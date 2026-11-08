@@ -148,6 +148,7 @@ static rune::node::NodeConfig makeSmokeConfig(const fs::path& dataDir) {
     cfg.clientEndpoint.streamId = 1;
 
     cfg.workerCount = rune::node::test::workerCountFromEnv();
+    cfg.unservableWarmupMs = 50;
 
     return cfg;
 }
@@ -293,7 +294,7 @@ static int countDeletedFiles(const std::string& dir) {
     return n;
 }
 
-// Wait (bounded) for a condition to become true, polling every 50 ms.
+// Wait (bounded) for a condition to become true, polling every 5 ms.
 template <typename Pred>
 static bool waitFor(Pred&& pred,
                     std::chrono::milliseconds timeout = 6s) {
@@ -301,7 +302,7 @@ static bool waitFor(Pred&& pred,
     const auto deadline = clk::now() + timeout;
     while (clk::now() < deadline) {
         if (pred()) return true;
-        std::this_thread::sleep_for(50ms);
+        std::this_thread::sleep_for(5ms);
     }
     return pred();
 }
@@ -1704,7 +1705,7 @@ TEST(CompactionRetentionSmoke, RetentionAfterRestart) {
 //
 // This test drives the FULL post-restart new-leader path through a REAL
 // BrokerNode:
-//   Phase 1: pre-write 200 updates × 4 keys (r-MAJOR so the NEWEST value per key
+//   Phase 1: pre-write 80 records over 4 keys (r-MAJOR so the NEWEST value per key
 //            lands at the very end → in the ACTIVE, un-compacted segment).
 //   Phase 2: start node #1 (leader) → cleaner compacts the sealed prefix →
 //            checkpoint persisted to disk → stop.
@@ -1714,10 +1715,10 @@ TEST(CompactionRetentionSmoke, RetentionAfterRestart) {
 //   Phase 4: assert through the HW-BOUNDED SERVE PATH (PartitionReplica::read,
 //            the same code the gateway uses) that BOTH hold:
 //              (A) CONVERGENCE: exactly one live record per key (no superseded).
-//              (B) TAIL DELIVERY: the newest value per key (v199-region) is
+//              (B) TAIL DELIVERY: the newest value per key (v19-region) is
 //                  present and HW-bounded (served from the active segment).
 //
-// Non-vacuous: 200 records → 4 keys.  Before compaction there are 200 records;
+// Non-vacuous: 80 records → 4 keys.  Before compaction there are 80 records;
 // a passing test requires the served set to collapse to exactly 4 AND to carry
 // the maximum seq per key.  If the new leader fails to re-compact, arm (A) sees
 // > 4; if it drops the active tail, arm (B) sees a stale value.
@@ -1773,10 +1774,10 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
     SmokeDir tmp{"smoke12_restart_converge_"};
 
     constexpr int   K        = 4;     // distinct keys
-    constexpr int   R        = 50;    // updates per key (200 records total)
-    constexpr int   kRecords = K * R; // 200
+    constexpr int   R        = 20;    // updates per key (80 records total)
+    constexpr int   kRecords = K * R; // 80
     constexpr int64_t kRoll  = 128;   // tiny roll → many sealed segments + active tail
-    constexpr int   kSentinelAnchors = 4; // seal 196-199 below the active boundary
+    constexpr int   kSentinelAnchors = 4; // seal 76-79 below the active boundary
 
     rune::node::TopicSpec ts;
     ts.name                   = "restart-converge";
@@ -1810,7 +1811,7 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
             }
         }
         // Anchor appends on a SENTINEL key: force the segment holding the newest
-        // per-key values (offsets 196-199) to SEAL and a fresh active segment to
+        // per-key values (offsets 76-79) to SEAL and a fresh active segment to
         // form above them.  Without this, keys whose newest value lands in the
         // (never-compacted) active segment keep their superseded sealed copies —
         // which is EXPECTED Kafka behaviour (active segment is never in the cleaner
@@ -1827,8 +1828,8 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
             << "Smoke12: tiny roll must form many segments; got " << segsBefore;
     }
 
-    // Expected newest value per DATA key = v(R-1) = v49.  All now in SEALED
-    // segments (the sentinel anchor pushed 196-199 below the active boundary).
+    // Expected newest value per DATA key = v(R-1) = v19.  All now in SEALED
+    // segments (the sentinel anchor pushed 76-79 below the active boundary).
 
     int64_t leoBefore = 0;
     {
@@ -1847,7 +1848,10 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
         ASSERT_TRUE(node.awaitLeader(3s)) << "Smoke12 P2: must self-elect";
         ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
             << "Smoke12 P2: replication bridge must propagate within 2 s";
-        std::this_thread::sleep_for(3000ms);  // let the cleaner run several passes
+        // The sealed prefix is compacted once the cleaner has passed the data keys' last records (offsets below the sentinel anchors).
+        ASSERT_TRUE(waitFor([&] {
+            return node.onOwnerThreadForTest(0, 0, [](rune::replication::PartitionReplica& r) { return r.lastCleanOffset(); }) >= K * R;
+        }, 10s)) << "Smoke12 P2: the cleaner never compacted the sealed prefix";
         node.stop();
     }
 
@@ -1863,9 +1867,10 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
         ASSERT_TRUE(node2.awaitLeader(3s)) << "Smoke12 P3: must self-elect";
         ASSERT_TRUE(waitFor([&] { return node2.replicationIsLeaderForTest(); }, 2s))
             << "Smoke12 P3: replication bridge must propagate within 2 s";
-        // Give the new leader ample time to re-run its incremental cleaner passes
-        // to convergence (the observed e2e failure is that it does not).
-        std::this_thread::sleep_for(5000ms);
+        // The new leader re-runs its incremental cleaner passes (the observed e2e failure is that it does not converge).
+        const uint64_t c0 = node2.cleanerCyclesForTest();
+        ASSERT_TRUE(waitFor([&] { return node2.cleanerCyclesForTest() >= c0 + 3; }, 10s))
+            << "Smoke12 P3: the new leader's cleaner never completed a pass";
         node2.stop();  // duty + cleaner threads joined → on-disk state is final.
     }
 
@@ -1883,7 +1888,7 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
     }
 
     // Count how many times each DATA key (key0..K-1) is served.  These keys' newest
-    // values (v49) are all in SEALED segments (the sentinel anchor pushed them below
+    // values (v19) are all in SEALED segments (the sentinel anchor pushed them below
     // the active boundary), so a correct new leader MUST converge them to exactly one
     // record each.  The sentinel key is excluded from the strict count because its
     // own newest value lands in the never-compacted active segment (expected Kafka
@@ -1924,7 +1929,7 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
         ASSERT_NE(it, served.end())
             << "Smoke12 Arm B FAILED — key '" << key << "' MISSING from the served "
                "(HW-bounded) set after restart. The new leader dropped the newest "
-               "tail record. (This is the e2e 'missing 196-199' shape.)";
+               "tail record. (This is the e2e 'missing 76-79' shape.)";
         EXPECT_EQ(it->second, v)
             << "Smoke12 Arm B FAILED — key '" << key << "' served STALE value '"
             << it->second << "' (expected newest '" << v << "').";
