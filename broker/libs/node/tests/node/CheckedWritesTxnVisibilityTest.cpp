@@ -6,6 +6,7 @@
 #include <array>
 #include <filesystem>
 #include <random>
+#include <set>
 
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
@@ -450,7 +451,8 @@ TEST(CheckedWritesTxnVisibilityRegression, CheckpointNeverInsideAnOpenSpanRegres
 
 namespace {
 // R11b: a source {id, g, v} under count(*), last(v), lastNonNull(v) by g, once as a verdict member with check (lv >= 0) and once
-// as an ordinary view; each again as a copy installed after the writes.
+// as an ordinary view; each again as a copy installed after the writes.  Without the check the source has only its key index: a
+// committed transaction is then applied at its marker (applyOrdinary_), not judged there.
 constexpr const char* kR11Topic = "topic r11 { id uint64, g uint64, v int64 } partitions 1 key id;";
 constexpr int32_t kChk = 0x40000701, kOrd = 0x40000702, kChkCopy = 0x40000703, kOrdCopy = 0x40000704;
 
@@ -503,6 +505,7 @@ std::vector<uint8_t> r11Batch(const std::vector<R11Rec>& recs, int64_t pid, int3
 /// What D5 compares: each view's rows by group (logical, no row or group ids) and the source's rejected verdicts.
 struct R11Image {
     std::vector<std::vector<uint8_t>> rows;
+    std::set<uint64_t> keys;   // the key index
     std::vector<std::tuple<int64_t, uint16_t, uint32_t>> rejected;
     bool operator==(const R11Image&) const = default;
     friend void PrintTo(const R11Image& im, std::ostream* os) {
@@ -511,16 +514,18 @@ struct R11Image {
             for (const uint8_t b : row) *os << ' ' << int(b);
         }
         for (const auto& [o, code, cid] : im.rejected) *os << "\n  rejected " << o << " code " << code << " constraint " << cid;
+        for (const uint64_t k : im.keys) *os << "\n  key " << k;
     }
 };
 
 struct R11 {
     VerdictRig r;
     int64_t writesEnd = 0;
-    explicit R11(uint32_t seed) {
+    int commits = 0;   // transactions committed
+    explicit R11(uint32_t seed, bool checked = true) {
         r.createQlTopic(kR11Topic, false);
         r.setViewPassCap(2);
-        r.installCompiledView(r11View(kChk, true), 0x5701, /*persisted=*/true);
+        if (checked) r.installCompiledView(r11View(kChk, true), 0x5701, /*persisted=*/true);
         r.installCompiledView(r11View(kOrd, false), 0x5702, /*persisted=*/true);
         r.passes(20);
         write(seed);
@@ -542,7 +547,9 @@ struct R11 {
                 if (std::all_of(recs.begin(), recs.end(), [](const R11Rec& x) { return x.v.has_value(); })) ASSERT_EQ(r.produceBatch(r11Batch(recs, -1, -1, false)), 0);
                 else (void)r.appendTxnReplicated(r11Batch(recs, -1, -1, false));
             } else if (what == 3 && open[p] > 0) {
-                r.marker(pid, pick(3) != 0);
+                const bool commit = pick(3) != 0;
+                r.marker(pid, commit);
+                commits += commit ? 1 : 0;
                 open[p] = 0;
             } else if (open[p] < 8) {
                 std::vector<R11Rec> recs{rec()};
@@ -552,8 +559,12 @@ struct R11 {
                 open[p] += static_cast<int>(recs.size());
             }
         }
-        for (uint32_t p = 0; p < 3; ++p)
-            if (open[p] > 0) r.marker(41 + p, pick(3) != 0);
+        for (uint32_t p = 0; p < 3; ++p) {
+            if (open[p] == 0) continue;
+            const bool commit = pick(3) != 0;
+            r.marker(41 + p, commit);
+            commits += commit ? 1 : 0;
+        }
         // A judged record last, in its own group: a stretch with nothing judged (an aborted transaction) gets its marker with it.
         ASSERT_EQ(r.produceBatch(r11Batch({{99, 4, 0}}, -1, -1, false)), 0);
         writesEnd = r.leo();
@@ -570,9 +581,9 @@ struct R11 {
         for (int i = 0; i < 2000 && !done(); ++i) r.pass();
         ASSERT_TRUE(done());
     }
-    [[nodiscard]] R11Image image(int32_t chk, int32_t ord) const {
+    [[nodiscard]] R11Image image(std::initializer_list<int32_t> views) {
         R11Image out;
-        for (const int32_t v : {chk, ord}) {
+        for (const int32_t v : views) {
             const ViewInstance* inst = r.vs->instanceForTest(v, 0);
             out.rows.push_back({static_cast<uint8_t>(inst->table.size())});
             for (uint64_t g = 1; g <= 3; ++g) {
@@ -585,6 +596,7 @@ struct R11 {
             const auto* e = rej.find(o);
             out.rejected.emplace_back(o, e->code, e->constraintId);
         }
+        out.keys = r.keyIndexKeys();
         return out;
     }
     [[nodiscard]] uint64_t mismatches() const { return r.writeState()->rejected.mismatches(); }
@@ -605,29 +617,62 @@ class CheckedWritesTxnDeterminismRegression : public ::testing::TestWithParam<ui
 TEST_P(CheckedWritesTxnDeterminismRegression, LiveEqualsRefoldEqualsRebuildUnderInterleavedTxnsRegression) {
     R11 w(GetParam());
     w.settle({kChk, kOrd}, /*live=*/true);
-    const R11Image live = w.image(kChk, kOrd);
+    const R11Image live = w.image({kChk, kOrd});
     EXPECT_EQ(w.mismatches(), 0u);
 
     w.r.installCompiledView(r11View(kChkCopy, true), 0x5703, /*persisted=*/true);
     w.r.installCompiledView(r11View(kOrdCopy, false), 0x5704, /*persisted=*/true);
     w.settle({kChk, kOrd, kChkCopy, kOrdCopy});
-    EXPECT_EQ(w.image(kChkCopy, kOrdCopy), live) << "the copies installed after the writes";
-    EXPECT_EQ(w.image(kChk, kOrd), live);
+    EXPECT_EQ(w.image({kChkCopy, kOrdCopy}), live) << "the copies installed after the writes";
+    EXPECT_EQ(w.image({kChk, kOrd}), live);
 
     w.r.agent.reset();
     for (const int32_t v : {kChk, kOrd, kChkCopy, kOrdCopy}) std::filesystem::remove(viewCheckpointFilePath(w.r.snapDir(), v, 0));
     w.r.agent = std::make_unique<ViewSnapshotIoAgent>(w.r.channel, w.r.snapDir(), /*fsyncMs=*/0, w.r.backupPolicy);
     w.r.restart();
     w.settle({kChk, kOrd, kChkCopy, kOrdCopy});
-    EXPECT_EQ(w.image(kChk, kOrd), live) << "the refold from 0";
-    EXPECT_EQ(w.image(kChkCopy, kOrdCopy), live) << "the copies' refold from 0";
+    EXPECT_EQ(w.image({kChk, kOrd}), live) << "the refold from 0";
+    EXPECT_EQ(w.image({kChkCopy, kOrdCopy}), live) << "the copies' refold from 0";
     EXPECT_EQ(w.mismatches(), 0u);
 
     w.r.failover();
     w.settle({kChk, kOrd, kChkCopy, kOrdCopy});
-    EXPECT_EQ(w.image(kChk, kOrd), live) << "the failover";
-    EXPECT_EQ(w.image(kChkCopy, kOrdCopy), live) << "the copies after the failover";
+    EXPECT_EQ(w.image({kChk, kOrd}), live) << "the failover";
+    EXPECT_EQ(w.image({kChkCopy, kOrdCopy}), live) << "the copies after the failover";
     EXPECT_EQ(w.mismatches(), 0u);
 }
 
 INSTANTIATE_TEST_SUITE_P(Seeds, CheckedWritesTxnDeterminismRegression, ::testing::Range(1u, 101u));
+
+// REGRESSION (Task 8 review 3, m-4): R11b on a source with only its key index.  No member constrains it, so every committed
+// transaction goes through applyOrdinary_ (the budgeted collect, check and apply walks and the supersede decisions) instead of
+// judgeAtMarker_, under the same comparisons.
+class CheckedWritesTxnDeterminismOrdinaryRegression : public ::testing::TestWithParam<uint32_t> {};
+
+TEST_P(CheckedWritesTxnDeterminismOrdinaryRegression, KeyIndexOnlySourceAppliesAtTheMarkerAlikeEverywhereRegression) {
+    R11 w(GetParam(), /*checked=*/false);
+    w.settle({kOrd}, /*live=*/true);
+    const R11Image live = w.image({kOrd});
+    EXPECT_EQ(w.mismatches(), 0u);
+    EXPECT_EQ(w.r.writeState()->txn.stats.markerWithoutVote, 0u) << "no committed transaction was judged at its marker";
+
+    w.r.installCompiledView(r11View(kOrdCopy, false), 0x5704, /*persisted=*/true);
+    w.settle({kOrd, kOrdCopy});
+    EXPECT_EQ(w.image({kOrdCopy}), live) << "the copy installed after the writes";
+
+    w.r.agent.reset();
+    for (const int32_t v : {kOrd, kOrdCopy}) std::filesystem::remove(viewCheckpointFilePath(w.r.snapDir(), v, 0));
+    w.r.agent = std::make_unique<ViewSnapshotIoAgent>(w.r.channel, w.r.snapDir(), /*fsyncMs=*/0, w.r.backupPolicy);
+    w.r.restart();
+    w.settle({kOrd, kOrdCopy});
+    EXPECT_EQ(w.image({kOrd}), live) << "the refold from 0";
+    EXPECT_EQ(w.image({kOrdCopy}), live) << "the copy's refold from 0";
+
+    w.r.failover();
+    w.settle({kOrd, kOrdCopy});
+    EXPECT_EQ(w.image({kOrd}), live) << "the failover";
+    EXPECT_EQ(w.image({kOrdCopy}), live) << "the copy after the failover";
+    EXPECT_EQ(w.mismatches(), 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(Seeds, CheckedWritesTxnDeterminismOrdinaryRegression, ::testing::Range(1u, 21u));
