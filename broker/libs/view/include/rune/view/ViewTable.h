@@ -94,6 +94,9 @@ struct ViewTableKeys {
     uint8_t  prefixWidth = 0;
     uint64_t hashSeed = 0;
     uint64_t hashMaskForTest = ~uint64_t{0};   // AND-ed into every hash; 0 makes every key collide
+    /// Optional per-row auxiliary bytes (0 = none: no allocation, no cost).  Chunked like the rows and grown by appendChunk()
+    /// with them; the table only zero-fills them (the owner sets what it needs when it creates a row).
+    uint32_t auxBytesPerRow = 0;
 };
 
 enum class PrefixScan : uint8_t { End, Stopped, CursorGone };
@@ -123,6 +126,20 @@ public:
     // The dense row id of `key`'s row (stable while the row lives), or false when absent.  Cold-path identity for
     // consumers that track rows by id (the lease wheels).
     bool ridOf(const ViewKey& key, uint32_t& rid) const noexcept;
+
+    // The auxiliary area of row `rid` (ViewTableKeys::auxBytesPerRow bytes, zero-filled when its chunk was allocated; a row id
+    // reused after erase() keeps its old bytes, the owner resets them).  Stable address (chunked).  Requires auxBytesPerRow > 0.
+    uint8_t* aux(uint32_t rid) noexcept {
+        assert(auxBytes_ > 0 && rid < auxChunks_.size() * rowsPerChunk_);
+        return auxChunks_[rid >> chunkShift_].get() + (rid & chunkMask_) * auxBytes_;
+    }
+    const uint8_t* aux(uint32_t rid) const noexcept {
+        assert(auxBytes_ > 0 && rid < auxChunks_.size() * rowsPerChunk_);
+        return auxChunks_[rid >> chunkShift_].get() + (rid & chunkMask_) * auxBytes_;
+    }
+    [[nodiscard]] uint32_t auxBytesPerRow() const noexcept { return static_cast<uint32_t>(auxBytes_); }
+    // Row ids addressable without another chunk (rowsPerChunk x chunks).
+    [[nodiscard]] size_t ridCapacity() const noexcept { return chunks_.size() * rowsPerChunk_; }
 
     // Removes `key`. Returns false if `key` was not present. O(1):
     // backward-shift in the index, the row-id returned to the free-list;
@@ -210,7 +227,7 @@ public:
     // Namespaces Phase 2 Task 12 (D26): the row-slab memory, chunkCount x bytes per chunk.  O(1) and incremental by
     // construction (chunks only ever append), so the view set charges it without scanning.
     size_t memoryBytes() const noexcept {
-        return chunks_.size() * rowsPerChunk_ * rowStride_ + poolBytes_ + (outer_.cap + outer_.ocap) * kSlotBytes;
+        return chunks_.size() * rowsPerChunk_ * (rowStride_ + auxBytes_) + poolBytes_ + (outer_.cap + outer_.ocap) * kSlotBytes;
     }
 
     // Task 5 test/bench hooks (Task 7's benchmark depends on these):
@@ -492,6 +509,8 @@ private:
     uint64_t  hashMask_    = ~uint64_t{0};
     uint32_t  headerLen_   = 0;  // keyWidth_ when wide (> 8), else 0
     size_t    rowStride_   = 0;  // headerLen_ + layout_.rowLen
+    size_t    auxBytes_    = 0;  // ViewTableKeys::auxBytesPerRow
+    std::vector<std::unique_ptr<uint8_t[]>> auxChunks_;   // parallel to chunks_ (empty when auxBytes_ == 0)
     mutable uint64_t arenaKeyReads_ = 0;
 
     SlotIndex main_;   // key -> rid

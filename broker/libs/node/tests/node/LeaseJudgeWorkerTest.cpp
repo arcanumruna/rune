@@ -75,6 +75,37 @@ Cols colsOf(VerdictRig& r, uint64_t id, uint16_t count) {
     return c;
 }
 
+constexpr uint8_t kRevokeAttr = 2 | (uint8_t(rec::LeaseOp::Revoke) << rec::kAttrLeaseOpShift);   // Revoke | existing
+
+struct Stored { int64_t offset; uint8_t attrs; std::string key; std::vector<uint8_t> value; bool crcOk; };
+// Every data record in the log, in offset order, straight from the segments.
+std::vector<Stored> storedRecords(VerdictRig& r) {
+    std::vector<Stored> out;
+    for (int64_t off = 0; off < r.leo();) {
+        const auto v = r.log->readView(off, 1 << 20);
+        if (v.empty()) break;
+        for (std::size_t p = 0; p + 12 <= v.len;) {
+            rune::protocol::RecordBatchReader rd(v.data + p, v.len - p);
+            const std::size_t total = static_cast<std::size_t>(rd.totalLength());
+            if (total < 12 || p + total > v.len) break;
+            if ((rd.attributes() & rune::protocol::batch::kAttrControl) == 0) {
+                const bool crc = rd.ensureValid();
+                (void)rune::protocol::forEachRecordSpan(v.data + p, total, [&](const rune::protocol::RecordSpan& s) {
+                    out.push_back({s.offset, s.attributes, std::string(s.key), std::vector<uint8_t>(s.value.begin(), s.value.end()), crc});
+                });
+            }
+            p += total;
+        }
+        off = v.nextOffset;
+    }
+    return out;
+}
+uint64_t le(const std::vector<uint8_t>& v, std::size_t at, int bytes = 8) {
+    uint64_t x = 0;
+    for (int i = 0; i < bytes; ++i) x |= uint64_t(v[at + std::size_t(i)]) << (8 * i);
+    return x;
+}
+
 }  // namespace
 
 TEST(LeaseJudgeWorkerRegression, ProvidesKeyIndexRegression) {
@@ -551,6 +582,15 @@ TEST(LeaseWriteHookWorkerRegression, GrantStampedRaisedAndJudgedRegression) {
     ASSERT_TRUE(c2.v[0].has_value());
     EXPECT_EQ(int64_t(*c1.v[0]), ack->baseOffset) << "lease_version is the record's offset";
     EXPECT_EQ(int64_t(*c2.v[0]), ack->baseOffset + 1);
+    // the STORED records (not only the row) carry the stamped version and the raised ttl
+    const auto stored = storedRecords(r);
+    ASSERT_EQ(stored.size(), 2u);
+    for (std::size_t i = 0; i < stored.size(); ++i) {
+        EXPECT_EQ(int64_t(le(stored[i].value, 4)), stored[i].offset) << "the stored lease_version bytes are the record's own offset";
+        EXPECT_TRUE(stored[i].crcOk);
+    }
+    EXPECT_EQ(le(stored[0].value, 12), 1000u);
+    EXPECT_EQ(le(stored[1].value, 12), 5000u);
     EXPECT_EQ(*c1.v[1], 1000u) << "ttl 0 raised to min_ttl";
     EXPECT_EQ(*c2.v[1], 5000u);
 
@@ -563,4 +603,157 @@ TEST(LeaseWriteHookWorkerRegression, GrantStampedRaisedAndJudgedRegression) {
     EXPECT_EQ(ack3->code, int16_t(rune::protocol::client::ErrorCode::InvalidRequest));
     EXPECT_EQ(r.leo(), leo);
     EXPECT_EQ(r.worker->hookRefusalsForTest(HookRefusal::LeaseClientVersion), 1u) << "refused by the lease client-version rule, not another one";
+}
+
+// ── Task 5b: revokes through the real produce path ──
+
+namespace {
+struct Leased {
+    Ready g;
+    VerdictRig& r = g.r;
+    int32_t seq = 0;
+    Leased() {
+        WorkerOp level;
+        level.type = WorkerOp::Type::ClusterFeatureLevel; level.nextOffset = rune::replication::MetadataFeature::kLeases;
+        r.send(std::move(level));
+        r.enableAcks(rune::protocol::client::kClientVersionLeases);
+        r.passes(30);
+    }
+    std::optional<VerdictRig::Ack> produce(const std::vector<RawRec>& recs) {
+        const int64_t c = r.produceBytes(VerdictRig::rawBatch(recs, 11, seq), rune::protocol::client::kAcksWireView, 11, seq);
+        seq += int32_t(recs.size());
+        return r.ack(c);
+    }
+    std::optional<VerdictRig::Ack> produceNoSeq(const std::vector<RawRec>& recs, int32_t at) {   // a refused batch does not consume its sequence
+        const int64_t c = r.produceBytes(VerdictRig::rawBatch(recs, 11, at), rune::protocol::client::kAcksWireView, 11, at);
+        return r.ack(c);
+    }
+};
+}  // namespace
+
+TEST(LeaseWriteHookWorkerRegression, RevokeReencodedFullRowRegression) {
+    Leased l;
+    VerdictRig& r = l.r;
+    const auto ack = l.produce({RawRec{keyOf(1), leaseValue(1, 0, "a1"), 1}});
+    ASSERT_TRUE(ack);
+    ASSERT_EQ(ack->code, 0);
+    const int64_t grantOffset = ack->baseOffset;
+    r.passes(30);
+    ASSERT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 1u);
+    r.addLeasePort();   // v2 adds `port`: the row layout gains a column and is rebuilt
+    r.passes(60);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(30);
+    ASSERT_TRUE(r.leaseReady());
+    // a client revoke at v1 with every user column zeroed
+    const int64_t before = r.leo();
+    const auto rack = l.produce({RawRec{keyOf(1), leaseValue(1, grantOffset, "", 1), kRevokeAttr}});
+    ASSERT_TRUE(rack);
+    EXPECT_EQ(rack->code, 0);
+    EXPECT_TRUE(rack->verdicts.empty()) << "the judge accepted the revoke";
+    r.passes(30);
+    const auto stored = storedRecords(r);
+    const Stored* rv = nullptr;
+    for (const auto& s : stored) if (s.offset >= before && s.attrs == kRevokeAttr) rv = &s;
+    ASSERT_NE(rv, nullptr);
+    EXPECT_TRUE(rv->crcOk);
+    EXPECT_EQ(le(rv->value, 2, 2), 2u) << "re-encoded at the latest installed version";
+    ASSERT_EQ(rv->value.size(), 64u);
+    EXPECT_EQ(int64_t(le(rv->value, 4)), grantOffset) << "lease_version from the row";
+    EXPECT_EQ(le(rv->value, 12), 5000u) << "ttl from the row";
+    EXPECT_EQ(le(rv->value, 36), 1u);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(rv->value.data()) + 44, 2), "a1") << "the user columns are the row's, not the client's zeros";
+    EXPECT_EQ(le(rv->value, 60, 4), 0u);
+    EXPECT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 0u) << "the row is gone";
+    EXPECT_EQ(firstRejection(r), nullptr);
+}
+
+TEST(LeaseWriteHookWorkerRegression, RevokeNoRowUnchangedRegression) {
+    Leased l;
+    VerdictRig& r = l.r;
+    const auto g = l.produce({RawRec{keyOf(1), leaseValue(1, 0, "a1"), 1}});
+    ASSERT_TRUE(g);
+    r.passes(30);
+    const int64_t before = r.leo();
+    const auto absentIn = leaseValue(2, 5, "zz", 1);
+    const auto otherIn = leaseValue(1, g->baseOffset + 50, "yy", 1);
+    const auto a1 = l.produce({RawRec{keyOf(2), absentIn, kRevokeAttr}});
+    ASSERT_TRUE(a1);
+    const auto a2 = l.produce({RawRec{keyOf(1), otherIn, kRevokeAttr}});
+    ASSERT_TRUE(a2);
+    ASSERT_EQ(a1->code, 0);
+    ASSERT_EQ(a2->code, 0);
+    ASSERT_EQ(a1->verdicts.size(), 1u);
+    EXPECT_EQ(std::get<1>(a1->verdicts[0]), 62);
+    ASSERT_EQ(a2->verdicts.size(), 1u);
+    EXPECT_EQ(std::get<1>(a2->verdicts[0]), 62);
+    std::vector<std::vector<uint8_t>> values;
+    for (const auto& s : storedRecords(r)) if (s.offset >= before) values.push_back(s.value);
+    ASSERT_EQ(values.size(), 2u);
+    EXPECT_EQ(values[0], absentIn) << "stored bytes equal the input";
+    EXPECT_EQ(values[1], otherIn);
+    EXPECT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 1u) << "the live lease is untouched";
+}
+
+TEST(LeaseWriteHookWorkerRegression, RevokeBehindUpdateThrottledRegression) {
+    Leased l;
+    VerdictRig& r = l.r;
+    const auto g = l.produce({RawRec{keyOf(1), leaseValue(1, 0, "a1"), 1}});
+    ASSERT_TRUE(g);
+    r.passes(30);
+    const int64_t ver = g->baseOffset;
+    r.holdJudge(true);   // the update below is appended but not judged
+    const int64_t cu = r.produceBytes(VerdictRig::rawBatch({RawRec{keyOf(1), leaseValue(1, ver, "zz"), 2}}, 11, l.seq), rune::protocol::client::kAcksWireView, 11, l.seq);
+    ++l.seq;
+    r.passes(30);
+    const int64_t leoAfterUpdate = r.leo();
+    ASSERT_TRUE(r.leaseReady()) << "vacuity guard: the index is ready, so the refusal below is the lastAppended rule";
+    const auto th = l.produceNoSeq({RawRec{keyOf(1), leaseValue(1, ver, "", 1), kRevokeAttr}}, l.seq);
+    ASSERT_TRUE(th);
+    EXPECT_EQ(th->code, int16_t(rune::protocol::client::ErrorCode::Throttled));
+    EXPECT_EQ(th->retryAfter, 1'000'000) << "retry-after 1 ms";
+    EXPECT_EQ(r.leo(), leoAfterUpdate) << "nothing stored";
+    r.holdJudge(false);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(30);
+    const auto au = r.ack(cu);
+    ASSERT_TRUE(au);
+    EXPECT_EQ(au->code, 0);
+    EXPECT_TRUE(au->verdicts.empty());
+    const int64_t before = r.leo();
+    const auto ok = l.produceNoSeq({RawRec{keyOf(1), leaseValue(1, ver, "", 1), kRevokeAttr}}, l.seq);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(ok->code, 0);
+    EXPECT_TRUE(ok->verdicts.empty());
+    for (const auto& s : storedRecords(r))
+        if (s.offset >= before && s.attrs == kRevokeAttr)
+            EXPECT_EQ(std::string(reinterpret_cast<const char*>(s.value.data()) + 44, 2), "zz") << "the stored revoke carries the UPDATED columns";
+    r.passes(30);
+    EXPECT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 0u);
+}
+
+TEST(LeaseWriteHookWorkerRegression, RevokeWhileIndexNotReadyThrottledRegression) {
+    Leased l;
+    VerdictRig& r = l.r;
+    const auto g = l.produce({RawRec{keyOf(1), leaseValue(1, 0, "a1"), 1}});
+    ASSERT_TRUE(g);
+    r.passes(30);
+    r.demote();
+    r.holdJudge(true);
+    r.promote();
+    r.passes(30);
+    ASSERT_FALSE(r.leaseReady()) << "vacuity guard: the judge has not activated under the new leadership";
+    const int64_t leo = r.leo();
+    const auto th = l.produceNoSeq({RawRec{keyOf(1), leaseValue(1, g->baseOffset, "", 1), kRevokeAttr}}, l.seq);
+    ASSERT_TRUE(th);
+    EXPECT_EQ(th->code, int16_t(rune::protocol::client::ErrorCode::Throttled));
+    EXPECT_EQ(th->retryAfter, 1'000'000);
+    EXPECT_EQ(r.leo(), leo);
+    r.holdJudge(false);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(60);
+    ASSERT_TRUE(r.leaseReady());
+    const auto ok = l.produceNoSeq({RawRec{keyOf(1), leaseValue(1, g->baseOffset, "", 1), kRevokeAttr}}, l.seq);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(ok->code, 0);
 }

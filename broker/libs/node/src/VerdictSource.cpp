@@ -397,7 +397,7 @@ Verdict VerdictSource::verdictOf_(const Member& m, const rune::view::SourceRecor
         const uint8_t* row = i.table.get(m.prospect.rows[0].key);
         const LeaseRowState st{row != nullptr, row != nullptr ? leaseRowVersion(row, i.layout) : 0, row != nullptr ? leaseRowTtl(row, i.layout) : 0};
         const uint32_t maxKeys = state_ != nullptr && state_->spec != nullptr && state_->spec->lease ? state_->spec->lease->maxKeys : UINT32_MAX;
-        return {judgeLease(st, rec.attributes, leaseRecordVersion(rec.value), leaseRecordTtl(rec.value), leaseRecordRemaining(rec.value), i.table.size(), maxKeys), 0};
+        return {judgeLease(st, rec.attributes, leaseRecordVersion(rec.value), leaseRecordRemaining(rec.value), i.table.size(), maxKeys), 0};
     }
     if (m.kind != rune::view::VerdictViewKind::TestReject || rec.value.empty()) return {};   // tombstones are never rejected
     const Verdict reject{static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation), rune::view::constraintIdOf(m.objectId, 1)};

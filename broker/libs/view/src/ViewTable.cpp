@@ -83,6 +83,7 @@ ViewTable::ViewTable(RowLayout layout, size_t initialIndexSlots, size_t chunkByt
     : layout_(std::move(layout)), keyWidth_(keys.keyWidth), prefixWidth_(keys.prefixWidth), hashSeed_(keys.hashSeed),
       hashMask_(keys.hashMaskForTest), headerLen_(keys.keyWidth > 8 ? keys.keyWidth : 0),
       rowStride_(headerLen_ + static_cast<size_t>(layout_.rowLen)) {
+    auxBytes_ = keys.auxBytesPerRow;
     assert(keyWidth_ <= rune::codec::kMaxViewKeyBytes && "ViewTable: keyWidth over kMaxViewKeyBytes");
     assert(initialIndexSlots > 0 && std::has_single_bit(initialIndexSlots) &&
            "ViewTable: initialIndexSlots must be a power of two");
@@ -131,6 +132,12 @@ void ViewTable::appendChunk() {
         std::unique_ptr<uint8_t[]> chunk(new uint8_t[bytes]);
         std::memset(chunk.get(), 0, bytes);
         chunks_.push_back(std::move(chunk));
+        if (auxBytes_ > 0) {
+            const size_t abytes = rowsPerChunk_ * auxBytes_;
+            std::unique_ptr<uint8_t[]> a(new uint8_t[abytes]);
+            std::memset(a.get(), 0, abytes);
+            auxChunks_.push_back(std::move(a));
+        }
     }
     // dirty_/dirtyKeys_ are indexed by rid and must cover every valid rid.
     // Grown here (alongside the row slab) rather than on index rehash:

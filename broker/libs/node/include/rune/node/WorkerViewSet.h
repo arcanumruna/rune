@@ -391,6 +391,13 @@ public:
         const auto it = keyIndexes_.find(instKey(src, partition));
         return it == keyIndexes_.end() ? 0 : it->second.table.size();
     }
+    /// The produce path's window on the lease index of (src, partition): its table, layout and layout descriptor.  Null table when
+    /// the partition has none.  Non-const: the produce hook writes the table's per-row lastAppended.
+    [[nodiscard]] LeaseIndexRef leaseIndexOf(int32_t src, int32_t partition) noexcept {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        if (it == keyIndexes_.end()) return {};
+        return LeaseIndexRef{&it->second.table, &it->second.layout, &it->second.evolvingSrc};
+    }
     /// A lease index row's column `slot` (up to 8 bytes, little-endian) for the 8-byte wire key `key`; nullopt: no such row, or the column is null.
     /// `slots` (if given) receives the layout's column count.
     [[nodiscard]] std::optional<uint64_t> leaseColumnForTest(int32_t src, int32_t partition, uint64_t key, uint16_t slot, std::size_t* slots = nullptr) const {

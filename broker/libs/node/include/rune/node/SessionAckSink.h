@@ -345,11 +345,13 @@ public:
         return true;
     }
 
-    /// The client version a session announced (D6), or 0 when it is unknown / not announced.  Read by the lease write hook.
+    /// The client version a session announced (D6), or -1 when this worker has not seen the session's announce (the gateway op
+    /// can reach the worker before the announce in the same pass).  Read by the lease write hook, which answers -1 with a
+    /// retriable code and only a KNOWN version below kClientVersionLeases with InvalidRequest.
     [[nodiscard]] int32_t clientVersionOf(int64_t sessionId) const noexcept {
-        if (sessionId <= 0) return 0;
+        if (sessionId <= 0) return -1;
         const std::size_t idx = find_(sessionId);
-        return idx == kNone ? 0 : clientVersion_[idx];
+        return idx == kNone ? -1 : clientVersion_[idx];
     }
 
     /// NAT-safe egress (Task 6, cold): announce a RESPONSE-MODE session.  Like announce(), but no channel and no

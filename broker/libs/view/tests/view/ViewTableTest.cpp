@@ -356,3 +356,43 @@ TEST(ViewTableMigrationRegression, EraseThenReinsertAlreadyMigratedKeyDuringMigr
         EXPECT_EQ(readSlot(t.get(v), L, 1).i, 2) << "key " << v << " corrupted (possible rid aliasing)";
     }
 }
+
+// The optional per-row auxiliary area (lease topics' lastAppended): chunked and grown with the rows.
+TEST(ViewTableAuxRegression, AuxSurvivesGrowthAcrossChunksRegression) {
+    RowLayout L = hpLayout();
+    ViewTableKeys keys;
+    keys.auxBytesPerRow = 8;
+    ViewTable t(L, 4096, /*chunkBytes=*/L.rowLen * 4, keys);   // a handful of rows per chunk
+    const std::size_t perChunk = t.ridCapacity();
+    ASSERT_GE(perChunk, 1u);
+    const uint64_t n = perChunk * 3 + 5;
+    std::vector<uint32_t> rids;
+    for (uint64_t k = 1; k <= n; ++k) {
+        (void)t.put(k);
+        uint32_t rid = 0;
+        ASSERT_TRUE(t.ridOf(ViewKey::fromU64(k), rid));
+        const int64_t v = int64_t(k) * 1000 - 7;
+        std::memcpy(t.aux(rid), &v, 8);
+        rids.push_back(rid);
+    }
+    ASSERT_GE(t.chunkCount(), 3u) << "the rids span at least 3 chunks";
+    for (uint64_t k = 1; k <= n; ++k) {   // read back after all the growth
+        int64_t v = 0;
+        std::memcpy(&v, std::as_const(t).aux(rids[k - 1]), 8);
+        EXPECT_EQ(v, int64_t(k) * 1000 - 7) << k;
+    }
+}
+
+TEST(ViewTableAuxRegression, NoAuxAllocatesNothingExtraRegression) {
+    RowLayout L = hpLayout();
+    ViewTable plain(L, 4096, L.rowLen * 4);
+    ViewTableKeys keys;
+    keys.auxBytesPerRow = 8;
+    ViewTable withAux(L, 4096, L.rowLen * 4, keys);
+    EXPECT_EQ(plain.auxBytesPerRow(), 0u);
+    EXPECT_EQ(withAux.memoryBytes() - plain.memoryBytes(), withAux.ridCapacity() * 8) << "the aux area is exactly 8 bytes per addressable row";
+    const uint64_t n = plain.ridCapacity() * 2;
+    for (uint64_t k = 1; k <= n; ++k) { (void)plain.put(k); (void)withAux.put(k); }
+    EXPECT_EQ(plain.chunkCount(), withAux.chunkCount());
+    EXPECT_EQ(withAux.memoryBytes() - plain.memoryBytes(), withAux.ridCapacity() * 8);
+}

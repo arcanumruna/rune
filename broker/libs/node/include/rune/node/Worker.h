@@ -3413,6 +3413,7 @@ private:
                               "layout; validator not installed", workerId_, topicId, version);
                 return;
             }
+            if (const TopicWriteSpec& installed = writeSpecOf_(topicId); installed.lease) sizeLeaseScratch_(installed);   // the widest fixed block may have grown
             spdlog::debug("Worker {}: SchemaUpdate installed validator for topicId={} version={}",
                           workerId_, topicId, version);
         } catch (const std::exception& ex) {
@@ -6577,6 +6578,7 @@ private:
     uint64_t typedVersionAhead_ = 0;   // batches answered NotLeader: a record's version has not been installed here yet
     uint64_t hookChecks_        = 0;   // CheckedWriteHook::check ran
     WriteFacts lastWriteFacts_{};
+    std::unique_ptr<LeaseHookWork> leaseHookWork_;   // lease topics: the produce hook's work area (allocated once, cold)
     std::vector<uint8_t> autoIncScratch_;   // Part 06: a key-0 batch is copied here to patch its ids (maxIntakeBatchBytes_, cold)
     std::size_t assignedBaseReserve_ = kAssignedBaseProducersInitial;
     bool autoIncGrowDue_ = false;   // a fresh key-0 append left a side window above 75 % load
@@ -7288,12 +7290,24 @@ private:
     // Cold: an autoincrement partition's counter facts, its side window and the worker's patch scratch (sized once).
     void installAutoInc_(PartitionWriteState& w, int32_t partition) {
         const TopicWriteSpec& spec = *w.spec;
-        if (spec.lease && autoIncScratch_.size() < maxIntakeBatchBytes_) autoIncScratch_.resize(maxIntakeBatchBytes_);   // the grant-stamping scratch
+        if (spec.lease) sizeLeaseScratch_(spec);
         if (!spec.autoIncrement) return;
         w.autoInc.configure(partition, std::max(spec.partitionCount, 1), effectiveAutoIncMax(spec.keyType, spec.autoIncrementMax),
                             spec.autoIncrementReserve);
         w.assignedBases.reserve(assignedBaseReserve_);
         if (autoIncScratch_.size() < maxIntakeBatchBytes_) autoIncScratch_.resize(maxIntakeBatchBytes_);
+    }
+    // Cold: the lease hook's scratch holds a rebuilt batch (grants stamped, revokes re-encoded at the widest installed version, so
+    // a revoke can grow by its value) and its work area.  Called when a lease partition's state is created and when a schema
+    // version installs (the widest fixed block can change).
+    void sizeLeaseScratch_(const TopicWriteSpec& spec) {
+        if (!leaseHookWork_) leaseHookWork_ = std::make_unique<LeaseHookWork>();
+        std::size_t maxFixed = 0;
+        for (int v = spec.maxVersion(); v >= 0; --v)
+            if (const auto* d = spec.descriptorFor(static_cast<uint16_t>(v))) maxFixed = std::max<std::size_t>(maxFixed, d->blockLength);
+        const std::size_t want = maxIntakeBatchBytes_ + rune::protocol::record::kMaxLeaseBatchRecords *
+                                                           (rune::protocol::kMaxRecordFramingBytes + 4 + maxFixed);
+        if (autoIncScratch_.size() < want) autoIncScratch_.resize(want);
     }
     // P6-8: a side window at or above 75 % load doubles, up to kAssignedBaseProducersMax producers; cold.
     void maintainAutoIncWindows_() {
@@ -10063,6 +10077,14 @@ private:
                 facts.clientVersion = ackSink_ ? ackSink_->clientVersionOf(f.sessionId) : 0;
                 facts.levelLeases   = clusterFeatureLevel_ >= rune::replication::MetadataFeature::kLeases;
                 facts.viewMemOver   = viewSet_ != nullptr && viewSet_->nsViewMemOver(nsTag.slot);
+                facts.leaseWork     = leaseHookWork_.get();
+                if (viewSet_ != nullptr && replica != nullptr) {
+                    facts.leaseIndex = viewSet_->leaseIndexOf(f.topicId, f.partition);
+                    const bool hwConfirmed = replica->highWatermark() >= replica->leadershipStartOffset();
+                    facts.leaseIndexReady = facts.leaseIndex.table != nullptr &&
+                        viewSet_->leaseIndexReady(f.topicId, f.partition, replica->leadershipGeneration(),
+                                                  replica->role() == rune::replication::Role::Leader, hwConfirmed);
+                }
             }
             lastWriteFacts_ = facts;
             CheckedWriteHook hook(*ws, facts, (ws->spec->autoIncrement || ws->spec->lease) ? std::span<uint8_t>(autoIncScratch_) : std::span<uint8_t>{});
@@ -10082,6 +10104,7 @@ private:
             if (hook.checked()) ++hookChecks_;
             if (hook.refusal() != HookRefusal::None) [[unlikely]] noteHookRefusal_(hook.refusal(), f);
             if (!outcome.isOK()) [[unlikely]] hook.onProduceFailed();
+            if (outcome.error == pc::ErrorCode::Throttled) [[unlikely]] outcome.retryAfterNs = hook.retryAfterNs();
             if (hook.assignedBase() != 0 && ws->assignedBases.wantsGrowth()) [[unlikely]] autoIncGrowDue_ = true;   // P6-8: grown next pass
             // P6-3: an in-window retry of a key-0 batch answers the ids its original took, from the side window.
             if (outcome.isDuplicate && outcome.baseOffset >= 0 && ws->spec->autoIncrement && keyZeroFirstRecord_(*ws->spec, rbSpan)) [[unlikely]] {
@@ -10132,6 +10155,8 @@ private:
             // log start in baseOffset (the WorkerReturn carrier does not grow,
             // F15 §7); every answer site maps it onto ProduceResponse.logStartOffset.
             if (outcome.error == pc::ErrorCode::UnknownProducerId) ret.baseOffset = outcome.logStartOffset;
+            // Throttled (a lease revoke behind an unapplied update): the retry-after rides lastOffset, like the namespace throttle.
+            if (outcome.error == pc::ErrorCode::Throttled && outcome.retryAfterNs > 0) ret.lastOffset = outcome.retryAfterNs;
             // Hop chain: answered without an append (value = -errorCode).
             FLIGHT_RECORDER_MARK_ARG_VAL_PRODUCE(flight_recorder::Site::ShAppendCorr, flight_recorder::foldCorr(f.correlationId),
                                                  static_cast<uint16_t>(workerId_), -static_cast<double>(ret.errorCode));

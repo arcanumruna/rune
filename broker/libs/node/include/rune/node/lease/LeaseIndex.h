@@ -25,6 +25,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <string_view>
 
@@ -42,6 +43,11 @@ inline constexpr uint16_t kLeaseHolderSlot    = 2;
 inline constexpr uint16_t kLeaseRemainingSlot = 3;
 inline constexpr uint16_t kLeaseSystemSlots   = 4;
 inline constexpr uint16_t kLeaseOffsetSlots   = 2;   // lease_granted_offset, lease_updated_offset: the last two slots
+
+/// Per-row auxiliary bytes of the lease table (ViewTableKeys::auxBytesPerRow): `lastAppended`, the offset of the last
+/// update or revoke of the key that the produce path has appended (spec 6.4, R8), -1 = none.  Task 9 widens this into the
+/// 48-byte entry-store entry.
+inline constexpr uint32_t kLeaseAuxBytes = 8;
 
 inline constexpr std::string_view kLeaseGrantedOffsetColumn = "lease_granted_offset";
 inline constexpr std::string_view kLeaseUpdatedOffsetColumn = "lease_updated_offset";
@@ -81,8 +87,7 @@ struct LeaseRowState {
 
 /// The judgment of spec 7.2.  0 = accept; else the verdict code (KeyExists, LeaseNotFound, LeaseLimitExceeded,
 /// InvalidRequest, or kVerdictStaleBroker for an Expire / Checkpoint whose lease moved on).  `recordVersion` is the
-/// record's lease_version (value bytes [4,12)); a grant ignores it.  `recordTtlMs` / `recordRemainingMs` are the record's
-/// lease_ttl_ms / lease_remaining_ms (bytes [12,20) / [28,36)).
+/// record's lease_version (value bytes [4,12)); a grant ignores it.  `recordRemainingMs` is the record's lease_remaining_ms (bytes [28,36)).
 ///
 /// Exact order, per record kind (the first match answers):
 ///   Put + Insert:    row present -> KeyExists (56); liveCount >= maxKeys -> LeaseLimitExceeded (63); remaining != 0 -> 39; accept.
@@ -94,10 +99,9 @@ struct LeaseRowState {
 /// An update or revoke's TTL and remaining are NOT checked (spec 6.4: the judge keeps the row's TTL and remaining; the
 /// write hook already refused a client remaining != 0).  Reason: the Task 8 cleaner keeps each live key's grant record, so a
 /// replay never builds a row from an update image, and the grant's TTL is the row's TTL on replay as well as live.
-[[nodiscard]] uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion, uint64_t recordTtlMs, uint64_t recordRemainingMs,
+[[nodiscard]] uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion, uint64_t recordRemainingMs,
                                   uint64_t liveCount, uint32_t maxKeys) noexcept;
-/// The record's lease_ttl_ms / lease_remaining_ms; 0 for a value too short to carry them.
-[[nodiscard]] uint64_t leaseRecordTtl(std::string_view value) noexcept;
+/// The record's lease_remaining_ms; 0 for a value too short to carry it.
 [[nodiscard]] uint64_t leaseRecordRemaining(std::string_view value) noexcept;
 
 /// The lease_version slot of a lease row image.
@@ -106,6 +110,34 @@ struct LeaseRowState {
 [[nodiscard]] uint64_t leaseRowTtl(const uint8_t* row, const rune::view::RowLayout& layout) noexcept;
 /// The record's lease_version (value bytes [4,12), little-endian); 0 for a value too short to carry one.
 [[nodiscard]] int64_t leaseRecordVersion(std::string_view value) noexcept;
+
+/// The row id's `lastAppended` (kLeaseAuxBytes of aux; -1 when the table has none).
+[[nodiscard]] inline int64_t leaseLastAppended(const rune::view::ViewTable& t, uint32_t rid) noexcept {
+    if (t.auxBytesPerRow() < kLeaseAuxBytes) return -1;
+    int64_t v;
+    std::memcpy(&v, t.aux(rid), sizeof(v));
+    return v;
+}
+inline void setLeaseLastAppended(rune::view::ViewTable& t, uint32_t rid, int64_t v) noexcept {
+    if (t.auxBytesPerRow() < kLeaseAuxBytes) return;
+    std::memcpy(t.aux(rid), &v, sizeof(v));
+}
+
+/// The produce path's non-virtual window on a partition's lease index (WorkerViewSet::leaseIndexOf): the table (rows and the
+/// per-row `lastAppended`), its row layout and the descriptor the layout was built from.  Null `table` = no index.
+struct LeaseIndexRef {
+    rune::view::ViewTable*         table   = nullptr;
+    const rune::view::RowLayout*   layout  = nullptr;
+    const rune::codec::Descriptor* outDesc = nullptr;
+};
+
+/// The exact inverse of projectLeaseRow: writes a lease record value for `writer` (version `writerVersion`) from a row image:
+/// [u16 blockLength][u16 version], then the writer's fixed block, each field copied from the row slot with the same field id
+/// (system columns included).  A field whose slot is null is written as zeros (what projectLeaseRow reads back as a present
+/// zero; the record format has no null).  Returns the bytes written; 0 when `cap` is too small or a writer field has no slot in
+/// the layout (cannot happen after a layout bump).  No allocation.
+[[nodiscard]] std::size_t encodeLeaseValue(const uint8_t* row, const rune::view::RowLayout& layout, const rune::codec::Descriptor& outDesc,
+                                           const rune::codec::Descriptor& writer, uint16_t writerVersion, uint8_t* out, std::size_t cap) noexcept;
 
 /// What the fold needs of the lease index: its table and layout, the descriptor the layout was built from and the wire
 /// key width.

@@ -9,6 +9,9 @@
 #include <rune/protocol/LeaseRecord.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/InMemoryLog.h>
+#include <rune/view/ViewTable.h>
+
+#include <memory>
 
 #include <cstdint>
 #include <cstring>
@@ -57,8 +60,8 @@ inline LRec grantOf(uint64_t id, uint64_t ttl = 5000) { return {id, kGrantA, lea
 inline LRec updateOf(uint64_t id, int64_t ver, uint64_t ttl = 5000) { return {id, kUpdateA, leaseValue(id, ver, ttl)}; }
 inline LRec revokeOf(uint64_t id, int64_t ver, uint64_t ttl = 5000) { return {id, kRevokeA, leaseValue(id, ver, ttl)}; }
 
-inline std::vector<uint8_t> batchOf(const std::vector<LRec>& recs) {
-    rune::protocol::RecordBatchBuilder b(0, 1'000'000);
+inline std::vector<uint8_t> batchOf(const std::vector<LRec>& recs, int64_t headerBase = 0) {
+    rune::protocol::RecordBatchBuilder b(headerBase, 1'000'000);
     for (const LRec& r : recs)
         b.append(keyOf(r.id), {reinterpret_cast<const char*>(r.value.data()), r.value.size()}, 1'000'000, r.attrs);
     return b.build();
@@ -76,13 +79,31 @@ struct Outcome {
     ErrorCode            code = ErrorCode::OK;
     HookRefusal          why  = HookRefusal::None;
     int64_t              base = -1;
+    int64_t              retryAfterNs = 0;
     const uint8_t*       staged = nullptr;   ///< the bytes handed to the append (the input itself when not patched)
     std::size_t          stagedLen = 0;
     std::vector<uint8_t> copy;               ///< a copy of the staged bytes (the scratch is reused by the next write)
 };
 
+/// A lease index for the hook (table with the lastAppended aux, the row layout and its descriptor).
+struct IndexBox {
+    rune::codec::Descriptor  desc;
+    rune::view::RowLayout    layout;
+    rune::view::ViewTable    table;
+    explicit IndexBox(rune::codec::Descriptor d)
+        : desc(std::move(d)), layout(leaseIndexRowLayout(desc)), table(layout, 4096, 64u << 10, keys()) {}
+    static rune::view::ViewTableKeys keys() {
+        rune::view::ViewTableKeys k;
+        k.keyWidth = 8;
+        k.auxBytesPerRow = kLeaseAuxBytes;
+        return k;
+    }
+};
+
 struct Rig {
     TopicWriteSpec       spec;
+    std::unique_ptr<LeaseHookWork> work = std::make_unique<LeaseHookWork>();
+    std::unique_ptr<IndexBox>      index;
     PartitionWriteState  state;
     WriteFacts           facts;
     std::vector<uint8_t> scratch = std::vector<uint8_t>(1 << 20);
@@ -106,6 +127,42 @@ struct Rig {
         facts.levelCheckedWrites = true;
         facts.clientVersion      = rune::protocol::client::kClientVersionLeases;
         facts.levelLeases        = true;
+        facts.leaseWork          = work.get();
+    }
+
+    /// Installs schema version 2 (v1 plus `port uint32`).
+    void installV2() {
+        rune::codec::DescriptorBuilder d("inst", 2);
+        d.add("lease_version", rune::codec::PrimType::Int64).add("lease_ttl_ms", rune::codec::PrimType::UInt64)
+            .add("lease_holder", rune::codec::PrimType::UInt64).add("lease_remaining_ms", rune::codec::PrimType::UInt64)
+            .add("id", rune::codec::PrimType::UInt64, 1, true).addFixedStr("addr", 16).add("port", rune::codec::PrimType::UInt32, 2);
+        spec.installVersion(2, d.build());
+    }
+    /// Builds the lease index from the installed versions and points the hook's facts at it (ready).
+    void withIndex() {
+        index = std::make_unique<IndexBox>(*spec.leaseLayoutSource());
+        facts.leaseIndex = LeaseIndexRef{&index->table, &index->layout, &index->desc};
+        facts.leaseIndexReady = true;
+    }
+    /// A row for `id`: version `ver`, ttl, remaining, and the user columns by field id (slot 5 addr, slot 6 port when present).
+    uint32_t addRow(uint64_t id, int64_t ver, uint64_t ttl = 5000, uint64_t remaining = 0, const std::string& addr = "", uint32_t port = 0) {
+        const auto key = rune::view::ViewKey::fromU64(id);
+        uint8_t* row = index->table.put(key);
+        const auto& l = index->layout;
+        const auto setU64 = [&](uint16_t slot, uint64_t v) { std::memcpy(row + l.slotOffset[slot], &v, 8); rune::view::clearNull(row, l, slot); };
+        setU64(0, uint64_t(ver)); setU64(1, ttl); setU64(2, 7); setU64(3, remaining); setU64(4, id);
+        std::memset(row + l.slotOffset[5], 0, 16);
+        std::memcpy(row + l.slotOffset[5], addr.data(), std::min<std::size_t>(addr.size(), 16));
+        rune::view::clearNull(row, l, 5);
+        if (l.slotType.size() > 8) { std::memcpy(row + l.slotOffset[6], &port, 4); rune::view::clearNull(row, l, 6); }
+        uint32_t rid = 0;
+        (void)index->table.ridOf(key, rid);
+        setLeaseLastAppended(index->table, rid, -1);
+        return rid;
+    }
+    int64_t lastAppendedOf(uint64_t id) const {
+        uint32_t rid = 0;
+        return index->table.ridOf(rune::view::ViewKey::fromU64(id), rid) ? leaseLastAppended(index->table, rid) : -2;
     }
     static TopicWriteSpecWire wire(const rune::protocol::LeaseSpec& ls) {
         TopicWriteSpecWire w;
@@ -138,16 +195,18 @@ struct Rig {
         Outcome o;
         o.code = hook.check(batch.data(), batch.size(), count < 0 ? countOf(batch) : count);
         o.why  = hook.refusal();
+        o.retryAfterNs = hook.retryAfterNs();
         return o;
     }
 
-    /// check, stage and append (what handleProduceBatch does).
-    Outcome write(const std::vector<uint8_t>& batch, bool keepCopy = true) {
+    /// check, stage and (when `append`) append (what handleProduceBatch does).  `append` false = the append fails: onAppended never runs.
+    Outcome write(const std::vector<uint8_t>& batch, bool keepCopy = true, bool append = true) {
         CheckedWriteHook hook(state, facts, scratch);
         const int32_t n = countOf(batch);
         Outcome o;
         o.code = hook.check(batch.data(), batch.size(), n);
         o.why  = hook.refusal();
+        o.retryAfterNs = hook.retryAfterNs();
         if (o.code != ErrorCode::OK) return o;
         const auto staged = hook.stage(tlog, batch.data(), batch.size());
         o.code = staged.error;
@@ -155,6 +214,7 @@ struct Rig {
         o.staged = staged.batch;
         o.stagedLen = staged.len;
         if (keepCopy) o.copy.assign(staged.batch, staged.batch + staged.len);
+        if (!append) { o.code = ErrorCode::TransientLogFull; return o; }
         if (tlog.appendNoSyncRestamp(staged.batch, staged.len, n - 1, o.base) < 0) { o.code = ErrorCode::TransientLogFull; return o; }
         hook.onAppended(o.base, o.base + n - 1);
         return o;

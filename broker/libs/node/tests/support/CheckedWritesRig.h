@@ -787,6 +787,7 @@ public:
         std::vector<std::tuple<uint16_t, uint16_t, uint32_t>> verdicts;
         std::size_t frameLen = 0;
         int64_t step = 0;
+        int64_t retryAfter = -1;   ///< a Throttled answer's retry-after (ns), from the response's logStartOffset field
     };
     static constexpr int32_t kIngressStream = 7601, kAckStream = 7602;
     static constexpr int64_t kAckSession = 5;
@@ -1143,7 +1144,7 @@ private:
             const auto r = rune::protocol::client::ProduceResponse::decode(wire, wireLen);
             if (!r) return;
             Ack a;
-            a.code = r->errorCode; a.baseOffset = r->baseOffset; a.assignedBase = r->assignedBase; a.hasVerdicts = r->hasVerdicts; a.frameLen = static_cast<std::size_t>(l) - (ackEncrypted_ ? rune::protocol::client::kCryptoOverhead : 0); a.step = passNo_;
+            a.code = r->errorCode; a.baseOffset = r->baseOffset; a.assignedBase = r->assignedBase; a.hasVerdicts = r->hasVerdicts; a.frameLen = static_cast<std::size_t>(l) - (ackEncrypted_ ? rune::protocol::client::kCryptoOverhead : 0); a.step = passNo_; a.retryAfter = r->logStartOffset;
             r->forEachVerdict([&](uint16_t i, uint16_t code, uint32_t cid) { a.verdicts.emplace_back(i, code, cid); });
             if (acksSeen_.emplace(r->correlationId, std::move(a)).second) ackOrder_.push_back(r->correlationId);
         }).handler(), 64);

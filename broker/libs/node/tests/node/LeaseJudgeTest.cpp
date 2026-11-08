@@ -1,7 +1,9 @@
 // Lease topics Task 6: the lease index as a verdict member (unit level: no worker, no replica).
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstring>
+#include <random>
 #include <memory>
 #include <string>
 #include <vector>
@@ -219,19 +221,19 @@ TEST(LeaseJudgeTableRegression, JudgeLeaseTableRegression) {
     constexpr uint64_t kTtl = 100;
     for (const Row& r : rows) {
         SCOPED_TRACE(r.name);
-        EXPECT_EQ(judgeLease({false, 0, 0}, r.attrs, 7, kTtl, 0, 0, 10), r.absent);
-        EXPECT_EQ(judgeLease({true, 7, kTtl}, r.attrs, 7, kTtl, 0, 1, 10), r.equal);
-        EXPECT_EQ(judgeLease({true, 7, kTtl}, r.attrs, 8, kTtl, 0, 1, 10), r.different);
+        EXPECT_EQ(judgeLease({false, 0, 0}, r.attrs, 7, 0, 0, 10), r.absent);
+        EXPECT_EQ(judgeLease({true, 7, kTtl}, r.attrs, 7, 0, 1, 10), r.equal);
+        EXPECT_EQ(judgeLease({true, 7, kTtl}, r.attrs, 8, 0, 1, 10), r.different);
     }
     // max_keys: the grant is judged against the live count; every other record ignores it.
     const uint8_t g = at(rec::LeaseOp::Put, 1);
-    EXPECT_EQ(judgeLease({false, 0, 0}, g, 0, kTtl, 0, 9, 10), 0);
-    EXPECT_EQ(judgeLease({false, 0, 0}, g, 0, kTtl, 0, 10, 10), kLimit);
-    EXPECT_EQ(judgeLease({false, 0, 0}, g, 0, kTtl, 0, 11, 10), kLimit);
-    EXPECT_EQ(judgeLease({false, 0, 0}, g, 0, kTtl, 0, 0, 0), kLimit);
-    EXPECT_EQ(judgeLease({true, 7, kTtl}, g, 7, kTtl, 0, 10, 10), kKeyExists);   // an existing key is KeyExists before it is a limit
-    EXPECT_EQ(judgeLease({true, 7, kTtl}, at(rec::LeaseOp::Put, 2), 7, kTtl, 0, 10, 10), 0);
-    EXPECT_EQ(judgeLease({true, 7, kTtl}, at(rec::LeaseOp::Expire, 0), 7, kTtl, 0, 10, 10), 0);
+    EXPECT_EQ(judgeLease({false, 0, 0}, g, 0, 0, 9, 10), 0);
+    EXPECT_EQ(judgeLease({false, 0, 0}, g, 0, 0, 10, 10), kLimit);
+    EXPECT_EQ(judgeLease({false, 0, 0}, g, 0, 0, 11, 10), kLimit);
+    EXPECT_EQ(judgeLease({false, 0, 0}, g, 0, 0, 0, 0), kLimit);
+    EXPECT_EQ(judgeLease({true, 7, kTtl}, g, 7, 0, 10, 10), kKeyExists);   // an existing key is KeyExists before it is a limit
+    EXPECT_EQ(judgeLease({true, 7, kTtl}, at(rec::LeaseOp::Put, 2), 7, 0, 10, 10), 0);
+    EXPECT_EQ(judgeLease({true, 7, kTtl}, at(rec::LeaseOp::Expire, 0), 7, 0, 10, 10), 0);
 }
 
 // A grant with remaining != 0 is refused; an update or revoke's TTL and remaining are not checked (spec 6.4).  Not-found / version answers keep precedence.
@@ -241,28 +243,28 @@ TEST(LeaseJudgeTableRegression, JudgeLeaseExactTtlAndRemainingRegression) {
     const LeaseRowState row{true, 7, 100};
     const LeaseRowState none{false, 0, 0};
     // A Put with remaining != 0 is refused, whatever the intent.
-    EXPECT_EQ(judgeLease(none, grantA, 0, 100, 1, 0, 10), kInvalid);
+    EXPECT_EQ(judgeLease(none, grantA, 0, 1, 0, 10), kInvalid);
     // Spec 6.4: an update or revoke's TTL and remaining are NOT checked (the write hook refuses a client remaining != 0; the
     // judge keeps the row's TTL and remaining), so every one of these is accepted.
-    EXPECT_EQ(judgeLease(row, updateA, 7, 100, 1, 1, 10), 0);
-    EXPECT_EQ(judgeLease(row, revokeA, 7, 100, 1, 1, 10), 0);
-    EXPECT_EQ(judgeLease(row, updateA, 7, 99, 0, 1, 10), 0);
-    EXPECT_EQ(judgeLease(row, updateA, 7, 0, 0, 1, 10), 0);
-    EXPECT_EQ(judgeLease(row, updateA, 7, 100, 0, 1, 10), 0);
-    EXPECT_EQ(judgeLease(row, revokeA, 7, 99, 0, 1, 10), 0);
-    EXPECT_EQ(judgeLease(row, revokeA, 7, 100, 0, 1, 10), 0);
+    EXPECT_EQ(judgeLease(row, updateA, 7, 1, 1, 10), 0);
+    EXPECT_EQ(judgeLease(row, revokeA, 7, 1, 1, 10), 0);
+    EXPECT_EQ(judgeLease(row, updateA, 7, 0, 1, 10), 0);
+    EXPECT_EQ(judgeLease(row, updateA, 7, 0, 1, 10), 0);
+    EXPECT_EQ(judgeLease(row, updateA, 7, 0, 1, 10), 0);
+    EXPECT_EQ(judgeLease(row, revokeA, 7, 0, 1, 10), 0);
+    EXPECT_EQ(judgeLease(row, revokeA, 7, 0, 1, 10), 0);
     // Precedence: the not-found / version answers come first, then KeyExists / the limit.
-    EXPECT_EQ(judgeLease(none, updateA, 7, 99, 1, 0, 10), kNotFound);
-    EXPECT_EQ(judgeLease(row, updateA, 8, 99, 1, 1, 10), kNotFound);
-    EXPECT_EQ(judgeLease(none, revokeA, 7, 99, 1, 0, 10), kNotFound);
-    EXPECT_EQ(judgeLease(row, revokeA, 8, 99, 1, 1, 10), kNotFound);
-    EXPECT_EQ(judgeLease(row, grantA, 0, 100, 1, 1, 10), kKeyExists);
-    EXPECT_EQ(judgeLease(none, grantA, 0, 100, 1, 10, 10), kLimit);
+    EXPECT_EQ(judgeLease(none, updateA, 7, 1, 0, 10), kNotFound);
+    EXPECT_EQ(judgeLease(row, updateA, 8, 1, 1, 10), kNotFound);
+    EXPECT_EQ(judgeLease(none, revokeA, 7, 1, 0, 10), kNotFound);
+    EXPECT_EQ(judgeLease(row, revokeA, 8, 1, 1, 10), kNotFound);
+    EXPECT_EQ(judgeLease(row, grantA, 0, 1, 1, 10), kKeyExists);
+    EXPECT_EQ(judgeLease(none, grantA, 0, 1, 10, 10), kLimit);
     // A grant takes its TTL as written (any value); broker records are not checked for either column.
-    EXPECT_EQ(judgeLease(none, grantA, 0, 0, 0, 0, 10), 0);
-    EXPECT_EQ(judgeLease(none, grantA, 0, 123456, 0, 0, 10), 0);
-    EXPECT_EQ(judgeLease(row, at(rec::LeaseOp::Expire, 0), 7, 5, 9, 1, 10), 0);
-    EXPECT_EQ(judgeLease(row, at(rec::LeaseOp::Checkpoint, 0), 7, 5, 9, 1, 10), 0);
+    EXPECT_EQ(judgeLease(none, grantA, 0, 0, 0, 10), 0);
+    EXPECT_EQ(judgeLease(none, grantA, 0, 0, 0, 10), 0);
+    EXPECT_EQ(judgeLease(row, at(rec::LeaseOp::Expire, 0), 7, 9, 1, 10), 0);
+    EXPECT_EQ(judgeLease(row, at(rec::LeaseOp::Checkpoint, 0), 7, 9, 1, 10), 0);
 }
 
 // ═══ Through the real VerdictSource ═══
@@ -1000,4 +1002,53 @@ TEST(LeaseJudgeTableRegression, LeaseCoverCacheAndCheckpointImageRegression) {
     ASSERT_TRUE(applyLeaseRecord(fm, put, prospect, ev1));
     ASSERT_EQ(prepareLeaseIndex(f, cp, prospect), rune::view::PrepareStatus::Ok);
     EXPECT_EQ(prospect.rows[0].image, nullptr) << "present row: no image is projected on the live path";
+}
+
+// ═══ encodeLeaseValue: the exact inverse of projectLeaseRow (lease topics Task 5b) ═══
+
+TEST(LeaseEncodeRoundTripRegression, EncodeRoundTripRegression) {
+    // evolving: system 0..3, id (key), addr (live v1-v2, dropped at v3), port (since v2), flags (v1+), note (since v3)
+    rune::codec::DescriptorBuilder b("inst", 3);
+    b.add("lease_version", P::Int64).add("lease_ttl_ms", P::UInt64).add("lease_holder", P::UInt64).add("lease_remaining_ms", P::UInt64)
+        .add("id", P::UInt64, 1, /*isKey=*/true)
+        .addFixedStrTagged("addr", 5, 16, 1, 3, false)
+        .addTagged("port", 6, P::UInt32, 2, 0xFFFF, false, {})
+        .addTagged("flags", 7, P::UInt16, 1, 0xFFFF, false, {})
+        .addFixedStrTagged("note", 8, 5, 3, 0xFFFF, false);
+    const rune::codec::Descriptor ev = b.build();
+    const rune::view::RowLayout layout = leaseIndexRowLayout(ev);
+    const uint16_t n = static_cast<uint16_t>(layout.slotType.size() - kLeaseOffsetSlots);
+    ASSERT_EQ(n, ev.fields.size());
+    std::mt19937_64 rng(0xC0FFEE);
+    std::vector<uint8_t> row(layout.rowLen), value(70000), back(layout.rowLen);
+    for (int iter = 0; iter < 500; ++iter) {
+        for (uint8_t& x : row) x = uint8_t(rng());   // garbage everywhere, including the bytes of null slots
+        for (uint16_t s = 0; s < layout.slotType.size(); ++s) rune::view::clearNull(row.data(), layout, s);
+        for (uint16_t s = rune::node::kLeaseSystemSlots; s < n; ++s)
+            if (rng() % 3 == 0) rune::view::setNull(row.data(), layout, s);
+        for (uint16_t v = 1; v <= 3; ++v) {
+            SCOPED_TRACE("iter " + std::to_string(iter) + " writer v" + std::to_string(v));
+            const rune::codec::Descriptor w = rune::codec::materializeAsOf(ev, v);
+            const std::size_t m = encodeLeaseValue(row.data(), layout, ev, w, v, value.data(), value.size());
+            ASSERT_EQ(m, 4u + w.blockLength);
+            EXPECT_EQ(value[2] | (value[3] << 8), v);
+            EXPECT_EQ(value[0] | (value[1] << 8), w.blockLength);
+            ASSERT_EQ(rune::node::projectLeaseRow(back.data(), layout, ev, w, std::string_view(reinterpret_cast<const char*>(value.data()), m)),
+                      rune::view::PrepareStatus::Ok);
+            for (uint16_t s = 0; s < n; ++s) {
+                const bool covered = std::any_of(w.fields.begin(), w.fields.end(), [&](const auto& f) { return f.id == ev.fields[s].id; });
+                if (!covered) {
+                    EXPECT_TRUE(rune::view::isNull(back.data(), layout, s)) << "slot " << s << " is not in the writer";
+                } else if (rune::view::isNull(row.data(), layout, s)) {
+                    EXPECT_FALSE(rune::view::isNull(back.data(), layout, s)) << "slot " << s;
+                    for (uint32_t k = 0; k < layout.slotWidth[s]; ++k) ASSERT_EQ(back[layout.slotOffset[s] + k], 0) << "a null slot encodes as zeros, slot " << s;
+                } else {
+                    EXPECT_FALSE(rune::view::isNull(back.data(), layout, s));
+                    ASSERT_EQ(std::memcmp(back.data() + layout.slotOffset[s], row.data() + layout.slotOffset[s], layout.slotWidth[s]), 0) << "slot " << s;
+                }
+            }
+            // too small a capacity writes nothing and answers 0
+            EXPECT_EQ(encodeLeaseValue(row.data(), layout, ev, w, v, value.data(), m - 1), 0u);
+        }
+    }
 }

@@ -151,3 +151,68 @@ TEST(CheckedWritesRecordSpanRegression, RebuildKeepsAttributesVerbatimRegression
     RecordBatchReader r(out.data(), out.size());
     EXPECT_TRUE(r.ensureValid());
 }
+
+// ── rebuildBatchReplacingValues (lease topics Task 5b) ──
+
+namespace {
+std::vector<std::string> valuesOf(const std::vector<uint8_t>& b, std::size_t n) {
+    RecordBatchReader r(b.data(), n);
+    std::vector<std::string> v;
+    r.forEachRecord([&](std::string_view, std::string_view val, int64_t, int64_t) { v.emplace_back(val); });
+    return v;
+}
+std::vector<uint8_t> rebuildWith(const std::vector<uint8_t>& src, const std::vector<std::string>& repl, std::size_t outSize, std::size_t* n) {
+    const auto s = spans(src);
+    std::vector<uint8_t> out(outSize);
+    *n = rebuildBatchReplacingValues(src, s, [&](std::size_t i) { return std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(repl[i].data()), repl[i].size()); }, out);
+    return out;
+}
+}  // namespace
+
+TEST(BatchRebuildRegression, ReplaceValuesNoneOneAllLongerShorterRegression) {
+    const auto src = batch5(100);
+    const std::string longV(300, 'L');   // the value-length and record-length varints grow
+    const struct { const char* name; std::vector<std::string> repl; std::vector<std::string> want; } cases[] = {
+        {"none", {"", "", "", "", ""}, {"v0", "v1", "v2", "v3", "v4"}},
+        {"one longer", {"", "", longV, "", ""}, {"v0", "v1", longV, "v3", "v4"}},
+        {"one shorter", {"", "x", "", "", ""}, {"v0", "x", "v2", "v3", "v4"}},
+        {"all", {"A", longV, "CC", longV, "E"}, {"A", longV, "CC", longV, "E"}},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        std::size_t n = 0;
+        const auto out = rebuildWith(src, c.repl, src.size() + 2000, &n);
+        ASSERT_GT(n, 0u);
+        RecordBatchReader r(out.data(), n);
+        ASSERT_TRUE(r.ensureValid()) << "CRC valid";
+        EXPECT_EQ(r.totalLength(), static_cast<int32_t>(n));
+        EXPECT_EQ(r.recordCount(), 5);
+        EXPECT_EQ(r.baseOffset(), 100);
+        EXPECT_EQ(r.lastOffsetDelta(), 4);
+        EXPECT_EQ(valuesOf(out, n), c.want);
+        std::vector<int64_t> offs;
+        std::vector<std::string> keys;
+        r.forEachRecord([&](std::string_view k, std::string_view, int64_t o, int64_t) { offs.push_back(o); keys.emplace_back(k); });
+        EXPECT_EQ(offs, (std::vector<int64_t>{100, 101, 102, 103, 104}));
+        EXPECT_EQ(keys, (std::vector<std::string>{"k0", "k1", "k2", "k3", "k4"}));
+        if (std::string(c.name) == "none") EXPECT_EQ(std::vector<uint8_t>(out.begin(), out.begin() + n), src) << "nothing replaced: the same bytes";
+    }
+}
+
+TEST(BatchRebuildRegression, ReplaceValuesRefusesShortOutputRegression) {
+    const auto src = batch5(0);
+    std::size_t n = 0;
+    (void)rebuildWith(src, {"", "", std::string(300, 'L'), "", ""}, src.size(), &n);
+    EXPECT_EQ(n, 0u) << "the longer value does not fit";
+    (void)rebuildWith(src, {"", "", "", "", ""}, 10, &n);
+    EXPECT_EQ(n, 0u);
+}
+
+TEST(BatchRebuildRegression, SpanOffsetDoesNotOverflowRegression) {
+    RecordBatchBuilder b(INT64_MAX - 1, 1'000'000);
+    for (int i = 0; i < 4; ++i) b.append("k", "v", 1'000'000);
+    const auto bytes = b.build();
+    std::vector<int64_t> deltas;
+    ASSERT_TRUE(forEachRecordSpan(bytes.data(), bytes.size(), [&](const RecordSpan& r) { deltas.push_back(r.offsetDelta); }));
+    EXPECT_EQ(deltas, (std::vector<int64_t>{0, 1, 2, 3}));
+}

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cassert>
 #include <cstring>
 
 namespace rune::node {
@@ -97,7 +98,31 @@ PrepareStatus projectLeaseRow(uint8_t* row, const rune::view::RowLayout& layout,
     return PrepareStatus::Ok;
 }
 
-uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion, uint64_t recordTtlMs, uint64_t recordRemainingMs,
+std::size_t encodeLeaseValue(const uint8_t* row, const rune::view::RowLayout& layout, const rune::codec::Descriptor& outDesc,
+                             const rune::codec::Descriptor& writer, uint16_t writerVersion, uint8_t* out, std::size_t cap) noexcept {
+    const std::size_t total = 4u + writer.blockLength;
+    if (total > cap || outDesc.fields.size() < userSlots(layout)) return 0;
+    std::memset(out, 0, total);
+    out[0] = static_cast<uint8_t>(writer.blockLength);
+    out[1] = static_cast<uint8_t>(writer.blockLength >> 8);
+    out[2] = static_cast<uint8_t>(writerVersion);
+    out[3] = static_cast<uint8_t>(writerVersion >> 8);
+    const uint16_t n = userSlots(layout);
+    for (const auto& w : writer.fields) {
+        uint16_t slot = n;
+        for (uint16_t i = 0; i < n; ++i)
+            if (outDesc.fields[i].id == w.id) { slot = i; break; }
+        assert(slot != n && "a writer field without a layout slot");
+        if (slot == n) return 0;
+        const uint32_t width = rune::codec::fieldWidth(w);
+        if (layout.slotWidth[slot] != width || 4u + w.offset + width > total) return 0;
+        if (rune::view::isNull(row, layout, slot)) continue;   // zeros: the record format has no null
+        std::memcpy(out + 4 + w.offset, row + layout.slotOffset[slot], width);
+    }
+    return total;
+}
+
+uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion, uint64_t recordRemainingMs,
                     uint64_t liveCount, uint32_t maxKeys) noexcept {
     using rune::protocol::client::ErrorCode;
     constexpr auto kInvalid = static_cast<uint16_t>(ErrorCode::InvalidRequest);
@@ -129,11 +154,6 @@ uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion
         break;
     }
     return kInvalid;
-}
-
-uint64_t leaseRecordTtl(std::string_view value) noexcept {
-    if (value.size() < lr::kLeaseTtlValueOffset + 8) return 0;
-    return loadU64(reinterpret_cast<const uint8_t*>(value.data()) + lr::kLeaseTtlValueOffset);
 }
 
 uint64_t leaseRecordRemaining(std::string_view value) noexcept {
@@ -217,6 +237,7 @@ bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& r, cons
             setSlotU64(row, l, grantedSlot, static_cast<uint64_t>(r.offset));
             setSlotU64(row, l, updatedSlot, static_cast<uint64_t>(r.offset));
             if (!f.table.ridOf(key, rid)) return false;
+            setLeaseLastAppended(f.table, rid, -1);   // a fresh row (a reused row id keeps its old aux bytes)
             ev.kind = LeaseEventKind::Granted;
             ev.rid = rid;
             ev.version = r.offset;
@@ -232,6 +253,7 @@ bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& r, cons
             setSlotU64(created, l, grantedSlot, slotU64(created, l, kLeaseVersionSlot));
             setSlotU64(created, l, updatedSlot, static_cast<uint64_t>(r.offset));
             if (!f.table.ridOf(key, rid)) return false;
+            setLeaseLastAppended(f.table, rid, -1);
             ev.kind = LeaseEventKind::Updated;
             ev.rid = rid;
             ev.version = static_cast<int64_t>(slotU64(created, l, kLeaseVersionSlot));
@@ -283,6 +305,7 @@ bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& r, cons
         setSlotU64(row, l, kLeaseRemainingSlot, loadU64(reinterpret_cast<const uint8_t*>(r.value.data()) + lr::kLeaseRemainingValueOffset));
         setSlotU64(row, l, updatedSlot, static_cast<uint64_t>(r.offset));
         if (!f.table.ridOf(key, rid)) return false;
+        if (absent) setLeaseLastAppended(f.table, rid, -1);
         ev.kind = LeaseEventKind::Checkpointed;
         ev.rid = rid;
         ev.version = static_cast<int64_t>(slotU64(row, l, kLeaseVersionSlot));

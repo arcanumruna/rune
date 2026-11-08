@@ -54,12 +54,19 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
     const bool autoIncReady = autoInc && state_.autoInc.ready();
     pc::ErrorCode stopped = pc::ErrorCode::OK;
     leaseGrants_ = 0;
+    leaseUpdates_ = 0;
+    leaseRevokes_ = 0;
+    retryAfterNs_ = 0;
 
     // Lease topic (spec 6.4, in the spec's order; each refusal is definite and nothing is stored).  Namespace suspension
     // is refused before the produce core (refuseSuspended_), so there is no row for it here.
     const bool lease = topic.lease;
     if (lease) [[unlikely]] {
         const auto refuseLease = [&](HookRefusal why) { refusal_ = why; return pc::ErrorCode::InvalidRequest; };
+        if (facts_.clientVersion < 0) {   // the session's announce has not reached this worker yet: retriable, nothing stored
+            refusal_ = HookRefusal::LeaseSessionUnannounced;
+            return pc::ErrorCode::NotLeader;
+        }
         if (facts_.clientVersion < pc::kClientVersionLeases || !facts_.levelLeases) return refuseLease(HookRefusal::LeaseClientVersion);
         if (!pc::acksView(facts_.acks)) return refuseLease(HookRefusal::LeaseNeedsView);
         if (facts_.transactional) return refuseLease(HookRefusal::LeaseInTxn);   // explicit: the View bit is cleared for a transaction, but the rule must not depend on that
@@ -91,6 +98,10 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
             if (grant) {
                 if (loadLe64(r.value, rec::kLeaseTtlValueOffset) > topic.leaseSpec->maxTtlMs) return bad(pc::ErrorCode::LeaseTtlTooLarge, HookRefusal::LeaseTtlTooLarge);
                 ++intents.leaseGrants;
+            } else if (update) {
+                ++leaseUpdates_;
+            } else {
+                ++leaseRevokes_;
             }
         }
         switch (checkTypedRecord(spec, r, level)) {
@@ -129,6 +140,9 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
         refusal_ = HookRefusal::ValidationFailed;
         return pc::ErrorCode::SchemaValidationFailed;
     }
+    if (lease && leaseUpdates_ != 0 && leaseRevokes_ != 0) [[unlikely]] {
+        if (const pc::ErrorCode e = checkLeaseBatch_(batch, len, leaseUpdates_, 0); e != pc::ErrorCode::OK) return e;
+    }
     // Every grant is refused while the namespace's view memory is over its limit (the hook has no index lookup; a grant
     // of a live key would be KeyExists anyway).  The max-leases limit is Task 21.
     if (intents.leaseGrants > 0 && facts_.viewMemOver) [[unlikely]] {
@@ -151,7 +165,80 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
     const RequirementVerdict v = evaluateRequirements(intents, facts_, topic);
     refusal_ = v.why;
     if (v.code == pc::ErrorCode::OK) leaseGrants_ = intents.leaseGrants;
+    // The retriable lease answers come after every definite refusal: a revoke is re-encoded from the row, so the row must be
+    // current (L19).  Nothing is stored; the client retries after retryAfterNs().
+    if (lease && v.code == pc::ErrorCode::OK && leaseRevokes_ != 0) [[unlikely]] return checkLeaseBatch_(batch, len, 0, leaseRevokes_);
     return v.code;
+}
+
+pc::ErrorCode CheckedWriteHook::checkLeaseBatch_(const uint8_t* batch, std::size_t len, uint32_t updates, uint32_t revokes) noexcept {
+    LeaseHookWork* const work = facts_.leaseWork;
+    if (work == nullptr) [[unlikely]] {
+        refusal_ = HookRefusal::LeaseBadRecord;
+        return pc::ErrorCode::Internal;
+    }
+    constexpr auto kExisting = static_cast<uint8_t>(rec::Intent::Existing);
+    if (updates != 0) {
+        // A batch that updates a key and LATER revokes it is refused: the revoke is re-encoded from the row, which does not yet
+        // hold the update, so the stored revoke would carry the pre-update columns.  Revoke-then-update is accepted (the update
+        // then gets LeaseNotFound from the judge).  An open-addressing set of key hashes, cleared by a generation stamp.
+        using Slot = LeaseHookWork::Slot;
+        if (++work->gen == 0) { for (Slot& sl : work->set) sl.gen = 0; work->gen = 1; }
+        constexpr std::size_t mask = LeaseHookWork::kSetSlots - 1;
+        const auto hashOf = [](std::string_view k) noexcept {
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (const char c : k) h = (h ^ static_cast<uint8_t>(c)) * 0x100000001b3ull;
+            return h;
+        };
+        bool clash = false;
+        (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& r) {
+            if (clash || rec::intentOf(r.attributes) != kExisting) return;
+            const rec::LeaseOp op = rec::leaseOpOf(r.attributes);
+            const uint64_t h = hashOf(r.key);
+            std::size_t i = h & mask;
+            bool found = false;
+            while (work->set[i].gen == work->gen) {
+                const Slot& sl = work->set[i];
+                if (sl.hash == h && sl.keyLen == r.key.size() && std::memcmp(sl.key, r.key.data(), r.key.size()) == 0) { found = true; break; }
+                i = (i + 1) & mask;
+            }
+            if (op == rec::LeaseOp::Put) {
+                if (!found) work->set[i] = Slot{work->gen, static_cast<uint32_t>(r.key.size()), h, r.key.data()};
+            } else if (op == rec::LeaseOp::Revoke && found) {
+                clash = true;
+            }
+        });
+        if (clash) {
+            refusal_ = HookRefusal::LeaseUpdateThenRevoke;
+            return pc::ErrorCode::InvalidRequest;
+        }
+    }
+    if (revokes != 0) {
+        const LeaseIndexRef& ix = facts_.leaseIndex;
+        if (ix.table == nullptr || !facts_.leaseIndexReady) {
+            refusal_ = HookRefusal::LeaseRevokeIndexNotReady;
+            retryAfterNs_ = kLeaseRetryAfterNs;
+            return pc::ErrorCode::Throttled;
+        }
+        pc::ErrorCode result = pc::ErrorCode::OK;
+        (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& r) {
+            if (result != pc::ErrorCode::OK || rec::leaseOpOf(r.attributes) != rec::LeaseOp::Revoke) return;
+            const auto key = rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(r.key.data()), r.key.size()});
+            uint32_t rid = 0;
+            // An update or revoke of this key is appended but not yet applied to the row: the re-encode would miss it.
+            if (ix.table->ridOf(key, rid) && leaseLastAppended(*ix.table, rid) >= state_.judgedThrough) {
+                refusal_ = HookRefusal::LeaseRevokeBehindUpdate;
+                retryAfterNs_ = kLeaseRetryAfterNs;
+                result = pc::ErrorCode::Throttled;
+            }
+        });
+        return result;
+    }
+    return pc::ErrorCode::OK;
+}
+
+void CheckedWriteHook::logLeaseScratch_(std::size_t need, std::size_t cap) noexcept {
+    spdlog::error("CheckedWriteHook: lease batch of {} bytes does not fit the {} byte scratch", need, cap);
 }
 
 rune::storage::HookStaged CheckedWriteHook::patchKeyZeroIds_(const uint8_t* batch, std::size_t len) noexcept {
@@ -176,7 +263,11 @@ rune::storage::HookStaged CheckedWriteHook::patchKeyZeroIds_(const uint8_t* batc
     return {pc::ErrorCode::OK, out, len};
 }
 
-void CheckedWriteHook::onAppended(int64_t base, int64_t) noexcept {
+void CheckedWriteHook::onAppended(int64_t base, int64_t last) noexcept {
+    if (leaseTouched_ != 0) [[unlikely]] {   // lastAppended is written only once the append succeeded (R8: grants record nothing)
+        for (uint32_t i = 0; i < leaseTouched_; ++i) setLeaseLastAppended(*facts_.leaseIndex.table, facts_.leaseWork->rids[i], last);
+        leaseTouched_ = 0;
+    }
     if (keyZeroCount_ == 0) return;
     idsTaken_ = false;
     assignedBase_ = autoIncId(plan_.firstN, state_.autoInc.partitions(), state_.autoInc.partition());

@@ -1136,6 +1136,7 @@ static ViewInstance freshKeyIndex(int32_t srcTopicId, int32_t partition, const T
 // A lease topic's index: the same instance, over the lease row layout (one column per evolving field, plus the offsets).
 static ViewInstance freshLeaseIndex(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec, const rune::codec::Descriptor& src,
                                     rune::view::ViewTableKeys keys, int64_t replayCap) {
+    keys.auxBytesPerRow = kLeaseAuxBytes;   // lastAppended per row (the produce path's Throttled retry)
     ViewInstance inst(leaseIndexPlan(srcTopicId, spec.keyFieldId), leaseIndexRowLayout(src), src, /*persist=*/false,
                       partition, /*indexSlots=*/4096, kLeaseIndexChunkBytes, keys);
     inst.maxRecordsPerPass = replayCap;

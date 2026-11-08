@@ -50,6 +50,7 @@ std::vector<uint8_t> manyUpdates(int n) {
 
 TEST(LeaseWriteHookRegression, RefusalTableRegression) {
     const auto none = [](Rig&) {};
+    const auto withIdx = [](Rig& r) { r.withIndex(); };   // a revoke needs a ready lease index (else Throttled)
     const uint8_t kRevokeInsert = 1 | (uint8_t(rec::LeaseOp::Revoke) << rec::kAttrLeaseOpShift);
     const uint8_t kExpireC = uint8_t(rec::LeaseOp::Expire) << rec::kAttrLeaseOpShift;
     const uint8_t kCheckptC = uint8_t(rec::LeaseOp::Checkpoint) << rec::kAttrLeaseOpShift;
@@ -81,11 +82,11 @@ TEST(LeaseWriteHookRegression, RefusalTableRegression) {
         // accepted
         {"grant", none, [] { return one(grantOf(1)); }, OKC, H::None},
         {"update version 0", none, [] { return one(updateOf(1, 0)); }, OKC, H::None},
-        {"revoke version 0", none, [] { return one(revokeOf(1, 0)); }, OKC, H::None},
-        {"revoke Existing", none, [] { return one(revokeOf(1, 5)); }, OKC, H::None},
+        {"revoke version 0", withIdx, [] { return one(revokeOf(1, 0)); }, OKC, H::None},
+        {"revoke Existing", withIdx, [] { return one(revokeOf(1, 5)); }, OKC, H::None},
         {"2048 records", none, [] { return manyGrants(2048); }, OKC, H::None},
         {"update while viewMemOver", [](Rig& r) { r.facts.viewMemOver = true; }, [] { return one(updateOf(1, 5)); }, OKC, H::None},
-        {"revoke while viewMemOver", [](Rig& r) { r.facts.viewMemOver = true; }, [] { return one(revokeOf(1, 5)); }, OKC, H::None},
+        {"revoke while viewMemOver", [](Rig& r) { r.withIndex(); r.facts.viewMemOver = true; }, [] { return one(revokeOf(1, 5)); }, OKC, H::None},
         {"update ttl differs", none, [] { return one(updateOf(1, 5, 7)); }, OKC, H::None},
         {"grant ttl max", none, [] { return one(grantOf(1, maxTtl())); }, OKC, H::None},
         {"grant ttl 0 (raised, not refused)", none, [] { return one(grantOf(1, 0)); }, OKC, H::None},
@@ -195,6 +196,7 @@ TEST(LeaseWriteHookRegression, MixedBatchOnlyGrantsPatchedRegression) {
 TEST(LeaseWriteHookRegression, UpdatesOnlyZeroCopyRegression) {
     Rig r;
     r.preload(3);
+    r.withIndex();
     for (const auto& batch : {manyUpdates(1), manyUpdates(50), batchOf({updateOf(1, 4), revokeOf(2, 6)})}) {
         const Outcome o = r.write(batch, /*keepCopy=*/false);
         ASSERT_EQ(o.code, OKC);
@@ -221,5 +223,260 @@ TEST(LeaseWriteHookRegression, NonLeaseUnchangedRegression) {
         CheckedWriteHook hook(state, facts, {});
         EXPECT_EQ(hook.check(batch.data(), batch.size(), 1), IR) << int(bits);
         EXPECT_EQ(hook.refusal(), H::ReservedBits) << int(bits);
+    }
+}
+
+// ── Task 5b ──
+
+namespace {
+
+uint16_t schemaOf(const uint8_t* value) { return uint16_t(value[2] | (value[3] << 8)); }
+const uint8_t* valueOfSpan(const rune::protocol::RecordSpan& s) { return reinterpret_cast<const uint8_t*>(s.value.data()); }
+
+std::vector<rune::protocol::RecordSpan> spansOf(const std::vector<uint8_t>& b) {
+    std::vector<rune::protocol::RecordSpan> v;
+    (void)rune::protocol::forEachRecordSpan(b.data(), b.size(), [&](const rune::protocol::RecordSpan& s) { v.push_back(s); });
+    return v;
+}
+
+bool crcOk(const std::vector<uint8_t>& b) {
+    return getLe(b.data() + rune::protocol::batch::kCrcOffset, 4) ==
+           rune::protocol::crc32c(b.data() + rune::protocol::batch::kAttributesOffset, b.size() - rune::protocol::batch::kAttributesOffset);
+}
+
+// The expected re-encoded value of row `id` at the topic's latest version.
+std::vector<uint8_t> expectedRevokeValue(Rig& r, uint64_t id, uint16_t version) {
+    const uint8_t* row = r.index->table.get(rune::view::ViewKey::fromU64(id));
+    const auto* w = r.spec.descriptorFor(version);
+    std::vector<uint8_t> out(4 + w->blockLength);
+    const std::size_t n = encodeLeaseValue(row, r.index->layout, r.index->desc, *w, version, out.data(), out.size());
+    EXPECT_EQ(n, out.size());
+    return out;
+}
+
+}  // namespace
+
+TEST(LeaseWriteHookRegression, LeaseUnannouncedSessionRetriableRegression) {
+    struct Case { int32_t version; ErrorCode code; H why; };
+    const Case cases[] = {
+        {-1, ErrorCode::NotLeader, H::LeaseSessionUnannounced},
+        {0, IR, H::LeaseClientVersion},
+        {17, IR, H::LeaseClientVersion},
+        {18, OKC, H::None},
+        {19, OKC, H::None},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.version);
+        Rig r;
+        r.facts.clientVersion = c.version;
+        const Outcome o = r.write(one(grantOf(1)), false);
+        EXPECT_EQ(o.code, c.code);
+        EXPECT_EQ(o.why, c.why);
+        if (c.code != OKC) EXPECT_EQ(r.tlog.logEndOffset(), 0) << "nothing stored";
+    }
+}
+
+TEST(LeaseWriteHookRegression, VersionStampingNearInt64MaxBaseOffsetRegression) {
+    for (const int64_t hdrBase : {int64_t(INT64_MAX) - 1, int64_t(1000), int64_t(INT64_MIN)}) {
+        SCOPED_TRACE(hdrBase);
+        Rig r;
+        r.preload(7);
+        std::vector<LRec> recs;
+        for (int i = 0; i < 5; ++i) recs.push_back(grantOf(uint64_t(i + 1)));
+        const Outcome o = r.write(batchOf(recs, hdrBase));
+        ASSERT_EQ(o.code, OKC);
+        int seen = 0;
+        ASSERT_TRUE(rune::protocol::forEachRecordSpan(o.copy.data(), o.copy.size(), [&](const rune::protocol::RecordSpan& s) {
+            EXPECT_EQ(int64_t(getLe(valueOfSpan(s) + rec::kLeaseVersionValueOffset)), 7 + int64_t(s.index)) << "the offset the append assigns, whatever the client's base";
+            ++seen;
+        }));
+        EXPECT_EQ(seen, 5);
+    }
+}
+
+TEST(LeaseWriteHookRegression, RevokeReencodedFullRowRegression) {
+    Rig r;
+    r.installV2();
+    r.withIndex();
+    r.preload(3);
+    ASSERT_EQ(r.index->layout.slotType.size(), 9u);
+    r.addRow(1, /*ver=*/5, /*ttl=*/7000, /*remaining=*/300, "alpha", 5);
+    r.addRow(2, 6, 7000, 0, "beta", 6);
+    // a v1 revoke with the user columns zeroed, between a grant and an update
+    const auto in = batchOf({grantOf(9), revokeOf(1, 5), updateOf(2, 6)});
+    const Outcome o = r.write(in);
+    ASSERT_EQ(o.code, OKC);
+    ASSERT_NE(o.staged, in.data());
+    ASSERT_TRUE(crcOk(o.copy));
+    const auto sp = spansOf(o.copy);
+    ASSERT_EQ(sp.size(), 3u);
+    EXPECT_EQ(sp[1].attributes, kRevokeA) << "op bits and intent kept";
+    EXPECT_EQ(sp[1].key, keyOf(1));
+    EXPECT_EQ(schemaOf(valueOfSpan(sp[1])), 2) << "the stored revoke is at the latest installed version";
+    const auto want = expectedRevokeValue(r, 1, 2);
+    ASSERT_EQ(sp[1].value.size(), want.size());
+    EXPECT_EQ(std::memcmp(valueOfSpan(sp[1]), want.data(), want.size()), 0);
+    EXPECT_EQ(std::string(sp[1].value.substr(44, 5)), "alpha") << "the user columns come from the row, not from the client's zeros";
+    EXPECT_EQ(getLe(valueOfSpan(sp[1]) + 60, 4), 5u);
+    EXPECT_EQ(getLe(valueOfSpan(sp[1]) + 28, 8), 300u) << "remaining, from the row";
+    // the other records: the grant stamped, the update untouched
+    EXPECT_EQ(int64_t(getLe(valueOfSpan(sp[0]) + rec::kLeaseVersionValueOffset)), 3);
+    const auto insp = spansOf(in);
+    EXPECT_EQ(std::memcmp(in.data() + insp[2].pos, o.copy.data() + sp[2].pos, insp[2].len), 0);
+    // the stored log holds the same bytes
+    const auto view = r.tlog.log.readView(o.base, 1 << 22);
+    ASSERT_NE(view.data, nullptr);
+    EXPECT_EQ(std::memcmp(view.data + 8, o.copy.data() + 8, o.copy.size() - 8), 0) << "stored = staged (past the base offset)";
+}
+
+TEST(LeaseWriteHookRegression, RevokeNoRowUnchangedRegression) {
+    Rig r;
+    r.installV2();
+    r.withIndex();
+    r.state.judgedThrough = INT64_MAX;
+    r.addRow(1, 5);
+    // an absent key, and a live key with another version: the record is appended as it is (the judge answers LeaseNotFound)
+    for (const auto& in : {one(revokeOf(2, 5)), one(revokeOf(1, 6)), batchOf({revokeOf(2, 5), revokeOf(1, 4)})}) {
+        const Outcome o = r.write(in);
+        ASSERT_EQ(o.code, OKC);
+        EXPECT_EQ(o.staged, in.data()) << "nothing to re-encode: zero-copy";
+        EXPECT_EQ(o.copy, in);
+    }
+    // mixed: only the matching revoke changes
+    const auto in = batchOf({revokeOf(2, 5), revokeOf(1, 5)});
+    const Outcome o = r.write(in);
+    ASSERT_EQ(o.code, OKC);
+    const auto a = spansOf(in), b = spansOf(o.copy);
+    EXPECT_EQ(std::memcmp(in.data() + a[0].pos, o.copy.data() + b[0].pos, a[0].len), 0);
+    EXPECT_EQ(schemaOf(valueOfSpan(b[1])), 2);
+    // a topic without an index (null table): unchanged, no crash
+    Rig bare;
+    const auto in2 = one(revokeOf(1, 5));
+    bare.facts.leaseIndexReady = true;
+    const Outcome o2 = bare.write(in2, false);
+    EXPECT_EQ(o2.code, ErrorCode::Throttled) << "no index: a revoke waits";
+}
+
+TEST(LeaseWriteHookRegression, UpdateThenRevokeSameBatchRefusedRegression) {
+    Rig r;
+    r.installV2();
+    r.withIndex();
+    r.addRow(1, 5);
+    r.addRow(2, 6);
+    r.state.judgedThrough = INT64_MAX;   // every earlier append is applied: only the same-batch rule is under test
+    const int64_t end = r.tlog.logEndOffset();
+    const Outcome refused = r.write(batchOf({updateOf(1, 5), revokeOf(1, 5)}), false);
+    EXPECT_EQ(refused.code, IR);
+    EXPECT_EQ(refused.why, H::LeaseUpdateThenRevoke);
+    EXPECT_EQ(r.tlog.logEndOffset(), end) << "nothing stored";
+    const Outcome far = r.write(batchOf({updateOf(3, 5), grantOf(9), revokeOf(7, 5), updateOf(1, 5), revokeOf(1, 5)}), false);   // refused even when far apart
+    EXPECT_EQ(far.why, H::LeaseUpdateThenRevoke);
+    EXPECT_EQ(r.write(batchOf({updateOf(1, 5), revokeOf(2, 6)}), false).code, OKC) << "different keys";
+    EXPECT_EQ(r.write(batchOf({revokeOf(1, 5), updateOf(1, 5)}), false).code, OKC) << "revoke then update: the judge answers the update 62";
+    EXPECT_EQ(r.write(batchOf({updateOf(1, 5), updateOf(1, 5)}), false).code, OKC);
+    EXPECT_EQ(r.write(batchOf({revokeOf(1, 5), revokeOf(1, 5)}), false).code, OKC);
+    // many updates (hash clustering), one revoke of the last: still found
+    std::vector<LRec> recs;
+    for (int i = 0; i < 1500; ++i) recs.push_back(updateOf(uint64_t(i + 100), 5));
+    recs.push_back(revokeOf(1599, 5));
+    EXPECT_EQ(r.write(batchOf(recs), false).why, H::LeaseUpdateThenRevoke);
+    recs.back() = revokeOf(1600, 5);
+    EXPECT_EQ(r.write(batchOf(recs), false).code, OKC);
+}
+
+TEST(LeaseWriteHookRegression, LastAppendedRegression) {
+    Rig r;
+    r.installV2();
+    r.withIndex();
+    r.preload(4);
+    r.addRow(1, 5);
+    r.addRow(2, 6);
+    r.addRow(3, 7);
+    for (uint64_t id = 1; id <= 3; ++id) ASSERT_EQ(r.lastAppendedOf(id), -1);
+    // updates k1, revokes k2, grants k4 (no row): lastAppended of k1 and k2 = the batch's last offset; k3 untouched
+    const auto in = batchOf({updateOf(1, 5), revokeOf(2, 6), grantOf(4)});
+    const Outcome o = r.write(in, false);
+    ASSERT_EQ(o.code, OKC);
+    EXPECT_EQ(r.lastAppendedOf(1), o.base + 2);
+    EXPECT_EQ(r.lastAppendedOf(2), o.base + 2);
+    EXPECT_EQ(r.lastAppendedOf(3), -1);
+    // a refused batch changes nothing
+    const Outcome bad = r.write(batchOf({updateOf(3, 7), updateOf(3, -1)}), false);
+    ASSERT_NE(bad.code, OKC);
+    EXPECT_EQ(r.lastAppendedOf(3), -1);
+    // a batch whose append fails (stage ran, onAppended did not) changes nothing
+    const Outcome failed = r.write(batchOf({updateOf(3, 7)}), false, /*append=*/false);
+    EXPECT_EQ(failed.code, ErrorCode::TransientLogFull);
+    EXPECT_EQ(r.lastAppendedOf(3), -1) << "written only after a successful append";
+    // grants record nothing; a key without a row gets nothing
+    const Outcome g = r.write(batchOf({grantOf(5), updateOf(99, 1)}), false);
+    ASSERT_EQ(g.code, OKC);
+    EXPECT_EQ(r.lastAppendedOf(99), -2);
+    EXPECT_EQ(r.lastAppendedOf(3), -1);
+}
+
+TEST(LeaseWriteHookRegression, RevokeBehindUpdateThrottledRegression) {
+    Rig r;
+    r.installV2();
+    r.withIndex();
+    r.preload(4);
+    r.addRow(1, 5);
+    r.state.judgedThrough = 4;
+    const Outcome upd = r.write(one(updateOf(1, 5)), false);
+    ASSERT_EQ(upd.code, OKC);   // appended at offset 4; the judge has not run
+    ASSERT_EQ(r.lastAppendedOf(1), 4);
+    const Outcome behind = r.write(one(revokeOf(1, 5)), false);
+    EXPECT_EQ(behind.code, ErrorCode::Throttled);
+    EXPECT_EQ(behind.why, H::LeaseRevokeBehindUpdate);
+    EXPECT_EQ(behind.retryAfterNs, 1'000'000);
+    EXPECT_EQ(r.tlog.logEndOffset(), 5) << "nothing stored";
+    r.state.judgedThrough = 5;   // the judge applied it
+    const Outcome ok = r.write(one(revokeOf(1, 5)), false);
+    EXPECT_EQ(ok.code, OKC);
+    EXPECT_EQ(r.lastAppendedOf(1), 5) << "the revoke itself is now pending";
+    // an update of the same key is not held back by a pending update (only a revoke re-encodes from the row)
+    EXPECT_EQ(r.write(one(updateOf(1, 5)), false).code, OKC);
+    // a pending REVOKE holds the next revoke back too
+    EXPECT_EQ(r.write(one(revokeOf(1, 5)), false).code, ErrorCode::Throttled);
+    // a definite refusal wins over the retriable one
+    EXPECT_EQ(r.write(batchOf({revokeOf(1, 5), updateOf(2, -1)}), false).code, IR);
+}
+
+TEST(LeaseWriteHookRegression, RevokeWhileIndexNotReadyThrottledRegression) {
+    Rig r;
+    r.withIndex();
+    r.state.judgedThrough = INT64_MAX;
+    r.addRow(1, 5);
+    r.facts.leaseIndexReady = false;
+    const Outcome o = r.write(one(revokeOf(1, 5)), false);
+    EXPECT_EQ(o.code, ErrorCode::Throttled);
+    EXPECT_EQ(o.why, H::LeaseRevokeIndexNotReady);
+    EXPECT_EQ(o.retryAfterNs, 1'000'000);
+    EXPECT_EQ(r.tlog.logEndOffset(), 0);
+    EXPECT_EQ(r.write(batchOf({grantOf(2), updateOf(1, 5)}), false).code, OKC) << "grants and updates do not need the index";
+    r.facts.leaseIndexReady = true;
+    EXPECT_EQ(r.write(one(revokeOf(1, 5)), false).code, OKC);
+    r.facts.leaseIndex = {};
+    EXPECT_EQ(r.write(one(revokeOf(1, 5)), false).code, ErrorCode::Throttled) << "no index at all";
+}
+
+TEST(LeaseWriteHookRegression, RevokeBatchFitsScratchRegression) {
+    Rig r;
+    r.installV2();
+    r.withIndex();
+    std::vector<LRec> recs;
+    for (uint64_t id = 1; id <= 2048; ++id) {
+        r.addRow(id, int64_t(id), 7000, 0, "x", uint32_t(id));
+        recs.push_back(revokeOf(id, int64_t(id)));
+    }
+    const auto in = batchOf(recs);
+    const Outcome o = r.write(in);
+    ASSERT_EQ(o.code, OKC);
+    ASSERT_TRUE(crcOk(o.copy));
+    const auto sp = spansOf(o.copy);
+    ASSERT_EQ(sp.size(), 2048u);
+    for (std::size_t i = 0; i < sp.size(); ++i) {
+        ASSERT_EQ(schemaOf(valueOfSpan(sp[i])), 2) << i;
+        ASSERT_EQ(getLe(valueOfSpan(sp[i]) + 60, 4), i + 1) << "the port column (v2 only) comes from the row";
     }
 }
