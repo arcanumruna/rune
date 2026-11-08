@@ -578,12 +578,50 @@ TEST(CheckedWritesTxnVisibilityRegression, NoteReadPastThePassBudgetResumesRegre
     EXPECT_EQ(p.slot(2, 1), 21);
 }
 
+// REGRESSION (Task 8 review 2, m-a): the application of a small transaction inside long plain traffic reads back only to T's last
+// record.  It read on to the marker, at the pass budget, with the view's reads held the whole time.
+TEST(CheckedWritesTxnVisibilityRegression, SmallTxnInLongPlainTrafficAppliesWithoutAFencedPassRegression) {
+    TxnLog log;
+    log.data({{1, 1, 10}}, 7);
+    plainTraffic(log, 3 * rune::view::kTxnReadBackBytesPerPass);
+    const int64_t m = log.marker(7, true);
+    Folder p(false);
+    while (p.cursor < m) p.pass(log, log.end, 0);
+    int fenced = 0, passes = 0;
+    for (; passes < 10 && p.cursor <= m; ++passes) {
+        p.pass(log, log.end, 0);
+        fenced += p.fence.fenced() ? 1 : 0;
+    }
+    EXPECT_EQ(fenced, 0);
+    EXPECT_LE(passes, 4) << "three passes of notes, the application in the last";
+    EXPECT_EQ(p.slot(1, 1), 10);
+}
+
+// REGRESSION (Task 8 review 2, m-a): every marker a call applies shares the call's read-back budget.  Each application had its own,
+// so a pass over N markers read N budgets.
+TEST(CheckedWritesTxnVisibilityRegression, ReadBackBudgetIsSharedByTheCallsMarkersRegression) {
+    TxnLog log;
+    log.data({{1, 1, 10}}, 7);
+    plainTraffic(log, rune::view::kTxnReadBackBytesPerPass * 7 / 10);
+    log.marker(7, true);
+    log.data({{2, 1, 20}}, 8);
+    plainTraffic(log, log.bytes.size() + rune::view::kTxnReadBackBytesPerPass * 7 / 10);
+    const int64_t m8 = log.marker(8, true);
+    Folder p(false);
+    p.pass(log, log.end, 0);
+    EXPECT_EQ(p.slot(1, 1), 10);
+    EXPECT_FALSE(p.has(2)) << "the second marker's notes wait for the next pass";
+    EXPECT_EQ(p.cursor, m8);
+    for (int i = 0; i < 4 && p.cursor <= m8; ++i) p.pass(log, log.end, 0);
+    EXPECT_EQ(p.slot(2, 1), 20);
+}
+
 // Two instances of a worker share its key set.  While one notes, the other's marker waits; a holder that is not driven for a whole
 // call of the waiter loses the set, and notes again from where it stood when it is driven again.  Both end as if alone.
 TEST(CheckedWritesTxnVisibilityRegression, SharedKeySetWaitsForItsHolderThenTakesAnIdleOneRegression) {
     TxnLog log;
     log.data({{1, 1, 10}, {2, 1, 20}}, 7);
-    plainTraffic(log, 2 * rune::view::kTxnReadBackBytesPerPass);
+    plainTraffic(log, 3 * rune::view::kTxnReadBackBytesPerPass);   // three passes of notes: the application itself is one batch
     log.data({{2, 1, 21}});
     const int64_t m = log.marker(7, true);
     Folder alone(false), a(false), b(false);

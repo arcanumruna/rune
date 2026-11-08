@@ -37,6 +37,7 @@ public:
     uint64_t owner   = 0;
     uint64_t touches = 0;   // the holder's uses; a waiter that sees none across a whole call of its own takes the set
     int64_t  pid = -1, marker = -1, from = -1, readTo = -1, segEnd = -1;
+    int64_t  lastT = -1;   // T's last record noted from `from`: the last segment's application ends after it
     bool     noted = false;
 
     /// Cold: a fresh segment of `pid`'s span from `at`, held by the returned token.
@@ -47,6 +48,7 @@ public:
         pid = spanPid;
         marker = segEnd = spanMarker;
         from = readTo = at;
+        lastT = -1;
         noted = false;
         return owner;
     }

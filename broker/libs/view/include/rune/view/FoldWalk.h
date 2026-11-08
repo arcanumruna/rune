@@ -235,7 +235,9 @@ inline NoteEnd noteSegment(TxnFold& txn, int64_t pid, int64_t at, int64_t marker
             if ((attrs & b::kAttrControl) != 0) {
             } else if ((attrs & b::kAttrTransactional) != 0 && r.producerId() == pid) {
                 r.forEachRecord([&](std::string_view key, std::string_view, int64_t offset, int64_t) {
-                    if (offset >= k.from && !k.noteT(key, offset, k.segEnd == marker)) k.segEnd = offset;
+                    if (offset < k.from) return;
+                    if (!k.noteT(key, offset, k.segEnd == marker)) k.segEnd = offset;
+                    k.lastT = offset;
                 });
             } else if (!isAbortedBatch(skip, r, attrs)) {
                 const TxnSpan* open = (attrs & b::kAttrTransactional) != 0 ? fence.find(r.producerId()) : nullptr;
@@ -252,16 +254,16 @@ inline NoteEnd noteSegment(TxnFold& txn, int64_t pid, int64_t at, int64_t marker
 }
 
 // Applies the span of `pid` (open in the fence) at its marker: its batches in [first, marker), resuming above applyingThrough, a
-// segment of noted keys at a time, a record another writer superseded skipped.  At most `left` records and kTxnReadBackBytesPerPass
-// bytes, notes included; false when either ran out first, the key set is another span's, or a read failed (applyingThrough says
-// where it stopped once a record is applied).
+// segment of noted keys at a time, a record another writer superseded skipped.  The last segment ends after T's last record, not
+// at the marker.  At most `left` records, and `bytes` (the call's read-back, notes included) up to kTxnReadBackBytesPerPass; false
+// when either ran out first, the key set is another span's, or a read failed (applyingThrough says where it stopped once a record
+// is applied).
 template <class OnRecord>
 bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const FoldSkip& skip, FoldStats& stats, OnRecord& onRecord,
-               int64_t& applied) {
+               int64_t& applied, std::size_t& bytes) {
     namespace b = rune::protocol::batch;
     TxnSpanFence& fence = txn.fence;
     int64_t at = fence.applyingThrough >= 0 ? fence.applyingThrough + 1 : fence.find(pid)->first;
-    std::size_t bytes = 0;
     const int64_t spanFirst = fence.find(pid)->first;
     // A failed read stops the application where it stands: the span stays open, applied records stay fenced, and the next call
     // retries.  It never closes the span, which would let a checkpoint pass records never applied.  The key set is given up, so a
@@ -288,11 +290,12 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
         if (n == NoteEnd::Failed) return failed();
         if (n == NoteEnd::Paused) return paused();
         const int64_t segEnd = txn.keys.segEnd;
-        while (at < segEnd) {
-            const rune::storage::LogReadView v = readSpan(txn, at, segEnd, marker);
+        const int64_t end = segEnd == marker ? std::min(marker, txn.keys.lastT + 1) : segEnd;
+        while (at < end) {
+            const rune::storage::LogReadView v = readSpan(txn, at, end, marker);
             if (v.empty()) return failed();
             const int64_t start = at;
-            for (std::size_t pos = 0; pos < v.len && at < segEnd;) {
+            for (std::size_t pos = 0; pos < v.len && at < end;) {
                 rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
                 if (!r.ensureValid()) return failed();
                 if (r.baseOffset() >= marker) return done();
@@ -307,7 +310,7 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
                     enum class Out : uint8_t { No, Segment, Budget } out = Out::No;
                     r.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t) {
                         if (out != Out::No || offset < at) return;
-                        if (offset >= segEnd) {
+                        if (offset >= end) {
                             out = Out::Segment;
                             return;
                         }
@@ -329,13 +332,13 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
                     });
                     if (out == Out::Budget) return false;
                     if (out == Out::Segment) {   // the segment ends inside this batch
-                        at = segEnd;
+                        at = end;
                         break;
                     }
                 }
                 at = last + 1;
-                if (at < marker && bytes >= kTxnReadBackBytesPerPass) {
-                    fence.applyingThrough = std::min(at, segEnd) - 1;
+                if (at < end && bytes >= kTxnReadBackBytesPerPass) {
+                    fence.applyingThrough = at - 1;
                     return false;
                 }
             }
@@ -359,6 +362,7 @@ void walkFold(const rune::storage::LogReadView& first, int64_t bound, int64_t& c
     const int64_t start = cursor;
     int64_t from = cursor;
     int64_t units = 0;   // records applied at markers this call
+    std::size_t bytes = 0;   // read back at markers this call
     rune::storage::LogReadView view = first;
     for (;;) {
         const detail::WalkOut w = detail::walkView(view, from, bound, skip, txn, stats, onRecord);
@@ -375,7 +379,7 @@ void walkFold(const rune::storage::LogReadView& first, int64_t bound, int64_t& c
         const int64_t left = txn->budget > 0 ? txn->budget - (w.at - start) - units : INT64_MAX;
         if (left <= 0) break;   // the marker is applied next call, with that call's whole budget
         int64_t applied = 0;
-        const bool done = detail::applySpan(*txn, w.pid, w.at, left, skip, stats, onRecord, applied);
+        const bool done = detail::applySpan(*txn, w.pid, w.at, left, skip, stats, onRecord, applied, bytes);
         units += applied;
         if (!done) break;
         fence->close(w.pid);
