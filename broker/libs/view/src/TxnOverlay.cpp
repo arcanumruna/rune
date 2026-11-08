@@ -28,10 +28,11 @@ void TxnOverlay::reserve(std::size_t rows, uint32_t maxRowLen) {
     slots_ = 2;
     while (slots_ < 2 * rows) slots_ <<= 1;
     // calloc's large blocks are fresh zero pages, and malloc's are untouched: neither costs a write per byte (an assign of every
-    // overlay at every restart and member change was most of a checked-writes model seed).
+    // overlay at every restart and member change was most of a checked-writes model seed).  The arena is calloc'd for its spare row,
+    // which no put writes.
     entries_.reset(static_cast<Entry*>(std::malloc((rows + 1) * sizeof(Entry))));
     index_.reset(static_cast<int32_t*>(std::calloc(slots_, sizeof(int32_t))));
-    arena_.reset(static_cast<uint8_t*>(std::malloc((rows + 1) * maxRowLen + 1)));
+    arena_.reset(static_cast<uint8_t*>(std::calloc((rows + 1) * maxRowLen + 1, 1)));
     if (!entries_ || !index_ || !arena_) throw std::bad_alloc();
     used_ = 0;
     full_ = false;
