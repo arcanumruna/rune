@@ -78,7 +78,7 @@ public:
 
     /// Start all three and wait for the catalog and the __security leaders.
     void start() {
-        for (int id : {1, 2, 3}) c_.startNode(id);
+        c_.startNodes({1, 2, 3});
         if (!c_.awaitCatalogLeader(std::chrono::seconds(60))) throw std::runtime_error("AuthTrio: no catalog leader");
         if (!awaitSecurityLeader(c_, std::chrono::seconds(60))) throw std::runtime_error("AuthTrio: no __security leader");
     }

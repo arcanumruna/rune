@@ -23,6 +23,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -183,7 +184,7 @@ struct ThreeNodes {
 
     static ThreeNodes start(const std::string& tag, std::vector<int> startOnly = {1, 2, 3}, Mode mode = Mode::Shard) {
         ThreeNodes c(tag, mode);
-        for (int id : startOnly) c.startNode(id);
+        c.startNodes(startOnly);
         return c;
     }
 
@@ -192,7 +193,7 @@ struct ThreeNodes {
     static ThreeNodes startWith(const std::string& tag, std::function<void(NodeConfig&)> tweak) {
         ThreeNodes c(tag, Mode::Shard);
         c.configTweak = std::move(tweak);
-        for (int id : {1, 2, 3}) c.startNode(id);
+        c.startNodes({1, 2, 3});
         return c;
     }
 
@@ -207,6 +208,19 @@ struct ThreeNodes {
         nodes[static_cast<std::size_t>(id - 1)] = std::make_unique<BrokerNode>(cfg);
         if (beforeStart) beforeStart(id, *nodes[static_cast<std::size_t>(id - 1)]);
         nodes[static_cast<std::size_t>(id - 1)]->start();
+    }
+    /// Starts the nodes on one thread each and returns when all are up (joining the starters; a node's start() does not wait
+    /// for its peers).
+    void startNodes(const std::vector<int>& ids) {
+        std::vector<std::exception_ptr> failed(ids.size());
+        std::vector<std::thread> starters;
+        for (std::size_t i = 0; i < ids.size(); ++i)
+            starters.emplace_back([this, &ids, &failed, i] {
+                try { startNode(ids[i]); } catch (...) { failed[i] = std::current_exception(); }
+            });
+        for (auto& t : starters) t.join();
+        for (const auto& e : failed)
+            if (e) std::rethrow_exception(e);
     }
     void stop(int id) {
         auto& n = nodes[static_cast<std::size_t>(id - 1)];

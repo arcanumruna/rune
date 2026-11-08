@@ -481,7 +481,7 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
     // 7. Restart mid-scenario
     fleet.clear();
     for (const int id : c.runningNodes()) c.stop(id);
-    for (int id = 1; id <= 3; ++id) c.startNode(id);
+    c.startNodes({1, 2, 3});
     ready(c);
     ASSERT_FALSE(HasFailure());
     ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
