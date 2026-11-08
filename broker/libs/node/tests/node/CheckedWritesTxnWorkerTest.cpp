@@ -582,6 +582,29 @@ TEST(CheckedWritesTxnWorker, RunAheadCheckpointIsBackfilledOnReplayRegression) {
     EXPECT_EQ(rows(), leader) << "the refold equals the leader's table";
 }
 
+// REGRESSION (found by R11b; P11-8): the checkpoint cap holds the judge at the markers' coverage plus the cap, and a marker covers
+// only a stretch with a judged record.  A stretch past the cap with nothing to judge (an aborted transaction, then its marker) held
+// the judge there for good, and every later record went unjudged.  While nothing judged waits for a marker the cap counts from the
+// judge's cursor: the members' tables did not change past the coverage.
+TEST(CheckedWritesTxnWorkerRegression, UnjudgedStretchPastTheCapNeverHoldsTheJudgeRegression) {
+    VerdictRig r;
+    r.createKeyIndex();
+    r.setViewPassCap(3);   // the change and plan records at 0 and 1 stay within it
+    TestRejectRule rule;
+    rule.mode = TestRejectRule::Mode::TagEquals;
+    rule.tag = 9;
+    r.installRejectView(kRej, kRejObj, rule, "rej", /*persisted=*/true);
+    r.passes(50);
+    ASSERT_EQ(r.produceBatch(VerdictRig::batch({ups(1)})), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    (void)r.appendTxnReplicated(VerdictRig::batch({ups(2), ups(3), ups(4), ups(6)}, kRaPid, 0, {}, /*txn=*/true));
+    r.marker(kRaPid, false);
+    ASSERT_EQ(r.produceBatch(VerdictRig::batch({ups(5)})), 0);
+    EXPECT_TRUE(r.driveUntilJudged());
+    EXPECT_TRUE(r.hasRow(kRej, 5)) << "the record past the aborted transaction is judged and folded";
+    EXPECT_FALSE(r.hasRow(kRej, 3));
+}
+
 // REGRESSION (Task 8 step 6, design 3.1, the activation invariant): an ordinary transaction (no vote, so no J to backfill from)
 // holds every member checkpoint at or below its first record until its marker.  (Its traffic stays within one delta frame; more is
 // step 7's multi-frame delta.)  So a recovered K

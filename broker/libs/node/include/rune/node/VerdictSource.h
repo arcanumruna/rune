@@ -1174,9 +1174,11 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     } else if (!behind && finalizeLocked_(readRange, aborted)) {
         // The checkpoint cap holds the judge at the markers' coverage plus the cap.  While a deferred transaction holds K the markers
         // wait for it and the judge runs ahead, the members pushing there (P11-8 (a)): the cap counts from their last push.  An
-        // ordinary one is applied at its marker, which the judge must reach.
+        // ordinary one is applied at its marker, which the judge must reach.  While nothing judged waits for a marker (only control
+        // records or an aborted transaction past the coverage) no marker is due and the members' tables did not change: the cap
+        // counts from the cursor.
         const bool ordinaryHolds = std::any_of(ordinary_.begin(), ordinary_.end(), [&](const OrdinaryTxn& o) { return o.first < judgeCursor_; });
-        const int64_t capFrom = judgedThrough() < judgeCursor_ ? runAheadFrom_() : emitFrom_;
+        const int64_t capFrom = judgedThrough() < judgeCursor_ ? runAheadFrom_() : judgedRecord_ || sawEmptyChange_ ? emitFrom_ : judgeCursor_;
         const int64_t passBound = std::min(bound, checkpointCap_ == INT64_MAX || ordinaryHolds || capFrom == INT64_MAX ? INT64_MAX : capFrom + checkpointCap_);
         while (!stalled_) {
             const int64_t A = state.constraintSets.nextChangeAtOrAfter(setFrom_);
