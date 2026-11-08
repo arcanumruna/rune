@@ -401,7 +401,7 @@ public:
         if (!compiled) throw std::runtime_error(compiled.error().message);
         compiled->plan.viewObjectId = objectIdOf(v);
         compiled->plan.persistence = 1;
-        compiled->plan.sizing.chunkBytes = 64u << 10;   // not the 32 MiB row-slab default: a model seed builds these tables at every restart
+        compiled->plan.sizing.chunkBytes = 1u << 20;   // not the 32 MiB row-slab default: a model seed builds these tables at every restart
         return std::move(*compiled);
     }
     /// A view topic id for the `generation`-th plan of `v`.
