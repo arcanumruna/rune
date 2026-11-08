@@ -282,6 +282,8 @@ settlements. The items below are open points the spec leaves to the implementati
   from that one event and fills `Applied.leaseViewObjectId`. `kFeatureLevelLeases` is a leader **build** rule in
   `AdminWorker` (never an apply rule), so replay never depends on the level. The alterable keys are applied by the
   existing `AlterTopicConfig` event kind, with the `lease.*` keys added to `ConfigKeys.h`.
+  **Amended 2026-11-08:** implemented as catalog formatVer 4 (the admin writes V4 for every event at level ≥ 6),
+  with the lease view as its own object (objectId + 1, kind `LeaseIndex`), not a trailer on a V2 event.
 - **L5. System columns.** `buildDefine_` prepends `lease_version int64`, `lease_ttl_ms uint64`, `lease_holder uint64`,
   `lease_remaining_ms uint64` as field ids 0–3, in that order, and renumbers the user fields from 4 (a new topic has
   no history). Fixed-block offsets 0, 8, 16, 24, so `lease_version` sits at value bytes `[4, 12)`.
@@ -590,7 +592,7 @@ Spec §5.1 (key width row 1), §5.2, §5.3; L4, L15.
 - [ ] **Step 2:** implement. Run `ctest --test-dir build -R 'LeaseCatalog|CatalogV2|CatalogGolden' --output-on-failure -j8`.
 - [ ] **Step 3:** commit `codec: lease topics in the catalog (LeaseSpec trailer, lease view object)` and push.
 
-**Don't:** bump the catalog formatVer; make `kFeatureLevelLeases` an apply rule; touch `ApplyV1.cpp` or
+**Don't:** make `kFeatureLevelLeases` an apply rule; touch `ApplyV1.cpp` or
 `CatalogFingerprint.h` (frozen).
 
 ### Task 3: broker admin + write spec — lease DDL, system columns, 128-byte keys, gates
@@ -636,21 +638,27 @@ Spec §5.1 (all rows), §5.3, §6.1; L5, L15.
 
 Spec §5.1, §5.2, §11; L16.
 
-**Files:** modify `ql/src/Parser.cpp` (`parseCreateStatement`: `lease topic <name> { … } [partitions n] [replicas r]
-key <field> [with (…)]`; `transient lease topic` and `autoincrement` refused; `show leases <topic> [where <key>
-like '<prefix>%'] [limit n]`; `show lease <topic> key <literal>`; `revoke lease <topic> key <literal>`), `ql/src/Ql.cpp`
-(plans: `DefineTopic` with `LeaseSpec`; `ScanLeases`; `LeaseTimeToLive`; a read-then-fenced-revoke plan),
-`ql/src/ConfigKeys.h` (`lease.*` keys and ranges, sharing `validateLeaseSpec`); test `ql/tests/LeaseQlTest.cpp`
-and goldens under `ql/tests/golden/`.
+**Files (corrected 2026-11-08; the original list named files that do not exist):** `ql/src/Parser.cpp`
+(`lease topic …` and `transient lease topic …` at statement level — there is no `create topic`; `show leases <topic>
+[where <key> like '<prefix>%'] [limit n]`; `show lease <topic> key <literal>`; `revoke lease <topic> key <literal>`),
+`ql/include/rune/ql/Ast.h` (`TopicDef::lease`; `ShowLeasesDef`, `ShowLeaseDef`, `RevokeLeaseDef` appended to
+`Statement`), `ql/src/ConfigKeys.h` (`lease.*` rows and `applyLeaseSetting`, sharing the `validateLeaseSpec` texts in
+`protocol/.../LeaseSpec.h`), `ql/src/Backends.cpp` + `Backends.h` (`DefineTopicPlan::lease`; script-scope view
+sources carry the lease system columns), `codec/include/rune/codec/LeaseColumns.h` (the one prepend/strip helper),
+`client-cpp/src/cli/QlEngine.cpp` (`run(PDefine)` sends the lease; printPlan; the three lease statements are refused at
+prepare until Task 22); tests `ql/tests/LeaseQlTest.cpp` (also built into the CI target `rune_checked_writes_tests`),
+`client-cpp/tests/LeaseQlCliTest.cpp`, `LeaseTopicQlBrokerRegression` in
+`broker/libs/node/tests/client/CheckedWritesQlBrokerRegressionTest.cpp`; bench case `BM_LeaseTopicDdl` in
+`ql/benchmark/ParseBench.cpp`.
 
-- [ ] **Step 1: failing tests** `LeaseQlRegression.*`: every form in spec §5.1 and §11 parses to the expected plan
-  (goldens); every refusal (no field list, `transient lease topic`, `autoincrement`, `like '%x'`, `like 'a%b%'`,
-  `where uri = …`) has its message; settings out of range refused at parse with the §5.2 text; the literal key of
-  `show lease … key 7` is encoded with the topic's key type; QL text → wire ≤ 2–5 µs (`QlPlanBench` case
-  `LeaseTopicDdl`, recorded, gated in Task 23).
-  Mutation: accept `like '%x'` as a prefix → the refusal test fails.
-- [ ] **Step 2:** implement. Run `ctest --test-dir build -R 'LeaseQl|CheckedWritesQlTopic|ParserTest' --output-on-failure -j8`.
-- [ ] **Step 3:** commit and push. **Checkpoint A.**
+Decisions taken during implementation:
+- `transient lease topic` parses; the broker answers it (owner ruling: transient lease topics will be supported).
+- QL refuses in the broker's rule order with the broker's texts.
+- In `like`, only `%` is a wildcard; `_` is literal (discovery paths contain `_`).
+- Encoding the literal key with the topic's key type moves to Task 22 (it needs the topic's descriptor at execution).
+- The settings are named as the catalog names them: `lease.checkpoint_interval` (no `_ms`).
+
+- [x] Done: 1e9d0dcd, review fixes 0953bacb. **Checkpoint A.**
 
 **Don't:** execute `show`/`revoke lease` here (Task 22 wires them to the client).
 
@@ -1227,6 +1235,11 @@ partition}`, fed from worker-owned counters through the existing metric slots, `
 in `client-cpp/src/cli/` (`show leases` → per-partition `ScanLeases`, `show lease` → `LeaseTimeToLive`, `revoke lease`
 → read version then fenced revoke; `show topic` prints lease settings and the live count); tests
 `client-cpp/tests/LeaseCliTest.cpp`, `broker/libs/node/tests/node/LeaseMetricsTest.cpp`.
+
+**Carried from Task 4 (2026-11-08):** encode the literal key with the topic's key type and range-check it (a signed
+u64 magnitude, `-0`, strings over 128 bytes); lift the prepare-time refusal of the three lease statements; let
+`show view` / `show topic` take a quoted or dotted name (`inst.leases`, `'ns/t'`); `rune stats view <t>.leases` reads
+the lease view's partition stats without a plan.
 
 - [ ] **Step 1: failing tests**: `LeaseMetricsRegression.EveryMetricMovesRegression` (each metric moved by its
   event, `stale_broker` stays 0 in every non-injected run); `LeaseQlRegression.ShowLeasesAllPartitionsRegression`,

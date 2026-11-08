@@ -327,7 +327,7 @@ Herald uses no etcd transactions, TimeToLive, Mutex or Election today.
 | revoke rate limit 1000/s (`leaseRevokeRate`) | `lease.expiry_batch` per duty cycle, ≥ 100 000/s per partition (§10) | timing only: never earlier, often sooner |
 | **Promote(extend = electionTimeout)**: every lease is re-armed at `now + extend + remainingTTL` (checkpointed) or `+ TTL`; if there are ≥ `leaseRevokeRate` leases, expiries are spread to 3/4 of the rate | the new leader re-arms every live lease at `T_ready + extend + (lease_remaining_ms > 0 ? remaining : ttl)`, where `T_ready` is the lease-clock time its lease view enters `Ready` (§9.6), with `extend = leaderHeartbeatTimeoutNs`. Nothing is spread: the batch emitter already bounds the rate. | same arming; no spreading (timing only) |
 | **Demote**: every lease set to forever | on demotion the leader's wheel is discarded with its view; nothing is emitted | same |
-| **Checkpointing**: every `checkpointInterval` (5 min default), for leases with remaining TTL > interval, at most `leaseCheckpointRate` (1000/s), in batches of 1000; persisted only with `CheckpointPersist` | `Checkpoint` records (lease op 3) every `lease.checkpoint_interval_ms` (5 min default) for leases with remaining > interval, at most `lease.checkpoint_rate` (1000/s) per partition, batches of up to 1000. On by default; always persisted, being log records. | **Divergence D4** (default on; always persisted) |
+| **Checkpointing**: every `checkpointInterval` (5 min default), for leases with remaining TTL > interval, at most `leaseCheckpointRate` (1000/s), in batches of 1000; persisted only with `CheckpointPersist` | `Checkpoint` records (lease op 3) every `lease.checkpoint_interval` (5 min default) for leases with remaining > interval, at most `lease.checkpoint_rate` (1000/s) per partition, batches of up to 1000. On by default; always persisted, being log records. | **Divergence D4** (default on; always persisted) |
 | **Put with a lease** attaches the key; it does not renew | `Put`+`update` replaces the row's columns, fenced by version; it does not renew | same |
 | Put on a key held by **another** lease re-attaches it (takeover) | refused: `Put`+`upsert` is `InvalidRequest`, and `Put`+`insert` on a live key is `KeyExists` | **owner ruling** (no takeover) |
 | **DeleteRange** on a leased key deletes it; the lease lives on | refused (`InvalidRequest`, "use revoke"): deleting the key would end the lease without the version check | D1 |
@@ -409,7 +409,7 @@ lease topic <name> { <field> <type>, ... } [ partitions <n> ] [ replicas <r> ] k
 | `lease.max_ttl` | `min_ttl` to 9 000 000 000 000 ms (etcd `MaxLeaseTTL`) | 9 000 000 000 000 | yes |
 | `lease.max_keys` | 1–16 777 216 live leases per partition | 1 048 576 | no |
 | `lease.checkpoint` | `on`, `off` | `on` (D4) | yes |
-| `lease.checkpoint_interval_ms` | 1 000–86 400 000 | 300 000 (etcd 5 min) | yes |
+| `lease.checkpoint_interval` | 1 000–86 400 000 | 300 000 (etcd 5 min) | yes |
 | `lease.checkpoint_rate` | 1–100 000 checkpoints/s per partition | 1 000 (etcd) | yes |
 | `lease.expiry_batch` | 1–4096 `Expire` records per partition per duty cycle | 256 | no |
 
@@ -711,7 +711,7 @@ is a fixed-width `prefixWidth`, which a path prefix cannot use.
 - **Folding is leader-only (Coordinator's call),** as today (`Worker.h:7360-7366`). The leader keeps two intrusive
   wheels next to its lease view:
   - the **deadline wheel**;
-  - the **checkpoint wheel**, which holds only leases with `ttl > lease.checkpoint_interval_ms` when checkpointing is
+  - the **checkpoint wheel**, which holds only leases with `ttl > lease.checkpoint_interval` when checkpointing is
     on.
 - **Arming.**
   - An accepted grant arms the key at `foldLeaseNow + ttl`.
@@ -837,7 +837,7 @@ is a fixed-width `prefixWidth`, which a path prefix cannot use.
 
 ### 9.5 Checkpoints (etcd's lease checkpoint)
 
-- **Scheduling.** When checkpointing is on and `ttl > lease.checkpoint_interval_ms`, the checkpoint wheel arms the key
+- **Scheduling.** When checkpointing is on and `ttl > lease.checkpoint_interval`, the checkpoint wheel arms the key
   at `grantFold + interval`, and re-arms it after each checkpoint folds. etcd's `scheduleCheckpointIfNeeded` applies
   only when the remaining TTL exceeds the interval, and so does Rune.
 - **Emission.** A due checkpoint becomes a `Checkpoint` record with `lease_remaining_ms = ⌈deadline − now⌉`.
