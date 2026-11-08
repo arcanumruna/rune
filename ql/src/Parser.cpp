@@ -783,6 +783,12 @@ struct Parser {
                 (w.key == "autoincrement.max" && w.value != static_cast<int64_t>(protocol::kAutoIncrementMaxDefault)))
                 return errAt(settingToks[i], "autoincrement.max and autoincrement.reserve need autoincrement");
         }
+        // A lease topic's fields are fixed-width (the lease view holds every user column in a fixed-width row); `string` here
+        // is the var-len String, `string(N)` the fixed one.
+        for (std::size_t i = 0; i < td.fields.size(); ++i)
+            if (rune::codec::isVarLen(td.fields[i].type))
+                return errAt(fieldToks[i], "a lease topic's fields are fixed-width: '" + td.fields[i].name + "' is " +
+                                               (td.fields[i].type == rune::codec::PrimType::String ? "string" : "bytes") + "; use string(N)");
         return std::nullopt;
     }
 

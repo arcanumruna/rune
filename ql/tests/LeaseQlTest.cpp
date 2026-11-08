@@ -111,6 +111,9 @@ TEST(LeaseQlRegression, LeaseTopicRefusalRegression) {
         {"lease topic t { id uint64 autoincrement } key id;", "a lease topic cannot use autoincrement"},
         {"lease topic t { id uint64, lease_x int32 } key id;", "lease_ field names are reserved"},
         {"lease topic t { lease_owner uint64 } key lease_owner;", "lease_ field names are reserved"},
+        {"lease topic t { id uint64, name string } key id;", "a lease topic's fields are fixed-width: 'name' is string; use string(N)"},
+        {"lease topic t { id uint64, blob bytes } key id;", "a lease topic's fields are fixed-width: 'blob' is bytes; use string(N)"},
+        {"lease topic t { id uint64, a string(8), b string } key id;", "a lease topic's fields are fixed-width: 'b' is string; use string(N)"},
         {withClause("key.index = on"), "a lease topic's key index is its lease view"},
         {withClause("autoincrement.reserve = 10"), "autoincrement.max and autoincrement.reserve need autoincrement"},
         {withClause("autoincrement.max = 10"), "autoincrement.max and autoincrement.reserve need autoincrement"},
@@ -137,6 +140,12 @@ TEST(LeaseQlRegression, LeaseTopicRefusalRegression) {
     auto s = ql::parse("lease topic t;");
     ASSERT_FALSE(s.has_value());
     EXPECT_EQ(s.error().col, 1u);
+    const std::string v = "lease topic t { id uint64, name string } key id;";
+    auto vr = ql::parse(v);
+    ASSERT_FALSE(vr.has_value());
+    EXPECT_EQ(vr.error().col, colOf(v, "name"));
+    EXPECT_EQ(refusal("topic t { id uint64, name string } key id;"), "<accepted>");   // a plain topic keeps string
+    EXPECT_EQ(refusal("lease topic t { id uint64, name string(32) } key id;"), "<accepted>");
     const std::string w = "lease topic t { id uint64 } key id with (retention.ms = 1);";
     auto wr = ql::parse(w);
     ASSERT_FALSE(wr.has_value());

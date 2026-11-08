@@ -21,8 +21,10 @@ public:
         uint32_t constraintId;
     };
 
+    /// Reserves `entries` plus ONE slot that only a broker-written record may take (add(..., reserved = true)): a lease
+    /// topic's stale Expire / Checkpoint has no producer to retry, so a full index must never stall the judge on one.
     void reserve(std::size_t entries) {
-        entries_.reserve(entries);
+        entries_.reserve(entries + 1);
         capacity_ = entries;
     }
     [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
@@ -30,13 +32,14 @@ public:
         if (entries > capacity_) reserve(entries);
     }
 
-    /// Appends in ascending offset order.  False: a non-ascending offset (counted in outOfOrder()) or a full index.
-    [[nodiscard]] bool add(int64_t offset, uint16_t code, uint32_t constraintId) noexcept {
+    /// Appends in ascending offset order.  False: a non-ascending offset (counted in outOfOrder()) or a full index.  A
+    /// `reserved` add may also take the one slot past capacity().
+    [[nodiscard]] bool add(int64_t offset, uint16_t code, uint32_t constraintId, bool reserved = false) noexcept {
         if (!entries_.empty() && offset <= entries_.back().offset) {
             ++outOfOrder_;
             return false;
         }
-        if (entries_.size() >= capacity_) return false;
+        if (entries_.size() >= capacity_ + (reserved ? 1 : 0)) return false;
         entries_.push_back({offset, code, constraintId});
         return true;
     }

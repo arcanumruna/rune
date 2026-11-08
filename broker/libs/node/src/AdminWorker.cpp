@@ -1452,6 +1452,12 @@ std::optional<DdlRejection> keyFeaturesRefusal(const rune::protocol::TopicKeyFea
     return std::nullopt;
 }
 
+// A lease topic's fields are fixed-width: the lease view holds every user column in a fixed-width row.
+std::string leaseFixedWidthDetail(const std::string& name, rune::codec::PrimType type) {
+    return "a lease topic's fields are fixed-width: '" + name + "' is " + (type == rune::codec::PrimType::String ? "string" : "bytes") +
+           "; use string(N)";
+}
+
 // Lease topics: the admin-only rules of a NEW lease define (the catalog's V4 apply rules are the replay half).  Judged in
 // the documented order; nullopt = fine.  `d` is the user's descriptor (null for an untyped define).
 std::optional<DdlRejection> leaseDefineRefusal(const DefineTopicMsg& m, const rune::codec::Descriptor* d, int16_t level) {
@@ -1469,6 +1475,8 @@ std::optional<DdlRejection> leaseDefineRefusal(const DefineTopicMsg& m, const ru
         return reject(kInvalidRequest, "a lease topic is compacted and keeps every live lease");
     for (const auto& f : d->fields)
         if (f.name.starts_with("lease_")) return reject(kInvalidRequest, "lease_ field names are reserved");
+    for (const auto& f : d->fields)
+        if (rune::codec::isVarLen(f.type)) return reject(kInvalidSchema, leaseFixedWidthDetail(f.name, f.type));
     // Any other key feature (autoincrement.max / .reserve without autoincrement) is the non-lease answer.
     if (m.keyFeatures != rp::TopicKeyFeatures{})
         return reject(kInvalidRequest, "autoincrement.max and autoincrement.reserve need autoincrement");
@@ -1667,6 +1675,10 @@ AdminWorker::Built AdminWorker::buildAlter_(const AlterTopicMsg& m, const cat::C
     }
     // The compatibility gate (the engine apply runs): SchemaIncompatible.
     if (!rune::codec::checkCompatibility(*ops, mode)) return Rejected(reject(kSchemaIncompatible, {}, topicId, cur));
+    if (t->lease)
+        for (const auto& op : *ops)
+            if (op.type == rune::codec::AlterOpType::Add && rune::codec::isVarLen(op.primType))
+                return Rejected(reject(kInvalidSchema, leaseFixedWidthDetail(op.name, op.primType), topicId, cur));
     // F20: stored resolved to durable tags.
     auto resolved = cat::resolveAlterOps(*t->schema, std::span<const rune::codec::AlterOp>(ops->data(), ops->size()));
     if (!resolved) return Rejected(reject(kInvalidSchema, resolved.error(), topicId, cur));

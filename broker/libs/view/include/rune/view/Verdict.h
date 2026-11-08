@@ -15,6 +15,11 @@ struct Verdict {
     return (static_cast<uint32_t>(viewObjectId) << 16) | ordinal;
 }
 
+// Internal, stored in the rejected index and in verdict markers only, never sent on the wire: a lease topic's stale broker
+// record (an Expire or Checkpoint whose lease was revoked, renewed or re-granted meanwhile).  Broker records have no
+// producer to answer.
+inline constexpr uint16_t kVerdictStaleBroker = 0xFFFE;
+
 enum class VerdictViewKind : uint8_t { KeyIndex = 1, Unique = 2, Check = 3, LeaseIndex = 4, TestReject = 200 };
 
 } // namespace rune::view

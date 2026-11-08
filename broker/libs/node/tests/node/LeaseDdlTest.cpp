@@ -49,13 +49,13 @@ rp::LeaseSpec validSpec() {
     return s;
 }
 
-/// {<keyName> key, note String} (+ extra Int64 fields).
+/// {<keyName> key, note string(16)} (+ extra Int64 fields); a lease topic's fields are fixed-width.
 std::vector<uint8_t> blobOf(PrimType keyType = PrimType::UInt64, uint16_t width = 0, const std::string& keyName = "id",
                             const std::vector<std::string>& extra = {}) {
     rune::codec::DescriptorBuilder b("t", 1);
     if (keyType == PrimType::FixedStr) b.addFixedStr(keyName, width, 1, true);
     else b.add(keyName, keyType, 1, true);
-    b.add("note", PrimType::String);
+    b.addFixedStr("note", 16);
     for (const auto& e : extra) b.add(e, PrimType::Int64);
     return rune::codec::serialize(b.build());
 }
@@ -98,6 +98,13 @@ TEST(LeaseDdlRegression, ValidSpecIsValidRegression) {
 // ── the refusal table ────────────────────────────────────────────────────────
 namespace {
 
+std::vector<uint8_t> varLenBlob(PrimType t) {
+    rune::codec::DescriptorBuilder b("t", 1);
+    b.add("id", PrimType::UInt64, 1, true);
+    b.add("title", t);
+    return rune::codec::serialize(b.build());
+}
+
 struct Row {
     const char* name;
     int16_t     level;
@@ -135,6 +142,10 @@ const Row kRows[] = {
      [](DefineTopicMsg& m) { m.config.retentionBytes = 1000; }, true},
     {"ReservedFieldName", 6, kInvalidRequest, "lease_ field names are reserved",
      [](DefineTopicMsg& m) { m.blob = blobOf(PrimType::UInt64, 0, "id", {"lease_x"}); }, true},
+    {"VarLenString", 6, kInvalidSchema, "a lease topic's fields are fixed-width: 'title' is string; use string(N)",
+     [](DefineTopicMsg& m) { m.blob = varLenBlob(PrimType::String); }, true},
+    {"VarLenBytes", 6, kInvalidSchema, "a lease topic's fields are fixed-width: 'title' is bytes; use string(N)",
+     [](DefineTopicMsg& m) { m.blob = varLenBlob(PrimType::Bytes); }, true},
 };
 
 }  // namespace
@@ -371,7 +382,11 @@ TEST(LeaseDdlRegression, NamespaceCountsRegression) {
 // ── dedupe fingerprint ───────────────────────────────────────────────────────
 TEST(LeaseDdlRegression, DedupeFingerprintRegression) {
     DefineTopicMsg base;
-    base.session = 1; base.corr = 2; base.name = "t"; base.keyField = "id"; base.blob = blobOf();
+    // The pin below hashes this blob, so it stays the original {id key, note String} shape (only hashed, never defined).
+    rune::codec::DescriptorBuilder legacy("t", 1);
+    legacy.add("id", PrimType::UInt64, 1, true);
+    legacy.add("note", PrimType::String);
+    base.session = 1; base.corr = 2; base.name = "t"; base.keyField = "id"; base.blob = rune::codec::serialize(legacy.build());
     base.meta.statement = "s";
     DefineTopicMsg withLease = base;
     withLease.lease = validSpec();
@@ -548,7 +563,7 @@ TEST(LeaseDdlRegression, TagExhaustionRegression) {
     auto blobWithTag = [](uint16_t tag) {
         rune::codec::DescriptorBuilder b("t", 1);
         b.add("id", PrimType::UInt64, 1, true);
-        b.add("note", PrimType::String);
+        b.addFixedStr("note", 16);
         rune::codec::Descriptor d = b.build();
         d.fields[1].id = tag;
         return rune::codec::serialize(d);
@@ -605,6 +620,23 @@ TEST(LeaseDdlRegression, LeaseObjectDdlRegression) {
     EXPECT_EQ(plainTtl.detail, "AlterTopicConfig: lease.* keys need a lease topic");
     EXPECT_EQ(alterAdd.code, kInvalidSchemaCode);
     EXPECT_EQ(alterAdd.detail, "AlterSchema: lease_ field names are reserved");
+
+    // A lease topic's fields are fixed-width: an ALTER that adds string / bytes is refused, string(N) is accepted, and a
+    // plain topic still takes string.
+    const auto alterOp = [&](const std::string& topic, const std::string& name, PrimType t, uint16_t len) {
+        rune::codec::AlterOp op{};
+        op.type = rune::codec::AlterOpType::Add; op.name = name; op.primType = t; op.fixedLen = len;
+        return rig.alter(topic, {op});
+    };
+    const auto addString = alterOp("inst", "label", PrimType::String, 0);
+    EXPECT_EQ(addString.code, kInvalidSchemaCode);
+    EXPECT_EQ(addString.detail, "a lease topic's fields are fixed-width: 'label' is string; use string(N)");
+    const auto addBytes = alterOp("inst", "blob", PrimType::Bytes, 0);
+    EXPECT_EQ(addBytes.code, kInvalidSchemaCode);
+    EXPECT_EQ(addBytes.detail, "a lease topic's fields are fixed-width: 'blob' is bytes; use string(N)");
+    const auto addFixed = alterOp("inst", "label", PrimType::FixedStr, 32);
+    EXPECT_EQ(addFixed.code, kOk) << addFixed.detail;
+    EXPECT_EQ(alterOp("plain", "label", PrimType::String, 0).code, kOk);
     EXPECT_EQ(badTtl.detail, "");
     EXPECT_EQ(badTtl.code, kOk) << badTtl.detail;
     EXPECT_EQ(topicOf(rig, "inst")->lease->ttlMs, 20'000u);
