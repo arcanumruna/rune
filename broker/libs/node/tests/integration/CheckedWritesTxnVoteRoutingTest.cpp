@@ -382,6 +382,12 @@ TEST(CheckedWritesTxnVoteRoutingRegression, AnswerThatMatchesNoFieldIsIgnoredReg
     C.gw.onRemoteTxnVoteResponse(stale);
     stale = r; stale.producerEpoch = 3;
     C.gw.onRemoteTxnVoteResponse(stale);
+    stale = r; stale.topicId = 1;
+    C.gw.onRemoteTxnVoteResponse(stale);
+    stale = r; stale.partition = 1;
+    C.gw.onRemoteTxnVoteResponse(stale);
+    stale = r; stale.producerId = 78;
+    C.gw.onRemoteTxnVoteResponse(stale);
     EXPECT_TRUE(C.got.empty()) << "a mismatched answer completed the vote";
     EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 1u);
     C.gw.onRemoteTxnVoteResponse(r);
