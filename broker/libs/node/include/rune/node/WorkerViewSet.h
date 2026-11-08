@@ -898,8 +898,10 @@ private:
         }
         // 00. Task 12 (D26): the namespace is over its view-memory limit -> pause at foldCursor (reads answer
         //     ViewPaused); back under it -> resume from that same foldCursor.  Untagged instances skip this.  A paused view folds
-        //     nothing, so a kept dirty window is given back at once: it is reclaimable charge that would hold the pause.
+        //     nothing.  A held delta was folded already: it still leaves, and its push trims the window it drained.  A kept dirty
+        //     window is given back at once: both are reclaimable charge that would hold the pause.
         if (inst.nsSlot != kNoNsSlot && !nsViewGate_(inst)) {
+            if (inst.pendingValid && !tryPushDelta_(inst)) return 1;   // the ring is full: keep the worker hot to retry it (step 1)
             if (inst.windowKept) releaseQuiet_(inst);
             return work;
         }
@@ -1032,6 +1034,7 @@ private:
             return work;
         }
         work += buildAndPushCheckpoint_(inst);
+        chargeMem_(inst);   // a held delta is charged (a pushed one was, by releaseWindow_)
         return work;
     }
 

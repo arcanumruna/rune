@@ -589,3 +589,41 @@ TEST(WorkerViewSetRegression, PausedViewGivesBackItsKeptWindowRegression) {
     rig.driveA(log, 0, 2);
     EXPECT_TRUE(std::holds_alternative<ViewRunning>(inst->pause)) << "the pause it caused is lifted";
 }
+
+// REGRESSION (review 8 I-2, m-2): a paused view returned before step 1's flush, so a delta held on a full ring never left, its push's
+// trim never ran, and the window it drained stayed charged: the pause held for good.  The held delta was not charged either.
+TEST(WorkerViewSetRegression, PausedViewWithAHeldDeltaGivesBackItsWindowRegression) {
+    Rig rig(/*limit chunks*/ 0);
+    rv::ViewPlan plan = hpPlan(kSrcB);
+    plan.persistence = 0;
+    const rune::codec::Descriptor* srcs[] = {&rig.src};
+    const auto comp = rv::compileView(plan, srcs, kViewB).value();
+    rig.vs.installView(comp.plan, comp.rowLayout, rig.src, /*persisted*/ true);
+    rig.assign(kSlotB, kNsB, 0);
+    SimLog log;
+    log.append(1, 2000);
+    rig.drive(kSrcB, kSlotB, kNsB, log);
+    const ViewInstance* inst = rig.vs.instanceForTest(kViewB, 0);
+    ASSERT_NE(inst, nullptr);
+    for (const std::size_t len : {std::size_t{4096}, std::size_t{256}, std::size_t{16}, std::size_t{0}})   // nothing drains the ring
+        for (int i = 0; i < 4096; ++i) {
+            const auto c = rig.channel.deltas.tryClaim(99, len);
+            if (c < 0) break;
+            rig.channel.deltas.commit(c);
+        }
+    log.appendRewrites(1, 2000, 10);   // a long window
+    rig.drive(kSrcB, kSlotB, kNsB, log, 0, 1);
+    ASSERT_TRUE(inst->pendingValid) << "the delta is held on the full ring";
+    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotB), inst->table.memoryBytes() + inst->table.dirtyBytes() + inst->pendingDelta.capacity())
+        << "the held delta is charged";
+    rig.assign(kSlotB, kNsB, inst->table.memoryBytes() + inst->table.dirtyBytes() / 2);
+    rig.drive(kSrcB, kSlotB, kNsB, log, 0, 2);
+    ASSERT_TRUE(std::holds_alternative<ViewPaused>(inst->pause));
+    rig.channel.deltas.drain([](int32_t, aeron::concurrent::AtomicBuffer&, OneToOneByteRing::index_t, OneToOneByteRing::index_t) {});
+    rig.drive(kSrcB, kSlotB, kNsB, log, 0, 3);   // the IO agent caught up
+    EXPECT_FALSE(inst->pendingValid) << "the paused view flushes its held delta";
+    EXPECT_EQ(inst->table.dirtyBytes(), 0u) << "and gives its window back";
+    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotB), inst->table.memoryBytes());
+    rig.drive(kSrcB, kSlotB, kNsB, log, 0, 4);
+    EXPECT_TRUE(std::holds_alternative<ViewRunning>(inst->pause)) << "the pause it caused is lifted";
+}
