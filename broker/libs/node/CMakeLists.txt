@@ -2050,7 +2050,7 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_ns_hotpath_suspend_alloc_tests PROPERTIES TIMEOUT 600)
 
         # Namespaces Phase 2 Task 12 (D26): the namespace view-memory limit pauses views at an offset and resumes them.
-        add_executable(rune_ns_view_memory_tests tests/node/NsViewMemoryRegressionTest.cpp)
+        add_executable(rune_ns_view_memory_tests tests/node/NsViewMemoryRegressionTest.cpp tests/support/AllocWindow.cpp)
         target_include_directories(rune_ns_view_memory_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_ns_view_memory_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
                               aeron::aeron GTest::gtest_main)

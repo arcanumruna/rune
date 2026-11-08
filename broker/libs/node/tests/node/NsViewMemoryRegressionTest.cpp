@@ -1,5 +1,5 @@
 // NsViewMemoryRegressionTest.cpp - namespaces Phase 2 Task 12 (D26): a namespace's view-memory limit pauses its views at an
-// offset and resumes them.  Deterministic: a WorkerViewSet driven over a simulated committed log (no Aeron, no clocks);
+// offset and resumes them.  Deterministic: a WorkerViewSet driven over a simulated committed log (no Aeron; a test clock);
 // the paused read is answered by a real Worker (GetViewRow op -> ViewRowResult).
 //
 // Interaction matrix (limit x {below, at, above} x view state / peer):
@@ -38,6 +38,7 @@
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/ViewRow.h>
 
+#include "support/AllocWindow.h"
 #include "support/LimitEnforcementTable.h"
 
 using namespace rune::node;
@@ -189,14 +190,14 @@ struct Rig {
         settle();
     }
     void release(uint16_t slot, uint32_t ns) { vs.onNsSlotFreed(slot, ns); limits_.erase(slot); }
-    int drive(int32_t srcTopic, uint16_t slot, uint32_t ns, const SimLog& log, uint64_t gen = 0) {
+    int drive(int32_t srcTopic, uint16_t slot, uint32_t ns, const SimLog& log, uint64_t gen = 0, int64_t nowNs = 0) {
         auto rd = [&](int64_t f, int64_t t) { return log.read(f, t); };
-        const int n = vs.driveFolds(srcTopic, 0, rd, log.end, rv::kNoSkip, 0, nullptr, gen, true, NsTag{slot, ns},
+        const int n = vs.driveFolds(srcTopic, 0, rd, log.end, rv::kNoSkip, nowNs, nullptr, gen, true, NsTag{slot, ns},
                                 nullptr, nullptr, SourceLogBounds{log.start, log.end});
         settle();
         return n;
     }
-    int driveA(const SimLog& log, uint64_t gen = 0) { return drive(kSrcA, kSlotA, kNsA, log, gen); }
+    int driveA(const SimLog& log, uint64_t gen = 0, int64_t nowNs = 0) { return drive(kSrcA, kSlotA, kNsA, log, gen, nowNs); }
     const uint8_t* row(int32_t view, int64_t key, WorkerViewSet::RowStatus& rs) {
         const rv::RowLayout* L = nullptr;
         return vs.getRow(view, 0, static_cast<uint64_t>(key), L, &rs);
@@ -487,8 +488,10 @@ TEST(WorkerViewSetRegression, TransientDirtyGrowthIsGivenBackAfterThePassRegress
 
 // REGRESSION (review 6 I-1): the hysteresis keeps a window's dirty capacity when the window before was at least half its size, so
 // two long spans in a row, or a ramp of at most 2x per window, were kept at their push, and a view gone quiet never drained again:
-// the growth stayed charged for good.  The first caught-up pass gives it back.
+// the growth stayed charged for good.  A caught-up pass once the view has been quiet for a second gives it back (review 7 I-1).
 namespace {
+constexpr int64_t kQuietNs = 1'000'000'000;   // WorkerViewSet::kQuietGiveBackNs
+
 size_t churnThenQuiet(std::initializer_list<int> longWindows, size_t& steady, size_t& kept) {
     Rig rig(/*limit chunks*/ 0);
     SimLog log;
@@ -505,7 +508,8 @@ size_t churnThenQuiet(std::initializer_list<int> longWindows, size_t& steady, si
         rig.driveA(log);
     }
     kept = inst->table.dirtyBytes();
-    rig.driveA(log);   // quiet: nothing new
+    rig.driveA(log, 0, 1);             // quiet: nothing new
+    rig.driveA(log, 0, 1 + kQuietNs);  // and for a second
     EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), inst->table.memoryBytes() + inst->table.dirtyBytes());
     return inst->table.dirtyBytes();
 }
@@ -525,4 +529,39 @@ TEST(WorkerViewSetRegression, RampThenQuietGivesBackItsChargeRegression) {
     ASSERT_GT(steady, 0u) << "steady churn keeps its dirty set";
     ASSERT_GT(kept, steady) << "a ramp of at most 2x per window is kept at its push";
     EXPECT_LE(quiet, steady) << "the quiet pass gives the ramp's growth back";
+}
+
+// REGRESSION (review 7 I-1): the worker runs a caught-up pass between nearly every two windows (it spins into the next pass, and
+// parks for at most a millisecond), so giving a kept window back on the first quiet pass reallocated it on every window: N-2
+// regressed.  It is kept while windows come less than a second apart, and given back after a second of quiet.
+TEST(WorkerViewSetRegression, SteadyChurnWithIdlePassesKeepsItsDirtySetUntilQuietRegression) {
+    Rig rig(/*limit chunks*/ 0);
+    SimLog log;
+    log.append(1, 2000);
+    int64_t now = 0;
+    rig.driveA(log, 0, now);
+    const ViewInstance* inst = rig.vs.instanceForTest(kViewA, 0);
+    const auto window = [&] {
+        log.appendRewrites(1, 2000, 1);
+        rig.driveA(log, 0, now += 1'000'000);
+        rig.driveA(log, 0, now += 1'000'000);   // the caught-up pass after it
+    };
+    for (int w = 0; w < 6; ++w) window();   // warm-up
+    const size_t steady = inst->table.dirtyBytes();
+    ASSERT_GT(steady, 0u) << "steady churn keeps its dirty set";
+    uint64_t allocs = 0;
+    for (int w = 0; w < 20; ++w) {
+        log.appendRewrites(1, 2000, 1);   // the log's own allocation is outside the window
+        {
+            rune::testing::AllocWindow aw;
+            rig.driveA(log, 0, now += 1'000'000);
+            rig.driveA(log, 0, now += 1'000'000);
+            allocs += aw.count();
+        }
+        EXPECT_EQ(inst->table.dirtyBytes(), steady);
+    }
+    EXPECT_EQ(allocs, 0u) << "idle passes between windows give nothing back";
+    rig.driveA(log, 0, now + kQuietNs);
+    EXPECT_EQ(inst->table.dirtyBytes(), 0u) << "a second of quiet gives it back";
+    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), inst->table.memoryBytes());
 }

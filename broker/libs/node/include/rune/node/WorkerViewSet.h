@@ -227,7 +227,6 @@ public:
                      const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
                      bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr,
                      SourceLogBounds b = {}) {
-        (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end()) return 0;
         int work = 0;
@@ -246,7 +245,7 @@ public:
             ViewInstance& inst = vit->second;
             adoptNs_(inst, ns);
             if (inst.readiness == ViewReadiness::Ready) continue;  // already caught up
-            work += driveView_(inst, readRange, rebuildTail, rskip, transientSrc, leaderGen, leaderHwConfirmed, b);
+            work += driveView_(inst, readRange, rebuildTail, rskip, nowNs, transientSrc, leaderGen, leaderHwConfirmed, b);
             if (inst.foldCursor >= rebuildTail && checkpointSettled(inst)) {
                 // N-C1: Ready only once the leader's HW reached its leadership start offset; else CatchingUp
                 // (never left RebuildingViews: that state gates elections).
@@ -315,7 +314,6 @@ public:
                    const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
                      bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr, VerdictSource* judge = nullptr,
                    SourceLogBounds b = {}, int64_t judgeBound = -1) {
-        (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end() && judge == nullptr) return 0;
         static const std::vector<int32_t> kNoViews;
@@ -345,7 +343,7 @@ public:
             ViewInstance* inst = getOrCreate_(viewTopicId, partition, bound);
             if (inst == nullptr) continue;  // defensive: template must exist
             adoptNs_(*inst, ns);
-            work += driveView_(*inst, readRange, viewBound, viewSkip, transientSrc, leaderGen, leaderHwConfirmed, b);
+            work += driveView_(*inst, readRange, viewBound, viewSkip, nowNs, transientSrc, leaderGen, leaderHwConfirmed, b);
         }
         return work + finishRetired_();
     }
@@ -571,8 +569,8 @@ private:
 
     // The tables, their dirty sets' growth and a held delta: a long window between checkpoints (P11-9) is view memory too.  A
     // pushed window gives a long span's growth back (releaseWindow_; ViewTable::trimDirty).  Churn past the reserve keeps its
-    // dirty sets, charged, and allocates nothing; the first quiet pass gives them back (releaseQuiet_), so a view gone quiet
-    // carries no charge past its tables.
+    // dirty sets, charged, while windows come less than kQuietGiveBackNs apart, and allocates nothing per drain; a caught-up pass
+    // after that long quiet gives them back (quietPass_), so a view quiet for kQuietGiveBackNs carries no charge past its tables.
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
         std::size_t m = inst.table.memoryBytes() + inst.table.dirtyBytes() + (inst.pendingValid ? inst.pendingDelta.capacity() : 0);
         if (inst.owners) m += inst.owners->memoryBytes() + inst.owners->dirtyBytes();
@@ -602,13 +600,23 @@ private:
             kept += t.dirtyBytes();
         });
         inst.windowKept = kept != 0;
+        inst.quietSinceNs = -1;
         chargeMem_(inst);
     }
-    /// A caught-up pass after a drain that kept dirty capacity: give it back (ViewTable::trimQuiet) and the charge follows.
+    /// A caught-up pass: a kept dirty window is given back once the view has been quiet for kQuietGiveBackNs, on the pass's own
+    /// clock.  Longer than any steady producer's gap between batches, so steady churn keeps it however many idle passes fall between.
+    static constexpr int64_t kQuietGiveBackNs = 1'000'000'000;
+    void quietPass_(ViewInstance& inst, int64_t nowNs) {
+        if (!inst.windowKept) return;
+        if (inst.quietSinceNs < 0) inst.quietSinceNs = nowNs;
+        else if (nowNs - inst.quietSinceNs >= kQuietGiveBackNs) releaseQuiet_(inst);
+    }
+    /// Give a kept dirty window back (ViewTable::trimQuiet) and the charge follows.
     void releaseQuiet_(ViewInstance& inst) {
         eachDirtySet_(inst, [](rune::view::ViewTable& t) { t.trimQuiet(); });
         chargeMem_(inst);
         inst.windowKept = false;
+        inst.quietSinceNs = -1;
     }
     template <class F>
     static void eachDirtySet_(ViewInstance& inst, F&& f) {
@@ -859,7 +867,7 @@ private:
     // progress count for the instance.
     template <class ReadRangeFn>
     int driveView_(ViewInstance& inst, ReadRangeFn&& readRange, int64_t bound,
-                   const rune::view::FoldSkip& skip,
+                   const rune::view::FoldSkip& skip, int64_t nowNs,
                    const TransientBounds* transientSrc, uint64_t leaderGen, bool leaderHwConfirmed, const SourceLogBounds& b) {
         int work = 0;
         // 0a. A discard in flight (the old checkpoint is being backed up): fold nothing, checkpoint nothing, serve NotReady until
@@ -923,7 +931,7 @@ private:
         //    the capacity event so capacityExceeded_ counts folds that actually
         //    crossed the ceiling, not idle passes).
         if (inst.foldCursor >= bound) {
-            if (inst.windowKept) releaseQuiet_(inst);
+            quietPass_(inst, nowNs);
             return work;
         }
         // 3. §15 #24: maxRows is an OBSERVABLE capacity-exceeded EVENT, NOT a

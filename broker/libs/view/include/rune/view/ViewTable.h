@@ -254,15 +254,15 @@ public:
     // After a drain: a dirty set grown past twice its reserve is reallocated at the reserve, which follows the index (a grown
     // table's warm start).  Hysteresis: a window that used at least a quarter of the capacity and is at most twice the window
     // before it is churn and keeps it (no allocation per drain); a much larger window (a long span's) or a small one gives it back.
-    // A kept capacity is at most about four times the last window, which may itself be long (two long spans in a row, a ramp):
-    // trimQuiet gives it back once the view goes quiet.
+    // An empty drain is not a window.  A kept capacity is at most about four times the last window, which may itself be long (two
+    // long spans in a row, a ramp): the owner gives it back with trimQuiet once the view has been quiet a while, or pauses.
     void trimDirty() {
         if (hasDirty() || dirtyBytes() == 0) return;
         const size_t cap = dirtyList_.capacity() * sizeof(uint32_t) + deleted_.capacity() * sizeof(DeletedEntry) + deletedKeyBytes_.capacity();
         if (4 * window_ >= cap && window_ <= 2 * lastWindow_) return;
         giveBackDirty_();
     }
-    // A pass with nothing to drain: a kept capacity is given back, so a view gone quiet carries no charge for its last windows.
+    // The view is quiet (or paused): a kept capacity is given back, so it carries no charge for its last windows.
     void trimQuiet() {
         if (hasDirty()) return;
         window_ = lastWindow_ = 0;
