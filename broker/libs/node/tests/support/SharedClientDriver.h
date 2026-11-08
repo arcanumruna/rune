@@ -5,7 +5,6 @@
 #include <rune/node/EmbeddedDriver.h>
 #include <unistd.h>
 #include <atomic>
-#include <cstdlib>
 #include <filesystem>
 #include <string>
 
@@ -15,12 +14,12 @@ class SharedClientDriver {
 public:
     SharedClientDriver()
         : scratch_(std::filesystem::temp_directory_path() / ("rune_clientdrv_" + std::to_string(::getpid()) + "_" + std::to_string(seq_()++))),
-          driver_(config_(scratch_.dir / "aeron"), DriverMode::Threaded) {
-        ::setenv("RUNE_CLI_AERON_DIR", driver_.dir().c_str(), 1);   // rune::cli::run attaches to it as well
-    }
-    ~SharedClientDriver() { ::unsetenv("RUNE_CLI_AERON_DIR"); }
+          driver_(config_(scratch_.dir / "aeron"), DriverMode::Threaded) {}
     SharedClientDriver(const SharedClientDriver&)            = delete;
     SharedClientDriver& operator=(const SharedClientDriver&) = delete;
+
+    /// The aeron dir to hand `--cli-aeron-dir`, so a `rune::cli::run` attaches to this driver as well.
+    [[nodiscard]] const std::string& dir() const { return driver_.dir(); }
 
     /// `cfg` attached to this driver: the caller's clients must be destroyed before it.
     [[nodiscard]] rune::client::ClientConfig attach(rune::client::ClientConfig cfg) const {

@@ -60,8 +60,10 @@ bool waitFor(Pred&& pred, std::chrono::milliseconds within) {
 }
 
 /// Every broker here runs the shard runtime: its client stream is catalog_cluster::kClientStream.
-int runCli(std::vector<std::string> args, std::string* out = nullptr, std::string* err = nullptr) {
+/// `aeronDir` attaches the run to a running media driver instead of one of its own.
+int runCli(std::vector<std::string> args, std::string* out = nullptr, std::string* err = nullptr, const std::string& aeronDir = {}) {
     args.insert(args.end(), {"--cli-stream-in", std::to_string(catalog_cluster::kClientStream)});
+    if (!aeronDir.empty()) args.insert(args.end(), {"--cli-aeron-dir", aeronDir});
     std::stringstream o, e;
     const int code = rune::cli::run(std::move(args), o, e);
     if (out) *out = o.str();
@@ -94,11 +96,11 @@ std::string stmt(std::string st) {
 }
 
 /// A script through one `rune ql -f` (one client and driver for all its statements); its output is every statement's.
-int qlScript(const std::string& endpoint, const std::string& text, std::string* out, std::string* err) {
+int qlScript(const std::string& endpoint, const std::string& text, std::string* out, std::string* err, const std::string& aeronDir = {}) {
     static int seq = 0;
     const fs::path path = tmpDir() / ("cut" + std::to_string(seq++) + ".rql");
     std::ofstream(path, std::ios::binary) << text;
-    return runCli({"ql", "-f", path.string(), "--broker", endpoint}, out, err);
+    return runCli({"ql", "-f", path.string(), "--broker", endpoint}, out, err, aeronDir);
 }
 
 void awaitLevel(BrokerNode& n) {
@@ -740,7 +742,7 @@ TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardR
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
     ASSERT_EQ(qlScript(b.endpoint(), stmt("topic pc { id uint64, userId uint64, name string(16) } key id with (cleanup.policy = compact)") +
-                       stmt("create unique view pc_name key lower(name) as nameKey as select id from pc"), &out, &err), 0) << err;
+                       stmt("create unique view pc_name key lower(name) as nameKey as select id from pc"), &out, &err, clientDriver.dir()), 0) << err;
     ViewHandle view(b.node(), "pc_name");
 
     // The client has no idempotence switch: an acks=none batch is its non-idempotent wire path (producer id -1) and gets no completion, so
@@ -767,7 +769,7 @@ TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardR
     }
     ASSERT_TRUE(firstFoo.has_value());
     ASSERT_TRUE(waitFor([&] {
-        return runCli({"stats", "topic", "pc", "--json", "--broker", b.endpoint()}, &out, &err) == 0 && out.find("\"rejectionsConstraint\": 7,") != std::string::npos;
+        return runCli({"stats", "topic", "pc", "--json", "--broker", b.endpoint()}, &out, &err, clientDriver.dir()) == 0 && out.find("\"rejectionsConstraint\": 7,") != std::string::npos;
     }, 10s)) << out << err;
 
     rc::ClientConfig cfg = clientDriver.attach(b.clientConfig());
@@ -1165,7 +1167,7 @@ TEST(CheckedWritesRegressorsPathRegression, RejectedRecordsAreNeverDeliveredAndC
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("user", true) + ddlUserIdentity() + topicDdl("character", true) + ddlCharacterName(), &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("user", true) + ddlUserIdentity() + topicDdl("character", true) + ddlCharacterName(), &out, &err, clientDriver.dir()), 0) << err;
     const int32_t userTopic = topicIdOf(b.node(), "user"), characterTopic = topicIdOf(b.node(), "character");
     ASSERT_GE(userTopic, 0);
     ASSERT_GE(characterTopic, 0);
@@ -1206,7 +1208,7 @@ TEST(CheckedWritesRegressorsPathRegression, ACrashedLeaderIsReplacedThreeNodesRe
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("user")) + stmt(goldenTopic("character")) + ddlCharacterName(), &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("user")) + stmt(goldenTopic("character")) + ddlCharacterName(), &out, &err, clientDriver.dir()), 0) << err;
     BrokerNode& admin = c.node(awaitController(c));
     const int32_t userTopic = topicIdOf(admin, "user"), characterTopic = topicIdOf(admin, "character");
     ASSERT_GE(userTopic, 0);
@@ -1247,7 +1249,7 @@ TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheLimitThree
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + ddlCharacterName() + accountStats(2), &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + ddlCharacterName() + accountStats(2), &out, &err, clientDriver.dir()), 0) << err;
     const int32_t characterTopic = topicIdOf(c.node(awaitController(c)), "character");
     ASSERT_GE(characterTopic, 0);
     constexpr uint64_t kFull = 3;
@@ -1291,7 +1293,7 @@ TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropMin
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + ddlCharacterName(), &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + ddlCharacterName(), &out, &err, clientDriver.dir()), 0) << err;
     const int32_t characterTopic = topicIdOf(c.node(awaitController(c)), "character");
     ASSERT_GE(characterTopic, 0);
     std::vector<int32_t> leaders;
