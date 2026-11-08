@@ -176,7 +176,7 @@ struct TopicSchemaResult {
     /// (TopicSchemaResponse trailing field); <= 0 = not reported (pre-2b broker)
     /// — typed topics then route over 1 partition (typedPartitionCount).
     int32_t              partitionCount = 0;
-    /// Checked writes: the topic's key features when the broker sent them (it does iff they are not the defaults);
+    /// Checked writes: the topic's key features when the broker sent them (it does iff they are not the defaults OR the topic is a lease topic);
     bool                             hasKeyFeatures = false;
     rune::protocol::TopicKeyFeatures keyFeatures{};
     /// Lease topics: the topic's lease spec when the broker sent it (broker >= 11 to a lease-aware session).
@@ -929,7 +929,8 @@ public:
     //   DefineTopic    value = topicId, aux = version; a broker errorCode in the
     //                  response -> BrokerError (errorCode, value/aux kept).
     //   GetTopicSchema value = topicId, aux = version (+ a key-features flag, see schemaAuxOf), payload = descriptor
-    //                  blob, then the 14-byte key-features block when the aux flag says so (schemaBlobOf strips it)
+    //                  blob; aux bit 16 = the 14-byte key-features block follows it, and aux bit 17 = the 39 lease
+    //                  bytes follow that (bit 17 is set only together with bit 16); schemaBlobOf strips both
     //                  (polled form: up to maxResultBytes, else
     //                  ResultTooLarge with value = the real size),
     //                  reserved0 = the topic's partitionCount (Phase 2b; <= 0

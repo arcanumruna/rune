@@ -118,14 +118,58 @@ TEST_F(ClientCatalogDdl, LeaseDefineFrameRegression) {
     EXPECT_EQ(with->lease, spec);
     EXPECT_TRUE(with->hasKeyFeatures) << "the lease block rides behind the key block";
     EXPECT_EQ(with->keyFeatures, rune::protocol::TopicKeyFeatures{});
-    // Without a lease: byte-identical to the protocol encoder's frame (the correlation id and session aside).
+    // Without a lease: byte-identical to a frame the protocol encoder builds directly from the same fields (the
+    // session and correlation ids are the session's, taken from the header).
     const auto plain = pc::DefineTopic::decode(frames[1].data(), frames[1].size());
     ASSERT_TRUE(plain.has_value());
     EXPECT_FALSE(plain->hasLease);
     EXPECT_FALSE(plain->hasKeyFeatures);
-    std::vector<uint8_t> again(plain->encodedSize());
-    ASSERT_EQ(plain->encode(again.data()), frames[1].size());
-    EXPECT_EQ(again, frames[1]);
+    const auto hdr = pc::MessageHeader::decode(frames[1].data(), frames[1].size());
+    ASSERT_TRUE(hdr.has_value());
+    pc::DefineTopic expect;
+    expect.sessionId      = hdr->sessionId;
+    expect.correlationId  = hdr->correlationId;
+    expect.topicName      = "t";
+    expect.partitionCount = 1;
+    expect.keyField       = "";
+    expect.validate       = true;
+    expect.descriptorBlob = kBlob;
+    expect.descriptorLen  = sizeof kBlob;
+    expect.persistence    = pc::DefineTopic::kPersistenceDisk;
+    expect.hasExt         = true;
+    expect.ext.requestId  = ddl.requestId;
+    expect.ext.clientName = plain->ext.clientName;   // the config's name (the default)
+    std::vector<uint8_t> built(expect.encodedSize());
+    ASSERT_EQ(expect.encode(built.data()), frames[1].size());
+    EXPECT_EQ(built, frames[1]);
+}
+
+TEST_F(ClientCatalogDdl, LeaseDefineBrokerTooOldRegression) {
+    const rune::protocol::LeaseSpec spec{.ttlMs = 10000, .minTtlMs = 1000, .maxTtlMs = 60000, .maxKeys = 1,
+                                         .expiryBatch = 64, .checkpoint = 0, .checkpointIntervalMs = 1000,
+                                         .checkpointRate = 1};
+    for (const int32_t version : {pc::kBrokerVersionLeases - 1, pc::kBrokerVersionLeases}) {
+        SCOPED_TRACE(version);
+        Rig r(invokerCfg(3984 + 2 * (version & 1), 3985 + 2 * (version & 1)));
+        r.gw.advertisedBrokerVersion = version;
+        r.connect();
+        auto& frames = r.capture(pc::DefineTopic::TEMPLATE_ID);
+        rc::TopicOptions leased;
+        leased.lease = spec;
+        test_support::TestCq cq(r.client);
+        auto f = cq.issue([&](rc::Completions& q, rc::Token t) {
+            return r.client.defineTopic("t", 1, "", blob, rc::Persistence::Disk, leased, rc::DdlOptions{}, q, t);
+        });
+        ASSERT_TRUE(f.accepted());
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+        if (version < pc::kBrokerVersionLeases) {
+            EXPECT_EQ(f.status(), rc::OpStatus::BrokerTooOld);
+            EXPECT_TRUE(frames.empty()) << "a v10 broker never sees the lease frame";
+        } else {
+            EXPECT_EQ(frames.size(), 1u) << "a v11 broker gets the frame";
+            EXPECT_NE(f.status(), rc::OpStatus::BrokerTooOld);
+        }
+    }
 }
 
 TEST_F(ClientCatalogDdl, DefineTopicSendsReplicationFactorConfigAndExtension) {

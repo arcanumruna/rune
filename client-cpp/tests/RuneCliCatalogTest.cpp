@@ -714,6 +714,35 @@ TEST(RuneCliCatalogRegression, ReplayStripsLeaseColumnsRegression) {
     EXPECT_EQ(d.blockLength, 64u) << "the block holds the user fields only";
 }
 
+TEST(RuneCliCatalogRegression, ReplayStripsLeaseColumnsRenumbersMixedFieldsRegression) {
+    namespace cd = rune::codec;
+    cd::DescriptorBuilder b("x");
+    b.addTagged("lease_version", 0, cd::PrimType::Int64, 1, 0xFFFF, false, {})
+        .addTagged("lease_ttl_ms", 1, cd::PrimType::UInt64, 1, 0xFFFF, false, {})
+        .addTagged("lease_holder", 2, cd::PrimType::UInt64, 1, 0xFFFF, false, {})
+        .addTagged("lease_remaining_ms", 3, cd::PrimType::UInt64, 1, 0xFFFF, false, {})
+        .addTagged("a", 4, cd::PrimType::Int32, 1, 0xFFFF, false, {})
+        .addTagged("s", 6, cd::PrimType::String, 1, 0xFFFF, false, {})
+        .addTagged("e", 9, cd::PrimType::Enum, 1, 0xFFFF, false, {3, 7, 11});
+    const auto stored = b.build();
+    ASSERT_EQ(stored.fields[4].offset, 32u) << "in the stored blob the user fixed fields follow the 32 system bytes";
+    const auto user = rune::cli::stripLeaseColumns(cd::serialize(stored), "x");
+    ASSERT_TRUE(user.has_value()) << user.error();
+    const auto d = cd::deserialize(*user);
+    ASSERT_EQ(d.fields.size(), 3u);
+    EXPECT_EQ(d.fields[0].name, "a");
+    EXPECT_EQ(d.fields[0].id, 0u);
+    EXPECT_EQ(d.fields[0].offset, 0u);
+    EXPECT_EQ(d.fields[1].name, "s");
+    EXPECT_EQ(d.fields[1].id, 2u);
+    EXPECT_EQ(d.fields[1].offset, 0u) << "var index 0";
+    EXPECT_EQ(d.fields[2].name, "e");
+    EXPECT_EQ(d.fields[2].id, 5u);
+    EXPECT_EQ(d.fields[2].offset, 4u);
+    EXPECT_EQ(d.fields[2].enumValues, (std::vector<int32_t>{3, 7, 11}));
+    EXPECT_EQ(d.blockLength, 8u);
+}
+
 TEST(RuneCliCatalogRegression, ReplayStripsLeaseColumnsRefusesADescriptorWithoutThemRegression) {
     namespace cd = rune::codec;
     const std::string want = "lease topic 'x' does not start with the lease system columns";
@@ -727,6 +756,14 @@ TEST(RuneCliCatalogRegression, ReplayStripsLeaseColumnsRefusesADescriptorWithout
     {   // right names, wrong order
         cd::DescriptorBuilder b("x");
         b.add("lease_ttl_ms", cd::PrimType::UInt64).add("lease_version", cd::PrimType::Int64)
+            .add("lease_holder", cd::PrimType::UInt64).add("lease_remaining_ms", cd::PrimType::UInt64);
+        const auto r = rune::cli::stripLeaseColumns(cd::serialize(b.build()), "x");
+        ASSERT_FALSE(r.has_value());
+        EXPECT_EQ(r.error(), want);
+    }
+    {   // right names and order, wrong types
+        cd::DescriptorBuilder b("x");
+        b.add("lease_version", cd::PrimType::UInt64).add("lease_ttl_ms", cd::PrimType::UInt64)
             .add("lease_holder", cd::PrimType::UInt64).add("lease_remaining_ms", cd::PrimType::UInt64);
         const auto r = rune::cli::stripLeaseColumns(cd::serialize(b.build()), "x");
         ASSERT_FALSE(r.has_value());
@@ -764,6 +801,7 @@ TEST(RuneCliCatalogRegression, FormatLeaseTopicRegression) {
     EXPECT_NE(out.find("  lease.checkpoint_interval " + std::to_string(l.checkpointIntervalMs) + "\n"), std::string::npos) << out;
     EXPECT_NE(out.find("  lease.checkpoint_rate " + std::to_string(l.checkpointRate) + "\n"), std::string::npos) << out;
     EXPECT_NE(out.find("  lease view inst.leases\n"), std::string::npos) << out;
+    EXPECT_EQ(out.find("key.index"), std::string::npos) << "the lease view line says it\n" << out;
 
     // A non-lease topic prints nothing new.
     cat::CatalogReplayer r1;

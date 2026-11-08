@@ -162,8 +162,12 @@ std::expected<std::vector<uint8_t>, std::string> stripLeaseColumns(std::span<con
         return std::unexpected(refusal);
     }
     if (d.fields.size() < kColumns.size()) return std::unexpected(refusal);
-    for (std::size_t i = 0; i < kColumns.size(); ++i)
-        if (d.fields[i].id != i || d.fields[i].name != kColumns[i]) return std::unexpected(refusal);
+    // lease_version is Int64; the other three are UInt64 (the broker's system columns).
+    for (std::size_t i = 0; i < kColumns.size(); ++i) {
+        const rune::codec::PrimType want = i == 0 ? rune::codec::PrimType::Int64 : rune::codec::PrimType::UInt64;
+        if (d.fields[i].id != i || d.fields[i].name != kColumns[i] || d.fields[i].type != want)
+            return std::unexpected(refusal);
+    }
     d.fields.erase(d.fields.begin(), d.fields.begin() + kColumns.size());
     for (auto& f : d.fields) f.id = static_cast<uint16_t>(f.id - kColumns.size());
     d.blockLength = rune::codec::computeOffsets(d.fields);
@@ -180,8 +184,9 @@ std::string formatTopicDefinition(const cat::TopicObject& t) {
       << "  kind " << (t.schema ? "typed" : "raw") << "\n";
     if (t.schema) {
         const rune::protocol::TopicKeyFeatures& kf = t.schema->keyFeatures;
-        o << "  key.index " << (kf.keyIndex ? "on" : "off") << "\n"
-          << "  autoincrement " << (kf.autoIncrement ? "on (reserve " + std::to_string(kf.autoIncrementReserve) + ", max " + std::to_string(kf.autoIncrementMax) + ")" : "off") << "\n"
+        // A lease topic's key index is implied: the `lease view <t>.leases` line below says it.
+        if (!t.lease) o << "  key.index " << (kf.keyIndex ? "on" : "off") << "\n";
+        o << "  autoincrement " << (kf.autoIncrement ? "on (reserve " + std::to_string(kf.autoIncrementReserve) + ", max " + std::to_string(kf.autoIncrementMax) + ")" : "off") << "\n"
           << "  partitioner " << (kf.partitioner == rune::protocol::Partitioner::Modulo ? "modulo" : "fnv1a") << "\n";
     }
     if (t.lease) {

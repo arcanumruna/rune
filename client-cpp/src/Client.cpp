@@ -1565,6 +1565,14 @@ bool defineKeyFeaturesTooOld(std::span<const uint8_t> frame, int32_t brokerVersi
     return d && d->hasKeyFeatures;
 }
 
+// A DefineTopic that carries a lease cannot go to a broker below v11.  `brokerVersion` 0 = unknown: sent.
+bool defineLeaseTooOld(std::span<const uint8_t> frame, int32_t brokerVersion) {
+    namespace rpc = rune::protocol::client;
+    if (brokerVersion < 1 || brokerVersion >= rpc::kBrokerVersionLeases) return false;
+    const auto d = rpc::DefineTopic::decode(frame.data(), frame.size());
+    return d && d->hasLease;
+}
+
 // SD11: GetViewRowK / ScanViewRows / GetStats are served from broker v10 on.  `brokerVersion` 0 = unknown: sent.
 bool checkedWritesReadTooOld(rune::client::OpKind op, int32_t brokerVersion) noexcept {
     return (op == rune::client::OpKind::GetViewRowK || op == rune::client::OpKind::ScanViewRows || op == rune::client::OpKind::GetStats) &&
@@ -1938,7 +1946,8 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     if (h.op == OpKind::DefineTopic) {
         if (auto d = rpc::DefineTopic::decode(frame.data(), frame.size())) {
             p.topicName = std::string(d->topicName);
-            if (defineKeyFeaturesTooOld(frame, agent_.sessionBrokerVersion(0))) {
+            if (defineKeyFeaturesTooOld(frame, agent_.sessionBrokerVersion(0)) ||
+                defineLeaseTooOld(frame, agent_.sessionBrokerVersion(0))) {
                 completeCtl_(p, OpStatus::BrokerTooOld, ddlNoValue(p.op));
                 return;
             }
@@ -2073,7 +2082,8 @@ int Client::driveAwaitingSeed_() {
             continue;
         }
         if (pendingCtl_[i].op == OpKind::DefineTopic &&
-            defineKeyFeaturesTooOld(a->frame, agent_.sessionBrokerVersion(0))) {
+            (defineKeyFeaturesTooOld(a->frame, agent_.sessionBrokerVersion(0)) ||
+             defineLeaseTooOld(a->frame, agent_.sessionBrokerVersion(0)))) {
             PendingCtl dead = takeCtl_(i);
             completeCtl_(dead, OpStatus::BrokerTooOld, ddlNoValue(dead.op));
             ++work;
@@ -2431,7 +2441,8 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
             heldRedirects   = hld->redirects;
             heldBudgetEndNs = hld->budgetEndNs;
         } else if (!std::holds_alternative<DdlUnsentOnSeed>(d->retry)) { ++i; continue; }
-        if ((p.op == OpKind::DefineTopic && defineKeyFeaturesTooOld(d->frame, agent_.sessionBrokerVersion(0))) ||
+        if ((p.op == OpKind::DefineTopic && (defineKeyFeaturesTooOld(d->frame, agent_.sessionBrokerVersion(0)) ||
+                                         defineLeaseTooOld(d->frame, agent_.sessionBrokerVersion(0)))) ||
             checkedWritesReadTooOld(p.op, agent_.sessionBrokerVersion(0))) {
             PendingCtl dead = takeCtl_(i);   // queued before the seed connected: the version is known now
             completeCtl_(dead, OpStatus::BrokerTooOld, ddlNoValue(dead.op));
