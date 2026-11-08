@@ -205,6 +205,13 @@ protected:
         for (const auto& p : parts) svc_->onControlMarkerLanded(p.topicId, p.partition, pid, svc_->coordinatorEpoch());
     }
 
+    /// The decision record commits, the markers go out and land: the transaction is complete.
+    void completeWithMarkers(int64_t pid, const std::vector<pc::TxnTopicPartition>& parts) {
+        followerFetches();
+        (void)svc_->doWork(now_);
+        landMarkers(pid, parts);
+    }
+
     /// A transaction on `parts` (txn id "tx"), ready for EndTxn.
     int64_t beginTxn(const std::vector<pc::TxnTopicPartition>& parts, int16_t& epoch, const std::string& txn = "tx") {
         const int64_t pid = initPid(txn, epoch);
@@ -420,9 +427,9 @@ TEST_F(CheckedWritesTxnCoordinatorRegression, AddPartitionsDuringTheVoteIsConcur
     const auto offAnswer = pc::AddOffsetsToTxnResponse::decode(outBuf_.data(), sync);
     ASSERT_TRUE(offAnswer);
     EXPECT_EQ(offAnswer->errorCode, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
-    const std::size_t again = endTxn("tx", pid, ep, true);
-    ASSERT_GT(again, 0u);
-    EXPECT_EQ(syncAnswer(again).errorCode, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+    EXPECT_EQ(endTxn("tx", pid, ep, true), 0u) << "a repeated commit takes the gate over";
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    EXPECT_EQ(lastAnswer().errorCode, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions)) << "the earlier request is told to retry";
     EXPECT_EQ(votes_.size(), 1u) << "no second round of votes";
     EXPECT_EQ(svc_->voteGatesForTest(), 1u);
 }
@@ -445,7 +452,7 @@ TEST_F(CheckedWritesTxnCoordinatorRegression, UnloadAnswersAVoteGateAndACommitWa
     followerFetches();
     (void)svc_->doWork(now_);
     ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::Ongoing);
-    // The reload forgot the candidates (10b restores them): a second transaction, voted and decided, waits for its markers.
+    // A second transaction, voted and decided, waits for its markers.
     int16_t ep2 = 0;
     const int64_t pid2 = initPid("tx2", ep2);
     ASSERT_EQ(addPartitions("tx2", pid2, ep2, {{kCw, 1}}), 0);
@@ -500,9 +507,9 @@ TEST_F(CheckedWritesTxnCoordinatorRegression, OldSessionConcurrentIsNotLeaderReg
     int16_t ep2 = 0;
     const int64_t pid2 = beginTxn({{kCw, 0}}, ep2, "tx2");
     ASSERT_EQ(endTxn("tx2", pid2, ep2, true), 0u);
-    n = endTxn("tx2", pid2, ep2, true);   // a gated commit: 27 as well
-    ASSERT_GT(n, 0u);
-    EXPECT_EQ(syncAnswer(n).errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_EQ(endTxn("tx2", pid2, ep2, true), 0u);   // a gated commit: the earlier request is told 27 as well
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    EXPECT_EQ(lastAnswer().errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader));
 }
 
 TEST_F(CheckedWritesTxnCoordinatorRegression, CommitWithNoMarkerPartitionsIsAnsweredWhenTheVotesAreInRegression) {
@@ -590,4 +597,298 @@ TEST_F(CheckedWritesTxnCoordinatorRegression, VoteCandidatesAndGatesOfANamespace
     ASSERT_EQ(endTxn("b", pidB, epB, true), 0u);
     ASSERT_EQ(svc_->voteGatesForTest(), 1u);
     EXPECT_EQ(svc_->inMemoryEntriesOfNamespaceForTest(kNs), n3) << "the candidate became a gate: still one entry";
+}
+
+// ---- Task 10b: races and recovery ----
+
+TEST_F(CheckedWritesTxnCoordinatorTest, TimeoutDuringTheVoteAbortsAndAnswersInvalidTxnState) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    now_ += 31'000'000'000;   // past the 30 s transaction timeout, the votes still out
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareAbort);
+    EXPECT_EQ(svc_->voteGatesForTest(), 0u);
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    EXPECT_EQ(lastAnswer().errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidTxnState));
+    EXPECT_EQ(markerAppends_, 0) << "the abort markers wait for the abort record";
+    completeWithMarkers(pid, {{kCw, 0}});
+    EXPECT_EQ(markerAppends_, 1);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::CompleteAbort);
+    EXPECT_EQ(answers_.frames.size(), 1u) << "answered once";
+}
+
+TEST_F(CheckedWritesTxnCoordinatorTest, RepeatedCommitTakesOverTheGate) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    const int64_t first = corr_;
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u) << "the retry waits for the same votes";
+    const int64_t second = corr_;
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    EXPECT_EQ(lastAnswer().errorCode, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+    EXPECT_EQ(lastAnswer().correlationId, first);
+    EXPECT_EQ(votes_.size(), 1u) << "no second round of votes";
+    EXPECT_EQ(svc_->voteGatesForTest(), 1u);
+    vote(votes_[0]);
+    (void)svc_->doWork(now_);
+    completeWithMarkers(pid, {{kCw, 0}});
+    ASSERT_EQ(answers_.frames.size(), 2u);
+    EXPECT_EQ(lastAnswer().errorCode, 0);
+    EXPECT_EQ(lastAnswer().correlationId, second) << "the final answer goes to the request that took the gate";
+}
+
+TEST_F(CheckedWritesTxnCoordinatorTest, AbortDuringTheVoteCancelsTheGate) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    const auto asked = votes_;
+    const int64_t commitCorr = corr_;
+    ASSERT_EQ(endTxn("tx", pid, ep, false), 0u) << "the abort runs today's path: answered with its record";
+    EXPECT_EQ(svc_->voteGatesForTest(), 0u);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareAbort);
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    EXPECT_EQ(lastAnswer().errorCode, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+    EXPECT_EQ(lastAnswer().correlationId, commitCorr);
+    followerFetches();
+    (void)svc_->doWork(now_);
+    ASSERT_EQ(answers_.frames.size(), 2u);
+    EXPECT_EQ(lastAnswer().errorCode, 0) << "the abort";
+    // The cancelled vote is still out: its late yes is dropped, and the producer's next transaction would wait for it.
+    EXPECT_EQ(svc_->voteOrphansForTest(), 1u);
+    vote(asked[0]);
+    EXPECT_EQ(svc_->voteOrphansForTest(), 0u);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareAbort);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, LateYesFromAResolvedGateIsNotCountedRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    const auto asked = votes_;
+    now_ += 31'000'000'000;   // the timeout abort keeps the epoch
+    (void)svc_->doWork(now_);
+    completeWithMarkers(pid, {{kCw, 0}});
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::CompleteAbort);
+    EXPECT_EQ(svc_->voteOrphansForTest(), 1u);
+    answers_.frames.clear();
+    ASSERT_EQ(addPartitions("tx", pid, ep, {{kCw, 0}}), 0);   // the next transaction of the same producer
+    votes_.clear();
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    EXPECT_TRUE(votes_.empty()) << "one live vote per key: the old one is still out";
+    EXPECT_EQ(svc_->doWork(now_), 0) << "waiting for the old answer is not work";
+    vote(asked[0]);   // the old gate's late yes
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::Ongoing) << "a yes the new transaction never asked for";
+    EXPECT_EQ(svc_->voteGatesForTest(), 1u);
+    ASSERT_EQ(votes_.size(), 1u);
+    vote(votes_[0]);
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareCommit);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, LateNoFromAGateResolvedByAFirstNoIsNotCountedRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}, {kCw, 1}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    const auto asked = votes_;
+    ASSERT_EQ(asked.size(), 2u);
+    vote(asked[0], static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation), 0x00070000, 123);
+    (void)svc_->doWork(now_);   // the first no: cw-1's vote is still out
+    completeWithMarkers(pid, {{kCw, 0}, {kCw, 1}});
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::CompleteAbort);
+    EXPECT_EQ(svc_->voteOrphansForTest(), 1u) << "cw-1's vote";
+    answers_.frames.clear();
+    ASSERT_EQ(addPartitions("tx", pid, ep, {{kCw, 1}}), 0);
+    votes_.clear();
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    EXPECT_TRUE(votes_.empty());
+    vote(asked[1], static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation), 0x00070001, 9);   // the old gate's late no
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::Ongoing) << "the new transaction is not aborted by it";
+    ASSERT_EQ(votes_.size(), 1u);
+    vote(votes_[0]);
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareCommit);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, FeatureLevelBumpedMidTransactionVotesEveryPartitionRegression) {
+    svc_->setMetadataFeatureLevel(rep::MetadataFeature::kCheckedWrites - 1);
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}, {kPlain, 0}}, ep);   // started while the cluster could not vote
+    svc_->setMetadataFeatureLevel(rep::MetadataFeature::kCheckedWrites);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    ASSERT_EQ(votes_.size(), 2u) << "never a constrained write committed unvoted: every partition of the transaction votes";
+    vote(votes_[0]);
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::Ongoing);
+    vote(votes_[1]);
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareCommit);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, FailoverBetweenAddPartitionsAndCommitCollectsEveryVoteRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}, {kPlain, 0}}, ep);
+    isLeader_ = false;
+    (void)svc_->doWork(now_);   // unload
+    isLeader_ = true;
+    followerFetches();
+    (void)svc_->doWork(now_);   // reload from the persisted state only
+    followerFetches();
+    (void)svc_->doWork(now_);
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::Ongoing);
+    cwIsCandidate_ = false;     // the constraint was dropped meanwhile: the persisted set still votes
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    ASSERT_EQ(votes_.size(), 2u) << "one vote per partition of the persisted set";
+    vote(votes_[1]);            // plain-0 says yes
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::Ongoing) << "the gate resolves only after both answers";
+    vote(votes_[0], static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation), 0x00070000, 123);
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareAbort);
+    completeWithMarkers(pid, {{kCw, 0}, {kPlain, 0}});
+    ASSERT_FALSE(answers_.frames.empty());
+    const auto a = lastAnswer();
+    EXPECT_EQ(a.errorCode, static_cast<int16_t>(pc::ErrorCode::ConstraintViolation));
+    EXPECT_TRUE(a.hasVote);
+    EXPECT_EQ(a.failingOffset, 123);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, UnloadWithVotesOutThenRetryGetsTheSameAnswerRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    const auto asked = votes_;
+    isLeader_ = false;
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->voteGatesForTest(), 0u);
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    EXPECT_EQ(lastAnswer().errorCode, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    answers_.frames.clear();
+    isLeader_ = true;
+    followerFetches();
+    (void)svc_->doWork(now_);
+    followerFetches();
+    (void)svc_->doWork(now_);
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::Ongoing);
+    votes_.clear();
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u) << "the client's retry";
+    ASSERT_EQ(votes_.size(), 1u) << "the votes are asked again: the old vote died with the old load";
+    vote(votes_[0], static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation), 0x00070000, 123);
+    (void)svc_->doWork(now_);
+    completeWithMarkers(pid, {{kCw, 0}});
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    const auto a = lastAnswer();
+    EXPECT_EQ(a.errorCode, static_cast<int16_t>(pc::ErrorCode::ConstraintViolation));
+    EXPECT_TRUE(a.hasVote);
+    EXPECT_EQ(a.constraintId, 0x00070000u);
+    EXPECT_EQ(a.failingOffset, 123);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, OrphanedVotesAreForgottenAtUnloadRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    now_ += 31'000'000'000;   // the timeout orphans the vote
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->voteOrphansForTest(), 1u);
+    isLeader_ = false;        // the gateway purges its votes with the old load
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->voteOrphansForTest(), 0u);
+    isLeader_ = true;
+    followerFetches();
+    (void)svc_->doWork(now_);
+    followerFetches();
+    (void)svc_->doWork(now_);
+    ASSERT_TRUE(svc_->isLoaded());
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareAbort) << "the reload re-drives the persisted abort";
+    completeWithMarkers(pid, {{kCw, 0}});
+    answers_.frames.clear();
+    ASSERT_EQ(addPartitions("tx", pid, ep, {{kCw, 0}}), 0);
+    votes_.clear();
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    EXPECT_EQ(votes_.size(), 1u) << "no answer of the old load will ever come: nothing to wait for";
+}
+
+TEST_F(CheckedWritesTxnCoordinatorTest, RememberedNoAnswersALateRetry) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    vote(votes_[0], static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation), 0x00070000, 123);
+    (void)svc_->doWork(now_);
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareAbort);
+    std::size_t n = endTxn("tx", pid, ep, true);   // the abort is still writing its markers
+    ASSERT_GT(n, 0u);
+    EXPECT_EQ(syncAnswer(n).errorCode, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+    completeWithMarkers(pid, {{kCw, 0}});
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::CompleteAbort);
+    answers_.frames.clear();
+    n = endTxn("tx", pid, ep, true);   // the answer was lost: the client asks again
+    ASSERT_GT(n, 0u);
+    const auto a = syncAnswer(n);
+    EXPECT_EQ(a.errorCode, static_cast<int16_t>(pc::ErrorCode::ConstraintViolation)) << "the same no, not 19";
+    EXPECT_TRUE(a.hasVote);
+    EXPECT_EQ(a.constraintId, 0x00070000u);
+    EXPECT_EQ(a.failingOffset, 123);
+    n = endTxn("tx", pid, static_cast<int16_t>(ep + 1), true);   // another epoch is the coordinator's to answer
+    ASSERT_GT(n, 0u);
+    EXPECT_EQ(syncAnswer(n).errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidProducerEpoch));
+    ASSERT_EQ(addPartitions("tx", pid, ep, {{kPlain, 0}}), 0);   // a new transaction: the old no is history
+    now_ += 31'000'000'000;   // it times out and aborts
+    (void)svc_->doWork(now_);
+    completeWithMarkers(pid, {{kPlain, 0}});
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::CompleteAbort);
+    n = endTxn("tx", pid, ep, true);
+    ASSERT_GT(n, 0u);
+    const auto b = syncAnswer(n);
+    EXPECT_EQ(b.errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidTxnState)) << "not the previous transaction's no";
+    EXPECT_FALSE(b.hasVote);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, RememberedNoBelowVersionSeventeenHasNoTrailerRegression) {
+    clientVersion_ = pc::kClientVersionCheckedWrites - 1;
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    vote(votes_[0], static_cast<uint16_t>(pc::ErrorCode::TxnConflict), 0, 9);
+    (void)svc_->doWork(now_);
+    completeWithMarkers(pid, {{kCw, 0}});
+    const std::size_t n = endTxn("tx", pid, ep, true);
+    ASSERT_GT(n, 0u);
+    EXPECT_EQ(n, pc::EndTxnResponse::ENCODED_SIZE);
+    const auto a = syncAnswer(n);
+    EXPECT_EQ(a.errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_FALSE(a.hasVote);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, RememberedNoOfANamespaceIsForgottenWithItRegression) {
+    ctx_.sessionNsId = kNs;
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCwNs, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    rune::gateway::TxnVoteResult no;
+    no.code = static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation);
+    svc_->onTxnVoteResult(kCwNs, 0, pid, ep, svc_->coordinatorEpoch(), no);
+    (void)svc_->doWork(now_);
+    completeWithMarkers(pid, {{kCwNs, 0}});
+    ASSERT_EQ(answers_.frames.size(), 1u) << "the no was answered: the transaction is complete";
+    EXPECT_GT(svc_->inMemoryEntriesOfNamespaceForTest(kNs), 1u) << "the transaction, its last put and the remembered no";
+    for (int i = 0; i < 8 && svc_->tombstoneNamespace(kNs, 64, now_) != rune::node::ReapStatus::Done; ++i) {
+        followerFetches();
+        (void)svc_->doWork(now_);
+    }
+    EXPECT_EQ(svc_->inMemoryEntriesOfNamespaceForTest(kNs), 0u);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, AllYesAndTheTimeoutInOnePassIsNeverACommitRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    vote(votes_[0]);          // the last yes is in ...
+    now_ += 31'000'000'000;   // ... and so is the deadline: the sweep (first in doWork) decides before the gate
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareAbort);
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    EXPECT_EQ(lastAnswer().errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidTxnState));
 }

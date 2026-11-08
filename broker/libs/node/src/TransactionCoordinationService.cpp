@@ -216,7 +216,11 @@ bool TransactionCoordinationService::load_(int64_t nowNs)
     stuckMarkers_  = 0;
     nextStuckScanNs_ = 0;
     publishStuckMarkers_();
-    if (gateway_) (void)gateway_->purgeQueuedMarkers(coordinatorEpoch_);   // older epochs' leftovers
+    if (gateway_) {
+        (void)gateway_->purgeQueuedMarkers(coordinatorEpoch_);   // older epochs' leftovers
+        (void)gateway_->purgeTxnVotes(coordinatorEpoch_);
+    }
+    recoveredAtNs_ = nowNs;   // reload stamped every recovered Ongoing transaction with it: all their partitions vote (R11c)
     if (txnState_ != nullptr) {
         // I7: the next pid lies at or above every ceiling a previous coordinator
         // persisted (idempotent pids are recorded nowhere else) and above every
@@ -257,7 +261,10 @@ void TransactionCoordinationService::unload_()
     stuckMarkers_  = 0;
     nextStuckScanNs_ = 0;
     publishStuckMarkers_();
-    if (gateway_) (void)gateway_->purgeQueuedMarkers(coordinatorEpoch_ + 1);   // this (now old) epoch
+    if (gateway_) {
+        (void)gateway_->purgeQueuedMarkers(coordinatorEpoch_ + 1);   // this (now old) epoch
+        (void)gateway_->purgeTxnVotes(coordinatorEpoch_ + 1);
+    }
     coordinator_.clear();
     pidCeilingPending_       = -1;
     pidCeilingPendingOffset_ = -1;
@@ -317,8 +324,8 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
     if (completingHolds_ != 0) work += releaseCommittedHolds_();   // #438
     // Drive coordinator timeout aborts (sets markersPending on timed-out txns).
     work += coordinator_.doWork(nowNs);
-    // After the timeout sweep, so a gate whose transaction just timed out answers 19 in this pass (correctness
-    // rests on staleVoteCode_; the order only saves a pass).
+    // After the timeout sweep: a gate whose transaction just timed out answers 19 in this pass, even when its last
+    // yes arrived in it (staleVoteCode_ sees the Prepare* state); before it, that yes would commit a timed-out transaction.
     if (!voteGates_.empty()) work += processVoteGates_(nowNs);
     work += retryRefusedMarkers_(nowNs);
     work += retryDeferredCompletions_(nowNs);
@@ -552,6 +559,10 @@ void TransactionCoordinationService::forgetNamespace_(uint32_t nsId)
         if (rune::coordination::parseScopedId(it->second).nsId == nsId) it = pidIndex_.erase(it);
         else ++it;
     }
+    for (auto it = lastVoteNo_.begin(); it != lastVoteNo_.end();) {
+        if (rune::coordination::parseScopedId(it->first).nsId == nsId) it = lastVoteNo_.erase(it);
+        else ++it;
+    }
     // Belt-and-braces for the #663 rule: completion already erases a candidate entry, and a gated transaction is
     // unsettled, so its namespace never reaches here with a gate open.
     for (auto it = voteCandidatesAtAdd_.begin(); it != voteCandidatesAtAdd_.end();) {
@@ -569,6 +580,7 @@ std::size_t TransactionCoordinationService::inMemoryEntriesOfNamespaceForTest(ui
     for (const auto& kv : pidIndex_) n += rune::coordination::parseScopedId(kv.second).nsId == nsId ? 1 : 0;
     for (const auto& kv : voteCandidatesAtAdd_) n += rune::coordination::parseScopedId(kv.first).nsId == nsId ? 1 : 0;
     for (const VoteGate& g : voteGates_) n += rune::coordination::parseScopedId(g.txnId).nsId == nsId ? 1 : 0;
+    for (const auto& kv : lastVoteNo_) n += rune::coordination::parseScopedId(kv.first).nsId == nsId ? 1 : 0;
     return n;
 }
 
@@ -899,19 +911,36 @@ int TransactionCoordinationService::processPrepareGates_()
 // ---------------------------------------------------------------------------
 // Checked writes Part 11: the vote gate of EndTxn(commit) (see the header).
 // ---------------------------------------------------------------------------
-bool TransactionCoordinationService::votesEnabled_() const
+bool TransactionCoordinationService::votesWired_() const
 {
     // Also a way to ask (gateway or seam) and to write the markers that answer the commit (gateway or seam).
-    return voteCandidate_ && topics_ != nullptr && clusterVotes() && (voteFnOverride_ || gateway_ != nullptr) &&
+    return voteCandidate_ && topics_ != nullptr && (voteFnOverride_ || gateway_ != nullptr) &&
            (gateway_ != nullptr || appendFnOverride_);
 }
 
-bool TransactionCoordinationService::voteGated_(const tx::TransactionalId& txnId, int64_t producerId,
-                                                int16_t producerEpoch) const
+bool TransactionCoordinationService::votesEnabled_() const
 {
-    for (const VoteGate& g : voteGates_)
-        if (g.txnId == txnId && g.producerId == producerId && g.producerEpoch == producerEpoch) return true;
-    return false;
+    return votesWired_() && clusterVotes();
+}
+
+std::vector<TransactionCoordinationService::VoteGate>::iterator TransactionCoordinationService::findVoteGate_(
+    const tx::TransactionalId& txnId, int64_t producerId, int16_t producerEpoch)
+{
+    return std::find_if(voteGates_.begin(), voteGates_.end(), [&](const VoteGate& g) {
+        return g.txnId == txnId && g.producerId == producerId && g.producerEpoch == producerEpoch;
+    });
+}
+
+bool TransactionCoordinationService::voteGated_(const tx::TransactionalId& txnId, int64_t producerId,
+                                                int16_t producerEpoch)
+{
+    return findVoteGate_(txnId, producerId, producerEpoch) != voteGates_.end();
+}
+
+void TransactionCoordinationService::orphanVotes_(const VoteGate& g)
+{
+    for (const VoteTarget& t : g.targets)
+        if (t.outstanding) voteOrphans_.emplace(t.topicId, t.partition, g.producerId, g.producerEpoch);
 }
 
 int16_t TransactionCoordinationService::staleVoteCode_(const VoteGate& g)
@@ -926,19 +955,25 @@ int16_t TransactionCoordinationService::staleVoteCode_(const VoteGate& g)
     return r.ok() ? static_cast<int16_t>(pc::ErrorCode::InvalidTxnState) : txnErrorToProtocol(r.errorCode);
 }
 
-void TransactionCoordinationService::noteVoteCandidates_(const pc::TxnTopicPartitionView& parts)
+void TransactionCoordinationService::noteVoteCandidates_(const pc::TxnTopicPartitionView& parts, bool votesOn)
 {
     const auto* m = coordinator_.metadata(txnIdScratch_);
     if (m == nullptr) return;
     VoteCandidates* c = nullptr;   // created by the first candidate: a transaction without any holds no entry
+    const auto entry = [&] {
+        c = &voteCandidatesAtAdd_[txnIdScratch_];
+        if (c->producerId != m->producerId || c->producerEpoch != m->producerEpoch || c->txnStartNs != m->txnStartNs)
+            *c = VoteCandidates{m->producerId, m->producerEpoch, m->txnStartNs, false, {}};   // a previous transaction's leftovers
+    };
+    if (!votesOn) {   // the feature level is not there yet: the transaction may commit after it is, and then nothing is known
+        entry();
+        c->all = true;
+        return;
+    }
     for (std::size_t i = 0; i < parts.size(); ++i) {
         const pc::TxnTopicPartition tp = parts[i];
         if (!voteCandidate_(tp.topicId)) continue;
-        if (c == nullptr) {
-            c = &voteCandidatesAtAdd_[txnIdScratch_];
-            if (c->producerId != m->producerId || c->producerEpoch != m->producerEpoch || c->txnStartNs != m->txnStartNs)
-                *c = VoteCandidates{m->producerId, m->producerEpoch, m->txnStartNs, {}};   // a previous transaction's leftovers
-        }
+        if (c == nullptr) entry();
         const std::string& name = partitionScratch_[i].topic;
         const bool known = std::any_of(c->targets.begin(), c->targets.end(), [&](const VoteTarget& t) {
             return t.partition == tp.partition && t.topic == name;
@@ -959,11 +994,29 @@ bool TransactionCoordinationService::startVoteGate_(const pc::EndTxn& msg, int64
     if (m == nullptr || m->state != tx::TxnState::Ongoing || m->producerId != requestPid_(msg.producerId, msg.sessionId) ||
         m->producerEpoch != msg.producerEpoch)
         return false;   // today's path gives the answer
-    const auto it = voteCandidatesAtAdd_.find(txnIdScratch_);
-    if (it == voteCandidatesAtAdd_.end()) return false;
-    VoteCandidates c = std::move(it->second);
-    voteCandidatesAtAdd_.erase(it);
-    if (c.producerId != m->producerId || c.producerEpoch != m->producerEpoch || c.txnStartNs != m->txnStartNs) return false;
+    VoteCandidates c;
+    if (const auto it = voteCandidatesAtAdd_.find(txnIdScratch_); it != voteCandidatesAtAdd_.end()) {
+        c = std::move(it->second);
+        voteCandidatesAtAdd_.erase(it);
+        if (c.producerId != m->producerId || c.producerEpoch != m->producerEpoch || c.txnStartNs != m->txnStartNs)
+            c = VoteCandidates{};   // a previous transaction's
+    }
+    // R11c / a level bump mid-transaction: what was noted is not everything the transaction wrote to, so every
+    // partition votes (a constrained write is never committed unvoted); a partition that is no candidate says yes.
+    if (c.all || m->txnStartNs <= recoveredAtNs_) {
+        c.targets.clear();
+        const uint32_t nsId = rune::coordination::parseScopedId(m->txnId).nsId;
+        for (const tx::TopicPartition& tp : m->partitions) {
+            const auto topicId = topics_->topicIdForName(nsId, tp.topic);
+            if (!topicId.has_value()) continue;   // as dispatchMarkers_: a topic that does not resolve takes no vote
+            VoteTarget t;
+            t.topic     = tp.topic;
+            t.topicId   = *topicId;
+            t.partition = tp.partition;
+            c.targets.push_back(std::move(t));
+        }
+    }
+    if (c.targets.empty()) return false;
     VoteGate g;
     g.txnId            = m->txnId;
     g.producerId       = m->producerId;
@@ -982,6 +1035,7 @@ bool TransactionCoordinationService::startVoteGate_(const pc::EndTxn& msg, int64
 
 void TransactionCoordinationService::sendVote_(const VoteGate& g, VoteTarget& t, int64_t nowNs)
 {
+    if (voteOrphans_.contains({t.topicId, t.partition, g.producerId, g.producerEpoch})) return;   // one live vote per key: onTxnVoteResult frees it
     const bool sent = voteFnOverride_
         ? voteFnOverride_(t.topic, t.partition, g.producerId, g.producerEpoch)
         : gateway_->sendTxnVote(t.topicId, t.partition, g.producerId, g.producerEpoch, g.coordinatorEpoch) >= 0;
@@ -1000,6 +1054,7 @@ void TransactionCoordinationService::onTxnVoteResult(int32_t topicId, int32_t pa
                                                      const rune::gateway::TxnVoteResult& r) noexcept
 {
     if (!currentEpoch_(coordinatorEpoch)) return;   // an earlier load's vote
+    if (voteOrphans_.erase({topicId, partition, producerId, producerEpoch}) != 0) return;   // its gate is gone: not counted
     for (VoteGate& g : voteGates_) {
         if (g.producerId != producerId || g.producerEpoch != producerEpoch) continue;
         for (VoteTarget& t : g.targets) {
@@ -1020,6 +1075,7 @@ int TransactionCoordinationService::processVoteGates_(int64_t nowNs)
         VoteGate& g = voteGates_[i];
         if (const int16_t stale = staleVoteCode_(g); stale != 0) {   // timed out, fenced or ended: the votes are moot
             sendEndTxnAnswer_(g.sessionId, g.correlationId, stale);
+            orphanVotes_(g);
             voteGates_.erase(voteGates_.begin() + static_cast<std::ptrdiff_t>(i));
             ++work;
             continue;
@@ -1027,6 +1083,7 @@ int TransactionCoordinationService::processVoteGates_(int64_t nowNs)
         if (!g.hasNo) {
             for (VoteTarget& t : g.targets) {
                 if (t.yes || t.outstanding || t.dueNs > nowNs) continue;
+                if (voteOrphans_.contains({t.topicId, t.partition, g.producerId, g.producerEpoch})) continue;   // its turn comes with the old answer
                 ++work;
                 if (!partitionExists_(t.topicId, t.partition)) t.yes = true;   // deleted meanwhile: nothing to judge
                 else sendVote_(g, t, nowNs);
@@ -1038,6 +1095,7 @@ int TransactionCoordinationService::processVoteGates_(int64_t nowNs)
         }
         VoteGate done = std::move(g);
         voteGates_.erase(voteGates_.begin() + static_cast<std::ptrdiff_t>(i));
+        orphanVotes_(done);   // a first no leaves the other partitions' votes out
         ++work;
         prepareVoted_(done, !done.hasNo, nowNs);
     }
@@ -1054,6 +1112,7 @@ void TransactionCoordinationService::prepareVoted_(VoteGate& g, bool commit, int
         return;
     }
     const auto* m = coordinator_.metadata(g.txnId);
+    if (g.hasNo) lastVoteNo_[g.txnId] = RememberedNo{g.producerId, g.producerEpoch, g.no};
     (void)persist_(*m);   // a refused append is retried by the gate
     PrepareGate pg = makeGate_(*m, commit, std::vector<tx::TopicPartition>(m->partitions.begin(), m->partitions.end()),
                                /*respond=*/true, g.sessionId, g.correlationId);
@@ -1084,6 +1143,8 @@ void TransactionCoordinationService::dropDeferred_()
         sendEndTxnAnswer_(g.sessionId, g.correlationId, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
     voteGates_.clear();
     voteCandidatesAtAdd_.clear();
+    voteOrphans_.clear();   // the gateway's votes are purged with them
+    lastVoteNo_.clear();
     for (const auto& [pid, a] : awaiting_)
         if (a.respond) sendEndTxnAnswer_(a.sessionId, a.correlationId, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
     for (ParkedNextTxn& p : parkedNextTxn_) {   // #557: the client re-discovers and retries at the new coordinator
@@ -1149,6 +1210,8 @@ size_t TransactionCoordinationService::handleInitProducerId_(
         if (outCap < pc::InitProducerIdResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
         return resp.encode(out);
     }
+
+    if (txnIdOpt.has_value() && !lastVoteNo_.empty()) lastVoteNo_.erase(*txnIdOpt);
 
     // Call coordinator.  Issue #122: the id is issued to (bound to) the session's principal - once every member
     // supports bound ids (below the feature level: a raw id, nothing rebound).
@@ -1277,7 +1340,8 @@ size_t TransactionCoordinationService::handleAddPartitions_(
         if (meta && txnState_) {
             (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
         }
-        if (votesEnabled_()) noteVoteCandidates_(msg.partitions);
+        if (!lastVoteNo_.empty()) lastVoteNo_.erase(txnIdScratch_);   // a new transaction: the old no is history
+        if (votesWired_()) noteVoteCandidates_(msg.partitions, clusterVotes());
     }
 
     // Encode response: one result entry per partition with the same error code.
@@ -1349,6 +1413,7 @@ size_t TransactionCoordinationService::handleAddOffsets_(
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
+        if (!lastVoteNo_.empty()) lastVoteNo_.erase(txnIdScratch_);   // may open a new transaction
         coordinator_.noteSession(txnIdScratch_, msg.sessionId);   // Task 4: abortAllForSession finds it
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
@@ -1514,14 +1579,40 @@ size_t TransactionCoordinationService::handleEndTxn_(
     // Decode txnId.
     rune::gateway::scopeClientIdInto(ctx, idView_(msg.transactionalId), txnIdScratch_);   // D19
 
-    if (voteGated_(txnIdScratch_, requestPid_(msg.producerId, msg.sessionId), msg.producerEpoch)) {   // one decision at a time
-        const int32_t ver = clientVersionOf_(msg.sessionId);
-        resp.errorCode = static_cast<int16_t>(pc::produceErrorForClient(pc::ErrorCode::ConcurrentTransactions, ver));
-        if (outCap < pc::EndTxnResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
-        return resp.encode(out);
+    const bool commit = (msg.commit != 0);
+    const int64_t requestPid = requestPid_(msg.producerId, msg.sessionId);
+    if (const auto gate = findVoteGate_(txnIdScratch_, requestPid, msg.producerEpoch); gate != voteGates_.end()) {
+        // One decision at a time: the earlier request (its session may be gone) is told to retry, and the new one
+        // takes its place, a commit by waiting for the same votes, an abort by cancelling them.
+        sendEndTxnAnswer_(gate->sessionId, gate->correlationId, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+        if (commit) {
+            gate->sessionId     = msg.sessionId;
+            gate->correlationId = msg.correlationId;
+            return 0;
+        }
+        orphanVotes_(*gate);
+        voteGates_.erase(gate);
+    } else if (commit && !lastVoteNo_.empty()) {
+        // A retry of the commit a no aborted (its answer was lost): the same no, once the abort markers landed.
+        const auto it = lastVoteNo_.find(txnIdScratch_);
+        const auto* m = coordinator_.metadata(txnIdScratch_);
+        if (it != lastVoteNo_.end() && m != nullptr && it->second.producerId == requestPid &&
+            it->second.producerEpoch == msg.producerEpoch &&
+            (m->state == tx::TxnState::PrepareAbort || m->state == tx::TxnState::CompleteAbort)) {
+            const int32_t ver = clientVersionOf_(msg.sessionId);
+            if (outCap < pc::EndTxnResponse::ENCODED_SIZE_V17) return answerCannotFit_(buf, len, out, outCap);
+            if (m->state == tx::TxnState::PrepareAbort) {   // the abort is still writing its markers
+                resp.errorCode = static_cast<int16_t>(pc::produceErrorForClient(pc::ErrorCode::ConcurrentTransactions, ver));
+            } else {
+                resp.errorCode     = static_cast<int16_t>(pc::produceErrorForClient(static_cast<pc::ErrorCode>(it->second.no.code), ver));
+                resp.hasVote       = true;
+                resp.constraintId  = it->second.no.constraintId;
+                resp.failingOffset = it->second.no.failingOffset;
+            }
+            return resp.encodeFor(out, ver);
+        }
     }
 
-    const bool commit = (msg.commit != 0);
     if (commit && startVoteGate_(msg, nowNs)) return 0;   // answered once the votes are in and the markers landed
 
     const auto result = coordinator_.endTransaction(
