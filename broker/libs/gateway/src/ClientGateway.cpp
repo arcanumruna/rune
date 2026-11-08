@@ -7168,6 +7168,10 @@ void ClientGateway::onTxnVoteResult_(const rune::node::WorkerReturn& ret)
 void ClientGateway::onRemoteTxnVote(const rune::replication::TxnVoteMsg& m)
 {
     namespace pcl = rune::protocol::client;
+    if (m.coordinatorNodeId < 0 || m.coordinatorNodeId == thisNodeId_) [[unlikely]] {   // no answer can reach such an origin
+        spdlog::warn("ClientGateway: TxnVote with origin node {} (this node {}) dropped (bug)", m.coordinatorNodeId, thisNodeId_);
+        return;
+    }
     const RemoteVoteKey key{m.coordinatorNodeId, m.token};
     if (remoteVotes_.contains(key)) return;   // a re-sent copy: the first one's answer is still owed
     rune::replication::TxnVoteResponseMsg r{};

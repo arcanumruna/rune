@@ -386,3 +386,19 @@ TEST(CheckedWritesTxnVoteRoutingRegression, AnswerThatMatchesNoFieldIsIgnoredReg
     N.runWorker(2);
     EXPECT_EQ(N.got.size(), 1u);
 }
+
+// A vote naming no possible origin (negative, or this node) is dropped: no entry, no queued answer, no op.
+TEST(CheckedWritesTxnVoteRoutingRegression, VoteFromAnImpossibleOriginIsDroppedRegression) {
+    VoteRig L(1);
+    rune::replication::TxnVoteMsg m{};
+    m.coordinatorEpoch = 9; m.token = 914; m.topicId = 0; m.partition = 0; m.producerId = 77; m.producerEpoch = 1;
+    for (const int32_t origin : {-1, 1}) {
+        m.coordinatorNodeId = origin;
+        L.gw.onRemoteTxnVote(m);
+        L.runWorker(2);
+        EXPECT_EQ(L.gw.remoteTxnVotesForTest(), 0u) << "origin " << origin;
+        EXPECT_EQ(L.gw.txnVoteResponsesQueuedForTest(), 0u) << "origin " << origin;
+        EXPECT_TRUE(L.responsesSent.empty()) << "origin " << origin;
+        EXPECT_EQ(L.voteReturns, 0) << "origin " << origin;
+    }
+}
