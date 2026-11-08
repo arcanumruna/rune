@@ -796,12 +796,16 @@ TEST(CheckedWritesAutoIncCleanerRegression, ManyExpiredProducersDoNotOverflowThe
     for (const bool coalesce : {false, true}) {
         SCOPED_TRACE(name(coalesce));
         const auto dir = tempDir();
+        constexpr int kExpired = 800;   // 800 producers of one batch: past the 64 KiB window
         {
-            Log log(dir.string(), /*segmentBytes=*/1);
+            Log log(dir.string(), /*segmentBytes=*/1 << 20);   // the batches aged together share one segment
             log.recover();
-            constexpr int kExpired = 800;   // 800 producers of one batch: past the 64 KiB window
             for (int i = 0; i < kExpired; ++i) rec(log, i, 1000 + i, 0, uint64_t(i), "insert");
             for (int i = 0; i < 10; ++i) rec(log, kExpired + i, -1, -1, uint64_t(i), "update");
+        }
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);   // from here on a segment per batch
+            log.recover();
             rec(log, kExpired + 10, 7, 0, 999'999, "live", now);
             pad(log, kExpired + 11);
             ageSegments(log, 0, kExpired + 10, exp + 60'000);
