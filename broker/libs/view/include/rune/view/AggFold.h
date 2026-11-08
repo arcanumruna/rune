@@ -24,14 +24,14 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layo
                              const AggLayout& agg, VersionDescriptorCache& vdc,
                              ViewTable& view, ViewTable& contributors, ViewTable& groups,
                              ViewTable* blocks, const rune::storage::LogReadView& lv,
-                             int64_t bound, int64_t& cursor, const FoldSkip& skip);
+                             int64_t bound, int64_t& cursor, const FoldSkip& skip, TxnFold* txn = nullptr);
 
 // 2a and Last-only layouts (no value block): blocks = nullptr.
 FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                              const AggLayout& agg, VersionDescriptorCache& vdc,
                              ViewTable& view, ViewTable& contributors, ViewTable& groups,
                              const rune::storage::LogReadView& lv, int64_t bound,
-                             int64_t& cursor, const FoldSkip& skip);
+                             int64_t& cursor, const FoldSkip& skip, TxnFold* txn = nullptr);
 
 // An aggregate view's fold inputs, built once per ViewInstance.  `blocks` is nullptr iff agg.numBlockCols == 0.
 struct AggregateFold {
@@ -60,6 +60,6 @@ void applyAggregate(AggregateFold& f, const SourceRecord& rec, const Prospect& p
 // The walk of foldProjectionBatch for an aggregate: each committed record prepared into p (reserved once per instance) and applied.
 // The keyed view's fold (f.keyed set); a LegacyU64 view uses foldAggregateBatch.
 FoldStats foldKeyedAggregateBatch(AggregateFold& f, Prospect& p, const rune::storage::LogReadView& lv, int64_t bound, int64_t& cursor,
-                                  const FoldSkip& skip);
+                                  const FoldSkip& skip, TxnFold* txn = nullptr);
 
 } // namespace rune::view
