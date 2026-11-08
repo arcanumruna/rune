@@ -13,13 +13,16 @@
 //     message on ring_.  A full ring (observer not draining) is not an error:
 //     lastPublished_ is left unchanged, so the next cycle retries with the then
 //     current view — the observer always converges on the latest view.
-//   - Observer thread (EXACTLY ONE, enforced): the first thread to call observe()
-//     becomes the only observer (a node may be started on any thread).
+//   - Observer thread (EXACTLY ONE, enforced): bindObserver() — called by
+//     BrokerNode::start() — makes the CALLING thread the only observer.
 //     observe() drains ring_ and returns the latest snapshot; observed_ is owned
 //     by that thread.  observe() from any OTHER thread is refused: logged
 //     critical then std::abort() in ALL builds — a second consumer is a
 //     programming error and a silent "no leader" in release would hide it.
-//     There is no rebinding: the observer is fixed by its first observe().
+//     Before bindObserver() nothing is published (the control thread is not
+//     running) and observe() returns the initial view without draining.
+//     There is no rebinding in production: bindObserver() runs once, from
+//     start().  The one explicit rebind is BrokerNode::bindLeaderObserverForTest.
 //
 //   Everything the CONTROL thread itself needs (gateway leaderView, group / txn
 //   coordinators, admin role hook) MUST use computeOnControl(), never observe():
@@ -103,11 +106,13 @@ public:
     }
 
     // --------------------------------------------------------------- observer
+    /// Make the CALLING thread the one observer (BrokerNode::start()).
+    void bindObserver() noexcept { observer_ = std::this_thread::get_id(); }
+
     /// OBSERVER thread only (enforced): drain published snapshots; return the
-    /// latest.  The first caller becomes the observer; another thread is
-    /// refused (critical log + abort, all builds).
+    /// latest.  Another thread is refused (critical log + abort, all builds).
     LeaderSnapshot observe() noexcept {
-        if (observer_ == std::thread::id{}) observer_ = std::this_thread::get_id();
+        if (observer_ == std::thread::id{}) return observed_;   // unbound: nothing published
         if (std::this_thread::get_id() != observer_) [[unlikely]] {
             refuseForeignObserver_();
             return LeaderSnapshot{};
@@ -138,7 +143,7 @@ private:
     LeaderSnapshot                    lastPublished_{};       // control-thread-owned
     rune::consensus::ControlRing<4096> ring_;                 // control → observer
     LeaderSnapshot                    observed_{};            // observer-thread-owned
-    std::thread::id                   observer_{};            // set by the first observe()
+    std::thread::id                   observer_{};            // set by bindObserver()
 };
 
 } // namespace rune::node

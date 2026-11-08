@@ -222,6 +222,7 @@ struct ThreeNodes {
         for (auto& t : starters) t.join();
         for (const auto& e : failed)
             if (e) std::rethrow_exception(e);
+        for (const int id : ids) nodes[static_cast<std::size_t>(id - 1)]->bindLeaderObserverForTest();   // the joins order it after the starters
     }
     void stop(int id) {
         auto& n = nodes[static_cast<std::size_t>(id - 1)];

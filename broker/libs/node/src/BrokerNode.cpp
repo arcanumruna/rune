@@ -263,6 +263,10 @@ std::unique_ptr<rune::consensus::BackoffIdleStrategy> makeShapedBackoff(const No
 void BrokerNode::start() {
     if (started_) return; // idempotent (controller-owned flag, F9a)
     started_ = true;
+    // F9a fix round 1: the thread that starts the node is the ONE leadership
+    // observer (isLeader/leaderId/... drain the ring; others are refused).
+    // Bound before the control thread exists (ordered by its start).
+    leaderObserver_.bindObserver();
 
     // 2026-10-02: the findings §4 config is the DEFAULT, derived from the host —
     // Aeron mtu / socket buffer / window, shard base ports, worker affinity.

@@ -1553,6 +1553,10 @@ public:
     // LeaderObserver::computeOnControl() instead — never these.
     // -----------------------------------------------------------------------
 
+    /// Test-only: make the CALLING thread the observer (start() bound the thread that ran it).  Legal only while no thread observes:
+    /// a fixture that starts nodes on worker threads and joins them calls it before the first observe().
+    void bindLeaderObserverForTest() noexcept { leaderObserver_.bindObserver(); }
+
     bool   isLeader()  const noexcept;
     rune::consensus::NodeId leaderId() const noexcept;
 
