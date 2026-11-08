@@ -44,6 +44,8 @@
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/NsSlotTable.h>
 
+#include <spdlog/spdlog.h>
+
 namespace rune::node {
 
 /// The most row bytes (each row with its u32 length) one scanPage answers with.
@@ -947,6 +949,9 @@ private:
         inst.counters.ownerMoves       += st.ownerMoves;
         inst.counters.uniquePromotions += st.uniquePromotions;
         inst.counters.txnSpanTableFull += st.txnSpanTableFull;
+        if (st.txnSpanTableFull != 0 && inst.counters.txnSpanTableFull == st.txnSpanTableFull)
+            spdlog::warn("WorkerViewSet: view {}: more than {} transactions open at once; the excess apply at their own offsets (P11-9)",
+                         inst.plan.viewName, rune::view::TxnSpanFence::kSlots);
         inst.counters.txnSuperseded    += st.txnSuperseded;
         if (inst.claims) inst.counters.uniqueConflicts = inst.claims->extras();
 

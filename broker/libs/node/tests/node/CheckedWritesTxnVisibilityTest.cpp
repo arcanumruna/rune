@@ -5,6 +5,9 @@
 
 #include <array>
 
+#include <spdlog/sinks/ringbuffer_sink.h>
+#include <spdlog/spdlog.h>
+
 using namespace rune::node;
 using namespace rune::node::cw;
 using RS = rune::protocol::client::ViewRowResponse;
@@ -238,6 +241,28 @@ TEST(CheckedWritesTxnVisibilityRegression, VetoCountsOnlyRefusedPushesRegression
     EXPECT_EQ(inst()->counters.vetoedCheckpointPushes, 0u) << "the walk through T's own batches dirtied nothing";
     for (int i = 0; i < 100 && inst()->foldCursor <= first + 6; ++i) t.r.pass();
     EXPECT_GT(inst()->counters.vetoedCheckpointPushes, 0u) << "the fenced application had rows to push";
+}
+
+// REGRESSION (Task 8 review 1, D-A): past 64 spans open at once (67 transactions, then their markers) the excess apply at their own
+// offsets; the instance warns once, not per batch.
+TEST(CheckedWritesTxnVisibilityRegression, FullSpanTableWarnsOnceRegression) {
+    const auto sink = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(256);
+    const auto prev = spdlog::default_logger();
+    spdlog::set_default_logger(std::make_shared<spdlog::logger>("capture", sink));
+    {
+        Txv t(0);
+        t.r.dropView(kView);
+        t.r.installProjection(kView + 1, "pproj", /*persisted=*/true);
+        for (int64_t pid = 100; pid < 167; ++pid) t.txn(pid, recs(static_cast<uint64_t>(pid), static_cast<uint64_t>(pid)));
+        for (int64_t pid = 100; pid < 167; ++pid) t.marker(pid, true);
+        t.r.settle();
+        for (uint64_t id = 100; id < 167; ++id) EXPECT_TRUE(t.r.idRow(kView + 1, id).has_value()) << id;
+        EXPECT_EQ(t.r.vs->foldCounters(kView + 1, 0)->txnSpanTableFull, 3u);
+    }
+    spdlog::set_default_logger(prev);
+    int warned = 0;
+    for (const auto& l : sink->last_formatted()) warned += l.find("transactions open at once") != std::string::npos ? 1 : 0;
+    EXPECT_EQ(warned, 1);
 }
 
 // REGRESSION (Task 8 review 1, m4): a discard taken while a marker application is in progress clears the fence with the cursor.  A
