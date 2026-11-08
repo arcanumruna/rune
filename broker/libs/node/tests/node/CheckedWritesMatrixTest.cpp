@@ -363,8 +363,8 @@ public:
 
         checkIndex(r_, model);                                              // (a)
         checkMarkers(model, log, target);
-        std::set<std::string> live;                                         // (b)
-        for (const auto& [id, row] : model.projection()) live.insert(std::to_string(id));
+        std::set<uint64_t> live;                                            // (b)
+        for (const auto& [id, row] : model.projection()) live.insert(live.end(), id);
         EXPECT_EQ(r_.keyIndexKeys(), live) << "(b) the key index holds the live keys of the accepted records";
         checkDelivered_(model);                                             // (c)
         checkViews(r_, model, log, kProj, kCnt);                            // (d)

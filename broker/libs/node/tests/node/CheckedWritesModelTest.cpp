@@ -528,8 +528,8 @@ private:
         }
         for (const int64_t off : acceptedByAck_)
             EXPECT_EQ(model.verdicts().count(off), 0u) << "IntentVerdictsExact: the record at " << off << " was acked as accepted but the model rejects it";
-        std::set<std::string> live;
-        for (const auto& [id, row] : model.projection()) live.insert(std::to_string(id));
+        std::set<uint64_t> live;
+        for (const auto& [id, row] : model.projection()) live.insert(live.end(), id);
         EXPECT_EQ(rig_.keyIndexKeys(), live) << "KeyIndexEqualsLiveKeys";
         EXPECT_EQ(rig_.stats()->keyIndexSkippedMalformed, 0u);
     }
@@ -1039,8 +1039,8 @@ private:
         }
         for (const int64_t off : acceptedByAck_)
             EXPECT_EQ(model.verdicts().count(off), 0u) << "IntentVerdictsExact: the record at " << off << " was acked as accepted but the model rejects it";
-        std::set<std::string> live;
-        for (const auto& [id, row] : model.projection()) live.insert(std::to_string(id));
+        std::set<uint64_t> live;
+        for (const auto& [id, row] : model.projection()) live.insert(live.end(), id);
         EXPECT_EQ(rig_.keyIndexKeys(), live) << "KeyIndexEqualsLiveKeys";
         EXPECT_EQ(rig_.stats()->keyIndexSkippedMalformed, 0u);
     }

@@ -56,7 +56,7 @@ TEST(CheckedWritesTxnWorker, VoteYesThenCommitAppliesInOneStep) {
     EXPECT_TRUE(k.r.keyIndexKeys().empty()) << "nothing applied before the marker";
     k.r.marker(31, true);
     ASSERT_TRUE(k.r.driveUntilJudged());
-    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<std::string>{"1", "2"}));
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{1, 2}));
     EXPECT_EQ(k.stats().votesYes, 1u);
 }
 
@@ -74,7 +74,7 @@ TEST(CheckedWritesTxnWorker, InsertOfAnExistingKeyVotesKeyExists) {
     EXPECT_EQ(v.failingOffset, base + 1);
     k.r.marker(32, false);
     ASSERT_TRUE(k.r.driveUntilJudgeReaches());
-    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<std::string>{"1"})) << "the aborted transaction's 7 is never applied";
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{1})) << "the aborted transaction's 7 is never applied";
     EXPECT_EQ(k.stats().votesNo, 1u);
     EXPECT_EQ(k.stats().votesNoKeyExists, 1u);
 }
@@ -91,7 +91,7 @@ TEST(CheckedWritesTxnWorker, NonVotingTransactionAnswersYesWithoutWriting) {
     EXPECT_TRUE(k.r.txnJudgeOffsetsInLog().empty());
     k.r.marker(33, true);
     ASSERT_TRUE(k.r.driveUntilJudged());
-    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<std::string>{"4", "5"}));
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{4, 5}));
 }
 
 // P11-1: a partition that is not a verdict source answers yes at once and writes nothing.
@@ -189,7 +189,7 @@ TEST(CheckedWritesTxnWorker, MarkerAnswerWaitsForFinalizeRegression) {
     for (int i = 0; i < 600 && !k.r.markerAnswer(38); ++i) k.r.pass();
     ASSERT_TRUE(k.r.markerAnswer(38));
     EXPECT_GE(*k.r.markerAnswer(38), 0);
-    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<std::string>{"1"})) << "applied when the marker is answered";
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{1})) << "applied when the marker is answered";
 }
 
 // P11-10: on a verdict source read_uncommitted is served as read_committed - an aborted transaction never reaches a consumer.
@@ -420,7 +420,7 @@ TEST(CheckedWritesTxnWorker, AbortWhileTheScanWaitsForTheHwWritesNoJudgeRegressi
     EXPECT_GE(v.judgeOffset, 0);
     k.r.marker(49, true);
     ASSERT_TRUE(k.r.driveUntilJudged());
-    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<std::string>{"5"}));
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{5}));
     EXPECT_FALSE(back) << "K stepped back";
     k.r.onEveryPass({});
 }
@@ -469,13 +469,13 @@ TEST(CheckedWritesTxnWorker, AtomicBatchPastTheKnobIsRejectedAcrossAFailoverRegr
     };
     EXPECT_FALSE(k.r.vs->verdictSource(VerdictRig::kSrc, 0)->stalled());
     EXPECT_TRUE(rejectedWhole());
-    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<std::string>{"1"}));
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{1}));
     EXPECT_EQ(k.stats().atomicTooLarge, 1u);
     k.r.failover();
     ASSERT_TRUE(k.r.ack(k.r.produceFrame({ups(2)}, kLeader)));
     ASSERT_TRUE(k.r.driveUntilJudged());
     EXPECT_TRUE(rejectedWhole()) << "the new leader keeps the rejection";
-    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<std::string>{"1", "2"}));
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{1, 2}));
 }
 
 namespace {
@@ -790,10 +790,10 @@ TEST(CheckedWritesTxnWorker, TxnPairCommitsOnBothOrNeither) {
     TxnPair t;
     t.write(70, {ins(1)}, {ins(2)});
     EXPECT_TRUE(t.end(70));
-    EXPECT_EQ(t.a.keyIndexKeys(), (std::set<std::string>{"1"}));
-    EXPECT_EQ(t.b.keyIndexKeys(), (std::set<std::string>{"2"}));
+    EXPECT_EQ(t.a.keyIndexKeys(), (std::set<uint64_t>{1}));
+    EXPECT_EQ(t.b.keyIndexKeys(), (std::set<uint64_t>{2}));
     t.write(71, {ins(1)}, {ins(3)});   // 1 exists on a: a votes KeyExists
     EXPECT_FALSE(t.end(71));
-    EXPECT_EQ(t.a.keyIndexKeys(), (std::set<std::string>{"1"}));
-    EXPECT_EQ(t.b.keyIndexKeys(), (std::set<std::string>{"2"})) << "b's yes is aborted with a's no";
+    EXPECT_EQ(t.a.keyIndexKeys(), (std::set<uint64_t>{1}));
+    EXPECT_EQ(t.b.keyIndexKeys(), (std::set<uint64_t>{2})) << "b's yes is aborted with a's no";
 }

@@ -477,14 +477,14 @@ public:
         holdJudge_ = on;
         vs->holdJudgesForTest(on);
     }
-    /// The ids in [0, 4096) the key index holds, as decimal strings; the table's size must be that many.
-    std::set<std::string> keyIndexKeys() {
-        std::set<std::string> out;
+    /// The ids in [0, 4096) the key index holds; the table's size must be that many.
+    std::set<uint64_t> keyIndexKeys() {
+        std::set<uint64_t> out;
         const uint32_t kw = keyWidthOf(keyShape_);
         std::string key(kw, '\0');
         for (uint64_t id = 0; id < 4096; ++id) {
             for (uint32_t i = 0; i < kw; ++i) key[i] = i < 8 ? static_cast<char>(id >> (8 * i)) : '\0';
-            if (vs->keyIndexContainsForTest(kSrc, tuning_.partition, key)) out.insert(std::to_string(id));
+            if (vs->keyIndexContainsForTest(kSrc, tuning_.partition, key)) out.insert(out.end(), id);
         }
         EXPECT_EQ(out.size(), vs->keyIndexSizeForTest(kSrc, tuning_.partition)) << "a key outside [0, 4096)";
         return out;

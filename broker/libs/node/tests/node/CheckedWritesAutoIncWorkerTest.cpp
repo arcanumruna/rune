@@ -530,7 +530,7 @@ TEST(CheckedWritesAutoIncWorker, AbortedTransactionBurnsItsIds) {
     Producer p{r, 42};
     EXPECT_EQ(p.createIds(1), std::vector<uint64_t>{3});
     ASSERT_TRUE(r.driveUntilJudged());
-    EXPECT_EQ(r.keyIndexKeys(), (std::set<std::string>{"3"}));
+    EXPECT_EQ(r.keyIndexKeys(), (std::set<uint64_t>{3}));
     EXPECT_EQ(r.autoIncStats().idsBurned, 2u);
 }
 
