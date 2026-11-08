@@ -142,21 +142,31 @@ WalkOut walkView(const rune::storage::LogReadView& view, int64_t from, int64_t b
     return {WalkEnd::Done, walkedUpto};
 }
 
+// A read-back below the marker.  A disk read stops at the next segment base at or above `to`, so an empty answer is read again to
+// just past the marker, which holds at least the marker's batch: empty again is a failed read (an I/O error, a damaged segment,
+// retention below the span), never "nothing left".
+inline rune::storage::LogReadView readSpan(const TxnFold& txn, int64_t at, int64_t to, int64_t marker) {
+    rune::storage::LogReadView v = txn.reader.read(at, to);
+    if (v.empty()) v = txn.reader.read(at, marker + 1);
+    return v;
+}
+
 // The supersede notes of the segment of `pid`'s span from `from` (P11-3a): T's keys up to the first that does not fit, each with
 // last_T over the rest of the span, and per key the last offset below the marker of another writer's record applied before it - plain and not rejected, or of a transaction not open in the
 // fence at its offset (it closed below the marker; an aborted one is skipped by the partition's aborted index, which every fold path
-// is handed).  Returns the segment's end.
+// is handed).  Returns the segment's end, -1 when a read failed.
 inline int64_t noteSupersede(TxnFold& txn, int64_t pid, int64_t from, int64_t marker, const FoldSkip& skip) {
     namespace b = rune::protocol::batch;
     txn.keys.clear();
     int64_t segEnd = marker;
     for (int64_t at = from; at < marker;) {
-        const rune::storage::LogReadView v = txn.reader.read(at, marker);
-        if (v.empty()) break;
+        const rune::storage::LogReadView v = readSpan(txn, at, marker, marker);
+        if (v.empty()) return -1;
         const int64_t start = at;
         for (std::size_t pos = 0; pos < v.len;) {
             rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
-            if (!r.ensureValid() || r.baseOffset() >= marker) return segEnd;
+            if (!r.ensureValid()) return -1;
+            if (r.baseOffset() >= marker) return segEnd;
             pos += static_cast<std::size_t>(r.totalLength());
             const int16_t attrs = r.attributes();
             const int64_t last  = r.baseOffset() + r.lastOffsetDelta();
@@ -178,7 +188,7 @@ inline int64_t noteSupersede(TxnFold& txn, int64_t pid, int64_t from, int64_t ma
                 if (offset >= from && offset < marker && !isRejectedRecord(skip, offset)) txn.keys.noteOther(key, offset);
             });
         }
-        if (at == start) break;
+        if (at == start) return -1;
     }
     return segEnd;
 }
@@ -193,15 +203,25 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
     TxnSpanFence& fence = txn.fence;
     int64_t at = fence.applyingThrough >= 0 ? fence.applyingThrough + 1 : fence.find(pid)->first;
     std::size_t bytes = 0;
+    const int64_t spanFirst = fence.find(pid)->first;
+    // A failed read stops the application where it stands: the span stays open, applied records stay fenced, and the next call
+    // retries.  It never closes the span, which would let a checkpoint pass records never applied.
+    const auto failed = [&] {
+        if (at > spanFirst) fence.applyingThrough = at - 1;
+        ++stats.txnReadFailed;
+        return false;
+    };
     while (at < marker) {
         const int64_t segEnd = noteSupersede(txn, pid, at, marker, skip);
+        if (segEnd < 0) return failed();
         while (at < segEnd) {
-            const rune::storage::LogReadView v = txn.reader.read(at, segEnd);
-            if (v.empty()) return true;   // nothing left below the marker
+            const rune::storage::LogReadView v = readSpan(txn, at, segEnd, marker);
+            if (v.empty()) return failed();
             const int64_t start = at;
             for (std::size_t pos = 0; pos < v.len && at < segEnd;) {
                 rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
-                if (!r.ensureValid() || r.baseOffset() >= marker) return true;
+                if (!r.ensureValid()) return failed();
+                if (r.baseOffset() >= marker) return true;
                 const auto len = static_cast<std::size_t>(r.totalLength());
                 const int64_t last = r.baseOffset() + r.lastOffsetDelta();
                 pos += len;
@@ -243,7 +263,7 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
                     return false;
                 }
             }
-            if (at == start) return true;
+            if (at == start) return failed();
         }
         at = std::max(at, segEnd);
     }

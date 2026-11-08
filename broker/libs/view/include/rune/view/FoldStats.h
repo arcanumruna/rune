@@ -38,6 +38,7 @@ struct FoldStats {
     uint64_t uniquePromotions = 0;   // unique views: an extra claimant became the owner of a key
     uint64_t txnSpanTableFull = 0;   // P11-9: a transactional batch found the TxnSpanFence full and applied at its own offsets
     uint64_t txnSuperseded    = 0;   // P11-3a: a committed transaction's record another writer superseded before its marker
+    uint64_t txnReadFailed    = 0;   // P11-0: a span read-back below the marker failed: the application waits, the span stays open
 };
 
 } // namespace rune::view

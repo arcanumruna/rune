@@ -162,7 +162,17 @@ struct TxnLog {
         push(std::move(b), 1);
         return base;
     }
+    // Faults: a read from `emptyAt` answers empty once after `emptySkip` good ones; every read from [failFrom, failTo) answers empty.
+    mutable int64_t emptyAt = -1;
+    mutable int     emptySkip = 0;
+    int64_t failFrom = -1, failTo = -1;
+
     [[nodiscard]] rune::storage::LogReadView read(int64_t from, int64_t /*to*/) const {
+        if (from == emptyAt && emptySkip-- == 0) {
+            emptyAt = -1;
+            return {};
+        }
+        if (from >= failFrom && from < failTo) return {};
         for (std::size_t i = 0; i < pos.size(); ++i) {
             if (last[i] < from) continue;
             return {bytes.data() + pos[i], bytes.size() - pos[i], i == 0 ? 0 : last[i - 1] + 1, end};
@@ -471,6 +481,42 @@ TEST(CheckedWritesTxnVisibilityRegression, SupersedeIsPerKeyAboveTheTransactions
     EXPECT_EQ(a.slot(1, 2), 5) << "x passed through g1 and left it";
     EXPECT_EQ(a.slot(3, 2), 30);
     EXPECT_EQ(p.slot(2, 1), 30);
+}
+
+// A read-back that comes back empty below the marker (a compacted gap, an I/O error, a damaged segment) never closes the span: the
+// read is retried to the marker, and a failure that lasts holds the application where it stands, fenced, until reads work again.
+TEST(CheckedWritesTxnVisibilityRegression, EmptyReadBackMidSpanNeverClosesTheSpanRegression) {
+    TxnLog log;
+    log.data({{1, 1, 10}, {2, 1, 20}}, 7);
+    log.data({{3, 1, 30}, {4, 1, 40}}, 7);
+    log.data({{5, 1, 50}, {6, 1, 60}}, 7);
+    const int64_t m = log.marker(7, true);
+    Folder once(false);
+    for (int i = 0; i < 20 && once.fence.applyingThrough < 0; ++i) once.pass(log, log.end, 2);
+    ASSERT_EQ(once.fence.applyingThrough, 1);
+    log.emptyAt = 2;   // the next pass notes from 2, then its apply read from 2 answers empty once
+    log.emptySkip = 1;
+    for (int i = 0; i < 20 && once.cursor <= m; ++i) once.pass(log, log.end, 2);
+    EXPECT_EQ(log.emptyAt, -1) << "the fault fired";
+    EXPECT_EQ(once.present({1, 2, 3, 4, 5, 6}), 6);
+
+    Folder p(false);
+    for (int i = 0; i < 20 && p.fence.applyingThrough < 0; ++i) p.pass(log, log.end, 2);
+    ASSERT_EQ(p.fence.applyingThrough, 1);
+    log.failFrom = 0;
+    log.failTo = m;
+    for (int i = 0; i < 3; ++i) {
+        const rune::view::FoldStats st = p.pass(log, log.end, 2);
+        EXPECT_EQ(st.txnReadFailed, 1u);
+    }
+    EXPECT_EQ(p.cursor, m);
+    EXPECT_TRUE(p.fence.fenced()) << "the applied half stays fenced";
+    EXPECT_EQ(p.fence.count, 1);
+    EXPECT_EQ(p.present({1, 2, 3, 4, 5, 6}), 2);
+    log.failFrom = log.failTo = -1;
+    for (int i = 0; i < 20 && p.cursor <= m; ++i) p.pass(log, log.end, 2);
+    EXPECT_EQ(p.present({1, 2, 3, 4, 5, 6}), 6);
+    EXPECT_FALSE(p.fence.fenced());
 }
 
 // A transaction with more keys than one segment notes applies in segments, each superseded by the writes above it; with a pass cap
