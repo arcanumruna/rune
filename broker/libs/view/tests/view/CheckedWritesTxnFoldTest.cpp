@@ -71,7 +71,8 @@ TEST(CheckedWritesTxnSpanFence, FencedWhileAnApplicationIsInProgress) {
     EXPECT_FALSE(f.fenced());   // an open span alone never holds reads (P11-9): its rows are simply not there yet
     f.applyingThrough = 12;
     EXPECT_TRUE(f.fenced());
-    f.close(3);   // the application completed with the span
+    f.close(3);   // the application completed with the span: the walk resets its resume point
+    f.applyingThrough = -1;
     EXPECT_FALSE(f.fenced());
     f.atomicThrough = 40;
     EXPECT_TRUE(f.fenced());
@@ -82,6 +83,17 @@ TEST(CheckedWritesTxnSpanFence, FencedWhileAnApplicationIsInProgress) {
 
 // ---------------------------------------------------------------------------------------------------------------------------
 // The fold: one in-memory log, a projection (orderId -> amount) and an aggregate by userId (count(*), last(amount)).
+
+// Closing a span other than the one being applied keeps the application's resume point.
+TEST(CheckedWritesTxnSpanFenceRegression, ClosingAnotherSpanKeepsTheApplicationRegression) {
+    TxnSpanFence f;
+    ASSERT_TRUE(f.add(7, 10));
+    ASSERT_TRUE(f.add(8, 12));
+    f.applyingThrough = 14;
+    f.close(8);
+    EXPECT_EQ(f.applyingThrough, 14);
+    EXPECT_TRUE(f.fenced());
+}
 
 rune::codec::Descriptor orderSource() {
     return rune::codec::DescriptorBuilder("order", 1)

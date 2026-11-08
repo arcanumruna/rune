@@ -337,6 +337,7 @@ void walkFold(const rune::storage::LogReadView& first, int64_t bound, int64_t& c
         units += applied;
         if (!done) break;
         fence->close(w.pid);
+        fence->applyingThrough = -1;
         cursor = from = w.at + 1;
         if (txn->budget > 0) {
             const int64_t rest = txn->budget - (cursor - start) - units;

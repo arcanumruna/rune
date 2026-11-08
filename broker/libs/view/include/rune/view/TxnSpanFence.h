@@ -22,6 +22,7 @@ struct TxnSpanFence {
     std::array<TxnSpan, kSlots> open{};
     uint8_t count = 0;
     // A marker application the pass budget stopped: the span's records at or below it are applied, the fold stands at the marker.
+    // Only the walk that finishes that application resets it: closing another span (an abort marker, the judge) leaves it.
     int64_t applyingThrough = -1;
     // An atomic batch the pass cap cut ends here: its records at or below the cursor are applied, the rest are not yet.
     int64_t atomicThrough = -1;
@@ -45,7 +46,6 @@ struct TxnSpanFence {
             if (open[i].pid != pid) continue;
             open[i] = open[--count];
             open[count] = TxnSpan{};
-            applyingThrough = -1;
             return;
         }
     }
