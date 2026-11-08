@@ -13,9 +13,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <string_view>
 #include <vector>
+
+#include <rune/view/ViewKeyHash.h>
 
 namespace rune::view {
 
@@ -26,6 +27,9 @@ public:
     static constexpr std::size_t kArenaBytes = 64u << 10;
 
     SupersedeKeys() : slots_(kSlots), arena_(kArenaBytes), used_(kMaxKeys) {}
+    /// The worker's table hash seed: client-chosen keys must not cluster into one probe chain.  Set once, before any key.
+    void seed(uint64_t s) noexcept { seed_ = s; }
+    [[nodiscard]] std::size_t homeForTest(std::string_view key) const noexcept { return home_(key); }
 
     static constexpr uint64_t kNoTouches = UINT64_MAX;
 
@@ -89,16 +93,20 @@ private:
         int64_t  lastT = -1, lastOther = -1;
     };
     [[nodiscard]] std::size_t probe_(std::string_view key) const noexcept {
-        std::size_t i = std::hash<std::string_view>{}(key) & (kSlots - 1);
+        std::size_t i = home_(key);
         while (slots_[i].used && std::string_view(arena_.data() + slots_[i].at, slots_[i].len) != key) i = (i + 1) & (kSlots - 1);
         return i;
+    }
+
+    [[nodiscard]] std::size_t home_(std::string_view key) const noexcept {
+        return static_cast<std::size_t>(viewKeyHash({reinterpret_cast<const uint8_t*>(key.data()), key.size()}, seed_)) & (kSlots - 1);
     }
 
     std::vector<Slot>     slots_;
     std::vector<char>     arena_;
     std::vector<uint32_t> used_;
     std::size_t           count_ = 0, arenaUsed_ = 0;
-    uint64_t              lastToken_ = 0;
+    uint64_t              lastToken_ = 0, seed_ = 0;
 };
 
 } // namespace rune::view

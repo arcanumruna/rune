@@ -95,6 +95,18 @@ TEST(CheckedWritesTxnSpanFenceRegression, ClosingAnotherSpanKeepsTheApplicationR
     EXPECT_TRUE(f.fenced());
 }
 
+// The key set hashes with the worker's seed, as the view tables do: another seed places keys elsewhere.
+TEST(CheckedWritesTxnSpanFenceRegression, SupersedeKeysHashWithTheWorkersSeedRegression) {
+    rune::view::SupersedeKeys a, b;
+    b.seed(0x9E3779B97F4A7C15ull);
+    int moved = 0;
+    for (int k = 0; k < 16; ++k) {
+        const std::string key = "key-" + std::to_string(k);
+        moved += a.homeForTest(key) != b.homeForTest(key) ? 1 : 0;
+    }
+    EXPECT_GE(moved, 12);
+}
+
 rune::codec::Descriptor orderSource() {
     return rune::codec::DescriptorBuilder("order", 1)
         .add("orderId", P::Int64, 1, true)
