@@ -245,10 +245,20 @@ public:
     void markDirty(uint32_t rid) noexcept;
     // A row was dirtied or deleted since the last drainDirty(): a checkpoint now would carry a delta.
     [[nodiscard]] bool hasDirty() const noexcept { return !dirtyList_.empty() || !deleted_.empty(); }
-    // The dirty set's growth past its warm-start reserve (P11-9): it grows with the window between two checkpoints, which an
-    // ordinary transaction's span can make long, so the view set charges it as view memory.
+    // The dirty set's growth past twice its warm-start reserve (P11-9): it grows with the window between two checkpoints, which an
+    // ordinary transaction's span can make long, so the view set charges it as view memory.  trimDirty gives it back.
     [[nodiscard]] size_t dirtyBytes() const noexcept {
-        return dirtyList_.capacity() * sizeof(uint32_t) + deleted_.capacity() * sizeof(DeletedEntry) + deletedKeyBytes_.capacity() - dirtyReserved_;
+        const size_t b = dirtyList_.capacity() * sizeof(uint32_t) + deleted_.capacity() * sizeof(DeletedEntry) + deletedKeyBytes_.capacity();
+        return b > 2 * dirtyReserved_ ? b - 2 * dirtyReserved_ : 0;
+    }
+    // After a drain: a dirty set grown past twice its reserve (a long window) is reallocated at the reserve, which follows the
+    // index (a grown table's warm start).  Cold: one allocation after such a window, none otherwise.
+    void trimDirty() {
+        if (dirtyBytes() == 0 || hasDirty()) return;
+        std::vector<uint32_t>().swap(dirtyList_);
+        std::vector<DeletedEntry>().swap(deleted_);
+        std::vector<uint8_t>().swap(deletedKeyBytes_);
+        reserveDirty_();
     }
 
     // Calls `emit(rid, row, deleted, key)` once for every row dirtied (an
@@ -539,11 +549,17 @@ private:
     std::vector<uint8_t>  dirty_;
     std::vector<uint64_t> dirtyKeys_;   // TODO: on a wide table this holds the hashed slot word, not the key; do not consume it
     std::vector<uint32_t> dirtyList_; // rids marked dirty this interval, each pushed once (coalesced)
-    size_t                dirtyReserved_ = 0;   // the dirty set's bytes after the constructor's reserve
+    size_t                dirtyReserved_ = 0;   // the dirty set's bytes after its reserve (reserveDirty_)
 
     struct DeletedEntry { uint32_t rid; uint64_t key; };
     std::vector<DeletedEntry> deleted_; // erase()'d {rid,key} pairs pending drainDirty()
     std::vector<uint8_t> deletedKeyBytes_; // wide tables: keyWidth_ bytes per deleted_ entry, in the same order
+    void reserveDirty_() {
+        dirtyList_.reserve(main_.cap);
+        deleted_.reserve(256);
+        deletedKeyBytes_.reserve(256 * headerLen_);
+        dirtyReserved_ = dirtyList_.capacity() * sizeof(uint32_t) + deleted_.capacity() * sizeof(DeletedEntry) + deletedKeyBytes_.capacity();
+    }
 };
 
 } // namespace rune::view

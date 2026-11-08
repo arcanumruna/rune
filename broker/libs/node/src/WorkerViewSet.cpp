@@ -1141,6 +1141,7 @@ bool WorkerViewSet::tryPushDelta_(ViewInstance& inst) {
     channel_.deltas.commit(claim);
 
     inst.pendingValid = false;
+    releaseWindow_(inst);
     return true;
 }
 
@@ -1163,6 +1164,8 @@ bool WorkerViewSet::tryPushDeltaParts_(ViewInstance& inst) {
     }
     inst.pendingSent  = 0;
     inst.pendingValid = false;
+    std::vector<uint8_t>().swap(inst.pendingDelta);   // a run's buffer is past one message: give it back
+    releaseWindow_(inst);
     return true;
 }
 

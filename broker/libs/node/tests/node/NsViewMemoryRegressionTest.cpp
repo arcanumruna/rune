@@ -457,16 +457,16 @@ TEST(NsViewMemoryRegression, SetViewSetReplaysBootSlotsRegression) {
     EXPECT_GT(vs.nsViewMemBytes(3), 0u);
 }
 
-// REGRESSION (P11-9, Task 8 step 7; T7 re-review 3): the dirty set grows with the window between two checkpoints, which an
-// ordinary transaction's span can make long.  Its growth past the warm-start reserve is view memory: charged to the namespace,
-// so a long window meets the memory limit instead of growing unaccounted.
-TEST(NsViewMemoryRegression, DirtySetGrowthIsChargedRegression) {
+// REGRESSION (P11-9, Task 8 step 7; T7 re-review 3; review 2 I-C): the dirty set grows with the window between two checkpoints,
+// which an ordinary transaction's span can make long, so its growth is charged as view memory (LongSpanChargeComesBackDown...).  A
+// transient view's window is one pass: the growth is given back when the pass discards it, and the charge comes back down with it.
+TEST(WorkerViewSetRegression, TransientDirtyGrowthIsGivenBackAfterThePassRegression) {
     Rig rig(/*limit chunks*/ 0);
     SimLog log;
-    log.append(1, 20000);   // one pass dirties every row: past the dirty list's reserve
+    log.append(1, 20000);   // one pass dirties every row: past twice the dirty list's reserve
     rig.driveA(log);
     const ViewInstance* inst = rig.vs.instanceForTest(kViewA, 0);
     ASSERT_NE(inst, nullptr);
-    ASSERT_GT(inst->table.dirtyBytes(), 0u);
-    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), inst->table.memoryBytes() + inst->table.dirtyBytes());
+    EXPECT_EQ(inst->table.dirtyBytes(), 0u);
+    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), inst->table.memoryBytes());
 }

@@ -110,10 +110,7 @@ ViewTable::ViewTable(RowLayout layout, size_t initialIndexSlots, size_t chunkByt
     // grow in steady state (a reserve() here just gives them a warm start
     // so the first interval's push_backs don't reallocate); dirty_/
     // dirtyKeys_ are sized to the rid space by appendChunk(), below.
-    dirtyList_.reserve(main_.cap);
-    deleted_.reserve(256);
-    deletedKeyBytes_.reserve(256 * headerLen_);
-    dirtyReserved_ = dirtyList_.capacity() * sizeof(uint32_t) + deleted_.capacity() * sizeof(DeletedEntry) + deletedKeyBytes_.capacity();
+    reserveDirty_();
 
     if (prefixWidth_) {
         outer_.init(initialIndexSlots, true, hashSeed_, hashMask_);

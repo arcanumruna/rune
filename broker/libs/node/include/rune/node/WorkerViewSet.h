@@ -569,9 +569,10 @@ private:
     std::vector<uint8_t>  nsViewMemOver_ = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
     uint64_t viewPauses_ = 0, viewResumes_ = 0;
 
-    // The tables, their dirty sets and the held delta: a long window between checkpoints (P11-9) is view memory too.
+    // The tables, their dirty sets' growth and a held delta: a long window between checkpoints (P11-9) is view memory too.  A
+    // pushed window gives its growth back (releaseWindow_), so a view with nothing held carries no charge past its tables.
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
-        std::size_t m = inst.table.memoryBytes() + inst.table.dirtyBytes() + inst.pendingDelta.capacity();
+        std::size_t m = inst.table.memoryBytes() + inst.table.dirtyBytes() + (inst.pendingValid ? inst.pendingDelta.capacity() : 0);
         if (inst.owners) m += inst.owners->memoryBytes() + inst.owners->dirtyBytes();
         if (inst.claims) m += inst.claims->indexTable().memoryBytes() + inst.claims->extrasTable().memoryBytes();
         if (inst.agg) {
@@ -590,6 +591,18 @@ private:
         if (!nsSlots_.matches(inst.nsSlot, inst.nsId)) { ++nsSlotMismatches_; return; }   // stale tag: never charge another namespace
         nsViewMem_[inst.nsSlot] = nsViewMem_[inst.nsSlot] + m - inst.memCharged;
         inst.memCharged = m;
+    }
+    /// A window drained (pushed, or discarded by a transient view): the dirty sets give back their growth and the charge follows.
+    void releaseWindow_(ViewInstance& inst) {
+        inst.table.trimDirty();
+        if (inst.owners) inst.owners->trimDirty();
+        if (inst.agg) {
+            inst.agg->contributors.trimDirty();
+            inst.agg->groups.trimDirty();
+            if (inst.agg->blocks) inst.agg->blocks->trimDirty();
+            if (inst.agg->groupIds) inst.agg->groupIds->trimDirty();
+        }
+        chargeMem_(inst);
     }
     void releaseMem_(ViewInstance& inst) noexcept {
         if (inst.nsSlot == kNoNsSlot || inst.memCharged == 0) return;
@@ -977,6 +990,7 @@ private:
         //    pass), no allocation.
         if (!inst.persisted) {
             discardDirty_(inst);
+            releaseWindow_(inst);
             return work;
         }
         work += buildAndPushCheckpoint_(inst);

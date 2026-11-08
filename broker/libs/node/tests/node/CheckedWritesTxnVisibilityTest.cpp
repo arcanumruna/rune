@@ -271,6 +271,37 @@ TEST(CheckedWritesTxnVisibilityRegression, LongSpanKeepsCheckpointingWithoutARes
     EXPECT_EQ(t.r.pass(), 0) << "and the worker idles: no held delta retried every pass";
 }
 
+// REGRESSION (Task 8 review 2, I-C): the window's dirty growth is view memory while checkpoints are vetoed, and it is given back
+// with the push that ends the window, as is the buffer of a delta past one message.  A persisted view with nothing in flight
+// carries no charge past its tables, before the span and after it.
+TEST(CheckedWritesTxnVisibilityRegression, LongSpanChargeComesBackDownAfterItsPushRegression) {
+    constexpr int64_t kCap = 2000;
+    Txv t(kCap);
+    t.r.dropView(kView);
+    t.r.installProjection(kView + 1, "pproj", /*persisted=*/true);
+    const auto tables = [](const ViewInstance& i) { return i.table.memoryBytes() + (i.owners ? i.owners->memoryBytes() : 0); };
+    ASSERT_EQ(t.r.produceBatch(VerdictRig::batch(recs(1, 50))), 0);
+    t.r.settle();
+    const ViewInstance* inst = t.r.vs->instanceForTest(kView + 1, 0);
+    ASSERT_NE(inst, nullptr);
+    ASSERT_NE(inst->nsSlot, kNoNsSlot) << "the view is charged to a namespace";
+    EXPECT_EQ(inst->memCharged, tables(*inst)) << "a pushed delta leaves no standing charge";
+    const int64_t first = t.r.leo();
+    t.txn(31, recs(10, 10));
+    for (uint64_t from = 100; from < 100 + 5 * kCap; from += 500) ASSERT_EQ(t.r.produceBatch(VerdictRig::batch(recs(from, from + 499))), 0);
+    const int64_t m = t.r.leo();
+    t.marker(31, true);
+    for (int i = 0; i < 50 && inst->foldCursor < first + 9000; ++i) t.r.pass();
+    ASSERT_GE(inst->foldCursor, first + 9000);
+    ASSERT_LE(inst->foldCursor, m) << "the window is still open";
+    EXPECT_GT(inst->memCharged, tables(*inst)) << "the window's dirty growth is charged";
+    t.r.settle();
+    ASSERT_GT(t.r.agent->lastDurableOffset(kView + 1, 0), m);
+    EXPECT_FALSE(inst->pendingValid);
+    EXPECT_EQ(inst->pendingDelta.capacity(), 0u) << "the part run's buffer is given back";
+    EXPECT_EQ(inst->memCharged, tables(*inst)) << "the charge comes back down with the push";
+}
+
 // REGRESSION (Task 8 review 1, D-A): past 64 spans open at once (67 transactions, then their markers) the excess apply at their own
 // offsets; the instance warns once, not per batch.
 TEST(CheckedWritesTxnVisibilityRegression, FullSpanTableWarnsOnceRegression) {
