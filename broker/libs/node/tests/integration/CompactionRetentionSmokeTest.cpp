@@ -1727,17 +1727,6 @@ TEST(CompactionRetentionSmoke, RetentionAfterRestart) {
 // node.start(); reads happen AFTER node.stop() (no duty/cleaner thread running).
 // ===========================================================================
 
-// The first batch at/after `cursor`, hopping to the next segment base while the cursor sits in a segment compaction
-// emptied (Log::read stops at the end of one segment; the serve path, Log::readInto, continues — D26).
-static std::vector<uint8_t> readHopping(Log& log, int64_t cursor, int64_t hwBound) {
-    auto bytes = log.read(cursor, 1 << 20);
-    for (const int64_t base : log.segmentBaseOffsets()) {
-        if (!bytes.empty() || base >= hwBound) break;
-        if (base > cursor) bytes = log.read(base, 1 << 20);
-    }
-    return bytes;
-}
-
 // Scan the ENTIRE committed log up to `hwBound` (single-node: HW == LEO after
 // becomeLeader), returning latest-value-per-key and total live count.  Reading
 // [0, LEO) on a stopped single-node log is the exact set the HW-bounded serve
@@ -1752,10 +1741,12 @@ static void serveScanLatestPerKey(
     liveCountOut = 0;
     // Gateway resolves "Earliest" to logStartOffset (bug-1 fix 0ec0592), NOT 0.
     int64_t cursor = log.logStartOffset();
+    std::vector<uint8_t> buf(1 << 20);
     while (cursor < hwBound) {
-        auto bytes = readHopping(log, cursor, hwBound);
-        if (bytes.empty()) break;
-        RecordBatchReader r(bytes.data(), bytes.size());
+        ReadIntoStatus st{};
+        const auto view = log.readInto(cursor, 1 << 20, buf.data(), buf.size(), st, hwBound);   // hops over a segment compaction emptied (D26)
+        if (st != ReadIntoStatus::Ok) break;
+        RecordBatchReader r(view.data, view.len);
         if (!r.ensureValid()) break;
         bool advanced = false;
         r.forEach([&](std::string_view k, std::string_view v,
@@ -1899,10 +1890,12 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
         finalLog2.recover();
         int64_t c = finalLog2.logStartOffset();
         const int64_t hw = finalLog2.logEndOffset();
+        std::vector<uint8_t> buf(1 << 20);
         while (c < hw) {
-            auto by = readHopping(finalLog2, c, hw);
-            if (by.empty()) break;
-            RecordBatchReader r(by.data(), by.size());
+            ReadIntoStatus st{};
+            const auto view = finalLog2.readInto(c, 1 << 20, buf.data(), buf.size(), st, hw);
+            if (st != ReadIntoStatus::Ok) break;
+            RecordBatchReader r(view.data, view.len);
             if (!r.ensureValid()) break;
             bool adv = false;
             r.forEach([&](std::string_view k, std::string_view, int64_t o, int64_t) {
