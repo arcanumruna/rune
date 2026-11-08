@@ -498,9 +498,16 @@ public:
         installs_.emplace_back(viewTopicId, [=, this] { installRejectViewNow_(viewTopicId, objectId, rule, name, persisted); });
         installs_.back().second();
     }
-    void installProjection(int32_t viewTopicId, const char* name = "proj") {
-        installs_.emplace_back(viewTopicId, [=, this] { installProjectionNow_(viewTopicId, name); });
+    /// `persisted`: installed by the control thread's frame (a restarted node recovers it from its checkpoint).
+    void installProjection(int32_t viewTopicId, const char* name = "proj", bool persisted = false) {
+        if (persisted && !agent) agent = std::make_unique<ViewSnapshotIoAgent>(channel, viewDir_.string(), /*fsyncMs=*/0, backupPolicy);
+        installs_.emplace_back(viewTopicId, [=, this] { installProjectionNow_(viewTopicId, name, persisted); });
         installs_.back().second();
+    }
+    /// Every view instance folds at most `n` records a pass (0 = the cap derived from the delta ring), across restarts too.
+    void setViewPassCap(int64_t n) {
+        viewPassCap_ = n;
+        vs->setPassCapForTest(n);
     }
     /// count(*) of the records folded per id (a view key is an 8-byte field: the tag cannot group).
     void installCountById(int32_t viewTopicId, const char* name = "cnt") {
@@ -541,6 +548,7 @@ public:
         epoch_ = 1;   // the new replica starts at epoch 1
         vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string());
         vs->holdJudgesForTest(holdJudge_);
+        vs->setPassCapForTest(viewPassCap_);
         open();
         if (cutTo < 0) replica->setLastCleanOffset(clean);
         typedWith_(5, keyShape_, keyIndexOn_ && specDelayPasses == 0);
@@ -713,7 +721,7 @@ private:
         ASSERT_TRUE(comp.has_value());
         vs->installView(comp->plan, comp->rowLayout, src, /*persisted=*/false);
     }
-    void installProjectionNow_(int32_t viewTopicId, const char* name) {
+    void installProjectionNow_(int32_t viewTopicId, const char* name, bool persisted) {
         const auto src = verdictSourceDescriptor();
         rune::view::ViewPlan v;
         v.viewName = name; v.key = "id"; v.sources = {{kSrc, "id"}};
@@ -724,6 +732,11 @@ private:
         const rune::codec::Descriptor* srcs[] = {&src};
         auto comp = rune::view::compileView(v, srcs, viewTopicId);
         ASSERT_TRUE(comp.has_value());
+        if (persisted) {
+            comp->plan.persistence = 0;
+            sendInstall_(*comp, src, true);
+            return;
+        }
         vs->installView(comp->plan, comp->rowLayout, src, /*persisted=*/false);
     }
 
@@ -1510,6 +1523,7 @@ private:
         }
     }
     bool keyIndexOn_ = false, holdJudge_ = false;
+    int64_t viewPassCap_ = 0;
     int delayedSpecIn_ = 0;
     std::filesystem::path viewDir_, logDir_;
     NullPartitionTransport transport_;

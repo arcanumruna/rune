@@ -664,6 +664,7 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
             return nullptr;
         }
     }
+    if (passCapForTest_ > 0) inst.maxRecordsPerPass = passCapForTest_;
 
     // Bug A fix (whole-branch re-review): a view installed FOR RESTART
     // RECOVERY must never serve a lazily-created DEFAULT-READY instance, even
@@ -1043,6 +1044,12 @@ int WorkerViewSet::buildAndPushKeyedCheckpoint_(ViewInstance& inst) {
 
 int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
     if (!checkpointSettled(inst)) return 0;   // belt and braces: driveView_ step 0a already returned
+    // P11-0: no checkpoint inside an open span (a refold from it would never see the span's records below it) or an application in
+    // progress.  The dirty rows wait for the first cursor outside every span.
+    if (inst.spanFence.fenced() || inst.spanFence.straddles(inst.foldCursor)) [[unlikely]] {
+        ++inst.counters.vetoedCheckpointPushes;
+        return 0;
+    }
     if (inst.keyed) return buildAndPushKeyedCheckpoint_(inst);
     dirtyEntries_.clear();
     rowOffsets_.clear();

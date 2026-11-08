@@ -136,6 +136,7 @@ struct ViewFoldCounters {
     uint64_t scanRows                = 0;   // rows served by scanPage
     uint64_t scanPages               = 0;   // pages served by scanPage
     uint64_t txnSpanTableFull        = 0;   // P11-9: a transactional batch found the span fence full and applied at its offsets
+    uint64_t vetoedCheckpointPushes  = 0;   // P11-0: a checkpoint not pushed because the cursor stood inside an open span
 };
 
 // Where the persisted checkpoint of an instance stands in a discard (one explicit state, each holding only what it needs):

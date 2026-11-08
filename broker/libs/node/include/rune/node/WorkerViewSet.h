@@ -71,6 +71,8 @@ public:
     [[nodiscard]] uint64_t installRefusals() const noexcept { return installRefusals_; }
     /// Test seam: tables created afterwards AND their hashes with `mask` (0 makes every key collide).
     void setHashMaskForTest(uint64_t mask) noexcept { hashMask_ = mask; }
+    /// Every instance created from now on folds at most `n` records a pass (0 = the derived cap).
+    void setPassCapForTest(int64_t n) noexcept { passCapForTest_ = n; }
     [[nodiscard]] const ViewInstance* instanceForTest(int32_t viewTopicId, int32_t partition) const {
         const auto it = views_.find(instKey(viewTopicId, partition));
         return it == views_.end() ? nullptr : &it->second;
@@ -410,9 +412,6 @@ public:
     [[nodiscard]] int64_t maxRecordsPerPassForTest(int32_t viewTopicId, int32_t partition) const {
         const auto it = views_.find(instKey(viewTopicId, partition));
         return it == views_.end() ? -1 : it->second.maxRecordsPerPass;
-    }
-    void setMaxRecordsPerPassForTest(int32_t viewTopicId, int32_t partition, int64_t n) {
-        if (const auto it = views_.find(instKey(viewTopicId, partition)); it != views_.end()) it->second.maxRecordsPerPass = n;
     }
     [[nodiscard]] bool keyIndexContainsForTest(int32_t src, int32_t partition, std::string_view wireKey) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
@@ -1037,6 +1036,7 @@ private:
     std::string          viewDataDir_;
     uint64_t             hashSeed_ = 0;
     uint64_t             hashMask_ = ~uint64_t{0};
+    int64_t              passCapForTest_ = 0;
     uint64_t             installRefusals_ = 0;
 
     std::unordered_map<int32_t, ViewTemplate>         templates_;        // viewTopicId -> plan template

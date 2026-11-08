@@ -11,7 +11,6 @@ using RS = rune::protocol::client::ViewRowResponse;
 
 namespace {
 constexpr int32_t kView = 0x40000602;
-constexpr uint8_t kLeader = 1;
 
 /// The view-key encoding of a u64 id (big-endian).
 std::array<uint8_t, 8> keyOf(uint64_t id) {
@@ -30,26 +29,30 @@ struct Txv {
     VerdictRig r;
     explicit Txv(int64_t cap) {
         r.typed();
-        r.enableAcks();
+        r.setViewPassCap(cap);
         r.installProjection(kView);
         EXPECT_EQ(r.produce({{99, 99, 1}}), 0);
         for (int i = 0; i < 200 && !r.hasRow(kView, 99); ++i) r.pass();
         EXPECT_TRUE(r.hasRow(kView, 99));
-        r.vs->setMaxRecordsPerPassForTest(kView, 0, cap);
     }
     [[nodiscard]] int visible(uint64_t from, uint64_t to) const {
         int n = 0;
         for (uint64_t id = from; id <= to; ++id) n += r.hasRow(kView, id) ? 1 : 0;
         return n;
     }
-    /// Producer `pid`'s transactional batch of `ids`, acked.
-    void txn(int64_t pid, std::vector<Rec> ids) { ASSERT_TRUE(r.ack(r.produceFrame(ids, kLeader, pid, 0, /*txn=*/true))); }
+    /// Producer `pid`'s transactional batch of `ids`, appended in one pass.
+    void txn(int64_t pid, const std::vector<Rec>& ids) {
+        const int64_t leo = r.leo();
+        enqueue(VerdictRig::batch(ids, pid, 0, {}, /*txn=*/true), pid);
+        r.pass();
+        ASSERT_EQ(r.leo(), leo + static_cast<int64_t>(ids.size()));
+    }
     /// A Produce op of `bytes` on the op ring, without a pass.
-    void enqueue(std::vector<uint8_t> bytes, int64_t pid = -1) {
+    void enqueue(std::vector<uint8_t> bytes, int64_t pid = -1, int32_t seq = 0) {
         WorkerOp op;
         op.type = WorkerOp::Type::Produce; op.topicId = VerdictRig::kSrc; op.partition = 0; op.replica = r.replica.get(); op.logPtr = r.log.get();
         op.sessionId = 1; op.correlationId = ++r.corr; op.durabilityTier = 1;
-        op.producerId = pid; op.producerEpoch = 0; op.baseSequence = pid >= 0 ? 0 : -1;
+        op.producerId = pid; op.producerEpoch = 0; op.baseSequence = pid >= 0 ? seq : -1;
         op.recordBatchBytes = std::move(bytes);
         ASSERT_TRUE(r.worker->tryEnqueueOp(std::move(op)));
     }
@@ -142,9 +145,10 @@ TEST(CheckedWritesTxnVisibilityRegression, CommittedSpanCrossingTheLsoNeverHolds
     Txv t(0);
     t.txn(41, recs(10, 12));
     t.txn(42, recs(20, 20));
+    const int64_t leo = t.r.leo();
     t.marker(41, true);
     t.r.passes(5);
-    ASSERT_TRUE(t.r.markerAnswer(41)) << "A's marker is in the log";
+    ASSERT_EQ(t.r.leo(), leo + 1) << "A's marker is in the log";
     const auto k10 = keyOf(10);
     for (int s = 0; s < 10; ++s) {   // ten seconds of the injected clock, B open throughout
         t.r.now += 1'000'000'000;
@@ -185,4 +189,65 @@ TEST(CheckedWritesTxnVisibilityRegression, HeldReadIsNeverServedInsideAnApplicat
     t.r.settle();
     EXPECT_EQ(t.visible(1, 4), 4);
     EXPECT_EQ(t.visible(40, 49), 10);
+}
+
+namespace {
+// A persisted projection with pass cap 2 over plain records interleaved with a two-batch transaction of producer 31: the fold
+// stands inside the span (first, M] for several passes, with dirty rows of the plain records.
+struct Interleaved {
+    static constexpr std::array<uint64_t, 13> kIds{1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15};
+    Txv t{2};
+    int64_t first = -1, marker = -1;
+    Interleaved() {
+        t.r.dropView(kView);
+        t.r.installProjection(kView + 1, "pproj", /*persisted=*/true);
+        const int64_t base = t.r.leo();
+        t.enqueue(VerdictRig::batch(recs(1, 2)));
+        t.enqueue(VerdictRig::batch(recs(10, 12), 31, 0, {}, /*txn=*/true), 31, 0);
+        t.enqueue(VerdictRig::batch(recs(3, 4)));
+        t.enqueue(VerdictRig::batch(recs(13, 15), 31, 3, {}, /*txn=*/true), 31, 3);
+        t.enqueue(VerdictRig::batch(recs(5, 5)));
+        t.marker(31, true);
+        t.enqueue(VerdictRig::batch(recs(6, 7)));
+        first = base + 2;
+        marker = base + 11;
+    }
+    [[nodiscard]] const ViewInstance* inst() const { return t.r.vs->instanceForTest(kView + 1, 0); }
+    [[nodiscard]] bool folded() const { return inst() != nullptr && inst()->foldCursor >= marker + 3 && inst()->readiness == ViewReadiness::Ready; }
+    [[nodiscard]] std::vector<std::optional<std::pair<int64_t, uint16_t>>> image() const {
+        std::vector<std::optional<std::pair<int64_t, uint16_t>>> out;
+        for (const uint64_t id : kIds) out.push_back(t.r.idRow(kView + 1, id));
+        return out;
+    }
+};
+}  // namespace
+
+// REGRESSION (P11-0, contract 13): a checkpoint at O with first < O <= M would hold none of the span's records and a refold from it
+// would never see the ones below O.  The push is vetoed while the cursor stands in the span; a crash at every pass boundary then
+// recovers the undisturbed tables.
+TEST(CheckedWritesTxnVisibilityRegression, CheckpointNeverInsideAnOpenSpanRegression) {
+    std::vector<std::optional<std::pair<int64_t, uint16_t>>> want;
+    int passes = 0;
+    {
+        Interleaved w;
+        std::vector<int64_t> pushed;
+        for (; passes < 100 && !w.folded(); ++passes) {
+            w.t.r.pass();
+            if (w.inst() != nullptr && (pushed.empty() || pushed.back() != w.inst()->lastEncodedO)) pushed.push_back(w.inst()->lastEncodedO);
+        }
+        ASSERT_TRUE(w.folded());
+        ASSERT_EQ(w.t.r.leo(), w.marker + 3) << "the layout the test assumes";
+        for (const int64_t o : pushed) EXPECT_FALSE(w.first < o && o <= w.marker) << "a checkpoint at " << o << " inside (" << w.first << ", " << w.marker << "]";
+        EXPECT_GT(w.inst()->counters.vetoedCheckpointPushes, 0u) << "the fold stood inside the span with dirty rows (the vacuity guard)";
+        want = w.image();
+        for (const auto& row : want) EXPECT_TRUE(row.has_value());
+    }
+    for (int k = 1; k <= passes; ++k) {   // pass 1 appends the writes (a crash before it loses them, unacked)
+        Interleaved c;
+        c.t.r.passes(k);
+        c.t.r.restart();
+        for (int i = 0; i < 200 && !c.folded(); ++i) c.t.r.pass();
+        EXPECT_TRUE(c.folded()) << "crash after pass " << k;
+        EXPECT_EQ(c.image(), want) << "crash after pass " << k;
+    }
 }
