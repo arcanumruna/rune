@@ -11,6 +11,7 @@
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerPool.h>
 #include <rune/node/TransactionCoordinationService.h>
+#include <rune/node/TxnVoteWiring.h>
 #include <rune/protocol/client/TxnMessages.h>
 #include <rune/storage/Log.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
@@ -22,9 +23,12 @@
 #include <Aeron.h>
 #include <Context.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <memory>
+#include <span>
 #include <vector>
 #include <unistd.h>
 
@@ -654,4 +658,104 @@ TEST(CheckedWritesTxnVoteRoutingRegression, LoadAndUnloadPurgeTheGatewaysVotesRe
     EXPECT_EQ(tcs.txnStateForTest("tx"), rune::transaction::TxnState::Ongoing) << "the old load's answer does not count for the retried gate";
     EXPECT_EQ(tcs.voteGatesForTest(), 1u);
     EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
+}
+
+// BrokerNode's wiring (TxnVoteWiring.h): the candidate set, and the vote sink / predicate on the real gateway.
+TEST(CheckedWritesTxnVoteRouting, CandidateSetHoldsKeyedTopicsAndEveryViewSource) {
+    VoteCandidates c;
+    c.noteWriteSpec(1, true);
+    c.noteWriteSpec(2, false);   // a typed topic without key.index
+    const std::vector<int32_t> sources = {4, 5, 6};
+    c.noteViewSources(sources);
+    EXPECT_TRUE(c.contains(1));
+    EXPECT_FALSE(c.contains(2));
+    EXPECT_FALSE(c.contains(3));   // a plain topic
+    for (const int32_t s : sources) EXPECT_TRUE(c.contains(s));
+    c.forget(1);
+    c.forget(5);
+    EXPECT_FALSE(c.contains(1));
+    EXPECT_FALSE(c.contains(5));
+    EXPECT_TRUE(c.contains(4));
+    EXPECT_TRUE(c.contains(6));
+}
+
+namespace {
+namespace pc = rune::protocol::client;
+// A store-backed coordinator wired to the rig's gateway the way BrokerNode does, with one open transaction on topic 0.
+struct WiredCoordinator {
+    VoteRig R;
+    VoteTmpDir logDir;
+    rune::storage::Log txnLog{logDir.path.string()};
+    PartitionConfig c = [] {
+        PartitionConfig c; c.topicId = 0; c.partitionId = 0; c.selfId = 1; c.minIsr = 1; c.durabilityTier = 1;
+        c.fetchIntervalNs = 1'000'000LL; c.isrCheckIntervalNs = 1'000'000LL; c.pushOnAppend = false; c.replicaLagMaxMs = 1'000'000;
+        return c;
+    }();
+    PartitionReplica txnReplica{c, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &txnLog, &R.t};
+    rune::transaction::ReplicatedTxnStateStore store{&txnReplica};
+    std::unique_ptr<TransactionCoordinationService> tcs = std::make_unique<TransactionCoordinationService>(
+        &store, &R.topics, [] { return true; }, [] { return NodeId{1}; });
+    VoteCandidates candidates;
+    int64_t now = 1'000'000'000;
+    std::array<uint8_t, 1024> req{}, out{};
+    rune::coordination::NsRequestContext ctx{};
+    pc::EndTxn end;
+    std::vector<std::vector<uint8_t>> frames;
+    const std::string txn = "tx";
+
+    explicit WiredCoordinator(bool keyed) {   // the candidates are judged when the partition is added
+        if (keyed) candidates.noteWriteSpec(0, true);
+        R.gw.setOnControlFrame([this](int64_t, const uint8_t* f, std::size_t n) { frames.emplace_back(f, f + n); });
+        tcs->setGateway(&R.gw);
+        R.gw.setTxnService(tcs.get());
+        wireTxnVote(R.gw, *tcs, candidates);
+        for (int i = 0; i < 20 && !tcs->isLoaded(); ++i) step();
+        const std::span<const uint8_t> txnBytes(reinterpret_cast<const uint8_t*>(txn.data()), txn.size());
+        pc::InitProducerId init;
+        init.sessionId = 1; init.correlationId = 1; init.transactionTimeoutMs = 600'000; init.transactionalId = txnBytes;
+        const std::size_t initN = tcs->handleInitProducerId(req.data(), init.encode(req.data()), now, out.data(), out.size(), ctx);
+        step(); step();
+        const auto ip = initN != 0 ? pc::InitProducerIdResponse::decode(out.data(), initN)
+                                   : pc::InitProducerIdResponse::decode(frames.back().data(), frames.back().size());
+        pc::AddPartitionsToTxn add;
+        add.sessionId = 1; add.correlationId = 2; add.producerId = ip->producerId; add.producerEpoch = ip->producerEpoch; add.transactionalId = txnBytes;
+        const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+        (void)tcs->handleAddPartitions(req.data(), add.encode(req.data(), parts), now, out.data(), out.size(), ctx);
+        step(); step();
+        end.sessionId = 1; end.correlationId = 3; end.producerId = ip->producerId; end.producerEpoch = ip->producerEpoch; end.commit = 1; end.transactionalId = txnBytes;
+    }
+    void step() { now += 1'000'000; txnReplica.doWork(now); if (tcs) (void)tcs->doWork(now); }
+    std::size_t endTxn() { return tcs->handleEndTxn(req.data(), end.encode(req.data()), now, out.data(), out.size(), ctx); }
+};
+} // namespace
+
+TEST(CheckedWritesTxnVoteRouting, CommitOnACandidateSendsAVoteThroughTheGatewayAndTheSinkAnswersIt) {
+    WiredCoordinator W(true);
+    ASSERT_EQ(W.endTxn(), 0u);
+    ASSERT_EQ(W.R.gw.txnVotesInFlightForTest(), 1u);
+    W.R.runWorker(2);   // the leader answers yes into the coordinator, through the gateway's sink
+    EXPECT_EQ(W.R.gw.txnVotesInFlightForTest(), 0u);
+    for (int i = 0; i < 4; ++i) W.step();
+    EXPECT_EQ(W.tcs->txnStateForTest("tx"), rune::transaction::TxnState::PrepareCommit) << "the yes reached the gate";
+}
+
+TEST(CheckedWritesTxnVoteRouting, CommitOnAPlainTopicAsksNoVote) {
+    WiredCoordinator W(false);
+    EXPECT_NE(W.endTxn(), 0u) << "answered at once";
+    EXPECT_EQ(W.R.gw.txnVotesInFlightForTest(), 0u);
+    EXPECT_EQ(W.tcs->voteGatesForTest(), 0u);
+}
+
+// The setup-failure path and the teardown both release through releaseTxnCoordinator: the gateway must not keep the dead coordinator.
+TEST(CheckedWritesTxnVoteRoutingRegression, ReleaseDetachesTheGatewayFromTheCoordinatorRegression) {
+    WiredCoordinator W(true);
+    ASSERT_EQ(W.endTxn(), 0u);
+    ASSERT_EQ(W.R.gw.txnVotesInFlightForTest(), 1u);
+    ASSERT_TRUE(W.R.gw.txnVoteSinkSetForTest());
+    releaseTxnCoordinator(&W.R.gw, W.tcs);
+    EXPECT_EQ(W.tcs, nullptr);
+    EXPECT_EQ(W.R.gw.txnService(), nullptr) << "no dangling handler";
+    EXPECT_FALSE(W.R.gw.txnVoteSinkSetForTest()) << "no dangling sink";
+    W.R.runWorker(2);   // the late answer of an in-flight vote reaches no one
+    EXPECT_EQ(W.R.gw.txnVotesInFlightForTest(), 0u);
 }
