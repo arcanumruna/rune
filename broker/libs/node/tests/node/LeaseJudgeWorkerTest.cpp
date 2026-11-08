@@ -47,8 +47,8 @@ RawRec updateRec(uint64_t id, int64_t ver, const std::string& addr, uint32_t por
 /// replicate, promote): the produce hook's lease rules belong to the hook, this suite is about the judge's rebuilds.
 struct Ready {
     VerdictRig r;
-    explicit Ready(int64_t rollBytes = 64LL * 1024 * 1024, std::optional<rune::codec::Descriptor> src = std::nullopt) : r(false, rollBytes) {
-        r.createLeaseTopic(1000, std::move(src));
+    explicit Ready(int64_t rollBytes = 64LL * 1024 * 1024, std::optional<rune::codec::Descriptor> src = std::nullopt, uint32_t maxKeys = 1000) : r(false, rollBytes) {
+        r.createLeaseTopic(maxKeys, std::move(src));
         r.passes(30);
     }
     /// One batch committed into the log and judged by the next leadership.
@@ -496,6 +496,20 @@ TEST(LeaseJudgeWorkerRegression, LeaseIndexReadyRegression) {
     ASSERT_TRUE(r.driveUntilJudged());
     r.passes(60);
     EXPECT_TRUE(r.leaseReady());
+
+    // U1: an update the index could not track (leaseUntrackedThrough) holds readiness until the judge has passed its offset.
+    PartitionWriteState* w = const_cast<PartitionWriteState*>(r.writeState());
+    ASSERT_NE(w, nullptr);
+    const int64_t judged = w->judgedThrough;
+    ASSERT_GT(judged, 0);
+    w->leaseUntrackedThrough = judged;
+    EXPECT_FALSE(r.leaseReady()) << "judgedThrough == leaseUntrackedThrough: that offset is not judged yet";
+    w->leaseUntrackedThrough = judged - 1;
+    EXPECT_TRUE(r.leaseReady()) << "judgedThrough > leaseUntrackedThrough";
+    w->leaseUntrackedThrough = INT64_MAX;
+    EXPECT_FALSE(r.leaseReady());
+    w->leaseUntrackedThrough = -1;
+    EXPECT_TRUE(r.leaseReady());
 }
 
 // R7: the REPLAY (not the judge) holds on a version this node has not installed yet, and resumes after the install.
@@ -612,7 +626,7 @@ struct Leased {
     Ready g;
     VerdictRig& r = g.r;
     int32_t seq = 0;
-    Leased() {
+    explicit Leased(uint32_t maxKeys = 1000) : g(64LL * 1024 * 1024, std::nullopt, maxKeys) {
         WorkerOp level;
         level.type = WorkerOp::Type::ClusterFeatureLevel; level.nextOffset = rune::replication::MetadataFeature::kLeases;
         r.send(std::move(level));
@@ -654,7 +668,9 @@ TEST(LeaseWriteHookWorkerRegression, RevokeReencodedFullRowRegression) {
     r.passes(30);
     const auto stored = storedRecords(r);
     const Stored* rv = nullptr;
-    for (const auto& s : stored) if (s.offset >= before && s.attrs == kRevokeAttr) rv = &s;
+    int revokes = 0;
+    for (const auto& s : stored) if (s.offset >= before && s.attrs == kRevokeAttr) { rv = &s; ++revokes; }
+    ASSERT_EQ(revokes, 1) << "exactly one stored revoke";
     ASSERT_NE(rv, nullptr);
     EXPECT_TRUE(rv->crcOk);
     EXPECT_EQ(le(rv->value, 2, 2), 2u) << "re-encoded at the latest installed version";
@@ -725,11 +741,122 @@ TEST(LeaseWriteHookWorkerRegression, RevokeBehindUpdateThrottledRegression) {
     ASSERT_TRUE(ok);
     EXPECT_EQ(ok->code, 0);
     EXPECT_TRUE(ok->verdicts.empty());
+    int revokes = 0;
     for (const auto& s : storedRecords(r))
-        if (s.offset >= before && s.attrs == kRevokeAttr)
+        if (s.offset >= before && s.attrs == kRevokeAttr) {
+            ++revokes;
             EXPECT_EQ(std::string(reinterpret_cast<const char*>(s.value.data()) + 44, 2), "zz") << "the stored revoke carries the UPDATED columns";
+        }
+    EXPECT_EQ(revokes, 1) << "exactly one stored revoke";
     r.passes(30);
     EXPECT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 0u);
+}
+
+// ── U1: updates appended before the lease index tracked them (spec 6.2, L19) ──
+namespace {
+// 4 batches of 2048 grants (8192 accepted records = kLeaseFoldEventCap): one judge pass fills its lease event buffer with them and
+// stops before the next batch, so the index is ready (activated, replayed up to the judge) with that next batch still unjudged.
+void appendBulkGrants(Leased& l) {
+    for (int b = 0; b < 4; ++b) {
+        std::vector<RawRec> recs;
+        for (uint64_t i = 0; i < 2048; ++i) { const uint64_t id = 100 + uint64_t(b) * 2048 + i; recs.push_back(RawRec{keyOf(id), leaseValue(id, 0, "b"), 1}); }
+        (void)l.r.produceBytes(VerdictRig::rawBatch(recs, 11, l.seq), rune::protocol::client::kAcksWireView, 11, l.seq);
+        l.seq += 2048;
+        l.r.passes(3);
+    }
+}
+// Release the held judge and pass until it has activated: its first pass judges the bulk and stops before the update.
+void releaseUntilReadyWithTailUnjudged(VerdictRig& r) {
+    r.holdJudge(false);
+    const VerdictSource* judge = r.vs->verdictSource(VerdictRig::kSrc, 0);
+    ASSERT_NE(judge, nullptr);
+    for (int i = 0; i < 20 && !judge->activated(); ++i) r.pass();
+    ASSERT_TRUE(judge->activated());
+    ASSERT_GE(r.vs->keyIndexFoldCursorForTest(VerdictRig::kSrc, 0), judge->judgedThrough()) << "vacuity guard: the index replayed up to the judge, so only leaseUntrackedThrough keeps it not ready";
+    ASSERT_LT(judge->judgedThrough(), r.leo()) << "vacuity guard: the update is still unjudged";
+}
+void expectRevokeThrottledThenCarriesUpdate(Leased& l, int64_t ver) {
+    VerdictRig& r = l.r;
+    const int64_t leo = r.leo();
+    const auto th = l.produceNoSeq({RawRec{keyOf(1), leaseValue(1, ver, "", 1), kRevokeAttr}}, l.seq);
+    ASSERT_TRUE(th);
+    EXPECT_EQ(th->code, int16_t(rune::protocol::client::ErrorCode::Throttled)) << "the update is not judged yet";
+    EXPECT_EQ(th->retryAfter, 1'000'000);
+    EXPECT_EQ(r.leo(), leo) << "nothing stored";
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(30);
+    ASSERT_TRUE(r.leaseReady());
+    const int64_t before = r.leo();
+    const auto ok = l.produceNoSeq({RawRec{keyOf(1), leaseValue(1, ver, "", 1), kRevokeAttr}}, l.seq);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(ok->code, 0);
+    EXPECT_TRUE(ok->verdicts.empty());
+    int revokes = 0;
+    for (const auto& s : storedRecords(r))
+        if (s.offset >= before && s.attrs == kRevokeAttr) {
+            ++revokes;
+            EXPECT_EQ(std::string(reinterpret_cast<const char*>(s.value.data()) + 44, 2), "zz") << "the stored revoke carries the UPDATED columns";
+        }
+    EXPECT_EQ(revokes, 1);
+}
+}  // namespace
+
+TEST(LeaseWriteHookWorkerRegression, RevokeAfterLayoutRebuildSeesPendingUpdateRegression) {
+    Leased l(10000);
+    VerdictRig& r = l.r;
+    const auto g = l.produce({RawRec{keyOf(1), leaseValue(1, 0, "a1"), 1}});
+    ASSERT_TRUE(g);
+    r.passes(30);
+    const int64_t ver = g->baseOffset;
+    r.holdJudge(true);
+    appendBulkGrants(l);
+    (void)r.produceBytes(VerdictRig::rawBatch({RawRec{keyOf(1), leaseValue(1, ver, "zz"), 2}}, 11, l.seq), rune::protocol::client::kAcksWireView, 11, l.seq);
+    ++l.seq;
+    r.passes(3);
+    r.addLeasePort();   // an AddField: the layout rebuild replaces the lease table, whose lastAppended started at -1
+    r.passes(5);
+    releaseUntilReadyWithTailUnjudged(r);
+    expectRevokeThrottledThenCarriesUpdate(l, ver);
+}
+
+// The tail is 8192 grants then the update: a judge pass stops before it (the lease event buffer is full).
+TEST(LeaseWriteHookWorkerRegression, RevokeAfterFailoverSeesTailUpdateRegression) {
+    Leased l(10000);
+    VerdictRig& r = l.r;
+    const auto g = l.produce({RawRec{keyOf(1), leaseValue(1, 0, "a1"), 1}});
+    ASSERT_TRUE(g);
+    r.passes(30);
+    const int64_t ver = g->baseOffset;
+    r.holdJudge(true);
+    appendBulkGrants(l);
+    (void)r.produceBytes(VerdictRig::rawBatch({RawRec{keyOf(1), leaseValue(1, ver, "zz"), 2}}, 11, l.seq), rune::protocol::client::kAcksWireView, 11, l.seq);
+    ++l.seq;
+    r.passes(3);
+    r.demote();
+    r.promote();   // a new leadership: a fresh lease table
+    r.passes(5);
+    releaseUntilReadyWithTailUnjudged(r);
+    expectRevokeThrottledThenCarriesUpdate(l, ver);
+}
+
+TEST(LeaseWriteHookWorkerRegression, UpdateWhileNotReadyTracksRegression) {
+    Leased l(10000);
+    VerdictRig& r = l.r;
+    const auto g = l.produce({RawRec{keyOf(1), leaseValue(1, 0, "a1"), 1}});
+    ASSERT_TRUE(g);
+    r.passes(30);
+    const int64_t ver = g->baseOffset;
+    r.demote();
+    r.holdJudge(true);
+    r.promote();
+    r.passes(30);
+    ASSERT_FALSE(r.leaseReady()) << "vacuity guard: the judge has not activated, so the index is not ready while the updates arrive";
+    appendBulkGrants(l);
+    (void)r.produceBytes(VerdictRig::rawBatch({RawRec{keyOf(1), leaseValue(1, ver, "zz"), 2}}, 11, l.seq), rune::protocol::client::kAcksWireView, 11, l.seq);
+    ++l.seq;
+    r.passes(3);
+    releaseUntilReadyWithTailUnjudged(r);
+    expectRevokeThrottledThenCarriesUpdate(l, ver);
 }
 
 TEST(LeaseWriteHookWorkerRegression, RevokeWhileIndexNotReadyThrottledRegression) {

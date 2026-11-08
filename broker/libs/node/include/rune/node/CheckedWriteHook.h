@@ -208,6 +208,7 @@ private:
     [[nodiscard]] rune::storage::HookStaged stageLease_(LogT& log, const uint8_t* batch, std::size_t len) noexcept;
     /// check(), lease topic, after the per-record rules: the same-batch update-then-revoke refusal, then the Throttled retries.
     [[nodiscard]] rune::protocol::client::ErrorCode checkLeaseBatch_(const uint8_t* batch, std::size_t len, uint32_t updates, uint32_t revokes) noexcept;
+    static void logLeaseEncode_() noexcept;   // cold
     static void logLeaseScratch_(std::size_t need, std::size_t cap) noexcept;   // cold
 
     PartitionWriteState& state_;
@@ -220,6 +221,7 @@ private:
     uint32_t             leaseGrants_  = 0;   // lease topic: the grants check() found (stage() stamps them)
     uint32_t             leaseUpdates_ = 0;   // lease topic: the updates / revokes check() found (stage() records their rows)
     uint32_t             leaseRevokes_ = 0;
+    bool                 leaseUntracked_ = false;   // stage() found an update the index cannot track (not ready, or no row): onAppended raises leaseUntrackedThrough
     uint32_t             leaseTouched_ = 0;   // rows stage() recorded in leaseWork->rids; onAppended() writes lastAppended
     int64_t              retryAfterNs_ = 0;
     uint64_t             importMaxN_   = 0;
@@ -273,7 +275,9 @@ rune::storage::HookStaged CheckedWriteHook::stageLease_(LogT& log, const uint8_t
     LeaseHookWork* const work = facts_.leaseWork;
     if (work == nullptr) [[unlikely]] return {ErrorCode::Internal, nullptr, 0};
     leaseTouched_ = 0;
+    leaseUntracked_ = false;
     const LeaseIndexRef& ix = facts_.leaseIndex;
+    if (leaseUpdates_ + leaseRevokes_ != 0 && (ix.table == nullptr || !facts_.leaseIndexReady)) leaseUntracked_ = true;
     uint32_t replacements = 0;
     if (leaseUpdates_ + leaseRevokes_ != 0 && ix.table != nullptr) {
         const bool ok = rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& r) {
@@ -284,7 +288,9 @@ rune::storage::HookStaged CheckedWriteHook::stageLease_(LogT& log, const uint8_t
             if (op != rec::LeaseOp::Put && op != rec::LeaseOp::Revoke) return;
             const auto key = rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(r.key.data()), r.key.size()});
             uint32_t rid = 0;
-            if (ix.table->ridOf(key, rid)) {
+            if (!ix.table->ridOf(key, rid)) {
+                leaseUntracked_ = true;   // nothing is recorded for a key without a row
+            } else {
                 work->rids[leaseTouched_++] = rid;
                 if (op == rec::LeaseOp::Revoke) {
                     const uint8_t* row = ix.table->get(key);
@@ -330,7 +336,7 @@ rune::storage::HookStaged CheckedWriteHook::stageLease_(LogT& log, const uint8_t
             scratch_);
         if (n == 0 || encodeFailed) [[unlikely]] {
             assert(false && "a lease revoke rebuild must fit the scratch");
-            logLeaseScratch_(len, scratch_.size());
+            if (encodeFailed) logLeaseEncode_(); else logLeaseScratch_(len, scratch_.size());
             return {ErrorCode::InvalidRequest, nullptr, 0};
         }
         cur = out;

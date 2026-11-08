@@ -324,6 +324,14 @@ struct PartitionWriteState {
     AutoIncState                       autoInc;              ///< the partition's id counter (an autoincrement topic only)
     AssignedBaseWindow                 assignedBases;        ///< the last assigned bases per producer, for retried key-0 batches
     AutoIncStats                       autoIncStats;
+    /// A lease topic: the highest offset whose update or revoke the lease index's per-row `lastAppended` may not have recorded
+    /// (-1: none).  `lastAppended` lives in the current lease table's aux area and only onAppended writes it, so a fresh table
+    /// (a leadership or layout rebuild) starts every row at -1 while the updates in [judgedThrough, LEO) are still unjudged, and an
+    /// update appended while the index was not ready, or before its row was replayed, recorded nothing.  A revoke re-encoded from
+    /// the row in that window would drop the update (spec 6.2, L19).  Set to LEO - 1 on every judge activation of a lease source
+    /// and raised by onAppended for an untracked update; leaseIndexReady requires judgedThrough > it, so it converges as the judge
+    /// advances past that offset (no timer).
+    int64_t                            leaseUntrackedThrough = -1;
     LeaseFoldEvents                    leaseEvents;          ///< a lease topic: one event per accepted record, until the wheels consume them
     bool                               staleBrokerLogged = false;   ///< the stale-broker-record warning was logged for this partition
 

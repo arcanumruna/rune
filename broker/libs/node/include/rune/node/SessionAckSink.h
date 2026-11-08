@@ -345,11 +345,11 @@ public:
         return true;
     }
 
-    /// The client version a session announced (D6), or -1 when this worker has not seen the session's announce (the gateway op
+    /// The client version a session announced (D6), or -1 when this worker has not seen the announce of a POSITIVE session id (the gateway op
     /// can reach the worker before the announce in the same pass).  Read by the lease write hook, which answers -1 with a
     /// retriable code and only a KNOWN version below kClientVersionLeases with InvalidRequest.
     [[nodiscard]] int32_t clientVersionOf(int64_t sessionId) const noexcept {
-        if (sessionId <= 0) return -1;
+        if (sessionId <= 0) return 0;   // an id that can never be announced is a definite answer, never a retry (a retry would hang)
         const std::size_t idx = find_(sessionId);
         return idx == kNone ? -1 : clientVersion_[idx];
     }

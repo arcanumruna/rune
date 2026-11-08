@@ -1298,3 +1298,16 @@ TEST(CheckedWritesAckSink, AckTermIsNeverBelowTheFloor) {
     EXPECT_EQ(withAckTermLength("aeron:udp?term-length=1048576", 65536), "aeron:udp?term-length=1048576");
     EXPECT_EQ(withAckTermLength("aeron:udp?endpoint=h:1", 0), "aeron:udp?endpoint=h:1|term-length=524288");
 }
+
+// H1 (lease write hook): a positive id this worker has not seen announced yet is retriable (-1); an id that can never be announced
+// (<= 0) is a definite answer (0, which the hook maps to InvalidRequest), so a client can never retry one forever.
+TEST(SessionAckSinkRegression, ClientVersionOfNonPositiveSessionIsDefiniteRegression) {
+    FakePolicy pol;
+    Sink s(pol);
+    ASSERT_TRUE(s.announce(7, "c", 1, 18));
+    EXPECT_EQ(s.clientVersionOf(7), 18);
+    EXPECT_EQ(s.clientVersionOf(8), -1) << "a positive id not announced yet: retriable";
+    EXPECT_EQ(s.clientVersionOf(0), 0) << "session 0 never announces: definite";
+    EXPECT_EQ(s.clientVersionOf(-1), 0);
+    EXPECT_EQ(s.clientVersionOf(INT64_MIN), 0);
+}

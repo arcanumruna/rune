@@ -237,6 +237,10 @@ pc::ErrorCode CheckedWriteHook::checkLeaseBatch_(const uint8_t* batch, std::size
     return pc::ErrorCode::OK;
 }
 
+void CheckedWriteHook::logLeaseEncode_() noexcept {
+    spdlog::error("CheckedWriteHook: a lease revoke's row could not be encoded at the latest installed version");
+}
+
 void CheckedWriteHook::logLeaseScratch_(std::size_t need, std::size_t cap) noexcept {
     spdlog::error("CheckedWriteHook: lease batch of {} bytes does not fit the {} byte scratch", need, cap);
 }
@@ -264,6 +268,10 @@ rune::storage::HookStaged CheckedWriteHook::patchKeyZeroIds_(const uint8_t* batc
 }
 
 void CheckedWriteHook::onAppended(int64_t base, int64_t last) noexcept {
+    if (leaseUntracked_) [[unlikely]] {   // the index could not record this batch's updates: readiness waits for the judge to pass them
+        state_.leaseUntrackedThrough = std::max(state_.leaseUntrackedThrough, last);
+        leaseUntracked_ = false;
+    }
     if (leaseTouched_ != 0) [[unlikely]] {   // lastAppended is written only once the append succeeded (R8: grants record nothing)
         for (uint32_t i = 0; i < leaseTouched_; ++i) setLeaseLastAppended(*facts_.leaseIndex.table, facts_.leaseWork->rids[i], last);
         leaseTouched_ = 0;

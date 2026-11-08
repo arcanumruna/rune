@@ -323,6 +323,8 @@ public:
                 // A lease index whose row layout is out of date (an AddField reached the evolving descriptor) activates again
                 // under the same leadership: the rebuild below replaces it, the activation replays the log into it.
                 if (write->spec->lease && leaseLayoutStale_(srcTopicId, partition, *write->spec)) judge->requestReactivation();
+                // Every fresh lease table starts with lastAppended = -1 for rows whose updates in [judgedThrough, LEO) are unjudged.
+                if (write->spec->lease && judge->activationPending()) write->leaseUntrackedThrough = std::max(write->leaseUntrackedThrough, b.logEnd - 1);
                 if (judge->activationPending()) rebuildKeyIndex_(srcTopicId, partition, *judge, *write->spec, leaderGen);
                 work += judge->driveJudge(readRange, bound, nowNs, *write, skip.aborted);
                 viewBound = std::min(bound, judge->judgedThrough());
@@ -434,7 +436,8 @@ public:
         if (w == nullptr || w->spec == nullptr || !w->spec->lease) return false;
         const ViewInstance& inst = kit->second;
         return judge.activated() && judge.leadershipGeneration() == currentLeaderGen && inst.foldLeadership == currentLeaderGen &&
-               inst.layoutGen == w->spec->leaseLayoutGen && inst.foldCursor >= judge.judgedThrough();
+               inst.layoutGen == w->spec->leaseLayoutGen && inst.foldCursor >= judge.judgedThrough() &&
+               judge.judgedThrough() > w->leaseUntrackedThrough;   // updates appended before the table tracked them are judged
     }
     /// -1: the partition has no key index.
     [[nodiscard]] int64_t keyIndexFoldCursorForTest(int32_t src, int32_t partition) const {
