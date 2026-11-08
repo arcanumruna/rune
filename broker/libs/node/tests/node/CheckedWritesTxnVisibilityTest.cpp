@@ -240,6 +240,24 @@ TEST(CheckedWritesTxnVisibilityRegression, VetoCountsOnlyRefusedPushesRegression
     EXPECT_GT(inst()->counters.vetoedCheckpointPushes, 0u) << "the fenced application had rows to push";
 }
 
+// REGRESSION (Task 8 review 1, m4): a discard taken while a marker application is in progress clears the fence with the cursor.  A
+// kept applyingThrough would resume the refold's application above T's first records and hold its reads from the first pass.
+TEST(CheckedWritesTxnVisibilityRegression, DiscardMidApplicationClearsTheFenceRegression) {
+    Txv t(2);
+    t.r.dropView(kView);
+    t.r.installProjection(kView + 1, "pproj", /*persisted=*/true);
+    t.enqueue(VerdictRig::batch(recs(10, 15), 31, 0, {}, /*txn=*/true), 31, 0);
+    t.marker(31, true);
+    const auto inst = [&] { return t.r.vs->instanceForTest(kView + 1, 0); };
+    for (int i = 0; i < 100 && (inst() == nullptr || inst()->spanFence.applyingThrough < 0); ++i) t.r.pass();
+    ASSERT_TRUE(inst() != nullptr && inst()->spanFence.fenced());
+    ASSERT_TRUE(t.r.vs->beginDiscardForTest(kView + 1, 0, ViewDiscardReason::AheadOfLog));
+    EXPECT_FALSE(inst()->spanFence.fenced());
+    EXPECT_EQ(inst()->spanFence.count, 0);
+    for (int i = 0; i < 200 && !(inst()->foldCursor > t.r.leo() - 1 && inst()->readiness == ViewReadiness::Ready); ++i) t.r.pass();
+    for (uint64_t id = 10; id <= 15; ++id) EXPECT_TRUE(t.r.idRow(kView + 1, id).has_value()) << id;
+}
+
 // REGRESSION (P11-0, contract 13): a checkpoint at O with first < O <= M would hold none of the span's records and a refold from it
 // would never see the ones below O.  The push is vetoed while the cursor stands in the span; a crash at every pass boundary then
 // recovers the undisturbed tables.
