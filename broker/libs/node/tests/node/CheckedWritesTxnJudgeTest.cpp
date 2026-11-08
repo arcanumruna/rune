@@ -589,10 +589,13 @@ struct JudgeRig {
     int     counted = 0;
     int64_t countAt = -1;            // reads from exactly it are counted in countedAt
     int     countedAt = 0;
+    int64_t countTo = -1;            // reads up to exactly it are counted in countedTo
+    int     countedTo = 0;
     int drive(int64_t hw = INT64_MAX, int64_t now = 0) {
         return vs.driveJudge([&](int64_t from, int64_t to) {
             counted += from >= countFrom;
             countedAt += from == countAt;
+            countedTo += to == countTo;
             if (failReads > 0 && from == failFrom && to == failTo) {
                 --failReads;
                 return rune::storage::LogReadView{};
@@ -1449,36 +1452,49 @@ TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnPastTheKeySetIsAppliedEqualToAP
 
 // Task 7 (T7 review 1, F1): an ordinary transaction spanning more other producers' markers than the set holds is applied too.  The
 // markers are noted in windows, and a batch whose decision lies past a window is looked up: a delete committed far into the span
-// supersedes, one aborted far into it does not, and one committed past T's marker applies after T.
+// supersedes, one aborted far into it does not, and one committed past T's marker applies after T.  Budgeted (T7 re-review 2 carry):
+// with one batch a walk per pass the marker refills resume too, and give the same answer.
 TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnPastTheMarkerListIsAppliedEqualToAPlainFoldRegression) {
-    JudgeRig r(false);
-    r.start();
-    r.log.data({{1}, {2}, {3}, {4}}, 77);   // 10..13, its first records
-    for (int64_t p = 0; p < 1100; ++p) {
-        if (p == 5) r.log.data({del(2)}, 5001);
-        if (p == 10) r.log.data({del(3)}, 5003);
-        if (p == 1050) r.log.data({del(1)}, 5000);
-        if (p == 1090) r.log.marker(5000, true);
-        if (p == 1095) r.log.marker(5001, false);
-        r.log.data({{30'000 + p}}, 1000 + p);
-        r.log.marker(1000 + p, true);
+    for (const bool budgeted : {false, true}) {
+        SCOPED_TRACE(budgeted ? "budgeted" : "one pass");
+        JudgeRig r(false);
+        r.start();
+        r.log.data({{1}, {2}, {3}, {4}}, 77);   // 10..13, its first records
+        for (int64_t p = 0; p < 1100; ++p) {
+            if (p == 5) r.log.data({del(2)}, 5001);
+            if (p == 10) r.log.data({del(3)}, 5003);
+            if (p == 1050) r.log.data({del(1)}, 5000);
+            if (p == 1090) r.log.marker(5000, true);
+            if (p == 1095) r.log.marker(5001, false);
+            r.log.data({{30'000 + p}}, 1000 + p);
+            r.log.marker(1000 + p, true);
+        }
+        r.log.data({del(4)});   // a plain delete, then T's last write of 4
+        r.log.data({{4}}, 77);
+        const int64_t marker = r.log.next;
+        r.log.marker(77, true);
+        r.log.marker(5003, true);
+        if (budgeted) {
+            r.oneBatch = true;
+            r.vs.setVoteScanBytesForTest(1);
+            r.countTo = marker;
+        }
+        for (int i = 0; i < (budgeted ? 40'000 : 40) && r.vs.judgeCursor() < r.log.next; ++i) {
+            r.countedTo = 0;
+            r.drive();
+            if (budgeted && r.vs.judgeCursor() <= marker) ASSERT_LE(r.countedTo, 2) << "drive " << i;
+        }
+        EXPECT_EQ(r.vs.judgeCursor(), r.log.next);
+        EXPECT_GT(r.vs.judgedThrough(), marker);
+        EXPECT_EQ(r.st.txn.stats.supersedeKeysOverflow, 0u) << "the keys fit";
+        EXPECT_EQ(r.st.rejected.nextRejectedAtOrAfter(0), INT64_MAX) << "nothing refused";
+        EXPECT_FALSE(r.indexed(1)) << "5000's delete committed below T's marker supersedes T's insert";
+        EXPECT_TRUE(r.indexed(2)) << "5001's delete aborted";
+        EXPECT_FALSE(r.indexed(3)) << "5003's delete commits after T";
+        EXPECT_TRUE(r.indexed(4)) << "T wrote 4 again after the plain delete";
+        EXPECT_TRUE(r.indexed(30'000));
+        EXPECT_TRUE(r.indexed(30'000 + 1099));
     }
-    r.log.data({del(4)});   // a plain delete, then T's last write of 4
-    r.log.data({{4}}, 77);
-    const int64_t marker = r.log.next;
-    r.log.marker(77, true);
-    r.log.marker(5003, true);
-    for (int i = 0; i < 40 && r.vs.judgeCursor() < r.log.next; ++i) r.drive();
-    EXPECT_EQ(r.vs.judgeCursor(), r.log.next);
-    EXPECT_GT(r.vs.judgedThrough(), marker);
-    EXPECT_EQ(r.st.txn.stats.supersedeKeysOverflow, 0u) << "the keys fit";
-    EXPECT_EQ(r.st.rejected.nextRejectedAtOrAfter(0), INT64_MAX) << "nothing refused";
-    EXPECT_FALSE(r.indexed(1)) << "5000's delete committed below T's marker supersedes T's insert";
-    EXPECT_TRUE(r.indexed(2)) << "5001's delete aborted";
-    EXPECT_FALSE(r.indexed(3)) << "5003's delete commits after T";
-    EXPECT_TRUE(r.indexed(4)) << "T wrote 4 again after the plain delete";
-    EXPECT_TRUE(r.indexed(30'000));
-    EXPECT_TRUE(r.indexed(30'000 + 1099));
 }
 
 // Task 7 (T6 re-review 2): on the judgement path the same overflow is a deterministic no: a marker list past its slots takes every
@@ -1620,6 +1636,46 @@ TEST(CheckedWritesTxnJudgeRegression, OrdinaryResolutionWalkIsBudgetedAndResumes
     EXPECT_TRUE(r.indexed(4)) << "T0's insert supersedes O's delete";
 }
 
+// REGRESSION (T7 re-review 2 carry): the collect and supersede walks of an ordinary transaction resume and share one byte budget per
+// pass; only the apply walk reads the segment in one step.  A pass once read the span three times, unbudgeted.
+TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnSpanReadIsBudgetedPerPassRegression) {
+    const auto write = [](JudgeRig& r, int64_t pid) {
+        r.log.data({{1000}, {1001}, {1002}}, pid);   // 10..12
+        for (int64_t id = 2000; id < 2040; ++id) {
+            if (id == 2010) r.log.data({del(1001)});
+            if (id == 2020) r.log.data({del(1002)});
+            r.log.data({{id}});
+        }
+        r.log.data({{1002}}, pid);
+        if (pid >= 0) r.log.marker(pid, true);
+    };
+    JudgeRig plain(false);
+    plain.start();
+    write(plain, -1);
+    for (int i = 0; i < 4; ++i) plain.drive();
+    JudgeRig r(false);
+    r.start();
+    write(r, 77);
+    const int64_t marker = r.log.next - 1;
+    const int64_t span = marker - 10;   // one record per batch past T's first: span - 2 batches
+    r.oneBatch = true;
+    r.vs.setVoteScanBytesForTest(1);
+    r.countTo = marker;
+    int drives = 0;
+    for (; drives < 4 * span && r.vs.judgeCursor() < r.log.next; ++drives) {
+        r.countedTo = 0;
+        r.drive();
+        EXPECT_LE(r.countedTo, r.vs.judgeCursor() <= marker ? 2 : span) << "drive " << drives << ": one batch a walk, or the segment's apply";
+    }
+    EXPECT_EQ(r.vs.judgeCursor(), r.log.next);
+    EXPECT_GT(drives, span) << "the collect and supersede walks resumed over passes";
+    EXPECT_EQ(r.st.rejected.nextRejectedAtOrAfter(0), INT64_MAX);
+    EXPECT_FALSE(r.indexed(1001)) << "the plain delete above T's last 1001 supersedes it";
+    EXPECT_TRUE(r.indexed(1002)) << "T's last 1002 is above the plain delete";
+    for (int64_t id = 0; id < 200; ++id) EXPECT_EQ(r.indexed(id), plain.indexed(id)) << id;
+    for (int64_t id = 1000; id < 2040; ++id) EXPECT_EQ(r.indexed(id), plain.indexed(id)) << id;
+}
+
 // T7 review 2, N1: the one-step set is the worker's, shared by its sources.  O's segment is parked on T0's marker; another source
 // applies its own ordinary transaction meanwhile and takes the set (review 4, I1).  O collects its keys anew, so T0's insert still
 // supersedes O's delete.
@@ -1719,7 +1775,7 @@ TEST(CheckedWritesTxnJudgeRegression, DroppedHolderReleasesTheOneStepSetRegressi
         r.log.marker(55, true);                       // 13
         for (int64_t id = 30; id < 70; ++id) r.log.data({{id}});   // 14-53
         r.vs.setVoteScanBytesForTest(1);
-        for (int i = 0; i < 16 && r.vs.judgeCursor() < 13; ++i) r.drive();
+        for (int i = 0; i < 16 && !r.pool.oneStepHeld(); ++i) r.drive();   // the intent search and the collect take a batch a pass
         ASSERT_EQ(r.vs.judgeCursor(), 13) << "O waits for T0's marker";
         ASSERT_TRUE(r.pool.oneStepHeld());
         other.log.data({{50}, {51}}, 88);

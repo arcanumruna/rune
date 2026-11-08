@@ -386,7 +386,7 @@ private:
     // Part 11 (P11-2): a transaction without a committed TxnJudge or marker stops the judge at its first record (TxnStop::Probe) until a
     // look-ahead finds one; an ordinary transaction stops it at its marker (TxnStop::Marker) to be applied there.
     // `vote`: P11-7, -1 until the judge classifies it at the marker.
-    struct OrdinaryTxn { int64_t producerId; int64_t first; int64_t marker; bool commit; int8_t vote = -1; };
+    struct OrdinaryTxn { int64_t producerId; int64_t first; int64_t marker; bool commit; int8_t vote = -1; int64_t intentFrom = -1; };
     struct TxnProbe { int64_t producerId = -1, first = -1, from = -1, waitAt = -1; };
     struct OwedMarker { int64_t producerId; int64_t judgeOffset; int64_t from; };   // a re-offered TxnJudge's marker, searched from `from`
     // Judge: the judge stands at a TxnJudge to judge (judgePid_).  Locked: a record touches a row a transaction holds (P11-4).
@@ -436,7 +436,7 @@ private:
     template <class ReadRangeFn>
     bool   judgeAtMarker_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept;
     template <class ReadRangeFn>
-    int8_t shouldHaveVoted_(ReadRangeFn& readRange, const OrdinaryTxn& o) noexcept;
+    int8_t shouldHaveVoted_(ReadRangeFn& readRange, OrdinaryTxn& o) noexcept;
     template <class ReadRangeFn>
     bool   runJudgement_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept;
     template <class ReadRangeFn>
@@ -540,9 +540,10 @@ private:
     // P11-3a: the walk of that entry while the judge stands at its marker.  T's records apply in segments [from, end) of at most
     // the one-step set's keys, each key with its last offset in all of T, so every segment takes the same supersede decision for a
     // key.  The set's markers hold every entry from markersFrom up to where they overflowed (refill: noted anew from checkFrom); the
-    // supersede walk resumes at checkFrom until checked; `lookup` decides one batch the markers cannot.
+    // supersede walk resumes at checkFrom (-1: the collect is not done) until checked; `lookup` decides one batch the markers cannot.
+    // The collect walk resumes at collectFrom (-1: not begun), a refill at refillFrom.
     struct OrdinaryWalk {
-        int64_t   marker = -1, from = -1, end = -1, markersFrom = -1, checkFrom = -1;
+        int64_t   marker = -1, from = -1, end = -1, collectFrom = -1, markersFrom = -1, checkFrom = -1, refillFrom = -1;
         bool      checked = false, refill = false;
         TxnLookup lookup;
     };
@@ -561,6 +562,7 @@ private:
     int64_t                     nowNs_ = 0, lockPausedNs_ = 0;
     int64_t                     finalizePid_ = -1, finalizeApplied_ = -1;   // a commit finalized part-way (a read failed)
     std::size_t                 voteScanBytes_ = kVoteScanBytesPerPass;
+    std::size_t                 spanBytes_ = 0;           // what an ordinary transaction's intent, collect and supersede walks may still read this pass
     VerdictViewHooks            hooks_;
     VerdictSourceStats          stats_;
     std::vector<uint8_t>        scratch_;
@@ -786,22 +788,28 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
         TxnKeySet& keys = oneStepKeys_();
         OrdinaryWalk& w = ordinaryWalk_;
         if (w.marker != o.marker) w = {o.marker, o.first};
-        if (w.end < 0 || !txnPool_->holdsOneStep(oneStepClaim_)) {
-            if (!txnPool_->holdsOneStep(oneStepClaim_)) {
-                if (!txnPool_->oneStepClaimable()) return false;   // another source is mid-segment: wait for it
-                oneStepClaim_ = txnPool_->claimOneStep();
-            }
+        if (!txnPool_->holdsOneStep(oneStepClaim_)) {
+            if (!txnPool_->oneStepClaimable()) return false;   // another source is mid-segment: wait for it
+            oneStepClaim_ = txnPool_->claimOneStep();
+            w.collectFrom = -1;   // another source may have taken the set mid-segment: note the keys again
+        }
+        if (w.collectFrom < 0) {
             keys.clear();
-            w.end = -1;   // another source may have taken the set mid-segment: note the keys again
-            if (!walkBatches_(readRange, w.from, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+            w.end = w.checkFrom = -1;
+            w.collectFrom = w.from;
+        }
+        if (w.checkFrom < 0) {   // the collect is not done
+            bool more = false;
+            if (!walkBatches_(readRange, w.collectFrom, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
                     collectOrdinaryBatch_(r, b, len, o.producerId, keys);
-                    return true;
-                })) {
-                w.end = -1;
-                return false;
-            }
+                    w.collectFrom = r.baseOffset() + r.lastOffsetDelta() + 1;
+                    spanBytes_ -= std::min(spanBytes_, len);
+                    more = spanBytes_ == 0;
+                    return !more;
+                }) || more) return false;
             if (w.end < 0) w.end = o.marker;
             w.markersFrom = w.checkFrom = w.from;
+            w.refillFrom = -1;
             w.checked = w.refill = false;
         }
         if (!w.checked && !checkOrdinary_(readRange, o, aborted, keys)) return false;
@@ -829,12 +837,21 @@ template <class ReadRangeFn>
 bool VerdictSource::checkOrdinary_(ReadRangeFn& readRange, const OrdinaryTxn& o, const rune::view::AbortedTxnFilter& aborted, TxnKeySet& keys) noexcept {
     OrdinaryWalk& w = ordinaryWalk_;
     if (w.refill) {
-        keys.clearMarkers();
-        if (!walkBatches_(readRange, w.checkFrom, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+        if (w.refillFrom < 0) {
+            keys.clearMarkers();
+            w.refillFrom = w.checkFrom;
+        }
+        bool more = false;
+        if (!walkBatches_(readRange, w.refillFrom, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
                 if ((r.attributes() & rune::protocol::batch::kAttrControl) != 0) noteControl_(r, b, len, o.producerId, keys);
-                return !keys.markersOverflowed();
-            })) return false;
+                if (keys.markersOverflowed()) return false;
+                w.refillFrom = r.baseOffset() + r.lastOffsetDelta() + 1;
+                spanBytes_ -= std::min(spanBytes_, len);
+                more = spanBytes_ == 0;
+                return !more;
+            }) || more) return false;
         w.markersFrom = w.checkFrom;
+        w.refillFrom = -1;
         w.refill = false;
     } else if (w.lookup.producerId >= 0 && !w.lookup.decided && !lookupTxn_(readRange, o.marker)) {
         return false;
@@ -846,7 +863,9 @@ bool VerdictSource::checkOrdinary_(ReadRangeFn& readRange, const OrdinaryTxn& o,
                 return false;
             }
             w.checkFrom = r.baseOffset() + r.lastOffsetDelta() + 1;
-            return true;
+            spanBytes_ -= std::min(spanBytes_, len);
+            stopped = spanBytes_ == 0;
+            return !stopped;
         }) || stopped) return false;
     w.checked = true;
     return true;
@@ -1000,21 +1019,24 @@ bool VerdictSource::judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedT
 }
 
 // P11-1 (a), (b) or (c) on the log: a committed transaction without a TxnJudge that should have voted (1), or not (0).  -1: the
-// intent search's read failed, the transaction stays unclassified.
+// intent search's read failed or used up spanBytes_, the transaction stays unclassified and the search resumes at intentFrom.
 template <class ReadRangeFn>
-int8_t VerdictSource::shouldHaveVoted_(ReadRangeFn& readRange, const OrdinaryTxn& o) noexcept {
+int8_t VerdictSource::shouldHaveVoted_(ReadRangeFn& readRange, OrdinaryTxn& o) noexcept {
     const auto constrained = [](const ConstraintSet& s) {
         return std::any_of(s.members.begin(), s.members.begin() + s.count, [](const ConstraintSetMember& m) {
             return m.kind == rune::view::VerdictViewKind::Unique || m.kind == rune::view::VerdictViewKind::Check || m.kind == rune::view::VerdictViewKind::TestReject;
         });
     };
     if (constrained(*state_->constraintSets.setAt(o.first)) || state_->isConstrainedSource()) return 1;
-    bool intent = false;
-    if (!walkBatches_(readRange, o.first, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
-        if (r.producerId() != o.producerId || (r.attributes() & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) != rune::protocol::batch::kAttrTransactional) return true;
-        (void)rune::protocol::forEachRecordSpan(b, len, [&](const rune::protocol::RecordSpan& span) { intent = intent || rune::protocol::record::intentOf(span.attributes) != 0; });
-        return !intent;
-    })) return -1;
+    bool intent = false, more = false;
+    if (!walkBatches_(readRange, std::max(o.first, o.intentFrom), o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+        if (r.producerId() == o.producerId && (r.attributes() & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) == rune::protocol::batch::kAttrTransactional)
+            (void)rune::protocol::forEachRecordSpan(b, len, [&](const rune::protocol::RecordSpan& span) { intent = intent || rune::protocol::record::intentOf(span.attributes) != 0; });
+        o.intentFrom = r.baseOffset() + r.lastOffsetDelta() + 1;
+        spanBytes_ -= std::min(spanBytes_, len);
+        more = !intent && spanBytes_ == 0;
+        return !intent && !more;
+    }) || more) return -1;
     return intent ? 1 : 0;
 }
 
@@ -1133,6 +1155,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     if (needsActivation_) { activate_(state); ++work; }
     passHw_ = bound;
     nowNs_ = nowNs;
+    spanBytes_ = voteScanBytes_;
     if (!owedMarkers_.empty()) feedOwedMarkers_(readRange, bound);
     state.txn.finalizeDecided(state.rejected.coveredThrough(), bound);
     rejectedThisPass_ = 0;
