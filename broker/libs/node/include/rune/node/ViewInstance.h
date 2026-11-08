@@ -137,6 +137,7 @@ struct ViewFoldCounters {
     uint64_t scanPages               = 0;   // pages served by scanPage
     uint64_t txnSpanTableFull        = 0;   // P11-9: a transactional batch found the span fence full and applied at its offsets
     uint64_t txnSuperseded           = 0;   // P11-3a: a committed transaction's record another writer superseded before its marker
+    uint64_t txnReadFailed           = 0;   // P11-9: a span read-back below its marker failed (I/O error, damaged segment); retried next pass
     uint64_t vetoedCheckpointPushes  = 0;   // P11-0: a checkpoint not pushed because the cursor stood inside an open span
 };
 
@@ -345,10 +346,11 @@ struct SourceLogBounds {
     int64_t logEnd   = INT64_MAX;
 };
 
-/// Retention trimmed the source below this instance's cursor.  An instance holding no rows starts at the log start (true);
-/// one holding rows folded from records that no longer exist cannot be trusted: false = the caller discards it (BelowLogStart).
+/// Retention trimmed the source below this instance's cursor, or below an open span's first batch.  An instance holding no rows
+/// below the log start starts there (true).  One holding rows folded from records that no longer exist, or standing at a marker
+/// whose span lost its first batches, cannot be trusted: false = the caller discards it (BelowLogStart) and it refolds.
 [[nodiscard]] inline bool startAtLogStart(ViewInstance& i, int64_t logStart) noexcept {
-    if (!viewTablesEmpty(i)) return false;
+    if (i.foldCursor >= logStart || !viewTablesEmpty(i)) return false;
     i.counters.sourceRecordsTrimmed += static_cast<uint64_t>(logStart - i.foldCursor);
     i.foldCursor   = logStart;
     i.spanFence.clear();   // every open span started below the old cursor: its records are gone

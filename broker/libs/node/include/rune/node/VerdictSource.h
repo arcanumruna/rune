@@ -486,9 +486,9 @@ private:
     void   noteKeyZeroRejection_(const rune::view::Verdict& v, const rune::view::SourceRecord& rec) noexcept;
     void   apply_(Member& m, const rune::view::SourceRecord& rec) noexcept;
     /// Retention may have trimmed the log below a member's cursor: an empty member starts at the log start, one with rows is
-    /// discarded (BelowLogStart).  False when it was discarded.
+    /// discarded (BelowLogStart), as is one with an open span that lost its first batches.  False when it was discarded.
     bool   clampToLogStart_(Member& m) {
-        if (m.inst->foldCursor >= logStart_) return true;
+        if (m.inst->foldCursor >= logStart_ && !m.inst->spanFence.straddles(logStart_)) return true;
         if (startAtLogStart(*m.inst, logStart_)) return true;
         if (hooks_.discard != nullptr) hooks_.discard(hooks_.ctx, *m.inst, ViewDiscardReason::BelowLogStart);
         return false;

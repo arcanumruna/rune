@@ -311,6 +311,51 @@ TEST(CheckedWritesTxnVisibilityRegression, DiscardMidApplicationClearsTheFenceRe
     for (uint64_t id = 10; id <= 15; ++id) EXPECT_TRUE(t.r.idRow(kView + 1, id).has_value()) << id;
 }
 
+// REGRESSION (Task 8 review 2, I-B): retention deletes the first batch of an open span while the fold stands above the log start.
+// The marker could never be applied (its read-back is gone), so the view is discarded (BelowLogStart) and refolds from the log start,
+// instead of waiting at the marker for good.
+TEST(CheckedWritesTxnVisibilityRegression, RetentionBelowAnOpenSpanDiscardsAndRefoldsRegression) {
+    VerdictRig r(false, /*rollBytes=*/1);   // one batch per segment
+    r.typed();
+    r.setViewPassCap(2);
+    r.installProjection(kView, "pproj", /*persisted=*/true);
+    ASSERT_EQ(r.produce({{1, 1, 1}}), 0);
+    r.settle(10);
+    const auto enqueue = [&r](WorkerOp op) { ASSERT_TRUE(r.worker->tryEnqueueOp(std::move(op))); };
+    WorkerOp t;
+    t.type = WorkerOp::Type::Produce; t.topicId = VerdictRig::kSrc; t.partition = 0; t.replica = r.replica.get(); t.logPtr = r.log.get();
+    t.sessionId = 1; t.correlationId = ++r.corr; t.durabilityTier = 1;
+    t.producerId = 31; t.producerEpoch = 0; t.baseSequence = 0;
+    t.recordBatchBytes = VerdictRig::batch(recs(10, 12), 31, 0, {}, /*txn=*/true);
+    enqueue(std::move(t));
+    ASSERT_EQ(r.produceBatch(VerdictRig::batch(recs(20, 20))), 0);
+    ASSERT_EQ(r.produceBatch(VerdictRig::batch(recs(21, 21))), 0);
+    const int64_t m = r.leo();
+    WorkerOp c;
+    c.type = WorkerOp::Type::AppendControlRecord; c.topicId = VerdictRig::kSrc; c.partition = 0; c.replica = r.replica.get();
+    c.logPtr = r.log.get(); c.correlationId = 9031; c.producerId = 31;
+    c.targetReplicaId = r.replica->registryId(); c.incarnation = r.replica->incarnation();
+    c.recordBatchBytes = rune::transaction::ControlMarker::build(31, 0, rune::transaction::ControlType::Commit, 0);
+    enqueue(std::move(c));
+    const ViewInstance* inst = nullptr;
+    for (int i = 0; i < 40 && !(inst != nullptr && inst->foldCursor == m && inst->spanFence.count == 1); ++i) {
+        r.pass();
+        inst = r.vs->instanceForTest(kView, 0);
+    }
+    ASSERT_TRUE(inst != nullptr && inst->foldCursor == m && inst->spanFence.count == 1) << "the fold stands at T's marker, its span open";
+    ASSERT_GT(r.log->deleteOldSegments(0), 0);
+    ASSERT_EQ(r.log->logStartOffset(), m) << "retention took T's batches; the fold stands at the log start";
+    ASSERT_EQ(r.produceBatch(VerdictRig::batch(recs(30, 30))), 0);
+    r.settle(40);
+    inst = r.vs->instanceForTest(kView, 0);
+    EXPECT_EQ(r.vs->foldCounters(kView, 0)->checkpointDiscards, 1u) << "exactly one BelowLogStart discard";
+    EXPECT_TRUE(r.idRow(kView, 30).has_value()) << "the refold goes on past the marker";
+    EXPECT_FALSE(r.idRow(kView, 20).has_value()) << "the refold starts at the log start";
+    EXPECT_EQ(inst->spanFence.count, 0);
+    EXPECT_FALSE(inst->spanFence.fenced());
+    EXPECT_EQ(inst->readiness, ViewReadiness::Ready);
+}
+
 // REGRESSION (P11-0, contract 13): a checkpoint at O with first < O <= M would hold none of the span's records and a refold from it
 // would never see the ones below O.  The push is vetoed while the cursor stands in the span; a crash at every pass boundary then
 // recovers the undisturbed tables.

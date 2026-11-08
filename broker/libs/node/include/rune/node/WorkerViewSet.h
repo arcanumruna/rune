@@ -839,9 +839,10 @@ private:
             return 0;
         }
         // 0c. Retention trimmed the disk source below this cursor (#726; a paused view, a stale checkpoint, a fresh view over a trimmed
-        //     log): an instance without rows starts at the log start; one with rows is backed up and rebuilt.  Pure arithmetic, so it
-        //     runs before the namespace pause return: a resumed view sees it on its first pass.
-        if (transientSrc == nullptr && inst.foldCursor < b.logStart) [[unlikely]] {
+        //     log): an instance without rows starts at the log start; one with rows is backed up and rebuilt, as is one whose open
+        //     span lost its first batches (its marker could never be applied).  Pure arithmetic, so it runs before the namespace
+        //     pause return: a resumed view sees it on its first pass.
+        if (transientSrc == nullptr && (inst.foldCursor < b.logStart || inst.spanFence.straddles(b.logStart))) [[unlikely]] {
             if (!startAtLogStart_(inst, b.logStart)) return 1;
         }
         // 0c'. #159: a persisted instance whose cursor is above the source log end holds rows from records the log no longer has
@@ -955,6 +956,10 @@ private:
             spdlog::warn("WorkerViewSet: view {}: more than {} transactions open at once; the excess apply at their own offsets (P11-9)",
                          inst.plan.viewName, rune::view::TxnSpanFence::kSlots);
         inst.counters.txnSuperseded    += st.txnSuperseded;
+        inst.counters.txnReadFailed    += st.txnReadFailed;
+        if (st.txnReadFailed != 0 && inst.counters.txnReadFailed == st.txnReadFailed)
+            spdlog::warn("WorkerViewSet: view {} partition {}: a transaction's read-back below offset {} failed; its marker is retried each pass",
+                         inst.plan.viewName, inst.partition, inst.foldCursor);
         if (inst.claims) inst.counters.uniqueConflicts = inst.claims->extras();
 
         // Bug A: this pass's OWN fold may be what just caught the instance up
