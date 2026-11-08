@@ -191,10 +191,11 @@ struct ThreeNodes {
 
     /// Applied to every node's config before it starts (catalog Task 12 fix round 1: a small MTU).
     std::function<void(NodeConfig&)> configTweak;
-    static ThreeNodes startWith(const std::string& tag, std::function<void(NodeConfig&)> tweak) {
+    static ThreeNodes startWith(const std::string& tag, std::function<void(NodeConfig&)> tweak, bool parallel = true) {
         ThreeNodes c(tag, Mode::Shard);
         c.configTweak = std::move(tweak);
-        c.startNodes({1, 2, 3});
+        if (parallel) c.startNodes({1, 2, 3});
+        else for (int id : {1, 2, 3}) c.startNode(id);   // a test that needs node 1 up alone for a while (its slow candidacy)
         return c;
     }
 

@@ -286,7 +286,7 @@ TEST(TestClusterRegression, ALeaderHoldingNoPartitionAnswersOkRegression) {
     auto c3 = ThreeNodes::startWith("tc_nohold", [](NodeConfig& cfg) {
         cfg.gatewayMinIsr = 1;
         if (cfg.nodeId == 1) { cfg.electionTimeoutMs = 3000; cfg.startupCanvassTimeoutMs = 3000; }
-    });
+    }, false);   // booted one after the other: started together, node 1 wins the first election whatever its timeout
     ASSERT_TRUE(c3.awaitCatalogLeader(30s));
     const int32_t leader = c3.catalogLeaderId();
     ASSERT_GT(leader, 0);
