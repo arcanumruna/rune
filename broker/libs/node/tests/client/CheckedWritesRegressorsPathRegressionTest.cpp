@@ -130,12 +130,13 @@ std::string eagerScript() {
 
 /// The statement of the golden script that holds `marker`.
 std::string goldenStatement(const std::string& marker) {
-    std::ifstream in(std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql");
+    const std::string path = std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql";
+    std::ifstream in(path);
     std::stringstream text;
     text << in.rdbuf();
     for (std::string st : rune::cli::engine::splitStatements(text.str()))
         if (st.find(marker) != std::string::npos) return st;
-    return {};
+    throw std::runtime_error("no statement holding '" + marker + "' in " + path);
 }
 
 /// The statement of the golden script that defines topic `name`, on one broker.
@@ -747,9 +748,9 @@ TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardR
     struct Kind { rc::Acks acks; int32_t announce; };
     uint64_t id = 1;
     std::optional<int64_t> firstFoo;
-    std::vector<std::unique_ptr<PcWriter>> writers;   // an acks=none writer has nothing to await: it lives until the broker has judged its records
     rc::Client plain(clientDriver.attach(b.clientConfig()));   // the three plain writers are three producers of one client; the v11 announce is a property of the session
     plain.connectAndWait(10s);
+    std::vector<std::unique_ptr<PcWriter>> writers;   // an acks=none writer has nothing to await: it lives until the broker has judged its records
     for (const Kind kind : {Kind{rc::Acks::Leader, 0}, Kind{rc::Acks::All, 0}, Kind{rc::Acks::None, 0}, Kind{rc::Acks::All, 11}}) {
         rc::ClientConfig cfg = clientDriver.attach(b.clientConfig());
         cfg.testAnnounceClientVersion = kind.announce;
@@ -893,8 +894,8 @@ TEST(CheckedWritesRegressorsPathRegression, ReplaceWhileWritingShardRegression) 
 // ============================================================================
 namespace {
 
-const std::string kUserIdentity   = goldenView("user_identity");
-const std::string kCharacterName  = goldenView("character_name");
+std::string ddlUserIdentity() { return goldenView("user_identity"); }
+std::string ddlCharacterName() { return goldenView("character_name"); }
 const std::string kCharacterById  = "create view character_by_id key characterId as select userId, name from character;\n";
 const std::string kAccountChars   = "create view account_characters key (userId, characterId) as select name from character;\n";
 /// The golden account_stats view with its limit set to `cap`.
@@ -937,7 +938,16 @@ void compactOwner(BrokerNode& n, Writer& w, int32_t topicId, int64_t through, Le
         for (int i = 0; i < 32; ++i) tokens.push_back(send(w, rec));
         for (const rc::Token t : tokens) ledger.note(id, w.await(t));
     }
-    EXPECT_TRUE(waitFor([&] { return n.onOwnerThreadForTest(topicId, 0, [](rune::replication::PartitionReplica& r) { return r.lastCleanOffset(); }) > through; }, 10s)) << "the cleaner never passed offset " << through << " of topic " << topicId;
+    if (!waitFor([&] { return n.onOwnerThreadForTest(topicId, 0, [](rune::replication::PartitionReplica& r) { return r.lastCleanOffset(); }) > through; }, 10s)) {
+        const std::string inputs = n.onOwnerThreadForTest(topicId, 0, [](rune::replication::PartitionReplica& r) {
+            std::string bases;
+            for (const int64_t b : r.log()->segmentBaseOffsets()) bases += " " + std::to_string(b);
+            return "lastClean " + std::to_string(r.lastCleanOffset()) + " progress " + std::to_string(r.cleanerProgress()) + " verdictBound " + std::to_string(r.cleanerVerdictBound()) +
+                   " markerEnd " + std::to_string(r.cleanerVerdictMarkerEnd()) + " lso " + std::to_string(r.cleanerLastStableOffset()) + " hw " + std::to_string(r.cleanerHighWatermark()) +
+                   " segments" + bases;
+        });
+        ADD_FAILURE() << "the cleaner never passed offset " << through << " of topic " << topicId << ": " << inputs;
+    }
 }
 
 /// What compaction must have left of `topic`: no rejected record, the newest accepted record of every key, and the stats saying so.
@@ -991,7 +1001,7 @@ TEST(CheckedWritesRegressorsPathRegression, LoginRaceAdmitsOneWinnerShardRegress
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("user") + kUserIdentity, &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("user") + ddlUserIdentity(), &out, &err), 0) << err;
     ViewHandle userIdentity(b.node(), "user_identity");
     Writer a(b.clientConfig(), true, false), c(b.clientConfig(), true, false);
     Ledger users;
@@ -1019,7 +1029,7 @@ TEST(CheckedWritesRegressorsPathRegression, ViewsAreShownAndCreatesReturnTheirId
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("character") + kCharacterName + accountStats(12) + kCharacterById + "show view character_name;\nshow view account_stats;\n",
+    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("character") + ddlCharacterName() + accountStats(12) + kCharacterById + "show view character_name;\nshow view account_stats;\n",
                        &out, &err), 0) << err;
     EXPECT_NE(out.find("unique"), std::string::npos) << out;
     EXPECT_NE(out.find("keyspec lower(name) as nameKey"), std::string::npos) << out;
@@ -1086,7 +1096,7 @@ TEST(CheckedWritesRegressorsPathRegression, RestartKeepsTheLimitsAndTheNamesShar
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("user") + kUserIdentity + topicDdl("character") + kCharacterName + accountStats(2), &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("user") + ddlUserIdentity() + topicDdl("character") + ddlCharacterName() + accountStats(2), &out, &err), 0) << err;
     uint64_t k = 0, c1 = 0;
     constexpr uint64_t kFull = 3;
     {
@@ -1125,7 +1135,7 @@ TEST(CheckedWritesRegressorsPathRegression, DeleteFreesTheNameAndTheSlotShardReg
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("character") + kCharacterName + accountStats(2), &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("character") + ddlCharacterName() + accountStats(2), &out, &err), 0) << err;
     ViewHandle accountStats(b.node(), "account_stats");
     Writer w(b.clientConfig(), false);
     Ledger chars;
@@ -1155,7 +1165,7 @@ TEST(CheckedWritesRegressorsPathRegression, RejectedRecordsAreNeverDeliveredAndC
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("user", true) + kUserIdentity + topicDdl("character", true) + kCharacterName, &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("user", true) + ddlUserIdentity() + topicDdl("character", true) + ddlCharacterName(), &out, &err), 0) << err;
     const int32_t userTopic = topicIdOf(b.node(), "user"), characterTopic = topicIdOf(b.node(), "character");
     ASSERT_GE(userTopic, 0);
     ASSERT_GE(characterTopic, 0);
@@ -1196,7 +1206,7 @@ TEST(CheckedWritesRegressorsPathRegression, ACrashedLeaderIsReplacedThreeNodesRe
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("user")) + stmt(goldenTopic("character")) + kCharacterName, &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("user")) + stmt(goldenTopic("character")) + ddlCharacterName(), &out, &err), 0) << err;
     BrokerNode& admin = c.node(awaitController(c));
     const int32_t userTopic = topicIdOf(admin, "user"), characterTopic = topicIdOf(admin, "character");
     ASSERT_GE(userTopic, 0);
@@ -1225,7 +1235,8 @@ TEST(CheckedWritesRegressorsPathRegression, ACrashedLeaderIsReplacedThreeNodesRe
     EXPECT_GT(bar.key(), fooId) << "the new leader must not reuse an id";
     characterName.builder.clear();
     const auto row = readRow(*loser.client, characterName, bytesOf(characterName.builder.setString("name", "foo").key()), refused.offset());
-    EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "the loser reads the winner's row on the first try";
+    ASSERT_EQ(row.status, rc::ViewRowResult::kOk) << "the loser reads Foo's row on the first try";
+    EXPECT_EQ(characterName.u(row.rowBytes, "characterId"), fooId);
 }
 
 // Whole step 7 across nodes: every broker restarts and the limit still holds.
@@ -1236,7 +1247,7 @@ TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheLimitThree
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + kCharacterName + accountStats(2), &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + ddlCharacterName() + accountStats(2), &out, &err), 0) << err;
     const int32_t characterTopic = topicIdOf(c.node(awaitController(c)), "character");
     ASSERT_GE(characterTopic, 0);
     constexpr uint64_t kFull = 3;
@@ -1280,7 +1291,7 @@ TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropMin
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + kCharacterName, &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + ddlCharacterName(), &out, &err), 0) << err;
     const int32_t characterTopic = topicIdOf(c.node(awaitController(c)), "character");
     ASSERT_GE(characterTopic, 0);
     std::vector<int32_t> leaders;
