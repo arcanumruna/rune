@@ -794,6 +794,12 @@ bit read from the per-partition write spec or view source already in cache):**
   `ProducerImpl.cpp:661`, `:4021`: client send paths — proven unreachable for lease topics because lease writes go
   only through `LeaseTopic<T>` (Task 14), which never sends an empty value; a `static_assert`-free runtime test
   pins that `TypedTopic<T>::open` on a lease topic is refused locally.
+- **Amended 2026-11-08.** The client sites above (`Subscription.h`, `TypedTopic.h`, `Producer.cpp`, `ProducerImpl.cpp`)
+  move to Task 14: the client has no per-subscription lease flag until `LeaseTopic<T>` exists. Broker side, the data
+  folds normalize in one place (`leaseDataView` in `FoldSkip.h`, used by `walkCommitted`, `walkAggregate` and the
+  verdict members other than the lease index): a `Checkpoint` is skipped and a `Revoke` / `Expire` is folded as an
+  empty value, so the existing delete paths at `ViewFold.cpp:177/343/377` and `AggFold.cpp:628` are unchanged. The
+  trait comes from the partition's write spec through `FoldSkip::traits`.
 - Step 0 of the task re-runs `grep -rn "value\.empty()\|value()\.empty()" --include=*.h --include=*.cpp broker/libs
   client-cpp/include client-cpp/src codec/src codec/include | grep -v /tests/` and the reviewer checks the list above
   equals its output (21 sites at the plan's tip); any new site is added.
