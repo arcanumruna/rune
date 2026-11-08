@@ -1,5 +1,6 @@
 #include "rune/ql/Backends.h"
 #include "ConfigKeys.h"
+#include <rune/codec/LeaseColumns.h>
 #include <rune/codec/Serialize.h>
 #include <rune/codec/UnicodeLower.h>
 #include <rune/codec/ViewKeyEncoding.h>
@@ -197,6 +198,10 @@ ViewSource viewSourceOf(const TopicDef& td) {
     src.name = td.name;
     src.keyField = td.keyField;
     if (!td.fields.empty()) src.descriptor = toDescriptor(td);
+    // A lease topic's stored schema starts with the four lease system columns (ids 0..3, user ids + 4); a script view
+    // over it must see them exactly as the broker's catalog does.
+    if (td.lease && !rune::codec::prependLeaseColumns(src.descriptor))
+        throw std::logic_error("lease topic '" + td.name + "': a field id no longer fits after the lease columns");
     src.partitions = static_cast<int32_t>(td.partitions);
     src.transient = td.persistence == Persistence::Transient;
     return src;

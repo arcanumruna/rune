@@ -1,6 +1,6 @@
 // rune-ql parser — tokenizer + recursive-descent DDL parser
 // Grammar:
-//   statement   := topicStmt | transientStmt | alterStmt | dropStmt | showStmt | diffStmt
+//   statement   := topicStmt | leaseTopicStmt | transientStmt | alterStmt | dropStmt | showStmt | diffStmt
 //                | createStmt | grantStmt | revokeStmt                       (authentication: users / roles / grants)
 //   transientStmt := "transient" ["lease"] topicStmt       (Phase 2b E: persistence = Transient)
 //   leaseTopicStmt := "lease" topicStmt                    (a lease topic: needs a typed, keyed topic; lease.* settings)
@@ -33,14 +33,16 @@
 //   alterUser   := "alter" "user" NAME ( "add" "password" STRING | "drop" "password" INT         (1 oldest | 2)
 //                                      | "set" "password" STRING [ "terminate" "sessions" ] | "disable" | "enable" ) ";"
 //   grantStmt   := "grant" ( OPERATION "on" resource "to" ( "user" | "role" ) NAME | "role" NAME "to" "user" NAME ) ";"
-//   revokeStmt  := "revoke" ( OPERATION "on" resource "from" ( "user" | "role" ) NAME | "role" NAME "from" "user" NAME ) ";"
+//   revokeStmt  := "revoke" ( OPERATION "on" resource "from" ( "user" | "role" ) NAME | "role" NAME "from" "user" NAME
+//                | "lease" NAME "key" KEYLIT ) ";"
 //   resource    := "cluster" | ( "topic" | "view" | "group" | "transactional_id" ) ( "prefix" STRING | NAME )
 //   OPERATION   := "read" | "write" | "create" | "alter" | "drop" | "describe" | "admin" | "truncate" | "import"
 //   showSecurity:= "show" ( "users" | "roles" ) ";"
 //                | "show" "grants" "for" ( "user" | "role" ) NAME [ "as" "of" ( "offset" INT | "time" STRING ) ] ";"
 //                | "show" "security" "history" [ ( "user" | "role" ) NAME ] [ "since" STRING ] ";"
 //   NAME        := IDENT | STRING        (names with '.', '@' or '-' are written as a STRING; a password STRING is non-empty)
-//   showStmt    := "show" "history" [ ("topic" | "view" | "schema") IDENT ] [ "since" STRING ] ";"
+//   showStmt    := "show" "leases" … | "show" "lease" …                 (the lease forms above)
+//                | "show" "history" [ ("topic" | "view" | "schema") IDENT ] [ "since" STRING ] ";"
 //                | "show" ("schema" | "view" | "topic") IDENT "as" "of" ( "version" INT | "time" STRING | "offset" INT ) ";"
 //   diffStmt    := "diff" "schema" IDENT "version" INT "to" INT ";"
 //                | "diff" "catalog" "offset" INT "to" INT ";"
@@ -751,20 +753,8 @@ struct Parser {
                 if (leaseSettingAt(i)) return errAt(settingToks[i], "lease.* settings need a lease topic");
             return std::nullopt;
         }
-        if (td.fields.empty() || td.keyField.empty()) return errAt(stmtStart, "a lease topic needs a typed, keyed topic");
-        for (std::size_t i = 0; i < td.fields.size(); ++i)
-            if (td.fields[i].autoIncrement) return errAt(fieldToks[i], "a lease topic cannot use autoincrement");
-        for (std::size_t i = 0; i < td.fields.size(); ++i)
-            if (td.fields[i].name.starts_with("lease_")) return errAt(fieldToks[i], "lease_ field names are reserved");
-        for (std::size_t i = 0; i < td.with.size(); ++i) {
-            const auto& w = td.with[i];
-            if (w.key == "key.index" && w.value != 0) return errAt(settingToks[i], "a lease topic's key index is its lease view");
-            if (w.key == "autoincrement.reserve" || w.key == "autoincrement.max")
-                return errAt(settingToks[i], "autoincrement.max and autoincrement.reserve need autoincrement");
-            if ((w.key == "cleanup.policy" && w.value != 1) || (w.key == "retention.ms" && w.value != -1) ||
-                (w.key == "retention.bytes" && w.value != -1))
-                return errAt(settingToks[i], "a lease topic is compacted and keeps every live lease");
-        }
+        // The broker's leaseDefineRefusal order, each rule a whole pass: lease spec -> typed+keyed -> autoincrement ->
+        // key.index -> cleanup/retention -> lease_ fields -> autoincrement.reserve/max.  (Transient: no QL refusal.)
         protocol::LeaseSpec spec{};
         for (std::size_t i = 0; i < td.with.size(); ++i) {
             const auto* ss = detail::findSetting(td.with[i].key);
@@ -773,6 +763,26 @@ struct Parser {
                 return errAt(settingToks[i], std::string(*refusal));
         }
         if (const auto refusal = protocol::validateLeaseSpec(spec)) return errAt(stmtStart, std::string(*refusal));
+        if (td.fields.empty() || td.keyField.empty()) return errAt(stmtStart, "a lease topic needs a typed, keyed topic");
+        for (std::size_t i = 0; i < td.fields.size(); ++i)
+            if (td.fields[i].autoIncrement) return errAt(fieldToks[i], "a lease topic cannot use autoincrement");
+        for (std::size_t i = 0; i < td.with.size(); ++i)
+            if (td.with[i].key == "key.index" && td.with[i].value != 0)
+                return errAt(settingToks[i], "a lease topic's key index is its lease view");
+        for (std::size_t i = 0; i < td.with.size(); ++i) {
+            const auto& w = td.with[i];
+            if ((w.key == "cleanup.policy" && w.value != 1) || (w.key == "retention.ms" && w.value != -1) ||
+                (w.key == "retention.bytes" && w.value != -1))
+                return errAt(settingToks[i], "a lease topic is compacted and keeps every live lease");
+        }
+        for (std::size_t i = 0; i < td.fields.size(); ++i)
+            if (td.fields[i].name.starts_with("lease_")) return errAt(fieldToks[i], "lease_ field names are reserved");
+        for (std::size_t i = 0; i < td.with.size(); ++i) {
+            const auto& w = td.with[i];
+            if ((w.key == "autoincrement.reserve" && w.value != static_cast<int64_t>(protocol::kAutoIncrementReserveDefault)) ||
+                (w.key == "autoincrement.max" && w.value != static_cast<int64_t>(protocol::kAutoIncrementMaxDefault)))
+                return errAt(settingToks[i], "autoincrement.max and autoincrement.reserve need autoincrement");
+        }
         return std::nullopt;
     }
 
@@ -1540,8 +1550,21 @@ struct Parser {
         return Statement(std::in_place_type<DropViewDef>, DropViewDef{std::string(nameToken->text)});
     }
 
+    // "limit" INT (1..4294967295) - cur is "limit"; shared by select and show leases.
+    std::expected<uint32_t, ParseError> parseLimit() noexcept {
+        advance();   // "limit"
+        if (cur.kind != TK::Int) return std::unexpected(err("expected integer for limit, got " + got()));
+        uint64_t n = 0;
+        const auto ec = std::from_chars(cur.text.data(), cur.text.data() + cur.text.size(), n).ec;
+        if (ec != std::errc{} || n > std::numeric_limits<uint32_t>::max()) return std::unexpected(err("limit must be <= 4294967295"));
+        if (n < 1) return std::unexpected(err("limit must be >= 1"));
+        advance();
+        return static_cast<uint32_t>(n);
+    }
+
     // KEYLIT := ["-"] INT | STRING  - a lease key, stored as parseLiteral builds a literal.
     std::expected<Literal, ParseError> parseLeaseKey() noexcept {
+        if (cur.kind == TK::BadString) return std::unexpected(err("unterminated string literal"));
         if (cur.kind != TK::String && cur.kind != TK::Int && cur.kind != TK::Dash)
             return std::unexpected(err("a lease key is an integer or a string"));
         return parseLiteral();
@@ -1574,14 +1597,9 @@ struct Parser {
             if (isKw("and") || isKw("or")) return std::unexpected(err(kPrefixOnly));
         }
         if (isKw("limit")) {
-            advance();
-            if (cur.kind != TK::Int) return std::unexpected(err("expected integer for limit, got " + got()));
-            uint64_t v = 0;
-            const auto ec = std::from_chars(cur.text.data(), cur.text.data() + cur.text.size(), v).ec;
-            if (ec != std::errc{} || v > std::numeric_limits<uint32_t>::max()) return std::unexpected(err("limit must be <= 4294967295"));
-            if (v < 1) return std::unexpected(err("limit must be >= 1"));
-            advance();
-            d.limit = static_cast<uint32_t>(v);
+            auto l = parseLimit();
+            if (!l) return std::unexpected(std::move(l.error()));
+            d.limit = *l;
         }
         if (auto semi = expect(TK::Semi, ";"); !semi) return std::unexpected(std::move(semi.error()));
         return Statement(std::in_place_type<ShowLeasesDef>, std::move(d));
@@ -1732,14 +1750,9 @@ struct Parser {
             s.where.push_back(WhereTerm{std::string(c->text), std::move(*lit)});
         } while (isKw("and"));
         if (isKw("limit")) {
-            advance();
-            if (cur.kind != TK::Int) return std::unexpected(err("expected integer for limit, got " + got()));
-            uint64_t n = 0;
-            const auto ec = std::from_chars(cur.text.data(), cur.text.data() + cur.text.size(), n).ec;
-            if (ec != std::errc{} || n > std::numeric_limits<uint32_t>::max()) return std::unexpected(err("limit must be <= 4294967295"));
-            if (n < 1) return std::unexpected(err("limit must be >= 1"));
-            advance();
-            s.limit = static_cast<uint32_t>(n);
+            auto l = parseLimit();
+            if (!l) return std::unexpected(std::move(l.error()));
+            s.limit = *l;
         }
         if (auto semi = expect(TK::Semi, ";"); !semi) return std::unexpected(std::move(semi.error()));
         return Statement(std::in_place_type<SelectDef>, std::move(s));

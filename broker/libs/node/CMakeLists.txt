@@ -865,9 +865,11 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesStatsTest.cpp
         tests/node/CheckedWritesStatsGatewayTest.cpp
         tests/node/CheckedWritesQlCompileTest.cpp
-        ${RUNE_BROKER_DIR}/../ql/tests/CheckedWritesQlFuzzTest.cpp)
+        ${RUNE_BROKER_DIR}/../ql/tests/CheckedWritesQlFuzzTest.cpp
+        ${RUNE_BROKER_DIR}/../ql/tests/LeaseQlTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
+        ${RUNE_BROKER_DIR}/../ql/src
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_checked_writes_tests PRIVATE
         rune_node

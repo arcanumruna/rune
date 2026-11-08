@@ -18,6 +18,7 @@
 
 #include <rune/catalog/CatalogFile.h>
 #include <rune/codec/AlterOps.h>
+#include <rune/codec/LeaseColumns.h>
 #include <rune/codec/Serialize.h>
 #include <rune/codec/ViewKeyEncoding.h>
 #include <rune/codec/ViewPlanAuthored.h>
@@ -152,26 +153,15 @@ std::string formatSchemaDefinition(const cat::TopicObject& t) {
 
 std::expected<std::vector<uint8_t>, std::string> stripLeaseColumns(std::span<const uint8_t> storedBlob,
                                                                    std::string_view topicName) {
-    static constexpr std::array<std::string_view, 4> kColumns = {"lease_version", "lease_ttl_ms", "lease_holder",
-                                                                 "lease_remaining_ms"};
-    const std::string refusal = "lease topic '" + std::string(topicName) + "' does not start with the lease system columns";
     rune::codec::Descriptor d;
     try {
         d = rune::codec::deserialize(storedBlob);
     } catch (const std::exception&) {
-        return std::unexpected(refusal);
+        return std::unexpected("lease topic '" + std::string(topicName) + "' does not start with the lease system columns");
     }
-    if (d.fields.size() < kColumns.size()) return std::unexpected(refusal);
-    // lease_version is Int64; the other three are UInt64 (the broker's system columns).
-    for (std::size_t i = 0; i < kColumns.size(); ++i) {
-        const rune::codec::PrimType want = i == 0 ? rune::codec::PrimType::Int64 : rune::codec::PrimType::UInt64;
-        if (d.fields[i].id != i || d.fields[i].name != kColumns[i] || d.fields[i].type != want)
-            return std::unexpected(refusal);
-    }
-    d.fields.erase(d.fields.begin(), d.fields.begin() + kColumns.size());
-    for (auto& f : d.fields) f.id = static_cast<uint16_t>(f.id - kColumns.size());
-    d.blockLength = rune::codec::computeOffsets(d.fields);
-    return rune::codec::serialize(d);
+    auto stripped = rune::codec::stripLeaseColumns(std::move(d), topicName);
+    if (!stripped) return std::unexpected(std::move(stripped.error()));
+    return rune::codec::serialize(*stripped);
 }
 
 std::string formatTopicDefinition(const cat::TopicObject& t) {
@@ -199,7 +189,7 @@ std::string formatTopicDefinition(const cat::TopicObject& t) {
           << "  lease.checkpoint " << (l.checkpoint != 0 ? "on" : "off") << "\n"
           << "  lease.checkpoint_interval " << l.checkpointIntervalMs << "\n"
           << "  lease.checkpoint_rate " << l.checkpointRate << "\n"
-          << "  lease view " << t.name << ".leases\n";
+          << "  lease view " << t.name << rune::codec::kLeaseViewSuffix << "\n";
     }
     o
       << "  config.cleanupPolicy " << int{c.cleanupPolicy} << "\n"
@@ -223,7 +213,7 @@ std::string formatTopicDefinition(const cat::TopicObject& t) {
 std::string formatViewDefinition(const cat::ViewObject& v) {
     std::ostringstream o;
     if (v.kind == cat::ViewKind::LeaseIndex) {   // a plan-less sink the broker made beside its lease topic (named `<topic>.leases`)
-        static constexpr std::string_view kSuffix = ".leases";
+        static constexpr std::string_view kSuffix = rune::codec::kLeaseViewSuffix;
         const std::string_view topic = std::string_view(v.name).ends_with(kSuffix)
                                            ? std::string_view(v.name).substr(0, v.name.size() - kSuffix.size())
                                            : std::string_view(v.name);

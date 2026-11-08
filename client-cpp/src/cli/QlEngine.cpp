@@ -17,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <type_traits>
 
 #include <fcntl.h>
@@ -354,11 +355,14 @@ std::optional<Prepared> prepare(const ql::Statement& st, const PrepareOptions& o
                 } else if constexpr (std::is_same_v<T, ql::ShowViewDef>) {
                     return Prepared{PShowView{s.name}};
                 } else if constexpr (std::is_same_v<T, ql::ShowLeasesDef>) {
-                    return Prepared{PShowLeases{s}};
+                    why = "'show leases' is not available yet";   // Task 22 prepares it; refused before anything is issued
+                    return std::nullopt;
                 } else if constexpr (std::is_same_v<T, ql::ShowLeaseDef>) {
-                    return Prepared{PShowLease{s}};
+                    why = "'show lease' is not available yet";
+                    return std::nullopt;
                 } else if constexpr (std::is_same_v<T, ql::RevokeLeaseDef>) {
-                    return Prepared{PRevokeLease{s}};
+                    why = "'revoke lease' is not available yet";
+                    return std::nullopt;
                 } else if constexpr (std::is_same_v<T, ql::ShowHistoryDef>) {
                     PHistory p;
                     p.text = "show history";
@@ -1408,10 +1412,10 @@ bool QlRun::run(const PShowTopic& s, const rc::DdlOptions&) {
     return true;
 }
 
-// Task 22 replaces these: the lease statements parse and plan today, but nothing is sent to the broker.
-bool QlRun::run(const PShowLeases&, const rc::DdlOptions&) { return fail("'show leases' is not available yet"); }
-bool QlRun::run(const PShowLease&, const rc::DdlOptions&) { return fail("'show lease' is not available yet"); }
-bool QlRun::run(const PRevokeLease&, const rc::DdlOptions&) { return fail("'revoke lease' is not available yet"); }
+// Task 22 replaces these: the lease statements are refused at prepare, so a script never reaches run() with one.
+bool QlRun::run(const PShowLeases&, const rc::DdlOptions&) { throw std::logic_error("unreachable: refused at prepare"); }
+bool QlRun::run(const PShowLease&, const rc::DdlOptions&) { throw std::logic_error("unreachable: refused at prepare"); }
+bool QlRun::run(const PRevokeLease&, const rc::DdlOptions&) { throw std::logic_error("unreachable: refused at prepare"); }
 
 bool QlRun::run(const PShowView& s, const rc::DdlOptions&) {
     if (!refreshCatalog()) return false;

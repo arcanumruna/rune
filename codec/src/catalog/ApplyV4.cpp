@@ -16,6 +16,7 @@
 #include <rune/catalog/TopicName.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Fingerprint.h>
+#include <rune/codec/LeaseColumns.h>
 #include <rune/codec/PrimType.h>
 #include <rune/codec/Serialize.h>
 
@@ -36,7 +37,7 @@ static_assert(rune::codec::kMaxLeaseKeyBytes == rune::protocol::kMaxLeaseKeyByte
 namespace rp = rune::protocol;
 using Code = ApplyError::Code;
 
-constexpr std::string_view kLeaseViewSuffix = ".leases";
+using rune::codec::kLeaseViewSuffix;
 constexpr uint16_t kFirstUserTag = 4;   // tags 0..3 are the lease system columns (L5)
 
 std::unexpected<ApplyError> fail(int64_t offset, const CatalogEvent& e, const std::string& what) {
@@ -60,16 +61,14 @@ std::string leaseViewName(const std::string& topicName) { return topicName + std
 std::string leaseColumnsError(const SchemaDef& schema) {
     using rune::codec::PrimType;
     const rune::codec::Descriptor d = rune::codec::deserialize(schema.descriptorBlob);
-    struct Col { const char* name; PrimType type; };
-    constexpr Col kCols[] = {{"lease_version", PrimType::Int64}, {"lease_ttl_ms", PrimType::UInt64},
-                             {"lease_holder", PrimType::UInt64}, {"lease_remaining_ms", PrimType::UInt64}};
+    const auto& kCols = rune::codec::kLeaseColumns;
     for (std::size_t i = 0; i < std::size(kCols); ++i) {
         if (i >= d.fields.size() || d.fields[i].id != i || d.fields[i].name != kCols[i].name || d.fields[i].type != kCols[i].type)
             return "a lease topic starts with the four lease system columns";
     }
     for (std::size_t i = std::size(kCols); i < d.fields.size(); ++i)
         if (d.fields[i].name.starts_with("lease_")) return "lease_ field names are reserved";
-    for (const Col& c : kCols)
+    for (const auto& c : kCols)
         if (schema.keyField == c.name) return "the key of a lease topic is a user field";
     return {};
 }

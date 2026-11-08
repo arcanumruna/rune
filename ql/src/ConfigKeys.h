@@ -109,7 +109,7 @@ inline constexpr std::array<SettingSpec, 25> kSettings{{
             if (!fits(std::numeric_limits<uint32_t>::max())) return protocol::kLeaseCheckpointRateRangeText;
             s.checkpointRate = static_cast<uint32_t>(v);
             return std::nullopt;
-        default: return std::nullopt;
+        default: return std::string_view("not a lease setting");
     }
 }
 

@@ -385,6 +385,39 @@ TEST(CheckedWritesQlBrokerRegression, ScriptCreatesTopicThenViewShardRegression)
     EXPECT_NE(out.find("  sources s\n"), std::string::npos) << out;
 }
 
+// Lease topics Task 4 (H3): `rune ql` sends the lease - a REAL client against a REAL broker (shard runtime, the one every
+// test in this file runs), not a LiveBroker double.
+TEST(CheckedWritesQlBrokerRegression, LeaseTopicQlBrokerRegression) {
+    OneBroker b("cw08_lease", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    std::string out, err;
+    ASSERT_EQ(ql(b.endpoint(), "lease topic inst { id uint64, addr string(64) } partitions 2 key id with "
+                               "(lease.ttl = 5000, lease.checkpoint = off);", &out, &err), 0) << err;
+
+    auto client = b.connectClient();
+    const auto leaseOf = [&]() -> std::optional<rune::protocol::LeaseSpec> {
+        if (!client->catalogHistory({}, 10s)) return std::nullopt;
+        const auto* t = client->catalogReader().state().topicByName(rune::catalog::kDefaultNsId, "inst");
+        return t != nullptr ? t->lease : std::nullopt;
+    };
+    auto lease = leaseOf();
+    ASSERT_TRUE(lease.has_value()) << "the broker's topic 'inst' is not a lease topic";
+    rune::protocol::LeaseSpec want{};
+    want.ttlMs = 5000;
+    want.checkpoint = 0;
+    EXPECT_EQ(*lease, want);
+    const auto* t = client->catalogReader().state().topicByName(rune::catalog::kDefaultNsId, "inst");
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->config.cleanupPolicy, 1);
+    EXPECT_NE(client->catalogReader().state().viewByName(rune::catalog::kDefaultNsId, "inst.leases"), nullptr);
+
+    ASSERT_EQ(ql(b.endpoint(), "alter topic inst set lease.ttl = 7000;", &out, &err), 0) << err;
+    lease = leaseOf();
+    ASSERT_TRUE(lease.has_value());
+    EXPECT_EQ(lease->ttlMs, 7000u);
+}
+
 // R02d, R10b: a keyless typed topic is legal; a view over it and key.index on it are the broker's refusals.
 TEST(CheckedWritesQlBrokerRegression, KeylessTypedTopicFromQlShardRegression) {
     OneBroker b("cw08_keyless", OneBroker::Runtime::Shard);

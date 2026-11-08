@@ -252,7 +252,8 @@ add_executable(rune_codec_tests
     tests/LineageDecodeTest.cpp
     tests/CheckedWritesUnicodeLowerTest.cpp
     tests/CheckedWritesViewKeyEncodingTest.cpp
-    tests/CheckedWritesViewPlanAuthoredTest.cpp)
+    tests/CheckedWritesViewPlanAuthoredTest.cpp
+    tests/LeaseColumnsTest.cpp)
 target_include_directories(rune_codec_tests PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")
 target_compile_definitions(rune_codec_tests PRIVATE

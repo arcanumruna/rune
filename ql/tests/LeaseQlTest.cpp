@@ -294,9 +294,25 @@ TEST(LeaseQlRegression, ShowLeasesRegression) {
     EXPECT_EQ(refusal("show leases t limit 0;"), "limit must be >= 1");
     EXPECT_EQ(refusal("show leases t limit 4294967296;"), "limit must be <= 4294967295");
     EXPECT_EQ(refusal("show leases t limit x;"), "expected integer for limit, got 'x'");
-    EXPECT_NE(refusal("show leases;"), "<accepted>");
-    EXPECT_NE(refusal("show leases t extra;"), "<accepted>");
-    EXPECT_NE(refusal("show leases t where k like 'a%'"), "<accepted>");   // no ';'
+    EXPECT_EQ(refusal("show leases;"), "expected topic name (an identifier or a quoted string), got ';'");
+    EXPECT_EQ(refusal("show leases t extra;"), "expected ;, got 'extra'");
+    EXPECT_EQ(refusal("show leases t where k like 'a%'"), "expected ;, got end of input");   // no ';'
+    EXPECT_EQ(refusal("show leases t where k like 'abc;"), "unterminated string literal");
+
+    // The prefix limit is in BYTES: 63 two-byte characters + 'x' = 127 accepted, 64 two-byte characters = 128 refused.
+    std::string two;
+    for (int i = 0; i < 63; ++i) two += "\xC3\xA9";
+    const auto ok127 = parseAs<ql::ShowLeasesDef>("show leases t where k like '" + two + "x%';");
+    ASSERT_TRUE(ok127.prefix.has_value());
+    EXPECT_EQ(ok127.prefix->size(), 127u);
+    EXPECT_EQ(refusal("show leases t where k like '" + two + "\xC3\xA9%';"), "a lease key prefix is at most 127 bytes");
+
+    // Positions: the refusals of the `like` term are at the pattern token.
+    const std::string like = "show leases t where k like 'abc';";
+    auto lr = ql::parse(like);
+    ASSERT_FALSE(lr.has_value());
+    EXPECT_EQ(lr.error().line, 1u);
+    EXPECT_EQ(lr.error().col, like.find("'abc'") + 1);
 }
 
 TEST(LeaseQlRegression, ShowAndRevokeLeaseRegression) {
@@ -326,10 +342,12 @@ TEST(LeaseQlRegression, ShowAndRevokeLeaseRegression) {
     for (const char* text : {"show lease t key true;", "show lease t key false;", "revoke lease t key true;", "show lease t key x;",
                              "revoke lease t key;", "show lease t key ;"})
         EXPECT_EQ(refusal(text), "a lease key is an integer or a string") << text;
-    EXPECT_NE(refusal("show lease t key - 3;"), "<accepted>");
-    EXPECT_NE(refusal("show lease t 7;"), "<accepted>");
-    EXPECT_NE(refusal("revoke lease t;"), "<accepted>");
-    EXPECT_NE(refusal("show lease t key 7 extra;"), "<accepted>");
+    EXPECT_EQ(refusal("show lease t key - 3;"), "expected digits right after '-', got '3'");
+    EXPECT_EQ(refusal("show lease t 7;"), "expected 'key', got '7'");
+    EXPECT_EQ(refusal("revoke lease t;"), "expected 'key', got ';'");
+    EXPECT_EQ(refusal("show lease t key 7 extra;"), "expected ;, got 'extra'");
+    EXPECT_EQ(refusal("show lease t key 'abc;"), "unterminated string literal");
+    EXPECT_EQ(refusal("revoke lease t key 'abc;"), "unterminated string literal");
 
     // The security grammar of `revoke` is unchanged.
     const auto rv = parseAs<ql::RevokeDef>("revoke read on topic t from user u;");
@@ -357,4 +375,95 @@ TEST(LeaseQlRegression, ShowAndRevokeLeaseRegression) {
     EXPECT_EQ((*script)[1].index(), 25u);
     EXPECT_EQ((*script)[2].index(), 27u);
     EXPECT_EQ((*script)[3].index(), 14u);
+}
+
+TEST(LeaseQlRegression, LeaseErrorPositionsAndDuplicatesRegression) {
+    struct Row { std::string text, message; std::size_t col; };
+    const std::vector<Row> rows = {
+        {"lease topic t { id uint64, lease_x int32 } key id;", "lease_ field names are reserved", 28},
+        {"lease topic t { id uint64 } key id with (lease.ttl = 100, lease.min_ttl = 2000);",
+         std::string(rp::kLeaseTtlRangeText), 1},
+        {"lease topic t { id uint64 } key id with (lease.ttl = -1);", std::string(rp::kLeaseTtlRangeText), 42},
+        {"lease topic t { id uint64 } key id with (lease.ttl = 5000, lease.ttl = 6000);", "duplicate setting 'lease.ttl'", 60},
+    };
+    for (const auto& row : rows) {
+        auto r = ql::parse(row.text);
+        ASSERT_FALSE(r.has_value()) << row.text;
+        EXPECT_EQ(r.error().message, row.message) << row.text;
+        EXPECT_EQ(r.error().line, 1u) << row.text;
+        EXPECT_EQ(r.error().col, row.col) << row.text;
+    }
+}
+
+TEST(LeaseQlRegression, LeaseIsAnOrdinaryNameRegression) {
+    EXPECT_EQ(parseAs<ql::TopicDef>("topic lease {id int32} key id;").name, "lease");
+    EXPECT_FALSE(parseAs<ql::TopicDef>("topic lease {id int32} key id;").lease);
+    const auto lt = parseAs<ql::TopicDef>("lease topic lease {id int32} key id;");
+    EXPECT_EQ(lt.name, "lease");
+    EXPECT_TRUE(lt.lease);
+    EXPECT_EQ(parseAs<ql::ShowTopicDef>("show topic lease;").name, "lease");
+    EXPECT_EQ(parseAs<ql::AlterTopicConfigDef>("alter topic lease set retention.ms = 1;").name, "lease");
+    EXPECT_EQ(parseAs<ql::SelectDef>("select * from lease where id = 1;").view, "lease");
+    EXPECT_EQ(parseAs<ql::RevokeDef>("revoke read on topic lease from user u;").granteeName, "u");
+    EXPECT_EQ(parseAs<ql::RevokeRoleDef>("revoke role lease from user u;").role, "lease");
+}
+
+TEST(LeaseQlRegression, RuleOrderRegression) {
+    // Pairs of violations: the EARLIER rule in the broker's leaseDefineRefusal order wins.
+    struct Row { std::string text, message; };
+    const std::string ttl = std::string(rp::kLeaseTtlRangeText);
+    const std::vector<Row> rows = {
+        // spec -> typed+keyed
+        {"lease topic t partitions 2 with (lease.ttl = 5);", ttl},
+        // typed+keyed -> every later rule (autoincrement without a key is the generic "autoincrement needs a key")
+        {"lease topic t { id uint64 } with (key.index = on, retention.ms = 5);", "a lease topic needs a typed, keyed topic"},
+        {"lease topic t { id uint64, lease_x int32 } with (autoincrement.max = 5);", "a lease topic needs a typed, keyed topic"},
+        // autoincrement -> key.index
+        {"lease topic t { id uint64 autoincrement } key id with (key.index = on);", "a lease topic cannot use autoincrement"},
+        // key.index -> cleanup/retention
+        {"lease topic t { id uint64 } key id with (key.index = on, retention.ms = 5);", "a lease topic's key index is its lease view"},
+        // cleanup/retention -> lease_ fields
+        {"lease topic t { id uint64, lease_x int32 } key id with (retention.ms = 5);",
+         "a lease topic is compacted and keeps every live lease"},
+        // lease_ fields -> autoincrement.reserve/max
+        {"lease topic t { id uint64, lease_x int32 } key id with (autoincrement.max = 5);", "lease_ field names are reserved"},
+        // last: autoincrement.reserve / max alone
+        {"lease topic t { id uint64 } key id with (autoincrement.max = 5);",
+         "autoincrement.max and autoincrement.reserve need autoincrement"},
+        {"lease topic t { id uint64 } key id with (autoincrement.reserve = 5);",
+         "autoincrement.max and autoincrement.reserve need autoincrement"},
+        // each rule is a whole pass: a later setting of an EARLIER rule beats an earlier setting of a later rule
+        {"lease topic t { id uint64 } key id with (retention.ms = 5, key.index = on);", "a lease topic's key index is its lease view"},
+        {"lease topic t { id uint64 } key id with (autoincrement.max = 5, retention.ms = 5);",
+         "a lease topic is compacted and keeps every live lease"},
+        {"lease topic t { id uint64 } key id with (retention.ms = 5, lease.ttl = 1);", ttl},
+    };
+    for (const auto& row : rows) EXPECT_EQ(refusal(row.text), row.message) << row.text;
+
+    // The protocol defaults are accepted (the broker only refuses a value that differs from them).
+    EXPECT_TRUE(ql::parse("lease topic t { id uint64 } key id with (autoincrement.reserve = " +
+                          std::to_string(rp::kAutoIncrementReserveDefault) + ");").has_value());
+    EXPECT_TRUE(ql::parse("lease topic t { id uint64 } key id with (autoincrement.max = " +
+                          std::to_string(rp::kAutoIncrementMaxDefault) + ");").has_value());
+}
+
+TEST(LeaseQlRegression, ScriptViewOverLeaseColumnsRegression) {
+    const auto td = topicOf("lease topic inst { id uint64, addr string(64) } key id;");
+    const ql::ViewSource src = ql::viewSourceOf(td);
+    ASSERT_EQ(src.descriptor.fields.size(), 6u);
+    const char* names[] = {"lease_version", "lease_ttl_ms", "lease_holder", "lease_remaining_ms", "id", "addr"};
+    for (std::size_t i = 0; i < 6; ++i) {
+        EXPECT_EQ(src.descriptor.fields[i].name, names[i]);
+        EXPECT_EQ(src.descriptor.fields[i].id, i);
+    }
+    // A plain topic's source is unchanged.
+    EXPECT_EQ(ql::viewSourceOf(topicOf("topic p { id uint64 } key id;")).descriptor.fields.size(), 1u);
+
+    auto v = ql::parse("create view v key id as select id, lease_holder from inst;");
+    ASSERT_TRUE(v.has_value()) << v.error().message;
+    const auto* cv = std::get_if<ql::CreateViewDef>(&*v);
+    ASSERT_NE(cv, nullptr);
+    auto plan = ql::applyViewPlan(*cv, src);
+    ASSERT_TRUE(plan.has_value()) << plan.error().message;
+    EXPECT_EQ(plan->output.size(), 2u);
 }

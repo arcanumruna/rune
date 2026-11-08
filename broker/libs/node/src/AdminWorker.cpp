@@ -14,6 +14,7 @@
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/Evolve.h>
 #include <rune/codec/Fingerprint.h>
+#include <rune/codec/LeaseColumns.h>
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -1474,31 +1475,6 @@ std::optional<DdlRejection> leaseDefineRefusal(const DefineTopicMsg& m, const ru
     return std::nullopt;
 }
 
-// Lease topics (L5): the four system columns first at tags 0..3, every user field after them with its tag + 4.  False
-// when a shifted tag no longer fits.  Offsets are recomputed by the caller.
-bool prependLeaseColumns(rune::codec::Descriptor& d) {
-    using rune::codec::PrimType;
-    struct Col { const char* name; PrimType type; };
-    constexpr Col kCols[] = {{"lease_version", PrimType::Int64}, {"lease_ttl_ms", PrimType::UInt64},
-                             {"lease_holder", PrimType::UInt64}, {"lease_remaining_ms", PrimType::UInt64}};
-    std::vector<rune::codec::FieldDescriptor> out;
-    out.reserve(d.fields.size() + std::size(kCols));
-    uint16_t id = 0;
-    for (const Col& c : kCols) {
-        rune::codec::FieldDescriptor f;
-        f.name = c.name; f.id = id++; f.type = c.type; f.sinceVersion = 1; f.untilVersion = 0xFFFF; f.isKey = false;
-        out.push_back(std::move(f));
-    }
-    for (auto& f : d.fields) {
-        if (uint32_t{f.id} + std::size(kCols) > 0xFFFF) return false;
-        f.id = static_cast<uint16_t>(f.id + std::size(kCols));
-        out.push_back(std::move(f));
-    }
-    d.fields = std::move(out);
-    d.blockLength = rune::codec::computeOffsets(d.fields);
-    return true;
-}
-
 }  // namespace
 
 AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat::CatalogState& s) const {
@@ -1647,7 +1623,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         // L5: the system columns lead the stored descriptor; the user's key field stays marked as it was.
         rune::codec::Descriptor d = std::move(*userDesc);
         constexpr const char* kTagsExhausted = "field tags are exhausted after the 4 lease system columns";
-        if (!prependLeaseColumns(d)) return Rejected(reject(kInvalidSchema, kTagsExhausted));
+        if (!rune::codec::prependLeaseColumns(d)) return Rejected(reject(kInvalidSchema, kTagsExhausted));
         uint32_t past = 0;
         for (const auto& f : d.fields) past = std::max<uint32_t>(past, uint32_t{f.id} + 1);
         if (past > 0xFFFF) return Rejected(reject(kInvalidSchema, kTagsExhausted));
