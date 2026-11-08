@@ -222,6 +222,24 @@ struct Interleaved {
 };
 }  // namespace
 
+// REGRESSION (Task 8 review 1, m2): vetoedCheckpointPushes counts pushes refused, not passes that stood in a span with nothing to
+// push.  The walk through a span of T's records alone dirties nothing; the fenced application that follows does.
+TEST(CheckedWritesTxnVisibilityRegression, VetoCountsOnlyRefusedPushesRegression) {
+    Txv t(2);
+    t.r.dropView(kView);
+    t.r.installProjection(kView + 1, "pproj", /*persisted=*/true);
+    const int64_t first = t.r.leo();
+    t.enqueue(VerdictRig::batch(recs(10, 15), 31, 0, {}, /*txn=*/true), 31, 0);
+    t.marker(31, true);
+    const auto inst = [&] { return t.r.vs->instanceForTest(kView + 1, 0); };
+    for (int i = 0; i < 100 && (inst() == nullptr || inst()->foldCursor < first + 6); ++i) t.r.pass();
+    ASSERT_NE(inst(), nullptr);
+    ASSERT_EQ(inst()->foldCursor, first + 6) << "at the marker, nothing of T applied";
+    EXPECT_EQ(inst()->counters.vetoedCheckpointPushes, 0u) << "the walk through T's own batches dirtied nothing";
+    for (int i = 0; i < 100 && inst()->foldCursor <= first + 6; ++i) t.r.pass();
+    EXPECT_GT(inst()->counters.vetoedCheckpointPushes, 0u) << "the fenced application had rows to push";
+}
+
 // REGRESSION (P11-0, contract 13): a checkpoint at O with first < O <= M would hold none of the span's records and a refold from it
 // would never see the ones below O.  The push is vetoed while the cursor stands in the span; a crash at every pass boundary then
 // recovers the undisturbed tables.

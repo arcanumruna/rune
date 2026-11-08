@@ -1049,7 +1049,7 @@ int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
     // P11-0: no checkpoint inside an open span (a refold from it would never see the span's records below it) or an application in
     // progress.  The dirty rows wait for the first cursor outside every span.
     if (inst.spanFence.fenced() || inst.spanFence.straddles(inst.foldCursor)) [[unlikely]] {
-        ++inst.counters.vetoedCheckpointPushes;
+        if (viewTablesDirty(inst)) ++inst.counters.vetoedCheckpointPushes;   // a push refused, not a pass with nothing to push
         return 0;
     }
     if (inst.keyed) return buildAndPushKeyedCheckpoint_(inst);

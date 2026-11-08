@@ -243,6 +243,8 @@ public:
     // interval. noexcept, no allocation beyond dirtyList_'s own
     // (amortized, reserve()'d) growth.
     void markDirty(uint32_t rid) noexcept;
+    // A row was dirtied or deleted since the last drainDirty(): a checkpoint now would carry a delta.
+    [[nodiscard]] bool hasDirty() const noexcept { return !dirtyList_.empty() || !deleted_.empty(); }
 
     // Calls `emit(rid, row, deleted, key)` once for every row dirtied (an
     // upsert: `row` is the live row pointer, `deleted` is false) or deleted

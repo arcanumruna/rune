@@ -331,6 +331,14 @@ inline void buildKeyedTables(ViewInstance& inst, std::size_t indexSlots, std::si
            (!i.agg->groupIds || i.agg->groupIds->size() == 0);
 }
 
+/// True when some table of the instance has a row its next checkpoint would carry.
+[[nodiscard]] inline bool viewTablesDirty(const ViewInstance& i) noexcept {
+    if (i.table.hasDirty() || (i.owners && i.owners->hasDirty())) return true;
+    if (!i.agg) return false;
+    return i.agg->contributors.hasDirty() || i.agg->groups.hasDirty() || (i.agg->blocks && i.agg->blocks->hasDirty()) ||
+           (i.agg->groupIds && i.agg->groupIds->hasDirty());
+}
+
 /// The log range a source partition holds: retention may have trimmed it below a cursor (logStart); logEnd bounds a checkpoint.
 /// The default (0, INT64_MAX) says nothing, so a caller without a disk log (a transient source, a unit test) changes no behaviour.
 struct SourceLogBounds {
