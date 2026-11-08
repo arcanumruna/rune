@@ -317,6 +317,8 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
     if (completingHolds_ != 0) work += releaseCommittedHolds_();   // #438
     // Drive coordinator timeout aborts (sets markersPending on timed-out txns).
     work += coordinator_.doWork(nowNs);
+    // After the timeout sweep, so a gate whose transaction just timed out answers 19 in this pass (correctness
+    // rests on staleVoteCode_; the order only saves a pass).
     if (!voteGates_.empty()) work += processVoteGates_(nowNs);
     work += retryRefusedMarkers_(nowNs);
     work += retryDeferredCompletions_(nowNs);
@@ -550,14 +552,11 @@ void TransactionCoordinationService::forgetNamespace_(uint32_t nsId)
         if (rune::coordination::parseScopedId(it->second).nsId == nsId) it = pidIndex_.erase(it);
         else ++it;
     }
+    // Belt-and-braces for the #663 rule: completion already erases a candidate entry, and a gated transaction is
+    // unsettled, so its namespace never reaches here with a gate open.
     for (auto it = voteCandidatesAtAdd_.begin(); it != voteCandidatesAtAdd_.end();) {
         if (rune::coordination::parseScopedId(it->first).nsId == nsId) it = voteCandidatesAtAdd_.erase(it);
         else ++it;
-    }
-    for (std::size_t i = 0; i < voteGates_.size();) {   // answered like an unload does
-        if (rune::coordination::parseScopedId(voteGates_[i].txnId).nsId != nsId) { ++i; continue; }
-        sendEndTxnAnswer_(voteGates_[i].sessionId, voteGates_[i].correlationId, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
-        voteGates_.erase(voteGates_.begin() + static_cast<std::ptrdiff_t>(i));
     }
     (void)coordinator_.eraseNamespace(nsId);
 }
@@ -922,7 +921,7 @@ int16_t TransactionCoordinationService::staleVoteCode_(const VoteGate& g)
         m->producerEpoch == g.producerEpoch)
         return m->txnStartNs == g.txnStartNs ? int16_t{0} : static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);   // a newer transaction of the id
     // Timed out / fenced / ended meanwhile.  endTransaction changes nothing here (the state is not the gate's Ongoing)
-    // and names the reason: 19, or 17 / 18 when fenced.
+    // and names the reason: 19, 17 / 18 when fenced, or 27 while an overflow or foreign-principal fence is pending.
     const auto r = coordinator_.endTransaction(g.txnId, g.producerId, g.producerEpoch, /*commit=*/true, lastNowNs_);
     return r.ok() ? static_cast<int16_t>(pc::ErrorCode::InvalidTxnState) : txnErrorToProtocol(r.errorCode);
 }
@@ -1049,8 +1048,9 @@ void TransactionCoordinationService::prepareVoted_(VoteGate& g, bool commit, int
 {
     beginRequest_();
     const auto result = coordinator_.endTransaction(g.txnId, g.producerId, g.producerEpoch, commit, nowNs);
-    if (!result.ok() || result.alreadyComplete) {   // the transaction moved on while the votes were out
-        sendEndTxnAnswer_(g.sessionId, g.correlationId, txnErrorToProtocol(result.errorCode));
+    if (!result.ok() || result.alreadyComplete) {   // the transaction moved on while the votes were out: never a commit OK
+        sendEndTxnAnswer_(g.sessionId, g.correlationId,
+                          result.ok() ? static_cast<int16_t>(pc::ErrorCode::InvalidTxnState) : txnErrorToProtocol(result.errorCode));
         return;
     }
     const auto* m = coordinator_.metadata(g.txnId);

@@ -568,13 +568,10 @@ TEST_F(CheckedWritesTxnCoordinatorRegression, AProducerThatIsNotTheGatedOneIsAns
     const int64_t pid = beginTxn({{kCw, 0}}, ep);
     ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
     const int16_t zombie = addPartitions("tx", pid + 1000, ep, {{kCw, 1}});
-    EXPECT_NE(zombie, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions)) << "fenced, not retriable";
-    EXPECT_NE(zombie, 0);
+    EXPECT_EQ(zombie, static_cast<int16_t>(pc::ErrorCode::ProducerFenced)) << "fenced, not retriable";
     const std::size_t n = endTxn("tx", pid, static_cast<int16_t>(ep + 1), true);
     ASSERT_GT(n, 0u);
-    const auto a = syncAnswer(n);
-    EXPECT_NE(a.errorCode, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
-    EXPECT_NE(a.errorCode, 0);
+    EXPECT_EQ(syncAnswer(n).errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidProducerEpoch));
     EXPECT_EQ(svc_->voteGatesForTest(), 1u) << "the gate is untouched";
 }
 
