@@ -738,6 +738,7 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
     }
     try {
         cfg.dataDir = resolveDataDir(o.dataDir, dir_);   // empty = a private scratch directory, removed on close (#315)
+        if (const char* env = std::getenv("RUNE_CLI_AERON_DIR"); env != nullptr) cfg.aeronDir = env;   // hidden test override: attach to a running driver
     } catch (const std::exception& e) {   // #680: a bad TMPDIR is a clean failure, not an exception past the secrets
         lastFailure_ = std::string("cannot create the client's data directory: ") + e.what();
         if (!quietFailure) err << "rune: " << lastFailure_ << "\n";

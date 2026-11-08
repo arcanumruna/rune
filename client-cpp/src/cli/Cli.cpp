@@ -163,6 +163,7 @@ rune::client::ClientConfig buildClientConfig(const std::vector<std::string>& arg
 
     // Aeron data directory: hidden test override, else a private scratch directory removed with `dir`.
     cfg.dataDir = rune::cli::support::resolveDataDir(flagValue(args, "--cli-data-dir"), dir);   // empty = scratch (#315)
+    if (const char* env = std::getenv("RUNE_CLI_AERON_DIR"); env != nullptr) cfg.aeronDir = env;   // hidden test override: attach to a running driver
 
     // Review B I6: the credential flags are global (--user / --password-file, RUNE_USER / RUNE_PASSWORD_FILE).
     rune::cli::support::applyCredentials(cfg, flagValue(args, "--user"), flagValue(args, "--password-file"));

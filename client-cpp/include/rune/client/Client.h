@@ -386,6 +386,10 @@ struct ClientConfig {
     // (transport::kMinDriverCountersBytes) holds 8192 of them and starts the driver ~4x faster.  Else [1 MiB, 500 MiB].
     std::size_t driverCountersBytes = 0;
 
+    /// Empty = the client starts its own embedded driver under dataDir.  Else the aeron dir of a media driver that is already running
+    /// (a test fixture shares one among its clients): the client starts none, attaches to it and leaves it running at close.
+    std::string aeronDir;
+
     // Explicit Aeron knobs (spec §4.1/§4.3).  Env overrides (RUNE_CLIENT_AERON_MTU,
     // RUNE_AERON_SOCKET_BUFFER_BYTES, RUNE_CLIENT_AERON_DRIVER_IDLE) win; a
     // malformed env value is logged once at construction and not applied.

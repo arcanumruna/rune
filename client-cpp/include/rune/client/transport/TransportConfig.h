@@ -109,6 +109,8 @@ struct TransportConfig {
     /// The driver CnC's counter-values buffer: 0 = Aeron's default (8 MiB), else
     /// [kMinDriverCountersBytes, kMaxDriverCountersBytes] (ClientConfig::driverCountersBytes).
     std::size_t driverCountersBytes = 0;
+    /// Non-empty: attach to the media driver running in this aeron dir instead of starting one (ClientConfig::aeronDir).
+    std::string aeronDir;
 };
 
 /// The aeron::Context::mediaDriverTimeout the transport applies (T15 R2).
