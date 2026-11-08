@@ -716,9 +716,10 @@ public:
             std::shared_ptr<const rune::metadata::RoutingImage> img) noexcept {
         routingImage_ = std::move(img);
         // D9: a partition whose leadership moved fails its in-flight remote
-        // markers and its in-flight remote votes (Part 11) NotLeader (event-driven; the TCS retry re-routes) — done by
-        // the next marker pump of this same thread (review LOW-7: never calls
-        // into the coordinator from inside the routing publish).
+        // markers and its in-flight remote votes (Part 11) NotLeader
+        // (event-driven; the TCS retry re-routes) — done by the next marker
+        // pump of this same thread (review LOW-7: never calls into the
+        // coordinator from inside the routing publish).
         routingChangedForMarkers_ = true;
     }
 
@@ -1189,11 +1190,12 @@ public:
     // Checked writes Part 11: the transaction coordinator's vote on a partition.
     //
     // sendTxnVote asks the partition's leader whether the transaction (producerId, producerEpoch) may commit there.  It
-    // returns a token >= 0, and that token gets EXACTLY ONE sink call unless purgeTxnVotes drops it first: the leader's vote (from this node's worker or, over
-    // the cluster plane, from the remote leader), or errorCode NotLeader when it could not answer.  -1 means no call
-    // follows (no route, no vote channel, a full op ring, a refused plane send, a full table): a transport error, retried
-    // by the caller with backoff.  A result is never delivered from inside sendTxnVote; the sink may call sendTxnVote
-    // again.  `coordinatorEpoch` rides back to the sink unchanged.  Runtime thread, cold.
+    // returns a token >= 0, and that token gets EXACTLY ONE sink call unless purgeTxnVotes drops it first: the leader's
+    // vote (from this node's worker or, over the cluster plane, from the remote leader), or errorCode NotLeader when it
+    // could not answer.  -1 means no call follows (no route, no vote channel, a full op ring, a refused plane send, a
+    // full table): a transport error, retried by the caller with backoff.  A result is never delivered from inside
+    // sendTxnVote; the sink may call sendTxnVote again.  `coordinatorEpoch` rides back to the sink unchanged.  Runtime
+    // thread, cold.
     // -----------------------------------------------------------------------
     void setTxnVoteSink(TxnVoteSink sink, void* ctx) noexcept { voteSink_ = sink; voteSinkCtx_ = ctx; }
     int64_t sendTxnVote(int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch, int32_t coordinatorEpoch);
