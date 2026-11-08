@@ -828,6 +828,8 @@ struct NodeConfig {
     /// Counter-values buffer of each embedded driver's CnC (EmbeddedDriverConfig::countersValuesBytes).  0 = Aeron's default
     /// (8 MiB of values + 32 MiB of metadata, zero-filled when the driver starts).  Test brokers set Aeron's 1 MiB minimum.
     int32_t aeronCountersValuesBytes     = 0;
+    /// Receiver status-message timeout of each embedded driver (EmbeddedDriverConfig::statusMessageTimeoutNs).  0 = Aeron's default (200 ms).
+    int64_t aeronStatusMessageTimeoutNs  = 0;
     /// RUNE_AERON_CONTROL_TERM_BYTES: term of the worker's per-session ACK publications only — small so a
     /// term rotation never cleans 16 MiB inside the worker pass.  NOT the gateway egress publications:
     /// consumer record pushes travel there (max message = term/8 must cover the largest batch).
