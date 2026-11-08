@@ -575,8 +575,7 @@ private:
     // pushed window gives a long span's growth back (releaseWindow_; ViewTable::trimDirty).  Churn past the reserve keeps its
     // dirty sets, charged, while windows come less than kQuietGiveBackNs apart, and allocates nothing per drain; a driven pass
     // after that long without a window ending (a push; a drain for the key index) gives them back (quietPass_: a caught-up
-    // view, any judge pass for a member or the key
-    // index), so such an instance carries no charge past its tables.  A paused view flushes a held delta and gives a kept window
+    // view, any judge pass for a member or the key index), so such an instance carries no charge past its tables.  A paused view flushes a held delta and gives a kept window
     // back on its first paused pass.  An open span's undrained rows stay (they are live).  An instance that is not driven (its
     // source partition is not led here) keeps its charge, a kept window included, until a pass drives it again.
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
@@ -611,8 +610,8 @@ private:
         inst.quietSinceNs = -1;
         chargeMem_(inst);
     }
-    /// A pass that pushed nothing (a view's caught-up pass; any judge pass for a member or the key index): a kept dirty window is
-    /// given back once no window has ended for kQuietGiveBackNs, on the pass's own clock.  Longer than any steady producer's gap
+    /// Run on a view's caught-up pass and on every judge pass for a member or the key index, after any push or drain in it: a
+    /// kept dirty window is given back once no window has ended for kQuietGiveBackNs, on the pass's own clock.  Longer than any steady producer's gap
     /// between windows, so steady churn keeps it however many passes fall between.
     static constexpr int64_t kQuietGiveBackNs = 1'000'000'000;
     void quietPass_(ViewInstance& inst, int64_t nowNs) {

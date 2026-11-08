@@ -257,7 +257,7 @@ struct ViewInstance {
     uint32_t                           nsId            = 0;
     std::size_t                        memCharged      = 0;
     bool                               windowKept      = false;   // a drain left dirty capacity kept (WorkerViewSet::releaseWindow_)
-    int64_t                            quietSinceNs    = -1;      // the first pass after the last window ended (WorkerViewSet::quietPass_)
+    int64_t                            quietSinceNs    = -1;      // the pass the quiet clock started: the first quietPass_ at or after the last window ended
 
     // C1 (Task 22 fix round 1): the source replica's leadershipGeneration() this
     // table is caught up under; 0 = never driven by a leader.  A read is served
