@@ -657,12 +657,13 @@ struct CheckedWritesTxnVoteRoutingWired : ::testing::Test {
     void step() { now += 1'000'000; txnReplica.doWork(now); if (tcs) (void)tcs->doWork(now); }
     std::size_t endTxn() { return tcs->handleEndTxn(req.data(), end.encode(req.data()), now, out.data(), out.size(), ctx); }
 };
+using CheckedWritesTxnVoteRoutingWiredRegression = CheckedWritesTxnVoteRoutingWired;
 } // namespace
 
 // The coordinator's load and unload purge the gateway's votes.  An unload and reload at the SAME coordinator epoch (a
 // lost coordinator check) must not let the old load's vote count for the retried commit, and a vote of an older epoch
 // is dropped by the load.
-TEST_F(CheckedWritesTxnVoteRoutingWired, LoadAndUnloadPurgeTheGatewaysVotesRegression) {
+TEST_F(CheckedWritesTxnVoteRoutingWiredRegression, LoadAndUnloadPurgeTheGatewaysVotesRegression) {
     ASSERT_NO_FATAL_FAILURE(begin(true));
     ASSERT_EQ(endTxn(), 0u);
     ASSERT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
@@ -722,7 +723,7 @@ TEST_F(CheckedWritesTxnVoteRoutingWired, CommitOnAPlainTopicAsksNoVote) {
 }
 
 // The setup-failure path and the teardown both release through releaseTxnCoordinator: the gateway must not keep the dead coordinator.
-TEST_F(CheckedWritesTxnVoteRoutingWired, ReleaseDetachesTheGatewayFromTheCoordinatorRegression) {
+TEST_F(CheckedWritesTxnVoteRoutingWiredRegression, ReleaseDetachesTheGatewayFromTheCoordinatorRegression) {
     ASSERT_NO_FATAL_FAILURE(begin(true));
     ASSERT_EQ(endTxn(), 0u);
     ASSERT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
