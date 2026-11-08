@@ -16,7 +16,11 @@ std::vector<ConsumedRecord> PartitionApi::consume(int64_t fromOffset, int32_t ma
     int64_t hw = highWatermark();
     while (cursor < hw) {
         auto bytes = log_.read(cursor, maxBytes);
-        if (bytes.empty()) break;
+        if (bytes.empty()) {   // a segment compaction emptied
+            cursor = log_.nextSegmentBaseAfter(cursor);
+            if (cursor < 0) break;
+            continue;
+        }
         size_t pos = 0;
         bool advanced = false;
         while (pos < bytes.size()) {

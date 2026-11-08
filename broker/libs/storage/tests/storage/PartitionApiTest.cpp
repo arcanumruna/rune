@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 #include <rune/storage/PartitionApi.h>
+#include <rune/protocol/RecordBatch.h>
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -263,5 +266,35 @@ TEST(PartitionApi, ConsumeAtOrPastHWMReturnsEmpty) {
     auto pastHwm = api.consume(100);
     EXPECT_TRUE(pastHwm.empty()) << "consume past HWM must return empty";
 
+    std::filesystem::remove_all(dir);
+}
+
+// ---- A segment compaction emptied: consume continues at the next segment ----
+TEST(PartitionApi, ConsumeContinuesPastASegmentCompactionEmptiedRegression) {
+    auto dir = makeTempDir("rune_api_emptied");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    const auto put = [&dir](int64_t base, const std::vector<uint8_t>& bytes) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(dir / name, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    put(0, {});
+    std::vector<uint8_t> bytes;
+    for (int64_t base : {10, 11}) {
+        rune::protocol::RecordBatchBuilder b(base, 1000);
+        b.append("k" + std::to_string(base), "v" + std::to_string(base), 1000);
+        const auto x = b.build();
+        bytes.insert(bytes.end(), x.begin(), x.end());
+    }
+    put(10, bytes);
+    {
+        PartitionApi api(dir.string());
+        ASSERT_EQ(api.highWatermark(), 12);
+        const auto recs = api.consume(0);
+        ASSERT_EQ(recs.size(), 2u);
+        EXPECT_EQ(recs[0].offset, 10);
+        EXPECT_EQ(recs[1].offset, 11);
+    }
     std::filesystem::remove_all(dir);
 }
