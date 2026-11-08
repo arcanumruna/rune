@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <csignal>
 #include <thread>
 
 using rune::node::LeaderObserver;
@@ -22,7 +23,6 @@ TEST(LeaderObserver, UnboundObserverReportsNoLeader) {
 
 TEST(LeaderObserver, ObserverSeesLatestPublishedSnapshot) {
     LeaderObserver o{1};
-    o.bindObserver();
     o.publish({/*leaderId=*/2, /*term=*/5, /*isLeader=*/false});
     o.publish({/*leaderId=*/1, /*term=*/6, /*isLeader=*/true});
     const LeaderSnapshot& v = o.observe();
@@ -35,7 +35,6 @@ TEST(LeaderObserver, ObserverSeesLatestPublishedSnapshot) {
 // the observer drains and the control thread runs its next cycle.
 TEST(LeaderObserverRegression, FullRingConvergesOnLatestView) {
     LeaderObserver o{1};
-    o.bindObserver();
     LeaderSnapshot last{};
     for (int i = 0; i < 10'000; ++i) {          // >> ring capacity (128 snapshots)
         last = {static_cast<rune::consensus::NodeId>(i % 3), i, (i % 3) == 1};
@@ -51,7 +50,6 @@ TEST(LeaderObserverRegression, FullRingConvergesOnLatestView) {
 // the observer never sees a torn {leaderId, term} pair and ends on the final.
 TEST(LeaderObserverRegression, CrossThreadSnapshotsAreNeverTorn) {
     LeaderObserver o{0};
-    o.bindObserver();
     constexpr int kN = 200'000;
     std::thread control([&o] {
         for (int t = 1; t <= kN; ++t) {
@@ -84,11 +82,24 @@ TEST(LeaderObserverRegression, CrossThreadSnapshotsAreNeverTorn) {
 TEST(LeaderObserverRegression, SecondThreadObserverIsRefused) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     LeaderObserver o{1};
-    o.bindObserver();                                  // this thread observes
+    (void)o.observe();                                 // this thread observes first
     o.publish({/*leaderId=*/1, /*term=*/4, /*isLeader=*/true});
     EXPECT_DEATH({
         std::thread t([&o] { (void)o.observe(); });
         t.join();
     }, "");
     EXPECT_EQ(o.observe().term, 4) << "the bound observer still drains (ring untouched)";
+}
+
+// A node may be started on any thread: the observer is the first thread that observes, not the one that published or started.
+TEST(LeaderObserverRegression, ObserverIsTheFirstObservingThreadNotTheStarter) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    LeaderObserver o{1};
+    std::thread starter([&o] { o.publish({/*leaderId=*/1, /*term=*/7, /*isLeader=*/true}); });
+    starter.join();
+    EXPECT_EQ(o.observe().term, 7) << "the test thread observes what the starter thread published";
+    EXPECT_EXIT({
+        std::thread t([&o] { (void)o.observe(); });
+        t.join();
+    }, ::testing::KilledBySignal(SIGABRT), "") << "a second, different thread is still refused";
 }
