@@ -1,7 +1,6 @@
 #pragma once
 // CheckedWritesRig.h - checked writes Part 04: one Worker over a leader partition (topic 6, partition 0) with a tag-capable
 // source {id uint64 key, v int64, tag uint8}, TestReject views and a projection, driven pass by pass without a driver.
-#include <rune/aeronutil/testing/FreePort.h>
 #include <rune/codec/Evolve.h>
 #include <rune/codec/Filter.h>
 #include <rune/crypto/Aead.h>
@@ -954,10 +953,8 @@ public:
     void enableEgress() {
         if (egress_) return;
         ensureDriver_();
-        const std::string control = "127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
-        const std::string local   = "127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
-        egress_ = std::make_unique<WorkerEgress>(aeron_, control.c_str(), 3001, driver_->pumpWith(aeron_.get()));
-        const int64_t reg = aeron_->addSubscription("aeron:udp?control=" + control + "|control-mode=dynamic|endpoint=" + local, 3001);
+        egress_ = WorkerEgress::ipcForTest(aeron_, 3001, driver_->pumpWith(aeron_.get()));
+        const int64_t reg = aeron_->addSubscription("aeron:ipc", 3001);
         ASSERT_TRUE(egress_->resolved());
         while (!(sub_ && sub_->isConnected() && egress_->isConnected())) {
             if (!sub_) sub_ = aeron_->findSubscription(reg);
