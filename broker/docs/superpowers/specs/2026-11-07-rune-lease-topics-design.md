@@ -381,6 +381,10 @@ lease topic <name> { <field> <type>, ... } [ partitions <n> ] [ replicas <r> ] k
   record must never be deleted by retention. `delete.retention.ms` defaults to 1 h (call).
 - **Key index.** The lease index is the topic's key index (§7.1); `key.index` is implied.
 - **Reserved names.** User fields named `lease_*` are refused, because the broker adds four system columns (§6.1).
+- **Fixed-width fields (amended 2026-11-08).** Every field of a lease topic is fixed-width: `string` and `bytes`
+  without a width are refused with `InvalidSchema` ("a lease topic's fields are fixed-width"), at `define` and at
+  `alter ... add`. The lease view holds every user column in a fixed-width row, and the revoke re-encode (§6.2) rebuilds
+  the record from that row.
 - **Key width (Coordinator's call, R1).** A lease topic's key is an integer or `string(N)` with N ≤ 128
   (`kMaxLeaseKeyBytes = kMaxViewKeyBytes = 128`). Every other topic keeps N ≤ 16. Discovery paths and election
   names need the width; it costs only lease-view memory, which `max-view-memory-bytes` already counts.
@@ -474,13 +478,16 @@ lease topic they carry the lease op. On every other topic they stay refused, exa
 - **The broker re-encodes every `Revoke` (Coordinator's call, R9).** A client revoke carries only the key and
   `lease_version` that matter (`LeaseSession.close()`, `unlock()` and `resign()` hold nothing else); its other
   columns are ignored. The write hook replaces the record with the lease view's row for that key, re-encoded with the
-  latest writer version, in the grant's scratch-copy patch (§6.3), and recomputes the CRC32C.
+  latest writer version, in the grant's scratch-copy patch (§6.3), and recomputes the CRC32C. The re-encoded record
+  carries the row's `lease_ttl_ms` and `lease_remaining_ms` (amended 2026-11-08), so it matches the row exactly.
   - If the lease view has no row for the key, or a different version, the record goes through unchanged and the
     judge answers `kErrLeaseNotFound`.
-  - If a client `Update` or `Revoke` for the key is still in the unfolded tail (`lastAppended[k] > foldCursor`), the
-    lease view's row may be older than the log. The hook then answers the revoke `Throttled` (53) with a 1 ms
-    retry-after (call), and the client library resends it. Only a revoke sent back-to-back behind the holder's own
-    update meets this.
+  - If a client `Update` or `Revoke` for the key is not yet judged (`lastAppended[k] >= judgedThrough`), or the lease
+    index is not ready (§7.1), the lease view's row may be older than the log. The hook then answers the revoke
+    `Throttled` (53) with a 1 ms retry-after (`kLeaseRetryAfterNs`, call), and the client library resends it. Only a
+    revoke sent back-to-back behind the holder's own update, or one sent during a leadership rebuild, meets this
+    (amended 2026-11-08: the bound is the judge's `judgedThrough`, not the fold cursor).
+  - An update and a revoke of the same key in one batch are refused `InvalidRequest`.
 - **Refusals.** Plain deletes (an empty value, `remove`, `removeExisting`) are refused with "use revoke". So are a
   client `Expire` or `Checkpoint`, and the `upsert` intent.
 
@@ -505,21 +512,48 @@ lease topic they carry the lease op. On every other topic they stay refused, exa
     | `Put`+`update` | `Ok` | `kErrLeaseNotFound` | the client learned `version` from the grant's ack, after the grant folded. Live now means live when the original was judged, so it was accepted. |
     | `Revoke` | cannot happen | `kErrLeaseNotFound` | a version is never reused, so a judged revoke of `(k, v)` leaves `v` ended either way. For a revoke this answer means "that lease is over", and the client treats it as done. |
 
+    **As implemented (amended 2026-11-08, Task 5c).**
+    - The duplicate is answered at produce from the lease index, with replay status 3, and its ack still waits on
+      the usual `View` fire condition.
+    - On the wire a grant duplicate carries `DuplicateSequence` (21) as its per-record verdict. The client maps 21 on
+      a lease grant to `VerdictUnknown` (Task 14).
+    - A live update carries no verdict (accepted). Any other update or revoke carries `LeaseNotFound` (62).
+    - Every lease-trailer entry of a known-old duplicate is `{version -1, ttl 0}`.
+    - While the lease index is not ready, or the sink's verdict arena is full, the duplicate is answered `Throttled`
+      (53) with a 1 ms retry-after.
+  - **The lease ack trailer (amended 2026-11-08, Task 5c).** For a session at `kClientVersionLeases` (18) or above, a
+    `View` ack on a lease topic carries one `{lease_version, lease_ttl_ms}` entry per record.
+    - It is filled when the `View` ack fires, from the stored batch and the batch's rejected-record list.
+    - A grant gets its own offset and its clamped TTL. An update gets the row's TTL while the row still holds that
+      version, otherwise the record's. A rejected record gets `{-1, 0}`.
+    - The run lives in the sink's preallocated verdict arena (2n 8-byte units), so it needs no allocation. An error
+      ack frees the run and carries no trailer. A session below 18 gets no trailer.
+
 ### 6.4 Write rules (the write hook; each refusal is definite)
 
 | Check | Answer |
 |---|---|
+| the session's announce has not reached the partition's worker yet | `NotLeader` (retriable, nothing stored) |
 | session below `kClientVersionLeases`, or cluster below `kFeatureLevelLeases` | `InvalidRequest` |
 | acks without the `View` flag | `InvalidRequest` ("lease writes need acks=view") |
+| a non-idempotent producer | `InvalidRequest` (an explicit-key intent needs an idempotent producer and `View` acks, as in checked writes) |
+| more than `kMaxLeaseBatchRecords` (2048) records in the batch | `InvalidRequest` |
 | `upsert`, `insert` on a `Revoke`, a client `Expire` / `Checkpoint`, an empty value | `InvalidRequest` |
 | `lease_remaining_ms ≠ 0` on a client record | `InvalidRequest` |
-| update or revoke with `lease_version ≤ 0` | `InvalidRequest` |
+| update or revoke with `lease_version < 0` | `InvalidRequest`. Version 0 is valid: a partition's first grant has offset 0 (amended 2026-11-08). |
+| an update and a revoke of the same key in one batch | `InvalidRequest` |
 | grant with `lease_ttl_ms > lease.max_ttl` | `kErrLeaseTtlTooLarge` |
 | grant with `lease_ttl_ms < lease.min_ttl` (0 included) | **not refused:** raised to `min_ttl` in the same scratch patch |
 | update or revoke whose `lease_ttl_ms` differs from the live row's | not checked; the judge keeps the row's TTL |
-| a new-key grant while the node is over `max-leases` or view memory | `NamespaceLimitExceeded` (52) |
+| any grant while the namespace's view memory is over its limit | `NamespaceLimitExceeded` (52). Every grant, not only a new key's: the hook does no index lookup, and a grant of a live key would be `KeyExists` anyway (amended 2026-11-08). |
+| a new-key grant while the node is over `max-leases` | `NamespaceLimitExceeded` (52) (Task 21) |
 | namespace `ReadOnly` or `RejectAll` | `NamespaceSuspended` (51), as for any write |
 | transactional produce | `InvalidRequest` |
+
+**Order (amended 2026-11-08).** Batch-wide rules come first, in this order: announce, client version and feature level,
+`View`, transaction, record count. Then the records are walked in order and the first failing record decides the
+answer for the whole batch. Each refusal is definite and stores nothing. Namespace suspension is refused before the
+hook, as for any write.
 
 After the checks, the hook stores the batch's last offset in the `lastAppended` slot (§9.3) of each key the batch
 **updates or revokes**, on the same worker, before the append. Grants do not touch it (Coordinator's call, R8). A
@@ -546,9 +580,14 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
 - **Checkpoints are invisible to data folds.** A second predicate, `isLeaseControl(record)`, makes user-view folds and
   aggregate folds skip `Checkpoint` records. The client library's subscriptions drop them before the handler. Only
   the LeaseIndex judge applies them.
-- **Compaction.** For each key the cleaner keeps the latest non-`Checkpoint` record, as today. For a live key it also
-  keeps the latest `Checkpoint` whose `lease_version` equals that record's (call). A `Checkpoint` never supersedes the
-  data row, and a later grant or tombstone supersedes the old checkpoint.
+- **Compaction (amended 2026-11-08: the grant is kept).** For each live key the cleaner keeps three records:
+  - the grant record of the live version (the record whose offset equals `lease_version`);
+  - the latest `Checkpoint` whose `lease_version` equals the live version;
+  - the latest non-`Checkpoint` record, as today.
+
+  A `Checkpoint` never supersedes the data row, and a later grant or tombstone supersedes the old grant and
+  checkpoint. The grant must stay because the judge keeps the row's TTL on update (§6.4): a log compacted to only the
+  latest update would rebuild that update's TTL instead of the grant's. This is a merge gate for the branch (Task 8).
   - So a lease view rebuilt from a compacted log has every live lease, its row, its version and its checkpointed
     remaining time.
   - **How the cleaner reads it (Coordinator's call).** `LogCleaner::isTombstone(string_view)` (`LogCleaner.h:401`)
@@ -598,6 +637,16 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
 
   All are served under the view-read lease and the readiness gate, and authorised as `READ` on the topic (new
   mapping).
+- **Readiness (amended 2026-11-08).** The lease index is ready for a partition only when every one of these holds:
+  - this node leads the partition, and its high watermark is confirmed;
+  - the judge is activated for the current leadership generation, and the view folded under that same generation
+    and the current lease layout;
+  - the fold has caught up with the judge (`foldCursor >= judgedThrough`);
+  - the judge is past every update the index could not record (`judgedThrough > leaseUntrackedThrough`).
+
+  `leaseUntrackedThrough` is set at activation and raised when an update is appended that the index cannot track (no
+  table yet, or no row for the key). The write hook, the revoke throttle and the known-old duplicate answers use the
+  same check.
 
 ### 7.2 Judgment table (at fold, on the leader, in log order)
 

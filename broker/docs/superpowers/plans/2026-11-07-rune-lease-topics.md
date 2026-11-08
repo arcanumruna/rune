@@ -342,6 +342,21 @@ settlements. The items below are open points the spec leaves to the implementati
   leader change on a one-partition lease topic on the 3-node rig and pins p99 < 1.5 s as an integration assertion
   (`LeaseTrioRegression.KeepAliveOutageUnderLeaderChangeRegression`), because Herald 02 §4.3 depends on it. If it
   fails, it is an urgent blocker for Herald, fixed in this plan.
+- **L23. Amendments from implementation (2026-11-08).** Spec §5.1, §6.2–§6.4, §6.6 and §7.1 carry the details.
+  - Task 6 (the judge) ran before Task 5 (the hook), because the hook's revoke throttle and known-old answers read the
+    judge's `judgedThrough` and the index's readiness.
+  - Readiness: `leaseReady_(inst, key, leaderGen, isLeader, hwConfirmed)` (`WorkerViewSet.h`). It needs the judge
+    activated for this generation, `foldCursor >= judgedThrough`, and `judgedThrough > leaseUntrackedThrough`.
+  - Lease fields are fixed-width; an update or revoke version below 0 is refused, and 0 is valid; every grant is
+    refused 52 while view memory is over; a non-idempotent lease write is refused; the first failing record decides,
+    after the batch-wide rules.
+  - The revoke re-encode carries the row's TTL and remaining. The judge does not check an update's or revoke's TTL or
+    remaining.
+  - Task 5c: the lease ack trailer is filled at `View`-ack fire; a known-old duplicate is answered from the index
+    (grant 21, live update no verdict, else 62, entries `{-1, 0}`, `Throttled` 1 ms while not ready or the arena is
+    full).
+  - Task 8 keeps the live version's grant record as well as its checkpoint and its latest record. This is a merge
+    gate.
 
 ## Interaction matrix
 
@@ -806,13 +821,15 @@ Spec §6.6 (compaction, cleaner reading), §16.1 (cleaner).
 a `CleanerTopicMode { Plain, Lease }` passed per log by `LogCleanerAgent` from the topic's traits. In `Lease` mode:
 the op comes from per-record attributes; `lease_version` read at value bytes `[4, 12)` (LE int64); a second
 `OffsetMap` holds the latest `Checkpoint` per key and its version; keep rule: the latest non-`Checkpoint` record per
-key (as today) plus that key's latest `Checkpoint` iff its version equals the kept record's and the kept record is
-not a tombstone; tombstone horizon = the cleaner's own KIP-534 stamp only — assert `nowMs ≥ 0` and never run the
+key (as today), plus the live version's grant record (offset = `lease_version`; amended 2026-11-08, merge gate), plus
+that key's latest `Checkpoint` iff its version equals the kept record's and the kept record is not a tombstone; tombstone horizon = the cleaner's own KIP-534 stamp only — assert `nowMs ≥ 0` and never run the
 legacy `nowNs` path (`:942-947`) for a lease log; rejected records removed as in checked writes §8.5. Modify
 `broker/libs/node/include/rune/node/LogCleanerAgent.h` to pass the mode. Test:
 `broker/libs/storage/tests/LeaseCleanerModeTest.cpp` and `broker/libs/node/tests/node/LeaseCleanerRebuildTest.cpp`.
 
 - [ ] **Step 1: failing tests** `LeaseCleanerRegression.*`:
+  - `KeepsGrantOfLiveVersionRegression`: grant, 100 updates with other TTLs, clean, rebuild: the row's TTL is the
+    grant's;
   - `KeepsRowAndSameVersionCheckpointRegression`; `DropsCheckpointOfEndedLeaseRegression`;
     `DropsCheckpointOfRegrantedLeaseRegression`; `CheckpointNeverSupersedesRowRegression` (M19);
   - `VersionOffsetAcrossSchemaVersionsRegression`: three writer versions (columns appended), `lease_version` read
