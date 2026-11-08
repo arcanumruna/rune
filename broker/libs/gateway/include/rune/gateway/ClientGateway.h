@@ -1198,6 +1198,9 @@ public:
     void setTxnVoteSink(TxnVoteSink sink, void* ctx) noexcept { voteSink_ = sink; voteSinkCtx_ = ctx; }
     int64_t sendTxnVote(int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch, int32_t coordinatorEpoch);
     static constexpr std::size_t kMaxTxnVotesInFlight = 16384;
+    /// Silently drops the votes asked under a coordinator epoch below @p olderThan (no sink call); the coordinator's
+    /// unload and load call it beside purgeQueuedMarkers.  \returns the number dropped.  Control thread only.
+    std::size_t purgeTxnVotes(int32_t olderThan);
     /// Leader side: a coordinator on another node asks for the vote on a partition this node leads.
     void onRemoteTxnVote(const rune::replication::TxnVoteMsg& m);
     /// Coordinator side: the partition leader's answer.
@@ -3333,6 +3336,9 @@ private:
         int32_t remoteNode = -1; int32_t remoteLeaderEpoch = -1;   ///< the leader the vote went to, -1 = the local worker
     };
     void onTxnVoteResult_(const rune::node::WorkerReturn& ret);
+    bool sendRemoteVote_(int64_t token, const VoteInFlight& v);
+    void completeVotesNotLeader_(const std::vector<int64_t>& tokens);
+    void failRemoteVotesOnLeaderChange_();
     std::unordered_map<int64_t, VoteInFlight> votesInFlight_;
     // Leader side: votes taken from another node's coordinator whose answer is still owed, by (origin node, origin token).
     struct RemoteVoteKey {

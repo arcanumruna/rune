@@ -420,3 +420,149 @@ TEST(CheckedWritesTxnVoteRoutingRegression, VoteFromAnImpossibleOriginIsDroppedR
         EXPECT_EQ(L.voteReturns, 0) << "origin " << origin;
     }
 }
+
+namespace {
+// Partition 0 led by `leader0` at `epoch0`; partition 1 led by this node (node 0), so its votes go to the local worker.
+std::shared_ptr<const rune::metadata::RoutingImage> voteImageSplit(int32_t leader0, int32_t epoch0) {
+    return rune::metadata::RoutingImage::build({{rune::metadata::gpidOf(0, 0), leader0, epoch0},
+                                                {rune::metadata::gpidOf(0, 1), 0, 1}});
+}
+constexpr int16_t kVoteNotLeader = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+}
+
+// A remote vote completes NotLeader when its leader or leader epoch changes in the image, and only then.
+TEST(CheckedWritesTxnVoteRoutingRegression, LeaderChangeFailsInFlightVotesNotLeaderRegression) {
+    VoteRig C(0);
+    C.gw.setRoutingImageSnapshot(voteImageSplit(1, 1));
+    const int64_t remote = C.gw.sendTxnVote(0, 0, 77, 2, 9);
+    ASSERT_GE(remote, 0);
+    ASSERT_EQ(C.votesSent.size(), 1u);
+    ASSERT_GE(C.gw.sendTxnVote(0, 1, 78, 1, 9), 0);   // local
+    ASSERT_EQ(C.gw.txnVotesInFlightForTest(), 2u);
+
+    C.gw.setRoutingImageSnapshot(voteImageSplit(1, 1));   // identical re-publish
+    (void)C.gw.pumpTxnMarkersForTest(2);
+    EXPECT_TRUE(C.got.empty()) << "an unchanged image failed a vote";
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 2u);
+
+    C.gw.setRoutingImageSnapshot(voteImageSplit(1, 2));   // epoch bump
+    (void)C.gw.pumpTxnMarkersForTest(3);
+    ASSERT_EQ(C.got.size(), 1u);
+    EXPECT_EQ(C.got[0].partition, 0);
+    EXPECT_EQ(C.got[0].producerId, 77);
+    EXPECT_EQ(C.got[0].producerEpoch, 2);
+    EXPECT_EQ(C.got[0].coordinatorEpoch, 9);
+    EXPECT_EQ(C.got[0].r.errorCode, kVoteNotLeader);
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 1u) << "the local vote is the worker's to release";
+
+    rune::replication::TxnVoteResponseMsg late{};   // the old leader's answer arrives after the failure
+    late.token = remote; late.topicId = 0; late.partition = 0; late.producerId = 77; late.producerEpoch = 2; late.coordinatorEpoch = 9;
+    C.gw.onRemoteTxnVoteResponse(late);
+    EXPECT_EQ(C.got.size(), 1u);
+
+    C.runWorker(4);   // the local vote is released by the worker (partition 1 has no replica)
+    ASSERT_EQ(C.got.size(), 2u);
+    EXPECT_EQ(C.got[1].partition, 1);
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 0u);
+
+    // Leader moved to another node, and then to this one; the sink sends again from inside the sweep.
+    const int64_t moved = C.gw.sendTxnVote(0, 0, 79, 1, 9);
+    ASSERT_GE(moved, 0);
+    C.resendInSink = true;
+    C.gw.setRoutingImageSnapshot(voteImageSplit(2, 5));
+    (void)C.gw.pumpTxnMarkersForTest(5);
+    ASSERT_EQ(C.got.size(), 3u);
+    EXPECT_EQ(C.got[2].r.errorCode, kVoteNotLeader);
+    EXPECT_EQ(C.inFlightAtSink, 0u) << "the failed entry is erased before the sink runs";
+    ASSERT_EQ(C.reentrantTokens.size(), 8u);
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 8u);
+    C.gw.setRoutingImageSnapshot(voteImageSplit(0, 6));   // now led here: every remote entry fails
+    (void)C.gw.pumpTxnMarkersForTest(6);
+    EXPECT_EQ(C.got.size(), 11u);
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 0u);
+}
+
+// A plane reconnect re-sends the in-flight votes of that peer with the same token; the answer completes once.
+TEST(CheckedWritesTxnVoteRoutingRegression, ReconnectResendsWithTheSameTokenRegression) {
+    VoteRig C(0);
+    C.gw.setRoutingImageSnapshot(voteImageSplit(1, 1));
+    const int64_t token = C.gw.sendTxnVote(0, 0, 77, 2, 9);
+    ASSERT_GE(token, 0);
+    ASSERT_EQ(C.votesSent.size(), 1u);
+    const auto first = C.votesSent[0];
+    C.votesSent.clear();
+
+    C.gw.onPlaneReconnect(3);   // a peer this vote did not go to
+    (void)C.gw.pumpTxnMarkersForTest(2);
+    EXPECT_TRUE(C.votesSent.empty());
+
+    C.gw.onPlaneReconnect(1);
+    (void)C.gw.pumpTxnMarkersForTest(3);
+    ASSERT_EQ(C.votesSent.size(), 1u);
+    EXPECT_EQ(C.votesSent[0].first, 1);
+    EXPECT_EQ(C.votesSent[0].second, first.second) << "the re-send is the same frame: same token, fields and epoch";
+    C.votesSent.clear();
+
+    C.gw.onPlaneReconnect(-1);
+    (void)C.gw.pumpTxnMarkersForTest(4);
+    ASSERT_EQ(C.votesSent.size(), 1u);
+    EXPECT_EQ(C.votesSent[0].first, 1);
+    C.votesSent.clear();
+    (void)C.gw.pumpTxnMarkersForTest(5);   // the events were consumed
+    EXPECT_TRUE(C.votesSent.empty());
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 1u);
+
+    rune::replication::TxnVoteResponseMsg r{};   // answers to two copies
+    r.token = token; r.topicId = 0; r.partition = 0; r.producerId = 77; r.producerEpoch = 2; r.coordinatorEpoch = 9;
+    C.gw.onRemoteTxnVoteResponse(r);
+    C.gw.onRemoteTxnVoteResponse(r);
+    EXPECT_EQ(C.got.size(), 1u);
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 0u);
+
+    // The plane refuses the re-send: the vote completes NotLeader.
+    ASSERT_GE(C.gw.sendTxnVote(0, 0, 78, 1, 9), 0);
+    C.votesSent.clear();
+    C.acceptVotes = false;
+    C.gw.onPlaneReconnect(1);
+    (void)C.gw.pumpTxnMarkersForTest(6);
+    ASSERT_EQ(C.got.size(), 2u);
+    EXPECT_EQ(C.got[1].producerId, 78);
+    EXPECT_EQ(C.got[1].r.errorCode, kVoteNotLeader);
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 0u);
+
+    // A local vote is not re-sent and not failed by a reconnect.
+    ASSERT_GE(C.gw.sendTxnVote(0, 1, 80, 1, 9), 0);
+    C.gw.onPlaneReconnect(-1);
+    (void)C.gw.pumpTxnMarkersForTest(7);
+    EXPECT_EQ(C.got.size(), 2u);
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 1u);
+
+    // Leader side: a copy of a pending token is not enqueued twice.
+    VoteRig L(1);
+    rune::replication::TxnVoteMsg m{};
+    m.coordinatorNodeId = 0; m.coordinatorEpoch = 9; m.token = 914; m.topicId = 0; m.partition = 0;
+    m.producerId = 77; m.producerEpoch = 1; m.leaderEpoch = 1;
+    L.gw.onRemoteTxnVote(m);
+    L.gw.onRemoteTxnVote(m);
+    L.runWorker(2);
+    EXPECT_EQ(L.voteReturns, 1);
+    EXPECT_EQ(L.responsesSent.size(), 1u);
+}
+
+// purgeTxnVotes silently drops the votes of coordinator epochs below the bound.
+TEST(CheckedWritesTxnVoteRoutingRegression, PurgeDropsVotesOfOlderCoordinatorEpochsRegression) {
+    VoteRig C(0);
+    C.gw.setRoutingImageSnapshot(voteImageSplit(1, 1));
+    const int64_t old = C.gw.sendTxnVote(0, 0, 77, 2, 5);
+    ASSERT_GE(C.gw.sendTxnVote(0, 0, 78, 2, 9), 0);
+    ASSERT_GE(C.gw.sendTxnVote(0, 1, 79, 2, 4), 0);   // local, old epoch
+    EXPECT_EQ(C.gw.purgeTxnVotes(7), 2u);
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 1u);
+    EXPECT_EQ(C.gw.purgeTxnVotes(7), 0u);
+    rune::replication::TxnVoteResponseMsg r{};
+    r.token = old; r.topicId = 0; r.partition = 0; r.producerId = 77; r.producerEpoch = 2; r.coordinatorEpoch = 5;
+    C.gw.onRemoteTxnVoteResponse(r);
+    C.runWorker(2);   // the purged local vote's answer is dropped too
+    EXPECT_TRUE(C.got.empty()) << "a purged vote produces no result";
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 1u);
+}
