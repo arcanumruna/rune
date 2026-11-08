@@ -72,7 +72,7 @@
 #include <vector>
 
 // Forward declaration — ClientGateway lives in rune_gateway; node→gateway direction is fine.
-namespace rune::gateway { class ClientGateway; }
+namespace rune::gateway { class ClientGateway; struct TxnVoteResult; }
 
 namespace rune::node {
 
@@ -134,7 +134,8 @@ public:
     // -----------------------------------------------------------------------
     // setAppendFnOverride — TEST SEAM ONLY.
     // When gateway_ is null, doWork uses this function to resolve pending
-    // markers.  The fn maps (TopicPartition, markerBytes) to a log append.
+    // markers.  The fn maps (TopicPartition, markerBytes) to a log append; a negative
+    // result is a partition that takes no marker (gone, like an unknown topic).
     // Allows testing the doWork→resolvePendingMarkers path without Aeron.
     // Set to nullptr to clear (production: never call this).
     // Single-writer: call only on the duty-cycle thread.
@@ -248,6 +249,27 @@ public:
     [[nodiscard]] int32_t coordinatorNode() const override { return leaderIdFn_ ? leaderIdFn_() : -1; }
     /// #112: the cluster's metadata feature level (setMetadataFeatureLevel) includes the verification.
     [[nodiscard]] bool    clusterVerifiesTxnPartitions() const override;
+    /// Checked writes Part 11: the cluster's metadata feature level (setMetadataFeatureLevel) includes the vote.
+    [[nodiscard]] bool    clusterVotes() const;
+
+    /// Checked writes Part 11: true for a topic whose partition leader judges a transaction's commit (a keyed or
+    /// source-of-a-view topic).  Control thread.  Votes are asked only while this is wired, a topic registry is set and
+    /// clusterVotes() holds; an unwired coordinator (rigs) commits exactly as before.
+    using VoteCandidateFn = std::function<bool(int32_t topicId)>;
+    void setVoteCandidateFn(VoteCandidateFn fn) { voteCandidate_ = std::move(fn); }
+    /// Test seam: a vote is asked through this instead of the gateway; false = not sent (retried with backoff).
+    using VoteFnOverride = std::function<bool(std::string_view topic, int32_t partition, int64_t producerId,
+                                              int16_t producerEpoch)>;
+    void setVoteFnOverride(VoteFnOverride fn) { voteFnOverride_ = std::move(fn); }
+    /// Test seam: the ConnectRequest.clientVersion of a session when no gateway is wired (else kClientVersion).
+    using SessionVersionFn = int32_t (*)(void* ctx, int64_t sessionId) noexcept;
+    void setSessionVersionFn(SessionVersionFn fn, void* ctx) noexcept { sessionVersionFn_ = fn; sessionVersionCtx_ = ctx; }
+    /// A partition leader's answer to a vote (ClientGateway::TxnVoteSink).  Only records it: the gate acts on it in
+    /// doWork, never from inside the gateway's drain.  Control thread.
+    void onTxnVoteResult(int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch,
+                         int32_t coordinatorEpoch, const rune::gateway::TxnVoteResult& r) noexcept;
+    [[nodiscard]] std::size_t voteGatesForTest() const noexcept { return voteGates_.size(); }
+    [[nodiscard]] std::size_t voteCandidateTxnsForTest() const noexcept { return voteCandidatesAtAdd_.size(); }
     /// Task 10 round 5: an asynchronously appended marker landed.
     void onControlMarkerLanded(int32_t topicId, int32_t partition, int64_t producerId,
                                int32_t coordinatorEpoch) override;
@@ -381,6 +403,11 @@ private:
     /// take it for the current state's: a gate appends again (kNeedsPut), a registration is not committed, a hold
     /// floor / stand-in is never this value.  Cleared by the next successful put of the id (or a load).
     static constexpr int64_t kUnpersisted = -4;
+    struct VoteNo {   ///< the partition leader's no: the answer's code, constraint id and failing offset
+        uint16_t code          = 0;
+        uint32_t constraintId  = 0;
+        int64_t  failingOffset = -1;
+    };
     struct PrepareGate {
         rune::transaction::TransactionalId          txnId;
         int64_t                                     producerId       = -1;
@@ -392,8 +419,65 @@ private:
         int64_t                                     sessionId = 0, correlationId = 0;
         bool                                        durable          = false;   ///< loaded from the committed log
         int64_t                                     recordOffset     = kNeedsPut;
+        bool                                        answerAtMarkers  = false;   ///< a voted EndTxn: answered when its markers landed, not here
+        bool                                        hasVote          = false;
+        VoteNo                                      vote{};                     ///< the no the answer carries
     };
     std::vector<PrepareGate> prepareGates_;
+
+    // ----- Checked writes Part 11: the commit waits for the partition leaders' votes -----
+    // EndTxn(commit) of a transaction with candidate partitions persists nothing and answers nothing until every
+    // candidate voted yes (then the usual PrepareCommit path) or one voted no (PrepareAbort; the no is the answer).
+    // Either way the answer is sent when the markers landed ("commit OK" means the rows are final), see AwaitingMarkers.
+    // The transaction is frozen meanwhile: the other txn requests of its id answer ConcurrentTransactions.
+    struct VoteTarget {
+        std::string topic;
+        int32_t     topicId   = 0;
+        int32_t     partition = 0;
+        bool        yes         = false;
+        bool        outstanding = false;   ///< a vote is out: its answer is awaited
+        int64_t     dueNs       = 0;       ///< not outstanding and not yes: (re-)sent from this time on
+        int64_t     backoffNs   = 0;
+    };
+    struct VoteCandidates {   ///< the candidates of an Ongoing transaction, noted at AddPartitions
+        int64_t                 producerId    = -1;
+        int16_t                 producerEpoch = 0;
+        int64_t                 txnStartNs    = 0;
+        std::vector<VoteTarget> targets;
+    };
+    struct VoteGate {
+        rune::transaction::TransactionalId txnId;
+        int64_t                 producerId       = -1;
+        int16_t                 producerEpoch    = 0;
+        int64_t                 txnStartNs       = 0;   ///< the transaction the votes were asked for (L5 staleness)
+        int32_t                 coordinatorEpoch = -1;
+        int64_t                 sessionId = 0, correlationId = 0;
+        std::vector<VoteTarget> targets;
+        bool                    hasNo = false;
+        VoteNo                  no{};
+    };
+    std::vector<VoteGate> voteGates_;
+    std::map<rune::transaction::TransactionalId, VoteCandidates, std::less<>> voteCandidatesAtAdd_;
+    VoteCandidateFn  voteCandidate_;
+    VoteFnOverride   voteFnOverride_;
+    SessionVersionFn sessionVersionFn_  = nullptr;
+    void*            sessionVersionCtx_ = nullptr;
+    [[nodiscard]] bool votesEnabled_() const;
+    /// True while a vote gate holds `txnId` for this producer id and epoch (another producer's request is answered
+    /// by the coordinator: fenced, wrong id).
+    [[nodiscard]] bool voteGated_(const rune::transaction::TransactionalId& txnId, int64_t producerId,
+                                  int16_t producerEpoch) const;
+    /// 0 while the gate's transaction is still the Ongoing one the votes were asked for, else the EndTxn(commit) answer.
+    [[nodiscard]] int16_t staleVoteCode_(const VoteGate& g);
+    void noteVoteCandidates_(const rune::protocol::client::TxnTopicPartitionView& parts);
+    /// True when EndTxn(commit) of txnIdScratch_ opened a vote gate (the answer is deferred).
+    bool startVoteGate_(const rune::protocol::client::EndTxn& msg, int64_t nowNs);
+    void sendVote_(const VoteGate& g, VoteTarget& t, int64_t nowNs);
+    void scheduleVoteResend_(VoteTarget& t, int64_t fromNs) noexcept;
+    int  processVoteGates_(int64_t nowNs);
+    /// The gate decided: PrepareCommit (all yes) or PrepareAbort (a no, whose code is the answer).
+    void prepareVoted_(VoteGate& g, bool commit, int64_t nowNs);
+    [[nodiscard]] int32_t clientVersionOf_(int64_t sessionId) const;
 
     // ----- #557: the next transaction's first leg waits for the previous transaction's markers -----
     // EndTxn is answered once the Prepare* record is durable (#38), so the producer's next transaction usually starts
@@ -445,7 +529,7 @@ private:
     /// The handler's answer `n`, sent now when every record it depends on is committed, else parked (returns 0).
     size_t finishRequest_(const uint8_t* buf, size_t len, uint8_t* out, size_t outCap, size_t n);
     void sendDeferred_(int64_t sessionId, const uint8_t* frame, std::size_t n);
-    void sendEndTxnAnswer_(int64_t sessionId, int64_t correlationId, int16_t errorCode);
+    void sendEndTxnAnswer_(int64_t sessionId, int64_t correlationId, int16_t errorCode, const VoteNo* vote = nullptr);
     int  releaseParked_();
     /// The gate for `meta`'s markers (respond: the EndTxn is answered OK once it opens).
     [[nodiscard]] PrepareGate makeGate_(const rune::transaction::TransactionMetadata& meta, bool commit,
@@ -584,6 +668,10 @@ private:
         int64_t offsetRefusedSinceNs = -1;  // #359: the first refusal of the current refused streak (-1: none)
         rune::coordination::TxnOffsetRefusal offsetRefusal = rune::coordination::TxnOffsetRefusal::Unknown;
         std::vector<MarkerRetry> retries;   // refused markers awaiting re-dispatch
+        bool    respond = false;            // a voted EndTxn waits for these markers
+        int64_t sessionId = 0, correlationId = 0;
+        bool    hasVote = false;
+        VoteNo  vote{};
     };
     static constexpr int64_t kMarkerRetryMinNs = 10'000'000;      // 10 ms
     static constexpr int64_t kMarkerRetryMaxNs = 1'000'000'000;   // 1 s
@@ -604,9 +692,11 @@ private:
     bool dropRetry_(AwaitingMarkers& a, int32_t topicId, int32_t partition);
     [[nodiscard]] bool partitionExists_(int32_t topicId, int32_t partition) const;
     std::unordered_map<int64_t, AwaitingMarkers> awaiting_;
+    /// `answerTo`: the voted EndTxn gate whose answer is sent once these markers landed.
     void dispatchMarkers_(const rune::transaction::TransactionalId& txnId, int64_t producerId,
                           int16_t producerEpoch, int32_t coordinatorEpoch, bool commit,
-                          const std::vector<rune::transaction::TopicPartition>& parts);
+                          const std::vector<rune::transaction::TopicPartition>& parts,
+                          const PrepareGate* answerTo = nullptr);
     void resolveMarker_(int64_t producerId);
     [[nodiscard]] int concurrentIfPreparing_(int err) const;
     /// Task 10 (D24): NamespaceLimitExceeded (52) is for a v14+ session; an older one is answered InvalidRequest (39).

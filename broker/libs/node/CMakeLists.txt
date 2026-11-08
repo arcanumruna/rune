@@ -532,7 +532,8 @@ if(BUILD_TESTING)
     # single-node PartitionReplica (minIsr=1), no Aeron required.
     # ---------------------------------------------------------------------------
     add_executable(rune_txn_coordination_service_tests
-        tests/node/TransactionCoordinationServiceTest.cpp)
+        tests/node/TransactionCoordinationServiceTest.cpp
+        tests/node/CheckedWritesTxnCoordinatorTest.cpp)
     target_link_libraries(rune_txn_coordination_service_tests PRIVATE
         rune_node
         rune_transaction
