@@ -243,6 +243,30 @@ TEST(CheckedWritesTxnVisibilityRegression, VetoCountsOnlyRefusedPushesRegression
     EXPECT_GT(inst()->counters.vetoedCheckpointPushes, 0u) << "the fenced application had rows to push";
 }
 
+// REGRESSION (Task 8 review 1, C1; P11-9, D4): on path A a persisted ordinary view whose span (T's first record to its marker) covers
+// more than 2C distinct-key plain records folds them with every checkpoint vetoed; the delta at the marker then outgrows one ring
+// message.  It goes out as part frames, so the view keeps folding and checkpointing without a restart.
+TEST(CheckedWritesTxnVisibilityRegression, LongSpanKeepsCheckpointingWithoutARestartRegression) {
+    constexpr int64_t kCap = 2000;
+    Txv t(kCap);
+    t.r.dropView(kView);
+    t.r.installProjection(kView + 1, "pproj", /*persisted=*/true);
+    t.txn(31, recs(10, 10));
+    for (uint64_t from = 100; from < 100 + 5 * kCap; from += 500) ASSERT_EQ(t.r.produceBatch(VerdictRig::batch(recs(from, from + 499))), 0);
+    const int64_t m = t.r.leo();
+    t.marker(31, true);
+    t.r.settle();
+    for (int i = 0; i < 50; ++i) t.r.pass();
+    EXPECT_TRUE(t.r.idRow(kView + 1, 10).has_value());
+    EXPECT_TRUE(t.r.idRow(kView + 1, 100 + 5 * kCap - 1).has_value());
+    EXPECT_GT(t.r.agent->lastDurableOffset(kView + 1, 0), m) << "the delta past one message is durable";
+    ASSERT_EQ(t.r.produceBatch(VerdictRig::batch(recs(9000, 9001))), 0);
+    const int64_t after = t.r.leo();
+    t.r.settle();
+    for (int i = 0; i < 50; ++i) t.r.pass();
+    EXPECT_GE(t.r.agent->lastDurableOffset(kView + 1, 0), after - 1) << "and checkpoints go on";
+}
+
 // REGRESSION (Task 8 review 1, D-A): past 64 spans open at once (67 transactions, then their markers) the excess apply at their own
 // offsets; the instance warns once, not per batch.
 TEST(CheckedWritesTxnVisibilityRegression, FullSpanTableWarnsOnceRegression) {

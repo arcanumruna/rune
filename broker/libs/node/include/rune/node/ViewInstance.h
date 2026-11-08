@@ -269,9 +269,8 @@ struct ViewInstance {
     // dirty rows, so no delta is ever lost or double-counted.
     std::vector<uint8_t>               pendingDelta;
     bool                               pendingValid    = false;
-    // The held delta outgrew one ring message (a verdict member whose judge ran ahead of an ordinary transaction's marker): it is
-    // never pushed, so checkpoints stop and a restart refolds from the last one.
-    bool                               deltaOversized  = false;
+    // A held delta past one ring message goes as a run of part frames (P11-9): the bytes of it already framed.
+    std::size_t                        pendingSent     = 0;
     // P11-0 / P11-9 (contract addition 13): the transactions this instance's fold met and has not applied yet, and whether an
     // application is in progress (reads held).  Consistent with foldCursor: every reset of the cursor clears it.
     rune::view::TxnSpanFence           spanFence;

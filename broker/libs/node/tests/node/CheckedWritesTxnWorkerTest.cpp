@@ -633,35 +633,41 @@ TEST(CheckedWritesTxnWorker, NoCheckpointPushWhileLockedRegression) {
 }
 
 // The judge runs to an ordinary transaction's marker in one go, and a member cannot checkpoint inside it (no J to backfill from):
-// a delta past one ring message is held, never claimed (a claim that large throws on the worker thread).  Until Task 8 checkpoints
-// stop there and a restart refolds from the last one.
-TEST(CheckedWritesTxnWorker, OversizedDeltaIsHeldNotClaimedRegression) {
+// the delta at the marker outgrows one ring message.  REGRESSION (P11-9, D4; re-pins OversizedDeltaIsHeldNotClaimed, T7 fix 1 and
+// fix 2): it goes out as a run of part frames, is acked as one checkpoint without a restart, and a restart recovers from it.
+TEST(CheckedWritesTxnWorkerRegression, OversizedDeltaPushesAcrossFramesRegression) {
     Persisted p;
-    const int64_t before = p.durable();
     std::vector<std::vector<uint8_t>> batches{VerdictRig::batch({ups(1001)}, kRaPid, 0, {}, /*txn=*/true)};
     for (auto& b : Persisted::plain(10000, 3 * p.cap)) batches.push_back(std::move(b));
     (void)p.replicated(std::move(batches));
+    const int64_t m = p.r.leo();
     p.r.marker(kRaPid, true);
     ASSERT_TRUE(p.r.driveUntilJudged());
     p.r.passes(50);
     EXPECT_TRUE(p.r.hasRow(kRej, 1001));
-    EXPECT_TRUE(p.r.hasRow(kRej, 10000 + static_cast<uint64_t>(3 * p.cap) - 1));
-    EXPECT_TRUE(p.r.vs->instanceForTest(kRej, 0)->deltaOversized);
-    EXPECT_EQ(p.durable(), before) << "the oversized delta never left";
+    EXPECT_GT(p.durable(), m) << "the delta past one message is durable without a restart";
+    const int64_t durable = p.durable();
     p.r.restart();
+    for (int i = 0; i < 20 && (p.r.vs->instanceForTest(kRej, 0) == nullptr || p.r.vs->instanceForTest(kRej, 0)->foldCursor <= 0); ++i) p.r.pass();
+    ASSERT_NE(p.r.vs->instanceForTest(kRej, 0), nullptr);
+    EXPECT_GE(p.r.vs->instanceForTest(kRej, 0)->foldCursor, durable) << "recovered from the multi-frame checkpoint, not refolded";
     p.r.passes(300);
     ASSERT_TRUE(p.r.driveUntilJudged());
+    EXPECT_EQ(p.r.vs->instanceForTest(kRej, 0)->counters.checkpointDiscards, 0u);
+    EXPECT_EQ(p.r.agent->tailTrimsForTest(), 0);
     EXPECT_TRUE(p.r.hasRow(kRej, 1001));
     EXPECT_TRUE(p.r.hasRow(kRej, 10000 + static_cast<uint64_t>(3 * p.cap) - 1));
 }
 
-// T7 review 2, N2: a member holding an oversized delta pushes no more, so it no longer bounds the run-ahead: a voted transaction
-// whose J lies more than one cap past the markers is still judged, answered and applied without a restart.
+// T7 review 2, N2 (re-pinned in Task 8, D4): after a delta past one message, the member keeps pushing, so the run-ahead cap counts
+// from its push past the first transaction: a voted transaction whose J lies more than one cap past that is judged, answered and
+// applied without a restart.
 TEST(CheckedWritesTxnWorker, OversizedDeltaNeverHoldsTheRunAheadRegression) {
     Persisted p;
     std::vector<std::vector<uint8_t>> batches{VerdictRig::batch({ups(1001)}, kRaPid, 0, {}, /*txn=*/true)};
     for (auto& b : Persisted::plain(10000, 3 * p.cap)) batches.push_back(std::move(b));
     (void)p.replicated(std::move(batches));
+    const int64_t m = p.r.leo();
     p.r.marker(kRaPid, true);
     ASSERT_TRUE(p.r.driveUntilJudged());
     p.r.passes(50);
@@ -669,7 +675,7 @@ TEST(CheckedWritesTxnWorker, OversizedDeltaNeverHoldsTheRunAheadRegression) {
     for (auto& b : Persisted::plain(30000, 2 * p.cap)) batches.push_back(std::move(b));
     batches.push_back(VerdictRig::batch({ins(2002)}, kRaPid + 1, 1, {}, /*txn=*/true));
     (void)p.replicated(std::move(batches));
-    ASSERT_TRUE(p.r.vs->instanceForTest(kRej, 0)->deltaOversized);
+    ASSERT_GT(p.durable(), m) << "the member pushed past the first transaction";
     const int64_t tok = p.r.sendVote(VerdictRig::kSrc, kRaPid + 1, 0);
     for (int i = 0; i < 2000 && !p.r.voteReply(tok); ++i) p.r.pass();
     ASSERT_TRUE(p.r.voteReply(tok)) << "the judge never reached T's J";

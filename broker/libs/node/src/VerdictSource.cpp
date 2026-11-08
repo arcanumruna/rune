@@ -1386,11 +1386,11 @@ bool VerdictSource::runsAheadAt_(int64_t cursor) const noexcept {
 }
 
 // Where the checkpoint cap counts from while the judge runs ahead: the persisted members' last push, at least the markers' coverage.
-// A member whose delta is too large to push checkpoints no more, so it bounds nothing; with none left the cap is off (INT64_MAX).
+// With no persisted member the cap is off (INT64_MAX).
 int64_t VerdictSource::runAheadFrom_() const noexcept {
     int64_t from = INT64_MAX;
     for (const Member& m : members_)
-        if (m.inst->persisted && m.inst->maxRecordsPerPass > 0 && !m.inst->deltaOversized) from = std::min(from, std::max(m.pushedAt, emitFrom_));
+        if (m.inst->persisted && m.inst->maxRecordsPerPass > 0) from = std::min(from, std::max(m.pushedAt, emitFrom_));
     return from;
 }
 

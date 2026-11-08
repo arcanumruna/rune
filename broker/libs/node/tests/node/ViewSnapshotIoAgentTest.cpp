@@ -728,3 +728,80 @@ TEST(ViewCheckpointTailRegression, WriteFailureThenRestartTrimsAndResumesRegress
                   catBytes({rec1, rec2, rec3, rec4, deltaOnly(50, 5, layout), deltaOnly(60, 6, layout)}));
     }
 }
+
+namespace {
+// Sends `rec` as part frames of `size` bytes, from byte `from` up to `to` (the last one has no `more` iff it ends the record).
+void sendParts(rune::node::ViewSnapshotChannel& ch, const std::vector<uint8_t>& rec, std::size_t size, std::size_t from, std::size_t to) {
+    for (std::size_t at = from; at < to; at += size) {
+        const std::size_t n = std::min(size, rec.size() - at);
+        std::vector<uint8_t> f(rune::node::ViewSnapshotChannel::kDeltaPartHeaderBytes + n, 0);
+        for (int i = 0; i < 4; ++i) f[std::size_t(i)] = static_cast<uint8_t>(uint32_t(kBView) >> (i * 8));
+        for (int i = 0; i < 4; ++i) f[std::size_t(8 + i)] = static_cast<uint8_t>(uint32_t(at) >> (i * 8));
+        f[12] = at + n < rec.size() ? 1 : 0;
+        std::memcpy(f.data() + rune::node::ViewSnapshotChannel::kDeltaPartHeaderBytes, rec.data() + at, n);
+        ASSERT_TRUE(ch.deltas.write(f.data(), f.size(), rune::node::ViewSnapshotChannel::kDeltaPartMsgType));
+    }
+}
+void work(rune::node::ViewSnapshotIoAgent& agent, rune::consensus::ManualNanoClock& clk) {
+    for (int i = 0; i < 4; ++i) {
+        agent.doWork(clk.nowNs());
+        clk.advance(60LL * 1'000'000LL);
+    }
+}
+}  // namespace
+
+// REGRESSION (P11-9, D4): a delta past one ring message arrives as a run of part frames.  The agent writes them as they come and
+// acks the delta's O only on the last part, so the durable offset never covers a record not wholly written.
+TEST(CheckedWritesIoAgentRegression, DeltaRunIsAckedOnItsLastPartRegression) {
+    const RowLayout layout = testLayout();
+    const auto rec10 = deltaOnly(10, 1, layout), rec20 = deltaOnly(20, 2, layout);
+    TempDir dir;
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), /*fsyncMs=*/0);
+    rune::consensus::ManualNanoClock clk(0);
+    appendDurable(ch, agent, clk, kBView, 0, 10, 1, layout);
+    ASSERT_GT(rec20.size(), 32u);
+    sendParts(ch, rec20, 32, 0, 32);
+    work(agent, clk);
+    EXPECT_EQ(agent.lastDurableOffset(kBView, 0), 10) << "the run is not complete";
+    sendParts(ch, rec20, 32, 32, rec20.size());
+    work(agent, clk);
+    EXPECT_EQ(agent.lastDurableOffset(kBView, 0), 20);
+    EXPECT_EQ(readFile(committedPath(dir.path(), kBView, 0)), catBytes({rec10, rec20}));
+}
+
+// REGRESSION (P11-9, D4): a run cut short is dropped.  A frame that follows it (a new worker's whole delta or a new run) cuts the
+// file back to where the run began; a crash leaves it as a torn tail the next agent trims.  Either way the file holds whole records.
+TEST(CheckedWritesIoAgentRegression, CutDeltaRunIsDroppedRegression) {
+    const RowLayout layout = testLayout();
+    const auto rec10 = deltaOnly(10, 1, layout), rec20 = deltaOnly(20, 2, layout);
+    {
+        TempDir dir;
+        rune::node::ViewSnapshotChannel ch;
+        rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), /*fsyncMs=*/0);
+        rune::consensus::ManualNanoClock clk(0);
+        appendDurable(ch, agent, clk, kBView, 0, 10, 1, layout);
+        sendParts(ch, rec20, 32, 0, 32);
+        work(agent, clk);
+        appendDurable(ch, agent, clk, kBView, 0, 30, 3, layout);
+        sendParts(ch, rec20, 32, 0, 32);
+        sendParts(ch, deltaOnly(40, 4, layout), 32, 0, deltaOnly(40, 4, layout).size());
+        work(agent, clk);
+        EXPECT_EQ(agent.lastDurableOffset(kBView, 0), 40);
+        EXPECT_EQ(readFile(committedPath(dir.path(), kBView, 0)), catBytes({rec10, deltaOnly(30, 3, layout), deltaOnly(40, 4, layout)}));
+    }
+    {
+        TempDir dir;
+        {
+            rune::node::ViewSnapshotChannel ch;
+            rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), /*fsyncMs=*/0);
+            rune::consensus::ManualNanoClock clk(0);
+            appendDurable(ch, agent, clk, kBView, 0, 10, 1, layout);
+            sendParts(ch, rec20, 32, 0, 32);
+            work(agent, clk);
+            EXPECT_EQ(readFile(committedPath(dir.path(), kBView, 0)).size(), rec10.size() + 32) << "the part was written";
+        }   // the crash
+        EXPECT_EQ(appendOverFile(dir.path(), readFile(committedPath(dir.path(), kBView, 0)), 30, 3, layout), 1);
+        EXPECT_EQ(readFile(committedPath(dir.path(), kBView, 0)), catBytes({rec10, deltaOnly(30, 3, layout)}));
+    }
+}

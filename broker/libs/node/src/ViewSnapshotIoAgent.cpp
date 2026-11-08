@@ -399,6 +399,7 @@ void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len, i
     if (fs == nullptr) return; // open failed this cycle (transient, NOT cached) -- drop, retried next delta
     if (std::holds_alternative<StreamRefused>(fs->stream)) return;   // a file that could not be verified or repaired: never written
     fs->channelIdx = channelIdx;  // Task 19: route this key's done acks back to its channel
+    if (fs->runStart >= 0 && !dropRun_(*fs)) return;
 
     // appendNoSync-style: a plain write(), no fsync here -- fsyncs are
     // GROUPED in flushDue_ (offset-atomic: see file header).
@@ -423,6 +424,55 @@ void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len, i
     // backward.
     fs->pendingO       = std::max(fs->pendingO, O);
     fs->dirtySinceSync = true;
+}
+
+void ViewSnapshotIoAgent::handleDeltaPartFrame_(const uint8_t* p, std::size_t len, int channelIdx) {
+    if (len < ViewSnapshotChannel::kDeltaPartHeaderBytes) return;
+    const int32_t viewTopicId = static_cast<int32_t>(readLE32(p));
+    const int32_t partition   = static_cast<int32_t>(readLE32(p + 4));
+    const uint32_t at         = readLE32(p + 8);
+    const bool more           = p[12] != 0;
+    const uint8_t* bytes      = p + ViewSnapshotChannel::kDeltaPartHeaderBytes;
+    const std::size_t n       = len - ViewSnapshotChannel::kDeltaPartHeaderBytes;
+    const Key key{viewTopicId, partition};
+    if (auto it = files_.find(key); it != files_.end() && std::holds_alternative<StreamRefused>(it->second.stream)) return;
+    FileState* fs = openVerified_(key);
+    if (fs == nullptr || std::holds_alternative<StreamRefused>(fs->stream)) return;
+    fs->channelIdx = channelIdx;
+    if (at == 0) {
+        if (fs->runStart >= 0 && !dropRun_(*fs)) return;
+        const int64_t O = peekDeltaOffset(bytes, n);
+        if (O < 0) return;
+        const off_t start = ::lseek(fs->fd, 0, SEEK_CUR);
+        if (start < 0) return;
+        fs->runStart = start;
+        fs->runAt    = 0;
+        fs->runO     = O;
+    } else if (fs->runStart < 0 || at != fs->runAt) {   // a part of no run this agent began: never written
+        if (fs->runStart >= 0) (void)dropRun_(*fs);
+        return;
+    }
+    if (!writeFull(fs->fd, bytes, n)) {
+        fs->stream = StreamRefused{errno, "write failed"};
+        spdlog::error("ViewSnapshotIoAgent: FATAL write failure for viewTopicId={} partition={} at O={}: {} "
+                      "-- this delta stream is now stopped (hasError() will report true)",
+                      viewTopicId, partition, fs->runO, std::strerror(errno));
+        return;
+    }
+    fs->runAt += static_cast<uint32_t>(n);
+    if (more) return;
+    fs->runStart       = -1;
+    fs->pendingO       = std::max(fs->pendingO, fs->runO);
+    fs->dirtySinceSync = true;
+}
+
+bool ViewSnapshotIoAgent::dropRun_(FileState& fs) {
+    if (::ftruncate(fs.fd, fs.runStart) != 0 || ::lseek(fs.fd, fs.runStart, SEEK_SET) < 0) {
+        fs.stream = StreamRefused{errno, "run truncate failed"};
+        return false;
+    }
+    fs.runStart = -1;
+    return true;
 }
 
 // One ack onto `channels_[channelIdx]->done`; false when the ring is full (or the channel is gone).
@@ -520,6 +570,10 @@ int ViewSnapshotIoAgent::doWork(int64_t nowNs) {
                        aeron::util::index_t off, aeron::util::index_t len) {
                 if (type == kDiscardMsgType) {
                     handleDiscardFrame_(reinterpret_cast<const uint8_t*>(buf.buffer() + off), static_cast<std::size_t>(len), ci);
+                    return;
+                }
+                if (type == ViewSnapshotChannel::kDeltaPartMsgType) {
+                    handleDeltaPartFrame_(reinterpret_cast<const uint8_t*>(buf.buffer() + off), static_cast<std::size_t>(len), ci);
                     return;
                 }
                 if (type != ViewSnapshotChannel::kDeltaMsgType) return;

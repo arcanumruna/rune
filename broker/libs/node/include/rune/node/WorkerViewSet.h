@@ -1034,6 +1034,7 @@ private:
     // [viewTopicId i32][partition i32][delta bytes].  Returns false (and keeps
     // pendingValid) on back-pressure; true once committed.
     [[nodiscard]] bool tryPushDelta_(ViewInstance& inst);
+    [[nodiscard]] bool tryPushDeltaParts_(ViewInstance& inst);
 
     /// Cold: the source log starts above this instance's cursor.  True = it now starts at the log start; false = it held rows
     /// from trimmed records and a BelowLogStart discard began.

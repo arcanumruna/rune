@@ -1127,13 +1127,7 @@ int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
 bool WorkerViewSet::tryPushDelta_(ViewInstance& inst) {
     const std::size_t frameLen =
         ViewSnapshotChannel::kDeltaHeaderBytes + inst.pendingDelta.size();
-    if (frameLen > static_cast<std::size_t>(channel_.deltas.maxMsgLength())) [[unlikely]] {   // a claim this large throws
-        if (!inst.deltaOversized)
-            spdlog::critical("VIEW-DELTA-TOO-LARGE view={} partition={} bytes={} max={} -- checkpoints stop; a restart refolds from the last one",
-                             inst.plan.viewTopicId, inst.partition, frameLen, channel_.deltas.maxMsgLength());
-        inst.deltaOversized = true;
-        return false;
-    }
+    if (inst.pendingSent != 0 || frameLen > static_cast<std::size_t>(channel_.deltas.maxMsgLength())) [[unlikely]] return tryPushDeltaParts_(inst);
 
     const auto claim =
         channel_.deltas.tryClaim(ViewSnapshotChannel::kDeltaMsgType, frameLen);
@@ -1146,6 +1140,28 @@ bool WorkerViewSet::tryPushDelta_(ViewInstance& inst) {
                 inst.pendingDelta.data(), inst.pendingDelta.size());
     channel_.deltas.commit(claim);
 
+    inst.pendingValid = false;
+    return true;
+}
+
+// P11-9: a delta past one ring message (a claim that large throws), as part frames; on back-pressure the rest goes next pass.
+bool WorkerViewSet::tryPushDeltaParts_(ViewInstance& inst) {
+    const std::size_t room = static_cast<std::size_t>(channel_.deltas.maxMsgLength()) - ViewSnapshotChannel::kDeltaPartHeaderBytes;
+    while (inst.pendingSent < inst.pendingDelta.size()) {
+        const std::size_t n = std::min(room, inst.pendingDelta.size() - inst.pendingSent);
+        const auto claim = channel_.deltas.tryClaim(ViewSnapshotChannel::kDeltaPartMsgType, ViewSnapshotChannel::kDeltaPartHeaderBytes + n);
+        if (claim < 0) return false;   // ring full: the run resumes here next pass
+        uint8_t* dst = channel_.deltas.base() + claim;
+        writeI32LE(dst, inst.plan.viewTopicId);
+        writeI32LE(dst + 4, inst.partition);
+        writeI32LE(dst + 8, static_cast<int32_t>(inst.pendingSent));
+        dst[12] = inst.pendingSent + n < inst.pendingDelta.size() ? 1 : 0;
+        dst[13] = dst[14] = dst[15] = 0;
+        std::memcpy(dst + ViewSnapshotChannel::kDeltaPartHeaderBytes, inst.pendingDelta.data() + inst.pendingSent, n);
+        channel_.deltas.commit(claim);
+        inst.pendingSent += n;
+    }
+    inst.pendingSent  = 0;
     inst.pendingValid = false;
     return true;
 }
@@ -1576,10 +1592,7 @@ bool WorkerViewSet::startAtLogStart_(ViewInstance& inst, int64_t logStart) {
 bool WorkerViewSet::tryPushDiscard_(ViewInstance& inst) {
     const auto* owed = std::get_if<CheckpointDiscardOwed>(&inst.checkpoint);
     if (owed == nullptr) return false;
-    if (inst.pendingValid && !tryPushDelta_(inst)) {   // the held delta belongs to the old stream: it precedes the frame
-        if (!inst.deltaOversized) return false;
-        inst.pendingValid = inst.deltaOversized = false;   // never pushed: the backup goes without it
-    }
+    if (inst.pendingValid && !tryPushDelta_(inst)) return false;   // the held delta belongs to the old stream: it precedes the frame
     const auto claim = channel_.deltas.tryClaim(kDiscardMsgType, static_cast<std::size_t>(kDiscardMsgBytes));
     if (claim < 0) return false;            // ring full: retried next pass
     uint8_t* dst = channel_.deltas.base() + claim;
