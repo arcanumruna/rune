@@ -482,12 +482,13 @@ public:
     std::set<uint64_t> keyIndexKeys() {
         std::set<uint64_t> out;
         const uint32_t kw = keyWidthOf(keyShape_);
+        const std::size_t held = vs->keyIndexSizeForTest(kSrc, tuning_.partition);
         std::string key(kw, '\0');
-        for (uint64_t id = 0; id < 4096; ++id) {
+        for (uint64_t id = 0; id < 4096 && out.size() < held; ++id) {   // every key found: the rest of the range holds none
             for (uint32_t i = 0; i < kw; ++i) key[i] = i < 8 ? static_cast<char>(id >> (8 * i)) : '\0';
             if (vs->keyIndexContainsForTest(kSrc, tuning_.partition, key)) out.insert(out.end(), id);
         }
-        EXPECT_EQ(out.size(), vs->keyIndexSizeForTest(kSrc, tuning_.partition)) << "a key outside [0, 4096)";
+        EXPECT_EQ(out.size(), held) << "a key outside [0, 4096)";
         return out;
     }
 
