@@ -290,7 +290,7 @@ std::vector<uint8_t> foreignPlan(const std::string& view, int32_t source, ViewKi
 
 // #640: foreign names are hidden before authorizeName, so a user of namespace a gets the plain-view answer for b's constrained view.
 TEST(CheckedWritesConstraintDdl, ForeignNamespaceConstraintDdlMatchesThePlainViewAnswers) {
-    AuthRig rig("cwcdn");
+    AuthRig rig(AuthRig::Bare{}, "cwcdn");
     rig.createNamespace("a");
     rig.createNamespace("b");
     namespace pc = rune::protocol::client;
