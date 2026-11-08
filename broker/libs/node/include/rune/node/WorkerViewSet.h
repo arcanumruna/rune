@@ -575,7 +575,8 @@ private:
     // pushed window gives a long span's growth back (releaseWindow_; ViewTable::trimDirty).  Churn past the reserve keeps its
     // dirty sets, charged, while windows come less than kQuietGiveBackNs apart, and allocates nothing per drain; a caught-up pass
     // after that long quiet gives them back (quietPass_), so a view quiet for kQuietGiveBackNs carries no charge past its tables.
-    // A paused view gives them back on its first paused pass.
+    // A paused view gives them back on its first paused pass.  An instance that is not driven (its source partition is not led
+    // here) keeps its charge, a kept window included, until a pass drives it again.
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
         std::size_t m = inst.table.memoryBytes() + inst.table.dirtyBytes() + (inst.pendingValid ? inst.pendingDelta.capacity() : 0);
         if (inst.owners) m += inst.owners->memoryBytes() + inst.owners->dirtyBytes();
