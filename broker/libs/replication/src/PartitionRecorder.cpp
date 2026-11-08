@@ -76,7 +76,9 @@ void PartitionRecorder::onCommitted(int64_t startOffset, int64_t endOffset)
     while (scanFrom < endOffset) {
         auto rawBytes = log_->read(scanFrom, kMaxReadBytes);
         if (rawBytes.empty()) {
-            break;
+            scanFrom = log_->nextSegmentBaseAfter(scanFrom);   // a segment compaction emptied
+            if (scanFrom < 0) break;
+            continue;
         }
 
         // Walk individual RecordBatch frames within the flat read buffer.

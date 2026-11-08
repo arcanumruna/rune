@@ -18,7 +18,9 @@
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -392,6 +394,34 @@ protected:
     TempFile            storeFile;
     rune::storage::Log  log;
 };
+
+// A segment compaction emptied: recording continues at the next segment instead of stopping at the first empty read.
+TEST_F(PartitionRecorderTest, OnCommitted_ContinuesPastASegmentCompactionEmptiedRegression)
+{
+    TempDir dir("recorder_emptied");
+    const auto put = [&dir](int64_t base, const std::vector<uint8_t>& bytes) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(std::filesystem::path(dir.path) / name, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    put(0, {});
+    auto bytes = makeBatch(10, 0xAA);
+    const auto second = makeBatch(11, 0xBB);
+    bytes.insert(bytes.end(), second.begin(), second.end());
+    put(10, bytes);
+    rune::storage::Log emptied(dir.path);
+    emptied.recover();
+    ASSERT_EQ(emptied.logEndOffset(), 12);
+
+    FileRecordingStore store(storeFile.path);
+    PartitionRecorder recorder(0, &emptied, &store);
+    recorder.startRecording(0);
+    recorder.onCommitted(0, 12);
+
+    EXPECT_EQ(store.batchCount(), 2);
+    EXPECT_EQ(recorder.getRecordingPosition(), 12);
+}
 
 TEST_F(PartitionRecorderTest, InitiallyNotRecording)
 {
