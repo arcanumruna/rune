@@ -37,31 +37,31 @@ static_assert(std::atomic_ref<std::int32_t>::is_always_lock_free);
 static_assert(std::atomic_ref<std::int64_t>::is_always_lock_free);
 
 template <typename T>
-[[nodiscard]] inline std::atomic_ref<T> word(const aeron::concurrent::AtomicBuffer& b,
-                                              aeron::util::index_t offset) noexcept {
+[[nodiscard]] inline std::atomic_ref<T> controlWord(const aeron::concurrent::AtomicBuffer& b,
+                                                    aeron::util::index_t offset) noexcept {
     return std::atomic_ref<T>(*reinterpret_cast<T*>(b.buffer() + offset));
 }
 
 [[nodiscard]] inline std::int32_t getInt32Acquire(const aeron::concurrent::AtomicBuffer& b,
                                                 aeron::util::index_t offset) noexcept {
-    return word<std::int32_t>(b, offset).load(std::memory_order_acquire);
+    return controlWord<std::int32_t>(b, offset).load(std::memory_order_acquire);
 }
 inline void putInt32Release(const aeron::concurrent::AtomicBuffer& b, aeron::util::index_t offset,
                            std::int32_t v) noexcept {
-    word<std::int32_t>(b, offset).store(v, std::memory_order_release);
+    controlWord<std::int32_t>(b, offset).store(v, std::memory_order_release);
 }
 [[nodiscard]] inline std::int64_t getInt64Acquire(const aeron::concurrent::AtomicBuffer& b,
                                                 aeron::util::index_t offset) noexcept {
-    return word<std::int64_t>(b, offset).load(std::memory_order_acquire);
+    return controlWord<std::int64_t>(b, offset).load(std::memory_order_acquire);
 }
 inline void putInt64Release(const aeron::concurrent::AtomicBuffer& b, aeron::util::index_t offset,
                            std::int64_t v) noexcept {
-    word<std::int64_t>(b, offset).store(v, std::memory_order_release);
+    controlWord<std::int64_t>(b, offset).store(v, std::memory_order_release);
 }
 /// Multi-producer tail claim (Aeron compareAndSetInt64 = __sync CAS, seq_cst — kept).
 [[nodiscard]] inline bool compareAndSetInt64(const aeron::concurrent::AtomicBuffer& b, aeron::util::index_t offset,
                                    std::int64_t expected, std::int64_t desired) noexcept {
-    return word<std::int64_t>(b, offset).compare_exchange_strong(expected, desired,
+    return controlWord<std::int64_t>(b, offset).compare_exchange_strong(expected, desired,
                                                                  std::memory_order_seq_cst);
 }
 
