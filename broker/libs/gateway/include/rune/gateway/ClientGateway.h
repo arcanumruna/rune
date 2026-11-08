@@ -155,6 +155,16 @@ struct ShardIngressEndpoint {
     int32_t     egressControlBasePort = 0;
 };
 
+// Checked writes Part 11: the coordinator's vote result (see ClientGateway::sendTxnVote).
+struct TxnVoteResult {
+    int16_t  errorCode     = 0;    ///< non-zero (NotLeader): transport failure, the other fields mean nothing
+    uint16_t code          = 0;    ///< 0 = yes
+    uint32_t constraintId  = 0;
+    int64_t  failingOffset = -1;
+};
+using TxnVoteSink = void (*)(void* ctx, int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch,
+                             int32_t coordinatorEpoch, const TxnVoteResult&) noexcept;
+
 // ---------------------------------------------------------------------------
 // ClientGateway
 // ---------------------------------------------------------------------------
@@ -1171,6 +1181,22 @@ public:
     [[nodiscard]] uint64_t txnVerifiesServedForPeersForTest() const noexcept { return txnVerifiesServedForPeers_; }
     /// Test-only: doWork's verification step at `nowNs`.
     int pumpTxnVerifyForTest(int64_t nowNs) { nowNs_ = nowNs; return pumpTxnVerify_(); }
+
+    // -----------------------------------------------------------------------
+    // Checked writes Part 11: the transaction coordinator's vote on a partition.
+    //
+    // sendTxnVote asks the partition's leader whether the transaction (producerId, producerEpoch) may commit there.  It
+    // returns a token >= 0, and that token gets EXACTLY ONE sink call: the worker's vote, or errorCode NotLeader when the
+    // worker could not answer.  -1 means no call follows (no worker route, a full ring, a full table): a transport error,
+    // retried by the caller with backoff.  A result is never delivered from inside sendTxnVote; the sink may call
+    // sendTxnVote again.  `coordinatorEpoch` rides back to the sink unchanged.  Runtime thread, cold.
+    // -----------------------------------------------------------------------
+    void setTxnVoteSink(TxnVoteSink sink, void* ctx) noexcept { voteSink_ = sink; voteSinkCtx_ = ctx; }
+    int64_t sendTxnVote(int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch, int32_t coordinatorEpoch);
+    static constexpr std::size_t kMaxTxnVotesInFlight = 16384;
+    [[nodiscard]] std::size_t txnVotesInFlightForTest() const noexcept { return votesInFlight_.size(); }
+    /// Test-only: the token of the last vote issued.
+    [[nodiscard]] int64_t lastVoteTokenForTest() const noexcept { return nextVoteToken_ - 1; }
 
     /// Review MAJOR-1: the cluster plane's link to `peer` came back (down→up
     /// edge; -1 = a new inbound image whose peer is unknown) — every remote
@@ -3284,6 +3310,16 @@ private:
     int64_t nextVerifyToken_ = initialMarkerToken_();   ///< per-boot incarnation in the high bits (as markers)
     bool failAllRemoteVerifies_ = false;
     int32_t lastVerifyCoordinator_ = -1;   ///< the node the in-flight asks went to (sweep on change)
+    // Checked writes Part 11: votes this node's coordinator has asked, by token.
+    struct VoteInFlight {
+        int32_t topicId = 0; int32_t partition = 0; int64_t producerId = -1; int16_t producerEpoch = 0;
+        int32_t coordinatorEpoch = 0;
+    };
+    void onTxnVoteResult_(const rune::node::WorkerReturn& ret);
+    std::unordered_map<int64_t, VoteInFlight> votesInFlight_;
+    int64_t nextVoteToken_ = initialMarkerToken_();   ///< per-boot incarnation in the high bits (as markers)
+    TxnVoteSink voteSink_    = nullptr;
+    void*       voteSinkCtx_ = nullptr;
     uint64_t txnVerifiesForwarded_      = 0;
     uint64_t txnVerifiesServedForPeers_ = 0;
     std::vector<int32_t> verifyReconnectedPeers_;

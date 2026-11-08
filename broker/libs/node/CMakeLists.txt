@@ -1473,7 +1473,8 @@ if(BUILD_TESTING)
 
             # D9 (cross-node transaction markers): gateway unit + 3-node
             # in-process integration over the real cluster-plane transport.
-            add_executable(rune_d9_cross_node_marker_tests tests/integration/D9CrossNodeMarkerTest.cpp)
+            add_executable(rune_d9_cross_node_marker_tests tests/integration/D9CrossNodeMarkerTest.cpp
+                tests/integration/CheckedWritesTxnVoteRoutingTest.cpp)
             target_include_directories(rune_d9_cross_node_marker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
             target_link_libraries(rune_d9_cross_node_marker_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_d9_cross_node_marker_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
