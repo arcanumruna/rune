@@ -532,8 +532,11 @@ TEST(CheckedWritesTxnVoteRoutingRegression, ReconnectResendsWithTheSameTokenRegr
 
     // A local vote is not re-sent and not failed by a reconnect.
     ASSERT_GE(C.gw.sendTxnVote(0, 1, 80, 1, 9), 0);
+    C.acceptVotes = true;
+    C.votesSent.clear();
     C.gw.onPlaneReconnect(-1);
     (void)C.gw.pumpTxnMarkersForTest(7);
+    EXPECT_TRUE(C.votesSent.empty()) << "a local vote is never sent over the plane";
     EXPECT_EQ(C.got.size(), 2u);
     EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 1u);
 

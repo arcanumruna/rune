@@ -6871,6 +6871,7 @@ int ClientGateway::resendRemoteMarkers_()
     // reconnected peer(s) with the SAME token.  Idempotent end to end: the
     // leader skips a copy still in flight there and re-answers otherwise; the
     // answer to any copy completes the marker once; copies stay FIFO per peer.
+    // Votes (Part 11) likewise, minus the queue: a refused re-send completes NotLeader.
     const bool all = resendAllRemoteMarkers_;
     resendAllRemoteMarkers_ = false;
     std::vector<int32_t> peers;
@@ -6889,12 +6890,17 @@ int ClientGateway::resendRemoteMarkers_()
     for (const auto& [token, v] : votesInFlight_) {
         if (v.remoteNode < 0) continue;
         if (!all && std::find(peers.begin(), peers.end(), v.remoteNode) == peers.end()) continue;
-        if (!sendRemoteVote_(token, v)) refused.push_back(token);
+        if (!sendRemoteVote_(token, v)) {
+            refused.push_back(token);
+            continue;
+        }
         ++resent;
     }
     completeVotesNotLeader_(refused);
     if (resent > 0)
         spdlog::info("ClientGateway: cluster-plane reconnect — re-sent {} in-flight remote marker(s) and vote(s)", resent);
+    if (!refused.empty())
+        spdlog::info("ClientGateway: cluster-plane reconnect — {} remote vote(s) completed NotLeader (re-send refused)", refused.size());
     return resent;
 }
 

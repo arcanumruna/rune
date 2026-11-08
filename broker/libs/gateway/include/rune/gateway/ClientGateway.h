@@ -716,7 +716,7 @@ public:
             std::shared_ptr<const rune::metadata::RoutingImage> img) noexcept {
         routingImage_ = std::move(img);
         // D9: a partition whose leadership moved fails its in-flight remote
-        // markers NotLeader (event-driven; the TCS retry re-routes) — done by
+        // markers and its in-flight remote votes (Part 11) NotLeader (event-driven; the TCS retry re-routes) — done by
         // the next marker pump of this same thread (review LOW-7: never calls
         // into the coordinator from inside the routing publish).
         routingChangedForMarkers_ = true;
@@ -1189,7 +1189,7 @@ public:
     // Checked writes Part 11: the transaction coordinator's vote on a partition.
     //
     // sendTxnVote asks the partition's leader whether the transaction (producerId, producerEpoch) may commit there.  It
-    // returns a token >= 0, and that token gets EXACTLY ONE sink call: the leader's vote (from this node's worker or, over
+    // returns a token >= 0, and that token gets EXACTLY ONE sink call unless purgeTxnVotes drops it first: the leader's vote (from this node's worker or, over
     // the cluster plane, from the remote leader), or errorCode NotLeader when it could not answer.  -1 means no call
     // follows (no route, no vote channel, a full op ring, a refused plane send, a full table): a transport error, retried
     // by the caller with backoff.  A result is never delivered from inside sendTxnVote; the sink may call sendTxnVote
@@ -1222,6 +1222,7 @@ public:
     /// marker in flight to it (to everyone for -1) is RE-SENT with the SAME
     /// token by the next marker pump.  A remote marker completes only on a real
     /// answer or a leadership change — never on a timer.
+    /// Part 11: every remote vote in flight to it is re-sent with the same token; a refused re-send completes NotLeader.
     /// #112: every verification forwarded to that peer (to anyone for -1) is
     /// answered NotCoordinator (retriable) — its ask or answer may be lost.
     void onPlaneReconnect(int32_t peer) {
