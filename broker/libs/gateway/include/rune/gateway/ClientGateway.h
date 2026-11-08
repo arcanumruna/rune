@@ -716,9 +716,10 @@ public:
             std::shared_ptr<const rune::metadata::RoutingImage> img) noexcept {
         routingImage_ = std::move(img);
         // D9: a partition whose leadership moved fails its in-flight remote
-        // markers NotLeader (event-driven; the TCS retry re-routes) — done by
-        // the next marker pump of this same thread (review LOW-7: never calls
-        // into the coordinator from inside the routing publish).
+        // markers and its in-flight remote votes (Part 11) NotLeader
+        // (event-driven; the TCS retry re-routes) — done by the next marker
+        // pump of this same thread (review LOW-7: never calls into the
+        // coordinator from inside the routing publish).
         routingChangedForMarkers_ = true;
     }
 
@@ -1189,15 +1190,19 @@ public:
     // Checked writes Part 11: the transaction coordinator's vote on a partition.
     //
     // sendTxnVote asks the partition's leader whether the transaction (producerId, producerEpoch) may commit there.  It
-    // returns a token >= 0, and that token gets EXACTLY ONE sink call: the leader's vote (from this node's worker or, over
-    // the cluster plane, from the remote leader), or errorCode NotLeader when it could not answer.  -1 means no call
-    // follows (no route, no vote channel, a full op ring, a refused plane send, a full table): a transport error, retried
-    // by the caller with backoff.  A result is never delivered from inside sendTxnVote; the sink may call sendTxnVote
-    // again.  `coordinatorEpoch` rides back to the sink unchanged.  Runtime thread, cold.
+    // returns a token >= 0, and that token gets EXACTLY ONE sink call unless purgeTxnVotes drops it first: the leader's
+    // vote (from this node's worker or, over the cluster plane, from the remote leader), or errorCode NotLeader when it
+    // could not answer.  -1 means no call follows (no route, no vote channel, a full op ring, a refused plane send, a
+    // full table): a transport error, retried by the caller with backoff.  A result is never delivered from inside
+    // sendTxnVote; the sink may call sendTxnVote again.  `coordinatorEpoch` rides back to the sink unchanged.  Runtime
+    // thread, cold.
     // -----------------------------------------------------------------------
     void setTxnVoteSink(TxnVoteSink sink, void* ctx) noexcept { voteSink_ = sink; voteSinkCtx_ = ctx; }
     int64_t sendTxnVote(int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch, int32_t coordinatorEpoch);
     static constexpr std::size_t kMaxTxnVotesInFlight = 16384;
+    /// Silently drops the votes asked under a coordinator epoch below @p olderThan (no sink call); the coordinator's
+    /// unload and load call it beside purgeQueuedMarkers.  \returns the number dropped.  Control thread only.
+    std::size_t purgeTxnVotes(int32_t olderThan);
     /// Leader side: a coordinator on another node asks for the vote on a partition this node leads.
     void onRemoteTxnVote(const rune::replication::TxnVoteMsg& m);
     /// Coordinator side: the partition leader's answer.
@@ -1219,6 +1224,7 @@ public:
     /// marker in flight to it (to everyone for -1) is RE-SENT with the SAME
     /// token by the next marker pump.  A remote marker completes only on a real
     /// answer or a leadership change — never on a timer.
+    /// Part 11: every remote vote in flight to it is re-sent with the same token; a refused re-send completes NotLeader.
     /// #112: every verification forwarded to that peer (to anyone for -1) is
     /// answered NotCoordinator (retriable) — its ask or answer may be lost.
     void onPlaneReconnect(int32_t peer) {
@@ -3333,6 +3339,9 @@ private:
         int32_t remoteNode = -1; int32_t remoteLeaderEpoch = -1;   ///< the leader the vote went to, -1 = the local worker
     };
     void onTxnVoteResult_(const rune::node::WorkerReturn& ret);
+    bool sendRemoteVote_(int64_t token, const VoteInFlight& v);
+    void completeVotesNotLeader_(const std::vector<int64_t>& tokens);
+    void failRemoteVotesOnLeaderChange_();
     std::unordered_map<int64_t, VoteInFlight> votesInFlight_;
     // Leader side: votes taken from another node's coordinator whose answer is still owed, by (origin node, origin token).
     struct RemoteVoteKey {
