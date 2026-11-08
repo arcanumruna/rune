@@ -260,11 +260,13 @@ TEST(CheckedWritesTxnVisibilityRegression, LongSpanKeepsCheckpointingWithoutARes
     EXPECT_TRUE(t.r.idRow(kView + 1, 10).has_value());
     EXPECT_TRUE(t.r.idRow(kView + 1, 100 + 5 * kCap - 1).has_value());
     EXPECT_GT(t.r.agent->lastDurableOffset(kView + 1, 0), m) << "the delta past one message is durable";
-    ASSERT_EQ(t.r.produceBatch(VerdictRig::batch(recs(9000, 9001))), 0);
+    ASSERT_EQ(t.r.produceBatch(VerdictRig::batch(recs(20000, 20001))), 0);
     const int64_t after = t.r.leo();
     t.r.settle();
     for (int i = 0; i < 50; ++i) t.r.pass();
+    EXPECT_TRUE(t.r.idRow(kView + 1, 20001).has_value()) << "the fold goes on past the marker";
     EXPECT_GE(t.r.agent->lastDurableOffset(kView + 1, 0), after - 1) << "and checkpoints go on";
+    EXPECT_EQ(t.r.pass(), 0) << "and the worker idles: no held delta retried every pass";
 }
 
 // REGRESSION (Task 8 review 1, D-A): past 64 spans open at once (67 transactions, then their markers) the excess apply at their own
