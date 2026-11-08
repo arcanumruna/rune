@@ -926,8 +926,8 @@ TEST(CheckedWritesTxnWorker, TxnPairCommitsOnBothOrNeither) {
 namespace {
 constexpr int16_t kInvalidTxnState = static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);
 
-int16_t txnProduce(Ki& k, int64_t pid, uint64_t id, int32_t seq) {
-    const auto a = k.r.ack(k.r.produceFrame({ups(id)}, kLeader, pid, seq, /*txn=*/true));
+int16_t txnProduce(Ki& k, int64_t pid, uint64_t id, int32_t seq, int16_t epoch = 0) {
+    const auto a = k.r.ack(k.r.produceFrame({ups(id)}, kLeader, pid, seq, /*txn=*/true, epoch));
     EXPECT_TRUE(a.has_value());
     return a ? a->code : int16_t{-1};
 }
@@ -940,6 +940,7 @@ TEST(CheckedWritesTxnVoteFreezeRegression, AppendAfterYesVoteIsRefusedUntilTheMa
     const int64_t leo = k.r.replica->logEndOffset();
     EXPECT_EQ(txnProduce(k, 61, 7, 1), kInvalidTxnState);
     EXPECT_EQ(k.r.replica->logEndOffset(), leo) << "the refused row is not in the log";
+    EXPECT_EQ(k.r.worker->txnBatchesRefusedAfterVoteForTest(), 1u);
     k.r.marker(61, true);
     ASSERT_TRUE(k.r.driveUntilJudged());
     EXPECT_EQ(txnProduce(k, 61, 8, 1), 0) << "the next transaction appends once the marker landed";
@@ -981,4 +982,48 @@ TEST(CheckedWritesTxnVoteFreezeRegression, NewLeaderRefusesAppendAfterVoteInLog)
     k.r.passes(60);
     ASSERT_EQ(k.r.txnJudgeOffsetsInLog().size(), 1u);
     EXPECT_EQ(txnProduce(k, 65, 7, 1), kInvalidTxnState);
+}
+
+// A yes that wrote no TxnJudge (nothing to judge) freezes the transaction too: the marker-time judge would otherwise reject rows the
+// commit decision never covered.
+TEST(CheckedWritesTxnVoteFreezeRegression, AppendAfterAVoteWithoutAJudgeRecordIsRefused) {
+    Ki k;
+    ASSERT_EQ(txnProduce(k, 66, 4, 0), 0);
+    const auto v = k.vote(66);
+    ASSERT_EQ(v.errorCode, 0);
+    ASSERT_EQ(v.judgeOffset, -1) << "a non-voting yes";
+    const int64_t leo = k.r.replica->logEndOffset();
+    EXPECT_EQ(txnProduce(k, 66, 5, 1), kInvalidTxnState);
+    EXPECT_EQ(k.r.replica->logEndOffset(), leo);
+    k.r.marker(66, true);
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    EXPECT_EQ(txnProduce(k, 66, 6, 1), 0);
+}
+
+// A new leader freezes from the TxnJudge in the log even while the judge has not taken the record into its table.
+TEST(CheckedWritesTxnVoteFreezeRegression, FreezeComesFromTheLogNotFromTheJudgeTable) {
+    Ki k(/*follower=*/true);
+    k.txn(67, {ins(1)});
+    ASSERT_EQ(k.vote(67).errorCode, 0);
+    k.r.followerFetch();
+    k.r.failover();
+    k.r.passes(60);
+    ASSERT_EQ(k.r.txnJudgeOffsetsInLog().size(), 1u);
+    const_cast<PartitionWriteState*>(k.r.writeState())->txn.truncateFrom(0);   // as if the table had refused J
+    ASSERT_EQ(k.r.writeState()->txn.find(67), nullptr);
+    EXPECT_EQ(txnProduce(k, 67, 7, 1), kInvalidTxnState);
+}
+
+// Only the voted epoch is frozen; an older epoch is fenced as before.
+TEST(CheckedWritesTxnVoteFreezeRegression, OlderEpochIsFencedNotFrozen) {
+    Ki k;
+    (void)k.r.appendTxnReplicated(VerdictRig::batch({ins(1)}, 68, 0, {}, /*txn=*/true, /*epoch=*/1));
+    k.r.passes(30);
+    const int64_t tok = k.r.sendVote(VerdictRig::kSrc, 68, 1);
+    ASSERT_TRUE(k.r.driveUntilVoted(tok));
+    ASSERT_EQ(k.r.voteReply(tok)->errorCode, 0);
+    EXPECT_EQ(txnProduce(k, 68, 7, 1, /*epoch=*/1), kInvalidTxnState) << "the voted epoch";
+    const int16_t zombie = txnProduce(k, 68, 8, 1, /*epoch=*/0);
+    EXPECT_NE(zombie, kInvalidTxnState);
+    EXPECT_NE(zombie, 0) << "fenced";
 }

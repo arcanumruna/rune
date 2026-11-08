@@ -743,11 +743,11 @@ private:
 public:
 
     /// `shape`: the source's key; the wire key and the value's id field are that wide (the id's little-endian bytes, zero padded).
-    static std::vector<uint8_t> batch(const std::vector<Rec>& recs, int64_t pid = -1, int32_t seq = -1, const KeyShape& shape = {}, bool txn = false) {
+    static std::vector<uint8_t> batch(const std::vector<Rec>& recs, int64_t pid = -1, int32_t seq = -1, const KeyShape& shape = {}, bool txn = false, int16_t epoch = 0) {
         const uint32_t kw = keyWidthOf(shape);
         const auto idByte = [](uint64_t id, uint32_t i) { return static_cast<uint8_t>(i < 8 ? id >> (8 * i) : 0); };
         rune::protocol::RecordBatchBuilder b(0, 1000);
-        if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
+        if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq); }
         b.setTransactional(txn);
         for (const auto& r : recs) {
             std::vector<uint8_t> key(kw), val;
@@ -1092,15 +1092,15 @@ public:
         wireAcks_();
     }
     /// A Produce frame on the worker's ingress; returns its correlation id.  `recs` is one batch.
-    int64_t produceFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool txn = false) {
-        return produceBytes(batch(recs, pid, seq, keyShape_, txn), acks, pid, seq);
+    int64_t produceFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool txn = false, int16_t epoch = 0) {
+        return produceBytes(batch(recs, pid, seq, keyShape_, txn, epoch), acks, pid, seq, epoch);
     }
     /// A Produce frame carrying `bytes` as its batch (a hand-made one); returns its correlation id.
-    int64_t produceBytes(const std::vector<uint8_t>& bytes, uint8_t acks, int64_t pid = -1, int32_t seq = -1) {
+    int64_t produceBytes(const std::vector<uint8_t>& bytes, uint8_t acks, int64_t pid = -1, int32_t seq = -1, int16_t epoch = 0) {
         const int64_t c = ++corr;
         rune::protocol::client::Produce m;
         m.sessionId = kAckSession; m.correlationId = c; m.topicId = kSrc; m.partition = tuning_.partition; m.partitionKnown = 1;
-        m.acks = acks; m.producerId = pid; m.producerEpoch = 0; m.baseSequence = seq;
+        m.acks = acks; m.producerId = pid; m.producerEpoch = epoch; m.baseSequence = seq;
         m.recordBatch = std::span<const uint8_t>(bytes);
         std::vector<uint8_t> f(m.encodedSize()); m.encode(f.data());
         if (ackEncrypted_) f = sealC2b_(f);

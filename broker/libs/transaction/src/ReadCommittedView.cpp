@@ -240,6 +240,19 @@ int64_t LsoTracker::firstOffsetOf(ProducerId producerId) const noexcept
     return s ? fifo_[s->pos & fifoMask_].firstOffset : -1;
 }
 
+void LsoTracker::markVoted(ProducerId producerId, int16_t epoch) noexcept
+{
+    if (producerId < 0) return;
+    if (Slot* s = find_(producerId)) fifo_[s->pos & fifoMask_].votedEpoch = epoch;
+}
+
+bool LsoTracker::votedAt(ProducerId producerId, int16_t epoch) const noexcept
+{
+    if (producerId < 0) return false;
+    const Slot* s = find_(producerId);
+    return s != nullptr && fifo_[s->pos & fifoMask_].votedEpoch == epoch;
+}
+
 void LsoTracker::clear() noexcept
 {
     // N4: both indexes are reset here, in one place.

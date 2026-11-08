@@ -7923,6 +7923,7 @@ private:
         const int64_t first = rc->tracker().firstOffsetOf(v.producerId);
         if (first < 0) {   // no open transaction of the producer here (nothing written, or its marker landed): yes
             ++ws->txn.stats.votesYes;
+            rcOf_(replica)->onVote(v.producerId, v.epoch);
             answerVote_(*ws, v, 0, {}, -1, passNowNs_, false);
             return;
         }
@@ -7949,6 +7950,7 @@ private:
             return;
         }
         ++parkedVotes_;
+        rcOf_(replica)->onVote(v.producerId, v.epoch);   // the transaction takes no more batches, whichever way the vote is answered
     }
 
     /// One step of a vote-time scan; true once it is over (its votes answered or bound to the J it appended).
@@ -9918,16 +9920,12 @@ private:
         enqueueReturn_(ret);
         return true;
     }
-    // Part 11 (design L6): a transaction whose TxnJudge is in the log and whose marker has not landed has had its vote on this
-    // partition; a later batch of the same producer and epoch would commit unjudged.  The refusal is derived from the log (the
-    // judge state is rebuilt from it by a failover): the producer's entry in the judge table, still the open transaction.
-    [[nodiscard]] bool txnVotedAlready_(const RcState& rc, const PartitionWriteState& ws, std::span<const uint8_t> rbSpan) const noexcept {
+    // Part 11 (design L6): once this partition answered a vote for a transaction, or holds its TxnJudge, a later batch of the same
+    // producer and epoch would commit unjudged.  The tracker holds the mark with the open transaction, so a marker clears it and a
+    // leadership scan rebuilds it from the TxnJudge records.
+    [[nodiscard]] static bool txnVotedAlready_(const RcState& rc, std::span<const uint8_t> rbSpan) noexcept {
         const rune::protocol::RecordBatchReader r(rbSpan.data(), rbSpan.size());
-        if ((static_cast<uint16_t>(r.attributes()) & kTxnAttrBit) == 0 || r.producerId() < 0) [[likely]] return false;
-        const int64_t first = rc.tracker().firstOffsetOf(r.producerId());
-        if (first < 0) return false;
-        const DeferredTxn* t = ws.txn.find(r.producerId());
-        return t != nullptr && t->firstOffset == first && t->epoch == r.producerEpoch();
+        return (static_cast<uint16_t>(r.attributes()) & kTxnAttrBit) != 0 && rc.tracker().votedAt(r.producerId(), r.producerEpoch());
     }
     // F15-FU1 (#112): the verify outbox → the return ring, oldest first, only while the
     // return FIFO is empty (flushRetFifo_); stops at the first refused claim.
@@ -9973,6 +9971,7 @@ public:
     [[nodiscard]] bool txnVerification() const noexcept { return txnVerification_; }
     [[nodiscard]] uint64_t txnVerifyRequestsSentForTest() const noexcept { return txnVerifyRequestsSent_; }
     [[nodiscard]] uint64_t txnBatchesRefusedUnverifiedForTest() const noexcept { return txnBatchesRefusedUnverified_; }
+    [[nodiscard]] uint64_t txnBatchesRefusedAfterVoteForTest() const noexcept { return txnBatchesRefusedAfterVote_; }
     [[nodiscard]] uint64_t txnVerifyAnswersDroppedForTest() const noexcept { return txnVerifyAnswersDropped_; }
     /// #112: verification requests most one worker holds unsent (the ring was full).
     static constexpr std::size_t kTxnVerifyOutboxCapacity = 256;
@@ -9997,6 +9996,7 @@ private:
     uint64_t nextTxnVerifyReqId_          = 0;
     uint64_t txnVerifyRequestsSent_       = 0;
     uint64_t txnBatchesRefusedUnverified_ = 0;
+    uint64_t txnBatchesRefusedAfterVote_ = 0;
     uint64_t txnVerifyAnswersDropped_     = 0;
 
     struct ProduceFields {
@@ -10352,7 +10352,8 @@ private:
         // produce never gets here: rc is set only for producerId >= 0).
         if (rc != nullptr && rbSpan.size() >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
             [[unlikely]] {
-            if (ws != nullptr && txnVotedAlready_(*rc, *ws, rbSpan)) {
+            if (txnVotedAlready_(*rc, rbSpan)) {
+                ++txnBatchesRefusedAfterVote_;
                 ret.errorCode = static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);
                 enqueueReturn_(ret);
                 return 1;
