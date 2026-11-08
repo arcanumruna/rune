@@ -77,7 +77,7 @@ struct VoteRig {
         auto* rig = static_cast<VoteRig*>(self);
         rig->got.push_back({topicId, partition, producerId, producerEpoch, coordinatorEpoch, r});
         rig->inFlightAtSink = rig->gw.txnVotesInFlightForTest();
-        if (rig->resendInSink) {   // enough emplaces to rehash the table while the gateway is inside the drain
+        if (rig->resendInSink) {   // several sends from inside the drain; the empty-table check above is what catches a late erase
             rig->resendInSink = false;
             for (int i = 0; i < 8; ++i)
                 rig->reentrantTokens.push_back(rig->gw.sendTxnVote(topicId, partition, producerId + 100, producerEpoch, coordinatorEpoch));
@@ -171,9 +171,13 @@ TEST(CheckedWritesTxnVoteRouting, RefusedVoteReturnsMinusOneAndIsNeverAnswered) 
     }
     VoteRig R;   // full op ring
     std::size_t sent = 0;
-    while (sent < 100000 && R.gw.sendTxnVote(0, 0, 77 + static_cast<int64_t>(sent), 1, 9) >= 0) ++sent;
-    ASSERT_LT(sent, 100000u) << "the ring never filled";
+    while (sent < rune::gateway::ClientGateway::kMaxTxnVotesInFlight &&
+           R.gw.sendTxnVote(0, 0, 77 + static_cast<int64_t>(sent), 1, 9) >= 0) ++sent;
+    ASSERT_LT(sent, rune::gateway::ClientGateway::kMaxTxnVotesInFlight) << "the ring never filled";
     ASSERT_GT(sent, 0u);
+    const int64_t lastToken = R.gw.lastVoteTokenForTest();
+    EXPECT_EQ(R.gw.sendTxnVote(0, 0, 1, 1, 9), -1);
+    EXPECT_EQ(R.gw.lastVoteTokenForTest(), lastToken) << "a refused send does not draw a token";
     EXPECT_EQ(R.gw.txnVotesInFlightForTest(), sent);
     for (int pass = 0; pass < 1000 && R.gw.txnVotesInFlightForTest() > 0; ++pass) R.runWorker(2 + pass);
     EXPECT_EQ(R.got.size(), sent);
