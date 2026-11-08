@@ -1154,6 +1154,8 @@ public:
         return workerOpFrameBytes(tailLen) <= static_cast<std::size_t>(ingress_.maxMsgLength());
     }
     [[nodiscard]] uint64_t oversizedOpsRefusedForTest() const noexcept { return oversizedOpsRefused_; }
+    /// Lease topic schema versions refused or erased because the system-column layout was broken (leaseLayoutOk).
+    [[nodiscard]] uint64_t leaseLayoutRefusedForTest() const noexcept { return leaseLayoutRefused_; }
     void setReturnDrainLimit(int32_t n)  noexcept { returnDrainLimit_  = (n >= 1) ? n : 1024; }
 
     // Configure the per-produce-ack return-ring reservation slot size (bytes).  The
@@ -3405,7 +3407,12 @@ private:
         try {
             rune::codec::Descriptor desc =
                 rune::codec::deserialize(std::span<const uint8_t>(tail, tailLen));
-            writeSpecOf_(topicId).installVersion(version, std::move(desc));
+            if (!writeSpecOf_(topicId).installVersion(version, std::move(desc))) {
+                ++leaseLayoutRefused_;
+                spdlog::error("Worker {}: SchemaUpdate for lease topicId={} version={} breaks the lease system-column "
+                              "layout; validator not installed", workerId_, topicId, version);
+                return;
+            }
             spdlog::debug("Worker {}: SchemaUpdate installed validator for topicId={} version={}",
                           workerId_, topicId, version);
         } catch (const std::exception& ex) {
@@ -3431,7 +3438,11 @@ private:
         }
         TopicWriteSpec& spec = writeSpecOf_(w->topicId);
         if (viewSet_ != nullptr && spec.keyIndex != w->keyIndex) viewSet_->noteWriteSpecChange();
-        spec.setFacts(*w);
+        if (const uint32_t erased = spec.setFacts(*w); erased != 0) {
+            leaseLayoutRefused_ += erased;
+            spdlog::error("Worker {}: lease topicId={} — {} installed version(s) break the lease system-column layout; erased",
+                          workerId_, w->topicId, erased);
+        }
         if (w->keyFieldId != kNoKeyField && w->keyWidth == 0)
             spdlog::warn("Worker {}: topic {} key field cannot be a topic key; wire-key check skipped (pre-existing topic)",
                          workerId_, w->topicId);
@@ -6610,6 +6621,7 @@ private:
     // default so routed replication ops / acks don't queue behind a tiny cap).
     int32_t ingressDrainLimit_ = 1024;  // RUNE_WORKER_INGRESS_DRAIN_LIMIT
     uint64_t    oversizedOpsRefused_  = 0;                    // F18: ops > one ring frame
+    uint64_t    leaseLayoutRefused_   = 0;                    // lease topic versions refused/erased (layout guard)
     int32_t returnDrainLimit_  = 1024;  // RUNE_WORKER_RETURN_DRAIN_LIMIT
     // FR trace: monotonic count of routed replication ops (fetch/apply) dequeued
     // from the ingress ring — pairs 1:1 (FIFO) with the control thread's

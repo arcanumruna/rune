@@ -664,12 +664,12 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     if (!named && msg.requestedFingerprint == rune::protocol::client::kSchemaKindFingerprint) {
         // Checked writes kind probe: an untyped topic is OK with no blob (a raw handle binds to it).
         if (const cat::TopicObject* t = applier_.state().topicByName(msg.nsId, msg.name)) {
-            deps_.respondGet(msg.session, msg.corr, t->topicId, 0, t->partitions, {}, kOK, {});
+            deps_.respondGet(msg.session, msg.corr, t->topicId, 0, t->partitions, {}, kOK, {}, std::nullopt);
             return;
         }
     }
     if (!named) {
-        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {});
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {}, std::nullopt);
         return;
     }
     const cat::TopicObject* topic = applier_.state().topicByName(msg.nsId, msg.name);
@@ -678,21 +678,21 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
         // #418: the topic's lineage - the latest entry's EVOLVING blob (every field ever declared, with its
         // lifetime), so a typed reader can place a record of any version.
         deps_.respondGet(msg.session, msg.corr, named->topicId, named->version, named->partitionCount,
-                         named->descriptorBlob, kOK, features);
+                         named->descriptorBlob, kOK, features, topic ? topic->lease : std::nullopt);
         return;
     }
     const RegistryEntry* e = (msg.requestedFingerprint == 0 || msg.requestedFingerprint == rune::protocol::client::kSchemaKindFingerprint)
                                  ? named
                                  : reg_.byFingerprint(named->topicId, msg.requestedFingerprint);
     if (!e) {
-        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {});
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {}, std::nullopt);
         return;
     }
     // The wire blob is the MATERIALIZED-as-of-version descriptor (its fingerprint
     // is e->fingerprint), never the evolving blob; the partition count is the
     // topic's (the latest entry).
     deps_.respondGet(msg.session, msg.corr, e->topicId, e->version, named->partitionCount,
-                     rune::codec::serialize(e->descriptor), kOK, features);
+                     rune::codec::serialize(e->descriptor), kOK, features, topic ? topic->lease : std::nullopt);
 }
 
 void AdminWorker::respondList_(const ListNamespacesMsg& m) {
@@ -1805,6 +1805,7 @@ AdminWorker::Built AdminWorker::buildAlterView_(const AlterViewMsg& m, const cat
     if (m.persistence > 1) return Rejected(reject(kInvalidSchema));   // a direct submit
     const cat::ViewObject* v = s.viewByName(m.nsId, m.name);
     if (v == nullptr) return Rejected(reject(kUnknownTopic, "no view named " + quotedName(m.name)));
+    if (v->kind == cat::ViewKind::LeaseIndex) return Rejected(reject(kViewNotAlterable));   // a lease view follows its topic
     if (m.expectedVersion != 0 && m.expectedVersion != v->version)
         return Rejected(reject(kSchemaConflict, "view " + quotedName(m.name) + " is at version " + std::to_string(v->version),
                                v->def.viewTopicId, static_cast<uint16_t>(std::min<uint32_t>(v->version, 0xFFFF))));
@@ -1824,6 +1825,8 @@ AdminWorker::Built AdminWorker::buildAlterView_(const AlterViewMsg& m, const cat
 AdminWorker::Built AdminWorker::buildDropView_(const DropViewMsg& m, const cat::CatalogState& s) const {
     const cat::ViewObject* v = s.viewByName(m.nsId, m.name);
     if (v == nullptr) return Rejected(reject(kUnknownTopic, "no view named " + quotedName(m.name)));
+    if (v->kind == cat::ViewKind::LeaseIndex)
+        return Rejected(reject(kInvalidRequest, quotedName(m.name) + " is a lease view; drop its lease topic"));
     cat::CatalogEvent e;
     e.nsId        = m.nsId;
     e.objectName  = v->name;
@@ -1835,7 +1838,10 @@ AdminWorker::Built AdminWorker::buildDropView_(const DropViewMsg& m, const cat::
 }
 
 AdminWorker::Built AdminWorker::buildDropTopic_(const DropTopicMsg& m, const cat::CatalogState& s) const {
-    if (s.viewByName(m.nsId, m.name)) return Rejected(reject(kInvalidRequest, quotedName(m.name) + " is a view; use DROP VIEW"));
+    if (const cat::ViewObject* v = s.viewByName(m.nsId, m.name))
+        return Rejected(reject(kInvalidRequest, v->kind == cat::ViewKind::LeaseIndex
+                                                    ? quotedName(m.name) + " is a lease view; drop its lease topic"
+                                                    : quotedName(m.name) + " is a view; use DROP VIEW"));
     const cat::TopicObject* t = s.topicByName(m.nsId, m.name);
     if (t == nullptr) return Rejected(reject(kUnknownTopic, "no topic named " + quotedName(m.name)));
     if (const cat::ViewObject* v = s.viewReading(m.nsId, m.name))

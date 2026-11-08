@@ -11081,6 +11081,23 @@ bool ClientGateway::sendControlFrame(int64_t sessionId,
             }
         }
     }
+    // Lease topics: a TopicSchemaResponse's lease block is for v18+ sessions only.  An older client gets the frame a
+    // v17 broker would have sent (the key block only when the features are non-default).  Cold: only that template.
+    if (session->clientVersion < pc::kClientVersionLeases && len > pc::MessageHeader::ENCODED_SIZE) [[unlikely]] {
+        if (const auto h = pc::MessageHeader::decode(buf, len);
+            h && h->templateId == static_cast<uint16_t>(pc::TemplateId::TopicSchemaResponse)) {
+            if (auto resp = pc::TopicSchemaResponse::decode(buf, len); resp && resp->hasLease) {
+                resp->hasLease       = false;
+                resp->lease          = {};
+                resp->hasKeyFeatures = resp->keyFeatures != rune::protocol::TopicKeyFeatures{};
+                ddlDowngradeScratch_.resize(resp->encodedSize());
+                const std::size_t n = resp->encode(ddlDowngradeScratch_.data());
+                ddlDowngradeScratch_.resize(n);
+                buf = ddlDowngradeScratch_.data();
+                len = n;
+            }
+        }
+    }
     // No-hang (R2): every answer delivered through here (DDL responses from the
     // admin thread, deferred EndTxn answers, Assign) is queued and retried under
     // back-pressure — a best-effort sendTo lost it and left the client waiting.

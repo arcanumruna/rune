@@ -1339,6 +1339,22 @@ if(BUILD_TESTING)
                 PROPERTIES TIMEOUT 180
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            # Lease topics Task 3b: the broker effects of a lease topic (a plan-less lease view sink) over a REAL
+            # single-node BrokerNode and real Aeron: create / restart / drop / restart.
+            add_executable(rune_lease_topic_broker_tests
+                tests/integration/LeaseTopicBrokerTest.cpp)
+            target_include_directories(rune_lease_topic_broker_tests PRIVATE
+                ${RUNE_PROTOCOL_INCLUDE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(rune_lease_topic_broker_tests PRIVATE
+                rune_node
+                rune_view
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_lease_topic_broker_tests
+                PROPERTIES TIMEOUT 180
+                ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
             # EmbeddedDriver: one driver, one pumping thread (spec §3.6).
             add_executable(rune_embedded_driver_tests tests/node/EmbeddedDriverTest.cpp tests/node/DriverWakePollProbe.c)
             target_link_libraries(rune_embedded_driver_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)

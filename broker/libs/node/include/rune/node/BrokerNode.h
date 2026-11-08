@@ -795,7 +795,8 @@ public:
     /// never dropped.
     void postTopicSchemaResponse(int64_t session, int64_t corr, int32_t topicId, uint16_t version,
                                  int32_t partitionCount, const std::vector<uint8_t>& blob,
-                                 uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures) {
+                                 uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures,
+                                 const std::optional<rune::protocol::LeaseSpec>& lease = std::nullopt) {
         namespace pc = rune::protocol::client;
         pc::TopicSchemaResponse resp;
         resp.sessionId      = session;
@@ -804,7 +805,9 @@ public:
         resp.version        = version;
         resp.errorCode      = errorCode;
         resp.partitionCount = partitionCount;   // Phase 2b Part C
-        resp.hasKeyFeatures = keyFeatures != rune::protocol::TopicKeyFeatures{};
+        resp.hasLease       = lease.has_value();
+        resp.lease          = lease.value_or(rune::protocol::LeaseSpec{});
+        resp.hasKeyFeatures = keyFeatures != rune::protocol::TopicKeyFeatures{} || resp.hasLease;   // the key block precedes the lease block
         resp.keyFeatures    = keyFeatures;
         resp.descriptorBlob = blob.empty() ? nullptr : blob.data();
         resp.descriptorLen  = static_cast<uint32_t>(blob.size());
@@ -1224,11 +1227,13 @@ private:
     void postCatalogTopicApplied_(int32_t topicId, std::string_view name, int32_t partitions, int16_t rf,
                                   rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c,
                                   uint32_t nsId, const rune::protocol::TopicKeyFeatures& kf,
-                                  int32_t typeId = kA2cCatalogTopicApplied) {
-        const std::size_t len = catalogTopicAppliedWireLen(name, c);
+                                  int32_t typeId = kA2cCatalogTopicApplied,
+                                  const std::optional<rune::protocol::LeaseSpec>& lease = std::nullopt,
+                                  bool leaseView = false) {
+        const std::size_t len = catalogTopicAppliedWireLen(name, c, lease.has_value());
         const uint8_t pers = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
         postCatalog_(typeId, len, [&](uint8_t* p) {
-            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c, nsId, kf);
+            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c, nsId, kf, lease, leaseView);
         });
     }
 
@@ -1285,7 +1290,8 @@ private:
             postCatalogValidator_(t, 1);
             postCatalogWriteSpec_(t);
             postCatalogTopicApplied_(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence, t.config, t.nsId,
-                                     t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{});
+                                     t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{},
+                                     kA2cCatalogTopicApplied, t.lease);
         };
         fx.sinkApplied = [this](const SinkSpec& s) {
             // A view sink is a keyed, compacted table (Task 19's sink spec), every broker (rf 0).
@@ -1293,7 +1299,7 @@ private:
             c.cleanupPolicy = 1;   // Compact
             c.partitionKey  = s.keyField;
             postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf*/0, s.persistence, c, s.nsId, s.sourceKeyFeatures,
-                                     kA2cCatalogSinkApplied);   // Task 12 (N5)
+                                     kA2cCatalogSinkApplied, std::nullopt, s.leaseView);   // Task 12 (N5)
         };
         fx.namespaceUpserted = [this](const rune::catalog::NamespaceRecord& r) {   // namespaces Task 9: login mirror
             postCatalog_(kA2cNamespaceUpserted, namespaceUpsertedWireLen(r.name),
@@ -1307,14 +1313,22 @@ private:
                          [&](uint8_t* p) { writeCatalogTopicDropped(p, topicId, name, nsId); });
         };
         fx.topicConfig = [this](int32_t topicId, std::span<const rune::catalog::ConfigChange> changes) {
-            const std::size_t n = changes.size();
+            // Only keys 1..kLastConfigKeyV3 reach the cleaner (it refuses a policy message with any other key): the
+            // lease.* keys (7..12) travel as a write-spec update (writeSpecChanged) instead.
+            std::size_t n = 0;
+            for (const auto& ch : changes)
+                if (static_cast<uint8_t>(ch.key) <= static_cast<uint8_t>(rune::protocol::kLastConfigKeyV3)) ++n;
+            if (n == 0) return;
             postCatalog_(kA2cCatalogTopicConfig, n > kMaxCatalogConfigEntries ? 0 : catalogTopicConfigWireLen(n),
                          [&](uint8_t* p) {
                 writeCatalogTopicConfigHeader(p, topicId, static_cast<uint16_t>(n));
-                for (std::size_t i = 0; i < n; ++i)
-                    writeCatalogTopicConfigEntry(p, i, static_cast<uint8_t>(changes[i].key), changes[i].value);
+                std::size_t i = 0;
+                for (const auto& ch : changes)
+                    if (static_cast<uint8_t>(ch.key) <= static_cast<uint8_t>(rune::protocol::kLastConfigKeyV3))
+                        writeCatalogTopicConfigEntry(p, i++, static_cast<uint8_t>(ch.key), ch.value);
             });
         };
+        fx.writeSpecChanged = [this](const rune::catalog::TopicObject& t) { postCatalogWriteSpec_(t); };
         fx.schemaChanged = [this](const rune::catalog::TopicObject& t, uint16_t fromVersion) {
             postCatalogValidator_(t, fromVersion);
             postCatalogWriteSpec_(t);

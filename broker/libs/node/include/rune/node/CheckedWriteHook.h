@@ -38,6 +38,12 @@ struct WriteFacts {
     bool    levelCheckedWrites = false;
 };
 
+/// Whether a verdict view of this kind provides the key index (member 0 of a logged set): a lease index is a key index
+/// over a wider key.  Task 5 decides the lease hook; `TopicHookFacts::keyIndex` is unchanged.
+[[nodiscard]] constexpr bool providesKeyIndex(rune::view::VerdictViewKind k) noexcept {
+    return k == rune::view::VerdictViewKind::KeyIndex || k == rune::view::VerdictViewKind::LeaseIndex;
+}
+
 /// What the topic says.  Later parts set the members; in Part 03 every member is false.
 struct TopicHookFacts {
     bool keyIndex          = false;
@@ -55,7 +61,7 @@ struct TopicHookFacts {
     f.verdictSource     = state.isVerdictSource();
     f.constrainedSource = state.isConstrainedSource();
     const ConstraintSet& logged = state.constraintSets.latest();
-    f.keyIndexActive    = logged.count > 0 && logged.members[0].kind == rune::view::VerdictViewKind::KeyIndex;
+    f.keyIndexActive    = logged.count > 0 && providesKeyIndex(logged.members[0].kind);
     return f;
 }
 

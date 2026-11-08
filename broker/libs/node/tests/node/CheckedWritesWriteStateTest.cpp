@@ -357,3 +357,120 @@ TEST(CheckedWritesValidationFuzzRegression, RandomMutationsAgreeWithTheModel) {
         }
     }
 }
+
+// ═══ Lease topics: the write spec's lease block and the system-column layout guard ═══
+
+namespace {
+
+rune::codec::Descriptor leaseDescriptor(uint16_t keyWidth = 64) {
+    rune::codec::DescriptorBuilder d("inst");
+    d.add("lease_version", PrimType::Int64).add("lease_ttl_ms", PrimType::UInt64)
+        .add("lease_holder", PrimType::UInt64).add("lease_remaining_ms", PrimType::UInt64)
+        .addFixedStr("id", keyWidth, 1, /*isKey=*/true);
+    return d.build();
+}
+
+}  // namespace
+
+TEST(LeaseWriteSpecRegression, WireRoundTrip) {
+    rune::protocol::LeaseSpec ls;
+    ls.ttlMs = 4242; ls.maxKeys = 9; ls.checkpoint = 0;
+    TopicWriteSpecWire w;
+    w.topicId = 6; w.keyFieldId = 4; w.keyType = PrimType::FixedStr; w.keyWidth = 128; w.keyIndex = true;
+    w.lease = ls;
+    EXPECT_EQ(kTopicWriteSpecLeaseWireLen, 48u);
+    ASSERT_EQ(topicWriteSpecWireLen(w), 48u);
+    std::vector<uint8_t> buf(48);
+    ASSERT_EQ(encodeTopicWriteSpec(w, buf), 48u);
+    EXPECT_EQ(buf[8] & 8, 8);
+    const auto back = decodeTopicWriteSpec(buf);
+    ASSERT_TRUE(back);
+    EXPECT_EQ(*back, w);
+    ASSERT_TRUE(back->lease.has_value());
+    EXPECT_EQ(*back->lease, ls);
+
+    // the 9 and 26 byte forms are unchanged
+    TopicWriteSpecWire plain;
+    plain.topicId = 6;
+    uint8_t nine[kTopicWriteSpecWireLen];
+    ASSERT_EQ(encodeTopicWriteSpec(plain, nine), 9u);
+    EXPECT_TRUE(decodeTopicWriteSpec(nine));
+    TopicWriteSpecWire ai;
+    ai.topicId = 6; ai.autoIncrement = true; ai.partitionCount = 2;
+    uint8_t tw[kTopicWriteSpecAutoIncWireLen];
+    ASSERT_EQ(encodeTopicWriteSpec(ai, tw), 26u);
+    EXPECT_TRUE(decodeTopicWriteSpec(tw));
+
+    // lease + autoincrement together: refused on decode
+    auto both = buf;
+    both[8] |= 4;
+    EXPECT_FALSE(decodeTopicWriteSpec(both));
+    // a 48-byte frame without bit 3
+    auto noBit = buf;
+    noBit[8] &= static_cast<uint8_t>(~8u);
+    EXPECT_FALSE(decodeTopicWriteSpec(noBit));
+    // bit 3 on a 9-byte frame
+    auto shortBit = std::vector<uint8_t>(buf.begin(), buf.begin() + 9);
+    EXPECT_FALSE(decodeTopicWriteSpec(shortBit));
+    // bits 4-7
+    for (int bit = 4; bit < 8; ++bit) {
+        auto b = buf;
+        b[8] |= static_cast<uint8_t>(1u << bit);
+        EXPECT_FALSE(decodeTopicWriteSpec(b)) << "bit " << bit;
+    }
+    // cut at every length
+    for (std::size_t n = 0; n < 48; ++n) {
+        const bool good = n == 9 || n == 26;
+        const auto cut = decodeTopicWriteSpec(std::span<const uint8_t>(buf.data(), n));
+        EXPECT_FALSE(cut.has_value()) << "cut to " << n << (good ? " (a legal length, but bit 3 is set)" : "");
+    }
+}
+
+TEST(LeaseWriteSpecRegression, KeyWidthRealRegression) {
+    rune::catalog::TopicObject lease = topicOf(leaseDescriptor(128), "id", true);
+    lease.lease = rune::protocol::LeaseSpec{};
+    const auto w = writeSpecWireOf(lease);
+    ASSERT_TRUE(w);
+    EXPECT_EQ(w->keyWidth, 128) << "a lease topic's key may be a string(128)";
+    ASSERT_TRUE(w->lease.has_value());
+    EXPECT_EQ(*w->lease, rune::protocol::LeaseSpec{});
+
+    rune::catalog::TopicObject plain = topicOf(leaseDescriptor(128), "id", true);
+    const auto p = writeSpecWireOf(plain);
+    ASSERT_TRUE(p);
+    EXPECT_EQ(p->keyWidth, 0) << "the same key on a non-lease topic is not a topic key";
+    EXPECT_FALSE(p->lease.has_value());
+}
+
+TEST(LeaseWriteSpecRegression, LayoutBreakRefusedRegression) {
+    TopicWriteSpecWire facts;
+    facts.topicId = 9; facts.lease = rune::protocol::LeaseSpec{};
+
+    auto bad = leaseDescriptor();
+    bad.fields[0].offset = 8;   // lease_version moved off offset 0
+    ASSERT_FALSE(leaseLayoutOk(bad));
+    ASSERT_TRUE(leaseLayoutOk(leaseDescriptor()));
+
+    TopicWriteSpec spec;
+    EXPECT_EQ(spec.setFacts(facts), 0u);
+    EXPECT_FALSE(spec.installVersion(1, bad));
+    EXPECT_EQ(spec.descriptorFor(1), nullptr);
+    EXPECT_TRUE(spec.installVersion(1, leaseDescriptor()));
+    EXPECT_NE(spec.descriptorFor(1), nullptr);
+
+    // the spec arrives AFTER the version (the production order: SchemaUpdate, then WriteSpecUpdate): the bad one is erased
+    TopicWriteSpec late;
+    EXPECT_TRUE(late.installVersion(1, bad));   // no lease known yet
+    EXPECT_TRUE(late.installVersion(2, leaseDescriptor()));
+    EXPECT_EQ(late.setFacts(facts), 1u);
+    EXPECT_EQ(late.descriptorFor(1), nullptr);
+    EXPECT_NE(late.descriptorFor(2), nullptr);
+
+    // a non-lease spec guards nothing
+    TopicWriteSpec nolease;
+    EXPECT_TRUE(nolease.installVersion(1, bad));
+    TopicWriteSpecWire plainFacts;
+    plainFacts.topicId = 9;
+    EXPECT_EQ(nolease.setFacts(plainFacts), 0u);
+    EXPECT_NE(nolease.descriptorFor(1), nullptr);
+}

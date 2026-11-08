@@ -148,11 +148,14 @@ void VerdictSource::addVerdictView(ViewInstance* inst, rune::view::VerdictViewKi
     m.objectId = viewObjectId;
     m.fingerprint = planFingerprint;
     m.prospect.reserve(inst->layout, inst->agg ? &inst->agg->layout : nullptr);
-    if (kind == rune::view::VerdictViewKind::KeyIndex) {
+    if (kind == rune::view::VerdictViewKind::KeyIndex || kind == rune::view::VerdictViewKind::LeaseIndex) {
+        const bool lease = kind == rune::view::VerdictViewKind::LeaseIndex;
         const uint16_t keyField = inst->plan.keyFieldId[0];
         const auto it = std::find_if(inst->evolvingSrc.fields.begin(), inst->evolvingSrc.fields.end(), [&](const auto& f) { return f.id == keyField; });
         const uint32_t width = it == inst->evolvingSrc.fields.end() ? 0 : rune::codec::fieldWidth(*it);
-        if (width == 0 || width > rune::codec::kMaxTopicKeyBytes) throw std::invalid_argument("key index: the source key field must be fixed-width, 1 to 16 bytes");
+        if (width == 0 || width > (lease ? rune::codec::kMaxLeaseKeyBytes : rune::codec::kMaxTopicKeyBytes))
+            throw std::invalid_argument(lease ? "lease index: the source key field must be fixed-width, 1 to 128 bytes"
+                                              : "key index: the source key field must be fixed-width, 1 to 16 bytes");
         m.keyWidth = static_cast<uint8_t>(width);
     }
     auto at = std::lower_bound(members_.begin(), members_.end(), viewObjectId, [](const Member& x, uint64_t id) { return x.objectId < id; });

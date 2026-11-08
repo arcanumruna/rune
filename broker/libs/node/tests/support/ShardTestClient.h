@@ -586,6 +586,7 @@ public:
     struct SchemaAnswer {
         int32_t topicId = -1; uint16_t version = 0; uint16_t errorCode = 0; int32_t partitionCount = 0;
         std::vector<uint8_t> blob;
+        std::optional<rune::protocol::LeaseSpec> lease;   // lease topics: the TopicSchemaResponse's lease block (client >= 18)
         bool operator==(const SchemaAnswer&) const = default;
     };
     /// `rid` (Task 11): {0,0} = a fresh requestId; set = this DDL's id (a retry re-sends the SAME id).
@@ -603,6 +604,23 @@ public:
         std::vector<uint8_t> buf(m.encodedSize());
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    /// A lease topic define (client >= 18): the lease block rides after the key features; compacted, keep every live lease.
+    int64_t sendDefineLeaseTopic(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,
+                                 uint32_t partitions, const std::vector<uint8_t>& descriptor,
+                                 const rune::protocol::LeaseSpec& lease, rune::protocol::RequestId rid = {}) {
+        pc::DefineTopic m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.partitionCount = partitions;
+        m.keyField = "id"; m.validate = true; m.persistence = 0;
+        m.descriptorBlob = descriptor.data(); m.descriptorLen = static_cast<uint32_t>(descriptor.size());
+        m.hasExt = true; m.ext.clientName = "shard-test-client"; m.ext.requestId = ridOr_(rid);
+        m.config = boundedTestTopicConfig();
+        m.config.cleanupPolicy = 1; m.config.retentionMs = -1; m.config.retentionBytes = -1;
+        m.hasKeyFeatures = true;
+        m.hasLease = true; m.lease = lease;
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return len != 0 && send(ch, stream, buf.data(), len) ? m.correlationId : 0;
     }
     int64_t sendCreateView(const std::string& ch, int32_t stream, int64_t sid, std::string_view viewName,
                            std::string_view keyField, uint8_t persistence, const std::vector<uint8_t>& plan,
@@ -1061,7 +1079,8 @@ private:
                 if (auto r = pc::TopicSchemaResponse::decode(p, n))
                     schemas_[r->correlationId] = SchemaAnswer{
                         r->topicId, r->version, r->errorCode, r->partitionCount,
-                        std::vector<uint8_t>(r->descriptorBlob, r->descriptorBlob + r->descriptorLen)};
+                        std::vector<uint8_t>(r->descriptorBlob, r->descriptorBlob + r->descriptorLen),
+                        r->hasLease ? std::optional<rune::protocol::LeaseSpec>(r->lease) : std::nullopt};
                 break;
             case pc::TemplateId::MetadataResponse:
                 if (auto r = pc::MetadataResponse::decode(p, n)) {

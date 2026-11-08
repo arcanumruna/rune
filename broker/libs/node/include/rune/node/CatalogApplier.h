@@ -84,6 +84,9 @@ struct SinkSpec {
     uint32_t                     nsId       = 0;   // the namespace that owns the view (and so its sink)
     /// The source topic's key features: the sink routes a key like its source (partitioner).
     rune::protocol::TopicKeyFeatures sourceKeyFeatures{};
+    /// A lease topic's lease view (`<topic>.leases`): a catalog-only sink with NO plan - never viewInstalled, and the
+    /// gateway is never told to await a plan for it.
+    bool leaseView = false;
 };
 
 /// The admin-thread effect sink.  Production = ring encoders (AdminWorkerAgent);
@@ -100,6 +103,9 @@ struct CatalogEffects {
     std::function<void(uint32_t nsId)>                                   namespaceErased;
     std::function<void(int32_t topicId, uint32_t nsId, const std::string& name)> topicDropped;   // DropTopic, retired sink
     std::function<void(int32_t topicId, std::span<const rune::catalog::ConfigChange>)> topicConfig;
+    // A lease topic's lease.* keys (7..12) changed: the topic AFTER the event, so the workers' write spec follows.
+    // Fires after topicConfig.
+    std::function<void(const rune::catalog::TopicObject&)>               writeSpecChanged;
     // Validators fan-out of versions fromVersion..current: live passes the current version (earlier ones were
     // posted by earlier events), boot passes 1 (workers start empty).
     std::function<void(const rune::catalog::TopicObject&, uint16_t fromVersion)> schemaChanged;

@@ -315,6 +315,7 @@ public:
         uint16_t code = 0; int32_t topicId = -1; uint16_t version = 0; int32_t partitionCount = 0;
         std::vector<uint8_t> blob;
         rune::protocol::TopicKeyFeatures keyFeatures{};
+        std::optional<rune::protocol::LeaseSpec> lease;
     };
     SchemaAnswer getSchema(const std::string& name, uint64_t fingerprint = 0, uint32_t nsId = 0) {
         const int64_t corr = ++corr_;
@@ -565,8 +566,9 @@ private:
         deps.nsDefaults.limits = nsDefaults_;
         deps.respondGet = [this](int64_t, int64_t corr, int32_t topicId, uint16_t version, int32_t partitions,
                                  const std::vector<uint8_t>& blob, uint16_t code,
-                                 const rune::protocol::TopicKeyFeatures& keyFeatures) {
-            gets_[corr] = SchemaAnswer{code, topicId, version, partitions, blob, keyFeatures};
+                                 const rune::protocol::TopicKeyFeatures& keyFeatures,
+                                 const std::optional<rune::protocol::LeaseSpec>& lease) {
+            gets_[corr] = SchemaAnswer{code, topicId, version, partitions, blob, keyFeatures, lease};
         };
         // Task 23: the catalog read egress (counts only — zero-alloc, so the idle-reader gate
         // measures the admin pass, never the rig).

@@ -62,6 +62,7 @@
 #include <rune/node/IdleShape.h>
 #include <rune/node/PersistenceMode.h>
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/LeaseSpec.h>
 #include <rune/protocol/NamespaceLimits.h>
 #include <rune/node/PemFile.h>   // Task 9: loadPemFile() — re-exported here for config callers
 
@@ -162,6 +163,9 @@ struct TopicSpec {
     /// A view sink carries its source's partitioner.
     rune::protocol::Partitioner partitioner   = rune::protocol::Partitioner::Fnv1a;
     bool                        autoIncrement = false;
+
+    /// Lease topics: the topic's lease spec (set by the catalog sink effect, live and boot).  Nothing reads it yet.
+    std::optional<rune::protocol::LeaseSpec> lease;
 };
 
 struct PeerConfig {

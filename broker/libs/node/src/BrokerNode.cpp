@@ -4100,7 +4100,8 @@ TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m);   // defined wi
 // would have built).
 TopicSpec bootSpecOfFrame(uint32_t nsId, int32_t topicId, const std::string& name, int32_t partitions, int16_t rf,
                           rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c,
-                          const rune::protocol::TopicKeyFeatures& kf) {
+                          const rune::protocol::TopicKeyFeatures& kf,
+                          const std::optional<rune::protocol::LeaseSpec>& lease = std::nullopt) {
     CatalogTopicAppliedMsg m;
     m.nsId              = nsId;
     m.topicId           = topicId;
@@ -4110,6 +4111,7 @@ TopicSpec bootSpecOfFrame(uint32_t nsId, int32_t topicId, const std::string& nam
     m.persistence       = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
     m.config            = c;
     m.keyFeatures       = kf;
+    m.lease             = lease;
     return topicSpecFromCatalog(m);
 }
 
@@ -4151,7 +4153,7 @@ void BrokerNode::bootFromCatalog_() {
     sink.topicApplied = [&catalogTopics, this](const cat::TopicObject& t) {
         bootObjects_.onTopic(t.nsId, t.topicId, t.name);
         catalogTopics.push_back(bootSpecOfFrame(t.nsId, t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence,
-                                                t.config, t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{}));
+                                                t.config, t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{}, t.lease));
     };
     sink.sinkApplied = [&catalogTopics, this](const SinkSpec& sp) {   // a view's sink: a keyed, compacted table, every broker
         bootObjects_.onView(sp.nsId, sp.topicId, sp.name);
@@ -4516,12 +4518,13 @@ void BrokerNode::buildAdminWorker() {
         deps.respondGet = [this](int64_t session, int64_t corr, int32_t topicId,
                                  uint16_t version, int32_t partitionCount,
                                  const std::vector<uint8_t>& blob,
-                                 uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures) {
+                                 uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures,
+                                 const std::optional<rune::protocol::LeaseSpec>& lease) {
             if (!adminWorkerAgent_) return;
             // Fix round 3: the encode / post / MessageTooLarge logic lives in
             // AdminWorkerAgent::postTopicSchemaResponse (directly testable).
             adminWorkerAgent_->postTopicSchemaResponse(session, corr, topicId, version, partitionCount,
-                                                       blob, errorCode, keyFeatures);
+                                                       blob, errorCode, keyFeatures, lease);
         };
         deps.respondCreateView = [this](int64_t session, int64_t corr, int32_t viewTopicId,
                                         uint64_t outputFingerprint, uint16_t errorCode) {
@@ -5217,7 +5220,10 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             // cleaner's policy ring.  Every handler is idempotent (see BrokerNode.h).
             if (tid == kA2cCatalogTopicApplied) { onCatalogTopicApplied_(p, n); return; }
             if (tid == kA2cCatalogSinkApplied) {   // Task 12 (N5): a view sink — gated until its plan is on every worker
-                if (gateway_ && n >= 4) {
+                // A lease view sink has no plan: nothing to await (and it is never viewInstalled).
+                CatalogTopicAppliedMsg probe;
+                const bool leaseView = decodeCatalogTopicApplied(p, n, probe) && probe.leaseView;
+                if (gateway_ && n >= 4 && !leaseView) {
                     int32_t viewTopicId;
                     std::memcpy(&viewTopicId, p, 4);
                     gateway_->noteViewSinkAwaitingPlan(viewTopicId);
@@ -5891,6 +5897,7 @@ TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m) {
     s.partitionKey           = c.partitionKey;
     s.partitioner            = m.keyFeatures.partitioner;
     s.autoIncrement          = m.keyFeatures.autoIncrement;
+    s.lease                  = m.lease;
     return s;
 }
 } // namespace

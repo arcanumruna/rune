@@ -1830,5 +1830,55 @@ TEST(ClientGatewayEgressRegression, ViewDdlCodesAreDowngradedForAnOldClientRegre
     EXPECT_EQ(cap.last<pc::CreateViewResponse>()->errorCode, code);
 }
 
+// A TopicSchemaResponse carries the lease block only to a v18+ session; an older one gets the frame a v17 broker sent.
+TEST(ClientGatewayEgressRegression, TopicSchemaLeaseVersionGateRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t oldSid = gw.injectReliableTestSessionForTest(0, pc::kClientVersionLeases - 1);
+    const int64_t newSid = gw.injectReliableTestSessionForTest(0, pc::kClientVersionLeases);
+    const std::vector<uint8_t> blob{1, 2, 3, 4, 5};
+    rune::protocol::LeaseSpec spec;
+    spec.ttlMs = 4321;
+
+    const auto send = [&](int64_t sid, bool withKeyFeatures) {
+        pc::TopicSchemaResponse r;
+        r.sessionId = sid; r.correlationId = 7; r.topicId = 3; r.version = 2; r.partitionCount = 4;
+        r.descriptorBlob = blob.data(); r.descriptorLen = static_cast<uint32_t>(blob.size());
+        r.hasKeyFeatures = true;
+        if (withKeyFeatures) r.keyFeatures.keyIndex = true;
+        r.hasLease = true; r.lease = spec;
+        std::vector<uint8_t> f(r.encodedSize());
+        f.resize(r.encode(f.data()));
+        ASSERT_FALSE(f.empty());
+        ASSERT_TRUE(gw.sendControlFrame(sid, f.data(), f.size()));
+    };
+
+    send(oldSid, /*withKeyFeatures=*/false);
+    auto o = cap.last<pc::TopicSchemaResponse>();
+    ASSERT_TRUE(o.has_value());
+    EXPECT_FALSE(o->hasLease);
+    EXPECT_FALSE(o->hasKeyFeatures) << "default features: the v17 frame has no key block";
+    EXPECT_EQ(o->topicId, 3);
+    EXPECT_EQ(o->version, 2);
+    EXPECT_EQ(o->partitionCount, 4);
+    ASSERT_EQ(o->descriptorLen, blob.size());
+    EXPECT_EQ(std::vector<uint8_t>(o->descriptorBlob, o->descriptorBlob + o->descriptorLen), blob);
+
+    send(oldSid, /*withKeyFeatures=*/true);
+    o = cap.last<pc::TopicSchemaResponse>();
+    ASSERT_TRUE(o.has_value());
+    EXPECT_FALSE(o->hasLease);
+    ASSERT_TRUE(o->hasKeyFeatures) << "non-default features keep the key block";
+    EXPECT_TRUE(o->keyFeatures.keyIndex);
+
+    send(newSid, /*withKeyFeatures=*/false);
+    const auto n = cap.last<pc::TopicSchemaResponse>();
+    ASSERT_TRUE(n.has_value());
+    ASSERT_TRUE(n->hasLease);
+    EXPECT_EQ(n->lease, spec);
+    EXPECT_TRUE(n->hasKeyFeatures);
+}
+
 } // namespace
 } // namespace rune::gateway

@@ -51,7 +51,7 @@ std::vector<uint8_t> materializedDescriptorOf(const cat::TopicObject& t, uint16_
 
 std::optional<std::string> topicEffectFramesError(const cat::TopicObject& t, std::size_t maxFrame,
                                                   uint16_t fromVersion) {
-    if (auto e = tooLarge("the TopicApplied effect", t.name, catalogTopicAppliedWireLen(t.name, t.config), maxFrame))
+    if (auto e = tooLarge("the TopicApplied effect", t.name, catalogTopicAppliedWireLen(t.name, t.config, t.lease.has_value()), maxFrame))
         return e;
     if (t.schema) {
         try {
@@ -62,7 +62,8 @@ std::optional<std::string> topicEffectFramesError(const cat::TopicObject& t, std
         } catch (const std::exception& ex) {
             return "the schema of '" + t.name + "' does not materialize: " + ex.what();
         }
-        if (auto e = tooLarge("the WriteSpec effect", t.name, kTopicWriteSpecAutoIncWireLen, maxFrame)) return e;
+        if (auto e = tooLarge("the WriteSpec effect", t.name,
+                              std::max(kTopicWriteSpecAutoIncWireLen, kTopicWriteSpecLeaseWireLen), maxFrame)) return e;
     }
     // Phase 2c: every typed topic also posts its FilterSchema (the EVOLVING descriptor: retired fields stay, so it can
     // outgrow the materialized one) - validate or not.  Unsized, a frame the ring cannot take is refused on every broker
@@ -72,6 +73,16 @@ std::optional<std::string> topicEffectFramesError(const cat::TopicObject& t, std
             return e;
     }
     return std::nullopt;
+}
+
+std::optional<std::string> leaseViewEffectFramesError(const cat::ViewObject& v, const cat::CatalogState& state,
+                                                      std::size_t maxFrame) {
+    // The lease view is a plan-less sink: only its TopicApplied frame (sized like a plan view's sink) is posted.
+    rune::protocol::TopicConfig c;
+    c.cleanupPolicy = 1;
+    if (const cat::TopicObject* t = state.topicByObjectId(v.leaseTopicObjectId); t && t->schema)
+        c.partitionKey = t->schema->keyField;
+    return tooLarge("the lease view sink's TopicApplied effect", v.name, catalogTopicAppliedWireLen(v.name, c), maxFrame);
 }
 
 std::optional<std::string> viewEffectFramesError(const cat::ViewObject& v, const cat::CatalogState& state,
@@ -99,7 +110,7 @@ std::optional<std::string> eventEffectFramesError(const cat::CatalogState& after
     case cat::EventKind::CreateSchema:
     case cat::EventKind::AlterSchema:
     case cat::EventKind::SetCompatibility:
-    case cat::EventKind::AlterTopicConfig:   // its frame is fixed-size (keys 1..6, plus the lease keys 7..12; the cleaner filters to 1..6, Task 3); the topic's frames are checked
+    case cat::EventKind::AlterTopicConfig:   // its frame is fixed-size (keys 1..6, plus the lease keys 7..12; the agent's topicConfig filters to 1..6); the topic's frames are checked
         if (const cat::TopicObject* t = after.topicByObjectId(e.objectId)) return topicEffectFramesError(*t, maxFrame, t->schema ? t->schema->schemaVersion : uint16_t{1});
         return std::nullopt;
     case cat::EventKind::DropTopic:
@@ -111,7 +122,9 @@ std::optional<std::string> eventEffectFramesError(const cat::CatalogState& after
             if (auto err = tooLarge("the TopicDropped effect", e.objectName,
                                     catalogTopicDroppedWireLen(e.objectName), maxFrame))
                 return err;
-        if (const cat::ViewObject* v = after.viewByObjectId(e.objectId)) return viewEffectFramesError(*v, after, maxFrame);
+        if (const cat::ViewObject* v = after.viewByObjectId(e.objectId))
+            return v->kind == cat::ViewKind::LeaseIndex ? leaseViewEffectFramesError(*v, after, maxFrame)
+                                                         : viewEffectFramesError(*v, after, maxFrame);
         return std::nullopt;
     }
     case cat::EventKind::NamespaceCreated:      // namespace kinds post no effect frame (Checkpoint A F2)

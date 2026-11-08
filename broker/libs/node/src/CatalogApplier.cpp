@@ -63,6 +63,25 @@ SinkSpec sinkSpecOf(const cat::ViewObject& v, const cat::CatalogState& state) {
     return s;
 }
 
+/// The lease view's sink: a catalog-only table beside its lease topic, with the topic's partitions and persistence.
+SinkSpec leaseSinkSpecOf(const cat::ViewObject& v, const cat::CatalogState& state) {
+    SinkSpec s;
+    s.topicId   = v.def.viewTopicId;
+    s.name      = v.name;
+    s.nsId      = v.nsId;
+    s.leaseView = true;
+    if (const cat::TopicObject* t = state.topicByObjectId(v.leaseTopicObjectId)) {
+        s.partitions  = t->partitions;
+        s.persistence = t->persistence;
+        if (t->schema) s.keyField = t->schema->keyField;
+    }
+    return s;
+}
+
+bool isLeaseKeyChange(const cat::ConfigChange& c) noexcept {
+    return static_cast<uint8_t>(c.key) > static_cast<uint8_t>(rune::protocol::kLastConfigKeyV3);
+}
+
 cat::ApplyError decodeFailure(int64_t offset, cat::DecodeError e) {
     cat::ApplyError err;
     err.offset = offset;
@@ -84,6 +103,7 @@ cat::ApplyError localFailure(int64_t offset, cat::ApplyError::Code code, std::st
 
 std::vector<int32_t> droppedTopicIds(const cat::CatalogState& s) {
     std::vector<int32_t> out;
+    // A live lease view's id is a view (kept); a dropped lease topic's view id is neither a topic nor a view (listed).
     for (int32_t id = 0; id < s.nextTopicId(); ++id)
         if (s.topicByTopicId(id) == nullptr && s.viewByViewTopicId(id) == nullptr) out.push_back(id);
     return out;
@@ -201,6 +221,11 @@ void CatalogApplier::postBootStash(const CatalogEffects& sink) const {
             if (t->schema && sink.schemaChanged) sink.schemaChanged(*t, 1);   // boot: every version
         }
         for (const cat::ViewObject* v : state_.views()) {
+            if (v->kind == cat::ViewKind::LeaseIndex) {   // a plan-less sink: sinkApplied only
+                if (maxFrame != 0 && leaseViewEffectFramesError(*v, state_, maxFrame)) continue;
+                if (sink.sinkApplied) sink.sinkApplied(leaseSinkSpecOf(*v, state_));
+                continue;
+            }
             if (maxFrame != 0 && viewEffectFramesError(*v, state_, maxFrame)) continue;
             if (sink.sinkApplied) sink.sinkApplied(sinkSpecOf(*v, state_));
             if (sink.viewInstalled) sink.viewInstalled(*v);
@@ -236,6 +261,12 @@ void CatalogApplier::emitFinalState_() {
         if (t->schema && sink->schemaChanged) sink->schemaChanged(*t, 1);
     }
     for (const cat::ViewObject* v : state_.views()) {
+        if (v->kind == cat::ViewKind::LeaseIndex) {   // a plan-less sink: sinkApplied only
+            if (maxFrame != 0)
+                if (auto err = leaseViewEffectFramesError(*v, state_, maxFrame)) { refuse(std::move(*err)); continue; }
+            if (sink->sinkApplied) sink->sinkApplied(leaseSinkSpecOf(*v, state_));
+            continue;
+        }
         if (maxFrame != 0)
             if (auto err = viewEffectFramesError(*v, state_, maxFrame)) { refuse(std::move(*err)); continue; }
         if (sink->sinkApplied) sink->sinkApplied(sinkSpecOf(*v, state_));
@@ -532,9 +563,15 @@ void CatalogApplier::effects_(const CatalogEffects& sink, const cat::CatalogEven
         if (const cat::TopicObject* t = state_.topicByObjectId(e.objectId)) {
             if (sink.topicApplied) sink.topicApplied(*t);
             if (t->schema && sink.schemaChanged) sink.schemaChanged(*t, t->schema->schemaVersion);   // a typed topic's validator follows it
+            if (a.leaseViewTopicId >= 0)   // a lease topic: its lease view is a plan-less sink (no viewInstalled)
+                if (const cat::ViewObject* lv = state_.viewByViewTopicId(a.leaseViewTopicId); lv && sink.sinkApplied)
+                    sink.sinkApplied(leaseSinkSpecOf(*lv, state_));
         }
         return;
     case cat::EventKind::DropTopic:
+        // The lease view first (it dies with its topic), under the codec's `<topic>.leases` name.
+        if (a.leaseViewTopicId >= 0 && sink.topicDropped)
+            sink.topicDropped(a.leaseViewTopicId, e.nsId, e.objectName + ".leases");
         if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.nsId, e.objectName);
         return;
     case cat::EventKind::AlterTopicConfig: {
@@ -542,6 +579,9 @@ void CatalogApplier::effects_(const CatalogEffects& sink, const cat::CatalogEven
         const auto* ops = std::get_if<cat::AlterTopicConfigOps>(&e.ops);
         if (t && ops && sink.topicConfig)
             sink.topicConfig(t->topicId, std::span<const cat::ConfigChange>(ops->changes.data(), ops->changes.size()));
+        if (t && t->lease && ops && sink.writeSpecChanged &&
+            std::any_of(ops->changes.begin(), ops->changes.end(), isLeaseKeyChange))
+            sink.writeSpecChanged(*t);
         return;
     }
     case cat::EventKind::CreateSchema:
