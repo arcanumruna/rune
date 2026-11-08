@@ -2609,6 +2609,57 @@ TEST(CheckedWritesTxnJudgeRegression, ReplayReadFailureIsCountedOnTheMemberRegre
     r.vs.removeCandidate(9, 0x5eed);
 }
 
+// Task 8 review 2, m-f: an active member whose replay meets an undecided T at J drops T's span (D3) and gets T from
+// finalizeLocked_, as every active member does; an abort leaves nothing of T.
+TEST(CheckedWritesTxnJudgeRegression, ActiveMemberDropsAnUndecidedTxnAtJAndGetsItAtFinalizeRegression) {
+    for (const bool commit : {false, true}) {
+        JudgeRig r(true);
+        r.start();
+        r.log.data({{50}}, 77);   // 10: T
+        r.log.data({{51}}, 77);   // 11: T
+        r.log.judge(77, 10);      // 12: J
+        r.log.data({{60}});       // 13
+        for (int i = 0; i < 4; ++i) r.drive();
+        ASSERT_EQ(r.vs.judgeCursor(), 14) << commit;
+        r.reject->foldCursor = 10;   // behind the judge: its replay covers T and J
+        r.drive();
+        EXPECT_EQ(r.reject->foldCursor, 14) << commit << ": the replay passes J";
+        EXPECT_EQ(r.reject->spanFence.count, 0) << commit << ": T's span is dropped at J";
+        EXPECT_TRUE(r.reject->table.get(50) == nullptr && r.reject->table.get(51) == nullptr) << commit;
+        r.log.marker(77, commit);    // 14
+        for (int i = 0; i < 4; ++i) r.drive();
+        EXPECT_EQ(r.st.txn.find(77)->phase, TxnPhase::Finalized) << commit;
+        EXPECT_EQ(r.reject->table.get(50) != nullptr, commit) << commit;
+        EXPECT_EQ(r.reject->table.get(51) != nullptr, commit) << commit;
+        EXPECT_TRUE(r.reject->table.get(60) != nullptr) << commit;
+        EXPECT_EQ(r.reject->spanFence.count, 0) << commit;
+    }
+}
+
+// Task 8 review 2, m-f: a member behind the judge replays an ordinary T's batches below the judge's cursor, which opens T's span in
+// its fence; endOrdinary_ closes it.  Left open it would veto the member's checkpoints for good (its cursor passes the marker).
+TEST(CheckedWritesTxnJudgeRegression, OrdinaryApplicationClosesAReplayedSpanRegression) {
+    JudgeRig r(false);
+    r.start();
+    r.log.data({{3}, {4}}, 77);   // 10-11
+    r.log.data({{5}}, 88);        // 12, open
+    r.log.marker(77, true);       // 13
+    r.drive();
+    ASSERT_EQ(r.vs.judgeCursor(), 12);
+    r.index->foldCursor = 10;
+    r.drive();
+    ASSERT_EQ(r.index->foldCursor, 12);
+    ASSERT_EQ(r.index->spanFence.count, 1) << "the replay holds 77's batches in the fence";
+    r.log.marker(88, true);       // 14
+    for (int i = 0; i < 4; ++i) r.drive();
+    EXPECT_TRUE(r.indexed(3));
+    EXPECT_TRUE(r.indexed(4));
+    EXPECT_TRUE(r.indexed(5));
+    EXPECT_EQ(r.index->foldCursor, 15);
+    EXPECT_EQ(r.index->spanFence.count, 0);
+    EXPECT_FALSE(r.index->spanFence.straddles(r.index->foldCursor));
+}
+
 // REGRESSION (Task 8 review 1, m1): a checkpoint push the span fence vetoes leaves nothing durable, so the run-ahead cap (P11-8 (a))
 // still counts from the member's last real push.  A persisted candidate waiting at J inside T has every push vetoed; recording
 // them as pushes let the judge run a further cap past a checkpoint that was never written.

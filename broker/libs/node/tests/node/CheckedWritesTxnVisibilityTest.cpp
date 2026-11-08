@@ -302,6 +302,37 @@ TEST(CheckedWritesTxnVisibilityRegression, LongSpanChargeComesBackDownAfterItsPu
     EXPECT_EQ(inst->memCharged, tables(*inst)) << "the charge comes back down with the push";
 }
 
+// Task 8 review 2, m-f: a part run the delta ring cannot take whole stops where the ring filled and resumes there on a later pass
+// (pendingSent); the agent reassembles one delta, made durable past the marker.
+TEST(CheckedWritesTxnVisibilityRegression, PartRunResumesWhereTheRingFilledRegression) {
+    constexpr int64_t kCap = 2000;
+    Txv t(kCap);
+    t.r.dropView(kView);
+    t.r.installProjection(kView + 1, "pproj", /*persisted=*/true);
+    ASSERT_EQ(t.r.produceBatch(VerdictRig::batch(recs(1, 50))), 0);
+    t.r.settle();
+    const ViewInstance* inst = t.r.vs->instanceForTest(kView + 1, 0);
+    ASSERT_NE(inst, nullptr);
+    t.txn(31, recs(10, 10));
+    for (uint64_t from = 100; from < 100 + 20 * kCap; from += 500) ASSERT_EQ(t.r.produceBatch(VerdictRig::batch(recs(from, from + 499))), 0);
+    const int64_t m = t.r.leo();
+    t.marker(31, true);
+    t.r.pauseAgent = true;   // nothing drains the ring
+    for (int i = 0; i < 100 && inst->pendingSent == 0; ++i) t.r.pass();
+    ASSERT_GT(inst->pendingSent, 0u) << "a part run stopped on a full ring";
+    const std::size_t sent = inst->pendingSent;
+    t.r.pass();
+    EXPECT_EQ(inst->pendingSent, sent) << "the full ring holds the run where it stands";
+    EXPECT_TRUE(inst->pendingValid);
+    t.r.pauseAgent = false;
+    t.r.settle();
+    EXPECT_EQ(inst->pendingSent, 0u);
+    EXPECT_FALSE(inst->pendingValid);
+    EXPECT_GT(t.r.agent->lastDurableOffset(kView + 1, 0), m) << "the resumed run is one durable delta";
+    EXPECT_TRUE(t.r.idRow(kView + 1, 10).has_value());
+    EXPECT_TRUE(t.r.idRow(kView + 1, 100 + 20 * kCap - 1).has_value());
+}
+
 // REGRESSION (Task 8 review 1, D-A): past 64 spans open at once (67 transactions, then their markers) the excess apply at their own
 // offsets; the instance warns once, not per batch.
 TEST(CheckedWritesTxnVisibilityRegression, FullSpanTableWarnsOnceRegression) {

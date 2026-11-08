@@ -305,6 +305,16 @@ TEST(CheckedWritesViewSetRegression, FixedSeedHookReachesEveryTableRegression) {
     ASSERT_TRUE(inst->owners.has_value());
     EXPECT_EQ(inst->table.hashSeedForTest(), 7u);
     EXPECT_EQ(inst->owners->hashSeedForTest(), 7u);
+    // Task 8 review 2, m-f (m3): the worker's supersede key set hashes with the seed too.
+    rune::view::SupersedeKeys seeded, unseeded;
+    seeded.seed(7);
+    int moved = 0;
+    for (int k = 0; k < 16; ++k) {
+        const std::string key = "key-" + std::to_string(k);
+        EXPECT_EQ(r.vs.txnOverlaysForTest().supersedeKeys.homeForTest(key), seeded.homeForTest(key)) << key;
+        moved += seeded.homeForTest(key) != unseeded.homeForTest(key) ? 1 : 0;
+    }
+    EXPECT_GE(moved, 12) << "seed 7 places keys elsewhere than seed 0";
 
     KeyedRig plain;
     EXPECT_EQ(plain.vs.hashSeedForTest(), 0u);
