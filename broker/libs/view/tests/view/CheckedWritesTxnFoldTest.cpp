@@ -191,7 +191,8 @@ struct Folder {
     rune::view::VersionDescriptorCache vdc{src};
     std::unique_ptr<rune::view::ViewTable> view, contributors, groups;
     TxnSpanFence fence;
-    rune::view::SupersedeKeys keys;
+    rune::view::SupersedeKeys ownKeys;
+    rune::view::SupersedeKeys* keys = &ownKeys;   // a test may hand two folders one set, as a worker's instances share it
     int64_t cursor = 0;
 
     explicit Folder(bool aggregateView, bool fenced = true) : aggregate(aggregateView), withFence(fenced) {
@@ -221,7 +222,7 @@ struct Folder {
         const rune::storage::LogReadView lv = log.read(cursor, passBound);
         if (lv.empty()) return {};
         auto rd = [&log](int64_t f, int64_t t) { return log.read(f, t); };
-        rune::view::TxnFold tf{fence, keys, rune::view::spanReaderOf(rd), cap};
+        rune::view::TxnFold tf{fence, *keys, rune::view::spanReaderOf(rd), cap};
         rune::view::TxnFold* txn = withFence ? &tf : nullptr;
         if (aggregate)
             return rune::view::foldAggregateBatch(comp.plan, comp.rowLayout, *agg, vdc, *view, *contributors, *groups, lv, passBound, cursor, skip, txn);
@@ -494,8 +495,8 @@ TEST(CheckedWritesTxnVisibilityRegression, EmptyReadBackMidSpanNeverClosesTheSpa
     Folder once(false);
     for (int i = 0; i < 20 && once.fence.applyingThrough < 0; ++i) once.pass(log, log.end, 2);
     ASSERT_EQ(once.fence.applyingThrough, 1);
-    log.emptyAt = 2;   // the next pass notes from 2, then its apply read from 2 answers empty once
-    log.emptySkip = 1;
+    log.emptyAt = 2;   // the next pass's apply read from 2 (its notes are kept from the last pass) answers empty once
+    log.emptySkip = 0;
     for (int i = 0; i < 20 && once.cursor <= m; ++i) once.pass(log, log.end, 2);
     EXPECT_EQ(log.emptyAt, -1) << "the fault fired";
     EXPECT_EQ(once.present({1, 2, 3, 4, 5, 6}), 6);
@@ -517,6 +518,66 @@ TEST(CheckedWritesTxnVisibilityRegression, EmptyReadBackMidSpanNeverClosesTheSpa
     for (int i = 0; i < 20 && p.cursor <= m; ++i) p.pass(log, log.end, 2);
     EXPECT_EQ(p.present({1, 2, 3, 4, 5, 6}), 6);
     EXPECT_FALSE(p.fence.fenced());
+}
+
+// A span with more bytes below its marker than one pass may read: the note read stops at the budget and resumes where it stopped,
+// unfenced and with nothing of T visible until the notes are complete; it never re-reads the span from its start.
+namespace {
+int64_t plainTraffic(TxnLog& log, std::size_t bytes) {
+    int64_t n = 0;
+    while (log.bytes.size() < bytes) {
+        std::vector<Rec> b;
+        for (int i = 0; i < 1000; ++i, ++n) b.push_back({100 + n % 1000, n % 7, n});
+        log.data(b);
+    }
+    return n;
+}
+}
+
+TEST(CheckedWritesTxnVisibilityRegression, NoteReadPastThePassBudgetResumesRegression) {
+    TxnLog log;
+    log.data({{1, 1, 10}, {2, 1, 20}}, 7);
+    plainTraffic(log, 3 * rune::view::kTxnReadBackBytesPerPass);
+    log.data({{2, 1, 21}});   // supersedes T's key 2: the decision needs the notes to reach the marker
+    const int64_t m = log.marker(7, true);
+    Folder p(false);
+    while (p.cursor < m) p.pass(log, log.end, 0);
+    ASSERT_EQ(p.cursor, m);
+    p.pass(log, log.end, 0);
+    EXPECT_EQ(p.cursor, m) << "the notes are not complete after one budget";
+    EXPECT_FALSE(p.fence.fenced()) << "nothing of T is applied yet: reads are served";
+    EXPECT_EQ(p.present({1}), 0);
+    int passes = 1;
+    for (; passes < 10 && p.cursor <= m; ++passes) p.pass(log, log.end, 0);
+    EXPECT_LE(passes, 8) << "about 3 MiB of notes and 3 MiB of apply read at 1 MiB a pass";
+    EXPECT_EQ(p.slot(1, 1), 10);
+    EXPECT_EQ(p.slot(2, 1), 21);
+}
+
+// Two instances of a worker share its key set.  While one notes, the other's marker waits; a holder that is not driven for a whole
+// call of the waiter loses the set, and notes again from where it stood when it is driven again.  Both end as if alone.
+TEST(CheckedWritesTxnVisibilityRegression, SharedKeySetWaitsForItsHolderThenTakesAnIdleOneRegression) {
+    TxnLog log;
+    log.data({{1, 1, 10}, {2, 1, 20}}, 7);
+    plainTraffic(log, 2 * rune::view::kTxnReadBackBytesPerPass);
+    log.data({{2, 1, 21}});
+    const int64_t m = log.marker(7, true);
+    Folder alone(false), a(false), b(false);
+    b.keys = &a.ownKeys;
+    while (alone.cursor <= m) alone.pass(log, log.end, 0);
+    while (a.cursor < m) a.pass(log, log.end, 0);
+    while (b.cursor < m) b.pass(log, log.end, 0);
+    a.pass(log, log.end, 0);   // a holds the set, its notes half read
+    EXPECT_EQ(b.pass(log, log.end, 0).txnNoteWaits, 1u);
+    a.pass(log, log.end, 0);
+    EXPECT_EQ(b.pass(log, log.end, 0).txnNoteWaits, 1u) << "a used the set since b's last look";
+    EXPECT_EQ(b.pass(log, log.end, 0).txnNoteWaits, 0u) << "a was not driven: b takes the set";
+    for (int i = 0; i < 20 && (a.cursor <= m || b.cursor <= m); ++i) {
+        b.pass(log, log.end, 0);
+        a.pass(log, log.end, 0);
+    }
+    EXPECT_TRUE(a.sameRows(alone, 1100));
+    EXPECT_TRUE(b.sameRows(alone, 1100));
 }
 
 // A transaction with more keys than one segment notes applies in segments, each superseded by the writes above it; with a pass cap

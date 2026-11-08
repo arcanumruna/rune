@@ -25,6 +25,9 @@ struct TxnSpanFence {
     int64_t applyingThrough = -1;
     // An atomic batch the pass cap cut ends here: its records at or below the cursor are applied, the rest are not yet.
     int64_t atomicThrough = -1;
+    // The worker's supersede key set: the token this fence holds it by (0 = none), and the holder's use count a wait last saw.
+    uint64_t noteToken   = 0;
+    uint64_t seenTouches = UINT64_MAX;
 
     /// False when every slot is taken.
     [[nodiscard]] bool add(int64_t pid, int64_t first) noexcept {
@@ -59,6 +62,8 @@ struct TxnSpanFence {
         for (uint8_t i = 0; i < count; ++i) open[i] = TxnSpan{};
         count = 0;
         applyingThrough = atomicThrough = -1;
+        noteToken = 0;
+        seenTouches = UINT64_MAX;
     }
 };
 

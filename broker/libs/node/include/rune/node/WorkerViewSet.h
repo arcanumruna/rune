@@ -933,7 +933,8 @@ private:
         chargeMem_(inst);   // Task 12: the pass may have appended chunks
         work += static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted +
                                  st.skippedMalformed + st.skippedNoGroup + st.skippedNoKey + st.keyConflicts) +
-                (inst.spanFence.fenced() && st.txnReadFailed == 0 ? 1 : 0);   // an application in progress keeps the worker hot; a failed read does not
+                ((inst.spanFence.fenced() && st.txnReadFailed == 0) || st.txnNoteWaits != 0 ? 1 : 0);   // an application in progress, or one
+                                                                                                         // waiting for the key set, keeps the worker hot
         inst.counters.skippedAborted   += st.skippedAborted;
         inst.counters.skippedMalformed += st.skippedMalformed;
         inst.counters.skippedNoGroup   += st.skippedNoGroup;

@@ -151,51 +151,75 @@ inline rune::storage::LogReadView readSpan(const TxnFold& txn, int64_t at, int64
     return v;
 }
 
-// The supersede notes of the segment of `pid`'s span from `from` (P11-3a): T's keys up to the first that does not fit, each with
-// last_T over the rest of the span, and per key the last offset below the marker of another writer's record applied before it - plain and not rejected, or of a transaction not open in the
-// fence at its offset (it closed below the marker; an aborted one is skipped by the partition's aborted index, which every fold path
-// is handed).  Returns the segment's end, -1 when a read failed.
-inline int64_t noteSupersede(TxnFold& txn, int64_t pid, int64_t from, int64_t marker, const FoldSkip& skip) {
+enum class NoteEnd : uint8_t { Ready, Paused, Failed };
+
+// The supersede notes of the segment of `pid`'s span from `at` (P11-3a), in the worker's key set: T's keys up to the first that does
+// not fit, each with last_T over the rest of the span, and per key the last offset below the marker of another writer's record
+// applied before it - plain and not rejected, or of a transaction not open in the fence at its offset (it closed below the marker; an
+// aborted one is skipped by the partition's aborted index, which every fold path is handed).
+//
+// The note read reaches the marker, so it shares the call's byte budget and resumes where it stopped (SupersedeKeys' progress).  One
+// fence holds the set at a time: another waits (Paused) while the holder keeps using it, and takes it once a whole call of its own
+// saw no use (the holder is not driven: stalled, demoted, dropped).  A taken set is noted again from the holder's resume point.
+inline NoteEnd noteSegment(TxnFold& txn, int64_t pid, int64_t at, int64_t marker, const FoldSkip& skip, std::size_t& bytes, FoldStats& stats) {
     namespace b = rune::protocol::batch;
-    txn.keys.clear();
-    int64_t segEnd = marker;
-    for (int64_t at = from; at < marker;) {
-        const rune::storage::LogReadView v = readSpan(txn, at, marker, marker);
-        if (v.empty()) return -1;
-        const int64_t start = at;
-        for (std::size_t pos = 0; pos < v.len;) {
+    SupersedeKeys& k = txn.keys;
+    TxnSpanFence& fence = txn.fence;
+    const bool mine = fence.noteToken != 0 && k.owner == fence.noteToken;
+    if (mine && k.pid == pid && k.marker == marker && at >= k.from && (!k.noted || at < k.segEnd)) {
+        ++k.touches;
+    } else {
+        if (!mine && k.owner != 0 && fence.seenTouches != k.touches) {
+            fence.seenTouches = k.touches;
+            ++stats.txnNoteWaits;
+            return NoteEnd::Paused;
+        }
+        fence.noteToken = k.claim(pid, marker, at);
+        fence.seenTouches = SupersedeKeys::kNoTouches;
+    }
+    while (!k.noted) {
+        if (bytes >= kTxnReadBackBytesPerPass) return NoteEnd::Paused;
+        const rune::storage::LogReadView v = readSpan(txn, k.readTo, marker, marker);
+        if (v.empty()) return NoteEnd::Failed;
+        const int64_t start = k.readTo;
+        for (std::size_t pos = 0; pos < v.len && !k.noted;) {
             rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
-            if (!r.ensureValid()) return -1;
-            if (r.baseOffset() >= marker) return segEnd;
-            pos += static_cast<std::size_t>(r.totalLength());
+            if (!r.ensureValid()) return NoteEnd::Failed;
+            if (r.baseOffset() >= marker) {
+                k.noted = true;
+                break;
+            }
+            const auto len = static_cast<std::size_t>(r.totalLength());
+            pos += len;
             const int16_t attrs = r.attributes();
             const int64_t last  = r.baseOffset() + r.lastOffsetDelta();
-            if (last < at) continue;
-            at = last + 1;
-            if ((attrs & b::kAttrControl) != 0) continue;
-            if ((attrs & b::kAttrTransactional) != 0 && r.producerId() == pid) {
+            if (last < k.readTo) continue;
+            k.readTo = last + 1;
+            k.noted = k.readTo >= marker;
+            bytes += len;
+            if ((attrs & b::kAttrControl) != 0) {
+            } else if ((attrs & b::kAttrTransactional) != 0 && r.producerId() == pid) {
                 r.forEachRecord([&](std::string_view key, std::string_view, int64_t offset, int64_t) {
-                    if (offset >= from && !txn.keys.noteT(key, offset, segEnd == marker)) segEnd = offset;
+                    if (offset >= k.from && !k.noteT(key, offset, k.segEnd == marker)) k.segEnd = offset;
                 });
-                continue;
+            } else if (!isAbortedBatch(skip, r, attrs)) {
+                const TxnSpan* open = (attrs & b::kAttrTransactional) != 0 ? fence.find(r.producerId()) : nullptr;
+                if (open == nullptr || open->first > r.baseOffset())   // an open one applies at its own marker, above this one
+                    r.forEachRecord([&](std::string_view key, std::string_view, int64_t offset, int64_t) {
+                        if (offset >= k.from && offset < marker && !isRejectedRecord(skip, offset)) k.noteOther(key, offset);
+                    });
             }
-            if (isAbortedBatch(skip, r, attrs)) continue;
-            if ((attrs & b::kAttrTransactional) != 0) {
-                const TxnSpan* open = txn.fence.find(r.producerId());
-                if (open != nullptr && open->first <= r.baseOffset()) continue;   // applied at its own marker, above this one
-            }
-            r.forEachRecord([&](std::string_view key, std::string_view, int64_t offset, int64_t) {
-                if (offset >= from && offset < marker && !isRejectedRecord(skip, offset)) txn.keys.noteOther(key, offset);
-            });
+            if (!k.noted && bytes >= kTxnReadBackBytesPerPass) return NoteEnd::Paused;
         }
-        if (at == start) return -1;
+        if (!k.noted && k.readTo == start) return NoteEnd::Failed;
     }
-    return segEnd;
+    return NoteEnd::Ready;
 }
 
 // Applies the span of `pid` (open in the fence) at its marker: its batches in [first, marker), resuming above applyingThrough, a
 // segment of noted keys at a time, a record another writer superseded skipped.  At most `left` records and kTxnReadBackBytesPerPass
-// bytes; false when either ran out first (applyingThrough says where it stopped).
+// bytes, notes included; false when either ran out first, the key set is another span's, or a read failed (applyingThrough says
+// where it stopped once a record is applied).
 template <class OnRecord>
 bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const FoldSkip& skip, FoldStats& stats, OnRecord& onRecord,
                int64_t& applied) {
@@ -206,14 +230,24 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
     const int64_t spanFirst = fence.find(pid)->first;
     // A failed read stops the application where it stands: the span stays open, applied records stay fenced, and the next call
     // retries.  It never closes the span, which would let a checkpoint pass records never applied.
-    const auto failed = [&] {
+    const auto paused = [&] {
         if (at > spanFirst) fence.applyingThrough = at - 1;
-        ++stats.txnReadFailed;
         return false;
     };
+    const auto failed = [&] {
+        ++stats.txnReadFailed;
+        return paused();
+    };
+    const auto done = [&] {
+        txn.keys.release();
+        fence.noteToken = 0;
+        return true;
+    };
     while (at < marker) {
-        const int64_t segEnd = noteSupersede(txn, pid, at, marker, skip);
-        if (segEnd < 0) return failed();
+        const NoteEnd n = noteSegment(txn, pid, at, marker, skip, bytes, stats);
+        if (n == NoteEnd::Failed) return failed();
+        if (n == NoteEnd::Paused) return paused();
+        const int64_t segEnd = txn.keys.segEnd;
         while (at < segEnd) {
             const rune::storage::LogReadView v = readSpan(txn, at, segEnd, marker);
             if (v.empty()) return failed();
@@ -221,7 +255,7 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
             for (std::size_t pos = 0; pos < v.len && at < segEnd;) {
                 rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
                 if (!r.ensureValid()) return failed();
-                if (r.baseOffset() >= marker) return true;
+                if (r.baseOffset() >= marker) return done();
                 const auto len = static_cast<std::size_t>(r.totalLength());
                 const int64_t last = r.baseOffset() + r.lastOffsetDelta();
                 pos += len;
@@ -267,7 +301,7 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
         }
         at = std::max(at, segEnd);
     }
-    return true;
+    return done();
 }
 
 } // namespace detail
