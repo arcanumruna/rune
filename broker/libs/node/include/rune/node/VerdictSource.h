@@ -1136,7 +1136,7 @@ bool VerdictSource::finalizeLocked_(ReadRangeFn& readRange, const rune::view::Ab
         txnPool_->release(t->overlay);
         t->overlay = -1;
         t->phase = TxnPhase::Finalized;
-        closeSpan_(t->producerId);
+        closeSpan_(t->producerId);   // the step's postcondition: T was applied to every active member (no span is open here today)
         finalizePid_ = finalizeApplied_ = -1;
         any = true;
         if (checkpointCap_ != INT64_MAX && t->records >= checkpointCap_) {   // a delta holds at most one transaction past the cap
