@@ -307,6 +307,12 @@ static bool waitFor(Pred&& pred,
     return pred();
 }
 
+// Wait (bounded) for the node's cleaner to complete `cycles` more cycles.
+static bool awaitCleanerCycles(rune::node::BrokerNode& node, uint64_t cycles) {
+    const uint64_t c0 = node.cleanerCyclesForTest();
+    return waitFor([&] { return node.cleanerCyclesForTest() >= c0 + cycles; }, 10s);
+}
+
 // ===========================================================================
 // TEST 1: CompactHappyPath_LatestPerKey
 //
@@ -403,7 +409,7 @@ TEST(CompactionRetentionSmoke, CompactHappyPath_LatestPerKey) {
     // No test-thread replica calls needed (TSan-clean: duty thread owns replica).
 
     // Wait for the cleaner to run (it runs on its own thread).
-    std::this_thread::sleep_for(3000ms);
+    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -465,7 +471,7 @@ TEST(CompactionRetentionSmoke, TombstoneLifecycle_KIP534) {
 
     constexpr int64_t kRoll = 128;
     // Short delete-retention: the stamped horizon expires between Phase A and Phase C (see below).
-    constexpr int64_t kTombRetentionMs = 3'000LL;
+    constexpr int64_t kTombRetentionMs = 150LL;
 
     // Topics exist only through DDL: boot once to create the topic in the catalog (the same properties in every
     // phase).  segment.bytes is immutable in the catalog, so Phase C keeps kRoll (it ran with 64 MiB when the
@@ -733,7 +739,7 @@ TEST(CompactionRetentionSmoke, DeleteRetention_TimeAndSize) {
     // No test-thread replica calls (duty-thread-only invariant).
 
     // Wait for retention to run.
-    std::this_thread::sleep_for(2000ms);
+    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -1020,7 +1026,7 @@ TEST(CompactionRetentionSmoke, IdempotentDedup_SurvivesRetention) {
     // HW advanced by becomeLeader() on duty-cycle thread.
     // No test-thread replica calls (duty-thread-only invariant).
 
-    std::this_thread::sleep_for(2000ms);
+    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -1112,7 +1118,7 @@ TEST(CompactionRetentionSmoke, RestartResume_Checkpoint) {
         };
         ASSERT_TRUE(rune::node::test::hasReplica(node));
 
-        std::this_thread::sleep_for(1500ms);
+        ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
 
         waitFor([&] { return lastClean() > 0; }, 2s);
         watermarkAfterFirst = lastClean();
@@ -1143,7 +1149,7 @@ TEST(CompactionRetentionSmoke, RestartResume_Checkpoint) {
         };
         ASSERT_TRUE(rune::node::test::hasReplica(node2));
 
-        std::this_thread::sleep_for(1500ms);
+        ASSERT_TRUE(awaitCleanerCycles(node2, 3)) << "the cleaner never completed 3 cycles";
 
         waitFor([&] { return lastClean2() >= watermarkAfterFirst; }, 2s);
 
@@ -1220,7 +1226,7 @@ TEST(CompactionRetentionSmoke, HwLeo_NonPerturbation) {
     // HW advanced to LEO by becomeLeader() on the duty-cycle thread.
     // No test-thread replica calls (duty-thread-only invariant).
 
-    std::this_thread::sleep_for(2500ms);
+    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -1315,7 +1321,7 @@ TEST(CompactionRetentionSmoke, AppendDuringCompaction_Correctness) {
         // No test-thread replica calls (duty-thread-only invariant).
 
         // Give cleaner 1.5 s to work.
-        std::this_thread::sleep_for(1500ms);
+        ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
         node.stop();
     }
 
@@ -1349,7 +1355,7 @@ TEST(CompactionRetentionSmoke, AppendDuringCompaction_Correctness) {
         // HW advanced by becomeLeader() on duty-cycle thread.
         // No test-thread replica calls (duty-thread-only invariant).
 
-        std::this_thread::sleep_for(2000ms);
+        ASSERT_TRUE(awaitCleanerCycles(node2, 3)) << "the cleaner never completed 3 cycles";
 
         using sclock = std::chrono::steady_clock;
         const auto t0 = sclock::now();
@@ -1437,7 +1443,7 @@ TEST(CompactionRetentionSmoke, Failover_HwBounded_NoResurrection) {
     // No test-thread replica calls (duty-thread-only invariant).
 
     // Let the cleaner compact some records (as leader).
-    std::this_thread::sleep_for(2000ms);
+    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
