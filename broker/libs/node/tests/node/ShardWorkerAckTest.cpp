@@ -96,11 +96,12 @@ struct Fixture {
     /// it (data replicated or recovered before this leader's state was built);
     /// `rollBytes`: segment roll (small = retention can delete segments);
     /// `session5Version`: session 5's ConnectRequest.clientVersion, carried by
-    /// its WorkerOp::SessionAnnounce.
+    /// its WorkerOp::SessionAnnounce.  `driverLivenessNs`: the driver's client liveness (0 = Aeron's 10 s); 1 s also
+    /// drops its timer to 100 ms, so a closed image goes within that instead of the default second.
     explicit Fixture(std::vector<rune::replication::NodeId> replicas, int minIsr,
                      const std::function<void(rune::storage::Log&)>& preload = {},
                      int64_t rollBytes = 64LL * 1024 * 1024, int32_t session5Version = 0,
-                     std::size_t ringBytes = 1 << 16) {
+                     std::size_t ringBytes = 1 << 16, int64_t driverLivenessNs = 0) {
         // `ringBytes` (D8d): the op / return ring sizes (production: 32 MiB each).
         worker = std::make_unique<Worker>(0, ringBytes, ringBytes, 64, 64);
         static std::atomic<int> seq{0};
@@ -115,7 +116,7 @@ struct Fixture {
         c.fetchIntervalNs = 1'000'000'000; c.isrCheckIntervalNs = 1'000'000'000'000LL;
         c.replicaLagMaxMs = 600'000; c.pushOnAppend = false;
         replica = std::make_unique<PartitionReplica>(c, Role::Leader, 1, replicas, replicas, log.get(), &t);
-        EmbeddedDriverConfig dc; dc.dir = adir.string(); dc.termBufferBytes = 64 * 1024;
+        EmbeddedDriverConfig dc; dc.dir = adir.string(); dc.termBufferBytes = 64 * 1024; dc.clientLivenessTimeoutNs = driverLivenessNs;
         drv = std::make_unique<EmbeddedDriver>(dc, DriverMode::Invoker);
         aeron::Context ctx; ctx.aeronDir(adir.string()); ctx.useConductorAgentInvoker(true);
         client = aeron::Aeron::connect(ctx);
@@ -1239,7 +1240,7 @@ TEST(ShardWorkerAckRegression, MalformedFramesAndPurgedParkedDirectAcksReturnThe
 // handled on the first poll after that, can reveal A's lost image - handleWorkerBind_ requests the rescan on Bound.
 // The invoker driver + client conductor are pumped by the test only, so the swap is atomic w.r.t. the drain.
 TEST(ShardWorkerAckRegression, RebindAfterMaskedImageLossUnbindsTheDeadImageRegression) {
-    Fixture f({1}, 1);
+    Fixture f({1}, 1, {}, 64LL * 1024 * 1024, 0, 1 << 16, /*driverLivenessNs=*/1'000'000'000);
     f.worker->setResponseControl("127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort()));
     const std::array<uint8_t, 16> tokA = [] { std::array<uint8_t, 16> t{}; t.fill(0xA1); return t; }();
     const std::array<uint8_t, 16> tokB = [] { std::array<uint8_t, 16> t{}; t.fill(0xB2); return t; }();
