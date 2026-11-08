@@ -169,9 +169,16 @@ private:
         bool    dirtySinceSync  = false;
         StreamState stream;              // StreamRefused after a FATAL write error / an unrepairable file (see hasError())
         int     channelIdx      = 0;    // Task 19: which channel this (view,part) arrived on
+        // P11-9: a multi-frame delta being written: the file offset it began at (-1 = none), its bytes so far and its O
+        off_t    runStart       = -1;
+        uint32_t runAt          = 0;
+        int64_t  runO           = -1;
     };
 
     void handleDeltaFrame_(const uint8_t* p, std::size_t len, int channelIdx);
+    void handleDeltaPartFrame_(const uint8_t* p, std::size_t len, int channelIdx);
+    // A run cut short (its worker went away, or a part out of order): the file is cut back to where the run began.
+    bool dropRun_(FileState& fs);
     // Worker -> IO: move the live (or legacy) checkpoint file into backup/ and ack.  The ack is posted only after every
     // durable step (link, unlink, fsync(backupDir), fsync(viewDir)) is done; ENOENT is OK (idempotent replay after a crash).
     void handleDiscardFrame_(const uint8_t* p, std::size_t len, int channelIdx);

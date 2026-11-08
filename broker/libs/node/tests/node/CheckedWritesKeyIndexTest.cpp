@@ -345,6 +345,19 @@ TEST(CheckedWritesKeyIndex, ActivationPendingUntilTheFirstDrive) {
     EXPECT_FALSE(r.vs.activationPending());
 }
 
+// REGRESSION (Task 8 review 1, m4): retention moving an empty instance to the log start clears its span fence.  Every open span
+// started below the old cursor, so a kept span would fence reads on records that no longer exist and never meet their marker.
+TEST(CheckedWritesTxnVisibilityRegression, StartAtLogStartClearsTheFenceRegression) {
+    ViewInstance inst(keyIndexPlan(5, 0), keyIndexRowLayout(), tagSource(), false, 0, 4096, kKeyIndexChunkBytes);
+    inst.foldCursor = 10;
+    ASSERT_TRUE(inst.spanFence.add(31, 4));
+    inst.spanFence.applyingThrough = 7;
+    ASSERT_TRUE(startAtLogStart(inst, 50));
+    EXPECT_FALSE(inst.spanFence.fenced());
+    EXPECT_EQ(inst.spanFence.count, 0);
+    EXPECT_EQ(inst.foldCursor, 50);
+}
+
 TEST(CheckedWritesKeyIndex, AMemberWithoutAFixedKeyOfOneToSixteenBytesIsRefused) {
     const auto build = [](rune::codec::Descriptor src, uint16_t keyField) {
         ViewInstance inst(keyIndexPlan(5, keyField), keyIndexRowLayout(), std::move(src), false, 0, 4096, kKeyIndexChunkBytes);

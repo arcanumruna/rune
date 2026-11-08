@@ -216,6 +216,23 @@ TEST(CheckedWritesTransientViewRegression, AbortedRangeInTheNewRingNeverDiscards
     EXPECT_EQ(rig.hp(1), 6);
 }
 
+// Part 11 Task 8 (D6): a transient source keeps offset order.  Its ring may have evicted a span's first batch and its read ignores
+// the end, so an undecided transaction's records fold at their own offsets, and the view's reads are never fenced.
+TEST(CheckedWritesTransientView, TransactionFoldsAtItsOwnOffsetsNeverFenced) {
+    ViewSetRig rig("txnorder");
+    rig.install(Kind::Replace);
+    rig.appendTransactional(7, Rec{50, 1, 5});
+    const std::array<Rec, 1> plain{Rec{51, 1, 6}};
+    rig.append(plain);
+    for (int i = 0; i < 8; ++i) {
+        (void)rig.pass(1, /*maxRecordsPerRead=*/1);
+        EXPECT_FALSE(rig.views().readFenced(viewId(Kind::Replace), 0)) << "pass " << i;
+    }
+    EXPECT_EQ(rig.hp(50), 5) << "the transaction's record folds at its own offset, no marker needed";
+    EXPECT_EQ(rig.hp(51), 6);
+    EXPECT_EQ(rig.counters(Kind::Replace).txnSpanTableFull, 0u);
+}
+
 TEST(CheckedWritesTransientViewRegression, FullRestartLosesOnlyTheUncheckpointedTailRegression) {
     ViewSetRig rig("tail");
     rig.install(Kind::Replace);

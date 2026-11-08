@@ -667,6 +667,7 @@ Until this part ships, the §11.2 refusals apply.
 - **View reads** of a provisional row return its before-image until the commit marker. Then the transaction's rows change in one worker step, so no read sees part of it (level 3a).
 - **Consumers** on a verdict source stay bounded as in §8.6. They never pass a deferred transaction's records until its marker, which is what `read_committed` gives today. On these partitions, `read_uncommitted` behaves the same way.
 - **Partitions that aren't verdict sources** get level 3a too. The fold never ends a step between a committed transaction's first record and its commit marker, so a committed transaction becomes visible in one step.
+- **Exceptions.** A view over a transient source keeps offset order and has no level 3a. A view with more than 64 transactions open across one stretch of its log applies the excess in offset order, without level 3a, counted in `txnSpanTableFull` and warned once per view instance.
 
 **G.6 Atomic batches** (`p.batch(...)`) on a verdict source are judged as a unit at their own offset, all records passing or none. They reuse the before-images: the fold applies the batch's records one by one within one worker step, and puts the before-images back if any record fails. No vote is needed, because a batch lives on one partition and in one append. The `View` ack carries a single verdict for the whole batch.
 

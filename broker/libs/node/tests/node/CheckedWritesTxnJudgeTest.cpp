@@ -239,6 +239,20 @@ TEST(CheckedWritesTxnState, DrainNeverAnswersWithAnUnjudgedDefaultRegression) {
     EXPECT_NE(got, nullptr);
 }
 
+// REGRESSION (Task 8 review 3, m-1): a rescan's reset drops an entry's hold below an applied ordinary span.  A Finalized, unjudged
+// entry kept it and held K at the old span's first record, not its own, until finalizeDecided ran past its marker.
+TEST(CheckedWritesTxnState, TruncateDropsTheHoldBelowASpanRegression) {
+    auto t = reserved();
+    ASSERT_NE(t.onJudgeRecord(500, {77, 3, 400}), nullptr);
+    t.holdBelowSpan(300, 450);   // an ordinary span [300, 450] applied around 400
+    ASSERT_EQ(t.earliestUndecidedFirst(), 300);
+    t.onMarker(77, 520, true);
+    t.find(77)->phase = TxnPhase::Finalized;
+    t.truncateFrom(510);   // the marker is cut: judged anew
+    ASSERT_EQ(t.find(77)->phase, TxnPhase::AwaitJudge);
+    EXPECT_EQ(t.earliestUndecidedFirst(), 400) << "K is held at T's own first record";
+}
+
 // Task 7: a vote bound to an older J is never answered from the producer's next transaction; a scanning vote is the worker's.
 TEST(CheckedWritesTxnState, VoteBoundToAReplacedJudgeIsAnsweredWithNoneRegression) {
     auto t = reserved();
@@ -581,7 +595,8 @@ struct JudgeRig {
         drive();
         ASSERT_EQ(vs.judgeCursor(), 10);
     }
-    // A read of exactly [failFrom, failTo) comes back empty failReads times; oneBatch reads return one batch each.
+    // A read of exactly [failFrom, failTo) (any end when failTo is INT64_MAX) comes back empty failReads times; oneBatch reads return
+    // one batch each.
     int64_t failFrom = -1, failTo = -1;
     int     failReads = 0;
     bool    oneBatch = false;
@@ -589,11 +604,16 @@ struct JudgeRig {
     int     counted = 0;
     int64_t countAt = -1;            // reads from exactly it are counted in countedAt
     int     countedAt = 0;
+    int64_t countTo = -1;            // reads up to exactly it are counted in countedTo
+    int     countedTo = 0;
+    int64_t logStart = 0;            // a read from below it comes back empty, as the log's below its start
     int drive(int64_t hw = INT64_MAX, int64_t now = 0) {
         return vs.driveJudge([&](int64_t from, int64_t to) {
             counted += from >= countFrom;
             countedAt += from == countAt;
-            if (failReads > 0 && from == failFrom && to == failTo) {
+            countedTo += to == countTo;
+            if (from < logStart) return rune::storage::LogReadView{};
+            if (failReads > 0 && from == failFrom && (to == failTo || failTo == INT64_MAX)) {
                 --failReads;
                 return rune::storage::LogReadView{};
             }
@@ -1449,36 +1469,49 @@ TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnPastTheKeySetIsAppliedEqualToAP
 
 // Task 7 (T7 review 1, F1): an ordinary transaction spanning more other producers' markers than the set holds is applied too.  The
 // markers are noted in windows, and a batch whose decision lies past a window is looked up: a delete committed far into the span
-// supersedes, one aborted far into it does not, and one committed past T's marker applies after T.
+// supersedes, one aborted far into it does not, and one committed past T's marker applies after T.  Budgeted (T7 re-review 2 carry):
+// with one batch a walk per pass the marker refills resume too, and give the same answer.
 TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnPastTheMarkerListIsAppliedEqualToAPlainFoldRegression) {
-    JudgeRig r(false);
-    r.start();
-    r.log.data({{1}, {2}, {3}, {4}}, 77);   // 10..13, its first records
-    for (int64_t p = 0; p < 1100; ++p) {
-        if (p == 5) r.log.data({del(2)}, 5001);
-        if (p == 10) r.log.data({del(3)}, 5003);
-        if (p == 1050) r.log.data({del(1)}, 5000);
-        if (p == 1090) r.log.marker(5000, true);
-        if (p == 1095) r.log.marker(5001, false);
-        r.log.data({{30'000 + p}}, 1000 + p);
-        r.log.marker(1000 + p, true);
+    for (const bool budgeted : {false, true}) {
+        SCOPED_TRACE(budgeted ? "budgeted" : "one pass");
+        JudgeRig r(false);
+        r.start();
+        r.log.data({{1}, {2}, {3}, {4}}, 77);   // 10..13, its first records
+        for (int64_t p = 0; p < 1100; ++p) {
+            if (p == 5) r.log.data({del(2)}, 5001);
+            if (p == 10) r.log.data({del(3)}, 5003);
+            if (p == 1050) r.log.data({del(1)}, 5000);
+            if (p == 1090) r.log.marker(5000, true);
+            if (p == 1095) r.log.marker(5001, false);
+            r.log.data({{30'000 + p}}, 1000 + p);
+            r.log.marker(1000 + p, true);
+        }
+        r.log.data({del(4)});   // a plain delete, then T's last write of 4
+        r.log.data({{4}}, 77);
+        const int64_t marker = r.log.next;
+        r.log.marker(77, true);
+        r.log.marker(5003, true);
+        if (budgeted) {
+            r.oneBatch = true;
+            r.vs.setVoteScanBytesForTest(1);
+            r.countTo = marker;
+        }
+        for (int i = 0; i < (budgeted ? 40'000 : 40) && r.vs.judgeCursor() < r.log.next; ++i) {
+            r.countedTo = 0;
+            r.drive();
+            if (budgeted && r.vs.judgeCursor() <= marker) ASSERT_LE(r.countedTo, 2) << "drive " << i;
+        }
+        EXPECT_EQ(r.vs.judgeCursor(), r.log.next);
+        EXPECT_GT(r.vs.judgedThrough(), marker);
+        EXPECT_EQ(r.st.txn.stats.supersedeKeysOverflow, 0u) << "the keys fit";
+        EXPECT_EQ(r.st.rejected.nextRejectedAtOrAfter(0), INT64_MAX) << "nothing refused";
+        EXPECT_FALSE(r.indexed(1)) << "5000's delete committed below T's marker supersedes T's insert";
+        EXPECT_TRUE(r.indexed(2)) << "5001's delete aborted";
+        EXPECT_FALSE(r.indexed(3)) << "5003's delete commits after T";
+        EXPECT_TRUE(r.indexed(4)) << "T wrote 4 again after the plain delete";
+        EXPECT_TRUE(r.indexed(30'000));
+        EXPECT_TRUE(r.indexed(30'000 + 1099));
     }
-    r.log.data({del(4)});   // a plain delete, then T's last write of 4
-    r.log.data({{4}}, 77);
-    const int64_t marker = r.log.next;
-    r.log.marker(77, true);
-    r.log.marker(5003, true);
-    for (int i = 0; i < 40 && r.vs.judgeCursor() < r.log.next; ++i) r.drive();
-    EXPECT_EQ(r.vs.judgeCursor(), r.log.next);
-    EXPECT_GT(r.vs.judgedThrough(), marker);
-    EXPECT_EQ(r.st.txn.stats.supersedeKeysOverflow, 0u) << "the keys fit";
-    EXPECT_EQ(r.st.rejected.nextRejectedAtOrAfter(0), INT64_MAX) << "nothing refused";
-    EXPECT_FALSE(r.indexed(1)) << "5000's delete committed below T's marker supersedes T's insert";
-    EXPECT_TRUE(r.indexed(2)) << "5001's delete aborted";
-    EXPECT_FALSE(r.indexed(3)) << "5003's delete commits after T";
-    EXPECT_TRUE(r.indexed(4)) << "T wrote 4 again after the plain delete";
-    EXPECT_TRUE(r.indexed(30'000));
-    EXPECT_TRUE(r.indexed(30'000 + 1099));
 }
 
 // Task 7 (T6 re-review 2): on the judgement path the same overflow is a deterministic no: a marker list past its slots takes every
@@ -1615,9 +1648,50 @@ TEST(CheckedWritesTxnJudgeRegression, OrdinaryResolutionWalkIsBudgetedAndResumes
     EXPECT_EQ(r.vs.judgeCursor(), 13) << "O still waits for T0's marker";
     r.log.marker(66, true);                       // 34
     r.countFrom = INT64_MAX;
-    for (int i = 0; i < 8 && r.vs.judgeCursor() == 13; ++i) r.drive();
+    for (int i = 0; i < 16 && r.vs.judgeCursor() == 13; ++i) r.drive();   // one batch a walk a pass, the apply walk included
     EXPECT_GT(r.vs.judgeCursor(), 13);
     EXPECT_TRUE(r.indexed(4)) << "T0's insert supersedes O's delete";
+}
+
+// REGRESSION (T7 re-review 2 carry; Task 8 review 3, I-1): the intent, collect, supersede and apply walks of an ordinary transaction
+// resume and share one byte budget per pass.  A pass once read the span three times, unbudgeted, and the apply walk read the whole
+// segment, plain traffic included, in the pass that applied it.
+TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnSpanReadIsBudgetedPerPassRegression) {
+    const auto write = [](JudgeRig& r, int64_t pid) {
+        r.log.data({{1000}, {1001}, {1002}}, pid);   // 10..12
+        for (int64_t id = 2000; id < 2040; ++id) {
+            if (id == 2010) r.log.data({del(1001)});
+            if (id == 2020) r.log.data({del(1002)});
+            r.log.data({{id}});
+        }
+        r.log.data({{1002}}, pid);
+        if (pid >= 0) r.log.marker(pid, true);
+    };
+    JudgeRig plain(false);
+    plain.start();
+    write(plain, -1);
+    for (int i = 0; i < 4; ++i) plain.drive();
+    JudgeRig r(false);
+    r.start();
+    write(r, 77);
+    const int64_t marker = r.log.next - 1;
+    const int64_t span = marker - 10;   // one record per batch past T's first: span - 2 batches
+    r.oneBatch = true;
+    r.vs.setVoteScanBytesForTest(1);
+    r.countTo = marker;
+    int drives = 0;
+    for (; drives < 4 * span && r.vs.judgeCursor() < r.log.next; ++drives) {
+        r.countedTo = 0;
+        r.drive();
+        EXPECT_LE(r.countedTo, 2) << "drive " << drives << ": one batch a walk";
+    }
+    EXPECT_EQ(r.vs.judgeCursor(), r.log.next);
+    EXPECT_GT(drives, span) << "the collect and supersede walks resumed over passes";
+    EXPECT_EQ(r.st.rejected.nextRejectedAtOrAfter(0), INT64_MAX);
+    EXPECT_FALSE(r.indexed(1001)) << "the plain delete above T's last 1001 supersedes it";
+    EXPECT_TRUE(r.indexed(1002)) << "T's last 1002 is above the plain delete";
+    for (int64_t id = 0; id < 200; ++id) EXPECT_EQ(r.indexed(id), plain.indexed(id)) << id;
+    for (int64_t id = 1000; id < 2040; ++id) EXPECT_EQ(r.indexed(id), plain.indexed(id)) << id;
 }
 
 // T7 review 2, N1: the one-step set is the worker's, shared by its sources.  O's segment is parked on T0's marker; another source
@@ -1719,7 +1793,7 @@ TEST(CheckedWritesTxnJudgeRegression, DroppedHolderReleasesTheOneStepSetRegressi
         r.log.marker(55, true);                       // 13
         for (int64_t id = 30; id < 70; ++id) r.log.data({{id}});   // 14-53
         r.vs.setVoteScanBytesForTest(1);
-        for (int i = 0; i < 16 && r.vs.judgeCursor() < 13; ++i) r.drive();
+        for (int i = 0; i < 16 && !r.pool.oneStepHeld(); ++i) r.drive();   // the intent search and the collect take a batch a pass
         ASSERT_EQ(r.vs.judgeCursor(), 13) << "O waits for T0's marker";
         ASSERT_TRUE(r.pool.oneStepHeld());
         other.log.data({{50}, {51}}, 88);
@@ -2419,4 +2493,258 @@ TEST(CheckedWritesTxnJudgeRegression, AtomicBatchPastTheKnobIsRejectedWholeNever
     EXPECT_TRUE(r.indexed(6));
     EXPECT_TRUE(r.indexed(8));
     EXPECT_EQ(r.st.txn.stats.atomicTooLarge, 1u);
+}
+
+// REGRESSION (P11-0, D3, Task 8 step 6): a member joining at a set change A replays [0, A] unjudged.  A voted transaction T whose J
+// lies below A and whose marker is not yet in the log is past the LSO: the joiner holds T's records in its fence, and the switch
+// waits at A until T is decided; then the joiner applies T at J (or drops it), as the active members did.  Applying T at its own
+// offsets left an aborted transaction's rows in the joiner, and showed a committed one before its marker.
+TEST(CheckedWritesTxnJudgeRegression, SwitchSetJoinerNeverAppliesPastTheLsoRegression) {
+    for (const bool commit : {false, true}) {
+        JudgeRig r(true);
+        const ConstraintSet base = r.set;
+        rune::view::CompileResult joinComp;
+        TestRejectRule rule;
+        rule.mode = TestRejectRule::Mode::TagEquals;
+        rule.tag  = 77;
+        const auto joiner = r.tagMember(joinComp, 9, rule);
+        ConstraintSet later = r.set;
+        later.id = 2;
+        r.set = base;
+        r.start();
+        r.log.data({{50}, {51}}, 77);   // 10-11: T
+        r.log.data({{60}});             // 12
+        r.log.judge(77, 10);            // 13: J
+        r.st.constraintSets.onChange(14, later);
+        r.log.control();                // 14: the joiner enters
+        r.log.data({{61}});             // 15
+        for (int i = 0; i < 8; ++i) r.drive();
+        ASSERT_TRUE(r.st.txn.find(77) != nullptr && r.st.txn.find(77)->judged) << commit;
+        EXPECT_TRUE(joiner->table.get(50) == nullptr) << commit << ": T is undecided";
+        EXPECT_TRUE(joiner->table.get(51) == nullptr) << commit << ": T is undecided";
+        EXPECT_GT(r.st.txn.stats.joinerTxnWaits, 0u) << commit << ": the wait is counted (review 2 m-d)";
+        r.log.marker(77, commit);       // 16
+        for (int i = 0; i < 8; ++i) r.drive();
+        EXPECT_EQ(r.vs.judgeCursor(), 17) << commit;
+        EXPECT_EQ(joiner->table.get(50) != nullptr, commit) << commit;
+        EXPECT_EQ(joiner->table.get(51) != nullptr, commit) << commit;
+        EXPECT_TRUE(joiner->table.get(60) != nullptr) << commit;
+        EXPECT_TRUE(joiner->table.get(61) != nullptr) << commit;
+        EXPECT_EQ(r.indexed(50), commit) << commit;
+    }
+}
+
+// REGRESSION (T7 re-review 2, D3, Task 8 step 6): a replace candidate recovering K inside a voted transaction T (a run-ahead
+// checkpoint: firstOffset < K < J) while T is undecided holds T's records past K in its fence and waits at J; at the decision it
+// applies all of T from firstOffset (commit) or none of it (abort).  Before, it folded T's records past K at their own offsets
+// before the backfill waited, and an abort left them in the candidate.
+TEST(CheckedWritesTxnJudgeRegression, CandidateInsideAnUndecidedTxnWaitsAtItsJudgeRegression) {
+    for (const bool commit : {false, true}) {
+        JudgeRig r(true);
+        r.start();
+        r.log.data({{50}}, 77);   // 10: T
+        r.log.data({{51}}, 77);   // 11: T
+        r.log.data({{60}});       // 12
+        r.log.judge(77, 10);      // 13: J
+        r.log.data({{61}});       // 14
+        for (int i = 0; i < 8; ++i) r.drive();
+        ASSERT_TRUE(r.st.txn.find(77) != nullptr && r.st.txn.find(77)->judged) << commit;
+        ASSERT_EQ(r.vs.judgeCursor(), 15) << commit;
+        rune::view::CompileResult candComp;
+        const rune::codec::Descriptor* s[] = {&r.src};
+        candComp = rune::view::compileView(tagView(), s, 9).value();
+        ViewInstance cand(candComp.plan, candComp.rowLayout, r.src, false, 0, 8192, 1u << 16);
+        cand.foldCursor = 11;     // recovered inside T: the run-ahead checkpoint holds none of T's records
+        r.vs.addCandidate(&cand, VerdictViewKind::TestReject, 9, 0x5eed);
+        for (int i = 0; i < 8; ++i) r.drive();
+        EXPECT_TRUE(cand.table.get(51) == nullptr) << commit << ": T is undecided";
+        EXPECT_LE(cand.foldCursor, 13) << commit << ": the candidate waits at J";
+        EXPECT_EQ(r.st.txn.stats.joinerTxnWaits, 0u) << commit << ": a candidate's wait is not a joiner's";
+        r.log.marker(77, commit);  // 15
+        for (int i = 0; i < 8; ++i) r.drive();
+        EXPECT_EQ(cand.table.get(50) != nullptr, commit) << commit;
+        EXPECT_EQ(cand.table.get(51) != nullptr, commit) << commit;
+        EXPECT_TRUE(cand.table.get(60) != nullptr) << commit;
+        EXPECT_TRUE(cand.table.get(61) != nullptr) << commit;
+        EXPECT_EQ(r.st.txn.stats.checkpointBackfills, commit ? 1u : 0u) << commit;
+        r.vs.removeCandidate(9, 0x5eed);
+    }
+}
+
+// REGRESSION (Task 8 review 2, m-c): a backfill is counted once per transaction.  A candidate with a per-pass cap of 1 applies T at
+// J over several passes, and every re-visit of J counted another backfill.
+TEST(CheckedWritesTxnJudgeRegression, BackfillAppliedOverSeveralPassesCountsOnceRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.log.data({{50}}, 77);   // 10: T
+    r.log.data({{51}}, 77);   // 11: T
+    r.log.data({{52}}, 77);   // 12: T
+    r.log.data({{60}});       // 13
+    r.log.judge(77, 10);      // 14: J
+    r.log.marker(77, true);   // 15
+    for (int i = 0; i < 8; ++i) r.drive();
+    ASSERT_EQ(r.vs.judgeCursor(), 16);
+    const rune::codec::Descriptor* s[] = {&r.src};
+    const rune::view::CompileResult candComp = rune::view::compileView(tagView(), s, 9).value();
+    ViewInstance cand(candComp.plan, candComp.rowLayout, r.src, false, 0, 8192, 1u << 16);
+    cand.foldCursor = 11;      // recovered inside T
+    cand.maxRecordsPerPass = 1;
+    r.vs.addCandidate(&cand, VerdictViewKind::TestReject, 9, 0x5eed);
+    for (int i = 0; i < 16 && cand.foldCursor < 16; ++i) r.drive();
+    EXPECT_TRUE(cand.table.get(50) != nullptr && cand.table.get(51) != nullptr && cand.table.get(52) != nullptr);
+    EXPECT_EQ(r.st.txn.stats.checkpointBackfills, 1u);
+    r.vs.removeCandidate(9, 0x5eed);
+}
+
+// REGRESSION (Task 8 review 2, m-e): a member replay's fold stats reach the member's counters.  A failed read-back of a span at J
+// was counted by the worker's fold only; path B dropped it, and never warned.
+TEST(CheckedWritesTxnJudgeRegression, ReplayReadFailureIsCountedOnTheMemberRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.log.data({{50}}, 77);   // 10: T
+    r.log.data({{51}}, 77);   // 11: T
+    r.log.data({{60}});       // 12
+    r.log.judge(77, 10);      // 13: J
+    r.log.marker(77, true);   // 14
+    for (int i = 0; i < 8; ++i) r.drive();
+    ASSERT_EQ(r.vs.judgeCursor(), 15);
+    const rune::codec::Descriptor* s[] = {&r.src};
+    const rune::view::CompileResult candComp = rune::view::compileView(tagView(), s, 9).value();
+    ViewInstance cand(candComp.plan, candComp.rowLayout, r.src, false, 0, 8192, 1u << 16);
+    cand.foldCursor = 11;     // recovered inside T: J reads T back from 10
+    r.failFrom = 10;
+    r.failTo = INT64_MAX;
+    r.failReads = 2;          // the read and its retry to past J
+    r.vs.addCandidate(&cand, VerdictViewKind::TestReject, 9, 0x5eed);
+    r.drive();
+    EXPECT_EQ(cand.counters.txnReadFailed, 1u);
+    EXPECT_TRUE(cand.table.get(51) == nullptr);
+    for (int i = 0; i < 8 && cand.foldCursor < 15; ++i) r.drive();
+    EXPECT_TRUE(cand.table.get(50) != nullptr && cand.table.get(51) != nullptr) << "the next pass retries";
+    EXPECT_EQ(cand.counters.txnReadFailed, 1u);
+    r.vs.removeCandidate(9, 0x5eed);
+}
+
+// Task 8 review 2, m-f: an active member whose replay meets an undecided T at J drops T's span (D3) and gets T from
+// finalizeLocked_, as every active member does; an abort leaves nothing of T.
+TEST(CheckedWritesTxnJudgeRegression, ActiveMemberDropsAnUndecidedTxnAtJAndGetsItAtFinalizeRegression) {
+    for (const bool commit : {false, true}) {
+        JudgeRig r(true);
+        r.start();
+        r.log.data({{50}}, 77);   // 10: T
+        r.log.data({{51}}, 77);   // 11: T
+        r.log.judge(77, 10);      // 12: J
+        r.log.data({{60}});       // 13
+        for (int i = 0; i < 4; ++i) r.drive();
+        ASSERT_EQ(r.vs.judgeCursor(), 14) << commit;
+        r.reject->foldCursor = 10;   // behind the judge: its replay covers T and J
+        r.drive();
+        EXPECT_EQ(r.reject->foldCursor, 14) << commit << ": the replay passes J";
+        EXPECT_EQ(r.reject->spanFence.count, 0) << commit << ": T's span is dropped at J";
+        EXPECT_TRUE(r.reject->table.get(50) == nullptr && r.reject->table.get(51) == nullptr) << commit;
+        r.log.marker(77, commit);    // 14
+        for (int i = 0; i < 4; ++i) r.drive();
+        EXPECT_EQ(r.st.txn.find(77)->phase, TxnPhase::Finalized) << commit;
+        EXPECT_EQ(r.reject->table.get(50) != nullptr, commit) << commit;
+        EXPECT_EQ(r.reject->table.get(51) != nullptr, commit) << commit;
+        EXPECT_TRUE(r.reject->table.get(60) != nullptr) << commit;
+        EXPECT_EQ(r.reject->spanFence.count, 0) << commit;
+    }
+}
+
+// Task 8 review 2, m-f: a member behind the judge replays an ordinary T's batches below the judge's cursor, which opens T's span in
+// its fence; endOrdinary_ closes it.  Left open it would veto the member's checkpoints for good (its cursor passes the marker).
+TEST(CheckedWritesTxnJudgeRegression, OrdinaryApplicationClosesAReplayedSpanRegression) {
+    JudgeRig r(false);
+    r.start();
+    r.log.data({{3}, {4}}, 77);   // 10-11
+    r.log.data({{5}}, 88);        // 12, open
+    r.log.marker(77, true);       // 13
+    r.drive();
+    ASSERT_EQ(r.vs.judgeCursor(), 12);
+    r.index->foldCursor = 10;
+    r.drive();
+    ASSERT_EQ(r.index->foldCursor, 12);
+    ASSERT_EQ(r.index->spanFence.count, 1) << "the replay holds 77's batches in the fence";
+    r.log.marker(88, true);       // 14
+    for (int i = 0; i < 4; ++i) r.drive();
+    EXPECT_TRUE(r.indexed(3));
+    EXPECT_TRUE(r.indexed(4));
+    EXPECT_TRUE(r.indexed(5));
+    EXPECT_EQ(r.index->foldCursor, 15);
+    EXPECT_EQ(r.index->spanFence.count, 0);
+    EXPECT_FALSE(r.index->spanFence.straddles(r.index->foldCursor));
+}
+
+// REGRESSION (Task 8 review 4, N-1; review 2 I-B, member half): retention cut a committed T's first batch (T.first < log start <= J).
+// A member below the log start with rows is discarded once and refolds from the log start; at J its backfill starts at the log
+// start, so T's retained records apply and the member catches up.  The backfill from T.first read below the log start, failed, and
+// the open span straddling the log start discarded the member again at every J, for as long as J was retained.
+TEST(CheckedWritesTxnJudgeRegression, BackfillBelowTheLogStartRefoldsOnceRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.log.data({{50}}, 77);   // 10: T, cut by retention
+    r.log.data({{51}}, 77);   // 11: T
+    r.log.data({{60}});       // 12
+    r.log.judge(77, 10);      // 13: J
+    r.log.marker(77, true);   // 14
+    r.log.data({{61}});       // 15
+    for (int i = 0; i < 8; ++i) r.drive();
+    ASSERT_EQ(r.vs.judgeCursor(), 16);
+    int discards = 0;
+    r.vs.setViewHooks({&discards, nullptr, [](void* ctx, ViewInstance& inst, ViewDiscardReason why) {
+                           EXPECT_EQ(why, ViewDiscardReason::BelowLogStart);
+                           ++*static_cast<int*>(ctx);
+                           for (uint64_t id = 0; id < 200; ++id) (void)inst.table.erase(id);
+                           inst.spanFence.clear();
+                           inst.foldCursor = 0;
+                       }, nullptr});
+    const rune::codec::Descriptor* s[] = {&r.src};
+    const rune::view::CompileResult candComp = rune::view::compileView(tagView(), s, 9).value();
+    ViewInstance cand(candComp.plan, candComp.rowLayout, r.src, false, 0, 8192, 1u << 16);
+    (void)cand.table.put(uint64_t(5));   // folded from records retention has since removed
+    cand.foldCursor = 6;
+    r.logStart = 11;
+    r.vs.bindLeader(nullptr, 1, 11);
+    r.vs.addCandidate(&cand, VerdictViewKind::TestReject, 9, 0x5eed);
+    for (int i = 0; i < 16; ++i) r.drive();
+    EXPECT_EQ(discards, 1) << "one discard, no repeated refold";
+    EXPECT_EQ(cand.foldCursor, 16);
+    EXPECT_EQ(cand.spanFence.count, 0);
+    EXPECT_EQ(cand.counters.txnReadFailed, 0u);
+    EXPECT_TRUE(cand.table.get(50) == nullptr) << "below the log start: gone";
+    EXPECT_TRUE(cand.table.get(51) != nullptr) << "T's retained record applies at J";
+    EXPECT_TRUE(cand.table.get(60) != nullptr && cand.table.get(61) != nullptr);
+    r.vs.removeCandidate(9, 0x5eed);
+}
+
+// REGRESSION (Task 8 review 1, m1): a checkpoint push the span fence vetoes leaves nothing durable, so the run-ahead cap (P11-8 (a))
+// still counts from the member's last real push.  A persisted candidate waiting at J inside T has every push vetoed; recording
+// them as pushes let the judge run a further cap past a checkpoint that was never written.
+TEST(CheckedWritesTxnJudgeRegression, VetoedPushNeverMovesTheRunAheadCapRegression) {
+    JudgeRig r(true);
+    r.start();
+    VerdictViewHooks hooks;
+    hooks.checkpoint = [](void*, ViewInstance&) { return 0; };
+    r.vs.setViewHooks(hooks);
+    r.vs.bindLeader(nullptr, 2, 0);
+    r.drive();
+    r.log.data({{50}}, 77);                              // 10: T
+    for (int64_t id = 100; id < 120; ++id) r.log.data({{id}});   // 11..30
+    r.log.judge(77, 10);                                 // 31: J
+    r.log.data({{61}});                                  // 32
+    for (int i = 0; i < 8; ++i) r.drive();
+    ASSERT_TRUE(r.st.txn.find(77) != nullptr && r.st.txn.find(77)->judged);
+    ASSERT_EQ(r.vs.judgeCursor(), 33);
+    const rune::codec::Descriptor* s[] = {&r.src};
+    rune::view::CompileResult candComp = rune::view::compileView(tagView(), s, 9).value();
+    ViewInstance cand(candComp.plan, candComp.rowLayout, r.src, true, 0, 8192, 1u << 16);
+    cand.maxRecordsPerPass = 8;
+    r.vs.addCandidate(&cand, VerdictViewKind::TestReject, 9, 0x5eed);
+    for (int i = 0; i < 20; ++i) r.drive();
+    ASSERT_EQ(cand.foldCursor, 31) << "the candidate waits at J";
+    for (int64_t id = 200; id < 240; ++id) r.log.data({{id}});   // 33..72
+    for (int i = 0; i < 40; ++i) r.drive();
+    EXPECT_LT(r.vs.judgeCursor(), 31 + 8) << "the cap counts from the candidate's last real push, below T";
+    r.vs.removeCandidate(9, 0x5eed);
 }

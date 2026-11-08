@@ -213,6 +213,7 @@ struct TxnJudgeStats {
              ordinaryWaits = 0,         ///< an ordinary transaction the judge could not track (its table full): the judge waits
              supersedeKeysOverflow = 0, ///< an ordinary transaction with more keys than the one-step set holds: applied in segments, one per pass
              undecidedReplaceRefusals = 0, ///< a producer's next TxnJudge refused while its previous transaction has no marker
+             joinerTxnWaits = 0,        ///< a joiner's set switch waits at an undecided J (D3; bounded by the transaction timeout)
              atomicTooLarge = 0;        ///< an atomic batch past txnJudgedRecordsMax: every record rejected (62) until rule 10 (Task 12)
 };
 struct DeferredTxn {
@@ -227,6 +228,7 @@ struct DeferredTxn {
     bool        judged = false;   ///< `answer` is the judge's, not a default
     int32_t     overlay = -1;
     int64_t     voteReceivedNs = 0;
+    int64_t     holdFrom = INT64_MAX;   ///< below firstOffset: an applied ordinary span holds it (the coverage never splits that span)
 };
 /// `judgeOffset`: the J the vote waits for; -1 while the worker's vote-time scan runs (only the worker answers those).
 struct ParkedVote { int64_t token = 0; int32_t originNode = -1; int64_t producerId = -1; int16_t epoch = -1; int64_t judgeOffset = -1; int64_t receivedNs = 0; };
@@ -299,6 +301,7 @@ public:
             t.answer = {};
             t.judged = false;
             t.records = 0;
+            t.holdFrom = INT64_MAX;   // the old span's hold: the judge sets it again if it applies the span again
         }
     }
     /// The owner gives back every overlay an entry holds: before a leadership scan (truncateFrom) or a re-activation.
@@ -328,8 +331,13 @@ public:
     [[nodiscard]] int64_t earliestUndecidedFirst() const noexcept {
         int64_t first = INT64_MAX;
         for (const DeferredTxn& t : txns_)
-            if (t.phase != TxnPhase::Finalized && t.firstOffset < first) first = t.firstOffset;
+            if (t.phase != TxnPhase::Finalized) first = std::min({first, t.firstOffset, t.holdFrom});
         return first;
+    }
+    /// An ordinary transaction [first, marker] was applied: an undecided entry holding K inside (first, marker] holds it at `first`.
+    void holdBelowSpan(int64_t first, int64_t marker) noexcept {
+        for (DeferredTxn& t : txns_)
+            if (const int64_t at = std::min(t.firstOffset, t.holdFrom); t.phase != TxnPhase::Finalized && first < at && at <= marker) t.holdFrom = first;
     }
     /// onJudgeRecord would take a new record of the producer now: its entry (if any) holds no overlay and has its marker, and the
     /// table has room.  The worker appends a TxnJudge only then, so the judge never waits on a record the worker wrote.

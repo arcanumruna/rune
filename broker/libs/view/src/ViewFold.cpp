@@ -35,6 +35,7 @@
 
 #include <rune/codec/Record.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/view/FoldWalk.h>
 
 namespace rune::view {
 
@@ -407,91 +408,6 @@ PrepareStatus prepareOne(Stores& st, const SourceRecord& rec, Prospect& p) noexc
     return PrepareStatus::Ok;
 }
 
-// The batch walk both folds share: control and aborted batches are consumed whole, `onRecord(key, value, offset, stats)` sees
-// every other record in [cursor, bound) that the judge did not reject.  `cursor` is IN/OUT exactly as foldBatch documents it.
-template <class OnRecord>
-FoldStats walkCommitted(const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor, const FoldSkip& skip, OnRecord&& onRecord) {
-    FoldStats stats{};
-    // Resume point: a LogReadView is WHOLE batches, so when the caller's cursor
-    // sits mid-batch (a capped pass stopped there) the batch's records below it
-    // were already folded and must not be re-applied.
-    const FoldSkip foldSkip = skip;   // #537: by value (see AbortedTxnFilter::skips)
-    const int64_t from = cursor;
-    bool stopped = false;
-    bool corrupt = false;
-
-    // Highest offset this call has FULLY folded so far (every record of
-    // every batch up to and including this point was folded or validly
-    // skipped as control). Starts at view.baseOffset (nothing folded yet).
-    // LogReadView's contract is WHOLE batches only, so this only ever
-    // advances to a batch boundary -- never mid-batch.
-    int64_t walkedUpto = view.baseOffset;
-
-    size_t pos = 0;
-    while (pos < view.len) {
-        rune::protocol::RecordBatchReader r(view.data + pos, view.len - pos);
-        if (!r.ensureValid()) {
-            corrupt = true; // torn/corrupt tail: stop, do not advance past it
-            break;
-        }
-        const int16_t attrs = r.attributes();
-        if ((attrs & rune::protocol::batch::kAttrControl) != 0) {
-            ++stats.skippedControl;
-            pos += static_cast<size_t>(r.totalLength());
-            walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
-            continue;
-        }
-        if (isAbortedBatch(foldSkip, r, attrs)) [[unlikely]] {
-            // #537: an aborted transaction's batch is never applied.  Below the
-            // bound it is consumed whole, like a control batch; a batch the
-            // bound cuts (a capped pass) stops the walk exactly as a record
-            // past the bound does — the next pass resumes and skips it again.
-            if (r.baseOffset() + r.lastOffsetDelta() >= bound) { stopped = true; break; }
-            ++stats.skippedAborted;
-            pos += static_cast<size_t>(r.totalLength());
-            walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
-            continue;
-        }
-
-        r.forEachRecord([&](std::string_view key, std::string_view value,
-                             int64_t offset, int64_t /*timestamp*/) {
-            if (stopped) {
-                return; // already hit the uncommitted boundary this call
-            }
-            if (offset >= bound) {
-                stopped = true; // don't fold uncommitted records
-                return;
-            }
-            if (offset < from) {
-                return; // already folded by a previous (mid-batch-stopped) pass
-            }
-            if (isRejectedRecord(foldSkip, offset)) [[unlikely]] {
-                ++stats.skippedRejected;   // the judge rejected it: no view ever applies it
-                return;
-            }
-
-            onRecord(key, value, offset, stats);
-        });
-
-        if (stopped) {
-            break; // bound reached mid-batch: this batch was NOT fully folded
-        }
-        pos += static_cast<size_t>(r.totalLength());
-        walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1; // batch fully folded
-    }
-
-    // On a corrupt/torn break, never advance past the last fully-folded
-    // batch -- view.nextOffset describes the WHOLE view (including bytes we
-    // never validated), so using it here could skip records this call never
-    // folded. Otherwise (normal completion or a bound-stop), the walk either
-    // consumed the whole view or stopped exactly at a committed boundary, so
-    // the existing min(nextOffset, bound) cap is correct and tighter than
-    // walkedUpto would be when bound < nextOffset.
-    // Never move the resume point backwards (a corrupt batch at/after `from`).
-    cursor = std::max(from, corrupt ? walkedUpto : std::min(view.nextOffset, bound));
-    return stats;
-}
-
 } // namespace
 
 PrimType viewKeyType(const CompiledViewPlan& plan) noexcept { return resolveKeyType(plan); }
@@ -527,9 +443,10 @@ void applyProjection(ProjectionFold& f, const SourceRecord& rec, const Prospect&
 FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                      VersionDescriptorCache& vdc, ViewTable& table,
                      const rune::storage::LogReadView& view, int64_t bound,
-                     int64_t& cursor, const FoldSkip& skip) {
+                     int64_t& cursor, const FoldSkip& skip, TxnFold* txn) {
     const PrimType keyType = resolveKeyType(plan);
-    return walkCommitted(view, bound, cursor, skip, [&](std::string_view key, std::string_view value, int64_t, FoldStats& stats) {
+    FoldStats stats{};
+    walkFold(view, bound, cursor, skip, txn, stats, [&](std::string_view key, std::string_view value, int64_t) {
         uint64_t k = 0;
         if (!decodeWireKey(key, keyType, k)) {
             ++stats.skippedMalformed;
@@ -545,11 +462,13 @@ FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
         writeProjectionRow(plan, layout, d, value, table.put(k));
         ++stats.applied;
     });
+    return stats;
 }
 
 FoldStats foldProjectionBatch(ProjectionFold& f, Prospect& p, const rune::storage::LogReadView& view, int64_t bound,
-                              int64_t& cursor, const FoldSkip& skip) {
-    return walkCommitted(view, bound, cursor, skip, [&](std::string_view key, std::string_view value, int64_t offset, FoldStats& stats) {
+                              int64_t& cursor, const FoldSkip& skip, TxnFold* txn) {
+    FoldStats stats{};
+    walkFold(view, bound, cursor, skip, txn, stats, [&](std::string_view key, std::string_view value, int64_t offset) {
         const SourceRecord rec{key, value, offset, 0, nullptr};
         (void)prepareProjection(f, rec, p);   // a malformed record leaves op None: apply does nothing and the stats say why
         applyProjection(f, rec, p);
@@ -561,6 +480,7 @@ FoldStats foldProjectionBatch(ProjectionFold& f, Prospect& p, const rune::storag
         stats.ownerMoves += p.stats.ownerMoves;
         stats.uniquePromotions += p.stats.uniquePromotions;
     });
+    return stats;
 }
 
 } // namespace rune::view

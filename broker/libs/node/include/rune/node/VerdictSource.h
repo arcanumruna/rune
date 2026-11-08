@@ -14,6 +14,7 @@
 #include <rune/storage/ControlMarkerLayout.h>
 #include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/ProducerBatchWindow.h>
+#include <rune/view/FoldWalk.h>
 #include <rune/view/TxnOverlay.h>
 #include <rune/view/Verdict.h>
 
@@ -52,7 +53,7 @@ using rune::storage::keyIndexWord;
 void applyKeyIndex(KeyIndexFold&, const rune::view::SourceRecord&, const rune::view::Prospect&) noexcept;
 /// foldBatch's contract (batch, bound, cursor, corrupt tail) over the accepted records: nothing is judged.
 rune::view::FoldStats foldKeyIndexBatch(KeyIndexFold&, const rune::storage::LogReadView&, int64_t bound, int64_t& cursor,
-                                        const rune::view::FoldSkip&) noexcept;
+                                        const rune::view::FoldSkip&, rune::view::TxnFold* txn = nullptr);
 /// What a unique or check member is evaluated against: its plan, row layout and current table.
 struct ConstraintFold {
     const rune::view::CompiledViewPlan& plan;
@@ -131,6 +132,9 @@ private:
 /// has its key set (a judgement keeps both across passes); `oneStep()` is the key set of work done within one step (P11-3a).
 class TxnOverlayPool {
 public:
+    /// D1: one marker application's noted keys at a time, for every fold of the worker (path A and the members' replays).
+    rune::view::SupersedeKeys supersedeKeys;
+
     /// Cold.  The caller's precondition: rows >= txnJudgedRecordsMax x the sum, over the verdict members of the source, of
     /// (key index 1; aggregate 4 x kSlotsPerTable + 3; projection = its applyTo write set + 1), and maxRowLen >= the largest
     /// member table rowLen, ClaimsExtras included (VerdictSource::overlayNeed).  An undersized overlay stalls the judge on a legal
@@ -255,7 +259,7 @@ public:
     [[nodiscard]] int64_t judgedThrough() const noexcept {
         int64_t through = judgeCursor_;
         if (state_ != nullptr) through = std::min(through, state_->txn.earliestUndecidedFirst());
-        for (const OrdinaryTxn& o : ordinary_) through = std::min(through, o.first);
+        for (const OrdinaryTxn& o : ordinary_) through = std::min({through, o.first, o.holdFrom});
         return through;
     }
     /// P11-8 (c): the lowest checkpoint a persisted member restarts from; a replay from it backfills from the TxnJudges at or above it.
@@ -359,8 +363,8 @@ private:
         int32_t                     chainLive = 0;  // CapLiveKeys inside a chained judgement: the rows the chain added less those it erased
         bool                        retiring = false, leaving = false, candidate = false;
         int64_t                     leaveOffset = -1;
-        // P11-8 (a): the cursor its replay began at, and the TxnJudge it backfilled last there; the cursor of its last push
-        int64_t                     replayFrom = -1, backfilledAt = -1, pushedAt = -1;
+        // P11-8 (a): the cursor its replay began at (a TxnJudge whose firstOffset is below it is backfilled); the cursor of its last push
+        int64_t                     replayFrom = -1, pushedAt = -1;
         std::vector<uint8_t>        planRecordPayload;   // the type-20 value requestChange appends when the member joins
     };
 
@@ -369,12 +373,12 @@ private:
     template <class ReadRangeFn>
     int    replayCandidates_(ReadRangeFn& readRange, int64_t bound, const rune::view::AbortedTxnFilter& aborted);
     void   activate_(PartitionWriteState& state);
-    int    replay_(Member& m, const rune::storage::LogReadView& view, int64_t upTo, const rune::view::AbortedTxnFilter& aborted);
+    int    replay_(Member& m, const rune::storage::LogReadView& view, int64_t upTo, const rune::view::AbortedTxnFilter& aborted,
+                   rune::view::SpanReader reader);
+    [[nodiscard]] rune::view::JudgeDecision judgeStep_(Member& m, const uint8_t* batch, std::size_t len, int64_t at) noexcept;
+    void   closeSpan_(int64_t producerId) noexcept;
     template <class ReadRangeFn>
     int    replayMember_(ReadRangeFn& readRange, Member& m, int64_t bound, const rune::view::AbortedTxnFilter& aborted);
-    template <class ReadRangeFn>
-    bool   backfill_(ReadRangeFn& readRange, Member& m, const rune::storage::control_record::TxnJudgeRecord& j, int64_t judgeOffset,
-                     const rune::view::AbortedTxnFilter& aborted) noexcept;
     [[nodiscard]] bool runsAheadAt_(int64_t cursor) const noexcept;
     [[nodiscard]] int64_t runAheadFrom_() const noexcept;
     int    judgeBatches_(const rune::storage::LogReadView& view, int64_t limit, int64_t hardLimit, const rune::view::AbortedTxnFilter& aborted);
@@ -382,7 +386,7 @@ private:
     // Part 11 (P11-2): a transaction without a committed TxnJudge or marker stops the judge at its first record (TxnStop::Probe) until a
     // look-ahead finds one; an ordinary transaction stops it at its marker (TxnStop::Marker) to be applied there.
     // `vote`: P11-7, -1 until the judge classifies it at the marker.
-    struct OrdinaryTxn { int64_t producerId; int64_t first; int64_t marker; bool commit; int8_t vote = -1; };
+    struct OrdinaryTxn { int64_t producerId; int64_t first; int64_t marker; bool commit; int8_t vote = -1; int64_t intentFrom = -1; int64_t holdFrom = INT64_MAX; };
     struct TxnProbe { int64_t producerId = -1, first = -1, from = -1, waitAt = -1; };
     struct OwedMarker { int64_t producerId; int64_t judgeOffset; int64_t from; };   // a re-offered TxnJudge's marker, searched from `from`
     // Judge: the judge stands at a TxnJudge to judge (judgePid_).  Locked: a record touches a row a transaction holds (P11-4).
@@ -432,7 +436,7 @@ private:
     template <class ReadRangeFn>
     bool   judgeAtMarker_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept;
     template <class ReadRangeFn>
-    int8_t shouldHaveVoted_(ReadRangeFn& readRange, const OrdinaryTxn& o) noexcept;
+    int8_t shouldHaveVoted_(ReadRangeFn& readRange, OrdinaryTxn& o) noexcept;
     template <class ReadRangeFn>
     bool   runJudgement_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept;
     template <class ReadRangeFn>
@@ -482,9 +486,9 @@ private:
     void   noteKeyZeroRejection_(const rune::view::Verdict& v, const rune::view::SourceRecord& rec) noexcept;
     void   apply_(Member& m, const rune::view::SourceRecord& rec) noexcept;
     /// Retention may have trimmed the log below a member's cursor: an empty member starts at the log start, one with rows is
-    /// discarded (BelowLogStart).  False when it was discarded.
+    /// discarded (BelowLogStart), as is one with an open span that lost its first batches.  False when it was discarded.
     bool   clampToLogStart_(Member& m) {
-        if (m.inst->foldCursor >= logStart_) return true;
+        if (m.inst->foldCursor >= logStart_ && !m.inst->spanFence.straddles(logStart_)) return true;
         if (startAtLogStart(*m.inst, logStart_)) return true;
         if (hooks_.discard != nullptr) hooks_.discard(hooks_.ctx, *m.inst, ViewDiscardReason::BelowLogStart);
         return false;
@@ -525,7 +529,7 @@ private:
     uint64_t                    membersEpoch_ = 0;        // bumped by every change of the members or of the active set
     TxnStop                     txnStop_ = TxnStop::None;
     std::size_t                 markerAt_ = 0;            // TxnStop::Marker: the entry of ordinary_ whose marker the judge stands at
-    int64_t                     ordinaryApplied_ = -1;    // that entry's records below it are applied (a read failed mid-way)
+    int64_t                     ordinaryApplied_ = -1;    // that entry's apply walk resumes here: its records below it are applied
     // P11-3a: the decision of a producer's batches of `epoch` in [base, to) (decided), searched from `from`; judged: the TxnJudge of
     // their transaction is at `to`, its marker still searched
     struct TxnLookup {
@@ -536,9 +540,10 @@ private:
     // P11-3a: the walk of that entry while the judge stands at its marker.  T's records apply in segments [from, end) of at most
     // the one-step set's keys, each key with its last offset in all of T, so every segment takes the same supersede decision for a
     // key.  The set's markers hold every entry from markersFrom up to where they overflowed (refill: noted anew from checkFrom); the
-    // supersede walk resumes at checkFrom until checked; `lookup` decides one batch the markers cannot.
+    // supersede walk resumes at checkFrom (-1: the collect is not done) until checked; `lookup` decides one batch the markers cannot.
+    // The collect walk resumes at collectFrom (-1: not begun), a refill at refillFrom.
     struct OrdinaryWalk {
-        int64_t   marker = -1, from = -1, end = -1, markersFrom = -1, checkFrom = -1;
+        int64_t   marker = -1, from = -1, end = -1, collectFrom = -1, markersFrom = -1, checkFrom = -1, refillFrom = -1;
         bool      checked = false, refill = false;
         TxnLookup lookup;
     };
@@ -557,6 +562,7 @@ private:
     int64_t                     nowNs_ = 0, lockPausedNs_ = 0;
     int64_t                     finalizePid_ = -1, finalizeApplied_ = -1;   // a commit finalized part-way (a read failed)
     std::size_t                 voteScanBytes_ = kVoteScanBytesPerPass;
+    std::size_t                 spanBytes_ = 0;           // what an ordinary transaction's intent, collect, supersede and apply walks may still read this pass
     VerdictViewHooks            hooks_;
     VerdictSourceStats          stats_;
     std::vector<uint8_t>        scratch_;
@@ -677,7 +683,7 @@ bool VerdictSource::switchSet_(int64_t A, ReadRangeFn& readRange, const rune::vi
         if (!clampToLogStart_(m)) return false;   // retention deleted what this member folded from: it is being backed up and rebuilt
         if (m.inst->foldCursor < A + 1) {
             const rune::storage::LogReadView v = readRange(m.inst->foldCursor, A + 1);
-            if (!v.empty()) work += replay_(m, v, A + 1, aborted);
+            if (!v.empty()) work += replay_(m, v, A + 1, aborted, rune::view::spanReaderOf(readRange));
         }
         if (m.inst->foldCursor != A + 1) return false;
     }
@@ -711,71 +717,21 @@ int VerdictSource::replayCandidates_(ReadRangeFn& readRange, int64_t bound, cons
     return work;
 }
 
-// A member's unjudged replay to the judge's cursor.  P11-8 (a): a checkpoint pushed while the judge ran ahead of a deferred
-// transaction holds none of its records, so when the replay from O meets a TxnJudge whose firstOffset < O it stops there and
-// backfills the transaction: its records below J, in order.  Every fold keeps one row or contribution per source key, so a record
-// the replay folded at or above O sets the same one again, and a key T rewrites above O ends at T's last record (P11-3 keeps other
-// writers' later records out).
+// A member's replay to the judge's cursor, through the fold every view shares (P11-0, R11b): a transaction applies at its TxnJudge
+// when it has one (D2), else at its marker, and an undecided one is never applied (judgeStep_).  P11-8 (a): a checkpoint pushed while
+// the judge ran ahead of a deferred transaction holds none of its records, so a TxnJudge whose firstOffset lies below where the replay
+// began applies the whole transaction from there.
 template <class ReadRangeFn>
 int VerdictSource::replayMember_(ReadRangeFn& readRange, Member& m, int64_t bound, const rune::view::AbortedTxnFilter& aborted) {
-    namespace proto = rune::protocol;
     ViewInstance& inst = *m.inst;
-    if (m.replayFrom < 0 || inst.foldCursor < m.replayFrom) {   // a discard refolds from below: nothing there is backfilled
-        m.replayFrom = inst.foldCursor;
-        m.backfilledAt = -1;
-    }
+    if (m.replayFrom < 0 || inst.foldCursor < m.replayFrom) m.replayFrom = inst.foldCursor;   // a discard refolds from below
     // A read stops at the next segment base at or above its end: a compacted gap whose next segment starts at judgeCursor_ reads
     // empty to judgeCursor_, and still to the bound when judgeCursor_ == bound.  So read to the bound and at least one past it.
     const rune::storage::LogReadView v = readRange(inst.foldCursor, std::max(bound, judgeCursor_ + 1));
     if (v.empty()) return 0;
-    int64_t upTo = judgeCursor_;
-    cr::TxnJudgeRecord j{};
-    for (std::size_t pos = 0; pos < v.len;) {
-        const proto::RecordBatchReader r(v.data + pos, v.len - pos);
-        if (!r.ensureValid() || r.baseOffset() >= upTo) break;
-        const auto len = static_cast<std::size_t>(r.totalLength());
-        if ((r.attributes() & (proto::batch::kAttrControl | proto::batch::kAttrTransactional)) == proto::batch::kAttrControl && len == cr::kTxnJudgeBatchBytes &&
-            r.baseOffset() >= inst.foldCursor && r.baseOffset() > m.backfilledAt)
-            if (const auto p = cr::parseTxnJudge(v.data + pos, len); p && p->firstOffset < m.replayFrom) {
-                upTo = r.baseOffset();
-                j = *p;
-            }
-        pos += len;
-    }
-    int work = replay_(m, v, upTo, aborted);
-    if (upTo < judgeCursor_ && inst.foldCursor == upTo && backfill_(readRange, m, j, upTo, aborted)) {
-        m.backfilledAt = upTo;
-        ++state_->txn.stats.checkpointBackfills;
-        ++work;
-    }
-    if (inst.foldCursor >= judgeCursor_) m.replayFrom = m.backfilledAt = -1;
+    const int work = replay_(m, v, judgeCursor_, aborted, rune::view::spanReaderOf(readRange));
+    if (inst.foldCursor >= judgeCursor_) m.replayFrom = -1;
     return work;
-}
-
-// The backfill of j's transaction into the member, through its normal path.  An aborted one applies nothing; one not decided yet
-// waits (false), and so does a read that came back short.
-template <class ReadRangeFn>
-bool VerdictSource::backfill_(ReadRangeFn& readRange, Member& m, const cr::TxnJudgeRecord& j, int64_t judgeOffset,
-                              const rune::view::AbortedTxnFilter& aborted) noexcept {
-    namespace proto = rune::protocol;
-    if (const DeferredTxn* t = state_->txn.find(j.producerId); t != nullptr && t->judgeOffset == judgeOffset && t->phase != TxnPhase::Finalized) return false;
-    bool ok = true;
-    return walkBatches_(readRange, j.firstOffset, judgeOffset, [&](const proto::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
-        const int16_t attrs = r.attributes();
-        if (r.producerId() != j.producerId || (attrs & (proto::batch::kAttrTransactional | proto::batch::kAttrControl)) != proto::batch::kAttrTransactional ||
-            aborted.skips(r, attrs)) return true;
-        (void)proto::forEachRecordSpan(b, len, [&](const proto::RecordSpan& span) {
-            if (!ok || state_->rejected.isRejected(span.offset)) return;
-            const rune::view::SourceRecord rec = recordOf_(span);
-            if (prepare_(m, rec, nullptr, nullptr) == rune::view::PrepareStatus::CapacityExhausted) {
-                stall_(StallReason::Capacity);
-                ok = false;
-                return;
-            }
-            apply_(m, rec);
-        });
-        return ok;
-    }) && ok;
 }
 
 // fn(reader, batch, len) for every batch with an offset in [from, to); fn returns false to stop.  False: a read came back short.
@@ -832,32 +788,45 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
         TxnKeySet& keys = oneStepKeys_();
         OrdinaryWalk& w = ordinaryWalk_;
         if (w.marker != o.marker) w = {o.marker, o.first};
-        if (w.end < 0 || !txnPool_->holdsOneStep(oneStepClaim_)) {
-            if (!txnPool_->holdsOneStep(oneStepClaim_)) {
-                if (!txnPool_->oneStepClaimable()) return false;   // another source is mid-segment: wait for it
-                oneStepClaim_ = txnPool_->claimOneStep();
-            }
+        if (!txnPool_->holdsOneStep(oneStepClaim_)) {
+            if (!txnPool_->oneStepClaimable()) return false;   // another source is mid-segment: wait for it
+            oneStepClaim_ = txnPool_->claimOneStep();
+            w.collectFrom = -1;   // another source may have taken the set mid-segment: note the keys again
+        }
+        if (w.collectFrom < 0) {
             keys.clear();
-            w.end = -1;   // another source may have taken the set mid-segment: note the keys again
-            if (!walkBatches_(readRange, w.from, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+            w.end = w.checkFrom = -1;
+            w.collectFrom = w.from;
+        }
+        if (w.checkFrom < 0) {   // the collect is not done
+            bool more = false;
+            if (!walkBatches_(readRange, w.collectFrom, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
                     collectOrdinaryBatch_(r, b, len, o.producerId, keys);
-                    return true;
-                })) {
-                w.end = -1;
-                return false;
-            }
+                    w.collectFrom = r.baseOffset() + r.lastOffsetDelta() + 1;
+                    spanBytes_ -= std::min(spanBytes_, len);
+                    more = spanBytes_ == 0;
+                    return !more;
+                }) || more) return false;
             if (w.end < 0) w.end = o.marker;
             w.markersFrom = w.checkFrom = w.from;
+            w.refillFrom = -1;
             w.checked = w.refill = false;
         }
         if (!w.checked && !checkOrdinary_(readRange, o, aborted, keys)) return false;
         txnPool_->parkOneStep(oneStepClaim_, false);   // applyTxnBatch_ parks it again on a row a judged transaction holds
-        bool applied = true;
+        // The apply walk shares the pass's budget too: it resumes past every batch it walked, plain ones included, as a Locked stop
+        // resumes past the last record it applied.
+        bool applied = true, more = false;
         if (!walkBatches_(readRange, std::max(w.from, ordinaryApplied_), w.end, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
-                if (r.producerId() != o.producerId || (r.attributes() & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) != rune::protocol::batch::kAttrTransactional) return true;
-                applied = applyTxnBatch_(b, len, keys, w.end);
-                return applied;
-            }) || !applied) return false;
+                if (r.producerId() == o.producerId && (r.attributes() & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) == rune::protocol::batch::kAttrTransactional) {
+                    applied = applyTxnBatch_(b, len, keys, w.end);
+                    if (!applied) return false;
+                }
+                ordinaryApplied_ = std::max(ordinaryApplied_, std::min(r.baseOffset() + r.lastOffsetDelta() + 1, w.end));
+                spanBytes_ -= std::min(spanBytes_, len);
+                more = spanBytes_ == 0;
+                return !more;
+            }) || !applied || more) return false;
         if (w.end < o.marker) {
             if (w.from == o.first) ++state_->txn.stats.supersedeKeysOverflow;
             ordinaryApplied_ = std::max(ordinaryApplied_, w.end);
@@ -875,12 +844,21 @@ template <class ReadRangeFn>
 bool VerdictSource::checkOrdinary_(ReadRangeFn& readRange, const OrdinaryTxn& o, const rune::view::AbortedTxnFilter& aborted, TxnKeySet& keys) noexcept {
     OrdinaryWalk& w = ordinaryWalk_;
     if (w.refill) {
-        keys.clearMarkers();
-        if (!walkBatches_(readRange, w.checkFrom, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+        if (w.refillFrom < 0) {
+            keys.clearMarkers();
+            w.refillFrom = w.checkFrom;
+        }
+        bool more = false;
+        if (!walkBatches_(readRange, w.refillFrom, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
                 if ((r.attributes() & rune::protocol::batch::kAttrControl) != 0) noteControl_(r, b, len, o.producerId, keys);
-                return !keys.markersOverflowed();
-            })) return false;
+                if (keys.markersOverflowed()) return false;
+                w.refillFrom = r.baseOffset() + r.lastOffsetDelta() + 1;
+                spanBytes_ -= std::min(spanBytes_, len);
+                more = spanBytes_ == 0;
+                return !more;
+            }) || more) return false;
         w.markersFrom = w.checkFrom;
+        w.refillFrom = -1;
         w.refill = false;
     } else if (w.lookup.producerId >= 0 && !w.lookup.decided && !lookupTxn_(readRange, o.marker)) {
         return false;
@@ -892,7 +870,9 @@ bool VerdictSource::checkOrdinary_(ReadRangeFn& readRange, const OrdinaryTxn& o,
                 return false;
             }
             w.checkFrom = r.baseOffset() + r.lastOffsetDelta() + 1;
-            return true;
+            spanBytes_ -= std::min(spanBytes_, len);
+            stopped = spanBytes_ == 0;
+            return !stopped;
         }) || stopped) return false;
     w.checked = true;
     return true;
@@ -1046,21 +1026,24 @@ bool VerdictSource::judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedT
 }
 
 // P11-1 (a), (b) or (c) on the log: a committed transaction without a TxnJudge that should have voted (1), or not (0).  -1: the
-// intent search's read failed, the transaction stays unclassified.
+// intent search's read failed or used up spanBytes_, the transaction stays unclassified and the search resumes at intentFrom.
 template <class ReadRangeFn>
-int8_t VerdictSource::shouldHaveVoted_(ReadRangeFn& readRange, const OrdinaryTxn& o) noexcept {
+int8_t VerdictSource::shouldHaveVoted_(ReadRangeFn& readRange, OrdinaryTxn& o) noexcept {
     const auto constrained = [](const ConstraintSet& s) {
         return std::any_of(s.members.begin(), s.members.begin() + s.count, [](const ConstraintSetMember& m) {
             return m.kind == rune::view::VerdictViewKind::Unique || m.kind == rune::view::VerdictViewKind::Check || m.kind == rune::view::VerdictViewKind::TestReject;
         });
     };
     if (constrained(*state_->constraintSets.setAt(o.first)) || state_->isConstrainedSource()) return 1;
-    bool intent = false;
-    if (!walkBatches_(readRange, o.first, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
-        if (r.producerId() != o.producerId || (r.attributes() & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) != rune::protocol::batch::kAttrTransactional) return true;
-        (void)rune::protocol::forEachRecordSpan(b, len, [&](const rune::protocol::RecordSpan& span) { intent = intent || rune::protocol::record::intentOf(span.attributes) != 0; });
-        return !intent;
-    })) return -1;
+    bool intent = false, more = false;
+    if (!walkBatches_(readRange, std::max(o.first, o.intentFrom), o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+        if (r.producerId() == o.producerId && (r.attributes() & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) == rune::protocol::batch::kAttrTransactional)
+            (void)rune::protocol::forEachRecordSpan(b, len, [&](const rune::protocol::RecordSpan& span) { intent = intent || rune::protocol::record::intentOf(span.attributes) != 0; });
+        o.intentFrom = r.baseOffset() + r.lastOffsetDelta() + 1;
+        spanBytes_ -= std::min(spanBytes_, len);
+        more = !intent && spanBytes_ == 0;
+        return !intent && !more;
+    }) || more) return -1;
     return intent ? 1 : 0;
 }
 
@@ -1153,6 +1136,7 @@ bool VerdictSource::finalizeLocked_(ReadRangeFn& readRange, const rune::view::Ab
         txnPool_->release(t->overlay);
         t->overlay = -1;
         t->phase = TxnPhase::Finalized;
+        closeSpan_(t->producerId);   // the step's postcondition: T was applied to every active member (no span is open here today)
         finalizePid_ = finalizeApplied_ = -1;
         any = true;
         if (checkpointCap_ != INT64_MAX && t->records >= checkpointCap_) {   // a delta holds at most one transaction past the cap
@@ -1178,6 +1162,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     if (needsActivation_) { activate_(state); ++work; }
     passHw_ = bound;
     nowNs_ = nowNs;
+    spanBytes_ = voteScanBytes_;
     if (!owedMarkers_.empty()) feedOwedMarkers_(readRange, bound);
     state.txn.finalizeDecided(state.rejected.coveredThrough(), bound);
     rejectedThisPass_ = 0;
@@ -1196,9 +1181,11 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     } else if (!behind && finalizeLocked_(readRange, aborted)) {
         // The checkpoint cap holds the judge at the markers' coverage plus the cap.  While a deferred transaction holds K the markers
         // wait for it and the judge runs ahead, the members pushing there (P11-8 (a)): the cap counts from their last push.  An
-        // ordinary one is applied at its marker, which the judge must reach.
+        // ordinary one is applied at its marker, which the judge must reach.  While nothing judged waits for a marker (only control
+        // records or an aborted transaction past the coverage) no marker is due and the members' tables did not change: the cap
+        // counts from the cursor.
         const bool ordinaryHolds = std::any_of(ordinary_.begin(), ordinary_.end(), [&](const OrdinaryTxn& o) { return o.first < judgeCursor_; });
-        const int64_t capFrom = judgedThrough() < judgeCursor_ ? runAheadFrom_() : emitFrom_;
+        const int64_t capFrom = judgedThrough() < judgeCursor_ ? runAheadFrom_() : judgedRecord_ || sawEmptyChange_ ? emitFrom_ : judgeCursor_;
         const int64_t passBound = std::min(bound, checkpointCap_ == INT64_MAX || ordinaryHolds || capFrom == INT64_MAX ? INT64_MAX : capFrom + checkpointCap_);
         while (!stalled_) {
             const int64_t A = state.constraintSets.nextChangeAtOrAfter(setFrom_);

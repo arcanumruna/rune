@@ -4598,6 +4598,9 @@ private:
                 enqueueReturn_(std::move(ret));
                 return ViewServe::Answered;
             }
+            // P11-9: a transaction or atomic batch is part applied (its application spans passes): held like the fold barrier's
+            // reads, served by serveHeldViewReads_ once the fence clears (next pass), NotReady at the deadline.
+            if (st.fenced) [[unlikely]] return ViewServe::Hold;
             // 2d. Issue #82 (VLS A.5.5): read-your-writes - an acked write is committed (at or below the HW / LSO), but
             //     the fold may lag it within a pass (a persisted view folds at most maxRecordsPerPass per pass; the ack
             //     leaves before the next pass folds).  The read waits for the fold to reach the committed bound AT ITS

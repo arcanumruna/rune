@@ -10,6 +10,7 @@
 
 #include <rune/codec/Record.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/view/FoldWalk.h>
 
 namespace rune::view {
 
@@ -745,80 +746,36 @@ void chainRecord(AggregateFold& f, const RowOverlay& ov, const TxnTable& groups,
     for (std::size_t i = 0; i < ov.used(T::Blocks); ++i) publish(T::Blocks, OverlayTable::Blocks, i, ViewKey::fromU64(ov.slot(T::Blocks, i).key));
 }
 
-// The batch walk both folds share: `onRecord(key, value, offset)` sees every committed, unrejected record in [cursor, bound).
-template <class OnRecord>
-FoldStats walkAggregate(const rune::storage::LogReadView& lv, int64_t bound, int64_t& cursor, const FoldSkip& skip, FoldStats& stats,
-                        OnRecord&& onRecord) {
-    const FoldSkip foldSkip = skip;   // #537: by value (see AbortedTxnFilter::skips)
-    const int64_t from = cursor;   // records below it were folded by a prior (mid-batch) pass
-    bool stopped = false;
-    bool corrupt = false;
-    int64_t walkedUpto = lv.baseOffset;
-
-    size_t pos = 0;
-    while (pos < lv.len) {
-        rune::protocol::RecordBatchReader r(lv.data + pos, lv.len - pos);
-        if (!r.ensureValid()) { corrupt = true; break; }
-        const int16_t attrs = r.attributes();
-        if ((attrs & rune::protocol::batch::kAttrControl) != 0) {
-            ++stats.skippedControl;
-            pos += static_cast<size_t>(r.totalLength());
-            walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
-            continue;
-        }
-        if (isAbortedBatch(foldSkip, r, attrs)) [[unlikely]] {   // #537: never applied (see foldBatch)
-            if (r.baseOffset() + r.lastOffsetDelta() >= bound) { stopped = true; break; }
-            ++stats.skippedAborted;
-            pos += static_cast<size_t>(r.totalLength());
-            walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
-            continue;
-        }
-        r.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset,
-                            int64_t /*ts*/) {
-            if (stopped) return;
-            if (offset >= bound) { stopped = true; return; }
-            if (offset < from) return;         // already folded (resume mid-batch)
-            if (isRejectedRecord(foldSkip, offset)) [[unlikely]] { ++stats.skippedRejected; return; }
-            onRecord(key, value, offset);
-        });
-        if (stopped) break;
-        pos += static_cast<size_t>(r.totalLength());
-        walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
-    }
-    // Never move the resume point backwards (a corrupt batch at/after `from`).
-    cursor = std::max(from, corrupt ? walkedUpto : std::min(lv.nextOffset, bound));
-    return stats;
-}
-
 } // namespace
 
 FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& layout,
                              const AggLayout& agg, VersionDescriptorCache& vdc,
                              ViewTable& view, ViewTable& contributors, ViewTable& groups,
                              ViewTable* blocks, const rune::storage::LogReadView& lv,
-                             int64_t bound, int64_t& cursor, const FoldSkip& skip) {
+                             int64_t bound, int64_t& cursor, const FoldSkip& skip, TxnFold* txn) {
     FoldStats stats{};
     DirectTable dBlocks{blocks != nullptr ? *blocks : view};   // unused when blocks == nullptr
     Ctx<DirectTable> cx{layout, agg, DirectTable{view}, DirectTable{contributors}, DirectTable{groups},
                         blocks != nullptr ? &dBlocks : nullptr, stats};
-    return walkAggregate(lv, bound, cursor, skip, stats, [&](std::string_view key, std::string_view value, int64_t) {
+    walkFold(lv, bound, cursor, skip, txn, stats, [&](std::string_view key, std::string_view value, int64_t) {
         (void)aggStep(cx, vdc, nullptr, key, value);
     });
+    return stats;
 }
 
 FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                              const AggLayout& agg, VersionDescriptorCache& vdc,
                              ViewTable& view, ViewTable& contributors, ViewTable& groups,
                              const rune::storage::LogReadView& lv, int64_t bound,
-                             int64_t& cursor, const FoldSkip& skip) {
+                             int64_t& cursor, const FoldSkip& skip, TxnFold* txn) {
     return foldAggregateBatch(plan, layout, agg, vdc, view, contributors, groups, nullptr, lv,
-                              bound, cursor, skip);
+                              bound, cursor, skip, txn);
 }
 
 FoldStats foldKeyedAggregateBatch(AggregateFold& f, Prospect& p, const rune::storage::LogReadView& lv, int64_t bound, int64_t& cursor,
-                                  const FoldSkip& skip) {
+                                  const FoldSkip& skip, TxnFold* txn) {
     FoldStats stats{};
-    return walkAggregate(lv, bound, cursor, skip, stats, [&](std::string_view key, std::string_view value, int64_t offset) {
+    walkFold(lv, bound, cursor, skip, txn, stats, [&](std::string_view key, std::string_view value, int64_t offset) {
         const SourceRecord rec{key, value, offset, 0, nullptr};
         (void)prepareAggregate(f, rec, p);   // a malformed record leaves op None: apply does nothing and the stats say why
         applyAggregate(f, rec, p);
@@ -831,6 +788,7 @@ FoldStats foldKeyedAggregateBatch(AggregateFold& f, Prospect& p, const rune::sto
         stats.aggInconsistent += p.stats.aggInconsistent;
         stats.aggRescans += p.stats.aggRescans;
     });
+    return stats;
 }
 
 PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospect& p, TxnOverlay* chain) noexcept {

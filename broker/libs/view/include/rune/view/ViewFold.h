@@ -11,6 +11,7 @@
 #include <rune/storage/LogReadView.h>
 #include <rune/view/FoldSkip.h>
 #include <rune/view/FoldStats.h>
+#include <rune/view/FoldWalk.h>
 #include <rune/view/KeyedFold.h>
 #include <rune/view/RecordFold.h>
 #include <rune/view/TxnOverlay.h>
@@ -72,10 +73,12 @@ private:
 // caller should resume from next time: the highest offset actually folded,
 // capped at `bound` -- NEVER past a batch this call did not fully fold (see
 // ViewFold.cpp for the early-break case). foldAggregateBatch: same contract.
+// `txn` (P11-0): the instance's span fence and reader; a transaction then applies at its commit marker and the cursor may stop
+// there or at a transactional batch the fence cannot hold (FoldWalk.h).  nullptr: offset order (a transient source, D6).
 FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                      VersionDescriptorCache& vdc, ViewTable& table,
                      const rune::storage::LogReadView& view, int64_t bound,
-                     int64_t& cursor, const FoldSkip& skip);
+                     int64_t& cursor, const FoldSkip& skip, TxnFold* txn = nullptr);
 
 // A projection view's fold inputs, built once per ViewInstance.
 struct ProjectionFold {
@@ -102,6 +105,6 @@ void applyProjection(ProjectionFold& f, const SourceRecord& rec, const Prospect&
 
 // foldBatch for a keyed projection: the same walk, each record prepared into `p` (reserved once per instance) and applied.
 FoldStats foldProjectionBatch(ProjectionFold& f, Prospect& p, const rune::storage::LogReadView& view, int64_t bound,
-                              int64_t& cursor, const FoldSkip& skip);
+                              int64_t& cursor, const FoldSkip& skip, TxnFold* txn = nullptr);
 
 } // namespace rune::view

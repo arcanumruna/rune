@@ -8,6 +8,10 @@
 
 #include <gtest/gtest.h>
 
+#include <rune/codec/Descriptor.h>
+#include <rune/view/ViewRow.h>
+#include <rune/view/ViewTable.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -728,4 +732,78 @@ TEST(CheckedWritesAllocRegression, SteadyStateUniqueAndCheckJudgingAllocatesNoth
     EXPECT_GT(accepted, static_cast<uint64_t>(kMeasured));
     EXPECT_GT(r.worker->subscriptionPositionForTest(raw), 1000) << "the Raw subscription was served";
     EXPECT_EQ(total, 0u) << "worst batch allocated " << worst;
+}
+
+// REGRESSION (Task 8 review 4, N-2): a view whose every window erases and rewrites its 2000 rows (past twice the dirty set's
+// reserve) drains and trims its dirty set with no allocation once warm: the second large window in a row keeps the capacity.
+// The trim gave it back after every drain, so each window allocated it again.  A small window then gives the capacity back.
+TEST(CheckedWritesAllocRegression, HighChurnDirtyDrainAllocatesNothingRegression) {
+    const rune::view::RowLayout layout = rune::view::buildRowLayout(
+        rune::codec::DescriptorBuilder("v", 1).add("id", rune::codec::PrimType::Int64, 1, true).add("hp", rune::codec::PrimType::Int32).build());
+    rune::view::ViewTable t(layout, 64, layout.rowLen * 256);
+    for (uint64_t k = 0; k < 2000; ++k) (void)t.put(k);
+    const auto window = [&](uint64_t from, uint64_t n) {
+        for (uint64_t k = from; k < from + n; ++k) (void)t.erase(k % 2000);
+        for (uint64_t k = from; k < from + n; ++k) (void)t.put(k % 2000);
+        t.drainDirtyKeyed([](auto&&...) {});
+        t.trimDirty();
+    };
+    for (uint64_t w = 0; w < 4; ++w) window(0, 2000);   // warm-up
+    uint64_t allocs = 0;
+    {
+        rune::testing::AllocWindow aw;
+        for (int w = 0; w < 50; ++w) window(0, 2000);
+        allocs = aw.count();
+    }
+    EXPECT_EQ(allocs, 0u) << "steady churn keeps its dirty set";
+    EXPECT_GT(t.dirtyBytes(), 0u) << "the kept growth stays charged";
+    window(0, 10);
+    EXPECT_EQ(t.dirtyBytes(), 0u) << "a small window gives it back";
+}
+
+// Review 5 N-3: a long span's window after steady churn was kept at its push, and a view gone quiet kept it charged for good.
+TEST(CheckedWritesAllocRegression, LongWindowAfterSteadyChurnIsGivenBackRegression) {
+    const rune::view::RowLayout layout = rune::view::buildRowLayout(
+        rune::codec::DescriptorBuilder("v", 1).add("id", rune::codec::PrimType::Int64, 1, true).add("hp", rune::codec::PrimType::Int32).build());
+    rune::view::ViewTable t(layout, 64, layout.rowLen * 256);
+    for (uint64_t k = 0; k < 2000; ++k) (void)t.put(k);
+    const auto window = [&](int rounds) {   // every round rewrites the whole table: a deleted entry per erase
+        for (int r = 0; r < rounds; ++r) {
+            for (uint64_t k = 0; k < 2000; ++k) (void)t.erase(k);
+            for (uint64_t k = 0; k < 2000; ++k) (void)t.put(k);
+        }
+        t.drainDirtyKeyed([](auto&&...) {});
+        t.trimDirty();
+    };
+    for (int w = 0; w < 6; ++w) window(1);
+    const size_t steady = t.dirtyBytes();
+    ASSERT_GT(steady, 0u) << "steady churn keeps its dirty set";
+    window(10);   // the long span's window, pushed; then the view goes quiet
+    EXPECT_LE(t.dirtyBytes(), steady) << "no standing charge past the steady window's";
+}
+
+// Review 7 m-3: an empty drain (a member's quiet judge pass, a pass of only control records) counted as a window of 0, so the next
+// real window was more than twice it and was given back at its push: an allocation per window again.
+TEST(CheckedWritesAllocRegression, EmptyDrainsBetweenWindowsAllocateNothingRegression) {
+    const rune::view::RowLayout layout = rune::view::buildRowLayout(
+        rune::codec::DescriptorBuilder("v", 1).add("id", rune::codec::PrimType::Int64, 1, true).add("hp", rune::codec::PrimType::Int32).build());
+    rune::view::ViewTable t(layout, 64, layout.rowLen * 256);
+    for (uint64_t k = 0; k < 2000; ++k) (void)t.put(k);
+    const auto window = [&] {
+        for (uint64_t k = 0; k < 2000; ++k) (void)t.erase(k);
+        for (uint64_t k = 0; k < 2000; ++k) (void)t.put(k);
+        t.drainDirtyKeyed([](auto&&...) {});
+        t.trimDirty();
+        t.drainDirtyKeyed([](auto&&...) {});   // an empty drain, then its trim
+        t.trimDirty();
+    };
+    for (int w = 0; w < 4; ++w) window();   // warm-up
+    uint64_t allocs = 0;
+    {
+        rune::testing::AllocWindow aw;
+        for (int w = 0; w < 20; ++w) window();
+        allocs = aw.count();
+    }
+    EXPECT_EQ(allocs, 0u) << "an empty drain is not a window";
+    EXPECT_GT(t.dirtyBytes(), 0u);
 }

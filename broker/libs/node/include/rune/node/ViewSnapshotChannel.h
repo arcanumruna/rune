@@ -113,6 +113,11 @@ struct ViewSnapshotChannel {
     static constexpr int32_t     kCatalogMarkMsgType = 7;
     // 4 was the checkpoint-truncate "reset" frame.  Retired (replaced by kDiscardMsgType = 5, discard + backup): the value is never reused.
     static constexpr std::size_t kDeltaHeaderBytes = 8;  // viewTopicId i32 + partition i32
+    // P11-9: a delta past one message goes as a run of these, in order, for one (view, partition): [view i32][part i32][at u32]
+    // [more u8][pad 3], then the delta's bytes from `at`.  at 0 starts a run.  The IO agent writes each part as it comes and moves
+    // the durable offset (the ack) only on the part without `more`; a run cut short is a torn tail that recovery drops.
+    static constexpr int32_t     kDeltaPartMsgType     = 8;
+    static constexpr std::size_t kDeltaPartHeaderBytes = 16;
     static constexpr std::size_t kDoneMsgBytes      = 16; // viewTopicId i32 + partition i32 + O i64
 
     OneToOneByteRing deltas{1 << 20};  // worker -> IO

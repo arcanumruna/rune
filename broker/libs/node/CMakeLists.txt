@@ -1401,7 +1401,7 @@ if(BUILD_TESTING)
             gtest_discover_tests(rune_checked_writes_ack_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Checked writes Part 04: the verdict pipeline on a real Worker.
-            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesKeyIndexWideTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp tests/node/CheckedWritesCatalogGateTest.cpp tests/node/CheckedWritesConstraintWorkerTest.cpp tests/node/CheckedWritesConstraintChangeTest.cpp tests/node/CheckedWritesTxnWorkerTest.cpp)
+            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesKeyIndexWideTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp tests/node/CheckedWritesCatalogGateTest.cpp tests/node/CheckedWritesConstraintWorkerTest.cpp tests/node/CheckedWritesConstraintChangeTest.cpp tests/node/CheckedWritesTxnWorkerTest.cpp tests/node/CheckedWritesTxnVisibilityTest.cpp)
             target_include_directories(rune_checked_writes_verdict_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
             target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view rune_ql aeron::aeron GTest::gtest_main)
             # The full-length determinism runs (two whole seeds, over 1 s alone) carry LABELS stress; the default runs half the steps.
@@ -2050,7 +2050,7 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_ns_hotpath_suspend_alloc_tests PROPERTIES TIMEOUT 600)
 
         # Namespaces Phase 2 Task 12 (D26): the namespace view-memory limit pauses views at an offset and resumes them.
-        add_executable(rune_ns_view_memory_tests tests/node/NsViewMemoryRegressionTest.cpp)
+        add_executable(rune_ns_view_memory_tests tests/node/NsViewMemoryRegressionTest.cpp tests/support/AllocWindow.cpp)
         target_include_directories(rune_ns_view_memory_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_ns_view_memory_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
                               aeron::aeron GTest::gtest_main)

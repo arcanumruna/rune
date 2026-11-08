@@ -267,7 +267,9 @@ int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
 } // namespace
 
 WorkerViewSet::WorkerViewSet(ViewSnapshotChannel& channel, std::string viewDataDir, uint64_t hashSeed)
-    : channel_(channel), viewDataDir_(std::move(viewDataDir)), hashSeed_(hashSeed) {}
+    : channel_(channel), viewDataDir_(std::move(viewDataDir)), hashSeed_(hashSeed) {
+    txnOverlays_.supersedeKeys.seed(hashSeed);
+}
 
 void WorkerViewSet::installView(rune::view::CompiledViewPlan plan,
                                 rune::view::RowLayout layout,
@@ -664,6 +666,7 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
             return nullptr;
         }
     }
+    if (passCapForTest_ > 0) inst.maxRecordsPerPass = passCapForTest_;
 
     // Bug A fix (whole-branch re-review): a view installed FOR RESTART
     // RECOVERY must never serve a lazily-created DEFAULT-READY instance, even
@@ -1043,6 +1046,12 @@ int WorkerViewSet::buildAndPushKeyedCheckpoint_(ViewInstance& inst) {
 
 int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
     if (!checkpointSettled(inst)) return 0;   // belt and braces: driveView_ step 0a already returned
+    // P11-0: no checkpoint inside an open span (a refold from it would never see the span's records below it) or an application in
+    // progress.  The dirty rows wait for the first cursor outside every span.
+    if (inst.spanFence.fenced() || inst.spanFence.straddles(inst.foldCursor)) [[unlikely]] {
+        if (viewTablesDirty(inst)) ++inst.counters.vetoedCheckpointPushes;   // a push refused, not a pass with nothing to push
+        return 0;
+    }
     if (inst.keyed) return buildAndPushKeyedCheckpoint_(inst);
     dirtyEntries_.clear();
     rowOffsets_.clear();
@@ -1118,13 +1127,7 @@ int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
 bool WorkerViewSet::tryPushDelta_(ViewInstance& inst) {
     const std::size_t frameLen =
         ViewSnapshotChannel::kDeltaHeaderBytes + inst.pendingDelta.size();
-    if (frameLen > static_cast<std::size_t>(channel_.deltas.maxMsgLength())) [[unlikely]] {   // a claim this large throws
-        if (!inst.deltaOversized)
-            spdlog::critical("VIEW-DELTA-TOO-LARGE view={} partition={} bytes={} max={} -- checkpoints stop; a restart refolds from the last one",
-                             inst.plan.viewTopicId, inst.partition, frameLen, channel_.deltas.maxMsgLength());
-        inst.deltaOversized = true;
-        return false;
-    }
+    if (inst.pendingSent != 0 || frameLen > static_cast<std::size_t>(channel_.deltas.maxMsgLength())) [[unlikely]] return tryPushDeltaParts_(inst);
 
     const auto claim =
         channel_.deltas.tryClaim(ViewSnapshotChannel::kDeltaMsgType, frameLen);
@@ -1138,6 +1141,31 @@ bool WorkerViewSet::tryPushDelta_(ViewInstance& inst) {
     channel_.deltas.commit(claim);
 
     inst.pendingValid = false;
+    releaseWindow_(inst);
+    return true;
+}
+
+// P11-9: a delta past one ring message (a claim that large throws), as part frames; on back-pressure the rest goes next pass.
+bool WorkerViewSet::tryPushDeltaParts_(ViewInstance& inst) {
+    const std::size_t room = static_cast<std::size_t>(channel_.deltas.maxMsgLength()) - ViewSnapshotChannel::kDeltaPartHeaderBytes;
+    while (inst.pendingSent < inst.pendingDelta.size()) {
+        const std::size_t n = std::min(room, inst.pendingDelta.size() - inst.pendingSent);
+        const auto claim = channel_.deltas.tryClaim(ViewSnapshotChannel::kDeltaPartMsgType, ViewSnapshotChannel::kDeltaPartHeaderBytes + n);
+        if (claim < 0) return false;   // ring full: the run resumes here next pass
+        uint8_t* dst = channel_.deltas.base() + claim;
+        writeI32LE(dst, inst.plan.viewTopicId);
+        writeI32LE(dst + 4, inst.partition);
+        writeI32LE(dst + 8, static_cast<int32_t>(inst.pendingSent));
+        dst[12] = inst.pendingSent + n < inst.pendingDelta.size() ? 1 : 0;
+        dst[13] = dst[14] = dst[15] = 0;
+        std::memcpy(dst + ViewSnapshotChannel::kDeltaPartHeaderBytes, inst.pendingDelta.data() + inst.pendingSent, n);
+        channel_.deltas.commit(claim);
+        inst.pendingSent += n;
+    }
+    inst.pendingSent  = 0;
+    inst.pendingValid = false;
+    std::vector<uint8_t>().swap(inst.pendingDelta);   // a run's buffer is past one message: give it back
+    releaseWindow_(inst);
     return true;
 }
 
@@ -1458,9 +1486,10 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
     return work;
 }
 
-int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns) {
+int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, int64_t nowNs, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns) {
     if (const auto kit = keyIndexes_.find(instKey(srcTopicId, partition)); kit != keyIndexes_.end()) {
         adoptNs_(kit->second, ns);
+        quietPass_(kit->second, nowNs);   // a pass that applied to it restarted the clock (discardKeyIndexDirty_)
         chargeMem_(kit->second);
     }
     const auto sit = subscriptionIndex_.find(srcTopicId);
@@ -1471,6 +1500,7 @@ int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, in
         if (vit == views_.end()) continue;
         ViewInstance& inst = vit->second;
         adoptNs_(inst, ns);
+        quietPass_(inst, nowNs);   // as the key index: a push restarts the clock, so a member whose judge stopped (stall, install wait, Locked) gives back too
         chargeMem_(inst);
         if (inst.foldLeadership != leaderGen) {
             inst.foldLeadership = leaderGen;
@@ -1540,6 +1570,7 @@ void WorkerViewSet::beginDiscard_(ViewInstance& inst, ViewDiscardReason reason) 
     if (inst.agg) inst.agg.emplace(rune::view::buildAggLayout(inst.plan, inst.evolvingSrc).value(), indexSlots, chunkBytes, inst.tableKeys);
     if (inst.keyed) buildKeyedTables(inst, indexSlots, chunkBytes);
     inst.foldCursor = 0;
+    inst.spanFence.clear();
     inst.lastEncodedO = -1;
     inst.lastDurableO = -1;
     inst.transientCursor = CursorFresh{};
@@ -1566,10 +1597,7 @@ bool WorkerViewSet::startAtLogStart_(ViewInstance& inst, int64_t logStart) {
 bool WorkerViewSet::tryPushDiscard_(ViewInstance& inst) {
     const auto* owed = std::get_if<CheckpointDiscardOwed>(&inst.checkpoint);
     if (owed == nullptr) return false;
-    if (inst.pendingValid && !tryPushDelta_(inst)) {   // the held delta belongs to the old stream: it precedes the frame
-        if (!inst.deltaOversized) return false;
-        inst.pendingValid = inst.deltaOversized = false;   // never pushed: the backup goes without it
-    }
+    if (inst.pendingValid && !tryPushDelta_(inst)) return false;   // the held delta belongs to the old stream: it precedes the frame
     const auto claim = channel_.deltas.tryClaim(kDiscardMsgType, static_cast<std::size_t>(kDiscardMsgBytes));
     if (claim < 0) return false;            // ring full: retried next pass
     uint8_t* dst = channel_.deltas.base() + claim;

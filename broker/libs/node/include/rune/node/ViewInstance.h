@@ -135,6 +135,11 @@ struct ViewFoldCounters {
     uint64_t uniquePromotions        = 0;   // unique view: an extra claimant became the owner of a key
     uint64_t scanRows                = 0;   // rows served by scanPage
     uint64_t scanPages               = 0;   // pages served by scanPage
+    uint64_t txnSpanTableFull        = 0;   // P11-9: a transactional batch found the span fence full and applied at its offsets
+    uint64_t txnSuperseded           = 0;   // P11-3a: a committed transaction's record another writer superseded before its marker
+    uint64_t txnReadFailed           = 0;   // P11-9: a span read-back below its marker failed (I/O error, damaged segment); retried next pass
+    uint64_t txnNoteWaits            = 0;   // P11-3a: a marker application waited for the worker's supersede key set
+    uint64_t vetoedCheckpointPushes  = 0;   // P11-0: a checkpoint not pushed because the cursor stood inside an open span
 };
 
 // Where the persisted checkpoint of an instance stands in a discard (one explicit state, each holding only what it needs):
@@ -251,6 +256,8 @@ struct ViewInstance {
     uint16_t                           nsSlot          = kNoNsSlot;
     uint32_t                           nsId            = 0;
     std::size_t                        memCharged      = 0;
+    bool                               windowKept      = false;   // a drain left dirty capacity kept (WorkerViewSet::releaseWindow_)
+    int64_t                            quietSinceNs    = -1;      // the pass the quiet clock started: the first quietPass_ at or after the last window ended
 
     // C1 (Task 22 fix round 1): the source replica's leadershipGeneration() this
     // table is caught up under; 0 = never driven by a leader.  A read is served
@@ -266,9 +273,11 @@ struct ViewInstance {
     // dirty rows, so no delta is ever lost or double-counted.
     std::vector<uint8_t>               pendingDelta;
     bool                               pendingValid    = false;
-    // The held delta outgrew one ring message (a verdict member whose judge ran ahead of an ordinary transaction's marker): it is
-    // never pushed, so checkpoints stop and a restart refolds from the last one.
-    bool                               deltaOversized  = false;
+    // A held delta past one ring message goes as a run of part frames (P11-9): the bytes of it already framed.
+    std::size_t                        pendingSent     = 0;
+    // P11-0 / P11-9 (contract addition 13): the transactions this instance's fold met and has not applied yet, and whether an
+    // application is in progress (reads held).  Consistent with foldCursor: every reset of the cursor clears it.
+    rune::view::TxnSpanFence           spanFence;
     // Part 04 (P4-4) / view backups: where this instance's checkpoint file stands in a discard (see CheckpointState).  Anything but
     // CheckpointLive means the instance folds nothing, checkpoints nothing and serves NotReady.
     CheckpointState                    checkpoint{CheckpointLive{}};
@@ -325,6 +334,14 @@ inline void buildKeyedTables(ViewInstance& inst, std::size_t indexSlots, std::si
            (!i.agg->groupIds || i.agg->groupIds->size() == 0);
 }
 
+/// True when some table of the instance has a row its next checkpoint would carry.
+[[nodiscard]] inline bool viewTablesDirty(const ViewInstance& i) noexcept {
+    if (i.table.hasDirty() || (i.owners && i.owners->hasDirty())) return true;
+    if (!i.agg) return false;
+    return i.agg->contributors.hasDirty() || i.agg->groups.hasDirty() || (i.agg->blocks && i.agg->blocks->hasDirty()) ||
+           (i.agg->groupIds && i.agg->groupIds->hasDirty());
+}
+
 /// The log range a source partition holds: retention may have trimmed it below a cursor (logStart); logEnd bounds a checkpoint.
 /// The default (0, INT64_MAX) says nothing, so a caller without a disk log (a transient source, a unit test) changes no behaviour.
 struct SourceLogBounds {
@@ -332,12 +349,14 @@ struct SourceLogBounds {
     int64_t logEnd   = INT64_MAX;
 };
 
-/// Retention trimmed the source below this instance's cursor.  An instance holding no rows starts at the log start (true);
-/// one holding rows folded from records that no longer exist cannot be trusted: false = the caller discards it (BelowLogStart).
+/// Retention trimmed the source below this instance's cursor, or below an open span's first batch.  An instance holding no rows
+/// below the log start starts there (true).  One holding rows folded from records that no longer exist, or standing at a marker
+/// whose span lost its first batches, cannot be trusted: false = the caller discards it (BelowLogStart) and it refolds.
 [[nodiscard]] inline bool startAtLogStart(ViewInstance& i, int64_t logStart) noexcept {
-    if (!viewTablesEmpty(i)) return false;
+    if (i.foldCursor >= logStart || !viewTablesEmpty(i)) return false;
     i.counters.sourceRecordsTrimmed += static_cast<uint64_t>(logStart - i.foldCursor);
     i.foldCursor   = logStart;
+    i.spanFence.clear();   // every open span started below the old cursor: its records are gone
     i.lastEncodedO = logStart - 1;
     return true;
 }
