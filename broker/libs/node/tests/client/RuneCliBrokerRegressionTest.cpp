@@ -10,6 +10,8 @@
 #include <rune/catalog/CatalogQueries.h>
 #include <rune/cli/CatalogCommands.h>
 #include <rune/cli/Cli.h>
+#include <rune/codec/Descriptor.h>
+#include <rune/codec/Serialize.h>
 
 #include <gtest/gtest.h>
 
@@ -224,6 +226,94 @@ TEST(RuneCliBrokerRegression, ReplayClusterIdDefaultsToTheFromArgumentVerbatim) 
     EXPECT_EQ(d[1].event.replayedFrom->clusterId, src.endpoint());
     EXPECT_EQ(d[0].event.principal.requestId, rune::cli::replayRequestId(src.endpoint(), 0));
     EXPECT_EQ(d[1].event.principal.requestId, rune::cli::replayRequestId(src.endpoint(), 1));
+}
+
+// Lease Task 3c: a lease topic, a key.index topic and an autoincrement topic defined with the CLIENT primitives
+// (TopicOptions::lease / keyFeatures) on a real broker, then replayed by the real CLI onto a fresh broker.  The
+// target's catalog fingerprints, stored descriptor, lease and key features equal the source's.
+TEST(RuneCliBrokerRegression, LeaseTopicClientBrokerRegression) {
+    namespace cd = rune::codec;
+    OneBroker src("cli_lease_src"), dst("cli_lease_dst");
+    const rune::protocol::LeaseSpec spec{.ttlMs = 10000, .minTtlMs = 1000, .maxTtlMs = 60000, .maxKeys = 1,
+                                         .expiryBatch = 64, .checkpoint = 0, .checkpointIntervalMs = 1000,
+                                         .checkpointRate = 1};
+    rune::client::Client* c = src.connectClient();
+    {
+        cd::DescriptorBuilder d("inst");
+        d.addFixedStr("id", 64, 1, /*isKey=*/true).add("note", cd::PrimType::Int32);
+        const auto blob = cd::serialize(d.build());
+        rune::client::TopicOptions o;
+        o.config.cleanupPolicy = 1;
+        o.config.retentionMs   = -1;
+        o.config.retentionBytes = -1;
+        o.lease = spec;
+        const auto r = c->defineTopicAndWait("inst", 1, "id", blob, rune::client::Persistence::Disk, o, {}, 10s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+    }
+    {
+        cd::DescriptorBuilder d("kidx");
+        d.add("id", cd::PrimType::UInt64, 1, /*isKey=*/true).add("v", cd::PrimType::Int32);
+        rune::client::TopicOptions o;
+        o.keyFeatures.keyIndex = true;
+        const auto r = c->defineTopicAndWait("kidx", 1, "id", cd::serialize(d.build()), rune::client::Persistence::Disk, o, {}, 10s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+    }
+    {
+        cd::DescriptorBuilder d("auto");
+        d.add("id", cd::PrimType::UInt64, 1, /*isKey=*/true).add("v", cd::PrimType::Int32);
+        rune::client::TopicOptions o;
+        o.keyFeatures.keyIndex = true;
+        o.keyFeatures.autoIncrement = true;
+        o.config.cleanupPolicy = 1;
+        o.keyFeatures.autoIncrementReserve = 77;
+        const auto r = c->defineTopicAndWait("auto", 1, "id", cd::serialize(d.build()), rune::client::Persistence::Disk, o, {}, 10s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+    }
+
+    const auto sc = c->getTopicSchemaAndWait("inst", 0, 10s);
+    ASSERT_EQ(sc.errorCode, 0);
+    ASSERT_TRUE(sc.lease.has_value()) << "the schema result carries the lease";
+    EXPECT_EQ(*sc.lease, spec);
+    const auto stored = cd::deserialize(sc.descriptorBlob);
+    ASSERT_GE(stored.fields.size(), 5u);
+    EXPECT_EQ(stored.fields[0].name, "lease_version");
+    EXPECT_EQ(stored.fields[1].name, "lease_ttl_ms");
+    EXPECT_EQ(stored.fields[2].name, "lease_holder");
+    EXPECT_EQ(stored.fields[3].name, "lease_remaining_ms");
+    EXPECT_EQ(stored.fields[4].name, "id");
+
+    std::string out, err;
+    ASSERT_EQ(runCli({"catalog", "replay", "--from", src.endpoint(), "--into", dst.endpoint(), "--cluster-id", "src"}, &out, &err), 0)
+        << err;
+    const auto s = src.catalogEvents(), d = dst.catalogEvents();
+    ASSERT_EQ(d.size(), s.size());
+    for (std::size_t i = 0; i < d.size(); ++i)
+        EXPECT_EQ(d[i].event.fingerprint, s[i].event.fingerprint) << "offset " << i;
+
+    rcat::CatalogReplayer sr, dr;
+    for (const auto& e : s) ASSERT_TRUE(sr.feedDecoded(e.offset, e.event).has_value());
+    for (const auto& e : d) ASSERT_TRUE(dr.feedDecoded(e.offset, e.event).has_value());
+    for (const char* name : {"inst", "kidx", "auto"}) {
+        const auto* st = sr.state().topicByName(rune::catalog::kDefaultNsId, name);
+        const auto* dt = dr.state().topicByName(rune::catalog::kDefaultNsId, name);
+        ASSERT_NE(st, nullptr) << name;
+        ASSERT_NE(dt, nullptr) << name;
+        ASSERT_TRUE(st->schema && dt->schema) << name;
+        EXPECT_EQ(dt->lease, st->lease) << name;
+        EXPECT_EQ(dt->schema->keyFeatures, st->schema->keyFeatures) << name;
+        EXPECT_EQ(dt->schema->evolvingBlob, st->schema->evolvingBlob) << name;
+    }
+    EXPECT_EQ(dr.state().topicByName(rune::catalog::kDefaultNsId, "inst")->lease, std::optional<rune::protocol::LeaseSpec>(spec));
+    EXPECT_TRUE(dr.state().topicByName(rune::catalog::kDefaultNsId, "kidx")->schema->keyFeatures.keyIndex) << "replay keeps key.index";
+    EXPECT_TRUE(dr.state().topicByName(rune::catalog::kDefaultNsId, "auto")->schema->keyFeatures.autoIncrement) << "replay keeps autoincrement";
+    EXPECT_EQ(dr.state().topicByName(rune::catalog::kDefaultNsId, "auto")->schema->keyFeatures.autoIncrementReserve, 77u);
+
+    // The target broker itself answers the same schema and lease.
+    const auto tc = dst.connectClient()->getTopicSchemaAndWait("inst", 0, 10s);
+    ASSERT_EQ(tc.errorCode, 0);
+    EXPECT_EQ(tc.descriptorBlob, sc.descriptorBlob);
+    ASSERT_TRUE(tc.lease.has_value());
+    EXPECT_EQ(*tc.lease, spec);
 }
 
 TEST(RuneCliBrokerRegression, ReplayRemapsViewSourcesOntoTheTargetsOwnTopicIds) {

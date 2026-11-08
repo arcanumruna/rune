@@ -17,7 +17,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <rune/protocol/LeaseSpec.h>
 #include <type_traits>
 
 namespace rune::client {
@@ -149,23 +151,36 @@ static_assert(sizeof(Completion) == 40);
 [[nodiscard]] constexpr uint64_t assignedKeyOf(const Completion& c) noexcept { return static_cast<uint64_t>(c.aux); }
 
 /// GetTopicSchema: aux = the schema version (bits 0-15); bit 16 set when the broker sent a key-features block, which then
-/// follows the descriptor blob in the payload as its 14 wire bytes (putTopicKeyFeatures).
-[[nodiscard]] constexpr int64_t schemaAuxOf(uint16_t version, bool hasKeyFeatures) noexcept {
-    return static_cast<int64_t>(version) | (hasKeyFeatures ? int64_t{1} << 16 : 0);
+/// follows the descriptor blob in the payload as its 14 wire bytes (putTopicKeyFeatures); bit 17 set when it also sent a
+/// lease block (lease topics), which follows the key-features block as the LeaseSpec's 39 wire bytes (encodeLeaseSpec).
+[[nodiscard]] constexpr int64_t schemaAuxOf(uint16_t version, bool hasKeyFeatures, bool hasLease = false) noexcept {
+    return static_cast<int64_t>(version) | (hasKeyFeatures ? int64_t{1} << 16 : 0) | (hasLease ? int64_t{1} << 17 : 0);
 }
 [[nodiscard]] constexpr bool schemaHasKeyFeatures(const Completion& c) noexcept { return ((c.aux >> 16) & 1) != 0; }
-/// The descriptor blob of a GetTopicSchema payload, without the key-features block.
+[[nodiscard]] constexpr bool schemaHasLease(const Completion& c) noexcept { return ((c.aux >> 17) & 1) != 0; }
+/// The descriptor blob of a GetTopicSchema payload, without the key-features and lease blocks.
 [[nodiscard]] constexpr std::span<const uint8_t> schemaBlobOf(const Completion& c, std::span<const uint8_t> payload) noexcept {
-    return schemaHasKeyFeatures(c) && payload.size() >= rune::protocol::kTopicKeyFeaturesWireLen
-               ? payload.first(payload.size() - rune::protocol::kTopicKeyFeaturesWireLen) : payload;
+    const std::size_t tail = (schemaHasKeyFeatures(c) ? rune::protocol::kTopicKeyFeaturesWireLen : 0u) +
+                             (schemaHasLease(c) ? rune::protocol::kLeaseSpecBytes : 0u);
+    return payload.size() >= tail ? payload.first(payload.size() - tail) : payload;
 }
 /// The key features of a GetTopicSchema completion (the defaults when the broker sent none).
 [[nodiscard]] inline rune::protocol::TopicKeyFeatures schemaKeyFeaturesOf(const Completion& c, std::span<const uint8_t> payload) noexcept {
     rune::protocol::TopicKeyFeatures f;
-    if (schemaHasKeyFeatures(c) && payload.size() >= rune::protocol::kTopicKeyFeaturesWireLen)
-        (void)rune::protocol::getTopicKeyFeatures(payload.data() + payload.size() - rune::protocol::kTopicKeyFeaturesWireLen,
-                                                  rune::protocol::kTopicKeyFeaturesWireLen, f);
+    const std::size_t lease = schemaHasLease(c) ? rune::protocol::kLeaseSpecBytes : 0u;
+    const std::size_t kf    = rune::protocol::kTopicKeyFeaturesWireLen;
+    if (schemaHasKeyFeatures(c) && payload.size() >= kf + lease)
+        (void)rune::protocol::getTopicKeyFeatures(payload.data() + payload.size() - lease - kf, kf, f);
     return f;
+}
+/// The lease spec of a GetTopicSchema completion; nullopt when the broker sent none.
+[[nodiscard]] inline std::optional<rune::protocol::LeaseSpec> schemaLeaseOf(const Completion& c, std::span<const uint8_t> payload) noexcept {
+    rune::protocol::LeaseSpec l;
+    if (schemaHasLease(c) && payload.size() >= rune::protocol::kLeaseSpecBytes &&
+        rune::protocol::decodeLeaseSpec(payload.data() + payload.size() - rune::protocol::kLeaseSpecBytes,
+                                        rune::protocol::kLeaseSpecBytes, l))
+        return l;
+    return std::nullopt;
 }
 
 /// One rejected record of a judged batch, decoded from its 8-byte wire entry (u16 record index, u16 code, u32 constraintId, LE).

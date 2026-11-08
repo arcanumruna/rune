@@ -1434,7 +1434,9 @@ OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::st
     msg.config            = rune::protocol::convertTopicConfig<rpc::TopicConfigWire>(topic.config);
     msg.hasExt            = true;   // catalog history: every DDL carries the extension
     msg.ext               = ddlExt_(ddl);
-    msg.hasKeyFeatures    = topic.keyFeatures != rune::protocol::TopicKeyFeatures{};
+    msg.hasLease          = topic.lease.has_value();
+    msg.lease             = topic.lease.value_or(rune::protocol::LeaseSpec{});
+    msg.hasKeyFeatures    = topic.keyFeatures != rune::protocol::TopicKeyFeatures{} || msg.hasLease;   // the lease block follows the key block
     msg.keyFeatures       = topic.keyFeatures;
     std::vector<uint8_t> frame(msg.encodedSize());
     const std::size_t n = msg.encode(frame.data());
@@ -3113,6 +3115,7 @@ TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, uint64_t 
                  result.partitionCount = static_cast<int32_t>(c.reserved0);  // Phase 2b C
                 result.hasKeyFeatures = schemaHasKeyFeatures(c);
                 if (result.hasKeyFeatures) result.keyFeatures = schemaKeyFeaturesOf(c, p);
+                result.lease          = schemaLeaseOf(c, p);
                  if (c.status == OpStatus::Ok) {
                     const auto blob = schemaBlobOf(c, p);
                     result.descriptorBlob.assign(blob.begin(), blob.end());
@@ -5014,9 +5017,13 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 payload.resize(payload.size() + rune::protocol::kTopicKeyFeaturesWireLen);
                 rune::protocol::putTopicKeyFeatures(payload.data() + payload.size() - rune::protocol::kTopicKeyFeaturesWireLen,
                                                     opt->keyFeatures);
+                if (opt->hasLease) {
+                    payload.resize(payload.size() + rune::protocol::kLeaseSpecBytes);
+                    rune::protocol::encodeLeaseSpec(opt->lease, payload.data() + payload.size() - rune::protocol::kLeaseSpecBytes);
+                }
             }
             completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
-                         opt->topicId, schemaAuxOf(opt->version, opt->hasKeyFeatures),
+                         opt->topicId, schemaAuxOf(opt->version, opt->hasKeyFeatures, opt->hasLease),
                          opt->errorCode, payload,
                          detail::CompletionRing::Overflow::TooLarge,
                          static_cast<uint32_t>(opt->partitionCount));  // Phase 2b C (<=0 = not reported)

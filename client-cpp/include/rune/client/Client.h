@@ -151,6 +151,8 @@ struct TopicOptions {
     rune::protocol::TopicConfig config{};
     /// Checked writes (broker >= 10): the key index and its options; the default sends nothing.
     rune::protocol::TopicKeyFeatures keyFeatures{};
+    /// A lease topic (broker >= 11); the broker adds the four lease system columns.
+    std::optional<rune::protocol::LeaseSpec> lease;
 };
 
 /// Result of DropTopic / DropView / AlterView / AlterTopicConfig (DdlResponse 78).
@@ -177,6 +179,8 @@ struct TopicSchemaResult {
     /// Checked writes: the topic's key features when the broker sent them (it does iff they are not the defaults);
     bool                             hasKeyFeatures = false;
     rune::protocol::TopicKeyFeatures keyFeatures{};
+    /// Lease topics: the topic's lease spec when the broker sent it (broker >= 11 to a lease-aware session).
+    std::optional<rune::protocol::LeaseSpec> lease;
 };
 
 // ---------------------------------------------------------------------------

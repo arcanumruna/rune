@@ -94,6 +94,40 @@ const std::span<const uint8_t> blob(kBlob, sizeof kBlob);
 const pc::ConfigChangeWire kChanges[] = {{1, 60'000}, {6, -1}};
 } // namespace
 
+TEST_F(ClientCatalogDdl, LeaseDefineFrameRegression) {
+    const rune::protocol::LeaseSpec spec{.ttlMs = 10000, .minTtlMs = 1000, .maxTtlMs = 60000, .maxKeys = 1,
+                                         .expiryBatch = 64, .checkpoint = 0, .checkpointIntervalMs = 1000,
+                                         .checkpointRate = 1};
+    Rig r(invokerCfg(3982, 3983));
+    r.connect();
+    auto& frames = r.capture(pc::DefineTopic::TEMPLATE_ID);
+    rc::TopicOptions leased;
+    leased.lease = spec;
+    rc::DdlOptions ddl;
+    ddl.requestId = RequestId{1, 2};
+    r.run([&](rc::Completions& q, rc::Token t) {
+        return r.client.defineTopic("t", 1, "", blob, rc::Persistence::Disk, leased, ddl, q, t);
+    });
+    r.run([&](rc::Completions& q, rc::Token t) {
+        return r.client.defineTopic("t", 1, "", blob, rc::Persistence::Disk, rc::TopicOptions{}, ddl, q, t);
+    });
+    ASSERT_EQ(frames.size(), 2u);
+    const auto with = pc::DefineTopic::decode(frames[0].data(), frames[0].size());
+    ASSERT_TRUE(with.has_value());
+    EXPECT_TRUE(with->hasLease);
+    EXPECT_EQ(with->lease, spec);
+    EXPECT_TRUE(with->hasKeyFeatures) << "the lease block rides behind the key block";
+    EXPECT_EQ(with->keyFeatures, rune::protocol::TopicKeyFeatures{});
+    // Without a lease: byte-identical to the protocol encoder's frame (the correlation id and session aside).
+    const auto plain = pc::DefineTopic::decode(frames[1].data(), frames[1].size());
+    ASSERT_TRUE(plain.has_value());
+    EXPECT_FALSE(plain->hasLease);
+    EXPECT_FALSE(plain->hasKeyFeatures);
+    std::vector<uint8_t> again(plain->encodedSize());
+    ASSERT_EQ(plain->encode(again.data()), frames[1].size());
+    EXPECT_EQ(again, frames[1]);
+}
+
 TEST_F(ClientCatalogDdl, DefineTopicSendsReplicationFactorConfigAndExtension) {
     rc::ClientConfig cfg = invokerCfg(3980, 3981);
     cfg.clientName = "ql-test";
