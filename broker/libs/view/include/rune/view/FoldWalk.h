@@ -264,18 +264,23 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
     std::size_t bytes = 0;
     const int64_t spanFirst = fence.find(pid)->first;
     // A failed read stops the application where it stands: the span stays open, applied records stay fenced, and the next call
-    // retries.  It never closes the span, which would let a checkpoint pass records never applied.
+    // retries.  It never closes the span, which would let a checkpoint pass records never applied.  The key set is given up, so a
+    // read that keeps failing never holds another instance's marker; the retry notes again from where it stands.
     const auto paused = [&] {
         if (at > spanFirst) fence.applyingThrough = at - 1;
         return false;
     };
+    const auto release = [&] {
+        txn.keys.release();
+        fence.noteToken = 0;
+    };
     const auto failed = [&] {
         ++stats.txnReadFailed;
+        release();
         return paused();
     };
     const auto done = [&] {
-        txn.keys.release();
-        fence.noteToken = 0;
+        release();
         return true;
     };
     while (at < marker) {

@@ -604,6 +604,38 @@ TEST(CheckedWritesTxnVisibilityRegression, SharedKeySetWaitsForItsHolderThenTake
     EXPECT_TRUE(b.sameRows(alone, 1100));
 }
 
+// A holder whose read-back keeps failing (a damaged segment) gives the shared key set up on every failure: another instance's
+// marker applies within two calls, and the failing one still finishes once its reads work again.
+TEST(CheckedWritesTxnVisibilityRegression, FailingHolderNeverHoldsTheSharedKeySetRegression) {
+    TxnLog logA, logB;
+    for (TxnLog* log : {&logA, &logB}) {
+        log->data({{1, 1, 10}, {2, 1, 20}}, 7);
+        log->data({{3, 1, 30}});
+        log->marker(7, true);
+    }
+    const int64_t m = logA.end - 1;
+    Folder alone(false), a(false), b(false);
+    b.keys = &a.ownKeys;
+    while (alone.cursor <= m) alone.pass(logA, logA.end, 2);
+    a.pass(logA, logA.end, 2);   // a stands below the marker; every read back from T's first batch fails from here on
+    logA.failFrom = 0;
+    logA.failTo = 1;
+    for (int i = 0; i < 3; ++i) a.pass(logA, logA.end, 2);
+    ASSERT_EQ(a.cursor, m);
+    EXPECT_EQ(a.pass(logA, logA.end, 2).txnReadFailed, 1u);
+    int calls = 0;
+    for (; calls < 6 && b.cursor <= m; ++calls) {
+        b.pass(logB, logB.end, 2);
+        a.pass(logA, logA.end, 2);
+    }
+    EXPECT_LE(calls, 3) << "b waited on a holder that never progresses";
+    EXPECT_TRUE(b.sameRows(alone, 3));
+    EXPECT_EQ(a.cursor, m);
+    logA.failFrom = logA.failTo = -1;
+    for (int i = 0; i < 4 && a.cursor <= m; ++i) a.pass(logA, logA.end, 2);
+    EXPECT_TRUE(a.sameRows(alone, 3));
+}
+
 // A transaction with more keys than one segment notes applies in segments, each superseded by the writes above it; with a pass cap
 // of 3 the result equals the uncapped fold.
 TEST(CheckedWritesTxnVisibility, SegmentsOfManyKeysSupersedeLikeOne) {
