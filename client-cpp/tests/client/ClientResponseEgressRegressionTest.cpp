@@ -328,10 +328,16 @@ TEST(ClientResponseEgressRegression, ProduceHeldUntilBound) {
         EXPECT_LT(r.gw.produced[i - 1].corrId, r.gw.produced[i].corrId) << "produces arrive in order";
 }
 
+namespace { void connectThenFreeze(Rig& r); }
+
 TEST(ClientResponseEgressRegression, ReconnectRebindsWithTheNewToken) {
-    Rig r(4130, 4131);
+    // The duty clock is frozen once connected: on a loaded host a bind ack slower than kBindRetryNs would otherwise
+    // show up as a lost-datagram resend among the binds this test counts (#968).
+    Options o; o.fakeClock = true;
+    Rig r(4130, 4131, o);
     const auto w = r.addWorker(0, 4132);
-    ASSERT_TRUE(r.connect());
+    connectThenFreeze(r);
+    if (::testing::Test::HasFatalFailure()) return;
     auto p = r.client.producer(noLinger());
     ASSERT_EQ(r.sendAcked(p, 0, 1), 1);
     ASSERT_EQ(r.gw.binds.size(), 1u);
@@ -612,9 +618,13 @@ TEST(ClientAgentRegression, LostWorkerBindAckIsRecoveredByResendRegression) {
 // pair (new response subscription + new request publication = a new image).  The fake answers per image, so the
 // observable is the image: the reconnect's Connect and the rebind's WorkerBind arrive on images the first session never used.
 TEST(ClientResponseEgressRegression, ReconnectBuildsAFreshResponsePairRegression) {
-    Rig r(4250, 4251);
+    // The duty clock is frozen once connected: on a loaded host a bind ack slower than kBindRetryNs would otherwise
+    // show up as a lost-datagram resend among the binds this test counts (#968).
+    Options o; o.fakeClock = true;
+    Rig r(4250, 4251, o);
     const auto w = r.addWorker(0, 4252);
-    ASSERT_TRUE(r.connect());
+    connectThenFreeze(r);
+    if (::testing::Test::HasFatalFailure()) return;
     auto p = r.client.producer(noLinger());
     ASSERT_EQ(r.sendAcked(p, 0, 2), 2);
     auto imagesAt = [&](int endpoint) {
