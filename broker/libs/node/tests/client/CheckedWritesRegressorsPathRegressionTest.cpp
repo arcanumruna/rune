@@ -138,7 +138,7 @@ std::string goldenStatement(const std::string& marker) {
     text << in.rdbuf();
     for (std::string st : rune::cli::engine::splitStatements(text.str()))
         if (st.find(marker) != std::string::npos) return st;
-    throw std::runtime_error("no statement holding '" + marker + "' in " + path);
+    throw std::runtime_error("regressorspath.rql: no statement holding '" + marker + "' in " + path);
 }
 
 /// The statement of the golden script that defines topic `name`, on one broker.
