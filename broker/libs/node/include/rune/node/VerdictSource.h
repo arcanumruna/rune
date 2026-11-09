@@ -138,7 +138,7 @@ public:
     /// Cold.  The caller's precondition: rows >= txnJudgedRecordsMax x the sum, over the verdict members of the source, of
     /// (key index 1; aggregate 4 x kSlotsPerTable + 3; projection = its applyTo write set + 1), and maxRowLen >= the largest
     /// member table rowLen, ClaimsExtras included (VerdictSource::overlayNeed).  An undersized overlay stalls the judge on a legal
-    /// transaction.  Only grows; an overlay in use keeps its rows until a later call finds it free (pending()).
+    /// transaction.  Only grows; an overlay in use keeps its rows until release() finds it free (pending()).
     void reserveFor(std::size_t rows, uint32_t maxRowLen) {
         rowsWanted_ = std::max(rowsWanted_, rows);
         rowLenWanted_ = std::max(rowLenWanted_, maxRowLen);
@@ -154,7 +154,7 @@ public:
             reservedRowLen_[i] = rowLenWanted_;
         }
     }
-    /// A reserve call left an overlay or a key set in use short: the owner calls again (cold) once they may be free.
+    /// A reserve call left an overlay or a key set in use short: release() retries it once that one is free.
     [[nodiscard]] bool pending() const noexcept { return overlaysPending_ || keysPending_; }
     /// A cleared overlay bound to `sourceKey`, or -1 when all are in use.
     [[nodiscard]] int32_t acquire(uint64_t sourceKey) noexcept {
@@ -169,11 +169,15 @@ public:
     void release(int32_t i) noexcept {
         overlays_[static_cast<std::size_t>(i)].clear();
         inUse_[static_cast<std::size_t>(i)] = false;
+        if (pending()) {   // a reserve found this one in use and short: nothing else retries it
+            reserveKeys(0);
+            reserveFor(0, 0);
+        }
     }
     [[nodiscard]] std::size_t freeCount() const noexcept { return static_cast<std::size_t>(std::count(inUse_.begin(), inUse_.end(), false)); }
     [[nodiscard]] rune::view::TxnOverlay& at(int32_t i) noexcept { return overlays_[static_cast<std::size_t>(i)]; }
     /// Cold: every key set holds at least `keys` keys.  A set whose overlay is in use keeps its keys (a judgement is reading them):
-    /// it grows at the next call that finds it free (keysPending()).  The one-step set has a fixed size: an ordinary transaction is
+    /// release() grows it once it is free (keysPending()).  The one-step set has a fixed size: an ordinary transaction is
     /// refused past it on every leader alike.
     void reserveKeys(std::size_t keys);
     [[nodiscard]] bool keysPending() const noexcept { return keysPending_; }
@@ -390,7 +394,9 @@ private:
     struct TxnProbe { int64_t producerId = -1, first = -1, from = -1, waitAt = -1; };
     struct OwedMarker { int64_t producerId; int64_t judgeOffset; int64_t from; };   // a re-offered TxnJudge's marker, searched from `from`
     // Judge: the judge stands at a TxnJudge to judge (judgePid_).  Locked: a record touches a row a transaction holds (P11-4).
-    enum class TxnStop : uint8_t { None, Probe, Marker, Judge, Locked };
+    // Fold: the judge passed a decided commit's TxnJudge that an active member's replay still owes.  The members replay through it
+    // before the judge goes on (no cursor sync).
+    enum class TxnStop : uint8_t { None, Probe, Marker, Judge, Locked, Fold };
     enum class ProbeStep : uint8_t { Next, Classified, Wait };
     // The transaction being judged at `end`, its TxnJudge (or its marker, P11-7): the chained read of [first, end), then the P11-3
     // scan of (first, end), each from `from` and bounded per pass.  The overlay and its key set are kept across passes.
@@ -1163,7 +1169,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     nowNs_ = nowNs;
     spanBytes_ = voteScanBytes_;
     if (!owedMarkers_.empty()) feedOwedMarkers_(readRange, bound);
-    state.txn.finalizeDecided(state.rejected.coveredThrough(), bound);
+    state.txn.finalizeDecided(state.rejected.coveredThrough());
     rejectedThisPass_ = 0;
     for (const std::size_t i : active_) {
         Member& m = members_[i];
@@ -1229,7 +1235,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
                 if (checkpointCap_ != INT64_MAX && span >= checkpointCap_) break;   // one step past the cap: its delta holds it alone
                 continue;
             }
-            if (txnStop_ == TxnStop::Locked || judgeCursor_ == before) break;
+            if (txnStop_ == TxnStop::Fold || txnStop_ == TxnStop::Locked || judgeCursor_ == before) break;
         }
         state.rejected.noteCovered(judgedThrough());
     }

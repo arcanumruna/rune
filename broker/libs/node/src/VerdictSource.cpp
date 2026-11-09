@@ -1090,6 +1090,13 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
                     txnStop_ = TxnStop::Judge;
                     break;
                 }
+                // A decided commit whose span a member's replay holds open: the member's fold applies it at this J, so the judge stops after it.
+                if (t != nullptr && t->judgeOffset == r.baseOffset() && t->phase == TxnPhase::Finalized && t->commit &&
+                    std::any_of(active_.begin(), active_.end(), [&](std::size_t i) { return members_[i].inst->spanFence.find(t->producerId) != nullptr; })) {
+                    judgeCursor_ = last + 1;
+                    txnStop_ = TxnStop::Fold;
+                    break;
+                }
             }
             if (control && (attrs & proto::batch::kAttrTransactional) != 0 && !ordinary_.empty()) {   // a COMMIT / ABORT
                 const auto o = std::find_if(ordinary_.begin(), ordinary_.end(), [&](const OrdinaryTxn& t) { return t.producerId == r.producerId() && t.marker == r.baseOffset(); });
@@ -1156,7 +1163,7 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
         judgeCursor_ = halt ? limit : std::max(judgeCursor_, last + 1);
         pos += static_cast<std::size_t>(r.totalLength());
     }
-    syncMemberCursors_();
+    if (txnStop_ != TxnStop::Fold) syncMemberCursors_();
     return work;
 }
 

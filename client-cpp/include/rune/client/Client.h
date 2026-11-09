@@ -1767,7 +1767,7 @@ private:
     // ---- D4 coordinator route (duty thread only) ----------------------------
     // Kafka's coordinator connection: empty = the seed (byte-identical to the
     // pre-D4 client until a NotCoordinator answer names another node).
-    detail::CoordRoute coordRoute_;   // #362: CoordSeed, or CoordRemote{session index, channel, failBase, downSince}
+    detail::CoordRoute coordRoute_;   // #362: CoordSeed, or CoordRemote{session index, channel, failBase, downSince, staleBase, wasUp}
     [[nodiscard]] uint32_t coordIdx() const noexcept { return detail::coordIdxOf(coordRoute_); }
     [[nodiscard]] uint64_t staleLossesAt_(uint32_t idx) const noexcept;   // session idx's stale-session losses, not the client's own stalls
     // A coordinator session that stays down past kCoordDownFallbackNs is given up like an exhausted connect budget (back to the

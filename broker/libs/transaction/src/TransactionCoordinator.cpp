@@ -262,6 +262,7 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
     meta->state              = TxnState::Empty;
     meta->partitions.clear();
     meta->pendingOffsets.clear();
+    meta->voteNoCode         = 0;
     meta->txnStartNs         = 0;
     meta->fencingEpoch       = false;
     meta->markersPending     = false;
@@ -308,6 +309,7 @@ AddPartitionsResult TransactionCoordinator::addPartitions(
         meta->fencingEpoch = false;
         meta->partitions.clear();
         meta->pendingOffsets.clear();
+        meta->voteNoCode = 0;
     }
     meta->coordinatorEpoch = coordinatorEpoch_;
 
@@ -429,6 +431,7 @@ AddPartitionsResult TransactionCoordinator::addOffsetsToTxn(
         meta->fencingEpoch = false;
         meta->partitions.clear();
         meta->pendingOffsets.clear();
+        meta->voteNoCode = 0;
     }
     if (meta->state != TxnState::Ongoing) {
         return { .errorCode = AddPartitionsResult::kInvalidTransition };

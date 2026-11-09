@@ -1405,8 +1405,8 @@ if(BUILD_TESTING)
             add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesKeyIndexWideTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp tests/node/CheckedWritesCatalogGateTest.cpp tests/node/CheckedWritesConstraintWorkerTest.cpp tests/node/CheckedWritesConstraintChangeTest.cpp tests/node/CheckedWritesTxnWorkerTest.cpp tests/node/CheckedWritesTxnVisibilityTest.cpp)
             target_include_directories(rune_checked_writes_verdict_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
             target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view rune_ql aeron::aeron GTest::gtest_main)
-            # The full-length determinism runs (two whole seeds, over 1 s alone) carry LABELS stress; the default runs half the steps.
-            set(RUNE_CW_VERDICT_STRESS_TESTS "*SameSeedSameTraceFullLength*")
+            # The full-length runs (over 1 s alone) carry LABELS stress; the default runs half the steps.
+            set(RUNE_CW_VERDICT_STRESS_TESTS "*FullLength*")
             gtest_discover_tests(rune_checked_writes_verdict_tests TEST_FILTER "${RUNE_CW_VERDICT_STRESS_TESTS}"
                                  PROPERTIES TIMEOUT 300 LABELS stress ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
             gtest_discover_tests(rune_checked_writes_verdict_tests TEST_FILTER "-${RUNE_CW_VERDICT_STRESS_TESTS}"
@@ -1951,7 +1951,8 @@ if(BUILD_TESTING)
                        tests/client/CheckedWritesBrokerRegressionTest.cpp
                        tests/client/CheckedWritesTransientViewBrokerRegressionTest.cpp
                        tests/client/CheckedWritesQlBrokerRegressionTest.cpp
-                       tests/client/CheckedWritesRegressorsPathRegressionTest.cpp)
+                       tests/client/CheckedWritesRegressorsPathRegressionTest.cpp
+                       tests/client/CheckedWritesTxnBrokerRegressionTest.cpp)
         target_compile_definitions(rune_client_broker_tests PRIVATE RUNE_QL_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/ql/tests/golden")
         # Phase 2b B Task 8b: ClaimBrokerRegressionTest compiles against the client's build-time generated all-fixed
         # `position.gen.h` (rune_gen_claim_schemas); the embedded client builds it under its own binary dir.
@@ -1965,9 +1966,9 @@ if(BUILD_TESTING)
         # rest of the binary is functional and runs in parallel.
         set(RUNE_CLIENT_BROKER_LATENCY_TESTS
             "AuthGatesRegression.FullScramLoginMedianUnder5msRegression:AuthGatesRegression.FirstLegTimingDoesNotRevealUserExistenceRegression")
-        # The two whole scenarios of the regressors path stay as stress; their default cuts are the tests around them.
+        # The two whole scenarios of the regressors path and the 1,000-transaction run stay as stress; their default cuts are the tests around them.
         set(RUNE_CLIENT_BROKER_STRESS_TESTS
-            "CheckedWritesRegressorsPathRegression.TheWholeScenarioThreeNodesRegression:CheckedWritesRegressorsPathRegression.FailoverDuringDropFinishesTheDropThreeNodesRegression")
+            "CheckedWritesRegressorsPathRegression.TheWholeScenarioThreeNodesRegression:CheckedWritesRegressorsPathRegression.FailoverDuringDropFinishesTheDropThreeNodesRegression:CheckedWritesTxnBrokerRegression.*FullLength*")
         gtest_discover_tests(rune_client_broker_tests TEST_FILTER "${RUNE_CLIENT_BROKER_LATENCY_TESTS}"
                              PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE LABELS latency)
         gtest_discover_tests(rune_client_broker_tests TEST_FILTER "${RUNE_CLIENT_BROKER_STRESS_TESTS}"
@@ -1982,7 +1983,10 @@ if(BUILD_TESTING)
         target_compile_definitions(rune_checked_writes_stress_tests PRIVATE RUNE_QL_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/ql/tests/golden")
         target_link_libraries(rune_checked_writes_stress_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_checked_writes_stress_tests PROPERTIES TIMEOUT 1800 LABELS stress)
+        # The transaction stress has a fast default cut; every other case of the binary is a heavy stress run.
+        set(RUNE_CHECKED_WRITES_TXN_STRESS_TESTS "CheckedWritesTxnStressRegression.*")
+        gtest_discover_tests(rune_checked_writes_stress_tests TEST_FILTER "${RUNE_CHECKED_WRITES_TXN_STRESS_TESTS}" PROPERTIES TIMEOUT 30)
+        gtest_discover_tests(rune_checked_writes_stress_tests TEST_FILTER "-${RUNE_CHECKED_WRITES_TXN_STRESS_TESTS}" PROPERTIES TIMEOUT 1800 LABELS stress)
 
         # Checked writes Part 09 Task 5a (#788): a lagging leader never undoes a newer constraint-set change, on three real brokers.
         add_executable(rune_checked_writes_catalog_gate_cluster_tests tests/integration/CheckedWritesCatalogGateClusterTest.cpp)

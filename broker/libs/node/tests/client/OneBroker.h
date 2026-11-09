@@ -56,7 +56,7 @@ public:
     enum class Runtime { Legacy, Shard };
 
     explicit OneBroker(const std::string& tag, Runtime runtime = Runtime::Legacy,
-                       std::function<void(NodeConfig&)> tweak = {})
+                       std::function<void(NodeConfig&)> tweak = {}, std::function<void(BrokerNode&)> beforeStart = {})
         : dir_(std::filesystem::temp_directory_path() /
                ("rune_onebroker_" + tag + "_" + std::to_string(::getpid()) + "_" + std::to_string(seq_()++))) {
         std::filesystem::remove_all(dir_);
@@ -85,6 +85,7 @@ public:
         }
         if (tweak) tweak(cfg);
         tweak_   = std::move(tweak);
+        beforeStart_ = std::move(beforeStart);
         cfg_     = cfg;
         channel_ = cfg.clientEndpoint.channel;
         startNode_();
@@ -313,6 +314,7 @@ private:
     void startNode_() {
         if (tweak_) tweak_(cfg_);   // re-read on every start: a test that changes what the tweak captures restarts with it
         node_ = std::make_unique<BrokerNode>(cfg_);
+        if (beforeStart_) beforeStart_(*node_);
         node_->start();
         if (!node_->awaitLeader(std::chrono::seconds(30)))
             throw std::runtime_error("OneBroker: the node never became the leader");
@@ -328,6 +330,7 @@ private:
     int                                                ownClients_ = 0;
     NodeConfig                                         cfg_;
     std::function<void(NodeConfig&)>                   tweak_;
+    std::function<void(BrokerNode&)>                   beforeStart_;
     std::unique_ptr<BrokerNode>                        node_;
     std::vector<std::unique_ptr<rune::client::Client>> clients_;
 };

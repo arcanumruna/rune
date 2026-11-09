@@ -219,7 +219,7 @@ TEST(CheckedWritesTxnState, DrainNeverAnswersWithAnUnjudgedDefaultRegression) {
     ASSERT_NE(t.onJudgeRecord(500, {77, 3, 400}), nullptr);
     t.onMarker(77, 520, true);
     ASSERT_TRUE(t.parkVote({1, 0, 77, 3, 500}));
-    t.finalizeDecided(600, 600);
+    t.finalizeDecided(600);
     ASSERT_EQ(t.find(77)->phase, TxnPhase::Finalized);
     int none = 0;
     EXPECT_EQ(t.drainAnswered([&](const ParkedVote&, const DeferredTxn* d) { none += d == nullptr; }), 1);
@@ -237,6 +237,20 @@ TEST(CheckedWritesTxnState, DrainNeverAnswersWithAnUnjudgedDefaultRegression) {
     const DeferredTxn* got = nullptr;
     EXPECT_EQ(t.drainAnswered([&](const ParkedVote&, const DeferredTxn* d) { got = d; }), 1);
     EXPECT_NE(got, nullptr);
+}
+
+// A restart's first pass has no high watermark yet: an entry below the markers' coverage with its marker is decided all the same, or the
+// replay of a view drops the committed transaction at its TxnJudge and nothing applies it again.
+TEST(CheckedWritesTxnState, FinalizeDecidedNeedsNoHighWatermarkRegression) {
+    auto t = reserved();
+    ASSERT_NE(t.onJudgeRecord(500, {77, 3, 400}), nullptr);
+    t.onMarker(77, 520, true);
+    t.finalizeDecided(401);
+    EXPECT_EQ(t.find(77)->phase, TxnPhase::Finalized);
+    ASSERT_NE(t.onJudgeRecord(900, {78, 3, 850}), nullptr);
+    t.onMarker(78, 950, true);
+    t.finalizeDecided(850);
+    EXPECT_EQ(t.find(78)->phase, TxnPhase::AwaitJudge) << "K does not cover its first record";
 }
 
 // REGRESSION (Task 8 review 3, m-1): a rescan's reset drops an entry's hold below an applied ordinary span.  A Finalized, unjudged
@@ -329,6 +343,22 @@ TEST(CheckedWritesTxnPool, AcquireReleaseAndLockSet) {
     EXPECT_EQ(pool.lockSetFor(100).count, ids.size() / 2 - 1);
     EXPECT_EQ(pool.acquire(300), ids[0]);
     EXPECT_EQ(pool.at(ids[0]).rows(), 0u);
+}
+
+// A reserve that finds an overlay in use leaves it short; the release of that overlay grows it, or the next transaction it judges
+// stalls the judge (Capacity) on a row its table can hold.
+TEST(CheckedWritesTxnPool, ReleaseGrowsAnOverlayLeftShortWhileInUseRegression) {
+    TxnOverlayPool pool;
+    pool.reserveFor(4, 8);
+    const int32_t held = pool.acquire(100);
+    ASSERT_GE(held, 0);
+    pool.reserveFor(8, 64);
+    EXPECT_TRUE(pool.pending());
+    EXPECT_LT(pool.at(held).maxRowLen(), 64u);
+    pool.release(held);
+    EXPECT_FALSE(pool.pending());
+    EXPECT_GE(pool.at(held).maxRowLen(), 64u);
+    EXPECT_GE(pool.at(pool.acquire(100)).maxRowLen(), 64u);
 }
 
 namespace {
@@ -1230,6 +1260,22 @@ TEST(CheckedWritesTxnJudgeRegression, OutsideWriteNewerThanTheTxnsLastWriteVotes
     EXPECT_EQ(t->answer.constraintId, 0u);
     EXPECT_EQ(t->answer.failingOffset, 14);
     EXPECT_EQ(r.st.txn.stats.votesNoConflict, 1u);
+}
+
+// The judge answers the constraint before the conflict scan: a record that fails a member is a 55 at that record even with an outside write
+// newer than the transaction's last on its key.
+TEST(CheckedWritesTxnJudgeRegression, ConstraintFailureIsAnsweredBeforeTheConflictScanRegression) {
+    JudgeRig r(VoteMembers{100});
+    r.start();
+    r.log.data({{1}, {2}});          // 10-11
+    r.log.data({{4, 9}}, 77);        // 12, fails the tag member
+    r.log.data({{4}});               // 13, an outside write newer than 77's last on id 4
+    r.log.judge(77, 12);             // 14
+    r.drive();
+    const DeferredTxn* t = r.st.txn.find(77);
+    EXPECT_EQ(t->phase, TxnPhase::Finalized);
+    EXPECT_EQ(t->answer.code, 55);
+    EXPECT_EQ(t->answer.failingOffset, 12);
 }
 
 // After the commit the view's id 4 is 77's record at 15, the latest record of id 4 in the log (what compaction keeps).

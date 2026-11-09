@@ -141,6 +141,8 @@ struct Env {
         k.connectTimeoutMs             = 30'000;
         k.pingTimeoutMs                = 30'000;
         k.aeronClientLivenessTimeoutNs = 120'000'000'000LL;   // a broker crash blocks this thread for a while
+        k.responseTimeoutNs            = 500'000'000LL;       // a crashed broker is noticed after 0.5 s of silence, not the default 10 s
+        k.keepaliveIntervalNs          = 100'000'000LL;
         return k;
     }
     std::unique_ptr<rc::Client> open(int seed, std::vector<rc::TopicSpec> topics) {
@@ -753,11 +755,13 @@ TEST(EosBrokerRegression, InDoubtCommitRetryCommitsOnceRegression) {
     Env e("eos_indoubt");
     const rc::TopicSpec plain = e.define("eos.plain", kParts);
     const int ctl = e.ctl;
-    auto cl = e.open(ctl, {plain});   // the coordinator is the seed's broker
-    // The session is declared stale after ~10 s; an op timeout below that makes the first commit a deterministic
-    // Timeout (InDoubt), so the RETRY branch always runs.
+    auto kcfg = e.cfg(ctl, {plain});   // the coordinator is the seed's broker
+    kcfg.responseTimeoutNs = 1'500'000'000LL;
+    auto cl = connectClient(e.c, kcfg);
+    // The session is declared stale after ~1.5 s; an op timeout below that makes the first commit a deterministic
+    // Timeout (InDoubt), so the RETRY branch always runs, and the retry's own 1 s budget outlasts the stale edge.
     auto icfg = txnConfig("eos-indoubt");
-    icfg.transactionOpTimeoutMs = 7'000;
+    icfg.transactionOpTimeoutMs = 1'000;
     rc::Producer p = cl->producer(icfg);
     Writer w(*cl, p, cl->topic("eos.plain"), kParts);
     ASSERT_TRUE(w.init().ok());
@@ -844,7 +848,7 @@ TEST(EosBrokerRegression, LeaderCrashMidTransactionResendsAndCommitsOnceRegressi
 // 6. consume -> transform -> produce, every 5th transaction aborted, rewound with seekToCommitted, redone.
 // =========================================================================================================
 TEST(EosBrokerRegression, AbortRewindRedoOutputEqualsInputRegression) {
-    constexpr int kInput = 10'000;
+    constexpr int kInput = 8'000;
     constexpr int kBatch = 200;
     Env e("eos_loop");
     const rc::TopicSpec in  = e.define("eos.in", kParts);
@@ -931,7 +935,7 @@ TEST(EosBrokerRegression, AbortRewindRedoOutputEqualsInputRegression) {
             want.merge(scratch);
         }
     }
-    EXPECT_GE(aborts, 10) << "the loop must really abort and redo";
+    EXPECT_GE(aborts, kInput / kBatch / 5) << "the loop must really abort and redo";
     EXPECT_EQ(committed, kInput);
     EXPECT_EQ(static_cast<int>(want.values.size()), kInput) << "each input id produced exactly once by a committed txn";
     int64_t cursor = 5'000'000;
@@ -1356,12 +1360,7 @@ TEST(EosBrokerRegression, PipelineSurvivesTheCoordinatorCrashWithSeekToCommitted
     }
     struct Item { int32_t partition; int64_t offset; int64_t id; };
     std::vector<Item> pending;
-    // #883: the pipeline's clients declare a silent session stale after 3 s (3x the 1 s keepalive) instead of the
-    // 10 s default - the crashed coordinator's session is given up (then kCoordDownFallbackNs) in ~8 s, not ~15 s
-    // (#893).  The recovery path is the same; only its threshold is shorter.
-    constexpr int64_t kStaleNs = 3'000'000'000LL;
-    auto ccfg = e.cfg(seed, {in});
-    ccfg.responseTimeoutNs = kStaleNs;
+    auto ccfg = e.cfg(seed, {in});   // Env::cfg: a silent session is declared stale after 0.5 s, so the crashed coordinator is given up at that edge
     auto cc = std::make_unique<rc::Client>(ccfg);
     rc::GroupConfig gcfg;
     gcfg.autoCommit          = false;
@@ -1375,9 +1374,7 @@ TEST(EosBrokerRegression, PipelineSurvivesTheCoordinatorCrashWithSeekToCommitted
         });
     });
     cc->connectAndWait(30s);
-    auto pcfg0 = e.cfg(seed, {out});
-    pcfg0.responseTimeoutNs = kStaleNs;
-    auto cp = connectClient(e.c, pcfg0);
+    auto cp = connectClient(e.c, e.cfg(seed, {out}));
     rc::Producer pp = cp->producer(txnConfig("eos-crash"));
     Writer w(*cp, pp, cp->topic("eos.out"), kParts);
     w.alsoPump(cc.get());

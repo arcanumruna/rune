@@ -246,6 +246,12 @@ struct TransactionMetadata {
     /// (via OffsetApplyCallback), discarded on ABORT.
     /// Persisted to TransactionLog so a recovered PrepareCommit can re-apply them.
     std::vector<PendingTxnOffset> pendingOffsets;
+    /// Checked writes Part 11: the partition leader's no that ended this transaction (code 0: none).  Set by the
+    /// service with its PrepareAbort, kept on CompleteAbort, cleared when the next transaction starts.  Persisted
+    /// (header byte 27 bit1 + a trailer), so a retried EndTxn(commit) gets the same no from a new coordinator.
+    uint16_t voteNoCode{0};
+    uint32_t voteNoConstraintId{0};
+    int64_t  voteNoFailingOffset{-1};
 
     /// Namespaces Phase 2 Task 4: the gateway session that last opened / extended this transaction (0 = none known).
     /// NOT persisted: a coordinator that reloads (failover) has no live session of the old coordinator's node; the
@@ -554,6 +560,15 @@ public:
     /// TxnOffsetCommit).  Unknown id: no-op.
     void noteSession(const TransactionalId& txnId, int64_t sessionId) noexcept {
         if (auto it = txnMap_.find(txnId); it != txnMap_.end()) it->second.sessionId = sessionId;
+    }
+
+    /// Checked writes Part 11: the no that ended @p txnId's PrepareAbort (the caller persists the record after it).
+    void noteVoteNo(const TransactionalId& txnId, uint16_t code, uint32_t constraintId, int64_t failingOffset) noexcept {
+        if (auto it = txnMap_.find(txnId); it != txnMap_.end()) {
+            it->second.voteNoCode          = code;
+            it->second.voteNoConstraintId  = constraintId;
+            it->second.voteNoFailingOffset = failingOffset;
+        }
     }
 
     // -----------------------------------------------------------------------

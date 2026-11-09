@@ -264,6 +264,8 @@ public:
     using VoteFnOverride = std::function<bool(std::string_view topic, int32_t partition, int64_t producerId,
                                               int16_t producerEpoch)>;
     void setVoteFnOverride(VoteFnOverride fn) { voteFnOverride_ = std::move(fn); }
+    /// Test seam: true holds a vote (not sent, retried with backoff); false sends it as usual, through the override or the gateway.
+    void setVoteHoldFn(VoteFnOverride fn) { voteHoldFn_ = std::move(fn); }
     /// Test seam: the ConnectRequest.clientVersion of a session when no gateway is wired (else kClientVersion).
     using SessionVersionFn = int32_t (*)(void* ctx, int64_t sessionId) noexcept;
     void setSessionVersionFn(SessionVersionFn fn, void* ctx) noexcept { sessionVersionFn_ = fn; sessionVersionCtx_ = ctx; }
@@ -451,11 +453,6 @@ private:
         bool                    all           = false;   ///< noted while votes were off (a level bump mid-transaction): every partition votes
         std::vector<VoteTarget> targets;
     };
-    struct RememberedNo {   ///< the no of the last voted abort of an id: a late EndTxn(commit) retry gets it again
-        int64_t producerId    = -1;
-        int16_t producerEpoch = 0;
-        VoteNo  no{};
-    };
     struct VoteGate {
         rune::transaction::TransactionalId txnId;
         int64_t                 producerId       = -1;
@@ -469,8 +466,6 @@ private:
     };
     std::vector<VoteGate> voteGates_;
     std::map<rune::transaction::TransactionalId, VoteCandidates, std::less<>> voteCandidatesAtAdd_;
-    /// Memory only: a failover loses it (the retry then gets InvalidTxnState and the client aborts).
-    std::map<rune::transaction::TransactionalId, RememberedNo, std::less<>> lastVoteNo_;
     /// Votes still out in the gateway whose gate is gone (first no, timeout, takeover by an abort), by (topic id,
     /// partition, pid, epoch).  The gateway answers each exactly once; a new gate for the key waits for that answer
     /// and drops it, else a late yes would count for the producer's next transaction (same pid and epoch).
@@ -479,6 +474,7 @@ private:
     int64_t          recoveredAtNs_ = -1;
     VoteCandidateFn  voteCandidate_;
     VoteFnOverride   voteFnOverride_;
+    VoteFnOverride   voteHoldFn_;
     SessionVersionFn sessionVersionFn_  = nullptr;
     void*            sessionVersionCtx_ = nullptr;
     /// Wired to vote (predicate, topics, a way to ask and to write markers), whatever the feature level.

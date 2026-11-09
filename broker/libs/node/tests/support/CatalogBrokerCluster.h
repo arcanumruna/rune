@@ -194,9 +194,10 @@ struct ThreeNodes {
 
     /// Applied to every node's config before it starts (catalog Task 12 fix round 1: a small MTU).
     std::function<void(NodeConfig&)> configTweak;
-    static ThreeNodes startWith(const std::string& tag, std::function<void(NodeConfig&)> tweak) {
+    static ThreeNodes startWith(const std::string& tag, std::function<void(NodeConfig&)> tweak, std::function<void(int, BrokerNode&)> before = {}) {
         ThreeNodes c(tag, Mode::Shard);
         c.configTweak = std::move(tweak);
+        c.beforeStart = std::move(before);
         c.startNodes({1, 2, 3});
         return c;
     }

@@ -313,12 +313,12 @@ public:
                 t.overlay = -1;
             }
     }
-    /// An entry truncateFrom reset whose transaction lies below `covered`, the markers' coverage, with its marker committed: a judge
+    /// An entry truncateFrom reset whose transaction lies below `covered`, the markers' coverage, with its marker known: a judge
     /// before this one applied it (K never passes a transaction that is not Finalized), so nothing is left to do.  Not from the
     /// judge's cursor: a reset Locked entry with J < cursor <= M still owes its apply (T5 N1).
-    void finalizeDecided(int64_t covered, int64_t hw) noexcept {
+    void finalizeDecided(int64_t covered) noexcept {
         for (DeferredTxn& t : txns_)
-            if (t.phase == TxnPhase::AwaitJudge && t.markerOffset >= 0 && t.markerOffset < hw && t.firstOffset < covered) t.phase = TxnPhase::Finalized;
+            if (t.phase == TxnPhase::AwaitJudge && t.markerOffset >= 0 && t.firstOffset < covered) t.phase = TxnPhase::Finalized;
     }
     /// The first Locked entry whose marker is below `hw`: the judge finalizes it (P11-4).
     [[nodiscard]] DeferredTxn* lockedDecided(int64_t hw) noexcept {

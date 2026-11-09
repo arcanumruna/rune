@@ -34,7 +34,16 @@
 #                 from 0 on user and character holds no offset a write was refused at; after `alter topic` makes the cleaner eager,
 #                 `rune stats topic <t> --json` on the leader reports rejectedNotCompacted 0 for both.  Bounded at 600 s per race.
 #                 Prints REGRESSORSPATH: OK;
-#   9. print CHECKED-WRITES-E2E: OK.
+#   9. TXN:       a `ledger` topic (1 partition, replicas 3, compact) and the view `balances` (balance >= 0) beside the character topic.
+#                 TXN-RACE: 4 probes run transactions of two characters and two ledger entries over the same users (per user six
+#                 fit account_stats, a seventh and an overdraw are refused), the `character` leader `docker kill`ed at ~30 % (first half of the users) and
+#                 the consensus leader, the transaction coordinator, at ~60 % (second half, its probes seeded on another node), each restarted once progress resumes (per user at most
+#                 six Ok, every other answer 55; the workers share the names u<user>k<k>a / b and race for them; a lost answer only on a
+#                 transaction that overlaps a kill window, no transaction longer than the transaction timeout and a pass); TXN-VERIFY: a read_committed
+#                 subscription from 0 holds every committed transaction whole, no refused one, a lost one whole or not at all, each name
+#                 in one committed transaction with character_name mapping it to that transaction's character, and account_stats and balances agree; TXN-RESTART: all three nodes restarted, TXN-VERIFY again and a new transaction
+#                 commits.  Bounded at 600 s per race.  Prints TXN: OK;
+#  10. print CHECKED-WRITES-E2E: OK.
 #
 # Usage (on the VM, under the host lock):
 #   ssh root@$RUNE_VM_HOST 'flock -w 7200 /root/vm.lock bash broker/docker/checked-writes-e2e.sh'
@@ -47,6 +56,7 @@
 #   RP_E2E_SUBJECTS         subjects the login race covers in leg 8 (default 1000)
 #   RP_E2E_USERS            users the character race covers (default 200; even: a Foo / foo pair takes two)
 #   RP_E2E_LIFECYCLE_USERS  users of the delete and name-reuse step (default 100, at most RP_E2E_USERS)
+#   TXN_E2E_USERS           users the transaction race covers in leg 9 (default 64: 4 probes x 64 users x 8 transactions = 2,048)
 #   E2E_LOG_DIR             when set, the brokers' and the probes' logs are kept there at teardown
 #
 # House style: bounded waits, trap teardown (`docker compose down -v` on every exit path), every failure names its step.
@@ -75,6 +85,12 @@ AI_CREATES="${AI_E2E_CREATES:-5000}"
 RP_SUBJECTS="${RP_E2E_SUBJECTS:-1000}"
 RP_USERS="${RP_E2E_USERS:-200}"
 RP_LIFE_USERS="${RP_E2E_LIFECYCLE_USERS:-100}"
+TXN_USERS="${TXN_E2E_USERS:-64}"
+TXN_USER_BASE=10000    # the transaction users are 10001..: none has characters from leg 8
+TXN_PER_USER=8         # the probe's per-user transactions: six that fit, the cap's, the overdraw
+TXN_FITTING=6          # transactions of two characters that fit account_stats.max_characters
+TXN_TIMEOUT_MS=60000   # the probe's transactionTimeoutMs
+TXN_PASS_MS=5000       # one pass of the coordinator's timeout sweep and the vote retry on top of it
 RP_CHARS=13            # creates per user and probe (the probe's kRpCharsPerUser)
 RP_CAP=12              # account_stats.max_characters
 RP_PAIR_BASE=1000000   # the probe's kRpPairBase: the users of the Foo / foo pairs
@@ -113,7 +129,9 @@ dc() {
 }
 cname() { dc ps -a -q "rune-$1" | head -1; }   # the container id of node <n> (1-3)
 now_s() { date +%s; }
+now_ms() { date +%s%3N; }   # GNU date on the VM; the probes write epoch ms from the same host clock (the containers share it), so the two are comparable
 
+[[ "$(now_ms)" =~ ^[0-9]{13}$ ]] || fail "now_ms needs GNU date"
 [ -d "${FLIGHT_RECORDER_DIR}" ] || fail "missing flight-recorder checkout (set FLIGHT_RECORDER_DIR)"
 [ -d "${ARCANUM_METRICS_DIR}" ] || fail "missing arcanum-metrics checkout (set ARCANUM_METRICS_DIR)"
 for d in protocol codec crypto ql client-cpp conan/aeron; do
@@ -684,5 +702,137 @@ wait_until "${LEG_S}" "the user topic compacted" rp_not_compacted_zero user "${R
 wait_until "${LEG_S}" "the character topic compacted" rp_not_compacted_zero character "${RP_CHARACTER_TOPIC}" || fail "character: rejectedNotCompacted is not 0 on the leader within ${LEG_S}s"
 log "Leg 8 OK"
 echo "REGRESSORSPATH: OK"
+
+# ---------------------------------------------------------------------------
+# Leg 9: TXN.
+# ---------------------------------------------------------------------------
+LEG="leg 9a TXN-SETUP"
+log "Leg 9a: TXN-SETUP: the ledger topic and the balances view through the CLI..."
+printf '%s\n' "topic ledger { entryId uint64, account uint64, amount int64, memo string(16) } partitions 1 replicas 3 key entryId with (cleanup.policy = compact);" \
+    "create view balances key account as select sum(amount) as balance from ledger group by account constraint non_negative check (balance >= 0);" \
+    > "${RUNE_AUTH_WORK_DIR}/ledger.rql"
+set +e
+out=$(rune_auth_cli_admin "${RUNE_AUTH_NETWORK}" ql -f /work/ledger.rql --broker "rune-${SEED_NODE}:${BROKER_PORT}" 2>&1); rc=$?
+set -e
+rm -f "${RUNE_AUTH_WORK_DIR}/ledger.rql"
+[ "${rc}" -eq 0 ] || { echo "${out}" >&2; fail "the ledger DDL failed (exit ${rc})"; }
+leg txn-setup 300 "CHECKED-WRITES-TXN-SETUP: OK" txn-setup
+TXN_LEDGER_TOPIC=$(grep -oE '^TXN_LEDGER_TOPIC_ID=[0-9]+' "${WORK_DIR}/txn-setup.out" | cut -d= -f2) || true
+[ -n "${TXN_LEDGER_TOPIC}" ] || fail "txn-setup printed no ledger topic id"
+wait_until 120 "the ledger leader" partition_leader "${TXN_LEDGER_TOPIC}" 0 || fail "ledger partition 0 has no leader"
+
+LEG="leg 9b TXN-RACE"
+log "Leg 9b: TXN-RACE: ${WORKERS} probes run ${TXN_PER_USER} transactions per user over ${TXN_USERS} users in two halves; the character leader is killed at ~30 %, the coordinator at ~60 %..."
+txn_half=$(( TXN_USERS / 2 ))
+txn_total=$(( WORKERS * TXN_USERS * TXN_PER_USER ))
+txn_start=$(now_s)
+txn_windows="${WORK_DIR}/txn-kill-windows.txt"   # "<kill ms> <resumed ms>" per kill: a lost answer is allowed only inside one
+: > "${txn_windows}"
+# txn_kill <node 0-2> <progress share in percent> <what> <progress at the running half's end>: kill it at the share of all the
+# transactions, restart it once progress resumes
+txn_kill() {
+    wait_until "${RACE_S}" "${3} kill point" progress_at_least $(( txn_total * $2 / 100 )) txn-run \
+        || { out_of "txn-run-0" | tail -20 >&2; fail "txn-run never reached $2 % within ${RACE_S}s (at $(race_progress txn-run) of ${txn_total})"; }
+    BASE=$(race_progress txn-run)
+    log "Leg 9: killing node $1, the ${3}, at ${BASE} of ${txn_total} transactions"
+    local killed_ms
+    killed_ms=$(now_ms)
+    kill_node "$1"
+    RESUME_AT=$(( BASE + 20 ))
+    [ "${RESUME_AT}" -le "$4" ] || RESUME_AT="$4"
+    wait_until "${RESUME_WAIT_S}" "txn-run resuming" progress_at_least "${RESUME_AT}" txn-run \
+        || { out_of "txn-run-0" | tail -20 >&2; fail "txn-run: no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the ${3} kill"; }
+    restart_node "$1"
+    # the window ends once progress advances again after the restart
+    BASE=$(race_progress txn-run)
+    RESUME_AT=$(( BASE + 20 ))
+    [ "${RESUME_AT}" -le "$4" ] || RESUME_AT="$4"
+    wait_until "${RESUME_WAIT_S}" "txn-run resuming after the ${3} restart" progress_at_least "${RESUME_AT}" txn-run \
+        || { out_of "txn-run-0" | tail -20 >&2; fail "txn-run: no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the ${3} restart"; }
+    echo "${killed_ms} $(now_ms)" >> "${txn_windows}"
+}
+# txn_half_run <first worker number> <first user> <last user> : WORKERS probes over the users; the seed node is neither the character
+# leader nor the coordinator (a probe does not outlive its seed), so each half starts by reading both.
+txn_half_run() {
+    local first="$1" lo="$2" hi="$3" i leader coord n
+    leader=$(partition_leader "${RP_CHARACTER_TOPIC}" 0) || fail "no leader of the character topic"
+    coord=$(consensus_leader) || fail "no consensus leader"
+    SEED_NODE=1
+    for n in 1 2 3; do
+        if [ "$(( n - 1 ))" != "${leader}" ] && [ "$(( n - 1 ))" != "${coord}" ]; then SEED_NODE="${n}"; break; fi
+    done
+    TXN_COORDINATOR="${coord}"
+    for i in $(seq 0 $(( WORKERS - 1 ))); do probe_start "txn-run-$(( first + i ))" "${RACE_S}" txn-run --worker "$(( first + i ))" --users "${lo}-${hi}"; done
+}
+txn_half_wait() {   # <first worker number> : every probe of the half exited 0, within the race bound
+    local first="$1" i left
+    for i in $(seq 0 $(( WORKERS - 1 ))); do
+        left=$(( RACE_S - ($(now_s) - txn_start) ))
+        [ "${left}" -gt 0 ] || left=1
+        wait_until "${left}" "txn-run probe $(( first + i ))" bg_done "txn-run-$(( first + i ))" || fail "txn-run probe $(( first + i )) did not finish within ${RACE_S}s of the race start"
+        [ "$(bg_rc "txn-run-$(( first + i ))")" = "0" ] || { out_of "txn-run-$(( first + i ))" | tail -20 >&2; fail "txn-run probe $(( first + i )) exited $(bg_rc "txn-run-$(( first + i ))")"; }
+    done
+}
+# First half: the character leader is killed at ~30 % of all the transactions (60 % of this half).
+txn_half_run 0 $(( TXN_USER_BASE + 1 )) $(( TXN_USER_BASE + txn_half ))
+txn_kill "$(partition_leader "${RP_CHARACTER_TOPIC}" 0)" 30 "character leader" $(( WORKERS * txn_half * TXN_PER_USER ))
+txn_half_wait 0
+# Second half, started with the coordinator read afresh: it is killed at ~60 % of all the transactions (20 % of this half).
+txn_half_run "${WORKERS}" $(( TXN_USER_BASE + txn_half + 1 )) $(( TXN_USER_BASE + TXN_USERS ))
+coordinator=$(consensus_leader) || fail "no consensus leader at the coordinator kill"
+[ "${coordinator}" = "${TXN_COORDINATOR}" ] || fail "the coordinator moved from node ${TXN_COORDINATOR} to ${coordinator} while the second half started"
+txn_kill "${coordinator}" 60 "coordinator" "${txn_total}"
+txn_half_wait "${WORKERS}"
+log "Leg 9b: done in $(( $(now_s) - txn_start )) s"
+txn_files=("${SHARED}"/txn-run-w*.txt)
+[ "${#txn_files[@]}" -eq $(( 2 * WORKERS )) ] || fail "${#txn_files[@]} transaction result files, want $(( 2 * WORKERS ))"
+awk -v per="${TXN_PER_USER}" -v workers="${WORKERS}" -v fitting="${TXN_FITTING}" -v users="${TXN_USERS}" -v ubase="${TXN_USER_BASE}" \
+    -v limit="$(( TXN_TIMEOUT_MS + TXN_PASS_MS ))" -v windows="$(tr '\n' ';' < "${txn_windows}")" '
+    BEGIN { nw = split(windows, w, ";") }
+    { if ($9 - $8 > limit) { if (shown++ < 10) printf "%s: took %d ms\n", $6, $9 - $8; bad = 1 }
+      if ($3 == 20000) {
+          inside = 0
+          for (i = 1; i < nw; i++) { split(w[i], b, " "); if ($8 <= b[2] && $9 >= b[1]) inside = 1 }
+          if (!inside) { if (shown++ < 10) printf "%s: a lost answer outside every kill window\n", $6; bad = 1 }
+      }
+      if ($3 != 0 && $3 != 55 && $3 != 20000) { other[$3]++; next }
+      if ($6 ~ /od$/) { if ($3 == 0) { if (shown++ < 10) printf "%s: an overdraw committed\n", $6; bad = 1 } next }
+      u = $2; n[u]++
+      if ($3 == 0) ok[u]++; else if ($3 == 20000) lost[u]++ }
+    END {
+        for (c in other) { printf "result code %s x%d\n", c, other[c]; bad = 1 }
+        for (i = 1; i <= users; i++) {
+            u = ubase + i
+            if (n[u] != workers * (per - 1) || ok[u] > fitting || (lost[u] == 0 && ok[u] != fitting)) {
+                if (shown++ < 10) printf "user %d: %d transactions, %d Ok, %d lost\n", u, n[u], ok[u], lost[u]
+                bad = 1
+            }
+        }
+        exit bad
+    }' "${txn_files[@]}" > "${WORK_DIR}/txn-run-check.txt" \
+    || { cat "${WORK_DIR}/txn-run-check.txt" >&2; fail "the transaction race broke 'per user at most ${TXN_FITTING} Ok, every other answer 55, no overdraw commits' (20000 = a lost answer, only inside a kill window; none longer than ${TXN_TIMEOUT_MS} ms + ${TXN_PASS_MS} ms)"; }
+log "Leg 9b OK"
+
+LEG="leg 9c TXN-VERIFY"
+log "Leg 9c: TXN-VERIFY: a read_committed subscription from 0 against the committed, refused and lost transactions..."
+leg txn-verify "${RACE_S}" "CHECKED-WRITES-TXN-VERIFY: OK" txn-verify
+
+LEG="leg 9d TXN-RESTART"
+log "Leg 9d: TXN-RESTART: docker restart of all three nodes; the verification again, then a new transaction..."
+restart_all
+if [ "$(partition_leader "${RP_CHARACTER_TOPIC}" 0)" = "0" ]; then SEED_NODE=2; else SEED_NODE=1; fi
+leg txn-verify-restart "${RACE_S}" "CHECKED-WRITES-TXN-VERIFY: OK" txn-verify
+leg txn-run-restart "${RACE_S}" "CHECKED-WRITES-TXN-RUN: DONE" txn-run --worker 9 --users "$(( TXN_USER_BASE + TXN_USERS + 1 ))-$(( TXN_USER_BASE + TXN_USERS + 2 ))"
+awk -v fitting="${TXN_FITTING}" -v per="${TXN_PER_USER}" -v u1="$(( TXN_USER_BASE + TXN_USERS + 1 ))" -v u2="$(( TXN_USER_BASE + TXN_USERS + 2 ))" '
+    { if ($6 ~ /od$/) { if ($3 != 55) { if (shown++ < 10) printf "%s: the overdraw gave %d\n", $6, $3; bad = 1 } x = $6; sub(/^u/, "", x); sub(/od$/, "", x); od[x + 0]++; next }
+      ok[$2] += ($3 == 0); refused[$2] += ($3 == 55) ; n[$2]++ }
+    END { for (u = u1; u <= u2; u++)
+              if (n[u] != per - 1 || od[u] != 1 || ok[u] != fitting || refused[u] != 1) { if (shown++ < 10) printf "user %d: %d transactions, %d Ok, %d refused, %d overdraws\n", u, n[u], ok[u], refused[u], od[u]; bad = 1 }
+          exit bad }' \
+    "${SHARED}/txn-run-w9.txt" > "${WORK_DIR}/txn-restart-check.txt" \
+    || { cat "${WORK_DIR}/txn-restart-check.txt" >&2; fail "after the restart a fresh user did not get ${TXN_FITTING} committed transactions and one refused"; }
+leg txn-verify-final "${RACE_S}" "CHECKED-WRITES-TXN-VERIFY: OK" txn-verify
+log "Leg 9 OK"
+echo "TXN: OK"
 
 echo "CHECKED-WRITES-E2E: OK"

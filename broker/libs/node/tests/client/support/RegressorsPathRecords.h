@@ -7,6 +7,7 @@
 //   RpUser      {userId uint64 key, provider uint16, subject string(64), createdAt int64}
 //   RpCharacter {characterId uint64 key, userId uint64, name string(16), gender uint16, hairSkin uint16, hairSheet uint16, headSkin uint16,
 //                createdAt int64, lastPlayed int64}
+//   RpLedger    {entryId uint64 key, account uint64, amount int64, memo string(16)}  (Part 11's ledger topic)
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Fingerprint.h>
 
@@ -108,5 +109,38 @@ struct RpCharacter {
     [[nodiscard]] uint64_t key() const noexcept { return characterId; }
 };
 inline const uint64_t RpCharacter::kFingerprint = rune::codec::fingerprint(rpCharacterDescriptor());
+
+inline rune::codec::Descriptor rpLedgerDescriptor() {
+    return rune::codec::DescriptorBuilder("ledger", 1)
+        .add("entryId", rune::codec::PrimType::UInt64, 1, /*isKey=*/true)
+        .add("account", rune::codec::PrimType::UInt64)
+        .add("amount", rune::codec::PrimType::Int64)
+        .addFixedStr("memo", 16)
+        .build();
+}
+
+struct RpLedger {
+    static const uint64_t kFingerprint;
+    static constexpr std::string_view kSchemaName = "ledger";
+    static constexpr uint16_t kVersion = 1, kBlockLength = 40;
+    static constexpr std::size_t kMemoBytes = 16;
+
+    uint64_t    entryId = 0;
+    uint64_t    account = 0;
+    int64_t     amount = 0;
+    std::string memo;   ///< at most 16 bytes; the rest of the field is NUL
+
+    [[nodiscard]] std::size_t encodedSize() const noexcept { return 4 + kBlockLength; }
+    [[nodiscard]] std::size_t encode(uint8_t* b) const noexcept {
+        rpdetail::putHeader(b, kBlockLength, kVersion);
+        rpdetail::putLe(b, 4, entryId, 8);
+        rpdetail::putLe(b, 12, account, 8);
+        rpdetail::putLe(b, 20, static_cast<uint64_t>(amount), 8);
+        rpdetail::putStr(b, 28, memo, kMemoBytes);
+        return encodedSize();
+    }
+    [[nodiscard]] uint64_t key() const noexcept { return entryId; }
+};
+inline const uint64_t RpLedger::kFingerprint = rune::codec::fingerprint(rpLedgerDescriptor());
 
 }  // namespace rune::node::test

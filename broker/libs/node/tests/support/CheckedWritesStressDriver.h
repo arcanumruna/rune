@@ -15,6 +15,9 @@
 // account_stats) and a character_by_id projection; three typed clients race first logins, creates for four users near the cap of 12,
 // renames to colliding names, moves and removeExisting on `character`, and AtMostTwelveLiveCharacters and LowerNameUnique join
 // NoIdTwiceNoReuse and 04's invariants, from the broker's verdicts and the leader's views.
+// Transaction mode (plan 11): RegressorsPath plus a `ledger` topic with a `balances` view (balance >= 0).  Three transactional writers
+// commit or abort a character create with a ledger entry, two plain writers send atomic ledger batches, and the faults of plan D hit
+// the commit; TxnAllOrNothingAndAtomicPerPartition joins the invariants.
 #include "CheckedWritesChecks.h"
 #include "CheckedWritesModel.h"
 #include "client/ClusterClient.h"
@@ -97,14 +100,24 @@ public:
         enum class Result : uint8_t { Ok, Violation, Unknown } result = Result::Unknown;
     };
 
-    CheckedWritesStressDriver(rune::node::test::catalog_cluster::ThreeNodes& cluster, uint64_t seed, bool keyIndex = false, bool autoInc = false, bool regressorsPath = false)
-        : c_(cluster), rng_(seed), seed_(seed), rp_(regressorsPath), autoInc_(autoInc || rp_), keyIndex_(keyIndex || autoInc_), parts_(rp_ ? 1 : autoInc ? kAiParts : keyIndex ? kKiParts : 1), keys_(keyIndex ? kKiKeys : kTagKeys),
-          seen_(static_cast<std::size_t>(parts_)), data_(static_cast<std::size_t>(parts_)), changes_(static_cast<std::size_t>(parts_)), reservations_(static_cast<std::size_t>(parts_)), models_(static_cast<std::size_t>(parts_)),
+    /// Transaction mode: what one transaction (or atomic batch) wrote and what its writer was told.  A character is found in the log by its
+    /// unique name, a ledger entry by its id.
+    struct TxnRun {
+        enum class Kind : uint8_t { Commit, Abort, Batch } kind = Kind::Commit;
+        enum class Answer : uint8_t { Yes, No, Unknown } answer = Answer::Unknown;   ///< Yes: acked committed; No: voted no, aborted or refused
+        std::vector<std::string> names;
+        std::vector<uint64_t> entries;
+    };
+
+    CheckedWritesStressDriver(rune::node::test::catalog_cluster::ThreeNodes& cluster, uint64_t seed, bool keyIndex = false, bool autoInc = false, bool regressorsPath = false, bool transactions = false)
+        : c_(cluster), rng_(seed), seed_(seed), rp_(regressorsPath || transactions), txn_(transactions), autoInc_(autoInc || rp_), keyIndex_(keyIndex || autoInc_), parts_(rp_ ? 1 : autoInc ? kAiParts : keyIndex ? kKiParts : 1), keys_(keyIndex ? kKiKeys : kTagKeys),
+          seen_(static_cast<std::size_t>(parts_)), data_(static_cast<std::size_t>(parts_)), changes_(static_cast<std::size_t>(parts_)), reservations_(static_cast<std::size_t>(parts_)), txnMarkers_(static_cast<std::size_t>(parts_)), judges_(static_cast<std::size_t>(parts_)), models_(static_cast<std::size_t>(parts_)),
           deliveredOffsets_(static_cast<std::size_t>(parts_)), rawIntents_(static_cast<std::size_t>(parts_)), groupOffsets_(static_cast<std::size_t>(parts_)) {
         registerDefaults_();
         if (keyIndex_ && !rp_) registerKeyIndexInvariants_();
         if (autoInc_) registerAutoIncInvariants_();
         if (rp_) registerRegressorsPathInvariants_();
+        if (txn_) registerTransactionInvariants_();
     }
     ~CheckedWritesStressDriver() {
         group_.reset();
@@ -115,6 +128,7 @@ public:
         kiWriters_.clear();
         aiWriters_.clear();
         rpWriters_.clear();
+        txnWriters_.clear();
     }
 
     /// The typed topic (replicas 3), the projection view, TestReject on every node (not in key-index mode) and three clients.
@@ -181,10 +195,22 @@ public:
             std::stringstream o, e;
             ASSERT_EQ(rune::cli::run({"ql", "-e", st, "--broker", ep, "--cli-stream-in", std::to_string(tcc::kClientStream)}, o, e), 0) << st << "\n" << e.str();
         }
+        if (txn_) {
+            for (const char* st : {"topic ledger { entryId uint64, account uint64, amount int64, memo string(16) } partitions 1 replicas 3 key entryId with (cleanup.policy = compact);",
+                                   "create view balances key account as select sum(amount) as balance from ledger group by account constraint non_negative check (balance >= 0);"}) {
+                std::stringstream o, e;
+                ASSERT_EQ(rune::cli::run({"ql", "-e", st, "--broker", ep, "--cli-stream-in", std::to_string(tcc::kClientStream)}, o, e), 0) << st << "\n" << e.str();
+            }
+        }
         auto admin = tcc::connectClient(c_, ctl);
         const auto character = admin->getTopicSchemaAndWait("character", 30s);
         ASSERT_EQ(character.errorCode, 0);
         topicId_ = character.topicId;
+        if (txn_) {
+            const auto ledger = admin->getTopicSchemaAndWait("ledger", 30s);
+            ASSERT_EQ(ledger.errorCode, 0);
+            ledgerTopicId_ = ledger.topicId;
+        }
         const auto view = admin->createViewAndWait("character_by_id", "characterId", 0, byIdPlan_(topicId_), {}, 60s);
         ASSERT_EQ(view.errorCode, 0) << view.detail;
         viewTopicId_ = view.viewTopicId;
@@ -192,6 +218,7 @@ public:
         admin.reset();
         std::vector<int32_t> leaders;
         ASSERT_TRUE(tcc::awaitLeaders(c_, topicId_, parts_, leaders, 30s));
+        if (txn_) ASSERT_TRUE(tcc::awaitLeaders(c_, ledgerTopicId_, 1, leaders, 30s));
         for (const int id : c_.runningNodes()) prepareNode_(id);
         ASSERT_FALSE(::testing::Test::HasFatalFailure());
         rebuildWriters_(-1);
@@ -239,6 +266,17 @@ public:
     void step() {
         const unsigned r = static_cast<unsigned>(rng_() % 100);
         const int down = downNode_();
+        if (txn_) {
+            if (r < 40) txnBurst_();
+            else if (r < 50) sendBurst_(-1);
+            else if (r < 58) atomicBatch(rng_() % 2 == 0);
+            else if (r < 64) raceCreates_();
+            else if (r < 72 && down == 0) crashDuringTxn_();
+            else if (r < 84) { if (down != 0) restartNode_(down, false); else restartNonLeader_(); }
+            else if (r < 90) replaceStats_();
+            else std::this_thread::sleep_for(std::chrono::milliseconds(50 + static_cast<int>(rng_() % 150)));   // the cleaner passes
+            return;
+        }
         if (rp_) {
             if (r < 45) sendBurst_(-1);
             else if (r < 55) raceLogins_();
@@ -262,6 +300,65 @@ public:
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(50 + static_cast<int>(rng_() % 150)));
         }
+    }
+
+    /// Transaction mode: a character create and a ledger credit, committed.
+    void commitTransaction() { txnRun_(TxnRun::Kind::Commit, 25, -1); }
+    /// ... the same, aborted by the writer.
+    void abortTransaction() { txnRun_(TxnRun::Kind::Abort, 25, -1); }
+    /// ... a debit no balance covers: balances votes no.
+    void overdrawTransaction() { txnRun_(TxnRun::Kind::Commit, -1'000'000'000, -1); }
+    /// ... two ledger entries in one atomic batch through a plain All|View writer: two credits, or a debit no balance covers and a credit.
+    void atomicBatch(bool overdraw) {
+        if (writersStale_) rebuildWriters_(-1);
+        TxnRun run;
+        run.kind = TxnRun::Kind::Batch;
+        const uint64_t account = 1 + rng_() % kRpUsers;
+        std::array<rune::node::test::RpLedger, 2> entries;
+        for (auto& e : entries) {
+            e = {++ledgerSeq_, account, 1 + static_cast<int64_t>(rng_() % 40), "batch"};
+            run.entries.push_back(e.entryId);
+        }
+        if (overdraw) entries[0].amount = -1'000'000'000;
+        try {
+            RpWriter& w = rpWriter_(rng_() % rpWriters_.size());
+            rune::client::BatchBuilder b = w.prod->batch(*w.ledger, rune::client::Key(account));
+            for (const auto& e : entries) {
+                std::array<uint8_t, 4 + rune::node::test::RpLedger::kBlockLength> buf{};
+                e.encode(buf.data());
+                std::array<char, 8> key{};
+                std::memcpy(key.data(), &e.entryId, key.size());   // the record's key is its key field
+                b.add(buf, std::string_view(key.data(), key.size()));
+            }
+            if (b.send(*w.cq, 1) == rune::client::OpResult::Accepted) {
+                std::optional<rune::client::Completion> got;
+                (void)w.cq->waitFor(1, 10s, [&](const rune::client::Completion& d, std::span<const uint8_t>) { got = d; });
+                if (got && got->status == rune::client::OpStatus::Ok) run.answer = TxnRun::Answer::Yes;
+                else if (got && got->status == rune::client::OpStatus::BrokerError && got->errorCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation)) run.answer = TxnRun::Answer::No;
+            }
+        } catch (const std::exception&) {
+            ++txnErrors_;
+        }
+        if (run.answer == TxnRun::Answer::Unknown) writersStale_ = true;
+        txns_.push_back(std::move(run));
+        recordHistory_();
+    }
+    [[nodiscard]] std::string txnTally() const {
+        std::array<int, 3> commits{}, aborts{}, batches{};
+        for (const TxnRun& t : txns_) ++(t.kind == TxnRun::Kind::Commit ? commits : t.kind == TxnRun::Kind::Abort ? aborts : batches)[static_cast<std::size_t>(t.answer)];
+        const auto three = [](const std::array<int, 3>& a) { return std::to_string(a[0]) + " yes, " + std::to_string(a[1]) + " no, " + std::to_string(a[2]) + " unknown"; };
+        return "commits " + three(commits) + "; aborts " + std::to_string(aborts[0] + aborts[1] + aborts[2]) + "; atomic batches " + three(batches) + "; " + std::to_string(txnErrors_) + " writer exceptions";
+    }
+    /// Transaction mode: the run committed, aborted and refused a transaction and refused an atomic batch.  "" = it did.
+    [[nodiscard]] std::string txnShortfall() const {
+        const auto answered = [this](TxnRun::Kind kind, TxnRun::Answer answer) {
+            return std::any_of(txns_.begin(), txns_.end(), [&](const TxnRun& t) { return t.kind == kind && t.answer == answer; });
+        };
+        if (!answered(TxnRun::Kind::Commit, TxnRun::Answer::Yes)) return "no transaction committed";
+        if (!answered(TxnRun::Kind::Commit, TxnRun::Answer::No)) return "no transaction voted no";
+        if (!answered(TxnRun::Kind::Abort, TxnRun::Answer::No)) return "no transaction aborted";
+        if (!answered(TxnRun::Kind::Batch, TxnRun::Answer::No)) return "no atomic batch was refused";
+        return {};
     }
 
     /// Crashes a random partition's leader in the middle of a burst of writes.
@@ -294,8 +391,8 @@ public:
     void registerInvariant(std::string name, Invariant fn) { invariants_.emplace_back(std::move(name), std::move(fn)); }
 
     /// Judges the history and runs every invariant; the name of the first that fails (and why) lands in `failed`.
-    [[nodiscard]] bool checkAll(std::string* failed) {
-        awaitCompaction_();
+    [[nodiscard]] bool checkAll(std::string* failed, bool awaitCompaction = true) {
+        if (awaitCompaction) awaitCompaction_();
         compactedAway_ = 0;   // measured before the invariants: the first failure ends checkAll
         for (const NodeSnap& s : snaps_) {
             std::set<int64_t> present;
@@ -482,8 +579,11 @@ private:
         std::optional<rune::client::Producer> prod;
         std::optional<rune::client::TypedTopic<rune::node::test::RpCharacter, rune::client::ProducerRef>> characters;
         std::optional<rune::client::TypedTopic<rune::node::test::RpUser, rune::client::ProducerRef>> users;
+        std::unique_ptr<rune::client::Completions> cq;        ///< transaction mode: atomic batches to the ledger
+        std::optional<rune::client::TopicHandle> ledger;
 
-        explicit RpWriter(rune::client::ClientConfig cfg) {
+        RpWriter(rune::client::ClientConfig cfg, int32_t ledgerTopic) {
+            if (ledgerTopic >= 0) cfg.topics.push_back(rune::client::TopicSpec{"ledger", ledgerTopic, 1});
             client = std::make_unique<rune::client::Client>(cfg);
             rune::client::ProducerConfig pc;
             pc.acks = rune::client::Acks::All | rune::client::Acks::View;
@@ -492,8 +592,39 @@ private:
             client->connectAndWait(30s);
             characters.emplace(client->openTopicAndWait<rune::node::test::RpCharacter>("character", *prod, 30s));
             users.emplace(client->openTopicAndWait<rune::node::test::RpUser>("user", *prod, 30s));
+            if (ledgerTopic >= 0) {
+                cq = std::make_unique<rune::client::Completions>(*client);
+                ledger.emplace(client->topic("ledger"));
+            }
         }
         ~RpWriter() {
+            if (prod) prod->closeImmediately();
+            if (client) client->close();
+        }
+    };
+
+    /// Transaction mode: a client whose transactional producer writes characters and ledger entries in one transaction.
+    struct TxnWriter {
+        std::unique_ptr<rune::client::Client> client;
+        std::optional<rune::client::Producer> prod;
+        std::optional<rune::client::TypedTopic<rune::node::test::RpCharacter, rune::client::ProducerRef>> characters;
+        std::optional<rune::client::TypedTopic<rune::node::test::RpLedger, rune::client::ProducerRef>> ledger;
+
+        TxnWriter(rune::client::ClientConfig cfg, const std::string& transactionalId) {
+            client = std::make_unique<rune::client::Client>(cfg);
+            rune::client::ProducerConfig pc;
+            pc.acks = rune::client::Acks::All;
+            pc.lingerUs = 1;
+            pc.produceTimeoutMs = kWriteTimeoutMs;
+            pc.transactionalId = transactionalId;
+            pc.transactionTimeoutMs = 5'000;
+            prod.emplace(client->producer(pc));
+            client->connectAndWait(30s);
+            prod->initTransactionsAndWait(30s);
+            characters.emplace(client->openTopicAndWait<rune::node::test::RpCharacter>("character", *prod, 30s));
+            ledger.emplace(client->openTopicAndWait<rune::node::test::RpLedger>("ledger", *prod, 30s));
+        }
+        ~TxnWriter() {
             if (prod) prod->closeImmediately();
             if (client) client->close();
         }
@@ -668,6 +799,7 @@ private:
         writers_.clear();
         kiWriters_.clear();
         rpWriters_.clear();
+        txnWriters_.clear();
         writerSeeds_.clear();
         std::vector<int> seeds;
         for (const int id : c_.runningNodes()) if (id != avoid) seeds.push_back(id);
@@ -676,6 +808,7 @@ private:
         kiWriters_.resize(3);
         aiWriters_.resize(3);
         rpWriters_.resize(3);
+        txnWriters_.resize(3);
         writersStale_ = false;
     }
     /// Built when the slot connects: the config reserves the client's egress port.
@@ -698,8 +831,12 @@ private:
         return *aiWriters_[i];
     }
     RpWriter& rpWriter_(std::size_t i) {
-        if (!rpWriters_[i]) rpWriters_[i] = std::make_unique<RpWriter>(writerCfg_(i));
+        if (!rpWriters_[i]) rpWriters_[i] = std::make_unique<RpWriter>(writerCfg_(i), ledgerTopicId_);
         return *rpWriters_[i];
+    }
+    TxnWriter& txnWriter_(std::size_t i) {
+        if (!txnWriters_[i]) txnWriters_[i] = std::make_unique<TxnWriter>(writerCfg_(i), "cw-txn-" + std::to_string(i));
+        return *txnWriters_[i];
     }
     void sendBurst_(int victim) {
         if (writersStale_ || victim > 0) rebuildWriters_(victim);
@@ -1016,6 +1153,62 @@ private:
             EXPECT_NE(answer(rpWriter_(2).users->insertAndWait(u, 10s)), Sent::Result::Ok) << "seed " << seed_ << ": a later login of " << u.subject << " was accepted";
     }
 
+    // ---- Transaction mode ----
+    /// 1 to 3 transactions: committed, aborted by the writer, or committed with a debit the ledger votes no on.
+    void txnBurst_() {
+        for (int n = 1 + static_cast<int>(rng_() % 3); n > 0 && !::testing::Test::HasFatalFailure(); --n) {
+            const unsigned o = static_cast<unsigned>(rng_() % 100);
+            if (o < 50) commitTransaction();
+            else if (o < 70) abortTransaction();
+            else overdrawTransaction();
+        }
+    }
+    /// A commit with a node crashed while its votes are out: the character partition's leader or any node (the coordinator is one of them).
+    void crashDuringTxn_() {
+        const std::vector<int> running = c_.runningNodes();
+        const int32_t victim = rng_() % 2 == 0 ? partitionLeader_(0) : running[rng_() % running.size()];
+        if (victim <= 0) return;
+        ++crashes_;
+        txnRun_(TxnRun::Kind::Commit, 1 + static_cast<int64_t>(rng_() % 50), victim);
+        writersStale_ = true;
+    }
+    /// One transaction of a character create for a random user and a ledger entry of `amount` for the same user: committed, or aborted by
+    /// the writer (also when a write failed).  With `victim`, a thread crashes that node a few milliseconds into the commit.
+    void txnRun_(TxnRun::Kind kind, int64_t amount, int victim) {
+        if (writersStale_) rebuildWriters_(-1);
+        TxnRun run;
+        run.kind = kind;
+        run.names.push_back("t" + std::to_string(++txnSeq_));
+        run.entries.push_back(++ledgerSeq_);
+        const uint64_t user = 1 + rng_() % kRpUsers;
+        const auto delay = std::chrono::milliseconds(rng_() % 40);
+        const std::size_t slot = rng_() % txnWriters_.size();
+        std::jthread killer;   // joined on unwind too
+        try {
+            TxnWriter& w = txnWriter_(slot);
+            w.prod->beginTransaction();
+            const rune::node::test::RpCharacter character{0, user, run.names[0], 1, 2, 3, 4, ++vSeq_, vSeq_};
+            const rune::node::test::RpLedger entry{run.entries[0], user, amount, "txn"};
+            const bool written = w.characters->insertAndWait(character, 10s).status() == rune::client::OpStatus::Ok && w.ledger->upsertAndWait(entry, 10s).status() == rune::client::OpStatus::Ok;
+            if (victim > 0) {
+                checkCounters_(victim);
+                killer = std::jthread([this, victim, delay] { std::this_thread::sleep_for(delay); c_.crash(victim); });
+            }
+            if (!written || kind == TxnRun::Kind::Abort) {
+                w.prod->abortTransactionAndWait(10s);
+                run.answer = TxnRun::Answer::No;
+            } else {
+                run.answer = w.prod->commitTransactionAndWait(10s).ok ? TxnRun::Answer::Yes : TxnRun::Answer::No;
+            }
+        } catch (const std::exception&) {
+            ++txnErrors_;
+        }
+        if (killer.joinable()) killer.join();
+        if (run.answer == TxnRun::Answer::Unknown) writersStale_ = true;
+        txns_.push_back(std::move(run));
+        recordHistory_();
+    }
+
     /// Sends `s` (its id and op) through `w`: its token is the new record's name, its result the answer.
     void kiSend_(KiWriter& w, Sent* s) {
         if (kiSendHook_) kiSendHook_(*s);
@@ -1151,7 +1344,7 @@ private:
         return "its window [" + std::to_string(s.hwBefore) + ", " + std::to_string(s.hwAfter) + ") of partition " + std::to_string(s.part) + " has no unseen offset";
     }
     /// One past the last data record: what the judge and the committed markers must cover (a trailing change record needs no marker).
-    static int64_t dataEnd_(const VerdictRig::RigLog& l) { return l.data.empty() ? 0 : l.data.back().offset + 1; }
+    static int64_t dataEnd_(const VerdictRig::RigLog& l) { return l.judgedEnd(); }
 
     /// The committed records ever seen: a compaction may remove them from every log later, the model still judges them.  Every
     /// running node's log is read below its own high watermark: only a leader compacts, so a committed record its cleaner dropped
@@ -1168,6 +1361,14 @@ private:
                 seen_[static_cast<std::size_t>(part)].insert(ch.offset);
             }
             for (const auto& m : log.markers) seen_[static_cast<std::size_t>(part)].insert(m.offset);
+            for (const auto& m : log.txnMarkers) {
+                txnMarkers_[static_cast<std::size_t>(part)][m.offset] = m;
+                seen_[static_cast<std::size_t>(part)].insert(m.offset);
+            }
+            for (const auto& j : log.judges) {
+                judges_[static_cast<std::size_t>(part)][j.offset] = j;
+                seen_[static_cast<std::size_t>(part)].insert(j.offset);
+            }
             for (const auto& [off, through] : log.reservations) reservations_[static_cast<std::size_t>(part)][off] = through;
         };
         if (given != nullptr) {
@@ -1195,6 +1396,8 @@ private:
         for (const auto& kv : data_[static_cast<std::size_t>(part)]) out.data.push_back(kv.second);
         for (const auto& kv : changes_[static_cast<std::size_t>(part)]) out.changes.push_back(kv.second);
         for (const auto& kv : reservations_[static_cast<std::size_t>(part)]) out.reservations.emplace_back(kv.first, kv.second);
+        for (const auto& kv : txnMarkers_[static_cast<std::size_t>(part)]) out.txnMarkers.push_back(kv.second);
+        for (const auto& kv : judges_[static_cast<std::size_t>(part)]) out.judges.push_back(kv.second);
         return out;
     }
 
@@ -1675,8 +1878,20 @@ private:
         RpLive live;
         std::set<uint64_t> members;
         auto ch = changes_[0].begin();
+        std::map<std::pair<int64_t, int64_t>, const VerdictRig::RigLogRec*> order;   // a transaction's records apply at its commit marker, an aborted one's never
         for (const auto& [off, rec] : data_[0]) {
-            for (; ch != changes_[0].end() && ch->first < off; ++ch) {
+            int64_t at = off;
+            if (rec.txn) {
+                const auto m = std::find_if(txnMarkers_[0].upper_bound(off), txnMarkers_[0].end(), [&](const auto& kv) { return kv.second.producerId == rec.producerId; });
+                if (m == txnMarkers_[0].end() || !m->second.commit) continue;
+                at = m->first;
+            }
+            order.emplace(std::pair{at, off}, &rec);
+        }
+        for (const auto& [pos, recAt] : order) {
+            const auto& rec = *recAt;
+            const int64_t off = rec.offset;
+            for (; ch != changes_[0].end() && ch->first < pos.first; ++ch) {
                 members.clear();
                 for (const auto& m : ch->second.members) members.insert(m.viewObjectId);
             }
@@ -1762,10 +1977,81 @@ private:
         });
     }
 
+    /// Transaction mode: what a node holds of the ledger's partition, read on its own threads.
+    struct LedgerSnap {
+        bool leader = false;
+        VerdictRig::RigLog log;                              ///< below the HW
+        std::map<int64_t, ModelVerdict> index;               ///< the node's RejectedOffsetIndex
+    };
+    LedgerSnap ledgerSnap_(int id) {
+        LedgerSnap s;
+        BrokerNode& n = c_.node(id);
+        n.onOwnerThreadForTest(ledgerTopicId_, 0, [&s](rune::replication::PartitionReplica& r) {
+            s.leader = r.role() == rune::replication::Role::Leader;
+            s.log = readLogOf(*r.log(), r.highWatermark());
+            return 0;
+        });
+        const int32_t t = ledgerTopicId_;
+        n.onWorkerThreadForTest(rune::metadata::ShardRouter(n.workerCountForTest()).workerForPartition(t, 0), [&s, t](Worker& wk) {
+            if (const PartitionWriteState* ws = wk.writeStateForTest(t, 0))
+                ws->rejected.forEachIn(0, INT64_MAX, [&](const rune::storage::RejectedOffsetIndex::Entry& e) { s.index[e.offset] = {e.code, e.constraintId}; });
+            return 0;
+        });
+        return s;
+    }
+
+    /// Plan 11 (matrix D): each transaction is fully visible or fully invisible on both of its partitions.  A committed one is visible
+    /// whole, one the writer was told "no" or aborted is invisible, and an atomic batch is never partial.  A record is visible when it
+    /// is not in a transaction or the transaction's COMMIT marker follows it, and the partition's verdicts do not reject it.
+    void registerTransactionInvariants_() {
+        registerInvariant("TxnAllOrNothingAndAtomicPerPartition", [](CheckedWritesStressDriver& d, std::string* why) {
+            std::map<int64_t, VerdictRig::RigLogRec> ledgerData;
+            std::map<int64_t, VerdictRig::RigTxnMarker> ledgerMarkers;
+            std::set<int64_t> ledgerRejected;
+            for (const int id : d.c_.runningNodes()) {
+                const LedgerSnap s = d.ledgerSnap_(id);
+                for (const auto& rec : s.log.data) ledgerData.emplace(rec.offset, rec);
+                for (const auto& m : s.log.txnMarkers) ledgerMarkers.emplace(m.offset, m);
+                for (const auto& kv : s.index) ledgerRejected.insert(kv.first);
+            }
+            std::map<std::string, const VerdictRig::RigLogRec*> characters;
+            for (const auto& kv : d.data_[0]) if (!kv.second.del) characters.emplace(kv.second.name, &kv.second);
+            std::map<uint64_t, const VerdictRig::RigLogRec*> entries;
+            for (const auto& kv : ledgerData) entries.emplace(kv.second.id, &kv.second);
+            const auto committed = [](const auto& markers, const VerdictRig::RigLogRec& rec) {
+                if (!rec.txn) return true;
+                const auto m = std::find_if(markers.upper_bound(rec.offset), markers.end(), [&](const auto& kv) { return kv.second.producerId == rec.producerId; });
+                return m != markers.end() && m->second.commit;
+            };
+            for (const TxnRun& t : d.txns_) {
+                std::size_t present = 0, visible = 0;
+                for (const std::string& name : t.names) {
+                    const auto it = characters.find(name);
+                    if (it == characters.end()) continue;
+                    ++present;
+                    visible += committed(d.txnMarkers_[0], *it->second) && d.models_[0].verdicts().count(it->second->offset) == 0 ? 1 : 0;
+                }
+                for (const uint64_t entry : t.entries) {
+                    const auto it = entries.find(entry);
+                    if (it == entries.end()) continue;
+                    ++present;
+                    visible += committed(ledgerMarkers, *it->second) && ledgerRejected.count(it->second->offset) == 0 ? 1 : 0;
+                }
+                const std::size_t total = t.names.size() + t.entries.size();
+                const std::string at = std::string(t.kind == TxnRun::Kind::Batch ? "atomic batch of ledger entries " : "transaction of ") + (t.names.empty() ? std::to_string(t.entries[0]) : t.names[0]) +
+                                       " (" + std::to_string(visible) + " of " + std::to_string(total) + " records visible, " + std::to_string(present) + " in the logs): ";
+                if (visible != 0 && visible != total) { *why = at + "partly visible"; return false; }
+                if (t.answer == TxnRun::Answer::Yes && visible != total) { *why = at + "acked committed but not visible"; return false; }
+                if (t.answer == TxnRun::Answer::No && visible != 0) { *why = at + "refused or aborted but visible"; return false; }
+            }
+            return true;
+        });
+    }
+
     rune::node::test::catalog_cluster::ThreeNodes& c_;
     std::mt19937_64 rng_;
     uint64_t seed_;
-    bool rp_, autoInc_, keyIndex_;
+    bool rp_, txn_, autoInc_, keyIndex_;
     int parts_, keys_;
     int32_t topicId_ = -1, viewTopicId_ = -1;
     int32_t capTopic_ = kCapTopicBase, capSeq_ = 0;   // the installed CapLiveKeys view's topic (0 = dropped)
@@ -1780,6 +2066,11 @@ private:
     std::vector<std::unique_ptr<KiWriter>> kiWriters_;
     std::vector<std::unique_ptr<AiWriter>> aiWriters_;
     std::vector<std::unique_ptr<RpWriter>> rpWriters_;
+    std::vector<std::unique_ptr<TxnWriter>> txnWriters_;
+    int32_t ledgerTopicId_ = -1;
+    uint64_t ledgerSeq_ = 0, txnSeq_ = 0;
+    int txnErrors_ = 0;
+    std::vector<TxnRun> txns_;
     uint64_t nameObj_ = 0, statsObj_ = 0, statsFp_ = 0;   ///< RegressorsPath mode: the unique and check members (learnConstrainedViews_)
     int32_t nameTopic_ = 0, statsTopic_ = 0;
     std::map<uint64_t, std::pair<uint64_t, std::string>> rpChars_;   ///< ... what the acked writes left of the characters: id -> (user, name)
@@ -1798,6 +2089,8 @@ private:
     std::vector<std::map<int64_t, VerdictRig::RigLogRec>> data_;   ///< per partition
     std::vector<std::map<int64_t, VerdictRig::RigChange>> changes_;
     std::vector<std::map<int64_t, uint64_t>> reservations_;        ///< per partition: (offset, reserved-through n) of every reservation record any replica showed
+    std::vector<std::map<int64_t, VerdictRig::RigTxnMarker>> txnMarkers_;   ///< per partition: every COMMIT / ABORT marker any replica showed
+    std::vector<std::map<int64_t, VerdictRig::RigJudge>> judges_;           ///< ... and every TxnJudge record
     struct LeadCounter { int id, part; AutoIncReady counter; std::size_t sentBefore; };
     std::vector<std::size_t> faultsAt_;                            ///< sent_.size() when a node was stopped or crashed
     std::vector<LeadCounter> leadCounters_;                        ///< autoincrement mode: a leader's counter, read after sent_[0, sentBefore)

@@ -1199,11 +1199,23 @@ public:
     }
 
     // ---- the log, read back ----
-    struct RigLogRec { int64_t offset; uint64_t id; int64_t v; uint8_t tag; bool del; uint8_t intent = 0; uint64_t valueId = 0; std::string name; };   ///< valueId: the value's own key field; name: the string(16) after the first 8-byte column (a character's name), empty if the value ends before it
+    struct RigLogRec { int64_t offset; uint64_t id; int64_t v; uint8_t tag; bool del; uint8_t intent = 0; uint64_t valueId = 0; std::string name; int64_t producerId = -1; bool txn = false; bool atomic = false; int64_t batchBase = -1; };   ///< valueId: the value's own key field; name: the string(16) after the first 8-byte column (a character's name), empty if the value ends before it; batchBase: the base offset of its batch
     struct RigChange { int64_t offset; std::vector<rune::storage::control_record::ChangeMember> members; int64_t catalogThrough = -1; };
     struct RigMarker { int64_t offset; rune::storage::control_record::MarkerHeader header; std::vector<std::tuple<int64_t, uint16_t, uint32_t>> entries; bool horizon = false; };
     struct RigPlan { int64_t offset; rune::storage::control_record::VerdictPlanHeader header; std::vector<uint8_t> plan, outputDescriptor, sourceDescriptor; };   ///< a type-20 record
-    struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; std::vector<std::pair<int64_t, uint64_t>> reservations; std::vector<RigPlan> plans; };   ///< reservations: (offset, reserved-through n)
+    struct RigTxnMarker { int64_t offset; int64_t producerId; bool commit; };   ///< a COMMIT / ABORT marker
+    struct RigJudge { int64_t offset; int64_t producerId; int16_t epoch; int64_t firstOffset; };   ///< a TxnJudge record
+    struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; std::vector<std::pair<int64_t, uint64_t>> reservations; std::vector<RigPlan> plans; std::vector<RigTxnMarker> txnMarkers; std::vector<RigJudge> judges;
+        /// One past the last record that gets a verdict: an aborted transaction's records get none, and no marker covers a trailing range of them.
+        [[nodiscard]] int64_t judgedEnd() const {
+            int64_t end = 0;
+            for (const RigLogRec& d : data) {
+                const auto m = std::find_if(txnMarkers.begin(), txnMarkers.end(), [&](const RigTxnMarker& x) { return x.producerId == d.producerId && x.offset > d.offset; });
+                if (!d.txn || m == txnMarkers.end() || m->commit) end = d.offset + 1;
+            }
+            return end;
+        }
+    };   ///< reservations: (offset, reserved-through n)
 
     /// Every data record, change record and marker below `through`, in offset order, straight from the segments.
     [[nodiscard]] RigLog readLog(int64_t through = INT64_MAX) const;
@@ -1568,23 +1580,36 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
             const uint8_t* b = v.data + p;
             rune::protocol::RecordBatchReader r(b, total);
             if ((r.attributes() & rune::protocol::batch::kAttrControl) == 0) {
+                const auto push = [&](VerdictRig::RigLogRec rec) {
+                    rec.producerId = r.producerId();
+                    rec.txn = (r.attributes() & rune::protocol::batch::kAttrTransactional) != 0;
+                    rec.atomic = (r.attributes() & rune::protocol::batch::kAttrAtomic) != 0;
+                    rec.batchBase = r.baseOffset();
+                    out.data.push_back(std::move(rec));
+                };
                 (void)rune::protocol::forEachRecordSpan(b, total, [&](const rune::protocol::RecordSpan& rs) {
                     if (rs.offset >= through) return;
                     uint64_t id = 0;
                     const std::size_t kw = rs.key.size();   // the wire key is the id, kw bytes wide
                     for (std::size_t i = 0; i < std::min<std::size_t>(kw, 8); ++i) id |= uint64_t(uint8_t(rs.key[i])) << (8 * i);
                     const auto intent = static_cast<uint8_t>(rs.attributes & 0x03);
-                    if (rs.value.empty()) { out.data.push_back({rs.offset, id, 0, 0, true, intent, id}); return; }
+                    if (rs.value.empty()) { push({rs.offset, id, 0, 0, true, intent, id}); return; }
                     const auto* val = reinterpret_cast<const uint8_t*>(rs.value.data());
                     uint64_t x = 0, valueId = 0;
                     for (int i = 0; i < 8; ++i) x |= uint64_t(val[4 + kw + i]) << (8 * i);
                     for (std::size_t i = 0; i < std::min<std::size_t>(kw, 8); ++i) valueId |= uint64_t(val[4 + i]) << (8 * i);
                     std::string name;
                     if (rs.value.size() >= 4 + kw + 8 + 16) name.assign(reinterpret_cast<const char*>(val + 4 + kw + 8), strnlen(reinterpret_cast<const char*>(val + 4 + kw + 8), 16));
-                    out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(rs.value.size() > 4 + kw + 8 ? val[4 + kw + 8] : 0), false, intent, valueId, std::move(name)});   // a topic with no tag field ends after the int64
+                    push({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(rs.value.size() > 4 + kw + 8 ? val[4 + kw + 8] : 0), false, intent, valueId, std::move(name)});   // a topic with no tag field ends after the int64
                 });
             } else if (r.baseOffset() < through) {
-                if (const auto c = crl::parseControl(b, total); c && c->type == crl::kConstraintSetChange) {
+                const auto c = crl::parseControl(b, total);
+                const int endType = (r.attributes() & rune::protocol::batch::kAttrTransactional) != 0 ? rune::storage::control_marker::controlType(b, total) : rune::storage::control_marker::kUnparseable;
+                if (endType != rune::storage::control_marker::kUnparseable) {
+                    out.txnMarkers.push_back({r.baseOffset(), r.producerId(), endType == rune::storage::control_marker::kCommit});
+                } else if (c && c->type == crl::kTxnJudge) {
+                    if (const auto j = crl::parseTxnJudge(*c)) out.judges.push_back({r.baseOffset(), j->producerId, j->producerEpoch, j->firstOffset});
+                } else if (c && c->type == crl::kConstraintSetChange) {
                     std::array<crl::ChangeMember, 32> ms{};
                     uint32_t setId = 0; int64_t catalogThrough = -1; uint16_t n = 0;
                     if (crl::parseConstraintSetChange(*c, setId, catalogThrough, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n), catalogThrough});
@@ -1614,17 +1639,14 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
 
 inline VerdictRig::RigLog VerdictRig::readLog(int64_t through) const { return readLogOf(*log, through); }
 
-/// Contract addition 19 (R-2h): one transaction over two key-index topics, each led by its own rig, ended as its coordinator does:
+/// Contract addition 19 (R-2h): one transaction over two topics, each led by its own rig (set up by `setup`), ended as its coordinator does:
 /// both partitions vote, and the transaction commits on both only when both voted yes.
 struct TxnPair {
     VerdictRig a, b;
-    TxnPair() {
-        for (VerdictRig* r : {&a, &b}) {
-            r->createKeyIndex();
-            r->enableAcks();
-            r->worker->setVerdictIntervalNs(1'000'000);
-            r->passes(60);
-        }
+    /// `follower` / `rollBytes`: both rigs' replica and segment settings (VerdictRig's).
+    explicit TxnPair(const std::function<void(VerdictRig&)>& setup, bool follower = false, int64_t rollBytes = 64LL * 1024 * 1024) : a(follower, rollBytes), b(follower, rollBytes) {
+        setup(a);
+        setup(b);
     }
     /// Producer `pid`'s records on each topic, written by the previous leaders.
     void write(int64_t pid, const std::vector<Rec>& onA, const std::vector<Rec>& onB) {
@@ -1633,20 +1655,34 @@ struct TxnPair {
         a.passes(30);
         b.passes(30);
     }
-    /// Both votes, then the decision's markers on both; true when it committed.
-    bool end(int64_t pid) {
-        bool commit = true;
+    /// Both votes (0 = a, 1 = b), then the decision's markers on both: commit only when both voted yes.
+    VerdictRig::TxnEnd commit(int64_t pid) {
+        VerdictRig::TxnEnd end;
+        end.committed = true;
+        int32_t index = 0;
         for (VerdictRig* r : {&a, &b}) {
             const int64_t tok = r->sendVote(VerdictRig::kSrc, pid, 0);
             EXPECT_TRUE(r->driveUntilVoted(tok));
             const auto v = r->voteReply(tok);
-            commit = commit && v && v->errorCode == 0 && v->code == 0;
+            if (v) end.votes.emplace_back(index, *v);
+            ++index;
+            end.committed = end.committed && v && v->errorCode == 0 && v->code == 0;
         }
+        mark_(pid, end.committed);
+        return end;
+    }
+    /// The abort markers on both, as after a timeout or another partition's no.
+    VerdictRig::TxnEnd abort(int64_t pid) {
+        mark_(pid, false);
+        return {};
+    }
+
+private:
+    void mark_(int64_t pid, bool commit) {
         for (VerdictRig* r : {&a, &b}) {
             r->marker(pid, commit);
             EXPECT_TRUE(commit ? r->driveUntilJudged() : r->driveUntilJudgeReaches());   // an abort leaves nothing to mark
         }
-        return commit;
     }
 };
 

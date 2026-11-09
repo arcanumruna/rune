@@ -1107,7 +1107,7 @@ struct FallbackRig {
     rc::Completions              cq{client};
     std::map<rc::Token, rc::Completion> got;
 
-    static rc::ClientConfig makeCfg(int32_t in, int32_t eg, int seedPort) {
+    static rc::ClientConfig makeCfg(int32_t in, int32_t eg, int seedPort, int64_t responseTimeoutNs, int64_t keepaliveNs) {
         rc::ClientConfig c;
         c.gatewayChannel  = fbUdp(seedPort);
         c.gatewayStreamId = in;
@@ -1119,8 +1119,9 @@ struct FallbackRig {
         c.nanoClock       = &fbNow;
         c.connectTimeoutMs = 3000;   // below the 5 s grace: a silent coordinator session stays Connecting, never Backoff
         // Nothing else may time out inside the 5 s windows the test jumps over.
-        c.responseTimeoutNs = 3'600'000'000'000LL;
-        c.pingTimeoutMs     = 3'600'000;
+        c.responseTimeoutNs   = responseTimeoutNs;
+        c.keepaliveIntervalNs = keepaliveNs;
+        c.pingTimeoutMs       = 3'600'000;
         rc::TopicSpec ts;
         ts.name           = "t";
         ts.topicId        = 1;
@@ -1128,8 +1129,8 @@ struct FallbackRig {
         c.topics.push_back(ts);
         return c;
     }
-    explicit FallbackRig(int32_t in, int32_t eg)
-        : seedPort(fbFreePort()), nodePort(fbFreePort()), cfg(makeCfg(in, eg, seedPort)), client(cfg),
+    explicit FallbackRig(int32_t in, int32_t eg, int64_t responseTimeoutNs = 3'600'000'000'000LL, int64_t keepaliveNs = 0)
+        : seedPort(fbFreePort()), nodePort(fbFreePort()), cfg(makeCfg(in, eg, seedPort, responseTimeoutNs, keepaliveNs)), client(cfg),
           gw(cfg.dataDir + "/aeron", cfg.gatewayChannel, in, cfg.egressChannel, eg) {
         gw.brokerHost       = "127.0.0.1";
         gw.brokerPort       = seedPort;
@@ -1286,6 +1287,120 @@ TEST(ProducerTxnClientRegression, CoordinatorFallbackHappensAfterFiveSecondsNotC
     EXPECT_EQ(r.gw.coordinatorEndpoints.back(), 0) << "the re-offer arrived on the seed node";
     EXPECT_EQ(r.client.testCoordinatorFallbacks(), 1u) << "a second fallback";
     EXPECT_EQ(strs(r.gw.committedValues(0)), (std::vector<std::string>{"fb"}));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The coordinator node's silence: its session goes stale after responseTimeoutNs, and the route is given up at that
+// edge (Client.cpp syncCoordinatorSession_, CoordRemote::staleBase) instead of after the 5 s grace.
+// ---------------------------------------------------------------------------------------------------------------
+namespace {
+
+constexpr int64_t kStaleRespNs      = 1'000'000'000LL;
+constexpr int64_t kStaleKeepaliveNs = 200'000'000LL;
+
+/// A connected producer whose coordinator is the other node; with `endTxn` its commit (op 201) is in flight there
+/// (the answer held) and the correlation id of that EndTxn is returned.
+int64_t fbCoordinatorUp(FallbackRig& r, rc::Producer& p, bool endTxn) {
+    EXPECT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    EXPECT_EQ(r.client.connect(r.cq, 1), rc::OpResult::Accepted);
+    EXPECT_TRUE(r.drive([&] { return r.got.count(1) != 0; })) << "the seed never connected";
+    EXPECT_EQ(p.initTransactions(r.cq, 100), rc::OpResult::Accepted);
+    EXPECT_TRUE(r.drive([&] { return r.got.count(100) != 0; }));
+    EXPECT_EQ(r.got[100].status, rc::OpStatus::Ok);
+    EXPECT_EQ(r.client.testCoordinatorRedirects(), 1u) << "precondition: the coordinator is the other node";
+    EXPECT_EQ(r.coordState(), rc::session::SessionState::Connected);
+    if (!endTxn) return 0;
+    p.beginTransaction();
+    EXPECT_TRUE(r.drive([&] { return p.state() == rc::TxnState::InTransaction; }, 20'000, 0));
+    const std::string v = "fb";
+    EXPECT_EQ(p.trySend(r.client.topic("t"), rc::Key(uint64_t{1}), bytesOf(v), r.cq, 200), rc::SendResult::Ok);
+    EXPECT_TRUE(r.drive([&] { return r.got.count(200) != 0; }, 200'000, 0));
+    r.gw.holdTxnReplies = true;
+    EXPECT_EQ(p.commitTransaction(r.cq, 201), rc::OpResult::Accepted);
+    EXPECT_TRUE(r.drive([&] { return r.gw.endTxns >= 1; }, 200'000, 0));
+    return r.gw.coordDecisions.empty() ? 0 : r.gw.coordDecisions.back().correlationId;
+}
+
+rc::ProducerConfig fbStaleProducerCfg() {
+    rc::ProducerConfig pc = txnCfg();
+    pc.transactionOpTimeoutMs = 3'600'000;
+    pc.produceTimeoutMs       = 3'600'000;
+    pc.deliveryTimeoutMs      = 7'200'000;
+    return pc;
+}
+
+}  // namespace
+
+// RED (mutations): `stale` dropped from gaveUp in syncCoordinatorSession_ (the route is given up only by the 5 s
+// grace: no fallback at +1.6 s).
+TEST(ProducerTxnClientRegression, CoordinatorFallbackAtTheStaleEdgeRegression) {
+    FallbackRig r(5103, 5104, kStaleRespNs, kStaleKeepaliveNs);
+    rc::Producer p = r.client.producer(fbStaleProducerCfg());
+    const int64_t endCorr = fbCoordinatorUp(r, p, true);
+    ASSERT_NE(endCorr, 0);
+    ASSERT_EQ(r.client.testCoordinatorFallbacks(), 0u);
+
+    // The coordinator node dies: no pong, no connect answer, no SessionExpired.  The seed names the new coordinator.
+    const int64_t t0 = g_fbNow;
+    r.gw.noPongEndpoints.insert(r.node);
+    r.gw.silentEndpoints.insert(r.node);
+    r.gw.coordinatorEndpoint = 0;
+    r.gw.holdTxnReplies      = false;   // the dead node's EndTxn stays swallowed; the new coordinator answers
+    r.advanceTo(t0 + 1'600'000'000LL);
+    ASSERT_LT(g_fbNow - t0, kFbGraceNs);
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 1u) << "the stale edge did not give the coordinator up";
+    EXPECT_EQ(r.coordIdx(), 0u);
+
+    ASSERT_TRUE(r.drive([&] { return r.got.count(201) != 0; }, 200'000, 0)) << "the commit never completed after the fallback";
+    EXPECT_EQ(r.got[201].status, rc::OpStatus::Ok) << "errorCode " << r.got[201].errorCode;
+    r.passes(2000);
+    EXPECT_EQ(r.gw.endTxns, 2) << "the EndTxn must reach the new coordinator exactly once";
+    std::vector<test_support::InvokerGateway::CoordDecision> ends;
+    for (const auto& d : r.gw.coordDecisions) if (d.kind == test_support::InvokerGateway::TxnFrameKind::EndTxn) ends.push_back(d);
+    ASSERT_EQ(ends.size(), 2u);
+    EXPECT_EQ(ends[0].correlationId, endCorr);
+    EXPECT_EQ(ends[1].correlationId, endCorr) << "the re-offer carries the original correlation id";
+    EXPECT_EQ(r.gw.coordinatorEndpoints.back(), 0) << "the re-offer arrived on the seed node";
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 1u);
+}
+
+// RED (mutations): CoordRemote::staleBase initialised to 0 instead of the session's current count (a fallback the
+// moment the seed names the dead node again, not at the never-connected grace's growing pace).
+TEST(ProducerTxnClientRegression, StaleFallbackReasksADeadNodeAtTheNeverUpPaceRegression) {
+    FallbackRig r(5105, 5106, kStaleRespNs, kStaleKeepaliveNs);
+    rc::Producer p = r.client.producer(fbStaleProducerCfg());
+    ASSERT_NE(fbCoordinatorUp(r, p, true), 0);
+
+    // The election has not moved on: after the fallback the seed still names the silent node.
+    const int64_t t0 = g_fbNow;
+    r.gw.noPongEndpoints.insert(r.node);
+    r.gw.silentEndpoints.insert(r.node);
+    // The stale edge gives it up once; each re-follow of the node that never connects is given up after the
+    // never-connected grace (100, 200, 400, 800 ms ...), never at the stale count the session already had.
+    std::vector<int64_t> at;
+    while (g_fbNow - t0 < 3'000'000'000LL) {
+        const uint64_t before = r.client.testCoordinatorFallbacks();
+        r.step(1'000'000);
+        if (r.client.testCoordinatorFallbacks() != before) at.push_back(g_fbNow);
+    }
+    ASSERT_GE(at.size(), 3u) << "the seed is never re-asked about the dead node";
+    for (size_t i = 2; i < at.size(); ++i)
+        EXPECT_GE(at[i] - at[i - 1], at[i - 1] - at[i - 2]) << "fallback " << i << " came sooner than the grace before it";
+    EXPECT_LE(at.size(), 6u) << "the route went back and forth between the seed and the dead node";
+}
+
+// RED (mutations): staleSessionLosses() read without subtracting ownStallLosses().
+TEST(ProducerTxnClientRegression, OwnStallDoesNotGiveTheCoordinatorUpRegression) {
+    FallbackRig r(5107, 5108, kStaleRespNs, kStaleKeepaliveNs);
+    rc::Producer p = r.client.producer(fbStaleProducerCfg());
+    fbCoordinatorUp(r, p, false);
+    ASSERT_NE(r.coordIdx(), 0u);
+
+    r.step(2 * kStaleRespNs);   // the client stalled: the node answers on resume
+    r.passes(200);
+    ASSERT_TRUE(r.drive([&] { return r.coordState() == rc::session::SessionState::Connected; }, 20'000, 0));
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 0u) << "the client's own stall gave the coordinator up";
+    EXPECT_NE(r.coordIdx(), 0u);
 }
 
 // ---------------------------------------------------------------------------------------------------------------

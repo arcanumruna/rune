@@ -1834,6 +1834,8 @@ public:
     void holdSecurityApplyAtBootForTest(bool on) noexcept { holdSecurityApplyAtBootForTest_ = on; }
     /// Test seam, before start(): the namespace reaper issues nothing until its budget is raised.
     void holdReaperAtBootForTest(bool on) noexcept { holdReaperAtBootForTest_ = on; }
+    /// Test seam, before start(): the transaction coordinator holds a vote while `fn` returns true for it (the control thread calls it).
+    void setTxnVoteHoldForTest(TransactionCoordinationService::VoteFnOverride fn) { txnVoteHoldForTest_ = std::move(fn); }
     /// Catalog history Task 22 (checklist 1): a REAL crash for the 3-node slice - stop() without the
     /// controlled-shutdown protocol (no halt, no consensus hand-off, no goodbye to the members): the
     /// threads are joined and the transport torn down, nothing is answered or flushed on purpose.
@@ -2808,6 +2810,7 @@ private:
     bool                                                  holdCatalogApplyAtBootForTest_ = false;
     bool holdSecurityApplyAtBootForTest_ = false;   // issue #15 test seam (startup thread, before start)
     bool holdReaperAtBootForTest_ = false;          // test seam (startup thread, before start)
+    TransactionCoordinationService::VoteFnOverride txnVoteHoldForTest_;   // test seam (before start)
     std::vector<int32_t>                                  topicsAtReplicationBuild_;   // serving topic ids when replication was built
     std::thread::id                                       controlThreadId_;   // start() (controller); see controlThreadIdForTest
     // Control thread: the last consensus-driven catalog role posted (single node).

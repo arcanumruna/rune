@@ -1,6 +1,7 @@
 // Checked writes Part 11 Task 7: the TxnVote op on a real Worker - the vote-time scan, the TxnJudge record J, answers parked until
 // the judge judged J, the marker's answer held until its transaction is final, the stats 11-20 and the read_uncommitted bound.
 // A transaction with intents is written by replication where the test needs the previous leader's bytes.
+#include "CheckedWritesModel.h"
 #include "CheckedWritesRig.h"
 
 #include <rune/protocol/client/StatsMessages.h>
@@ -636,6 +637,62 @@ TEST(CheckedWritesTxnWorker, RunAheadCheckpointIsBackfilledOnReplayRegression) {
     EXPECT_EQ(rows(), leader) << "the refold equals the leader's table";
 }
 
+// P11-8 (a), the restored member at exactly the deferred transaction's first record: U (open, never voted) starts right after T's first record,
+// so the checkpoint pushed while the judge runs ahead of T sits at U's first offset, above T's first.  The crash takes every later push.
+// The restart restores the member at that offset with an empty span fence, and T's commit must still reach it from T's TxnJudge.
+TEST(CheckedWritesTxnWorkerRegression, RunAheadCheckpointAtADeferredTxnStartStillGetsTheCommitRegression) {
+    Persisted p;
+    ASSERT_GT(p.cap, 0);
+    constexpr int64_t kOther = kRaPid + 1;
+    // U starts at the pass cap's second push: the plain records between T's first record and U's make the cap fall on U's first offset.
+    std::vector<std::vector<uint8_t>> batches{VerdictRig::batch({ins(1001)}, kRaPid, 0, {}, /*txn=*/true)};
+    for (auto& b : Persisted::plain(10000, 2 * p.cap - 1)) batches.push_back(std::move(b));
+    batches.push_back(VerdictRig::batch({ins(1003)}, kOther, 0, {}, /*txn=*/true));
+    for (auto& b : Persisted::plain(20000, 3 * p.cap)) batches.push_back(std::move(b));
+    const int64_t first = p.replicated(std::move(batches));
+    const int64_t tok = p.r.sendVote(VerdictRig::kSrc, kRaPid, 0);
+    const int64_t tokOther = p.r.sendVote(VerdictRig::kSrc, kOther, 0);
+    std::vector<uint8_t> atOther;
+    int64_t pushedAt = -1;
+    for (int i = 0; i < 2000 && !(p.r.voteReply(tok) && p.r.voteReply(tokOther)); ++i) {
+        p.r.pass();
+        const auto js = p.r.txnJudgeOffsetsInLog();
+        if (pushedAt < 0 && !js.empty() && p.durable() > first && p.durable() < js[0]) {
+            pushedAt = p.durable();
+            atOther = slurp(viewCheckpointFilePath(p.r.snapDir(), kRej, 0));
+        }
+    }
+    ASSERT_TRUE(p.r.voteReply(tok));
+    ASSERT_EQ(p.r.voteReply(tok)->code, 0);
+    ASSERT_TRUE(p.r.voteReply(tokOther));
+    ASSERT_EQ(pushedAt, first + 2 * p.cap) << "the first checkpoint above T's first record is at the open transaction's first record";
+    p.r.marker(kRaPid, true);
+    p.r.passes(300);   // U is voted and undecided: it holds K at its first record
+    ASSERT_TRUE(p.r.hasRow(kRej, 1001));
+    const auto rows = [&] {
+        std::vector<uint64_t> out;
+        const ViewInstance* inst = p.r.vs->instanceForTest(kRej, 0);
+        for (uint64_t k = 0; k < 10000 + static_cast<uint64_t>(3 * p.cap) + 10; ++k)
+            if (inst->table.get(k) != nullptr) out.push_back(k);
+        return std::make_pair(out, inst->table.size());
+    };
+    const auto leader = rows();
+    p.r.agent.reset();
+    {
+        std::ofstream out(viewCheckpointFilePath(p.r.snapDir(), kRej, 0), std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(atOther.data()), static_cast<std::streamsize>(atOther.size()));
+    }
+    p.r.agent = std::make_unique<ViewSnapshotIoAgent>(p.r.channel, p.r.snapDir(), /*fsyncMs=*/0, p.r.backupPolicy);
+    p.r.restart();
+    p.r.passes(300);
+    ASSERT_NE(p.r.stats(), nullptr);
+    EXPECT_EQ(p.r.stats()->verdictCheckpointsDiscarded, 0u) << "the restored member is kept, at U's first record";
+    EXPECT_EQ(p.r.writeState()->txn.stats.checkpointBackfills, 1u);
+    EXPECT_TRUE(p.r.hasRow(kRej, 1001)) << "T's record below the restored cursor reaches the member from J";
+    EXPECT_TRUE(p.r.hasRow(kRej, 10000 + static_cast<uint64_t>(3 * p.cap) - 1));
+    EXPECT_EQ(rows(), leader) << "the refold equals the leader's table";
+}
+
 // REGRESSION (found by R11b; P11-8): the checkpoint cap holds the judge at the markers' coverage plus the cap, and a marker covers
 // only a stretch with a judged record.  A stretch past the cap with nothing to judge (an aborted transaction, then its marker) held
 // the judge there for good, and every later record went unjudged.  While nothing judged waits for a marker the cap counts from the
@@ -698,6 +755,34 @@ TEST(CheckedWritesTxnWorkerRegression, CoverageNeverInsideAnAppliedOrdinaryTxnRe
     EXPECT_TRUE(r.hasRow(kRej, 3));
     EXPECT_TRUE(r.hasRow(kRej, 4));
     EXPECT_TRUE(r.hasRow(kRej, 29));
+}
+
+// REGRESSION (design 3.1, P11-2): a verdict marker appended while the judge waits at a later transaction B opened inside the span (first, M]
+// of an ordinary T must not end past T's first record: the log check (CheckedWritesModel::coverageProblem) sees it.  Without the third
+// term of judgedThrough the marker ends at B's first record, inside T's span.
+TEST(CheckedWritesTxnWorkerRegression, MarkerInsideAnOrdinarySpanIsCaughtByTheLogRegression) {
+    VerdictRig r;
+    r.createKeyIndex();
+    r.enableAcks();
+    r.passes(50);
+    namespace tx = rune::transaction;
+    r.demote();
+    r.replicate({VerdictRig::batch({ups(1)}, kRaPid, 0, {}, /*txn=*/true), VerdictRig::batch({ups(2)}),
+                 VerdictRig::batch({ups(3)}, kRaPid + 1, 0, {}, /*txn=*/true), tx::ControlMarker::build(kRaPid, 0, tx::ControlType::Commit, 0)});
+    r.promoteWithoutPass();
+    for (int i = 0; i < 60; ++i) {
+        if (i % 8 == 0) r.followerFetch();
+        r.pass();
+    }
+    r.marker(kRaPid + 1, true);
+    ASSERT_TRUE(r.driveUntilJudged());
+    const VerdictRig::RigLog log = r.readLog();
+    ASSERT_FALSE(log.markers.empty());
+    CheckedWritesModel model;
+    model.addKeyIndexRule();
+    model.reset(log);
+    EXPECT_EQ(model.coverageProblem(log), "");
+    EXPECT_EQ(model.judgeStop(), INT64_MAX);
 }
 
 // REGRESSION (design 3.1): as above with the later transaction D voted: its TxnJudge defers it, so the judge passes D and applies T
@@ -962,17 +1047,26 @@ TEST(CheckedWritesTxnWorker, VotedAbortedRefoldsEqual) {
 }
 
 // Contract addition 19: one transaction over two topics.  Both vote yes: the commit applies it on both.  One votes no: it aborts on
-// both, and the other applies nothing.
+// both, and the other applies nothing.  An abort applies nothing on either.
 TEST(CheckedWritesTxnWorker, TxnPairCommitsOnBothOrNeither) {
-    TxnPair t;
+    TxnPair t([](VerdictRig& r) {
+        r.createKeyIndex();
+        r.enableAcks();
+        r.worker->setVerdictIntervalNs(1'000'000);
+        r.passes(60);
+    });
     t.write(70, {ins(1)}, {ins(2)});
-    EXPECT_TRUE(t.end(70));
+    EXPECT_TRUE(t.commit(70).committed);
     EXPECT_EQ(t.a.keyIndexKeys(), (std::set<uint64_t>{1}));
     EXPECT_EQ(t.b.keyIndexKeys(), (std::set<uint64_t>{2}));
     t.write(71, {ins(1)}, {ins(3)});   // 1 exists on a: a votes KeyExists
-    EXPECT_FALSE(t.end(71));
+    EXPECT_FALSE(t.commit(71).committed);
     EXPECT_EQ(t.a.keyIndexKeys(), (std::set<uint64_t>{1}));
     EXPECT_EQ(t.b.keyIndexKeys(), (std::set<uint64_t>{2})) << "b's yes is aborted with a's no";
+    t.write(72, {ins(4)}, {ins(5)});
+    EXPECT_FALSE(t.abort(72).committed);
+    EXPECT_EQ(t.a.keyIndexKeys(), (std::set<uint64_t>{1}));
+    EXPECT_EQ(t.b.keyIndexKeys(), (std::set<uint64_t>{2}));
 }
 
 // Design L6: after the partition's vote, a producer (and epoch) that cached the partition as verified may not append to its
@@ -1339,4 +1433,26 @@ TEST(CheckedWritesTxnWorker, VerifyRequestReportsThatTheSourceVotes) {
     EXPECT_EQ(a->code, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
     ASSERT_EQ(plain.worker->txnVerifyRequestsSentForTest(), 1u);
     EXPECT_FALSE(plain.lastVerifyVotes());
+}
+
+// REGRESSION: an open transaction holds K inside a decided commit's span.  A rebuild folds the member to K, where the span is still open,
+// and the judge passed the commit's TxnJudge before the member's fold applied it: the committed delete was lost.
+TEST(CheckedWritesTxnWorkerRegression, RebuildAppliesACommitHeldInsideAnotherTxnsSpanRegression) {
+    Ki k;
+    k.txn(31, {ins(1), ins(2)});
+    ASSERT_EQ(k.vote(31).code, 0);
+    k.r.marker(31, true);
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    ASSERT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{1, 2}));
+    k.txn(32, {Rec{1, 0, 0, true, 1}});
+    k.txn(33, {ins(5)});   // voted, undecided: K stays at its first record, inside 32's span
+    const int64_t tok32 = k.r.sendVote(VerdictRig::kSrc, 32, 0), tok33 = k.r.sendVote(VerdictRig::kSrc, 33, 0);
+    ASSERT_TRUE(k.r.driveUntilVoted(tok32));
+    ASSERT_TRUE(k.r.driveUntilVoted(tok33));
+    k.r.marker(32, true);
+    k.r.passes(60);
+    ASSERT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{2}));
+    k.r.demotePromote();
+    k.r.passes(60);
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{2})) << "the rebuild applies 32's delete";
 }

@@ -212,6 +212,17 @@ protected:
         landMarkers(pid, parts);
     }
 
+    /// The leader unloads and loads again from the committed log only.
+    void reload() {
+        isLeader_ = false;
+        (void)svc_->doWork(now_);
+        isLeader_ = true;
+        followerFetches();
+        (void)svc_->doWork(now_);
+        followerFetches();
+        (void)svc_->doWork(now_);
+    }
+
     /// A transaction on `parts` (txn id "tx"), ready for EndTxn.
     int64_t beginTxn(const std::vector<pc::TxnTopicPartition>& parts, int16_t& epoch, const std::string& txn = "tx") {
         const int64_t pid = initPid(txn, epoch);
@@ -410,6 +421,23 @@ TEST_F(CheckedWritesTxnCoordinatorTest, AVoteThatCouldNotBeSentIsResentWithBacko
     EXPECT_EQ(votes_.size(), 3u);
     vote(votes_[2]);
     (void)svc_->doWork(t0 + 30'000'000);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareCommit);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorTest, AHeldVoteIsNotSentUntilReleasedThenGoesOutOnTheNextRetry) {
+    bool hold = true;
+    svc_->setVoteHoldFn([&](std::string_view, int32_t, int64_t, int16_t) { return hold; });
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    const int64_t t0 = now_;
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    (void)svc_->doWork(t0 + 20'000'000);
+    EXPECT_TRUE(votes_.empty()) << "a held vote reaches neither the override nor the gateway";
+    hold = false;
+    (void)svc_->doWork(t0 + 60'000'000);
+    ASSERT_EQ(votes_.size(), 1u);
+    vote(votes_[0]);
+    (void)svc_->doWork(t0 + 60'000'000);
     EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareCommit);
 }
 
@@ -811,6 +839,106 @@ TEST_F(CheckedWritesTxnCoordinatorRegression, UnloadWithVotesOutThenRetryGetsThe
     EXPECT_EQ(a.failingOffset, 123);
 }
 
+TEST_F(CheckedWritesTxnCoordinatorRegression, NoSurvivesFailoverInPrepareAbortRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    vote(votes_[0], static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation), 0x00070000, 123);
+    (void)svc_->doWork(now_);
+    followerFetches();
+    (void)svc_->doWork(now_);   // the PrepareAbort is committed, the markers are out and have not landed
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareAbort);
+    reload();
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    EXPECT_EQ(lastAnswer().errorCode, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    answers_.frames.clear();
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareAbort);
+    std::size_t n = endTxn("tx", pid, ep, true);   // the client's retry on the new coordinator
+    ASSERT_GT(n, 0u);
+    EXPECT_EQ(syncAnswer(n).errorCode, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions)) << "the abort is still writing its markers";
+    completeWithMarkers(pid, {{kCw, 0}});
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::CompleteAbort);
+    answers_.frames.clear();
+    n = endTxn("tx", pid, ep, true);
+    ASSERT_GT(n, 0u);
+    const auto a = syncAnswer(n);
+    EXPECT_EQ(a.errorCode, static_cast<int16_t>(pc::ErrorCode::ConstraintViolation)) << "the same no, not 19";
+    EXPECT_TRUE(a.hasVote);
+    EXPECT_EQ(a.constraintId, 0x00070000u);
+    EXPECT_EQ(a.failingOffset, 123);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, NoSurvivesFailoverInCompleteAbortRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    vote(votes_[0], static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation), 0x00070000, 123);
+    (void)svc_->doWork(now_);
+    completeWithMarkers(pid, {{kCw, 0}});
+    followerFetches();
+    (void)svc_->doWork(now_);   // the CompleteAbort is committed
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    EXPECT_EQ(lastAnswer().errorCode, static_cast<int16_t>(pc::ErrorCode::ConstraintViolation));
+    answers_.frames.clear();    // the answer died with the node
+    reload();
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::CompleteAbort);
+    const std::size_t n = endTxn("tx", pid, ep, true);
+    ASSERT_GT(n, 0u);
+    const auto a = syncAnswer(n);
+    EXPECT_EQ(a.errorCode, static_cast<int16_t>(pc::ErrorCode::ConstraintViolation));
+    EXPECT_TRUE(a.hasVote);
+    EXPECT_EQ(a.constraintId, 0x00070000u);
+    EXPECT_EQ(a.failingOffset, 123);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, TimeoutAbortAfterFailoverStillAnswersInvalidTxnStateRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);   // the votes are out, none answered
+    reload();
+    answers_.frames.clear();
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::Ongoing);
+    now_ += 31'000'000'000;
+    (void)svc_->doWork(now_);
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareAbort);
+    completeWithMarkers(pid, {{kCw, 0}});
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::CompleteAbort);
+    const std::size_t n = endTxn("tx", pid, ep, true);
+    ASSERT_GT(n, 0u);
+    const auto a = syncAnswer(n);
+    EXPECT_EQ(a.errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidTxnState));
+    EXPECT_FALSE(a.hasVote);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, NextTransactionAfterAFailedOverNoAnswersInvalidTxnStateRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    vote(votes_[0], static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation), 0x00070000, 123);
+    (void)svc_->doWork(now_);
+    completeWithMarkers(pid, {{kCw, 0}});
+    followerFetches();
+    (void)svc_->doWork(now_);
+    answers_.frames.clear();
+    reload();
+    std::size_t n = endTxn("tx", pid, ep, true);
+    ASSERT_GT(n, 0u);
+    ASSERT_EQ(syncAnswer(n).errorCode, static_cast<int16_t>(pc::ErrorCode::ConstraintViolation)) << "the failed-over no";
+    ASSERT_EQ(addPartitions("tx", pid, ep, {{kPlain, 0}}), 0);   // the next transaction of the same pid and epoch
+    reload();
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::Ongoing);
+    answers_.frames.clear();
+    now_ += 31'000'000'000;
+    (void)svc_->doWork(now_);
+    completeWithMarkers(pid, {{kPlain, 0}});
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::CompleteAbort);
+    n = endTxn("tx", pid, ep, true);
+    ASSERT_GT(n, 0u);
+    const auto a = syncAnswer(n);
+    EXPECT_EQ(a.errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidTxnState)) << "not the previous transaction's no";
+    EXPECT_FALSE(a.hasVote);
+}
+
 TEST_F(CheckedWritesTxnCoordinatorRegression, OrphanedVotesAreForgottenAtUnloadRegression) {
     int16_t ep = 0;
     const int64_t pid = beginTxn({{kCw, 0}}, ep);
@@ -907,7 +1035,7 @@ TEST_F(CheckedWritesTxnCoordinatorRegression, RememberedNoOfANamespaceIsForgotte
     (void)svc_->doWork(now_);
     completeWithMarkers(pidB, {{kCwNs, 0}});
     ASSERT_EQ(answers_.frames.size(), 1u) << "the no was answered: the transaction is complete";
-    EXPECT_EQ(svc_->inMemoryEntriesOfNamespaceForTest(kNs), 2 * afterYes + 1) << "b has the entries of a, plus its remembered no";
+    EXPECT_EQ(svc_->inMemoryEntriesOfNamespaceForTest(kNs), 2 * afterYes) << "b's no lives on its coordinator entry";
     for (int i = 0; i < 8 && svc_->tombstoneNamespace(kNs, 64, now_) != rune::node::ReapStatus::Done; ++i) {
         followerFetches();
         (void)svc_->doWork(now_);
