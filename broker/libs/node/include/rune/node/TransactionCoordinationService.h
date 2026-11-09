@@ -453,11 +453,6 @@ private:
         bool                    all           = false;   ///< noted while votes were off (a level bump mid-transaction): every partition votes
         std::vector<VoteTarget> targets;
     };
-    struct RememberedNo {   ///< the no of the last voted abort of an id: a late EndTxn(commit) retry gets it again
-        int64_t producerId    = -1;
-        int16_t producerEpoch = 0;
-        VoteNo  no{};
-    };
     struct VoteGate {
         rune::transaction::TransactionalId txnId;
         int64_t                 producerId       = -1;
@@ -471,8 +466,6 @@ private:
     };
     std::vector<VoteGate> voteGates_;
     std::map<rune::transaction::TransactionalId, VoteCandidates, std::less<>> voteCandidatesAtAdd_;
-    /// Memory only: a failover loses it (the retry then gets InvalidTxnState and the client aborts).
-    std::map<rune::transaction::TransactionalId, RememberedNo, std::less<>> lastVoteNo_;
     /// Votes still out in the gateway whose gate is gone (first no, timeout, takeover by an abort), by (topic id,
     /// partition, pid, epoch).  The gateway answers each exactly once; a new gate for the key waits for that answer
     /// and drops it, else a late yes would count for the producer's next transaction (same pid and epoch).

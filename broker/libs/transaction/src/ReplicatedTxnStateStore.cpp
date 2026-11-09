@@ -34,6 +34,8 @@ static constexpr uint32_t kMagic          = 0x544B4E4Cu;
 static constexpr uint32_t kFixedHeaderSize = 52u;
 static constexpr uint32_t kChecksumSize   = 4u;
 static constexpr uint8_t  kFlagFencing    = 0x01u;   // header byte 27, bit0 (F15)
+static constexpr uint8_t  kFlagVoteNo     = 0x02u;   // header byte 27, bit1 (Part 11): a vote-no trailer follows the offsets
+static constexpr uint32_t kVoteNoBytes    = 2u + 4u + 8u;   // code u16, constraintId u32, failingOffset i64
 
 template<typename T>
 inline void write_le(uint8_t* p, T v) noexcept { std::memcpy(p, &v, sizeof(T)); }
@@ -89,11 +91,13 @@ void ReplicatedTxnStateStore::encodeRecord(
                             + po.tp.topic.size();
     }
 
+    const bool voteNo = meta.voteNoCode != 0;
     const uint32_t totalLength =
         kFixedHeaderSize
         + static_cast<uint32_t>(txnIdLen)
         + static_cast<uint32_t>(partBytes)
         + static_cast<uint32_t>(offsetSectionBytes)
+        + (voteNo ? kVoteNoBytes : 0u)
         + kChecksumSize;
 
     recordScratch_.resize(totalLength);
@@ -107,7 +111,7 @@ void ReplicatedTxnStateStore::encodeRecord(
     p[26] = static_cast<uint8_t>(meta.state);
     // F15 concern 3: flags byte (was always-0 padding, so old records decode as
     // no flags).  bit0 = fencingEpoch (the txn was ended by an InitProducerId fence).
-    p[27] = meta.fencingEpoch ? kFlagFencing : 0u;
+    p[27] = static_cast<uint8_t>((meta.fencingEpoch ? kFlagFencing : 0u) | (voteNo ? kFlagVoteNo : 0u));
     write_le<int32_t> (p + 28, coordinatorEpoch);
     write_le<int32_t> (p + 32, meta.txnTimeoutMs);
     write_le<uint16_t>(p + 36, txnIdLen);
@@ -141,6 +145,12 @@ void ReplicatedTxnStateStore::encodeRecord(
         write_le<int64_t> (p + pos, po.offset);       pos += 8;
         std::memcpy(p + pos, po.group.data(), groupLen);         pos += groupLen;
         std::memcpy(p + pos, po.tp.topic.data(), topicLen);      pos += topicLen;
+    }
+
+    if (voteNo) {
+        write_le<uint16_t>(p + pos, meta.voteNoCode);          pos += 2;
+        write_le<uint32_t>(p + pos, meta.voteNoConstraintId);  pos += 4;
+        write_le<int64_t> (p + pos, meta.voteNoFailingOffset); pos += 8;
     }
 
     assert(pos + kChecksumSize == totalLength);
@@ -328,6 +338,17 @@ void ReplicatedTxnStateStore::applyRecord(std::string_view payload)
         }
     }
 
+    // Part 11: the no that ended the transaction (an older reader skips bit1 and the trailer).
+    uint16_t voteNoCode = 0;
+    uint32_t voteNoConstraintId = 0;
+    int64_t  voteNoFailingOffset = -1;
+    if ((p[27] & kFlagVoteNo) != 0) {
+        if (pos + kVoteNoBytes > limit) return;
+        voteNoCode          = read_le<uint16_t>(p + pos);
+        voteNoConstraintId  = read_le<uint32_t>(p + pos + 2);
+        voteNoFailingOffset = read_le<int64_t> (p + pos + 6);
+    }
+
     // Build metadata and fold into index_ (last-write-wins).
     TransactionMetadata meta;
     meta.txnId                   = std::move(txnId);
@@ -342,6 +363,9 @@ void ReplicatedTxnStateStore::applyRecord(std::string_view payload)
     meta.pendingNewProducerEpoch = pendingNewEpoch;
     meta.pendingOffsets          = std::move(pendingOffsets);
     meta.fencingEpoch            = fencing;   // F15 concern 3: persisted in byte 27
+    meta.voteNoCode              = voteNoCode;
+    meta.voteNoConstraintId      = voteNoConstraintId;
+    meta.voteNoFailingOffset     = voteNoFailingOffset;
     // Recovered Prepare* states need markers written (B2 resolution).
     meta.markersPending = (state == TxnState::PrepareCommit
                            || state == TxnState::PrepareAbort);

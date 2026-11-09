@@ -281,6 +281,40 @@ TEST_F(ReplicatedTxnStateStoreTest, MultiplePartitionsPreservedOnRebuild) {
 }
 
 // ===========================================================================
+// Part 11: the no that ended a transaction survives the record codec beside the pending offsets and the fence flag;
+// a record without a no carries none.
+// ===========================================================================
+TEST_F(ReplicatedTxnStateStoreTest, VoteNoTrailerRoundTripsRegression) {
+    TransactionMetadata m1 = makeMeta("tx1", 7, 3, TxnState::CompleteAbort);
+    m1.voteNoCode          = 41;
+    m1.voteNoConstraintId  = 0x00070000;
+    m1.voteNoFailingOffset = 123;
+    m1.fencingEpoch        = true;
+    m1.pendingOffsets.push_back(PendingTxnOffset{"g", rune::coordination::TopicPartition{"t", 2}, 99});
+    TransactionMetadata m2 = makeMeta("tx2", 8, 0, TxnState::PrepareAbort);
+
+    ASSERT_TRUE(store_->put(m1, 1));
+    ASSERT_TRUE(store_->put(m2, 1));
+    ASSERT_TRUE(driveHwAdvance(2));
+
+    ReplicatedTxnStateStore rebuilt(replica_.get());
+    rebuilt.rebuildFromLog();
+
+    const auto* got1 = rebuilt.get("tx1");
+    ASSERT_TRUE(got1);
+    EXPECT_EQ(got1->voteNoCode, 41u);
+    EXPECT_EQ(got1->voteNoConstraintId, 0x00070000u);
+    EXPECT_EQ(got1->voteNoFailingOffset, 123);
+    EXPECT_TRUE(got1->fencingEpoch);
+    ASSERT_EQ(got1->pendingOffsets.size(), 1u);
+    EXPECT_EQ(got1->pendingOffsets[0].offset, 99);
+    const auto* got2 = rebuilt.get("tx2");
+    ASSERT_TRUE(got2);
+    EXPECT_EQ(got2->voteNoCode, 0u);
+    EXPECT_EQ(got2->voteNoFailingOffset, -1);
+}
+
+// ===========================================================================
 // 6. MultiTxnRebuild
 // ===========================================================================
 TEST_F(ReplicatedTxnStateStoreTest, MultiTxnRebuild) {

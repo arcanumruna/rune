@@ -561,10 +561,6 @@ void TransactionCoordinationService::forgetNamespace_(uint32_t nsId)
         if (rune::coordination::parseScopedId(it->second).nsId == nsId) it = pidIndex_.erase(it);
         else ++it;
     }
-    for (auto it = lastVoteNo_.begin(); it != lastVoteNo_.end();) {
-        if (rune::coordination::parseScopedId(it->first).nsId == nsId) it = lastVoteNo_.erase(it);
-        else ++it;
-    }
     // Belt-and-braces for the #663 rule: completion already erases a candidate entry, and a gated transaction is
     // unsettled, so its namespace never reaches here with a gate open.
     for (auto it = voteCandidatesAtAdd_.begin(); it != voteCandidatesAtAdd_.end();) {
@@ -582,7 +578,6 @@ std::size_t TransactionCoordinationService::inMemoryEntriesOfNamespaceForTest(ui
     for (const auto& kv : pidIndex_) n += rune::coordination::parseScopedId(kv.second).nsId == nsId ? 1 : 0;
     for (const auto& kv : voteCandidatesAtAdd_) n += rune::coordination::parseScopedId(kv.first).nsId == nsId ? 1 : 0;
     for (const VoteGate& g : voteGates_) n += rune::coordination::parseScopedId(g.txnId).nsId == nsId ? 1 : 0;
-    for (const auto& kv : lastVoteNo_) n += rune::coordination::parseScopedId(kv.first).nsId == nsId ? 1 : 0;
     return n;
 }
 
@@ -1135,8 +1130,8 @@ void TransactionCoordinationService::prepareVoted_(VoteGate& g, bool commit, int
                           result.ok() ? static_cast<int16_t>(pc::ErrorCode::InvalidTxnState) : txnErrorToProtocol(result.errorCode));
         return;
     }
+    if (g.hasNo) coordinator_.noteVoteNo(g.txnId, g.no.code, g.no.constraintId, g.no.failingOffset);   // persisted with the PrepareAbort
     const auto* m = coordinator_.metadata(g.txnId);
-    if (g.hasNo) lastVoteNo_[g.txnId] = RememberedNo{g.producerId, g.producerEpoch, g.no};
     (void)persist_(*m);   // a refused append is retried by the gate
     PrepareGate pg = makeGate_(*m, commit, std::vector<tx::TopicPartition>(m->partitions.begin(), m->partitions.end()),
                                /*respond=*/true, g.sessionId, g.correlationId);
@@ -1168,7 +1163,6 @@ void TransactionCoordinationService::dropDeferred_()
     voteGates_.clear();
     voteCandidatesAtAdd_.clear();
     voteOrphans_.clear();   // the gateway's votes are purged with them
-    lastVoteNo_.clear();
     for (const auto& [pid, a] : awaiting_)
         if (a.respond) sendEndTxnAnswer_(a.sessionId, a.correlationId, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
     for (ParkedNextTxn& p : parkedNextTxn_) {   // #557: the client re-discovers and retries at the new coordinator
@@ -1234,8 +1228,6 @@ size_t TransactionCoordinationService::handleInitProducerId_(
         if (outCap < pc::InitProducerIdResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
         return resp.encode(out);
     }
-
-    if (txnIdOpt.has_value() && !lastVoteNo_.empty()) lastVoteNo_.erase(*txnIdOpt);
 
     // Call coordinator.  Issue #122: the id is issued to (bound to) the session's principal - once every member
     // supports bound ids (below the feature level: a raw id, nothing rebound).
@@ -1364,7 +1356,6 @@ size_t TransactionCoordinationService::handleAddPartitions_(
         if (meta && txnState_) {
             (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
         }
-        if (!lastVoteNo_.empty()) lastVoteNo_.erase(txnIdScratch_);   // a new transaction: the old no is history
         if (votesWired_()) noteVoteCandidates_(msg.partitions, clusterVotes());
     }
 
@@ -1437,7 +1428,6 @@ size_t TransactionCoordinationService::handleAddOffsets_(
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
-        if (!lastVoteNo_.empty()) lastVoteNo_.erase(txnIdScratch_);   // may open a new transaction
         coordinator_.noteSession(txnIdScratch_, msg.sessionId);   // Task 4: abortAllForSession finds it
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
@@ -1616,22 +1606,21 @@ size_t TransactionCoordinationService::handleEndTxn_(
         }
         orphanVotes_(*gate);
         voteGates_.erase(gate);
-    } else if (commit && !lastVoteNo_.empty()) {
-        // A retry of the commit a no aborted (its answer was lost): the same no, once the abort markers landed.
-        const auto it = lastVoteNo_.find(txnIdScratch_);
+    } else if (commit) {
+        // A retry of the commit a no aborted (its answer was lost, or its coordinator failed): the same no, from the
+        // decision record, once the abort markers landed.
         const auto* m = coordinator_.metadata(txnIdScratch_);
-        if (it != lastVoteNo_.end() && m != nullptr && it->second.producerId == requestPid &&
-            it->second.producerEpoch == msg.producerEpoch &&
+        if (m != nullptr && m->voteNoCode != 0 && m->producerId == requestPid && m->producerEpoch == msg.producerEpoch &&
             (m->state == tx::TxnState::PrepareAbort || m->state == tx::TxnState::CompleteAbort)) {
             const int32_t ver = clientVersionOf_(msg.sessionId);
             if (outCap < pc::EndTxnResponse::ENCODED_SIZE_V17) return answerCannotFit_(buf, len, out, outCap);
             if (m->state == tx::TxnState::PrepareAbort) {   // the abort is still writing its markers
                 resp.errorCode = static_cast<int16_t>(pc::produceErrorForClient(pc::ErrorCode::ConcurrentTransactions, ver));
             } else {
-                resp.errorCode     = static_cast<int16_t>(pc::produceErrorForClient(static_cast<pc::ErrorCode>(it->second.no.code), ver));
+                resp.errorCode     = static_cast<int16_t>(pc::produceErrorForClient(static_cast<pc::ErrorCode>(m->voteNoCode), ver));
                 resp.hasVote       = true;
-                resp.constraintId  = it->second.no.constraintId;
-                resp.failingOffset = it->second.no.failingOffset;
+                resp.constraintId  = m->voteNoConstraintId;
+                resp.failingOffset = m->voteNoFailingOffset;
             }
             return resp.encodeFor(out, ver);
         }
