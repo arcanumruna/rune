@@ -19,7 +19,7 @@
 //   | keepalive             | worker ring full                        | Throttled, ttlMs 1                          | RingFullThrottledRegression
 //   | ScanLeases            | lease view, topic READ / VIEW-only      | pages in hash order / NotAuthorized         | ScanLeasesRoutedRegression, ScanLeasesAuthRegression
 //   | ScanLeases            | non-lease id / led elsewhere / refusals | missing id / Redirect / every refusal done | ScanLeasesAuthRegression, ScanLeasesRedirectRegression, ScanLeasesRefusalDoneRegression
-//   | GetViewRow (legacy)   | narrow-key lease topic, 4 partitions    | routed on the key's own width               | LegacyU64NarrowKeyRoutesToOwnerRegression
+//   | GetViewRow (legacy)   | narrow-key lease topic, 7 partitions    | routed on the key's own width               | LegacyU64NarrowKeyRoutesToOwnerRegression
 //   | keepalive             | cannot fit one ingress frame            | MessageTooLarge (never Throttled)           | KeepAliveTooLargeForRingIsNotRetriableRegression
 //   | keepalive / TTL       | undecodable body                        | InvalidRequest                              | UndecodableBodyRegression
 //   | keepalive / TTL       | plain topic / partition out of range    | InvalidRequest                              | NonLeaseTopicAndPartitionRangeRegression
@@ -1691,12 +1691,14 @@ TEST(LeaseGatewayRouteRegression, LeaseViewPartitionRangeRegression) {
 }
 
 // 10e. The legacy u64 GetViewRow of a NARROW-key lease topic is routed on the key's own width: the gateway narrows the u64 with the helper the
-//      worker reads the row with before it hashes to a partition.  4 partitions, UInt32 keys: the rig leads one partition; a key whose 4-byte
+//      worker reads the row with before it hashes to a partition.  7 partitions, UInt32 keys: the rig leads one partition; a key whose 4-byte
 //      form hashes there is served, any other is redirected - exactly as the 4-byte key (GetViewRowK) is.  A value above UINT32_MAX is
 //      InvalidRequest at the gateway.
 //      Mutation: hash the 8 raw bytes of the u64 -> some keys route to the wrong partition (redirected, or served by a non-owner): red.
 TEST(LeaseGatewayRouteRegression, LegacyU64NarrowKeyRoutesToOwnerRegression) {
-    constexpr int32_t kParts = 4;
+    // 7 partitions, not 4: fnv1a64 of the 8 zero-extended bytes is h4 * P^4 (mod 2^64) and P^4 == 1 (mod n) for n = 2..6, 8..10, so with
+    // those counts the 4-byte and 8-byte forms ALWAYS pick the same partition and the test could not tell them apart (P^4 mod 7 == 4).
+    constexpr int32_t kParts = 7;
     GwLease g(1 << 22, /*partitionOfRig=*/1, kParts, /*narrowKey=*/true);
     g.addLeaseView();
     std::vector<uint32_t> mine, theirs;
@@ -1709,6 +1711,16 @@ TEST(LeaseGatewayRouteRegression, LegacyU64NarrowKeyRoutesToOwnerRegression) {
     }
     ASSERT_EQ(mine.size(), 6u);
     ASSERT_EQ(theirs.size(), 6u);
+    {   // the sample must discriminate: hashing the 8 raw bytes of the u64 puts some of these keys on another partition
+        int moved = 0;
+        for (const uint32_t id : mine) {
+            const uint64_t w = id;
+            uint8_t k8[8];
+            for (int i = 0; i < 8; ++i) k8[i] = uint8_t(w >> (8 * i));
+            moved += g.registry->partitionForKey(GwLease::kView, std::span<const uint8_t>(k8, 8)) != 1 ? 1 : 0;
+        }
+        ASSERT_GT(moved, 0) << "an 8-byte hash must differ from the 4-byte one for the sample";
+    }
     ASSERT_TRUE(g.produce(grants));
     ASSERT_TRUE(g.r.driveUntilJudged());
     for (int i = 0; i < 400 && !g.r.leaseReady(); ++i) g.pass();

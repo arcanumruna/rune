@@ -278,6 +278,7 @@ TEST(ScanLeasesRegression, ChurnBetweenPagesRegression) {
     for (uint64_t id : got) ++seen[id];
     for (const auto& [id, n] : seen) EXPECT_EQ(n, 1) << "key " << id << " repeated";
     EXPECT_EQ(seen.count(goneKey), 0u);
+    EXPECT_EQ(got.size(), 300u - 1u + (hashOf(7000) > p1.lastHash ? 1u : 0u)) << "the revoked rows are not rows (no erased rid is returned)";
     for (std::size_t i = 64; i < sorted.size(); ++i)
         if (sorted[i] != goneKey) EXPECT_EQ(seen[sorted[i]], 1) << "untouched key " << sorted[i];
 }
