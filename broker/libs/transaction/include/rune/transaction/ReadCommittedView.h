@@ -166,8 +166,11 @@ public:
     /// The open transaction of `producerId` was voted on at exactly `epoch` (O(1)).
     [[nodiscard]] bool votedAt(ProducerId producerId, int16_t epoch) const noexcept;
 
-    /// Part 11: `records` more records of the producer's open transaction on this partition (rebuilt from the log with the entry).
-    void addRecords(ProducerId producerId, int32_t records) noexcept;
+    /// Part 11: `records` more records of the producer's open transaction on this partition (rebuilt from the log with the entry);
+    /// `intent` sticks to the transaction when one of them carries a write intent.
+    void addRecords(ProducerId producerId, int32_t records, bool intent) noexcept;
+    /// A record of the producer's open transaction on this partition carries an intent (O(1)).
+    [[nodiscard]] bool hasIntent(ProducerId producerId) const noexcept;
     /// The records the producer's open transaction has on this partition; 0 when none is open (O(1)).
     [[nodiscard]] int64_t recordsOf(ProducerId producerId) const noexcept;
 
@@ -195,6 +198,7 @@ private:
         int16_t    votedEpoch  = -1;   ///< Part 11: the epoch this partition voted at (-1 = not voted)
         bool       inherited   = false; ///< Part 11: open since before this leadership; verified again by the next batch
         int64_t    records     = 0;     ///< Part 11: the records the transaction has appended here
+        bool       intent      = false; ///< Part 11: one of them carries a write intent
     };
     struct Slot {
         ProducerId producerId = kEmptyPid;   ///< kEmptyPid = free

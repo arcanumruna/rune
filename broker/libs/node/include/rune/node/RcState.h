@@ -444,11 +444,11 @@ public:
     // ---- §2.1: append-time updates (same invocation as the append) --------
     /// A TRANSACTIONAL data batch appended at `base` (not a duplicate).  Only
     /// reachable while Ready (the produce gate) — anything else halts (m4).
-    void onTxnBatch(int64_t producerId, int64_t base, int32_t records) {
+    void onTxnBatch(int64_t producerId, int64_t base, int32_t records, bool intent) {
         if (!ready()) [[unlikely]]
             haltInvariant_("a producerId >= 0 data batch was appended while the RC state is not Ready");
         tracker_.onProduceBatch(producerId, base);
-        tracker_.addRecords(producerId, records);
+        tracker_.addRecords(producerId, records, intent);
         if (verify_.size() != 0) [[unlikely]] verify_.erase(producerId);   // #112: a Verified entry is consumed
     }
     /// A COMMIT / ABORT control batch appended at `offset`.

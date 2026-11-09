@@ -7893,6 +7893,12 @@ private:
         if (parked) --parkedVotes_;
         enqueueReturn_(voteReturn_(ws.spec->topicId, ws.partition, v, err, a, judgeOffset));
     }
+    // P11-1 / P11-7: the judge judges the transaction whole, at its vote or its marker: its first record's set or the source is constrained,
+    // or a record carries an intent.  The produce bound uses the same predicate.
+    [[nodiscard]] static bool txnJudged_(const PartitionWriteState& ws, bool intent, int64_t first) noexcept {
+        const ConstraintSet* set = first >= 0 ? ws.constraintSets.setAt(first) : nullptr;
+        return intent || ws.isConstrainedSource() || (set != nullptr && constrainedSet_(*set));
+    }
     [[nodiscard]] static bool constrainedSet_(const ConstraintSet& s) noexcept {
         return std::any_of(s.members.begin(), s.members.begin() + s.count, [](const ConstraintSetMember& m) {
             return m.kind == rune::view::VerdictViewKind::Unique || m.kind == rune::view::VerdictViewKind::Check ||
@@ -7997,8 +8003,7 @@ private:
             if (pos == 0) return false;   // nothing whole was read: the next pass reads again
             budget -= std::min(budget, pos);
         }
-        const ConstraintSet* set = ws.constraintSets.setAt(s.first);
-        if (!(s.intent || ws.isConstrainedSource() || (set != nullptr && constrainedSet_(*set)))) {   // P11-1: does not vote
+        if (!txnJudged_(ws, s.intent, s.first)) {   // P11-1: does not vote
             ++ws.txn.stats.votesYes;
             answerAll(0, {});
             return true;
@@ -9933,15 +9938,6 @@ private:
         const rune::protocol::RecordBatchReader r(rbSpan.data(), rbSpan.size());
         return (static_cast<uint16_t>(r.attributes()) & kTxnAttrBit) != 0 && rc.tracker().votedAt(r.producerId(), r.producerEpoch());
     }
-    // Part 11 (P11-7): a transaction past txnJudgedRecordsMax records on a constrained source is TxnTooLarge at its vote or its marker, and
-    // the marker's rejection needs one index entry per record; refusing the batch that takes it past the knob keeps that bounded.
-    // Residual: records produced before the source was constrained still count only from this leadership's log scan; a transaction
-    // of more than 2^24 of them keeps the loud permanent stall in the judge.
-    [[nodiscard]] bool txnPastJudgedMax_(const RcState& rc, const PartitionWriteState* ws, std::span<const uint8_t> rbSpan) const noexcept {
-        const rune::protocol::RecordBatchReader r(rbSpan.data(), rbSpan.size());
-        return (static_cast<uint16_t>(r.attributes()) & kTxnAttrBit) != 0 && ws != nullptr && ws->isConstrainedSource() &&
-               rc.tracker().recordsOf(r.producerId()) + r.recordCount() > txnJudgedRecordsMax_;
-    }
     // F15-FU1 (#112): the verify outbox → the return ring, oldest first, only while the
     // return FIFO is empty (flushRetFifo_); stops at the first refused claim.
     int flushTxnVerifyOutbox_() {
@@ -9987,6 +9983,7 @@ public:
     [[nodiscard]] uint64_t txnVerifyRequestsSentForTest() const noexcept { return txnVerifyRequestsSent_; }
     [[nodiscard]] uint64_t txnBatchesRefusedUnverifiedForTest() const noexcept { return txnBatchesRefusedUnverified_; }
     [[nodiscard]] uint64_t txnBatchesRefusedAfterVoteForTest() const noexcept { return txnBatchesRefusedAfterVote_; }
+    [[nodiscard]] uint64_t txnBatchesRefusedTooLargeForTest() const noexcept { return txnBatchesRefusedTooLarge_; }
     [[nodiscard]] uint64_t txnVerifyAnswersDroppedForTest() const noexcept { return txnVerifyAnswersDropped_; }
     /// #112: verification requests most one worker holds unsent (the ring was full).
     static constexpr std::size_t kTxnVerifyOutboxCapacity = 256;
@@ -10012,6 +10009,7 @@ private:
     uint64_t txnVerifyRequestsSent_       = 0;
     uint64_t txnBatchesRefusedUnverified_ = 0;
     uint64_t txnBatchesRefusedAfterVote_ = 0;
+    uint64_t txnBatchesRefusedTooLarge_ = 0;
     uint64_t txnVerifyAnswersDropped_     = 0;
 
     struct ProduceFields {
@@ -10372,11 +10370,6 @@ private:
                 enqueueReturn_(ret);
                 return 1;
             }
-            if (txnPastJudgedMax_(*rc, ws, rbSpan)) {
-                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::TxnTooLarge);   // what the vote answers; not retriable, the producer aborts
-                enqueueReturn_(ret);
-                return 1;
-            }
             if (txnAdmissionRefuses_(*rc, replica, rbSpan, ret)) return 1;
         }
 
@@ -10389,9 +10382,12 @@ private:
         // validated these exact bytes (the gateway, right after ensureValid).
         const bool crcPreverified = f.fromOp && f.crcValidated;
         rune::storage::ProduceOutcome outcome;
+        bool batchIntent = false;
         if (ws != nullptr) [[unlikely]] {
             const WriteFacts facts{.acks = acks, .idempotent = f.producerId >= 0, .transactional = txn, .atomicBatch = !txn && (batchAttrs & rune::protocol::batch::kAttrAtomic) != 0,
-                                   .importGranted = f.importGranted, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_(), .txnJudgedRecordsMax = txnJudgedRecordsMax_};
+                                   .importGranted = f.importGranted, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_(), .txnJudgedRecordsMax = txnJudgedRecordsMax_,
+                                   .txnRecords = txn && rc != nullptr ? rc->tracker().recordsOf(f.producerId) : 0,
+                                   .txnJudged = txn && rc != nullptr && txnJudged_(*ws, rc->tracker().hasIntent(f.producerId), rc->tracker().firstOffsetOf(f.producerId))};
             lastWriteFacts_ = facts;
             CheckedWriteHook hook(*ws, facts, ws->spec->autoIncrement ? std::span<uint8_t>(autoIncScratch_) : std::span<uint8_t>{});
             if (log != nullptr) {
@@ -10408,6 +10404,8 @@ private:
                 if (outcome.logFull) [[unlikely]] noteTransientFull_(f.topicId, f.partition, outcome.error);
             }
             if (hook.checked()) ++hookChecks_;
+            batchIntent = hook.anyIntent();
+            if (txn && outcome.error == pc::ErrorCode::TxnTooLarge) [[unlikely]] ++txnBatchesRefusedTooLarge_;
             if (hook.refusal() != HookRefusal::None) [[unlikely]] noteHookRefusal_(hook.refusal(), f);
             if (!outcome.isOK()) [[unlikely]] hook.onProduceFailed();
             if (hook.assignedBase() != 0 && ws->assignedBases.wantsGrowth()) [[unlikely]] autoIncGrowDue_ = true;   // P6-8: grown next pass
@@ -10493,7 +10491,7 @@ private:
         // F15 §2.1 (C1): RC update in the same invocation as the append; a
         // duplicate retry was registered with its original.
         if (rc != nullptr && !outcome.isDuplicate && (outcome.batchAttrs & kTxnAttrBit) != 0) [[unlikely]] {
-            rc->onTxnBatch(f.producerId, outcome.baseOffset, rune::protocol::RecordBatchReader(rbSpan.data(), rbSpan.size()).recordCount());
+            rc->onTxnBatch(f.producerId, outcome.baseOffset, rune::protocol::RecordBatchReader(rbSpan.data(), rbSpan.size()).recordCount(), batchIntent);
             if (replica) publishCleanerLso_(replica, *rc);   // D3b: an open txn caps the cleaner
         }
 

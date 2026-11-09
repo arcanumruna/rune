@@ -419,6 +419,26 @@ TEST(ReadCommittedViewRebuildTest, RebuildCountsTheOpenTransactionsRecords)
     EXPECT_EQ(f.tracker.recordsOf(9), 0);
 }
 
+// Part 11: a record with an intent marks its open transaction, and the mark comes back with a rebuild.
+TEST(ReadCommittedViewRebuildTest, RebuildRestoresTheTransactionsIntentMark)
+{
+    RcvFixture f;
+    for (const int64_t pid : {1, 2}) {
+        const int64_t off = f.log.logEndOffset();
+        rune::protocol::RecordBatchBuilder builder(off, 0);
+        builder.setProducerId(pid);
+        builder.setTransactional(true);
+        builder.append({}, "plain", 0);
+        if (pid == 1) builder.append({}, "intent", 0, 1);
+        auto batch = builder.build();
+        f.log.append(batch, off + (pid == 1 ? 1 : 0));
+    }
+    f.view.rebuild(&f.log, f.hw());
+    EXPECT_TRUE(f.tracker.hasIntent(1));
+    EXPECT_FALSE(f.tracker.hasIntent(2));
+    EXPECT_FALSE(f.tracker.hasIntent(9));
+}
+
 TEST(ReadCommittedViewRebuildTest, CommitMarkerClosesTransaction)
 {
     RcvFixture f;

@@ -93,6 +93,7 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
         refusal_ = HookRefusal::ValidationFailed;
         return pc::ErrorCode::SchemaValidationFailed;
     }
+    anyIntent_ = intents.anyIntent;
     intents.keyZeroCreate = keyZeroCreates > 0;
     intents.mixedKeyZero  = keyZeroCreates > 0 && keyZeroCreates < recordCount;
     if (autoInc) [[unlikely]] {
@@ -108,6 +109,13 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
 
     const RequirementVerdict v = evaluateRequirements(intents, facts_, topic);
     refusal_ = v.why;
+    // P11-7: a transaction the judge judges whole is TxnTooLarge past the knob at its vote or marker, and the marker's rejection needs one
+    // index entry per record; the batch that takes it past the knob is refused here, after the duplicate and fence answers.
+    // Records are always counted (at append, or by the log scan after a failover).  What escapes the bound: a transaction whose batches were
+    // all admitted before the source was judged whole, and the records a transient ring evicted before its rebuild; the judge keeps its loud
+    // stall for more than 2^24 of them.
+    if (v.code == pc::ErrorCode::OK && facts_.transactional && (facts_.txnJudged || intents.anyIntent) && facts_.txnRecords + recordCount > facts_.txnJudgedRecordsMax)
+        return pc::ErrorCode::TxnTooLarge;
     return v.code;
 }
 

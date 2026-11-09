@@ -18,6 +18,7 @@
 #include <rune/storage/Log.h>
 #include <rune/storage/LogReadView.h>
 // rune-protocol RecordBatch: little-endian field accessors (unified).
+#include <rune/protocol/BatchRebuild.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <algorithm>
@@ -252,10 +253,21 @@ void LsoTracker::markVoted(ProducerId producerId, int16_t epoch) noexcept
     }
 }
 
-void LsoTracker::addRecords(ProducerId producerId, int32_t records) noexcept
+void LsoTracker::addRecords(ProducerId producerId, int32_t records, bool intent) noexcept
 {
     if (producerId < 0) return;
-    if (Slot* s = find_(producerId)) fifo_[s->pos & fifoMask_].records += records;
+    if (Slot* s = find_(producerId)) {
+        FifoEntry& e = fifo_[s->pos & fifoMask_];
+        e.records += records;
+        e.intent = e.intent || intent;
+    }
+}
+
+bool LsoTracker::hasIntent(ProducerId producerId) const noexcept
+{
+    if (producerId < 0) return false;
+    const Slot* s = find_(producerId);
+    return s != nullptr && fifo_[s->pos & fifoMask_].intent;
 }
 
 int64_t LsoTracker::recordsOf(ProducerId producerId) const noexcept
@@ -327,7 +339,12 @@ RcBuilder::Result RcBuilder::step(const uint8_t* batch, std::size_t avail)
         const int64_t producerId = reader.producerId();
         if (producerId >= 0) {
             tracker_->onProduceBatch(producerId, res.baseOffset);
-            tracker_->addRecords(producerId, reader.recordCount());
+            bool intent = tracker_->hasIntent(producerId);
+            if (!intent)
+                (void)rune::protocol::forEachRecordSpan(batch, static_cast<std::size_t>(totalLen), [&](const rune::protocol::RecordSpan& span) {
+                    intent = intent || rune::protocol::record::intentOf(span.attributes) != 0;
+                });
+            tracker_->addRecords(producerId, reader.recordCount(), intent);
             res.outcome = Outcome::TxnData;
         }
     }

@@ -37,6 +37,8 @@ struct WriteFacts {
     bool    legacyMode         = false;
     bool    levelCheckedWrites = false;
     int32_t txnJudgedRecordsMax = 4096;   ///< the node's bound on a batch the judge holds whole (rule 10)
+    int64_t txnRecords         = 0;       ///< a transactional batch: the records its open transaction already has here
+    bool    txnJudged          = false;   ///< a transactional batch: the judge judges its transaction whole (vote or marker) without this batch's own intents
 };
 
 /// What the topic says.  Later parts set the members; in Part 03 every member is false.
@@ -150,6 +152,8 @@ public:
     [[nodiscard]] uint64_t assignedBase() const noexcept { return assignedBase_; }
     [[nodiscard]] HookRefusal refusal() const noexcept { return refusal_; }
     [[nodiscard]] bool checked() const noexcept { return checked_; }
+    /// check() ran clean and a record carries an intent.
+    [[nodiscard]] bool anyIntent() const noexcept { return anyIntent_; }
 
 private:
     [[nodiscard]] rune::storage::HookStaged patchKeyZeroIds_(const uint8_t* batch, std::size_t len) noexcept;
@@ -159,6 +163,7 @@ private:
     std::span<uint8_t>   scratch_;   // key-0 batches are copied here to patch their ids
     HookRefusal          refusal_ = HookRefusal::None;
     bool                 checked_ = false;
+    bool                 anyIntent_ = false;
     AutoIncPlan          plan_;
     uint32_t             keyZeroCount_ = 0;
     uint64_t             importMaxN_   = 0;
