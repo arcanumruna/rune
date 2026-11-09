@@ -18,6 +18,17 @@
 //   | parked keepalive      | session closed before the clear folds   | no frame, park table drained                | SessionGoneDropsRegression
 //   | keepalive             | worker ring full                        | Throttled, ttlMs 1                          | RingFullThrottledRegression
 //   | ScanLeases            | any                                     | InvalidRequest (until Task 13)              | ScanLeasesNotYetRegression
+//   | keepalive             | cannot fit one ingress frame            | MessageTooLarge (never Throttled)           | KeepAliveTooLargeForRingIsNotRetriableRegression
+//   | keepalive / TTL       | undecodable body                        | InvalidRequest                              | UndecodableBodyRegression
+//   | keepalive / TTL       | plain topic / partition out of range    | InvalidRequest                              | NonLeaseTopicAndPartitionRangeRegression
+//   | keepalive / TTL       | unknown id / deleting ns / no pool      | UnknownTopic                                | UnknownTopicPathsRegression
+//   | keepalive / TTL       | placement committed, not applied        | route refusal (NotLeader)                   | NonNotAuthorizedDenialIsRouteRefusalRegression
+//   | keepalive / TTL       | led elsewhere, endpoint unknown         | bare NotLeader                              | LedElsewhereNoEndpointRegression
+//   | keepalive / TTL       | not logged in / anonymous / sec. behind | AuthFailed+end / NotAuthorized / AuthUnavail| AuthGateCellsRegression
+//   | keepalive / TTL       | grant removed between two requests      | served, then NotAuthorized                  | RevokedMidSessionRegression
+//   | keepalive / TTL       | root under RejectAll / Deleting gate    | served / NamespaceSuspended                 | RootExemptUnderRejectAllRegression
+//   | worker return         | count / chunk mismatch, TTL chunk != 16 | Internal + counter; good returns unchanged  | MalformedWorkerReturnRegression
+//   | keepalive / TTL       | partition 1 of a 2-partition topic      | served by partition 1's leader              | SecondPartitionRoutedRegression
 #include "CheckedWritesRig.h"
 
 #include <rune/gateway/ClientGateway.h>
@@ -139,15 +150,22 @@ struct GwLease {
     int32_t seq = 0;
     std::vector<std::vector<uint8_t>> out;   // every frame the gateway sent, in order
 
-    static RigTuning hosted(WorkerPool& p) {
+    int32_t rigPartition = 0;   // the partition of kTopic the rig's worker leads
+    int32_t partitions = 1;     // the topic's partition count
+
+    static RigTuning hosted(WorkerPool& p, int32_t partition) {
         RigTuning t;
         t.hostWorker = &p.worker(0);
+        t.partition = partition;
         return t;
     }
 
-    GwLease()
-        : pool(1, rune::metadata::ShardRouter(1), 1 << 22, 1 << 25, 64, 64),
-          r(false, 64LL * 1024 * 1024, hosted(pool)),
+    /// `ingressRingBytes`: the worker pool's ingress ring (RUNE_WORKER_INGRESS_RING_BYTES / the WorkerPool ctor's 3rd argument).
+    explicit GwLease(std::size_t ingressRingBytes = 1 << 22, int32_t partitionOfRig = 0, int32_t partitionCount = 1)
+        : rigPartition(partitionOfRig),
+          partitions(partitionCount),
+          pool(1, rune::metadata::ShardRouter(1), ingressRingBytes, 1 << 25, 64, 64),
+          r(false, 64LL * 1024 * 1024, hosted(pool, partitionOfRig)),
           dir(rigTmpPath("gwlease").string()),
           gw(rune::gateway::ClientGateway::makeForTest([this](const uint8_t* b, std::size_t n) -> int64_t { out.emplace_back(b, b + n); return 1; }, 1)) {
         r.worker->setLeaseClockForTest(&leaseNow);
@@ -162,7 +180,7 @@ struct GwLease {
         registry = std::make_unique<rune::gateway::TopicRegistry>(std::vector<TopicSpec>{}, dir + "/reg");
         TopicSpec spec;
         spec.name = "instances";
-        spec.partitionCount = 1;
+        spec.partitionCount = partitions;
         spec.leaseTopic = true;
         if (registry->createTopicAt(kTopic, spec) != kTopic) throw std::logic_error("GwLease: topic id");
         gw.setTopicRegistry(registry.get());
@@ -177,7 +195,7 @@ struct GwLease {
 
     void setLeader(int32_t node) {
         std::vector<rune::metadata::RoutingImage::BuildEntry> img;
-        img.push_back({rune::metadata::gpidOf(kTopic, 0), node, 1});
+        for (int32_t p = 0; p < partitions; ++p) img.push_back({rune::metadata::gpidOf(kTopic, p), p == rigPartition ? node : kOther, 1});
         gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build(img, rune::metadata::RoutingImage::Source::Committed));
         gw.setNodeEndpointMap({{kOther, kOtherEndpoint}});
     }
@@ -190,7 +208,7 @@ struct GwLease {
         const auto ack = r.ack(c, 600);
         return ack && ack->code == 0;
     }
-    lease::LeaseRuntime* rt() { return r.worker->leaseRuntimeForTest(kTopic, 0); }
+    lease::LeaseRuntime* rt() { return r.worker->leaseRuntimeForTest(kTopic, rigPartition); }
     bool setup(std::initializer_list<uint64_t> keys, uint64_t ttl = 5000) {
         std::vector<RawRec> recs;
         for (uint64_t k : keys) recs.push_back(grantRec(k, ttl));
@@ -206,7 +224,7 @@ struct GwLease {
         const auto batch = b.build();
         if (r.replica->appendLeaseBatch(batch) < 0) return false;
         for (int i = 0; i < kCap; ++i) {
-            const auto lk = r.vs->leaseIndexFor(kTopic, 0, r.replica->leadershipGeneration(), true, true);
+            const auto lk = r.vs->leaseIndexFor(kTopic, rigPartition, r.replica->leadershipGeneration(), true, true);
             uint32_t rid = 0;
             const uint8_t* row = lk.ref.table == nullptr ? nullptr : lk.ref.table->find(rune::view::ViewKey::fromU64(key), rid);
             if (row != nullptr && leaseRowRemaining(row, *lk.ref.layout) == remainingMs) return true;
@@ -684,4 +702,439 @@ TEST(LeaseGatewayRouteRegression, RejectionFramesRegression) {
         EXPECT_EQ(s->rowCount, 0);
         EXPECT_TRUE(s->rows.empty());
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Task 11b review fixes: the TooLarge answer, the malformed worker returns and the remaining matrix cells.
+// ---------------------------------------------------------------------------------------------------------------------------------
+namespace {
+
+std::vector<uint8_t> withTrailingByte(std::vector<uint8_t> f) { f.push_back(0); return f; }
+std::vector<uint8_t> withCount(std::vector<uint8_t> f, uint16_t n) {
+    f[std::size_t(pc::lease_wire::kBase) + 8] = uint8_t(n);
+    f[std::size_t(pc::lease_wire::kBase) + 9] = uint8_t(n >> 8);
+    return f;
+}
+std::vector<uint8_t> truncated(std::vector<uint8_t> f, std::size_t by) { f.resize(f.size() - by); return f; }
+
+std::vector<uint8_t> entryBytes(std::initializer_list<Ans> es) {
+    std::vector<uint8_t> b(es.size() * 12, 0);
+    std::size_t at = 0;
+    for (const Ans& e : es) {
+        putLe(b, at, e.index, 2);
+        putLe(b, at + 2, e.code, 2);
+        putLe(b, at + 4, e.ttl, 8);
+        at += 12;
+    }
+    return b;
+}
+WorkerReturn kaReturn(const GwLease& g, int64_t corr, int32_t count, std::vector<uint8_t> chunk, bool final) {
+    WorkerReturn w;
+    w.type = WorkerReturn::Type::LeaseKeepAliveResult;
+    w.sessionId = g.sid; w.correlationId = corr; w.recordCount = count; w.lastOffset = final ? 1 : 0;
+    w.chunk = std::move(chunk);
+    return w;
+}
+WorkerReturn ttlReturn(const GwLease& g, int64_t corr, std::vector<uint8_t> chunk) {
+    WorkerReturn w;
+    w.type = WorkerReturn::Type::LeaseTimeToLiveResult;
+    w.sessionId = g.sid; w.correlationId = corr; w.errorCode = 0; w.baseOffset = 4000; w.lastOffset = 9;
+    w.chunk = std::move(chunk);
+    return w;
+}
+void expectWholeKa(const std::vector<uint8_t>& frame, int64_t corr, uint16_t c, uint64_t ttl = 0) {
+    const auto k = asKa(frame);
+    ASSERT_TRUE(k.has_value());
+    EXPECT_EQ(k->corr, corr);
+    EXPECT_TRUE(k->final);
+    ASSERT_EQ(k->es.size(), 1u);
+    EXPECT_EQ(k->es[0].index, kWhole);
+    EXPECT_EQ(k->es[0].code, c);
+    EXPECT_EQ(k->es[0].ttl, ttl);
+}
+void expectErrorFrame(const std::vector<uint8_t>& frame, pc::ErrorCode c) {
+    const auto err = pc::ErrorResponse::decode(frame.data(), frame.size());
+    ASSERT_TRUE(err.has_value());
+    EXPECT_EQ(err->code, static_cast<int16_t>(c));
+}
+
+}  // namespace
+
+// 11. A keepalive that can NEVER fit one worker-ingress frame is not back-pressure: MessageTooLarge (whole request, final, ttl 0),
+//     never Throttled (a client would retry it forever).  The pool's ingress ring is the WorkerPool ctor's 3rd argument
+//     (NodeConfig / RUNE_WORKER_INGRESS_RING_BYTES): 256 KiB gives a 32 KiB frame, a 256-entry keepalive of 128-byte keys is 35 KB.
+//     The same request on the default ring is enqueued.  Mutation: map TooLarge to Throttled in answerLeaseEnqueue_ -> red.
+TEST(LeaseGatewayRouteRegression, KeepAliveTooLargeForRingIsNotRetriableRegression) {
+    const auto bigFrame = [](const GwLease& g, int64_t corr) {
+        std::vector<std::string> keys(256, std::string(128, 'k'));
+        std::vector<pc::LeaseKeepAlive::Entry> es;
+        for (const auto& k : keys) es.push_back({std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(k.data()), k.size()), 1});
+        pc::LeaseKeepAlive m;
+        m.sessionId = g.sid; m.correlationId = corr; m.topicId = kTopic; m.partition = 0;
+        m.entries = es;
+        std::vector<uint8_t> f(m.encodedSize());
+        f.resize(m.encode(f.data()));
+        return f;
+    };
+    {
+        GwLease g(1 << 18);
+        ASSERT_TRUE(g.setup({1}));
+        const auto fr = g.send(bigFrame(g, 61));
+        ASSERT_EQ(fr.size(), 1u);
+        expectWholeKa(fr[0], 61, code(pc::ErrorCode::MessageTooLarge));
+        g.settle();
+        EXPECT_EQ(g.out.size(), 1u) << "nothing reached the worker";
+    }
+    {
+        GwLease g;   // the default ring takes the same request
+        ASSERT_TRUE(g.setup({1}));
+        const auto fr = g.send(bigFrame(g, 62));
+        EXPECT_TRUE(fr.empty()) << "enqueued: answered by the worker later";
+    }
+}
+
+// 12. Bodies that do not decode: InvalidRequest, exactly one frame, never enqueued.
+TEST(LeaseGatewayRouteRegression, UndecodableBodyRegression) {
+    GwLease g;
+    ASSERT_TRUE(g.setup({1}));
+    const int64_t v = g.leaseVersion(1);
+    const std::vector<std::vector<uint8_t>> kas = {withTrailingByte(g.kaFrame(1, {{1, v}})), withCount(g.kaFrame(2, {{1, v}}), 0),
+                                                   withCount(g.kaFrame(3, {{1, v}}), 257), truncated(g.kaFrame(4, {{1, v}}), 3)};
+    int64_t corr = 1;
+    for (const auto& f : kas) {
+        const auto fr = g.send(f);
+        ASSERT_EQ(fr.size(), 1u) << corr;
+        expectWholeKa(fr[0], corr, kInvalid);
+        ++corr;
+    }
+    const std::vector<std::vector<uint8_t>> ttls = {withTrailingByte(g.ttlFrame(11, 1)), truncated(g.ttlFrame(12, 1), 3)};
+    corr = 11;
+    for (const auto& f : ttls) {
+        const auto fr = g.send(f);
+        ASSERT_EQ(fr.size(), 1u) << corr;
+        const auto t = asTtl(fr[0]);
+        ASSERT_TRUE(t.has_value());
+        EXPECT_EQ(t->corr, corr);
+        EXPECT_EQ(t->code, kInvalid);
+        EXPECT_EQ(t->remaining, -1);
+        ++corr;
+    }
+    g.settle();
+    EXPECT_EQ(g.out.size(), kas.size() + ttls.size()) << "nothing reached the worker";
+}
+
+// 13. A topic that is not a lease topic, and a partition outside [0, partitionCount): InvalidRequest for both operations.
+TEST(LeaseGatewayRouteRegression, NonLeaseTopicAndPartitionRangeRegression) {
+    GwLease g;
+    ASSERT_TRUE(g.setup({1}));
+    const int64_t v = g.leaseVersion(1);
+    constexpr int32_t kPlain = 8;
+    TopicSpec plain;
+    plain.name = "plain";
+    plain.partitionCount = 1;
+    ASSERT_EQ(g.registry->createTopicAt(kPlain, plain), kPlain);
+    struct Cell { int32_t topic, partition; };
+    for (const Cell c : {Cell{kPlain, 0}, Cell{kTopic, -1}, Cell{kTopic, 1}}) {
+        const auto ka = g.send(g.kaFrame(5, {{1, v}}, c.topic, 0, c.partition));
+        ASSERT_EQ(ka.size(), 1u) << c.topic << "/" << c.partition;
+        expectWholeKa(ka[0], 5, kInvalid);
+        const auto tt = g.send(g.ttlFrame(6, 1, c.topic, 0, c.partition));
+        ASSERT_EQ(tt.size(), 1u);
+        const auto t = asTtl(tt[0]);
+        ASSERT_TRUE(t.has_value());
+        EXPECT_EQ(t->corr, 6);
+        EXPECT_EQ(t->code, kInvalid);
+        EXPECT_EQ(t->remaining, -1);
+    }
+    g.settle();
+    EXPECT_EQ(g.out.size(), 6u);
+}
+
+// 14. UnknownTopic: an id nothing created, a topic of a DELETING namespace (a root session reaches it otherwise), and a gateway with
+//     no worker pool / no topic registry.
+TEST(LeaseGatewayRouteRegression, UnknownTopicPathsRegression) {
+    GwLease g;
+    ASSERT_TRUE(g.setup({1}));
+    const int64_t v = g.leaseVersion(1);
+    const auto expectUnknown = [&](GwLease& gl, int64_t session, int32_t topic) {
+        const auto ka = gl.send(gl.kaFrame(7, {{1, v}}, topic, session));
+        ASSERT_EQ(ka.size(), 1u);
+        expectWholeKa(ka[0], 7, kUnknownTopic);
+        const auto tt = gl.send(gl.ttlFrame(8, 1, topic, session));
+        ASSERT_EQ(tt.size(), 1u);
+        const auto t = asTtl(tt[0]);
+        ASSERT_TRUE(t.has_value());
+        EXPECT_EQ(t->code, kUnknownTopic);
+        EXPECT_EQ(t->remaining, -1);
+    };
+    expectUnknown(g, g.sid, 77);   // root (allow-all): an unknown id
+
+    const int64_t root = g.authedSession({grant(rs::Operation::Admin, rs::ResourceType::Cluster, rs::PatternKind::Exact, ""),
+                                          topicGrant(rs::Operation::Read), topicGrant(rs::Operation::Write)},
+                                         /*nsId=*/1, /*topicNs=*/2);
+    rune::catalog::NamespaceRecord rec;
+    rec.nsId = 2; rec.name = "ns2"; rec.version = 1; rec.state = rune::catalog::stateOf(rune::catalog::NsStateTag::Deleting);
+    g.gw.onNamespaceUpserted(rec);
+    expectUnknown(g, root, kTopic);   // the topic of a deleting namespace
+    g.settle();
+
+    // no pool, then a pool but no registry (a gateway the broker has not wired yet)
+    std::vector<std::vector<uint8_t>> sent;
+    auto bare = rune::gateway::ClientGateway::makeForTest([&](const uint8_t* b, std::size_t n) -> int64_t { sent.emplace_back(b, b + n); return 1; }, 1);
+    bare.setOnEgressFrame([&](int64_t, const uint8_t* b, std::size_t n) { sent.emplace_back(b, b + n); });
+    const int64_t bs = bare.injectTestSession();
+    const auto sendBare = [&](const std::vector<uint8_t>& f) {
+        sent.clear();
+        bare.applyClientFrameForTest(f.data(), f.size());
+        return sent;
+    };
+    for (int leg = 0; leg < 2; ++leg) {
+        if (leg == 1) bare.setWorkerPool(&g.pool);
+        const auto ka = sendBare(g.kaFrame(9, {{1, v}}, kTopic, bs));
+        ASSERT_EQ(ka.size(), 1u) << leg;
+        expectWholeKa(ka[0], 9, kUnknownTopic);
+        const auto tt = sendBare(g.ttlFrame(10, 1, kTopic, bs));
+        ASSERT_EQ(tt.size(), 1u) << leg;
+        const auto t = asTtl(tt[0]);
+        ASSERT_TRUE(t.has_value());
+        EXPECT_EQ(t->code, kUnknownTopic);
+    }
+}
+
+// 15. A denial that is not NotAuthorized (the topic is placed in the committed routing image but this node has not applied it to its
+//     object index yet) is the route refusal, not a lease frame: a bare NotLeader the client retries.
+TEST(LeaseGatewayRouteRegression, NonNotAuthorizedDenialIsRouteRefusalRegression) {
+    GwLease g;
+    ASSERT_TRUE(g.setup({1}));
+    const int64_t v = g.leaseVersion(1);
+    const int64_t user = g.authedSession({topicGrant(rs::Operation::Read), topicGrant(rs::Operation::Write)}, 0, 0, /*indexTopic=*/false);
+    for (const auto& f : {g.kaFrame(1, {{1, v}}, kTopic, user), g.ttlFrame(2, 1, kTopic, user)}) {
+        const auto fr = g.send(f);
+        ASSERT_EQ(fr.size(), 1u);
+        expectErrorFrame(fr[0], pc::ErrorCode::NotLeader);
+    }
+    g.settle();
+    EXPECT_EQ(g.out.size(), 2u);
+}
+
+// 16. Led elsewhere with no known endpoint of the leader: the bare NotLeader (no Redirect target to name).
+TEST(LeaseGatewayRouteRegression, LedElsewhereNoEndpointRegression) {
+    GwLease g;
+    ASSERT_TRUE(g.setup({1}));
+    const int64_t v = g.leaseVersion(1);
+    g.setLeader(kOther);
+    g.gw.setNodeEndpointMap({});
+    for (const auto& f : {g.kaFrame(1, {{1, v}}), g.ttlFrame(2, 1)}) {
+        const auto fr = g.send(f);
+        ASSERT_EQ(fr.size(), 1u);
+        expectErrorFrame(fr[0], pc::ErrorCode::NotLeader);
+        const auto err = pc::ErrorResponse::decode(fr[0].data(), fr[0].size());
+        EXPECT_TRUE(err->message.empty());
+    }
+    g.settle();
+    EXPECT_EQ(g.out.size(), 2u);
+}
+
+// 17. The auth gates in front of the handler: a session that has not logged in gets AuthenticationFailed (the lease frame) and ends;
+//     the anonymous reader may not keep alive (WRITE): NotAuthorized; a __security view that is behind: AuthUnavailable.
+TEST(LeaseGatewayRouteRegression, AuthGateCellsRegression) {
+    GwLease g;
+    ASSERT_TRUE(g.setup({1}));
+    const int64_t v = g.leaseVersion(1);
+    const auto kAuthFailed = code(pc::ErrorCode::AuthenticationFailed);
+    const auto kUnavailable = code(pc::ErrorCode::AuthUnavailable);
+
+    const int64_t user = g.authedSession({topicGrant(rs::Operation::Read), topicGrant(rs::Operation::Write)});
+    const auto awaiting = [&] {   // a session that has sent nothing yet (injectTestSession gives an anonymous one)
+        const int64_t s = g.gw.injectTestSession();
+        g.gw.setSessionAuthForTest(s, rune::gateway::AuthAwaitingFirst{INT64_MAX / 2, 0, false});
+        return s;
+    };
+    const int64_t fresh = awaiting();
+    const auto ka = g.send(g.kaFrame(1, {{1, v}}, kTopic, fresh));
+    ASSERT_EQ(ka.size(), 1u);
+    expectWholeKa(ka[0], 1, kAuthFailed);
+    const auto tt = g.send(g.ttlFrame(2, 1, kTopic, awaiting()));
+    ASSERT_EQ(tt.size(), 1u);
+    const auto t = asTtl(tt[0]);
+    ASSERT_TRUE(t.has_value());
+    EXPECT_EQ(t->code, kAuthFailed);
+    EXPECT_FALSE(g.gw.hasSessionForTest(fresh)) << "the unauthenticated session ends after its answer (nothing was spilled)";
+
+    g.gw.setAnonymousRead(true);
+    const int64_t anon = awaiting();
+    const auto ak = g.send(g.kaFrame(3, {{1, v}}, kTopic, anon));
+    ASSERT_EQ(ak.size(), 1u);
+    expectWholeKa(ak[0], 3, kNotAuthorized);
+    EXPECT_TRUE(g.gw.hasSessionForTest(anon)) << "the anonymous reader stays";
+
+    g.gw.setSecurityBehind(true);
+    const auto bk = g.send(g.kaFrame(4, {{1, v}}, kTopic, user));
+    ASSERT_EQ(bk.size(), 1u);
+    expectWholeKa(bk[0], 4, kUnavailable);
+    const auto bt = g.send(g.ttlFrame(5, 1, kTopic, user));
+    ASSERT_EQ(bt.size(), 1u);
+    const auto bttl = asTtl(bt[0]);
+    ASSERT_TRUE(bttl.has_value());
+    EXPECT_EQ(bttl->code, kUnavailable);
+}
+
+// 18. Authorisation is read per request: a keepalive is served, the grant is removed, the next one is NotAuthorized.
+TEST(LeaseGatewayRouteRegression, RevokedMidSessionRegression) {
+    GwLease g;
+    ASSERT_TRUE(g.setup({1}));
+    const int64_t v = g.leaseVersion(1);
+    const int64_t user = g.authedSession({topicGrant(rs::Operation::Read), topicGrant(rs::Operation::Write)});
+    std::size_t before = g.out.size();
+    g.send(g.kaFrame(1, {{1, v}}, kTopic, user));
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    const auto served = asKa(g.out.back());
+    ASSERT_TRUE(served.has_value());
+    ASSERT_EQ(served->es.size(), 1u);
+    EXPECT_EQ(served->es[0].code, 0);
+
+    g.gw.setSessionAuthForTest(user, rune::gateway::AuthAuthenticated{1, "user", rune::gateway::PermissionTable::compile({}, 0, g.idx), "", 0});
+    const KaFrame k = g.ka(g.kaFrame(2, {{1, v}}, kTopic, user));
+    EXPECT_EQ(k.corr, 2);
+    ASSERT_EQ(k.es.size(), 1u);
+    EXPECT_EQ(k.es[0].index, kWhole);
+    EXPECT_EQ(k.es[0].code, kNotAuthorized);
+    const TtlFrame t = g.ttl(g.ttlFrame(3, 1, kTopic, user));
+    EXPECT_EQ(t.code, kNotAuthorized);
+}
+
+// 19. A cluster admin is exempt from a suspended namespace (RejectAll) and is served; a non-admin session under the Deleting gate is
+//     refused (NamespaceSuspended), and a root session is refused with UnknownTopic once the namespace is deleting (inDeletingNs_).
+TEST(LeaseGatewayRouteRegression, RootExemptUnderRejectAllRegression) {
+    GwLease g;
+    ASSERT_TRUE(g.setup({1}));
+    const int64_t v = g.leaseVersion(1);
+    const int64_t root = g.authedSession({grant(rs::Operation::Admin, rs::ResourceType::Cluster, rs::PatternKind::Exact, ""),
+                                          topicGrant(rs::Operation::Read), topicGrant(rs::Operation::Write)},
+                                         /*nsId=*/0, /*topicNs=*/0);
+    g.gw.setSessionNsGateForTest(root, rune::catalog::NsStateTag::SuspendedRejectAll);
+    std::size_t before = g.out.size();
+    g.send(g.kaFrame(1, {{1, v}}, kTopic, root));
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    const auto ok = asKa(g.out.back());
+    ASSERT_TRUE(ok.has_value());
+    ASSERT_EQ(ok->es.size(), 1u);
+    EXPECT_EQ(ok->es[0].code, 0) << "root is served under RejectAll";
+    ASSERT_EQ(ok->es[0].ttl, 5000u);
+
+    const int64_t user = g.authedSession({topicGrant(rs::Operation::Read), topicGrant(rs::Operation::Write)});
+    g.gw.setSessionNsGateForTest(user, rune::catalog::NsStateTag::Deleting);
+    const KaFrame k = g.ka(g.kaFrame(2, {{1, v}}, kTopic, user));
+    ASSERT_EQ(k.es.size(), 1u);
+    EXPECT_EQ(k.es[0].code, kSuspended) << "the Deleting gate refuses a non-admin";
+    const TtlFrame t = g.ttl(g.ttlFrame(3, 1, kTopic, user));
+    EXPECT_EQ(t.code, kSuspended);
+}
+
+// 20. A worker return the gateway cannot forward as it is (count / chunk mismatch, a TimeToLive chunk that is not 16 B) is a broker bug:
+//     counted and answered Internal; well-formed returns (incl. the worker's own whole-request refusals and the NotLeader a demotion
+//     gives a parked entry) are forwarded byte for byte.  Mutation: drop the count / chunk check -> the mismatch legs are forwarded.
+TEST(LeaseGatewayRouteRegression, MalformedWorkerReturnRegression) {
+    GwLease g;
+    ASSERT_TRUE(g.setup({1}));
+    const uint16_t kInternal = code(pc::ErrorCode::Internal);
+    ASSERT_EQ(g.gw.leaseReturnMalformed(), 0u);
+
+    uint64_t bad = 0;
+    const auto malformed = [&](WorkerReturn w) {
+        const std::size_t before = g.out.size();
+        g.gw.handleWorkerReturnForTest(w);
+        ++bad;
+        ASSERT_EQ(g.out.size(), before + 1);
+        expectWholeKa(g.out.back(), w.correlationId, kInternal);
+        EXPECT_EQ(g.gw.leaseReturnMalformed(), bad);
+    };
+    malformed(kaReturn(g, 71, 2, entryBytes({{0, 0, 5000}}), true));                       // count says 2, chunk is 1 entry
+    malformed(kaReturn(g, 72, 1, entryBytes({{0, 0, 5000}, {1, 0, 5000}}), true));         // count says 1, chunk is 2 entries
+    malformed(kaReturn(g, 73, 0, {}, true));                                               // no entries
+    malformed(kaReturn(g, 74, 257, std::vector<uint8_t>(257 * 12, 0), true));              // above the wire maximum
+    malformed(kaReturn(g, 75, 1, std::vector<uint8_t>(11, 0), false));                     // short chunk; final is forced to 1
+
+    const std::size_t before = g.out.size();
+    g.gw.handleWorkerReturnForTest(ttlReturn(g, 76, std::vector<uint8_t>(15, 0)));
+    ASSERT_EQ(g.out.size(), before + 1);
+    const auto t = asTtl(g.out.back());
+    ASSERT_TRUE(t.has_value());
+    EXPECT_EQ(t->corr, 76);
+    EXPECT_EQ(t->code, kInternal);
+    EXPECT_EQ(t->remaining, -1);
+    EXPECT_EQ(t->granted, 0u);
+    EXPECT_EQ(t->holder, 0u);
+    EXPECT_EQ(t->version, 0);
+    EXPECT_EQ(g.gw.leaseReturnMalformed(), bad + 1);
+
+    // well-formed: forwarded unchanged, byte for byte what LeaseKeepAliveResponse::encode gives for the same entries
+    const std::array<pc::LeaseKeepAliveResponse::Entry, 3> es = {{{0, 0, 5000}, {1, code(pc::ErrorCode::LeaseNotFound), 0}, {2, 0, 123456789012ULL}}};
+    pc::LeaseKeepAliveResponse expect;
+    expect.sessionId = g.sid; expect.correlationId = 77; expect.final = 0;
+    expect.entries = es;
+    std::vector<uint8_t> bytes(expect.encodedSize());
+    bytes.resize(expect.encode(bytes.data()));
+    g.gw.handleWorkerReturnForTest(kaReturn(g, 77, 3, entryBytes({{0, 0, 5000}, {1, code(pc::ErrorCode::LeaseNotFound), 0}, {2, 0, 123456789012ULL}}), false));
+    EXPECT_EQ(g.out.back(), bytes);
+    for (const uint16_t c : {kNotLeader, kUnknownTopic}) {   // a worker's own whole-request refusal
+        g.gw.handleWorkerReturnForTest(kaReturn(g, 78, 1, entryBytes({{kWhole, c, 0}}), true));
+        expectWholeKa(g.out.back(), 78, c);
+    }
+    EXPECT_EQ(g.gw.leaseReturnMalformed(), bad + 1) << "well-formed returns are not counted";
+
+    // a real worker: an entry parked behind a clear is answered NotLeader when the partition is demoted
+    ASSERT_TRUE(g.setup({2}));
+    const int64_t v2 = g.leaseVersion(2);
+    ASSERT_TRUE(g.checkpoint(2, v2, 4000));
+    g.r.holdJudge(true);
+    const std::size_t b2 = g.out.size();
+    g.send(g.kaFrame(79, {{2, v2}}));
+    g.settle(10);
+    ASSERT_EQ(g.r.worker->leaseParksForTest().inUse(), 1u);
+    ASSERT_EQ(g.out.size(), b2);
+    g.r.demote();
+    g.settle();
+    ASSERT_EQ(g.out.size(), b2 + 1);
+    const auto parked = asKa(g.out.back());
+    ASSERT_TRUE(parked.has_value());
+    EXPECT_EQ(parked->corr, 79);
+    EXPECT_TRUE(parked->final);
+    ASSERT_EQ(parked->es.size(), 1u);
+    EXPECT_EQ(parked->es[0].index, 0);
+    EXPECT_EQ(parked->es[0].code, kNotLeader);
+}
+
+// 21. A two-partition lease topic whose partition 1 is led (and owned by the worker) here and partition 0 elsewhere: a keepalive and
+//     a TimeToLive on partition 1 are served by partition 1's worker, partition 0 redirects.  Mutation: route every request as
+//     partition 0 (the leader check in leaseRouteAdmit_) -> the partition 1 requests are redirected (red).
+TEST(LeaseGatewayRouteRegression, SecondPartitionRoutedRegression) {
+    GwLease g(1 << 22, /*partitionOfRig=*/1, /*partitionCount=*/2);
+    ASSERT_TRUE(g.setup({1}));
+    const int64_t v = g.leaseVersion(1);
+
+    std::size_t before = g.out.size();
+    g.send(g.kaFrame(1, {{1, v}}, kTopic, 0, /*partition=*/1));
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    const auto k = asKa(g.out.back());
+    ASSERT_TRUE(k.has_value());
+    EXPECT_EQ(k->corr, 1);
+    ASSERT_EQ(k->es.size(), 1u);
+    EXPECT_EQ(k->es[0].index, 0);
+    EXPECT_EQ(k->es[0].code, 0);
+    EXPECT_EQ(k->es[0].ttl, 5000u);
+    before = g.out.size();
+    g.send(g.ttlFrame(2, 1, kTopic, 0, /*partition=*/1));
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    const auto t = asTtl(g.out.back());
+    ASSERT_TRUE(t.has_value());
+    EXPECT_EQ(t->code, 0);
+    EXPECT_EQ(t->version, v);
+
+    const auto other = g.send(g.kaFrame(3, {{1, v}}, kTopic, 0, /*partition=*/0));
+    ASSERT_EQ(other.size(), 1u);
+    const auto err = pc::ErrorResponse::decode(other[0].data(), other[0].size());
+    ASSERT_TRUE(err.has_value());
+    EXPECT_EQ(err->code, static_cast<int16_t>(pc::ErrorCode::Redirect));
+    EXPECT_EQ(err->message, kOtherEndpoint);
 }

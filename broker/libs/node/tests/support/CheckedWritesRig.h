@@ -1,6 +1,7 @@
 #pragma once
 // CheckedWritesRig.h - checked writes Part 04: one Worker over a leader partition (topic 6, partition 0) with a tag-capable
 // source {id uint64 key, v int64, tag uint8}, TestReject views and a projection, driven pass by pass without a driver.
+#include <cassert>
 #include <rune/aeronutil/testing/FreePort.h>
 #include <rune/codec/Evolve.h>
 #include <rune/codec/Filter.h>
@@ -132,6 +133,11 @@ public:
     }
     ~VerdictRig() {
         std::error_code ec;
+        // A hosted worker outlives the rig: it must not keep the replica / view set that die here.
+        if (tuning_.hostWorker != nullptr) {
+            worker->setOwnedDirect(Worker::OwnedSet{});
+            worker->setViewSet(nullptr);
+        }
         worker.reset();
         vs.reset();
         std::filesystem::remove_all(viewDir_, ec);
@@ -327,6 +333,7 @@ public:
     /// `specDelayPasses`: the write spec carrying key.index reaches the worker that many passes after restart() returns; until then the
     /// topic is typed without it (the leader scan restores the logged set from the log).
     void restart(bool reinstall = true, int64_t cutTo = -1, int specDelayPasses = 0) {
+        assert(tuning_.hostWorker == nullptr && "a hosted worker cannot restart");
         const int64_t clean = replica->lastCleanOffset();   // what LogCleanerAgent's checkpoint reloads (a cut forgets it)
         worker.reset();
         vs.reset();

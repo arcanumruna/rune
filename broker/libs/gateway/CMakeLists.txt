@@ -66,6 +66,9 @@ target_link_libraries(rune_gateway PRIVATE spdlog::spdlog rune_coordination)
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
 
+    # The lease gateway route tests (LeaseKeepAlive / LeaseTimeToLive through a real ClientGateway) are NOT built here: they host a
+    # real lease worker, so they live in node's rune_lease_emitter_tests (libs/gateway/tests/LeaseGatewayRouteTest.cpp, listed in
+    # libs/node/CMakeLists.txt).
     # -------------------------------------------------------------------------
     # SessionTable unit tests (no Aeron, no driver)
     # -------------------------------------------------------------------------

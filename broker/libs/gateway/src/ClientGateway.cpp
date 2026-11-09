@@ -7528,23 +7528,24 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             using LKR = pc::LeaseKeepAliveResponse;
             const std::span<const uint8_t> chunk = ret.chunkBytes();
             const std::size_t count = static_cast<std::size_t>(ret.recordCount > 0 ? ret.recordCount : 0);
-            std::array<LKR::Entry, LKR::kMaxEntries> entries;   // 4 KiB of stack, no allocation
-            LKR resp;
-            resp.sessionId     = ret.sessionId;
-            resp.correlationId = ret.correlationId;
-            resp.final         = ret.lastOffset == 1 ? 1 : 0;
             if (count < 1 || count > LKR::kMaxEntries || chunk.size() != count * LKR::kEntryBytes) [[unlikely]] {
-                entries[0] = {pc::kLeaseWholeRequest, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), 0};
-                resp.final   = 1;
-                resp.entries = std::span<const LKR::Entry>(entries.data(), 1);
-            } else {
-                for (std::size_t i = 0; i < count; ++i) {
-                    const uint8_t* e = chunk.data() + i * LKR::kEntryBytes;
-                    entries[i] = {pc::detail::getLE16(e, 0), pc::detail::getLE16(e, 2), static_cast<uint64_t>(pc::detail::getLE64(e, 4))};
-                }
-                resp.entries = std::span<const LKR::Entry>(entries.data(), count);
+                // A worker bug (its chunk is built by the lease runtime, never by a client): count it, say so, answer Internal.
+                noteLeaseReturnMalformed_("LeaseKeepAliveResult", ret.recordCount, chunk.size());
+                const std::size_t n = encodeRejection(static_cast<uint16_t>(pc::TemplateId::LeaseKeepAlive), ret.sessionId,
+                                                      ret.correlationId, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                                                      scratch_.data(), scratch_.size());
+                sendAnswer_(*session, scratch_.data(), n);
+                return;
             }
-            sendAnswer_(*session, scratch_.data(), resp.encode(scratch_.data()));
+            // The chunk already is the wire entry layout ({index u16, code u16, ttlMs u64} x count): write the fixed part
+            // (header, final, count) and copy it behind it, no per-entry re-encode.
+            uint8_t* const out = scratch_.data();
+            pc::lease_wire::putHeader(out, LKR::BODY_FIXED, LKR::TEMPLATE_ID, ret.sessionId, ret.correlationId);
+            out[pc::lease_wire::kBase] = ret.lastOffset == 1 ? 1 : 0;
+            pc::detail::putLE16(out, pc::lease_wire::kBase + 1, static_cast<uint16_t>(count));
+            const std::size_t fixed = pc::MessageHeader::ENCODED_SIZE + LKR::BODY_FIXED;
+            std::memcpy(out + fixed, chunk.data(), chunk.size());
+            sendAnswer_(*session, out, fixed + chunk.size());
             return;
         }
 
@@ -7560,10 +7561,16 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             resp.remainingMs   = ret.baseOffset;
             resp.version       = ret.lastOffset;
             const std::span<const uint8_t> chunk = ret.chunkBytes();
-            if (chunk.size() == 16) {
-                resp.grantedTtlMs = static_cast<uint64_t>(pc::detail::getLE64(chunk.data(), 0));
-                resp.holder       = static_cast<uint64_t>(pc::detail::getLE64(chunk.data(), 8));
+            if (chunk.size() != 16) [[unlikely]] {
+                noteLeaseReturnMalformed_("LeaseTimeToLiveResult", 0, chunk.size());
+                const std::size_t n = encodeRejection(static_cast<uint16_t>(pc::TemplateId::LeaseTimeToLive), ret.sessionId,
+                                                      ret.correlationId, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                                                      scratch_.data(), scratch_.size());
+                sendAnswer_(*session, scratch_.data(), n);
+                return;
             }
+            resp.grantedTtlMs = static_cast<uint64_t>(pc::detail::getLE64(chunk.data(), 0));
+            resp.holder       = static_cast<uint64_t>(pc::detail::getLE64(chunk.data(), 8));
             sendAnswer_(*session, scratch_.data(), resp.encode(scratch_.data()));
             return;
         }
@@ -10922,6 +10929,29 @@ bool ClientGateway::leaseRouteAdmit_(Session& session, int64_t sessionId, int64_
     return true;
 }
 
+// Lease topics Task 11b: the enqueue outcome of a lease request.  Only Full is back-pressure (Throttled, retry-after 1 ms); TooLarge
+// can never fit one worker-ingress frame, so a retry would loop forever: the non-retriable MessageTooLarge, loudly.
+void ClientGateway::answerLeaseEnqueue_(rune::node::EnqueueResult er, int32_t topicId, int32_t partition, const uint8_t* buf,
+                                        std::size_t len, const char* what)
+{
+    if (er == rune::node::EnqueueResult::Enqueued) return;
+    if (er == rune::node::EnqueueResult::TooLarge) [[unlikely]] {
+        spdlog::error("ClientGateway: {} for topicId={} partition={} ({} B) exceeds the worker ingress frame; MessageTooLarge", what,
+                      topicId, partition, len);
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge), what);
+        return;
+    }
+    (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Throttled), what);
+}
+
+// Lease topics Task 11b: a lease worker return the gateway cannot forward as it is (chunk / count mismatch) is a broker bug.
+void ClientGateway::noteLeaseReturnMalformed_(const char* what, int32_t recordCount, std::size_t chunkBytes)
+{
+    if (leaseReturnMalformed_++ % 1024 == 0)
+        spdlog::error("ClientGateway: malformed {} from a worker: recordCount={} chunk={} B; answered Internal (total={})", what,
+                      recordCount, chunkBytes, leaseReturnMalformed_);
+}
+
 // Lease topics Task 11b: LeaseKeepAlive (96).  WRITE on the topic; the worker answers one LeaseKeepAliveResult per decided group.
 void ClientGateway::handleLeaseKeepAlive(const uint8_t* buf, std::size_t len)
 {
@@ -10946,8 +10976,8 @@ void ClientGateway::handleLeaseKeepAlive(const uint8_t* buf, std::size_t len)
     op.correlationId = m->correlationId;
     op.recordCount   = static_cast<int32_t>(m->count);
     op.leaseTail     = m->entryBytes;
-    if (!workerPool_->tryEnqueueOp(m->topicId, m->partition, std::move(op)))
-        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Throttled), "LeaseKeepAlive: worker ring full");
+    answerLeaseEnqueue_(workerPool_->enqueueOp(m->topicId, m->partition, std::move(op)), m->topicId, m->partition, buf, len,
+                        "LeaseKeepAlive");
 }
 
 // Lease topics Task 11b: LeaseTimeToLive (98).  READ on the topic.
@@ -10973,8 +11003,8 @@ void ClientGateway::handleLeaseTimeToLive(const uint8_t* buf, std::size_t len)
     op.sessionId     = m->sessionId;
     op.correlationId = m->correlationId;
     op.leaseTail     = m->key;
-    if (!workerPool_->tryEnqueueOp(m->topicId, m->partition, std::move(op)))
-        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Throttled), "LeaseTimeToLive: worker ring full");
+    answerLeaseEnqueue_(workerPool_->enqueueOp(m->topicId, m->partition, std::move(op)), m->topicId, m->partition, buf, len,
+                        "LeaseTimeToLive");
 }
 
 void ClientGateway::handleGetViewRowK(const uint8_t* buf, std::size_t len)

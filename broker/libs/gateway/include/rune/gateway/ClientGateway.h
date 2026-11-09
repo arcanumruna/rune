@@ -1512,6 +1512,7 @@ public:
     void applyGetViewRowKForTest(const uint8_t* buf, std::size_t len) { handleGetViewRowK(buf, len); }
     void applyScanViewRowsForTest(const uint8_t* buf, std::size_t len) { handleScanViewRows(buf, len); }
     void applyGetStatsForTest(const uint8_t* buf, std::size_t len) { handleGetStats(buf, len); }
+    [[nodiscard]] uint64_t leaseReturnMalformed() const noexcept { return leaseReturnMalformed_; }
     void applyLeaseKeepAliveForTest(const uint8_t* buf, std::size_t len) { handleLeaseKeepAlive(buf, len); }
     void applyLeaseTimeToLiveForTest(const uint8_t* buf, std::size_t len) { handleLeaseTimeToLive(buf, len); }
     [[nodiscard]] uint64_t rejectedRequestsForTest() const noexcept { return rejectedRequests_; }
@@ -2111,6 +2112,9 @@ private:
     // LeaseTimeToLiveResult (LeaseKeepAliveResponse 97 / LeaseTimeToLiveResponse 99).  ScanLeases (100) is refused until Task 13.
     void handleLeaseKeepAlive (const uint8_t* buf, std::size_t len);
     void handleLeaseTimeToLive(const uint8_t* buf, std::size_t len);
+    void answerLeaseEnqueue_(rune::node::EnqueueResult er, int32_t topicId, int32_t partition, const uint8_t* buf, std::size_t len,
+                             const char* what);
+    void noteLeaseReturnMalformed_(const char* what, int32_t recordCount, std::size_t chunkBytes);
     [[nodiscard]] bool leaseRouteAdmit_(Session& session, int64_t sessionId, int64_t corr, int32_t topicId, int32_t partition,
                                         rune::security::Operation op, const uint8_t* buf, std::size_t len, const char* what);
     [[nodiscard]] Session* checkedViewReadSession_(const uint8_t* buf, std::size_t len, int64_t sessionId,
@@ -3073,6 +3077,7 @@ private:
     void onControlRecordRefused_(const rune::node::WorkerReturn& ret);
     void onControlRecordAppended_(const rune::node::WorkerReturn& ret);
     uint64_t controlRecordsRefused_ = 0;
+    uint64_t leaseReturnMalformed_  = 0;   // lease worker returns with a bad count / chunk (a broker bug), answered Internal
     uint64_t produceBackPressured_  = 0;   // M5: produces answered NotLeader on back-pressure
 
     // -----------------------------------------------------------------------
