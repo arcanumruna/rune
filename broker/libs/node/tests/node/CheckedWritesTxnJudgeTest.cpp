@@ -629,6 +629,14 @@ struct JudgeRig {
         verdictOnHw(st, old.appendBases[n - 1] + 1);
         vs.bindLeader(nullptr, ++gen, 0);
     }
+    // A view discard as the worker does it: a member ahead of K is rebuilt from the log's start.
+    void rebuildViewsAheadOfK() {
+        vs.setViewHooks({nullptr, nullptr, [](void*, ViewInstance& inst, ViewDiscardReason) {
+            inst.table = rune::view::ViewTable(inst.layout, 4096, 1u << 16, inst.tableKeys);
+            inst.foldCursor = 0;
+            inst.spanFence.clear();
+        }, nullptr});
+    }
     // The same on the old leader's own node: its views keep what they applied.
     void failoverKeeping(std::size_t n) { takeOver(*this, n); }
     // Drives until the judge has passed the whole log (at least once: a new leader judges again from K).
@@ -933,9 +941,15 @@ TEST(CheckedWritesTxnJudgeRegression, RejectedP11_7SpanSplitByInterleavedRejecti
 // A restart inside the span applied the tail within the cap.
 TEST(CheckedWritesTxnJudgeRegression, TooLargeEscapeSpanSplitSurvivesFailoverRegression) {
     const auto build = [](JudgeRig& r) {
+        ConstraintSet later = r.set;
+        later.id = 2;
+        r.set.count--;   // the set at T's first record has no TestReject member
         r.start();
         r.drive(INT64_MAX, 2'000'000'000);
-        burst(r, 5000, 1000, 1, 77);
+        burst(r, 2500, 1000, 1, 77);
+        r.log.control();   // the member is created inside T
+        r.st.constraintSets.onChange(r.log.next - 1, later);
+        burst(r, 2500, 3500, 1, 77);
         r.log.marker(77, true);
         r.drive();
         ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{0, 4096, 904}));
@@ -944,6 +958,7 @@ TEST(CheckedWritesTxnJudgeRegression, TooLargeEscapeSpanSplitSurvivesFailoverReg
     build(straight);
     JudgeRig r(true);
     build(r);
+    r.rebuildViewsAheadOfK();
     r.failoverKeeping(2);
     r.settle();
     for (int64_t id = 1000; id < 6000; ++id) ASSERT_FALSE(r.indexed(id)) << id;
@@ -3292,4 +3307,29 @@ TEST(CheckedWritesTxnJudgeRegression, RejectionBesideHeldEntriesWaitsForRetentio
     EXPECT_FALSE(r.vs.stalled());
     for (int64_t o = 13; o < 16; ++o) EXPECT_NE(r.st.rejected.find(o), nullptr) << o;
     EXPECT_EQ(r.vs.judgedThrough(), 16);
+}
+
+// REGRESSION (#974, the checkpoint gate): a persisted member's delta leaves only once a marker that closes coverage reaches its cursor.
+// A full marker appended over its records is no such marker: a restart from the checkpoint would start inside a span.
+TEST(CheckedWritesTxnJudgeRegression, CheckpointWaitsForAClosingMarkerNotAFullOneRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.index->persisted = true;
+    int pushes = 0;
+    VerdictViewHooks hooks;
+    hooks.ctx = &pushes;
+    hooks.checkpoint = [](void* ctx, ViewInstance& inst) { *static_cast<int*>(ctx) += inst.persisted; return 0; };
+    r.vs.setViewHooks(hooks);
+    r.log.data({{1}, {2}, {3}});   // 10..12
+    ASSERT_TRUE(r.st.markers.onMarker(5, 13, false));   // a full marker over them, no closing one after it yet
+    r.vs.bindLeader(nullptr, 2, 0);
+    r.drive();
+    ASSERT_EQ(r.vs.judgedThrough(), 13);
+    ASSERT_EQ(r.index->foldCursor, 13);
+    ASSERT_TRUE(r.st.markers.chainOpen());
+    EXPECT_EQ(pushes, 0);
+    r.log.data({{4}});   // 13: the judge's closing marker covers it
+    r.drive();
+    EXPECT_FALSE(r.st.markers.chainOpen());
+    EXPECT_GT(pushes, 0);
 }
