@@ -102,7 +102,9 @@
 #include <rune/crypto/Aead.h>
 #include <rune/crypto/Cipher.h>
 #include <rune/node/CheckedWriteHook.h>
+#include <rune/node/lease/LeaseIndex.h>
 #include <rune/node/lease/LeaseRuntime.h>
+#include <rune/protocol/client/LeaseMessages.h>
 #include <rune/node/WriteState.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/replication/ReplicationFrameLimits.h>   // F18 frame limits (maxAcceptableBatchBytes)
@@ -198,6 +200,8 @@ public:
     // Bound (review S3 m1).  Let F = |FIFO| and O = owed returns (parked
     // acks=all + durablePending_ + held PushReads; S6 adds commit waiters /
     // parked markers — every owed source MUST be counted in reservedAckSlots_()).
+    //   * Lease keepalive parks (Task 11a) are owed returns too: each park is checked against owedCapAllows_() first and
+    //     counted in reservedAckSlots_() (LeaseParkTable::inUse: parked + queued until drained) - one owed per parked entry.
     //   * O <= maxOwedReturns_ always: the cap is checked BEFORE the append on
     //     the gateway path (ackReservationAvailable_) and bounds the shard poll
     //     budget (ingressPollBudget_, K <= cap - O, one owed per frame).
@@ -607,9 +611,13 @@ public:
         return w == nullptr ? nullptr : w->leaseRuntime.get();
     }
     void setLeaseBatchCapForTest(std::size_t bytes) noexcept { leaseBatchCapOverrideForTest_ = bytes; }
+    /// Lease topics Task 11a: the leader heartbeat timeout (ns) granted to a promoted key (spec 9.7).  Applies to runtimes created afterwards.
+    void setLeaseExtendNs(int64_t ns) noexcept { leaseExtendNs_ = ns; }
+    [[nodiscard]] const lease::LeaseParkTable& leaseParksForTest() const noexcept { return *leaseParks_; }
+    [[nodiscard]] uint64_t nsProduceRecordsForTest(uint16_t slot) const noexcept { return slot < nsHot_.size() ? nsHot_[slot].produceRecords : 0; }
     void onEventsForTest(int32_t topicId, int32_t partition, std::span<const LeaseEvent> events, int64_t leaseNowNs) {
         if (PartitionWriteState* w = writeOf_(findOwnedReplica_(topicId, partition)); w != nullptr && w->leaseRuntime)
-            w->leaseRuntime->onEvents(events, leaseNowNs);
+            w->leaseRuntime->onEvents(events, leaseNowNs, *leaseParks_);
     }
     [[nodiscard]] int64_t viewLeaseEndNsForTest() const noexcept { return viewLeaseEndNs_; }
     [[nodiscard]] uint64_t viewReadsWithoutLeaseForTest() const noexcept { return viewReadsWithoutLease_; }
@@ -1362,6 +1370,12 @@ public:
             tailKind = sbe::TailKind::Value::VIEW_READ;
             tailSrc  = op.viewReadTail.data();
             tailLen  = op.viewReadTail.size();
+            break;
+        case WorkerOp::Type::LeaseKeepAlive:
+        case WorkerOp::Type::LeaseTimeToLive:
+            tailKind = sbe::TailKind::Value::LEASE_REQUEST;
+            tailSrc  = op.leaseTail.data();
+            tailLen  = op.leaseTail.size();
             break;
         case WorkerOp::Type::SessionAnnounce:
             tailKind = sbe::TailKind::Value::EGRESS_CHANNEL;
@@ -2772,6 +2786,16 @@ private:
         case WorkerOp::Type::GetStats:
             executeGetStats_(op);
             break;
+        // Lease topics Task 11a: not ownership-gated here; the handlers check the replica themselves.
+        case WorkerOp::Type::LeaseKeepAlive:
+            executeLeaseKeepAlive_(op);
+            break;
+        case WorkerOp::Type::LeaseTimeToLive:
+            executeLeaseTimeToLive_(op);
+            break;
+        case WorkerOp::Type::ScanLeases:
+            break;   // Task 13 serves it
+
         case WorkerOp::Type::ApplyReplicated:
             // Worker-clock: dequeued a routed apply op.  corr=runSeq pairs 1:1 (FIFO)
             // with the control thread's ReplFragRecv → EXACT control→worker handoff.
@@ -3504,6 +3528,7 @@ private:
                 // Part 04: the scan feed and the judge point at the state
                 if (sl.rc) sl.rc->setVerdictHooks(RcVerdictHooks{});
                 if (viewSet_ != nullptr) viewSet_->dropVerdictSource(topicId, static_cast<int32_t>(sl.replica->partitionId()));
+                dropLeaseRuntime_(*sl.write, static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownTopic));   // Task 11a (idempotent)
                 sl.write.reset();
             }
         rebuildWriteById_();
@@ -6611,6 +6636,14 @@ private:
     std::unique_ptr<LeaseHookWork> leaseHookWork_;   // lease topics: the produce hook's work area (allocated once, cold)
     std::unique_ptr<lease::LeaseEmitWork> leaseEmitWork_;   // lease topics Task 10: the Expire batch under construction (allocated once, cold)
     std::size_t leaseBatchCapOverrideForTest_ = 0;           // test seam: a lease batch's byte cap (0: none)
+    // Lease topics Task 11a: the keepalives parked until the log catches up (allocated once in the ctor, cold), the leader
+    // heartbeat timeout a promoted key is granted on top of its remaining time (BrokerNode: setLeaseExtendNs), and the decided
+    // entries of the keepalive op being served (256 x 12 bytes: one wire entry each).
+    std::unique_ptr<lease::LeaseParkTable> leaseParks_ = std::make_unique<lease::LeaseParkTable>();
+    int64_t  leaseExtendNs_ = 0;
+    std::array<uint8_t, 256 * 12> leaseKaScratch_{};
+    uint64_t leaseKeepAlives_ = 0;      // LeaseKeepAlive ops executed
+    uint64_t leaseTimeToLives_ = 0;     // LeaseTimeToLive ops executed
     std::vector<uint8_t> autoIncScratch_;   // Part 06: a key-0 batch is copied here to patch its ids (maxIntakeBatchBytes_, cold)
     std::size_t assignedBaseReserve_ = kAssignedBaseProducersInitial;
     bool autoIncGrowDue_ = false;   // a fresh key-0 append left a side window above 75 % load
@@ -7065,6 +7098,9 @@ private:
     std::vector<uint64_t> droppedTopicBits_;
     void markTopicDropped_(int32_t topicId) {
         if (topicId < 0) return;
+        for (auto& sl : rcSlots_)   // lease topics Task 11a: the parked keepalives of its partitions are answered before anything is released
+            if (sl.write && sl.write->leaseRuntime && sl.write->leaseRuntime->topicId() == topicId)
+                dropLeaseRuntime_(*sl.write, static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownTopic));
         const std::size_t w = static_cast<std::size_t>(topicId) >> 6;
         if (w >= droppedTopicBits_.size()) droppedTopicBits_.resize(w + 1, 0);
         droppedTopicBits_[w] |= (1ULL << (static_cast<unsigned>(topicId) & 63u));
@@ -7384,9 +7420,11 @@ private:
             next.push_back(std::move(slot));
         }
         // A state not carried over is freed below: its judge and key index go first (the replica may be gone, the judge is not).
-        for (auto& old : rcSlots_)
+        for (auto& old : rcSlots_) {
+            if (old.write) dropLeaseRuntime_(*old.write, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader));   // Task 11a
             if (old.write && old.write->verdicts != nullptr && old.write->verdicts->boundState() == old.write.get())
                 viewSet_->dropVerdictSource(old.write->spec->topicId, old.write->verdicts->partition());
+        }
         rcSlots_ = std::move(next);
         ringSlots_ = 0;   // E2 residual N5: memory-backed slots (0 -> no ring walk at all)
         for (const auto& sl : rcSlots_) ringSlots_ += sl.replica->isDiskBacked() ? 0u : 1u;
@@ -7481,13 +7519,14 @@ private:
     // (leadership generation, lease rebuild epoch) changes.  Namespace suspension is deliberately not consulted: expiry is the broker's
     // own housekeeping and keeps running in a suspended namespace.  `leaseNowNs` is read ONCE per doWork by the caller.
     int leaseDuty_(int64_t leaseNowNs) {
+        namespace pc = rune::protocol::client;
         int work = 0;
         for (auto* replica : owned_) {
             if (replica == nullptr || replica->topicId() < 0) continue;
             PartitionWriteState* const w = writeOf_(replica);
             if (w == nullptr || w->spec == nullptr || !w->spec->lease) continue;
             if (replica->role() != rune::replication::Role::Leader) {   // the role check driveViews_ uses
-                w->leaseRuntime.reset();
+                dropLeaseRuntime_(*w, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
                 w->leaseEvents.buf.clear();
                 continue;
             }
@@ -7497,42 +7536,230 @@ private:
             const uint64_t gen      = replica->leadershipGeneration();
             const WorkerViewSet::LeaseIndexLookup lk = viewSet_->leaseIndexFor(topicId, partition, gen, true, hwConfirmed);
             const uint64_t epoch    = viewSet_->leaseRebuildEpoch(topicId, partition);
-            if (w->leaseRuntime && !w->leaseRuntime->sameIdentity(gen, epoch)) w->leaseRuntime.reset();
+            if (w->leaseRuntime && !w->leaseRuntime->sameIdentity(gen, epoch))
+                dropLeaseRuntime_(*w, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
             if (!w->leaseRuntime && lk.ready) {   // cold; live keys at creation are armed by Task 12's promotion pass, not here
                 if (!leaseEmitWork_) leaseEmitWork_ = std::make_unique<lease::LeaseEmitWork>(kLeaseEmitReserveBytes);
-                w->leaseRuntime = std::make_unique<lease::LeaseRuntime>(gen, epoch, w->spec->lease->maxKeys, leaseNowNs);
+                w->leaseRuntime = std::make_unique<lease::LeaseRuntime>(gen, epoch, w->spec->lease->maxKeys, leaseNowNs, topicId, partition,
+                                                                        leaseExtendNs_);
             }
             if (w->leaseRuntime) {
-                w->leaseRuntime->onEvents(w->leaseEvents.buf, leaseNowNs);
+                w->leaseRuntime->onEvents(w->leaseEvents.buf, leaseNowNs, *leaseParks_);
                 work += static_cast<int>(w->leaseEvents.buf.size());
             }
             w->leaseEvents.buf.clear();   // consumed (or discarded: no runtime yet)
             if (!w->leaseRuntime || !lk.ready) continue;
             const LeaseWriter writer = latestLeaseWriter(*w->spec);
-            std::size_t cap = kLeaseEmitReserveBytes;
-            if (leaseBatchCapOverrideForTest_ != 0) {
-                cap = std::min(cap, leaseBatchCapOverrideForTest_);
-            } else {
-                const NsTag nsTag = replica->isDiskBacked() ? nsTagOfLog_(replica->log(), nullptr) : nsTagOfLog_(nullptr, replica->memoryLog());
-                const uint64_t nsMax = nsTag.slot < nsHot_.size() ? nsHot_[nsTag.slot].maxBatchBytes : std::numeric_limits<uint64_t>::max();
-                cap = static_cast<std::size_t>(std::min<uint64_t>(cap, std::min<uint64_t>(nsMax, maxIntakeBatchBytes_)));
+            const std::size_t cap     = leaseBatchCap_(replica);
+            const std::size_t hardCap = leaseHardCap_();
+            const ReplReadScope rs(*replica, replScratch_);   // the appends' push reads into the scratch
+            // Order: fold (above) -> the clears the parked keepalives wait for -> the due Expires.
+            const uint32_t cleared = w->leaseRuntime->flushClears(*leaseEmitWork_, lk.ref, writer, w->judgedThrough, leaseNowNs, cap, hardCap,
+                                                                  *replica, *leaseParks_);
+            if (cleared != 0) {
+                work += static_cast<int>(cleared);
+                noteLeaseAppended_(replica);
             }
-            const ReplReadScope rs(*replica, replScratch_);   // the append's push reads into the scratch
-            const uint32_t emitted = w->leaseRuntime->emit(*leaseEmitWork_, lk.ref, writer, w->judgedThrough, leaseNowNs, cap,
+            const uint32_t emitted = w->leaseRuntime->emit(*leaseEmitWork_, lk.ref, writer, w->judgedThrough, leaseNowNs, cap, hardCap,
                                                            w->spec->lease->expiryBatch, *replica);
             if (emitted != 0) {
                 work += static_cast<int>(emitted);
-                if (replica->durabilityTier() == 2 && replica->isDiskBacked()) {   // a Strict-tier batch joins this pass's durable flush
-                    rune::storage::Log* log = replica->log();
-                    bool found = false;
-                    for (auto* dl : dirtyThisCycle_) {
-                        if (dl == log) { found = true; break; }
-                    }
-                    if (!found) dirtyThisCycle_.push_back(log);
+                noteLeaseAppended_(replica);
+            }
+        }
+        drainLeaseParks_();   // the folds, the clears and the demotions above queued their answers
+        return work;
+    }
+
+    /// The byte cap of one lease batch: the reserve, narrowed by the namespace's and the intake's batch limits (and the test seam).
+    [[nodiscard]] std::size_t leaseBatchCap_(rune::replication::PartitionReplica* replica) const noexcept {
+        std::size_t cap = kLeaseEmitReserveBytes;
+        if (leaseBatchCapOverrideForTest_ != 0) return std::min(cap, leaseBatchCapOverrideForTest_);
+        const NsTag nsTag = replica->isDiskBacked() ? nsTagOfLog_(replica->log(), nullptr) : nsTagOfLog_(nullptr, replica->memoryLog());
+        const uint64_t nsMax = nsTag.slot < nsHot_.size() ? nsHot_[nsTag.slot].maxBatchBytes : std::numeric_limits<uint64_t>::max();
+        return static_cast<std::size_t>(std::min<uint64_t>(cap, std::min<uint64_t>(nsMax, maxIntakeBatchBytes_)));
+    }
+    /// The most a lone lease record's batch may take (a record over the byte cap but within this goes out alone).
+    [[nodiscard]] std::size_t leaseHardCap_() const noexcept { return std::min<std::size_t>(kLeaseEmitReserveBytes, maxIntakeBatchBytes_); }
+    /// A Strict-tier lease batch joins this pass's durable flush.
+    void noteLeaseAppended_(rune::replication::PartitionReplica* replica) {
+        if (replica->durabilityTier() != 2 || !replica->isDiskBacked()) return;
+        rune::storage::Log* log = replica->log();
+        for (auto* dl : dirtyThisCycle_)
+            if (dl == log) return;
+        dirtyThisCycle_.push_back(log);
+    }
+
+    /// Lease topics Task 11a: every place a lease runtime dies goes through here, so its parked keepalives are answered first
+    /// (`code`: NotLeader for a demotion / identity change / released state, UnknownTopic for a dropped topic).  The answers
+    /// queue in the park table; the caller (or the next duty pass) drains them.
+    void dropLeaseRuntime_(PartitionWriteState& w, uint16_t code) {
+        if (!w.leaseRuntime) return;
+        leaseParks_->answerWhere(w.leaseRuntime->topicId(), w.leaseRuntime->partition(), code);
+        w.leaseRuntime.reset();
+    }
+
+    /// One LeaseKeepAliveResult return: `count` wire entries (12 bytes each).
+    void enqueueLeaseKaReturn_(int64_t sessionId, int64_t correlationId, int32_t topicId, int32_t partition, const uint8_t* entries,
+                               uint16_t count, bool final) {
+        WorkerReturn ret;
+        ret.type          = WorkerReturn::Type::LeaseKeepAliveResult;
+        ret.sessionId     = sessionId;
+        ret.correlationId = correlationId;
+        ret.readTopicId   = topicId;
+        ret.readPartition = partition;
+        ret.recordCount   = count;
+        ret.lastOffset    = final ? 1 : 0;
+        const ChunkRun run{entries, static_cast<uint32_t>(count) * 12u};
+        enqueueViewResult_(ret, &run, 1, run.len);
+    }
+    static void putKaEntry_(uint8_t* p, uint16_t index, uint16_t code, uint64_t ttlMs) noexcept {
+        p[0] = static_cast<uint8_t>(index);        p[1] = static_cast<uint8_t>(index >> 8);
+        p[2] = static_cast<uint8_t>(code);         p[3] = static_cast<uint8_t>(code >> 8);
+        for (int i = 0; i < 8; ++i) p[4 + i] = static_cast<uint8_t>(ttlMs >> (8 * i));
+    }
+    /// The park table's queued answers become returns, one per answer, to the parked entry's own session / correlation.
+    void drainLeaseParks_() {
+        if (leaseParks_->queued() == 0) [[likely]] return;
+        leaseParks_->drain([this](const lease::LeaseParkSlot& s, const lease::LeaseParkAnswer& a) {
+            uint8_t e[12];
+            putKaEntry_(e, s.index, a.code, a.ttlMs);
+            enqueueLeaseKaReturn_(s.sessionId, s.correlationId, s.topicId, s.partition, e, 1, a.final != 0);
+        });
+    }
+    void answerLeaseWhole_(int64_t sessionId, int64_t correlationId, int32_t topicId, int32_t partition, uint16_t code, uint64_t ttlMs) {
+        uint8_t e[12];
+        putKaEntry_(e, rune::protocol::client::kLeaseWholeRequest, code, ttlMs);
+        enqueueLeaseKaReturn_(sessionId, correlationId, topicId, partition, e, 1, true);
+    }
+
+    /// The leader-side preconditions both lease reads share (the view read's: leader of the partition, read lease held), plus a ready
+    /// runtime of the current identity.  Null = answer NotLeader.
+    struct LeaseServe {
+        rune::replication::PartitionReplica* replica = nullptr;
+        PartitionWriteState*                 w       = nullptr;
+        WorkerViewSet::LeaseIndexLookup      lk{};
+    };
+    [[nodiscard]] bool leaseServeable_(int32_t topicId, int32_t partition, int64_t nowNs, LeaseServe& out) {
+        rune::replication::PartitionReplica* const replica = findOwnedReplica_(topicId, partition);
+        if (replica == nullptr || replica->role() != rune::replication::Role::Leader) return false;
+        if (viewLeaseEndNs_ != kViewLeaseUnbounded && nowNs >= viewLeaseEndNs_) [[unlikely]] {   // as serveViewReadImpl_ 2c
+            ++viewReadsWithoutLease_;
+            return false;
+        }
+        PartitionWriteState* const w = writeOf_(replica);
+        if (w == nullptr || w->spec == nullptr || !w->spec->lease || !w->leaseRuntime || viewSet_ == nullptr) return false;
+        const uint64_t gen = replica->leadershipGeneration();
+        const WorkerViewSet::LeaseIndexLookup lk = viewSet_->leaseIndexFor(topicId, partition, gen, true,
+                                                                           replica->highWatermark() >= replica->leadershipStartOffset());
+        if (!lk.ready || !w->leaseRuntime->sameIdentity(gen, viewSet_->leaseRebuildEpoch(topicId, partition))) return false;
+        out.replica = replica;
+        out.w       = w;
+        out.lk      = lk;
+        return true;
+    }
+
+    // Lease topics Task 11a (spec 9.3, 9.6): a LeaseKeepAlive op.  leaseTail = the validated entries; recordCount = their count.
+    // Read once: the lease clock.  The request-level refusals are ONE entry {kLeaseWholeRequest, code}, final.
+    void executeLeaseKeepAlive_(sbe::WorkerOp& op) {
+        namespace pc = rune::protocol::client;
+        ++leaseKeepAlives_;
+        const int32_t  topicId   = op.topicId();
+        const int32_t  partition = op.partition();
+        const int64_t  sid       = op.sessionId();
+        const int64_t  corr      = op.correlationId();
+        const int64_t  nowNs     = leaseNow_();
+        const int32_t  count32   = op.recordCount();
+        LeaseServe sv;
+        if (!leaseServeable_(topicId, partition, nowNs, sv)) {
+            answerLeaseWhole_(sid, corr, topicId, partition, static_cast<uint16_t>(pc::ErrorCode::NotLeader), 0);
+            return;
+        }
+        if (count32 < 1 || count32 > 256) [[unlikely]] {
+            answerLeaseWhole_(sid, corr, topicId, partition, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), 0);
+            return;
+        }
+        const uint16_t count = static_cast<uint16_t>(count32);
+        const NsTag nsTag = sv.replica->isDiskBacked() ? nsTagOfLog_(sv.replica->log(), nullptr) : nsTagOfLog_(nullptr, sv.replica->memoryLog());
+        if (NsHot* const nh = nsReadMeter_(topicId, nsTag)) {
+            if (passNowNs_ < nh->produceUntil) [[unlikely]] {   // the produce throttle (one compare); retry-after in ms, at least 1
+                ++throttledRefusals_;
+                const int64_t ms = (nh->produceUntil - passNowNs_ + 999'999) / 1'000'000;
+                answerLeaseWhole_(sid, corr, topicId, partition, static_cast<uint16_t>(pc::ErrorCode::Throttled),
+                                  static_cast<uint64_t>(std::max<int64_t>(1, ms)));
+                return;
+            }
+            nh->produceRecords += count;   // L13: a keepalive entry is charged like a produced record, before any is served
+        }
+        lease::LeaseRuntime& rt = *sv.w->leaseRuntime;
+        const std::uint32_t tailLen = op.tailLength();   // length first: tail() moves the flyweight's limit
+        const auto tail = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(op.tail()), tailLen);
+        uint32_t req     = lease::kLeaseNil;
+        uint16_t decided = 0;
+        const ReplReadScope rs(*sv.replica, replScratch_);
+        rune::protocol::client::forEachLeaseKeepAliveEntry(tail, count, [&](uint16_t index, std::span<const uint8_t> key, int64_t version) {
+            const lease::LeaseKaOutcome o = rt.keepAlive(sv.lk.ref, key, version, sv.w->judgedThrough, nowNs, *leaseParks_, req, sid, corr, index,
+                                                          owedCapAllows_());
+            if (o.parked) return;
+            putKaEntry_(leaseKaScratch_.data() + static_cast<std::size_t>(decided) * 12, index, o.code, o.ttlMs);
+            ++decided;
+        });
+        // The clears the parked entries wait for go out now (a row with remaining 0 answers at once, below).
+        if (rt.clearPending() != 0) {
+            if (!leaseEmitWork_) leaseEmitWork_ = std::make_unique<lease::LeaseEmitWork>(kLeaseEmitReserveBytes);
+            if (rt.flushClears(*leaseEmitWork_, sv.lk.ref, latestLeaseWriter(*sv.w->spec), sv.w->judgedThrough, nowNs, leaseBatchCap_(sv.replica),
+                               leaseHardCap_(), *sv.replica, *leaseParks_) != 0)
+                noteLeaseAppended_(sv.replica);
+        }
+        if (decided != 0) enqueueLeaseKaReturn_(sid, corr, topicId, partition, leaseKaScratch_.data(), decided, req == lease::kLeaseNil);
+        drainLeaseParks_();
+    }
+
+    // Lease topics Task 11a: a LeaseTimeToLive op (a read: no throttle charge).  leaseTail = the key bytes.
+    void executeLeaseTimeToLive_(sbe::WorkerOp& op) {
+        namespace pc = rune::protocol::client;
+        ++leaseTimeToLives_;
+        const int32_t topicId   = op.topicId();
+        const int32_t partition = op.partition();
+        const int64_t nowNs     = leaseNow_();
+        WorkerReturn ret;
+        ret.type          = WorkerReturn::Type::LeaseTimeToLiveResult;
+        ret.sessionId     = op.sessionId();
+        ret.correlationId = op.correlationId();
+        ret.readTopicId   = topicId;
+        ret.readPartition = partition;
+        ret.baseOffset    = -1;
+        ret.lastOffset    = 0;
+        uint8_t body[16] = {};
+        LeaseServe sv;
+        if (!leaseServeable_(topicId, partition, nowNs, sv)) {
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+        } else {
+            const std::uint32_t keyLen = op.tailLength();   // length first: tail() moves the flyweight's limit
+            const auto key = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(op.tail()), keyLen);
+            uint32_t rid = 0;
+            const LeaseIndexRef& ref = sv.lk.ref;
+            const uint8_t* const row = ref.table == nullptr || ref.layout == nullptr || key.size() != ref.table->keyWidth() ? nullptr
+                                       : ref.table->find(rune::view::ViewKey::fromBytes(key), rid);
+            if (row == nullptr) {
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::LeaseNotFound);
+            } else {
+                const uint64_t ttl    = leaseRowTtl(row, *ref.layout);
+                const uint64_t holder = leaseRowHolder(row, *ref.layout);
+                const int64_t deadline = sv.w->leaseRuntime->deadlineFor(rid, ttl, leaseRowRemaining(row, *ref.layout));
+                int64_t left;
+                if (__builtin_sub_overflow(deadline, nowNs, &left)) left = std::numeric_limits<int64_t>::max();
+                ret.errorCode  = 0;
+                ret.baseOffset = std::max<int64_t>(0, left / 1'000'000);
+                ret.lastOffset = leaseRowVersion(row, *ref.layout);
+                for (int i = 0; i < 8; ++i) {
+                    body[i]     = static_cast<uint8_t>(ttl >> (8 * i));
+                    body[8 + i] = static_cast<uint8_t>(holder >> (8 * i));
                 }
             }
         }
-        return work;
+        const ChunkRun run{body, 16};
+        enqueueViewResult_(ret, &run, 1, 16);
     }
     static constexpr std::size_t kLeaseEmitReserveBytes = 1u << 20;
 
@@ -9265,7 +9492,8 @@ private:
                static_cast<int64_t>(durablePending_.size()) +
                static_cast<int64_t>(heldPushReads_.size()) +   // F15 S4 I-2: held PushReads owe a return
                static_cast<int64_t>(heldViewReads_.size()) +   // issue #82: so do GetViewRows the fold barrier holds
-               static_cast<int64_t>(deferredPushCount_);        // F5: so do budget-deferred ones
+               static_cast<int64_t>(deferredPushCount_) +       // F5: so do budget-deferred ones
+               static_cast<int64_t>(leaseParks_->inUse());      // lease topics Task 11a: so does every parked keepalive entry
     }
 
     // Reservation-before-poll (E5.1.3 deliverable b), G-A6: never poll more

@@ -47,6 +47,7 @@ public:
         FILTER = static_cast<std::uint8_t>(11),
         WRITE_SPEC = static_cast<std::uint8_t>(12),
         VIEW_READ = static_cast<std::uint8_t>(13),
+        LEASE_REQUEST = static_cast<std::uint8_t>(14),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
 
@@ -68,6 +69,7 @@ public:
             case static_cast<std::uint8_t>(11): return FILTER;
             case static_cast<std::uint8_t>(12): return WRITE_SPEC;
             case static_cast<std::uint8_t>(13): return VIEW_READ;
+            case static_cast<std::uint8_t>(14): return LEASE_REQUEST;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
 
@@ -92,6 +94,7 @@ public:
             case FILTER: return "FILTER";
             case WRITE_SPEC: return "WRITE_SPEC";
             case VIEW_READ: return "VIEW_READ";
+            case LEASE_REQUEST: return "LEASE_REQUEST";
             case NULL_VALUE: return "NULL_VALUE";
         }
 

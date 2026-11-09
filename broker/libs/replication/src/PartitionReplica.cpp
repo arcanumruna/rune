@@ -10,6 +10,7 @@
 // the existing segment scanner.
 // ---------------------------------------------------------------------------
 
+#include <system_error>
 #include <type_traits>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/BatchPrefix.h>
@@ -698,6 +699,7 @@ bool PartitionReplica::isLeaseDataBatch(std::span<const uint8_t> batch) noexcept
 Offset PartitionReplica::appendLeaseBatch(std::span<const uint8_t> batch)
 {
     if (!acceptsProduce() || appendRefusedForTest_) return kAppendNotLeader;   // retriable (also while incomplete)
+    if (leaseAppendThrowForTest_) throw std::system_error(std::make_error_code(std::errc::no_space_on_device), "test: lease append");
     if (!isLeaseDataBatch(batch)) return kAppendInvalidBatch;
     ++rtAppends_;
     if (!committedIsrMeetsMinIsr_(true)) return kAppendMinIsr;   // lease records are always acks=all

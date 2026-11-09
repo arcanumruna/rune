@@ -69,6 +69,9 @@ public:
         GET_VIEW_ROW_K = static_cast<std::uint8_t>(33),
         SCAN_VIEW_ROWS = static_cast<std::uint8_t>(34),
         GET_STATS = static_cast<std::uint8_t>(35),
+        LEASE_KEEP_ALIVE = static_cast<std::uint8_t>(36),
+        LEASE_TIME_TO_LIVE = static_cast<std::uint8_t>(37),
+        SCAN_LEASES = static_cast<std::uint8_t>(38),
         TEST_TASK = static_cast<std::uint8_t>(200),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
@@ -113,6 +116,9 @@ public:
             case static_cast<std::uint8_t>(33): return GET_VIEW_ROW_K;
             case static_cast<std::uint8_t>(34): return SCAN_VIEW_ROWS;
             case static_cast<std::uint8_t>(35): return GET_STATS;
+            case static_cast<std::uint8_t>(36): return LEASE_KEEP_ALIVE;
+            case static_cast<std::uint8_t>(37): return LEASE_TIME_TO_LIVE;
+            case static_cast<std::uint8_t>(38): return SCAN_LEASES;
             case static_cast<std::uint8_t>(200): return TEST_TASK;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
@@ -160,6 +166,9 @@ public:
             case GET_VIEW_ROW_K: return "GET_VIEW_ROW_K";
             case SCAN_VIEW_ROWS: return "SCAN_VIEW_ROWS";
             case GET_STATS: return "GET_STATS";
+            case LEASE_KEEP_ALIVE: return "LEASE_KEEP_ALIVE";
+            case LEASE_TIME_TO_LIVE: return "LEASE_TIME_TO_LIVE";
+            case SCAN_LEASES: return "SCAN_LEASES";
             case TEST_TASK: return "TEST_TASK";
             case NULL_VALUE: return "NULL_VALUE";
         }

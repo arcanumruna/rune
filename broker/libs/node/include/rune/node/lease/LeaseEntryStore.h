@@ -20,6 +20,9 @@ inline constexpr uint32_t kLeaseEntryChunk = 4096;
 inline constexpr int64_t  kLeaseNoCheckpoint = INT64_MAX;   // checkpointNs when the key has no checkpoint schedule
 inline constexpr uint8_t  kLeaseUnlinked   = 0xFF;          // levelD / levelC of an entry that is not in that wheel
 inline constexpr std::size_t kLeaseEntryBytes = 48;
+/// LeaseEntry::pad bit 0: a keepalive is parked waiting for this key's Checkpoint(0) (or for the index gate to open before it can be
+/// appended); the rid is on the runtime's clear-pending ring (pushed at most once while the flag is set).  Task 11a.
+inline constexpr uint8_t  kLeaseClearWanted = 0x01;
 /// The largest maxKeys the store accepts: row ids are u32, kLeaseNil stays out of range, and roundUp (to a chunk) never wraps.
 inline constexpr uint32_t kLeaseMaxKeys = UINT32_MAX - 2 * kLeaseEntryChunk;
 
@@ -41,10 +44,10 @@ struct LeaseEntry {
     int64_t  inflightOffset = -1;   // emitOffset / ckptOffset / clearOffset (one at a time); -1 in Free / Armed
     uint32_t dPrev = kLeaseNil, dNext = kLeaseNil;   // deadline wheel links
     uint32_t cPrev = kLeaseNil, cNext = kLeaseNil;   // checkpoint wheel links
-    uint32_t parkHead = kLeaseNil;                   // Task 11's park table
+    uint32_t parkHead = kLeaseNil;                   // Task 11a: the head of this key's chain in the LeaseParkTable (newest first)
     uint8_t  levelD = kLeaseUnlinked, levelC = kLeaseUnlinked;   // 0..4 wheel level, 5 = ready list, 0xFF = unlinked
     LeaseEntryState state = LeaseEntryState::Free;
-    uint8_t  pad = 0;
+    uint8_t  pad = 0;                                // bit 0 = kLeaseClearWanted
 };
 static_assert(sizeof(LeaseEntry) == kLeaseEntryBytes, "the lease entry is exactly 48 bytes");
 static_assert(alignof(LeaseEntry) == 8);

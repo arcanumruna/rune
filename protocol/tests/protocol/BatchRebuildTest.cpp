@@ -216,3 +216,19 @@ TEST(BatchRebuildRegression, SpanOffsetDoesNotOverflowRegression) {
     ASSERT_TRUE(forEachRecordSpan(bytes.data(), bytes.size(), [&](const RecordSpan& r) { deltas.push_back(r.offsetDelta); }));
     EXPECT_EQ(deltas, (std::vector<int64_t>{0, 1, 2, 3}));
 }
+
+TEST(BatchRebuildRegression, BuiltRecordBytesMatchesBuilderRegression) {
+    for (const int64_t delta : {0, 1, 63, 64, 8191, 8192}) {
+        for (const std::size_t klen : {std::size_t{0}, std::size_t{1}, std::size_t{128}}) {
+            for (const std::size_t vlen : {std::size_t{0}, std::size_t{36}, std::size_t{127}, std::size_t{128}, std::size_t{16383},
+                                           std::size_t{16384}, std::size_t{65540}}) {
+                RecordBatchBuilder b(0, 0);
+                for (int64_t i = 0; i < delta; ++i) b.append("", "", 0);   // offsetDelta of the next record == delta
+                const std::string key(klen, 'k'), value(vlen, 'v');
+                const std::size_t before = b.bodyBytes();
+                b.append(key, value, 0);
+                EXPECT_EQ(b.bodyBytes() - before, builtRecordBytes(delta, klen, vlen)) << delta << "/" << klen << "/" << vlen;
+            }
+        }
+    }
+}

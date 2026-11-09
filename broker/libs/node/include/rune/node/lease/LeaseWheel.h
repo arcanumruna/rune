@@ -324,6 +324,9 @@ public:
     /// and one fold can add more grants than that.  False (nothing added) past the cap.
     [[nodiscard]] bool reserveFor(uint32_t rid) { return store_.reserveFor(rid); }
     void noteUse(uint32_t rid) noexcept { store_.noteUse(rid); }
+    /// The park chain head and the flag byte of an entry: the keepalive path's two mutable fields (Task 11a).  Not wheel state.
+    [[nodiscard]] uint32_t& parkHead(uint32_t rid) noexcept { return store_.at(rid).parkHead; }
+    [[nodiscard]] uint8_t& flags(uint32_t rid) noexcept { return store_.at(rid).pad; }
     [[nodiscard]] bool growOwed() const noexcept { return store_.growOwed(); }
     void growIfOwed() { store_.growIfOwed(); }   // cold
     [[nodiscard]] uint32_t capacity() const noexcept { return store_.capacity(); }

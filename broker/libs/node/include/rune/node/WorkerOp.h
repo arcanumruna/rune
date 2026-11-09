@@ -181,6 +181,13 @@ struct WorkerOp {
         // Checked writes Part 08: gateway → the partition leader's worker: the counters of a topic partition (recordCount =
         // StatsScope 1, topicId = the topic) or of a view partition (scope 2, topicId = the view).  No tail.  Not ownership-gated.
         GetStats                  = 35, ///< gateway → worker: the stats of one topic or view partition
+        // Lease topics Task 11a: gateway → the lease partition leader's worker.  topicId / partition / sessionId / correlationId as GetStats;
+        // not ownership-gated in the switch (the handlers check the replica themselves).  LeaseKeepAlive: recordCount = the entry count
+        // (1..256), leaseTail (TailKind LEASE_REQUEST) = the request's validated entries [keyLen u8][key][version i64 LE].
+        // LeaseTimeToLive: leaseTail = the key bytes.  ScanLeases (38) is served by Task 13 (reserved: the worker answers it nothing yet).
+        LeaseKeepAlive            = 36, ///< gateway → worker: keepalive entries of one lease partition
+        LeaseTimeToLive           = 37, ///< gateway → worker: the remaining time of one lease key
+        ScanLeases                = 38, ///< gateway → worker: a page of the lease rows (Task 13)
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -493,6 +500,10 @@ struct WorkerOp {
     // A view valid only for the synchronous tryEnqueueOp call, like filterBytes.
     std::span<const uint8_t> viewReadTail;
 
+    // Lease topics Task 11a: a LeaseKeepAlive op's raw validated entries / a LeaseTimeToLive op's key bytes, TailKind::LEASE_REQUEST.
+    // A view valid only for the synchronous tryEnqueueOp call.
+    std::span<const uint8_t> leaseTail;
+
     // Authentication Task 15: a PeerLinkKeys op's key material, [sendMaster 32][recvMaster 32] (the tail on the wire).
     // topicId = the peer node id, partition = the link epoch.
     static constexpr std::size_t kPeerKeysBytes = 64;
@@ -607,6 +618,14 @@ struct WorkerReturn {
         /// recordCount = stat entries, readTopicId / readPartition = the object, isolation = the StatsScope; the chunk is
         /// [count x 10 B][nConstraints u16][n x 12 B].
         StatsResult = 10,
+        /// Lease topics Task 11a: answers of a LeaseKeepAlive op (one return per decided group of entries, and one per parked entry once
+        /// answered).  errorCode = 0, recordCount = the entry count (1..256), lastOffset = final (0/1), sessionId / correlationId echoed;
+        /// the chunk is count x 12 bytes, each {index u16, code u16, ttlMs u64} little-endian - exactly the wire entry layout of
+        /// LeaseKeepAliveResponse.  A request-level refusal is one entry with index kLeaseWholeRequest (0xFFFF).
+        LeaseKeepAliveResult = 11,
+        /// Lease topics Task 11a: the answer to a LeaseTimeToLive op.  errorCode = the client code, baseOffset = remainingMs (-1 = none),
+        /// lastOffset = the lease version, sessionId / correlationId echoed; the chunk is 16 bytes {grantedTtlMs u64, holder u64} LE.
+        LeaseTimeToLiveResult = 12,
     };
 
     Type    type = Type::ProduceResult;

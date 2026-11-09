@@ -219,6 +219,49 @@ TEST(LeaseProtocolRegression, KeepAliveResponseRegression) {
     EXPECT_FALSE(rc::LeaseKeepAliveResponse::decode(f257.data(), f257.size()).has_value());
 }
 
+TEST(LeaseProtocolRegression, WholeRequestIndexRegression) {
+    EXPECT_EQ(rc::kLeaseWholeRequest, 0xFFFFu);
+    const rc::LeaseKeepAliveResponse::Entry e{rc::kLeaseWholeRequest, static_cast<uint16_t>(rc::ErrorCode::NotLeader), 77};
+    rc::LeaseKeepAliveResponse m;
+    m.sessionId = 3; m.correlationId = 4; m.final = 1;
+    m.entries = std::span<const rc::LeaseKeepAliveResponse::Entry>(&e, 1);
+    const Bytes f = encodeVec(m);
+    const auto d = rc::LeaseKeepAliveResponse::decode(f.data(), f.size());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->final, 1);
+    ASSERT_EQ(d->count, 1);
+    std::size_t seen = 0;
+    d->forEachEntry([&](uint16_t idx, uint16_t code, uint64_t ttl) {
+        EXPECT_EQ(idx, 0xFFFF);
+        EXPECT_EQ(code, static_cast<uint16_t>(rc::ErrorCode::NotLeader));
+        EXPECT_EQ(ttl, 77u);
+        ++seen;
+    });
+    EXPECT_EQ(seen, 1u);
+}
+
+TEST(LeaseProtocolRegression, ForEachEntryOverRawBytesRegression) {
+    const std::vector<Bytes> keys{keyOf(1, 3), keyOf(17, 5), keyOf(128, 9)};
+    const Bytes f = keepAliveFrame(keys);
+    const auto d = rc::LeaseKeepAlive::decode(f.data(), f.size());
+    ASSERT_TRUE(d.has_value());
+    std::vector<std::pair<Bytes, int64_t>> viaMember, viaRaw;
+    d->forEachEntry([&](uint16_t i, std::span<const uint8_t> k, int64_t v) {
+        EXPECT_EQ(i, viaMember.size());
+        viaMember.push_back({Bytes(k.begin(), k.end()), v});
+    });
+    rc::forEachLeaseKeepAliveEntry(d->entryBytes, d->count, [&](uint16_t i, std::span<const uint8_t> k, int64_t v) {
+        EXPECT_EQ(i, viaRaw.size());
+        viaRaw.push_back({Bytes(k.begin(), k.end()), v});
+    });
+    ASSERT_EQ(viaRaw.size(), 3u);
+    EXPECT_EQ(viaRaw, viaMember);
+    for (std::size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(viaRaw[i].first, keys[i]);
+        EXPECT_EQ(viaRaw[i].second, static_cast<int64_t>(i) + 1);
+    }
+}
+
 TEST(LeaseProtocolRegression, TimeToLiveRoundTripRegression) {
     for (const std::size_t klen : {std::size_t{0}, std::size_t{128}}) {
         const Bytes k = keyOf(klen);

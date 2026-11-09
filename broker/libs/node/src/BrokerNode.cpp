@@ -1701,6 +1701,8 @@ void BrokerNode::buildWorkerPool() {
         workerPool_->worker(i).setDesiredFragmentLimit(config_.gatewayFragmentLimit);
         workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
         workerPool_->worker(i).setVerdictIntervalNs(config_.verdictIntervalMs * 1'000'000LL);
+        // Lease topics Task 11a: a promoted lease key is granted the leader heartbeat timeout (Election: max(electionTimeout, 3 x statusInterval)).
+        workerPool_->worker(i).setLeaseExtendNs(std::max(config_.electionTimeoutMs, 3 * config_.electionStatusIntervalMs) * 1'000'000LL);
         workerPool_->worker(i).setBackgroundSyncIntervalNs(config_.workerSyncIntervalMs * 1'000'000LL);
         if (!config_.ioWorkerCpus.empty()) workerPool_->worker(i).setIoWorkerCpus(config_.ioWorkerCpus);
         workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);

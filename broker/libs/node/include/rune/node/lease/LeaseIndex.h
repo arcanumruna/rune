@@ -136,6 +136,10 @@ struct LeaseRowState {
 [[nodiscard]] int64_t leaseRowVersion(const uint8_t* row, const rune::view::RowLayout& layout) noexcept;
 /// The lease_ttl_ms slot of a lease row image.
 [[nodiscard]] uint64_t leaseRowTtl(const uint8_t* row, const rune::view::RowLayout& layout) noexcept;
+/// The lease_remaining_ms slot of a lease row image (a checkpointed key's remaining time; 0 = none).
+[[nodiscard]] uint64_t leaseRowRemaining(const uint8_t* row, const rune::view::RowLayout& layout) noexcept;
+/// The lease_holder slot of a lease row image.
+[[nodiscard]] uint64_t leaseRowHolder(const uint8_t* row, const rune::view::RowLayout& layout) noexcept;
 /// The record's lease_version (value bytes [4,12), little-endian); 0 for a value too short to carry one.
 [[nodiscard]] int64_t leaseRecordVersion(std::string_view value) noexcept;
 /// A lease record's `lease_ttl_ms` (value bytes [12, 20), little-endian); 0 for a value too short to carry it.

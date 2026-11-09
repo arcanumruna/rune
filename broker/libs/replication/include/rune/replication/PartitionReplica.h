@@ -560,6 +560,8 @@ public:
     [[nodiscard]] int64_t followerStorageForTest(NodeId n) const noexcept { return slotStorage_(n); }   // ISR v3 Step 6
     /// TEST ONLY (ISR v3 Step 7): append() refuses (kAppendNotLeader) while set - a leader whose append is refused.
     void setAppendRefusedForTest(bool on) noexcept { appendRefusedForTest_ = on; }
+    /// TEST ONLY (lease topics Task 11a): appendLeaseBatch throws std::system_error while set - a failed storage under the broker's own append.
+    void setLeaseAppendThrowForTest(bool on) noexcept { leaseAppendThrowForTest_ = on; }
     /// TEST ONLY (ISR v3 Step 9, B-I8): emit no follower fetch / ack until the steady clock reaches `deadlineNs`.
     void holdFetchesUntilForTest(int64_t deadlineNs) noexcept { fetchHoldUntilNs_ = deadlineNs; }
     /// TEST SEAM (CP2 C1-R): ignore inbound internal-ISR proposals until this steady-clock time (a dead link from the leader).
@@ -1921,6 +1923,7 @@ private:
     int64_t proposalSeq_ = 0;                  ///< never reset; id = ++proposalSeq_
     int64_t storageId_ = 0;                    ///< this node's storage id (setStorageId)
     bool    appendRefusedForTest_ = false;     ///< setAppendRefusedForTest
+    bool    leaseAppendThrowForTest_ = false;  ///< setLeaseAppendThrowForTest
     int64_t dropInternalIsrUntilNs_ = 0;       ///< dropInternalIsrUntilForTest (0 = off)
     int64_t fetchHoldUntilNs_ = 0;             ///< holdFetchesUntilForTest (steady-clock ns, 0 = off)
     uint64_t olderSendAnswers_ = 0;            ///< answers to an older send of the pending proposal

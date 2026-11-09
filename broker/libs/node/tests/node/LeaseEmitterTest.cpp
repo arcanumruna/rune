@@ -518,7 +518,7 @@ TEST(LeaseEmitterRegression, ByteCapSplitsBatchRegression) {
     ASSERT_TRUE(e.produce(recs));
     ASSERT_TRUE(r.driveUntilJudged());
     ASSERT_TRUE(e.waitRuntime());
-    constexpr std::size_t kCap = 900;   // 61 header + 10 x 75 bytes of record fit, an 11th does not
+    constexpr std::size_t kCap = 850;   // exact sizes (Task 11a): 61 header + 10 x 75 = 811 fit, 11 x 75 = 886 do not (900 fit eleven)
     r.worker->setLeaseBatchCapForTest(kCap);
     e.advanceMs(5000 + 1);
     const int64_t before = r.leo();
@@ -644,4 +644,74 @@ TEST(LeaseEmitterAllocRegression, EmitterNoAllocRegression) {
     }
     EXPECT_EQ(expires(r).size(), 301u);
     EXPECT_EQ(allocs, 0u);
+}
+
+// 15. A record bigger than the namespace's batch cap does not stall the emitter (Task 11a addendum A): the first record of a batch is
+// accepted when it fits the hard cap, so the due keys behind it still expire.  Each goes out alone (every record is over the cap).
+// Mutation: a "full" flag set when the record is over the cap with nothing in the batch yet stalls the loop at n == 0: red.
+TEST(LeaseEmitterRegression, OversizedRecordDoesNotStallRegression) {
+    Em e;
+    VerdictRig& r = e.r;
+    ASSERT_TRUE(e.produce({grantRec(1), grantRec(2), grantRec(3), grantRec(4), grantRec(5), grantRec(6)}));
+    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_TRUE(e.waitRuntime());
+    constexpr uint16_t kSlot = 3;
+    constexpr uint32_t kNs = 77;
+    rune::protocol::NamespaceLimits limits;
+    limits.maxBatchBytes = 100;   // below one encoded Expire batch (the 61-byte overhead plus a ~75-byte record)
+    r.worker->applyNsSlotAssignDirect(kSlot, kNs, limits);
+    r.log->setNsTag(kNs, kSlot);
+    const int64_t leoBefore = r.leo();
+    e.advanceMs(5000 + 1);
+    for (int i = 0; i < 40 && expires(r).size() < 6; ++i) r.pass();
+    EXPECT_EQ(expires(r).size(), 6u) << "all six expired";
+    const auto batches = storedBatches(r, leoBefore);
+    ASSERT_FALSE(batches.empty());
+    EXPECT_EQ(batches[0].recs.size(), 1u) << "the first record goes out alone";
+    for (const auto& b : batches) EXPECT_EQ(b.recs.size(), 1u) << "every record is over the cap: one per batch";
+    EXPECT_GE(e.st().oversizedDeferred + e.st().expiriesAppended, 6u);
+}
+
+// 15b. Rows over the HARD cap (min(1 MiB, the worker's intake limit)).  Every Expire of one emit is re-encoded at the same latest writer
+// and lease keys are fixed-width, so the records of one cycle all have the same size: over the hard cap means every row is.  They are
+// counted (oversizedDeferred), stay Armed and linked, nothing is appended, and they all expire once the cap admits them.
+TEST(LeaseEmitterRegression, OverHardCapRowsWaitAndRecoverRegression) {
+    Em e;
+    VerdictRig& r = e.r;
+    ASSERT_TRUE(e.produce({grantRec(1), grantRec(2), grantRec(3)}));
+    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_TRUE(e.waitRuntime());
+    r.worker->setMaxBatchBytes(100);   // below one Expire batch (61 + ~75)
+    e.advanceMs(5000 + 1);
+    r.passes(5);
+    EXPECT_TRUE(expires(r).empty());
+    EXPECT_GE(e.st().oversizedDeferred, 3u);
+    for (uint64_t k = 1; k <= 3; ++k) {
+        EXPECT_EQ(e.entry(k).state, LeaseEntryState::Armed);
+        EXPECT_TRUE(e.linked(k));
+    }
+    r.worker->setMaxBatchBytes(64u << 10);
+    for (int i = 0; i < 40 && expires(r).size() < 3; ++i) r.pass();
+    EXPECT_EQ(expires(r).size(), 3u);
+}
+
+// 16. A throwing append (a failed storage) is a refusal, never a terminate (Task 11a addendum B): the entry stays Armed and linked,
+// the error is counted, and the key expires once the append works again.
+TEST(LeaseEmitterRegression, AppendThrowDoesNotTerminateRegression) {
+    Em e;
+    VerdictRig& r = e.r;
+    ASSERT_TRUE(e.produce({grantRec(1)}));
+    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_TRUE(e.waitRuntime());
+    e.advanceMs(5000 + 1);
+    r.replica->setLeaseAppendThrowForTest(true);
+    r.passes(3);   // a throw out of a noexcept frame would terminate the test binary here
+    EXPECT_TRUE(expires(r).empty());
+    EXPECT_GE(e.st().appendErrors, 1u);
+    EXPECT_EQ(e.entry(1).state, LeaseEntryState::Armed);
+    EXPECT_TRUE(e.linked(1));
+    r.replica->setLeaseAppendThrowForTest(false);
+    r.pass();
+    EXPECT_EQ(expires(r).size(), 1u);
+    EXPECT_EQ(e.entry(1).state, LeaseEntryState::Emitting);
 }

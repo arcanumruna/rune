@@ -508,6 +508,8 @@ public:
             if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
             else if (r.type == WorkerReturn::Type::ViewRowResult || r.type == WorkerReturn::Type::ViewScanResult) viewAnswers_.push_back(std::move(r));
             else if (r.type == WorkerReturn::Type::StatsResult) statsAnswers_.push_back(std::move(r));
+            else if (r.type == WorkerReturn::Type::LeaseKeepAliveResult) leaseKaAnswers.push_back(std::move(r));
+            else if (r.type == WorkerReturn::Type::LeaseTimeToLiveResult) leaseTtlAnswers.push_back(std::move(r));
         }, [](const TxnReturn&) {});
         if (agent) { if (!pauseAgent) (void)agent->doWork(now); }
         else channel.deltas.drain([this](int32_t, aeron::concurrent::AtomicBuffer& buf, OneToOneByteRing::index_t off, OneToOneByteRing::index_t) {
@@ -759,6 +761,8 @@ public:
                 worker->drainReturn([&](WorkerReturn r) {
                     if (r.type == WorkerReturn::Type::PushReadResult) { chunk.assign(r.chunkBytes().begin(), r.chunkBytes().end()); next = r.newNextOffset; }
                     if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
+                    if (r.type == WorkerReturn::Type::LeaseKeepAliveResult) leaseKaAnswers.push_back(std::move(r));
+                    if (r.type == WorkerReturn::Type::LeaseTimeToLiveResult) leaseTtlAnswers.push_back(std::move(r));
                 }, [](const TxnReturn&) {});
                 absorb_(box, chunk.data(), chunk.size());
                 cursors_[subId] = next;
@@ -1059,6 +1063,8 @@ public:
     std::unique_ptr<Worker> worker;
     int64_t now = 0, corr = 0;
     std::vector<int16_t> produceAnswers;
+    std::vector<WorkerReturn> leaseKaAnswers, leaseTtlAnswers;   ///< lease topics Task 11a: the LeaseKeepAlive / LeaseTimeToLive returns the passes drained
+
     std::vector<int32_t> deltaViewIds;   ///< the view topic of every checkpoint frame the worker pushed (only without a persisted view's agent)
 
 private:

@@ -33,6 +33,25 @@ inline constexpr std::size_t kLeaseKeepAliveMaxEntries = 256;
 inline constexpr std::size_t kScanLeasesMaxRows        = 1024;
 inline constexpr std::size_t kScanLeasesMaxPrefixBytes = 127;
 
+/// A LeaseKeepAliveResponse entry with this index answers EVERY entry of the request with its code (a request-level refusal:
+/// NotLeader, Throttled, UnknownTopic, NotAuthorized, InvalidRequest, NamespaceSuspended); it is always the only entry and
+/// final = 1. For Throttled, ttlMs is the retry-after in ms (ceil).
+inline constexpr uint16_t kLeaseWholeRequest = 0xFFFF;
+
+/// Walks `count` already-validated LeaseKeepAlive entries (keyLen u8, key, version i64) in raw bytes: fn(index, key, version).
+template <class Fn>
+inline void forEachLeaseKeepAliveEntry(std::span<const uint8_t> entryBytes, uint16_t count, Fn&& fn) noexcept {
+    const uint8_t* p = entryBytes.data();
+    for (uint16_t i = 0; i < count; ++i) {
+        const std::size_t klen = *p++;
+        const std::span<const uint8_t> key(p, klen);
+        p += klen;
+        const int64_t version = detail::getLE64(p, 0);
+        p += 8;
+        fn(i, key, version);
+    }
+}
+
 namespace lease_wire {
 
 inline void putHeader(uint8_t* buf, uint16_t blockLength, uint16_t templateId, int64_t sessionId,
@@ -135,17 +154,7 @@ struct LeaseKeepAlive {
     }
     /// Visit the entries of a decoded message: fn(index, key, version).
     template <class Fn>
-    void forEachEntry(Fn&& fn) const noexcept {
-        const uint8_t* p = entryBytes.data();
-        for (uint16_t i = 0; i < count; ++i) {
-            const std::size_t klen = *p++;
-            const std::span<const uint8_t> key(p, klen);
-            p += klen;
-            const int64_t version = detail::getLE64(p, 0);
-            p += 8;
-            fn(i, key, version);
-        }
-    }
+    void forEachEntry(Fn&& fn) const noexcept { forEachLeaseKeepAliveEntry(entryBytes, count, fn); }
 };
 
 // ---------------------------------------------------------------------------

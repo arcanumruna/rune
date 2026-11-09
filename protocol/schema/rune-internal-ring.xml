@@ -142,6 +142,12 @@
            scope 1) or of a view partition (scope 2).  topicId = the topic / view, partition; no tail.  Answered with
            STATS_RESULT. -->
       <validValue name="GET_STATS">35</validValue>
+      <!-- Lease topics Task 11a: gateway -> the lease partition leader's worker.  LEASE_KEEP_ALIVE: recordCount = the entry count, tail
+           (TailKind = LEASE_REQUEST) = the request's validated entries [keyLen u8][key][version i64]; LEASE_TIME_TO_LIVE: tail =
+           the key bytes.  SCAN_LEASES is reserved (served by Task 13).  Answered with LEASE_KEEP_ALIVE_RESULT / LEASE_TIME_TO_LIVE_RESULT. -->
+      <validValue name="LEASE_KEEP_ALIVE">36</validValue>
+      <validValue name="LEASE_TIME_TO_LIVE">37</validValue>
+      <validValue name="SCAN_LEASES">38</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -175,6 +181,8 @@
       <validValue name="WRITE_SPEC">12</validValue>
       <!-- Checked writes Part 07: a GET_VIEW_ROW_K / SCAN_VIEW_ROWS op's key-or-prefix and page token. -->
       <validValue name="VIEW_READ">13</validValue>
+      <!-- Lease topics Task 11a: a LEASE_KEEP_ALIVE op's raw validated entries / a LEASE_TIME_TO_LIVE op's key bytes. -->
+      <validValue name="LEASE_REQUEST">14</validValue>
     </enum>
 
     <!-- WorkerReturn::Type -->
@@ -219,6 +227,11 @@
       <!-- Checked writes Part 08: the answer to a GET_STATS op.  errorCode = StatsResponse status, recordCount = stat
            entries; the chunk is [count x 10 B][nConstraints u16][n x 12 B]. -->
       <validValue name="STATS_RESULT">10</validValue>
+      <!-- Lease topics Task 11a: LEASE_KEEP_ALIVE_RESULT: recordCount = entry count, lastOffset = final, chunk = count x
+           {index u16, code u16, ttlMs u64} LE.  LEASE_TIME_TO_LIVE_RESULT: errorCode = code, baseOffset = remainingMs (-1 none),
+           lastOffset = version, chunk = {grantedTtlMs u64, holder u64} LE. -->
+      <validValue name="LEASE_KEEP_ALIVE_RESULT">11</validValue>
+      <validValue name="LEASE_TIME_TO_LIVE_RESULT">12</validValue>
     </enum>
 
     <!-- F15: TxnReturn::kind -->

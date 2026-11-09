@@ -227,6 +227,8 @@ int64_t leaseRowVersion(const uint8_t* row, const rune::view::RowLayout& layout)
 }
 
 uint64_t leaseRowTtl(const uint8_t* row, const rune::view::RowLayout& layout) noexcept { return slotU64(row, layout, kLeaseTtlSlot); }
+uint64_t leaseRowRemaining(const uint8_t* row, const rune::view::RowLayout& layout) noexcept { return slotU64(row, layout, kLeaseRemainingSlot); }
+uint64_t leaseRowHolder(const uint8_t* row, const rune::view::RowLayout& layout) noexcept { return slotU64(row, layout, kLeaseHolderSlot); }
 
 int64_t leaseRecordVersion(std::string_view value) noexcept {
     if (value.size() < lr::kLeaseVersionValueOffset + 8) return 0;

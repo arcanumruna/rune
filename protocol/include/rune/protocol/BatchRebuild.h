@@ -159,6 +159,14 @@ inline std::size_t replacedRecordBytes(std::span<const uint8_t> src, const Recor
     return detail::varintSize(newBody) + static_cast<std::size_t>(newBody);
 }
 
+/// The exact bytes RecordBatchBuilder::append writes for a record with timestampDelta 0 and no headers (attributes byte,
+/// tsDelta, offsetDelta, keyLen, key, valueLen, value, header count 0; the whole prefixed by the body-length varint).
+inline std::size_t builtRecordBytes(int64_t offsetDelta, std::size_t keyLen, std::size_t valueLen) noexcept {
+    const std::size_t body = 1 + detail::varintSize(0) + detail::varintSize(offsetDelta) + detail::varintSize(static_cast<int64_t>(keyLen)) +
+                             keyLen + detail::varintSize(static_cast<int64_t>(valueLen)) + valueLen + detail::varintSize(0);
+    return detail::varintSize(static_cast<int64_t>(body)) + body;
+}
+
 /// Rebuild `src` with some records' VALUES replaced (every record kept, offsets unchanged).  `records` are the spans
 /// forEachRecordSpan produced for `src`; `replacementFor(i)` (called once per record, in order) returns the new value of record
 /// i, or an empty span to copy the record verbatim.  A replaced record gets its value-length and record-length varints

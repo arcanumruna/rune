@@ -392,9 +392,17 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     EXPECT_EQ(sbe::ReturnType::get(9), sbe::ReturnType::Value::VIEW_SCAN_RESULT);
     EXPECT_EQ(sbe::ReturnType::get(10), sbe::ReturnType::Value::STATS_RESULT);
     EXPECT_EQ(sbe::TailKind::get(13), sbe::TailKind::Value::VIEW_READ);
-    EXPECT_THROW((void)sbe::OpType::get(36), std::runtime_error);
-    EXPECT_THROW((void)sbe::ReturnType::get(11), std::runtime_error);
-    EXPECT_THROW((void)sbe::TailKind::get(14), std::runtime_error);
+    // Lease topics Task 11a: keepalive / TimeToLive / ScanLeases (ops 36-38, returns 11-12, tail 14), appended.
+    EXPECT_EQ(sbe::OpType::get(36), sbe::OpType::Value::LEASE_KEEP_ALIVE);
+    EXPECT_EQ(sbe::OpType::get(37), sbe::OpType::Value::LEASE_TIME_TO_LIVE);
+    EXPECT_EQ(sbe::OpType::get(38), sbe::OpType::Value::SCAN_LEASES);
+    EXPECT_EQ(sbe::ReturnType::get(11), sbe::ReturnType::Value::LEASE_KEEP_ALIVE_RESULT);
+    EXPECT_EQ(sbe::ReturnType::get(12), sbe::ReturnType::Value::LEASE_TIME_TO_LIVE_RESULT);
+    EXPECT_EQ(sbe::TailKind::get(14), sbe::TailKind::Value::LEASE_REQUEST);
+    EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::LEASE_KEEP_ALIVE), "LEASE_KEEP_ALIVE");
+    EXPECT_THROW((void)sbe::OpType::get(39), std::runtime_error);
+    EXPECT_THROW((void)sbe::ReturnType::get(13), std::runtime_error);
+    EXPECT_THROW((void)sbe::TailKind::get(15), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------

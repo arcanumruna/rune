@@ -4,10 +4,15 @@
 #include <rune/node/lease/LeaseIndex.h>
 #include <rune/protocol/BatchRebuild.h>
 #include <rune/protocol/LeaseRecord.h>
+#include <rune/protocol/client/Protocol.h>
 #include <rune/replication/PartitionReplica.h>
+
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cassert>
+#include <cstring>
+#include <exception>
 #include <string_view>
 
 namespace rune::node::lease {
@@ -15,14 +20,37 @@ namespace rune::node::lease {
 namespace {
 using rune::replication::PartitionReplica;
 
-/// Steps the state machine for `rid` and applies the next state.  The action is ignored here: Task 11 wires the park / answer actions.
-inline LeaseEntryState step(LeaseTimers& timers, uint32_t rid, LeaseEntryEvent event) noexcept {
-    const LeaseEntry& e = timers.entry(rid);
-    const LeaseStepOut out = leaseStep({e.state, event, /*gateOpen=*/false, /*due=*/false, /*remainingPositive=*/false});
-    // Task 11: out.action (Park / RearmAnswerOk / ReturnArmedReplayParked / ReturnArmedAnswerParkedOk / FreeAnswerParkedNotFound /
-    // DiscardAnswerParkedNotLeader / ReplayParked) is performed by the keepalive path; Task 10 applies the state only.
-    if (out.next != e.state) timers.setState(rid, out.next);
-    return out.next;
+constexpr uint16_t kCodeLeaseNotFound = static_cast<uint16_t>(rune::protocol::client::ErrorCode::LeaseNotFound);
+constexpr uint16_t kCodeThrottled     = static_cast<uint16_t>(rune::protocol::client::ErrorCode::Throttled);
+constexpr uint16_t kCodeNotLeader     = static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader);
+
+/// A storage failure surfaced by appendLeaseBatch (it throws): handled as a refusal of the whole batch.
+constexpr int64_t kAppendThrew = INT64_MIN;
+
+enum class Fit : uint8_t { Ok, Full, Oversized };
+/// Whether the record (key, value of `len` bytes) as record number `n` of the batch under construction fits.  EXACT sizes
+/// (builtRecordBytes), never a worst case: a lone record over `byteCap` still goes out when it fits `hardCap`.
+[[nodiscard]] inline Fit fitRecord(const rune::protocol::RecordBatchBuilder& b, uint32_t n, std::size_t keyLen, std::size_t len, std::size_t byteCap,
+                                   std::size_t hardCap) noexcept {
+    const std::size_t rec = rune::protocol::builtRecordBytes(static_cast<int64_t>(n), keyLen, len);
+    const std::size_t ovh = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+    if (b.bodyBytes() + rec + ovh <= byteCap) return Fit::Ok;
+    if (n > 0) return Fit::Full;
+    return ovh + rec <= hardCap ? Fit::Ok : Fit::Oversized;
+}
+
+/// appendLeaseBatch, with a throw turned into kAppendThrew.
+[[nodiscard]] inline int64_t appendBatch(PartitionReplica& replica, std::span<const uint8_t> batch, LeaseRuntimeStats& stats, const char* what) {
+    try {
+        return replica.appendLeaseBatch(batch);
+    } catch (const std::exception& ex) {
+        ++stats.appendErrors;
+        if ((stats.appendErrors & (stats.appendErrors - 1)) == 0) spdlog::warn("lease runtime: {} append threw: {} (error {})", what, ex.what(), stats.appendErrors);
+    } catch (...) {
+        ++stats.appendErrors;
+        if ((stats.appendErrors & (stats.appendErrors - 1)) == 0) spdlog::warn("lease runtime: {} append threw (error {})", what, stats.appendErrors);
+    }
+    return kAppendThrew;
 }
 
 [[nodiscard]] inline bool inflight(LeaseEntryState s) noexcept {
@@ -30,7 +58,92 @@ inline LeaseEntryState step(LeaseTimers& timers, uint32_t rid, LeaseEntryEvent e
 }
 }  // namespace
 
-void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNowNs) noexcept {
+void LeaseRuntime::flagClear_(uint32_t rid) noexcept {
+    uint8_t& f = timers_.flags(rid);
+    if ((f & kLeaseClearWanted) != 0) return;
+    assert(clearTail_ - clearHead_ < kClearRingCap && "the clear ring is bounded by the rids with parks");
+    if (clearTail_ - clearHead_ >= kClearRingCap) return;   // unreachable: at most one entry per rid, and only rids with parks are pushed
+    f = static_cast<uint8_t>(f | kLeaseClearWanted);
+    clearRing_[clearTail_ % kClearRingCap] = rid;
+    ++clearTail_;
+}
+
+LeaseRuntime::KaStep LeaseRuntime::kaStep_(uint32_t rid, int64_t leaseNowNs, bool remainingPositive, uint64_t ttlMs, bool gateOpen) noexcept {
+    const LeaseEntry& e = timers_.entry(rid);
+    const bool due      = e.deadlineNs <= leaseNowNs;
+    const LeaseStepOut out = leaseStep({e.state, LeaseEntryEvent::Keepalive, gateOpen, due, remainingPositive});
+    switch (out.action) {
+        case LeaseAction::RearmAnswerOk:
+            timers_.rearm(rid, satAdd(leaseNowNs, msToNsSat(ttlMs)));
+            return {false, false, 0, ttlMs};
+        case LeaseAction::AppendClear:   // the entry stays Armed: flushClears appends the Checkpoint(0)
+            return {true, true, 0, 0};
+        case LeaseAction::Park:
+            // Armed and not due can only mean the gate is closed with remaining > 0: the clear path waits for it
+            return {true, e.state == LeaseEntryState::Armed && !due, 0, 0};
+        case LeaseAction::None:
+        case LeaseAction::Link:
+        case LeaseAction::AppendExpire:
+        case LeaseAction::AppendCheckpoint:
+        case LeaseAction::ReturnArmedReplayParked:
+        case LeaseAction::ReturnArmedAnswerParkedOk:
+        case LeaseAction::FreeAnswerParkedNotFound:
+        case LeaseAction::DiscardAnswerParkedNotLeader:
+        case LeaseAction::ReplayParked: break;
+    }
+    assert(false && "a Keepalive step produced an action the keepalive path does not own");
+    return {false, false, kCodeLeaseNotFound, 0};
+}
+
+void LeaseRuntime::replay_(uint32_t rid, int64_t leaseNowNs, bool remainingPositive, uint64_t ttlMs, LeaseParkTable& parks) noexcept {
+    uint32_t& head = timers_.parkHead(rid);
+    if (head == kLeaseNil) return;
+    // The gate is not consulted here: AppendClear and a gate-closed Park both leave the slot parked with the clear flag set, and
+    // flushClears re-checks the gate before it appends.
+    parks.forEachInChain(head, [&](uint32_t slot, const LeaseParkSlot&) {
+        const KaStep st = kaStep_(rid, leaseNowNs, remainingPositive, ttlMs, /*gateOpen=*/true);
+        if (!st.park) parks.answerOne(head, slot, st.code, st.ttlMs);
+        else if (st.wantFlag) flagClear_(rid);   // a replay never takes a new slot and never answers Throttled
+    });
+}
+
+void LeaseRuntime::foldStep_(uint32_t rid, LeaseEntryEvent event, const LeaseEvent& ev, int64_t leaseNowNs, LeaseParkTable& parks) noexcept {
+    const LeaseEntry& e = timers_.entry(rid);
+    const LeaseEntryState from = e.state;
+    const LeaseStepOut out = leaseStep({from, event, /*gateOpen=*/true, e.deadlineNs <= leaseNowNs, ev.remainingMs > 0});
+    switch (out.action) {
+        case LeaseAction::None:
+            if (out.next != from) timers_.setState(rid, out.next);
+            return;
+        case LeaseAction::ReturnArmedAnswerParkedOk:   // Clearing: its own Checkpoint(0) folded
+            timers_.setState(rid, out.next);
+            timers_.rearm(rid, satAdd(leaseNowNs, msToNsSat(ev.ttlMs)));
+            parks.answerChain(timers_.parkHead(rid), 0, ev.ttlMs);
+            return;
+        case LeaseAction::FreeAnswerParkedNotFound:    // the key ended (its Expire folded, or a revoke): answered BEFORE Free resets the entry
+            parks.answerChain(timers_.parkHead(rid), kCodeLeaseNotFound, 0);
+            timers_.setState(rid, out.next);
+            return;
+        case LeaseAction::ReturnArmedReplayParked:
+        case LeaseAction::ReplayParked:
+            if (out.next != from) timers_.setState(rid, out.next);
+            // A BrokerRejected event carries no row values: treat the remaining time as positive, so every non-due keepalive takes the
+            // clear path, where flushClears reads the row (remaining 0: Ok at once; else it appends the Checkpoint(0)).
+            if (event == LeaseEntryEvent::OwnRecordRejected) replay_(rid, leaseNowNs, /*remainingPositive=*/true, 0, parks);
+            else replay_(rid, leaseNowNs, ev.remainingMs > 0, ev.ttlMs, parks);
+            return;
+        case LeaseAction::DiscardAnswerParkedNotLeader:
+        case LeaseAction::Link:
+        case LeaseAction::AppendExpire:
+        case LeaseAction::AppendCheckpoint:
+        case LeaseAction::AppendClear:
+        case LeaseAction::Park:
+        case LeaseAction::RearmAnswerOk: break;
+    }
+    assert(false && "a fold event produced an action only the keepalive path or a demotion owns");
+}
+
+void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNowNs, LeaseParkTable& parks) noexcept {
     for (const LeaseEvent& ev : events) {
         const uint32_t rid = ev.rid;
         if (ev.kind == LeaseEventKind::Granted) {
@@ -41,6 +154,7 @@ void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNow
             if (timers_.entry(rid).state != LeaseEntryState::Free) {
                 assert(false && "a Granted event found its entry armed or in flight");
                 ++stats_.grantNotFree;
+                parks.answerChain(timers_.parkHead(rid), kCodeLeaseNotFound, 0);
                 timers_.setState(rid, LeaseEntryState::Free);
             }
             timers_.noteUse(rid);
@@ -54,7 +168,9 @@ void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNow
             const LeaseEntry& e = timers_.entry(rid);
             if (inflight(e.state) && e.inflightOffset == ev.offset) {
                 // Back to Armed at the stored deadline (relinked: past due means due on the next poll, rebuilt from the current row).
-                if (step(timers_, rid, LeaseEntryEvent::OwnRecordRejected) == LeaseEntryState::Armed) ++stats_.ownRecordRejected;
+                const bool wasArmed = e.state == LeaseEntryState::Armed;
+                foldStep_(rid, LeaseEntryEvent::OwnRecordRejected, ev, leaseNowNs, parks);
+                if (!wasArmed && timers_.entry(rid).state == LeaseEntryState::Armed) ++stats_.ownRecordRejected;
             }
             continue;   // otherwise a stale record of another leadership
         }
@@ -62,15 +178,15 @@ void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNow
         const LeaseEntry& e = timers_.entry(rid);
         switch (ev.kind) {
             case LeaseEventKind::Updated:
-                step(timers_, rid, LeaseEntryEvent::OtherUpdateFolds);
+                foldStep_(rid, LeaseEntryEvent::OtherUpdateFolds, ev, leaseNowNs, parks);
                 break;
             case LeaseEventKind::Checkpointed:
-                // Task 12 adds the checkpoint re-arming; here only the state is applied.
-                step(timers_, rid, e.inflightOffset == ev.offset ? LeaseEntryEvent::OwnRecordFolds : LeaseEntryEvent::OtherUpdateFolds);
+                // Task 12 adds the checkpoint re-arming.
+                foldStep_(rid, e.inflightOffset == ev.offset ? LeaseEntryEvent::OwnRecordFolds : LeaseEntryEvent::OtherUpdateFolds, ev, leaseNowNs, parks);
                 break;
             case LeaseEventKind::Ended:
-                step(timers_, rid, e.state == LeaseEntryState::Emitting && e.inflightOffset == ev.offset ? LeaseEntryEvent::OwnRecordFolds
-                                                                                                          : LeaseEntryEvent::EndFolds);
+                foldStep_(rid, e.state == LeaseEntryState::Emitting && e.inflightOffset == ev.offset ? LeaseEntryEvent::OwnRecordFolds
+                                                                                                    : LeaseEntryEvent::EndFolds, ev, leaseNowNs, parks);
                 break;
             case LeaseEventKind::Granted:
             case LeaseEventKind::BrokerRejected: break;   // handled above
@@ -79,8 +195,47 @@ void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNow
     if (timers_.growOwed()) timers_.growIfOwed();   // cold, once per cycle
 }
 
+LeaseKaOutcome LeaseRuntime::keepAlive(const LeaseIndexRef& ref, std::span<const uint8_t> key, int64_t version, int64_t judgedThrough,
+                                       int64_t leaseNowNs, LeaseParkTable& parks, uint32_t& req, int64_t sessionId, int64_t correlationId,
+                                       uint16_t index, bool owedRoom) {
+    if (ref.table == nullptr || ref.layout == nullptr || key.size() != ref.table->keyWidth()) return {false, kCodeLeaseNotFound, 0};   // a wrong-width key is no key
+    uint32_t rid = 0;
+    const uint8_t* const row = ref.table->find(rune::view::ViewKey::fromBytes(key), rid);
+    if (row == nullptr || leaseRowVersion(row, *ref.layout) != version) return {false, kCodeLeaseNotFound, 0};
+    if (!timers_.covers(rid) && !timers_.reserveFor(rid)) return {false, kCodeThrottled, 1};   // cold growth
+    const uint64_t ttl       = leaseRowTtl(row, *ref.layout);
+    const uint64_t remaining = leaseRowRemaining(row, *ref.layout);
+    if (timers_.entry(rid).state == LeaseEntryState::Free) {   // a row the promotion pass has not linked yet (Task 12): armed at its promotion deadline
+        timers_.noteUse(rid);
+        timers_.arm(rid, promotionDeadline(ttl, remaining), kLeaseNoCheckpoint);
+    }
+    const bool gateOpen = leaseLastAppended(*ref.table, rid) < judgedThrough;
+    LeaseKaOutcome out{false, 0, 0};
+    // The park path must not change the entry when it cannot park: decide with a dry run first, then commit.
+    const LeaseEntry& e = timers_.entry(rid);
+    const bool due = e.deadlineNs <= leaseNowNs;
+    const LeaseStepOut peek = leaseStep({e.state, LeaseEntryEvent::Keepalive, gateOpen, due, remaining > 0});
+    if (peek.action == LeaseAction::Park || peek.action == LeaseAction::AppendClear) {
+        if (!owedRoom || parks.full() || (req == kLeaseNil && (req = parks.openRequest(sessionId, correlationId)) == kLeaseNil)) {
+            out = {false, kCodeThrottled, 1};
+        } else {
+            const uint32_t slot = parks.park(req, topicId_, partition_, rid, index, timers_.parkHead(rid));
+            assert(slot != kLeaseNil);
+            (void)slot;
+            if (peek.action == LeaseAction::AppendClear || (e.state == LeaseEntryState::Armed && !due)) flagClear_(rid);
+            out = {true, 0, 0};
+        }
+    } else {
+        const KaStep st = kaStep_(rid, leaseNowNs, remaining > 0, ttl, gateOpen);
+        assert(!st.park);
+        out = {false, st.code, st.ttlMs};
+    }
+    if (timers_.growOwed()) timers_.growIfOwed();   // cold
+    return out;
+}
+
 uint32_t LeaseRuntime::emit(LeaseEmitWork& work, const LeaseIndexRef& ref, const LeaseWriter& writer, int64_t judgedThrough, int64_t leaseNowNs,
-                            std::size_t byteCap, uint32_t maxRecords, PartitionReplica& replica) noexcept {
+                            std::size_t byteCap, std::size_t hardCap, uint32_t maxRecords, PartitionReplica& replica) {
     namespace rec = rune::protocol::record;
     if (writer.descriptor == nullptr || ref.table == nullptr) return 0;
     maxRecords = std::min<uint32_t>(maxRecords, rune::protocol::kMaxLeaseExpiryBatch);
@@ -104,10 +259,10 @@ uint32_t LeaseRuntime::emit(LeaseEmitWork& work, const LeaseIndexRef& ref, const
             ++stats_.encodeFailures;
             return false;
         }
-        if (work.builder.bodyBytes() + rune::protocol::kMaxRecordFramingBytes + key.size() + len +
-                static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) > byteCap) {
-            full = true;
-            return false;
+        switch (fitRecord(work.builder, n, key.size(), len, byteCap, hardCap)) {
+            case Fit::Ok: break;
+            case Fit::Full: full = true; return false;
+            case Fit::Oversized: ++stats_.oversizedDeferred; return false;   // only this row waits; the others go on
         }
         work.builder.append(std::string_view(reinterpret_cast<const char*>(key.data()), key.size()),
                             std::string_view(reinterpret_cast<const char*>(work.valueTmp.data()), len), /*timestamp=*/0,
@@ -118,14 +273,16 @@ uint32_t LeaseRuntime::emit(LeaseEmitWork& work, const LeaseIndexRef& ref, const
     (void)timers_.pollDeadline(leaseNowNs, sink, maxRecords);
     if (n == 0) return 0;
     work.builder.buildInto(work.batch);
-    const int64_t base = replica.appendLeaseBatch(std::span<const uint8_t>(work.batch.data(), work.batch.size()));
+    const int64_t base = appendBatch(replica, std::span<const uint8_t>(work.batch.data(), work.batch.size()), stats_, "expire");
     if (base >= 0) {
         for (uint32_t i = 0; i < n; ++i) timers_.setState(work.rids[i], LeaseEntryState::Emitting, base + static_cast<int64_t>(i));
         stats_.expiriesAppended += n;
         ++stats_.expiryBatches;
         return n;
     }
-    if (base == PartitionReplica::kAppendNotLeader) {
+    if (base == kAppendThrew) {
+        // counted and logged by appendBatch: the entries stay Armed and are due again next cycle
+    } else if (base == PartitionReplica::kAppendNotLeader) {
         ++stats_.notLeaderStops;   // the runtime is destroyed next cycle when the role change is seen
     } else if (base == PartitionReplica::kAppendMinIsr || base == PartitionReplica::kAppendBackPressure) {
         stats_.expiryBacklog += n;
@@ -134,6 +291,75 @@ uint32_t LeaseRuntime::emit(LeaseEmitWork& work, const LeaseIndexRef& ref, const
         ++stats_.encodeFailures;
     }
     for (uint32_t i = 0; i < n; ++i) timers_.relink(work.rids[i]);   // Armed again, due on the next cycle
+    return 0;
+}
+
+uint32_t LeaseRuntime::flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref, const LeaseWriter& writer, int64_t judgedThrough,
+                                   int64_t leaseNowNs, std::size_t byteCap, std::size_t hardCap, PartitionReplica& replica, LeaseParkTable& parks) {
+    namespace rec = rune::protocol::record;
+    if (clearHead_ == clearTail_) return 0;
+    if (writer.descriptor == nullptr || ref.table == nullptr || ref.layout == nullptr) return 0;   // the parks wait for an index that can encode
+    work.builder.reset(0, 0);
+    uint32_t n = 0;
+    const uint64_t visit = clearTail_ - clearHead_;
+    uint64_t visited     = 0;
+    bool full            = false;
+    while (visited < visit && n < rune::protocol::kMaxLeaseExpiryBatch && !full) {
+        const uint32_t rid = clearRing_[clearHead_ % kClearRingCap];
+        ++clearHead_;
+        ++visited;
+        timers_.flags(rid) = static_cast<uint8_t>(timers_.flags(rid) & ~kLeaseClearWanted);
+        const LeaseEntry& e = timers_.entry(rid);
+        if (e.state != LeaseEntryState::Armed || e.parkHead == kLeaseNil) continue;   // answered or changed meanwhile
+        if (e.deadlineNs <= leaseNowNs) continue;   // due: the emitter expires it, its parks are answered at the Expire fold
+        const uint8_t* row = ref.table->rowOf(rid);
+        if (leaseRowRemaining(row, *ref.layout) == 0) {   // nothing to clear (the row was cleared meanwhile): a plain keepalive
+            const uint64_t ttl = leaseRowTtl(row, *ref.layout);
+            timers_.rearm(rid, satAdd(leaseNowNs, msToNsSat(ttl)));
+            parks.answerChain(timers_.parkHead(rid), 0, ttl);
+            continue;
+        }
+        if (leaseLastAppended(*ref.table, rid) >= judgedThrough) {   // a client update of the key is appended but not judged
+            ++stats_.clearDeferred;
+            flagClear_(rid);
+            continue;
+        }
+        const std::span<const uint8_t> key = ref.table->keyOf(rid);
+        const uint16_t* const slotOf = ref.cover != nullptr
+            ? leaseSlotMapFor(*ref.cover, writer.version, writer.installSeq, *ref.layout, *ref.outDesc, *writer.descriptor) : nullptr;
+        const std::size_t len = encodeLeaseValue(row, *ref.layout, *ref.outDesc, *writer.descriptor, writer.version, work.valueTmp.data(),
+                                                 work.valueTmp.size(), slotOf);
+        if (len < rec::kLeaseRemainingValueOffset + 8) {
+            ++stats_.encodeFailures;
+            ++stats_.clearDeferred;
+            flagClear_(rid);
+            continue;
+        }
+        std::memset(work.valueTmp.data() + rec::kLeaseRemainingValueOffset, 0, 8);   // lease_remaining_ms = 0
+        switch (fitRecord(work.builder, n, key.size(), len, byteCap, hardCap)) {
+            case Fit::Ok: break;
+            case Fit::Full: ++stats_.clearDeferred; flagClear_(rid); full = true; continue;
+            case Fit::Oversized: ++stats_.oversizedDeferred; ++stats_.clearDeferred; flagClear_(rid); continue;
+        }
+        work.builder.append(std::string_view(reinterpret_cast<const char*>(key.data()), key.size()),
+                            std::string_view(reinterpret_cast<const char*>(work.valueTmp.data()), len), /*timestamp=*/0,
+                            rec::withLeaseOp(0, rec::LeaseOp::Checkpoint));
+        work.rids[n++] = rid;   // stays Armed and linked until the append result is known
+    }
+    if (n == 0) return 0;
+    work.builder.buildInto(work.batch);
+    const int64_t base = appendBatch(replica, std::span<const uint8_t>(work.batch.data(), work.batch.size()), stats_, "clear");
+    if (base >= 0) {
+        for (uint32_t i = 0; i < n; ++i) timers_.setState(work.rids[i], LeaseEntryState::Clearing, base + static_cast<int64_t>(i));
+        stats_.clearsAppended += n;
+        ++stats_.clearBatches;
+        return n;
+    }
+    if (base == PartitionReplica::kAppendNotLeader) ++stats_.notLeaderStops;
+    for (uint32_t i = 0; i < n; ++i) {   // refused (any code): they stay Armed and linked, wanted again next cycle
+        ++stats_.clearDeferred;
+        flagClear_(work.rids[i]);
+    }
     return 0;
 }
 

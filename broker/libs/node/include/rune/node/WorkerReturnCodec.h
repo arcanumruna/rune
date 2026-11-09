@@ -15,6 +15,7 @@
 #include <rune/node/WorkerOp.h>
 
 #include <rune_protocol_internal_sbe/MessageHeader.h>
+#include <rune_protocol_internal_sbe/OpType.h>
 #include <rune_protocol_internal_sbe/ReturnType.h>
 #include <rune_protocol_internal_sbe/TxnReturn.h>
 #include <rune_protocol_internal_sbe/TxnReturnKind.h>
@@ -48,6 +49,22 @@ static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::ViewScanResult) ==
 static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::StatsResult) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::STATS_RESULT),
               "WorkerReturn::StatsResult must stay on sbe ReturnType::STATS_RESULT");
+
+// Lease topics Task 11a: the lease results ride sbe ReturnType values 11 and 12.
+static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::LeaseKeepAliveResult) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::LEASE_KEEP_ALIVE_RESULT),
+              "WorkerReturn::LeaseKeepAliveResult must stay on sbe ReturnType::LEASE_KEEP_ALIVE_RESULT");
+static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::LeaseTimeToLiveResult) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::LEASE_TIME_TO_LIVE_RESULT),
+              "WorkerReturn::LeaseTimeToLiveResult must stay on sbe ReturnType::LEASE_TIME_TO_LIVE_RESULT");
+// ... and the lease ops on sbe OpType 36-38.
+static_assert(static_cast<std::uint8_t>(WorkerOp::Type::LeaseKeepAlive) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::LEASE_KEEP_ALIVE) &&
+              static_cast<std::uint8_t>(WorkerOp::Type::LeaseTimeToLive) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::LEASE_TIME_TO_LIVE) &&
+              static_cast<std::uint8_t>(WorkerOp::Type::ScanLeases) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::SCAN_LEASES),
+              "the lease WorkerOp types must stay on sbe OpType 36-38");
 
 // ---------------------------------------------------------------------------
 // WorkerReturn (template id 2)
