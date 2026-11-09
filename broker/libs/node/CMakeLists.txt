@@ -1429,7 +1429,11 @@ if(BUILD_TESTING)
             add_executable(rune_checked_writes_alloc_regression_tests tests/node/CheckedWritesAllocRegressionTest.cpp tests/node/CheckedWritesAutoIncAllocTest.cpp tests/node/CheckedWritesViewReadAllocTest.cpp tests/support/AllocWindow.cpp)
             target_include_directories(rune_checked_writes_alloc_regression_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
             target_link_libraries(rune_checked_writes_alloc_regression_tests PRIVATE rune_node rune_replication rune_codec rune_view rune_ql aeron::aeron GTest::gtest_main)
-            gtest_discover_tests(rune_checked_writes_alloc_regression_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            # The full-length transaction mix (over 1 s alone) carries LABELS stress; the default runs a shorter one of the same mix.
+            gtest_discover_tests(rune_checked_writes_alloc_regression_tests TEST_FILTER "*FullLength*"
+                                 PROPERTIES TIMEOUT 300 LABELS stress ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            gtest_discover_tests(rune_checked_writes_alloc_regression_tests TEST_FILTER "-*FullLength*"
+                                 PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Authentication Task 13 (spec §6, D30): the shard worker's WRITE grants, a REAL invoker driver over aeron:ipc.
             add_executable(rune_worker_write_grants_tests tests/node/WorkerWriteGrantsTest.cpp)

@@ -36,6 +36,7 @@ value as false). *ring/size* values must be powers of two; any other value keeps
 |---|---|---|
 | `RUNE_ELECTION_TIMEOUT_MS` | `150` | Maximum wait per election round (positive ms). Raise it for slow or cross-datacenter links. Max 2592000000 (30 days). |
 | `RUNE_VERDICT_INTERVAL_MS` | `100` | How often a verdict source's leader writes a verdict marker when nothing was rejected (positive ms). A rejection writes one at once. Max 2592000000 (30 days). |
+| `RUNE_TXN_JUDGED_RECORDS_MAX` | `4096` | The most records of one partition a transaction may have judged (1 to 1,048,576); a larger transaction is voted `TxnTooLarge` (62), and a larger atomic batch to a verdict source is refused with `InvalidRequest` (39). Before-images and locks are pre-allocated per worker for this many records. Read at startup; set it the same on every node. |
 | `RUNE_ELECTION_STATUS_INTERVAL_MS` | `20` | Canvass and heartbeat cadence (positive ms). The leader-heartbeat timeout is `max(election timeout, 3 x this)`. Max 2592000000 (30 days). |
 | `RUNE_STARTUP_CANVASS_TIMEOUT_MS` | `100` | Extended canvass window on first boot, for peer discovery (positive ms). Max 2592000000 (30 days). |
 | `RUNE_CONTROLLED_SHUTDOWN_MS` | `5000` | Budget for handing partition leadership to in-sync peers on SIGTERM. `0` = no hand-off. An integer in `[0, 2592000000]` ms (30 days); anything else refuses startup. |

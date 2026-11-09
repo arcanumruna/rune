@@ -49,7 +49,12 @@ raw log and shows as `kind raw` in `rune catalog show`. `SchemaDef::validate` is
 before, but it only decides whether a topic validates below metadata feature level 5 (`kCheckedWrites`); from that level
 every typed topic validates fully and the flag is ignored.
 
-**`formatVer` 3** is `formatVer` 2 byte for byte plus a trailing 14-byte key-features block in every schema definition
+**View plan v2.** `CreateView` and `AlterView` carry the authored plan in `normalizedPlanBlob`. A plan with a composite or derived
+key (`key (a, b)`, `lower(c) as n`), `unique`, `constraint ... check (...)` or a `group by` is written as **plan v2**: the v1 fields
+with version byte 2, then the key components, the `unique` byte, the constraints, the unicode version and the `group by` components. A
+plan with none of them stays v1 byte for byte, so every earlier digest replays as before.
+
+**`formatVer` 3** is `formatVer` 2 byte for byte plus a trailing 14-byte key-features block (`TopicKeyFeatures`) in every schema definition
 (`CreateTopic` with a schema, `CreateSchema`): `[flags u8: bit 0 keyIndex, bit 1 autoIncrement][partitioner u8]
 [autoIncrementMax u64][autoIncrementReserve u32]`. Other flag bits and a partitioner above 1 are `BadEnum`. The leader
 writes `formatVer` 3 once the cluster feature level is 5 (`kCheckedWrites`) and `formatVer` 2 below it, for every DDL,

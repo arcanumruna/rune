@@ -243,7 +243,7 @@ in offset order, against the records accepted before it:
 | `Update` | empty (removeExisting) | `KeyNotFound` (57) when the key is absent |
 
 - **Requirements**: intents need `Acks::All | Acks::View` (or `Acks::Leader | Acks::View`) and an idempotent producer
-  (every acked producer is). A rejected record is never visible; its completion is `BrokerError` with `errorCode` 56 or 57
+  (every acked producer is), or a transactional producer (the transaction's commit judges them). A rejected record is never visible; its completion is `BrokerError` with `errorCode` 56 or 57
   and `constraintIdOf(completion)` 0. A topic without a key index answers an intent `InvalidRequest`.
 - **Refused locally**: these sends return `SendResult::WriteNotAllowed` (nothing is queued and no completion follows), and
   the blocking forms throw `std::invalid_argument` with the text in quotes: an intent on a raw handle ("intents need a typed
@@ -348,7 +348,7 @@ if (p.trySend(events, Key(uint64_t{42}), bytes, cq, /*token=*/7) == SendResult::
 ### Batches and flush
 
 ```cpp
-auto batch = p.batch(events, Key(uint64_t{42}));   // one atomic append to one partition: contiguous offsets; View producers get a verdict per record
+auto batch = p.batch(events, Key(uint64_t{42}));   // one atomic append to one partition: contiguous offsets; View producers get a verdict per record. On a verdict source it is all or nothing
 batch.add(bytes);
 batch.send();
 p.flush();
@@ -361,6 +361,8 @@ A batch is built in a preallocated pool slot (`ProducerConfig::tier2Slots`, defa
 `batch()` is single-thread per producer (the creating thread, or the thread that last called `bindBatchThread()`, with no
 builder live): from another thread it returns a refused builder whose `send()` is `WrongThread`. A builder made when every
 slot is in use is refused too (`send()` is `BackPressured`, nothing stored): rebuild the whole batch. `send()` is `[[nodiscard]]`.
+A batch to a verdict source is all or nothing. A rejected one has one completion, `BrokerError` with the code in `errorCode`, the
+constraint id in `constraintIdOf` and the batch's base offset in `value`; it carries no per-record verdicts.
 
 ### Zero-copy claims
 
@@ -506,7 +508,10 @@ try {
     tp.send(out, Key(uint64_t{2}), b);
     const OffsetEntry offsets[] = {{topicId, partition, nextOffset}};
     tp.sendOffsetsToTransactionAndWait(offsets, "economy");   // the consumer group's input offsets
-    tp.commitTransactionAndWait();             // outputs and offsets, atomically
+    const TxnCommitResult r = tp.commitTransactionAndWait();   // outputs and offsets, atomically
+    if (!r.ok) {   // a partition voted no: the transaction is already aborted, begin the next one
+        const auto name = client.constraintName(r.constraintId);   // r.code 55 / 56 / 57 / 62 / 63, r.failingOffset
+    }
 } catch (const std::runtime_error&) {
     if (tp.state() == TxnState::FatalError) return;   // fenced: a newer producer with this id took over
     tp.abortTransactionAndWait();              // roll back
@@ -516,6 +521,12 @@ try {
 - `TxnState`: `Uninitialized`, `Initializing`, `Ready`, `InTransaction`, `CommittingTransaction`,
   `AbortingTransaction`, `AbortableError`, `FatalError`. After a timeout in `CommittingTransaction` the outcome is in doubt:
   retry the same `commitTransactionAndWait()`.
+- **A no vote.** On a topic with constraints, `commitTransactionAndWait()` returns a `TxnCommitResult` (`ok`, `code`,
+  `constraintId`, `failingOffset`) instead of throwing. `code` is 55, 56, 57, 62 or 63; resolve `constraintId` with
+  `Client::constraintName`. After a no the transaction is already aborted and the producer is `Ready`: call `beginTransaction()`
+  for the next one. A retried commit after a coordinator failover gets the same no. Every other failure still throws.
+- **`View` on a transactional producer** is ignored on sends: the verdict comes from the commit, and a commit that returns `ok`
+  means the rows are final on every partition.
 - Sequences continue across transactions under one epoch. After a commit lands, if any partition's sequence counter is
   above 2^30 the commit also bumps the epoch (one `InitProducerId`, every partition restarts at 0) and completes `Ok` once
   the bump is answered; if that bump fails the commit still completes `Ok` (it landed) and the producer is `FatalError`.

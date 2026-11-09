@@ -467,6 +467,24 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
   while a member of the logged set is not installed on its worker.
 - After a crash that lost the marker tail a verdict view backs up and rebuilds a checkpoint ahead of its local markers
   (`verdictCheckpointsDiscarded`). When the rejected-offset index is full the judge stalls and raises `verdictStalls`.
+- **Transactions.** A transaction that writes to a verdict source is judged at a `TxnJudge` record (control record 19) that
+  the leader appends when the coordinator asks for its vote. The leader's cleaner removes a `TxnJudge` once the transaction's
+  COMMIT or ABORT lies below W and every persisted constraint view has checkpointed past it. As with all compaction and
+  retention, only the partition's leader cleans: a follower keeps every record it has replicated, these included, until it
+  leads and its own cleaner passes over them (follower cleaning: #990). A node restart does not change this.
+  - **Votes.** The coordinator asks the leader of every partition the transaction wrote to whether it votes yes. The judge answers
+    once it has judged the transaction whole, applying its records provisionally and locking the rows it wrote; the commit or
+    abort marker then finalizes the result in one step. Counters are ids 11 to 20 of `rune stats topic <t>`: `txnVotesYes`,
+    `txnVotesNo`, one counter each for 55, 56, 57 and 62 (`TxnConflict` no votes count only in `txnVotesNo`), `txnVoteLatencyNsMax` and `txnVoteLatencyNsTotal`.
+  - **Lock pause.** While a transaction holds a row locked, the verdicts of other writers' records that touch the row wait for its
+    marker; the time is `foldPausedOnTxnLockNs`. A distributed lock wait ends at the transaction timeout at the latest, when the
+    coordinator aborts the transaction.
+  - **`txnMarkerWithoutVote`** counts markers that arrived for a transaction nobody asked a vote for. It stays 0; a non-zero
+    value is a coordinator bug.
+  - **Size.** A transaction over `RUNE_TXN_JUDGED_RECORDS_MAX` records on one partition is voted `TxnTooLarge` (62); an atomic batch
+    over it to a verdict source is refused with `InvalidRequest` (39), see [configuration](configuration.md).
+  - **Persisted constrained views.** A persisted view of a verdict source checkpoints while the judge runs ahead of undecided
+    transactions, and a restart backfills from the `TxnJudge` records at or above its checkpoint.
 - **Constraint views** (`unique` and `check`, see [Constraints](api/ql.md#constraints)) join and leave the set through
   change records in the source log, so every leader judges a record with the set that was active at its offset.
   - **Create.** The leader appends the view's plan (control record 20) and then the change record at offset `A`. The view builds

@@ -9,6 +9,13 @@ client ships them); do NOT pull in the `common` library for these.
 
 Benchmark procedure, clean-box steps and known baselines: [bench/BENCHMARKING.md](bench/BENCHMARKING.md).
 
+**Checked writes.** A typed topic (a field list) always validates its records; an untyped topic is `raw`. The database features
+(`key.index`, `autoincrement`, `unique` and `check` views, judged transactions and atomic batches) need a typed, keyed topic.
+A topic without them takes one branch on the produce path (a raw topic compiles the hook out); a verdict source's judge, votes
+and locks allocate nothing in steady state, gated by `CheckedWritesAllocRegression`. Tests: `ctest -R CheckedWrites`
+runs the binaries `rune_checked_writes_{tests,ack_tests,verdict_tests,matrix_tests,alloc_regression_tests,stress_tests,
+transient_view_tests,catalog_gate_cluster_tests}`; the full-length alloc variant carries `LABELS stress` (`-LE stress` skips it).
+
 ## Benchmark: optimal config for the 4-core box (3-node acks=all)
 
 Custom (non-default) knobs that took shared+backoff 6k → 92k @256B (win2000) / 106k @256B
