@@ -252,8 +252,8 @@ public:
         return nullptr;
     }
     [[nodiscard]] const DeferredTxn* find(int64_t producerId) const noexcept { return const_cast<TxnJudgeState*>(this)->find(producerId); }
-    /// A producer's next transaction replaces its previous entry; a full table gives up its oldest Finalized one.  nullptr: the judge
-    /// waits (the previous entry holds an overlay or has no marker yet, or every entry is live).  A record at or below the producer's
+    /// A producer's next transaction replaces its previous entry; a full table gives up its oldest decided one.  nullptr: the judge
+    /// waits (the previous entry holds an overlay or has no marker yet, or every entry is live or awaits its marker).  A record at or below the producer's
     /// entry is a re-feed.
     DeferredTxn* onJudgeRecord(int64_t judgeOffset, const rune::storage::control_record::TxnJudgeRecord& r) noexcept {
         if (DeferredTxn* old = find(r.producerId)) {
@@ -266,7 +266,7 @@ public:
             giveUp_(txns_.begin() + (old - txns_.data()));
         }
         if (txns_.size() >= kMaxTxns) {
-            const auto done = std::find_if(txns_.begin(), txns_.end(), [&](const DeferredTxn& t) { return t.phase == TxnPhase::Finalized && t.overlay < 0 && !hasParked_(t.producerId); });
+            const auto done = std::find_if(txns_.begin(), txns_.end(), [&](const DeferredTxn& t) { return evictable_(t); });
             if (done == txns_.end()) return nullptr;
             giveUp_(done);
         }
@@ -340,12 +340,12 @@ public:
             if (const int64_t at = std::min(t.firstOffset, t.holdFrom); t.phase != TxnPhase::Finalized && first < at && at <= marker) t.holdFrom = first;
     }
     /// onJudgeRecord would take a new record of the producer now: its entry (if any) holds no overlay and has its marker, and the
-    /// table has room.  The worker appends a TxnJudge only then, so the judge never waits on a record the worker wrote.
+    /// table has room or a decided entry with its marker to give up.  The worker appends a TxnJudge only then, so the judge never waits on a record the worker wrote.
     [[nodiscard]] bool acceptsJudge(int64_t producerId) const noexcept {
         for (std::size_t i = txns_.size(); i-- > 0;)
             if (txns_[i].producerId == producerId) return txns_[i].overlay < 0 && txns_[i].markerOffset >= 0;
         return txns_.size() < kMaxTxns ||
-               std::any_of(txns_.begin(), txns_.end(), [&](const DeferredTxn& t) { return t.phase == TxnPhase::Finalized && t.overlay < 0 && !hasParked_(t.producerId); });
+               std::any_of(txns_.begin(), txns_.end(), [&](const DeferredTxn& t) { return evictable_(t); });
     }
     /// A Locked transaction judged below `cursor`: a member folded past it holds rows its apply has not changed yet (P11-8).
     [[nodiscard]] bool lockedBelow(int64_t cursor) const noexcept {
@@ -426,13 +426,17 @@ public:
     TxnJudgeStats stats;
 
 private:
+    /// A full table gives up an entry only once its marker is known: one given up without it would hold its J for good.
+    [[nodiscard]] bool evictable_(const DeferredTxn& t) const noexcept {
+        return t.phase == TxnPhase::Finalized && t.markerOffset >= 0 && t.overlay < 0 && !hasParked_(t.producerId);
+    }
     [[nodiscard]] bool hasParked_(int64_t producerId) const noexcept {
         return std::any_of(parked_.begin(), parked_.end(), [&](const ParkedVote& v) { return v.producerId == producerId; });
     }
 
     void giveUp_(std::vector<DeferredTxn>::iterator t) noexcept {
         givenUpJ_ = std::min(givenUpJ_, t->judgeOffset);
-        givenUpMarker_ = std::max(givenUpMarker_, t->markerOffset < 0 ? INT64_MAX : t->markerOffset);
+        givenUpMarker_ = std::max(givenUpMarker_, t->markerOffset);
         txns_.erase(t);
     }
 

@@ -7680,7 +7680,7 @@ private:
                 end = w.markers.committedMarkerEnd();
             }
             // Part 11: a TxnJudge goes only below the committed markers' coverage, below every transaction not decided under it, and
-            // below every persisted member's last checkpoint (P11-8 (c)).  A follower keeps them all.
+            // below every persisted member's last checkpoint (P11-8 (c)).  A follower publishes nothing: its RC is not Ready, and the cleaner skips it.
             int64_t txnBound = 0;
             if (sl.write && sl.replica->role() == rune::replication::Role::Leader && sl.write->constraintSets.size() != 0) {
                 txnBound = sl.write->txn.judgeRecordsNeededFrom(sl.write->markers.committedThrough());

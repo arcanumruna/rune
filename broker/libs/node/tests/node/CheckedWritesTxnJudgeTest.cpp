@@ -128,6 +128,7 @@ TEST(CheckedWritesTxnState, FullTableReusesAFinalizedEntryRegression) {
         DeferredTxn* e = t.onJudgeRecord(static_cast<int64_t>(i) + 10, {static_cast<int64_t>(i), 1, static_cast<int64_t>(i)});
         ASSERT_NE(e, nullptr);
         e->phase = TxnPhase::Finalized;
+        e->markerOffset = e->judgeOffset + 1;
     }
     ASSERT_NE(t.onJudgeRecord(5000, {5000, 1, 4000}), nullptr);
     EXPECT_EQ(t.find(0), nullptr) << "the oldest finalized entry went";
@@ -144,6 +145,7 @@ TEST(CheckedWritesTxnState, FullTableKeepsAFinalizedEntryWithAParkedVoteRegressi
         DeferredTxn* e = t.onJudgeRecord(static_cast<int64_t>(i) + 10, {static_cast<int64_t>(i), 1, static_cast<int64_t>(i)});
         ASSERT_NE(e, nullptr);
         e->phase = TxnPhase::Finalized;
+        e->markerOffset = e->judgeOffset + 1;
         e->judged = true;
     }
     ASSERT_TRUE(t.parkVote({1, 0, 0, 1, 10}));
@@ -151,6 +153,26 @@ TEST(CheckedWritesTxnState, FullTableKeepsAFinalizedEntryWithAParkedVoteRegressi
     EXPECT_NE(t.find(0), nullptr);
     EXPECT_EQ(t.find(1), nullptr) << "the next finalized entry went instead";
     EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn*) {}), 1);
+}
+
+// P11 carry B: a full table never gives up a decided entry before its marker is known (a no vote waits for its ABORT): the entry
+// would hold the cleaner bound at its J for good.  acceptsJudge agrees with onJudgeRecord, and the entry goes once its marker lands.
+TEST(CheckedWritesTxnState, FullTableNeverGivesUpAnEntryWithoutItsMarkerRegression) {
+    auto t = reserved();
+    for (std::size_t i = 0; i < TxnJudgeState::kMaxTxns; ++i)
+        ASSERT_NE(t.onJudgeRecord(static_cast<int64_t>(i) * 10 + 100, {static_cast<int64_t>(i), 1, static_cast<int64_t>(i) * 10 + 95}), nullptr);
+    DeferredTxn* voted = t.find(0);
+    voted->phase = TxnPhase::Finalized;
+    voted->judged = true;
+    EXPECT_FALSE(t.acceptsJudge(5000));
+    EXPECT_EQ(t.onJudgeRecord(20'000, {5000, 1, 19'990}), nullptr) << "the only decided entry has no marker";
+    EXPECT_NE(t.find(0), nullptr);
+    EXPECT_EQ(t.judgeRecordsNeededFrom(INT64_MAX), 100);
+    t.onMarker(0, 20'010, false);
+    EXPECT_TRUE(t.acceptsJudge(5000));
+    ASSERT_NE(t.onJudgeRecord(20'000, {5000, 1, 19'990}), nullptr);
+    EXPECT_EQ(t.find(0), nullptr);
+    EXPECT_GT(t.judgeRecordsNeededFrom(20'011), 100) << "past the marker the bound moves on";
 }
 
 // F6: a rescan judges the kept entries anew; a Finalized entry whose marker was cut away is undecided again.
@@ -884,6 +906,7 @@ TEST(CheckedWritesTxnJudge, FullTxnTableWaitsNeverJudges) {
     EXPECT_FALSE(r.indexed(3));
     EXPECT_EQ(r.st.txn.stats.judgeRecordRefusals, 1u) << "one wait, counted once";
     r.st.txn.find(1000)->phase = TxnPhase::Finalized;
+    r.st.txn.onMarker(1000, 100'001, true);
     r.drive();
     ASSERT_NE(r.st.txn.find(77), nullptr) << "the judge re-offered the TxnJudge";
     EXPECT_EQ(r.vs.judgeCursor(), 16);
@@ -933,6 +956,7 @@ TEST(CheckedWritesTxnJudgeRegression, ReofferedJudgeRecordGetsTheMarkerTheFeedDr
     r.drive();
     EXPECT_EQ(r.vs.judgeCursor(), 12);
     r.st.txn.find(1000)->phase = TxnPhase::Finalized;
+    r.st.txn.onMarker(1000, 100'001, true);
     r.drive(16);                       // the HW below the abort
     ASSERT_NE(r.st.txn.find(77), nullptr);
     EXPECT_LT(r.st.txn.find(77)->markerOffset, 0);
@@ -954,6 +978,7 @@ TEST(CheckedWritesTxnJudgeRegression, ReofferedJudgeRecordTakesALaterMarkerFromT
     r.log.judge(77, 10);               // 12, refused by the feed
     r.drive();
     r.st.txn.find(1000)->phase = TxnPhase::Finalized;
+    r.st.txn.onMarker(1000, 100'001, true);
     r.drive();
     ASSERT_NE(r.st.txn.find(77), nullptr);
     EXPECT_EQ(r.vs.judgedThrough(), 10);
@@ -986,6 +1011,7 @@ TEST(CheckedWritesTxnJudgeRegression, OwedMarkerSearchKeepsTheProbeBudgetRegress
     r.log.marker(77, true);            // dropped by the feed
     r.drive();
     r.st.txn.find(1000)->phase = TxnPhase::Finalized;
+    r.st.txn.onMarker(1000, 100'001, true);
     r.drive();                         // re-offered: deferred, the marker owed
     ASSERT_NE(r.st.txn.find(77), nullptr);
     EXPECT_EQ(r.vs.judgedThrough(), 10);
@@ -996,6 +1022,32 @@ TEST(CheckedWritesTxnJudgeRegression, OwedMarkerSearchKeepsTheProbeBudgetRegress
     r.drive();
     EXPECT_EQ(r.st.txn.find(77)->markerOffset, r.log.next - 1);
     EXPECT_EQ(r.vs.judgedThrough(), r.log.next);
+}
+
+// P11 carry B: a no vote awaiting its ABORT is not given up when the table is full: the judge waits at the next producer's TxnJudge
+// until the marker lands, and the bound is released then.
+TEST(CheckedWritesTxnJudgeRegression, NoVoteAwaitingItsAbortIsNeverGivenUpRegression) {
+    JudgeRig r(VoteMembers{});
+    r.start();
+    r.log.data({{1}, {2, 9}, {3, 9}}, 77);   // 10-12
+    r.log.judge(77, 10);                     // 13
+    r.drive();
+    ASSERT_NE(r.st.txn.find(77), nullptr);
+    ASSERT_EQ(r.st.txn.find(77)->phase, TxnPhase::Finalized);
+    ASSERT_LT(r.st.txn.find(77)->markerOffset, 0);
+    for (std::size_t i = 0; i + 1 < TxnJudgeState::kMaxTxns; ++i)
+        ASSERT_NE(r.st.txn.onJudgeRecord(100'000 + int64_t(i), {1000 + int64_t(i), 0, 50'000 + int64_t(i)}), nullptr);
+    r.log.data({{5}}, 88);   // 14
+    r.log.judge(88, 14);     // 15
+    r.drive();
+    EXPECT_NE(r.st.txn.find(77), nullptr) << "no marker yet: not given up";
+    EXPECT_EQ(r.st.txn.find(88), nullptr);
+    EXPECT_EQ(r.st.txn.stats.judgeRecordRefusals, 1u);
+    r.log.marker(77, false);   // 16
+    r.drive();
+    EXPECT_NE(r.st.txn.find(88), nullptr);
+    EXPECT_EQ(r.st.txn.find(77), nullptr);
+    EXPECT_EQ(r.st.txn.judgeRecordsNeededFrom(17), 15);
 }
 
 // Re-review 3: a rescan resets every kept entry to AwaitJudge; the judge finalizes the ones a kept marker decided, so a full table
@@ -1614,7 +1666,9 @@ TEST(CheckedWritesTxnJudgeRegression, OwedMarkerSearchRotatesAcrossAReactivation
     r.log.marker(77, true);           // dropped: without the rotation 77's search would take every pass until it is found
     r.drive();
     r.st.txn.find(1000)->phase = TxnPhase::Finalized;
+    r.st.txn.onMarker(1000, 100'001, true);
     r.st.txn.find(1001)->phase = TxnPhase::Finalized;
+    r.st.txn.onMarker(1001, 100'002, true);
     r.drive();
     ASSERT_NE(r.st.txn.find(77), nullptr);
     ASSERT_NE(r.st.txn.find(88), nullptr);

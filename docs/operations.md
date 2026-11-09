@@ -467,6 +467,11 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
   while a member of the logged set is not installed on its worker.
 - After a crash that lost the marker tail a verdict view backs up and rebuilds a checkpoint ahead of its local markers
   (`verdictCheckpointsDiscarded`). When the rejected-offset index is full the judge stalls and raises `verdictStalls`.
+- **Transactions.** A transaction that writes to a verdict source is judged at a `TxnJudge` record (control record 19) that
+  the leader appends when the coordinator asks for its vote. The leader's cleaner removes a `TxnJudge` once the transaction's
+  COMMIT or ABORT lies below W and every persisted constraint view has checkpointed past it. As with all compaction and
+  retention, only the partition's leader cleans: a follower keeps every record it has replicated, these included, until it
+  leads and its own cleaner passes over them (follower cleaning: #990). A node restart does not change this.
 - **Constraint views** (`unique` and `check`, see [Constraints](api/ql.md#constraints)) join and leave the set through
   change records in the source log, so every leader judges a record with the set that was active at its offset.
   - **Create.** The leader appends the view's plan (control record 20) and then the change record at offset `A`. The view builds
