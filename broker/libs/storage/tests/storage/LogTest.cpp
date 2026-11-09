@@ -4,6 +4,7 @@
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include <filesystem>
+#include <cstdio>
 #include <fstream>
 #include <atomic>
 #include <chrono>
@@ -2862,5 +2863,39 @@ TEST(OverDiskRegression, BytesOnDiskMatchesFilesAfterRestartRegression) {
     for (const auto& e : std::filesystem::directory_iterator(dir))
         if (e.path().extension() == ".log") files += static_cast<int64_t>(std::filesystem::file_size(e.path()));
     EXPECT_LE(reopened.bytesOnDisk(), files) << "never more than the .log files hold";
+    std::filesystem::remove_all(dir);
+}
+
+// ---- readPastEmptied hops an emptied segment without zero-filling a maxBytes buffer ----
+TEST(Log, ReadPastEmptiedWithAHugeMaxBytesIsNotZeroFilledRegression) {
+    auto dir = makeTempDir("rune_log_emptied");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    const auto put = [&dir](int64_t base, const std::vector<uint8_t>& bytes) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(dir / name, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    put(0, {});
+    RecordBatchBuilder b(10, 1000);
+    b.append("k", "v", 1000);
+    const auto batch = b.build();
+    put(10, batch);
+    Log log(dir.string());
+    log.recover();
+    // A zero-filled INT32_MAX buffer would touch 2 GiB on every hop (ru_maxrss: bytes on macOS, KiB on Linux).
+    const auto peakBytes = [] {
+        rusage ru{};
+        getrusage(RUSAGE_SELF, &ru);
+#ifdef __APPLE__
+        return static_cast<int64_t>(ru.ru_maxrss);
+#else
+        return static_cast<int64_t>(ru.ru_maxrss) * 1024;
+#endif
+    };
+    const int64_t before = peakBytes();
+    const auto bytes = log.readPastEmptied(0, INT32_MAX, log.logEndOffset());
+    EXPECT_LT(peakBytes() - before, 256LL << 20);
+    EXPECT_EQ(bytes, batch);
     std::filesystem::remove_all(dir);
 }

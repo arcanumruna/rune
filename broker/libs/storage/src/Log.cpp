@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <new>
 #include <charconv>
 #include <fstream>
@@ -1957,12 +1958,11 @@ void Log::unpinSegmentFlush(LogSegment* seg) noexcept {
 std::vector<uint8_t> Log::readPastEmptied(int64_t startOffset, int32_t maxBytes, int64_t boundOffset) {
     std::vector<uint8_t> raw = read(startOffset, maxBytes);
     if (!raw.empty()) return raw;
-    std::vector<uint8_t> buf(static_cast<std::size_t>(maxBytes));
+    const auto buf = std::make_unique_for_overwrite<uint8_t[]>(static_cast<std::size_t>(maxBytes));   // no zero fill of a maxBytes-sized buffer per hop
     ReadIntoStatus st;
-    const LogReadView v = readInto(startOffset, maxBytes, buf.data(), buf.size(), st, boundOffset);
+    const LogReadView v = readInto(startOffset, maxBytes, buf.get(), static_cast<std::size_t>(maxBytes), st, boundOffset);
     if (st != ReadIntoStatus::Ok) return {};
-    buf.resize(v.len);
-    return buf;
+    return std::vector<uint8_t>(buf.get(), buf.get() + v.len);
 }
 int64_t Log::nextSegmentBaseAfter(int64_t offset) const noexcept {
     const auto it = segments_.upper_bound(offset);
