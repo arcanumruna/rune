@@ -587,16 +587,6 @@ struct Sender {
         if (owned) owned->close();
     }
 
-    /// The producer id is assigned or the session of its coordinator is up: a crash then finds the request on a session that goes stale, not
-    /// on one still connecting, which only the 5 s coordinator-down fallback gives up.
-    void awaitCoordinatorSession() {
-        const auto up = [&] {
-            const uint32_t idx = client->testCoordinatorSessionIndex();
-            return prod->producerId() >= 0 || (idx != 0 && client->testSessionStateAt(idx) == rune::client::session::SessionState::Connected);
-        };
-        for (int i = 0; i < 10'000 && !up(); ++i) std::this_thread::sleep_for(1ms);
-        EXPECT_TRUE(up()) << "the coordinator session never came up";
-    }
     /// The token of the queued send of record `id`.
     uint64_t send(uint64_t id) { return sendValue(id, idValue(id)); }
     uint64_t sendValue(uint64_t id, const std::string& v) {
@@ -804,7 +794,6 @@ TEST(CheckedWritesBrokerRegression, AllViewProduceAcrossALeaderCrashThreeNodesRe
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     Sender s(cfg, "acct", src.topicId, 1, kAllView);
-    s.awaitCoordinatorSession();
     constexpr int kTotal = 200;
     std::vector<uint64_t> tokens;
     std::thread killer;
@@ -1196,12 +1185,18 @@ std::vector<std::optional<std::pair<int64_t, uint16_t>>> vtRows(rc::Client& read
         for (std::size_t from = 0; from < pending.size(); from += kWindow) {
             const std::size_t to = std::min(pending.size(), from + kWindow);
             const rc::Token first = token;
-            for (std::size_t k = from; k < to; ++k) (void)reader.getViewRow(viewTopicId, static_cast<uint64_t>(pending[k]), 0, cq, token++);
+            std::vector<bool> refused(to - from, false);
+            for (std::size_t k = from; k < to; ++k) {
+                const rc::OpResult submitted = reader.getViewRow(viewTopicId, static_cast<uint64_t>(pending[k]), 0, cq, token++);
+                if (submitted == rc::OpResult::Accepted) continue;
+                refused[k - from] = true;
+                ADD_FAILURE() << "getViewRow of row " << pending[k] << " refused: " << static_cast<int>(submitted);
+            }
             const auto chunkEnd = Clock::now() + 3s;
             for (std::size_t k = from; k < to; ++k) {
                 const int id = pending[k];
-                bool done = false;
-                (void)cq.waitFor(first + (k - from), std::max(Clock::duration::zero(), chunkEnd - Clock::now()), [&](const rc::Completion& d, std::span<const uint8_t> row) {
+                bool done = refused[k - from];
+                if (!done) (void)cq.waitFor(first + (k - from), std::max(Clock::duration::zero(), chunkEnd - Clock::now()), [&](const rc::Completion& d, std::span<const uint8_t> row) {
                     if (d.status == rc::OpStatus::Ok && row.size() >= 19) {
                         int64_t v = 0;
                         for (int i = 0; i < 8; ++i) v |= static_cast<int64_t>(row[9 + static_cast<std::size_t>(i)]) << (8 * i);   // [bitmap][id][v][tag]
@@ -1370,7 +1365,6 @@ TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRe
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     Sender s(cfg, "vt", src.topicId, 1, kAllView);
-    s.awaitCoordinatorSession();
     constexpr int kTotal = 200;
     const auto tagOf = [](int i) -> uint16_t { return i % 10 == 9 ? 9 : 1; };
     std::vector<uint64_t> tokens;
@@ -2018,6 +2012,7 @@ void expectKeyExists(rc::Client& client, uint64_t first, uint64_t last) {
 }
 
 int64_t leoOf(BrokerNode& n, int32_t topicId, int32_t partition);
+bool inIsrOn(BrokerNode& leader, int32_t topicId, int32_t partition, int member);
 
 /// A 3-replica `ki` on a started cluster, the level raised on every node.  The admin client connects while the cluster elects.
 int32_t defineKiOnCluster(Cluster& c) {
@@ -2032,6 +2027,8 @@ int32_t defineKiOnCluster(Cluster& c) {
     if (t.errorCode != 0) { ADD_FAILURE() << t.detail; return -1; }
     std::vector<int32_t> leaders;
     if (!awaitLeaders(c, t.topicId, kKiParts, leaders, 30s)) { ADD_FAILURE() << "no leaders"; return -1; }
+    std::string why;
+    if (!c.awaitCatalogDigestsEqual(30s, &why)) { ADD_FAILURE() << "the nodes never applied the topic: " << why; return -1; }
     return t.topicId;
 }
 
@@ -2105,18 +2102,44 @@ void keyIndexSurvivesTakeoverAfterARestart(int partition) {
     }
     ASSERT_FALSE(::testing::Test::HasFatalFailure());
 
-    c.startNode(first);
+    // Every node but the leader of the partition is restarted and caught up, so whichever of them takes it over rebuilt its index from the log.
+    std::set<int> restarted;
+    const auto restart = [&](int node) {
+        c.startNode(node);
+        ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
+        ASSERT_TRUE(waitFor([&] {
+            for (int32_t p = 0; p < kKiParts; ++p) {   // the restart may hand the leadership back to `node`: read it again
+                const int32_t current = leaderOn(c.node(node), topicId, p);
+                if (current <= 0 || !c.running(current)) return false;
+                if (leoOf(c.node(node), topicId, p) != leoOf(c.node(current), topicId, p)) return false;
+                if (current != node && !inIsrOn(c.node(current), topicId, p, node)) return false;
+            }
+            return true;
+        }, 30s)) << "the restarted node never rejoined the ISR";
+        ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
+        restarted.insert(node);
+    };
+    restart(first);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    int second = leaders[static_cast<std::size_t>(partition)];
+    for (;;) {   // a restart may move the leadership: look again until every other node restarted
+        int pending = -1;
+        for (const int node : {1, 2, 3})
+            if (node != second && !restarted.contains(node)) pending = node;
+        if (pending < 0) break;
+        c.crash(pending);
+        restart(pending);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        second = leaders[static_cast<std::size_t>(partition)];
+    }
+    std::string why;
+    ASSERT_TRUE(c.awaitCatalogDigestsEqual(30s, &why)) << "the restarted nodes never settled: " << why;
     ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
-    ASSERT_TRUE(waitFor([&] {
-        for (int32_t p = 0; p < kKiParts; ++p)
-            if (leoOf(c.node(first), topicId, p) != leoOf(c.node(leaders[static_cast<std::size_t>(p)]), topicId, p)) return false;
-        return true;
-    }, 30s)) << "the restarted node never caught up";
-    const int second = leaders[static_cast<std::size_t>(partition)];
+    second = leaders[static_cast<std::size_t>(partition)];
     auto reader = kiClient(c, second == 1 ? 2 : 1);
     c.crash(second);
     ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s)) << "after crashing node " << second;
-    EXPECT_NE(leaders[static_cast<std::size_t>(partition)], second) << "the takeover really happened";
+    EXPECT_TRUE(restarted.contains(leaders[static_cast<std::size_t>(partition)])) << "the takeover was by a node that did not restart";
     const auto cr = reader.get();
     expectKeyExists(*cr, 1, 100);
 }
@@ -2267,6 +2290,13 @@ uint64_t idOf(const std::string& keyBytes) {
 
 int64_t leoOf(BrokerNode& n, int32_t topicId, int32_t partition) {
     return n.onOwnerThreadForTest(topicId, partition, [](rune::replication::PartitionReplica& r) { return r.log()->logEndOffset(); });
+}
+
+/// Node `member` is in the ISR of the partition as its leader `leader` holds it.
+bool inIsrOn(BrokerNode& leader, int32_t topicId, int32_t partition, int member) {
+    return leader.onOwnerThreadForTest(topicId, partition, [member](rune::replication::PartitionReplica& r) {
+        return std::find(r.isr().begin(), r.isr().end(), member) != r.isr().end();
+    });
 }
 
 /// A connected admin session on the controller of a started cluster, the level raised on every node (a failure is a gtest failure and null).
@@ -3337,24 +3367,22 @@ TEST(CheckedWritesBrokerRegression, KeyIndexOnASixteenByteKeyShardRegression) {
     prod.closeImmediately();
 }
 
-// A producer-id request in flight when the node that coordinates it crashes is answered by the new coordinator after about two stale-session
-// thresholds, not after the 5 s coordinator-down fallback.  The seed is not the coordinator; the crash waits for the request to
-// move to the coordinator's own session.
-TEST(CheckedWritesBrokerRegression, ProducerIdAcrossACoordinatorCrashThreeNodesRegression) {
+// Smoke test: the node that coordinates the producer id crashes once the client has opened a session on it, and the new coordinator
+// answers within the stale-session threshold, not after the 5 s coordinator-down fallback.  The request is usually still unanswered at
+// the crash, but nothing holds the reply back, so a regression of the in-flight move is pinned by the client test
+// (GroupRoutingRegression.InitProducerIdInFlightOnACrashedCoordinatorMovesWithTheLostSessionRegression).
+TEST(CheckedWritesBrokerRegression, ProducerIdAfterACoordinatorCrashSmokeThreeNodesRegression) {
     Cluster c = startCluster("cw_pid");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t coordinator = c.settledLeader();
     const int32_t seed        = coordinator == 1 ? 2 : 1;
+    const uint64_t accepted   = c.node(coordinator).testConnectsAccepted();
     rc::ClientConfig cfg = quickConfig(c, seed);
     cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
     rc::Client client(cfg);
     rc::Producer prod = client.producer(rc::ProducerConfig{});
     client.connectAndWait(30s);
-    const auto connected = [&] {
-        const uint32_t idx = client.testCoordinatorSessionIndex();
-        return idx != 0 && client.testSessionStateAt(idx) == rune::client::session::SessionState::Connected;
-    };
-    for (int i = 0; i < 10'000 && !connected() && prod.producerId() < 0; ++i) std::this_thread::sleep_for(100us);
+    for (int i = 0; i < 10'000 && c.node(coordinator).testConnectsAccepted() == accepted && prod.producerId() < 0; ++i) std::this_thread::sleep_for(100us);
     c.crash(coordinator);
     const auto start = std::chrono::steady_clock::now();
     while (prod.producerId() < 0 && std::chrono::steady_clock::now() - start < 10s) std::this_thread::sleep_for(1ms);
