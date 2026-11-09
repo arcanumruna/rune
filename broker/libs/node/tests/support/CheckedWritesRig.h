@@ -776,9 +776,8 @@ public:
     }
 
     /// One worker pass; the driver and the client conductor run in it too (Invoker), so the rig is single-threaded.
-    int pass() {
-        now += 1'000'000;
-        if (tuning_.durabilityTier == 2) std::this_thread::sleep_for(std::chrono::microseconds(50));   // a Strict append waits for an fsync that takes wall-clock time
+    int pass(int64_t advanceNs = 1'000'000) {
+        now += advanceNs;
         ++passNo_;
         if (delayedSpecIn_ > 0 && --delayedSpecIn_ == 0) EXPECT_TRUE(worker->tryEnqueueOp(specOp_(true)));
         pumpAeron_();
@@ -1152,10 +1151,16 @@ public:
         passes(3);
     }
     /// Drives until the ack of `corr` arrived (or `maxPasses`).
+    /// A Strict ack also waits for its fsync, which takes wall-clock time: up to 5 s more of passes that do not move `now`.
     std::optional<Ack> ack(int64_t c, int maxPasses = 600) {
         for (int i = 0; i < maxPasses; ++i) {
             if (const auto it = acksSeen_.find(c); it != acksSeen_.end()) return it->second;
             pass();
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (tuning_.durabilityTier == 2 && acksSeen_.count(c) == 0 && std::chrono::steady_clock::now() < deadline) {
+            pass(0);
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
         if (const auto it = acksSeen_.find(c); it != acksSeen_.end()) return it->second;
         return std::nullopt;
