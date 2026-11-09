@@ -1364,9 +1364,9 @@ TEST(ProducerTxnClientRegression, CoordinatorFallbackAtTheStaleEdgeRegression) {
     EXPECT_EQ(r.client.testCoordinatorFallbacks(), 1u);
 }
 
-// RED (mutations): CoordRemote::staleBase initialised to 0 instead of the session's current count (a second
-// fallback the moment the seed names the dead node again).
-TEST(ProducerTxnClientRegression, StaleFallbackFollowsADeadNodeOnceRegression) {
+// RED (mutations): CoordRemote::staleBase initialised to 0 instead of the session's current count (a fallback the
+// moment the seed names the dead node again, not at the never-connected grace's growing pace).
+TEST(ProducerTxnClientRegression, StaleFallbackReasksADeadNodeAtTheNeverUpPaceRegression) {
     FallbackRig r(5105, 5106, kStaleRespNs, kStaleKeepaliveNs);
     rc::Producer p = r.client.producer(fbStaleProducerCfg());
     ASSERT_NE(fbCoordinatorUp(r, p, true), 0);
@@ -1375,12 +1375,18 @@ TEST(ProducerTxnClientRegression, StaleFallbackFollowsADeadNodeOnceRegression) {
     const int64_t t0 = g_fbNow;
     r.gw.noPongEndpoints.insert(r.node);
     r.gw.silentEndpoints.insert(r.node);
-    r.advanceTo(t0 + 1'600'000'000LL);
-    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 1u);
-    r.advanceTo(t0 + 3'000'000'000LL);
-    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 1u) << "the route went back and forth between the seed and the dead node";
-    EXPECT_EQ(r.client.testCoordinatorRedirects(), 2u) << "the dead node is followed once";
-    EXPECT_NE(r.coordIdx(), 0u);
+    // The stale edge gives it up once; each re-follow of the node that never connects is given up after the
+    // never-connected grace (100, 200, 400, 800 ms ...), never at the stale count the session already had.
+    std::vector<int64_t> at;
+    while (g_fbNow - t0 < 3'000'000'000LL) {
+        const uint64_t before = r.client.testCoordinatorFallbacks();
+        r.step(1'000'000);
+        if (r.client.testCoordinatorFallbacks() != before) at.push_back(g_fbNow);
+    }
+    ASSERT_GE(at.size(), 3u) << "the seed is never re-asked about the dead node";
+    for (size_t i = 2; i < at.size(); ++i)
+        EXPECT_GE(at[i] - at[i - 1], at[i - 1] - at[i - 2]) << "fallback " << i << " came sooner than the grace before it";
+    EXPECT_LE(at.size(), 6u) << "the route went back and forth between the seed and the dead node";
 }
 
 // RED (mutations): staleSessionLosses() read without subtracting ownStallLosses().
