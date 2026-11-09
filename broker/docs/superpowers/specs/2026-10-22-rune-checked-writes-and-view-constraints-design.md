@@ -733,6 +733,8 @@ Until this part ships, the §11.2 refusals apply.
 | 54 | `AutoIncrementExhausted` | The counter has reached `autoincrement.max`. The batch isn't stored. | write | definite |
 | 55 | `TxnTooLarge` | A transaction wrote more than `txn.judged.records.max` records to one voting partition. The transaction aborts. | vote | definite |
 
+Numbering note: this table uses the design's numbers. As shipped (plan 00 RB2, plan 11 Refresh R-1), 51–54 are taken by main, so the codes are 55 `ConstraintViolation`, 56 `KeyExists`, 57 `KeyNotFound`, 58 `AutoIncrementExhausted`, 62 `TxnTooLarge` and 63 `TxnConflict` (§9b); 59–61 are the compile errors.
+
 A no vote (51–53, 55) is returned by `commitTransaction()`, with the constraint id, and the transaction is aborted.
 
 Existing codes reused:
