@@ -480,3 +480,40 @@ TEST(ClientAuthClusterRegression, EosPipelineSurvivesTheCoordinatorCrashOnAnAuth
     tp.close();
     cl->close();
 }
+
+// =====================================================================================================================
+// Checkpoint E review (adversarial, L22 Part B on the docker default = authenticated, TLS-sealed sessions): a restarted
+// gateway answers the forgotten session's keepalive Ping with a CLEAR ErrorResponse{UnknownSession}.  The client drops a
+// clear frame naming an encrypted session (ClientAgent.cpp "every encrypted candidate failed auth - drop"), so the notice
+// never reaches the session machine and recovery waits for the response timeout (60 s here) - L22 is a no-op with TLS.
+// =====================================================================================================================
+TEST(ClientAuthClusterRegression, RestartedNodeNoticeReachesATlsSessionAdversarialRegression) {
+    AuthTrio t("unktls");
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "unk-user", AuthTrio::kPw);
+    const int leader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(leader, 0);
+    const int seed = leader % 3 + 1;   // a follower of __security: its restart keeps the security leader
+    std::unique_ptr<rc::Client> c;
+    int seq = 0;
+    ASSERT_TRUE(AuthTrio::until(60s, [&] {
+        try {
+            auto cfg = configFor(t, seed, "unk-user", AuthTrio::kPw, seq++);
+            cfg.responseTimeoutNs = 60'000'000'000LL;   // recovery by timeout is impossible inside the deadline
+            c = std::make_unique<rc::Client>(cfg);
+            c->connectAndWait(30s);
+            return true;
+        } catch (const std::exception&) { c.reset(); return false; }
+    }));
+    const int64_t old = c->testSeedSessionId();
+    ASSERT_NE(old, 0);
+    t.cluster().crash(seed);
+    t.cluster().startNode(seed);
+    const bool recovered = AuthTrio::until(8s, [&] { const int64_t s = c->testSeedSessionId(); return s != 0 && s != old; });
+    const auto n = t.cluster().node(seed).testUnknownSessionNotices();
+    EXPECT_TRUE(recovered) << "a TLS session on a restarted node did not recover by the notice (sent/deduped/dropped/abandoned = " << n[0] << "/"
+                           << n[1] << "/" << n[2] << "/" << n[3] << ")";
+    EXPECT_GE(n[0], 1u) << "the restarted gateway answered the encrypted session's probe Ping with a clear notice";
+    c->close();
+}

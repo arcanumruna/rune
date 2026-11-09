@@ -1,4 +1,5 @@
 #pragma once
+#include <limits>
 #include <rune/storage/ZeroedBytes.h>
 #include <rune/consensus/PeerResolution.h>
 
@@ -1396,6 +1397,24 @@ public:
         return static_cast<int>(answerUnknownSession_(channel, streamId, sid, correlationId, nowNs));
     }
     int pollUnknownSessionNoticesForTest(int64_t nowNs) { return pollUnknownSessionNotices_(nowNs); }
+    /// Marks a session encrypted without keys (U2 test: a clear frame is dropped before any AEAD attempt, so none is needed).
+    bool markSessionEncryptedForTest(int64_t sid) noexcept {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr) return false;
+        s->crypto.encrypted = true;
+        return true;
+    }
+    [[nodiscard]] std::size_t pendingNoticeCountForTest() const noexcept {
+        std::size_t n = 0;
+        for (const auto& e : unknownNotices_) n += e.state != NoticeState::Free ? 1u : 0u;
+        return n;
+    }
+    /// The channel of the i-th non-free notice entry (after a resolve: the address form).
+    [[nodiscard]] std::string pendingNoticeChannelForTest(std::size_t i) const {
+        for (const auto& e : unknownNotices_)
+            if (e.state != NoticeState::Free && i-- == 0) return std::string(e.channel.data(), e.channelLen);
+        return {};
+    }
 
     // -----------------------------------------------------------------------
     // subscriptionCount — number of active subscriptions (for tests).
@@ -2229,9 +2248,19 @@ private:
     static constexpr std::size_t kUnknownSessionNoticeCap = 16;
     static constexpr std::size_t kUnknownSessionNoticeSids = 4;
     static constexpr int64_t     kUnknownSessionNoticeAbandonNs = 5'000'000'000LL;
+    /// Free: unused.  Resolving: the declared channel names a HOSTNAME, offered to the cold resolver (never resolved by a
+    /// conductor or duty thread); the answer rewrites `channel` to the address.  Registering: addExclusivePublication was
+    /// called, the publication is not yet found.  Sending: the publication is up; notices are offered on it.
+    enum class NoticeState : uint8_t { Free, Resolving, Registering, Sending };
+    static constexpr std::size_t kNoticeSrcHostBytes = 64;   // the fairness key, truncated (both sides of a compare truncate alike)
+    static constexpr int64_t     kNoticeResolveIdBase = std::numeric_limits<int64_t>::min() / 2;   // negative: never a session id
     struct UnknownSessionEntry {
+        NoticeState state = NoticeState::Free;
         std::array<char, 255> channel{};   // SessionAckSink::kMaxChannelBytes
-        uint16_t channelLen = 0;           // 0 = free
+        uint16_t channelLen = 0;
+        int64_t resolveId = 0;             // Resolving: the id the resolver answers with (unique, so a stale answer matches nothing)
+        std::array<char, kNoticeSrcHostBytes> srcHost{};   // the source host (sourceHostOf_) that owns this pending entry
+        uint8_t srcHostLen = 0;
         int32_t streamId = 0;
         int64_t registrationId = -1;
         std::shared_ptr<aeron::ExclusivePublication> pub;
@@ -2242,6 +2271,16 @@ private:
         int64_t startNs = 0;
     };
     UnknownSessionNotice answerUnknownSession_(std::string_view channel, int32_t streamId, int64_t sid, int64_t correlationId, int64_t nowNs);
+    /// The shared resolve pieces of the Connect path and the notice path (one copy): does this declared channel name a hostname;
+    /// offer a host to the cold resolver under `id` (`holder` keeps the allocation across a refused offer); the channel with the
+    /// answered address (network order) in place of the host.
+    [[nodiscard]] static bool channelNamesHostname_(std::string_view channel);
+    bool offerHostResolveOf_(std::unique_ptr<std::string>& holder, std::string_view channel, int64_t id);
+    [[nodiscard]] static std::string channelWithResolvedHost_(std::string_view channel, int64_t ipNetworkOrder);
+    /// Register the notice entry's publication (the call the Connect path makes for its reply channel); false = refused.
+    bool startNoticePub_(UnknownSessionEntry& e, bool testGateway);
+    void onNoticeResolved_(int64_t id, bool resolved, int64_t ip);
+    int64_t noticeResolveSeq_ = 0;
     int pollUnknownSessionNotices_(int64_t nowNs);
     static std::shared_ptr<aeron::ExclusivePublication> placeholderPub_();
     /// "aeron:udp?control=<responseControlEndpoint_>|control-mode=response|response-correlation-id=<imageCorrelationId>" into `out`
@@ -3628,6 +3667,8 @@ public:
     bool clientFrameHeldForTest(const uint8_t* buf, std::size_t len) { return produceFrameHeld_(buf, len); }
     /// Issue #116: encrypted client frames dropped because they name another receiver (a worker-bound frame).
     [[nodiscard]] uint64_t c2bWrongReceiverDropsForTest() const noexcept { return c2bWrongReceiverDrops_; }
+    /// U2: clear probe Pings (correlationId <= -kProbeNonceFloor) that named a known encrypted session; dropped before any AEAD attempt.
+    [[nodiscard]] uint64_t clearFramesOnEncryptedSessionDropped() const noexcept { return clearFramesOnEncryptedSessionDropped_; }
     /// PR #528 review (issue #116, mixed-version cluster): answer MetadataRequests as a broker below
     /// kBrokerVersionReceiverKeys does - the worker ingressEndpoint without the receiver-id trailer.
     void emulatePreReceiverKeyMetadataForTest(bool on) noexcept { preReceiverKeyMetadataForTest_ = on; }
@@ -3954,6 +3995,9 @@ private:
     // END of the object so no hot member's offset moves.
     uint64_t rejectedRequests_      = 0;       // answered with an error instead of dropped
     uint64_t unanswerableFrames_    = 0;       // dropped: no header / no session / no response type
+    /// A client's clear probe Ping carries a correlationId at or below -kProbeNonceFloor (SessionMachine::kProbeNonceFloor, mirrored).
+    static constexpr int64_t kProbeNonceFloor = int64_t{1} << 32;
+    uint64_t clearFramesOnEncryptedSessionDropped_ = 0;   // a clear frame naming a KNOWN encrypted session: dropped before any AEAD
     uint64_t c2bWrongReceiverDrops_ = 0;       // issue #116: encrypted frames naming another receiver (control thread)
     bool     preReceiverKeyMetadataForTest_ = false;   // test seam: metadata as a broker < 7 sends it (cold)
     uint64_t spillExpiries_         = 0;       // sessions expired because the egress spill was full

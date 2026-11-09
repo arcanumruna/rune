@@ -121,6 +121,7 @@ struct SessionEndpointIo : session::SessionIo {
         : agent(a), endpoint(std::move(ep)) {}
 
     bool sendFrame(const uint8_t* buf, std::size_t len) override;
+    bool sendClearFrame(const uint8_t* buf, std::size_t len) override;
     bool retarget(const std::string& newIngressChannel) noexcept override;
     /// NAT-safe egress: the Redirect's `#port` names the target gateway's response-control port.
     bool retargetWithResponsePort(const std::string& newIngressChannel, int32_t responsePort) noexcept override;
@@ -858,6 +859,9 @@ public:
     [[nodiscard]] uint64_t staleFramesDropped() const noexcept { return staleFramesDropped_; }
     /// F-A C1: session-fatal notices for a session this client already left (dropped, never applied).
     [[nodiscard]] uint64_t staleSessionNotices() const noexcept { return staleSessionNotices_; }
+    /// U2: clear UnknownSession notices accepted for an encrypted session (probe nonce echoed) / refused (wrong nonce or session).
+    [[nodiscard]] uint64_t probeNoticesAccepted() const noexcept { return probeNoticesAccepted_; }
+    [[nodiscard]] uint64_t probeNoticesRejected() const noexcept { return probeNoticesRejected_; }
     [[nodiscard]] uint64_t ingressOfferRefused() const noexcept { return ingressOfferRefused_; }
     [[nodiscard]] uint64_t ingressFatalDropped() const noexcept { return ingressFatalDropped_; }
     /// DR client bug 2: ring-drained control frames dropped because the transport
@@ -1247,6 +1251,13 @@ private:
     std::vector<uint8_t>        egressDecryptScratch_;
     /// PR #476 review: frames in clear dropped because this client requires crypto (dispatchEgressFrame).
     uint64_t                    clearFramesDropped_ = 0;
+    /// U2: clear UnknownSession notices accepted on an encrypted session (sessionId + one of its last two probe nonces) / clear
+    /// UnknownSession notices naming an encrypted session that were refused (wrong nonce, wrong session).
+    uint64_t                    probeNoticesAccepted_ = 0;
+    uint64_t                    probeNoticesRejected_ = 0;
+    /// True when `buf` (an undecrypted frame naming an encrypted session) is a clear ErrorResponse{UnknownSession} for that
+    /// session echoing one of its probe nonces.  Counts accepted / rejected clear notices.
+    [[nodiscard]] bool acceptsProbeNotice_(const uint8_t* buf, std::size_t len, int64_t headerSid) noexcept;
     /// An ErrorResponse whose correlation id is a session's in-flight ConnectRequest (the connect leg's answer).
     [[nodiscard]] bool answersAnInFlightConnect_(const uint8_t* buf) const noexcept;
     uint32_t sessionIndexFor_(const std::string& endpoint) noexcept;
@@ -1287,7 +1298,8 @@ private:
         ++rejectedSessions_;
         ++rejectedEpoch_;
     }
-    bool offerControlTo(Session& owner, const uint8_t* buf, std::size_t len) noexcept;
+    /// `clear`: send `buf` unsealed even on an encrypted session (only the probe Ping, SessionIo::sendClearFrame).
+    bool offerControlTo(Session& owner, const uint8_t* buf, std::size_t len, bool clear = false) noexcept;
     /// Open a NEW session to `endpoint` (async connect, disjoint corrId range).
     Session& openSession_(const std::string& endpoint) noexcept;
     /// T15a fix1 I1: point the default ingress publication (the seed session's

@@ -7301,7 +7301,7 @@ private:
         std::unique_ptr<RcHintCtx>           hint;
         std::unique_ptr<PartitionWriteState> write;   // checked writes: a typed partition's write state (null: untyped)
         int64_t verdictBoundPublished = -2, verdictEndPublished = -2;   // Part 04: what the cleaner was last told (publish on change only)
-        bool    verdictSourcePublished = false;   ///< what the gateway was last told (PartitionReplica::publishVerdictSource)
+        bool    leaderOnlyReadsPublished = false;   ///< what the gateway was last told (PartitionReplica::publishLeaderOnlyReads); seeded from the replica when the slot is made
     };
     // The default read-ahead issuer: an async IORING_OP_FADVISE(WILLNEED) on the
     // segment fd where the worker's io backend is io_uring AND the kernel
@@ -7520,6 +7520,7 @@ private:
             RcSlot slot;
             slot.replica = r;
             slot.inc     = r->incarnation();
+            slot.leaderOnlyReadsPublished = r->gatewayLeaderOnlyReads();   // a stale published bit is corrected on the first pass
             for (auto& old : rcSlots_) {
                 if (old.replica == r && old.inc == slot.inc && old.rc) {
                     slot.rc = std::move(old.rc);
@@ -8317,10 +8318,12 @@ private:
     void publishVerdictCleanerBounds_() noexcept {
         for (auto& sl : rcSlots_) {
             if (sl.write && sl.write->growOwed) [[unlikely]] growVerdictIndex_(*sl.write);
-            // Every replica, disk or transient, ready or not: a verdict source stays one (the timeline only grows).
-            if (const bool vs = sl.write && sl.write->constraintSets.size() != 0; vs != sl.verdictSourcePublished) [[unlikely]] {
-                sl.replica->publishVerdictSource(vs);
-                sl.verdictSourcePublished = vs;
+            // A typed partition (it has a write state) is served by its leader only: a follower holds no verdict state, so
+            // Worker::verdictBound_ (same predicate: `writeOf_(replica) != nullptr`, here sl.write) holds it at -1.  Every replica,
+            // disk or transient, ready or not.
+            if (const bool vs = sl.write != nullptr; vs != sl.leaderOnlyReadsPublished) [[unlikely]] {
+                sl.replica->publishLeaderOnlyReads(vs);
+                sl.leaderOnlyReadsPublished = vs;
             }
             if (!sl.replica->isDiskBacked() || !sl.rc->ready()) continue;
             int64_t bound = rune::replication::PartitionReplica::kNoCleanerLso, end = std::max<int64_t>(sl.verdictEndPublished, 0);

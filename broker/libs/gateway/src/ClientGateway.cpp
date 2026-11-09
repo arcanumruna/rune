@@ -1199,6 +1199,17 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         if (peekedTid != pc::TemplateId::Connect &&
             peekedTid != pc::TemplateId::HandshakeContinue) {
             if (Session* s = sessions_.find(hdrOpt->sessionId); s != nullptr && s->crypto.encrypted) {
+                // U2: the header does not tell a clear frame from a sealed one (a sealed frame keeps the clear header, schema id
+                // included, and appends the crypto sub-header), so the probe is recognised by what only it carries: a Ping whose
+                // correlationId is at or below -kProbeNonceFloor.  Sealed Pings never carry one (a keepalive's is -(session index + 1),
+                // an application ping's is positive), and the client draws every probe nonce at or below it.  A probe naming a KNOWN
+                // encrypted session is dropped here, before any AEAD attempt: it is not tamper or replay evidence (a live gateway
+                // gets it every keepalive interval from each encrypted session), so it reaches neither the tamper nor the replay
+                // accounting.  (A restarted gateway, which knows no session, answers it from handlePing's unknown branch.)
+                if (peekedTid == pc::TemplateId::Ping && hdrOpt->correlationId <= -kProbeNonceFloor) [[unlikely]] {
+                    ++clearFramesOnEncryptedSessionDropped_;
+                    return true;
+                }
                 // Plaintext is always kCryptoOverhead (28) bytes SHORTER than
                 // the wire frame — `len` bytes of capacity is always enough.
                 // noexcept-adjacent hot path: vector::resize can throw
@@ -2376,9 +2387,7 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // DR-15 fix round 2 (LOW-4): a reply HOSTNAME is resolved off-thread by the
     // cold resolver (never by a driver conductor on a duty thread); the session
     // stays pending — bounded by the connect timeout — until the hub answers.
-    const std::string_view replyHost = rune::consensus::PeerHostTable::endpointHost(pc_entry.egressChannel);
-    if (!pc_entry.responseEgress && hostResolver_.valid() && !replyHost.empty() &&
-        !rune::consensus::PeerHostTable::isNumericHost(replyHost)) [[unlikely]] {
+    if (!pc_entry.responseEgress && hostResolver_.valid() && channelNamesHostname_(pc_entry.egressChannel)) [[unlikely]] {
         pc_entry.awaitingResolve = true;
         // Fix round 3 (concern 2): a momentarily full resolve ring no longer
         // drops the Connect — the pending connect is kept (ResolveOfferPending)
@@ -2461,22 +2470,41 @@ bool ClientGateway::registerConnectEgress_(PendingConnect& pending)
 // ring is full right now (the caller keeps the connect pending and retries).
 bool ClientGateway::offerHostResolve_(PendingConnect& pending)
 {
-    // Fix round 4 (N12): allocated once per connect; a refused offer keeps it
-    // (retried each poll with no new allocation); the ring takes it on success.
-    if (!pending.resolveHost)
-        pending.resolveHost = std::make_unique<std::string>(
-            rune::consensus::PeerHostTable::endpointHost(pending.egressChannel));
-    if (!hostResolver_.req->offer(rune::consensus::kHostResolveRequest, pending.sessionId,
-                                  static_cast<int64_t>(reinterpret_cast<std::intptr_t>(pending.resolveHost.get()))))
+    return offerHostResolveOf_(pending.resolveHost, pending.egressChannel, pending.sessionId);
+}
+
+// The ONE resolver offer (the Connect path and the unknown-session notice path).  Fix round 4 (N12): allocated once per request;
+// a refused offer keeps it in `holder` (retried with no new allocation); the ring takes it on success.
+bool ClientGateway::offerHostResolveOf_(std::unique_ptr<std::string>& holder, std::string_view channel, int64_t id)
+{
+    if (!holder) holder = std::make_unique<std::string>(rune::consensus::PeerHostTable::endpointHost(channel));
+    if (!hostResolver_.req->offer(rune::consensus::kHostResolveRequest, id,
+                                  static_cast<int64_t>(reinterpret_cast<std::intptr_t>(holder.get()))))
         return false;
-    (void)pending.resolveHost.release();   // owned by the resolver from here (it deletes it)
+    (void)holder.release();   // owned by the resolver from here (it deletes it)
     return true;
+}
+
+bool ClientGateway::channelNamesHostname_(std::string_view channel)
+{
+    const std::string_view host = rune::consensus::PeerHostTable::endpointHost(channel);
+    return !host.empty() && !rune::consensus::PeerHostTable::isNumericHost(host);
+}
+
+std::string ClientGateway::channelWithResolvedHost_(std::string_view channel, int64_t ip)
+{
+    in_addr a{};
+    a.s_addr = static_cast<uint32_t>(ip);
+    char buf[INET_ADDRSTRLEN] = {};
+    ::inet_ntop(AF_INET, &a, buf, sizeof buf);
+    return rune::consensus::PeerHostTable::withEndpointHost(channel, buf);
 }
 
 int ClientGateway::pollHostResolutions_()
 {
     if (!hostResolver_.valid()) [[likely]] return 0;
     return hostResolver_.resp->poll([this](std::int32_t type, std::int64_t id, std::int64_t ip) {
+        if (id < 0) { onNoticeResolved_(id, type == rune::consensus::kHostResolved, ip); return; }   // an unknown-session notice's answer
         for (auto it = pendingConnects_.begin(); it != pendingConnects_.end(); ++it) {
             if (it->sessionId != id || !it->awaitingResolve) continue;
             if (type != rune::consensus::kHostResolved) {
@@ -2486,11 +2514,7 @@ int ClientGateway::pollHostResolutions_()
                 pendingConnects_.erase(it);
                 return;
             }
-            in_addr a{};
-            a.s_addr = static_cast<uint32_t>(ip);
-            char buf[INET_ADDRSTRLEN] = {};
-            ::inet_ntop(AF_INET, &a, buf, sizeof buf);
-            it->egressChannel   = rune::consensus::PeerHostTable::withEndpointHost(it->egressChannel, buf);
+            it->egressChannel   = channelWithResolvedHost_(it->egressChannel, ip);
             it->replyChannel    = it->egressChannel;   // only a declared-path entry ever awaits a resolve
             it->awaitingResolve = false;
             if ((shardMode_ && it->egressChannel.size() > rune::node::SessionAckSink::kMaxChannelBytes) ||
@@ -3130,9 +3154,11 @@ void ClientGateway::handlePing(const uint8_t* buf, std::size_t len, int64_t nowN
         // gateway that restarted and forgot the session answers ErrorResponse{UnknownSession} on that declared channel, so the client
         // reconnects at once instead of waiting for its response timeout.  Anything else stays unanswerable.
         //
-        // Security: this exposes nothing new.  Connect already opens a publication to any declared channel before auth; the notice is one
-        // ErrorResponse per (channel, sid), and the 16-entry table bounds it.  The Connect path's sourceHostOf_ fairness check (Required
-        // auth mode) is not reused: it allocates a std::string and the table bound already limits the cost.
+        // Security: an unauthenticated Ping makes the gateway open a publication to a channel the sender names, which Connect
+        // does too (before auth).  What bounds it: one notice per pending (host, channel, stream, sid); 16 entries; ONE pending
+        // entry per source host (sourceHostOf_, in every auth mode: a single sender cannot squat the table); a hostname endpoint is
+        // resolved off-thread by the cold resolver (or refused when there is none), never inline on the conductor or duty thread.
+        // An encrypted session's probe Ping (clear, carrying a random nonce as its correlationId) takes this same path.
         constexpr std::size_t kMaxCh = rune::node::SessionAckSink::kMaxChannelBytes;
         constexpr std::string_view kUdpPrefix = "aeron:udp?";
         if (pingOpt->correlationId <= 0 && pingOpt->echo.size() > 4 && pingOpt->echo.size() <= 4 + kMaxCh &&
@@ -3464,7 +3490,7 @@ ClientGateway::UnknownSessionNotice ClientGateway::answerUnknownSession_(std::st
     }
     UnknownSessionEntry* slot = nullptr;
     for (auto& e : unknownNotices_) {
-        if (e.channelLen == 0) { if (slot == nullptr) slot = &e; continue; }
+        if (e.state == NoticeState::Free) { if (slot == nullptr) slot = &e; continue; }
         if (e.streamId != streamId || std::string_view(e.channel.data(), e.channelLen) != channel) continue;
         for (uint8_t i = 0; i < e.nSids; ++i)
             if (e.sids[i] == sid) { ++unknownSessionNoticesDeduped_; return UnknownSessionNotice::Deduped; }
@@ -3476,16 +3502,18 @@ ClientGateway::UnknownSessionNotice ClientGateway::answerUnknownSession_(std::st
     }
     const bool testGateway = testEgressFn_ && !aeron_;   // the intercepting test egress: a placeholder publication, never dereferenced
     if (slot == nullptr || (!aeron_ && !testGateway)) { ++unknownSessionNoticesDropped_; return UnknownSessionNotice::Dropped; }
+    // Fairness (the Connect path's key, in every auth mode): ONE pending entry per source host, so a single sender cannot squat the
+    // 16-entry table.  Cold: an unknown session only, after the table-room check above.
+    const std::string srcHost = sourceHostOf_(channel);
+    const std::size_t hostLen = std::min(srcHost.size(), kNoticeSrcHostBytes);
+    for (const auto& e : unknownNotices_) {
+        if (e.state != NoticeState::Free && std::string_view(e.srcHost.data(), e.srcHostLen) == std::string_view(srcHost.data(), hostLen)) {
+            ++unknownSessionNoticesDropped_;
+            return UnknownSessionNotice::Dropped;
+        }
+    }
     slot->pub.reset();
     slot->registrationId = -1;
-    if (!testGateway) try {
-        // Exactly the call the declared-egress Connect path makes for pc_entry.replyChannel.
-        slot->registrationId = aeron_->addExclusivePublication(rune::node::withSparseTerms(channel), streamId);
-    } catch (...) {
-        ++unknownSessionNoticesDropped_;
-        return UnknownSessionNotice::Dropped;
-    }
-    if (testGateway) slot->pub = placeholderPub_();
     std::memcpy(slot->channel.data(), channel.data(), channel.size());
     slot->channelLen = static_cast<uint16_t>(channel.size());
     slot->streamId = streamId;
@@ -3494,30 +3522,85 @@ ClientGateway::UnknownSessionNotice ClientGateway::answerUnknownSession_(std::st
     slot->nSids = 1;
     slot->nSent = 0;
     slot->startNs = nowNs;
+    std::memcpy(slot->srcHost.data(), srcHost.data(), hostLen);
+    slot->srcHostLen = static_cast<uint8_t>(hostLen);
+    const auto drop = [&]() {
+        slot->state = NoticeState::Free;
+        slot->channelLen = 0;
+        slot->nSids = 0;
+        ++unknownSessionNoticesDropped_;
+        return UnknownSessionNotice::Dropped;
+    };
+    if (channelNamesHostname_(channel)) {
+        // A hostname is never resolved inline (a driver conductor would block on DNS): off-thread through the cold resolver,
+        // exactly as the declared-egress Connect path does (DR-15); without one the notice is refused.
+        if (!hostResolver_.valid()) return drop();
+        slot->resolveId = kNoticeResolveIdBase + ++noticeResolveSeq_;
+        std::unique_ptr<std::string> holder;
+        if (!offerHostResolveOf_(holder, channel, slot->resolveId)) return drop();   // a full ring: best-effort, the client re-probes
+        slot->state = NoticeState::Resolving;
+        return UnknownSessionNotice::Queued;
+    }
+    if (!startNoticePub_(*slot, testGateway)) return drop();
     return UnknownSessionNotice::Queued;
+}
+
+bool ClientGateway::startNoticePub_(UnknownSessionEntry& e, bool testGateway)
+{
+    e.pub.reset();
+    e.registrationId = -1;
+    e.state = NoticeState::Registering;
+    if (testGateway) { e.pub = placeholderPub_(); return true; }
+    try {
+        // Exactly the call the declared-egress Connect path makes for pc_entry.replyChannel.
+        e.registrationId = aeron_->addExclusivePublication(
+            rune::node::withSparseTerms(std::string_view(e.channel.data(), e.channelLen)), e.streamId);
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+void ClientGateway::onNoticeResolved_(int64_t id, bool resolved, int64_t ip)
+{
+    for (auto& e : unknownNotices_) {
+        if (e.state != NoticeState::Resolving || e.resolveId != id) continue;
+        const auto release = [&e] { e.state = NoticeState::Free; e.channelLen = 0; e.nSids = 0; e.nSent = 0; };
+        if (!resolved) { release(); ++unknownSessionNoticesDropped_; return; }
+        const std::string ch = channelWithResolvedHost_(std::string_view(e.channel.data(), e.channelLen), ip);
+        if (ch.size() > rune::node::SessionAckSink::kMaxChannelBytes) { release(); ++unknownSessionNoticesDropped_; return; }
+        std::memcpy(e.channel.data(), ch.data(), ch.size());
+        e.channelLen = static_cast<uint16_t>(ch.size());
+        if (!startNoticePub_(e, testEgressFn_ && !aeron_)) { release(); ++unknownSessionNoticesDropped_; }
+        return;
+    }
+    // Not pending any more (abandoned): nothing registered, nothing to release.
 }
 
 int ClientGateway::pollUnknownSessionNotices_(int64_t nowNs)
 {
     int work = 0;
     for (auto& e : unknownNotices_) {
-        if (e.channelLen == 0) continue;
+        if (e.state == NoticeState::Free) continue;
         const auto release = [&e] {
             e.pub.reset();   // closes the publication; Aeron's linger delivers what was offered
+            e.state = NoticeState::Free;
             e.channelLen = 0;
             e.registrationId = -1;
             e.nSids = 0;
             e.nSent = 0;
         };
         if (nowNs - e.startNs > kUnknownSessionNoticeAbandonNs) {   // a resource bound for a vanished client, not a convergence timer
+            const bool resolving = e.state == NoticeState::Resolving;
             const bool resolved = e.pub != nullptr;
             const int64_t reg = e.registrationId;
             release();
-            if (!resolved) abandonRegistration_(reg);
+            if (!resolving && !resolved) abandonRegistration_(reg);
             ++unknownSessionNoticesAbandoned_;
             ++work;
             continue;
         }
+        if (e.state == NoticeState::Resolving) continue;   // the resolver's answer moves it on (onNoticeResolved_)
         if (!e.pub) {
             try {
                 if (aeron_) e.pub = aeron_->findExclusivePublication(e.registrationId);
@@ -3529,6 +3612,7 @@ int ClientGateway::pollUnknownSessionNotices_(int64_t nowNs)
             }
             if (!e.pub) continue;
         }
+        e.state = NoticeState::Sending;
         if (!testEgressFn_ && !e.pub->isConnected()) continue;
         while (e.nSent < e.nSids) {
             pc::ErrorResponse err;
@@ -5442,8 +5526,9 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // BEFORE any subscription is registered — the one registration point both
     // worker modes go through (shard mode forwards the registered sub to the
     // owning worker below).  Also covers a group carrier switching to it (5a).
-    // Checked writes: a partition whose records need verdicts (a lease topic, a verdict source) is served by its
-    // leader only, at any isolation - a follower holds no verdict state, so its verdict bound never moves.
+    // Checked writes: a partition whose records need verdicts (a lease topic, a typed partition) is served by its
+    // leader only, at any isolation: a typed partition (it has a write state) is served by its leader only, a follower holds
+    // no verdict state, so its verdict bound never moves.
     if (!servableHere_(msg.topicId, partition, msg.isolation)) [[unlikely]] {
         spdlog::debug("ClientGateway: Subscribe to topicId={} partition={} (isolation {}) on a follower — "
                       "NotLeader (retriable)", msg.topicId, partition, msg.isolation);

@@ -62,10 +62,11 @@ public:
     /// NotLeader (the client re-routes), a stale "leader" is the demotion the
     /// client's metadata update moves the subscription away from.
     /// Checked writes: this partition's records are deliverable only by its leader (the judge's node) - a lease topic
-    /// (immutable config) or a published verdict source.  A plain subscription is then served like read_committed:
+    /// (immutable config) or a typed partition (the worker published that it has a write state: a follower holds no
+    /// verdict state).  A plain subscription is then served like read_committed:
     /// refused on a follower and moved off a demoted leader (no silent stall behind a verdict bound that never moves).
     [[nodiscard]] bool leaderOnlyReads() const noexcept {
-        return replica_->leaseTopic() || replica_->gatewayVerdictSource();
+        return replica_->leaseTopic() || replica_->gatewayLeaderOnlyReads();
     }
     [[nodiscard]] bool publishedLeader() const noexcept {
         return intended_ != IntendedRole::Follower &&

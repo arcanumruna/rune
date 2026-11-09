@@ -1241,11 +1241,12 @@ acknowledged deadline per leader on simulated real time with drift ρ), `LeaseSt
 - **Finding, fixed (checked writes, broker).** The tap froze after a leader moved back: a read_uncommitted subscription bound
   on a node that led the partition stayed there after its demotion, and the follower's verdict bound
   (`Worker::verdictBound_`) never moves (a follower keeps no verdict state, checked-writes plan 04 P4-1), so it pushed nothing
-  and never told the client. The gateway now serves a partition whose records need verdicts (a lease topic, or a published
-  verdict source: `PartitionReplica::publishVerdictSource`) from its leader only at any isolation, like read_committed:
+  and never told the client. Checkpoint E narrowed the criterion to the worker's own fail-closed rule: typed partitions are
+  leader-only reads (a partition with a write state, `PartitionReplica::publishLeaderOnlyReads`, set whether or not a constraint
+  set is logged). The gateway serves such a partition (and a lease topic) from its leader only at any isolation, like read_committed:
   `ClientGateway::servableHere_` refuses it on a follower and `movedAway_` moves it off a demoted leader (bare NotLeader; the
   client re-subscribes from its position). Regressions: `TransientGatewayRegression.VerdictSource*`,
-  `CheckedWritesConsumerRegression.VerdictSourceIsPublishedToTheGatewayRegression`, and Leg T itself: the tap never
+  `CheckedWritesConsumerRegression.TypedPartitionIsLeaderOnlyRegression`, and Leg T itself: the tap never
   re-subscribes (before the fix, 19 of 20 trio seeds froze).
 - **Mutations** (each applied, stress target rebuilt, 20 seeds per leg, reverted, `touch`ed): M1 (promotion deadline without
   `extend`) not red in 20 trio seeds (a crashed leader is replaced only after the heartbeat timeout, so readiness is already
@@ -1274,15 +1275,30 @@ modelled on `checked-writes-e2e.sh`; a small driver `client-cpp/examples/lease_e
   5. `ReadOnly` then `RejectAll` on the namespace mid-TTL: an unkept lease still expires; resume.
   Check `df` before and after; remove only your own containers and images.
 **As built (Task 19).** Files: `broker/docker/lease-e2e.sh`, `client-cpp/examples/lease_e2e_driver.cpp` (subcommands
-setup, grant, ttl, scan, hold, watch, scale-hold, guard), `client-cpp/docker/Dockerfile.lease-e2e-driver` + `.dockerignore`
+setup, grant, ttl, scan, hold, watch, scale-hold, ckpt-poll, guard), `client-cpp/docker/Dockerfile.lease-e2e-driver` + `.dockerignore`
 (iptables in the runtime stage), and a CMake block next to `checked_writes_probe`.
 - Deviation: no `docker-compose.lease.yml`. The default config needs no overlay; the script uses `docker-compose.yml` +
   `docker-compose.auth.yml` only.
 - Clock: Expire/Checkpoint records carry timestamp 0, so every lateness is RECEIVE time (`CLOCK_REALTIME` ms stamped in the
   watcher handler, the same domain as the script's `date +%s%3N`). Only upper bounds are asserted; early expiry is the stress
   test's job.
-- GUARD offset method: the client has no partition end-offset query, so O = highest acked offset + 1 at the first pass
-  at or after Entered + d; the log read from offset 0 must hold every record below O and no `LeaseAtRisk` send.
+- GUARD marker method (Checkpoint E fix round; replaces the earlier offset-O method): the client has no partition end-offset
+  query, so at the first pass at or after Entered (E) + d an UNGUARDED producer on its own client session appends a marker
+  record (sequence `UINT64_MAX`) and waits for its ack (offset M). The log read from offset 0 must hold no guarded record at
+  an offset > M. In-flight batches that failed `LeaseAtRisk` MAY still be appended within d of their send (spec 12.2), so the
+  old "no `LeaseAtRisk` send is in the log" check is gone; they sit before M. A failure lists each late record's seq, offset,
+  send time and ack time.
+- CHECKPOINT bound (Checkpoint E fix round): the watcher and the checkpoint pollers are seeded on a node W that does not lead
+  the partition. A checkpoint is observed as folded through the lease view row (`lease_remaining_ms` > 0, new driver subcommand
+  `ckpt-poll`; a raw subscription never delivers Checkpoint records). Kill 1 follows a folded checkpoint (R1); kill 2 follows a
+  NEW one under the new leader (R2 < R1) and is skipped (logged) when that leader is W or the lease already expired. For the
+  last kill the bound is spec 9.6: received <= L + extend + R + BOUND_MS, L = the realtime `partition_leader` first shows the
+  new leader (stands in for T_ready, so it can be slightly tight: a miss under 1 s prints every number). Every timestamp and
+  the plain lateness `received - (G + 15 s)` are printed; the restart no longer blocks before the bound timestamps are taken.
+- Basic watcher: restarted per leg (BASIC, SUSPEND; no node is guaranteed to survive the GUARD / CHECKPOINT kills), each with
+  an explicit cap (leg cap + 60 s) and its exit code checked; the exactly-once check is per (key, version).
+- Images: the script records before building which of the broker / rune CLI (QL) / driver images already exist and removes at
+  teardown only those it created (the QL image from `create-topics.sh --build-image` included); `LEASE_E2E_KEEP_IMAGES=1` keeps all.
 - Bounds: `BOUND_MS=1500`, `SCALE_BOUND_MS=5000` (env-overridable); every measured lateness is printed. extend = 300 ms
   (compose election timeout, `NodeConfig.h:1247`).
 - Other deviations: 10 000 leases use 3 `LeaseSession<3334>` (capacity <= 4095); the typed lease topics are defined by the

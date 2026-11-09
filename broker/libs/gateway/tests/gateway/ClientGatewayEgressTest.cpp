@@ -34,6 +34,7 @@
 #include <rune/gateway/SpillFifo.h>
 #include <rune/gateway/SpillPool.h>
 #include <rune/protocol/client/OffsetMessages.h>
+#include <arpa/inet.h>
 #include <array>
 #include <rune/consensus/PeerResolution.h>
 #include <rune/protocol/client/ControlMessages.h>
@@ -1888,7 +1889,9 @@ TEST(GatewayUnknownSessionRegression, NoticeTableBoundedRegression)
 {
     CaptureAll cap;
     ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
-    const auto ch = [](int i) { return std::string("aeron:udp?endpoint=localhost:") + std::to_string(40000 + i); };
+    // One distinct numeric source host per channel: a pending entry is one per source host (OnePendingNoticePerSourceHostRegression),
+    // and a hostname would be refused without a resolver (NoticeChannelHostnameResolvedOffThreadRegression).
+    const auto ch = [](int i) { return "aeron:udp?endpoint=127.0.0." + std::to_string(i + 1) + ":" + std::to_string(40000 + i); };
     constexpr int kChannels = 20;
     int queued = 0, dropped = 0;
     for (int i = 0; i < kChannels; ++i) {
@@ -1919,8 +1922,110 @@ TEST(GatewayUnknownSessionRegression, NoticeTableBoundedRegression)
     EXPECT_EQ(gw.unknownSessionNoticesDeduped(), 1u);
     for (int s = 1; s < 4; ++s) EXPECT_EQ(gw.answerUnknownSessionForTest(ch(200), 2, 8000 + s, -1, 4), 0);
     EXPECT_EQ(gw.answerUnknownSessionForTest(ch(200), 2, 8009, -1, 4), 2) << "a 5th session of one channel is dropped";
-    EXPECT_EQ(gw.answerUnknownSessionForTest(ch(200), 3, 8009, -1, 4), 0) << "another stream is its own entry";
+    EXPECT_EQ(gw.answerUnknownSessionForTest(ch(200), 3, 8009, -1, 4), 2) << "another stream of the same source host waits for its pending entry";
     EXPECT_EQ(gw.answerUnknownSessionForTest(std::string(256, 'a'), 2, 9000, -1, 4), 2) << "over the 255-byte cap is dropped";
+}
+
+// Checkpoint E (U3): a hostname endpoint of a notice is resolved OFF-thread through the cold resolver, exactly as the declared-egress
+// Connect path does (DR-15), never by the conductor or the duty thread.  The publication is added only after the resolver answers; with
+// no resolver a hostname is refused (Dropped) and no publication is added.
+// RED: call addExclusivePublication (the placeholder here) at once, without the resolver round trip.
+TEST(GatewayUnknownSessionRegression, NoticeChannelHostnameResolvedOffThreadRegression)
+{
+    const std::string host = "aeron:udp?endpoint=client-host.example:40123";
+    {   // no resolver: refused, nothing registered
+        CaptureAll cap;
+        ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+        EXPECT_EQ(gw.answerUnknownSessionForTest(host, 2, 5001, -7, 0), 2) << "a hostname without a resolver is Dropped";
+        EXPECT_EQ(gw.pendingNoticeCountForTest(), 0u);
+        EXPECT_EQ(gw.pollUnknownSessionNoticesForTest(1), 0);
+        EXPECT_TRUE(cap.frames.empty());
+        EXPECT_EQ(gw.unknownSessionNoticesDropped(), 1u);
+    }
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    rune::consensus::HostResolveRing req, resp;
+    gw.setHostResolver(rune::consensus::HostResolvePort{&req, &resp});
+    EXPECT_EQ(gw.answerUnknownSessionForTest(host, 2, 5001, -7, 0), 0);
+    EXPECT_EQ(gw.pollUnknownSessionNoticesForTest(1), 0) << "the publication is not added before the resolver answers";
+    EXPECT_TRUE(cap.frames.empty());
+    ASSERT_EQ(gw.pendingNoticeCountForTest(), 1u);
+    int64_t id = 0;
+    std::string asked;
+    req.poll([&](std::int32_t type, std::int64_t i, std::int64_t h) {
+        ASSERT_EQ(type, rune::consensus::kHostResolveRequest);
+        id = i;
+        auto* p = reinterpret_cast<std::string*>(static_cast<std::intptr_t>(h));
+        asked = *p;
+        delete p;
+    });
+    EXPECT_EQ(asked, "client-host.example");
+    EXPECT_LT(id, 0) << "a notice's resolve id never collides with a session id";
+    in_addr a{};
+    ASSERT_EQ(::inet_pton(AF_INET, "127.0.0.9", &a), 1);
+    ASSERT_TRUE(resp.offer(rune::consensus::kHostResolved, id, static_cast<std::int64_t>(a.s_addr)));
+    gw.pollPendingConnectsForTest(2);   // the resolver's answer is applied
+    EXPECT_EQ(gw.pendingNoticeChannelForTest(0), "aeron:udp?endpoint=127.0.0.9:40123");
+    EXPECT_EQ(gw.pollUnknownSessionNoticesForTest(3), 1);
+    const auto e = pc::ErrorResponse::decode(cap.frames.at(0).data(), cap.frames.at(0).size());
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->sessionId, 5001);
+    EXPECT_EQ(e->correlationId, -7);
+    EXPECT_EQ(gw.pendingNoticeCountForTest(), 0u);
+}
+
+// Checkpoint E (U3): ONE pending notice entry per source host (the Connect path's fairness key), in every auth mode: a single sender
+// cannot squat the 16-entry table with unknown sessions on many channels.
+// RED: drop the per-host check in answerUnknownSession_.
+TEST(GatewayUnknownSessionRegression, OnePendingNoticePerSourceHostRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const auto ch = [](int host, int port) { return "aeron:udp?endpoint=127.0.0." + std::to_string(host) + ":" + std::to_string(port); };
+    EXPECT_EQ(gw.answerUnknownSessionForTest(ch(1, 40001), 2, 100, -1, 0), 0);
+    for (int i = 1; i < 5; ++i)
+        EXPECT_EQ(gw.answerUnknownSessionForTest(ch(1, 40001 + i), 2, 100 + i, -1, 0), 2) << "a second pending entry of the same host is Dropped";
+    EXPECT_EQ(gw.pendingNoticeCountForTest(), 1u);
+    EXPECT_EQ(gw.unknownSessionNoticesDropped(), 4u);
+    EXPECT_EQ(gw.answerUnknownSessionForTest(ch(2, 40001), 2, 200, -1, 0), 0) << "a second host has its own entry";
+    EXPECT_EQ(gw.pendingNoticeCountForTest(), 2u);
+    EXPECT_EQ(gw.pollUnknownSessionNoticesForTest(1), 2);
+    EXPECT_EQ(gw.answerUnknownSessionForTest(ch(1, 40002), 2, 101, -1, 2), 0) << "once the first entry is done the host may queue again";
+}
+
+// Checkpoint E (U2): a clear frame naming a KNOWN encrypted session is dropped BEFORE any AEAD attempt and counted apart.  The
+// probe's correlationId (at or below -2^32; no sealed Ping carries one) tells it from a sealed Ping.  A live gateway never answers it (no
+// Pong), and it is not tamper or replay evidence.  RED: remove the probe check (the frame goes to the AEAD open and is dropped silently,
+// the new counter stays 0).
+TEST(GatewayUnknownSessionRegression, ClearFrameOnEncryptedSessionDroppedBeforeAeadRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t plain = gw.injectReliableTestSessionForTest(0);
+    const int64_t enc   = gw.injectReliableTestSessionForTest(0);
+    ASSERT_TRUE(gw.markSessionEncryptedForTest(enc));
+    const auto ping = [](int64_t sid, int64_t corr) {
+        pc::Ping p;
+        p.sessionId = sid;
+        p.correlationId = corr;
+        p.echo = "xxxxx";
+        std::vector<uint8_t> f(128);
+        f.resize(p.encode(f.data()));
+        return f;
+    };
+    const auto fp = ping(plain, -5);
+    ASSERT_TRUE(gw.applyClientFrameForTest(fp.data(), fp.size()));
+    ASSERT_TRUE(cap.last<pc::Pong>().has_value()) << "control: a clear Ping on a plaintext session is answered";
+    EXPECT_EQ(gw.clearFramesOnEncryptedSessionDropped(), 0u);
+    cap.frames.clear();
+    const auto fe = ping(enc, -(int64_t{1} << 40));
+    ASSERT_TRUE(gw.applyClientFrameForTest(fe.data(), fe.size()));
+    EXPECT_EQ(gw.clearFramesOnEncryptedSessionDropped(), 1u);
+    EXPECT_TRUE(cap.frames.empty()) << "no Pong, no notice";
+    EXPECT_EQ(gw.unknownSessionNoticesDropped() + gw.unknownSessionNoticesSent(), 0u) << "a known session never takes the notice path";
+    const auto fk = ping(enc, -3);   // a keepalive-shaped Ping (a sealed one on a real session): not a probe, goes to the AEAD open
+    ASSERT_TRUE(gw.applyClientFrameForTest(fk.data(), fk.size()));
+    EXPECT_EQ(gw.clearFramesOnEncryptedSessionDropped(), 1u) << "only the probe shape is counted";
 }
 
 } // namespace

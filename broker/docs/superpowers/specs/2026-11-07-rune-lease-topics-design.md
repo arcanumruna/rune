@@ -1589,6 +1589,12 @@ table keyed by channel and stream), so the client reconnects at once; the client
 Limit: in response mode (`gatewayResponseControlPort != 0`) the notice publication does not connect to the client's surviving response
 subscription, so recovery there is by the response timeout (`GatewayUnknownSessionRegression.DISABLED_ResponseModeRestartedNodeAnswersRegression`;
 an issue is filed).
+Checkpoint E additions to L22: an ENCRYPTED session is covered by a probe (a restarted gateway holds no keys, so it cannot open the sealed
+keepalive and its notice is clear text, which the client drops for an encrypted session): right after each keepalive the client also sends
+a clear Ping with a fresh random negative nonce as its correlationId, and accepts a clear `UnknownSession` for that session only when it
+echoes one of its last two nonces (a live gateway drops the clear frame before any AEAD attempt, `clearFramesOnEncryptedSessionDropped`);
+the notice's endpoint name is resolved off-thread by the cold resolver like a Connect's (no resolver: refused, never resolved inline); and
+the table keeps one pending notice per source host.
 - **Namespaces.**
   - `ReadOnly`: keepalives served, writes refused, an unkept lease still expires.
   - `RejectAll`: keepalives refused, and every lease ends within TTL + bound.
@@ -1637,8 +1643,9 @@ steps, at most 2 leader kills and restarts per seed). Skipped step kinds: partit
 bound is read from the lease view row (client subscriptions never see Checkpoint records); I6 is not checked directly (no
 counter); end-record append time is the tap's receive time. Mutations M1, M3, M4, M13 were not red in 20 seeds on the legs that
 could see them; M16 has no pause code. The stress found a silent stall, fixed: a subscription to records needing verdicts
-(any lease topic, any verdict source) is served by the partition leader only, at any isolation, and is moved off a demoted
-leader with NotLeader (a follower keeps no verdict state). See the plan's Task 18 note.
+(any lease topic, any typed partition) is served by the partition leader only, at any isolation, and is moved off a demoted
+leader with NotLeader (a follower keeps no verdict state): typed partitions are leader-only reads (Checkpoint E narrowed the bit to the
+worker's own fail-closed rule, a write state, not a logged constraint set). See the plan's Task 18 note.
 
 ### 16.5 Mutation checks (each turns a test red)
 

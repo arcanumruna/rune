@@ -619,7 +619,7 @@ TEST(TransientGatewayRegression, ReadCommittedSubscriptionOnADemotedLeaderAnswer
 TEST(TransientGatewayRegression, VerdictSourceUncommittedSubscriptionOnADemotedLeaderAnswersNotLeaderRegression) {
     Rig r;
     const int64_t sid = r.gw.injectTestSession(0);
-    r.rep->publishVerdictSource(true);   // the owning worker saw a logged constraint set
+    r.rep->publishLeaderOnlyReads(true);   // the owning worker saw a logged constraint set
     r.subscribe(sid, -2, 63, /*read_uncommitted=*/0);
     ASSERT_TRUE(r.subscribed.count(63));
     r.gw.pushSubscriptionsForTest();
@@ -641,7 +641,7 @@ TEST(TransientGatewayRegression, VerdictSourceUncommittedSubscribeOnAFollowerIsR
     r.rep->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
     r.subscribe(sid, -2, 64, /*read_uncommitted=*/0);
     ASSERT_TRUE(r.subscribed.count(64)) << "precondition: a follower serves read_uncommitted without verdicts";
-    r.rep->publishVerdictSource(true);
+    r.rep->publishLeaderOnlyReads(true);
     r.subscribe(sid, -2, 65, /*read_uncommitted=*/0);
     ASSERT_TRUE(r.errors.count(65)) << "a follower accepted a read_uncommitted subscription to records needing verdicts";
     EXPECT_EQ(r.errors[65], kNotLeader);
