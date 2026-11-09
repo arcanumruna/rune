@@ -2668,18 +2668,34 @@ std::vector<uint8_t> bytesOf(std::expected<std::vector<uint8_t>, std::string> k)
     return std::move(*k);
 }
 
+/// True once `n`'s catalog applier holds `view`. A view created through another node reaches a follower's catalog
+/// asynchronously, so a test reading the definition on that follower waits for it first.
+bool awaitViewKnown(BrokerNode& n, const std::string& view) {
+    for (int i = 0; i < 2000; ++i) {
+        const bool known = n.onAdminThreadForTest([&n, &view] {
+            return n.adminWorkerAgentForTest()->worker().applier().state().viewByName(rune::catalog::kDefaultNsId, view) != nullptr;
+        });
+        if (known) return true;
+        std::this_thread::sleep_for(5ms);
+    }
+    return false;
+}
+
 /// The columns of a view's rows by name, from the output descriptor the catalog holds.
 struct ViewColumns {
     rcv::RowLayout           layout;
     std::vector<std::string> names;
 
     ViewColumns(BrokerNode& n, const std::string& view) {
-        const auto blob = n.onAdminThreadForTest([&n, &view] {
-            return n.adminWorkerAgentForTest()->worker().applier().state().viewByName(rune::catalog::kDefaultNsId, view)->def.outputDescriptorBlob;
+        const auto blob = n.onAdminThreadForTest([&n, &view]() -> std::optional<std::vector<uint8_t>> {
+            const auto* v = n.adminWorkerAgentForTest()->worker().applier().state().viewByName(rune::catalog::kDefaultNsId, view);
+            if (v == nullptr) return std::nullopt;
+            return v->def.outputDescriptorBlob;
         });
+        if (!blob) throw std::runtime_error("view '" + view + "' is not in this node's catalog");
         std::vector<PrimType> types;
         std::vector<uint16_t> widths;
-        for (const auto& f : rune::codec::deserialize(blob).fields) {
+        for (const auto& f : rune::codec::deserialize(*blob).fields) {
             names.push_back(f.name);
             types.push_back(f.type);
             widths.push_back(f.type == PrimType::FixedStr ? f.fixedLen : uint16_t{0});
@@ -3000,6 +3016,7 @@ TEST(CheckedWritesBrokerRegression, WideViewReadsAfterLeaderCrashThreeNodesRegre
     int32_t seed = 0;
     for (const int id : c.runningNodes()) if (id != victim) { seed = id; break; }
     ASSERT_GT(seed, 0);
+    ASSERT_TRUE(awaitViewKnown(c.node(seed), "account_characters")) << "node " << seed << " never applied the view";
     const ViewColumns cols(c.node(seed), "account_characters");
     rcv::ViewKeyBuilder builder = keyBuilder(c.node(seed), "account_characters");
 
