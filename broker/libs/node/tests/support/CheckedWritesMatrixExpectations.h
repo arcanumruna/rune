@@ -15,7 +15,7 @@ enum class Op : uint16_t {
     ViewUpsertNew = 60, ViewUpdateNonKey = 61, ViewRename = 62, ViewMoveGroup = 63, ViewDelete = 64, ViewDeleteThenReuse = 65,   // 07: 60-79
     ViewDuplicateRetry = 66, ViewPointRead = 67, ViewPrefixScan = 68,
     CCreate = 80, CUpdateNonKey = 81, CRename = 82, CMove = 83, CRemove = 84, CRemoveExisting = 85, CDeleteThenReuse = 86,   // 09: 80-99
-    /* 11: 100-119 */
+    TxnCreate = 100, TxnRename = 101, TxnMove = 102, TxnRemoveExisting = 103, TxnSelfCollidingCreates = 104, TxnUpdateNonKey = 105, AtomicBatch = 106,   // 11: 100-119
     ViewAckLV = 120, ViewAckAV = 121,                                                                   // 03: 120-139
 };
 enum class Entity : uint16_t {
@@ -26,6 +26,8 @@ enum class Entity : uint16_t {
     KeyU16 = 60, KeyU32 = 61, KeyU64 = 62, KeyI64 = 63, KeyStr16 = 64, KeyComposite = 65, KeyCompositeWide = 66, KeyLower = 67, KeyMaxWidth = 68,   // 07: 60-79
     G11Free = 80, G11Taken = 81, G12Free = 82, G12Taken = 83, OverFree = 84, OverTaken = 85, G11Self = 86, G12Self = 87, OverSelf = 88,   // 09: 80-99
     DupOwner = 89, DupExtra = 90,
+    AllPass = 100, FailsUnique = 101, FailsCheck = 102, SecondPartitionNo = 103, KeyAbsent = 104, OutsideWriteSameKey = 105,   // 11: 100-119
+    OutsideWriteLockedRow = 106, RacingTxnSameName = 107,
     AckNoViews = 120, AckOneView = 121, AckTwoViewsLate = 122, AckTransientSource = 123,                 // 03: 120-139
 };
 enum class Timing : uint16_t {
@@ -290,6 +292,42 @@ enum class V09 : uint8_t { Ok, N, M };
     }
 }
 
+// ---- Part 11 (transaction votes): the Single table ----
+/// A verdict of the Single table: Ok, N (character_name), M (account_stats), K (KeyNotFound) or C (TxnConflict).
+enum class V11 : uint8_t { Ok, N, M, K, C };
+
+/// The Single table of the plan's Interaction matrix A: `character`'s verdict of the transaction (or atomic batch) and, for OutsideWriteLockedRow, of
+/// producer 78's create after the vote; for RacingTxnSameName, of the second transaction (the second batch).  Empty = the pair is not applicable.
+/// The ledger partition's own vote (SecondPartitionNo) is not `character`'s.
+[[nodiscard]] inline std::vector<V11> single11(Op op, Entity e) {
+    constexpr V11 O = V11::Ok, N = V11::N, M = V11::M, K = V11::K, C = V11::C;
+    const bool create = op == Op::TxnCreate || op == Op::TxnSelfCollidingCreates;
+    switch (e) {
+    case Entity::AllPass: return {op == Op::TxnSelfCollidingCreates ? N : O};
+    case Entity::SecondPartitionNo: return op == Op::AtomicBatch ? std::vector<V11>{} : std::vector<V11>{op == Op::TxnSelfCollidingCreates ? N : O};
+    case Entity::FailsUnique: return {op == Op::TxnCreate || op == Op::TxnRename || op == Op::AtomicBatch || op == Op::TxnSelfCollidingCreates ? N : O};
+    case Entity::FailsCheck: return {create || op == Op::TxnMove || op == Op::AtomicBatch ? M : O};
+    case Entity::KeyAbsent: return create || op == Op::AtomicBatch ? std::vector<V11>{} : std::vector<V11>{K};
+    case Entity::OutsideWriteSameKey: return create || op == Op::AtomicBatch ? std::vector<V11>{} : std::vector<V11>{C};
+    case Entity::OutsideWriteLockedRow:
+        switch (op) {
+        case Op::TxnCreate: case Op::TxnMove: return {O, M};
+        case Op::TxnSelfCollidingCreates: return {N, O};
+        case Op::AtomicBatch: return {M, O};
+        default: return {O, O};
+        }
+    default:   // RacingTxnSameName
+        switch (op) {
+        case Op::TxnCreate: case Op::TxnRename: return {O, N};
+        case Op::TxnMove: return {O, M};
+        case Op::TxnRemoveExisting: return {O, K};
+        case Op::TxnSelfCollidingCreates: return {N, O};
+        case Op::AtomicBatch: return {O, N};
+        default: return {O, O};
+        }
+    }
+}
+
 [[nodiscard]] inline Expected expect09(const Cell& c) {
     if (c.op == Op::CCreate && (isSelf09(c.entity) || c.entity == Entity::DupExtra))
         return {false, c.entity == Entity::DupExtra ? "the duplicate's name is the DupOwner cell" : "a new record owns no name yet"};
@@ -397,6 +435,9 @@ inline const char* nameOf(Op o) {
     case Op::ViewDuplicateRetry: return "ViewDuplicateRetry"; case Op::ViewPointRead: return "ViewPointRead"; case Op::ViewPrefixScan: return "ViewPrefixScan";
     case Op::ImportAbove: return "ImportAbove"; case Op::UpdateAssigned: return "UpdateAssigned"; case Op::RemoveExistingAssigned: return "RemoveExistingAssigned"; case Op::CCreate: return "CCreate"; case Op::CUpdateNonKey: return "CUpdateNonKey"; case Op::CRename: return "CRename"; case Op::CMove: return "CMove";
     case Op::CRemove: return "CRemove"; case Op::CRemoveExisting: return "CRemoveExisting"; case Op::CDeleteThenReuse: return "CDeleteThenReuse";
+    case Op::TxnCreate: return "TxnCreate"; case Op::TxnRename: return "TxnRename"; case Op::TxnMove: return "TxnMove";
+    case Op::TxnRemoveExisting: return "TxnRemoveExisting"; case Op::TxnSelfCollidingCreates: return "TxnSelfCollidingCreates";
+    case Op::TxnUpdateNonKey: return "TxnUpdateNonKey"; case Op::AtomicBatch: return "AtomicBatch";
     case Op::ViewAckLV: return "ViewAckLV"; case Op::ViewAckAV: return "ViewAckAV";
     }
     return "?";
@@ -410,6 +451,10 @@ inline const char* nameOf(Entity e) {
     case Entity::G11Free: return "G11Free"; case Entity::G11Taken: return "G11Taken"; case Entity::G12Free: return "G12Free"; case Entity::G12Taken: return "G12Taken";
     case Entity::OverFree: return "OverFree"; case Entity::OverTaken: return "OverTaken"; case Entity::G11Self: return "G11Self"; case Entity::G12Self: return "G12Self";
     case Entity::OverSelf: return "OverSelf"; case Entity::DupOwner: return "DupOwner"; case Entity::DupExtra: return "DupExtra";
+    case Entity::AllPass: return "AllPass"; case Entity::FailsUnique: return "FailsUnique"; case Entity::FailsCheck: return "FailsCheck";
+    case Entity::SecondPartitionNo: return "SecondPartitionNo"; case Entity::KeyAbsent: return "KeyAbsent";
+    case Entity::OutsideWriteSameKey: return "OutsideWriteSameKey"; case Entity::OutsideWriteLockedRow: return "OutsideWriteLockedRow";
+    case Entity::RacingTxnSameName: return "RacingTxnSameName";
     case Entity::AckNoViews: return "AckNoViews"; case Entity::AckOneView: return "AckOneView";
     case Entity::AckTwoViewsLate: return "AckTwoViewsLate"; case Entity::AckTransientSource: return "AckTransientSource";
     case Entity::KeyNew: return "KeyNew"; case Entity::KeyExisting: return "KeyExisting"; case Entity::KeyEarlierInBatch: return "KeyEarlierInBatch";

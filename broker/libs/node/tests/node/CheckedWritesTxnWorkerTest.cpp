@@ -962,17 +962,26 @@ TEST(CheckedWritesTxnWorker, VotedAbortedRefoldsEqual) {
 }
 
 // Contract addition 19: one transaction over two topics.  Both vote yes: the commit applies it on both.  One votes no: it aborts on
-// both, and the other applies nothing.
+// both, and the other applies nothing.  An abort applies nothing on either.
 TEST(CheckedWritesTxnWorker, TxnPairCommitsOnBothOrNeither) {
-    TxnPair t;
+    TxnPair t([](VerdictRig& r) {
+        r.createKeyIndex();
+        r.enableAcks();
+        r.worker->setVerdictIntervalNs(1'000'000);
+        r.passes(60);
+    });
     t.write(70, {ins(1)}, {ins(2)});
-    EXPECT_TRUE(t.end(70));
+    EXPECT_TRUE(t.commit(70).committed);
     EXPECT_EQ(t.a.keyIndexKeys(), (std::set<uint64_t>{1}));
     EXPECT_EQ(t.b.keyIndexKeys(), (std::set<uint64_t>{2}));
     t.write(71, {ins(1)}, {ins(3)});   // 1 exists on a: a votes KeyExists
-    EXPECT_FALSE(t.end(71));
+    EXPECT_FALSE(t.commit(71).committed);
     EXPECT_EQ(t.a.keyIndexKeys(), (std::set<uint64_t>{1}));
     EXPECT_EQ(t.b.keyIndexKeys(), (std::set<uint64_t>{2})) << "b's yes is aborted with a's no";
+    t.write(72, {ins(4)}, {ins(5)});
+    EXPECT_FALSE(t.abort(72).committed);
+    EXPECT_EQ(t.a.keyIndexKeys(), (std::set<uint64_t>{1}));
+    EXPECT_EQ(t.b.keyIndexKeys(), (std::set<uint64_t>{2}));
 }
 
 // Design L6: after the partition's vote, a producer (and epoch) that cached the partition as verified may not append to its

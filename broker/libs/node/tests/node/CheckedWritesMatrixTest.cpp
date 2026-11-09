@@ -359,11 +359,13 @@ public:
         CheckedWritesModel model;
         model.declareRule(kObj, tagRule(9).fingerprint(), modelRule(tagRule(9)));
         model.addKeyIndexRule();
-        model.reset(commitOrder_(withoutAbortedTxn_(log)));
+        model.reset(log);
         if (c_.timing == Timing::TxnCommitBehind) {
-            EXPECT_EQ(txnEnd_.committed, !txnConflict_);
-            EXPECT_EQ(r_.writeState()->txn.stats.votesNoConflict, txnConflict_ ? 1u : 0u);
-            if (txnConflict_) {
+            const auto vote = model.vote(kTxnPid);
+            const bool conflict = vote && vote->code == 63;
+            EXPECT_EQ(txnEnd_.committed, !conflict);
+            EXPECT_EQ(r_.writeState()->txn.stats.votesNoConflict, conflict ? 1u : 0u);
+            if (conflict) {
                 ASSERT_EQ(txnEnd_.votes.size(), 1u);
                 EXPECT_EQ(txnEnd_.votes.at(0).second.code, 63) << "the vote names TxnConflict";
             }
@@ -558,7 +560,6 @@ private:
             const auto ta = r_.ackFetching(txn.corr, ackPasses_());
             ASSERT_TRUE(ta);
             EXPECT_EQ(ta->code, 0);
-            txnOffset_ = ta->baseOffset;
             sendOp_();
             for (int i = 0; i < 300; ++i) {   // the op is below the HW (the follower keeps fetching) while the transaction is open
                 if (i % 8 == 0) r_.followerFetch();
@@ -609,31 +610,6 @@ private:
         ASSERT_TRUE(waitActive_());
         r_.passes(10);
         sendOp_();
-    }
-
-    VerdictRig::RigLog withoutAbortedTxn_(VerdictRig::RigLog log) const {
-        if (c_.timing == Timing::TxnAbortBehind)
-            std::erase_if(log.data, [&](const VerdictRig::RigLogRec& d) { return d.offset == txnOffset_; });
-        return log;
-    }
-
-    // P11-0: a committed transaction applies at its commit marker, above every record of the cell, not at its own offset.  Where the op left a record of k (a tombstone too), an
-    // ordinary key index supersedes the upsert but still delivers it, and the constrained vote answers TxnConflict: the transaction aborts.
-    VerdictRig::RigLog commitOrder_(VerdictRig::RigLog log) {
-        if (c_.timing != Timing::TxnCommitBehind) return log;
-        const auto at = std::find_if(log.data.begin(), log.data.end(), [&](const VerdictRig::RigLogRec& d) { return d.offset == txnOffset_; });
-        const VerdictRig::RigLogRec txn = *at;
-        log.data.erase(at);
-        const auto marker = r_.markerAnswer(kTxnPid);
-        EXPECT_TRUE(marker && (log.data.empty() || log.data.back().offset < *marker)) << "no record of the cell follows the commit marker";
-        CheckedWritesModel withoutTxn;
-        withoutTxn.declareRule(kObj, tagRule(9).fingerprint(), modelRule(tagRule(9)));
-        withoutTxn.addKeyIndexRule();
-        withoutTxn.reset(log);
-        const auto last = withoutTxn.latestAcceptedByKey().find(kKey);
-        txnConflict_ = c_.entity == Entity::KeyRejectedEarlier && last != withoutTxn.latestAcceptedByKey().end() && last->second.offset > txnOffset_;
-        if (!txnConflict_) log.data.push_back(txn);
-        return log;
     }
 
     static uint64_t count_(const CheckedWritesModel& model, uint16_t code) {
@@ -716,8 +692,6 @@ private:
     std::map<int64_t, int32_t> seqs_;
     std::size_t stored_ = 0;
     int16_t firstAckCode_ = 0;
-    int64_t txnOffset_ = -1;
-    bool txnConflict_ = false;   // the constrained vote answered TxnConflict: T is not delivered
     VerdictRig::TxnEnd txnEnd_;
     Trailer setupTrailer_;
 };
@@ -770,8 +744,8 @@ public:
 
         const auto judgeAll = [&] {
             waitCommitted_();
-            const auto appended = withoutAbortedTxn_(r_.readLog());   // an aborted transaction at the tail needs no verdicts
-            const int64_t reach = std::max(appended.data.empty() ? 0 : appended.data.back().offset + 1, appended.changes.empty() ? 0 : appended.changes.back().offset + 1);
+            const auto appended = r_.readLog();
+            const int64_t reach = std::max(judgedEnd_(appended), appended.changes.empty() ? 0 : appended.changes.back().offset + 1);
             EXPECT_TRUE(r_.driveUntilJudged(reach, VerdictRig::kMaxPass * strictFactor_()));
             r_.passes(60);
             return reach;
@@ -783,12 +757,11 @@ public:
             target = judgeAll();
         }
         const auto log = r_.readLog();
-        const auto judged = withoutAbortedTxn_(log);
         CheckedWritesModel model;
         model.declareRule(kObj, tagRule(9).fingerprint(), modelRule(tagRule(9)));
         model.declareRule(kObj, tagRule(1).fingerprint(), modelRule(tagRule(1)));
         model.addAutoIncRule(setup_.shape, setup_.partition);
-        model.reset(judged);
+        model.reset(log);
         collectAcks_();
 
         checkIndex(r_, model);                                                           // (a)
@@ -815,8 +788,7 @@ public:
         std::set<int64_t> present;
         for (const auto& d : r_.readLog().data) present.insert(d.offset);
         r_.restart();
-        const auto compacted = withoutAbortedTxn_(r_.readLog());
-        ASSERT_TRUE(r_.driveUntilJudged(compacted.data.empty() ? 0 : compacted.data.back().offset + 1));
+        ASSERT_TRUE(r_.driveUntilJudged(judgedEnd_(r_.readLog())));
         r_.passes(60);
         checkIndex(r_, model, &present);
         ASSERT_TRUE(waitReady_());
@@ -900,6 +872,16 @@ private:
         }
         EXPECT_EQ(r_.replica->highWatermark(), r_.leo());
     }
+    /// One past the last record that needs a verdict: an aborted transaction at the tail needs none.
+    static int64_t judgedEnd_(const VerdictRig::RigLog& log) {
+        int64_t end = 0;
+        for (const auto& d : log.data) {
+            const bool aborted = d.txn && std::any_of(log.txnMarkers.begin(), log.txnMarkers.end(), [&](const auto& m) { return m.producerId == d.producerId && !m.commit; });
+            if (!aborted) end = d.offset + 1;
+        }
+        return end;
+    }
+
     bool waitReady_() {
         for (int i = 0; i < VerdictRig::kMaxPass; ++i) {
             if (r_.autoIncState() && r_.worker->rcStatusForTest(VerdictRig::kSrc, setup_.partition) == Worker::kRcReady) return true;
@@ -978,7 +960,6 @@ private:
             const auto ta = r_.ackFetching(txn.corr, ackPasses_());
             ASSERT_TRUE(ta);
             EXPECT_EQ(ta->code, 0);
-            txnOffset_ = ta->baseOffset;
             batches_[ta->baseOffset] = 2;
             keyZero_[ta->baseOffset] = {ta->baseOffset, ta->assignedBase, 2};
             sendOp_();
@@ -1032,12 +1013,6 @@ private:
         ASSERT_TRUE(waitReady_());
         r_.passes(10);
         sendOp_();
-    }
-
-    VerdictRig::RigLog withoutAbortedTxn_(VerdictRig::RigLog log) const {
-        if (c_.timing == Timing::TxnAbortBehind)
-            std::erase_if(log.data, [&](const VerdictRig::RigLogRec& d) { return d.offset == txnOffset_ || d.offset == txnOffset_ + 1; });
-        return log;
     }
 
     // Every OK ack of a batch: the batches stored (a retry's ack names the original's offset) and the key-0 ones among them.
@@ -1135,7 +1110,8 @@ private:
                 for (std::size_t i = 0; i < a.count; ++i) rejected += model.verdicts().count(a.baseOffset + static_cast<int64_t>(i));
             EXPECT_GT(rejected, 0u);
             if (!faulty_()) {
-                const std::size_t aborted = c_.timing == Timing::TxnAbortBehind ? keyZero_.at(txnOffset_).count : 0;   // the aborted transaction's two key-0 creates burn their ids too
+                std::size_t aborted = 0;   // the aborted transaction's key-0 creates burn their ids too
+                for (const ModelTxn& t : model.txns()) aborted += t.commit ? 0 : t.offsets.size();
                 EXPECT_EQ(r_.autoIncStats().idsBurned, rejected + aborted) << "every rejected or aborted create burned its id";
                 const auto& later = acksByCorr_.at(sent_.back().corr);
                 uint64_t next = 0;
@@ -1179,7 +1155,7 @@ private:
     std::map<int64_t, std::size_t> batches_;
     std::map<int64_t, CheckedWritesModel::AutoIncAck> keyZero_;
     int16_t firstAckCode_ = 0;
-    int64_t txnOffset_ = -1, cutTo_ = 0;
+    int64_t cutTo_ = 0;
 };
 
 }  // namespace
@@ -2091,6 +2067,151 @@ TEST(CheckedWritesModel, ConstraintRulesMatchTheTable) {
         for (const auto& [off2, v] : m.verdicts()) EXPECT_GE(off2, opAt) << "the setup is unjudged";
     }
     EXPECT_EQ(pairs, 40u);
+}
+
+// The model's transaction rules against the Single-timing table, all 49 applicable op x entity pairs, on hand-built logs: no broker code runs.
+// Producer 77's transaction (or an atomic batch) is written, then its TxnJudge and its marker (a commit exactly when the table votes yes).
+TEST(CheckedWritesModel, TxnRulesMatchTheTable) {
+    using LogRec = VerdictRig::RigLogRec;
+    constexpr uint64_t kName = 7, kStats = 8, kFingerprint = 99;
+    const auto id = [](uint64_t k) { return kIdBase09 + k; };
+    const auto verdictOf = [](V11 v) {
+        switch (v) {
+        case V11::N: return ModelVerdict{55, kNameCid09};
+        case V11::M: return ModelVerdict{55, kStatsCid09};
+        case V11::K: return ModelVerdict{57, 0};
+        case V11::C: return ModelVerdict{63, 0};
+        default: return ModelVerdict{};
+        }
+    };
+    std::size_t pairs = 0;
+    for (const Op op : {Op::TxnCreate, Op::TxnRename, Op::TxnMove, Op::TxnRemoveExisting, Op::TxnSelfCollidingCreates, Op::TxnUpdateNonKey, Op::AtomicBatch})
+        for (const Entity e : {Entity::AllPass, Entity::FailsUnique, Entity::FailsCheck, Entity::SecondPartitionNo, Entity::KeyAbsent, Entity::OutsideWriteSameKey,
+                               Entity::OutsideWriteLockedRow, Entity::RacingTxnSameName}) {
+            const std::vector<V11> want = single11(op, e);
+            if (want.empty()) continue;
+            ++pairs;
+            SCOPED_TRACE(std::string(nameOf(op)) + " x " + nameOf(e));
+            const bool batch = op == Op::AtomicBatch, racing = e == Entity::RacingTxnSameName;
+            VerdictRig::RigLog log;
+            int64_t off = 0;
+            const auto put = [&](const Char09& c, int64_t pid = -1, int64_t batchBase = -1) {
+                LogRec r{off, c.id, static_cast<int64_t>(c.userId), 0, c.del, c.intent, 0, c.name};
+                r.producerId = pid; r.txn = pid >= 0; r.atomic = batchBase >= 0; r.batchBase = batchBase;
+                log.data.push_back(std::move(r));
+                return off++;
+            };
+            // Setup is written before the constrained views exist (unjudged): U's characters, W's, V's.
+            const uint64_t users = e == Entity::FailsCheck ? 12 : (e == Entity::OutsideWriteLockedRow || (racing && op == Op::TxnMove)) ? 11 : 5;
+            for (uint64_t k = 1; k <= users; ++k) put({id(k), kUserU09, "u" + std::to_string(k)});
+            put({id(101), kUserW09, e == Entity::FailsUnique ? "XNEW" : "w1"});
+            for (uint64_t k = 1; k <= 3; ++k) put({id(200 + k), kUserV09, "v" + std::to_string(k)});
+            using Kind = rune::view::VerdictViewKind;
+            log.changes.push_back({off++, {{0, static_cast<uint8_t>(Kind::KeyIndex), kKeyIndexPlanFingerprint}, {kName, static_cast<uint8_t>(Kind::Unique), kFingerprint},
+                                           {kStats, static_cast<uint8_t>(Kind::Check), kFingerprint}}});
+            const Char09 c = op == Op::TxnMove ? Char09{id(201), kUserV09, "v1"} : Char09{id(1), kUserU09, "u1"};
+            if (e == Entity::KeyAbsent) put({c.id, 0, "", 0, 0, true});   // C was removed before the transaction
+            const std::vector<Char09> mine = [&]() -> std::vector<Char09> {
+                switch (op) {
+                case Op::TxnCreate: return {{id(900), kUserU09, "Xnew", 0, 1}};
+                case Op::TxnRename: return {{c.id, c.userId, "Xnew", 0, 2}};
+                case Op::TxnMove: return {{c.id, kUserU09, c.name, 0, 2}};
+                case Op::TxnRemoveExisting: return {{c.id, 0, "", 0, 2, true}};
+                case Op::TxnSelfCollidingCreates: return {{id(900), kUserU09, "Xnew", 0, 1}, {id(901), kUserU09, "xnew", 0, 1}};
+                case Op::TxnUpdateNonKey: return {{c.id, c.userId, c.name, 777, 2}};
+                default: return {{id(900), kUserU09, "Xnew", 0, 1}, {id(901), kUserU09, "Ynew", 0, 1}};
+                }
+            }();
+            // The second writer of RacingTxnSameName: the same op on another key with the same target (a remove or an update meets the same C).
+            const std::vector<Char09> second = [&]() -> std::vector<Char09> {
+                switch (op) {
+                case Op::TxnCreate: case Op::TxnSelfCollidingCreates: return {{id(902), kUserU09, "Xnew", 0, 1}};
+                case Op::TxnRename: return {{id(2), kUserU09, "Xnew", 0, 2}};
+                case Op::TxnMove: return {{id(202), kUserU09, "v2", 0, 2}};
+                case Op::AtomicBatch: return {{id(902), kUserU09, "Xnew", 0, 1}, {id(903), kUserU09, "Ynew", 0, 1}};
+                default: return mine;
+                }
+            }();
+            const auto write = [&](const std::vector<Char09>& recs, int64_t pid) {
+                const int64_t first = off;
+                for (const Char09& r : recs) put(r, batch ? -1 : pid, batch ? first : -1);
+                return first;
+            };
+            const int64_t first77 = write(mine, 77);
+            int64_t outside = -1, first79 = -1;
+            if (e == Entity::OutsideWriteSameKey) outside = put({c.id, c.userId, c.name, 555, 2});   // producer 78's update of C, before J
+            if (racing) first79 = write(second, 79);
+            if (!batch) {
+                log.judges.push_back({off++, 77, 0, first77});
+                if (racing) log.judges.push_back({off++, 79, 0, first79});
+            }
+            int64_t lockedCreate = -1;
+            if (e == Entity::OutsideWriteLockedRow) lockedCreate = put({id(950), kUserU09, "Ynew", 0, 1});   // producer 78's create, after the vote, before the marker
+            if (!batch) {
+                log.txnMarkers.push_back({off++, 77, want[0] == V11::Ok});
+                if (racing) log.txnMarkers.push_back({off++, 79, want[1] == V11::Ok});
+            }
+
+            CheckedWritesModel m;
+            m.addKeyIndexRule();
+            m.addLowerNameUniqueRule(kName);
+            m.addCountCheckRule(kStats, 12);
+            m.reset(log);
+            EXPECT_EQ(m.judgeStop(), INT64_MAX);
+            const auto expectBatch = [&](int64_t first, std::size_t n, V11 v) {
+                for (std::size_t i = 0; i < n; ++i) {
+                    const auto it = m.verdicts().find(first + static_cast<int64_t>(i));
+                    if (v == V11::Ok) EXPECT_TRUE(it == m.verdicts().end()) << "record " << i;
+                    else { ASSERT_TRUE(it != m.verdicts().end()) << "record " << i; EXPECT_EQ(it->second, verdictOf(v)) << "record " << i; }
+                }
+            };
+            const auto expectVote = [&](int64_t pid, V11 v) {
+                const auto vote = m.vote(pid);
+                ASSERT_TRUE(vote) << "producer " << pid;
+                EXPECT_EQ(std::make_pair(vote->code, vote->constraintId), std::make_pair(verdictOf(v).code, verdictOf(v).constraintId)) << "producer " << pid;
+                if (v == V11::C) EXPECT_EQ(vote->failingOffset, outside);
+                const auto txn = std::find_if(m.txns().begin(), m.txns().end(), [&](const ModelTxn& t) { return t.pid == pid; });
+                ASSERT_TRUE(txn != m.txns().end());
+                EXPECT_EQ(txn->applied, v == V11::Ok) << "producer " << pid << ": a yes applies at its marker, a no never";
+            };
+            if (batch) {
+                expectBatch(first77, mine.size(), want[0]);
+                if (racing) expectBatch(first79, second.size(), want[1]);
+            } else {
+                expectVote(77, want[0]);
+                if (racing) expectVote(79, want[1]);
+            }
+            if (lockedCreate >= 0) expectBatch(lockedCreate, 1, want[1]);
+        }
+    EXPECT_EQ(pairs, 49u);
+}
+
+// coverageProblem on hand-built logs: producer 77's transaction has records 1 and 2; its marker is at 4 (a commit), or its TxnJudge at 3.
+TEST(CheckedWritesModel, CoverageProblemFlagsAMarkerPastAnUndecidedTransaction) {
+    using Log = VerdictRig::RigLog;
+    const auto logOf = [](bool commit, bool judged, int64_t markerAt, int64_t finalThrough) {
+        Log log;
+        for (int64_t o : {0, 1, 2}) {
+            VerdictRig::RigLogRec r{o, static_cast<uint64_t>(o + 1), 10, 0, false};
+            r.producerId = o == 0 ? -1 : 77; r.txn = o != 0;
+            log.data.push_back(r);
+        }
+        if (judged) log.judges.push_back({3, 77, 0, 1});
+        log.txnMarkers.push_back({4, 77, commit});
+        log.markers.push_back({markerAt, {0, finalThrough, 0, 0}, {}});
+        return log;
+    };
+    const auto problem = [&](const Log& log) {
+        CheckedWritesModel m;
+        m.reset(log);
+        return m.coverageProblem(log);
+    };
+    EXPECT_EQ(problem(logOf(true, false, 3, 1)), "") << "a marker before the commit stops at the first record";
+    EXPECT_NE(problem(logOf(true, false, 3, 2)), "") << "a marker before the commit ends past the first record";
+    EXPECT_EQ(problem(logOf(true, true, 5, 4)), "") << "after the TxnJudge the transaction is decided";
+    EXPECT_NE(problem(logOf(true, false, 5, 3)), "") << "a commit without a TxnJudge: no marker ends inside (first, marker]";
+    EXPECT_EQ(problem(logOf(true, false, 5, 5)), "") << "past the commit marker is covered";
+    EXPECT_EQ(problem(logOf(false, false, 5, 4)), "") << "an abort drops the records; ending at its marker is harmless";
 }
 
 // A hand-built log, judged by the model alone: no broker code runs.

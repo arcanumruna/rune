@@ -116,10 +116,11 @@ inline void checkIndex(VerdictRig& r, const CheckedWritesModel& model, const std
     EXPECT_EQ(r.writeState()->rejected.mismatches(), 0u) << "(a) the index counted mismatches";
 }
 
-/// (b) The markers carry the model's verdicts; unless a compaction removed superseded markers they cover the log without a gap.
+/// (b) The markers carry the model's verdicts and stop at an undecided transaction (coverageProblem); unless a compaction removed superseded markers they cover the log without a gap.
 inline void checkMarkers(const CheckedWritesModel& model, const VerdictRig::RigLog& log, int64_t target, bool compacted = false) {
     ASSERT_FALSE(log.markers.empty());
     ASSERT_FALSE(log.changes.empty());
+    EXPECT_EQ(model.coverageProblem(log), "") << "(b) the markers never end past a transaction the judge has not decided";
     int64_t reach = 0;
     const std::string problem = markerUnionProblem(log.markers, log.changes.front().offset, &reach);
     if (!compacted) EXPECT_EQ(problem, "") << "(b) markers cover the log without a gap and agree where they overlap";
