@@ -457,7 +457,6 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     if (!state.txn.reserved()) state.txn.reserve();
     if (ordinary_.capacity() == 0) {
         ordinary_.reserve(TxnJudgeState::kMaxTxns);
-        rejectedSpans_.reserve(TxnJudgeState::kMaxTxns);
         owedMarkers_.reserve(TxnJudgeState::kMaxTxns);
     }
     // Part 11: the transactions are judged anew from K.  The overlays go back first; nothing is cut from the table, so the owed
@@ -465,7 +464,6 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     releaseTxnOverlays(state.txn);
     state.txn.truncateFrom(INT64_MAX);
     ordinary_.clear();
-    rejectedSpans_.clear();
     probe_ = {};
     txnStop_ = TxnStop::None;
     ordinaryApplied_ = -1;
@@ -1354,26 +1352,12 @@ bool VerdictSource::applyTxnBatch_(const uint8_t* batch, std::size_t len, TxnKey
     return ok;
 }
 
-// Design 3.1: a marker split at the entry limit never ends inside a rejected span (first, M], or a restart there would meet the rest of
-// the span with none of its rejected records ahead of it.  The split is held at the span's first record when that lies above `from`;
-// a span longer than one marker is split inside all the same.
-int64_t VerdictSource::splitBeforeRejectedSpan_(int64_t at, int64_t from) const noexcept {
-    for (bool moved = true; moved;) {
-        moved = false;
-        for (const RejectedSpan& s : rejectedSpans_)
-            if (from < s.first && s.first < at && at <= s.marker) {
-                at = s.first;
-                moved = true;
-            }
-    }
-    return at;
-}
-
-// P11-2: the markers cover [emitFrom, judgedThrough()); a deferred transaction holds them until it is decided.
+// P11-2: the markers cover [emitFrom, judgedThrough()); a deferred transaction holds them until it is decided.  A marker split at the
+// entry limit may end inside a span, so it is no coverage point (closesCoverage): the chain goes on until a marker with room to spare.
 int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
     const int64_t through = judgedThrough();
-    if (generation_ == kUnbound || through <= emitFrom_ || !(judgedRecord_ || sawEmptyChange_)) return 0;
-    const bool due = rejectedThisPass_ > 0 || sawEmptyChange_ || nowNs - lastMarkerNs_ >= intervalNs_ ||
+    if (generation_ == kUnbound || through <= emitFrom_ || !(judgedRecord_ || sawEmptyChange_ || state.markers.chainOpen())) return 0;
+    const bool due = rejectedThisPass_ > 0 || sawEmptyChange_ || state.markers.chainOpen() || nowNs - lastMarkerNs_ >= intervalNs_ ||
                      (checkpointCap_ != INT64_MAX && through - emitFrom_ >= checkpointCap_);
     if (!due) return 0;
     int work = 0;
@@ -1385,8 +1369,7 @@ int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
             const int64_t off = state.rejected.nextRejectedAtOrAfter(pos);
             if (off >= through) break;
             if (entryScratch_.size() == cr::kMaxMarkerEntries) {
-                finalThrough = splitBeforeRejectedSpan_(off, from);
-                while (from + entryScratch_.back().offsetDelta >= finalThrough) entryScratch_.pop_back();
+                finalThrough = off;
                 break;
             }
             const auto* e = state.rejected.find(off);
@@ -1406,14 +1389,13 @@ int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
         }
         if (base == rune::replication::PartitionReplica::kAppendNotLeader) break;
         if (base < 0) { ++stats_.markerAppendRetries; break; }
-        (void)state.markers.onMarker(base, finalThrough);
+        (void)state.markers.onMarker(base, finalThrough, cr::closesCoverage(entryScratch_.size()));
         state.rejected.noteCovered(finalThrough);
         ++stats_.markersWritten;
         emitFrom_     = finalThrough;
         lastMarkerNs_ = nowNs;
         ++work;
     }
-    std::erase_if(rejectedSpans_, [&](const RejectedSpan& s) { return s.marker < emitFrom_; });
     if (emitFrom_ >= judgeCursor_) sawEmptyChange_ = judgedRecord_ = false;   // not judgedThrough(): the run-ahead records still need a marker
     return work;
 }
@@ -1426,7 +1408,7 @@ int VerdictSource::pushCheckpoints_(PartitionWriteState& state) {
         if (inst.persisted && !inst.pendingValid && checkpointSettled(inst)) {
             // P4-4: a persisted member's delta leaves only once a marker in the local log covers the cursor it is stamped with, or
             // while it runs ahead of deferred transactions (P11-8 (a)).
-            if (state.markers.appendedThrough() < inst.foldCursor && !runsAheadAt_(inst.foldCursor)) continue;
+            if (state.markers.appendedClosedThrough() < inst.foldCursor && !runsAheadAt_(inst.foldCursor)) continue;
             // P11-8 (b): nor while a Locked transaction judged below its cursor is not applied (its delta would stamp rows the apply
             // changes).
             if (state.txn.lockedBelow(inst.foldCursor)) {

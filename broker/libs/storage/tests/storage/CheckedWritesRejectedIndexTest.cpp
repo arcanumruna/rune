@@ -51,6 +51,20 @@ TEST(CheckedWritesRejectedIndex, MarkerMergeIsIdempotent) {
     EXPECT_EQ(idx.coveredThrough(), 30);
 }
 
+// REGRESSION (#974): a marker with the maximum entries may end inside a transaction span; K stays at the last closing marker's end.
+TEST(CheckedWritesRejectedIndexRegression, FullMarkerNeverRaisesCoverageRegression) {
+    RejectedOffsetIndex idx;
+    idx.reserve(rune::storage::control_record::kMaxMarkerEntries + 8);
+    idx.onMarker(0, 100, {});
+    std::vector<Entry> full;
+    for (std::size_t i = 0; i < rune::storage::control_record::kMaxMarkerEntries; ++i) full.push_back({100 + int64_t(i), 55, 1});
+    idx.onMarker(100, 9000, full);
+    EXPECT_EQ(idx.size(), full.size()) << "the entries are merged";
+    EXPECT_EQ(idx.coveredThrough(), 100);
+    idx.onMarker(9000, 9100, {});
+    EXPECT_EQ(idx.coveredThrough(), 9100);
+}
+
 TEST(CheckedWritesRejectedIndexRegression, MarkerDisagreementCountsAMismatchRegression) {
     RejectedOffsetIndex idx;
     idx.reserve(8);

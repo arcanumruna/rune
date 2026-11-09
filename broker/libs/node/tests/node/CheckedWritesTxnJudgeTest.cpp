@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <functional>
 #include <system_error>
+#include <tuple>
 
 #include <rune/node/RcState.h>
 #include <rune/node/VerdictSource.h>
@@ -607,7 +609,35 @@ struct JudgeRig {
     int64_t countTo = -1;            // reads up to exactly it are counted in countedTo
     int     countedTo = 0;
     int64_t logStart = 0;            // a read from below it comes back empty, as the log's below its start
+    uint64_t gen = 1;
+    int64_t  nextAppend = 0;                // where the judge's next append without a replica lands
+    std::vector<int64_t> appendBases;       // the offset of each appended batch
     int drive(int64_t hw = INT64_MAX, int64_t now = 0) {
+        const std::size_t had = vs.appendedForTest().size();
+        const int work = driveOnce(hw, now);
+        for (std::size_t i = had; i < vs.appendedForTest().size(); ++i) {
+            appendBases.push_back(std::max(nextAppend, vs.judgeCursor()));
+            nextAppend = appendBases.back() + 1;
+        }
+        return work;
+    }
+    // A takeover: of the old leader's log only its first n markers survive; this node's scan reads them before it leads.
+    void takeOver(const JudgeRig& old, std::size_t n) {
+        st.rejected.truncateFrom(0);
+        st.markers.truncateFrom(0);
+        for (std::size_t i = 0; i < n; ++i) verdictFeedBatch(&st, old.vs.appendedForTest()[i].data(), old.vs.appendedForTest()[i].size(), old.appendBases[i]);
+        verdictOnHw(st, old.appendBases[n - 1] + 1);
+        vs.bindLeader(nullptr, ++gen, 0);
+    }
+    // The same on the old leader's own node: its views keep what they applied.
+    void failoverKeeping(std::size_t n) { takeOver(*this, n); }
+    // Drives until the judge has passed the whole log (at least once: a new leader judges again from K).
+    void settle() {
+        drive();
+        for (int i = 0; i < 16 && vs.judgedThrough() < log.next; ++i) drive();
+        ASSERT_EQ(vs.judgedThrough(), log.next);
+    }
+    int driveOnce(int64_t hw, int64_t now) {
         return vs.driveJudge([&](int64_t from, int64_t to) {
             counted += from >= countFrom;
             countedAt += from == countAt;
@@ -659,6 +689,29 @@ struct JudgeRig {
             if (!c || c->type != cr::kVerdictMarker) continue;
             if (const auto m = cr::parseMarker(*c)) out.push_back(m->header.finalThrough);
         }
+        return out;
+    }
+    // The entry counts of the appended verdict markers.
+    [[nodiscard]] std::vector<uint32_t> markerCounts() const {
+        std::vector<uint32_t> out;
+        for (const auto& b : vs.appendedForTest()) {
+            const auto c = cr::parseControl(b.data(), b.size());
+            if (!c || c->type != cr::kVerdictMarker) continue;
+            if (const auto m = cr::parseMarker(*c)) out.push_back(m->header.count);
+        }
+        return out;
+    }
+    // What a view of the log sees: the rejected entries and the key index's ids below `ids`.
+    struct Seen {
+        std::vector<std::tuple<int64_t, uint16_t, uint32_t>> rejected;
+        std::vector<int64_t> indexed;
+        bool operator==(const Seen&) const = default;
+    };
+    [[nodiscard]] Seen seen(int64_t ids) const {
+        Seen out;
+        st.rejected.forEachIn(0, INT64_MAX, [&](const rune::storage::RejectedOffsetIndex::Entry& e) { out.rejected.emplace_back(e.offset, e.code, e.constraintId); });
+        for (int64_t id = 0; id < ids; ++id)
+            if (indexed(id)) out.indexed.push_back(id);
         return out;
     }
     // The offsets the appended verdict markers list.
@@ -816,9 +869,9 @@ TEST(CheckedWritesTxnJudgeRegression, ActivationKNeverPassesAnUndecidedTxnRegres
     EXPECT_LE(r.st.rejected.coveredThrough(), 12);
 }
 
-// REGRESSION (#974, design 3.1): the markers' 4096-entry split fell on the 4097th rejected offset, inside the span of a rejected
-// P11-7 transaction T.  A failover after that first marker restarted the judge there, above all but the last record of T, which it
-// judged as a transaction of its own and applied.  The coverage never lies inside a rejected span: the split backs off to T's first record.
+// REGRESSION (#974): the markers' 4096-entry split fell on the 4097th rejected offset, inside the span of a rejected P11-7 transaction T.
+// A failover after that first marker restarted the judge there, above all but the last record of T, which it judged as a transaction of
+// its own and applied.  A full marker is no coverage point: the restart is at the last closing marker and judges T whole.
 TEST(CheckedWritesTxnJudgeRegression, MarkerSplitNeverLandsInsideARejectedUnvotedTxnRegression) {
     JudgeRig r(true);
     r.vs.bindTxn(&r.pool, r.batch, 2);   // T's 3 records are over the cap: all rejected at the marker (TxnTooLarge)
@@ -831,15 +884,174 @@ TEST(CheckedWritesTxnJudgeRegression, MarkerSplitNeverLandsInsideARejectedUnvote
     r.drive();
     ASSERT_EQ(r.st.rejected.size(), 4097u);
     ASSERT_EQ(r.markerEnds().size(), 2u);
-    const int64_t firstEnd = r.markerEnds()[0];
-    EXPECT_TRUE(firstEnd <= 4104 || firstEnd > 4107) << "the split " << firstEnd << " is not inside T's span";
-    // The failover: only the first marker is committed.
-    const int64_t base0 = r.vs.judgeCursor();
-    r.st.markers.truncateFrom(base0 + 1);
-    r.st.rejected.truncateFrom(firstEnd);
-    r.vs.bindLeader(nullptr, 2, 0);
-    r.drive();
+    r.failoverKeeping(1);                // only the first marker is committed
+    r.settle();
     for (const int64_t id : {1, 2, 3}) EXPECT_FALSE(r.indexed(id)) << "T's record " << id << " stays rejected after the failover";
+    EXPECT_EQ(r.st.rejected.size(), 4097u);
+}
+
+namespace {
+// n records of one tag in batches of 1000, ids from firstId, by producer pid (-1: plain); rec(i) overrides the record.
+void burst(JudgeRig& r, int n, int64_t pid, const std::function<Rec(int)>& rec) {
+    for (int i = 0; i < n;) {
+        std::vector<Rec> batch;
+        for (const int end = std::min(n, i + 1000); i < end; ++i) batch.push_back(rec(i));
+        r.log.data(batch, pid);
+    }
+}
+void burst(JudgeRig& r, int n, int64_t firstId, int32_t tag, int64_t pid = -1) {
+    burst(r, n, pid, [&](int i) { return Rec{firstId + i, tag}; });
+}
+// A closing marker at 10, then T (pid 77) whose first record fails, 4100 failing records of another writer inside its span, T's second
+// record and its commit marker: [10, 4113) holds 4102 rejections, the 4097th inside T's span.
+void interleavedRejectedSpan(JudgeRig& r) {
+    r.start();
+    r.drive(INT64_MAX, 2'000'000'000);
+    r.log.data({{1, 9}}, 77);
+    burst(r, 4100, 200, 9);
+    r.log.data({{2}}, 77);
+    r.log.marker(77, true);
+    r.drive();
+    ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{0, 4096, 6}));
+}
+}  // namespace
+
+// REGRESSION (#974, P11-7 span with other writers' rejections inside it): the failover restarts before T, which is judged whole.
+TEST(CheckedWritesTxnJudgeRegression, RejectedP11_7SpanSplitByInterleavedRejectionsSurvivesFailoverRegression) {
+    JudgeRig straight(true);
+    interleavedRejectedSpan(straight);
+    JudgeRig r(true);
+    interleavedRejectedSpan(r);
+    r.failoverKeeping(2);
+    r.settle();
+    EXPECT_FALSE(r.indexed(2)) << "T's second record stays rejected";
+    EXPECT_EQ(r.seen(300), straight.seen(300));
+    EXPECT_EQ(r.st.rejected.size(), 4102u);
+}
+
+// REGRESSION (#974, a transaction past the cap that no hook capped): the judge at the marker rejects all 5000 records, the cap is 4096.
+// A restart inside the span applied the tail within the cap.
+TEST(CheckedWritesTxnJudgeRegression, TooLargeEscapeSpanSplitSurvivesFailoverRegression) {
+    const auto build = [](JudgeRig& r) {
+        r.start();
+        r.drive(INT64_MAX, 2'000'000'000);
+        burst(r, 5000, 1000, 1, 77);
+        r.log.marker(77, true);
+        r.drive();
+        ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{0, 4096, 904}));
+    };
+    JudgeRig straight(true);
+    build(straight);
+    JudgeRig r(true);
+    build(r);
+    r.failoverKeeping(2);
+    r.settle();
+    for (int64_t id = 1000; id < 6000; ++id) ASSERT_FALSE(r.indexed(id)) << id;
+    EXPECT_EQ(r.st.rejected.size(), 5000u);
+    EXPECT_EQ(r.seen(300), straight.seen(300));
+}
+
+// REGRESSION (#974, a rejected atomic batch): the split fell on a record of the batch, and the restart applied its tail record by record.
+TEST(CheckedWritesTxnJudgeRegression, RejectedAtomicBatchSplitSurvivesFailoverRegression) {
+    const auto build = [](JudgeRig& r) {
+        r.start();
+        r.drive(INT64_MAX, 2'000'000'000);
+        burst(r, 4000, 200, 9);
+        std::vector<Rec> atomic{{5000, 9}};
+        for (int64_t id = 5001; id < 5200; ++id) atomic.push_back({id});
+        r.log.data(atomic, -1, true);
+        r.drive();
+        ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{0, 4096, 104}));
+    };
+    JudgeRig straight(true);
+    build(straight);
+    JudgeRig r(true);
+    build(r);
+    r.failoverKeeping(2);
+    r.settle();
+    for (int64_t id = 5000; id < 5200; ++id) ASSERT_FALSE(r.indexed(id)) << id;
+    EXPECT_EQ(r.st.rejected.size(), 4200u);
+    EXPECT_EQ(r.seen(300), straight.seen(300));
+}
+
+// REGRESSION (#974, an applied ordinary span): the split fell inside T, and the restart applied only its tail and dropped its head.
+TEST(CheckedWritesTxnJudgeRegression, AppliedOrdinarySpanSplitSurvivesFailoverRegression) {
+    const auto logT = [](JudgeRig& r) {
+        r.log.data({{1}}, 77);
+        burst(r, 4100, -1, [](int) { return Rec{100, 1, false, kInsert}; });   // id 100 exists: KeyExists
+        r.log.data({{2}}, 77);
+        r.log.marker(77, true);
+    };
+    const auto build = [&](JudgeRig& r) {
+        r.start();
+        r.drive(INT64_MAX, 2'000'000'000);
+        logT(r);
+        r.drive();
+        ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{0, 4096, 4}));
+    };
+    JudgeRig straight(false);
+    build(straight);
+    JudgeRig old(false);
+    build(old);
+    JudgeRig r(false);   // a node that folded the log to its start takes over: its views have not applied T
+    r.start();
+    logT(r);
+    r.takeOver(old, 2);
+    r.settle();
+    EXPECT_TRUE(r.indexed(1));
+    EXPECT_TRUE(r.indexed(2));
+    EXPECT_FALSE(r.index->spanFence.fenced());
+    EXPECT_EQ(r.seen(300), straight.seen(300));
+}
+
+// REGRESSION (#974): W holds at the last closing marker while a full marker's chain is open.
+TEST(CheckedWritesTxnJudgeRegression, FullMarkerHoldsWatermarkRegression) {
+    JudgeRig r(true);
+    interleavedRejectedSpan(r);
+    ASSERT_EQ(r.appendBases.size(), 3u);
+    verdictOnHw(r.st, r.appendBases[1] + 1);   // the full marker is committed, the one that closes the chain is not
+    EXPECT_EQ(r.st.markers.committedThrough(), r.markerEnds()[0]);
+    EXPECT_EQ(r.st.rejected.watermark(), r.markerEnds()[0]);
+    verdictOnHw(r.st, r.appendBases[2] + 1);
+    EXPECT_EQ(r.st.markers.committedThrough(), r.markerEnds()[2]);
+}
+
+// REGRESSION (#974): a natural marker with exactly the maximum entries is open: a marker with none follows once the judge has passed it.
+TEST(CheckedWritesTxnJudgeRegression, ExactlyFullNaturalMarkerIsClosedByTheNextRegression) {
+    JudgeRig r(true);
+    r.start();
+    burst(r, 4096, 200, 9);
+    r.drive();
+    ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{4096}));
+    ASSERT_TRUE(r.st.markers.chainOpen());
+    r.drive();
+    EXPECT_EQ(r.markerCounts().size(), 1u) << "the marker record itself is not judged yet";
+    r.log.push(r.vs.appendedForTest()[0], 1);   // the marker reaches the log
+    r.drive();
+    ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{4096, 0}));
+    EXPECT_EQ(r.markerEnds()[1], r.log.next);
+    EXPECT_FALSE(r.st.markers.chainOpen());
+    verdictOnHw(r.st, r.appendBases[1] + 1);
+    EXPECT_EQ(r.st.markers.committedThrough(), r.markerEnds()[1]);
+}
+
+// REGRESSION (#974): the first record of T, all of it and its marker are judged in one pass, so the marker starts below T: 4096 records
+// of T and one of another writer inside its span are 4097 rejections, none below T's first record.
+TEST(CheckedWritesTxnJudgeRegression, OversizeOwnSpanFromBelowFirstEmitsValidMarkersRegression) {
+    JudgeRig r(true);
+    r.start();
+    burst(r, 2000, 77, [](int i) { return Rec{1000 + i, i == 0 ? 9 : 1}; });   // T's first record fails
+    r.log.data({{9000, 9}});
+    burst(r, 2096, 3000, 1, 77);
+    r.log.marker(77, true);
+    r.drive();
+    EXPECT_EQ(r.st.rejected.size(), 4097u);
+    ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{4096, 1}));
+    EXPECT_EQ(r.markerEnds()[0], 4106);
+    EXPECT_EQ(r.markerEnds()[1], r.log.next);
+    r.failoverKeeping(1);
+    r.settle();
+    for (int64_t id = 1000; id < 3000 + 2096; ++id) ASSERT_FALSE(r.indexed(id)) << id;
     EXPECT_EQ(r.st.rejected.size(), 4097u);
 }
 

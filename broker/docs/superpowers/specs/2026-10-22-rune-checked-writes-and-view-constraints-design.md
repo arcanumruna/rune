@@ -478,12 +478,12 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
   Acceptance alone writes nothing per record.
 - **Replication.** Markers replicate like any record. Consumers and folds skip them as data, as they skip transaction markers.
 - **The bitmap.** Each replica builds a local index of rejected offsets per segment from the markers, rebuilt at recovery. It follows `TxnCleanState` (`storage/include/rune/storage/TxnCleanState.h`), which already does this for aborted transactions.
-- **The verdict watermark `W`** is the highest `finalThrough` among committed markers. Every verdict below `W` is durable on every replica.
+- **The verdict watermark `W`** is the highest `finalThrough` among committed markers that hold fewer than the maximum 4096 entries; a full marker continues into the next and ends no coverage, because its split may fall inside a transaction span or an atomic batch. Every verdict below `W` is durable on every replica.
 - **The cleaner** on a verdict source:
   - compacts only below `W`;
   - drops rejected records;
   - never counts a rejected record as the latest for its key, so an accepted value is never removed in favor of a rejected one;
-  - drops a marker once every offset it lists is gone and a later marker carries a higher `finalThrough`, after the same grace period as tombstones.
+  - drops a marker once every offset it lists is gone and a later marker with fewer than the maximum 4096 entries carries a higher `finalThrough`, after the same grace period as tombstones.
   - On a `delete`-retention topic, rejected records and markers age out with everything else.
 - **Refold** (restart, view rebuild, new leader):
   - Below `W`, records are applied without being judged, skipping the ones the bitmap marks. A constraint change can therefore never overturn an old verdict.
@@ -657,6 +657,7 @@ Until this part ships, the §11.2 refusals apply.
 - **Failover.**
   - If the `TxnJudge` record committed, a new leader judges at it and reaches the same vote.
   - If it didn't, it was truncated, and the coordinator's retried vote appends a new one.
+  - If a failover cuts a chain of full markers short, the new leader restarts at the end of the last marker with fewer than 4096 entries, which lies outside every transaction span, and judges the whole span again.
 - **The verdict watermark** `W` (§8.5) never passes a `TxnJudge` whose transaction is undecided, so the cleaner never compacts across one.
 
 **G.4 Locks between the vote and the marker.** A provisionally applied row is locked from the vote until the marker, which is normally one coordinator round trip.

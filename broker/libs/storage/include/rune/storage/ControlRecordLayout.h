@@ -35,6 +35,8 @@ inline constexpr int         kUnparseable         = -1;
 inline constexpr uint8_t     kPayloadVersion      = 1;
 inline constexpr uint8_t     kChangePayloadVersion = 2;
 inline constexpr std::size_t kMaxMarkerEntries    = 4096;
+/// A marker with the maximum entries may end inside a transaction span: its finalThrough is no point to restart from.
+constexpr bool closesCoverage(std::size_t count) noexcept { return count < kMaxMarkerEntries; }
 inline constexpr std::size_t kMaxVerdictPlanBytes = 65536;
 
 struct MarkerEntry  { uint32_t offsetDelta; uint16_t code; uint32_t constraintId; };
