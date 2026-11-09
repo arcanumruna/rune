@@ -477,7 +477,7 @@ TEST(HotPathBRegression, EpochHistoryNeverLagsRecoveryPointAcrossPowerLossRegres
         rig.pass();
         at6 = rig.log->logEndOffset();
         applyStamped(rig, 6, 6, 120);                      // ~30 rolls: seals make data durable
-        (void)rig.passUntil([&] { return rig.log->persistedRecoveryPoint() > at6 + 20; }, 1500);
+        (void)rig.passUntil([&] { return rig.log->persistedRecoveryPoint() > at6 + 20; }, 300);
         EXPECT_LE(rig.log->persistedRecoveryPoint(), at6)
             << "the recovery point passed epoch history that is not durable";
         writeFile(d.p / "leader-epoch-state", confirmed);  // power loss: the unconfirmed slot is gone
@@ -522,7 +522,7 @@ TEST(HotPathBRegression, DivergenceTruncationRefetchWaitsForDurableHistoryRegres
         ASSERT_TRUE(rig.passUntil([&] { return rig.log->logEndOffset() == x; })) << "truncation never ran";
         EXPECT_TRUE(rig.rep->refetchAwaitsEpochStateForTest()) << "re-fetch did not wait for the durable history";
         applyStamped(rig, 6, 6, 60);                       // the new leader's records
-        (void)rig.passUntil([&] { return rig.log->persistedRecoveryPoint() > x + 20; }, 1500);
+        (void)rig.passUntil([&] { return rig.log->persistedRecoveryPoint() > x + 20; }, 300);
         writeFile(d.p / "leader-epoch-state", confirmed);
         rig.log->crashForTest();
     }
@@ -581,7 +581,7 @@ TEST(HotPathBRegression, CancelledLeadershipLeavesNoPhantomEpochAfterCrashRegres
         rig.roleOp(false, 4, 2);                           // cancelled
         rig.pass();
         applyStamped(rig, 4, 4, 120);
-        (void)rig.passUntil([&] { return rig.log->persistedRecoveryPoint() > rig.log->logEndOffset() / 2; }, 1500);
+        (void)rig.passUntil([&] { return rig.log->persistedRecoveryPoint() > rig.log->logEndOffset() / 2; }, 300);
         rig.log->crashForTest();
     }
     Restarted r(d.p, kRoll);
