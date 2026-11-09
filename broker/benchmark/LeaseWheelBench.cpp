@@ -1,6 +1,6 @@
 // LeaseWheelBench.cpp - lease topics Task 9: the lease timer wheel over the entry store, at 1 k / 100 k / 1 M / 16 M rows.
 //
-//   BM_Arm           cancel + arm of one row (a fresh link: unlink of the old slot is included)
+//   BM_Arm           cancel + arm of one row through LeaseTimers (a fresh link: unlink of the old slot is included)
 //   BM_Rearm         arm of an already linked row (O(1) unlink + link)
 //   BM_IdlePoll      poll when nothing is due: the one `nowNs < nextCheckNs_` compare
 //   BM_PollDrain256  poll that hands 256 due rows (the 256 arms are untimed)
@@ -27,14 +27,14 @@ struct Rig {
     std::array<uint32_t, 4096> rids{};
     std::array<int64_t, 4096> spans{};
     uint32_t rows;
+    bool ok = false;
 
-    explicit Rig(uint32_t n) : t(std::make_unique<LeaseTimers>(n)), rows(n) {
-        t->store.reserveFor(n - 1);
-        t->deadline.reset(kNow);
+    explicit Rig(uint32_t n) : t(std::make_unique<LeaseTimers>(n, kNow)), rows(n) {
+        ok = t->reserveFor(n - 1);
         std::mt19937_64 rng(0x1EA5E);
         for (uint32_t i = 0; i < n; ++i) {
             // U[10 s, 1 h] ahead of now: nothing is due or near during the idle-poll case
-            t->deadline.arm(i, kNow + 10'000'000'000 + static_cast<int64_t>(rng() % 3'590'000'000'001ull));
+            t->arm(i, kNow + 10'000'000'000 + static_cast<int64_t>(rng() % 3'590'000'000'001ull), kLeaseNoCheckpoint);
         }
         for (std::size_t i = 0; i < rids.size(); ++i) {
             rids[i]  = static_cast<uint32_t>(rng() % n);
@@ -45,31 +45,35 @@ struct Rig {
 
 void BM_Arm(benchmark::State& st) {
     Rig r(static_cast<uint32_t>(st.range(0)));
+    if (!r.ok) { st.SkipWithError("reserve"); return; }
     std::size_t i = 0;
     for (auto _ : st) {
         const uint32_t rid = r.rids[i & 4095];
-        r.t->deadline.cancel(rid);
-        r.t->deadline.arm(rid, kNow + r.spans[i & 4095]);
+        r.t->setState(rid, LeaseEntryState::Emitting, 1);   // the cancel half: unlinks both wheels
+        r.t->rearm(rid, kNow + r.spans[i & 4095]);          // stores the deadline (not Armed: no link)
+        r.t->setState(rid, LeaseEntryState::Armed);         // the arm half: links at the stored deadline
         ++i;
     }
 }
 
 void BM_Rearm(benchmark::State& st) {
     Rig r(static_cast<uint32_t>(st.range(0)));
+    if (!r.ok) { st.SkipWithError("reserve"); return; }
     std::size_t i = 0;
     for (auto _ : st) {
-        r.t->deadline.arm(r.rids[i & 4095], kNow + r.spans[(i + 1) & 4095]);
+        r.t->rearm(r.rids[i & 4095], kNow + r.spans[(i + 1) & 4095]);
         ++i;
     }
 }
 
 void BM_IdlePoll(benchmark::State& st) {
     Rig r(static_cast<uint32_t>(st.range(0)));
+    if (!r.ok) { st.SkipWithError("reserve"); return; }
     int64_t now = kNow;
     uint64_t handed = 0;
     for (auto _ : st) {
-        now = kNow + (now - kNow + 1000) % 5'000'000'000;   // stays inside the first 5 s: nothing is due
-        handed += r.t->deadline.poll(now, [](uint32_t) { return true; }, UINT32_MAX);
+        now += 1000;   // monotonic, no wrap: stays inside the first 5 s for any realistic iteration count (nothing is due)
+        handed += r.t->pollDeadline(now, [](uint32_t) { return true; }, UINT32_MAX);
     }
     benchmark::DoNotOptimize(handed);
 }
@@ -77,16 +81,21 @@ void BM_IdlePoll(benchmark::State& st) {
 void BM_PollDrain256(benchmark::State& st) {
     const uint32_t n = static_cast<uint32_t>(st.range(0));
     Rig r(n);
+    if (!r.ok) { st.SkipWithError("reserve"); return; }
+    // the background rows sit beyond the run's reach (10 years), so a poll hands exactly the 256 rows armed below
+    constexpr int64_t kTenYears = int64_t{10} * 365 * 86'400 * 1'000'000'000;
+    for (uint32_t i = 0; i < n; ++i) r.t->rearm(i, kNow + kTenYears);
     int64_t now = kNow;
     uint32_t base = 0;
     uint64_t handed = 0;
     for (auto _ : st) {
         st.PauseTiming();
-        for (uint32_t k = 0; k < 256; ++k) r.t->deadline.arm((base + k) % n, now + 1'000'000);
+        for (uint32_t k = 0; k < 256; ++k) r.t->rearm((base + k) % n, now + 1'000'000);
         base = (base + 256) % n;
         now += 2'000'000;
         st.ResumeTiming();
-        handed += r.t->deadline.poll(now, [](uint32_t) { return true; }, UINT32_MAX);
+        handed += r.t->pollDeadline(now, [](uint32_t) { return true; }, UINT32_MAX);
+        // the handed rows stay Armed but unlinked: the next rearm links them again
     }
     benchmark::DoNotOptimize(handed);
 }

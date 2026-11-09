@@ -1369,6 +1369,7 @@ if(BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/include
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
             target_link_libraries(rune_lease_wheel_tests PRIVATE GTest::gtest_main)
+            target_compile_options(rune_lease_wheel_tests PRIVATE -Werror=switch)
             gtest_discover_tests(rune_lease_wheel_tests PROPERTIES TIMEOUT 120)
 
             # EmbeddedDriver: one driver, one pumping thread (spec §3.6).

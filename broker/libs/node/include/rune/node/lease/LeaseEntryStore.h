@@ -7,7 +7,7 @@
 //
 // DEADLINE ARITHMETIC: callers compute EVERY deadline with satAdd (saturating at INT64_MAX).  Neither the store nor the wheel
 // does any other deadline arithmetic; a saturated deadline lands in the top wheel level and is never due.
-#include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -19,10 +19,18 @@ inline constexpr uint32_t kLeaseNil        = 0xFFFF'FFFFu;
 inline constexpr uint32_t kLeaseEntryChunk = 4096;
 inline constexpr int64_t  kLeaseNoCheckpoint = INT64_MAX;   // checkpointNs when the key has no checkpoint schedule
 inline constexpr uint8_t  kLeaseUnlinked   = 0xFF;          // levelD / levelC of an entry that is not in that wheel
+inline constexpr std::size_t kLeaseEntryBytes = 48;
+/// The largest maxKeys the store accepts: row ids are u32, kLeaseNil stays out of range, and roundUp (to a chunk) never wraps.
+inline constexpr uint32_t kLeaseMaxKeys = UINT32_MAX - 2 * kLeaseEntryChunk;
 
 /// a + b for a, b >= 0, saturating at INT64_MAX.  The only deadline arithmetic the store and the wheel use.
 [[nodiscard]] inline constexpr int64_t satAdd(int64_t a, int64_t b) noexcept {
     return b > INT64_MAX - a ? INT64_MAX : a + b;
+}
+
+/// ms as ns, saturating at INT64_MAX (a TTL / interval from a wire u64).
+[[nodiscard]] inline constexpr int64_t msToNsSat(uint64_t ms) noexcept {
+    return ms > static_cast<uint64_t>(INT64_MAX) / 1'000'000 ? INT64_MAX : static_cast<int64_t>(ms) * 1'000'000;
 }
 
 enum class LeaseEntryState : uint8_t { Free = 0, Armed, Checkpointing, Clearing, Emitting };
@@ -38,24 +46,28 @@ struct LeaseEntry {
     LeaseEntryState state = LeaseEntryState::Free;
     uint8_t  pad = 0;
 };
-static_assert(sizeof(LeaseEntry) == 48, "the lease entry is exactly 48 bytes");
+static_assert(sizeof(LeaseEntry) == kLeaseEntryBytes, "the lease entry is exactly 48 bytes");
 static_assert(alignof(LeaseEntry) == 8);
 
 /// Chunked entry store: chunks of 4096 entries, the pointer vector reserved up front so it never reallocates, chunks added on
-/// the cold path, never past `maxKeys` (rounded up to a chunk), never freed while the partition lives (clear() resets them).
+/// the cold path, never past `maxKeys` (rounded up to a chunk), never freed while the partition lives (destruction frees them; demotion destroys the runtime).
 class LeaseEntryStore {
 public:
-    /// maxKeys must be < 2^32 - 4096 (row ids are u32 and kLeaseNil is reserved).
+    /// maxKeys must be <= kLeaseMaxKeys (asserted; clamped to it otherwise).
     explicit LeaseEntryStore(uint32_t maxKeys)
-        : cap_(roundUp(maxKeys)) {
+        : cap_(roundUp(clampKeys(maxKeys))) {
         chunks_.reserve(cap_ / kLeaseEntryChunk);
         addChunk();
     }
     LeaseEntryStore(const LeaseEntryStore&)            = delete;
     LeaseEntryStore& operator=(const LeaseEntryStore&) = delete;
 
-    [[nodiscard]] LeaseEntry& at(uint32_t rid) noexcept { return chunks_[rid >> 12][rid & (kLeaseEntryChunk - 1)]; }
+    [[nodiscard]] LeaseEntry& at(uint32_t rid) noexcept {
+        assert(covers(rid));
+        return chunks_[rid >> 12][rid & (kLeaseEntryChunk - 1)];
+    }
     [[nodiscard]] const LeaseEntry& at(uint32_t rid) const noexcept {
+        assert(covers(rid));
         return chunks_[rid >> 12][rid & (kLeaseEntryChunk - 1)];
     }
     [[nodiscard]] bool covers(uint32_t rid) const noexcept {
@@ -71,6 +83,7 @@ public:
 
     /// Hot-path note that `rid` is in use; sets growOwed_ at 75 % of the current capacity while below the cap.
     void noteUse(uint32_t rid) noexcept {
+        assert(rid < cap_);
         if (rid + 1 > highWater_) highWater_ = rid + 1;
         evaluate();
     }
@@ -90,14 +103,11 @@ public:
         return chunks_.size() * kLeaseEntryChunk * sizeof(LeaseEntry) + chunks_.capacity() * sizeof(chunks_[0]);
     }
 
-    /// Demotion: keeps the chunks (never freed while the partition lives), resets every entry.  Destruction frees everything.
-    void clear() noexcept {
-        for (auto& c : chunks_) std::fill_n(c.get(), kLeaseEntryChunk, LeaseEntry{});
-        highWater_ = 0;
-        growOwed_  = false;
-    }
-
 private:
+    static uint32_t clampKeys(uint32_t maxKeys) noexcept {
+        assert(maxKeys <= kLeaseMaxKeys);
+        return maxKeys > kLeaseMaxKeys ? kLeaseMaxKeys : maxKeys;
+    }
     static uint32_t roundUp(uint32_t maxKeys) noexcept {
         const uint64_t chunks = (static_cast<uint64_t>(maxKeys) + kLeaseEntryChunk - 1) / kLeaseEntryChunk;
         return static_cast<uint32_t>((chunks == 0 ? 1 : chunks) * kLeaseEntryChunk);
@@ -120,11 +130,19 @@ private:
 /// Arm = a grant fold or the promotion pass.  OwnRecordFolds = the entry's in-flight record (offset == inflightOffset) folded.
 /// OtherUpdateFolds = an accepted Put+update of the key.  EndFolds = an end of the key that is NOT the entry's own Expire (a
 /// revoke, or an Expire appended by an earlier leader).  `due` (on the step input) = the deadline passed.
-enum class LeaseEntryEvent : uint8_t { Arm, FallDue, CheckpointDue, Keepalive, OwnRecordFolds, OtherUpdateFolds, EndFolds, Demotion };
+///
+/// CheckpointDue: the caller polls the deadline wheel before the checkpoint wheel, and skips a checkpoint whose remaining time is
+/// <= the interval (spec 9.5) - Task 12.  OwnRecordRejected: a broker record of this entry (its in-flight offset) was rejected by
+/// the judge (stale broker); the entry returns to Armed and is re-examined.
+enum class LeaseEntryEvent : uint8_t {
+    Arm, FallDue, CheckpointDue, Keepalive, OwnRecordFolds, OtherUpdateFolds, EndFolds, Demotion, OwnRecordRejected
+};
 
 enum class LeaseAction : uint8_t {
     None, Link, AppendExpire, AppendCheckpoint, AppendClear, Park, RearmAnswerOk,
-    ReturnArmedReplayParked, ReturnArmedAnswerParkedOk, FreeAnswerParkedNotFound, DiscardAnswerParkedNotLeader
+    ReturnArmedReplayParked, ReturnArmedAnswerParkedOk, FreeAnswerParkedNotFound, DiscardAnswerParkedNotLeader,
+    /// ReplayParked: the caller re-runs this key's parked keepalives as Keepalive events (none parked = nothing to do).
+    ReplayParked
 };
 
 struct LeaseStepIn {
@@ -140,7 +158,10 @@ struct LeaseStepOut {
 };
 
 /// A switch over state then event, no default branch (-Wswitch flags a missing case).  AppendExpire / AppendCheckpoint appear
-/// only in the Armed row (R4).  Free x Keepalive is None: the caller answers an absent row LeaseNotFound before the entry.
+/// only in the Armed row (R4).  Free x Keepalive is None: the caller answers an absent row LeaseNotFound before the entry.  For a
+/// present row whose entry is Free (not yet linked by the promotion pass, spec 9.6) the caller steps Arm first, then Keepalive.
+/// Armed x OtherUpdateFolds is ReplayParked: the per-key `lastAppended` gate can only open when the key's update / revoke folds
+/// (a revoke is EndFolds and answers NotFound).
 /// AppendClear means the keepalive is parked on that Checkpoint(0); ReturnArmedReplayParked means the parked keepalives run
 /// again as Keepalive events, now seeing remaining > 0.
 [[nodiscard]] constexpr LeaseStepOut leaseStep(LeaseStepIn in) noexcept {
@@ -157,7 +178,8 @@ struct LeaseStepOut {
                 case E::OwnRecordFolds:
                 case E::OtherUpdateFolds:
                 case E::EndFolds:
-                case E::Demotion: return {S::Free, A::None};
+                case E::Demotion:
+                case E::OwnRecordRejected: return {S::Free, A::None};
             }
             break;
         case S::Armed:
@@ -165,13 +187,15 @@ struct LeaseStepOut {
                 case E::Arm: return {S::Armed, A::None};
                 case E::FallDue: return in.gateOpen ? LeaseStepOut{S::Emitting, A::AppendExpire} : LeaseStepOut{S::Armed, A::None};
                 case E::CheckpointDue:
+                    if (in.due) return {S::Armed, A::None};   // a due key never checkpoints: it expires first
                     return in.gateOpen ? LeaseStepOut{S::Checkpointing, A::AppendCheckpoint} : LeaseStepOut{S::Armed, A::None};
                 case E::Keepalive:
                     if (in.due) return {S::Armed, A::Park};
                     if (!in.remainingPositive) return {S::Armed, A::RearmAnswerOk};
                     return in.gateOpen ? LeaseStepOut{S::Clearing, A::AppendClear} : LeaseStepOut{S::Armed, A::Park};
                 case E::OwnRecordFolds:
-                case E::OtherUpdateFolds: return {S::Armed, A::None};
+                case E::OwnRecordRejected: return {S::Armed, A::None};
+                case E::OtherUpdateFolds: return {S::Armed, A::ReplayParked};
                 case E::EndFolds: return {S::Free, A::FreeAnswerParkedNotFound};
                 case E::Demotion: return {S::Free, A::DiscardAnswerParkedNotLeader};
             }
@@ -186,6 +210,7 @@ struct LeaseStepOut {
                 case E::OwnRecordFolds: return {S::Armed, A::ReturnArmedReplayParked};
                 case E::EndFolds: return {S::Free, A::FreeAnswerParkedNotFound};
                 case E::Demotion: return {S::Free, A::DiscardAnswerParkedNotLeader};
+                case E::OwnRecordRejected: return {S::Armed, A::ReturnArmedReplayParked};
             }
             break;
         case S::Clearing:
@@ -198,6 +223,7 @@ struct LeaseStepOut {
                 case E::OwnRecordFolds: return {S::Armed, A::ReturnArmedAnswerParkedOk};
                 case E::EndFolds: return {S::Free, A::FreeAnswerParkedNotFound};
                 case E::Demotion: return {S::Free, A::DiscardAnswerParkedNotLeader};
+                case E::OwnRecordRejected: return {S::Armed, A::ReturnArmedReplayParked};
             }
             break;
         case S::Emitting:
@@ -210,6 +236,7 @@ struct LeaseStepOut {
                 case E::OwnRecordFolds:
                 case E::EndFolds: return {S::Free, A::FreeAnswerParkedNotFound};
                 case E::Demotion: return {S::Free, A::DiscardAnswerParkedNotLeader};
+                case E::OwnRecordRejected: return {S::Armed, A::ReturnArmedReplayParked};
             }
             break;
     }
