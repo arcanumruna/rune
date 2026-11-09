@@ -52,6 +52,14 @@ constexpr uint16_t kConstraintViolation = static_cast<uint16_t>(rune::protocol::
 constexpr uint16_t kKeyNotFound         = static_cast<uint16_t>(rune::protocol::client::ErrorCode::KeyNotFound);
 constexpr rc::Acks kAllView             = rc::Acks::All | rc::Acks::View;
 
+/// The cluster's client config with a short stale-session threshold: a client whose leader's session dies reroutes in about half a second, not after the 10 s default.
+rc::ClientConfig clientConfig(catalog_cluster::ThreeNodes& c, int id) {
+    rc::ClientConfig cfg = catalog_cluster::clientConfigFor(c, id);
+    cfg.responseTimeoutNs   = std::chrono::nanoseconds(500ms).count();
+    cfg.keepaliveIntervalNs = std::chrono::nanoseconds(100ms).count();
+    return cfg;
+}
+
 template <class Pred>
 bool waitFor(Pred&& pred, std::chrono::milliseconds within) {
     for (const auto deadline = std::chrono::steady_clock::now() + within; std::chrono::steady_clock::now() < deadline; std::this_thread::sleep_for(20ms))
@@ -316,7 +324,7 @@ using Fleet = std::vector<std::unique_ptr<Writer>>;
 Fleet makeFleet(catalog_cluster::ThreeNodes& c, std::size_t n) {
     Fleet f;
     const auto nodes = c.runningNodes();
-    for (std::size_t i = 0; i < n; ++i) f.push_back(std::make_unique<Writer>(catalog_cluster::clientConfigFor(c, nodes[i % nodes.size()])));
+    for (std::size_t i = 0; i < n; ++i) f.push_back(std::make_unique<Writer>(clientConfig(c, nodes[i % nodes.size()])));
     return f;
 }
 
@@ -553,7 +561,7 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
     ASSERT_TRUE(sentinelChar.ok());
     const auto delivered = [&](const std::string& topic, int32_t topicId, const Ledger& ledger, int64_t sentinel) {
         ASSERT_TRUE(leadersWithin(c, topicId, leaders));
-        rc::ClientConfig cfg = clientConfigFor(c, leaders[0]);
+        rc::ClientConfig cfg = clientConfig(c, leaders[0]);
         cfg.topics.push_back(rc::TopicSpec{topic, topicId, 1});
         rc::Client reader(cfg);
         reader.connectAndWait(10s);
@@ -628,7 +636,7 @@ TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropThr
     const int32_t leader = leaders[0];
     const int survivor = leader == 1 ? 2 : 1;
 
-    auto w = std::make_unique<Writer>(clientConfigFor(c, survivor));
+    auto w = std::make_unique<Writer>(clientConfig(c, survivor));
     ASSERT_TRUE(w->insertAndAwait(character(1, "Foo")).ok());
     std::vector<rc::Token> inFlight;
     for (int i = 0; i < 12; ++i) inFlight.push_back(w->insert(character(2 + static_cast<uint64_t>(i % 3), "f" + std::to_string(i))));
@@ -657,7 +665,7 @@ TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropThr
         return true;
     }, 10s)) << "a verdict source still waits for an install";
     w.reset();
-    w = std::make_unique<Writer>(clientConfigFor(c, survivor));
+    w = std::make_unique<Writer>(clientConfig(c, survivor));
     const rc::WriteResult dup = w->insertAndAwait(character(9, "foo"));
     EXPECT_TRUE(dup.ok()) << "the dropped unique view no longer refuses a duplicate: code " << dup.code();
 }
@@ -1229,7 +1237,7 @@ struct CrashedLeader {
         first  = crashed == 1 ? 2 : 1;
         second = crashed == 3 ? 2 : 3;
         {
-            Writer w(clientDriver.attach(clientConfigFor(c, first)), false);
+            Writer w(clientDriver.attach(clientConfig(c, first)), false);
             const rc::WriteResult foo = w.insertAndAwait(character(1, "Foo"));
             ASSERT_TRUE(foo.ok()) << "code " << foo.code();
             fooId = foo.key();
@@ -1246,7 +1254,7 @@ TEST(CheckedWritesRegressorsPathRegression, ACrashedLeaderIsReplacedThreeNodesRe
     CrashedLeader s("cw09_lead");
     s.run(true);
     ASSERT_FALSE(HasFatalFailure());
-    Writer winner(s.clientDriver.attach(clientConfigFor(s.c, s.second)), false);
+    Writer winner(s.clientDriver.attach(clientConfig(s.c, s.second)), false);
     const rc::WriteResult bar = winner.insertAndAwait(character(3, "Bar"));
     ASSERT_TRUE(bar.ok()) << "code " << bar.code();
     EXPECT_GT(bar.key(), s.fooId) << "the new leader must not reuse an id";
@@ -1258,7 +1266,7 @@ TEST(CheckedWritesRegressorsPathRegression, ACrashedLeaderStillRefusesADuplicate
     s.run(false);
     ASSERT_FALSE(HasFatalFailure());
     ViewHandle characterName(s.c.node(awaitController(s.c)), "character_name");
-    Writer loser(s.clientDriver.attach(clientConfigFor(s.c, s.first)), false);
+    Writer loser(s.clientDriver.attach(clientConfig(s.c, s.first)), false);
     const rc::WriteResult refused = loser.insertAndAwait(character(2, "foo"));
     EXPECT_TRUE(isConstraint(refused, *loser.client, "character_name", "unique")) << "code " << refused.code();
     characterName.builder.clear();
@@ -1304,14 +1312,14 @@ TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheLimitThree
     ASSERT_GE(characterTopic, 0);
     constexpr uint64_t kFull = 3;
     {
-        Writer w(clientDriver.attach(clientConfigFor(c, 1)), false);
+        Writer w(clientDriver.attach(clientConfig(c, 1)), false);
         ASSERT_TRUE(w.insertAndAwait(character(kFull, "Foo")).ok());
         ASSERT_TRUE(w.insertAndAwait(character(kFull, "Bar")).ok());
     }
     restartEveryNode(c, characterTopic);
     ASSERT_FALSE(HasFatalFailure());
     ViewHandle accountStats(c.node(awaitController(c)), "account_stats");
-    Writer w(clientDriver.attach(clientConfigFor(c, 1)), false);
+    Writer w(clientDriver.attach(clientConfig(c, 1)), false);
     const auto stats = rowWhenReady(*w.client, accountStats, accountStats.keyOf(kFull));
     ASSERT_TRUE(stats.has_value());
     EXPECT_EQ(accountStats.u(*stats, "characters"), 2u) << "the account still has 2";
@@ -1330,12 +1338,12 @@ TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheNameUnique
     const int32_t characterTopic = topicIdOf(c.node(awaitController(c)), "character");
     ASSERT_GE(characterTopic, 0);
     {
-        Writer w(clientDriver.attach(clientConfigFor(c, 1)), false);
+        Writer w(clientDriver.attach(clientConfig(c, 1)), false);
         ASSERT_TRUE(w.insertAndAwait(character(3, "Foo")).ok());
     }
     restartEveryNode(c, characterTopic);
     ASSERT_FALSE(HasFatalFailure());
-    Writer w(clientDriver.attach(clientConfigFor(c, 1)), false);
+    Writer w(clientDriver.attach(clientConfig(c, 1)), false);
     EXPECT_TRUE(isConstraint(w.insertAndAwait(character(9, "foo")), *w.client, "character_name", "unique"));
 }
 
@@ -1361,7 +1369,7 @@ struct DropWithFailover {
         ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
         const int32_t leader = leaders[0];
         survivor = leader == 1 ? 2 : 1;
-        w = std::make_unique<Writer>(clientDriver.attach(clientConfigFor(c, survivor)), false);
+        w = std::make_unique<Writer>(clientDriver.attach(clientConfig(c, survivor)), false);
         ASSERT_TRUE(w->insertAndAwait(character(1, "Foo")).ok());
         for (int i = 0; i < 3; ++i) inFlight.push_back(w->insert(character(2 + static_cast<uint64_t>(i), "f" + std::to_string(i))));
         ASSERT_EQ(ql(endpointOf(c, survivor), "drop view character_name;", &out, &err), 0) << err;
@@ -1404,7 +1412,7 @@ TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropUninstallsTheUniqu
         return true;
     }, 10s)) << "a verdict source still waits for an install";
     s.w.reset();
-    s.w = std::make_unique<Writer>(s.clientDriver.attach(clientConfigFor(s.c, s.survivor)), false);
+    s.w = std::make_unique<Writer>(s.clientDriver.attach(clientConfig(s.c, s.survivor)), false);
     const rc::WriteResult dup = s.w->insertAndAwait(character(9, "foo"));
     EXPECT_TRUE(dup.ok()) << "the dropped unique view no longer refuses a duplicate: code " << dup.code();
 }

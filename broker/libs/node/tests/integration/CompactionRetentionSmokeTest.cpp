@@ -409,7 +409,9 @@ TEST(CompactionRetentionSmoke, CompactHappyPath_LatestPerKey) {
     // No test-thread replica calls needed (TSan-clean: duty thread owns replica).
 
     // Wait for the cleaner to run (it runs on its own thread).
-    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
+    ASSERT_TRUE(waitFor([&] {
+        return node.onOwnerThreadForTest(0, 0, [](rune::replication::PartitionReplica& r) { return r.lastCleanOffset(); }) > 0;
+    }, 10s)) << "Smoke1: the cleaner never compacted the log";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
