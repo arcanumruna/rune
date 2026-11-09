@@ -7309,8 +7309,9 @@ void ClientGateway::onTxnVerifyRequest_(const rune::node::WorkerReturn& ret)
     a.producerId    = ret.producerId;
     a.producerEpoch = ret.producerEpoch;
     a.reqId         = ret.correlationId;
+    a.votes         = ret.baseOffset != 0;
     if (txnService_ != nullptr && txnService_->coordinatesLocally()) {
-        a.code = txnService_->verifyTxnPartition(a.producerId, a.producerEpoch, a.topicId, a.partition, nowNs_);
+        a.code = txnService_->verifyTxnPartition(a.producerId, a.producerEpoch, a.topicId, a.partition, nowNs_, a.votes);
         answerVerify_(a);
         return;
     }
@@ -7346,6 +7347,7 @@ bool ClientGateway::sendRemoteVerify_(int64_t token, VerifyInFlight& v)
     m.token           = token;
     m.producerId      = v.req.producerId;
     m.producerEpoch   = v.req.producerEpoch;
+    m.votes           = v.req.votes;
     if (!txnMarkerChannel_.sendVerify(txnMarkerChannel_.ctx, v.coordinator, m)) return false;
     v.sent = true;
     ++txnVerifiesForwarded_;
@@ -7385,7 +7387,7 @@ void ClientGateway::onRemoteVerifyTxnPartition(const rune::replication::VerifyTx
     rune::replication::VerifyTxnPartitionResponseMsg r{};
     static_cast<rune::replication::VerifyTxnPartitionMsg&>(r) = m;
     const bool local = txnService_ != nullptr && txnService_->coordinatesLocally();
-    r.errorCode = local ? txnService_->verifyTxnPartition(m.producerId, m.producerEpoch, m.topicId, m.partition, nowNs_)
+    r.errorCode = local ? txnService_->verifyTxnPartition(m.producerId, m.producerEpoch, m.topicId, m.partition, nowNs_, m.votes)
                         : static_cast<int16_t>(pcl::ErrorCode::NotCoordinator);   // the asker retries
     if (local) ++txnVerifiesServedForPeers_;
     if (txnMarkerChannel_.sendVerifyResponse == nullptr) return;   // unreachable: the ask came over the plane
@@ -7432,7 +7434,7 @@ int16_t ClientGateway::inlineTxnAdmission_(int32_t topicId, int32_t partition, c
         if (!txnService_->clusterVerifiesTxnPartitions()) return 0;
         return static_cast<int16_t>(pcl::ErrorCode::ConcurrentTransactions);
     }
-    const int16_t c = txnService_->verifyTxnPartition(pid, r.producerEpoch(), topicId, partition, nowNs_);
+    const int16_t c = txnService_->verifyTxnPartition(pid, r.producerEpoch(), topicId, partition, nowNs_, false);
     if (c == static_cast<int16_t>(pcl::ErrorCode::NotCoordinator)) return static_cast<int16_t>(pcl::ErrorCode::ConcurrentTransactions);
     return c;
 }

@@ -184,7 +184,8 @@ struct FakeTcs final : rune::gateway::ITxnRequestHandler {
     int16_t verifyCode      = 0;
     bool    clusterVerifies = true;
     int     verifyCalls     = 0;
-    int16_t verifyTxnPartition(int64_t, int16_t, int32_t, int32_t, int64_t) override { ++verifyCalls; return verifyCode; }
+    bool    lastVotes       = false;
+    int16_t verifyTxnPartition(int64_t, int16_t, int32_t, int32_t, int64_t, bool votes) override { ++verifyCalls; lastVotes = votes; return verifyCode; }
     bool    coordinatesLocally() const override { return local; }
     int32_t coordinatorNode() const override { return coordNode; }
     bool    clusterVerifiesTxnPartitions() const override { return clusterVerifies; }
@@ -1079,7 +1080,9 @@ TEST(TxnVerifyRemoteRegression, CoordinatorAnswersTheAskerRegression) {
     R.tcs.verifyCode = kInvalidTxnStateCode;
     VerifyTxnPartitionMsg m{};
     m.requesterNodeId = 3; m.topicId = 0; m.partition = 1; m.token = 4242; m.producerId = 9; m.producerEpoch = 2;
+    m.votes = true;
     R.gw.onRemoteVerifyTxnPartition(m);
+    EXPECT_TRUE(R.tcs.lastVotes) << "the asker's votes flag must reach the coordinator";
     ASSERT_EQ(R.ch.verifyResponses.size(), 1u);
     EXPECT_EQ(R.ch.verifyResponses[0].first, 3);
     const auto& a = R.ch.verifyResponses[0].second;
@@ -1103,11 +1106,32 @@ TEST(TxnVerifyRemoteRegression, CoordinatorAnswersTheAskerRegression) {
     EXPECT_EQ(R.ch.verifyResponses[1].second.errorCode, kNotCoordinator);
 }
 
+// L9: the worker's verdict-source flag (TxnVerifyRequest baseOffset) reaches the coordinator, asked locally or over the plane.
+TEST(TxnVerifyRemoteRegression, WorkerVotesFlagReachesTheCoordinatorOnBothPathsRegression) {
+    VerifyGwRig R;
+    rune::node::WorkerReturn ret{};
+    ret.type = rune::node::WorkerReturn::Type::TxnVerifyRequest;
+    ret.topicId = 0; ret.partition = 0; ret.producerId = 77; ret.producerEpoch = 0; ret.correlationId = 1;
+    ret.baseOffset = 1;
+    R.gw.handleWorkerReturnForTest(ret);
+    ASSERT_EQ(R.ch.verifies.size(), 1u);
+    EXPECT_TRUE(R.ch.verifies[0].second.votes) << "the remote ask lost the flag";
+    R.tcs.local = true;
+    R.gw.handleWorkerReturnForTest(ret);
+    EXPECT_EQ(R.tcs.verifyCalls, 1);
+    EXPECT_TRUE(R.tcs.lastVotes) << "the local ask lost the flag";
+    ret.baseOffset = 0;
+    R.gw.handleWorkerReturnForTest(ret);
+    EXPECT_EQ(R.tcs.verifyCalls, 2);
+    EXPECT_FALSE(R.tcs.lastVotes);
+}
+
 // Wire round trip of both frames (templates 13 / 14), fixed 32-byte block, little-endian.
 TEST(TxnVerifyRemoteRegression, VerifyFramesRoundTripRegression) {
     VerifyTxnPartitionMsg m{};
     m.requesterNodeId = 7; m.topicId = -3; m.token = 0x0102030405060708LL; m.producerId = 1LL << 40;
     m.partition = 65535; m.producerEpoch = 32767; m.errorCode = 99;   // ignored on the ask
+    m.votes = true;
     uint8_t buf[VerifyTxnPartitionMsg::TOTAL_SIZE];
     ASSERT_EQ(m.encode(buf, sizeof buf), VerifyTxnPartitionMsg::TOTAL_SIZE);
     EXPECT_EQ(m.encode(buf, sizeof buf - 1), 0u);
@@ -1116,6 +1140,13 @@ TEST(TxnVerifyRemoteRegression, VerifyFramesRoundTripRegression) {
     EXPECT_EQ(d.requesterNodeId, 7); EXPECT_EQ(d.topicId, -3); EXPECT_EQ(d.token, m.token);
     EXPECT_EQ(d.producerId, m.producerId); EXPECT_EQ(d.partition, 65535); EXPECT_EQ(d.producerEpoch, 32767);
     EXPECT_EQ(d.errorCode, 0);
+    EXPECT_TRUE(d.votes);
+    m.votes = false;   // a node that predates the flag writes 0 at +30
+    ASSERT_EQ(m.encode(buf, sizeof buf), VerifyTxnPartitionMsg::TOTAL_SIZE);
+    ASSERT_TRUE(VerifyTxnPartitionMsg::decode(buf, sizeof buf, d));
+    EXPECT_FALSE(d.votes);
+    m.votes = true;
+    ASSERT_EQ(m.encode(buf, sizeof buf), VerifyTxnPartitionMsg::TOTAL_SIZE);
     VerifyTxnPartitionResponseMsg rd{};
     EXPECT_FALSE(VerifyTxnPartitionResponseMsg::decode(buf, sizeof buf, rd)) << "an ask decoded as an answer";
     EXPECT_FALSE(VerifyTxnPartitionMsg::decode(buf, sizeof buf - 1, d)) << "a truncated frame decoded";

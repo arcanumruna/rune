@@ -360,6 +360,20 @@ TEST_F(CheckedWritesTxnCoordinatorRegression, CandidateAtCommitIsAskedThoughNotA
     EXPECT_EQ(svc_->voteGatesForTest(), 1u);
 }
 
+TEST_F(CheckedWritesTxnCoordinatorRegression, VerifiedVotingPartitionIsACandidateDespiteCatalogLagRegression) {
+    cwIsCandidate_ = false;   // this node's catalog has not seen the view yet
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}, {kPlain, 0}}, ep);
+    ASSERT_EQ(svc_->verifyTxnPartition(pid, ep, kPlain, 0, now_, false), 0);
+    ASSERT_EQ(svc_->verifyTxnPartition(pid, ep, kCw, 0, now_, true), 0) << "the partition leader reports a verdict source";
+    ASSERT_EQ(svc_->verifyTxnPartition(pid, ep, kCw, 0, now_, true), 0);
+    EXPECT_EQ(endTxn("tx", pid, ep, true), 0u);
+    ASSERT_EQ(votes_.size(), 1u) << "one vote, to the reporting partition only, however often it verified";
+    EXPECT_EQ(votes_[0].topic, "cw");
+    EXPECT_EQ(votes_[0].partition, 0);
+    EXPECT_EQ(svc_->voteGatesForTest(), 1u);
+}
+
 TEST_F(CheckedWritesTxnCoordinatorTest, NotLeaderVoteIsResentWithBackoff) {
     int16_t ep = 0;
     const int64_t pid = beginTxn({{kCw, 0}}, ep);
@@ -423,7 +437,7 @@ TEST_F(CheckedWritesTxnCoordinatorRegression, AddPartitionsDuringTheVoteIsConcur
     int16_t ep = 0;
     const int64_t pid = beginTxn({{kCw, 0}}, ep);
     ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
-    EXPECT_EQ(svc_->verifyTxnPartition(pid, ep, kCw, 0, now_), static_cast<int16_t>(pc::ErrorCode::InvalidTxnState))
+    EXPECT_EQ(svc_->verifyTxnPartition(pid, ep, kCw, 0, now_, false), static_cast<int16_t>(pc::ErrorCode::InvalidTxnState))
         << "a gated commit takes no more batches";
     EXPECT_EQ(addPartitions("tx", pid, ep, {{kCw, 1}}), static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions))
         << "a partition joining after its votes were asked would commit without one";

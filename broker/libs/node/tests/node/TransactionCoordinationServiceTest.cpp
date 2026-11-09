@@ -1931,14 +1931,14 @@ TEST_F(TxnPrepareGateRegression, AProduceIntoARegistrationWhosePutWasRefusedIsRe
     replica_->setMinIsrForTest(3);
     ASSERT_EQ(addPartitions("tx562p", pid, ep, 0), kNotCoord);
     ASSERT_EQ(svc_->txnStateForTest("tx562p"), tx::TxnState::Ongoing) << "precondition: registered in memory";
-    EXPECT_EQ(svc_->verifyTxnPartition(pid, ep, 0, 0, now_), kConcurrent)
+    EXPECT_EQ(svc_->verifyTxnPartition(pid, ep, 0, 0, now_, false), kConcurrent)
         << "a produce was accepted into a registration that is not in the log";
     EXPECT_EQ(kConcurrent, 27);
 
     // The client's retry is appended and commits: the produce is accepted.
     replica_->setMinIsrForTest(1);
     ASSERT_EQ(addPartitions("tx562p", pid, ep, 0), 0);
-    EXPECT_EQ(svc_->verifyTxnPartition(pid, ep, 0, 0, now_), 0);
+    EXPECT_EQ(svc_->verifyTxnPartition(pid, ep, 0, 0, now_, false), 0);
 }
 
 // ===========================================================================

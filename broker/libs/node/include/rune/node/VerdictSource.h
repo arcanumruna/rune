@@ -1036,7 +1036,7 @@ int8_t VerdictSource::shouldHaveVoted_(ReadRangeFn& readRange, OrdinaryTxn& o) n
             return m.kind == rune::view::VerdictViewKind::Unique || m.kind == rune::view::VerdictViewKind::Check || m.kind == rune::view::VerdictViewKind::TestReject;
         });
     };
-    if (constrained(*state_->constraintSets.setAt(o.first)) || state_->isConstrainedSource()) return 1;
+    if (constrained(*state_->constraintSets.setAt(o.first)) || constrained(*state_->constraintSets.setAt(o.marker))) return 1;   // the log's sets up to M, never one registered past it
     bool intent = false, more = false;
     if (!walkBatches_(readRange, std::max(o.first, o.intentFrom), o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
         if (r.producerId() == o.producerId && (r.attributes() & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) == rune::protocol::batch::kAttrTransactional)

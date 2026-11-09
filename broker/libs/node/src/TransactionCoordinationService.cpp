@@ -454,7 +454,7 @@ TransactionCoordinationService::topicNameOf_(uint32_t nsId, int32_t topicId, std
 // F15-FU1 (#112): partition-registration verification (KIP-890 part 1).
 // ---------------------------------------------------------------------------
 int16_t TransactionCoordinationService::verifyTxnPartition(int64_t producerId, int16_t producerEpoch,
-                                                           int32_t topicId, int32_t partition, int64_t nowNs)
+                                                           int32_t topicId, int32_t partition, int64_t nowNs, bool votes)
 {
     if (!ensureLoaded_(nowNs)) return static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
     tx::TopicPartition tp;
@@ -492,6 +492,8 @@ int16_t TransactionCoordinationService::verifyTxnPartition(int64_t producerId, i
             it != lastPutOffset_.end() && (it->second == kUnpersisted || !committed_(it->second)))
             return static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions);
     }
+    // L9: the partition's own catalog says it is a verdict source, whatever this node's catalog lags behind.
+    if (votes && votesEnabled_()) noteVoteTarget_(*meta, tp.topic, topicId, partition);
     return 0;
 }
 
@@ -959,32 +961,37 @@ void TransactionCoordinationService::noteVoteCandidates_(const pc::TxnTopicParti
 {
     const auto* m = coordinator_.metadata(txnIdScratch_);
     if (m == nullptr) return;
-    VoteCandidates* c = nullptr;   // created by the first candidate: a transaction without any holds no entry
-    const auto entry = [&] {
-        c = &voteCandidatesAtAdd_[txnIdScratch_];
-        if (c->producerId != m->producerId || c->producerEpoch != m->producerEpoch || c->txnStartNs != m->txnStartNs)
-            *c = VoteCandidates{m->producerId, m->producerEpoch, m->txnStartNs, false, {}};   // a previous transaction's leftovers
-    };
     if (!votesOn) {   // the feature level is not there yet: the transaction may commit after it is, and then nothing is known
-        entry();
-        c->all = true;
+        candidatesOf_(*m).all = true;
         return;
     }
     for (std::size_t i = 0; i < parts.size(); ++i) {
         const pc::TxnTopicPartition tp = parts[i];
-        if (!voteCandidate_(tp.topicId)) continue;
-        if (c == nullptr) entry();
-        const std::string& name = partitionScratch_[i].topic;
-        const bool known = std::any_of(c->targets.begin(), c->targets.end(), [&](const VoteTarget& t) {
-            return t.partition == tp.partition && t.topic == name;
-        });
-        if (known) continue;
-        VoteTarget t;
-        t.topic     = name;
-        t.topicId   = tp.topicId;
-        t.partition = tp.partition;
-        c->targets.push_back(std::move(t));
+        if (voteCandidate_(tp.topicId)) noteVoteTarget_(*m, partitionScratch_[i].topic, tp.topicId, tp.partition);
     }
+}
+
+TransactionCoordinationService::VoteCandidates& TransactionCoordinationService::candidatesOf_(const tx::TransactionMetadata& m)
+{
+    VoteCandidates& c = voteCandidatesAtAdd_[m.txnId];
+    if (c.producerId != m.producerId || c.producerEpoch != m.producerEpoch || c.txnStartNs != m.txnStartNs)
+        c = VoteCandidates{m.producerId, m.producerEpoch, m.txnStartNs, false, {}};   // a previous transaction's leftovers
+    return c;
+}
+
+void TransactionCoordinationService::noteVoteTarget_(const tx::TransactionMetadata& m, const std::string& topic,
+                                                     int32_t topicId, int32_t partition)
+{
+    VoteCandidates& c = candidatesOf_(m);   // created by the first candidate: a transaction without any holds no entry
+    const bool known = std::any_of(c.targets.begin(), c.targets.end(), [&](const VoteTarget& t) {
+        return t.partition == partition && t.topic == topic;
+    });
+    if (known) return;
+    VoteTarget t;
+    t.topic     = topic;
+    t.topicId   = topicId;
+    t.partition = partition;
+    c.targets.push_back(std::move(t));
 }
 
 bool TransactionCoordinationService::startVoteGate_(const pc::EndTxn& msg, int64_t nowNs)

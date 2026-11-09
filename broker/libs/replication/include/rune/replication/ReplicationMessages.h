@@ -976,7 +976,8 @@ struct WriteTxnMarkerResponseMsg {
 //   token           : int64 @ +8    the requester's token (echoed back)
 //   producerId      : int64 @ +16
 //   partition       : int32 @ +24
-//   producerEpoch   : int16 @ +28   (+30..31 pad)
+//   producerEpoch   : int16 @ +28
+//   votes           : int16 @ +30   1 = the partition is a verdict source and votes (0 from a node that predates it)
 //
 // VerifyTxnPartitionResponse (template 14), same block with
 //   errorCode       : int16 @ +30   client ErrorCode (0 = the batch may open the txn)
@@ -993,6 +994,7 @@ struct VerifyTxnPartitionMsg {
     int32_t partition       = 0;
     int16_t producerEpoch   = 0;
     int16_t errorCode       = 0;   ///< the response only (template 14)
+    bool    votes           = false;   ///< the request only (template 13)
 
     std::size_t encodeAs(uint16_t templateId, uint8_t* buf, std::size_t cap) const noexcept {
         if (cap < TOTAL_SIZE) return 0;
@@ -1004,7 +1006,7 @@ struct VerifyTxnPartitionMsg {
         detail::write_le<int64_t>(p + 16, producerId);
         detail::write_le<int32_t>(p + 24, partition);
         detail::write_le<int16_t>(p + 28, producerEpoch);
-        detail::write_le<int16_t>(p + 30, templateId == TEMPLATE_ID ? int16_t{0} : errorCode);
+        detail::write_le<int16_t>(p + 30, templateId == TEMPLATE_ID ? int16_t{votes} : errorCode);
         return TOTAL_SIZE;
     }
     std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept { return encodeAs(TEMPLATE_ID, buf, cap); }
@@ -1020,7 +1022,9 @@ struct VerifyTxnPartitionMsg {
         m.producerId      = detail::read_le<int64_t>(p + 16);
         m.partition       = detail::read_le<int32_t>(p + 24);
         m.producerEpoch   = detail::read_le<int16_t>(p + 28);
-        m.errorCode       = templateId == TEMPLATE_ID ? int16_t{0} : detail::read_le<int16_t>(p + 30);
+        const int16_t at30 = detail::read_le<int16_t>(p + 30);
+        m.votes           = templateId == TEMPLATE_ID && at30 != 0;
+        m.errorCode       = templateId == TEMPLATE_ID ? int16_t{0} : at30;
         return true;
     }
     [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, VerifyTxnPartitionMsg& m) noexcept {

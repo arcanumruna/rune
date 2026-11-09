@@ -296,6 +296,8 @@ public:
         pass();
         return voteToken_;
     }
+    /// Whether the worker's most recent verification request reported its partition as a verdict source.
+    [[nodiscard]] bool lastVerifyVotes() const { return lastVerifyVotes_; }
     /// The coordinator's answer `code`, as (pid, epoch), to the worker's most recent verification request of any producer; one pass.
     void answerVerify(int64_t pid, int16_t epoch, int16_t code) {
         WorkerOp op;
@@ -1530,12 +1532,14 @@ private:
             ++voteReplyCount_[r.correlationId];
         } else if (r.type == WorkerReturn::Type::TxnVerifyRequest) {
             lastVerifyReqId_ = r.correlationId;
+            lastVerifyVotes_ = r.baseOffset != 0;
         } else if (r.type == WorkerReturn::Type::ControlRecordAppended) {
             markerAnswers_[r.correlationId] = r.errorCode == 0 ? r.baseOffset : -1 - r.errorCode;
         }
     }
     bool keyIndexOn_ = false, holdJudge_ = false;
     int64_t lastVerifyReqId_ = 0;
+    bool lastVerifyVotes_ = false;
     int64_t viewPassCap_ = 0;
     int delayedSpecIn_ = 0;
     std::filesystem::path viewDir_, logDir_;
