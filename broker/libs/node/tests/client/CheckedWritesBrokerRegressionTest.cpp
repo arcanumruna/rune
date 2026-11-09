@@ -61,6 +61,14 @@ std::future<std::unique_ptr<rc::Client>> kiClient(Cluster& c, int seed) {
     return std::async(std::launch::async, [&c, cfg] { return rune::node::test::catalog_cluster::connectClient(c, cfg); });
 }
 
+/// Every node stops at once and comes back at once.
+void restartAll(Cluster& c) {
+    std::vector<std::thread> stoppers;
+    for (int id = 1; id <= 3; ++id) stoppers.emplace_back([&c, id] { c.stop(id); });
+    for (auto& t : stoppers) t.join();
+    c.startNodes({1, 2, 3});
+}
+
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, TopicCreateWaitsForItsSpecOnEveryWorkerRegression) {
@@ -1351,10 +1359,10 @@ TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRe
     const int32_t victim = leaders[0];
     for (const int id : c.runningNodes()) {
         installTagReject(c.node(id), src.topicId);
-        ASSERT_FALSE(HasFatalFailure());
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
     }
     awaitSetLogged(c.node(victim), src.topicId);
-    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
     int32_t seed = 0;
     for (int id : c.runningNodes()) if (id != victim) { seed = id; break; }
 
@@ -1395,7 +1403,7 @@ TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRe
         if (round == 0) {
             c.startNode(victim);
             installTagReject(c.node(victim), src.topicId);
-            ASSERT_FALSE(HasFatalFailure());
+            ASSERT_FALSE(::testing::Test::HasFatalFailure());
             c.crash(leader);
         }
     }
@@ -1457,8 +1465,7 @@ TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegres
     ASSERT_EQ(before.indexed, before.rejectedInLog);
 
     // Every node restarts; TestReject (a test-installed member) goes back on each.
-    for (int id = 3; id >= 1; --id) c.stop(id);
-    for (int id = 1; id <= 3; ++id) c.startNode(id);
+    restartAll(c);
     ASSERT_TRUE(c.awaitCatalogLeader(60s));
     ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 60s));
     // The leadership scan alone rebuilds the index from the committed markers, before TestReject is back.
@@ -2010,14 +2017,6 @@ void expectKeyExists(rc::Client& client, uint64_t first, uint64_t last) {
     for (std::size_t i = 0; i < r.size(); ++i) EXPECT_EQ(r[i].code, kKeyExists) << "id " << first + i << " status " << static_cast<int>(r[i].status);
 }
 
-/// Every node stops at once and comes back at once.
-void restartAll(Cluster& c) {
-    std::vector<std::thread> stoppers;
-    for (int id = 1; id <= 3; ++id) stoppers.emplace_back([&c, id] { c.stop(id); });
-    for (auto& t : stoppers) t.join();
-    c.startNodes({1, 2, 3});
-}
-
 int64_t leoOf(BrokerNode& n, int32_t topicId, int32_t partition);
 
 /// A 3-replica `ki` on a started cluster, the level raised on every node.  The admin client connects while the cluster elects.
@@ -2537,7 +2536,7 @@ TEST(CheckedWritesBrokerRegression, RegressorsPathBackFillThenInsertsNeverCollid
     ASSERT_TRUE(awaitLeaders(c, userTopic, 1, userLeader, 60s));
     ASSERT_TRUE(awaitLeaders(c, characterTopic, 1, characterLeader, 60s));
     insertLive(c.runningNodes().front(), 500, 1000, userMax, characterMax);
-    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
     const auto userCounter = counterOf(c.node(userLeader[0]), userTopic);
     const auto characterCounter = counterOf(c.node(characterLeader[0]), characterTopic);
     ASSERT_TRUE(userCounter && characterCounter);
