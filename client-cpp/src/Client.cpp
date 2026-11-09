@@ -6944,8 +6944,11 @@ void Client::syncCoordinatorSession_() noexcept {
         // this client) is given up at once, as a routed leader's lost session is re-asked about (watchProduceRoutes_):
         // the seed names the current coordinator.  Any other outage, or a connect pending against a dead endpoint, is
         // given up after kCoordDownFallbackNs, so a seed that still names the dead node is followed at that pace, never a spin.
+        // A session that has not been Connected since it became the coordinator is given up after the metadata backoff: the
+        // seed is asked again, as for a leader that stays unreachable.
         const int64_t nowNs = now();
-        const bool downTooLong = detail::coordDownTooLong(*rm, st == session::SessionState::Connected, nowNs, kCoordDownFallbackNs);
+        const bool downTooLong = detail::coordDownTooLong(*rm, st == session::SessionState::Connected, nowNs,
+                                                          rm->wasUp ? kCoordDownFallbackNs : metadataBackoffNs_);
         const bool lost = staleLossesAt_(rm->idx) != rm->staleBase;
         const bool gaveUp = downTooLong || lost ||
                             st == session::SessionState::Disconnected ||
@@ -6955,6 +6958,7 @@ void Client::syncCoordinatorSession_() noexcept {
                              agent_.sessionConnectFailuresAt(rm->idx) != rm->failBase);
         if (gaveUp) {
             ++coordinatorFallbacks_;
+            if (!rm->wasUp) scheduleMetadataRefresh();
             if (st == session::SessionState::Rejected || st == session::SessionState::Closed) {
                 coordRejected_ = detail::RejectedCoord{rm->channel, metadataResponses_};   // r2 LOW-3
             }

@@ -18,6 +18,7 @@ struct CoordRemote {
     uint64_t               failBase = 0;   // its connectFailures() when it became the coordinator
     std::optional<int64_t> downSinceNs;    // first seen NOT Connected (duty clock); empty = up
     uint64_t               staleBase = 0;  // its stale-session losses (not the client's own stalls) when it became the coordinator
+    bool                   wasUp = false;  // it has been Connected since it became the coordinator
 };
 using CoordRoute = std::variant<CoordSeed, CoordRemote>;
 
@@ -29,6 +30,7 @@ using CoordRoute = std::variant<CoordSeed, CoordRemote>;
 /// Phase 2b F Task 11 / #362: track the remote session's down time; true once it has been down longer than graceNs.
 [[nodiscard]] inline bool coordDownTooLong(CoordRemote& r, bool connected, int64_t nowNs, int64_t graceNs) noexcept {
     if (connected) {
+        r.wasUp = true;
         r.downSinceNs.reset();
         return false;
     }

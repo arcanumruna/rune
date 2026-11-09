@@ -1934,6 +1934,61 @@ TEST(GroupRoutingRegression, InitProducerIdInFlightOnACrashedCoordinatorMovesWit
     EXPECT_LT(g_routingClockNs - t0, 600'000'000) << "it waited past 1.5 x responseTimeoutNs for the dead coordinator";
     EXPECT_EQ(r.gw.coordinatorEndpoints.back(), n2);
     EXPECT_GE(r.client.testCoordinatorFallbacks(), 1u);
+    const uint64_t fallbacks = r.client.testCoordinatorFallbacks();
+    const int answers = r.gw.notCoordinatorAnswers;
+    const int64_t t1 = g_routingClockNs;
+    ASSERT_TRUE(r.drive([&] { return g_routingClockNs - t1 > 2'000'000'000; }, 8'000));
+    EXPECT_LE(fallbacks, 2u) << "the route flapped";
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), fallbacks) << "the lost give-up stayed armed after the move";
+    EXPECT_LE(r.gw.notCoordinatorAnswers, answers + 1) << "the seed was asked on every duty pass";
+}
+
+// The seed first names a coordinator that is dead and never connects, then names a live one.  The session never reaches Connected,
+// so the lost-session give-up cannot fire: the route re-asks the seed after the metadata backoff, not after kCoordDownFallbackNs.
+// RED: the InitProducerId waited the 5 s fallback.  The seed is asked once per backoff, not on every duty pass.
+TEST(GroupRoutingRegression, InitProducerIdOnANeverConnectedCoordinatorReasksTheSeedOnTheMetadataBackoffRegression) {
+    RigOptions o = routingClockOptions();   // duty clock
+    o.connectTimeoutMs = 600'000;           // the dead endpoint's connect never fails: only the never-up give-up can move the route
+    GroupRig r(4185, 4186, o);
+    const auto [n1, p1port] = r.addNode(4185);
+    const auto [n2, p2port] = r.addNode(4185);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions            = {{1, 0, 0, 1, 4185, ""}};
+    r.gw.coordinatorEndpoint   = n1;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
+    r.gw.deadEndpoints.insert(n1);
+    r.gw.initPidReply          = true;
+    rc::ProducerConfig tcfg;
+    tcfg.acks            = rc::Acks::All;
+    tcfg.transactionalId = "tx-never-up";
+    auto tp = r.client.producer(tcfg);
+    r.connect();
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(tp.initTransactions(r.cq, t), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return r.client.testCoordinatorRedirects() >= 1; }, 4'000))
+        << "precondition: the seed named the dead coordinator";
+    r.gw.coordinatorEndpoint   = n2;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p2port);
+    const int64_t t0 = g_routingClockNs;
+    bool done = false;
+    rc::OpStatus st = rc::OpStatus::Closed;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == t) { done = true; st = cc.status; }
+        });
+        return done;
+    }, 8'000)) << "InitProducerId never completed";
+    EXPECT_EQ(st, rc::OpStatus::Ok);
+    EXPECT_LT(g_routingClockNs - t0, 1'000'000'000) << "it waited past the metadata backoff for the never-connected coordinator";
+    EXPECT_EQ(r.gw.coordinatorEndpoints.back(), n2);
+    EXPECT_GE(r.client.testCoordinatorFallbacks(), 1u);
+    const uint64_t fallbacks = r.client.testCoordinatorFallbacks();
+    const int answers = r.gw.notCoordinatorAnswers;
+    const int64_t t1 = g_routingClockNs;
+    ASSERT_TRUE(r.drive([&] { return g_routingClockNs - t1 > 2'000'000'000; }, 8'000));
+    EXPECT_LE(fallbacks, 2u) << "the route flapped";
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), fallbacks) << "the route kept falling back to the seed once the coordinator was live";
+    EXPECT_LE(r.gw.notCoordinatorAnswers, answers + 1) << "the seed was asked on every duty pass";
 }
 
 // ===========================================================================
