@@ -3082,7 +3082,7 @@ TopicHandle Client::rawTopicAndWait(std::string_view name, std::chrono::nanoseco
     return TopicHandle{r.topicId, r.partitionCount > 0 ? r.partitionCount : 1, TopicKind::Raw};
 }
 
-void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::chrono::nanoseconds remaining) {
+TopicSchemaResult Client::resolveOpenTopicFailure(std::string_view name, uint64_t fingerprint, uint16_t code, std::chrono::nanoseconds remaining) {
     constexpr auto kUnknownTopic = static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownTopic);
     const auto refused = [&](uint16_t c) {
         std::string msg = "openTopic: the broker refused '" + std::string(name) + "' (error " + std::to_string(c);
@@ -3106,6 +3106,8 @@ void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::ch
             if (kind.errorCode == 0 && kind.descriptorBlob.empty())
                 throw std::runtime_error("openTopic: '" + std::string(name) + "' is an untyped (raw) topic; a TypedTopic "
                                          "binds only to a typed topic (use rawTopicAndWait)");
+            // The first answer may predate the topic's apply on this node: the topic is there now and is the caller's type.
+            if (kind.errorCode == 0 && schemaMatches(fingerprint, std::span<const uint8_t>(kind.descriptorBlob))) return kind;
             if (kind.errorCode == 0)
                 throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
             code = kind.errorCode;

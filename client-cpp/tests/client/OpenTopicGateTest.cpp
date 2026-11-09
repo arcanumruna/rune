@@ -101,6 +101,7 @@ struct GateGateway {
     };
     std::map<uint64_t, FingerprintOverride> fingerprintOverrides;
     uint16_t unknownFingerprintErrorCode = 1;  // any nonzero "not found" code
+    int      unappliedFingerprintAnswers = 0;  // the first N answers for an overridden fingerprint are "not found" (the topic is not applied yet)
 
     uint8_t replyBuf[4096]{};
 
@@ -198,7 +199,14 @@ struct GateGateway {
                                 fingerprintOverrides.find(rpc::kSchemaKindFingerprint) == fingerprintOverrides.end());
             if (!plain) {
                 auto it = fingerprintOverrides.find(opt->requestedFingerprint);
-                if (it != fingerprintOverrides.end()) {
+                if (it != fingerprintOverrides.end() && unappliedFingerprintAnswers > 0) {
+                    --unappliedFingerprintAnswers;
+                    resp.topicId        = -1;
+                    resp.version        = 0;
+                    resp.errorCode      = unknownFingerprintErrorCode;
+                    resp.descriptorBlob = nullptr;
+                    resp.descriptorLen  = 0;
+                } else if (it != fingerprintOverrides.end()) {
                     resp.topicId        = it->second.topicId;
                     resp.version        = it->second.version;
                     resp.errorCode      = 0;
@@ -674,14 +682,14 @@ TEST(OpenTopicGateRegression, AnotherBrokerErrorIsNamedRegression) {
 }
 
 namespace {
-// C7 adversarial review (#22): the what() of a direct throwOpenTopicFailure call.
+// C7 adversarial review (#22): the what() of a direct resolveOpenTopicFailure call.
 std::string openFailureText(Client& c, std::string_view name, uint16_t code, std::chrono::nanoseconds left) {
     try {
-        c.throwOpenTopicFailure(name, code, left);
+        (void)c.resolveOpenTopicFailure(name, StubV1::kFingerprint, code, left);
     } catch (const std::runtime_error& e) {
         return e.what();
     }
-    ADD_FAILURE() << "throwOpenTopicFailure returned";
+    ADD_FAILURE() << "resolveOpenTopicFailure returned";
     return {};
 }
 }  // namespace
@@ -1373,6 +1381,24 @@ TEST(CheckedWritesBind, TypedOpenOfAMissingTopicSaysSo) {
     h.gw->unknownFingerprintErrorCode = 7;
     GateGatewayPump pump(*h.gw);
     expectOpenMessage(*h.client, "characters", "topic 'characters' does not exist");
+}
+
+// The node answers the fingerprint UnknownTopic because it has not applied the topic yet; the kind probe then finds it applied.
+// The type matches, so the open succeeds - it is not told to regenerate.  RED: "generated type is stale".
+TEST(CheckedWritesBind, TypedOpenOfATopicAppliedBetweenTheAnswerAndTheProbeSucceedsRegression) {
+    GateHarness h(1420, 1421);
+    h.build();
+    h.connectAndWait();
+    h.gw->getTopicId                  = 0x40000001;
+    h.gw->getVersion                  = 1;
+    h.gw->getBlob                     = serialize(makeCharsV1Descriptor());
+    h.gw->unknownFingerprintErrorCode = 7;
+    h.gw->unappliedFingerprintAnswers = 1;
+    h.gw->fingerprintOverrides[StubV1::kFingerprint] = GateGateway::FingerprintOverride{
+        /*topicId=*/0x40000001, /*version=*/1, serialize(makeCharsV1Descriptor())};
+    GateGatewayPump pump(*h.gw);
+    TypedTopic<StubV1> tt = h.client->openTopicAndWait<StubV1>("characters");
+    EXPECT_EQ(tt.boundVersion(), 1u);
 }
 
 TEST(CheckedWritesBind, TypedOpenFingerprintMismatchKeepsTheStaleMessage) {
