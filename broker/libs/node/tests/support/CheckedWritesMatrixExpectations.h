@@ -124,8 +124,6 @@ struct Expected {
 
 [[nodiscard]] inline Expected expect05(const Cell& c) {
     if (c.timing == Timing::ReplaceDuringWrites || c.timing == Timing::DropDuringWrites) return {false, "key.index is immutable (no replace or drop)"};
-    if (c.entity == Entity::KeyRejectedEarlier && (c.timing == Timing::TxnCommitBehind || c.timing == Timing::TxnAbortBehind))
-        return {false, "the TestReject member makes the source constrained, and transactions are refused there before Part G"};
     switch (c.timing) {
     case Timing::FailoverAppendHw: case Timing::TruncateTail: return {true, nullptr, Check::NotLeaderFirst};
     case Timing::LeaderLossParked: return {true, nullptr, Check::NotLeaderParked};
@@ -168,8 +166,6 @@ inline constexpr uint32_t kConstraintId06 = (7u << 16) | 1u;
 [[nodiscard]] inline Expected expect06(const Cell& c) {
     if ((c.timing == Timing::ReplaceDuringWrites || c.timing == Timing::DropDuringWrites) && c.entity != Entity::Constrained)
         return {false, "no constraint member to replace or drop"};
-    if ((c.timing == Timing::TxnCommitBehind || c.timing == Timing::TxnAbortBehind) && c.entity == Entity::Constrained)
-        return {false, "transactions are refused on a constrained source"};
     if (c.entity == Entity::NearMax && c.op == Op::AutoCreate8) return {true, nullptr, Check::AutoExhausted};
     if (c.entity == Entity::NearMax && c.op == Op::ImportAbove) return {true, nullptr, Check::ImportOutOfRange};
     switch (c.timing) {
