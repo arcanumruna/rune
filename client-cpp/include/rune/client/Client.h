@@ -1773,6 +1773,7 @@ private:
     // A coordinator session that stays down past kCoordDownFallbackNs is given up like an exhausted connect budget (back to the
     // seed, which names the CURRENT coordinator); one that went stale is given up at once.
     static constexpr int64_t kCoordDownFallbackNs = 5'000'000'000LL;
+    int64_t     coordNeverUpGraceNs_ = kMetadataBackoffInitNs;   // grace of a coordinator session never Connected; doubles per give-up
     uint64_t    coordinatorRedirects_ = 0;   // coordinator moves followed
     uint64_t    coordinatorFallbacks_ = 0;   // coordinator sessions given up (back to the seed)
     // r2 LOW-3: a coordinator channel whose session was Rejected / Closed, and

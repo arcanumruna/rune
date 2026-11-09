@@ -1861,8 +1861,8 @@ TEST(GroupRoutingRegression, NotCoordinatorWithAConnectCorrIdNeverFailsTheConnec
 // D4 fallback: the named coordinator is unreachable — its session gives up
 // (connect budget spent -> Disconnected) and the coordinator route falls back
 // to the seed, whose node answers again with the coordinator; once that node is
-// reachable the member joins there.  Paced by the session's own connect budget
-// (no loop at round-trip speed).
+// reachable the member joins there.  Paced by the never-up grace, which doubles
+// per give-up (no loop at round-trip speed).
 TEST(GroupRoutingRegression, UnreachableCoordinatorFallsBackToTheSeedAndRetriesRegression) {
     RigOptions o = routingClockOptions();   // #676: duty clock
     o.connectTimeoutMs = 300;   // the coordinator session gives up after 4 x 300 ms
@@ -1897,7 +1897,7 @@ TEST(GroupRoutingRegression, UnreachableCoordinatorFallsBackToTheSeedAndRetriesR
 // 5 s fallback (and 2 x the threshold with the grace scaled to it).
 TEST(GroupRoutingRegression, InitProducerIdInFlightOnACrashedCoordinatorMovesWithTheLostSessionRegression) {
     RigOptions o = routingClockOptions();   // duty clock
-    o.connectTimeoutMs  = 600'000;          // no connect failure: only the lost session can move the route
+    o.connectTimeoutMs  = 300;              // a connect attempt to n1 while it is dead fails only after the lost session was given up
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 400'000'000;
     GroupRig r(4181, 4182, o);
@@ -1912,6 +1912,8 @@ TEST(GroupRoutingRegression, InitProducerIdInFlightOnACrashedCoordinatorMovesWit
     tcfg.acks            = rc::Acks::All;
     tcfg.transactionalId = "tx-lost";
     auto tp = r.client.producer(tcfg);
+    tcfg.transactionalId = "tx-lost-back";
+    auto tpBack = r.client.producer(tcfg);
     r.connect();
     const rc::Token t = r.nextToken++;
     ASSERT_EQ(tp.initTransactions(r.cq, t), rc::OpResult::Accepted);
@@ -1941,6 +1943,24 @@ TEST(GroupRoutingRegression, InitProducerIdInFlightOnACrashedCoordinatorMovesWit
     EXPECT_LE(fallbacks, 2u) << "the route flapped";
     EXPECT_EQ(r.client.testCoordinatorFallbacks(), fallbacks) << "the lost give-up stayed armed after the move";
     EXPECT_LE(r.gw.notCoordinatorAnswers, answers + 1) << "the seed was asked on every duty pass";
+
+    // n1 is back and the coordinator again.  Its session was lost earlier, so the move back must take that loss as the new base:
+    // otherwise the old loss reads as a new one and the route is given up on every duty pass.
+    r.gw.deadEndpoints.erase(n1);
+    r.gw.coordinatorEndpoint   = n1;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
+    const rc::Token tBack = r.nextToken++;
+    ASSERT_EQ(tpBack.initTransactions(r.cq, tBack), rc::OpResult::Accepted);
+    const int64_t t2 = g_routingClockNs;
+    bool doneBack = false;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == tBack) doneBack = true;
+        });
+        return doneBack && g_routingClockNs - t2 > 2'000'000'000;
+    }, 8'000)) << "InitProducerId never completed on the coordinator that came back";
+    EXPECT_EQ(r.gw.coordinatorEndpoints.back(), n1);
+    EXPECT_LE(r.client.testCoordinatorFallbacks(), fallbacks + 1) << "the lost session of the coordinator that came back was taken as new";
 }
 
 // The seed first names a coordinator that is dead and never connects, then names a live one.  The session never reaches Connected,
@@ -1989,6 +2009,38 @@ TEST(GroupRoutingRegression, InitProducerIdOnANeverConnectedCoordinatorReasksThe
     EXPECT_LE(fallbacks, 2u) << "the route flapped";
     EXPECT_EQ(r.client.testCoordinatorFallbacks(), fallbacks) << "the route kept falling back to the seed once the coordinator was live";
     EXPECT_LE(r.gw.notCoordinatorAnswers, answers + 1) << "the seed was asked on every duty pass";
+}
+
+// The seed keeps naming a coordinator that never connects.  Each give-up waits twice as long as the last (100 ms doubling to the
+// 5 s cap), and a metadata answer does not reset that: over 10 s of duty clock the seed is asked a handful of times, not every 100 ms.
+// RED: with the grace taken from the metadata backoff (reset by every answer) there were 92 give-ups, answers and metadata requests.
+TEST(GroupRoutingRegression, InitProducerIdOnACoordinatorThatNeverConnectsReasksTheSeedAtAGrowingPaceRegression) {
+    RigOptions o = routingClockOptions();   // duty clock
+    o.connectTimeoutMs = 600'000;           // the dead endpoint's connect never fails: only the never-up give-up can move the route
+    GroupRig r(4187, 4188, o);
+    const auto [n1, p1port] = r.addNode(4187);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, 0, 1, 4187, ""}};
+    r.gw.coordinatorEndpoint   = n1;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
+    r.gw.deadEndpoints.insert(n1);
+    rc::ProducerConfig tcfg;
+    tcfg.acks            = rc::Acks::All;
+    tcfg.transactionalId = "tx-never-connects";
+    auto tp = r.client.producer(tcfg);
+    r.connect();
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(tp.initTransactions(r.cq, t), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return r.client.testCoordinatorRedirects() >= 1; }, 4'000))
+        << "precondition: the seed named the dead coordinator";
+    const uint64_t fallbacks0 = r.client.testCoordinatorFallbacks();
+    const int answers0        = r.gw.notCoordinatorAnswers;
+    const int metadata0       = r.gw.metadataRequests;
+    const int64_t t0          = g_routingClockNs;
+    ASSERT_TRUE(r.drive([&] { return g_routingClockNs - t0 > 10'000'000'000; }, 20'000));
+    EXPECT_LE(r.client.testCoordinatorFallbacks() - fallbacks0, 8u) << "the never-connected coordinator was given up at a fixed pace";
+    EXPECT_LE(r.gw.notCoordinatorAnswers - answers0, 9) << "the seed was asked for the coordinator at a fixed pace";
+    EXPECT_LE(r.gw.metadataRequests - metadata0, 9) << "the metadata was re-requested at a fixed pace";
 }
 
 // ===========================================================================
