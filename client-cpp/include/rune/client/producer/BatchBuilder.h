@@ -4,7 +4,7 @@
 //
 // A single RecordBatch to one partition is already atomic (one log append) —
 // Tier-2 is the explicit form; NO transaction/markers.  Atomic is the APPEND: on a View producer
-// (checked writes) every record still gets its own verdict (OpStatus::RecordsRejected + BatchVerdicts).
+// (checked writes) the batch is all or nothing: Ok, or OpStatus::BrokerError (code, constraintIdOf, value = the base offset), no per-record list.
 //
 // Threading model:
 //   Tier-2 is single-thread per producer: batch() / add() / send() / destruction run on the
@@ -144,9 +144,9 @@ public:
     ///   send(cq, token)        one Completion{op = Tier2Batch, value =
     ///                          baseOffset (or -1), aux = recordCount} into cq
     ///                          (credit reserved on cq first: QueueFull).  View
-    ///                          producer, n >= 2 records: status Ok (all accepted),
-    ///                          or RecordsRejected with value = the real base and a
-    ///                          payload of every rejection (BatchVerdicts); the
+    ///                          producer: status Ok (all accepted), or BrokerError
+    ///                          (the batch is all or nothing: the code, constraintIdOf,
+    ///                          value = the base offset, no per-record payload); the
     ///                          reservation is the whole completion's size, and a
     ///                          batch whose completion cannot fit one queue record is
     ///                          refused InvalidArgument with nothing reserved.  A

@@ -2649,10 +2649,10 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         const bool idsUnknown = b->idStride != 0 && (dupSeq || (!hasTrailer && (off < 0 || assignedBase == 0)));
         if (hasVerdicts && !verdicts.empty()) {
             const int16_t firstCode = static_cast<int16_t>(verdicts[2] | (verdicts[3] << 8));
-            if (b->recordCount > 1)   // stored and judged: the real base, the first code, and every rejection
+            if (b->recordCount > 1 && !b->atomic)   // stored and judged: the real base, the first code, and every rejection
                 emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, firstCode,
                               OpStatus::RecordsRejected, units, b->producerEpoch, b->producerId, verdicts);
-            else                      // a 1-record batch keeps single-record semantics
+            else                      // a 1-record batch keeps single-record semantics; an atomic batch is all or nothing
                 emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, firstCode,
                               OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
         }
@@ -3186,9 +3186,8 @@ void ProducerImpl::completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, 
             const int64_t base = baseOffset >= 0 ? baseOffset : -1;
             if (n == 0) {
                 completeHandle_(h, OpKind::Tier2Batch, base, recordCount, OpStatus::Ok, 0);
-            } else if (atomic && n == 1) {   // all-or-nothing: the one entry is the first failing record, at its own offset.
-                // More than one entry means the broker judged the records one by one, so report them all below.
-                completeHandle_(h, OpKind::Tier2Batch, base >= 0 ? base + le16(verdicts.data()) : -1, recordCount, OpStatus::BrokerError,
+            } else if (atomic) {   // all-or-nothing: the batch completes once with the broker's code, whatever the entry count.
+                completeHandle_(h, OpKind::Tier2Batch, base, recordCount, OpStatus::BrokerError,
                                 le16(verdicts.data() + 2), le32(verdicts.data() + 4));
             } else if (recordCount > 1) {
                 // One completion reports every record: the trailer's entries are the batch's own (0-based) - passed through.
