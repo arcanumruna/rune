@@ -1653,13 +1653,15 @@ TEST(CatalogClusterRegression, SliceCellResolvesItsRolesAfterALeaderMoveInThePre
     }
 }
 
-static void fastElection(NodeConfig& cfg) {
+namespace {
+void fastElection(NodeConfig& cfg) {
     cfg.unservableWarmupMs = 50;
     cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused;
     cfg.electionTimeoutMs = 40;
     cfg.readLeaseMaxMs = 50;
     cfg.brokerLivenessTimeoutMs = 150;
 }
+}  // namespace
 
 // T1b: awaitCatalogIsrSize follows the CURRENT leader (a follower's isr() is always empty).
 // RED (poll a fixed id captured before the move): times out.
