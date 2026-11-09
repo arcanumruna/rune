@@ -1635,7 +1635,9 @@ public:
             // leaves the ISR (re-admitted by the new leader's AlterIsr) unless it
             // only hit the restart fence: its log is intact, and an ISR without it
             // can lose its last live member before it is re-admitted.
-            if (topicId < 0) {
+            // The coordinator services run only on the controller: its own -1 / -2 replica is re-elected in place, never moved away.
+            const bool controllerInPlace = (topicId == -1 || topicId == -2) && q.requester == selfId_ && q.reason == BumpReason::Fence;
+            if (topicId < 0 && !controllerInPlace) {
                 const bool requesterStays = q.reason == BumpReason::Fence && !isShutting_(q.requester);
                 for (int32_t n : pa->isr) {
                     if (n == q.requester || isShutting_(n)) continue;

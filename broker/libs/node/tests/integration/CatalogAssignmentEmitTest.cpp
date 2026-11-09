@@ -1278,43 +1278,82 @@ TEST(EpochRestartControllerRegression, SoleIsrBumpReelectsSameLeaderPastFenceReg
     EXPECT_EQ(c.pa().isr.size(), 1u);
 }
 
-// A restarted coordinator-partition leader refuses at the restart fence while its log is intact.  The partition moves to the
-// other live ISR member; the requester stays in the ISR (its log is the committed one), so when that member dies before the
-// requester was re-admitted, the partition still has a live ISR member to elect.  RED: the requester left the ISR, ISR and live
-// set did not meet and the partition stayed leaderless.
+namespace {
+/// A coordinator-partition leader bump from the current leader of (-1, 0): the restart fence, or a memory-backed restart.
+rune::replication::AlterIsrMsg coordinatorBump(CtlRig& c, bool memory = false) {
+    const auto& a = c.paOf(-1);
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = -1; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+    m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = a.partitionEpoch;
+    m.isr[0] = a.leaderEpoch;
+    m.isr[1] = rune::replication::AlterIsrMsg::kBumpFenceValid | (memory ? rune::replication::AlterIsrMsg::kBumpMemoryBacked : 0);
+    return m;
+}
+}  // namespace
+
+// A restarted coordinator-partition leader that is not the controller refuses at the restart fence while its log is intact.  The
+// partition moves to another live ISR member; the requester stays in the ISR, so when that member dies before the requester was
+// re-admitted, the partition still has a live ISR member to elect.  RED: the requester left the ISR, ISR and live set did not meet
+// and the partition stayed leaderless.
 TEST(EpochRestartControllerRegression, CoordinatorBumpKeepsTheRequesterInTheIsrRegression) {
     CtlRig c(/*userTopics=*/false);
     (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
     c.drive(50);
-    ASSERT_NE(c.svc->assignment(-1, 0), nullptr);
-    const int32_t requester = c.paOf(-1).leaderNode;
-    const int32_t other     = requester == 1 ? 2 : 1;
-    {   // the third node was out of the ISR (a restart that was never re-admitted)
-        const auto& a = c.paOf(-1);
-        rune::replication::AlterIsrMsg m{};
-        m.topicId = -1; m.partition = 0; m.leaderId = requester; m.leaderEpoch = a.leaderEpoch;
-        m.isrCount = 2; m.isr[0] = requester; m.isr[1] = other; m.partitionEpoch = a.partitionEpoch;
-        ASSERT_TRUE(c.svc->onAlterIsr(m));
-        c.drive(50);
-        ASSERT_EQ(c.paOf(-1).isr.size(), 2u);
-    }
-    const auto& a = c.paOf(-1);
-    rune::replication::AlterIsrMsg bump{};
-    bump.topicId = -1; bump.partition = 0; bump.leaderId = requester; bump.leaderEpoch = a.leaderEpoch;
-    bump.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
-    bump.partitionEpoch = a.partitionEpoch;
-    bump.isr[0] = a.leaderEpoch;
-    bump.isr[1] = rune::replication::AlterIsrMsg::kBumpFenceValid;
-    (void)c.svc->onAlterIsr(bump);
+    ASSERT_EQ(c.paOf(-1).leaderNode, 1);
+    (void)c.svc->onAlterIsr(coordinatorBump(c, /*memory=*/true));   // the controller's own replica loses its place: node 2 leads, ISR {2, 3}
     (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
     c.drive(50);
-    ASSERT_NE(c.paOf(-1).leaderNode, requester) << "the restarted leader was re-elected over a live ISR member";
+    const int32_t requester = c.paOf(-1).leaderNode;
+    ASSERT_EQ(requester, 2);
+    ASSERT_EQ(c.paOf(-1).isr.size(), 2u);
+    (void)c.svc->onAlterIsr(coordinatorBump(c));
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_EQ(c.paOf(-1).leaderNode, 3) << "the restarted leader was re-elected over a live ISR member";
     EXPECT_EQ(std::count(c.paOf(-1).isr.begin(), c.paOf(-1).isr.end(), requester), 1) << "the requester left the ISR";
     for (int i = 0; i < 3; ++i) {   // the member that took over dies before the requester was re-admitted
         (void)c.svc->runDynamicRebalanceOnTick({requester}, nullptr);
         c.drive(50);
     }
     EXPECT_EQ(c.paOf(-1).leaderNode, requester) << "the partition stayed leaderless with a live in-sync member";
+}
+
+// The controller's own coordinator replica refuses at the restart fence.  The coordinator services run only on the controller, so
+// moving the partition to another member is an outage: it is re-elected in place, at an epoch past its fence, ISR unchanged.
+// RED: the partition moved to another ISR member.
+TEST(EpochRestartControllerRegression, CoordinatorBumpOfTheControllerReelectsItInPlaceRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    const auto before = c.paOf(-1);
+    ASSERT_EQ(before.leaderNode, 1);
+    auto bump = coordinatorBump(c);
+    bump.isr[0] = before.leaderEpoch + 5;
+    (void)c.svc->onAlterIsr(bump);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    EXPECT_EQ(c.paOf(-1).leaderNode, 1) << "the partition moved away from the controller";
+    EXPECT_EQ(c.paOf(-1).leaderEpoch, before.leaderEpoch + 6) << "the bump did not jump past the requester's fence";
+    EXPECT_EQ(c.paOf(-1).isr, before.isr);
+}
+
+// Only the live member left in the ISR is the requester: it is re-elected at an epoch past its fence, the other ISR members being
+// dead.
+TEST(EpochRestartControllerRegression, CoordinatorBumpWithNoOtherLiveIsrMemberReelectsTheRequesterRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    (void)c.svc->onAlterIsr(coordinatorBump(c, /*memory=*/true));   // node 2 leads, ISR {2, 3}
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_EQ(c.paOf(-1).leaderNode, 2);
+    const int32_t le = c.paOf(-1).leaderEpoch;
+    (void)c.svc->onAlterIsr(coordinatorBump(c));
+    (void)c.svc->runDynamicRebalanceOnTick({2}, nullptr);   // node 3 is dead
+    c.drive(50);
+    EXPECT_EQ(c.paOf(-1).leaderNode, 2);
+    EXPECT_EQ(c.paOf(-1).leaderEpoch, le + 1);
 }
 
 namespace {
