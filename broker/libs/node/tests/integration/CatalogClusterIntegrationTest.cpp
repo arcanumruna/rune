@@ -438,7 +438,8 @@ public:
                 if (seen) seen->push_back(code);
                 if (code == cOk) return true;
                 if (code == -1) { ADD_FAILURE() << "produce through node " << node << " topic " << topicId << " p" << p << ": no answer"; return false; }
-                if (code != cRedirect || nodeOf(redirect) < 0) break;
+                // NewBrokerJoins: until the deferred election moves it, a partition's placed leader may be the node not up yet.
+                if (code != cRedirect || nodeOf(redirect) < 0 || !c_.running(nodeOf(redirect))) break;
                 cur = nodeOf(redirect);
             }
             std::this_thread::sleep_for(50ms);
