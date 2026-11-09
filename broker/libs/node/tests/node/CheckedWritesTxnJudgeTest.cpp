@@ -219,7 +219,7 @@ TEST(CheckedWritesTxnState, DrainNeverAnswersWithAnUnjudgedDefaultRegression) {
     ASSERT_NE(t.onJudgeRecord(500, {77, 3, 400}), nullptr);
     t.onMarker(77, 520, true);
     ASSERT_TRUE(t.parkVote({1, 0, 77, 3, 500}));
-    t.finalizeDecided(600, 600);
+    t.finalizeDecided(600);
     ASSERT_EQ(t.find(77)->phase, TxnPhase::Finalized);
     int none = 0;
     EXPECT_EQ(t.drainAnswered([&](const ParkedVote&, const DeferredTxn* d) { none += d == nullptr; }), 1);
@@ -237,6 +237,20 @@ TEST(CheckedWritesTxnState, DrainNeverAnswersWithAnUnjudgedDefaultRegression) {
     const DeferredTxn* got = nullptr;
     EXPECT_EQ(t.drainAnswered([&](const ParkedVote&, const DeferredTxn* d) { got = d; }), 1);
     EXPECT_NE(got, nullptr);
+}
+
+// A restart's first pass has no high watermark yet: an entry below the markers' coverage with its marker is decided all the same, or the
+// replay of a view drops the committed transaction at its TxnJudge and nothing applies it again.
+TEST(CheckedWritesTxnState, FinalizeDecidedNeedsNoHighWatermarkRegression) {
+    auto t = reserved();
+    ASSERT_NE(t.onJudgeRecord(500, {77, 3, 400}), nullptr);
+    t.onMarker(77, 520, true);
+    t.finalizeDecided(401);
+    EXPECT_EQ(t.find(77)->phase, TxnPhase::Finalized);
+    ASSERT_NE(t.onJudgeRecord(900, {78, 3, 850}), nullptr);
+    t.onMarker(78, 950, true);
+    t.finalizeDecided(850);
+    EXPECT_EQ(t.find(78)->phase, TxnPhase::AwaitJudge) << "K does not cover its first record";
 }
 
 // REGRESSION (Task 8 review 3, m-1): a rescan's reset drops an entry's hold below an applied ordinary span.  A Finalized, unjudged

@@ -1163,7 +1163,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     nowNs_ = nowNs;
     spanBytes_ = voteScanBytes_;
     if (!owedMarkers_.empty()) feedOwedMarkers_(readRange, bound);
-    state.txn.finalizeDecided(state.rejected.coveredThrough(), bound);
+    state.txn.finalizeDecided(state.rejected.coveredThrough());
     rejectedThisPass_ = 0;
     for (const std::size_t i : active_) {
         Member& m = members_[i];
