@@ -114,15 +114,17 @@ public:
     /// wait pumps them); a test that stops calling the client stops its driver
     /// (no status messages to the broker).  Construct, use and destroy it on ONE
     /// thread (the driver's pump owner).
+    /// `conductorIdleSleepMs`: the Threaded client conductor's idle sleep; 0 = Aeron's 16 ms (every add / find waits out two).
     explicit ShardTestClient(const std::filesystem::path& aeronDir, int32_t termBufferBytes = 1 << 20,
                              bool legacyTransport = false, DriverMode mode = DriverMode::Threaded,
-                             int32_t rcvWindowBytes = 128 * 1024)
+                             int32_t rcvWindowBytes = 128 * 1024, long conductorIdleSleepMs = 0)
         : driver_(cfgFor(aeronDir, termBufferBytes, legacyTransport, rcvWindowBytes), mode),
           invoker_(mode == DriverMode::Invoker)
     {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir.string());
         ctx.useConductorAgentInvoker(invoker_);
+        if (conductorIdleSleepMs > 0) ctx.idleSleepDuration(conductorIdleSleepMs);
         aeron_ = aeron::Aeron::connect(ctx);
         egressChannel_ = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPort());
         const int64_t reg = aeron_->addSubscription(egressChannel_, kEgressStream);

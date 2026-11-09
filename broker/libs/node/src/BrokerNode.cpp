@@ -504,6 +504,7 @@ void BrokerNode::start() {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
         ctx.mediaDriverTimeout(config_.inProcessDriverTimeoutMs());   // in-process driver: survive own stalls
+        if (config_.testAeronClientIdleSleepMs > 0) ctx.idleSleepDuration(config_.testAeronClientIdleSleepMs);   // TEST-ONLY
         // Spec §3.2 fused placement: the runtime client has no conductor thread
         // either — its conductor runs in worker 0's pass (during start(): in the
         // interim pump runner below).

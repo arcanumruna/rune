@@ -936,14 +936,18 @@ TEST(ShardModeRegression, SequentialShardResolveKeepsEarlierShardsAlive) {
     const auto ports = ShardPorts::discover(1, kWorkers);
     auto cfg = makeShardConfig(0, dir.path, ports, 1, kWorkers, /*fused=*/false);
     constexpr int32_t kTopicParts = 12;
-    constexpr int64_t kLivenessNs = 500'000'000;           // the driver timer runs at a tenth of it
+    // Above the Aeron client's fixed 500 ms keepalive interval (aeron::Context has no setter for it): at 500 ms a pumped client is
+    // timed out between two keepalives.  The driver timer runs at a tenth of it.
+    constexpr int64_t kLivenessNs = 650'000'000;
     cfg.shardClientLivenessTimeoutNs = kLivenessNs;
+    cfg.testAeronClientIdleSleepMs = 1;
     BrokerNode node{cfg};
-    node.setShardResolveStallForTest(kWorkers - 1, std::chrono::milliseconds{2 * kLivenessNs / 1'000'000});
+    // Past the liveness and the driver timer that checks it: an earlier shard left unpumped this long is timed out.
+    node.setShardResolveStallForTest(kWorkers - 1, std::chrono::milliseconds{kLivenessNs / 1'000'000 + 150});
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
     ASSERT_EQ(defineShardTopic({&node}, kTopicParts), 0);
-    ShardTestClient c(cdir.path);
+    ShardTestClient c(cdir.path, 1 << 20, /*legacyTransport=*/false, DriverMode::Threaded, 128 * 1024, /*conductorIdleSleepMs=*/1);
     const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
     ASSERT_GT(sid, 0);
     for (int32_t w = 0; w < kWorkers; ++w) {
@@ -1921,15 +1925,19 @@ int64_t pauseClient(ShardTestClient& a, const std::string& gw, int64_t sidA, int
     }, /*maxFrames=*/40'000, paused);
 }
 // A silent client reads NOT_CONNECTED after `silent` and its image closes after four times that, its session lease runs out after `lease`:
-// not the 5, 10 and 10 s defaults.  The Stress variants wait 0.3 s and 1 s, the defaults 0.1 s and 0.35 s.
+// not the 5, 10 and 10 s defaults.  The Stress variants wait 0.3 s and 1 s, the defaults 0.1 s and 0.15 s.
 // The defaults also fill a small ack pipe: the worker's session ack publications get the smallest term (64 KiB), the broker a small MTU and
 // the client a window just above it, so a client that reads nothing has a window full after a few thousand acks instead of ten thousand.
+// The paused client's own publication gets the smallest term too: it buffers a few hundred produces, not thousands that a 1-credit
+// gateway then forwards one by one.  Every client conductor (the broker's and a Threaded test client's) idles 1 ms, not 16.
 struct ClientTimeouts {
     std::chrono::milliseconds silent, lease;
     bool smallAckPipe;
     [[nodiscard]] int32_t ackWindowBytes() const noexcept { return smallAckPipe ? 2816 : 128 * 1024; }
+    [[nodiscard]] int32_t clientTermBytes() const noexcept { return smallAckPipe ? 1 << 16 : 1 << 20; }
+    [[nodiscard]] long clientIdleSleepMs() const noexcept { return smallAckPipe ? 1 : 0; }
 };
-constexpr ClientTimeouts kStressTimeouts{300ms, 1000ms, false}, kFastTimeouts{100ms, 350ms, true};
+constexpr ClientTimeouts kStressTimeouts{300ms, 1000ms, false}, kFastTimeouts{100ms, 150ms, true};
 constexpr auto kHeldLease = 500ms;   // the held-direct test only waits out the lease
 NodeConfig withShortClientTimeouts(NodeConfig cfg, ClientTimeouts t = kStressTimeouts) {
     cfg.testSilentPeerTimeoutNs = std::chrono::duration_cast<std::chrono::nanoseconds>(t.silent).count();
@@ -1937,6 +1945,7 @@ NodeConfig withShortClientTimeouts(NodeConfig cfg, ClientTimeouts t = kStressTim
     if (t.smallAckPipe) {
         cfg.aeronControlTermBufferBytes = 1 << 16;
         cfg.aeronMtuBytes = 1408;
+        cfg.testAeronClientIdleSleepMs = 1;
     }
     return cfg;
 }
@@ -1972,10 +1981,11 @@ void runKilledPausedClientsSessionAndAcksAreFreed(ClientTimeouts timeouts) {
     };
     auto clientImages = [&] { return node.onControlThreadForTest([&] { return node.gatewayForTest()->clientImageCountForTest(); }); };
     const int images0 = clientImages();
-    ShardTestClient b(bd.path, 1 << 20);   // D8c follow-up: the host-derived (default) transport
+    ShardTestClient b(bd.path, 1 << 20, /*legacyTransport=*/false, DriverMode::Threaded, 128 * 1024, timeouts.clientIdleSleepMs());   // D8c follow-up: the host-derived (default) transport
     int64_t sidA = 0, sidB = 0;
     {
-        ShardTestClient a(ad.path, 1 << 20, /*legacyTransport=*/false, DriverMode::Threaded, timeouts.ackWindowBytes());
+        ShardTestClient a(ad.path, timeouts.clientTermBytes(), /*legacyTransport=*/false, DriverMode::Threaded, timeouts.ackWindowBytes(),
+                          timeouts.clientIdleSleepMs());
         sidA = a.connect(gw, kClientStream);
         ASSERT_GT(sidA, 0);
         ASSERT_TRUE(a.produceUntilOk(gw, kClientStream, sidA, 0, 0, /*acks=*/1, makeBatch(1)));
@@ -2041,7 +2051,7 @@ void runPausedInvokerClientSurvivesNotConnected(uint32_t gatewayProduceCredits, 
             return g->heldProduceAbortsForTest() - g->creditProduceAbortsForTest() - g->workerCapProduceAbortsForTest();
         });
     };
-    ShardTestClient a(ad.path, 1 << 20, /*legacyTransport=*/false, DriverMode::Invoker, timeouts.ackWindowBytes());   // default transport (D8c follow-up)
+    ShardTestClient a(ad.path, timeouts.clientTermBytes(), /*legacyTransport=*/false, DriverMode::Invoker, timeouts.ackWindowBytes());   // default transport (D8c follow-up)
     const int64_t sidA = a.connect(gw, kClientStream);
     ASSERT_GT(sidA, 0);
     ASSERT_TRUE(a.produceUntilOk(gw, kClientStream, sidA, 0, 0, /*acks=*/1, makeBatch(1)));
@@ -2116,7 +2126,7 @@ void runPausedInvokerClientResumingWithoutReadingIsFoundNotReaped(ClientTimeouts
             return g.heldProduceAbortsForTest() - g.creditProduceAbortsForTest() - g.workerCapProduceAbortsForTest();
         });
     };
-    ShardTestClient a(ad.path, 1 << 20, /*legacyTransport=*/false, DriverMode::Invoker, timeouts.ackWindowBytes());
+    ShardTestClient a(ad.path, timeouts.clientTermBytes(), /*legacyTransport=*/false, DriverMode::Invoker, timeouts.ackWindowBytes());
     const int64_t sidA = a.connect(gw, kClientStream);
     ASSERT_GT(sidA, 0);
     ASSERT_TRUE(a.produceUntilOk(gw, kClientStream, sidA, 0, 0, /*acks=*/1, makeBatch(1)));

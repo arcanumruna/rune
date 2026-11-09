@@ -321,6 +321,10 @@ struct NodeConfig {
     /// TEST-ONLY: the floor (ms) of inProcessDriverTimeoutMs in place of Aeron's 10 s default, so a test can freeze the process
     /// past it in a fraction of the time.  0 = 10 s; never set in production.
     long testInProcessDriverTimeoutFloorMs = 0;
+    /// TEST-ONLY: the idle sleep (ms) of the node's runtime Aeron client conductor (thread placement) in place of Aeron's 16 ms, so a
+    /// test's every client-conductor round trip (a gateway egress publication, a subscription) does not wait out two 16 ms sleeps.
+    /// 0 = Aeron's 16 ms; never set in production.
+    long testAeronClientIdleSleepMs = 0;
     /// The in-process clients' media-driver timeout (ms) matching shardClientLivenessTimeoutNs (never below
     /// Aeron's 10 s default).
     [[nodiscard]] long inProcessDriverTimeoutMs() const noexcept {
