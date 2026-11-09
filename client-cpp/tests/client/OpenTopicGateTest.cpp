@@ -78,6 +78,7 @@ struct GateGateway {
     bool replyConnectOK      = true;
     bool replyGetTopicSchema = true;
     int  getTopicSchemaSeen  = 0;   // GetTopicSchema requests that reached the gateway (a skipped probe sends none)
+    int  getTopicSchemaAnswers = -1;   // answer only this many GetTopicSchema requests (-1 = all)
     std::vector<bool> defineValidate;   // the validate byte of every DefineTopic that reached the gateway
 
     int32_t              getTopicId   = 0x40000001;
@@ -101,6 +102,7 @@ struct GateGateway {
     };
     std::map<uint64_t, FingerprintOverride> fingerprintOverrides;
     uint16_t unknownFingerprintErrorCode = 1;  // any nonzero "not found" code
+    int      unappliedFingerprintAnswers = 0;  // the first N answers for an overridden fingerprint are "not found" (the topic is not applied yet)
 
     uint8_t replyBuf[4096]{};
 
@@ -187,6 +189,7 @@ struct GateGateway {
             auto opt = rpc::GetTopicSchema::decode(buf, len);
             if (opt) ++getTopicSchemaSeen;
             if (!opt || !replyGetTopicSchema) break;
+            if (getTopicSchemaAnswers >= 0 && getTopicSchemaSeen > getTopicSchemaAnswers) break;
 
             rpc::TopicSchemaResponse resp;
             resp.sessionId      = opt->sessionId;
@@ -198,7 +201,14 @@ struct GateGateway {
                                 fingerprintOverrides.find(rpc::kSchemaKindFingerprint) == fingerprintOverrides.end());
             if (!plain) {
                 auto it = fingerprintOverrides.find(opt->requestedFingerprint);
-                if (it != fingerprintOverrides.end()) {
+                if (it != fingerprintOverrides.end() && unappliedFingerprintAnswers > 0) {
+                    --unappliedFingerprintAnswers;
+                    resp.topicId        = -1;
+                    resp.version        = 0;
+                    resp.errorCode      = unknownFingerprintErrorCode;
+                    resp.descriptorBlob = nullptr;
+                    resp.descriptorLen  = 0;
+                } else if (it != fingerprintOverrides.end()) {
                     resp.topicId        = it->second.topicId;
                     resp.version        = it->second.version;
                     resp.errorCode      = 0;
@@ -674,14 +684,14 @@ TEST(OpenTopicGateRegression, AnotherBrokerErrorIsNamedRegression) {
 }
 
 namespace {
-// C7 adversarial review (#22): the what() of a direct throwOpenTopicFailure call.
+// C7 adversarial review (#22): the what() of a direct resolveOpenTopicFailure call.
 std::string openFailureText(Client& c, std::string_view name, uint16_t code, std::chrono::nanoseconds left) {
     try {
-        c.throwOpenTopicFailure(name, code, left);
+        (void)c.resolveOpenTopicFailure(name, StubV1::kFingerprint, code, left);
     } catch (const std::runtime_error& e) {
         return e.what();
     }
-    ADD_FAILURE() << "throwOpenTopicFailure returned";
+    ADD_FAILURE() << "resolveOpenTopicFailure returned";
     return {};
 }
 }  // namespace
@@ -704,8 +714,9 @@ TEST(OpenTopicGateRegression, OpenFailureWithNoBudgetLeftSkipsTheProbeAdversaria
         EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
     }
     EXPECT_EQ(h.gw->getTopicSchemaSeen, before) << "no probe without budget";
+    h.gw->unknownFingerprintErrorCode = 7;
     EXPECT_NE(openFailureText(*h.client, "characters", 7, 5s).find("stale"), std::string::npos);
-    EXPECT_EQ(h.gw->getTopicSchemaSeen, before + 1);
+    EXPECT_EQ(h.gw->getTopicSchemaSeen, before + 2) << "the kind probe, then the caller's fingerprint again";
 }
 
 // #22: a probe that is never answered proves nothing - the original code is named (never "does not exist" or
@@ -723,6 +734,21 @@ TEST(OpenTopicGateRegression, OpenFailureProbeTimeoutNamesTheOriginalCodeAdversa
     EXPECT_EQ(msg.find("stale"), std::string::npos) << msg;
     EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
     EXPECT_LT(took, 3s) << "bounded by the remaining budget";
+}
+
+// P5 retry: the kind probe answers a typed blob but the retry with the caller's fingerprint is never answered within the budget.
+// The probe's verdict stands (the type is stale); the retry's timeout never escapes as "getTopicSchema(): timed out".
+TEST(OpenTopicGateRegression, OpenFailureRetryTimeoutKeepsTheStaleTypeVerdictAdversarialRegression) {
+    GateHarness h(1358, 1359);
+    h.build();
+    h.connectAndWait();
+    h.gw->getBlob              = serialize(makeCharsV2Descriptor());
+    h.gw->getErrorCode         = 0;
+    h.gw->getTopicSchemaAnswers = h.gw->getTopicSchemaSeen + 1;   // the probe only
+    GateGatewayPump pump(*h.gw);
+    const std::string msg = openFailureText(*h.client, "characters", 7, 300ms);
+    EXPECT_NE(msg.find("stale"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("timed out"), std::string::npos) << msg;
 }
 
 // #22: the probe itself refused names the PROBE's code (an auth name when it has one, the bare number for an unknown
@@ -1373,6 +1399,42 @@ TEST(CheckedWritesBind, TypedOpenOfAMissingTopicSaysSo) {
     h.gw->unknownFingerprintErrorCode = 7;
     GateGatewayPump pump(*h.gw);
     expectOpenMessage(*h.client, "characters", "topic 'characters' does not exist");
+}
+
+// The node answers the fingerprint UnknownTopic because it has not applied the topic yet; the kind probe then finds it applied.
+// The type matches, so the open succeeds - it is not told to regenerate.  RED: "generated type is stale".
+TEST(CheckedWritesBind, TypedOpenOfATopicAppliedBetweenTheAnswerAndTheProbeSucceedsRegression) {
+    GateHarness h(1420, 1421);
+    h.build();
+    h.connectAndWait();
+    h.gw->getTopicId                  = 0x40000001;
+    h.gw->getVersion                  = 1;
+    h.gw->getBlob                     = serialize(makeCharsV1Descriptor());
+    h.gw->unknownFingerprintErrorCode = 7;
+    h.gw->unappliedFingerprintAnswers = 1;
+    h.gw->fingerprintOverrides[StubV1::kFingerprint] = GateGateway::FingerprintOverride{
+        /*topicId=*/0x40000001, /*version=*/1, serialize(makeCharsV1Descriptor())};
+    GateGatewayPump pump(*h.gw);
+    TypedTopic<StubV1> tt = h.client->openTopicAndWait<StubV1>("characters");
+    EXPECT_EQ(tt.boundVersion(), 1u);
+}
+
+// The same, for a type bound to an older version: the probe answers the latest schema (V2), which is not T's, yet T's own version is
+// registered.  The open asks for T's fingerprint once more and binds to V1.  RED: "generated type is stale".
+TEST(CheckedWritesBind, TypedOpenOfAnOlderVersionAppliedBetweenTheAnswerAndTheProbeSucceedsRegression) {
+    GateHarness h(1422, 1423);
+    h.build();
+    h.connectAndWait();
+    h.gw->getTopicId                  = 0x40000001;
+    h.gw->getVersion                  = 2;
+    h.gw->getBlob                     = serialize(makeCharsV2Descriptor());
+    h.gw->unknownFingerprintErrorCode = 7;
+    h.gw->unappliedFingerprintAnswers = 1;
+    h.gw->fingerprintOverrides[StubV1::kFingerprint] = GateGateway::FingerprintOverride{
+        /*topicId=*/0x40000001, /*version=*/1, serialize(makeCharsV1Descriptor())};
+    GateGatewayPump pump(*h.gw);
+    TypedTopic<StubV1> tt = h.client->openTopicAndWait<StubV1>("characters");
+    EXPECT_EQ(tt.boundVersion(), 1u);
 }
 
 TEST(CheckedWritesBind, TypedOpenFingerprintMismatchKeepsTheStaleMessage) {

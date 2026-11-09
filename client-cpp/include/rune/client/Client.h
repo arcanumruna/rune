@@ -1347,10 +1347,11 @@ public:
         return T::lineage(rune::codec::deserialize(std::span<const uint8_t>(r.descriptorBlob)));
     }
 
-    /// Internal (Issue #22): the open failure for a GetTopicSchema(name, fingerprint) error `code`; cold path, throws,
-    /// never returns.  @p remaining is what is left of the caller's wait budget (the UnknownTopic probe waits at most
+    /// Internal (Issue #22): the open failure for a GetTopicSchema(name, fingerprint) error `code`; cold path, throws
+    /// unless the probe finds the topic now answers for `fingerprint` (the first answer predated its apply): then that
+    /// answer.  @p remaining is what is left of the caller's wait budget (the UnknownTopic probe waits at most
     /// that long and is skipped when nothing is left).
-    [[noreturn]] void throwOpenTopicFailure(std::string_view name, uint16_t code, std::chrono::nanoseconds remaining);
+    TopicSchemaResult resolveOpenTopicFailure(std::string_view name, uint64_t fingerprint, uint16_t code, std::chrono::nanoseconds remaining);
 
     /// Issue #435: the message for a failed schema-lineage request.  On UnknownTopic it probes the latest schema
     /// (fingerprint 0): served -> the broker predates lineage; UnknownTopic -> the topic does not exist.  Runs on the
@@ -1520,7 +1521,7 @@ private:
         const auto started = std::chrono::steady_clock::now();
         TopicSchemaResult r = getTopicSchemaAndWait(name, T::kFingerprint, timeout);
         if (r.errorCode != 0)   // Issue #22: missing topic / stale type / another refusal
-            throwOpenTopicFailure(name, r.errorCode, timeout - (std::chrono::steady_clock::now() - started));
+            r = resolveOpenTopicFailure(name, T::kFingerprint, r.errorCode, timeout - (std::chrono::steady_clock::now() - started));
         if (!schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
             throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
         }
@@ -1768,10 +1769,11 @@ private:
     // pre-D4 client until a NotCoordinator answer names another node).
     detail::CoordRoute coordRoute_;   // #362: CoordSeed, or CoordRemote{session index, channel, failBase, downSince}
     [[nodiscard]] uint32_t coordIdx() const noexcept { return detail::coordIdxOf(coordRoute_); }
-    // A coordinator that stays down past kCoordDownFallbackNs is given up like an exhausted connect budget (back to
-    // the seed, which names the CURRENT coordinator): a crashed coordinator node's session otherwise retries for
-    // minutes and every txn / group op waits on it.
+    [[nodiscard]] uint64_t staleLossesAt_(uint32_t idx) const noexcept;   // session idx's stale-session losses, not the client's own stalls
+    // A coordinator session that stays down past kCoordDownFallbackNs is given up like an exhausted connect budget (back to the
+    // seed, which names the CURRENT coordinator); one that went stale is given up at once.
     static constexpr int64_t kCoordDownFallbackNs = 5'000'000'000LL;
+    int64_t     coordNeverUpGraceNs_ = kMetadataBackoffInitNs;   // grace of a coordinator session never Connected; doubles per give-up
     uint64_t    coordinatorRedirects_ = 0;   // coordinator moves followed
     uint64_t    coordinatorFallbacks_ = 0;   // coordinator sessions given up (back to the seed)
     // r2 LOW-3: a coordinator channel whose session was Rejected / Closed, and

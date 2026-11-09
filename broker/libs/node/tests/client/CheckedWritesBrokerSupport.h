@@ -22,6 +22,16 @@ namespace rune::node::test::cw_broker {
 using namespace std::chrono_literals;
 namespace rc = rune::client;
 
+/// The three-broker tests' cluster: the short warm-up, fused workers and a 40 ms election; a crashed node's partitions fail over after the 150 ms
+/// liveness timeout, and a restart waits 50 ms for the old leader's read lease.
+inline void fastFailover(NodeConfig& cfg) {
+    cfg.unservableWarmupMs      = 50;
+    cfg.runtimePlacement        = NodeConfig::RuntimePlacement::Fused;
+    cfg.electionTimeoutMs       = 40;
+    cfg.readLeaseMaxMs          = 50;
+    cfg.brokerLivenessTimeoutMs = 150;
+}
+
 /// A typed topic {id uint64 key, name string(16), bio string, blob bytes, kind enum} with `partitions` partitions.
 inline rc::DefineTopicResult defineTyped(rc::Client& c, const std::string& name, uint32_t partitions) {
     const auto blob = rune::codec::serialize(rune::node::cw::matrixDescriptor());
