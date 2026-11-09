@@ -1357,14 +1357,14 @@ TEST(CheckedWritesTxnJudge, NoFreeOverlayWaitsAtJ) {
 
 namespace {
 // A 4,096-record 77 at 10, ~1 MiB of tombstone batches (16 passes at the test's 64 KiB scan bound), a plain upsert of one of 77's keys, then 77's TxnJudge.
-void spanningLog(JudgeRig& r) {
+void spanningLog(JudgeRig& r, std::size_t tailBytes = 1u << 20) {
     std::vector<Rec> txn;
     for (int64_t id = 0; id < JudgeRig::kRecordsMax; ++id) txn.push_back({10'000 + id});
     r.log.data(txn, 77);
     std::vector<Rec> dels;
     for (int64_t i = 0; i < 3000; ++i) dels.push_back(del(1'000'000 + i));
     const std::size_t from = r.log.bytes.size();
-    while (r.log.bytes.size() - from < (1u << 20)) r.log.data(dels);
+    while (r.log.bytes.size() - from < tailBytes) r.log.data(dels);
     r.log.data({{10'005}});
     r.log.judge(77, 10);
 }
@@ -1398,6 +1398,17 @@ TEST(CheckedWritesTxnJudge, JudgingSpansPassesWithABoundedRead) {
     EXPECT_EQ(a.constraintId, b.constraintId);
     EXPECT_EQ(a.failingOffset, b.failingOffset);
     EXPECT_EQ(a.failingOffset, bounded.log.next - 2);
+}
+
+// The production per-pass scan budget: a log one batch past it is not judged in one pass.
+TEST(CheckedWritesTxnJudgeRegression, DefaultPassBudgetBoundsTheJudgeReadRegression) {
+    JudgeRig r(VoteMembers{100'000});
+    r.start();
+    spanningLog(r, kVoteScanBytesPerPass + (64u << 10));
+    int passes = 0;
+    for (; passes < 400 && !r.st.txn.find(77)->judged; ++passes) r.drive();
+    ASSERT_TRUE(r.st.txn.find(77)->judged);
+    EXPECT_GE(passes, 2) << "the default budget ended the first pass";
 }
 
 // F3: a chain paused on a lock mid-transaction re-chains from the first record; the answer equals an unpaused run's.
@@ -1549,7 +1560,7 @@ TEST(CheckedWritesTxnJudgeRegression, OwedMarkerSearchRotatesAcrossAReactivation
     r.log.data({{5}}, 88);            // 12
     r.log.judge(88, 12);              // 13, refused
     std::vector<Rec> big;
-    for (int64_t id = 0; id < 40'000; ++id) big.push_back({1'000'000 + id});
+    for (int64_t id = 0; id < 20'000; ++id) big.push_back({1'000'000 + id});
     r.log.data(big);
     r.log.marker(88, true);           // dropped by the feed
     const int64_t m88 = r.log.next - 1;
