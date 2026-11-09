@@ -536,6 +536,8 @@ struct ClientConfig {
     // ViewRowResult::kNotLeader.  Bounded by the read's own deadline
     // (pingTimeoutMs) too.  Independent of the DDL knobs (#76).
     std::chrono::milliseconds viewReadRetryBudget{5'000};
+    // ddlRetryBackoff: the first NotLeader backoff of a DDL / view read (doubling to 1 s).
+    std::chrono::milliseconds ddlRetryBackoff{100};
     // ddlTimeoutMs: the deadline of EVERY DDL (DefineTopic, AlterTopic,
     // CreateView, DropTopic, DropView, AlterView, AlterTopicConfig) — the whole
     // op, its Redirect hops and NotLeader retries included; no answer by then ->
