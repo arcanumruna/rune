@@ -980,7 +980,8 @@ None of these can stop expiry:
   That covers `MaxLeaseTTL` (285 years), and a saturated `INT64_MAX` deadline (§9.1). An entry cascades at most four
   times in its life.
 - **Intrusive by row id.** `ViewTable` row ids are dense and stable. One 48-byte entry per live lease holds:
-  - `deadlineNs`, `checkpointNs`, `lastAppended`;
+  - `deadlineNs`, `checkpointNs` (`lastAppended` stays in the lease table's aux, written by the produce hook; it is not in
+    the entry);
   - the deadline-wheel links and the checkpoint-wheel links (`u32` each);
   - `level` ×2, `state`;
   - `emitOffset` / `ckptOffset` / `clearOffset` (one field: an entry is in at most one of those states), and the park
@@ -994,8 +995,10 @@ None of these can stop expiry:
   - `poll(nowNs)` is O(due + slots passed), and only on lease partitions. An idle partition costs one compare.
 - **Throughput gate.** At least 100 000 `Expire` records/s appended per partition. A 10 000-lease mass expiry drains in
   40 cycles at the default batch.
-- **Scratch.** One per-worker scratch of `min(1 MiB, namespace maxBatchBytes when set)` (`Worker.h:6802`: the default
-  0 means unlimited, so 1 MiB). It is shared by `Expire` and `Checkpoint` batches.
+- **Scratch.** One per-worker scratch of 1 MiB, shared by `Expire` and `Checkpoint` batches. A batch is at most
+  `min(1 MiB, namespace maxBatchBytes when set, the broker's produce-intake batch limit)` bytes (`Worker.h` `NsHot`: the
+  default 0 means unlimited). The intake term is the Coordinator's call (Task 10): a lease batch is never larger than a
+  batch the broker accepts from a client, so it always replicates.
 
 ## 11. Rune QL and CLI
 

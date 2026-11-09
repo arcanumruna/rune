@@ -862,9 +862,10 @@ Spec §9.1 (saturating), §9.6 (states), §10; R4, R11.
   `arm(row, deadlineNs)` places at the lowest level whose span covers `deadline − now`; `poll(nowNs, sink, max)`
   advances the cursor, cascades higher-level slots whose tick passed (each entry cascades ≤ 4 times), and hands due
   rows to `sink` up to `max`; O(due + slots passed); an idle partition costs one compare (`nowNs < nextCheckNs`).
-- Entry (48 bytes, `static_assert`): `deadlineNs`, `checkpointNs`, `lastAppended` (i64 each), deadline links and
-  checkpoint links (`u32` ×4), `levelD u8`, `levelC u8`, `state u8`, `pad`, `inflightOffset i64` (the one
-  `emitOffset`/`ckptOffset`/`clearOffset` field), `parkHead u32`. States `Armed`, `Checkpointing`, `Clearing`,
+- Entry (48 bytes, `static_assert`): `deadlineNs`, `checkpointNs`, `inflightOffset` (i64 each; the one
+  `emitOffset`/`ckptOffset`/`clearOffset` field), deadline links and checkpoint links (`u32` ×4), `parkHead u32`,
+  `levelD u8`, `levelC u8`, `state u8`, `pad`. `lastAppended` stays in the lease table's aux (`kLeaseAuxBytes = 8`,
+  `LeaseIndex.h`, written by the produce hook); it is not in the entry (with it the entry would be 56 bytes). States `Armed`, `Checkpointing`, `Clearing`,
   `Emitting`; only `Armed` is linked in the deadline wheel for emission; transitions per spec §9.6's table; demotion
   discards the whole store.
 - Saturating arithmetic: `satAdd(a, b) = b > INT64_MAX − a ? INT64_MAX : a + b`; a saturated deadline lands in level 4

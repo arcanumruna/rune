@@ -1360,6 +1360,17 @@ if(BUILD_TESTING)
                 PROPERTIES TIMEOUT 180
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            # Lease topics Task 9: the lease wheels, the entry store and the four-state machine.  Header-only and standard
+            # library only, so this target links no broker library and never rebuilds one.
+            add_executable(rune_lease_wheel_tests
+                tests/node/LeaseWheelTest.cpp
+                tests/support/AllocWindow.cpp)
+            target_include_directories(rune_lease_wheel_tests PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
+            target_link_libraries(rune_lease_wheel_tests PRIVATE GTest::gtest_main)
+            gtest_discover_tests(rune_lease_wheel_tests PROPERTIES TIMEOUT 120)
+
             # EmbeddedDriver: one driver, one pumping thread (spec §3.6).
             add_executable(rune_embedded_driver_tests tests/node/EmbeddedDriverTest.cpp tests/node/DriverWakePollProbe.c)
             target_link_libraries(rune_embedded_driver_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)

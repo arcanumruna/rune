@@ -46,8 +46,8 @@ inline constexpr uint16_t kLeaseSystemSlots   = 4;
 inline constexpr uint16_t kLeaseOffsetSlots   = 2;   // lease_granted_offset, lease_updated_offset: the last two slots
 
 /// Per-row auxiliary bytes of the lease table (ViewTableKeys::auxBytesPerRow): `lastAppended`, the offset of the last
-/// update or revoke of the key that the produce path has appended (spec 6.4, R8), -1 = none.  Task 9 widens this into the
-/// 48-byte entry-store entry.
+/// update or revoke of the key that the produce path has appended (spec 6.4, R8), -1 = none.  It stays here; the entry store
+/// (Task 9) does not hold it.
 inline constexpr uint32_t kLeaseAuxBytes = 8;
 
 inline constexpr std::string_view kLeaseGrantedOffsetColumn = "lease_granted_offset";
