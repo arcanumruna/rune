@@ -131,6 +131,7 @@ cname() { dc ps -a -q "rune-$1" | head -1; }   # the container id of node <n> (1
 now_s() { date +%s; }
 now_ms() { date +%s%3N; }   # GNU date on the VM; the probes write epoch ms from the same host clock (the containers share it), so the two are comparable
 
+[[ "$(now_ms)" =~ ^[0-9]{13}$ ]] || fail "now_ms needs GNU date"
 [ -d "${FLIGHT_RECORDER_DIR}" ] || fail "missing flight-recorder checkout (set FLIGHT_RECORDER_DIR)"
 [ -d "${ARCANUM_METRICS_DIR}" ] || fail "missing arcanum-metrics checkout (set ARCANUM_METRICS_DIR)"
 for d in protocol codec crypto ql client-cpp conan/aeron; do
@@ -741,6 +742,12 @@ txn_kill() {
     wait_until "${RESUME_WAIT_S}" "txn-run resuming" progress_at_least "${RESUME_AT}" txn-run \
         || { out_of "txn-run-0" | tail -20 >&2; fail "txn-run: no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the ${3} kill"; }
     restart_node "$1"
+    # the window ends once progress advances again after the restart
+    BASE=$(race_progress txn-run)
+    RESUME_AT=$(( BASE + 20 ))
+    [ "${RESUME_AT}" -le "${txn_total}" ] || RESUME_AT="${txn_total}"
+    wait_until "${RESUME_WAIT_S}" "txn-run resuming after the ${3} restart" progress_at_least "${RESUME_AT}" txn-run \
+        || { out_of "txn-run-0" | tail -20 >&2; fail "txn-run: no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the ${3} restart"; }
     echo "${killed_ms} $(now_ms)" >> "${txn_windows}"
 }
 # txn_half_run <first worker number> <first user> <last user> : WORKERS probes over the users; the seed node is neither the character

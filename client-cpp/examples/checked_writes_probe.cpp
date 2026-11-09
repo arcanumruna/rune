@@ -1152,11 +1152,12 @@ RpLine txnRun(std::unique_ptr<TxnWriter>& w, Client& c, const std::string& txnId
         l.code         = r.ok ? 0 : r.code;
         l.constraintId = r.constraintId;
         l.offset       = r.failingOffset;
+        l.endMs        = epochMs();
     } catch (const std::exception& e) {
+        l.endMs = epochMs();   // the answer's arrival: not the abort and the writer rebuild below
         std::fprintf(stderr, "%s threw: %s\n", tag.c_str(), e.what());
         try { w->producer.abortTransactionAndWait(30s); } catch (const std::exception&) { w = std::make_unique<TxnWriter>(c, txnId); }   // a fenced or broken producer starts over
     }
-    l.endMs = epochMs();
     return l;
 }
 

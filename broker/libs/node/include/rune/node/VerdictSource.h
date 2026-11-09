@@ -138,7 +138,7 @@ public:
     /// Cold.  The caller's precondition: rows >= txnJudgedRecordsMax x the sum, over the verdict members of the source, of
     /// (key index 1; aggregate 4 x kSlotsPerTable + 3; projection = its applyTo write set + 1), and maxRowLen >= the largest
     /// member table rowLen, ClaimsExtras included (VerdictSource::overlayNeed).  An undersized overlay stalls the judge on a legal
-    /// transaction.  Only grows; an overlay in use keeps its rows until a later call finds it free (pending()).
+    /// transaction.  Only grows; an overlay in use keeps its rows until release() finds it free (pending()).
     void reserveFor(std::size_t rows, uint32_t maxRowLen) {
         rowsWanted_ = std::max(rowsWanted_, rows);
         rowLenWanted_ = std::max(rowLenWanted_, maxRowLen);
@@ -177,7 +177,7 @@ public:
     [[nodiscard]] std::size_t freeCount() const noexcept { return static_cast<std::size_t>(std::count(inUse_.begin(), inUse_.end(), false)); }
     [[nodiscard]] rune::view::TxnOverlay& at(int32_t i) noexcept { return overlays_[static_cast<std::size_t>(i)]; }
     /// Cold: every key set holds at least `keys` keys.  A set whose overlay is in use keeps its keys (a judgement is reading them):
-    /// it grows at the next call that finds it free (keysPending()).  The one-step set has a fixed size: an ordinary transaction is
+    /// release() grows it once it is free (keysPending()).  The one-step set has a fixed size: an ordinary transaction is
     /// refused past it on every leader alike.
     void reserveKeys(std::size_t keys);
     [[nodiscard]] bool keysPending() const noexcept { return keysPending_; }
