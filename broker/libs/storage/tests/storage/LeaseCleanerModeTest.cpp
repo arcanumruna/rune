@@ -417,6 +417,10 @@ TEST(LeaseCleanerRegression, OffsetMapPathsRefuseLeaseModeRegression) {
         EXPECT_EQ(kept(log, all), all) << "produceCleanedFile cleaned nothing";
         rune::storage::OffsetMap map;   // what a Plain build would have produced: k -> 5
         map.put("k", 5);
+        for (const int64_t b : sealed)   // the private rewrite on its own, with a map that would drop offsets 0-4 in Plain mode
+            EXPECT_FALSE(cleaner.rewriteSegmentForTest(log.dir(), b, map, 0, active, 0, 1000, 1'000'000));
+        log.reloadSegments();
+        EXPECT_EQ(kept(log, all), all) << "rewriteSegment(OffsetMap) rewrote nothing";
         cleaner.compact(log, map, 0, active, 0, 1000, 1'000'000);
         log.reloadSegments();
         EXPECT_EQ(kept(log, all), all) << "the log is untouched";

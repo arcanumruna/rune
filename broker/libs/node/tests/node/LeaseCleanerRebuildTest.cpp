@@ -216,11 +216,13 @@ TEST(LeaseCleanerRebuildRegression, CleanWriteCleanRestartRegression) {
         ASSERT_TRUE(g.send(recs));
     };
     round(5, 7000);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "the round's send failed";
     const std::size_t before1 = storedRecords(r).size();
     const auto c1 = r.compact();
     EXPECT_GT(c1.installed, 0) << "vacuity guard: the first clean installed a rewrite";
     EXPECT_LT(storedRecords(r).size(), before1) << "vacuity guard: the first clean dropped records";
     round(5, 8000);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "the round's send failed";
     const std::size_t before2 = storedRecords(r).size();
     const auto c2 = r.compact();
     EXPECT_GT(c2.installed, 0) << "vacuity guard: the second clean installed a rewrite";

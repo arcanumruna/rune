@@ -360,7 +360,8 @@ std::string leaseValue(int64_t version, uint64_t ttl, uint64_t holder) {
     std::memcpy(v.data() + 28, &remaining, 8);
     return v;
 }
-std::vector<int64_t> runLeaseKeepRun(bool lease) {
+struct LeaseKeepRun { std::vector<int64_t> offsets; int64_t lastUpdate = -1; };
+LeaseKeepRun runLeaseKeepRun(bool lease) {
     constexpr uint8_t kPutInsert = 1, kPutExisting = 2;   // intent bits 0-1: Insert, Existing
     auto dir = cp6TempDir(lease ? "cp6_lease_keep_on" : "cp6_lease_keep_off");
     Log log(dir.string(), /*rollBytes=*/1);   // one record per segment: every record is cleanable
@@ -417,25 +418,21 @@ std::vector<int64_t> runLeaseKeepRun(bool lease) {
         cur = std::max(cur + 1, r.baseOffset() + r.lastOffsetDelta() + 1);
     }
     fs::remove_all(dir);
-    offsets.push_back(-lastUpdate - 1000);   // encode the last update's offset after the survivors
-    return offsets;
+    return {std::move(offsets), lastUpdate};
 }
 }  // namespace
 
 TEST(CompactionCleanerAgent, LeaseTopicKeepsTheGrantRegression) {
     {
         SCOPED_TRACE("lease topic");
-        auto o = runLeaseKeepRun(true);
-        const int64_t lastUpdate = -(o.back() + 1000);
-        o.pop_back();
-        EXPECT_NE(std::find(o.begin(), o.end(), 0), o.end()) << "the live grant is kept";
-        EXPECT_NE(std::find(o.begin(), o.end(), lastUpdate), o.end()) << "the latest update is kept";
+        const auto r = runLeaseKeepRun(true);
+        EXPECT_EQ(r.offsets, (std::vector<int64_t>{0, r.lastUpdate}))
+            << "the live grant and the latest update are kept; the 19 superseded updates are cleaned (the clean ran)";
     }
     {
         SCOPED_TRACE("plain compacted topic");
-        auto o = runLeaseKeepRun(false);
-        o.pop_back();
-        EXPECT_EQ(std::find(o.begin(), o.end(), 0), o.end()) << "plain mode drops the grant: the clean ran";
+        const auto r = runLeaseKeepRun(false);
+        EXPECT_EQ(r.offsets, (std::vector<int64_t>{r.lastUpdate})) << "plain mode keeps only the latest record of the key";
     }
 }
 

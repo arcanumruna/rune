@@ -113,6 +113,11 @@ public:
     /// be one the window just released).  Window only.
     void setPreviousPassEnd(Offset offset) noexcept { previousPassEnd_ = offset; }
     [[nodiscard]] const ProducerBatchWindow* producerBatchWindowForTest() const noexcept { return window_ ? &*window_ : nullptr; }
+    /// Test hook: the private OffsetMap rewriteSegment, so its lease-mode refusal is tested on its own (with a non-empty map).
+    bool rewriteSegmentForTest(const std::string& dir, int64_t segBase, OffsetMap& map, Offset fromOffset,
+                               Offset cleanBoundaryOffset, int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs) {
+        return rewriteSegment(dir, segBase, map, fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
+    }
     /// M3: bytes the last offset-map build read from clean-prefix segments
     /// (producer tails) — throttled by the bounded passes.
     [[nodiscard]] int64_t lastPrefixBytesRead() const noexcept { return prefixBytesRead_; }
