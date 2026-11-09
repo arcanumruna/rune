@@ -360,6 +360,14 @@ public:
         model.declareRule(kObj, tagRule(9).fingerprint(), modelRule(tagRule(9)));
         model.addKeyIndexRule();
         model.reset(commitOrder_(withoutAbortedTxn_(log)));
+        if (c_.timing == Timing::TxnCommitBehind) {
+            EXPECT_EQ(txnEnd_.committed, !txnConflict_);
+            EXPECT_EQ(r_.writeState()->txn.stats.votesNoConflict, txnConflict_ ? 1u : 0u);
+            if (txnConflict_) {
+                ASSERT_EQ(txnEnd_.votes.size(), 1u);
+                EXPECT_EQ(txnEnd_.votes.at(0).second.code, 63) << "the vote names TxnConflict";
+            }
+        }
 
         checkIndex(r_, model);                                              // (a)
         checkMarkers(model, log, target);
@@ -557,7 +565,7 @@ private:
                 r_.pass();
             }
             ASSERT_FALSE(r_.acked(sent_[0].corr)) << "behind an open transaction the judge is held";
-            if (c_.timing == Timing::TxnCommitBehind) r_.commitTxn(kTxnPid);
+            if (c_.timing == Timing::TxnCommitBehind) txnEnd_ = r_.commitTxn(kTxnPid);
             else r_.marker(kTxnPid, false);
             return;
         }
@@ -609,9 +617,9 @@ private:
         return log;
     }
 
-    // P11-0: a committed transaction applies at its commit marker, above every record of the cell, not at its own offset.  Where the op left a record of k (a tombstone too), an
+    // P11-0: a committed transaction applies at its commit marker, above every record of the cell (the fixture sends nothing after the marker), not at its own offset.  Where the op left a record of k (a tombstone too), an
     // ordinary key index supersedes the upsert but still delivers it, and the constrained vote answers TxnConflict: the transaction aborts.
-    VerdictRig::RigLog commitOrder_(VerdictRig::RigLog log) const {
+    VerdictRig::RigLog commitOrder_(VerdictRig::RigLog log) {
         if (c_.timing != Timing::TxnCommitBehind) return log;
         const auto at = std::find_if(log.data.begin(), log.data.end(), [&](const VerdictRig::RigLogRec& d) { return d.offset == txnOffset_; });
         const VerdictRig::RigLogRec txn = *at;
@@ -620,7 +628,9 @@ private:
         withoutTxn.declareRule(kObj, tagRule(9).fingerprint(), modelRule(tagRule(9)));
         withoutTxn.addKeyIndexRule();
         withoutTxn.reset(log);
-        if (!(c_.entity == Entity::KeyRejectedEarlier && withoutTxn.latestAcceptedByKey().count(kKey) != 0)) log.data.push_back(txn);
+        const auto last = withoutTxn.latestAcceptedByKey().find(kKey);
+        txnConflict_ = c_.entity == Entity::KeyRejectedEarlier && last != withoutTxn.latestAcceptedByKey().end() && last->second.offset > txnOffset_;
+        if (!txnConflict_) log.data.push_back(txn);
         return log;
     }
 
@@ -705,6 +715,8 @@ private:
     std::size_t stored_ = 0;
     int16_t firstAckCode_ = 0;
     int64_t txnOffset_ = -1;
+    bool txnConflict_ = false;   // the constrained vote answered TxnConflict: T is not delivered
+    VerdictRig::TxnEnd txnEnd_;
     Trailer setupTrailer_;
 };
 
@@ -1121,7 +1133,7 @@ private:
                 for (std::size_t i = 0; i < a.count; ++i) rejected += model.verdicts().count(a.baseOffset + static_cast<int64_t>(i));
             EXPECT_GT(rejected, 0u);
             if (!faulty_()) {
-                const std::size_t aborted = c_.timing == Timing::TxnAbortBehind ? 2 : 0;   // the aborted transaction's two key-0 creates burn their ids too
+                const std::size_t aborted = c_.timing == Timing::TxnAbortBehind ? keyZero_.at(txnOffset_).count : 0;   // the aborted transaction's two key-0 creates burn their ids too
                 EXPECT_EQ(r_.autoIncStats().idsBurned, rejected + aborted) << "every rejected or aborted create burned its id";
                 const auto& later = acksByCorr_.at(sent_.back().corr);
                 uint64_t next = 0;

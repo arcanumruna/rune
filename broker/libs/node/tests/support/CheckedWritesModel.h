@@ -1,6 +1,6 @@
 #pragma once
 // CheckedWritesModel.h - the reference judge of the checked-writes matrix and the model checks.  Written independently of
-// VerdictSource: it reads the data records and the constraint-set change records of a log and judges them in offset order with
+// VerdictSource: it reads the data records and the constraint-set change records of a log and judges them in apply order (ascending offsets, or a committed transaction moved to its marker, P11-0) with
 // its own copy of the TestReject rules.  Every non-rejected record reaches every member's table (a joining member builds from the
 // start of the log unjudged), so all members' live keys are the live keys of the accepted records.
 #include "CheckedWritesRig.h"
@@ -141,12 +141,12 @@ public:
         return out;
     }
 
-    /// The key's state while reset() judges: every accepted record before the judged one has been applied, in offset order.
+    /// The key's state while reset() judges: every accepted record before the judged one has been applied, in apply order.
     [[nodiscard]] bool isLiveAtJudge(uint64_t id) const { return live_.count(id) != 0; }
 
     [[nodiscard]] static uint32_t constraintIdOf(uint64_t viewObjectId) noexcept { return static_cast<uint32_t>((viewObjectId << 16) | 1u); }
 
-    /// Judges `log` (data records and change records, ascending offsets) from scratch.
+    /// Judges `log` from scratch: data records in apply order (ascending offsets, or a committed transaction moved to its marker, P11-0), change records ascending.
     void reset(const VerdictRig::RigLog& log) {
         verdicts_.clear(); accepted_.clear(); latest_.clear(); live_.clear(); claimants_.clear(); characters_.clear();
         std::vector<std::pair<uint64_t, uint64_t>> set;   // the current members, ascending object id
