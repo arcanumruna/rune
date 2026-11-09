@@ -457,6 +457,7 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     if (!state.txn.reserved()) state.txn.reserve();
     if (ordinary_.capacity() == 0) {
         ordinary_.reserve(TxnJudgeState::kMaxTxns);
+        rejectedSpans_.reserve(TxnJudgeState::kMaxTxns);
         owedMarkers_.reserve(TxnJudgeState::kMaxTxns);
     }
     // Part 11: the transactions are judged anew from K.  The overlays go back first; nothing is cut from the table, so the owed
@@ -464,6 +465,7 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     releaseTxnOverlays(state.txn);
     state.txn.truncateFrom(INT64_MAX);
     ordinary_.clear();
+    rejectedSpans_.clear();
     probe_ = {};
     txnStop_ = TxnStop::None;
     ordinaryApplied_ = -1;
@@ -1352,6 +1354,21 @@ bool VerdictSource::applyTxnBatch_(const uint8_t* batch, std::size_t len, TxnKey
     return ok;
 }
 
+// Design 3.1: a marker split at the entry limit never ends inside a rejected span (first, M], or a restart there would meet the rest of
+// the span with none of its rejected records ahead of it.  The split is held at the span's first record when that lies above `from`;
+// a span longer than one marker is split inside all the same.
+int64_t VerdictSource::splitBeforeRejectedSpan_(int64_t at, int64_t from) const noexcept {
+    for (bool moved = true; moved;) {
+        moved = false;
+        for (const RejectedSpan& s : rejectedSpans_)
+            if (from < s.first && s.first < at && at <= s.marker) {
+                at = s.first;
+                moved = true;
+            }
+    }
+    return at;
+}
+
 // P11-2: the markers cover [emitFrom, judgedThrough()); a deferred transaction holds them until it is decided.
 int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
     const int64_t through = judgedThrough();
@@ -1367,7 +1384,11 @@ int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
         for (int64_t pos = from;;) {
             const int64_t off = state.rejected.nextRejectedAtOrAfter(pos);
             if (off >= through) break;
-            if (entryScratch_.size() == cr::kMaxMarkerEntries) { finalThrough = off; break; }
+            if (entryScratch_.size() == cr::kMaxMarkerEntries) {
+                finalThrough = splitBeforeRejectedSpan_(off, from);
+                while (from + entryScratch_.back().offsetDelta >= finalThrough) entryScratch_.pop_back();
+                break;
+            }
             const auto* e = state.rejected.find(off);
             entryScratch_.push_back(cr::MarkerEntry{static_cast<uint32_t>(off - from), e->code, e->constraintId});
             pos = off + 1;
@@ -1392,6 +1413,7 @@ int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
         lastMarkerNs_ = nowNs;
         ++work;
     }
+    std::erase_if(rejectedSpans_, [&](const RejectedSpan& s) { return s.marker < emitFrom_; });
     if (emitFrom_ >= judgeCursor_) sawEmptyChange_ = judgedRecord_ = false;   // not judgedThrough(): the run-ahead records still need a marker
     return work;
 }

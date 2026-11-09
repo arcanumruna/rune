@@ -816,6 +816,33 @@ TEST(CheckedWritesTxnJudgeRegression, ActivationKNeverPassesAnUndecidedTxnRegres
     EXPECT_LE(r.st.rejected.coveredThrough(), 12);
 }
 
+// REGRESSION (#974, design 3.1): the markers' 4096-entry split fell on the 4097th rejected offset, inside the span of a rejected
+// P11-7 transaction T.  A failover after that first marker restarted the judge there, above all but the last record of T, which it
+// judged as a transaction of its own and applied.  The coverage never lies inside a rejected span: the split backs off to T's first record.
+TEST(CheckedWritesTxnJudgeRegression, MarkerSplitNeverLandsInsideARejectedUnvotedTxnRegression) {
+    JudgeRig r(true);
+    r.vs.bindTxn(&r.pool, r.batch, 2);   // T's 3 records are over the cap: all rejected at the marker (TxnTooLarge)
+    r.start();
+    std::vector<Rec> plain;
+    for (int64_t id = 200; id < 200 + 4094; ++id) plain.push_back({id, 9});
+    r.log.data(plain);                   // 10-4103: rejected one by one
+    for (const int64_t id : {1, 2, 3}) r.log.data({{id}}, 77);   // 4104-4106, a batch each: the 4097th rejected offset is 4106
+    r.log.marker(77, true);              // 4107
+    r.drive();
+    ASSERT_EQ(r.st.rejected.size(), 4097u);
+    ASSERT_EQ(r.markerEnds().size(), 2u);
+    const int64_t firstEnd = r.markerEnds()[0];
+    EXPECT_TRUE(firstEnd <= 4104 || firstEnd > 4107) << "the split " << firstEnd << " is not inside T's span";
+    // The failover: only the first marker is committed.
+    const int64_t base0 = r.vs.judgeCursor();
+    r.st.markers.truncateFrom(base0 + 1);
+    r.st.rejected.truncateFrom(firstEnd);
+    r.vs.bindLeader(nullptr, 2, 0);
+    r.drive();
+    for (const int64_t id : {1, 2, 3}) EXPECT_FALSE(r.indexed(id)) << "T's record " << id << " stays rejected after the failover";
+    EXPECT_EQ(r.st.rejected.size(), 4097u);
+}
+
 // A decided ordinary transaction whose marker the judge has not reached yet holds judgedThrough (and so K) at its first record.
 TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnAwaitingItsMarkerHoldsJudgedThroughRegression) {
     JudgeRig r(false);

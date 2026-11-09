@@ -387,6 +387,7 @@ private:
     // look-ahead finds one; an ordinary transaction stops it at its marker (TxnStop::Marker) to be applied there.
     // `vote`: P11-7, -1 until the judge classifies it at the marker.
     struct OrdinaryTxn { int64_t producerId; int64_t first; int64_t marker; bool commit; int8_t vote = -1; int64_t intentFrom = -1; int64_t holdFrom = INT64_MAX; };
+    struct RejectedSpan { int64_t first; int64_t marker; };   // an ordinary transaction rejected whole at its marker, until a marker covers it
     struct TxnProbe { int64_t producerId = -1, first = -1, from = -1, waitAt = -1; };
     struct OwedMarker { int64_t producerId; int64_t judgeOffset; int64_t from; };   // a re-offered TxnJudge's marker, searched from `from`
     // Judge: the judge stands at a TxnJudge to judge (judgePid_).  Locked: a record touches a row a transaction holds (P11-4).
@@ -471,6 +472,7 @@ private:
     [[nodiscard]] bool indexHasRoom_(std::size_t n) noexcept;
     [[nodiscard]] rune::view::SourceRecord recordOf_(const rune::protocol::RecordSpan& span) noexcept;
     int    emitMarkers_(PartitionWriteState& state, int64_t nowNs);
+    [[nodiscard]] int64_t splitBeforeRejectedSpan_(int64_t at, int64_t from) const noexcept;
     int    pushCheckpoints_(PartitionWriteState& state);
     int    dropRetired_(PartitionWriteState& state);
     bool   resolveSet_(const ConstraintSet& set, std::vector<std::size_t>& out) const;
@@ -554,6 +556,7 @@ private:
     int64_t                     failCapacityAt_ = -1;
     TxnProbe                    probe_;
     std::vector<OrdinaryTxn>    ordinary_;
+    std::vector<RejectedSpan>   rejectedSpans_;
     std::vector<OwedMarker>     owedMarkers_;
     std::size_t                 owedStart_ = 0;           // rotates each pass: one owed marker far behind never starves the rest
     uint64_t                    sourceKey_ = 0;           // the overlays' source key: (topic, partition)
@@ -1062,6 +1065,7 @@ bool VerdictSource::judgeAtMarker_(ReadRangeFn& readRange, const rune::view::Abo
                              : !rejectTxnRecords_(readRange, o.producerId, o.first, o.marker, aborted, {jx_.answer.code, jx_.answer.constraintId}))
         return false;
     noteMarkerWithoutVote_(o, jx_.answer.code == 0);
+    if (jx_.answer.code != 0) rejectedSpans_.push_back({o.first, o.marker});
     txnPool_->release(jx_.overlay);
     endJudgement_();
     endOrdinary_(o);
