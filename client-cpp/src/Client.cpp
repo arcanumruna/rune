@@ -6919,7 +6919,11 @@ void Client::onCoordinatorRedirect_(const std::string& message) {
     // That node's ONE session (lazily opened / re-driven) — 0 = the seed is there.
     const uint32_t idx = agent_.coordinatorSessionIndex(channel, now());
     if (idx == 0) coordRoute_ = detail::CoordSeed{};
-    else          coordRoute_ = detail::CoordRemote{idx, channel, agent_.sessionConnectFailuresAt(idx), std::nullopt};
+    else {
+        const session::SessionMachine& nm = agent_.sessionMachineAt(idx);
+        coordRoute_ = detail::CoordRemote{idx, channel, agent_.sessionConnectFailuresAt(idx), std::nullopt,
+                                          nm.staleSessionLosses() - nm.ownStallLosses()};
+    }
     groupConsumerHub_.onCoordinatorMoved();   // members -> Rejoining (there)
     producerHub_.onCoordinatorMoved();        // Phase 2b F: AwaitCoordinator requests re-send
     syncCoordinatorSession_();                // already connected: they join at once
@@ -6939,10 +6943,14 @@ void Client::syncCoordinatorSession_() noexcept {
         // minutes before any of the exhausted-budget states above - so a session that stays down for
         // kCoordDownFallbackNs is given up too (level-triggered; the seed names the current coordinator, and
         // each fallback is paced by this grace, never a spin).
+        // The grace covers only a route that was followed but never came up: a session that is declared dead by
+        // its node's silence (a new stale loss since the route was made, the client's own stalls excluded) is
+        // given up at that edge, so the in-flight request reaches the new coordinator within the transaction timeout.
         const int64_t nowNs = now();
         const bool downTooLong =
             detail::coordDownTooLong(*rm, st == session::SessionState::Connected, nowNs, kCoordDownFallbackNs);
-        const bool gaveUp = downTooLong ||
+        const bool stale = m.staleSessionLosses() - m.ownStallLosses() != rm->staleBase;
+        const bool gaveUp = downTooLong || stale ||
                             st == session::SessionState::Disconnected ||
                             st == session::SessionState::Rejected ||
                             st == session::SessionState::Closed ||

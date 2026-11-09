@@ -17,6 +17,7 @@ struct CoordRemote {
     std::string            channel;        // its channel
     uint64_t               failBase = 0;   // its connectFailures() when it became the coordinator
     std::optional<int64_t> downSinceNs;    // first seen NOT Connected (duty clock); empty = up
+    uint64_t               staleBase = 0;  // its staleSessionLosses() - ownStallLosses() when it became the coordinator
 };
 using CoordRoute = std::variant<CoordSeed, CoordRemote>;
 
