@@ -273,6 +273,12 @@ TEST(LeaseDdlRegression, LeaseStoredRegression) {
     const cat::ViewObject* v = viewOf(rig, "inst.leases");
     ASSERT_NE(v, nullptr);
     EXPECT_EQ(v->kind, cat::ViewKind::LeaseIndex);
+    {   // Task 14a: the schema answer names the lease view's topic id (from the catalog), and only a lease topic has one.
+        const auto g = rig.getSchema("inst");
+        ASSERT_TRUE(g.lease.has_value());
+        EXPECT_EQ(g.leaseViewTopicId, v->def.viewTopicId);
+        EXPECT_NE(g.leaseViewTopicId, -1);
+    }
     // The event the admin appended (rig.recordedLog(): every event the catalog replica holds, in order).
     const cat::CatalogEvent e = lastEvent(rig);
     EXPECT_EQ(e.formatVer, cat::kFormatV4);

@@ -200,8 +200,8 @@ struct SgHarness {
         };
         deps.respondGet = [this](int64_t session, int64_t corr, int32_t tid, uint16_t ver, int32_t parts,
                                  const std::vector<uint8_t>& blob, uint16_t err, const rune::protocol::TopicKeyFeatures& keyFeatures,
-                                 const std::optional<rune::protocol::LeaseSpec>& lease) {
-            agent->postTopicSchemaResponse(session, corr, tid, ver, parts, blob, err, keyFeatures, lease);
+                                 const std::optional<rune::protocol::LeaseSpec>& lease, int32_t leaseView) {
+            agent->postTopicSchemaResponse(session, corr, tid, ver, parts, blob, err, keyFeatures, lease, leaseView);
         };
         deps.respondAlter = [this](int64_t session, int64_t corr, int32_t tid, uint16_t newVer, uint16_t err) {
             pc::AlterTopicResponse r; r.sessionId=session; r.correlationId=corr;

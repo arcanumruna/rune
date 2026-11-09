@@ -674,6 +674,9 @@ public:
         uint16_t verdictCount  = 0;
         uint32_t verdictOffset = 0;       ///< into the agent's verdict bytes (verdictBytes())
         uint64_t assignedBase  = 0;       ///< client 17: the first broker-assigned id of a key-0 batch (0 = none)
+        bool     hasLease      = false;   ///< client 18: the lease trailer follows (leaseCount x 16 bytes at leaseOffset)
+        uint16_t leaseCount    = 0;
+        uint32_t leaseOffset   = 0;       ///< into the lease-trailer arena (leaseBytes())
     };
     [[nodiscard]] std::span<const ProduceAck> produceAcks() const noexcept {
         return {produceAcks_.data(), produceAcks_.size()};
@@ -682,7 +685,13 @@ public:
     [[nodiscard]] std::span<const uint8_t> verdictBytes(const ProduceAck& a) const noexcept {
         return {verdictBytes_.data() + a.verdictOffset, std::size_t{a.verdictCount} * 8};
     }
-    void clearProduceAcks() noexcept { produceAcks_.clear(); verdictBytes_.clear(); }
+    /// The 16-byte lease entries of `a` {leaseVersion i64 LE, ttlMs u64 LE}, entry i for record i; valid until clearProduceAcks().
+    [[nodiscard]] std::span<const uint8_t> leaseBytes(const ProduceAck& a) const noexcept {
+        return {leaseTrailerBytes_.data() + a.leaseOffset, std::size_t{a.leaseCount} * 16};
+    }
+    void clearProduceAcks() noexcept { produceAcks_.clear(); verdictBytes_.clear(); leaseTrailerBytes_.clear(); }
+    /// Task 14a: how often the lease-trailer arena outgrew its reserve (a cycle of more than kMaxVerdictEntries lease entries).
+    [[nodiscard]] uint64_t leaseArenaGrowths() const noexcept { return leaseArenaGrowths_; }
     /// Test seam: discards the next `n` ProduceResponses (a lost ack).
     void dropProduceAcksForTest(int n) noexcept { dropProduceAcks_ = n; }
     /// Times the trailer bytes had to grow (a duty cycle with more verdicts than ever before).
@@ -1221,6 +1230,8 @@ private:
     std::vector<uint32_t>       freeRoutes_;
     int                         dropProduceAcks_ = 0;
     std::vector<ProduceAck>     produceAcks_;  // reserved in the ctor; owner clears
+    std::vector<uint8_t>        leaseTrailerBytes_;   // Task 14a: the lease trailers of produceAcks_, cleared with them
+    uint64_t                    leaseArenaGrowths_ = 0;
     std::vector<uint8_t>        verdictBytes_; // the trailers of produceAcks_, cleared with them; grows only for a larger duty cycle
     uint64_t                    verdictArenaGrowths_ = 0;
     bool                        mnDebug_ = false;  // RUNE_MN_DEBUG, read ONCE

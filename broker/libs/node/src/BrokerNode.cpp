@@ -4526,12 +4526,12 @@ void BrokerNode::buildAdminWorker() {
                                  uint16_t version, int32_t partitionCount,
                                  const std::vector<uint8_t>& blob,
                                  uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures,
-                                 const std::optional<rune::protocol::LeaseSpec>& lease) {
+                                 const std::optional<rune::protocol::LeaseSpec>& lease, int32_t leaseViewTopicId) {
             if (!adminWorkerAgent_) return;
             // Fix round 3: the encode / post / MessageTooLarge logic lives in
             // AdminWorkerAgent::postTopicSchemaResponse (directly testable).
             adminWorkerAgent_->postTopicSchemaResponse(session, corr, topicId, version, partitionCount,
-                                                       blob, errorCode, keyFeatures, lease);
+                                                       blob, errorCode, keyFeatures, lease, leaseViewTopicId);
         };
         deps.respondCreateView = [this](int64_t session, int64_t corr, int32_t viewTopicId,
                                         uint64_t outputFingerprint, uint16_t errorCode) {

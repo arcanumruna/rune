@@ -1070,6 +1070,35 @@ graces.grant(gen::DeleteGrace{.nsId = ns}, LeaseOptions{.ttl = 7 * 24h, .holder 
   `lease_remaining_ms`.
 - **Gating.** The client gates on `kBrokerVersionLeases`.
 
+**As built (Task 14a).**
+
+- **OpKinds**, appended after `GetStats`: `OpenLeaseTopic, LeaseGrant, LeaseUpdate, LeaseRevoke, LeaseKeepAlive,
+  LeaseTimeToLive, ScanLeases, LeaseCampaign, LeaseWatchReady`. Payload and fields per kind:
+
+  | OpKind | `value` | `aux` | `reserved0` | payload |
+  |---|---|---|---|---|
+  | `OpenLeaseTopic` | topic id | `schemaAuxOf` | partition count | descriptor blob + key features + lease block (spec + `i32` lease-view topic id) |
+  | `LeaseGrant` / `LeaseUpdate` | lease version | `ttlMs` | 0 | none |
+  | `LeaseRevoke` | 0 | 0 | 0 | none |
+  | `LeaseKeepAlive` | lease version | `ttlMs` | 0 | none |
+  | `LeaseTimeToLive` | version | remaining ms | 0 | 32-byte `LeaseTtlInfo` |
+  | `ScanLeases` | `asOfOffset` | last row hash | `rowCount \| done << 31` | the packed rows |
+  | `LeaseCampaign`, `LeaseWatchReady` | reserved for Tasks 15-16 | | | |
+
+- **Ack trailer to completion.** An accepted entry is `Ok`. A missing trailer entry is `StoredIdUnknown` (counted).
+  A per-record verdict is `RecordsRejected`. Verdict 21 on a grant is `VerdictUnknown`. A batch error is
+  `BrokerError`. A throttled batch (53) is re-sent.
+- **Schema answer.** The lease block of `TopicSchemaResponse` is the 39-byte `LeaseSpec` plus an `i32`
+  `leaseViewTopicId` (43 bytes); a 39-byte block without the id decodes with `-1`.
+- **Write timeout (deviation).** Writes use a dedicated producer whose `produceTimeoutMs` and `deliveryTimeoutMs`
+  both equal the handle's `opTimeoutMs` (default `ttl/3`, floor 1 ms). A per-call `LeaseOptions.opTimeoutMs`
+  applies to the routed requests (keep-alive, time-to-live, scan) only. A write's `DeliveryFailed` is reported as
+  `Timeout`.
+- **Writes** accept a `Completions` queue only; `revoke` takes the full key row.
+- **Subscriptions.** `Record::op()` is `Delete` for Revoke and Expire; `Record::leaseOp()` names the five forms.
+  A `Checkpoint` record is dropped before the handler while the position still advances (plain subscriptions;
+  group consumers do not deliver attributes).
+
 ### 12.2 `LeaseSession<Capacity, OnLost, OnAtRisk>` (etcd `concurrency.Session`)
 
 **Untyped and multi-topic (Coordinator's call, R7).** A preallocated, fixed-capacity set of leases on **one** client

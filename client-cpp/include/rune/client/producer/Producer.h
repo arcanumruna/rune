@@ -242,6 +242,10 @@ struct ProducerConfig {
     int32_t directDeferredPartitionBytes = 0; // Invoker only: one partition's max share of that
                                               // arena (0 = min(arena/2, 4 x batchBytes)), so a
                                               // stalled partition cannot exhaust it.
+    /// Internal (Task 14a): a LeaseTopic's dedicated writer.  The producer then accepts lease writes (Producer::trySendLease)
+    /// and completes them as LeaseGrant / LeaseUpdate / LeaseRevoke with value = leaseVersion, aux = ttlMs (a delivery
+    /// timeout completes Timeout).  Needs acks including View and All; leave false for every other producer.
+    bool    leaseWrites = false;
 
     /// Build a ProducerConfig from environment variables, falling back to
     /// sane defaults for any variable that is not set.
@@ -790,6 +794,16 @@ public:
               Token token, WriteIntent intent = WriteIntent::Upsert);
     void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, AckToken token,
               WriteIntent intent = WriteIntent::Upsert);
+
+    /// Lease topics (Task 14a; used by LeaseTopic - needs ProducerConfig::leaseWrites): write one lease record, key 1..128
+    /// bytes, routed to `partition` (the caller hashed the key).  `leaseOp` is a rune::protocol::record::LeaseOp (Put 0 /
+    /// Revoke 1), `kind` the completion's OpKind (LeaseGrant / LeaseUpdate / LeaseRevoke).  Exactly one completion arrives in
+    /// `cq` for an Ok result: Ok with value = leaseVersion, aux = ttlMs; RecordsRejected (errorCode = the verdict);
+    /// VerdictUnknown; BrokerError; StoredIdUnknown; Timeout (the delivery deadline).  InvalidArgument: not a lease
+    /// producer, a key outside 1..128 bytes, a bad token or queue.  Other results as trySend(..., Completions&, ...).
+    [[nodiscard]] SendResult trySendLease(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
+                                          std::span<const uint8_t> value, WriteIntent intent, uint8_t leaseOp, OpKind kind,
+                                          Completions& cq, Token token) noexcept;
 
     /// Send one record with `intent` and wait for its verdict: the Send completion, unchanged (status Ok with
     /// value = the record's offset; BrokerError with errorCode 56 / 57 and constraintIdOf() for a refused intent;

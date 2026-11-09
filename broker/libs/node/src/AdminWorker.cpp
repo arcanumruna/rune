@@ -665,35 +665,40 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     if (!named && msg.requestedFingerprint == rune::protocol::client::kSchemaKindFingerprint) {
         // Checked writes kind probe: an untyped topic is OK with no blob (a raw handle binds to it).
         if (const cat::TopicObject* t = applier_.state().topicByName(msg.nsId, msg.name)) {
-            deps_.respondGet(msg.session, msg.corr, t->topicId, 0, t->partitions, {}, kOK, {}, std::nullopt);
+            deps_.respondGet(msg.session, msg.corr, t->topicId, 0, t->partitions, {}, kOK, {}, std::nullopt, -1);
             return;
         }
     }
     if (!named) {
-        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {}, std::nullopt);
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {}, std::nullopt, -1);
         return;
     }
     const cat::TopicObject* topic = applier_.state().topicByName(msg.nsId, msg.name);
     const rune::protocol::TopicKeyFeatures features = topic != nullptr && topic->schema ? topic->schema->keyFeatures : rune::protocol::TopicKeyFeatures{};
+    // Task 14a: a lease topic's answer names its lease view's sink topic id, read from the catalog (never topicId + 1).
+    const auto leaseViewIdOf = [this](const cat::TopicObject* t) -> int32_t {
+        const cat::ViewObject* lv = t != nullptr && t->lease ? applier_.state().leaseViewOf(t->objectId) : nullptr;
+        return lv != nullptr ? lv->def.viewTopicId : -1;
+    };
     if (msg.requestedFingerprint == rune::protocol::client::kSchemaLineageFingerprint) {
         // #418: the topic's lineage - the latest entry's EVOLVING blob (every field ever declared, with its
         // lifetime), so a typed reader can place a record of any version.
         deps_.respondGet(msg.session, msg.corr, named->topicId, named->version, named->partitionCount,
-                         named->descriptorBlob, kOK, features, topic ? topic->lease : std::nullopt);
+                         named->descriptorBlob, kOK, features, topic ? topic->lease : std::nullopt, leaseViewIdOf(topic));
         return;
     }
     const RegistryEntry* e = (msg.requestedFingerprint == 0 || msg.requestedFingerprint == rune::protocol::client::kSchemaKindFingerprint)
                                  ? named
                                  : reg_.byFingerprint(named->topicId, msg.requestedFingerprint);
     if (!e) {
-        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {}, std::nullopt);
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {}, std::nullopt, -1);
         return;
     }
     // The wire blob is the MATERIALIZED-as-of-version descriptor (its fingerprint
     // is e->fingerprint), never the evolving blob; the partition count is the
     // topic's (the latest entry).
     deps_.respondGet(msg.session, msg.corr, e->topicId, e->version, named->partitionCount,
-                     rune::codec::serialize(e->descriptor), kOK, features, topic ? topic->lease : std::nullopt);
+                     rune::codec::serialize(e->descriptor), kOK, features, topic ? topic->lease : std::nullopt, leaseViewIdOf(topic));
 }
 
 void AdminWorker::respondList_(const ListNamespacesMsg& m) {

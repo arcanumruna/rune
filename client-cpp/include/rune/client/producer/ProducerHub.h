@@ -159,7 +159,7 @@ public:
     /// Client 17: `hasVerdicts` + the trailer entries of a View ack of a verdict source.
     void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
                            int64_t logStartOffset = -1, bool hasVerdicts = false, std::span<const uint8_t> verdicts = {},
-                           uint64_t assignedBase = 0);
+                           uint64_t assignedBase = 0, std::span<const uint8_t> leases = {});
 
     // ---- Phase 2b F Task 2: coordinator answers, routed by producer ordinal ----
 

@@ -305,7 +305,7 @@ TEST(CheckedWritesTypedTopic, SchemaCompletionHelpersRegression) {
     lease.ttlMs = 4242;
     lease.maxKeys = 9;
     lease.checkpoint = 0;
-    constexpr std::size_t B = 20, K = kTopicKeyFeaturesWireLen, L = kLeaseSpecBytes;
+    constexpr std::size_t B = 20, K = kTopicKeyFeaturesWireLen, L = rc::kSchemaLeaseBlockBytes;
     const int64_t none = rc::schemaAuxOf(5, false), k = rc::schemaAuxOf(5, true), kl = rc::schemaAuxOf(5, true, true),
                   l = rc::schemaAuxOf(5, false, true);
     ASSERT_EQ(l >> 17, 1);
@@ -361,7 +361,7 @@ TEST(CheckedWritesTypedTopic, FromSchemaOnALeaseCompletionKeepsTheDescriptorUnch
     FakeClient client{StubProducer{&script}};
     auto payload = rune::codec::serialize(rune::gen::Position::descriptor());
     const std::size_t blobLen = payload.size();
-    payload.resize(blobLen + rune::protocol::kTopicKeyFeaturesWireLen + rune::protocol::kLeaseSpecBytes);
+    payload.resize(blobLen + rune::protocol::kTopicKeyFeaturesWireLen + rune::protocol::kLeaseSpecBytes + 4);   // + the i32 lease-view topic id (Task 14a)
     rune::protocol::putTopicKeyFeatures(payload.data() + blobLen, rune::protocol::TopicKeyFeatures{});
     rune::protocol::encodeLeaseSpec(rune::protocol::LeaseSpec{},
                                     payload.data() + blobLen + rune::protocol::kTopicKeyFeaturesWireLen);

@@ -88,6 +88,27 @@ inline constexpr int32_t kMsgTier2Discard  = 6; // #341: a Tier-2 slot whose bui
 inline constexpr int32_t kMsgClaimCreditLost = 7; // #322: a credit claim aborted off its queue's owner thread
 inline constexpr int32_t kMsgDirectClaimAbort = 8; // #656: an Invoker claim aborted / destroyed off its owner thread: the owner rolls it back (payload: the claim's gen, 8 bytes LE, then one byte: 1 = the claim held cq / bq credit)
 
+inline constexpr int32_t kMsgSendLeaseRecord = 9; // Task 14a: SEND_LEASE_RECORD - a lease topic write (key up to 128 bytes; layout below)
+
+// SEND_LEASE_RECORD layout (kMsgSendLeaseRecord payload; the DeferredArena holds the same bytes), fixed header 151 bytes:
+//   [0..3] topicId i32 | [4..7] partition i32 | [8] keyLen u8 (1..128) | [9..136] key (128-byte slot, zero padded) |
+//   [137] flags u8 (bit0 wantAck, bits1-2 intent, bits4-5 lease op: Put 0 / Revoke 1; bit3 never set) |
+//   [138] leaseKind u8 (the OpKind of the completion: LeaseGrant / LeaseUpdate / LeaseRevoke) |
+//   [139..146] ackHandle i64 | [147..150] valueLen u32 | [151..] value
+// The non-lease SEND_RECORD form (above) is untouched: its key stays <= 16 bytes and its header 38 bytes.
+inline constexpr int kLeaseKeySlot        = 128;
+inline constexpr int kLeaseRecTopicIdOff  = 0;
+inline constexpr int kLeaseRecPartOff     = 4;
+inline constexpr int kLeaseRecKeyLenOff   = 8;
+inline constexpr int kLeaseRecKeyBytesOff = 9;
+inline constexpr int kLeaseRecFlagsOff    = kLeaseRecKeyBytesOff + kLeaseKeySlot;   // 137
+inline constexpr int kLeaseRecKindOff     = kLeaseRecFlagsOff + 1;                  // 138
+inline constexpr int kLeaseRecCorrIdOff   = kLeaseRecKindOff + 1;                   // 139
+inline constexpr int kLeaseRecValLenOff   = kLeaseRecCorrIdOff + 8;                 // 147
+inline constexpr int kLeaseRecValBytesOff = kLeaseRecValLenOff + 4;                 // 151
+inline constexpr int kLeaseRecHeaderSize  = kLeaseRecValBytesOff;                   // 151
+static_assert(kLeaseRecHeaderSize == 151);
+
 // TXN_CONTROL layout (kMsgTxnControl payload, little endian, Phase 2b F Task 8):
 //   [0]      kind          : u8  (TxnControl::Kind)
 //   [1..3]   pad
@@ -214,6 +235,9 @@ inline constexpr uint8_t kFlagIntentMask  = 0x06;  ///< the record's WriteIntent
 /// An autoincrement create (key 0 on a Modulo handle): its ring message ends with the topic's partition count (uint32 LE).
 /// A partition batch holds only key-0 creates or only other records.
 inline constexpr uint8_t kFlagKeyZero     = 0x08;
+/// Lease form only (kMsgSendLeaseRecord): bits 4-5 = the record's lease op (rune::protocol::record::LeaseOp: Put 0, Revoke 1).
+inline constexpr uint8_t kFlagLeaseOpShift = 4;
+inline constexpr uint8_t kFlagLeaseOpMask  = 0x30;
 inline constexpr std::size_t kKeyZeroTrailerBytes = 4;
 
 // Default ring capacity for a producer (per-producer, separate from agent ring).
@@ -409,7 +433,7 @@ struct PartitionState {
 // ---------------------------------------------------------------------------
 struct DeferredHdr {
     uint32_t len       = 0;  ///< payload bytes
-    uint8_t  type      = 0;  ///< kMsgSendRecord / kMsgTier2Batch; 0 = dead
+    uint8_t  type      = 0;  ///< kMsgSendRecord / kMsgSendLeaseRecord / kMsgTier2Batch; 0 = dead
     uint8_t  flags     = 0;  ///< kDefUnknownPartition | kDefFlushOnApply
     uint16_t reserved  = 0;
     int32_t  topicId   = 0;
@@ -673,6 +697,18 @@ public:
                           std::span<const uint8_t> value,
                           bool wantAck,
                           int64_t correlationId, uint8_t intent = 0, uint32_t idStride = 0) noexcept;
+
+    /// Task 14a: write a SEND_LEASE_RECORD (a lease topic write, key 1..128 bytes) into the ring.  App thread; no heap, no
+    /// lock.  `flags` = wantAck | intent << 1 | leaseOp << 4; `leaseKind` = the completion's OpKind.  False: ring full.
+    bool submitSendLeaseRecord(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
+                               std::span<const uint8_t> value, int64_t ackHandle, uint8_t flags,
+                               uint8_t leaseKind) noexcept;
+    /// Task 14a: trySubmit's lease form.  InvalidArgument for a key outside 1..128 bytes; otherwise the results of trySubmit.
+    [[nodiscard]] SendResult trySubmitLease(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
+                                            std::span<const uint8_t> value, int64_t ackHandle, RejectReason* why,
+                                            uint8_t intent, uint8_t leaseOp, uint8_t leaseKind) noexcept;
+    /// Lease completions whose accepted ack carried no (or a short) lease trailer: completed StoredIdUnknown.
+    [[nodiscard]] uint64_t leaseTrailerMissing() const noexcept { return leaseTrailerMissing_; }
 
     // ---- Phase 2b F: the handle gate (issuing-thread state) -------------------
     //
@@ -1170,7 +1206,7 @@ public:
     /// Client 17: `assignedBase` = the first broker-assigned id of a key-0 batch; record i gets assignedBase + i * idStride.
     void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
                            int64_t logStartOffset = -1, bool hasVerdicts = false, std::span<const uint8_t> verdicts = {},
-                           uint64_t assignedBase = 0);
+                           uint64_t assignedBase = 0, std::span<const uint8_t> leases = {});
 
     /// Called on redirect-reconnect failure (SessionLost) and by the close paths
     /// (duty-cycle thread, or after it stopped): fails AND drops every accepted
@@ -1627,6 +1663,10 @@ private:
     SendResult tryAppendDirect_(int32_t topicId, int32_t partition, const Key& key,
                                 std::span<const uint8_t> value, int64_t ackHandle,
                                 RejectReason& why, uint8_t intent, uint32_t idStride) noexcept;
+    /// Task 14a: the lease form of tryAppendDirect_ (same gates, the lease record layout when deferred).
+    SendResult tryAppendLeaseDirect_(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
+                                     std::span<const uint8_t> value, int64_t ackHandle, RejectReason& why,
+                                     uint8_t flags, uint8_t leaseKind) noexcept;
 
     /// One record into its partition builder — the single append path shared by
     /// the ring drain (Ring) and trySubmit (Direct).  Owner/duty thread only.
@@ -1636,7 +1676,7 @@ private:
     /// handle passes to the producer only on CONTINUE.
     rune::client::detail::ControlledAction appendRecord_(int32_t topicId, int32_t partition,
         const uint8_t* keyBytes, uint8_t keyLen, const uint8_t* valBytes, uint32_t valueLen,
-        uint8_t flags, uint64_t ackHandle, int64_t nowNs, uint32_t idStride = 0);
+        uint8_t flags, uint64_t ackHandle, int64_t nowNs, uint32_t idStride = 0, uint8_t leaseKind = 0);
     // [[gnu::always_inline]] members are DEFINED only in ProducerImpl.cpp: they may be called only from that
     // translation unit (appendRecord_, the claim paths, the drain), never from another TU or a header.
     // Task 10 (perf): the per-record helpers below are force-inlined into the
@@ -2232,6 +2272,24 @@ private:
     /// A View producer's claim span is rebased into this (entries index - first): reserved once in the constructor
     /// (8 * kMaxJudgedBatchRecords), never resized.
     std::vector<uint8_t> claimVerdictScratch_;
+    /// Task 14a: a lease-writes producer (ProducerConfig::leaseWrites).  leaseKinds_ maps an in-flight lease write's ack handle
+    /// to the OpKind its completion carries (LeaseGrant / LeaseUpdate / LeaseRevoke); duty/owner thread only, sized once at
+    /// construction (it grows only if more lease writes are in flight than ever before; erase never allocates).  Every
+    /// completion of such a handle goes through completeHandle_, which takes the kind there.
+    bool                         leaseWrites_ = false;
+    detail::FlatIndexMap         leaseKinds_{4};
+    uint64_t                     leaseTrailerMissing_ = 0;
+    /// The kind recorded for `h` (0 = none), erasing it.  Lease-writes producers only.
+    [[nodiscard]] uint8_t takeLeaseKind_(uint64_t h) noexcept {
+        const uint32_t k = leaseKinds_.find(static_cast<int64_t>(h));
+        if (k == detail::FlatIndexMap::kNone) return 0;
+        leaseKinds_.erase(static_cast<int64_t>(h));
+        return static_cast<uint8_t>(k);
+    }
+    /// completeSlice_ for an Ok (batch-level) ack of a lease-writes producer: each record's completion from its verdict
+    /// entry and its lease trailer entry (value = leaseVersion, aux = ttlMs).
+    void completeLeaseSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, std::span<const uint8_t> verdicts,
+                             std::span<const uint8_t> leases, bool dupSeq, uint16_t dupCode) noexcept;
     BatchAckFn   batchAckFn_    = nullptr;
     void*        batchAckCtx_   = nullptr;
     CqRef        batchAckCqRef_ = kNoCqRef;   // duty side: the BatchAck queue's registry ref
@@ -2381,6 +2439,10 @@ private:
     SendResult deferRecord_(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
                             std::span<const uint8_t> value, uint8_t flags, int64_t ackHandle,
                             RejectReason& why, uint32_t idStride) noexcept;
+    /// Task 14a: deferRecord_ for a lease write (the SEND_LEASE_RECORD layout in the arena).
+    SendResult deferLeaseRecord_(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
+                                 std::span<const uint8_t> value, uint8_t flags, uint8_t leaseKind, int64_t ackHandle,
+                                 RejectReason& why) noexcept;
     RejectReason deferTier2_(uint32_t slot) noexcept;
     void tier2Collect_() noexcept;
     // ---- Tier-2 partition FIFO + pool return (duty side) -----------------------

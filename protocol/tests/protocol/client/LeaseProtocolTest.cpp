@@ -657,8 +657,9 @@ TEST(LeaseProtocolRegression, SchemaLeaseTrailerRegression) {
     auto withLease = m;
     withLease.hasLease = true;
     withLease.lease.ttlMs = 4242;
+    withLease.leaseViewTopicId = 77;
     const Bytes lf = encodeVec(withLease);
-    EXPECT_EQ(lf.size(), noLease.size() + 40);
+    EXPECT_EQ(lf.size(), noLease.size() + 44);   // marker + 39-byte spec + i32 lease-view topic id (Task 14a)
     EXPECT_EQ(std::memcmp(lf.data(), noLease.data(), noLease.size()), 0);
     EXPECT_EQ(lf[noLease.size()], 1);
     {
@@ -666,6 +667,14 @@ TEST(LeaseProtocolRegression, SchemaLeaseTrailerRegression) {
         ASSERT_TRUE(d.has_value());
         EXPECT_TRUE(d->hasLease);
         EXPECT_EQ(d->lease, withLease.lease);
+        EXPECT_EQ(d->leaseViewTopicId, 77);
+    }
+    // a 40-byte lease block (no id) decodes with -1
+    {
+        const auto d = rc::TopicSchemaResponse::decode(lf.data(), lf.size() - 4);
+        ASSERT_TRUE(d.has_value());
+        EXPECT_TRUE(d->hasLease);
+        EXPECT_EQ(d->leaseViewTopicId, -1);
     }
     // remainders of 0..39 bytes after the key block decode as no lease block
     for (std::size_t extra = 0; extra < 40; ++extra) {
@@ -903,11 +912,11 @@ TEST(LeaseProtocolRegression, LeaseTrailersTruncatedAtEveryOffsetRegression) {
         m.sessionId = 1; m.correlationId = 2; m.topicId = 5; m.version = 3; m.descriptorBlob = desc; m.descriptorLen = 2;
         m.partitionCount = 6; m.hasKeyFeatures = true; m.hasLease = true;
         const Bytes lf = encodeVec(m);
-        const std::size_t start = lf.size() - 40;
+        const std::size_t start = lf.size() - 44;
         for (std::size_t cut = start; cut < lf.size(); ++cut) {
             const auto d = rc::TopicSchemaResponse::decode(lf.data(), cut);
             ASSERT_TRUE(d.has_value()) << cut;
-            EXPECT_FALSE(d->hasLease) << cut;
+            EXPECT_EQ(d->hasLease, cut >= start + 40) << cut;
         }
         const auto full = rc::TopicSchemaResponse::decode(lf.data(), lf.size());
         ASSERT_TRUE(full.has_value());

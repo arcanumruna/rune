@@ -168,11 +168,15 @@ public:
         case OpKind::GetTopicSchema:
         case OpKind::ListTopics:
         case OpKind::GetViewRow:  // Task 21: response carries a variable rowBytes payload
+        case OpKind::OpenLeaseTopic:  // Task 14a: the GetTopicSchema payload
+        case OpKind::ScanLeases:      // Task 14a: a page of lease rows
         case OpKind::GetViewRowK:     // wide view keys: the same row payload
         case OpKind::ScanViewRows:    // wide view keys: a page of rows
         case OpKind::ListNamespaces:  // Namespaces (Task 11): the raw ListNamespacesResponse frame
         case OpKind::NamespaceUsage:  // Phase 2 Task 16: the raw NamespaceUsageResponse frame
             return detail::CompletionRing::completionRecordBytes(cfg_.maxResultBytes);
+        case OpKind::LeaseTimeToLive:   // Task 14a: 32 payload bytes (or the error text)
+            return detail::CompletionRing::completionRecordBytes(cfg_.maxErrorText > 32u ? cfg_.maxErrorText : 32u);
         case OpKind::GetStats:
             return detail::CompletionRing::completionRecordBytes(rune::protocol::client::StatsResponse::kMaxEncodedSize);
         default:

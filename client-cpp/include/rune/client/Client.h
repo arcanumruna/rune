@@ -75,6 +75,7 @@
 #include <rune/protocol/client/NamespaceUsageMessages.h>
 #include <rune/protocol/client/StatsMessages.h>
 #include <rune/client/NamespaceLimitFields.h>
+#include <rune/client/lease/LeaseOptions.h>
 
 #include <chrono>
 #include <cstddef>
@@ -96,6 +97,9 @@
 #include <vector>
 
 namespace rune::client {
+
+template <class T> class LeaseTopic;   // Task 14a: lease/LeaseTopic.h
+
 
 // ---------------------------------------------------------------------------
 // Bytes alias
@@ -181,6 +185,8 @@ struct TopicSchemaResult {
     rune::protocol::TopicKeyFeatures keyFeatures{};
     /// Lease topics: the topic's lease spec when the broker sent it (broker >= 11 to a lease-aware session).
     std::optional<rune::protocol::LeaseSpec> lease;
+    /// Lease topics (Task 14a): the topic id of the lease view (`<topic>.leases`), from the catalog; -1 = none.
+    int32_t leaseViewTopicId = -1;
 };
 
 // ---------------------------------------------------------------------------
@@ -641,6 +647,8 @@ public:
     /// constructing thread.  Re-entry from a callback fired inside the duty cycle
     /// returns 0 without running a nested cycle.  Thread mode: throws logic_error.
     int doWork();
+    /// Whether this client runs in RunnerMode::Invoker (the owner pumps doWork()).
+    [[nodiscard]] bool invokerMode() const noexcept { return cfg_.runnerMode == RunnerMode::Invoker; }
 
     /// A7 park-until-work (Invoker owner): the embedded invoker driver's socket-readiness fds — park in
     /// ppoll() on them when doWork() returned 0 instead of spinning; a datagram (an ack, a status message)
@@ -1005,6 +1013,36 @@ public:
     /// below kBrokerVersionCheckedWrites ends it BrokerTooOld, nothing sent.
     OpResult getStats(rune::protocol::client::StatsScope scope, int32_t objectId, int32_t partition,
                       CompletionTarget target, Token token);
+
+    // ---- Lease topics (Task 14a): routed lease control ops (use LeaseTopic<T>; these are its building blocks) ----
+    /// GetTopicSchema(name, fingerprint) completing as OpKind::OpenLeaseTopic (same value/aux/payload as GetTopicSchema).  A seed
+    /// whose brokerVersion is known and below kBrokerVersionLeases ends it BrokerTooOld, nothing sent.
+    OpResult openLeaseTopicSchema(std::string_view name, uint64_t requestedFingerprint, CompletionTarget target, Token token);
+    /// openLeaseTopicSchema, blocking (cold).  Throws like getTopicSchemaAndWait; a non-lease topic throws (InvalidArgument),
+    /// a broker below kBrokerVersionLeases throws (BrokerTooOld).  Used by openLeaseTopicAndWait<T>.
+    TopicSchemaResult openLeaseSchemaAndWait(std::string_view name, uint64_t requestedFingerprint,
+                                             std::chrono::nanoseconds timeout);
+    /// Task 14a: the typed lease handle of the lease topic `name` (see lease/LeaseTopic.h, which defines this).  The async
+    /// form completes OpKind::OpenLeaseTopic with the schema payload; build the handle from it with LeaseTopic<T>::fromOpen.
+    template <class T>
+    OpResult openLeaseTopic(std::string_view name, CompletionTarget target, Token token) {
+        return openLeaseTopicSchema(name, T::kFingerprint, target, token);
+    }
+    template <class T>
+    [[nodiscard]] LeaseTopic<T> openLeaseTopicAndWait(std::string_view name, const LeaseTopicConfig& cfg = {},
+                                                      std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+    /// LeaseKeepAlive (wire 96) with ONE entry.  `timeoutMs` 0 = the ping timeout.  Completion: OpKind::LeaseKeepAlive, Ok with
+    /// aux = the lease's ttlMs, or BrokerError with errorCode = the entry's code.  Zero-alloc after warm-up.
+    OpResult leaseKeepAlive(int32_t topicId, int32_t partition, std::span<const uint8_t> key, int64_t version,
+                            uint32_t timeoutMs, CompletionTarget target, Token token);
+    /// LeaseTimeToLive (wire 98).  Completion: OpKind::LeaseTimeToLive, value = version, aux = remainingMs (-1 none), payload =
+    /// the 32 LE bytes {grantedTtlMs u64, remainingMs i64, version i64, holder u64}.
+    OpResult leaseTimeToLive(int32_t topicId, int32_t partition, std::span<const uint8_t> key, uint32_t timeoutMs,
+                             CompletionTarget target, Token token);
+    /// ScanLeases (wire 100) on the lease view.  Completion: OpKind::ScanLeases, value = asOfOffset, aux = bit_cast<int64_t>(lastHash),
+    /// reserved0 = rowCount | (done << 31), payload = the rows verbatim.
+    OpResult scanLeases(int32_t viewTopicId, int32_t partition, std::span<const uint8_t> prefix, uint64_t resumeHash, bool first,
+                        uint16_t maxRows, uint32_t timeoutMs, CompletionTarget target, Token token);
 
     // ---- Catalog history (Task 5): DDL with the DDL extension ---------------
     // Every DDL (the overloads above included, with default DdlOptions) carries
@@ -1581,7 +1619,8 @@ private:
     /// GetViewRow (a view row is served only by its source partition's leader).
     [[nodiscard]] static constexpr bool isRoutedCtlOp(OpKind op) noexcept {
         return isDdlOp(op) || op == OpKind::GetViewRow || op == OpKind::GetViewRowK || op == OpKind::ScanViewRows ||
-               op == OpKind::GetStats;
+               op == OpKind::GetStats || op == OpKind::LeaseKeepAlive || op == OpKind::LeaseTimeToLive ||
+               op == OpKind::ScanLeases || op == OpKind::OpenLeaseTopic;
     }
     /// A DDL that is not in flight (its frame waits for the resend pump).
     [[nodiscard]] static bool ddlWaitsForResend(const DdlRetry& r) noexcept {
@@ -1620,6 +1659,7 @@ private:
         // counter); 0 = the frame carries an explicit requestId (or is not a DDL).
         uint32_t          requestIdAt   = 0;
         uint16_t          secretLen     = 0;   // review B I4: trailing bytes of the record's frame area that are a secret, not wire
+        uint32_t          timeoutMs     = 0;   // Task 14a: a per-op deadline (0 = the op kind's configured default)
     };
 
     /// A handler completion deferred while close() runs (delivered after every
@@ -1793,7 +1833,7 @@ private:
     /// op's PendingCtl::newPassword (a self SET PASSWORD's plaintext, installed on OK) — never sent, wiped on any outcome.
     OpResult issueControl_(OpKind op, CompletionTarget target, Token token,
                            std::span<const uint8_t> frame, uint32_t payloadHint, uint32_t requestIdAt = 0,
-                           std::span<const uint8_t> secret = {});
+                           std::span<const uint8_t> secret = {}, uint32_t timeoutMs = 0);
     // ---- Catalog history (Task 5): DDL issue + answers (duty thread, cold) ----
     /// The DDL extension of `ddl` (views into `ddl` / cfg_; requestId as given).
     [[nodiscard]] rune::protocol::client::DdlExtension ddlExt_(const DdlOptions& ddl) const noexcept;
@@ -2266,6 +2306,7 @@ private:
     [[nodiscard]] bool seedCannotReconnect_() const noexcept;
     int driveAwaitingSeed_();
     std::vector<uint8_t>    ctlScratch_;               // frame patch buffer (reused)
+    std::vector<std::vector<uint8_t>> framePool_;      // Task 14a: recycled RoutedCtlPending frames (zero-alloc routed ops)
     // closing_: written by the closing thread after the runner is joined (or
     // on the Invoker owner); read only on the duty / closing thread.
     bool                    closing_ = false;

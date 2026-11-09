@@ -471,6 +471,7 @@ struct InvokerGateway {
     uint16_t schemaVersion  = 1;
     uint16_t schemaErrorCode = 0;
     std::vector<uint8_t> schemaBlob;  // the GetTopicSchema descriptor blob
+    int32_t schemaLeaseViewTopicId = 1;   // Task 14a: the lease view's topic id the stub reports with schemaLease
     std::optional<rune::protocol::LeaseSpec> schemaLease;   // the GetTopicSchema reply's lease block (needs schemaKeyFeatures too)
     std::optional<rune::protocol::TopicKeyFeatures> schemaKeyFeatures;  // the GetTopicSchema reply's key-features block
     int defines = 0;
@@ -985,9 +986,14 @@ struct InvokerGateway {
     /// Checked writes: when set, every ProduceResponse carries this verdict trailer (the frame is then the v17 one):
     /// 8-byte entries (recordIndex u16, code u16, constraintId u32), empty = judged, nothing refused.
     std::optional<std::vector<uint8_t>> produceVerdicts;
+    /// Task 14a: when set, every ProduceResponse also carries this lease trailer (16-byte entries {leaseVersion i64, ttlMs u64}).
+    std::optional<std::vector<uint8_t>> produceLeaseTrailer;
+    std::vector<uint8_t> leaseRepeat_;
+    /// Task 14a: the raw bytes of every Produce frame received (idempotent path), in order.
+    std::vector<std::vector<uint8_t>> produceFrameBytes;
     std::vector<uint8_t> produceResponseBytes_(const Produced& pr, int16_t errorCode, int64_t baseOffset, int64_t logStart) {
         namespace rcc = rune::client::codec;
-        if (!produceVerdicts) {
+        if (!produceVerdicts && !produceLeaseTrailer) {
             std::vector<uint8_t> out(rune::protocol::client::ProduceResponse::ENCODED_SIZE);
             out.resize(rcc::encodeProduceResponse(out.data(), out.size(), errorCode, pr.partition, baseOffset,
                                                   pr.sessionId, pr.corrId, logStart));
@@ -1000,11 +1006,27 @@ struct InvokerGateway {
         msg.partition      = pr.partition;
         msg.baseOffset     = baseOffset;
         msg.logStartOffset = logStart;
+        leaseRepeat_.clear();
+        static const std::vector<uint8_t> kNone;
+        const std::vector<uint8_t>& verdicts = produceVerdicts ? *produceVerdicts : kNone;
         msg.hasVerdicts    = true;
-        msg.verdictCount   = static_cast<uint16_t>(produceVerdicts->size() / 8);
-        msg.verdictBytes   = *produceVerdicts;
-        std::vector<uint8_t> out(msg.encodedSize(rune::protocol::client::kClientVersionCheckedWrites));
-        out.resize(msg.encodeFor(out.data(), rune::protocol::client::kClientVersionCheckedWrites));
+        msg.verdictCount   = static_cast<uint16_t>(verdicts.size() / 8);
+        msg.verdictBytes   = verdicts;
+        const int32_t cv = produceLeaseTrailer ? rune::protocol::client::kClientVersionLeases
+                                               : rune::protocol::client::kClientVersionCheckedWrites;
+        if (produceLeaseTrailer) {   // Task 14a: 16-byte entries {leaseVersion i64, ttlMs u64}
+            msg.hasLease   = true;
+            msg.leaseCount = static_cast<uint16_t>(produceLeaseTrailer->size() / 16);
+            msg.leaseBytes = *produceLeaseTrailer;
+            if (produceLeaseTrailer->size() == 16 && pr.records > 1) {   // ONE template entry: repeated for every record of the batch
+                for (int32_t i = 0; i < pr.records; ++i)
+                    leaseRepeat_.insert(leaseRepeat_.end(), produceLeaseTrailer->begin(), produceLeaseTrailer->end());
+                msg.leaseCount = static_cast<uint16_t>(pr.records);
+                msg.leaseBytes = leaseRepeat_;
+            }
+        }
+        std::vector<uint8_t> out(msg.encodedSize(cv));
+        out.resize(msg.encodeFor(out.data(), cv));
         return out;
     }
 
@@ -2028,6 +2050,7 @@ private:
         case rcc::TemplateId::Produce: {
             const auto pv = rcc::decodeProduce(buf, len);
             if (!pv) return;
+            produceFrameBytes.emplace_back(buf, buf + len);   // Task 14a
             if (idempotence) {
                 onIdempotentProduce(*pv, endpoint);
                 return;
@@ -2205,6 +2228,7 @@ private:
             if (schemaKeyFeatures) r.keyFeatures = *schemaKeyFeatures;
             r.hasLease = schemaLease.has_value();
             if (schemaLease) r.lease = *schemaLease;
+            r.leaseViewTopicId = schemaLeaseViewTopicId;
             // Task 19: a nonzero requestedFingerprint selects by fingerprint
             // (the real broker's Task 13/18 behavior).  This stub only knows
             // one materialized version (schemaBlob/schemaVersion), so a

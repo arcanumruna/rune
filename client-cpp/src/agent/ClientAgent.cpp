@@ -115,7 +115,9 @@ ClientAgent::ClientAgent(AgentConfig cfg)
 void ClientAgent::init() {
     mnDebug_ = std::getenv("RUNE_MN_DEBUG") != nullptr;
     produceAcks_.reserve(static_cast<std::size_t>(cfg_.egressPollLimit) * 4);
+    // Task 14a: room for the lease trailers (kMaxVerdictEntries x 16 bytes) on top of the verdicts - sized once, here.
     verdictBytes_.reserve(65536 * 8);
+    leaseTrailerBytes_.reserve(std::size_t{rune::protocol::client::ProduceResponse::kMaxVerdictEntries} * 16);   // Task 14a: a cycle of lease trailers
     // Seed the endpoint-keyed session collection with the seed session
     // (sessions_[0]).  Its IO adapter targets the transport default ingress
     // channel, so its control frames fast-path back to the default offer (the
@@ -1220,6 +1222,14 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
                     const std::size_t cap = verdictBytes_.capacity();
                     verdictBytes_.insert(verdictBytes_.end(), opt->verdictBytes.begin(), opt->verdictBytes.end());
                     if (verdictBytes_.capacity() != cap) ++verdictArenaGrowths_;
+                }
+                if (opt->hasLease) {   // Task 14a: the lease trailer rides its own preallocated arena (cleared with the acks)
+                    ack.hasLease    = true;
+                    ack.leaseCount  = opt->leaseCount;
+                    ack.leaseOffset = static_cast<uint32_t>(leaseTrailerBytes_.size());
+                    const std::size_t cap = leaseTrailerBytes_.capacity();
+                    leaseTrailerBytes_.insert(leaseTrailerBytes_.end(), opt->leaseBytes.begin(), opt->leaseBytes.end());
+                    if (leaseTrailerBytes_.capacity() != cap) ++leaseArenaGrowths_;
                 }
                 produceAcks_.push_back(ack);
             }

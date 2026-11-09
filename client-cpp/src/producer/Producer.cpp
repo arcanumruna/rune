@@ -346,6 +346,30 @@ SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const 
     return r;
 }
 
+SendResult Producer::trySendLease(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
+                                  std::span<const uint8_t> value, WriteIntent intent, uint8_t leaseOp, OpKind kind,
+                                  Completions& cq, Token token) noexcept {
+    if (!impl_) return SendResult::InvalidTopic;
+    if (!impl_->config().leaseWrites || key.empty() || key.size() > static_cast<std::size_t>(producer::kLeaseKeySlot) ||
+        token > kMaxToken || cq.client_ == nullptr || cq.client_ != impl_->hooks().ctx || cq.ring_ == nullptr ||
+        impl_->batchAckCq() != nullptr) {
+        return SendResult::InvalidArgument;
+    }
+    if (!cq.onOwnerThread()) return SendResult::WrongThread;
+    if (impl_->gateRefusesBeforeCredit()) [[unlikely]] return SendResult::NotInTransaction;
+    const OpResult rr = cq.reserve(producer::kAckRecordBytes);
+    if (rr != OpResult::Accepted) return mapReserve(rr);
+    const uint64_t h = producer::ackhandle::forCq(cq.cqRef_, token);
+    const SendResult r = impl_->trySubmitLease(topicId, partition, key, value, static_cast<int64_t>(h), nullptr,
+                                               intentBits(intent), leaseOp, static_cast<uint8_t>(kind));
+    if (r == SendResult::Ok) [[likely]] {
+        ++cq.producerIssued_;
+        return r;
+    }
+    cq.unreserve(producer::kAckRecordBytes);   // rejected: no completion will ever arrive
+    return r;
+}
+
 namespace {
 // The blocking forms: retry BackPressured with the void send()'s waiting rules
 // (sendBlocking decides pump / wait / throw); everything else is final.

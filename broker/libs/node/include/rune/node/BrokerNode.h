@@ -796,7 +796,8 @@ public:
     void postTopicSchemaResponse(int64_t session, int64_t corr, int32_t topicId, uint16_t version,
                                  int32_t partitionCount, const std::vector<uint8_t>& blob,
                                  uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures,
-                                 const std::optional<rune::protocol::LeaseSpec>& lease = std::nullopt) {
+                                 const std::optional<rune::protocol::LeaseSpec>& lease = std::nullopt,
+                                 int32_t leaseViewTopicId = -1) {
         namespace pc = rune::protocol::client;
         pc::TopicSchemaResponse resp;
         resp.sessionId      = session;
@@ -807,6 +808,7 @@ public:
         resp.partitionCount = partitionCount;   // Phase 2b Part C
         resp.hasLease       = lease.has_value();
         resp.lease          = lease.value_or(rune::protocol::LeaseSpec{});
+        resp.leaseViewTopicId = resp.hasLease ? leaseViewTopicId : -1;
         resp.hasKeyFeatures = keyFeatures != rune::protocol::TopicKeyFeatures{} || resp.hasLease;   // the key block precedes the lease block
         resp.keyFeatures    = keyFeatures;
         resp.descriptorBlob = blob.empty() ? nullptr : blob.data();

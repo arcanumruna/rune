@@ -394,19 +394,22 @@ struct TopicSchemaResponse {
     // a remainder of 14 or more whose block has an unknown flag bit or partitioner is refused.
     bool hasKeyFeatures = false;
     TopicKeyFeatures keyFeatures{};
-    // v18 (lease topics): after the TopicKeyFeatures block, [isLease u8 = 1][LeaseSpec: 39 bytes].  Requires
+    // v18 (lease topics): after the TopicKeyFeatures block, [isLease u8 = 1][LeaseSpec: 39 bytes][leaseViewTopicId i32] (the id is Task 14a).  Requires
     // hasKeyFeatures (the broker writes the key block whenever it writes the lease block) and is sent ONLY to a session
     // >= kClientVersionLeases.  Decode: a remainder of 0..39 bytes after the key block = no lease block; >= 40 bytes
     // must start with 1 and hold a decodable spec, else the frame is refused.
     bool hasLease = false;
     LeaseSpec lease{};
+    // Task 14a: after the LeaseSpec, [leaseViewTopicId i32 LE] - the topic id of the lease view (`<topic>.leases`), from the
+    // catalog.  Present iff hasLease (encoded always with it); a lease block of exactly 40 bytes (no id) decodes with -1.
+    int32_t leaseViewTopicId = -1;
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::TopicSchemaResponse);
     static constexpr uint16_t BODY_FIXED  = 8;
     /// False when the lease block is set without the key-features block (it could not be told apart on decode).
     [[nodiscard]] bool fits() const noexcept { return !hasLease || hasKeyFeatures; }
     std::size_t encodedSize() const noexcept {
         return MessageHeader::ENCODED_SIZE + BODY_FIXED + 4u + descriptorLen + 4u + (hasKeyFeatures ? kTopicKeyFeaturesWireLen : 0u) +
-               (hasLease ? 1u + kLeaseSpecBytes : 0u);
+               (hasLease ? 1u + kLeaseSpecBytes + 4u : 0u);
     }
     std::size_t encode(uint8_t* buf) const noexcept {
         if (!fits()) return 0;
@@ -420,7 +423,10 @@ struct TopicSchemaResponse {
         pos += putVarBytes32(buf + pos, descriptorBlob, descriptorLen);
         detail::putLE32(buf, static_cast<int>(pos), partitionCount); pos += 4;
         if (hasKeyFeatures) { putTopicKeyFeatures(buf + pos, keyFeatures); pos += kTopicKeyFeaturesWireLen; }
-        if (hasLease) { buf[pos++] = 1; encodeLeaseSpec(lease, buf + pos); pos += kLeaseSpecBytes; }
+        if (hasLease) {
+            buf[pos++] = 1; encodeLeaseSpec(lease, buf + pos); pos += kLeaseSpecBytes;
+            detail::putLE32(buf, static_cast<int>(pos), leaseViewTopicId); pos += 4;
+        }
         return pos;
     }
     static std::optional<TopicSchemaResponse> decode(const uint8_t* buf, std::size_t avail) noexcept {
@@ -446,6 +452,8 @@ struct TopicSchemaResponse {
                 if (avail - pos >= 1u + kLeaseSpecBytes) {
                     if (buf[pos] != 1 || !decodeLeaseSpec(buf + pos + 1, kLeaseSpecBytes, m.lease)) return std::nullopt;
                     m.hasLease = true;
+                    pos += 1u + kLeaseSpecBytes;
+                    if (avail - pos >= 4) m.leaseViewTopicId = detail::getLE32(buf, static_cast<int>(pos));
                 }
             }
         }
