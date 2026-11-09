@@ -1081,6 +1081,7 @@ TEST(CheckedWritesTxnWorker, AtomicFactsComeFromTheHeaderAndTheKnob) {
     ASSERT_TRUE(refused);
     EXPECT_EQ(refused->code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
     EXPECT_TRUE(k.r.worker->lastWriteFactsForTest().atomicBatch);
+    EXPECT_EQ(k.r.worker->hookRefusalsForTest(HookRefusal::AtomicBatchTooLarge), 1u);
     EXPECT_EQ(k.r.worker->lastWriteFactsForTest().txnJudgedRecordsMax, kKnob);
     std::vector<uint8_t> txn = VerdictRig::batch(recs, 31, 0, {}, /*txn=*/true);
     VerdictRig::setBatchAttribute(txn, rune::protocol::batch::kAttrAtomic);
