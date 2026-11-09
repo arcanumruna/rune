@@ -1,6 +1,7 @@
 // CheckedWritesQlBrokerRegressionTest.cpp - checked writes Part 08 Task 10: the REAL `rune` CLI (rune::cli::run) against REAL
 // brokers on the shard runtime.  The RegressorsPath DDL (unique and check views included), select, show, stats and
 // lower() literals.  Every wait is bounded.
+#include "client/CheckedWritesBrokerSupport.h"
 #include "client/ClusterClient.h"
 #include "client/OneBroker.h"
 #include "client/support/RegressorsPathRecords.h"
@@ -90,13 +91,8 @@ void awaitLevel(BrokerNode& n) {
     ASSERT_TRUE(raised) << "the cluster feature level reaches kCheckedWrites";
 }
 
-/// The three-broker cluster of these tests: the short warm-up, fused workers and a 40 ms election.
 catalog_cluster::ThreeNodes startCluster(const std::string& tag) {
-    return catalog_cluster::ThreeNodes::startWith(tag, [](NodeConfig& cfg) {
-        cfg.unservableWarmupMs = 50;
-        cfg.runtimePlacement   = NodeConfig::RuntimePlacement::Fused;
-        cfg.electionTimeoutMs  = 40;
-    });
+    return catalog_cluster::ThreeNodes::startWith(tag, rune::node::test::cw_broker::fastFailover);
 }
 
 std::string clusterEndpoint(catalog_cluster::ThreeNodes& c, int id) {

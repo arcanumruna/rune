@@ -1,6 +1,7 @@
 // CheckedWritesRegressorsPathRegressionTest.cpp - checked writes Part 09 Task 10: the RegressorsPath scenario (ql/tests/golden/regressorspath.rql)
 // end to end on real brokers - the login race, the Foo / foo names, the 13th slot, delete and reuse, a failover, a restart of every node and
 // the compaction of the rejected records - through the real client and the real `rune` CLI.  Every wait is a bounded waitFor.
+#include "client/CheckedWritesBrokerSupport.h"
 #include "client/ClusterClient.h"
 #include "client/OneBroker.h"
 #include "client/support/RegressorsPathRecords.h"
@@ -168,12 +169,7 @@ catalog_cluster::ThreeNodes startCluster(const std::string& tag, bool fast) {
     return catalog_cluster::ThreeNodes::startWith(tag, [fast](NodeConfig& cfg) {
         cfg.verdictIntervalMs      = 20;
         cfg.producerIdExpirationMs = 2'000;   // a stopped writer's last batches leave the cleaner something to compact
-        if (!fast) return;
-        cfg.unservableWarmupMs     = 50;
-        cfg.runtimePlacement       = NodeConfig::RuntimePlacement::Fused;
-        cfg.electionTimeoutMs      = 40;
-        cfg.readLeaseMaxMs         = 50;    // the restart wait for the old leader's read lease (W = 1.02 x this), not 204 ms
-        cfg.brokerLivenessTimeoutMs = 150;   // a crashed node's partitions fail over after this, not after 3 x the election timeout
+        if (fast) rune::node::test::cw_broker::fastFailover(cfg);
     });
 }
 
