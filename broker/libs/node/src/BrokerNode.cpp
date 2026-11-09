@@ -6665,7 +6665,7 @@ void BrokerNode::buildShardRuntimes_() {
         shardDrivers_.push_back(std::make_unique<EmbeddedDriver>(std::move(dcfg), DriverMode::Invoker));
         if (w == shardDriverBuildStallWorkerForTest_) [[unlikely]] {
             rune::aeronutil::StartupClientGate::Yield pumpMayRun;
-            std::this_thread::sleep_for(shardDriverBuildStallForTest_);
+            shardDriverBuildStallForTest_();
         }
         pumpOwnDrivers();
     }

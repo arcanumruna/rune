@@ -73,6 +73,12 @@ static std::map<std::string, std::string> legacyEnv(std::map<std::string, std::s
 // Happy-path tests
 // ---------------------------------------------------------------------------
 
+TEST(NodeConfigTest, InProcessLivenessDefaultsToOneHourRegression) {
+    const NodeConfig cfg;
+    EXPECT_EQ(cfg.shardClientLivenessTimeoutNs, 3'600'000'000'000LL) << "only tests lower it";
+    EXPECT_EQ(cfg.inProcessDriverTimeoutMs(), 3'600'000);
+}
+
 TEST(NodeConfigTest, ReadLeaseMaxDefaultsToTheProductionBoundRegression) {
     EXPECT_EQ(NodeConfig{}.readLeaseMaxMs * 1'000'000, rune::consensus::kReadLeaseMaxNs) << "#491: tests lower it, the default is the safety bound";
 }

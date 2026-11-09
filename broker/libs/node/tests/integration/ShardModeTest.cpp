@@ -885,22 +885,25 @@ TEST(ShardModeRegression, LargerWorkerCountExtraShardsDoNotSplit) {
 // Fix round 1 (I2): no long startup phase may run between shard-runtime creation
 // and the shard runners (nothing pumps an invoker driver/client in between; a
 // gap > the client liveness timeout kills the client — Aeron's default handler
-// even exit()s the process).  Stall the offset/txn/metadata/admin rebuild phase
-// for 2x a small liveness timeout; every shard must still serve.
+// even exit()s the process).  The slow phase is the metadata recovery: no shard
+// driver or client may exist while it runs (Aeron's client keepalive is a fixed
+// 500 ms, so a liveness short enough for a fast test cannot be used); every shard must serve.
 TEST(ShardModeRegression, SlowStartupPhaseDoesNotKillShardClient) {
     TmpDir dir{"slowstart"}, cdir{"slowstartc"};
     constexpr int32_t kWorkers = 2;
     const auto ports = ShardPorts::discover(1, kWorkers);
     auto cfg = makeShardConfig(0, dir.path, ports, 1, kWorkers, /*fused=*/false);
     constexpr int32_t kTopicParts = 8;
-    constexpr int64_t kLivenessNs = 2'000'000'000;           // > driver timer interval (1 s)
-    cfg.shardClientLivenessTimeoutNs = kLivenessNs;
     BrokerNode node{cfg};
-    node.setStartupPhaseHookForTest([](std::string_view phase) {
-        if (phase == "metadata-recover")                      // the injected fault: a slow recovery
-            std::this_thread::sleep_for(std::chrono::nanoseconds{2 * kLivenessNs});
+    bool hookRan = false;
+    node.setStartupPhaseHookForTest([&](std::string_view phase) {
+        if (phase != "metadata-recover") return;
+        hookRan = true;
+        EXPECT_EQ(node.shardDriverCountForTest(), 0u) << "a shard driver exists during a long startup phase";
+        EXPECT_EQ(node.shardClientCountForTest(), 0u) << "a shard client exists during a long startup phase";
     });
     node.start();
+    ASSERT_TRUE(hookRan);
     ASSERT_TRUE(node.awaitLeader(10'000ms));
     ASSERT_EQ(defineShardTopic({&node}, kTopicParts), 0);
     ShardTestClient c(cdir.path);
@@ -956,20 +959,24 @@ TEST(ShardModeRegression, SequentialShardResolveKeepsEarlierShardsAlive) {
     node.stop();
 }
 
-// The last shard's driver start blocks for 2x the client liveness timeout.  No shard client may exist yet
-// while a driver is constructed, so every shard must still serve.  Fused: the runtime client (worker 0's) exists
-// and is serviced by the interim pump, which the stall must let through.
+// The last shard's driver start is a long stall.  No shard client may exist yet while a driver is constructed,
+// and fused, the runtime client (worker 0's) exists: the stall must hold no startup gate, so the interim pump
+// services it.  Every shard must still serve.
 static void slowShardDriverStartKeepsEarlierShardClientsAlive(bool fused) {
     TmpDir dir{"slowdrv"}, cdir{"slowdrvc"};
-    constexpr int32_t kWorkers = 3;
+    constexpr int32_t kWorkers = 2;
     const auto ports = ShardPorts::discover(1, kWorkers);
     auto cfg = makeShardConfig(0, dir.path, ports, 1, kWorkers, fused);
-    constexpr int32_t kTopicParts = 12;
-    constexpr int64_t kLivenessNs = 2'000'000'000;           // > driver timer interval (1 s)
-    cfg.shardClientLivenessTimeoutNs = kLivenessNs;
+    constexpr int32_t kTopicParts = 8;
     BrokerNode node{cfg};
-    node.setShardDriverBuildStallForTest(kWorkers - 1, std::chrono::milliseconds{2 * kLivenessNs / 1'000'000});
+    bool stalled = false;
+    node.setShardDriverBuildStallForTest(kWorkers - 1, [&] {
+        stalled = true;
+        EXPECT_EQ(node.shardClientCountForTest(), 0u) << "a shard client exists while a driver is built";
+        EXPECT_EQ(rune::aeronutil::StartupClientGate::heldHere(), nullptr) << "the stall holds the startup gate";
+    });
     node.start();
+    ASSERT_TRUE(stalled);
     ASSERT_TRUE(node.awaitLeader(10'000ms));
     ASSERT_EQ(defineShardTopic({&node}, kTopicParts), 0);
     ShardTestClient c(cdir.path);
@@ -1272,21 +1279,24 @@ TEST(ShardModeFusedRegression, ThreeNodeAcksAllCommitsWithFusedRuntimes) {
 // The runtime's invoker driver + client exist from step 3 of start() (consensus,
 // replication and gateway are built on them), long before worker 0 runs.  The
 // system-log recoveries make no client call, so they yield the startup gate: a slow
-// one must not leave the client unpumped for longer than its liveness timeout — the
-// driver would time the runtime client out (nothing serves).  The other startup
-// phases are not covered: the production liveness (1 h) is what keeps them safe.
+// one must not leave the client unpumped — the driver would time the runtime client
+// out (nothing serves).  The other startup phases are not covered: the production
+// liveness (1 h) is what keeps them safe.  The yield is checked directly (Aeron's
+// client keepalive is a fixed 500 ms, so a liveness short enough for a fast test
+// cannot be used).
 TEST(ShardModeFusedRegression, SlowStartupPhaseDoesNotKillTheRuntimeClient) {
     TmpDir dir{"fslow"}, cdir{"fslowc"};
     const auto ports = ShardPorts::discover(1, 1);
     auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true);
-    constexpr int64_t kLivenessNs = 2'000'000'000;           // > driver timer interval (1 s)
-    cfg.shardClientLivenessTimeoutNs = kLivenessNs;          // every invoker driver of the node
     BrokerNode node{cfg};
-    node.setStartupPhaseHookForTest([](std::string_view phase) {
-        if (phase == "metadata-recover")                      // the injected fault: a slow recovery
-            std::this_thread::sleep_for(std::chrono::nanoseconds{2 * kLivenessNs});
+    bool hookRan = false;
+    node.setStartupPhaseHookForTest([&](std::string_view phase) {
+        if (phase != "metadata-recover") return;
+        hookRan = true;
+        EXPECT_EQ(rune::aeronutil::StartupClientGate::heldHere(), nullptr) << "a slow recovery holds the startup gate";
     });
     node.start();
+    ASSERT_TRUE(hookRan);
     ASSERT_TRUE(node.awaitLeader(10'000ms));
     ASSERT_EQ(defineShardTopic({&node}), 0);
     ShardTestClient c(cdir.path);

@@ -1919,11 +1919,7 @@ if(BUILD_TESTING)
         add_executable(rune_shard_mode_tests tests/integration/ShardModeTest.cpp)
         target_include_directories(rune_shard_mode_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_shard_mode_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
-        # The shard-driver stall variant sleeps 2x the lowered client liveness (4 s), so it carries LABELS stress.
-        gtest_discover_tests(rune_shard_mode_tests TEST_FILTER "*SlowShardDriverStartKeepsTheRuntimeClientAlive*"
-                             PROPERTIES TIMEOUT 360 LABELS stress)
-        gtest_discover_tests(rune_shard_mode_tests TEST_FILTER "-*SlowShardDriverStartKeepsTheRuntimeClientAlive*"
-                             PROPERTIES TIMEOUT 360)
+        gtest_discover_tests(rune_shard_mode_tests PROPERTIES TIMEOUT 360)
 
         # Phase 2b E2: TRANSIENT topics end to end in-process over real Aeron —
         # shard + legacy produce/subscribe, 3-node acks=all, restart (empty).

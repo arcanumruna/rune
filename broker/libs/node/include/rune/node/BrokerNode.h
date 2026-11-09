@@ -2317,6 +2317,7 @@ public:
         for (const auto& d : shardDrivers_) n += d ? 1u : 0u;
         return n;
     }
+    [[nodiscard]] std::size_t shardClientCountForTest() const noexcept { return shardClients_.size(); }
     /// Test-only (R-M1): TopicDropped ops the control thread delivered to worker rings (one per worker per
     /// drop) / still pending.  Control-thread state: read inside onControlThreadForTest.
     [[nodiscard]] uint64_t topicDroppedEnqueuedForTest() const noexcept { return topicDroppedFanout_.enqueuedForTest(); }
@@ -2358,10 +2359,11 @@ public:
         shardResolveStallForTest_       = stall;
     }
 
-    /// Test-only fault: after shard `worker`'s driver is built, block the start thread for `stall` (a slow driver start).
-    void setShardDriverBuildStallForTest(int32_t worker, std::chrono::milliseconds stall) noexcept {
+    /// Test-only fault: after shard `worker`'s driver is built, the start thread runs `stall` (a slow driver start),
+    /// holding no startup gate.
+    void setShardDriverBuildStallForTest(int32_t worker, std::function<void()> stall) {
         shardDriverBuildStallWorkerForTest_ = worker;
-        shardDriverBuildStallForTest_       = stall;
+        shardDriverBuildStallForTest_       = std::move(stall);
     }
 
     /// Test-only (DR-15 fix round 1): the peer-hostname resolve function of this
@@ -3057,7 +3059,7 @@ private:
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};
     int32_t                                      shardDriverBuildStallWorkerForTest_ = -1;
-    std::chrono::milliseconds                    shardDriverBuildStallForTest_{0};
+    std::function<void()>                        shardDriverBuildStallForTest_;
     void buildShardRuntimes_();
     void attachShardRuntimes_();
     void teardownShardRuntimes_() noexcept;
