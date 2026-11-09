@@ -133,8 +133,7 @@ struct ITxnRequestHandler {
     // InvalidProducerEpoch / InvalidTxnState = never (non-retriable).  Synchronous,
     // control thread, cold (once per transaction and partition).  votes = the partition
     // is a verdict source: the coordinator counts it a vote candidate whatever its own
-    // catalog knows (L9).  Default (test
-    // doubles): NotCoordinator.
+    // catalog knows (L9).  Default (test doubles): NotCoordinator.
     static constexpr int16_t kVerifyNotCoordinator = 14;   // pc::ErrorCode::NotCoordinator
     virtual int16_t verifyTxnPartition(int64_t /*producerId*/, int16_t /*producerEpoch*/, int32_t /*topicId*/,
                                        int32_t /*partition*/, int64_t /*nowNs*/, bool /*votes*/) {

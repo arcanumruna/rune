@@ -1106,6 +1106,26 @@ TEST(TxnVerifyRemoteRegression, CoordinatorAnswersTheAskerRegression) {
     EXPECT_EQ(R.ch.verifyResponses[1].second.errorCode, kNotCoordinator);
 }
 
+// L9: the worker's verdict-source flag (TxnVerifyRequest baseOffset) reaches the coordinator, asked locally or over the plane.
+TEST(TxnVerifyRemoteRegression, WorkerVotesFlagReachesTheCoordinatorOnBothPathsRegression) {
+    VerifyGwRig R;
+    rune::node::WorkerReturn ret{};
+    ret.type = rune::node::WorkerReturn::Type::TxnVerifyRequest;
+    ret.topicId = 0; ret.partition = 0; ret.producerId = 77; ret.producerEpoch = 0; ret.correlationId = 1;
+    ret.baseOffset = 1;
+    R.gw.handleWorkerReturnForTest(ret);
+    ASSERT_EQ(R.ch.verifies.size(), 1u);
+    EXPECT_TRUE(R.ch.verifies[0].second.votes) << "the remote ask lost the flag";
+    R.tcs.local = true;
+    R.gw.handleWorkerReturnForTest(ret);
+    EXPECT_EQ(R.tcs.verifyCalls, 1);
+    EXPECT_TRUE(R.tcs.lastVotes) << "the local ask lost the flag";
+    ret.baseOffset = 0;
+    R.gw.handleWorkerReturnForTest(ret);
+    EXPECT_EQ(R.tcs.verifyCalls, 2);
+    EXPECT_FALSE(R.tcs.lastVotes);
+}
+
 // Wire round trip of both frames (templates 13 / 14), fixed 32-byte block, little-endian.
 TEST(TxnVerifyRemoteRegression, VerifyFramesRoundTripRegression) {
     VerifyTxnPartitionMsg m{};

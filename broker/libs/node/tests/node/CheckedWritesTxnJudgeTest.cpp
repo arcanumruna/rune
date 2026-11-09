@@ -2081,6 +2081,30 @@ TEST(CheckedWritesTxnJudge, ConstrainedSourceClassifiesAMarkerWithoutVote) {
     EXPECT_EQ(r.st.txn.stats.markerWithoutVote, 1u);
 }
 
+// L9 / Q4: a constrained member created after T's first record and before its marker (the coordinator lagged, so no vote was asked):
+// P11-7 judges all of T at the marker under the latest set, and T's violating record is rejected.
+TEST(CheckedWritesTxnJudgeRegression, MemberCreatedMidTransactionRejectsAtTheMarkerRegression) {
+    JudgeRig r(true);
+    const ConstraintSet constrained = r.set;
+    r.set.count--;   // the logged set has no TestReject member yet
+    r.start();
+    r.log.data({{1}, {2, 9}, {3}}, 77);   // 10-12, written while the source was unconstrained
+    ConstraintSet later = constrained;
+    later.id = 2;
+    r.log.control();                      // 13: the set change's record
+    r.st.constraintSets.onChange(13, later);   // the member is created
+    r.log.marker(77, true);               // 14, no TxnJudge
+    r.drive();
+    r.drive();
+    for (const int64_t o : {10, 11, 12}) {
+        const auto* e = r.st.rejected.find(o);
+        ASSERT_NE(e, nullptr) << o;
+        EXPECT_EQ(e->code, kViolation);
+    }
+    EXPECT_FALSE(r.rowed(1));
+    EXPECT_EQ(r.st.txn.stats.markerWithoutVote, 1u);
+}
+
 // M4: P11-1 (c), an intent on a source with no constrained member.
 TEST(CheckedWritesTxnJudge, IntentClassifiesAMarkerWithoutVote) {
     JudgeRig r(false);
