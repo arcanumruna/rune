@@ -851,7 +851,7 @@ private:
             StepProfile* prof; uint64_t t0;
             ~ParseClock() { if (prof) prof->parseNs += clock_() - t0; }
         } parseClock{profile_, profile_ ? clock_() : 0};
-        rune::transaction::RcBuilder builder(&tracker_, &aborted_);
+        rune::transaction::RcBuilder builder(&tracker_, &aborted_, verdict_.ctx != nullptr);
         std::size_t pos = 0;
         while (pos + kOverhead <= res) {
             RecordBatchReader r(p + pos, res - pos);
@@ -993,7 +993,7 @@ private:
             if (verdict_.begin != nullptr) verdict_.begin(verdict_.ctx, ring.logStartOffset(), ring.logEndOffset());   // the feed restarts too
         }
         RingScanning& cur = rs;
-        rune::transaction::RcBuilder builder(&tracker_, &aborted_);
+        rune::transaction::RcBuilder builder(&tracker_, &aborted_, verdict_.ctx != nullptr);
         // #37: base << min(boost, 40), saturating (an unboosted build keeps the plain budget).
         const std::size_t base  = static_cast<std::size_t>(budget > 0 ? budget : 1);
         const unsigned    shift = std::min<uint32_t>(cur.boost, 40u);

@@ -1840,6 +1840,7 @@ public:
     [[nodiscard]] uint64_t hookRefusalsForTest(HookRefusal why) const noexcept { return hookRefusals_[std::to_underlying(why)]; }
     /// The facts of the last write that reached the write hook.
     [[nodiscard]] WriteFacts lastWriteFactsForTest() const noexcept { return lastWriteFacts_; }
+    [[nodiscard]] static bool txnJudgedForTest(const PartitionWriteState& ws, bool intent, int64_t first) noexcept { return txnJudged_(ws, intent, first); }
     /// Part 06: an autoincrement partition's counters (nullptr: not owned or untyped).
     [[nodiscard]] const AutoIncStats* autoIncStatsForTest(int32_t topicId, int32_t partition) const noexcept {
         const PartitionWriteState* w = writeStateForTest(topicId, partition);
@@ -7897,7 +7898,7 @@ private:
     // or a record carries an intent.  The produce bound uses the same predicate.
     [[nodiscard]] static bool txnJudged_(const PartitionWriteState& ws, bool intent, int64_t first) noexcept {
         const ConstraintSet* set = first >= 0 ? ws.constraintSets.setAt(first) : nullptr;
-        return intent || ws.isConstrainedSource() || (set != nullptr && constrainedSet_(*set));
+        return ws.isVerdictSource() && (intent || ws.isConstrainedSource() || (set != nullptr && constrainedSet_(*set)));
     }
     [[nodiscard]] static bool constrainedSet_(const ConstraintSet& s) noexcept {
         return std::any_of(s.members.begin(), s.members.begin() + s.count, [](const ConstraintSetMember& m) {
@@ -9983,7 +9984,6 @@ public:
     [[nodiscard]] uint64_t txnVerifyRequestsSentForTest() const noexcept { return txnVerifyRequestsSent_; }
     [[nodiscard]] uint64_t txnBatchesRefusedUnverifiedForTest() const noexcept { return txnBatchesRefusedUnverified_; }
     [[nodiscard]] uint64_t txnBatchesRefusedAfterVoteForTest() const noexcept { return txnBatchesRefusedAfterVote_; }
-    [[nodiscard]] uint64_t txnBatchesRefusedTooLargeForTest() const noexcept { return txnBatchesRefusedTooLarge_; }
     [[nodiscard]] uint64_t txnVerifyAnswersDroppedForTest() const noexcept { return txnVerifyAnswersDropped_; }
     /// #112: verification requests most one worker holds unsent (the ring was full).
     static constexpr std::size_t kTxnVerifyOutboxCapacity = 256;
@@ -10009,7 +10009,6 @@ private:
     uint64_t txnVerifyRequestsSent_       = 0;
     uint64_t txnBatchesRefusedUnverified_ = 0;
     uint64_t txnBatchesRefusedAfterVote_ = 0;
-    uint64_t txnBatchesRefusedTooLarge_ = 0;
     uint64_t txnVerifyAnswersDropped_     = 0;
 
     struct ProduceFields {
@@ -10405,7 +10404,6 @@ private:
             }
             if (hook.checked()) ++hookChecks_;
             batchIntent = hook.anyIntent();
-            if (txn && outcome.error == pc::ErrorCode::TxnTooLarge) [[unlikely]] ++txnBatchesRefusedTooLarge_;
             if (hook.refusal() != HookRefusal::None) [[unlikely]] noteHookRefusal_(hook.refusal(), f);
             if (!outcome.isOK()) [[unlikely]] hook.onProduceFailed();
             if (hook.assignedBase() != 0 && ws->assignedBases.wantsGrowth()) [[unlikely]] autoIncGrowDue_ = true;   // P6-8: grown next pass

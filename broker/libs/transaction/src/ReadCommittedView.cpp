@@ -340,7 +340,7 @@ RcBuilder::Result RcBuilder::step(const uint8_t* batch, std::size_t avail)
         if (producerId >= 0) {
             tracker_->onProduceBatch(producerId, res.baseOffset);
             bool intent = tracker_->hasIntent(producerId);
-            if (!intent)
+            if (trackIntents_ && !intent)
                 (void)rune::protocol::forEachRecordSpan(batch, static_cast<std::size_t>(totalLen), [&](const rune::protocol::RecordSpan& span) {
                     intent = intent || rune::protocol::record::intentOf(span.attributes) != 0;
                 });
@@ -365,7 +365,7 @@ void ReadCommittedView::rebuild(rune::storage::Log* log, int64_t hw)
     // Zero-copy chunks of whole batches; the same classification step the
     // owning worker's incremental build runs (S4).
     constexpr int32_t kChunkBytes = 1 << 20;
-    RcBuilder builder(tracker_, abortedIndex_);
+    RcBuilder builder(tracker_, abortedIndex_, /*trackIntents=*/false);
     int64_t cursor = log->logStartOffset();
     const int64_t end = std::min(hw, log->logEndOffset());
     while (cursor < end) {

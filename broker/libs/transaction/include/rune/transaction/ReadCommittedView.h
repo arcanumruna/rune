@@ -260,8 +260,9 @@ public:
         int64_t baseOffset  = 0;
     };
 
-    RcBuilder(LsoTracker* tracker, AbortedTxnIndex* abortedIndex) noexcept
-        : tracker_(tracker), abortedIndex_(abortedIndex) {}
+    /// `trackIntents`: a transactional batch's records are parsed for write intents (a typed partition's scan); otherwise only headers are read.
+    RcBuilder(LsoTracker* tracker, AbortedTxnIndex* abortedIndex, bool trackIntents) noexcept
+        : tracker_(tracker), abortedIndex_(abortedIndex), trackIntents_(trackIntents) {}
 
     /// Classify and apply the batch at `batch` (`avail` bytes readable).
     Result step(const uint8_t* batch, std::size_t avail);
@@ -269,6 +270,7 @@ public:
 private:
     LsoTracker*      tracker_;
     AbortedTxnIndex* abortedIndex_;
+    bool             trackIntents_;
 };
 
 // ---------------------------------------------------------------------------

@@ -85,7 +85,7 @@ enum class HookRefusal : uint8_t {
     ExplicitKeyNeedsIdempotentAndView, IntentInTxnOrAtomicBatch, TxnOnConstrainedSource,
     KeyZeroCreateNeedsIdempotentAll, KeyZeroCreateNeedsView, MixedKeyZeroBatch, ViewBatchTooLarge,
     ViewWithoutReplica, KeyIndexActivating, UpsertOnAutoIncrement, ImportNotGranted, ImportOutOfRange,
-    AutoIncExhausted, AutoIncWindowFull, AutoIncActivating, AtomicBatchTooLarge, Count_
+    AutoIncExhausted, AutoIncWindowFull, AutoIncActivating, AtomicBatchTooLarge, TxnTooLarge, Count_
 };
 
 struct RequirementVerdict {
@@ -118,6 +118,12 @@ struct RequirementVerdict {
     }
     if (view && b.records > kMaxJudgedBatchRecords && t.verdictSource) return refuse(HookRefusal::ViewBatchTooLarge);
     if (f.atomicBatch && t.verdictSource && b.records > f.txnJudgedRecordsMax) return refuse(HookRefusal::AtomicBatchTooLarge);
+    // P11-7: a transaction the judge judges whole is TxnTooLarge past the knob at its vote or marker, and the marker's rejection needs one
+    // index entry per record; the batch that takes it past the knob is refused here.  Records are always counted (at append, or by the log
+    // scan after a failover).  What escapes: a transaction whose batches were all admitted before the source was judged whole, and the
+    // records a transient ring evicted before its rebuild; the judge keeps its loud stall for more than 2^24 of them.
+    if (f.transactional && t.verdictSource && (f.txnJudged || b.anyIntent) && f.txnRecords + b.records > f.txnJudgedRecordsMax)
+        return {ErrorCode::TxnTooLarge, HookRefusal::TxnTooLarge};
     if (t.autoIncrement) {
         if ((b.keyZeroCreate || b.explicitInsert) && !t.autoIncReady) return {ErrorCode::NotLeader, HookRefusal::AutoIncActivating};
         if (b.keyZeroCreate && b.autoIncWindowFull) return {ErrorCode::NotLeader, HookRefusal::AutoIncWindowFull};

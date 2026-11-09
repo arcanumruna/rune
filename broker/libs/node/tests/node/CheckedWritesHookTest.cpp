@@ -21,6 +21,7 @@ constexpr ErrorCode OK  = ErrorCode::OK;
 constexpr ErrorCode IR  = ErrorCode::InvalidRequest;
 constexpr ErrorCode NL  = ErrorCode::NotLeader;
 constexpr ErrorCode NA  = ErrorCode::NotAuthorized;
+constexpr ErrorCode TL  = ErrorCode::TxnTooLarge;
 constexpr ErrorCode EXH = ErrorCode::AutoIncrementExhausted;
 using H = HookRefusal;
 
@@ -61,6 +62,7 @@ struct Row { const char* why; Shape shape; WriteFacts f; TopicHookFacts t; Error
 
 constexpr WriteFacts kIdemView = F(3, true, false, false, false, true);
 constexpr WriteFacts withImport(WriteFacts f) { f.importGranted = true; return f; }
+constexpr WriteFacts withTxn(WriteFacts f, int64_t records, bool judged) { f.txnRecords = records; f.txnJudged = judged; return f; }
 constexpr WriteFacts withKnob(WriteFacts f, int32_t knob) { f.txnJudgedRecordsMax = knob; return f; }
 
 const std::vector<Row>& rows() {
@@ -164,6 +166,13 @@ const std::vector<Row>& rows() {
         {"93 update in an atomic batch, acks 1: an atomic batch still needs View", Update, F(1, true, false, true, false, true), T(1,0,0,0), IR, H::ExplicitKeyNeedsIdempotentAndView},
         {"94 key-0 creates in a transaction on a constrained source, acks 1", KeyZero, F(1, true, true, false, false, true), T(1,1,1,0), OK, H::None},
         {"95 key-0 creates in an atomic batch on a constrained source, acks 1", KeyZero, F(1, true, false, true, false, true), T(1,1,1,0), IR, H::KeyZeroCreateNeedsView},
+        // Part 11 (P11-7): a judged transaction past the knob
+        {"96 plain record taking a judged transaction past the knob", Plain, withTxn(F(1, true, true, false, false, true), 4096, true), T(0,0,0,1), TL, H::TxnTooLarge},
+        {"97 plain record landing a judged transaction on the knob", Plain, withTxn(F(1, true, true, false, false, true), 4095, true), T(0,0,0,1), OK, H::None},
+        {"98 plain record past the knob, transaction not judged whole", Plain, withTxn(F(1, true, true, false, false, true), 4096, false), T(0,0,0,1), OK, H::None},
+        {"99 intent record past the knob: its own intent judges the transaction whole", InsertExplicit, withTxn(F(1, true, true, false, false, true), 4096, false), T(1,0,0,1), TL, H::TxnTooLarge},
+        {"100 intent record past the knob, not a verdict source", InsertExplicit, withTxn(F(1, true, true, false, false, true), 4096, false), T(1,0,0,0), OK, H::None},
+        {"101 judged transaction past the knob, not transactional", Plain, withTxn(F(1, true, false, false, false, true), 4096, true), T(0,0,0,1), OK, H::None},
     };
     return r;
 }
@@ -185,7 +194,7 @@ static_assert(isRow(InsertExplicit, kIdemView, T(1,0,0,0,1), OK, H::None));
 }  // namespace
 
 TEST(CheckedWritesRequirementTable, PinnedRows) {
-    ASSERT_EQ(rows().size(), 95u);
+    ASSERT_EQ(rows().size(), 101u);
     for (const Row& r : rows()) {
         const auto v = evaluateRequirements(intentsOf(r.shape), r.f, r.t);
         EXPECT_EQ(v.code, r.code) << r.why;
@@ -200,7 +209,7 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         case 0: return h == H::LegacyMode || h == H::LevelTooLow || h == H::ExplicitKeyNeedsIdempotentAndView ||
                        h == H::KeyZeroCreateNeedsIdempotentAll || h == H::KeyZeroCreateNeedsView || h == H::ViewBatchTooLarge;   // acks All
         case 1: return h == H::ExplicitKeyNeedsIdempotentAndView || h == H::KeyZeroCreateNeedsIdempotentAll;                      // idempotent
-        case 2: return h == H::ExplicitKeyNeedsIdempotentAndView || h == H::KeyZeroCreateNeedsView;                                // transactional
+        case 2: return h == H::ExplicitKeyNeedsIdempotentAndView || h == H::KeyZeroCreateNeedsView || h == H::TxnTooLarge;                               // transactional
         case 3: return h == H::AtomicBatchTooLarge;                                                                                // atomic
         case 4: return h == H::ImportNotGranted;                                                                                   // import
         case 5: return h == H::LegacyMode;                                                                                         // legacy
@@ -209,7 +218,7 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         case 8: return h == H::UpsertOnAutoIncrement || h == H::ImportNotGranted || h == H::ImportOutOfRange || h == H::AutoIncExhausted ||
                        h == H::AutoIncWindowFull || h == H::AutoIncActivating;                                                     // autoIncrement
         case 9: return h == H::KeyZeroCreateNeedsView;                                                                             // constrained
-        case 10: return h == H::ViewBatchTooLarge || h == H::AtomicBatchTooLarge;                                                  // verdict source
+        case 10: return h == H::ViewBatchTooLarge || h == H::AtomicBatchTooLarge || h == H::TxnTooLarge;                                                 // verdict source
         case 11: return h == H::KeyIndexActivating;                                                                                // keyIndexActive
         case 12: return h == H::AutoIncActivating;                                                                                 // autoIncReady
         case 13: return h == H::AutoIncExhausted;                                                                                  // exhausted
@@ -274,7 +283,7 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
             if (!b.reservedBits && f.legacyMode && (b.anyIntent || view)) ASSERT_EQ(v.why, H::LegacyMode) << "(iii)";
             if (v.code != OK) {
                 const bool retriable = v.why == H::KeyIndexActivating || v.why == H::AutoIncActivating || v.why == H::AutoIncWindowFull;
-                ASSERT_EQ(v.code, retriable ? NL : v.why == H::ImportNotGranted ? NA : v.why == H::AutoIncExhausted ? EXH : IR) << "(iv)";
+                ASSERT_EQ(v.code, retriable ? NL : v.why == H::ImportNotGranted ? NA : v.why == H::AutoIncExhausted ? EXH : v.why == H::TxnTooLarge ? TL : IR) << "(iv)";
             }
             for (int fact = 0; fact < 16; ++fact) {
                 const RequirementVerdict w = out[flip(m, fact)];

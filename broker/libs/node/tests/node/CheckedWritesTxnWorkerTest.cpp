@@ -1223,13 +1223,13 @@ TEST(CheckedWritesTxnWorkerRegression, TransactionPastTheKnobIsRefusedOnAConstra
     const auto over = r.ack(r.appendRecords(chars(1), kAllView, 77, 3, /*txn=*/true));
     ASSERT_TRUE(over);
     EXPECT_EQ(over->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge));
-    EXPECT_EQ(r.worker->txnBatchesRefusedTooLargeForTest(), 2u);
+    EXPECT_EQ(r.worker->hookRefusalsForTest(HookRefusal::TxnTooLarge), 2u);
     const int64_t leoAtKnob = r.replica->logEndOffset();
     const auto retry = r.ack(r.appendRecords(chars(1), kAllView, 77, 2, /*txn=*/true));
     ASSERT_TRUE(retry);
     EXPECT_EQ(retry->code, 0) << "a retry of the appended at-knob batch is a duplicate, not TxnTooLarge";
     EXPECT_EQ(r.replica->logEndOffset(), leoAtKnob);
-    EXPECT_EQ(r.worker->txnBatchesRefusedTooLargeForTest(), 2u);
+    EXPECT_EQ(r.worker->hookRefusalsForTest(HookRefusal::TxnTooLarge), 2u);
 
     Ki plain;
     plain.r.worker->setTxnJudgedRecordsMax(3);
@@ -1259,6 +1259,13 @@ TEST(CheckedWritesTxnWorkerRegression, TransactionBoundFollowsTheJudgesPredicate
     EXPECT_EQ(over->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge)) << "the intents earlier in the transaction bound it, though these two carry none";
     EXPECT_EQ(k.r.replica->logEndOffset(), leo);
 
+    Ki own;
+    own.r.worker->setTxnJudgedRecordsMax(3);
+    const auto ownFirst = own.r.ack(own.r.produceBytes(VerdictRig::batch({ins(1), ins(2), ins(3), ins(4)}, 51, 0, {}, /*txn=*/true), kLeader, 51, 0));
+    ASSERT_TRUE(ownFirst);
+    EXPECT_EQ(ownFirst->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge)) << "the batch's own intents judge it whole";
+    EXPECT_EQ(own.r.worker->hookRefusalsForTest(HookRefusal::TxnTooLarge), 1u);
+
     VerdictRig r;
     r.createCharacterTopic(false);
     r.enableAcks();
@@ -1281,4 +1288,19 @@ TEST(CheckedWritesTxnWorkerRegression, TransactionBoundFollowsTheJudgesPredicate
     const auto b = r.ack(r.appendRecords(chars(2), kAllView, 77, 2, /*txn=*/true));
     ASSERT_TRUE(b);
     EXPECT_EQ(b->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge)) << "the set at the transaction's first record was constrained";
+}
+
+// The produce bound is the vote's predicate, verdict-source precondition included: a source whose last view was dropped and that has no
+// judge answers yes at the vote, so the transaction opened under the old constrained set is not bounded.
+TEST(CheckedWritesTxnWorkerRegression, TransactionBoundNeedsAVerdictSourceRegression) {
+    PartitionWriteState ws;
+    ConstraintSet constrained;
+    constrained.count = 1;
+    constrained.members[0] = {7, rune::view::VerdictViewKind::TestReject, 1};
+    ws.constraintSets.onChange(0, constrained);
+    ASSERT_TRUE(Worker::txnJudgedForTest(ws, false, 5)) << "constrained at the transaction's first record";
+    ws.constraintSets.onChange(10, ConstraintSet{});
+    ASSERT_FALSE(ws.isVerdictSource());
+    EXPECT_FALSE(Worker::txnJudgedForTest(ws, false, 5));
+    EXPECT_FALSE(Worker::txnJudgedForTest(ws, true, 5));
 }

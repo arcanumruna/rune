@@ -419,24 +419,38 @@ TEST(ReadCommittedViewRebuildTest, RebuildCountsTheOpenTransactionsRecords)
     EXPECT_EQ(f.tracker.recordsOf(9), 0);
 }
 
-// Part 11: a record with an intent marks its open transaction, and the mark comes back with a rebuild.
+// Part 11: a record with an intent marks its open transaction when the scan tracks intents; a builder that does not never parses records.
+// A reopened transaction starts without the mark.
 TEST(ReadCommittedViewRebuildTest, RebuildRestoresTheTransactionsIntentMark)
 {
-    RcvFixture f;
-    for (const int64_t pid : {1, 2}) {
-        const int64_t off = f.log.logEndOffset();
-        rune::protocol::RecordBatchBuilder builder(off, 0);
+    const auto txnBatch = [](int64_t pid, bool intent) {
+        rune::protocol::RecordBatchBuilder builder(0, 0);
         builder.setProducerId(pid);
         builder.setTransactional(true);
         builder.append({}, "plain", 0);
-        if (pid == 1) builder.append({}, "intent", 0, 1);
-        auto batch = builder.build();
-        f.log.append(batch, off + (pid == 1 ? 1 : 0));
-    }
-    f.view.rebuild(&f.log, f.hw());
-    EXPECT_TRUE(f.tracker.hasIntent(1));
-    EXPECT_FALSE(f.tracker.hasIntent(2));
-    EXPECT_FALSE(f.tracker.hasIntent(9));
+        if (intent) builder.append({}, "intent", 0, 1);
+        return builder.build();
+    };
+    const auto step = [](RcBuilder& b, const std::vector<uint8_t>& batch) { (void)b.step(batch.data(), batch.size()); };
+    LsoTracker tracker;
+    AbortedTxnIndex aborted;
+    RcBuilder tracking(&tracker, &aborted, /*trackIntents=*/true);
+    step(tracking, txnBatch(1, true));
+    step(tracking, txnBatch(2, false));
+    EXPECT_TRUE(tracker.hasIntent(1));
+    EXPECT_FALSE(tracker.hasIntent(2));
+    EXPECT_FALSE(tracker.hasIntent(9));
+    const auto commit = ControlMarker::build(1, 0, ControlType::Commit, 0);
+    (void)tracking.step(commit.data(), commit.size());
+    step(tracking, txnBatch(1, false));
+    EXPECT_EQ(tracker.recordsOf(1), 1);
+    EXPECT_FALSE(tracker.hasIntent(1)) << "the reopened transaction starts without the mark";
+
+    LsoTracker plainTracker;
+    RcBuilder headersOnly(&plainTracker, &aborted, /*trackIntents=*/false);
+    step(headersOnly, txnBatch(1, true));
+    EXPECT_EQ(plainTracker.recordsOf(1), 2);
+    EXPECT_FALSE(plainTracker.hasIntent(1)) << "the records are not parsed";
 }
 
 TEST(ReadCommittedViewRebuildTest, CommitMarkerClosesTransaction)
