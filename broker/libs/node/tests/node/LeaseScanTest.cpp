@@ -261,9 +261,18 @@ TEST(ScanLeasesRegression, ChurnBetweenPagesRegression) {
     const std::vector<uint64_t> sorted = byHash(range(1, 300));
     const uint64_t seenKey = sorted[10];      // already returned
     const uint64_t goneKey = sorted[200];     // beyond the resume
-    ASSERT_TRUE(k.produce({ltr::revokeRec(seenKey, k.versionOf(seenKey)), ltr::revokeRec(goneKey, k.versionOf(goneKey))}));
+    const uint64_t goneKey2 = sorted[250];    // (two, so that one erased row id with a stale key above the resume survives the one grant below)
+    ASSERT_TRUE(k.produce({ltr::revokeRec(seenKey, k.versionOf(seenKey)), ltr::revokeRec(goneKey, k.versionOf(goneKey)),
+                           ltr::revokeRec(goneKey2, k.versionOf(goneKey2))}));
     ASSERT_TRUE(k.produce({ltr::grantRec(7000)}));
     ready(k);
+    {   // the scenario really leaves an erased row id behind (the walk must skip it)
+        const auto lk = k.r.vs->leaseIndexFor(kSrc, 0, k.r.replica->leadershipGeneration(), true, true);
+        ASSERT_NE(lk.ref.table, nullptr);
+        uint32_t erased = 0;
+        for (uint32_t rid = 0; rid < lk.ref.table->ridHighWater(); ++rid) erased += leaseRowLive(*lk.ref.table, rid) ? 0 : 1;
+        ASSERT_GE(erased, 1u);
+    }
     std::vector<uint64_t> got = p1.ids();
     uint64_t resume = p1.lastHash;
     bool done = p1.done;
@@ -278,9 +287,10 @@ TEST(ScanLeasesRegression, ChurnBetweenPagesRegression) {
     for (uint64_t id : got) ++seen[id];
     for (const auto& [id, n] : seen) EXPECT_EQ(n, 1) << "key " << id << " repeated";
     EXPECT_EQ(seen.count(goneKey), 0u);
-    EXPECT_EQ(got.size(), 300u - 1u + (hashOf(7000) > p1.lastHash ? 1u : 0u)) << "the revoked rows are not rows (no erased rid is returned)";
+    EXPECT_EQ(seen.count(goneKey2), 0u);
+    EXPECT_EQ(got.size(), 300u - 2u + (hashOf(7000) > p1.lastHash ? 1u : 0u)) << "the revoked rows are not rows (no erased rid is returned)";
     for (std::size_t i = 64; i < sorted.size(); ++i)
-        if (sorted[i] != goneKey) EXPECT_EQ(seen[sorted[i]], 1) << "untouched key " << sorted[i];
+        if (sorted[i] != goneKey && sorted[i] != goneKey2) EXPECT_EQ(seen[sorted[i]], 1) << "untouched key " << sorted[i];
 }
 
 // 8. maxRows bounds on the worker: 1 -> one row per page (a full scan of 40 keys takes 40 pages), 1024 -> one page, 0 and 1025 -> InvalidRequest
