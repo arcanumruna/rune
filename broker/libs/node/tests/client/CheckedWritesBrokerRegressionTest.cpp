@@ -2361,10 +2361,7 @@ TEST(CheckedWritesBrokerRegression, ControllerCrashCoordinatorsRecoverWithinBoun
         for (const int32_t n : c.runningNodes()) {
             if (!c.node(n).isLeader()) continue;
             for (int32_t t : {-1, -2}) {
-                bool led = false;
-                for (const int32_t l : c.runningNodes())
-                    led = led || (leaderHoldsInIsr(c.node(l), t, 0, l) && !leaderHoldsInIsr(c.node(l), t, 0, a));
-                if (!led) return false;
+                if (!leaderHoldsInIsr(c.node(n), t, 0, n) || leaderHoldsInIsr(c.node(n), t, 0, a)) return false;
             }
             return true;
         }

@@ -309,6 +309,11 @@ void PartitionReplica::setBootId(std::string id) {
     ledThisBoot_ = n == bootId_.size() && std::memcmp(buf, bootId_.data(), n) == 0;
 }
 
+void PartitionReplica::dropLeaderBoot_() {
+    ledThisBoot_ = false;
+    if (!memoryBacked_ && diskLog_ != nullptr) std::remove((diskLog_->dir() + "/leader-boot").c_str());
+}
+
 bool PartitionReplica::writeLeaderBoot_() const {
     // No fsync: the marker vouches for this boot only, whose page cache holds it; a torn or lost marker never matches (fail closed).
     FILE* f = std::fopen((diskLog_->dir() + "/leader-boot").c_str(), "wb");
@@ -383,7 +388,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
         }
         if (logDirOffline_ || noFence || (!fenceFile_.empty() && !persistLedEpoch_(newEpoch))) {
             // A failed fence write takes the log dir offline (sticky, N1).
-            if (!noFence && !fenceFile_.empty()) logDirOffline_ = true;
+            if (!noFence && !fenceFile_.empty()) { logDirOffline_ = true; dropLeaderBoot_(); }
             if (newEpoch > restartFenceEpoch_) restartFenceEpoch_ = newEpoch;
             fenceEstablished_ = true;
             if (fenceUnknown_) {
@@ -2062,6 +2067,7 @@ void PartitionReplica::enableEpochState_() noexcept
                     spdlog::critical("PartitionReplica[topic={} part={}]: updating {} failed — log FAILED "
                                      "(fail-stop)", cfg_.topicId, cfg_.partitionId, ES::path(dir));
                     logDirOffline_ = true;
+                    dropLeaderBoot_();
                     if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->markStorageFailed(EIO);
                     return;   // es_ stays enabled: nothing is ever written to a legacy file
                 }
@@ -2286,6 +2292,7 @@ bool PartitionReplica::epochStateWriteCompleted(uint64_t seq, int err)
             const int32_t pe = pendingLead_.partitionEpoch;
             cancelPendingLeadership_();
             logDirOffline_ = true;
+            dropLeaderBoot_();
             if (e > restartFenceEpoch_) restartFenceEpoch_ = e;
             fenceEstablished_ = true;
             refuseStaleLeadership_(e, pe);
@@ -2294,6 +2301,7 @@ bool PartitionReplica::epochStateWriteCompleted(uint64_t seq, int err)
             // Like every other storage failure on the log: fail-stop (the owner
             // routes it to the broker halt).
             logDirOffline_ = true;
+            dropLeaderBoot_();
             diskLog_->markStorageFailed(err);
         }
         pushEpochCap_();

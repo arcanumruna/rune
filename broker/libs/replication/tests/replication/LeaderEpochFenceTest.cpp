@@ -191,6 +191,38 @@ TEST(LeaderEpochFenceRegression, LedThisBootFlagOnlyAfterALeadershipInThisBootRe
     EXPECT_EQ(t.sent[0].isr[1] & AlterIsrMsg::kBumpLedThisBoot, 0) << "the marker is from another boot";
 }
 
+// Election fix round 1: a storage failure on the log dir (here a failed fence write) revokes the leader-boot marker, so a restart in the
+// same boot is refused at the fence without kBumpLedThisBoot.  RED: logDirOffline_ is set without dropLeaderBoot_().
+TEST(LeaderEpochFenceRegression, LogDirOfflineRevokesTheLeaderBootMarkerRegression) {
+    Dir d;
+    const fs::path logDir = d.path / "log";
+    fs::create_directories(logDir);
+    {
+        rune::storage::Log log(logDir.string());
+        log.recover();
+        CapturingTransport t;
+        auto r = std::make_unique<PartitionReplica>(cfg(), Role::Follower, 0, kAll, kAll, &log, &t);
+        r->setIsrChannel(&t);
+        r->setBootId("boot-a");
+        r->becomeLeader(2, kAll);
+        ASSERT_EQ(r->role(), Role::Leader);
+        r->setLeaderEpochFenceFile((d.path / "missing-dir" / "fence").string());
+        r->becomeLeader(3, kAll);
+        ASSERT_TRUE(r->logDirOfflineForTest());
+    }
+    rune::storage::Log log(logDir.string());
+    log.recover();
+    CapturingTransport t;
+    auto r = std::make_unique<PartitionReplica>(cfg(), Role::Follower, 0, kAll, kAll, &log, &t);
+    r->setIsrChannel(&t);
+    r->setBootId("boot-a");
+    r->becomeLeader(2, kAll);
+    EXPECT_NE(r->role(), Role::Leader);
+    r->doWork(1'000'000'000);
+    ASSERT_EQ(t.sent.size(), 1u);
+    EXPECT_EQ(t.sent[0].isr[1] & AlterIsrMsg::kBumpLedThisBoot, 0) << "the log dir failed after the marker was written";
+}
+
 // D15 review m5: a MEMORY-backed replica's restart fence is written by the
 // owning worker's async epoch-state writer (leader-epoch-state in its own
 // dir), never by a synchronous fsync on the worker: a new-epoch leadership is

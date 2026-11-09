@@ -442,6 +442,10 @@ public:
     void setProcessIncarnation(int64_t inc) noexcept { processIncarnation_ = inc; }
     /// Election batch: this process's OS boot id ("" = unknown: never vouched).  A disk-backed replica reads <log dir>/leader-boot
     /// here; equal = it led this partition earlier in this boot, so its leader-epoch bumps carry kBumpLedThisBoot.  Cold (registry add).
+    /// Assumes an operator does not restore an old log dir without a reboot, and storage does not silently drop dirty pages on a
+    /// writeback error without a reboot.  A detected storage failure (fsync error, log dir offline) revokes the certificate for the rest
+    /// of this boot (storage-failed-boot sentinel, dropLeaderBoot_); if even the sentinel cannot be written the device is unwritable and
+    /// the restart's recovery cannot write the log either.
     void setBootId(std::string id);
     /// E2 C1 residual N1: this PROCESS's node-control identity (the nonce the
     /// node registers with every controller, ControlledShutdown).  Carried in
@@ -2074,6 +2078,8 @@ public:
 private:
     [[nodiscard]] int32_t bumpFlags_() const noexcept;
     bool writeLeaderBoot_() const;
+    /// A storage failure on the log dir revokes the leader-boot certificate: clears ledThisBoot_ and unlinks the marker.
+    void dropLeaderBoot_();
     bool fenceEstablished_ = false;          ///< no-fence-file mode: the first leadership was refused
     /// D21 review L2: both leader-epoch-state slots were corrupt — the epochs an
     /// earlier incarnation led at are unknown (an epoch led with no surviving

@@ -508,9 +508,9 @@ TEST(EpochRestartRegression, SingleNodeRestartBumpsLeaderEpochRegression) {
     TmpDir d0{"n0"}, d1{"n1"}, d2{"n2"};
     const auto ports = Ports::discover(3);
     // A liveness timeout far above a node restart (~1 s in-process): the
-    // controller does NOT fail the partition over while its leader restarts —
-    // the restarted node finds itself the committed leader at its old epoch
-    // (the docker DR window: a fast container restart).
+    // restarted node is never declared dead.  stop() is a controlled shutdown
+    // that moves the leadership away; the test pins the epoch bump and the
+    // re-spread back to the victim.
     constexpr int64_t kSlowLivenessMs = 3000;
     std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports, 2, kSlowLivenessMs),
                                   makeConfig(1, d1.path, ports, 2, kSlowLivenessMs),

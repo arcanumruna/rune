@@ -646,6 +646,24 @@ std::string SI::osBootId() {
 #endif
 }
 
+bool SI::markStorageFailedThisBoot(const std::string& dataDir, const std::string& bootId) {
+    FILE* f = std::fopen((dataDir + "/storage-failed-boot").c_str(), "wb");
+    if (f == nullptr) return false;
+    const bool wrote = std::fwrite(bootId.data(), 1, bootId.size(), f) == bootId.size() && std::fflush(f) == 0;
+    (void)::fsync(::fileno(f));
+    return std::fclose(f) == 0 && wrote;
+}
+
+bool SI::storageFailedThisBoot(const std::string& dataDir, const std::string& bootId) {
+    if (bootId.empty()) return false;
+    FILE* f = std::fopen((dataDir + "/storage-failed-boot").c_str(), "rb");
+    if (f == nullptr) return false;
+    char buf[64];
+    const std::size_t n = std::fread(buf, 1, sizeof buf, f);
+    std::fclose(f);
+    return n == bootId.size() && std::memcmp(buf, bootId.data(), n) == 0;
+}
+
 bool SI::isPresent(const std::string& d, Class c) { return classPresent(fs::path{d}, c); }
 
 bool SI::markPresent(const std::string& d, Loaded& l, Class c) {
