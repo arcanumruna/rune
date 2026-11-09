@@ -250,16 +250,42 @@ TEST(LeaseProtocolRegression, ForEachEntryOverRawBytesRegression) {
         EXPECT_EQ(i, viaMember.size());
         viaMember.push_back({Bytes(k.begin(), k.end()), v});
     });
-    rc::forEachLeaseKeepAliveEntry(d->entryBytes, d->count, [&](uint16_t i, std::span<const uint8_t> k, int64_t v) {
+    EXPECT_TRUE(rc::forEachLeaseKeepAliveEntry(d->entryBytes, d->count, [&](uint16_t i, std::span<const uint8_t> k, int64_t v) {
         EXPECT_EQ(i, viaRaw.size());
         viaRaw.push_back({Bytes(k.begin(), k.end()), v});
-    });
+    }));
     ASSERT_EQ(viaRaw.size(), 3u);
     EXPECT_EQ(viaRaw, viaMember);
     for (std::size_t i = 0; i < 3; ++i) {
         EXPECT_EQ(viaRaw[i].first, keys[i]);
         EXPECT_EQ(viaRaw[i].second, static_cast<int64_t>(i) + 1);
     }
+}
+
+// R3: the raw walk validates the whole span before it calls fn: a 3-entry span cut at EVERY offset, one extra trailing byte, a wrong count
+// and an over-long key all return false and never call fn.
+TEST(LeaseProtocolRegression, ForEachEntryRejectsTruncationRegression) {
+    const std::vector<Bytes> keys{keyOf(1, 3), keyOf(17, 5), keyOf(128, 9)};
+    const Bytes f = keepAliveFrame(keys);
+    const auto d = rc::LeaseKeepAlive::decode(f.data(), f.size());
+    ASSERT_TRUE(d.has_value());
+    const Bytes whole(d->entryBytes.begin(), d->entryBytes.end());
+    int calls = 0;
+    auto fn = [&](uint16_t, std::span<const uint8_t>, int64_t) { ++calls; };
+    EXPECT_TRUE(rc::forEachLeaseKeepAliveEntry(std::span<const uint8_t>(whole), 3, fn));
+    EXPECT_EQ(calls, 3);
+    calls = 0;
+    for (std::size_t cut = 0; cut < whole.size(); ++cut)
+        EXPECT_FALSE(rc::forEachLeaseKeepAliveEntry(std::span<const uint8_t>(whole.data(), cut), 3, fn)) << "cut at " << cut;
+    Bytes extra = whole;
+    extra.push_back(0);
+    EXPECT_FALSE(rc::forEachLeaseKeepAliveEntry(std::span<const uint8_t>(extra), 3, fn)) << "one trailing byte";
+    EXPECT_FALSE(rc::forEachLeaseKeepAliveEntry(std::span<const uint8_t>(whole), 2, fn)) << "count smaller than the entries";
+    EXPECT_FALSE(rc::forEachLeaseKeepAliveEntry(std::span<const uint8_t>(whole), 4, fn)) << "count larger than the entries";
+    Bytes longKey(1u + 129u + 8u, 0);
+    longKey[0] = 129;
+    EXPECT_FALSE(rc::forEachLeaseKeepAliveEntry(std::span<const uint8_t>(longKey), 1, fn)) << "key over kMaxLeaseKeyBytes";
+    EXPECT_EQ(calls, 0) << "fn is never called for a bad span";
 }
 
 TEST(LeaseProtocolRegression, TimeToLiveRoundTripRegression) {

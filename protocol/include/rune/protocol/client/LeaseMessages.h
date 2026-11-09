@@ -38,9 +38,20 @@ inline constexpr std::size_t kScanLeasesMaxPrefixBytes = 127;
 /// final = 1. For Throttled, ttlMs is the retry-after in ms (ceil).
 inline constexpr uint16_t kLeaseWholeRequest = 0xFFFF;
 
-/// Walks `count` already-validated LeaseKeepAlive entries (keyLen u8, key, version i64) in raw bytes: fn(index, key, version).
+/// Walks `count` LeaseKeepAlive entries (keyLen u8, key, version i64) in raw bytes: fn(index, key, version).  The whole span is
+/// validated FIRST (every entry inside the remaining bytes, key <= kMaxLeaseKeyBytes, exactly `count` entries consuming exactly the
+/// span); false on any mismatch, and fn is then never called.  Not noexcept: the callback may throw.
 template <class Fn>
-inline void forEachLeaseKeepAliveEntry(std::span<const uint8_t> entryBytes, uint16_t count, Fn&& fn) noexcept {
+[[nodiscard]] inline bool forEachLeaseKeepAliveEntry(std::span<const uint8_t> entryBytes, uint16_t count, Fn&& fn) {
+    std::size_t pos = 0;
+    const std::size_t avail = entryBytes.size();
+    for (uint16_t i = 0; i < count; ++i) {
+        if (pos >= avail) return false;
+        const std::size_t klen = entryBytes[pos++];
+        if (klen > kMaxLeaseKeyBytes || avail - pos < klen + 8u) return false;
+        pos += klen + 8u;
+    }
+    if (pos != avail) return false;
     const uint8_t* p = entryBytes.data();
     for (uint16_t i = 0; i < count; ++i) {
         const std::size_t klen = *p++;
@@ -50,6 +61,7 @@ inline void forEachLeaseKeepAliveEntry(std::span<const uint8_t> entryBytes, uint
         p += 8;
         fn(i, key, version);
     }
+    return true;
 }
 
 namespace lease_wire {
@@ -154,7 +166,7 @@ struct LeaseKeepAlive {
     }
     /// Visit the entries of a decoded message: fn(index, key, version).
     template <class Fn>
-    void forEachEntry(Fn&& fn) const noexcept { forEachLeaseKeepAliveEntry(entryBytes, count, fn); }
+    void forEachEntry(Fn&& fn) const noexcept { (void)forEachLeaseKeepAliveEntry(entryBytes, count, fn); }
 };
 
 // ---------------------------------------------------------------------------

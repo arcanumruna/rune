@@ -15,6 +15,7 @@
 #include <rune/protocol/RecordBatch.h>
 
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -112,7 +113,8 @@ public:
         return timers_.entry(rid).deadlineNs;
     }
 
-    /// One keepalive entry (spec 9.3, 9.6).  See LeaseKaOutcome.  `req` is the request's park-table index, kLeaseNil until its first park
+    /// One keepalive entry (spec 9.3, 9.6).  See LeaseKaOutcome.  A Throttled answer may still have armed a Free entry at its promotion
+    /// deadline (idempotent and never early: the deadline is the same one a later keepalive or the promotion pass would set).  `req` is the request's park-table index, kLeaseNil until its first park
     /// (this call opens it).  `owedRoom`: one more owed return fits the worker's cap; without it (or a slot) a park is Throttled with
     /// no state change.  Allocates nothing (the entry store grows cold, as Granted does).
     [[nodiscard]] LeaseKaOutcome keepAlive(const LeaseIndexRef& ref, std::span<const uint8_t> key, int64_t version, int64_t judgedThrough,
@@ -125,6 +127,12 @@ public:
     uint32_t flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref, const LeaseWriter& writer, int64_t judgedThrough, int64_t leaseNowNs,
                          std::size_t byteCap, std::size_t hardCap, rune::replication::PartitionReplica& replica, LeaseParkTable& parks);
     [[nodiscard]] uint32_t clearPending() const noexcept { return static_cast<uint32_t>(clearTail_ - clearHead_); }
+    /// Test seams (Task 11a review fixes): the clear ring's capacity (a power of two <= the array, ring empty), and a rid's clear-wanted flag.
+    void setClearRingCapForTest(uint32_t cap) noexcept {
+        assert(clearHead_ == clearTail_ && cap != 0 && (cap & (cap - 1)) == 0 && cap <= kClearRingCap);
+        clearMask_ = cap - 1;
+    }
+    [[nodiscard]] bool clearFlagged(uint32_t rid) const noexcept { return (timers_.entry(rid).pad & kLeaseClearWanted) != 0; }
 
     /// One Expire batch: polls the deadline wheel for at most `maxRecords` due Armed entries whose key the judge has caught up with
     /// (lastAppended < judgedThrough), encodes each from its row at the latest installed writer version, and appends the batch with
@@ -146,12 +154,18 @@ private:
     };
     /// The keepalive decision for an entry that is linked (Free is armed by the caller first): leaseStep, then the RearmAnswerOk side effect.
     KaStep kaStep_(uint32_t rid, int64_t leaseNowNs, bool remainingPositive, uint64_t ttlMs, bool gateOpen) noexcept;
-    void flagClear_(uint32_t rid) noexcept;
-    /// Re-runs the chain of `rid` through kaStep_ (ReplayParked / ReturnArmedReplayParked): decided slots are answered, the rest stay parked.
+    /// Puts `rid` on the clear ring (idempotent by the flag).  A full ring is compacted first; false = still full (the caller must not park).
+    [[nodiscard]] bool flagClear_(uint32_t rid) noexcept;
+    /// Drops every ring entry whose flag is clear (a stale or duplicate one) or whose rid has no parks (its flag is cleared too),
+    /// keeping the first of each rid.  O(ring), cold.
+    void compactClears_() noexcept;
+    /// Whether flagClear_(rid) would succeed (compacts a full ring).
+    [[nodiscard]] bool clearRoom_(uint32_t rid) noexcept;
+    /// Decides the chain of `rid` ONCE (the decision depends only on the entry's state and the row values): answered as a whole, or left parked.
     void replay_(uint32_t rid, int64_t leaseNowNs, bool remainingPositive, uint64_t ttlMs, LeaseParkTable& parks) noexcept;
     void foldStep_(uint32_t rid, LeaseEntryEvent event, const LeaseEvent& ev, int64_t leaseNowNs, LeaseParkTable& parks) noexcept;
 
-    static constexpr uint32_t kClearRingCap = 2 * kLeaseParkTableEntries;   ///< a rid is on it at most once (the flag); see flagClear_
+    static constexpr uint32_t kClearRingCap = 2 * kLeaseParkTableEntries;   ///< a power of two; the live entries are flagged rids with parks, <= the park table
     uint64_t         gen_, epoch_;
     LeaseTimers      timers_;
     LeaseRuntimeStats stats_;
@@ -160,6 +174,7 @@ private:
     uint64_t         clearHead_ = 0, clearTail_ = 0;
     std::size_t      lastBatchBytes_ = 0;
     bool             ridPastWarned_  = false;
+    uint32_t         clearMask_ = kClearRingCap - 1;   ///< the ring's capacity - 1 (a test seam lowers it)
     std::array<uint32_t, kClearRingCap> clearRing_{};
 };
 

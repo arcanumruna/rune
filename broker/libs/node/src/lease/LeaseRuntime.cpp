@@ -13,6 +13,7 @@
 #include <cassert>
 #include <cstring>
 #include <exception>
+#include <new>
 #include <string_view>
 
 namespace rune::node::lease {
@@ -58,14 +59,38 @@ enum class Fit : uint8_t { Ok, Full, Oversized };
 }
 }  // namespace
 
-void LeaseRuntime::flagClear_(uint32_t rid) noexcept {
+void LeaseRuntime::compactClears_() noexcept {
+    uint64_t w = clearHead_;
+    for (uint64_t r = clearHead_; r != clearTail_; ++r) {
+        const uint32_t rid = clearRing_[r & clearMask_];
+        uint8_t& f = timers_.flags(rid);
+        if ((f & kLeaseClearWanted) == 0) continue;   // stale (the entry was reset) or a duplicate of one kept already
+        f = static_cast<uint8_t>(f & ~kLeaseClearWanted);   // kept ones are marked seen by a clear flag, restored below
+        if (timers_.parkHead(rid) == kLeaseNil) continue;   // answered meanwhile: out of the ring, flag clear
+        clearRing_[w++ & clearMask_] = rid;
+    }
+    clearTail_ = w;
+    for (uint64_t r = clearHead_; r != clearTail_; ++r) {
+        uint8_t& f = timers_.flags(clearRing_[r & clearMask_]);
+        f = static_cast<uint8_t>(f | kLeaseClearWanted);
+    }
+}
+
+bool LeaseRuntime::clearRoom_(uint32_t rid) noexcept {
+    if ((timers_.flags(rid) & kLeaseClearWanted) != 0) return true;
+    if (clearTail_ - clearHead_ <= clearMask_) return true;
+    compactClears_();
+    return clearTail_ - clearHead_ <= clearMask_;
+}
+
+bool LeaseRuntime::flagClear_(uint32_t rid) noexcept {
+    if ((timers_.flags(rid) & kLeaseClearWanted) != 0) return true;
+    if (!clearRoom_(rid)) return false;
     uint8_t& f = timers_.flags(rid);
-    if ((f & kLeaseClearWanted) != 0) return;
-    assert(clearTail_ - clearHead_ < kClearRingCap && "the clear ring is bounded by the rids with parks");
-    if (clearTail_ - clearHead_ >= kClearRingCap) return;   // unreachable: at most one entry per rid, and only rids with parks are pushed
     f = static_cast<uint8_t>(f | kLeaseClearWanted);
-    clearRing_[clearTail_ % kClearRingCap] = rid;
+    clearRing_[clearTail_ & clearMask_] = rid;
     ++clearTail_;
+    return true;
 }
 
 LeaseRuntime::KaStep LeaseRuntime::kaStep_(uint32_t rid, int64_t leaseNowNs, bool remainingPositive, uint64_t ttlMs, bool gateOpen) noexcept {
@@ -98,13 +123,12 @@ LeaseRuntime::KaStep LeaseRuntime::kaStep_(uint32_t rid, int64_t leaseNowNs, boo
 void LeaseRuntime::replay_(uint32_t rid, int64_t leaseNowNs, bool remainingPositive, uint64_t ttlMs, LeaseParkTable& parks) noexcept {
     uint32_t& head = timers_.parkHead(rid);
     if (head == kLeaseNil) return;
-    // The gate is not consulted here: AppendClear and a gate-closed Park both leave the slot parked with the clear flag set, and
-    // flushClears re-checks the gate before it appends.
-    parks.forEachInChain(head, [&](uint32_t slot, const LeaseParkSlot&) {
-        const KaStep st = kaStep_(rid, leaseNowNs, remainingPositive, ttlMs, /*gateOpen=*/true);
-        if (!st.park) parks.answerOne(head, slot, st.code, st.ttlMs);
-        else if (st.wantFlag) flagClear_(rid);   // a replay never takes a new slot and never answers Throttled
-    });
+    // The gate is not consulted here: AppendClear and a gate-closed Park both leave the chain parked with the clear flag set, and
+    // flushClears re-checks the gate before it appends.  The decision depends only on the entry's state and the row's values, so it is
+    // taken ONCE for the whole chain.
+    const KaStep st = kaStep_(rid, leaseNowNs, remainingPositive, ttlMs, /*gateOpen=*/true);
+    if (!st.park) parks.answerChain(head, st.code, st.ttlMs);
+    else if (st.wantFlag && !flagClear_(rid)) parks.answerChain(head, kCodeThrottled, 1);   // a replay never takes a new slot; no ring room = Throttled
 }
 
 void LeaseRuntime::foldStep_(uint32_t rid, LeaseEntryEvent event, const LeaseEvent& ev, int64_t leaseNowNs, LeaseParkTable& parks) noexcept {
@@ -220,7 +244,11 @@ LeaseKaOutcome LeaseRuntime::keepAlive(const LeaseIndexRef& ref, std::span<const
     uint32_t rid = 0;
     const uint8_t* const row = ref.table->find(rune::view::ViewKey::fromBytes(key), rid);
     if (row == nullptr || leaseRowVersion(row, *ref.layout) != version) return {false, kCodeLeaseNotFound, 0};
-    if (!timers_.covers(rid) && !timers_.reserveFor(rid)) return {false, kCodeThrottled, 1};   // cold growth
+    try {
+        if (!timers_.covers(rid) && !timers_.reserveFor(rid)) return {false, kCodeThrottled, 1};   // cold growth
+    } catch (const std::bad_alloc&) {
+        return {false, kCodeThrottled, 1};
+    }
     const uint64_t ttl       = leaseRowTtl(row, *ref.layout);
     const uint64_t remaining = leaseRowRemaining(row, *ref.layout);
     if (timers_.entry(rid).state == LeaseEntryState::Free) {   // a row the promotion pass has not linked yet (Task 12): armed at its promotion deadline
@@ -234,13 +262,19 @@ LeaseKaOutcome LeaseRuntime::keepAlive(const LeaseIndexRef& ref, std::span<const
     const bool due = e.deadlineNs <= leaseNowNs;
     const LeaseStepOut peek = leaseStep({e.state, LeaseEntryEvent::Keepalive, gateOpen, due, remaining > 0});
     if (peek.action == LeaseAction::Park || peek.action == LeaseAction::AppendClear) {
-        if (!owedRoom || parks.full() || (req == kLeaseNil && (req = parks.openRequest(sessionId, correlationId)) == kLeaseNil)) {
+        const bool needFlag = peek.action == LeaseAction::AppendClear || (e.state == LeaseEntryState::Armed && !due);
+        // The dry run: a park that needs a clear-ring slot and finds none (after a compaction) is Throttled, never parked unflagged.
+        if (!owedRoom || parks.full() || (needFlag && !clearRoom_(rid)) ||
+            (req == kLeaseNil && (req = parks.openRequest(sessionId, correlationId)) == kLeaseNil)) {
             out = {false, kCodeThrottled, 1};
         } else {
             const uint32_t slot = parks.park(req, topicId_, partition_, rid, index, timers_.parkHead(rid));
             assert(slot != kLeaseNil);
             (void)slot;
-            if (peek.action == LeaseAction::AppendClear || (e.state == LeaseEntryState::Armed && !due)) flagClear_(rid);
+            if (needFlag) {
+                [[maybe_unused]] const bool flagged = flagClear_(rid);   // room was checked above
+                assert(flagged);
+            }
             out = {true, 0, 0};
         }
     } else {
@@ -248,7 +282,10 @@ LeaseKaOutcome LeaseRuntime::keepAlive(const LeaseIndexRef& ref, std::span<const
         assert(!st.park);
         out = {false, st.code, st.ttlMs};
     }
-    if (timers_.growOwed()) timers_.growIfOwed();   // cold
+    try {
+        if (timers_.growOwed()) timers_.growIfOwed();   // cold; a failure is retried by the next call
+    } catch (const std::bad_alloc&) {
+    }
     return out;
 }
 
@@ -334,11 +371,20 @@ uint32_t LeaseRuntime::flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref
     const uint64_t visit = clearTail_ - clearHead_;
     uint64_t visited     = 0;
     bool full            = false;
+    // A popped rid goes back on the ring (deferred): its own pop freed the slot, so there is always room.
+    auto repush = [this](uint32_t rid) noexcept {
+        [[maybe_unused]] const bool ok = flagClear_(rid);
+        assert(ok);
+    };
+    // Stale ring rids (flag clear: the entry was reset, or a duplicate of one handled already) are popped for free: they count toward
+    // neither the record nor the byte limit.  When a limit stops the walk, the entries left behind stay as they are (flagged, parked).
     while (visited < visit && n < rune::protocol::kMaxLeaseExpiryBatch && !full) {
-        const uint32_t rid = clearRing_[clearHead_ % kClearRingCap];
+        const uint32_t rid = clearRing_[clearHead_ & clearMask_];
         ++clearHead_;
         ++visited;
-        timers_.flags(rid) = static_cast<uint8_t>(timers_.flags(rid) & ~kLeaseClearWanted);
+        uint8_t& flag = timers_.flags(rid);
+        if ((flag & kLeaseClearWanted) == 0) continue;
+        flag = static_cast<uint8_t>(flag & ~kLeaseClearWanted);
         const LeaseEntry& e = timers_.entry(rid);
         if (e.state != LeaseEntryState::Armed || e.parkHead == kLeaseNil) continue;   // answered or changed meanwhile
         if (e.deadlineNs <= leaseNowNs) continue;   // due: the emitter expires it, its parks are answered at the Expire fold
@@ -351,7 +397,7 @@ uint32_t LeaseRuntime::flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref
         }
         if (leaseLastAppended(*ref.table, rid) >= judgedThrough) {   // a client update of the key is appended but not judged
             ++stats_.clearDeferred;
-            flagClear_(rid);
+            repush(rid);
             continue;
         }
         const std::span<const uint8_t> key = ref.table->keyOf(rid);
@@ -360,14 +406,14 @@ uint32_t LeaseRuntime::flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref
         if (len < rec::kLeaseRemainingValueOffset + 8) {
             ++stats_.encodeFailures;
             ++stats_.clearDeferred;
-            flagClear_(rid);
+            repush(rid);
             continue;
         }
         std::memset(work.valueTmp.data() + rec::kLeaseRemainingValueOffset, 0, 8);   // lease_remaining_ms = 0
         switch (fitRecord(work.builder, n, key.size(), len, byteCap, hardCap)) {
             case Fit::Ok: break;
-            case Fit::Full: ++stats_.clearDeferred; flagClear_(rid); full = true; continue;
-            case Fit::Oversized: ++stats_.oversizedDeferred; ++stats_.clearDeferred; flagClear_(rid); continue;
+            case Fit::Full: ++stats_.clearDeferred; repush(rid); full = true; continue;
+            case Fit::Oversized: ++stats_.oversizedDeferred; ++stats_.clearDeferred; repush(rid); continue;
         }
         work.builder.append(std::string_view(reinterpret_cast<const char*>(key.data()), key.size()),
                             std::string_view(reinterpret_cast<const char*>(work.valueTmp.data()), len), /*timestamp=*/0,
@@ -387,7 +433,7 @@ uint32_t LeaseRuntime::flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref
     if (base == PartitionReplica::kAppendNotLeader) ++stats_.notLeaderStops;
     for (uint32_t i = 0; i < n; ++i) {   // refused (any code): they stay Armed and linked, wanted again next cycle
         ++stats_.clearDeferred;
-        flagClear_(work.rids[i]);
+        repush(work.rids[i]);
     }
     return 0;
 }

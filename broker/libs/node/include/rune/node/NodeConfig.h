@@ -1234,6 +1234,14 @@ struct NodeConfig {
     static std::string shardIngressEndpoint(const PeerConfig& p, int32_t w);  // "<p.host>:<p.ingressBasePort+w>"
 };
 
+/// The leader heartbeat timeout (ns) the Election derives from this config: max(electionTimeout, 3 x electionStatusInterval).  The one
+/// formula for a lease key's promotion grace (spec 9.7) - BrokerNode hands it to every Worker (setLeaseExtendNs).
+[[nodiscard]] inline int64_t leaderHeartbeatTimeoutNs(const NodeConfig& c) noexcept {
+    const int64_t timeout = c.electionTimeoutMs * 1'000'000LL;
+    const int64_t status3 = 3 * c.electionStatusIntervalMs * 1'000'000LL;
+    return timeout > status3 ? timeout : status3;
+}
+
 struct ConfigResult {
     std::optional<NodeConfig> config;
     std::string               error;

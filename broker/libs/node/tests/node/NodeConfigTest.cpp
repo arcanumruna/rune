@@ -6,6 +6,12 @@
 #include <rune/node/HostDefaults.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/Worker.h>   // Worker::maxAcceptableBatchBytes (THE batch limit)
+#include <rune/consensus/ClusterMember.h>
+#include <rune/consensus/Election.h>
+#include <rune/consensus/NodeStateFile.h>
+#include <rune/consensus/NullSink.h>
+#include <rune/consensus/SbeConsensusPublisher.h>
+#include <rune/consensus/TermLog.h>
 
 #include <filesystem>
 #include <fstream>
@@ -3603,3 +3609,29 @@ TEST(NodeConfigRegression, LeadingWhitespaceOrSignIsRefusedByTheStrictMsKnobsReg
 }
 
 } // namespace rune::node
+
+// Lease R13: the extend a promoted lease key is granted is THE Election's leader heartbeat timeout, from one helper.
+TEST(LeaseExtendRegression, ExtendEqualsElectionHeartbeatTimeoutRegression) {
+    struct Cfg { int64_t timeoutMs, statusMs; };
+    for (const Cfg c : {Cfg{150, 20}, Cfg{100, 60}, Cfg{500, 100}}) {
+        rune::node::NodeConfig cfg;
+        cfg.electionTimeoutMs        = c.timeoutMs;
+        cfg.electionStatusIntervalMs = c.statusMs;
+        const auto dir = std::filesystem::temp_directory_path() / ("rune_lease_extend_" + std::to_string(::getpid()) + "_" + std::to_string(c.timeoutMs));
+        std::filesystem::create_directories(dir);
+        {
+            rune::consensus::NodeStateFile nsf((dir / "n.nsf").string());
+            rune::consensus::TermLog       tl((dir / "t.tl").string());
+            rune::consensus::NullSink      sink;
+            rune::consensus::SbeConsensusPublisher pub(sink);
+            rune::consensus::ClusterMember m;
+            m.id = 0; m.logPosition = 0; m.logLeadershipTermId = 0; m.leadershipTermId = 0;
+            rune::consensus::Election e(true, -1, 0, 0, 0, 0, std::vector<rune::consensus::ClusterMember>{m}, 0, pub, nsf, tl,
+                                        cfg.electionTimeoutMs * 1'000'000LL, cfg.electionStatusIntervalMs * 1'000'000LL,
+                                        cfg.startupCanvassTimeoutMs * 1'000'000LL);
+            EXPECT_EQ(rune::node::leaderHeartbeatTimeoutNs(cfg), e.leaderHeartbeatTimeoutNs()) << c.timeoutMs << "/" << c.statusMs;
+            EXPECT_EQ(e.leaderHeartbeatTimeoutNs(), std::max(c.timeoutMs, 3 * c.statusMs) * 1'000'000LL);
+        }
+        std::filesystem::remove_all(dir);
+    }
+}

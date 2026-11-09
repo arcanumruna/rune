@@ -96,9 +96,10 @@ struct Ka {
     int64_t corr = 1000;
     std::vector<Frame> frames;   // every keepalive return seen so far, in order
 
-    explicit Ka(uint32_t maxKeys = 1000, bool follower = false) : r(follower, 64LL * 1024 * 1024, RigTuning{}) {
+    explicit Ka(uint32_t maxKeys = 1000, bool follower = false, bool leaseTopic = true) : r(follower, 64LL * 1024 * 1024, RigTuning{}) {
         r.worker->setLeaseClockForTest(&leaseNow);
-        r.createLeaseTopic(maxKeys);
+        if (leaseTopic) r.createLeaseTopic(maxKeys);
+        else r.typed();   // a plain topic: its write spec has no lease block
         r.passes(30);
         WorkerOp level;
         level.type = WorkerOp::Type::ClusterFeatureLevel; level.nextOffset = rune::replication::MetadataFeature::kLeases;
@@ -179,20 +180,31 @@ struct Ka {
         EXPECT_TRUE(r.worker->tryEnqueueOp(std::move(op)));
         return corr;
     }
+    /// One drained keepalive return as a Frame.
+    static Frame frameOf(const WorkerReturn& w) {
+        Frame f{w.correlationId, w.lastOffset == 1, {}};
+        EXPECT_EQ(w.chunk.size(), std::size_t(w.recordCount) * 12);
+        for (int i = 0; i < w.recordCount; ++i) {
+            const uint8_t* p = w.chunk.data() + std::size_t(i) * 12;
+            uint64_t t = 0;
+            for (int j = 0; j < 8; ++j) t |= uint64_t(p[4 + j]) << (8 * j);
+            f.es.push_back({uint16_t(p[0] | (p[1] << 8)), uint16_t(p[2] | (p[3] << 8)), t});
+        }
+        return f;
+    }
     /// Moves the keepalive returns the rig drained into `frames`.
     void collect() {
-        for (auto& w : r.leaseKaAnswers) {
-            Frame f{w.correlationId, w.lastOffset == 1, {}};
-            EXPECT_EQ(w.chunk.size(), std::size_t(w.recordCount) * 12);
-            for (int i = 0; i < w.recordCount; ++i) {
-                const uint8_t* p = w.chunk.data() + std::size_t(i) * 12;
-                uint64_t t = 0;
-                for (int j = 0; j < 8; ++j) t |= uint64_t(p[4 + j]) << (8 * j);
-                f.es.push_back({uint16_t(p[0] | (p[1] << 8)), uint16_t(p[2] | (p[3] << 8)), t});
-            }
-            frames.push_back(std::move(f));
-        }
+        for (auto& w : r.leaseKaAnswers) frames.push_back(frameOf(w));
         r.leaseKaAnswers.clear();
+    }
+    /// One LeaseKeepAlive op with a hand-built tail and count (served by the next pass).  Returns its correlation id.
+    int64_t enqueueRaw(const std::vector<uint8_t>& tail, int32_t count, int64_t sessionId = 77) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::LeaseKeepAlive; op.topicId = VerdictRig::kSrc; op.partition = 0;
+        op.sessionId = sessionId; op.correlationId = ++corr; op.recordCount = count;
+        op.leaseTail = std::span<const uint8_t>(tail.data(), tail.size());
+        EXPECT_TRUE(r.worker->tryEnqueueOp(std::move(op)));
+        return corr;
     }
     /// One pass, then the frames it produced.
     void step() { r.pass(); collect(); }
@@ -338,8 +350,7 @@ TEST(LeaseKeepAliveTableRegression, ArmedNoCheckpointRegression) {
     EXPECT_TRUE(withOp(k.r, rec::LeaseOp::Expire).empty());
 }
 
-// 5. A checkpointed row (remaining > 0): the keepalive appends Checkpoint(0) and is answered only when it folds.  Mutation M10
-// (answer Ok when the clear is appended) turns the "no answer yet" assertions red.
+// 5. A checkpointed row (remaining > 0): the keepalive appends Checkpoint(0) (the record's bytes, the entry Clearing, one clear counted).
 TEST(LeaseKeepAliveTableRegression, ArmedCheckpointClearsRegression) {
     Ka k;
     ASSERT_TRUE(k.setup({1}));
@@ -358,8 +369,23 @@ TEST(LeaseKeepAliveTableRegression, ArmedCheckpointClearsRegression) {
     EXPECT_EQ(le(c.value, 28), 0u) << "lease_remaining_ms = 0";
     EXPECT_EQ(int64_t(le(c.value, 4)), v) << "the row's version";
     EXPECT_EQ(k.entry(1).state, LeaseEntryState::Clearing);
+    EXPECT_EQ(k.rt()->stats().clearsAppended, 1u);
+    k.r.holdJudge(false);
+}
+
+// 5b. The answer comes only after the Checkpoint(0) folds.  Mutation M10 (answer Ok when the clear is appended) turns the "never Ok
+// before it folds" assertions red.
+TEST(LeaseKeepAliveTableRegression, ClearAnswersAfterFoldRegression) {
+    Ka k;
+    ASSERT_TRUE(k.setup({1}));
+    const int64_t v = k.versionOf(1);
+    ASSERT_TRUE(k.checkpoint(1, v, 4000));
+    k.r.holdJudge(true);
+    EXPECT_TRUE(k.keepAlive({E(1, v)}).empty()) << "no answer in the pass that appended the clear";
+    ASSERT_EQ(k.entry(1).state, LeaseEntryState::Clearing);
     for (int i = 0; i < 10; ++i) k.step();
     EXPECT_TRUE(k.frames.empty()) << "the clear has not folded: never Ok before it does";
+    EXPECT_EQ(k.rowRemaining(1), 4000u);
     k.r.holdJudge(false);
     ASSERT_TRUE(k.waitFrames(1));
     ASSERT_EQ(k.frames.size(), 1u);
@@ -369,7 +395,6 @@ TEST(LeaseKeepAliveTableRegression, ArmedCheckpointClearsRegression) {
     EXPECT_EQ(k.entry(1).state, LeaseEntryState::Armed);
     EXPECT_EQ(k.entry(1).deadlineNs, k.leaseNow + 5000 * kMs);
     EXPECT_EQ(k.rowRemaining(1), 0u);
-    EXPECT_EQ(k.rt()->stats().clearsAppended, 1u);
 }
 
 // 6. The clear waits behind a client update of the key that is appended but not judged (the last-appended gate): no Checkpoint is
@@ -723,7 +748,9 @@ TEST(LeaseKeepAliveTableRegression, TimeToLiveRegression) {
     EXPECT_EQ(fresh.remainingMs, 5000) << "a Free entry: the promotion deadline (ready time + ttl; extend is 0 here)";
 }
 
-// 17. No allocation on the keepalive path: 100 ops of 256 entries (Ok, parks, clears) and their folds.
+// 17. No allocation on the keepalive path: 100 ops of 256 entries (Ok, parks, clears), their clears, folds and answers - the worker's
+// whole answer path runs inside the window.  Only the return collector (the gateway side: drainReturn builds a vector per return) is
+// outside it.
 TEST(LeaseKeepAliveAllocRegression, KeepAliveNoAllocRegression) {
     Ka k;
     ASSERT_TRUE(k.setup({1, 2}));
@@ -738,8 +765,10 @@ TEST(LeaseKeepAliveAllocRegression, KeepAliveNoAllocRegression) {
         for (int j = 0; j < 8; ++j) tail.push_back(uint8_t(uint64_t(ver) >> (8 * j)));
     }
     uint64_t allocs = 0;
+    uint64_t clears = k.rt()->stats().clearsAppended;
     for (int i = 0; i < 100; ++i) {
-        if (i % 5 == 0) ASSERT_TRUE(k.checkpoint(2, v2, 4000));   // outside the window: the next op parks 8 clears again
+        const bool parks = i % 5 == 0;
+        if (parks) ASSERT_TRUE(k.checkpoint(2, v2, 4000));   // outside the window: the next op parks 8 clears again
         k.r.pass();
         k.collect();
         k.frames.clear();
@@ -748,16 +777,51 @@ TEST(LeaseKeepAliveAllocRegression, KeepAliveNoAllocRegression) {
         op.sessionId = 77; op.correlationId = ++k.corr; op.recordCount = 256;
         op.leaseTail = std::span<const uint8_t>(tail.data(), tail.size());
         uint64_t used = 0;
+        int passesRun = 0;
         {
             rune::testing::AllocWindow w;
             const bool ok = k.r.worker->tryEnqueueOp(std::move(op));
-            k.r.now += 1'000'000;
-            k.r.worker->doWork(k.r.now);
-            used = w.count();
             EXPECT_TRUE(ok);
+            // the op, then the passes that append the clear, fold it and send the parked answers: until nothing is parked
+            for (; passesRun < 50; ++passesRun) {
+                k.r.now += 1'000'000;
+                k.r.worker->doWork(k.r.now);
+                if (passesRun > 0 && k.r.worker->leaseParksForTest().inUse() == 0) { ++passesRun; break; }
+            }
+            used = w.count();
         }
+        ASSERT_LT(passesRun, 50) << "iteration " << i << ": the parked answers never left";
         if (i > 0) allocs += used;   // op 0 is the warm-up: the emit work area and the first growth are cold
-        k.r.worker->drainReturn([](WorkerReturn) {}, [](const TxnReturn&) {});
+        std::vector<Frame> got;
+        k.r.worker->drainReturn([&](WorkerReturn r) {
+            if (r.type == WorkerReturn::Type::LeaseKeepAliveResult) got.push_back(Ka::frameOf(r));
+        }, [](const TxnReturn&) {});
+        std::size_t entries = 0, finals = 0;
+        for (const Frame& f : got) {
+            EXPECT_EQ(f.corr, k.corr);
+            for (const Ans& a : f.es) {
+                EXPECT_EQ(a.code, 0) << "iteration " << i;
+                EXPECT_EQ(a.ttl, 5000u);
+                ++entries;
+            }
+            finals += f.final ? 1 : 0;
+        }
+        EXPECT_EQ(entries, 256u) << "iteration " << i;
+        EXPECT_EQ(finals, 1u) << "exactly the request's last frame is final";
+        ASSERT_FALSE(got.empty());
+        EXPECT_TRUE(got.back().final);
+        if (parks) {
+            ASSERT_EQ(got.size(), 9u) << "248 decided entries in the first frame, then the 8 parked answers one per frame";
+            EXPECT_EQ(got[0].es.size(), 248u);
+            EXPECT_FALSE(got[0].final);
+        } else {
+            ASSERT_EQ(got.size(), 1u);
+            EXPECT_EQ(got[0].es.size(), 256u);
+        }
+        EXPECT_EQ(k.r.worker->leaseParksForTest().inUse(), 0u);
+        const uint64_t nowClears = k.rt()->stats().clearsAppended;
+        EXPECT_EQ(nowClears - clears, parks ? 1u : 0u) << "one Checkpoint(0) serves the 8 parked entries of the key";
+        clears = nowClears;
     }
     EXPECT_EQ(allocs, 0u);
 }
@@ -793,4 +857,279 @@ TEST(LeaseKeepAliveTableRegression, FreeEntryKeepAliveArmsRegression) {
     EXPECT_EQ(k.frames[1].es[0].ttl, 5000u);
     EXPECT_TRUE(k.frames[1].final);
     EXPECT_EQ(k.entry(2).deadlineNs, k.leaseNow + 5000 * kMs);
+}
+
+// 18b. R14: the leader heartbeat timeout (setLeaseExtendNs) is part of the promotion deadline of a Free entry.  A checkpointed row with
+// a closed gate arms at exactly readyNs + extend + remaining; TimeToLive reports it before and after.  Mutation: drop extend in
+// promotionDeadline turns the deadline assertions red.
+TEST(LeaseKeepAliveTableRegression, FreeEntryPromotionDeadlineIncludesExtendRegression) {
+    Ka k;
+    ASSERT_TRUE(k.setup({1}));
+    const int64_t v = k.versionOf(1);
+    ASSERT_TRUE(k.checkpoint(1, v, 4000));
+    k.r.worker->setLeaseExtendNs(2000 * kMs);
+    k.r.demote();
+    k.r.promote();
+    ASSERT_TRUE(k.waitRuntime());
+    ASSERT_EQ(k.entry(1).state, LeaseEntryState::Free);
+    const int64_t ready = k.leaseNow;
+    const auto before = k.timeToLive(keyOf(1));
+    EXPECT_EQ(before.code, 0);
+    EXPECT_EQ(before.remainingMs, 6000) << "ready + extend (2 s) + remaining (4 s)";
+    k.r.holdJudge(true);
+    (void)k.send({updateRec(1, v)});
+    k.r.passes(30);
+    EXPECT_TRUE(k.keepAlive({E(1, v)}).empty());
+    EXPECT_EQ(k.entry(1).state, LeaseEntryState::Armed) << "parked behind the closed gate";
+    EXPECT_EQ(k.entry(1).deadlineNs, ready + 2000 * kMs + 4000 * kMs);
+    const auto after = k.timeToLive(keyOf(1));
+    EXPECT_EQ(after.remainingMs, 6000);
+}
+
+// R1. A deferred Ok is only valid under the view-read lease: one sent after the lease ended is NotLeader.  Control leg: the lease still
+// held -> Ok.  Mutation: drop the check in drainLeaseParks_ turns the lapsed leg red.
+TEST(LeaseKeepAliveTableRegression, ParkedOkAfterReadLeaseEndsIsNotLeaderRegression) {
+    for (const bool lapse : {false, true}) {
+        Ka k;
+        ASSERT_TRUE(k.setup({1}));
+        const int64_t v = k.versionOf(1);
+        ASSERT_TRUE(k.checkpoint(1, v, 4000));
+        k.r.worker->requireViewReadLease();
+        WorkerOp lease;
+        lease.type = WorkerOp::Type::ReadLease; lease.nextOffset = k.leaseNow + 10'000 * kMs;
+        ASSERT_TRUE(k.r.worker->tryEnqueueOp(std::move(lease)));
+        k.r.pass();
+        k.r.holdJudge(true);
+        EXPECT_TRUE(k.keepAlive({E(1, v)}).empty()) << "parked behind the clear";
+        ASSERT_EQ(k.entry(1).state, LeaseEntryState::Clearing);
+        if (lapse) k.leaseNow += 20'000 * kMs;   // the read lease ended; no role change
+        k.r.holdJudge(false);
+        ASSERT_TRUE(k.waitFrames(1)) << "lapse " << lapse;
+        ASSERT_EQ(k.frames.size(), 1u);
+        ASSERT_EQ(k.frames[0].es.size(), 1u);
+        EXPECT_EQ(k.frames[0].es[0].index, 0);
+        EXPECT_TRUE(k.frames[0].final);
+        if (lapse) {
+            EXPECT_EQ(k.frames[0].es[0].code, kNotLeader);
+            EXPECT_EQ(k.frames[0].es[0].ttl, 0u);
+            EXPECT_EQ(k.r.worker->leaseOkWithheldForTest(), 1u);
+        } else {
+            EXPECT_EQ(k.frames[0].es[0].code, 0);
+            EXPECT_EQ(k.frames[0].es[0].ttl, 5000u);
+            EXPECT_EQ(k.r.worker->leaseOkWithheldForTest(), 0u);
+        }
+    }
+}
+
+// R2. The clear ring (capacity 8 here) never loses a park: stale entries (the entry was reset to Free while its rid sat on the ring) are
+// compacted away, and a park that finds the ring genuinely full is Throttled - never parked without its clear flag.  Mutation: restore
+// the silent return on a full ring (no compaction, no Throttled) leaves a parked rid unflagged: red.
+TEST(LeaseKeepAliveTableRegression, ClearRingStaleEntriesNeverDropAParkRegression) {
+    Ka k;
+    constexpr uint64_t kKeys = 12;
+    std::vector<RawRec> grants;
+    for (uint64_t id = 1; id <= kKeys; ++id) grants.push_back(grantRec(id));
+    ASSERT_TRUE(k.produce(grants));
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    ASSERT_TRUE(k.waitRuntime());
+    std::vector<int64_t> ver(kKeys + 1);
+    for (uint64_t id = 1; id <= kKeys; ++id) {
+        ver[id] = k.versionOf(id);
+        ASSERT_TRUE(k.checkpoint(id, ver[id], 4000));
+    }
+    k.r.holdJudge(true);
+    std::vector<RawRec> ups;
+    for (uint64_t id = 1; id <= kKeys; ++id) ups.push_back(updateRec(id, ver[id]));
+    (void)k.send(ups);   // appended, not judged: the gate of every key is closed
+    k.r.passes(30);
+    lease::LeaseRuntime* const rt = k.rt();
+    ASSERT_NE(rt, nullptr);
+    rt->setClearRingCapForTest(8);
+    const auto lk = k.r.vs->leaseIndexFor(VerdictRig::kSrc, 0, k.r.replica->leadershipGeneration(), true, true);
+    ASSERT_NE(lk.ref.table, nullptr);
+    lease::LeaseParkTable& parks = k.r.worker->leaseParksMutForTest();
+    const int64_t judged = k.r.writeState()->judgedThrough;
+    auto call = [&](uint64_t id, uint16_t index) {
+        const std::string key = keyOf(id);
+        uint32_t req = lease::kLeaseNil;
+        const lease::LeaseKaOutcome o = rt->keepAlive(lk.ref, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(key.data()), key.size()), ver[id],
+                                                      judged, k.leaseNow, parks, req, 77, ++k.corr, index, true);
+        if (o.parked) EXPECT_TRUE(rt->clearFlagged(k.ridOf(id))) << "key " << id << ": parked without its clear flag";
+        return o;
+    };
+    // 4 rounds x 3 keys: park (a ring entry), then the key ends (the entry is Free: its flag resets, the ring entry is now stale).
+    for (int round = 0; round < 4; ++round) {
+        std::vector<LeaseEvent> ended;
+        for (uint64_t id = 1; id <= 3; ++id) {
+            const lease::LeaseKaOutcome o = call(id, 0);
+            ASSERT_TRUE(o.parked) << "round " << round << " key " << id;
+            LeaseEvent ev;
+            ev.kind = LeaseEventKind::Ended; ev.endOp = uint8_t(rec::LeaseOp::Revoke); ev.rid = k.ridOf(id); ev.version = ver[id]; ev.offset = 1'000'000 + round;
+            ended.push_back(ev);
+        }
+        k.r.worker->onEventsForTest(VerdictRig::kSrc, 0, ended, k.leaseNow);
+        for (uint64_t id = 1; id <= 3; ++id) EXPECT_EQ(k.entry(id).state, LeaseEntryState::Free);
+    }
+    // The final park of every key: 8 fit the ring, the rest are Throttled with ttl 1.
+    std::size_t parked = 0, throttled = 0;
+    for (uint64_t id = 1; id <= kKeys; ++id) {
+        const lease::LeaseKaOutcome o = call(id, 0);
+        if (o.parked) ++parked;
+        else if (o.code == kThrottled && o.ttlMs == 1) ++throttled;
+        else ADD_FAILURE() << "key " << id << ": code " << o.code;
+    }
+    EXPECT_EQ(parked, 8u);
+    EXPECT_EQ(throttled, kKeys - 8);
+    // The gate opens: every parked key's clear goes out and each is answered Ok exactly once.
+    k.r.holdJudge(false);
+    for (int i = 0; i < kCap; ++i) {
+        k.step();
+        std::size_t ok = 0;
+        for (const Frame& f : k.frames) for (const Ans& a : f.es) if (a.code == 0) ++ok;
+        if (ok >= parked) break;
+    }
+    std::size_t ok = 0, notFound = 0;
+    for (const Frame& f : k.frames) for (const Ans& a : f.es) { if (a.code == 0) ++ok; if (a.code == kNotFound) ++notFound; }
+    EXPECT_EQ(ok, parked) << "every flagged park was answered Ok";
+    EXPECT_EQ(notFound, 12u) << "the 4 rounds' parks, answered when their keys ended";
+    EXPECT_EQ(parks.inUse(), 0u);
+}
+
+// R3. A tail that does not hold `count` whole entries is one InvalidRequest for the whole request, before anything is served or charged.
+TEST(LeaseKeepAliveTableRegression, KeepAliveBadTailInvalidRequestRegression) {
+    Ka k;
+    ASSERT_TRUE(k.setup({1}));
+    const int64_t v = k.versionOf(1);
+    constexpr uint16_t kSlot = 3;
+    constexpr uint32_t kNs = 77;
+    rune::protocol::NamespaceLimits limits;
+    k.r.worker->applyNsSlotAssignDirect(kSlot, kNs, limits);
+    k.r.log->setNsTag(kNs, kSlot);
+    const uint64_t before = k.r.worker->nsProduceRecordsForTest(kSlot);
+    const int64_t deadline = k.entry(1).deadlineNs;
+    std::vector<uint8_t> tail;
+    for (int e = 0; e < 2; ++e) {
+        const std::string key = keyOf(1);
+        tail.push_back(uint8_t(key.size()));
+        tail.insert(tail.end(), key.begin(), key.end());
+        for (int i = 0; i < 8; ++i) tail.push_back(uint8_t(uint64_t(v) >> (8 * i)));
+    }
+    k.advanceMs(100);
+    k.enqueueRaw(tail, 3);   // count 3, two entries
+    k.step();
+    ASSERT_EQ(k.frames.size(), 1u);
+    ASSERT_EQ(k.frames[0].es.size(), 1u);
+    EXPECT_EQ(k.frames[0].es[0].index, kWhole);
+    EXPECT_EQ(k.frames[0].es[0].code, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(k.frames[0].final);
+    EXPECT_EQ(k.r.worker->nsProduceRecordsForTest(kSlot), before) << "nothing charged";
+    EXPECT_EQ(k.entry(1).deadlineNs, deadline) << "nothing served: the two whole entries were not rearmed";
+    // control: the same two entries with count 2 are served and charged
+    k.enqueueRaw(tail, 2);
+    k.step();
+    ASSERT_EQ(k.frames.size(), 2u);
+    EXPECT_EQ(k.frames[1].es.size(), 2u);
+    EXPECT_EQ(k.r.worker->nsProduceRecordsForTest(kSlot), before + 2);
+}
+
+// R4. A plain (non-lease) topic is InvalidRequest, for both ops; the cells of R11 (a dropped topic) are UnknownTopic.
+TEST(LeaseKeepAliveTableRegression, PlainTopicInvalidRequestRegression) {
+    Ka k(1000, false, /*leaseTopic=*/false);
+    const std::string key = keyOf(1);
+    std::vector<uint8_t> tail;
+    tail.push_back(uint8_t(key.size()));
+    tail.insert(tail.end(), key.begin(), key.end());
+    for (int i = 0; i < 8; ++i) tail.push_back(0);
+    k.enqueueRaw(tail, 1);
+    k.step();
+    ASSERT_EQ(k.frames.size(), 1u);
+    ASSERT_EQ(k.frames[0].es.size(), 1u);
+    EXPECT_EQ(k.frames[0].es[0].index, kWhole);
+    EXPECT_EQ(k.frames[0].es[0].code, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(k.frames[0].final);
+    const auto t = k.timeToLive(key);
+    ASSERT_TRUE(t.got);
+    EXPECT_EQ(t.code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(t.remainingMs, -1);
+}
+
+// R11. A dropped topic: both ops answer UnknownTopic, and its runtime is gone after one pass.
+TEST(LeaseKeepAliveTableRegression, DroppedTopicUnknownTopicRegression) {
+    Ka k;
+    ASSERT_TRUE(k.setup({1}));
+    const int64_t v = k.versionOf(1);
+    ASSERT_NE(k.r.writeState()->leaseRuntime.get(), nullptr);
+    k.r.worker->setDroppedTopicsDirect({VerdictRig::kSrc});
+    k.r.pass();
+    EXPECT_EQ(k.r.writeState()->leaseRuntime.get(), nullptr) << "the runtime of a dropped topic does not outlive a pass";
+    const auto fr = k.keepAlive({E(1, v)});
+    ASSERT_EQ(fr.size(), 1u);
+    ASSERT_EQ(fr[0].es.size(), 1u);
+    EXPECT_EQ(fr[0].es[0].index, kWhole);
+    EXPECT_EQ(fr[0].es[0].code, kUnknownTopic);
+    EXPECT_TRUE(fr[0].final);
+    const auto t = k.timeToLive(keyOf(1));
+    ASSERT_TRUE(t.got);
+    EXPECT_EQ(t.code, int16_t(kUnknownTopic));
+    EXPECT_EQ(t.remainingMs, -1);
+}
+
+// R9. Both ops count as request ops; a paced TimeToLive is Throttled (remainingMs -1).
+TEST(LeaseKeepAliveTableRegression, LeaseOpsMeteredAndPacedRegression) {
+    Ka k;
+    ASSERT_TRUE(k.setup({1}));
+    const int64_t v = k.versionOf(1);
+    constexpr uint16_t kSlot = 3;
+    constexpr uint32_t kNs = 77;
+    rune::protocol::NamespaceLimits limits;
+    k.r.worker->applyNsSlotAssignDirect(kSlot, kNs, limits);
+    k.r.log->setNsTag(kNs, kSlot);
+    const uint64_t ops0 = k.r.worker->nsRequestOpsForTest(kSlot);
+    (void)k.keepAlive({E(1, v)});
+    EXPECT_EQ(k.r.worker->nsRequestOpsForTest(kSlot), ops0 + 1);
+    auto t = k.timeToLive(keyOf(1));
+    EXPECT_EQ(t.code, 0);
+    EXPECT_EQ(k.r.worker->nsRequestOpsForTest(kSlot), ops0 + 2);
+    k.r.worker->applyNsThrottleDirect(kSlot, kNs, ThrottleKind::QueryCycles, k.r.now + 1 * kMs + 2'500'000);
+    t = k.timeToLive(keyOf(1));
+    ASSERT_TRUE(t.got);
+    EXPECT_EQ(t.code, int16_t(kThrottled));
+    EXPECT_EQ(t.remainingMs, -1);
+    EXPECT_EQ(k.r.worker->nsRequestOpsForTest(kSlot), ops0 + 3) << "a paced op is still counted";
+}
+
+// R7. The two ops and their two returns through the real op ring and return ring: every field the handlers and the collector see.
+TEST(WorkerOpWireRegression, LeaseOpsRoundTripThroughWorkerRegression) {
+    Ka k;
+    ASSERT_TRUE(k.setup({1}));
+    const int64_t v = k.versionOf(1);
+    // LeaseKeepAlive: a 2-entry tail (a hit, then an absent key).
+    k.r.leaseKaAnswers.clear();
+    const int64_t c = k.enqueue({E(1, v), E(99, 7)}, /*sessionId=*/4242);
+    k.r.pass();
+    ASSERT_EQ(k.r.leaseKaAnswers.size(), 1u);
+    const WorkerReturn& w = k.r.leaseKaAnswers[0];
+    EXPECT_EQ(w.type, WorkerReturn::Type::LeaseKeepAliveResult);
+    EXPECT_EQ(w.sessionId, 4242);
+    EXPECT_EQ(w.correlationId, c);
+    EXPECT_EQ(w.readTopicId, VerdictRig::kSrc);
+    EXPECT_EQ(w.readPartition, 0);
+    EXPECT_EQ(w.recordCount, 2);
+    EXPECT_EQ(w.lastOffset, 1) << "final";
+    std::vector<uint8_t> expect(24, 0);
+    putLe(expect, 0, 0, 2); putLe(expect, 2, 0, 2); putLe(expect, 4, 5000, 8);               // index 0: Ok, ttl 5000
+    putLe(expect, 12, 1, 2); putLe(expect, 14, kNotFound, 2); putLe(expect, 16, 0, 8);       // index 1: LeaseNotFound
+    EXPECT_EQ(std::vector<uint8_t>(w.chunk.begin(), w.chunk.end()), expect);
+    k.r.leaseKaAnswers.clear();
+    // LeaseTimeToLive: the key bytes.
+    const auto t = k.timeToLive(keyOf(1));
+    ASSERT_TRUE(t.got);
+    EXPECT_EQ(t.code, 0);
+    EXPECT_EQ(t.version, v);
+    EXPECT_EQ(t.ttl, 5000u);
+    EXPECT_EQ(t.holder, 1u);
+    EXPECT_EQ(t.remainingMs, 5000);
+    const auto absent = k.timeToLive(keyOf(2));
+    EXPECT_EQ(absent.code, int16_t(kNotFound));
+    EXPECT_EQ(absent.remainingMs, -1);
 }
