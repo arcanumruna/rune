@@ -12,6 +12,7 @@
 #include <rune/client/Completions.h>
 #include <rune/client/lease/LeaseSession.h>
 #include <rune/client/lease/LeaseTopic.h>
+#include <rune/client/lease/LeaseWatch.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/LeaseSpec.h>
@@ -23,6 +24,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -377,4 +379,98 @@ TEST(LeaseTopicBrokerRegression, SessionKeepsAliveAndClosesRegression) {
         const rc::LeaseResult ttl = lt.timeToLiveAndWait(row, &info);
         EXPECT_FALSE(ttl.ok()) << "close() revoked the lease: status " << int(ttl.status) << " err " << ttl.errorCode << " remaining " << info.remainingMs << " ver " << info.version;
     }
+}
+
+namespace {
+struct WatchLog {
+    std::map<std::string, int64_t> live;   // key bytes -> version
+    int bad = 0, readies = 0;
+    static void fn(void* c, const rc::LeaseEvent& e) {
+        auto& w = *static_cast<WatchLog*>(c);
+        const std::string k(reinterpret_cast<const char*>(e.key.data()), e.key.size());
+        switch (e.kind) {
+        case rc::LeaseEventKind::Granted:
+            if (!w.live.emplace(k, e.version).second) ++w.bad;
+            break;
+        case rc::LeaseEventKind::Updated:
+            if (w.live.count(k) == 0) ++w.bad;
+            break;
+        case rc::LeaseEventKind::Revoked:
+        case rc::LeaseEventKind::Expired:
+        case rc::LeaseEventKind::Vanished:
+            if (w.live.erase(k) == 0) ++w.bad;
+            break;
+        case rc::LeaseEventKind::Ready: ++w.readies; break;
+        case rc::LeaseEventKind::Failed: ++w.bad; break;
+        }
+    }
+};
+}  // namespace
+
+// Task 16: startFromNow against a real broker while grants and revokes are produced: after Ready and the producer's last ack the watch's live
+// set is exactly the set of keys the broker reports live, each once (the hash-range handoff loses and duplicates nothing).
+TEST(LeaseTopicBrokerRegression, WatchStartFromNowRealBrokerRegression) {
+    constexpr int kInitial = 300, kGrants = 50, kRevokes = 50;
+    OneBroker b("lease-watch", OneBroker::Runtime::Shard);
+    rc::Client& c = *b.connectClient();
+    defineLease(c, "claims", 2, "claim", claimBlob());
+    auto lt = c.openLeaseTopicAndWait<LeaseClaim>("claims", {}, 30s);
+
+    rc::LeaseOptions o;
+    o.holder = 5;
+    std::map<std::string, int64_t> truth;   // the producer's own view: key -> version
+    const auto keyOf = [](int i) { return "w-" + std::to_string(i); };
+    for (int i = 0; i < kInitial; ++i) {
+        const rc::LeaseResult g = lt.grantAndWait(claimRow(keyOf(i)), o);
+        ASSERT_TRUE(g.ok()) << i;
+        truth[keyOf(i)] = g.version;
+    }
+
+    rc::LeaseWatchOptions wo;
+    wo.maxRows = 16;      // many pages a partition, so the produce loop below overlaps the scan
+    wo.maxLive = 1024;
+    rc::LeaseWatch<LeaseClaim> watch(c, lt, wo);
+    WatchLog log;
+    watch.setHandler(&WatchLog::fn, &log);
+    const std::vector<uint8_t> none;
+    const std::span<const uint8_t> prefixes[] = {std::span<const uint8_t>(none)};
+    ASSERT_EQ(watch.startFromNow(prefixes), rc::OpResult::Accepted);
+
+    for (int i = 0; i < kGrants || i < kRevokes; ++i) {
+        watch.doWork(c.nowNs());
+        if (i < kGrants) {
+            const rc::LeaseResult g = lt.grantAndWait(claimRow(keyOf(kInitial + i)), o);
+            ASSERT_TRUE(g.ok()) << "grant " << i;
+            truth[keyOf(kInitial + i)] = g.version;
+        }
+        watch.doWork(c.nowNs());
+        if (i < kRevokes) {
+            const std::string k = keyOf(i * 2);   // every other initial key
+            const rc::LeaseResult r = lt.revokeAndWait(claimRow(k), truth.at(k));
+            ASSERT_TRUE(r.ok()) << "revoke " << i;
+            truth.erase(k);
+        }
+    }
+    // The broker's answer for every key ever granted.
+    std::map<std::string, int64_t> live;
+    for (int i = 0; i < kInitial + kGrants; ++i) {
+        rc::LeaseTtlInfo info;
+        const LeaseClaim row = claimRow(keyOf(i));
+        const rc::LeaseResult ttl = lt.timeToLiveAndWait(row, &info);
+        if (ttl.ok()) live[std::string(row.claim.data(), row.claim.size())] = info.version;
+    }
+    ASSERT_EQ(live.size(), truth.size());
+    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    while ((!watch.isReady() || log.live != live) && std::chrono::steady_clock::now() < deadline) {
+        watch.doWork(c.nowNs());
+        std::this_thread::sleep_for(2ms);
+    }
+    for (int i = 0; i < 50; ++i) watch.doWork(c.nowNs());
+    ASSERT_FALSE(watch.failed());
+    EXPECT_TRUE(watch.isReady());
+    EXPECT_EQ(log.readies, 1);
+    EXPECT_EQ(log.bad, 0) << "each lease granted once, ended once";
+    EXPECT_EQ(log.live, live) << "the watch's live set is the broker's";
+    EXPECT_EQ(watch.liveCount(), live.size());
+    EXPECT_EQ(live.size(), std::size_t(kInitial + kGrants - kRevokes));
 }

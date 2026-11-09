@@ -128,6 +128,10 @@ public:
         return ok;
     }
 
+    /// Producer side (lease watch, Task 16): would `bytes` of records (aligned, padding included) fit right now?  Reads the consumer's
+    /// head like a write does; a record of r bytes written after a true answer for 2r + k always leaves k free (padding is below r).
+    [[nodiscard]] bool hasCapacityFor(std::uint32_t bytes) { return ring_.hasCapacityFor(static_cast<aeron::util::index_t>(bytes)); }
+
     /// STANDALONE use only (tests, a custom producer with no Client): the
     /// producer will deliver nothing more (release).  A Client-registered ring
     /// is closed with producerCloseAndDetach() — this form never detaches, so

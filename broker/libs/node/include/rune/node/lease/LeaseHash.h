@@ -7,15 +7,13 @@
 // not seen yet exactly once.  It is only ever computed by brokers (the client treats lastHash as an opaque cursor), so any deterministic
 // seedable function would do; the repo's wyhash is used (no new dependency).  The golden values are pinned by
 // ScanLeasesRegression.ScanHashGoldenRegression: changing this function is a wire (version-skew) change.
-#include <rune/storage/WyHash.h>
+#include <rune/protocol/LeaseScanHash.h>
 
 #include <cstdint>
 #include <span>
 
 namespace rune::node::lease {
 
-[[nodiscard]] inline uint64_t scanHash(std::span<const uint8_t> key, int32_t sourceTopicId) noexcept {
-    return rune::storage::detail::wyhash64(key.data(), key.size(), static_cast<uint64_t>(static_cast<int64_t>(sourceTopicId)));
-}
+using rune::protocol::scanHash;   // shared with the client (protocol/LeaseScanHash.h)
 
 }  // namespace rune::node::lease

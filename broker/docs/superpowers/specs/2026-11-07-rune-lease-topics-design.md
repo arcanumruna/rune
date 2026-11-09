@@ -1279,6 +1279,39 @@ These are client recipes over a one-partition lease topic keyed by `path string(
 - **Ready.** `LeaseWatchReady` completes once every page is scanned and the buffer is applied.
 - **Breaks.** On any later break, the watch re-runs `startFromNow` (§3.3).
 - **No op filter in v1.**
+- **As built (Task 16) - deviations from the text above.**
+  - **Shape.** `LeaseWatchBase` (untyped; sessions and recipes) and `LeaseWatch<T>` (typed decoders only) live in
+    `client-cpp/include/rune/client/lease/LeaseWatch.h`. `startFromNow(prefixes)` is synchronous to start (it returns
+    `Accepted` or `InvalidArgument`); progress and the result are `doWork(nowNs)` and `isReady()`, plus a `Ready`
+    event, because the whole watch runs on the owner thread. Events go to one handler and up to 8 observers (the
+    `LeaseSession` is one: `observe(watch)`).
+  - **Hash.** The scan hash moved to `protocol/include/rune/protocol/LeaseScanHash.h` (wyhash64 seeded with the source
+    topic id), shared by the broker and the client; the broker's golden test and a client copy of it pin the values.
+  - **Threads.** The subscription handler (duty thread) does one thing: it copies `{partition, offset, op, version,
+    key, value}` into a standalone record ring (`Completions`), the only cross-thread memory. `doWork` drains it in
+    order. Scan answers arrive on a second, registered `Completions`.
+  - **Overflow.** The ring keeps marker space reserved for every partition. A record that does not fit the ring, or the
+    handoff list while the partition scans (`handoffBuffer` records), becomes an `Overflow{partition, generation,
+    cursor = that record's offset}` marker and the handler drops the rest of that subscription (generations make stale
+    records and markers harmless). The cursor is the first record NOT buffered, not "the offset after the last buffered
+    one" of the text above; both name the same record. A Live partition that overflows re-subscribes from the cursor
+    at once; a scanning one finishes its scan, applies the list, then re-subscribes (`resubscribes()`).
+  - **Page bounds.** Every page of every prefix keeps `(lastHash, asOf)`; the subscription is opened at the first
+    page's `asOf` (the minimum) the moment that page answers, and rule 3 stays active for the partition's whole epoch.
+  - **Breaks.** A broken subscription (or a non-retriable scan error) moves the partition to a re-run after a 1 ms
+    deadline: live entries are marked unconfirmed, the partition is rescanned and re-subscribed, and when the scan
+    ends every entry still unconfirmed is emitted `Vanished` and removed. A confirmed entry is not granted twice.
+    `isReady()` stays true during a re-run (a recipe keeps seeing the old set); `Ready` is emitted once.
+  - **Identity.** `(key, version)`: a `Granted` at another version of a held key emits `Vanished` for the old one,
+    then `Granted`. `Updated` / `Revoked` / `Expired` for an unknown `(key, version)` are ignored.
+  - **Memory.** The live set (open addressing, backward-shift deletion), name heaps, page bounds, handoff lists and the
+    ring are allocated in the constructor; `doWork` and the record handler allocate nothing. Only (re)subscribing
+    builds a `std::function` (cold).
+  - **Names (Task 20 groundwork).** `registerName(name)` before `startFromNow`; a key belongs to `N` iff it starts with
+    `N/` and the rest has no further `/`; `lowest(id)` is the live lease of the name with the smallest version
+    (indexed min-heap per name).
+  - **Not in this task.** The leader-change-mid-scan 3-node test and the compacted-log-start test move to Task 17.
+    `rune_client_lease_watch_handoff_resubscribes_total` is not exported; `resubscribes()` is the observer.
 
 ## 13. The Rune-backed discovery library (deliverable)
 

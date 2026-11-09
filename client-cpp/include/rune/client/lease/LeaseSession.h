@@ -21,6 +21,7 @@
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
 #include <rune/client/lease/LeaseTopic.h>
+#include <rune/client/lease/LeaseWatch.h>
 #include <rune/client/producer/Producer.h>
 
 #include <array>
@@ -120,6 +121,10 @@ public:
     void close();
     [[nodiscard]] bool isClosed() const noexcept { return closed_ && live_ == 0; }
     void onWatchedEnd(int32_t topicId, int32_t partition, std::span<const uint8_t> key, int64_t version, LostReason reason);
+    /// Task 16: registers this session as an observer of `watch` (up to 8 observers per watch): a Revoked / Expired / Vanished event of a
+    /// held (topic, key, version) ends that lease (WatchedRevoked / WatchedExpired / WatchedVanished).  false when the watch has no free slot.
+    [[nodiscard]] bool observe(LeaseWatchBase& watch);
+    bool unobserve(LeaseWatchBase& watch) noexcept;
     int  doWork(int64_t nowNs);
 
     // ---- observers (tests) ----
@@ -242,6 +247,10 @@ public:
     void onWatchedEnd(int32_t topicId, int32_t partition, std::span<const uint8_t> key, int64_t version, LostReason reason) {
         core_.onWatchedEnd(topicId, partition, key, version, reason);
     }
+    /// Watches `watch` (a LeaseWatch over a topic whose leases this session keeps): its ends of a held lease are this session's losses.  The
+    /// watch calls the session from its own doWork(), on the thread that owns both; destroy the watch (or unobserve) before the session.
+    [[nodiscard]] bool observe(LeaseWatchBase& watch) { return core_.observe(watch); }
+    bool unobserve(LeaseWatchBase& watch) noexcept { return core_.unobserve(watch); }
     int doWork(int64_t nowNs) { return core_.doWork(nowNs); }
 
     [[nodiscard]] uint32_t liveCount() const noexcept { return core_.liveCount(); }

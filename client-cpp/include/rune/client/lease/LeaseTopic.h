@@ -57,6 +57,14 @@ public:
     [[nodiscard]] Producer& producer() noexcept { return producer_; }
     [[nodiscard]] Client& client() noexcept { return *client_; }
 
+    /// Task 16 (LeaseWatch): the layout of the lease VIEW row a ScanLeases page carries, computed once from the topic's schema at open (the
+    /// generated LeasesRow layout: null bitmap, one fixed slot per field ever declared, then lease_granted_offset and lease_updated_offset).
+    /// viewRowLen() == 0: the schema was unreadable (a watch refuses to start).
+    [[nodiscard]] uint32_t viewRowLen() const noexcept { return viewRowLen_; }
+    [[nodiscard]] uint32_t viewVersionOffset() const noexcept { return viewVersionOffset_; }   ///< the lease_version slot (an Int64)
+    [[nodiscard]] uint32_t viewGrantedOffset() const noexcept { return viewGrantedOffset_; }   ///< the lease_granted_offset slot (an Int64)
+    [[nodiscard]] uint32_t viewGrantedSlot() const noexcept { return viewGrantedSlot_; }       ///< its null-bitmap bit (a set bit = null)
+
     /// The partition of `key` under the topic's partitioner.
     [[nodiscard]] int32_t partitionOf(std::span<const uint8_t> key) const noexcept;
 
@@ -111,6 +119,7 @@ private:
     uint32_t                     revokeKeyOffset_ = 0;   ///< byte offset of the key column in the row (4 + the field's block offset)
     uint32_t                     revokeKeyWidth_  = 0;
     std::vector<uint8_t>         revokeRow_; ///< Task 15: the revoke template row (T{} encoded once)
+    uint32_t                     viewRowLen_ = 0, viewVersionOffset_ = 0, viewGrantedOffset_ = 0, viewGrantedSlot_ = 0;   ///< Task 16
 
     template <class Issue>
     LeaseResult waitOne_(std::chrono::nanoseconds timeout, Issue&& issue, LeaseTtlInfo* info);

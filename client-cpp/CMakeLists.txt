@@ -515,6 +515,7 @@ if(aeron_FOUND)
         src/lease/LeaseWire.cpp
         src/lease/LeaseGuards.cpp
         src/lease/LeaseSession.cpp
+        src/lease/LeaseWatch.cpp
     )
     target_include_directories(rune_client_api PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -1612,6 +1613,7 @@ if(BUILD_TESTING)
         tests/detail/CoordRouteTest.cpp
         tests/support/FreePortRegressionTest.cpp   # 429 / 370
         tests/support/AtomicFileRegressionTest.cpp   # 44
+        tests/lease/LeaseScanHashTest.cpp   # lease topics Task 16: the shared scan hash
     )
     target_include_directories(rune_pure_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1658,6 +1660,7 @@ if(BUILD_TESTING)
             tests/client/CheckedWritesClientStatsTest.cpp    # checked writes Part 08: getStats over GetStats 91
             tests/client/LeaseTopicTest.cpp                  # lease topics Task 14a: LeaseTopic<T> writes and requests
             tests/lease/LeaseSessionTest.cpp                 # lease topics Task 15: LeaseSession and the produce guard
+            tests/lease/LeaseWatchTest.cpp                   # lease topics Task 16: LeaseWatch (hash-range handoff)
             tests/client/IngressEndpointRoutingTest.cpp
             tests/client/ClientResponseEgressRegressionTest.cpp   # NAT egress Task 7
             tests/producer/ProducerRouteParkTest.cpp

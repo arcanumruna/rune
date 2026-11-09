@@ -293,6 +293,22 @@ void LeaseSessionCore::onWatchedEnd(int32_t topicId, int32_t partition, std::spa
     }
 }
 
+namespace {
+void watchThunk(void* ctx, const LeaseEvent& ev) {
+    LostReason why;
+    switch (ev.kind) {
+    case LeaseEventKind::Revoked:  why = LostReason::WatchedRevoked; break;
+    case LeaseEventKind::Expired:  why = LostReason::WatchedExpired; break;
+    case LeaseEventKind::Vanished: why = LostReason::WatchedVanished; break;
+    default: return;
+    }
+    static_cast<LeaseSessionCore*>(ctx)->onWatchedEnd(ev.topicId, ev.partition, ev.key, ev.version, why);   // filters by topic id, key and version
+}
+}  // namespace
+
+bool LeaseSessionCore::observe(LeaseWatchBase& watch) { return watch.addObserver(&watchThunk, this); }
+bool LeaseSessionCore::unobserve(LeaseWatchBase& watch) noexcept { return watch.removeObserver(this); }
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // The work pass
 // ---------------------------------------------------------------------------------------------------------------------------------

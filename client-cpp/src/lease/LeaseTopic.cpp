@@ -87,8 +87,19 @@ OpResult LeaseTopicCore::write(OpKind kind, std::span<const uint8_t> key, std::s
 void LeaseTopicCore::setRevokeTemplate(std::span<const uint8_t> row, std::span<const uint8_t> descriptorBlob) {
     revokeKeyOffset_ = 0;
     revokeKeyWidth_  = 0;
+    viewRowLen_ = viewVersionOffset_ = viewGrantedOffset_ = viewGrantedSlot_ = 0;
     try {
         const rune::codec::Descriptor d = rune::codec::deserialize(descriptorBlob);
+        // The lease view row (generated LeasesRow): bitmap of ceil((fields + 2) / 8) bytes, one fixed slot per field ever declared
+        // (dropped ones too), then the two Int64 offsets.  The generator pins the first field to lease_version.
+        if (d.fields.size() >= 4 && d.fields[0].name == "lease_version") {
+            uint32_t off = static_cast<uint32_t>((d.fields.size() + 2 + 7) / 8);
+            viewVersionOffset_ = off;
+            for (const auto& f : d.fields) off += rune::codec::fieldWidth(f);
+            viewGrantedOffset_ = off;
+            viewGrantedSlot_   = static_cast<uint32_t>(d.fields.size());
+            viewRowLen_        = off + 16;
+        }
         for (const auto& f : d.fields) {
             if (!f.isKey || f.sinceVersion > version_ || version_ >= f.untilVersion) continue;
             revokeKeyOffset_ = 4u + f.offset;
