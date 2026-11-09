@@ -165,10 +165,12 @@ public:
             }
             if (verdict) { verdicts_[rec.offset] = *verdict; continue; }
             accepted_.push_back(rec);
+            if (const auto seen = latest_.find(rec.id); seen != latest_.end() && seen->second.offset > rec.offset) continue;   // P11-3a: applied after a later offset, delivered but superseded
             latest_[rec.id] = rec;
             if (rec.del) live_.erase(rec.id); else live_[rec.id] = rec;
             if (uniqueView_ || countView_) applyCharacter_(rec);
         }
+        std::sort(accepted_.begin(), accepted_.end(), [](const LogRec& a, const LogRec& b) { return a.offset < b.offset; });   // delivery is in offset order
     }
 
     /// The rejected offsets only; an accepted record has no entry.

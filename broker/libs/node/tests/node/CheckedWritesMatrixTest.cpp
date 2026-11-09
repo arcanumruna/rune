@@ -359,7 +359,7 @@ public:
         CheckedWritesModel model;
         model.declareRule(kObj, tagRule(9).fingerprint(), modelRule(tagRule(9)));
         model.addKeyIndexRule();
-        model.reset(withoutAbortedTxn_(log));
+        model.reset(commitOrder_(withoutAbortedTxn_(log)));
 
         checkIndex(r_, model);                                              // (a)
         checkMarkers(model, log, target);
@@ -370,6 +370,7 @@ public:
         checkViews(r_, model, log, kProj, kCnt);                            // (d)
         checkAcks_(ex, model, log);
         EXPECT_EQ(r_.writeState()->rejected.mismatches(), 0u);              // (f)
+        EXPECT_EQ(r_.writeState()->txn.stats.markerWithoutVote, 0u);
         EXPECT_EQ(r_.stats()->keyIndexSkippedMalformed, 0u);
         checkCounts_(model);                                                // (g)
         checkCompaction(r_, model, log);                                    // (e)
@@ -556,7 +557,8 @@ private:
                 r_.pass();
             }
             ASSERT_FALSE(r_.acked(sent_[0].corr)) << "behind an open transaction the judge is held";
-            r_.marker(kTxnPid, c_.timing == Timing::TxnCommitBehind);
+            if (c_.timing == Timing::TxnCommitBehind) r_.commitTxn(kTxnPid);
+            else r_.marker(kTxnPid, false);
             return;
         }
         case Timing::LeaderLossParked:
@@ -604,6 +606,21 @@ private:
     VerdictRig::RigLog withoutAbortedTxn_(VerdictRig::RigLog log) const {
         if (c_.timing == Timing::TxnAbortBehind)
             std::erase_if(log.data, [&](const VerdictRig::RigLogRec& d) { return d.offset == txnOffset_; });
+        return log;
+    }
+
+    // P11-0: a committed transaction applies at its commit marker, above every record of the cell, not at its own offset.  Where the op left a record of k (a tombstone too), an
+    // ordinary key index supersedes the upsert but still delivers it, and the constrained vote answers TxnConflict: the transaction aborts.
+    VerdictRig::RigLog commitOrder_(VerdictRig::RigLog log) const {
+        if (c_.timing != Timing::TxnCommitBehind) return log;
+        const auto at = std::find_if(log.data.begin(), log.data.end(), [&](const VerdictRig::RigLogRec& d) { return d.offset == txnOffset_; });
+        const VerdictRig::RigLogRec txn = *at;
+        log.data.erase(at);
+        CheckedWritesModel withoutTxn;
+        withoutTxn.declareRule(kObj, tagRule(9).fingerprint(), modelRule(tagRule(9)));
+        withoutTxn.addKeyIndexRule();
+        withoutTxn.reset(log);
+        if (!(c_.entity == Entity::KeyRejectedEarlier && withoutTxn.latestAcceptedByKey().count(kKey) != 0)) log.data.push_back(txn);
         return log;
     }
 
@@ -956,7 +973,8 @@ private:
                 r_.pass();
             }
             if (!refused_()) ASSERT_FALSE(r_.acked(sent_[0].corr)) << "behind an open transaction the judge is held";
-            r_.marker(kTxnPid, c_.timing == Timing::TxnCommitBehind);
+            if (c_.timing == Timing::TxnCommitBehind) r_.commitTxn(kTxnPid);
+            else r_.marker(kTxnPid, false);
             return;
         }
         case Timing::LeaderLossParked:
@@ -1103,7 +1121,8 @@ private:
                 for (std::size_t i = 0; i < a.count; ++i) rejected += model.verdicts().count(a.baseOffset + static_cast<int64_t>(i));
             EXPECT_GT(rejected, 0u);
             if (!faulty_()) {
-                EXPECT_EQ(r_.autoIncStats().idsBurned, rejected) << "every rejected create burned its id";
+                const std::size_t aborted = c_.timing == Timing::TxnAbortBehind ? 2 : 0;   // the aborted transaction's two key-0 creates burn their ids too
+                EXPECT_EQ(r_.autoIncStats().idsBurned, rejected + aborted) << "every rejected or aborted create burned its id";
                 const auto& later = acksByCorr_.at(sent_.back().corr);
                 uint64_t next = 0;
                 for (const auto& [offset, a] : keyZero_)
@@ -1130,6 +1149,7 @@ private:
         EXPECT_EQ(r_.autoIncStats().windowMisses, 0u);
         EXPECT_EQ(r_.autoIncStats().assignedKeyExists, 0u);
         EXPECT_EQ(r_.writeState()->rejected.mismatches(), 0u);
+        EXPECT_EQ(r_.writeState()->txn.stats.markerWithoutVote, 0u);
     }
 
     Cell c_;
@@ -1975,10 +1995,10 @@ TEST(CheckedWritesMatrixCountRegression, CellCountsArePinned) {
     EXPECT_EQ(skipped(cellsFor(Part::P03)), 2u);
     EXPECT_EQ(applicable(cellsFor(Part::P04)), 585u);
     EXPECT_EQ(skipped(cellsFor(Part::P04)), 15u);
-    EXPECT_EQ(applicable(cellsFor(Part::P05)), 560u);
-    EXPECT_EQ(skipped(cellsFor(Part::P05)), 70u);
-    EXPECT_EQ(applicable(cellsFor(Part::P06)), 798u);
-    EXPECT_EQ(skipped(cellsFor(Part::P06)), 84u);
+    EXPECT_EQ(applicable(cellsFor(Part::P05)), 570u);
+    EXPECT_EQ(skipped(cellsFor(Part::P05)), 60u);
+    EXPECT_EQ(applicable(cellsFor(Part::P06)), 810u);
+    EXPECT_EQ(skipped(cellsFor(Part::P06)), 72u);
     EXPECT_EQ(applicable(cellsFor(Part::P07)), 420u);
     EXPECT_EQ(skipped(cellsFor(Part::P07)), 129u);
     EXPECT_EQ(aggCellsFor07().size(), 190u);
