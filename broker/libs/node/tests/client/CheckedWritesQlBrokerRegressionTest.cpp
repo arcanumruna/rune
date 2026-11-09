@@ -256,9 +256,11 @@ TEST(CheckedWritesQlBrokerRegression, RegressorsPathOutcomesThreeNodesRegression
     const std::string ep = clusterEndpoint(c, 1);
     for (std::size_t i = 0; i < statements.size(); ++i) {
         std::string out, err;
-        // Node 1 may apply the previous statement's catalog change a moment after its leader answered it.
-        EXPECT_TRUE(qlEventually(ep, statements[i], out, err)) << "statement " << i << ": " << statements[i] << "\n" << err;
+        EXPECT_EQ(ql(ep, statements[i], &out, &err), 0) << "statement " << i << ": " << statements[i] << "\n" << err;
         EXPECT_TRUE(err.empty()) << "statement " << i << ": " << err;
+        // Node 1 may apply this statement's catalog change a moment after its leader answered it.
+        std::string why;
+        ASSERT_TRUE(c.awaitCatalogDigestsEqual(30s, &why)) << "statement " << i << ": " << why;
     }
     std::string out, err;
     ASSERT_EQ(ql(ep, "show topic user;", &out, &err), 0) << err;
