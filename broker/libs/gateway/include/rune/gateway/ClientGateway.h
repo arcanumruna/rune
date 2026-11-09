@@ -3224,7 +3224,10 @@ private:
     /// published leader (GatewayReplicaView::publishedLeader); no replica
     /// (unreplicated / internal) → true, unchanged.  Cold (subscribe time, and
     /// the demotion sweep on a routed role change — retireReadCommittedMovedAway_).
-    [[nodiscard]] bool readCommittedServableHere_(int32_t topicId, int32_t partition) const noexcept;
+    /// Checked writes: the same holds at ANY isolation for a partition whose
+    /// records need verdicts (GatewayReplicaView::leaderOnlyReads) — the judge
+    /// runs on the leader only, a follower's verdict bound never moves.
+    [[nodiscard]] bool servableHere_(int32_t topicId, int32_t partition, uint8_t isolation) const noexcept;
     /// Task 11 carry (E2 Task 13): a plain read_committed subscription accepted
     /// while this node led the partition, which it no longer leads (demoted:
     /// controlled shutdown, failover, a higher epoch) — no RC state serves it
@@ -3271,7 +3274,8 @@ private:
     }
     /// Moved-away verdict for one plain subscription during a sweep: true when
     /// this node can no longer serve it — its replica was removed (any
-    /// isolation) or, read_committed, it is no longer a published leader.
+    /// isolation) or, read_committed or leader-only reads (checked writes), it
+    /// is no longer a published leader.
     /// M5: also records hadReplica the first time it sees a registered replica.
     [[nodiscard]] bool movedAway_(Subscription& sub) const noexcept;
     int  pumpMarkerQueue_();

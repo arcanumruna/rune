@@ -7301,6 +7301,7 @@ private:
         std::unique_ptr<RcHintCtx>           hint;
         std::unique_ptr<PartitionWriteState> write;   // checked writes: a typed partition's write state (null: untyped)
         int64_t verdictBoundPublished = -2, verdictEndPublished = -2;   // Part 04: what the cleaner was last told (publish on change only)
+        bool    verdictSourcePublished = false;   ///< what the gateway was last told (PartitionReplica::publishVerdictSource)
     };
     // The default read-ahead issuer: an async IORING_OP_FADVISE(WILLNEED) on the
     // segment fd where the worker's io backend is io_uring AND the kernel
@@ -8316,6 +8317,11 @@ private:
     void publishVerdictCleanerBounds_() noexcept {
         for (auto& sl : rcSlots_) {
             if (sl.write && sl.write->growOwed) [[unlikely]] growVerdictIndex_(*sl.write);
+            // Every replica, disk or transient, ready or not: a verdict source stays one (the timeline only grows).
+            if (const bool vs = sl.write && sl.write->constraintSets.size() != 0; vs != sl.verdictSourcePublished) [[unlikely]] {
+                sl.replica->publishVerdictSource(vs);
+                sl.verdictSourcePublished = vs;
+            }
             if (!sl.replica->isDiskBacked() || !sl.rc->ready()) continue;
             int64_t bound = rune::replication::PartitionReplica::kNoCleanerLso, end = std::max<int64_t>(sl.verdictEndPublished, 0);
             if (sl.write && sl.write->constraintSets.size() != 0 && sl.replica->role() == rune::replication::Role::Leader) {

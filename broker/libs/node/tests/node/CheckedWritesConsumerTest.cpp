@@ -217,6 +217,23 @@ TEST(CheckedWritesConsumerRegression, DropWhileUnbuiltClearsTheVerdictHooksRegre
     EXPECT_EQ(s.r.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady);
 }
 
+// Lease Task 18 finding: the gateway serves a partition whose records need verdicts from its leader only (any isolation) and
+// learns that from the owning worker's published bit (PartitionReplica::publishVerdictSource), set once a constraint set is
+// logged - kept by a restarted node that knows the set only from the log.
+// RED: drop the publishVerdictSource call in Worker::publishVerdictCleanerBounds_.
+TEST(CheckedWritesConsumerRegression, VerdictSourceIsPublishedToTheGatewayRegression) {
+    VerdictRig r;
+    r.typed();
+    r.passes(50);
+    EXPECT_FALSE(r.replica->gatewayVerdictSource()) << "a typed topic without a constraint set is served by followers";
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(50);
+    EXPECT_TRUE(r.replica->gatewayVerdictSource());
+    r.restart(/*reinstall=*/false);
+    r.passes(300);
+    EXPECT_TRUE(r.replica->gatewayVerdictSource()) << "known from the log after a restart";
+}
+
 TEST(CheckedWritesConsumer, UntypedTopicPaysOneBranch) {
     VerdictRig r;
     ASSERT_EQ(r.produce({{1, 10, 1}, {2, 20, 9}}), 0);   // never typed: no write state

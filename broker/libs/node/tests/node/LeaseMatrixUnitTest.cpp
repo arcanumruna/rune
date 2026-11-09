@@ -46,7 +46,7 @@ TEST(LeaseMatrixRegression, MatrixCountRegression) {
     EXPECT_EQ(all.applicable, 150u);
     EXPECT_EQ(all.timing, 89u);
     EXPECT_EQ(all.executed, 239u);
-    const Counts impl = countCells(true);   // Mutex* / Elect* are Task 20's: 38 sequential and 10 timing cells wait for it
+    const Counts impl = countCells(true);   // Own* / Elect* are Task 20's: 38 sequential and 10 timing cells wait for it
     EXPECT_EQ(impl.sequential, 15u * 9u);
     EXPECT_EQ(impl.applicable, 112u);
     EXPECT_EQ(impl.na, 135u - 112u);

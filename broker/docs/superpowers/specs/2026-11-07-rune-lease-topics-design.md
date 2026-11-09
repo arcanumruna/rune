@@ -304,7 +304,7 @@ Herald uses no etcd transactions, TimeToLive, Mutex or Election today.
 | DG6 | etcd-cpp's `KeepAlive` reports errors to an `eptr` nobody reads | `onLost` / `onAtRisk` callbacks; the Producer re-registers |
 | DG7 | per-prefix etcd watches → one subscription per partition | the client filters by prefix. The discovery topic is small, so one consumer receiving the whole namespace's registry is cheap; a re-scan on every break replaces etcd's re-init on `ErrCompacted`. |
 | DG8 | etcd's global revision orders every key | the discovery topic has one partition, so its offsets are a total order, as etcd's revision is |
-| DG9 | `Mutex` / `Election` from etcd `concurrency` (not used by Herald today, needed for leadership) | `LeaseMutex` / `LeaseElection` recipes (§12.3) |
+| DG9 | `Mutex` / `Election` from etcd `concurrency` (not used by Herald today, needed for leadership) | `LeaseOwnership` / `LeaseElection` recipes (§12.3) |
 
 ## 4. etcd parity
 
@@ -336,7 +336,7 @@ Herald uses no etcd transactions, TimeToLive, Mutex or Election today.
 | `Get(prefix)` at revision R, then `Watch(prefix, R + 1)`: one MVCC snapshot | paged `ScanLeases` with a per-page `asOfOffset`, then a subscription from the first page's `asOf`, merged by the handoff rule | **Divergence D3** |
 | watch after compaction → `ErrCompacted`; the client re-lists | a subscription resumes on the compacted log; the discovery library re-scans on every break. Tombstones live `delete.retention.ms` (1 h default). | equivalent |
 | **Session**(TTL 60 s default, `Done()` on loss, `Close` revokes) | `LeaseSession` (`ttl` default = the topic's `lease.ttl`; `onLost` ≈ `Done()`; `close()` revokes every key) | same, per key (D1) |
-| **Mutex**: put `pfx/<leaseId>` guarded by `CreateRevision == 0`; the owner is the lowest create revision under `pfx`; `Lock` waits for predecessor deletes; `TryLock`; `IsOwner` | `LeaseMutex`: grant `name/<sessionId>-<campaignNo>` (§12.3); the owner is the lowest `lease_version` under `name/`, read from the recipe's shared `LeaseWatch`; `lock` waits for its predecessor's `Revoked` / `Expired`; `tryLock`; `isOwner` | same within a partition (D2) |
+| **Mutex**: put `pfx/<leaseId>` guarded by `CreateRevision == 0`; the owner is the lowest create revision under `pfx`; `Lock` waits for predecessor deletes; `TryLock`; `IsOwner` | `LeaseOwnership`: grant `name/<sessionId>-<campaignNo>` (§12.3); the owner is the lowest `lease_version` under `name/`, read from the recipe's shared `LeaseWatch`; `lock` waits for its predecessor's `Revoked` / `Expired`; `tryLock`; `isOwner` | same within a partition (D2) |
 | **Election**: `Campaign`, `Proclaim`, `Resign`, `Leader`, `Observe` | `LeaseElection` on the same pattern (§12.3) | same |
 | fencing: the create revision of the owner's key | `lease_version` of the owner's key, strictly increasing per key and per partition | same within a partition (D2) |
 
@@ -349,7 +349,7 @@ Herald uses no etcd transactions, TimeToLive, Mutex or Election today.
   - A holder with many keys keeps them alive together with one `LeaseSession` (batched keepalives).
   - Multi-key leases inside one partition are later work (§18).
 - **D2. Revisions are per partition.** Rune has no cluster-wide order across partitions. A fencing token is compared
-  only with tokens of the same key, which is all fencing needs. Mutex and Election topics have one partition, which
+  only with tokens of the same key, which is all fencing needs. Ownership and Election topics have one partition, which
   gives them etcd's total order.
 - **D3. List-then-watch is paged.** A Rune view is not MVCC: it holds the current state only. The handoff rule
   (§12.4) gives the same "snapshot + every later change, no gap, no duplicate" result as etcd's revision-based watch.
@@ -476,7 +476,7 @@ lease topic they carry the lease op. On every other topic they stay refused, exa
   broker copies the row from the lease view into `Expire` and `Checkpoint`, re-encoded with the latest writer
   version.
 - **The broker re-encodes every `Revoke` (Coordinator's call, R9).** A client revoke carries only the key and
-  `lease_version` that matter (`LeaseSession.close()`, `unlock()` and `resign()` hold nothing else); its other
+  `lease_version` that matter (`LeaseSession.close()`, `release()` and `resign()` hold nothing else); its other
   columns are ignored. The write hook replaces the record with the lease view's row for that key, re-encoded with the
   latest writer version, in the grant's scratch-copy patch (§6.3), and recomputes the CRC32C. The re-encoded record
   carries the row's `lease_ttl_ms` and `lease_remaining_ms` (amended 2026-11-08), so it matches the row exactly.
@@ -1058,7 +1058,7 @@ graces.grant(gen::DeleteGrace{.nsId = ns}, LeaseOptions{.ttl = 7 * 24h, .holder 
 ```
 
 - **New `OpKind`s:** `OpenLeaseTopic`, `LeaseGrant`, `LeaseUpdate`, `LeaseRevoke`, `LeaseKeepAlive` (one completion
-  per entry, §8.1), `LeaseTimeToLive`, `ScanLeases`, `LeaseCampaign` (`LeaseElection::campaign` / `LeaseMutex::lock`
+  per entry, §8.1), `LeaseTimeToLive`, `ScanLeases`, `LeaseCampaign` (`LeaseElection::campaign` / `LeaseOwnership::claim`
   reaching ownership), `LeaseWatchReady` (`startFromNow`'s scan finished and the watch is live).
   - `value` is the version for `LeaseGrant`, and the `asOfOffset` for `ScanLeases` and `LeaseWatchReady`.
   - `aux` is `ttlMs`.
@@ -1227,9 +1227,11 @@ hold one session per client, for example one per tenant client for case claims (
     `GuardRelease` with the idle strategy until accepted or the client is closed. (L7) Lease control requests arriving
     at a full control table (256) complete with `Throttled`; the session reschedules them soon.
 
-### 12.3 `LeaseMutex` and `LeaseElection` (etcd `concurrency.Mutex` / `Election`)
+### 12.3 `LeaseOwnership` and `LeaseElection` (etcd `concurrency.Mutex` / `Election`)
 
-These are client recipes over a one-partition lease topic keyed by `path string(N ≤ 128)`. Every operation is async
+These are client recipes over a one-partition lease topic keyed by `path string(N ≤ 128)`. `LeaseOwnership` is etcd's
+`Mutex` renamed (owner's ruling, 2026-11-09): it is cluster-wide ownership of a name by lease records, never a thread
+lock, and takes no lock in the client or the broker. Every operation is async
 (§12.1), and the recipes run inside the session's `doWork`.
 - **Shared watch (Coordinator's call, R7).** Recipes take `(session, watch, name)`. Every recipe on one topic in a
   process shares one `LeaseWatch` started with `startFromNow`, so a Herald gateway with about 2 000 elections runs one
@@ -1240,22 +1242,22 @@ These are client recipes over a one-partition lease topic keyed by `path string(
   - A recipe acts only after the watch's `LeaseWatchReady`.
 - **The key (Coordinator's call).** `name/<sessionId>-<campaignNo>`.
   - `sessionId` is a 64-bit random id that the `LeaseSession` draws at construction, as 16 hex digits.
-  - `campaignNo` is a per-session counter of 8 hex digits, incremented at every `lock` / `campaign`.
+  - `campaignNo` is a per-session counter of 8 hex digits, incremented at every `claim` / `campaign`.
   - So a re-campaign after a resign or a lost lease always grants a new key (Herald F1).
   - `name` is at most 128 − 26 = 102 bytes.
-- **`LeaseMutex(session, watch, name)`.**
-  - **`lock()`** grants its key (always granted: the key is new). After the grant's ack and the watch passing that
+- **`LeaseOwnership(session, watch, name)`.**
+  - **`claim()`** grants its key (always granted: the key is new). After the grant's ack and the watch passing that
     offset, the lock is held if its version is the lowest under `name/`. Otherwise it waits for the `Revoked` /
     `Expired` of its immediate predecessor, then re-checks. This is etcd's `waitDeletes`. `OpKind::LeaseCampaign`
     completes on ownership.
   - A grant answered `VerdictUnknown` (§6.3): the recipe reads its key. If it is live with
     `lease_holder == sessionId`, it adopts that version. Otherwise it grants with the next `campaignNo`.
-  - **`tryLock()`** grants, checks, and revokes its own key if it is not the lowest (`ErrLocked`).
-  - **`unlock()`** is a fenced revoke.
+  - **`tryClaim()`** grants, checks, and revokes its own key if it is not the lowest (`ErrClaimed`).
+  - **`release()`** is a fenced revoke.
   - **`isOwner()`** compares its version with the lowest.
   - **`token()`** returns its `lease_version`.
 - **`LeaseElection(session, watch, name)`.**
-  - **`campaign(value)`** is a mutex `lock` with the value as the row.
+  - **`campaign(value)`** is a `claim` with the value as the row.
   - **`proclaim(value)`** is a fenced `Put`+`update`.
   - **`resign()`** is a revoke.
   - **`leader()`** returns the lowest version under `name/`, from the watch.
@@ -1534,7 +1536,7 @@ All tests follow `docs/testing.md`:
   - Several prefixes, nested and disjoint.
   - Handoff-buffer overflow, then re-subscribe from the cursor, with nothing lost or duplicated.
 - **QL, DDL and catalog.** Every form and setting, the refusals, and replay creating both objects.
-- **`LeaseSession`, `LeaseMutex`, `LeaseElection` with a stub transport.**
+- **`LeaseSession`, `LeaseOwnership`, `LeaseElection` with a stub transport.**
   - Cadence `ttl/3`, and batching per partition.
   - `onLost` on each trigger; `onAtRisk(Entered)` at `t + ttl/2` for each cause (error, timeout, missing reply,
     disconnect, park), then `Cleared` on a late `Ok`; `maxDelay` validation.
@@ -1543,7 +1545,7 @@ All tests follow `docs/testing.md`:
   - One session over two topics and 8 partitions, batching per `(topic, partition)` (R7).
   - Recipes sharing one `LeaseWatch`; `name/<sessionId>-<campaignNo>` keys; a `VerdictUnknown` grant adopted or
     re-campaigned.
-  - Mutex ordering by version, `waitDeletes` on the predecessor only, `tryLock` cleaning up its key.
+  - Ownership ordering by version, `waitDeletes` on the predecessor only, `tryClaim` cleaning up its key.
   - Election `observe` reporting each leader change once.
 
 ### 16.2 Broker integration (real broker, 1-node and 3-node)
@@ -1626,6 +1628,15 @@ intervals and clock advances. After every step it checks:
 - **I8 (expiry never pauses).** Under `ReadOnly` and `RejectAll`, I7 still holds.
 
 Runs: `--repeat until-fail:20`, and once under `-j` load.
+
+**As built (Task 18).** Two legs on one model, because the injected lease clock works on a single node only: Leg S (one node,
+injected clock, exact invariants, 20 seeds x 3 000 steps) and Leg T (3 nodes, real clock, rho = 1 % plus 2 ms, 20 seeds x 200
+steps, at most 2 leader kills and restarts per seed). Skipped step kinds: partitions, follower lag, compaction. I5's checkpoint
+bound is read from the lease view row (client subscriptions never see Checkpoint records); I6 is not checked directly (no
+counter); end-record append time is the tap's receive time. Mutations M1, M3, M4, M13 were not red in 20 seeds on the legs that
+could see them; M16 has no pause code. The stress found a silent stall, fixed: a subscription to records needing verdicts
+(any lease topic, any verdict source) is served by the partition leader only, at any isolation, and is moved off a demoted
+leader with NotLeader (a follower keeps no verdict state). See the plan's Task 18 note.
 
 ### 16.5 Mutation checks (each turns a test red)
 
@@ -1773,7 +1784,7 @@ create view 'herald-sys/herald.idslots_by_slot' key (slot, epoch) as select high
 - **The slot and the lock (Herald's formula, B28; Coordinator's call, R10).** `slot = nsId << 16 | roleId`, with
   `roleId = role << 8 | partition` (up to 256 partitions per role). The `role → u8` table lives in Herald 02. Rune
   never reuses an `nsId`. Each Herald process `grant`s the
-  slots rendezvous hashing assigns it. This is a single-slot lock (etcd `TryLock`, §12.3), where `KeyExists` means
+  slots rendezvous hashing assigns it. This is a single-slot claim (etcd `TryLock`, §12.3), where `KeyExists` means
   someone holds it.
 - **Fencing writes.** The worker writes with `version` as its fencing token.
 - **Handing a slot back.** On a membership change it hands the slot back with a fenced revoke, so the next owner
@@ -1886,7 +1897,7 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 
 ### Phase 2: recipes, limits, operations
 
-1. `LeaseMutex` and `LeaseElection`, with unit tests and the election e2e.
+1. `LeaseOwnership` and `LeaseElection`, with unit tests and the election e2e.
 2. `max-leases`, the view-memory rule, the suspension matrix.
 3. Metrics, `show lease(s)`, `revoke lease`.
 4. Latency gates (§16.6).
@@ -1910,7 +1921,7 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 - point read, `ScanLeases`, watch (`startFromNow`);
 - broker `Expire`, broker `Checkpoint`, keepalive-triggered `Checkpoint(0)`;
 - alter of the TTL bounds and checkpoint keys, drop topic;
-- Mutex `lock` / `tryLock` / `unlock`;
+- Ownership `claim` / `tryClaim` / `release`;
 - Election `campaign` / `proclaim` / `resign` / `observe`;
 - discovery `registerEndpoint` / load report / `stop`, and Consumer `run`.
 
@@ -1978,7 +1989,7 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 | non-lease topic × any | byte-identical behaviour, unchanged bench |
 | discovery × restart within TTL | the new incarnation visible at once; the old one's end ignored |
 | discovery × current incarnation ends, an older one still live | the cache falls back to the older one |
-| Mutex × holder expires | the next waiter by version owns the lock; its token is larger |
+| Ownership × holder expires | the next waiter by version becomes the owner; its token is larger |
 | any op × another namespace | answers as missing |
 
 ## 22. Review focus

@@ -18,7 +18,7 @@ enum class Op : uint8_t {
     Grant, Update, Revoke, KeepAlive1, KeepAliveBatch, TimeToLive, PointRead, ScanLeases, WatchStart,   // the 9 client-surface ops
     BrokerExpire, BrokerCheckpoint, ClearCheckpoint0,                                                   // broker records
     AlterBounds, AlterCheckpoint, DropTopic,                                                           // DDL
-    MutexLock, MutexTryLock, MutexUnlock,                                                              // Task 20
+    OwnClaim, OwnTryClaim, OwnRelease,                                                              // Task 20
     ElectCampaign, ElectProclaim, ElectResign, ElectObserve,                                           // Task 20
     kCount
 };
@@ -41,7 +41,7 @@ inline constexpr std::size_t kOps = std::size_t(Op::kCount), kEntities = std::si
 [[nodiscard]] constexpr const char* name(Op o) noexcept {
     constexpr const char* n[] = {"Grant", "Update", "Revoke", "KeepAlive1", "KeepAliveBatch", "TimeToLive", "PointRead", "ScanLeases",
                                  "WatchStart", "BrokerExpire", "BrokerCheckpoint", "ClearCheckpoint0", "AlterBounds", "AlterCheckpoint",
-                                 "DropTopic", "MutexLock", "MutexTryLock", "MutexUnlock", "ElectCampaign", "ElectProclaim", "ElectResign",
+                                 "DropTopic", "OwnClaim", "OwnTryClaim", "OwnRelease", "ElectCampaign", "ElectProclaim", "ElectResign",
                                  "ElectObserve"};
     return n[std::size_t(o)];
 }
@@ -66,7 +66,7 @@ inline constexpr std::size_t kOps = std::size_t(Op::kCount), kEntities = std::si
 [[nodiscard]] constexpr bool carriesVersion(Op o) noexcept {
     switch (o) {
     case Op::Update: case Op::Revoke: case Op::KeepAlive1: case Op::KeepAliveBatch: case Op::BrokerExpire: case Op::BrokerCheckpoint:
-    case Op::ClearCheckpoint0: case Op::MutexUnlock: case Op::ElectProclaim: case Op::ElectResign:
+    case Op::ClearCheckpoint0: case Op::OwnRelease: case Op::ElectProclaim: case Op::ElectResign:
         return true;
     default: return false;
     }
@@ -77,8 +77,8 @@ inline constexpr std::size_t kOps = std::size_t(Op::kCount), kEntities = std::si
     return o == Op::KeepAlive1 || o == Op::KeepAliveBatch || o == Op::TimeToLive || o == Op::ScanLeases || o == Op::WatchStart ||
            o == Op::AlterBounds || o == Op::AlterCheckpoint;   // the lease.* keys of a plain topic are refused
 }
-/// False for the 7 Mutex / Elect ops: Task 20 builds them and flips this.
-[[nodiscard]] constexpr bool implemented(Op o) noexcept { return std::size_t(o) < std::size_t(Op::MutexLock); }
+/// False for the 7 Own / Elect ops: Task 20 builds them and flips this.
+[[nodiscard]] constexpr bool implemented(Op o) noexcept { return std::size_t(o) < std::size_t(Op::OwnClaim); }
 
 /// True when the (op, entity) cell does not exist (the plan's 48 n/a cells).
 [[nodiscard]] constexpr bool naRule(Op o, Entity e) noexcept {
@@ -126,7 +126,7 @@ inline constexpr std::array<Timing, 7> kBrokerCheckpointT{Timing::LeaderChangeUn
 inline constexpr std::array<Timing, 3> kClearT{Timing::LeaderChangeUncommitted, Timing::LeaderChangeCommittedNotFolded, Timing::LeaderChangeFolded};
 inline constexpr std::array<Timing, 1> kAlterT{Timing::AlterMidLife};
 inline constexpr std::array<Timing, 1> kDropT{Timing::DropWithParked};
-inline constexpr std::array<Timing, 2> kMutexLockT{Timing::LeaderChangeFolded, Timing::KnownOldDuplicate};
+inline constexpr std::array<Timing, 2> kOwnClaimT{Timing::LeaderChangeFolded, Timing::KnownOldDuplicate};
 inline constexpr std::array<Timing, 1> kBackToBackT{Timing::BackToBack};
 inline constexpr std::array<Timing, 1> kAfterFoldT{Timing::AroundExpireAfterFold};
 inline constexpr std::array<Timing, 3> kCampaignT{Timing::Zombie, Timing::KnownOldDuplicate, Timing::AtRiskPendingUnsent};
@@ -149,9 +149,9 @@ inline constexpr std::array<Timing, 1> kFoldedT{Timing::LeaderChangeFolded};
     case Op::ClearCheckpoint0: return kClearT;
     case Op::AlterBounds: case Op::AlterCheckpoint: return kAlterT;
     case Op::DropTopic: return kDropT;
-    case Op::MutexLock: return kMutexLockT;
-    case Op::MutexTryLock: return kBackToBackT;
-    case Op::MutexUnlock: return kAfterFoldT;
+    case Op::OwnClaim: return kOwnClaimT;
+    case Op::OwnTryClaim: return kBackToBackT;
+    case Op::OwnRelease: return kAfterFoldT;
     case Op::ElectCampaign: return kCampaignT;
     case Op::ElectProclaim: return kAfterFoldT;
     case Op::ElectResign: return kBackToBackT;

@@ -2012,6 +2012,16 @@ if(BUILD_TESTING)
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_checked_writes_stress_tests PROPERTIES TIMEOUT 1800 LABELS stress)
 
+        # Lease topics Task 18 (spec 16.4): the seeded model-checked lease stress.  Leg S: one real broker with the injected lease clock;
+        # leg T: three real brokers on the real clock.  One ctest case per seed (gtest discovery); labelled stress.
+        add_executable(rune_lease_stress_tests tests/integration/LeaseStressTest.cpp)
+        add_dependencies(rune_lease_stress_tests generate_claim_schema_headers)
+        target_include_directories(rune_lease_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/tests/support ${CMAKE_BINARY_DIR}/rune-client/claim-gen)
+        target_link_libraries(rune_lease_stress_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
+                              rune_client_view rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_lease_stress_tests PROPERTIES TIMEOUT 1800 LABELS stress)
+
         # Namespaces Task 11: the REAL client namespace API and the REAL `rune namespace` / `rune ql` CLI against ONE
         # real authenticating BrokerNode.
         add_executable(rune_namespace_client_tests tests/client/NamespaceClientTest.cpp)

@@ -1215,3 +1215,87 @@ TEST(ClientFailoverBrokerRegression, ShardClientWithOfferedCryptoSurvivesAStallP
 TEST(ClientFailoverBrokerRegression, SubscribeRedirectedToTheLeaderDeliversUnderRequiredCryptoRegression) {
     tlsSubscribeAfterRedirect("fo_tls_subr", /*require=*/true);
 }
+
+// Lease Task 18 (coverage): a subscription homed on a NON-seed partition leader's node session, that leader
+// crashed (and, in the second leg, restarted at once, three times over).  Required: the subscription keeps
+// delivering the records produced on the new leader after the crash, or ends explicitly — never active and
+// silent.  (Without a restart it waits out the client's responseTimeoutNs before it moves.)
+namespace {
+void homedLeaderCrash(const char* tag, bool restart) {
+    ThreeNodes c = ThreeNodes::start(tag);
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    auto admin = connectClient(c, c.runningNodes().front());
+    rc::TopicOptions to;
+    to.replicationFactor = 3;
+    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, kDisk, to, {}, 60s);
+    ASSERT_EQ(def.errorCode, 0) << def.detail;
+    admin->close();
+    const rc::TopicSpec spec{"events", def.topicId, kPartitions};
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, def.topicId, leaders, 30s));
+    const int32_t victim = leaders[0];   // leads p0; NOT the subscriber's seed
+    int32_t seed = -1;
+    for (int id : c.runningNodes()) if (id != victim) { seed = id; break; }
+
+    auto scfg = clientConfigFor(c, seed);
+    scfg.topics = {spec};
+    auto sub = connectClient(c, scfg);
+    const rc::TopicHandle sth = sub->topic("events");
+    SubLedger led;
+    rc::SubscribeOptions o; o.from = rc::From::earliest();
+    auto s0 = sub->subscribe(sth, 0, o, led.handler(0));
+
+    auto pcfg0 = clientConfigFor(c, seed);
+    pcfg0.topics = {spec};
+    auto prodClient = connectClient(c, pcfg0);
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.produceTimeoutMs = 30'000; pcfg.deliveryTimeoutMs = 40'000;
+    auto producer = prodClient->producer(pcfg);
+    const rc::TopicHandle pth = prodClient->topic("events");
+    std::atomic<bool> stop{false};
+    std::atomic<int>  sent{0};
+    std::thread pump([&] {
+        for (int seq = 0; !stop.load(); ++seq) {
+            uint64_t k = static_cast<uint64_t>(seq) * 16;
+            while (rc::Key(k).partition(kPartitions) != 0) ++k;
+            const std::string v = valueOf(seq);
+            producer.send(pth, rc::Key(k), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()));
+            sent.store(seq + 1);
+            std::this_thread::sleep_for(10ms);
+        }
+    });
+    struct JoinOnExit {
+        std::atomic<bool>& stop; std::thread& t;
+        ~JoinOnExit() { stop.store(true); if (t.joinable()) t.join(); }
+    } joinPump{stop, pump};
+    for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && led.count(0) < 5;) std::this_thread::sleep_for(10ms);
+    ASSERT_GE(led.count(0), 5u) << "precondition: p0 delivers through its leader's node session";
+
+    for (int cycle = 0; cycle < (restart ? 3 : 1); ++cycle) {
+        int32_t v = victim;
+        if (cycle > 0) {   // the partition's current leader, unless it is the seed (then p0's leader stays put this cycle)
+            ASSERT_TRUE(awaitLeaders(c, def.topicId, leaders, 30s));
+            v = leaders[0] == seed ? -1 : leaders[0];
+            if (v < 0) for (int id : c.runningNodes()) if (id != seed) { v = id; break; }
+        }
+        c.crash(v);
+        const auto tCrash = Clock::now();
+        if (restart) c.startNode(v);
+        const int target = sent.load() + 20;   // a seq produced well after the crash
+        bool delivered = false, ended = false;
+        for (const auto deadline = tCrash + 30s; Clock::now() < deadline && !delivered && !ended; std::this_thread::sleep_for(20ms)) {
+            delivered = led.has(0, target);
+            ended = !delivered && !s0.active();
+        }
+        std::fprintf(stderr, "[homed-crash restart=%d cycle=%d victim=%d] delivered=%d ended=%d after %lld ms active=%d count=%zu\n", restart, cycle, v,
+                     delivered, ended, static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - tCrash).count()),
+                     s0.active(), led.count(0));
+        ASSERT_TRUE(delivered || ended) << "SILENT STALL: the homed subscription stayed active on a crashed leader (cycle " << cycle << ")";
+        ASSERT_TRUE(delivered) << "the homed subscription moves to the new leader (cycle " << cycle << ")";
+    }
+    EXPECT_EQ(led.dupes, 0);
+}
+}  // namespace
+TEST(ClientFailoverBrokerRegression, HomedLeaderCrashedSubscriptionKeepsDeliveringRegression) { homedLeaderCrash("fo_hlc", false); }
+TEST(ClientFailoverBrokerRegression, HomedLeaderCrashedAndRestartedSubscriptionKeepsDeliveringRegression) { homedLeaderCrash("fo_hlr", true); }
+

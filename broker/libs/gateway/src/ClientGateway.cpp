@@ -3686,11 +3686,13 @@ void ClientGateway::forgetDroppedTopic(int32_t topicId, int32_t partitions,
     }
 }
 
-bool ClientGateway::readCommittedServableHere_(int32_t topicId, int32_t partition) const noexcept
+bool ClientGateway::servableHere_(int32_t topicId, int32_t partition, uint8_t isolation) const noexcept
 {
     if (replicaRegistry_ == nullptr || topicId < 0) return true;   // unreplicated / internal: unchanged
     const GatewayReplicaView v{replicaRegistry_->lookupHandle(topicId, partition)};
-    return !v || v.publishedLeader();
+    if (!v) return true;
+    const bool rc = isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted);
+    return (!rc && !v.leaderOnlyReads()) || v.publishedLeader();
 }
 
 void ClientGateway::scanMovedAwaySlice_()
@@ -3756,7 +3758,8 @@ bool ClientGateway::movedAway_(Subscription& sub) const noexcept
     // here, the first time a sweep sees the registered replica — so that
     // replica's later removal retires it instead of leaving it silent.
     sub.hadReplica = true;
-    return sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
+    // Checked writes: records needing verdicts are deliverable by the leader only, at any isolation (servableHere_).
+    return (sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) || v.leaderOnlyReads()) &&
            !v.publishedLeader();
 }
 
@@ -5439,10 +5442,11 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // BEFORE any subscription is registered — the one registration point both
     // worker modes go through (shard mode forwards the registered sub to the
     // owning worker below).  Also covers a group carrier switching to it (5a).
-    if (msg.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
-        !readCommittedServableHere_(msg.topicId, partition)) [[unlikely]] {
-        spdlog::debug("ClientGateway: read_committed Subscribe to topicId={} partition={} on a follower — "
-                      "NotLeader (retriable)", msg.topicId, partition);
+    // Checked writes: a partition whose records need verdicts (a lease topic, a verdict source) is served by its
+    // leader only, at any isolation - a follower holds no verdict state, so its verdict bound never moves.
+    if (!servableHere_(msg.topicId, partition, msg.isolation)) [[unlikely]] {
+        spdlog::debug("ClientGateway: Subscribe to topicId={} partition={} (isolation {}) on a follower — "
+                      "NotLeader (retriable)", msg.topicId, partition, msg.isolation);
         sendSubRedirect(std::string{}, msg.correlationId);
         return;
     }
@@ -11365,9 +11369,8 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
         return -1;
     }
     // E2 Task 11 ruling: read_committed only where it is served (a leader).
-    if (isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
-        !readCommittedServableHere_(topicId, partition)) [[unlikely]] {
-        spdlog::debug("ClientGateway::addGroupSubscription: read_committed on a follower topicId={} "
+    if (!servableHere_(topicId, partition, isolation)) [[unlikely]] {   // read_committed, or records needing verdicts
+        spdlog::debug("ClientGateway::addGroupSubscription: leader-only read on a follower topicId={} "
                       "partition={} — refused (NotLeader)", topicId, partition);
         return -1;
     }

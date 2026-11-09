@@ -17,7 +17,7 @@ by the partition leader under the view-read lease (no log record), ended by a fe
 `Expire` record that replicates, folds into every view and is a compaction tombstone. The grant's offset is the lease
 version and fencing token. Long TTLs survive leader changes and whole-cluster restarts through always-persisted
 `Checkpoint` records. Expiry never pauses, in any namespace state, and is never early. On top of that: the async C++
-client (`LeaseTopic<T>`, `LeaseSession`, `LeaseWatch`), the `LeaseMutex` / `LeaseElection` recipes, limits, metrics
+client (`LeaseTopic<T>`, `LeaseSession`, `LeaseWatch`), the `LeaseOwnership` / `LeaseElection` recipes, limits, metrics
 and QL. Non-lease topics pay nothing: byte-identical behaviour and an unchanged ABAB bench.
 
 **Architecture:**
@@ -48,7 +48,7 @@ and QL. Non-lease topics pay nothing: byte-identical behaviour and an unchanged 
 - **Client (`client-cpp/`).** Async-first (F8c `Completion` pattern): `LeaseTopic<T>`, a lease-only 128-byte
   `SEND_RECORD` form, `Record::leaseOp()`, `LeaseSession<Capacity, OnLost, OnAtRisk>` driven by `doWork(nowNs)`, the
   producer guard (R5) enforced on the client agent thread, `LeaseWatch` with the hash-range handoff, then
-  `LeaseMutex` / `LeaseElection`.
+  `LeaseOwnership` / `LeaseElection`.
 
 **Tech Stack:** C++23, GoogleTest (`TEST_P` for the matrix), Google Benchmark, CMake/Ninja, real Aeron UDP for the
 in-process `BrokerNode` / `TestCluster` tests, docker compose (3 nodes) on the shared Linux test VM for e2e.
@@ -112,7 +112,7 @@ and NAT egress merged. What exists today (line numbers are hints; use the quoted
 | Phase | Delivers (stable after the phase's checkpoint) | Consumed by |
 |---|---|---|
 | 1 | QL `lease topic … with (lease.*)`; wire templates and codes; broker lease semantics (grant, update, revoke, keepalive, TimeToLive, Expire, Checkpoint, ScanLeases, lease view reads); client `rune/client/lease/LeaseTopic.h` (`Client::openLeaseTopic<T>`, `grant`, `update`, `revoke`, `keepAliveOnce`, `timeToLive`, `get`, `scan`, `*AndWait`), `LeaseOptions`, `LeaseResult`, `Record::leaseOp()`, `rune/client/lease/LeaseSession.h` (`LeaseSession<Capacity, OnLost, OnAtRisk>`: `add`, `remove`, `revoke`, `update`, `observe`, `close`, `isClosed`, `doWork`), `ProducerConfig::guard`, `ErrorCode::LeaseAtRisk` (client-local), `rune/client/lease/LeaseWatch.h` (`LeaseWatch<T>`, `LeaseWatchBase`, `startFromNow`, `OpKind::LeaseWatchReady`) | `herald/docs/superpowers/plans/2026-11-07-herald-02-runtime-and-rune-integration.md` (Phase 1 / Task 5 RuneAgent's `RealRune` port, Task 10 `idslots` minting, Task 16 worker slots; Phase 2 / Task 21 tenant election keys and leader map, Task 23 invites); `…-herald-04-safety-reporting-evidence-sanctions.md` (Phase 2 / Task 21: `sanction-expiry` / `strike-expiry` one-shot checkpointed leases); `…-herald-05-moderation-console-appeals-transparency.md` (Phase A / Task 6 case claims; Phase B / Tasks 16–17 appeal tokens, Task 20 break-glass grants); `…-herald-01-core-domain-and-tenancy.md` (`onAtRisk` at Tasks 29 and 40); `…-herald-00-conformance-suite.md` (the `InProcRune` double's lease conformance against this behaviour: herald-02 Phase 1 / Tasks 4–5, used by 00's `LEASE` gate) |
-| 2 | `rune/client/lease/LeaseMutex.h`, `LeaseElection.h` (`campaign`, `proclaim`, `resign`, `leader`, `observe`, `isLeader`, `token`, `OpKind::LeaseCampaign`); namespace limit `max-leases`; the suspension matrix; metrics; `show lease(s)`, `revoke lease`; latency gates; docs | herald-02 (Phase 2 / Task 21 tenant lease `tenant/<nsId>`, Phase 1 / Task 15 singletons `singleton/<role>`, Phase 1 / Task 12 `herald-provisioner` setting `max-leases`); herald-01 (`LeaseElection` at Tasks 29 and 40) |
+| 2 | `rune/client/lease/LeaseOwnership.h`, `LeaseElection.h` (`campaign`, `proclaim`, `resign`, `leader`, `observe`, `isLeader`, `token`, `OpKind::LeaseCampaign`); namespace limit `max-leases`; the suspension matrix; metrics; `show lease(s)`, `revoke lease`; latency gates; docs | herald-02 (Phase 2 / Task 21 tenant lease `tenant/<nsId>`, Phase 1 / Task 15 singletons `singleton/<role>`, Phase 1 / Task 12 `herald-provisioner` setting `max-leases`); herald-01 (`LeaseElection` at Tasks 29 and 40) |
 
 ## Execution context
 
@@ -385,7 +385,7 @@ view is unchanged (or changed exactly as `expect` says).
 
 - **Ops (22):** `Grant`, `Update`, `Revoke`, `KeepAlive1`, `KeepAliveBatch`, `TimeToLive`, `PointRead`,
   `ScanLeases`, `WatchStart`, `BrokerExpire`, `BrokerCheckpoint`, `ClearCheckpoint0`, `AlterBounds`,
-  `AlterCheckpoint`, `DropTopic`, `MutexLock`, `MutexTryLock`, `MutexUnlock`, `ElectCampaign`, `ElectProclaim`,
+  `AlterCheckpoint`, `DropTopic`, `OwnClaim`, `OwnTryClaim`, `OwnRelease`, `ElectCampaign`, `ElectProclaim`,
   `ElectResign`, `ElectObserve`.
 - **Entities (9):** `SameKeyVer` (L itself), `StaleVer` (k with v′ ≠ v), `OtherKeySamePart`, `OtherPart`,
   `OtherLeaseTopic`, `NonLeaseSameWorker`, `UserView` (U), `OtherNs` (same names in another namespace),
@@ -394,7 +394,7 @@ view is unchanged (or changed exactly as `expect` says).
   - `StaleVer` applies only to ops that carry a version: `Update`, `Revoke`, `KeepAlive1`, `KeepAliveBatch`,
     `BrokerExpire`, `BrokerCheckpoint`, `ClearCheckpoint0` (broker records injected stale through the emitter test
     seam: expected defensive `StaleExpiry` / `StaleCheckpoint` and `stale_broker` + 1, which is the only place the
-    counter may move), `MutexUnlock`, `ElectProclaim`, `ElectResign` → 10 applicable,
+    counter may move), `OwnRelease`, `ElectProclaim`, `ElectResign` → 10 applicable,
     **12 n/a**.
   - `UserView` applies to `Grant`, `Update`, `Revoke`, `KeepAlive1`, `KeepAliveBatch`, `BrokerExpire`,
     `BrokerCheckpoint`, `ClearCheckpoint0`, `DropTopic` → **13 n/a**.
@@ -426,7 +426,7 @@ view is unchanged (or changed exactly as `expect` says).
   | BrokerCheckpoint | LeaderChange ×3, RestartOne, RestartAll, CompactionMid, AlterMidLife | 7 |
   | ClearCheckpoint0 | LeaderChange ×3 | 3 |
   | AlterBounds, AlterCheckpoint, DropTopic | AlterMidLife, AlterMidLife, DropWithParked | 3 |
-  | MutexLock, MutexTryLock, MutexUnlock | {LeaderChange.Folded, KnownOldDuplicate}, {BackToBack}, {AroundExpire.AfterFold} | 4 |
+  | OwnClaim, OwnTryClaim, OwnRelease | {LeaderChange.Folded, KnownOldDuplicate}, {BackToBack}, {AroundExpire.AfterFold} | 4 |
   | ElectCampaign, ElectProclaim, ElectResign, ElectObserve | {Zombie, KnownOldDuplicate, AtRiskPendingUnsent}, {AroundExpire.AfterFold}, {BackToBack}, {LeaderChange.Folded} | 6 |
 
 - **Pinned counts** (`LeaseMatrixRegression.MatrixCountRegression`): 22 × 9 = **198 sequential cells**, **48 n/a**,
@@ -492,7 +492,7 @@ New:
   - `LeaseKeepAliveServer.h` / `src/lease/LeaseKeepAliveServer.cpp`: the §8.1 table, TimeToLive, ScanLeases pages;
   - `LeaseHash.h`: `scanHash(key, topicId) = wyhash64(key, seed = topicId)`.
 - `client-cpp/include/rune/client/lease/`: `LeaseOptions.h`, `LeaseResult.h`, `LeaseTopic.h`, `LeaseSession.h`,
-  `LeaseWatch.h`, `LeaseMutex.h`, `LeaseElection.h`; `client-cpp/include/rune/client/detail/BootClock.h`;
+  `LeaseWatch.h`, `LeaseOwnership.h`, `LeaseElection.h`; `client-cpp/include/rune/client/detail/BootClock.h`;
   `client-cpp/src/lease/LeaseTopic.cpp`, `LeaseWire.cpp`.
 - Tests (broker): `broker/libs/node/tests/node/Lease{WriteHook,Judge,Predicate,Cleaner,Wheel,Emitter,KeepAlive,
   Checkpoint,Promotion,Scan,Ddl}Test.cpp`; `broker/libs/node/tests/integration/Lease{Matrix,Integration,Race,Trio,
@@ -1209,15 +1209,48 @@ acknowledged deadline per leader on simulated real time with drift ρ), `LeaseSt
 `CheckedWritesStressDriver.h`'s 3-node in-process shape: the real worker, replication and fold code), test
 `broker/libs/node/tests/integration/LeaseStressTest.cpp`.
 
-- [ ] `LeaseStressRegression.SeededModelRegression`, seeds 1..20 (printed on failure), 3 000 steps per seed. Steps
+- [x] `LeaseStressRegression.SingleNodeSeededRegression` / `TrioSeededRegression` (see As built), seeds 1..20 (printed on failure), 3 000 steps per seed. Steps
   drawn from the matrix enums: grants, keepalive gaps, updates, revokes, leader kills, restarts, partitions,
   follower lag, compaction, checkpoint intervals, suspend/resume, lease-clock advances (to the next deadline, never
   wall time). After **every** step: I1–I8 of spec §16.4 (I3 against the model's acknowledged deadlines with ρ = 1 %;
   I4 also `stale_broker == 0`; I5 recompute from the log after every rebuild; I6 no ack by a node that was not the
   serving leader; I7/I8 liveness bounds).
-- [ ] Mutations: M1, M3, M4, M13, M16 each make a seed fail within 3 000 steps (record which).
+- [~] Mutations: M1, M3, M4, M13, M16 each make a seed fail within 3 000 steps (record which). Run; none went red (see As built).
 - [ ] Run `ctest --test-dir build -R LeaseStress --output-on-failure --repeat until-fail:20`, and once under `-j8`
   load. Commit and push.
+
+**As built (Task 18).**
+- **Scale call.** Two legs on one model (`LeaseModel.h`, driver `LeaseStressDriver.h`, test `LeaseStressTest.cpp`, executable
+  `rune_lease_stress_tests`, label `stress`), because the injected lease clock works on a single node only:
+  - Leg S, `LeaseStressRegression.SingleNodeSeededRegression/<seed>`, seeds 1..20, 3 000 steps, `LeaseBrokerRig`, injected clock,
+    exact invariants (rho = 0) plus one duty tick of slack. Steps: grant, keepalive, keepalive gap, update, revoke, checkpoint
+    interval change (AlterTopicConfig), namespace suspend ReadOnly / RejectAll / resume, clock advance (to the next deadline or a
+    1..50 ms nudge). Slowest instance 15.1 s.
+  - Leg T, `LeaseStressRegression.TrioSeededRegression/<seed>`, seeds 1..20, 200 steps, `LeaseTrio`, real clock, TTLs 1000..1500 ms
+    (the topic's floor is 1000 ms), I3 with rho = 1 % plus 2 ms, at most 2 leader kills + restarts per seed (the recipe allowed 3;
+    2 keeps a seed under 20 s). Slowest instance 15.2 s (after the fix below).
+  - The plan's single 3 000-step 3-node simulated-time run needs a multi-node injected clock: out of scope.
+- **Observation.** Ends come from a raw log tap (subscription from offset 0); a Checkpoint record never reaches a client
+  subscription, so I5's "checkpoint remaining >= true remaining" is checked on the lease view row's `lease_remaining_ms`.
+  The append time of an end record is the tap's receive time (a deviation: no usable broker timestamp reaches the client), which
+  is later than the append, so the never-early check is conservative only in the safe direction for I3.
+- **Not done / skipped.** Step kinds partitions, follower lag (no seam in `LeaseTrio`) and compaction are not drawn. I6 is not
+  checked (no broker counter of keepalives answered while not leader; I3 would catch an unfenced stale ack).
+- **Finding, fixed (checked writes, broker).** The tap froze after a leader moved back: a read_uncommitted subscription bound
+  on a node that led the partition stayed there after its demotion, and the follower's verdict bound
+  (`Worker::verdictBound_`) never moves (a follower keeps no verdict state, checked-writes plan 04 P4-1), so it pushed nothing
+  and never told the client. The gateway now serves a partition whose records need verdicts (a lease topic, or a published
+  verdict source: `PartitionReplica::publishVerdictSource`) from its leader only at any isolation, like read_committed:
+  `ClientGateway::servableHere_` refuses it on a follower and `movedAway_` moves it off a demoted leader (bare NotLeader; the
+  client re-subscribes from its position). Regressions: `TransientGatewayRegression.VerdictSource*`,
+  `CheckedWritesConsumerRegression.VerdictSourceIsPublishedToTheGatewayRegression`, and Leg T itself: the tap never
+  re-subscribes (before the fix, 19 of 20 trio seeds froze).
+- **Mutations** (each applied, stress target rebuilt, 20 seeds per leg, reverted, `touch`ed): M1 (promotion deadline without
+  `extend`) not red in 20 trio seeds (a crashed leader is replaced only after the heartbeat timeout, so readiness is already
+  past the old leader's last ack); M3 (checkpoint does not enter `Checkpointing`) not red in 20 seeds on either leg; M4 (grants
+  record `lastAppended`) not red in 20 single-node seeds (its own targeted test needs a judge-hold seam, see the note above);
+  M13 (expiry ignores `lastAppended`) not red in 20 seeds on either leg (needs judge lag); M16: no pause code to mutate.
+  Results: the random stress as built is not strong enough to kill these five; each stays owned by its targeted test.
 
 ### Task 19: Phase 1 e2e on the default config
 
@@ -1242,27 +1275,27 @@ modelled on `checked-writes-e2e.sh`; a small driver `client-cpp/examples/lease_e
 
 ## Phase 2: recipes, limits, operations
 
-### Task 20: `LeaseMutex` and `LeaseElection`
+### Task 20: `LeaseOwnership` and `LeaseElection`
 
 Spec §12.3, §12.2 (election at-risk), §16.1 (recipes), §16.3 (election e2e); R7; F1.
 
-**Files:** create `client-cpp/include/rune/client/lease/LeaseMutex.h`, `LeaseElection.h`; tests
+**Files:** create `client-cpp/include/rune/client/lease/LeaseOwnership.h`, `LeaseElection.h`; tests
 `client-cpp/tests/LeaseRecipeTest.cpp` (stub), `LeaseRecipeBrokerTest.cpp` (1-node and trio); extend
 `lease-e2e.sh` with the election leg.
 
 **Algorithm:** recipes take `(session, watch, name ≤ 102 B)`; key `name/<sessionId 16 hex>-<campaignNo 8 hex>`
-(`sessionId` drawn at session construction, `campaignNo` incremented per `lock`/`campaign`); act only after
-`LeaseWatchReady`; `lock()` grants (new key, so granted), waits for the ack and for the watch to pass that offset,
+(`sessionId` drawn at session construction, `campaignNo` incremented per `claim`/`campaign`); act only after
+`LeaseWatchReady`; `claim()` grants (new key, so granted), waits for the ack and for the watch to pass that offset,
 owns iff its version is the lowest under `name/` (from the watch heap), else waits for its immediate predecessor's
 `Revoked`/`Expired` and re-checks (`OpKind::LeaseCampaign` on ownership); `VerdictUnknown` grant → read the key;
-adopt if live with `lease_holder == sessionId`, else re-grant with the next `campaignNo`; `tryLock()` revokes its own
-key if not lowest (`ErrLocked`); `unlock()`/`resign()` fenced revoke; `proclaim(value)` fenced update; `leader()`
+adopt if live with `lease_holder == sessionId`, else re-grant with the next `campaignNo`; `tryClaim()` revokes its own
+key if not lowest (`ErrClaimed`); `release()`/`resign()` fenced revoke; `proclaim(value)` fenced update; `leader()`
 and `observe()` from the watch; `onAtRisk(Entered)` suspends (`isLeader() == false`, callback runs), `Cleared`
 resumes iff still lowest; `token()` = version.
 
 - [ ] **Step 1: failing tests** `LeaseRecipeRegression.*`: `SharedWatchOneSubscriptionRegression` (2 000 elections, one
-  subscription); `KeyShapeRegression`; `VerdictUnknownAdoptOrRecampaignRegression`; `MutexOrderByVersionRegression`;
-  `WaitDeletesPredecessorOnlyRegression`; `TryLockCleansUpRegression`; `ObserveOncePerChangeRegression`;
+  subscription); `KeyShapeRegression`; `VerdictUnknownAdoptOrRecampaignRegression`; `OwnershipOrderByVersionRegression`;
+  `WaitDeletesPredecessorOnlyRegression`; `TryClaimCleansUpRegression`; `ObserveOncePerChangeRegression`;
   `AtRiskSuspendsResumesRegression`; `RecampaignAlwaysNewKeyRegression` (F1); `RecipeNoAllocRegression`; broker:
   `HolderExpiresNextWaiterOwnsRegression` (larger token), `LeaderChangeFoldedRegression`.
 - [ ] **Step 2:** e2e election leg on the VM: two campaigners, SIGSTOP the leader past the TTL, the other leads with a
@@ -1336,7 +1369,7 @@ Spec §15.1 (budgets), §16.6; CLAUDE.md §2 latency budgets.
 Spec §20 P2.5.
 
 **Files:** `docs/api/ql.md` (lease topic DDL, settings, `show lease(s)`, `revoke lease`), `docs/api/client-cpp.md`
-(`LeaseTopic`, `LeaseSession`, `LeaseWatch`, `LeaseMutex`, `LeaseElection`, the guard, the at-risk / lost
+(`LeaseTopic`, `LeaseSession`, `LeaseWatch`, `LeaseOwnership`, `LeaseElection`, the guard, the at-risk / lost
 semantics, the local-`onLost` note of §12.2), `docs/api/wire-protocol.md` (templates 96–101, codes, trailers),
 `docs/operations.md` (sizing `checkpoint_rate`, the lease clock, `max-leases`, metrics), `README.md` link, root
 `CLAUDE.md` §8 note that lease topics exist.

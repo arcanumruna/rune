@@ -920,6 +920,11 @@ public:
     void publishCleanerVerdictBound(Offset bound) noexcept { publishedVerdictBound_.store(bound, std::memory_order_release); }
     [[nodiscard]] Offset cleanerVerdictBound() const noexcept { return publishedVerdictBound_.load(std::memory_order_acquire); }
     [[nodiscard]] Offset cleanerVerdictMarkerEnd() const noexcept { return publishedVerdictMarkerEnd_.load(std::memory_order_acquire); }
+    // Checked writes: the owning worker publishes whether this partition's records need verdicts (a logged constraint set).
+    // Its records are then deliverable only where the judge runs - the leader (Worker::verdictBound_): a node that is not
+    // leading keeps no verdict state (plan 04, P4-1), so the gateway moves such a subscription off a demoted leader.
+    void publishVerdictSource(bool on) noexcept { publishedVerdictSource_.store(on, std::memory_order_release); }
+    [[nodiscard]] bool gatewayVerdictSource() const noexcept { return publishedVerdictSource_.load(std::memory_order_acquire); }
     // D3b fix round 1: the minimum fetch position over EVERY assigned replica (not
     // just the ISR), published by the duty/owning thread in publishCleanerState().
     // A txn marker below it is held by every replica, so the cleaner may remove it;
@@ -2165,6 +2170,7 @@ private:
     std::atomic<Offset> publishedVerdictBound_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso};
     Offset retentionHold_ = std::numeric_limits<Offset>::max();   // owner thread only
     std::atomic<Offset> publishedVerdictMarkerEnd_{0};
+    std::atomic<bool>   publishedVerdictSource_{false};   ///< publishVerdictSource (owner: the worker)
     // D3b fix round 1: min fetch position over every assigned replica — see
     // cleanerMarkerRemovalBound().  0 until the first leader publication.
     std::atomic<Offset> publishedMarkerBoundForCleaner_{0};
