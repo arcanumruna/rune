@@ -1986,7 +1986,7 @@ if(BUILD_TESTING)
         target_compile_definitions(rune_checked_writes_stress_tests PRIVATE RUNE_QL_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/ql/tests/golden")
         target_link_libraries(rune_checked_writes_stress_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
-        # Each family has a fast default (seed 1, a few steps, small segments); the History tests run on small segments too.  The full
+        # Each family has a fast default (one seed of its set, a few steps, small segments); the History tests run on small segments too.  The full
         # seed sets (one ctest case per seed) are stress.
         gtest_discover_tests(rune_checked_writes_stress_tests TEST_FILTER "Seeds/*" PROPERTIES TIMEOUT 1800 LABELS stress)
         gtest_discover_tests(rune_checked_writes_stress_tests TEST_FILTER "CheckedWritesStressFast.*:CheckedWritesStressHistory.*" PROPERTIES TIMEOUT 300)
