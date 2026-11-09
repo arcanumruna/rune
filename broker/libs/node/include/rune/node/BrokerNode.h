@@ -2271,6 +2271,7 @@ public:
         return cleanerAgent_ ? cleanerAgent_->dedupeBufferBytesForTest() : -2;
     }
     /// Test-only (#658): bytes the cleaner's dedupe table really allocated (-2 = no cleaner).
+    /// The table only: once the cleaner runs a lease pass it also holds a same-capacity lease side table of the same size (2x in all).
     [[nodiscard]] int64_t cleanerDedupeTableBytesForTest() const noexcept {
         return cleanerAgent_ ? static_cast<int64_t>(cleanerAgent_->dedupeTableBytes()) : -2;
     }

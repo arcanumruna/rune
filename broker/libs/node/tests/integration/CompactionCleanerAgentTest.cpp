@@ -57,6 +57,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <fstream>
@@ -141,8 +142,10 @@ static int cp6CountLiveRecords(Log& log) {
 }
 
 static PartitionConfig makeCompactConfig(int32_t topicId,
-                                          double  dirtyRatio = 0.0) {
+                                          double  dirtyRatio = 0.0,
+                                          bool    leaseTopic = false) {
     PartitionConfig cfg;
+    cfg.leaseTopic            = leaseTopic;
     cfg.topicId               = topicId;
     cfg.partitionId           = 0;
     cfg.selfId                = 1;
@@ -335,6 +338,105 @@ TEST(CompactionCleanerAgent, ConvergesToOnePerKeyAtDefaultDirtyRatio) {
             << "— compaction did NOT converge at production dirtyRatio=0.5";
     }
     fs::remove_all(dir);
+}
+
+// ===========================================================================
+// LeaseTopicKeepsTheGrantRegression
+//
+// The agent reads the topic mode from the replica: a lease topic keeps the live grant (offset 0) and the latest update,
+// a plain compacted topic with the same records keeps only the latest (the control: the clean really ran).
+// RED (LogCleanerAgent.h: setTopicMode(Plain) for every replica): the lease leg loses the grant.
+// ===========================================================================
+namespace {
+std::string leaseValue(int64_t version, uint64_t ttl, uint64_t holder) {
+    std::string v(4 + 32 + 24, '\0');
+    const uint16_t block = 56, schemaVer = 1;
+    std::memcpy(v.data(), &block, 2);
+    std::memcpy(v.data() + 2, &schemaVer, 2);
+    const uint64_t ver = static_cast<uint64_t>(version), remaining = 0;
+    std::memcpy(v.data() + 4, &ver, 8);
+    std::memcpy(v.data() + 12, &ttl, 8);
+    std::memcpy(v.data() + 20, &holder, 8);
+    std::memcpy(v.data() + 28, &remaining, 8);
+    return v;
+}
+std::vector<int64_t> runLeaseKeepRun(bool lease) {
+    constexpr uint8_t kPutInsert = 1, kPutExisting = 2;   // intent bits 0-1: Insert, Existing
+    auto dir = cp6TempDir(lease ? "cp6_lease_keep_on" : "cp6_lease_keep_off");
+    Log log(dir.string(), /*rollBytes=*/1);   // one record per segment: every record is cleanable
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(lease ? 1850 : 1851, /*dirtyRatio=*/0.0, lease);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, /*epoch=*/1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->becomeLeader(1, {1});
+
+    int64_t off = 0;
+    {
+        RecordBatchBuilder b(off, 1000);
+        b.append("k", leaseValue(0, 5000, 1), 1000, kPutInsert);
+        log.append(b.build(), off++);
+    }
+    for (int i = 0; i < 20; ++i) {
+        RecordBatchBuilder b(off, 1000);
+        b.append("k", leaseValue(0, 7000 + static_cast<uint64_t>(i), 2 + static_cast<uint64_t>(i)), 1000, kPutExisting);
+        log.append(b.build(), off++);
+    }
+    const int64_t lastUpdate = off - 1;
+    for (int i = 0; i < 4; ++i) {   // seal the tail
+        log.append(cp6Batch(off, "sentinel" + std::to_string(i), "s"), off);
+        ++off;
+    }
+    replica->onLeaderLogAppended();
+
+    rune::node::ReplicaRegistry registry;
+    registry.add(cfg.topicId, 0, std::move(replica));
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent duty(dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+    rune::node::LogCleanerAgent cleaner(&registry);
+    for (int i = 0; i < 500; ++i) {   // hard cap
+        cleaner.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        duty.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+    }
+    log.reloadSegments();
+
+    std::vector<int64_t> offsets;
+    const auto bases = log.segmentBaseOffsets();
+    for (int64_t cur = log.logStartOffset(); cur < log.logEndOffset();) {
+        auto bytes = log.read(cur, 1 << 20);
+        if (bytes.empty()) {   // a cleaned gap: continue at the next segment
+            const auto next = std::upper_bound(bases.begin(), bases.end(), cur);
+            if (next == bases.end()) break;
+            cur = *next;
+            continue;
+        }
+        RecordBatchReader r(bytes.data(), bytes.size());
+        if (!r.ensureValid()) break;
+        r.forEach([&](std::string_view k, std::string_view, int64_t o, int64_t) { if (k == "k") offsets.push_back(o); });
+        cur = std::max(cur + 1, r.baseOffset() + r.lastOffsetDelta() + 1);
+    }
+    fs::remove_all(dir);
+    offsets.push_back(-lastUpdate - 1000);   // encode the last update's offset after the survivors
+    return offsets;
+}
+}  // namespace
+
+TEST(CompactionCleanerAgent, LeaseTopicKeepsTheGrantRegression) {
+    {
+        SCOPED_TRACE("lease topic");
+        auto o = runLeaseKeepRun(true);
+        const int64_t lastUpdate = -(o.back() + 1000);
+        o.pop_back();
+        EXPECT_NE(std::find(o.begin(), o.end(), 0), o.end()) << "the live grant is kept";
+        EXPECT_NE(std::find(o.begin(), o.end(), lastUpdate), o.end()) << "the latest update is kept";
+    }
+    {
+        SCOPED_TRACE("plain compacted topic");
+        auto o = runLeaseKeepRun(false);
+        o.pop_back();
+        EXPECT_EQ(std::find(o.begin(), o.end(), 0), o.end()) << "plain mode drops the grant: the clean ran";
+    }
 }
 
 // ===========================================================================

@@ -1096,6 +1096,9 @@ struct NodeConfig {
     /// minutes-slow.
     static constexpr int64_t kMinCleanerDedupeBufferBytes = int64_t{1} << 20;
     static constexpr int64_t kMaxCleanerDedupeBufferBytes = int64_t{1} << 32;
+    /// A node hosting lease topics also allocates, on the first lease pass, a lease side table (SkimpyOffsetMap::LeaseAux,
+    /// 16 B per slot) with the same slot count as the table: sizeof(LeaseAux) == kEntryBytes == 16, so a lease cleaner uses
+    /// up to 2x this budget in total (table + side table).
     int64_t cleanerDedupeBufferBytes = int64_t{128} << 20;
 
     // PSM fix round 1 (I1, Kafka producer.id.expiration.ms): compaction keeps the

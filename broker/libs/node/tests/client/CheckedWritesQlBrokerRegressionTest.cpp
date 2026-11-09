@@ -418,6 +418,54 @@ TEST(CheckedWritesQlBrokerRegression, LeaseTopicQlBrokerRegression) {
     EXPECT_EQ(lease->ttlMs, 7000u);
 }
 
+// Lease topics Task 8 (H1a): the topic's lease flag reaches every partition's replica config (the cleaner reads its mode from
+// it), when the topic is created and again after a restart rebuilds the replicas from the catalog.
+// RED (BrokerNode.cpp: drop `pcfg.leaseTopic = spec->leaseTopic` or the boot-path assignment): the lease leg reads false.
+TEST(CheckedWritesQlBrokerRegression, LeaseTopicCleansInLeaseModeRegression) {
+    OneBroker b("cw08_lease_mode", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    std::string out, err;
+    ASSERT_EQ(ql(b.endpoint(), "lease topic inst { id uint64, addr string(64) } partitions 2 key id with "
+                               "(lease.ttl = 5000, lease.checkpoint = off);", &out, &err), 0) << err;
+    ASSERT_EQ(ql(b.endpoint(), "topic plain { id uint64, n int64 } partitions 2 key id with (cleanup.policy = compact);", &out, &err), 0) << err;
+
+    const auto topicIdOf = [&](const char* name) -> int32_t {
+        int32_t id = -1;
+        for (const auto deadline = std::chrono::steady_clock::now() + 10s; id < 0 && std::chrono::steady_clock::now() < deadline; std::this_thread::sleep_for(20ms))
+            id = b.node().onAdminThreadForTest([&]() -> int32_t {
+                const auto* t = b.node().adminWorkerAgentForTest()->worker().applier().state().topicByName(rune::catalog::kDefaultNsId, name);
+                return t != nullptr ? t->topicId : -1;
+            });
+        return id;
+    };
+    // The replica's flag, or nullopt while the (restarted) node has not built that replica yet.
+    const auto flagOf = [&](int32_t topicId, int32_t partition) -> std::optional<bool> {
+        try {
+            return b.node().onOwnerThreadForTest(topicId, partition, [](rune::replication::PartitionReplica& r) { return r.leaseTopic(); }, 2s);
+        } catch (const std::runtime_error&) {
+            return std::nullopt;
+        }
+    };
+    const auto expectFlags = [&](const char* leg) {
+        SCOPED_TRACE(leg);
+        const int32_t inst = topicIdOf("inst"), plain = topicIdOf("plain");
+        ASSERT_GE(inst, 0);
+        ASSERT_GE(plain, 0);
+        for (int32_t p = 0; p < 2; ++p) {
+            std::optional<bool> lease, pl;
+            EXPECT_TRUE(waitFor([&] { return (lease = flagOf(inst, p)).has_value(); }, 30s));
+            EXPECT_TRUE(waitFor([&] { return (pl = flagOf(plain, p)).has_value(); }, 30s));
+            EXPECT_EQ(lease, std::optional<bool>(true)) << "lease topic partition " << p;
+            EXPECT_EQ(pl, std::optional<bool>(false)) << "plain topic partition " << p;
+        }
+    };
+    expectFlags("after create");
+    ASSERT_FALSE(HasFatalFailure());
+    b.restart();
+    expectFlags("after restart");
+}
+
 // R02d, R10b: a keyless typed topic is legal; a view over it and key.index on it are the broker's refusals.
 TEST(CheckedWritesQlBrokerRegression, KeylessTypedTopicFromQlShardRegression) {
     OneBroker b("cw08_keyless", OneBroker::Runtime::Shard);

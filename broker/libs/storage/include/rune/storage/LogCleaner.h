@@ -469,6 +469,7 @@ private:
     int64_t producerIdExpirationMs_ = ProducerTails::kDefaultExpirationMs;
     std::optional<ProducerBatchWindow> window_{};   ///< depth > 1 only
     int64_t windowNowMs_ = -1;                       ///< the window's expiry clock: the last produceCleanedRangeBounded's nowMs
+    bool warnedNoClock_ = false;                     ///< a lease tombstone was kept for want of a clock (warned once)
     bool windowOverflowLogged_ = false;              ///< the window went over its budget once (logged once)
     Offset previousPassEnd_ = -1;                    ///< setPreviousPassEnd
     Offset heldFrom_ = std::numeric_limits<Offset>::max();   ///< a forward pass's watermark (setPreviousPassEnd); max otherwise

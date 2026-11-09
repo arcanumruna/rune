@@ -854,6 +854,10 @@ public:
                 continue; // done for this replica — never compact Delete topics
             }
 
+            // A lease topic is cleaned only by the LogCleanerAgent (lease mode); this legacy Plain-mode pass would drop its
+            // grants and checkpoints.
+            if (replica->leaseTopic()) continue;
+
             // ---------------------------------------------------------------
             // Compact or CompactDelete: run the compaction pass first.
             // ---------------------------------------------------------------

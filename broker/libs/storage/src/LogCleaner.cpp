@@ -594,7 +594,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
                                          const std::vector<int64_t>& bases,
                                          Offset fromOffset, Offset toOffset,
                                          OffsetMap& map) {
-    assert(mode_ == CleanerTopicMode::Plain);   // lease mode runs on the SkimpyOffsetMap engines only
+    if (mode_ != CleanerTopicMode::Plain) return;   // lease mode runs on the SkimpyOffsetMap engines only: nothing is mapped
     prefixBytesRead_ = 0;
     TxnCleanState& txn = map.txnState();
     txn.clear();
@@ -982,7 +982,7 @@ bool LogCleaner::rewriteSegmentImpl(
                 // No horizon stamp yet.
                 // Lease mode: the horizon is the cleaner's own stamp only; broker records carry timestamp 0, so the legacy
                 // nowNs path below would drop every lease tombstone at once.
-                if (leaseMap != nullptr && nowMs < 0) { assert(nowMs >= 0); keep(); return; }
+                if (leaseMap != nullptr && nowMs < 0) { if (!warnedNoClock_) { warnedNoClock_ = true; spdlog::warn("LogCleaner: a lease tombstone is kept because the cleaner has no clock (nowMs < 0)"); } keep(); return; }
                 if (nowMs >= 0) {
                     // CP-8: first time compacting this tombstone — stamp the horizon.
                     // The tombstone is RETAINED in this pass.  It will be dropped
@@ -1098,7 +1098,7 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetM
                                 Offset fromOffset, Offset cleanBoundaryOffset,
                                 int64_t nowNs, int64_t deleteRetentionMs,
                                 int64_t nowMs, std::optional<int64_t> nextSegBase) {
-    assert(mode_ == CleanerTopicMode::Plain);   // lease mode runs on the SkimpyOffsetMap engines only
+    if (mode_ != CleanerTopicMode::Plain) return false;   // lease mode runs on the SkimpyOffsetMap engines only: nothing is rewritten
     return rewriteSegmentImpl(dir, segBase,
         [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
         fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs, nullptr,
@@ -1125,7 +1125,7 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, SkimpyO
 void LogCleaner::compact(Log& log, OffsetMap& map,
                          Offset firstDirtyOffset, Offset cleanBoundaryOffset,
                          int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs) {
-    assert(mode_ == CleanerTopicMode::Plain);   // lease mode runs on the SkimpyOffsetMap engines only
+    if (mode_ != CleanerTopicMode::Plain) return;   // lease mode runs on the SkimpyOffsetMap engines only: nothing is compacted
     const std::string& dir = log.dir();
     rewriteSegmentsRead_ = 0;
     if (damaged_.has_value()) return;   // uncleanable until restart
@@ -1893,7 +1893,7 @@ void LogCleaner::mergeGroupWithMap(
                         if (horizonExpired && !pinned) { modified = true; return; }
                         keepWithHorizon2(batchHorizonMs); return;
                     }
-                    if (mode_ == CleanerTopicMode::Lease && nowMs < 0) { assert(nowMs >= 0); keep2(); return; }   // KIP-534 stamp only
+                    if (mode_ == CleanerTopicMode::Lease && nowMs < 0) { if (!warnedNoClock_) { warnedNoClock_ = true; spdlog::warn("LogCleaner: a lease tombstone is kept because the cleaner has no clock (nowMs < 0)"); } keep2(); return; }   // KIP-534 stamp only
                     if (nowMs >= 0) {
                         modified = true;
                         keepWithHorizon2(nowMs + deleteRetentionMs); return;
