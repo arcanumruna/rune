@@ -2012,7 +2012,7 @@ void expectKeyExists(rc::Client& client, uint64_t first, uint64_t last) {
 }
 
 int64_t leoOf(BrokerNode& n, int32_t topicId, int32_t partition);
-bool inIsrOn(BrokerNode& leader, int32_t topicId, int32_t partition, int member);
+bool leaderHoldsInIsr(BrokerNode& leader, int32_t topicId, int32_t partition, int member);
 
 /// A 3-replica `ki` on a started cluster, the level raised on every node.  The admin client connects while the cluster elects.
 int32_t defineKiOnCluster(Cluster& c) {
@@ -2107,15 +2107,24 @@ void keyIndexSurvivesTakeoverAfterARestart(int partition) {
     const auto restart = [&](int node) {
         c.startNode(node);
         ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
+        // Settled when the replica that leads each partition (ki, __consumer_offsets, __transaction_state) serves it with the
+        // restarted node in its ISR, and the restarted node holds the same log.  The restarted node's own committed map still names
+        // itself leader while it refuses at the restart fence, so only the leader replica's role says who leads.
         ASSERT_TRUE(waitFor([&] {
-            for (int32_t p = 0; p < kKiParts; ++p) {   // the restart may hand the leadership back to `node`: read it again
-                const int32_t current = leaderOn(c.node(node), topicId, p);
-                if (current <= 0 || !c.running(current)) return false;
-                if (leoOf(c.node(node), topicId, p) != leoOf(c.node(current), topicId, p)) return false;
-                if (current != node && !inIsrOn(c.node(current), topicId, p, node)) return false;
+            std::vector<int32_t> current;
+            if (!awaitLeaders(c, topicId, kKiParts, current, 20ms)) return false;   // a restart may hand the leadership back to `node`
+            for (int32_t p = 0; p < kKiParts; ++p) {
+                const int32_t l = current[static_cast<std::size_t>(p)];
+                if (leoOf(c.node(node), topicId, p) != leoOf(c.node(l), topicId, p)) return false;
+                if (!leaderHoldsInIsr(c.node(l), topicId, p, node)) return false;
+            }
+            for (const int32_t coordinator : {-1, -2}) {
+                std::vector<int32_t> l;
+                if (!awaitLeaders(c, coordinator, 1, l, 20ms) || !leaderHoldsInIsr(c.node(l[0]), coordinator, 0, node)) return false;
             }
             return true;
         }, 30s)) << "the restarted node never rejoined the ISR";
+        ASSERT_TRUE(c.awaitInCatalogIsr(node, 30s)) << "the restarted node is not in the catalog ISR";
         ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
         restarted.insert(node);
     };
@@ -2132,8 +2141,6 @@ void keyIndexSurvivesTakeoverAfterARestart(int partition) {
         ASSERT_FALSE(::testing::Test::HasFatalFailure());
         second = leaders[static_cast<std::size_t>(partition)];
     }
-    std::string why;
-    ASSERT_TRUE(c.awaitCatalogDigestsEqual(30s, &why)) << "the restarted nodes never settled: " << why;
     ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
     second = leaders[static_cast<std::size_t>(partition)];
     auto reader = kiClient(c, second == 1 ? 2 : 1);
@@ -2292,10 +2299,10 @@ int64_t leoOf(BrokerNode& n, int32_t topicId, int32_t partition) {
     return n.onOwnerThreadForTest(topicId, partition, [](rune::replication::PartitionReplica& r) { return r.log()->logEndOffset(); });
 }
 
-/// Node `member` is in the ISR of the partition as its leader `leader` holds it.
-bool inIsrOn(BrokerNode& leader, int32_t topicId, int32_t partition, int member) {
+/// The replica of the partition on `leader` leads it, and node `member` is in the ISR it holds.
+bool leaderHoldsInIsr(BrokerNode& leader, int32_t topicId, int32_t partition, int member) {
     return leader.onOwnerThreadForTest(topicId, partition, [member](rune::replication::PartitionReplica& r) {
-        return std::find(r.isr().begin(), r.isr().end(), member) != r.isr().end();
+        return r.role() == rune::replication::Role::Leader && std::find(r.isr().begin(), r.isr().end(), member) != r.isr().end();
     });
 }
 
