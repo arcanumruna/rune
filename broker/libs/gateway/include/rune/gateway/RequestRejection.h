@@ -26,6 +26,7 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/StatsMessages.h>
 #include <rune/protocol/client/GroupMessages.h>
+#include <rune/protocol/client/LeaseMessages.h>
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/Protocol.h>
@@ -38,9 +39,16 @@
 
 namespace rune::gateway {
 
-/// Every rejection frame fits in this many bytes (the largest is a one-entry
-/// OffsetFetchResponse: 24 + 2 + 18 = 44 B).  Callers pass at least this much.
+/// Every rejection frame fits in this many bytes (the largest is a LeaseTimeToLiveResponse: 24 + 34 = 58 B; a one-entry
+/// OffsetFetchResponse is 24 + 2 + 18 = 44 B).  Callers pass at least this much.
 inline constexpr std::size_t kMaxRejectionBytes = 64;
+static_assert(rune::protocol::client::MessageHeader::ENCODED_SIZE + rune::protocol::client::LeaseKeepAliveResponse::BODY_FIXED +
+                  rune::protocol::client::LeaseKeepAliveResponse::kEntryBytes <= kMaxRejectionBytes,
+              "a one-entry LeaseKeepAliveResponse (39 B) fits a rejection");
+static_assert(rune::protocol::client::MessageHeader::ENCODED_SIZE + rune::protocol::client::LeaseTimeToLiveResponse::BODY_FIXED <=
+                  kMaxRejectionBytes, "a LeaseTimeToLiveResponse (58 B) fits a rejection");
+static_assert(rune::protocol::client::MessageHeader::ENCODED_SIZE + rune::protocol::client::ScanLeasesResponse::BODY_FIXED <=
+                  kMaxRejectionBytes, "a row-less ScanLeasesResponse (49 B) fits a rejection");
 
 /// Encode the error answer to a request of `requestTid` into out[0..cap).
 /// `code` is the value of the response type's own error field: an
@@ -182,6 +190,28 @@ inline constexpr std::size_t kMaxRejectionBytes = 64;
     case T::GetStats: {
         pc::StatsResponse r;
         r.sessionId = sessionId; r.correlationId = correlationId; r.status = code;
+        return r.encode(out);
+    }
+    // Lease topics (Task 11b): the answer is the lease response itself.  A keepalive refusal is ONE entry
+    // {kLeaseWholeRequest, code, ttlMs} with final = 1 (Throttled carries ttlMs = 1, the retry-after in ms); a TimeToLive refusal
+    // is {code, grantedTtlMs 0, remainingMs -1, version 0, holder 0}; ScanLeases refuses with its own response (no rows).
+    case T::LeaseKeepAlive: {
+        pc::LeaseKeepAliveResponse r;
+        r.sessionId = sessionId; r.correlationId = correlationId; r.final = 1;
+        const pc::LeaseKeepAliveResponse::Entry one{pc::kLeaseWholeRequest, code,
+                                                    code == static_cast<uint16_t>(pc::ErrorCode::Throttled) ? 1u : 0u};
+        r.entries = std::span<const pc::LeaseKeepAliveResponse::Entry>(&one, 1);
+        return r.encode(out);
+    }
+    case T::LeaseTimeToLive: {
+        pc::LeaseTimeToLiveResponse r;
+        r.sessionId = sessionId; r.correlationId = correlationId; r.code = code;
+        r.grantedTtlMs = 0; r.remainingMs = -1; r.version = 0; r.holder = 0;
+        return r.encode(out);
+    }
+    case T::ScanLeases: {
+        pc::ScanLeasesResponse r;
+        r.sessionId = sessionId; r.correlationId = correlationId; r.code = code;
         return r.encode(out);
     }
     case T::Ping:

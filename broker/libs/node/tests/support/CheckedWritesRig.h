@@ -102,7 +102,15 @@ struct AutoIncShape {
 
 /// The replica and worker settings a cell may change: minIsr and durabilityTier (2 = Strict) of the partition, the acks=all commit-wait (0 = the default),
 /// and the partition of topic 6 the rig owns (an autoincrement cell at P > 1 owns another than 0).
-struct RigTuning { int minIsr = 1; uint8_t durabilityTier = 1; int64_t ackTimeoutNs = 0; int32_t partition = 0; };
+struct RigTuning {
+    int minIsr = 1; uint8_t durabilityTier = 1; int64_t ackTimeoutNs = 0; int32_t partition = 0;
+    /// A Worker owned by someone else (a WorkerPool behind a ClientGateway): the rig drives it instead of building its own.  The owner must
+    /// outlive the rig's use of it and must not be asked to restart().
+    Worker* hostWorker = nullptr;
+};
+/// The rig's worker: owned (the default) or borrowed from a WorkerPool (RigTuning::hostWorker, never deleted by the rig).
+struct RigWorkerDelete { bool owns = true; void operator()(Worker* w) const noexcept { if (owns) delete w; } };
+using RigWorkerPtr = std::unique_ptr<Worker, RigWorkerDelete>;
 
 class VerdictRig {
 public:
@@ -1060,7 +1068,7 @@ public:
     ViewSnapshotChannel channel;
     std::unique_ptr<WorkerViewSet> vs;
     std::unique_ptr<ViewSnapshotIoAgent> agent;   ///< only with a persisted view: it writes the checkpoint files
-    std::unique_ptr<Worker> worker;
+    RigWorkerPtr worker;
     int64_t now = 0, corr = 0;
     std::vector<int16_t> produceAnswers;
     std::vector<WorkerReturn> leaseKaAnswers, leaseTtlAnswers;   ///< lease topics Task 11a: the LeaseKeepAlive / LeaseTimeToLive returns the passes drained
@@ -1197,7 +1205,7 @@ private:
         c.maxFetchBytes = 1 << 20; c.pushOnAppend = false;
         c.leaseTopic = lease_.has_value();   // a restarted partition carries it (the first open() precedes createLeaseTopic)
         replica = std::make_unique<rune::replication::PartitionReplica>(c, rune::replication::Role::Leader, 1, isr_, isr_, log.get(), &transport_);
-        worker = std::make_unique<Worker>(0);
+        worker = tuning_.hostWorker != nullptr ? RigWorkerPtr(tuning_.hostWorker, RigWorkerDelete{false}) : RigWorkerPtr(new Worker(0), RigWorkerDelete{true});
         worker->setFilterConfig(filter::FilterConfig{});
         if (tuning_.ackTimeoutNs != 0) worker->setAckTimeoutNs(tuning_.ackTimeoutNs);
         worker->setOwnedDirect(Worker::OwnedSet{replica.get()});

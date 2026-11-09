@@ -1305,6 +1305,9 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::GetViewRowK:
         case pc::TemplateId::ScanViewRows:
         case pc::TemplateId::GetStats:
+        case pc::TemplateId::LeaseKeepAlive:
+        case pc::TemplateId::LeaseTimeToLive:
+        case pc::TemplateId::ScanLeases:
             if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
                 sessions_.touch(hdr->sessionId, nowNs_);
             }
@@ -1437,6 +1440,17 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             break;
         case pc::TemplateId::GetStats:
             handleGetStats(buf, len);
+            break;
+        // Lease topics Task 11b: keepalive / TimeToLive route to the partition leader's worker; ScanLeases is answered here until
+        // Task 13 (never enqueued: the worker asserts it is never routed).
+        case pc::TemplateId::LeaseKeepAlive:
+            handleLeaseKeepAlive(buf, len);
+            break;
+        case pc::TemplateId::LeaseTimeToLive:
+            handleLeaseTimeToLive(buf, len);
+            break;
+        case pc::TemplateId::ScanLeases:
+            (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "ScanLeases: Task 13");
             break;
         default:
             // ConnectResponse, ErrorResponse, Pong, MetadataResponse (broker→client),
@@ -7505,6 +7519,55 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             return;
         }
 
+        // Lease topics Task 11b: a worker's LeaseKeepAlive answer.  The gateway keeps no per-request state: EVERY return is one
+        // LeaseKeepAliveResponse frame (a request may get several - the decided entries at once, each parked entry later), the
+        // chunk is already the wire entry bytes ({index u16, code u16, ttlMs u64} x count).  A session that is gone drops it.
+        if (ret.type == rune::node::WorkerReturn::Type::LeaseKeepAliveResult) {
+            Session* session = sessions_.find(ret.sessionId);
+            if (!session) return;
+            using LKR = pc::LeaseKeepAliveResponse;
+            const std::span<const uint8_t> chunk = ret.chunkBytes();
+            const std::size_t count = static_cast<std::size_t>(ret.recordCount > 0 ? ret.recordCount : 0);
+            std::array<LKR::Entry, LKR::kMaxEntries> entries;   // 4 KiB of stack, no allocation
+            LKR resp;
+            resp.sessionId     = ret.sessionId;
+            resp.correlationId = ret.correlationId;
+            resp.final         = ret.lastOffset == 1 ? 1 : 0;
+            if (count < 1 || count > LKR::kMaxEntries || chunk.size() != count * LKR::kEntryBytes) [[unlikely]] {
+                entries[0] = {pc::kLeaseWholeRequest, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), 0};
+                resp.final   = 1;
+                resp.entries = std::span<const LKR::Entry>(entries.data(), 1);
+            } else {
+                for (std::size_t i = 0; i < count; ++i) {
+                    const uint8_t* e = chunk.data() + i * LKR::kEntryBytes;
+                    entries[i] = {pc::detail::getLE16(e, 0), pc::detail::getLE16(e, 2), static_cast<uint64_t>(pc::detail::getLE64(e, 4))};
+                }
+                resp.entries = std::span<const LKR::Entry>(entries.data(), count);
+            }
+            sendAnswer_(*session, scratch_.data(), resp.encode(scratch_.data()));
+            return;
+        }
+
+        // Lease topics Task 11b: a worker's LeaseTimeToLive answer: errorCode = the code, baseOffset = remainingMs, lastOffset =
+        // the lease version, chunk = {grantedTtlMs u64, holder u64}.
+        if (ret.type == rune::node::WorkerReturn::Type::LeaseTimeToLiveResult) {
+            Session* session = sessions_.find(ret.sessionId);
+            if (!session) return;
+            pc::LeaseTimeToLiveResponse resp;
+            resp.sessionId     = ret.sessionId;
+            resp.correlationId = ret.correlationId;
+            resp.code          = static_cast<uint16_t>(ret.errorCode);
+            resp.remainingMs   = ret.baseOffset;
+            resp.version       = ret.lastOffset;
+            const std::span<const uint8_t> chunk = ret.chunkBytes();
+            if (chunk.size() == 16) {
+                resp.grantedTtlMs = static_cast<uint64_t>(pc::detail::getLE64(chunk.data(), 0));
+                resp.holder       = static_cast<uint64_t>(pc::detail::getLE64(chunk.data(), 8));
+            }
+            sendAnswer_(*session, scratch_.data(), resp.encode(scratch_.data()));
+            return;
+        }
+
         // ===================================================================
         // ProduceResult
         // ===================================================================
@@ -10816,6 +10879,102 @@ void ClientGateway::handleGetStats(const uint8_t* buf, std::size_t len)
     op.recordCount   = static_cast<int32_t>(m->scope);
     if (!workerPool_->tryEnqueueOp(routeTopic, m->partition, std::move(op)))
         (void)rejectRequest_(buf, len, SR::kBusy, "GetStats: worker ring full");
+}
+
+// Lease topics Task 11b: the checks both lease requests share, in the fixed order (the caller has decoded the body and found the
+// session): client version -> authorisation -> pool / registry / deleting namespace / unknown topic -> lease topic and partition range
+// -> the partition's leader.  A refusal is answered here (the lease response itself, or a route refusal) and false returned.
+// A foreign-namespace topic id gets no permission bits, so it is answered exactly like a nonexistent one (NotAuthorized).
+bool ClientGateway::leaseRouteAdmit_(Session& session, int64_t sessionId, int64_t corr, int32_t topicId, int32_t partition,
+                                     rune::security::Operation op, const uint8_t* buf, std::size_t len, const char* what)
+{
+    using EC = pc::ErrorCode;
+    if (session.clientVersion < pc::kClientVersionLeases) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(EC::InvalidRequest), what);
+        return false;
+    }
+    if (const PermissionTable& perms = permsOf_(session); !perms.isAllowAll())
+        if (const auto denial = authorizeTopicIdHere_(perms, topicId, partition, op, rune::security::ResourceType::Topic)) {
+            if (denial->code != static_cast<uint16_t>(EC::NotAuthorized)) {   // not applied here yet: retriable
+                sendRouteRefusal_(session, sessionId, corr, {});
+                return false;
+            }
+            (void)deny_(session, denial, buf, len);
+            return false;
+        }
+    if (!workerPool_ || topicRegistry_ == nullptr || inDeletingNs_(topicId)) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(EC::UnknownTopic), what);
+        return false;
+    }
+    const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
+    if (spec == nullptr) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(EC::UnknownTopic), what);
+        return false;
+    }
+    if (!spec->leaseTopic || partition < 0 || partition >= spec->partitionCount) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(EC::InvalidRequest), what);
+        return false;
+    }
+    if (std::string_view ep; partitionLedElsewhere_(topicId, partition, ep)) {
+        sendRouteRefusal_(session, sessionId, corr, ep);
+        return false;
+    }
+    return true;
+}
+
+// Lease topics Task 11b: LeaseKeepAlive (96).  WRITE on the topic; the worker answers one LeaseKeepAliveResult per decided group.
+void ClientGateway::handleLeaseKeepAlive(const uint8_t* buf, std::size_t len)
+{
+    const auto m = pc::LeaseKeepAlive::decode(buf, len);
+    if (!m) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "LeaseKeepAlive body undecodable");
+        return;
+    }
+    Session* session = sessions_.find(m->sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "LeaseKeepAlive for unknown session");
+        return;
+    }
+    if (!leaseRouteAdmit_(*session, m->sessionId, m->correlationId, m->topicId, m->partition, rune::security::Operation::Write, buf, len,
+                          "LeaseKeepAlive refused"))
+        return;
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::LeaseKeepAlive;
+    op.topicId       = m->topicId;
+    op.partition     = m->partition;
+    op.sessionId     = m->sessionId;
+    op.correlationId = m->correlationId;
+    op.recordCount   = static_cast<int32_t>(m->count);
+    op.leaseTail     = m->entryBytes;
+    if (!workerPool_->tryEnqueueOp(m->topicId, m->partition, std::move(op)))
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Throttled), "LeaseKeepAlive: worker ring full");
+}
+
+// Lease topics Task 11b: LeaseTimeToLive (98).  READ on the topic.
+void ClientGateway::handleLeaseTimeToLive(const uint8_t* buf, std::size_t len)
+{
+    const auto m = pc::LeaseTimeToLive::decode(buf, len);
+    if (!m) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "LeaseTimeToLive body undecodable");
+        return;
+    }
+    Session* session = sessions_.find(m->sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "LeaseTimeToLive for unknown session");
+        return;
+    }
+    if (!leaseRouteAdmit_(*session, m->sessionId, m->correlationId, m->topicId, m->partition, rune::security::Operation::Read, buf, len,
+                          "LeaseTimeToLive refused"))
+        return;
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::LeaseTimeToLive;
+    op.topicId       = m->topicId;
+    op.partition     = m->partition;
+    op.sessionId     = m->sessionId;
+    op.correlationId = m->correlationId;
+    op.leaseTail     = m->key;
+    if (!workerPool_->tryEnqueueOp(m->topicId, m->partition, std::move(op)))
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Throttled), "LeaseTimeToLive: worker ring full");
 }
 
 void ClientGateway::handleGetViewRowK(const uint8_t* buf, std::size_t len)

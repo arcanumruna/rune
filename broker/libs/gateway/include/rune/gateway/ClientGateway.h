@@ -650,6 +650,10 @@ public:
         const auto* a = s ? std::get_if<rune::gateway::AuthAuthenticated>(&s->auth) : nullptr;
         return a ? &a->perms.table() : nullptr;
     }
+    /// Test seam: the namespace gate of an existing session (what an upserted suspended namespace sets; RejectAll would also revoke it).
+    void setSessionNsGateForTest(int64_t sid, rune::catalog::NsStateTag tag) {
+        if (Session* s = sessions_.find(sid)) s->nsGate = tag;
+    }
     /// Test seam: the auth state of an existing session.
     void setSessionAuthForTest(int64_t sid, rune::gateway::SessionAuth a) {
         if (Session* s = sessions_.find(sid)) s->auth = std::move(a);
@@ -1508,6 +1512,8 @@ public:
     void applyGetViewRowKForTest(const uint8_t* buf, std::size_t len) { handleGetViewRowK(buf, len); }
     void applyScanViewRowsForTest(const uint8_t* buf, std::size_t len) { handleScanViewRows(buf, len); }
     void applyGetStatsForTest(const uint8_t* buf, std::size_t len) { handleGetStats(buf, len); }
+    void applyLeaseKeepAliveForTest(const uint8_t* buf, std::size_t len) { handleLeaseKeepAlive(buf, len); }
+    void applyLeaseTimeToLiveForTest(const uint8_t* buf, std::size_t len) { handleLeaseTimeToLive(buf, len); }
     [[nodiscard]] uint64_t rejectedRequestsForTest() const noexcept { return rejectedRequests_; }
     // No-hang fix round 2: inject a session with a NON-NULL placeholder egress
     // (never dereferenced: makeForTest's TestEgressFn intercepts every offer of
@@ -2101,6 +2107,12 @@ private:
     void handleScanViewRows (const uint8_t* buf, std::size_t len);
     // Checked writes Part 08: GetStats (91) - the same route; the worker answers a StatsResult (StatsResponse 92).
     void handleGetStats     (const uint8_t* buf, std::size_t len);
+    // Lease topics Task 11b: LeaseKeepAlive (96) / LeaseTimeToLive (98) - the worker answers LeaseKeepAliveResult /
+    // LeaseTimeToLiveResult (LeaseKeepAliveResponse 97 / LeaseTimeToLiveResponse 99).  ScanLeases (100) is refused until Task 13.
+    void handleLeaseKeepAlive (const uint8_t* buf, std::size_t len);
+    void handleLeaseTimeToLive(const uint8_t* buf, std::size_t len);
+    [[nodiscard]] bool leaseRouteAdmit_(Session& session, int64_t sessionId, int64_t corr, int32_t topicId, int32_t partition,
+                                        rune::security::Operation op, const uint8_t* buf, std::size_t len, const char* what);
     [[nodiscard]] Session* checkedViewReadSession_(const uint8_t* buf, std::size_t len, int64_t sessionId,
                                                    int32_t viewTopicId, const char* what);
     void enqueueViewRead_(const uint8_t* buf, std::size_t len, Session& session, rune::node::WorkerOp& op);
