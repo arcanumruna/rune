@@ -7696,12 +7696,9 @@ private:
             sl.verdictEndPublished = end;
         }
     }
-    // Part 04 (P4-11): a verdict index that crosses 75 % doubles, up to 2^24 entries; cold.  A judge stalled on a full index resumes.
+    // Part 04 (P4-11): a verdict index that crosses 75 % doubles, up to 2^24 entries; cold.  A whole-batch rejection that does not fit grows it to fit.  A judge stalled on a full index resumes.
     static void growVerdictIndex_(PartitionWriteState& w) {
-        auto& idx = w.rejected;
-        w.growOwed = false;
-        if (idx.capacity() != 0 && idx.size() * 4 >= idx.capacity() * 3 && idx.capacity() < (std::size_t{1} << 24))
-            idx.grow(std::min<std::size_t>(idx.capacity() * 2, std::size_t{1} << 24));
+        w.growRejected();
         if (w.verdicts != nullptr) w.verdicts->unstall();
     }
     void maintainVerdictIndexes_() {

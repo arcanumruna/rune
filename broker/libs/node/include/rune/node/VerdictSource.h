@@ -468,6 +468,7 @@ private:
     void   countVote_(const TxnVoteAnswer& a) noexcept;
     [[nodiscard]] bool recordRejection_(int64_t offset, const rune::view::Verdict& v) noexcept;
     void   countRejection_(const rune::view::Verdict& v) noexcept;
+    [[nodiscard]] bool indexHasRoom_(std::size_t n) noexcept;
     [[nodiscard]] rune::view::SourceRecord recordOf_(const rune::protocol::RecordSpan& span) noexcept;
     int    emitMarkers_(PartitionWriteState& state, int64_t nowNs);
     int    pushCheckpoints_(PartitionWriteState& state);
@@ -1099,10 +1100,7 @@ bool VerdictSource::rejectTxnRecords_(ReadRangeFn& readRange, int64_t producerId
     };
     std::size_t n = 0;
     if (!each([&](const rune::protocol::RecordSpan&) { ++n; })) return false;
-    if (state_->rejected.size() + n > state_->rejected.capacity()) {
-        stall_(StallReason::Full);
-        return false;
-    }
+    if (!indexHasRoom_(n)) return false;
     std::array<int64_t, 256> run{};
     std::size_t used = 0;
     const auto flush = [&] {

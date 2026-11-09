@@ -2748,3 +2748,69 @@ TEST(CheckedWritesTxnJudgeRegression, VetoedPushNeverMovesTheRunAheadCapRegressi
     EXPECT_LT(r.vs.judgeCursor(), 31 + 8) << "the cap counts from the candidate's last real push, below T";
     r.vs.removeCandidate(9, 0x5eed);
 }
+
+// 12b: a replicated atomic batch past txnJudgedRecordsMax needs one index entry per record.  With fewer free than that the judge
+// waits on a retryable stall, not a permanent one; the worker's growth reaches size + n in one step (not just 2x the capacity), and
+// the retry rejects the whole batch.  Nothing is held while it waits.
+TEST(CheckedWritesTxnJudgeRegression, AtomicRejectionLargerThanTheFreeIndexGrowsItRegression) {
+    JudgeRig r(true);
+    r.st.rejected.reserve(1);
+    r.start();
+    r.batch[0].reserve(3 * 3, r.batch[0].maxRowLen());
+    r.vs.bindTxn(&r.pool, r.batch, 3);
+    r.log.data({{1}, {2}, {3}, {4}}, -1, true);   // 10..13: knob + 1, 4 entries into a capacity of 1
+    r.log.data({{5}});                            // 14
+    r.drive();
+    ASSERT_TRUE(r.vs.stalled());
+    EXPECT_TRUE(r.st.growOwed);
+    EXPECT_EQ(r.st.growNeed_, 4u);
+    EXPECT_EQ(r.st.rejected.size(), 0u);
+    EXPECT_FALSE(r.pool.oneStepHeld());
+    EXPECT_EQ(r.freeOverlays(), rune::view::kTxnOverlaysPerWorker);
+    EXPECT_EQ(r.vs.judgeCursor(), 10);
+    r.st.growRejected();
+    r.vs.unstall();
+    EXPECT_FALSE(r.st.growOwed);
+    EXPECT_EQ(r.st.growNeed_, 0u);
+    ASSERT_FALSE(r.vs.stalled());
+    r.drive();
+    EXPECT_FALSE(r.vs.stalled());
+    EXPECT_EQ(r.vs.judgedThrough(), 15);
+    for (int64_t o = 10; o < 14; ++o) {
+        const auto* e = r.st.rejected.find(o);
+        ASSERT_NE(e, nullptr) << o;
+        EXPECT_EQ(e->code, uint16_t(rune::protocol::client::ErrorCode::TxnTooLarge));
+    }
+    EXPECT_TRUE(r.indexed(5));
+    EXPECT_EQ(r.st.txn.stats.atomicTooLarge, 1u);
+}
+
+// 12b: the same for P11-7's rejection of an unvoted transaction at its marker.
+TEST(CheckedWritesTxnJudgeRegression, UnvotedTxnRejectionLargerThanTheFreeIndexGrowsItRegression) {
+    JudgeRig r(VoteMembers{100});
+    r.st.rejected.reserve(1);
+    r.start();
+    r.log.data({{1}, {2, 9}, {3}}, 77);   // 10-12, no TxnJudge
+    r.log.marker(77, true);               // 13
+    r.drive(INT64_MAX, 200'000'000);
+    r.drive(INT64_MAX, 2'000'000'000);
+    ASSERT_TRUE(r.vs.stalled());
+    EXPECT_TRUE(r.st.growOwed);
+    EXPECT_EQ(r.st.growNeed_, 3u);
+    EXPECT_EQ(r.st.rejected.size(), 0u);
+    EXPECT_FALSE(r.pool.oneStepHeld());
+    r.st.growRejected();
+    r.vs.unstall();
+    ASSERT_FALSE(r.vs.stalled());
+    r.drive(INT64_MAX, 3'000'000'000);
+    r.drive(INT64_MAX, 4'000'000'000);
+    EXPECT_FALSE(r.vs.stalled());
+    for (const int64_t o : {10, 11, 12}) {
+        const auto* e = r.st.rejected.find(o);
+        ASSERT_NE(e, nullptr) << o;
+        EXPECT_EQ(e->code, kViolation);
+    }
+    EXPECT_FALSE(r.rowed(1));
+    EXPECT_EQ(r.vs.judgeCursor(), 14);
+    EXPECT_EQ(r.freeOverlays(), rune::view::kTxnOverlaysPerWorker);
+}

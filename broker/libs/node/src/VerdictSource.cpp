@@ -653,6 +653,20 @@ bool VerdictSource::recordRejection_(int64_t offset, const Verdict& v) noexcept 
     return true;
 }
 
+// False: n entries do not fit; the worker grows the index to fit and the judge retries, or stalls for good past kIndexMax.
+bool VerdictSource::indexHasRoom_(std::size_t n) noexcept {
+    const std::size_t need = state_->rejected.size() + n;
+    if (need <= state_->rejected.capacity()) return true;
+    if (need > kIndexMax) {
+        stall_(StallReason::Capacity);
+        return false;
+    }
+    state_->growNeed_ = need;
+    state_->growOwed  = true;
+    stall_(StallReason::Full);
+    return false;
+}
+
 void VerdictSource::countRejection_(const Verdict& v) noexcept {
     if (state_->rejected.size() * 4 >= state_->rejected.capacity() * 3) state_->growOwed = true;
     using rune::protocol::client::ErrorCode;
@@ -801,10 +815,7 @@ bool VerdictSource::judgeAtomic_(const rune::protocol::RecordBatchReader& r, con
         return false;
     }
     if (step == ChainStep::Failed) {
-        if (state_->rejected.size() + static_cast<std::size_t>(r.lastOffsetDelta()) + 1 > state_->rejected.capacity()) {
-            stall_(StallReason::Full);
-            return false;
-        }
+        if (!indexHasRoom_(static_cast<std::size_t>(r.lastOffsetDelta()) + 1)) return false;
         bool ok = true;
         (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& span) {
             if (!ok) return;
