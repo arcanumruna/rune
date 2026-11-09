@@ -58,6 +58,13 @@ inline constexpr std::string_view kLeaseUpdatedOffsetColumn = "lease_updated_off
 [[nodiscard]] rune::codec::Descriptor leaseIndexOutDescriptor(const rune::codec::Descriptor& evolving);
 /// buildRowLayout(leaseIndexOutDescriptor(evolving)).  Throws only on a var-len field (a lease topic has none).  Cold.
 [[nodiscard]] rune::view::RowLayout leaseIndexRowLayout(const rune::codec::Descriptor& evolving);
+/// The lease view's output fingerprint (spec 7.1): mix(layoutHash, kLeaseIndexPlanFingerprint), where layoutHash is the wyhash (seed 0) over,
+/// for every slot of `layout` in slot order, [field id u32 LE][column type u8][width u32 LE][offset u32 LE].  `outDesc` is
+/// leaseIndexOutDescriptor(evolving) (slot i = outDesc.fields[i]).  LAYOUT ONLY: no field names, no sinceVersion, no schema name, so a
+/// rename or a FilterSchema/version install that leaves the layout alone keeps it, and an AddField changes it.  Cold.
+[[nodiscard]] uint64_t leaseViewLayoutFingerprint(const rune::codec::Descriptor& outDesc, const rune::view::RowLayout& layout);
+/// leaseViewLayoutFingerprint over the layout of `evolving` (the index's own: leaseIndexOutDescriptor + leaseIndexRowLayout).  Cold.
+[[nodiscard]] uint64_t leaseViewFingerprintOf(const rune::codec::Descriptor& evolving);
 /// keyIndexPlan's twin: name __lease_index, no view topic, 64 KiB chunks.  Cold.
 [[nodiscard]] rune::view::CompiledViewPlan leaseIndexPlan(int32_t srcTopicId, uint16_t keyFieldId);
 

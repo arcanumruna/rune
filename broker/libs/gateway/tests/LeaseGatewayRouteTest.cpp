@@ -29,6 +29,13 @@
 //   | keepalive / TTL       | root under RejectAll / Deleting gate    | served / NamespaceSuspended                 | RootExemptUnderRejectAllRegression
 //   | worker return         | count / chunk mismatch, TTL chunk != 16 | Internal + counter; good returns unchanged  | MalformedWorkerReturnRegression
 //   | keepalive / TTL       | partition 1 of a 2-partition topic      | served by partition 1's leader              | SecondPartitionRoutedRegression
+//   | GetViewRow (legacy)   | topic READ / VIEW-only / no grant       | Ok / NotAuthorized / NotAuthorized          | LegacyGetViewRowAuthorisesOnTopicRegression
+//   | ScanViewRows          | lease view, authorised / not            | UnknownView / NotAuthorized                 | ScanViewRowsOnLeaseViewRegression
+//   | GetViewRowK           | anonymous reader / not logged in        | NotAuthorized / AuthenticationFailed        | LeaseViewAnonymousRegression
+//   | GetViewRowK           | grant revoked while the read is held    | the held row (authorised at request time)   | LeaseViewGrantRevokedWhileHeldRegression
+//   | GetViewRowK           | worker demoted, image says another leader | Redirect with the leader's endpoint       | LeaseViewSentinelRedirectsOnReturnRegression
+//   | GetViewRowK           | partition -1 / == count / led here / not | InvalidRequest / served / Redirect          | LeaseViewPartitionRangeRegression
+//   | lease view mapping    | view sink dropped from the registry     | mapping -1, UnknownView                     | LeaseViewDropClearsMappingRegression
 #include "CheckedWritesRig.h"
 
 #include <rune/gateway/ClientGateway.h>
@@ -316,9 +323,8 @@ struct GwLease {
         sink.name = "instances.leases";
         sink.partitionCount = partitions;
         sink.viewSink = true;
+        sink.leaseSourceTopicId = kTopic;   // the registry's sink spec IS the lease view -> source mapping (Task 13a review fixes)
         if (registry->createTopicAt(kView, sink) != kView) throw std::logic_error("GwLease: lease view id");
-        gw.noteViewSource(kView, kTopic);
-        gw.noteLeaseView(kView, kTopic);
     }
     std::vector<uint8_t> viewFrame(int64_t c, uint64_t key, int32_t partition = -1, int64_t session = 0, int32_t view = kView) const {
         const std::string k = keyOf(key);
@@ -1243,28 +1249,254 @@ TEST(LeaseGatewayRouteRegression, LeaseViewRoutesToSourceLeaderRegression) {
     EXPECT_EQ(GwLease::viewStatus(g.out.back()), int32_t(pc::ViewRowResponse::kOk)) << "the led partition is served";
 }
 
-// 24. Dropping the lease topic's view clears both mappings: a read answers UnknownView at the gate and never reaches the worker.
-//     Mutation: drop the forgetLeaseView / forgetViewSource calls in forgetDroppedTopic and the gate's Dropped check -> routed (red).
+// 24. The lease view -> source mapping has ONE source of truth: the TopicRegistry's view-sink spec.  Dropping the sink in the registry (what the
+//     broker's dropRuntimeTopic_ does for a view sink) clears the mapping by construction: both accessors answer -1, the read is UnknownView at
+//     the gate and never reaches the worker; a READ-on-topic session does not reach it through the lease rule either.
+//     Mutation: make viewSinkSpec answer a Dropped slot's spec (the sink outlives its drop) -> the accessors keep the source (red).
 TEST(LeaseGatewayRouteRegression, LeaseViewDropClearsMappingRegression) {
     GwLease g;
     g.addLeaseView();
     ASSERT_TRUE(g.setup({1}));
+    EXPECT_EQ(g.gw.leaseSourceOfView_(GwLease::kView), kTopic);
+    EXPECT_EQ(g.gw.viewSourceOf_(GwLease::kView), kTopic);
+    EXPECT_EQ(g.gw.leaseSourceOfView_(kTopic), -1) << "the topic itself is not a lease view";
+    EXPECT_EQ(g.gw.leaseSourceOfView_(99), -1);
     std::size_t before = g.out.size();
     g.send(g.viewFrame(1, 1));
     ASSERT_TRUE(g.waitFrames(before, 1));
     EXPECT_EQ(GwLease::viewStatus(g.out.back()), int32_t(pc::ViewRowResponse::kOk));
 
     ASSERT_TRUE(g.registry->dropTopic(GwLease::kView));
-    g.gw.forgetDroppedTopic(GwLease::kView, 1, {});
+    EXPECT_EQ(g.gw.leaseSourceOfView_(GwLease::kView), -1) << "the registry entry died with the sink";
+    EXPECT_EQ(g.gw.viewSourceOf_(GwLease::kView), -1);
     const auto gone = g.send(g.viewFrame(2, 1));
     ASSERT_EQ(gone.size(), 1u);
     EXPECT_EQ(GwLease::viewStatus(gone[0]), int32_t(pc::ViewRowResponse::kUnknownView));
     g.settle();
     EXPECT_EQ(g.out.size(), before + 2) << "nothing was routed to the worker";
 
-    // an authenticated READ-on-topic session no longer reaches it through the lease rule either
     const int64_t user = g.authedSession({topicGrant(rs::Operation::Read)});
     const auto after = g.send(g.viewFrame(3, 1, -1, user));
     ASSERT_EQ(after.size(), 1u);
-    EXPECT_NE(GwLease::viewStatus(after[0]), int32_t(pc::ViewRowResponse::kOk));
+    EXPECT_EQ(GwLease::viewStatus(after[0]), int32_t(pc::ViewRowResponse::kNotAuthorized)) << "a dropped lease view falls back to the VIEW rule: no grant";
+}
+
+// ---- Task 13a review fixes (M4): the matrix cells of the lease view reads through the gateway ----------------------------------------
+
+namespace {
+/// A legacy GetViewRow (72): the u64 key.
+std::vector<uint8_t> legacyViewFrame(const GwLease& g, int64_t c, uint64_t key, int64_t session = 0, int32_t view = GwLease::kView) {
+    pc::GetViewRow m;
+    m.sessionId = session != 0 ? session : g.sid; m.correlationId = c; m.viewTopicId = view; m.keyU64 = key;
+    std::vector<uint8_t> f(pc::GetViewRow::ENCODED_SIZE);
+    m.encode(f.data());
+    return f;
+}
+std::vector<uint8_t> scanViewFrame(const GwLease& g, int64_t c, int64_t session = 0, int32_t view = GwLease::kView) {
+    pc::ScanViewRows m;
+    m.sessionId = session != 0 ? session : g.sid; m.correlationId = c; m.viewTopicId = view; m.limit = 10;
+    const uint8_t prefix[1] = {0};
+    m.prefix = std::span<const uint8_t>(prefix, 1);
+    std::vector<uint8_t> f(m.encodedSize());
+    f.resize(m.encode(f.data()));
+    return f;
+}
+int32_t scanStatus(const std::vector<uint8_t>& f) {
+    const auto r = pc::ScanViewRowsResponse::decode(f.data(), f.size());
+    return r ? int32_t(r->status) : -1;
+}
+}  // namespace
+
+// 25. The legacy GetViewRow (72) authorises exactly like GetViewRowK: READ on the lease TOPIC; a VIEW-only grant on `<t>.leases` and no grant
+//     are NotAuthorized.
+//     Mutation: handleGetViewRow checks READ on the VIEW id again (revert authorizeViewRead_) -> the topic-READ session is refused (red).
+TEST(LeaseGatewayRouteRegression, LegacyGetViewRowAuthorisesOnTopicRegression) {
+    GwLease g;
+    g.addLeaseView();
+    ASSERT_TRUE(g.setup({1}));
+    const uint16_t kOk = pc::ViewRowResponse::kOk, kNotAuth = pc::ViewRowResponse::kNotAuthorized;
+    const int64_t topicRead = g.authedSession({topicGrant(rs::Operation::Read)});
+    std::size_t before = g.out.size();
+    g.send(legacyViewFrame(g, 1, 1, topicRead));
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    EXPECT_EQ(GwLease::viewStatus(g.out.back()), kOk);
+    const auto ok = pc::ViewRowResponse::decode(g.out.back().data(), g.out.back().size());
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ(ok->correlationId, 1);
+    EXPECT_GT(ok->rowLen, 0u) << "the lease row";
+
+    const int64_t viewOnly = g.authedSession({grant(rs::Operation::Read, rs::ResourceType::View, rs::PatternKind::Prefix, "")});
+    const auto denied = g.send(legacyViewFrame(g, 2, 1, viewOnly));
+    ASSERT_EQ(denied.size(), 1u);
+    EXPECT_EQ(GwLease::viewStatus(denied[0]), kNotAuth);
+    const int64_t none = g.authedSession({});
+    const auto nothing = g.send(legacyViewFrame(g, 3, 1, none));
+    ASSERT_EQ(nothing.size(), 1u);
+    EXPECT_EQ(GwLease::viewStatus(nothing[0]), kNotAuth);
+    g.settle();
+}
+
+// 26. ScanViewRows on a lease view is not served (Task 13b's ScanLeases is the scan): an authorised read reaches the worker and is
+//     UnknownView; a session without READ on the topic is refused first (NotAuthorized).
+//     Mutation: serve the scan through the plan-view scan in the worker's lease branch -> not UnknownView (red).
+TEST(LeaseGatewayRouteRegression, ScanViewRowsOnLeaseViewRegression) {
+    GwLease g;
+    g.addLeaseView();
+    ASSERT_TRUE(g.setup({1}));
+    const int64_t topicRead = g.authedSession({topicGrant(rs::Operation::Read)});
+    std::size_t before = g.out.size();
+    g.send(scanViewFrame(g, 1, topicRead));
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    EXPECT_EQ(scanStatus(g.out.back()), int32_t(pc::ViewRowResponse::kUnknownView));
+    const int64_t none = g.authedSession({});
+    const auto denied = g.send(scanViewFrame(g, 2, none));
+    ASSERT_EQ(denied.size(), 1u);
+    EXPECT_EQ(scanStatus(denied[0]), int32_t(pc::ViewRowResponse::kNotAuthorized));
+}
+
+// 27. Not logged in / anonymous: a session that has sent nothing is AuthenticationFailed and ends; with anonymous read switched on the anonymous
+//     reader is NotAuthorized for a lease view (no READ bit on the lease topic), whichever read frame it sends.
+//     Mutation: authorise a lease view for the anonymous reader on the VIEW rule -> red.
+TEST(LeaseGatewayRouteRegression, LeaseViewAnonymousRegression) {
+    GwLease g;
+    g.addLeaseView();
+    ASSERT_TRUE(g.setup({1}));
+    (void)g.authedSession({topicGrant(rs::Operation::Read)});   // Required mode, the object index
+    const auto awaiting = [&] {
+        const int64_t s = g.gw.injectTestSession();
+        g.gw.setSessionAuthForTest(s, rune::gateway::AuthAwaitingFirst{INT64_MAX / 2, 0, false});
+        return s;
+    };
+    const int64_t fresh = awaiting();
+    const auto fr = g.send(g.viewFrame(1, 1, -1, fresh));
+    ASSERT_EQ(fr.size(), 1u);
+    EXPECT_EQ(GwLease::viewStatus(fr[0]), int32_t(pc::ErrorCode::AuthenticationFailed)) << "not logged in";
+    g.gw.setAnonymousRead(true);
+    const int64_t anon = awaiting();
+    const auto k = g.send(g.viewFrame(2, 1, -1, anon));
+    ASSERT_EQ(k.size(), 1u);
+    EXPECT_EQ(GwLease::viewStatus(k[0]), int32_t(pc::ViewRowResponse::kNotAuthorized));
+    const auto l = g.send(legacyViewFrame(g, 3, 1, anon));
+    ASSERT_EQ(l.size(), 1u);
+    EXPECT_EQ(GwLease::viewStatus(l[0]), int32_t(pc::ViewRowResponse::kNotAuthorized));
+}
+
+// 28. The gateway authorises a read at REQUEST time and keeps no per-request state: a read held at the worker behind the fold, whose grant is
+//     revoked before it is re-served, is still answered with the row.  A read sent after the revoke is NotAuthorized.  (Documented behaviour:
+//     revocation takes effect for the next request; the answer to an already-admitted read is not recalled.)
+//     Mutation: authorise on the return path too -> the held row is not delivered (red).
+TEST(LeaseGatewayRouteRegression, LeaseViewGrantRevokedWhileHeldRegression) {
+    GwLease g;
+    g.addLeaseView();
+    ASSERT_TRUE(g.setup({1}));
+    const int64_t v = g.leaseVersion(1);
+    const int64_t user = g.authedSession({topicGrant(rs::Operation::Read)});
+    g.r.holdJudge(true);
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    const auto val = leaseValue(1, v, "a", 5000, 3000);
+    b.append(keyOf(1), std::string_view(reinterpret_cast<const char*>(val.data()), val.size()), 0, rec::withLeaseOp(0, rec::LeaseOp::Checkpoint));
+    const int64_t at = g.r.replica->appendLeaseBatch(b.build());
+    ASSERT_GE(at, 0);
+    g.settle(5);
+    // a GetViewRowK that must see the checkpoint (minOffset = its offset): held while the judge is held
+    pc::GetViewRowK m;
+    m.sessionId = user; m.correlationId = 7; m.viewTopicId = GwLease::kView; m.partition = -1; m.minOffset = at;
+    const std::string k1 = keyOf(1);
+    m.key = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(k1.data()), k1.size());
+    std::vector<uint8_t> f(m.encodedSize());
+    m.encode(f.data());
+    const std::size_t before = g.out.size();
+    g.send(f);
+    g.settle(10);
+    ASSERT_EQ(g.out.size(), before) << "held: no answer yet";
+    ASSERT_EQ(g.r.worker->heldViewReadsForTest(), 1u);
+    g.gw.setSessionAuthForTest(user, rune::gateway::AuthAuthenticated{1, "user", rune::gateway::PermissionTable::compile({}, 0, g.idx), "", 0});
+    g.r.holdJudge(false);
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    const auto held = pc::ViewRowResponse::decode(g.out.back().data(), g.out.back().size());
+    ASSERT_TRUE(held.has_value());
+    EXPECT_EQ(held->correlationId, 7);
+    EXPECT_EQ(held->status, pc::ViewRowResponse::kOk) << "admitted before the revoke: the row is delivered";
+    const auto after = g.send(g.viewFrame(8, 1, -1, user));
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(GwLease::viewStatus(after[0]), int32_t(pc::ViewRowResponse::kNotAuthorized)) << "the next request is refused";
+}
+
+// 29. The worker's not-leader sentinel on the RETURN path: the gateway admitted the read (its image said this node leads), the read is held,
+//     the worker is demoted and the image now names another node: the held read's sentinel answers a Redirect to the image's leader through
+//     viewSourceLedElsewhere_ (the lease view maps to its SOURCE topic's routing).  With the image still naming this node the sentinel is a
+//     bare NotLeader.
+//     Mutation: encode the sentinel as a ViewRowResponse status / skip viewSourceLedElsewhere_ -> no endpoint (red).
+TEST(LeaseGatewayRouteRegression, LeaseViewSentinelRedirectsOnReturnRegression) {
+    GwLease g;
+    g.addLeaseView();
+    ASSERT_TRUE(g.setup({1}));
+    const int64_t v = g.leaseVersion(1);
+    g.r.holdJudge(true);
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    const auto val = leaseValue(1, v, "a", 5000, 3000);
+    b.append(keyOf(1), std::string_view(reinterpret_cast<const char*>(val.data()), val.size()), 0, rec::withLeaseOp(0, rec::LeaseOp::Checkpoint));
+    const int64_t at = g.r.replica->appendLeaseBatch(b.build());
+    ASSERT_GE(at, 0);
+    g.settle(5);
+    const auto heldFrame = [&](int64_t c) {
+        pc::GetViewRowK m;
+        m.sessionId = g.sid; m.correlationId = c; m.viewTopicId = GwLease::kView; m.partition = -1; m.minOffset = at;
+        static const std::string k1 = keyOf(1);
+        m.key = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(k1.data()), k1.size());
+        std::vector<uint8_t> f(m.encodedSize());
+        m.encode(f.data());
+        return f;
+    };
+    // (a) the image changes to another leader while the read is held
+    std::size_t before = g.out.size();
+    g.send(heldFrame(1));
+    g.settle(10);
+    ASSERT_EQ(g.out.size(), before);
+    g.setLeader(kOther);
+    g.r.demote();
+    g.settle(20);
+    ASSERT_EQ(g.out.size(), before + 1);
+    const auto err = pc::ErrorResponse::decode(g.out.back().data(), g.out.back().size());
+    ASSERT_TRUE(err.has_value());
+    EXPECT_EQ(err->code, static_cast<int16_t>(pc::ErrorCode::Redirect));
+    EXPECT_EQ(err->message, kOtherEndpoint);
+    EXPECT_EQ(err->correlationId, 1);
+    // (b) the image still names this node: a bare NotLeader (the client retries)
+    g.setLeader(kNode);
+    before = g.out.size();
+    g.send(heldFrame(2));
+    g.settle(20);
+    ASSERT_EQ(g.out.size(), before + 1);
+    const auto bare = pc::ErrorResponse::decode(g.out.back().data(), g.out.back().size());
+    ASSERT_TRUE(bare.has_value());
+    EXPECT_EQ(bare->code, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_TRUE(bare->message.empty());
+    EXPECT_EQ(bare->correlationId, 2);
+    g.r.holdJudge(false);
+}
+
+// 30. The partition argument of a lease view read on a TWO-partition topic whose partition 1 this node leads: -1 (the whole-key form is only
+//     valid on a one-partition sink) and == partitionCount are InvalidRequest at the gateway; partition 1 is served by its leader; partition
+//     0 (led elsewhere) redirects.
+//     Mutation: accept partition -1 / == count on a wider sink -> red.
+TEST(LeaseGatewayRouteRegression, LeaseViewPartitionRangeRegression) {
+    GwLease g(1 << 22, /*partitionOfRig=*/1, /*partitionCount=*/2);
+    g.addLeaseView();
+    ASSERT_TRUE(g.setup({1}));
+    const uint16_t kInvalidReq = pc::ViewRowResponse::kInvalidRequest;
+    for (const int32_t bad : {-1, 2, 3, INT32_MIN, INT32_MAX}) {
+        const auto fr = g.send(g.viewFrame(10, 1, bad));
+        ASSERT_EQ(fr.size(), 1u) << bad;
+        EXPECT_EQ(GwLease::viewStatus(fr[0]), kInvalidReq) << "partition " << bad;
+    }
+    const std::size_t before = g.out.size();
+    g.send(g.viewFrame(11, 1, /*partition=*/1));
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    EXPECT_EQ(GwLease::viewStatus(g.out.back()), int32_t(pc::ViewRowResponse::kOk));
+    const auto other = g.send(g.viewFrame(12, 1, /*partition=*/0));
+    ASSERT_EQ(other.size(), 1u);
+    const auto err = pc::ErrorResponse::decode(other[0].data(), other[0].size());
+    ASSERT_TRUE(err.has_value());
+    EXPECT_EQ(err->code, static_cast<int16_t>(pc::ErrorCode::Redirect));
 }

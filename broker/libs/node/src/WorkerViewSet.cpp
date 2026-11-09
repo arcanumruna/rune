@@ -1144,9 +1144,9 @@ static ViewInstance freshLeaseIndex(int32_t srcTopicId, int32_t partition, const
     inst.maxRecordsPerPass = replayCap;
     inst.foldLeadership = kNeverActivated;
     inst.layoutGen = spec.leaseLayoutGen;
-    // The lease view's output fingerprint: the row layout is a pure function of `src` plus the fixed lease system columns, so the
-    // fingerprint of `src` mixed with the lease index plan fingerprint names it (same combine as the other 64-bit mixes of the repo).
-    inst.leaseViewFp = rune::codec::fingerprint(src) ^ (kLeaseIndexPlanFingerprint * 0x9E3779B97F4A7C15ull);
+    // The lease view's output fingerprint: LAYOUT ONLY (field ids, column types, widths, offsets of the row layout just built; no names),
+    // mixed with the lease index plan fingerprint (leaseViewLayoutFingerprint).
+    inst.leaseViewFp = leaseViewFingerprintOf(src);
     return inst;
 }
 

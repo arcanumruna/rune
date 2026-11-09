@@ -95,6 +95,9 @@ struct TopicSpec {
     /// VLS B.2: a view's sink -- a replica-less, catalog-only namespace (no log, no dir, no replica); its rows live
     /// in the source owner's WorkerViewSet.  Set by the catalog sink effect (live and boot) only.
     bool        viewSink       = false;
+    /// Lease topics Task 13a: a lease view's sink (`<topic>.leases`) names its lease topic here (the catalog's id; -1: not a lease
+    /// view).  The gateway's one source of truth for the lease view -> source mapping: auth (READ on the topic) and routing.
+    int32_t     leaseSourceTopicId = -1;
     /// Replicas per partition (DDL replicationFactor); 0 = every node (the
     /// default).  Clamped to the cluster size.
     int16_t     replicationFactor = 0;

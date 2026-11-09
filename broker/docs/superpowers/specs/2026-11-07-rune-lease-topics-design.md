@@ -1071,6 +1071,9 @@ hold one session per client, for example one per tenant client for case claims (
 - **`add(topic, partition, keyBytes, version, ttlMs) → LeaseRef`** takes over keepalives for a lease this client
   granted. `keyBytes` is at most 128 bytes (§5.1). `remove(ref)` stops keeping it alive without a revoke.
   `revoke(ref)` sends a fenced revoke and then removes it.
+- **Completed correlation ids.** The gateway keeps no per-request state: after it answers a malformed non-final keepalive return with a final
+  `Internal`, later returns for that correlation id are still forwarded, so the client drops any lease frame for a correlation id it has
+  already completed.
 - **Keepalive.** Each key is kept alive at `ttl/3`, batched per `(topic, partition)` into one `LeaseKeepAlive` of up
   to 256 entries, spread rather than bursty, through a preallocated completion ring. Answers arrive per entry (§8.1).
 - **Ends from a `LeaseWatch` (optional).** `session.observe(watch)` connects a `LeaseWatch` (§12.4) over one of the

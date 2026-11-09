@@ -1644,7 +1644,8 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
         const bool hasLease = (buf[pos] & 4u) != 0;
         const bool isLeaseView = (buf[pos] & 8u) != 0;
         const std::size_t body = len - pos - kCatalogTopicAppliedFeatureBytes;   // 39 with a lease block; 0 or 4 (the source id) for a lease view
-        if (body == 4 && isLeaseView && !hasLease) {
+        if (isLeaseView) {   // a lease view frame always names its lease topic (in-process ring: no skew)
+            if (body != 4 || hasLease) return false;
             m.leaseSourceTopicId = getI32(buf + pos + kCatalogTopicAppliedFeatureBytes);
             if (m.leaseSourceTopicId < 0) return false;
         } else if (body != (hasLease ? rune::protocol::kLeaseSpecBytes : 0)) {

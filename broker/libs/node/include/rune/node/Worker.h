@@ -4609,12 +4609,6 @@ private:
 
         using RS = rune::protocol::client::ViewRowResponse;
 
-        // 0. A lease view (`<topic>.leases`, spec 7.1): no plan template - it is the topic's lease index.  The id -> source mapping is the
-        //    catalog's (the write spec's leaseViewTopicId), a flat scan of the worker's lease topics.
-        if (viewSet_ != nullptr)
-            if (const int32_t leaseSrc = viewSet_->leaseSourceOfView(viewTopicId); leaseSrc >= 0) [[unlikely]]
-                return serveLeaseViewRead_(r, ret, leaseSrc);
-
         // 1. No view set on this worker, or no view installed for this id.
         uint64_t outputFp = 0;
         // Catalog history Task 12 (Task 8 review N5): the control thread posts a
@@ -4622,8 +4616,15 @@ private:
         // any read of it (the gateway gates a sink whose plan is not on every
         // install ring yet), but this pass drains ops before installs — drain
         // them once before answering the permanent UnknownView.  Error path only.
-        if (viewSet_ != nullptr && !viewSet_->viewOutputFingerprint(viewTopicId, outputFp)) [[unlikely]]
+        if (viewSet_ != nullptr && !viewSet_->viewOutputFingerprint(viewTopicId, outputFp)) [[unlikely]] {
+            // Lease topics Task 13a (spec 7.1): a lease view (`<topic>.leases`) has no plan template - it is the topic's lease index.  Asked
+            // ONLY on this plan-view miss (never on a plan-view hit: the plan-view hot path pays nothing), before the install drain (a lease
+            // view has no install).  The id -> source mapping is the catalog's (the write spec's leaseViewTopicId, fed to the view set by
+            // executeWriteSpecUpdateWire_), a flat scan of the worker's few lease topics.
+            if (const int32_t leaseSrc = viewSet_->leaseSourceOfView(viewTopicId); leaseSrc >= 0)
+                return serveLeaseViewRead_(r, ret, leaseSrc);
             (void)viewSet_->drainInstalls();
+        }
         if (viewSet_ == nullptr || !viewSet_->viewOutputFingerprint(viewTopicId, outputFp)) {
             ret.errorCode = static_cast<int16_t>(RS::kUnknownView);
             enqueueReturn_(std::move(ret));
@@ -4753,9 +4754,9 @@ private:
     }
 
     /// Lease topics Task 13a (spec 7.1): a point read (GetViewRow u64 key / GetViewRowK bytes key) of `<topic>.leases`, served from the
-    /// source partition's lease index.  The order is the plan view's: fingerprint pin, leader of the source partition, read lease, the
-    /// namespace meter; then readiness (a not-ready index answers NotReady, never a stale row) and the read-your-writes barrier on the
-    /// index's fold cursor (Hold: the held-read list re-enters here every pass); then the row.  ScanViewRows is not served here (Task 13b's
+    /// source partition's lease index.  The order: leader of the source partition, read lease, the namespace meter; then readiness (a
+    /// not-ready index answers NotReady, never a stale row), the fingerprint pin (against the ready index's layout) and the read-your-writes
+    /// barrier on the index's fold cursor (Hold: the held-read list re-enters here every pass); then the row.  ScanViewRows is not served here (Task 13b's
     /// ScanLeases is the scan): it answers UnknownView.
     ViewServe serveLeaseViewRead_(ViewReadReq& r, WorkerReturn& ret, int32_t src) {
         using RS = rune::protocol::client::ViewRowResponse;
@@ -4766,10 +4767,7 @@ private:
         };
         if (r.kind == ViewReadReq::Kind::Scan) return answer(static_cast<int16_t>(RS::kUnknownView));
         const int32_t partition = r.partition;
-        // 1. Schema drift: a pinned (non-zero) fingerprint that is not the lease view's current one.  (0: no index on this partition.)
-        if (const uint64_t fp = viewSet_->leaseViewFingerprint(src, partition); r.fingerprint != 0 && fp != 0 && r.fingerprint != fp)
-            return answer(static_cast<int16_t>(RS::kSchemaMismatch));
-        // 2. Leader of the source partition, under a read lease (as serveViewReadImpl_ 2b, 2c).
+        // 1. Leader of the source partition, under a read lease (as serveViewReadImpl_ 2b, 2c).
         rune::replication::PartitionReplica* srcRep = findOwnedReplica_(src, partition);
         if (srcRep == nullptr || srcRep->role() != rune::replication::Role::Leader) return answer(kViewRowNotLeaderInternal);
         if (viewLeaseEndNs_ != kViewLeaseUnbounded && leaseNow_() >= viewLeaseEndNs_) [[unlikely]] {
@@ -4786,10 +4784,15 @@ private:
                 return answer(static_cast<int16_t>(RS::kThrottled));
             }
         }
-        // 3. Readiness: every fact of WorkerViewSet::leaseReady_ under this leadership (the judge past every update the index could not track).
+        // 2. Readiness: every fact of WorkerViewSet::leaseReady_ under this leadership (the judge past every update the index could not track).
         const WorkerViewSet::LeaseIndexLookup lk = viewSet_->leaseIndexFor(src, partition, srcRep->leadershipGeneration(), true,
                                                                            srcRep->highWatermark() >= srcRep->leadershipStartOffset());
         if (lk.ref.table == nullptr || !lk.ready) return answer(static_cast<int16_t>(RS::kNotReady));
+        // 3. Schema drift: a pinned (non-zero) fingerprint that is not the lease view's CURRENT one.  Checked here, after leadership, the
+        //     read lease and readiness (a ready index is at the current layout generation, so lk.viewFp is the layout a row would be read
+        //     with): a demoted partition answers the not-leader sentinel, an index still rebuilding for a new column answers NotReady, never
+        //     a SchemaMismatch the client cannot act on yet.
+        if (r.fingerprint != 0 && r.fingerprint != lk.viewFp) return answer(static_cast<int16_t>(RS::kSchemaMismatch));
         // 4. Read-your-writes (as serveViewReadImpl_ 2d): the fold reaches the committed bound at arrival and minOffset + 1.
         if (r.target < 0) {
             if (const int64_t hw = srcRep->highWatermark(); lk.foldCursor < hw) [[unlikely]]
@@ -4797,14 +4800,29 @@ private:
             if (r.minOffset >= 0) r.target = std::max(r.target, std::min(r.minOffset, INT64_MAX - 1) + 1);
         }
         if (r.target >= 0 && lk.foldCursor < r.target) [[unlikely]] return ViewServe::Hold;
-        // 5. The row.  A GetViewRow key is the u64 as 8 little-endian bytes; a key of another width than the table's is BadKey.
+        // 5. The row.  A GetViewRow key is the u64: 8 little-endian bytes, or - when the topic's key is a fixed-width integer narrower than
+        //    8 bytes (Int32 / UInt16 / UInt32) - the u64 encoded to that width, little-endian (the key's wire form).  A value that does not
+        //    fit the key's type (an Int32 reads the u64 as its sign-extension, as a plan view's LegacyU64 key does) is InvalidRequest.  A
+        //    key of another width than the table's is InvalidRequest.
         std::array<uint8_t, 8> u64Key{};
         std::span<const uint8_t> key;
         if (r.kind == ViewReadReq::Kind::PointKey) {
             key = std::span<const uint8_t>(r.keyBytes.data(), r.keyLen);
         } else {
+            std::size_t width = 8;
+            if (const std::size_t kw = lk.ref.table->keyWidth(); kw < 8) [[unlikely]] {
+                const auto sit = writeSpecs_.find(src);
+                const rune::codec::PrimType kt = sit != writeSpecs_.end() ? sit->second->keyType : rune::codec::PrimType::Float64;
+                bool fits = false;
+                if (kt == rune::codec::PrimType::Int32)
+                    fits = static_cast<int64_t>(r.key) >= INT32_MIN && static_cast<int64_t>(r.key) <= INT32_MAX;
+                else if (kt == rune::codec::PrimType::UInt16 || kt == rune::codec::PrimType::UInt32)
+                    fits = (r.key >> (8 * kw)) == 0;
+                if (!fits) return answer(static_cast<int16_t>(RS::kInvalidRequest));
+                width = kw;
+            }
             std::memcpy(u64Key.data(), &r.key, 8);
-            key = std::span<const uint8_t>(u64Key.data(), 8);
+            key = std::span<const uint8_t>(u64Key.data(), width);
         }
         if (key.size() != lk.ref.table->keyWidth()) [[unlikely]] return answer(static_cast<int16_t>(RS::kInvalidRequest));
         const uint8_t* row = lk.ref.table->get(rune::view::ViewKey::fromBytes(key));

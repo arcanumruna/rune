@@ -10,6 +10,10 @@
 //   | GetViewRowK pinned      | the current fingerprint / another / 0         | Ok / SchemaMismatch / Ok         | FingerprintPinRegression
 //   | ScanViewRows            | any                                           | UnknownView                      | ScanViewRowsOnLeaseViewUnknownRegression
 //   | GetViewRowK pinned      | AlterSchema adds a user column                | fingerprint changes; old pin SchemaMismatch, 0 wider row | LeaseViewFingerprintEvolvesRegression
+//   | fingerprint             | demote+promote / rename / FilterSchema order  | unchanged / unchanged / equal    | FingerprintStableAcrossRebuildRegression, LeaseViewFingerprintGoldenRegression
+//   | GetViewRowK pinned      | judge held after ADD / demoted + wrong pin    | NotReady / not-leader sentinel   | PinCheckedAfterReadinessAndLeadershipRegression
+//   | GetViewRow u64          | uint32 / uint16 / int32 key topic             | Ok in range, InvalidRequest out  | NarrowIntegerKeyU64ReadRegression
+//   | held GetViewRowK        | demote / drop / ADD rebuild while held        | sentinel / UnknownView / NotReady | HeldReadReServeCellsRegression
 #include "LeaseRig.h"
 
 #include <rune/view/ViewRow.h>
@@ -271,4 +275,239 @@ TEST(LeaseViewReadRegression, LeaseViewFingerprintEvolvesRegression) {
     EXPECT_GT(wide->chunk.size(), narrow) << "the wider row";
     EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, bytesOf(1), -1, before)), int16_t(RS::kSchemaMismatch)) << "the old pin";
     EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, bytesOf(1), -1, after)), int16_t(RS::kOk)) << "the new pin";
+}
+
+
+// ---- Task 13a review fixes ------------------------------------------------------------------------------------------------------
+
+namespace {
+
+/// The lease source descriptor of the rig with the key field's type and the user column's / schema's names chosen.
+rune::codec::Descriptor leaseSrc(uint16_t latest, const char* schemaName = "inst", const char* addrName = "addr",
+                                 rune::codec::PrimType keyType = rune::codec::PrimType::UInt64) {
+    using rune::codec::PrimType;
+    rune::codec::DescriptorBuilder d(schemaName, latest);
+    d.add("lease_version", PrimType::Int64).add("lease_ttl_ms", PrimType::UInt64).add("lease_holder", PrimType::UInt64)
+        .add("lease_remaining_ms", PrimType::UInt64).add("id", keyType, 1, true).addFixedStr(addrName, 16);
+    if (latest >= 2) d.add("port", PrimType::UInt32, 2);
+    return d.build();
+}
+
+void waitReady(Lk& k) {
+    for (int i = 0; i < ltr::kCap && !k.r.leaseReady(); ++i) k.r.pass();
+    ASSERT_TRUE(k.r.leaseReady());
+}
+/// Passes until the index is ready AND its fingerprint differs from `old` (a rebuild over a new layout), hard-capped.
+uint64_t waitNewFingerprint(Lk& k, uint64_t old) {
+    for (int i = 0; i < 2000; ++i) {
+        k.r.pass();
+        const uint64_t fp = k.r.vs->leaseViewFingerprint(kSrc, 0);
+        if (fp != 0 && fp != old && k.r.leaseReady()) return fp;
+    }
+    return 0;
+}
+
+}  // namespace
+
+// 11. M2: the lease view fingerprint is a pure function of the row LAYOUT (field ids, column types, widths, offsets of the lease index row):
+// it survives a demote + promote (a rebuild of the index), a rename of a user column with a forced rebuild, and it is the same whichever
+// of the two schema installs (SchemaUpdate = the writer version, FilterSchema = the evolving blob) reaches the worker first.  A pinned
+// read keeps working through each of them.
+// Mutation: hash a field NAME into leaseViewLayoutFingerprint -> the rename leg turns red.
+TEST(LeaseViewReadRegression, FingerprintStableAcrossRebuildRegression) {
+    Lk k(noCheckpoints());
+    grantKey1(k);
+    const uint64_t fp0 = k.r.vs->leaseViewFingerprint(kSrc, 0);
+    ASSERT_NE(fp0, 0u);
+    EXPECT_EQ(fp0, leaseViewFingerprintOf(VerdictRig::leaseSourceDescriptor(1))) << "the worker's fingerprint is the layout function";
+
+    k.r.demotePromote();
+    waitReady(k);
+    EXPECT_EQ(k.r.vs->leaseViewFingerprint(kSrc, 0), fp0) << "a demote + promote rebuilds the index over the same layout";
+    EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, bytesOf(1), -1, fp0)), int16_t(RS::kOk)) << "the pin from before survives";
+
+    // RENAME a user column and the schema; the evolving blob arrives, a new leadership forces the rebuild.
+    k.r.leaseFilterSchema(leaseSrc(1, "inst_renamed", "address"), 1);
+    k.r.passes(10);
+    k.r.demotePromote();
+    waitReady(k);
+    EXPECT_EQ(k.r.vs->leaseViewFingerprint(kSrc, 0), fp0) << "names are not part of the fingerprint";
+    EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, bytesOf(1), -1, fp0)), int16_t(RS::kOk));
+
+    // FilterSchema before vs after the versions: two rigs, one ADD of `port`, the two installs in either order.
+    const rune::codec::Descriptor v2 = leaseSrc(2);
+    uint64_t fpA = 0, fpB = 0;
+    {
+        Lk a(noCheckpoints());
+        grantKey1(a);
+        a.r.leaseFilterSchema(v2, 2);
+        a.r.leaseSchemaUpdate(v2, 2);
+        fpA = waitNewFingerprint(a, fp0);
+    }
+    {
+        Lk b(noCheckpoints());
+        grantKey1(b);
+        b.r.leaseSchemaUpdate(v2, 2);
+        b.r.leaseFilterSchema(v2, 2);
+        fpB = waitNewFingerprint(b, fp0);
+    }
+    ASSERT_NE(fpA, 0u);
+    ASSERT_NE(fpB, 0u);
+    EXPECT_EQ(fpA, fpB) << "the install order does not move the fingerprint";
+    EXPECT_EQ(fpA, leaseViewFingerprintOf(v2));
+    EXPECT_NE(fpA, fp0) << "an ADD does";
+}
+
+// 12. The fingerprint is pinned by a golden value: the layout of the rig's lease topic at version 1 and 2 (the four system columns, id, addr
+// [, port] and the two offset columns).  A change of the hashed bytes (the encoding below) or of the lease system columns moves it.
+// Mutation: hash the slot index instead of the field id / drop the offset from the bytes -> red.
+TEST(LeaseViewReadRegression, LeaseViewFingerprintGoldenRegression) {
+    EXPECT_EQ(leaseViewFingerprintOf(leaseSrc(1)), 0x6141a01b41ea80bcull) << "v1 layout";
+    EXPECT_EQ(leaseViewFingerprintOf(leaseSrc(2)), 0xff8cf5f8f7c7dbebull) << "v2 layout (port added)";
+    // names, the schema name and sinceVersion never matter
+    EXPECT_EQ(leaseViewFingerprintOf(leaseSrc(1, "other", "other_name")), leaseViewFingerprintOf(leaseSrc(1)));
+    // a different key type changes the column type of the id slot
+    EXPECT_NE(leaseViewFingerprintOf(leaseSrc(1, "inst", "addr", rune::codec::PrimType::UInt32)), leaseViewFingerprintOf(leaseSrc(1)));
+}
+
+// 13. M3: the fingerprint pin is checked AFTER leadership, the read lease and readiness, against the READY index's layout.  After an AlterSchema
+// ADD whose rebuild cannot finish (the judge is held), a read pinned to the NEW fingerprint is NotReady (retriable), not SchemaMismatch; a
+// demoted partition answers the not-leader sentinel whatever the pin; once the rebuild is done the new pin is served and the old one is
+// SchemaMismatch.
+// Mutation: check the pin first (against the stale index's fingerprint) -> the first leg answers SchemaMismatch and the demoted one too: red.
+TEST(LeaseViewReadRegression, PinCheckedAfterReadinessAndLeadershipRegression) {
+    Lk k(noCheckpoints());
+    grantKey1(k);
+    const uint64_t oldFp = k.r.vs->leaseViewFingerprint(kSrc, 0);
+    const uint64_t newFp = leaseViewFingerprintOf(leaseSrc(2));
+    ASSERT_NE(oldFp, newFp);
+    k.r.holdJudge(true);
+    k.r.addLeasePort();
+    k.r.passes(30);
+    ASSERT_FALSE(k.r.leaseReady()) << "the rebuild for the wider layout waits for the judge";
+    EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, bytesOf(1), -1, newFp)), int16_t(RS::kNotReady)) << "pinned to the new layout";
+    EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, bytesOf(1), -1, oldFp)), int16_t(RS::kNotReady)) << "pinned to the old layout";
+    k.r.holdJudge(false);
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    ASSERT_EQ(waitNewFingerprint(k, oldFp), newFp);
+    EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, bytesOf(1), -1, newFp)), int16_t(RS::kOk));
+    EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, bytesOf(1), -1, oldFp)), int16_t(RS::kSchemaMismatch));
+
+    k.r.demote();
+    EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, bytesOf(1), -1, newFp + 1)), kViewRowNotLeaderInternal) << "demoted, wrong pin";
+    EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, bytesOf(1), -1, oldFp)), kViewRowNotLeaderInternal) << "demoted, stale pin";
+}
+
+// 14. L3: a GetViewRow (u64 key) of a lease topic whose key is a fixed-width integer NARROWER than 8 bytes encodes the u64 to the key's width
+// (little-endian: its wire form); a value that does not fit the key's type is InvalidRequest.  UInt32 / UInt16: the unsigned range;
+// Int32: the sign-extension of the int32 range, as a plan view's LegacyU64 key reads it.  A GetViewRowK of the key's own width is served;
+// of 8 bytes it is InvalidRequest (a key of another width than the table's).
+// Mutation: always send the 8 bytes (drop the narrowing) -> every in-range read is InvalidRequest: red.
+TEST(LeaseViewReadRegression, NarrowIntegerKeyU64ReadRegression) {
+    using rune::codec::PrimType;
+    struct Case { PrimType type; uint32_t width; std::vector<uint64_t> granted; std::vector<uint64_t> absent; std::vector<uint64_t> bad; };
+    const std::vector<Case> cases = {
+        {PrimType::UInt32, 4, {7, 0xFFFFFFFFull}, {8}, {0x1'0000'0000ull, 0x1'0000'0007ull, UINT64_MAX}},
+        {PrimType::UInt16, 2, {7, 0xFFFFull}, {8}, {0x1'0000ull, 0x1'0007ull, UINT64_MAX}},
+        {PrimType::Int32, 4, {7, 0xFFFFFFFFFFFFFFFBull /* -5 */, 0x7FFFFFFFull}, {8}, {0x1'0000'0000ull, 0xFFFFFFFFull /* 4294967295 */, 0x8000'0000ull}},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(testing::Message() << "key width " << c.width << " type " << int(c.type));
+        Lk k(noCheckpoints(), false, {}, 64LL * 1024 * 1024, KeyShape{c.type}, leaseSrc(1, "inst", "addr", c.type));
+        std::vector<RawRec> grants;
+        for (uint64_t id : c.granted) {
+            std::string key(c.width, '\0');
+            std::vector<uint8_t> v(4u + 32u + c.width + 16u, 0);
+            ltr::putLe(v, 0, 32u + c.width + 16u, 2);
+            ltr::putLe(v, 2, 1, 2);
+            ltr::putLe(v, 12, 5000, 8);
+            ltr::putLe(v, 20, 1, 8);
+            ltr::putLe(v, 36, id, c.width);
+            v[36 + c.width] = 'a';
+            for (uint32_t i = 0; i < c.width; ++i) key[i] = char(id >> (8 * i));
+            grants.push_back({key, v, 1});
+        }
+        ASSERT_TRUE(k.produce(grants));
+        ASSERT_TRUE(k.r.driveUntilJudged());
+        waitReady(k);
+        const auto lk = k.r.vs->leaseIndexFor(kSrc, 0, k.r.replica->leadershipGeneration(), true, true);
+        ASSERT_NE(lk.ref.table, nullptr);
+        ASSERT_EQ(lk.ref.table->keyWidth(), c.width);
+        const auto u64Bytes = [](uint64_t v) { std::vector<uint8_t> b(8); for (int i = 0; i < 8; ++i) b[std::size_t(i)] = uint8_t(v >> (8 * i)); return b; };
+        for (uint64_t id : c.granted) {
+            const auto a = readOnce(k, WorkerOp::Type::GetViewRow, u64Bytes(id));
+            ASSERT_TRUE(a) << id;
+            EXPECT_EQ(a->errorCode, int16_t(RS::kOk)) << "u64 " << id;
+            EXPECT_EQ(a->recordCount, int32_t(lk.ref.layout->rowLen));
+            std::vector<uint8_t> wire(c.width);
+            for (uint32_t i = 0; i < c.width; ++i) wire[i] = uint8_t(id >> (8 * i));
+            const auto kk = readOnce(k, WorkerOp::Type::GetViewRowK, wire);
+            ASSERT_TRUE(kk) << id;
+            EXPECT_EQ(kk->errorCode, int16_t(RS::kOk)) << "the key's own wire form";
+            EXPECT_EQ(kk->chunk, a->chunk) << "the same row";
+        }
+        for (uint64_t id : c.absent) EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRow, u64Bytes(id))), int16_t(RS::kAbsentKey)) << "u64 " << id;
+        for (uint64_t id : c.bad) EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRow, u64Bytes(id))), int16_t(RS::kInvalidRequest)) << "u64 " << id;
+        EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, std::vector<uint8_t>(8, 0))), int16_t(RS::kInvalidRequest)) << "8-byte wire key";
+    }
+}
+
+// 15. M4 (worker cells): a read HELD behind the fold is re-served every pass with every check re-run.  Demoted while held -> the not-leader
+// sentinel; the topic dropped while held -> UnknownView (the lease view mapping is gone with the topic); an AlterSchema ADD whose rebuild
+// cannot finish while held -> NotReady at once (not at the 100 ms deadline).
+// Mutation: skip the readiness / role check on a re-serve (answer the held read from the old index) -> red.
+TEST(LeaseViewReadRegression, HeldReadReServeCellsRegression) {
+    const auto holdOne = [](Lk& k) {
+        const int64_t never = k.r.leo() + 1000;
+        (void)k.r.takeViewAnswers();
+        k.r.postViewReadOp(WorkerOp::Type::GetViewRowK, kView, bytesOf(1), never);
+        for (int i = 0; i < 5; ++i) {
+            k.r.pass();
+            ASSERT_TRUE(k.r.takeViewAnswers().empty());
+        }
+        ASSERT_EQ(k.r.worker->heldViewReadsForTest(), 1u);
+    };
+    const auto answerWithin = [](Lk& k, int passes) -> std::optional<WorkerReturn> {
+        for (int i = 0; i < passes; ++i) {
+            k.r.pass();
+            auto a = k.r.takeViewAnswers();
+            if (!a.empty()) return std::move(a.front());
+        }
+        return std::nullopt;
+    };
+    {   // demoted while held
+        Lk k(noCheckpoints());
+        grantKey1(k);
+        holdOne(k);
+        k.r.demote();
+        const auto a = answerWithin(k, 20);
+        ASSERT_TRUE(a);
+        EXPECT_EQ(a->errorCode, kViewRowNotLeaderInternal);
+        EXPECT_EQ(k.r.worker->heldViewReadsForTest(), 0u);
+    }
+    {   // dropped while held
+        Lk k(noCheckpoints());
+        grantKey1(k);
+        holdOne(k);
+        WorkerOp drop;
+        drop.type = WorkerOp::Type::TopicDropped; drop.topicId = kSrc;
+        ASSERT_TRUE(k.r.worker->tryEnqueueOp(std::move(drop)));
+        const auto a = answerWithin(k, 20);
+        ASSERT_TRUE(a);
+        EXPECT_EQ(a->errorCode, int16_t(RS::kUnknownView));
+        EXPECT_EQ(k.r.worker->heldViewReadsForTest(), 0u);
+        EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, bytesOf(1))), int16_t(RS::kUnknownView)) << "a new read too";
+    }
+    {   // an AlterSchema ADD while held, the rebuild blocked
+        Lk k(noCheckpoints());
+        grantKey1(k);
+        holdOne(k);
+        k.r.holdJudge(true);
+        k.r.addLeasePort();
+        const auto a = answerWithin(k, 40);
+        ASSERT_TRUE(a);
+        EXPECT_EQ(a->errorCode, int16_t(RS::kNotReady));
+        EXPECT_EQ(k.r.worker->heldViewReadsForTest(), 0u);
+        k.r.holdJudge(false);
+    }
 }

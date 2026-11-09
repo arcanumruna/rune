@@ -74,7 +74,10 @@ SinkSpec leaseSinkSpecOf(const cat::ViewObject& v, const cat::CatalogState& stat
         s.partitions  = t->partitions;
         s.persistence = t->persistence;
         s.leaseSourceTopicId = t->topicId;
-        if (t->schema) s.keyField = t->schema->keyField;
+        if (t->schema) {
+            s.keyField = t->schema->keyField;
+            s.sourceKeyFeatures = t->schema->keyFeatures;   // the lease topic's own key features (the sink mirrors its source's partitioner), never the default
+        }
     }
     return s;
 }

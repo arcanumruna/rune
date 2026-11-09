@@ -112,10 +112,11 @@ struct Lk {
     int64_t corr = 1000;
     std::vector<Frame> frames;
 
-    explicit Lk(const rune::protocol::LeaseSpec& spec, bool follower = false, RigTuning tuning = {}, int64_t rollBytes = 64LL * 1024 * 1024)
+    explicit Lk(const rune::protocol::LeaseSpec& spec, bool follower = false, RigTuning tuning = {}, int64_t rollBytes = 64LL * 1024 * 1024,
+                KeyShape key = KeyShape{rune::codec::PrimType::UInt64}, std::optional<rune::codec::Descriptor> src = std::nullopt)
         : r(follower, rollBytes, tuning) {
         r.worker->setLeaseClockForTest(&leaseNow);
-        r.createLeaseTopicSpec(spec);
+        r.createLeaseTopicSpec(spec, std::move(src), key);
         r.passes(30);
         WorkerOp level;
         level.type = WorkerOp::Type::ClusterFeatureLevel; level.nextOffset = rune::replication::MetadataFeature::kLeases;

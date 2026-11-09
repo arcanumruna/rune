@@ -3549,7 +3549,6 @@ void ClientGateway::forgetDroppedTopic(int32_t topicId, int32_t partitions,
 {
     std::erase(viewSinksAwaitingPlan_, topicId);   // Task 12 (N5): a dropped sink waits for nothing
     forgetViewSource(topicId);                     // Task 22 fix round 1 (C1): no source to route a read to
-    forgetLeaseView(topicId);                      // Lease topics Task 13a: a dropped lease view authorises and routes nothing
     for (int32_t p = 0; p < partitions; ++p) {
         partitionTxnStates_.erase(partitionKey(topicId, p));
         if (const auto it = inlinePsm_.find(inlinePsmKey_(topicId, p)); it != inlinePsm_.end()) {
@@ -5964,27 +5963,13 @@ void ClientGateway::forgetViewSource(int32_t viewTopicId)
     if (it != viewSources_.end() && it->first == viewTopicId) viewSources_.erase(it);
 }
 
-void ClientGateway::noteLeaseView(int32_t viewTopicId, int32_t sourceTopicId)
-{
-    const auto it = std::lower_bound(leaseViews_.begin(), leaseViews_.end(), viewTopicId,
-                                     [](const auto& e, int32_t id) { return e.first < id; });
-    if (it != leaseViews_.end() && it->first == viewTopicId) it->second = sourceTopicId;
-    else leaseViews_.insert(it, {viewTopicId, sourceTopicId});
-}
-
-void ClientGateway::forgetLeaseView(int32_t viewTopicId)
-{
-    const auto it = std::lower_bound(leaseViews_.begin(), leaseViews_.end(), viewTopicId,
-                                     [](const auto& e, int32_t id) { return e.first < id; });
-    if (it != leaseViews_.end() && it->first == viewTopicId) leaseViews_.erase(it);
-}
-
 int32_t ClientGateway::leaseSourceOfView_(int32_t viewTopicId) const noexcept
 {
-    if (leaseViews_.empty()) [[likely]] return -1;
-    const auto it = std::lower_bound(leaseViews_.begin(), leaseViews_.end(), viewTopicId,
-                                     [](const auto& e, int32_t id) { return e.first < id; });
-    return (it != leaseViews_.end() && it->first == viewTopicId) ? it->second : -1;
+    // The registry's sink spec (viewSinkSpec is null for a Dropped / unknown id): -1 for every non-lease view.  Control-plane facts only,
+    // O(1), no allocation.
+    if (topicRegistry_ == nullptr) return -1;
+    const rune::node::TopicSpec* sp = topicRegistry_->viewSinkSpec(viewTopicId);
+    return sp != nullptr ? sp->leaseSourceTopicId : -1;
 }
 
 std::optional<rune::gateway::Denial> ClientGateway::authorizeViewRead_(const rune::gateway::PermissionTable& perms,
@@ -5999,6 +5984,7 @@ std::optional<rune::gateway::Denial> ClientGateway::authorizeViewRead_(const run
 
 int32_t ClientGateway::viewSourceOf_(int32_t viewTopicId) const noexcept
 {
+    if (const int32_t lease = leaseSourceOfView_(viewTopicId); lease >= 0) return lease;   // a lease view: its lease topic (the registry's)
     const auto it = std::lower_bound(viewSources_.begin(), viewSources_.end(), viewTopicId,
                                      [](const auto& e, int32_t id) { return e.first < id; });
     return (it != viewSources_.end() && it->first == viewTopicId) ? it->second : -1;
@@ -7564,6 +7550,9 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             const std::size_t count = static_cast<std::size_t>(ret.recordCount > 0 ? ret.recordCount : 0);
             if (count < 1 || count > LKR::kMaxEntries || chunk.size() != count * LKR::kEntryBytes) [[unlikely]] {
                 // A worker bug (its chunk is built by the lease runtime, never by a client): count it, say so, answer Internal.
+                // Decided (11b(d)): the gateway is stateless per request.  This Internal is a FINAL answer, yet a later return for the same
+                // correlation id is still forwarded; the CLIENT drops any lease frame for a correlation id it has already completed
+                // (Task 14, spec 12.2).  No per-correlation state here.
                 noteLeaseReturnMalformed_("LeaseKeepAliveResult", ret.recordCount, chunk.size());
                 const std::size_t n = encodeRejection(static_cast<uint16_t>(pc::TemplateId::LeaseKeepAlive), ret.sessionId,
                                                       ret.correlationId, static_cast<uint16_t>(pc::ErrorCode::Internal),

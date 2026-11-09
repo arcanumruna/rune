@@ -726,6 +726,17 @@ public:
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
     }
+    /// Lease topics Task 13a review: a GetViewRowK point read (typed key bytes) of `partition` (-1 = the gateway hashes the key);
+    /// the answer by awaitViewRowOrError.
+    int64_t sendGetViewRowK(const std::string& ch, int32_t stream, int64_t sid, int32_t viewTopicId,
+                            std::span<const uint8_t> key, int32_t partition = -1, uint64_t fingerprint = 0) {
+        pc::GetViewRowK m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.viewTopicId = viewTopicId; m.partition = partition;
+        m.requestedFingerprint = fingerprint; m.key = key;
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
     std::optional<uint16_t> awaitViewRow(int64_t corr, Clock::time_point deadline) {
         const auto r = awaitIn_(viewRows_, corr, deadline);
         return r ? std::optional<uint16_t>(r->status) : std::nullopt;

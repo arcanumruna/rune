@@ -1,6 +1,7 @@
 #include <rune/node/lease/LeaseIndex.h>
 
 #include <rune/protocol/BatchRebuild.h>
+#include <rune/storage/WyHash.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/view/Verdict.h>
@@ -55,6 +56,25 @@ rune::codec::Descriptor leaseIndexOutDescriptor(const rune::codec::Descriptor& e
 
 rune::view::RowLayout leaseIndexRowLayout(const rune::codec::Descriptor& evolving) {
     return rune::view::buildRowLayout(leaseIndexOutDescriptor(evolving));
+}
+
+uint64_t leaseViewLayoutFingerprint(const rune::codec::Descriptor& outDesc, const rune::view::RowLayout& layout) {
+    std::vector<uint8_t> buf;
+    buf.reserve(layout.slotType.size() * 13);
+    const auto putU32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) buf.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    for (std::size_t i = 0; i < layout.slotType.size(); ++i) {
+        putU32(i < outDesc.fields.size() ? static_cast<uint32_t>(outDesc.fields[i].id) : 0u);
+        buf.push_back(static_cast<uint8_t>(layout.slotType[i]));
+        putU32(layout.slotWidth[i]);
+        putU32(layout.slotOffset[i]);
+    }
+    const uint64_t layoutHash = rune::storage::detail::wyhash64(buf.data(), buf.size(), 0);
+    return layoutHash ^ (kLeaseIndexPlanFingerprint * 0x9E3779B97F4A7C15ull);
+}
+
+uint64_t leaseViewFingerprintOf(const rune::codec::Descriptor& evolving) {
+    const rune::codec::Descriptor out = leaseIndexOutDescriptor(evolving);
+    return leaseViewLayoutFingerprint(out, rune::view::buildRowLayout(out));
 }
 
 rune::view::CompiledViewPlan leaseIndexPlan(int32_t srcTopicId, uint16_t keyFieldId) {

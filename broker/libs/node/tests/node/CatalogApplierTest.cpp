@@ -16,6 +16,7 @@
 #include <rune/node/CatalogCheckpoint.h>
 #include <rune/node/CatalogEffectFrames.h>
 #include <rune/node/SchemaRegistry.h>
+#include <rune/node/WriteState.h>
 #include <rune/node/ViewRegistry.h>
 
 #include <rune/catalog/CatalogEvent.h>
@@ -1626,6 +1627,14 @@ TEST(LeaseEffectsRegression, LiveCreateEmitsTopicThenLeaseSinkRegression) {
     EXPECT_EQ(sp.keyField, "id");
     EXPECT_EQ(sp.nsId, 0u);
     EXPECT_EQ(sp.leaseSourceTopicId, 1) << "Task 13a: the lease view names its lease topic (the catalog's id)";
+    {   // L6: the sink mirrors the lease topic's key features (set from the source topic explicitly)
+        const cat::TopicObject* owner = rig.applier.state().topicByName(0, "inst");
+        ASSERT_NE(owner, nullptr);
+        ASSERT_TRUE(owner->schema.has_value());
+        EXPECT_EQ(sp.sourceKeyFeatures.keyIndex, owner->schema->keyFeatures.keyIndex);
+        EXPECT_EQ(sp.sourceKeyFeatures.autoIncrement, owner->schema->keyFeatures.autoIncrement);
+        EXPECT_EQ(sp.sourceKeyFeatures.partitioner, owner->schema->keyFeatures.partitioner);
+    }
     EXPECT_TRUE(rig.rec.liveViewInstalls.empty()) << "no plan: never viewInstalled";
     EXPECT_NE(rig.rec.objects.byName(0, "inst.leases"), std::nullopt) << "its name resolves";
 }
@@ -1735,11 +1744,11 @@ TEST(CatalogTopicAppliedLeaseRoundTripRegression, LeaseViewSinkCarriesItsSourceR
     EXPECT_TRUE(m.leaseView);
     EXPECT_EQ(m.leaseSourceTopicId, 5);
     EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m, /*sink*/false)) << "a TopicApplied frame refuses bit 3";
-    // a lease view without a known source: the old, shorter form still decodes, naming none
+    // a lease view frame WITHOUT its source is refused (Task 13a review fixes: the gateway registry's lease mapping has one definition,
+    // a sink with a source; the in-process ring has no version skew)
     std::vector<uint8_t> bare(catalogTopicAppliedWireLen("inst.leases", c));
     writeCatalogTopicApplied(bare.data(), 9, "inst.leases", 2, 0, 0, c, 3, kf, std::nullopt, true);
-    ASSERT_TRUE(decodeCatalogTopicApplied(bare.data(), bare.size(), m, true));
-    EXPECT_EQ(m.leaseSourceTopicId, -1);
+    EXPECT_FALSE(decodeCatalogTopicApplied(bare.data(), bare.size(), m, true)) << "a lease view frame without its source";
     // the 4 bytes belong to a lease view only: not to a plain sink, not cut, not extended, not a negative id
     auto plain = f;
     plain[plain.size() - 4 - 2] &= static_cast<uint8_t>(~8u);
@@ -1754,6 +1763,66 @@ TEST(CatalogTopicAppliedLeaseRoundTripRegression, LeaseViewSinkCarriesItsSourceR
     EXPECT_FALSE(decodeCatalogTopicApplied(negative.data(), negative.size(), m, true));
 }
 
+// Lease topics Task 13a review fixes (H1): the PRODUCTION sink (AdminWorkerAgent) posts the two facts the lease view read depends on, from the
+// catalog and on both paths: the write spec names the lease view's sink id (the worker maps `<t>.leases` -> `<t>` with it), and the lease
+// view's sink frame names its lease topic (the gateway's TopicRegistry holds the mapping).  Never `topicId + 1` arithmetic.
+// Mutation: post the write spec without the catalog's lease view id (postCatalogWriteSpec_ passes -1) -> red; drop leaseSourceTopicId from
+// leaseSinkSpecOf -> red.
+TEST(LeaseEffectsRegression, ProductionSinkPostsTheLeaseViewMappingOnBothPathsRegression) {
+    using namespace rune::node;
+    // The agent's OWN applier applies the script (production: the sink reads the lease view id from the applier that applied the event).
+    const auto check = [&](const char* path, const std::vector<Frame>& frames, const CatalogApplier& applied) {
+        const cat::TopicObject* t = applied.state().topicByName(0, "inst");
+        ASSERT_NE(t, nullptr) << path;
+        const cat::ViewObject* lv = applied.state().leaseViewOf(t->objectId);
+        ASSERT_NE(lv, nullptr) << path;
+        bool spec = false, sink = false;
+        for (const auto& f : frames) {
+            if (f.type == kA2cWriteSpec) {
+                const auto w = decodeTopicWriteSpec(std::span<const uint8_t>(f.bytes.data(), f.bytes.size()));
+                ASSERT_TRUE(w.has_value()) << path;
+                if (w->topicId != t->topicId) continue;
+                spec = true;
+                EXPECT_TRUE(w->lease.has_value()) << path;
+                EXPECT_EQ(w->leaseViewTopicId, lv->def.viewTopicId) << path << ": the catalog's lease view id";
+            } else if (f.type == kA2cCatalogSinkApplied) {
+                CatalogTopicAppliedMsg m;
+                ASSERT_TRUE(decodeCatalogTopicApplied(f.bytes.data(), f.bytes.size(), m, /*sink*/true)) << path;
+                if (m.topicId != lv->def.viewTopicId) continue;
+                sink = true;
+                EXPECT_TRUE(m.leaseView) << path;
+                EXPECT_EQ(m.leaseSourceTopicId, t->topicId) << path << ": the lease view names its lease topic";
+            }
+        }
+        EXPECT_TRUE(spec) << path << ": the lease topic's write spec was posted";
+        EXPECT_TRUE(sink) << path << ": the lease view's sink frame was posted";
+    };
+    {
+        CatalogRig rig("lease_prod_live");
+        AdminWorkerAgent agent(rig.schemas, 1, AdminDeps{}, nullptr, &rig.replica());
+        CatalogApplier& ap = agent.worker().applierForTest();
+        ASSERT_EQ(ap.replayLocal(rig.replica(), agent.catalogBootEffects()), 0);
+        ASSERT_TRUE(ap.goLive(agent.catalogLiveEffects()));
+        appendLeaseScript(rig, 0, 2);
+        ASSERT_EQ(ap.applyCommitted(rig.replica()), 2);
+        check("live", drainFailureRing(agent), ap);
+    }
+    {
+        CatalogRig rig("lease_prod_boot");
+        appendLeaseScript(rig, 0, 2);
+        ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 2);
+        rig.restart();
+        AdminWorkerAgent agent(rig.schemas, 1, AdminDeps{}, nullptr, &rig.replica());
+        CatalogApplier& ap = agent.worker().applierForTest();
+        ASSERT_EQ(ap.replayLocal(rig.replica(), agent.catalogBootEffects()), 2);
+        (void)drainFailureRing(agent);   // the boot replay's own frames
+        CatalogEffects stash = agent.catalogBootEffects().sink;
+        stash.maxFrameBytes = catalogEffectMaxFrame();
+        ap.postBootStash(stash);
+        check("postBootStash", drainFailureRing(agent), ap);
+    }
+}
+
 TEST(CatalogTopicAppliedLeaseRoundTripRegression, LeaseTopicLeaseViewSinkAndNeither) {
     using namespace rune::node;
     rune::protocol::TopicConfig c;
@@ -1763,9 +1832,9 @@ TEST(CatalogTopicAppliedLeaseRoundTripRegression, LeaseTopicLeaseViewSinkAndNeit
     rune::protocol::TopicKeyFeatures kf;
     kf.keyIndex = true;
 
-    auto encode = [&](const std::optional<rune::protocol::LeaseSpec>& lease, bool leaseView) {
-        std::vector<uint8_t> f(catalogTopicAppliedWireLen("inst", c, lease.has_value()));
-        writeCatalogTopicApplied(f.data(), 4, "inst", 2, 0, 0, c, /*nsId=*/3, kf, lease, leaseView);
+    auto encode = [&](const std::optional<rune::protocol::LeaseSpec>& lease, bool leaseView, int32_t source = -1) {
+        std::vector<uint8_t> f(catalogTopicAppliedWireLen("inst", c, lease.has_value(), leaseView && source >= 0));
+        writeCatalogTopicApplied(f.data(), 4, "inst", 2, 0, 0, c, /*nsId=*/3, kf, lease, leaseView, source);
         return f;
     };
     CatalogTopicAppliedMsg m;
@@ -1779,11 +1848,16 @@ TEST(CatalogTopicAppliedLeaseRoundTripRegression, LeaseTopicLeaseViewSinkAndNeit
         EXPECT_EQ(m.nsId, 3u);
         EXPECT_EQ(f.size(), catalogTopicAppliedWireLen("inst", c, false) + rune::protocol::kLeaseSpecBytes);
     }
+    {   // a lease view sink without its source id is refused (Task 13a review: the registry's mapping must be complete)
+        const auto bare = encode(std::nullopt, true);
+        EXPECT_FALSE(decodeCatalogTopicApplied(bare.data(), bare.size(), m, /*sink*/true));
+    }
     {   // a lease view sink
-        const auto f = encode(std::nullopt, true);
+        const auto f = encode(std::nullopt, true, /*source*/2);
         ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m, /*sink*/true));
         EXPECT_FALSE(m.lease.has_value());
         EXPECT_TRUE(m.leaseView);
+        EXPECT_EQ(m.leaseSourceTopicId, 2);
         EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m, /*sink*/false)) << "R7: a TopicApplied frame refuses bit 3";
     }
     {   // neither

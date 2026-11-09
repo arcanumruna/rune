@@ -188,7 +188,6 @@ public:
     uint32_t              autoIncrementReserve = rune::protocol::kAutoIncrementReserveDefault;
     int32_t               partitionCount = 0;
     std::optional<rune::protocol::LeaseSpec> lease;   ///< a lease topic's spec (set by setFacts)
-    int32_t leaseViewTopicId = -1;                    ///< a lease topic's lease view sink id (set by setFacts; -1: none)
     /// A lease topic: bumped when leaseLayoutSource() gains a field id (an AddField, through installVersion or FilterSchema,
     /// whichever delivers the id first), so the lease index, whose row layout has one column per source field, is rebuilt
     /// from the log (WorkerViewSet::rebuildKeyIndex_).  That is
@@ -288,7 +287,6 @@ public:
         autoIncrementReserve = w.autoIncrementReserve;
         partitionCount = w.partitionCount;
         lease          = w.lease;
-        leaseViewTopicId = w.leaseViewTopicId;
         hasFacts_      = true;
         uint32_t erased = 0;
         for (auto& sv : versions_) {

@@ -228,10 +228,11 @@ public:
         createLeaseTopicSpec(ls, std::move(src));
     }
     /// The same with the whole lease spec (Task 12: checkpoint keys).
-    void createLeaseTopicSpec(const rune::protocol::LeaseSpec& ls, std::optional<rune::codec::Descriptor> src = std::nullopt) {
+    void createLeaseTopicSpec(const rune::protocol::LeaseSpec& ls, std::optional<rune::codec::Descriptor> src = std::nullopt,
+                              KeyShape key = KeyShape{rune::codec::PrimType::UInt64}) {
         lease_ = ls;
         keyFieldId_ = 4;
-        useSource(src ? std::move(*src) : leaseSourceDescriptor(), KeyShape{rune::codec::PrimType::UInt64});
+        useSource(src ? std::move(*src) : leaseSourceDescriptor(), key);
         for (int i = 0; i < kMaxPass && !leaseIndexLogged(); ++i) pass();
         ASSERT_TRUE(leaseIndexLogged()) << "the lease index never became the logged set's member";
     }

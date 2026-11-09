@@ -1431,13 +1431,10 @@ public:
     /// keep the vector sorted by view id; the read is a lower_bound (zero-alloc).
     void noteViewSource(int32_t viewTopicId, int32_t sourceTopicId);
     void forgetViewSource(int32_t viewTopicId);
-    /// Lease topics Task 13a (control thread, cold): `viewTopicId` is the lease view (`<topic>.leases`) of lease topic `sourceTopicId`,
-    /// both from the catalog.  A read of a lease view is authorised as READ on its SOURCE topic (spec 7.1, 14.1): a VIEW grant on the
-    /// lease view is not consulted.  Sorted by view id, like viewSources_; forgetLeaseView on the view's drop.  The routing is
-    /// noteViewSource's (the same call).
-    void noteLeaseView(int32_t viewTopicId, int32_t sourceTopicId);
-    void forgetLeaseView(int32_t viewTopicId);
-    [[nodiscard]] int32_t leaseSourceOfView_(int32_t viewTopicId) const noexcept;   // -1 = not a lease view
+    /// Lease topics Task 13a: the lease topic of lease view `viewTopicId` (`<topic>.leases`), -1 when it is not one.  ONE source of truth:
+    /// the TopicRegistry's view-sink spec (TopicSpec::leaseSourceTopicId, from the catalog), so it dies with dropTopic and cannot leak.
+    /// A read of a lease view is authorised as READ on its SOURCE topic (spec 7.1, 14.1): a VIEW grant on the lease view is not consulted.
+    [[nodiscard]] int32_t leaseSourceOfView_(int32_t viewTopicId) const noexcept;
     /// The authorisation of a view read: READ on the source topic for a lease view, READ on the view otherwise.
     [[nodiscard]] std::optional<rune::gateway::Denial> authorizeViewRead_(const rune::gateway::PermissionTable& perms,
                                                                            int32_t viewTopicId) const;
@@ -2866,7 +2863,6 @@ private:
     /// C1: sorted by view topic id — (view, its source topic).  Control thread only.
     std::vector<std::pair<int32_t, int32_t>> viewSources_;
     /// Lease topics Task 13a: sorted by view topic id - (lease view, its lease topic).  Control thread writes; reads are a lower_bound.
-    std::vector<std::pair<int32_t, int32_t>> leaseViews_;
     /// Answer a data/read op that reached a broker which does not lead its
     /// partition: ErrorResponse{Redirect, endpoint}, or the bare NotLeader when the
     /// endpoint is empty or too long for the frame.  Queued (sendAnswer_), never dropped.

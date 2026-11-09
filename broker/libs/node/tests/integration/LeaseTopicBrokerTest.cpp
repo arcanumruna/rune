@@ -6,6 +6,11 @@
 //   (TopicRegistry ViewSink, its name resolves, the gateway never awaits a plan for it); GetTopicSchema carries the
 //   lease; restart on the same data dir -> the same holds after boot, nothing halted; drop the topic -> both ids are
 //   gone from the ObjectIndex and Dropped in the registry; restart -> still gone.
+//
+// Task 13a review (H1): the PRODUCTION wiring of the lease view READ over a real authenticating shard-mode broker:
+// a granted key is read with a raw GetViewRowK on `<t>.leases`; READ on the source topic is the rule (a VIEW-only grant on
+// the lease view is NotAuthorized); the gateway's registry-held lease view -> source mapping is set after create and after
+// restart, and gone after a real DropTopic (the read is UnknownView).  The 3-node follower-Redirect leg: see the note at the end.
 #include <rune/aeronutil/testing/FreePort.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
@@ -17,6 +22,8 @@
 #include <rune/protocol/LeaseSpec.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include "support/AuthRig.h"
+#include "support/CatalogBrokerCluster.h"
 #include "support/DdlHarness.h"
 #include "support/OwnerThreadTestHelpers.h"
 #include "support/ShardTestClient.h"
@@ -280,4 +287,239 @@ TEST(LeaseTopicBrokerRegression, LeaseViewIsAPlanLessSinkAcrossCreateRestartDrop
         EXPECT_FALSE(applierHalted(node));
         node.stop();
     }
+}
+
+
+// ── Task 13a review (H1): the lease view read through the REAL wiring (create -> grant -> read -> auth -> restart -> drop) ──
+namespace {
+using SO = rp::SecurityOperation;
+using ST = rp::SecurityResourceType;
+constexpr int kStatusOk = 0, kStatusUnknownView = 4, kStatusNotAuthorized = 45;
+
+struct LeaseWiring {
+    AuthRig&  rig;
+    int32_t   topicId = -1;
+    int32_t   viewId  = -1;
+    std::string key = [] { std::string k(64, '\0'); k.replace(0, 4, "a-01"); return k; }();
+
+    int64_t loginAs2(const std::string& user, const char* pw) { return rig.login(user, pw, rp::client::kClientVersionLeases); }
+    int64_t loginAs(const std::string& user) { return rig.login(user, AuthRig::kPw, rp::client::kClientVersionLeases); }
+
+    /// One GetViewRowK as `sid`; the code is the ViewRowResponse status or the ErrorResponse code.  Retries only the transient
+    /// answers (NotReady while the view rebuilds / the grant folds, NotLeader while leadership settles); bounded.
+    std::pair<int, std::vector<uint8_t>> readK(int64_t sid, bool retryUnknown = false) {
+        const auto deadline = Clock::now() + 30s;
+        std::pair<int, std::vector<uint8_t>> last{-1, {}};
+        while (Clock::now() < deadline) {
+            const auto kb = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(key.data()), key.size());
+            const int64_t corr = rig.c().sendGetViewRowK(rig.ch(), AuthRig::stream(), sid, viewId, kb);
+            const auto a = rig.c().awaitViewRowOrError(corr, Clock::now() + 10s);
+            if (!a) { last = {-1, {}}; continue; }
+            last = {a->isError ? int(a->errorCode) : int(a->status), a->row};
+            const bool transient = last.first == int(rp::client::ViewRowResponse::kNotReady) ||
+                                   (a->isError && last.first == int(rp::client::ErrorCode::NotLeader)) ||
+                                   (retryUnknown && !a->isError && last.first == kStatusUnknownView);
+            if (!transient) return last;
+            std::this_thread::sleep_for(20ms);
+        }
+        return last;
+    }
+    struct Map { int32_t lease = -2, viewSource = -2; };
+    Map mapping() {
+        return rig.broker().node().onControlThreadForTest([&] {
+            Map m;
+            if (auto* gw = rig.broker().node().gatewayForTest()) {
+                m.lease = gw->leaseSourceOfView_(viewId);
+                m.viewSource = gw->viewSourceOf_(viewId);
+            }
+            return m;
+        });
+    }
+    bool grantKey(int64_t writerSid) {
+        std::string value;
+        value.push_back(static_cast<char>(96)); value.push_back(0);   // blockLength = 4 * 8 + 64
+        value.push_back(1); value.push_back(0);                       // schema version 1
+        auto put64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) value.push_back(static_cast<char>(v >> (8 * i))); };
+        put64(0);        // lease_version
+        put64(5'000);    // ttl_ms
+        put64(1);        // holder
+        put64(0);        // remaining
+        value += key;    // id
+        // A lease write is an explicit-key intent: idempotent, acks=All|View (the checked-writes rule list).
+        const auto ids = rig.initProducer(writerSid);
+        if (ids.code != 0) return false;
+        rp::RecordBatchBuilder b(0, 0);
+        b.setProducerId(ids.pid); b.setProducerEpoch(ids.epoch); b.setBaseSequence(0);
+        b.append(key, value, 0, /*attrs: grant*/ 1);
+        const std::vector<uint8_t> batch = b.build();
+        int last = -1;
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            const int64_t corr = rig.c().nextCorrelationId();
+            if (!rig.c().produceIdempotent(rig.broker().workerIngressChannel(), AuthRig::stream(), writerSid, corr, topicId, 0,
+                                           rp::client::kAcksWireAll | rp::client::kAcksWireView, ids.pid, ids.epoch, 0, batch))
+                return false;
+            const auto a = rig.c().awaitProduceResponseUntil(corr, AuthRig::dl(10));
+            last = a ? a->errorCode : -1;
+            if (last == 0) return true;
+            if (last != int(rp::client::ErrorCode::NotLeader) && last != int(rp::client::ErrorCode::UnknownTopic) && last != -1) break;
+            std::this_thread::sleep_for(25ms);
+        }
+        std::cout << "[lease] grant produce answered " << last << "\n";
+        return false;
+    }
+};
+} // namespace
+
+TEST(LeaseTopicBrokerRegression, LeaseViewReadThroughTheRealWiringAndRequiredAuthRegression) {
+    AuthBroker::Options o;
+    o.shard = true;
+    AuthRig rig("leasewire", o);
+    rig.broker().createUser("lbuild", AuthRig::kPw, {grants::cluster(SO::Create), grants::cluster(SO::Alter), grants::cluster(SO::Drop),
+                                                       grants::cluster(SO::Describe)});
+    rig.broker().createUser("lwriter", AuthRig::kPw, {grants::exact(SO::Write, ST::Topic, "inst")});
+    rig.broker().createUser("lreader", AuthRig::kPw, {grants::exact(SO::Read, ST::Topic, "inst")});
+    rig.broker().createUser("lviewonly", AuthRig::kPw, {grants::exact(SO::Read, ST::View, "inst.leases")});
+    LeaseWiring w{rig};
+
+    int64_t builder = w.loginAs("lbuild");
+    const auto def = rig.c().awaitDefine(
+        rig.c().sendDefineLeaseTopic(rig.ch(), AuthRig::stream(), builder, "inst", 1, userBlob(), validSpec()), AuthRig::dl(30));
+    ASSERT_TRUE(def.has_value());
+    ASSERT_EQ(def->errorCode, kOk);
+    w.topicId = def->topicId;
+    w.viewId  = w.topicId + 1;   // the catalog allocates the lease view right after the topic (asserted below against the registry)
+
+    // The registry-held mapping is set after create.
+    ASSERT_TRUE(eventually([&] { return w.mapping().lease == w.topicId; })) << "leaseSourceOfView_ after create";
+    EXPECT_EQ(w.mapping().viewSource, w.topicId) << "viewSourceOf_ answers the lease source first";
+
+    int64_t writer = w.loginAs("lwriter");
+    ASSERT_TRUE(w.grantKey(writer));
+
+    // Topic READ: Ok with a row.  VIEW-only on the lease view: NotAuthorized (the rule is READ on the SOURCE topic).
+    int64_t reader = w.loginAs("lreader");
+    int64_t viewOnly = w.loginAs("lviewonly");
+    {
+        const auto r = w.readK(reader);
+        EXPECT_EQ(r.first, kStatusOk) << "a topic-READ session reads the lease row";
+        EXPECT_FALSE(r.second.empty()) << "the row bytes are carried";
+        EXPECT_EQ(w.readK(viewOnly).first, kStatusNotAuthorized) << "VIEW on <t>.leases alone is not the rule";
+        EXPECT_EQ(w.readK(writer).first, kStatusNotAuthorized) << "WRITE is not READ";
+    }
+
+    // Restart on the same data dir: the boot stash re-registers the mapping; the same reads hold.
+    rig.restart();
+    builder = w.loginAs("lbuild");
+    ASSERT_TRUE(eventually([&] { return w.mapping().lease == w.topicId; }, 30s)) << "leaseSourceOfView_ after restart";
+    EXPECT_EQ(w.mapping().viewSource, w.topicId);
+    reader = w.loginAs("lreader");
+    viewOnly = w.loginAs("lviewonly");
+    {
+        const auto r = w.readK(reader, /*retryUnknown=*/true);
+        EXPECT_EQ(r.first, kStatusOk) << "after restart the lease row is read again";
+        EXPECT_FALSE(r.second.empty());
+        EXPECT_EQ(w.readK(viewOnly, true).first, kStatusNotAuthorized);
+    }
+
+    // A real DropTopic: the registry entry dies with the topic, so both accessors answer -1 and the read is UnknownView.
+    ASSERT_EQ(rig.dropTopicCode(builder, "inst"), kOk);
+    ASSERT_TRUE(eventually([&] { return w.mapping().lease == -1; })) << "leaseSourceOfView_ after DropTopic";
+    EXPECT_EQ(w.mapping().viewSource, -1);
+    // A session whose only grant was on the dropped topic fails closed (NotAuthorized: nothing resolves for it any more, the
+    // existence of the dropped view is not revealed); a session allowed to read every view (the bootstrap admin) sees the truth.
+    EXPECT_EQ(w.readK(reader).first, kStatusNotAuthorized) << "a dropped lease view fails closed for a grant on the dropped topic";
+    EXPECT_EQ(w.readK(w.loginAs2("admin", AuthBroker::kAdminPassword)).first, kStatusUnknownView) << "the dropped lease view is unknown";
+}
+
+// The 3-node leg of H1: a lease view read at a broker that does not lead the source partition is a Redirect to the source
+// leader (the gateway's viewSourceLedElsewhere_ / registry-held mapping on a follower), and the leader serves the row.
+TEST(LeaseTopicBrokerRegression, LeaseViewReadAtAFollowerRedirectsToTheSourceLeaderRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    auto c = ThreeNodes::start("leasef3");
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    ShardTestClient cl(c.clientsDir->path / "lease-client");
+    cl.setClientVersion(rp::client::kClientVersionLeases);
+    cl.keepSessionsAlive(true);
+    const auto chOf = [&](int id) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(c.ports.client[std::size_t(id - 1)]); };
+    int64_t sid[4] = {0, 0, 0, 0};
+    for (int id = 1; id <= 3; ++id) {
+        sid[id] = cl.connect(chOf(id), kClientStream);
+        ASSERT_GT(sid[id], 0) << "node " << id;
+    }
+    // Define through whichever node leads the catalog (a follower answers Redirect, which awaitDefine does not return): try all, bounded.
+    int32_t topicId = -1;
+    for (const auto deadline = Clock::now() + 60s; topicId < 0 && Clock::now() < deadline;) {
+        for (int id = 1; id <= 3 && topicId < 0; ++id) {
+            const auto r = cl.awaitDefine(cl.sendDefineLeaseTopic(chOf(id), kClientStream, sid[id], "inst", 1, userBlob(), validSpec()),
+                                          Clock::now() + 5s);
+            if (r && r->errorCode == kOk) topicId = r->topicId;
+        }
+    }
+    ASSERT_GE(topicId, 0) << "the lease topic is defined";
+    const int32_t viewId = topicId + 1;
+
+    // The source partition's leader, as every broker's metadata sees it.
+    int leader = -1;
+    ASSERT_TRUE(eventually([&] {
+        int agreed = -1;
+        for (int id = 1; id <= 3; ++id) {
+            const int32_t l = c.node(id).onControlThreadForTest([&]() -> int32_t {
+                const MetadataService* ms = c.node(id).metadataServiceForTest();
+                const auto* pa = ms ? ms->assignment(topicId, 0) : nullptr;
+                return pa ? pa->leaderNode : -1;
+            });
+            if (l < 1) return false;
+            if (agreed >= 0 && agreed != l) return false;
+            agreed = l;
+        }
+        leader = agreed;
+        return true;
+    }, 60s));
+    const int follower = leader == 1 ? 2 : 1;
+
+    // Grant a key straight to the leader's worker (idempotent, acks All|View).
+    std::string key(64, '\0'); key.replace(0, 4, "a-01");
+    std::string value;
+    value.push_back(static_cast<char>(96)); value.push_back(0); value.push_back(1); value.push_back(0);
+    const auto put64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) value.push_back(static_cast<char>(v >> (8 * i))); };
+    put64(0); put64(5'000); put64(1); put64(0);
+    value += key;
+    rp::RecordBatchBuilder b(0, 0);
+    b.setProducerId(777); b.setProducerEpoch(0); b.setBaseSequence(0);
+    b.append(key, value, 0, 1);
+    const std::vector<uint8_t> batch = b.build();
+    const std::string ingress = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(c.ports.ib[std::size_t(leader - 1)]);
+    int granted = -1;
+    for (int attempt = 0; attempt < 200 && granted != 0; ++attempt) {
+        const int64_t corr = cl.nextCorrelationId();
+        ASSERT_TRUE(cl.produceIdempotent(ingress, kClientStream, sid[leader], corr, topicId, 0,
+                                         rp::client::kAcksWireAll | rp::client::kAcksWireView, 777, 0, 0, batch));
+        const auto a = cl.awaitProduceResponseUntil(corr, Clock::now() + 10s);
+        granted = a ? a->errorCode : -1;
+        if (granted != 0) std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_EQ(granted, 0) << "the grant is acked by the source leader";
+
+    const auto kb = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(key.data()), key.size());
+    // The follower: a Redirect naming the leader's client endpoint (retriable answers while its registry / metadata settle).
+    ShardTestClient::ViewRowAnswer fa;
+    ASSERT_TRUE(eventually([&] {
+        const auto a = cl.awaitViewRowOrError(cl.sendGetViewRowK(chOf(follower), kClientStream, sid[follower], viewId, kb), Clock::now() + 10s);
+        if (!a) return false;
+        fa = *a;
+        return a->isError && a->errorCode == int16_t(rp::client::ErrorCode::Redirect);
+    }, 60s)) << "a follower answers Redirect (last: error=" << fa.isError << " code=" << (fa.isError ? fa.errorCode : fa.status) << ")";
+    EXPECT_NE(fa.message.find(std::to_string(c.ports.client[std::size_t(leader - 1)])), std::string::npos)
+        << "the Redirect names the source leader: " << fa.message;
+    // The leader serves the row.
+    int code = -1;
+    std::size_t rowLen = 0;
+    ASSERT_TRUE(eventually([&] {
+        const auto a = cl.awaitViewRowOrError(cl.sendGetViewRowK(chOf(leader), kClientStream, sid[leader], viewId, kb), Clock::now() + 10s);
+        if (!a) return false;
+        code = a->isError ? a->errorCode : a->status;
+        rowLen = a->row.size();
+        return !a->isError && a->status == 0;
+    }, 60s)) << "the leader serves the lease row (last code " << code << ")";
+    EXPECT_GT(rowLen, 0u);
 }

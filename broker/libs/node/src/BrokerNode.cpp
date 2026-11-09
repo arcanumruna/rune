@@ -4166,6 +4166,7 @@ void BrokerNode::bootFromCatalog_() {
         c.partitionKey  = sp.keyField;
         TopicSpec bs = bootSpecOfFrame(sp.nsId, sp.topicId, sp.name, sp.partitions, /*rf*/0, sp.persistence, c, sp.sourceKeyFeatures);
         bs.viewSink = true;   // VLS B.2: catalog-only -- no dir, no log, no replica
+        bs.leaseSourceTopicId = sp.leaseView ? sp.leaseSourceTopicId : -1;   // Task 13a: the gateway registry holds the lease view's source
         catalogTopics.push_back(std::move(bs));
     };
     const int replayed = bootApplier_->replayLocal(*catalogLog_, BootEffects{std::move(sink)});   // throws: refuse boot
@@ -5234,12 +5235,9 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                     std::memcpy(&viewTopicId, p, 4);
                     gateway_->noteViewSinkAwaitingPlan(viewTopicId);
                 }
-                // Lease topics Task 13a: a lease view reads and routes by its SOURCE topic (the catalog's id, carried by the frame) and its
-                // read is authorised as READ on that topic.  Boot posts the same frame (postBootStash), so one handler covers both.
-                if (gateway_ && leaseView && decoded.leaseSourceTopicId >= 0) {
-                    gateway_->noteViewSource(decoded.topicId, decoded.leaseSourceTopicId);
-                    gateway_->noteLeaseView(decoded.topicId, decoded.leaseSourceTopicId);
-                }
+                // Lease topics Task 13a: a lease view reads and routes by its SOURCE topic and its read is authorised as READ on that topic.
+                // The mapping lives in the TopicRegistry's sink spec (TopicSpec::leaseSourceTopicId, set by topicSpecFromCatalog on this live
+                // path and by the boot sink): it dies with dropTopic, so there is nothing to forget.
                 onCatalogTopicApplied_(p, n, /*isView*/true, ok ? &decoded : nullptr);
                 return;
             }
@@ -5910,6 +5908,7 @@ TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m) {
     s.partitioner            = m.keyFeatures.partitioner;
     s.autoIncrement          = m.keyFeatures.autoIncrement;
     s.leaseTopic             = m.lease.has_value();
+    s.leaseSourceTopicId     = m.leaseView ? m.leaseSourceTopicId : -1;   // Task 13a: a lease view sink names its lease topic
     return s;
 }
 } // namespace
@@ -6028,7 +6027,12 @@ void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
 void BrokerNode::postBootWriteSpecs_() {
     if (!workerPool_ || !bootApplier_ || !schemaRegistry_) return;
     for (const rune::catalog::TopicObject* t : bootApplier_->state().topics()) {
-        const auto w = writeSpecWireOf(*t);
+        // Task 13a: a lease topic names its lease view (the catalog's id) in the boot write spec too, or a worker could not map
+        // `<topic>.leases` to its source until the admin thread's later (idempotent) post.
+        int32_t leaseView = -1;
+        if (t->lease)
+            if (const rune::catalog::ViewObject* lv = bootApplier_->state().leaseViewOf(t->objectId)) leaseView = lv->def.viewTopicId;
+        const auto w = writeSpecWireOf(*t, leaseView);
         if (!w) continue;
         for (uint16_t v = 1; v <= t->schema->schemaVersion; ++v)
             if (const RegistryEntry* e = schemaRegistry_->byIdVersion(t->topicId, v))
