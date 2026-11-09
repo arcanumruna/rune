@@ -835,6 +835,9 @@ struct NodeConfig {
     int32_t aeronCountersValuesBytes     = 0;
     /// Receiver status-message timeout of each embedded driver (EmbeddedDriverConfig::statusMessageTimeoutNs).  0 = Aeron's default (200 ms).
     int64_t aeronStatusMessageTimeoutNs  = 0;
+    /// TEST-ONLY: how soon an embedded driver reads a silent client's publication as NOT_CONNECTED and closes its image
+    /// (EmbeddedDriverConfig::silentPeerTimeoutNs).  0 = Aeron's defaults (5 s and 10 s); never set in production.
+    int64_t testSilentPeerTimeoutNs = 0;
     /// RUNE_AERON_CONTROL_TERM_BYTES: term of the worker's per-session ACK publications only — small so a
     /// term rotation never cleans 16 MiB inside the worker pass.  NOT the gateway egress publications:
     /// consumer record pushes travel there (max message = term/8 must cover the largest batch).

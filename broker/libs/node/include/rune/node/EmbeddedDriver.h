@@ -86,6 +86,10 @@ struct EmbeddedDriverConfig {
     /// 0 = Aeron default (200 ms).  Test-only: how often a receiver repeats its status message, i.e. how long a new image
     /// waits for the sender to learn the receiver's window (a client's egress subscription connecting).
     int64_t     statusMessageTimeoutNs = 0;
+    /// 0 = Aeron defaults (5 s publication connection timeout, 10 s image liveness).  Test-only: a publication whose receiver went silent
+    /// reads NOT_CONNECTED after this, and an image whose sender went silent is closed after four times this (a killed client's egress and
+    /// ingress).  The driver checks them on its timer, so the timer runs at a tenth of it.
+    int64_t     silentPeerTimeoutNs = 0;
     /// DR-15 fix round 1: when valid, this driver's Aeron name resolver answers
     /// the managed peer hostnames from this (off-thread fed) cache ONLY — its
     /// conductor never calls getaddrinfo for a peer.  Invalid = Aeron default.

@@ -110,6 +110,8 @@ NodeConfig makeShardConfig(int nodeId, const fs::path& dataDir, const ShardPorts
     cfg.workerIngressBaseStreamId = kIngressStream;
     cfg.gatewayMinIsr = nodes == 1 ? 1 : 2;
     cfg.aeronTermBufferBytes = 1 << 20;
+    cfg.aeronCountersValuesBytes = kTestClientCountersBytes;   // a test broker owns a few dozen counters: a small CnC
+    cfg.aeronStatusMessageTimeoutNs = 20'000'000;   // a node driver's receivers announce their window every 20 ms, not 200
     cfg.workerCoreBase = -1;   // tests never auto-pin busy-spinning workers (ctest -j)
     for (int i = 0; i < nodes; ++i) {
         PeerConfig pc;
@@ -934,7 +936,7 @@ TEST(ShardModeRegression, SequentialShardResolveKeepsEarlierShardsAlive) {
     const auto ports = ShardPorts::discover(1, kWorkers);
     auto cfg = makeShardConfig(0, dir.path, ports, 1, kWorkers, /*fused=*/false);
     constexpr int32_t kTopicParts = 12;
-    constexpr int64_t kLivenessNs = 2'000'000'000;           // > driver timer interval (1 s)
+    constexpr int64_t kLivenessNs = 500'000'000;           // the driver timer runs at a tenth of it
     cfg.shardClientLivenessTimeoutNs = kLivenessNs;
     BrokerNode node{cfg};
     node.setShardResolveStallForTest(kWorkers - 1, std::chrono::milliseconds{2 * kLivenessNs / 1'000'000});
@@ -1918,15 +1920,23 @@ int64_t pauseClient(ShardTestClient& a, const std::string& gw, int64_t sidA, int
         m.encode(out.data());
     }, /*maxFrames=*/40'000, paused);
 }
+// A silent client reads NOT_CONNECTED in 0.3 s and its image closes in 1.2 s, its session lease runs out in 1 s: not the 5, 10 and 10 s defaults.
+constexpr auto kShortLease = 1000ms;
+constexpr auto kHeldLease  = 500ms;   // the held-direct test only waits out the lease
+NodeConfig withShortClientTimeouts(NodeConfig cfg, std::chrono::milliseconds lease = kShortLease) {
+    cfg.testSilentPeerTimeoutNs = 300'000'000;
+    cfg.testSessionTimeoutMs = lease.count();
+    return cfg;
+}
 } // namespace
 
 // ... that is KILLED (its Aeron client + driver closed — no more status messages) has its session closed and its
 // owed acks freed within ~ the publication-connection timeout (5 s) + the normal lease (10 s): the worker reports
-// it Lost, the gateway reaps it 10 s later.  (982b50e kept it forever.)  Another session is served afterwards.
+// it Lost, the gateway reaps it a lease later.  (982b50e kept it forever.)  Another session is served afterwards.
 TEST(ShardModeRegression, KilledPausedClientsSessionAndAcksAreFreedRegression) {
     TmpDir dir{"killcl"}, ad{"killa"}, bd{"killb"};
     const auto ports = ShardPorts::discover(1, 1);
-    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+    BrokerNode node{withShortClientTimeouts(makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false))};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
     ASSERT_EQ(defineShardTopic({&node}), 0);
@@ -1974,7 +1984,7 @@ TEST(ShardModeRegression, KilledPausedClientsSessionAndAcksAreFreedRegression) {
     EXPECT_TRUE(awaitBrokerState([&] { return !sessionAlive(sidA) && acksPending() == 0; }, 40s))
         << "a killed paused client's session and owed acks must be freed";
     const auto took = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - killed);
-    EXPECT_LE(took.count(), 25) << "~5 s NOT_CONNECTED + 10 s lease, not the 10-min held bound";
+    EXPECT_LE(took.count(), 25) << "NOT_CONNECTED + the lease, not the 10-min held bound";
     // D8b-L (LOW-4): A's image at the gateway is released (an aborted held frame never pins it); B's stays.
     EXPECT_TRUE(awaitBrokerState([&] { return clientImages() == images0 + 1; }, 40s))
         << "the killed client's gateway image was not released: images=" << clientImages() << " baseline=" << images0;
@@ -1994,7 +2004,7 @@ namespace {
 void runPausedInvokerClientSurvivesNotConnected(uint32_t gatewayProduceCredits) {
     TmpDir dir{"invcl"}, ad{"inva"};
     const auto ports = ShardPorts::discover(1, 1);
-    NodeConfig cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false);
+    NodeConfig cfg = withShortClientTimeouts(makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false));
     cfg.gatewayProduceCredits = gatewayProduceCredits;   // 0 = default (1024)
     BrokerNode node{cfg};
     node.start();
@@ -2068,7 +2078,7 @@ TEST(ShardModeRegression, PausedInvokerCreditPauseIsNotAHoldRegression) {
 TEST(ShardModeRegression, PausedInvokerClientResumingWithoutReadingIsFoundNotReapedRegression) {
     TmpDir dir{"invbp"}, ad{"invbpa"};
     const auto ports = ShardPorts::discover(1, 1);
-    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+    BrokerNode node{withShortClientTimeouts(makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false))};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
     ASSERT_EQ(defineShardTopic({&node}), 0);
@@ -2103,9 +2113,8 @@ TEST(ShardModeRegression, PausedInvokerClientResumingWithoutReadingIsFoundNotRea
     ASSERT_TRUE(pumpFor([&] { return !onGw([&](auto& g) { return g.sessionLostForTest(sidA); }); }, 20s))
         << "a pumping (but not reading) client must be Found";
     const auto found = std::chrono::steady_clock::now();
-    // ... and held past the Lost lease (sessionTimeout 10 s, measured from the Lost edge) without being reaped.
-    constexpr auto kLease = std::chrono::nanoseconds{rune::gateway::ClientGateway::kDefaultSessionTimeoutNs};
-    const auto pastLease = found + kLease + 2s;
+    // ... and held past the Lost lease (the session lease, measured from the Lost edge) without being reaped.
+    const auto pastLease = found + kShortLease + 500ms;
     (void)pumpFor([&] { return std::chrono::steady_clock::now() >= pastLease ||
                                onGw([&](auto& g) { return g.sessionLastSeenNsForTest(sidA) < 0; }); }, 30s);
     EXPECT_TRUE(onGw([&](auto& g) { return g.sessionLastSeenNsForTest(sidA) >= 0; }))
@@ -2126,7 +2135,7 @@ TEST(ShardModeRegression, PausedInvokerClientResumingWithoutReadingIsFoundNotRea
 TEST(ShardModeRegression, HeldDirectClientRecoveringAfterTheLeaseIsNotReapedOnReleaseRegression) {
     TmpDir dir{"relrp"}, ad{"relrpa"};
     const auto ports = ShardPorts::discover(1, 1);
-    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+    BrokerNode node{withShortClientTimeouts(makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false), kHeldLease)};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
     ASSERT_EQ(defineShardTopic({&node}), 0);
@@ -2166,10 +2175,9 @@ TEST(ShardModeRegression, HeldDirectClientRecoveringAfterTheLeaseIsNotReapedOnRe
         << "the worker holds A's acks (sent=" << sent << ", pending=" << acksPending() << ")";
     const auto lastSent = std::chrono::steady_clock::now();
     // A's app is silent past the whole lease (no keepalive, no read); its driver thread keeps the publication up.
-    constexpr auto kLease = std::chrono::nanoseconds{rune::gateway::ClientGateway::kDefaultSessionTimeoutNs};
-    ASSERT_FALSE(awaitBrokerState([&] { return std::chrono::steady_clock::now() >= lastSent + kLease + 1s &&
+    ASSERT_FALSE(awaitBrokerState([&] { return std::chrono::steady_clock::now() >= lastSent + kHeldLease + 500ms &&
                                                onGw([&](auto& g) { return g.sessionLastSeenNsForTest(sidA) < 0; }); },
-                                  std::chrono::duration_cast<std::chrono::seconds>(kLease + 2s)))
+                                  2s))
         << "the held bound must keep A while it is silent";
     ASSERT_GE(onGw([&](auto& g) { return g.sessionLastSeenNsForTest(sidA); }), 0);
     ASSERT_FALSE(onGw([&](auto& g) { return g.sessionLostForTest(sidA); })) << "its driver is alive: never Lost";
