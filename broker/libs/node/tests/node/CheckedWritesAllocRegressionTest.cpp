@@ -15,9 +15,12 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
 using namespace rune::node;
 using namespace rune::node::cw;
@@ -807,3 +810,202 @@ TEST(CheckedWritesAllocRegression, EmptyDrainsBetweenWindowsAllocateNothingRegre
     EXPECT_EQ(allocs, 0u) << "an empty drain is not a window";
     EXPECT_GT(t.dirtyBytes(), 0u);
 }
+
+// Part 11: the vote, the lock pause, the marker's step and an atomic batch allocate nothing in steady state.  Two rigs joined as a
+// coordinator would: topic character under its three views (unique name, account stats, account characters) and topic entry under
+// the balances.  The mix: transactions of 2..16 characters and a debit, 10 % voted no (a taken name, an overdraw), 10 % aborted
+// after both yes, an outside write on a locked row pausing behind every 5th; atomic batches, 10 % refused whole.  The window brackets
+// the worker's passes of each step (the write, a vote, a marker, an atomic batch); the frames, the acks and the polling are the rig's.
+// The records reuse 256 characters and 64 entries: a view's row table growing for new keys is the fold's.
+namespace {
+struct TxnAllocMix {
+    TxnPair pair;
+    uint64_t allocs = 0, expectedCold = 0, committed = 0, votedNo = 0, abortedAfterYes = 0, lockedWrites = 0, atomicRefused = 0;
+    uint64_t lcg = 0x9E3779B97F4A7C15ull;
+    std::map<int64_t, int32_t> seqA, seqB;
+    int32_t seqLocked = 0;
+    int txns = 0, batches = 0;
+
+    static constexpr uint64_t kChars = 256, kEntries = 64, kAccounts = 8;
+    static constexpr uint8_t kAcksViewAll = rune::protocol::client::kAcksWireView | rune::protocol::client::kAcksWireAll;
+    static constexpr uint8_t kAcksAll = rune::protocol::client::kAcksWireAll;
+
+    TxnAllocMix() : pair(setup()) {
+        VerdictRig& a = pair.a;
+        VerdictRig& b = pair.b;
+        for (uint64_t at = 1; at <= kChars; at += 16) {
+            std::vector<VerdictRig::Char> chunk;
+            for (uint64_t id = at; id < at + 16; ++id) chunk.push_back(character(id, 0));
+            EXPECT_TRUE(a.ack(a.appendCharacters(chunk, 1)));
+        }
+        std::vector<VerdictRig::Entry> open;
+        for (uint64_t acc = 1; acc <= kAccounts; ++acc) open.push_back({acc, acc, 1000, "open"});
+        EXPECT_TRUE(b.ack(b.appendEntries(open, kAcksAll)));
+        EXPECT_TRUE(a.driveUntilJudgeReaches());
+        EXPECT_TRUE(b.driveUntilJudgeReaches());
+        for (const ConstrainedView v : {ConstrainedView::CharacterName, ConstrainedView::AccountStats, ConstrainedView::AccountCharacters}) a.createConstrainedView(v);
+        b.createConstrainedView(ConstrainedView::Ledger);
+        for (VerdictRig* r : {&a, &b}) {
+            EXPECT_TRUE(r->driveUntilJudgeReaches());
+            for (const auto& [v, l] : r->constrained) r->driveUntilFolded(l.topicId, r->dataEnd());
+        }
+    }
+
+    static std::function<void(VerdictRig&)> setup() {
+        auto n = std::make_shared<int>(0);
+        return [n](VerdictRig& r) {
+            r.worker->setVerdictIntervalNs(1'000'000);
+            if ((*n)++ == 0) r.createCharacterTopic(false);
+            else r.createLedgerTopic();
+            r.enableAcks();
+            r.passes(60);
+        };
+    }
+    static VerdictRig::Char character(uint64_t id, int64_t lastPlayed, bool takeNameOf = false, uint64_t other = 0) {
+        return VerdictRig::Char{.id = id, .userId = id % 40 + 1, .name = "c" + std::to_string(takeNameOf ? other : id), .lastPlayed = lastPlayed};
+    }
+    uint64_t next(uint64_t n) { lcg = lcg * 6364136223846793005ull + 1442695040888963407ull; return (lcg >> 33) % n; }
+
+    /// The worker's passes of `r`, bracketed: what a pass does is the gate, the rig's polling between windows is not.
+    template <class Body>
+    void window(VerdictRig& r, int passes, Body&& body) {
+        rune::testing::AllocWindow w;
+        body();
+        for (int i = 0; i < passes; ++i) {
+            r.now += 1'000'000;
+            r.worker->doWork(r.now);
+            r.worker->drainReturn([](WorkerReturn&&) {});
+        }
+        allocs += w.count();
+    }
+    void window(VerdictRig& r, int passes) { window(r, passes, [] {}); }
+
+    struct Vote { bool answered = false; bool yes = false; };
+    Vote vote(VerdictRig& r, int64_t pid) {
+        Vote v;
+        rune::testing::AllocWindow w;
+        WorkerOp op;
+        op.type = WorkerOp::Type::TxnVote; op.topicId = VerdictRig::kSrc; op.partition = 0; op.replica = r.replica.get();
+        op.logPtr = r.log.get(); op.correlationId = ++voteToken; op.producerId = pid; op.producerEpoch = 0; op.sessionId = -1;
+        op.targetReplicaId = r.replica->registryId(); op.incarnation = r.replica->incarnation();
+        EXPECT_TRUE(r.worker->tryEnqueueOp(std::move(op)));
+        for (int i = 0; i < 30 && !v.answered; ++i) {
+            r.now += 1'000'000;
+            r.worker->doWork(r.now);
+            r.worker->drainReturn([&](WorkerReturn&& ret) {
+                if (ret.type != WorkerReturn::Type::TxnVoteResult || ret.correlationId != voteToken) return;
+                v.answered = true;
+                v.yes = ret.errorCode == 0 && ret.recordCount == 0;
+            });
+        }
+        allocs += w.count();
+        return v;
+    }
+    int64_t voteToken = 400'000;
+
+    void marker(VerdictRig& r, int64_t pid, bool commit) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::AppendControlRecord; op.topicId = VerdictRig::kSrc; op.partition = 0; op.replica = r.replica.get();
+        op.logPtr = r.log.get(); op.correlationId = 9000 + pid; op.producerId = pid;
+        op.targetReplicaId = r.replica->registryId(); op.incarnation = r.replica->incarnation();
+        op.recordBatchBytes = rune::transaction::ControlMarker::build(
+            pid, 0, commit ? rune::transaction::ControlType::Commit : rune::transaction::ControlType::Abort, 0);
+        const std::size_t aborted = r.worker->rcAbortedRangesForTest(VerdictRig::kSrc, 0).size();
+        const bool coldGrowth = !commit && aborted >= rune::transaction::AbortedTxnIndex::kDefaultReservedRanges && (aborted & (aborted - 1)) == 0;
+        expectedCold += coldGrowth ? 1 : 0;
+        window(r, 8, [&] { EXPECT_TRUE(r.worker->tryEnqueueOp(std::move(op))); });
+        EXPECT_TRUE(commit ? r.driveUntilJudged() : r.driveUntilJudgeReaches());
+    }
+
+    void transaction() {
+        const int t = txns++;
+        VerdictRig& a = pair.a;
+        VerdictRig& b = pair.b;
+        const int64_t pid = 100 + t % 16;
+        const bool takenName = t % 10 == 3, overdraw = t % 10 == 8, abortAfterYes = t % 10 == 7, locked = t % 5 == 1;
+        std::vector<VerdictRig::Char> chars;
+        std::set<uint64_t> ids;
+        const std::size_t records = 2 + next(15);
+        while (chars.size() < records) {
+            const uint64_t id = 1 + next(kChars);
+            if (!ids.insert(id).second) continue;
+            const uint64_t other = id % kChars + 1;
+            chars.push_back(character(id, t, takenName && chars.empty() && ids.count(other) == 0, other));
+        }
+        const uint64_t entryId = 100 + static_cast<uint64_t>(t) % kEntries;
+        const VerdictRig::Entry debit{entryId, entryId % kAccounts + 1, overdraw ? -1'000'000 : -10, "d"};
+        const int32_t sa = seqA[pid], sb = seqB[pid];
+        seqA[pid] += static_cast<int32_t>(chars.size());
+        seqB[pid] += 1;
+        const int64_t ca = a.appendCharacters(chars, kAcksAll, pid, sa, /*txn=*/true);
+        const int64_t cb = b.appendEntries(std::span<const VerdictRig::Entry>(&debit, 1), kAcksAll, pid, sb, /*txn=*/true);
+        window(a, 4);
+        window(b, 4);
+        EXPECT_TRUE(a.ack(ca));
+        EXPECT_TRUE(b.ack(cb));
+        const Vote va = vote(a, pid), vb = vote(b, pid);
+        EXPECT_TRUE(va.answered && vb.answered) << "txn " << t;
+        const bool yes = va.yes && vb.yes;
+        EXPECT_EQ(yes, !takenName && !overdraw) << "txn " << t;
+        votedNo += yes ? 0 : 1;
+        int64_t lockedAck = -1;
+        if (locked && yes) {   // a plain write to a row the open transaction holds: its verdict waits for the marker
+            lockedAck = a.appendCharacters(std::vector<VerdictRig::Char>{character(chars.front().id, -t)}, kAcksViewAll, 500, seqLocked++);
+            window(a, 4);
+            ++lockedWrites;
+        }
+        const bool commit = yes && !abortAfterYes;
+        abortedAfterYes += yes && abortAfterYes ? 1 : 0;
+        committed += commit ? 1 : 0;
+        marker(a, pid, commit);
+        marker(b, pid, commit);
+        if (lockedAck >= 0) {
+            const auto ack = a.ack(lockedAck);
+            EXPECT_TRUE(ack && ack->code == 0);
+        }
+    }
+
+    void atomicBatch() {
+        const int i = batches++;
+        VerdictRig& a = pair.a;
+        std::vector<VerdictRig::Char> chars;
+        std::set<uint64_t> ids;
+        const std::size_t records = 2 + next(15);
+        const bool refused = i % 10 == 5;
+        while (chars.size() < records) {
+            const uint64_t id = 1 + next(kChars);
+            if (!ids.insert(id).second) continue;
+            const uint64_t other = id % kChars + 1;
+            chars.push_back(character(id, i, refused && chars.empty() && ids.count(other) == 0, other));
+        }
+        const int64_t c = a.appendCharacters(chars, kAcksViewAll, -1, -1, /*txn=*/false, /*atomic=*/true);
+        window(a, 6);
+        const auto ack = a.ack(c);
+        ASSERT_TRUE(ack);
+        EXPECT_EQ(ack->code, 0);
+        EXPECT_EQ(!ack->verdicts.empty(), refused) << "batch " << i;
+        atomicRefused += ack->hasVerdicts ? 1 : 0;
+    }
+};
+}  // namespace
+
+// The abort index's vector doubles past its 256 reserved ranges (AbortedTxnIndex: cold growth, counted): the one allocation the
+// full-length run expects, at each power of two of aborted ranges.
+static void runTxnAllocMix(int warm, int measured) {
+    TxnAllocMix m;
+    for (int i = 0; i < warm; ++i) { m.transaction(); m.atomicBatch(); }
+    m.allocs = m.expectedCold = m.committed = m.votedNo = m.abortedAfterYes = m.lockedWrites = m.atomicRefused = 0;
+    const uint64_t pausesBefore = m.pair.a.writeState()->txn.stats.lockPauses;
+    for (int i = 0; i < measured; ++i) { m.transaction(); m.atomicBatch(); }
+    EXPECT_EQ(m.allocs, m.expectedCold);
+    EXPECT_GT(m.committed, static_cast<uint64_t>(measured / 2));
+    EXPECT_GT(m.votedNo, static_cast<uint64_t>(measured / 10));
+    EXPECT_GT(m.abortedAfterYes, static_cast<uint64_t>(measured / 20));
+    EXPECT_GT(m.lockedWrites, static_cast<uint64_t>(measured / 10));
+    EXPECT_GT(m.pair.a.writeState()->txn.stats.lockPauses, pausesBefore);
+    EXPECT_GT(m.atomicRefused, static_cast<uint64_t>(measured / 20));
+}
+
+TEST(CheckedWritesAllocRegression, SteadyStateTxnVotesAndAtomicBatchesAllocateNothingRegression) { runTxnAllocMix(50, 150); }
+
+TEST(CheckedWritesAllocRegression, SteadyStateTxnVotesAndAtomicBatchesAllocateNothingFullLengthRegression) { runTxnAllocMix(200, 2000); }

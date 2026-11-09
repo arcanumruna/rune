@@ -31,6 +31,7 @@
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/WorkerViewSet.h>
 #include <rune/node/WriteState.h>
+#include <rune/transaction/ControlMarker.h>
 #include <rune/view/PlanCompiler.h>
 
 #include "BenchGate.h"
@@ -506,3 +507,134 @@ BENCHMARK(BM_WorkerProduceToPushRead_VerdictSource_256B)->Unit(benchmark::kNanos
 BENCHMARK(BM_WorkerProduceToPushRead_Transient_256B)->Unit(benchmark::kNanosecond)->MinTime(0.2);
 BENCHMARK(BM_WorkerProduceToPushRead_Disk_1KiB)->Unit(benchmark::kNanosecond)->MinTime(0.2);
 BENCHMARK(BM_WorkerProduceToPushRead_Transient_1KiB)->Unit(benchmark::kNanosecond)->MinTime(0.2);
+
+// Checked writes Part 11: one transaction on one worker, from its produce to the answer of its commit marker.  `voting` is the
+// verdict-source partition of BM_WorkerProduceToPushRead_VerdictSource_256B, where the coordinator's vote round trip (the TxnJudge
+// append, the judge at J, the answer) comes before the marker; `non_voting` is the plain disk partition, where the transaction
+// touches no verdict source and runs the way it did before Part 11 (the ABAB gate: no regression against the base).
+namespace {
+struct TxnCommitFixture {
+    static constexpr int32_t kSrc = 1;   // the fixture replica's topic
+    RealWorkerFixture f;
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs{channel, f.dir};
+    int64_t nowNs = 1, corr = 0;
+
+    explicit TxnCommitFixture(bool voting) {
+        if (!voting) return;
+        f.worker->setViewSet(&vs);
+        f.worker->setFilterConfig(rune::node::filter::FilterConfig{});
+        vs.setVerdictIntervalNs(0);
+        auto send = [&](WorkerOp op) { while (!f.worker->tryEnqueueOp(op)) pump(); for (int i = 0; i < 3; ++i) pump(); };
+        // 256 B values, as BM_WorkerProduceToPushRead_VerdictSource_256B: id, v, tag, then padding.
+        rune::codec::DescriptorBuilder srcBuilder("t", 1);
+        srcBuilder.add("id", rune::codec::PrimType::UInt64, 1, true).add("v", rune::codec::PrimType::Int64).add("tag", rune::codec::PrimType::UInt16);
+        for (int i = 0; i < 29; ++i) srcBuilder.add("pad" + std::to_string(i), rune::codec::PrimType::UInt64);
+        srcBuilder.add("padEnd", rune::codec::PrimType::UInt16);
+        const auto src = srcBuilder.build();
+        WorkerOp lvl; lvl.type = WorkerOp::Type::ClusterFeatureLevel; lvl.nextOffset = 5; send(lvl);
+        WorkerOp sch; sch.type = WorkerOp::Type::SchemaUpdate; sch.topicId = kSrc; sch.clientVersion = 1;
+        sch.schemaUpdateBlob = rune::codec::serialize(src); send(sch);
+        WorkerOp flt; flt.type = WorkerOp::Type::FilterSchema; flt.topicId = kSrc; flt.clientVersion = 1;
+        flt.schemaUpdateBlob = rune::codec::serialize(src); send(flt);
+        rune::node::TopicWriteSpecWire w;
+        w.topicId = kSrc; w.keyFieldId = 0; w.keyType = rune::codec::PrimType::UInt64; w.keyWidth = 8; w.legacyValidate = false;
+        WorkerOp spec; spec.type = WorkerOp::Type::WriteSpecUpdate; spec.topicId = kSrc;
+        spec.schemaUpdateBlob.resize(rune::node::kTopicWriteSpecWireLen);
+        (void)rune::node::encodeTopicWriteSpec(w, spec.schemaUpdateBlob); send(spec);
+        rune::view::ViewPlan plan;
+        plan.viewName = "rej"; plan.key = "id"; plan.sources = {{kSrc, "id"}};
+        plan.output = {{"id", rune::codec::PrimType::UInt64, 0, "id", rune::view::MergeRule::Replace},
+                       {"v", rune::codec::PrimType::Int64, 0, "v", rune::view::MergeRule::Replace}};
+        plan.persistence = 1;
+        const rune::codec::Descriptor* srcs[] = {&src};
+        auto comp = rune::view::compileView(plan, srcs, 0x51000001).value();
+        rune::node::TestRejectRule rule;
+        rule.mode = rune::node::TestRejectRule::Mode::TagEquals; rule.tag = 200;
+        vs.installTestVerdictViewForTest(comp.plan, comp.rowLayout, src, false, 7, rule);
+        for (int i = 0; i < 50; ++i) pump();
+    }
+    void pump() {
+        f.worker->doWork(nowNs += 1'000'000);
+        channel.deltas.drain([](int32_t, aeron::concurrent::AtomicBuffer&, rune::node::OneToOneByteRing::index_t, rune::node::OneToOneByteRing::index_t) {});
+        f.worker->drainReturn([](WorkerReturn&&) {});
+    }
+    WorkerOp op(WorkerOp::Type type, int64_t pid) {
+        WorkerOp o;
+        o.type = type; o.topicId = kSrc; o.partition = 0;
+        o.replica = f.replica.get(); o.logPtr = f.log.get();
+        o.sessionId = 1; o.correlationId = ++corr; o.producerId = pid; o.producerEpoch = 0;
+        o.targetReplicaId = f.replica->registryId(); o.incarnation = f.replica->incarnation();
+        return o;
+    }
+    // Drives the worker until a return of `type` for the correlation id of `o` arrives; the answer's error code, or -1 if it never came.
+    int driveTo(WorkerOp o, WorkerReturn::Type type) {
+        const int64_t id = o.correlationId;
+        while (!f.worker->tryEnqueueOp(o)) pump();
+        int code = -1;
+        for (int i = 0; i < 5'000'000 && code < 0; ++i) {
+            f.worker->doWork(nowNs += 1'000'000);
+            f.worker->drainReturn([&](WorkerReturn&& r) {
+                if (r.type == type && r.correlationId == id) code = r.errorCode;
+            });
+        }
+        return code;
+    }
+};
+
+// A one-record transactional batch of producer `pid`, `seq` its base sequence: the 256 B value of the verdict source's schema, or a
+// bare value on the plain partition.
+std::vector<uint8_t> txnBatch(bool voting, int64_t pid, int32_t seq, uint64_t id) {
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    b.setTransactional(true);
+    b.setProducerId(pid);
+    b.setProducerEpoch(0);
+    b.setBaseSequence(seq);
+    std::vector<uint8_t> key(8), val;
+    for (int i = 0; i < 8; ++i) key[std::size_t(i)] = uint8_t(id >> (8 * i));
+    if (voting) {
+        val.push_back(252); val.push_back(0); val.push_back(1); val.push_back(0);   // fixed length 252, version 1
+        for (int i = 0; i < 8; ++i) val.push_back(uint8_t(id >> (8 * i)));
+        for (int i = 0; i < 8; ++i) val.push_back(uint8_t(id >> (8 * i)));
+        val.push_back(1); val.push_back(0);
+        val.resize(256, 0);
+    } else {
+        val.assign(256, 'x');
+    }
+    b.append({reinterpret_cast<const char*>(key.data()), key.size()}, {reinterpret_cast<const char*>(val.data()), val.size()}, 0);
+    return b.build();
+}
+
+void runTxnCommit(benchmark::State& state, bool voting) {
+    TxnCommitFixture fix(voting);
+    std::vector<int64_t> samples;
+    samples.reserve(1 << 16);
+    constexpr int64_t kProducers = 16;
+    std::vector<int32_t> seq(kProducers, 0);
+    uint64_t id = 0;
+    for (auto _ : state) {
+        const int64_t pid = 100 + int64_t(id % kProducers);
+        WorkerOp produce = fix.op(WorkerOp::Type::Produce, pid);
+        produce.baseSequence = seq[std::size_t(id % kProducers)]++;
+        produce.lastOffsetDelta = 0; produce.recordCount = 1; produce.durabilityTier = 1;
+        produce.recordBatchBytes = txnBatch(voting, pid, produce.baseSequence, ++id);
+        WorkerOp marker = fix.op(WorkerOp::Type::AppendControlRecord, pid);
+        marker.recordBatchBytes = rune::transaction::ControlMarker::build(pid, 0, rune::transaction::ControlType::Commit, 0);
+
+        const auto t0 = std::chrono::steady_clock::now();
+        const int produced = fix.driveTo(std::move(produce), WorkerReturn::Type::ProduceResult);
+        const int voted = voting ? fix.driveTo(fix.op(WorkerOp::Type::TxnVote, pid), WorkerReturn::Type::TxnVoteResult) : 0;
+        const int marked = fix.driveTo(std::move(marker), WorkerReturn::Type::ControlRecordAppended);
+        const auto t1 = std::chrono::steady_clock::now();
+        if (produced != 0 || voted != 0 || marked != 0) { state.SkipWithError("a step of the transaction was not answered"); break; }
+        samples.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    }
+    state.SetItemsProcessed(state.iterations());
+    reportPercentiles(state, samples);
+}
+}  // namespace
+
+static void BM_WorkerTxnCommit_NonVoting(benchmark::State& s) { runTxnCommit(s, false); }
+static void BM_WorkerTxnCommit_Voting(benchmark::State& s) { runTxnCommit(s, true); }
+BENCHMARK(BM_WorkerTxnCommit_NonVoting)->Name("BM_WorkerTxnCommit/non_voting")->Unit(benchmark::kNanosecond)->MinTime(0.2);
+BENCHMARK(BM_WorkerTxnCommit_Voting)->Name("BM_WorkerTxnCommit/voting")->Unit(benchmark::kNanosecond)->MinTime(0.2);

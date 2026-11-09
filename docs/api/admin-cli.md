@@ -95,6 +95,7 @@ line per constraint, labelled `<view>.unique` or `<view>.<constraint name>` (`co
 still gives its name. `rune stats view <unique view>` also prints `uniqueConflicts`, the number of extra claimants that share a key with its owner. A view's constraint counts are the rejections its source
 partition's judge recorded, so `rune stats view` reads the source partition too. A counter the partition does not have is not printed,
 and a partition with none prints `(no counters)`.
+A topic that is a verdict source also prints the transaction vote counters, ids 11 to 20 (`txnVotesYes` to `txnMarkerWithoutVote`); see the [wire protocol](wire-protocol.md#stats-client-version-17).
 
 ```text
 $ rune stats topic character --broker rune-1:40200
@@ -109,6 +110,16 @@ $ rune stats topic character --broker rune-1:40200
     autoIncrementCounter 1049
     autoIncrementReservedThrough 4097
     autoIncrementIdsBurned 0
+    txnVotesYes 0
+    txnVotesNo 0
+    txnVotesNoConstraintViolation 0
+    txnVotesNoKeyExists 0
+    txnVotesNoKeyNotFound 0
+    txnVotesNoTxnTooLarge 0
+    txnVoteLatencyNsMax 0
+    txnVoteLatencyNsTotal 0
+    foldPausedOnTxnLockNs 0
+    txnMarkerWithoutVote 0
 ```
 
 JSON, with the same names and the constraints as `{constraintId, label, rejections}`:

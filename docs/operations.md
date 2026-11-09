@@ -472,6 +472,19 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
   COMMIT or ABORT lies below W and every persisted constraint view has checkpointed past it. As with all compaction and
   retention, only the partition's leader cleans: a follower keeps every record it has replicated, these included, until it
   leads and its own cleaner passes over them (follower cleaning: #990). A node restart does not change this.
+  - **Votes.** The coordinator asks the leader of every partition the transaction wrote to whether it votes yes. The judge answers
+    once it has judged the transaction whole, applying its records provisionally and locking the rows it wrote; the commit or
+    abort marker then finalizes the result in one step. Counters are ids 11 to 20 of `rune stats topic <t>`: `txnVotesYes`,
+    `txnVotesNo` with one counter per code, `txnVoteLatencyNsMax` and `txnVoteLatencyNsTotal`.
+  - **Lock pause.** While a transaction holds a row locked, the verdicts of other writers' records that touch the row wait for its
+    marker; the time is `foldPausedOnTxnLockNs`. A distributed lock wait ends at the transaction timeout at the latest, when the
+    coordinator aborts the transaction.
+  - **`txnMarkerWithoutVote`** counts markers that arrived for a transaction nobody asked a vote for. It stays 0; a non-zero
+    value is a coordinator bug.
+  - **Size.** A transaction (or atomic batch) over `RUNE_TXN_JUDGED_RECORDS_MAX` records on one partition is voted `TxnTooLarge`
+    (62), see [configuration](configuration.md).
+  - **Persisted constrained views.** A persisted view of a verdict source checkpoints while the judge runs ahead of undecided
+    transactions, and a restart backfills from the `TxnJudge` records at or above its checkpoint.
 - **Constraint views** (`unique` and `check`, see [Constraints](api/ql.md#constraints)) join and leave the set through
   change records in the source log, so every leader judges a record with the set that was active at its offset.
   - **Create.** The leader appends the view's plan (control record 20) and then the change record at offset `A`. The view builds

@@ -82,9 +82,11 @@ alloc-free handoff). The agent drains, accumulates records into per-
   dropped or replaced view, with one refresh bounded by `kConstraintNameRefreshTimeout` (5 s); owner thread only. A rejected
   record carries its own offset: a single send, `claimBatch(1)`, a 1-record Tier-2 batch and a 1-record `BatchAck`; a
   `RecordsRejected` batch reports every rejection with `offset = base + index`.
+- A transactional commit with a no vote completes with the code in `errorCode`, the constraint id in `reserved0` and the failing
+  offset in `value`; the producer is Ready (the transaction is already aborted). `commitTransactionAndWait()` returns it as a `TxnCommitResult`.
 - Write intents (`WriteIntent` on every send, the typed `insert`/`update`/`upsert`/`remove`/`removeExisting`) ride
   record attributes bits 0-1 (ring flags `kFlagIntentMask`). The client refuses them locally
-  (`SendResult::WriteNotAllowed`, no completion) without `View`, inside a transaction, or on a raw handle, and refuses
+  (`SendResult::WriteNotAllowed`, no completion) without `View` (outside a transaction) or on a raw handle, and refuses
   any `View` send on a raw handle (R05a). Tier-2 batches and claims are upsert-only.
 - F8c C6: no per-send heap on ANY path — acked sends carry a tagged 64-bit
   token (a `Completions` queue's CqRef + Token, or the producer's `onAck`

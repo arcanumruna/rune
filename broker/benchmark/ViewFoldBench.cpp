@@ -107,7 +107,9 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/ql/Backends.h>
 #include <rune/ql/Parser.h>
+#include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/LogReadView.h>
+#include <rune/transaction/ControlMarker.h>
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/AggFold.h>
@@ -118,6 +120,7 @@
 #include <rune/view/ViewRow.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -1177,6 +1180,132 @@ static void BM_ViewFoldVerdictPromotions(benchmark::State& st) {
     }
 }
 BENCHMARK(BM_ViewFoldVerdictPromotions)->Name("BM_ViewFoldVerdict/unique_with_promotions")->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime();
+
+// Transaction judging (checked writes Part 11, G.2): a deferred transaction of `records` upserts through the same character_name and
+// account_stats members.  The judge reads it chained at its TxnJudge (prepare plus the conflict scan, then the vote), and the
+// commit marker finalizes it (the apply).  judge_record_p50_ns and finalize_record_p50_ns are the median per-record share of each
+// step over the transactions; steady_alloc counts the measured half.  Reported only: the spec sets no budget.  The records cycle
+// through 65,536 keys, so the second half only updates.
+namespace {
+constexpr uint64_t kTxnKeys = 65'536;
+
+struct TxnJudgeRun {
+    std::vector<uint32_t> judgeNs, finalizeNs;
+    int64_t steadyAlloc = 0;
+    uint64_t finalized = 0;
+};
+
+TxnJudgeRun runTxnJudging(int32_t records) {
+    namespace cr = rune::storage::control_record;
+    ConstraintRig rig;
+    const int txns = static_cast<int>(2 * kTxnKeys / static_cast<uint64_t>(records));
+    struct Span { size_t pos; int64_t base, last; };
+    std::vector<uint8_t> bytes;
+    std::vector<Span> spans;
+    int64_t next = 0;
+    const auto push = [&](std::vector<uint8_t> batch, int64_t count) {
+        for (int i = 0; i < 8; ++i) batch[static_cast<size_t>(i)] = static_cast<uint8_t>(static_cast<uint64_t>(next) >> (8 * i));   // baseOffset, outside the CRC
+        spans.push_back({bytes.size(), next, next + count - 1});
+        bytes.insert(bytes.end(), batch.begin(), batch.end());
+        next += count;
+    };
+    struct Txn { int64_t pid, first, judge, marker; };
+    std::vector<Txn> plan;
+    for (int t = 0; t < txns; ++t) {
+        const int64_t pid = 77 + t % 16;
+        rune::protocol::RecordBatchBuilder bb(next, 0);
+        bb.setTransactional(true);
+        bb.setProducerId(pid);
+        bb.setProducerEpoch(0);
+        for (int i = 0; i < records; ++i) rig.append(bb, Op{(static_cast<uint64_t>(t) * static_cast<uint64_t>(records) + static_cast<uint64_t>(i)) % kTxnKeys, t, false});
+        Txn x{pid, next, 0, 0};
+        push(bb.build(), records);
+        std::vector<uint8_t> j(cr::kTxnJudgeBatchBytes);
+        (void)cr::buildTxnJudge(j, {pid, 0, x.first});
+        x.judge = next;
+        push(std::move(j), 1);
+        x.marker = next;
+        push(rune::transaction::ControlMarker::build(pid, 0, rune::transaction::ControlType::Commit, 1), 1);
+        plan.push_back(x);
+    }
+
+    rune::node::PartitionWriteState write;
+    rune::node::VerdictSource vs{5, 0};
+    vs.addVerdictView(rig.unique.inst.get(), rig.unique.kind, rig.unique.objectId, rig.unique.objectId);
+    vs.addVerdictView(rig.stats.inst.get(), rig.stats.kind, rig.stats.objectId, rig.stats.objectId);
+    rune::node::ConstraintSet set;
+    set.id = 1;
+    set.members[set.count++] = {rig.unique.objectId, rig.unique.kind, rig.unique.objectId};
+    set.members[set.count++] = {rig.stats.objectId, rig.stats.kind, rig.stats.objectId};
+    write.constraintSets.onChange(0, set);
+    rune::node::TxnOverlayPool pool;
+    std::array<rune::view::TxnOverlay, 1> batchOverlay;
+    const auto need = vs.overlayNeed();
+    const size_t overlayRows = static_cast<size_t>(records) * need.rowsPerRecord;
+    pool.reserveFor(overlayRows, need.maxRowLen);
+    batchOverlay[0].reserve(overlayRows, need.maxRowLen);
+    vs.bindTxn(&pool, batchOverlay, records);
+    vs.bindState(&write);
+    write.verdicts = &vs;
+    vs.bindLeader(nullptr, 1, 0);
+    vs.captureAppendedForTest(false);
+    int64_t nowNs = 0;
+
+    const int64_t end = next;
+    auto readRange = [&](int64_t from, int64_t) {
+        const size_t j = static_cast<size_t>(std::upper_bound(spans.begin(), spans.end(), from, [](int64_t f, const Span& s) { return f < s.base; }) - spans.begin()) - 1;
+        const Span& s = spans[j];
+        return rune::storage::LogReadView{bytes.data() + s.pos, bytes.size() - s.pos, s.base, end};
+    };
+    const auto step = [&](int64_t bound) { vs.driveJudge(readRange, bound, nowNs += 1'000'000, write); };
+    const auto phaseOf = [&](int64_t pid) { const auto* e = write.txn.find(pid); return e == nullptr ? rune::node::TxnPhase::Scanning : e->phase; };
+
+    TxnJudgeRun out;
+    out.judgeNs.reserve(static_cast<size_t>(txns));
+    out.finalizeNs.reserve(static_cast<size_t>(txns));
+    const auto ns = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count()); };
+    for (int t = 0; t < txns; ++t) {
+        const Txn& x = plan[static_cast<size_t>(t)];
+        const bool measured = t >= txns / 2;
+        if (t == txns / 2) {
+            rig.dropDirty();
+            g_allocCount.store(0, std::memory_order_relaxed);
+            g_allocEnabled.store(true, std::memory_order_relaxed);
+        }
+        rune::node::verdictFeedBatch(&write, bytes.data() + spans[static_cast<size_t>(3 * t + 1)].pos, cr::kTxnJudgeBatchBytes, x.judge);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int pass = 0; pass < 100000 && phaseOf(x.pid) != rune::node::TxnPhase::Locked && phaseOf(x.pid) != rune::node::TxnPhase::Finalized; ++pass) step(x.judge + 1);
+        const auto t1 = std::chrono::steady_clock::now();
+        rune::node::verdictFeedMarker(&write, x.pid, x.marker, true);
+        for (int pass = 0; pass < 100000 && phaseOf(x.pid) != rune::node::TxnPhase::Finalized; ++pass) step(x.marker + 1);
+        const auto t2 = std::chrono::steady_clock::now();
+        out.finalized += phaseOf(x.pid) == rune::node::TxnPhase::Finalized ? 1 : 0;
+        if (measured) {
+            out.judgeNs.push_back(static_cast<uint32_t>(ns(t0, t1) / static_cast<uint64_t>(records)));
+            out.finalizeNs.push_back(static_cast<uint32_t>(ns(t1, t2) / static_cast<uint64_t>(records)));
+        }
+        rune::node::verdictOnHw(write, x.marker + 1);
+        if (t % 8 == 7) rig.dropDirty();
+    }
+    g_allocEnabled.store(false, std::memory_order_relaxed);
+    out.steadyAlloc = g_allocCount.load(std::memory_order_relaxed);
+    return out;
+}
+}  // namespace
+
+static void BM_ViewFoldTxnJudge(benchmark::State& st) {
+    const auto records = static_cast<int32_t>(st.range(0));
+    for (auto _ : st) {
+        auto r = runTxnJudging(records);
+        st.counters["judge_record_p50_ns"]    = percentileUs(r.judgeNs, 0.50) * 1000.0;
+        st.counters["finalize_record_p50_ns"] = percentileUs(r.finalizeNs, 0.50) * 1000.0;
+        st.counters["steady_alloc"]           = static_cast<double>(r.steadyAlloc);
+        st.counters["finalized"]              = static_cast<double>(r.finalized);
+        if (r.finalized != 2 * kTxnKeys / static_cast<uint64_t>(records)) st.SkipWithError("a transaction was not finalized");
+    }
+}
+BENCHMARK(BM_ViewFoldTxnJudge)->Name("BM_ViewFoldVerdict/txn_judge_16")->Arg(16)->Unit(benchmark::kMillisecond)->Iterations(1)->UseRealTime();
+BENCHMARK(BM_ViewFoldTxnJudge)->Name("BM_ViewFoldVerdict/txn_judge_4096")->Arg(4096)->Unit(benchmark::kMillisecond)->Iterations(1)->UseRealTime();
 
 // Aggregate fold gate (Phase 2a): user_totals grouped by userId over
 // 1,000,000 contributors / 10,000 groups. What is warm before timing:

@@ -227,12 +227,39 @@ create view account_stats key userId as select count(*) as characters from chara
 - **Creating a constraint on a large topic** pauses delivery of new records to consumers while the view builds, because their
   verdicts are not known yet. Writes are never refused for it: they are stored, acked, and judged once the build has caught up. Rows
   that already break a rule are not repaired.
-- **`create or replace`** keeps judging with the old definition until the new one has caught up, then swaps in one step: there is no
-  gap. **`drop view`** stops judging after the drop, and a drop followed by a create leaves a gap in which writes are not judged.
+- **`create or replace`** keeps judging with the old definition until the new one has caught up, then swaps in one step: there is
+  no gap. **`drop view`** stops judging after the drop, and a drop followed by a create leaves a gap in which writes are not judged.
 - **Refused.** A `unique` or `check` view over a transient source (`InvalidRequest`, 39, "constraints need a persisted topic"); a topic with more than
   32 verdict views (the key index counts as one), a view whose object id is 65536 or above, and a view whose plan record is over 65,536
   bytes (`ViewConstraintInvalid`, 60).
-- **Transactions.** A transactional batch to a source with a constrained view is answered `InvalidRequest` (39).
+
+## Transactions and atomic batches
+
+A transaction that writes to a topic with a constrained view or a key index, and an atomic batch to such a topic, are validated
+against its rules. What a transaction guarantees, by level:
+
+| Level | Guarantee | Status |
+|---|---|---|
+| 1. Atomic writes across topics | All of a transaction's records commit, or none do. | as in Kafka |
+| 2. Atomic validation across topics and views | Every constraint on every partition the transaction wrote passes, or nothing commits and `commitTransactionAndWait()` fails with the reason. | shipped |
+| 3a. Atomic visibility within a partition | No read or consumer on a partition sees part of a transaction. | shipped |
+| 3b. Atomic visibility across partitions | Reads across views on different partitions see a transaction entirely or not at all. | a non-goal (it needs snapshot reads) |
+
+- **Every constraint on every partition votes.** At commit the coordinator asks the leader of each partition the transaction wrote
+  to; each judges all of its records together against every `unique`, `check` and key-index rule of the source. One no aborts the
+  whole transaction. The no names the first failing record: its code (`ConstraintViolation` 55, `KeyExists` 56, `KeyNotFound` 57),
+  its constraint id and its offset.
+- **Deletes are never rejected.** A tombstone passes every constraint.
+- **`TxnTooLarge`** (62). A transaction with more records on one partition than `RUNE_TXN_JUDGED_RECORDS_MAX` (default 4096, see
+  [configuration](../configuration.md)) is voted no, and a send that would take it past the limit is refused with the same code.
+- **`TxnConflict`** (63). Another writer wrote the same key after this transaction's write and before its commit; the transaction
+  aborts.
+- **Locked rows.** From a yes vote until the commit or abort marker, the rows the transaction wrote are locked: the verdict of another
+  writer's record that touches one of them waits for the marker.
+- **Atomic batch.** `p.batch(...)` on a verdict source is all or nothing: one rejected record rejects the batch, and the ack carries one
+  entry for it.
+- **Every way a view is built gives the same rows.** A back-fill, a live fold, a replay after a restart and a new leader's rebuild
+  reach the same rows for the same log, transactions included.
 
 ## Reads
 
