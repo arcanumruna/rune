@@ -264,6 +264,8 @@ public:
     using VoteFnOverride = std::function<bool(std::string_view topic, int32_t partition, int64_t producerId,
                                               int16_t producerEpoch)>;
     void setVoteFnOverride(VoteFnOverride fn) { voteFnOverride_ = std::move(fn); }
+    /// Test seam: true holds a vote (not sent, retried with backoff); false sends it as usual, through the override or the gateway.
+    void setVoteHoldFn(VoteFnOverride fn) { voteHoldFn_ = std::move(fn); }
     /// Test seam: the ConnectRequest.clientVersion of a session when no gateway is wired (else kClientVersion).
     using SessionVersionFn = int32_t (*)(void* ctx, int64_t sessionId) noexcept;
     void setSessionVersionFn(SessionVersionFn fn, void* ctx) noexcept { sessionVersionFn_ = fn; sessionVersionCtx_ = ctx; }
@@ -479,6 +481,7 @@ private:
     int64_t          recoveredAtNs_ = -1;
     VoteCandidateFn  voteCandidate_;
     VoteFnOverride   voteFnOverride_;
+    VoteFnOverride   voteHoldFn_;
     SessionVersionFn sessionVersionFn_  = nullptr;
     void*            sessionVersionCtx_ = nullptr;
     /// Wired to vote (predicate, topics, a way to ask and to write markers), whatever the feature level.

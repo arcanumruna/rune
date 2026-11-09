@@ -2576,6 +2576,7 @@ void BrokerNode::buildGateway() {
                 [this]() -> NodeId { return leaderObserver_.computeOnControl().leaderId; });
 
             txnCoordService_->setGateway(gateway_.get());
+            if (txnVoteHoldForTest_) txnCoordService_->setVoteHoldFn(txnVoteHoldForTest_);
             // D9 review MEDIUM-3: the stuck-markers gauge → its Aeron counter.
             txnCoordService_->setStuckMarkersSink(&BrokerNode::publishStuckMarkers_, this);
             txnCoordService_->setStuckTxnOffsetsSink(&BrokerNode::publishStuckTxnOffsets_, this);   // #359

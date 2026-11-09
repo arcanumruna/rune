@@ -413,6 +413,23 @@ TEST_F(CheckedWritesTxnCoordinatorTest, AVoteThatCouldNotBeSentIsResentWithBacko
     EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareCommit);
 }
 
+TEST_F(CheckedWritesTxnCoordinatorTest, AHeldVoteIsNotSentUntilReleasedThenGoesOutOnTheNextRetry) {
+    bool hold = true;
+    svc_->setVoteHoldFn([&](std::string_view, int32_t, int64_t, int16_t) { return hold; });
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    const int64_t t0 = now_;
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    (void)svc_->doWork(t0 + 20'000'000);
+    EXPECT_TRUE(votes_.empty()) << "a held vote reaches neither the override nor the gateway";
+    hold = false;
+    (void)svc_->doWork(t0 + 60'000'000);
+    ASSERT_EQ(votes_.size(), 1u);
+    vote(votes_[0]);
+    (void)svc_->doWork(t0 + 60'000'000);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareCommit);
+}
+
 TEST_F(CheckedWritesTxnCoordinatorRegression, OldSessionNoVoteIsInvalidRequestThenAbortSucceedsRegression) {
     clientVersion_ = pc::kClientVersionCheckedWrites - 1;
     int16_t ep = 0;

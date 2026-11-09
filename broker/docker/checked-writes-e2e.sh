@@ -36,8 +36,8 @@
 #                 Prints REGRESSORSPATH: OK;
 #   9. TXN:       a `ledger` topic (1 partition, replicas 3, compact) and the view `balances` (balance >= 0) beside the character topic.
 #                 TXN-RACE: 4 probes run transactions of two characters and two ledger entries over the same users (per user six
-#                 fit account_stats, a seventh and an overdraw are refused), the `character` leader `docker kill`ed at ~30 % and
-#                 the consensus leader, the transaction coordinator, at ~60 %, each restarted once progress resumes (per user at most
+#                 fit account_stats, a seventh and an overdraw are refused), the `character` leader `docker kill`ed at ~30 % (first half of the users) and
+#                 the consensus leader, the transaction coordinator, at ~60 % (second half, its probes seeded on another node), each restarted once progress resumes (per user at most
 #                 six Ok, every other answer 55, a lost answer only on a killed node's transaction); TXN-VERIFY: a read_committed
 #                 subscription from 0 holds every committed transaction whole, no refused one, a lost one whole or not at all, and
 #                 account_stats and balances agree; TXN-RESTART: all three nodes restarted, TXN-VERIFY again and a new transaction
@@ -717,17 +717,12 @@ TXN_LEDGER_TOPIC=$(grep -oE '^TXN_LEDGER_TOPIC_ID=[0-9]+' "${WORK_DIR}/txn-setup
 wait_until 120 "the ledger leader" partition_leader "${TXN_LEDGER_TOPIC}" 0 || fail "ledger partition 0 has no leader"
 
 LEG="leg 9b TXN-RACE"
-log "Leg 9b: TXN-RACE: ${WORKERS} probes run ${TXN_PER_USER} transactions per user over ${TXN_USERS} users; the character leader is killed at ~30 %, the coordinator at ~60 %..."
+log "Leg 9b: TXN-RACE: ${WORKERS} probes run ${TXN_PER_USER} transactions per user over ${TXN_USERS} users in two halves; the character leader is killed at ~30 %, the coordinator at ~60 %..."
+txn_half=$(( TXN_USERS / 2 ))
 txn_total=$(( WORKERS * TXN_USERS * TXN_PER_USER ))
-character_leader=$(partition_leader "${RP_CHARACTER_TOPIC}" 0) || fail "no leader of the character topic"
-coordinator=$(consensus_leader) || fail "no consensus leader"
-SEED_NODE=1
-for n in 1 2 3; do
-    if [ "$(( n - 1 ))" != "${character_leader}" ] && [ "$(( n - 1 ))" != "${coordinator}" ]; then SEED_NODE="${n}"; break; fi
-done
 txn_start=$(now_s)
-for i in $(seq 0 $(( WORKERS - 1 ))); do probe_start "txn-run-${i}" "${RACE_S}" txn-run --worker "${i}" --users "$(( TXN_USER_BASE + 1 ))-$(( TXN_USER_BASE + TXN_USERS ))"; done
-txn_kill() {   # <node 0-2> <progress share in percent> <what>: kill it at the share of the writes, restart it once progress resumes
+# txn_kill <node 0-2> <progress share in percent> <what>: kill it at the share of all the transactions, restart it once progress resumes
+txn_kill() {
     wait_until "${RACE_S}" "${3} kill point" progress_at_least $(( txn_total * $2 / 100 )) txn-run \
         || { out_of "txn-run-0" | tail -20 >&2; fail "txn-run never reached $2 % within ${RACE_S}s (at $(race_progress txn-run) of ${txn_total})"; }
     BASE=$(race_progress txn-run)
@@ -739,19 +734,41 @@ txn_kill() {   # <node 0-2> <progress share in percent> <what>: kill it at the s
         || { out_of "txn-run-0" | tail -20 >&2; fail "txn-run: no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the ${3} kill"; }
     restart_node "$1"
 }
-txn_kill "${character_leader}" 30 "character leader"
-coordinator=$(consensus_leader) || fail "no consensus leader after the first restart"
-[ "$(( coordinator + 1 ))" != "${SEED_NODE}" ] || fail "the coordinator is the probes' seed node ${SEED_NODE}"
+# txn_half_run <first worker number> <first user> <last user> : WORKERS probes over the users; the seed node is neither the character
+# leader nor the coordinator (a probe does not outlive its seed), so each half starts by reading both.
+txn_half_run() {
+    local first="$1" lo="$2" hi="$3" i leader coord n
+    leader=$(partition_leader "${RP_CHARACTER_TOPIC}" 0) || fail "no leader of the character topic"
+    coord=$(consensus_leader) || fail "no consensus leader"
+    SEED_NODE=1
+    for n in 1 2 3; do
+        if [ "$(( n - 1 ))" != "${leader}" ] && [ "$(( n - 1 ))" != "${coord}" ]; then SEED_NODE="${n}"; break; fi
+    done
+    TXN_COORDINATOR="${coord}"
+    for i in $(seq 0 $(( WORKERS - 1 ))); do probe_start "txn-run-$(( first + i ))" "${RACE_S}" txn-run --worker "$(( first + i ))" --users "${lo}-${hi}"; done
+}
+txn_half_wait() {   # <first worker number> : every probe of the half exited 0, within the race bound
+    local first="$1" i left
+    for i in $(seq 0 $(( WORKERS - 1 ))); do
+        left=$(( RACE_S - ($(now_s) - txn_start) ))
+        [ "${left}" -gt 0 ] || left=1
+        wait_until "${left}" "txn-run probe $(( first + i ))" bg_done "txn-run-$(( first + i ))" || fail "txn-run probe $(( first + i )) did not finish within ${RACE_S}s of the race start"
+        [ "$(bg_rc "txn-run-$(( first + i ))")" = "0" ] || { out_of "txn-run-$(( first + i ))" | tail -20 >&2; fail "txn-run probe $(( first + i )) exited $(bg_rc "txn-run-$(( first + i ))")"; }
+    done
+}
+# First half: the character leader is killed at ~30 % of all the transactions (60 % of this half).
+txn_half_run 0 $(( TXN_USER_BASE + 1 )) $(( TXN_USER_BASE + txn_half ))
+txn_kill "$(partition_leader "${RP_CHARACTER_TOPIC}" 0)" 30 "character leader"
+txn_half_wait 0
+# Second half, started with the coordinator read afresh: it is killed at ~60 % of all the transactions (20 % of this half).
+txn_half_run "${WORKERS}" $(( TXN_USER_BASE + txn_half + 1 )) $(( TXN_USER_BASE + TXN_USERS ))
+coordinator=$(consensus_leader) || fail "no consensus leader at the coordinator kill"
+[ "${coordinator}" = "${TXN_COORDINATOR}" ] || fail "the coordinator moved from node ${TXN_COORDINATOR} to ${coordinator} while the second half started"
 txn_kill "${coordinator}" 60 "coordinator"
-for i in $(seq 0 $(( WORKERS - 1 ))); do
-    left=$(( RACE_S - ($(now_s) - txn_start) ))
-    [ "${left}" -gt 0 ] || left=1
-    wait_until "${left}" "txn-run probe ${i}" bg_done "txn-run-${i}" || fail "txn-run probe ${i} did not finish within ${RACE_S}s of the race start"
-    [ "$(bg_rc "txn-run-${i}")" = "0" ] || { out_of "txn-run-${i}" | tail -20 >&2; fail "txn-run probe ${i} exited $(bg_rc "txn-run-${i}")"; }
-done
+txn_half_wait "${WORKERS}"
 log "Leg 9b: done in $(( $(now_s) - txn_start )) s"
 txn_files=("${SHARED}"/txn-run-w*.txt)
-[ "${#txn_files[@]}" -eq "${WORKERS}" ] || fail "${#txn_files[@]} transaction result files, want ${WORKERS}"
+[ "${#txn_files[@]}" -eq $(( 2 * WORKERS )) ] || fail "${#txn_files[@]} transaction result files, want $(( 2 * WORKERS ))"
 awk -v per="${TXN_PER_USER}" -v workers="${WORKERS}" -v fitting="${TXN_FITTING}" -v users="${TXN_USERS}" -v ubase="${TXN_USER_BASE}" '
     { if ($3 != 0 && $3 != 55 && $3 != 20000) { other[$3]++; next }
       if ($6 ~ /od$/) { if ($3 == 0) { if (shown++ < 10) printf "%s: an overdraw committed\n", $6; bad = 1 } next }

@@ -303,7 +303,8 @@ struct Shard {
     OneBroker b;
     int32_t   characterTopic = -1, ledgerTopic = -1;
 
-    explicit Shard(const char* tag, std::function<void(NodeConfig&)> tweak = fastBroker) : b(tag, OneBroker::Runtime::Shard, std::move(tweak)) {}
+    explicit Shard(const char* tag, std::function<void(NodeConfig&)> tweak = fastBroker, std::function<void(BrokerNode&)> beforeStart = {})
+        : b(tag, OneBroker::Runtime::Shard, std::move(tweak), std::move(beforeStart)) {}
     void setUp() {
         awaitLevel(b.node());
         ASSERT_FALSE(::testing::Test::HasFatalFailure());
@@ -421,23 +422,35 @@ TEST(CheckedWritesTxnBrokerRegression, RacingTransactionsForTheLastSlotShardRegr
     ASSERT_FALSE(HasFatalFailure());
     constexpr uint64_t user = 9;
     PlainClient plain(s.b.clientConfig(), s.ledgerTopic);
-    for (int i = 0; i < 11; ++i) ASSERT_TRUE(plain.create(user, "p" + std::to_string(i)).ok());
-    std::vector<std::unique_ptr<TxnClient>> clients;
-    for (int i = 0; i < 8; ++i) clients.push_back(std::make_unique<TxnClient>(s.b.clientConfig(), "tx-slot-" + std::to_string(i)));
+    // The eight producers start up and write while the eleven plain creates fill the slots; they commit once the slots are filled.
+    std::vector<std::unique_ptr<TxnClient>> clients(8);
     std::vector<rc::TxnCommitResult> results(clients.size());
+    std::vector<char> isFull(clients.size(), 0);
+    std::atomic<bool> filled{false};
+    std::atomic<int> refused{0};
+    std::vector<rc::ClientConfig> configs;   // a config takes the next data dir of the broker rig: made here, not in the threads
+    for (std::size_t i = 0; i < clients.size(); ++i) configs.push_back(s.b.clientConfig());
     {
         std::vector<std::jthread> threads;
         for (std::size_t i = 0; i < clients.size(); ++i)
             threads.emplace_back([&, i] {
+                clients[i] = std::make_unique<TxnClient>(configs[i], "tx-slot-" + std::to_string(i));
                 clients[i]->begin();
-                if (!clients[i]->create(user, "r" + std::to_string(i)).ok()) throw std::runtime_error("a transaction write was refused");
+                if (!clients[i]->create(user, "r" + std::to_string(i)).ok()) ++refused;
+                while (!filled) std::this_thread::sleep_for(1ms);
                 results[i] = clients[i]->commit();
+                isFull[i]  = !results[i].ok && isConstraint(results[i], *clients[i]->client, "account_stats", "max_characters");   // a Client is read on its own thread
+                clients[i].reset();   // and closed on it: the eight closes overlap
             });
+        for (int i = 0; i < 11; ++i)
+            if (!plain.create(user, "p" + std::to_string(i)).ok()) { ADD_FAILURE() << "plain create " << i << " was refused"; break; }
+        filled = true;
     }
+    ASSERT_EQ(refused.load(), 0) << "a transaction write was refused";
     int ok = 0, full = 0;
     for (std::size_t i = 0; i < results.size(); ++i) {
         if (results[i].ok) ++ok;
-        else if (isConstraint(results[i], *clients[i]->client, "account_stats", "max_characters")) ++full;
+        else if (isFull[i]) ++full;
         else ADD_FAILURE() << "transaction " << i << " voted " << results[i].code;
     }
     EXPECT_EQ(ok, 1);
@@ -502,20 +515,45 @@ TEST(CheckedWritesTxnBrokerRegression, AtomicBatchOnAConstrainedSourceShardRegre
     EXPECT_FALSE(reader.hasEntry(3));
 }
 
-TEST(CheckedWritesTxnBrokerRegression, OppositeOrderLocksResolveByTimeoutShardRegression) {
-    // Two transactions rewrite the same character and the same ledger entry and commit at once.  Their votes may pause behind each other's
-    // locks (the broker has no seam that fixes the order the votes reach the two partitions in): with a 2 s transaction timeout neither
-    // commit hangs, at least one commits, and the rows are one transaction's whole.
-    Shard s("cw11_order");
+/// The coordinator's votes, seen on its control thread: a vote of (topic, producer) in `held` is not sent until it is released.
+struct VoteGate {
+    std::mutex                                   mu;
+    std::set<std::pair<std::string, int64_t>>    held, seen;   // seen: the votes that were let through
+    bool holds(std::string_view topic, int64_t pid) {
+        std::lock_guard<std::mutex> g(mu);
+        const std::pair<std::string, int64_t> key{std::string(topic), pid};
+        if (held.contains(key)) return true;
+        seen.insert(key);
+        return false;
+    }
+    bool saw(const std::string& topic, int64_t pid) { std::lock_guard<std::mutex> g(mu); return seen.contains({topic, pid}); }
+    void release() { std::lock_guard<std::mutex> g(mu); held.clear(); }
+};
+
+/// T1 and T2 rewrite the same character and the same ledger entry and commit at once, with the votes held so that T1's reaches `character` first
+/// and T2's `ledger` first: each partition judges one and blocks the other.  With the transaction timeout `timeoutMs` one aborts by timeout
+/// within it and one pass, the other commits with its rows whole, and no commit hangs.
+void expectOppositeOrderResolvesByTimeout(const char* tag, int32_t timeoutMs) {
+    auto gate = std::make_shared<VoteGate>();
+    Shard s(tag, fastBroker, [gate](BrokerNode& n) {
+        n.setTxnVoteHoldForTest([gate](std::string_view topic, int32_t, int64_t pid, int16_t) { return gate->holds(topic, pid); });
+    });
     s.setUp();
-    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
     ViewHandle names(s.b.node(), "character_name"), balances(s.b.node(), "balances");
     PlainClient plain(s.b.clientConfig(), s.ledgerTopic);
     const rc::WriteResult c = plain.create(5, "base");
     ASSERT_TRUE(c.ok());
     ASSERT_TRUE(plain.put(1, 5, 5).ok());
     std::array<std::unique_ptr<TxnClient>, 2> t;
-    for (std::size_t i = 0; i < t.size(); ++i) t[i] = std::make_unique<TxnClient>(s.b.clientConfig(), "tx-order-" + std::to_string(i), 2'000);
+    for (std::size_t i = 0; i < t.size(); ++i) t[i] = std::make_unique<TxnClient>(s.b.clientConfig(), "tx-order-" + std::to_string(i), timeoutMs);   // producerId() is read on this thread
+    const int64_t pid[2] = {t[0]->prod->producerId(), t[1]->prod->producerId()};
+    ASSERT_GE(pid[0], 0);
+    ASSERT_GE(pid[1], 0);
+    {
+        std::lock_guard<std::mutex> g(gate->mu);
+        gate->held = {{"ledger", pid[0]}, {"character", pid[1]}};
+    }
     for (std::size_t i = 0; i < t.size(); ++i) {
         t[i]->begin();
         ASSERT_TRUE(t[i]->rename(c.key(), 5, "n" + std::to_string(i + 1)).ok());
@@ -523,16 +561,23 @@ TEST(CheckedWritesTxnBrokerRegression, OppositeOrderLocksResolveByTimeoutShardRe
     }
     std::array<std::optional<rc::TxnCommitResult>, 2> r;
     const auto t0 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point done[2];
     {
         std::vector<std::jthread> threads;
         for (std::size_t i = 0; i < t.size(); ++i)
             threads.emplace_back([&, i] {
                 try { r[i] = t[i]->commit(15s); } catch (const std::exception&) {}
+                done[i] = std::chrono::steady_clock::now();
             });
+        // T1's vote has reached character and T2's ledger: each partition judges its first; then the held votes go out and meet the locks.
+        ASSERT_TRUE(waitFor([&] { return gate->saw("character", pid[0]) && gate->saw("ledger", pid[1]); }, 5s));
+        std::this_thread::sleep_for(20ms);
+        gate->release();
     }
-    EXPECT_LT(std::chrono::steady_clock::now() - t0, 8s) << "a commit waited past the transaction timeout and a pass";
+    const auto limit = std::chrono::milliseconds(timeoutMs) + 1500ms;   // the timeout and one pass of the coordinator and the vote retry
+    for (std::size_t i = 0; i < t.size(); ++i) EXPECT_LT(done[i] - t0, limit) << "commit " << i << " waited past the transaction timeout and a pass";
     const bool first = r[0] && r[0]->ok, second = r[1] && r[1]->ok;
-    ASSERT_TRUE(first || second) << "neither transaction committed";
+    EXPECT_NE(first, second) << "exactly one commits, the other aborts by timeout";
     const auto balance = readRow(*plain.client, balances, balances.keyOf(5));
     ASSERT_TRUE(balance.has_value());
     const bool one = readRow(*plain.client, names, names.keyOf("n1")).has_value(), two = readRow(*plain.client, names, names.keyOf("n2")).has_value();
@@ -540,6 +585,10 @@ TEST(CheckedWritesTxnBrokerRegression, OppositeOrderLocksResolveByTimeoutShardRe
     EXPECT_EQ(balances.i(*balance, "balance"), one ? 6 : 7) << "the rows are one transaction's";
     EXPECT_EQ(one ? first : second, true) << "the visible rows are a committed transaction's";
 }
+
+TEST(CheckedWritesTxnBrokerRegression, OppositeOrderLocksResolveByTimeoutShardRegression) { expectOppositeOrderResolvesByTimeout("cw11_order", 200); }
+
+TEST(CheckedWritesTxnBrokerRegression, OppositeOrderLocksResolveByTimeoutFullLengthShardRegression) { expectOppositeOrderResolvesByTimeout("cw11_orderfl", 2'000); }
 
 TEST(CheckedWritesTxnBrokerRegression, OldClientTransactionOnAConstrainedSourceShardRegression) {
     Shard s("cw11_old");

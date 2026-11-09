@@ -1058,7 +1058,9 @@ bool TransactionCoordinationService::startVoteGate_(const pc::EndTxn& msg, int64
 void TransactionCoordinationService::sendVote_(const VoteGate& g, VoteTarget& t, int64_t nowNs)
 {
     if (voteOrphans_.contains({t.topicId, t.partition, g.producerId, g.producerEpoch})) return;   // one live vote per key: onTxnVoteResult frees it
-    const bool sent = voteFnOverride_
+    const bool held = voteHoldFn_ && voteHoldFn_(t.topic, t.partition, g.producerId, g.producerEpoch);
+    const bool sent = held ? false
+        : voteFnOverride_
         ? voteFnOverride_(t.topic, t.partition, g.producerId, g.producerEpoch)
         : gateway_->sendTxnVote(t.topicId, t.partition, g.producerId, g.producerEpoch, g.coordinatorEpoch) >= 0;
     t.outstanding = sent;
