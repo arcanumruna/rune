@@ -734,7 +734,9 @@ view is a `ViewTable`, an open-addressing hash table (`ViewTable.h:60-90`) with 
 is a fixed-width `prefixWidth`, which a path prefix cannot use.
 - **Request:** `{ viewId, partition, prefix (0–127 bytes; empty = all), resumeHash u64, first u8, maxRows (1–1024) }`.
 - **Response:** `{ asOfOffset, rows[], lastHash u64, done u8 }`.
-- **The order.** `h(k) = xxh3_64(key bytes, seed = the topic id)`. It is the same on every node and for every table
+- **The order.** `h(k) = wyhash64(key bytes, seed = the source topic id)` (`rune/node/lease/LeaseHash.h`, pinned by
+  `ScanLeasesRegression.ScanHashGoldenRegression`). wyhash, not xxh3: it is the hash the storage and view tables already
+  link, so the scan adds no second hash function or dependency. It is the same on every node and for every table
   size, so it survives a leader change and table growth. It is not the table's own probe seed, which is per node.
 - **A page.** It holds the live rows whose key starts with `prefix` (filtered on the broker) and whose `h(k)` is
   above `resumeHash` (or any hash when `first = 1`), taking the `maxRows` smallest hashes. It always ends on a hash
@@ -750,6 +752,12 @@ is a fixed-width `prefixWidth`, which a path prefix cannot use.
 - **Resume.** Each page resumes after `resumeHash`, at its own, later `asOfOffset`. Churn between pages never
   invalidates the scan.
 - **Leader change.** A mid-scan change answers `NotLeader`, and the client resumes on the new leader.
+- **Wire (Task 13b).** The gateway routes `ScanLeases` to the SOURCE topic's leader (the view id must be a lease view; any
+  other id is answered like a missing one). Rows are `[keyLen u8][key][rowLen u32 LE][row payload]`, whole hash groups
+  only, within `kScanLeasesMaxPageBytes`; a first group that alone exceeds it is `MessageTooLarge`. A tie group of more
+  than 64 rows beyond `maxRows` is refused `Internal` and counted (`scanTieOverflow`), never answered wrong. The client
+  error space has no NotReady: an index that is not ready answers `NotLeader`, as the lease reads do. Every refusal carries
+  `done = 1` and an empty page.
 - **Why it is new.** Today's `ScanViewRows` cannot serve it: it routes to partition 0, has no `asOf`, and its cursor
   is invalidated by churn (checked-writes §9).
 

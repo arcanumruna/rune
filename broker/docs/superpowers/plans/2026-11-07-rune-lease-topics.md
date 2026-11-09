@@ -1049,6 +1049,12 @@ view's readiness gate is the existing one). Test: `broker/libs/node/tests/node/L
 
 **Don't:** reuse `ScanViewRows` (routes to partition 0, no `asOf`); order by the table's probe seed.
 
+**As built (Task 13b).** The scan hash is `wyhash64(key, seed = source topic id)`, not xxh3 (spec §8.3): the storage tables already link
+it; `ScanLeasesRegression.ScanHashGoldenRegression` pins it. The page is selected in `Worker::executeScanLeases_` (worker op 38,
+return `ScanLeasesResult = 13`) from one walk of the rids with a bounded max-heap plus a 64-entry tie list, then heapsorted; the
+gateway (`handleScanLeases`) requires a lease view id and authorises READ on the SOURCE topic. The lease-view sink frame also carries the
+key type and width, so the gateway narrows a legacy u64 `GetViewRow` with the worker's helper before it picks the partition.
+
 ### Task 14: client — `LeaseTopic<T>`, the lease `SEND_RECORD` form, `Record::leaseOp()`, codegen
 
 Spec §5.1 (client row), §6.6 (consumers), §12.1; L2, L3, L8, L9, L19.

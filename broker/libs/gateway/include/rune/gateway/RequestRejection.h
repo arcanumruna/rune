@@ -212,6 +212,7 @@ static_assert(rune::protocol::client::MessageHeader::ENCODED_SIZE + rune::protoc
     case T::ScanLeases: {
         pc::ScanLeasesResponse r;
         r.sessionId = sessionId; r.correlationId = correlationId; r.code = code;
+        r.done = 1;   // a refusal ends the scan: a client that loops until done never spins on it
         return r.encode(out);
     }
     case T::Ping:

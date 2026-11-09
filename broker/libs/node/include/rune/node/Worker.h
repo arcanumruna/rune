@@ -102,7 +102,9 @@
 #include <rune/crypto/Aead.h>
 #include <rune/crypto/Cipher.h>
 #include <rune/node/CheckedWriteHook.h>
+#include <rune/node/lease/LeaseHash.h>
 #include <rune/node/lease/LeaseIndex.h>
+#include <rune/node/lease/LeaseKey.h>
 #include <rune/node/lease/LeaseRuntime.h>
 #include <rune/protocol/client/LeaseMessages.h>
 #include <rune/node/WriteState.h>
@@ -622,6 +624,12 @@ public:
     /// LeaseKeepAlive / LeaseTimeToLive ops the worker executed (a request refused before the worker never counts).
     [[nodiscard]] uint64_t leaseKeepAlivesForTest() const noexcept { return leaseKeepAlives_; }
     [[nodiscard]] uint64_t leaseTimeToLivesForTest() const noexcept { return leaseTimeToLives_; }
+    /// ScanLeases ops executed; scans answered Internal because more than kScanTieHeadroom keys shared one hash (unreachable without injection).
+    [[nodiscard]] uint64_t scanLeasesForTest() const noexcept { return scanLeases_; }
+    [[nodiscard]] uint64_t scanTieOverflowForTest() const noexcept { return scanTieOverflow_; }
+    /// Test seam (Task 13b): replaces the scan order hash (lease/LeaseHash.h scanHash) so a test can make keys collide; nullptr restores it.
+    using ScanHashFn = uint64_t (*)(std::span<const uint8_t> key, int32_t sourceTopicId);
+    void setScanHashForTest(ScanHashFn fn) noexcept { scanHashFn_ = fn; }
     /// Lease runtime creations that threw bad_alloc (the runtime is retried on the next duty pass).
     [[nodiscard]] uint64_t leaseCreateFailuresForTest() const noexcept { return leaseCreateFailures_; }
     [[nodiscard]] uint64_t nsRequestOpsForTest(uint16_t slot) const noexcept { return slot < nsHot_.size() ? nsHot_[slot].requestOps : 0; }
@@ -1390,6 +1398,7 @@ public:
             break;
         case WorkerOp::Type::LeaseKeepAlive:
         case WorkerOp::Type::LeaseTimeToLive:
+        case WorkerOp::Type::ScanLeases:
             tailKind = sbe::TailKind::Value::LEASE_REQUEST;
             tailSrc  = op.leaseTail.data();
             tailLen  = op.leaseTail.size();
@@ -2811,19 +2820,7 @@ private:
             executeLeaseTimeToLive_(op);
             break;
         case WorkerOp::Type::ScanLeases:
-            // Answering nothing would leave the caller waiting: the gateway never routes ScanLeases (100) to a worker before Task 13.
-            assert(false && "ScanLeases is routed only from Task 13");
-            {   // release: a mis-route still answers (a whole-request InvalidRequest as an empty scan return), so a caller never hangs
-                WorkerReturn ret;
-                ret.type          = WorkerReturn::Type::ViewScanResult;
-                ret.sessionId     = op.sessionId();
-                ret.correlationId = op.correlationId();
-                ret.readTopicId   = op.topicId();
-                ret.readPartition = op.partition();
-                ret.recordCount   = 0;
-                ret.errorCode     = static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest);
-                enqueueReturn_(std::move(ret));
-            }
+            executeScanLeases_(op);
             break;
 
         case WorkerOp::Type::ApplyReplicated:
@@ -4809,19 +4806,10 @@ private:
         if (r.kind == ViewReadReq::Kind::PointKey) {
             key = std::span<const uint8_t>(r.keyBytes.data(), r.keyLen);
         } else {
-            std::size_t width = 8;
-            if (const std::size_t kw = lk.ref.table->keyWidth(); kw < 8) [[unlikely]] {
-                const auto sit = writeSpecs_.find(src);
-                const rune::codec::PrimType kt = sit != writeSpecs_.end() ? sit->second->keyType : rune::codec::PrimType::Float64;
-                bool fits = false;
-                if (kt == rune::codec::PrimType::Int32)
-                    fits = static_cast<int64_t>(r.key) >= INT32_MIN && static_cast<int64_t>(r.key) <= INT32_MAX;
-                else if (kt == rune::codec::PrimType::UInt16 || kt == rune::codec::PrimType::UInt32)
-                    fits = (r.key >> (8 * kw)) == 0;
-                if (!fits) return answer(static_cast<int16_t>(RS::kInvalidRequest));
-                width = kw;
-            }
-            std::memcpy(u64Key.data(), &r.key, 8);
+            const auto sit = writeSpecs_.find(src);
+            const rune::codec::PrimType kt = sit != writeSpecs_.end() ? sit->second->keyType : rune::codec::PrimType::Float64;
+            const std::size_t width = lease::leaseKeyFromLegacyU64(r.key, kt, lk.ref.table->keyWidth(), u64Key);   // the gateway's partition choice uses the same
+            if (width == 0) return answer(static_cast<int16_t>(RS::kInvalidRequest));
             key = std::span<const uint8_t>(u64Key.data(), width);
         }
         if (key.size() != lk.ref.table->keyWidth()) [[unlikely]] return answer(static_cast<int16_t>(RS::kInvalidRequest));
@@ -6767,6 +6755,19 @@ private:
     uint64_t leaseCreateFailures_ = 0;  // lease runtime creations that threw bad_alloc (retried on the next duty pass)
     uint64_t leaseKeepAlives_ = 0;      // LeaseKeepAlive ops executed
     uint64_t leaseTimeToLives_ = 0;     // LeaseTimeToLive ops executed
+    uint64_t scanLeases_ = 0;           // ScanLeases ops executed
+    uint64_t scanTieOverflow_ = 0;      // scans answered Internal: more than kScanTieHeadroom keys shared the boundary hash
+    ScanHashFn scanHashFn_ = nullptr;   // test seam: the scan order hash (nullptr: lease::scanHash)
+    /// ScanLeases scratch, allocated once on the first scan of this worker (cold): the selected rows (a max-heap while the table is walked,
+    /// then sorted), the rids tied with the heap's top hash, and the page's encoded rows.  ~80 KiB.
+    static constexpr std::size_t kScanTieHeadroom = 64;
+    struct LeaseScanScratch {
+        struct Cand { uint64_t hash; uint32_t rid; };
+        std::array<Cand, rune::protocol::client::kScanLeasesMaxRows + kScanTieHeadroom> sel;
+        std::array<uint32_t, kScanTieHeadroom> ties;
+        std::array<uint8_t, rune::protocol::client::kScanLeasesMaxPageBytes> page;
+    };
+    std::unique_ptr<LeaseScanScratch> leaseScan_;
     uint64_t leaseOkWithheld_ = 0;      // deferred Ok answers sent as NotLeader: the read lease ended before they left (R1)
     std::vector<uint8_t> autoIncScratch_;   // Part 06: a key-0 batch is copied here to patch its ids (maxIntakeBatchBytes_, cold)
     std::size_t assignedBaseReserve_ = kAssignedBaseProducersInitial;
@@ -7978,6 +7979,145 @@ private:
         }
         const ChunkRun run{body, 16};
         enqueueViewResult_(ret, &run, 1, 16);
+    }
+    // Lease topics Task 13b (spec 8.3): a ScanLeases op - one page of the lease rows in ascending order of the scan hash (lease/LeaseHash.h).
+    // topicId = the SOURCE topic; nextOffset = resumeHash, recordCount = maxRows, isolation = first, leaseTail = the key prefix.
+    // One walk of the lease table's row ids in ONE duty cycle (a consistent snapshot of the fold at `foldCursor`, answered as asOfOffset):
+    //   - a live row whose key starts with the prefix and (first, or hash > resumeHash) is a candidate;
+    //   - the page is the `maxRows` smallest candidates PLUS every candidate tied with the last one's hash (a tie group is never split:
+    //     the client resumes by hash alone), selected with a bounded max-heap and a tie list for the heap's top hash, then heap-sorted;
+    //   - the encoded rows are capped at kScanLeasesMaxPageBytes, again on a tie-group boundary (done = 0, lastHash = the last group sent;
+    //     a first group that alone does not fit is MessageTooLarge).
+    // `done` = 1 iff no candidate is left beyond the page.  Every refusal carries done = 1.  Nothing allocates after the first scan.
+    void executeScanLeases_(sbe::WorkerOp& op) {
+        namespace pc = rune::protocol::client;
+        using Cand = LeaseScanScratch::Cand;
+        ++scanLeases_;
+        const int32_t topicId   = op.topicId();
+        const int32_t partition = op.partition();
+        const int64_t nowNs     = leaseNow_();
+        WorkerReturn ret;
+        ret.type          = WorkerReturn::Type::ScanLeasesResult;
+        ret.sessionId     = op.sessionId();
+        ret.correlationId = op.correlationId();
+        ret.readTopicId   = topicId;
+        ret.readPartition = partition;
+        ret.baseOffset    = -1;
+        ret.isolation     = 1;   // done
+        const auto refuse = [&](uint16_t code) {
+            ret.errorCode = static_cast<int16_t>(code);
+            enqueueReturn_(std::move(ret));
+        };
+        // The gates, in order: dropped topic (UnknownTopic), not owned / not leader / read lease ended / index not ready / no runtime
+        // (NotLeader - the client code space has no NotReady, and a retry reaches the same answer as the lease reads), not a lease topic.
+        LeaseServe sv;
+        if (const uint16_t refusal = leaseServeable_(topicId, partition, nowNs, sv); refusal != 0) return refuse(refusal);
+        const uint64_t resumeHash = static_cast<uint64_t>(op.nextOffset());
+        const int32_t  maxRows32  = op.recordCount();
+        const bool     first      = op.isolation() == 1;
+        const bool     firstBad   = op.isolation() > 1;
+        const std::uint32_t prefixLen = op.tailLength();   // length first: tail() moves the flyweight's limit
+        if (firstBad || maxRows32 < 1 || maxRows32 > static_cast<int32_t>(pc::kScanLeasesMaxRows) || prefixLen > pc::kScanLeasesMaxPrefixBytes)
+            return refuse(static_cast<uint16_t>(pc::ErrorCode::InvalidRequest));
+        const auto prefix = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(op.tail()), prefixLen);
+        const NsTag nsTag = sv.replica->isDiskBacked() ? nsTagOfLog_(sv.replica->log(), nullptr) : nsTagOfLog_(nullptr, sv.replica->memoryLog());
+        if (NsHot* const nh = nsReadMeter_(topicId, nsTag)) {   // R9: counted and paced like a view read
+            ++nh->requestOps;
+            if (passNowNs_ < nh->queryUntil) [[unlikely]] {
+                ++throttledRefusals_;
+                return refuse(static_cast<uint16_t>(pc::ErrorCode::Throttled));
+            }
+        }
+        const LeaseIndexRef& ref = sv.lk.ref;
+        if (ref.table == nullptr || ref.layout == nullptr) return refuse(static_cast<uint16_t>(pc::ErrorCode::NotLeader));   // unreachable: ready
+        if (!leaseScan_) leaseScan_ = std::make_unique<LeaseScanScratch>();   // cold, once
+        LeaseScanScratch& sc = *leaseScan_;
+        const rune::view::ViewTable& table = *ref.table;
+        const std::size_t maxRows = static_cast<std::size_t>(maxRows32);
+        const auto less = [](const Cand& a, const Cand& b) noexcept { return a.hash != b.hash ? a.hash < b.hash : a.rid < b.rid; };
+        std::size_t hn = 0, tn = 0, candidates = 0;
+        bool tieOverflow = false;
+        const auto addTie = [&](uint32_t rid) noexcept {
+            if (tn < kScanTieHeadroom) sc.ties[tn++] = rid;
+            else tieOverflow = true;
+        };
+        const uint32_t high = table.ridHighWater();
+        for (uint32_t rid = 0; rid < high; ++rid) {
+            if (!leaseRowLive(table, rid)) continue;
+            const std::span<const uint8_t> key = table.keyOf(rid);
+            if (key.size() < prefix.size() || (!prefix.empty() && std::memcmp(key.data(), prefix.data(), prefix.size()) != 0)) continue;
+            const uint64_t h = scanHashFn_ != nullptr ? scanHashFn_(key, topicId) : lease::scanHash(key, topicId);
+            if (!first && h <= resumeHash) continue;
+            ++candidates;
+            if (hn < maxRows) {
+                sc.sel[hn++] = Cand{h, rid};
+                std::push_heap(sc.sel.begin(), sc.sel.begin() + static_cast<std::ptrdiff_t>(hn), less);
+                continue;
+            }
+            const uint64_t top = sc.sel[0].hash;
+            if (h > top) continue;
+            if (h == top) {
+                addTie(rid);
+                continue;
+            }
+            // A smaller hash replaces the top: the popped row stays in the page only when it is tied with the new top.
+            const auto end = sc.sel.begin() + static_cast<std::ptrdiff_t>(hn);
+            std::pop_heap(sc.sel.begin(), end, less);
+            const Cand popped = sc.sel[hn - 1];
+            sc.sel[hn - 1]    = Cand{h, rid};
+            std::push_heap(sc.sel.begin(), end, less);
+            if (popped.hash == sc.sel[0].hash) {
+                addTie(popped.rid);
+            } else {
+                tn          = 0;   // the old ties had the old top's hash, now above the page
+                tieOverflow = false;
+            }
+        }
+        if (tieOverflow) [[unlikely]] {   // more than kScanTieHeadroom keys with one 64-bit hash: never a wrong page
+            ++scanTieOverflow_;
+            return refuse(static_cast<uint16_t>(pc::ErrorCode::Internal));
+        }
+        if (hn != 0)
+            for (std::size_t i = 0; i < tn; ++i) sc.sel[hn++] = Cand{sc.sel[0].hash, sc.ties[i]};   // the ties join the top's group
+        std::make_heap(sc.sel.begin(), sc.sel.begin() + static_cast<std::ptrdiff_t>(hn), less);
+        std::sort_heap(sc.sel.begin(), sc.sel.begin() + static_cast<std::ptrdiff_t>(hn), less);   // ascending by (hash, rid), in place
+        // Encode whole hash groups up to the page's byte cap.
+        const std::size_t keyW   = table.keyWidth();
+        const std::size_t rowLen = ref.layout->rowLen;
+        const std::size_t rowBytes = 1 + keyW + 4 + rowLen;
+        std::size_t pos = 0, rows = 0;
+        uint64_t lastHash = resumeHash;
+        bool cut = false;
+        for (std::size_t i = 0; i < hn;) {
+            std::size_t j = i;
+            while (j < hn && sc.sel[j].hash == sc.sel[i].hash) ++j;
+            if (pos + (j - i) * rowBytes > pc::kScanLeasesMaxPageBytes) {
+                if (rows == 0) return refuse(static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge));   // the first group alone does not fit
+                cut = true;
+                break;
+            }
+            for (std::size_t k = i; k < j; ++k) {
+                const uint32_t rid = sc.sel[k].rid;
+                const std::span<const uint8_t> key = table.keyOf(rid);
+                uint8_t* const out = sc.page.data() + pos;
+                out[0] = static_cast<uint8_t>(keyW);
+                std::memcpy(out + 1, key.data(), keyW);
+                const uint32_t rl = static_cast<uint32_t>(rowLen);
+                std::memcpy(out + 1 + keyW, &rl, 4);   // little-endian host (the ring and the wire are little-endian throughout)
+                std::memcpy(out + 1 + keyW + 4, table.rowOf(rid), rowLen);
+                pos += rowBytes;
+            }
+            rows += j - i;
+            lastHash = sc.sel[i].hash;
+            i = j;
+        }
+        ret.errorCode   = 0;
+        ret.baseOffset  = sv.lk.foldCursor;
+        ret.lastOffset  = static_cast<int64_t>(lastHash);
+        ret.recordCount = static_cast<int32_t>(rows);
+        ret.isolation   = (!cut && candidates == hn) ? 1 : 0;   // done: no candidate beyond the page
+        const ChunkRun run{sc.page.data(), static_cast<uint32_t>(pos)};
+        enqueueViewResult_(ret, &run, 1, static_cast<uint32_t>(pos));
     }
     static constexpr std::size_t kLeaseEmitReserveBytes = 1u << 20;
 

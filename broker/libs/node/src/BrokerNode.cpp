@@ -4167,6 +4167,8 @@ void BrokerNode::bootFromCatalog_() {
         TopicSpec bs = bootSpecOfFrame(sp.nsId, sp.topicId, sp.name, sp.partitions, /*rf*/0, sp.persistence, c, sp.sourceKeyFeatures);
         bs.viewSink = true;   // VLS B.2: catalog-only -- no dir, no log, no replica
         bs.leaseSourceTopicId = sp.leaseView ? sp.leaseSourceTopicId : -1;   // Task 13a: the gateway registry holds the lease view's source
+        bs.leaseKeyType       = sp.leaseView ? sp.leaseKeyType : 0;          // Task 13b: ... and that topic's key
+        bs.leaseKeyWidth      = sp.leaseView ? sp.leaseKeyWidth : 0;
         catalogTopics.push_back(std::move(bs));
     };
     const int replayed = bootApplier_->replayLocal(*catalogLog_, BootEffects{std::move(sink)});   // throws: refuse boot
@@ -5909,6 +5911,8 @@ TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m) {
     s.autoIncrement          = m.keyFeatures.autoIncrement;
     s.leaseTopic             = m.lease.has_value();
     s.leaseSourceTopicId     = m.leaseView ? m.leaseSourceTopicId : -1;   // Task 13a: a lease view sink names its lease topic
+    s.leaseKeyType           = m.leaseView ? m.leaseKeyType : 0;           // Task 13b: ... and that topic's key
+    s.leaseKeyWidth          = m.leaseView ? m.leaseKeyWidth : 0;
     return s;
 }
 } // namespace

@@ -6,6 +6,7 @@
 #include <rune/node/CatalogEffectFrames.h>
 #include <rune/node/PersistenceMode.h>
 #include <rune/node/SchemaRegistry.h>
+#include <rune/node/WriteState.h>
 #include <rune/node/ViewRegistry.h>
 
 #include <rune/catalog/CatalogReplayer.h>
@@ -77,6 +78,10 @@ SinkSpec leaseSinkSpecOf(const cat::ViewObject& v, const cat::CatalogState& stat
         if (t->schema) {
             s.keyField = t->schema->keyField;
             s.sourceKeyFeatures = t->schema->keyFeatures;   // the lease topic's own key features (the sink mirrors its source's partitioner), never the default
+            if (const auto w = writeSpecWireOf(*t)) {       // Task 13b: the key's type and width, for the gateway's legacy-u64 narrowing (cold)
+                s.leaseKeyType  = static_cast<uint8_t>(w->keyType);
+                s.leaseKeyWidth = w->keyWidth;
+            }
         }
     }
     return s;

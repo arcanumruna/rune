@@ -401,7 +401,9 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     EXPECT_EQ(sbe::TailKind::get(14), sbe::TailKind::Value::LEASE_REQUEST);
     EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::LEASE_KEEP_ALIVE), "LEASE_KEEP_ALIVE");
     EXPECT_THROW((void)sbe::OpType::get(39), std::runtime_error);
-    EXPECT_THROW((void)sbe::ReturnType::get(13), std::runtime_error);
+    EXPECT_EQ(sbe::ReturnType::get(13), sbe::ReturnType::Value::SCAN_LEASES_RESULT);   // Task 13b
+    EXPECT_STREQ(sbe::ReturnType::c_str(sbe::ReturnType::Value::SCAN_LEASES_RESULT), "SCAN_LEASES_RESULT");
+    EXPECT_THROW((void)sbe::ReturnType::get(14), std::runtime_error);
     EXPECT_THROW((void)sbe::TailKind::get(15), std::runtime_error);
 }
 

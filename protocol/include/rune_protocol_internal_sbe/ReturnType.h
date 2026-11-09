@@ -46,6 +46,7 @@ public:
         STATS_RESULT = static_cast<std::uint8_t>(10),
         LEASE_KEEP_ALIVE_RESULT = static_cast<std::uint8_t>(11),
         LEASE_TIME_TO_LIVE_RESULT = static_cast<std::uint8_t>(12),
+        SCAN_LEASES_RESULT = static_cast<std::uint8_t>(13),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
 
@@ -66,6 +67,7 @@ public:
             case static_cast<std::uint8_t>(10): return STATS_RESULT;
             case static_cast<std::uint8_t>(11): return LEASE_KEEP_ALIVE_RESULT;
             case static_cast<std::uint8_t>(12): return LEASE_TIME_TO_LIVE_RESULT;
+            case static_cast<std::uint8_t>(13): return SCAN_LEASES_RESULT;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
 
@@ -89,6 +91,7 @@ public:
             case STATS_RESULT: return "STATS_RESULT";
             case LEASE_KEEP_ALIVE_RESULT: return "LEASE_KEEP_ALIVE_RESULT";
             case LEASE_TIME_TO_LIVE_RESULT: return "LEASE_TIME_TO_LIVE_RESULT";
+            case SCAN_LEASES_RESULT: return "SCAN_LEASES_RESULT";
             case NULL_VALUE: return "NULL_VALUE";
         }
 

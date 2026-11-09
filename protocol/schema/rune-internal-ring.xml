@@ -144,7 +144,7 @@
       <validValue name="GET_STATS">35</validValue>
       <!-- Lease topics Task 11a: gateway -> the lease partition leader's worker.  LEASE_KEEP_ALIVE: recordCount = the entry count, tail
            (TailKind = LEASE_REQUEST) = the request's validated entries [keyLen u8][key][version i64]; LEASE_TIME_TO_LIVE: tail =
-           the key bytes.  SCAN_LEASES is reserved (served by Task 13).  Answered with LEASE_KEEP_ALIVE_RESULT / LEASE_TIME_TO_LIVE_RESULT. -->
+           the key bytes.  SCAN_LEASES (Task 13b): tail = the key prefix bytes (LEASE_REQUEST), nextOffset = resumeHash, recordCount = maxRows, isolation = first (0/1).  Answered with LEASE_KEEP_ALIVE_RESULT / LEASE_TIME_TO_LIVE_RESULT / SCAN_LEASES_RESULT. -->
       <validValue name="LEASE_KEEP_ALIVE">36</validValue>
       <validValue name="LEASE_TIME_TO_LIVE">37</validValue>
       <validValue name="SCAN_LEASES">38</validValue>
@@ -232,6 +232,10 @@
            lastOffset = version, chunk = {grantedTtlMs u64, holder u64} LE. -->
       <validValue name="LEASE_KEEP_ALIVE_RESULT">11</validValue>
       <validValue name="LEASE_TIME_TO_LIVE_RESULT">12</validValue>
+      <!-- Lease topics Task 13b: SCAN_LEASES_RESULT: errorCode = code, baseOffset = asOfOffset (the lease index's fold cursor, exclusive),
+           lastOffset = lastHash (the u64 bit-cast), recordCount = rowCount, isolation = done (0/1), chunk = the encoded rows
+           [keyLen u8][key][rowLen u32 LE][row payload]. -->
+      <validValue name="SCAN_LEASES_RESULT">13</validValue>
     </enum>
 
     <!-- F15: TxnReturn::kind -->

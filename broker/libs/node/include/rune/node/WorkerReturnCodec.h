@@ -57,6 +57,9 @@ static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::LeaseKeepAliveResult
 static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::LeaseTimeToLiveResult) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::LEASE_TIME_TO_LIVE_RESULT),
               "WorkerReturn::LeaseTimeToLiveResult must stay on sbe ReturnType::LEASE_TIME_TO_LIVE_RESULT");
+static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::ScanLeasesResult) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::SCAN_LEASES_RESULT),
+              "WorkerReturn::ScanLeasesResult must stay on sbe ReturnType::SCAN_LEASES_RESULT");
 // ... and the lease ops on sbe OpType 36-38.
 static_assert(static_cast<std::uint8_t>(WorkerOp::Type::LeaseKeepAlive) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::LEASE_KEEP_ALIVE) &&

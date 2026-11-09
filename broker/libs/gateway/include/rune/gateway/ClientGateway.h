@@ -1522,6 +1522,7 @@ public:
     [[nodiscard]] uint64_t leaseReturnMalformed() const noexcept { return leaseReturnMalformed_; }
     void applyLeaseKeepAliveForTest(const uint8_t* buf, std::size_t len) { handleLeaseKeepAlive(buf, len); }
     void applyLeaseTimeToLiveForTest(const uint8_t* buf, std::size_t len) { handleLeaseTimeToLive(buf, len); }
+    void applyScanLeasesForTest(const uint8_t* buf, std::size_t len) { handleScanLeases(buf, len); }
     [[nodiscard]] uint64_t rejectedRequestsForTest() const noexcept { return rejectedRequests_; }
     // No-hang fix round 2: inject a session with a NON-NULL placeholder egress
     // (never dereferenced: makeForTest's TestEgressFn intercepts every offer of
@@ -2116,9 +2117,11 @@ private:
     // Checked writes Part 08: GetStats (91) - the same route; the worker answers a StatsResult (StatsResponse 92).
     void handleGetStats     (const uint8_t* buf, std::size_t len);
     // Lease topics Task 11b: LeaseKeepAlive (96) / LeaseTimeToLive (98) - the worker answers LeaseKeepAliveResult /
-    // LeaseTimeToLiveResult (LeaseKeepAliveResponse 97 / LeaseTimeToLiveResponse 99).  ScanLeases (100) is refused until Task 13.
+    // LeaseTimeToLiveResult (LeaseKeepAliveResponse 97 / LeaseTimeToLiveResponse 99).  Task 13b: ScanLeases (100) - a ScanLeasesResult
+    // (ScanLeasesResponse 101).
     void handleLeaseKeepAlive (const uint8_t* buf, std::size_t len);
     void handleLeaseTimeToLive(const uint8_t* buf, std::size_t len);
+    void handleScanLeases     (const uint8_t* buf, std::size_t len);
     void answerLeaseEnqueue_(rune::node::EnqueueResult er, int32_t topicId, int32_t partition, const uint8_t* buf, std::size_t len,
                              const char* what);
     void noteLeaseReturnMalformed_(const char* what, int32_t recordCount, std::size_t chunkBytes);

@@ -184,10 +184,11 @@ struct WorkerOp {
         // Lease topics Task 11a: gateway → the lease partition leader's worker.  topicId / partition / sessionId / correlationId as GetStats;
         // not ownership-gated in the switch (the handlers check the replica themselves).  LeaseKeepAlive: recordCount = the entry count
         // (1..256), leaseTail (TailKind LEASE_REQUEST) = the request's validated entries [keyLen u8][key][version i64 LE].
-        // LeaseTimeToLive: leaseTail = the key bytes.  ScanLeases (38) is served by Task 13 (reserved: the worker answers it nothing yet).
+        // LeaseTimeToLive: leaseTail = the key bytes.  ScanLeases (38, Task 13b): topicId = the SOURCE topic, nextOffset = resumeHash (the u64 bit-cast),
+        // recordCount = maxRows (1..1024), isolation = first (0/1), leaseTail = the key prefix (<= 127 bytes).
         LeaseKeepAlive            = 36, ///< gateway → worker: keepalive entries of one lease partition
         LeaseTimeToLive           = 37, ///< gateway → worker: the remaining time of one lease key
-        ScanLeases                = 38, ///< gateway → worker: a page of the lease rows (Task 13)
+        ScanLeases                = 38, ///< gateway → worker: a page of the lease rows in hash order (Task 13b)
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -626,6 +627,10 @@ struct WorkerReturn {
         /// Lease topics Task 11a: the answer to a LeaseTimeToLive op.  errorCode = the client code, baseOffset = remainingMs (-1 = none),
         /// lastOffset = the lease version, sessionId / correlationId echoed; the chunk is 16 bytes {grantedTtlMs u64, holder u64} LE.
         LeaseTimeToLiveResult = 12,
+        /// Lease topics Task 13b: the answer to a ScanLeases op.  errorCode = the client code, baseOffset = asOfOffset (the lease index's fold
+        /// cursor at the walk, exclusive), lastOffset = lastHash (the u64 bit-cast), recordCount = the rows in the page, isolation = done (0/1);
+        /// the chunk is the encoded rows, recordCount x { keyLen u8, key, rowLen u32 LE, row payload } (LeaseMessages.h).
+        ScanLeasesResult = 13,
     };
 
     Type    type = Type::ProduceResult;

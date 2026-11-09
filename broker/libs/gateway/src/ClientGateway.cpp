@@ -34,6 +34,7 @@
 // avoid a circular CMake target dep; rune_gateway does NOT link rune_node).
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/lease/LeaseKey.h>
 #include <rune/node/SessionAckSink.h>
 // E5.1.2d: shared produce-batch helper now in rune_storage (leaf lib, no circular dep).
 #include <rune/storage/ProducePath.h>
@@ -1441,8 +1442,7 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::GetStats:
             handleGetStats(buf, len);
             break;
-        // Lease topics Task 11b: keepalive / TimeToLive route to the partition leader's worker; ScanLeases is answered here until
-        // Task 13 (never enqueued: the worker asserts it is never routed).
+        // Lease topics Task 11b / 13b: keepalive / TimeToLive / ScanLeases route to the partition leader's worker.
         case pc::TemplateId::LeaseKeepAlive:
             handleLeaseKeepAlive(buf, len);
             break;
@@ -1450,7 +1450,7 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             handleLeaseTimeToLive(buf, len);
             break;
         case pc::TemplateId::ScanLeases:
-            (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "ScanLeases: Task 13");
+            handleScanLeases(buf, len);
             break;
         default:
             // ConnectResponse, ErrorResponse, Pong, MetadataResponse (broker→client),
@@ -7598,6 +7598,50 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             return;
         }
 
+        // Lease topics Task 13b: a worker's ScanLeases answer: errorCode = the code, baseOffset = asOfOffset, lastOffset = lastHash (bit-cast),
+        // recordCount = rows, isolation = done; the chunk is the encoded rows, forwarded as they are after a structural check (the rows
+        // tile the chunk exactly and number recordCount - a worker bug otherwise, answered Internal).
+        if (ret.type == rune::node::WorkerReturn::Type::ScanLeasesResult) {
+            Session* session = sessions_.find(ret.sessionId);
+            if (!session) return;
+            const std::span<const uint8_t> chunk = ret.chunkBytes();
+            bool ok = ret.recordCount >= 0 && ret.recordCount <= 0xFFFF && chunk.size() <= pc::kScanLeasesMaxPageBytes &&
+                      (ret.errorCode == 0 || (chunk.empty() && ret.recordCount == 0));
+            if (ok) {
+                std::size_t pos = 0;
+                int32_t rows = 0;
+                while (pos < chunk.size()) {
+                    if (pos + 1 > chunk.size()) { ok = false; break; }
+                    const std::size_t klen = chunk[pos];
+                    if (pos + 1 + klen + 4 > chunk.size()) { ok = false; break; }
+                    const std::size_t rlen = static_cast<uint32_t>(pc::detail::getLE32(chunk.data(), static_cast<int>(pos + 1 + klen)));
+                    if (rlen > chunk.size() - (pos + 1 + klen + 4)) { ok = false; break; }
+                    pos += 1 + klen + 4 + rlen;
+                    ++rows;
+                }
+                ok = ok && rows == ret.recordCount;
+            }
+            if (!ok) [[unlikely]] {
+                noteLeaseReturnMalformed_("ScanLeasesResult", ret.recordCount, chunk.size());
+                const std::size_t n = encodeRejection(static_cast<uint16_t>(pc::TemplateId::ScanLeases), ret.sessionId, ret.correlationId,
+                                                      static_cast<uint16_t>(pc::ErrorCode::Internal), scratch_.data(), scratch_.size());
+                sendAnswer_(*session, scratch_.data(), n);
+                return;
+            }
+            pc::ScanLeasesResponse resp;
+            resp.sessionId     = ret.sessionId;
+            resp.correlationId = ret.correlationId;
+            resp.code          = static_cast<uint16_t>(ret.errorCode);
+            resp.asOfOffset    = ret.baseOffset;
+            resp.lastHash      = static_cast<uint64_t>(ret.lastOffset);
+            resp.done          = ret.isolation == 1 ? 1 : 0;
+            resp.rowCount      = static_cast<uint16_t>(ret.recordCount);
+            resp.rows          = chunk;
+            static_assert(pc::MessageHeader::ENCODED_SIZE + pc::ScanLeasesResponse::BODY_FIXED + pc::kScanLeasesMaxPageBytes <= kScratchSize);
+            sendAnswer_(*session, scratch_.data(), resp.encode(scratch_.data()));
+            return;
+        }
+
         // ===================================================================
         // ProduceResult
         // ===================================================================
@@ -10751,10 +10795,23 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     // view id yields partition 0 and the worker answers UnknownView.
     uint8_t keyLe[8];
     for (int i = 0; i < 8; ++i) keyLe[i] = static_cast<uint8_t>(m.keyU64 >> (8 * i));
+    std::size_t keyLen = sizeof keyLe;
+    // Lease topics Task 13b: a lease topic partitions on its key's own width (a UInt32 key is 4 bytes), so the legacy u64 is narrowed to that
+    // width - by the helper the worker reads the row with - before it picks the partition; a value the key type cannot hold is InvalidRequest.
+    if (leaseSourceOfView_(m.viewTopicId) >= 0) {
+        const rune::node::TopicSpec* sp = topicRegistry_->viewSinkSpec(m.viewTopicId);
+        std::array<uint8_t, 8> narrowed{};
+        keyLen = rune::node::lease::leaseKeyFromLegacyU64(m.keyU64, static_cast<rune::codec::PrimType>(sp->leaseKeyType), sp->leaseKeyWidth, narrowed);
+        if (keyLen == 0) {
+            (void)rejectRequest_(buf, len, pc::ViewRowResponse::kInvalidRequest, "GetViewRow: key does not fit the lease topic's key type");
+            return;
+        }
+        std::memcpy(keyLe, narrowed.data(), sizeof keyLe);
+    }
     int32_t partition = 0;
     if (topicRegistry_) {
         const int32_t p = topicRegistry_->partitionForKey(
-            m.viewTopicId, std::span<const uint8_t>(keyLe, sizeof keyLe));
+            m.viewTopicId, std::span<const uint8_t>(keyLe, keyLen));
         if (p >= 0) partition = p;
     }
     if (const uint16_t gate = viewRowGate_(m.viewTopicId, partition); gate != kViewRowNoGate) {
@@ -11028,6 +11085,51 @@ void ClientGateway::handleLeaseTimeToLive(const uint8_t* buf, std::size_t len)
     op.leaseTail     = m->key;
     answerLeaseEnqueue_(workerPool_->enqueueOp(m->topicId, m->partition, std::move(op)), m->topicId, m->partition, buf, len,
                         "LeaseTimeToLive");
+}
+
+// Lease topics Task 13b: ScanLeases (100) - one page of a lease partition's rows in hash order.  The request names the lease VIEW
+// (`<topic>.leases`); the read is authorised as READ on the lease TOPIC (spec 7.1: a VIEW grant on the lease view is not consulted) and routed
+// to the SOURCE topic's partition leader.  Every refusal is a ScanLeasesResponse with done = 1 (encodeRejection).
+void ClientGateway::handleScanLeases(const uint8_t* buf, std::size_t len)
+{
+    const auto m = pc::ScanLeases::decode(buf, len);
+    if (!m) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "ScanLeases body undecodable");
+        return;
+    }
+    Session* session = sessions_.find(m->sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "ScanLeases for unknown session");
+        return;
+    }
+    if (session->clientVersion < pc::kClientVersionLeases) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "ScanLeases: client version below leases");
+        return;
+    }
+    // The id must be a lease view; the lease topic is the registry's (the catalog's), never viewTopicId - 1.  Anything else is answered
+    // exactly like a missing id (the auth rule: a hidden and a missing id are the same), so the scan cannot probe other objects.
+    const int32_t src = leaseSourceOfView_(m->viewTopicId);
+    if (src < 0) {
+        if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
+            if (deny_(*session, authorizeTopicIdHere_(perms, m->viewTopicId, 0, rune::security::Operation::Read, rune::security::ResourceType::Topic), buf, len))
+                return;
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::UnknownTopic), "ScanLeases: not a lease view");
+        return;
+    }
+    if (!leaseRouteAdmit_(*session, m->sessionId, m->correlationId, src, m->partition, rune::security::Operation::Read, buf, len,
+                          "ScanLeases refused"))
+        return;
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::ScanLeases;
+    op.topicId       = src;
+    op.partition     = m->partition;
+    op.sessionId     = m->sessionId;
+    op.correlationId = m->correlationId;
+    op.nextOffset    = static_cast<int64_t>(m->resumeHash);
+    op.recordCount   = static_cast<int32_t>(m->maxRows);
+    op.isolation     = m->first;
+    op.leaseTail     = m->prefix;
+    answerLeaseEnqueue_(workerPool_->enqueueOp(src, m->partition, std::move(op)), src, m->partition, buf, len, "ScanLeases");
 }
 
 void ClientGateway::handleGetViewRowK(const uint8_t* buf, std::size_t len)

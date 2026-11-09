@@ -17,7 +17,9 @@
 //   | 2-entry keepalive     | entry 1 parks behind a clear            | two frames, final 0 then 1                  | ParkedAnswerForwardedRegression
 //   | parked keepalive      | session closed before the clear folds   | no frame, park table drained                | SessionGoneDropsRegression
 //   | keepalive             | worker ring full                        | Throttled, ttlMs 1                          | RingFullThrottledRegression
-//   | ScanLeases            | any                                     | InvalidRequest (until Task 13)              | ScanLeasesNotYetRegression
+//   | ScanLeases            | lease view, topic READ / VIEW-only      | pages in hash order / NotAuthorized         | ScanLeasesRoutedRegression, ScanLeasesAuthRegression
+//   | ScanLeases            | non-lease id / led elsewhere / refusals | missing id / Redirect / every refusal done | ScanLeasesAuthRegression, ScanLeasesRedirectRegression, ScanLeasesRefusalDoneRegression
+//   | GetViewRow (legacy)   | narrow-key lease topic, 4 partitions    | routed on the key's own width               | LegacyU64NarrowKeyRoutesToOwnerRegression
 //   | keepalive             | cannot fit one ingress frame            | MessageTooLarge (never Throttled)           | KeepAliveTooLargeForRingIsNotRetriableRegression
 //   | keepalive / TTL       | undecodable body                        | InvalidRequest                              | UndecodableBodyRegression
 //   | keepalive / TTL       | plain topic / partition out of range    | InvalidRequest                              | NonLeaseTopicAndPartitionRangeRegression
@@ -48,11 +50,13 @@
 #include <rune/metadata/RoutingImage.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/node/lease/LeaseHash.h>
 #include <rune/node/lease/LeaseIndex.h>
 #include <rune/node/lease/LeaseRuntime.h>
 #include <rune/protocol/LeaseRecord.h>
 #include <rune/protocol/client/LeaseMessages.h>
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -144,6 +148,28 @@ std::optional<TtlFrame> asTtl(const std::vector<uint8_t>& f) {
     return TtlFrame{m->correlationId, m->code, m->grantedTtlMs, m->remainingMs, m->version, m->holder};
 }
 
+/// The lease topic's source descriptor with a UInt32 key (the lease columns, then the key `id`, then the address).
+rune::codec::Descriptor narrowLeaseSource() {
+    using rune::codec::PrimType;
+    rune::codec::DescriptorBuilder d("inst", 1);
+    d.add("lease_version", PrimType::Int64).add("lease_ttl_ms", PrimType::UInt64).add("lease_holder", PrimType::UInt64)
+        .add("lease_remaining_ms", PrimType::UInt64).add("id", PrimType::UInt32, 1, true).addFixedStr("addr", 16);
+    return d.build();
+}
+/// A 4-byte-key grant record (the layout of LeaseViewReadTest's narrow-key case).
+RawRec narrowGrant(uint32_t id) {
+    std::string key(4, '\0');
+    for (int i = 0; i < 4; ++i) key[std::size_t(i)] = char(id >> (8 * i));
+    std::vector<uint8_t> v(4u + 32u + 4u + 16u, 0);
+    putLe(v, 0, 32u + 4u + 16u, 2);
+    putLe(v, 2, 1, 2);
+    putLe(v, 12, 5000, 8);
+    putLe(v, 20, 1, 8);
+    putLe(v, 36, id, 4);
+    v[40] = 'a';
+    return {key, v, 1};
+}
+
 /// A real ClientGateway + WorkerPool(1) whose worker is the VerdictRig's real lease worker.
 struct GwLease {
     int64_t leaseNow = 1'000'000'000;   // declared first: outlives the worker that reads it
@@ -159,6 +185,7 @@ struct GwLease {
 
     int32_t rigPartition = 0;   // the partition of kTopic the rig's worker leads
     int32_t partitions = 1;     // the topic's partition count
+    bool narrowKey = false;     // the lease topic's key is a UInt32 (4 bytes), not the default UInt64
 
     static RigTuning hosted(WorkerPool& p, int32_t partition) {
         RigTuning t;
@@ -168,15 +195,22 @@ struct GwLease {
     }
 
     /// `ingressRingBytes`: the worker pool's ingress ring (RUNE_WORKER_INGRESS_RING_BYTES / the WorkerPool ctor's 3rd argument).
-    explicit GwLease(std::size_t ingressRingBytes = 1 << 22, int32_t partitionOfRig = 0, int32_t partitionCount = 1)
+    explicit GwLease(std::size_t ingressRingBytes = 1 << 22, int32_t partitionOfRig = 0, int32_t partitionCount = 1, bool narrowKeyTopic = false)
         : rigPartition(partitionOfRig),
           partitions(partitionCount),
+          narrowKey(narrowKeyTopic),
           pool(1, rune::metadata::ShardRouter(1), ingressRingBytes, 1 << 25, 64, 64),
           r(false, 64LL * 1024 * 1024, hosted(pool, partitionOfRig)),
           dir(rigTmpPath("gwlease").string()),
           gw(rune::gateway::ClientGateway::makeForTest([this](const uint8_t* b, std::size_t n) -> int64_t { out.emplace_back(b, b + n); return 1; }, 1)) {
         r.worker->setLeaseClockForTest(&leaseNow);
-        r.createLeaseTopic(1000);
+        if (narrowKey) {
+            rune::protocol::LeaseSpec ls;
+            ls.maxKeys = 1000;
+            r.createLeaseTopicSpec(ls, narrowLeaseSource(), KeyShape{rune::codec::PrimType::UInt32});
+        } else {
+            r.createLeaseTopic(1000);
+        }
         r.passes(30);
         WorkerOp level;
         level.type = WorkerOp::Type::ClusterFeatureLevel; level.nextOffset = rune::replication::MetadataFeature::kLeases;
@@ -248,6 +282,9 @@ struct GwLease {
         auto ttl = std::move(r.leaseTtlAnswers);
         r.leaseTtlAnswers.clear();
         auto views = r.takeViewAnswers();
+        auto scans = std::move(r.leaseScanAnswers);
+        r.leaseScanAnswers.clear();
+        for (const WorkerReturn& w : scans) gw.handleWorkerReturnForTest(w);
         for (const WorkerReturn& w : views) gw.handleWorkerReturnForTest(w);
         for (const WorkerReturn& w : ka) gw.handleWorkerReturnForTest(w);
         for (const WorkerReturn& w : ttl) gw.handleWorkerReturnForTest(w);
@@ -291,6 +328,15 @@ struct GwLease {
         f.resize(m.encode(f.data()));
         return f;
     }
+    std::vector<uint8_t> scanFrameFor(int64_t c, int32_t view, std::span<const uint8_t> prefix, uint16_t maxRows, uint64_t resume, bool first,
+                                      int32_t partition = 0, int64_t session = 0) const {
+        pc::ScanLeases m;
+        m.sessionId = session != 0 ? session : sid; m.correlationId = c; m.viewTopicId = view; m.partition = partition;
+        m.resumeHash = resume; m.first = first ? 1 : 0; m.maxRows = maxRows; m.prefix = prefix;
+        std::vector<uint8_t> f(m.encodedSize());
+        f.resize(m.encode(f.data()));
+        return f;
+    }
     /// The full ingress dispatch (checkFrame, the suspend and auth gates, the handler), then the frames sent since.
     std::vector<std::vector<uint8_t>> send(const std::vector<uint8_t>& f) {
         const std::size_t before = out.size();
@@ -324,6 +370,8 @@ struct GwLease {
         sink.partitionCount = partitions;
         sink.viewSink = true;
         sink.leaseSourceTopicId = kTopic;   // the registry's sink spec IS the lease view -> source mapping (Task 13a review fixes)
+        sink.leaseKeyType  = static_cast<uint8_t>(narrowKey ? rune::codec::PrimType::UInt32 : rune::codec::PrimType::UInt64);   // Task 13b: the legacy u64 narrowing
+        sink.leaseKeyWidth = narrowKey ? 4 : 8;
         if (registry->createTopicAt(kView, sink) != kView) throw std::logic_error("GwLease: lease view id");
     }
     std::vector<uint8_t> viewFrame(int64_t c, uint64_t key, int32_t partition = -1, int64_t session = 0, int32_t view = kView) const {
@@ -686,23 +734,164 @@ TEST(LeaseGatewayRouteRegression, RingFullThrottledRegression) {
     EXPECT_EQ(t.remaining, -1);
 }
 
-// 10. ScanLeases (100) is answered by the gateway itself until Task 13: InvalidRequest, never enqueued, never dropped.
-//     (Removed by Task 13.)
-TEST(LeaseGatewayRouteRegression, ScanLeasesNotYetRegression) {
+// 10. ScanLeases (100) through the gateway: a lease view id is scanned on its SOURCE topic's leader; the pages come back in scanHash order
+//     with the resume token, the as-of offset and done; rows decode as [keyLen][key][rowLen][row].
+//     Mutation: route the op with the view id as the topic (not the source) -> the worker answers UnknownTopic: red.
+TEST(ScanLeasesGatewayRegression, ScanLeasesRoutedRegression) {
     GwLease g;
+    g.addLeaseView();
+    ASSERT_TRUE(g.setup({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}));
+    for (int i = 0; i < 400 && !g.r.leaseReady(); ++i) g.pass();
+    std::vector<uint64_t> got;
+    uint64_t resume = 0;
+    bool first = true, done = false;
+    int64_t asOf = -1;
+    for (int page = 0; page < 8 && !done; ++page) {
+        const std::size_t before = g.out.size();
+        g.send(g.scanFrameFor(500 + page, GwLease::kView, {}, 5, resume, first));
+        ASSERT_TRUE(g.waitFrames(before, 1));
+        const auto s = pc::ScanLeasesResponse::decode(g.out.back().data(), g.out.back().size());
+        ASSERT_TRUE(s.has_value());
+        EXPECT_EQ(s->correlationId, 500 + page);
+        ASSERT_EQ(s->code, 0);
+        EXPECT_GE(s->asOfOffset, 0);
+        if (asOf >= 0) EXPECT_EQ(s->asOfOffset, asOf);
+        asOf = s->asOfOffset;
+        std::size_t at = 0;
+        for (int i = 0; i < s->rowCount; ++i) {
+            const std::size_t kl = s->rows[at];
+            ASSERT_EQ(kl, 8u);
+            uint64_t id = 0;
+            std::memcpy(&id, s->rows.data() + at + 1, 8);
+            got.push_back(id);
+            uint32_t rl = 0;
+            std::memcpy(&rl, s->rows.data() + at + 1 + kl, 4);
+            EXPECT_GT(rl, 0u);
+            at += 5 + kl + rl;
+        }
+        EXPECT_EQ(at, s->rows.size());
+        resume = s->lastHash; first = false; done = s->done == 1;
+    }
+    ASSERT_TRUE(done);
+    ASSERT_EQ(got.size(), 12u);
+    for (std::size_t i = 1; i < got.size(); ++i) {
+        const std::string a = keyOf(got[i - 1]), b = keyOf(got[i]);
+        EXPECT_LT(rune::node::lease::scanHash({reinterpret_cast<const uint8_t*>(a.data()), a.size()}, kTopic),
+                  rune::node::lease::scanHash({reinterpret_cast<const uint8_t*>(b.data()), b.size()}, kTopic));
+    }
+    std::sort(got.begin(), got.end());
+    EXPECT_EQ(std::adjacent_find(got.begin(), got.end()), got.end()) << "no repeats";
+}
+
+// 10b. Authorisation: READ on the lease TOPIC serves the scan; a VIEW grant on `<t>.leases` alone, and no grant, are NotAuthorized; an id that is
+//      not a lease view (the topic itself, or a never-registered one) is answered exactly like a missing id for the same session.
+//      Mutation: authorise on the VIEW grant -> the VIEW-only session is served and the topic-READ one refused: red.
+TEST(ScanLeasesGatewayRegression, ScanLeasesAuthRegression) {
+    GwLease g;
+    g.addLeaseView();
     ASSERT_TRUE(g.setup({1}));
-    const auto fr = g.send(g.scanFrame(51));
-    ASSERT_EQ(fr.size(), 1u);
-    const auto s = pc::ScanLeasesResponse::decode(fr[0].data(), fr[0].size());
+    for (int i = 0; i < 400 && !g.r.leaseReady(); ++i) g.pass();
+    const int64_t topicRead = g.authedSession({topicGrant(rs::Operation::Read)});
+    std::size_t before = g.out.size();
+    g.send(g.scanFrameFor(1, GwLease::kView, {}, 10, 0, true, 0, topicRead));
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    auto s = pc::ScanLeasesResponse::decode(g.out.back().data(), g.out.back().size());
     ASSERT_TRUE(s.has_value());
-    EXPECT_EQ(s->correlationId, 51);
-    EXPECT_EQ(s->code, kInvalid);
-    EXPECT_EQ(s->rowCount, 0);
-    EXPECT_EQ(s->done, 0);
-    EXPECT_EQ(s->asOfOffset, -1);
-    EXPECT_TRUE(s->rows.empty());
+    EXPECT_EQ(s->code, 0) << "READ on the topic serves the scan";
+    EXPECT_EQ(s->rowCount, 1);
+
+    const int64_t viewOnly = g.authedSession({grant(rs::Operation::Read, rs::ResourceType::View, rs::PatternKind::Prefix, "")});
+    auto fr = g.send(g.scanFrameFor(2, GwLease::kView, {}, 10, 0, true, 0, viewOnly));
+    ASSERT_EQ(fr.size(), 1u);
+    s = pc::ScanLeasesResponse::decode(fr[0].data(), fr[0].size());
+    ASSERT_TRUE(s.has_value());
+    EXPECT_EQ(s->code, kNotAuthorized);
+    EXPECT_EQ(s->done, 1);
+    const int64_t none = g.authedSession({});
+    fr = g.send(g.scanFrameFor(3, GwLease::kView, {}, 10, 0, true, 0, none));
+    ASSERT_EQ(fr.size(), 1u);
+    s = pc::ScanLeasesResponse::decode(fr[0].data(), fr[0].size());
+    ASSERT_TRUE(s.has_value());
+    EXPECT_EQ(s->code, kNotAuthorized);
+
+    constexpr int32_t kNever = 78;
+    {   // a session that may read the topic: the topic's own id is not a lease view -> UnknownTopic, done
+        const auto plain = g.send(g.scanFrameFor(4, kTopic, {}, 10, 0, true, 0, topicRead));
+        ASSERT_EQ(plain.size(), 1u);
+        const auto ps = pc::ScanLeasesResponse::decode(plain[0].data(), plain[0].size());
+        ASSERT_TRUE(ps.has_value());
+        EXPECT_EQ(ps->code, kUnknownTopic);
+        EXPECT_EQ(ps->done, 1);
+    }
+    {   // a session that may read nothing: a non-lease id and a missing id are byte for byte the same refusal
+        const auto plain   = g.send(g.scanFrameFor(5, kTopic, {}, 10, 0, true, 0, none));
+        const auto missing = g.send(g.scanFrameFor(5, kNever, {}, 10, 0, true, 0, none));
+        ASSERT_EQ(plain.size(), 1u);
+        ASSERT_EQ(missing.size(), 1u);
+        EXPECT_EQ(plain[0], missing[0]) << "a non-lease id is a missing id";
+    }
+}
+
+// 10c. A partition led elsewhere is a Redirect with that leader's endpoint (the SOURCE topic's placement), never an op.
+//      Mutation: look the leader up with the view id -> no redirect, the op reaches the worker: red.
+TEST(ScanLeasesGatewayRegression, ScanLeasesRedirectRegression) {
+    GwLease g(1 << 22, /*partitionOfRig=*/1, /*partitionCount=*/2);
+    g.addLeaseView();
+    ASSERT_TRUE(g.setup({1}));
+    const auto other = g.send(g.scanFrameFor(1, GwLease::kView, {}, 10, 0, true, /*partition=*/0));
+    ASSERT_EQ(other.size(), 1u);
+    const auto err = pc::ErrorResponse::decode(other[0].data(), other[0].size());
+    ASSERT_TRUE(err.has_value());
+    EXPECT_EQ(err->code, static_cast<int16_t>(pc::ErrorCode::Redirect));
+    EXPECT_EQ(err->message, kOtherEndpoint);
     g.settle();
-    EXPECT_EQ(g.out.size(), 1u) << "no op reached the worker (it asserts ScanLeases is never routed)";
+    EXPECT_EQ(g.out.size(), 1u) << "nothing reached the worker";
+    for (int i = 0; i < 400 && !g.r.leaseReady(); ++i) g.pass();
+    const std::size_t before = g.out.size();
+    g.send(g.scanFrameFor(2, GwLease::kView, {}, 10, 0, true, /*partition=*/1));
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    const auto s = pc::ScanLeasesResponse::decode(g.out.back().data(), g.out.back().size());
+    ASSERT_TRUE(s.has_value());
+    EXPECT_EQ(s->code, 0);
+    EXPECT_EQ(s->rowCount, 1);
+}
+
+// 10d. Every refusal of ScanLeases carries done=1 and an empty page: a bad maxRows (0, 1025), a partition out of range, a version below the
+//      leases level, an unknown view, a worker-side refusal (follower), the same through encodeRejection.  A paging client never loops.
+//      Mutation: leave done=0 in encodeRejection case 100 -> the refusals are not done: red.
+TEST(ScanLeasesGatewayRegression, ScanLeasesRefusalDoneRegression) {
+    GwLease g;
+    g.addLeaseView();
+    ASSERT_TRUE(g.setup({1}));
+    for (int i = 0; i < 400 && !g.r.leaseReady(); ++i) g.pass();
+    const auto expectRefused = [&](std::vector<uint8_t> f, uint16_t code, const char* what) {
+        const auto fr = g.send(f);
+        ASSERT_EQ(fr.size(), 1u) << what;
+        const auto s = pc::ScanLeasesResponse::decode(fr[0].data(), fr[0].size());
+        ASSERT_TRUE(s.has_value()) << what;
+        EXPECT_EQ(s->code, code) << what;
+        EXPECT_EQ(s->done, 1) << what;
+        EXPECT_EQ(s->rowCount, 0) << what;
+        EXPECT_TRUE(s->rows.empty()) << what;
+    };
+    // maxRows 0 and 1025 do not encode (fits() fails): patch the wire field
+    auto patched = [&](uint16_t maxRows) {
+        std::vector<uint8_t> f = g.scanFrameFor(1, GwLease::kView, {}, 1, 0, true);
+        f[std::size_t(pc::lease_wire::kBase) + 17] = uint8_t(maxRows);
+        f[std::size_t(pc::lease_wire::kBase) + 18] = uint8_t(maxRows >> 8);
+        return f;
+    };
+    expectRefused(patched(0), kInvalid, "maxRows 0");
+    expectRefused(patched(1025), kInvalid, "maxRows 1025");
+    expectRefused(g.scanFrameFor(2, GwLease::kView, {}, 10, 0, true, /*partition=*/1), kInvalid, "partition out of range");
+    expectRefused(g.scanFrameFor(3, 78, {}, 10, 0, true), kUnknownTopic, "unknown view");
+    uint8_t buf[rune::gateway::kMaxRejectionBytes];
+    for (const uint16_t c : {kInvalid, kUnknownTopic, kNotAuthorized, kSuspended, kThrottled, kNotLeader}) {
+        const std::size_t n = rune::gateway::encodeRejection(100, 5, 9, c, buf, sizeof buf);
+        const auto s = pc::ScanLeasesResponse::decode(buf, n);
+        ASSERT_TRUE(s.has_value());
+        EXPECT_EQ(s->done, 1) << c;
+    }
 }
 
 // Rejection cells: the lease responses encodeRejection produces, decoded.  Sizes 39 / 58 / 49 B within kMaxRejectionBytes.
@@ -1499,4 +1688,45 @@ TEST(LeaseGatewayRouteRegression, LeaseViewPartitionRangeRegression) {
     const auto err = pc::ErrorResponse::decode(other[0].data(), other[0].size());
     ASSERT_TRUE(err.has_value());
     EXPECT_EQ(err->code, static_cast<int16_t>(pc::ErrorCode::Redirect));
+}
+
+// 10e. The legacy u64 GetViewRow of a NARROW-key lease topic is routed on the key's own width: the gateway narrows the u64 with the helper the
+//      worker reads the row with before it hashes to a partition.  4 partitions, UInt32 keys: the rig leads one partition; a key whose 4-byte
+//      form hashes there is served, any other is redirected - exactly as the 4-byte key (GetViewRowK) is.  A value above UINT32_MAX is
+//      InvalidRequest at the gateway.
+//      Mutation: hash the 8 raw bytes of the u64 -> some keys route to the wrong partition (redirected, or served by a non-owner): red.
+TEST(LeaseGatewayRouteRegression, LegacyU64NarrowKeyRoutesToOwnerRegression) {
+    constexpr int32_t kParts = 4;
+    GwLease g(1 << 22, /*partitionOfRig=*/1, kParts, /*narrowKey=*/true);
+    g.addLeaseView();
+    std::vector<uint32_t> mine, theirs;
+    std::vector<RawRec> grants;
+    for (uint32_t id = 1; id <= 200 && (mine.size() < 6 || theirs.size() < 6); ++id) {
+        const uint8_t k4[4] = {uint8_t(id), uint8_t(id >> 8), uint8_t(id >> 16), uint8_t(id >> 24)};
+        const int32_t p4 = g.registry->partitionForKey(GwLease::kView, std::span<const uint8_t>(k4, 4));
+        if (p4 == 1 && mine.size() < 6) { mine.push_back(id); grants.push_back(narrowGrant(id)); }
+        else if (p4 != 1 && theirs.size() < 6) theirs.push_back(id);
+    }
+    ASSERT_EQ(mine.size(), 6u);
+    ASSERT_EQ(theirs.size(), 6u);
+    ASSERT_TRUE(g.produce(grants));
+    ASSERT_TRUE(g.r.driveUntilJudged());
+    for (int i = 0; i < 400 && !g.r.leaseReady(); ++i) g.pass();
+    ASSERT_TRUE(g.r.leaseReady());
+    for (const uint32_t id : mine) {
+        const std::size_t before = g.out.size();
+        g.send(legacyViewFrame(g, 100 + id, id, g.sid));
+        ASSERT_TRUE(g.waitFrames(before, 1)) << id;
+        EXPECT_EQ(GwLease::viewStatus(g.out.back()), int32_t(pc::ViewRowResponse::kOk)) << "u64 " << id << " is served by its own partition";
+    }
+    for (const uint32_t id : theirs) {
+        const auto fr = g.send(legacyViewFrame(g, 200 + id, id, g.sid));
+        ASSERT_EQ(fr.size(), 1u) << id;
+        const auto err = pc::ErrorResponse::decode(fr[0].data(), fr[0].size());
+        ASSERT_TRUE(err.has_value()) << id;
+        EXPECT_EQ(err->code, static_cast<int16_t>(pc::ErrorCode::Redirect)) << "u64 " << id << " belongs to another partition's leader";
+    }
+    const auto big = g.send(legacyViewFrame(g, 900, 0x1'0000'0001ull, g.sid));
+    ASSERT_EQ(big.size(), 1u);
+    EXPECT_EQ(GwLease::viewStatus(big[0]), int32_t(pc::ViewRowResponse::kInvalidRequest));
 }

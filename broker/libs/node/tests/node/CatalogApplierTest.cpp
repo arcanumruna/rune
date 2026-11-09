@@ -1738,28 +1738,30 @@ TEST(CatalogTopicAppliedLeaseRoundTripRegression, LeaseViewSinkCarriesItsSourceR
     c.cleanupPolicy = 1;
     rune::protocol::TopicKeyFeatures kf;
     std::vector<uint8_t> f(catalogTopicAppliedWireLen("inst.leases", c, false, /*leaseViewSource*/true));
-    writeCatalogTopicApplied(f.data(), 9, "inst.leases", 2, 0, 0, c, 3, kf, std::nullopt, /*leaseView*/true, /*source*/5);
+    writeCatalogTopicApplied(f.data(), 9, "inst.leases", 2, 0, 0, c, 3, kf, std::nullopt, /*leaseView*/true, /*source*/5, /*keyType*/7, /*keyWidth*/4);
     CatalogTopicAppliedMsg m;
     ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m, /*sink*/true));
     EXPECT_TRUE(m.leaseView);
     EXPECT_EQ(m.leaseSourceTopicId, 5);
+    EXPECT_EQ(m.leaseKeyType, 7) << "Task 13b: the gateway narrows a legacy u64 with the key's type and width";
+    EXPECT_EQ(m.leaseKeyWidth, 4);
     EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m, /*sink*/false)) << "a TopicApplied frame refuses bit 3";
     // a lease view frame WITHOUT its source is refused (Task 13a review fixes: the gateway registry's lease mapping has one definition,
     // a sink with a source; the in-process ring has no version skew)
     std::vector<uint8_t> bare(catalogTopicAppliedWireLen("inst.leases", c));
     writeCatalogTopicApplied(bare.data(), 9, "inst.leases", 2, 0, 0, c, 3, kf, std::nullopt, true);
     EXPECT_FALSE(decodeCatalogTopicApplied(bare.data(), bare.size(), m, true)) << "a lease view frame without its source";
-    // the 4 bytes belong to a lease view only: not to a plain sink, not cut, not extended, not a negative id
+    // the 6 bytes belong to a lease view only: not to a plain sink, not cut, not extended, not a negative id
     auto plain = f;
-    plain[plain.size() - 4 - 2] &= static_cast<uint8_t>(~8u);
-    EXPECT_FALSE(decodeCatalogTopicApplied(plain.data(), plain.size(), m, true)) << "bit 3 clear with 4 trailing bytes";
-    for (std::size_t cut = 1; cut <= 3; ++cut)
+    plain[plain.size() - 6 - 2] &= static_cast<uint8_t>(~8u);
+    EXPECT_FALSE(decodeCatalogTopicApplied(plain.data(), plain.size(), m, true)) << "bit 3 clear with 6 trailing bytes";
+    for (std::size_t cut = 1; cut <= 5; ++cut)
         EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size() - cut, m, true)) << "cut by " << cut;
     auto longer = f;
     longer.push_back(0);
     EXPECT_FALSE(decodeCatalogTopicApplied(longer.data(), longer.size(), m, true));
     auto negative = f;
-    negative[negative.size() - 1] = 0xFF;   // the id's high byte: -2^24 and below
+    negative[negative.size() - 3] = 0xFF;   // the id's high byte: -2^24 and below
     EXPECT_FALSE(decodeCatalogTopicApplied(negative.data(), negative.size(), m, true));
 }
 

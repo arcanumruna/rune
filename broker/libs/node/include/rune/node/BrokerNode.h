@@ -1229,11 +1229,13 @@ private:
                                   uint32_t nsId, const rune::protocol::TopicKeyFeatures& kf,
                                   int32_t typeId = kA2cCatalogTopicApplied,
                                   const std::optional<rune::protocol::LeaseSpec>& lease = std::nullopt,
-                                  bool leaseView = false, int32_t leaseSourceTopicId = -1) {
+                                  bool leaseView = false, int32_t leaseSourceTopicId = -1, uint8_t leaseKeyType = 0,
+                                  uint8_t leaseKeyWidth = 0) {
         const std::size_t len = catalogTopicAppliedWireLen(name, c, lease.has_value(), leaseView && leaseSourceTopicId >= 0);
         const uint8_t pers = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
         postCatalog_(typeId, len, [&](uint8_t* p) {
-            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c, nsId, kf, lease, leaseView, leaseSourceTopicId);
+            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c, nsId, kf, lease, leaseView, leaseSourceTopicId, leaseKeyType,
+                                     leaseKeyWidth);
         });
     }
 
@@ -1303,7 +1305,8 @@ private:
             c.cleanupPolicy = 1;   // Compact
             c.partitionKey  = s.keyField;
             postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf*/0, s.persistence, c, s.nsId, s.sourceKeyFeatures,
-                                     kA2cCatalogSinkApplied, std::nullopt, s.leaseView, s.leaseSourceTopicId);   // Task 12 (N5); Task 13a: the lease view's source
+                                     kA2cCatalogSinkApplied, std::nullopt, s.leaseView, s.leaseSourceTopicId, s.leaseKeyType,
+                                     s.leaseKeyWidth);   // Task 12 (N5); Task 13a: the lease view's source and its key
         };
         fx.namespaceUpserted = [this](const rune::catalog::NamespaceRecord& r) {   // namespaces Task 9: login mirror
             postCatalog_(kA2cNamespaceUpserted, namespaceUpsertedWireLen(r.name),

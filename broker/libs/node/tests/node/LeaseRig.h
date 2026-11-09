@@ -111,6 +111,7 @@ struct Lk {
     int32_t seq = 0;
     int64_t corr = 1000;
     std::vector<Frame> frames;
+    std::vector<uint8_t> scanTail_;
 
     explicit Lk(const rune::protocol::LeaseSpec& spec, bool follower = false, RigTuning tuning = {}, int64_t rollBytes = 64LL * 1024 * 1024,
                 KeyShape key = KeyShape{rune::codec::PrimType::UInt64}, std::optional<rune::codec::Descriptor> src = std::nullopt)
@@ -212,6 +213,72 @@ struct Lk {
         op.leaseTail = std::span<const uint8_t>(tail.data(), tail.size());
         EXPECT_TRUE(r.worker->tryEnqueueOp(std::move(op)));
         return corr;
+    }
+    /// One decoded ScanLeases page (Task 13b).
+    struct ScanPage {
+        int16_t code = -99;   ///< -99: no answer within the pass cap
+        int64_t asOf = -1;
+        uint64_t lastHash = 0;
+        bool done = false;
+        std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> rows;   ///< (key, row payload)
+        std::vector<uint64_t> ids() const {   // 8-byte keys as ids
+            std::vector<uint64_t> v;
+            for (const auto& [k, _] : rows) { uint64_t x = 0; for (std::size_t i = 0; i < k.size() && i < 8; ++i) x |= uint64_t(k[i]) << (8 * i); v.push_back(x); }
+            return v;
+        }
+    };
+    /// Enqueues one ScanLeases op (no pass).
+    void postScan(std::span<const uint8_t> prefix, int32_t maxRows, uint64_t resumeHash, bool first, int32_t topic = VerdictRig::kSrc) {
+        scanTail_.assign(prefix.begin(), prefix.end());
+        WorkerOp op;
+        op.type = WorkerOp::Type::ScanLeases; op.topicId = topic; op.partition = 0;
+        op.sessionId = 1; op.correlationId = ++corr;
+        op.nextOffset = int64_t(resumeHash); op.recordCount = maxRows; op.isolation = first ? 1 : 0;
+        op.leaseTail = std::span<const uint8_t>(scanTail_.data(), scanTail_.size());
+        EXPECT_TRUE(r.worker->tryEnqueueOp(std::move(op)));
+    }
+    static ScanPage decodeScan(const WorkerReturn& w) {
+        ScanPage p;
+        p.code = w.errorCode; p.asOf = w.baseOffset; p.lastHash = uint64_t(w.lastOffset); p.done = w.isolation == 1;
+        const std::span<const uint8_t> c = w.chunkBytes();
+        std::size_t at = 0;
+        for (int i = 0; i < w.recordCount; ++i) {
+            const std::size_t kl = c[at];
+            std::vector<uint8_t> key(c.begin() + std::ptrdiff_t(at + 1), c.begin() + std::ptrdiff_t(at + 1 + kl));
+            uint32_t rl = 0;
+            std::memcpy(&rl, c.data() + at + 1 + kl, 4);
+            std::vector<uint8_t> row(c.begin() + std::ptrdiff_t(at + 5 + kl), c.begin() + std::ptrdiff_t(at + 5 + kl + rl));
+            p.rows.emplace_back(std::move(key), std::move(row));
+            at += 5 + kl + rl;
+        }
+        EXPECT_EQ(at, c.size());
+        return p;
+    }
+    /// One scan: post, pass until the answer arrives (hard cap).
+    ScanPage scan(std::span<const uint8_t> prefix, int32_t maxRows, uint64_t resumeHash, bool first, int passes = 8) {
+        r.leaseScanAnswers.clear();
+        postScan(prefix, maxRows, resumeHash, first);
+        for (int i = 0; i < passes; ++i) {
+            r.pass();
+            if (!r.leaseScanAnswers.empty()) { ScanPage p = decodeScan(r.leaseScanAnswers.front()); r.leaseScanAnswers.clear(); return p; }
+        }
+        return {};
+    }
+    /// Every page of a prefix scan, resumed by lastHash (hard cap on pages).  The pages are appended to `pages`.
+    std::vector<uint64_t> scanAll(int32_t maxRows, std::vector<ScanPage>* pages = nullptr, std::span<const uint8_t> prefix = {}) {
+        std::vector<uint64_t> all;
+        uint64_t resume = 0;
+        bool first = true;
+        for (int i = 0; i < 4096; ++i) {
+            ScanPage p = scan(prefix, maxRows, resume, first);
+            EXPECT_EQ(p.code, 0);
+            for (uint64_t id : p.ids()) all.push_back(id);
+            const bool done = p.done || p.code != 0;
+            resume = p.lastHash; first = false;
+            if (pages != nullptr) pages->push_back(std::move(p));
+            if (done) break;
+        }
+        return all;
     }
     static Frame frameOf(const WorkerReturn& w) {
         Frame f{w.correlationId, w.lastOffset == 1, {}};

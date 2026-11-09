@@ -417,3 +417,29 @@ TEST(LeasePromotionArmingRegression, ErasedChunkIsWorkRegression) {
     EXPECT_TRUE(k.rt()->promotionDone());
     EXPECT_EQ(k.rt()->stats().promotionLinked, 1u);
 }
+
+// 11. (Task 12 re-review) A growth failure inside the promotion walk reports NO work (the worker backs off) and does not advance the cursor
+// past the rid that failed; the retry once memory is back walks on and finishes.  4100 rows against a one-chunk (4096) entry store.
+// Mutation: count the failed rid as walked / advance the cursor (LeaseRuntime::promote) -> the cursor moves or the retry skips the rid: red.
+TEST(LeasePromotionArmingRegression, GrowStallReportsNoWorkRegression) {
+    Lk k(specWith(13000, 0, 1000, 1000));
+    ASSERT_TRUE(k.grantMany(4100, 10'000));
+    k.r.worker->setLeasePromotionChunkForTest(0);
+    ASSERT_GT(k.promoteStepwise(), 0);
+    ASSERT_EQ(k.rt()->timers().capacity(), lease::kLeaseEntryChunk);
+    ASSERT_EQ(k.rt()->promoteCursorForTest(), 0u);
+    const auto lk = k.r.vs->leaseIndexFor(VerdictRig::kSrc, 0, k.r.replica->leadershipGeneration(), true, true);
+    ASSERT_NE(lk.ref.table, nullptr);
+    const auto sp = specWith(13000, 0, 1000, 1000);
+    k.rt()->setPromotionChunkForTest(lease::kLeasePromotionChunk * 4);
+    k.rt()->setGrowThrowForTest(true);
+    EXPECT_EQ(k.rt()->promote(lk.ref, sp, k.leaseNow), 0u) << "stalled: no work reported";
+    const uint32_t stuck = k.rt()->promoteCursorForTest();
+    EXPECT_EQ(stuck, lease::kLeaseEntryChunk) << "the rids that fit were handled; the failed one is not";
+    EXPECT_FALSE(k.rt()->promotionDone());
+    EXPECT_EQ(k.rt()->promote(lk.ref, sp, k.leaseNow), 0u);
+    EXPECT_EQ(k.rt()->promoteCursorForTest(), stuck) << "unchanged on the retry";
+    k.rt()->setGrowThrowForTest(false);
+    EXPECT_GT(k.rt()->promote(lk.ref, sp, k.leaseNow), 0u);
+    EXPECT_TRUE(k.rt()->promotionDone());
+}

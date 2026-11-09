@@ -90,6 +90,10 @@ struct SinkSpec {
     /// A lease view: the lease topic that owns it (from the catalog, `ViewObject::leaseTopicObjectId`'s topic id); -1 otherwise.  The
     /// gateway routes a read of the view by it and authorises the read as READ on that topic; the workers learn it from the write spec.
     int32_t leaseSourceTopicId = -1;
+    /// A lease view: the lease topic's key type (rune::codec::PrimType) and width in bytes (0: unknown).  The gateway narrows a legacy GetViewRow's
+    /// u64 key to this width before it picks the partition (the worker does the same with the same helper, lease/LeaseKey.h).
+    uint8_t leaseKeyType  = 0;
+    uint8_t leaseKeyWidth = 0;
 };
 
 /// The admin-thread effect sink.  Production = ring encoders (AdminWorkerAgent);

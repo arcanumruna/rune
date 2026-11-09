@@ -314,10 +314,7 @@ void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNow
         const LeaseEntry& e = timers_.entry(rid);
         // A fold of a present row whose entry is Free (the promotion pass has not reached it, or the row was created by this fold) links it
         // first, at the promotion deadline the pass would have used, then the event is stepped as usual.
-        if (present && e.state == LeaseEntryState::Free) {
-            timers_.noteUse(rid);
-            timers_.arm(rid, promotionDeadline(ev.ttlMs, ev.remainingMs), checkpointTime(spec, ev.remainingMs > 0 ? ev.remainingMs : ev.ttlMs, leaseNowNs));
-        }
+        if (present && e.state == LeaseEntryState::Free) (void)armFree_(rid, ev.ttlMs, ev.remainingMs, leaseNowNs, spec);
         switch (ev.kind) {
             case LeaseEventKind::Updated:
                 foldStep_(rid, LeaseEntryEvent::OtherUpdateFolds, ev, leaseNowNs, parks, spec);
@@ -361,10 +358,8 @@ LeaseKaOutcome LeaseRuntime::keepAlive(const LeaseIndexRef& ref, std::span<const
     }
     const uint64_t ttl       = leaseRowTtl(row, *ref.layout);
     const uint64_t remaining = leaseRowRemaining(row, *ref.layout);
-    if (timers_.entry(rid).state == LeaseEntryState::Free) {   // a row the promotion pass has not linked yet: armed at its promotion deadline
-        timers_.noteUse(rid);
-        timers_.arm(rid, promotionDeadline(ttl, remaining), checkpointTime(spec, remaining > 0 ? remaining : ttl, leaseNowNs));
-    }
+    if (timers_.entry(rid).state == LeaseEntryState::Free)   // a row the promotion pass has not linked yet: armed at its promotion deadline
+        (void)armFree_(rid, ttl, remaining, leaseNowNs, spec);
     const bool gateOpen = leaseLastAppended(*ref.table, rid) < judgedThrough;
     LeaseKaOutcome out{false, 0, 0};
     // The park path must not change the entry when it cannot park: decide with a dry run first, then commit.
@@ -556,35 +551,41 @@ uint32_t LeaseRuntime::flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref
     return 0;
 }
 
+bool LeaseRuntime::armFree_(uint32_t rid, uint64_t ttlMs, uint64_t remainingMs, int64_t leaseNowNs, const rune::protocol::LeaseSpec& spec) noexcept {
+    const LeaseStepOut step = leaseStep({LeaseEntryState::Free, LeaseEntryEvent::Arm, true, false, remainingMs > 0});
+    assert(step.action == LeaseAction::Link);
+    if (step.action != LeaseAction::Link) return false;
+    timers_.noteUse(rid);
+    timers_.arm(rid, promotionDeadline(ttlMs, remainingMs), checkpointTime(spec, remainingMs > 0 ? remainingMs : ttlMs, leaseNowNs));
+    return true;
+}
+
 uint32_t LeaseRuntime::promote(const LeaseIndexRef& ref, const rune::protocol::LeaseSpec& spec, int64_t leaseNowNs) {
     if (promoteDone_ || ref.table == nullptr || ref.layout == nullptr) return 0;
     const uint32_t high = ref.table->ridHighWater();   // re-read every pass: the table grows while the pass walks
     uint32_t budget     = promoteChunk_;
     uint32_t walked     = 0;
+    bool     stalled    = false;   // a growth failure stopped the pass: it reports no work, so the worker backs off (memory exhaustion)
     while (promoteCursor_ < high && budget != 0) {
         --budget;
-        ++walked;
         const uint32_t rid = promoteCursor_;
         if (leaseRowLive(*ref.table, rid)) {
             bool growFailed = false;
             if (!timers_.covers(rid) && !coverOrCount_(rid, growFailed)) {
-                if (growFailed) break;   // not advanced: retried next pass
-                ++promoteCursor_;        // past maxKeys: nothing to link
+                if (growFailed) {   // not advanced, not counted as walked: retried next pass
+                    stalled = true;
+                    break;
+                }
+                ++walked;
+                ++promoteCursor_;   // past maxKeys: nothing to link
                 continue;
             }
             if (timers_.entry(rid).state == LeaseEntryState::Free) {   // a grant fold or a keepalive already armed the others
                 const uint8_t* const row = ref.table->rowOf(rid);
-                const uint64_t ttl       = leaseRowTtl(row, *ref.layout);
-                const uint64_t remaining = leaseRowRemaining(row, *ref.layout);
-                const LeaseStepOut step = leaseStep({LeaseEntryState::Free, LeaseEntryEvent::Arm, true, false, remaining > 0});
-                assert(step.action == LeaseAction::Link);
-                if (step.action == LeaseAction::Link) {
-                    timers_.noteUse(rid);
-                    timers_.arm(rid, promotionDeadline(ttl, remaining), checkpointTime(spec, remaining > 0 ? remaining : ttl, leaseNowNs));
-                    ++stats_.promotionLinked;
-                }
+                if (armFree_(rid, leaseRowTtl(row, *ref.layout), leaseRowRemaining(row, *ref.layout), leaseNowNs, spec)) ++stats_.promotionLinked;
             }
         }
+        ++walked;   // a rid counts once it is handled
         ++promoteCursor_;
     }
     if (promoteCursor_ >= high) promoteDone_ = true;
@@ -594,7 +595,7 @@ uint32_t LeaseRuntime::promote(const LeaseIndexRef& ref, const rune::protocol::L
         timers_.noteGrowFailed();
         ++stats_.growFailures;
     }
-    return walked;
+    return stalled ? 0 : walked;
 }
 
 uint32_t LeaseRuntime::emitCheckpoints(LeaseEmitWork& work, const LeaseIndexRef& ref, const LeaseWriter& writer, int64_t judgedThrough,

@@ -107,6 +107,7 @@ public:
                !promotionDone();
     }
     [[nodiscard]] bool promotionDone() const noexcept { return promoteDone_; }
+    [[nodiscard]] uint32_t promoteCursorForTest() const noexcept { return promoteCursor_; }
     /// True once a fold of a PRESENT row (a Granted event, or a row created by a fold) could not grow the entry store (bad_alloc): that row
     /// has no entry to arm, so a later link of it would use the promotion deadline, which can be before the grant's own g + ttl.  The
     /// worker destroys the runtime right after onEvents; the next runtime is created at a fresh ready time >= g, so every promotion
@@ -201,6 +202,10 @@ private:
     };
     /// The keepalive decision for an entry that is linked (Free is armed by the caller first): leaseStep, then the RearmAnswerOk side effect.
     KaStep kaStep_(uint32_t rid, int64_t leaseNowNs, bool remainingPositive, uint64_t ttlMs, bool gateOpen, const rune::protocol::LeaseSpec& spec) noexcept;
+    /// Links a Free entry of a present row at its promotion deadline (spec 9.7), through leaseStep({Free, Arm}) and its Link action - the one
+    /// way a Free entry is armed (the promotion pass, a fold of a present row, a keepalive of a row the pass has not reached).  The entry
+    /// must be Free and covered.  True = linked.
+    bool armFree_(uint32_t rid, uint64_t ttlMs, uint64_t remainingMs, int64_t leaseNowNs, const rune::protocol::LeaseSpec& spec) noexcept;
     /// Puts `rid` on the clear ring (idempotent by the flag).  A full ring is compacted first; false = still full (the caller must not park).
     [[nodiscard]] bool flagClear_(uint32_t rid) noexcept;
     /// Keeps only the live ring entries (flag set, position current) whose rid still has parks, rewriting their positions; a live entry

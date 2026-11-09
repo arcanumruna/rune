@@ -109,6 +109,8 @@ struct RigTuning {
     /// A Worker owned by someone else (a WorkerPool behind a ClientGateway): the rig drives it instead of building its own.  The owner must
     /// outlive the rig's use of it and must not be asked to restart().
     Worker* hostWorker = nullptr;
+    /// The view set's table hash seed (Task 13b): two rigs with different seeds probe their ViewTables differently, as two nodes do.
+    uint64_t hashSeed = 0;
 };
 /// The rig's worker: owned (the default) or borrowed from a WorkerPool (RigTuning::hostWorker, never deleted by the rig).
 struct RigWorkerDelete { bool owns = true; void operator()(Worker* w) const noexcept { if (owns) delete w; } };
@@ -130,7 +132,7 @@ public:
     explicit VerdictRig(bool follower = false, int64_t rollBytes = 64LL * 1024 * 1024, RigTuning tuning = {})
         : isr_(follower ? std::vector<rune::replication::NodeId>{1, 2} : std::vector<rune::replication::NodeId>{1}),
           rollBytes_(rollBytes), tuning_(tuning), viewDir_(rigTmpPath("views")), logDir_(rigTmpPath("log")) {
-        vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string());
+        vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string(), tuning_.hashSeed);
         open();
     }
     ~VerdictRig() {
@@ -357,7 +359,7 @@ public:
         if (cutTo >= 0) (void)log->truncateTo(cutTo);
         log.reset();
         epoch_ = 1;   // the new replica starts at epoch 1
-        vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string());
+        vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string(), tuning_.hashSeed);
         vs->holdJudgesForTest(holdJudge_);
         open();
         if (cutTo < 0) replica->setLastCleanOffset(clean);
@@ -542,6 +544,7 @@ public:
             else if (r.type == WorkerReturn::Type::StatsResult) statsAnswers_.push_back(std::move(r));
             else if (r.type == WorkerReturn::Type::LeaseKeepAliveResult) leaseKaAnswers.push_back(std::move(r));
             else if (r.type == WorkerReturn::Type::LeaseTimeToLiveResult) leaseTtlAnswers.push_back(std::move(r));
+            else if (r.type == WorkerReturn::Type::ScanLeasesResult) leaseScanAnswers.push_back(std::move(r));
         }, [](const TxnReturn&) {});
         if (agent) { if (!pauseAgent) (void)agent->doWork(now); }
         else channel.deltas.drain([this](int32_t, aeron::concurrent::AtomicBuffer& buf, OneToOneByteRing::index_t off, OneToOneByteRing::index_t) {
@@ -816,6 +819,7 @@ public:
                     if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
                     if (r.type == WorkerReturn::Type::LeaseKeepAliveResult) leaseKaAnswers.push_back(std::move(r));
                     if (r.type == WorkerReturn::Type::LeaseTimeToLiveResult) leaseTtlAnswers.push_back(std::move(r));
+                    if (r.type == WorkerReturn::Type::ScanLeasesResult) leaseScanAnswers.push_back(std::move(r));
                 }, [](const TxnReturn&) {});
                 absorb_(box, chunk.data(), chunk.size());
                 cursors_[subId] = next;
@@ -1116,7 +1120,7 @@ public:
     RigWorkerPtr worker;
     int64_t now = 0, corr = 0;
     std::vector<int16_t> produceAnswers;
-    std::vector<WorkerReturn> leaseKaAnswers, leaseTtlAnswers;   ///< lease topics Task 11a: the LeaseKeepAlive / LeaseTimeToLive returns the passes drained
+    std::vector<WorkerReturn> leaseKaAnswers, leaseTtlAnswers, leaseScanAnswers;   ///< lease topics Task 11a: the LeaseKeepAlive / LeaseTimeToLive returns the passes drained
 
     std::vector<int32_t> deltaViewIds;   ///< the view topic of every checkpoint frame the worker pushed (only without a persisted view's agent)
 

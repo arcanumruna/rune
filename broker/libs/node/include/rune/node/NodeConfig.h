@@ -98,6 +98,9 @@ struct TopicSpec {
     /// Lease topics Task 13a: a lease view's sink (`<topic>.leases`) names its lease topic here (the catalog's id; -1: not a lease
     /// view).  The gateway's one source of truth for the lease view -> source mapping: auth (READ on the topic) and routing.
     int32_t     leaseSourceTopicId = -1;
+    /// ... and that lease topic's key: its rune::codec::PrimType and width in bytes (0: unknown), from the catalog.
+    uint8_t     leaseKeyType  = 0;
+    uint8_t     leaseKeyWidth = 0;
     /// Replicas per partition (DDL replicationFactor); 0 = every node (the
     /// default).  Clamped to the cluster size.
     int16_t     replicationFactor = 0;

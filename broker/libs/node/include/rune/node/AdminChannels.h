@@ -1502,8 +1502,9 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
 //                             [partitioner:u8][39-byte LeaseSpec block iff bit2]   (checked writes Part 06;
 //                             a frame without these two bytes is Fnv1a with no autoincrement; appended LAST;
 //                             bits 2 and 3 never both)
-//                             [leaseSourceTopicId:i32 iff bit3 and the id is known]   (lease topics Task 13a: the lease
-//                             view's source topic, from the catalog; a bit-3 frame without it names none)
+//                             [leaseSourceTopicId:i32][leaseKeyType:u8][leaseKeyWidth:u8] iff bit3 and the id is known   (lease
+//                             topics Task 13a / 13b: the lease view's source topic and that topic's key type / width, from the
+//                             catalog; a bit-3 frame without them names none)
 //   kA2cCatalogTopicDropped : [topicId:i32][nameLen:u16 + name][nsId:u32]
 //   kA2cCatalogTopicConfig  : [topicId:i32][count:u16][(key:u8, value:i64) * count]
 //   kA2cViewUninstall       : [viewTopicId:i32]
@@ -1551,11 +1552,15 @@ struct CatalogTopicAppliedMsg {
     rune::protocol::TopicKeyFeatures keyFeatures{};   // only keyIndex, autoIncrement and partitioner travel
     std::optional<rune::protocol::LeaseSpec> lease;   // flags bit 2: a lease topic
     bool                        leaseView         = false;   // flags bit 3: the sink of a lease topic's lease view (no plan)
-    int32_t                     leaseSourceTopicId = -1;     // bit 3 + 4 trailing bytes: the lease topic that owns the view; -1: not carried
+    int32_t                     leaseSourceTopicId = -1;     // bit 3 + 6 trailing bytes: the lease topic that owns the view; -1: not carried
+    uint8_t                     leaseKeyType       = 0;      // ... and its key's rune::codec::PrimType
+    uint8_t                     leaseKeyWidth      = 0;      // ... and its key's width in bytes (0: not known)
 };
 
 /// The key-feature flags and partitioner bytes after nsId.
 inline constexpr std::size_t kCatalogTopicAppliedFeatureBytes = 2;
+/// The trailing bytes of a lease view frame: [leaseSourceTopicId i32][leaseKeyType u8][leaseKeyWidth u8].
+inline constexpr std::size_t kCatalogLeaseViewSourceBytes = 6;
 
 /// 0 = cannot be encoded (a string longer than a u16 prefix holds).
 [[nodiscard]] inline std::size_t catalogTopicAppliedWireLen(std::string_view name,
@@ -1564,14 +1569,15 @@ inline constexpr std::size_t kCatalogTopicAppliedFeatureBytes = 2;
     if (name.size() > kMaxStr16 || c.coPartitionGroup.size() > kMaxStr16 || c.partitionKey.size() > kMaxStr16)
         return 0;
     return 4 + 2 + name.size() + 4 + 2 + 1 + topicConfigWireLen(c) + 4 + kCatalogTopicAppliedFeatureBytes +
-           (lease ? rune::protocol::kLeaseSpecBytes : 0) + (leaseViewSource ? 4 : 0);
+           (lease ? rune::protocol::kLeaseSpecBytes : 0) + (leaseViewSource ? kCatalogLeaseViewSourceBytes : 0);
 }
 
 inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_view name, int32_t partitions,
                                      int16_t rf, uint8_t persistence, const rune::protocol::TopicConfig& c,
                                      uint32_t nsId = 0, const rune::protocol::TopicKeyFeatures& kf = {},
                                      const std::optional<rune::protocol::LeaseSpec>& lease = std::nullopt,
-                                     bool leaseView = false, int32_t leaseSourceTopicId = -1) {
+                                     bool leaseView = false, int32_t leaseSourceTopicId = -1, uint8_t leaseKeyType = 0,
+                                     uint8_t leaseKeyWidth = 0) {
     using namespace admin_wire;
     putI32(p, topicId); p += 4;
     p = putStr16(p, name);
@@ -1597,7 +1603,11 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
                                 (leaseView ? 8u : 0u));
     *p++ = static_cast<uint8_t>(kf.partitioner);
     if (lease) rune::protocol::encodeLeaseSpec(*lease, p);
-    if (leaseView && leaseSourceTopicId >= 0) putI32(p, leaseSourceTopicId);   // sized by catalogTopicAppliedWireLen(.., leaseViewSource)
+    if (leaseView && leaseSourceTopicId >= 0) {   // sized by catalogTopicAppliedWireLen(.., leaseViewSource)
+        putI32(p, leaseSourceTopicId); p += 4;
+        *p++ = leaseKeyType;
+        *p++ = leaseKeyWidth;
+    }
 }
 
 /// `sink` is the frame TYPE: false = kA2cCatalogTopicApplied (feature bit 3, "lease view", is refused), true =
@@ -1635,6 +1645,8 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
     m.lease.reset();
     m.leaseView = false;
     m.leaseSourceTopicId = -1;
+    m.leaseKeyType = 0;
+    m.leaseKeyWidth = 0;
     if (pos != len) {   // the feature bytes; a frame without them is Fnv1a, no autoincrement
         const uint8_t forbidden = sink ? 0x04 : 0x08;   // a sink has no lease block; a topic is never a lease view
         if (pos + kCatalogTopicAppliedFeatureBytes > len || (buf[pos] & 0xF0) != 0 || (buf[pos] & forbidden) != 0 ||
@@ -1643,11 +1655,13 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
             return false;
         const bool hasLease = (buf[pos] & 4u) != 0;
         const bool isLeaseView = (buf[pos] & 8u) != 0;
-        const std::size_t body = len - pos - kCatalogTopicAppliedFeatureBytes;   // 39 with a lease block; 0 or 4 (the source id) for a lease view
+        const std::size_t body = len - pos - kCatalogTopicAppliedFeatureBytes;   // 39 with a lease block; 0 or 6 (the source id, key type, key width) for a lease view
         if (isLeaseView) {   // a lease view frame always names its lease topic (in-process ring: no skew)
-            if (body != 4 || hasLease) return false;
+            if (body != kCatalogLeaseViewSourceBytes || hasLease) return false;
             m.leaseSourceTopicId = getI32(buf + pos + kCatalogTopicAppliedFeatureBytes);
             if (m.leaseSourceTopicId < 0) return false;
+            m.leaseKeyType  = buf[pos + kCatalogTopicAppliedFeatureBytes + 4];
+            m.leaseKeyWidth = buf[pos + kCatalogTopicAppliedFeatureBytes + 5];
         } else if (body != (hasLease ? rune::protocol::kLeaseSpecBytes : 0)) {
             return false;
         }

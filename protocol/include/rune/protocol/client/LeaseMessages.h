@@ -15,7 +15,11 @@
 //   ScanLeases (100)             fixed: viewTopicId i32, partition i32, resumeHash u64, first u8 (0|1), maxRows u16
 //                                var:   prefixLen u8 + prefix                             (maxRows 1..1024, prefix <= 127)
 //   ScanLeasesResponse (101)     fixed: code u16, asOfOffset i64, lastHash u64, done u8 (0|1), rowCount u16, rowsLen u32
-//                                var:   rowsLen opaque row bytes
+//                                var:   rowsLen opaque row bytes: rowCount x { keyLen u8, key, rowLen u32 LE, row payload }
+//                                       (Task 13b) - the row payload is exactly what a GetViewRowK of that key answers (the lease view's
+//                                       row image).  Rows are in ascending order of the broker's scan hash of the key; `lastHash` is the
+//                                       hash of the last row (the resume cursor), `done` = 1 when no matching row has a larger hash.
+//                                       Rows with an equal hash are always in the same page (a page may then exceed maxRows).
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -32,6 +36,9 @@ namespace rune::protocol::client {
 inline constexpr std::size_t kLeaseKeepAliveMaxEntries = 256;
 inline constexpr std::size_t kScanLeasesMaxRows        = 1024;
 inline constexpr std::size_t kScanLeasesMaxPrefixBytes = 127;
+/// The most row bytes one ScanLeasesResponse carries: a scan page is bounded like a ScanViewRows page (kMaxPageBytes), minus this response's
+/// own fixed part (the 24-byte header and the 25-byte block).  A group of equal-hash rows that does not fit is left for the next page.
+inline constexpr std::size_t kScanLeasesMaxPageBytes = 61440 - (24 + 25);
 
 /// A LeaseKeepAliveResponse entry with this index answers EVERY entry of the request with its code (a request-level refusal:
 /// NotLeader, Throttled, UnknownTopic, NotAuthorized, InvalidRequest, NamespaceSuspended); it is always the only entry and
@@ -438,5 +445,8 @@ struct ScanLeasesResponse {
         return m;
     }
 };
+
+static_assert(kScanLeasesMaxPageBytes == 61440 - (MessageHeader::ENCODED_SIZE + ScanLeasesResponse::BODY_FIXED),
+              "the scan page cap is kMaxPageBytes minus the response's fixed part");
 
 } // namespace rune::protocol::client
