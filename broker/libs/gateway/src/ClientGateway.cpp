@@ -10968,8 +10968,10 @@ void ClientGateway::answerLeaseEnqueue_(rune::node::EnqueueResult er, int32_t to
 {
     if (er == rune::node::EnqueueResult::Enqueued) return;
     if (er == rune::node::EnqueueResult::TooLarge) [[unlikely]] {
-        spdlog::error("ClientGateway: {} for topicId={} partition={} ({} B) exceeds the worker ingress frame; MessageTooLarge", what,
-                      topicId, partition, len);
+        // Rate-limited like noteLeaseReturnMalformed_ (first, then every 1024th): a client can repeat this request at wire speed.
+        if (leaseEnqueueTooLarge_++ % 1024 == 0)
+            spdlog::error("ClientGateway: {} for topicId={} partition={} ({} B) exceeds the worker ingress frame; MessageTooLarge "
+                          "(total={})", what, topicId, partition, len, leaseEnqueueTooLarge_);
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge), what);
         return;
     }

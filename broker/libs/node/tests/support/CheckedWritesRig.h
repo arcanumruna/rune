@@ -36,6 +36,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -344,7 +345,10 @@ public:
     /// `specDelayPasses`: the write spec carrying key.index reaches the worker that many passes after restart() returns; until then the
     /// topic is typed without it (the leader scan restores the logged set from the log).
     void restart(bool reinstall = true, int64_t cutTo = -1, int specDelayPasses = 0) {
-        assert(tuning_.hostWorker == nullptr && "a hosted worker cannot restart");
+        if (tuning_.hostWorker != nullptr) {   // not an assert: it must hold in Release too
+            ADD_FAILURE() << "VerdictRig::restart(): a hosted worker cannot restart";
+            std::abort();
+        }
         const int64_t clean = replica->lastCleanOffset();   // what LogCleanerAgent's checkpoint reloads (a cut forgets it)
         worker.reset();
         vs.reset();

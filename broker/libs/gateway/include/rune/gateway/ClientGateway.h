@@ -3090,6 +3090,7 @@ private:
     void onControlRecordAppended_(const rune::node::WorkerReturn& ret);
     uint64_t controlRecordsRefused_ = 0;
     uint64_t leaseReturnMalformed_  = 0;   // lease worker returns with a bad count / chunk (a broker bug), answered Internal
+    uint64_t leaseEnqueueTooLarge_  = 0;   // lease requests that can never fit one worker-ingress frame, answered MessageTooLarge
     uint64_t produceBackPressured_  = 0;   // M5: produces answered NotLeader on back-pressure
 
     // -----------------------------------------------------------------------

@@ -160,7 +160,50 @@ struct Em {
         for (const auto& s : storedRecords(r)) if (s.key == keyOf(key) && rec::leaseOpOf(s.attrs) == rec::LeaseOp::Put) return s.offset;
         return -1;
     }
+    int64_t corr = 5000;
+    /// One LeaseKeepAlive op for `key` at `version`, then ONE pass: the first answered entry's code (0xFFFF: no answer) and ttl.
+    struct KaOut { uint16_t code = 0xFFFF; uint64_t ttl = 0; };
+    KaOut keepAlive(uint64_t key, int64_t version) {
+        std::vector<uint8_t> tail;
+        const std::string k = keyOf(key);
+        tail.push_back(uint8_t(k.size()));
+        tail.insert(tail.end(), k.begin(), k.end());
+        for (int i = 0; i < 8; ++i) tail.push_back(uint8_t(uint64_t(version) >> (8 * i)));
+        WorkerOp op;
+        op.type = WorkerOp::Type::LeaseKeepAlive; op.topicId = VerdictRig::kSrc; op.partition = 0;
+        op.sessionId = 77; op.correlationId = ++corr; op.recordCount = 1;
+        op.leaseTail = std::span<const uint8_t>(tail.data(), tail.size());
+        EXPECT_TRUE(r.worker->tryEnqueueOp(std::move(op)));
+        r.leaseKaAnswers.clear();
+        r.pass();
+        KaOut out;
+        if (!r.leaseKaAnswers.empty() && r.leaseKaAnswers.back().chunk.size() >= 12) {
+            const uint8_t* p = r.leaseKaAnswers.back().chunk.data();
+            out.code = uint16_t(p[2] | (p[3] << 8));
+            for (int j = 0; j < 8; ++j) out.ttl |= uint64_t(p[4 + j]) << (8 * j);
+        }
+        r.leaseKaAnswers.clear();
+        return out;
+    }
+    /// One LeaseTimeToLive op for `key`, then ONE pass: the answer's error code and remaining ms (-2: no answer).
+    struct TtlOut { int16_t code = -1; int64_t remainingMs = -2; };
+    TtlOut timeToLive(uint64_t key) {
+        r.leaseTtlAnswers.clear();
+        const std::string k = keyOf(key);
+        WorkerOp op;
+        op.type = WorkerOp::Type::LeaseTimeToLive; op.topicId = VerdictRig::kSrc; op.partition = 0;
+        op.sessionId = 5; op.correlationId = ++corr;
+        op.leaseTail = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(k.data()), k.size());
+        EXPECT_TRUE(r.worker->tryEnqueueOp(std::move(op)));
+        r.pass();
+        TtlOut out;
+        if (r.leaseTtlAnswers.size() == 1) { out.code = r.leaseTtlAnswers[0].errorCode; out.remainingMs = r.leaseTtlAnswers[0].baseOffset; }
+        r.leaseTtlAnswers.clear();
+        return out;
+    }
 };
+
+constexpr uint16_t kNotLeaderCode = static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader);
 
 /// Nothing carried over from an earlier runtime: every counter is zero except the promotion pass's own (Task 12).
 bool statsAllZero(const lease::LeaseRuntimeStats& st) {
@@ -762,8 +805,23 @@ TEST(LeaseEmitterRegression, IdentityChangeDiscardsRegression) {
             ASSERT_TRUE(r.leaseReady());
             ASSERT_NE(r.replica->leadershipGeneration(), genBefore) << "the identity changed";
         }
-        // Past every old deadline (t0 + 5 s).  Leg 0's old runtime is replaced by the first non-idle pass (the idle skip checks the generation
-        // only), which is this one: its ready time is t0 + 5.001 s; leg 1's new runtime was created above, at t0 + 3 s.
+        if (leg == 0) {
+            // The index was rebuilt under the SAME leadership while the duty pass idled (it checks the generation only).  The first keepalive
+            // sees the stale identity: it answers NotLeader and drops the runtime, so the next duty pass (never idle-skipped: no runtime)
+            // recreates it at the then leaseNow = t0 + 3 s with NO clock advance; the retried keepalive is Ok within 3 passes.
+            ASSERT_NE(e.rt(), nullptr);
+            ASSERT_FALSE(e.rt()->sameIdentity(r.replica->leadershipGeneration(), r.vs->leaseRebuildEpoch(VerdictRig::kSrc, 0))) << "the stale runtime is still there";
+            const auto first = e.keepAlive(1, e.versionOf(1));
+            EXPECT_EQ(first.code, kNotLeaderCode) << "the stale runtime answers NotLeader";
+            for (int i = 0; i < 3 && (e.rt() == nullptr || !e.rt()->sameIdentity(r.replica->leadershipGeneration(), r.vs->leaseRebuildEpoch(VerdictRig::kSrc, 0))); ++i) r.pass();
+            ASSERT_NE(e.rt(), nullptr) << "recreated within a pass or two, not at the next wheel deadline";
+            EXPECT_EQ(e.rt()->readyNs(), t0 + 3000 * kMs) << "ready at the then leaseNow";
+            Em::KaOut again;
+            for (int i = 0; i < 3 && again.code != 0; ++i) again = e.keepAlive(1, e.versionOf(1));
+            EXPECT_EQ(again.code, 0) << "the retried keepalive is served";
+            EXPECT_EQ(again.ttl, 5000u);
+        }
+        // Past every old deadline (t0 + 5 s).  Leg 1's new runtime was created above, at t0 + 3 s; leg 0's just now (also t0 + 3 s).
         e.advanceMs(2000 + 1);
         r.passes(5);
         ASSERT_NE(e.rt(), nullptr) << "leg " << leg << ": the runtime of the new identity exists";
@@ -776,10 +834,51 @@ TEST(LeaseEmitterRegression, IdentityChangeDiscardsRegression) {
             EXPECT_EQ(e.rt()->timers().entry(rid).state, LeaseEntryState::Armed) << "leg " << leg << " key " << i + 1 << ": armed by the promotion pass";
             EXPECT_EQ(e.rt()->timers().entry(rid).deadlineNs, e.rt()->readyNs() + 5000 * kMs) << "leg " << leg << " key " << i + 1 << ": the NEW deadline";
             EXPECT_GE(e.rt()->readyNs(), t0 + 3000 * kMs) << "leg " << leg;
-            (void)rids[i];
+            EXPECT_EQ(rid, rids[i]) << "leg " << leg << ": the rebuilt table assigns the same row ids";
         }
         EXPECT_TRUE(expires(r).empty()) << "leg " << leg << ": no Expire at the old deadlines";
         EXPECT_EQ(r.leo(), leoStable) << "leg " << leg << ": nothing appended";
+    }
+}
+
+// 17b. (F2) After an index rebuild under the SAME leadership, a duty pass that idles never notices the stale identity, so the leader's lease ops
+// themselves must: a keepalive (or TimeToLive) on the stale runtime answers NotLeader and drops it, the next duty pass (no runtime: never
+// idle-skipped) recreates it, and the retry is served within 3 passes - at once, not at the next wheel deadline.
+// Mutation: remove the `dropLeaseRuntime_` of the stale identity in leaseServeable_: the runtime stays stale, the retries stay NotLeader: red.
+TEST(LeaseEmitterRegression, IdleRebuildServesKeepAliveRegression) {
+    for (const int op : {0, 1}) {   // 0: LeaseKeepAlive, 1: LeaseTimeToLive
+        SCOPED_TRACE(op == 0 ? "keepalive" : "timeToLive");
+        Em e;
+        VerdictRig& r = e.r;
+        ASSERT_TRUE(e.produce({grantRec(1)}));
+        ASSERT_TRUE(r.driveUntilJudged());
+        ASSERT_TRUE(e.waitRuntime());
+        const int64_t t0 = e.leaseNow;
+        e.advanceMs(3000);
+        r.addLeasePort();
+        r.passes(30);
+        ASSERT_TRUE(r.driveUntilJudged());
+        r.passes(30);
+        ASSERT_TRUE(r.leaseReady());
+        ASSERT_NE(e.rt(), nullptr);
+        ASSERT_FALSE(e.rt()->sameIdentity(r.replica->leadershipGeneration(), r.vs->leaseRebuildEpoch(VerdictRig::kSrc, 0))) << "idle: the stale runtime is still there";
+        const int64_t v = e.versionOf(1);
+        if (op == 0) EXPECT_EQ(e.keepAlive(1, v).code, kNotLeaderCode);
+        else         EXPECT_EQ(e.timeToLive(1).code, int16_t(kNotLeaderCode));
+        bool served = false;
+        for (int i = 0; i < 3 && !served; ++i) {
+            if (op == 0) {
+                const auto o = e.keepAlive(1, v);
+                served = o.code == 0 && o.ttl == 5000;
+            } else {
+                const auto o = e.timeToLive(1);
+                served = o.code == 0 && o.remainingMs == 5000;
+            }
+        }
+        EXPECT_TRUE(served) << "served within 3 passes";
+        ASSERT_NE(e.rt(), nullptr);
+        EXPECT_EQ(e.rt()->readyNs(), t0 + 3000 * kMs);
+        EXPECT_TRUE(e.rt()->sameIdentity(r.replica->leadershipGeneration(), r.vs->leaseRebuildEpoch(VerdictRig::kSrc, 0)));
     }
 }
 

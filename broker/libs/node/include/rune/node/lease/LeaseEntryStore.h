@@ -155,7 +155,10 @@ enum class LeaseAction : uint8_t {
     None, Link, AppendExpire, AppendCheckpoint, AppendClear, Park, RearmAnswerOk,
     ReturnArmedReplayParked, ReturnArmedAnswerParkedOk, FreeAnswerParkedNotFound, DiscardAnswerParkedNotLeader,
     /// ReplayParked: the caller re-runs this key's parked keepalives as Keepalive events (none parked = nothing to do).
-    ReplayParked
+    ReplayParked,
+    /// Armed x CheckpointDue (the checkpoint sink decides through these, spec 9.5): Unschedule = no checkpoint (it expires first, checkpointing is
+    /// off, or the remaining time is within the interval): the caller cancels the schedule; Defer = the gate is closed, the key waits in the wheel.
+    Unschedule, Defer
 };
 
 struct LeaseStepIn {
@@ -164,6 +167,8 @@ struct LeaseStepIn {
     bool gateOpen;
     bool due;
     bool remainingPositive;
+    /// CheckpointDue only: checkpointing is on for the topic AND the key's remaining time exceeds the checkpoint interval (spec 9.5).
+    bool checkpointWanted = true;
 };
 struct LeaseStepOut {
     LeaseEntryState next;
@@ -200,8 +205,8 @@ struct LeaseStepOut {
                 case E::Arm: return {S::Armed, A::None};
                 case E::FallDue: return in.gateOpen ? LeaseStepOut{S::Emitting, A::AppendExpire} : LeaseStepOut{S::Armed, A::None};
                 case E::CheckpointDue:
-                    if (in.due) return {S::Armed, A::None};   // a due key never checkpoints: it expires first
-                    return in.gateOpen ? LeaseStepOut{S::Checkpointing, A::AppendCheckpoint} : LeaseStepOut{S::Armed, A::None};
+                    if (in.due || !in.checkpointWanted) return {S::Armed, A::Unschedule};   // a due key never checkpoints (it expires first); nor does one about to end
+                    return in.gateOpen ? LeaseStepOut{S::Checkpointing, A::AppendCheckpoint} : LeaseStepOut{S::Armed, A::Defer};
                 case E::Keepalive:
                     if (in.due) return {S::Armed, A::Park};
                     if (!in.remainingPositive) return {S::Armed, A::RearmAnswerOk};

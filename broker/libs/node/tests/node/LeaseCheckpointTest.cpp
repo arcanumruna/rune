@@ -6,8 +6,11 @@
 #include "LeaseRig.h"
 #include "AllocWindow.h"
 
+#include <rune/storage/testing/DemandChannelForTest.h>
+
 #include <array>
 #include <map>
+#include <set>
 
 using namespace ltr;
 
@@ -327,4 +330,213 @@ TEST(LeaseCheckpointAllocRegression, CheckpointAndPromotionNoAllocRegression) {
     EXPECT_EQ(k.rt()->stats().promotionLinked, 400u);
     EXPECT_GT(k.rt()->stats().checkpointsAppended, ckptBefore);
     EXPECT_EQ(allocs, 0u);
+}
+
+// 11. (F3) A key whose deadline and checkpoint time are BOTH due in one pass is never checkpointed: it expires first.  expiryBatch 1: pass 1
+// expires one key and the checkpoint sink meets the other, due and Armed, with its checkpoint time long due and the gate open.  No Checkpoint
+// record is ever appended; the sink unschedules the due key; both keys expire (once each) over the passes.
+// Mutation: the sink ignores `due` (LeaseRuntime::emitCheckpoints: `const bool due = false`, and `!due` out of `wanted`): a Checkpoint is appended: red.
+TEST(LeaseCheckpointRegression, DueKeyNeverCheckpointedRegression) {
+    auto spec = specWith(1000, 1, 1000, 1000);
+    spec.expiryBatch = 1;
+    Lk k(spec);
+    ASSERT_TRUE(setup(k, {1, 2}, 5000));
+    const uint32_t rids[2] = {k.ridOf(1), k.ridOf(2)};   // taken now: an expired key's row is erased
+    k.advanceMs(6000);   // the checkpoint (+1 s) and the deadline (+5 s) are due in the SAME pass
+    k.r.pass();
+    EXPECT_EQ(countOp(k.r, rec::LeaseOp::Expire), 1u) << "expiryBatch 1: one Expire in pass 1";
+    EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 0u);
+    std::size_t armed = 0;
+    for (const uint32_t rid : rids) {
+        if (k.rt()->timers().entry(rid).state != LeaseEntryState::Armed) continue;
+        ++armed;
+        EXPECT_EQ(k.rt()->timers().entry(rid).checkpointNs, lease::kLeaseNoCheckpoint) << "the due key was unscheduled, not checkpointed";
+        EXPECT_FALSE(k.rt()->timers().checkpoint().linked(rid));
+    }
+    EXPECT_EQ(armed, 1u) << "the other key is still Armed, waiting for its Expire";
+    k.r.passes(10);
+    EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 0u) << "never";
+    EXPECT_EQ(countOp(k.r, rec::LeaseOp::Expire), 2u);
+    for (const uint32_t rid : rids) EXPECT_EQ(k.rt()->timers().entry(rid).checkpointNs, lease::kLeaseNoCheckpoint);
+}
+
+// 12. (F4a) The per-key gate defers a due checkpoint: an update of the key appended but not judged means the re-encode would miss it.  Nothing
+// is appended while the judge is held (checkpointDeferred counts), and the checkpoint goes out once the update is judged.
+// Mutation: the sink takes the gate as open (`const bool gate = true`): a Checkpoint is appended while held: red.
+TEST(LeaseCheckpointRegression, GateClosedDefersThenEmitsRegression) {
+    Lk k(specWith(1000, 1, 1000, 1000));
+    ASSERT_TRUE(setup(k, {1}, 5000));
+    const int64_t v = k.versionOf(1);
+    k.r.holdJudge(true);
+    (void)k.send({updateRec(1, v)});
+    k.r.passes(30);
+    k.advanceMs(1000);
+    k.r.passes(5);
+    EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 0u) << "the gate is closed";
+    EXPECT_GE(k.rt()->stats().checkpointDeferred, 1u);
+    EXPECT_EQ(k.entry(1).state, LeaseEntryState::Armed);
+    k.r.holdJudge(false);
+    ASSERT_TRUE(waitCheckpoints(k, 1));
+    EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 1u);
+}
+
+// 13. (F4b) A refused append (ISR below min-ISR, or a throwing storage) appends nothing, leaves the tokens unspent and the entries due on the
+// next cycle: with rate 1 per second the next pass after the refusal clears still emits the checkpoint in the SAME one-second window.
+// Mutation: spend the tokens on a refusal (`ckptUsed_ += n` in the refused path of emitCheckpoints): the checkpoint waits a second: red.
+TEST(LeaseCheckpointRegression, RefusedAppendRetriesNextCycleRegression) {
+    {   // a throwing append
+        Lk k(specWith(1000, 1, 1000, 1));
+        ASSERT_TRUE(setup(k, {1}, 5000));
+        k.advanceMs(1000);
+        k.r.replica->setLeaseAppendThrowForTest(true);
+        k.r.passes(3);
+        EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 0u);
+        EXPECT_GE(k.rt()->stats().appendErrors, 1u);
+        EXPECT_EQ(k.rt()->stats().checkpointsAppended, 0u);
+        EXPECT_EQ(k.entry(1).state, LeaseEntryState::Armed);
+        k.r.replica->setLeaseAppendThrowForTest(false);
+        k.r.pass();
+        EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 1u) << "the very next pass: the tokens were not spent";
+    }
+    {   // ISR below min-ISR
+        Lk k(specWith(1000, 1, 1000, 1), /*follower=*/true, RigTuning{.minIsr = 2});
+        const int64_t c = k.send({grantRec(1, 5000)});
+        const auto ack = k.r.ackFetching(c);
+        ASSERT_TRUE(ack);
+        ASSERT_EQ(ack->code, 0);
+        ASSERT_TRUE(k.r.driveUntilJudged());
+        ASSERT_TRUE(k.waitRuntime());
+        const int32_t live[1] = {1};
+        k.r.replica->shrinkIsrToLive(std::span<const int32_t>(live, 1), k.r.now);   // |ISR| 1 < minIsr 2
+        k.advanceMs(1000);
+        const int64_t leo = k.r.leo();
+        k.r.passes(3);
+        EXPECT_EQ(k.r.leo(), leo) << "nothing appended";
+        EXPECT_EQ(k.rt()->stats().checkpointBacklog, 3u) << "1 record x 3 attempts, counted as the CHECKPOINT backlog";
+        EXPECT_EQ(k.rt()->stats().expiryBacklog, 0u);
+        EXPECT_EQ(k.rt()->stats().checkpointsAppended, 0u);
+        k.r.replica->becomeLeader(k.r.replica->epoch(), std::vector<rune::replication::NodeId>{1, 2});
+        for (int i = 0; i < 5 && countOp(k.r, rec::LeaseOp::Checkpoint) == 0; ++i) k.r.pass();
+        EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 1u) << "emitted on the next cycle after the ISR is back";
+    }
+}
+
+// 14. (F4c) A full batch leaves the rest: five due checkpoints, a byte cap that fits two records: 2, then 2, then 1 over the passes - none lost,
+// none doubled (five distinct keys).
+// Mutation: the sink drops a key it cannot fit (return true instead of false at Fit::Full): the rest never go out: red.
+TEST(LeaseCheckpointRegression, FullBatchLeavesRestRegression) {
+    Lk k(specWith(1000, 1, 1000, 1000));
+    ASSERT_TRUE(setup(k, {1, 2, 3, 4, 5}, 5000));
+    k.r.worker->setLeaseBatchCapForTest(250);   // 61 header + 2 x 75 = 211 fit, 3 x 75 = 286 do not
+    k.advanceMs(1000);
+    std::vector<std::size_t> after;
+    for (int i = 0; i < 3; ++i) {
+        k.r.pass();
+        after.push_back(countOp(k.r, rec::LeaseOp::Checkpoint));
+    }
+    EXPECT_EQ(after, (std::vector<std::size_t>{2, 4, 5}));
+    k.r.passes(5);
+    EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 5u) << "no repeat";
+    std::set<std::string> keys;
+    for (const auto& s : withOp(k.r, rec::LeaseOp::Checkpoint)) keys.insert(s.key);
+    EXPECT_EQ(keys.size(), 5u) << "five distinct keys";
+}
+
+// 15. (F4d) Roll back-pressure: while the log's roll is deferred no checkpoint is appended (counted as a roll-deferred skip); they go out once a
+// segment is ready.  Mutation: drop the rollDeferred check in leaseDuty_: a Checkpoint lands while held: red.
+TEST(LeaseCheckpointRegression, RollDeferredSkipsCheckpointsRegression) {
+    Lk k(specWith(1000, 1, 1000, 1000), false, RigTuning{}, /*rollBytes=*/100);
+    ASSERT_TRUE(setup(k, {1, 2}, 5000));
+    struct Hook { static bool fn(void*, rune::storage::Log*, rune::storage::Log::ProvisionDemand) noexcept { return true; } };
+    rune::storage::testing::DemandChannelForTest demandCh{&Hook::fn, nullptr};
+    k.r.log->setProvisioning(&demandCh);
+    ASSERT_TRUE(k.r.log->rollDeferred()) << "the active segment is full and no segment is ready";
+    k.advanceMs(1000);
+    const int64_t leo = k.r.leo();
+    k.r.passes(5);
+    EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 0u) << "held: no Checkpoint";
+    EXPECT_EQ(k.r.leo(), leo);
+    EXPECT_GE(k.rt()->stats().rollDeferredSkips, 5u);
+    ASSERT_EQ(k.r.log->provisionReady(1), 1);
+    EXPECT_TRUE(waitCheckpoints(k, 2)) << "released: both are checkpointed";
+    (void)k.r.log->finalizeStagingRenames();
+    (void)k.r.log->drainStagingRenamesDone();
+}
+
+// 16. (F8, F4e) A rejected own Checkpoint(R) returns the entry to Armed with the NEXT checkpoint one interval from the rejection - not the past time
+// it was polled at, which would append the same checkpoint again at once.
+// Mutation: drop the reschedule before the relink in onEvents' BrokerRejected path: a second Checkpoint on the next pass: red.
+TEST(LeaseCheckpointRegression, CheckpointRejectedRearmsLaterRegression) {
+    Lk k(specWith(1000, 1, 1000, 1000));
+    ASSERT_TRUE(setup(k, {1}, 5000));
+    const int64_t v = k.versionOf(1);
+    k.r.holdJudge(true);   // the Checkpoint stays in flight
+    k.advanceMs(1000);
+    k.r.pass();
+    ASSERT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 1u);
+    ASSERT_EQ(k.entry(1).state, LeaseEntryState::Checkpointing);
+    const int64_t at = k.leaseNow;
+    LeaseEvent ev;
+    ev.kind = LeaseEventKind::BrokerRejected; ev.rid = k.ridOf(1); ev.offset = withOp(k.r, rec::LeaseOp::Checkpoint)[0].offset; ev.version = v;
+    k.r.worker->onEventsForTest(VerdictRig::kSrc, 0, std::span<const LeaseEvent>(&ev, 1), at);
+    ASSERT_EQ(k.entry(1).state, LeaseEntryState::Armed);
+    EXPECT_EQ(k.rt()->stats().ownRecordRejected, 1u);
+    EXPECT_EQ(k.entry(1).checkpointNs, at + 1000 * kMs) << "one interval from the rejection";
+    k.r.passes(5);
+    EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 1u) << "not again at once";
+    k.advanceMs(999);
+    k.r.passes(3);
+    EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 1u) << "not before leaseNow + interval";
+    k.advanceMs(1);
+    ASSERT_TRUE(waitCheckpoints(k, 2));
+    EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 2u);
+}
+
+// 17. (F6) A checkpoint that cannot be appended because its lone record exceeds the hard cap is skipped (spec 9.5: a checkpoint may be skipped):
+// the key is unscheduled, not left forever-deferred in the wheel (the pass has no pending work afterwards).  A later keepalive re-arm reschedules.
+// (The encode-failure branch shares this code; it has no test seam.)
+// Mutation: return false (defer) at Fit::Oversized in the checkpoint sink: the row stays scheduled and due, hasPendingWork stays true: red.
+TEST(LeaseCheckpointRegression, OversizedCheckpointUnscheduledRegression) {
+    Lk k(specWith(1000, 1, 1000, 1000));
+    ASSERT_TRUE(setup(k, {1}, 5000));
+    k.r.worker->setMaxBatchBytes(100);   // below one checkpoint batch (61 + ~75)
+    k.advanceMs(1000);
+    k.r.passes(3);
+    EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 0u);
+    EXPECT_GE(k.rt()->stats().oversizedDeferred, 1u);
+    EXPECT_EQ(k.entry(1).state, LeaseEntryState::Armed);
+    EXPECT_EQ(k.entry(1).checkpointNs, lease::kLeaseNoCheckpoint) << "unscheduled";
+    EXPECT_FALSE(k.rt()->timers().checkpoint().linked(k.ridOf(1)));
+    EXPECT_FALSE(k.rt()->hasPendingWork(k.leaseNow)) << "no forever-deferred row";
+    k.r.worker->setMaxBatchBytes(64u << 10);
+    k.r.passes(3);
+    EXPECT_EQ(countOp(k.r, rec::LeaseOp::Checkpoint), 0u) << "skipped, not retried";
+}
+
+// 18. (F7) A parked keepalive answered Ok by the remaining-0 branch of flushClears renews the lease AND schedules its next checkpoint (as every
+// keepalive re-arm does).  Setup: a Checkpoint(R) in flight, a keepalive parked behind it, 500 ms left when the checkpoint is refused (so the
+// refusal unschedules: remaining <= interval); the replay takes the clear path, the row's remaining is 0: Ok at once, deadline now + ttl.
+// Mutation: drop `scheduleIfNone_` in flushClears' remaining-0 branch: checkpointNs stays kLeaseNoCheckpoint: red.
+TEST(LeaseCheckpointRegression, ClearRenewalSchedulesNextCheckpointRegression) {
+    Lk k(specWith(1000, 1, 1000, 1000));
+    ASSERT_TRUE(setup(k, {1}, 5000));
+    const int64_t v = k.versionOf(1);
+    k.r.holdJudge(true);
+    k.advanceMs(1000);
+    k.r.pass();
+    ASSERT_EQ(k.entry(1).state, LeaseEntryState::Checkpointing);
+    EXPECT_TRUE(k.keepAlive({E(1, v)}).empty()) << "parked behind the checkpoint";
+    k.advanceMs(3500);   // 500 ms left
+    LeaseEvent ev;
+    ev.kind = LeaseEventKind::BrokerRejected; ev.rid = k.ridOf(1); ev.offset = withOp(k.r, rec::LeaseOp::Checkpoint)[0].offset; ev.version = v;
+    k.r.worker->onEventsForTest(VerdictRig::kSrc, 0, std::span<const LeaseEvent>(&ev, 1), k.leaseNow);
+    ASSERT_EQ(k.entry(1).state, LeaseEntryState::Armed);
+    EXPECT_EQ(k.entry(1).checkpointNs, lease::kLeaseNoCheckpoint) << "500 ms left: nothing to checkpoint";
+    k.step();
+    ASSERT_EQ(k.frames.size(), 1u);
+    EXPECT_EQ(k.frames[0].es[0].code, 0);
+    EXPECT_EQ(k.frames[0].es[0].ttl, 5000u);
+    EXPECT_EQ(k.entry(1).deadlineNs, k.leaseNow + 5000 * kMs);
+    EXPECT_EQ(k.entry(1).checkpointNs, k.leaseNow + 1000 * kMs) << "the renewal scheduled the next checkpoint";
+    EXPECT_TRUE(k.rt()->timers().checkpoint().linked(k.ridOf(1)));
 }

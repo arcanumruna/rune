@@ -191,24 +191,37 @@ TEST(LeasePromotionArmingRegression, ChunkedLinkingRegression) {
     }
 }
 
-// 5. A key the pass has not reached never expires early: it has no entry, so nothing can fire for it before its promotion deadline
-// (T_ready + extend + ttl); once linked past that time it expires exactly once.  One row per pass (the chunk seam), the clock jumping ahead.
+// 5. A key the pass has not reached never expires early: it has no entry, so nothing can fire for it before the pass that links it.  Chunk 1,
+// four keys (ttl 3 s): the creation pass links one; the clock then jumps to ready + 10 s (every linked deadline, ready + 3 s, is long due).
+// Each following pass links ONE more key and expires exactly the keys linked so far - never one the walk has not reached - and each key
+// expires exactly once.  Mutation: ignore the chunk (`uint32_t budget = promoteChunk_` -> UINT32_MAX in LeaseRuntime::promote): the creation
+// pass links all four, the first pass after the jump expires all four: red.
 TEST(LeasePromotionArmingRegression, NotLinkedNeverExpiresEarlyRegression) {
     Lk k(specWith(1000, 0, 1000, 1000));
     ASSERT_TRUE(setup(k, {1, 2, 3, 4}, 3000));
     k.r.worker->setLeasePromotionChunkForTest(1);
     ASSERT_GT(k.promoteStepwise(), 0);
     const int64_t ready = k.rt()->readyNs();
-    ASSERT_EQ(k.rt()->stats().promotionLinked, 1u);
-    for (const int64_t at : {1000, 2000, 2999}) {
-        k.leaseNow = ready + at * kMs;
+    ASSERT_EQ(k.rt()->stats().promotionLinked, 1u) << "the creation pass links one row";
+    uint32_t ridOfKey[5] = {};
+    for (uint64_t id = 1; id <= 4; ++id) ridOfKey[id] = k.ridOf(id);
+    k.leaseNow = ready + 10'000 * kMs;
+    for (uint64_t pass = 1; pass <= 3; ++pass) {
         k.r.pass();
-        EXPECT_EQ(countOp(k.r, rec::LeaseOp::Expire), 0u) << "at ready + " << at << " ms";
+        EXPECT_EQ(k.rt()->stats().promotionLinked, pass + 1) << "pass " << pass;
+        std::set<uint32_t> expired;
+        for (const auto& s : withOp(k.r, rec::LeaseOp::Expire)) {
+            for (uint64_t id = 1; id <= 4; ++id) if (s.key == keyOf(id)) expired.insert(ridOfKey[id]);
+        }
+        EXPECT_EQ(countOp(k.r, rec::LeaseOp::Expire), pass + 1) << "pass " << pass << ": one record per linked key, none for an unreached one";
+        // the rows walked so far are rids [0, pass]: every expired key must be one of them (rids are dense from 0 in grant order)
+        uint32_t minRid = UINT32_MAX;
+        for (uint64_t id = 1; id <= 4; ++id) minRid = std::min(minRid, ridOfKey[id]);
+        for (const uint32_t rid : expired) EXPECT_LE(rid - minRid, pass) << "pass " << pass << ": an Expire for a key the walk had not reached";
     }
-    k.leaseNow = ready + 3000 * kMs;
-    for (int i = 0; i < 12; ++i) k.r.pass();
+    k.r.passes(10);
     const auto ex = withOp(k.r, rec::LeaseOp::Expire);
-    ASSERT_EQ(ex.size(), 4u) << "all four expire, at or after ready + ttl";
+    ASSERT_EQ(ex.size(), 4u) << "all four expire";
     std::set<std::string> keys;
     for (const auto& s : ex) keys.insert(s.key);
     EXPECT_EQ(keys.size(), 4u) << "each exactly once";
@@ -308,4 +321,99 @@ TEST(LeasePromotionArmingRegression, IdleSkipWaitsForPromotionRegression) {
     const uint64_t lookups = k.r.worker->leaseDutyLookupsForTest();
     k.r.passes(50);
     EXPECT_EQ(k.r.worker->leaseDutyLookupsForTest(), lookups) << "done: idle again";
+}
+
+// 9. (F1) An acked lease never expires early after a failed cold growth.  A fold of a LIVE row (a Granted event, or an Updated fold of a row
+// past the store) whose entry cannot be grown (bad_alloc) leaves a Free entry on a live row; linking it later would use the PROMOTION deadline
+// (ready + extend + ttl, the OLD runtime's ready time), which can be before g + ttl.  The runtime is therefore rebuilt: it is dropped right
+// after the fold and the next pass recreates it at a fresh ready time >= g, so every promotion deadline is >= g + extend + ttl.
+// Setup: extend 2 s, ttl 10 s, 4100 rows, a runtime created at T_ready whose store holds the first chunk only (promotion chunk 0); 30 s later
+// the growth seam is on and key K (leg 0: a new grant past the headroom; leg 1: an update of the present row 4100) folds.  The runtime is
+// rebuilt on the following pass (readyNs == that pass's leaseNow); with the seam off a keepalive at g + 1 s is Ok; no Expire for K at any step
+// up to g + 10 s - 1 ms; exactly one by g + 11.5 s (the keepalive moved the deadline to g + 11 s).
+// Mutation: do not set `rebuildOwed_` (both growth-failure paths in LeaseRuntime::onEvents): the old runtime stays, the keepalive's Free-arm links K at
+// the OLD promotion deadline, long past: an Expire at ~g + 1 s: red (both legs).
+TEST(LeasePromotionArmingRegression, GrowFailedGrantNeverEarlyRegression) {
+    constexpr uint64_t kRows = 4100;
+    constexpr uint64_t kTtl  = 10'000;
+    for (const int leg : {0, 1}) {
+        SCOPED_TRACE(leg == 0 ? "leg 0: a grant past the store" : "leg 1: an Updated fold of a present row past the store");
+        Lk k(specWith(13000, 0, 1000, 1000));
+        k.r.worker->setLeaseExtendNs(2000 * kMs);
+        ASSERT_TRUE(k.grantMany(kRows, kTtl));
+        k.r.worker->setLeasePromotionChunkForTest(0);   // the first runtime does not walk: its store keeps the first chunk
+        ASSERT_GT(k.promoteStepwise(), 0);
+        ASSERT_EQ(k.rt()->timers().capacity(), lease::kLeaseEntryChunk);
+        const int64_t ready0 = k.rt()->readyNs();
+        k.r.worker->setLeasePromotionChunkForTest(lease::kLeasePromotionChunk);   // the rebuilt runtime walks
+        k.advanceMs(30'000);
+        const int64_t g = k.leaseNow;
+        k.rt()->setGrowThrowForTest(true);
+        const uint64_t key = leg == 0 ? kRows + 1 : kRows;
+        if (leg == 0) ASSERT_TRUE(k.produce({grantRec(key, kTtl)}));
+        else          ASSERT_TRUE(k.produce({updateRec(key, k.versionOf(key))}));
+        ASSERT_TRUE(k.r.driveUntilJudged());
+        k.r.passes(3);
+        ASSERT_NE(k.rt(), nullptr);
+        EXPECT_GT(k.rt()->readyNs(), ready0) << "the runtime was rebuilt";
+        EXPECT_EQ(k.rt()->readyNs(), g) << "at the pass's leaseNow";
+        EXPECT_EQ(k.rt()->stats().growFailures, 0u) << "the new runtime";
+        k.rt()->setGrowThrowForTest(false);
+        k.r.passes(3);
+        ASSERT_TRUE(k.rt()->promotionDone());
+        k.advanceMs(1000);
+        const int64_t ver = k.versionOf(key);
+        const auto fr = k.keepAlive({E(key, ver)});
+        ASSERT_EQ(fr.size(), 1u);
+        EXPECT_EQ(fr[0].es[0].code, 0);
+        auto expiresOf = [&] {
+            std::size_t n = 0;
+            for (const auto& s : withOp(k.r, rec::LeaseOp::Expire)) n += s.key == keyOf(key) ? 1 : 0;
+            return n;
+        };
+        EXPECT_EQ(expiresOf(), 0u);
+        const int64_t last = g + msToNs(kTtl) - 1 * kMs;
+        while (k.leaseNow < last) {
+            k.leaseNow = std::min(k.leaseNow + 500 * kMs, last);
+            k.r.passes(2);
+            ASSERT_EQ(expiresOf(), 0u) << "an acked lease expired at g + " << (k.leaseNow - g) / kMs << " ms";
+        }
+        k.leaseNow = g + 11'500 * kMs;
+        k.r.passes(5);
+        EXPECT_EQ(expiresOf(), 1u);
+        k.r.passes(30);
+        EXPECT_EQ(expiresOf(), 1u) << "exactly once";
+    }
+}
+
+// 10. (F10) The promotion pass reports the rids it WALKED as work, so a chunk made of erased rids is not idle: chunk 1, rows 0..2 erased and
+// row 3 live: every pass that walks returns work >= 1 until the walk is done.
+// Mutation: return the entries LINKED instead of the rids walked (LeaseRuntime::promote): the passes over the erased rows return 0: red.
+TEST(LeasePromotionArmingRegression, ErasedChunkIsWorkRegression) {
+    Lk k(specWith(1000, 0, 1000, 1000));
+    ASSERT_TRUE(setup(k, {1, 2, 3, 4}, 5000));
+    std::vector<RawRec> rv;
+    for (uint64_t id = 1; id <= 3; ++id) rv.push_back(revokeRec(id, k.versionOf(id)));
+    ASSERT_TRUE(k.produce(rv));
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    k.r.passes(5);
+    for (uint64_t id = 1; id <= 3; ++id) ASSERT_EQ(k.ridOf(id), UINT32_MAX);
+    ASSERT_EQ(k.ridOf(4), 3u);
+    k.r.worker->setLeasePromotionChunkForTest(1);
+    k.r.demote();
+    k.r.promoteWithoutPass();
+    int walkingPasses = 0;
+    for (int i = 0; i < 400; ++i) {
+        const bool walking = k.rt() != nullptr && !k.rt()->promotionDone();
+        const int work = k.r.pass();
+        if (walking) {
+            ++walkingPasses;
+            EXPECT_GE(work, 1) << "a walking pass over " << (walkingPasses) << " is work";
+        }
+        if (k.rt() != nullptr && k.rt()->promotionDone()) break;
+    }
+    EXPECT_GE(walkingPasses, 2) << "the passes over the erased rows were observed";
+    ASSERT_NE(k.rt(), nullptr);
+    EXPECT_TRUE(k.rt()->promotionDone());
+    EXPECT_EQ(k.rt()->stats().promotionLinked, 1u);
 }

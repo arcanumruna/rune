@@ -891,7 +891,8 @@ is a fixed-width `prefixWidth`, which a path prefix cannot use.
   only when the remaining TTL exceeds the interval, and so does Rune.
 - **Emission.** A due checkpoint becomes a `Checkpoint` record with `lease_remaining_ms = ⌈deadline − now⌉`.
   - It passes the same gate as `Expire`.
-  - At most `lease.checkpoint_rate`/s and 1000 per batch are emitted, from the same scratch.
+  - At most `lease.checkpoint_rate` records per one-second window aligned to the leader's ready time (so up to 2x the rate across a
+    window boundary) and 1000 per batch are emitted, from the same scratch.
   - It is skipped when the remaining time is ≤ the interval, as in etcd.
 - **In flight (R4).** Appending a scheduled `Checkpoint(R)` moves the entry to `Checkpointing{ckptOffset}`. A
   keepalive there parks. Without this state, a keepalive arriving after `Checkpoint(R)` is appended but before it

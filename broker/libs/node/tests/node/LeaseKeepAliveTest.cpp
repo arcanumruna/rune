@@ -1233,6 +1233,7 @@ TEST(LeaseKeepAliveTableRegression, GrowBadAllocOnEventsRegression) {
         rt.onEvents(std::span<const LeaseEvent>(&g, 1), 1'000'000'000, parks, kBareSpec);
         EXPECT_EQ(rt.stats().growFailures, 1u);
         EXPECT_FALSE(rt.timers().covers(5000)) << "the grant stays untracked";
+        EXPECT_TRUE(rt.rebuildOwed()) << "and the worker rebuilds the runtime (an acked lease must never expire early)";
         rt.setGrowThrowForTest(false);
         rt.onEvents(std::span<const LeaseEvent>(&g, 1), 1'000'000'000, parks, kBareSpec);
         EXPECT_EQ(rt.stats().growFailures, 1u);
@@ -1245,6 +1246,7 @@ TEST(LeaseKeepAliveTableRegression, GrowBadAllocOnEventsRegression) {
         g.rid = 3100;   // covered, and past 75 % of the first chunk: growth is owed
         rt.onEvents(std::span<const LeaseEvent>(&g, 1), 1'000'000'000, parks, kBareSpec);
         EXPECT_EQ(rt.stats().growFailures, 1u);
+        EXPECT_FALSE(rt.rebuildOwed()) << "the 75 % headroom growth is retried, not a rebuild: the grant itself was tracked";
         EXPECT_EQ(rt.timers().entry(3100).state, LeaseEntryState::Armed);
         EXPECT_EQ(rt.timers().capacity(), lease::kLeaseEntryChunk);
         rt.setGrowThrowForTest(false);

@@ -612,13 +612,18 @@ public:
     }
     void setLeaseBatchCapForTest(std::size_t bytes) noexcept { leaseBatchCapOverrideForTest_ = bytes; }
     /// Test seam (Task 12): the promotion pass's chunk (row ids per pass) of runtimes created afterwards; 0 keeps every entry Free.
-    void setLeasePromotionChunkForTest(uint32_t chunk) noexcept { leasePromotionChunkForTest_ = chunk; }
+    void setLeasePromotionChunkForTest(uint32_t chunk) noexcept { leasePromotionChunk_ = chunk; }
     /// Lease topics Task 11a: the leader heartbeat timeout (ns) granted to a promoted key (spec 9.7).  Applies to runtimes created afterwards.
     void setLeaseExtendNs(int64_t ns) noexcept { leaseExtendNs_ = ns; }
     [[nodiscard]] const lease::LeaseParkTable& leaseParksForTest() const noexcept { return *leaseParks_; }
     [[nodiscard]] lease::LeaseParkTable& leaseParksMutForTest() noexcept { return *leaseParks_; }
     /// Deferred Ok answers turned into NotLeader because the view-read lease had ended by the time they were sent (Task 11a review R1).
     [[nodiscard]] uint64_t leaseOkWithheldForTest() const noexcept { return leaseOkWithheld_; }
+    /// LeaseKeepAlive / LeaseTimeToLive ops the worker executed (a request refused before the worker never counts).
+    [[nodiscard]] uint64_t leaseKeepAlivesForTest() const noexcept { return leaseKeepAlives_; }
+    [[nodiscard]] uint64_t leaseTimeToLivesForTest() const noexcept { return leaseTimeToLives_; }
+    /// Lease runtime creations that threw bad_alloc (the runtime is retried on the next duty pass).
+    [[nodiscard]] uint64_t leaseCreateFailuresForTest() const noexcept { return leaseCreateFailures_; }
     [[nodiscard]] uint64_t nsRequestOpsForTest(uint16_t slot) const noexcept { return slot < nsHot_.size() ? nsHot_[slot].requestOps : 0; }
     [[nodiscard]] uint64_t nsProduceRecordsForTest(uint16_t slot) const noexcept { return slot < nsHot_.size() ? nsHot_[slot].produceRecords : 0; }
     void onEventsForTest(int32_t topicId, int32_t partition, std::span<const LeaseEvent> events, int64_t leaseNowNs) {
@@ -6739,8 +6744,9 @@ private:
     // entries of the keepalive op being served (256 x 12 bytes: one wire entry each).
     std::unique_ptr<lease::LeaseParkTable> leaseParks_ = std::make_unique<lease::LeaseParkTable>();
     int64_t  leaseExtendNs_ = 0;
-    uint32_t leasePromotionChunkForTest_ = lease::kLeasePromotionChunk;
+    uint32_t leasePromotionChunk_ = lease::kLeasePromotionChunk;
     std::array<uint8_t, 256 * 12> leaseKaScratch_{};
+    uint64_t leaseCreateFailures_ = 0;  // lease runtime creations that threw bad_alloc (retried on the next duty pass)
     uint64_t leaseKeepAlives_ = 0;      // LeaseKeepAlive ops executed
     uint64_t leaseTimeToLives_ = 0;     // LeaseTimeToLive ops executed
     uint64_t leaseOkWithheld_ = 0;      // deferred Ok answers sent as NotLeader: the read lease ended before they left (R1)
@@ -7657,17 +7663,27 @@ private:
             if (w->leaseRuntime && !w->leaseRuntime->sameIdentity(gen, epoch))
                 dropLeaseRuntime_(*w, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
             if (!w->leaseRuntime && lk.ready) {   // cold; the live keys at creation are armed by the promotion pass below, at this time (T_ready)
-                if (!leaseEmitWork_) leaseEmitWork_ = std::make_unique<lease::LeaseEmitWork>(kLeaseEmitReserveBytes);
-                w->leaseRuntime = std::make_unique<lease::LeaseRuntime>(gen, epoch, w->spec->lease->maxKeys, leaseNowNs, topicId, partition,
-                                                                        leaseExtendNs_);
-                w->leaseRuntime->setPromotionChunkForTest(leasePromotionChunkForTest_);
+                try {
+                    if (!leaseEmitWork_) leaseEmitWork_ = std::make_unique<lease::LeaseEmitWork>(kLeaseEmitReserveBytes);
+                    w->leaseRuntime = std::make_unique<lease::LeaseRuntime>(gen, epoch, w->spec->lease->maxKeys, leaseNowNs, topicId, partition,
+                                                                            leaseExtendNs_, leasePromotionChunk_);
+                } catch (const std::bad_alloc&) {
+                    // No runtime: nothing is tracked, nothing expires.  A pass with no runtime is never idle-skipped (the skip above requires
+                    // `w->leaseRuntime`), so the next pass retries the creation (at a later ready time, which only delays expiry).
+                    ++leaseCreateFailures_;
+                }
             }
+            const rune::protocol::LeaseSpec& lspec = *w->spec->lease;
             if (w->leaseRuntime) {
-                const rune::protocol::LeaseSpec& lspec = *w->spec->lease;
                 w->leaseRuntime->onEvents(w->leaseEvents.buf, leaseNowNs, *leaseParks_, lspec, &lk.ref);
                 work += static_cast<int>(w->leaseEvents.buf.size());
+                if (w->leaseRuntime->rebuildOwed()) {   // a fold of a live row could not grow the store: rebuild at a fresh ready time (acked leases never expire early)
+                    dropLeaseRuntime_(*w, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
+                    w->leaseEvents.buf.clear();
+                    continue;
+                }
                 if (lk.ready && !w->leaseRuntime->promotionDone())   // the events above arm their keys first; the pass links the rest
-                    work += static_cast<int>(w->leaseRuntime->promote(lk.ref, lspec, leaseNowNs));
+                    work += static_cast<int>(w->leaseRuntime->promote(lk.ref, lspec, leaseNowNs));   // the rids walked: a chunk of erased rids is work
             }
             w->leaseEvents.buf.clear();   // consumed (or discarded: no runtime yet)
             if (!w->leaseRuntime || !lk.ready) continue;
@@ -7681,7 +7697,7 @@ private:
             const ReplReadScope rs(*replica, replScratch_);   // the appends' push reads into the scratch
             // Order: fold (above) -> promotion (above) -> the clears the parked keepalives wait for -> the due Expires -> the due checkpoints.
             const uint32_t cleared = w->leaseRuntime->flushClears(*leaseEmitWork_, lk.ref, writer, w->judgedThrough, leaseNowNs, cap, hardCap,
-                                                                  *replica, *leaseParks_);
+                                                                  *replica, *leaseParks_, lspec);
             if (cleared != 0) {
                 work += static_cast<int>(cleared);
                 noteLeaseAppended_(replica, w->leaseRuntime->lastBatchBytes());
@@ -7806,7 +7822,14 @@ private:
         const uint64_t gen = replica->leadershipGeneration();
         const WorkerViewSet::LeaseIndexLookup lk = viewSet_->leaseIndexFor(topicId, partition, gen, true,
                                                                            replica->highWatermark() >= replica->leadershipStartOffset());
-        if (!lk.ready || !w->leaseRuntime->sameIdentity(gen, viewSet_->leaseRebuildEpoch(topicId, partition))) return kNotLeaderCode;
+        if (!lk.ready) return kNotLeaderCode;
+        if (!w->leaseRuntime->sameIdentity(gen, viewSet_->leaseRebuildEpoch(topicId, partition))) {
+            // The index was rebuilt under the same leadership (a new rebuild epoch) while the duty pass idled.  Drop the stale runtime HERE:
+            // the next duty pass has no runtime (never idle-skipped) and recreates it, so the keepalive's retry is served.  Left in place, the
+            // idle skip would hide the stale identity until a wheel came due.
+            dropLeaseRuntime_(*w, kNotLeaderCode);
+            return kNotLeaderCode;
+        }
         out.replica = replica;
         out.w       = w;
         out.lk      = lk;
@@ -7870,7 +7893,7 @@ private:
             if (sv.replica->isDiskBacked() && sv.replica->log()->rollDeferred()) {   // F9: the next duty pass flushes them
                 rt.noteRollDeferredSkip();
             } else if (rt.flushClears(*leaseEmitWork_, sv.lk.ref, latestLeaseWriter(*sv.w->spec), sv.w->judgedThrough, nowNs, leaseBatchCap_(sv.replica),
-                                      leaseHardCap_(), *sv.replica, *leaseParks_) != 0) {
+                                      leaseHardCap_(), *sv.replica, *leaseParks_, *sv.w->spec->lease) != 0) {
                 noteLeaseAppended_(sv.replica, rt.lastBatchBytes());
             }
         }

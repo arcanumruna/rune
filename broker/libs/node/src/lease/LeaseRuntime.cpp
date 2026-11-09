@@ -66,6 +66,12 @@ enum class Fit : uint8_t { Ok, Full, Oversized };
     return len;
 }
 
+/// ceil_ms(deadline - now) for a deadline after `nowNs` (the remaining time a Checkpoint(R) carries).
+[[nodiscard]] inline uint64_t ceilRemainingMs(int64_t deadlineNs, int64_t nowNs) noexcept {
+    const int64_t diff = deadlineNs - nowNs;
+    return static_cast<uint64_t>(diff / 1'000'000) + (diff % 1'000'000 != 0 ? 1u : 0u);
+}
+
 [[nodiscard]] inline bool inflight(LeaseEntryState s) noexcept {
     return s == LeaseEntryState::Checkpointing || s == LeaseEntryState::Clearing || s == LeaseEntryState::Emitting;
 }
@@ -170,6 +176,8 @@ LeaseRuntime::KaStep LeaseRuntime::kaStep_(uint32_t rid, int64_t leaseNowNs, boo
         case LeaseAction::ReturnArmedAnswerParkedOk:
         case LeaseAction::FreeAnswerParkedNotFound:
         case LeaseAction::DiscardAnswerParkedNotLeader:
+        case LeaseAction::Unschedule:
+        case LeaseAction::Defer:
         case LeaseAction::ReplayParked: break;
     }
     assert(false && "a Keepalive step produced an action the keepalive path does not own");
@@ -221,6 +229,8 @@ void LeaseRuntime::foldStep_(uint32_t rid, LeaseEntryEvent event, const LeaseEve
         case LeaseAction::AppendCheckpoint:
         case LeaseAction::AppendClear:
         case LeaseAction::Park:
+        case LeaseAction::Unschedule:
+        case LeaseAction::Defer:
         case LeaseAction::RearmAnswerOk: break;
     }
     assert(false && "a fold event produced an action only the keepalive path or a demotion owns");
@@ -236,8 +246,11 @@ void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNow
                 try {
                     reserved = reserveFor_(rid);
                 } catch (const std::bad_alloc&) {
-                    // The grant stays untracked (its entry is not armed): the next runtime's promotion pass or a keepalive links it.
+                    // The grant has no entry to arm, and a later link of its (live) row would use the PROMOTION deadline, which can be before
+                    // g + ttl: an acked lease must never expire early.  The worker destroys this runtime after the fold (rebuildOwed) and the
+                    // next one, created at a ready time >= g, promotes the row at a deadline >= g + extend + ttl.
                     ++stats_.growFailures;
+                    rebuildOwed_ = true;
                     continue;
                 }
             }
@@ -278,7 +291,11 @@ void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNow
                         continue;
                     }
                 }
-                // Back to Armed at the stored deadline (relinked: past due means due on the next poll, rebuilt from the current row).
+                // Back to Armed at the stored deadline (relinked: past due means due on the next poll, rebuilt from the current row).  A rejected
+                // Checkpoint(R) leaves the stored checkpoint time in the past: reschedule it one interval from now BEFORE the relink (as the
+                // own-fold path does), else the next pass would append the same checkpoint again.
+                if (e.state == LeaseEntryState::Checkpointing && e.deadlineNs > leaseNowNs)
+                    timers_.scheduleCheckpoint(rid, checkpointTime(spec, ceilRemainingMs(e.deadlineNs, leaseNowNs), leaseNowNs));
                 const bool wasArmed = e.state == LeaseEntryState::Armed;
                 foldStep_(rid, LeaseEntryEvent::OwnRecordRejected, ev, leaseNowNs, parks, spec);
                 if (!wasArmed && timers_.entry(rid).state == LeaseEntryState::Armed) ++stats_.ownRecordRejected;
@@ -288,7 +305,10 @@ void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNow
         const bool present = ev.kind == LeaseEventKind::Updated || ev.kind == LeaseEventKind::Checkpointed;   // the row is in the table: the event carries its values
         if (present && !timers_.covers(rid)) {   // a row created by a fold (an absent-row replay) past the entry store: cover it cold
             bool growFailed = false;
-            if (!coverOrCount_(rid, growFailed)) continue;
+            if (!coverOrCount_(rid, growFailed)) {
+                if (growFailed) rebuildOwed_ = true;   // as the Granted case: a Free entry on a live row would link at the promotion deadline
+                continue;
+            }
         }
         if (!timers_.covers(rid)) continue;
         const LeaseEntry& e = timers_.entry(rid);
@@ -449,7 +469,8 @@ uint32_t LeaseRuntime::emit(LeaseEmitWork& work, const LeaseIndexRef& ref, const
 }
 
 uint32_t LeaseRuntime::flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref, const LeaseWriter& writer, int64_t judgedThrough,
-                                   int64_t leaseNowNs, std::size_t byteCap, std::size_t hardCap, PartitionReplica& replica, LeaseParkTable& parks) {
+                                   int64_t leaseNowNs, std::size_t byteCap, std::size_t hardCap, PartitionReplica& replica, LeaseParkTable& parks,
+                                   const rune::protocol::LeaseSpec& spec) {
     namespace rec = rune::protocol::record;
     if (clearHead_ == clearTail_) return 0;
     if (writer.descriptor == nullptr || ref.table == nullptr || ref.layout == nullptr) return 0;   // the parks wait for an index that can encode
@@ -490,6 +511,7 @@ uint32_t LeaseRuntime::flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref
         if (leaseRowRemaining(row, *ref.layout) == 0) {
             const uint64_t ttl = leaseRowTtl(row, *ref.layout);
             timers_.rearm(rid, satAdd(leaseNowNs, msToNsSat(ttl)));
+            scheduleIfNone_(rid, ttl, leaseNowNs, spec);
             parks.answerChain(timers_.parkHead(rid), 0, ttl);
             continue;
         }
@@ -538,9 +560,10 @@ uint32_t LeaseRuntime::promote(const LeaseIndexRef& ref, const rune::protocol::L
     if (promoteDone_ || ref.table == nullptr || ref.layout == nullptr) return 0;
     const uint32_t high = ref.table->ridHighWater();   // re-read every pass: the table grows while the pass walks
     uint32_t budget     = promoteChunk_;
-    uint32_t linked     = 0;
+    uint32_t walked     = 0;
     while (promoteCursor_ < high && budget != 0) {
         --budget;
+        ++walked;
         const uint32_t rid = promoteCursor_;
         if (leaseRowLive(*ref.table, rid)) {
             bool growFailed = false;
@@ -553,10 +576,13 @@ uint32_t LeaseRuntime::promote(const LeaseIndexRef& ref, const rune::protocol::L
                 const uint8_t* const row = ref.table->rowOf(rid);
                 const uint64_t ttl       = leaseRowTtl(row, *ref.layout);
                 const uint64_t remaining = leaseRowRemaining(row, *ref.layout);
-                timers_.noteUse(rid);
-                timers_.arm(rid, promotionDeadline(ttl, remaining), checkpointTime(spec, remaining > 0 ? remaining : ttl, leaseNowNs));
-                ++stats_.promotionLinked;
-                ++linked;
+                const LeaseStepOut step = leaseStep({LeaseEntryState::Free, LeaseEntryEvent::Arm, true, false, remaining > 0});
+                assert(step.action == LeaseAction::Link);
+                if (step.action == LeaseAction::Link) {
+                    timers_.noteUse(rid);
+                    timers_.arm(rid, promotionDeadline(ttl, remaining), checkpointTime(spec, remaining > 0 ? remaining : ttl, leaseNowNs));
+                    ++stats_.promotionLinked;
+                }
             }
         }
         ++promoteCursor_;
@@ -568,7 +594,7 @@ uint32_t LeaseRuntime::promote(const LeaseIndexRef& ref, const rune::protocol::L
         timers_.noteGrowFailed();
         ++stats_.growFailures;
     }
-    return linked;
+    return walked;
 }
 
 uint32_t LeaseRuntime::emitCheckpoints(LeaseEmitWork& work, const LeaseIndexRef& ref, const LeaseWriter& writer, int64_t judgedThrough,
@@ -589,42 +615,47 @@ uint32_t LeaseRuntime::emitCheckpoints(LeaseEmitWork& work, const LeaseIndexRef&
     work.builder.reset(0, 0);
     uint32_t n = 0;
     bool full  = false;
+    uint64_t remainingMs = 0;
     auto sink = [&](uint32_t rid) -> bool {
         if (full) return false;
         assert(timers_.entry(rid).state == LeaseEntryState::Armed);   // only Armed is linked
         const LeaseEntry& e = timers_.entry(rid);
-        if (spec.checkpoint == 0 || e.deadlineNs <= leaseNowNs) {   // turned off by an alter, or due: it expires first
-            timers_.scheduleCheckpoint(rid, kLeaseNoCheckpoint);
-            return true;
-        }
-        const int64_t diff = e.deadlineNs - leaseNowNs;
-        const uint64_t remainingMs = static_cast<uint64_t>(diff / 1'000'000) + (diff % 1'000'000 != 0 ? 1u : 0u);   // ceil
-        if (remainingMs <= spec.checkpointIntervalMs) {   // about to end: no checkpoint (a later keepalive reschedules)
-            timers_.scheduleCheckpoint(rid, kLeaseNoCheckpoint);
-            return true;
-        }
-        if (leaseLastAppended(*ref.table, rid) >= judgedThrough) {   // an update or revoke of the key is appended but not judged
-            ++stats_.checkpointDeferred;
-            return false;
+        // The decision is the step table's (Armed x CheckpointDue): unschedule / defer / append.  Inputs: due; the remaining time (ceil ms)
+        // against the interval; the per-key gate.
+        const bool due = e.deadlineNs <= leaseNowNs;
+        remainingMs    = due ? 0 : ceilRemainingMs(e.deadlineNs, leaseNowNs);
+        const bool wanted = spec.checkpoint != 0 && !due && remainingMs > spec.checkpointIntervalMs;
+        const bool gate   = leaseLastAppended(*ref.table, rid) < judgedThrough;   // else an update or revoke of the key is appended but not judged
+        const LeaseStepOut step = leaseStep({LeaseEntryState::Armed, LeaseEntryEvent::CheckpointDue, gate, due, true, wanted});
+        switch (step.action) {
+            case LeaseAction::Unschedule:   // turned off by an alter, due (it expires first), or about to end: a later keepalive reschedules
+                timers_.scheduleCheckpoint(rid, kLeaseNoCheckpoint);
+                return true;
+            case LeaseAction::Defer:
+                ++stats_.checkpointDeferred;
+                return false;
+            case LeaseAction::AppendCheckpoint: break;
+            default: assert(false && "a CheckpointDue step produced an action the checkpoint sink does not own"); return false;
         }
         const uint8_t* row = ref.table->rowOf(rid);
         const std::span<const uint8_t> key = ref.table->keyOf(rid);
+        // A checkpoint may be skipped (spec 9.5): a row that cannot be encoded, or whose lone record exceeds the hard cap, is unscheduled (the
+        // sink unlinked it) and the next keepalive re-arm reschedules it - never left forever-deferred in the wheel.
         const std::size_t len = encodeCheckpointValue(work, row, ref, writer, slotOf, remainingMs);
         if (len == 0) {
             ++stats_.encodeFailures;
-            return false;
+            timers_.scheduleCheckpoint(rid, kLeaseNoCheckpoint);
+            return true;
         }
         switch (fitRecord(work.builder, n, key.size(), len, byteCap, hardCap)) {
             case Fit::Ok: break;
             case Fit::Full: full = true; return false;
-            case Fit::Oversized: ++stats_.oversizedDeferred; return false;
+            case Fit::Oversized: ++stats_.oversizedDeferred; timers_.scheduleCheckpoint(rid, kLeaseNoCheckpoint); return true;
         }
         work.builder.append(std::string_view(reinterpret_cast<const char*>(key.data()), key.size()),
                             std::string_view(reinterpret_cast<const char*>(work.valueTmp.data()), len), /*timestamp=*/0,
                             rec::withLeaseOp(0, rec::LeaseOp::Checkpoint));
-        work.rids[n]   = rid;
-        work.ckptMs[n] = remainingMs;
-        ++n;
+        work.rids[n++] = rid;
         return true;   // the wheel unlinked it; its state stays Armed until the append result is known
     };
     (void)timers_.pollCheckpoint(leaseNowNs, sink, maxRecords);
@@ -640,7 +671,7 @@ uint32_t LeaseRuntime::emitCheckpoints(LeaseEmitWork& work, const LeaseIndexRef&
         return n;
     }
     if (base == PartitionReplica::kAppendNotLeader) ++stats_.notLeaderStops;
-    else if (base == PartitionReplica::kAppendMinIsr || base == PartitionReplica::kAppendBackPressure) stats_.expiryBacklog += n;
+    else if (base == PartitionReplica::kAppendMinIsr || base == PartitionReplica::kAppendBackPressure) stats_.checkpointBacklog += n;
     else if (base != kAppendThrew) {
         assert(false && "appendLeaseBatch refused a batch the emitter built");
         ++stats_.encodeFailures;

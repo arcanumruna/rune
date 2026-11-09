@@ -30,8 +30,9 @@ struct LeaseWriter;
 
 namespace rune::node::lease {
 
-/// The most Checkpoint records one batch carries, and the most row ids one promotion pass links (spec 9.5, 9.6).
+/// The most Checkpoint records one batch carries (spec 9.5).
 inline constexpr uint32_t kLeaseCheckpointBatchMax = 1000;
+/// The most row ids one promotion pass walks (spec 9.6).
 inline constexpr uint32_t kLeasePromotionChunk     = 4096;
 
 struct LeaseRuntimeStats {
@@ -56,6 +57,7 @@ struct LeaseRuntimeStats {
     uint64_t checkpointsAppended = 0;  ///< Checkpoint(R) records appended (Task 12)
     uint64_t checkpointBatches  = 0;   ///< successful appendLeaseBatch calls of emitCheckpoints
     uint64_t checkpointDeferred = 0;   ///< due checkpoints skipped because lastAppended >= judgedThrough (per poll visit)
+    uint64_t checkpointBacklog  = 0;   ///< records of checkpoint batches refused with kAppendMinIsr / kAppendBackPressure (per attempt)
     uint64_t promotionLinked    = 0;   ///< entries the promotion pass linked (Free rows armed at the promotion deadline)
     uint64_t clearExamined      = 0;   ///< flushClears: live ring entries handled (flag set and position current); stale ones are skipped for free
 };
@@ -79,7 +81,6 @@ struct LeaseEmitWork {
     std::vector<uint8_t>               batch;
     std::array<uint8_t, kValueBytes>   valueTmp{};
     std::array<uint32_t, rune::protocol::kMaxLeaseExpiryBatch> rids{};
-    std::array<uint64_t, kLeaseCheckpointBatchMax> ckptMs{};   ///< the remaining time (ms) each appended Checkpoint carries, beside `rids`
 };
 
 class LeaseRuntime {
@@ -87,10 +88,11 @@ public:
     /// Cold.  `maxKeys` sizes the entry store (spec->lease->maxKeys); both wheel cursors start at `leaseNowNs`, which is also the
     /// runtime's ready time (promotionDeadline).  `extendNs`: the leader heartbeat timeout (a promoted key's grace, spec 9.7).
     /// `topicId` / `partition` name the partition on the park table's slots.
+    /// `promotionChunk`: the row ids one promotion pass walks (the worker passes kLeasePromotionChunk; a test seam lowers it).
     LeaseRuntime(uint64_t leaderGen, uint64_t rebuildEpoch, uint32_t maxKeys, int64_t leaseNowNs, int32_t topicId = 0, int32_t partition = 0,
-                 int64_t extendNs = 0)
+                 int64_t extendNs = 0, uint32_t promotionChunk = kLeasePromotionChunk)
         : gen_(leaderGen), epoch_(rebuildEpoch), timers_(maxKeys, leaseNowNs), readyNs_(leaseNowNs), extendNs_(extendNs),
-          topicId_(topicId), partition_(partition), clearPos_(timers_.capacity(), 0) {}
+          topicId_(topicId), partition_(partition), promoteChunk_(promotionChunk), clearPos_(timers_.capacity(), 0) {}
     LeaseRuntime(const LeaseRuntime&)            = delete;
     LeaseRuntime& operator=(const LeaseRuntime&) = delete;
 
@@ -105,6 +107,11 @@ public:
                !promotionDone();
     }
     [[nodiscard]] bool promotionDone() const noexcept { return promoteDone_; }
+    /// True once a fold of a PRESENT row (a Granted event, or a row created by a fold) could not grow the entry store (bad_alloc): that row
+    /// has no entry to arm, so a later link of it would use the promotion deadline, which can be before the grant's own g + ttl.  The
+    /// worker destroys the runtime right after onEvents; the next runtime is created at a fresh ready time >= g, so every promotion
+    /// deadline is >= g + extend + ttl (spec 9.2).  The keepalive-path growth failure is NOT this: it leaves the entry unarmed (Throttled).
+    [[nodiscard]] bool rebuildOwed() const noexcept { return rebuildOwed_; }
     [[nodiscard]] int64_t readyNs() const noexcept { return readyNs_; }
     void noteRollDeferredSkip() noexcept { ++stats_.rollDeferredSkips; }
     /// The byte size of the batch the last successful emit / flushClears appended.
@@ -121,9 +128,10 @@ public:
 
     /// The promotion pass (spec 9.6): links the live rows of the lease table that still have a Free entry, at most kLeasePromotionChunk
     /// row ids per call, from where the last call stopped, at the promotion deadline.  Runs every duty pass until promotionDone().
-    /// Returns the entries linked.  A growth failure stops the pass at that rid (retried next pass).
+    /// Returns the row ids WALKED (work done: a chunk of erased rids is not idle); stats().promotionLinked counts the entries linked.
+    /// A growth failure stops the pass at that rid (retried next pass).
     uint32_t promote(const LeaseIndexRef& ref, const rune::protocol::LeaseSpec& spec, int64_t leaseNowNs);
-    /// Test seam: the promotion pass's chunk size (rids per pass).
+    /// Test seam: the promotion pass's chunk size (rids per pass).  Production passes it to the constructor.
     void setPromotionChunkForTest(uint32_t chunk) noexcept { promoteChunk_ = chunk; }
 
     /// The checkpoint time of a lease whose current remaining-or-ttl time is `rMs` (spec 9.5): now + interval when checkpointing is on
@@ -153,8 +161,10 @@ public:
     /// Appends one batch of Checkpoint(0) records for the keys whose parked keepalives wait to clear their remaining time (the clear-wanted
     /// ring), and answers the ones whose row already has remaining 0.  `byteCap` bounds the batch (namespace / intake limit); `hardCap`
     /// is the most a lone record may take (a record over `byteCap` but within `hardCap` goes out alone).  Returns the records appended.
+    /// `spec`: a remaining-0 renewal schedules the key's next checkpoint when none is scheduled (as every keepalive re-arm does).
     uint32_t flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref, const LeaseWriter& writer, int64_t judgedThrough, int64_t leaseNowNs,
-                         std::size_t byteCap, std::size_t hardCap, rune::replication::PartitionReplica& replica, LeaseParkTable& parks);
+                         std::size_t byteCap, std::size_t hardCap, rune::replication::PartitionReplica& replica, LeaseParkTable& parks,
+                         const rune::protocol::LeaseSpec& spec);
     [[nodiscard]] uint32_t clearPending() const noexcept { return static_cast<uint32_t>(clearTail_ - clearHead_); }
     /// Test seams (Task 11a review fixes): the clear ring's capacity (a power of two <= the array, ring empty), and a rid's clear-wanted flag.
     void setClearRingCapForTest(uint32_t cap) noexcept {
@@ -225,6 +235,7 @@ private:
     bool             promoteDone_    = false;
     uint32_t         promoteCursor_  = 0;
     uint32_t         promoteChunk_   = kLeasePromotionChunk;
+    bool             rebuildOwed_    = false;
     int64_t          ckptWindow_     = -1;   ///< the checkpoint rate window (seconds since readyNs_) ckptUsed_ counts
     uint32_t         ckptUsed_       = 0;
     uint32_t         clearMask_ = kClearRingCap - 1;   ///< the ring's capacity - 1 (a test seam lowers it)

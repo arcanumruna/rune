@@ -812,17 +812,32 @@ TEST(LeaseGatewayRouteRegression, KeepAliveTooLargeForRingIsNotRetriableRegressi
     {
         GwLease g(1 << 18);
         ASSERT_TRUE(g.setup({1}));
+        const uint64_t opsBefore = g.r.worker->leaseKeepAlivesForTest();
         const auto fr = g.send(bigFrame(g, 61));
         ASSERT_EQ(fr.size(), 1u);
         expectWholeKa(fr[0], 61, code(pc::ErrorCode::MessageTooLarge));
         g.settle();
         EXPECT_EQ(g.out.size(), 1u) << "nothing reached the worker";
+        EXPECT_EQ(g.r.worker->leaseKeepAlivesForTest(), opsBefore) << "the worker saw no keepalive op";
     }
     {
         GwLease g;   // the default ring takes the same request
         ASSERT_TRUE(g.setup({1}));
+        const uint64_t opsBefore = g.r.worker->leaseKeepAlivesForTest();
         const auto fr = g.send(bigFrame(g, 62));
         EXPECT_TRUE(fr.empty()) << "enqueued: answered by the worker later";
+        ASSERT_TRUE(g.waitFrames(0, 1)) << "the worker's answer reaches the client";
+        ASSERT_EQ(g.out.size(), 1u);
+        const auto served = asKa(g.out[0]);
+        ASSERT_TRUE(served.has_value());
+        EXPECT_EQ(served->corr, 62);
+        EXPECT_TRUE(served->final);
+        ASSERT_EQ(served->es.size(), 256u) << "one answer per entry";
+        for (std::size_t i = 0; i < served->es.size(); ++i) {
+            EXPECT_EQ(served->es[i].index, i);
+            EXPECT_EQ(served->es[i].code, code(pc::ErrorCode::LeaseNotFound)) << "no 128-byte key is a lease";
+        }
+        EXPECT_EQ(g.r.worker->leaseKeepAlivesForTest(), opsBefore + 1) << "the worker executed the op exactly once";
     }
 }
 

@@ -112,7 +112,8 @@ struct Lk {
     int64_t corr = 1000;
     std::vector<Frame> frames;
 
-    explicit Lk(const rune::protocol::LeaseSpec& spec, bool follower = false) : r(follower, 64LL * 1024 * 1024, RigTuning{}) {
+    explicit Lk(const rune::protocol::LeaseSpec& spec, bool follower = false, RigTuning tuning = {}, int64_t rollBytes = 64LL * 1024 * 1024)
+        : r(follower, rollBytes, tuning) {
         r.worker->setLeaseClockForTest(&leaseNow);
         r.createLeaseTopicSpec(spec);
         r.passes(30);

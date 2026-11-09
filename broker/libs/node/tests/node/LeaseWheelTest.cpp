@@ -374,7 +374,9 @@ TEST(LeaseWheelRegression, StateMachineRegression) {
         // Armed, the three bool-dependent cells
         check(S::Armed, E::FallDue, gate ? S::Emitting : S::Armed, gate ? A::AppendExpire : A::None);
         // a due key never checkpoints, whatever the gate says
-        check(S::Armed, E::CheckpointDue, (gate && !due) ? S::Checkpointing : S::Armed, (gate && !due) ? A::AppendCheckpoint : A::None);
+        // (checkpointWanted defaults true here; the full CheckpointDue input space is CheckpointDueTableRegression)
+        check(S::Armed, E::CheckpointDue, (gate && !due) ? S::Checkpointing : S::Armed,
+              due ? A::Unschedule : (gate ? A::AppendCheckpoint : A::Defer));
         if (due) check(S::Armed, E::Keepalive, S::Armed, A::Park);
         else if (!rem) check(S::Armed, E::Keepalive, S::Armed, A::RearmAnswerOk);
         else if (gate) check(S::Armed, E::Keepalive, S::Clearing, A::AppendClear);
@@ -405,6 +407,46 @@ TEST(LeaseWheelRegression, StateMachineRegression) {
                 if (out.action == A::AppendExpire || out.action == A::AppendCheckpoint) EXPECT_EQ(static_cast<S>(s), S::Armed);
             }
         }
+    }
+}
+
+// The checkpoint sink decides through leaseStep (rule 3: one code path).  Every input combination of the CheckpointDue event, every state.
+TEST(LeaseWheelRegression, CheckpointDueTableRegression) {
+    int cells = 0;
+    for (int st = 0; st <= 4; ++st) {
+        for (int mask = 0; mask < 32; ++mask) {
+            const bool gate = mask & 1, due = mask & 2, rem = mask & 4, wanted = mask & 8;
+            const LeaseStepOut out = leaseStep({static_cast<S>(st), E::CheckpointDue, gate, due, rem, wanted});
+            ++cells;
+            if (static_cast<S>(st) != S::Armed) {   // nothing is appended, unscheduled or deferred from any other state
+                EXPECT_EQ(out.next, static_cast<S>(st)) << st << " mask " << mask;
+                EXPECT_EQ(out.action, A::None) << st << " mask " << mask;
+                continue;
+            }
+            if (due || !wanted) {   // expires first / checkpointing off or about to end: unschedule, whatever the gate says
+                EXPECT_EQ(out.next, S::Armed) << mask;
+                EXPECT_EQ(out.action, A::Unschedule) << mask;
+            } else if (gate) {
+                EXPECT_EQ(out.next, S::Checkpointing) << mask;
+                EXPECT_EQ(out.action, A::AppendCheckpoint) << mask;
+            } else {
+                EXPECT_EQ(out.next, S::Armed) << mask;
+                EXPECT_EQ(out.action, A::Defer) << mask;
+            }
+        }
+    }
+    EXPECT_EQ(cells, 5 * 32);
+    // `remainingPositive` never matters to CheckpointDue.
+    for (int mask = 0; mask < 16; ++mask) {
+        const LeaseStepOut a = leaseStep({S::Armed, E::CheckpointDue, bool(mask & 1), bool(mask & 2), false, bool(mask & 8)});
+        const LeaseStepOut b = leaseStep({S::Armed, E::CheckpointDue, bool(mask & 1), bool(mask & 2), true, bool(mask & 8)});
+        EXPECT_EQ(a.action, b.action);
+    }
+    // promote() arms through Free x Arm: Link, to Armed, whatever the other inputs.
+    for (int mask = 0; mask < 16; ++mask) {
+        const LeaseStepOut out = leaseStep({S::Free, E::Arm, bool(mask & 1), bool(mask & 2), bool(mask & 4), bool(mask & 8)});
+        EXPECT_EQ(out.next, S::Armed);
+        EXPECT_EQ(out.action, A::Link);
     }
 }
 
