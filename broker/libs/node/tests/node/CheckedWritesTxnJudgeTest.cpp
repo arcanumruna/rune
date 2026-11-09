@@ -2064,21 +2064,42 @@ TEST(CheckedWritesTxnJudge, CommitMarkerWithoutJudgeAppliesAPassingTxn) {
     EXPECT_EQ(r.freeOverlays(), rune::view::kTxnOverlaysPerWorker);
 }
 
-// M4: P11-1 (b), the source is constrained (its latest set) though the set at T's first record is not.
+// M4: P11-1 (b), the source is constrained at the marker (the set a change record between T's first record and its marker logs) though
+// the set at T's first record is not.
 TEST(CheckedWritesTxnJudge, ConstrainedSourceClassifiesAMarkerWithoutVote) {
-    JudgeRig r(false);
-    r.start();
+    JudgeRig r(true);
     ConstraintSet later = r.set;
     later.id = 2;
-    later.members[later.count++] = {7, VerdictViewKind::TestReject, JudgeRig::tagRule().fingerprint()};
-    r.st.constraintSets.onChange(1'000'000, later);
-    ASSERT_TRUE(r.st.isConstrainedSource());
-    r.log.data({{1}, {2}}, 77);
-    r.log.marker(77, true);
+    r.set.count--;   // the logged set has no TestReject member yet
+    r.start();
+    r.log.data({{1}, {2}}, 77);   // 10-11
+    r.log.control();              // 12: the set change's record
+    r.st.constraintSets.onChange(12, later);
+    r.log.marker(77, true);       // 13
     r.drive();
     EXPECT_TRUE(r.indexed(1));
     EXPECT_TRUE(r.indexed(2));
     EXPECT_EQ(r.st.txn.stats.markerWithoutVote, 1u);
+}
+
+// P11-7 is deterministic over the log: a set registered past T's marker (the node ran ahead of the judge) does not make T "should have
+// voted"; every leader and every refold classifies it as an ordinary transaction.
+TEST(CheckedWritesTxnJudgeRegression, MarkerClassificationIgnoresASetRegisteredPastTheMarkerRegression) {
+    JudgeRig r(true);
+    ConstraintSet later = r.set;
+    later.id = 2;
+    r.set.count--;
+    r.start();
+    r.log.data({{1}, {2, 9}}, 77);   // 10-11
+    r.log.marker(77, true);          // 12
+    r.log.control();                 // 13: a view is created after the marker
+    r.st.constraintSets.onChange(13, later);
+    ASSERT_TRUE(r.st.isConstrainedSource());
+    r.drive();
+    EXPECT_EQ(r.st.txn.stats.markerWithoutVote, 0u);
+    EXPECT_TRUE(r.indexed(1));
+    EXPECT_TRUE(r.indexed(2));
+    EXPECT_EQ(r.st.rejected.size(), 0u);
 }
 
 // L9 / Q4: a constrained member created after T's first record and before its marker (the coordinator lagged, so no vote was asked):
@@ -2100,6 +2121,7 @@ TEST(CheckedWritesTxnJudgeRegression, MemberCreatedMidTransactionRejectsAtTheMar
         const auto* e = r.st.rejected.find(o);
         ASSERT_NE(e, nullptr) << o;
         EXPECT_EQ(e->code, kViolation);
+        EXPECT_EQ(e->constraintId, kCapId);
     }
     EXPECT_FALSE(r.rowed(1));
     EXPECT_EQ(r.st.txn.stats.markerWithoutVote, 1u);
