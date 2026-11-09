@@ -40,6 +40,7 @@ struct ModelVote {
 /// One transaction of the log (a producer's records from its first to its marker).  `vote` is set when the model judged it whole.
 struct ModelTxn {
     int64_t pid = -1, first = -1, judge = -1, marker = -1;   ///< judge, marker: -1 when the log has none
+    int64_t appliedAt = -1;   ///< the judge position it applied at: its marker, or the offset of the unit that met its locks first
     bool commit = false, applied = false;
     std::optional<ModelVote> vote;
     std::vector<int64_t> offsets;   ///< its records, ascending
@@ -186,14 +187,20 @@ public:
         std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) { return a.offset < b.offset; });
         std::vector<std::pair<uint64_t, uint64_t>> set;   // the current members, ascending object id
         std::size_t judgedData = 0;   // the data records below this index were judged with their atomic batch
+        int64_t joinStop = INT64_MAX;
         for (const Event& e : events) {
             bool go = true;
             switch (e.kind) {
-            case Event::Kind::Change:
-                set.clear();
-                for (const auto& m : log.changes[e.at].members) set.emplace_back(m.viewObjectId, m.planFingerprint);
-                std::sort(set.begin(), set.end());
+            case Event::Kind::Change: {
+                std::vector<std::pair<uint64_t, uint64_t>> next;
+                for (const auto& m : log.changes[e.at].members) next.emplace_back(m.viewObjectId, m.planFingerprint);
+                std::sort(next.begin(), next.end());
+                const bool joins = std::any_of(next.begin(), next.end(), [&](const auto& m) { return !std::binary_search(set.begin(), set.end(), m); });
+                if (joins && std::any_of(txns_.begin(), txns_.end(), [&](const ModelTxn& t) { return t.judge >= 0 && t.judge < e.offset && t.marker < 0; }))
+                    joinStop = std::min(joinStop, e.offset + 1);   // D3: a joining member's switch waits for every voted transaction without a marker
+                set = std::move(next);
                 break;
+            }
             case Event::Kind::Data: {
                 if (e.at < judgedData) break;
                 judgedData = e.at + 1;
@@ -207,8 +214,14 @@ public:
             }
             if (!go) break;
         }
+        judgeStop_ = std::min(judgeStop_, joinStop);
         for (const ModelTxn& t : txns_)
             if (t.judge < 0 && t.marker < 0) judgeStop_ = std::min(judgeStop_, t.first);   // P11-2: the judge waits at an undecided transaction's first record
+        for (bool moved = true; moved;) {   // a transaction without a TxnJudge is decided at its marker: past the stop, its records' verdicts are not made yet
+            moved = false;
+            for (const ModelTxn& t : txns_)
+                if (t.judge < 0 && t.marker >= judgeStop_ && t.first < judgeStop_) judgeStop_ = t.first, moved = true;
+        }
         std::sort(accepted_.begin(), accepted_.end(), [](const LogRec& a, const LogRec& b) { return a.offset < b.offset; });   // delivery is in offset order
     }
 
@@ -349,20 +362,21 @@ private:
                 judgeStop_ = offset;
                 return false;
             }
-            finalize_(log, i);
+            finalize_(log, i, offset);
         }
         return true;
     }
-    void finalize_(const VerdictRig::RigLog& log, std::size_t lockedAt) {
+    void finalize_(const VerdictRig::RigLog& log, std::size_t lockedAt, int64_t at) {
         const std::size_t t = locked_[lockedAt].txn;
         locked_.erase(locked_.begin() + static_cast<std::ptrdiff_t>(lockedAt));
-        if (txns_[t].commit) applyTxn_(log, t, /*superseded=*/false);
+        if (txns_[t].commit) applyTxn_(log, t, /*superseded=*/false, at);
     }
     /// A transaction's records applied at its marker, in offset order.  `superseded`: an ordinary transaction (P11-3a) applies nothing of a key whose
     /// latest accepted record is another writer's above the transaction's last on it; the record is still delivered.
-    void applyTxn_(const VerdictRig::RigLog& log, std::size_t t, bool superseded) {
+    void applyTxn_(const VerdictRig::RigLog& log, std::size_t t, bool superseded, int64_t at) {
         ModelTxn& txn = txns_[t];
         txn.applied = true;
+        txn.appliedAt = at;
         std::map<uint64_t, int64_t> last;
         for (const int64_t offset : txn.offsets) last[recordAt_(log, offset)->id] = offset;
         for (const int64_t offset : txn.offsets) {
@@ -459,17 +473,17 @@ private:
         ModelTxn& txn = txns_[t];
         if (txn.judge >= 0) {   // voted: a yes holds its rows until here
             const auto at = std::find_if(locked_.begin(), locked_.end(), [&](const Locked& l) { return l.txn == t; });
-            if (at != locked_.end()) finalize_(log, static_cast<std::size_t>(at - locked_.begin()));
+            if (at != locked_.end()) finalize_(log, static_cast<std::size_t>(at - locked_.begin()), txn.marker);
             return true;
         }
         if (!txn.commit) return true;
         if (!shouldVote_(log, txn)) {
-            applyTxn_(log, t, /*superseded=*/true);
+            applyTxn_(log, t, /*superseded=*/true, txn.marker);
             return true;
         }
         if (!settleTxn_(log, set, t, txn.marker)) return false;   // P11-7: judged at the marker
         std::set<std::string> rows;
-        if (judgeWhole_(log, set, t, rows)) applyTxn_(log, t, /*superseded=*/false);
+        if (judgeWhole_(log, set, t, rows)) applyTxn_(log, t, /*superseded=*/false, txn.marker);
         else for (const int64_t offset : txn.offsets) verdicts_[offset] = ModelVerdict{txn.vote->code, txn.vote->constraintId};
         return true;
     }

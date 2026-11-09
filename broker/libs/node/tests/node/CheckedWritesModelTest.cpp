@@ -1170,9 +1170,10 @@ constexpr uint8_t kCwLeader = 1;
 constexpr uint64_t kCwObjName = 7, kCwObjStats = 8;
 const char* const kCwNames[] = {"Foo", "foo", "FOO", "Bar", "bar", "Baz", "\xC8\xBA" "x", "\xE2\xB1\xA5" "x"};
 
-struct CwParam { uint64_t seed; int64_t cap; };
+struct CwParam { uint64_t seed; int64_t cap; bool txn = false; };
 
-enum class CwAction : uint8_t { Creates, Rename, Move, Remove, RemoveExisting, Plain, Failover, DemotePromote, Restart, RestartDuringRebuild, TruncateTail, Compact, ReplaceStats, DropCreateName };
+enum class CwAction : uint8_t { Creates, Rename, Move, Remove, RemoveExisting, Plain, Failover, DemotePromote, Restart, RestartDuringRebuild, TruncateTail, Compact, ReplaceStats, DropCreateName,
+                                TxnWrite, CommitVoted, AbortVoted, TimeoutAbort, MarkerWithoutVote, AtomicBatch, OutsideWrite, CoordinatorFailover };
 const char* nameOf(CwAction a) {
     switch (a) {
     case CwAction::Creates: return "Creates";
@@ -1189,6 +1190,14 @@ const char* nameOf(CwAction a) {
     case CwAction::Compact: return "Compact";
     case CwAction::ReplaceStats: return "ReplaceStats";
     case CwAction::DropCreateName: return "DropCreateName";
+    case CwAction::TxnWrite: return "TxnWrite";
+    case CwAction::CommitVoted: return "CommitVoted";
+    case CwAction::AbortVoted: return "AbortVoted";
+    case CwAction::TimeoutAbort: return "TimeoutAbort";
+    case CwAction::MarkerWithoutVote: return "MarkerWithoutVote";
+    case CwAction::AtomicBatch: return "AtomicBatch";
+    case CwAction::OutsideWrite: return "OutsideWrite";
+    case CwAction::CoordinatorFailover: return "CoordinatorFailover";
     }
     return "";
 }
@@ -1198,7 +1207,7 @@ public:
     using CV = ConstrainedView;
     using Char = VerdictRig::Char;
 
-    explicit CwRun(CwParam p) : rng_(p.seed), cap_(p.cap), statsCap_(p.cap), autoInc_(p.seed % 2 == 1), rig_(/*follower=*/true, kModelRollBytes) {
+    explicit CwRun(CwParam p) : rng_(p.seed), cap_(p.cap), statsCap_(p.cap), txn_(p.txn), autoInc_(p.seed % 2 == 1 && !p.txn), rig_(/*follower=*/true, kModelRollBytes) {
         rig_.worker->setVerdictIntervalNs(1'000'000);
         rig_.createCharacterTopic(autoInc_);
         rig_.enableAcks();
@@ -1236,7 +1245,46 @@ public:
         return CwAction::DropCreateName;
     }
 
+    // The transaction alphabet: the Part 09 faults and constraint changes stay, the writes become transactions, atomic batches and outside writes.
+    CwAction pickTxn() {
+        const unsigned r = static_cast<unsigned>(rng_() % 100);
+        if (r < 20) return CwAction::TxnWrite;
+        if (r < 28) return CwAction::CommitVoted;
+        if (r < 33) return CwAction::AbortVoted;
+        if (r < 37) return CwAction::TimeoutAbort;
+        if (r < 41) return CwAction::MarkerWithoutVote;
+        if (r < 49) return CwAction::AtomicBatch;
+        if (r < 59) return CwAction::OutsideWrite;
+        if (r < 63) return CwAction::CoordinatorFailover;
+        if (r < 69) return CwAction::Creates;
+        if (r < 73) return CwAction::Rename;
+        if (r < 76) return CwAction::Plain;
+        if (r < 80) return CwAction::Failover;
+        if (r < 83) return CwAction::DemotePromote;
+        if (r < 86) return CwAction::Restart;
+        if (r < 88) return CwAction::RestartDuringRebuild;
+        if (r < 91) return CwAction::TruncateTail;
+        if (r < 94) return CwAction::Compact;
+        if (r < 97) return CwAction::ReplaceStats;
+        return CwAction::DropCreateName;
+    }
+
+    // Ends every open transaction (the run's last step), then checks everything.
+    void finish() {
+        trace += "Z";
+        while (anyOpen_() && !::testing::Test::HasFatalFailure()) endTxn_(firstOpen_(), rng_() % 3 != 0, true);
+        if (!::testing::Test::HasFatalFailure()) verify_();
+    }
+
     void step(CwAction action) {
+        switch (action) {
+        case CwAction::Failover: case CwAction::DemotePromote: case CwAction::Restart: case CwAction::RestartDuringRebuild: case CwAction::TruncateTail:
+        case CwAction::ReplaceStats: case CwAction::DropCreateName:
+            if (txn_) beforeFault_();
+            break;
+        default: break;
+        }
+        if (::testing::Test::HasFatalFailure()) return;
         switch (action) {
         case CwAction::Creates: trace += "c"; write_(creates_(1 + rng_() % 3)); break;
         case CwAction::Rename: trace += "r"; write_(updates_(1 + rng_() % 2, false, 2)); break;
@@ -1269,6 +1317,14 @@ public:
         case CwAction::Compact: trace += "C"; compact_ = true; break;
         case CwAction::ReplaceStats: replaceStats_(); break;
         case CwAction::DropCreateName: dropCreateName_(); break;
+        case CwAction::TxnWrite: trace += "w"; txnWrite_(); break;
+        case CwAction::CommitVoted: trace += "k"; endRandom_(true, true); break;
+        case CwAction::AbortVoted: trace += "a"; endRandom_(false, true); break;
+        case CwAction::TimeoutAbort: trace += "t"; endRandom_(false, false); break;
+        case CwAction::MarkerWithoutVote: trace += "n"; endRandom_(true, false); break;
+        case CwAction::AtomicBatch: trace += "b"; send_(rng_() % 2 == 0 ? creates_(1 + rng_() % 4) : updates_(1 + rng_() % 3, rng_() % 2 == 0, 2), true); break;
+        case CwAction::OutsideWrite: trace += "o"; outsideWrite_(); break;
+        case CwAction::CoordinatorFailover: trace += "v"; coordinatorFailover_(); break;
         }
         if (!::testing::Test::HasFatalFailure()) verify_();
     }
@@ -1276,7 +1332,10 @@ public:
 private:
     static constexpr uint8_t kAllView = rune::protocol::client::kAcksWireView | rune::protocol::client::kAcksWireAll;
     struct CwProducer { int64_t pid = 0; int32_t seq = 0; };
-    struct Pending { VerdictRig::Ack ack; std::size_t n; int64_t corr; };
+    struct Pending { VerdictRig::Ack ack; std::size_t n; int64_t corr; bool atomic = false; };
+    struct OpenTxn { int64_t pid; int32_t seq = 0; bool open = false, voted = false, votedBeforeFault = false; int64_t token = -1; std::vector<uint64_t> ids; };   // voted: a vote was asked, so a J may be in the log
+    struct VoteSeen { int64_t pid; VerdictRig::VoteReply reply; };
+    std::vector<int64_t> lostVotes_;   ///< voted before a fault and never answered after it: the model must hold a no for it
     struct LiveChar { uint64_t id; uint64_t userId; std::string name; };
 
     // A key-0 create on the autoincrement topic, an insert of a fresh id on the other.
@@ -1311,7 +1370,19 @@ private:
         }
         return out;
     }
-    void write_(const std::vector<Char>& chars) { (void)sendIdem_(producers_[rng_() % 2], chars); }
+    void write_(const std::vector<Char>& chars) { send_(chars, false); }
+    // A plain or atomic View write.  While a transaction is open the judge holds the View acks of later writes until it ends, so the ack
+    // is collected at the next full check, from a producer of its own.
+    void send_(const std::vector<Char>& chars, bool atomic) {
+        if (!anyOpen_()) {
+            if (sendIdem_(producers_[rng_() % 2], chars, atomic)) pending_.back().atomic = atomic;
+            return;
+        }
+        waitReady_();
+        if (::testing::Test::HasFatalFailure()) return;
+        const int64_t c = rig_.appendCharacters(chars, kAllView, 800 + ++deferredPids_, 0, false, atomic);
+        deferred_.push_back({{}, chars.size(), c, atomic});
+    }
 
     void waitReady_() {
         for (int i = 0; i < VerdictRig::kMaxPass; ++i) {
@@ -1322,11 +1393,11 @@ private:
         FAIL() << "the partition was not ready after " << trace;
     }
     // NotLeader until the counter is active; nothing was appended then, so the same sequence is sent again.
-    std::optional<VerdictRig::Ack> sendIdem_(CwProducer& p, const std::vector<Char>& chars) {
+    std::optional<VerdictRig::Ack> sendIdem_(CwProducer& p, const std::vector<Char>& chars, bool atomic = false) {
         waitReady_();
         if (::testing::Test::HasFatalFailure()) return std::nullopt;
         for (int tries = 0; tries < 100; ++tries) {
-            const int64_t c = rig_.appendCharacters(chars, kAllView, p.pid, p.seq);
+            const int64_t c = rig_.appendCharacters(chars, kAllView, p.pid, p.seq, false, atomic);
             const auto a = rig_.ackFetching(c, 60000);
             if (!a) { ADD_FAILURE() << "the produce was never answered, corr " << c; return std::nullopt; }
             if (a->code == static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader)) { rig_.passes(5); continue; }
@@ -1343,6 +1414,7 @@ private:
     void plain_() {
         std::vector<Char> chars = autoInc_ || rng_() % 3 == 0 ? tombstones_(1, 0) : updates_(1 + rng_() % 2, rng_() % 2 == 0, 0);
         if (chars.front().id == 0) return;   // nothing written yet: a key-0 create needs a View ack
+        if (!deferred_.empty()) return;   // the session answers in v11 for the write's passes: a View ack owed then would carry no trailer
         for (Char& c : chars) c.intent = 0;
         waitReady_();
         if (::testing::Test::HasFatalFailure()) return;
@@ -1356,6 +1428,125 @@ private:
             break;
         }
         rig_.enableAcks(17);
+    }
+
+    [[nodiscard]] bool anyOpen_() const { return txns_[0].open || txns_[1].open; }
+    [[nodiscard]] OpenTxn& firstOpen_() { return !txns_[0].open ? txns_[1] : !txns_[1].open ? txns_[0] : txns_[openOrder_]; }
+    // Everything below the tail is committed, so a cut keeps the markers and writes of the transactions.
+    void commitAll_() {
+        for (int i = 0; i < VerdictRig::kMaxPass && rig_.replica->highWatermark() < rig_.leo(); ++i) {
+            if (i % 8 == 0) rig_.followerFetch();
+            rig_.pass();
+        }
+    }
+    // A constraint-set change needs a write acked past it, which the judge holds while a transaction is open; a fault loses the votes asked and the acks owed.
+    void beforeFault_() {
+        commitAll_();   // a restart left the high watermark behind, and a tail cut goes to it
+        if (setChanged_) while (anyOpen_() && !::testing::Test::HasFatalFailure()) endTxn_(firstOpen_(), rng_() % 2 == 0, true);
+        for (OpenTxn& t : txns_) {
+            t.votedBeforeFault = t.votedBeforeFault || t.voted;
+            t.token = -1;
+        }
+        deferred_.clear();
+    }
+    void txnWrite_() {
+        OpenTxn* open = &txns_[rng_() % 2];
+        if (open->voted) open = &txns_[open - txns_ == 0 ? 1 : 0];
+        if (open->voted) return;   // the worker refuses a write to a transaction it has voted on
+        OpenTxn& t = *open;
+        std::vector<Char> chars;
+        switch (rng_() % 4) {
+        case 0: chars = creates_(1 + rng_() % 3); break;
+        case 1: chars = updates_(1 + rng_() % 2, false, 2); break;
+        case 2: chars = updates_(1, true, 2); break;
+        default: chars = tombstones_(1 + rng_() % 2, rng_() % 2 == 0 ? 0 : 2); break;
+        }
+        waitReady_();
+        if (::testing::Test::HasFatalFailure()) return;
+        auto a = rig_.ackFetching(rig_.appendCharacters(chars, rune::protocol::client::kAcksWireAll, t.pid, t.seq, true), 60000);
+        ASSERT_TRUE(a) << "the transactional produce was never answered";
+        if (a->code == static_cast<int16_t>(rune::protocol::client::ErrorCode::UnknownProducerId)) {   // a new leader has no state for the producer: it starts again at sequence 0
+            const bool wasOpen = t.open;
+            if (wasOpen) endTxn_(t, false, false);
+            t.seq = 0;
+            if (wasOpen) return;
+            a = rig_.ackFetching(rig_.appendCharacters(chars, rune::protocol::client::kAcksWireAll, t.pid, 0, true), 60000);
+            ASSERT_TRUE(a);
+        }
+        ASSERT_EQ(a->code, 0);
+        t.seq += static_cast<int32_t>(chars.size());
+        if (!t.open) {
+            if (!anyOpen_()) openOrder_ = &t == &txns_[0] ? 0 : 1;
+            t.open = true;
+        }
+        for (const Char& c : chars) t.ids.push_back(c.id);
+        commitAll_();
+    }
+    // The vote of every open transaction goes out in log order: the judge waits at an undecided one, so a vote behind it is answered only when it too is voted or ended.
+    void endTxn_(OpenTxn& t, bool commit, bool vote) {
+        waitReady_();
+        if (::testing::Test::HasFatalFailure()) return;
+        bool yes = true;
+        if (vote) {
+            for (OpenTxn* x : {&txns_[openOrder_], &txns_[1 - openOrder_]})
+                if (x->open && x->token < 0) { x->token = rig_.sendVote(VerdictRig::kSrc, x->pid, 0); x->voted = true; }
+            if (t.votedBeforeFault && !rig_.driveUntilVoted(t.token)) {   // a no that K passed before the fault is not judged again: the vote waits for the marker
+                lostVotes_.push_back(t.pid);
+                commit = false;
+            } else if (!rig_.driveUntilVoted(t.token)) {   // its rows are locked by the other transaction's yes: that one ends first, as a coordinator's timeout would
+                OpenTxn& other = &t == &txns_[0] ? txns_[1] : txns_[0];
+                ASSERT_TRUE(other.open && other.token >= 0 && rig_.voteReply(other.token)) << "the vote of " << t.pid << " was never answered";
+                endTxn_(other, rng_() % 2 == 0, true);
+                if (::testing::Test::HasFatalFailure()) return;
+                ASSERT_TRUE(rig_.driveUntilVoted(t.token)) << "the vote of " << t.pid << " was never answered after the other transaction ended";
+            }
+            if (const auto reply = rig_.voteReply(t.token)) {
+                votes_.push_back({t.pid, *reply});
+                yes = reply->errorCode == 0 && reply->code == 0;
+            } else {
+                ASSERT_TRUE(!lostVotes_.empty() && lostVotes_.back() == t.pid);
+                yes = false;
+            }
+        }
+        rig_.marker(t.pid, commit && yes);
+        commitAll_();
+        t.open = false;
+        t.voted = t.votedBeforeFault = false;
+        t.token = -1;
+        t.pid += 100;   // a producer's next transaction is a new producer id: the same (pid, epoch) cannot open one after its last ended
+        t.seq = 0;
+        t.ids.clear();
+        if (txns_[0].open != txns_[1].open) openOrder_ = txns_[0].open ? 0 : 1;
+        rig_.passes(5);
+    }
+    void endRandom_(bool commit, bool vote) {
+        if (!anyOpen_()) return;
+        OpenTxn& t = txns_[0].open && (!txns_[1].open || rng_() % 2 == 0) ? txns_[0] : txns_[1];
+        endTxn_(t, commit, vote || (commit && t.voted));   // a coordinator commits a transaction it has voted only on a yes
+    }
+    // A plain write on a key an open transaction wrote: the judge pauses at the locked row or answers TxnConflict.
+    void outsideWrite_() {
+        std::vector<uint64_t> locked;
+        for (const OpenTxn& t : txns_) locked.insert(locked.end(), t.ids.begin(), t.ids.end());
+        locked.erase(std::remove(locked.begin(), locked.end(), uint64_t{0}), locked.end());
+        if (locked.empty() || live_.empty()) { write_(creates_(1)); return; }
+        const uint64_t id = locked[rng_() % locked.size()];
+        const auto it = std::find_if(live_.begin(), live_.end(), [&](const LiveChar& c) { return c.id == id; });
+        write_({Char{.id = id, .userId = it != live_.end() ? it->userId : user_(), .name = name_(), .intent = 2}});
+    }
+    // The reloaded coordinator asks again: the same J, the same answer.
+    void coordinatorFailover_() {
+        for (OpenTxn& t : txns_) {
+            if (!t.open || t.token < 0) continue;
+            const auto first = rig_.voteReply(t.token);
+            if (!first) continue;
+            const int64_t again = rig_.sendVote(VerdictRig::kSrc, t.pid, 0);
+            ASSERT_TRUE(rig_.driveUntilVoted(again));
+            const auto second = rig_.voteReply(again);
+            ASSERT_TRUE(second);
+            EXPECT_EQ(std::make_tuple(second->code, second->constraintId, second->failingOffset, second->judgeOffset), std::make_tuple(first->code, first->constraintId, first->failingOffset, first->judgeOffset))
+                << "the re-sent vote of " << t.pid << " is answered from the same J";
+        }
     }
 
     // account_stats under its other cap; the swap at S writes the change record.  The model learns the new plan's cap by fingerprint.
@@ -1406,18 +1597,22 @@ private:
     }
 
     // One past the last data record: a trailing change record needs no marker.
-    static int64_t dataEnd_(const VerdictRig::RigLog& log) { return log.data.empty() ? 0 : log.data.back().offset + 1; }
+    static int64_t dataEnd_(const VerdictRig::RigLog& log) { return log.judgedEnd(); }
     bool judged_() { return rig_.driveUntilJudged(dataEnd_(rig_.readLog())); }
 
     void absorb_(const VerdictRig::RigLog& log, int64_t hw) {
         for (const auto& d : log.data) { data_[d.offset] = d; ids_.insert(d.id); }
         for (const auto& ch : log.changes) changes_[ch.offset] = ch;
+        for (const auto& m : log.txnMarkers) txnMarkers_[m.offset] = m;
+        for (const auto& j : log.judges) judges_[j.offset] = j;
         rig_.writeState()->rejected.forEachIn(0, INT64_MAX, [&](const rune::storage::RejectedOffsetIndex::Entry& e) { if (e.offset < hw) rejected_[e.offset] = {e.code, e.constraintId}; });
     }
     VerdictRig::RigLog history_() const {
         VerdictRig::RigLog out;
         for (const auto& kv : data_) out.data.push_back(kv.second);
         for (const auto& kv : changes_) out.changes.push_back(kv.second);
+        for (const auto& kv : txnMarkers_) out.txnMarkers.push_back(kv.second);
+        for (const auto& kv : judges_) out.judges.push_back(kv.second);
         return out;
     }
 
@@ -1425,16 +1620,28 @@ private:
     // account_stats an accepted write that raises a user's count leaves it at most the cap of the plan that judged it, and a move leaves its
     // old group empty or within that cap; under character_name an accepted live write claims no lowered name another live character holds.
     // So a user over the cap was over before the plan judged it, and every extra of a name was written while no unique member was active.
-    void checkConstraintInvariants_(const VerdictRig::RigLog& all) {
+    void checkConstraintInvariants_(const VerdictRig::RigLog& all, const CheckedWritesModel& model) {
         std::map<uint64_t, uint64_t> members;   // object id -> plan fingerprint
         std::map<uint64_t, std::pair<uint64_t, std::string>> live;   // id -> (userId, lowered name)
         std::map<uint64_t, int64_t> count;
-        std::size_t next = 0;
+        // A transaction's records apply at its commit marker (an aborted one's never) under the plans its TxnJudge judged with.
+        std::vector<std::tuple<int64_t, int64_t, const VerdictRig::RigLogRec*>> order;   // (apply offset, plan offset, record)
         for (const auto& rec : all.data) {
-            while (next < all.changes.size() && all.changes[next].offset < rec.offset) {
+            if (!rec.txn) { order.emplace_back(rec.offset, rec.offset, &rec); continue; }
+            const auto end = std::find_if(all.txnMarkers.begin(), all.txnMarkers.end(), [&](const auto& m) { return m.producerId == rec.producerId && m.offset > rec.offset; });
+            const auto applied = std::find_if(model.txns().begin(), model.txns().end(), [&](const ModelTxn& t) { return t.pid == rec.producerId && t.first <= rec.offset && (t.marker < 0 || rec.offset < t.marker); });
+            if (end == all.txnMarkers.end() || !end->commit || applied == model.txns().end() || !applied->applied) continue;
+            const auto judge = std::find_if(all.judges.begin(), all.judges.end(), [&](const auto& j) { return j.producerId == rec.producerId && j.offset > rec.offset && j.offset < end->offset; });
+            order.emplace_back(applied->appliedAt, judge != all.judges.end() ? judge->offset : end->offset, &rec);
+        }
+        std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return std::get<0>(a) < std::get<0>(b); });
+        for (const auto& [applyAt, planAt, recp] : order) {
+            const VerdictRig::RigLogRec& rec = *recp;
+            members.clear();
+            for (const auto& ch : all.changes) {
+                if (ch.offset >= planAt) break;
                 members.clear();
-                for (const auto& m : all.changes[next].members) members[m.viewObjectId] = m.planFingerprint;
-                ++next;
+                for (const auto& m : ch.members) members[m.viewObjectId] = m.planFingerprint;
             }
             if (rejected_.count(rec.offset) != 0) continue;
             const auto old = live.find(rec.id);
@@ -1528,8 +1735,57 @@ private:
         ADD_FAILURE() << "the constrained views never folded through " << target;
     }
 
+    // The votes the run asked for are the model's answers for the producer's latest transaction.
+    void checkVotes_(const CheckedWritesModel& model) {
+        for (const VoteSeen& v : votes_)
+            if (const auto m = model.vote(v.pid))
+                EXPECT_EQ(std::make_tuple(v.reply.code, v.reply.constraintId, v.reply.failingOffset), std::make_tuple(m->code, m->constraintId, m->failingOffset)) << "the vote of " << v.pid << " (a)";
+        votes_.clear();
+        for (const int64_t pid : lostVotes_) {
+            const auto m = model.vote(pid);
+            EXPECT_TRUE(m && m->code != 0) << "the vote of " << pid << " went unanswered after a fault, so the model must hold a no for it";
+        }
+        lostVotes_.clear();
+    }
+
+    // Below an undecided transaction only: the judge waits at its first record, and runs ahead of a voted one (its cursor, which the voted
+    // transaction's records stay behind until its marker).
+    void verifyOpen_(const CheckedWritesModel& model, const VerdictRig::RigLog& log, int64_t hw) {
+        const VerdictSource* judge = rig_.vs->verdictSource(VerdictRig::kSrc, rig_.partition());
+        const int64_t target = std::min(model.judgeStop(), log.data.empty() ? 0 : log.data.back().offset + 1);
+        for (int i = 0; i < VerdictRig::kMaxPass && judge->judgeCursor() < target; ++i) {
+            if (i % 8 == 0) rig_.followerFetch();
+            rig_.pass();
+        }
+        ASSERT_GE(judge->judgeCursor(), target) << "after " << trace;
+        const int64_t below = judge->judgeCursor();
+        EXPECT_EQ(model.coverageProblem(log), "") << "(b) the markers never end past a transaction the judge has not decided";
+        std::map<int64_t, ModelVerdict> got;
+        rig_.writeState()->rejected.forEachIn(0, std::min({below, hw, model.judgeStop()}), [&](const rune::storage::RejectedOffsetIndex::Entry& e) { got[e.offset] = {e.code, e.constraintId}; });
+        std::set<int64_t> present;   // a compaction drops the verdicts of records it removed
+        for (const auto& d : log.data) present.insert(d.offset);
+        for (const auto& [o, v] : got) {
+            const auto it = model.verdicts().find(o);
+            EXPECT_TRUE(it != model.verdicts().end() && it->second == v) << "(a) index entry " << o << " is not the model's verdict";
+        }
+        for (const auto& [o, v] : model.verdicts())
+            if (o < std::min(below, model.judgeStop()) && present.count(o) != 0) EXPECT_TRUE(got.count(o) != 0) << "(a) rejected offset " << o << " is in the log but not in the index";
+        checkVotes_(model);
+        trace += "[" + std::to_string(model.acceptedRecords().size()) + "/" + std::to_string(model.verdicts().size()) + "o]";
+    }
+
     void verify_() {
-        ASSERT_TRUE(judged_()) << " after " << trace;
+        if (!anyOpen_()) {
+            ASSERT_TRUE(judged_()) << " after " << trace;
+            for (Pending& p : deferred_) {
+                const auto a = rig_.ackFetching(p.corr, 60000);
+                ASSERT_TRUE(a) << "the deferred write " << p.corr << " was never answered";
+                ASSERT_EQ(a->code, 0);
+                p.ack = *a;
+                pending_.push_back(p);
+            }
+            deferred_.clear();
+        }
         const int64_t hw = rig_.replica->highWatermark();
         const VerdictRig::RigLog log = rig_.readLog(hw);
         absorb_(log, hw);
@@ -1543,16 +1799,24 @@ private:
         model.addCountCheckRule(kCwObjStats, cap_);
         for (const auto& [fp, c] : statsCaps_) model.declareCountCap(kCwObjStats, fp, c);
         model.reset(all);
+        if (anyOpen_()) { verifyOpen_(model, log, hw); return; }
+        EXPECT_EQ(model.judgeStop(), INT64_MAX) << "no transaction is open, so the whole log is judged";
         std::set<int64_t> present;
         for (const auto& d : log.data) present.insert(d.offset);
 
         foldViews_(dataEnd_(log));
         checkIndex(rig_, model, &present);
         if (!log.data.empty() && !log.markers.empty() && !log.changes.empty()) checkMarkers(model, log, dataEnd_(log), compacted_);
-        for (const Pending& p : pending_) checkModelTrailer(model, p.ack, p.n, p.corr);
+        for (const Pending& p : pending_) {
+            if (!p.atomic) { checkModelTrailer(model, p.ack, p.n, p.corr); continue; }
+            AckTrailer want = trailerFromModel(model, p.ack, p.n);   // an atomic batch is judged whole: its trailer carries the first entry
+            if (want.size() > 1) want.resize(1);
+            EXPECT_EQ(p.ack.verdicts, want) << "the atomic batch's trailer, corr " << p.corr;
+        }
         pending_.clear();
+        checkVotes_(model);
         checkViews_(model);
-        checkConstraintInvariants_(all);
+        checkConstraintInvariants_(all, model);
         checkDelivered_(model, present);
         if (compact_) {
             compact_ = false;
@@ -1567,6 +1831,7 @@ private:
 
     std::mt19937_64 rng_;
     int64_t cap_, statsCap_ = 0;
+    bool txn_;
     bool autoInc_;   ///< odd seeds: the autoincrement topic (key-0 creates); even seeds: key.index only (inserts of fresh ids, plain upserts)
     VerdictRig rig_;
     CwProducer producers_[2];
@@ -1576,6 +1841,13 @@ private:
     std::map<uint64_t, int64_t> statsCaps_;   ///< account_stats plan fingerprint -> its cap
     std::map<int64_t, VerdictRig::RigLogRec> data_;
     std::map<int64_t, VerdictRig::RigChange> changes_;
+    std::map<int64_t, VerdictRig::RigTxnMarker> txnMarkers_;
+    std::map<int64_t, VerdictRig::RigJudge> judges_;
+    OpenTxn txns_[2]{{77}, {79}};
+    int openOrder_ = 0;   ///< the open transaction whose first record is lower
+    int64_t deferredPids_ = 0;
+    std::vector<Pending> deferred_;   ///< View acks owed while a transaction was open
+    std::vector<VoteSeen> votes_;
     std::map<int64_t, ModelVerdict> rejected_;   ///< every verdict the broker's index ever held, by offset
     uint64_t swapFp_ = 0, lastId_ = 0;
     bool compact_ = false, compacted_ = false, setChanged_ = false;
@@ -1585,10 +1857,11 @@ private:
 std::string runCwSeed(CwParam p, int steps = kCwSteps) {
     CwRun run(p);
     for (int step = 0; step < steps && !::testing::Test::HasFatalFailure(); ++step) {
-        const CwAction action = run.pick();
+        const CwAction action = p.txn ? run.pickTxn() : run.pick();
         SCOPED_TRACE("seed=" + std::to_string(p.seed) + " cap=" + std::to_string(p.cap) + " step=" + std::to_string(step) + " action=" + nameOf(action) + " trace=" + run.trace);
         run.step(action);
     }
+    if (p.txn) run.finish();
     return run.trace;
 }
 }  // namespace
@@ -1628,3 +1901,36 @@ std::string cwName(const ::testing::TestParamInfo<CwParam>& i) { return "cap" + 
 INSTANTIATE_TEST_SUITE_P(Cap3, CheckedWritesConstraintModelRegression, ::testing::ValuesIn(cwParams(3, 200)), cwName);
 INSTANTIATE_TEST_SUITE_P(Cap12, CheckedWritesConstraintModelRegression, ::testing::ValuesIn(cwParams(12, 20)), cwName);
 
+
+// Part 11: the same run with transactions.  Producers 77 and 79 open transactions of 1-3 records per write over the character topic, vote (the
+// judge waits at an undecided one, so every open transaction is voted before the first answer is read), commit or abort, or end without a vote
+// (an abort timeout, a commit marker without a vote); atomic batches and plain View writes on the transactions' keys wait for the judge; faults
+// and constraint changes happen with transactions open.  With one open the checks hold below its first record, and with none the whole log
+// is checked against the model, which applies a commit at its marker.
+class CheckedWritesTxnModelRegression : public ::testing::TestWithParam<CwParam> {};
+
+// Over the first half of the steps (one run fits 1 s); the whole length is SeededTransactionsMatchTheModelFullLength, label stress.
+TEST_P(CheckedWritesTxnModelRegression, SeededTransactionsMatchTheModel) {
+    EXPECT_FALSE(runCwSeed(GetParam(), kCwSteps / 2).empty());
+}
+
+TEST_P(CheckedWritesTxnModelRegression, SeededTransactionsMatchTheModelFullLength) {
+    EXPECT_FALSE(runCwSeed(GetParam()).empty());
+}
+
+TEST_P(CheckedWritesTxnModelRegression, SameSeedSameTraceTxn) {
+    if (GetParam().seed > 8) GTEST_SKIP() << "seeds 1-8 only";
+    const std::string first = runCwSeed(GetParam(), kCwSteps / 4);
+    const std::string second = runCwSeed(GetParam(), kCwSteps / 4);
+    EXPECT_EQ(first, second);
+}
+
+namespace {
+std::vector<CwParam> cwTxnParams(uint64_t seeds) {
+    std::vector<CwParam> out;
+    for (uint64_t s = 1; s <= seeds; ++s) out.push_back({s, 3, true});
+    return out;
+}
+}  // namespace
+
+INSTANTIATE_TEST_SUITE_P(Cap3, CheckedWritesTxnModelRegression, ::testing::ValuesIn(cwTxnParams(200)), cwName);
