@@ -1165,11 +1165,11 @@ worker, namespaces `a` and `b`, a v17 session), `LeaseTrio.h` (3-node, on `AuthT
 `LeaseTrioTest.cpp`. **Task 17a** (same task, first step): the unit table rig `broker/libs/node/tests/node/LeaseMatrixUnitTest.cpp`
 running the applicable sequential cells against the in-process worker + stub gateway.
 
-- [ ] **Step 1:** `LeaseMatrixRegression.MatrixCountRegression`: 198 / 48 / 150 / 89 / 239.
-- [ ] **Step 2:** `TEST_P` over the 150 applicable sequential cells, unit rig and 1-node broker; `OtherNs` cells
+- [x] **Step 1:** `LeaseMatrixRegression.MatrixCountRegression`: 198 / 48 / 150 / 89 / 239.
+- [x] **Step 2:** (as built, see the note) `TEST_P` over the 150 applicable sequential cells, unit rig and 1-node broker; `OtherNs` cells
   compare full response bytes with a truly missing name.
-- [ ] **Step 3:** `TEST_P` over the 89 timing cells on their layer (Interaction matrix). Drive loops capped; no sleeps.
-- [ ] **Step 4:** the §16.2 scenarios as named tests: `LeaseIntegrationRegression.GrantExpiryRegression`,
+- [x] **Step 3:** (as built, see the note) `TEST_P` over the 89 timing cells on their layer (Interaction matrix). Drive loops capped; no sleeps.
+- [x] **Step 4:** (as built, see the note) the §16.2 scenarios as named tests: `LeaseIntegrationRegression.GrantExpiryRegression`,
   `…FencingRegression`, `…UpdateDoesNotRenewRegression` (M15), `…CompactionRestartRegression` (10 000 updates + 100
   checkpoints per key, clean, restart, identical view and remaining times), `…GatingRegression`;
   `LeaseRaceRegression.KeepAliveAtFourPointsRegression`, `…RevokeAndUpdateAtFourPointsRegression`,
@@ -1178,10 +1178,26 @@ running the applicable sequential cells against the in-process worker + stub gat
   (R4), `…PromotionBoundRegression` (with and without checkpoints), `…WholeClusterRestartRegression` (24 h lease at 5
   min ± 1 interval; 400-day lease after three restarts, injected clock), `…NoZombieAckRegression`,
   `…KeepAliveOutageUnderLeaderChangeRegression` (L22, p99 < 1.5 s over 50 forced changes).
-- [ ] **Step 5:** mutation pass: apply each of M1–M20 that this task owns, confirm red, revert; record in the commit.
+- [~] **Step 5:** (M2, M8, M13, M15 done; M4 and M16 open, see the note) mutation pass: apply each of M1–M20 that this task owns, confirm red, revert; record in the commit.
   Run `ctest --test-dir build -R 'LeaseMatrix|LeaseIntegration|LeaseRace|LeaseTrio' --output-on-failure -j8`, then
   `--repeat until-fail:20` and once under `-j8` load.
 - [ ] **Step 6:** commit and push.
+
+**As built (Task 17, part 1 of 3; Steps 5 repeat runs and 6 are the orchestrator's):**
+- Files: `tests/support/{LeaseMatrixExpectations,LeaseTestClock,LeaseBrokerRig,LeaseTrio}.h`, `tests/node/LeaseMatrixUnitTest.cpp`,
+  and `tests/client/{LeaseIntegration,LeaseRace,LeaseMatrix,LeaseTrio}Test.cpp` (target `rune_client_broker_tests`, not
+  `tests/integration/`: that target does not link the client). The rig is `LeaseBrokerRig.h` (`LeaseRig.h` was taken).
+- The injected lease clock is single-node only (a per-worker cell, shared-nothing). The trio runs the real lease clock with short
+  TTLs, so `WholeClusterRestart` is a real-time restart; the 24 h / 400-day legs are covered by the single-node
+  `CompactionRestart` (clean restart, injected clock).
+- `CompactionRestart` is 4 keys x 2 000 updates + 20 clock steps (recipe fallback); compaction itself is not forced (no seam;
+  covered by `LeaseJudgeWorkerRegression.LeaseRebuildAfterCompactionRegression`). `L22` uses 3 forced changes, not 50.
+- Broker-layer sequential matrix: 7 client-surface ops x non-n/a entities (56 cells); the rest is the unit table. Timing cells:
+  18 on one node, the trio legs in `LeaseTrioTest.cpp`, the others mapped in the `kCoverage` table to existing tests
+  (checked by `LeaseMatrixRegression.TimingCoverageRegression`).
+- Open: `KeepAliveOutageOnRejoinLeaderChangeRegression` fails on purpose (outage 1.64-1.72 s after a leader moves back to a rejoined
+  node, budget 1.5 s): an L22 finding for diagnosis. M4 is not turned red by `ContenderGrantsDoNotDeferExpire` (the deferral
+  window is the judge lag; needs a judge-hold seam). M16 has no pause code to mutate.
 
 ### Task 18: seeded model-checked stress
 

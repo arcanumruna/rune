@@ -1573,6 +1573,12 @@ All tests follow `docs/testing.md`:
 - **Compaction.** 10 000 updates and 100 checkpoints per key, then clean, then restart: the lease view and the
   remaining times are identical.
 - **Gating.** A session one version below is refused on every lease surface.
+
+**As built (Task 17).** The named scenarios are `LeaseIntegrationRegression`, `LeaseRaceRegression` (single node, injected lease clock),
+`LeaseTrioRegression` and `LeaseWatchTrioRegression` (3 nodes, real clock, short TTLs). Deviations: the whole-cluster restart runs in
+real time on the trio (the 24 h / 400-day legs are the single-node injected-clock `CompactionRestart`, scaled to 4 keys x 2 000
+updates); compaction is not forced on a real broker (no seam); the leader-outage test uses 3 forced changes and measures on
+the wall clock. An outage of 1.64-1.72 s after a leader moves back to a rejoined node is recorded as an open finding.
 - **Namespaces.**
   - `ReadOnly`: keepalives served, writes refused, an unkept lease still expires.
   - `RejectAll`: keepalives refused, and every lease ends within TTL + bound.
