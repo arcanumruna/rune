@@ -90,6 +90,15 @@ void awaitLevel(BrokerNode& n) {
     ASSERT_TRUE(raised) << "the cluster feature level reaches kCheckedWrites";
 }
 
+/// The three-broker cluster of these tests: the short warm-up, fused workers and a 40 ms election.
+catalog_cluster::ThreeNodes startCluster(const std::string& tag) {
+    return catalog_cluster::ThreeNodes::startWith(tag, [](NodeConfig& cfg) {
+        cfg.unservableWarmupMs = 50;
+        cfg.runtimePlacement   = NodeConfig::RuntimePlacement::Fused;
+        cfg.electionTimeoutMs  = 40;
+    });
+}
+
 std::string clusterEndpoint(catalog_cluster::ThreeNodes& c, int id) {
     return "127.0.0.1:" + std::to_string(c.ports.client[static_cast<std::size_t>(id - 1)]);
 }
@@ -233,7 +242,7 @@ bool qlEventually(const std::string& endpoint, const std::string& text, std::str
 
 }  // namespace
 
-// The acceptance case: every statement of the RegressorsPath script, one `rune ql -e` each, then the whole script with `-f` on a fresh cluster.
+// The acceptance case: every statement of the RegressorsPath script, one `rune ql -e` each.
 TEST(CheckedWritesQlBrokerRegression, RegressorsPathOutcomesThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
     const std::string golden = std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql";
@@ -244,32 +253,35 @@ TEST(CheckedWritesQlBrokerRegression, RegressorsPathOutcomesThreeNodesRegression
     const std::vector<std::string> statements = rune::cli::engine::splitStatements(script.str());
     ASSERT_EQ(statements.size(), 7u);
 
-    {
-        ThreeNodes c = ThreeNodes::start("cw09_ql");
-        ASSERT_TRUE(c.awaitCatalogLeader(30s));
-        for (const int id : c.runningNodes()) awaitLevel(c.node(id));
-        ASSERT_FALSE(HasFatalFailure());
-        const std::string ep = clusterEndpoint(c, 1);
-        for (std::size_t i = 0; i < statements.size(); ++i) {
-            std::string out, err;
-            EXPECT_EQ(ql(ep, statements[i], &out, &err), 0) << "statement " << i << ": " << statements[i] << "\n" << err;
-            EXPECT_TRUE(err.empty()) << "statement " << i << ": " << err;
-        }
+    ThreeNodes c = startCluster("cw09_ql");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    for (const int id : c.runningNodes()) awaitLevel(c.node(id));
+    ASSERT_FALSE(HasFatalFailure());
+    const std::string ep = clusterEndpoint(c, 1);
+    for (std::size_t i = 0; i < statements.size(); ++i) {
         std::string out, err;
-        ASSERT_EQ(ql(ep, "show topic user;", &out, &err), 0) << err;
-        EXPECT_NE(out.find("partitions 1"), std::string::npos) << out;
-        EXPECT_NE(out.find("key.index on"), std::string::npos) << out;
-        EXPECT_NE(out.find("autoincrement on (reserve 4096, max 9007199254740991)"), std::string::npos) << out;
-        EXPECT_NE(out.find("partitioner modulo"), std::string::npos) << out;
-        EXPECT_NE(out.find("autoIncrementCounter 1"), std::string::npos) << out;
-        ASSERT_EQ(ql(ep, "show topic character;", &out, &err), 0) << err;
-        EXPECT_NE(out.find("partitions 1"), std::string::npos) << out;
-        ASSERT_EQ(ql(ep, "show view device_history;", &out, &err), 0) << err;
-        EXPECT_NE(out.find("keyspec (userId, deviceFp)"), std::string::npos) << out;
-        EXPECT_NE(out.find("group by (userId, deviceFp)"), std::string::npos) << out;
+        EXPECT_EQ(ql(ep, statements[i], &out, &err), 0) << "statement " << i << ": " << statements[i] << "\n" << err;
+        EXPECT_TRUE(err.empty()) << "statement " << i << ": " << err;
     }
+    std::string out, err;
+    ASSERT_EQ(ql(ep, "show topic user;", &out, &err), 0) << err;
+    EXPECT_NE(out.find("partitions 1"), std::string::npos) << out;
+    EXPECT_NE(out.find("key.index on"), std::string::npos) << out;
+    EXPECT_NE(out.find("autoincrement on (reserve 4096, max 9007199254740991)"), std::string::npos) << out;
+    EXPECT_NE(out.find("partitioner modulo"), std::string::npos) << out;
+    EXPECT_NE(out.find("autoIncrementCounter 1"), std::string::npos) << out;
+    ASSERT_EQ(ql(ep, "show topic character;", &out, &err), 0) << err;
+    EXPECT_NE(out.find("partitions 1"), std::string::npos) << out;
+    ASSERT_EQ(ql(ep, "show view device_history;", &out, &err), 0) << err;
+    EXPECT_NE(out.find("keyspec (userId, deviceFp)"), std::string::npos) << out;
+    EXPECT_NE(out.find("group by (userId, deviceFp)"), std::string::npos) << out;
+}
 
-    ThreeNodes c = ThreeNodes::start("cw09_ql_f");
+// The whole script with `-f` on a fresh cluster.
+TEST(CheckedWritesQlBrokerRegression, RegressorsPathWholeScriptThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    const std::string golden = std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql";
+    ThreeNodes c = startCluster("cw09_ql_f");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     for (const int id : c.runningNodes()) awaitLevel(c.node(id));
     ASSERT_FALSE(HasFatalFailure());
@@ -519,7 +531,7 @@ TEST(CheckedWritesQlBrokerRegression, ScanSelectPagesShardRegression) {
 // A follower seed: the client follows the Redirect to the partition leader and prints the leader's counters.
 TEST(CheckedWritesQlBrokerRegression, StatsFromAFollowerRedirectsThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw08_stf");
+    ThreeNodes c = startCluster("cw08_stf");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     for (const int id : c.runningNodes()) awaitLevel(c.node(id));
     ASSERT_FALSE(HasFatalFailure());
