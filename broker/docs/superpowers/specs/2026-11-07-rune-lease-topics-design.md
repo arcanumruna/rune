@@ -1177,6 +1177,44 @@ hold one session per client, for example one per tenant client for case claims (
 - **Updates are separate.** `update(ref, rowBytes)` sends a fenced `Put`+`update` at once. It is a separate write and
   does not keep the lease alive (etcd: a put does not renew).
 
+- **As built (Task 15) - deviations from the text above.**
+  - **`grantSentNs`.** `add(topic, row, version, ttlMs, grantSentNs)` takes the client-clock time at which the grant (or
+    the update that produced `version`) was SENT, from `Client::nowNs()`. The margin `M` and the at-risk deadline are
+    computed from it, never from the reply time.
+  - **`bindProducer` replaces `ProducerOptions.guard`.** `bindProducer(ref, producer)` binds a producer to one lease after
+    the fact. At most 8 producers per lease; a 9th, a stale ref, or a producer of another client is refused with
+    `InvalidArgument`. The bind itself travels through the producer's own ring (`kMsgGuardBind`), in FIFO order with its
+    records; in Direct ingress it is applied in place. A ring-side refusal (unknown session) comes back as a `BindRefused`
+    event and the producer stays blocked.
+  - **Phase-preserving spread.** An entry's cadence is its own phase (`grant + k * ttl/3`). After a send the phase moves on
+    by whole periods past `now + ttl/12` (the early window in which a request may carry an entry that is not yet due); it
+    is never re-anchored to the send time, so a spread fleet does not collapse into one burst.
+  - **`LeaseAtRisk` = 0xFF01.** A client-local error code (`ClientErrorCode::LeaseAtRisk`, not a broker code) carried by
+    the `DeliveryFailed` completions of writes that the produce guard fails when a lease trips.
+  - **Revoke template row.** The fenced revoke of a typed topic is a row encoded once from a default-constructed `T`
+    (`setRevokeTemplate`, stored at `open`), so the session revokes by key alone and never needs the user's row. `T` must
+    be default-constructible.
+  - **A producer of an ended lease stays blocked.** After `Ended` (the lease left the session by loss, `remove`, or `close`)
+    the bound producer does not resume: its writes keep failing with `LeaseAtRisk`. After `Tripped` it resumes only at
+    `Rearmed` (`Cleared`).
+  - **Guard events: one pool, ack and coalescing.** The duty thread posts guard events (Reserved, ReserveFailed, Tripped,
+    Rearmed, Ended, BindRefused) into the session's queue from one session-level pool of `P = 2 * Capacity + 8` credits,
+    reserved at construction and returned in the destructor after `GuardRelease`. Guard completions carry 0 units and 0
+    bytes on the consumer side. The duty side posts only while `posted - acked < P`; the session sends `GuardAck(consumed)`
+    at most once per `doWork`. Each slot keeps at most two pending edges, so Tripped, Rearmed, Tripped, Rearmed collapses to
+    Tripped, Rearmed with the latest `armSeq`. The queue therefore never overflows however many edges occur between two
+    session passes.
+  - **Multi-entry keepalive credit.** The session reserves `48 * (1 + N)` bytes for a request of `N` entries. Each entry's
+    completion returns 48 bytes (`reserved0` = the entry index); the terminal (`reserved0` = 0xFFFF) returns
+    `48 * (1 + unanswered)`. A duplicate or out-of-range index is dropped. A whole-request answer is expanded by the
+    client into per-entry completions for the entries not yet answered, then a terminal `Ok`.
+  - **Token layout.** Tokens are limited to 48 bits: kind in bits 44-47 (keepalive, best-effort revoke, close revoke), the
+    request index or slot in bits 32-43, the generation in the low 32 bits. `Capacity` is therefore at most 4095.
+  - **No `offerAttempt_` check.** The recipe's check on the transport offer attempt is unreachable, because the guard blocks
+    the producer before any re-send, and was not built. Its mutation (skip the guard's block in `appendRecord_`) turns
+    `GuardBlocksReconnectResendRegression` red instead; that test has a second leg (trip, rearm, new in-flight writes, trip
+    again: the second trip fails them and a reconnect sends no frame).
+
 ### 12.3 `LeaseMutex` and `LeaseElection` (etcd `concurrency.Mutex` / `Election`)
 
 These are client recipes over a one-partition lease topic keyed by `path string(N ≤ 128)`. Every operation is async

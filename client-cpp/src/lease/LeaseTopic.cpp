@@ -1,6 +1,8 @@
 // src/lease/LeaseTopic.cpp - the non-template core of LeaseTopic<T> (Task 14a): writes and routed requests.
 #include <rune/client/lease/LeaseTopic.h>
 
+#include <rune/codec/Descriptor.h>
+#include <rune/codec/Serialize.h>
 #include <rune/protocol/LeaseRecord.h>
 
 #include <algorithm>
@@ -80,6 +82,50 @@ OpResult LeaseTopicCore::write(OpKind kind, std::span<const uint8_t> key, std::s
     putLe64(row + rune::protocol::record::kLeaseRemainingValueOffset, 0);
     return toOpResult(producer_.trySendLease(topicId_, partitionOf(key), key, std::span<const uint8_t>(row, rowBytes), intent,
                                              static_cast<uint8_t>(op), kind, *target.cq, token));
+}
+
+void LeaseTopicCore::setRevokeTemplate(std::span<const uint8_t> row, std::span<const uint8_t> descriptorBlob) {
+    revokeKeyOffset_ = 0;
+    revokeKeyWidth_  = 0;
+    try {
+        const rune::codec::Descriptor d = rune::codec::deserialize(descriptorBlob);
+        for (const auto& f : d.fields) {
+            if (!f.isKey || f.sinceVersion > version_ || version_ >= f.untilVersion) continue;
+            revokeKeyOffset_ = 4u + f.offset;
+            revokeKeyWidth_  = rune::codec::fieldWidth(f);
+            break;
+        }
+    } catch (...) {
+        revokeKeyWidth_ = 0;   // a schema we cannot read: revokeKey refuses
+    }
+    revokeRow_.assign(row.begin(), row.end());
+    if (revokeRow_.size() >= 4) {   // the same schema-version stamp LeaseTopic::encode_ applies
+        revokeRow_[2] = static_cast<uint8_t>(version_ & 0xffu);
+        revokeRow_[3] = static_cast<uint8_t>((version_ >> 8) & 0xffu);
+    }
+    if (scratch_.size() < revokeRow_.size()) scratch_.resize(revokeRow_.size());   // so a revoke never grows the scratch
+}
+
+OpResult LeaseTopicCore::revokeKey(std::span<const uint8_t> key, int64_t version, const LeaseOptions& opts, CompletionTarget target,
+                                   Token token) noexcept {
+    if (closed_ || revokeRow_.size() < kMinLeaseRowBytes || revokeRow_.size() > scratch_.size()) return OpResult::InvalidArgument;
+    if (revokeKeyWidth_ == 0 || key.size() != revokeKeyWidth_ || revokeKeyOffset_ + revokeKeyWidth_ > revokeRow_.size())
+        return OpResult::InvalidArgument;
+    std::memcpy(scratch_.data(), revokeRow_.data(), revokeRow_.size());
+    std::memcpy(scratch_.data() + revokeKeyOffset_, key.data(), key.size());   // the row's key column must equal the record key
+    return write(OpKind::LeaseRevoke, key, revokeRow_.size(), version, opts, target, token);
+}
+
+OpResult LeaseTopicCore::writeRaw(OpKind kind, std::span<const uint8_t> key, std::span<const uint8_t> row, int64_t version,
+                                  const LeaseOptions& opts, CompletionTarget target, Token token) noexcept {
+    if (closed_ || row.size() < kMinLeaseRowBytes) return OpResult::InvalidArgument;
+    if (row.size() > scratch_.size()) {   // cold: the high-water mark grows once
+        try { scratch_.resize(row.size()); } catch (...) { return OpResult::InvalidArgument; }
+    }
+    std::memcpy(scratch_.data(), row.data(), row.size());
+    scratch_[2] = static_cast<uint8_t>(version_ & 0xffu);
+    scratch_[3] = static_cast<uint8_t>((version_ >> 8) & 0xffu);
+    return write(kind, key, row.size(), version, opts, target, token);
 }
 
 OpResult LeaseTopicCore::keepAliveOnce(std::span<const uint8_t> key, int64_t version, const LeaseOptions& opts,

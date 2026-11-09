@@ -7,6 +7,7 @@
 // addEndpoint() adds worker endpoints, each with its OWN ack publication on the
 // client's egress channel (shard-mode brokers ack from a different publication).
 #pragma once
+#include <rune/protocol/client/LeaseMessages.h>
 
 #include "AeronTestErrors.h"
 #include <rune/client/codec/Codec.h>
@@ -403,6 +404,66 @@ struct InvokerGateway {
     /// the endpoint the frame arrived on; the handler answers through send() /
     /// sendError() / sendDdlResponse().
     std::map<uint16_t, std::function<void(int endpoint, const uint8_t*, std::size_t)>> templateHandlers;
+    // ---- Task 15: LeaseKeepAlive (96).  Every request is recorded; the test answers it (answerKa / answerKaWhole), or kaAutoOk does. ----
+    struct KaEntry { std::vector<uint8_t> key; int64_t version = 0; };
+    struct KaSeen {
+        int64_t  corr = 0, sessionId = 0;
+        int32_t  topicId = 0, partition = 0;
+        int      endpoint = 0;
+        std::vector<KaEntry> entries;
+    };
+    struct KaAnswer { uint16_t index = 0; uint16_t code = 0; uint64_t ttlMs = 0; };
+    std::vector<KaSeen> kaSeen;
+    bool     kaAutoOk    = false;   // answer every entry Ok at once (one final frame)
+    uint64_t kaAutoTtlMs = 3000;    // ... with this ttl
+    bool     kaRecord    = true;    // false: do not record (kaAutoOk only; keeps the stub from growing)
+    uint64_t kaCount     = 0;       // requests seen (recorded or not)
+    /// One LeaseKeepAliveResponse frame for the recorded request `i`.
+    void answerKa(std::size_t i, std::span<const KaAnswer> answers, bool final) {
+        namespace rp = rune::protocol::client;
+        const KaSeen& k = kaSeen.at(i);
+        std::vector<rp::LeaseKeepAliveResponse::Entry> es;
+        for (const KaAnswer& a : answers) es.push_back({a.index, a.code, a.ttlMs});
+        rp::LeaseKeepAliveResponse r;
+        r.sessionId = k.sessionId;
+        r.correlationId = k.corr;
+        r.final = final ? 1 : 0;
+        r.entries = es;
+        std::vector<uint8_t> out(r.encodedSize());
+        const std::size_t n = r.encode(out.data());
+        send(k.endpoint, out.data(), n);
+    }
+    /// A whole-request answer (index 0xFFFF, final) to the recorded request `i`.
+    void answerKaWhole(std::size_t i, uint16_t code, uint64_t ttlMs) {
+        const KaAnswer a{rune::protocol::client::kLeaseWholeRequest, code, ttlMs};
+        answerKa(i, std::span<const KaAnswer>(&a, 1), true);
+    }
+    void onLeaseKeepAlive_(int endpoint, const uint8_t* buf, std::size_t len) {
+        namespace rp = rune::protocol::client;
+        const auto m = rp::LeaseKeepAlive::decode(buf, len);
+        if (!m) return;
+        ++kaCount;
+        if (kaRecord) {
+            KaSeen k;
+            k.corr = m->correlationId; k.sessionId = m->sessionId; k.topicId = m->topicId; k.partition = m->partition; k.endpoint = endpoint;
+            (void)rp::forEachLeaseKeepAliveEntry(m->entryBytes, m->count, [&](uint16_t, std::span<const uint8_t> key, int64_t v) {
+                k.entries.push_back(KaEntry{std::vector<uint8_t>(key.begin(), key.end()), v});
+            });
+            kaSeen.push_back(std::move(k));
+        }
+        if (!kaAutoOk) return;
+        std::vector<rp::LeaseKeepAliveResponse::Entry> es;
+        es.reserve(m->count);
+        for (uint16_t i = 0; i < m->count; ++i) es.push_back({i, 0, kaAutoTtlMs});
+        rp::LeaseKeepAliveResponse r;
+        r.sessionId = m->sessionId;
+        r.correlationId = m->correlationId;
+        r.final = 1;
+        r.entries = es;
+        std::vector<uint8_t> out(r.encodedSize());
+        const std::size_t n = r.encode(out.data());
+        send(endpoint, out.data(), n);
+    }
     /// A DdlResponse (78) from endpoint `from`.
     void sendDdlResponse(int from, const rune::protocol::client::DdlResponse& r) {
         std::vector<uint8_t> out(r.encodedSize());
@@ -468,6 +529,7 @@ struct InvokerGateway {
     std::vector<int64_t> pingCorrIds; // correlationIds of the Pings received
     bool    replySchemas    = false;  // DefineTopic / GetTopicSchema -> their responses
     int32_t schemaTopicId   = 7;
+    int32_t schemaPartitionCount = 0;   // the GetTopicSchema reply's partitionCount (0 = not reported)
     uint16_t schemaVersion  = 1;
     uint16_t schemaErrorCode = 0;
     std::vector<uint8_t> schemaBlob;  // the GetTopicSchema descriptor blob
@@ -2212,6 +2274,9 @@ private:
             send(0, out.data(), n);
             return;
         }
+        case rcc::TemplateId::LeaseKeepAlive:
+            onLeaseKeepAlive_(endpoint, buf, len);
+            return;
         case rcc::TemplateId::GetTopicSchema: {
             ++schemaGets;
             const auto g = rp::GetTopicSchema::decode(buf, len);
@@ -2220,6 +2285,7 @@ private:
             r.sessionId      = g->sessionId;
             r.correlationId  = g->correlationId;
             r.topicId        = schemaTopicId;
+            r.partitionCount = schemaPartitionCount;
             r.version        = schemaVersion;
             r.errorCode      = schemaErrorCode;
             r.descriptorBlob = schemaBlob.data();

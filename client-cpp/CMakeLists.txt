@@ -513,6 +513,8 @@ if(aeron_FOUND)
         src/security/SecurityReader.cpp
         src/lease/LeaseTopic.cpp
         src/lease/LeaseWire.cpp
+        src/lease/LeaseGuards.cpp
+        src/lease/LeaseSession.cpp
     )
     target_include_directories(rune_client_api PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -1655,6 +1657,7 @@ if(BUILD_TESTING)
             tests/client/CheckedWritesTypedTopicCqTest.cpp   # checked writes: TypedTopic cq forms, ProducerRef
             tests/client/CheckedWritesClientStatsTest.cpp    # checked writes Part 08: getStats over GetStats 91
             tests/client/LeaseTopicTest.cpp                  # lease topics Task 14a: LeaseTopic<T> writes and requests
+            tests/lease/LeaseSessionTest.cpp                 # lease topics Task 15: LeaseSession and the produce guard
             tests/client/IngressEndpointRoutingTest.cpp
             tests/client/ClientResponseEgressRegressionTest.cpp   # NAT egress Task 7
             tests/producer/ProducerRouteParkTest.cpp

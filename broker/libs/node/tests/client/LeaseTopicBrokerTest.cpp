@@ -10,6 +10,7 @@
 
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
+#include <rune/client/lease/LeaseSession.h>
 #include <rune/client/lease/LeaseTopic.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
@@ -310,4 +311,70 @@ TEST(LeaseTopicBrokerRegression, SubscribeSeesLeaseOpsRegression) {
     EXPECT_NE(seen[1].op, rc::RecordOp::Delete);
     EXPECT_EQ(seen[2].op, rc::RecordOp::Delete) << "a revoke is the lease's deletion";
     EXPECT_EQ(seen[0].offset, g.version);
+}
+
+namespace {
+struct NoLost {
+    int* n;
+    void operator()(rc::LeaseRef, rc::LostReason) const { ++*n; }
+};
+struct NoRisk {
+    int* n;
+    void operator()(rc::LeaseRef, rc::AtRiskEdge) const { ++*n; }
+};
+}  // namespace
+
+// Task 15: a LeaseSession keeps three real leases alive across several ttl/3 periods (ttl 1 s), then close() revokes them all.
+TEST(LeaseTopicBrokerRegression, SessionKeepsAliveAndClosesRegression) {
+    OneBroker b("lease-session", OneBroker::Runtime::Shard);
+    rc::Client& c = *b.connectClient();
+    defineLease(c, "claims", 2, "claim", claimBlob());
+    auto lt = c.openLeaseTopicAndWait<LeaseClaim>("claims", {}, 30s);
+
+    int lost = 0, risk = 0;
+    rc::LeaseSession<8, NoLost, NoRisk> session(c, NoLost{&lost}, NoRisk{&risk});
+    rc::LeaseOptions o;
+    o.ttlMs = 1000;
+    std::vector<rc::LeaseRef> refs;
+    std::vector<LeaseClaim>   rows;
+    for (int i = 0; i < 3; ++i) {
+        const LeaseClaim row = claimRow("sess-" + std::to_string(i));
+        const int64_t    sentNs = c.nowNs();
+        const rc::LeaseResult g = lt.grantAndWait(row, o);
+        ASSERT_TRUE(g.ok()) << int(g.status) << " " << g.errorCode;
+        rc::OpResult err = rc::OpResult::Accepted;
+        const rc::LeaseRef ref = session.add(lt, row, g.version, 1000, sentNs, &err);
+        ASSERT_EQ(err, rc::OpResult::Accepted);
+        refs.push_back(ref);
+        rows.push_back(row);
+    }
+    // Drive the session on this thread until every key has had 2 keepalives answered Ok (3 keys x 2), within a 5 s wall cap.
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (session.core().okAnswers() < 6 && std::chrono::steady_clock::now() < deadline) {
+        session.doWork(c.nowNs());
+        std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_GE(session.core().okAnswers(), 6u);
+    EXPECT_EQ(lost, 0);
+    EXPECT_EQ(risk, 0) << "a healthy single node never puts a lease at risk";
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        EXPECT_EQ(session.stateOf(refs[i]), rc::LeaseEntryState::Held);
+        rc::LeaseTtlInfo info;
+        const rc::LeaseResult ttl = lt.timeToLiveAndWait(rows[i], &info);
+        ASSERT_TRUE(ttl.ok()) << "the lease is live after the keepalives";
+        EXPECT_GT(info.remainingMs, 0);
+    }
+    session.close();
+    const auto closeDeadline = std::chrono::steady_clock::now() + 10s;
+    while (!session.isClosed() && std::chrono::steady_clock::now() < closeDeadline) {
+        session.doWork(c.nowNs());
+        std::this_thread::sleep_for(5ms);
+    }
+    ASSERT_TRUE(session.isClosed());
+    EXPECT_EQ(lost, 0) << "a close is not a loss";
+    for (const LeaseClaim& row : rows) {
+        rc::LeaseTtlInfo info;
+        const rc::LeaseResult ttl = lt.timeToLiveAndWait(row, &info);
+        EXPECT_FALSE(ttl.ok()) << "close() revoked the lease: status " << int(ttl.status) << " err " << ttl.errorCode << " remaining " << info.remainingMs << " ver " << info.version;
+    }
 }

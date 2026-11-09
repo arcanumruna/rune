@@ -805,6 +805,10 @@ public:
                                           std::span<const uint8_t> value, WriteIntent intent, uint8_t leaseOp, OpKind kind,
                                           Completions& cq, Token token) noexcept;
 
+    /// Internal (Task 15; LeaseSession::bindProducer): binds this producer to a lease-session guard slot.  The bind travels the producer's own
+    /// ring (FIFO with its writes) or, Direct ingress, is applied in place.  False: no impl, the ring refused it, or it is already bound.
+    [[nodiscard]] bool bindGuard(uint32_t sid, uint32_t slot, uint32_t gen) noexcept;
+
     /// Send one record with `intent` and wait for its verdict: the Send completion, unchanged (status Ok with
     /// value = the record's offset; BrokerError with errorCode 56 / 57 and constraintIdOf() for a refused intent;
     /// BrokerTooOld).  Flushes at once.  Throws std::invalid_argument for a local refusal (see trySend, KeyTooLong,

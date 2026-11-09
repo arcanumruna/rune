@@ -29,6 +29,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <string_view>
 #include <vector>
 
@@ -65,6 +66,19 @@ public:
     [[nodiscard]] OpResult write(OpKind kind, std::span<const uint8_t> key, std::size_t rowBytes, int64_t version,
                                  const LeaseOptions& opts, CompletionTarget target, Token token) noexcept;
 
+    /// Task 15 (LeaseSession): a revoke of `key` at `version` written from the topic's stored REVOKE TEMPLATE row (T{} encoded once at
+    /// open).  The broker re-encodes every revoke from the lease view (spec 6.2, R9), so the template's other columns are ignored.
+    /// Same results as write(); InvalidArgument also when the handle has no template.
+    [[nodiscard]] OpResult revokeKey(std::span<const uint8_t> key, int64_t version, const LeaseOptions& opts, CompletionTarget target,
+                                     Token token) noexcept;
+    /// Task 15: `write` of an already encoded row (`row`, a whole row image of the topic's type) - copied into scratch (growth is cold:
+    /// the high-water mark rule).  The row's schema-version header bytes are stamped with the bound version.
+    [[nodiscard]] OpResult writeRaw(OpKind kind, std::span<const uint8_t> key, std::span<const uint8_t> row, int64_t version,
+                                    const LeaseOptions& opts, CompletionTarget target, Token token) noexcept;
+    /// Stores the revoke template row (cold; the encoded T{} of the topic's type).
+    /// `descriptorBlob` is the topic's schema: the key column's offset in the row is read from it (the broker requires the row's key
+    /// column to equal the record key, so every revoke patches the key into the template).
+    void setRevokeTemplate(std::span<const uint8_t> row, std::span<const uint8_t> descriptorBlob);
     [[nodiscard]] OpResult keepAliveOnce(std::span<const uint8_t> key, int64_t version, const LeaseOptions& opts,
                                          CompletionTarget target, Token token);
     [[nodiscard]] OpResult timeToLive(std::span<const uint8_t> key, const LeaseOptions& opts, CompletionTarget target,
@@ -94,10 +108,24 @@ private:
     uint32_t                     opTimeoutMs_    = 1;
     bool                         closed_         = false;
     std::vector<uint8_t>         scratch_;   ///< the encoded row; grown to the high-water mark, never freed per write
+    uint32_t                     revokeKeyOffset_ = 0;   ///< byte offset of the key column in the row (4 + the field's block offset)
+    uint32_t                     revokeKeyWidth_  = 0;
+    std::vector<uint8_t>         revokeRow_; ///< Task 15: the revoke template row (T{} encoded once)
 
     template <class Issue>
     LeaseResult waitOne_(std::chrono::nanoseconds timeout, Issue&& issue, LeaseTtlInfo* info);
 };
+
+/// Encodes T{} once into the core's revoke template (cold; fromOpen / openLeaseTopicAndWait).
+template <class T>
+void storeRevokeTemplate(LeaseTopicCore& core, std::span<const uint8_t> descriptorBlob) {
+    static_assert(std::is_default_constructible_v<T>, "LeaseTopic<T>: T must be default-constructible (the revoke template row is T{})");
+    const T row{};
+    std::vector<uint8_t> bytes(row.encodedSize());
+    const std::size_t n = row.encode(bytes.data());
+    bytes.resize(n);
+    core.setRevokeTemplate(std::span<const uint8_t>(bytes.data(), bytes.size()), descriptorBlob);
+}
 
 }  // namespace detail
 
@@ -121,12 +149,22 @@ public:
     [[nodiscard]] int32_t partitionCount() const noexcept { return core_.partitionCount(); }
     [[nodiscard]] const rune::protocol::LeaseSpec& spec() const noexcept { return core_.spec(); }
     [[nodiscard]] uint32_t opTimeoutMs() const noexcept { return core_.opTimeoutMs(); }
+    /// The key bytes of `row` (1..128) into `out` (at least kMaxLeaseKeyBytes bytes); false for an empty or too wide key.
+    [[nodiscard]] bool keyBytes(const T& row, uint8_t* out, std::size_t& n) const noexcept {
+        KeyBuf k;
+        if (!keyOf_(row, k)) return false;
+        std::memcpy(out, k.bytes, k.n);
+        n = k.n;
+        return true;
+    }
     /// The partition `row`'s key routes to.
     [[nodiscard]] int32_t partitionOf(const T& row) const noexcept {
         KeyBuf k;
         return keyOf_(row, k) ? core_.partitionOf(k.span()) : 0;
     }
     void close() noexcept { core_.close(); }
+    /// The untyped body (Task 15: what a LeaseSession keeps alive and revokes through).
+    [[nodiscard]] detail::LeaseTopicCore& core() noexcept { return core_; }
     /// The handle's dedicated writer (test seam: producerId() tells when the idempotent identity is assigned).
     [[nodiscard]] Producer& producer() noexcept { return core_.producer(); }
 
@@ -304,8 +342,10 @@ LeaseTopic<T> LeaseTopic<T>::fromOpen(Client& client, const Completion& c, std::
     pc.leaseWrites       = true;
     pc.produceTimeoutMs  = opTimeout;
     pc.deliveryTimeoutMs = opTimeout;
-    return LeaseTopic(detail::LeaseTopicCore(client, client.producer(pc), static_cast<int32_t>(c.value), viewId, partitions,
-                                             kf, *lease, static_cast<uint16_t>(c.aux & 0xFFFFu), opTimeout));
+    detail::LeaseTopicCore core(client, client.producer(pc), static_cast<int32_t>(c.value), viewId, partitions, kf, *lease,
+                                static_cast<uint16_t>(c.aux & 0xFFFFu), opTimeout);
+    detail::storeRevokeTemplate<T>(core, schemaBlobOf(c, payload));
+    return LeaseTopic(std::move(core));
 }
 
 template <class T>
@@ -325,9 +365,10 @@ LeaseTopic<T> Client::openLeaseTopicAndWait(std::string_view name, const LeaseTo
     pc.leaseWrites       = true;
     pc.produceTimeoutMs  = opTimeout;
     pc.deliveryTimeoutMs = opTimeout;
-    return LeaseTopic<T>(detail::LeaseTopicCore(*this, producer(pc), r.topicId, r.leaseViewTopicId,
-                                                typedPartitionCount(r.partitionCount), r.keyFeatures.partitioner, *r.lease,
-                                                r.version, opTimeout));
+    detail::LeaseTopicCore core(*this, producer(pc), r.topicId, r.leaseViewTopicId, typedPartitionCount(r.partitionCount),
+                                r.keyFeatures.partitioner, *r.lease, r.version, opTimeout);
+    detail::storeRevokeTemplate<T>(core, std::span<const uint8_t>(r.descriptorBlob));
+    return LeaseTopic<T>(std::move(core));
 }
 
 }  // namespace rune::client

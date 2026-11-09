@@ -399,12 +399,18 @@ private:
     // batch (reservedBytes / kBatchAckUnitBytes reservations; EOS-OOS:
     // reserved0 carries the batch's producerEpoch).
     static uint32_t unitsOf_(const Completion& c) noexcept {
-        return (c.op == OpKind::BatchAck) ? batchAckUnits(c) : 1u;
+        if (c.op == OpKind::BatchAck) return batchAckUnits(c);
+        // Task 15: the terminal completion of a leaseKeepAliveBatch returns the credit of every entry that got no per-entry
+        // completion too (reservedBytes = 48 * (1 + unanswered)), like a BatchAck returns its records' credit.
+        if (c.op == OpKind::LeaseKeepAlive && c.reserved0 == kLeaseKeepAliveTerminal) return batchAckUnits(c);
+        if (c.op == OpKind::LeaseGuard) return 0u;   // a guard event rides the session's standing pool: no credit moves
+        return 1u;
     }
+    static uint32_t bytesOf_(const Completion& c) noexcept { return c.op == OpKind::LeaseGuard ? 0u : c.reservedBytes; }
 
     // Immediate return of a record's credit: only for a stash entry (not ring space).
     void consumeCredit_(const Completion& c) noexcept {
-        reservedTotal_ -= c.reservedBytes;
+        reservedTotal_ -= bytesOf_(c);
         outstanding_ -= unitsOf_(c);
     }
 
@@ -442,7 +448,7 @@ private:
         DeferredCredit& operator=(const DeferredCredit&) = delete;
         ~DeferredCredit() { apply(); }
         void add(const Completion& c) noexcept {
-            bytes += c.reservedBytes;
+            bytes += bytesOf_(c);
             units += unitsOf_(c);
         }
         void apply() noexcept {

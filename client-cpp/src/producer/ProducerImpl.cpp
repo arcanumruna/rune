@@ -1873,6 +1873,13 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                 FLIGHT_RECORDER_MARK_VAL_PRODUCE(flight_recorder::Site::ClientAgentDrain,
                                          static_cast<uint32_t>(ackHandle),
                                          static_cast<double>(static_cast<uint64_t>(n) * recLen));
+                if (guard_.bound && guardBlocks_()) [[unlikely]] {   // Task 15: see appendRecord_
+                    const uint16_t code = static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk);
+                    emitUnsentBatchAck_(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff), static_cast<int32_t>(n),
+                                        OpStatus::DeliveryFailed, n, code);
+                    completeHandle_(ackHandle, OpKind::Send, -1, 0, OpStatus::DeliveryFailed, code, 0, {}, batchCompletionBytes(n));
+                    return ControlledAction::CONTINUE;
+                }
                 PartitionState& ps = getOrCreatePartition(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff));
                 const uint8_t keyLen = p[kRecKeyLenOff];
                 if (admitBatch_(ps, keyLen, n, recLen, ackHandle) == ControlledAction::ABORT) {
@@ -1889,6 +1896,16 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
             }
             if (msgTypeId == kMsgClaimCreditLost) {
                 noteClaimCreditLost_();
+                return ControlledAction::CONTINUE;
+            }
+            if (msgTypeId == kMsgGuardBind) {   // Task 15: in FIFO order with the records before it
+                if (len >= 12 && hooks_.guardBind != nullptr) {
+                    uint32_t sid, slot, gen;
+                    std::memcpy(&sid, p, 4);
+                    std::memcpy(&slot, p + 4, 4);
+                    std::memcpy(&gen, p + 8, 4);
+                    hooks_.guardBind(hooks_.ctx, *this, sid, slot, gen);
+                }
                 return ControlledAction::CONTINUE;
             }
 
@@ -2064,6 +2081,13 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     uint8_t leaseKind)
 {
     using rune::client::detail::ControlledAction;
+    if (guard_.bound && guardBlocks_()) [[unlikely]] {
+        // Task 15: a guarded producer whose lease is at risk (or gone) appends nothing: the record fails at once.
+        const uint16_t code = static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk);
+        emitUnsentBatchAck_(topicId, partition, 1, OpStatus::DeliveryFailed, 1, code);
+        completeHandle_((flags & kFlagWantAck) ? ackHandle : 0u, OpKind::Send, -1, 0, OpStatus::DeliveryFailed, code);
+        return ControlledAction::CONTINUE;
+    }
     PartitionState& ps = getOrCreatePartition(topicId, partition);
     if (admitRecord_(ps, keyLen, valueLen, flags, ackHandle) == ControlledAction::ABORT) {
         return ControlledAction::ABORT;
@@ -2576,6 +2600,10 @@ int ProducerImpl::flushBatches(
         const uint32_t slot = dirty_[di];
         PartitionState& ps = *partitions_[slot];
         ++flushVisits_;
+        if (guard_.bound && guardBlocks_()) [[unlikely]] {   // Task 15: a blocked guarded producer sends nothing
+            guardFailPartition_(ps, OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk));
+            continue;
+        }
         // ---- EOS-OOS: parked batches whose older batches all resolved go out
         // again FIRST, oldest-first — a new batch sent ahead of them would only
         // meet the same sequence gap.  Back-pressure: nothing new this pass.
@@ -4019,6 +4047,37 @@ int ProducerImpl::refuseRingTxn_(int limit) noexcept {
         poison_(o.status, o.errorCode, AbortKind::Plain);
     }
     return n;
+}
+
+bool ProducerImpl::submitGuardBind(uint32_t sid, uint32_t slot, uint32_t gen) noexcept {
+    if (hooks_.guardBind == nullptr) return false;
+    if (mode_ == IngressMode::Direct) {
+        // Direct ingress: the owner IS the duty thread and appends in place - the bind is applied here, in the owner's own
+        // program order with its writes (no ring hop to reorder against).
+        if (std::this_thread::get_id() != dutyThreadId_) return false;
+        hooks_.guardBind(hooks_.ctx, *this, sid, slot, gen);
+        return true;
+    }
+    uint8_t p[12];
+    std::memcpy(p, &sid, 4);
+    std::memcpy(p + 4, &slot, 4);
+    std::memcpy(p + 8, &gen, 4);
+    return writeToRing(kMsgGuardBind, p, sizeof p);   // FIFO with this producer's records
+}
+
+void ProducerImpl::guardFailPartition_(PartitionState& ps, OpStatus st, uint16_t errorCode) noexcept {
+    ps.inflight.forEachLive([&](InFlightBatch& b) { failBatch_(ps, b, st, errorCode); });
+    failBuilder_(ps, st, errorCode);
+    failQueuedTier2_(ps, st, errorCode);
+    ps.builderBytes   = 0;
+    ps.batchStartNs   = 0;
+    ps.flushRequested = false;
+    ps.resendParked   = false;
+    ps.routeResend    = false;
+    ps.routeParked    = false;
+    ps.laneWait       = false;
+    ps.dirty          = false;
+    reclaimAckRing_(ps);
 }
 
 void ProducerImpl::failRoutedBroker(RouteFailFn pred, void* ctx) noexcept {

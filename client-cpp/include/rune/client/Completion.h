@@ -72,7 +72,15 @@ enum class OpKind : uint8_t {
     ScanLeases,         ///< LeaseTopic::scanLeases(); value = asOfOffset, aux = lastHash, reserved0 = rowCount | done << 31, payload = rows
     LeaseCampaign,      ///< reserved (Task 16): no producer yet
     LeaseWatchReady,    ///< reserved (Task 20): no producer yet
+    LeaseGuard,         ///< Task 15: a LeaseSession's produce-guard event (detail::GuardEvent): token = the session id, value = slot, aux = gen, reserved0 = event | armSeq << 8; never carries credit
 };
+
+/// Client-local error codes (Completion::errorCode): the range 0xFF00-0xFFFE is never on the wire and never a broker code.
+enum class ClientErrorCode : uint16_t {
+    LeaseAtRisk = 0xFF01,   ///< a guarded producer's write failed because its lease is at risk or gone (LeaseSession)
+};
+/// The terminal completion of a Client::leaseKeepAliveBatch request (Completion::reserved0); entry completions carry the entry index.
+inline constexpr uint32_t kLeaseKeepAliveTerminal = 0xFFFF;
 
 enum class OpStatus : uint8_t {
     Ok = 0,

@@ -346,6 +346,11 @@ SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const 
     return r;
 }
 
+bool Producer::bindGuard(uint32_t sid, uint32_t slot, uint32_t gen) noexcept {
+    if (!impl_ || impl_->guardBound()) return false;
+    return impl_->submitGuardBind(sid, slot, gen);
+}
+
 SendResult Producer::trySendLease(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
                                   std::span<const uint8_t> value, WriteIntent intent, uint8_t leaseOp, OpKind kind,
                                   Completions& cq, Token token) noexcept {

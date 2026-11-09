@@ -43,6 +43,7 @@
 #include <rune/client/TopicHandle.h>
 #include <rune/client/detail/CompletionRing.h>
 #include <rune/client/detail/OpTarget.h>
+#include <rune/client/lease/detail/LeaseGuards.h>
 #include <rune/client/producer/Producer.h>
 
 #include <rune/protocol/RecordBatch.h>
@@ -87,6 +88,8 @@ inline constexpr int32_t kMsgTxnControl  = 5; // Phase 2b F: a transaction contr
 inline constexpr int32_t kMsgTier2Discard  = 6; // #341: a Tier-2 slot whose builder died off the batch thread
 inline constexpr int32_t kMsgClaimCreditLost = 7; // #322: a credit claim aborted off its queue's owner thread
 inline constexpr int32_t kMsgDirectClaimAbort = 8; // #656: an Invoker claim aborted / destroyed off its owner thread: the owner rolls it back (payload: the claim's gen, 8 bytes LE, then one byte: 1 = the claim held cq / bq credit)
+
+inline constexpr int32_t kMsgGuardBind = 10; // Task 15: bind this producer to a lease guard slot; payload sid u32, slot u32, gen u32 (LE); applied in FIFO order with the producer's own writes
 
 inline constexpr int32_t kMsgSendLeaseRecord = 9; // Task 14a: SEND_LEASE_RECORD - a lease topic write (key up to 128 bytes; layout below)
 
@@ -1050,6 +1053,8 @@ public:
         /// F8c C7: the handle's §3.3 release (HubCommand::HandleRelease).
         /// Absent (bare rig): no duty side — the handle frees the impl alone.
         detail::HubCommandSink release = nullptr;
+        /// Task 15 (duty side): attach `impl` to guard slot (sid, slot, gen) of the Client's LeaseGuards.
+        void (*guardBind)(void* ctx, ProducerImpl& impl, uint32_t sid, uint32_t slot, uint32_t gen) noexcept = nullptr;
     };
     /// Set once by Client::producer() before the handle is returned.
     void setHooks(const Hooks& h) noexcept { hooks_ = h; }
@@ -1216,6 +1221,24 @@ public:
     /// of a close applied inside a handler).  Everything it calls is non-
     /// throwing (handlers are noexcept function pointers; no allocation).
     void failAllPending(OpStatus st, uint16_t errorCode = 0) noexcept;
+    // ---- Task 15: lease guard (duty thread) ------------------------------------------------------------------
+    /// The producer is bound to a lease whose guard slot is not Armed with the bound generation (tripped, ended, reused, or
+    /// the session gone): nothing may be appended or sent.  One compare when unbound.
+    [[nodiscard]] bool guardBlocks_() const noexcept {
+        return guard_.bound && (guard_.dead || guard_.entry->gen != guard_.gen ||
+                                guard_.entry->state != detail::GuardEntry::State::Armed);
+    }
+    /// Fails everything the producer accepted and not yet acknowledged (in flight, builder, Tier-2, deferred, ring) with `st` /
+    /// `errorCode`; the producer stays open.  Idempotent.  Duty thread.
+    void failGuarded(OpStatus st, uint16_t errorCode) noexcept { failAllPending(st, errorCode); }
+    /// The guard's attach / kill (LeaseGuards, duty thread).
+    void guardAttach(const detail::GuardEntry* e, uint32_t gen) noexcept { guard_ = GuardRef{e, gen, true, false}; }
+    void guardKill() noexcept { guard_ = GuardRef{nullptr, 0, true, true}; }   // blocked for good
+    void guardDetach() noexcept { guard_ = GuardRef{}; }
+    [[nodiscard]] bool guardBound() const noexcept { return guard_.bound; }
+    /// Issuing side: bind this producer to guard slot (sid, slot, gen).  Ring mode: a kMsgGuardBind ring message, FIFO with
+    /// the producer's writes; Direct mode (the owner is the duty thread): applied at once.  False: the ring refused it.
+    [[nodiscard]] bool submitGuardBind(uint32_t sid, uint32_t slot, uint32_t gen) noexcept;
     /// Authentication (D26): every batch IN FLIGHT (already sent, unanswered) completes BrokerError `errorCode`
     /// (SessionRevoked) — the answer the broker's closing session can no longer give.  Records not yet sent
     /// are left to the caller's terminal failure path.  Duty thread.
@@ -2261,6 +2284,16 @@ private:
 
     // ---- F8c C6: ack targets (setup phase; read on the duty thread) ------------
     Hooks        hooks_{};
+    /// Task 15: the lease guard slot this producer is bound to (duty-owned).
+    struct GuardRef {
+        const detail::GuardEntry* entry = nullptr;
+        uint32_t                  gen   = 0;
+        bool                      bound = false;
+        bool                      dead  = false;   ///< the guard is gone (session released) or refused the bind: blocked for good
+    };
+    GuardRef     guard_{};
+    /// Fails the partition's unsent work (builder, Tier-2) and in-flight batches with `st` / `errorCode`.
+    void guardFailPartition_(PartitionState& ps, OpStatus st, uint16_t errorCode) noexcept;
     /// The per-record ack target of AckToken sends: none, the scalar form, or the full-Completion form (one enum, no flags).
     struct AckHandler {
         enum class Kind : uint8_t { None, Plain, Full };

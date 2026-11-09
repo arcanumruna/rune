@@ -76,7 +76,10 @@
 #include <rune/protocol/client/StatsMessages.h>
 #include <rune/client/NamespaceLimitFields.h>
 #include <rune/client/lease/LeaseOptions.h>
+#include <rune/client/lease/detail/LeaseGuards.h>
+#include <rune/protocol/client/LeaseMessages.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -369,6 +372,8 @@ using NanoClock = int64_t (*)() noexcept;
 inline constexpr std::size_t kMaxPasswordBytes = detail::kMaxPasswordBytes;
 
 struct ClientConfig {
+    /// Task 15: how many LeaseSessions may be open at once on this client (0 = lease sessions refused).
+    uint32_t    maxLeaseSessions = 64;
     std::string gatewayChannel   = "aeron:ipc";
     int32_t     gatewayStreamId  = 1;
     std::string egressChannel    = "aeron:ipc";
@@ -1035,6 +1040,21 @@ public:
     /// aux = the lease's ttlMs, or BrokerError with errorCode = the entry's code.  Zero-alloc after warm-up.
     OpResult leaseKeepAlive(int32_t topicId, int32_t partition, std::span<const uint8_t> key, int64_t version,
                             uint32_t timeoutMs, CompletionTarget target, Token token);
+    /// Task 15: LeaseKeepAlive with `entries` (1..256) for ONE topic partition, for a LeaseSession.  `target.cq` is required and the CALLER has
+    /// already reserved 48 x (1 + entries.size()) bytes on it (one reserve(48) per entry plus one for the terminal): nothing is reserved or
+    /// unreserved here.  Accepted is followed by one completion per answered entry (OpKind::LeaseKeepAlive, reserved0 = the entry index, aux =
+    /// the ttlMs, errorCode = the entry's code, 48 reserved bytes) and exactly one terminal (reserved0 == kLeaseKeepAliveTerminal, status Ok
+    /// when every entry was answered, else the failure; it returns 48 x (1 + unanswered) bytes).  An index answered twice, or >= entries, is
+    /// dropped.  InvalidArgument when the frame exceeds leaseKeepAliveBudgetBytes(); on any non-Accepted result the caller unreserves.
+    OpResult leaseKeepAliveBatch(int32_t topicId, int32_t partition, std::span<const rune::protocol::client::LeaseKeepAlive::Entry> entries,
+                                 uint32_t timeoutMs, CompletionTarget target, Token token);
+    /// The most bytes one leaseKeepAliveBatch frame may encode (the smaller of the transport frame and the command ring's record limit).
+    [[nodiscard]] std::size_t leaseKeepAliveBudgetBytes() const noexcept;
+    /// The injected (or steady) monotonic clock, the one every duty-side deadline uses.
+    [[nodiscard]] int64_t nowNs() const noexcept { return now(); }
+    /// Task 15: submits a guard command (GuardReserve/Arm/End/Release/Ack) to the duty thread: applied in place on the duty thread, else
+    /// through the agent's command ring.  False when the ring is full or closed.
+    [[nodiscard]] bool submitGuardCommand(const detail::HubCommand& cmd);
     /// LeaseTimeToLive (wire 98).  Completion: OpKind::LeaseTimeToLive, value = version, aux = remainingMs (-1 none), payload =
     /// the 32 LE bytes {grantedTtlMs u64, remainingMs i64, version i64, holder u64}.
     OpResult leaseTimeToLive(int32_t topicId, int32_t partition, std::span<const uint8_t> key, uint32_t timeoutMs,
@@ -1643,6 +1663,12 @@ private:
         struct CtlAwaitingSeed { std::vector<uint8_t> frame; };
         std::variant<std::monostate, RoutedCtlPending, CtlAwaitingSeed> ddl;   // catalog history: a DDL's own state
         detail::SecretString newPassword;   // review B I4: a self SET PASSWORD's plaintext until its answer (wiped always)
+        /// Task 15: a multi-entry LeaseKeepAlive (leaseKeepAliveBatch).  multiCount > 0: each answered entry delivers its own completion
+        /// (reserved0 = the entry index, 48 reserved bytes); the op's terminal completion (reserved0 == kLeaseKeepAliveTerminal) carries
+        /// 48 x (1 + unanswered entries).  multiBits marks the entries answered so far (a duplicate or out-of-range index is dropped).
+        uint16_t                multiCount    = 0;
+        uint16_t                multiAnswered = 0;
+        std::array<uint64_t, 4> multiBits{};
     };
 
     /// Header of a kMsgControlOp ring record (followed by the op's frame).
@@ -1660,6 +1686,8 @@ private:
         uint32_t          requestIdAt   = 0;
         uint16_t          secretLen     = 0;   // review B I4: trailing bytes of the record's frame area that are a secret, not wire
         uint32_t          timeoutMs     = 0;   // Task 14a: a per-op deadline (0 = the op kind's configured default)
+        uint16_t          multiCount    = 0;   // Task 15: entries of a leaseKeepAliveBatch (0 = an ordinary op)
+        uint16_t          pad2          = 0;
     };
 
     /// A handler completion deferred while close() runs (delivered after every
@@ -1833,7 +1861,7 @@ private:
     /// op's PendingCtl::newPassword (a self SET PASSWORD's plaintext, installed on OK) — never sent, wiped on any outcome.
     OpResult issueControl_(OpKind op, CompletionTarget target, Token token,
                            std::span<const uint8_t> frame, uint32_t payloadHint, uint32_t requestIdAt = 0,
-                           std::span<const uint8_t> secret = {}, uint32_t timeoutMs = 0);
+                           std::span<const uint8_t> secret = {}, uint32_t timeoutMs = 0, uint16_t multiCount = 0);
     // ---- Catalog history (Task 5): DDL issue + answers (duty thread, cold) ----
     /// The DDL extension of `ddl` (views into `ddl` / cfg_; requestId as given).
     [[nodiscard]] rune::protocol::client::DdlExtension ddlExt_(const DdlOptions& ddl) const noexcept;
@@ -1936,7 +1964,7 @@ private:
     /// an ack that arrived earlier in the same poll is applied before a resend.
     int  routeBufferedAcks_();
     [[nodiscard]] int64_t now() const noexcept {
-        return cfg_.nanoClock != nullptr ? cfg_.nanoClock() : nowNs();
+        return cfg_.nanoClock != nullptr ? cfg_.nanoClock() : steadyNs_();
     }
 
     /// Shared implementation of producer() / testProducerWithRingCap().
@@ -2160,6 +2188,12 @@ private:
     /// F8a: apply one hub command on the duty thread (ring drain, close drain,
     /// or directly when a handle is used on the duty thread).
     void applyHubCommand_(const detail::HubCommand& cmd);
+    /// Task 15: GuardReserve/Arm/End/Release/Ack (duty thread).
+    void applyGuardCommand_(const detail::HubCommand& cmd);
+    static void guardBindTrampoline_(void* ctx, producer::ProducerImpl& impl, uint32_t sid, uint32_t slot, uint32_t gen) noexcept;
+    /// Task 15: one LeaseKeepAliveResponse frame for the multi-entry pending op at index i.
+    void onKeepAliveBatchAnswer_(std::size_t i, const rune::protocol::client::LeaseKeepAliveResponse& r);
+    std::vector<uint8_t> batchFrame_;   // leaseKeepAliveBatch's encode buffer (owner thread; grown once)
     /// fix3 I3: the duty-thread DIRECT application (acts on the impl).
     void applyHubCommandDirect_(const detail::HubCommand& cmd);
     /// The thread whose handle calls take the duty path: the Thread-mode runner;
@@ -2233,7 +2267,7 @@ private:
     // Helpers
     // -------------------------------------------------------------------------
 
-    static int64_t nowNs() noexcept {
+    static int64_t steadyNs_() noexcept {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
@@ -2377,6 +2411,7 @@ private:
     // ---- CB-2: ProducerHub + topic registry ----------------------------------
     // Hub is owned by Client and wired into the agent before start().
     producer::ProducerHub producerHub_;
+    detail::LeaseGuards leaseGuards_;   // Task 15: duty-owned lease-session guard blocks
 
     std::vector<PendingRelease> releases_;  // duty-thread owned (C7)
     std::vector<PendingRelease> orphans_;   // duty-thread owned (C7 F1): orphaned, not yet applied
