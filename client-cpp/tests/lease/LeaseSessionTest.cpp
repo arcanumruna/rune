@@ -1030,6 +1030,14 @@ TEST(LeaseSessionRegression, InvokerModeOrderRegression) {
     r.session->doWork(g_now);
     ASSERT_EQ(r.cb.entered(), 1);
     EXPECT_EQ(seen, 4) << "the producer's failures were delivered before the callback ran";
+    // Direct ingress: a write while at risk is appended in place (appendRecord_) and must fail at once, with no frame.
+    const std::size_t frames = r.gw.produceFrameBytes.size();
+    const int failedBefore = d.failed;
+    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal, pq, ++tok), rc::SendResult::Ok);
+    r.settle();   // no flush: only the append-time block (not the flush-time one) can fail it, linger being 60 s
+    d.run(pq);
+    EXPECT_EQ(d.failed, failedBefore + 1) << "a Direct-mode write while at risk fails at once with LeaseAtRisk";
+    EXPECT_EQ(r.gw.produceFrameBytes.size(), frames);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------
