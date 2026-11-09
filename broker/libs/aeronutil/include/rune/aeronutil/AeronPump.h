@@ -40,6 +40,7 @@ public:
     }
     /// Idempotent; also valid from another thread than the holder.
     void release() noexcept {
+        if (held() == this) held() = nullptr;   // the TLS pointer must not outlive the gate's owner
         if (owner_.exchange(std::thread::id{}, std::memory_order_relaxed) != std::thread::id{}) unlock();
     }
     /// The gate this thread currently holds, else nullptr.
@@ -97,7 +98,7 @@ public:
 
     AeronPump& withStartupDeadline(std::chrono::milliseconds d) noexcept { startupDeadline_ = d; return *this; }
     [[nodiscard]] std::chrono::milliseconds startupDeadline() const noexcept { return startupDeadline_; }
-    /// True once a kUntilAnswered resolve gave up at startupDeadline().
+    /// True once any kUntilAnswered resolve gave up at startupDeadline().
     [[nodiscard]] bool deadlineExpired() const noexcept { return deadlineExpired_; }
 
     /// Probe `find` until it yields a truthy value, `budget` elapses (never, for kUntilAnswered),
@@ -109,10 +110,15 @@ public:
         using clock = std::chrono::steady_clock;
         const bool capped = budget == kUntilAnswered;
         const auto deadline = clock::now() + (capped ? startupDeadline_ : budget);
+        bool lastTry = false;
         for (;;) {
             auto r = find();
             if (r || (failed && *failed)) return r;
-            if (clock::now() >= deadline) { deadlineExpired_ = capped; return r; }
+            if (clock::now() >= deadline) {
+                // After a process pause the pump thread has not run since the resume: one more pump or sleep, then find.
+                if (lastTry) { if (capped) deadlineExpired_ = true; return r; }
+                lastTry = true;
+            }
             if (invoker()) {
                 if (pump() < 0) return r;                      // refused: fail fast
             } else if (StartupClientGate* g = StartupClientGate::heldHere()) {

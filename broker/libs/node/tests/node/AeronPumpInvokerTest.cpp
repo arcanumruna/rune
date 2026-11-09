@@ -23,6 +23,8 @@
 #include <atomic>
 #include <filesystem>
 #include <string>
+#include <cstring>
+#include <new>
 #include <thread>
 
 using namespace rune::node;
@@ -285,6 +287,7 @@ TEST(StartupClientGateRegression, ResolveLetsThePumpThreadInOnlyWhileItSleeps) {
                 sawFree = true;
                 gate.unlock();
             }
+            std::this_thread::yield();
         }
     });
     gate.acquire();
@@ -331,7 +334,7 @@ TEST(StartupClientGateRegression, StarterAddsAgainstARunningPumpAreAllAnswered) 
     rune::aeronutil::StartupClientGate gate;
     DriverPumpAgent agent(*s.driver, *s.client, gate);
     std::atomic<bool> stop{false};
-    std::thread pumpThread([&] { while (!stop.load()) (void)agent.doWork(0); });
+    std::thread pumpThread([&] { while (!stop.load()) { (void)agent.doWork(0); std::this_thread::yield(); } });
     gate.acquire();
     int resolved = 0;
     for (int i = 0; i < 100; ++i) {
@@ -362,4 +365,30 @@ TEST(StartupDeadlineRegression, AnUnansweredResolveFailsAtTheDeadlineNamingTheCh
     pump.withStartupDeadline(20ms);
     EXPECT_FALSE(pump.resolve([] { return std::shared_ptr<int>{}; }, rune::aeronutil::AeronPump::kUntilAnswered));
     EXPECT_TRUE(pump.deadlineExpired());
+    EXPECT_FALSE(pump.resolve([] { return std::shared_ptr<int>{}; }, 5ms));
+    EXPECT_TRUE(pump.deadlineExpired()) << "a later bounded expiry does not clear it";
+}
+
+TEST(StartupDeadlineRegression, AResolveAnsweredRightAfterTheDeadlineStillSucceeds) {
+    // A process pause longer than the deadline: the answer is there, the pump thread just has not run since the resume.
+    rune::aeronutil::AeronPump pump;
+    pump.withStartupDeadline(0ms);
+    int calls = 0;
+    EXPECT_TRUE(pump.resolve([&] { return ++calls == 2 ? std::make_shared<int>(1) : std::shared_ptr<int>{}; },
+                             rune::aeronutil::AeronPump::kUntilAnswered));
+    EXPECT_FALSE(pump.deadlineExpired());
+}
+
+TEST(StartupClientGateRegression, ReleaseClearsTheStarterThreadsHeldPointer) {
+    using Gate = rune::aeronutil::StartupClientGate;
+    alignas(Gate) unsigned char storage[sizeof(Gate)];
+    auto* gate = new (storage) Gate;
+    gate->acquire();
+    EXPECT_EQ(Gate::heldHere(), gate);
+    gate->release();
+    gate->~Gate();
+    // The dead gate's storage is reused by something that looks like a gate held by this very thread.
+    const std::thread::id self = std::this_thread::get_id();
+    for (std::size_t off = 0; off + sizeof(self) <= sizeof(storage); off += sizeof(self)) std::memcpy(storage + off, &self, sizeof(self));
+    EXPECT_EQ(Gate::heldHere(), nullptr) << "the starter thread still points at a gate that no longer exists";
 }
