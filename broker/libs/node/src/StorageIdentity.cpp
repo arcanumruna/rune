@@ -24,6 +24,9 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 
 namespace rune::node {
 
@@ -621,6 +624,26 @@ int64_t SI::bumpProcessIncarnation(const std::string& dataDir, int64_t realtimeN
     ::close(fd);
     if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) return realtimeNowNs;
     return next;
+}
+
+std::string SI::osBootId() {
+#if defined(__linux__)
+    FILE* f = std::fopen("/proc/sys/kernel/random/boot_id", "r");
+    if (f == nullptr) return {};
+    char buf[64];
+    const std::size_t len = std::fread(buf, 1, sizeof buf - 1, f);
+    std::fclose(f);
+    std::string id(buf, len);
+    while (!id.empty() && id.back() == '\n') id.pop_back();
+    return id;
+#elif defined(__APPLE__)
+    char buf[64] = {};
+    std::size_t len = sizeof buf;
+    if (::sysctlbyname("kern.bootsessionuuid", buf, &len, nullptr, 0) != 0) return {};
+    return std::string(buf, ::strnlen(buf, sizeof buf));
+#else
+    return {};
+#endif
 }
 
 bool SI::isPresent(const std::string& d, Class c) { return classPresent(fs::path{d}, c); }

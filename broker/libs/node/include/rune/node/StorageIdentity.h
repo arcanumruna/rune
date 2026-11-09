@@ -82,6 +82,9 @@ public:
     /// wiped data dir.  Falls back to `realtimeNowNs` when the dir is empty/unwritable.  Cold (once per process).
     static int64_t bumpProcessIncarnation(const std::string& dataDir, int64_t realtimeNowNs);
 
+    /// The OS boot id (Linux /proc/sys/kernel/random/boot_id, macOS kern.bootsessionuuid); empty when unknown.  Cold (once per process).
+    static std::string osBootId();
+
     static const char* originName(Origin o) noexcept;
     /// 16 lower-case hex digits.
     static std::string idHex(int64_t id);

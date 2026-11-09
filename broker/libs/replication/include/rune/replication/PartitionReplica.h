@@ -440,6 +440,9 @@ public:
     /// every start; 0 = untracked).  Stamped on every FetchRequest this replica
     /// sends; set once before the replica is driven (ReplicaRegistry::add).
     void setProcessIncarnation(int64_t inc) noexcept { processIncarnation_ = inc; }
+    /// Election batch: this process's OS boot id ("" = unknown: never vouched).  A disk-backed replica reads <log dir>/leader-boot
+    /// here; equal = it led this partition earlier in this boot, so its leader-epoch bumps carry kBumpLedThisBoot.  Cold (registry add).
+    void setBootId(std::string id);
     /// E2 C1 residual N1: this PROCESS's node-control identity (the nonce the
     /// node registers with every controller, ControlledShutdown).  Carried in
     /// the transient lineage report and committed with the lineage, so the
@@ -1986,6 +1989,8 @@ private:
     /// not controller-managed).  Set by every becomeLeader.
     int32_t committedPartitionEpoch_ = -1;
     int64_t processIncarnation_      = 0;    ///< KIP-903 (see setProcessIncarnation)
+    std::string bootId_;                     ///< Election batch (see setBootId)
+    bool        ledThisBoot_ = false;        ///< <log dir>/leader-boot holds bootId_: this replica led in this OS boot
     // Internal quorum mode (MAJOR-2/3, see setInternalIsrKnowledge).
     InternalIsrKnowledge* isrKnowledge_     = nullptr;
     bool     internalSeedPending_ = false;   ///< leadership seed (every replica) not yet replaced by a committed ISR
@@ -2068,6 +2073,7 @@ public:
     static constexpr int64_t kAlterIsrResendNsForTest = 50'000'000LL;   // == kAlterIsrResendNs
 private:
     [[nodiscard]] int32_t bumpFlags_() const noexcept;
+    bool writeLeaderBoot_() const;
     bool fenceEstablished_ = false;          ///< no-fence-file mode: the first leadership was refused
     /// D21 review L2: both leader-epoch-state slots were corrupt — the epochs an
     /// earlier incarnation led at are unknown (an epoch led with no surviving

@@ -490,3 +490,15 @@ TEST(StorageIdentityRegression, ConsensusClassIsPresentOnlyOnceTheTermLogHoldsDa
     touch(t.path / "term.log", "y");
     EXPECT_TRUE(StorageIdentity::isPresent(d, StorageIdentity::Class::Consensus));
 }
+
+#if defined(__linux__) || defined(__APPLE__)
+// Election batch: the OS boot id is read from the kernel and is stable within a process.  RED: osBootId() returns "".
+TEST(StorageIdentityRegression, OsBootIdIsReadFromTheKernelRegression) {
+    const std::string id = StorageIdentity::osBootId();
+    EXPECT_FALSE(id.empty());
+    EXPECT_EQ(id, StorageIdentity::osBootId());
+#if defined(__linux__)
+    EXPECT_EQ(id.size(), 36u);
+#endif
+}
+#endif

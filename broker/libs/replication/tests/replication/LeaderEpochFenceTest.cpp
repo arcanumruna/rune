@@ -149,6 +149,48 @@ TEST(LeaderEpochFenceRegression, FenceWriteFailureTakesLogDirOfflineStickyRegres
 }
 
 
+// Election batch (F1): the restart-fence bump carries kBumpLedThisBoot only when the replica led this partition earlier in the
+// SAME OS boot (<log dir>/leader-boot holds the boot id).  A restart in a new boot, or a replica that never led, sends no flag.
+// RED: the flag is sent whenever a boot id is set (step 3), or the marker is never written (step 2).
+TEST(LeaderEpochFenceRegression, LedThisBootFlagOnlyAfterALeadershipInThisBootRegression) {
+    Dir d;
+    const fs::path logDir = d.path / "log";
+    fs::create_directories(logDir);
+    {
+        rune::storage::Log log(logDir.string());
+        log.recover();
+        CapturingTransport t;
+        auto r = std::make_unique<PartitionReplica>(cfg(), Role::Follower, 0, kAll, kAll, &log, &t);
+        r->setIsrChannel(&t);
+        r->setBootId("boot-a");
+        r->becomeLeader(2, kAll);
+        ASSERT_EQ(r->role(), Role::Leader);
+    }
+    {
+        rune::storage::Log log(logDir.string());
+        log.recover();
+        CapturingTransport t;
+        auto r = std::make_unique<PartitionReplica>(cfg(), Role::Follower, 0, kAll, kAll, &log, &t);
+        r->setIsrChannel(&t);
+        r->setBootId("boot-a");
+        r->becomeLeader(2, kAll);
+        EXPECT_NE(r->role(), Role::Leader);
+        r->doWork(1'000'000'000);
+        ASSERT_EQ(t.sent.size(), 1u);
+        EXPECT_NE(t.sent[0].isr[1] & AlterIsrMsg::kBumpLedThisBoot, 0) << "it led in this boot: its log is intact";
+    }
+    rune::storage::Log log(logDir.string());
+    log.recover();
+    CapturingTransport t;
+    auto r = std::make_unique<PartitionReplica>(cfg(), Role::Follower, 0, kAll, kAll, &log, &t);
+    r->setIsrChannel(&t);
+    r->setBootId("boot-b");
+    r->becomeLeader(2, kAll);
+    r->doWork(1'000'000'000);
+    ASSERT_EQ(t.sent.size(), 1u);
+    EXPECT_EQ(t.sent[0].isr[1] & AlterIsrMsg::kBumpLedThisBoot, 0) << "the marker is from another boot";
+}
+
 // D15 review m5: a MEMORY-backed replica's restart fence is written by the
 // owning worker's async epoch-state writer (leader-epoch-state in its own
 // dir), never by a synchronous fsync on the worker: a new-epoch leadership is
