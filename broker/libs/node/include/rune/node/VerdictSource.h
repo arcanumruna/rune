@@ -169,6 +169,10 @@ public:
     void release(int32_t i) noexcept {
         overlays_[static_cast<std::size_t>(i)].clear();
         inUse_[static_cast<std::size_t>(i)] = false;
+        if (pending()) {   // a reserve found this one in use and short: nothing else retries it
+            reserveKeys(0);
+            reserveFor(0, 0);
+        }
     }
     [[nodiscard]] std::size_t freeCount() const noexcept { return static_cast<std::size_t>(std::count(inUse_.begin(), inUse_.end(), false)); }
     [[nodiscard]] rune::view::TxnOverlay& at(int32_t i) noexcept { return overlays_[static_cast<std::size_t>(i)]; }

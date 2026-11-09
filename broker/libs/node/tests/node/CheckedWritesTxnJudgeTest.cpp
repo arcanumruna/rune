@@ -345,6 +345,22 @@ TEST(CheckedWritesTxnPool, AcquireReleaseAndLockSet) {
     EXPECT_EQ(pool.at(ids[0]).rows(), 0u);
 }
 
+// A reserve that finds an overlay in use leaves it short; the release of that overlay grows it, or the next transaction it judges
+// stalls the judge (Capacity) on a row its table can hold.
+TEST(CheckedWritesTxnPool, ReleaseGrowsAnOverlayLeftShortWhileInUseRegression) {
+    TxnOverlayPool pool;
+    pool.reserveFor(4, 8);
+    const int32_t held = pool.acquire(100);
+    ASSERT_GE(held, 0);
+    pool.reserveFor(8, 64);
+    EXPECT_TRUE(pool.pending());
+    EXPECT_LT(pool.at(held).maxRowLen(), 64u);
+    pool.release(held);
+    EXPECT_FALSE(pool.pending());
+    EXPECT_GE(pool.at(held).maxRowLen(), 64u);
+    EXPECT_GE(pool.at(pool.acquire(100)).maxRowLen(), 64u);
+}
+
 namespace {
 struct ScanLog {
     std::filesystem::path dir = rune::node::cw::rigTmpPath("txnscan");
