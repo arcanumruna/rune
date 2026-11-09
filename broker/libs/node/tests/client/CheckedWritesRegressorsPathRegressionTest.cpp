@@ -172,6 +172,7 @@ catalog_cluster::ThreeNodes startCluster(const std::string& tag, bool fast) {
         cfg.unservableWarmupMs     = 50;
         cfg.runtimePlacement       = NodeConfig::RuntimePlacement::Fused;
         cfg.electionTimeoutMs      = 40;
+        cfg.readLeaseMaxMs         = 50;    // the restart wait for the old leader's read lease (W = 1.02 x this), not 204 ms
         cfg.brokerLivenessTimeoutMs = 150;   // a crashed node's partitions fail over after this, not after 3 x the election timeout
     });
 }
