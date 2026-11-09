@@ -993,7 +993,7 @@ private:
             if (verdict_.begin != nullptr) verdict_.begin(verdict_.ctx, ring.logStartOffset(), ring.logEndOffset());   // the feed restarts too
         }
         RingScanning& cur = rs;
-        rune::transaction::RcBuilder builder(&tracker_, &aborted_, verdict_.ctx != nullptr);
+        rune::transaction::RcBuilder builder(&tracker_, &aborted_, /*trackIntents=*/false);   // a ring (transient) partition has no key index, so no intents
         // #37: base << min(boost, 40), saturating (an unboosted build keeps the plain budget).
         const std::size_t base  = static_cast<std::size_t>(budget > 0 ? budget : 1);
         const unsigned    shift = std::min<uint32_t>(cur.boost, 40u);

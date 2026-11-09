@@ -1290,6 +1290,21 @@ TEST(CheckedWritesTxnWorkerRegression, TransactionBoundFollowsTheJudgesPredicate
     EXPECT_EQ(b->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge)) << "the set at the transaction's first record was constrained";
 }
 
+// P11-7 bound across a rebuild: the open transaction's intents are re-read from the log when the partition reopens, so a later batch
+// with no intent still counts toward the bound on a source with nothing to reject.
+TEST(CheckedWritesTxnWorkerRegression, TransactionBoundSurvivesTheRebuildRegression) {
+    Ki k;
+    k.r.worker->setTxnJudgedRecordsMax(3);
+    ASSERT_FALSE(k.r.writeState()->isConstrainedSource());
+    (void)k.txn(61, {ins(1), ins(2)});
+    const int64_t leo = k.r.replica->logEndOffset();
+    const auto over = k.r.ack(k.r.produceBytes(VerdictRig::batch({ups(3), ups(4)}, 61, 2, {}, /*txn=*/true), kLeader, 61, 2));
+    ASSERT_TRUE(over);
+    EXPECT_EQ(over->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge)) << "the rebuilt transaction still carries its intent mark";
+    EXPECT_EQ(k.r.replica->logEndOffset(), leo);
+    EXPECT_EQ(k.r.worker->hookRefusalsForTest(HookRefusal::TxnTooLarge), 1u);
+}
+
 // The produce bound is the vote's predicate, verdict-source precondition included: a source whose last view was dropped and that has no
 // judge answers yes at the vote, so the transaction opened under the old constrained set is not bounded.
 TEST(CheckedWritesTxnWorkerRegression, TransactionBoundNeedsAVerdictSourceRegression) {
