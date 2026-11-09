@@ -112,7 +112,7 @@ const std::vector<Row>& rows() {
         {"44 key-0 creates with no key index", KeyZero, kIdemView, T(0,1,0,0), IR, H::NoKeyIndex},
         {"45 key-0 creates below the level", KeyZero, F(1, true, false, false, false, false), T(1,1,0,0), IR, H::LevelTooLow},
         {"46 key-0 mixed, not idempotent: mixed first", KeyZeroMixed, F(0, false, false, false, false, true), T(1,1,0,0), IR, H::MixedKeyZeroBatch},
-        {"47 key-0 creates, acks 3, not atomic, on a constrained source", KeyZero, kIdemView, T(1,1,1,0), OK, H::None},
+        {"47 key-0 creates in an atomic batch on a constrained source, acks 3", KeyZero, F(3, true, false, true, false, true), T(1,1,1,0), OK, H::None},
         {"48 key-0 creates in a transaction on a constrained source", KeyZero, F(3, true, true, false, false, true), T(1,1,1,0), OK, H::None},
         {"49 4096 records, acks 3, verdict source", ManyPlain, kIdemView, T(0,0,0,1), OK, H::None},
         {"50 4097 records, acks 2, verdict source", ManyPlainOver, F(2, false, false, false, false, true), T(0,0,0,1), IR, H::ViewBatchTooLarge},
@@ -198,10 +198,9 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
     const auto feeds = [](int fact, H h) {
         switch (fact) {
         case 0: return h == H::LegacyMode || h == H::LevelTooLow || h == H::ExplicitKeyNeedsIdempotentAndView ||
-                       h == H::KeyZeroCreateNeedsIdempotentAll || h == H::KeyZeroCreateNeedsView || h == H::ViewBatchTooLarge ||
-                       h == H::AtomicBatchTooLarge;   // acks
+                       h == H::KeyZeroCreateNeedsIdempotentAll || h == H::KeyZeroCreateNeedsView || h == H::ViewBatchTooLarge;   // acks All
         case 1: return h == H::ExplicitKeyNeedsIdempotentAndView || h == H::KeyZeroCreateNeedsIdempotentAll;                      // idempotent
-        case 2: return h == H::ExplicitKeyNeedsIdempotentAndView || h == H::KeyZeroCreateNeedsView;                                  // transactional
+        case 2: return h == H::ExplicitKeyNeedsIdempotentAndView || h == H::KeyZeroCreateNeedsView;                                // transactional
         case 3: return h == H::AtomicBatchTooLarge;                                                                                // atomic
         case 4: return h == H::ImportNotGranted;                                                                                   // import
         case 5: return h == H::LegacyMode;                                                                                         // legacy
@@ -209,12 +208,14 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         case 7: return h == H::NoKeyIndex || h == H::KeyIndexActivating;                                                           // keyIndex
         case 8: return h == H::UpsertOnAutoIncrement || h == H::ImportNotGranted || h == H::ImportOutOfRange || h == H::AutoIncExhausted ||
                        h == H::AutoIncWindowFull || h == H::AutoIncActivating;                                                     // autoIncrement
-        case 9: return h == H::KeyZeroCreateNeedsView;                                                                          // constrained
-        case 10: return h == H::ViewBatchTooLarge || h == H::AtomicBatchTooLarge;                                                                                 // verdict source
+        case 9: return h == H::KeyZeroCreateNeedsView;                                                                             // constrained
+        case 10: return h == H::ViewBatchTooLarge || h == H::AtomicBatchTooLarge;                                                  // verdict source
         case 11: return h == H::KeyIndexActivating;                                                                                // keyIndexActive
         case 12: return h == H::AutoIncActivating;                                                                                 // autoIncReady
         case 13: return h == H::AutoIncExhausted;                                                                                  // exhausted
-        default: return h == H::AutoIncWindowFull;                                                                                 // window full
+        case 14: return h == H::AutoIncWindowFull;                                                                                 // window full
+        default: return h == H::LegacyMode || h == H::LevelTooLow || h == H::ExplicitKeyNeedsIdempotentAndView ||
+                        h == H::KeyZeroCreateNeedsView || h == H::ViewBatchTooLarge || h == H::AtomicBatchTooLarge;                // acks View
         }
     };
     const auto build = [](uint32_t m, BatchIntents& b, WriteFacts& f, TopicHookFacts& t) {
@@ -225,7 +226,7 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         t = {};
         t.keyIndex = m & 256; t.autoIncrement = m & 512; t.constrainedSource = m & 1024; t.verdictSource = m & 2048; t.keyIndexActive = m & 4096; t.autoIncReady = m & 8192;
     };
-    // Matrix B: every intent shape x reserved bits on / off x records {1, 4096, 4097} x the 15 facts (import and the three autoincrement ones included).
+    // Matrix B: every intent shape x reserved bits on / off x records {1, 4096, 4097} x the 16 facts (the View bit, import and the three autoincrement ones included).
     const Shape shapes[] = {Plain, InsertExplicit, Update, RemoveExisting, KeyZero, KeyZeroMixed, PlainUpsert};
     const auto flip = [](uint32_t m, int fact) {
         switch (fact) {
@@ -243,10 +244,12 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         case 11: return m ^ 4096u;
         case 12: return m ^ 8192u;
         case 13: return m ^ 16384u;
-        default: return m ^ 32768u;
+        case 14: return m ^ 32768u;
+        default: return m ^ 2u;
         }
     };
     int cells = 0;
+    std::vector<RequirementVerdict> out(65536);   // every verdict of a block, so a flipped fact's verdict is a lookup
     for (Shape s : shapes)
     for (const bool reserved : {false, true})
     for (const int32_t records : {1, 4096, 4097}) {
@@ -256,10 +259,15 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         for (uint32_t m = 0; m < 65536; ++m) {
             BatchIntents bm = b; WriteFacts f; TopicHookFacts t;
             build(m, bm, f, t);
-            const auto v = evaluateRequirements(bm, f, t);
+            out[m] = evaluateRequirements(bm, f, t);
+        }
+        for (uint32_t m = 0; m < 65536; ++m) {
+            BatchIntents bm = b; WriteFacts f; TopicHookFacts t;
+            build(m, bm, f, t);
+            const RequirementVerdict v = out[m];
             ++cells;
             const bool view = f.acks & 2;
-            if (!b.anyIntent && !(b.plainUpsert && t.autoIncrement) && !b.reservedBits && !view && !(f.atomicBatch && t.verdictSource && records > 4096)) {
+            if (!b.anyIntent && !(b.plainUpsert && t.autoIncrement) && !b.reservedBits && !view && !(f.atomicBatch && t.verdictSource && records > f.txnJudgedRecordsMax)) {
                 ASSERT_EQ(v.code, OK) << "(i) shape " << s << " records " << records << " m " << m;
             }
             if (b.reservedBits) ASSERT_EQ(v.why, H::ReservedBits) << "(ii)";
@@ -268,10 +276,8 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
                 const bool retriable = v.why == H::KeyIndexActivating || v.why == H::AutoIncActivating || v.why == H::AutoIncWindowFull;
                 ASSERT_EQ(v.code, retriable ? NL : v.why == H::ImportNotGranted ? NA : v.why == H::AutoIncExhausted ? EXH : IR) << "(iv)";
             }
-            for (int fact = 0; fact < 15; ++fact) {
-                BatchIntents b2 = b; WriteFacts f2; TopicHookFacts t2;
-                build(flip(m, fact), b2, f2, t2);
-                const auto w = evaluateRequirements(b2, f2, t2);
+            for (int fact = 0; fact < 16; ++fact) {
+                const RequirementVerdict w = out[flip(m, fact)];
                 if (w.why != v.why) ASSERT_TRUE(feeds(fact, v.why) || feeds(fact, w.why)) << "(v) fact " << fact << " shape " << s << " reserved " << reserved << " records " << records << " m " << m;
             }
         }

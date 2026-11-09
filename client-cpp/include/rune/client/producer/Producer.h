@@ -689,7 +689,7 @@ public:
     /// rule): on a raw handle, without View in the producer's acks (a transactional producer needs none), or Insert with an empty value.
     /// A View producer also refuses every send on a raw handle.
     /// On a Modulo (autoincrement) handle a live Upsert is refused too, and so is a key-0 create from a producer that is not
-    /// idempotent or whose acks lack All; a key-0 create needs no View.
+    /// idempotent or whose acks lack All; a key-0 create is not refused locally for lacking View.
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
                                      WriteIntent intent = WriteIntent::Upsert) noexcept;
 

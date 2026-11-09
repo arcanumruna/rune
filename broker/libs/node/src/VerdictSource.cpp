@@ -780,7 +780,7 @@ bool VerdictSource::judgeAtomic_(const rune::protocol::RecordBatchReader& r, con
     ChainStep step = ChainStep::Ok;
     bool walked = true;
     // More records than the overlay is sized for (the knob): rejected whole, the same on every leader, never a capacity stall.
-    // Produce refuses such a batch (rule 10); this guards replicated batches and those logged before the upgrade.
+    // Produce refuses such a batch (rule 10); this guards replicated batches, those logged before the upgrade and those a leader with a larger knob accepted.
     const bool tooLarge = r.recordCount() > txnJudgedRecordsMax_;
     if (tooLarge) {
         failed = {static_cast<uint16_t>(rune::protocol::client::ErrorCode::TxnTooLarge), 0};

@@ -1067,6 +1067,30 @@ TEST(CheckedWritesTxnVoteFreezeRegression, NewLeaderVerifiesAgainAfterAVoteWitho
     EXPECT_EQ(k.r.worker->txnVerifyRequestsSentForTest(), 1u);
 }
 
+// The hook's facts come from the batch header and the node's knob: an atomic batch past the knob is refused, and the atomic bit of a
+// transactional batch is ignored (the transaction is judged at its vote).
+TEST(CheckedWritesTxnWorker, AtomicFactsComeFromTheHeaderAndTheKnob) {
+    Ki k;
+    constexpr int32_t kKnob = 16;
+    k.r.worker->setTxnJudgedRecordsMax(kKnob);
+    std::vector<Rec> recs;
+    for (int32_t i = 0; i <= kKnob; ++i) recs.push_back(ups(2000 + uint64_t(i)));
+    std::vector<uint8_t> atomic = VerdictRig::batch(recs);
+    VerdictRig::setBatchAttribute(atomic, rune::protocol::batch::kAttrAtomic);
+    const auto refused = k.r.ack(k.r.produceBytes(atomic, kLeader));
+    ASSERT_TRUE(refused);
+    EXPECT_EQ(refused->code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(k.r.worker->lastWriteFactsForTest().atomicBatch);
+    EXPECT_EQ(k.r.worker->lastWriteFactsForTest().txnJudgedRecordsMax, kKnob);
+    std::vector<uint8_t> txn = VerdictRig::batch(recs, 31, 0, {}, /*txn=*/true);
+    VerdictRig::setBatchAttribute(txn, rune::protocol::batch::kAttrAtomic);
+    const auto accepted = k.r.ack(k.r.produceBytes(txn, kLeader, 31, 0));
+    ASSERT_TRUE(accepted);
+    EXPECT_EQ(accepted->code, 0);
+    EXPECT_FALSE(k.r.worker->lastWriteFactsForTest().atomicBatch);
+    EXPECT_TRUE(k.r.worker->lastWriteFactsForTest().transactional);
+}
+
 // P6-13: a voted-no transaction's key-0 ids are burned: the next create is above them, the key index holds neither, nothing is delivered.
 TEST(CheckedWritesTxnWorker, NoVoteBurnsTheTransactionsIds) {
     VerdictRig r;
@@ -1084,9 +1108,11 @@ TEST(CheckedWritesTxnWorker, NoVoteBurnsTheTransactionsIds) {
     ASSERT_TRUE(first);
     ASSERT_EQ(first->code, 0);
     ASSERT_TRUE(first->verdicts.empty());
-    const auto txn = r.ack(r.appendRecords(chars(20, 22), kAllView, 77, 0, /*txn=*/true));
+    const auto txnRecords = chars(20, 22);
+    const auto txn = r.ack(r.appendRecords(txnRecords, kAllView, 77, 0, /*txn=*/true));
     ASSERT_TRUE(txn);
     ASSERT_EQ(txn->code, 0);
+    ASSERT_NE(txn->assignedBase, 0u);
     const auto end = r.commitTxn(77);
     EXPECT_FALSE(end.committed);
     ASSERT_EQ(end.votes.size(), 1u);
@@ -1102,7 +1128,11 @@ TEST(CheckedWritesTxnWorker, NoVoteBurnsTheTransactionsIds) {
     EXPECT_EQ(keys.count(txn->assignedBase + 1), 0u);
     EXPECT_EQ(keys.count(next->assignedBase), 1u);
     const int64_t sub = r.subscribe(SubKind::Raw, 0);
+    const int64_t txnEnd = txn->baseOffset + static_cast<int64_t>(txnRecords.size());
+    bool nextDelivered = false;
     for (const auto& d : r.collect(sub).records) {
-        EXPECT_TRUE(d.offset < txn->baseOffset || d.offset >= txn->baseOffset + 3) << "an aborted record was delivered at " << d.offset;
+        EXPECT_TRUE(d.offset < txn->baseOffset || d.offset >= txnEnd) << "an aborted record was delivered at " << d.offset;
+        nextDelivered |= d.offset == next->baseOffset;
     }
+    EXPECT_TRUE(nextDelivered) << "delivery passed the aborted transaction";
 }
