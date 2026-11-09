@@ -617,13 +617,15 @@ private:
         return log;
     }
 
-    // P11-0: a committed transaction applies at its commit marker, above every record of the cell (the fixture sends nothing after the marker), not at its own offset.  Where the op left a record of k (a tombstone too), an
+    // P11-0: a committed transaction applies at its commit marker, above every record of the cell, not at its own offset.  Where the op left a record of k (a tombstone too), an
     // ordinary key index supersedes the upsert but still delivers it, and the constrained vote answers TxnConflict: the transaction aborts.
     VerdictRig::RigLog commitOrder_(VerdictRig::RigLog log) {
         if (c_.timing != Timing::TxnCommitBehind) return log;
         const auto at = std::find_if(log.data.begin(), log.data.end(), [&](const VerdictRig::RigLogRec& d) { return d.offset == txnOffset_; });
         const VerdictRig::RigLogRec txn = *at;
         log.data.erase(at);
+        const auto marker = r_.markerAnswer(kTxnPid);
+        EXPECT_TRUE(marker && (log.data.empty() || log.data.back().offset < *marker)) << "no record of the cell follows the commit marker";
         CheckedWritesModel withoutTxn;
         withoutTxn.declareRule(kObj, tagRule(9).fingerprint(), modelRule(tagRule(9)));
         withoutTxn.addKeyIndexRule();
