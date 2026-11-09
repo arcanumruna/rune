@@ -153,6 +153,28 @@ TEST(LeaseViewReadRegression, PointReadReadYourWritesRegression) {
     EXPECT_EQ(expired->errorCode, int16_t(RS::kNotReady));
     EXPECT_EQ(k.r.worker->heldViewReadsForTest(), 0u);
     k.r.holdJudge(false);
+
+    // minOffset alone (the fold is at the committed bound): an offset nobody wrote is held, then NotReady - never the row now.  This
+    // leg is the one that fails when minOffset is ignored (the legs above are also held by the unfolded committed tail).
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    for (int i = 0; i < 20; ++i) k.r.pass();
+    ASSERT_NE(k.rowRemaining(1), UINT64_MAX);
+    const int64_t never = k.r.leo() + 1000;
+    (void)k.r.takeViewAnswers();
+    k.r.postViewReadOp(WorkerOp::Type::GetViewRowK, kView, bytesOf(1), never);
+    for (int i = 0; i < 20; ++i) {
+        k.r.pass();
+        ASSERT_TRUE(k.r.takeViewAnswers().empty()) << "held at pass " << i;
+    }
+    EXPECT_EQ(k.r.worker->heldViewReadsForTest(), 1u);
+    std::optional<WorkerReturn> late;
+    for (int i = 0; i < 200 && !late; ++i) {
+        k.r.pass();
+        auto a = k.r.takeViewAnswers();
+        if (!a.empty()) late = std::move(a.front());
+    }
+    ASSERT_TRUE(late);
+    EXPECT_EQ(late->errorCode, int16_t(RS::kNotReady));
 }
 
 // 3. An index that is not ready answers NotReady - never the row it holds - and Ok once it is ready again.  Not ready: an update of a key with
