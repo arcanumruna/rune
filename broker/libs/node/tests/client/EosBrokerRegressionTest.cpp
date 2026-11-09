@@ -1157,7 +1157,7 @@ TEST(EosBrokerRegression, CoordinatorCrashedUnderANonSeedClientCommitsAfterTheMo
     const TxnResult c = w.commit(60s);
     const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0);
     ASSERT_TRUE(c.ok()) << "the commit after a coordinator crash: " << c.str();
-    EXPECT_LT(took, 45s) << "the coordinator was re-discovered, not waited on until the op deadline";
+    EXPECT_LT(took, 15s) << "the coordinator was re-discovered, not waited on until the op deadline";
     int64_t cursor = 500'000;
     ASSERT_TRUE(w.sentinel(recs, cursor).ok()) << "the producer keeps working with the new coordinator";
 
