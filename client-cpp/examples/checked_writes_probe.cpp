@@ -44,10 +44,12 @@
 //
 // The transaction legs (Part 11) run against the golden script's `character` topic and a `ledger` topic {entryId key, account, amount,
 // memo} with the view `balances` (balance >= 0).  Each transaction writes two characters and two ledger entries of 1 through a
-// transactional producer (acks All); the result line is `txn <user> <code> <constraintName> <failingOffset> <w<worker>u<user>k<k>> <first entryId>`.
+// transactional producer (acks All); the result line is `txn <user> <code> <constraintName> <failingOffset> <u<user>k<k>> <first entryId> <start ms> <end ms> <character ids>`.
 //   txn-setup      prints TXN_CHARACTER_TOPIC_ID, TXN_LEDGER_TOPIC_ID and CHECKED-WRITES-TXN-SETUP: OK once the topics and views exist.
 //   txn-run        --worker <i> --users <a>-<b>: per user six transactions that fit account_stats, a seventh the cap refuses, and one
-//                  that overdraws the user's account (the workers share the users: per user six transactions fit in all).  Writes the tag txn-run and txn-run-progress-w<i>.
+//                  that overdraws the user's account (the workers share the users and the names u<user>k<k>a / b: per user six
+//                  transactions fit in all, a worker that loses the name race answers 55).  Writes the tag txn-run and txn-run-progress-w<i>;
+//                  a line ends with the transaction's start and end in epoch ms (the host's clock) and its two assigned character ids.
 //   txn-verify     a read_committed subscription from 0 holds every committed transaction whole, no refused one, and a transaction
 //                  whose answer was lost whole or not at all; the account_stats and balances rows agree with it.
 //
@@ -658,6 +660,8 @@ struct RpLine {
     int64_t     offset = -1;
     std::string name;
     uint64_t    id = 0;
+    int64_t     startMs = 0, endMs = 0;   // a transaction's wall-clock epoch ms (the containers share the host's clock)
+    uint64_t    char1 = 0, char2 = 0;      // the ids a transaction's creates were assigned
 };
 
 /// Runs one write; the line carries its verdict (code as write(): 0 Ok, the broker's code, 10000 + OpStatus, kClientErr when it threw).
@@ -742,7 +746,8 @@ void saveRpLines(Client& c, const std::string& tag, int worker, const std::vecto
             constraint = it->second;
         }
         text += l.op + " " + std::to_string(l.key) + " " + std::to_string(l.code) + " " + constraint + " " + std::to_string(l.offset) + " " +
-                (l.name.empty() ? "-" : l.name) + " " + std::to_string(l.id) + "\n";
+                (l.name.empty() ? "-" : l.name) + " " + std::to_string(l.id) + " " +
+                std::to_string(l.startMs) + " " + std::to_string(l.endMs) + " " + std::to_string(l.char1) + " " + std::to_string(l.char2) + "\n";
     }
     writeFileAtomic(shared() + "/" + tag + "-w" + std::to_string(worker) + ".txt", text);
 }
@@ -759,7 +764,7 @@ std::vector<RpLine> readRpLines(std::initializer_list<const char*> prefixes) {
         std::ifstream f(e.path());
         RpLine l;
         std::string constraint;
-        while (f >> l.op >> l.key >> l.code >> constraint >> l.offset >> l.name >> l.id) all.push_back(l);
+        while (f >> l.op >> l.key >> l.code >> constraint >> l.offset >> l.name >> l.id >> l.startMs >> l.endMs >> l.char1 >> l.char2) all.push_back(l);
     }
     return all;
 }
@@ -1116,24 +1121,32 @@ struct TxnWriter {
 
 /// One transaction: a character per name of `names` for `user`, a ledger entry of `amount` on `account` per id from `firstEntry` (`entries` of them).
 /// The line's code is 0 for a commit, the vote's code for a no, kClientErr when the answer was lost (the transaction is then aborted if it can be).
+/// The line carries the transaction's start and end in epoch ms and the ids its creates were assigned.
+int64_t epochMs() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
+
 RpLine txnRun(std::unique_ptr<TxnWriter>& w, Client& c, const std::string& txnId, uint64_t user, uint64_t account, const std::vector<std::string>& names,
               uint64_t firstEntry, int entries, int64_t amount, const std::string& tag) {
     RpLine l{"txn", user, kClientErr, 0, -1, tag, firstEntry};
+    l.startMs = epochMs();
     try {
         w->producer.beginTransaction();
+        uint64_t* assigned = &l.char1;
         for (const std::string& name : names) {
             RpCharacter ch;
             ch.userId = user;
             ch.gender = 1;
             std::snprintf(ch.name.data(), ch.name.size(), "%s", name.c_str());
-            if (!w->characters.insertAndWait(ch, std::chrono::seconds(kTxnWaitS)).ok()) throw std::runtime_error("a character write was refused");
+            const WriteResult cr = w->characters.insertAndWait(ch, std::chrono::seconds(kTxnWaitS));
+            if (!cr.ok()) throw std::runtime_error("a character write was refused with code " + std::to_string(cr.code()) + " status " + std::to_string(static_cast<int>(cr.status())));
+            *assigned++ = cr.key();
         }
         for (int i = 0; i < entries; ++i) {
             TxnLedger e;
             e.entryId = firstEntry + static_cast<uint64_t>(i);
             e.account = account;
             e.amount  = amount;
-            if (!w->ledger.upsertAndWait(e, std::chrono::seconds(kTxnWaitS)).ok()) throw std::runtime_error("a ledger write was refused");
+            const WriteResult lr = w->ledger.upsertAndWait(e, std::chrono::seconds(kTxnWaitS));
+            if (!lr.ok()) throw std::runtime_error("a ledger write was refused with code " + std::to_string(lr.code()) + " status " + std::to_string(static_cast<int>(lr.status())));
         }
         const TxnCommitResult r = w->producer.commitTransactionAndWait(std::chrono::seconds(kTxnWaitS));
         l.code         = r.ok ? 0 : r.code;
@@ -1143,6 +1156,7 @@ RpLine txnRun(std::unique_ptr<TxnWriter>& w, Client& c, const std::string& txnId
         std::fprintf(stderr, "%s threw: %s\n", tag.c_str(), e.what());
         try { w->producer.abortTransactionAndWait(30s); } catch (const std::exception&) { w = std::make_unique<TxnWriter>(c, txnId); }   // a fenced or broken producer starts over
     }
+    l.endMs = epochMs();
     return l;
 }
 
@@ -1173,7 +1187,7 @@ int runTxnRun(const Args& a) {
                 const std::string txnId = "txn-probe-w" + std::to_string(a.worker) + "-t" + std::to_string(t);
                 auto w = std::make_unique<TxnWriter>(c, txnId);
                 for (uint64_t u = a.lo + static_cast<uint64_t>(t); u <= a.hi; u += static_cast<uint64_t>(threads)) {
-                    const std::string base = "w" + std::to_string(a.worker) + "u" + std::to_string(u);
+                    const std::string base = "u" + std::to_string(u);   // the names are shared by the workers: they race for them
                     const uint64_t entries = static_cast<uint64_t>(a.worker + 1) * kTxnEntryBase + u * 1000;
                     for (int k = 0; k <= kTxnCommitted; ++k) {   // the seventh is the cap's: account_stats refuses it
                         const std::string tag = base + "k" + std::to_string(k);
@@ -1198,11 +1212,12 @@ int runTxnRun(const Args& a) {
 
 /// What a read_committed reader of the character and ledger topics has seen.
 struct TxnTap {
-    std::mutex            mu;
-    std::set<std::string> names;
-    std::set<uint64_t>    entries;
-    bool has(const std::string& n) { std::lock_guard<std::mutex> g(mu); return names.contains(n); }
-    bool has(uint64_t id) { std::lock_guard<std::mutex> g(mu); return entries.contains(id); }
+    std::mutex                  mu;
+    std::map<std::string, uint64_t> names;   // name -> the id of the character that holds it
+    std::set<uint64_t>          characters, entries;
+    bool has(uint64_t characterId) { std::lock_guard<std::mutex> g(mu); return characters.contains(characterId); }
+    bool hasEntry(uint64_t id) { std::lock_guard<std::mutex> g(mu); return entries.contains(id); }
+    uint64_t idOf(const std::string& n) { std::lock_guard<std::mutex> g(mu); const auto it = names.find(n); return it == names.end() ? 0 : it->second; }
 };
 
 int runTxnVerify() {
@@ -1226,9 +1241,12 @@ int runTxnVerify() {
     const TopicHandle ledger = c.topic("ledger");
     SubscriptionSet characterSet = c.subscribe(w.characters.handle(), AllPartitions{}, so, [&](const Record& r) {
         if (r.value.size() < 36) return;
+        uint64_t id = 0;
+        std::memcpy(&id, r.value.data() + 4, sizeof id);
         const char* name = reinterpret_cast<const char*>(r.value.data()) + 20;
         std::lock_guard<std::mutex> g(tap.mu);
-        tap.names.insert(std::string(name, strnlen(name, 16)));
+        tap.names[std::string(name, strnlen(name, 16))] = id;
+        tap.characters.insert(id);
     });
     SubscriptionSet ledgerSet = c.subscribe(ledger, AllPartitions{}, so, [&](const Record& r) {
         if (r.value.size() < 12) return;
@@ -1237,34 +1255,53 @@ int runTxnVerify() {
         std::lock_guard<std::mutex> g(tap.mu);
         tap.entries.insert(id);
     });
-    // A committed transaction's records are all delivered; wait for them, then a quiet window for a refused record that is going to land.
+    // The names are shared by the workers: a transaction is visible by its own character ids and ledger entries, not by its names.
     const auto names = [](const RpLine& l) { return l.name.find("od") != std::string::npos ? std::vector<std::string>{l.name} : std::vector<std::string>{l.name + "a", l.name + "b"}; };
     const auto entryCount = [](const RpLine& l) { return l.name.find("od") != std::string::npos ? 1 : 2; };
+    const auto idsOf = [&](const RpLine& l) { return std::vector<uint64_t>{l.char1, l.char2}; };
+    // A committed transaction's records are all delivered; wait for them, then a quiet window for a refused record that is going to land.
     const auto delivered = [&] {
         for (const RpLine& l : lines) {
             if (l.code != 0) continue;
-            for (const std::string& n : names(l)) if (!tap.has(n)) return false;
-            for (int i = 0; i < entryCount(l); ++i) if (!tap.has(l.id + static_cast<uint64_t>(i))) return false;
+            for (std::size_t i = 0; i < names(l).size(); ++i) if (!tap.has(idsOf(l)[i])) return false;
+            for (int i = 0; i < entryCount(l); ++i) if (!tap.hasEntry(l.id + static_cast<uint64_t>(i))) return false;
         }
         return true;
     };
     for (const auto deadline = Clock::now() + std::chrono::seconds(envInt("KI_E2E_VERIFY_S", 300)); Clock::now() < deadline && !delivered();) std::this_thread::sleep_for(100ms);
     std::this_thread::sleep_for(5s);
+    const auto state = latestCatalog(c);
+    RpView nameView(state, "character_name");
     int bad = 0;
     std::map<uint64_t, std::pair<int64_t, int64_t>> perUser;   // the first user a transaction is for -> {characters, balance} it leaves visible
+    std::map<std::string, std::string> nameOwner;               // a name -> the transaction that delivers it
     for (const RpLine& l : lines) {
         bool all = true, none = true;
-        for (const std::string& n : names(l)) { const bool v = tap.has(n); all = all && v; none = none && !v; }
-        for (int i = 0; i < entryCount(l); ++i) { const bool v = tap.has(l.id + static_cast<uint64_t>(i)); all = all && v; none = none && !v; }
+        for (std::size_t i = 0; i < names(l).size(); ++i) {
+            const bool v = idsOf(l)[i] != 0 && tap.has(idsOf(l)[i]);
+            all = all && v;
+            none = none && !v;
+        }
+        for (int i = 0; i < entryCount(l); ++i) { const bool v = tap.hasEntry(l.id + static_cast<uint64_t>(i)); all = all && v; none = none && !v; }
         if (l.code == 0 && !all) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", l.name + ": a committed transaction is not whole"); }
         else if (l.code != 0 && l.code != kClientErr && !none) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", l.name + ": a refused transaction is visible"); }
         else if (l.code == kClientErr && !all && !none) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", l.name + ": a transaction whose answer was lost is torn"); }
-        if (all && l.name.find("od") == std::string::npos) { perUser[l.key].first += 2; perUser[l.key].second += 2; }
+        if (!all) continue;
+        // Each name is delivered by one transaction, and character_name maps it to that transaction's character.
+        for (std::size_t i = 0; i < names(l).size(); ++i) {
+            const std::string n = names(l)[i];
+            const std::string owner = l.name + "@" + std::to_string(idsOf(l)[i]);
+            if (!nameOwner.emplace(n, owner).second) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", "the name " + n + " is delivered by " + nameOwner[n] + " and " + owner); }
+            if (tap.idOf(n) != idsOf(l)[i]) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", "the name " + n + " is held by character " + std::to_string(tap.idOf(n)) + ", not " + std::to_string(idsOf(l)[i])); }
+            nameView.builder.clear();
+            const auto row = rpRowWhenReady(c, nameView, keyBytes(nameView.builder.setString("name", n).key()), 0, 30s);
+            if (!row || nameView.u(*row, "characterId") != idsOf(l)[i]) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", "character_name does not map " + n + " to character " + std::to_string(idsOf(l)[i])); }
+        }
+        if (l.name.find("od") == std::string::npos) { perUser[l.key].first += 2; perUser[l.key].second += 2; }
     }
     if (bad != 0) return 1;
 
     // The views agree with what is visible.
-    const auto state = latestCatalog(c);
     RpView stats(state, "account_stats"), balances(state, "balances");
     for (const auto& [user, expect] : perUser) {
         stats.builder.clear();
