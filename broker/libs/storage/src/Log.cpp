@@ -1962,7 +1962,7 @@ std::vector<uint8_t> Log::readPastEmptied(int64_t startOffset, int32_t maxBytes,
     ReadIntoStatus st;
     const LogReadView v = readInto(startOffset, maxBytes, buf.get(), static_cast<std::size_t>(maxBytes), st, boundOffset);
     if (st != ReadIntoStatus::Ok) return {};
-    return std::vector<uint8_t>(buf.get(), buf.get() + v.len);
+    return std::vector<uint8_t>(v.data, v.data + v.len);
 }
 int64_t Log::nextSegmentBaseAfter(int64_t offset) const noexcept {
     const auto it = segments_.upper_bound(offset);

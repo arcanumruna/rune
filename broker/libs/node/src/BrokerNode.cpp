@@ -518,12 +518,11 @@ void BrokerNode::start() {
         // it: during a resolve's sleep or a StartupClientGate::Yield.  Between
         // those the client is unserviced, which is safe because the in-process
         // client liveness is 1 h (kInProcessLivenessNs); a test that lowers it
-        // must keep every other phase shorter.
+        // must keep every other phase shorter.  A new long wait in start() that makes no aeron_ call
+        // holds a StartupClientGate::Yield, like the system-log recoveries and the shard-driver stall.
         // Startup resolves on aeron_ then use the default sleep-poll pump,
         // exactly as with thread placement's driver/conductor threads.
         if (config_.fused()) {
-            // Any new wait in start() longer than ~2 s (the test-lowered shard client liveness) that makes no
-            // aeron_ call must hold a StartupClientGate::Yield, like the system-log recoveries and the shard-driver stall.
             startupGate_.acquire();   // released by stopStartupPump_()
             startupPumpAgent_  = std::make_unique<DriverPumpAgent>(*nodeDriver_, *aeron_, startupGate_);
             startupPumpIdle_   = makeBackoffIdle(config_.idleMaxParkUs);
