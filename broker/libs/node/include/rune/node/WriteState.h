@@ -458,18 +458,19 @@ struct PartitionWriteState {
     uint64_t                           seenLogGeneration = UINT64_MAX;   ///< the replica's log generation the timeline and ledger are in step with
     int64_t                            scanHw = 0;           ///< the replica HW at the start of this pass: the scan feed commits ledger slots below it
     bool                               growOwed = false;     ///< the judge saw the rejected index cross 75 %, or stalled for room: the worker's cold maintenance grows it
-    std::size_t                        growNeed_ = 0;        ///< the size a stalled whole-batch rejection needs (size + its records); 0 when none
+    std::size_t                        rejectedMax = kIndexMax;   ///< the rejected index's ceiling (a rig lowers it)
+    std::size_t                        growNeed = 0;        ///< the size a stalled whole-batch rejection needs (size + its records); 0 when none
     AutoIncState                       autoInc;              ///< the partition's id counter (an autoincrement topic only)
     AssignedBaseWindow                 assignedBases;        ///< the last assigned bases per producer, for retried key-0 batches
     AutoIncStats                       autoIncStats;
 
-    /// Cold: doubles the rejected index (up to kIndexMax) once it is 75 % full, or grows it to growNeed_ when a whole-batch rejection waits for room.
+    /// Cold: doubles the rejected index (up to rejectedMax) once it is 75 % full, or grows it to growNeed when a whole-batch rejection waits for room.
     void growRejected() {
         const std::size_t cap = rejected.capacity();
-        const std::size_t want = growNeed_ != 0 ? std::max(cap * 2, growNeed_) : rejected.size() * 4 >= cap * 3 ? cap * 2 : 0;
+        const std::size_t want = growNeed != 0 ? std::max(cap * 2, growNeed) : rejected.size() * 4 >= cap * 3 ? cap * 2 : 0;
         growOwed = false;
-        growNeed_ = 0;
-        if (cap != 0 && want > cap) rejected.grow(std::min(want, kIndexMax));
+        growNeed = 0;
+        if (cap != 0 && want > cap) rejected.grow(std::min(want, rejectedMax));
     }
     /// A judge is attached or the latest logged set is non-empty.
     [[nodiscard]] bool isVerdictSource() const noexcept;

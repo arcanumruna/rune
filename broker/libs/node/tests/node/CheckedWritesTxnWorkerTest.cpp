@@ -1188,3 +1188,47 @@ TEST(CheckedWritesTxnWorker, NoVoteBurnsTheTransactionsIds) {
     }
     EXPECT_TRUE(nextDelivered) << "delivery passed the aborted transaction";
 }
+
+// P11-7 bound: on a constrained source the batch that takes an open transaction past txnJudgedRecordsMax is refused with TxnTooLarge
+// (the vote's own answer) and never reaches the log; one landing exactly on the knob is admitted, each producer counts alone, and a
+// source with nothing to reject is unaffected.
+TEST(CheckedWritesTxnWorkerRegression, TransactionPastTheKnobIsRefusedOnAConstrainedSourceRegression) {
+    VerdictRig r;
+    r.createCharacterTopic();
+    r.enableAcks();
+    r.passes(20);
+    r.createConstrainedView(ConstrainedView::AccountStats, 12);
+    r.worker->setTxnJudgedRecordsMax(3);
+    constexpr uint8_t kAllView = pc::kAcksWireView | pc::kAcksWireAll;
+    int next = 0;
+    const auto chars = [&](int n) {
+        std::vector<VerdictRig::SrcRecord> out;
+        for (int i = 0; i < n; ++i) out.push_back(VerdictRig::srcOf(VerdictRig::Char{.userId = uint64_t(20 + next), .name = "c" + std::to_string(next++), .intent = 1}));
+        return out;
+    };
+    const auto first = r.ack(r.appendRecords(chars(2), kAllView, 77, 0, /*txn=*/true));
+    ASSERT_TRUE(first);
+    ASSERT_EQ(first->code, 0);
+    const int64_t leo = r.replica->logEndOffset();
+    const auto refused = r.ack(r.appendRecords(chars(2), kAllView, 77, 2, /*txn=*/true));
+    ASSERT_TRUE(refused);
+    EXPECT_EQ(refused->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge));
+    EXPECT_EQ(r.replica->logEndOffset(), leo) << "the refused batch is not in the log";
+    const auto other = r.ack(r.appendRecords(chars(3), kAllView, 78, 0, /*txn=*/true));
+    ASSERT_TRUE(other);
+    EXPECT_EQ(other->code, 0) << "another producer counts alone, and 3 is the knob";
+    const auto atKnob = r.ack(r.appendRecords(chars(1), kAllView, 77, 2, /*txn=*/true));
+    ASSERT_TRUE(atKnob);
+    EXPECT_EQ(atKnob->code, 0) << "2 + 1 lands exactly on the knob";
+    const auto over = r.ack(r.appendRecords(chars(1), kAllView, 77, 3, /*txn=*/true));
+    ASSERT_TRUE(over);
+    EXPECT_EQ(over->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge));
+
+    Ki plain;
+    plain.r.worker->setTxnJudgedRecordsMax(3);
+    std::vector<Rec> recs;
+    for (uint64_t i = 0; i < 5; ++i) recs.push_back(ups(3000 + i));
+    const auto big = plain.r.ack(plain.r.produceBytes(VerdictRig::batch(recs, 31, 0, {}, /*txn=*/true), kLeader, 31, 0));
+    ASSERT_TRUE(big);
+    EXPECT_EQ(big->code, 0) << "a source with nothing to reject takes it";
+}

@@ -2763,7 +2763,7 @@ TEST(CheckedWritesTxnJudgeRegression, AtomicRejectionLargerThanTheFreeIndexGrows
     r.drive();
     ASSERT_TRUE(r.vs.stalled());
     EXPECT_TRUE(r.st.growOwed);
-    EXPECT_EQ(r.st.growNeed_, 4u);
+    EXPECT_EQ(r.st.growNeed, 4u);
     EXPECT_EQ(r.st.rejected.size(), 0u);
     EXPECT_FALSE(r.pool.oneStepHeld());
     EXPECT_EQ(r.freeOverlays(), rune::view::kTxnOverlaysPerWorker);
@@ -2771,7 +2771,7 @@ TEST(CheckedWritesTxnJudgeRegression, AtomicRejectionLargerThanTheFreeIndexGrows
     r.st.growRejected();
     r.vs.unstall();
     EXPECT_FALSE(r.st.growOwed);
-    EXPECT_EQ(r.st.growNeed_, 0u);
+    EXPECT_EQ(r.st.growNeed, 0u);
     ASSERT_FALSE(r.vs.stalled());
     r.drive();
     EXPECT_FALSE(r.vs.stalled());
@@ -2796,10 +2796,12 @@ TEST(CheckedWritesTxnJudgeRegression, UnvotedTxnRejectionLargerThanTheFreeIndexG
     r.drive(INT64_MAX, 2'000'000'000);
     ASSERT_TRUE(r.vs.stalled());
     EXPECT_TRUE(r.st.growOwed);
-    EXPECT_EQ(r.st.growNeed_, 3u);
+    EXPECT_EQ(r.st.growNeed, 3u);
     EXPECT_EQ(r.st.rejected.size(), 0u);
     EXPECT_FALSE(r.pool.oneStepHeld());
     r.st.growRejected();
+    EXPECT_FALSE(r.st.growOwed);
+    EXPECT_EQ(r.st.growNeed, 0u);
     r.vs.unstall();
     ASSERT_FALSE(r.vs.stalled());
     r.drive(INT64_MAX, 3'000'000'000);
@@ -2813,4 +2815,53 @@ TEST(CheckedWritesTxnJudgeRegression, UnvotedTxnRejectionLargerThanTheFreeIndexG
     EXPECT_FALSE(r.rowed(1));
     EXPECT_EQ(r.vs.judgeCursor(), 14);
     EXPECT_EQ(r.freeOverlays(), rune::view::kTxnOverlaysPerWorker);
+}
+
+// 12b fix: a rejection larger than the index's ceiling can never fit: growth and unstall leave the judge stalled.
+TEST(CheckedWritesTxnJudgeRegression, RejectionLargerThanTheIndexCeilingStaysStalledRegression) {
+    JudgeRig r(true);
+    r.st.rejected.reserve(1);
+    r.st.rejectedMax = 3;
+    r.start();
+    r.batch[0].reserve(3 * 3, r.batch[0].maxRowLen());
+    r.vs.bindTxn(&r.pool, r.batch, 3);
+    r.log.data({{1}, {2}, {3}, {4}}, -1, true);   // 10..13: knob + 1, 4 entries against a ceiling of 3
+    r.drive();
+    ASSERT_TRUE(r.vs.stalled());
+    EXPECT_FALSE(r.st.growOwed);
+    r.st.growRejected();
+    r.vs.unstall();
+    r.drive();
+    EXPECT_TRUE(r.vs.stalled());
+    EXPECT_EQ(r.st.rejected.size(), 0u);
+    EXPECT_EQ(r.st.rejected.capacity(), 1u);
+    EXPECT_EQ(r.vs.judgeCursor(), 10);
+}
+
+// 12b fix: a rejection that fits the ceiling alone but not beside the entries held waits for retention, not for good: growth clamps at
+// the ceiling, the judge stays stalled while the room is short (no stall/unstall loop), and resumes once retention frees it.
+TEST(CheckedWritesTxnJudgeRegression, RejectionBesideHeldEntriesWaitsForRetentionRegression) {
+    JudgeRig r(true);
+    r.st.rejected.reserve(3);
+    r.st.rejectedMax = 5;
+    r.start();
+    r.batch[0].reserve(3 * 3, r.batch[0].maxRowLen());
+    r.vs.bindTxn(&r.pool, r.batch, 2);
+    r.log.data({{1}, {2}, {3}}, -1, true);   // 10..12: fills the capacity of 3
+    r.log.data({{4}, {5}, {6}}, -1, true);   // 13..15: needs 6 against a ceiling of 5
+    r.drive();
+    ASSERT_TRUE(r.vs.stalled());
+    EXPECT_EQ(r.st.rejected.size(), 3u);
+    EXPECT_EQ(r.st.growNeed, 5u) << "clamped to the ceiling";
+    r.st.growRejected();
+    EXPECT_EQ(r.st.rejected.capacity(), 5u);
+    r.vs.unstall();
+    EXPECT_TRUE(r.vs.stalled()) << "2 free of the 3 it waits for";
+    r.st.rejected.dropBelow(11);
+    r.vs.unstall();
+    ASSERT_FALSE(r.vs.stalled());
+    r.drive();
+    EXPECT_FALSE(r.vs.stalled());
+    for (int64_t o = 13; o < 16; ++o) EXPECT_NE(r.st.rejected.find(o), nullptr) << o;
+    EXPECT_EQ(r.vs.judgedThrough(), 16);
 }

@@ -290,7 +290,7 @@ public:
     [[nodiscard]] bool stalled() const noexcept { return stalled_; }
     /// Cold, the owner after growing the index: resumes a judge that stalled on a full index.  The other stalls stay.
     void unstall() noexcept {
-        if (stallReason_ == StallReason::Full && state_ != nullptr && state_->rejected.size() < state_->rejected.capacity()) stalled_ = false;
+        if (stallReason_ == StallReason::Full && state_ != nullptr && state_->rejected.size() + stallRoom_ <= state_->rejected.capacity()) stalled_ = false;
     }
     [[nodiscard]] bool waitingForInstall() const noexcept { return waitingForInstall_; }
     /// While waitingForInstall(): the member whose view is not installed.
@@ -513,6 +513,7 @@ private:
     bool                        needsActivation_ = false;
     bool                        stalled_ = false, waitingForInstall_ = false, held_ = false;
     StallReason                 stallReason_ = StallReason::None;
+    std::size_t                 stallRoom_ = 1;   ///< the index entries the stalled rejection waits for
     ConstraintSetMember         waitingFor_;
     int64_t                     judgeCursor_ = 0, emitFrom_ = 0, setFrom_ = 0;
     int64_t                     checkpointCap_ = INT64_MAX;

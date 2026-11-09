@@ -405,6 +405,20 @@ TEST(ReadCommittedViewRebuildTest, DataBatchesWithNoControlsOpenTxns)
     EXPECT_EQ(f.view.lso(hw), 0);
 }
 
+// Part 11 (P11-7): a rebuild from the log restores the open transaction's record count, so a leader change keeps the produce bound.
+TEST(ReadCommittedViewRebuildTest, RebuildCountsTheOpenTransactionsRecords)
+{
+    RcvFixture f;
+    for (int i = 0; i < 3; ++i) appendData(f.log, 1);
+    appendData(f.log, 2);
+    appendControlMarker(f.log, 2, ControlType::Commit);
+    appendData(f.log, 2);
+    f.view.rebuild(&f.log, f.hw());
+    EXPECT_EQ(f.tracker.recordsOf(1), 3);
+    EXPECT_EQ(f.tracker.recordsOf(2), 1) << "the reopened transaction counts from its own first batch";
+    EXPECT_EQ(f.tracker.recordsOf(9), 0);
+}
+
 TEST(ReadCommittedViewRebuildTest, CommitMarkerClosesTransaction)
 {
     RcvFixture f;

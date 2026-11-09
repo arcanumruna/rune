@@ -646,6 +646,7 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
 // False: the index refused it and the judge stalled.
 bool VerdictSource::recordRejection_(int64_t offset, const Verdict& v) noexcept {
     if (!state_->rejected.add(offset, v.code, v.constraintId)) {
+        stallRoom_ = 1;
         stall_(state_->rejected.size() >= state_->rejected.capacity() ? StallReason::Full : StallReason::OutOfOrder);
         return false;
     }
@@ -653,16 +654,18 @@ bool VerdictSource::recordRejection_(int64_t offset, const Verdict& v) noexcept 
     return true;
 }
 
-// False: n entries do not fit; the worker grows the index to fit and the judge retries, or stalls for good past kIndexMax.
+// False: n entries do not fit.  The worker grows the index (to the ceiling at most) and the judge retries once retention leaves room;
+// only a rejection larger than the ceiling itself stalls for good.
 bool VerdictSource::indexHasRoom_(std::size_t n) noexcept {
     const std::size_t need = state_->rejected.size() + n;
     if (need <= state_->rejected.capacity()) return true;
-    if (need > kIndexMax) {
+    stallRoom_ = n;
+    if (n > state_->rejectedMax) {
         stall_(StallReason::Capacity);
         return false;
     }
-    state_->growNeed_ = need;
-    state_->growOwed  = true;
+    state_->growNeed = std::min(need, state_->rejectedMax);
+    state_->growOwed = true;
     stall_(StallReason::Full);
     return false;
 }

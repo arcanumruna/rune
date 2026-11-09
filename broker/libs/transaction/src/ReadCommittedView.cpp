@@ -252,6 +252,19 @@ void LsoTracker::markVoted(ProducerId producerId, int16_t epoch) noexcept
     }
 }
 
+void LsoTracker::addRecords(ProducerId producerId, int32_t records) noexcept
+{
+    if (producerId < 0) return;
+    if (Slot* s = find_(producerId)) fifo_[s->pos & fifoMask_].records += records;
+}
+
+int64_t LsoTracker::recordsOf(ProducerId producerId) const noexcept
+{
+    if (producerId < 0) return 0;
+    const Slot* s = find_(producerId);
+    return s != nullptr ? fifo_[s->pos & fifoMask_].records : 0;
+}
+
 bool LsoTracker::votedAt(ProducerId producerId, int16_t epoch) const noexcept
 {
     if (producerId < 0) return false;
@@ -314,6 +327,7 @@ RcBuilder::Result RcBuilder::step(const uint8_t* batch, std::size_t avail)
         const int64_t producerId = reader.producerId();
         if (producerId >= 0) {
             tracker_->onProduceBatch(producerId, res.baseOffset);
+            tracker_->addRecords(producerId, reader.recordCount());
             res.outcome = Outcome::TxnData;
         }
     }

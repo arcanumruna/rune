@@ -9933,6 +9933,15 @@ private:
         const rune::protocol::RecordBatchReader r(rbSpan.data(), rbSpan.size());
         return (static_cast<uint16_t>(r.attributes()) & kTxnAttrBit) != 0 && rc.tracker().votedAt(r.producerId(), r.producerEpoch());
     }
+    // Part 11 (P11-7): a transaction past txnJudgedRecordsMax records on a constrained source is TxnTooLarge at its vote or its marker, and
+    // the marker's rejection needs one index entry per record; refusing the batch that takes it past the knob keeps that bounded.
+    // Residual: records produced before the source was constrained still count only from this leadership's log scan; a transaction
+    // of more than 2^24 of them keeps the loud permanent stall in the judge.
+    [[nodiscard]] bool txnPastJudgedMax_(const RcState& rc, const PartitionWriteState* ws, std::span<const uint8_t> rbSpan) const noexcept {
+        const rune::protocol::RecordBatchReader r(rbSpan.data(), rbSpan.size());
+        return (static_cast<uint16_t>(r.attributes()) & kTxnAttrBit) != 0 && ws != nullptr && ws->isConstrainedSource() &&
+               rc.tracker().recordsOf(r.producerId()) + r.recordCount() > txnJudgedRecordsMax_;
+    }
     // F15-FU1 (#112): the verify outbox → the return ring, oldest first, only while the
     // return FIFO is empty (flushRetFifo_); stops at the first refused claim.
     int flushTxnVerifyOutbox_() {
@@ -10363,6 +10372,11 @@ private:
                 enqueueReturn_(ret);
                 return 1;
             }
+            if (txnPastJudgedMax_(*rc, ws, rbSpan)) {
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::TxnTooLarge);   // what the vote answers; not retriable, the producer aborts
+                enqueueReturn_(ret);
+                return 1;
+            }
             if (txnAdmissionRefuses_(*rc, replica, rbSpan, ret)) return 1;
         }
 
@@ -10479,7 +10493,7 @@ private:
         // F15 §2.1 (C1): RC update in the same invocation as the append; a
         // duplicate retry was registered with its original.
         if (rc != nullptr && !outcome.isDuplicate && (outcome.batchAttrs & kTxnAttrBit) != 0) [[unlikely]] {
-            rc->onTxnBatch(f.producerId, outcome.baseOffset);
+            rc->onTxnBatch(f.producerId, outcome.baseOffset, rune::protocol::RecordBatchReader(rbSpan.data(), rbSpan.size()).recordCount());
             if (replica) publishCleanerLso_(replica, *rc);   // D3b: an open txn caps the cleaner
         }
 
