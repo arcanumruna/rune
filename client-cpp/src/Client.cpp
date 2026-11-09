@@ -3095,6 +3095,7 @@ TopicSchemaResult Client::resolveOpenTopicFailure(std::string_view name, uint64_
         // (the kind probe: a typed topic answers like the latest schema, an untyped one OK with no blob).
         TopicSchemaResult kind;
         bool probed = true;
+        const auto probeStarted = std::chrono::steady_clock::now();
         try {
             kind = getTopicSchemaAndWait(name, rune::protocol::client::kSchemaKindFingerprint, remaining);
         } catch (const std::exception&) {
@@ -3106,11 +3107,17 @@ TopicSchemaResult Client::resolveOpenTopicFailure(std::string_view name, uint64_
             if (kind.errorCode == 0 && kind.descriptorBlob.empty())
                 throw std::runtime_error("openTopic: '" + std::string(name) + "' is an untyped (raw) topic; a TypedTopic "
                                          "binds only to a typed topic (use rawTopicAndWait)");
-            // The first answer may predate the topic's apply on this node: the topic is there now and is the caller's type.
-            if (kind.errorCode == 0 && schemaMatches(fingerprint, std::span<const uint8_t>(kind.descriptorBlob))) return kind;
-            if (kind.errorCode == 0)
-                throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
-            code = kind.errorCode;
+            if (kind.errorCode == 0) {
+                // The first answer may predate the topic's apply on this node, and the type may be bound to an older version
+                // than the latest one the probe answered: ask for the caller's fingerprint once more.
+                TopicSchemaResult again = getTopicSchemaAndWait(name, fingerprint, remaining - (std::chrono::steady_clock::now() - probeStarted));
+                if (again.errorCode == 0) return again;
+                if (again.errorCode == kUnknownTopic)
+                    throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
+                code = again.errorCode;
+            } else {
+                code = kind.errorCode;
+            }
         }
     }
     throw std::runtime_error(refused(code));

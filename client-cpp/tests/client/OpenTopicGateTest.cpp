@@ -712,8 +712,9 @@ TEST(OpenTopicGateRegression, OpenFailureWithNoBudgetLeftSkipsTheProbeAdversaria
         EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
     }
     EXPECT_EQ(h.gw->getTopicSchemaSeen, before) << "no probe without budget";
+    h.gw->unknownFingerprintErrorCode = 7;
     EXPECT_NE(openFailureText(*h.client, "characters", 7, 5s).find("stale"), std::string::npos);
-    EXPECT_EQ(h.gw->getTopicSchemaSeen, before + 1);
+    EXPECT_EQ(h.gw->getTopicSchemaSeen, before + 2) << "the kind probe, then the caller's fingerprint again";
 }
 
 // #22: a probe that is never answered proves nothing - the original code is named (never "does not exist" or
@@ -1392,6 +1393,24 @@ TEST(CheckedWritesBind, TypedOpenOfATopicAppliedBetweenTheAnswerAndTheProbeSucce
     h.gw->getTopicId                  = 0x40000001;
     h.gw->getVersion                  = 1;
     h.gw->getBlob                     = serialize(makeCharsV1Descriptor());
+    h.gw->unknownFingerprintErrorCode = 7;
+    h.gw->unappliedFingerprintAnswers = 1;
+    h.gw->fingerprintOverrides[StubV1::kFingerprint] = GateGateway::FingerprintOverride{
+        /*topicId=*/0x40000001, /*version=*/1, serialize(makeCharsV1Descriptor())};
+    GateGatewayPump pump(*h.gw);
+    TypedTopic<StubV1> tt = h.client->openTopicAndWait<StubV1>("characters");
+    EXPECT_EQ(tt.boundVersion(), 1u);
+}
+
+// The same, for a type bound to an older version: the probe answers the latest schema (V2), which is not T's, yet T's own version is
+// registered.  The open asks for T's fingerprint once more and binds to V1.  RED: "generated type is stale".
+TEST(CheckedWritesBind, TypedOpenOfAnOlderVersionAppliedBetweenTheAnswerAndTheProbeSucceedsRegression) {
+    GateHarness h(1422, 1423);
+    h.build();
+    h.connectAndWait();
+    h.gw->getTopicId                  = 0x40000001;
+    h.gw->getVersion                  = 2;
+    h.gw->getBlob                     = serialize(makeCharsV2Descriptor());
     h.gw->unknownFingerprintErrorCode = 7;
     h.gw->unappliedFingerprintAnswers = 1;
     h.gw->fingerprintOverrides[StubV1::kFingerprint] = GateGateway::FingerprintOverride{
