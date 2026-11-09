@@ -3117,7 +3117,7 @@ TopicSchemaResult Client::resolveOpenTopicFailure(std::string_view name, uint64_
                         TopicSchemaResult again = getTopicSchemaAndWait(name, fingerprint, left);
                         if (again.errorCode == 0) return again;
                         code = again.errorCode;
-                    } catch (const std::runtime_error&) {
+                    } catch (const std::exception&) {
                     }
                 }
                 if (code == kUnknownTopic)
