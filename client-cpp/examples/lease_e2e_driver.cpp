@@ -23,19 +23,24 @@
 //                 a LeaseWatch from now; every event is one line `EV <kind> <key> <version> <recv_realtime_ms>` in FILE (the receive
 //                 time is CLOCK_REALTIME, taken in the handler: Expire records carry timestamp 0).  Writes FILE-ready (READY) once the
 //                 initial scan is done and the live set holds ready-live leases.  Ends on F, on expect-expired distinct Expired keys
-//                 (plus 2 s to catch duplicates), or at max-s.  Fails on a key Expired twice.
+//                 (plus 2 s to catch duplicates), or at max-s.  Fails on a (key, version) Expired twice.
 //   scale-hold  --topic T --count N --ttl-ms N --out FILE [--stop-file F] [--max-s N]
 //                 grants N leases through 3 LeaseSessions (one session holds at most 4095), writes `HELD <n>` and keeps them alive,
 //                 appending `ALIVE lost=<n> atrisk=<n> ok=<n>` every second.
+//   ckpt-poll   --topic T --key K [--below N] [--max-s N]
+//                 polls the lease view's row of K (every 50 ms) until its lease_remaining_ms (the folded checkpoint's R) is > 0 and
+//                 < below (default 15000); prints `CKPT remaining_ms=<R> seen_ms=<realtime> version=<v>`.  A raw subscription cannot
+//                 see Checkpoint records (the subscription consumes them), the view row is the client's window onto a folded one.
 //   guard       --lease-topic L --data-topic D --ttl-ms N --out FILE [--key K] [--ready-file F] [--window N] [--after-ms N]
 //                 R5 (spec 12.2): holds a lease, binds a producer to it and sends sequence-numbered records.  After the script cut
-//                 the lease leader (onAtRisk Entered at E) it records O (see below), keeps sending for after-ms, then reads the data
-//                 topic from offset 0 and checks the log against the send log.
+//                 the lease leader (onAtRisk Entered at E) an UNGUARDED producer (its own client session, not bound to the lease)
+//                 appends one marker record to the same partition at the first loop pass at or after E + d; the guarded producer
+//                 keeps sending for after-ms, then the driver reads the data topic from offset 0 and checks the log against the send log.
 //
-// Guard check.  The client has no end-offset query for a data partition (onCaughtUp is the catalog's), so O = 1 + the highest offset
-// acknowledged Ok by a completion polled at realtime <= E + d, d = LeaseSessionOptions::maxDelayMs (100).  A record the producer
-// appended later than E + d has an offset >= O (its ack, if any, comes after E + d).  A record appended just before E + d whose ack
-// is polled after E + d would be reported too: the failure line lists its sequence and ack time.
+// Guard check.  The client has no end-offset query for a data partition, so the marker is the fence: its offset M is acknowledged
+// by the log.  The marker was appended at or after E + d (d = LeaseSessionOptions::maxDelayMs, 100), so a guarded record at an
+// offset > M was appended after E + d: late (spec 12.2).  In-flight batches that failed LeaseAtRisk MAY still be appended within d
+// of their send (they sit before M); the failure line lists each late record's sequence, offset, send time and ack time.
 //
 // Environment: RUNE_TARGET, RUNE_EGRESS_HOST + RUNE_EGRESS_PORT, RUNE_DATA_DIR, RUNE_USER / RUNE_PASSWORD_FILE / RUNE_TLS_CA_FILE,
 // RUNE_TIMEOUT_MS.  Single-threaded per client: one loop with Client::nowNs() and a 1 ms idle sleep; every loop has a hard time cap.
@@ -142,13 +147,14 @@ bool parseArgs(int argc, char** argv, Args& a) {
     return true;
 }
 
-rc::ClientConfig makeConfig() {
+/// slot 0 is the driver's one client; the GUARD leg's marker producer uses slot 1 (its own data dir and egress port).
+rc::ClientConfig makeConfig(int slot = 0) {
     rc::ClientConfig cfg;
     cfg.gatewayChannel   = envStr("RUNE_TARGET");
     cfg.gatewayStreamId  = static_cast<int32_t>(envInt("RUNE_TARGET_STREAM", 1));
-    cfg.egressChannel    = "aeron:udp?endpoint=" + envStr("RUNE_EGRESS_HOST") + ":" + std::to_string(envInt("RUNE_EGRESS_PORT", 40500));
+    cfg.egressChannel    = "aeron:udp?endpoint=" + envStr("RUNE_EGRESS_HOST") + ":" + std::to_string(envInt("RUNE_EGRESS_PORT", 40500) + slot);
     cfg.egressStreamId   = static_cast<int32_t>(envInt("RUNE_EGRESS_STREAM", 2));
-    cfg.dataDir          = envStr("RUNE_DATA_DIR") + "/c0";
+    cfg.dataDir          = envStr("RUNE_DATA_DIR") + "/c" + std::to_string(slot);
     cfg.connectTimeoutMs = static_cast<int>(envInt("RUNE_TIMEOUT_MS", 30000));
     cfg.pingTimeoutMs    = cfg.connectTimeoutMs;
     rune::examples::applyEnvCredentials(cfg);
@@ -408,8 +414,9 @@ struct WatchCtx {
         const int64_t now = realtimeMs();   // the receive time
         const std::string k = keyText(e.key);
         if (e.kind == rc::LeaseEventKind::Expired) {
+            // exactly once per (key, version): a key that is re-granted legitimately expires once per version
             ++w.expiredEvents;
-            if (++w.expired[k] > 1) ++w.dup;
+            if (++w.expired[k + "@" + std::to_string(e.version)] > 1) ++w.dup;
         }
         if (e.kind == rc::LeaseEventKind::Failed) ++w.failed;
         w.buf += "EV ";
@@ -474,7 +481,7 @@ int runWatch(const Args& a) {
     }
     ctx.flush(f);
     std::fclose(f);
-    if (ctx.dup != 0) return failWith("WATCH", std::to_string(ctx.dup) + " keys Expired more than once");
+    if (ctx.dup != 0) return failWith("WATCH", std::to_string(ctx.dup) + " (key, version) pairs Expired more than once");
     if (expectExpired > 0 && static_cast<int64_t>(ctx.expired.size()) != expectExpired)
         return failWith("WATCH", std::to_string(ctx.expired.size()) + " Expired keys, want " + std::to_string(expectExpired));
     return ok("WATCH", "expired=" + std::to_string(ctx.expired.size()) + " events=" + std::to_string(ctx.expiredEvents));
@@ -532,6 +539,38 @@ int runScaleHold(const Args& a) {
     }
     for (auto& s : sessions) s->close();   // reached only without a SIGKILL: revoke
     return ok("SCALE-HOLD");
+}
+
+// ---- ckpt-poll ---------------------------------------------------------------------------------------------------------
+
+int runCkptPoll(const Args& a) {
+    const int64_t below = a.num("below", 15000), maxS = a.num("max-s", 60);
+    rc::Client c(makeConfig());
+    c.connectAndWait();
+    auto lt = c.openLeaseTopicAndWait<LeaseClaim>(a.str("topic"), {}, 30s);
+    const LeaseClaim row = claimRow(a.str("key"));
+    const int64_t    startMs = realtimeMs();
+    int64_t          last = -1;
+    int              errors = 0;
+    for (;;) {
+        try {
+            const auto r = lt.getAndWait(row, -1, 5s);   // the view row: lease_remaining_ms is the last FOLDED checkpoint's R (0 = none)
+            if (r) {
+                last = static_cast<int64_t>(r->lease_remaining_ms);
+                if (last > 0 && last < below) {
+                    std::printf("CKPT remaining_ms=%lld seen_ms=%lld version=%lld\n", static_cast<long long>(last),
+                                static_cast<long long>(realtimeMs()), static_cast<long long>(r->lease_version));
+                    return ok("CKPT-POLL");
+                }
+            }
+        } catch (const std::exception&) {
+            ++errors;   // a leader change in flight: keep polling until the cap
+        }
+        if (realtimeMs() - startMs > maxS * 1000)
+            return failWith("CKPT-POLL", "no folded checkpoint with 0 < remaining < " + std::to_string(below) + " within " + std::to_string(maxS) +
+                                             " s (last remaining_ms " + std::to_string(last) + ", " + std::to_string(errors) + " read errors)");
+        std::this_thread::sleep_for(50ms);
+    }
 }
 
 // ---- guard -------------------------------------------------------------------------------------------------------------
@@ -597,11 +636,26 @@ int runGuard(const Args& a) {
     }
     if (bind != rc::OpResult::Accepted) return failWith("GUARD", "bindProducer: " + std::to_string(int(bind)));
 
+    // The marker producer: an UNGUARDED producer on its OWN client session (slot 1: its own data dir and egress port), connected
+    // before the cut so the marker's append at E + d does not wait for a connect.
+    rc::Client mc(makeConfig(1));
+    mc.connectAndWait();
+    auto               mdata = mc.rawTopicAndWait(a.str("data-topic"));
+    rc::ProducerConfig mpc;
+    mpc.acks              = rc::Acks::All;
+    mpc.deliveryTimeoutMs = 20'000;
+    rc::Producer    mprod = mc.producer(mpc);
+    rc::Completions mq(mc);
+    constexpr uint64_t kMarkerSeq = UINT64_MAX;   // no guarded record uses it
+
     rc::Completions q(c);
     std::vector<Sent> sent;
     sent.reserve(400'000);
-    int64_t     inflight = 0, nextSendMs = 0, okAcks = 0, maxAckedOffset = -1, oFrozen = -1, frozenAtMs = 0;
-    bool        readyWritten = false, oDone = false;
+    int64_t     inflight = 0, nextSendMs = 0, okAcks = 0;
+    bool        readyWritten = false;
+    bool        markerSent = false, markerAcked = false;
+    int64_t     markerSentMs = 0, markerAckMs = 0, markerOffset = -1;
+    uint16_t    markerStatus = 0, markerError = 0;
     int64_t     afterDeadlineMs = 0;
     const int64_t startMs = realtimeMs();
     int           badAfterEntered = 0;
@@ -619,7 +673,6 @@ int runGuard(const Args& a) {
             s.outcome = 1;
             s.offset  = cc.value;
             ++okAcks;
-            if (!oDone) maxAckedOffset = std::max(maxAckedOffset, cc.value);
         } else if (cc.status == rc::OpStatus::DeliveryFailed && cc.errorCode == static_cast<uint16_t>(rc::ClientErrorCode::LeaseAtRisk)) {
             s.outcome = 2;
         } else {
@@ -631,20 +684,34 @@ int runGuard(const Args& a) {
         }
     };
 
+    const auto markerHandle = [&](const rc::Completion& cc, std::span<const uint8_t>) {
+        markerAcked  = true;
+        markerAckMs  = realtimeMs();
+        markerStatus = static_cast<uint16_t>(cc.status);
+        markerError  = cc.errorCode;
+        if (cc.status == rc::OpStatus::Ok) markerOffset = cc.value;
+    };
+
     for (;;) {
         session.doWork(c.nowNs());
         q.poll(handle);
+        mq.poll(markerHandle);
         const int64_t now = realtimeMs();
         if (lost != 0 && enters == 0) return failWith("GUARD", "the lease was lost before Entered");
-        // O: frozen at the first pass at or after E + d (acks polled up to now are counted).
-        if (enters != 0 && !oDone && now >= enteredMs + dMs) {
-            q.poll(handle);
-            oFrozen    = maxAckedOffset + 1;
-            frozenAtMs = realtimeMs();
-            oDone      = true;
-            afterDeadlineMs = frozenAtMs + afterMs;
+        // The marker: appended by the unguarded producer at the first loop pass at or after E + d.
+        if (enters != 0 && !markerSent && now >= enteredMs + dMs) {
+            uint8_t val[16] = {};
+            std::memcpy(val, &kMarkerSeq, 8);
+            const rc::SendResult r = mprod.trySend(mdata, rc::Key(kMarkerSeq), std::span<const uint8_t>(val, 16), mq, 0);
+            if (r == rc::SendResult::Ok) {
+                markerSent      = true;
+                markerSentMs    = realtimeMs();
+                afterDeadlineMs = markerSentMs + afterMs;
+            } else if (r != rc::SendResult::BackPressured && r != rc::SendResult::QueueFull) {
+                return failWith("GUARD", "the marker trySend was refused synchronously: " + std::to_string(int(r)));
+            }
         }
-        if (oDone && now >= afterDeadlineMs) break;
+        if (markerSent && now >= afterDeadlineMs) break;
         if (!readyWritten && okAcks >= 200) {
             appendLine(readyFile, "READY " + std::to_string(g.version) + " " + std::to_string(realtimeMs()));
             readyWritten = true;
@@ -674,10 +741,16 @@ int runGuard(const Args& a) {
         idle();
     }
     if (inflight != 0) return failWith("GUARD", std::to_string(inflight) + " sends never completed");
+    for (int i = 0; i < 30'000 && !markerAcked; ++i) {   // the marker's ack, bounded (the delivery timeout is 20 s)
+        mq.poll(markerHandle);
+        idle();
+    }
+    if (!markerAcked) return failWith("GUARD", "the marker was never acknowledged");
+    if (markerOffset < 0) return failWith("GUARD", "the marker failed: status " + std::to_string(markerStatus) + " err " + std::to_string(markerError));
     if (badAfterEntered != 0) return failWith("GUARD", std::to_string(badAfterEntered) + " sends submitted after Entered did not complete DeliveryFailed/LeaseAtRisk (first: " + firstBad + ")");
 
     appendLine(out, "ENTERED_MS=" + std::to_string(enteredMs));
-    appendLine(out, "O=" + std::to_string(oFrozen));
+    appendLine(out, "MARKER=" + std::to_string(markerOffset));
     // Read the data topic from offset 0 (the data leader is reachable): seq -> offset.
     std::mutex                        mu;
     std::map<uint64_t, int64_t>       logged;      // seq -> offset
@@ -708,14 +781,18 @@ int runGuard(const Args& a) {
     sub.unsubscribe();
 
     std::lock_guard<std::mutex> lk(mu);
-    int         late = 0, missing = 0, mismatch = 0, riskLogged = 0;
+    int         late = 0, missing = 0, mismatch = 0;
     std::string detail;
+    const auto  markerIt = logged.find(kMarkerSeq);
+    if (markerIt == logged.end()) return failWith("GUARD", "the marker (offset " + std::to_string(markerOffset) + ") is not in the log");
+    if (markerIt->second != markerOffset) return failWith("GUARD", "the marker is at offset " + std::to_string(markerIt->second) + " in the log, acknowledged at " + std::to_string(markerOffset));
     for (const auto& [seq, off] : logged) {
-        if (off >= oFrozen) {
-            if (++late <= 5) detail += " late(seq=" + std::to_string(seq) + " off=" + std::to_string(off) + ")";
-        }
-        if (seq < sent.size() && sent[seq].outcome == 2) {
-            if (++riskLogged <= 5) detail += " atrisk-in-log(seq=" + std::to_string(seq) + ")";
+        if (seq == kMarkerSeq || off <= markerOffset) continue;
+        // a guarded record after the marker, itself appended at or after E + d: late
+        if (++late <= 8) {
+            const Sent* s = seq < sent.size() ? &sent[seq] : nullptr;
+            detail += " late(seq=" + std::to_string(seq) + " off=" + std::to_string(off) + " sent_ms=" + (s ? std::to_string(s->sentMs) : "?") +
+                      " ack_ms=" + (s && s->outcome != 0 ? std::to_string(s->ackMs) : "none") + ")";
         }
     }
     for (std::size_t seq = 0; seq < sent.size(); ++seq) {
@@ -724,11 +801,10 @@ int runGuard(const Args& a) {
         if (it == logged.end()) { if (++missing <= 5) detail += " missing(seq=" + std::to_string(seq) + ")"; }
         else if (it->second != sent[seq].offset) { if (++mismatch <= 5) detail += " offset-mismatch(seq=" + std::to_string(seq) + ")"; }
     }
-    std::printf("GUARD sends=%zu ok=%lld entered_ms=%lld O=%lld logged=%zu max_offset=%lld late=%d atrisk_in_log=%d missing=%d mismatch=%d\n", sent.size(),
-                static_cast<long long>(okAcks), static_cast<long long>(enteredMs), static_cast<long long>(oFrozen), logged.size(),
-                static_cast<long long>(maxLogged), late, riskLogged, missing, mismatch);
-    if (late != 0) return failWith("GUARD", std::to_string(late) + " records appended at offset >= O (after Entered + d):" + detail);
-    if (riskLogged != 0) return failWith("GUARD", std::to_string(riskLogged) + " records that completed LeaseAtRisk are in the log:" + detail);
+    std::printf("GUARD sends=%zu ok=%lld entered_ms=%lld marker_sent_ms=%lld marker_ack_ms=%lld M=%lld logged=%zu max_offset=%lld late=%d missing=%d mismatch=%d\n", sent.size(),
+                static_cast<long long>(okAcks), static_cast<long long>(enteredMs), static_cast<long long>(markerSentMs), static_cast<long long>(markerAckMs),
+                static_cast<long long>(markerOffset), logged.size(), static_cast<long long>(maxLogged), late, missing, mismatch);
+    if (late != 0) return failWith("GUARD", std::to_string(late) + " guarded records at an offset > the marker M=" + std::to_string(markerOffset) + " (appended after Entered + d):" + detail);
     if (missing != 0 || mismatch != 0) return failWith("GUARD", "an acknowledged record is missing or at another offset:" + detail);
     return ok("GUARD");
 }
@@ -743,6 +819,7 @@ int usage() {
                  "  hold        --topic T --key K --ttl-ms N --out FILE [--keep-ms N] [--stop-file F] [--max-s N]\n"
                  "  watch       --topic T --log FILE --ready FILE --stop-file F [--max-s N] [--ready-live N] [--expect-expired N]\n"
                  "  scale-hold  --topic T --count N --ttl-ms N --out FILE [--stop-file F] [--max-s N]\n"
+                 "  ckpt-poll   --topic T --key K [--below N] [--max-s N]\n"
                  "  guard       --lease-topic L --data-topic D --ttl-ms N --out FILE [--key K] [--ready-file F] [--window N] [--after-ms N]\n"
                  "environment: RUNE_TARGET, RUNE_EGRESS_HOST, RUNE_EGRESS_PORT, RUNE_DATA_DIR, RUNE_USER, RUNE_PASSWORD_FILE, RUNE_TLS_CA_FILE\n");
     return 2;
@@ -763,6 +840,7 @@ int main(int argc, char** argv) {
         if (mode == "hold") return runHold(a);
         if (mode == "watch") return runWatch(a);
         if (mode == "scale-hold") return runScaleHold(a);
+        if (mode == "ckpt-poll") return runCkptPoll(a);
         if (mode == "guard") return runGuard(a);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "LEASE-E2E: %s threw: %s\n", mode.c_str(), e.what());
