@@ -703,7 +703,7 @@ struct Cluster {
 /// answered; the held vote is released after the crash.  A transaction of one character and one ledger entry
 /// (ids `entryId`) commits through a client seeded on `seed`.  The commit still answers yes within the transaction timeout and a pass, then a
 /// transaction of a fresh producer commits on the survivors.  The crashed one's rows are both visible or neither, to a read_committed reader.
-void expectCrashMidVoteLeavesAllOrNothing(Cluster& k, int victim, int seed, const char* name, uint64_t entryId, bool sameAnswer) {
+void expectCrashMidVoteLeavesAllOrNothing(Cluster& k, int victim, int seed, const char* name, uint64_t entryId) {
     constexpr int32_t timeoutMs = 5'000;
     TxnClient t(k.config(seed), std::string("tx-") + name, timeoutMs);
     const int64_t pid = t.prod->producerId();
@@ -720,8 +720,9 @@ void expectCrashMidVoteLeavesAllOrNothing(Cluster& k, int victim, int seed, cons
     std::atomic<bool> answered{false};
     const auto t0 = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point done;
+    std::chrono::steady_clock::time_point crashedAt;
     std::thread committer([&] {
-        try { r = t.commit(sameAnswer ? 30s : 2s); } catch (const std::exception& e) { thrown = e.what(); }
+        try { r = t.commit(30s); } catch (const std::exception& e) { thrown = e.what(); }
         done = std::chrono::steady_clock::now();
         answered = true;
     });
@@ -729,15 +730,15 @@ void expectCrashMidVoteLeavesAllOrNothing(Cluster& k, int victim, int seed, cons
     if (voted) {
         EXPECT_FALSE(answered) << "the commit answered before the crash";
         k.c.crash(victim);
+        crashedAt = std::chrono::steady_clock::now();
     }
     k.votes->release();
     committer.join();
     ASSERT_TRUE(voted) << "the vote never went out";
-    if (sameAnswer) {
-        ASSERT_TRUE(r.has_value()) << "the commit threw: " << thrown;
-        EXPECT_TRUE(r->ok) << "the commit answered " << r->code;
-        EXPECT_LT(done - t0, std::chrono::milliseconds(timeoutMs) + 1500ms) << "the commit waited past the transaction timeout and a pass";
-    }
+    ASSERT_TRUE(r.has_value()) << "the commit threw: " << thrown;
+    EXPECT_TRUE(r->ok) << "the commit answered " << r->code;
+    EXPECT_LT(done - t0, std::chrono::milliseconds(timeoutMs) + 1500ms) << "the commit waited past the transaction timeout and a pass";
+    if (victim == k.ctl) EXPECT_LT(done - crashedAt, std::chrono::milliseconds(timeoutMs / 2)) << "rediscovered at the stale edge, not after the 5 s grace";
 
     const int survivor = k.c.runningNodes().front();
     ASSERT_NE(survivor, victim);
@@ -764,14 +765,12 @@ TEST(CheckedWritesTxnBrokerRegression, VoterLeaderCrashMidVoteThreeNodesRegressi
     k.moveControllerOff(victim);
     ASSERT_EQ(k.leaderOf(k.characterTopic), victim) << "character moved with the controller";
     ASSERT_TRUE(victim > 0 && victim != k.ctl) << "character is led by " << victim << ", the controller is " << k.ctl;
-    expectCrashMidVoteLeavesAllOrNothing(k, victim, k.ctl, "Voter", 1, true);
+    expectCrashMidVoteLeavesAllOrNothing(k, victim, k.ctl, "Voter", 1);
 }
 
 TEST(CheckedWritesTxnBrokerRegression, CoordinatorCrashMidVoteThreeNodesRegression) {
     Cluster k("cw11_coord");
     k.setUp();
     ASSERT_FALSE(HasFatalFailure());
-    // The new coordinator loads the crashed one's id as a completed abort (the open transaction is not in its log) and answers the re-sent EndTxn 19, which
-    // the client treats as fatal, about 5 s after the crash: the commit does not get its answer back (waited 2 s here).  The rows stay whole or absent, and the next transaction commits.
-    expectCrashMidVoteLeavesAllOrNothing(k, k.ctl, k.ctl % 3 + 1, "Coord", 1, false);
+    expectCrashMidVoteLeavesAllOrNothing(k, k.ctl, k.ctl % 3 + 1, "Coord", 1);
 }
