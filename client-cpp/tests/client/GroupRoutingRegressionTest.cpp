@@ -1892,6 +1892,50 @@ TEST(GroupRoutingRegression, UnreachableCoordinatorFallsBackToTheSeedAndRetriesR
     EXPECT_EQ(r.gw.connectsAt[0], 1) << "the seed session must never move";
 }
 
+// The coordinator was Connected and took the InitProducerId, then died silently.  Its lost session is given up at once - after the
+// stale-session threshold, not after kCoordDownFallbackNs - and the seed names the new coordinator.  RED: the request waited out the
+// 5 s fallback (and 2 x the threshold with the grace scaled to it).
+TEST(GroupRoutingRegression, InitProducerIdInFlightOnACrashedCoordinatorMovesWithTheLostSessionRegression) {
+    RigOptions o = routingClockOptions();   // duty clock
+    o.connectTimeoutMs  = 600'000;          // no connect failure: only the lost session can move the route
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 400'000'000;
+    GroupRig r(4181, 4182, o);
+    const auto [n1, p1port] = r.addNode(4181);
+    const auto [n2, p2port] = r.addNode(4181);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions            = {{1, 0, 0, 1, 4181, ""}};
+    r.gw.coordinatorEndpoint   = n1;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
+    r.gw.initPidReply          = false;   // n1 takes the request and never answers
+    rc::ProducerConfig tcfg;
+    tcfg.acks            = rc::Acks::All;
+    tcfg.transactionalId = "tx-lost";
+    auto tp = r.client.producer(tcfg);
+    r.connect();
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(tp.initTransactions(r.cq, t), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.coordinatorEndpoints.empty() && r.gw.coordinatorEndpoints.back() == n1; }, 4'000))
+        << "precondition: the InitProducerId is in flight on the coordinator";
+    r.gw.deadEndpoints.insert(n1);
+    r.gw.coordinatorEndpoint   = n2;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p2port);
+    r.gw.initPidReply          = true;
+    const int64_t t0 = g_routingClockNs;
+    bool done = false;
+    rc::OpStatus st = rc::OpStatus::Closed;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == t) { done = true; st = cc.status; }
+        });
+        return done;
+    }, 8'000)) << "InitProducerId never completed";
+    EXPECT_EQ(st, rc::OpStatus::Ok);
+    EXPECT_LT(g_routingClockNs - t0, 600'000'000) << "it waited past 1.5 x responseTimeoutNs for the dead coordinator";
+    EXPECT_EQ(r.gw.coordinatorEndpoints.back(), n2);
+    EXPECT_GE(r.client.testCoordinatorFallbacks(), 1u);
+}
+
 // ===========================================================================
 // D4 fix round 1 (re-review r2)
 // ===========================================================================

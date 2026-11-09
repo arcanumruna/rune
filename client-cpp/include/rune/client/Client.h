@@ -1768,9 +1768,9 @@ private:
     // pre-D4 client until a NotCoordinator answer names another node).
     detail::CoordRoute coordRoute_;   // #362: CoordSeed, or CoordRemote{session index, channel, failBase, downSince}
     [[nodiscard]] uint32_t coordIdx() const noexcept { return detail::coordIdxOf(coordRoute_); }
-    // A coordinator that stays down past kCoordDownFallbackNs is given up like an exhausted connect budget (back to
-    // the seed, which names the CURRENT coordinator): a crashed coordinator node's session otherwise retries for
-    // minutes and every txn / group op waits on it.
+    [[nodiscard]] uint64_t staleLossesAt_(uint32_t idx) const noexcept;   // session idx's stale-session losses, not the client's own stalls
+    // A coordinator session that stays down past kCoordDownFallbackNs is given up like an exhausted connect budget (back to the
+    // seed, which names the CURRENT coordinator); one that went stale is given up at once.
     static constexpr int64_t kCoordDownFallbackNs = 5'000'000'000LL;
     uint64_t    coordinatorRedirects_ = 0;   // coordinator moves followed
     uint64_t    coordinatorFallbacks_ = 0;   // coordinator sessions given up (back to the seed)

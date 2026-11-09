@@ -6919,10 +6919,15 @@ void Client::onCoordinatorRedirect_(const std::string& message) {
     // That node's ONE session (lazily opened / re-driven) — 0 = the seed is there.
     const uint32_t idx = agent_.coordinatorSessionIndex(channel, now());
     if (idx == 0) coordRoute_ = detail::CoordSeed{};
-    else          coordRoute_ = detail::CoordRemote{idx, channel, agent_.sessionConnectFailuresAt(idx), std::nullopt};
+    else          coordRoute_ = detail::CoordRemote{idx, channel, agent_.sessionConnectFailuresAt(idx), std::nullopt, staleLossesAt_(idx)};
     groupConsumerHub_.onCoordinatorMoved();   // members -> Rejoining (there)
     producerHub_.onCoordinatorMoved();        // Phase 2b F: AwaitCoordinator requests re-send
     syncCoordinatorSession_();                // already connected: they join at once
+}
+
+uint64_t Client::staleLossesAt_(uint32_t idx) const noexcept {
+    const session::SessionMachine& m = agent_.sessionMachineAt(idx);
+    return m.staleSessionLosses() - m.ownStallLosses();
 }
 
 // D4: see syncSeedSession_ / onCoordinatorRedirect_.  Duty thread.
@@ -6935,15 +6940,14 @@ void Client::syncCoordinatorSession_() noexcept {
         // it to Backoff): back to the seed, whose node answers again with the
         // current coordinator.  Paced by that session's own connect / backoff
         // cycle (each failure is one event), never a spin.
-        // A coordinator node that CRASHED: its session goes stale, then retries against a dead endpoint for
-        // minutes before any of the exhausted-budget states above - so a session that stays down for
-        // kCoordDownFallbackNs is given up too (level-triggered; the seed names the current coordinator, and
-        // each fallback is paced by this grace, never a spin).
+        // A coordinator session that went stale (a crashed node stopped answering for responseTimeoutNs; not a stall of
+        // this client) is given up at once, as a routed leader's lost session is re-asked about (watchProduceRoutes_):
+        // the seed names the current coordinator.  Any other outage, or a connect pending against a dead endpoint, is
+        // given up after kCoordDownFallbackNs, so a seed that still names the dead node is followed at that pace, never a spin.
         const int64_t nowNs = now();
-        // A client that tunes its stale-session threshold waits two of them, never more than kCoordDownFallbackNs.
-        const int64_t graceNs = cfg_.responseTimeoutNs > 0 ? std::min(kCoordDownFallbackNs, 2 * cfg_.responseTimeoutNs) : kCoordDownFallbackNs;
-        const bool downTooLong = detail::coordDownTooLong(*rm, st == session::SessionState::Connected, nowNs, graceNs);
-        const bool gaveUp = downTooLong ||
+        const bool downTooLong = detail::coordDownTooLong(*rm, st == session::SessionState::Connected, nowNs, kCoordDownFallbackNs);
+        const bool lost = staleLossesAt_(rm->idx) != rm->staleBase;
+        const bool gaveUp = downTooLong || lost ||
                             st == session::SessionState::Disconnected ||
                             st == session::SessionState::Rejected ||
                             st == session::SessionState::Closed ||
