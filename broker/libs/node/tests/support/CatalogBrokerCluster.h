@@ -180,8 +180,10 @@ struct ThreeNodes {
     ThreeNodes(ThreeNodes&&) = default;
     ~ThreeNodes() {
         joinKillWatcher_();
-        for (auto it = nodes.rbegin(); it != nodes.rend(); ++it)
-            if (*it) (*it)->stop();
+        std::vector<std::thread> stoppers;
+        for (auto& n : nodes)
+            if (n) stoppers.emplace_back([&n] { n->stop(); });
+        for (auto& t : stoppers) t.join();
     }
 
     static ThreeNodes start(const std::string& tag, std::vector<int> startOnly = {1, 2, 3}, Mode mode = Mode::Shard) {

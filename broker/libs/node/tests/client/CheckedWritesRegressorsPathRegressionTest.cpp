@@ -44,6 +44,7 @@ namespace rc  = rune::client;
 namespace rcv = rune::client::view;
 namespace cw  = rune::node::cw;
 namespace fs  = std::filesystem;
+namespace rr  = rune::replication;
 using rune::codec::PrimType;
 
 namespace {
@@ -62,7 +63,7 @@ rc::ClientConfig clientConfig(catalog_cluster::ThreeNodes& c, int id) {
 
 template <class Pred>
 bool waitFor(Pred&& pred, std::chrono::milliseconds within) {
-    for (const auto deadline = std::chrono::steady_clock::now() + within; std::chrono::steady_clock::now() < deadline; std::this_thread::sleep_for(20ms))
+    for (const auto deadline = std::chrono::steady_clock::now() + within; std::chrono::steady_clock::now() < deadline; std::this_thread::sleep_for(5ms))
         if (pred()) return true;
     return pred();
 }
@@ -178,8 +179,12 @@ catalog_cluster::ThreeNodes startCluster(const std::string& tag, bool fast) {
 /// outlast 10 s on a loaded host (the failure detector alone takes several seconds), so this wait is the one 10 s waitFor that is repeated,
 /// at most 3 times; the rounds beyond the first are counted and printed.
 bool leadersWithin(catalog_cluster::ThreeNodes& c, int32_t topicId, std::vector<int32_t>& leaders) {
+    const auto serving = [&] {
+        return catalog_cluster::awaitLeaders(c, topicId, 1, leaders, 1ms) &&
+               c.node(leaders[0]).onOwnerThreadForTest(topicId, 0, [](rr::PartitionReplica* r) { return r != nullptr && r->role() == rr::Role::Leader; });
+    };
     for (int round = 0; round < 3; ++round) {
-        if (waitFor([&] { return catalog_cluster::awaitLeaders(c, topicId, 1, leaders, 1ms); }, 10s)) return true;
+        if (waitFor(serving, 10s)) return true;
         std::printf("leader wait for topic %d: round %d of 3 timed out\n", topicId, round + 1);
     }
     return false;
@@ -1291,12 +1296,18 @@ TEST(CheckedWritesRegressorsPathRegression, ARestartedControllerDefersItsElectio
 
 /// Every broker stops and starts again, and the character partition has a leader.
 void restartEveryNode(catalog_cluster::ThreeNodes& c, int32_t characterTopic) {
-    for (const int id : c.runningNodes()) c.stop(id);
+    std::vector<std::thread> stoppers;
+    for (const int id : c.runningNodes()) stoppers.emplace_back([&c, id] { c.stop(id); });
+    for (auto& t : stoppers) t.join();
     c.startNodes({1, 2, 3});
     ready(c);
     if (testing::Test::HasFatalFailure()) return;
     std::vector<int32_t> leaders;
     ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
+    ASSERT_TRUE(waitFor([&] {
+        return catalog_cluster::awaitLeaders(c, characterTopic, 1, leaders, 1ms) &&
+               c.node(leaders[0]).onOwnerThreadForTest(characterTopic, 0, [](rr::PartitionReplica* r) { return r != nullptr && r->role() == rr::Role::Leader && r->isr().size() == 3; });
+    }, 10s)) << "the character leader serves with every replica in sync";
 }
 
 // Whole step 7 across nodes: every broker restarts and the limit still holds.
