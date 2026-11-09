@@ -419,14 +419,14 @@ TEST(CheckedWritesTxnVoteClient, RejectedAtomicBatchCompletesOnceWithTheEntry) {
     ASSERT_EQ(b.send(rc::AckToken{9}), rc::OpResult::Accepted);
     r.tick();
     ASSERT_EQ(r.wire.size(), 1u);
-    r.impl->onProduceResponse(r.wire[0].corrId, 100, 0, -1, true, entry(0, kNoVote, kConstraint));
+    r.impl->onProduceResponse(r.wire[0].corrId, 100, 0, -1, true, entry(2, kNoVote, kConstraint));
     ASSERT_EQ(r.acks.times[9], 1);
     const rc::Completion& c = r.acks.done.at(9);
     EXPECT_EQ(c.op, rc::OpKind::Tier2Batch);
     EXPECT_EQ(c.status, OpStatus::BrokerError);
     EXPECT_EQ(c.errorCode, kNoVote);
     EXPECT_EQ(c.reserved0, kConstraint);
-    EXPECT_EQ(c.value, 100) << "the batch's base offset";
+    EXPECT_EQ(c.value, 100) << "the batch's base offset, whatever index the entry names";
     EXPECT_EQ(c.aux, 3);
 }
 
@@ -438,7 +438,7 @@ TEST(CheckedWritesTxnVoteClientRegression, RejectedAtomicBatchCompletesOnceForAn
     r.tick();
     ASSERT_EQ(r.wire.size(), 1u);
     std::vector<uint8_t> three;
-    for (uint16_t i = 0; i < 3; ++i) {
+    for (uint16_t i = 1; i <= 3; ++i) {
         const std::vector<uint8_t> e = entry(i, kNoVote, kConstraint);
         three.insert(three.end(), e.begin(), e.end());
     }
@@ -449,4 +449,24 @@ TEST(CheckedWritesTxnVoteClientRegression, RejectedAtomicBatchCompletesOnceForAn
     EXPECT_EQ(c.errorCode, kNoVote);
     EXPECT_EQ(c.reserved0, kConstraint);
     EXPECT_EQ(c.value, 100);
+}
+
+TEST(CheckedWritesTxnVoteClientRegression, RejectedAtomicBatchAcksTheObserverAllOrNothingRegression) {
+    struct Seen {
+        int calls = 0;
+        rc::BatchAck ack;
+        static void on(void* c, const rc::BatchAck& a) noexcept { auto* s = static_cast<Seen*>(c); ++s->calls; s->ack = a; }
+    } seen;
+    Rig r(cfgOf(Acks::All | Acks::View, false));
+    r.impl->setOnBatchAck(&Seen::on, &seen);
+    rc::BatchBuilder b(r.impl, kTopic, 0);
+    b.add(kVal).add(kVal).add(kVal);
+    ASSERT_EQ(b.send(rc::AckToken{9}), rc::OpResult::Accepted);
+    r.tick();
+    ASSERT_EQ(r.wire.size(), 1u);
+    r.impl->onProduceResponse(r.wire[0].corrId, 100, 0, -1, true, entry(0, kNoVote, kConstraint));
+    ASSERT_EQ(seen.calls, 1);
+    EXPECT_EQ(seen.ack.errorCode, static_cast<int16_t>(kNoVote));
+    EXPECT_EQ(seen.ack.baseOffset, 100);
+    EXPECT_EQ(seen.ack.rejectedCount, 0u) << "an atomic batch stores nothing: no record is 'the rejected one'";
 }

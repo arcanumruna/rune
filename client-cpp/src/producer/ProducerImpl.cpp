@@ -2649,10 +2649,10 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         const bool idsUnknown = b->idStride != 0 && (dupSeq || (!hasTrailer && (off < 0 || assignedBase == 0)));
         if (hasVerdicts && !verdicts.empty()) {
             const int16_t firstCode = static_cast<int16_t>(verdicts[2] | (verdicts[3] << 8));
-            if (b->recordCount > 1)   // stored and judged: the real base, the first code, and every rejection
+            if (b->recordCount > 1 && !b->atomic)   // stored and judged: the real base, the first code, and every rejection
                 emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, firstCode,
                               OpStatus::RecordsRejected, units, b->producerEpoch, b->producerId, verdicts);
-            else                      // a 1-record batch keeps single-record semantics
+            else                      // a 1-record batch keeps single-record semantics; an atomic batch is all or nothing
                 emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, firstCode,
                               OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
         }
