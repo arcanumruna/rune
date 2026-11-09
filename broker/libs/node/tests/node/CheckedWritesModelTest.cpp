@@ -1918,11 +1918,17 @@ TEST_P(CheckedWritesTxnModelRegression, SeededTransactionsMatchTheModelFullLengt
     EXPECT_FALSE(runCwSeed(GetParam()).empty());
 }
 
+// Over the first quarter of the steps (two runs fit 1 s); the whole length is SameSeedSameTraceTxnFullLength, label stress.
 TEST_P(CheckedWritesTxnModelRegression, SameSeedSameTraceTxn) {
     if (GetParam().seed > 8) GTEST_SKIP() << "seeds 1-8 only";
     const std::string first = runCwSeed(GetParam(), kCwSteps / 4);
     const std::string second = runCwSeed(GetParam(), kCwSteps / 4);
     EXPECT_EQ(first, second);
+}
+
+TEST_P(CheckedWritesTxnModelRegression, SameSeedSameTraceTxnFullLength) {
+    if (GetParam().seed > 8) GTEST_SKIP() << "seeds 1-8 only";
+    EXPECT_EQ(runCwSeed(GetParam()), runCwSeed(GetParam()));
 }
 
 namespace {
