@@ -449,6 +449,54 @@ TEST(EpochRestartRegression, StaleSameEpochTailTruncatedAfterRestartRegression) 
     for (auto& n : ns) if (n) n->stop();
 }
 
+// Election batch: a non-controller leader restarted in-process (same OS boot, so its leader-boot marker matches the boot id the
+// registry stamps) inside the controller's liveness window (3 x 1000 ms election-derived, above the ~1 s in-process restart) is
+// re-elected in place at a higher epoch and never leaves the ISR.  RED: without the registry's setBootId the bump is unproven and the
+// partition moves to another member.
+TEST(EpochRestartRegression, RestartedLeaderThatLedInThisBootIsReelectedInPlaceRegression) {
+    constexpr int32_t kParts = 3;
+    TmpDir d0{"n0"}, d1{"n1"}, d2{"n2"};
+    const auto ports = Ports::discover(3);
+    constexpr int64_t kSlowElectionMs = 1000;
+    std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports, 2, kSlowElectionMs),
+                                  makeConfig(1, d1.path, ports, 2, kSlowElectionMs),
+                                  makeConfig(2, d2.path, ports, 2, kSlowElectionMs)};
+    std::array<std::unique_ptr<BrokerNode>, 3> ns;
+    startAll(ns, cfg, {0, 1, 2});
+    for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(defineTestTopic(ns, kParts), 0);
+    for (int32_t p = 0; p < kParts; ++p) {
+        ASSERT_TRUE(produceAny(raw(ns), p, 0xE0, 3));
+        ASSERT_TRUE(eventually([&] { return settledWith(raw(ns), p, 3) >= 0; }));
+    }
+    int32_t part = -1;
+    int victim = -1;
+    ASSERT_TRUE(eventually([&] {
+        const int32_t controller = ns[0]->leaderId();
+        for (int32_t p = 0; p < kParts; ++p) {
+            const int l = settledWith(raw(ns), p, 3);
+            if (l >= 0 && l != controller && ns[1]->leaderId() == controller && ns[2]->leaderId() == controller) {
+                part = p; victim = l; return true;
+            }
+        }
+        return false;
+    })) << "no settled partition led by a non-controller node";
+    const Epoch oldEpoch = maxEpoch(raw(ns), part);
+    ns[victim]->crashForTest();   // no controlled shutdown: stop() would announce it and move the partition away
+    ns[victim] = std::make_unique<BrokerNode>(cfg[victim]);
+    ns[victim]->start();
+
+    bool moved = false;
+    const bool inPlace = eventually([&] {
+        const auto l = leaderOf(raw(ns), part);
+        moved = moved || (l.first >= 0 && l.first != victim);
+        return l.first == victim && l.second > oldEpoch && gatewayIsrSizeOnOwner(*ns[static_cast<std::size_t>(victim)], 0, part) == 3;
+    }, 5'000ms);
+    EXPECT_TRUE(inPlace) << "partition " << part << " was not re-led by node " << victim << " past epoch " << oldEpoch;
+    EXPECT_FALSE(moved) << "the intact restarted leader was moved away";
+    for (auto& n : ns) n->stop();
+}
+
 // ===========================================================================
 // 3. Single-node restart: restart ONLY the node leading a partition (not the
 //    consensus leader, so the controller survives).  Whoever leads that
@@ -460,9 +508,9 @@ TEST(EpochRestartRegression, SingleNodeRestartBumpsLeaderEpochRegression) {
     TmpDir d0{"n0"}, d1{"n1"}, d2{"n2"};
     const auto ports = Ports::discover(3);
     // A liveness timeout far above a node restart (~1 s in-process): the
-    // controller does NOT fail the partition over while its leader restarts —
-    // the restarted node finds itself the committed leader at its old epoch
-    // (the docker DR window: a fast container restart).
+    // restarted node is never declared dead.  stop() is a controlled shutdown
+    // that moves the leadership away; the test pins the epoch bump and the
+    // re-spread back to the victim.
     constexpr int64_t kSlowLivenessMs = 3000;
     std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports, 2, kSlowLivenessMs),
                                   makeConfig(1, d1.path, ports, 2, kSlowLivenessMs),
@@ -508,10 +556,10 @@ TEST(EpochRestartRegression, SingleNodeRestartBumpsLeaderEpochRegression) {
     EXPECT_TRUE(bumped) << "partition " << part << " leadership never moved past epoch " << oldEpoch;
     EXPECT_FALSE(staleLead) << "the restarted node led partition " << part << " at pre-restart epoch "
                             << staleEpoch << " (<= " << oldEpoch << ")";
-    // Fix round 1 (M2 / MAJOR-1): the restarted ex-leader handed leadership to
-    // an in-sync peer; once it is back in the ISR it leads its (preferred)
-    // partition again — leadership re-spreads, never stays collapsed.
-    EXPECT_TRUE(eventually([&] { return settledWith(raw(ns), part, 3) == victim; }, 60'000ms))
+    // stop() hands leadership to an in-sync peer; once the restarted node is
+    // back in the ISR it leads its (preferred) partition again (measured max
+    // 0.6 s over 10 runs), so leadership re-spreads and never stays collapsed.
+    EXPECT_TRUE(eventually([&] { return settledWith(raw(ns), part, 3) == victim; }, 1'000ms))
         << "leadership of partition " << part << " never returned to node " << victim;
     ASSERT_TRUE(produceAny(raw(ns), part, 0xE1, 1));
     EXPECT_TRUE(eventually([&] { return settledWith(raw(ns), part, 4) >= 0; }));

@@ -3082,7 +3082,7 @@ TopicHandle Client::rawTopicAndWait(std::string_view name, std::chrono::nanoseco
     return TopicHandle{r.topicId, r.partitionCount > 0 ? r.partitionCount : 1, TopicKind::Raw};
 }
 
-void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::chrono::nanoseconds remaining) {
+TopicSchemaResult Client::resolveOpenTopicFailure(std::string_view name, uint64_t fingerprint, uint16_t code, std::chrono::nanoseconds remaining) {
     constexpr auto kUnknownTopic = static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownTopic);
     const auto refused = [&](uint16_t c) {
         std::string msg = "openTopic: the broker refused '" + std::string(name) + "' (error " + std::to_string(c);
@@ -3095,6 +3095,7 @@ void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::ch
         // (the kind probe: a typed topic answers like the latest schema, an untyped one OK with no blob).
         TopicSchemaResult kind;
         bool probed = true;
+        const auto probeStarted = std::chrono::steady_clock::now();
         try {
             kind = getTopicSchemaAndWait(name, rune::protocol::client::kSchemaKindFingerprint, remaining);
         } catch (const std::exception&) {
@@ -3106,9 +3107,24 @@ void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::ch
             if (kind.errorCode == 0 && kind.descriptorBlob.empty())
                 throw std::runtime_error("openTopic: '" + std::string(name) + "' is an untyped (raw) topic; a TypedTopic "
                                          "binds only to a typed topic (use rawTopicAndWait)");
-            if (kind.errorCode == 0)
-                throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
-            code = kind.errorCode;
+            if (kind.errorCode == 0) {
+                // The first answer may predate the topic's apply on this node, and the type may be bound to an older version
+                // than the latest one the probe answered: ask for the caller's fingerprint once more.
+                // With no budget left, or a retry that times out, the probe's answer stands: the type is stale.
+                const auto left = remaining - (std::chrono::steady_clock::now() - probeStarted);
+                if (left > std::chrono::nanoseconds::zero()) {
+                    try {
+                        TopicSchemaResult again = getTopicSchemaAndWait(name, fingerprint, left);
+                        if (again.errorCode == 0) return again;
+                        code = again.errorCode;
+                    } catch (const std::exception&) {
+                    }
+                }
+                if (code == kUnknownTopic)
+                    throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
+            } else {
+                code = kind.errorCode;
+            }
         }
     }
     throw std::runtime_error(refused(code));
@@ -6919,14 +6935,15 @@ void Client::onCoordinatorRedirect_(const std::string& message) {
     // That node's ONE session (lazily opened / re-driven) — 0 = the seed is there.
     const uint32_t idx = agent_.coordinatorSessionIndex(channel, now());
     if (idx == 0) coordRoute_ = detail::CoordSeed{};
-    else {
-        const session::SessionMachine& nm = agent_.sessionMachineAt(idx);
-        coordRoute_ = detail::CoordRemote{idx, channel, agent_.sessionConnectFailuresAt(idx), std::nullopt,
-                                          nm.staleSessionLosses() - nm.ownStallLosses()};
-    }
+    else          coordRoute_ = detail::CoordRemote{idx, channel, agent_.sessionConnectFailuresAt(idx), std::nullopt, staleLossesAt_(idx)};
     groupConsumerHub_.onCoordinatorMoved();   // members -> Rejoining (there)
     producerHub_.onCoordinatorMoved();        // Phase 2b F: AwaitCoordinator requests re-send
     syncCoordinatorSession_();                // already connected: they join at once
+}
+
+uint64_t Client::staleLossesAt_(uint32_t idx) const noexcept {
+    const session::SessionMachine& m = agent_.sessionMachineAt(idx);
+    return m.staleSessionLosses() - m.ownStallLosses();
 }
 
 // D4: see syncSeedSession_ / onCoordinatorRedirect_.  Duty thread.
@@ -6939,18 +6956,19 @@ void Client::syncCoordinatorSession_() noexcept {
         // it to Backoff): back to the seed, whose node answers again with the
         // current coordinator.  Paced by that session's own connect / backoff
         // cycle (each failure is one event), never a spin.
-        // A coordinator node that CRASHED: its session goes stale, then retries against a dead endpoint for
-        // minutes before any of the exhausted-budget states above - so a session that stays down for
-        // kCoordDownFallbackNs is given up too (level-triggered; the seed names the current coordinator, and
-        // each fallback is paced by this grace, never a spin).
-        // The grace covers only a route that was followed but never came up: a session that is declared dead by
-        // its node's silence (a new stale loss since the route was made, the client's own stalls excluded) is
-        // given up at that edge, so the in-flight request reaches the new coordinator within the transaction timeout.
+        // A coordinator session that went stale (a crashed node stopped answering for responseTimeoutNs; not a stall of
+        // this client) is given up at once, as a routed leader's lost session is re-asked about (watchProduceRoutes_):
+        // the seed names the current coordinator.  Any other outage of a coordinator that was up is given up after
+        // kCoordDownFallbackNs, so a seed that still names the dead node is followed at that pace, never a spin.
+        // A session that has not been Connected since it became the coordinator is given up after coordNeverUpGraceNs_: it
+        // starts at the metadata backoff and doubles on each such give-up up to kCoordDownFallbackNs, so a seed that keeps
+        // naming a node that never connects is asked at a growing pace.  It resets once a coordinator session is Connected.
         const int64_t nowNs = now();
-        const bool downTooLong =
-            detail::coordDownTooLong(*rm, st == session::SessionState::Connected, nowNs, kCoordDownFallbackNs);
-        const bool stale = m.staleSessionLosses() - m.ownStallLosses() != rm->staleBase;
-        const bool gaveUp = downTooLong || stale ||
+        const bool downTooLong = detail::coordDownTooLong(*rm, st == session::SessionState::Connected, nowNs,
+                                                          rm->wasUp ? kCoordDownFallbackNs : coordNeverUpGraceNs_);
+        if (rm->wasUp) coordNeverUpGraceNs_ = kMetadataBackoffInitNs;
+        const bool lost = staleLossesAt_(rm->idx) != rm->staleBase;
+        const bool gaveUp = downTooLong || lost ||
                             st == session::SessionState::Disconnected ||
                             st == session::SessionState::Rejected ||
                             st == session::SessionState::Closed ||
@@ -6958,6 +6976,10 @@ void Client::syncCoordinatorSession_() noexcept {
                              agent_.sessionConnectFailuresAt(rm->idx) != rm->failBase);
         if (gaveUp) {
             ++coordinatorFallbacks_;
+            if (!rm->wasUp) {
+                scheduleMetadataRefresh();
+                coordNeverUpGraceNs_ = std::min(coordNeverUpGraceNs_ * 2, kCoordDownFallbackNs);
+            }
             if (st == session::SessionState::Rejected || st == session::SessionState::Closed) {
                 coordRejected_ = detail::RejectedCoord{rm->channel, metadataResponses_};   // r2 LOW-3
             }

@@ -1653,10 +1653,20 @@ TEST(CatalogClusterRegression, SliceCellResolvesItsRolesAfterALeaderMoveInThePre
     }
 }
 
+namespace {
+void fastElection(NodeConfig& cfg) {
+    cfg.unservableWarmupMs = 50;
+    cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused;
+    cfg.electionTimeoutMs = 40;
+    cfg.readLeaseMaxMs = 50;
+    cfg.brokerLivenessTimeoutMs = 150;
+}
+}  // namespace
+
 // T1b: awaitCatalogIsrSize follows the CURRENT leader (a follower's isr() is always empty).
 // RED (poll a fixed id captured before the move): times out.
 TEST(ThreeNodesRegression, AwaitCatalogIsrSizeFollowsTheCurrentLeaderRegression) {
-    ThreeNodes c = ThreeNodes::start("isrfollow");
+    ThreeNodes c = ThreeNodes::startWith("isrfollow", fastElection);
     ASSERT_TRUE(c.awaitCatalogLeader(60s));
     Rig rig(c);
     MovedLeader m;
@@ -2064,7 +2074,7 @@ TEST(ThreeNodesRegression, SchedulerWatchdogDetectsAWholeProcessStopRegression) 
 // the owner threads.  A test task that occupies the owner thread for 300 ms is a 300 ms gap of exactly that thread.
 // RED: remove the update in AdminControlPlane::doWork -> controlMaxGapNs stays below 300 ms (likewise AdminWorker::doWork).
 TEST(ThreeNodesRegression, PassGapsMeasureAnOwnerThreadThatWasNotScheduledRegression) {
-    ThreeNodes c = ThreeNodes::start("passgaps");
+    ThreeNodes c = ThreeNodes::startWith("passgaps", fastElection);
     ASSERT_TRUE(c.awaitCatalogLeader(60s));
     BrokerNode& n = c.node(1);
     n.resetPassGapsForTest();

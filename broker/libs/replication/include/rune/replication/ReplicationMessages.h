@@ -589,6 +589,11 @@ struct AlterIsrMsg {
     /// in its leadership).  isr[1] = this flag, `leaderId` = the reporter, isr[2] = the floor
     /// (clamped to int32), isr[3]/isr[4] = the reporter's incarnation, `proposalId` = reportId.
     static constexpr int32_t kBumpLeaderBelowCommitted = 2048;
+    /// Election batch: a partition bump's requester led this partition earlier in the CURRENT OS boot (<log dir>/leader-boot
+    /// holds this boot's id), so its log still holds every record it held then: the committed prefix.  The controller keeps such a
+    /// requester in the ISR and re-elects it in place.  An older controller ignores the bit (it drops the requester, as before);
+    /// a requester that does not set it is dropped (fail closed).  No feature level: both mixes fail closed.
+    static constexpr int32_t kBumpLedThisBoot = 4096;
     int32_t topicId        = 0;
     int32_t partition      = 0;
     NodeId  leaderId       = -1;

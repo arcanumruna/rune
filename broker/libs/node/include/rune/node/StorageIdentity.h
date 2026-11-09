@@ -82,6 +82,13 @@ public:
     /// wiped data dir.  Falls back to `realtimeNowNs` when the dir is empty/unwritable.  Cold (once per process).
     static int64_t bumpProcessIncarnation(const std::string& dataDir, int64_t realtimeNowNs);
 
+    /// The OS boot id (Linux /proc/sys/kernel/random/boot_id, macOS kern.bootsessionuuid); empty when unknown.  Cold (once per process).
+    static std::string osBootId();
+    /// Records that storage failed in OS boot `bootId` (<dataDir>/storage-failed-boot); best-effort fsync.  Cold.
+    static bool markStorageFailedThisBoot(const std::string& dataDir, const std::string& bootId);
+    /// True iff the sentinel names `bootId` (non-empty): a restart in the same boot must not vouch for any log.
+    static bool storageFailedThisBoot(const std::string& dataDir, const std::string& bootId);
+
     static const char* originName(Origin o) noexcept;
     /// 16 lower-case hex digits.
     static std::string idHex(int64_t id);
