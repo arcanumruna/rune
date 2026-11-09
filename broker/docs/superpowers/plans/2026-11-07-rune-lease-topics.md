@@ -453,7 +453,7 @@ view is unchanged (or changed exactly as `expect` says).
   M1 promoted arm without `extend` → `LeasePromotionArmingRegression.ExtendAddedRegression`;
   M2 arm at refold time → `LeaseTrioRegression.PromotionKeepsOldLeaderInIsrRegression`;
   M3 drop `Checkpointing` → `LeaseKeepAliveTableRegression.CheckpointingParksRegression`;
-  M4 grant sets `lastAppended` → `LeaseRaceRegression.ContenderGrantsDoNotDeferExpireRegression`;
+  M4 grant sets `lastAppended` → `LeaseEmitterRegression.ContenderGrantDoesNotDeferExpireRegression`;
   M5 no revoke re-encode → `LeaseWriteHookRegression.RevokeReencodedFullRowRegression` and the filtered-watch leg;
   M6 known-old update answered `LeaseNotFound` while live → `LeaseWriteHookRegression.KnownOldDuplicateTableRegression`;
   M7 guarded resend after `Entered` → `LeaseSessionRegression.GuardBlocksReconnectResendRegression`;
@@ -1198,7 +1198,9 @@ running the applicable sequential cells against the in-process worker + stub gat
   (checked by `LeaseMatrixRegression.TimingCoverageRegression`).
 - Open: `KeepAliveOutageOnRejoinLeaderChangeRegression` fails on purpose (outage 1.64-1.72 s after a leader moves back to a rejoined
   node, budget 1.5 s): an L22 finding for diagnosis. M4 is not turned red by `ContenderGrantsDoNotDeferExpire` (the deferral
-  window is the judge lag; needs a judge-hold seam). M16 has no pause code to mutate.
+  window is the judge lag). Closed at Checkpoint E: `LeaseEmitterRegression.ContenderGrantDoesNotDeferExpireRegression` (in-process,
+  judge held) is red under M4; M1 (`ExtendAddedRegression`) and M3 (`CheckpointingParksRegression`) re-checked red. M16 has no pause
+  code to mutate.
 
 ### Task 18: seeded model-checked stress
 

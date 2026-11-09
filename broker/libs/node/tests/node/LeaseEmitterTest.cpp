@@ -467,6 +467,30 @@ TEST(LeaseEmitterRegression, RevokeBeforeExpireBuiltRegression) {
     EXPECT_EQ(r.stats()->rejectionsLeaseNotFound, 0u);
 }
 
+// 7b. (M4) A contender's grant of a live key, appended but not judged: grants record no lastAppended (R8), so the due key's Expire is still
+// built while the judge holds.  Mutation M4 (a grant sets lastAppended) defers the Expire until the judge passes the grant: red.
+TEST(LeaseEmitterRegression, ContenderGrantDoesNotDeferExpireRegression) {
+    Em e;
+    VerdictRig& r = e.r;
+    ASSERT_TRUE(e.produce({grantRec(1, "a1")}));
+    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_TRUE(e.waitRuntime());
+    r.holdJudge(true);
+    (void)e.send({grantRec(1, "b2")});   // the key is live: judged KeyExists later
+    r.passes(30);
+    ASSERT_TRUE(r.leaseReady());
+    e.advanceMs(5000 + 1);
+    r.passes(3);
+    EXPECT_EQ(expires(r).size(), 1u) << "the contender grant, not yet judged, deferred the live key's Expire";
+    r.holdJudge(false);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(5);
+    EXPECT_EQ(countOp(r, rec::LeaseOp::Expire), 1u);
+    EXPECT_FALSE(r.vs->leaseColumnForTest(VerdictRig::kSrc, 0, 1, 0).has_value()) << "the Expire ended the key";
+    ASSERT_NE(r.stats(), nullptr);
+    EXPECT_EQ(r.stats()->leaseRejectedStaleBroker, 0u);
+}
+
 // 8. A revoke appended after the Expire: the Expire ends the key, the revoke is refused LeaseNotFound.
 TEST(LeaseEmitterRegression, RevokeAfterExpireRegression) {
     Em e;
