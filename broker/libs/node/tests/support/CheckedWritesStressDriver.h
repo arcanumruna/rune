@@ -174,13 +174,19 @@ public:
         std::stringstream script;
         script << in.rdbuf();
         const std::string ep = "127.0.0.1:" + std::to_string(c_.ports.client[static_cast<std::size_t>(ctl - 1)]);
+        std::string ddl;
         for (std::string st : rune::cli::engine::splitStatements(script.str())) {
             if (st.starts_with("topic character "))
                 st.replace(st.find("with (cleanup.policy = compact)"), std::string_view("with (cleanup.policy = compact)").size(),
                            "with (cleanup.policy = compact, segment.bytes = " + std::to_string(segmentRollBytes_ > 0 ? segmentRollBytes_ : 65536) + ", min.compaction.lag.ms = 100, min.cleanable.dirty.ratio = 0.000001, file.delete.delay.ms = 50)");
-            std::stringstream o, e;
-            ASSERT_EQ(rune::cli::run({"ql", "-e", st, "--broker", ep, "--cli-stream-in", std::to_string(tcc::kClientStream)}, o, e), 0) << st << "\n" << e.str();
+            if (st.starts_with("create view account_stats "))
+                st.replace(st.find("characters <= 12"), std::string_view("characters <= 12").size(), "characters <= " + std::to_string(rpCap_));
+            ddl += st + "\n";
         }
+        const std::string ddlFile = (c_.clientsDir->path / "regressorspath.rql").string();
+        std::ofstream(ddlFile) << ddl;
+        std::stringstream o, e;
+        ASSERT_EQ(rune::cli::run({"ql", "-f", ddlFile, "--broker", ep, "--cli-stream-in", std::to_string(tcc::kClientStream)}, o, e), 0) << e.str();
         auto admin = tcc::connectClient(c_, ctl);
         const auto character = admin->getTopicSchemaAndWait("character", 30s);
         ASSERT_EQ(character.errorCode, 0);
@@ -309,7 +315,7 @@ public:
             if (rp_) {
                 models_[p].addAutoIncRule(AutoIncShape{}, 0);
                 models_[p].addLowerNameUniqueRule(nameObj_);
-                models_[p].addCountCheckRule(statsObj_, kRpCap);
+                models_[p].addCountCheckRule(statsObj_, rpCap_);
             } else if (autoInc_) {
                 models_[p].addAutoIncRule(AutoIncShape{.partitions = kAiParts}, p);
             } else if (keyIndex_) {
@@ -367,6 +373,8 @@ public:
     /// Roll the topic's segments at `bytes` instead of 64 KiB (4 KiB in autoincrement mode): a short run closes segments for the cleaner to
     /// compact.  Call before setUp().
     void setSegmentRollBytes(int64_t bytes) noexcept { segmentRollBytes_ = bytes; }
+    /// RegressorsPath mode: account_stats caps a user at `cap` characters instead of 12, so a short run reaches the cap.  Call before setUpRegressorsPath().
+    void setRegressorsPathCap(int64_t cap) noexcept { rpCap_ = cap; }
     /// Key-index mode: `fn` sees every write just before it is sent, and may throw in its place.
     void setKiSendHookForTest(std::function<void(const Sent&)> fn) { kiSendHook_ = std::move(fn); }
     /// `fn` runs before every view row lookup, and may throw in its place.
@@ -828,7 +836,6 @@ private:
     }
     // ---- RegressorsPath mode ----
     static constexpr uint64_t kRpUsers = 4;
-    static constexpr int64_t kRpCap = 12;
     static constexpr const char* kRpNames[] = {"Foo", "foo", "FOO", "Bar", "bar", "Baz", "BAZ", "Qux"};
 
     static std::vector<uint8_t> byIdPlan_(int32_t src) {
@@ -905,7 +912,7 @@ private:
     void replaceStats_() {
         const char* extra = ++statsReplaces_ % 2 == 1 ? ", max(lastPlayed) as lastPlayed" : "";
         const std::string text = std::string("create or replace view account_stats key userId as select count(*) as characters") + extra +
-                                 " from character group by userId constraint max_characters check (characters <= 12);";
+                                 " from character group by userId constraint max_characters check (characters <= " + std::to_string(rpCap_) + ");";
         for (int attempt = 0; attempt < 5; ++attempt) {
             std::string err;
             const int code = qlAny_(text, &err);
@@ -1235,7 +1242,7 @@ private:
     void awaitCompaction_() {
         const auto deadline = Clock::now() + wait_(60s);
         std::string last;
-        for (int poll = 0; poll < kPollCap && Clock::now() < deadline; ++poll, std::this_thread::sleep_for(200ms)) {
+        for (int poll = 0; poll < kPollCap && Clock::now() < deadline; ++poll, std::this_thread::sleep_for(50ms)) {
             snapAll_();
             recordHistory_(&snaps_);
             if (!atRest_(&last)) continue;
@@ -1722,7 +1729,7 @@ private:
             const RpLive live = d.replayBrokerVerdicts_([&](const VerdictRig::RigLogRec& rec, const auto& before, const RpLive& now, const std::set<uint64_t>& members) {
                 if (!why->empty() || rec.del || members.count(d.statsObj_) == 0 || (before && before->first == static_cast<uint64_t>(rec.v))) return;
                 const auto n = std::count_if(now.begin(), now.end(), [&](const auto& kv) { return kv.second.first == static_cast<uint64_t>(rec.v); });
-                if (n > kRpCap) *why = "the write at offset " + std::to_string(rec.offset) + " gave user " + std::to_string(rec.v) + " " + std::to_string(n) + " live characters";
+                if (n > d.rpCap_) *why = "the write at offset " + std::to_string(rec.offset) + " gave user " + std::to_string(rec.v) + " " + std::to_string(n) + " live characters";
             });
             if (!why->empty()) return false;
             const auto v = d.rpViewOf_(d.statsTopic_);
@@ -1818,6 +1825,7 @@ private:
     std::vector<std::map<int64_t, uint8_t>> rawIntents_;
     std::size_t compactedAway_ = 0;
     int64_t segmentRollBytes_ = 0;
+    int64_t rpCap_ = 12;
     std::chrono::milliseconds viewLookupWait_{0};
 };
 
