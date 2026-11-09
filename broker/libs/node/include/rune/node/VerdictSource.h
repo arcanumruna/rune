@@ -191,6 +191,7 @@ public:
         oneStepParked_ = false;
         return ++oneStepClaim_;
     }
+    [[nodiscard]] uint64_t oneStepClaimsForTest() const noexcept { return oneStepClaim_; }
     [[nodiscard]] bool holdsOneStep(uint64_t claim) const noexcept { return oneStepHeld_ && claim == oneStepClaim_; }
     void parkOneStep(uint64_t claim, bool parked) noexcept { oneStepParked_ = holdsOneStep(claim) ? parked : oneStepParked_; }
     void releaseOneStep(uint64_t claim) noexcept { oneStepHeld_ = oneStepHeld_ && claim != oneStepClaim_; }
@@ -279,6 +280,7 @@ public:
     void releaseOneStep() noexcept {
         if (oneStepClaim_ != 0) txnPool_->releaseOneStep(oneStepClaim_);
         oneStepClaim_ = 0;
+        stepParked_ = false;
     }
     /// The leadership scan's begin: the overlays go back, and the judge re-activates from K once the scan is done (the table's
     /// entries are judged anew, so a reset Locked entry gets its apply).
@@ -449,6 +451,7 @@ private:
     bool   rejectTxnRecords_(ReadRangeFn& readRange, int64_t producerId, int64_t first, int64_t end, const rune::view::AbortedTxnFilter& aborted,
                              rune::view::Verdict v) noexcept;
     void   endOrdinary_(const OrdinaryTxn& o) noexcept;
+    void   parkOneStep_(bool parked) noexcept { txnPool_->parkOneStep(oneStepClaim_, parked); stepParked_ = parked; }
     void   restartJudgement_() noexcept;
     [[nodiscard]] bool beginJudgement_(int64_t producerId, int64_t first, int64_t end, bool atMarker) noexcept;
     void   endJudgement_() noexcept;
@@ -553,6 +556,7 @@ private:
     };
     OrdinaryWalk                ordinaryWalk_;
     uint64_t                    oneStepClaim_ = 0;        // the pool's one-step set holds this source's collect while the claim stands
+    bool                        stepParked_ = false;      // this source last parked on the set, waiting for a marker: it takes it from no other parked holder
     int64_t                     failCapacityAt_ = -1;
     TxnProbe                    probe_;
     std::vector<OrdinaryTxn>    ordinary_;
@@ -794,8 +798,9 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
         OrdinaryWalk& w = ordinaryWalk_;
         if (w.marker != o.marker) w = {o.marker, o.first};
         if (!txnPool_->holdsOneStep(oneStepClaim_)) {
-            if (!txnPool_->oneStepClaimable()) return false;   // another source is mid-segment: wait for it
+            if (!txnPool_->oneStepClaimable() || (stepParked_ && txnPool_->oneStepHeld())) return false;   // another source is mid-segment, or parked as this one is: wait for it
             oneStepClaim_ = txnPool_->claimOneStep();
+            stepParked_ = false;
             w.collectFrom = -1;   // another source may have taken the set mid-segment: note the keys again
         }
         if (w.collectFrom < 0) {
@@ -818,7 +823,7 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
             w.checked = w.refill = false;
         }
         if (!w.checked && !checkOrdinary_(readRange, o, aborted, keys)) return false;
-        txnPool_->parkOneStep(oneStepClaim_, false);   // applyTxnBatch_ parks it again on a row a judged transaction holds
+        parkOneStep_(false);   // applyTxnBatch_ parks it again on a row a judged transaction holds
         // The apply walk shares the pass's budget too: it resumes past every batch it walked, plain ones included, as a Locked stop
         // resumes past the last record it applied.
         bool applied = true, more = false;
@@ -914,7 +919,7 @@ bool VerdictSource::lookupTxn_(ReadRangeFn& readRange, int64_t end) noexcept {
         budget -= std::min(budget, len);
         return !l.decided && budget > 0;
     });
-    txnPool_->parkOneStep(oneStepClaim_, !l.decided && l.from >= passHw_);   // scanned to the HW: only T's marker decides it
+    parkOneStep_(!l.decided && l.from >= passHw_);   // scanned to the HW: only T's marker decides it
     return l.decided;
 }
 

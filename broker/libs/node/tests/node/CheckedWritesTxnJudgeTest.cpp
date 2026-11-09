@@ -1978,6 +1978,118 @@ TEST(CheckedWritesTxnJudgeRegression, LockPausedHolderLetsAnotherPartitionJudgeT
     EXPECT_EQ(a.tables(), plain.tables());
 }
 
+// #963: a holder paused on a lock that loses the one-step set after part of its transaction is applied resumes where it stopped.  O writes
+// key 3 below its paused write of key 4; the table is cleared of key 3 while B has the set, so a second apply of it would bring it back.
+TEST(CheckedWritesTxnJudgeRegression, LockPausedHolderNeverAppliesItsAppliedRecordsAgainRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    a.log.data({{4, 1, false, kInsert}}, 66);     // 10, T0
+    a.log.judge(66, 10);                          // 11
+    a.log.data({{3}}, 55);                        // 12, O
+    a.log.data({del(4)}, 55);                     // 13, O
+    a.log.marker(55, true);                       // 14
+    for (int i = 0; i < 4 && a.st.txn.stats.lockPauses == 0; ++i) a.drive();
+    ASSERT_EQ(a.st.txn.stats.lockPauses, 1u) << "O's delete of key 4 pauses on T0's row";
+    ASSERT_TRUE(a.indexed(3)) << "O's write of key 3 below it is applied";
+    b.log.data({{50}, {51}}, 88);                 // 10-11, 88
+    b.log.data({{60, 1, false, kInsert}}, 66);    // 12, T0
+    b.log.marker(88, true);                       // 13
+    b.log.judge(66, 12);                          // 14
+    const uint64_t claims = a.pool.oneStepClaimsForTest();
+    for (int i = 0; i < 8 && (b.st.txn.find(66) == nullptr || !b.st.txn.find(66)->judged); ++i) {
+        b.drive();
+        a.drive();
+    }
+    ASSERT_GT(a.pool.oneStepClaimsForTest(), claims) << "B took the set from the paused A";
+    ASSERT_TRUE(a.index->table.erase(3));
+    a.log.marker(66, true);
+    b.log.marker(66, true);
+    for (int i = 0; i < 8 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_FALSE(a.indexed(3)) << "key 3 is applied once, before the pause";
+    EXPECT_FALSE(a.indexed(4)) << "O's delete applies after T0's insert";
+}
+
+// #963: a holder whose lock pause ended is not parked any more.  O's first write waits on T0's row; once T0's marker lands O applies
+// in two segments (more keys than the set holds), and holds the set between them: B waits for it.
+TEST(CheckedWritesTxnJudgeRegression, ResumedHolderIsNoLongerParkedBetweenSegmentsRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    a.log.data({{4, 1, false, kInsert}}, 66);     // 10, T0
+    a.log.judge(66, 10);                          // 11
+    std::vector<Rec> big{del(4)};
+    for (int64_t id = 1000; id < 2100; ++id) big.push_back({id});
+    a.log.data(big, 55);                          // 12-1112, O: more keys than the one-step set holds
+    a.log.marker(55, true);
+    for (int i = 0; i < 4 && a.st.txn.stats.lockPauses == 0; ++i) a.drive();
+    ASSERT_EQ(a.st.txn.stats.lockPauses, 1u);
+    a.log.marker(66, true);
+    for (int i = 0; i < 4 && a.st.txn.stats.supersedeKeysOverflow == 0; ++i) a.drive();
+    ASSERT_EQ(a.st.txn.stats.supersedeKeysOverflow, 1u) << "O is applied in segments";
+    ASSERT_TRUE(a.pool.oneStepHeld());
+    ASSERT_FALSE(a.pool.oneStepClaimable()) << "A holds the set between its segments, parked no more";
+    b.log.data({{50}, {51}}, 88);                 // 10-11
+    const int64_t marker = b.log.next;
+    b.log.marker(88, true);
+    for (int i = 0; i < 2; ++i) b.drive();
+    EXPECT_EQ(b.vs.judgeCursor(), marker) << "88 waits for the set";
+    EXPECT_FALSE(b.indexed(51));
+    for (int i = 0; i < 16 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_TRUE(b.indexed(51));
+}
+
+// #964: two parked holders passed the set between them on every pass, each collecting its segment's keys anew.  A source that parked
+// when it lost the set waits for the holder to release it instead.
+TEST(CheckedWritesTxnJudgeRegression, ParkedHoldersNeverTakeTheSetFromEachOtherRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    for (JudgeRig* r : {&a, &b}) {
+        const int64_t key = r == &a ? 4 : 5;          // the rows T0 holds are the pool's: one key each
+        r->log.data({{key, 1, false, kInsert}}, 66);  // 10, T0
+        r->log.judge(66, 10);                         // 11
+        r->log.data({del(key)}, 55);                  // 12, O
+        r->log.marker(55, true);                      // 13
+    }
+    for (int i = 0; i < 4 && (a.st.txn.stats.lockPauses == 0 || b.st.txn.stats.lockPauses == 0); ++i) {
+        a.drive();
+        b.drive();
+    }
+    ASSERT_GE(a.st.txn.stats.lockPauses, 1u);
+    ASSERT_GE(b.st.txn.stats.lockPauses, 1u);
+    const uint64_t claims = a.pool.oneStepClaimsForTest();
+    for (int i = 0; i < 20; ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.pool.oneStepClaimsForTest(), claims) << "no collect anew while both wait for their markers";
+    a.log.marker(66, true);
+    b.log.marker(66, true);
+    for (int i = 0; i < 16 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_EQ(b.vs.judgeCursor(), b.log.next);
+    EXPECT_FALSE(a.indexed(4));
+    EXPECT_FALSE(b.indexed(5));
+}
+
 // I3: accepted(r), an ordinary transaction committed below J.
 TEST(CheckedWritesTxnJudge, OrdinaryCommittedBelowJConflicts) {
     JudgeRig r(VoteMembers{100});
