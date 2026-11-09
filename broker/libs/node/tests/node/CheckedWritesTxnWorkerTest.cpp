@@ -1378,3 +1378,25 @@ TEST(CheckedWritesTxnWorker, VerifyRequestReportsThatTheSourceVotes) {
     ASSERT_EQ(plain.worker->txnVerifyRequestsSentForTest(), 1u);
     EXPECT_FALSE(plain.lastVerifyVotes());
 }
+
+// REGRESSION: an open transaction holds K inside a decided commit's span.  A rebuild folds the member to K, where the span is still open,
+// and the judge passed the commit's TxnJudge before the member's fold applied it: the committed delete was lost.
+TEST(CheckedWritesTxnWorkerRegression, RebuildAppliesACommitHeldInsideAnotherTxnsSpanRegression) {
+    Ki k;
+    k.txn(31, {ins(1), ins(2)});
+    ASSERT_EQ(k.vote(31).code, 0);
+    k.r.marker(31, true);
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    ASSERT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{1, 2}));
+    k.txn(32, {Rec{1, 0, 0, true, 1}});
+    k.txn(33, {ins(5)});   // voted, undecided: K stays at its first record, inside 32's span
+    const int64_t tok32 = k.r.sendVote(VerdictRig::kSrc, 32, 0), tok33 = k.r.sendVote(VerdictRig::kSrc, 33, 0);
+    ASSERT_TRUE(k.r.driveUntilVoted(tok32));
+    ASSERT_TRUE(k.r.driveUntilVoted(tok33));
+    k.r.marker(32, true);
+    k.r.passes(60);
+    ASSERT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{2}));
+    k.r.demotePromote();
+    k.r.passes(60);
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{2})) << "the rebuild applies 32's delete";
+}

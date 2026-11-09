@@ -390,7 +390,7 @@ private:
     struct TxnProbe { int64_t producerId = -1, first = -1, from = -1, waitAt = -1; };
     struct OwedMarker { int64_t producerId; int64_t judgeOffset; int64_t from; };   // a re-offered TxnJudge's marker, searched from `from`
     // Judge: the judge stands at a TxnJudge to judge (judgePid_).  Locked: a record touches a row a transaction holds (P11-4).
-    enum class TxnStop : uint8_t { None, Probe, Marker, Judge, Locked };
+    enum class TxnStop : uint8_t { None, Probe, Marker, Judge, Locked, Fold };
     enum class ProbeStep : uint8_t { Next, Classified, Wait };
     // The transaction being judged at `end`, its TxnJudge (or its marker, P11-7): the chained read of [first, end), then the P11-3
     // scan of (first, end), each from `from` and bounded per pass.  The overlay and its key set are kept across passes.
@@ -1229,7 +1229,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
                 if (checkpointCap_ != INT64_MAX && span >= checkpointCap_) break;   // one step past the cap: its delta holds it alone
                 continue;
             }
-            if (txnStop_ == TxnStop::Locked || judgeCursor_ == before) break;
+            if (txnStop_ == TxnStop::Fold || txnStop_ == TxnStop::Locked || judgeCursor_ == before) break;
         }
         state.rejected.noteCovered(judgedThrough());
     }
