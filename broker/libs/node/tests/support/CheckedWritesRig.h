@@ -223,11 +223,21 @@ public:
     void createLeaseTopic(uint32_t maxKeys = 1000, std::optional<rune::codec::Descriptor> src = std::nullopt) {
         rune::protocol::LeaseSpec ls;
         ls.maxKeys = maxKeys;
+        createLeaseTopicSpec(ls, std::move(src));
+    }
+    /// The same with the whole lease spec (Task 12: checkpoint keys).
+    void createLeaseTopicSpec(const rune::protocol::LeaseSpec& ls, std::optional<rune::codec::Descriptor> src = std::nullopt) {
         lease_ = ls;
         keyFieldId_ = 4;
         useSource(src ? std::move(*src) : leaseSourceDescriptor(), KeyShape{rune::codec::PrimType::UInt64});
         for (int i = 0; i < kMaxPass && !leaseIndexLogged(); ++i) pass();
         ASSERT_TRUE(leaseIndexLogged()) << "the lease index never became the logged set's member";
+    }
+    /// The ALTER seam of the lease.* keys: the catalog applier hands the worker the same WriteSpecUpdate op, which replaces the lease block
+    /// of the topic's write spec in place (the running lease runtime reads it per call).
+    void alterLeaseSpec(const rune::protocol::LeaseSpec& ls) {
+        lease_ = ls;
+        send(specOp_(false));
     }
     [[nodiscard]] bool leaseIndexLogged() const {
         const PartitionWriteState* w = writeState();

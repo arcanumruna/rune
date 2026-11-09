@@ -611,6 +611,8 @@ public:
         return w == nullptr ? nullptr : w->leaseRuntime.get();
     }
     void setLeaseBatchCapForTest(std::size_t bytes) noexcept { leaseBatchCapOverrideForTest_ = bytes; }
+    /// Test seam (Task 12): the promotion pass's chunk (row ids per pass) of runtimes created afterwards; 0 keeps every entry Free.
+    void setLeasePromotionChunkForTest(uint32_t chunk) noexcept { leasePromotionChunkForTest_ = chunk; }
     /// Lease topics Task 11a: the leader heartbeat timeout (ns) granted to a promoted key (spec 9.7).  Applies to runtimes created afterwards.
     void setLeaseExtendNs(int64_t ns) noexcept { leaseExtendNs_ = ns; }
     [[nodiscard]] const lease::LeaseParkTable& leaseParksForTest() const noexcept { return *leaseParks_; }
@@ -623,7 +625,8 @@ public:
         if (PartitionWriteState* w = writeOf_(findOwnedReplica_(topicId, partition)); w != nullptr && w->leaseRuntime)
         {
             const LeaseIndexRef ref = viewSet_->leaseIndexOf(topicId, partition);
-            w->leaseRuntime->onEvents(events, leaseNowNs, *leaseParks_, &ref);
+            static const rune::protocol::LeaseSpec kDefaultSpec{};
+            w->leaseRuntime->onEvents(events, leaseNowNs, *leaseParks_, w->spec != nullptr && w->spec->lease ? *w->spec->lease : kDefaultSpec, &ref);
         }
     }
     /// Test seams (Task 10 review fixes): the lookups leaseDuty_ made (the idle skip keeps this still).
@@ -6664,6 +6667,7 @@ private:
     // entries of the keepalive op being served (256 x 12 bytes: one wire entry each).
     std::unique_ptr<lease::LeaseParkTable> leaseParks_ = std::make_unique<lease::LeaseParkTable>();
     int64_t  leaseExtendNs_ = 0;
+    uint32_t leasePromotionChunkForTest_ = lease::kLeasePromotionChunk;
     std::array<uint8_t, 256 * 12> leaseKaScratch_{};
     uint64_t leaseKeepAlives_ = 0;      // LeaseKeepAlive ops executed
     uint64_t leaseTimeToLives_ = 0;     // LeaseTimeToLive ops executed
@@ -7565,8 +7569,8 @@ private:
                 continue;
             }
             const uint64_t gen = replica->leadershipGeneration();
-            // Idle skip (F8): a runtime of this leadership with no event to fold, no wheel due, no clear owed and no parked answer
-            // queued has nothing to do, so the pass costs no index lookup.  Skipping the rebuild-epoch check while idle is safe:
+            // Idle skip (F8): a runtime of this leadership with no event to fold, no wheel due, no clear owed, no promotion walk left and no
+            // parked answer queued has nothing to do, so the pass costs no index lookup.  Skipping the rebuild-epoch check while idle is safe:
             // nothing is emitted while idle, and the first non-idle pass (an event, a due wheel, a clear) checks the epoch before it
             // emits.  The leadership generation is a cheap member read and is still checked here.
             if (w->leaseRuntime && w->leaseEvents.buf.empty() && w->leaseRuntime->leaderGeneration() == gen && leaseParks_->queued() == 0 &&
@@ -7580,14 +7584,18 @@ private:
             const uint64_t epoch    = viewSet_->leaseRebuildEpoch(topicId, partition);
             if (w->leaseRuntime && !w->leaseRuntime->sameIdentity(gen, epoch))
                 dropLeaseRuntime_(*w, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
-            if (!w->leaseRuntime && lk.ready) {   // cold; live keys at creation are armed by Task 12's promotion pass, not here
+            if (!w->leaseRuntime && lk.ready) {   // cold; the live keys at creation are armed by the promotion pass below, at this time (T_ready)
                 if (!leaseEmitWork_) leaseEmitWork_ = std::make_unique<lease::LeaseEmitWork>(kLeaseEmitReserveBytes);
                 w->leaseRuntime = std::make_unique<lease::LeaseRuntime>(gen, epoch, w->spec->lease->maxKeys, leaseNowNs, topicId, partition,
                                                                         leaseExtendNs_);
+                w->leaseRuntime->setPromotionChunkForTest(leasePromotionChunkForTest_);
             }
             if (w->leaseRuntime) {
-                w->leaseRuntime->onEvents(w->leaseEvents.buf, leaseNowNs, *leaseParks_, &lk.ref);
+                const rune::protocol::LeaseSpec& lspec = *w->spec->lease;
+                w->leaseRuntime->onEvents(w->leaseEvents.buf, leaseNowNs, *leaseParks_, lspec, &lk.ref);
                 work += static_cast<int>(w->leaseEvents.buf.size());
+                if (lk.ready && !w->leaseRuntime->promotionDone())   // the events above arm their keys first; the pass links the rest
+                    work += static_cast<int>(w->leaseRuntime->promote(lk.ref, lspec, leaseNowNs));
             }
             w->leaseEvents.buf.clear();   // consumed (or discarded: no runtime yet)
             if (!w->leaseRuntime || !lk.ready) continue;
@@ -7599,7 +7607,7 @@ private:
             const std::size_t cap     = leaseBatchCap_(replica);
             const std::size_t hardCap = leaseHardCap_();
             const ReplReadScope rs(*replica, replScratch_);   // the appends' push reads into the scratch
-            // Order: fold (above) -> the clears the parked keepalives wait for -> the due Expires.
+            // Order: fold (above) -> promotion (above) -> the clears the parked keepalives wait for -> the due Expires -> the due checkpoints.
             const uint32_t cleared = w->leaseRuntime->flushClears(*leaseEmitWork_, lk.ref, writer, w->judgedThrough, leaseNowNs, cap, hardCap,
                                                                   *replica, *leaseParks_);
             if (cleared != 0) {
@@ -7610,6 +7618,12 @@ private:
                                                            w->spec->lease->expiryBatch, *replica);
             if (emitted != 0) {
                 work += static_cast<int>(emitted);
+                noteLeaseAppended_(replica, w->leaseRuntime->lastBatchBytes());
+            }
+            const uint32_t checkpointed = w->leaseRuntime->emitCheckpoints(*leaseEmitWork_, lk.ref, writer, w->judgedThrough, leaseNowNs, cap, hardCap,
+                                                                           *w->spec->lease, *replica);   // after the Expires: a due key expires first
+            if (checkpointed != 0) {
+                work += static_cast<int>(checkpointed);
                 noteLeaseAppended_(replica, w->leaseRuntime->lastBatchBytes());
             }
         }
@@ -7773,7 +7787,7 @@ private:
         const ReplReadScope rs(*sv.replica, replScratch_);
         rune::protocol::client::forEachValidatedLeaseKeepAliveEntry(tail, count, [&](uint16_t index, std::span<const uint8_t> key, int64_t version) {
             const lease::LeaseKaOutcome o = rt.keepAlive(sv.lk.ref, key, version, sv.w->judgedThrough, nowNs, *leaseParks_, req, sid, corr, index,
-                                                          owedCapAllows_());
+                                                          owedCapAllows_(), *sv.w->spec->lease);
             if (o.parked) return;
             putKaEntry_(leaseKaScratch_.data() + static_cast<std::size_t>(decided) * 12, index, o.code, o.ttlMs);
             ++decided;

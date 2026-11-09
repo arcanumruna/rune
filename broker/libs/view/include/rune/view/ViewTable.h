@@ -147,6 +147,10 @@ public:
         return auxChunks_[rid >> chunkShift_].get() + (rid & chunkMask_) * auxBytes_;
     }
     [[nodiscard]] uint32_t auxBytesPerRow() const noexcept { return static_cast<uint32_t>(auxBytes_); }
+    // Every row id ever handed out is below this (a never-used id is bumped from it; erased ids go to the free-list and are
+    // reused first).  A consumer that walks rows by id (the lease promotion pass) walks [0, ridHighWater()) and asks its own
+    // liveness marker which of them hold a row.
+    [[nodiscard]] uint32_t ridHighWater() const noexcept { return nextRid_; }
     // Row ids addressable without another chunk (rowsPerChunk x chunks).
     [[nodiscard]] size_t ridCapacity() const noexcept { return chunks_.size() * rowsPerChunk_; }
 

@@ -30,6 +30,10 @@ struct LeaseWriter;
 
 namespace rune::node::lease {
 
+/// The most Checkpoint records one batch carries, and the most row ids one promotion pass links (spec 9.5, 9.6).
+inline constexpr uint32_t kLeaseCheckpointBatchMax = 1000;
+inline constexpr uint32_t kLeasePromotionChunk     = 4096;
+
 struct LeaseRuntimeStats {
     uint64_t expiriesAppended   = 0;   ///< Expire records appended
     uint64_t expiryBatches      = 0;   ///< successful appendLeaseBatch calls
@@ -49,6 +53,10 @@ struct LeaseRuntimeStats {
     uint64_t rejectedStale      = 0;   ///< BrokerRejected events of an in-flight entry whose row moved on (version differs / row gone): entry Free
     uint64_t ridPastMaxKeys     = 0;   ///< Granted events whose row id is past maxKeys (dropped)
     uint64_t growFailures       = 0;   ///< cold growth of the entry store threw bad_alloc (the grant stays untracked / the growth is retried)
+    uint64_t checkpointsAppended = 0;  ///< Checkpoint(R) records appended (Task 12)
+    uint64_t checkpointBatches  = 0;   ///< successful appendLeaseBatch calls of emitCheckpoints
+    uint64_t checkpointDeferred = 0;   ///< due checkpoints skipped because lastAppended >= judgedThrough (per poll visit)
+    uint64_t promotionLinked    = 0;   ///< entries the promotion pass linked (Free rows armed at the promotion deadline)
     uint64_t clearExamined      = 0;   ///< flushClears: live ring entries handled (flag set and position current); stale ones are skipped for free
 };
 
@@ -71,6 +79,7 @@ struct LeaseEmitWork {
     std::vector<uint8_t>               batch;
     std::array<uint8_t, kValueBytes>   valueTmp{};
     std::array<uint32_t, rune::protocol::kMaxLeaseExpiryBatch> rids{};
+    std::array<uint64_t, kLeaseCheckpointBatchMax> ckptMs{};   ///< the remaining time (ms) each appended Checkpoint carries, beside `rids`
 };
 
 class LeaseRuntime {
@@ -89,11 +98,14 @@ public:
     [[nodiscard]] int32_t partition() const noexcept { return partition_; }
     [[nodiscard]] bool sameIdentity(uint64_t gen, uint64_t epoch) const noexcept { return gen_ == gen && epoch_ == epoch; }
     [[nodiscard]] uint64_t leaderGeneration() const noexcept { return gen_; }
-    /// Whether a duty pass has anything to do at `leaseNowNs` besides folding events: a deadline or checkpoint wheel due, or a
-    /// parked keepalive waiting for its clear.  (Task 12's promotion pass is not a wheel; it runs at runtime creation.)
+    /// Whether a duty pass has anything to do at `leaseNowNs` besides folding events: a deadline or checkpoint wheel due, a parked
+    /// keepalive waiting for its clear, or the promotion pass still walking rows (it is not a wheel: it advances every pass until done).
     [[nodiscard]] bool hasPendingWork(int64_t leaseNowNs) const noexcept {
-        return timers_.deadline().nextCheckNs() <= leaseNowNs || timers_.checkpoint().nextCheckNs() <= leaseNowNs || clearHead_ != clearTail_;
+        return timers_.deadline().nextCheckNs() <= leaseNowNs || timers_.checkpoint().nextCheckNs() <= leaseNowNs || clearHead_ != clearTail_ ||
+               !promotionDone();
     }
+    [[nodiscard]] bool promotionDone() const noexcept { return promoteDone_; }
+    [[nodiscard]] int64_t readyNs() const noexcept { return readyNs_; }
     void noteRollDeferredSkip() noexcept { ++stats_.rollDeferredSkips; }
     /// The byte size of the batch the last successful emit / flushClears appended.
     [[nodiscard]] std::size_t lastBatchBytes() const noexcept { return lastBatchBytes_; }
@@ -103,8 +115,23 @@ public:
     /// A fold action that answers parked keepalives (Clearing's own Checkpoint, an end of the key, a replay) does so through `parks`.
     /// `ref` (may be null in a bare unit test: a rejected record is then taken as the entry's own) is the lease index the rejected
     /// record's version is compared against.
-    void onEvents(std::span<const LeaseEvent> events, int64_t leaseNowNs, LeaseParkTable& parks, const LeaseIndexRef* ref = nullptr) noexcept;
+    /// `spec` is the topic's lease spec read per call (an ALTER of the checkpoint keys applies to checkpoints scheduled afterwards).
+    void onEvents(std::span<const LeaseEvent> events, int64_t leaseNowNs, LeaseParkTable& parks, const rune::protocol::LeaseSpec& spec,
+                  const LeaseIndexRef* ref = nullptr) noexcept;
 
+    /// The promotion pass (spec 9.6): links the live rows of the lease table that still have a Free entry, at most kLeasePromotionChunk
+    /// row ids per call, from where the last call stopped, at the promotion deadline.  Runs every duty pass until promotionDone().
+    /// Returns the entries linked.  A growth failure stops the pass at that rid (retried next pass).
+    uint32_t promote(const LeaseIndexRef& ref, const rune::protocol::LeaseSpec& spec, int64_t leaseNowNs);
+    /// Test seam: the promotion pass's chunk size (rids per pass).
+    void setPromotionChunkForTest(uint32_t chunk) noexcept { promoteChunk_ = chunk; }
+
+    /// The checkpoint time of a lease whose current remaining-or-ttl time is `rMs` (spec 9.5): now + interval when checkpointing is on
+    /// and rMs exceeds the interval, else kLeaseNoCheckpoint.
+    [[nodiscard]] static int64_t checkpointTime(const rune::protocol::LeaseSpec& spec, uint64_t rMs, int64_t leaseNowNs) noexcept {
+        if (spec.checkpoint == 0 || rMs <= spec.checkpointIntervalMs) return kLeaseNoCheckpoint;
+        return satAdd(leaseNowNs, msToNsSat(spec.checkpointIntervalMs));
+    }
     /// The deadline of a key promoted at this runtime's ready time (spec 9.7): readyNs + extendNs + (remaining, else ttl).  Saturating.
     [[nodiscard]] int64_t promotionDeadline(uint64_t ttlMs, uint64_t remainingMs) const noexcept {
         return satAdd(readyNs_, satAdd(extendNs_, msToNsSat(remainingMs > 0 ? remainingMs : ttlMs)));
@@ -121,7 +148,7 @@ public:
     /// no state change.  Allocates nothing (the entry store grows cold, as Granted does).
     [[nodiscard]] LeaseKaOutcome keepAlive(const LeaseIndexRef& ref, std::span<const uint8_t> key, int64_t version, int64_t judgedThrough,
                                            int64_t leaseNowNs, LeaseParkTable& parks, uint32_t& req, int64_t sessionId, int64_t correlationId,
-                                           uint16_t index, bool owedRoom);
+                                           uint16_t index, bool owedRoom, const rune::protocol::LeaseSpec& spec);
 
     /// Appends one batch of Checkpoint(0) records for the keys whose parked keepalives wait to clear their remaining time (the clear-wanted
     /// ring), and answers the ones whose row already has remaining 0.  `byteCap` bounds the batch (namespace / intake limit); `hardCap`
@@ -144,6 +171,13 @@ public:
     uint32_t emit(LeaseEmitWork& work, const LeaseIndexRef& ref, const LeaseWriter& writer, int64_t judgedThrough, int64_t leaseNowNs,
                   std::size_t byteCap, std::size_t hardCap, uint32_t maxRecords, rune::replication::PartitionReplica& replica);
 
+    /// One batch of Checkpoint(R) records (spec 9.5): polls the checkpoint wheel for at most min(kLeaseCheckpointBatchMax, the tokens left
+    /// in this second's window) due Armed entries, skips (and unschedules) the ones with R <= interval, the gate-closed ones wait, encodes
+    /// the others from their rows at the latest writer with remaining = ceil_ms(deadline - leaseNow) and appends them.  Returns the
+    /// records appended.  A refused append reschedules its entries at `leaseNowNs` (due again next cycle).
+    uint32_t emitCheckpoints(LeaseEmitWork& work, const LeaseIndexRef& ref, const LeaseWriter& writer, int64_t judgedThrough, int64_t leaseNowNs,
+                             std::size_t byteCap, std::size_t hardCap, const rune::protocol::LeaseSpec& spec, rune::replication::PartitionReplica& replica);
+
     [[nodiscard]] const LeaseRuntimeStats& stats() const noexcept { return stats_; }
     [[nodiscard]] LeaseTimers& timersForTest() noexcept { return timers_; }
     [[nodiscard]] const LeaseTimers& timers() const noexcept { return timers_; }
@@ -156,7 +190,7 @@ private:
         uint64_t ttlMs;
     };
     /// The keepalive decision for an entry that is linked (Free is armed by the caller first): leaseStep, then the RearmAnswerOk side effect.
-    KaStep kaStep_(uint32_t rid, int64_t leaseNowNs, bool remainingPositive, uint64_t ttlMs, bool gateOpen) noexcept;
+    KaStep kaStep_(uint32_t rid, int64_t leaseNowNs, bool remainingPositive, uint64_t ttlMs, bool gateOpen, const rune::protocol::LeaseSpec& spec) noexcept;
     /// Puts `rid` on the clear ring (idempotent by the flag).  A full ring is compacted first; false = still full (the caller must not park).
     [[nodiscard]] bool flagClear_(uint32_t rid) noexcept;
     /// Keeps only the live ring entries (flag set, position current) whose rid still has parks, rewriting their positions; a live entry
@@ -169,8 +203,15 @@ private:
     /// Whether flagClear_(rid) would succeed (compacts a full ring).
     [[nodiscard]] bool clearRoom_(uint32_t rid) noexcept;
     /// Decides the chain of `rid` ONCE (the decision depends only on the entry's state and the row values): answered as a whole, or left parked.
-    void replay_(uint32_t rid, int64_t leaseNowNs, bool remainingPositive, uint64_t ttlMs, LeaseParkTable& parks) noexcept;
-    void foldStep_(uint32_t rid, LeaseEntryEvent event, const LeaseEvent& ev, int64_t leaseNowNs, LeaseParkTable& parks) noexcept;
+    void replay_(uint32_t rid, int64_t leaseNowNs, bool remainingPositive, uint64_t ttlMs, LeaseParkTable& parks, const rune::protocol::LeaseSpec& spec) noexcept;
+    void foldStep_(uint32_t rid, LeaseEntryEvent event, const LeaseEvent& ev, int64_t leaseNowNs, LeaseParkTable& parks,
+                   const rune::protocol::LeaseSpec& spec) noexcept;
+    /// A keepalive re-arm (RearmAnswerOk / the Clearing fold): schedules the next checkpoint only when none is scheduled.
+    void scheduleIfNone_(uint32_t rid, uint64_t ttlMs, int64_t leaseNowNs, const rune::protocol::LeaseSpec& spec) noexcept;
+    /// The checkpoint tokens left in the current one-second window of the lease clock (aligned to readyNs_).
+    [[nodiscard]] uint32_t checkpointTokens_(const rune::protocol::LeaseSpec& spec, int64_t leaseNowNs) noexcept;
+    /// Cold-grows the entry store to cover `rid`: true = covered; false = past maxKeys (counted) or the growth threw (counted, growFailed).
+    [[nodiscard]] bool coverOrCount_(uint32_t rid, bool& growFailed);
 
     static constexpr uint32_t kClearRingCap = 2 * kLeaseParkTableEntries;   ///< a power of two; the live entries are flagged rids with parks, <= the park table
     uint64_t         gen_, epoch_;
@@ -181,6 +222,11 @@ private:
     uint64_t         clearHead_ = 0, clearTail_ = 0;
     std::size_t      lastBatchBytes_ = 0;
     bool             ridPastWarned_  = false;
+    bool             promoteDone_    = false;
+    uint32_t         promoteCursor_  = 0;
+    uint32_t         promoteChunk_   = kLeasePromotionChunk;
+    int64_t          ckptWindow_     = -1;   ///< the checkpoint rate window (seconds since readyNs_) ckptUsed_ counts
+    uint32_t         ckptUsed_       = 0;
     uint32_t         clearMask_ = kClearRingCap - 1;   ///< the ring's capacity - 1 (a test seam lowers it)
     std::array<uint32_t, kClearRingCap> clearRing_{};
     /// Per rid (sized with the entry store, grown cold with it): the ring position (low 32 bits) of the rid's LIVE ring entry, valid while

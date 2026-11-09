@@ -156,6 +156,10 @@ inline void setLeaseLastAppended(rune::view::ViewTable& t, uint32_t rid, int64_t
     if (t.auxBytesPerRow() < kLeaseAuxBytes) return;
     std::memcpy(t.aux(rid), &v, sizeof(v));
 }
+/// The `lastAppended` an ERASED lease row id carries until a new row reuses it (a fresh row resets it to -1): the lease promotion pass
+/// walks row ids and reads this to tell a live row from an erased one.  Never a real offset or -1.
+inline constexpr int64_t kLeaseRowErased = INT64_MIN;
+[[nodiscard]] inline bool leaseRowLive(const rune::view::ViewTable& t, uint32_t rid) noexcept { return leaseLastAppended(t, rid) != kLeaseRowErased; }
 
 /// The produce path's non-virtual window on a partition's lease index (WorkerViewSet::leaseIndexOf): the table (rows and the
 /// per-row `lastAppended`), its row layout and the descriptor the layout was built from.  Null `table` = no index.

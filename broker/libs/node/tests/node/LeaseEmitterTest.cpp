@@ -162,9 +162,12 @@ struct Em {
     }
 };
 
+/// Nothing carried over from an earlier runtime: every counter is zero except the promotion pass's own (Task 12).
 bool statsAllZero(const lease::LeaseRuntimeStats& st) {
     static const lease::LeaseRuntimeStats zero{};
-    return std::memcmp(&st, &zero, sizeof(st)) == 0;
+    lease::LeaseRuntimeStats c = st;
+    c.promotionLinked = 0;
+    return std::memcmp(&c, &zero, sizeof(c)) == 0;
 }
 
 }  // namespace
@@ -614,14 +617,19 @@ TEST(LeaseEmitterRegression, DemotionDiscardsRegression) {
     r.passes(60);
     ASSERT_NE(e.rt(), nullptr) << "a new runtime of the new leadership exists";
     EXPECT_TRUE(statsAllZero(e.st())) << "a new runtime: nothing carried over";
-    for (uint64_t k = 1; k <= 3; ++k) {   // every entry Free
+    EXPECT_EQ(e.st().promotionLinked, 3u);
+    for (uint64_t k = 1; k <= 3; ++k) {   // the promotion pass armed every live row at ready + extend (0 here) + ttl
         const uint32_t rid = e.ridOf(k);
         ASSERT_NE(rid, UINT32_MAX);
-        EXPECT_EQ(e.rt()->timers().entry(rid).state, LeaseEntryState::Free) << "key " << k;
+        EXPECT_EQ(e.rt()->timers().entry(rid).state, LeaseEntryState::Armed) << "key " << k;
+        EXPECT_EQ(e.rt()->timers().entry(rid).deadlineNs, e.rt()->readyNs() + 5000 * kMs) << "key " << k;
     }
-    e.advanceMs(5000 + 1);
+    e.advanceMs(5000 - 1);
     r.passes(5);
-    EXPECT_TRUE(expires(r).empty()) << "Task 12 arms these on promotion";
+    EXPECT_TRUE(expires(r).empty()) << "not before the promotion deadline";
+    e.advanceMs(2);
+    r.passes(5);
+    EXPECT_EQ(expires(r).size(), 3u) << "the promoted keys expire at their promotion deadline";
 }
 
 // 14. The emitter allocates nothing in steady state (hard rule 4): across the emitting passes and the judge folds of the Expires.
@@ -735,6 +743,9 @@ TEST(LeaseEmitterRegression, IdentityChangeDiscardsRegression) {
         for (uint64_t k = 1; k <= 3; ++k) ASSERT_EQ(e.entry(k).state, LeaseEntryState::Armed) << "leg " << leg << " key " << k;
         const uint32_t epochBefore = r.vs->leaseRebuildEpoch(VerdictRig::kSrc, 0);
         const uint64_t genBefore   = r.replica->leadershipGeneration();
+        const int64_t leoStable    = r.leo();
+        const int64_t t0           = e.leaseNow;
+        e.advanceMs(3000);   // the new runtime is ready 3 s after the old deadlines were set: its promotion deadlines are t0 + 8 s
         if (leg == 0) {
             r.addLeasePort();   // the evolving descriptor gains a field id: the layout generation moves, the index is rebuilt
             r.passes(30);
@@ -751,8 +762,9 @@ TEST(LeaseEmitterRegression, IdentityChangeDiscardsRegression) {
             ASSERT_TRUE(r.leaseReady());
             ASSERT_NE(r.replica->leadershipGeneration(), genBefore) << "the identity changed";
         }
-        const int64_t leoStable = r.leo();
-        e.advanceMs(5000 + 1);   // past every old deadline
+        // Past every old deadline (t0 + 5 s).  Leg 0's old runtime is replaced by the first non-idle pass (the idle skip checks the generation
+        // only), which is this one: its ready time is t0 + 5.001 s; leg 1's new runtime was created above, at t0 + 3 s.
+        e.advanceMs(2000 + 1);
         r.passes(5);
         ASSERT_NE(e.rt(), nullptr) << "leg " << leg << ": the runtime of the new identity exists";
         EXPECT_TRUE(r.leaseReady());
@@ -761,8 +773,10 @@ TEST(LeaseEmitterRegression, IdentityChangeDiscardsRegression) {
         for (std::size_t i = 0; i < 3; ++i) {
             const uint32_t rid = e.ridOf(uint64_t(i + 1));
             ASSERT_NE(rid, UINT32_MAX);
-            EXPECT_EQ(e.rt()->timers().entry(rid).state, LeaseEntryState::Free) << "leg " << leg << " key " << i + 1;
-            EXPECT_EQ(e.rt()->timers().entry(rids[i]).state, LeaseEntryState::Free) << "leg " << leg << ": the old rid " << rids[i];
+            EXPECT_EQ(e.rt()->timers().entry(rid).state, LeaseEntryState::Armed) << "leg " << leg << " key " << i + 1 << ": armed by the promotion pass";
+            EXPECT_EQ(e.rt()->timers().entry(rid).deadlineNs, e.rt()->readyNs() + 5000 * kMs) << "leg " << leg << " key " << i + 1 << ": the NEW deadline";
+            EXPECT_GE(e.rt()->readyNs(), t0 + 3000 * kMs) << "leg " << leg;
+            (void)rids[i];
         }
         EXPECT_TRUE(expires(r).empty()) << "leg " << leg << ": no Expire at the old deadlines";
         EXPECT_EQ(r.leo(), leoStable) << "leg " << leg << ": nothing appended";

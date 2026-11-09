@@ -365,6 +365,7 @@ bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& r, cons
         ev.version = static_cast<int64_t>(slotU64(row, l, kLeaseVersionSlot));
         ev.ttlMs = slotU64(row, l, kLeaseTtlSlot);
         ev.remainingMs = slotU64(row, l, kLeaseRemainingSlot);
+        setLeaseLastAppended(f.table, rid, kLeaseRowErased);   // the promotion pass walks row ids: this one holds no row now
         (void)f.table.erase(key);
         return true;
     }

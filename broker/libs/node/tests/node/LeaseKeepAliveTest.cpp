@@ -738,6 +738,7 @@ TEST(LeaseKeepAliveTableRegression, TimeToLiveRegression) {
 
     Ka f;
     ASSERT_TRUE(f.setup({1}));
+    f.r.worker->setLeasePromotionChunkForTest(0);   // the promotion pass must not link the row: this leg reads a Free entry
     f.r.demote();
     const auto nl = f.timeToLive(keyOf(1));
     EXPECT_EQ(nl.code, int16_t(kNotLeader));
@@ -835,6 +836,7 @@ TEST(LeaseKeepAliveTableRegression, FreeEntryKeepAliveArmsRegression) {
     ASSERT_TRUE(k.setup({1, 2}));
     const int64_t v1 = k.versionOf(1), v2 = k.versionOf(2);
     ASSERT_TRUE(k.checkpoint(2, v2, 4000));
+    k.r.worker->setLeasePromotionChunkForTest(0);   // the promotion pass must not link the rows: this test keeps the entries Free
     k.r.demote();
     k.r.promote();
     ASSERT_TRUE(k.waitRuntime());
@@ -870,6 +872,7 @@ TEST(LeaseKeepAliveTableRegression, FreeEntryPromotionDeadlineIncludesExtendRegr
     const int64_t v = k.versionOf(1);
     ASSERT_TRUE(k.checkpoint(1, v, 4000));
     k.r.worker->setLeaseExtendNs(2000 * kMs);
+    k.r.worker->setLeasePromotionChunkForTest(0);   // the promotion pass must not link the row: this test keeps the entry Free
     k.r.demote();
     k.r.promote();
     ASSERT_TRUE(k.waitRuntime());
@@ -955,7 +958,7 @@ TEST(LeaseKeepAliveTableRegression, ClearRingStaleEntriesNeverDropAParkRegressio
         const std::string key = keyOf(id);
         uint32_t req = lease::kLeaseNil;
         const lease::LeaseKaOutcome o = rt->keepAlive(lk.ref, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(key.data()), key.size()), ver[id],
-                                                      judged, k.leaseNow, parks, req, 77, ++k.corr, index, true);
+                                                      judged, k.leaseNow, parks, req, 77, ++k.corr, index, true, *k.r.writeState()->spec->lease);
         if (o.parked) EXPECT_TRUE(rt->clearFlagged(k.ridOf(id))) << "key " << id << ": parked without its clear flag";
         return o;
     };
@@ -1196,7 +1199,7 @@ TEST(LeaseKeepAliveTableRegression, ClearRingOneLiveEntryPerRidRegression) {
     for (int round = 0; round < 5; ++round) {
         uint32_t req = lease::kLeaseNil;
         const lease::LeaseKaOutcome o = rt->keepAlive(lk.ref, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(key.data()), key.size()), v,
-                                                      judged, k.leaseNow, parks, req, 77, ++k.corr, 0, true);
+                                                      judged, k.leaseNow, parks, req, 77, ++k.corr, 0, true, *k.r.writeState()->spec->lease);
         ASSERT_TRUE(o.parked) << "round " << round;
         if (round == 4) break;   // the last park stays
         LeaseEvent ev;
@@ -1217,6 +1220,8 @@ TEST(LeaseKeepAliveTableRegression, ClearRingOneLiveEntryPerRidRegression) {
 // untracked; with the failure gone the next grant is tracked.  (b) The 75 % growth owed at the end of a call throws: it is owed again and
 // the next call grows.  Mutations: remove the try/catch in onEvents - terminate (red); remove noteGrowFailed in onEvents - (b) never grows (red).
 TEST(LeaseKeepAliveTableRegression, GrowBadAllocOnEventsRegression) {
+    rune::protocol::LeaseSpec kBareSpec;
+    kBareSpec.checkpoint = 0;
     lease::LeaseParkTable parks;
     LeaseEvent g;
     g.kind = LeaseEventKind::Granted; g.ttlMs = 1000;
@@ -1225,11 +1230,11 @@ TEST(LeaseKeepAliveTableRegression, GrowBadAllocOnEventsRegression) {
         ASSERT_EQ(rt.timers().capacity(), lease::kLeaseEntryChunk);
         rt.setGrowThrowForTest(true);
         g.rid = 5000;
-        rt.onEvents(std::span<const LeaseEvent>(&g, 1), 1'000'000'000, parks);
+        rt.onEvents(std::span<const LeaseEvent>(&g, 1), 1'000'000'000, parks, kBareSpec);
         EXPECT_EQ(rt.stats().growFailures, 1u);
         EXPECT_FALSE(rt.timers().covers(5000)) << "the grant stays untracked";
         rt.setGrowThrowForTest(false);
-        rt.onEvents(std::span<const LeaseEvent>(&g, 1), 1'000'000'000, parks);
+        rt.onEvents(std::span<const LeaseEvent>(&g, 1), 1'000'000'000, parks, kBareSpec);
         EXPECT_EQ(rt.stats().growFailures, 1u);
         ASSERT_TRUE(rt.timers().covers(5000));
         EXPECT_EQ(rt.timers().entry(5000).state, LeaseEntryState::Armed) << "with the failure gone the next grant is tracked";
@@ -1238,12 +1243,12 @@ TEST(LeaseKeepAliveTableRegression, GrowBadAllocOnEventsRegression) {
         lease::LeaseRuntime rt(1, 1, 10000, 1'000'000'000);
         rt.setGrowThrowForTest(true);
         g.rid = 3100;   // covered, and past 75 % of the first chunk: growth is owed
-        rt.onEvents(std::span<const LeaseEvent>(&g, 1), 1'000'000'000, parks);
+        rt.onEvents(std::span<const LeaseEvent>(&g, 1), 1'000'000'000, parks, kBareSpec);
         EXPECT_EQ(rt.stats().growFailures, 1u);
         EXPECT_EQ(rt.timers().entry(3100).state, LeaseEntryState::Armed);
         EXPECT_EQ(rt.timers().capacity(), lease::kLeaseEntryChunk);
         rt.setGrowThrowForTest(false);
-        rt.onEvents(std::span<const LeaseEvent>(), 1'000'000'000, parks);
+        rt.onEvents(std::span<const LeaseEvent>(), 1'000'000'000, parks, kBareSpec);
         EXPECT_EQ(rt.timers().capacity(), 2 * lease::kLeaseEntryChunk) << "the owed growth was retried";
         EXPECT_EQ(rt.stats().growFailures, 1u);
     }

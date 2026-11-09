@@ -402,14 +402,14 @@ TEST(LeaseJudgeTableRegression, EventsRegression) {
     LV b; b.ttl = 4000; b.addr = "y"; b.holder = 2;
     ASSERT_EQ(r.judgeOne(update(1, g1, b), &u), 0);
     ASSERT_EQ(r.judgeOne(checkpoint(1, g1, 1500), &cp), 0);
-    EXPECT_EQ(r.judgeOne(expire(1, g1 + 5)), kStale);              // rejected: no event
+    EXPECT_EQ(r.judgeOne(expire(1, g1 + 5)), kStale);              // rejected: a BrokerRejected event (Task 10)
     ASSERT_EQ(r.judgeOne(revoke(1, g1, 4000), &rv), 0);
     LV c; c.ttl = 6000;
     ASSERT_EQ(r.judgeOne(grant(1, c), &g2), 0);
     ASSERT_EQ(r.judgeOne(expire(1, g2), &ex), 0);
 
     const auto& ev = r.st.leaseEvents.buf;
-    ASSERT_EQ(ev.size(), 6u);
+    ASSERT_EQ(ev.size(), 7u);
     EXPECT_EQ(ev[0].kind, LeaseEventKind::Granted);
     EXPECT_EQ(ev[0].version, g1);
     EXPECT_EQ(ev[0].offset, g1);
@@ -426,21 +426,24 @@ TEST(LeaseJudgeTableRegression, EventsRegression) {
     EXPECT_EQ(ev[2].version, g1);
     EXPECT_EQ(ev[2].offset, cp);
     EXPECT_EQ(ev[2].remainingMs, 1500u);
-    EXPECT_EQ(ev[3].kind, LeaseEventKind::Ended);
-    EXPECT_EQ(ev[3].endOp, uint8_t(rec::LeaseOp::Revoke));
+    EXPECT_EQ(ev[3].kind, LeaseEventKind::BrokerRejected) << "the stale Expire of the live row";
     EXPECT_EQ(ev[3].rid, rid);
-    EXPECT_EQ(ev[3].version, g1);
-    EXPECT_EQ(ev[3].offset, rv);
-    EXPECT_EQ(ev[3].remainingMs, 1500u);
-    EXPECT_EQ(ev[4].kind, LeaseEventKind::Granted);
-    EXPECT_EQ(ev[4].version, g2);
-    EXPECT_EQ(ev[4].offset, g2);
-    EXPECT_EQ(ev[4].ttlMs, 6000u);
-    EXPECT_EQ(ev[5].kind, LeaseEventKind::Ended);
-    EXPECT_EQ(ev[5].endOp, uint8_t(rec::LeaseOp::Expire));
-    EXPECT_EQ(ev[5].rid, ev[4].rid);
+    EXPECT_EQ(ev[3].version, g1 + 5);
+    EXPECT_EQ(ev[4].kind, LeaseEventKind::Ended);
+    EXPECT_EQ(ev[4].endOp, uint8_t(rec::LeaseOp::Revoke));
+    EXPECT_EQ(ev[4].rid, rid);
+    EXPECT_EQ(ev[4].version, g1);
+    EXPECT_EQ(ev[4].offset, rv);
+    EXPECT_EQ(ev[4].remainingMs, 1500u);
+    EXPECT_EQ(ev[5].kind, LeaseEventKind::Granted);
     EXPECT_EQ(ev[5].version, g2);
-    EXPECT_EQ(ev[5].offset, ex);
+    EXPECT_EQ(ev[5].offset, g2);
+    EXPECT_EQ(ev[5].ttlMs, 6000u);
+    EXPECT_EQ(ev[6].kind, LeaseEventKind::Ended);
+    EXPECT_EQ(ev[6].endOp, uint8_t(rec::LeaseOp::Expire));
+    EXPECT_EQ(ev[6].rid, ev[5].rid);
+    EXPECT_EQ(ev[6].version, g2);
+    EXPECT_EQ(ev[6].offset, ex);
 }
 
 TEST(LeaseJudgeTableRegression, EventBackPressureRegression) {
