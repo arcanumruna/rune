@@ -637,6 +637,62 @@ TEST(CheckedWritesTxnWorker, RunAheadCheckpointIsBackfilledOnReplayRegression) {
     EXPECT_EQ(rows(), leader) << "the refold equals the leader's table";
 }
 
+// P11-8 (a), the restored member at exactly the deferred transaction's first record: U (open, never voted) starts right after T's first record,
+// so the checkpoint pushed while the judge runs ahead of T sits at U's first offset, above T's first.  The crash takes every later push.
+// The restart restores the member at that offset with an empty span fence, and T's commit must still reach it from T's TxnJudge.
+TEST(CheckedWritesTxnWorkerRegression, RunAheadCheckpointAtADeferredTxnStartStillGetsTheCommitRegression) {
+    Persisted p;
+    ASSERT_GT(p.cap, 0);
+    constexpr int64_t kOther = kRaPid + 1;
+    // U starts at the pass cap's second push: the plain records between T's first record and U's make the cap fall on U's first offset.
+    std::vector<std::vector<uint8_t>> batches{VerdictRig::batch({ins(1001)}, kRaPid, 0, {}, /*txn=*/true)};
+    for (auto& b : Persisted::plain(10000, 2 * p.cap - 1)) batches.push_back(std::move(b));
+    batches.push_back(VerdictRig::batch({ins(1003)}, kOther, 0, {}, /*txn=*/true));
+    for (auto& b : Persisted::plain(20000, 3 * p.cap)) batches.push_back(std::move(b));
+    const int64_t first = p.replicated(std::move(batches));
+    const int64_t tok = p.r.sendVote(VerdictRig::kSrc, kRaPid, 0);
+    const int64_t tokOther = p.r.sendVote(VerdictRig::kSrc, kOther, 0);
+    std::vector<uint8_t> atOther;
+    int64_t pushedAt = -1;
+    for (int i = 0; i < 2000 && !(p.r.voteReply(tok) && p.r.voteReply(tokOther)); ++i) {
+        p.r.pass();
+        const auto js = p.r.txnJudgeOffsetsInLog();
+        if (pushedAt < 0 && !js.empty() && p.durable() > first && p.durable() < js[0]) {
+            pushedAt = p.durable();
+            atOther = slurp(viewCheckpointFilePath(p.r.snapDir(), kRej, 0));
+        }
+    }
+    ASSERT_TRUE(p.r.voteReply(tok));
+    ASSERT_EQ(p.r.voteReply(tok)->code, 0);
+    ASSERT_TRUE(p.r.voteReply(tokOther));
+    ASSERT_EQ(pushedAt, first + 2 * p.cap) << "the first checkpoint above T's first record is at the open transaction's first record";
+    p.r.marker(kRaPid, true);
+    p.r.passes(300);   // U is voted and undecided: it holds K at its first record
+    ASSERT_TRUE(p.r.hasRow(kRej, 1001));
+    const auto rows = [&] {
+        std::vector<uint64_t> out;
+        const ViewInstance* inst = p.r.vs->instanceForTest(kRej, 0);
+        for (uint64_t k = 0; k < 10000 + static_cast<uint64_t>(3 * p.cap) + 10; ++k)
+            if (inst->table.get(k) != nullptr) out.push_back(k);
+        return std::make_pair(out, inst->table.size());
+    };
+    const auto leader = rows();
+    p.r.agent.reset();
+    {
+        std::ofstream out(viewCheckpointFilePath(p.r.snapDir(), kRej, 0), std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(atOther.data()), static_cast<std::streamsize>(atOther.size()));
+    }
+    p.r.agent = std::make_unique<ViewSnapshotIoAgent>(p.r.channel, p.r.snapDir(), /*fsyncMs=*/0, p.r.backupPolicy);
+    p.r.restart();
+    p.r.passes(300);
+    ASSERT_NE(p.r.stats(), nullptr);
+    EXPECT_EQ(p.r.stats()->verdictCheckpointsDiscarded, 0u) << "the restored member is kept, at U's first record";
+    EXPECT_EQ(p.r.writeState()->txn.stats.checkpointBackfills, 1u);
+    EXPECT_TRUE(p.r.hasRow(kRej, 1001)) << "T's record below the restored cursor reaches the member from J";
+    EXPECT_TRUE(p.r.hasRow(kRej, 10000 + static_cast<uint64_t>(3 * p.cap) - 1));
+    EXPECT_EQ(rows(), leader) << "the refold equals the leader's table";
+}
+
 // REGRESSION (found by R11b; P11-8): the checkpoint cap holds the judge at the markers' coverage plus the cap, and a marker covers
 // only a stretch with a judged record.  A stretch past the cap with nothing to judge (an aborted transaction, then its marker) held
 // the judge there for good, and every later record went unjudged.  While nothing judged waits for a marker the cap counts from the

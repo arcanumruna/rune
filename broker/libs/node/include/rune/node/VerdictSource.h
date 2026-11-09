@@ -154,7 +154,7 @@ public:
             reservedRowLen_[i] = rowLenWanted_;
         }
     }
-    /// A reserve call left an overlay or a key set in use short: the owner calls again (cold) once they may be free.
+    /// A reserve call left an overlay or a key set in use short: release() retries it once that one is free.
     [[nodiscard]] bool pending() const noexcept { return overlaysPending_ || keysPending_; }
     /// A cleared overlay bound to `sourceKey`, or -1 when all are in use.
     [[nodiscard]] int32_t acquire(uint64_t sourceKey) noexcept {
@@ -394,6 +394,8 @@ private:
     struct TxnProbe { int64_t producerId = -1, first = -1, from = -1, waitAt = -1; };
     struct OwedMarker { int64_t producerId; int64_t judgeOffset; int64_t from; };   // a re-offered TxnJudge's marker, searched from `from`
     // Judge: the judge stands at a TxnJudge to judge (judgePid_).  Locked: a record touches a row a transaction holds (P11-4).
+    // Fold: the judge passed a decided commit's TxnJudge that an active member's replay still owes.  The members replay through it
+    // before the judge goes on (no cursor sync).
     enum class TxnStop : uint8_t { None, Probe, Marker, Judge, Locked, Fold };
     enum class ProbeStep : uint8_t { Next, Classified, Wait };
     // The transaction being judged at `end`, its TxnJudge (or its marker, P11-7): the chained read of [first, end), then the P11-3

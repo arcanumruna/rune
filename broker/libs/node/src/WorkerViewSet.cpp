@@ -1295,10 +1295,6 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     }
     VerdictSource* judge = vit->second.get();
     const std::size_t membersBefore = judge->memberCountForTest();
-    if (txnOverlays_.pending()) [[unlikely]] {
-        txnOverlays_.reserveKeys(0);
-        txnOverlays_.reserveFor(0, 0);
-    }
     judge->bindState(&write);
     write.verdicts = judge;
     if (write.spec->keyIndex && !judge->hasMember(0, kKeyIndexPlanFingerprint)) {
