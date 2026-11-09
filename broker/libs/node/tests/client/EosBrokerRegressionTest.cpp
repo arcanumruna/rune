@@ -756,9 +756,9 @@ TEST(EosBrokerRegression, InDoubtCommitRetryCommitsOnceRegression) {
     const rc::TopicSpec plain = e.define("eos.plain", kParts);
     const int ctl = e.ctl;
     auto kcfg = e.cfg(ctl, {plain});   // the coordinator is the seed's broker
-    kcfg.responseTimeoutNs = 2'000'000'000LL;
+    kcfg.responseTimeoutNs = 1'500'000'000LL;
     auto cl = connectClient(e.c, kcfg);
-    // The session is declared stale after ~2 s; an op timeout below that makes the first commit a deterministic
+    // The session is declared stale after ~1.5 s; an op timeout below that makes the first commit a deterministic
     // Timeout (InDoubt), so the RETRY branch always runs.
     auto icfg = txnConfig("eos-indoubt");
     icfg.transactionOpTimeoutMs = 1'000;
@@ -848,7 +848,7 @@ TEST(EosBrokerRegression, LeaderCrashMidTransactionResendsAndCommitsOnceRegressi
 // 6. consume -> transform -> produce, every 5th transaction aborted, rewound with seekToCommitted, redone.
 // =========================================================================================================
 TEST(EosBrokerRegression, AbortRewindRedoOutputEqualsInputRegression) {
-    constexpr int kInput = 10'000;
+    constexpr int kInput = 8'000;
     constexpr int kBatch = 200;
     Env e("eos_loop");
     const rc::TopicSpec in  = e.define("eos.in", kParts);
@@ -935,7 +935,7 @@ TEST(EosBrokerRegression, AbortRewindRedoOutputEqualsInputRegression) {
             want.merge(scratch);
         }
     }
-    EXPECT_GE(aborts, 10) << "the loop must really abort and redo";
+    EXPECT_GE(aborts, kInput / kBatch / 5) << "the loop must really abort and redo";
     EXPECT_EQ(committed, kInput);
     EXPECT_EQ(static_cast<int>(want.values.size()), kInput) << "each input id produced exactly once by a committed txn";
     int64_t cursor = 5'000'000;

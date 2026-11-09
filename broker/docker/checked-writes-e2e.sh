@@ -728,7 +728,8 @@ txn_total=$(( WORKERS * TXN_USERS * TXN_PER_USER ))
 txn_start=$(now_s)
 txn_windows="${WORK_DIR}/txn-kill-windows.txt"   # "<kill ms> <resumed ms>" per kill: a lost answer is allowed only inside one
 : > "${txn_windows}"
-# txn_kill <node 0-2> <progress share in percent> <what>: kill it at the share of all the transactions, restart it once progress resumes
+# txn_kill <node 0-2> <progress share in percent> <what> <progress at the running half's end>: kill it at the share of all the
+# transactions, restart it once progress resumes
 txn_kill() {
     wait_until "${RACE_S}" "${3} kill point" progress_at_least $(( txn_total * $2 / 100 )) txn-run \
         || { out_of "txn-run-0" | tail -20 >&2; fail "txn-run never reached $2 % within ${RACE_S}s (at $(race_progress txn-run) of ${txn_total})"; }
@@ -738,14 +739,14 @@ txn_kill() {
     killed_ms=$(now_ms)
     kill_node "$1"
     RESUME_AT=$(( BASE + 20 ))
-    [ "${RESUME_AT}" -le "${txn_total}" ] || RESUME_AT="${txn_total}"
+    [ "${RESUME_AT}" -le "$4" ] || RESUME_AT="$4"
     wait_until "${RESUME_WAIT_S}" "txn-run resuming" progress_at_least "${RESUME_AT}" txn-run \
         || { out_of "txn-run-0" | tail -20 >&2; fail "txn-run: no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the ${3} kill"; }
     restart_node "$1"
     # the window ends once progress advances again after the restart
     BASE=$(race_progress txn-run)
     RESUME_AT=$(( BASE + 20 ))
-    [ "${RESUME_AT}" -le "${txn_total}" ] || RESUME_AT="${txn_total}"
+    [ "${RESUME_AT}" -le "$4" ] || RESUME_AT="$4"
     wait_until "${RESUME_WAIT_S}" "txn-run resuming after the ${3} restart" progress_at_least "${RESUME_AT}" txn-run \
         || { out_of "txn-run-0" | tail -20 >&2; fail "txn-run: no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the ${3} restart"; }
     echo "${killed_ms} $(now_ms)" >> "${txn_windows}"
@@ -774,13 +775,13 @@ txn_half_wait() {   # <first worker number> : every probe of the half exited 0, 
 }
 # First half: the character leader is killed at ~30 % of all the transactions (60 % of this half).
 txn_half_run 0 $(( TXN_USER_BASE + 1 )) $(( TXN_USER_BASE + txn_half ))
-txn_kill "$(partition_leader "${RP_CHARACTER_TOPIC}" 0)" 30 "character leader"
+txn_kill "$(partition_leader "${RP_CHARACTER_TOPIC}" 0)" 30 "character leader" $(( WORKERS * txn_half * TXN_PER_USER ))
 txn_half_wait 0
 # Second half, started with the coordinator read afresh: it is killed at ~60 % of all the transactions (20 % of this half).
 txn_half_run "${WORKERS}" $(( TXN_USER_BASE + txn_half + 1 )) $(( TXN_USER_BASE + TXN_USERS ))
 coordinator=$(consensus_leader) || fail "no consensus leader at the coordinator kill"
 [ "${coordinator}" = "${TXN_COORDINATOR}" ] || fail "the coordinator moved from node ${TXN_COORDINATOR} to ${coordinator} while the second half started"
-txn_kill "${coordinator}" 60 "coordinator"
+txn_kill "${coordinator}" 60 "coordinator" "${txn_total}"
 txn_half_wait "${WORKERS}"
 log "Leg 9b: done in $(( $(now_s) - txn_start )) s"
 txn_files=("${SHARED}"/txn-run-w*.txt)
