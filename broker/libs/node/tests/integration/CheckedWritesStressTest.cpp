@@ -121,6 +121,34 @@ TEST_P(CheckedWritesStressRegression, SeededRegressorsPathHoldsTheInvariants) {
     std::printf("seed %d: %s, %d leader crashes, %d restarts (%d cut short), %zu committed records the most compacted log lost\n", seed, d.regressorsPathTally().c_str(), f[0], f[1], f[2], d.compactedAway());
 }
 
+// Plan 11 (matrix D): the RegressorsPath DDL plus a ledger with balances.  Three transactional writers commit or abort a character
+// create with a ledger entry (or overdraw the ledger), two plain writers send atomic ledger batches, and a node crashes while a commit's
+// votes are out, through restarts, cleaner passes and replaces of account_stats.  300 steps unless RUNE_CW_STRESS_STEPS says otherwise.
+TEST_P(CheckedWritesStressRegression, SeededTransactionsHoldTheInvariants) {
+    const int seed = GetParam();
+    const int steps = std::getenv("RUNE_CW_STRESS_STEPS") != nullptr ? stepsPerSeed() : 300;
+    ThreeNodes cluster = ThreeNodes::startWith("cw11_" + std::to_string(seed), [](rune::node::NodeConfig& cfg) {
+        cfg.verdictIntervalMs = 20;
+        cfg.producerIdExpirationMs = 3'000;
+        cfg.txnJudgedRecordsMax = 64;
+    });
+    CheckedWritesStressDriver d(cluster, static_cast<uint64_t>(seed), false, false, false, true);
+    d.setUpRegressorsPath();
+    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    for (int step = 0; step < steps && !HasFatalFailure(); ++step) {
+        SCOPED_TRACE("seed=" + std::to_string(seed) + " step=" + std::to_string(step));
+        d.step();
+    }
+    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    d.quiesce();
+    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    std::string failed;
+    EXPECT_TRUE(d.checkAll(&failed)) << failed;
+    EXPECT_EQ(d.txnShortfall(), "") << "seed " << seed;
+    const auto f = d.faults();
+    std::printf("seed %d: %s, %d crashes, %d restarts (%d cut short)\n", seed, d.txnTally().c_str(), f[0], f[1], f[2]);
+}
+
 INSTANTIATE_TEST_SUITE_P(Seeds, CheckedWritesStressRegression, ::testing::Range(1, 13));
 
 // Only a leader compacts, and it may drop a committed rejected record before the history reads its log: the record is still on the
@@ -249,4 +277,30 @@ TEST(CheckedWritesStressHistory, ViewLookupThatNeverAnswersSaysSoRegression) {
     std::string why;
     EXPECT_FALSE(d.checkInvariantForTest("ViewEqualsFreshRefold", &why));
     EXPECT_NE(why.find("key 1: the lookup failed after "), std::string::npos) << why;
+}
+
+// The fast cut of the transaction stress: one commit, one abort, one overdrawn commit and two atomic batches, no fault, every invariant.
+TEST(CheckedWritesTxnStressRegression, ShortTransactionRunHoldsTheInvariants) {
+    ThreeNodes cluster = ThreeNodes::startWith("cw11_short", [](rune::node::NodeConfig& cfg) {
+        cfg.verdictIntervalMs = 20;
+        cfg.unservableWarmupMs = 50;
+        cfg.runtimePlacement = rune::node::NodeConfig::RuntimePlacement::Fused;
+        cfg.electionTimeoutMs = 40;
+        cfg.readLeaseMaxMs = 50;
+        cfg.brokerLivenessTimeoutMs = 150;
+    });
+    CheckedWritesStressDriver d(cluster, 1, false, false, false, true);
+    d.setUpRegressorsPath();
+    ASSERT_FALSE(HasFatalFailure());
+    d.commitTransaction();
+    d.abortTransaction();
+    d.overdrawTransaction();
+    d.atomicBatch(false);
+    d.atomicBatch(true);
+    d.quiesce();
+    ASSERT_FALSE(HasFatalFailure());
+    std::string failed;
+    EXPECT_TRUE(d.checkAll(&failed, false)) << failed;
+    EXPECT_EQ(d.txnShortfall(), "");
+    std::printf("%s\n", d.txnTally().c_str());
 }

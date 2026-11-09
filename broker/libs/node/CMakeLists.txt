@@ -1982,7 +1982,10 @@ if(BUILD_TESTING)
         target_compile_definitions(rune_checked_writes_stress_tests PRIVATE RUNE_QL_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/ql/tests/golden")
         target_link_libraries(rune_checked_writes_stress_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_checked_writes_stress_tests PROPERTIES TIMEOUT 1800 LABELS stress)
+        # The transaction stress has a fast default cut; every other case of the binary is a heavy stress run.
+        set(RUNE_CHECKED_WRITES_TXN_STRESS_TESTS "CheckedWritesTxnStressRegression.*")
+        gtest_discover_tests(rune_checked_writes_stress_tests TEST_FILTER "${RUNE_CHECKED_WRITES_TXN_STRESS_TESTS}" PROPERTIES TIMEOUT 30)
+        gtest_discover_tests(rune_checked_writes_stress_tests TEST_FILTER "-${RUNE_CHECKED_WRITES_TXN_STRESS_TESTS}" PROPERTIES TIMEOUT 1800 LABELS stress)
 
         # Checked writes Part 09 Task 5a (#788): a lagging leader never undoes a newer constraint-set change, on three real brokers.
         add_executable(rune_checked_writes_catalog_gate_cluster_tests tests/integration/CheckedWritesCatalogGateClusterTest.cpp)
