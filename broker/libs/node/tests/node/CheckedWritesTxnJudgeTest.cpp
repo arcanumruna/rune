@@ -2102,8 +2102,27 @@ TEST(CheckedWritesTxnJudgeRegression, MarkerClassificationIgnoresASetRegisteredP
     EXPECT_EQ(r.st.rejected.size(), 0u);
 }
 
+// The same registration ahead of the judge must not change the outcome: a marker judgement caps T's size (TxnTooLarge rejects every
+// record), the ordinary apply has no cap, so a leader that classified T by the newest set would reject what another applies.
+TEST(CheckedWritesTxnJudgeRegression, SetRegisteredPastTheMarkerNeverRejectsATooLargeUnvotedTxnRegression) {
+    JudgeRig r(true);
+    ConstraintSet later = r.set;
+    later.id = 2;
+    r.set.count--;
+    r.vs.bindTxn(&r.pool, r.batch, 2);
+    r.start();
+    r.log.data({{1}, {2}, {3}}, 77);   // 10-12, over the cap of 2
+    r.log.marker(77, true);            // 13
+    r.log.control();                   // 14: a view is created after the marker
+    r.st.constraintSets.onChange(14, later);
+    r.drive();
+    EXPECT_EQ(r.st.rejected.size(), 0u);
+    for (const int64_t id : {1, 2, 3}) EXPECT_TRUE(r.indexed(id)) << id;
+    EXPECT_EQ(r.st.txn.stats.markerWithoutVote, 0u);
+}
+
 // L9 / Q4: a constrained member created after T's first record and before its marker (the coordinator lagged, so no vote was asked):
-// P11-7 judges all of T at the marker under the latest set, and T's violating record is rejected.
+// P11-7 judges all of T at the marker under the set at the marker, and T's violating record is rejected.
 TEST(CheckedWritesTxnJudgeRegression, MemberCreatedMidTransactionRejectsAtTheMarkerRegression) {
     JudgeRig r(true);
     const ConstraintSet constrained = r.set;
@@ -2121,7 +2140,7 @@ TEST(CheckedWritesTxnJudgeRegression, MemberCreatedMidTransactionRejectsAtTheMar
         const auto* e = r.st.rejected.find(o);
         ASSERT_NE(e, nullptr) << o;
         EXPECT_EQ(e->code, kViolation);
-        EXPECT_EQ(e->constraintId, kCapId);
+        EXPECT_EQ(e->constraintId, rune::view::constraintIdOf(7, 1));
     }
     EXPECT_FALSE(r.rowed(1));
     EXPECT_EQ(r.st.txn.stats.markerWithoutVote, 1u);
