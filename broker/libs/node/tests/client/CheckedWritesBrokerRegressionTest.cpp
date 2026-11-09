@@ -3258,3 +3258,29 @@ TEST(CheckedWritesBrokerRegression, KeyIndexOnASixteenByteKeyShardRegression) {
     EXPECT_EQ(again.code(), static_cast<uint16_t>(rune::protocol::client::ErrorCode::KeyExists));
     prod.closeImmediately();
 }
+
+// A producer-id request in flight when the node that coordinates it crashes is answered by the new coordinator after about two stale-session
+// thresholds, not after the 5 s coordinator-down fallback.  The coordinator is not the seed, so one of the two other nodes is it.
+namespace {
+void producerIdAcrossCoordinatorCrash(int victim) {
+    Cluster c = startCluster("cw_pid" + std::to_string(victim));
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    rc::ClientConfig cfg = quickConfig(c, 1);
+    cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
+    rc::Client client(cfg);
+    rc::ProducerConfig pc;
+    pc.acks = kAllView;
+    rc::Producer prod = client.producer(pc);
+    client.connectAndWait(30s);
+    c.crash(victim);
+    const auto start = std::chrono::steady_clock::now();
+    while (prod.producerId() < 0 && std::chrono::steady_clock::now() - start < 10s) std::this_thread::sleep_for(1ms);
+    EXPECT_GE(prod.producerId(), 0);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 3s) << "the producer id waited for the coordinator-down fallback";
+    prod.closeImmediately();
+    client.close();
+}
+}  // namespace
+
+TEST(CheckedWritesBrokerRegression, ProducerIdAcrossACoordinatorCrashNode2ThreeNodesRegression) { producerIdAcrossCoordinatorCrash(2); }
+TEST(CheckedWritesBrokerRegression, ProducerIdAcrossACoordinatorCrashNode3ThreeNodesRegression) { producerIdAcrossCoordinatorCrash(3); }

@@ -6940,8 +6940,9 @@ void Client::syncCoordinatorSession_() noexcept {
         // kCoordDownFallbackNs is given up too (level-triggered; the seed names the current coordinator, and
         // each fallback is paced by this grace, never a spin).
         const int64_t nowNs = now();
-        const bool downTooLong =
-            detail::coordDownTooLong(*rm, st == session::SessionState::Connected, nowNs, kCoordDownFallbackNs);
+        // A client that tunes its stale-session threshold waits two of them, never more than kCoordDownFallbackNs.
+        const int64_t graceNs = cfg_.responseTimeoutNs > 0 ? std::min(kCoordDownFallbackNs, 2 * cfg_.responseTimeoutNs) : kCoordDownFallbackNs;
+        const bool downTooLong = detail::coordDownTooLong(*rm, st == session::SessionState::Connected, nowNs, graceNs);
         const bool gaveUp = downTooLong ||
                             st == session::SessionState::Disconnected ||
                             st == session::SessionState::Rejected ||
