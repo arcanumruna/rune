@@ -667,7 +667,8 @@ TEST(LeaseSessionRegression, AtRiskOncePerEpisodeRegression) {
     const int64_t okSent = g_now;
     (void)okSent;
     answered = r.kaCount();
-    for (int64_t x = g_now; x < g_now + 2000 * kMs;) {
+    const int64_t episode2End = g_now + 2000 * kMs;   // fixed: r.at(x) moves g_now, so the bound must not read it
+    for (int64_t x = g_now; x < episode2End;) {
         x += 50 * kMs;
         r.at(x);
         for (; answered < r.kaCount(); ++answered) {
