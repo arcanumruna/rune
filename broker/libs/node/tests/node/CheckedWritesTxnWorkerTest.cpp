@@ -14,7 +14,7 @@ using namespace rune::node::cw;
 namespace pc = rune::protocol::client;
 
 namespace {
-constexpr uint8_t kLeader = 1;
+constexpr uint8_t kLeader = 1, kAllView = 3;
 constexpr uint16_t kKeyExists = 56, kTooLarge = static_cast<uint16_t>(pc::ErrorCode::TxnTooLarge);
 constexpr int16_t kNotLeader = static_cast<int16_t>(pc::ErrorCode::NotLeader);
 
@@ -445,6 +445,40 @@ TEST(CheckedWritesTxnWorker, RefusedParkLeavesNoScanRegression) {
     k.r.marker(55, false);   // the judge passes 55's records only once 55 ends, and reaches 54's J
     for (const int64_t t : parked) ASSERT_TRUE(k.r.driveUntilVoted(t));
     EXPECT_EQ(k.r.worker->parkedVotesForTest(), 0);
+}
+
+// P11-6: an atomic batch is judged whole, so its index holds one entry per record; the View ack answers one {0, code, constraintId}.
+TEST(CheckedWritesTxnWorker, RejectedAtomicBatchAnswersOneEntry) {
+    Ki k;
+    ASSERT_TRUE(k.r.ack(k.r.produceFrame({ins(1)}, kAllView, 60, 0)));
+    std::vector<uint8_t> bytes = VerdictRig::batch({ins(2), ins(1), ins(3)}, 60, 1);
+    VerdictRig::setBatchAttribute(bytes, rune::protocol::batch::kAttrAtomic);
+    const auto a = k.r.ack(k.r.produceBytes(bytes, kAllView, 60, 1));
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, 0);
+    ASSERT_TRUE(a->hasVerdicts);
+    ASSERT_EQ(a->verdicts.size(), 1u);
+    EXPECT_EQ(std::get<0>(a->verdicts[0]), 0);
+    EXPECT_EQ(std::get<1>(a->verdicts[0]), kKeyExists);
+}
+
+// The pending ack is not rebuilt from the log: a failover drops it and the producer resends.  The resend is a duplicate inside the
+// dedupe window, and its pending takes `atomic` from the resent batch header, so the replayed ack still answers one entry.
+TEST(CheckedWritesTxnWorkerRegression, RejectedAtomicBatchResentAfterFailoverAnswersOneEntryRegression) {
+    Ki k;
+    ASSERT_TRUE(k.r.ack(k.r.produceFrame({ins(1)}, kAllView, 61, 0)));
+    std::vector<uint8_t> bytes = VerdictRig::batch({ins(2), ins(1), ins(3)}, 61, 1);
+    VerdictRig::setBatchAttribute(bytes, rune::protocol::batch::kAttrAtomic);
+    const auto first = k.r.ack(k.r.produceBytes(bytes, kAllView, 61, 1));
+    ASSERT_TRUE(first);
+    ASSERT_EQ(first->verdicts.size(), 1u);
+    k.r.failover();
+    const auto again = k.r.ack(k.r.produceBytes(bytes, kAllView, 61, 1));
+    ASSERT_TRUE(again);
+    EXPECT_EQ(again->code, 0);
+    ASSERT_EQ(again->verdicts.size(), 1u);
+    EXPECT_EQ(std::get<0>(again->verdicts[0]), 0);
+    EXPECT_EQ(std::get<1>(again->verdicts[0]), kKeyExists);
 }
 
 // Task 7 (T7 review 1, F4): an atomic batch of txnJudgedRecordsMax + 1 records is refused by produce (rule 10); one that arrives by

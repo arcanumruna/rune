@@ -934,12 +934,11 @@ TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRe
     (void)s.cq->waitFor(tok2, 15s, [&](const rc::Completion& d, std::span<const uint8_t> p) { c2 = d; payload2.assign(p.begin(), p.end()); });
     ASSERT_TRUE(c2);
     ASSERT_EQ(c2->op, rc::OpKind::Tier2Batch);
-    ASSERT_EQ(c2->status, rc::OpStatus::RecordsRejected) << "err=" << c2->errorCode;
+    ASSERT_EQ(c2->status, rc::OpStatus::BrokerError) << "err=" << c2->errorCode;
+    EXPECT_EQ(c2->errorCode, static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation));
     EXPECT_EQ(rc::constraintIdOf(*c2), rune::view::constraintIdOf(7, 1));
-    const rc::BatchVerdicts v2(*c2, payload2);
-    // TODO(Part 11 Task 12): the ack carries one trailer entry, the first failing record's, and completes as BrokerError.
-    EXPECT_EQ(v2.rejectedCount(), tags.size()) << "every record of the atomic batch is rejected";
-    for (uint32_t i = 0; i < tags.size(); ++i) EXPECT_EQ(v2.offsetOf(i), -1);
+    EXPECT_GE(c2->value, 0) << "the batch's base offset";
+    EXPECT_TRUE(payload2.empty());
 
     // ---- the Raw subscriber gets exactly the accepted records: a capped poll ending on a sentinel accepted send ----
     const std::string sentinelVal = verdictValue(100, 1, 1);
@@ -989,8 +988,8 @@ TEST(CheckedWritesBrokerRegression, FullyRejectedBatchIsSkippedOnTheGroupPathSha
     const auto [cb, pb] = sendBatch(9, 3);   // B: every record rejected
     const auto [cc, pc] = sendBatch(1, 3);   // C: accepted
     ASSERT_EQ(ca.status, rc::OpStatus::Ok);
-    ASSERT_EQ(cb.status, rc::OpStatus::RecordsRejected);
-    ASSERT_EQ(rc::BatchVerdicts(cb, pb).rejectedCount(), 3u) << "B is fully rejected";
+    ASSERT_EQ(cb.status, rc::OpStatus::BrokerError) << "B is fully rejected, answered once";
+    ASSERT_TRUE(pb.empty());
     ASSERT_EQ(cc.status, rc::OpStatus::Ok);
     std::set<int64_t> want;
     for (int i = 0; i < 3; ++i) { want.insert(ca.value + i); want.insert(cc.value + i); }

@@ -6093,6 +6093,7 @@ private:
         int32_t                 minIsr     = 1;       ///< DR-BUG-3 (thenAwaitHw only)
         uint8_t                 thenAwaitAcks = 0;    ///< the wire acks byte: a View entry moves to pendingAcksView_ (thenAwaitHw only)
         uint8_t                 replay     = 0;       ///< PendingAcksView::replay of the entry it becomes
+        bool                    atomic     = false;   ///< PendingAcksView::atomic of the entry it becomes
     };
     // F15 S5 fix round 1 (I-1): park-ordered, O(1) front fire (OrderedWaitQueue.h).
     OrderedWaitQueue<DurablePending> durablePending_;
@@ -6511,6 +6512,7 @@ private:
         WorkerReturn                         ret;
         uint8_t                              acks       = 0;   ///< the Produce.acks wire byte
         uint8_t                              replay     = 0;   ///< a duplicate: 1 = in the dedupe window (its verdicts are replayed once W passes it), 2 = known-old (no verdicts to replay)
+        bool                                 atomic     = false; ///< an atomic batch: judged whole, so a rejection answers one trailer entry
     };
     OrderedWaitQueue<PendingAcksView> pendingAcksView_;
     // Part 11: the vote-time scans, the parked votes over every write state (each owes one return), the TxnJudge scratch, the knob.
@@ -8783,6 +8785,7 @@ private:
                 pending.minIsr     = entry.minIsr;
                 pending.acks       = entry.thenAwaitAcks;
                 pending.replay     = entry.replay;
+                pending.atomic     = entry.atomic;
                 pending.ret        = std::move(entry.ret);
                 pendingAcksView_.push_back(std::move(pending));
             } else {
@@ -9111,19 +9114,23 @@ private:
     // The trailer of a View ack of a verdict source: the rejections in [baseOffset, lastOffset] as {offset - baseOffset, code,
     // constraintId}.  Deferred = the sink's arena is full (the caller retries; nothing was reserved).  TooMany = more than a
     // trailer carries (a batch the hook let through before the limit applied): the ack is Internal, the write itself stands.
+    // An atomic batch is judged whole: its index holds N identical entries, the trailer carries the first as {0, code, constraintId}.
     enum class VerdictFill : uint8_t { Done, Deferred, TooMany };
     [[nodiscard]] VerdictFill fillVerdicts_(PendingAcksView& entry, const PartitionWriteState& ws) {
         const int64_t base = entry.ret.baseOffset;
         std::size_t count = 0;
         ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry&) { ++count; });
         if (count > static_cast<std::size_t>(kMaxJudgedBatchRecords)) [[unlikely]] return VerdictFill::TooMany;
-        const uint16_t n = static_cast<uint16_t>(count);
+        const uint16_t n = static_cast<uint16_t>(entry.atomic && count != 0 ? 1 : count);
         uint32_t run = kNoVerdictRun;
         if (n != 0) {
             if (!ackSink_->reserveVerdicts(n, run)) return VerdictFill::Deferred;
             uint8_t* out = ackSink_->verdictEntries(run).data();
+            uint16_t left = n;
             ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry& e) {
-                const uint16_t idx = static_cast<uint16_t>(e.offset - base);
+                if (left == 0) return;
+                --left;
+                const uint16_t idx = entry.atomic ? uint16_t{0} : static_cast<uint16_t>(e.offset - base);
                 out[0] = static_cast<uint8_t>(idx); out[1] = static_cast<uint8_t>(idx >> 8);
                 out[2] = static_cast<uint8_t>(e.code); out[3] = static_cast<uint8_t>(e.code >> 8);
                 for (int i = 0; i < 4; ++i) out[4 + i] = static_cast<uint8_t>(e.constraintId >> (8 * i));
@@ -10485,6 +10492,7 @@ private:
         // DelayedProduce waits on the duplicate's original offsets too.)
         const int64_t lastOff = ret.lastOffset;
         const uint8_t replay = !outcome.isDuplicate ? 0 : outcome.baseOffset < 0 ? 2 : 1;
+        const bool atomic = (batchAttrs & rune::protocol::batch::kAttrAtomic) != 0;
 
         if (asyncStrict) {
             // Park on the coalesced fsync (submitRound_ stamps the token
@@ -10500,6 +10508,7 @@ private:
             dp.thenAwaitHw = (acksAll || pc::acksView(acks)) ? replica : nullptr;
             dp.thenAwaitAcks = acks;
             dp.replay      = replay;
+            dp.atomic      = atomic;
             dp.deadlineNs  = nowNs + ackTimeoutNs_;
             dp.replica     = replica;
             dp.logGen      = replica ? replica->logGeneration() : 0;
@@ -10520,6 +10529,7 @@ private:
             pending.minIsr     = minIsr;
             pending.acks       = acks;
             pending.replay     = replay;
+            pending.atomic     = atomic;
             pending.ret        = std::move(ret);
             pendingAcksView_.push_back(std::move(pending));
             return 1;
