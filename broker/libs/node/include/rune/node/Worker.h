@@ -10280,8 +10280,9 @@ private:
         // Checked writes frame checks, before any append and for every topic, typed or not.  A transactional batch
         // ignores the View bit (its verdicts come with the commit vote); View needs worker-side acks, the feature level
         // and a replica to fold from.
-        const bool txn = rbSpan.size() >= static_cast<std::size_t>(rune::protocol::batch::kAttributesOffset) + 2 &&
-                         (rune::protocol::detail::getLE16(rbSpan.data() + rune::protocol::batch::kAttributesOffset) & kTxnAttrBit) != 0;
+        const uint16_t batchAttrs = rbSpan.size() >= static_cast<std::size_t>(rune::protocol::batch::kAttributesOffset) + 2
+                                        ? rune::protocol::detail::getLE16(rbSpan.data() + rune::protocol::batch::kAttributesOffset) : uint16_t{0};
+        const bool txn = (batchAttrs & kTxnAttrBit) != 0;
         const uint8_t acks = txn ? static_cast<uint8_t>(f.acks & ~pc::kAcksWireView) : f.acks;
         PartitionWriteState* const ws = writeOf_(replica);
         HookRefusal frameRefusal = HookRefusal::None;
@@ -10290,8 +10291,6 @@ private:
             else if (!checkedWritesEnabled_()) frameRefusal = HookRefusal::LevelTooLow;
             else if (replica == nullptr) frameRefusal = HookRefusal::ViewWithoutReplica;
         }
-        if (frameRefusal == HookRefusal::None && txn && ws != nullptr && topicHookFactsOf(*ws).constrainedSource) [[unlikely]]
-            frameRefusal = HookRefusal::TxnOnConstrainedSource;
         if (frameRefusal != HookRefusal::None) [[unlikely]] {
             noteHookRefusal_(frameRefusal, f);
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
@@ -10371,8 +10370,8 @@ private:
         const bool crcPreverified = f.fromOp && f.crcValidated;
         rune::storage::ProduceOutcome outcome;
         if (ws != nullptr) [[unlikely]] {
-            const WriteFacts facts{.acks = acks, .idempotent = f.producerId >= 0, .transactional = txn, .atomicBatch = false,
-                                   .importGranted = f.importGranted, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_()};
+            const WriteFacts facts{.acks = acks, .idempotent = f.producerId >= 0, .transactional = txn, .atomicBatch = !txn && (batchAttrs & rune::protocol::batch::kAttrAtomic) != 0,
+                                   .importGranted = f.importGranted, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_(), .txnJudgedRecordsMax = txnJudgedRecordsMax_};
             lastWriteFacts_ = facts;
             CheckedWriteHook hook(*ws, facts, ws->spec->autoIncrement ? std::span<uint8_t>(autoIncScratch_) : std::span<uint8_t>{});
             if (log != nullptr) {

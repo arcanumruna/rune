@@ -36,6 +36,7 @@ struct WriteFacts {
     int64_t producerId         = -1;
     bool    legacyMode         = false;
     bool    levelCheckedWrites = false;
+    int32_t txnJudgedRecordsMax = 4096;   ///< the node's bound on a batch the judge holds whole (rule 10)
 };
 
 /// What the topic says.  Later parts set the members; in Part 03 every member is false.
@@ -76,12 +77,13 @@ struct BatchIntents {
     uint64_t importMaxN       = 0;       ///< the highest counter value an import carries (0 = none)
 };
 
+/// IntentInTxnOrAtomicBatch and TxnOnConstrainedSource are unused since Part 11 (P11-14); their values keep the counter array's indices.
 enum class HookRefusal : uint8_t {
     None, ReservedBits, ValidationFailed, VersionAhead, LegacyMode, LevelTooLow, NoKeyIndex,
     ExplicitKeyNeedsIdempotentAndView, IntentInTxnOrAtomicBatch, TxnOnConstrainedSource,
     KeyZeroCreateNeedsIdempotentAll, KeyZeroCreateNeedsView, MixedKeyZeroBatch, ViewBatchTooLarge,
     ViewWithoutReplica, KeyIndexActivating, UpsertOnAutoIncrement, ImportNotGranted, ImportOutOfRange,
-    AutoIncExhausted, AutoIncWindowFull, AutoIncActivating, Count_
+    AutoIncExhausted, AutoIncWindowFull, AutoIncActivating, AtomicBatchTooLarge, Count_
 };
 
 struct RequirementVerdict {
@@ -100,13 +102,11 @@ struct RequirementVerdict {
     if (f.legacyMode && (b.anyIntent || view)) return refuse(HookRefusal::LegacyMode);
     if (!f.levelCheckedWrites && (b.anyIntent || view)) return refuse(HookRefusal::LevelTooLow);
     if (b.anyIntent && !t.keyIndex) return refuse(HookRefusal::NoKeyIndex);
-    if (b.explicitKeyIntent && (!f.idempotent || !view)) return refuse(HookRefusal::ExplicitKeyNeedsIdempotentAndView);
-    if (b.explicitKeyIntent && (f.transactional || f.atomicBatch)) return refuse(HookRefusal::IntentInTxnOrAtomicBatch);
-    if ((f.transactional || f.atomicBatch) && t.constrainedSource) return refuse(HookRefusal::TxnOnConstrainedSource);
+    if (b.explicitKeyIntent && (!f.idempotent || (!view && !f.transactional))) return refuse(HookRefusal::ExplicitKeyNeedsIdempotentAndView);
     if (b.keyZeroCreate) {
         if (b.mixedKeyZero) return refuse(HookRefusal::MixedKeyZeroBatch);
         if (!f.idempotent || !acksAll(f.acks)) return refuse(HookRefusal::KeyZeroCreateNeedsIdempotentAll);
-        if (t.constrainedSource && !view) return refuse(HookRefusal::KeyZeroCreateNeedsView);
+        if (t.constrainedSource && !view && !f.transactional) return refuse(HookRefusal::KeyZeroCreateNeedsView);
     }
     if (t.autoIncrement) {
         if (b.plainUpsert) return refuse(HookRefusal::UpsertOnAutoIncrement);
@@ -115,6 +115,7 @@ struct RequirementVerdict {
         if (b.keyZeroCreate && b.autoIncExhausted) return {ErrorCode::AutoIncrementExhausted, HookRefusal::AutoIncExhausted};
     }
     if (view && b.records > kMaxJudgedBatchRecords && t.verdictSource) return refuse(HookRefusal::ViewBatchTooLarge);
+    if (f.atomicBatch && t.verdictSource && b.records > f.txnJudgedRecordsMax) return refuse(HookRefusal::AtomicBatchTooLarge);
     if (t.autoIncrement) {
         if ((b.keyZeroCreate || b.explicitInsert) && !t.autoIncReady) return {ErrorCode::NotLeader, HookRefusal::AutoIncActivating};
         if (b.keyZeroCreate && b.autoIncWindowFull) return {ErrorCode::NotLeader, HookRefusal::AutoIncWindowFull};

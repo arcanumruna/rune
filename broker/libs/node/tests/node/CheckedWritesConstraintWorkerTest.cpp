@@ -313,16 +313,22 @@ TEST(CheckedWritesConstraintWorker, DropThenCreateLeavesAGap) {
     EXPECT_EQ(again->verdicts, (V{{0, kViolation, kNameId}}));
 }
 
-// §15, 03 rule 7: a constrained source takes no transaction (the vote is Part 11's).
-TEST(CheckedWritesConstraintWorker, ConstrainedSourceRefusesTransactions) {
+// §15, P11-14: a constrained source takes a transaction; the vote judges it and the commit applies it.
+TEST(CheckedWritesConstraintWorker, ConstrainedSourceAcceptsTransactions) {
     {
         Cw c;
         c.createTopic(true);
         c.createConstrainedView(CV::CharacterName);
-        const int64_t k = c.r.appendRecords(std::vector{VerdictRig::srcOf(create(1, "a"))}, kAllView, 77, 0, /*txn=*/true);
-        const auto a = c.r.ack(k);
+        const auto a = c.r.ack(c.r.appendRecords(std::vector{VerdictRig::srcOf(create(1, "a"))}, kAllView, 77, 0, /*txn=*/true));
         ASSERT_TRUE(a);
-        EXPECT_EQ(a->code, kInvalidRequest);
+        EXPECT_EQ(a->code, 0);
+        const auto end = c.r.commitTxn(77);
+        EXPECT_TRUE(end.committed);
+        ASSERT_EQ(end.votes.size(), 1u);
+        EXPECT_EQ(end.votes.front().second.code, 0);
+        c.settle();
+        EXPECT_EQ(c.owner("a"), static_cast<int64_t>(a->assignedBase));
+        EXPECT_EQ(c.r.writeState()->txn.stats.markerWithoutVote, 0u);
     }
     Cw plain;
     plain.createTopic(true);

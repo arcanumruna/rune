@@ -355,6 +355,17 @@ TEST(CheckedWritesVerdictWorker, HookFactsFollowTheTimeline) {
     facts = topicHookFactsOf(*w);
     EXPECT_TRUE(facts.verdictSource);
     EXPECT_TRUE(facts.constrainedSource);
+    // P11-14: a transaction is then accepted, and its commit makes the record visible.
+    r.enableAcks();
+    r.installProjection(kProj);
+    r.passes(50);
+    const auto accepted = r.ack(r.produceFrame({{3, 30, 0}}, 1, 41, 0, /*txn=*/true));
+    ASSERT_TRUE(accepted);
+    EXPECT_EQ(accepted->code, 0);
+    const auto end = r.commitTxn(41);
+    EXPECT_TRUE(end.committed);
+    ASSERT_TRUE(r.driveUntilJudged());
+    EXPECT_TRUE(r.hasRow(kProj, 3));
 }
 
 TEST(CheckedWritesVerdictWorker, TruncationOfAnUncommittedTailChangesNoVerdict) {
