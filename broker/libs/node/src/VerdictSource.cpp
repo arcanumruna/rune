@@ -1368,10 +1368,7 @@ int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
         for (int64_t pos = from;;) {
             const int64_t off = state.rejected.nextRejectedAtOrAfter(pos);
             if (off >= through) break;
-            if (entryScratch_.size() == cr::kMaxMarkerEntries) {
-                finalThrough = off;
-                break;
-            }
+            if (entryScratch_.size() == cr::kMaxMarkerEntries) { finalThrough = off; break; }
             const auto* e = state.rejected.find(off);
             entryScratch_.push_back(cr::MarkerEntry{static_cast<uint32_t>(off - from), e->code, e->constraintId});
             pos = off + 1;
