@@ -759,7 +759,7 @@ TEST(EosBrokerRegression, InDoubtCommitRetryCommitsOnceRegression) {
     kcfg.responseTimeoutNs = 1'500'000'000LL;
     auto cl = connectClient(e.c, kcfg);
     // The session is declared stale after ~1.5 s; an op timeout below that makes the first commit a deterministic
-    // Timeout (InDoubt), so the RETRY branch always runs.
+    // Timeout (InDoubt), so the RETRY branch always runs, and the retry's own 1 s budget outlasts the stale edge.
     auto icfg = txnConfig("eos-indoubt");
     icfg.transactionOpTimeoutMs = 1'000;
     rc::Producer p = cl->producer(icfg);
