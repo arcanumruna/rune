@@ -215,7 +215,7 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         case 13: return h == H::AutoIncExhausted;                                                                                  // exhausted
         case 14: return h == H::AutoIncWindowFull;                                                                                 // window full
         default: return h == H::LegacyMode || h == H::LevelTooLow || h == H::ExplicitKeyNeedsIdempotentAndView ||
-                        h == H::KeyZeroCreateNeedsView || h == H::ViewBatchTooLarge;                                          // acks View
+                        h == H::KeyZeroCreateNeedsView || h == H::ViewBatchTooLarge;                                               // acks View
         }
     };
     const auto build = [](uint32_t m, BatchIntents& b, WriteFacts& f, TopicHookFacts& t) {
