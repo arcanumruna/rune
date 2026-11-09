@@ -819,6 +819,8 @@ public:
         if (ackSink_) ackSink_->setDirectBudgets(perSession, workerCap);
     }
     [[nodiscard]] std::size_t directAcksInFlightForTest() const noexcept { return ackSink_ ? ackSink_->directInFlight() : 0; }
+    /// Produce acks the worker still holds: an fsync, the HW or a View verdict (the alloc gate's window ends with none).
+    [[nodiscard]] std::size_t heldAcksForTest() const noexcept { return durablePending_.size() + pendingAcksAll_.size() + pendingAcksView_.size(); }
     [[nodiscard]] uint32_t directAcksInFlightOfForTest(int64_t sid) const noexcept {
         return ackSink_ ? ackSink_->directInFlightOf(sid) : 0;
     }

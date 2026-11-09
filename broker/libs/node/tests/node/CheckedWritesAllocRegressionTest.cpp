@@ -813,9 +813,10 @@ TEST(CheckedWritesAllocRegression, EmptyDrainsBetweenWindowsAllocateNothingRegre
 
 // Part 11: the vote, the lock pause, the marker's step and an atomic batch allocate nothing in steady state.  Two rigs joined as a
 // coordinator would: topic character under its three views (unique name, account stats, account characters) and topic entry under
-// the balances.  The mix: transactions of 2..16 characters and a debit, 10 % voted no (a taken name, an overdraw), 10 % aborted
-// after both yes, an outside write on a locked row pausing behind every 5th; atomic batches, 10 % refused whole.  The window brackets
-// the worker's passes of each step (the write, a vote, a marker, an atomic batch); the frames, the acks and the polling are the rig's.
+// the balances.  The mix: transactions of 2..16 characters and a debit, 20 % voted no (10 % a taken name, 10 % an overdraw), 10 %
+// aborted after both yes, an outside write on a locked row pausing behind every 5th; atomic batches, 10 % refused whole.  The window
+// brackets the worker's passes of each step (the write, a vote, a marker, an atomic batch) until the step is done, and asserts it was;
+// the frames, the acks and the polling are the rig's.
 // The records reuse 256 characters and 64 entries: a view's row table growing for new keys is the fold's.
 namespace {
 struct TxnAllocMix {
@@ -866,19 +867,36 @@ struct TxnAllocMix {
     }
     uint64_t next(uint64_t n) { lcg = lcg * 6364136223846793005ull + 1442695040888963407ull; return (lcg >> 33) % n; }
 
-    /// The worker's passes of `r`, bracketed: what a pass does is the gate, the rig's polling between windows is not.
-    template <class Body>
-    void window(VerdictRig& r, int passes, Body&& body) {
-        rune::testing::AllocWindow w;
-        body();
-        for (int i = 0; i < passes; ++i) {
-            r.now += 1'000'000;
-            r.worker->doWork(r.now);
-            r.worker->drainReturn([](WorkerReturn&&) {});
+    /// The worker's passes of `r` until `done()`, bracketed: what a pass does is the gate, the rig's polling between windows is not.
+    /// `done` reads counters only, and must hold: a step's work left past its window would go unmeasured.
+    template <class Done, class Body>
+    void window(VerdictRig& r, Done&& done, Body&& body) {
+        bool reached = false;
+        {
+            rune::testing::AllocWindow w;
+            body();
+            for (int i = 0; !(reached = done()) && i < 200; ++i) {
+                r.now += 1'000'000;
+                r.worker->doWork(r.now);
+                r.worker->drainReturn([](WorkerReturn&&) {});
+            }
+            allocs += w.count();
         }
-        allocs += w.count();
+        EXPECT_TRUE(reached) << "txn " << txns << " batch " << batches;
     }
-    void window(VerdictRig& r, int passes) { window(r, passes, [] {}); }
+    template <class Done>
+    void window(VerdictRig& r, Done&& done) { window(r, std::forward<Done>(done), [] {}); }
+    /// The step's appends are in, under the HW, and the worker holds none of their acks.
+    static auto appended(VerdictRig& r, int64_t leo0) {
+        return [&r, leo0] { return r.leo() > leo0 && r.replica->highWatermark() >= r.leo() && r.worker->heldAcksForTest() == 0; };
+    }
+    /// ... and the judge is past them (a marker applied, a batch judged), and the markers cover the data through `marked`.
+    static auto judged(VerdictRig& r, int64_t leo0, int64_t marked = 0) {
+        return [&r, leo0, marked, in = appended(r, leo0)] {
+            const VerdictSource* j = r.vs->verdictSource(VerdictRig::kSrc, 0);
+            return in() && j != nullptr && j->judgedThrough() >= r.leo() && r.writeState()->markers.committedThrough() >= marked;
+        };
+    }
 
     struct Vote { bool answered = false; bool yes = false; };
     Vote vote(VerdictRig& r, int64_t pid) {
@@ -913,7 +931,7 @@ struct TxnAllocMix {
         const std::size_t aborted = r.worker->rcAbortedRangesForTest(VerdictRig::kSrc, 0).size();
         const bool coldGrowth = !commit && aborted >= rune::transaction::AbortedTxnIndex::kDefaultReservedRanges && (aborted & (aborted - 1)) == 0;
         expectedCold += coldGrowth ? 1 : 0;
-        window(r, 8, [&] { EXPECT_TRUE(r.worker->tryEnqueueOp(std::move(op))); });
+        window(r, judged(r, r.leo(), commit ? r.dataEnd() : 0), [&] { EXPECT_TRUE(r.worker->tryEnqueueOp(std::move(op))); });
         EXPECT_TRUE(commit ? r.driveUntilJudged() : r.driveUntilJudgeReaches());
     }
 
@@ -937,10 +955,11 @@ struct TxnAllocMix {
         const int32_t sa = seqA[pid], sb = seqB[pid];
         seqA[pid] += static_cast<int32_t>(chars.size());
         seqB[pid] += 1;
+        const int64_t leoA = a.leo(), leoB = b.leo();
         const int64_t ca = a.appendCharacters(chars, kAcksAll, pid, sa, /*txn=*/true);
         const int64_t cb = b.appendEntries(std::span<const VerdictRig::Entry>(&debit, 1), kAcksAll, pid, sb, /*txn=*/true);
-        window(a, 4);
-        window(b, 4);
+        window(a, appended(a, leoA));
+        window(b, appended(b, leoB));
         EXPECT_TRUE(a.ack(ca));
         EXPECT_TRUE(b.ack(cb));
         const Vote va = vote(a, pid), vb = vote(b, pid);
@@ -950,8 +969,9 @@ struct TxnAllocMix {
         votedNo += yes ? 0 : 1;
         int64_t lockedAck = -1;
         if (locked && yes) {   // a plain write to a row the open transaction holds: its verdict waits for the marker
+            const uint64_t pauses = a.writeState()->txn.stats.lockPauses;
             lockedAck = a.appendCharacters(std::vector<VerdictRig::Char>{character(chars.front().id, -t)}, kAcksViewAll, 500, seqLocked++);
-            window(a, 4);
+            window(a, [&] { return a.writeState()->txn.stats.lockPauses > pauses; });
             ++lockedWrites;
         }
         const bool commit = yes && !abortAfterYes;
@@ -978,13 +998,14 @@ struct TxnAllocMix {
             const uint64_t other = id % kChars + 1;
             chars.push_back(character(id, i, refused && chars.empty() && ids.count(other) == 0, other));
         }
+        const int64_t leo = a.leo();
         const int64_t c = a.appendCharacters(chars, kAcksViewAll, -1, -1, /*txn=*/false, /*atomic=*/true);
-        window(a, 6);
+        window(a, judged(a, leo));
         const auto ack = a.ack(c);
         ASSERT_TRUE(ack);
         EXPECT_EQ(ack->code, 0);
         EXPECT_EQ(!ack->verdicts.empty(), refused) << "batch " << i;
-        atomicRefused += ack->hasVerdicts ? 1 : 0;
+        atomicRefused += ack->verdicts.empty() ? 0 : 1;
     }
 };
 }  // namespace

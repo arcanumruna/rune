@@ -91,7 +91,7 @@ security 64 to 95.
 | 51 | `TxnOffsetCommit` | C→B | `producerId`, `producerEpoch`, `transactionalId`, `groupId`, `entries`, then optionally (client 10) `generationId` i32 + `memberId` |
 | 52 | `TxnOffsetCommitResponse` | B→C | `results` |
 | 53 | `EndTxn` | C→B | `producerId`, `producerEpoch`, `commit`, `transactionalId` |
-| 54 | `EndTxnResponse` | B→C | `errorCode`, then (v17, only after a transaction vote) `constraintId`, `failingOffset` |
+| 54 | `EndTxnResponse` | B→C | `errorCode`, then (v17, only after a no vote) `constraintId`, `failingOffset` |
 | 64 | `DefineTopic` | C→B | `topicName`, `partitionCount`, `keyField`, `validate` (sent as 1 for a typed topic; a broker of this version ignores it, typed topics always validate), `descriptorBlob`, `persistence`, `replicationFactor`, DDL extension, key features (optional; sent only when the features are not the defaults, and only to a broker of version 10 or later) |
 | 65 | `DefineTopicResponse` | B→C | `topicId`, `version`, `errorCode` |
 | 66 | `GetTopicSchema` | C→B | `topicName`, `requestedFingerprint` (0 = latest; `~0` = the evolving lineage) |
@@ -231,8 +231,8 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
   (thousands of rejections, up to 32,824 bytes) is offered rather than claimed; ack publications have a term of at least 512 KiB.
 - **Control records 16 to 20** are control batches with producer id -1 in the log: 16 reservation, 17 verdict marker,
   18 constraint-set change, 19 transaction judge, 20 verdict plan. Consumers never receive them and the transaction readers ignore them.
-- **Transaction judge record** (type 19, `kTxnJudge`): the payload is `[producerId i64][producerEpoch i16][firstOffset i64]`
-  (little-endian, 18 bytes after the type). The leader appends it when it has the coordinator's vote request for the transaction; the
+- **Transaction judge record** (type 19, `kTxnJudge`): the value is `[version u8 = 1][producerId i64][producerEpoch i16][firstOffset i64]`
+  (little-endian, 19 bytes; the record key is the type). The leader appends it when it has the coordinator's vote request for the transaction; the
   judge reads everything from `firstOffset` up to it as one unit, and the commit or abort marker then finalizes the verdict.
   The cleaner keeps the ones a restart or a new leader still needs to judge an undecided transaction.
 - **Atomic batch** (`attributes` bit 7, `kAttrAtomic`): on a verdict source the batch is all or nothing on its partition. If any
@@ -242,7 +242,7 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
 
   | Offset (body) | Size | Field |
   |---|---|---|
-  | 0 | 2 | `errorCode`: the vote, 55, 56, 57, 62 or 63 (0 = the commit succeeded) |
+  | 0 | 2 | `errorCode`: the vote, 55, 56, 57, 62 or 63 |
   | 2 | 4 | `constraintId` (`viewObjectId << 16 \| ordinal`; 0 when the code names none) |
   | 6 | 8 | `failingOffset`: the log offset of the record that failed, -1 for none |
 
@@ -267,7 +267,8 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
   skips it, so it never reaches a consumer.
 - **Limits and refusals**: the client sends at most 4096 records in a `View` batch (a verdict source refuses more). A `View` produce is answered `InvalidRequest` on the
   legacy gateway stream, while the cluster feature level is below checked writes, or without a replica to fold from. A
-  `View` bit on a transactional batch is ignored: the transaction commit carries the verdict. Error codes 55 to 63 are sent only to sessions at 17 or above.
+  `View` bit on a transactional batch is ignored: the transaction commit carries the verdict. An atomic batch with more records than
+  `RUNE_TXN_JUDGED_RECORDS_MAX` on a verdict source is answered `InvalidRequest` (39). Error codes 55 to 63 are sent only to sessions at 17 or above.
 - **Intents** (record `attributes` bits 0-1, see [Record batch](#record-batch-v2)) are judged against the topic's key
   index when the batch is folded, in offset order, each record against the accepted records before it. A rejected intent
   is a `View` trailer entry with `code` 56 or 57 and `constraintId` 0. In a transaction it is judged at the vote and a no names
@@ -460,7 +461,7 @@ rejection counts of a topic's verdict source, `constraintId = viewObjectId << 16
 | 59 | `ViewKeyExpressionInvalid` | Client 17: a view key expression does not compile (a bad type, `lower()` on a non-string, a duplicate or over-wide key, the identity rule). | DDL compile error |
 | 60 | `ViewConstraintInvalid` | Client 17: a `check` that does not compile, or a constraint limit (32 verdict views, object id 65536 or above, plan record over 65,536 bytes). | DDL compile error |
 | 61 | `ViewUniqueInvalid` | Client 17: a `unique` clause does not compile. | DDL compile error |
-| 62 | `TxnTooLarge` | Client 17: a transaction (or atomic batch) has more records on a partition than `RUNE_TXN_JUDGED_RECORDS_MAX`. The whole transaction aborts. | vote in `EndTxnResponse`; for an atomic batch, the `View` ack's one entry |
+| 62 | `TxnTooLarge` | Client 17: a transaction has more records on a partition than `RUNE_TXN_JUDGED_RECORDS_MAX`. The whole transaction aborts. | vote in `EndTxnResponse`, or the `Produce` that takes it past the limit |
 | 63 | `TxnConflict` | Client 17: another writer wrote one of the transaction's keys after its write and before its commit. The whole transaction aborts. | vote in `EndTxnResponse` |
 
 The broker-internal storage errors (`rune::protocol::ErrorCode`, [`Errors.h`](../../protocol/include/rune/protocol/Errors.h))

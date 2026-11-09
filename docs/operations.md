@@ -475,14 +475,14 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
   - **Votes.** The coordinator asks the leader of every partition the transaction wrote to whether it votes yes. The judge answers
     once it has judged the transaction whole, applying its records provisionally and locking the rows it wrote; the commit or
     abort marker then finalizes the result in one step. Counters are ids 11 to 20 of `rune stats topic <t>`: `txnVotesYes`,
-    `txnVotesNo` with one counter per code, `txnVoteLatencyNsMax` and `txnVoteLatencyNsTotal`.
+    `txnVotesNo`, one counter each for 55, 56, 57 and 62 (`TxnConflict` no votes count only in `txnVotesNo`), `txnVoteLatencyNsMax` and `txnVoteLatencyNsTotal`.
   - **Lock pause.** While a transaction holds a row locked, the verdicts of other writers' records that touch the row wait for its
     marker; the time is `foldPausedOnTxnLockNs`. A distributed lock wait ends at the transaction timeout at the latest, when the
     coordinator aborts the transaction.
   - **`txnMarkerWithoutVote`** counts markers that arrived for a transaction nobody asked a vote for. It stays 0; a non-zero
     value is a coordinator bug.
-  - **Size.** A transaction (or atomic batch) over `RUNE_TXN_JUDGED_RECORDS_MAX` records on one partition is voted `TxnTooLarge`
-    (62), see [configuration](configuration.md).
+  - **Size.** A transaction over `RUNE_TXN_JUDGED_RECORDS_MAX` records on one partition is voted `TxnTooLarge` (62); an atomic batch
+    over it to a verdict source is refused with `InvalidRequest` (39), see [configuration](configuration.md).
   - **Persisted constrained views.** A persisted view of a verdict source checkpoints while the judge runs ahead of undecided
     transactions, and a restart backfills from the `TxnJudge` records at or above its checkpoint.
 - **Constraint views** (`unique` and `check`, see [Constraints](api/ql.md#constraints)) join and leave the set through
