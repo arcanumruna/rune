@@ -1631,16 +1631,19 @@ public:
             br.rec.partition      = partition;
             br.rec.partitionEpoch = pa->partitionEpoch + 1;
             // Coordinator partitions are not in the balancer's topic set: the
-            // same rule here — another live ISR member leads, the requester
-            // leaves the ISR (re-admitted by the new leader's AlterIsr).
+            // same rule here — another live ISR member leads.  The requester
+            // leaves the ISR (re-admitted by the new leader's AlterIsr) unless it
+            // only hit the restart fence: its log is intact, and an ISR without it
+            // can lose its last live member before it is re-admitted.
             if (topicId < 0) {
+                const bool requesterStays = q.reason == BumpReason::Fence && !isShutting_(q.requester);
                 for (int32_t n : pa->isr) {
                     if (n == q.requester || isShutting_(n)) continue;
                     if (std::find(eligible_.begin(), eligible_.end(), n) == eligible_.end()) continue;
                     br.rec.leaderNode  = n;
                     br.rec.leaderEpoch = pa->leaderEpoch + 1;
                     br.isr.push_back(n);
-                    for (int32_t o : pa->isr) if (o != n && o != q.requester) br.isr.push_back(o);
+                    for (int32_t o : pa->isr) if (o != n && (o != q.requester || requesterStays)) br.isr.push_back(o);
                     break;
                 }
             }

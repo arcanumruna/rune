@@ -1278,6 +1278,45 @@ TEST(EpochRestartControllerRegression, SoleIsrBumpReelectsSameLeaderPastFenceReg
     EXPECT_EQ(c.pa().isr.size(), 1u);
 }
 
+// A restarted coordinator-partition leader refuses at the restart fence while its log is intact.  The partition moves to the
+// other live ISR member; the requester stays in the ISR (its log is the committed one), so when that member dies before the
+// requester was re-admitted, the partition still has a live ISR member to elect.  RED: the requester left the ISR, ISR and live
+// set did not meet and the partition stayed leaderless.
+TEST(EpochRestartControllerRegression, CoordinatorBumpKeepsTheRequesterInTheIsrRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_NE(c.svc->assignment(-1, 0), nullptr);
+    const int32_t requester = c.paOf(-1).leaderNode;
+    const int32_t other     = requester == 1 ? 2 : 1;
+    {   // the third node was out of the ISR (a restart that was never re-admitted)
+        const auto& a = c.paOf(-1);
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = -1; m.partition = 0; m.leaderId = requester; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = 2; m.isr[0] = requester; m.isr[1] = other; m.partitionEpoch = a.partitionEpoch;
+        ASSERT_TRUE(c.svc->onAlterIsr(m));
+        c.drive(50);
+        ASSERT_EQ(c.paOf(-1).isr.size(), 2u);
+    }
+    const auto& a = c.paOf(-1);
+    rune::replication::AlterIsrMsg bump{};
+    bump.topicId = -1; bump.partition = 0; bump.leaderId = requester; bump.leaderEpoch = a.leaderEpoch;
+    bump.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+    bump.partitionEpoch = a.partitionEpoch;
+    bump.isr[0] = a.leaderEpoch;
+    bump.isr[1] = rune::replication::AlterIsrMsg::kBumpFenceValid;
+    (void)c.svc->onAlterIsr(bump);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_NE(c.paOf(-1).leaderNode, requester) << "the restarted leader was re-elected over a live ISR member";
+    EXPECT_EQ(std::count(c.paOf(-1).isr.begin(), c.paOf(-1).isr.end(), requester), 1) << "the requester left the ISR";
+    for (int i = 0; i < 3; ++i) {   // the member that took over dies before the requester was re-admitted
+        (void)c.svc->runDynamicRebalanceOnTick({requester}, nullptr);
+        c.drive(50);
+    }
+    EXPECT_EQ(c.paOf(-1).leaderNode, requester) << "the partition stayed leaderless with a live in-sync member";
+}
+
 namespace {
 rune::replication::AlterIsrMsg leaderlessReport(int32_t node, int32_t epoch, int32_t leo, int64_t inc,
                                                 bool logDirFailed = false) {
@@ -5105,7 +5144,7 @@ TEST(LeaderMoveFenceRegression, EveryMoveThatDropsTheOldLeaderFromTheIsrWaitsFor
         for (NodeId n : {1, 2, 3}) if (n != L) others.push_back(n);
         expectMoveWaitsForTheOldLeadersLease(c, [&] { c.tick(others); }, "failover");
     }
-    {   // the coordinator-partition bump (decideBumps_ on a coordinator partition, controller path)
+    {   // the coordinator-partition bump of a memory-backed leader (decideBumps_ on a coordinator partition, controller path)
         CtlRig c(/*userTopics=*/false);
         (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
         c.drive(50);
@@ -5117,6 +5156,7 @@ TEST(LeaderMoveFenceRegression, EveryMoveThatDropsTheOldLeaderFromTheIsrWaitsFor
             m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
             m.partitionEpoch = a.partitionEpoch;
             m.isr[0] = -1;
+            m.isr[1] = rune::replication::AlterIsrMsg::kBumpMemoryBacked;
             (void)c.svc->onAlterIsr(m);
             (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
         }, "coordinator bump", /*topic=*/-1);
