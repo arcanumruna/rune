@@ -965,6 +965,7 @@ private:
         c.rcvWindowBytes = rcvWindowBytes;
         if (rcvWindowBytes < 64 * 1024) c.mtuBytes = 1408;
         c.countersValuesBytes = kTestClientCountersBytes;   // a client's few counters: a small CnC (#883)
+        c.statusMessageTimeoutNs = 20'000'000;   // as the test brokers: a 0.1 s silent-peer timeout must not see a live client between its status messages
         return c;
     }
     template <class M>

@@ -318,11 +318,15 @@ struct NodeConfig {
     /// short value to prove no startup phase starves an invoker driver.  No env var.
     static constexpr int64_t kInProcessLivenessNs = 3'600'000'000'000LL;
     int64_t shardClientLivenessTimeoutNs = kInProcessLivenessNs;
+    /// TEST-ONLY: the floor (ms) of inProcessDriverTimeoutMs in place of Aeron's 10 s default, so a test can freeze the process
+    /// past it in a fraction of the time.  0 = 10 s; never set in production.
+    long testInProcessDriverTimeoutFloorMs = 0;
     /// The in-process clients' media-driver timeout (ms) matching shardClientLivenessTimeoutNs (never below
     /// Aeron's 10 s default).
     [[nodiscard]] long inProcessDriverTimeoutMs() const noexcept {
         const long ms = static_cast<long>(shardClientLivenessTimeoutNs / 1'000'000);
-        return ms > 10'000 ? ms : 10'000;
+        const long floorMs = testInProcessDriverTimeoutFloorMs > 0 ? testInProcessDriverTimeoutFloorMs : 10'000;
+        return ms > floorMs ? ms : floorMs;
     }
     [[nodiscard]] bool shardMode() const noexcept { return workerMode == WorkerMode::Shard; }
     [[nodiscard]] bool fused() const noexcept { return runtimePlacement == RuntimePlacement::Fused; }
