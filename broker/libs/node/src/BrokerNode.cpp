@@ -1968,10 +1968,10 @@ void BrokerNode::buildWorkerPool() {
 //   TODO(Milestone B): per-peer client endpoints for exact REDIRECT.
 // ---------------------------------------------------------------------------
 void BrokerNode::onStorageFailure_(const std::string& logDir, int err) {
-    if (haltRaised_) return;
-    haltRaised_ = true;
     if (!StorageIdentity::markStorageFailedThisBoot(config_.dataDir, StorageIdentity::osBootId()))
         spdlog::critical("BrokerNode[{}]: could not record the storage failure in {}", config_.nodeId, config_.dataDir);
+    if (haltRaised_) return;
+    haltRaised_ = true;
     spdlog::critical("BrokerNode[{}]: STORAGE FAILURE — fsync failed on {} (errno={}: {}). "
                      "The log is permanently failed; HALTING the broker (exit {}). Restart "
                      "recovery truncates to the last valid batch; replication re-heals it.",

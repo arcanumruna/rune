@@ -1082,6 +1082,28 @@ TEST(ShardModeRegression, StorageFailureRevokesTheBootCertificateForTheRestartRe
     restarted.stop();
 }
 
+// A storage failure after an earlier invariant halt in the same run still revokes the certificate: the sentinel is recorded before
+// the halt guard.  RED: onStorageFailure_ returns on haltRaised_ before it records the sentinel.
+TEST(ShardModeRegression, StorageFailureAfterAnInvariantHaltStillRevokesTheBootCertificateRegression) {
+    TmpDir dir{"failafterhalt"};
+    const auto ports = ShardPorts::discover(1, 1);
+    const auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false);
+    {
+        BrokerNode node{cfg};
+        node.start();
+        HaltCapture halt;
+        node.setHaltHandler(&HaltCapture::handler, &halt);
+        node.raiseInvariantViolationForTest("test");
+        EXPECT_EQ(halt.await(1'000ms), BrokerNode::kExitInvariantViolation);
+        node.raiseStorageFailureForTest(dir.path.string(), EIO);
+        node.stop();
+    }
+    BrokerNode restarted{cfg};
+    restarted.start();
+    EXPECT_TRUE(restarted.bootIdForTest().empty()) << "a restart in the same boot vouches for a log after a storage failure";
+    restarted.stop();
+}
+
 TEST(ShardModeRegression, RefusesIoBackendThatCannotSubmit) {
     TmpDir dir{"iobk"};
     const auto ports = ShardPorts::discover(1, 1);

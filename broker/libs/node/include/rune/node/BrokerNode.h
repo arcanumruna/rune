@@ -1528,6 +1528,8 @@ public:
     void setHaltHandler(HaltHandler h, void* ctx) noexcept { haltHandler_ = h; haltCtx_ = ctx; }
     /// Test-only: drive the runtime's storage-failure path directly.
     void raiseStorageFailureForTest(const std::string& logDir, int err) { onStorageFailure_(logDir, err); }
+    /// Test-only: drive the runtime's invariant-halt path directly.
+    void raiseInvariantViolationForTest(const std::string& what) { onInvariantViolation_(what); }
     /// Test-only: the boot id this process's replicas vouch with (empty after a storage failure in this boot).
     [[nodiscard]] std::string bootIdForTest() const { return replicaRegistry_->bootId(); }
     /// Test-only: during start(), re-run one user log's recovery with this msync
