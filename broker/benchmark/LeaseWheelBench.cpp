@@ -72,7 +72,7 @@ void BM_IdlePoll(benchmark::State& st) {
     int64_t now = kNow;
     uint64_t handed = 0;
     for (auto _ : st) {
-        now += 1000;   // monotonic, no wrap: stays inside the first 5 s for any realistic iteration count (nothing is due)
+        now += 1;   // monotonic; 1 ns per iteration stays far below the first deadline for any iteration count (nothing is due)
         handed += r.t->pollDeadline(now, [](uint32_t) { return true; }, UINT32_MAX);
     }
     benchmark::DoNotOptimize(handed);

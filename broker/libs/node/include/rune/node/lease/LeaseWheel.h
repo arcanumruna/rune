@@ -65,7 +65,7 @@ public:
     /// Hands due rows to `sink(rid) -> bool`, at most `max` taken.  The row is unlinked before `sink(rid)` is called.  The sink may
     /// re-arm it, cancel it or change its state (through LeaseTimers).  Return true = taken (counts toward `max`); false =
     /// deferred: leave the row untouched and it goes back to the ready list's tail (the ready list is FIFO).  The sink may change
-    /// ONLY the row it was given.  A deferred row is not examined again in the same call, and at most kLeaseExamineFactor * max
+    /// ONLY the row it was given; a sink that cancels, re-arms or changes the state of its row must return true.  A deferred row is not examined again in the same call, and at most kLeaseExamineFactor * max
     /// ready rows are examined per call (a deferring sink costs O(max), not O(ready)).
     /// The clock is monotonic by contract (asserted): `nowNs` never goes back between calls.
     /// Due set, exactly: the rows armed with dTick <= nowTick; never early (every handed row has deadlineNs <= nowNs).
@@ -135,8 +135,11 @@ public:
             unlink(rid);   // the sink owns the row from here on
             if (sink(rid)) {
                 ++count;
-            } else if (levelOfEntry(store_->at(rid)) == kLeaseUnlinked) {
-                pushReady(rid);   // deferred: back at the FIFO tail
+            } else {
+                // a deferring sink leaves the row untouched: still Armed and unlinked (a sink that cancels, re-arms or changes
+                // the state must return true)
+                assert(levelOfEntry(store_->at(rid)) == kLeaseUnlinked && "deferred row was relinked by the sink");
+                if (levelOfEntry(store_->at(rid)) == kLeaseUnlinked) pushReady(rid);   // deferred: back at the FIFO tail
             }
             // a row now at the ready list's tail (deferred, or re-armed into the past by the sink) is not walked again
             if (firstDeferred == kLeaseNil && levelOfEntry(store_->at(rid)) == kLeaseReadyLevel) firstDeferred = rid;
@@ -383,7 +386,9 @@ public:
     }
 
     /// The entry is Armed and unlinked from the deadline wheel (a poll handed it and the caller could not use it, e.g. an append
-    /// was refused): re-places it at its stored deadline.
+    /// was refused): re-places it at its stored deadline.  A row a sink took stays unlinked until relink() or rearm(); note
+    /// setState(Armed) on an already-Armed row does NOT relink it.  There is no checkpoint-wheel relink: a checkpoint sink that
+    /// cannot use its row returns false (deferral) or reschedules it with scheduleCheckpoint().
     void relink(uint32_t rid) noexcept {
         const LeaseEntry& e = store_.at(rid);
         assert(e.state == LeaseEntryState::Armed);
@@ -392,19 +397,26 @@ public:
     }
 
     /// See LeaseWheel::poll for the sink contract.
+    /// A deferring sink (returns false) must leave its row Armed.
     template <class Sink>
     uint32_t pollDeadline(int64_t nowNs, Sink&& sink, uint32_t max) {
-        return deadline_.poll(nowNs, static_cast<Sink&&>(sink), max);
+        return deadline_.poll(nowNs, [&](uint32_t rid) { return checkedSink(sink, rid); }, max);
     }
     template <class Sink>
     uint32_t pollCheckpoint(int64_t nowNs, Sink&& sink, uint32_t max) {
-        return checkpoint_.poll(nowNs, static_cast<Sink&&>(sink), max);
+        return checkpoint_.poll(nowNs, [&](uint32_t rid) { return checkedSink(sink, rid); }, max);
     }
 
     [[nodiscard]] const LeaseWheel<LeaseWheelKind::Deadline>& deadline() const noexcept { return deadline_; }
     [[nodiscard]] const LeaseWheel<LeaseWheelKind::Checkpoint>& checkpoint() const noexcept { return checkpoint_; }
 
 private:
+    template <class Sink>
+    bool checkedSink(Sink& sink, uint32_t rid) {
+        const bool taken = sink(rid);
+        assert((taken || store_.at(rid).state == LeaseEntryState::Armed) && "a deferred row changed state");
+        return taken;
+    }
     LeaseEntryStore store_;
     LeaseWheel<LeaseWheelKind::Deadline> deadline_;
     LeaseWheel<LeaseWheelKind::Checkpoint> checkpoint_;
