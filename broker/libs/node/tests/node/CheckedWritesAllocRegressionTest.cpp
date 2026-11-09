@@ -183,7 +183,7 @@ TEST(CheckedWritesAllocRegression, SteadyStateJudgingAndMarkersAllocateNothingRe
 // The warm-up grows the key index (4096 slots at start) and the projection past 10,000 ids; the measured batches reuse them.
 // Each window brackets the worker's passes of one batch (doWork + drainReturnView); the frame encode and offer, the ack and
 // egress polling are the rig's, between windows.
-TEST(CheckedWritesAllocRegression, SteadyStateIntentJudgingAllocatesNothingRegression) {
+static void runSteadyStateIntentJudging(int measuredBatches) {
     VerdictRig r;
     r.createKeyIndex();
     r.installProjection(0x40000602);
@@ -243,7 +243,7 @@ TEST(CheckedWritesAllocRegression, SteadyStateIntentJudgingAllocatesNothingRegre
     EXPECT_EQ(acksBefore, 2000u) << "every warm-up batch was acked";
 
     uint64_t worst = 0, total = 0;
-    for (int i = kWarmup; i < kWarmup + 5000; ++i) {
+    for (int i = kWarmup; i < kWarmup + measuredBatches; ++i) {
         const uint64_t a = drive(i);
         total += a;
         worst = std::max(worst, a);
@@ -255,9 +255,18 @@ TEST(CheckedWritesAllocRegression, SteadyStateIntentJudgingAllocatesNothingRegre
     EXPECT_GT(after.rejectionsKeyExists - before.rejectionsKeyExists, 1000u);
     EXPECT_GT(after.rejectionsKeyNotFound - before.rejectionsKeyNotFound, 1000u);
     EXPECT_GT(after.markersWritten - before.markersWritten, 100u) << "markers were emitted in the window";
-    EXPECT_EQ(r.ackOrder().size() - acksBefore, 5000u) << "every batch was acked";
+    EXPECT_EQ(r.ackOrder().size() - acksBefore, static_cast<std::size_t>(measuredBatches)) << "every batch was acked";
     EXPECT_GT(r.worker->subscriptionPositionForTest(raw), 10'000) << "the Raw subscription was served";
     EXPECT_EQ(total, 0u) << "worst batch allocated " << worst;
+}
+
+// The default measures 2,500 batches, the FullLength run (stress) 5,000.
+TEST(CheckedWritesAllocRegression, SteadyStateIntentJudgingAllocatesNothingRegression) {
+    runSteadyStateIntentJudging(2500);
+}
+
+TEST(CheckedWritesAllocRegression, SteadyStateIntentJudgingAllocatesNothingFullLengthRegression) {
+    runSteadyStateIntentJudging(5000);
 }
 
 // Part 06 (hard rule): key-0 creates, imports above the counter and updates from 8 idempotent producers allocate nothing in steady
@@ -265,7 +274,7 @@ TEST(CheckedWritesAllocRegression, SteadyStateIntentJudgingAllocatesNothingRegre
 // only key-0 creates, or only imports, or only updates.  Every create is a new id, so the warm-up runs until the
 // counter passes the key index's second 64 KiB chunk (131,072 ids); the measured batches stay inside the third chunk and the
 // table's 262,144 slots.  It also fills every producer's window.
-TEST(CheckedWritesAllocRegression, SteadyStateAutoIncCreatesAllocateNothingRegression) {
+static void runSteadyStateAutoIncCreates(int measuredBatches, int warmupRecords) {
     VerdictRig r;
     r.createAutoIncTopic({.reserve = 64});
     r.installProjection(0x40000602);
@@ -290,8 +299,8 @@ TEST(CheckedWritesAllocRegression, SteadyStateAutoIncCreatesAllocateNothingRegre
         }
         return recs;
     };
-    const auto drive = [&](int round) -> uint64_t {
-        const int records = round % 2 == 0 ? 1 : 16, producer = round % kProducers;
+    const auto drive = [&](int round, int records) -> uint64_t {
+        const int producer = round % kProducers;
         (void)r.produceFrame(recordsOf(records, round), kAllView, 100 + producer, seq[producer]);
         seq[producer] += records;
         uint64_t allocs = 0;
@@ -310,23 +319,33 @@ TEST(CheckedWritesAllocRegression, SteadyStateAutoIncCreatesAllocateNothingRegre
     };
 
     int round = 0;
-    while (r.autoIncState()->nextN < kWarmupIds) (void)drive(round++);
+    while (r.autoIncState()->nextN < kWarmupIds) (void)drive(round, warmupRecords > 0 ? warmupRecords : round % 2 == 0 ? 1 : 16), ++round;
     r.passes(100);
     const std::size_t acksBefore = r.ackOrder().size();
     EXPECT_EQ(acksBefore, static_cast<std::size_t>(round)) << "every warm-up batch was acked";
     const std::size_t reservationsBefore = r.reservations().size();
 
     uint64_t worst = 0, total = 0;
-    for (const int end = round + 5000; round < end; ++round) {
-        const uint64_t a = drive(round);
+    for (const int end = round + measuredBatches; round < end; ++round) {
+        const uint64_t a = drive(round, round % 2 == 0 ? 1 : 16);
         total += a;
         worst = std::max(worst, a);
     }
     r.passes(100);
-    EXPECT_EQ(r.ackOrder().size() - acksBefore, 5000u) << "every batch was acked";
+    EXPECT_EQ(r.ackOrder().size() - acksBefore, static_cast<std::size_t>(measuredBatches)) << "every batch was acked";
     EXPECT_GT(r.reservations().size() - reservationsBefore, 100u) << "the measured batches crossed reservations";
     EXPECT_GT(r.worker->subscriptionPositionForTest(raw), 10'000) << "the Raw subscription was served";
     EXPECT_EQ(total, 0u) << "worst batch allocated " << worst;
+}
+
+// The default warms up on 256-record batches (131,100 ids take a tenth of the passes) and measures 2,500 batches; the FullLength run
+// (stress) warms up on the measured sizes and measures 5,000.
+TEST(CheckedWritesAllocRegression, SteadyStateAutoIncCreatesAllocateNothingRegression) {
+    runSteadyStateAutoIncCreates(2500, 256);
+}
+
+TEST(CheckedWritesAllocRegression, SteadyStateAutoIncCreatesAllocateNothingFullLengthRegression) {
+    runSteadyStateAutoIncCreates(5000, 0);
 }
 
 // Part 07 (hard rule): the keyed fold (upserts, renames, moves, deletes through a plain-key and a lower() key view), the
