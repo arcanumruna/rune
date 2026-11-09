@@ -2081,6 +2081,15 @@ public:
     uint64_t testConnectsAccepted() {
         return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->sessionsAllocated() : 0; });
     }
+    /// Test-only (L22 Part B): {sent, deduped, dropped, abandoned} unknown-session notices of the gateway (read on the control thread).
+    template <class = void>
+    std::array<uint64_t, 4> testUnknownSessionNotices() {
+        return onControlThreadForTest([this]() -> std::array<uint64_t, 4> {
+            if (!gateway_) return {};
+            return {gateway_->unknownSessionNoticesSent(), gateway_->unknownSessionNoticesDeduped(), gateway_->unknownSessionNoticesDropped(),
+                    gateway_->unknownSessionNoticesAbandoned()};
+        });
+    }
     template <class = void>
     int64_t processIdentityForTest() {
         return onControlThreadForTest([this]() -> int64_t {

@@ -61,6 +61,8 @@ public:
     ~LeaseTrio() { if (client_) { client_->close(); client_.reset(); } }
 
     catalog_cluster::ThreeNodes& nodes() noexcept { return c_; }
+    /// The node the client is seeded on.
+    [[nodiscard]] int32_t seedNode() const noexcept { return seed_; }
     /// The real client (seeded on a follower of the catalog, so it survives the catalog leader's death), connected lazily.
     Client& client() {
         if (!client_) {

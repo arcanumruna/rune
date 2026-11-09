@@ -388,6 +388,7 @@ public:
         // ClientAgent refuse it earlier with std::invalid_argument.
         (void)ownSecret_.assign(cfg_.password);
         detail::wipeString(cfg_.password);
+        buildKeepaliveEcho_();
     }
 
     // Non-copyable, non-movable (holds reference to io_).
@@ -1911,8 +1912,10 @@ private:
             // answers with a Pong, so even an idle session proves liveness inside
             // responseTimeoutNs.  Its correlationId (<= 0, per session) is never an
             // application ping's id (those start at 1) and routes the Pong back.
+            // L22: the echo (built once in the constructor) is the egress stream id plus the declared egress channel, so a gateway that
+            // restarted and forgot this session can still answer UnknownSession on that channel.  The Pong ignores the echo.
             const std::size_t n = rune::client::codec::encodePing(
-                scratch_.data(), kScratchCap, std::string_view{},
+                scratch_.data(), kScratchCap, std::string_view(keepaliveEcho_.data(), keepaliveEchoLen_),
                 sessionId_,
                 cfg_.keepaliveCorrelationId);
             if (n > 0) {
@@ -1938,6 +1941,25 @@ private:
     // ------------------------------------------------------------------------
     SessionIo&    io_;
     SessionConfig cfg_;
+
+    // Keepalive Ping echo: [int32 LE egressStreamId][declared egress channel].  Mirrors the gateway's Connect cap
+    // (rune::node::SessionAckSink::kMaxChannelBytes = 255); a longer channel sends the empty echo.
+    static constexpr std::size_t kMaxEchoChannelBytes = 255;
+    std::array<char, 4 + kMaxEchoChannelBytes> keepaliveEcho_{};
+    std::size_t                                keepaliveEchoLen_ = 0;
+
+    void buildKeepaliveEcho_() noexcept {
+        keepaliveEchoLen_ = 0;
+        if (cfg_.egressChannel.size() > kMaxEchoChannelBytes) {
+            return;
+        }
+        const auto stream = static_cast<uint32_t>(cfg_.egressStreamId);
+        for (int i = 0; i < 4; ++i) {
+            keepaliveEcho_[static_cast<std::size_t>(i)] = static_cast<char>((stream >> (8 * i)) & 0xFF);
+        }
+        std::memcpy(keepaliveEcho_.data() + 4, cfg_.egressChannel.data(), cfg_.egressChannel.size());
+        keepaliveEchoLen_ = 4 + cfg_.egressChannel.size();
+    }
 
     SessionState  state_            = SessionState::Disconnected;
     int64_t       sessionId_        = 0;

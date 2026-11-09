@@ -1181,6 +1181,7 @@ running the applicable sequential cells against the in-process worker + stub gat
 - [~] **Step 5:** (M2, M8, M13, M15 done; M4 and M16 open, see the note) mutation pass: apply each of M1–M20 that this task owns, confirm red, revert; record in the commit.
   Run `ctest --test-dir build -R 'LeaseMatrix|LeaseIntegration|LeaseRace|LeaseTrio' --output-on-failure -j8`, then
   `--repeat until-fail:20` and once under `-j8` load.
+- Note (L22 fix): the rejoin outage was a forgotten session; fixed by per-boot random session ids and an UnknownSession notice on the declared egress channel (spec §16.2); response mode recovers by the response timeout (issue filed).
 - [ ] **Step 6:** commit and push.
 
 **As built (Task 17, part 1 of 3; Steps 5 repeat runs and 6 are the orchestrator's):**

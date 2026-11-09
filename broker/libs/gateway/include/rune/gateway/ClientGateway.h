@@ -1385,6 +1385,17 @@ public:
     }
     /// Sessions ever accepted (monotonic; control thread).
     [[nodiscard]] uint64_t sessionsAllocated() const noexcept { return sessions_.sessionsAllocated(); }
+    /// L22 Part B counters (control thread): notices offered / the same (channel, stream, session) already pending / table full or no room / not
+    /// done within kUnknownSessionNoticeAbandonNs.
+    [[nodiscard]] uint64_t unknownSessionNoticesSent() const noexcept { return unknownSessionNoticesSent_; }
+    [[nodiscard]] uint64_t unknownSessionNoticesDeduped() const noexcept { return unknownSessionNoticesDeduped_; }
+    [[nodiscard]] uint64_t unknownSessionNoticesDropped() const noexcept { return unknownSessionNoticesDropped_; }
+    [[nodiscard]] uint64_t unknownSessionNoticesAbandoned() const noexcept { return unknownSessionNoticesAbandoned_; }
+    /// Test seam: the notice path of a Ping for an unknown session, for a given declared channel + stream (no real Ping needed).
+    int answerUnknownSessionForTest(std::string_view channel, int32_t streamId, int64_t sid, int64_t correlationId, int64_t nowNs) {
+        return static_cast<int>(answerUnknownSession_(channel, streamId, sid, correlationId, nowNs));
+    }
+    int pollUnknownSessionNoticesForTest(int64_t nowNs) { return pollUnknownSessionNotices_(nowNs); }
 
     // -----------------------------------------------------------------------
     // subscriptionCount — number of active subscriptions (for tests).
@@ -2210,6 +2221,34 @@ private:
     // session, no response type): counted, warn-logged rate-limited (first,
     // then every 1024th — never a per-frame log on the produce path).
     void noteUnanswerable_(const uint8_t* buf, std::size_t len, const char* why);
+    // L22 Part B: a keepalive Ping for a session this gateway has forgotten (it restarted) is answered ErrorResponse{UnknownSession} on the
+    // client's DECLARED egress channel + stream (carried in the Ping's echo: [int32 LE stream][channel]).  The reply publication is
+    // registered asynchronously (a bounded, preallocated table keyed by channel + stream); pollUnknownSessionNotices_ offers the
+    // notices and closes it.  Cold path (an unknown session only).
+    enum class UnknownSessionNotice : uint8_t { Queued, Deduped, Dropped };
+    static constexpr std::size_t kUnknownSessionNoticeCap = 16;
+    static constexpr std::size_t kUnknownSessionNoticeSids = 4;
+    static constexpr int64_t     kUnknownSessionNoticeAbandonNs = 5'000'000'000LL;
+    struct UnknownSessionEntry {
+        std::array<char, 255> channel{};   // SessionAckSink::kMaxChannelBytes
+        uint16_t channelLen = 0;           // 0 = free
+        int32_t streamId = 0;
+        int64_t registrationId = -1;
+        std::shared_ptr<aeron::ExclusivePublication> pub;
+        std::array<int64_t, kUnknownSessionNoticeSids> sids{};
+        std::array<int64_t, kUnknownSessionNoticeSids> corrs{};
+        uint8_t nSids = 0;
+        uint8_t nSent = 0;
+        int64_t startNs = 0;
+    };
+    UnknownSessionNotice answerUnknownSession_(std::string_view channel, int32_t streamId, int64_t sid, int64_t correlationId, int64_t nowNs);
+    int pollUnknownSessionNotices_(int64_t nowNs);
+    static std::shared_ptr<aeron::ExclusivePublication> placeholderPub_();
+    /// "aeron:udp?control=<responseControlEndpoint_>|control-mode=response|response-correlation-id=<imageCorrelationId>" into `out`
+    /// (the Connect path's response-mode reply channel).
+    void responseChannelFor_(int64_t imageCorrelationId, std::string& out) const;
+    std::array<UnknownSessionEntry, kUnknownSessionNoticeCap> unknownNotices_{};
+    uint64_t unknownSessionNoticesSent_ = 0, unknownSessionNoticesDeduped_ = 0, unknownSessionNoticesDropped_ = 0, unknownSessionNoticesAbandoned_ = 0;
     // Task 13 fix round 1: shard-mode session lifecycle helpers.
     /// Worker ack-table slots in use or about to be (I2): accepted sessions +
     /// closes not yet queued on every worker + pending connects whose

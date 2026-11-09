@@ -754,6 +754,7 @@ public:
     [[nodiscard]] uint64_t testStaleSessionNotices() const noexcept { return agent_.staleSessionNotices(); }
     /// Test hook (duty-cycle thread only): the seed session's current broker session id (0 = none).
     [[nodiscard]] int64_t testSeedSessionId() const noexcept { return agent_.seedSession().machine.sessionId(); }
+    [[nodiscard]] uint64_t testSeedStaleSessionLosses() const noexcept { return agent_.seedSession().machine.staleSessionLosses(); }
     [[nodiscard]] std::size_t testPendingUnsubscribes() const noexcept { return subscriberHub_.pendingUnsubscribes(); }
     [[nodiscard]] uint64_t testIngressFatalDropped() const noexcept { return agent_.ingressFatalDropped(); }
     /// DR client bug 2: ring-drained frames dropped after the transport refused
@@ -1108,6 +1109,12 @@ public:
     /// many further notes were dropped past kMaxDdlRetryNotes since the last take.
     /// Invoker owner thread only (std::logic_error otherwise).
     std::size_t takeDdlRetryNotes(std::vector<DdlRetryNote>& out);
+
+    /// L22 fix 2: route-hint counters of the partition-routed control ops (view reads, lease ops).  Safe from any thread.
+    [[nodiscard]] uint64_t routeHintHits() const noexcept;      ///< ops that started on a remembered leader
+    [[nodiscard]] uint64_t routeHintLearned() const noexcept;   ///< hints stored from a followed Redirect
+    [[nodiscard]] uint64_t routeHintCleared() const noexcept;   ///< hints dropped (NotLeader, Redirect from a hinted node, lost session)
+    [[nodiscard]] uint64_t ctlRedirectsFollowed() const noexcept;   ///< Redirects followed by routed control ops
 
     OpResult dropTopic(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token);
     OpResult dropView(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token);
@@ -1628,7 +1635,22 @@ private:
         std::string          endpoint;       // the node it goes to ("" = the seed); a Redirect moves it
         uint32_t             requestLo = 0;  // the generated requestId's lo (0 = an explicit requestId)
         DdlRetry             retry{};
+        // L22 fix 2: the partition a partition-routed op (view reads, lease ops) is served by; routeTopic -1 = not
+        // partition-routed.  routePartition kRouteAnyPartition = the frame names no single partition.
+        int32_t              routeTopic = -1;
+        int32_t              routePartition = -1;
+        bool                 hinted = false;   // `endpoint` came from the route-hint table and no Redirect was followed yet
     };
+    static constexpr int32_t kRouteAnyPartition = -2;
+    /// L22 fix 2: the node that last answered a partition-routed op for (topic, partition) - the next op starts there
+    /// instead of at the seed (which would Redirect it, two round trips per op).  Direct-mapped; a collision overwrites.
+    struct RouteHint {
+        int32_t     topic = -1;
+        int32_t     partition = -1;
+        std::string endpoint;
+    };
+    static constexpr std::size_t kRouteHintSlots = 256;
+    static constexpr std::size_t kRouteEndpointReserve = 128;
     /// The DDL ops (the ones that carry the DDL extension, plus the bootstrap).
     [[nodiscard]] static constexpr bool isDdlOp(OpKind op) noexcept {
         return op == OpKind::DefineTopic || op == OpKind::AlterTopic || op == OpKind::CreateView ||
@@ -2346,6 +2368,13 @@ private:
     int driveAwaitingSeed_();
     std::vector<uint8_t>    ctlScratch_;               // frame patch buffer (reused)
     std::vector<std::vector<uint8_t>> framePool_;      // Task 14a: recycled RoutedCtlPending frames (zero-alloc routed ops)
+    std::vector<std::string>          endpointPool_;   // L22 fix 2: recycled RoutedCtlPending endpoints (capacity reserved)
+    std::array<RouteHint, kRouteHintSlots> routeHints_;
+    uint64_t routeHintHits_ = 0, routeHintLearned_ = 0, routeHintCleared_ = 0, ctlRedirectsFollowed_ = 0;   // duty thread writes (atomic_ref)
+    [[nodiscard]] static std::size_t routeSlot_(int32_t topic, int32_t partition) noexcept;
+    /// Forget the hint d.endpoint was taken from / learned (only while it still names d.endpoint).
+    void forgetRouteHint_(const RoutedCtlPending& d) noexcept;
+    void learnRouteHint_(const RoutedCtlPending& d);
     // closing_: written by the closing thread after the runner is joined (or
     // on the Invoker owner); read only on the duty / closing thread.
     bool                    closing_ = false;

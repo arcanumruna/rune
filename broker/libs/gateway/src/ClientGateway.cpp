@@ -851,6 +851,7 @@ int ClientGateway::doWork(int64_t nowNs) {
         imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost client images (m-c)
     }
     pollPendingConnects(nowNs);
+    work += pollUnknownSessionNotices_(nowNs);   // L22 Part B
     work += advanceInlinePsmScans_();   // I3: budgeted inline producer-state rebuilds
     // Task 13: SessionClose ops a full worker ring refused earlier — never dropped.
     if (shardMode_ && workerPool_) work += sessionAnnouncer_.retryCloses(*workerPool_);
@@ -2271,9 +2272,7 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
             }
         }
         if (pc_entry.responseEgress) {
-            pc_entry.replyChannel = "aeron:udp?control=" + responseControlEndpoint_ +
-                                    "|control-mode=response|response-correlation-id=" +
-                                    std::to_string(image.correlation_id);
+            responseChannelFor_(image.correlation_id, pc_entry.replyChannel);
         } else {
             pc_entry.replyChannel = pc_entry.egressChannel;
             if (wantsResponse) {
@@ -2428,14 +2427,19 @@ void ClientGateway::drainHandshakeOutbound_(PendingConnect& pending)
 //   - Otherwise → leave in pending for next cycle.
 // Never blocks.
 // ---------------------------------------------------------------------------
+std::shared_ptr<aeron::ExclusivePublication> ClientGateway::placeholderPub_()
+{
+    static unsigned char placeholder alignas(64)[512];
+    return std::shared_ptr<aeron::ExclusivePublication>(
+        reinterpret_cast<aeron::ExclusivePublication*>(placeholder), [](aeron::ExclusivePublication*) {});
+}
+
 bool ClientGateway::registerConnectEgress_(PendingConnect& pending)
 {
     if (testEgressFn_ && !aeron_) [[unlikely]] {
         // Test gateways never reach Aeron (issue #236 tests drive real Connects): a placeholder reply publication,
         // never dereferenced while testEgressFn_ intercepts every pre-session offer (offerOnPub_).
-        static unsigned char placeholder alignas(64)[512];
-        pending.resolvedPub = std::shared_ptr<aeron::ExclusivePublication>(
-            reinterpret_cast<aeron::ExclusivePublication*>(placeholder), [](aeron::ExclusivePublication*) {});
+        pending.resolvedPub = placeholderPub_();
         return true;
     }
     try {
@@ -3122,6 +3126,25 @@ void ClientGateway::handlePing(const uint8_t* buf, std::size_t len, int64_t nowN
 
     Session* session = sessions_.find(pingOpt->sessionId);
     if (!session) {
+        // L22 Part B: a keepalive Ping (correlationId <= 0) carries [int32 LE egressStreamId][declared egress channel] as its echo.  A
+        // gateway that restarted and forgot the session answers ErrorResponse{UnknownSession} on that declared channel, so the client
+        // reconnects at once instead of waiting for its response timeout.  Anything else stays unanswerable.
+        //
+        // Security: this exposes nothing new.  Connect already opens a publication to any declared channel before auth; the notice is one
+        // ErrorResponse per (channel, sid), and the 16-entry table bounds it.  The Connect path's sourceHostOf_ fairness check (Required
+        // auth mode) is not reused: it allocates a std::string and the table bound already limits the cost.
+        constexpr std::size_t kMaxCh = rune::node::SessionAckSink::kMaxChannelBytes;
+        constexpr std::string_view kUdpPrefix = "aeron:udp?";
+        if (pingOpt->correlationId <= 0 && pingOpt->echo.size() > 4 && pingOpt->echo.size() <= 4 + kMaxCh &&
+            std::string_view(pingOpt->echo.data() + 4, pingOpt->echo.size() - 4).starts_with(kUdpPrefix)) {
+            const auto* e = reinterpret_cast<const uint8_t*>(pingOpt->echo.data());
+            const int32_t stream = static_cast<int32_t>(static_cast<uint32_t>(e[0]) | (static_cast<uint32_t>(e[1]) << 8) |
+                                                        (static_cast<uint32_t>(e[2]) << 16) | (static_cast<uint32_t>(e[3]) << 24));
+            if (answerUnknownSession_(std::string_view(pingOpt->echo.data() + 4, pingOpt->echo.size() - 4), stream, pingOpt->sessionId,
+                                      pingOpt->correlationId, nowNs) != UnknownSessionNotice::Queued)
+                noteUnanswerable_(buf, len, "Ping for unknown session (notice deduped or dropped)");
+            return;
+        }
         noteUnanswerable_(buf, len, "Ping for unknown session");
         return;
     }
@@ -3421,6 +3444,106 @@ void ClientGateway::evictOldClientMember_(Session& session, uint16_t tid, const 
     // Undecodable body: the group is unknown — the session's members (counted apart).
     groupService_->evictSessionMembers(session.sessionId, nowNs);
     ++oldClientSessionWideEvictions_;
+}
+
+void ClientGateway::responseChannelFor_(int64_t imageCorrelationId, std::string& out) const
+{
+    out.assign("aeron:udp?control=");
+    out.append(responseControlEndpoint_);
+    out.append("|control-mode=response|response-correlation-id=");
+    out.append(std::to_string(imageCorrelationId));
+}
+
+ClientGateway::UnknownSessionNotice ClientGateway::answerUnknownSession_(std::string_view channel, int32_t streamId, int64_t sid,
+                                                                       int64_t correlationId, int64_t nowNs)
+{
+    static_assert(sizeof(UnknownSessionEntry::channel) == rune::node::SessionAckSink::kMaxChannelBytes);
+    if (channel.empty() || channel.size() > rune::node::SessionAckSink::kMaxChannelBytes) {
+        ++unknownSessionNoticesDropped_;
+        return UnknownSessionNotice::Dropped;
+    }
+    UnknownSessionEntry* slot = nullptr;
+    for (auto& e : unknownNotices_) {
+        if (e.channelLen == 0) { if (slot == nullptr) slot = &e; continue; }
+        if (e.streamId != streamId || std::string_view(e.channel.data(), e.channelLen) != channel) continue;
+        for (uint8_t i = 0; i < e.nSids; ++i)
+            if (e.sids[i] == sid) { ++unknownSessionNoticesDeduped_; return UnknownSessionNotice::Deduped; }
+        if (e.nSids >= kUnknownSessionNoticeSids || e.nSent != 0) { ++unknownSessionNoticesDropped_; return UnknownSessionNotice::Dropped; }
+        e.sids[e.nSids] = sid;
+        e.corrs[e.nSids] = correlationId;
+        ++e.nSids;
+        return UnknownSessionNotice::Queued;
+    }
+    const bool testGateway = testEgressFn_ && !aeron_;   // the intercepting test egress: a placeholder publication, never dereferenced
+    if (slot == nullptr || (!aeron_ && !testGateway)) { ++unknownSessionNoticesDropped_; return UnknownSessionNotice::Dropped; }
+    slot->pub.reset();
+    slot->registrationId = -1;
+    if (!testGateway) try {
+        // Exactly the call the declared-egress Connect path makes for pc_entry.replyChannel.
+        slot->registrationId = aeron_->addExclusivePublication(rune::node::withSparseTerms(channel), streamId);
+    } catch (...) {
+        ++unknownSessionNoticesDropped_;
+        return UnknownSessionNotice::Dropped;
+    }
+    if (testGateway) slot->pub = placeholderPub_();
+    std::memcpy(slot->channel.data(), channel.data(), channel.size());
+    slot->channelLen = static_cast<uint16_t>(channel.size());
+    slot->streamId = streamId;
+    slot->sids[0] = sid;
+    slot->corrs[0] = correlationId;
+    slot->nSids = 1;
+    slot->nSent = 0;
+    slot->startNs = nowNs;
+    return UnknownSessionNotice::Queued;
+}
+
+int ClientGateway::pollUnknownSessionNotices_(int64_t nowNs)
+{
+    int work = 0;
+    for (auto& e : unknownNotices_) {
+        if (e.channelLen == 0) continue;
+        const auto release = [&e] {
+            e.pub.reset();   // closes the publication; Aeron's linger delivers what was offered
+            e.channelLen = 0;
+            e.registrationId = -1;
+            e.nSids = 0;
+            e.nSent = 0;
+        };
+        if (nowNs - e.startNs > kUnknownSessionNoticeAbandonNs) {   // a resource bound for a vanished client, not a convergence timer
+            const bool resolved = e.pub != nullptr;
+            const int64_t reg = e.registrationId;
+            release();
+            if (!resolved) abandonRegistration_(reg);
+            ++unknownSessionNoticesAbandoned_;
+            ++work;
+            continue;
+        }
+        if (!e.pub) {
+            try {
+                if (aeron_) e.pub = aeron_->findExclusivePublication(e.registrationId);
+            } catch (...) {   // ERRORED_MEDIA_DRIVER: the conductor already cleaned up
+                release();
+                ++unknownSessionNoticesAbandoned_;
+                ++work;
+                continue;
+            }
+            if (!e.pub) continue;
+        }
+        if (!testEgressFn_ && !e.pub->isConnected()) continue;
+        while (e.nSent < e.nSids) {
+            pc::ErrorResponse err;
+            err.sessionId     = e.sids[e.nSent];
+            err.correlationId = e.corrs[e.nSent];
+            err.code          = static_cast<int16_t>(pc::ErrorCode::UnknownSession);
+            const std::size_t encoded = err.encode(scratch_.data());
+            if (!offerOnPub_(*e.pub, scratch_.data(), encoded)) break;   // back-pressured: retried on the next poll
+            ++e.nSent;
+            ++unknownSessionNoticesSent_;
+            ++work;
+        }
+        if (e.nSent == e.nSids) release();
+    }
+    return work;
 }
 
 void ClientGateway::noteUnanswerable_(const uint8_t* buf, std::size_t len, const char* why)

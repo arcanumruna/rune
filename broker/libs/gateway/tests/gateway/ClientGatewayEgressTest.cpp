@@ -1880,5 +1880,48 @@ TEST(ClientGatewayEgressRegression, TopicSchemaLeaseVersionGateRegression)
     EXPECT_TRUE(n->hasKeyFeatures);
 }
 
+
+// L22 Part B: the unknown-session notice table is bounded (16 entries, 4 sessions per entry), never grows, and every queued notice is
+// offered exactly once with the Ping's correlation id.  The Aeron registration itself is covered end to end
+// (GatewayUnknownSessionRegression in rune_client_broker_tests); here the gateway has no driver, so the placeholder publication stands in.
+TEST(GatewayUnknownSessionRegression, NoticeTableBoundedRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const auto ch = [](int i) { return std::string("aeron:udp?endpoint=localhost:") + std::to_string(40000 + i); };
+    constexpr int kChannels = 20;
+    int queued = 0, dropped = 0;
+    for (int i = 0; i < kChannels; ++i) {
+        const int r = gw.answerUnknownSessionForTest(ch(i), /*stream=*/2, 5000 + i, /*corr=*/-1, /*nowNs=*/0);
+        (r == 0 ? queued : dropped) += (r == 0 || r == 2) ? 1 : 0;
+    }
+    EXPECT_EQ(queued, 16) << "the table holds 16 channels";
+    EXPECT_EQ(dropped, 4);
+    EXPECT_EQ(gw.unknownSessionNoticesDropped(), 4u);
+    EXPECT_EQ(gw.pollUnknownSessionNoticesForTest(/*nowNs=*/1), 16);
+    EXPECT_EQ(gw.unknownSessionNoticesSent() + gw.unknownSessionNoticesDropped(), 20u);
+    int errors = 0;
+    for (const auto& f : cap.frames) {
+        const auto e = pc::ErrorResponse::decode(f.data(), f.size());
+        ASSERT_TRUE(e.has_value());
+        EXPECT_EQ(e->code, static_cast<int16_t>(pc::ErrorCode::UnknownSession));
+        EXPECT_EQ(e->correlationId, -1);
+        EXPECT_GE(e->sessionId, 5000);
+        ++errors;
+    }
+    EXPECT_EQ(errors, 16);
+    // The table is empty again (nothing grew, nothing leaked): 16 new channels fit, the same session twice is deduped, a 5th session of one
+    // channel is dropped, the same channel on another stream is a separate entry.
+    for (int i = 0; i < 16; ++i) EXPECT_EQ(gw.answerUnknownSessionForTest(ch(100 + i), 2, 7000 + i, -1, 2), 0);
+    gw.pollUnknownSessionNoticesForTest(3);
+    EXPECT_EQ(gw.answerUnknownSessionForTest(ch(200), 2, 8000, -1, 4), 0);
+    EXPECT_EQ(gw.answerUnknownSessionForTest(ch(200), 2, 8000, -1, 4), 1) << "the same (channel, stream, session) is deduped";
+    EXPECT_EQ(gw.unknownSessionNoticesDeduped(), 1u);
+    for (int s = 1; s < 4; ++s) EXPECT_EQ(gw.answerUnknownSessionForTest(ch(200), 2, 8000 + s, -1, 4), 0);
+    EXPECT_EQ(gw.answerUnknownSessionForTest(ch(200), 2, 8009, -1, 4), 2) << "a 5th session of one channel is dropped";
+    EXPECT_EQ(gw.answerUnknownSessionForTest(ch(200), 3, 8009, -1, 4), 0) << "another stream is its own entry";
+    EXPECT_EQ(gw.answerUnknownSessionForTest(std::string(256, 'a'), 2, 9000, -1, 4), 2) << "over the 255-byte cap is dropped";
+}
+
 } // namespace
 } // namespace rune::gateway

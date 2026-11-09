@@ -1578,7 +1578,15 @@ All tests follow `docs/testing.md`:
 `LeaseTrioRegression` and `LeaseWatchTrioRegression` (3 nodes, real clock, short TTLs). Deviations: the whole-cluster restart runs in
 real time on the trio (the 24 h / 400-day legs are the single-node injected-clock `CompactionRestart`, scaled to 4 keys x 2 000
 updates); compaction is not forced on a real broker (no seam); the leader-outage test uses 3 forced changes and measures on
-the wall clock. An outage of 1.64-1.72 s after a leader moves back to a rejoined node is recorded as an open finding.
+the wall clock. The rejoin outage of 1.64-1.72 s (later 3.3-3.7 s) was a forgotten session, not a lease problem: a restarted gateway
+dropped the keepalive Ping of a session it no longer knew, and the client only recovered at its response timeout. Fixed
+(L22): session ids start at a per-boot random value, so a restarted node never reuses an id of its previous life; every keepalive Ping
+echoes `[int32 LE egressStreamId][declared egress channel]` (the Pong ignores it; a channel over 255 bytes sends the empty echo); an
+unknown-session Ping with that echo is answered `ErrorResponse{UnknownSession}` on the declared egress channel (a bounded 16-entry notice
+table keyed by channel and stream), so the client reconnects at once; the client also keeps route hints for partition-routed control ops.
+Limit: in response mode (`gatewayResponseControlPort != 0`) the notice publication does not connect to the client's surviving response
+subscription, so recovery there is by the response timeout (`GatewayUnknownSessionRegression.DISABLED_ResponseModeRestartedNodeAnswersRegression`;
+an issue is filed).
 - **Namespaces.**
   - `ReadOnly`: keepalives served, writes refused, an unkept lease still expires.
   - `RejectAll`: keepalives refused, and every lease ends within TTL + bound.

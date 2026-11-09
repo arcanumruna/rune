@@ -1983,7 +1983,9 @@ if(BUILD_TESTING)
                        tests/client/LeaseIntegrationTest.cpp
                        tests/client/LeaseRaceTest.cpp
                        tests/client/LeaseMatrixTest.cpp
-                       tests/client/LeaseTrioTest.cpp)
+                       tests/client/LeaseTrioTest.cpp
+                       tests/client/LeaseRouteHintTest.cpp
+                       tests/client/GatewayUnknownSessionTest.cpp)
         target_compile_definitions(rune_client_broker_tests PRIVATE RUNE_QL_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/ql/tests/golden")
         # Phase 2b B Task 8b: ClaimBrokerRegressionTest compiles against the client's build-time generated all-fixed
         # `position.gen.h` (rune_gen_claim_schemas); the embedded client builds it under its own binary dir.

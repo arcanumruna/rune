@@ -49,6 +49,7 @@
 #include <fstream>
 #include <iterator>
 #include <random>
+#include <atomic>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -349,6 +350,8 @@ Client::Client(ClientConfig cfg, const detail::ClientTestOptions& opts)
     pendingCtl_.reserve(kCtlTableCap);   // fixed for the lease ops (applyControlOp_ refuses them when full); cold ops may still grow it
     ctlScratch_.reserve(512);
     framePool_.reserve(kCtlTableCap);
+    endpointPool_.reserve(kCtlTableCap);
+    for (auto& h : routeHints_) h.endpoint.reserve(kRouteEndpointReserve);
     cqSlots_.reserve(kMaxCqs);
     cqFree_.assign(kMaxCqs, 0);  // FIFO ring of released slots (I3)
     releases_.reserve(16);       // C7: handle releases (cold; grows only on a burst of releases)
@@ -1317,6 +1320,74 @@ Completion Client::groupAndWaitTrampoline_(void* ctx, const char* what, std::chr
 // F8c C3: control ops — app-thread issue path
 // ---------------------------------------------------------------------------
 
+namespace {
+/// L22 fix 2: the (topic, partition) a partition-routed control frame is served by; false = not a partition-routed op.
+/// Spans only, no allocation.  The frames without a partition field (GetViewRow, ScanViewRows, a GetViewRowK that leaves the
+/// partition to the broker) share one bucket per topic.
+constexpr int32_t kAnyPart = -2;   // == Client::kRouteAnyPartition
+bool routeOfFrame(OpKind op, const uint8_t* b, std::size_t n, int32_t& topic, int32_t& partition) noexcept {
+    namespace rpc = rune::protocol::client;
+    switch (op) {
+    case OpKind::GetViewRow:
+        if (const auto m = rpc::GetViewRow::decode(b, n)) { topic = m->viewTopicId; partition = kAnyPart; return true; }
+        return false;
+    case OpKind::GetViewRowK:
+        if (const auto m = rpc::GetViewRowK::decode(b, n)) {
+            topic = m->viewTopicId; partition = m->partition >= 0 ? m->partition : kAnyPart; return true;
+        }
+        return false;
+    case OpKind::ScanViewRows:
+        if (const auto m = rpc::ScanViewRows::decode(b, n)) { topic = m->viewTopicId; partition = kAnyPart; return true; }
+        return false;
+    case OpKind::LeaseKeepAlive:
+        if (const auto m = rpc::LeaseKeepAlive::decode(b, n)) { topic = m->topicId; partition = m->partition; return true; }
+        return false;
+    case OpKind::LeaseTimeToLive:
+        if (const auto m = rpc::LeaseTimeToLive::decode(b, n)) { topic = m->topicId; partition = m->partition; return true; }
+        return false;
+    case OpKind::ScanLeases:
+        if (const auto m = rpc::ScanLeases::decode(b, n)) { topic = m->viewTopicId; partition = m->partition; return true; }
+        return false;
+    default: return false;
+    }
+}
+inline uint64_t bumpRelaxed(uint64_t& c) noexcept {
+    std::atomic_ref<uint64_t> r(c);
+    const uint64_t v = r.load(std::memory_order_relaxed) + 1;   // single writer (the duty thread)
+    r.store(v, std::memory_order_relaxed);
+    return v;
+}
+inline uint64_t loadRelaxed(const uint64_t& c) noexcept {
+    return std::atomic_ref<uint64_t>(const_cast<uint64_t&>(c)).load(std::memory_order_relaxed);   // libc++ has no atomic_ref<const T>::load
+}
+}  // namespace
+
+std::size_t Client::routeSlot_(int32_t topic, int32_t partition) noexcept {
+    const uint32_t h = (static_cast<uint32_t>(topic) * 0x9E3779B1u) ^ (static_cast<uint32_t>(partition) * 0x85EBCA77u);
+    return static_cast<std::size_t>((h ^ (h >> 15)) & (kRouteHintSlots - 1));
+}
+void Client::forgetRouteHint_(const RoutedCtlPending& d) noexcept {
+    if (d.routeTopic < 0) return;
+    RouteHint& h = routeHints_[routeSlot_(d.routeTopic, d.routePartition)];
+    if (h.topic != d.routeTopic || h.partition != d.routePartition || h.endpoint.empty() || h.endpoint != d.endpoint) return;
+    h.topic = -1;
+    h.partition = -1;
+    h.endpoint.clear();
+    bumpRelaxed(routeHintCleared_);
+}
+void Client::learnRouteHint_(const RoutedCtlPending& d) {
+    if (d.routeTopic < 0 || d.endpoint.empty()) return;
+    RouteHint& h = routeHints_[routeSlot_(d.routeTopic, d.routePartition)];
+    h.topic = d.routeTopic;
+    h.partition = d.routePartition;
+    h.endpoint.assign(d.endpoint);   // capacity reserved at construction: no allocation for an endpoint within it
+    bumpRelaxed(routeHintLearned_);
+}
+uint64_t Client::routeHintHits() const noexcept { return loadRelaxed(routeHintHits_); }
+uint64_t Client::routeHintLearned() const noexcept { return loadRelaxed(routeHintLearned_); }
+uint64_t Client::routeHintCleared() const noexcept { return loadRelaxed(routeHintCleared_); }
+uint64_t Client::ctlRedirectsFollowed() const noexcept { return loadRelaxed(ctlRedirectsFollowed_); }
+
 OpResult Client::issueControl_(OpKind op, CompletionTarget target, Token token,
                                std::span<const uint8_t> wireFrame, uint32_t payloadHint, uint32_t requestIdAt,
                                std::span<const uint8_t> secret, uint32_t timeoutMs, uint16_t multiCount) {
@@ -2101,8 +2172,31 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             framePool_.pop_back();
         }
         d.frame.assign(ctlScratch_.begin(), ctlScratch_.end());
+        if (!endpointPool_.empty()) {   // L22 fix 2: a recycled endpoint string (capacity kept)
+            d.endpoint = std::move(endpointPool_.back());
+            endpointPool_.pop_back();
+        }
+        if (routeOfFrame(h.op, ctlScratch_.data(), ctlScratch_.size(), d.routeTopic, d.routePartition)) {
+            const RouteHint& hint = routeHints_[routeSlot_(d.routeTopic, d.routePartition)];
+            if (hint.topic == d.routeTopic && hint.partition == d.routePartition && !hint.endpoint.empty()) {
+                d.endpoint.assign(hint.endpoint);   // starts on the remembered leader, not the seed
+                d.hinted = true;
+                bumpRelaxed(routeHintHits_);
+            }
+        } else {
+            d.routeTopic = -1;
+            d.routePartition = -1;
+        }
         DdlOfferedOn on;
-        switch (offerDdl_(d, nowNs, on)) {
+        auto offered = offerDdl_(d, nowNs, on);
+        if (d.hinted && offered != transport::AeronTransport::OfferResult::Accepted) {
+            // The remembered node's session is not up (it may be the node that died): never wait on it - the seed redirects.
+            forgetRouteHint_(d);
+            d.endpoint.clear();
+            d.hinted = false;
+            offered = offerDdl_(d, nowNs, on);
+        }
+        switch (offered) {
         case transport::AeronTransport::OfferResult::Accepted: d.retry = DdlSent{0, on}; break;
         case transport::AeronTransport::OfferResult::Retry:    d.retry = DdlUnsentOnSeed{}; break;   // the pump re-offers
         case transport::AeronTransport::OfferResult::Fatal:
@@ -2155,6 +2249,11 @@ void Client::completeCtl_(PendingCtl& p, OpStatus st, int64_t value, int64_t aux
     deliver_(p.target, c, payload, ov);
     if (auto* rp = std::get_if<RoutedCtlPending>(&p.ddl); rp != nullptr && rp->frame.capacity() != 0 && framePool_.size() < kCtlTableCap) {
         framePool_.push_back(std::move(rp->frame));   // Task 14a: recycle (the pool's capacity is reserved in the ctor)
+    }
+    if (auto* rp = std::get_if<RoutedCtlPending>(&p.ddl); rp != nullptr && rp->endpoint.capacity() != 0 && endpointPool_.size() < kCtlTableCap) {
+        rp->endpoint.clear();
+        if (rp->endpoint.capacity() < kRouteEndpointReserve) rp->endpoint.reserve(kRouteEndpointReserve);   // cold: after a followed Redirect
+        endpointPool_.push_back(std::move(rp->endpoint));   // L22 fix 2: recycle, as the frame
     }
 }
 
@@ -2347,7 +2446,11 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view message, int64_t now
     }
     // The leader's own session (the seed never moves for a DDL: it carries the
     // data ops / subscriptions); the same frame, so the same requestId.
+    bumpRelaxed(ctlRedirectsFollowed_);
+    forgetRouteHint_(d);   // the node it was sent to (a remembered one included) is not the leader any more
+    d.hinted = false;
     d.endpoint = toChannel(std::string(endpoint));
+    learnRouteHint_(d);
     if (redirect.responsePort != 0) agent_.setSessionResponsePort(d.endpoint, redirect.responsePort);
     DdlOfferedOn on;
     switch (offerDdl_(d, nowNs, on)) {
@@ -2375,6 +2478,10 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view message, int64_t now
 void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs, uint16_t failCode) {
     PendingCtl& p = pendingCtl_[i];
     RoutedCtlPending& d = std::get<RoutedCtlPending>(p.ddl);
+    if (std::holds_alternative<DdlSent>(d.retry) || std::holds_alternative<DdlNotLeaderSeen>(d.retry)) {   // an answer to an in-flight request
+        forgetRouteHint_(d);
+        if (d.hinted) { d.endpoint.clear(); d.hinted = false; }   // a remembered node that is no leader: the resend goes to the seed
+    }
     int     redirects   = 0;
     int64_t budgetEndNs = 0;
     int64_t backoffNs   = 0;
@@ -2456,7 +2563,9 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                 continue;
             }
             if (agent_.connectedEpoch(on->sessionIndex) != on->sessionEpoch) [[unlikely]] {
+                forgetRouteHint_(*d);   // its node's session is gone: the next op must not start there
                 d->endpoint.clear();   // toward the seed: it redirects to the current leader
+                d->hinted = false;
                 setDdlRetry_(*d, DdlAwaitingResend{redirects, budgetEndNs, backoffNs, nowNs,
                                                    DdlResendCause::SessionLost});
                 ++work;
@@ -2833,6 +2942,8 @@ void Client::sweepControl_(int64_t nowNs) {
     }
     for (std::size_t i = 0; i < pendingCtl_.size();) {
         if (nowNs >= pendingCtl_[i].deadlineNs) {
+            // L22 fix 2: an op that timed out toward a remembered node got no answer from it: forget the hint, the next op asks the seed.
+            if (const auto* rp = std::get_if<RoutedCtlPending>(&pendingCtl_[i].ddl)) forgetRouteHint_(*rp);
             PendingCtl p = takeCtl_(i);  // removed first: the delivery may issue a new op
             completeCtl_(p, OpStatus::Timeout);
         } else {
