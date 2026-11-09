@@ -406,14 +406,37 @@ public:
     /// The produce path's ONE lookup: the lease index window and whether it is ready (leaseIndexReady's rule with the caller's facts).
     struct LeaseIndexLookup {
         LeaseIndexRef ref;
-        bool          ready = false;
+        bool          ready      = false;
+        int64_t       foldCursor = -1;   ///< the index's fold cursor (the lease view read's read-your-writes barrier); -1: no index
+        uint64_t      viewFp     = 0;    ///< the lease view's output fingerprint over the current layout (leaseViewFingerprint)
     };
     [[nodiscard]] LeaseIndexLookup leaseIndexFor(int32_t src, int32_t partition, uint64_t currentLeaderGen, bool isLeader, bool hwConfirmed) noexcept {
         const uint64_t key = instKey(src, partition);
         const auto it = keyIndexes_.find(key);
         if (it == keyIndexes_.end()) return {};
         ViewInstance& inst = it->second;
-        return LeaseIndexLookup{LeaseIndexRef{&inst.table, &inst.layout, &inst.evolvingSrc, &inst.leaseCover}, leaseReady_(inst, key, currentLeaderGen, isLeader, hwConfirmed)};
+        return LeaseIndexLookup{LeaseIndexRef{&inst.table, &inst.layout, &inst.evolvingSrc, &inst.leaseCover}, leaseReady_(inst, key, currentLeaderGen, isLeader, hwConfirmed),
+                                inst.foldCursor, inst.leaseViewFp};
+    }
+    /// Lease view point reads (spec 7.1): the source topic of a lease view (`<topic>.leases`), -1 when `viewTopicId` is not one.  The
+    /// mapping comes from the catalog (the write spec's leaseViewTopicId), never from id arithmetic.  A flat scan of the (few) lease
+    /// topics of this worker: no hashing on the read path.
+    [[nodiscard]] int32_t leaseSourceOfView(int32_t viewTopicId) const noexcept {
+        for (const LeaseViewMap& m : leaseViews_)
+            if (m.view == viewTopicId) return m.src;
+        return -1;
+    }
+    /// Cold: the write spec of lease topic `srcTopicId` names `viewTopicId` as its lease view (idempotent; a changed view id replaces the old).
+    void noteLeaseView(int32_t srcTopicId, int32_t viewTopicId) {
+        for (LeaseViewMap& m : leaseViews_)
+            if (m.src == srcTopicId) { m.view = viewTopicId; return; }
+        leaseViews_.push_back({viewTopicId, srcTopicId});
+    }
+    /// The lease view's output fingerprint for (src, partition) over its CURRENT row layout; 0 when the partition has no lease index.  It
+    /// changes when the layout does (a column added by AlterSchema).  How a client learns it is a schema lookup (Task 14).
+    [[nodiscard]] uint64_t leaseViewFingerprint(int32_t src, int32_t partition) const noexcept {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it == keyIndexes_.end() ? 0 : it->second.leaseViewFp;
     }
     /// A lease index row's column `slot` (up to 8 bytes, little-endian) for the 8-byte wire key `key`; nullopt: no such row, or the column is null.
     /// `slots` (if given) receives the layout's column count.
@@ -778,6 +801,8 @@ private:
     // The key index of a key.index partition: a verdict member of its judge that is in neither views_ nor templates_.  Rebuilt from the
     // local log at every activation; never persisted.  unordered_map keeps the node's address across the move-assign that rebuilds it.
     std::unordered_map<uint64_t, ViewInstance> keyIndexes_;
+    struct LeaseViewMap { int32_t view, src; };
+    std::vector<LeaseViewMap> leaseViews_;   // lease view sink id -> source topic; cold-maintained from the write specs, scanned by lease view reads
     bool holdJudges_ = false;
     uint32_t leaseEpochCounter_ = 0;   // one per WorkerViewSet: every activation of ANY lease index takes the next value (never repeats)
     struct Retired { int32_t viewTopicId, partition; };

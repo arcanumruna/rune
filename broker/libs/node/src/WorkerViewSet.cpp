@@ -2,6 +2,7 @@
 #include <rune/node/WorkerViewSet.h>
 #include <rune/node/AdminChannels.h>   // Task 19: ViewPlanUpdateMsg + decodeViewPlanUpdate
 
+#include <rune/codec/Fingerprint.h>    // rune::codec::fingerprint (the lease view fingerprint)
 #include <rune/codec/Serialize.h>      // rune::codec::deserialize
 #include <rune/codec/UnicodeLower.h>   // unicodeVersionSupported
 #include <rune/codec/ViewKeyEncoding.h>  // decodeKeyComponent
@@ -1100,6 +1101,7 @@ void WorkerViewSet::dropSourceTopic(int32_t srcTopicId) {
         releaseMem_(it->second);
         it = keyIndexes_.erase(it);
     }
+    std::erase_if(leaseViews_, [&](const LeaseViewMap& m) { return m.src == srcTopicId; });
 }
 
 // Cold.  The key index is built over the source's evolving schema, as every view is: the judge decodes each writer version through it.
@@ -1142,6 +1144,9 @@ static ViewInstance freshLeaseIndex(int32_t srcTopicId, int32_t partition, const
     inst.maxRecordsPerPass = replayCap;
     inst.foldLeadership = kNeverActivated;
     inst.layoutGen = spec.leaseLayoutGen;
+    // The lease view's output fingerprint: the row layout is a pure function of `src` plus the fixed lease system columns, so the
+    // fingerprint of `src` mixed with the lease index plan fingerprint names it (same combine as the other 64-bit mixes of the repo).
+    inst.leaseViewFp = rune::codec::fingerprint(src) ^ (kLeaseIndexPlanFingerprint * 0x9E3779B97F4A7C15ull);
     return inst;
 }
 

@@ -1436,7 +1436,7 @@ if(BUILD_TESTING)
 
             # Lease topics Task 10: the expiry emitter on a real worker.  AllocWindow.cpp replaces the global operator new (the
             # no-allocation test), so this is its own binary.
-            add_executable(rune_lease_emitter_tests tests/node/LeaseEmitterTest.cpp tests/node/LeaseParkTableTest.cpp tests/node/LeaseKeepAliveTest.cpp tests/node/LeaseCheckpointTest.cpp tests/node/LeasePromotionTest.cpp ${RUNE_BROKER_DIR}/libs/gateway/tests/LeaseGatewayRouteTest.cpp tests/support/AllocWindow.cpp)
+            add_executable(rune_lease_emitter_tests tests/node/LeaseEmitterTest.cpp tests/node/LeaseParkTableTest.cpp tests/node/LeaseKeepAliveTest.cpp tests/node/LeaseCheckpointTest.cpp tests/node/LeasePromotionTest.cpp tests/node/LeaseViewReadTest.cpp ${RUNE_BROKER_DIR}/libs/gateway/tests/LeaseGatewayRouteTest.cpp tests/support/AllocWindow.cpp)
             target_include_directories(rune_lease_emitter_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
             target_link_libraries(rune_lease_emitter_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_lease_emitter_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")

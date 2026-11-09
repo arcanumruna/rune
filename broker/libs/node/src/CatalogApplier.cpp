@@ -73,6 +73,7 @@ SinkSpec leaseSinkSpecOf(const cat::ViewObject& v, const cat::CatalogState& stat
     if (const cat::TopicObject* t = state.topicByObjectId(v.leaseTopicObjectId)) {
         s.partitions  = t->partitions;
         s.persistence = t->persistence;
+        s.leaseSourceTopicId = t->topicId;
         if (t->schema) s.keyField = t->schema->keyField;
     }
     return s;

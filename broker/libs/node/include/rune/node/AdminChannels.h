@@ -1502,6 +1502,8 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
 //                             [partitioner:u8][39-byte LeaseSpec block iff bit2]   (checked writes Part 06;
 //                             a frame without these two bytes is Fnv1a with no autoincrement; appended LAST;
 //                             bits 2 and 3 never both)
+//                             [leaseSourceTopicId:i32 iff bit3 and the id is known]   (lease topics Task 13a: the lease
+//                             view's source topic, from the catalog; a bit-3 frame without it names none)
 //   kA2cCatalogTopicDropped : [topicId:i32][nameLen:u16 + name][nsId:u32]
 //   kA2cCatalogTopicConfig  : [topicId:i32][count:u16][(key:u8, value:i64) * count]
 //   kA2cViewUninstall       : [viewTopicId:i32]
@@ -1549,6 +1551,7 @@ struct CatalogTopicAppliedMsg {
     rune::protocol::TopicKeyFeatures keyFeatures{};   // only keyIndex, autoIncrement and partitioner travel
     std::optional<rune::protocol::LeaseSpec> lease;   // flags bit 2: a lease topic
     bool                        leaseView         = false;   // flags bit 3: the sink of a lease topic's lease view (no plan)
+    int32_t                     leaseSourceTopicId = -1;     // bit 3 + 4 trailing bytes: the lease topic that owns the view; -1: not carried
 };
 
 /// The key-feature flags and partitioner bytes after nsId.
@@ -1557,18 +1560,18 @@ inline constexpr std::size_t kCatalogTopicAppliedFeatureBytes = 2;
 /// 0 = cannot be encoded (a string longer than a u16 prefix holds).
 [[nodiscard]] inline std::size_t catalogTopicAppliedWireLen(std::string_view name,
                                                             const rune::protocol::TopicConfig& c,
-                                                            bool lease = false) noexcept {
+                                                            bool lease = false, bool leaseViewSource = false) noexcept {
     if (name.size() > kMaxStr16 || c.coPartitionGroup.size() > kMaxStr16 || c.partitionKey.size() > kMaxStr16)
         return 0;
     return 4 + 2 + name.size() + 4 + 2 + 1 + topicConfigWireLen(c) + 4 + kCatalogTopicAppliedFeatureBytes +
-           (lease ? rune::protocol::kLeaseSpecBytes : 0);
+           (lease ? rune::protocol::kLeaseSpecBytes : 0) + (leaseViewSource ? 4 : 0);
 }
 
 inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_view name, int32_t partitions,
                                      int16_t rf, uint8_t persistence, const rune::protocol::TopicConfig& c,
                                      uint32_t nsId = 0, const rune::protocol::TopicKeyFeatures& kf = {},
                                      const std::optional<rune::protocol::LeaseSpec>& lease = std::nullopt,
-                                     bool leaseView = false) {
+                                     bool leaseView = false, int32_t leaseSourceTopicId = -1) {
     using namespace admin_wire;
     putI32(p, topicId); p += 4;
     p = putStr16(p, name);
@@ -1594,6 +1597,7 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
                                 (leaseView ? 8u : 0u));
     *p++ = static_cast<uint8_t>(kf.partitioner);
     if (lease) rune::protocol::encodeLeaseSpec(*lease, p);
+    if (leaseView && leaseSourceTopicId >= 0) putI32(p, leaseSourceTopicId);   // sized by catalogTopicAppliedWireLen(.., leaseViewSource)
 }
 
 /// `sink` is the frame TYPE: false = kA2cCatalogTopicApplied (feature bit 3, "lease view", is refused), true =
@@ -1630,6 +1634,7 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
     m.keyFeatures = {};
     m.lease.reset();
     m.leaseView = false;
+    m.leaseSourceTopicId = -1;
     if (pos != len) {   // the feature bytes; a frame without them is Fnv1a, no autoincrement
         const uint8_t forbidden = sink ? 0x04 : 0x08;   // a sink has no lease block; a topic is never a lease view
         if (pos + kCatalogTopicAppliedFeatureBytes > len || (buf[pos] & 0xF0) != 0 || (buf[pos] & forbidden) != 0 ||
@@ -1637,8 +1642,14 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
             buf[pos + 1] > static_cast<uint8_t>(rune::protocol::Partitioner::Modulo))
             return false;
         const bool hasLease = (buf[pos] & 4u) != 0;
-        if (len - pos != kCatalogTopicAppliedFeatureBytes + (hasLease ? rune::protocol::kLeaseSpecBytes : 0))
+        const bool isLeaseView = (buf[pos] & 8u) != 0;
+        const std::size_t body = len - pos - kCatalogTopicAppliedFeatureBytes;   // 39 with a lease block; 0 or 4 (the source id) for a lease view
+        if (body == 4 && isLeaseView && !hasLease) {
+            m.leaseSourceTopicId = getI32(buf + pos + kCatalogTopicAppliedFeatureBytes);
+            if (m.leaseSourceTopicId < 0) return false;
+        } else if (body != (hasLease ? rune::protocol::kLeaseSpecBytes : 0)) {
             return false;
+        }
         m.keyFeatures.keyIndex      = (buf[pos] & 1u) != 0;
         m.keyFeatures.autoIncrement = (buf[pos] & 2u) != 0;
         m.keyFeatures.partitioner   = static_cast<rune::protocol::Partitioner>(buf[pos + 1]);

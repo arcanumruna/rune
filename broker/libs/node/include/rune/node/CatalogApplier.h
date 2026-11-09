@@ -87,6 +87,9 @@ struct SinkSpec {
     /// A lease topic's lease view (`<topic>.leases`): a catalog-only sink with NO plan - never viewInstalled, and the
     /// gateway is never told to await a plan for it.
     bool leaseView = false;
+    /// A lease view: the lease topic that owns it (from the catalog, `ViewObject::leaseTopicObjectId`'s topic id); -1 otherwise.  The
+    /// gateway routes a read of the view by it and authorises the read as READ on that topic; the workers learn it from the write spec.
+    int32_t leaseSourceTopicId = -1;
 };
 
 /// The admin-thread effect sink.  Production = ring encoders (AdminWorkerAgent);

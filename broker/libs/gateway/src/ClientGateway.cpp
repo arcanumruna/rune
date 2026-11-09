@@ -3549,6 +3549,7 @@ void ClientGateway::forgetDroppedTopic(int32_t topicId, int32_t partitions,
 {
     std::erase(viewSinksAwaitingPlan_, topicId);   // Task 12 (N5): a dropped sink waits for nothing
     forgetViewSource(topicId);                     // Task 22 fix round 1 (C1): no source to route a read to
+    forgetLeaseView(topicId);                      // Lease topics Task 13a: a dropped lease view authorises and routes nothing
     for (int32_t p = 0; p < partitions; ++p) {
         partitionTxnStates_.erase(partitionKey(topicId, p));
         if (const auto it = inlinePsm_.find(inlinePsmKey_(topicId, p)); it != inlinePsm_.end()) {
@@ -5961,6 +5962,39 @@ void ClientGateway::forgetViewSource(int32_t viewTopicId)
     const auto it = std::lower_bound(viewSources_.begin(), viewSources_.end(), viewTopicId,
                                      [](const auto& e, int32_t id) { return e.first < id; });
     if (it != viewSources_.end() && it->first == viewTopicId) viewSources_.erase(it);
+}
+
+void ClientGateway::noteLeaseView(int32_t viewTopicId, int32_t sourceTopicId)
+{
+    const auto it = std::lower_bound(leaseViews_.begin(), leaseViews_.end(), viewTopicId,
+                                     [](const auto& e, int32_t id) { return e.first < id; });
+    if (it != leaseViews_.end() && it->first == viewTopicId) it->second = sourceTopicId;
+    else leaseViews_.insert(it, {viewTopicId, sourceTopicId});
+}
+
+void ClientGateway::forgetLeaseView(int32_t viewTopicId)
+{
+    const auto it = std::lower_bound(leaseViews_.begin(), leaseViews_.end(), viewTopicId,
+                                     [](const auto& e, int32_t id) { return e.first < id; });
+    if (it != leaseViews_.end() && it->first == viewTopicId) leaseViews_.erase(it);
+}
+
+int32_t ClientGateway::leaseSourceOfView_(int32_t viewTopicId) const noexcept
+{
+    if (leaseViews_.empty()) [[likely]] return -1;
+    const auto it = std::lower_bound(leaseViews_.begin(), leaseViews_.end(), viewTopicId,
+                                     [](const auto& e, int32_t id) { return e.first < id; });
+    return (it != leaseViews_.end() && it->first == viewTopicId) ? it->second : -1;
+}
+
+std::optional<rune::gateway::Denial> ClientGateway::authorizeViewRead_(const rune::gateway::PermissionTable& perms,
+                                                                       int32_t viewTopicId) const
+{
+    // Spec 7.1 / 14.1: a lease view read needs READ on the lease TOPIC; a VIEW grant on `<topic>.leases` is not consulted.  A hidden
+    // (foreign namespace) topic answers exactly like a missing id (authorizeTopicIdHere_ is the one rule for both).
+    if (const int32_t src = leaseSourceOfView_(viewTopicId); src >= 0)
+        return authorizeTopicIdHere_(perms, src, 0, rune::security::Operation::Read, rune::security::ResourceType::Topic);
+    return authorizeTopicIdHere_(perms, viewTopicId, 0, rune::security::Operation::Read, rune::security::ResourceType::View);
 }
 
 int32_t ClientGateway::viewSourceOf_(int32_t viewTopicId) const noexcept
@@ -10714,8 +10748,7 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     // Authentication Task 12 (spec §2.1, D22): READ on the view's topic id - one byte load; a hidden and a missing id
     // answer alike.
     if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
-        if (deny_(*session, authorizeTopicIdHere_(perms, m.viewTopicId, 0, rune::security::Operation::Read,
-                                                             rune::security::ResourceType::View), buf, len))
+        if (deny_(*session, authorizeViewRead_(perms, m.viewTopicId), buf, len))
             return;
 
     // #721: a view of a DELETING namespace is gone for readers, a root session included (one compare when none deletes).
@@ -10789,8 +10822,7 @@ Session* ClientGateway::checkedViewReadSession_(const uint8_t* buf, std::size_t 
         return nullptr;
     }
     if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
-        if (deny_(*session, authorizeTopicIdHere_(perms, viewTopicId, 0, rune::security::Operation::Read,
-                                                  rune::security::ResourceType::View), buf, len))
+        if (deny_(*session, authorizeViewRead_(perms, viewTopicId), buf, len))
             return nullptr;
     if (inDeletingNs_(viewTopicId)) [[unlikely]] {
         (void)rejectRequest_(buf, len, pc::ViewRowResponse::kUnknownView, "view read: namespace is being deleted");

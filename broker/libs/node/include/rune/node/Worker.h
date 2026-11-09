@@ -3516,6 +3516,8 @@ private:
         }
         TopicWriteSpec& spec = writeSpecOf_(w->topicId);
         if (viewSet_ != nullptr && (spec.keyIndex != w->keyIndex || spec.lease.has_value() != w->lease.has_value())) viewSet_->noteWriteSpecChange();
+        // Lease topics Task 13a: the lease view's id -> source mapping (the catalog's; lease view point reads are served by it).
+        if (viewSet_ != nullptr && w->lease && w->leaseViewTopicId >= 0) viewSet_->noteLeaseView(w->topicId, w->leaseViewTopicId);
         if (const uint32_t erased = spec.setFacts(*w); erased != 0) {
             leaseLayoutRefused_ += erased;
             spdlog::error("Worker {}: lease topicId={} — {} installed version(s) break the lease system-column layout; erased",
@@ -4602,6 +4604,12 @@ private:
 
         using RS = rune::protocol::client::ViewRowResponse;
 
+        // 0. A lease view (`<topic>.leases`, spec 7.1): no plan template - it is the topic's lease index.  The id -> source mapping is the
+        //    catalog's (the write spec's leaseViewTopicId), a flat scan of the worker's lease topics.
+        if (viewSet_ != nullptr)
+            if (const int32_t leaseSrc = viewSet_->leaseSourceOfView(viewTopicId); leaseSrc >= 0) [[unlikely]]
+                return serveLeaseViewRead_(r, ret, leaseSrc);
+
         // 1. No view set on this worker, or no view installed for this id.
         uint64_t outputFp = 0;
         // Catalog history Task 12 (Task 8 review N5): the control thread posts a
@@ -4736,6 +4744,70 @@ private:
             ret.errorCode = static_cast<int16_t>(RS::kAbsentKey);
         }
         enqueueReturn_(std::move(ret));   // no chunk: a fixed-size answer
+        return ViewServe::Answered;
+    }
+
+    /// Lease topics Task 13a (spec 7.1): a point read (GetViewRow u64 key / GetViewRowK bytes key) of `<topic>.leases`, served from the
+    /// source partition's lease index.  The order is the plan view's: fingerprint pin, leader of the source partition, read lease, the
+    /// namespace meter; then readiness (a not-ready index answers NotReady, never a stale row) and the read-your-writes barrier on the
+    /// index's fold cursor (Hold: the held-read list re-enters here every pass); then the row.  ScanViewRows is not served here (Task 13b's
+    /// ScanLeases is the scan): it answers UnknownView.
+    ViewServe serveLeaseViewRead_(ViewReadReq& r, WorkerReturn& ret, int32_t src) {
+        using RS = rune::protocol::client::ViewRowResponse;
+        const auto answer = [&](int16_t code) {
+            ret.errorCode = code;
+            enqueueReturn_(std::move(ret));
+            return ViewServe::Answered;
+        };
+        if (r.kind == ViewReadReq::Kind::Scan) return answer(static_cast<int16_t>(RS::kUnknownView));
+        const int32_t partition = r.partition;
+        // 1. Schema drift: a pinned (non-zero) fingerprint that is not the lease view's current one.  (0: no index on this partition.)
+        if (const uint64_t fp = viewSet_->leaseViewFingerprint(src, partition); r.fingerprint != 0 && fp != 0 && r.fingerprint != fp)
+            return answer(static_cast<int16_t>(RS::kSchemaMismatch));
+        // 2. Leader of the source partition, under a read lease (as serveViewReadImpl_ 2b, 2c).
+        rune::replication::PartitionReplica* srcRep = findOwnedReplica_(src, partition);
+        if (srcRep == nullptr || srcRep->role() != rune::replication::Role::Leader) return answer(kViewRowNotLeaderInternal);
+        if (viewLeaseEndNs_ != kViewLeaseUnbounded && leaseNow_() >= viewLeaseEndNs_) [[unlikely]] {
+            ++viewReadsWithoutLease_;
+            return answer(kViewRowNotLeaderInternal);
+        }
+        const NsTag srcTag = srcRep->isDiskBacked() ? nsTagOfLog_(srcRep->log(), nullptr) : nsTagOfLog_(nullptr, srcRep->memoryLog());
+        if (NsHot* const meter = nsReadMeter_(src, srcTag)) {
+            ++meter->requestOps;
+            lastViewReadSlot_ = srcTag.slot;
+            if (passNowNs_ < meter->queryUntil) [[unlikely]] {
+                ++throttledRefusals_;
+                ret.lastOffset = meter->queryUntil - passNowNs_;
+                return answer(static_cast<int16_t>(RS::kThrottled));
+            }
+        }
+        // 3. Readiness: every fact of WorkerViewSet::leaseReady_ under this leadership (the judge past every update the index could not track).
+        const WorkerViewSet::LeaseIndexLookup lk = viewSet_->leaseIndexFor(src, partition, srcRep->leadershipGeneration(), true,
+                                                                           srcRep->highWatermark() >= srcRep->leadershipStartOffset());
+        if (lk.ref.table == nullptr || !lk.ready) return answer(static_cast<int16_t>(RS::kNotReady));
+        // 4. Read-your-writes (as serveViewReadImpl_ 2d): the fold reaches the committed bound at arrival and minOffset + 1.
+        if (r.target < 0) {
+            if (const int64_t hw = srcRep->highWatermark(); lk.foldCursor < hw) [[unlikely]]
+                if (const RcState* rc = rcServe_(srcRep, rcOf_(srcRep)); rc != nullptr) r.target = rc->lso(hw);
+            if (r.minOffset >= 0) r.target = std::max(r.target, std::min(r.minOffset, INT64_MAX - 1) + 1);
+        }
+        if (r.target >= 0 && lk.foldCursor < r.target) [[unlikely]] return ViewServe::Hold;
+        // 5. The row.  A GetViewRow key is the u64 as 8 little-endian bytes; a key of another width than the table's is BadKey.
+        std::array<uint8_t, 8> u64Key{};
+        std::span<const uint8_t> key;
+        if (r.kind == ViewReadReq::Kind::PointKey) {
+            key = std::span<const uint8_t>(r.keyBytes.data(), r.keyLen);
+        } else {
+            std::memcpy(u64Key.data(), &r.key, 8);
+            key = std::span<const uint8_t>(u64Key.data(), 8);
+        }
+        if (key.size() != lk.ref.table->keyWidth()) [[unlikely]] return answer(static_cast<int16_t>(RS::kInvalidRequest));
+        const uint8_t* row = lk.ref.table->get(rune::view::ViewKey::fromBytes(key));
+        if (row == nullptr) return answer(static_cast<int16_t>(RS::kAbsentKey));
+        ret.errorCode   = static_cast<int16_t>(RS::kOk);
+        ret.recordCount = static_cast<int32_t>(lk.ref.layout->rowLen);
+        const ChunkRun run{row, lk.ref.layout->rowLen};
+        enqueueViewResult_(ret, &run, 1, lk.ref.layout->rowLen);
         return ViewServe::Answered;
     }
 

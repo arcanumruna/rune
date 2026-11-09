@@ -116,6 +116,7 @@ using RigWorkerPtr = std::unique_ptr<Worker, RigWorkerDelete>;
 class VerdictRig {
 public:
     static constexpr int32_t kSrc = 6;
+    static constexpr int32_t kLeaseView = 7;   ///< the lease view's sink id the rig's write spec names (the catalog's, as in production)
     static constexpr int kMaxPass = 4000;
     static constexpr int kMaxFlushWait = 1'000'000;   ///< compact(): passes to wait for an in-flight async flush (a hang guard)
     bool pauseAgent = false;   ///< pass() skips the IO agent: a discard frame stays unacked (CheckpointDiscardPending)
@@ -429,6 +430,7 @@ private:
     [[nodiscard]] WorkerOp specOp_(bool keyIndex) const {
         TopicWriteSpecWire w;
         w.topicId = kSrc; w.keyFieldId = keyFieldId_; w.lease = lease_; w.keyType = keyShape_.type; w.legacyValidate = false; w.keyIndex = keyIndex;
+        if (lease_) w.leaseViewTopicId = kLeaseView;
         w.keyWidth = static_cast<uint8_t>(keyWidthOf(keyShape_));
         if (autoInc_) {
             w.autoIncrement = true; w.partitioner = rune::protocol::Partitioner::Modulo;
@@ -610,6 +612,27 @@ public:
         ADD_FAILURE() << "the view stayed NotReady";
         return {};
     }
+    /// Lease view reads (Task 13a): enqueue one GetViewRowK / GetViewRow / ScanViewRows op, no pass, no NotReady retry.  `fingerprint` 0: unpinned.
+    void postViewReadOp(WorkerOp::Type type, int32_t view, std::span<const uint8_t> keyOrPrefix, int64_t minOffset = -1, uint64_t fingerprint = 0) {
+        WorkerOp op;
+        op.type = type; op.topicId = view; op.partition = tuning_.partition; op.sessionId = 1; op.correlationId = ++corr;
+        op.hwBound = static_cast<int64_t>(fingerprint);
+        if (type == WorkerOp::Type::GetViewRow) {
+            uint64_t k = 0;
+            std::memcpy(&k, keyOrPrefix.data(), std::min<std::size_t>(8, keyOrPrefix.size()));
+            op.nextOffset = static_cast<int64_t>(k);
+            EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
+            return;
+        }
+        std::vector<uint8_t> tail;
+        tail.push_back(static_cast<uint8_t>(keyOrPrefix.size()));
+        tail.insert(tail.end(), keyOrPrefix.begin(), keyOrPrefix.end());
+        tail.push_back(0);
+        op.nextOffset = minOffset; op.viewReadTail = tail;
+        EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
+    }
+    /// The view answers collected by pass() so far (taken).
+    std::vector<WorkerReturn> takeViewAnswers() { return std::exchange(viewAnswers_, {}); }
     /// One answer to a GetStats: the status (the worker's internal not-leader sentinel sets notLeader), the stat entries and the constraint entries.
     struct StatsReply {
         uint16_t status = 0;

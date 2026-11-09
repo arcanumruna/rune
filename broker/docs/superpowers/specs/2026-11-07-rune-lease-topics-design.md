@@ -1258,6 +1258,9 @@ These are client recipes over a one-partition lease topic keyed by `path string(
 Herald 02 gives `herald-pool`, the Wardstone sidecar's principal, `READ` as well as `WRITE` on `herald-sys/discovery`
 (R11).
 
+Lease view reads need `READ` on the topic; a `VIEW` grant on `<t>.leases` is not consulted (one rule: the gateway
+authorises a read of a lease view as `READ` on its source topic, and a foreign namespace answers exactly like a missing id).
+
 - **Fencing.** It uses the version only. `lease_holder` is informational and unauthenticated.
 - **No takeover (owner).** No operation ends or replaces a live lease without its version. A principal with `WRITE`
   and `READ` can read a version and revoke, exactly as an etcd client with the lease ID can revoke it.

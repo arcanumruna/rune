@@ -82,7 +82,7 @@ std::optional<std::string> leaseViewEffectFramesError(const cat::ViewObject& v, 
     c.cleanupPolicy = 1;
     if (const cat::TopicObject* t = state.topicByObjectId(v.leaseTopicObjectId); t && t->schema)
         c.partitionKey = t->schema->keyField;
-    return tooLarge("the lease view sink's TopicApplied effect", v.name, catalogTopicAppliedWireLen(v.name, c), maxFrame);
+    return tooLarge("the lease view sink's TopicApplied effect", v.name, catalogTopicAppliedWireLen(v.name, c, false, /*leaseViewSource*/true), maxFrame);
 }
 
 std::optional<std::string> viewEffectFramesError(const cat::ViewObject& v, const cat::CatalogState& state,

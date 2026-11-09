@@ -5234,6 +5234,12 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                     std::memcpy(&viewTopicId, p, 4);
                     gateway_->noteViewSinkAwaitingPlan(viewTopicId);
                 }
+                // Lease topics Task 13a: a lease view reads and routes by its SOURCE topic (the catalog's id, carried by the frame) and its
+                // read is authorised as READ on that topic.  Boot posts the same frame (postBootStash), so one handler covers both.
+                if (gateway_ && leaseView && decoded.leaseSourceTopicId >= 0) {
+                    gateway_->noteViewSource(decoded.topicId, decoded.leaseSourceTopicId);
+                    gateway_->noteLeaseView(decoded.topicId, decoded.leaseSourceTopicId);
+                }
                 onCatalogTopicApplied_(p, n, /*isView*/true, ok ? &decoded : nullptr);
                 return;
             }

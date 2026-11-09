@@ -378,10 +378,11 @@ TEST(LeaseWriteSpecRegression, WireRoundTrip) {
     TopicWriteSpecWire w;
     w.topicId = 6; w.keyFieldId = 4; w.keyType = PrimType::FixedStr; w.keyWidth = 128; w.keyIndex = true;
     w.lease = ls;
-    EXPECT_EQ(kTopicWriteSpecLeaseWireLen, 48u);
-    ASSERT_EQ(topicWriteSpecWireLen(w), 48u);
-    std::vector<uint8_t> buf(48);
-    ASSERT_EQ(encodeTopicWriteSpec(w, buf), 48u);
+    w.leaseViewTopicId = 7;
+    EXPECT_EQ(kTopicWriteSpecLeaseWireLen, 52u);   // + the lease view's sink id (Task 13a)
+    ASSERT_EQ(topicWriteSpecWireLen(w), 52u);
+    std::vector<uint8_t> buf(52);
+    ASSERT_EQ(encodeTopicWriteSpec(w, buf), 52u);
     EXPECT_EQ(buf[8] & 8, 8);
     const auto back = decodeTopicWriteSpec(buf);
     ASSERT_TRUE(back);
@@ -405,7 +406,7 @@ TEST(LeaseWriteSpecRegression, WireRoundTrip) {
     auto both = buf;
     both[8] |= 4;
     EXPECT_FALSE(decodeTopicWriteSpec(both));
-    // a 48-byte frame without bit 3
+    // a 52-byte frame without bit 3
     auto noBit = buf;
     noBit[8] &= static_cast<uint8_t>(~8u);
     EXPECT_FALSE(decodeTopicWriteSpec(noBit));
@@ -419,7 +420,7 @@ TEST(LeaseWriteSpecRegression, WireRoundTrip) {
         EXPECT_FALSE(decodeTopicWriteSpec(b)) << "bit " << bit;
     }
     // cut at every length
-    for (std::size_t n = 0; n < 48; ++n) {
+    for (std::size_t n = 0; n < 52; ++n) {
         const bool good = n == 9 || n == 26;
         const auto cut = decodeTopicWriteSpec(std::span<const uint8_t>(buf.data(), n));
         EXPECT_FALSE(cut.has_value()) << "cut to " << n << (good ? " (a legal length, but bit 3 is set)" : "");

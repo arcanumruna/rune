@@ -265,6 +265,9 @@ struct ViewInstance {
     // A lease index: the writer descriptors already proven covered by this instance's layout (a rebuilt layout is a new instance,
     // so it starts empty).
     LeaseCoverCache                    leaseCover;
+    // A lease index: the output fingerprint of the lease view (`<topic>.leases`) over THIS layout - the fingerprint of the layout
+    // source mixed with the lease index plan fingerprint (WorkerViewSet::freshLeaseIndex).  A lease view read pins it.
+    uint64_t                           leaseViewFp     = 0;
 
     // Cumulative fold-anomaly counters (see ViewFoldCounters).
     ViewFoldCounters                   counters;

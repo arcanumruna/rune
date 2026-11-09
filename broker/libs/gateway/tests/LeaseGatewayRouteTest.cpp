@@ -240,6 +240,8 @@ struct GwLease {
         r.leaseKaAnswers.clear();
         auto ttl = std::move(r.leaseTtlAnswers);
         r.leaseTtlAnswers.clear();
+        auto views = r.takeViewAnswers();
+        for (const WorkerReturn& w : views) gw.handleWorkerReturnForTest(w);
         for (const WorkerReturn& w : ka) gw.handleWorkerReturnForTest(w);
         for (const WorkerReturn& w : ttl) gw.handleWorkerReturnForTest(w);
     }
@@ -304,6 +306,36 @@ struct GwLease {
         return t.value_or(TtlFrame{});
     }
 
+    // ---- the lease view `<topic>.leases` (Task 13a) ------------------------------------------------------------------------
+    static constexpr int32_t kView = VerdictRig::kLeaseView;
+    /// Registers the lease view sink as the broker's sinkApplied path does (registry + source mapping + lease-view mapping).
+    bool hasLeaseView = false;
+    void addLeaseView() {
+        hasLeaseView = true;
+        TopicSpec sink;
+        sink.name = "instances.leases";
+        sink.partitionCount = partitions;
+        sink.viewSink = true;
+        if (registry->createTopicAt(kView, sink) != kView) throw std::logic_error("GwLease: lease view id");
+        gw.noteViewSource(kView, kTopic);
+        gw.noteLeaseView(kView, kTopic);
+    }
+    std::vector<uint8_t> viewFrame(int64_t c, uint64_t key, int32_t partition = -1, int64_t session = 0, int32_t view = kView) const {
+        const std::string k = keyOf(key);
+        pc::GetViewRowK m;
+        m.sessionId = session != 0 ? session : sid; m.correlationId = c; m.viewTopicId = view; m.partition = partition;
+        m.minOffset = -1;
+        m.key = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(k.data()), k.size());
+        std::vector<uint8_t> f(m.encodedSize());
+        m.encode(f.data());
+        return f;
+    }
+    /// The status of a ViewRowResponse frame, -1 when the frame is not one.
+    static int32_t viewStatus(const std::vector<uint8_t>& f) {
+        const auto r = pc::ViewRowResponse::decode(f.data(), f.size());
+        return r ? int32_t(r->status) : -1;
+    }
+
     // ---- authorisation -----------------------------------------------------------------------------------------------------
     /// Required mode with an authenticated, NON-admin session of namespace `nsId`, holding `grants`.  The lease topic is
     /// indexed in namespace `topicNs`.  Returns the session id.
@@ -312,6 +344,7 @@ struct GwLease {
         gw.setAuthMode(rune::gateway::GatewayAuthMode::Required, view.get());
         idx = rune::gateway::ObjectIndex{};
         if (indexTopic) idx.onTopic(topicNs, kTopic, "instances");
+        if (indexTopic && hasLeaseView) idx.onView(topicNs, VerdictRig::kLeaseView, "instances.leases");
         gw.setBootObjects(idx);
         const int64_t s = gw.injectTestSession();
         gw.setSessionAuthForTest(s, rune::gateway::AuthAuthenticated{1, "user", rune::gateway::PermissionTable::compile(grants, nsId, idx), "", nsId});
@@ -1137,4 +1170,86 @@ TEST(LeaseGatewayRouteRegression, SecondPartitionRoutedRegression) {
     ASSERT_TRUE(err.has_value());
     EXPECT_EQ(err->code, static_cast<int16_t>(pc::ErrorCode::Redirect));
     EXPECT_EQ(err->message, kOtherEndpoint);
+}
+
+// 22. Lease topics Task 13a (spec 7.1 / 14.1): a lease view read needs READ on the lease TOPIC; a VIEW grant on `<t>.leases` is not
+//     consulted.  A foreign-namespace topic answers byte for byte like a missing id.  Mutation: keep the VIEW check in
+//     authorizeViewRead_ -> the topic-READ-only session is refused and the VIEW-only session is served (red).
+TEST(LeaseGatewayRouteRegression, ReadOnTopicAuthorisesViewReadRegression) {
+    GwLease g;
+    g.addLeaseView();
+    ASSERT_TRUE(g.setup({1}));
+    const uint16_t kOk = pc::ViewRowResponse::kOk, kNotAuth = pc::ViewRowResponse::kNotAuthorized;
+
+    const int64_t topicRead = g.authedSession({topicGrant(rs::Operation::Read)});
+    std::size_t before = g.out.size();
+    g.send(g.viewFrame(1, 1, -1, topicRead));
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    EXPECT_EQ(GwLease::viewStatus(g.out.back()), kOk) << "READ on the topic serves the lease view";
+
+    const int64_t viewOnly = g.authedSession({grant(rs::Operation::Read, rs::ResourceType::View, rs::PatternKind::Prefix, "")});
+    const auto denied = g.send(g.viewFrame(2, 1, -1, viewOnly));
+    ASSERT_EQ(denied.size(), 1u);
+    EXPECT_EQ(GwLease::viewStatus(denied[0]), kNotAuth) << "a VIEW grant on <t>.leases alone does not authorise";
+
+    const int64_t none = g.authedSession({});
+    const auto nothing = g.send(g.viewFrame(3, 1, -1, none));
+    ASSERT_EQ(nothing.size(), 1u);
+    EXPECT_EQ(GwLease::viewStatus(nothing[0]), kNotAuth);
+
+    // a topic of another namespace is a missing id, byte for byte
+    constexpr int32_t kNever = 78;
+    const int64_t foreign = g.authedSession({topicGrant(rs::Operation::Read)}, /*nsId=*/1, /*topicNs=*/2);
+    const auto fr = g.send(g.viewFrame(4, 1, -1, foreign));
+    const auto missing = g.send(g.viewFrame(4, 1, -1, foreign, kNever));
+    ASSERT_EQ(fr.size(), 1u);
+    ASSERT_EQ(missing.size(), 1u);
+    EXPECT_EQ(fr[0], missing[0]) << "a foreign lease topic is a missing id";
+    EXPECT_EQ(GwLease::viewStatus(fr[0]), kNotAuth);
+}
+
+// 23. A lease view of a partition led elsewhere is redirected to the SOURCE leader (the sink mirrors its source's partitioning).
+//     Mutation: skip noteViewSource for the lease view (addLeaseView) -> no source leader is found, the read is not redirected (red).
+TEST(LeaseGatewayRouteRegression, LeaseViewRoutesToSourceLeaderRegression) {
+    GwLease g(1 << 22, /*partitionOfRig=*/1, /*partitionCount=*/2);
+    g.addLeaseView();
+    ASSERT_TRUE(g.setup({1}));
+
+    const auto other = g.send(g.viewFrame(1, 1, /*partition=*/0));
+    ASSERT_EQ(other.size(), 1u);
+    const auto err = pc::ErrorResponse::decode(other[0].data(), other[0].size());
+    ASSERT_TRUE(err.has_value());
+    EXPECT_EQ(err->code, static_cast<int16_t>(pc::ErrorCode::Redirect));
+    EXPECT_EQ(err->message, kOtherEndpoint);
+
+    const std::size_t before = g.out.size();
+    g.send(g.viewFrame(2, 1, /*partition=*/1));
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    EXPECT_EQ(GwLease::viewStatus(g.out.back()), int32_t(pc::ViewRowResponse::kOk)) << "the led partition is served";
+}
+
+// 24. Dropping the lease topic's view clears both mappings: a read answers UnknownView at the gate and never reaches the worker.
+//     Mutation: drop the forgetLeaseView / forgetViewSource calls in forgetDroppedTopic and the gate's Dropped check -> routed (red).
+TEST(LeaseGatewayRouteRegression, LeaseViewDropClearsMappingRegression) {
+    GwLease g;
+    g.addLeaseView();
+    ASSERT_TRUE(g.setup({1}));
+    std::size_t before = g.out.size();
+    g.send(g.viewFrame(1, 1));
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    EXPECT_EQ(GwLease::viewStatus(g.out.back()), int32_t(pc::ViewRowResponse::kOk));
+
+    ASSERT_TRUE(g.registry->dropTopic(GwLease::kView));
+    g.gw.forgetDroppedTopic(GwLease::kView, 1, {});
+    const auto gone = g.send(g.viewFrame(2, 1));
+    ASSERT_EQ(gone.size(), 1u);
+    EXPECT_EQ(GwLease::viewStatus(gone[0]), int32_t(pc::ViewRowResponse::kUnknownView));
+    g.settle();
+    EXPECT_EQ(g.out.size(), before + 2) << "nothing was routed to the worker";
+
+    // an authenticated READ-on-topic session no longer reaches it through the lease rule either
+    const int64_t user = g.authedSession({topicGrant(rs::Operation::Read)});
+    const auto after = g.send(g.viewFrame(3, 1, -1, user));
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_NE(GwLease::viewStatus(after[0]), int32_t(pc::ViewRowResponse::kOk));
 }

@@ -1229,11 +1229,11 @@ private:
                                   uint32_t nsId, const rune::protocol::TopicKeyFeatures& kf,
                                   int32_t typeId = kA2cCatalogTopicApplied,
                                   const std::optional<rune::protocol::LeaseSpec>& lease = std::nullopt,
-                                  bool leaseView = false) {
-        const std::size_t len = catalogTopicAppliedWireLen(name, c, lease.has_value());
+                                  bool leaseView = false, int32_t leaseSourceTopicId = -1) {
+        const std::size_t len = catalogTopicAppliedWireLen(name, c, lease.has_value(), leaseView && leaseSourceTopicId >= 0);
         const uint8_t pers = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
         postCatalog_(typeId, len, [&](uint8_t* p) {
-            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c, nsId, kf, lease, leaseView);
+            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c, nsId, kf, lease, leaseView, leaseSourceTopicId);
         });
     }
 
@@ -1262,7 +1262,11 @@ private:
 
     /// Checked writes: a typed topic's write spec (the key facts), after its validators.  No-op for an untyped topic.
     void postCatalogWriteSpec_(const rune::catalog::TopicObject& t) {
-        const auto w = writeSpecWireOf(t);
+        // A lease topic's lease view id comes from the applied catalog (never `topicId + 1`): the workers map the view to its source with it.
+        int32_t leaseView = -1;
+        if (t.lease)
+            if (const rune::catalog::ViewObject* lv = worker_.applier().state().leaseViewOf(t.objectId)) leaseView = lv->def.viewTopicId;
+        const auto w = writeSpecWireOf(t, leaseView);
         if (!w) return;
         postCatalog_(kA2cWriteSpec, topicWriteSpecWireLen(*w), [&](uint8_t* p) {
             (void)encodeTopicWriteSpec(*w, std::span<uint8_t>(p, topicWriteSpecWireLen(*w)));
@@ -1299,7 +1303,7 @@ private:
             c.cleanupPolicy = 1;   // Compact
             c.partitionKey  = s.keyField;
             postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf*/0, s.persistence, c, s.nsId, s.sourceKeyFeatures,
-                                     kA2cCatalogSinkApplied, std::nullopt, s.leaseView);   // Task 12 (N5)
+                                     kA2cCatalogSinkApplied, std::nullopt, s.leaseView, s.leaseSourceTopicId);   // Task 12 (N5); Task 13a: the lease view's source
         };
         fx.namespaceUpserted = [this](const rune::catalog::NamespaceRecord& r) {   // namespaces Task 9: login mirror
             postCatalog_(kA2cNamespaceUpserted, namespaceUpsertedWireLen(r.name),
