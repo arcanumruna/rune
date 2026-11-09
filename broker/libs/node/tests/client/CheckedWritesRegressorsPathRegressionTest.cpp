@@ -58,6 +58,7 @@ rc::ClientConfig clientConfig(catalog_cluster::ThreeNodes& c, int id) {
     rc::ClientConfig cfg = catalog_cluster::clientConfigFor(c, id);
     cfg.responseTimeoutNs   = std::chrono::nanoseconds(500ms).count();
     cfg.keepaliveIntervalNs = std::chrono::nanoseconds(100ms).count();
+    cfg.ddlRetryBackoff     = 5ms;   // a NotLeader DDL retry after a failover waits 5 ms, not 100 ms + 200 ms
     return cfg;
 }
 
