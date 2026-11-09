@@ -127,7 +127,7 @@ public:
         rune::client::TopicOptions to;
         to.replicationFactor = 3;
         to.config.cleanupPolicy = 1;
-        to.config.segmentRollBytes = autoInc_ ? 4 * 1024 : 64 * 1024;   // sealed segments to compact in a few hundred writes
+        to.config.segmentRollBytes = segmentRollBytes_ > 0 ? segmentRollBytes_ : autoInc_ ? 4 * 1024 : 64 * 1024;   // sealed segments to compact in a few hundred writes
         if (autoInc_) to.config.deleteRetentionMs = 0;
         to.config.minCompactionLagMs = 100;
         to.config.minCleanableDirtyRatioPpm = 1;
@@ -177,7 +177,7 @@ public:
         for (std::string st : rune::cli::engine::splitStatements(script.str())) {
             if (st.starts_with("topic character "))
                 st.replace(st.find("with (cleanup.policy = compact)"), std::string_view("with (cleanup.policy = compact)").size(),
-                           "with (cleanup.policy = compact, segment.bytes = 65536, min.compaction.lag.ms = 100, min.cleanable.dirty.ratio = 0.000001, file.delete.delay.ms = 50)");
+                           "with (cleanup.policy = compact, segment.bytes = " + std::to_string(segmentRollBytes_ > 0 ? segmentRollBytes_ : 65536) + ", min.compaction.lag.ms = 100, min.cleanable.dirty.ratio = 0.000001, file.delete.delay.ms = 50)");
             std::stringstream o, e;
             ASSERT_EQ(rune::cli::run({"ql", "-e", st, "--broker", ep, "--cli-stream-in", std::to_string(tcc::kClientStream)}, o, e), 0) << st << "\n" << e.str();
         }
@@ -364,10 +364,15 @@ public:
         return out;
     }
     [[nodiscard]] int32_t topicId() const noexcept { return topicId_; }
+    /// Roll the topic's segments at `bytes` instead of 64 KiB (4 KiB in autoincrement mode): a short run closes segments for the cleaner to
+    /// compact.  Call before setUp().
+    void setSegmentRollBytes(int64_t bytes) noexcept { segmentRollBytes_ = bytes; }
     /// Key-index mode: `fn` sees every write just before it is sent, and may throw in its place.
     void setKiSendHookForTest(std::function<void(const Sent&)> fn) { kiSendHook_ = std::move(fn); }
     /// `fn` runs before every view row lookup, and may throw in its place.
     void setViewLookupHookForTest(std::function<void()> fn) { viewLookupHook_ = std::move(fn); }
+    /// A view row lookup that keeps failing gives up after `wait` instead of the 10 s or 60 s default.
+    void setViewLookupWaitForTest(std::chrono::milliseconds wait) noexcept { viewLookupWait_ = wait; }
     /// Runs the one registered invariant `name` against the history as it stands.
     [[nodiscard]] bool checkInvariantForTest(const std::string& name, std::string* why) {
         for (const auto& [n, fn] : invariants_)
@@ -1319,7 +1324,7 @@ private:
     enum class Lookup { Present, Absent, Failed };
     Lookup viewRow_(uint64_t id, std::pair<int64_t, uint16_t>* out, int* tries) {
         rune::client::ViewRowResult row;
-        const auto deadline = Clock::now() + wait_(60s);
+        const auto deadline = Clock::now() + (viewLookupWait_.count() > 0 ? viewLookupWait_ : std::chrono::milliseconds(wait_(60s)));
         *tries = 0;
         for (int poll = 0; poll < kPollCap && Clock::now() < deadline; ++poll, std::this_thread::sleep_for(100ms)) {
             ++*tries;
@@ -1812,6 +1817,8 @@ private:
     std::vector<std::set<int64_t>> deliveredOffsets_, groupOffsets_;
     std::vector<std::map<int64_t, uint8_t>> rawIntents_;
     std::size_t compactedAway_ = 0;
+    int64_t segmentRollBytes_ = 0;
+    std::chrono::milliseconds viewLookupWait_{0};
 };
 
 }  // namespace rune::node::cw

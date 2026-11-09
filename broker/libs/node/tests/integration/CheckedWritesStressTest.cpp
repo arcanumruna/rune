@@ -27,49 +27,51 @@ int stepsPerSeed() {
 
 class CheckedWritesStressRegression : public ::testing::TestWithParam<int> {};
 
-TEST_P(CheckedWritesStressRegression, SeededClusterHoldsTheInvariants) {
-    const int seed = GetParam();
+// The Stress cases run the whole step count on 64 KiB segments (4 KiB for autoincrement); the fast defaults run seed 1 for a few steps
+// on small segments, so the cleaner has closed segments to compact all the same.  Every assertion stays.
+namespace {
+constexpr int64_t kFastSegmentBytes = 2 * 1024;
+
+void runSeededCluster(int seed, int steps, int64_t segmentBytes) {
     ThreeNodes cluster = ThreeNodes::startWith("cw04_" + std::to_string(seed), [](rune::node::NodeConfig& cfg) { cfg.verdictIntervalMs = 20; });
     CheckedWritesStressDriver d(cluster, static_cast<uint64_t>(seed));
+    d.setSegmentRollBytes(segmentBytes);
     d.setUp();
-    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
-    for (int step = 0; step < stepsPerSeed() && !HasFatalFailure(); ++step) {
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "seed " << seed;
+    for (int step = 0; step < steps && !::testing::Test::HasFatalFailure(); ++step) {
         SCOPED_TRACE("seed=" + std::to_string(seed) + " step=" + std::to_string(step));
         d.step();
     }
-    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "seed " << seed;
     d.quiesce();
-    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "seed " << seed;
     std::string failed;
     EXPECT_TRUE(d.checkAll(&failed)) << failed;
     EXPECT_GT(d.compactedAway(), 0u) << "seed " << seed << ": the cleaner never removed a committed record";
-    RecordProperty("compactedAway", static_cast<int>(d.compactedAway()));
+    ::testing::Test::RecordProperty("compactedAway", static_cast<int>(d.compactedAway()));
     const auto f = d.faults();
     std::printf("seed %d: %zu sends, %d leader crashes, %d restarts (%d cut short), %zu committed records the most compacted log lost\n", seed, d.sent().size(), f[0], f[1], f[2], d.compactedAway());
 }
 
-TEST_P(CheckedWritesStressRegression, KeyIndexSeededClusterHoldsTheInvariants) {
-    const int seed = GetParam();
-    if (seed > 8) GTEST_SKIP() << "the key-index run covers seeds 1-8";
+void runKeyIndexSeededCluster(int seed, int steps, int64_t segmentBytes) {
     ThreeNodes cluster = ThreeNodes::startWith("cw05_" + std::to_string(seed), [](rune::node::NodeConfig& cfg) { cfg.verdictIntervalMs = 20; });
     CheckedWritesStressDriver d(cluster, static_cast<uint64_t>(seed), true);
+    d.setSegmentRollBytes(segmentBytes);
     d.setUp();
-    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
-    for (int step = 0; step < 300 && !HasFatalFailure(); ++step) {
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "seed " << seed;
+    for (int step = 0; step < steps && !::testing::Test::HasFatalFailure(); ++step) {
         SCOPED_TRACE("seed=" + std::to_string(seed) + " step=" + std::to_string(step));
         d.step();
     }
-    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "seed " << seed;
     d.quiesce();
-    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "seed " << seed;
     std::string failed;
     EXPECT_TRUE(d.checkAll(&failed)) << failed;
     std::printf("seed %d: %s\n", seed, d.keyIndexTally().c_str());
 }
 
-TEST_P(CheckedWritesStressRegression, AutoIncSeededClusterHoldsTheInvariants) {
-    const int seed = GetParam();
-    if (seed > 8) GTEST_SKIP() << "the autoincrement run covers seeds 1-8";
+void runAutoIncSeededCluster(int seed, int steps, int64_t segmentBytes) {
     // The cleaner keeps a live producer's last 32 batches whole (spec 6.6), and no writer here reaches 32: only expired producers leave
     // anything to compact.  Writers are rebuilt after every fault, so old pids expire and are compacted mid-run, the last ones at rest.
     // Only the cleaner reads this expiry; the producer state still dedupes those pids.
@@ -78,47 +80,80 @@ TEST_P(CheckedWritesStressRegression, AutoIncSeededClusterHoldsTheInvariants) {
         cfg.producerIdExpirationMs = 3'000;
     });
     CheckedWritesStressDriver d(cluster, static_cast<uint64_t>(seed), false, true);
+    d.setSegmentRollBytes(segmentBytes);
     d.setUp();
-    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
-    for (int step = 0; step < stepsPerSeed() && !HasFatalFailure(); ++step) {
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "seed " << seed;
+    for (int step = 0; step < steps && !::testing::Test::HasFatalFailure(); ++step) {
         SCOPED_TRACE("seed=" + std::to_string(seed) + " step=" + std::to_string(step));
         d.step();
     }
-    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "seed " << seed;
     d.quiesce();
-    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "seed " << seed;
     std::string failed;
     EXPECT_TRUE(d.checkAll(&failed)) << failed;
     EXPECT_EQ(d.autoIncWorkShortfall(), "") << "seed " << seed;
     std::printf("seed %d: %s\n", seed, d.autoIncTally().c_str());
 }
 
-// Plan 09 (matrix D): the RegressorsPath DDL from the golden script, logins, characters for four users near the cap, renames to
-// colliding names, moves and removes through crashes, restarts, cleaner passes and replaces of account_stats.  300 steps unless
-// RUNE_CW_STRESS_STEPS says otherwise.
-TEST_P(CheckedWritesStressRegression, SeededRegressorsPathHoldsTheInvariants) {
-    const int seed = GetParam();
-    const int steps = std::getenv("RUNE_CW_STRESS_STEPS") != nullptr ? stepsPerSeed() : 300;
+void runSeededRegressorsPath(int seed, int steps, int64_t segmentBytes) {
     ThreeNodes cluster = ThreeNodes::startWith("cw09_" + std::to_string(seed), [](rune::node::NodeConfig& cfg) {
         cfg.verdictIntervalMs = 20;
         cfg.producerIdExpirationMs = 3'000;   // as the autoincrement run: expired producers leave the cleaner something to compact
     });
     CheckedWritesStressDriver d(cluster, static_cast<uint64_t>(seed), false, false, true);
+    d.setSegmentRollBytes(segmentBytes);
     d.setUpRegressorsPath();
-    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
-    for (int step = 0; step < steps && !HasFatalFailure(); ++step) {
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "seed " << seed;
+    for (int step = 0; step < steps && !::testing::Test::HasFatalFailure(); ++step) {
         SCOPED_TRACE("seed=" + std::to_string(seed) + " step=" + std::to_string(step));
         d.step();
     }
-    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "seed " << seed;
     d.quiesce();
-    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    ASSERT_FALSE(::testing::Test::HasFatalFailure()) << "seed " << seed;
     std::string failed;
     EXPECT_TRUE(d.checkAll(&failed)) << failed;
     EXPECT_GT(d.compactedAway(), 0u) << "seed " << seed << ": the cleaner never removed a committed record";
     EXPECT_EQ(d.regressorsPathShortfall(), "") << "seed " << seed;
     const auto f = d.faults();
     std::printf("seed %d: %s, %d leader crashes, %d restarts (%d cut short), %zu committed records the most compacted log lost\n", seed, d.regressorsPathTally().c_str(), f[0], f[1], f[2], d.compactedAway());
+}
+}  // namespace
+
+TEST_P(CheckedWritesStressRegression, SeededClusterHoldsTheInvariants) {
+    runSeededCluster(GetParam(), stepsPerSeed(), 0);
+}
+
+TEST_P(CheckedWritesStressRegression, KeyIndexSeededClusterHoldsTheInvariants) {
+    if (GetParam() > 8) GTEST_SKIP() << "the key-index run covers seeds 1-8";
+    runKeyIndexSeededCluster(GetParam(), 300, 0);
+}
+
+TEST_P(CheckedWritesStressRegression, AutoIncSeededClusterHoldsTheInvariants) {
+    if (GetParam() > 8) GTEST_SKIP() << "the autoincrement run covers seeds 1-8";
+    runAutoIncSeededCluster(GetParam(), stepsPerSeed(), 0);
+}
+
+// Plan 09 (matrix D): the RegressorsPath DDL from the golden script, logins, characters for four users near the cap, renames to
+// colliding names, moves and removes through crashes, restarts, cleaner passes and replaces of account_stats.  300 steps unless
+// RUNE_CW_STRESS_STEPS says otherwise.
+TEST_P(CheckedWritesStressRegression, SeededRegressorsPathHoldsTheInvariants) {
+    runSeededRegressorsPath(GetParam(), std::getenv("RUNE_CW_STRESS_STEPS") != nullptr ? stepsPerSeed() : 300, 0);
+}
+
+// Seeds and step counts are the smallest that still make every assertion of the family (compaction, a pinned 56 and 57, creates on both
+// sides of a node stop) inside the cluster budget.
+TEST(CheckedWritesStressFast, SeededClusterHoldsTheInvariants) {
+    runSeededCluster(2, 6, kFastSegmentBytes);
+}
+
+TEST(CheckedWritesStressFast, KeyIndexSeededClusterHoldsTheInvariants) {
+    runKeyIndexSeededCluster(6, 7, kFastSegmentBytes);
+}
+
+TEST(CheckedWritesStressFast, AutoIncSeededClusterHoldsTheInvariants) {
+    runAutoIncSeededCluster(3, 6, kFastSegmentBytes);
 }
 
 INSTANTIATE_TEST_SUITE_P(Seeds, CheckedWritesStressRegression, ::testing::Range(1, 13));
@@ -130,6 +165,7 @@ TEST(CheckedWritesStressHistory, RejectionTheLeaderCompactedBeforeAnyHistoryRead
     using Result = CheckedWritesStressDriver::Sent::Result;
     ThreeNodes cluster = ThreeNodes::startWith("cw05_compacted_reject", [](rune::node::NodeConfig& cfg) { cfg.verdictIntervalMs = 20; });
     CheckedWritesStressDriver d(cluster, 1, true);
+    d.setSegmentRollBytes(kFastSegmentBytes);
     d.setUp();
     ASSERT_FALSE(HasFatalFailure());
     const uint64_t a = 1;
@@ -168,6 +204,7 @@ TEST(CheckedWritesStressHistory, CheckAllWaitsForTheNewLeadersScanRegression) {
         cfg.testHoldAllControllerDecisionsMs = 60'000;
     });
     CheckedWritesStressDriver d(cluster, 1, true);
+    d.setSegmentRollBytes(kFastSegmentBytes);
     d.setUp();
     ASSERT_FALSE(HasFatalFailure());
     const uint64_t a = 1;
@@ -246,6 +283,7 @@ TEST(CheckedWritesStressHistory, ViewLookupThatNeverAnswersSaysSoRegression) {
     d.quiesce();
     ASSERT_FALSE(HasFatalFailure());
     d.setViewLookupHookForTest([] { throw std::runtime_error("no answer"); });
+    d.setViewLookupWaitForTest(500ms);
     std::string why;
     EXPECT_FALSE(d.checkInvariantForTest("ViewEqualsFreshRefold", &why));
     EXPECT_NE(why.find("key 1: the lookup failed after "), std::string::npos) << why;

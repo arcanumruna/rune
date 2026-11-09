@@ -1429,7 +1429,9 @@ if(BUILD_TESTING)
             add_executable(rune_checked_writes_alloc_regression_tests tests/node/CheckedWritesAllocRegressionTest.cpp tests/node/CheckedWritesAutoIncAllocTest.cpp tests/node/CheckedWritesViewReadAllocTest.cpp tests/support/AllocWindow.cpp)
             target_include_directories(rune_checked_writes_alloc_regression_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
             target_link_libraries(rune_checked_writes_alloc_regression_tests PRIVATE rune_node rune_replication rune_codec rune_view rune_ql aeron::aeron GTest::gtest_main)
-            gtest_discover_tests(rune_checked_writes_alloc_regression_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            # The FullLength runs measure twice the batches (and warm up on small batches): stress, with the shorter default beside them.
+            gtest_discover_tests(rune_checked_writes_alloc_regression_tests TEST_FILTER "*FullLengthRegression" PROPERTIES TIMEOUT 300 LABELS stress ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            gtest_discover_tests(rune_checked_writes_alloc_regression_tests TEST_FILTER "-*FullLengthRegression" PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Authentication Task 13 (spec §6, D30): the shard worker's WRITE grants, a REAL invoker driver over aeron:ipc.
             add_executable(rune_worker_write_grants_tests tests/node/WorkerWriteGrantsTest.cpp)
@@ -1921,7 +1923,9 @@ if(BUILD_TESTING)
         add_executable(rune_shard_mode_tests tests/integration/ShardModeTest.cpp)
         target_include_directories(rune_shard_mode_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_shard_mode_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_shard_mode_tests PROPERTIES TIMEOUT 360)
+        # The Stress variants wait out the real silent-client and process-freeze timeouts (seconds); each has a fast default beside it.
+        gtest_discover_tests(rune_shard_mode_tests TEST_FILTER "*Stress" PROPERTIES TIMEOUT 360 LABELS stress)
+        gtest_discover_tests(rune_shard_mode_tests TEST_FILTER "-*Stress" PROPERTIES TIMEOUT 360)
 
         # Phase 2b E2: TRANSIENT topics end to end in-process over real Aeron —
         # shard + legacy produce/subscribe, 3-node acks=all, restart (empty).
@@ -1982,7 +1986,10 @@ if(BUILD_TESTING)
         target_compile_definitions(rune_checked_writes_stress_tests PRIVATE RUNE_QL_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/ql/tests/golden")
         target_link_libraries(rune_checked_writes_stress_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_checked_writes_stress_tests PROPERTIES TIMEOUT 1800 LABELS stress)
+        # Each family has a fast default (seed 1, a few steps, small segments); the History tests run on small segments too.  The full
+        # seed sets (one ctest case per seed) are stress.
+        gtest_discover_tests(rune_checked_writes_stress_tests TEST_FILTER "Seeds/*" PROPERTIES TIMEOUT 1800 LABELS stress)
+        gtest_discover_tests(rune_checked_writes_stress_tests TEST_FILTER "CheckedWritesStressFast.*:CheckedWritesStressHistory.*" PROPERTIES TIMEOUT 300)
 
         # Checked writes Part 09 Task 5a (#788): a lagging leader never undoes a newer constraint-set change, on three real brokers.
         add_executable(rune_checked_writes_catalog_gate_cluster_tests tests/integration/CheckedWritesCatalogGateClusterTest.cpp)
