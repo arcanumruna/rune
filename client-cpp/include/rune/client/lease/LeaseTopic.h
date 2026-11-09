@@ -8,6 +8,8 @@
 //   * requests (keepAliveOnce / timeToLive / scanLeases / get) are routed control ops, followed to the partition leader.
 // T contract: kFingerprint, key() (a fixed integer or a byte span of 1..128 bytes), encodedSize(), encode(uint8_t*); the row
 // starts with the 4-byte header and holds the four system columns right after it (a generated lease row does).
+// A generated lease type also has withLease(version, ttlMs, holder) and T::LeasesRow (rune schema generate does both for a lease
+// topic); getAndWait / decodeRow need LeasesRow.
 // Threading: NOT thread-safe - one owner thread (the Producer's rule).  Move-only.
 #pragma once
 
@@ -23,6 +25,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -167,7 +170,36 @@ public:
         return core_.get(k.span(), minOffset, target, token);
     }
 
+    /// Decodes the payload of a get completion (a lease view row) into T::LeasesRow; nullopt = not a row of this layout.
+    [[nodiscard]] static auto decodeRow(std::span<const uint8_t> row) noexcept {
+        static_assert(requires { typename T::LeasesRow; },
+                      "LeaseTopic<T>::decodeRow needs a generated lease type (T::LeasesRow): regenerate T with `rune schema generate`");
+        return T::LeasesRow::decode(row);
+    }
+
     // ---- blocking forms (tools and tests) ----
+    /// The lease view's row of row.key() as a T::LeasesRow (read-your-writes: the read waits for the view to pass `minOffset`;
+    /// -1 = no barrier).  nullopt = no lease under that key.  Throws std::invalid_argument for a key outside 1..128 bytes or a
+    /// closed handle, and std::runtime_error for any other answer (the status is in the message), like getViewRowAndWait for a
+    /// transport failure.
+    [[nodiscard]] auto getAndWait(const T& row, int64_t minOffset = -1,
+                                  std::chrono::nanoseconds timeout = std::chrono::seconds(10)) {
+        static_assert(requires { typename T::LeasesRow; },
+                      "LeaseTopic<T>::getAndWait needs a generated lease type (T::LeasesRow): regenerate T with `rune schema generate`");
+        KeyBuf k;
+        if (core_.closed() || !keyOf_(row, k)) throw std::invalid_argument("LeaseTopic::getAndWait: closed handle or invalid key");
+        ViewReadOptions ro;
+        ro.partition = core_.partitionOf(k.span());
+        ro.minOffset = minOffset;
+        const ViewRowResult r = core_.client().getViewRowAndWait(core_.leaseViewTopicId(), k.span(), ro, timeout);
+        if (r.status == ViewRowResult::kAbsentKey) return std::optional<typename T::LeasesRow>{};
+        if (r.status != ViewRowResult::kOk)
+            throw std::runtime_error("LeaseTopic::getAndWait: the lease view answered status " + std::to_string(r.status));
+        auto decoded = T::LeasesRow::decode(r.rowBytes);
+        if (!decoded) throw std::runtime_error("LeaseTopic::getAndWait: the lease view row has an unexpected length");
+        return decoded;
+    }
+
     [[nodiscard]] LeaseResult grantAndWait(const T& row, const LeaseOptions& opts = {},
                                            std::chrono::nanoseconds timeout = std::chrono::seconds(10)) {
         return writeAndWait_(OpKind::LeaseGrant, row, 0, opts, timeout);

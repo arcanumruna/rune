@@ -273,7 +273,10 @@ set(RUNE_CLAIM_GEN_HEADERS
     "${RUNE_CLAIM_GEN_DIR}/gen/eos_out.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/player_event.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/ki_account.gen.h"
-    "${RUNE_CLAIM_GEN_DIR}/gen/ai_user.gen.h")
+    "${RUNE_CLAIM_GEN_DIR}/gen/ai_user.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/lease_claim.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/lease_wide.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/lease_evo.gen.h")
 add_custom_command(
     OUTPUT  ${RUNE_CLAIM_GEN_HEADERS}
     COMMAND $<TARGET_FILE:rune_gen_claim_schemas> "${RUNE_CLAIM_GEN_DIR}/gen"
@@ -1156,6 +1159,7 @@ if(BUILD_TESTING)
         tests/client/ViewRowCodecTest.cpp
         tests/client/CheckedWritesViewKeyBuilderTest.cpp   # checked writes Part 07
         tests/client/PlayerEventSchemaTest.cpp   # Phase 2c Task 4
+        tests/client/LeasesRowDecodeTest.cpp   # lease topics Task 14b
     )
     target_include_directories(rune_schema_codec_smoke_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include "${RUNE_CLAIM_GEN_DIR}/gen")
     if(TARGET generate_claim_schema_headers)   # #377: guarded like the generator itself

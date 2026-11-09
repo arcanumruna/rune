@@ -1098,6 +1098,17 @@ graces.grant(gen::DeleteGrace{.nsId = ns}, LeaseOptions{.ttl = 7 * 24h, .holder 
   applies to the routed requests (keep-alive, time-to-live, scan) only. A write's `DeliveryFailed` is reported as
   `Timeout`.
 - **Writes** accept a `Completions` queue only; `revoke` takes the full key row.
+- **Generated helpers (Task 14b).** `generateHeader(evolving, version, nspace, isLease)`; `rune_schema_gen` passes `isLease` when
+  the schema reply carries the lease block. With `isLease` the generator requires the first four fields to be exactly
+  `kLeaseColumns` and every field fixed-width (else `std::invalid_argument`) and emits: `T& withLease(version, ttlMs, holder)`
+  (sets the three columns and `lease_remaining_ms = 0`); no `lease_remaining_ms` setter on `Encoder` / `ClaimEncoder` (the
+  member and the `Decoder` accessor stay); and `<T>LeasesRow` (alias `T::LeasesRow`) with a public member for every field live
+  in `T`'s version plus `int64_t lease_granted_offset, lease_updated_offset`, `kRowLen`, and a constants-only
+  `static std::optional<TLeasesRow> decode(span)` that walks the broker's row layout (null bitmap, one slot per field ever
+  declared, dropped ones skipped, then the two offsets): a wrong length is `nullopt`, a null live slot is the zero value.
+  `LeaseTopic<T>::getAndWait(row, minOffset = -1, timeout)` returns `std::optional<T::LeasesRow>` (absent key: `nullopt`;
+  any other non-Ok answer throws `std::runtime_error`); `decodeRow(span)` forwards to `LeasesRow::decode` for the async
+  `get`. Both `static_assert` on a type without `LeasesRow`. A header generated without `isLease` is byte-identical to before.
 - **Subscriptions.** `Record::op()` is `Delete` for Revoke and Expire; `Record::leaseOp()` names the five forms.
   A `Checkpoint` record is dropped before the handler while the position still advances (plain subscriptions;
   group consumers do not deliver attributes).

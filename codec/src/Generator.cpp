@@ -3,6 +3,7 @@
 #include <rune/codec/FilterWire.h>
 #include <rune/codec/Evolve.h>
 #include <rune/codec/Lineage.h>
+#include <rune/codec/LeaseColumns.h>
 #include <rune/codec/Serialize.h>
 #include <sstream>
 #include <cctype>
@@ -99,7 +100,12 @@ static std::string memberType(const FieldDescriptor& f) {
     return std::string(cppType(f.type));
 }
 
-static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::string& structName) {
+/// A lease topic's lease_remaining_ms is broker-computed: the generated writers (Encoder, ClaimEncoder) get no setter for it.
+static bool noSetter(const FieldDescriptor& f, bool isLease) noexcept {
+    return isLease && f.name == kLeaseColumns[3].name;
+}
+
+static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::string& structName, bool isLease) {
     const std::string cls = structName + "Encoder";
     const FieldDescriptor* k = singleKeyField(d);
     o << "// " << cls << " — zero-copy writer over a claimed buffer (Producer::tryClaim,\n"
@@ -130,6 +136,7 @@ static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::s
     o << "        std::memset(p + 4, 0, kBlockLength);\n";
     o << "    }\n\n";
     for (const auto& f : d.fields) {
+        if (noSetter(f, isLease)) continue;
         if (f.type == PrimType::FixedStr) {
             o << "    [[gnu::always_inline]] " << cls << " " << f.name << "(std::string_view v) noexcept {\n"
               << "        uint8_t* const p = p_;\n"
@@ -183,7 +190,7 @@ static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::s
 // The writer TypedTopic::claim hands out: the Encoder with the KEY FIELD hidden
 // (private base; the key is written once, by the constructor, and is exactly
 // what the record was routed with — it cannot be rewritten afterwards).
-static void emitClaimEncoder(std::ostringstream& o, const Descriptor& d, const std::string& structName) {
+static void emitClaimEncoder(std::ostringstream& o, const Descriptor& d, const std::string& structName, bool isLease) {
     const std::string cls  = structName + "ClaimEncoder";
     const std::string base = structName + "Encoder";
     const FieldDescriptor* k = singleKeyField(d);
@@ -208,6 +215,7 @@ static void emitClaimEncoder(std::ostringstream& o, const Descriptor& d, const s
     // unreachable through a returned value too).
     for (const auto& f : d.fields) {
         if (k != nullptr && f.name == k->name) continue;
+        if (noSetter(f, isLease)) continue;
         const std::string arg = f.type == PrimType::FixedStr ? std::string("std::string_view")
                                                              : std::string(cppType(f.type));
         o << "    [[gnu::always_inline]] " << cls << " " << f.name << "(" << arg << " v) noexcept {\n"
@@ -523,15 +531,83 @@ static void emitDecode(std::ostringstream& o, const Descriptor& d, const std::st
 
 // ─── generateHeader ───────────────────────────────────────────────────────────
 
-std::string generateHeader(const Descriptor& d, std::string_view nspace) {
-    return generateHeader(d, d.version, nspace);
+std::string generateHeader(const Descriptor& d, std::string_view nspace, bool isLease) {
+    return generateHeader(d, d.version, nspace, isLease);
 }
 
-std::string generateHeader(const Descriptor& evolving, uint16_t version, std::string_view nspace) {
+/// The lease topic's row image (what GetViewRowK / ScanLeases of `<t>.leases` return): the null bitmap, then every field of
+/// the evolving descriptor (dropped ones too) and lease_granted_offset / lease_updated_offset as Int64 slots, packed in order.
+/// A generated, allocation-free decoder: the live members of `d`, the two offsets, a null slot -> the zero value.
+static void emitLeasesRow(std::ostringstream& o, const Descriptor& evolving, const Descriptor& d, const std::string& structName) {
+    const std::string cls = structName + "LeasesRow";
+    const std::size_t nSlots = evolving.fields.size() + 2;
+    const uint32_t    bitmap = static_cast<uint32_t>((nSlots + 7) / 8);
+    o << "\n// " << cls << " — the row of " << structName << "'s lease view (`<topic>.leases`) as LeaseTopic::getAndWait returns it:\n"
+      << "// every live field of " << structName << ", plus the log offsets of the lease's grant and of its last update.\n"
+      << "// decode() reads the broker's row layout (null bitmap, then one fixed slot per field ever declared, then the two\n"
+      << "// offsets) with constants only: no allocation, no layout object.\n";
+    o << "struct " << cls << " {\n";
+    for (const auto& f : evolving.fields) {
+        const bool live = std::any_of(d.fields.begin(), d.fields.end(), [&](const FieldDescriptor& g) { return g.id == f.id; });
+        if (live) o << "    " << memberType(f) << " " << f.name << " = {};\n";
+    }
+    o << "    int64_t lease_granted_offset = 0;\n";
+    o << "    int64_t lease_updated_offset = 0;\n\n";
+    uint32_t off = bitmap;
+    for (const auto& f : evolving.fields) off += fieldWidth(f);
+    const uint32_t rowLen = off + 16;
+    o << "    static constexpr uint32_t kRowLen = " << rowLen << "u;\n\n";
+    o << "    /// nullopt: `row` is not exactly kRowLen bytes (a row of another layout).\n";
+    o << "    [[nodiscard]] static std::optional<" << cls << "> decode(std::span<const uint8_t> row_) noexcept {\n";
+    o << "        if (row_.size() != kRowLen) return std::nullopt;\n";
+    o << "        const uint8_t* const p_ = row_.data();\n";
+    o << "        " << cls << " r_;\n";
+    off = bitmap;
+    std::size_t slot = 0;
+    const auto nullTest = [&](std::size_t sl) {
+        return "(p_[" + std::to_string(sl >> 3) + "] & " + std::to_string(1u << (sl & 7)) + "u) == 0";
+    };
+    for (const auto& f : evolving.fields) {
+        const uint32_t w = fieldWidth(f);
+        const bool live = std::any_of(d.fields.begin(), d.fields.end(), [&](const FieldDescriptor& g) { return g.id == f.id; });
+        if (live) {
+            o << "        if (" << nullTest(slot) << ") ";
+            if (f.type == PrimType::FixedStr)
+                o << "std::memcpy(r_." << f.name << ".data(), p_ + " << off << "u, " << w << "u);\n";
+            else
+                o << "r_." << f.name << " = ::rune::codec::fly::load<" << flyType(f.type) << ">(p_ + " << off << "u);\n";
+        }
+        off += w;
+        ++slot;
+    }
+    o << "        if (" << nullTest(slot) << ") r_.lease_granted_offset = ::rune::codec::fly::load<int64_t>(p_ + " << off << "u);\n";
+    ++slot; off += 8;
+    o << "        if (" << nullTest(slot) << ") r_.lease_updated_offset = ::rune::codec::fly::load<int64_t>(p_ + " << off << "u);\n";
+    o << "        return r_;\n";
+    o << "    }\n";
+    o << "};\n";
+}
+
+std::string generateHeader(const Descriptor& evolving, uint16_t version, std::string_view nspace, bool isLease) {
     if (version == 0 || version > evolving.version) {
         throw std::invalid_argument("generateHeader: schema '" + evolving.name + "' has no version " +
                                     std::to_string(version) + " (its lineage ends at " +
                                     std::to_string(evolving.version) + ")");
+    }
+    if (isLease) {
+        // A lease topic's stored schema starts with the four system columns (names, types, order) and holds fixed fields only
+        // (the lease view's row has fixed slots).
+        const auto bad = [&](const std::string& why) {
+            return std::invalid_argument("generateHeader: lease schema '" + evolving.name + "' " + why);
+        };
+        if (evolving.fields.size() < kLeaseColumns.size()) throw bad("does not start with the lease system columns");
+        for (std::size_t i = 0; i < kLeaseColumns.size(); ++i)
+            if (evolving.fields[i].name != kLeaseColumns[i].name || evolving.fields[i].type != kLeaseColumns[i].type)
+                throw bad("does not start with the lease system columns (lease_version, lease_ttl_ms, lease_holder, lease_remaining_ms)");
+        for (const auto& f : evolving.fields)
+            if (isVarLen(f.type)) throw bad("has the variable-length field '" + f.name + "' (a lease row holds fixed fields only)");
+        if (evolving.find("LeasesRow") != nullptr || evolving.find("withLease") != nullptr)
+            throw bad("has a field named 'LeasesRow' or 'withLease', which collides with the generated lease helpers");
     }
     // #418: the type is the schema AS OF `version`; the lineage (every field ever declared, with its lifetime) gives
     // each of its fields' place in a record of every version 1..version.
@@ -582,6 +658,7 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
     o << "#include <cstdint>\n";
     o << "#include <cstring>\n";
     o << "#include <expected>\n";
+    if (isLease) o << "#include <optional>\n";
     o << "#include <span>\n";
     o << "#include <stdexcept>\n";
     o << "#include <string_view>\n";
@@ -608,6 +685,8 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
         o << "class " << structName << "Decoder;\n\n";
     }
 
+    if (isLease) o << "struct " << structName << "LeasesRow;\n\n";
+
     // ── Struct ───────────────────────────────────────────────────────────────
     o << "struct " << structName << " {\n";
 
@@ -617,6 +696,7 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
     o << "    static constexpr uint64_t     kFingerprint = " << fp << "ull;\n";
     o << "    static constexpr std::string_view kSchemaName = \"" << d.name << "\";\n";
     emitLineage(o, evolving, d, structName);
+    if (isLease) o << "    using LeasesRow = " << structName << "LeasesRow;  // the row of the lease view (LeaseTopic::getAndWait)\n";
     if (fly) {
         o << "    using Encoder = " << structName << "Encoder;  // zero-copy writer (all-fixed schema)\n";
         o << "    using Decoder = " << structName << "Decoder;  // zero-copy reader\n";
@@ -687,6 +767,13 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
                   << " key() const noexcept { return " << kf->name << "; }\n\n";
             }
         }
+    }
+
+    if (isLease) {
+        o << "    /// Sets the lease system columns of a grant / update / revoke (lease_remaining_ms is the broker's: written 0).\n";
+        o << "    " << structName << "& withLease(int64_t version_, uint64_t ttlMs_, uint64_t holder_) noexcept {\n";
+        o << "        lease_version = version_;\n        lease_ttl_ms = ttlMs_;\n        lease_holder = holder_;\n";
+        o << "        lease_remaining_ms = 0;\n        return *this;\n    }\n\n";
     }
 
     // ── encodedSize() ────────────────────────────────────────────────────────
@@ -806,10 +893,11 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
     o << "}; // struct " << structName << "\n";
     if (fly) {
         o << "\n";
-        emitEncoder(o, d, structName);
-        emitClaimEncoder(o, d, structName);
+        emitEncoder(o, d, structName, isLease);
+        emitClaimEncoder(o, d, structName, isLease);
         emitDecoder(o, d, structName);
     }
+    if (isLease) emitLeasesRow(o, evolving, d, structName);
 
     // ── Namespace close ──────────────────────────────────────────────────────
     o << "\n";
