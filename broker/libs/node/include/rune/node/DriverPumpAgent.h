@@ -2,6 +2,7 @@
 // DriverPumpAgent.h — interim pumper for an invoker driver + client (fused
 // runtime startup, Task 11).  Separate header so EmbeddedDriver.h stays light.
 #include <rune/consensus/ConsensusAgent.h>
+#include <rune/aeronutil/AeronPump.h>
 #include <rune/node/EmbeddedDriver.h>
 
 #include <Aeron.h>
@@ -15,23 +16,30 @@ namespace rune::node {
 /// serviced through every startup phase, however long.  Hand-off: the runner is
 /// stopped and JOINED, then the next owner binds itself (bindPumpThread) at its
 /// first pass — never two pumpers.  Startup resolves on that client use the
-/// default (sleep-poll) AeronPump while this agent runs.
+/// default (sleep-poll) AeronPump while this agent runs; `gate` keeps the starter thread and this one out of
+/// the client at the same time.
 class DriverPumpAgent final : public rune::consensus::Agent {
 public:
-    DriverPumpAgent(EmbeddedDriver& driver, aeron::Aeron& client) noexcept
-        : driver_(driver), client_(client) {}
+    DriverPumpAgent(EmbeddedDriver& driver, aeron::Aeron& client, rune::aeronutil::StartupClientGate& gate) noexcept
+        : driver_(driver), client_(client), gate_(gate) {}
     const char* name() const noexcept override { return "rune-rt-pump"; }
     int doWork(int64_t /*nowNs*/) noexcept override {
         if (!bound_) [[unlikely]] {
             driver_.bindPumpThread();          // hand-off: constructing thread → this runner
             bound_ = true;
         }
-        return driver_.doWork() + client_.conductorAgentInvoker().invoke();
+        int work = driver_.doWork();
+        if (gate_.tryLock()) {                 // the starter thread is not inside the client
+            work += client_.conductorAgentInvoker().invoke();
+            gate_.unlock();
+        }
+        return work;
     }
 
 private:
     EmbeddedDriver& driver_;
     aeron::Aeron&   client_;
+    rune::aeronutil::StartupClientGate& gate_;
     bool            bound_ = false;
 };
 

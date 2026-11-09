@@ -505,7 +505,8 @@ void BrokerNode::start() {
         // Startup resolves on aeron_ then use the default sleep-poll pump,
         // exactly as with thread placement's driver/conductor threads.
         if (config_.fused()) {
-            startupPumpAgent_  = std::make_unique<DriverPumpAgent>(*nodeDriver_, *aeron_);
+            startupGate_.acquire();   // released by stopStartupPump_(); resolves drop it around their sleeps
+            startupPumpAgent_  = std::make_unique<DriverPumpAgent>(*nodeDriver_, *aeron_, startupGate_);
             startupPumpIdle_   = makeBackoffIdle(config_.idleMaxParkUs);
             startupPumpRunner_ = std::make_unique<rune::consensus::AgentRunner>(
                 *startupPumpAgent_, *startupPumpIdle_, clock_);
@@ -2055,7 +2056,10 @@ void BrokerNode::refuseStartOnFailedRecovery_() {
 }
 
 void BrokerNode::buildGateway() {
-    if (startupPhaseHookForTest_) startupPhaseHookForTest_("build-gateway");   // test-only fault injection
+    if (startupPhaseHookForTest_) {
+        rune::aeronutil::StartupClientGate::Yield pumpMayRun;
+        startupPhaseHookForTest_("build-gateway");
+    }   // test-only fault injection
     // Capture config_ by value (immutable after construction).
     const std::string clientChannel  = config_.clientEndpoint.channel;
     const int32_t     clientStreamId = config_.clientEndpoint.streamId;
@@ -5681,7 +5685,7 @@ void BrokerNode::anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& clie
                 }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
             } catch (const std::exception& e) { err = e.what(); }
         }
-        if (!s) refuse(ch, err.empty() ? std::string("not resolved") : err);
+        if (!s) refuse(ch, err.empty() ? std::string(pump.deadlineExpired() ? "the driver did not answer within the startup deadline" : "not resolved") : err);
         bindAnchorSubs_.push_back(std::move(s));
         bindAnchorChannels_.push_back(ch);
     }
@@ -5699,7 +5703,7 @@ void BrokerNode::anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& clie
                 }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
             } catch (const std::exception& e) { err = e.what(); }
         }
-        if (!p) refuse(ch, err.empty() ? std::string("not resolved") : err);
+        if (!p) refuse(ch, err.empty() ? std::string(pump.deadlineExpired() ? "the driver did not answer within the startup deadline" : "not resolved") : err);
         bindAnchorPubs_.push_back(std::move(p));
         bindAnchorChannels_.push_back(ch);
     }
@@ -6576,6 +6580,7 @@ void BrokerNode::stopStartupPump_() noexcept {
     startupPumpRunner_.reset();
     startupPumpAgent_.reset();
     startupPumpIdle_.reset();
+    startupGate_.release();
 }
 
 // ---------------------------------------------------------------------------
@@ -6640,8 +6645,10 @@ void BrokerNode::buildShardRuntimes_() {
         dcfg.idleStrategy = config_.driverIdleStrategy.empty() ? std::string("sleep-ns") : config_.driverIdleStrategy;
         dcfg.clientLivenessTimeoutNs = config_.shardClientLivenessTimeoutNs;
         shardDrivers_.push_back(std::make_unique<EmbeddedDriver>(std::move(dcfg), DriverMode::Invoker));
-        if (w == shardDriverBuildStallWorkerForTest_) [[unlikely]]
+        if (w == shardDriverBuildStallWorkerForTest_) [[unlikely]] {
+            rune::aeronutil::StartupClientGate::Yield pumpMayRun;
             std::this_thread::sleep_for(shardDriverBuildStallForTest_);
+        }
         pumpOwnDrivers();
     }
     // Phase 2: clients.

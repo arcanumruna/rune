@@ -105,6 +105,8 @@ private:
         } catch (const std::exception& e) {
             spdlog::error("WorkerEgress: addExclusivePublication {} stream {} failed: {}", channel_, streamId_, e.what());
         }
+        if (!pub_ && pump.deadlineExpired())
+            spdlog::error("WorkerEgress: publication {} stream {} not answered by the driver within the startup deadline", channel_, streamId_);
         // pub_ == nullptr → resolved() returns false; caller handles.
     }
 

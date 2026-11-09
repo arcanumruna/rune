@@ -96,6 +96,8 @@ public:
         } catch (const std::exception& e) {
             spdlog::error("WorkerIngress: addSubscription {} stream {} failed: {}", channel_, streamId_, e.what());
         }
+        if (!sub_ && pump.deadlineExpired())
+            spdlog::error("WorkerIngress: subscription {} stream {} not answered by the driver within the startup deadline", channel_, streamId_);
         // sub_ == nullptr → resolved() returns false; caller handles.
     }
 

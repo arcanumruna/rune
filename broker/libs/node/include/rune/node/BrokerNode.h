@@ -3125,6 +3125,7 @@ private:
     std::unique_ptr<EmbeddedDriver> nodeDriver_;   // node-level driver (runtime / legacy workers)
     // Fused placement only: services the runtime's invoker driver + client from
     // aeron_ connect until worker 0 takes them over (joined at the hand-off).
+    rune::aeronutil::StartupClientGate             startupGate_;   // starter thread vs the pump: one thread in aeron_ at a time
     std::unique_ptr<DriverPumpAgent>               startupPumpAgent_;
     std::unique_ptr<rune::consensus::IdleStrategy> startupPumpIdle_;
     std::unique_ptr<rune::consensus::AgentRunner>  startupPumpRunner_;

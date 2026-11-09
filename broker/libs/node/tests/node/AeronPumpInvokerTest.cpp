@@ -4,6 +4,7 @@
 #include <rune/consensus/AeronIngress.h>
 #include <rune/consensus/IngressRing.h>
 #include <rune/gateway/ClientGateway.h>
+#include <rune/node/DriverPumpAgent.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/node/UdpMessageSink.h>
@@ -267,4 +268,98 @@ TEST(AeronPumpRegression, UntilAnsweredHasNoDeadlineOfItsOwn) {
                               rune::aeronutil::AeronPump::kUntilAnswered, &failed))
         << "a registration error (failed) still stops it";
     EXPECT_EQ(calls, 7);
+}
+
+// ---------------------------------------------------------------------------
+// Fused startup: the starter thread and the interim DriverPumpAgent thread share one invoker-mode client, whose
+// add*/find*/invoke race (a registration lost to an unlocked append vs compaction is never answered: the startNodes
+// hang).  The gate keeps one thread in the client at a time.
+// ---------------------------------------------------------------------------
+TEST(StartupClientGateRegression, ResolveLetsThePumpThreadInOnlyWhileItSleeps) {
+    rune::aeronutil::StartupClientGate gate;
+    std::atomic<bool> inFind{false}, stop{false}, sawFree{false}, violated{false};
+    std::thread pumpThread([&] {
+        while (!stop.load()) {
+            if (gate.tryLock()) {
+                if (inFind.load()) violated = true;   // took the client while the starter was inside it
+                sawFree = true;
+                gate.unlock();
+            }
+        }
+    });
+    gate.acquire();
+    int calls = 0;
+    rune::aeronutil::AeronPump pump;
+    const auto r = pump.resolve([&]() -> std::shared_ptr<int> {
+        inFind = true;
+        const bool done = ++calls == 20;
+        std::this_thread::sleep_for(100us);
+        inFind = false;
+        return done ? std::make_shared<int>(1) : nullptr;
+    }, rune::aeronutil::AeronPump::kUntilAnswered);
+    EXPECT_TRUE(r);
+    EXPECT_FALSE(gate.tryLock()) << "resolve() returns still holding the gate";
+    gate.release();
+    stop = true;
+    pumpThread.join();
+    EXPECT_FALSE(violated.load());
+    EXPECT_TRUE(sawFree.load()) << "resolve() never let the pump thread in while it slept";
+}
+
+TEST(StartupClientGateRegression, TheInterimPumpDoesNotInvokeTheClientWhileTheStarterHoldsTheGate) {
+    InvokerShard s;
+    rune::aeronutil::StartupClientGate gate;
+    DriverPumpAgent agent(*s.driver, *s.client, gate);
+    gate.acquire();
+    const int64_t reg = s.client->addSubscription("aeron:ipc", 7101);
+    for (int i = 0; i < 200; ++i) {
+        (void)agent.doWork(0);
+        std::this_thread::sleep_for(100us);
+    }
+    EXPECT_FALSE(s.client->findSubscription(reg)) << "the pump invoked the client under the starter's hold";
+    gate.release();
+    std::shared_ptr<aeron::Subscription> sub;
+    for (int i = 0; i < 2000 && !(sub = s.client->findSubscription(reg)); ++i) {
+        (void)agent.doWork(0);
+        std::this_thread::sleep_for(100us);
+    }
+    EXPECT_TRUE(sub);
+}
+
+TEST(StartupClientGateRegression, StarterAddsAgainstARunningPumpAreAllAnswered) {
+    InvokerShard s;
+    rune::aeronutil::StartupClientGate gate;
+    DriverPumpAgent agent(*s.driver, *s.client, gate);
+    std::atomic<bool> stop{false};
+    std::thread pumpThread([&] { while (!stop.load()) (void)agent.doWork(0); });
+    gate.acquire();
+    int resolved = 0;
+    for (int i = 0; i < 100; ++i) {
+        const int64_t reg = s.client->addSubscription("aeron:ipc", 7200 + i);
+        rune::aeronutil::AeronPump pump;
+        pump.withStartupDeadline(5s);
+        resolved += pump.resolve([&] { return s.client->findSubscription(reg); }, rune::aeronutil::AeronPump::kUntilAnswered) ? 1 : 0;
+    }
+    gate.release();
+    stop = true;
+    pumpThread.join();
+    EXPECT_EQ(resolved, 100);
+}
+
+TEST(StartupDeadlineRegression, AnUnansweredResolveFailsAtTheDeadlineNamingTheChannelAndStream) {
+    EXPECT_EQ(rune::aeronutil::AeronPump{}.startupDeadline(), 60s);
+    InvokerShard s;   // nothing pumps its driver: the answer never comes
+    rune::aeronutil::AeronPump pump;
+    pump.withStartupDeadline(100ms);
+    const auto t0 = std::chrono::steady_clock::now();
+    WorkerIngress ing(s.client, "aeron:ipc", 7301, pump);
+    EXPECT_FALSE(ing.resolved());
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 1s);
+
+    rune::aeronutil::AeronPump bounded;
+    EXPECT_FALSE(bounded.resolve([] { return std::shared_ptr<int>{}; }, 10ms));
+    EXPECT_FALSE(bounded.deadlineExpired()) << "an explicit budget is not the startup deadline";
+    pump.withStartupDeadline(20ms);
+    EXPECT_FALSE(pump.resolve([] { return std::shared_ptr<int>{}; }, rune::aeronutil::AeronPump::kUntilAnswered));
+    EXPECT_TRUE(pump.deadlineExpired());
 }
