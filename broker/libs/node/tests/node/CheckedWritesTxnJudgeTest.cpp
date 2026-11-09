@@ -1356,7 +1356,7 @@ TEST(CheckedWritesTxnJudge, NoFreeOverlayWaitsAtJ) {
 }
 
 namespace {
-// A 4,096-record 77 at 10, ~8 MiB of tombstone batches, a plain upsert of one of 77's keys, then 77's TxnJudge.
+// A 4,096-record 77 at 10, ~1 MiB of tombstone batches (16 passes at the test's 64 KiB scan bound), a plain upsert of one of 77's keys, then 77's TxnJudge.
 void spanningLog(JudgeRig& r) {
     std::vector<Rec> txn;
     for (int64_t id = 0; id < JudgeRig::kRecordsMax; ++id) txn.push_back({10'000 + id});
@@ -1364,7 +1364,7 @@ void spanningLog(JudgeRig& r) {
     std::vector<Rec> dels;
     for (int64_t i = 0; i < 3000; ++i) dels.push_back(del(1'000'000 + i));
     const std::size_t from = r.log.bytes.size();
-    while (r.log.bytes.size() - from < (8u << 20)) r.log.data(dels);
+    while (r.log.bytes.size() - from < (1u << 20)) r.log.data(dels);
     r.log.data({{10'005}});
     r.log.judge(77, 10);
 }
@@ -1372,6 +1372,7 @@ void spanningLog(JudgeRig& r) {
 
 TEST(CheckedWritesTxnJudge, JudgingSpansPassesWithABoundedRead) {
     JudgeRig bounded(VoteMembers{100'000});
+    bounded.vs.setVoteScanBytesForTest(64u << 10);
     bounded.start();
     spanningLog(bounded);
     int judgingPasses = 0, passes = 0;
