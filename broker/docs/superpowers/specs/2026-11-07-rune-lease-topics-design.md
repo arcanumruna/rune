@@ -1610,6 +1610,8 @@ an issue is filed).
 - **Election.** Two `LeaseElection` campaigners: the leader is SIGSTOPped past the TTL, the other leads with a higher
   token, and the first wakes, gets `onLost`, and its guarded write is refused.
 
+**As built (Task 19).** `broker/docker/lease-e2e.sh` runs the BASIC, SCALE, GUARD, CHECKPOINT and SUSPEND legs on the default config (lateness on receive time); the Linux-box run is pending.
+
 ### 16.4 Model-checked stress
 
 A seeded simulation of a 3-node in-process cluster runs the real worker, replication and fold code. It has random

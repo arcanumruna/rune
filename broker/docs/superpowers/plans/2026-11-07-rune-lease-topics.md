@@ -1271,6 +1271,23 @@ modelled on `checked-writes-e2e.sh`; a small driver `client-cpp/examples/lease_e
      late;
   5. `ReadOnly` then `RejectAll` on the namespace mid-TTL: an unkept lease still expires; resume.
   Check `df` before and after; remove only your own containers and images.
+**As built (Task 19).** Files: `broker/docker/lease-e2e.sh`, `client-cpp/examples/lease_e2e_driver.cpp` (subcommands
+setup, grant, ttl, scan, hold, watch, scale-hold, guard), `client-cpp/docker/Dockerfile.lease-e2e-driver` + `.dockerignore`
+(iptables in the runtime stage), and a CMake block next to `checked_writes_probe`.
+- Deviation: no `docker-compose.lease.yml`. The default config needs no overlay; the script uses `docker-compose.yml` +
+  `docker-compose.auth.yml` only.
+- Clock: Expire/Checkpoint records carry timestamp 0, so every lateness is RECEIVE time (`CLOCK_REALTIME` ms stamped in the
+  watcher handler, the same domain as the script's `date +%s%3N`). Only upper bounds are asserted; early expiry is the stress
+  test's job.
+- GUARD offset method: the client has no partition end-offset query, so O = highest acked offset + 1 at the first pass
+  at or after Entered + d; the log read from offset 0 must hold every record below O and no `LeaseAtRisk` send.
+- Bounds: `BOUND_MS=1500`, `SCALE_BOUND_MS=5000` (env-overridable); every measured lateness is printed. extend = 300 ms
+  (compose election timeout, `NodeConfig.h:1247`).
+- Other deviations: 10 000 leases use 3 `LeaseSession<3334>` (capacity <= 4095); the typed lease topics are defined by the
+  driver (the QL schema name is part of the fingerprint), plus one `lease topic` through QL; `show lease(s)` is refused until
+  Task 22, so the driver `ttl` / `scan` subcommands replace it.
+- The run on the Linux box is pending; the checkbox below stays unticked.
+
 - [ ] Commit and push. **Checkpoint E** (Phase 1 done; announce the Phase 1 deliverables to the Herald 02 plan).
 
 ## Phase 2: recipes, limits, operations

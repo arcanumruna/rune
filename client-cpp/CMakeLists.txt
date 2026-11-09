@@ -835,6 +835,28 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
         endif()
     endif()
 
+    # ── Lease topics Task 19 — Phase 1 e2e driver (broker/docker/lease-e2e.sh) ──
+    #
+    # lease_e2e_driver.cpp includes the build-time generated lease_claim.gen.h (tests/support/GenClaimSchemas.cpp), so the driver image
+    # needs tests/ in its context.
+    if(TARGET generate_claim_schema_headers)
+        add_executable(lease_e2e_driver examples/lease_e2e_driver.cpp)
+        add_dependencies(lease_e2e_driver generate_claim_schema_headers)
+        target_include_directories(lease_e2e_driver PRIVATE ${RUNE_PROTOCOL_INCLUDE} "${RUNE_CLAIM_GEN_DIR}/gen" "${CMAKE_CURRENT_SOURCE_DIR}/examples")
+        target_link_libraries(lease_e2e_driver PRIVATE
+            rune_client_api
+            rune_client_producer
+            rune_client_subscriber
+            rune_codec
+        )
+        if(UNIX AND NOT APPLE)
+            find_library(UUID_LIB_LEASE_E2E_DRIVER uuid)
+            if(UUID_LIB_LEASE_E2E_DRIVER)
+                target_link_libraries(lease_e2e_driver PRIVATE ${UUID_LIB_LEASE_E2E_DRIVER})
+            endif()
+        endif()
+    endif()
+
     # ── Task 10 (0c #11 gate) — CLI-driven rune-ql typed probe ────────────────
     #
     # tests/e2e/rune_ql_probe.cpp is the 0c single-node real-Aeron probe.  Unlike
