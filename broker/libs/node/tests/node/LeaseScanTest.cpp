@@ -104,6 +104,13 @@ uint64_t tieHash(std::span<const uint8_t> key, int32_t) {
     if (id >= gTieFrom && id <= gTieTo) return 100;
     return 1000 + id;
 }
+std::map<uint64_t, uint64_t> gHashes;   // id -> seam hash (the map seam: ties first, smaller keys later)
+uint64_t mapHash(std::span<const uint8_t> key, int32_t) {
+    uint64_t id = 0;
+    std::memcpy(&id, key.data(), std::min<std::size_t>(8, key.size()));
+    const auto it = gHashes.find(id);
+    return it != gHashes.end() ? it->second : 1000 + id;
+}
 }  // namespace
 
 // 2. Equal hashes (through the seam; the real hash is 64-bit): five keys share a hash, maxRows 3.  The page that reaches the tie group takes
@@ -152,6 +159,50 @@ TEST(ScanLeasesRegression, HashTiesInOnePageRegression) {
                 EXPECT_EQ(k.r.worker->scanTieOverflowForTest(), 1u);
             }
         }
+    }
+    {   // (a) the tie list is RESET when a smaller hash takes the top: five keys at hash 100 are walked first (rid order = grant order),
+        // then keys at hashes 1, 2, 3.  Page 1 is exactly {1, 2, 3} - none of the stale 100s ride along - and page 2 the five 100s.
+        // Mutation: delete `tn = 0` (Worker::executeScanLeases_) -> the stale ties join page 1: red.
+        gHashes = {{11, 100}, {12, 100}, {13, 100}, {14, 100}, {15, 100}, {21, 1}, {22, 2}, {23, 3}};
+        Lk k(spec(100));
+        k.r.worker->setScanHashForTest(&mapHash);
+        std::vector<RawRec> recs;
+        for (const uint64_t id : {11, 12, 13, 14, 15, 21, 22, 23}) recs.push_back(ltr::grantRec(id));
+        ASSERT_TRUE(k.produce(recs));
+        ready(k);
+        const Lk::ScanPage p1 = k.scan({}, 3, 0, true);
+        ASSERT_EQ(p1.code, 0);
+        EXPECT_EQ(p1.ids(), (std::vector<uint64_t>{21, 22, 23}));
+        EXPECT_EQ(p1.lastHash, 3u);
+        EXPECT_FALSE(p1.done);
+        const Lk::ScanPage p2 = k.scan({}, 3, p1.lastHash, false);
+        ASSERT_EQ(p2.code, 0);
+        const std::vector<uint64_t> ids2 = p2.ids();
+        EXPECT_EQ(std::set<uint64_t>(ids2.begin(), ids2.end()), (std::set<uint64_t>{11, 12, 13, 14, 15}));
+        EXPECT_EQ(ids2.size(), 5u);
+        EXPECT_TRUE(p2.done);
+        std::set<uint64_t> all;
+        for (const uint64_t id : p1.ids()) all.insert(id);
+        for (const uint64_t id : ids2) all.insert(id);
+        EXPECT_EQ(all.size(), 8u) << "no repeats across the pages";
+    }
+    {   // (b) the tie OVERFLOW flag is reset too: 70 keys at hash 100 overflow the 64-entry list, then three smaller keys displace them all -
+        // the page is the three smaller ones, not an Internal refusal.
+        // Mutation: delete `tieOverflow = false` -> a stale overflow refuses a correct page: red.
+        gHashes.clear();
+        for (uint64_t id = 100; id < 170; ++id) gHashes[id] = 100;
+        gHashes[21] = 1; gHashes[22] = 2; gHashes[23] = 3;
+        Lk k(spec(200));
+        k.r.worker->setScanHashForTest(&mapHash);
+        std::vector<RawRec> recs;
+        for (uint64_t id = 100; id < 170; ++id) recs.push_back(ltr::grantRec(id));
+        for (const uint64_t id : {21, 22, 23}) recs.push_back(ltr::grantRec(id));
+        ASSERT_TRUE(k.produce(recs));
+        ready(k);
+        const Lk::ScanPage p = k.scan({}, 3, 0, true);
+        EXPECT_EQ(p.code, 0);
+        EXPECT_EQ(k.r.worker->scanTieOverflowForTest(), 0u);
+        EXPECT_EQ(p.ids(), (std::vector<uint64_t>{21, 22, 23}));
     }
 }
 
@@ -423,6 +474,53 @@ TEST(ScanLeasesRegression, ScanGatesRegression) {
         ready(k);
         EXPECT_EQ(k.scan({}, 10, 0, true).code, 0);
     }
+}
+
+// 10b. A scan is metered by the WORK it does: one request op plus one per 1024 row ids walked.  The aggregator is simulated by the test
+// (a window of 30 ops: a page whose charge would pass it is paced - the throttle the real aggregator would apply from the usage report).
+// 10 240 keys cost 11 ops a page, so the 3rd page in one window is Throttled (done 1, no rows); a 1-key table costs 1 op a page and pages 30
+// times in the same window.
+// Mutation: charge 1 op per scan (Worker::executeScanLeases_) -> the big table's pages cost 1: the delta check and the pacing both go red.
+TEST(ScanLeasesRegression, ScanChargesWalkRegression) {
+    constexpr uint16_t kSlot = 3;
+    constexpr uint32_t kNs = 77;
+    constexpr uint64_t kWindowOps = 30;
+    const auto drive = [&](uint64_t keys, uint64_t perPage, int pages, int& served, int& throttled) {
+        Lk k(spec(20000));
+        rune::protocol::NamespaceLimits limits;
+        k.r.worker->applyNsSlotAssignDirect(kSlot, kNs, limits);
+        k.r.log->setNsTag(kNs, kSlot);
+        fill(k, keys);
+        uint64_t used = 0;
+        bool paced = false;
+        for (int i = 0; i < pages; ++i) {
+            if (!paced && used + perPage > kWindowOps) {   // the aggregator's pacing of an over-quota window
+                k.r.worker->applyNsThrottleDirect(kSlot, kNs, ThrottleKind::QueryCycles, k.r.now + 1000LL * 1'000'000);
+                paced = true;
+            }
+            const uint64_t before = k.r.worker->nsRequestOpsForTest(kSlot);
+            const Lk::ScanPage p = k.scan({}, 64, 0, true);
+            const uint64_t charged = k.r.worker->nsRequestOpsForTest(kSlot) - before;
+            EXPECT_EQ(charged, perPage) << "page " << i;
+            used += charged;
+            if (p.code == int16_t(pc::ErrorCode::Throttled)) {
+                ++throttled;
+                EXPECT_TRUE(p.done) << "every refusal carries done";
+                EXPECT_TRUE(p.rows.empty());
+            } else {
+                EXPECT_EQ(p.code, 0);
+                ++served;
+            }
+        }
+    };
+    int served = 0, throttled = 0;
+    drive(10240, 11, 3, served, throttled);
+    EXPECT_EQ(served, 2);
+    EXPECT_EQ(throttled, 1) << "the 3rd page of a 10 240-key table passes the 30-op window";
+    served = throttled = 0;
+    drive(1, 1, 30, served, throttled);
+    EXPECT_EQ(served, 30);
+    EXPECT_EQ(throttled, 0);
 }
 
 // 11. Hard rule 4: a warm scan allocates nothing on the worker thread (selection, heapsort and encode run in the preallocated scratch).

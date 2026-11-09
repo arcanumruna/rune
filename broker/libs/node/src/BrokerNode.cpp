@@ -4159,18 +4159,7 @@ void BrokerNode::bootFromCatalog_() {
         catalogTopics.push_back(bootSpecOfFrame(t.nsId, t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence,
                                                 t.config, t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{}, t.lease));
     };
-    sink.sinkApplied = [&catalogTopics, this](const SinkSpec& sp) {   // a view's sink: a keyed, compacted table, every broker
-        bootObjects_.onView(sp.nsId, sp.topicId, sp.name);
-        rune::protocol::TopicConfig c;
-        c.cleanupPolicy = 1;   // Compact
-        c.partitionKey  = sp.keyField;
-        TopicSpec bs = bootSpecOfFrame(sp.nsId, sp.topicId, sp.name, sp.partitions, /*rf*/0, sp.persistence, c, sp.sourceKeyFeatures);
-        bs.viewSink = true;   // VLS B.2: catalog-only -- no dir, no log, no replica
-        bs.leaseSourceTopicId = sp.leaseView ? sp.leaseSourceTopicId : -1;   // Task 13a: the gateway registry holds the lease view's source
-        bs.leaseKeyType       = sp.leaseView ? sp.leaseKeyType : 0;          // Task 13b: ... and that topic's key
-        bs.leaseKeyWidth      = sp.leaseView ? sp.leaseKeyWidth : 0;
-        catalogTopics.push_back(std::move(bs));
-    };
+    sink.sinkApplied = [&catalogTopics, this](const SinkSpec& sp) { bootSinkApplied_(sp, catalogTopics); };
     const int replayed = bootApplier_->replayLocal(*catalogLog_, BootEffects{std::move(sink)});   // throws: refuse boot
     if (replayed >= 0) ++bootReplays_;
     std::sort(catalogTopics.begin(), catalogTopics.end(),
@@ -5231,7 +5220,13 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                 ++sinkAppliedDrained_;
                 CatalogTopicAppliedMsg decoded;   // decoded once; onCatalogTopicApplied_ reuses it
                 const bool ok = decodeCatalogTopicApplied(p, n, decoded, /*sink*/true);
-                const bool leaseView = ok && decoded.leaseView;
+                // The raw flags bit decides, not the decode: a REFUSED lease frame must never be awaited (a forever-NotReady id).
+                const bool leaseView = decoded.leaseViewFlag;
+                if (!ok && leaseView) {
+                    int32_t refusedId = -1;
+                    if (n >= 4) std::memcpy(&refusedId, p, 4);
+                    noteLeaseSinkRefused_(refusedId, "live");
+                }
                 if (gateway_ && n >= 4 && !leaseView) {
                     int32_t viewTopicId;
                     std::memcpy(&viewTopicId, p, 4);
@@ -5942,6 +5937,34 @@ bool BrokerNode::catalogNameHeldByDrop_(uint32_t nsId, const std::string& name) 
     for (const auto& d : droppedAwaitingRetire_)
         if (d.nsId == nsId && (d.name == name || rune::catalog::topicNamesFoldEqual(d.name, name))) return true;
     return false;
+}
+
+/// The boot replay's sink effect (also the catalog-checkpoint restore's: one lambda calls this).  A lease view sink that names no lease
+/// topic is NOT registered - no TopicSpec, no write-spec view id - because the gateway authorises a lease view's reads as READ on its
+/// topic and routes by it; it is logged critical once per view id and counted (leaseSinkRefused_).  Fail closed.
+void BrokerNode::bootSinkApplied_(const SinkSpec& sp, std::vector<TopicSpec>& out) {
+    if (!leaseViewSinkValid(sp)) {
+        noteLeaseSinkRefused_(sp.topicId, "boot");
+        return;
+    }
+    bootObjects_.onView(sp.nsId, sp.topicId, sp.name);
+    rune::protocol::TopicConfig c;
+    c.cleanupPolicy = 1;   // Compact
+    c.partitionKey  = sp.keyField;
+    TopicSpec bs = bootSpecOfFrame(sp.nsId, sp.topicId, sp.name, sp.partitions, /*rf*/0, sp.persistence, c, sp.sourceKeyFeatures);
+    bs.viewSink = true;   // VLS B.2: catalog-only -- no dir, no log, no replica
+    bs.leaseSourceTopicId = sp.leaseView ? sp.leaseSourceTopicId : -1;   // Task 13a: the gateway registry holds the lease view's source
+    bs.leaseKeyType       = sp.leaseView ? sp.leaseKeyType : 0;          // Task 13b: ... and that topic's key
+    bs.leaseKeyWidth      = sp.leaseView ? sp.leaseKeyWidth : 0;
+    out.push_back(std::move(bs));
+}
+
+void BrokerNode::noteLeaseSinkRefused_(int32_t viewTopicId, const char* where) {
+    ++leaseSinkRefused_;
+    if (leaseSinkRefusedIds_.insert(viewTopicId).second) {
+        spdlog::critical("BrokerNode[{}]: the lease view sink (id={}) names no lease topic ({}): it is REFUSED - not registered, not served "
+                         "(fail closed); the catalog is damaged", config_.nodeId, viewTopicId, where);
+    }
 }
 
 void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView, const CatalogTopicAppliedMsg* decoded) {

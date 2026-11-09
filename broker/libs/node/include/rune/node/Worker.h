@@ -8021,14 +8021,15 @@ private:
             return refuse(static_cast<uint16_t>(pc::ErrorCode::InvalidRequest));
         const auto prefix = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(op.tail()), prefixLen);
         const NsTag nsTag = sv.replica->isDiskBacked() ? nsTagOfLog_(sv.replica->log(), nullptr) : nsTagOfLog_(nullptr, sv.replica->memoryLog());
-        if (NsHot* const nh = nsReadMeter_(topicId, nsTag)) {   // R9: counted and paced like a view read
-            ++nh->requestOps;
+        const LeaseIndexRef& ref = sv.lk.ref;
+        if (NsHot* const nh = nsReadMeter_(topicId, nsTag)) {   // R9: counted and paced like a view read, but charged by WORK:
+            // one op, plus one per 1024 row ids the walk below visits (a scan of a big table costs more than a point read).
+            nh->requestOps += 1 + (ref.table != nullptr ? ref.table->ridHighWater() / 1024u : 0u);
             if (passNowNs_ < nh->queryUntil) [[unlikely]] {
                 ++throttledRefusals_;
                 return refuse(static_cast<uint16_t>(pc::ErrorCode::Throttled));
             }
         }
-        const LeaseIndexRef& ref = sv.lk.ref;
         if (ref.table == nullptr || ref.layout == nullptr) return refuse(static_cast<uint16_t>(pc::ErrorCode::NotLeader));   // unreachable: ready
         if (!leaseScan_) leaseScan_ = std::make_unique<LeaseScanScratch>();   // cold, once
         LeaseScanScratch& sc = *leaseScan_;
@@ -8084,7 +8085,7 @@ private:
         // Encode whole hash groups up to the page's byte cap.
         const std::size_t keyW   = table.keyWidth();
         const std::size_t rowLen = ref.layout->rowLen;
-        const std::size_t rowBytes = 1 + keyW + 4 + rowLen;
+        const std::size_t rowBytes = pc::scanLeasesRowBytes(keyW, rowLen);
         std::size_t pos = 0, rows = 0;
         uint64_t lastHash = resumeHash;
         bool cut = false;

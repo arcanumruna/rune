@@ -7,6 +7,8 @@
 #include <rune/node/TopicFeatureRules.h>
 #include <rune/node/CatalogEffectFrames.h>
 #include <rune/node/FdBudget.h>
+#include <rune/node/lease/LeaseIndex.h>
+#include <rune/protocol/client/LeaseMessages.h>
 #include <rune/node/PersistenceMode.h>
 
 #include <rune/catalog/CatalogFingerprint.h>
@@ -1463,6 +1465,19 @@ std::string leaseFixedWidthDetail(const std::string& name, rune::codec::PrimType
            "; use string(N)";
 }
 
+// A lease topic's row (the lease view's row in a ScanLeases page) must fit one page.  `evolving` holds the system columns.
+constexpr const char* kLeaseRowTooBigDetail = "a lease topic's row must fit one ScanLeases page";
+bool leaseRowTooBig(const rune::codec::Descriptor& evolving, const std::string& keyField) {
+    std::size_t keyWidth = 0;
+    for (const auto& f : evolving.fields)
+        if (f.untilVersion == 0xFFFF && f.name == keyField) { keyWidth = rune::codec::fieldWidth(f); break; }
+    try {
+        return leaseScanRowBytes(evolving, keyWidth) > rune::protocol::client::kScanLeasesMaxPageBytes;
+    } catch (const std::invalid_argument&) {
+        return false;   // a var-len field: refused by its own rule
+    }
+}
+
 // Lease topics: the admin-only rules of a NEW lease define (the catalog's V4 apply rules are the replay half).  Judged in
 // the documented order; nullopt = fine.  `d` is the user's descriptor (null for an untyped define).
 std::optional<DdlRejection> leaseDefineRefusal(const DefineTopicMsg& m, const rune::codec::Descriptor* d, int16_t level) {
@@ -1641,6 +1656,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         uint32_t past = 0;
         for (const auto& f : d.fields) past = std::max<uint32_t>(past, uint32_t{f.id} + 1);
         if (past > 0xFFFF) return Rejected(reject(kInvalidSchema, kTagsExhausted));
+        if (leaseRowTooBig(d, m.keyField)) return Rejected(reject(kInvalidSchema, kLeaseRowTooBigDetail));
         op.schema = cat::SchemaDef{m.keyField, m.validate, rune::codec::serialize(d), static_cast<uint16_t>(past), features};
         op.lease  = *m.lease;
     } else if (!m.blob.empty()) {
@@ -1685,6 +1701,13 @@ AdminWorker::Built AdminWorker::buildAlter_(const AlterTopicMsg& m, const cat::C
         for (const auto& op : *ops)
             if (op.type == rune::codec::AlterOpType::Add && rune::codec::isVarLen(op.primType))
                 return Rejected(reject(kInvalidSchema, leaseFixedWidthDetail(op.name, op.primType), topicId, cur));
+    if (t->lease) {   // the grown row must still fit one ScanLeases page (an ALTER that fails to apply is refused by the catalog)
+        uint16_t nextTag = t->schema->nextTag;
+        if (auto grown = rune::codec::applyOps(rune::codec::deserialize(t->schema->evolvingBlob), *ops, nextTag,
+                                               static_cast<uint16_t>(cur + 1));
+            grown && leaseRowTooBig(*grown, t->schema->keyField))
+            return Rejected(reject(kInvalidSchema, kLeaseRowTooBigDetail, topicId, cur));
+    }
     // F20: stored resolved to durable tags.
     auto resolved = cat::resolveAlterOps(*t->schema, std::span<const rune::codec::AlterOp>(ops->data(), ops->size()));
     if (!resolved) return Rejected(reject(kInvalidSchema, resolved.error(), topicId, cur));

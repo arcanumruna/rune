@@ -257,7 +257,7 @@ namespace limit `max-leases`.
     fails `LeaseAtRisk`, and nothing is sent or re-sent (no reconnect retry) until `Cleared`. Attack: a reconnect
     racing `Entered`. Tests: `LeaseSessionRegression.GuardFailsPendingAndUnsentRegression`,
     `…GuardBlocksReconnectResendRegression` (Task 15), e2e leg (Task 19).
-12. **Hash-order scan and handoff (R2, §12.4).** Order by `xxh3_64(key, seed = topicId)`, never the per-node probe
+12. **Hash-order scan and handoff (R2, §12.4).** Order by `wyhash64(key, seed = topicId)`, never the per-node probe
     seed; exclusive `asOf`; rule 3 over hash ranges; nested prefixes dropped; overflow re-subscribes from the cursor
     with nothing lost or duplicated. Tests: `LeaseWatchHandoffRegression.*` (Task 16), `ScanLeasesRegression.*`
     (Task 13).
@@ -322,7 +322,7 @@ settlements. The items below are open points the spec leaves to the implementati
   (`partitionForKey(bytes)`); `get`, `timeToLive`, `revoke` and keepalive batching use the same function client-side.
 - **L10. ScanLeases page cap.** A page also stops at the response scratch cap (the existing `ScanViewRowsResponse`
   bound) on a hash boundary, with `done = 0`. If a single hash-tie group cannot fit, the page answers
-  `RecordTooLarge` (never happens with xxh3_64 in practice; tested with an injected hash).
+  `MessageTooLarge` (never happens with wyhash64 in practice; tested with an injected hash).
 - **L11. Park table.** One per worker, `kLeaseParkTableEntries = 4096`, a free-list of `{sessionReplySlot,
   correlationId, entryIndex u16, leaseRowId u32, next u32}`, chained per wheel entry. Full → that entry is answered
   `Throttled` with a 1 ms retry-after.
@@ -435,7 +435,7 @@ view is unchanged (or changed exactly as `expect` says).
   1. `OldSession` × any → `InvalidRequest` (39) naming the version, before any lease state is touched; L unchanged.
   2. `OtherNs` × any → the answer of a missing object (byte-equal to a truly missing name), L unchanged.
   3. `NonLeaseSameWorker` × a lease-only op (`KeepAlive*`, `TimeToLive`, `ScanLeases`, `openLeaseTopic`) →
-     `InvalidRequest` ("not a lease topic") / local `InvalidArgument`; × a broker op → the non-lease partition's log
+     answered like a missing id (UnknownTopic / NotAuthorized, spec §8.3) / local `InvalidArgument`; × a broker op → the non-lease partition's log
      and views byte-identical to a run without the lease activity.
   4. `OtherKeySamePart`, `OtherPart`, `OtherLeaseTopic` × any → that entity's own expected result; L unchanged.
   5. `UserView` × `Expire`/`Revoke` → row deleted in the same fold batch as the lease view's; × `Checkpoint`,
@@ -490,7 +490,7 @@ New:
   - `LeaseEmitter.h` / `src/lease/LeaseEmitter.cpp`: batch building into the per-worker scratch;
   - `LeaseParkTable.h`: L11;
   - `LeaseKeepAliveServer.h` / `src/lease/LeaseKeepAliveServer.cpp`: the §8.1 table, TimeToLive, ScanLeases pages;
-  - `LeaseHash.h`: `scanHash(key, topicId) = xxh3_64(key, seed = topicId)`.
+  - `LeaseHash.h`: `scanHash(key, topicId) = wyhash64(key, seed = topicId)`.
 - `client-cpp/include/rune/client/lease/`: `LeaseOptions.h`, `LeaseResult.h`, `LeaseTopic.h`, `LeaseSession.h`,
   `LeaseWatch.h`, `LeaseMutex.h`, `LeaseElection.h`; `client-cpp/include/rune/client/detail/BootClock.h`;
   `client-cpp/src/lease/LeaseTopic.cpp`, `LeaseWire.cpp`.

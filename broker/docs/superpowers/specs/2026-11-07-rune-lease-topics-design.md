@@ -757,7 +757,10 @@ is a fixed-width `prefixWidth`, which a path prefix cannot use.
   only, within `kScanLeasesMaxPageBytes`; a first group that alone exceeds it is `MessageTooLarge`. A tie group of more
   than 64 rows beyond `maxRows` is refused `Internal` and counted (`scanTieOverflow`), never answered wrong. The client
   error space has no NotReady: an index that is not ready answers `NotLeader`, as the lease reads do. Every refusal carries
-  `done = 1` and an empty page.
+  `done = 1` and an empty page. There is no scan fingerprint: lease evolution is append-only and fixed-width, so every
+  AddField grows `rowLen`, and a reader detects a layout change by `rowLen` (the client's `LeasesRow::decode` refuses a
+  wrong length). A lease topic whose row would not fit one page (`1 + keyWidth + 4 + rowLen > kScanLeasesMaxPageBytes`)
+  is refused at `define` and at `alter ... add` (`InvalidSchema`).
 - **Why it is new.** Today's `ScanViewRows` cannot serve it: it routes to partition 0, has no `asOf`, and its cursor
   is invalidated by churn (checked-writes §9).
 

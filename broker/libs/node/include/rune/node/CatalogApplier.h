@@ -96,6 +96,17 @@ struct SinkSpec {
     uint8_t leaseKeyWidth = 0;
 };
 
+/// A lease view's sink must name its lease topic (the gateway authorises its reads as READ on that topic): a lease-view sink without
+/// one is a catalog the broker cannot serve safely, and is refused (fail closed) by every consumer of a SinkSpec - the live decoder's
+/// frame rule (AdminChannels.h) and the boot sink (BrokerNode::bootSinkApplied_) share this one rule.
+[[nodiscard]] inline constexpr bool leaseViewSinkValid(bool leaseView, int32_t leaseSourceTopicId) noexcept {
+    return !leaseView || leaseSourceTopicId >= 0;
+}
+[[nodiscard]] inline bool leaseViewSinkValid(const SinkSpec& s) noexcept { return leaseViewSinkValid(s.leaseView, s.leaseSourceTopicId); }
+
+/// The sink of a lease view (cold; exposed so a test can pin what it mirrors from a hand-built state).
+[[nodiscard]] SinkSpec leaseSinkSpecOf(const rune::catalog::ViewObject& v, const rune::catalog::CatalogState& state);
+
 /// The admin-thread effect sink.  Production = ring encoders (AdminWorkerAgent);
 /// tests = recorders.  An empty function is skipped.
 struct CatalogEffects {

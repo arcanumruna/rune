@@ -64,6 +64,8 @@ SinkSpec sinkSpecOf(const cat::ViewObject& v, const cat::CatalogState& state) {
     return s;
 }
 
+} // namespace
+
 /// The lease view's sink: a catalog-only table beside its lease topic, with the topic's partitions and persistence.
 SinkSpec leaseSinkSpecOf(const cat::ViewObject& v, const cat::CatalogState& state) {
     SinkSpec s;
@@ -86,6 +88,8 @@ SinkSpec leaseSinkSpecOf(const cat::ViewObject& v, const cat::CatalogState& stat
     }
     return s;
 }
+
+namespace {
 
 bool isLeaseKeyChange(const cat::ConfigChange& c) noexcept {
     return static_cast<uint8_t>(c.key) > static_cast<uint8_t>(rune::protocol::kLastConfigKeyV3);

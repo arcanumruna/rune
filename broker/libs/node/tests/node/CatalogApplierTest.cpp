@@ -1627,16 +1627,31 @@ TEST(LeaseEffectsRegression, LiveCreateEmitsTopicThenLeaseSinkRegression) {
     EXPECT_EQ(sp.keyField, "id");
     EXPECT_EQ(sp.nsId, 0u);
     EXPECT_EQ(sp.leaseSourceTopicId, 1) << "Task 13a: the lease view names its lease topic (the catalog's id)";
-    {   // L6: the sink mirrors the lease topic's key features (set from the source topic explicitly)
-        const cat::TopicObject* owner = rig.applier.state().topicByName(0, "inst");
-        ASSERT_NE(owner, nullptr);
-        ASSERT_TRUE(owner->schema.has_value());
-        EXPECT_EQ(sp.sourceKeyFeatures.keyIndex, owner->schema->keyFeatures.keyIndex);
-        EXPECT_EQ(sp.sourceKeyFeatures.autoIncrement, owner->schema->keyFeatures.autoIncrement);
-        EXPECT_EQ(sp.sourceKeyFeatures.partitioner, owner->schema->keyFeatures.partitioner);
-    }
+    // L6: a lease topic's key features are always the defaults - AdminWorker refuses keyIndex ("a lease topic's key index is its lease
+    // view", leaseDefineRefusal) and autoIncrement ("a lease topic cannot use autoincrement") on a lease define, and the catalog's alter
+    // path cannot add them - so the sink's are the defaults too.  The mirroring itself is pinned below with a hand-built catalog.
+    EXPECT_EQ(sp.sourceKeyFeatures, rune::protocol::TopicKeyFeatures{});
     EXPECT_TRUE(rig.rec.liveViewInstalls.empty()) << "no plan: never viewInstalled";
     EXPECT_NE(rig.rec.objects.byName(0, "inst.leases"), std::nullopt) << "its name resolves";
+}
+
+// L6: the lease sink mirrors the lease topic's key features.  A CatalogState with NON-default features (hand-built, bypassing AdminWorker's
+// refusals) shows leaseSinkSpecOf copies them.  Mutation: drop `s.sourceKeyFeatures = ...` in leaseSinkSpecOf -> red.
+TEST(LeaseEffectsRegression, LeaseSinkMirrorsNonDefaultKeyFeaturesRegression) {
+    CatalogRig rig("lease_kf");
+    appendLeaseScript(rig, 0, 2);
+    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 2);
+    ASSERT_FALSE(rig.applier.halted());
+    const cat::TopicObject* t  = rig.applier.state().topicByName(0, "inst");
+    const cat::ViewObject*  lv = rig.applier.state().viewByName(0, "inst.leases");
+    ASSERT_NE(t, nullptr);
+    ASSERT_NE(lv, nullptr);
+    ASSERT_TRUE(t->schema.has_value());
+    // The catalog's own validator refuses a lease topic with keyIndex, so the state is edited in place (a test-only bypass).
+    const_cast<cat::TopicObject*>(t)->schema->keyFeatures.keyIndex = true;
+    const rune::node::SinkSpec sp = rune::node::leaseSinkSpecOf(*lv, rig.applier.state());
+    ASSERT_TRUE(sp.leaseView);
+    EXPECT_TRUE(sp.sourceKeyFeatures.keyIndex);
 }
 
 TEST(LeaseEffectsRegression, LiveDropEmitsLeaseSinkDropFirstRegression) {

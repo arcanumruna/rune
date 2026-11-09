@@ -20,6 +20,7 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/protocol/LeaseSpec.h>
+#include <rune/protocol/PartitionHash.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include "support/AuthRig.h"
@@ -33,7 +34,10 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstring>
+#include <set>
 #include <chrono>
 #include <filesystem>
 #include <functional>
@@ -522,4 +526,173 @@ TEST(LeaseTopicBrokerRegression, LeaseViewReadAtAFollowerRedirectsToTheSourceLea
         return !a->isError && a->status == 0;
     }, 60s)) << "the leader serves the lease row (last code " << code << ")";
     EXPECT_GT(rowLen, 0u);
+}
+
+// ── Checkpoint C: a REAL broker's ScanLeases (1 node, 2 partitions, 300 keys) ─────────────────────────────────────────────────
+// Raw ScanLeases frames through ShardTestClient: every partition paged with maxRows 64 to done -> every key exactly once; the node restarts
+// and the same set comes back (the index rebuilds from the log); READ on the source topic serves the scan, a VIEW-only grant on `<t>.leases`
+// is NotAuthorized (done 1).  The 3-node LeaderChangeMidScan leg is Task 17's.
+// Mutation: authorise ScanLeases on the VIEW grant -> the VIEW-only session is served: red.
+namespace {
+struct ScanWire {
+    AuthRig& rig;
+    int32_t  viewId = -1;
+
+    struct Page {
+        bool        got = false;
+        int         code = -1;      // ScanLeasesResponse code, or the ErrorResponse code
+        bool        isError = false;
+        bool        done = false;
+        uint64_t    lastHash = 0;
+        std::vector<std::vector<uint8_t>> keys;
+    };
+    Page page(int64_t sid, int32_t partition, uint64_t resume, bool first, uint16_t maxRows) {
+        Page p;
+        const int64_t corr = rig.c().sendScanLeases(rig.ch(), AuthRig::stream(), sid, viewId, partition, resume, first, maxRows);
+        if (corr == 0) return p;
+        const auto raw = rig.c().awaitRaw(corr, Clock::now() + 10s);
+        if (!raw) return p;
+        p.got = true;
+        if (const auto s = rp::client::ScanLeasesResponse::decode(raw->data(), raw->size())) {
+            p.code = s->code; p.done = s->done == 1; p.lastHash = s->lastHash;
+            std::size_t at = 0;
+            for (int i = 0; i < s->rowCount; ++i) {
+                const std::size_t kl = s->rows[at];
+                p.keys.emplace_back(s->rows.begin() + std::ptrdiff_t(at + 1), s->rows.begin() + std::ptrdiff_t(at + 1 + kl));
+                uint32_t rl = 0;
+                std::memcpy(&rl, s->rows.data() + at + 1 + kl, 4);
+                at += 5 + kl + rl;
+            }
+        } else if (const auto e = rp::client::ErrorResponse::decode(raw->data(), raw->size())) {
+            p.isError = true; p.code = e->code;
+        }
+        return p;
+    }
+    /// Every key of every partition, paged to done.  A transient answer (NotLeader / Throttled while leadership or the index settles) is
+    /// retried by restarting that partition's scan; bounded.
+    std::set<std::vector<uint8_t>> scanAll(int64_t sid, int32_t partitions, std::size_t* total = nullptr) {
+        std::set<std::vector<uint8_t>> all;
+        std::size_t seen = 0;
+        for (int32_t part = 0; part < partitions; ++part) {
+            const auto deadline = Clock::now() + 60s;
+            bool finished = false;
+            while (!finished && Clock::now() < deadline) {
+                std::set<std::vector<uint8_t>> mine;
+                std::size_t mineSeen = 0;
+                uint64_t resume = 0;
+                bool first = true, restart = false;
+                for (int pg = 0; pg < 64 && !restart; ++pg) {
+                    const Page p = page(sid, part, resume, first, 64);
+                    if (!p.got || p.code != 0) { restart = true; std::this_thread::sleep_for(25ms); break; }
+                    for (const auto& k : p.keys) { mine.insert(k); ++mineSeen; }
+                    resume = p.lastHash; first = false;
+                    if (p.done) { finished = true; break; }
+                }
+                if (finished) { all.insert(mine.begin(), mine.end()); seen += mineSeen; }
+            }
+            EXPECT_TRUE(finished) << "partition " << part << " was paged to done";
+        }
+        if (total != nullptr) *total = seen;
+        return all;
+    }
+};
+} // namespace
+
+TEST(LeaseTopicBrokerRegression, ScanLeasesThroughTheRealBrokerRegression) {
+    constexpr int kKeys = 300;
+    constexpr int32_t kParts = 2;
+    AuthBroker::Options o;
+    o.shard = true;
+    AuthRig rig("leasescan", o);
+    rig.c().captureRawAnswers(true);
+    rig.broker().createUser("lbuild", AuthRig::kPw, {grants::cluster(SO::Create), grants::cluster(SO::Alter), grants::cluster(SO::Drop),
+                                                       grants::cluster(SO::Describe)});
+    rig.broker().createUser("lwriter", AuthRig::kPw, {grants::exact(SO::Write, ST::Topic, "inst")});
+    rig.broker().createUser("lreader", AuthRig::kPw, {grants::exact(SO::Read, ST::Topic, "inst")});
+    rig.broker().createUser("lviewonly", AuthRig::kPw, {grants::exact(SO::Read, ST::View, "inst.leases")});
+    LeaseWiring w{rig};
+    ScanWire sw{rig};
+
+    rp::LeaseSpec spec = validSpec();
+    spec.maxKeys = 1000;
+    const int64_t builder = w.loginAs("lbuild");
+    const auto def = rig.c().awaitDefine(
+        rig.c().sendDefineLeaseTopic(rig.ch(), AuthRig::stream(), builder, "inst", kParts, userBlob(), spec), AuthRig::dl(30));
+    ASSERT_TRUE(def.has_value());
+    ASSERT_EQ(def->errorCode, kOk);
+    w.topicId = def->topicId;
+    sw.viewId = w.viewId = w.topicId + 1;
+    ASSERT_TRUE(eventually([&] { return w.mapping().lease == w.topicId; }));
+
+    // 300 grants: keys "k-0000".."k-0299" (the 64-byte id field), split by the partitioner, produced in batches of 50 per partition.
+    const auto keyOf = [](int i) { std::string k(64, '\0'); const std::string n = "k-" + std::to_string(10000 + i).substr(1); k.replace(0, n.size(), n); return k; };
+    std::vector<std::vector<std::string>> byPart(kParts);
+    std::set<std::vector<uint8_t>> expected;
+    for (int i = 0; i < kKeys; ++i) {
+        const std::string k = keyOf(i);
+        const std::span<const uint8_t> kb(reinterpret_cast<const uint8_t*>(k.data()), k.size());
+        byPart[std::size_t(rp::partitionForKey(kb, kParts))].push_back(k);
+        expected.insert(std::vector<uint8_t>(kb.begin(), kb.end()));
+    }
+    const int64_t writer = w.loginAs("lwriter");
+    const auto ids = rig.initProducer(writer);
+    ASSERT_EQ(ids.code, 0);
+    for (int32_t part = 0; part < kParts; ++part) {
+        int32_t seq = 0;
+        for (std::size_t from = 0; from < byPart[std::size_t(part)].size(); from += 50) {
+            const std::size_t to = std::min(byPart[std::size_t(part)].size(), from + 50);
+            rp::RecordBatchBuilder b(0, 0);
+            b.setProducerId(ids.pid); b.setProducerEpoch(ids.epoch); b.setBaseSequence(seq);
+            for (std::size_t i = from; i < to; ++i) {
+                const std::string& key = byPart[std::size_t(part)][i];
+                std::string value;
+                value.push_back(static_cast<char>(96)); value.push_back(0);
+                value.push_back(1); value.push_back(0);
+                const auto put64 = [&](uint64_t v) { for (int j = 0; j < 8; ++j) value.push_back(static_cast<char>(v >> (8 * j))); };
+                put64(0); put64(60'000); put64(1); put64(0);
+                value += key;
+                b.append(key, value, 0, /*attrs: grant*/ 1);
+            }
+            const std::vector<uint8_t> batch = b.build();
+            int last = -1;
+            for (int attempt = 0; attempt < 200 && last != 0; ++attempt) {
+                const int64_t corr = rig.c().nextCorrelationId();
+                ASSERT_TRUE(rig.c().produceIdempotent(rig.broker().workerIngressChannel(), AuthRig::stream(), writer, corr, w.topicId, part,
+                                                      rp::client::kAcksWireAll | rp::client::kAcksWireView, ids.pid, ids.epoch, seq, batch));
+                const auto a = rig.c().awaitProduceResponseUntil(corr, AuthRig::dl(10));
+                last = a ? a->errorCode : -1;
+                if (last != 0) std::this_thread::sleep_for(25ms);
+            }
+            ASSERT_EQ(last, 0) << "partition " << part << " grants acked";
+            seq += static_cast<int32_t>(to - from);
+        }
+    }
+
+    int64_t reader = w.loginAs("lreader");
+    int64_t viewOnly = w.loginAs("lviewonly");
+    {
+        std::size_t total = 0;
+        const auto got = sw.scanAll(reader, kParts, &total);
+        EXPECT_EQ(got, expected) << "every key once, across both partitions";
+        EXPECT_EQ(total, std::size_t(kKeys)) << "no key twice";
+        const ScanWire::Page denied = sw.page(viewOnly, 0, 0, true, 64);
+        ASSERT_TRUE(denied.got);
+        EXPECT_EQ(denied.code, kStatusNotAuthorized) << "VIEW on <t>.leases alone is not the rule";
+        EXPECT_TRUE(denied.done);
+        EXPECT_TRUE(denied.keys.empty());
+    }
+
+    rig.restart();
+    reader = w.loginAs("lreader");
+    viewOnly = w.loginAs("lviewonly");
+    ASSERT_TRUE(eventually([&] { return w.mapping().lease == w.topicId; }, 30s));
+    {
+        std::size_t total = 0;
+        const auto got = sw.scanAll(reader, kParts, &total);
+        EXPECT_EQ(got, expected) << "after a restart the same keys come back";
+        EXPECT_EQ(total, std::size_t(kKeys));
+        const ScanWire::Page denied = sw.page(viewOnly, 1, 0, true, 64);
+        ASSERT_TRUE(denied.got);
+        EXPECT_EQ(denied.code, kStatusNotAuthorized);
+    }
 }

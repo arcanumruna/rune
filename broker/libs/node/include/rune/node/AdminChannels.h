@@ -21,6 +21,7 @@
 // bytes inline; the consumer rebuilds owning strings / vectors on its own thread.
 // Cold path (DDL is rare): the per-op owning containers are acceptable here.
 
+#include <rune/node/CatalogApplier.h>   // leaseViewSinkValid (the one fail-closed rule for a lease view sink)
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/protocol/CatalogTypes.h>
 #include <rune/protocol/LeaseSpec.h>
@@ -1504,7 +1505,7 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
 //                             bits 2 and 3 never both)
 //                             [leaseSourceTopicId:i32][leaseKeyType:u8][leaseKeyWidth:u8] iff bit3 and the id is known   (lease
 //                             topics Task 13a / 13b: the lease view's source topic and that topic's key type / width, from the
-//                             catalog; a bit-3 frame without them names none)
+//                             catalog; the decoder REFUSES a bit-3 frame without them: a lease view that names no topic is not served)
 //   kA2cCatalogTopicDropped : [topicId:i32][nameLen:u16 + name][nsId:u32]
 //   kA2cCatalogTopicConfig  : [topicId:i32][count:u16][(key:u8, value:i64) * count]
 //   kA2cViewUninstall       : [viewTopicId:i32]
@@ -1551,6 +1552,7 @@ struct CatalogTopicAppliedMsg {
     uint32_t                    nsId              = 0;   // the owning namespace (names are per namespace)
     rune::protocol::TopicKeyFeatures keyFeatures{};   // only keyIndex, autoIncrement and partitioner travel
     std::optional<rune::protocol::LeaseSpec> lease;   // flags bit 2: a lease topic
+    bool                        leaseViewFlag     = false;   // the RAW flags bit 3, set even when the frame is refused (the caller must never await a plan for it)
     bool                        leaseView         = false;   // flags bit 3: the sink of a lease topic's lease view (no plan)
     int32_t                     leaseSourceTopicId = -1;     // bit 3 + 6 trailing bytes: the lease topic that owns the view; -1: not carried
     uint8_t                     leaseKeyType       = 0;      // ... and its key's rune::codec::PrimType
@@ -1643,11 +1645,13 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
     m.nsId = getU32(buf + pos); pos += 4;
     m.keyFeatures = {};
     m.lease.reset();
+    m.leaseViewFlag = false;
     m.leaseView = false;
     m.leaseSourceTopicId = -1;
     m.leaseKeyType = 0;
     m.leaseKeyWidth = 0;
     if (pos != len) {   // the feature bytes; a frame without them is Fnv1a, no autoincrement
+        m.leaseViewFlag = (buf[pos] & 8u) != 0;   // the RAW bit, before any refusal below
         const uint8_t forbidden = sink ? 0x04 : 0x08;   // a sink has no lease block; a topic is never a lease view
         if (pos + kCatalogTopicAppliedFeatureBytes > len || (buf[pos] & 0xF0) != 0 || (buf[pos] & forbidden) != 0 ||
             (buf[pos] & 0x06) == 0x06 ||
@@ -1659,7 +1663,7 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
         if (isLeaseView) {   // a lease view frame always names its lease topic (in-process ring: no skew)
             if (body != kCatalogLeaseViewSourceBytes || hasLease) return false;
             m.leaseSourceTopicId = getI32(buf + pos + kCatalogTopicAppliedFeatureBytes);
-            if (m.leaseSourceTopicId < 0) return false;
+            if (!leaseViewSinkValid(/*leaseView*/true, m.leaseSourceTopicId)) return false;
             m.leaseKeyType  = buf[pos + kCatalogTopicAppliedFeatureBytes + 4];
             m.leaseKeyWidth = buf[pos + kCatalogTopicAppliedFeatureBytes + 5];
         } else if (body != (hasLease ? rune::protocol::kLeaseSpecBytes : 0)) {

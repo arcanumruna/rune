@@ -58,6 +58,9 @@ inline constexpr std::string_view kLeaseUpdatedOffsetColumn = "lease_updated_off
 [[nodiscard]] rune::codec::Descriptor leaseIndexOutDescriptor(const rune::codec::Descriptor& evolving);
 /// buildRowLayout(leaseIndexOutDescriptor(evolving)).  Throws only on a var-len field (a lease topic has none).  Cold.
 [[nodiscard]] rune::view::RowLayout leaseIndexRowLayout(const rune::codec::Descriptor& evolving);
+/// The bytes one ScanLeases row of this lease topic takes on the wire: scanLeasesRowBytes(keyWidth, the index layout's rowLen).  The DDL
+/// refuses a lease topic whose row exceeds kScanLeasesMaxPageBytes.  `evolving` holds the system columns.  Cold.
+[[nodiscard]] std::size_t leaseScanRowBytes(const rune::codec::Descriptor& evolving, std::size_t keyWidth);
 /// The lease view's output fingerprint (spec 7.1): mix(layoutHash, kLeaseIndexPlanFingerprint), where layoutHash is the wyhash (seed 0) over,
 /// for every slot of `layout` in slot order, [field id u32 LE][column type u8][width u32 LE][offset u32 LE].  `outDesc` is
 /// leaseIndexOutDescriptor(evolving) (slot i = outDesc.fields[i]).  LAYOUT ONLY: no field names, no sinceVersion, no schema name, so a

@@ -10,6 +10,7 @@
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/GroupMessages.h>
+#include <rune/protocol/client/LeaseMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/MetadataMessages.h>
@@ -736,6 +737,17 @@ public:
         std::vector<uint8_t> buf(m.encodedSize());
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    /// Lease topics Checkpoint C: a raw ScanLeases (100) of `partition` on the lease view `viewTopicId`.  Call captureRawAnswers() first and
+    /// read the answer with awaitRaw (a ScanLeasesResponse, or an ErrorResponse for a Redirect).  0 = not sent.
+    int64_t sendScanLeases(const std::string& ch, int32_t stream, int64_t sid, int32_t viewTopicId, int32_t partition, uint64_t resumeHash,
+                           bool first, uint16_t maxRows, std::span<const uint8_t> prefix = {}) {
+        pc::ScanLeases m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.viewTopicId = viewTopicId; m.partition = partition;
+        m.resumeHash = resumeHash; m.first = first ? 1 : 0; m.maxRows = maxRows; m.prefix = prefix;
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return len != 0 && send(ch, stream, buf.data(), len) ? m.correlationId : 0;
     }
     std::optional<uint16_t> awaitViewRow(int64_t corr, Clock::time_point deadline) {
         const auto r = awaitIn_(viewRows_, corr, deadline);

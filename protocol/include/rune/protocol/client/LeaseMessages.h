@@ -40,6 +40,12 @@ inline constexpr std::size_t kScanLeasesMaxPrefixBytes = 127;
 /// own fixed part (the 24-byte header and the 25-byte block).  A group of equal-hash rows that does not fit is left for the next page.
 inline constexpr std::size_t kScanLeasesMaxPageBytes = 61440 - (24 + 25);
 
+/// One encoded ScanLeases row: [keyLen u8][key][rowLen u32 LE][row payload].  The ONE size formula (the worker's page builder and the
+/// DDL row cap both use it).
+[[nodiscard]] inline constexpr std::size_t scanLeasesRowBytes(std::size_t keyWidth, std::size_t rowLen) noexcept {
+    return 1 + keyWidth + 4 + rowLen;
+}
+
 /// A LeaseKeepAliveResponse entry with this index answers EVERY entry of the request with its code (a request-level refusal:
 /// NotLeader, Throttled, UnknownTopic, NotAuthorized, InvalidRequest, NamespaceSuspended); it is always the only entry and
 /// final = 1. For Throttled, ttlMs is the retry-after in ms (ceil).
@@ -405,7 +411,10 @@ struct ScanLeasesResponse {
     uint64_t lastHash      = 0;
     uint8_t  done          = 0;
     uint16_t rowCount      = 0;
-    std::span<const uint8_t> rows;   // opaque encoded rows; zero-copy on decode
+    // Opaque encoded rows, each [keyLen u8][key][rowLen u32 LE][row payload]; zero-copy on decode.  There is no layout fingerprint on the
+    // wire: lease evolution is append-only and fixed-width, so every AddField grows `rowLen` and a reader detects a layout change by
+    // `rowLen` (the client's LeasesRow::decode refuses a row of a length it does not know).  Spec 8.3.
+    std::span<const uint8_t> rows;
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::ScanLeasesResponse);   // 101
     static constexpr uint16_t BODY_FIXED  = 25;   // code(2) + asOfOffset(8) + lastHash(8) + done(1) + rowCount(2) + rowsLen(4)

@@ -136,6 +136,7 @@ extern "C" {
 #include <map>
 #include <optional>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -1831,6 +1832,11 @@ public:
     }
     /// Test-only (Task 16): the topics / dropped ids the boot replay produced (immutable after start()).
     [[nodiscard]] const std::vector<TopicSpec>& bootTopicsForTest() const noexcept { return bootTopics_; }
+    /// Test-only: feed the boot replay's sink one view sink (startup thread's code path) into `out`; returns out.size().
+    std::size_t bootSinkAppliedForTest(const SinkSpec& sp, std::vector<TopicSpec>& out) { bootSinkApplied_(sp, out); return out.size(); }
+    /// Lease sinks refused for naming no lease topic (boot or live).  Written by the startup thread at boot, then by the control thread:
+    /// read it on the control thread (onControlThreadForTest) once started.
+    [[nodiscard]] uint64_t leaseSinkRefused() const noexcept { return leaseSinkRefused_; }
     [[nodiscard]] std::size_t nsDirMismatchesAtBootForTest() const noexcept { return nsDirMismatchesAtBoot_; }
     [[nodiscard]] const std::vector<int32_t>& bootDroppedIdsForTest() const noexcept { return bootDroppedIds_; }
     /// Test-only (F6): the open-file need the boot budget estimated from bootTopics_ (immutable after start()).
@@ -2553,6 +2559,8 @@ private:
     //      that name's rename succeeded: the reused name starts EMPTY.
     // -----------------------------------------------------------------------
     void onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView = false, const CatalogTopicAppliedMsg* decoded = nullptr);   // decoded: the caller's decode of a sink frame
+    void bootSinkApplied_(const SinkSpec& sp, std::vector<TopicSpec>& out);   // the boot sink's effect (fail closed on a lease view without a topic)
+    void noteLeaseSinkRefused_(int32_t viewTopicId, const char* where);
     void runCatalogCreate_(const TopicSpec& spec);
     int  serviceCreatesAwaitingSpec_();   // control thread: build a parked create once its spec reached every worker
     void postBootWriteSpecs_();           // startup thread: every booted typed topic's validators + write spec -> schemaFanout_
@@ -3046,6 +3054,8 @@ private:
     SchemaFanout                                 schemaFanout_;
     TopicDroppedFanout                           topicDroppedFanout_;   // R-M1: drop -> every worker (control thread)
     uint64_t                                     adminToControlRejects_ = 0;   // control thread only
+    uint64_t                                     leaseSinkRefused_ = 0;        // startup thread at boot, then the control thread (never concurrently)
+    std::set<int32_t>                            leaseSinkRefusedIds_;         // ... the view ids already logged critical
     uint64_t                                     sinkAppliedDrained_ = 0;      // control thread only: kA2cCatalogSinkApplied frames drained
     std::function<void(std::string_view)>        startupPhaseHookForTest_;
     HaltHandler                                  haltHandler_ = nullptr;

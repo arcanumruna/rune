@@ -892,6 +892,26 @@ TEST(ScanLeasesGatewayRegression, ScanLeasesRefusalDoneRegression) {
         ASSERT_TRUE(s.has_value());
         EXPECT_EQ(s->done, 1) << c;
     }
+    // Checkpoint C: a session below the leases client version is refused InvalidRequest with done = 1, and never reaches the worker.
+    // Mutation: drop the version gate in handleScanLeases -> the old session is served: red.
+    const std::size_t sent = g.out.size();
+    const int64_t old = g.gw.injectTestSession(0, pc::kClientVersionLeases - 1);
+    expectRefused(g.scanFrameFor(6, GwLease::kView, {}, 10, 0, true, 0, old), kInvalid, "version below leases");
+    g.settle();
+    EXPECT_EQ(g.out.size(), sent + 1) << "the old session's scan never reached the worker";
+    // A worker's NotLeader (a demoted partition) is passed through as a ScanLeasesResponse: code NotLeader, done = 1, no rows.
+    // Mutation: forward the worker's refusal with done = 0 (ClientGateway ScanLeasesResult) -> red.
+    g.r.demote();
+    const std::size_t before = g.out.size();
+    g.send(g.scanFrameFor(7, GwLease::kView, {}, 10, 0, true));
+    ASSERT_TRUE(g.waitFrames(before, 1));
+    const auto nl = pc::ScanLeasesResponse::decode(g.out.back().data(), g.out.back().size());
+    ASSERT_TRUE(nl.has_value());
+    EXPECT_EQ(nl->correlationId, 7);
+    EXPECT_EQ(nl->code, kNotLeader);
+    EXPECT_EQ(nl->done, 1);
+    EXPECT_EQ(nl->rowCount, 0);
+    EXPECT_TRUE(nl->rows.empty());
 }
 
 // Rejection cells: the lease responses encodeRejection produces, decoded.  Sizes 39 / 58 / 49 B within kMaxRejectionBytes.
@@ -969,6 +989,23 @@ WorkerReturn ttlReturn(const GwLease& g, int64_t corr, std::vector<uint8_t> chun
     w.sessionId = g.sid; w.correlationId = corr; w.errorCode = 0; w.baseOffset = 4000; w.lastOffset = 9;
     w.chunk = std::move(chunk);
     return w;
+}
+WorkerReturn scanReturn(const GwLease& g, int64_t corr, int16_t code, int32_t count, std::vector<uint8_t> chunk) {
+    WorkerReturn w;
+    w.type = WorkerReturn::Type::ScanLeasesResult;
+    w.sessionId = g.sid; w.correlationId = corr; w.errorCode = code; w.recordCount = count; w.isolation = 1;
+    w.baseOffset = 5; w.lastOffset = 0;
+    w.chunk = std::move(chunk);
+    return w;
+}
+/// One encoded scan row: [klen][key][rlen u32 LE][payload]; `klen` and `rlen` are written as given (the row may lie about them).
+std::vector<uint8_t> scanRow(uint8_t klen, std::size_t keyBytes, uint32_t rlen, std::size_t payloadBytes) {
+    std::vector<uint8_t> b;
+    b.push_back(klen);
+    b.insert(b.end(), keyBytes, 7);
+    for (int i = 0; i < 4; ++i) b.push_back(uint8_t(rlen >> (8 * i)));
+    b.insert(b.end(), payloadBytes, 9);
+    return b;
 }
 void expectWholeKa(const std::vector<uint8_t>& frame, int64_t corr, uint16_t c, uint64_t ttl = 0) {
     const auto k = asKa(frame);
@@ -1325,6 +1362,57 @@ TEST(LeaseGatewayRouteRegression, MalformedWorkerReturnRegression) {
         expectWholeKa(g.out.back(), 78, c);
     }
     EXPECT_EQ(g.gw.leaseReturnMalformed(), bad + 1) << "well-formed returns are not counted";
+
+    // ScanLeasesResult: every structural lie is a worker bug - Internal (done 1, no rows) + the counter.  Mutation: `ok = true` -> red.
+    {
+        uint64_t scanBad = g.gw.leaseReturnMalformed();
+        const auto scanMalformed = [&](WorkerReturn w, const char* what) {
+            const std::size_t b = g.out.size();
+            g.gw.handleWorkerReturnForTest(w);
+            ++scanBad;
+            ASSERT_EQ(g.out.size(), b + 1) << what;
+            const auto r = pc::ScanLeasesResponse::decode(g.out.back().data(), g.out.back().size());
+            ASSERT_TRUE(r.has_value()) << what;
+            EXPECT_EQ(r->correlationId, w.correlationId) << what;
+            EXPECT_EQ(r->code, kInternal) << what;
+            EXPECT_EQ(r->done, 1) << what;
+            EXPECT_EQ(r->rowCount, 0) << what;
+            EXPECT_TRUE(r->rows.empty()) << what;
+            EXPECT_EQ(g.gw.leaseReturnMalformed(), scanBad) << what;
+        };
+        scanMalformed(scanReturn(g, 91, 0, 1, scanRow(8, 3, 0, 0)), "klen past the end");
+        scanMalformed(scanReturn(g, 92, 0, 1, scanRow(8, 8, 100, 2)), "rlen past the end");
+        {
+            std::vector<uint8_t> two = scanRow(8, 8, 4, 4);
+            scanMalformed(scanReturn(g, 93, 0, 2, two), "row count says 2, the chunk tiles 1");
+            std::vector<uint8_t> three = scanRow(8, 8, 4, 4);
+            const std::vector<uint8_t> more = scanRow(8, 8, 4, 4);
+            three.insert(three.end(), more.begin(), more.end());
+            scanMalformed(scanReturn(g, 94, 0, 1, three), "row count says 1, the chunk tiles 2");
+        }
+        scanMalformed(scanReturn(g, 95, int16_t(kNotLeader), 1, scanRow(8, 8, 4, 4)), "a non-empty chunk with a refusal code");
+        {   // 62 rows of 1013 bytes = 62 806 > kScanLeasesMaxPageBytes (61 391): every row tiles, the page is over the cap
+            std::vector<uint8_t> big;
+            for (int i = 0; i < 62; ++i) {
+                const std::vector<uint8_t> r = scanRow(8, 8, 1000, 1000);
+                big.insert(big.end(), r.begin(), r.end());
+            }
+            ASSERT_GT(big.size(), pc::kScanLeasesMaxPageBytes);
+            scanMalformed(scanReturn(g, 96, 0, 62, std::move(big)), "chunk above kScanLeasesMaxPageBytes");
+        }
+        // control: a well-formed page (a refusal with no rows, and one row) is forwarded and not counted
+        g.gw.handleWorkerReturnForTest(scanReturn(g, 97, int16_t(kNotLeader), 0, {}));
+        auto r = pc::ScanLeasesResponse::decode(g.out.back().data(), g.out.back().size());
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->code, kNotLeader);
+        g.gw.handleWorkerReturnForTest(scanReturn(g, 98, 0, 1, scanRow(8, 8, 4, 4)));
+        r = pc::ScanLeasesResponse::decode(g.out.back().data(), g.out.back().size());
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->code, 0);
+        EXPECT_EQ(r->rowCount, 1);
+        EXPECT_EQ(g.gw.leaseReturnMalformed(), scanBad) << "well-formed scan pages are not counted";
+        bad = scanBad;
+    }
 
     // a real worker: an entry parked behind a clear is answered NotLeader when the partition is demoted
     ASSERT_TRUE(g.setup({2}));
@@ -1741,4 +1829,90 @@ TEST(LeaseGatewayRouteRegression, LegacyU64NarrowKeyRoutesToOwnerRegression) {
     const auto big = g.send(legacyViewFrame(g, 900, 0x1'0000'0001ull, g.sid));
     ASSERT_EQ(big.size(), 1u);
     EXPECT_EQ(GwLease::viewStatus(big[0]), int32_t(pc::ViewRowResponse::kInvalidRequest));
+}
+
+// ---- Checkpoint C: the ScanLeases cells of the interaction matrix ----------------------------------------------------------------
+// Every state a session or the lease view can be in, crossed with ScanLeases:
+//   foreign namespace   -> byte-identical to a never-registered id (NotAuthorized, done 1)
+//   ReadOnly suspend    -> served (a scan only reads)           RejectAll suspend -> NamespaceSuspended, done 1
+//   deleting namespace  -> UnknownTopic, done 1 (root included)  anonymous reader -> NotAuthorized, done 1
+//   the lease view dropped through the registry -> the missing-id answer (UnknownTopic for root; NotAuthorized for a reader of nothing)
+// Mutations: skip the namespace check in handleScanLeases (foreign served); drop the suspend table row for 100 (ReadOnly refused or
+// RejectAll served); drop the inDeletingNs_ gate (served); read the lease mapping after the drop (served).
+TEST(ScanLeasesGatewayRegression, ScanLeasesMatrixCellsRegression) {
+    GwLease g;
+    g.addLeaseView();
+    ASSERT_TRUE(g.setup({1}));
+    for (int i = 0; i < 400 && !g.r.leaseReady(); ++i) g.pass();
+    constexpr int32_t kNever = 78;
+    const auto decode = [](const std::vector<uint8_t>& f) {
+        const auto s = pc::ScanLeasesResponse::decode(f.data(), f.size());
+        EXPECT_TRUE(s.has_value());
+        return s.value_or(pc::ScanLeasesResponse{});
+    };
+    const auto refused = [&](const std::vector<std::vector<uint8_t>>& fr, uint16_t c, const char* what) {
+        ASSERT_EQ(fr.size(), 1u) << what;
+        const auto s = decode(fr[0]);
+        EXPECT_EQ(s.code, c) << what;
+        EXPECT_EQ(s.done, 1) << what;
+        EXPECT_EQ(s.rowCount, 0) << what;
+        EXPECT_TRUE(s.rows.empty()) << what;
+    };
+    const std::vector<rs::GrantSpec> both = {topicGrant(rs::Operation::Read), topicGrant(rs::Operation::Write)};
+
+    {   // a foreign namespace: the lease topic and its view live in namespace 2, the session in 1
+        const int64_t user = g.authedSession(both, /*nsId=*/1, /*topicNs=*/2);
+        const auto foreign = g.send(g.scanFrameFor(5, GwLease::kView, {}, 10, 0, true, 0, user));
+        const auto missing = g.send(g.scanFrameFor(5, kNever, {}, 10, 0, true, 0, user));
+        refused(foreign, kNotAuthorized, "foreign namespace");
+        ASSERT_EQ(missing.size(), 1u);
+        EXPECT_EQ(foreign[0], missing[0]) << "a foreign lease view is a missing id, byte for byte";
+    }
+    {   // suspended namespace: ReadOnly serves a scan, RejectAll refuses it
+        const int64_t user = g.authedSession(both);
+        g.gw.setSessionNsGateForTest(user, rune::catalog::NsStateTag::SuspendedReadOnly);
+        std::size_t before = g.out.size();
+        g.send(g.scanFrameFor(1, GwLease::kView, {}, 10, 0, true, 0, user));
+        ASSERT_TRUE(g.waitFrames(before, 1));
+        const auto ro = decode(g.out.back());
+        EXPECT_EQ(ro.code, 0) << "ReadOnly serves a scan";
+        EXPECT_EQ(ro.rowCount, 1);
+        g.gw.setSessionNsGateForTest(user, rune::catalog::NsStateTag::SuspendedRejectAll);
+        refused(g.send(g.scanFrameFor(2, GwLease::kView, {}, 10, 0, true, 0, user)), kSuspended, "RejectAll");
+    }
+    {   // a deleting namespace: the lease view is gone for readers, a root session included
+        const int64_t root = g.authedSession({grant(rs::Operation::Admin, rs::ResourceType::Cluster, rs::PatternKind::Exact, ""),
+                                              topicGrant(rs::Operation::Read)},
+                                             /*nsId=*/1, /*topicNs=*/2);
+        rune::catalog::NamespaceRecord rec;
+        rec.nsId = 2; rec.name = "ns2"; rec.version = 1; rec.state = rune::catalog::stateOf(rune::catalog::NsStateTag::Deleting);
+        g.gw.onNamespaceUpserted(rec);
+        refused(g.send(g.scanFrameFor(3, GwLease::kView, {}, 10, 0, true, 0, root)), kUnknownTopic, "deleting namespace");
+    }
+    {   // an anonymous reader (anonymous read on) holds no grant: NotAuthorized
+        (void)g.authedSession({topicGrant(rs::Operation::Read)});
+        g.gw.setAnonymousRead(true);
+        const int64_t anon = g.gw.injectTestSession();
+        g.gw.setSessionAuthForTest(anon, rune::gateway::AuthAwaitingFirst{INT64_MAX / 2, 0, false});
+        refused(g.send(g.scanFrameFor(4, GwLease::kView, {}, 10, 0, true, 0, anon)), kNotAuthorized, "anonymous");
+    }
+    {   // the lease view dropped through the registry: the id is a missing one (the answer equals the never-registered id's)
+        GwLease d;
+        d.addLeaseView();
+        ASSERT_TRUE(d.setup({1}));
+        for (int i = 0; i < 400 && !d.r.leaseReady(); ++i) d.pass();
+        const int64_t reader = d.authedSession({topicGrant(rs::Operation::Read)});
+        ASSERT_TRUE(d.registry->dropTopic(GwLease::kView));
+        const auto root    = d.send(d.scanFrameFor(6, GwLease::kView, {}, 10, 0, true));
+        const auto rootNev = d.send(d.scanFrameFor(6, kNever, {}, 10, 0, true));
+        refused(root, kNotAuthorized, "dropped lease view, default session");
+        ASSERT_EQ(rootNev.size(), 1u);
+        EXPECT_EQ(root[0], rootNev[0]) << "a dropped lease view answers like a missing id";
+        const auto r1 = d.send(d.scanFrameFor(7, GwLease::kView, {}, 10, 0, true, 0, reader));
+        const auto r2 = d.send(d.scanFrameFor(7, kNever, {}, 10, 0, true, 0, reader));
+        refused(r1, kNotAuthorized, "dropped lease view, reader");
+        ASSERT_EQ(r2.size(), 1u);
+        EXPECT_EQ(r1[0], r2[0]);
+        d.settle();
+    }
 }

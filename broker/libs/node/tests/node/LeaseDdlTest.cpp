@@ -18,8 +18,12 @@
 //   | lease view name                | too long / topic / view / case-fold       | LeaseViewNameRegression
 //   | rule order                     | two broken rules per row                   | RuleOrderRegression
 //   | tag exhaustion                 | user tag 0xFFFA / 0xFFFB                   | TagExhaustionRegression
+//   | row cap (one ScanLeases page)  | define / alter add, exactly fits / +1 byte | RowCapRegression
 #include <rune/catalog/CatalogEvent.h>
+#include <rune/codec/LeaseColumns.h>
 #include <rune/codec/Serialize.h>
+#include <rune/node/lease/LeaseIndex.h>
+#include <rune/protocol/client/LeaseMessages.h>
 #include <rune/protocol/LeaseSpec.h>
 #include <rune/protocol/NamespaceLimits.h>
 
@@ -673,4 +677,63 @@ TEST(LeaseDdlRegression, LeaseObjectDdlRegression) {
     EXPECT_EQ(dropInst.detail, "");
     EXPECT_EQ(topicOf(rig, "inst"), nullptr);
     EXPECT_EQ(viewOf(rig, "inst.leases"), nullptr);
+}
+
+// ── a lease topic's row must fit one ScanLeases page (define and alter add) ────
+// Mutation: `>` -> `>=` in AdminWorker's leaseRowTooBig -> the exactly-fitting row is refused: red.
+TEST(LeaseDdlRegression, RowCapRegression) {
+    constexpr std::size_t kCap = rune::protocol::client::kScanLeasesMaxPageBytes;
+    // The wire bytes of one row of {id u64 key, note string(16), pad string(padW) [, grow string(growW)]}: the production helper.
+    const auto rowBytes = [](uint16_t padW, uint16_t growW) {
+        rune::codec::DescriptorBuilder b("t", 1);
+        b.add("id", PrimType::UInt64, 1, true);
+        b.addFixedStr("note", 16);
+        b.addFixedStr("pad", padW);
+        if (growW != 0) b.addFixedStr("grow", growW);
+        rune::codec::Descriptor d = b.build();
+        EXPECT_TRUE(rune::codec::prependLeaseColumns(d));
+        return rune::node::leaseScanRowBytes(d, 8);
+    };
+    const auto blobWithPad = [](uint16_t padW) {
+        rune::codec::DescriptorBuilder b("t", 1);
+        b.add("id", PrimType::UInt64, 1, true);
+        b.addFixedStr("note", 16);
+        b.addFixedStr("pad", padW);
+        return rune::codec::serialize(b.build());
+    };
+    ASSERT_LT(rowBytes(1, 0), kCap);
+    const uint16_t fitPad = static_cast<uint16_t>(1 + (kCap - rowBytes(1, 0)));   // rowBytes steps by 1 per byte of pad
+    ASSERT_EQ(rowBytes(fitPad, 0), kCap);
+    ASSERT_EQ(rowBytes(static_cast<uint16_t>(fitPad + 1), 0), kCap + 1);
+
+    CatalogDdlRig rig("leaserowcap");
+    serve(rig);
+    DefineTopicMsg fits = leaseMsg(rig, "fits");
+    fits.blob = blobWithPad(fitPad);
+    const auto a = submit(rig, fits);
+    EXPECT_EQ(a.code, kOk) << a.detail;
+    DefineTopicMsg over = leaseMsg(rig, "over");
+    over.blob = blobWithPad(static_cast<uint16_t>(fitPad + 1));
+    const auto b = submit(rig, over);
+    EXPECT_EQ(b.code, kInvalidSchema);
+    EXPECT_EQ(b.detail, "a lease topic's row must fit one ScanLeases page");
+    EXPECT_EQ(topicOf(rig, "over"), nullptr);
+
+    // alter ... add: a topic with a 100-byte pad grows by `growFit` bytes to exactly the cap, then one byte more is refused.
+    DefineTopicMsg base = leaseMsg(rig, "grows");
+    base.blob = blobWithPad(100);
+    ASSERT_EQ(submit(rig, base).code, kOk);
+    const uint16_t growFit = static_cast<uint16_t>(1 + (kCap - rowBytes(100, 1)));
+    ASSERT_EQ(rowBytes(100, growFit), kCap);
+    ASSERT_EQ(rowBytes(100, static_cast<uint16_t>(growFit + 1)), kCap + 1);
+    const auto addOp = [&](const std::string& topic, uint16_t w) {
+        rune::codec::AlterOp op{};
+        op.type = rune::codec::AlterOpType::Add; op.name = "grow"; op.primType = PrimType::FixedStr; op.fixedLen = w;
+        return rig.alter(topic, {op});
+    };
+    const auto tooBig = addOp("grows", static_cast<uint16_t>(growFit + 1));
+    EXPECT_EQ(tooBig.code, kInvalidSchema);
+    EXPECT_EQ(tooBig.detail, "a lease topic's row must fit one ScanLeases page");
+    const auto exact = addOp("grows", growFit);
+    EXPECT_EQ(exact.code, kOk) << exact.detail;
 }

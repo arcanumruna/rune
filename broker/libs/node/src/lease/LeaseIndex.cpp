@@ -3,6 +3,7 @@
 #include <rune/protocol/BatchRebuild.h>
 #include <rune/storage/WyHash.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/LeaseMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/view/Verdict.h>
 
@@ -56,6 +57,10 @@ rune::codec::Descriptor leaseIndexOutDescriptor(const rune::codec::Descriptor& e
 
 rune::view::RowLayout leaseIndexRowLayout(const rune::codec::Descriptor& evolving) {
     return rune::view::buildRowLayout(leaseIndexOutDescriptor(evolving));
+}
+
+std::size_t leaseScanRowBytes(const rune::codec::Descriptor& evolving, std::size_t keyWidth) {
+    return rune::protocol::client::scanLeasesRowBytes(keyWidth, leaseIndexRowLayout(evolving).rowLen);
 }
 
 uint64_t leaseViewLayoutFingerprint(const rune::codec::Descriptor& outDesc, const rune::view::RowLayout& layout) {
