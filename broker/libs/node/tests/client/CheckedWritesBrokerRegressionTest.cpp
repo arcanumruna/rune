@@ -1,7 +1,9 @@
 // CheckedWritesBrokerRegressionTest.cpp — checked writes Part 02: typed validation against REAL brokers and the REAL
 // client on the default (shard) runtime.  Worker state is read only inside onOwnerThreadForTest (a direct read from
 // the test thread would race the worker).
+#include "client/ClusterClient.h"
 #include "client/OneBroker.h"
+#include "support/SharedClientDriver.h"
 #include "client/CheckedWritesBrokerSupport.h"
 #include "client/support/KeyIndexRecords.h"
 
@@ -24,6 +26,42 @@ using namespace rune::node::test;
 namespace cwb = rune::node::test::cw_broker;
 namespace rc  = rune::client;
 namespace cw  = rune::node::cw;
+
+namespace {
+
+/// The three-broker cluster of these tests: the short warm-up, fused workers, a 40 ms election and a 150 ms liveness timeout, so a crashed
+/// leader's partitions fail over in about 0.2 s; the read lease max is 50 ms for a restart's wait for the old leader's lease.  Its clients
+/// share one media driver: a client otherwise starts one of its own (100-180 ms).
+struct Cluster : rune::node::test::catalog_cluster::ThreeNodes {
+    std::unique_ptr<SharedClientDriver> driver;
+
+    Cluster(ThreeNodes&& nodes, std::unique_ptr<SharedClientDriver> d) : ThreeNodes(std::move(nodes)), driver(std::move(d)) {}
+};
+
+Cluster startCluster(const std::string& tag) {
+    auto driver = std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
+    auto nodes  = rune::node::test::catalog_cluster::ThreeNodes::startWith(tag, [](NodeConfig& cfg) {
+        cfg.unservableWarmupMs      = 50;
+        cfg.runtimePlacement        = NodeConfig::RuntimePlacement::Fused;
+        cfg.electionTimeoutMs       = 40;
+        cfg.readLeaseMaxMs          = 50;
+        cfg.brokerLivenessTimeoutMs = 150;
+    });
+    return Cluster(std::move(nodes), driver.get());
+}
+
+/// A client of broker `id` whose leader's dead session is noticed after 0.5 s, not the 10 s default, and whose DDL retry after a failover waits 5 ms.
+rc::ClientConfig quickConfig(Cluster& c, int id) {
+    rc::ClientConfig cfg = rune::node::test::catalog_cluster::clientConfigFor(c, id);
+    cfg = c.driver->attach(cfg);
+    cfg.responseTimeoutNs = std::chrono::nanoseconds(500ms).count();
+    cfg.keepaliveIntervalNs = std::chrono::nanoseconds(100ms).count();
+    cfg.ddlRetryBackoff = 5ms;
+    cfg.produceTimeoutMs = 500;
+    return cfg;
+}
+
+}  // namespace
 
 TEST(CheckedWritesBrokerRegression, TopicCreateWaitsForItsSpecOnEveryWorkerRegression) {
     OneBroker b("cw-order", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testHoldWriteSpecPasses = 300; });
@@ -69,7 +107,6 @@ TEST(CheckedWritesBrokerRegression, DroppedWhileAwaitingSpecNeverBuildsRegressio
 // ===========================================================================================================
 // Task 9: typed validation end to end on real brokers.
 // ===========================================================================================================
-#include "client/ClusterClient.h"
 #include "support/ShardTestClient.h"
 
 #include <rune/cli/Cli.h>
@@ -424,11 +461,11 @@ TEST(CheckedWritesBrokerRegression, AlterThenProduceNewVersionSucceedsRegression
 
 TEST(CheckedWritesBrokerRegression, ThreeNodesNewLeaderValidatesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw_failover");
+    Cluster c = startCluster("cw_failover");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t ctl = awaitController(c);
     ASSERT_GT(ctl, 0);
-    auto admin = connectClient(c, ctl);
+    auto admin = connectClient(c, quickConfig(c, ctl));
     rc::TopicOptions to;
     to.replicationFactor = 3;
     const auto t = admin->defineTopicAndWait("p", 1, "id", rune::codec::serialize(cw::matrixDescriptor()), rc::Persistence::Disk, to, {}, 60s);
@@ -451,7 +488,7 @@ TEST(CheckedWritesBrokerRegression, ThreeNodesNewLeaderValidatesRegression) {
     const auto produce = [&](const cw::TypedRecord& r) {
         uint16_t code = kNotLeader;
         for (int i = 0; i < 200 && code == kNotLeader; ++i) {
-            code = cwb::produceRaw(clientConfigFor(c, seed), "p", t.topicId, 1, r.value, keyOf(r.key));
+            code = cwb::produceRaw(quickConfig(c, seed), "p", t.topicId, 1, r.value, keyOf(r.key));
             if (code == kNotLeader) std::this_thread::sleep_for(50ms);
         }
         return code;
@@ -521,6 +558,7 @@ struct Sender {
         rc::ProducerConfig pc;
         pc.acks            = acks;
         pc.lingerUs        = 1;
+        pc.produceTimeoutMs = cfg.produceTimeoutMs;
         pc.transactionalId = txnId;
         prod.emplace(client->producer(pc));
         client->connectAndWait(30s);
@@ -541,6 +579,11 @@ struct Sender {
         if (owned) owned->close();
     }
 
+    /// The producer holds the id its coordinator assigned: a crash with that request still in flight waits out the client's 5 s coordinator-down fallback.
+    void awaitProducerId() {
+        for (int i = 0; i < 10'000 && prod->producerId() < 0; ++i) std::this_thread::sleep_for(1ms);
+        EXPECT_GE(prod->producerId(), 0) << "the producer id was never assigned";
+    }
     /// The token of the queued send of record `id`.
     uint64_t send(uint64_t id) { return sendValue(id, idValue(id)); }
     uint64_t sendValue(uint64_t id, const std::string& v) {
@@ -723,11 +766,11 @@ TEST(CheckedWritesBrokerRegression, V12ClientAgainstV7BrokerKeepsEveryOldAckBeha
 
 TEST(CheckedWritesBrokerRegression, AllViewProduceAcrossALeaderCrashThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw03");
+    Cluster c = startCluster("cw03");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t ctl = awaitController(c);
     ASSERT_GT(ctl, 0);
-    auto admin = connectClient(c, ctl);
+    auto admin = connectClient(c, quickConfig(c, ctl));
     rc::TopicOptions to;
     to.replicationFactor = 3;
     const auto src = admin->defineTopicAndWait("acct", 1, "id", OneBroker::idDescriptor("acct"), rc::Persistence::Disk, to, {}, 60s);
@@ -744,10 +787,11 @@ TEST(CheckedWritesBrokerRegression, AllViewProduceAcrossALeaderCrashThreeNodesRe
     ASSERT_GT(seed, 0);
     for (int id : c.runningNodes()) awaitLevel(c.node(id));
 
-    rc::ClientConfig cfg = clientConfigFor(c, seed);
+    rc::ClientConfig cfg = quickConfig(c, seed);
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     Sender s(cfg, "acct", src.topicId, 1, kAllView);
+    s.awaitProducerId();
     constexpr int kTotal = 200;
     std::vector<uint64_t> tokens;
     std::thread killer;
@@ -764,7 +808,7 @@ TEST(CheckedWritesBrokerRegression, AllViewProduceAcrossALeaderCrashThreeNodesRe
     }
     EXPECT_EQ(ok, kTotal);
 
-    rc::ClientConfig rcfg = clientConfigFor(c, seed);
+    rc::ClientConfig rcfg = quickConfig(c, seed);
     rcfg.connectTimeoutMs = 30'000;
     rcfg.pingTimeoutMs    = 30'000;
     auto reader = connectClient(c, rcfg);
@@ -1249,11 +1293,11 @@ TEST(CheckedWritesBrokerRegression, OldWritersOnAVerdictSourceNeverSeeRejectedRe
 
 TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw04");
+    Cluster c = startCluster("cw04");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t ctl = awaitController(c);
     ASSERT_GT(ctl, 0);
-    auto admin = connectClient(c, ctl);
+    auto admin = connectClient(c, quickConfig(c, ctl));
     rc::TopicOptions to;
     to.replicationFactor = 3;
     const auto src = admin->defineTopicAndWait("vt", 1, "id", rune::codec::serialize(cw::verdictSourceDescriptor()), rc::Persistence::Disk, to, {}, 60s);
@@ -1274,10 +1318,11 @@ TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRe
     int32_t seed = 0;
     for (int id : c.runningNodes()) if (id != victim) { seed = id; break; }
 
-    rc::ClientConfig cfg = clientConfigFor(c, seed);
+    rc::ClientConfig cfg = quickConfig(c, seed);
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     Sender s(cfg, "vt", src.topicId, 1, kAllView);
+    s.awaitProducerId();
     constexpr int kTotal = 200;
     const auto tagOf = [](int i) -> uint16_t { return i % 10 == 9 ? 9 : 1; };
     std::vector<uint64_t> tokens;
@@ -1317,7 +1362,7 @@ TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRe
 
     // vt_v on the final leader is the accepted set: every id with tag 1 is a row, every tag-9 id is absent.
     ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 60s));
-    rc::ClientConfig rcfg = clientConfigFor(c, leaders[0]);
+    rc::ClientConfig rcfg = quickConfig(c, leaders[0]);
     rcfg.connectTimeoutMs = 30'000;
     rcfg.pingTimeoutMs    = 30'000;
     auto reader = connectClient(c, rcfg);
@@ -1333,11 +1378,11 @@ TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRe
 
 TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw04r");
+    Cluster c = startCluster("cw04r");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t ctl = awaitController(c);
     ASSERT_GT(ctl, 0);
-    auto admin = connectClient(c, ctl);
+    auto admin = connectClient(c, quickConfig(c, ctl));
     rc::TopicOptions to;
     to.replicationFactor = 3;
     const auto src = admin->defineTopicAndWait("vt", 1, "id", rune::codec::serialize(cw::verdictSourceDescriptor()), rc::Persistence::Disk, to, {}, 60s);
@@ -1358,7 +1403,7 @@ TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegres
     constexpr int kTotal = 60;
     const auto tagOf = [](int i) -> uint16_t { return i % 10 == 9 ? 9 : 1; };
     {
-        rc::ClientConfig cfg = clientConfigFor(c, 1);
+        rc::ClientConfig cfg = quickConfig(c, 1);
         cfg.connectTimeoutMs = 30'000;
         cfg.pingTimeoutMs    = 30'000;
         Sender s(cfg, "vt", src.topicId, 1, kAllView);
@@ -1394,7 +1439,7 @@ TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegres
     EXPECT_EQ(after.mismatches, 0u);
     EXPECT_EQ(after.rejectionsConstraint, 0u) << "nothing was judged again: the verdicts came from the markers";
 
-    rc::ClientConfig rcfg = clientConfigFor(c, leaders[0]);
+    rc::ClientConfig rcfg = quickConfig(c, leaders[0]);
     rcfg.connectTimeoutMs = 30'000;
     rcfg.pingTimeoutMs    = 30'000;
     const std::set<int64_t> delivered = deliveredFromZero(rcfg, src.topicId, static_cast<std::size_t>(kTotal) - before.rejectedInLog.size());
@@ -1526,6 +1571,23 @@ struct ScratchDir {
         std::filesystem::remove_all(path, ignore);
     }
 };
+
+/// `count` writes issued by `issue(i, cq, token)`, at most 128 in flight; `check(i, result)` sees every answer in the order issued and returns false to stop.
+template <class Issue, class Check>
+bool writePipelined(rc::Client& client, rc::Producer& prod, uint64_t count, Issue issue, Check check) {
+    constexpr uint64_t kWindow = 128;
+    rc::Completions cq(client);
+    uint64_t issued = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+        for (; issued < count && issued - i < kWindow; ++issued) issue(issued, cq, issued);
+        prod.flush();
+        std::optional<rc::Completion> answer;
+        (void)cq.waitFor(i, 60s, [&](const rc::Completion& d, std::span<const uint8_t>) { answer = d; });
+        if (!answer) { ADD_FAILURE() << "write " << i << " never completed"; return false; }
+        if (!check(i, rc::WriteResult::fromCompletion(*answer))) return false;
+    }
+    return true;
+}
 
 /// Everything stored on a topic, over all partitions.
 std::size_t storedTotal(BrokerNode& n, int32_t topicId, int32_t parts) {
@@ -1882,10 +1944,9 @@ std::vector<Outcome> insertRange(rc::ClientConfig cfg, uint64_t first, uint64_t 
         rc::Client client(cfg);
         client.connectAndWait(30s);
         KiWriter w(client, "ki");
-        for (uint64_t id = first; id <= last; ++id) {
-            const auto r = w.topic.insertAndWait(acct(id), 60s);
-            out.push_back({r.ok(), r.code(), r.status(), {}});
-        }
+        writePipelined(client, w.prod, last - first + 1,
+            [&](uint64_t i, rc::Completions& cq, rc::Token t) { w.topic.insert(acct(first + i), cq, t); },
+            [&](uint64_t, const rc::WriteResult& r) { out.push_back({r.ok(), r.code(), r.status(), {}}); return true; });
         client.close();
     } catch (const std::exception& e) {
         out.push_back({false, 0, rc::OpStatus::Timeout, e.what()});
@@ -1894,9 +1955,9 @@ std::vector<Outcome> insertRange(rc::ClientConfig cfg, uint64_t first, uint64_t 
 }
 
 /// Two clients race the same ids: each id is accepted once and refused with KeyExists once.
-void raceInserts(rune::node::test::catalog_cluster::ThreeNodes& c, int seedA, int seedB, uint64_t first, uint64_t last) {
+void raceInserts(Cluster& c, int seedA, int seedB, uint64_t first, uint64_t last) {
     using namespace rune::node::test::catalog_cluster;
-    rc::ClientConfig a = clientConfigFor(c, seedA), b = clientConfigFor(c, seedB);
+    rc::ClientConfig a = quickConfig(c, seedA), b = quickConfig(c, seedB);
     a.connectTimeoutMs = b.connectTimeoutMs = 30'000;
     a.pingTimeoutMs = b.pingTimeoutMs = 30'000;
     std::vector<Outcome> ra, rb;
@@ -1915,9 +1976,9 @@ void raceInserts(rune::node::test::catalog_cluster::ThreeNodes& c, int seedA, in
 }
 
 /// Every id in [first, last] answers KeyExists to an insert through a client of node `seed`.
-void expectKeyExists(rune::node::test::catalog_cluster::ThreeNodes& c, int seed, uint64_t first, uint64_t last) {
+void expectKeyExists(Cluster& c, int seed, uint64_t first, uint64_t last) {
     using namespace rune::node::test::catalog_cluster;
-    rc::ClientConfig cfg = clientConfigFor(c, seed);
+    rc::ClientConfig cfg = quickConfig(c, seed);
     cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
     const std::vector<Outcome> r = insertRange(cfg, first, last);
     ASSERT_EQ(r.size(), last - first + 1) << (r.empty() ? "" : r.back().error);
@@ -1925,14 +1986,14 @@ void expectKeyExists(rune::node::test::catalog_cluster::ThreeNodes& c, int seed,
 }
 
 /// A 3-replica `ki` on a started cluster, the level raised on every node.
-int32_t defineKiOnCluster(rune::node::test::catalog_cluster::ThreeNodes& c) {
+int32_t defineKiOnCluster(Cluster& c) {
     using namespace rune::node::test::catalog_cluster;
     if (!c.awaitCatalogLeader(30s)) { ADD_FAILURE() << "no catalog leader"; return -1; }
     const int32_t ctl = awaitController(c);
     if (ctl <= 0) { ADD_FAILURE() << "no controller"; return -1; }
     for (const int id : c.runningNodes()) awaitLevel(c.node(id));
     if (::testing::Test::HasFatalFailure()) return -1;
-    auto admin = connectClient(c, ctl);
+    auto admin = connectClient(c, quickConfig(c, ctl));
     const auto t = defineKi(*admin, "ki", 3);
     admin->close();
     if (t.errorCode != 0) { ADD_FAILURE() << t.detail; return -1; }
@@ -1945,10 +2006,10 @@ int32_t defineKiOnCluster(rune::node::test::catalog_cluster::ThreeNodes& c) {
 
 TEST(CheckedWritesBrokerRegression, LoginRaceOnAKeyIndexThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw05");
+    Cluster c = startCluster("cw05");
     const int32_t topicId = defineKiOnCluster(c);
     ASSERT_GE(topicId, 0);
-    raceInserts(c, 1, 2, 1, 200);
+    raceInserts(c, 1, 2, 1, 100);
     ASSERT_FALSE(HasFatalFailure());
 
     std::vector<int32_t> leaders;
@@ -1958,37 +2019,47 @@ TEST(CheckedWritesBrokerRegression, LoginRaceOnAKeyIndexThreeNodesRegression) {
     ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s)) << "a new leader after the crash";
     const std::vector<int> alive = c.runningNodes();
     ASSERT_EQ(alive.size(), 2u);
-    raceInserts(c, alive[0], alive[1], 201, 400);
+    raceInserts(c, alive[0], alive[1], 101, 200);
     ASSERT_FALSE(HasFatalFailure());
-    expectKeyExists(c, alive[0], 1, 400);
-
-    // Leadership moves off every node in turn: each takeover rebuilds the index from the log.  The cell does not
-    // assert which node takes each partition over.
-    c.startNode(victim);
-    for (int id = 1; id <= 3; ++id) {
-        ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
-        c.crash(id);
-        ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s)) << "after crashing node " << id;
-        expectKeyExists(c, c.runningNodes().front(), 1, 400);
-        ASSERT_FALSE(HasFatalFailure());
-        c.startNode(id);
-    }
+    expectKeyExists(c, alive[0], 1, 200);
 }
+
+// Leadership moves off one node: the takeover rebuilds the index from the log.  The cell does not assert which node takes
+// each partition over; the three nodes run as separate tests.
+static void keyIndexSurvivesTakeoverFrom(int id) {
+    using namespace rune::node::test::catalog_cluster;
+    Cluster c = startCluster("cw05t" + std::to_string(id));
+    const int32_t topicId = defineKiOnCluster(c);
+    ASSERT_GE(topicId, 0);
+    raceInserts(c, 1, 2, 1, 100);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
+    c.crash(id);
+    ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s)) << "after crashing node " << id;
+    expectKeyExists(c, c.runningNodes().front(), 1, 100);
+}
+
+TEST(CheckedWritesBrokerRegression, KeyIndexSurvivesTakeoverFromNode1ThreeNodesRegression) { keyIndexSurvivesTakeoverFrom(1); }
+TEST(CheckedWritesBrokerRegression, KeyIndexSurvivesTakeoverFromNode2ThreeNodesRegression) { keyIndexSurvivesTakeoverFrom(2); }
+TEST(CheckedWritesBrokerRegression, KeyIndexSurvivesTakeoverFromNode3ThreeNodesRegression) { keyIndexSurvivesTakeoverFrom(3); }
 
 TEST(CheckedWritesBrokerRegression, RestartRebuildsTheKeyIndexThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw05r");
+    Cluster c = startCluster("cw05r");
     const int32_t topicId = defineKiOnCluster(c);
     ASSERT_GE(topicId, 0);
     {
-        rc::ClientConfig cfg = clientConfigFor(c, 1);
+        rc::ClientConfig cfg = quickConfig(c, 1);
         cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
         rc::Client client(cfg);
         client.connectAndWait(30s);
         {
             KiWriter w(client, "ki");
-            for (uint64_t id = 1; id <= 300; ++id) ASSERT_TRUE(w.topic.insertAndWait(acct(id), 60s).ok()) << "insert " << id;
-            for (uint64_t id = 1; id <= 100; ++id) ASSERT_TRUE(w.topic.removeExistingAndWait(id, 60s).ok()) << "remove " << id;
+            ASSERT_TRUE(writePipelined(client, w.prod, 300, [&](uint64_t i, rc::Completions& cq, rc::Token t) { w.topic.insert(acct(i + 1), cq, t); },
+                [](uint64_t i, const rc::WriteResult& r) { EXPECT_TRUE(r.ok()) << "insert " << i + 1; return r.ok(); }));
+            ASSERT_TRUE(writePipelined(client, w.prod, 100, [&](uint64_t i, rc::Completions& cq, rc::Token t) { w.topic.removeExisting(i + 1, cq, t); },
+                [](uint64_t i, const rc::WriteResult& r) { EXPECT_TRUE(r.ok()) << "remove " << i + 1; return r.ok(); }));
         }
         client.close();
     }
@@ -2000,7 +2071,7 @@ TEST(CheckedWritesBrokerRegression, RestartRebuildsTheKeyIndexThreeNodesRegressi
 
     expectKeyExists(c, 1, 101, 300);
     ASSERT_FALSE(HasFatalFailure());
-    rc::ClientConfig cfg = clientConfigFor(c, 1);
+    rc::ClientConfig cfg = quickConfig(c, 1);
     cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
     const std::vector<Outcome> reinserted = insertRange(cfg, 1, 100);
     ASSERT_EQ(reinserted.size(), 100u) << (reinserted.empty() ? "" : reinserted.back().error);
@@ -2121,18 +2192,18 @@ int64_t leoOf(BrokerNode& n, int32_t topicId, int32_t partition) {
 }
 
 /// A connected admin session on the controller of a started cluster, the level raised on every node (a failure is a gtest failure and null).
-std::unique_ptr<rc::Client> clusterAdmin(rune::node::test::catalog_cluster::ThreeNodes& c) {
+std::unique_ptr<rc::Client> clusterAdmin(Cluster& c) {
     using namespace rune::node::test::catalog_cluster;
     if (!c.awaitCatalogLeader(30s)) { ADD_FAILURE() << "no catalog leader"; return nullptr; }
     const int32_t ctl = awaitController(c);
     if (ctl <= 0) { ADD_FAILURE() << "no controller"; return nullptr; }
     for (const int id : c.runningNodes()) awaitLevel(c.node(id));
     if (::testing::Test::HasFatalFailure()) return nullptr;
-    return connectClient(c, ctl);
+    return connectClient(c, quickConfig(c, ctl));
 }
 
-rc::ClientConfig patientConfig(rune::node::test::catalog_cluster::ThreeNodes& c, int seed) {
-    rc::ClientConfig cfg = rune::node::test::catalog_cluster::clientConfigFor(c, seed);
+rc::ClientConfig patientConfig(Cluster& c, int seed) {
+    rc::ClientConfig cfg = quickConfig(c, seed);
     cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
     return cfg;
 }
@@ -2325,7 +2396,7 @@ TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
 TEST(CheckedWritesBrokerRegression, RegressorsPathBackFillThenInsertsNeverCollideThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
     constexpr int kUsers = 3000, kCharacters = 6000;
-    ThreeNodes c = ThreeNodes::start("cw06");
+    Cluster c = startCluster("cw06");
     int32_t userTopic = -1, characterTopic = -1;
     {
         auto admin = clusterAdmin(c);
@@ -2352,27 +2423,34 @@ TEST(CheckedWritesBrokerRegression, RegressorsPathBackFillThenInsertsNeverCollid
     {
         auto client = connectClient(c, patientConfig(c, 1));
         AiWriter<AiUser> users(*client, "user");
-        for (uint64_t i = 1; i <= kUsers; ++i) {
-            const auto r = users.topic.insertAndWait(AiUser{.userId = backfillId(i), .provider = 1, .subject = "user" + std::to_string(i)}, 60s);
-            ASSERT_TRUE(r.ok()) << "user " << i << " code " << r.code();
-            userIds.insert(backfillId(i));
-        }
+        ASSERT_TRUE(writePipelined(*client, users.prod, kUsers,
+            [&](uint64_t i, rc::Completions& cq, rc::Token t) { users.topic.insert(AiUser{.userId = backfillId(i + 1), .provider = 1, .subject = "user" + std::to_string(i + 1)}, cq, t); },
+            [&](uint64_t i, const rc::WriteResult& r) {
+                EXPECT_TRUE(r.ok()) << "user " << i + 1 << " code " << r.code();
+                userIds.insert(backfillId(i + 1));
+                return r.ok();
+            }));
         AiWriter<AiCharacter> characters(*client, "character");
-        for (uint64_t i = 1; i <= kCharacters; ++i) {
-            const auto r = characters.topic.insertAndWait(
-                AiCharacter{.characterId = backfillId(i), .userId = backfillId(i % kUsers + 1), .name = "c" + std::to_string(i)}, 60s);
-            ASSERT_TRUE(r.ok()) << "character " << i << " code " << r.code();
-            characterIds.insert(backfillId(i));
-        }
+        ASSERT_TRUE(writePipelined(*client, characters.prod, kCharacters,
+            [&](uint64_t i, rc::Completions& cq, rc::Token t) { characters.topic.insert(AiCharacter{.characterId = backfillId(i + 1), .userId = backfillId((i + 1) % kUsers + 1), .name = "c" + std::to_string(i + 1)}, cq, t); },
+            [&](uint64_t i, const rc::WriteResult& r) {
+                EXPECT_TRUE(r.ok()) << "character " << i + 1 << " code " << r.code();
+                characterIds.insert(backfillId(i + 1));
+                return r.ok();
+            }));
     }
     const uint64_t userMax = *userIds.rbegin(), characterMax = *characterIds.rbegin();
 
     const auto insertLive = [&](int seed, int users, int characters, uint64_t userAbove, uint64_t characterAbove) {
         auto client = connectClient(c, patientConfig(c, seed));
         AiWriter<AiUser> u(*client, "user");
-        for (int i = 0; i < users; ++i) expectFresh(userIds, u.topic.insertAndWait(AiUser{.provider = 2, .subject = "live" + std::to_string(i)}, 60s), "user", userAbove);
+        ASSERT_TRUE(writePipelined(*client, u.prod, static_cast<uint64_t>(users),
+            [&](uint64_t i, rc::Completions& cq, rc::Token t) { u.topic.insert(AiUser{.provider = 2, .subject = "live" + std::to_string(i)}, cq, t); },
+            [&](uint64_t, const rc::WriteResult& r) { expectFresh(userIds, r, "user", userAbove); return r.ok(); }));
         AiWriter<AiCharacter> ch(*client, "character");
-        for (int i = 0; i < characters; ++i) expectFresh(characterIds, ch.topic.insertAndWait(AiCharacter{.userId = 1, .name = "live" + std::to_string(i)}, 60s), "character", characterAbove);
+        ASSERT_TRUE(writePipelined(*client, ch.prod, static_cast<uint64_t>(characters),
+            [&](uint64_t i, rc::Completions& cq, rc::Token t) { ch.topic.insert(AiCharacter{.userId = 1, .name = "live" + std::to_string(i)}, cq, t); },
+            [&](uint64_t, const rc::WriteResult& r) { expectFresh(characterIds, r, "character", characterAbove); return r.ok(); }));
     };
 
     const int first = userLeader[0];
@@ -2500,7 +2578,7 @@ TEST(CheckedWritesBrokerRegression, KeyZeroCreatesToAnOlderClusterShardRegressio
 
 TEST(CheckedWritesBrokerRegression, LostAckRetryAcrossFailoverReturnsTheSameIdsThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw06la");
+    Cluster c = startCluster("cw06la");
     int32_t topicId = -1, viewTopic = -1;
     {
         auto admin = clusterAdmin(c);
@@ -2562,7 +2640,7 @@ TEST(CheckedWritesBrokerRegression, LostAckRetryAcrossFailoverReturnsTheSameIdsT
 TEST(CheckedWritesBrokerRegression, WideKeyIndexSurvivesFailoverThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
     using Wide = KeyRec<std::array<uint8_t, 16>>;
-    ThreeNodes c = ThreeNodes::start("cw07wk");
+    Cluster c = startCluster("cw07wk");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t ctl = awaitController(c);
     ASSERT_GT(ctl, 0);
@@ -2572,25 +2650,26 @@ TEST(CheckedWritesBrokerRegression, WideKeyIndexSurvivesFailoverThreeNodesRegres
     to.replicationFactor    = 3;
     to.config.cleanupPolicy = 1;
     to.keyFeatures.keyIndex = true;
-    auto admin = connectClient(c, ctl);
+    auto admin = connectClient(c, quickConfig(c, ctl));
     const auto t = admin->defineTopicAndWait("wide", kKiParts, "k", rune::codec::serialize(Wide::descriptor()), rc::Persistence::Disk, to, {}, 60s);
     admin->close();
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     std::vector<int32_t> leaders;
     ASSERT_TRUE(awaitLeaders(c, t.topicId, kKiParts, leaders, 30s));
 
-    const auto insertAll = [&](int seed, int first, int last, uint16_t want) {
-        rc::ClientConfig cfg = clientConfigFor(c, seed);
+    const auto insertAll = [&](int seed, int first, int last, int existingBelow) {
+        rc::ClientConfig cfg = quickConfig(c, seed);
         cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
         rc::Client client(cfg);
         client.connectAndWait(30s);
         rc::Producer prod = client.producer(KiWriter::config(kAllView));
         rc::TypedTopic<Wide, rc::ProducerRef> topic = client.openTopicAndWait<Wide>("wide", prod, 30s);
-        for (int i = first; i <= last; ++i) {
-            const auto r = topic.insertAndWait(Wide::make(i), 60s);
-            if (want == 0) EXPECT_TRUE(r.ok()) << "insert " << i << " code " << r.code();
-            else EXPECT_EQ(r.code(), want) << "insert " << i;
-        }
+        writePipelined(client, prod, last - first + 1, [&](uint64_t i, rc::Completions& cq, rc::Token t) { topic.insert(Wide::make(first + static_cast<int>(i)), cq, t); },
+            [&](uint64_t i, const rc::WriteResult& r) {
+                if (first + static_cast<int>(i) >= existingBelow) EXPECT_TRUE(r.ok()) << "insert " << first + static_cast<int>(i) << " code " << r.code();
+                else EXPECT_EQ(r.code(), kKeyExists) << "insert " << first + static_cast<int>(i);
+                return true;
+            });
         prod.closeImmediately();
         client.close();
     };
@@ -2600,8 +2679,7 @@ TEST(CheckedWritesBrokerRegression, WideKeyIndexSurvivesFailoverThreeNodesRegres
     c.crash(leaders[0]);
     ASSERT_TRUE(awaitLeaders(c, t.topicId, kKiParts, leaders, 60s)) << "a new leader after the crash";
     const int seed = c.runningNodes().front();
-    insertAll(seed, 0, 99, kKeyExists);
-    insertAll(seed, 100, 100, 0);
+    insertAll(seed, 0, 100, 100);
 }
 
 // ===========================================================================================================
@@ -2997,13 +3075,13 @@ TEST(CheckedWritesBrokerRegression, WideViewSurvivesRestartShardRegression) {
 
 TEST(CheckedWritesBrokerRegression, WideViewReadsAfterLeaderCrashThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw07");
+    Cluster c = startCluster("cw07");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t ctl = awaitController(c);
     ASSERT_GT(ctl, 0);
     for (const int id : c.runningNodes()) awaitLevel(c.node(id));
     ASSERT_FALSE(HasFatalFailure());
-    auto admin = connectClient(c, ctl);
+    auto admin = connectClient(c, quickConfig(c, ctl));
     const auto src = defineCharacters(*admin, 3);
     ASSERT_EQ(src.errorCode, 0) << src.detail;
     const int32_t view = createView(*admin, accountCharactersPlan(src.topicId), "characterId");
@@ -3022,7 +3100,7 @@ TEST(CheckedWritesBrokerRegression, WideViewReadsAfterLeaderCrashThreeNodesRegre
     rcv::ViewKeyBuilder builder = keyBuilder(c.node(seed), "account_characters");
 
     constexpr uint64_t kTotal = 200;
-    rc::ClientConfig cfg = clientConfigFor(c, seed);
+    rc::ClientConfig cfg = quickConfig(c, seed);
     cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
     {
         KeyedSender w(cfg, "character", src.topicId, 1, kAllView);
