@@ -357,6 +357,7 @@ TEST(LeaseWatchHandoffRegression, ScanPlusSubscriptionEqualsFreshFoldSeededRegre
         EXPECT_EQ(rec.held, actualLive(w)) << "the event stream folds to the live set";
         EXPECT_EQ(rec.bad, 0);
         EXPECT_EQ(rec.readies, 1);
+        EXPECT_EQ(rec.count(Kind::Vanished), 0) << "no break: a record older than its page's asOf is never replayed over the page";
     }
 }
 
