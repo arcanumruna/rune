@@ -646,11 +646,28 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
 // False: the index refused it and the judge stalled.
 bool VerdictSource::recordRejection_(int64_t offset, const Verdict& v) noexcept {
     if (!state_->rejected.add(offset, v.code, v.constraintId)) {
+        stallRoom_ = 1;
         stall_(state_->rejected.size() >= state_->rejected.capacity() ? StallReason::Full : StallReason::OutOfOrder);
         return false;
     }
     countRejection_(v);
     return true;
+}
+
+// False: n entries do not fit.  The worker grows the index (to the ceiling at most) and the judge retries once retention leaves room;
+// only a rejection larger than the ceiling itself stalls for good.
+bool VerdictSource::indexHasRoom_(std::size_t n) noexcept {
+    const std::size_t need = state_->rejected.size() + n;
+    if (need <= state_->rejected.capacity()) return true;
+    stallRoom_ = n;
+    if (n > state_->rejectedMax) {
+        stall_(StallReason::Capacity);
+        return false;
+    }
+    state_->growNeed = std::min(need, state_->rejectedMax);
+    state_->growOwed = true;
+    stall_(StallReason::Full);
+    return false;
 }
 
 void VerdictSource::countRejection_(const Verdict& v) noexcept {
@@ -801,10 +818,7 @@ bool VerdictSource::judgeAtomic_(const rune::protocol::RecordBatchReader& r, con
         return false;
     }
     if (step == ChainStep::Failed) {
-        if (state_->rejected.size() + static_cast<std::size_t>(r.lastOffsetDelta()) + 1 > state_->rejected.capacity()) {
-            stall_(StallReason::Full);
-            return false;
-        }
+        if (!indexHasRoom_(static_cast<std::size_t>(r.lastOffsetDelta()) + 1)) return false;
         bool ok = true;
         (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& span) {
             if (!ok) return;

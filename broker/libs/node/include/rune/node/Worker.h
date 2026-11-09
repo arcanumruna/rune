@@ -1840,6 +1840,7 @@ public:
     [[nodiscard]] uint64_t hookRefusalsForTest(HookRefusal why) const noexcept { return hookRefusals_[std::to_underlying(why)]; }
     /// The facts of the last write that reached the write hook.
     [[nodiscard]] WriteFacts lastWriteFactsForTest() const noexcept { return lastWriteFacts_; }
+    [[nodiscard]] static bool txnJudgedForTest(const PartitionWriteState& ws, bool intent, int64_t first) noexcept { return txnJudged_(ws, intent, first); }
     /// Part 06: an autoincrement partition's counters (nullptr: not owned or untyped).
     [[nodiscard]] const AutoIncStats* autoIncStatsForTest(int32_t topicId, int32_t partition) const noexcept {
         const PartitionWriteState* w = writeStateForTest(topicId, partition);
@@ -7696,12 +7697,9 @@ private:
             sl.verdictEndPublished = end;
         }
     }
-    // Part 04 (P4-11): a verdict index that crosses 75 % doubles, up to 2^24 entries; cold.  A judge stalled on a full index resumes.
+    // Part 04 (P4-11): a verdict index that crosses 75 % doubles, up to 2^24 entries; cold.  A whole-batch rejection that does not fit grows it to fit.  A judge stalled on a full index resumes.
     static void growVerdictIndex_(PartitionWriteState& w) {
-        auto& idx = w.rejected;
-        w.growOwed = false;
-        if (idx.capacity() != 0 && idx.size() * 4 >= idx.capacity() * 3 && idx.capacity() < (std::size_t{1} << 24))
-            idx.grow(std::min<std::size_t>(idx.capacity() * 2, std::size_t{1} << 24));
+        w.growRejected();
         if (w.verdicts != nullptr) w.verdicts->unstall();
     }
     void maintainVerdictIndexes_() {
@@ -7896,6 +7894,12 @@ private:
         if (parked) --parkedVotes_;
         enqueueReturn_(voteReturn_(ws.spec->topicId, ws.partition, v, err, a, judgeOffset));
     }
+    // P11-1 / P11-7: the judge judges the transaction whole, at its vote or its marker: its first record's set or the source is constrained,
+    // or a record carries an intent.  The produce bound uses the same predicate.
+    [[nodiscard]] static bool txnJudged_(const PartitionWriteState& ws, bool intent, int64_t first) noexcept {
+        const ConstraintSet* set = first >= 0 ? ws.constraintSets.setAt(first) : nullptr;
+        return ws.isVerdictSource() && (intent || ws.isConstrainedSource() || (set != nullptr && constrainedSet_(*set)));
+    }
     [[nodiscard]] static bool constrainedSet_(const ConstraintSet& s) noexcept {
         return std::any_of(s.members.begin(), s.members.begin() + s.count, [](const ConstraintSetMember& m) {
             return m.kind == rune::view::VerdictViewKind::Unique || m.kind == rune::view::VerdictViewKind::Check ||
@@ -8000,8 +8004,7 @@ private:
             if (pos == 0) return false;   // nothing whole was read: the next pass reads again
             budget -= std::min(budget, pos);
         }
-        const ConstraintSet* set = ws.constraintSets.setAt(s.first);
-        if (!(s.intent || ws.isConstrainedSource() || (set != nullptr && constrainedSet_(*set)))) {   // P11-1: does not vote
+        if (!txnJudged_(ws, s.intent, s.first)) {   // P11-1: does not vote
             ++ws.txn.stats.votesYes;
             answerAll(0, {});
             return true;
@@ -10378,9 +10381,12 @@ private:
         // validated these exact bytes (the gateway, right after ensureValid).
         const bool crcPreverified = f.fromOp && f.crcValidated;
         rune::storage::ProduceOutcome outcome;
+        bool batchIntent = false;
         if (ws != nullptr) [[unlikely]] {
             const WriteFacts facts{.acks = acks, .idempotent = f.producerId >= 0, .transactional = txn, .atomicBatch = !txn && (batchAttrs & rune::protocol::batch::kAttrAtomic) != 0,
-                                   .importGranted = f.importGranted, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_(), .txnJudgedRecordsMax = txnJudgedRecordsMax_};
+                                   .importGranted = f.importGranted, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_(), .txnJudgedRecordsMax = txnJudgedRecordsMax_,
+                                   .txnRecords = txn && rc != nullptr ? rc->tracker().recordsOf(f.producerId) : 0,
+                                   .txnJudged = txn && rc != nullptr && txnJudged_(*ws, rc->tracker().hasIntent(f.producerId), rc->tracker().firstOffsetOf(f.producerId))};
             lastWriteFacts_ = facts;
             CheckedWriteHook hook(*ws, facts, ws->spec->autoIncrement ? std::span<uint8_t>(autoIncScratch_) : std::span<uint8_t>{});
             if (log != nullptr) {
@@ -10397,6 +10403,7 @@ private:
                 if (outcome.logFull) [[unlikely]] noteTransientFull_(f.topicId, f.partition, outcome.error);
             }
             if (hook.checked()) ++hookChecks_;
+            batchIntent = hook.anyIntent();
             if (hook.refusal() != HookRefusal::None) [[unlikely]] noteHookRefusal_(hook.refusal(), f);
             if (!outcome.isOK()) [[unlikely]] hook.onProduceFailed();
             if (hook.assignedBase() != 0 && ws->assignedBases.wantsGrowth()) [[unlikely]] autoIncGrowDue_ = true;   // P6-8: grown next pass
@@ -10482,7 +10489,7 @@ private:
         // F15 §2.1 (C1): RC update in the same invocation as the append; a
         // duplicate retry was registered with its original.
         if (rc != nullptr && !outcome.isDuplicate && (outcome.batchAttrs & kTxnAttrBit) != 0) [[unlikely]] {
-            rc->onTxnBatch(f.producerId, outcome.baseOffset);
+            rc->onTxnBatch(f.producerId, outcome.baseOffset, rune::protocol::RecordBatchReader(rbSpan.data(), rbSpan.size()).recordCount(), batchIntent);
             if (replica) publishCleanerLso_(replica, *rc);   // D3b: an open txn caps the cleaner
         }
 

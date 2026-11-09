@@ -290,7 +290,7 @@ public:
     [[nodiscard]] bool stalled() const noexcept { return stalled_; }
     /// Cold, the owner after growing the index: resumes a judge that stalled on a full index.  The other stalls stay.
     void unstall() noexcept {
-        if (stallReason_ == StallReason::Full && state_ != nullptr && state_->rejected.size() < state_->rejected.capacity()) stalled_ = false;
+        if (stallReason_ == StallReason::Full && state_ != nullptr && state_->rejected.size() + stallRoom_ <= state_->rejected.capacity()) stalled_ = false;
     }
     [[nodiscard]] bool waitingForInstall() const noexcept { return waitingForInstall_; }
     /// While waitingForInstall(): the member whose view is not installed.
@@ -468,6 +468,7 @@ private:
     void   countVote_(const TxnVoteAnswer& a) noexcept;
     [[nodiscard]] bool recordRejection_(int64_t offset, const rune::view::Verdict& v) noexcept;
     void   countRejection_(const rune::view::Verdict& v) noexcept;
+    [[nodiscard]] bool indexHasRoom_(std::size_t n) noexcept;
     [[nodiscard]] rune::view::SourceRecord recordOf_(const rune::protocol::RecordSpan& span) noexcept;
     int    emitMarkers_(PartitionWriteState& state, int64_t nowNs);
     int    pushCheckpoints_(PartitionWriteState& state);
@@ -512,6 +513,7 @@ private:
     bool                        needsActivation_ = false;
     bool                        stalled_ = false, waitingForInstall_ = false, held_ = false;
     StallReason                 stallReason_ = StallReason::None;
+    std::size_t                 stallRoom_ = 1;   ///< the index entries the stalled rejection waits for
     ConstraintSetMember         waitingFor_;
     int64_t                     judgeCursor_ = 0, emitFrom_ = 0, setFrom_ = 0;
     int64_t                     checkpointCap_ = INT64_MAX;
@@ -1099,10 +1101,7 @@ bool VerdictSource::rejectTxnRecords_(ReadRangeFn& readRange, int64_t producerId
     };
     std::size_t n = 0;
     if (!each([&](const rune::protocol::RecordSpan&) { ++n; })) return false;
-    if (state_->rejected.size() + n > state_->rejected.capacity()) {
-        stall_(StallReason::Full);
-        return false;
-    }
+    if (!indexHasRoom_(n)) return false;
     std::array<int64_t, 256> run{};
     std::size_t used = 0;
     const auto flush = [&] {

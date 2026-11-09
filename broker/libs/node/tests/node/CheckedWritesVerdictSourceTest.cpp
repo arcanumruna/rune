@@ -482,7 +482,7 @@ TEST(CheckedWritesControlRecordRegression, EveryLogReaderSkipsTypes16To20Regress
     for (const auto& lookalike : {txnFramedLookalike(-1, 0), txnFramedLookalike(5, cr::kVerdictMarker), txnFramedLookalike(-1, cr::kTxnJudge), txnFramedLookalike(-1, cr::kVerdictPlan)}) {
         tx::LsoTracker tracker(8);
         tx::AbortedTxnIndex aborted;
-        tx::RcBuilder builder(&tracker, &aborted);
+        tx::RcBuilder builder(&tracker, &aborted, false);
         EXPECT_EQ(builder.step(lookalike.data(), lookalike.size()).outcome, tx::RcBuilder::Outcome::Ignored);
         tx::ControlMarkerPayload payload{};
         EXPECT_FALSE(tx::ControlMarker::extract(lookalike.data(), 0, payload, lookalike.size()));
@@ -494,7 +494,7 @@ TEST(CheckedWritesControlRecordRegression, EveryLogReaderSkipsTypes16To20Regress
         {   // (1) RcBuilder::step
             tx::LsoTracker tracker(8);
             tx::AbortedTxnIndex aborted;
-            tx::RcBuilder builder(&tracker, &aborted);
+            tx::RcBuilder builder(&tracker, &aborted, false);
             const auto res = builder.step(ctl.data(), ctl.size());
             EXPECT_EQ(res.outcome, tx::RcBuilder::Outcome::Ignored);
             EXPECT_EQ(tracker.lso(100), 100);

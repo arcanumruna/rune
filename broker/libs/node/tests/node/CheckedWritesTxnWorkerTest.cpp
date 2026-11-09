@@ -1188,3 +1188,134 @@ TEST(CheckedWritesTxnWorker, NoVoteBurnsTheTransactionsIds) {
     }
     EXPECT_TRUE(nextDelivered) << "delivery passed the aborted transaction";
 }
+
+// P11-7 bound: on a constrained source the batch that takes an open transaction past txnJudgedRecordsMax is refused with TxnTooLarge
+// (the vote's own answer) and never reaches the log; one landing exactly on the knob is admitted, each producer counts alone, and a
+// source with nothing to reject is unaffected.
+TEST(CheckedWritesTxnWorkerRegression, TransactionPastTheKnobIsRefusedOnAConstrainedSourceRegression) {
+    VerdictRig r;
+    r.createCharacterTopic();
+    r.enableAcks();
+    r.passes(20);
+    r.createConstrainedView(ConstrainedView::AccountStats, 12);
+    r.worker->setTxnJudgedRecordsMax(3);
+    constexpr uint8_t kAllView = pc::kAcksWireView | pc::kAcksWireAll;
+    int next = 0;
+    const auto chars = [&](int n) {
+        std::vector<VerdictRig::SrcRecord> out;
+        for (int i = 0; i < n; ++i) out.push_back(VerdictRig::srcOf(VerdictRig::Char{.userId = uint64_t(20 + next), .name = "c" + std::to_string(next++), .intent = 1}));
+        return out;
+    };
+    const auto first = r.ack(r.appendRecords(chars(2), kAllView, 77, 0, /*txn=*/true));
+    ASSERT_TRUE(first);
+    ASSERT_EQ(first->code, 0);
+    const int64_t leo = r.replica->logEndOffset();
+    const auto refused = r.ack(r.appendRecords(chars(2), kAllView, 77, 2, /*txn=*/true));
+    ASSERT_TRUE(refused);
+    EXPECT_EQ(refused->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge));
+    EXPECT_EQ(r.replica->logEndOffset(), leo) << "the refused batch is not in the log";
+    const auto other = r.ack(r.appendRecords(chars(3), kAllView, 78, 0, /*txn=*/true));
+    ASSERT_TRUE(other);
+    EXPECT_EQ(other->code, 0) << "another producer counts alone, and 3 is the knob";
+    const auto atKnob = r.ack(r.appendRecords(chars(1), kAllView, 77, 2, /*txn=*/true));
+    ASSERT_TRUE(atKnob);
+    EXPECT_EQ(atKnob->code, 0) << "2 + 1 lands exactly on the knob";
+    const auto over = r.ack(r.appendRecords(chars(1), kAllView, 77, 3, /*txn=*/true));
+    ASSERT_TRUE(over);
+    EXPECT_EQ(over->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge));
+    EXPECT_EQ(r.worker->hookRefusalsForTest(HookRefusal::TxnTooLarge), 2u);
+    const int64_t leoAtKnob = r.replica->logEndOffset();
+    const auto retry = r.ack(r.appendRecords(chars(1), kAllView, 77, 2, /*txn=*/true));
+    ASSERT_TRUE(retry);
+    EXPECT_EQ(retry->code, 0) << "a retry of the appended at-knob batch is a duplicate, not TxnTooLarge";
+    EXPECT_EQ(r.replica->logEndOffset(), leoAtKnob);
+    EXPECT_EQ(r.worker->hookRefusalsForTest(HookRefusal::TxnTooLarge), 2u);
+
+    Ki plain;
+    plain.r.worker->setTxnJudgedRecordsMax(3);
+    std::vector<Rec> recs;
+    for (uint64_t i = 0; i < 5; ++i) recs.push_back(ups(3000 + i));
+    const auto big = plain.r.ack(plain.r.produceBytes(VerdictRig::batch(recs, 31, 0, {}, /*txn=*/true), kLeader, 31, 0));
+    ASSERT_TRUE(big);
+    EXPECT_EQ(big->code, 0) << "a source with nothing to reject takes it";
+}
+
+// P11-7 bound, the other ways the judge judges a transaction whole: a transaction whose records carry an intent on a verdict source
+// with nothing to reject, and one whose constraint was dropped after its first record.
+TEST(CheckedWritesTxnWorkerRegression, TransactionBoundFollowsTheJudgesPredicateRegression) {
+    Ki k;
+    k.r.worker->setTxnJudgedRecordsMax(3);
+    ASSERT_TRUE(k.r.writeState()->isVerdictSource());
+    ASSERT_FALSE(k.r.writeState()->isConstrainedSource());
+    const auto send = [&](const std::vector<Rec>& recs, int32_t seq) {
+        return k.r.ack(k.r.produceBytes(VerdictRig::batch(recs, 41, seq, {}, /*txn=*/true), kLeader, 41, seq));
+    };
+    const auto first = send({ins(1), ins(2)}, 0);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first->code, 0);
+    const int64_t leo = k.r.replica->logEndOffset();
+    const auto over = send({ups(3), ups(4)}, 2);
+    ASSERT_TRUE(over);
+    EXPECT_EQ(over->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge)) << "the intents earlier in the transaction bound it, though these two carry none";
+    EXPECT_EQ(k.r.replica->logEndOffset(), leo);
+
+    Ki own;
+    own.r.worker->setTxnJudgedRecordsMax(3);
+    const auto ownFirst = own.r.ack(own.r.produceBytes(VerdictRig::batch({ins(1), ins(2), ins(3), ins(4)}, 51, 0, {}, /*txn=*/true), kLeader, 51, 0));
+    ASSERT_TRUE(ownFirst);
+    EXPECT_EQ(ownFirst->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge)) << "the batch's own intents judge it whole";
+    EXPECT_EQ(own.r.worker->hookRefusalsForTest(HookRefusal::TxnTooLarge), 1u);
+
+    VerdictRig r;
+    r.createCharacterTopic(false);
+    r.enableAcks();
+    r.passes(20);
+    r.createConstrainedView(ConstrainedView::AccountStats, 12);
+    r.worker->setTxnJudgedRecordsMax(3);
+    int next = 0;
+    const auto chars = [&](int n) {
+        std::vector<VerdictRig::SrcRecord> out;
+        for (int i = 0; i < n; ++i) out.push_back(VerdictRig::srcOf(VerdictRig::Char{.id = uint64_t(100 + next), .userId = uint64_t(20 + next), .name = "c" + std::to_string(next++), .intent = 0}));
+        return out;
+    };
+    constexpr uint8_t kAllView = pc::kAcksWireView | pc::kAcksWireAll;
+    const auto a = r.ack(r.appendRecords(chars(2), kAllView, 77, 0, /*txn=*/true));
+    ASSERT_TRUE(a);
+    ASSERT_EQ(a->code, 0);
+    r.dropConstrainedView(ConstrainedView::AccountStats);
+    r.passes(30);
+    ASSERT_FALSE(r.writeState()->isConstrainedSource());
+    const auto b = r.ack(r.appendRecords(chars(2), kAllView, 77, 2, /*txn=*/true));
+    ASSERT_TRUE(b);
+    EXPECT_EQ(b->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge)) << "the set at the transaction's first record was constrained";
+}
+
+// P11-7 bound across a rebuild: the open transaction's intents are re-read from the log when the partition reopens, so a later batch
+// with no intent still counts toward the bound on a source with nothing to reject.
+TEST(CheckedWritesTxnWorkerRegression, TransactionBoundSurvivesTheRebuildRegression) {
+    Ki k;
+    k.r.worker->setTxnJudgedRecordsMax(3);
+    ASSERT_FALSE(k.r.writeState()->isConstrainedSource());
+    (void)k.txn(61, {ins(1), ins(2)});
+    const int64_t leo = k.r.replica->logEndOffset();
+    const auto over = k.r.ack(k.r.produceBytes(VerdictRig::batch({ups(3), ups(4)}, 61, 2, {}, /*txn=*/true), kLeader, 61, 2));
+    ASSERT_TRUE(over);
+    EXPECT_EQ(over->code, static_cast<int16_t>(pc::ErrorCode::TxnTooLarge)) << "the rebuilt transaction still carries its intent mark";
+    EXPECT_EQ(k.r.replica->logEndOffset(), leo);
+    EXPECT_EQ(k.r.worker->hookRefusalsForTest(HookRefusal::TxnTooLarge), 1u);
+}
+
+// The produce bound is the vote's predicate, verdict-source precondition included: a source whose last view was dropped and that has no
+// judge answers yes at the vote, so the transaction opened under the old constrained set is not bounded.
+TEST(CheckedWritesTxnWorkerRegression, TransactionBoundNeedsAVerdictSourceRegression) {
+    PartitionWriteState ws;
+    ConstraintSet constrained;
+    constrained.count = 1;
+    constrained.members[0] = {7, rune::view::VerdictViewKind::TestReject, 1};
+    ws.constraintSets.onChange(0, constrained);
+    ASSERT_TRUE(Worker::txnJudgedForTest(ws, false, 5)) << "constrained at the transaction's first record";
+    ws.constraintSets.onChange(10, ConstraintSet{});
+    ASSERT_FALSE(ws.isVerdictSource());
+    EXPECT_FALSE(Worker::txnJudgedForTest(ws, false, 5));
+    EXPECT_FALSE(Worker::txnJudgedForTest(ws, true, 5));
+}
