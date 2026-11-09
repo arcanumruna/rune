@@ -55,6 +55,9 @@ struct VerdictViewHooks {
     void (*discard)(void* ctx, ViewInstance&, ViewDiscardReason) = nullptr;
     /// A retiring member left this partition's set for good (W passed its drop): the owner may erase the partition's instance.
     void (*retired)(void* ctx, int32_t viewTopicId, int32_t partition) = nullptr;
+    /// The next lease rebuild epoch of the owner: strictly increasing across every lease index of the owner, so an index erased and
+    /// re-created never repeats an epoch a runtime already holds (null: the instance's own counter).
+    uint32_t (*nextLeaseEpoch)(void* ctx) = nullptr;
 };
 
 class VerdictSource {

@@ -1399,3 +1399,21 @@ TEST(LeaseWriteHookWorkerRegression, LeaseAckRunsFreedOnErrorRegression) {
     }
     EXPECT_EQ(r.leo(), leo);
 }
+
+// (F16) The lease rebuild epoch is monotonic per WorkerViewSet: a lease index erased and re-created takes a strictly greater epoch than
+// the one before, so a runtime of the old index can never match the new one.  Mutation: back to a per-instance counter: red.
+TEST(LeaseJudgeWorkerRegression, RebuildEpochMonotonicAcrossRecreateRegression) {
+    Ready g;
+    VerdictRig& r = g.r;
+    r.passes(30);
+    ASSERT_TRUE(r.leaseReady());
+    const uint32_t epoch0 = r.vs->leaseRebuildEpoch(VerdictRig::kSrc, 0);
+    ASSERT_GT(epoch0, 0u);
+    ASSERT_NE(r.writeState(), nullptr);
+    const_cast<PartitionWriteState*>(r.writeState())->verdicts = nullptr;   // the write state must not keep the erased judge
+    r.vs->dropVerdictSource(VerdictRig::kSrc, 0);   // the judge and its lease index are gone
+    EXPECT_EQ(r.vs->leaseRebuildEpoch(VerdictRig::kSrc, 0), 0u);
+    for (int i = 0; i < 400 && !(r.leaseReady() && r.vs->leaseRebuildEpoch(VerdictRig::kSrc, 0) != 0); ++i) r.pass();
+    ASSERT_TRUE(r.leaseReady());
+    EXPECT_GT(r.vs->leaseRebuildEpoch(VerdictRig::kSrc, 0), epoch0);
+}

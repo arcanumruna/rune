@@ -1190,7 +1190,7 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     }
     if (vit == verdictSources_.end()) {
         auto v = std::make_unique<VerdictSource>(srcTopicId, partition);
-        v->setViewHooks(VerdictViewHooks{this, &checkpointHook_, &discardHook_, &retiredHook_});
+        v->setViewHooks(VerdictViewHooks{this, &checkpointHook_, &discardHook_, &retiredHook_, &nextLeaseEpochHook_});
         v->setVerdictIntervalNs(verdictIntervalNs_);
         v->holdJudgeForTest(holdJudges_);
         vit = verdictSources_.emplace(key, std::move(v)).first;

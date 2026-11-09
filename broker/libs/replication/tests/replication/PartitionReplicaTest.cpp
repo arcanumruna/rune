@@ -1091,6 +1091,19 @@ TEST_F(TwoReplicaTest, LeaseBatchAppendRefusesControlAndCorruptRegression) {
     EXPECT_EQ(leader_->appendLeaseBatch(tb.build()), PartitionReplica::kAppendInvalidBatch);
     EXPECT_EQ(leader_->logEndOffset(), 0);
 
+    // A producer identity (F14): each of pid / epoch / baseSequence alone makes it a client batch, refused.
+    for (int which = 0; which < 3; ++which) {
+        rune::protocol::RecordBatchBuilder pb(0, 0);
+        if (which == 0) pb.setProducerId(7);
+        if (which == 1) pb.setProducerEpoch(2);
+        if (which == 2) pb.setBaseSequence(0);
+        pb.append("k", "v", 0, rune::protocol::record::withLeaseOp(0, rune::protocol::record::LeaseOp::Expire));
+        const auto withId = pb.build();
+        EXPECT_FALSE(PartitionReplica::isLeaseDataBatch(withId)) << "field " << which;
+        EXPECT_EQ(leader_->appendLeaseBatch(withId), PartitionReplica::kAppendInvalidBatch) << "field " << which;
+        EXPECT_EQ(leader_->logEndOffset(), 0);
+    }
+
     // One CRC-covered byte flipped (the last value byte).
     auto corrupt = leaseBatchOf({"a"}, {"1"});
     corrupt.back() ^= 0x01;

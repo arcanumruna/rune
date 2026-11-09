@@ -693,6 +693,8 @@ bool PartitionReplica::isLeaseDataBatch(std::span<const uint8_t> batch) noexcept
                                              (static_cast<uint16_t>(p[b::kAttributesOffset + 1]) << 8));
     if ((attrs & static_cast<uint16_t>(b::kAttrControl | b::kAttrTransactional)) != 0) return false;
     rune::protocol::RecordBatchReader r(p, batch.size());
+    // The broker's own batch carries no producer identity: a batch with one would enter the idempotence / transaction state.
+    if (r.producerId() != -1 || r.producerEpoch() != -1 || r.baseSequence() != -1) return false;
     return static_cast<std::size_t>(r.totalLength()) == batch.size() && r.ensureValid();
 }
 

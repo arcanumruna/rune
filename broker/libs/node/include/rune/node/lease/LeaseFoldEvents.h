@@ -19,7 +19,7 @@ namespace rune::node {
 inline constexpr std::size_t kLeaseFoldEventCap = 8192;
 
 /// BrokerRejected: the judge refused an Expire / Checkpoint (a stale broker record: its lease moved on).  `rid` is the existing row's
-/// id (lease::kLeaseNil = 0xFFFFFFFF when the key has no row), `offset` the refused record's offset; every other field is 0.
+/// id (lease::kLeaseNil = 0xFFFFFFFF when the key has no row), `offset` the refused record's offset, `version` the lease_version the refused record carries; every other field is 0.
 enum class LeaseEventKind : uint8_t { Granted, Updated, Ended, Checkpointed, BrokerRejected };
 
 struct LeaseEvent {

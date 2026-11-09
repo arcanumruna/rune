@@ -276,7 +276,7 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     for (Member& m : members_)
         if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
             m.prospect.reserve(m.inst->layout, nullptr);
-            ++m.inst->rebuildEpoch;
+            m.inst->rebuildEpoch = hooks_.nextLeaseEpoch != nullptr ? hooks_.nextLeaseEpoch(hooks_.ctx) : m.inst->rebuildEpoch + 1;
         }
     state.leaseEvents.buf.clear();
     activeSet_ = *state.constraintSets.setAt(judgeCursor_);
@@ -501,6 +501,7 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
                 ev.kind   = LeaseEventKind::BrokerRejected;
                 ev.rid    = pr.existed ? pr.rid : lease::kLeaseNil;
                 ev.offset = rec.offset;
+                ev.version = leaseRecordVersion(rec.value);   // the version the refused record carries (the entry compares it with its row)
                 state_->leaseEvents.buf.push_back(ev);
             }
         }

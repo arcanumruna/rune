@@ -143,11 +143,17 @@ void LeaseRuntime::foldStep_(uint32_t rid, LeaseEntryEvent event, const LeaseEve
     assert(false && "a fold event produced an action only the keepalive path or a demotion owns");
 }
 
-void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNowNs, LeaseParkTable& parks) noexcept {
+void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNowNs, LeaseParkTable& parks, const LeaseIndexRef* ref) noexcept {
     for (const LeaseEvent& ev : events) {
         const uint32_t rid = ev.rid;
         if (ev.kind == LeaseEventKind::Granted) {
             if (!timers_.covers(rid) && !timers_.reserveFor(rid)) {   // cold growth: one fold can add more grants than the 75 % headroom
+                ++stats_.ridPastMaxKeys;
+                if (!ridPastWarned_) {
+                    ridPastWarned_ = true;
+                    spdlog::warn("lease runtime: topic {} partition {}: a lease row id ({}) is past maxKeys; the grant is not tracked (counted, further ones silent)",
+                                 topicId_, partition_, rid);
+                }
                 assert(false && "a lease row id past maxKeys");
                 continue;
             }
@@ -167,6 +173,18 @@ void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNow
             if (ev.rid == kLeaseNil || !timers_.covers(rid)) continue;
             const LeaseEntry& e = timers_.entry(rid);
             if (inflight(e.state) && e.inflightOffset == ev.offset) {
+                // The refused record carries the version of the row it was built from.  A row that is gone, or that moved on to another
+                // version, means the in-flight record is stale: the entry is Free (a new grant of the key arms it afresh), the parks answered.
+                if (ref != nullptr && ref->table != nullptr && ref->layout != nullptr) {
+                    uint32_t liveRid = 0;   // the row id of the key this rid held: gone (erased) or reused by another row both read as moved on
+                    const uint8_t* const row = ref->table->find(rune::view::ViewKey::fromBytes(ref->table->keyOf(rid)), liveRid);
+                    if (row == nullptr || liveRid != rid || leaseRowVersion(row, *ref->layout) != ev.version) {
+                        parks.answerChain(timers_.parkHead(rid), kCodeLeaseNotFound, 0);
+                        timers_.setState(rid, LeaseEntryState::Free);
+                        ++stats_.rejectedStale;
+                        continue;
+                    }
+                }
                 // Back to Armed at the stored deadline (relinked: past due means due on the next poll, rebuilt from the current row).
                 const bool wasArmed = e.state == LeaseEntryState::Armed;
                 foldStep_(rid, LeaseEntryEvent::OwnRecordRejected, ev, leaseNowNs, parks);
@@ -238,6 +256,13 @@ uint32_t LeaseRuntime::emit(LeaseEmitWork& work, const LeaseIndexRef& ref, const
                             std::size_t byteCap, std::size_t hardCap, uint32_t maxRecords, PartitionReplica& replica) {
     namespace rec = rune::protocol::record;
     if (writer.descriptor == nullptr || ref.table == nullptr) return 0;
+    // The writer's slot map, once per emit: a writer the layout cannot cover encodes nothing (no row is polled for it).
+    const uint16_t* const slotOf = ref.cover != nullptr
+        ? leaseSlotMapFor(*ref.cover, writer.version, writer.installSeq, *ref.layout, *ref.outDesc, *writer.descriptor) : nullptr;
+    if (ref.cover != nullptr && slotOf == nullptr) {
+        ++stats_.encodeFailures;
+        return 0;
+    }
     maxRecords = std::min<uint32_t>(maxRecords, rune::protocol::kMaxLeaseExpiryBatch);
     work.builder.reset(0, 0);
     uint32_t n = 0;
@@ -251,8 +276,6 @@ uint32_t LeaseRuntime::emit(LeaseEmitWork& work, const LeaseIndexRef& ref, const
         }
         const uint8_t* row = ref.table->rowOf(rid);
         const std::span<const uint8_t> key = ref.table->keyOf(rid);
-        const uint16_t* const slotOf = ref.cover != nullptr
-            ? leaseSlotMapFor(*ref.cover, writer.version, writer.installSeq, *ref.layout, *ref.outDesc, *writer.descriptor) : nullptr;
         const std::size_t len = encodeLeaseValue(row, *ref.layout, *ref.outDesc, *writer.descriptor, writer.version, work.valueTmp.data(),
                                                  work.valueTmp.size(), slotOf);
         if (len == 0) {
@@ -276,6 +299,7 @@ uint32_t LeaseRuntime::emit(LeaseEmitWork& work, const LeaseIndexRef& ref, const
     const int64_t base = appendBatch(replica, std::span<const uint8_t>(work.batch.data(), work.batch.size()), stats_, "expire");
     if (base >= 0) {
         for (uint32_t i = 0; i < n; ++i) timers_.setState(work.rids[i], LeaseEntryState::Emitting, base + static_cast<int64_t>(i));
+        lastBatchBytes_ = work.batch.size();
         stats_.expiriesAppended += n;
         ++stats_.expiryBatches;
         return n;
@@ -299,6 +323,12 @@ uint32_t LeaseRuntime::flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref
     namespace rec = rune::protocol::record;
     if (clearHead_ == clearTail_) return 0;
     if (writer.descriptor == nullptr || ref.table == nullptr || ref.layout == nullptr) return 0;   // the parks wait for an index that can encode
+    const uint16_t* const slotOf = ref.cover != nullptr   // once per flush, not per row
+        ? leaseSlotMapFor(*ref.cover, writer.version, writer.installSeq, *ref.layout, *ref.outDesc, *writer.descriptor) : nullptr;
+    if (ref.cover != nullptr && slotOf == nullptr) {
+        ++stats_.encodeFailures;
+        return 0;
+    }
     work.builder.reset(0, 0);
     uint32_t n = 0;
     const uint64_t visit = clearTail_ - clearHead_;
@@ -325,8 +355,6 @@ uint32_t LeaseRuntime::flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref
             continue;
         }
         const std::span<const uint8_t> key = ref.table->keyOf(rid);
-        const uint16_t* const slotOf = ref.cover != nullptr
-            ? leaseSlotMapFor(*ref.cover, writer.version, writer.installSeq, *ref.layout, *ref.outDesc, *writer.descriptor) : nullptr;
         const std::size_t len = encodeLeaseValue(row, *ref.layout, *ref.outDesc, *writer.descriptor, writer.version, work.valueTmp.data(),
                                                  work.valueTmp.size(), slotOf);
         if (len < rec::kLeaseRemainingValueOffset + 8) {
@@ -351,6 +379,7 @@ uint32_t LeaseRuntime::flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref
     const int64_t base = appendBatch(replica, std::span<const uint8_t>(work.batch.data(), work.batch.size()), stats_, "clear");
     if (base >= 0) {
         for (uint32_t i = 0; i < n; ++i) timers_.setState(work.rids[i], LeaseEntryState::Clearing, base + static_cast<int64_t>(i));
+        lastBatchBytes_ = work.batch.size();
         stats_.clearsAppended += n;
         ++stats_.clearBatches;
         return n;

@@ -617,8 +617,13 @@ public:
     [[nodiscard]] uint64_t nsProduceRecordsForTest(uint16_t slot) const noexcept { return slot < nsHot_.size() ? nsHot_[slot].produceRecords : 0; }
     void onEventsForTest(int32_t topicId, int32_t partition, std::span<const LeaseEvent> events, int64_t leaseNowNs) {
         if (PartitionWriteState* w = writeOf_(findOwnedReplica_(topicId, partition)); w != nullptr && w->leaseRuntime)
-            w->leaseRuntime->onEvents(events, leaseNowNs, *leaseParks_);
+        {
+            const LeaseIndexRef ref = viewSet_->leaseIndexOf(topicId, partition);
+            w->leaseRuntime->onEvents(events, leaseNowNs, *leaseParks_, &ref);
+        }
     }
+    /// Test seams (Task 10 review fixes): the lookups leaseDuty_ made (the idle skip keeps this still).
+    [[nodiscard]] uint64_t leaseDutyLookupsForTest() const noexcept { return leaseDutyLookups_; }
     [[nodiscard]] int64_t viewLeaseEndNsForTest() const noexcept { return viewLeaseEndNs_; }
     [[nodiscard]] uint64_t viewReadsWithoutLeaseForTest() const noexcept { return viewReadsWithoutLease_; }
     [[nodiscard]] uint64_t readLeasesSeenForTest() const noexcept { return readLeasesSeen_; }
@@ -6634,6 +6639,7 @@ private:
     uint64_t hookChecks_        = 0;   // CheckedWriteHook::check ran
     WriteFacts lastWriteFacts_{};
     std::unique_ptr<LeaseHookWork> leaseHookWork_;   // lease topics: the produce hook's work area (allocated once, cold)
+    uint64_t leaseDutyLookups_ = 0;   // lookups leaseDuty_ made (test observability of the idle skip)
     std::unique_ptr<lease::LeaseEmitWork> leaseEmitWork_;   // lease topics Task 10: the Expire batch under construction (allocated once, cold)
     std::size_t leaseBatchCapOverrideForTest_ = 0;           // test seam: a lease batch's byte cap (0: none)
     // Lease topics Task 11a: the keepalives parked until the log catches up (allocated once in the ctor, cold), the leader
@@ -7530,10 +7536,18 @@ private:
                 w->leaseEvents.buf.clear();
                 continue;
             }
+            const uint64_t gen = replica->leadershipGeneration();
+            // Idle skip (F8): a runtime of this leadership with no event to fold, no wheel due, no clear owed and no parked answer
+            // queued has nothing to do, so the pass costs no index lookup.  Skipping the rebuild-epoch check while idle is safe:
+            // nothing is emitted while idle, and the first non-idle pass (an event, a due wheel, a clear) checks the epoch before it
+            // emits.  The leadership generation is a cheap member read and is still checked here.
+            if (w->leaseRuntime && w->leaseEvents.buf.empty() && w->leaseRuntime->leaderGeneration() == gen && leaseParks_->queued() == 0 &&
+                !w->leaseRuntime->hasPendingWork(leaseNowNs))
+                continue;
             const int32_t topicId   = replica->topicId();
             const int32_t partition = static_cast<int32_t>(replica->partitionId());
             const bool hwConfirmed  = replica->highWatermark() >= replica->leadershipStartOffset();
-            const uint64_t gen      = replica->leadershipGeneration();
+            ++leaseDutyLookups_;
             const WorkerViewSet::LeaseIndexLookup lk = viewSet_->leaseIndexFor(topicId, partition, gen, true, hwConfirmed);
             const uint64_t epoch    = viewSet_->leaseRebuildEpoch(topicId, partition);
             if (w->leaseRuntime && !w->leaseRuntime->sameIdentity(gen, epoch))
@@ -7544,11 +7558,15 @@ private:
                                                                         leaseExtendNs_);
             }
             if (w->leaseRuntime) {
-                w->leaseRuntime->onEvents(w->leaseEvents.buf, leaseNowNs, *leaseParks_);
+                w->leaseRuntime->onEvents(w->leaseEvents.buf, leaseNowNs, *leaseParks_, &lk.ref);
                 work += static_cast<int>(w->leaseEvents.buf.size());
             }
             w->leaseEvents.buf.clear();   // consumed (or discarded: no runtime yet)
             if (!w->leaseRuntime || !lk.ready) continue;
+            if (replica->isDiskBacked() && replica->log()->rollDeferred()) {   // the log cannot roll without blocking: no append this cycle
+                w->leaseRuntime->noteRollDeferredSkip();
+                continue;
+            }
             const LeaseWriter writer = latestLeaseWriter(*w->spec);
             const std::size_t cap     = leaseBatchCap_(replica);
             const std::size_t hardCap = leaseHardCap_();
@@ -7558,13 +7576,13 @@ private:
                                                                   *replica, *leaseParks_);
             if (cleared != 0) {
                 work += static_cast<int>(cleared);
-                noteLeaseAppended_(replica);
+                noteLeaseAppended_(replica, w->leaseRuntime->lastBatchBytes());
             }
             const uint32_t emitted = w->leaseRuntime->emit(*leaseEmitWork_, lk.ref, writer, w->judgedThrough, leaseNowNs, cap, hardCap,
                                                            w->spec->lease->expiryBatch, *replica);
             if (emitted != 0) {
                 work += static_cast<int>(emitted);
-                noteLeaseAppended_(replica);
+                noteLeaseAppended_(replica, w->leaseRuntime->lastBatchBytes());
             }
         }
         drainLeaseParks_();   // the folds, the clears and the demotions above queued their answers
@@ -7581,10 +7599,13 @@ private:
     }
     /// The most a lone lease record's batch may take (a record over the byte cap but within this goes out alone).
     [[nodiscard]] std::size_t leaseHardCap_() const noexcept { return std::min<std::size_t>(kLeaseEmitReserveBytes, maxIntakeBatchBytes_); }
-    /// A Strict-tier lease batch joins this pass's durable flush.
-    void noteLeaseAppended_(rune::replication::PartitionReplica* replica) {
-        if (replica->durabilityTier() != 2 || !replica->isDiskBacked()) return;
+    /// A lease batch of `bytes` was appended: the namespace's disk bytes grow (as a produce's do), and a Strict-tier batch joins this
+    /// pass's durable flush.
+    void noteLeaseAppended_(rune::replication::PartitionReplica* replica, std::size_t bytes) {
+        if (!replica->isDiskBacked()) return;
         rune::storage::Log* log = replica->log();
+        if (const uint16_t slot = nsTagOfLog_(log, nullptr).slot; slot < nsDiskBytes_.size()) noteDiskAppend_(slot, bytes);
+        if (replica->durabilityTier() != 2) return;
         for (auto* dl : dirtyThisCycle_)
             if (dl == log) return;
         dirtyThisCycle_.push_back(log);
@@ -7707,9 +7728,12 @@ private:
         // The clears the parked entries wait for go out now (a row with remaining 0 answers at once, below).
         if (rt.clearPending() != 0) {
             if (!leaseEmitWork_) leaseEmitWork_ = std::make_unique<lease::LeaseEmitWork>(kLeaseEmitReserveBytes);
-            if (rt.flushClears(*leaseEmitWork_, sv.lk.ref, latestLeaseWriter(*sv.w->spec), sv.w->judgedThrough, nowNs, leaseBatchCap_(sv.replica),
-                               leaseHardCap_(), *sv.replica, *leaseParks_) != 0)
-                noteLeaseAppended_(sv.replica);
+            if (sv.replica->isDiskBacked() && sv.replica->log()->rollDeferred()) {   // F9: the next duty pass flushes them
+                rt.noteRollDeferredSkip();
+            } else if (rt.flushClears(*leaseEmitWork_, sv.lk.ref, latestLeaseWriter(*sv.w->spec), sv.w->judgedThrough, nowNs, leaseBatchCap_(sv.replica),
+                                      leaseHardCap_(), *sv.replica, *leaseParks_) != 0) {
+                noteLeaseAppended_(sv.replica, rt.lastBatchBytes());
+            }
         }
         if (decided != 0) enqueueLeaseKaReturn_(sid, corr, topicId, partition, leaseKaScratch_.data(), decided, req == lease::kLeaseNil);
         drainLeaseParks_();

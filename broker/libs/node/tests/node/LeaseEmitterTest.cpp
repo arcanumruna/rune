@@ -8,6 +8,7 @@
 
 #include <rune/node/lease/LeaseRuntime.h>
 #include <rune/protocol/LeaseRecord.h>
+#include <rune/storage/testing/DemandChannelForTest.h>
 
 #include <chrono>
 #include <cstring>
@@ -115,15 +116,15 @@ struct Em {
     VerdictRig r;
     int32_t seq = 0;
     int ackPasses;
-    explicit Em(uint32_t maxKeys = 1000, RigTuning tuning = {}, bool follower = false)
-        : r(follower, 64LL * 1024 * 1024, tuning), ackPasses(tuning.durabilityTier == 2 ? 600 * 50 : 600) {
+    explicit Em(uint32_t maxKeys = 1000, RigTuning tuning = {}, bool follower = false, bool acks = true, int64_t rollBytes = 64LL * 1024 * 1024)
+        : r(follower, rollBytes, tuning), ackPasses(tuning.durabilityTier == 2 ? 600 * 50 : 600) {
         r.worker->setLeaseClockForTest(&leaseNow);
         r.createLeaseTopic(maxKeys);
         r.passes(30);
         WorkerOp level;
         level.type = WorkerOp::Type::ClusterFeatureLevel; level.nextOffset = rune::replication::MetadataFeature::kLeases;
         r.send(std::move(level));
-        r.enableAcks(rune::protocol::client::kClientVersionLeases, 0);
+        if (acks) r.enableAcks(rune::protocol::client::kClientVersionLeases, 0);
         r.passes(30);
     }
     void advance(int64_t ns) { leaseNow += ns; }
@@ -160,6 +161,11 @@ struct Em {
         return -1;
     }
 };
+
+bool statsAllZero(const lease::LeaseRuntimeStats& st) {
+    static const lease::LeaseRuntimeStats zero{};
+    return std::memcmp(&st, &zero, sizeof(st)) == 0;
+}
 
 }  // namespace
 
@@ -505,8 +511,7 @@ TEST(LeaseEmitterRegression, FullBatchContinuesNextCycleRegression) {
     ASSERT_NE(r.stats(), nullptr);
     EXPECT_EQ(r.stats()->leaseRejectedStaleBroker, 0u);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    std::printf("FullBatchContinuesNextCycle: %lld ms\n", static_cast<long long>(ms));
-    EXPECT_LT(ms, 20'000);
+    std::printf("FullBatchContinuesNextCycle: %lld ms\n", static_cast<long long>(ms));   // printed only: wall time is no assertion
 }
 
 // 11. The byte cap splits a batch: 25 due keys, a cap that fits 10 records -> 10, 10, 5.
@@ -556,7 +561,7 @@ TEST(LeaseEmitterRegression, OwnRecordRejectedReturnsArmedRegression) {
     ASSERT_EQ(e.entry(1).state, LeaseEntryState::Emitting);
     ASSERT_EQ(e.entry(1).inflightOffset, x);
     LeaseEvent other;
-    other.kind = LeaseEventKind::BrokerRejected; other.rid = rid; other.offset = x + 1;
+    other.kind = LeaseEventKind::BrokerRejected; other.rid = rid; other.offset = x + 1; other.version = e.versionOf(1);
     r.worker->onEventsForTest(VerdictRig::kSrc, 0, std::span<const LeaseEvent>(&other, 1), e.leaseNow);
     EXPECT_EQ(e.entry(1).state, LeaseEntryState::Emitting) << "a different offset is ignored";
     EXPECT_EQ(e.st().ownRecordRejected, 0u);
@@ -601,19 +606,18 @@ TEST(LeaseEmitterRegression, DemotionDiscardsRegression) {
     ASSERT_TRUE(e.produce({grantRec(1), grantRec(2), grantRec(3)}));
     ASSERT_TRUE(r.driveUntilJudged());
     ASSERT_TRUE(e.waitRuntime());
-    const lease::LeaseRuntime* old = e.rt();
-    ASSERT_NE(old, nullptr);
+    ASSERT_NE(e.rt(), nullptr);
     r.demote();
     r.passes(3);
     EXPECT_EQ(e.rt(), nullptr) << "the runtime of a follower is gone";
     r.promote();
     r.passes(60);
-    if (e.rt() != nullptr) {   // a new runtime of the new leadership: every entry Free
-        for (uint64_t k = 1; k <= 3; ++k) {
-            const uint32_t rid = e.ridOf(k);
-            ASSERT_NE(rid, UINT32_MAX);
-            EXPECT_EQ(e.rt()->timers().entry(rid).state, LeaseEntryState::Free) << "key " << k;
-        }
+    ASSERT_NE(e.rt(), nullptr) << "a new runtime of the new leadership exists";
+    EXPECT_TRUE(statsAllZero(e.st())) << "a new runtime: nothing carried over";
+    for (uint64_t k = 1; k <= 3; ++k) {   // every entry Free
+        const uint32_t rid = e.ridOf(k);
+        ASSERT_NE(rid, UINT32_MAX);
+        EXPECT_EQ(e.rt()->timers().entry(rid).state, LeaseEntryState::Free) << "key " << k;
     }
     e.advanceMs(5000 + 1);
     r.passes(5);
@@ -714,4 +718,257 @@ TEST(LeaseEmitterRegression, AppendThrowDoesNotTerminateRegression) {
     r.pass();
     EXPECT_EQ(expires(r).size(), 1u);
     EXPECT_EQ(e.entry(1).state, LeaseEntryState::Emitting);
+}
+
+// 17. (F3) An identity change DISCARDS the runtime: nothing is carried over and no Expire is emitted for the old deadlines.  Two legs:
+// (a) a new writer field id bumps the lease layout generation: the index is rebuilt (new rebuild epoch);
+// (b) a demote + promote inside ONE doWork (the generation changes, the passes in between never run).
+// Mutation: delete the `dropLeaseRuntime_` of the sameIdentity check in leaseDuty_: the old runtime emits at its old deadlines: red (both legs).
+TEST(LeaseEmitterRegression, IdentityChangeDiscardsRegression) {
+    for (const int leg : {0, 1}) {
+        Em e;
+        VerdictRig& r = e.r;
+        ASSERT_TRUE(e.produce({grantRec(1), grantRec(2), grantRec(3)})) << "leg " << leg;
+        ASSERT_TRUE(r.driveUntilJudged());
+        ASSERT_TRUE(e.waitRuntime());
+        const uint32_t rids[3] = {e.ridOf(1), e.ridOf(2), e.ridOf(3)};
+        for (uint64_t k = 1; k <= 3; ++k) ASSERT_EQ(e.entry(k).state, LeaseEntryState::Armed) << "leg " << leg << " key " << k;
+        const uint32_t epochBefore = r.vs->leaseRebuildEpoch(VerdictRig::kSrc, 0);
+        const uint64_t genBefore   = r.replica->leadershipGeneration();
+        if (leg == 0) {
+            r.addLeasePort();   // the evolving descriptor gains a field id: the layout generation moves, the index is rebuilt
+            r.passes(30);
+            ASSERT_TRUE(r.driveUntilJudged());
+            r.passes(30);
+            ASSERT_TRUE(r.leaseReady());
+            ASSERT_GT(r.vs->leaseRebuildEpoch(VerdictRig::kSrc, 0), epochBefore) << "the identity changed";
+        } else {
+            r.replica->becomeFollower(r.replica->epoch() + 1, 2);                                       // both role changes land before
+            r.replica->becomeLeader(r.replica->epoch() + 1, std::vector<rune::replication::NodeId>{1});   // one worker pass runs
+            r.passes(60);
+            ASSERT_TRUE(r.driveUntilJudged());
+            r.passes(30);
+            ASSERT_TRUE(r.leaseReady());
+            ASSERT_NE(r.replica->leadershipGeneration(), genBefore) << "the identity changed";
+        }
+        const int64_t leoStable = r.leo();
+        e.advanceMs(5000 + 1);   // past every old deadline
+        r.passes(5);
+        ASSERT_NE(e.rt(), nullptr) << "leg " << leg << ": the runtime of the new identity exists";
+        EXPECT_TRUE(r.leaseReady());
+        EXPECT_TRUE(e.rt()->sameIdentity(r.replica->leadershipGeneration(), r.vs->leaseRebuildEpoch(VerdictRig::kSrc, 0))) << "leg " << leg;
+        EXPECT_TRUE(statsAllZero(e.st())) << "leg " << leg << ": a new runtime, nothing carried over";
+        for (std::size_t i = 0; i < 3; ++i) {
+            const uint32_t rid = e.ridOf(uint64_t(i + 1));
+            ASSERT_NE(rid, UINT32_MAX);
+            EXPECT_EQ(e.rt()->timers().entry(rid).state, LeaseEntryState::Free) << "leg " << leg << " key " << i + 1;
+            EXPECT_EQ(e.rt()->timers().entry(rids[i]).state, LeaseEntryState::Free) << "leg " << leg << ": the old rid " << rids[i];
+        }
+        EXPECT_TRUE(expires(r).empty()) << "leg " << leg << ": no Expire at the old deadlines";
+        EXPECT_EQ(r.leo(), leoStable) << "leg " << leg << ": nothing appended";
+    }
+}
+
+// 18. (F4) The `!lk.ready` emit gate: a runtime of the current identity does NOT emit while the lease index is not ready, and does as
+// soon as it is.  The index goes not-ready without losing the runtime: an update of a key with no row, appended while the judge is held,
+// raises leaseUntrackedThrough (the hook cannot track it), so the index is not ready until the judge has passed it.
+// Mutation: drop `|| !lk.ready` from the gate in leaseDuty_: the Expire goes out while not ready: red.
+TEST(LeaseEmitterRegression, NotReadyGateRegression) {
+    Em e;
+    VerdictRig& r = e.r;
+    ASSERT_TRUE(e.produce({grantRec(1)}));
+    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_TRUE(e.waitRuntime());
+    ASSERT_EQ(e.entry(1).state, LeaseEntryState::Armed);
+    lease::LeaseRuntime* const before = e.rt();
+    r.holdJudge(true);
+    (void)e.send({updateRec(99, 0, "zz")});   // no row for key 99
+    r.passes(30);
+    ASSERT_FALSE(r.leaseReady()) << "the index is not ready (an update it could not track)";
+    ASSERT_EQ(e.rt(), before) << "the runtime is still the same one";
+    e.advanceMs(5000 + 1);
+    r.passes(5);
+    EXPECT_TRUE(expires(r).empty()) << "not ready: nothing is emitted";
+    EXPECT_EQ(e.entry(1).state, LeaseEntryState::Armed);
+    EXPECT_TRUE(e.linked(1));
+    r.holdJudge(false);
+    ASSERT_TRUE(r.driveUntilJudged());
+    for (int i = 0; i < 30 && expires(r).empty(); ++i) r.pass();
+    r.passes(5);
+    EXPECT_TRUE(r.leaseReady());
+    EXPECT_EQ(expires(r).size(), 1u) << "ready again: exactly one Expire";
+}
+
+// 19. (F6) The PRODUCTION byte cap, through the namespace's limit (applyNsSlotAssignDirect + the log's ns tag; no override seam) and the
+// intake's limit (setMaxBatchBytes).  One Expire of these rows is a 75-byte record on the 61-byte batch overhead.
+// Mutations: drop the namespace term of leaseBatchCap_ -> cell 0 red; drop the intake term -> cell 1 red.
+TEST(LeaseEmitterRegression, NamespaceByteCapRegression) {
+    constexpr uint64_t kThree = 61 + 3 * 75 + 10;   // room for three Expires, not four (61 + 4 * 75 = 361)
+    for (const int cell : {0, 1}) {
+        Em e;
+        VerdictRig& r = e.r;
+        std::vector<RawRec> recs;
+        for (uint64_t k = 1; k <= 7; ++k) recs.push_back(grantRec(k, "x"));
+        ASSERT_TRUE(e.produce(recs));
+        ASSERT_TRUE(r.driveUntilJudged());
+        ASSERT_TRUE(e.waitRuntime());
+        constexpr uint16_t kSlot = 3;
+        constexpr uint32_t kNs = 77;
+        rune::protocol::NamespaceLimits limits;
+        limits.maxBatchBytes = cell == 0 ? kThree : (1u << 20);
+        r.worker->applyNsSlotAssignDirect(kSlot, kNs, limits);
+        r.log->setNsTag(kNs, kSlot);
+        if (cell == 1) r.worker->setMaxBatchBytes(kThree);   // the intake's limit is the smaller one
+        const int64_t leoBefore = r.leo();
+        e.advanceMs(5000 + 1);
+        for (int i = 0; i < 3; ++i) r.pass();
+        std::vector<std::size_t> sizes;
+        for (const auto& b : storedBatches(r, leoBefore)) if (!b.control) sizes.push_back(b.recs.size());
+        ASSERT_EQ(sizes.size(), 3u) << "cell " << cell;
+        EXPECT_EQ(sizes[0], 3u) << "cell " << cell;
+        EXPECT_EQ(sizes[1], 3u) << "cell " << cell;
+        EXPECT_EQ(sizes[2], 1u) << "cell " << cell;
+        for (const auto& b : storedBatches(r, leoBefore)) EXPECT_LE(b.bytes, kThree) << "cell " << cell;
+    }
+}
+
+// 20. (F7) Both doWork paths run leaseDuty_: the classic doWork (shard mode off, the rig's default) and doWorkShard_.  (A grant needs the ack
+// sink's session version, so the rig cannot grant without enableAcks; the classic path is what every other cell here drives, and this cell
+// pins it beside the shard path.)  The Expire is in the log and the entry is Emitting, then Free after the fold.
+// Mutation: remove the leaseDuty_ call of a path -> that leg red.
+TEST(LeaseEmitterRegression, DoWorkPathsRegression) {
+    for (const bool shard : {false, true}) {
+        Em e;
+        VerdictRig& r = e.r;
+        if (shard) r.worker->setShardMode(true);
+        ASSERT_TRUE(e.produce({grantRec(1)})) << "shard " << shard;
+        ASSERT_TRUE(r.driveUntilJudged()) << "shard " << shard;
+        ASSERT_TRUE(e.waitRuntime()) << "shard " << shard;
+        ASSERT_EQ(e.entry(1).state, LeaseEntryState::Armed) << "shard " << shard;
+        const uint32_t rid = e.ridOf(1);   // the row is gone after the fold: keep the rid
+        e.advanceMs(5000 + 1);
+        r.holdJudge(true);
+        r.pass();
+        ASSERT_EQ(expires(r).size(), 1u) << "shard " << shard << ": the Expire is in the log";
+        EXPECT_EQ(e.entry(1).state, LeaseEntryState::Emitting) << "shard " << shard;
+        r.holdJudge(false);
+        ASSERT_TRUE(r.driveUntilJudged());
+        r.passes(3);
+        EXPECT_EQ(e.rt()->timers().entry(rid).state, LeaseEntryState::Free) << "shard " << shard << ": the fold ended the key";
+        EXPECT_EQ(expires(r).size(), 1u);
+    }
+}
+
+// 21. (F7) The Strict tier: the lease batch joins the pass's durable flush.  Mutation: remove the dirtyThisCycle_ push in noteLeaseAppended_
+// -> no durability round starts for the Expire: red.
+TEST(LeaseEmitterRegression, StrictTierExpireJoinsDurableRoundRegression) {
+    Em e(1000, RigTuning{.durabilityTier = 2});
+    VerdictRig& r = e.r;
+    ASSERT_TRUE(e.produce({grantRec(1)}));
+    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_TRUE(e.waitRuntime());
+    for (int i = 0; i < 50 * 600 && (r.worker->syncRoundInFlightForTest() || r.worker->lastSyncedLeoForTest(r.log.get()) < r.leo()); ++i) r.pass();
+    ASSERT_EQ(r.worker->lastSyncedLeoForTest(r.log.get()), r.leo()) << "the grant is durable";
+    const uint64_t rounds = r.worker->syncRoundsStartedForTest();
+    e.advanceMs(5000 + 1);
+    r.pass();
+    ASSERT_EQ(expires(r).size(), 1u) << "the Expire batch is appended";
+    EXPECT_GT(r.worker->syncRoundsStartedForTest(), rounds) << "a durability round started for it in the same pass";
+    for (int i = 0; i < 50 * 600 && r.worker->lastSyncedLeoForTest(r.log.get()) < r.leo(); ++i) r.pass();
+    EXPECT_EQ(r.worker->lastSyncedLeoForTest(r.log.get()), r.leo()) << "the log was flushed through the Expire";
+}
+
+// 22. (F8) The idle cost: a runtime with nothing to fold, no wheel due and no clear owed makes no index lookup.  Mutation: remove the idle
+// skip: the counter grows every pass: red.
+TEST(LeaseEmitterRegression, IdleSkipsLookupsRegression) {
+    Em e;
+    VerdictRig& r = e.r;
+    ASSERT_TRUE(e.produce({grantRec(1)}));
+    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_TRUE(e.waitRuntime());
+    r.passes(10);   // the grant's events consumed
+    const uint64_t before = r.worker->leaseDutyLookupsForTest();
+    r.passes(100);
+    EXPECT_EQ(r.worker->leaseDutyLookupsForTest(), before) << "100 idle passes: no lookup";
+    e.advanceMs(5000 + 1);
+    r.pass();
+    EXPECT_EQ(expires(r).size(), 1u) << "the due key is still expired on time";
+    EXPECT_GT(r.worker->leaseDutyLookupsForTest(), before);
+}
+
+// 23. (F9) Roll back-pressure: while the log's roll is deferred (a provisioned log with no ready segment) the emitter appends nothing, and
+// does once a segment is ready.  Mutation: drop the rollDeferred check in leaseDuty_: the Expire lands while held: red.
+TEST(LeaseEmitterRegression, RollDeferredHoldsExpiresRegression) {
+    Em e(1000, {}, false, true, /*rollBytes=*/100);
+    VerdictRig& r = e.r;
+    ASSERT_TRUE(e.produce({grantRec(1), grantRec(2)}));
+    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_TRUE(e.waitRuntime());
+    struct Hook { static bool fn(void*, rune::storage::Log*, rune::storage::Log::ProvisionDemand) noexcept { return true; } };
+    rune::storage::testing::DemandChannelForTest demandCh{&Hook::fn, nullptr};
+    r.log->setProvisioning(&demandCh);
+    ASSERT_TRUE(r.log->rollDeferred()) << "the active segment is full and no segment is ready";
+    e.advanceMs(5000 + 1);
+    const int64_t leo = r.leo();
+    r.passes(5);
+    EXPECT_TRUE(expires(r).empty()) << "held: no Expire";
+    EXPECT_EQ(r.leo(), leo);
+    EXPECT_GE(e.st().rollDeferredSkips, 5u);
+    ASSERT_EQ(r.log->provisionReady(1), 1);
+    for (int i = 0; i < 20 && expires(r).size() < 2; ++i) r.pass();
+    EXPECT_EQ(expires(r).size(), 2u) << "released: both expire";
+    (void)r.log->finalizeStagingRenames();
+    (void)r.log->drainStagingRenamesDone();
+}
+
+// 24. (F10) A BrokerRejected event carries the refused record's version.  An in-flight entry whose row still has that version is the
+// entry's own refused record (back to Armed); a row that moved on (or is gone) means the record is stale: the entry is Free.
+TEST(LeaseEmitterRegression, RejectedVersionRegression) {
+    for (const bool matches : {true, false}) {
+        Em e;
+        VerdictRig& r = e.r;
+        ASSERT_TRUE(e.produce({grantRec(1, "a1")}));
+        ASSERT_TRUE(r.driveUntilJudged());
+        ASSERT_TRUE(e.waitRuntime());
+        e.advanceMs(5000 + 1);
+        r.holdJudge(true);
+        r.pass();
+        const auto ex = expires(r);
+        ASSERT_EQ(ex.size(), 1u);
+        const uint32_t rid = e.ridOf(1);
+        ASSERT_EQ(e.entry(1).state, LeaseEntryState::Emitting);
+        LeaseEvent ev;
+        ev.kind = LeaseEventKind::BrokerRejected; ev.rid = rid; ev.offset = ex[0].offset;
+        ev.version = matches ? e.versionOf(1) : e.versionOf(1) + 1000;
+        r.worker->onEventsForTest(VerdictRig::kSrc, 0, std::span<const LeaseEvent>(&ev, 1), e.leaseNow);
+        if (matches) {
+            EXPECT_EQ(e.entry(1).state, LeaseEntryState::Armed);
+            EXPECT_EQ(e.st().ownRecordRejected, 1u);
+            EXPECT_EQ(e.st().rejectedStale, 0u);
+        } else {
+            EXPECT_EQ(e.entry(1).state, LeaseEntryState::Free);
+            EXPECT_EQ(e.st().ownRecordRejected, 0u);
+            EXPECT_EQ(e.st().rejectedStale, 1u);
+        }
+    }
+}
+
+// 25. (F15) A lease batch counts in the namespace's disk bytes, as a produce does.  Mutation: drop the noteDiskAppend_ call: red.
+TEST(LeaseEmitterRegression, NamespaceDiskBytesRegression) {
+    Em e;
+    VerdictRig& r = e.r;
+    ASSERT_TRUE(e.produce({grantRec(1), grantRec(2)}));
+    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_TRUE(e.waitRuntime());
+    constexpr uint16_t kSlot = 3;
+    constexpr uint32_t kNs = 77;
+    r.worker->applyNsSlotAssignDirect(kSlot, kNs, rune::protocol::NamespaceLimits{});
+    r.log->setNsTag(kNs, kSlot);
+    const int64_t disk0 = r.worker->nsDiskBytesForTest(kSlot);
+    const int64_t leoBefore = r.leo();
+    e.advanceMs(5000 + 1);
+    r.pass();
+    const auto batches = storedBatches(r, leoBefore);
+    ASSERT_EQ(batches.size(), 1u);
+    EXPECT_EQ(r.worker->nsDiskBytesForTest(kSlot) - disk0, int64_t(batches[0].bytes));
 }

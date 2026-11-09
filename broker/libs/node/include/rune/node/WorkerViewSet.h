@@ -769,6 +769,7 @@ private:
     void eraseInstance_(int32_t viewTopicId, int32_t partition);
     static int  checkpointHook_(void* ctx, ViewInstance& inst) { return static_cast<WorkerViewSet*>(ctx)->pushVerdictCheckpoint_(inst); }
     static void discardHook_(void* ctx, ViewInstance& inst, ViewDiscardReason reason) { static_cast<WorkerViewSet*>(ctx)->beginDiscard_(inst, reason); }
+    static uint32_t nextLeaseEpochHook_(void* ctx) { return ++static_cast<WorkerViewSet*>(ctx)->leaseEpochCounter_; }
     static void retiredHook_(void* ctx, int32_t viewTopicId, int32_t partition) {
         static_cast<WorkerViewSet*>(ctx)->retiredQueue_.push_back({viewTopicId, partition});
     }
@@ -778,6 +779,7 @@ private:
     // local log at every activation; never persisted.  unordered_map keeps the node's address across the move-assign that rebuilds it.
     std::unordered_map<uint64_t, ViewInstance> keyIndexes_;
     bool holdJudges_ = false;
+    uint32_t leaseEpochCounter_ = 0;   // one per WorkerViewSet: every activation of ANY lease index takes the next value (never repeats)
     struct Retired { int32_t viewTopicId, partition; };
     uint64_t verdictEpoch_ = 0;   // bumped by every verdict template install, retire and erase; syncConstraintSet_ reruns on a change
     std::vector<Retired> retiredQueue_;   // the members the judges dropped, per partition

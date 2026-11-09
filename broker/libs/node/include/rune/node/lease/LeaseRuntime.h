@@ -44,6 +44,9 @@ struct LeaseRuntimeStats {
     uint64_t clearsAppended     = 0;   ///< Checkpoint(0) records appended for parked keepalives (Task 11a)
     uint64_t clearBatches       = 0;   ///< successful appendLeaseBatch calls of flushClears
     uint64_t clearDeferred      = 0;   ///< clear-wanted rids pushed back (gate closed, byte cap, oversized, refused append)
+    uint64_t rollDeferredSkips  = 0;   ///< duty cycles whose appends were skipped because the log's roll was deferred (back-pressure)
+    uint64_t rejectedStale      = 0;   ///< BrokerRejected events of an in-flight entry whose row moved on (version differs / row gone): entry Free
+    uint64_t ridPastMaxKeys     = 0;   ///< Granted events whose row id is past maxKeys (dropped)
 };
 
 /// The outcome of one keepalive entry: parked = no answer now (the park table holds it); else `code` (0 = Ok) and `ttlMs`
@@ -82,11 +85,22 @@ public:
     [[nodiscard]] int32_t topicId() const noexcept { return topicId_; }
     [[nodiscard]] int32_t partition() const noexcept { return partition_; }
     [[nodiscard]] bool sameIdentity(uint64_t gen, uint64_t epoch) const noexcept { return gen_ == gen && epoch_ == epoch; }
+    [[nodiscard]] uint64_t leaderGeneration() const noexcept { return gen_; }
+    /// Whether a duty pass has anything to do at `leaseNowNs` besides folding events: a deadline or checkpoint wheel due, or a
+    /// parked keepalive waiting for its clear.  (Task 12's promotion pass is not a wheel; it runs at runtime creation.)
+    [[nodiscard]] bool hasPendingWork(int64_t leaseNowNs) const noexcept {
+        return timers_.deadline().nextCheckNs() <= leaseNowNs || timers_.checkpoint().nextCheckNs() <= leaseNowNs || clearHead_ != clearTail_;
+    }
+    void noteRollDeferredSkip() noexcept { ++stats_.rollDeferredSkips; }
+    /// The byte size of the batch the last successful emit / flushClears appended.
+    [[nodiscard]] std::size_t lastBatchBytes() const noexcept { return lastBatchBytes_; }
 
     /// Folds every event of one duty cycle, in order (the judge's LeaseEvents).  Granted arms the entry; the others step the state
     /// machine.  Cold growth of the entry store happens here, at most once per call (growIfOwed).
     /// A fold action that answers parked keepalives (Clearing's own Checkpoint, an end of the key, a replay) does so through `parks`.
-    void onEvents(std::span<const LeaseEvent> events, int64_t leaseNowNs, LeaseParkTable& parks) noexcept;
+    /// `ref` (may be null in a bare unit test: a rejected record is then taken as the entry's own) is the lease index the rejected
+    /// record's version is compared against.
+    void onEvents(std::span<const LeaseEvent> events, int64_t leaseNowNs, LeaseParkTable& parks, const LeaseIndexRef* ref = nullptr) noexcept;
 
     /// The deadline of a key promoted at this runtime's ready time (spec 9.7): readyNs + extendNs + (remaining, else ttl).  Saturating.
     [[nodiscard]] int64_t promotionDeadline(uint64_t ttlMs, uint64_t remainingMs) const noexcept {
@@ -144,6 +158,8 @@ private:
     int64_t          readyNs_, extendNs_;
     int32_t          topicId_, partition_;
     uint64_t         clearHead_ = 0, clearTail_ = 0;
+    std::size_t      lastBatchBytes_ = 0;
+    bool             ridPastWarned_  = false;
     std::array<uint32_t, kClearRingCap> clearRing_{};
 };
 
