@@ -505,7 +505,10 @@ void BrokerNode::start() {
         // Startup resolves on aeron_ then use the default sleep-poll pump,
         // exactly as with thread placement's driver/conductor threads.
         if (config_.fused()) {
-            startupGate_.acquire();   // released by stopStartupPump_(); resolves drop it around their sleeps
+            // The starter holds the gate until the hand-off, so the interim pump invokes aeron_ only while a resolve
+            // sleeps.  Any new non-client wait in start() longer than ~2 s (the shard clients' liveness) must hold a
+            // StartupClientGate::Yield, like the build-gateway hook and the shard-driver stall.
+            startupGate_.acquire();   // released by stopStartupPump_()
             startupPumpAgent_  = std::make_unique<DriverPumpAgent>(*nodeDriver_, *aeron_, startupGate_);
             startupPumpIdle_   = makeBackoffIdle(config_.idleMaxParkUs);
             startupPumpRunner_ = std::make_unique<rune::consensus::AgentRunner>(
@@ -2971,6 +2974,9 @@ void BrokerNode::buildGateway() {
     if (!config_.isSingleNode() && election_ && workerPool_) {
         for (int32_t i = 0; i < workerPool_->workerCount(); ++i) workerPool_->worker(i).requireViewReadLease();
         runtimeAgent_->enableReadLeaseFanout(workerPool_->workerCount());
+        election_->setReadLeaseMaxNs(config_.readLeaseMaxMs * 1'000'000LL);
+        if (metadataService_)
+            metadataService_->setReadLeaseFenceWaitNs(election_->readLeaseFenceWaitNs());
         if (metadataService_)
             metadataService_->setLeaderMoveFence(
                 [](void* e, int32_t old, int64_t nowNs) noexcept {

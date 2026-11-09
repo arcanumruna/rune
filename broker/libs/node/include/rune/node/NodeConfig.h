@@ -365,6 +365,11 @@ struct NodeConfig {
     // never set in production.
     int64_t testUserDecisionHoldMs = 0;
 
+    // TEST-ONLY: L, the longest view read lease a controller grants or a broker holds (ms).  The leader-move fence
+    // W = L x 1.0201 follows it (issue #491), so a restart waits W before the controller fails a leader over.  Safety
+    // bound: only tests lower it, the same on every node; never set in production.  Default 200.
+    int64_t readLeaseMaxMs = 200;
+
     // TEST-ONLY: the client gateway's session lease (a session silent, or Lost on a worker, this long
     // is reaped).  Lets a stall-past-the-lease test stall a few seconds instead of outlasting the
     // 10 s default.  0 (default): ClientGateway::kDefaultSessionTimeoutNs; never set in production.

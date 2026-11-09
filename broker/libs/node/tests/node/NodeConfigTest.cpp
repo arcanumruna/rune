@@ -1,4 +1,5 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/consensus/ReadLease.h>
 #include <rune/node/TlsStartupPolicy.h>
 #include <rune/node/AuthDevMode.h>
 #include <rune/catalog/TopicName.h>
@@ -71,6 +72,10 @@ static std::map<std::string, std::string> legacyEnv(std::map<std::string, std::s
 // ---------------------------------------------------------------------------
 // Happy-path tests
 // ---------------------------------------------------------------------------
+
+TEST(NodeConfigTest, ReadLeaseMaxDefaultsToTheProductionBoundRegression) {
+    EXPECT_EQ(NodeConfig{}.readLeaseMaxMs * 1'000'000, rune::consensus::kReadLeaseMaxNs) << "#491: tests lower it, the default is the safety bound";
+}
 
 TEST(NodeConfigTest, ValidThreeNodeConfig) {
     auto r = parseNodeConfig(fakeEnv(base3node()));

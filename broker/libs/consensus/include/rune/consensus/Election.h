@@ -334,7 +334,14 @@ public:
     /// Test seam: an injected lease clock (default: leaseClockNowNs).  Construction time, before the first doWork.
     void setLeaseClockForTest(LeaseClockFn fn, void* ctx) noexcept { leaseClockFn_ = fn; leaseClockCtx_ = ctx; }
     /// W (ReadLease.h kReadLeaseFenceWaitNs): a lease granted before a moment has ended W after it, on any clock.
-    [[nodiscard]] static constexpr int64_t readLeaseFenceWaitNs() noexcept { return kReadLeaseFenceWaitNs; }
+    [[nodiscard]] int64_t readLeaseFenceWaitNs() const noexcept { return leaseFenceWaitNs_; }
+    /// L for every lease this node grants or holds, and W = L(1+rho)^2 from it.  Construction time, before the first
+    /// doWork, and the same on every member: only tests lower it from kReadLeaseMaxNs.
+    void setReadLeaseMaxNs(int64_t maxLeaseNs) noexcept {
+        leaseFenceWaitNs_ = leaseGrowByDrift(maxLeaseNs);
+        leaseGrantor_.setMaxLease(maxLeaseNs);
+        leaseHolder_.setMaxLease(maxLeaseNs);
+    }
     /// Issue #486: the members whose lease the controller stops renewing (a leader move off them waits).  Control thread.
     void setReadLeaseWithheld(uint32_t mask) noexcept { leaseGrantor_.setWithheld(mask); }
     /// Issue #486 (VLS A.8): may this controller commit a leader move that takes leadership off `oldLeader` and drops
@@ -713,6 +720,7 @@ private:
     void*            commitPosCtx_  = nullptr;
     LeaseClockFn     leaseClockFn_  = nullptr;
     void*            leaseClockCtx_ = nullptr;
+    int64_t          leaseFenceWaitNs_ = kReadLeaseFenceWaitNs;
     [[nodiscard]] int64_t leaseNow_() const noexcept {
         return leaseClockFn_ != nullptr ? leaseClockFn_(leaseClockCtx_) : leaseClockNowNs();
     }

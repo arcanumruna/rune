@@ -1418,7 +1418,7 @@ bool Election::readLeaseControllerSettled(int64_t nowNs) const noexcept
 {
     if (clusterMembers_.size() <= 1) return true;   // a single node leads alone: no other lease exists
     if (state_ != ElectionState::Closed || leaderMember_ == nullptr || leaderMember_->id != thisMemberId_) return false;
-    return leaderSinceNs_ != INT64_MIN && nowNs - leaderSinceNs_ >= kReadLeaseFenceWaitNs;
+    return leaderSinceNs_ != INT64_MIN && nowNs - leaderSinceNs_ >= leaseFenceWaitNs_;
 }
 
 bool Election::readLeaseMoveFenceOpen(NodeId oldLeader, int64_t nowNs) const noexcept
