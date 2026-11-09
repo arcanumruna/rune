@@ -54,10 +54,10 @@ Cluster startCluster(const std::string& tag) {
 rc::ClientConfig quickConfig(Cluster& c, int id) {
     rc::ClientConfig cfg = rune::node::test::catalog_cluster::clientConfigFor(c, id);
     cfg = c.driver->attach(cfg);
-    cfg.responseTimeoutNs = std::chrono::nanoseconds(500ms).count();
-    cfg.keepaliveIntervalNs = std::chrono::nanoseconds(100ms).count();
+    cfg.responseTimeoutNs = std::chrono::nanoseconds(300ms).count();
+    cfg.keepaliveIntervalNs = std::chrono::nanoseconds(60ms).count();
     cfg.ddlRetryBackoff = 5ms;
-    cfg.produceTimeoutMs = 500;
+    cfg.produceTimeoutMs = 300;
     return cfg;
 }
 
