@@ -1205,7 +1205,17 @@ public:
     struct RigPlan { int64_t offset; rune::storage::control_record::VerdictPlanHeader header; std::vector<uint8_t> plan, outputDescriptor, sourceDescriptor; };   ///< a type-20 record
     struct RigTxnMarker { int64_t offset; int64_t producerId; bool commit; };   ///< a COMMIT / ABORT marker
     struct RigJudge { int64_t offset; int64_t producerId; int16_t epoch; int64_t firstOffset; };   ///< a TxnJudge record
-    struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; std::vector<std::pair<int64_t, uint64_t>> reservations; std::vector<RigPlan> plans; std::vector<RigTxnMarker> txnMarkers; std::vector<RigJudge> judges; };   ///< reservations: (offset, reserved-through n)
+    struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; std::vector<std::pair<int64_t, uint64_t>> reservations; std::vector<RigPlan> plans; std::vector<RigTxnMarker> txnMarkers; std::vector<RigJudge> judges;
+        /// One past the last record that gets a verdict: an aborted transaction's records get none, and no marker covers a trailing range of them.
+        [[nodiscard]] int64_t judgedEnd() const {
+            int64_t end = 0;
+            for (const RigLogRec& d : data) {
+                const auto m = std::find_if(txnMarkers.begin(), txnMarkers.end(), [&](const RigTxnMarker& x) { return x.producerId == d.producerId && x.offset > d.offset; });
+                if (!d.txn || m == txnMarkers.end() || m->commit) end = d.offset + 1;
+            }
+            return end;
+        }
+    };   ///< reservations: (offset, reserved-through n)
 
     /// Every data record, change record and marker below `through`, in offset order, straight from the segments.
     [[nodiscard]] RigLog readLog(int64_t through = INT64_MAX) const;
@@ -1648,11 +1658,13 @@ struct TxnPair {
     VerdictRig::TxnEnd commit(int64_t pid) {
         VerdictRig::TxnEnd end;
         end.committed = true;
+        int32_t index = 0;
         for (VerdictRig* r : {&a, &b}) {
             const int64_t tok = r->sendVote(VerdictRig::kSrc, pid, 0);
             EXPECT_TRUE(r->driveUntilVoted(tok));
             const auto v = r->voteReply(tok);
-            if (v) end.votes.emplace_back(static_cast<int32_t>(end.votes.size()), *v);
+            if (v) end.votes.emplace_back(index, *v);
+            ++index;
             end.committed = end.committed && v && v->errorCode == 0 && v->code == 0;
         }
         mark_(pid, end.committed);

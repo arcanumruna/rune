@@ -745,7 +745,7 @@ public:
         const auto judgeAll = [&] {
             waitCommitted_();
             const auto appended = r_.readLog();
-            const int64_t reach = std::max(judgedEnd_(appended), appended.changes.empty() ? 0 : appended.changes.back().offset + 1);
+            const int64_t reach = std::max(appended.judgedEnd(), appended.changes.empty() ? 0 : appended.changes.back().offset + 1);
             EXPECT_TRUE(r_.driveUntilJudged(reach, VerdictRig::kMaxPass * strictFactor_()));
             r_.passes(60);
             return reach;
@@ -788,7 +788,7 @@ public:
         std::set<int64_t> present;
         for (const auto& d : r_.readLog().data) present.insert(d.offset);
         r_.restart();
-        ASSERT_TRUE(r_.driveUntilJudged(judgedEnd_(r_.readLog())));
+        ASSERT_TRUE(r_.driveUntilJudged(r_.readLog().judgedEnd()));
         r_.passes(60);
         checkIndex(r_, model, &present);
         ASSERT_TRUE(waitReady_());
@@ -872,16 +872,6 @@ private:
         }
         EXPECT_EQ(r_.replica->highWatermark(), r_.leo());
     }
-    /// One past the last record that needs a verdict: an aborted transaction at the tail needs none.
-    static int64_t judgedEnd_(const VerdictRig::RigLog& log) {
-        int64_t end = 0;
-        for (const auto& d : log.data) {
-            const bool aborted = d.txn && std::any_of(log.txnMarkers.begin(), log.txnMarkers.end(), [&](const auto& m) { return m.producerId == d.producerId && !m.commit; });
-            if (!aborted) end = d.offset + 1;
-        }
-        return end;
-    }
-
     bool waitReady_() {
         for (int i = 0; i < VerdictRig::kMaxPass; ++i) {
             if (r_.autoIncState() && r_.worker->rcStatusForTest(VerdictRig::kSrc, setup_.partition) == Worker::kRcReady) return true;
@@ -2212,6 +2202,98 @@ TEST(CheckedWritesModel, CoverageProblemFlagsAMarkerPastAnUndecidedTransaction) 
     EXPECT_NE(problem(logOf(true, false, 5, 3)), "") << "a commit without a TxnJudge: no marker ends inside (first, marker]";
     EXPECT_EQ(problem(logOf(true, false, 5, 5)), "") << "past the commit marker is covered";
     EXPECT_EQ(problem(logOf(false, false, 5, 4)), "") << "an abort drops the records; ending at its marker is harmless";
+}
+
+// Between the TxnJudge and the marker a yes vote still holds K at the first record (it stays locked); a no vote is final at the TxnJudge.
+TEST(CheckedWritesModel, CoverageProblemAfterTheTxnJudgeDependsOnTheVote) {
+    using Log = VerdictRig::RigLog;
+    const auto logOf = [](bool outsideWrite) {
+        Log log;
+        const auto put = [&](int64_t o, uint64_t id, int64_t pid) {
+            VerdictRig::RigLogRec r{o, id, 10, 0, false};
+            r.producerId = pid; r.txn = pid >= 0;
+            log.data.push_back(r);
+        };
+        put(0, 9, -1);
+        put(1, 1, 77);
+        put(2, outsideWrite ? 1 : 5, -1);   // producer 78's update of the transaction's key, or another key
+        log.judges.push_back({3, 77, 0, 1});
+        log.markers.push_back({4, {0, 4, 0, 0}, {}});   // ends past the first record, between the TxnJudge and the marker
+        log.txnMarkers.push_back({5, 77, true});
+        return log;
+    };
+    const auto problem = [&](const Log& log) {
+        CheckedWritesModel m;
+        m.reset(log);
+        return m.coverageProblem(log);
+    };
+    EXPECT_NE(problem(logOf(false)), "") << "a yes vote stays locked until its marker";
+    EXPECT_EQ(problem(logOf(true)), "") << "a TxnConflict no is final at the TxnJudge";
+}
+
+// Hand-built logs on a key-index and unique-name source: the order of the judge (constraints, then the conflict scan) and the waits of P11-4.
+TEST(CheckedWritesModel, TxnJudgeOrderAndWaitsOnHandBuiltLogs) {
+    using Log = VerdictRig::RigLog;
+    using Kind = rune::view::VerdictViewKind;
+    constexpr uint64_t kName = 7, kFingerprint = 99;
+    const auto build = [&](const std::function<void(const std::function<int64_t(uint64_t, const char*, int64_t)>&, Log&)>& fill) {
+        Log log;
+        log.changes.push_back({0, {{0, static_cast<uint8_t>(Kind::KeyIndex), kKeyIndexPlanFingerprint}, {kName, static_cast<uint8_t>(Kind::Unique), kFingerprint}}});
+        int64_t off = 1;
+        fill([&](uint64_t id, const char* name, int64_t pid) {
+            VerdictRig::RigLogRec r{off, id, 1, 0, false, 0, 0, name};
+            r.producerId = pid; r.txn = pid >= 0;
+            log.data.push_back(r);
+            return off++;
+        }, log);
+        return log;
+    };
+    const auto judged = [&](const Log& log) {
+        CheckedWritesModel m;
+        m.addKeyIndexRule();
+        m.addLowerNameUniqueRule(kName);
+        m.reset(log);
+        return m;
+    };
+    {   // R1: a rename onto another key's name with an outside write on its own key before the TxnJudge answers the constraint, not TxnConflict
+        int64_t rename = -1;
+        const Log log = build([&](const auto& put, Log& l) {
+            put(1, "a", -1); put(2, "b", -1);
+            rename = put(1, "B", 77);
+            put(1, "a", -1);
+            l.judges.push_back({5, 77, 0, rename});
+            l.txnMarkers.push_back({6, 77, true});
+        });
+        const CheckedWritesModel m = judged(log);
+        ASSERT_TRUE(m.vote(77));
+        EXPECT_EQ(m.vote(77)->code, CheckedWritesModel::kConstraintViolation);
+        EXPECT_EQ(m.vote(77)->failingOffset, rename);
+    }
+    {   // P11-4: 79's TxnJudge touches the name 77's yes vote locks and 77's marker is not in the log: the judge stops there and 79 has no vote
+        const Log log = build([&](const auto& put, Log& l) {
+            put(1, "a", -1);
+            const int64_t first77 = put(3, "x", 77);
+            l.judges.push_back({3, 77, 0, first77});
+            const int64_t first79 = put(4, "X", 79);
+            l.judges.push_back({5, 79, 0, first79});
+        });
+        const CheckedWritesModel m = judged(log);
+        ASSERT_TRUE(m.vote(77));
+        EXPECT_EQ(m.vote(77)->code, 0);
+        EXPECT_EQ(m.judgeStop(), 5);
+        EXPECT_FALSE(m.vote(79));
+    }
+    {   // 78's yes-voted record on 77's key lies in 77's scan range, but its marker is not in the log: 77's TxnJudge waits for it
+        const Log log = build([&](const auto& put, Log& l) {
+            const int64_t first77 = put(1, "z", 77);
+            const int64_t first78 = put(1, "y", 78);
+            l.judges.push_back({3, 78, 0, first78});
+            l.judges.push_back({4, 77, 0, first77});
+        });
+        const CheckedWritesModel m = judged(log);
+        EXPECT_EQ(m.judgeStop(), 4);
+        EXPECT_FALSE(m.vote(77));
+    }
 }
 
 // A hand-built log, judged by the model alone: no broker code runs.

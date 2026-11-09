@@ -383,15 +383,7 @@ private:
         }
     }
 
-    // One past the last record that gets a verdict: the judge skips an aborted transaction's records and emits no marker for a
-    // trailing range of them.
-    int64_t judgedEnd_(const VerdictRig::RigLog& log) const {
-        int64_t end = 0;
-        for (const auto& d : log.data)
-            if (aborted_.count(d.offset) == 0) end = d.offset + 1;
-        return end;
-    }
-    bool judged_() { return rig_.driveUntilJudged(judgedEnd_(rig_.readLog())); }
+    bool judged_() { return rig_.driveUntilJudged(rig_.readLog().judgedEnd()); }
 
     std::vector<Rec> intentBatch_(uint64_t n) {
         std::vector<Rec> recs;
@@ -491,8 +483,6 @@ private:
         rig_.marker(pid, commit);
         rig_.followerFetch();   // a failover or a cut must not lose the marker: the transaction would be open again
         rig_.passes(4);
-        if (!commit)
-            for (uint64_t i = 0; i < n; ++i) aborted_.insert(a->baseOffset + static_cast<int64_t>(i));
     }
 
     // What a raw and a push-read subscription from 0 deliver: the accepted records with their intents.  Never an aborted
@@ -540,10 +530,13 @@ private:
         const VerdictRig::RigLog log = rig_.readLog(hw);
         for (const auto& d : log.data) data_[d.offset] = d;
         for (const auto& ch : log.changes) changes_[ch.offset] = ch;
+        for (const auto& m : log.txnMarkers) marks_[m.offset] = m;
+        for (const auto& j : log.judges) judges_[j.offset] = j;
         VerdictRig::RigLog all;
-        for (const auto& kv : data_)
-            if (aborted_.count(kv.first) == 0) all.data.push_back(kv.second);
+        for (const auto& kv : data_) all.data.push_back(kv.second);
         for (const auto& kv : changes_) all.changes.push_back(kv.second);
+        for (const auto& kv : marks_) all.txnMarkers.push_back(kv.second);
+        for (const auto& kv : judges_) all.judges.push_back(kv.second);
         CheckedWritesModel model;
         model.declareRule(kObjTag, tagRule(9).fingerprint(), CheckedWritesModel::tagEquals(9));
         model.addKeyIndexRule();
@@ -555,7 +548,7 @@ private:
         rig_.driveUntilFolded(kProj, dataEnd);
         rig_.driveUntilFolded(kCnt, dataEnd);
         checkIndex(rig_, model, &present);
-        if (!log.data.empty() && !log.markers.empty() && !log.changes.empty()) checkMarkers(model, log, judgedEnd_(log), compacted_);
+        if (!log.data.empty() && !log.markers.empty() && !log.changes.empty()) checkMarkers(model, log, log.judgedEnd(), compacted_);
         for (const Pending& p : pending_) checkModelTrailer(model, p.ack, p.n, p.corr);
         checkIntentVerdicts_(model, log, hw);
         pending_.clear();
@@ -575,8 +568,10 @@ private:
     std::vector<Pending> pending_;
     std::map<int64_t, VerdictRig::RigLogRec> data_;
     std::map<int64_t, VerdictRig::RigChange> changes_;
+    std::map<int64_t, VerdictRig::RigTxnMarker> marks_;
+    std::map<int64_t, VerdictRig::RigJudge> judges_;
     std::map<int64_t, ModelVerdict> reported_;
-    std::set<int64_t> acceptedByAck_, aborted_;
+    std::set<int64_t> acceptedByAck_;
     int32_t rejTopic_ = 0, rejSeq_ = 0;
     int64_t vSeq_ = 0, txns_ = 0;
     bool compact_ = false, compacted_ = false, setChanged_ = false;
@@ -804,7 +799,7 @@ private:
         if (::testing::Test::HasFatalFailure()) return;
         absorb_(rig_.readLog(rig_.replica->highWatermark()));
         const AutoIncReady counter = *rig_.autoIncState();
-        EXPECT_TRUE(idModel_.counterAboveEveryId(history_(true), counter)) << "CounterAboveEveryId: nextN " << counter.nextN << " reserved " << counter.reservedThroughN;
+        EXPECT_TRUE(idModel_.counterAboveEveryId(history_(), counter)) << "CounterAboveEveryId: nextN " << counter.nextN << " reserved " << counter.reservedThroughN;
         if (rebuilt) EXPECT_EQ(counter.nextN, counter.reservedThroughN + 1) << "a rebuilt counter resumes above the reservation";
         (void)sendIdem_(producers_[rng_() % 2], createBatch_(1 + rng_() % 4));   // the first batch after an activation takes its ids from the rebuilt counter
     }
@@ -841,15 +836,7 @@ private:
         }
     }
 
-    // One past the last record that gets a verdict: the judge skips an aborted transaction's records and emits no marker for a
-    // trailing range of them.
-    int64_t judgedEnd_(const VerdictRig::RigLog& log) const {
-        int64_t end = 0;
-        for (const auto& d : log.data)
-            if (aborted_.count(d.offset) == 0) end = d.offset + 1;
-        return end;
-    }
-    bool judged_() { return rig_.driveUntilJudged(judgedEnd_(rig_.readLog())); }
+    bool judged_() { return rig_.driveUntilJudged(rig_.readLog().judgedEnd()); }
 
     uint8_t tag_() { return rng_() % 5 == 0 ? 9 : static_cast<uint8_t>(1 + rng_() % 2); }
     std::vector<Rec> createBatch_(uint64_t n) {
@@ -987,21 +974,22 @@ private:
         rig_.marker(pid, commit);
         rig_.followerFetch();   // a failover or a cut must not lose the marker: the transaction would be open again
         rig_.passes(4);
-        if (!commit)
-            for (std::size_t i = 0; i < recs.size(); ++i) aborted_.insert(a->baseOffset + static_cast<int64_t>(i));
     }
 
     // Everything committed that was ever read: a compaction may remove records from the log later, the checks still judge them.
     void absorb_(const VerdictRig::RigLog& log) {
         for (const auto& d : log.data) data_[d.offset] = d;
         for (const auto& ch : log.changes) changes_[ch.offset] = ch;
+        for (const auto& m : log.txnMarkers) marks_[m.offset] = m;
+        for (const auto& j : log.judges) judges_[j.offset] = j;
         for (const auto& [off, through] : log.reservations) reservations_[off] = through;
     }
-    VerdictRig::RigLog history_(bool withAborted) const {
+    VerdictRig::RigLog history_() const {
         VerdictRig::RigLog out;
-        for (const auto& kv : data_)
-            if (withAborted || aborted_.count(kv.first) == 0) out.data.push_back(kv.second);
+        for (const auto& kv : data_) out.data.push_back(kv.second);
         for (const auto& kv : changes_) out.changes.push_back(kv.second);
+        for (const auto& kv : marks_) out.txnMarkers.push_back(kv.second);
+        for (const auto& kv : judges_) out.judges.push_back(kv.second);
         for (const auto& kv : reservations_) out.reservations.emplace_back(kv.first, kv.second);
         return out;
     }
@@ -1048,7 +1036,7 @@ private:
     // The ids: NoIdTwiceNoReuse, IdsFollowTheStride, ReservationCoversEveryId and AckedIdsMatchTheLog over everything committed, and the side
     // window and the assigned ids of the live worker.
     void checkIds_() {
-        const VerdictRig::RigLog full = history_(true);
+        const VerdictRig::RigLog full = history_();
         std::vector<CheckedWritesModel::AutoIncAck> acks;
         for (const auto& [offset, a] : keyZero_) acks.push_back(a);
         EXPECT_TRUE(idModel_.noIdTwiceNoReuse(full, acks)) << "NoIdTwiceNoReuse";
@@ -1064,7 +1052,7 @@ private:
         const int64_t hw = rig_.replica->highWatermark();
         const VerdictRig::RigLog log = rig_.readLog(hw);
         absorb_(log);
-        const VerdictRig::RigLog all = history_(false);
+        const VerdictRig::RigLog all = history_();
         CheckedWritesModel model;
         model.declareRule(kObjTag, tagRule(9).fingerprint(), CheckedWritesModel::tagEquals(9));
         model.addAutoIncRule(shape_, partition_);
@@ -1076,7 +1064,7 @@ private:
         rig_.driveUntilFolded(kProj, dataEnd);
         rig_.driveUntilFolded(kCnt, dataEnd);
         checkIndex(rig_, model, &present);
-        if (!log.data.empty() && !log.markers.empty() && !log.changes.empty()) checkMarkers(model, log, judgedEnd_(log), compacted_);
+        if (!log.data.empty() && !log.markers.empty() && !log.changes.empty()) checkMarkers(model, log, log.judgedEnd(), compacted_);
         for (const Pending& p : pending_) checkModelTrailer(model, p.ack, p.n, p.corr);
         checkIntentVerdicts_(model, log, hw);
         pending_.clear();
@@ -1114,9 +1102,11 @@ private:
     std::map<int64_t, CheckedWritesModel::AutoIncAck> keyZero_;
     std::map<int64_t, VerdictRig::RigLogRec> data_;
     std::map<int64_t, VerdictRig::RigChange> changes_;
+    std::map<int64_t, VerdictRig::RigTxnMarker> marks_;
+    std::map<int64_t, VerdictRig::RigJudge> judges_;
     std::map<int64_t, uint64_t> reservations_;
     std::map<int64_t, ModelVerdict> reported_;
-    std::set<int64_t> acceptedByAck_, aborted_;
+    std::set<int64_t> acceptedByAck_;
     int32_t rejTopic_ = 0, rejSeq_ = 0;
     int64_t vSeq_ = 0, txns_ = 0;
     bool compact_ = false, compacted_ = false, setChanged_ = false;

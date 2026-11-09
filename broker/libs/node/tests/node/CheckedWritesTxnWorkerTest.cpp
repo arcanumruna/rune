@@ -1,6 +1,7 @@
 // Checked writes Part 11 Task 7: the TxnVote op on a real Worker - the vote-time scan, the TxnJudge record J, answers parked until
 // the judge judged J, the marker's answer held until its transaction is final, the stats 11-20 and the read_uncommitted bound.
 // A transaction with intents is written by replication where the test needs the previous leader's bytes.
+#include "CheckedWritesModel.h"
 #include "CheckedWritesRig.h"
 
 #include <rune/protocol/client/StatsMessages.h>
@@ -698,6 +699,34 @@ TEST(CheckedWritesTxnWorkerRegression, CoverageNeverInsideAnAppliedOrdinaryTxnRe
     EXPECT_TRUE(r.hasRow(kRej, 3));
     EXPECT_TRUE(r.hasRow(kRej, 4));
     EXPECT_TRUE(r.hasRow(kRej, 29));
+}
+
+// REGRESSION (design 3.1, P11-2): a verdict marker appended while the judge waits at a later transaction B opened inside the span (first, M]
+// of an ordinary T must not end past T's first record: the log check (CheckedWritesModel::coverageProblem) sees it.  Without the third
+// term of judgedThrough the marker ends at B's first record, inside T's span.
+TEST(CheckedWritesTxnWorkerRegression, MarkerInsideAnOrdinarySpanIsCaughtByTheLogRegression) {
+    VerdictRig r;
+    r.createKeyIndex();
+    r.enableAcks();
+    r.passes(50);
+    namespace tx = rune::transaction;
+    r.demote();
+    r.replicate({VerdictRig::batch({ups(1)}, kRaPid, 0, {}, /*txn=*/true), VerdictRig::batch({ups(2)}),
+                 VerdictRig::batch({ups(3)}, kRaPid + 1, 0, {}, /*txn=*/true), tx::ControlMarker::build(kRaPid, 0, tx::ControlType::Commit, 0)});
+    r.promoteWithoutPass();
+    for (int i = 0; i < 60; ++i) {
+        if (i % 8 == 0) r.followerFetch();
+        r.pass();
+    }
+    r.marker(kRaPid + 1, true);
+    ASSERT_TRUE(r.driveUntilJudged());
+    const VerdictRig::RigLog log = r.readLog();
+    ASSERT_FALSE(log.markers.empty());
+    CheckedWritesModel model;
+    model.addKeyIndexRule();
+    model.reset(log);
+    EXPECT_EQ(model.coverageProblem(log), "");
+    EXPECT_EQ(model.judgeStop(), INT64_MAX);
 }
 
 // REGRESSION (design 3.1): as above with the later transaction D voted: its TxnJudge defers it, so the judge passes D and applies T

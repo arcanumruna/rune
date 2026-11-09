@@ -1232,6 +1232,22 @@ TEST(CheckedWritesTxnJudgeRegression, OutsideWriteNewerThanTheTxnsLastWriteVotes
     EXPECT_EQ(r.st.txn.stats.votesNoConflict, 1u);
 }
 
+// The judge answers the constraint before the conflict scan: a record that fails a member is a 55 at that record even with an outside write
+// newer than the transaction's last on its key.
+TEST(CheckedWritesTxnJudgeRegression, ConstraintFailureIsAnsweredBeforeTheConflictScanRegression) {
+    JudgeRig r(VoteMembers{100});
+    r.start();
+    r.log.data({{1}, {2}});          // 10-11
+    r.log.data({{4, 9}}, 77);        // 12, fails the tag member
+    r.log.data({{4}});               // 13, an outside write newer than 77's last on id 4
+    r.log.judge(77, 12);             // 14
+    r.drive();
+    const DeferredTxn* t = r.st.txn.find(77);
+    EXPECT_EQ(t->phase, TxnPhase::Finalized);
+    EXPECT_EQ(t->answer.code, 55);
+    EXPECT_EQ(t->answer.failingOffset, 12);
+}
+
 // After the commit the view's id 4 is 77's record at 15, the latest record of id 4 in the log (what compaction keeps).
 TEST(CheckedWritesTxnJudgeRegression, OutsideWriteOlderThanTheTxnsLastWriteVotesYesRegression) {
     JudgeRig r(VoteMembers{100});

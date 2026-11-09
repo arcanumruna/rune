@@ -229,7 +229,7 @@ public:
         for (const auto& v : log.markers)
             for (const ModelTxn& t : txns_) {
                 const int64_t through = v.header.finalThrough;
-                if ((t.marker < 0 || v.offset < t.marker) && (t.judge < 0 || v.offset < t.judge) && through > t.first)
+                if ((t.marker < 0 || v.offset < t.marker) && !(t.judge >= 0 && v.offset > t.judge && t.vote && t.vote->code != 0) && through > t.first)
                     return "the marker at " + std::to_string(v.offset) + " ends at " + std::to_string(through) + ", past the first record " + std::to_string(t.first) + " of producer " + std::to_string(t.pid) + "'s undecided transaction";
                 if (t.judge < 0 && t.commit && t.first < through && through <= t.marker)
                     return "the marker at " + std::to_string(v.offset) + " ends at " + std::to_string(through) + ", inside the span " + std::to_string(t.first) + ".." + std::to_string(t.marker) + " of producer " + std::to_string(t.pid) + "'s transaction";
@@ -381,10 +381,13 @@ private:
             std::set<std::string> rows = chain_(recs, set).rows;
             if (!settle_(log, rows, recs.front()->offset)) return false;
         }
-        const Chain judged = chain_(recs, set);
-        if (judged.verdict) {
-            if (recs.size() == 1) verdicts_[recs.front()->offset] = *judged.verdict;
-            else for (const LogRec* rec : recs) verdicts_[rec->offset] = *judged.verdict;   // P11-6: the first failing record's verdict stands for the batch
+        if (recs.size() == 1) {
+            if (const auto verdict = firstVerdict_(set, *recs.front())) {
+                verdicts_[recs.front()->offset] = *verdict;
+                return true;
+            }
+        } else if (const Chain judged = chain_(recs, set); judged.verdict) {
+            for (const LogRec* rec : recs) verdicts_[rec->offset] = *judged.verdict;   // P11-6: the first failing record's verdict stands for the batch
             return true;
         }
         for (const LogRec* rec : recs) {
@@ -395,6 +398,7 @@ private:
     }
 
     /// Whether the other transaction's records are applied before `end` in judge order: committed, voted yes below `end`, or applied at a marker below it.
+    /// A yes vote without its marker never gets here: its rows are locked, and settle_ stops the judge at the first unit that meets them.
     [[nodiscard]] static bool appliedBefore_(const ModelTxn& other, int64_t end) {
         if (other.marker < 0 || !other.commit) return false;
         return other.judge >= 0 ? other.judge < end && other.vote && other.vote->code == 0 : other.marker < end && other.applied;
@@ -430,9 +434,9 @@ private:
     /// The rows of the transaction's records meet the locks of the transactions that voted before: they finalize first.  False: see settle_.
     bool settleTxn_(const VerdictRig::RigLog& log, const std::vector<std::pair<uint64_t, uint64_t>>& set, std::size_t t, int64_t offset) {
         if (locked_.empty()) return true;
-        std::set<std::string> rows;
-        (void)judgeWhole_(log, set, t, rows);
-        return settle_(log, rows, offset);
+        std::vector<const LogRec*> recs;
+        for (const int64_t o : txns_[t].offsets) recs.push_back(recordAt_(log, o));
+        return settle_(log, chain_(recs, set).rows, offset);
     }
     bool judgeTxn_(const VerdictRig::RigLog& log, const std::vector<std::pair<uint64_t, uint64_t>>& set, std::size_t t) {
         if (!settleTxn_(log, set, t, txns_[t].judge)) return false;
