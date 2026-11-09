@@ -1,6 +1,6 @@
 // Checked writes Part 11 Task 7: the TxnVote op on a real Worker - the vote-time scan, the TxnJudge record J, answers parked until
 // the judge judged J, the marker's answer held until its transaction is final, the stats 11-20 and the read_uncommitted bound.
-// A transaction with intents is written by replication (the produce path refuses it until Part 11 Task 12).
+// A transaction with intents is written by replication where the test needs the previous leader's bytes.
 #include "CheckedWritesRig.h"
 
 #include <rune/protocol/client/StatsMessages.h>
@@ -447,8 +447,8 @@ TEST(CheckedWritesTxnWorker, RefusedParkLeavesNoScanRegression) {
     EXPECT_EQ(k.r.worker->parkedVotesForTest(), 0);
 }
 
-// Task 7 (T7 review 1, F4): an atomic batch of txnJudgedRecordsMax + 1 records is rejected whole (62) instead of stalling the judge,
-// and stays rejected across a failover; the records after it are judged.
+// Task 7 (T7 review 1, F4): an atomic batch of txnJudgedRecordsMax + 1 records is refused by produce (rule 10); one that arrives by
+// replication is rejected whole (62) instead of stalling the judge, and stays rejected across a failover; the records after it are judged.
 TEST(CheckedWritesTxnWorker, AtomicBatchPastTheKnobIsRejectedAcrossAFailoverRegression) {
     Ki k;
     const int32_t knob = k.r.vs->txnJudgedRecordsMax();
@@ -456,8 +456,11 @@ TEST(CheckedWritesTxnWorker, AtomicBatchPastTheKnobIsRejectedAcrossAFailoverRegr
     for (int32_t i = 0; i <= knob; ++i) big.push_back(ups(1000 + uint64_t(i)));
     std::vector<uint8_t> bytes = VerdictRig::batch(big);
     VerdictRig::setBatchAttribute(bytes, rune::protocol::batch::kAttrAtomic);
-    const int64_t base = k.r.leo();
-    ASSERT_TRUE(k.r.ack(k.r.produceBytes(bytes, kLeader)));
+    const auto refused = k.r.ack(k.r.produceBytes(bytes, kLeader));
+    ASSERT_TRUE(refused);
+    EXPECT_EQ(refused->code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(k.r.worker->hookRefusalsForTest(HookRefusal::AtomicBatchTooLarge), 1u);
+    const int64_t base = k.r.appendTxnReplicated(bytes);
     ASSERT_TRUE(k.r.ack(k.r.produceFrame({ups(1)}, kLeader)));
     ASSERT_TRUE(k.r.driveUntilJudged());
     const auto rejectedWhole = [&] {
@@ -1062,4 +1065,44 @@ TEST(CheckedWritesTxnVoteFreezeRegression, NewLeaderVerifiesAgainAfterAVoteWitho
     EXPECT_GT(k.r.replica->logEndOffset(), leo);
     EXPECT_EQ(txnProduce(k, 70, 6, 2), 0) << "the open transaction is verified for good";
     EXPECT_EQ(k.r.worker->txnVerifyRequestsSentForTest(), 1u);
+}
+
+// P6-13: a voted-no transaction's key-0 ids are burned: the next create is above them, the key index holds neither, nothing is delivered.
+TEST(CheckedWritesTxnWorker, NoVoteBurnsTheTransactionsIds) {
+    VerdictRig r;
+    r.createCharacterTopic();
+    r.enableAcks();
+    r.passes(20);
+    r.createConstrainedView(ConstrainedView::AccountStats, 12);
+    const auto chars = [](int from, int to) {
+        std::vector<VerdictRig::SrcRecord> out;
+        for (int i = from; i < to; ++i) out.push_back(VerdictRig::srcOf(VerdictRig::Char{.userId = 11, .name = "c" + std::to_string(i), .intent = 1}));
+        return out;
+    };
+    constexpr uint8_t kAllView = pc::kAcksWireView | pc::kAcksWireAll;
+    const auto first = r.ack(r.appendRecords(chars(0, 11), kAllView, 40, 0));
+    ASSERT_TRUE(first);
+    ASSERT_EQ(first->code, 0);
+    ASSERT_TRUE(first->verdicts.empty());
+    const auto txn = r.ack(r.appendRecords(chars(20, 22), kAllView, 77, 0, /*txn=*/true));
+    ASSERT_TRUE(txn);
+    ASSERT_EQ(txn->code, 0);
+    const auto end = r.commitTxn(77);
+    EXPECT_FALSE(end.committed);
+    ASSERT_EQ(end.votes.size(), 1u);
+    EXPECT_EQ(end.votes.front().second.code, 55);
+    ASSERT_TRUE(r.driveUntilJudgeReaches());
+    const auto next = r.ack(r.appendRecords(chars(30, 31), kAllView, 40, 11));
+    ASSERT_TRUE(next);
+    ASSERT_EQ(next->code, 0);
+    EXPECT_GT(next->assignedBase, txn->assignedBase + 1) << "both of the aborted transaction's ids are burned";
+    ASSERT_TRUE(r.driveUntilJudgeReaches());
+    const std::set<uint64_t> keys = r.keyIndexKeys();
+    EXPECT_EQ(keys.count(txn->assignedBase), 0u);
+    EXPECT_EQ(keys.count(txn->assignedBase + 1), 0u);
+    EXPECT_EQ(keys.count(next->assignedBase), 1u);
+    const int64_t sub = r.subscribe(SubKind::Raw, 0);
+    for (const auto& d : r.collect(sub).records) {
+        EXPECT_TRUE(d.offset < txn->baseOffset || d.offset >= txn->baseOffset + 3) << "an aborted record was delivered at " << d.offset;
+    }
 }

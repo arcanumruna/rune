@@ -206,7 +206,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
   - **The judge bound** is the HW, no longer the LSO. Waits come only from the classification above, the pause rule (P11-4), overlay exhaustion (P11-5) and Part 04's own waits.
   - **Two positions.**
     - `VerdictSource::judgeCursor()` is where the judge stands. It may run ahead of deferred transactions.
-    - `judgedThrough()` becomes `min(judgeCursor, state.txn.earliestUndecidedFirst())`.
+    - `judgedThrough()` becomes `min(judgeCursor, state.txn.earliestUndecidedFirst(), min over ordinary_ of (first, holdFrom))`.
   - **What uses `judgedThrough()`.** Everything Part 04 bounds by it is unchanged: consumers, the `View` ack, markers (`[emitFrom, judgedThrough)`), the other views of the partition, and the judge's contribution to K. A deferred transaction therefore holds delivery, markers, W and `View` acks of later writes until it is decided, which is SD16's behaviour.
 - **P11-0 — One fold order everywhere (R11b, binding).** Every fold path applies a committed transaction's records **at its commit marker**, in offset order among themselves, and drops an aborted one's at its abort marker:
   - the live judge and the live fold of every other view;
@@ -837,7 +837,7 @@ The ten appended values belong to `cellsFor(Part::P11)` only. `cellsFor` of ever
       atomic batch (kAttrAtomic, not transactional): judgeAtomic_(batch)                      // Task 6
       other: 04's per-record judge
       the judge reaches a TxnJudge offset J of an entry in AwaitJudge: judgeTxn_(t)             // Task 6
-  judgedThrough() = min(judgeCursor_, state.txn.earliestUndecidedFirst())
+  judgedThrough() = min(judgeCursor_, state.txn.earliestUndecidedFirst(), min over ordinary_ of (first, holdFrom))
   K contribution of the judge (P4-2) = judgedThrough()
   ```
 

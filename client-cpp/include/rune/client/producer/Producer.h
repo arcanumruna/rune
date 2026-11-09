@@ -686,10 +686,10 @@ public:
     /// failure path; the void path has no acknowledgement to lose.
     /// A non-Upsert `intent` (here and in every send form below) is refused locally, before anything is queued or
     /// reserved, with SendResult::WriteNotAllowed (the blocking forms throw std::invalid_argument naming the
-    /// rule): on a raw handle, without View in the producer's acks, in a transaction, or Insert with an empty value.
+    /// rule): on a raw handle, without View in the producer's acks (a transactional producer needs none), or Insert with an empty value.
     /// A View producer also refuses every send on a raw handle.
     /// On a Modulo (autoincrement) handle a live Upsert is refused too, and so is a key-0 create from a producer that is not
-    /// idempotent or whose acks lack All; a key-0 create needs neither View nor Part G.
+    /// idempotent or whose acks lack All; a key-0 create needs no View.
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
                                      WriteIntent intent = WriteIntent::Upsert) noexcept;
 

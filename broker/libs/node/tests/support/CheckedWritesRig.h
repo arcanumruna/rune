@@ -273,8 +273,8 @@ public:
         for (const Entry& e : entries) recs.push_back(SrcRecord{e.id, 0, e.tombstone, {{"account", e.account}, {"amount", static_cast<uint64_t>(e.amount)}}, {{"memo", e.memo}}});
         return appendRecords(recs, wireAcks, pid, seq, txn, atomic);
     }
-    /// A transaction's batch the way a previous leader wrote it: this node takes it by replication and leads again (the produce
-    /// path refuses a transaction on a constrained source, and an intent in one, until Part 11 Task 12).  Returns its base offset.
+    /// A batch the way a previous leader wrote it: this node takes it by replication and leads again, so the write hook never
+    /// sees it.  Returns its base offset.
     int64_t appendTxnReplicated(std::vector<uint8_t> batch) {
         const int64_t base = leo();
         demote();
