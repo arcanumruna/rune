@@ -481,6 +481,23 @@ TEST(CheckedWritesTxnWorkerRegression, RejectedAtomicBatchResentAfterFailoverAns
     EXPECT_EQ(std::get<1>(again->verdicts[0]), kKeyExists);
 }
 
+// The Strict tier parks the ack on the fsync first (the durable pending): it carries `atomic` to the View pending too.
+TEST(CheckedWritesTxnWorkerRegression, StrictTierRejectedAtomicBatchAnswersOneEntryRegression) {
+    VerdictRig r(false, 64LL * 1024 * 1024, RigTuning{.durabilityTier = 2});
+    r.createKeyIndex();
+    r.enableAcks();
+    r.passes(60);
+    ASSERT_TRUE(r.ack(r.produceFrame({ins(1)}, kAllView, 62, 0)));
+    std::vector<uint8_t> bytes = VerdictRig::batch({ins(2), ins(1), ins(3)}, 62, 1);
+    VerdictRig::setBatchAttribute(bytes, rune::protocol::batch::kAttrAtomic);
+    const auto a = r.ack(r.produceBytes(bytes, kAllView, 62, 1));
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, 0);
+    ASSERT_EQ(a->verdicts.size(), 1u);
+    EXPECT_EQ(std::get<0>(a->verdicts[0]), 0);
+    EXPECT_EQ(std::get<1>(a->verdicts[0]), kKeyExists);
+}
+
 // Task 7 (T7 review 1, F4): an atomic batch of txnJudgedRecordsMax + 1 records is refused by produce (rule 10); one that arrives by
 // replication is rejected whole (62) instead of stalling the judge, and stays rejected across a failover; the records after it are judged.
 TEST(CheckedWritesTxnWorker, AtomicBatchPastTheKnobIsRejectedAcrossAFailoverRegression) {

@@ -677,7 +677,7 @@ Until this part ships, the §11.2 refusals apply.
   - `commitTransaction()` and `commitTransactionAndWait()` return the code and the `constraintId` on a no vote.
   - A transactional producer whose acks include `View` also waits, on commit, until every voting partition has made the rows final.
   - Inside a transaction, sends are acked as `All`. The verdict comes from the commit, so `View` on a single send is ignored.
-  - **Rejected atomic batch.** The View ack carries one trailer entry `{recordIndex 0, code, constraintId}`, and the client completes the batch once with `BrokerError`, `value` = the batch's base offset. This deviates from "the first failing record's index": the rejected-offset index and the verdict markers store no failure position, and every rejected record of an atomic batch carries the same code. Owner ruling, Task 12c (Q1).
+  - **Rejected atomic batch.** The View ack carries one trailer entry `{recordIndex 0, code, constraintId}`, and the client completes the batch once with `BrokerError`, `value` = the batch's base offset. This deviates from the Task 12 design's "first failing record's index" (G.6 leaves the entry's index open): the rejected-offset index and the verdict markers store no failure position, and every rejected record of an atomic batch carries the same code. Owner ruling, Task 12c (Q1).
 - **Cost.** One extra coordinator round trip on commit, only for transactions that touch a voting partition, plus the `TxnJudge` record and the lock pause.
 
 ## 10. Rune QL and the CLI

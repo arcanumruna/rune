@@ -9118,24 +9118,26 @@ private:
     enum class VerdictFill : uint8_t { Done, Deferred, TooMany };
     [[nodiscard]] VerdictFill fillVerdicts_(PendingAcksView& entry, const PartitionWriteState& ws) {
         const int64_t base = entry.ret.baseOffset;
+        // An atomic batch is judged whole, so its first rejected entry stands for all of them.
+        const int64_t firstRejected = entry.atomic ? ws.rejected.nextRejectedAtOrAfter(base) : base;
         std::size_t count = 0;
-        ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry&) { ++count; });
+        if (!entry.atomic) ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry&) { ++count; });
+        else if (firstRejected <= entry.lastOffset) count = 1;
         if (count > static_cast<std::size_t>(kMaxJudgedBatchRecords)) [[unlikely]] return VerdictFill::TooMany;
-        const uint16_t n = static_cast<uint16_t>(entry.atomic && count != 0 ? 1 : count);
+        const uint16_t n = static_cast<uint16_t>(count);
         uint32_t run = kNoVerdictRun;
         if (n != 0) {
             if (!ackSink_->reserveVerdicts(n, run)) return VerdictFill::Deferred;
             uint8_t* out = ackSink_->verdictEntries(run).data();
-            uint16_t left = n;
-            ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry& e) {
-                if (left == 0) return;
-                --left;
-                const uint16_t idx = entry.atomic ? uint16_t{0} : static_cast<uint16_t>(e.offset - base);
+            const auto put = [&](const rune::storage::RejectedOffsetIndex::Entry& e) {
+                const uint16_t idx = static_cast<uint16_t>(e.offset - base);
                 out[0] = static_cast<uint8_t>(idx); out[1] = static_cast<uint8_t>(idx >> 8);
                 out[2] = static_cast<uint8_t>(e.code); out[3] = static_cast<uint8_t>(e.code >> 8);
                 for (int i = 0; i < 4; ++i) out[4 + i] = static_cast<uint8_t>(e.constraintId >> (8 * i));
                 out += 8;
-            });
+            };
+            if (entry.atomic) put(*ws.rejected.find(firstRejected));
+            else ws.rejected.forEachIn(base, entry.lastOffset + 1, put);
         }
         if (entry.replay == 1 && ws.verdicts != nullptr) ++ws.verdicts->statsMut().verdictReplays;
         entry.ret.hasVerdicts = 1;

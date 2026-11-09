@@ -507,7 +507,8 @@ std::string idValue(uint64_t id) { return le(16, 2) + le(1, 2) + le(id, 8) + le(
 
 /// One client + producer over one topic; every send carries its own token and is awaited by it.
 struct Sender {
-    std::unique_ptr<rc::Client>      client;
+    std::unique_ptr<rc::Client>      owned;
+    rc::Client*                      client = nullptr;
     std::optional<rc::Producer>      prod;
     std::unique_ptr<rc::Completions> cq;
     std::optional<rc::TopicHandle>   topic;
@@ -515,7 +516,8 @@ struct Sender {
 
     Sender(rc::ClientConfig cfg, const std::string& name, int32_t topicId, int32_t parts, rc::Acks acks, const std::string& txnId = {}) {
         cfg.topics.push_back(rc::TopicSpec{name, topicId, parts});
-        client = std::make_unique<rc::Client>(cfg);
+        owned  = std::make_unique<rc::Client>(cfg);
+        client = owned.get();
         rc::ProducerConfig pc;
         pc.acks            = acks;
         pc.lingerUs        = 1;
@@ -525,9 +527,18 @@ struct Sender {
         cq = std::make_unique<rc::Completions>(*client);
         topic.emplace(client->topic(name));
     }
+    /// A producer on a client that is already connected (the broker fixture's own).
+    Sender(rc::Client& shared, int32_t topicId, rc::Acks acks) : client(&shared) {
+        rc::ProducerConfig pc;
+        pc.acks     = acks;
+        pc.lingerUs = 1;
+        prod.emplace(client->producer(pc));
+        cq = std::make_unique<rc::Completions>(*client);
+        topic.emplace(rc::TopicHandle{topicId, 1});
+    }
     ~Sender() {
         if (prod) prod->closeImmediately();
-        if (client) client->close();
+        if (owned) owned->close();
     }
 
     /// The token of the queued send of record `id`.
@@ -553,9 +564,9 @@ bool isOk(const std::optional<rc::Completion>& c) { return c && c->status == rc:
 
 void awaitLevel(BrokerNode& n) {
     bool raised = false;
-    for (int i = 0; i < 800 && !raised; ++i) {
+    for (int i = 0; i < 4000 && !raised; ++i) {
         raised = n.onWorkerThreadForTest(0, [](Worker& w) { return w.clusterFeatureLevelForTest(); }) >= rune::replication::MetadataFeature::kCheckedWrites;
-        if (!raised) std::this_thread::sleep_for(25ms);
+        if (!raised) std::this_thread::sleep_for(5ms);
     }
     ASSERT_TRUE(raised) << "the cluster feature level reaches kCheckedWrites";
 }
@@ -793,19 +804,19 @@ std::string verdictValue(uint64_t id, int64_t v, uint16_t tag) {
 void awaitSetLogged(BrokerNode& node, int32_t topicId) {
     const int32_t w = rune::metadata::ShardRouter(node.workerCountForTest()).workerForPartition(topicId, 0);
     bool logged = false;
-    for (int i = 0; i < 1200 && !logged; ++i) {
+    for (int i = 0; i < 12000 && !logged; ++i) {
         logged = node.onWorkerThreadForTest(w, [topicId](Worker& wk) {
             const PartitionWriteState* ws = wk.writeStateForTest(topicId, 0);
             return ws != nullptr && ws->constraintSets.latest().count != 0;
         });
-        if (!logged) std::this_thread::sleep_for(50ms);
+        if (!logged) std::this_thread::sleep_for(5ms);
     }
     ASSERT_TRUE(logged) << "the TestReject set change was never logged";
 }
 
 /// A typed {id, v, tag} topic `vt` (one partition) with TagEquals{9} (object 7) installed on the worker that serves it.
-int32_t defineVerdictSource(OneBroker& b) {
-    rc::Client& c = *b.connectClient();
+int32_t defineVerdictSource(OneBroker& b, rc::Client* connected = nullptr) {
+    rc::Client& c = connected != nullptr ? *connected : *b.connectClient();
     const auto t  = c.defineTopicAndWait("vt", 1, "id", rune::codec::serialize(cw::verdictSourceDescriptor()), rc::Persistence::Disk, {}, {}, 60s);
     EXPECT_EQ(t.errorCode, 0) << t.detail;
     awaitLevel(b.node());
@@ -871,8 +882,9 @@ TEST(CheckedWritesBrokerRegression, VerdictAcksCarryThePerRecordResultShardRegre
 // exactly the accepted records.  (The Tier-2 leg of this test is added with the Tier-2 change.)
 TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRegression) {
     OneBroker b("cw-batchverdict", OneBroker::Runtime::Shard);
-    const int32_t src = defineVerdictSource(b);
-    Sender s(b.clientConfig(), "vt", src, 1, kAllView);
+    rc::Client& admin = *b.connectClient();
+    const int32_t src = defineVerdictSource(b, &admin);
+    Sender s(admin, src, kAllView);
     const std::vector<uint16_t> tags = {1, 9, 1, 1, 9, 9};   // records 1, 4 and 5 are rejected (TagEquals 9)
     std::vector<std::string> vals;
     for (std::size_t i = 0; i < tags.size(); ++i) vals.push_back(verdictValue(1, 1, tags[i]));   // the claim has one key: id 1 throughout
@@ -947,12 +959,12 @@ TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRe
     ASSERT_TRUE(isOk(sc));
     const int64_t sentinelOff = sc->value;
     bool seen = false;
-    for (int i = 0; i < 1200 && !seen; ++i) {
+    for (int i = 0; i < 12000 && !seen; ++i) {
         {
             std::lock_guard<std::mutex> g(mu);
             seen = got.count(sentinelOff) != 0;
         }
-        if (!seen) std::this_thread::sleep_for(50ms);
+        if (!seen) std::this_thread::sleep_for(5ms);
     }
     ASSERT_TRUE(seen) << "the sentinel never reached the subscriber";
     sub.unsubscribe();
@@ -965,7 +977,7 @@ TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRe
 TEST(CheckedWritesBrokerRegression, FullyRejectedBatchIsSkippedOnTheGroupPathShardRegression) {
     OneBroker b("cw-groupskip", OneBroker::Runtime::Shard);
     const int32_t src = defineVerdictSource(b);
-    Sender s(b.clientConfig(), "vt", src, 1, kAllView);
+    Sender s(b.clientConfig(), "vt", src, 1, kAllView);   // the group resolves "vt" through this client's topics
     const std::string recKey = std::string("\x01\0\0\0\0\0\0\0", 8);   // the typed record key: id 1
     const auto sendBatch = [&](uint16_t tag, int n) -> std::pair<rc::Completion, std::vector<uint8_t>> {
         const uint64_t tok = s.next++;
@@ -1005,12 +1017,12 @@ TEST(CheckedWritesBrokerRegression, FullyRejectedBatchIsSkippedOnTheGroupPathSha
     });
     const int64_t lastC = cc.value + 2;
     bool arrived = false;
-    for (int i = 0; i < 1200 && !arrived; ++i) {   // 50 ms each: a 60 s deadline
+    for (int i = 0; i < 12000 && !arrived; ++i) {   // 5 ms each: a 60 s deadline
         {
             std::lock_guard<std::mutex> g(mu);
             arrived = got.count(lastC) != 0;
         }
-        if (!arrived) std::this_thread::sleep_for(50ms);
+        if (!arrived) std::this_thread::sleep_for(5ms);
     }
     ASSERT_TRUE(arrived) << "the group never delivered the last accepted record";
     std::lock_guard<std::mutex> g(mu);
