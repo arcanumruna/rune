@@ -138,8 +138,9 @@ and NAT egress merged. What exists today (line numbers are hints; use the quoted
     - **B** after Task 8: write hook, judge, predicates, cleaner (log semantics complete without expiry).
     - **C** after Task 13: the whole broker side (wheels, emitter, keepalive, checkpoints, reads).
     - **D** after Task 16: the client (LeaseTopic, LeaseSession, LeaseWatch).
-    - **E** after Task 19: Phase 1 done (matrix, 3-node, stress, e2e). Herald 02 may start building on Phase 1.
-    - **F** after Task 24: Phase 2 done (recipes, limits, metrics, gates, docs). Herald P0 leadership unblocked.
+    - **E** after Tasks 17–19 (one merged task): Phase 1 done (matrix, 3-node, stress, e2e). Herald 02 may start
+      building on Phase 1.
+    - **F** after Task 23 (reduced): Phase 2 done (recipes, limits). Herald P0 leadership unblocked.
       Before the final whole-branch review.
 - **Docker e2e** (Tasks 19, 20) runs on the shared Linux test VM from `$RUNE_VM_HOST`: hold the shared lock
   for the whole run, work only in your own directory, remove only containers and images you created (never
@@ -153,6 +154,19 @@ and NAT egress merged. What exists today (line numbers are hints; use the quoted
   P0 is declared done.
 - **Commits** end with the session's `Co-Authored-By:` and `Claude-Session:` trailers. Never `conan create/export/
   upload` locally.
+
+## Scope cut (owner, 2026-11-09)
+
+- **Reviews run per batch, not per task:** the tasks up to a checkpoint run back to back, then one review and one fix
+  round cover the whole batch.
+- **Per-task tests are focused:** each task runs its new and changed tests plus the suites covering the touched code
+  (`--gtest_filter`), never whole binaries. The full Regression suite runs only at the checkpoints.
+- **Tasks 17, 18 and 19 are one task** (interaction matrix and broker integration, seeded stress, Phase 1 e2e); its
+  steps are the union of the three below.
+- **Task 22 is deferred** (metrics, `show lease(s)`, `revoke lease`, CLI, and the items carried from Task 4). It is
+  not part of this branch.
+- **Task 23 is reduced** to shrinking `AckEntry` back to 64 bytes. The latency gates stay owed under #841–#845.
+- **Task 24 is folded into each task:** every task updates the spec and docs text it changes in its own commit.
 
 ## Global Constraints
 
