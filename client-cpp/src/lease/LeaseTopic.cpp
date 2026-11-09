@@ -122,8 +122,16 @@ OpResult LeaseTopicCore::revokeKey(std::span<const uint8_t> key, int64_t version
     if (closed_ || revokeRow_.size() < kMinLeaseRowBytes || revokeRow_.size() > scratch_.size()) return OpResult::InvalidArgument;
     if (!revokeKeyFits(key.size())) return OpResult::InvalidArgument;
     std::memcpy(scratch_.data(), revokeRow_.data(), revokeRow_.size());
-    std::memcpy(scratch_.data() + revokeKeyOffset_, key.data(), key.size());   // the row's key column must equal the record key
+    if (!patchKey(std::span<uint8_t>(scratch_.data(), revokeRow_.size()), key)) return OpResult::InvalidArgument;   // the row's key column must equal the record key
     return write(OpKind::LeaseRevoke, key, revokeRow_.size(), version, opts, target, token);
+}
+
+OpResult LeaseTopicCore::grantKey(std::span<const uint8_t> key, const LeaseOptions& opts, CompletionTarget target, Token token) noexcept {
+    if (closed_ || revokeRow_.size() < kMinLeaseRowBytes || revokeRow_.size() > scratch_.size()) return OpResult::InvalidArgument;
+    if (!revokeKeyFits(key.size())) return OpResult::InvalidArgument;
+    std::memcpy(scratch_.data(), revokeRow_.data(), revokeRow_.size());
+    if (!patchKey(std::span<uint8_t>(scratch_.data(), revokeRow_.size()), key)) return OpResult::InvalidArgument;
+    return write(OpKind::LeaseGrant, key, revokeRow_.size(), 0, opts, target, token);
 }
 
 OpResult LeaseTopicCore::writeRaw(OpKind kind, std::span<const uint8_t> key, std::span<const uint8_t> row, int64_t version,

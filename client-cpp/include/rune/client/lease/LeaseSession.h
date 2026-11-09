@@ -146,6 +146,10 @@ public:
     [[nodiscard]] uint32_t liveCount() const noexcept { return live_; }
     [[nodiscard]] LeaseEntryState stateOf(LeaseRef ref) const noexcept;
     [[nodiscard]] uint32_t sessionId() const noexcept { return sid_; }
+    /// Task 20: the session's holder id, a non-zero 64-bit random id drawn once at construction (std::random_device, the steady clock if that
+    /// throws).  The recipes write it into every grant (LeaseOptions::holder) and into their keys; it is NOT sessionId() (the guard's token).
+    [[nodiscard]] uint64_t holderId() const noexcept { return holderId_; }
+    [[nodiscard]] uint32_t capacity() const noexcept { return capacity_; }
     [[nodiscard]] bool refused() const noexcept { return refused_; }
     [[nodiscard]] uint64_t requestsSent() const noexcept { return requestsSent_; }
     [[nodiscard]] uint64_t okAnswers() const noexcept { return okAnswers_; }   ///< keepalive entries answered Ok so far
@@ -208,6 +212,7 @@ private:
     uint32_t     num_, den_;
     Completions  cq_;
     uint32_t     sid_ = 0;
+    uint64_t     holderId_ = 0;
     uint32_t     pool_ = 0;
     uint32_t     poolHeld_ = 0;        // reserve(48) calls that succeeded (returned in the destructor)
     uint64_t     consumed_ = 0;        // guard events consumed so far
@@ -286,6 +291,7 @@ public:
     [[nodiscard]] uint32_t liveCount() const noexcept { return core_.liveCount(); }
     [[nodiscard]] LeaseEntryState stateOf(LeaseRef ref) const noexcept { return core_.stateOf(ref); }
     [[nodiscard]] detail::LeaseSessionCore& core() noexcept { return core_; }
+    [[nodiscard]] uint64_t holderId() const noexcept { return core_.holderId(); }
 
 private:
     static void lostThunk_(void* ctx, LeaseRef ref, LostReason r) { static_cast<LeaseSession*>(ctx)->onLost_(ref, r); }

@@ -1266,6 +1266,8 @@ lock, and takes no lock in the client or the broker. Every operation is async
 - **A single-slot lock.** A key that is the lock itself, with no waiters (`acquire slot` → `KeyExists`), is etcd's
   `TryLock` with no queue. Herald's fenced workers use that form (§19.4).
 
+**As built (Task 20).** `LeaseOwnership` and `LeaseElection` are thin front ends over `detail::LeaseRecipeCore` (`client-cpp/src/lease/LeaseRecipe.cpp`), driven by a `LeaseRecipeHost<Capacity>` that owns the slot table and is fed `doWork`, `onLost` and `onAtRisk` by the caller. Key bytes: `name/<holderId 16 hex>-<campaignNo 8 hex>` zero-padded to the key column `string(N)`, so a name is at most N-26 bytes; the holder id is per `LeaseSession`, so competing participants (two processes in production) use separate sessions and watches. A completion target may be a handler in either client mode, but a `Completions` queue only in Invoker mode (the queue is single-producer; in Thread mode the duty thread would be a second producer), otherwise `InvalidArgument`. An unknown grant outcome (`VerdictUnknown`) reads the key from the lease view: it adopts the key when the holder matches, otherwise re-grants with `campaignNo+1`, at most 8 times. A waiter re-evaluates only when exactly its predecessor ends (etcd `waitDeletes`). Release completes when `stateOf(ref)==Free` or on `onLost`. Verified by `LeaseRecipeRegression.*` (stub), `LeaseRecipeBrokerRegression` (one node, Thread mode), `LeaseRecipeTrioRegression` (leader kill) and the ELECTION leg of `lease-e2e.sh` (not yet run on the Linux box).
+
 ### 12.4 Watching and listing
 
 - **Subscribing.** `client.subscribe(topic, AllPartitions{}, opts.filter(...), h)` on a lease topic delivers

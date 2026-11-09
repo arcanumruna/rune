@@ -39,8 +39,12 @@ struct LeaseModelRec {
 
 class LeaseModel {
 public:
-    struct Held { int64_t version = 0, granted = 0, updated = 0; };
-    static constexpr std::size_t kValueLen = 44, kRowLen = 57;
+    struct Held { int64_t version = 0, granted = 0, updated = 0; uint64_t holder = 0; };
+    static constexpr std::size_t kValueLen = 44, kRowLen = 57;   // the default (8-byte key column) layouts
+    /// Task 20: the key column's width.  The log value is 36 + keyWidth bytes, the view row 49 + keyWidth + 8 (kRowLen at width 8).
+    std::size_t keyWidth = 8;
+    [[nodiscard]] std::size_t valueLen() const { return 36 + keyWidth; }
+    [[nodiscard]] std::size_t rowLen() const { return 49 + keyWidth; }
 
     std::vector<LeaseModelRec> log;                 ///< offset = index
     std::map<Bytes, Held>      table;               ///< the folded lease view
@@ -49,45 +53,47 @@ public:
     [[nodiscard]] int64_t asOf() const { return asOfOverride ? *asOfOverride : static_cast<int64_t>(log.size()); }
     [[nodiscard]] bool held(const Bytes& key) const { return table.count(key) != 0; }
 
-    static Bytes value(int64_t version, const Bytes& key) {
-        Bytes v(kValueLen, 0);
+    static Bytes value(int64_t version, const Bytes& key, uint64_t holder = 0, std::size_t width = 8) {
+        Bytes v(36 + width, 0);
         v[0] = 40;
         v[2] = 1;
         std::memcpy(v.data() + 4, &version, 8);
         const uint64_t ttl = 3000;
         std::memcpy(v.data() + 12, &ttl, 8);
-        std::memcpy(v.data() + 36, key.data(), std::min<std::size_t>(8, key.size()));
+        std::memcpy(v.data() + 20, &holder, 8);
+        std::memcpy(v.data() + 36, key.data(), std::min<std::size_t>(width, key.size()));
         return v;
     }
-    static Bytes row(const Bytes& key, const Held& h) {
-        Bytes r(kRowLen, 0);   // bitmap 0: every slot present
+    static Bytes row(const Bytes& key, const Held& h, std::size_t width = 8) {
+        Bytes r(49 + width, 0);   // bitmap 0: every slot present
         std::memcpy(r.data() + 1, &h.version, 8);
         const uint64_t ttl = 3000;
         std::memcpy(r.data() + 9, &ttl, 8);
-        std::memcpy(r.data() + 33, key.data(), std::min<std::size_t>(8, key.size()));
-        std::memcpy(r.data() + 41, &h.granted, 8);
-        std::memcpy(r.data() + 49, &h.updated, 8);
+        std::memcpy(r.data() + 17, &h.holder, 8);
+        std::memcpy(r.data() + 33, key.data(), std::min<std::size_t>(width, key.size()));
+        std::memcpy(r.data() + 33 + width, &h.granted, 8);
+        std::memcpy(r.data() + 41 + width, &h.updated, 8);
         return r;
     }
 
     // ---- writes (each appends one log record and folds it) ----
-    int64_t grant(const Bytes& key) {
+    int64_t grant(const Bytes& key, uint64_t holder = 0) {
         const int64_t o = static_cast<int64_t>(log.size());
-        log.push_back({key, static_cast<uint8_t>(0), value(o, key)});   // Put; version == offset reads as Granted
-        table[key] = Held{o, o, o};
+        log.push_back({key, static_cast<uint8_t>(0), value(o, key, holder, keyWidth)});   // Put; version == offset reads as Granted
+        table[key] = Held{o, o, o, holder};
         return o;
     }
     int64_t update(const Bytes& key) {
         const int64_t o = static_cast<int64_t>(log.size());
         Held& h = table.at(key);
-        log.push_back({key, static_cast<uint8_t>(0), value(h.version, key)});   // Put; version != offset reads as Updated
+        log.push_back({key, static_cast<uint8_t>(0), value(h.version, key, h.holder, keyWidth)});   // Put; version != offset reads as Updated
         h.updated = o;
         return o;
     }
     int64_t end(const Bytes& key, rune::protocol::record::LeaseOp op) {
         const int64_t o = static_cast<int64_t>(log.size());
         const Held h = table.at(key);
-        log.push_back({key, rune::protocol::record::withLeaseOp(0, op), value(h.version, key)});
+        log.push_back({key, rune::protocol::record::withLeaseOp(0, op), value(h.version, key, h.holder, keyWidth)});
         table.erase(key);
         return o;
     }
@@ -128,7 +134,7 @@ public:
             [this](int endpoint, const uint8_t* b, std::size_t n) { onScan_(endpoint, b, n); };
     }
     void reset() {
-        for (auto& m : parts) m = LeaseModel{};
+        for (auto& m : parts) { const std::size_t w = m.keyWidth; m = LeaseModel{}; m.keyWidth = w; }
         seen.clear();
         held_.clear();
         hold = false;
@@ -216,7 +222,7 @@ private:
             while (take < cands.size() && cands[take].first == cands[take - 1].first) ++take;   // whole tie groups
             uint64_t last = s.first ? 0 : s.resumeHash;
             for (std::size_t i = 0; i < take; ++i) {
-                const Bytes rw = LeaseModel::row(cands[i].second->first, cands[i].second->second);
+                const Bytes rw = LeaseModel::row(cands[i].second->first, cands[i].second->second, lm.keyWidth);
                 rows.push_back(static_cast<uint8_t>(cands[i].second->first.size()));
                 rows.insert(rows.end(), cands[i].second->first.begin(), cands[i].second->first.end());
                 const auto rl = static_cast<uint32_t>(rw.size());

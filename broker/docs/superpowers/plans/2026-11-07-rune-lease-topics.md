@@ -1328,14 +1328,16 @@ key if not lowest (`ErrClaimed`); `release()`/`resign()` fenced revoke; `proclai
 and `observe()` from the watch; `onAtRisk(Entered)` suspends (`isLeader() == false`, callback runs), `Cleared`
 resumes iff still lowest; `token()` = version.
 
-- [ ] **Step 1: failing tests** `LeaseRecipeRegression.*`: `SharedWatchOneSubscriptionRegression` (2 000 elections, one
+- [x] **Step 1: failing tests** `LeaseRecipeRegression.*`: `SharedWatchOneSubscriptionRegression` (2 000 elections, one
   subscription); `KeyShapeRegression`; `VerdictUnknownAdoptOrRecampaignRegression`; `OwnershipOrderByVersionRegression`;
   `WaitDeletesPredecessorOnlyRegression`; `TryClaimCleansUpRegression`; `ObserveOncePerChangeRegression`;
   `AtRiskSuspendsResumesRegression`; `RecampaignAlwaysNewKeyRegression` (F1); `RecipeNoAllocRegression`; broker:
   `HolderExpiresNextWaiterOwnsRegression` (larger token), `LeaderChangeFoldedRegression`.
-- [ ] **Step 2:** e2e election leg on the VM: two campaigners, SIGSTOP the leader past the TTL, the other leads with a
+- [x] **Step 2:** e2e election leg on the VM: two campaigners, SIGSTOP the leader past the TTL, the other leads with a
   higher token, the first wakes, gets `onLost`, its guarded write is refused (spec §16.3).
 - [ ] **Step 3:** run `ctest --test-dir build -R 'LeaseRecipe' --output-on-failure -j8`; commit and push.
+
+**As built (Task 20).** See spec 12.3. The e2e election leg (`lease-e2e.sh`, `elect` driver subcommand) is written and syntax-checked (`bash -n`), not yet run on the VM; step 3 commit and push left to the orchestrator.
 
 ### Task 21: `max-leases`, view memory, the suspension matrix
 

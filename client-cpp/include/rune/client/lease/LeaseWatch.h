@@ -109,6 +109,15 @@ public:
     [[nodiscard]] int32_t registerName(std::span<const uint8_t> name);
     /// The live lease under `id` with the smallest version and its key (valid until the next doWork); nullopt when none.
     [[nodiscard]] std::optional<std::pair<int64_t, std::span<const uint8_t>>> lowest(int32_t id) const noexcept;
+    /// The live lease under `id` with the largest version below `version` and its key (valid until the next doWork); nullopt when none.  A
+    /// linear pass over the name's entries: bounded by waitersPerName.
+    [[nodiscard]] std::optional<std::pair<int64_t, std::span<const uint8_t>>> predecessor(int32_t id, int64_t version) const noexcept;
+    /// Binds ONE callback to the name `id` (the recipes): it runs, on the owner thread inside doWork, for every Granted / Updated / Revoked /
+    /// Expired / Vanished event whose key belongs to the name, AFTER the live set and the name's heap reflect the event; Ready and Failed go to
+    /// every bound name once.  false: an unknown id, a name that is already bound, no callback.  `gone` (optional) is called from the watch's
+    /// destructor, so the binder can forget the watch.  unbindName removes the binding made with the same `ctx`.
+    [[nodiscard]] bool bindName(int32_t id, LeaseEventFn fn, void* ctx, WatchGoneFn gone = nullptr) noexcept;
+    bool unbindName(int32_t id, void* ctx) noexcept;
 
     [[nodiscard]] int32_t topicId() const noexcept { return core_.topicId(); }
     // ---- observers (tests) ----
@@ -178,6 +187,7 @@ private:
         uint8_t  bytes[kMaxKey]{};
         uint8_t  len = 0;
         uint32_t heapBegin = 0, heapSize = 0;
+        Cb       bound{};   ///< the recipe bound to this name (bindName)
     };
     struct HeapItem { int64_t version = 0; uint32_t liveIdx = 0; };
     struct Prefix { uint8_t len = 0; uint8_t bytes[kMaxPrefixLen]{}; };

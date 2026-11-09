@@ -23,7 +23,9 @@
 #                  watcher's seed: then skipped and logged).  Bound (spec 9.6), for the last kill done:
 #                  `Expired` received at <= L + extend + R + BOUND_MS (L stands in for T_ready; R of the checkpoint seen just before);
 #   5. SUSPEND:    namespace e2e ReadOnly then RejectAll mid-TTL: an unkept lease still expires by S + TTL + BOUND_MS; resume;
-#                  a new grant works.
+#                  a new grant works;
+#   6. ELECTION:   two LeaseElection candidates on e2e/elect (TTL 3 s, one lease session each); the leader is SIGSTOPped past the TTL,
+#                  the other leads with a LARGER fencing token; the first is resumed and must report LOST and a REFUSED fenced write.
 #
 # Clock.  Expire / Checkpoint records carry timestamp 0, so every lateness is measured on RECEIVE time: the watcher stamps each
 # event with CLOCK_REALTIME (ms) in its handler, and the script's `date +%s%3N` is the same domain (containers share the host
@@ -77,6 +79,7 @@ SCALE_TTL_MS=10000
 SCALE_COUNT=10000
 GUARD_TTL_MS=3000
 CKPT_TTL_MS=15000
+ELECT_TTL_MS=3000
 NS="e2e"
 
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
@@ -386,6 +389,7 @@ drv_leg setup-scale 300 "${APP_USER}" app.pw "LEASE-E2E-SETUP: OK" setup --topic
 drv_leg setup-guard 300 "${APP_USER}" app.pw "LEASE-E2E-SETUP: OK" setup --topic guard --partitions 1 --ttl-ms "${GUARD_TTL_MS}"
 drv_leg setup-guard-data 300 "${APP_USER}" app.pw "LEASE-E2E-SETUP: OK" setup --topic guard_data --raw 1
 drv_leg setup-ckpt 300 "${APP_USER}" app.pw "LEASE-E2E-SETUP: OK" setup --topic ckpt --partitions 1 --ttl-ms "${CKPT_TTL_MS}" --checkpoint 1 --ckpt-interval-ms "${CKPT_INTERVAL_MS}"
+drv_leg setup-elect 300 "${APP_USER}" app.pw "LEASE-E2E-SETUP: OK" setup --topic elect --partitions 1 --ttl-ms "${ELECT_TTL_MS}"
 GUARD_ID=$(topic_id setup-guard) || true;  [ -n "${GUARD_ID}" ] || fail "setup printed no id for guard"
 GUARD_DATA_ID=$(topic_id setup-guard-data) || true;  [ -n "${GUARD_DATA_ID}" ] || fail "setup printed no id for guard_data"
 CKPT_ID=$(topic_id setup-ckpt) || true;  [ -n "${CKPT_ID}" ] || fail "setup printed no id for ckpt"
@@ -656,5 +660,35 @@ cli admin admin.pw namespace resume "${NS}" --broker "rune-1:${BROKER_PORT}" >/d
 drv_leg suspend-regrant 120 "${APP_USER}" app.pw "LEASE-E2E-GRANT: OK" grant --topic basic --key key-3
 stop_watcher suspend-watch
 leg_end SUSPEND "${LEG_S}"
+
+# ---------------------------------------------------------------------------
+# Leg 6: ELECTION (LeaseElection: a stalled leader loses the name to the next candidate with a larger token).
+# ---------------------------------------------------------------------------
+leg_begin ELECTION "two candidates on e2e/elect, TTL ${ELECT_TTL_MS} ms; the leader SIGSTOPped past the TTL; the other leads; the first resumed is fenced..."
+rm -f "${SHARED}"/elect-*
+drv_start elect-a $(( LEG_S )) "${APP_USER}" app.pw elect --topic elect --name ldr --tag 1 --out /shared/elect-a.out --stop-file /shared/elect-a.stop --max-s $(( LEG_S - 60 ))
+wait_until 120 "candidate A leading" has_line elect-a.out "LEADER 1 " || { out_of elect-a | tail -20 >&2; fail "candidate A did not lead within 120s"; }
+TOKEN_A=$(line_of elect-a.out "LEADER 1 " | awk '{print $3}')
+[ -n "${TOKEN_A}" ] || fail "no token in A's LEADER line"
+drv_start elect-b $(( LEG_S )) "${APP_USER}" app.pw elect --topic elect --name ldr --tag 2 --out /shared/elect-b.out --stop-file /shared/elect-b.stop --max-s $(( LEG_S - 60 ))
+wait_until 120 "candidate B campaigning" has_line elect-b.out "CAMPAIGN 2 " || { out_of elect-b | tail -20 >&2; fail "candidate B did not campaign within 120s"; }
+sleep $(( ELECT_TTL_MS / 1000 + 1 ))
+has_line elect-b.out "LEADER 2 " && fail "B led while A was alive (A's keepalives must hold the name)"
+has_line elect-a.out "LOST" && fail "A lost the name while alive"
+# SIGSTOP A's container past the TTL: its keepalives stop, the lease expires, B leads.
+docker pause "rune-lease-elect-a" >/dev/null || fail "could not pause candidate A"
+wait_until $(( ELECT_TTL_MS / 1000 + 60 )) "candidate B leading" has_line elect-b.out "LEADER 2 " || { docker unpause "rune-lease-elect-a" >/dev/null 2>&1 || true; out_of elect-b | tail -20 >&2; fail "B did not lead after A stalled past the TTL"; }
+TOKEN_B=$(line_of elect-b.out "LEADER 2 " | awk '{print $3}')
+[ -n "${TOKEN_B}" ] && [ "${TOKEN_B}" -gt "${TOKEN_A}" ] || fail "B's token ${TOKEN_B:-none} is not above A's ${TOKEN_A}"
+docker unpause "rune-lease-elect-a" >/dev/null || fail "could not resume candidate A"
+wait_until 120 "candidate A to report LOST" has_line elect-a.out "LOST 1 " || { out_of elect-a | tail -20 >&2; fail "A did not report LOST after resuming"; }
+wait_until 60 "candidate A fenced" has_line elect-a.out "FENCED 1 refused" || { out_of elect-a | tail -20 >&2; fail "A's fenced write was not refused"; }
+wait_until 60 "candidate A to end" bg_done elect-a || { out_of elect-a | tail -20 >&2; fail "A did not finish"; }
+bg_leg_check elect-a "LEASE-E2E-ELECT: OK"
+has_line elect-b.out "LOST" && fail "B lost the name while it was the leader"
+touch "${SHARED}/elect-b.stop"
+wait_until 60 "candidate B to stop" bg_done elect-b || { out_of elect-b | tail -20 >&2; fail "B did not stop"; }
+bg_leg_check elect-b "LEASE-E2E-ELECT: OK"
+leg_end ELECTION "${LEG_S}"
 
 echo "LEASE-E2E: OK"

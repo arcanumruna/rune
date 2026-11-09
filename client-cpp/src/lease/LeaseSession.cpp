@@ -6,8 +6,10 @@
 #include <rune/client/lease/detail/LeaseGuards.h>
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cstring>
+#include <random>
 
 namespace rune::client::detail {
 namespace {
@@ -21,6 +23,21 @@ constexpr uint64_t kKindKeepAlive = 1, kKindBestEffort = 2, kKindClose = 3;
 [[nodiscard]] uint64_t kaToken(uint32_t req, uint32_t gen) noexcept { return (kKindKeepAlive << 44) | (uint64_t{req} << 32) | gen; }
 [[nodiscard]] uint64_t revokeToken(uint64_t kind, uint32_t slot, uint32_t gen) noexcept {
     return (kind << 44) | (uint64_t{slot & 0xFFFu} << 32) | gen;
+}
+
+/// A non-zero 64-bit random id (two 32-bit std::random_device draws; the steady clock when the device throws; redrawn on 0).
+[[nodiscard]] uint64_t drawHolderId() noexcept {
+    for (;;) {
+        uint64_t v = 0;
+        try {
+            std::random_device rd;
+            v = (uint64_t{rd()} << 32) | uint64_t{rd()};
+        } catch (...) {
+            v = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+            v ^= v << 13; v ^= v >> 7; v ^= v << 17;   // xorshift: spreads the clock's low bits
+        }
+        if (v != 0) return v;
+    }
 }
 
 }  // namespace
@@ -54,6 +71,7 @@ LeaseSessionCore::LeaseSessionCore(Client& client, Entry* entries, uint32_t* can
     if (num_ == 0 || num_ >= den_) throw std::invalid_argument("LeaseSession: need 0 < atRiskNum < atRiskDen");
     if (3ull * num_ <= den_) throw std::invalid_argument("LeaseSession: need 3 * atRiskNum > atRiskDen (at risk beyond the keepalive period)");
     nextWorkNs_ = INT64_MAX;
+    holderId_   = drawHolderId();
     sid_        = cq_.cqRef();
     pool_       = 2u * capacity + kPoolExtra;
     for (uint32_t i = 0; i < pool_; ++i) {

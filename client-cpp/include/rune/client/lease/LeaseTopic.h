@@ -97,6 +97,18 @@ public:
     /// Same results as write(); InvalidArgument also when the handle has no template.
     [[nodiscard]] OpResult revokeKey(std::span<const uint8_t> key, int64_t version, const LeaseOptions& opts, CompletionTarget target,
                                      Token token) noexcept;
+    /// Task 20 (the recipes): a grant of `key` from the stored template row (T{} with the key patched in), like revokeKey: the same results
+    /// as write(); InvalidArgument also when the key does not fit the template's key column.
+    [[nodiscard]] OpResult grantKey(std::span<const uint8_t> key, const LeaseOptions& opts, CompletionTarget target, Token token) noexcept;
+    /// Task 20: patches `key` into the key column of the whole row image `row` (the one patch shared by revokeKey, grantKey and the recipes).
+    /// false (nothing written) when the topic has no fixed-width key column, the key is not exactly that wide or the row is too short.
+    [[nodiscard]] bool patchKey(std::span<uint8_t> row, std::span<const uint8_t> key) const noexcept {
+        if (!revokeKeyFits(key.size()) || revokeKeyOffset_ + revokeKeyWidth_ > row.size()) return false;
+        std::memcpy(row.data() + revokeKeyOffset_, key.data(), key.size());
+        return true;
+    }
+    /// The size of the stored template row (0 = none).
+    [[nodiscard]] std::size_t templateRowBytes() const noexcept { return revokeRow_.size(); }
     /// Task 15: `write` of an already encoded row (`row`, a whole row image of the topic's type) - copied into scratch (growth is cold:
     /// the high-water mark rule).  The row's schema-version header bytes are stamped with the bound version.
     [[nodiscard]] OpResult writeRaw(OpKind kind, std::span<const uint8_t> key, std::span<const uint8_t> row, int64_t version,

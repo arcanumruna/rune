@@ -31,6 +31,12 @@
 //                 polls the lease view's row of K (every 50 ms) until its lease_remaining_ms (the folded checkpoint's R) is > 0 and
 //                 < below (default 15000); prints `CKPT remaining_ms=<R> seen_ms=<realtime> version=<v>`.  A raw subscription cannot
 //                 see Checkpoint records (the subscription consumes them), the view row is the client's window onto a folded one.
+//   elect       --topic T --tag X --out FILE [--name N] [--stop-file F] [--max-s N]
+//                 Task 20 (spec 12.3, 16.3): a LeaseElection candidate on the name N (default `ldr`, at most 6 bytes: the key column is
+//                 string(32) and the recipe's key suffix takes 26).  Campaigns, and appends to FILE `CAMPAIGN <tag> <ms>`, then
+//                 `LEADER <tag> <token> <ms>` when it leads.  When its lease is lost it appends `LOST <tag> <reason> <ms>`, then tries a
+//                 FENCED update of its old key at its old token (the refused guarded write): `FENCED <tag> refused|accepted <err> <ms>`.
+//                 Ends on the stop file or at max-s.  Run two, SIGSTOP the leader past the ttl: the other leads with a larger token.
 //   guard       --lease-topic L --data-topic D --ttl-ms N --out FILE [--key K] [--ready-file F] [--window N] [--after-ms N]
 //                 R5 (spec 12.2): holds a lease, binds a producer to it and sends sequence-numbered records.  After the script cut
 //                 the lease leader (onAtRisk Entered at E) an UNGUARDED producer (its own client session, not bound to the lease)
@@ -51,6 +57,8 @@
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
 #include <rune/client/Key.h>
+#include <rune/client/lease/LeaseElection.h>
+#include <rune/client/lease/LeaseRecipe.h>
 #include <rune/client/lease/LeaseSession.h>
 #include <rune/client/lease/LeaseTopic.h>
 #include <rune/client/lease/LeaseWatch.h>
@@ -809,6 +817,103 @@ int runGuard(const Args& a) {
     return ok("GUARD");
 }
 
+
+// ---- elect (Task 20) -----------------------------------------------------------------------------------------------------
+
+struct ElectState {
+    rc::LeaseRecipeHost<2>* host = nullptr;
+    std::string             tag, out;
+    int64_t                 token = 0;
+    bool                    leading = false, lost = false;
+    int64_t                 lostMs = 0;
+    std::string             lostReason;
+    std::vector<rc::Completion> done;
+    static void onLost(void* c, rc::LostReason r) {
+        auto& s = *static_cast<ElectState*>(c);
+        s.lost       = true;
+        s.lostMs     = realtimeMs();
+        s.lostReason = std::to_string(static_cast<int>(r));
+    }
+    static void onDone(void* c, const rc::Completion& x, std::span<const uint8_t>) noexcept { static_cast<ElectState*>(c)->done.push_back(x); }
+};
+struct ElectLostF {
+    ElectState* s;
+    void operator()(rc::LeaseRef r, rc::LostReason w) const { if (s->host != nullptr) (void)s->host->onLost(r, w); }
+};
+struct ElectRiskF {
+    ElectState* s;
+    void operator()(rc::LeaseRef r, rc::AtRiskEdge e) const { if (s->host != nullptr) (void)s->host->onAtRisk(r, e); }
+};
+
+int runElect(const Args& a) {
+    ElectState st;
+    st.tag = a.str("tag", "x");
+    st.out = a.str("out");
+    const std::string name = a.str("name", "ldr"), stopFile = a.str("stop-file");
+    const int64_t     maxS = a.num("max-s", 300);
+    rc::Client c(makeConfig());
+    c.connectAndWait();
+    auto lt = c.openLeaseTopicAndWait<LeaseClaim>(a.str("topic"), {}, 30s);
+    rc::LeaseSession<4, ElectLostF, ElectRiskF> session(c, ElectLostF{&st}, ElectRiskF{&st});
+    rc::LeaseWatchOptions wo;
+    wo.names          = 2;
+    wo.waitersPerName = 8;
+    wo.maxLive        = 64;
+    rc::LeaseWatch<LeaseClaim> watch(c, lt, wo);
+    if (!session.observe(watch)) return failWith("ELECT", "session.observe refused");
+    rc::LeaseRecipeHost<2> host(c, session, watch, lt);
+    st.host = &host;
+    if (!host.usable()) return failWith("ELECT", "the recipe host is not usable on this topic (key column too narrow or no lease view layout)");
+    rc::LeaseElection election(host, name, sizeof(LeaseClaim) + 64, rc::LeaseRecipeCallbacks{&st, &ElectState::onLost, nullptr});
+    if (!election.valid()) return failWith("ELECT", "the election is invalid (name too long for the key column?)");
+    const std::vector<uint8_t> none;
+    const std::span<const uint8_t> prefixes[] = {std::span<const uint8_t>(none)};
+    if (watch.startFromNow(prefixes) != rc::OpResult::Accepted) return failWith("ELECT", "watch.startFromNow refused");
+
+    bool        campaigned = false;
+    std::vector<uint8_t> oldKey;
+    const int64_t startMs = realtimeMs();
+    for (;;) {
+        const int64_t now = c.nowNs();
+        session.doWork(now);
+        watch.doWork(now);
+        host.doWork(now);
+        if (!campaigned && watch.isReady()) {
+            LeaseClaim row;
+            row.a = static_cast<uint64_t>(std::strtoull(st.tag.c_str(), nullptr, 10));
+            const rc::OpResult r = election.campaign(row, rc::CompletionTarget(rc::CompletionHandler{&ElectState::onDone, &st}), 1);
+            if (r != rc::OpResult::Accepted) return failWith("ELECT", "campaign refused: " + std::to_string(int(r)));
+            campaigned = true;
+            appendLine(st.out, "CAMPAIGN " + st.tag + " " + std::to_string(realtimeMs()));
+        }
+        if (!st.done.empty() && !st.leading && !st.lost) {
+            const rc::Completion d = st.done.front();
+            if (d.status != rc::OpStatus::Ok) return failWith("ELECT", "campaign completed status " + std::to_string(int(d.status)) + " err " + std::to_string(d.errorCode));
+            st.leading = true;
+            st.token   = d.value;
+            const auto k = election.key();
+            oldKey.assign(k.begin(), k.end());
+            appendLine(st.out, "LEADER " + st.tag + " " + std::to_string(st.token) + " " + std::to_string(realtimeMs()));
+        }
+        if (st.lost) {
+            appendLine(st.out, "LOST " + st.tag + " " + st.lostReason + " " + std::to_string(st.lostMs));
+            // The guarded write: a fenced update of the old key at the old token must be refused (the lease is gone or re-granted).
+            LeaseClaim row;
+            std::memcpy(row.claim.data(), oldKey.data(), std::min(oldKey.size(), row.claim.size()));
+            const rc::LeaseResult u = lt.updateAndWait(row, st.token);
+            appendLine(st.out, "FENCED " + st.tag + " " + (u.ok() ? "accepted" : "refused") + " " + std::to_string(u.errorCode) + " " + std::to_string(realtimeMs()));
+            std::printf("ELECT lost reason=%s fenced=%s\n", st.lostReason.c_str(), u.ok() ? "accepted" : "refused");
+            if (u.ok()) return failWith("ELECT", "the fenced update of a lost lease was ACCEPTED");
+            return ok("ELECT", "lost");
+        }
+        if (fileExists(stopFile)) break;
+        if (realtimeMs() - startMs > maxS * 1000) return failWith("ELECT", "no stop condition within " + std::to_string(maxS) + " s");
+        idle();
+    }
+    std::printf("ELECT leading=%d token=%lld\n", st.leading ? 1 : 0, static_cast<long long>(st.token));
+    return ok("ELECT");
+}
+
 int usage() {
     std::fprintf(stderr,
                  "usage: lease_e2e_driver <subcommand> [--flag value ...]\n"
@@ -820,6 +925,7 @@ int usage() {
                  "  watch       --topic T --log FILE --ready FILE --stop-file F [--max-s N] [--ready-live N] [--expect-expired N]\n"
                  "  scale-hold  --topic T --count N --ttl-ms N --out FILE [--stop-file F] [--max-s N]\n"
                  "  ckpt-poll   --topic T --key K [--below N] [--max-s N]\n"
+                 "  elect       --topic T --tag X --out FILE [--name N] [--stop-file F] [--max-s N]\n"
                  "  guard       --lease-topic L --data-topic D --ttl-ms N --out FILE [--key K] [--ready-file F] [--window N] [--after-ms N]\n"
                  "environment: RUNE_TARGET, RUNE_EGRESS_HOST, RUNE_EGRESS_PORT, RUNE_DATA_DIR, RUNE_USER, RUNE_PASSWORD_FILE, RUNE_TLS_CA_FILE\n");
     return 2;
@@ -841,6 +947,7 @@ int main(int argc, char** argv) {
         if (mode == "watch") return runWatch(a);
         if (mode == "scale-hold") return runScaleHold(a);
         if (mode == "ckpt-poll") return runCkptPoll(a);
+        if (mode == "elect") return runElect(a);
         if (mode == "guard") return runGuard(a);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "LEASE-E2E: %s threw: %s\n", mode.c_str(), e.what());

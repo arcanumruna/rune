@@ -149,6 +149,11 @@ LeaseWatchBase::LeaseWatchBase(Client& client, detail::LeaseTopicCore& topic, co
 }
 
 LeaseWatchBase::~LeaseWatchBase() {
+    for (uint32_t i = 0; i < nNames_; ++i) {   // the recipes bound to a name forget this watch first
+        Cb& c = names_[i].bound;
+        if (c.fn != nullptr && c.gone != nullptr) { const Cb g = c; c = Cb{}; g.gone(g.ctx, this); }
+        else c = Cb{};
+    }
     for (Cb& o : observers_)   // the sessions observing this watch forget it first (owner thread; they never call a destroyed watch)
         if (o.fn != nullptr && o.gone != nullptr) { const Cb c = o; o = Cb{}; c.gone(c.ctx, this); }
     for (Part& pt : parts_)
@@ -190,6 +195,18 @@ void LeaseWatchBase::emit_(LeaseEventKind kind, int32_t partition, int64_t offse
     if (handler_.fn != nullptr) handler_.fn(handler_.ctx, ev);
     for (const Cb& o : observers_)
         if (o.fn != nullptr) o.fn(o.ctx, ev);
+    // The recipes bound to names: Ready / Failed go to every bound name once; a key event to the name the key belongs to (the name's heap and
+    // the live set already reflect the event).
+    if (nNames_ == 0) return;
+    if (kind == LeaseEventKind::Ready || kind == LeaseEventKind::Failed) {
+        for (uint32_t i = 0; i < nNames_; ++i)
+            if (names_[i].bound.fn != nullptr) { const Cb c = names_[i].bound; c.fn(c.ctx, ev); }
+        return;
+    }
+    if (const int32_t nid = nameOf_(key); nid >= 0 && names_[static_cast<uint32_t>(nid)].bound.fn != nullptr) {
+        const Cb c = names_[static_cast<uint32_t>(nid)].bound;
+        c.fn(c.ctx, ev);
+    }
 }
 
 void LeaseWatchBase::fail_() {
@@ -475,9 +492,13 @@ void LeaseWatchBase::scanDone_(int32_t p) {
     for (uint32_t i = 0; i < o_.maxLive; ++i) {
         LiveEntry& e = live_[i];
         if (!e.used || e.partition != p || e.confirmed) continue;
-        emit_(LeaseEventKind::Vanished, p, -1, std::span<const uint8_t>(e.key, e.keyLen), e.version, {}, false);
+        uint8_t kb[kMaxKey];   // the entry leaves the live set and its name heap BEFORE the event (a bound recipe reads both)
+        const std::size_t kl = e.keyLen;
+        const int64_t ver = e.version;
+        std::memcpy(kb, e.key, kl);
         if (e.nameId >= 0) heapRemove_(e.nameId, e.heapPos);
         eraseLive_(i);
+        emit_(LeaseEventKind::Vanished, p, -1, std::span<const uint8_t>(kb, kl), ver, {}, false);
     }
     // The records that arrived during the scan, in order, through the same apply rule.
     for (uint32_t i = 0; i < pt.hn && !failed_; ++i) {
@@ -678,9 +699,13 @@ void LeaseWatchBase::grant_(int32_t p, int64_t offset, std::span<const uint8_t> 
     if (const uint32_t old = findLive_(key, h); old != kNone) {
         LiveEntry& e = live_[old];
         if (e.version == version) { e.confirmed = true; return; }   // the same lease: already held
-        emit_(LeaseEventKind::Vanished, p, offset, std::span<const uint8_t>(e.key, e.keyLen), e.version, {}, false);   // another incarnation replaces it
+        uint8_t kb[kMaxKey];   // the old incarnation leaves the live set and its name heap BEFORE the event (a bound recipe reads both)
+        const std::size_t kl = e.keyLen;
+        const int64_t ver = e.version;
+        std::memcpy(kb, e.key, kl);
         if (e.nameId >= 0) heapRemove_(e.nameId, e.heapPos);
         eraseLive_(old);
+        emit_(LeaseEventKind::Vanished, p, offset, std::span<const uint8_t>(kb, kl), ver, {}, false);   // another incarnation replaces it
     }
     const uint32_t idx = insertLive_(p, key, h, version);
     if (idx == kNone) { fail_(); return; }   // the live set is full
@@ -732,6 +757,34 @@ std::optional<std::pair<int64_t, std::span<const uint8_t>>> LeaseWatchBase::lowe
     const HeapItem& top = heapStore_[n.heapBegin];
     const LiveEntry& e = live_[top.liveIdx];
     return std::pair<int64_t, std::span<const uint8_t>>(top.version, std::span<const uint8_t>(e.key, e.keyLen));
+}
+
+bool LeaseWatchBase::bindName(int32_t id, LeaseEventFn fn, void* ctx, WatchGoneFn gone) noexcept {
+    if (fn == nullptr || id < 0 || static_cast<uint32_t>(id) >= nNames_) return false;
+    Cb& c = names_[static_cast<uint32_t>(id)].bound;
+    if (c.fn != nullptr) return false;
+    c = Cb{fn, ctx, gone};
+    return true;
+}
+
+bool LeaseWatchBase::unbindName(int32_t id, void* ctx) noexcept {
+    if (id < 0 || static_cast<uint32_t>(id) >= nNames_) return false;
+    Cb& c = names_[static_cast<uint32_t>(id)].bound;
+    if (c.fn == nullptr || c.ctx != ctx) return false;
+    c = Cb{};
+    return true;
+}
+
+std::optional<std::pair<int64_t, std::span<const uint8_t>>> LeaseWatchBase::predecessor(int32_t id, int64_t version) const noexcept {
+    if (id < 0 || static_cast<uint32_t>(id) >= nNames_) return std::nullopt;
+    const Name& n = names_[static_cast<uint32_t>(id)];
+    const HeapItem* h = heapStore_.data() + n.heapBegin;
+    const HeapItem* best = nullptr;   // a linear pass over the name's entries: bounded by waitersPerName
+    for (uint32_t i = 0; i < n.heapSize; ++i)
+        if (h[i].version < version && (best == nullptr || h[i].version > best->version)) best = &h[i];
+    if (best == nullptr) return std::nullopt;
+    const LiveEntry& e = live_[best->liveIdx];
+    return std::pair<int64_t, std::span<const uint8_t>>(best->version, std::span<const uint8_t>(e.key, e.keyLen));
 }
 
 void LeaseWatchBase::siftUp_(Name& n, uint32_t pos) noexcept {
