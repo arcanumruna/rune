@@ -36,6 +36,9 @@ enum class Timing : uint16_t {
     CreateOnNonEmpty, ReplaceDuringWrites, DropDuringWrites,
     TxnCommitBehind, TxnAbortBehind, LeaderLossParked, AckDeadline, StrictTier, GatewayRouted,           // appended for 03
     RetryAfterWindow,                                                                                    // appended for 04 (R04e)
+    CoordinatorFailoverVotesOut, VoterFailoverBeforeJudge, VoterFailoverAfterJudge, CoordinatorFailoverBeforeCommit,   // appended for 11
+    TimeoutDuringVote, TimeoutWhileLocked, AbortAfterYes,
+    ConstraintCreatedWhileOpen, ConstraintDroppedWhileOpen, ConstraintReplacedWhileOpen,
 };
 enum class Part : uint8_t { P03 = 3, P04 = 4, P05 = 5, P06 = 6, P07 = 7, P09 = 9, P11 = 11 };
 
@@ -68,6 +71,11 @@ enum class Check : uint8_t {
     CollidingPair,        ///< 06 Racing / SelfCollidingBatch x an import, update or remove: the pair of verdicts of collidingCodes06
     AutoVerdict,          ///< 06 an import, update or remove: the trailer is verdict06
     ConstraintTable,      ///< 09 Single: the trailer is the Single table's verdicts (single09), checked against the model
+    TxnTable,             ///< 11 Single: character's vote (and the later writer's verdict) is the Single table's (single11), checked against the model
+    TxnAborted,           ///< 11 TimeoutDuringVote, TimeoutWhileLocked, AbortAfterYes: nothing of the transaction is visible anywhere
+    TxnSameReply,         ///< 11 CoordinatorFailoverVotesOut, VoterFailoverAfterJudge: one TxnJudge per (producer, epoch) and an identical reply
+    TxnNewJudge,          ///< 11 VoterFailoverBeforeJudge: the cut TxnJudge is gone, one survives, and the answer equals Single's
+    TxnEveryPartition,    ///< 11 CoordinatorFailoverBeforeCommit: one vote reply per partition of the persisted set
 };
 
 struct Expected {
@@ -339,7 +347,29 @@ enum class V11 : uint8_t { Ok, N, M, K, C };
     return {true, nullptr, c.timing == Timing::Single ? Check::ConstraintTable : Check::Trailer};
 }
 
-[[nodiscard]] inline Expected expect(const Cell& c) { return isP09(c) ? expect09(c) : isP07(c) ? expect07(c) : isP06(c) ? expect06(c) : isP05(c) ? expect05(c) : isP03(c) ? expect03(c) : expect04(c); }
+[[nodiscard]] inline bool isP11(const Cell& c) noexcept { return c.op >= Op::TxnCreate && c.op <= Op::AtomicBatch; }
+
+/// The seven timings that vote or end a transaction: an atomic batch has neither.
+[[nodiscard]] inline bool isVoteTiming11(Timing t) noexcept { return t >= Timing::CoordinatorFailoverVotesOut && t <= Timing::AbortAfterYes; }
+
+[[nodiscard]] inline Expected expect11(const Cell& c) {
+    const bool create = c.op == Op::TxnCreate || c.op == Op::TxnSelfCollidingCreates;
+    const bool batch = c.op == Op::AtomicBatch;
+    if (batch && isVoteTiming11(c.timing)) return {false, "an atomic batch has no vote and no marker"};
+    if (batch && c.entity == Entity::SecondPartitionNo) return {false, "an atomic batch lives on one partition"};
+    if ((create || batch) && (c.entity == Entity::KeyAbsent || c.entity == Entity::OutsideWriteSameKey))
+        return {false, "a key-0 create's id is new; no earlier key and no outside write can hit it"};
+    switch (c.timing) {
+    case Timing::TimeoutDuringVote: case Timing::TimeoutWhileLocked: case Timing::AbortAfterYes: return {true, nullptr, Check::TxnAborted};
+    case Timing::CoordinatorFailoverVotesOut: case Timing::VoterFailoverAfterJudge: return {true, nullptr, Check::TxnSameReply};
+    case Timing::VoterFailoverBeforeJudge: return {true, nullptr, Check::TxnNewJudge};
+    case Timing::CoordinatorFailoverBeforeCommit: return {true, nullptr, Check::TxnEveryPartition};
+    case Timing::Single: return {true, nullptr, Check::TxnTable};
+    default: return {true, nullptr, Check::Trailer};
+    }
+}
+
+[[nodiscard]] inline Expected expect(const Cell& c) { return isP11(c) ? expect11(c) : isP09(c) ? expect09(c) : isP07(c) ? expect07(c) : isP06(c) ? expect06(c) : isP05(c) ? expect05(c) : isP03(c) ? expect03(c) : expect04(c); }
 
 [[nodiscard]] inline std::vector<Cell> cellsFor(Part part) {
     std::vector<Cell> out;
@@ -387,6 +417,14 @@ enum class V11 : uint8_t { Ok, N, M, K, C };
         for (uint16_t op = static_cast<uint16_t>(Op::CCreate); op <= static_cast<uint16_t>(Op::CDeleteThenReuse); ++op)
             for (uint16_t e = static_cast<uint16_t>(Entity::G11Free); e <= static_cast<uint16_t>(Entity::DupExtra); ++e)
                 for (const Timing t : t09) out.push_back({static_cast<Op>(op), static_cast<Entity>(e), t});
+    } else if (part == Part::P11) {
+        const Timing t11[] = {Timing::Single, Timing::FailoverHwFold, Timing::RestartDuringRebuild,
+                              Timing::CoordinatorFailoverVotesOut, Timing::VoterFailoverBeforeJudge, Timing::VoterFailoverAfterJudge, Timing::CoordinatorFailoverBeforeCommit,
+                              Timing::TimeoutDuringVote, Timing::TimeoutWhileLocked, Timing::AbortAfterYes,
+                              Timing::ConstraintCreatedWhileOpen, Timing::ConstraintDroppedWhileOpen, Timing::ConstraintReplacedWhileOpen};
+        for (uint16_t op = static_cast<uint16_t>(Op::TxnCreate); op <= static_cast<uint16_t>(Op::AtomicBatch); ++op)
+            for (uint16_t e = static_cast<uint16_t>(Entity::AllPass); e <= static_cast<uint16_t>(Entity::RacingTxnSameName); ++e)
+                for (const Timing t : t11) out.push_back({static_cast<Op>(op), static_cast<Entity>(e), t});
     } else if (part == Part::P04) {
         for (uint16_t op = 0; op <= static_cast<uint16_t>(Op::DeleteFreesCap); ++op)
             for (uint16_t e = 0; e <= static_cast<uint16_t>(Entity::OldWriters); ++e) {
@@ -481,6 +519,11 @@ inline const char* nameOf(Timing t) {
     case Timing::LeaderLossParked: return "LeaderLossParked"; case Timing::AckDeadline: return "AckDeadline";
     case Timing::StrictTier: return "StrictTier"; case Timing::GatewayRouted: return "GatewayRouted";
     case Timing::RetryAfterWindow: return "RetryAfterWindow";
+    case Timing::CoordinatorFailoverVotesOut: return "CoordinatorFailoverVotesOut"; case Timing::VoterFailoverBeforeJudge: return "VoterFailoverBeforeJudge";
+    case Timing::VoterFailoverAfterJudge: return "VoterFailoverAfterJudge"; case Timing::CoordinatorFailoverBeforeCommit: return "CoordinatorFailoverBeforeCommit";
+    case Timing::TimeoutDuringVote: return "TimeoutDuringVote"; case Timing::TimeoutWhileLocked: return "TimeoutWhileLocked"; case Timing::AbortAfterYes: return "AbortAfterYes";
+    case Timing::ConstraintCreatedWhileOpen: return "ConstraintCreatedWhileOpen"; case Timing::ConstraintDroppedWhileOpen: return "ConstraintDroppedWhileOpen";
+    case Timing::ConstraintReplacedWhileOpen: return "ConstraintReplacedWhileOpen";
     }
     return "?";
 }

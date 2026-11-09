@@ -1531,13 +1531,736 @@ private:
 
 }  // namespace
 
+// ---- Part 11: transactions on two voting partitions.  The character rig (a) and the ledger rig (b) are joined by TxnPair; producer 77 writes the op's
+// records to a and a debit of 10 to b, then ends the transaction as its coordinator does.  The verdicts of a come from the log-driven model. ----
+namespace {
+
+constexpr int64_t kPid77 = 77, kPid78 = 78, kPid79 = 79;
+constexpr uint64_t kEntryBase11 = 7000, kBalance11 = 100, kLowBalance11 = 5;
+constexpr uint32_t kBalancesCid11 = (11u << 16) | 1u;   ///< balances (object 11), non_negative (ordinal 1)
+
+class TxnCellRun {
+public:
+    using CV = ConstrainedView;
+    explicit TxnCellRun(const Cell& c)
+        : c_(c), batch_(c.op == Op::AtomicBatch), racing_(c.entity == Entity::RacingTxnSameName), pair_(setupRig_(), /*follower=*/true, /*rollBytes=*/1), a_(pair_.a), b_(pair_.b) {}
+
+    void run() {
+        const Expected ex = expect(c_);
+        plan_();
+        writeSetup_();
+        if (::testing::Test::HasFatalFailure()) return;
+        createViews_();
+        if (::testing::Test::HasFatalFailure()) return;
+        a_.onEveryPass([this] { observe_(); });
+        execute_();
+        if (::testing::Test::HasFatalFailure()) return;
+
+        a_.onEveryPass({});
+        ASSERT_TRUE(waitMembers_(a_, membersA_));
+        ASSERT_TRUE(waitMembers_(b_, 2));
+        {   // a judged record last: a stretch with nothing judged (an aborted transaction) gets its marker with it
+            const auto closing = a_.ackFetching(send_(501, {Char09{kIdBase09 + 101, kUserW09, c_.entity == Entity::FailsUnique ? "XNEW" : "w1", 9, 2}}, kAcksViewAll).corr, 3000);
+            ASSERT_TRUE(closing);
+            ASSERT_EQ(closing->code, 0);
+            const VerdictRig::Entry e{kEntryBase11 + 999, kUserW09, 1, "close"};
+            const auto ledger = b_.ackFetching(b_.appendEntries(std::span<const VerdictRig::Entry>(&e, 1), kAcksAll, 501, 1, false), 3000);
+            ASSERT_TRUE(ledger);
+            ASSERT_EQ(ledger->code, 0);
+        }
+        for (VerdictRig* r : {&a_, &b_}) waitCommitted_(*r);
+        const auto written = a_.readLog();
+        target_ = written.data.empty() ? 0 : written.data.back().offset + 1;
+        ASSERT_TRUE(a_.driveUntilJudged(std::max(target_, a_.dataEnd())));
+        ASSERT_TRUE(b_.driveUntilJudged());
+        a_.passes(60);
+        b_.passes(20);
+        settleViews_(a_);
+        settleViews_(b_);
+
+        const auto log = a_.readLog();
+        CheckedWritesModel model = modelOf_(log);
+        collectAcks_();
+        for (const auto& d : log.data)
+            if (d.producerId == kPid78) outside_.push_back(d.offset);
+
+        checkIndex(a_, model);                                              // (a) the verdicts
+        checkMarkers(model, log, std::max(target_, a_.dataEnd()));          // (b) markers, and the third judgedThrough term
+        checkVotes_(ex, model);                                             // (a) the vote replies
+        checkDelivered_(model, log);                                        // (c)
+        checkAcks_(model);
+        checkViews_(model, log);                                            // (b) of the plan: the views are a refold of the accepted records
+        checkLedger_();
+        checkStats_(ex);                                                    // (e) (g)
+        checkTxns_(ex, model, log);
+        const R11Rows live = rows_(model);
+        checkCompaction(a_, model, log);                                    // (f)
+
+        std::set<int64_t> present;
+        for (const auto& d : a_.readLog().data) present.insert(d.offset);
+        a_.restart();
+        b_.restart();
+        const auto compacted = a_.readLog();
+        ASSERT_TRUE(waitMembers_(a_, membersA_));
+        ASSERT_TRUE(waitMembers_(b_, 2));
+        ASSERT_TRUE(a_.driveUntilJudged(compacted.data.empty() ? 0 : compacted.data.back().offset + 1));
+        ASSERT_TRUE(b_.driveUntilJudged());
+        a_.passes(60);
+        b_.passes(20);
+        settleViews_(a_);
+        settleViews_(b_);
+        checkIndex(a_, model, &present);
+        checkViews_(model, log);
+        checkLedger_();
+        EXPECT_EQ(rows_(model), live) << "(f2) the views are byte-identical across the live fold and the refold after a restart";
+        EXPECT_EQ(a_.writeState()->rejected.mismatches(), 0u);
+        EXPECT_EQ(b_.writeState()->rejected.mismatches(), 0u);
+        EXPECT_EQ(a_.worker->parkedVotesForTest(), 0);
+    }
+
+private:
+    struct Sent { VerdictRig* r; int64_t corr; int64_t pid; std::vector<Char09> recs; bool view; };
+    struct VoteRec { int64_t pid; int rig; VerdictRig::VoteReply reply; };
+    struct R11Rows {
+        std::vector<std::vector<uint8_t>> rows;
+        bool operator==(const R11Rows&) const = default;
+    };
+
+    static std::function<void(VerdictRig&)> setupRig_() {
+        auto n = std::make_shared<int>(0);
+        return [n](VerdictRig& r) {
+            r.worker->setVerdictIntervalNs(1'000'000);
+            if ((*n)++ == 0) r.createCharacterTopic(true);
+            else r.createLedgerTopic();
+            r.enableAcks();
+            r.passes(60);
+            r.followerFetch();
+            r.passes(10);
+        };
+    }
+    static VerdictRig::Char charOf_(const Char09& c) {
+        return VerdictRig::Char{.id = c.id, .userId = c.userId, .name = c.name, .gender = 0, .lastPlayed = c.lastPlayed, .intent = c.intent, .tombstone = c.del};
+    }
+    [[nodiscard]] bool voteTiming_() const { return isVoteTiming11(c_.timing); }
+    [[nodiscard]] bool hasLedger_(int64_t pid) const { return pid == kPid77 && !batch_; }
+
+    // The scenario of the cell: the state before the op (the unit table's setup) and the records of producers 77 and 79.
+    void plan_() {
+        const auto id = [](uint64_t k) { return kIdBase09 + k; };
+        const bool e1 = c_.entity == Entity::FailsCheck;
+        const uint64_t users = e1 ? 12 : (c_.entity == Entity::OutsideWriteLockedRow || (racing_ && c_.op == Op::TxnMove)) ? 11 : 5;
+        for (uint64_t k = 1; k <= users; ++k) setup_.push_back({id(k), kUserU09, "u" + std::to_string(k)});
+        setup_.push_back({id(101), kUserW09, c_.entity == Entity::FailsUnique ? "XNEW" : "w1"});
+        for (uint64_t k = 1; k <= 3; ++k) setup_.push_back({id(200 + k), kUserV09, "v" + std::to_string(k)});
+        c_char_ = c_.op == Op::TxnMove ? Char09{id(201), kUserV09, "v1"} : Char09{id(1), kUserU09, "u1"};
+        const Char09& c = c_char_;
+        switch (c_.op) {
+        case Op::TxnCreate: mine_ = {{0, kUserU09, "Xnew", 0, 1}}; break;
+        case Op::TxnRename: mine_ = {{c.id, c.userId, "Xnew", 0, 2}}; break;
+        case Op::TxnMove: mine_ = {{c.id, kUserU09, c.name, 0, 2}}; break;
+        case Op::TxnRemoveExisting: mine_ = {{c.id, 0, "", 0, 2, true}}; break;
+        case Op::TxnSelfCollidingCreates: mine_ = {{0, kUserU09, "Xnew", 0, 1}, {0, kUserU09, "xnew", 0, 1}}; break;
+        case Op::TxnUpdateNonKey: mine_ = {{c.id, c.userId, c.name, 777, 2}}; break;
+        default: mine_ = {{0, kUserU09, "Xnew", 0, 1}, {0, kUserU09, "Ynew", 0, 1}}; break;
+        }
+        switch (c_.op) {   // the second writer of RacingTxnSameName: the same op on another key with the same target
+        case Op::TxnCreate: case Op::TxnSelfCollidingCreates: second_ = {{0, kUserU09, "Xnew", 0, 1}}; break;
+        case Op::TxnRename: second_ = {{id(2), kUserU09, "Xnew", 0, 2}}; break;
+        case Op::TxnMove: second_ = {{id(202), kUserU09, "v2", 0, 2}}; break;
+        case Op::AtomicBatch: second_ = {{0, kUserU09, "Xnew", 0, 1}, {0, kUserU09, "Ynew", 0, 1}}; break;
+        default: second_ = mine_; break;
+        }
+        std::set<std::string> existing;
+        for (const Char09& s : setup_) existing.insert(modelLower(s.name));
+        for (const Char09& m : mine_)
+            if (m.intent == 1 && existing.insert(modelLower(m.name)).second) watched_.push_back(modelLower(m.name));
+        membersA_ = c_.timing == Timing::ConstraintCreatedWhileOpen ? 2u : 3u;
+    }
+
+    Sent send_(int64_t pid, const std::vector<Char09>& recs, uint8_t acks, bool txn = false, bool atomic = false) {
+        const int32_t seq = pid >= 0 ? seqs_[pid] : -1;
+        if (pid >= 0) seqs_[pid] += static_cast<int32_t>(recs.size());
+        std::vector<VerdictRig::Char> chars;
+        for (const Char09& c : recs) chars.push_back(charOf_(c));
+        return {&a_, a_.appendCharacters(chars, acks, pid, seq, txn, atomic), pid, recs, (acks & rune::protocol::client::kAcksWireView) != 0};
+    }
+    Sent sendDebit_(int64_t pid, uint64_t account, int64_t amount, bool txn) {
+        const VerdictRig::Entry e{kEntryBase11 + static_cast<uint64_t>(entries_++), account, amount, "d"};
+        const int32_t seq = pid >= 0 ? seqsB_[pid] : -1;
+        if (pid >= 0) seqsB_[pid] += 1;
+        return {&b_, b_.appendEntries(std::span<const VerdictRig::Entry>(&e, 1), kAcksAll, pid, seq, txn), pid, {}, false};
+    }
+    // Sends, waits for the ack of `s` (a rig with a follower fetches along) and keeps it for the final checks.
+    Sent& ack_(Sent s) {
+        const auto a = s.r->ackFetching(s.corr, 3000);
+        EXPECT_TRUE(a) << "no ack for corr " << s.corr;
+        if (a) { EXPECT_EQ(a->code, 0); if (!s.view) acks_[s.corr] = *a; }
+        sent_.push_back(std::move(s));
+        return sent_.back();
+    }
+
+    void writeSetup_() {
+        for (std::size_t at = 0; at < setup_.size(); at += 16) {
+            std::vector<Char09> chunk(setup_.begin() + static_cast<std::ptrdiff_t>(at), setup_.begin() + static_cast<std::ptrdiff_t>(std::min(at + 16, setup_.size())));
+            for (Char09& c : chunk) c.intent = 1;   // an explicit insert: the counter moves above the ids, and a plain upsert is refused on an autoincrement source
+            const auto a = a_.ackFetching(send_(501, chunk, kAcksViewAll).corr, 3000);
+            ASSERT_TRUE(a);
+            ASSERT_EQ(a->code, 0);
+        }
+        const VerdictRig::Entry e{1, kUserU09, static_cast<int64_t>(c_.entity == Entity::SecondPartitionNo ? kLowBalance11 : kBalance11), "open"};
+        const auto la = b_.ackFetching(b_.appendEntries(std::span<const VerdictRig::Entry>(&e, 1), kAcksAll, 501, 0, false), 3000);
+        ASSERT_TRUE(la);
+        ASSERT_EQ(la->code, 0);
+        ASSERT_TRUE(a_.driveUntilJudged());
+        ASSERT_TRUE(b_.driveUntilJudged());
+    }
+
+    void createViews_() {
+        if (c_.timing != Timing::ConstraintCreatedWhileOpen) a_.createConstrainedView(CV::AccountStats, 12);
+        a_.createConstrainedView(CV::CharacterName);
+        if (c_.timing != Timing::ConstraintCreatedWhileOpen) fp12_ = a_.fingerprintOf(CV::AccountStats, false);
+        b_.createConstrainedView(CV::Ledger);
+        ASSERT_TRUE(waitMembers_(a_, membersA_));
+        ASSERT_TRUE(waitMembers_(b_, 2));
+        settleViews_(a_);
+        settleViews_(b_);
+        if (c_.entity == Entity::KeyAbsent) {   // C was removed (acked) before the transaction
+            const Char09 c = c_char_;
+            const auto a = a_.ackFetching(send_(501, {Char09{c.id, 0, "", 0, 0, true}}, kAcksViewAll).corr, 3000);
+            ASSERT_TRUE(a);
+            ASSERT_EQ(a->code, 0);
+            ASSERT_TRUE(a_.driveUntilJudged());
+        }
+    }
+
+    void settleViews_(VerdictRig& r) {
+        r.followerFetch();
+        ASSERT_TRUE(r.driveUntilJudgeReaches());
+        for (const auto& [v, l] : r.constrained) r.driveUntilFolded(l.topicId, r.dataEnd());
+    }
+    bool waitMembers_(VerdictRig& r, uint32_t count) {
+        for (int i = 0; i < VerdictRig::kMaxPass; ++i) {
+            const PartitionWriteState* w = r.writeState();
+            if (w != nullptr && w->constraintSets.latest().count == count && r.worker->rcStatusForTest(VerdictRig::kSrc, 0) == Worker::kRcReady) return true;
+            if (i % 8 == 0) r.followerFetch();
+            r.pass();
+        }
+        ADD_FAILURE() << "the logged set never reached " << count << " members";
+        return false;
+    }
+    void waitCommitted_(VerdictRig& r) {
+        r.passes(10);
+        for (int i = 0; i < VerdictRig::kMaxPass && r.replica->highWatermark() < r.leo(); ++i) {
+            if (i % 8 == 0) r.followerFetch();
+            r.pass();
+        }
+        EXPECT_EQ(r.replica->highWatermark(), r.leo());
+    }
+    static void pump_(VerdictRig& r, int n) {
+        for (int i = 0; i < n; ++i) {
+            if (i % 8 == 0) r.followerFetch();
+            r.pass();
+        }
+    }
+
+    // ---- the transaction ----
+    void writeTxn_(int64_t pid, const std::vector<Char09>& recs) {
+        ack_(send_(pid, recs, kAcksAll, /*txn=*/true));
+        if (hasLedger_(pid)) ack_(sendDebit_(pid, kUserU09, -10, /*txn=*/true));
+    }
+    void write78_(const std::vector<Char09>& recs) {
+        sent_.push_back(send_(kPid78, recs, kAcksViewAll));   // a view ack: the plain write of a constrained source is answered by the judge
+    }
+    // The votes of `pid`: on a, and on b when the transaction wrote there (`all`: on every partition of the persisted set).  true = every vote was yes.
+    bool vote_(int64_t pid, bool all = false) {
+        bool yes = true;
+        for (int rig = 0; rig < 2; ++rig) {
+            if (rig == 1 && !hasLedger_(pid) && !all) continue;
+            VerdictRig& r = rig == 0 ? a_ : b_;
+            const int64_t tok = r.sendVote(VerdictRig::kSrc, pid, 0);
+            EXPECT_TRUE(r.driveUntilVoted(tok)) << "the vote of " << pid << " on " << (rig == 0 ? "character" : "ledger") << " was never answered";
+            if (const auto reply = r.voteReply(tok)) {
+                votes_.push_back({pid, rig, *reply});
+                yes = yes && reply->errorCode == 0 && reply->code == 0;
+            } else yes = false;
+        }
+        return yes;
+    }
+    // Both partitions' markers, as the coordinator writes them; a commit waits for the judge to apply it.
+    void mark_(int64_t pid, bool commit, bool wait = true) {
+        ended_[pid] = commit;
+        for (VerdictRig* r : {&a_, &b_}) {
+            if (r == &b_ && !hasLedger_(pid)) continue;
+            r->marker(pid, commit);
+            if (wait) waitJudged_(*r, pid, commit);
+        }
+    }
+    void waitJudged_(VerdictRig& r, int64_t pid, bool commit) {
+        const int64_t upTo = &r == &a_ && racing_ && pid == kPid77 ? racingFrom_ : -1;   // the judge waits at the second transaction's first record
+        EXPECT_TRUE(commit ? r.driveUntilJudged(upTo) : r.driveUntilJudgeReaches(upTo));
+    }
+    // Producer 78's create for U after the yes and before the marker: it touches U's locked account_stats row, so the judge pauses there.
+    void afterVote_(int64_t pid) {
+        if (pid != kPid77) return;
+        if (racing_) {   // the judge waits at a transaction that is neither voted nor ended: 79 opens after J of 77
+            racingFrom_ = a_.leo();
+            writeTxn_(kPid79, second_);
+        }
+        if (c_.entity == Entity::OutsideWriteLockedRow) {
+            write78_({Char09{0, kUserU09, "Znew", 0, 1}});
+            pump_(a_, 40);
+        }
+        if (c_.timing == Timing::RestartDuringRebuild) {
+            for (int i = 0; i < 2; ++i) { restartRigs_(); a_.passes(2); }
+        }
+    }
+    void restartRigs_() {
+        a_.restart();
+        b_.restart();
+        restartedAt_ = votes_.size();
+        acksLost_ = true;
+        EXPECT_TRUE(waitMembers_(a_, membersA_));
+        EXPECT_TRUE(waitMembers_(b_, 2));
+    }
+    void failoverRigs_(bool fetch = true) {
+        if (fetch) for (VerdictRig* r : {&a_, &b_}) r->followerFetch();
+        a_.failover();
+        b_.failover();
+        restartedAt_ = votes_.size();
+        acksLost_ = true;
+        EXPECT_TRUE(waitMembers_(a_, membersA_));
+        EXPECT_TRUE(waitMembers_(b_, 2));
+    }
+    [[nodiscard]] static bool same_(const VerdictRig::VoteReply& x, const VerdictRig::VoteReply& y) {
+        return x.errorCode == y.errorCode && x.code == y.code && x.constraintId == y.constraintId && x.failingOffset == y.failingOffset && x.judgeOffset == y.judgeOffset;
+    }
+
+    void end_(int64_t pid) {
+        switch (c_.timing) {
+        case Timing::TimeoutDuringVote: {   // the timeout's abort marker arrives while J is appended and not judged
+            a_.holdJudge(true);
+            const int64_t tok = a_.sendVote(VerdictRig::kSrc, pid, 0);
+            pump_(a_, 20);
+            afterVote_(pid);
+            mark_(pid, false, /*wait=*/false);
+            a_.holdJudge(false);
+            waitJudged_(a_, pid, false);
+            if (hasLedger_(pid)) waitJudged_(b_, pid, false);
+            if (const auto r = a_.voteReply(tok)) votes_.push_back({pid, 0, *r});   // the judge answers once released
+            return;
+        }
+        case Timing::TimeoutWhileLocked: {   // a yes on a (b has not voted), then the timeout
+            const int64_t tok = a_.sendVote(VerdictRig::kSrc, pid, 0);
+            EXPECT_TRUE(a_.driveUntilVoted(tok));
+            if (const auto r = a_.voteReply(tok)) votes_.push_back({pid, 0, *r});
+            afterVote_(pid);
+            mark_(pid, false);
+            return;
+        }
+        case Timing::AbortAfterYes:
+            (void)vote_(pid);
+            afterVote_(pid);
+            mark_(pid, false);
+            return;
+        case Timing::CoordinatorFailoverVotesOut: {   // the first answer is lost, the reloaded coordinator sends the vote again
+            const int64_t t1 = a_.sendVote(VerdictRig::kSrc, pid, 0);
+            const int64_t t2 = a_.sendVote(VerdictRig::kSrc, pid, 0);
+            EXPECT_TRUE(a_.driveUntilVoted(t1) && a_.driveUntilVoted(t2));
+            const auto r1 = a_.voteReply(t1), r2 = a_.voteReply(t2);
+            ASSERT_TRUE(r1 && r2);
+            EXPECT_TRUE(same_(*r1, *r2)) << "the re-sent vote's reply equals the first";
+            votes_.push_back({pid, 0, *r1});   // the re-sent vote is answered from the state: the stats count one
+            EXPECT_EQ(a_.txnJudgeOffsetsInLog().size(), ended_.size() + (r1->judgeOffset >= 0 ? 1u : 0u)) << "one J per (producer, epoch)";
+            bool yes = r1->errorCode == 0 && r1->code == 0;
+            if (hasLedger_(pid)) {
+                const int64_t tb = b_.sendVote(VerdictRig::kSrc, pid, 0);
+                EXPECT_TRUE(b_.driveUntilVoted(tb));
+                if (const auto rb = b_.voteReply(tb)) { votes_.push_back({pid, 1, *rb}); yes = yes && rb->errorCode == 0 && rb->code == 0; }
+            }
+            afterVote_(pid);
+            mark_(pid, yes);
+            return;
+        }
+        case Timing::VoterFailoverBeforeJudge: {   // J is appended and cut with the tail: the re-sent vote appends a new J
+            waitCommitted_(a_);   // what is below J stays: the earlier transaction's marker
+            const int64_t tok = a_.sendVote(VerdictRig::kSrc, pid, 0);
+            a_.passes(60);
+            EXPECT_EQ(a_.txnJudgeOffsetsInLog().size(), ended_.size() + 1) << "J appended";
+            EXPECT_FALSE(a_.voteReply(tok)) << "J is above the HW: not answered";
+            failoverRigs_(/*fetch=*/false);
+            EXPECT_EQ(a_.txnJudgeOffsetsInLog().size(), ended_.size()) << "J was above the HW";
+            const bool yes = vote_(pid);
+            EXPECT_EQ(a_.txnJudgeOffsetsInLog().size(), ended_.size() + 1) << "one surviving J";
+            afterVote_(pid);
+            mark_(pid, yes);
+            return;
+        }
+        case Timing::VoterFailoverAfterJudge: {   // J is committed and not judged when the node is lost: the new leader judges at the same J
+            a_.holdJudge(true);
+            (void)a_.sendVote(VerdictRig::kSrc, pid, 0);
+            pump_(a_, 40);
+            const auto js = a_.txnJudgeOffsetsInLog();
+            ASSERT_EQ(js.size(), ended_.size() + 1);
+            EXPECT_LT(js.back(), a_.replica->highWatermark()) << "J is committed";
+            failoverRigs_();
+            a_.holdJudge(false);
+            EXPECT_EQ(a_.txnJudgeOffsetsInLog(), js) << "the same J";
+            const bool yes = vote_(pid);
+            ASSERT_FALSE(votes_.empty());
+            for (const VoteRec& v : votes_) if (v.pid == pid && v.rig == 0) EXPECT_EQ(v.reply.judgeOffset, js.back());
+            EXPECT_EQ(a_.txnJudgeOffsetsInLog(), js);
+            afterVote_(pid);
+            mark_(pid, yes);
+            return;
+        }
+        case Timing::CoordinatorFailoverBeforeCommit: {   // the reloaded coordinator votes on every partition of the persisted set
+            const bool yes = vote_(pid, /*all=*/true);
+            afterVote_(pid);
+            mark_(pid, yes);
+            return;
+        }
+        default: {
+            const bool yes = vote_(pid);
+            afterVote_(pid);
+            mark_(pid, yes);
+            return;
+        }
+        }
+    }
+
+    void changeConstraints_() {
+        if (c_.timing == Timing::ConstraintCreatedWhileOpen) {
+            a_.createConstrainedView(CV::AccountStats, 12);
+            fp12_ = a_.fingerprintOf(CV::AccountStats, false);
+            membersA_ = 3;
+        } else if (c_.timing == Timing::ConstraintDroppedWhileOpen) {
+            a_.dropConstrainedView(CV::CharacterName);
+            membersA_ = 2;
+        } else if (c_.timing == Timing::ConstraintReplacedWhileOpen) {
+            a_.replaceConstrainedView(CV::AccountStats, 13);
+            fp13_ = a_.fingerprintOf(CV::AccountStats, false);
+        } else return;
+        a_.passes(5);
+        EXPECT_TRUE(waitMembers_(a_, membersA_));
+    }
+
+    void execute_() {
+        if (batch_) {   // no transaction: one batch with the atomic bit, `All | View`, judged as a unit
+            if (c_.timing == Timing::ConstraintCreatedWhileOpen || c_.timing == Timing::ConstraintDroppedWhileOpen || c_.timing == Timing::ConstraintReplacedWhileOpen) changeConstraints_();
+            Sent first = send_(kPid77, mine_, kAcksViewAll, false, /*atomic=*/true);
+            if (racing_) sent_.push_back(send_(kPid79, second_, kAcksViewAll, false, true));
+            sent_.insert(sent_.begin(), std::move(first));
+            if (c_.entity == Entity::OutsideWriteLockedRow) { a_.passes(5); write78_({Char09{0, kUserU09, "Znew", 0, 1}}); }
+            ASSERT_TRUE(a_.driveUntilJudgeReaches(a_.dataEnd()));
+            for (const Sent& s : sent_) {
+                const auto a = a_.ackFetching(s.corr, 3000);
+                ASSERT_TRUE(a);
+                acks_[s.corr] = *a;
+            }
+            if (c_.timing == Timing::FailoverHwFold) failoverRigs_();
+            else if (c_.timing == Timing::RestartDuringRebuild) { restartRigs_(); a_.passes(2); restartRigs_(); }
+            return;
+        }
+        writeTxn_(kPid77, mine_);
+        changeConstraints_();
+        if (c_.entity == Entity::OutsideWriteSameKey) {   // producer 78's update of C lands after the transaction's write of C and before J
+            const Char09 c = c_char_;
+            write78_({Char09{c.id, c.userId, c.name, 555, 2}});
+        }
+        if (c_.timing == Timing::FailoverHwFold) failoverRigs_();   // the records are committed and the judge has not reached them
+        end_(kPid77);
+        if (racing_) end_(kPid79);
+    }
+
+    // ---- the checks ----
+    CheckedWritesModel modelOf_(const VerdictRig::RigLog& log) const {
+        CheckedWritesModel model;
+        model.addKeyIndexRule();
+        model.addLowerNameUniqueRule(VerdictRig::objectIdOf(CV::CharacterName));
+        model.addCountCheckRule(VerdictRig::objectIdOf(CV::AccountStats), 12);
+        model.declareCountCap(VerdictRig::objectIdOf(CV::AccountStats), fp12_, 12);
+        if (fp13_ != 0) model.declareCountCap(VerdictRig::objectIdOf(CV::AccountStats), fp13_, 13);
+        model.reset(log);
+        return model;
+    }
+    void collectAcks_() {
+        for (const Sent& s : sent_) {
+            if (acks_.count(s.corr) != 0 || (acksLost_ && s.pid == kPid78)) continue;   // a failover or restart drops the ack owed to a write pending then
+            const auto a = s.r->ackFetching(s.corr, 3000);
+            ASSERT_TRUE(a) << "corr " << s.corr;
+            acks_[s.corr] = *a;
+        }
+    }
+    [[nodiscard]] static std::pair<uint16_t, uint32_t> codeOf_(V11 v) {
+        switch (v) {
+        case V11::N: return {55, kNameCid09};
+        case V11::M: return {55, kStatsCid09};
+        case V11::K: return {57, 0};
+        case V11::C: return {63, 0};
+        default: return {0, 0};
+        }
+    }
+    [[nodiscard]] const VerdictRig::VoteReply* replyOf_(int64_t pid, int rig) const {
+        const VerdictRig::VoteReply* out = nullptr;
+        for (const VoteRec& v : votes_) if (v.pid == pid && v.rig == rig) out = &v.reply;
+        return out;
+    }
+
+    // (a) every partition's vote reply is the model's (character) or the ledger's rule; Single and the failover timings give the table's verdicts
+    void checkVotes_(const Expected& ex, const CheckedWritesModel& model) {
+        for (const VoteRec& v : votes_) {
+            EXPECT_EQ(v.reply.errorCode, 0) << "producer " << v.pid;
+            if (v.rig == 1) {
+                const bool no = c_.entity == Entity::SecondPartitionNo && v.pid == kPid77;
+                EXPECT_EQ(v.reply.code, no ? 55 : 0) << "the ledger's vote";
+                if (no) EXPECT_EQ(v.reply.constraintId, kBalancesCid11);
+                continue;
+            }
+            const auto m = model.vote(v.pid);
+            if (c_.timing == Timing::TimeoutDuringVote && v.reply.code == 0) {   // the abort marker was committed before the judge reached J: T ended, J judges nothing
+                EXPECT_EQ(v.reply.failingOffset, -1) << "producer " << v.pid;
+            } else if (m) {
+                EXPECT_EQ(std::make_tuple(v.reply.code, v.reply.constraintId, v.reply.failingOffset), std::make_tuple(m->code, m->constraintId, m->failingOffset)) << "producer " << v.pid << " (a) the model's vote";
+                if (v.reply.judgeOffset >= 0) EXPECT_EQ(v.reply.judgeOffset, m->judgeOffset);
+            } else {
+                EXPECT_EQ(v.reply.code, 0) << "producer " << v.pid << " has no TxnJudge: a yes";
+            }
+        }
+        if (ex.check == Check::TxnEveryPartition)
+            for (const int64_t pid : racing_ ? std::vector<int64_t>{kPid77, kPid79} : std::vector<int64_t>{kPid77}) {
+                std::size_t onA = 0, onB = 0;
+                for (const VoteRec& v : votes_) if (v.pid == pid) (v.rig == 0 ? onA : onB)++;
+                EXPECT_EQ(onA, 1u) << "one vote reply per partition of the persisted set";
+                EXPECT_EQ(onB, 1u) << "one vote reply per partition of the persisted set";
+            }
+        if (ex.check == Check::TxnSameReply && c_.timing == Timing::CoordinatorFailoverVotesOut) {
+            const VerdictRig::VoteReply* first = nullptr;
+            for (const VoteRec& v : votes_) if (v.pid == kPid77 && v.rig == 0) { if (first == nullptr) first = &v.reply; else EXPECT_TRUE(same_(*first, v.reply)); }
+        }
+        if (ex.check != Check::TxnTable) return;
+
+        const std::vector<V11> want = single11(c_.op, c_.entity);
+        ASSERT_FALSE(want.empty());
+        const auto [wc, wcid] = codeOf_(want[0]);
+        if (!batch_) {
+            const VerdictRig::VoteReply* r77 = replyOf_(kPid77, 0);
+            ASSERT_NE(r77, nullptr);
+            EXPECT_EQ(std::make_pair(r77->code, r77->constraintId), std::make_pair(wc, wcid)) << "the Single table: character's vote";
+            if (want[0] == V11::C) EXPECT_EQ(r77->failingOffset, outside_.at(0));
+            if (racing_) {
+                const VerdictRig::VoteReply* r79 = replyOf_(kPid79, 0);
+                ASSERT_NE(r79, nullptr);
+                EXPECT_EQ(std::make_pair(r79->code, r79->constraintId), std::make_pair(codeOf_(want[1]).first, codeOf_(want[1]).second)) << "the Single table: the second transaction";
+            }
+        } else {   // the batch's records all carry the failing member's verdict
+            std::size_t at = 0;
+            for (const Sent& s : sent_) {
+                if (!s.view) continue;
+                const V11 v = want[at++];
+                AckTrailer t;
+                if (v != V11::Ok) t.emplace_back(0, codeOf_(v).first, codeOf_(v).second);   // an atomic batch is judged whole: the trailer carries the first entry
+                EXPECT_EQ(acks_.at(s.corr).verdicts, t) << "the Single table: the atomic batch";
+            }
+        }
+        if (c_.entity == Entity::OutsideWriteLockedRow) {
+            const auto it = model.verdicts().find(outside_.at(0));
+            const auto [lc, lcid] = codeOf_(want[1]);
+            if (want[1] == V11::Ok) EXPECT_TRUE(it == model.verdicts().end()) << "the Single table: 78's create";
+            else { ASSERT_TRUE(it != model.verdicts().end()); EXPECT_EQ(std::make_pair(it->second.code, it->second.constraintId), std::make_pair(lc, lcid)) << "the Single table: 78's create"; }
+        }
+    }
+
+    // (c) raw and group consumers received exactly the accepted records (no record of an aborted or rejected transaction)
+    void checkDelivered_(const CheckedWritesModel& model, const VerdictRig::RigLog& log) {
+        for (int i = 0; i < VerdictRig::kMaxPass && a_.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady; ++i) a_.pass();
+        ASSERT_EQ(a_.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady);
+        std::vector<std::tuple<int64_t, uint64_t, uint8_t>> want;
+        for (const auto& r : model.acceptedRecords()) want.emplace_back(r.offset, r.id, r.intent);
+        std::sort(want.begin(), want.end());
+        for (const SubKind k : {SubKind::Raw, SubKind::Group}) {
+            const auto& box = a_.collect(a_.subscribe(k, 0));
+            std::vector<std::tuple<int64_t, uint64_t, uint8_t>> got;
+            for (const auto& d : box.records) got.emplace_back(d.offset, d.id, d.intent);
+            std::sort(got.begin(), got.end());
+            EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones, with their intents";
+        }
+        for (const VerdictRig::RigTxnMarker& m : log.txnMarkers)
+            if (!m.commit)
+                for (const auto& d : log.data)
+                    if (d.producerId == m.producerId && d.txn)
+                        for (const auto& w : want) EXPECT_NE(std::get<0>(w), d.offset) << "(c) a record of an aborted transaction was delivered";
+    }
+    void checkAcks_(const CheckedWritesModel& model) {
+        for (const Sent& s : sent_) {
+            if (!s.view || acks_.count(s.corr) == 0) continue;
+            if (!batch_) { checkModelTrailer(model, acks_.at(s.corr), s.recs.size(), s.corr); continue; }
+            AckTrailer want = trailerFromModel(model, acks_.at(s.corr), s.recs.size());
+            if (want.size() > 1) want.resize(1);
+            EXPECT_EQ(acks_.at(s.corr).verdicts, want) << "the atomic batch's trailer is the model's first rejection, corr " << s.corr;
+            EXPECT_EQ(acks_.at(s.corr).frameLen, 54u + 2 + 8 * want.size());
+        }
+    }
+
+    [[nodiscard]] int64_t column_(CV v, const uint8_t* row, const char* col) const {
+        const auto& comp = a_.constrained.at(v).comp;
+        for (std::size_t i = 0; i < comp.outputDescriptor.fields.size(); ++i)
+            if (comp.outputDescriptor.fields[i].name == col) {
+                const auto f = rune::view::readSlot(row, comp.rowLayout, static_cast<uint16_t>(i));
+                return f.type == rune::codec::PrimType::Int64 ? f.i : static_cast<int64_t>(f.u);
+            }
+        throw std::logic_error(std::string("no column ") + col);
+    }
+    // (b) character_name holds the model's owners and its gauge the extras; account_stats the live counts
+    void checkViews_(const CheckedWritesModel& model, const VerdictRig::RigLog& log) {
+        std::set<std::string> names;
+        std::set<uint64_t> users;
+        for (const auto& d : log.data) {
+            if (d.del) continue;
+            names.insert(modelLower(d.name));
+            users.insert(static_cast<uint64_t>(d.v));
+        }
+        if (a_.constrained.count(CV::CharacterName) != 0) {
+            const ViewInstance* inst = a_.constrainedInstance(CV::CharacterName);
+            ASSERT_NE(inst, nullptr);
+            const auto owners = model.uniqueOwners();
+            for (const std::string& name : names) {
+                std::vector<uint8_t> key(24, 0);
+                std::copy(name.begin(), name.end(), key.begin());
+                const uint8_t* row = inst->table.get(rune::view::ViewKey::fromBytes(key));
+                const auto owner = owners.find(name);
+                if (owner == owners.end()) { EXPECT_EQ(row, nullptr) << "'" << name << "' has no live claimant"; continue; }
+                ASSERT_NE(row, nullptr) << "'" << name << "'";
+                EXPECT_EQ(column_(CV::CharacterName, row, "characterId"), static_cast<int64_t>(owner->second)) << "the owner of '" << name << "'";
+            }
+            EXPECT_EQ(a_.uniqueConflicts(CV::CharacterName), model.uniqueExtras()) << "the gauge is the extras";
+        }
+        const ViewInstance* stats = a_.constrainedInstance(CV::AccountStats);
+        ASSERT_NE(stats, nullptr);
+        const auto counts = model.liveCountByUser();
+        for (const uint64_t user : users) {
+            const uint8_t* row = stats->table.get(user);
+            const auto want = counts.find(user);
+            if (want == counts.end()) { EXPECT_EQ(row, nullptr) << "user " << user; continue; }
+            ASSERT_NE(row, nullptr) << "user " << user;
+            EXPECT_EQ(column_(CV::AccountStats, row, "characters"), want->second) << "user " << user;
+        }
+    }
+    // (f2) the bytes of every row the cell can touch
+    R11Rows rows_(const CheckedWritesModel&) {
+        R11Rows out;
+        const ViewInstance* stats = a_.constrainedInstance(CV::AccountStats);
+        for (uint64_t u : {kUserU09, kUserW09, kUserV09}) {
+            const uint8_t* row = stats == nullptr ? nullptr : stats->table.get(u);
+            out.rows.push_back(row == nullptr ? std::vector<uint8_t>{} : std::vector<uint8_t>(row, row + stats->table.rowLen()));
+        }
+        return out;
+    }
+    // The ledger moves only with a transaction that every partition voted yes on and that committed
+    void checkLedger_() {
+        const bool moved = !batch_ && ended_.count(kPid77) != 0 && ended_.at(kPid77) && c_.entity != Entity::SecondPartitionNo;
+        const int64_t want = static_cast<int64_t>(c_.entity == Entity::SecondPartitionNo ? kLowBalance11 : kBalance11) - (moved ? 10 : 0);
+        const auto got = b_.viewInt64(b_.constrained.at(CV::Ledger).topicId, kUserU09, b_.outSlotOf(b_.constrained.at(CV::Ledger).topicId, "balance"));
+        ASSERT_TRUE(got);
+        EXPECT_EQ(*got, want) << "the ledger balance: a debit only when the transaction committed";
+    }
+    // (e) (g) the stats of each partition's current leader equal the votes it answered
+    void checkStats_(const Expected& ex) {
+        for (int rig = 0; rig < 2; ++rig) {
+            VerdictRig& r = rig == 0 ? a_ : b_;
+            const TxnJudgeStats& t = r.writeState()->txn.stats;
+            uint64_t yes = 0, no = 0, constraint = 0, notFound = 0, conflict = 0;
+            for (std::size_t i = restartedAt_; i < votes_.size(); ++i) {
+                if (votes_[i].rig != rig) continue;
+                const auto& rep = votes_[i].reply;
+                if (rep.code == 0) { ++yes; continue; }
+                ++no;
+                constraint += rep.code == 55; notFound += rep.code == 57; conflict += rep.code == 63;
+            }
+            if (restartedAt_ == 0 || ex.check == Check::TxnTable) {
+                EXPECT_EQ(t.votesYes, yes) << "rig " << rig << " (g) stat 11";
+                EXPECT_EQ(t.votesNo, no) << "rig " << rig << " (g) stat 12";
+                EXPECT_EQ(t.votesNoConstraint, constraint) << "rig " << rig << " (g) stat 13";
+                EXPECT_EQ(t.votesNoKeyNotFound, notFound) << "rig " << rig << " (g) stat 15";
+                EXPECT_EQ(t.votesNoConflict, conflict) << "rig " << rig;
+            }
+            EXPECT_EQ(t.votesNoKeyExists, 0u) << "rig " << rig << " (g) stat 14";
+            EXPECT_EQ(t.votesNoTooLarge, 0u) << "rig " << rig << " (g) stat 16";
+            EXPECT_EQ(t.markerWithoutVote, 0u) << "rig " << rig << " (e) stat 20";
+            if (restartedAt_ == 0 && t.votesYes + t.votesNo != 0) EXPECT_GT(t.voteLatencyNsTotal, 0u) << "rig " << rig << " (g) stat 18";
+        }
+        const bool pauses = c_.entity == Entity::OutsideWriteLockedRow && (c_.timing == Timing::Single || c_.timing == Timing::TimeoutWhileLocked) && !batch_ &&
+                            c_.op != Op::TxnSelfCollidingCreates;
+        if (pauses) EXPECT_GT(a_.writeState()->txn.stats.foldPausedOnTxnLockNs, 0u) << "(g) stat 19: the judge paused at the locked row";
+    }
+    // (e) no overlay is held once a transaction is decided; the model decides what was applied
+    void checkTxns_(const Expected& ex, const CheckedWritesModel& model, const VerdictRig::RigLog& log) {
+        for (VerdictRig* r : {&a_, &b_})
+            for (const int64_t pid : {kPid77, kPid79}) {
+                const DeferredTxn* t = r->writeState()->txn.find(pid);
+                if (t != nullptr) { EXPECT_EQ(t->overlay, -1) << "no overlay is held once decided"; EXPECT_EQ(t->phase, TxnPhase::Finalized); }
+            }
+        for (const auto& [pid, commit] : ended_) {
+            const auto it = std::find_if(model.txns().begin(), model.txns().end(), [&](const ModelTxn& t) { return t.pid == pid; });
+            ASSERT_TRUE(it != model.txns().end());
+            EXPECT_EQ(it->commit, commit) << "the marker the cell wrote";
+            if (!commit) EXPECT_FALSE(it->applied) << "nothing of an aborted transaction is visible";
+        }
+        if (ex.check == Check::TxnAborted)
+            for (const auto& d : log.data)
+                if (d.txn && d.producerId == kPid77)
+                    for (const auto& r : model.acceptedRecords()) EXPECT_NE(r.offset, d.offset) << "an aborted transaction's record was accepted";
+        if (ex.check == Check::TxnNewJudge || ex.check == Check::TxnSameReply) EXPECT_LE(log.judges.size(), racing_ ? 2u : 1u) << "one J per (producer, epoch)";
+        EXPECT_EQ(a_.writeState()->rejected.mismatches(), 0u);
+    }
+
+    // (d) level 3a: the rows of one transaction's creates appear in one step
+    void observe_() {
+        if (watched_.size() < 2 || a_.constrained.count(CV::CharacterName) == 0 || a_.vs == nullptr) return;
+        const ViewInstance* inst = a_.constrainedInstance(CV::CharacterName);
+        if (inst == nullptr) return;
+        std::size_t present = 0;
+        for (const std::string& name : watched_) {
+            std::vector<uint8_t> key(24, 0);
+            std::copy(name.begin(), name.end(), key.begin());
+            present += inst->table.get(rune::view::ViewKey::fromBytes(key)) != nullptr ? 1 : 0;
+        }
+        if (present != 0 && present != watched_.size() && !partial_) { partial_ = true; ADD_FAILURE() << "(d) a pass saw " << present << " of " << watched_.size() << " rows of one transaction"; }
+    }
+
+    Cell c_;
+    bool batch_, racing_;
+    TxnPair pair_;
+    VerdictRig& a_;
+    VerdictRig& b_;
+    std::vector<Char09> setup_, mine_, second_;
+    Char09 c_char_;
+    std::vector<std::string> watched_;
+    bool partial_ = false;
+    uint32_t membersA_ = 3;
+    int64_t target_ = 0;
+    uint64_t fp12_ = 0, fp13_ = 0;
+    int entries_ = 0;
+    std::map<int64_t, int32_t> seqs_, seqsB_;
+    std::vector<Sent> sent_;
+    std::map<int64_t, VerdictRig::Ack> acks_;
+    std::vector<VoteRec> votes_;
+    std::size_t restartedAt_ = 0;
+    std::map<int64_t, bool> ended_;
+    bool acksLost_ = false;
+    int64_t racingFrom_ = -1;   ///< the first offset of transaction 79
+    std::vector<int64_t> outside_;   ///< the offsets of producer 78's records
+};
+
+}  // namespace
+
 class CheckedWritesMatrix : public ::testing::TestWithParam<Cell> {};
 
 TEST_P(CheckedWritesMatrix, Holds) {
     const Cell c = GetParam();
     const Expected ex = expect(c);
     if (!ex.applicable) GTEST_SKIP() << ex.naReason;
-    if (isP09(c)) ConstraintCellRun(c).run();
+    if (isP11(c)) TxnCellRun(c).run();
+    else if (isP09(c)) ConstraintCellRun(c).run();
     else if (isP06(c)) AutoIncCellRun(c).run();
     else if (isP05(c)) KeyIndexCellRun(c).run();
     else CellRun(c).run();
@@ -1559,6 +2282,11 @@ INSTANTIATE_TEST_SUITE_P(Cell06, CheckedWritesMatrix, ::testing::ValuesIn(cellsF
     });
 
 INSTANTIATE_TEST_SUITE_P(Cell09, CheckedWritesMatrix, ::testing::ValuesIn(cellsFor(Part::P09)),
+    [](const ::testing::TestParamInfo<Cell>& i) {
+        return std::string(nameOf(i.param.op)) + "_" + nameOf(i.param.entity) + "_" + nameOf(i.param.timing);
+    });
+
+INSTANTIATE_TEST_SUITE_P(Cell11, CheckedWritesMatrix, ::testing::ValuesIn(cellsFor(Part::P11)),
     [](const ::testing::TestParamInfo<Cell>& i) {
         return std::string(nameOf(i.param.op)) + "_" + nameOf(i.param.entity) + "_" + nameOf(i.param.timing);
     });
@@ -1985,6 +2713,8 @@ TEST(CheckedWritesMatrixCountRegression, CellCountsArePinned) {
     EXPECT_EQ(applicable(cellsFor(Part::P07)) + aggCellsFor07().size(), 610u);
     EXPECT_EQ(applicable(cellsFor(Part::P09)), 600u);
     EXPECT_EQ(skipped(cellsFor(Part::P09)), 555u);
+    EXPECT_EQ(applicable(cellsFor(Part::P11)), 602u);
+    EXPECT_EQ(skipped(cellsFor(Part::P11)), 126u);
 }
 
 // The model's key index rule against the Single-timing table, all 30 op x entity pairs, on hand-built logs.

@@ -1643,7 +1643,8 @@ inline VerdictRig::RigLog VerdictRig::readLog(int64_t through) const { return re
 /// both partitions vote, and the transaction commits on both only when both voted yes.
 struct TxnPair {
     VerdictRig a, b;
-    explicit TxnPair(const std::function<void(VerdictRig&)>& setup) {
+    /// `follower` / `rollBytes`: both rigs' replica and segment settings (VerdictRig's).
+    explicit TxnPair(const std::function<void(VerdictRig&)>& setup, bool follower = false, int64_t rollBytes = 64LL * 1024 * 1024) : a(follower, rollBytes), b(follower, rollBytes) {
         setup(a);
         setup(b);
     }
