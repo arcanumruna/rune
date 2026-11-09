@@ -221,7 +221,8 @@ struct Ka {
         return frames.size() >= n;
     }
     /// A TimeToLive op and its answer.
-    struct Ttl { bool got = false; int16_t code = 0; int64_t remainingMs = 0; int64_t version = 0; uint64_t ttl = 0; uint64_t holder = 0; };
+    struct Ttl { bool got = false; int16_t code = 0; int64_t remainingMs = 0; int64_t version = 0; uint64_t ttl = 0; uint64_t holder = 0;
+                 int64_t sessionId = 0, correlationId = 0; int32_t readTopicId = -1, readPartition = -1; };
     Ttl timeToLive(const std::string& key) {
         r.leaseTtlAnswers.clear();
         WorkerOp op;
@@ -234,6 +235,7 @@ struct Ka {
         if (r.leaseTtlAnswers.size() != 1) { ADD_FAILURE() << r.leaseTtlAnswers.size() << " TimeToLive answers"; return t; }
         const WorkerReturn& w = r.leaseTtlAnswers[0];
         t.got = true; t.code = w.errorCode; t.remainingMs = w.baseOffset; t.version = w.lastOffset;
+        t.sessionId = w.sessionId; t.correlationId = w.correlationId; t.readTopicId = w.readTopicId; t.readPartition = w.readPartition;
         EXPECT_EQ(w.correlationId, corr);
         if (w.chunk.size() == 16) {
             for (int i = 0; i < 8; ++i) { t.ttl |= uint64_t(w.chunk[std::size_t(i)]) << (8 * i); t.holder |= uint64_t(w.chunk[std::size_t(8 + i)]) << (8 * i); }
@@ -1129,7 +1131,174 @@ TEST(WorkerOpWireRegression, LeaseOpsRoundTripThroughWorkerRegression) {
     EXPECT_EQ(t.ttl, 5000u);
     EXPECT_EQ(t.holder, 1u);
     EXPECT_EQ(t.remainingMs, 5000);
+    EXPECT_EQ(t.sessionId, 5) << "echoed (the helper's session)";
+    EXPECT_EQ(t.correlationId, k.corr);
+    EXPECT_EQ(t.readTopicId, VerdictRig::kSrc);
+    EXPECT_EQ(t.readPartition, 0);
     const auto absent = k.timeToLive(keyOf(2));
     EXPECT_EQ(absent.code, int16_t(kNotFound));
     EXPECT_EQ(absent.remainingMs, -1);
+}
+
+// R12. The write spec loses its lease block while a keepalive is parked: the runtime answers the park InvalidRequest (as a new request to a
+// non-lease topic would be) and dies in one duty pass; the park table is empty.  Mutation: remove the `!spec->lease` branch in leaseDuty_
+// (Worker.h) - the parked answer never comes (red).
+TEST(LeaseKeepAliveTableRegression, SpecLosesLeaseAnswersParksRegression) {
+    Ka k;
+    ASSERT_TRUE(k.setup({1}));
+    const int64_t v = k.versionOf(1);
+    ASSERT_TRUE(k.checkpoint(1, v, 4000));
+    k.r.holdJudge(true);
+    const int64_t c = k.enqueue({E(1, v)});
+    k.step();
+    ASSERT_TRUE(k.frames.empty());
+    ASSERT_EQ(k.r.worker->leaseParksForTest().inUse(), 1u);
+    ASSERT_NE(k.rt(), nullptr);
+    TopicWriteSpecWire w;
+    w.topicId = VerdictRig::kSrc; w.keyFieldId = 4; w.lease = std::nullopt; w.keyType = rune::codec::PrimType::UInt64; w.legacyValidate = false;
+    w.keyIndex = false; w.keyWidth = 8;
+    WorkerOp s;
+    s.type = WorkerOp::Type::WriteSpecUpdate; s.topicId = VerdictRig::kSrc;
+    s.schemaUpdateBlob.resize(topicWriteSpecWireLen(w));
+    ASSERT_EQ(encodeTopicWriteSpec(w, s.schemaUpdateBlob), topicWriteSpecWireLen(w));
+    ASSERT_TRUE(k.r.worker->tryEnqueueOp(std::move(s)));
+    k.step();   // one duty pass
+    EXPECT_EQ(k.rt(), nullptr);
+    ASSERT_EQ(k.frames.size(), 1u);
+    EXPECT_EQ(k.frames[0].corr, c);
+    ASSERT_EQ(k.frames[0].es.size(), 1u);
+    EXPECT_EQ(k.frames[0].es[0].index, 0);
+    EXPECT_EQ(k.frames[0].es[0].code, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(k.frames[0].final);
+    EXPECT_EQ(k.r.worker->leaseParksForTest().inUse(), 0u);
+}
+
+// R13. At most one LIVE clear-ring entry per rid.  Under a closed gate a rid is parked, ended (Free: its flag resets, the ring entry goes
+// stale), re-armed and parked again, 5 times: 5 ring entries, 1 live.  Each duty pass handles that one live entry (clearExamined +1) and
+// pushes it back once; the stale ones are popped for free and not re-pushed (clearPending stays 1).  Mutation: drop the position check in
+// flushClears - every stale entry looks live: clearExamined jumps by 5 and the ring does not shrink (red).
+TEST(LeaseKeepAliveTableRegression, ClearRingOneLiveEntryPerRidRegression) {
+    Ka k;
+    ASSERT_TRUE(k.setup({1}));
+    const int64_t v = k.versionOf(1);
+    ASSERT_TRUE(k.checkpoint(1, v, 4000));
+    k.r.holdJudge(true);
+    (void)k.send({updateRec(1, v)});   // appended, not judged: the gate is closed
+    k.r.passes(30);
+    lease::LeaseRuntime* const rt = k.rt();
+    ASSERT_NE(rt, nullptr);
+    const auto lk = k.r.vs->leaseIndexFor(VerdictRig::kSrc, 0, k.r.replica->leadershipGeneration(), true, true);
+    ASSERT_NE(lk.ref.table, nullptr);
+    lease::LeaseParkTable& parks = k.r.worker->leaseParksMutForTest();
+    const int64_t judged = k.r.writeState()->judgedThrough;
+    const uint32_t rid = k.ridOf(1);
+    const std::string key = keyOf(1);
+    for (int round = 0; round < 5; ++round) {
+        uint32_t req = lease::kLeaseNil;
+        const lease::LeaseKaOutcome o = rt->keepAlive(lk.ref, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(key.data()), key.size()), v,
+                                                      judged, k.leaseNow, parks, req, 77, ++k.corr, 0, true);
+        ASSERT_TRUE(o.parked) << "round " << round;
+        if (round == 4) break;   // the last park stays
+        LeaseEvent ev;
+        ev.kind = LeaseEventKind::Ended; ev.endOp = uint8_t(rec::LeaseOp::Revoke); ev.rid = rid; ev.version = v; ev.offset = 1'000'000 + round;
+        k.r.worker->onEventsForTest(VerdictRig::kSrc, 0, std::span<const LeaseEvent>(&ev, 1), k.leaseNow);
+        ASSERT_EQ(k.entry(1).state, LeaseEntryState::Free);
+    }
+    ASSERT_EQ(rt->clearPending(), 5u) << "one live entry and four stale ones";
+    for (int pass = 1; pass <= 3; ++pass) {
+        const uint64_t before = rt->stats().clearExamined;
+        k.step();
+        EXPECT_EQ(rt->stats().clearExamined - before, 1u) << "pass " << pass << ": only the live entry is handled";
+        EXPECT_EQ(rt->clearPending(), 1u) << "pass " << pass << ": the stale entries were dropped, not pushed back";
+    }
+}
+
+// R14. cold growth that throws bad_alloc never terminates onEvents.  (a) A Granted past the allocated chunks: growFailures 1, the grant is
+// untracked; with the failure gone the next grant is tracked.  (b) The 75 % growth owed at the end of a call throws: it is owed again and
+// the next call grows.  Mutations: remove the try/catch in onEvents - terminate (red); remove noteGrowFailed in onEvents - (b) never grows (red).
+TEST(LeaseKeepAliveTableRegression, GrowBadAllocOnEventsRegression) {
+    lease::LeaseParkTable parks;
+    LeaseEvent g;
+    g.kind = LeaseEventKind::Granted; g.ttlMs = 1000;
+    {   // (a)
+        lease::LeaseRuntime rt(1, 1, 10000, 1'000'000'000);
+        ASSERT_EQ(rt.timers().capacity(), lease::kLeaseEntryChunk);
+        rt.setGrowThrowForTest(true);
+        g.rid = 5000;
+        rt.onEvents(std::span<const LeaseEvent>(&g, 1), 1'000'000'000, parks);
+        EXPECT_EQ(rt.stats().growFailures, 1u);
+        EXPECT_FALSE(rt.timers().covers(5000)) << "the grant stays untracked";
+        rt.setGrowThrowForTest(false);
+        rt.onEvents(std::span<const LeaseEvent>(&g, 1), 1'000'000'000, parks);
+        EXPECT_EQ(rt.stats().growFailures, 1u);
+        ASSERT_TRUE(rt.timers().covers(5000));
+        EXPECT_EQ(rt.timers().entry(5000).state, LeaseEntryState::Armed) << "with the failure gone the next grant is tracked";
+    }
+    {   // (b)
+        lease::LeaseRuntime rt(1, 1, 10000, 1'000'000'000);
+        rt.setGrowThrowForTest(true);
+        g.rid = 3100;   // covered, and past 75 % of the first chunk: growth is owed
+        rt.onEvents(std::span<const LeaseEvent>(&g, 1), 1'000'000'000, parks);
+        EXPECT_EQ(rt.stats().growFailures, 1u);
+        EXPECT_EQ(rt.timers().entry(3100).state, LeaseEntryState::Armed);
+        EXPECT_EQ(rt.timers().capacity(), lease::kLeaseEntryChunk);
+        rt.setGrowThrowForTest(false);
+        rt.onEvents(std::span<const LeaseEvent>(), 1'000'000'000, parks);
+        EXPECT_EQ(rt.timers().capacity(), 2 * lease::kLeaseEntryChunk) << "the owed growth was retried";
+        EXPECT_EQ(rt.stats().growFailures, 1u);
+    }
+}
+
+// R15. A replay that needs the clear ring when it is full answers the chain Throttled (ttl 1, final) instead of leaving it parked unflagged.
+// Mutation: drop the `!flagClear_(rid)` Throttled branch in replay_ - the chain stays parked (red).
+TEST(LeaseKeepAliveTableRegression, ReplayThrottledWhenRingFullRegression) {
+    Ka k;
+    constexpr uint64_t kKeys = 9;
+    std::vector<RawRec> grants;
+    for (uint64_t id = 1; id <= kKeys; ++id) grants.push_back(grantRec(id));
+    ASSERT_TRUE(k.produce(grants));
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    ASSERT_TRUE(k.waitRuntime());
+    std::vector<int64_t> ver(kKeys + 1);
+    for (uint64_t id = 1; id <= kKeys; ++id) {
+        ver[id] = k.versionOf(id);
+        ASSERT_TRUE(k.checkpoint(id, ver[id], 4000));
+    }
+    k.r.holdJudge(true);
+    std::vector<RawRec> ups;
+    for (uint64_t id = 2; id <= kKeys; ++id) ups.push_back(updateRec(id, ver[id]));
+    (void)k.send(ups);   // keys 2..9: a closed gate each
+    k.r.passes(30);
+    lease::LeaseRuntime* const rt = k.rt();
+    ASSERT_NE(rt, nullptr);
+    rt->setClearRingCapForTest(8);
+    // key 1: a checkpoint is in flight (its fold is delivered by hand below)
+    const int64_t off = k.appendCheckpoint(1, ver[1], 4000);
+    ASSERT_GE(off, 0);
+    rt->timersForTest().setState(k.ridOf(1), LeaseEntryState::Checkpointing, off);
+    // keys 2..9 fill the ring with flagged parks
+    std::vector<std::pair<std::string, int64_t>> fill;
+    for (uint64_t id = 2; id <= kKeys; ++id) fill.push_back(E(id, ver[id]));
+    k.enqueue(fill);
+    k.step();
+    ASSERT_TRUE(k.frames.empty());
+    ASSERT_EQ(rt->clearPending(), 8u);
+    // key 1's keepalive parks without a flag (Checkpointing), the ring being full
+    const int64_t c = k.enqueue({E(1, ver[1])});
+    k.step();
+    ASSERT_TRUE(k.frames.empty());
+    ASSERT_EQ(k.r.worker->leaseParksForTest().inUse(), 9u);
+    // its own Checkpoint folds: the replay wants the clear path and the ring is full
+    LeaseEvent ev;
+    ev.kind = LeaseEventKind::Checkpointed; ev.rid = k.ridOf(1); ev.version = ver[1]; ev.offset = off; ev.ttlMs = 5000; ev.remainingMs = 4000;
+    k.r.worker->onEventsForTest(VerdictRig::kSrc, 0, std::span<const LeaseEvent>(&ev, 1), k.leaseNow);
+    k.step();
+    ASSERT_EQ(k.frames.size(), 1u);
+    EXPECT_EQ(k.frames[0].corr, c);
+    ASSERT_EQ(k.frames[0].es.size(), 1u);
+    EXPECT_EQ(k.frames[0].es[0].index, 0);
+    EXPECT_EQ(k.frames[0].es[0].code, kThrottled);
+    EXPECT_EQ(k.frames[0].es[0].ttl, 1u);
+    EXPECT_TRUE(k.frames[0].final);
+    EXPECT_EQ(k.r.worker->leaseParksForTest().inUse(), 8u) << "only the replayed chain was answered";
 }

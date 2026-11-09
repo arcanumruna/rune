@@ -38,11 +38,9 @@ inline constexpr std::size_t kScanLeasesMaxPrefixBytes = 127;
 /// final = 1. For Throttled, ttlMs is the retry-after in ms (ceil).
 inline constexpr uint16_t kLeaseWholeRequest = 0xFFFF;
 
-/// Walks `count` LeaseKeepAlive entries (keyLen u8, key, version i64) in raw bytes: fn(index, key, version).  The whole span is
-/// validated FIRST (every entry inside the remaining bytes, key <= kMaxLeaseKeyBytes, exactly `count` entries consuming exactly the
-/// span); false on any mismatch, and fn is then never called.  Not noexcept: the callback may throw.
-template <class Fn>
-[[nodiscard]] inline bool forEachLeaseKeepAliveEntry(std::span<const uint8_t> entryBytes, uint16_t count, Fn&& fn) {
+/// Whether `entryBytes` holds exactly `count` whole LeaseKeepAlive entries (keyLen u8, key, version i64): every entry inside the
+/// remaining bytes, key <= kMaxLeaseKeyBytes, exactly the span consumed.
+[[nodiscard]] inline bool validateLeaseKeepAliveEntries(std::span<const uint8_t> entryBytes, uint16_t count) noexcept {
     std::size_t pos = 0;
     const std::size_t avail = entryBytes.size();
     for (uint16_t i = 0; i < count; ++i) {
@@ -51,7 +49,13 @@ template <class Fn>
         if (klen > kMaxLeaseKeyBytes || avail - pos < klen + 8u) return false;
         pos += klen + 8u;
     }
-    if (pos != avail) return false;
+    return pos == avail;
+}
+
+/// Walks `count` entries that validateLeaseKeepAliveEntries accepted: fn(index, key, version).  UNCHECKED (the hot path validates once,
+/// then serves); behaviour on unvalidated bytes is undefined.  Not noexcept: the callback may throw.
+template <class Fn>
+inline void forEachValidatedLeaseKeepAliveEntry(std::span<const uint8_t> entryBytes, uint16_t count, Fn&& fn) {
     const uint8_t* p = entryBytes.data();
     for (uint16_t i = 0; i < count; ++i) {
         const std::size_t klen = *p++;
@@ -61,6 +65,14 @@ template <class Fn>
         p += 8;
         fn(i, key, version);
     }
+}
+
+/// Walks `count` LeaseKeepAlive entries (keyLen u8, key, version i64) in raw bytes: fn(index, key, version).  The whole span is
+/// validated FIRST; false on any mismatch, and fn is then never called.  Not noexcept: the callback may throw.
+template <class Fn>
+[[nodiscard]] inline bool forEachLeaseKeepAliveEntry(std::span<const uint8_t> entryBytes, uint16_t count, Fn&& fn) {
+    if (!validateLeaseKeepAliveEntries(entryBytes, count)) return false;
+    forEachValidatedLeaseKeepAliveEntry(entryBytes, count, static_cast<Fn&&>(fn));
     return true;
 }
 

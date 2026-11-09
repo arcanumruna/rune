@@ -329,6 +329,9 @@ public:
     [[nodiscard]] uint8_t& flags(uint32_t rid) noexcept { return store_.at(rid).pad; }
     [[nodiscard]] bool growOwed() const noexcept { return store_.growOwed(); }
     void growIfOwed() { store_.growIfOwed(); }   // cold
+    void noteGrowFailed() noexcept { store_.noteGrowFailed(); }
+    void setGrowThrowForTest(bool on) noexcept { store_.setGrowThrowForTest(on); }
+    [[nodiscard]] uint32_t cap() const noexcept { return store_.cap(); }
     [[nodiscard]] uint32_t capacity() const noexcept { return store_.capacity(); }
     [[nodiscard]] std::size_t bytes() const noexcept { return store_.bytes(); }
 

@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <new>
 #include <vector>
 
 namespace rune::node::lease {
@@ -91,13 +92,18 @@ public:
         evaluate();
     }
     [[nodiscard]] bool growOwed() const noexcept { return growOwed_; }
-    /// Cold: one chunk, clears the flag, re-evaluates.
+    /// Cold: one chunk, clears the flag, re-evaluates.  A throw (bad_alloc) leaves growOwed_ already false: the caller calls
+    /// noteGrowFailed() so the next call retries.
     void growIfOwed() {
         if (!growOwed_) return;
         growOwed_ = false;
         if (capacity() < cap_) addChunk();
         evaluate();
     }
+    /// After growIfOwed threw: the growth is still owed (growIfOwed cleared the flag before it allocated).
+    void noteGrowFailed() noexcept { growOwed_ = true; }
+    /// Test seam: addChunk throws std::bad_alloc while set.
+    void setGrowThrowForTest(bool on) noexcept { growThrowForTest_ = on; }
     [[nodiscard]] uint32_t capacity() const noexcept {
         return static_cast<uint32_t>(chunks_.size() * kLeaseEntryChunk);
     }
@@ -115,7 +121,10 @@ private:
         const uint64_t chunks = (static_cast<uint64_t>(maxKeys) + kLeaseEntryChunk - 1) / kLeaseEntryChunk;
         return static_cast<uint32_t>((chunks == 0 ? 1 : chunks) * kLeaseEntryChunk);
     }
-    void addChunk() { chunks_.push_back(std::make_unique<LeaseEntry[]>(kLeaseEntryChunk)); }   // value-initialized
+    void addChunk() {
+        if (growThrowForTest_) throw std::bad_alloc();
+        chunks_.push_back(std::make_unique<LeaseEntry[]>(kLeaseEntryChunk));   // value-initialized
+    }
     void evaluate() noexcept {
         if (static_cast<uint64_t>(highWater_) * 4 >= static_cast<uint64_t>(capacity()) * 3 && capacity() < cap_) growOwed_ = true;
     }
@@ -124,6 +133,7 @@ private:
     std::vector<std::unique_ptr<LeaseEntry[]>> chunks_;
     uint32_t highWater_ = 0;
     bool     growOwed_  = false;
+    bool     growThrowForTest_ = false;
 };
 
 // ---------------------------------------------------------------------------------------------------------------------

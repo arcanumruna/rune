@@ -237,6 +237,9 @@ enum class ClientTransport : uint8_t { TlsOptional = 0, RequireTls = 1, Plaintex
 /// authentication and every RUNE_TLS_* / RUNE_REQUIRE_TLS variable (issue #11).
 [[nodiscard]] bool tlsBuild() noexcept;
 
+struct NodeConfig;
+[[nodiscard]] inline int64_t leaderHeartbeatTimeoutNs(const NodeConfig& c) noexcept;
+
 struct NodeConfig {
     /// "Derive from the host" sentinel for the Aeron transport sizes (mtu, socket
     /// buffer, receive window) — resolved once at BrokerNode::start() by
@@ -657,8 +660,7 @@ struct NodeConfig {
     /// leader-heartbeat timeout (max(electionTimeout, 3 x statusInterval)) - the same derivation as the runtime's.
     [[nodiscard]] int64_t effectiveBrokerLivenessMs() const noexcept {
         if (brokerLivenessTimeoutMs > 0) return brokerLivenessTimeoutMs;
-        const int64_t hb = electionTimeoutMs > 3 * electionStatusIntervalMs ? electionTimeoutMs : 3 * electionStatusIntervalMs;
-        return 3 * hb;
+        return 3 * (leaderHeartbeatTimeoutNs(*this) / 1'000'000);
     }
 
     // Milestone E1: number of in-process partition workers. Each owned shard is

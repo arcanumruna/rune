@@ -2805,6 +2805,17 @@ private:
         case WorkerOp::Type::ScanLeases:
             // Answering nothing would leave the caller waiting: the gateway never routes ScanLeases (100) to a worker before Task 13.
             assert(false && "ScanLeases is routed only from Task 13");
+            {   // release: a mis-route still answers (a whole-request InvalidRequest as an empty scan return), so a caller never hangs
+                WorkerReturn ret;
+                ret.type          = WorkerReturn::Type::ViewScanResult;
+                ret.sessionId     = op.sessionId();
+                ret.correlationId = op.correlationId();
+                ret.readTopicId   = op.topicId();
+                ret.readPartition = op.partition();
+                ret.recordCount   = 0;
+                ret.errorCode     = static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest);
+                enqueueReturn_(std::move(ret));
+            }
             break;
 
         case WorkerOp::Type::ApplyReplicated:
@@ -7539,7 +7550,8 @@ private:
             PartitionWriteState* const w = writeOf_(replica);
             if (w == nullptr) continue;
             if (w->spec == nullptr || !w->spec->lease) {   // the spec lost its lease block: a runtime of it answers its parks and dies
-                dropLeaseRuntime_(*w, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
+                dropLeaseRuntime_(*w, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest));   // as a new request to a non-lease topic
+                w->leaseEvents.buf.clear();
                 continue;
             }
             if (topicDropped_(replica->topicId())) {   // a dropped topic: never served, its runtime (if any) answers UnknownTopic and dies
@@ -7739,7 +7751,7 @@ private:
         const std::uint32_t tailLen = op.tailLength();   // length first: tail() moves the flyweight's limit
         const auto tail = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(op.tail()), tailLen);
         // The whole entry list is validated before anything is served or charged (a bad tail is a bad request, not a partial one).
-        if (!rune::protocol::client::forEachLeaseKeepAliveEntry(tail, count, [](uint16_t, std::span<const uint8_t>, int64_t) {})) [[unlikely]] {
+        if (!rune::protocol::client::validateLeaseKeepAliveEntries(tail, count)) [[unlikely]] {
             answerLeaseWhole_(sid, corr, topicId, partition, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), 0);
             return;
         }
@@ -7759,7 +7771,7 @@ private:
         uint32_t req     = lease::kLeaseNil;
         uint16_t decided = 0;
         const ReplReadScope rs(*sv.replica, replScratch_);
-        (void)rune::protocol::client::forEachLeaseKeepAliveEntry(tail, count, [&](uint16_t index, std::span<const uint8_t> key, int64_t version) {
+        rune::protocol::client::forEachValidatedLeaseKeepAliveEntry(tail, count, [&](uint16_t index, std::span<const uint8_t> key, int64_t version) {
             const lease::LeaseKaOutcome o = rt.keepAlive(sv.lk.ref, key, version, sv.w->judgedThrough, nowNs, *leaseParks_, req, sid, corr, index,
                                                           owedCapAllows_());
             if (o.parked) return;

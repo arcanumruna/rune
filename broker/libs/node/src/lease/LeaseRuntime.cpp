@@ -59,21 +59,34 @@ enum class Fit : uint8_t { Ok, Full, Oversized };
 }
 }  // namespace
 
+bool LeaseRuntime::reserveFor_(uint32_t rid) {
+    if (rid >= timers_.cap()) return false;
+    const std::size_t need = (static_cast<std::size_t>(rid / kLeaseEntryChunk) + 1) * kLeaseEntryChunk;
+    if (clearPos_.size() < need) clearPos_.resize(need, 0);
+    return timers_.reserveFor(rid);
+}
+
+void LeaseRuntime::growIfOwed_() {
+    if (!timers_.growOwed()) return;
+    const std::size_t need = std::min<std::size_t>(timers_.cap(), static_cast<std::size_t>(timers_.capacity()) + kLeaseEntryChunk);
+    if (clearPos_.size() < need) clearPos_.resize(need, 0);
+    timers_.growIfOwed();
+}
+
 void LeaseRuntime::compactClears_() noexcept {
     uint64_t w = clearHead_;
     for (uint64_t r = clearHead_; r != clearTail_; ++r) {
         const uint32_t rid = clearRing_[r & clearMask_];
         uint8_t& f = timers_.flags(rid);
-        if ((f & kLeaseClearWanted) == 0) continue;   // stale (the entry was reset) or a duplicate of one kept already
-        f = static_cast<uint8_t>(f & ~kLeaseClearWanted);   // kept ones are marked seen by a clear flag, restored below
-        if (timers_.parkHead(rid) == kLeaseNil) continue;   // answered meanwhile: out of the ring, flag clear
+        if ((f & kLeaseClearWanted) == 0 || clearPos_[rid] != static_cast<uint32_t>(r)) continue;   // stale: not the rid's live entry
+        if (timers_.parkHead(rid) == kLeaseNil) {   // answered meanwhile: out of the ring, flag clear
+            f = static_cast<uint8_t>(f & ~kLeaseClearWanted);
+            continue;
+        }
+        clearPos_[rid] = static_cast<uint32_t>(w);   // writes go at w <= r: a later stale entry of this rid can never match it
         clearRing_[w++ & clearMask_] = rid;
     }
     clearTail_ = w;
-    for (uint64_t r = clearHead_; r != clearTail_; ++r) {
-        uint8_t& f = timers_.flags(clearRing_[r & clearMask_]);
-        f = static_cast<uint8_t>(f | kLeaseClearWanted);
-    }
 }
 
 bool LeaseRuntime::clearRoom_(uint32_t rid) noexcept {
@@ -88,6 +101,7 @@ bool LeaseRuntime::flagClear_(uint32_t rid) noexcept {
     if (!clearRoom_(rid)) return false;
     uint8_t& f = timers_.flags(rid);
     f = static_cast<uint8_t>(f | kLeaseClearWanted);
+    clearPos_[rid] = static_cast<uint32_t>(clearTail_);
     clearRing_[clearTail_ & clearMask_] = rid;
     ++clearTail_;
     return true;
@@ -171,7 +185,17 @@ void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNow
     for (const LeaseEvent& ev : events) {
         const uint32_t rid = ev.rid;
         if (ev.kind == LeaseEventKind::Granted) {
-            if (!timers_.covers(rid) && !timers_.reserveFor(rid)) {   // cold growth: one fold can add more grants than the 75 % headroom
+            bool reserved = timers_.covers(rid);
+            if (!reserved) {   // cold growth: one fold can add more grants than the 75 % headroom
+                try {
+                    reserved = reserveFor_(rid);
+                } catch (const std::bad_alloc&) {
+                    // The grant stays untracked (its entry is not armed): the next runtime's promotion pass or a keepalive links it.
+                    ++stats_.growFailures;
+                    continue;
+                }
+            }
+            if (!reserved) {
                 ++stats_.ridPastMaxKeys;
                 if (!ridPastWarned_) {
                     ridPastWarned_ = true;
@@ -234,7 +258,12 @@ void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNow
             case LeaseEventKind::BrokerRejected: break;   // handled above
         }
     }
-    if (timers_.growOwed()) timers_.growIfOwed();   // cold, once per cycle
+    try {
+        growIfOwed_();   // cold, once per cycle
+    } catch (const std::bad_alloc&) {
+        timers_.noteGrowFailed();   // growIfOwed cleared growOwed_ before it allocated: owe it again, the next cycle retries
+        ++stats_.growFailures;
+    }
 }
 
 LeaseKaOutcome LeaseRuntime::keepAlive(const LeaseIndexRef& ref, std::span<const uint8_t> key, int64_t version, int64_t judgedThrough,
@@ -245,8 +274,9 @@ LeaseKaOutcome LeaseRuntime::keepAlive(const LeaseIndexRef& ref, std::span<const
     const uint8_t* const row = ref.table->find(rune::view::ViewKey::fromBytes(key), rid);
     if (row == nullptr || leaseRowVersion(row, *ref.layout) != version) return {false, kCodeLeaseNotFound, 0};
     try {
-        if (!timers_.covers(rid) && !timers_.reserveFor(rid)) return {false, kCodeThrottled, 1};   // cold growth
+        if (!timers_.covers(rid) && !reserveFor_(rid)) return {false, kCodeThrottled, 1};   // cold growth
     } catch (const std::bad_alloc&) {
+        ++stats_.growFailures;
         return {false, kCodeThrottled, 1};
     }
     const uint64_t ttl       = leaseRowTtl(row, *ref.layout);
@@ -283,8 +313,11 @@ LeaseKaOutcome LeaseRuntime::keepAlive(const LeaseIndexRef& ref, std::span<const
         out = {false, st.code, st.ttlMs};
     }
     try {
-        if (timers_.growOwed()) timers_.growIfOwed();   // cold; a failure is retried by the next call
+        growIfOwed_();   // cold
     } catch (const std::bad_alloc&) {
+        // growIfOwed cleared growOwed_ BEFORE it allocated (LeaseEntryStore.h): owe the growth again so the next call retries.
+        timers_.noteGrowFailed();
+        ++stats_.growFailures;
     }
     return out;
 }
@@ -376,20 +409,25 @@ uint32_t LeaseRuntime::flushClears(LeaseEmitWork& work, const LeaseIndexRef& ref
         [[maybe_unused]] const bool ok = flagClear_(rid);
         assert(ok);
     };
-    // Stale ring rids (flag clear: the entry was reset, or a duplicate of one handled already) are popped for free: they count toward
+    // Stale ring entries (flag clear: the entry was reset; or position not current: a newer live entry of the rid exists) are popped for free and NOT pushed back: they count toward
     // neither the record nor the byte limit.  When a limit stops the walk, the entries left behind stay as they are (flagged, parked).
     while (visited < visit && n < rune::protocol::kMaxLeaseExpiryBatch && !full) {
         const uint32_t rid = clearRing_[clearHead_ & clearMask_];
         ++clearHead_;
         ++visited;
         uint8_t& flag = timers_.flags(rid);
-        if ((flag & kLeaseClearWanted) == 0) continue;
+        // Live only if the flag is set AND this is the position the rid was pushed at; anything else is stale and skipped for free.
+        if ((flag & kLeaseClearWanted) == 0 || clearPos_[rid] != static_cast<uint32_t>(clearHead_ - 1)) continue;
         flag = static_cast<uint8_t>(flag & ~kLeaseClearWanted);
+        ++stats_.clearExamined;
         const LeaseEntry& e = timers_.entry(rid);
         if (e.state != LeaseEntryState::Armed || e.parkHead == kLeaseNil) continue;   // answered or changed meanwhile
         if (e.deadlineNs <= leaseNowNs) continue;   // due: the emitter expires it, its parks are answered at the Expire fold
         const uint8_t* row = ref.table->rowOf(rid);
-        if (leaseRowRemaining(row, *ref.layout) == 0) {   // nothing to clear (the row was cleared meanwhile): a plain keepalive
+        // Nothing to clear (the row was cleared meanwhile): a plain keepalive.  Linearization: a keepalive parked behind an UNJUDGED update of
+        // the same key and answered Ok here from the folded row is ordered BEFORE that update - the update has not folded, an update never
+        // renews, and a revoke that folds later ends the key (the holder's next keepalive then gets LeaseNotFound).
+        if (leaseRowRemaining(row, *ref.layout) == 0) {
             const uint64_t ttl = leaseRowTtl(row, *ref.layout);
             timers_.rearm(rid, satAdd(leaseNowNs, msToNsSat(ttl)));
             parks.answerChain(timers_.parkHead(rid), 0, ttl);

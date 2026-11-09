@@ -48,6 +48,8 @@ struct LeaseRuntimeStats {
     uint64_t rollDeferredSkips  = 0;   ///< duty cycles whose appends were skipped because the log's roll was deferred (back-pressure)
     uint64_t rejectedStale      = 0;   ///< BrokerRejected events of an in-flight entry whose row moved on (version differs / row gone): entry Free
     uint64_t ridPastMaxKeys     = 0;   ///< Granted events whose row id is past maxKeys (dropped)
+    uint64_t growFailures       = 0;   ///< cold growth of the entry store threw bad_alloc (the grant stays untracked / the growth is retried)
+    uint64_t clearExamined      = 0;   ///< flushClears: live ring entries handled (flag set and position current); stale ones are skipped for free
 };
 
 /// The outcome of one keepalive entry: parked = no answer now (the park table holds it); else `code` (0 = Ok) and `ttlMs`
@@ -79,7 +81,7 @@ public:
     LeaseRuntime(uint64_t leaderGen, uint64_t rebuildEpoch, uint32_t maxKeys, int64_t leaseNowNs, int32_t topicId = 0, int32_t partition = 0,
                  int64_t extendNs = 0)
         : gen_(leaderGen), epoch_(rebuildEpoch), timers_(maxKeys, leaseNowNs), readyNs_(leaseNowNs), extendNs_(extendNs),
-          topicId_(topicId), partition_(partition) {}
+          topicId_(topicId), partition_(partition), clearPos_(timers_.capacity(), 0) {}
     LeaseRuntime(const LeaseRuntime&)            = delete;
     LeaseRuntime& operator=(const LeaseRuntime&) = delete;
 
@@ -132,6 +134,7 @@ public:
         assert(clearHead_ == clearTail_ && cap != 0 && (cap & (cap - 1)) == 0 && cap <= kClearRingCap);
         clearMask_ = cap - 1;
     }
+    void setGrowThrowForTest(bool on) noexcept { timers_.setGrowThrowForTest(on); }
     [[nodiscard]] bool clearFlagged(uint32_t rid) const noexcept { return (timers_.entry(rid).pad & kLeaseClearWanted) != 0; }
 
     /// One Expire batch: polls the deadline wheel for at most `maxRecords` due Armed entries whose key the judge has caught up with
@@ -156,9 +159,13 @@ private:
     KaStep kaStep_(uint32_t rid, int64_t leaseNowNs, bool remainingPositive, uint64_t ttlMs, bool gateOpen) noexcept;
     /// Puts `rid` on the clear ring (idempotent by the flag).  A full ring is compacted first; false = still full (the caller must not park).
     [[nodiscard]] bool flagClear_(uint32_t rid) noexcept;
-    /// Drops every ring entry whose flag is clear (a stale or duplicate one) or whose rid has no parks (its flag is cleared too),
-    /// keeping the first of each rid.  O(ring), cold.
+    /// Keeps only the live ring entries (flag set, position current) whose rid still has parks, rewriting their positions; a live entry
+    /// whose rid has no parks leaves with its flag cleared.  O(ring), cold.
     void compactClears_() noexcept;
+    /// Cold: reserveFor / growIfOwed of the entry store, with clearPos_ grown FIRST to the capacity they will reach (a throw leaves
+    /// clearPos_ longer than the store, never shorter).
+    [[nodiscard]] bool reserveFor_(uint32_t rid);
+    void growIfOwed_();
     /// Whether flagClear_(rid) would succeed (compacts a full ring).
     [[nodiscard]] bool clearRoom_(uint32_t rid) noexcept;
     /// Decides the chain of `rid` ONCE (the decision depends only on the entry's state and the row values): answered as a whole, or left parked.
@@ -176,6 +183,9 @@ private:
     bool             ridPastWarned_  = false;
     uint32_t         clearMask_ = kClearRingCap - 1;   ///< the ring's capacity - 1 (a test seam lowers it)
     std::array<uint32_t, kClearRingCap> clearRing_{};
+    /// Per rid (sized with the entry store, grown cold with it): the ring position (low 32 bits) of the rid's LIVE ring entry, valid while
+    /// its clear flag is set.  A popped entry is live only if its flag is set AND its position matches: at most one live entry per rid.
+    std::vector<uint32_t> clearPos_;
 };
 
 }  // namespace rune::node::lease
