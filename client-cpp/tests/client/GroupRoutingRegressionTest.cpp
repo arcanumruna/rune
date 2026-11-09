@@ -2043,6 +2043,66 @@ TEST(GroupRoutingRegression, InitProducerIdOnACoordinatorThatNeverConnectsReasks
     EXPECT_LE(r.gw.metadataRequests - metadata0, 9) << "the metadata was re-requested at a fixed pace";
 }
 
+// The grace of a never-connected coordinator grows with each give-up and is reset once a coordinator session was Connected.  After
+// one dead-coordinator episode has grown it past 3 s, a later coordinator that never connects is given up on the metadata backoff
+// again, not after the grown grace.
+// RED: with the reset at the Connected edge deleted the second coordinator waited the grown grace (3.2 s or more).
+TEST(GroupRoutingRegression, NeverConnectedCoordinatorGraceStartsOverAfterACoordinatorConnectedRegression) {
+    RigOptions o = routingClockOptions();   // duty clock
+    o.connectTimeoutMs = 600'000;           // a dead endpoint's connect never fails: only the never-up give-up can move the route
+    GroupRig r(4189, 4190, o);
+    const auto [n1, p1port] = r.addNode(4189);
+    const auto [n2, p2port] = r.addNode(4189);
+    const auto [n3, p3port] = r.addNode(4189);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}, {3, "127.0.0.1", p3port}};
+    r.gw.partitions            = {{1, 0, 0, 1, 4189, ""}};
+    r.gw.coordinatorEndpoint   = n1;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
+    r.gw.deadEndpoints.insert(n1);
+    r.gw.deadEndpoints.insert(n3);
+    r.gw.initPidReply          = true;
+    rc::ProducerConfig tcfg;
+    tcfg.acks            = rc::Acks::All;
+    tcfg.transactionalId = "tx-grace-reset";
+    auto tp = r.client.producer(tcfg);
+    r.connect();
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(tp.initTransactions(r.cq, t), rc::OpResult::Accepted);
+    const int64_t t0 = g_routingClockNs;
+    ASSERT_TRUE(r.drive([&] { return g_routingClockNs - t0 > 4'000'000'000; }, 20'000));   // give-ups at 0.1, 0.3, 0.7, 1.5, 3.1 s
+
+    // The seed names a live coordinator: it connects (the grace starts over).
+    r.gw.coordinatorEndpoint   = n2;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p2port);
+    bool done = false;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == t) done = true;
+        });
+        return done;
+    }, 20'000)) << "InitProducerId never completed on the live coordinator";
+    const int64_t t1 = g_routingClockNs;
+    ASSERT_TRUE(r.drive([&] { return g_routingClockNs - t1 > 500'000'000; }, 8'000));
+
+    // The seed now names another coordinator that never connects.
+    r.gw.coordinatorEndpoint   = n3;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p3port);
+    rc::ProducerConfig tcfg2;
+    tcfg2.acks            = rc::Acks::All;
+    tcfg2.transactionalId = "tx-grace-reset-2";
+    auto tp2 = r.client.producer(tcfg2);
+    const rc::Token t2 = r.nextToken++;
+    const uint64_t redirects0 = r.client.testCoordinatorRedirects();
+    ASSERT_EQ(tp2.initTransactions(r.cq, t2), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return r.client.testCoordinatorRedirects() > redirects0; }, 4'000))
+        << "precondition: the seed named the dead coordinator";
+    const uint64_t fallbacks0 = r.client.testCoordinatorFallbacks();
+    const int64_t t3          = g_routingClockNs;
+    ASSERT_TRUE(r.drive([&] { return r.client.testCoordinatorFallbacks() > fallbacks0; }, 20'000))
+        << "the never-connected coordinator was never given up";
+    EXPECT_LT(g_routingClockNs - t3, 600'000'000) << "the grace of the earlier episode was kept";
+}
+
 // ===========================================================================
 // D4 fix round 1 (re-review r2)
 // ===========================================================================

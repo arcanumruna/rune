@@ -78,6 +78,7 @@ struct GateGateway {
     bool replyConnectOK      = true;
     bool replyGetTopicSchema = true;
     int  getTopicSchemaSeen  = 0;   // GetTopicSchema requests that reached the gateway (a skipped probe sends none)
+    int  getTopicSchemaAnswers = -1;   // answer only this many GetTopicSchema requests (-1 = all)
     std::vector<bool> defineValidate;   // the validate byte of every DefineTopic that reached the gateway
 
     int32_t              getTopicId   = 0x40000001;
@@ -188,6 +189,7 @@ struct GateGateway {
             auto opt = rpc::GetTopicSchema::decode(buf, len);
             if (opt) ++getTopicSchemaSeen;
             if (!opt || !replyGetTopicSchema) break;
+            if (getTopicSchemaAnswers >= 0 && getTopicSchemaSeen > getTopicSchemaAnswers) break;
 
             rpc::TopicSchemaResponse resp;
             resp.sessionId      = opt->sessionId;
@@ -732,6 +734,21 @@ TEST(OpenTopicGateRegression, OpenFailureProbeTimeoutNamesTheOriginalCodeAdversa
     EXPECT_EQ(msg.find("stale"), std::string::npos) << msg;
     EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
     EXPECT_LT(took, 3s) << "bounded by the remaining budget";
+}
+
+// P5 retry: the kind probe answers a typed blob but the retry with the caller's fingerprint is never answered within the budget.
+// The probe's verdict stands (the type is stale); the retry's timeout never escapes as "getTopicSchema(): timed out".
+TEST(OpenTopicGateRegression, OpenFailureRetryTimeoutKeepsTheStaleTypeVerdictAdversarialRegression) {
+    GateHarness h(1358, 1359);
+    h.build();
+    h.connectAndWait();
+    h.gw->getBlob              = serialize(makeCharsV2Descriptor());
+    h.gw->getErrorCode         = 0;
+    h.gw->getTopicSchemaAnswers = h.gw->getTopicSchemaSeen + 1;   // the probe only
+    GateGatewayPump pump(*h.gw);
+    const std::string msg = openFailureText(*h.client, "characters", 7, 300ms);
+    EXPECT_NE(msg.find("stale"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("timed out"), std::string::npos) << msg;
 }
 
 // #22: the probe itself refused names the PROBE's code (an auth name when it has one, the bare number for an unknown

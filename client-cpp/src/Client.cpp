@@ -3110,11 +3110,18 @@ TopicSchemaResult Client::resolveOpenTopicFailure(std::string_view name, uint64_
             if (kind.errorCode == 0) {
                 // The first answer may predate the topic's apply on this node, and the type may be bound to an older version
                 // than the latest one the probe answered: ask for the caller's fingerprint once more.
-                TopicSchemaResult again = getTopicSchemaAndWait(name, fingerprint, remaining - (std::chrono::steady_clock::now() - probeStarted));
-                if (again.errorCode == 0) return again;
-                if (again.errorCode == kUnknownTopic)
+                // With no budget left, or a retry that times out, the probe's answer stands: the type is stale.
+                const auto left = remaining - (std::chrono::steady_clock::now() - probeStarted);
+                if (left > std::chrono::nanoseconds::zero()) {
+                    try {
+                        TopicSchemaResult again = getTopicSchemaAndWait(name, fingerprint, left);
+                        if (again.errorCode == 0) return again;
+                        code = again.errorCode;
+                    } catch (const std::runtime_error&) {
+                    }
+                }
+                if (code == kUnknownTopic)
                     throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
-                code = again.errorCode;
             } else {
                 code = kind.errorCode;
             }
