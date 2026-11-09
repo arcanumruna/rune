@@ -5,6 +5,7 @@
 #include "client/OneBroker.h"
 #include "client/support/RegressorsPathRecords.h"
 #include "support/CatalogBrokerCluster.h"
+#include "support/SharedClientDriver.h"
 #include "support/CheckedWritesRig.h"
 
 #include <QlEngine.h>
@@ -43,6 +44,7 @@ namespace rc  = rune::client;
 namespace rcv = rune::client::view;
 namespace cw  = rune::node::cw;
 namespace fs  = std::filesystem;
+namespace rr  = rune::replication;
 using rune::codec::PrimType;
 
 namespace {
@@ -51,16 +53,27 @@ constexpr uint16_t kConstraintViolation = static_cast<uint16_t>(rune::protocol::
 constexpr uint16_t kKeyNotFound         = static_cast<uint16_t>(rune::protocol::client::ErrorCode::KeyNotFound);
 constexpr rc::Acks kAllView             = rc::Acks::All | rc::Acks::View;
 
+/// The cluster's client config with a short stale-session threshold: a client whose leader's session dies reroutes in about half a second, not after the 10 s default.
+rc::ClientConfig clientConfig(catalog_cluster::ThreeNodes& c, int id) {
+    rc::ClientConfig cfg = catalog_cluster::clientConfigFor(c, id);
+    cfg.responseTimeoutNs   = std::chrono::nanoseconds(500ms).count();
+    cfg.keepaliveIntervalNs = std::chrono::nanoseconds(100ms).count();
+    cfg.ddlRetryBackoff     = 5ms;   // a NotLeader DDL retry after a failover waits 5 ms, not 100 ms + 200 ms
+    return cfg;
+}
+
 template <class Pred>
-bool waitFor(Pred&& pred, std::chrono::seconds within) {
-    for (const auto deadline = std::chrono::steady_clock::now() + within; std::chrono::steady_clock::now() < deadline; std::this_thread::sleep_for(20ms))
+bool waitFor(Pred&& pred, std::chrono::milliseconds within) {
+    for (const auto deadline = std::chrono::steady_clock::now() + within; std::chrono::steady_clock::now() < deadline; std::this_thread::sleep_for(5ms))
         if (pred()) return true;
     return pred();
 }
 
 /// Every broker here runs the shard runtime: its client stream is catalog_cluster::kClientStream.
-int runCli(std::vector<std::string> args, std::string* out = nullptr, std::string* err = nullptr) {
+/// `aeronDir` attaches the run to a running media driver instead of one of its own.
+int runCli(std::vector<std::string> args, std::string* out = nullptr, std::string* err = nullptr, const std::string& aeronDir = {}) {
     args.insert(args.end(), {"--cli-stream-in", std::to_string(catalog_cluster::kClientStream)});
+    if (!aeronDir.empty()) args.insert(args.end(), {"--cli-aeron-dir", aeronDir});
     std::stringstream o, e;
     const int code = rune::cli::run(std::move(args), o, e);
     if (out) *out = o.str();
@@ -84,6 +97,20 @@ struct TmpDir {
 fs::path tmpDir() {
     static const TmpDir d;
     return d.path;
+}
+
+/// `st` as a statement of a script.
+std::string stmt(std::string st) {
+    if (st.empty() || st.back() != ';') st += ';';
+    return st + "\n";
+}
+
+/// A script through one `rune ql -f` (one client and driver for all its statements); its output is every statement's.
+int qlScript(const std::string& endpoint, const std::string& text, std::string* out, std::string* err, const std::string& aeronDir = {}) {
+    static int seq = 0;
+    const fs::path path = tmpDir() / ("cut" + std::to_string(seq++) + ".rql");
+    std::ofstream(path, std::ios::binary) << text;
+    return runCli({"ql", "-f", path.string(), "--broker", endpoint}, out, err, aeronDir);
 }
 
 void awaitLevel(BrokerNode& n) {
@@ -113,20 +140,40 @@ std::string eagerScript() {
     return path.string();
 }
 
-/// The statement of the golden script that defines topic `name`, on one broker.
-std::string goldenTopic(const std::string& name) {
-    std::ifstream in(std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql");
+/// The statement of the golden script that holds `marker`.
+std::string goldenStatement(const std::string& marker) {
+    const std::string path = std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql";
+    std::ifstream in(path);
     std::stringstream text;
     text << in.rdbuf();
     for (std::string st : rune::cli::engine::splitStatements(text.str()))
-        if (st.find("topic " + name + " {") != std::string::npos) return st.replace(st.find(" replicas 3"), std::string_view(" replicas 3").size(), "");
-    return {};
+        if (st.find(marker) != std::string::npos) return st;
+    throw std::runtime_error("regressorspath.rql: no statement holding '" + marker + "' in " + path);
 }
 
-catalog_cluster::ThreeNodes startCluster(const std::string& tag) {
-    return catalog_cluster::ThreeNodes::startWith(tag, [](NodeConfig& cfg) {
+/// The statement of the golden script that defines topic `name`, on one broker.
+std::string goldenTopic(const std::string& name) {
+    std::string st = goldenStatement("topic " + name + " {");
+    st.replace(st.find(" replicas 3"), std::string_view(" replicas 3").size(), "");
+    return st;
+}
+
+/// The statement of the golden script that defines view `name`.
+std::string goldenView(const std::string& name) { return stmt(goldenStatement("view " + name + " key")); }
+
+void fastBroker(NodeConfig& cfg) { cfg.unservableWarmupMs = 50; cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused; }
+
+/// `fast`: the short warm-up, fused workers and a 40 ms election of the default cuts; the stress tests keep the product's.
+catalog_cluster::ThreeNodes startCluster(const std::string& tag, bool fast) {
+    return catalog_cluster::ThreeNodes::startWith(tag, [fast](NodeConfig& cfg) {
         cfg.verdictIntervalMs      = 20;
         cfg.producerIdExpirationMs = 2'000;   // a stopped writer's last batches leave the cleaner something to compact
+        if (!fast) return;
+        cfg.unservableWarmupMs     = 50;
+        cfg.runtimePlacement       = NodeConfig::RuntimePlacement::Fused;
+        cfg.electionTimeoutMs      = 40;
+        cfg.readLeaseMaxMs         = 50;    // the restart wait for the old leader's read lease (W = 1.02 x this), not 204 ms
+        cfg.brokerLivenessTimeoutMs = 150;   // a crashed node's partitions fail over after this, not after 3 x the election timeout
     });
 }
 
@@ -134,8 +181,12 @@ catalog_cluster::ThreeNodes startCluster(const std::string& tag) {
 /// outlast 10 s on a loaded host (the failure detector alone takes several seconds), so this wait is the one 10 s waitFor that is repeated,
 /// at most 3 times; the rounds beyond the first are counted and printed.
 bool leadersWithin(catalog_cluster::ThreeNodes& c, int32_t topicId, std::vector<int32_t>& leaders) {
+    const auto serving = [&] {
+        return catalog_cluster::awaitLeaders(c, topicId, 1, leaders, 1ms) &&
+               c.node(leaders[0]).onOwnerThreadForTest(topicId, 0, [](rr::PartitionReplica* r) { return r != nullptr && r->role() == rr::Role::Leader; });
+    };
     for (int round = 0; round < 3; ++round) {
-        if (waitFor([&] { return catalog_cluster::awaitLeaders(c, topicId, 1, leaders, 1ms); }, 10s)) return true;
+        if (waitFor(serving, 10s)) return true;
         std::printf("leader wait for topic %d: round %d of 3 timed out\n", topicId, round + 1);
     }
     return false;
@@ -238,7 +289,7 @@ struct Writer {
     std::optional<rc::Completions>                                  cq;
     rc::Token                                                       next = 1;
 
-    explicit Writer(rc::ClientConfig cfg, bool withUsers = true) {
+    explicit Writer(rc::ClientConfig cfg, bool withUsers = true, bool withCharacters = true) {
         client = std::make_unique<rc::Client>(cfg);
         rc::ProducerConfig pc;
         pc.acks     = kAllView;
@@ -246,7 +297,7 @@ struct Writer {
         prod.emplace(client->producer(pc));
         client->connectAndWait(10s);
         if (withUsers) users.emplace(client->openTopicAndWait<RpUser>("user", *prod, 10s));
-        characters.emplace(client->openTopicAndWait<RpCharacter>("character", *prod, 10s));
+        if (withCharacters) characters.emplace(client->openTopicAndWait<RpCharacter>("character", *prod, 10s));
         cq.emplace(*client);
     }
     ~Writer() {
@@ -280,7 +331,7 @@ using Fleet = std::vector<std::unique_ptr<Writer>>;
 Fleet makeFleet(catalog_cluster::ThreeNodes& c, std::size_t n) {
     Fleet f;
     const auto nodes = c.runningNodes();
-    for (std::size_t i = 0; i < n; ++i) f.push_back(std::make_unique<Writer>(catalog_cluster::clientConfigFor(c, nodes[i % nodes.size()])));
+    for (std::size_t i = 0; i < n; ++i) f.push_back(std::make_unique<Writer>(clientConfig(c, nodes[i % nodes.size()])));
     return f;
 }
 
@@ -355,7 +406,7 @@ void compactPast(catalog_cluster::ThreeNodes& c, Writer& w, int32_t topicId, int
 // The acceptance case: the scenario of the spec, step by step.
 TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = startCluster("cw09");
+    ThreeNodes c = startCluster("cw09", false);
     ready(c);
     ASSERT_FALSE(HasFailure());
     const std::string ep = endpointOf(c, 1);
@@ -478,7 +529,7 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
     // 7. Restart mid-scenario
     fleet.clear();
     for (const int id : c.runningNodes()) c.stop(id);
-    for (int id = 1; id <= 3; ++id) c.startNode(id);
+    for (const int id : {1, 2, 3}) c.startNode(id);
     ready(c);
     ASSERT_FALSE(HasFailure());
     ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
@@ -517,7 +568,7 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
     ASSERT_TRUE(sentinelChar.ok());
     const auto delivered = [&](const std::string& topic, int32_t topicId, const Ledger& ledger, int64_t sentinel) {
         ASSERT_TRUE(leadersWithin(c, topicId, leaders));
-        rc::ClientConfig cfg = clientConfigFor(c, leaders[0]);
+        rc::ClientConfig cfg = clientConfig(c, leaders[0]);
         cfg.topics.push_back(rc::TopicSpec{topic, topicId, 1});
         rc::Client reader(cfg);
         reader.connectAndWait(10s);
@@ -580,7 +631,7 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
 // R04a on real brokers: the leader fails right after `drop view`; the drop finishes on the new leader and nothing hangs.
 TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = startCluster("cw09_drop");
+    ThreeNodes c = startCluster("cw09_drop", false);
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -592,7 +643,7 @@ TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropThr
     const int32_t leader = leaders[0];
     const int survivor = leader == 1 ? 2 : 1;
 
-    auto w = std::make_unique<Writer>(clientConfigFor(c, survivor));
+    auto w = std::make_unique<Writer>(clientConfig(c, survivor));
     ASSERT_TRUE(w->insertAndAwait(character(1, "Foo")).ok());
     std::vector<rc::Token> inFlight;
     for (int i = 0; i < 12; ++i) inFlight.push_back(w->insert(character(2 + static_cast<uint64_t>(i % 3), "f" + std::to_string(i))));
@@ -621,7 +672,7 @@ TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropThr
         return true;
     }, 10s)) << "a verdict source still waits for an install";
     w.reset();
-    w = std::make_unique<Writer>(clientConfigFor(c, survivor));
+    w = std::make_unique<Writer>(clientConfig(c, survivor));
     const rc::WriteResult dup = w->insertAndAwait(character(9, "foo"));
     EXPECT_TRUE(dup.ok()) << "the dropped unique view no longer refuses a duplicate: code " << dup.code();
 }
@@ -657,26 +708,33 @@ const uint64_t Pc::kFingerprint = rune::codec::fingerprint(pcDescriptor());
 
 /// A writer of `pc` that does not ask for a verdict (or, as the first case, does): plain upserts.
 struct PcWriter {
-    std::unique_ptr<rc::Client>                              client;
+    std::unique_ptr<rc::Client>                              owned;   ///< null when the writer shares a client
+    rc::Client*                                              client;
     std::optional<rc::Producer>                              prod;
     std::optional<rc::TypedTopic<Pc, rc::ProducerRef>>       topic;
     std::optional<rc::Completions>                           cq;
     rc::Token                                                next = 1;
 
-    PcWriter(rc::ClientConfig cfg, rc::Acks acks) {
-        client = std::make_unique<rc::Client>(cfg);
-        rc::ProducerConfig pc;
-        pc.acks     = acks;
-        pc.lingerUs = 1;
-        prod.emplace(client->producer(pc));
-        client->connectAndWait(10s);
-        topic.emplace(client->openTopicAndWait<Pc>("pc", *prod, 10s));
-        cq.emplace(*client);
+    PcWriter(rc::ClientConfig cfg, rc::Acks acks) : owned(std::make_unique<rc::Client>(cfg)), client(owned.get()) {
+        open(acks);
+    }
+    /// A producer on `shared`, which the caller has connected.
+    PcWriter(rc::Client& shared, rc::Acks acks) : client(&shared) {
+        open(acks);
     }
     ~PcWriter() {
         cq.reset();
         if (prod) prod->closeImmediately();
-        if (client) client->close();
+        if (owned) owned->close();
+    }
+    void open(rc::Acks acks) {
+        rc::ProducerConfig pc;
+        pc.acks     = acks;
+        pc.lingerUs = 1;
+        prod.emplace(client->producer(pc));
+        if (owned) client->connectAndWait(10s);
+        topic.emplace(client->openTopicAndWait<Pc>("pc", *prod, 10s));
+        cq.emplace(*client);
     }
     rc::Token upsert(const Pc& r) {
         topic->upsert(r, *cq, next);
@@ -694,12 +752,13 @@ struct PcWriter {
 
 // §11.2: a write that asks for no verdict is judged all the same; its answer is today's and a rejected record is simply never visible.
 TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardRegression) {
-    OneBroker b("cw09_old", OneBroker::Runtime::Shard);
+    OneBroker b("cw09_old", OneBroker::Runtime::Shard, fastBroker);
+    SharedClientDriver clientDriver;
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(ql(b.endpoint(), "topic pc { id uint64, userId uint64, name string(16) } key id with (cleanup.policy = compact);", &out, &err), 0) << err;
-    ASSERT_EQ(ql(b.endpoint(), "create unique view pc_name key lower(name) as nameKey as select id from pc;", &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(b.endpoint(), stmt("topic pc { id uint64, userId uint64, name string(16) } key id with (cleanup.policy = compact)") +
+                       stmt("create unique view pc_name key lower(name) as nameKey as select id from pc"), &out, &err, clientDriver.dir()), 0) << err;
     ViewHandle view(b.node(), "pc_name");
 
     // The client has no idempotence switch: an acks=none batch is its non-idempotent wire path (producer id -1) and gets no completion, so
@@ -707,11 +766,13 @@ TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardR
     struct Kind { rc::Acks acks; int32_t announce; };
     uint64_t id = 1;
     std::optional<int64_t> firstFoo;
+    rc::Client plain(clientDriver.attach(b.clientConfig()));   // the three plain writers are three producers of one client; the v11 announce is a property of the session
+    plain.connectAndWait(10s);
     std::vector<std::unique_ptr<PcWriter>> writers;   // an acks=none writer has nothing to await: it lives until the broker has judged its records
     for (const Kind kind : {Kind{rc::Acks::Leader, 0}, Kind{rc::Acks::All, 0}, Kind{rc::Acks::None, 0}, Kind{rc::Acks::All, 11}}) {
-        rc::ClientConfig cfg = b.clientConfig();
+        rc::ClientConfig cfg = clientDriver.attach(b.clientConfig());
         cfg.testAnnounceClientVersion = kind.announce;
-        PcWriter& w = *writers.emplace_back(std::make_unique<PcWriter>(cfg, kind.acks));
+        PcWriter& w = *writers.emplace_back(kind.announce != 0 ? std::make_unique<PcWriter>(cfg, kind.acks) : std::make_unique<PcWriter>(plain, kind.acks));
         for (const char* name : {"Foo", "foo"}) {
             const rc::Token t = w.upsert(Pc{.id = id, .userId = 7, .name = name});
             ++id;
@@ -724,45 +785,43 @@ TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardR
     }
     ASSERT_TRUE(firstFoo.has_value());
     ASSERT_TRUE(waitFor([&] {
-        return runCli({"stats", "topic", "pc", "--json", "--broker", b.endpoint()}, &out, &err) == 0 && out.find("\"rejectionsConstraint\": 7,") != std::string::npos;
+        return runCli({"stats", "topic", "pc", "--json", "--broker", b.endpoint()}, &out, &err, clientDriver.dir()) == 0 && out.find("\"rejectionsConstraint\": 7,") != std::string::npos;
     }, 10s)) << out << err;
 
-    rc::Client& reader = *b.connectClient();
-    auto sentinel = PcWriter(b.clientConfig(), kAllView);
+    rc::ClientConfig cfg = clientDriver.attach(b.clientConfig());
+    const int32_t topicId = topicIdOf(b.node(), "pc");
+    cfg.topics.push_back(rc::TopicSpec{"pc", topicId, 1});
+    rc::Client shared(cfg);   // the sentinel writer, the reader and the consumer
+    shared.connectAndWait(10s);
+    PcWriter sentinel(shared, kAllView);
     const auto last = sentinel.await(sentinel.upsert(Pc{.id = 100, .userId = 7, .name = "Sentinel"}));
     ASSERT_TRUE(last.has_value());
     ASSERT_TRUE(last->ok());
 
     // The one lower(name) row of "foo" is the first writer's.
     rcv::ViewKeyBuilder foo = keyBuilder(b.node(), "pc_name");
-    const auto row = rowWhenReady(reader, view, bytesOf(foo.setString("name", "foo").key()));
+    const auto row = rowWhenReady(shared, view, bytesOf(foo.setString("name", "foo").key()));
     ASSERT_TRUE(row.has_value());
     EXPECT_EQ(view.u(*row, "id"), 1u);
 
     // A consumer from 0 sees the accepted records: the first "Foo" and the sentinel.
-    rc::ClientConfig cfg = b.clientConfig();
-    const int32_t topicId = topicIdOf(b.node(), "pc");
-    cfg.topics.push_back(rc::TopicSpec{"pc", topicId, 1});
-    rc::Client consumer(cfg);
-    consumer.connectAndWait(10s);
     std::mutex mu;
     std::set<int64_t> got;
     rc::SubscribeOptions o;
     o.from = rc::From::earliest();
-    rc::Subscription sub = consumer.subscribe(consumer.topic("pc"), 0, o, [&](const rc::Record& r) {
+    rc::Subscription sub = shared.subscribe(shared.topic("pc"), 0, o, [&](const rc::Record& r) {
         std::lock_guard<std::mutex> g(mu);
         got.insert(r.offset);
     });
     EXPECT_TRUE(waitFor([&] { std::lock_guard<std::mutex> g(mu); return got.contains(last->offset()); }, 10s));
     sub.unsubscribe();
-    consumer.close();
     std::lock_guard<std::mutex> g(mu);
     EXPECT_EQ(got, (std::set<int64_t>{*firstFoo, last->offset()}));
 }
 
 // R07c: a composite group-by check.
 TEST(CheckedWritesRegressorsPathRegression, CompositeGroupByCheckShardRegression) {
-    OneBroker b("cw09_pg", OneBroker::Runtime::Shard);
+    OneBroker b("cw09_pg", OneBroker::Runtime::Shard, fastBroker);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -781,7 +840,7 @@ TEST(CheckedWritesRegressorsPathRegression, CompositeGroupByCheckShardRegression
 // A replace of the check view while creates are running: nothing times out, the old cap holds up to the change record, the new one after it.
 TEST(CheckedWritesRegressorsPathRegression, ReplaceWhileWritingShardRegression) {
     constexpr uint64_t kUsers = 20;
-    OneBroker b("cw09_rep", OneBroker::Runtime::Shard);
+    OneBroker b("cw09_rep", OneBroker::Runtime::Shard, fastBroker);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -844,4 +903,529 @@ TEST(CheckedWritesRegressorsPathRegression, ReplaceWhileWritingShardRegression) 
         EXPECT_NE(d.status, rc::OpStatus::Timeout);
         if (d.status != rc::OpStatus::Ok) EXPECT_EQ(d.code, kConstraintViolation) << "user " << d.user;
     }
+}
+
+// ============================================================================
+// The default (non-stress) cuts of TheWholeScenarioThreeNodesRegression and FailoverDuringDropFinishesTheDropThreeNodesRegression, which
+// stay below under the stress label.  Each cut is one property: a single broker where the property is not cross-node, the smallest
+// three-broker cluster where it is.  ASSERTION MAP: cleanup-report.md.
+// ============================================================================
+namespace {
+
+std::string ddlUserIdentity() { return goldenView("user_identity"); }
+std::string ddlCharacterName() { return goldenView("character_name"); }
+const std::string kCharacterById  = "create view character_by_id key characterId as select userId, name from character;\n";
+const std::string kAccountChars   = "create view account_characters key (userId, characterId) as select name from character;\n";
+/// The golden account_stats view with its limit set to `cap`.
+std::string accountStats(int cap) {
+    std::string st = goldenView("account_stats");
+    st.replace(st.find("<= 12"), 5, "<= " + std::to_string(cap));
+    return st;
+}
+
+/// The golden topic `name` on one broker; `eager`: small segments and a cleaner that drops tombstones and old records at once.
+std::string topicDdl(const std::string& name, bool eager = false) {
+    std::string st = goldenTopic(name);
+    if (eager) {
+        const std::string plain = "with (cleanup.policy = compact)";
+        st.replace(st.find(plain), plain.size(),
+                   "with (cleanup.policy = compact, segment.bytes = 4096, delete.retention.ms = 0, min.compaction.lag.ms = 50, "
+                   "min.cleanable.dirty.ratio = 0.000001, file.delete.delay.ms = 50)");
+    }
+    return stmt(st);
+}
+
+/// The newest records of topic `topicId` on the single broker, read below the high watermark on the replica's thread.
+LeaderLog readOwner(BrokerNode& n, int32_t topicId) {
+    LeaderLog out;
+    out.node = 1;
+    n.onOwnerThreadForTest(topicId, 0, [&out](rune::replication::PartitionReplica& r) {
+        out.cleanedThrough = r.lastCleanOffset();
+        out.log            = cw::readLogOf(*r.log(), r.highWatermark());
+        return 0;
+    });
+    return out;
+}
+
+/// 256 accepted updates of the topic, enough to roll its 4 KiB segments past the one that holds the rejected records.  The cleaner makes no
+/// headway while the log is being written, so the writes stop before the wait for it.
+template <class Rec, class Send>
+void compactOwner(BrokerNode& n, Writer& w, int32_t topicId, int64_t through, Ledger& ledger, uint64_t id, const Rec& rec, Send&& send) {
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        std::vector<rc::Token> tokens;
+        for (int i = 0; i < 32; ++i) tokens.push_back(send(w, rec));
+        for (const rc::Token t : tokens) ledger.note(id, w.await(t));
+    }
+    if (!waitFor([&] { return n.onOwnerThreadForTest(topicId, 0, [](rune::replication::PartitionReplica& r) { return r.lastCleanOffset(); }) > through; }, 10s)) {
+        const std::string inputs = n.onOwnerThreadForTest(topicId, 0, [](rune::replication::PartitionReplica& r) {
+            std::string bases;
+            for (const int64_t b : r.log()->segmentBaseOffsets()) bases += " " + std::to_string(b);
+            return "lastClean " + std::to_string(r.lastCleanOffset()) + " progress " + std::to_string(r.cleanerProgress()) + " verdictBound " + std::to_string(r.cleanerVerdictBound()) +
+                   " markerEnd " + std::to_string(r.cleanerVerdictMarkerEnd()) + " lso " + std::to_string(r.cleanerLastStableOffset()) + " hw " + std::to_string(r.cleanerHighWatermark()) +
+                   " segments" + bases;
+        });
+        ADD_FAILURE() << "the cleaner never passed offset " << through << " of topic " << topicId << ": " << inputs;
+    }
+}
+
+/// What compaction must have left of `topic`: no rejected record, the newest accepted record of every key, and the stats saying so.
+void judgeOwner(BrokerNode& n, const std::string& endpoint, const std::string& topic, int32_t topicId, const Ledger& ledger) {
+    const LeaderLog l = readOwner(n, topicId);
+    std::map<uint64_t, int64_t> last;
+    for (const auto& rec : l.log.data) {
+        EXPECT_FALSE(ledger.rejected.contains(rec.offset)) << topic << ": a record at the rejected offset " << rec.offset << " is still in the log";
+        last[rec.id] = rec.offset;
+    }
+    for (const auto& [id, off] : last)
+        if (!ledger.latest.contains(id)) ADD_FAILURE() << topic << ": key " << id << " has a record but no accepted write";
+    for (const auto& [id, off] : ledger.latest) {
+        const auto it = last.find(id);
+        if (ledger.removed.contains(id)) {
+            if (it != last.end()) EXPECT_EQ(it->second, off) << topic << ": deleted key " << id << " has a record newer or older than its tombstone";
+        } else {
+            ASSERT_NE(it, last.end()) << topic << ": key " << id << " has no record left, its newest accepted write is at offset " << off;
+            EXPECT_EQ(it->second, off) << topic << ": key " << id << "'s newest record is not its newest accepted write";
+        }
+    }
+    std::string out, err;
+    EXPECT_TRUE(waitFor([&] {
+        return runCli({"stats", "topic", topic, "--json", "--broker", endpoint}, &out, &err) == 0 && out.find("\"rejectedNotCompacted\": 0") != std::string::npos;
+    }, 10s)) << topic << ": " << out << err;
+}
+
+/// A raw subscription from 0 on `topic` of `reader`, which lists it: the rejected records of `ledger` are never delivered, the accepted ones always are.
+void expectDelivery(rc::Client& reader, const std::string& topic, const Ledger& ledger, int64_t sentinel) {
+    std::mutex mu;
+    std::set<int64_t> got;
+    rc::SubscribeOptions o;
+    o.from = rc::From::earliest();
+    rc::Subscription sub = reader.subscribe(reader.topic(topic), 0, o, [&](const rc::Record& r) {
+        std::lock_guard<std::mutex> g(mu);
+        got.insert(r.offset);
+    });
+    const bool arrived = waitFor([&] { std::lock_guard<std::mutex> g(mu); return got.contains(sentinel); }, 10s);
+    sub.unsubscribe();
+    ASSERT_TRUE(arrived) << topic << ": the newest accepted record never arrived";
+    std::lock_guard<std::mutex> g(mu);
+    for (const int64_t off : ledger.rejected) EXPECT_FALSE(got.contains(off)) << topic << ": the rejected record at offset " << off << " was delivered";
+    for (const int64_t off : ledger.accepted) EXPECT_TRUE(got.contains(off)) << topic << ": the accepted record at offset " << off << " was not delivered";
+}
+
+}  // namespace
+
+// Whole step 2: two logins of one subject race; the unique view lets exactly one win.
+TEST(CheckedWritesRegressorsPathRegression, LoginRaceAdmitsOneWinnerShardRegression) {
+    OneBroker b("cw09_race", OneBroker::Runtime::Shard, fastBroker);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    std::string out, err;
+    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("user") + ddlUserIdentity(), &out, &err), 0) << err;
+    ViewHandle userIdentity(b.node(), "user_identity");
+    Writer a(b.clientConfig(), true, false), c(b.clientConfig(), true, false);
+    Ledger users;
+    userIdentity.builder.clear();
+    const auto key = bytesOf(userIdentity.builder.setUInt("provider", 1).setString("subject", "steam:42").key());
+    for (Writer* w : {&a, &c})
+        ASSERT_TRUE(waitFor([&] { return readRow(*w->client, userIdentity, key).status == rc::ViewRowResult::kAbsentKey; }, 10s)) << "no login row yet";
+    const rc::Token ta = a.insert(RpUser{.provider = 1, .subject = "steam:42"});
+    const rc::Token tb = c.insert(RpUser{.provider = 1, .subject = "steam:42"});
+    const rc::WriteResult ra = users.note(0, a.await(ta)), rb = users.note(0, c.await(tb));
+    ASSERT_NE(ra.ok(), rb.ok()) << "exactly one login wins: " << ra.code() << " / " << rb.code();
+    const rc::WriteResult& win = ra.ok() ? ra : rb;
+    const rc::WriteResult& lose = ra.ok() ? rb : ra;
+    rc::Client& loser = *(ra.ok() ? c : a).client;
+    ASSERT_GE(win.key(), 1u);
+    EXPECT_TRUE(isConstraint(lose, loser, "user_identity", "unique")) << "code " << lose.code();
+    const auto row = readRow(loser, userIdentity, key, lose.offset());
+    ASSERT_EQ(row.status, rc::ViewRowResult::kOk) << "the loser reads the winner's row on the first try";
+    EXPECT_EQ(userIdentity.u(row.rowBytes, "userId"), win.key());
+}
+
+// Whole steps 1 (the shown views), 4 and 5.
+TEST(CheckedWritesRegressorsPathRegression, ViewsAreShownAndCreatesReturnTheirIdsShardRegression) {
+    OneBroker b("cw09_names", OneBroker::Runtime::Shard, fastBroker);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    std::string out, err;
+    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("character") + ddlCharacterName() + accountStats(12) + kCharacterById + "show view character_name;\nshow view account_stats;\n",
+                       &out, &err), 0) << err;
+    EXPECT_NE(out.find("unique"), std::string::npos) << out;
+    EXPECT_NE(out.find("keyspec lower(name) as nameKey"), std::string::npos) << out;
+    EXPECT_NE(out.find("constraint max_characters check (characters <= 12)"), std::string::npos) << out;
+    ViewHandle characterById(b.node(), "character_by_id");
+    Writer w(b.clientConfig(), false);
+    const rc::WriteResult foo = w.insertAndAwait(character(7, "Foo"));
+    ASSERT_TRUE(foo.ok()) << "code " << foo.code();
+    const uint64_t c1 = foo.key();
+    ASSERT_GE(c1, 1u);
+    const auto row = readRow(*w.client, characterById, characterById.keyOf(c1), foo.offset());
+    ASSERT_EQ(row.status, rc::ViewRowResult::kOk);
+    EXPECT_EQ(characterById.u(row.rowBytes, "userId"), 7u);
+    EXPECT_TRUE(isConstraint(w.insertAndAwait(character(8, "foo")), *w.client, "character_name", "unique"));
+}
+
+// Whole step 6: the 13th character of an account is refused, its id is burned.
+TEST(CheckedWritesRegressorsPathRegression, ThirteenthCharacterIsRefusedAndItsIdBurnedShardRegression) {
+    OneBroker b("cw09_slot", OneBroker::Runtime::Shard, fastBroker);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    std::string out, err;
+    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("character") + accountStats(12) + kAccountChars, &out, &err), 0) << err;
+    ViewHandle accountStats(b.node(), "account_stats"), accountCharacters(b.node(), "account_characters");
+    const int32_t characterTopic = topicIdOf(b.node(), "character");
+    ASSERT_GE(characterTopic, 0);
+    Writer w0(b.clientConfig(), false), w1(b.clientConfig(), false);
+    Ledger chars;
+    constexpr uint64_t k3 = 3;
+    std::vector<std::pair<Writer*, rc::Token>> pending;
+    for (std::size_t i = 0; i < 13; ++i) {
+        Writer& w = i % 2 == 0 ? w0 : w1;
+        pending.emplace_back(&w, w.insert(character(k3, "k3c" + std::to_string(i))));
+    }
+    int accepted = 0, refused = 0;
+    int64_t refusedOffset = -1;
+    for (auto& [w, token] : pending) {
+        const rc::WriteResult r = chars.note(0, w->await(token));
+        if (r.ok()) ++accepted;
+        else if (isConstraint(r, *w->client, "account_stats", "max_characters")) { ++refused; refusedOffset = r.offset(); }
+        else ADD_FAILURE() << "unexpected answer " << r.code() << " status " << static_cast<int>(r.status());
+    }
+    EXPECT_EQ(accepted, 12);
+    EXPECT_EQ(refused, 1);
+    const auto stats = rowWhenReady(*w0.client, accountStats, accountStats.keyOf(k3));
+    ASSERT_TRUE(stats.has_value());
+    EXPECT_EQ(accountStats.u(*stats, "characters"), 12u);
+    accountCharacters.builder.clear();
+    EXPECT_EQ(scanAll(*w0.client, accountCharacters, bytesOf(accountCharacters.builder.setUInt("userId", k3).prefix())).size(), 12u);
+    // A refused create's answer carries no id: its id is the one of its record in the log.
+    uint64_t refusedId = 0;
+    for (const auto& rec : readOwner(b.node(), characterTopic).log.data)
+        if (rec.offset == refusedOffset) refusedId = rec.id;
+    ASSERT_GE(refusedOffset, 0);
+    ASSERT_NE(refusedId, 0u) << "the refused create's record is in the log at offset " << refusedOffset;
+    const rc::WriteResult after = w0.insertAndAwait(character(4, "Bar"));
+    ASSERT_TRUE(after.ok()) << "code " << after.code();
+    EXPECT_GT(after.key(), refusedId) << "the refused create's id is burned";
+}
+
+// Whole step 7 on one broker: a restart keeps the rows, the limit and the names.
+TEST(CheckedWritesRegressorsPathRegression, RestartKeepsTheLimitsAndTheNamesShardRegression) {
+    OneBroker b("cw09_restart", OneBroker::Runtime::Shard, fastBroker);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    std::string out, err;
+    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("user") + ddlUserIdentity() + topicDdl("character") + ddlCharacterName() + accountStats(2), &out, &err), 0) << err;
+    uint64_t k = 0, c1 = 0;
+    constexpr uint64_t kFull = 3;
+    {
+        Writer w(b.clientConfig());
+        const rc::WriteResult login = w.insertAndAwait(RpUser{.provider = 1, .subject = "steam:42"});
+        ASSERT_TRUE(login.ok());
+        k = login.key();
+        const rc::WriteResult foo = w.insertAndAwait(character(kFull, "Foo"));
+        ASSERT_TRUE(foo.ok());
+        c1 = foo.key();
+        ASSERT_TRUE(w.insertAndAwait(character(kFull, "Bar")).ok());
+    }
+    b.restart();
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    ViewHandle userIdentity(b.node(), "user_identity"), characterName(b.node(), "character_name"), accountStats(b.node(), "account_stats");
+    Writer w(b.clientConfig());
+    const auto stats = rowWhenReady(*w.client, accountStats, accountStats.keyOf(kFull));
+    ASSERT_TRUE(stats.has_value());
+    EXPECT_EQ(accountStats.u(*stats, "characters"), 2u) << "the account still has 2";
+    EXPECT_TRUE(isConstraint(w.insertAndAwait(character(kFull, "Baz")), *w.client, "account_stats", "max_characters"));
+    EXPECT_TRUE(isConstraint(w.insertAndAwait(character(9, "foo")), *w.client, "character_name", "unique"));
+    characterName.builder.clear();
+    const auto name = rowWhenReady(*w.client, characterName, bytesOf(characterName.builder.setString("name", "foo").key()));
+    ASSERT_TRUE(name.has_value());
+    EXPECT_EQ(characterName.u(*name, "characterId"), c1);
+    userIdentity.builder.clear();
+    const auto login = rowWhenReady(*w.client, userIdentity, bytesOf(userIdentity.builder.setUInt("provider", 1).setString("subject", "steam:42").key()));
+    ASSERT_TRUE(login.has_value());
+    EXPECT_EQ(userIdentity.u(*login, "userId"), k);
+}
+
+// Whole step 8: a delete frees the name and the slot; deleting twice is KeyNotFound.
+TEST(CheckedWritesRegressorsPathRegression, DeleteFreesTheNameAndTheSlotShardRegression) {
+    OneBroker b("cw09_delete", OneBroker::Runtime::Shard, fastBroker);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    std::string out, err;
+    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("character") + ddlCharacterName() + accountStats(2), &out, &err), 0) << err;
+    ViewHandle accountStats(b.node(), "account_stats");
+    Writer w(b.clientConfig(), false);
+    Ledger chars;
+    constexpr uint64_t k3 = 3;
+    const rc::WriteResult first = chars.note(0, w.insertAndAwait(character(k3, "k3c0")));
+    ASSERT_TRUE(first.ok());
+    ASSERT_TRUE(chars.note(0, w.insertAndAwait(character(k3, "k3c1"))).ok());
+    const auto statsOf = [&] {
+        const auto row = rowWhenReady(*w.client, accountStats, accountStats.keyOf(k3));
+        return row ? std::optional(accountStats.u(*row, "characters")) : std::nullopt;
+    };
+    const uint64_t cx = first.key();
+    const rc::WriteResult removed = chars.note(cx, w.removeExistingAndAwait(cx), true);
+    ASSERT_TRUE(removed.ok()) << "code " << removed.code();
+    EXPECT_EQ(statsOf(), std::optional<uint64_t>(1));
+    EXPECT_TRUE(chars.note(0, w.insertAndAwait(character(8, "k3c0"))).ok()) << "the name is free again";
+    EXPECT_TRUE(chars.note(0, w.insertAndAwait(character(k3, "k3again"))).ok());
+    EXPECT_EQ(statsOf(), std::optional<uint64_t>(2));
+    const rc::WriteResult twice = chars.note(cx, w.removeExistingAndAwait(cx), true);
+    EXPECT_EQ(twice.code(), kKeyNotFound);
+}
+
+// Whole steps 9 and 10: a rejected record is never delivered, and compaction removes it from the log.
+TEST(CheckedWritesRegressorsPathRegression, RejectedRecordsAreNeverDeliveredAndCompactedAwayShardRegression) {
+    OneBroker b("cw09_gone", OneBroker::Runtime::Shard, fastBroker);
+    SharedClientDriver clientDriver;
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    std::string out, err;
+    ASSERT_EQ(qlScript(b.endpoint(), topicDdl("user", true) + ddlUserIdentity() + topicDdl("character", true) + ddlCharacterName(), &out, &err, clientDriver.dir()), 0) << err;
+    const int32_t userTopic = topicIdOf(b.node(), "user"), characterTopic = topicIdOf(b.node(), "character");
+    ASSERT_GE(userTopic, 0);
+    ASSERT_GE(characterTopic, 0);
+    rc::ClientConfig cfg = clientDriver.attach(b.clientConfig());   // the writer's client also reads both topics back
+    cfg.topics.push_back(rc::TopicSpec{"character", characterTopic, 1});
+    cfg.topics.push_back(rc::TopicSpec{"user", userTopic, 1});
+    Writer w(cfg);
+    Ledger users, chars;
+    const rc::WriteResult login = users.note(0, w.insertAndAwait(RpUser{.provider = 1, .subject = "steam:42"}));
+    ASSERT_TRUE(login.ok());
+    users.note(0, w.insertAndAwait(RpUser{.provider = 1, .subject = "steam:42"}));
+    const rc::WriteResult foo = chars.note(0, w.insertAndAwait(character(login.key(), "Foo")));
+    ASSERT_TRUE(foo.ok());
+    chars.note(0, w.insertAndAwait(character(login.key(), "foo")));
+    const rc::WriteResult sentinelUser = users.note(0, w.insertAndAwait(RpUser{.provider = 1, .subject = "steam:99"}));
+    const rc::WriteResult sentinelChar = chars.note(0, w.insertAndAwait(character(5, "Sentinel")));
+    ASSERT_TRUE(sentinelUser.ok());
+    ASSERT_TRUE(sentinelChar.ok());
+    EXPECT_FALSE(chars.rejected.empty());
+    EXPECT_FALSE(users.rejected.empty());
+    expectDelivery(*w.client, "character", chars, sentinelChar.offset());
+    expectDelivery(*w.client, "user", users, sentinelUser.offset());
+    ASSERT_FALSE(HasFailure());
+    compactOwner(b.node(), w, characterTopic, *chars.rejected.rbegin(), chars, foo.key(), character(login.key(), "Foo", foo.key()),
+                 [](Writer& wr, const RpCharacter& r) { return wr.update(r); });
+    compactOwner(b.node(), w, userTopic, *users.rejected.rbegin(), users, login.key(), RpUser{.userId = login.key(), .provider = 1, .subject = "steam:42"},
+                 [](Writer& wr, const RpUser& r) { return wr.update(r); });
+    ASSERT_FALSE(HasFailure());
+    judgeOwner(b.node(), b.endpoint(), "character", characterTopic, chars);
+    judgeOwner(b.node(), b.endpoint(), "user", userTopic, users);
+}
+
+/// The first write of the regressors-path scenario (Foo) is acked, then the leader of the character partition crashes and a survivor takes over.
+struct CrashedLeader {
+    catalog_cluster::ThreeNodes c;
+    SharedClientDriver          clientDriver;
+    int32_t                     userTopic = -1, characterTopic = -1;
+    int                         first = 0, second = 0;
+    uint64_t                    fooId = 0;
+
+    explicit CrashedLeader(const std::string& tag) : c(startCluster(tag, true)) {}
+
+    void run(bool withUsers) {
+        ready(c);
+        if (testing::Test::HasFatalFailure()) return;
+        std::string out, err;
+        ASSERT_EQ(qlScript(endpointOf(c, 1), (withUsers ? stmt(goldenTopic("user")) : std::string()) + stmt(goldenTopic("character")) + ddlCharacterName(), &out, &err, clientDriver.dir()), 0) << err;
+        BrokerNode& admin = c.node(awaitController(c));
+        characterTopic = topicIdOf(admin, "character");
+        ASSERT_GE(characterTopic, 0);
+        if (withUsers) {
+            userTopic = topicIdOf(admin, "user");
+            ASSERT_GE(userTopic, 0);
+        }
+        std::vector<int32_t> leaders;
+        ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
+        const int32_t crashed = leaders[0];
+        first  = crashed == 1 ? 2 : 1;
+        second = crashed == 3 ? 2 : 3;
+        {
+            Writer w(clientDriver.attach(clientConfig(c, first)), false);
+            const rc::WriteResult foo = w.insertAndAwait(character(1, "Foo"));
+            ASSERT_TRUE(foo.ok()) << "code " << foo.code();
+            fooId = foo.key();
+        }
+        c.crash(crashed);
+        ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
+        ASSERT_NE(leaders[0], crashed);
+        if (withUsers) ASSERT_TRUE(leadersWithin(c, userTopic, leaders));
+    }
+};
+
+// Whole step 3: the leader of a partition crashes and another node takes over.  The new leader does not reuse an id.
+TEST(CheckedWritesRegressorsPathRegression, ACrashedLeaderIsReplacedThreeNodesRegression) {
+    CrashedLeader s("cw09_lead");
+    s.run(true);
+    ASSERT_FALSE(HasFatalFailure());
+    Writer winner(s.clientDriver.attach(clientConfig(s.c, s.second)), false);
+    const rc::WriteResult bar = winner.insertAndAwait(character(3, "Bar"));
+    ASSERT_TRUE(bar.ok()) << "code " << bar.code();
+    EXPECT_GT(bar.key(), s.fooId) << "the new leader must not reuse an id";
+}
+
+// Whole step 3, the other half: the replacement still refuses a duplicate name, and the refused writer reads Foo's row on the first try.
+TEST(CheckedWritesRegressorsPathRegression, ACrashedLeaderStillRefusesADuplicateNameThreeNodesRegression) {
+    CrashedLeader s("cw09_dup");
+    s.run(false);
+    ASSERT_FALSE(HasFatalFailure());
+    ViewHandle characterName(s.c.node(awaitController(s.c)), "character_name");
+    Writer loser(s.clientDriver.attach(clientConfig(s.c, s.first)), false);
+    const rc::WriteResult refused = loser.insertAndAwait(character(2, "foo"));
+    EXPECT_TRUE(isConstraint(refused, *loser.client, "character_name", "unique")) << "code " << refused.code();
+    characterName.builder.clear();
+    const auto row = readRow(*loser.client, characterName, bytesOf(characterName.builder.setString("name", "foo").key()), refused.offset());
+    ASSERT_EQ(row.status, rc::ViewRowResult::kOk) << "the loser reads Foo's row on the first try";
+    EXPECT_EQ(characterName.u(row.rowBytes, "characterId"), s.fooId);
+}
+
+// Whole step 7, the wait the three-broker restart test skips (it runs on a 50 ms warm-up): a restarted controller defers its partition
+// elections until it has held the replicas' reports for unservableWarmupMs.  Mutation: setUnservableReportWarmup not applied -> red.
+TEST(CheckedWritesRegressorsPathRegression, ARestartedControllerDefersItsElectionsWhileItWaitsForReportsShardRegression) {
+    OneBroker b("cw09_warm", OneBroker::Runtime::Shard, [](NodeConfig& cfg) {
+        cfg.unservableWarmupMs = 60'000;   // from 500 ms (BrokerNode::kUnservableReportPeriodNs) on, a restarted controller really waits for the reports
+        cfg.runtimePlacement   = NodeConfig::RuntimePlacement::Fused;
+    });
+    b.restart();
+    EXPECT_TRUE(b.node().onControlThreadForTest([&b] {
+        const auto* ms = b.node().metadataServiceForTest();
+        return ms != nullptr && ms->unservableWarmingUp();
+    })) << "the restarted controller does not defer its elections while it waits for the replicas' reports";
+}
+
+/// Every broker stops and starts again, and the character partition has a leader.
+void restartEveryNode(catalog_cluster::ThreeNodes& c, int32_t characterTopic) {
+    std::vector<std::thread> stoppers;
+    for (const int id : c.runningNodes()) stoppers.emplace_back([&c, id] { c.stop(id); });
+    for (auto& t : stoppers) t.join();
+    c.startNodes({1, 2, 3});
+    ready(c);
+    if (testing::Test::HasFatalFailure()) return;
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
+    ASSERT_TRUE(waitFor([&] {
+        return catalog_cluster::awaitLeaders(c, characterTopic, 1, leaders, 1ms) &&
+               c.node(leaders[0]).onOwnerThreadForTest(characterTopic, 0, [](rr::PartitionReplica* r) { return r != nullptr && r->role() == rr::Role::Leader && r->isr().size() == 3; });
+    }, 10s)) << "the character leader serves with every replica in sync";
+}
+
+// Whole step 7 across nodes: every broker restarts and the limit still holds.
+TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheLimitThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    ThreeNodes c = startCluster("cw09_all", true);
+    SharedClientDriver clientDriver;
+    ready(c);
+    ASSERT_FALSE(HasFatalFailure());
+    std::string out, err;
+    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + accountStats(2), &out, &err, clientDriver.dir()), 0) << err;
+    const int32_t characterTopic = topicIdOf(c.node(awaitController(c)), "character");
+    ASSERT_GE(characterTopic, 0);
+    constexpr uint64_t kFull = 3;
+    {
+        Writer w(clientDriver.attach(clientConfig(c, 1)), false);
+        ASSERT_TRUE(w.insertAndAwait(character(kFull, "Foo")).ok());
+        ASSERT_TRUE(w.insertAndAwait(character(kFull, "Bar")).ok());
+    }
+    restartEveryNode(c, characterTopic);
+    ASSERT_FALSE(HasFatalFailure());
+    ViewHandle accountStats(c.node(awaitController(c)), "account_stats");
+    Writer w(clientDriver.attach(clientConfig(c, 1)), false);
+    const auto stats = rowWhenReady(*w.client, accountStats, accountStats.keyOf(kFull));
+    ASSERT_TRUE(stats.has_value());
+    EXPECT_EQ(accountStats.u(*stats, "characters"), 2u) << "the account still has 2";
+    EXPECT_TRUE(isConstraint(w.insertAndAwait(character(kFull, "Baz")), *w.client, "account_stats", "max_characters"));
+}
+
+// Whole step 7 across nodes, the other half: every broker restarts and a name still refuses its duplicate.
+TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheNameUniqueThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    ThreeNodes c = startCluster("cw09_uniq", true);
+    SharedClientDriver clientDriver;
+    ready(c);
+    ASSERT_FALSE(HasFatalFailure());
+    std::string out, err;
+    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + ddlCharacterName(), &out, &err, clientDriver.dir()), 0) << err;
+    const int32_t characterTopic = topicIdOf(c.node(awaitController(c)), "character");
+    ASSERT_GE(characterTopic, 0);
+    {
+        Writer w(clientDriver.attach(clientConfig(c, 1)), false);
+        ASSERT_TRUE(w.insertAndAwait(character(3, "Foo")).ok());
+    }
+    restartEveryNode(c, characterTopic);
+    ASSERT_FALSE(HasFatalFailure());
+    Writer w(clientDriver.attach(clientConfig(c, 1)), false);
+    EXPECT_TRUE(isConstraint(w.insertAndAwait(character(9, "foo")), *w.client, "character_name", "unique"));
+}
+
+/// A character writer with three writes in flight while the unique view is dropped, the character leader crashing, and that node restarting.
+struct DropWithFailover {
+    catalog_cluster::ThreeNodes c;
+    SharedClientDriver          clientDriver;
+    int32_t                     characterTopic = -1;
+    int                         survivor = 0;
+    std::unique_ptr<Writer>     w;
+    std::vector<rc::Token>      inFlight;
+
+    explicit DropWithFailover(const std::string& tag) : c(startCluster(tag, true)) {}
+
+    void run() {
+        ready(c);
+        if (testing::Test::HasFatalFailure()) return;
+        std::string out, err;
+        ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + ddlCharacterName(), &out, &err, clientDriver.dir()), 0) << err;
+        characterTopic = topicIdOf(c.node(awaitController(c)), "character");
+        ASSERT_GE(characterTopic, 0);
+        std::vector<int32_t> leaders;
+        ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
+        const int32_t leader = leaders[0];
+        survivor = leader == 1 ? 2 : 1;
+        w = std::make_unique<Writer>(clientDriver.attach(clientConfig(c, survivor)), false);
+        ASSERT_TRUE(w->insertAndAwait(character(1, "Foo")).ok());
+        for (int i = 0; i < 3; ++i) inFlight.push_back(w->insert(character(2 + static_cast<uint64_t>(i), "f" + std::to_string(i))));
+        ASSERT_EQ(ql(endpointOf(c, survivor), "drop view character_name;", &out, &err), 0) << err;
+        c.crash(leader);
+        c.startNode(leader);
+    }
+};
+
+// FailoverDuringDrop with the fewest records: the writes in flight across the drop and the failover end in neither a timeout nor a close.
+TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropMinimalThreeNodesRegression) {
+    DropWithFailover s("cw09_dropmin");
+    s.run();
+    ASSERT_FALSE(HasFatalFailure());
+    for (const rc::Token t : s.inFlight) {
+        const rc::WriteResult r = s.w->await(t);
+        EXPECT_NE(r.status(), rc::OpStatus::Timeout);
+        EXPECT_NE(r.status(), rc::OpStatus::Closed);
+    }
+}
+
+// The same, the other half: the drop finishes on the new leader and the dropped unique view no longer refuses.
+TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropUninstallsTheUniqueRuleMinimalThreeNodesRegression) {
+    DropWithFailover s("cw09_dropuniq");
+    s.run();
+    ASSERT_FALSE(HasFatalFailure());
+    for (const rc::Token t : s.inFlight) (void)s.w->await(t);
+    ready(s.c);
+    ASSERT_FALSE(HasFatalFailure());
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(leadersWithin(s.c, s.characterTopic, leaders));
+    EXPECT_TRUE(waitFor([&] {
+        for (const int id : s.c.runningNodes()) {
+            const int32_t worker = rune::metadata::ShardRouter(s.c.node(id).workerCountForTest()).workerForPartition(s.characterTopic, 0);
+            const bool waiting = s.c.node(id).onWorkerThreadForTest(worker, [topic = s.characterTopic](Worker& wk) {
+                const VerdictSource* j = wk.viewSet()->verdictSource(topic, 0);
+                return j != nullptr && j->waitingForInstall();
+            });
+            if (waiting) return false;
+        }
+        return true;
+    }, 10s)) << "a verdict source still waits for an install";
+    s.w.reset();
+    s.w = std::make_unique<Writer>(s.clientDriver.attach(clientConfig(s.c, s.survivor)), false);
+    const rc::WriteResult dup = s.w->insertAndAwait(character(9, "foo"));
+    EXPECT_TRUE(dup.ok()) << "the dropped unique view no longer refuses a duplicate: code " << dup.code();
 }

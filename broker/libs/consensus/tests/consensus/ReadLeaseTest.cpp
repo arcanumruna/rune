@@ -118,6 +118,16 @@ TEST(ReadLeaseRegression, GrantorIgnoresUnknownAndStaleEchoesRegression) {
     EXPECT_GT(g.onRequest(2, b.grantSeq, now + 4 * kMs).grantSeq, b.grantSeq);
 }
 
+TEST(ReadLeaseRegression, HolderCapFollowsTheTestOnlyLoweredLRegression) {
+    ReadLeaseHolder h;
+    h.setMaxLease(30 * kMs);
+    const auto rq = h.nextRequest(1'000 * kMs);
+    EXPECT_TRUE(h.onGrant(rq.reqSeq, 1, 0, 10'000 * kMs));
+    EXPECT_EQ(h.latestEndNs(), 1'000 * kMs + leaseShrinkByDrift(30 * kMs));
+    h.onSelfGrant(2'000 * kMs, 10'000 * kMs, 0);
+    EXPECT_EQ(h.latestEndNs(), 2'000 * kMs + leaseShrinkByDrift(30 * kMs));
+}
+
 TEST(ReadLeaseRegression, HolderLeaseStartsAtTheRequestSendTimeAndIsShrunkByDriftRegression) {
     ReadLeaseHolder h;
     const auto rq = h.nextRequest(/*sendNs=*/1'000 * kMs);
@@ -430,6 +440,28 @@ TEST(ElectionReadLeaseRegression, AMemberHoldingALeaseIsNeverJudgedDeadRegressio
     r.leaseNow += valid;   // the lease is over on the controller's clock
     n = r.e.eligibleNodeIds(now, 10 * kMs, out, 8);
     EXPECT_EQ(std::vector<NodeId>(out, out + n), (std::vector<NodeId>{0, 2}));
+}
+
+// A test-only lowered L (NodeConfig::readLeaseMaxMs) caps every grant and shortens W with it; W stays L(1+rho)^2, never 0.
+// RED: setReadLeaseMaxNs ignoring the grantor (grant above L), the holder (self lease above L) or W (fence still 204 ms).
+TEST(ElectionReadLeaseRegression, ALoweredLeaseMaxCapsGrantsAndShortensTheFenceRegression) {
+    Rig r(0);
+    constexpr int64_t kL = 30 * kMs;
+    r.e.setReadLeaseMaxNs(kL);
+    EXPECT_EQ(r.e.readLeaseFenceWaitNs(), leaseGrowByDrift(kL));
+    int64_t now = 1'000 * kMs;
+    ASSERT_NO_FATAL_FAILURE(leaderClosed(r, now));
+    const Term term = r.e.leadershipTermId();
+    r.e.onReadLeaseRequest(now, term, 1, 1, 0);
+    r.leaseNow += 20 * kMs;
+    r.e.onReadLeaseRequest(now, term, 1, 2, r.pub.grants[0].grantSeq);
+    ASSERT_EQ(r.pub.grants.size(), 2u);
+    EXPECT_EQ(r.pub.grants[1].validFor, kL) << "QL alone would allow ~100 ms";
+    now += kStatusIntervalNs;
+    r.e.doWork(now);
+    EXPECT_LE(r.e.readLease().latestEndNs(), r.leaseNow + leaseShrinkByDrift(kL)) << "the controller's own lease is capped too";
+    EXPECT_FALSE(r.e.readLeaseMoveFenceOpen(2, now - kStatusIntervalNs)) << "inside the lowered W: still fenced";
+    EXPECT_TRUE(r.e.readLeaseMoveFenceOpen(2, now + r.e.readLeaseFenceWaitNs() + kMs));
 }
 
 TEST(ElectionReadLeaseRegression, ANewControllersFailoverGraceCoversEveryLeaseOfThePreviousOneRegression) {

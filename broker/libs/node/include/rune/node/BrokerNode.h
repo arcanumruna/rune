@@ -1549,10 +1549,15 @@ public:
     // {leaderId, term, isLeader} snapshot on LeaderObserver's ring whenever it
     // changes.  isLeader()/leaderId()/leadershipTermId()/awaitLeader()/
     // publishRole()/leaderClientEndpoint() DRAIN that ring: they must be called
-    // from the ONE observer thread: the thread that called start() (enforced —
-    // any other thread is refused: critical log, abort in debug builds).  Node-internal (control-thread) code uses
+    // from the ONE observer thread: the thread that called start() (or the thread
+    // bound by bindLeaderObserverForTest); any other thread is refused: critical
+    // log + abort in all builds.  Node-internal (control-thread) code uses
     // LeaderObserver::computeOnControl() instead — never these.
     // -----------------------------------------------------------------------
+
+    /// Test-only: make the CALLING thread the observer (start() bound the thread that ran it).  Legal only while no thread observes:
+    /// a fixture that starts nodes on worker threads and joins them calls it before the first observe().
+    void bindLeaderObserverForTest() noexcept { leaderObserver_.bindObserver(); }
 
     bool   isLeader()  const noexcept;
     rune::consensus::NodeId leaderId() const noexcept;
@@ -2313,6 +2318,7 @@ public:
         for (const auto& d : shardDrivers_) n += d ? 1u : 0u;
         return n;
     }
+    [[nodiscard]] std::size_t shardClientCountForTest() const noexcept { return shardClients_.size(); }
     /// Test-only (R-M1): TopicDropped ops the control thread delivered to worker rings (one per worker per
     /// drop) / still pending.  Control-thread state: read inside onControlThreadForTest.
     [[nodiscard]] uint64_t topicDroppedEnqueuedForTest() const noexcept { return topicDroppedFanout_.enqueuedForTest(); }
@@ -2340,7 +2346,7 @@ public:
     }
 
     /// Test-only fault injection: called (on the start() thread) at named startup
-    /// phases ("build-gateway" = offset/txn/metadata rebuilds + admin build).
+    /// phases ("offset-recover", "txn-recover", "metadata-recover" = the system logs' recovery, which yields the fused startup gate).
     /// Set before start().
     void setStartupPhaseHookForTest(std::function<void(std::string_view)> hook) {
         startupPhaseHookForTest_ = std::move(hook);
@@ -2354,10 +2360,11 @@ public:
         shardResolveStallForTest_       = stall;
     }
 
-    /// Test-only fault: after shard `worker`'s driver is built, block the start thread for `stall` (a slow driver start).
-    void setShardDriverBuildStallForTest(int32_t worker, std::chrono::milliseconds stall) noexcept {
+    /// Test-only fault: after shard `worker`'s driver is built, the start thread runs `stall` (a slow driver start),
+    /// holding no startup gate.
+    void setShardDriverBuildStallForTest(int32_t worker, std::function<void()> stall) {
         shardDriverBuildStallWorkerForTest_ = worker;
-        shardDriverBuildStallForTest_       = stall;
+        shardDriverBuildStallForTest_       = std::move(stall);
     }
 
     /// Test-only (DR-15 fix round 1): the peer-hostname resolve function of this
@@ -3054,7 +3061,7 @@ private:
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};
     int32_t                                      shardDriverBuildStallWorkerForTest_ = -1;
-    std::chrono::milliseconds                    shardDriverBuildStallForTest_{0};
+    std::function<void()>                        shardDriverBuildStallForTest_;
     void buildShardRuntimes_();
     void attachShardRuntimes_();
     void teardownShardRuntimes_() noexcept;
@@ -3122,6 +3129,7 @@ private:
     std::unique_ptr<EmbeddedDriver> nodeDriver_;   // node-level driver (runtime / legacy workers)
     // Fused placement only: services the runtime's invoker driver + client from
     // aeron_ connect until worker 0 takes them over (joined at the hand-off).
+    rune::aeronutil::StartupClientGate             startupGate_;   // starter thread vs the pump: one thread in aeron_ at a time
     std::unique_ptr<DriverPumpAgent>               startupPumpAgent_;
     std::unique_ptr<rune::consensus::IdleStrategy> startupPumpIdle_;
     std::unique_ptr<rune::consensus::AgentRunner>  startupPumpRunner_;

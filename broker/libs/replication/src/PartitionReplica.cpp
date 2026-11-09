@@ -1711,7 +1711,7 @@ void PartitionReplica::rebuildEpochCacheFromLog_()
     bool gapped = false;
     for (int guard = 0; at < leo && guard < (1 << 20); ++guard) {
         // Copying read (cold): never leaves sealed segments mapped (lazy maps).
-        const std::vector<uint8_t> buf = onLog([&](auto& L) { return L.read(at, 1 << 20); });
+        const std::vector<uint8_t> buf = memoryBacked_ ? memLog_->read(at, 1 << 20) : diskLog_->readPastEmptied(at, 1 << 20, leo);
         if (buf.empty()) break;
         struct { const uint8_t* data; std::size_t len; } v{buf.data(), buf.size()};
         (void)assignEpochsFromBatches_(v.data, v.len);
@@ -2447,7 +2447,7 @@ void PartitionReplica::reconcileEpochCacheWithLog_()
     Offset expect = from;    // CP3 I2: contiguity of the re-derived region
     bool gapped = false;
     for (int guard = 0; from < leo && guard < (1 << 20); ++guard) {
-        const std::vector<uint8_t> buf = diskLog_->read(from, 1 << 20);   // cold, copying read
+        const std::vector<uint8_t> buf = diskLog_->readPastEmptied(from, 1 << 20, leo);   // cold, copying read
         if (buf.empty()) break;
         Offset next = from;
         std::size_t pos = 0;

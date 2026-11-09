@@ -161,6 +161,52 @@ TEST(InvokerTransport, ThreadModeIsUnchanged) {
     t.stop();
 }
 
+// ClientConfig::aeronDir: a transport attaches to a running driver, starts none of its own, and leaves it running at close.
+// Mutation: startBody_ starting the embedded driver whatever aeronDir says -> the dir and the lock appear (red).
+namespace {
+bool roundTrip(Transport& t, int32_t stream) {
+    t.addEgressSubscription("aeron:ipc", stream);
+    const Transport::PubHandle h = t.publicationHandle("aeron:ipc", stream);
+    const uint8_t payload[] = {0x5A};
+    bool got = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!got && std::chrono::steady_clock::now() < deadline) {
+        t.dutyCycle();
+        t.offerOn(h, payload, sizeof payload);
+        t.poll([&](const uint8_t*, std::size_t n) { got = got || n == sizeof payload; }, 10);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return got;
+}
+
+void attachesToARunningDriver(DriverMode mode) {
+    Config a = invokerConfig("aeron:ipc", "aeron:ipc", 3150);
+    a.driverMode = DriverMode::Thread;
+    Transport owner{a};
+    owner.start();
+
+    Config b = invokerConfig("aeron:ipc", "aeron:ipc", 3151);
+    b.driverMode = mode;
+    b.aeronDir   = a.dataDir + "/aeron";
+    {
+        Transport attached{b};
+        attached.start();
+        EXPECT_TRUE(roundTrip(attached, 3152)) << "the attached transport round-trips through the running driver";
+        attached.stop();
+    }
+    EXPECT_FALSE(std::filesystem::exists(b.dataDir + "/aeron")) << "no driver of its own";
+    EXPECT_FALSE(std::filesystem::exists(b.dataDir + "/aeron.lock"));
+    EXPECT_TRUE(roundTrip(owner, 3153)) << "the driver outlives the attached transport";
+    owner.stop();
+    std::error_code ec;
+    std::filesystem::remove_all(b.dataDir, ec);
+}
+}  // namespace
+
+TEST(InvokerTransport, AeronDirAttachesToARunningDriverInThreadModeRegression) { attachesToARunningDriver(DriverMode::Thread); }
+
+TEST(InvokerTransport, AeronDirAttachesToARunningDriverInInvokerModeRegression) { attachesToARunningDriver(DriverMode::Invoker); }
+
 // Regression: validate() accepts any clientLivenessTimeoutNs > 0, but Aeron's
 // driver rejects liveness <= timer_interval_ns (default 1 s) and
 // publication_unblock_timeout_ns (default 15 s) <= liveness

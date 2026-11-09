@@ -282,10 +282,13 @@ TEST(TestClusterRegression, ThreeNodeTopicWithRfBelowTheClusterWaitsOnlyForItsRe
 // catalogTopicServes_: the define is answered Internal after the 5000 ms hold.
 TEST(TestClusterRegression, ALeaderHoldingNoPartitionAnswersOkRegression) {
     // Placement of a one-partition rf-1 topic is the LOWEST live broker (node 1).  Node 1 is made slow to campaign so
-    // that another broker leads the catalog and therefore holds none of those topics.
+    // that another broker leads the catalog and therefore holds none of those topics.  A booted-together cluster is
+    // unanimous at once and every node backs off rand * electionTimeout / 2 before standing; each election draws from an
+    // RNG seeded 42 + nodeId, whose first draws are 0.028 (node 1), 0.653 (node 2) and 0.904 (node 3).  Node 1 at 3000 ms
+    // therefore waited 42 ms against node 2's 49 ms (at 150 ms) and won: its timeout must put 0.028 * T / 2 past 68 ms.
     auto c3 = ThreeNodes::startWith("tc_nohold", [](NodeConfig& cfg) {
         cfg.gatewayMinIsr = 1;
-        if (cfg.nodeId == 1) { cfg.electionTimeoutMs = 3000; cfg.startupCanvassTimeoutMs = 3000; }
+        if (cfg.nodeId == 1) cfg.electionTimeoutMs = 10000;
     });
     ASSERT_TRUE(c3.awaitCatalogLeader(30s));
     const int32_t leader = c3.catalogLeaderId();

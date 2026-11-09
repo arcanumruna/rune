@@ -416,8 +416,7 @@ std::vector<uint8_t> ReadCommittedView::read(rune::storage::Log* log,
     if (fetchOffset >= limit) return {};
 
     // Read from the log.  The log returns raw batch bytes.
-    auto raw = log->read(fetchOffset, maxBytes > 0 ? maxBytes : 1 << 20);
-    if (raw.empty()) return {};
+    auto raw = log->readPastEmptied(fetchOffset, maxBytes > 0 ? maxBytes : 1 << 20, limit);
 
     // Walk the batch stream, collecting batches that pass the filter.
     std::vector<uint8_t> out;

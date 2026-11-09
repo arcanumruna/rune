@@ -22,7 +22,9 @@
 
 #include <atomic>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -1441,4 +1443,67 @@ TEST(LsoTrackerVoteMarkRegression, InheritedTransactionIsVerifiedAgainUntilItsNe
     EXPECT_FALSE(tracker.openVerified(2)) << "no open transaction";
     tracker.onProduceBatch(1, 8);   // its next batch, admitted after the verification
     EXPECT_TRUE(tracker.openVerified(1));
+}
+
+// A segment compaction emptied: the read continues at the next segment instead of answering empty forever.
+TEST(ReadCommittedViewReadTest, ReadContinuesPastASegmentCompactionEmptiedRegression)
+{
+    const std::string dir = makeTmpDir();
+    const auto put = [&dir](int64_t base, const std::vector<uint8_t>& bytes) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(fs::path(dir) / name, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    put(0, {});
+    auto bytes = makeDataBatch(10, -1);
+    const auto second = makeDataBatch(11, -1);
+    bytes.insert(bytes.end(), second.begin(), second.end());
+    put(10, bytes);
+
+    rune::storage::Log log(dir);
+    log.recover();
+    ASSERT_EQ(log.segmentBaseOffsets().size(), 2u);
+    LsoTracker tracker;
+    AbortedTxnIndex abortedIndex;
+    ReadCommittedView view(&tracker, &abortedIndex);
+    const int64_t hw = log.logEndOffset();
+    ASSERT_EQ(hw, 12);
+    view.rebuild(&log, hw);
+
+    const auto offsets = readOffsets(view.read(&log, hw, 0, 1 << 20, IsolationLevel::ReadUncommitted));
+    ASSERT_EQ(offsets.size(), 2u);
+    EXPECT_EQ(offsets[0], 10);
+    EXPECT_EQ(offsets[1], 11);
+
+    fs::remove_all(dir);
+}
+
+// Torn bytes in an earlier segment end the read there: it must not skip to the next segment.
+TEST(ReadCommittedViewReadTest, ReadStopsAtATornBatchRegression)
+{
+    const std::string dir = makeTmpDir();
+    const auto put = [&dir](int64_t base, const std::vector<uint8_t>& bytes) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(fs::path(dir) / name, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    const auto first = makeDataBatch(0, -1);
+    put(0, first);
+    put(10, makeDataBatch(10, -1));
+
+    rune::storage::Log log(dir);
+    log.recover();
+    LsoTracker tracker;
+    AbortedTxnIndex abortedIndex;
+    ReadCommittedView view(&tracker, &abortedIndex);
+    const int64_t hw = log.logEndOffset();
+    ASSERT_EQ(hw, 11);
+    view.rebuild(&log, hw);
+    put(0, std::vector<uint8_t>(first.size(), 0xFF));
+
+    EXPECT_TRUE(view.read(&log, hw, 0, 1 << 20, IsolationLevel::ReadUncommitted).empty());
+
+    fs::remove_all(dir);
 }

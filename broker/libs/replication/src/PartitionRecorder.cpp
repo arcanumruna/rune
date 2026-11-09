@@ -74,10 +74,8 @@ void PartitionRecorder::onCommitted(int64_t startOffset, int64_t endOffset)
 
     int64_t scanFrom = recordFrom;
     while (scanFrom < endOffset) {
-        auto rawBytes = log_->read(scanFrom, kMaxReadBytes);
-        if (rawBytes.empty()) {
-            break;
-        }
+        auto rawBytes = log_->readPastEmptied(scanFrom, kMaxReadBytes, endOffset);
+        if (rawBytes.empty()) break;
 
         // Walk individual RecordBatch frames within the flat read buffer.
         std::size_t pos = 0;

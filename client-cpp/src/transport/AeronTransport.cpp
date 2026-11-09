@@ -81,11 +81,11 @@ int AeronTransport::epollSelectedForTest(bool reset) noexcept {
 }
 
 int AeronTransport::dutyCycle() noexcept {
-    if (cfg_.driverMode != DriverMode::Invoker || driver_ == nullptr) [[unlikely]] return 0;
+    if (cfg_.driverMode != DriverMode::Invoker || (driver_ == nullptr && cfg_.aeronDir.empty())) [[unlikely]] return 0;
     // spec §3.1 order: driver, then client conductor.  T15 R2: the driver
     // refreshes its heartbeat before the conductor checks it — a second line of
-    // defence after mediaDriverTimeoutMsFor(); nothing relies on it alone.
-    int work = pumpDriverFromCaller_();
+    // defence after mediaDriverTimeoutMsFor(); nothing relies on it alone.  An attached client has no driver to pump.
+    int work = driver_ != nullptr ? pumpDriverFromCaller_() : 0;
     if (pumpObserver_ != nullptr) [[unlikely]] pumpObserver_(pumpObserverCtx_, PumpStep::Driver);
     if (aeron_ && conductorFault_ == nullptr) {
         try {
@@ -175,11 +175,11 @@ void AeronTransport::startBody_() {
                                  cfg_.dataDir + "': " + ec.message());
     }
 
-    // 2. Start the embedded media driver.
-    startEmbeddedDriver();
+    // 2. Start the embedded media driver, unless the config names a running one.
+    if (cfg_.aeronDir.empty()) startEmbeddedDriver();
 
     // 3. Connect the Aeron C++ client — aeronDir MUST match the driver's dir.
-    const std::string aeronDir = (fs::path{cfg_.dataDir} / "aeron").string();
+    const std::string aeronDir = cfg_.aeronDir.empty() ? (fs::path{cfg_.dataDir} / "aeron").string() : cfg_.aeronDir;
     {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);

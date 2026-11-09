@@ -62,7 +62,9 @@ AeronPartitionTransport::AeronPartitionTransport(
                         rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers
     if (!sub_) {
         throw std::runtime_error(
-            "AeronPartitionTransport: ingress subscription not resolved (driver refused the pump)");
+            "AeronPartitionTransport: ingress subscription " + ingressChannel + " stream " + std::to_string(ingressStreamId) +
+            (pump.deadlineExpired() ? " not answered by the driver within the startup deadline"
+                                    : " not resolved (driver refused the pump)"));
     }
 }
 

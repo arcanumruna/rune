@@ -135,7 +135,9 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
                         rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers (errors throw)
     if (!sub_) {
         throw std::runtime_error(
-            "ClientGateway: ingress subscription not resolved (driver refused the pump)");
+            "ClientGateway: ingress subscription " + clientChannel_ + " stream " + std::to_string(clientStreamId_) +
+            (pump.deadlineExpired() ? " not answered by the driver within the startup deadline"
+                                    : " not resolved (driver refused the pump)"));
     }
 }
 

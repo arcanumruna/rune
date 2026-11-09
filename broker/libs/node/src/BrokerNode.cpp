@@ -258,11 +258,25 @@ std::unique_ptr<rune::consensus::BackoffIdleStrategy> makeShapedBackoff(const No
     return std::make_unique<rune::consensus::BackoffIdleStrategy>(
         s.spins, s.yields, std::chrono::nanoseconds{s.minParkNs}, std::chrono::nanoseconds{s.maxParkNs});
 }
+
+/// Releases the fused startup gate when start() unwinds, on the starter thread (its TLS must not keep a dead gate).
+struct ReleaseGateOnUnwind {
+    rune::aeronutil::StartupClientGate& gate;
+    ~ReleaseGateOnUnwind() { gate.release(); }
+};
+
+/// A system log's recovery is storage only (no aeron_ call), so the fused interim pump may service the client meanwhile.
+void recoverSystemLog(rune::storage::Log& log, const std::function<void(std::string_view)>& phaseHook, std::string_view phase) {
+    rune::aeronutil::StartupClientGate::Yield pumpMayRun;
+    if (phaseHook) phaseHook(phase);   // test-only fault injection
+    log.recover();
+}
 } // namespace
 
 void BrokerNode::start() {
     if (started_) return; // idempotent (controller-owned flag, F9a)
     started_ = true;
+    ReleaseGateOnUnwind releaseStartupGate{startupGate_};
     // F9a fix round 1: the thread that starts the node is the ONE leadership
     // observer (isLeader/leaderId/... drain the ring; others are refused).
     // Bound before the control thread exists (ordered by its start).
@@ -500,12 +514,17 @@ void BrokerNode::start() {
         }
         // Fused: the runtime's invoker driver + conductor are serviced by an
         // interim pump runner from HERE until worker 0 takes them over (step
-        // 7b) — every startup phase, however long, keeps them live (time-
-        // independent: no phase may out-last the client liveness timeout).
+        // 7b).  The runner invokes the client only while the starter is out of
+        // it: during a resolve's sleep or a StartupClientGate::Yield.  Between
+        // those the client is unserviced, which is safe because the in-process
+        // client liveness is 1 h (kInProcessLivenessNs); a test that lowers it
+        // must keep every other phase shorter.  A new long wait in start() that makes no aeron_ call
+        // holds a StartupClientGate::Yield, like the system-log recoveries and the shard-driver stall.
         // Startup resolves on aeron_ then use the default sleep-poll pump,
         // exactly as with thread placement's driver/conductor threads.
         if (config_.fused()) {
-            startupPumpAgent_  = std::make_unique<DriverPumpAgent>(*nodeDriver_, *aeron_);
+            startupGate_.acquire();   // released by stopStartupPump_()
+            startupPumpAgent_  = std::make_unique<DriverPumpAgent>(*nodeDriver_, *aeron_, startupGate_);
             startupPumpIdle_   = makeBackoffIdle(config_.idleMaxParkUs);
             startupPumpRunner_ = std::make_unique<rune::consensus::AgentRunner>(
                 *startupPumpAgent_, *startupPumpIdle_, clock_);
@@ -2055,7 +2074,6 @@ void BrokerNode::refuseStartOnFailedRecovery_() {
 }
 
 void BrokerNode::buildGateway() {
-    if (startupPhaseHookForTest_) startupPhaseHookForTest_("build-gateway");   // test-only fault injection
     // Capture config_ by value (immutable after construction).
     const std::string clientChannel  = config_.clientEndpoint.channel;
     const int32_t     clientStreamId = config_.clientEndpoint.streamId;
@@ -2335,7 +2353,7 @@ void BrokerNode::buildGateway() {
             // One partition Log for all committed offsets (compact key/value encoding).
             offsetLog_ = std::make_unique<rune::storage::Log>(
                 offsetDir.string(), config_.offsetLogSegmentRollBytes);
-            offsetLog_->recover();
+            recoverSystemLog(*offsetLog_, startupPhaseHookForTest_, "offset-recover");
             refuseStartOnDamagedSystemLog_();   // #839: before offsetStore_->rebuildFromLog() (its first reader)
 
             // Wrap in a PartitionReplica for the __consumer_offsets topic.
@@ -2481,7 +2499,7 @@ void BrokerNode::buildGateway() {
             fs::create_directories(txnDir);
 
             txnLog_ = std::make_unique<rune::storage::Log>(txnDir.string(), config_.offsetLogSegmentRollBytes);
-            txnLog_->recover();
+            recoverSystemLog(*txnLog_, startupPhaseHookForTest_, "txn-recover");
             refuseStartOnDamagedSystemLog_();   // #839: before the txn store's rebuild (its first reader)
 
             const NodeId selfId = static_cast<NodeId>(config_.nodeId);
@@ -2674,7 +2692,7 @@ void BrokerNode::buildGateway() {
             fs::create_directories(metaDir);
 
             metadataLog_ = std::make_unique<rune::storage::Log>(metaDir.string(), config_.offsetLogSegmentRollBytes);
-            metadataLog_->recover();
+            recoverSystemLog(*metadataLog_, startupPhaseHookForTest_, "metadata-recover");
             refuseStartOnDamagedSystemLog_();   // #839: before metadataService_->rebuildFromLog() (its first reader)
 
             const NodeId selfId = static_cast<NodeId>(config_.nodeId);
@@ -2820,7 +2838,8 @@ void BrokerNode::buildGateway() {
                 metadataService_->setAllowSurvivorElection(config_.survivorLeaderElection);
                 // Task 11 fix round 5 (I1): a young controller process waits one
                 // report TTL before deciding user-partition leadership.
-                metadataService_->setUnservableReportWarmup(MetadataService::kUnservableReportTtlNs);
+                static_assert(NodeConfig::kDefaultUnservableWarmupMs * 1'000'000 == MetadataService::kUnservableReportTtlNs, "the default warm-up is one report TTL");
+                metadataService_->setUnservableReportWarmup(config_.unservableWarmupMs * 1'000'000);
                 // D15: the metadata feature level is raised only once every
                 // member advertised it (its node-control registration).
                 metadataService_->setClusterMembers(balancerNodes);
@@ -2970,6 +2989,9 @@ void BrokerNode::buildGateway() {
     if (!config_.isSingleNode() && election_ && workerPool_) {
         for (int32_t i = 0; i < workerPool_->workerCount(); ++i) workerPool_->worker(i).requireViewReadLease();
         runtimeAgent_->enableReadLeaseFanout(workerPool_->workerCount());
+        election_->setReadLeaseMaxNs(config_.readLeaseMaxMs * 1'000'000LL);
+        if (metadataService_)
+            metadataService_->setReadLeaseFenceWaitNs(election_->readLeaseFenceWaitNs());
         if (metadataService_)
             metadataService_->setLeaderMoveFence(
                 [](void* e, int32_t old, int64_t nowNs) noexcept {
@@ -5688,7 +5710,7 @@ void BrokerNode::anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& clie
                 }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
             } catch (const std::exception& e) { err = e.what(); }
         }
-        if (!s) refuse(ch, err.empty() ? std::string("not resolved") : err);
+        if (!s) refuse(ch, err.empty() ? std::string(pump.deadlineExpired() ? "the driver did not answer within the startup deadline" : "not resolved") : err);
         bindAnchorSubs_.push_back(std::move(s));
         bindAnchorChannels_.push_back(ch);
     }
@@ -5706,7 +5728,7 @@ void BrokerNode::anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& clie
                 }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
             } catch (const std::exception& e) { err = e.what(); }
         }
-        if (!p) refuse(ch, err.empty() ? std::string("not resolved") : err);
+        if (!p) refuse(ch, err.empty() ? std::string(pump.deadlineExpired() ? "the driver did not answer within the startup deadline" : "not resolved") : err);
         bindAnchorPubs_.push_back(std::move(p));
         bindAnchorChannels_.push_back(ch);
     }
@@ -6584,6 +6606,7 @@ void BrokerNode::stopStartupPump_() noexcept {
     startupPumpRunner_.reset();
     startupPumpAgent_.reset();
     startupPumpIdle_.reset();
+    startupGate_.release();
 }
 
 // ---------------------------------------------------------------------------
@@ -6648,8 +6671,10 @@ void BrokerNode::buildShardRuntimes_() {
         dcfg.idleStrategy = config_.driverIdleStrategy.empty() ? std::string("sleep-ns") : config_.driverIdleStrategy;
         dcfg.clientLivenessTimeoutNs = config_.shardClientLivenessTimeoutNs;
         shardDrivers_.push_back(std::make_unique<EmbeddedDriver>(std::move(dcfg), DriverMode::Invoker));
-        if (w == shardDriverBuildStallWorkerForTest_) [[unlikely]]
-            std::this_thread::sleep_for(shardDriverBuildStallForTest_);
+        if (w == shardDriverBuildStallWorkerForTest_) [[unlikely]] {
+            rune::aeronutil::StartupClientGate::Yield pumpMayRun;
+            shardDriverBuildStallForTest_();
+        }
         pumpOwnDrivers();
     }
     // Phase 2: clients.

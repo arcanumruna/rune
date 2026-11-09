@@ -171,6 +171,8 @@ public:
 
     static constexpr int64_t kNever = INT64_MIN / 4;
 
+    void setMaxLease(int64_t ns) noexcept { maxLeaseNs_ = ns; }
+
 private:
     struct Slot { int64_t seq = 0; int64_t sendNs = kNever; };
     struct Member {
@@ -227,15 +229,17 @@ public:
         if (s.seq != reqSeq) return false;
         if (grantSeq > heardGrantSeq_) heardGrantSeq_ = grantSeq;
         if (validForNs <= 0) return true;
-        push_(Lease{s.sendNs + leaseShrinkByDrift(std::min(validForNs, kReadLeaseMaxNs)), commitPos});
+        push_(Lease{s.sendNs + leaseShrinkByDrift(std::min(validForNs, maxLeaseNs_)), commitPos});
         return true;
     }
 
     /// The controller's own lease, valid for `validForNs` from `nowNs`.
     void onSelfGrant(int64_t nowNs, int64_t validForNs, int64_t commitPos) noexcept {
         if (validForNs <= 0) return;
-        push_(Lease{nowNs + leaseShrinkByDrift(std::min(validForNs, kReadLeaseMaxNs)), commitPos});
+        push_(Lease{nowNs + leaseShrinkByDrift(std::min(validForNs, maxLeaseNs_)), commitPos});
     }
+
+    void setMaxLease(int64_t ns) noexcept { maxLeaseNs_ = ns; }
 
     /// A new leader / term to follow: its grant sequence numbers are its own (the echo restarts from none).  Granted
     /// leases are kept: each is bounded on its own.
@@ -256,6 +260,7 @@ public:
     [[nodiscard]] uint64_t leasesGranted() const noexcept { return granted_; }
 
 private:
+    int64_t maxLeaseNs_ = kReadLeaseMaxNs;
     struct Sent { int64_t seq = 0; int64_t sendNs = kNone; };
     void push_(Lease l) noexcept {
         recent_[next_] = l;

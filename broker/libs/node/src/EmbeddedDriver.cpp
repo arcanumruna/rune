@@ -20,6 +20,8 @@ EmbeddedDriverConfig EmbeddedDriverConfig::fromNode(const NodeConfig& c, std::st
     e.rcvWindowBytes    = c.aeronRcvWindowBytes;
     e.socketBufferBytes = c.aeronSocketBufferBytes;
     e.termBufferSparse  = c.aeronTermBufferSparse;
+    e.countersValuesBytes = c.aeronCountersValuesBytes;
+    e.statusMessageTimeoutNs = c.aeronStatusMessageTimeoutNs;
     e.maxMessagesPerSend = c.aeronMaxMessagesPerSend;
     e.udpGso             = c.aeronUdpGso;
     e.epollPoll          = c.aeronEpollPoll;
@@ -206,6 +208,7 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
             aeron_driver_context_set_publication_unblock_timeout_ns(ctx_, livenessNs + livenessNs / 2);
     }
     if (cfg_.timerIntervalNs > 0) aeron_driver_context_set_timer_interval_ns(ctx_, static_cast<uint64_t>(cfg_.timerIntervalNs));
+    if (cfg_.statusMessageTimeoutNs > 0) aeron_driver_context_set_rcv_status_message_timeout_ns(ctx_, static_cast<uint64_t>(cfg_.statusMessageTimeoutNs));
     aeron_driver_context_set_dir_delete_on_start(ctx_, true);
     aeron_driver_context_set_dir_delete_on_shutdown(ctx_, cfg_.deleteDirOnShutdown);
     if (cfg_.countersValuesBytes > 0)

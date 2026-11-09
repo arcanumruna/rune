@@ -1507,6 +1507,51 @@ TEST(GroupRoutingRegression, BatchSentToALeaderThatDiesFollowsTheFailoverRegress
     EXPECT_EQ(r.gw.produced.back().endpoint, 0);
 }
 
+// The leader dies with a batch on it and the first metadata answer after its session is lost still names it (the cluster has not
+// elected yet).  The lost session keeps asking, backoff-paced, until the route moves - not once per loss, and not only when the
+// produce attempt times out (here 10 minutes).  RED: one request per loss - the batch stayed on the dead leader.
+TEST(GroupRoutingRegression, BatchOnALostLeaderKeepsAskingWhileTheAnswerIsStaleRegression) {
+    RigOptions o = routingClockOptions();   // #676: duty clock
+    o.connectTimeoutMs  = 600'000;                  // no connect failure within this test
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 400'000'000;
+    GroupRig r(4155, 4156, o);
+    const auto [n1, p1port] = r.addNode(4155);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions  = {{2, 0, 1, 1, 4155, ""}};
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(2, 0).empty(); }));
+    rc::ProducerConfig pc;
+    pc.lingerUs          = 0;
+    pc.deliveryTimeoutMs = 600'000;
+    pc.produceTimeoutMs  = 600'000;                 // only the lost session can move the batch
+    auto p = r.client.producer(pc);
+    r.gw.holdPartitions = {0};                      // node 1 takes the batch, never acks
+    const std::vector<uint8_t> val{1};
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(p.trySend(r.client.topic("b"), rc::Key(uint64_t{1}), std::span<const uint8_t>(val), r.cq, t),
+              rc::SendResult::Ok);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.held.empty() && r.gw.held.back().endpoint == n1; }, 8'000'000));
+    r.gw.deadEndpoints.insert(n1);                  // metadata still names node 1 (stale)
+    r.gw.silentEndpoints.insert(n1);                // and its reconnects are never answered
+    r.gw.holdPartitions.clear();
+    ASSERT_TRUE(r.drive([&] { return r.client.testSessionStateAt(1) != rc::session::SessionState::Connected; }, 20'000'000))
+        << "node 1's session never went stale";
+    const int answered = r.client.testMetadataResponses();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > answered; }, 20'000'000)) << "losing node 1 never got a metadata answer";
+    r.gw.partitions = {{2, 0, 0, 2, 4155, ""}};    // the cluster now elects node 0
+    rc::OpStatus st = rc::OpStatus::Closed;
+    bool done = false;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == t) { done = true; st = cc.status; }
+        });
+        return done;
+    }, 40'000'000)) << "the batch stayed on the dead leader: the client stopped asking after one stale answer (" << r.gw.metadataRequests << " requests)";
+    EXPECT_EQ(st, rc::OpStatus::Ok);
+    EXPECT_EQ(r.gw.produced.back().endpoint, 0);
+}
+
 // DR-7 (rerun, 2026-10-05): the DR client's connect timeout (40 s) is longer than
 // its delivery timeout (30 s), so a connect FAILURE never comes in time — the batch
 // held on the dead ex-leader's still-connecting session must itself ask for

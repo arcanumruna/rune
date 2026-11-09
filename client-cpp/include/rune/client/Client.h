@@ -386,6 +386,11 @@ struct ClientConfig {
     // (transport::kMinDriverCountersBytes) holds 8192 of them and starts the driver ~4x faster.  Else [1 MiB, 500 MiB].
     std::size_t driverCountersBytes = 0;
 
+    /// Empty = the client starts its own embedded driver under dataDir.  Else the aeron dir of a media driver that is already running
+    /// (a test fixture shares one among its clients): the client starts none, attaches to it and leaves it running at close.
+    /// The attached driver's settings apply; the client's driver knobs are ignored, and driverCountersBytes is refused.
+    std::string aeronDir;
+
     // Explicit Aeron knobs (spec §4.1/§4.3).  Env overrides (RUNE_CLIENT_AERON_MTU,
     // RUNE_AERON_SOCKET_BUFFER_BYTES, RUNE_CLIENT_AERON_DRIVER_IDLE) win; a
     // malformed env value is logged once at construction and not applied.
@@ -531,6 +536,8 @@ struct ClientConfig {
     // ViewRowResult::kNotLeader.  Bounded by the read's own deadline
     // (pingTimeoutMs) too.  Independent of the DDL knobs (#76).
     std::chrono::milliseconds viewReadRetryBudget{5'000};
+    // ddlRetryBackoff: the first NotLeader backoff of a DDL / view read (doubling to 1 s).
+    std::chrono::milliseconds ddlRetryBackoff{100};
     // ddlTimeoutMs: the deadline of EVERY DDL (DefineTopic, AlterTopic,
     // CreateView, DropTopic, DropView, AlterView, AlterTopicConfig) — the whole
     // op, its Redirect hops and NotLeader retries included; no answer by then ->
@@ -2031,7 +2038,8 @@ private:
     /// no session is Connected (the caller arms the backoff refresh).
     bool sendMetadataRequestAnywhere_() noexcept;
     std::vector<uint64_t> routeConnectFailuresSeen_;  // DR-7: per session, last seen connectFailures()
-    std::vector<uint8_t>  routeSessionUp_;            // DR-7 review M1: per session, Connected last pass
+    static constexpr uint8_t kRouteSessionUp = 1, kRouteSessionLost = 2;
+    std::vector<uint8_t>  routeSessionUp_;            // DR-7 review M1: per session, Connected last pass (kRouteSessionUp) or dropped since (kRouteSessionLost)
     uint64_t              heldOffersSeen_ = 0;        // DR-7: last seen agent_.heldOffers()
     uint64_t              rejectedEpochSeen_ = 0;     // issue #60: agent_.rejectedEpoch() at the last route sweep
     uint64_t              routedBrokerSweeps_ = 0;    // issue #60: failRoutedBroker sweeps run (test-visible)

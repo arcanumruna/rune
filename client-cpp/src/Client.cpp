@@ -118,6 +118,8 @@ void validateConfigInPlace(ClientConfig& c) {
     }
     if (c.ddlRetryBudget.count() < 0 || c.viewReadRetryBudget.count() < 0)
         throw std::invalid_argument("ClientConfig: ddlRetryBudget / viewReadRetryBudget must be >= 0");
+    if (c.ddlRetryBackoff.count() < 1)
+        throw std::invalid_argument("ClientConfig: ddlRetryBackoff must be >= 1 ms");
     if (c.traceDdlRetries && c.runnerMode != RunnerMode::Invoker)
         throw std::invalid_argument("ClientConfig::traceDdlRetries requires RunnerMode::Invoker "
                                     "(the notes are duty-thread state, read by the Invoker owner)");
@@ -206,6 +208,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c, const detail::ClientTest
     acfg.transport.dataDir         = c.dataDir;
     acfg.transport.termBufferLength = c.termBufferBytes;
     acfg.transport.driverCountersBytes = c.driverCountersBytes;
+    acfg.transport.aeronDir        = c.aeronDir;
 
     // Session egress config (for ConnectRequest body).
     acfg.session.egressChannel  = opts.declaredEgressChannel.empty() ? c.egressChannel : opts.declaredEgressChannel;
@@ -2176,7 +2179,6 @@ void Client::failDdl_(std::size_t i, uint16_t code, std::string_view detail, int
 }
 
 namespace {
-constexpr int64_t kDdlInitialBackoffNs = 100'000'000;     // 100 ms
 constexpr std::string_view kDdlNodeRejected =
     "the DDL's node session was rejected (the user was revoked there or its login was refused)";
 constexpr int64_t kDdlMaxBackoffNs     = 1'000'000'000;   // 1 s
@@ -2246,7 +2248,7 @@ void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t now
     if (const auto* st = std::get_if<DdlSent>(&d.retry)) {
         redirects   = st->redirects;
         budgetEndNs = std::min(p.deadlineNs, nsAfter(nowNs, (isDdlOp(p.op) ? cfg_.ddlRetryBudget : cfg_.viewReadRetryBudget).count()));
-        backoffNs   = kDdlInitialBackoffNs;
+        backoffNs   = cfg_.ddlRetryBackoff.count() * 1'000'000;
     } else if (const auto* n = std::get_if<DdlNotLeaderSeen>(&d.retry)) {
         redirects   = n->redirects;
         budgetEndNs = n->budgetEndNs;
@@ -2301,7 +2303,7 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
         // budget (started now if no NotLeader was seen yet).
         const DdlOfferedOn* on = nullptr;
         int redirects = 0;
-        int64_t budgetEndNs = 0, backoffNs = kDdlInitialBackoffNs;
+        int64_t budgetEndNs = 0, backoffNs = cfg_.ddlRetryBackoff.count() * 1'000'000;
         if (const auto* st = std::get_if<DdlSent>(&d->retry)) {
             on = &st->on;
             redirects = st->redirects;
@@ -6101,9 +6103,9 @@ int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
         const auto     st = agent_.sessionStateAt(i);
         const uint8_t  up = st == session::SessionState::Connected ? 1 : 0;
         const bool failed = f != routeConnectFailuresSeen_[i];
-        const bool lost   = routeSessionUp_[i] != 0 && up == 0;  // review MEDIUM-1: a Connected leader dropped
+        const bool lost   = routeSessionUp_[i] == kRouteSessionUp && up == 0;  // review MEDIUM-1: a Connected leader dropped
         routeConnectFailuresSeen_[i] = f;
-        routeSessionUp_[i]           = up;
+        routeSessionUp_[i]           = up != 0 ? kRouteSessionUp : lost || routeSessionUp_[i] == kRouteSessionLost ? kRouteSessionLost : uint8_t{0};
         if (i == 0) {
             // The seed has its own reconnect path (and the seed failover).  DR client
             // bug 1: its broker may lead partitions routed through it — a seed
@@ -6111,6 +6113,8 @@ int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
             if ((failed || lost) && agent_.multiNodeRouting()) ask = true;
             continue;
         }
+        if (routeSessionUp_[i] == kRouteSessionLost && agent_.routesUseSession(i))
+            scheduleMetadataRefresh();   // level: a leader that was live and is down keeps being asked about (backoff-paced) until an answer moves the route
         if (!failed && !lost && st != session::SessionState::Disconnected) [[likely]] continue;
         if (!agent_.routesUseSession(i)) continue;
         ask = ask || failed || lost;

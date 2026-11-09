@@ -436,7 +436,7 @@ public:
     [[nodiscard]] std::size_t unplaceableTopicCount() const noexcept { return unplaceable_.size(); }
     /// I1 (round 5): a controller whose PROCESS has held the broadcast reports for
     /// less than `ns` defers user-partition leader elections until it has (it may
-    /// lack a fresh "cannot serve" report).  BrokerNode sets kUnservableReportTtlNs
+    /// lack a fresh "cannot serve" report).  BrokerNode sets NodeConfig::unservableWarmupMs (one TTL by default)
     /// multi-node; 0 (unit rigs) = off.
     void setUnservableReportWarmup(int64_t ns) noexcept { unservableWarmupNs_ = ns; }
     [[nodiscard]] bool unservableWarmingUp() const noexcept {
@@ -3436,7 +3436,7 @@ private:
         const auto it = predecessors_.find(key);
         if (it == predecessors_.end()) return nullptr;
         Predecessors& ps = it->second;
-        const int64_t w = rune::consensus::kReadLeaseFenceWaitNs;
+        const int64_t w = readLeaseFenceWaitNs_;
         for (std::size_t i = 0; i < ps.n;) {
             if (lastNowNs_ - ps.e[i].movedAtNs >= w) ps.e[i] = ps.e[--ps.n]; else ++i;
         }
@@ -3447,8 +3447,10 @@ private:
     /// every removal from an ISR is fenced then.  fn(ctx, nowNs) = past that W.  nullptr (unit tests) = always young.
 public:
     using ControllerSettled = bool (*)(void* ctx, int64_t nowNs) noexcept;
+    void setReadLeaseFenceWaitNs(int64_t w) noexcept { readLeaseFenceWaitNs_ = w; }
     void setControllerSettled(ControllerSettled fn, void* ctx) noexcept { settledFn_ = fn; settledCtx_ = ctx; }
 private:
+    int64_t           readLeaseFenceWaitNs_ = rune::consensus::kReadLeaseFenceWaitNs;   // W: the election's, set with it
     ControllerSettled settledFn_  = nullptr;
     void*             settledCtx_ = nullptr;
     [[nodiscard]] bool controllerYoung_() const noexcept {
@@ -3463,7 +3465,7 @@ private:
         const auto inNew = [&](int32_t n) { for (const int32_t m : br.isr) if (m == n) return true; return false; };
         Predecessors* ps = livePredecessors_(key);
         const bool young = controllerYoung_();
-        const bool overflow = ps != nullptr && lastNowNs_ - ps->overflowAtNs < rune::consensus::kReadLeaseFenceWaitNs;
+        const bool overflow = ps != nullptr && lastNowNs_ - ps->overflowAtNs < readLeaseFenceWaitNs_;
         const auto isPredecessor = [&](int32_t n) {
             if (ps == nullptr) return false;
             for (std::size_t i = 0; i < ps->n; ++i) if (ps->e[i].node == n) return true;

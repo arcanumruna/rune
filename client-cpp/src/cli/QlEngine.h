@@ -180,6 +180,7 @@ struct LiveOptions {
     std::string egress;              // "" = RUNE_EGRESS, else derived for UDP (localEgressFor)
     std::string gatewayResponsePort; // --gateway-response-port ("" = RUNE_GATEWAY_RESPONSE_PORT, else 0: declared egress)
     std::string streamIn, streamOut, dataDir;   // hidden test overrides ("" = default; an empty dataDir = a private scratch dir)
+    std::string aeronDir;                       // hidden: attach to the running media driver in it ("" = the client's own)
     bool        verbose = false;
     std::string user, passwordFile;  // credentials ("" = RUNE_USER / RUNE_PASSWORD_FILE)
     std::string password;            // an interactively prompted password (never from argv / env); wiped by the caller

@@ -21,11 +21,14 @@
 #include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/LeaderEpochState.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <deque>
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -1703,6 +1706,132 @@ TEST(TruncationGuardRegression, CompactionGapReconcileIsNeverAHistoryMismatchReg
     ASSERT_EQ(f.lastFetchedEpoch(), 5);
     EXPECT_EQ(f.heldEpochStartForTest(5), -1) << "a start re-derived over a gap must not be compared";
     EXPECT_EQ(f.nextFetch().lastEpochStartOffset, -1);
+}
+
+namespace {
+/// Segment 0 compacted empty (or, with `firstHoldsABatch`, holding one epoch-2 batch), segment 10 holding epoch-3 batches 10 and 11.
+void writeEmptiedSegmentLog(const std::string& dir, bool firstHoldsABatch = false) {
+    const auto put = [&dir](int64_t base, const std::vector<uint8_t>& bytes) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(std::filesystem::path(dir) / name, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    std::vector<uint8_t> first;
+    if (firstHoldsABatch) {
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", "v", 1000);
+        first = b.build();
+        rune::protocol::RecordBatchReader::stampLeaderEpoch(first.data(), 2);
+    }
+    put(0, first);
+    std::vector<uint8_t> bytes;
+    for (int64_t base : {10, 11}) {
+        rune::protocol::RecordBatchBuilder b(base, 1000);
+        b.append("k", "v", 1000);
+        auto x = b.build();
+        rune::protocol::RecordBatchReader::stampLeaderEpoch(x.data(), 3);
+        bytes.insert(bytes.end(), x.begin(), x.end());
+    }
+    put(10, bytes);
+}
+
+/// Overwrites segment 0 in place with garbage of the same size: torn bytes behind an already recovered log.
+void tearSegmentZero(const std::string& dir) {
+    const auto path = std::filesystem::path(dir) / "00000000000000000000.log";
+    std::ofstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+    f.write(std::string(std::filesystem::file_size(path), '\xFF').data(), static_cast<std::streamsize>(std::filesystem::file_size(path)));
+}
+}  // namespace
+
+// Segment 0 was compacted empty: a boot with no epoch history and a clean recovery point derives it from the log
+// (rebuildEpochCacheFromLog_), which walks on to segment 10 instead of stopping at the first empty read.
+TEST(TruncationGuardRegression, EpochHistoryIsRebuiltPastAnEmptiedSegmentRegression) {
+    TempDir dir("emptied_rebuild");
+    writeEmptiedSegmentLog(dir.path);
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        ASSERT_EQ(log.segmentBaseOffsets().size(), 2u);
+        log.checkpointRecoveryPoint();
+    }
+    rune::storage::Log log(dir.path);
+    log.recover();
+    ASSERT_EQ(log.startupRecoveryPoint(), 12) << "precondition: the reconcile trusts the history below the recovery point";
+    CapturingIsr t;
+    PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+    ASSERT_EQ(f.logEndOffset(), 12);
+    EXPECT_EQ(f.lastFetchedEpochAtForTest(12), 3) << "the epoch stamped past the emptied segment was never found";
+}
+
+// A durable history that disagrees with the stamps is re-derived from the whole log (reconcileEpochCacheWithLog_), which walks on
+// to segment 10 instead of stopping at the emptied segment 0.
+TEST(TruncationGuardRegression, EpochHistoryIsReconciledPastAnEmptiedSegmentRegression) {
+    TempDir dir("emptied_reconcile");
+    writeEmptiedSegmentLog(dir.path);
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        log.checkpointRecoveryPoint();
+    }
+    {   // history {4:10} as written, but the batch at 10 is stamped 3
+        const std::vector<std::pair<int32_t, int64_t>> e{{4, 10}};
+        const int fd = rune::storage::LeaderEpochState::create(
+            dir.path, rune::storage::LeaderEpochState::strideFor(rune::storage::LeaderEpochState::kMinEntries), 100, 2, e.begin(), e.end());
+        ASSERT_GE(fd, 0);
+        ::close(fd);
+    }
+    rune::storage::Log log(dir.path);
+    log.recover();
+    ASSERT_EQ(log.startupRecoveryPoint(), 12);
+    CapturingIsr t;
+    PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+    ASSERT_EQ(f.epochHistoryRebuildsForTest(), 1u) << "precondition: the stale history was found";
+    EXPECT_EQ(f.lastFetchedEpochAtForTest(12), 3) << "the epoch stamped past the emptied segment was never found";
+}
+
+// Torn bytes in segment 0 end the rebuild there: it must not skip to segment 10's stamps.
+TEST(TruncationGuardRegression, EpochHistoryRebuildStopsAtATornBatchRegression) {
+    TempDir dir("torn_rebuild");
+    writeEmptiedSegmentLog(dir.path, true);
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        log.checkpointRecoveryPoint();
+    }
+    rune::storage::Log log(dir.path);
+    log.recover();
+    ASSERT_EQ(log.startupRecoveryPoint(), 12);
+    tearSegmentZero(dir.path);
+    CapturingIsr t;
+    PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+    EXPECT_NE(f.lastFetchedEpochAtForTest(12), 3) << "the walk skipped the torn segment";
+}
+
+// Same for the reconcile of a stale durable history.
+TEST(TruncationGuardRegression, EpochHistoryReconcileStopsAtATornBatchRegression) {
+    TempDir dir("torn_reconcile");
+    writeEmptiedSegmentLog(dir.path, true);
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        log.checkpointRecoveryPoint();
+    }
+    {
+        const std::vector<std::pair<int32_t, int64_t>> e{{4, 10}};
+        const int fd = rune::storage::LeaderEpochState::create(
+            dir.path, rune::storage::LeaderEpochState::strideFor(rune::storage::LeaderEpochState::kMinEntries), 100, 2, e.begin(), e.end());
+        ASSERT_GE(fd, 0);
+        ::close(fd);
+    }
+    rune::storage::Log log(dir.path);
+    log.recover();
+    ASSERT_EQ(log.startupRecoveryPoint(), 12);
+    tearSegmentZero(dir.path);
+    CapturingIsr t;
+    PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+    ASSERT_EQ(f.epochHistoryRebuildsForTest(), 1u) << "precondition: the stale history was found";
+    EXPECT_NE(f.lastFetchedEpochAtForTest(12), 3) << "the walk skipped the torn segment";
 }
 
 namespace {

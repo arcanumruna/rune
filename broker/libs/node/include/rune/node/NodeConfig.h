@@ -336,6 +336,11 @@ struct NodeConfig {
     static constexpr int32_t kTxnJudgedRecordsMaxCeiling = 1'048'576;
     int64_t electionStatusIntervalMs =  20;  // default  20 ms
     int64_t startupCanvassTimeoutMs  = 100;  // default 100 ms
+    /// A young controller process decides no user-partition leadership until it has held the replicas' "cannot serve" reports
+    /// this long (one report TTL).  Test clusters shorten it; production keeps the TTL.  A value below BrokerNode::kUnservableReportPeriodNs
+    /// (500 ms) disables the guard: no replica has reported "cannot serve" yet when it ends.
+    static constexpr int64_t kDefaultUnservableWarmupMs = 2'000;
+    int64_t unservableWarmupMs       = kDefaultUnservableWarmupMs;
 
     // Controlled shutdown (RUNE_CONTROLLED_SHUTDOWN_MS): on a graceful stop
     // signal main() hands this node's partition leadership (and, on the
@@ -359,6 +364,11 @@ struct NodeConfig {
     // edge, never re-armed by a later re-election.  0 (default): no hold;
     // never set in production.
     int64_t testUserDecisionHoldMs = 0;
+
+    // TEST-ONLY: L, the longest view read lease a controller grants or a broker holds (ms).  The leader-move fence
+    // W = L x 1.0201 follows it (issue #491), so a restart waits W before the controller fails a leader over.  Safety
+    // bound: only tests lower it, the same on every node; never set in production.  Default 200.
+    int64_t readLeaseMaxMs = 200;
 
     // TEST-ONLY: the client gateway's session lease (a session silent, or Lost on a worker, this long
     // is reaped).  Lets a stall-past-the-lease test stall a few seconds instead of outlasting the
@@ -820,6 +830,11 @@ struct NodeConfig {
     // 1 MiB (measured 2026-10-03, 3-node acks=all: >= 16 MiB throughput, no 100+ ms term-rotation stalls,
     // 16x less /dev/shm).  Max Aeron message = term/8 = 128 KiB -> the batch limit (batchLimitFormula).
     int32_t aeronTermBufferBytes         = 1024 * 1024;
+    /// Counter-values buffer of each embedded driver's CnC (EmbeddedDriverConfig::countersValuesBytes).  0 = Aeron's default
+    /// (8 MiB of values + 32 MiB of metadata, zero-filled when the driver starts).  Test brokers set Aeron's 1 MiB minimum.
+    int32_t aeronCountersValuesBytes     = 0;
+    /// Receiver status-message timeout of each embedded driver (EmbeddedDriverConfig::statusMessageTimeoutNs).  0 = Aeron's default (200 ms).
+    int64_t aeronStatusMessageTimeoutNs  = 0;
     /// RUNE_AERON_CONTROL_TERM_BYTES: term of the worker's per-session ACK publications only — small so a
     /// term rotation never cleans 16 MiB inside the worker pass.  NOT the gateway egress publications:
     /// consumer record pushes travel there (max message = term/8 must cover the largest batch).
