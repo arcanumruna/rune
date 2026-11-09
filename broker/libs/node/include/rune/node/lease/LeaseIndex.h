@@ -98,6 +98,15 @@ inline constexpr std::string_view kLeaseUpdatedOffsetColumn = "lease_updated_off
     return sv != nullptr ? sv->installSeq : 0;
 }
 
+/// The highest INSTALLED writer version of a topic's spec (a refused version has no descriptor; maxVersion() counts it).  The version a
+/// lease revoke is re-encoded at, and the version an Expire / Checkpoint record is written at.  descriptor == nullptr: none installed.
+struct LeaseWriter { const rune::codec::Descriptor* descriptor = nullptr; uint16_t version = 0; uint32_t installSeq = 0; };
+[[nodiscard]] inline LeaseWriter latestLeaseWriter(const TopicWriteSpec& spec) noexcept {
+    for (int v = spec.maxVersion(); v >= 0; --v)
+        if (const SpecVersion* sv = spec.versionFor(static_cast<uint16_t>(v))) return {&sv->descriptor, static_cast<uint16_t>(v), sv->installSeq};
+    return {};
+}
+
 struct LeaseRowState {
     bool     present = false;
     int64_t  version = 0;

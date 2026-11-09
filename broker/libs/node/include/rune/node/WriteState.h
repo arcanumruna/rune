@@ -16,6 +16,7 @@
 #include <rune/protocol/LeaseSpec.h>
 #include <rune/node/AutoInc.h>
 #include <rune/node/lease/LeaseFoldEvents.h>
+#include <rune/node/lease/LeaseRuntime.h>
 #include <rune/node/VerdictState.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/storage/RejectedOffsetIndex.h>
@@ -335,6 +336,9 @@ struct PartitionWriteState {
     /// advances past that offset (no timer).
     int64_t                            leaseUntrackedThrough = -1;
     LeaseFoldEvents                    leaseEvents;          ///< a lease topic: one event per accepted record, until the wheels consume them
+    /// A lease topic's wheels and entries (Task 10): exist only on the partition leader while the lease index is ready, under one
+    /// identity (leadership generation, lease rebuild epoch); Worker::leaseDuty_ creates and destroys it.  Cold-allocated.
+    std::unique_ptr<lease::LeaseRuntime> leaseRuntime;
     bool                               staleBrokerLogged = false;   ///< the stale-broker-record warning was logged for this partition
 
     /// A judge is attached or the latest logged set is non-empty.

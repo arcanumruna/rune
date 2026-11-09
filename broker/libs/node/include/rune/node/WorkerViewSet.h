@@ -336,8 +336,8 @@ public:
                 work += judge->driveJudge(readRange, bound, nowNs, *write, skip.aborted);
                 viewBound = std::min(bound, judge->judgedThrough());
                 work += flipVerdictMembers_(srcTopicId, partition, bound, leaderGen, leaderHwConfirmed, ns, write->leaseEvents.reservedBytes());
-                // Task 9 (the wheels) consumes these; until then they are discarded.
-                if (write->spec->lease) write->leaseEvents.buf.clear();
+                // The lease events stay in the buffer: Worker::leaseDuty_ consumes and clears them every doWork, right after driveViews_
+                // (the judge runs once per doWork per partition, so the fold-event cap accounting sees an emptied buffer).
             } else {
                 viewBound = std::min(bound, write->verdictKnownThrough());
             }

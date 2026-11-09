@@ -20,6 +20,7 @@
 #include <rune/replication/IsrManager.h>
 #include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/LeaseRecord.h>
 #include <rune/storage/Log.h>
 #include <spdlog/spdlog.h>
 
@@ -1005,6 +1006,135 @@ TEST(IsrShrinkUnblocksHwTest, FollowerRejoinsIsrAfterCatchUp) {
     // HW should be at leo since both are now in ISR and follower has caught up.
     bool hwDone = (leader.highWatermark() >= leo);
     EXPECT_TRUE(hwDone);
+}
+
+// ===========================================================================
+// Lease batch append (Task 10, spec 9.1): appendLeaseBatch appends a whole non-control data batch as is.
+// ===========================================================================
+
+namespace {
+std::vector<uint8_t> leaseBatchOf(std::initializer_list<const char*> keys, std::initializer_list<const char*> values) {
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    auto k = keys.begin();
+    auto v = values.begin();
+    for (; k != keys.end(); ++k, ++v)
+        b.append(*k, *v, 0, rune::protocol::record::withLeaseOp(0, rune::protocol::record::LeaseOp::Expire));
+    return b.build();
+}
+struct ReadRec { std::string key, value; int64_t offset; uint8_t attrs; };
+struct ReadBatch { int32_t epoch; int64_t base; int64_t pid; int16_t pep; int32_t seq; bool valid; std::vector<ReadRec> recs; };
+std::vector<ReadBatch> parseBatches(const std::vector<uint8_t>& bytes) {
+    std::vector<ReadBatch> out;
+    std::size_t pos = 0;
+    while (pos + 61 <= bytes.size()) {
+        rune::protocol::RecordBatchReader r(bytes.data() + pos, bytes.size() - pos);
+        const int32_t total = r.totalLength();
+        if (total <= 0) break;
+        ReadBatch rb{r.partitionLeaderEpoch(), r.baseOffset(), r.producerId(), r.producerEpoch(), r.baseSequence(),
+                     r.ensureValid(), {}};
+        r.forEachRecord([&](std::string_view k, std::string_view v, int64_t off, int64_t, uint8_t a) {
+            rb.recs.push_back({std::string(k), std::string(v), off, a});
+        });
+        out.push_back(std::move(rb));
+        pos += static_cast<std::size_t>(total);
+    }
+    return out;
+}
+}  // namespace
+
+TEST_F(TwoReplicaTest, LeaseBatchAppendAppendsTheBatchAsIsRegression) {
+    const auto batch = leaseBatchOf({"a", "b", "c"}, {"1", "2", "3"});
+    ASSERT_TRUE(PartitionReplica::isLeaseDataBatch(batch));
+    EXPECT_EQ(leader_->logEndOffset(), 0);
+    EXPECT_EQ(leader_->appendLeaseBatch(batch), 0);
+    EXPECT_EQ(leader_->logEndOffset(), 3);
+    EXPECT_EQ(leader_->appendLeaseBatch(batch), 3);
+    EXPECT_EQ(leader_->logEndOffset(), 6);
+    ASSERT_TRUE(driveUntil([&] { return leader_->highWatermark() >= 6; })) << "HW did not reach the appended batches";
+    const auto batches = parseBatches(leader_->read(0, 1 << 20));
+    ASSERT_EQ(batches.size(), 2u);
+    int64_t expectOffset = 0;
+    for (const auto& b : batches) {
+        EXPECT_EQ(b.epoch, static_cast<int32_t>(leader_->epoch()));
+        EXPECT_EQ(b.base, expectOffset);
+        EXPECT_TRUE(b.valid);
+        EXPECT_EQ(b.pid, -1);
+        EXPECT_EQ(b.pep, -1);
+        EXPECT_EQ(b.seq, -1);
+        ASSERT_EQ(b.recs.size(), 3u);
+        const char* keys[3] = {"a", "b", "c"};
+        const char* vals[3] = {"1", "2", "3"};
+        for (int i = 0; i < 3; ++i) {
+            EXPECT_EQ(b.recs[i].key, keys[i]);
+            EXPECT_EQ(b.recs[i].value, vals[i]);
+            EXPECT_EQ(b.recs[i].attrs, 0x08);
+            EXPECT_EQ(b.recs[i].offset, expectOffset + i);
+        }
+        expectOffset += 3;
+    }
+}
+
+TEST_F(TwoReplicaTest, LeaseBatchAppendRefusesControlAndCorruptRegression) {
+    // A control batch.
+    rune::protocol::RecordBatchBuilder cb(0, 0);
+    cb.setControl(true);
+    cb.append("k", "v", 0);
+    auto control = cb.build();
+    ASSERT_FALSE(PartitionReplica::isLeaseDataBatch(control));
+    EXPECT_EQ(leader_->appendLeaseBatch(control), PartitionReplica::kAppendInvalidBatch);
+    EXPECT_EQ(leader_->logEndOffset(), 0);
+
+    // A transactional data batch.
+    rune::protocol::RecordBatchBuilder tb(0, 0);
+    tb.setTransactional(true);
+    tb.append("k", "v", 0);
+    EXPECT_EQ(leader_->appendLeaseBatch(tb.build()), PartitionReplica::kAppendInvalidBatch);
+    EXPECT_EQ(leader_->logEndOffset(), 0);
+
+    // One CRC-covered byte flipped (the last value byte).
+    auto corrupt = leaseBatchOf({"a"}, {"1"});
+    corrupt.back() ^= 0x01;
+    EXPECT_EQ(leader_->appendLeaseBatch(corrupt), PartitionReplica::kAppendInvalidBatch);
+    EXPECT_EQ(leader_->logEndOffset(), 0);
+
+    // Truncated, at several offsets (header cut, body cut).
+    const auto whole = leaseBatchOf({"a", "b"}, {"1", "2"});
+    for (std::size_t cut : {std::size_t{0}, std::size_t{10}, std::size_t{60}, whole.size() - 1}) {
+        const std::vector<uint8_t> t(whole.begin(), whole.begin() + static_cast<std::ptrdiff_t>(cut));
+        EXPECT_EQ(leader_->appendLeaseBatch(t), PartitionReplica::kAppendInvalidBatch) << "cut " << cut;
+        EXPECT_EQ(leader_->logEndOffset(), 0);
+    }
+    // Trailing bytes after the batch.
+    auto longer = whole;
+    longer.push_back(0);
+    EXPECT_EQ(leader_->appendLeaseBatch(longer), PartitionReplica::kAppendInvalidBatch);
+    EXPECT_EQ(leader_->logEndOffset(), 0);
+    // And the intact batch still appends.
+    EXPECT_EQ(leader_->appendLeaseBatch(whole), 0);
+}
+
+TEST_F(TwoReplicaTest, LeaseBatchAppendNotLeaderAndMinIsrAppendNothingRegression) {
+    const auto batch = leaseBatchOf({"a"}, {"1"});
+    // A follower.
+    EXPECT_EQ(follower_->appendLeaseBatch(batch), PartitionReplica::kAppendNotLeader);
+    EXPECT_EQ(follower_->logEndOffset(), 0);
+    // The test seam append() honours.
+    leader_->setAppendRefusedForTest(true);
+    EXPECT_EQ(leader_->appendLeaseBatch(batch), PartitionReplica::kAppendNotLeader);
+    EXPECT_EQ(leader_->logEndOffset(), 0);
+    leader_->setAppendRefusedForTest(false);
+    EXPECT_EQ(leader_->appendLeaseBatch(batch), 0);
+
+    // ISR below min-ISR (the MinIsrTest rig): kAppendMinIsr, nothing appended.
+    TempDir dir("lease_minIsr_leader");
+    rune::storage::Log log(dir.path);
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2;
+    PartitionConfig cfg = makeConfig(kL);
+    cfg.minIsr = 2;
+    PartitionReplica lone(cfg, Role::Leader, /*epoch=*/1, {kL, kF}, {kL}, &log, &transport);
+    EXPECT_EQ(lone.appendLeaseBatch(batch), PartitionReplica::kAppendMinIsr);
+    EXPECT_EQ(lone.logEndOffset(), 0);
 }
 
 // ===========================================================================

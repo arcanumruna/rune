@@ -224,7 +224,7 @@ pc::ErrorCode CheckedWriteHook::checkLeaseBatch_(const uint8_t* batch, std::size
         pc::ErrorCode result = pc::ErrorCode::OK;
         // The size of the batch once every revoke with a row at the matching version is re-encoded at the latest installed version
         // (exact: the value length and both varints), so stage() never meets a batch the scratch cannot hold.
-        const SpecVersionRef latest = latestInstalled_();
+        const LeaseWriter latest = latestLeaseWriter(*state_.spec);
         const std::size_t newValueLen = latest.descriptor != nullptr ? 4u + latest.descriptor->blockLength : 0;
         std::size_t rebuilt = len;
         (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& r) {

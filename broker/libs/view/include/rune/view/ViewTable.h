@@ -216,6 +216,13 @@ public:
         return {payload - headerLen_, headerLen_};
     }
 
+    /// The key bytes of live row `rid` (keyWidth bytes): a wide table's row header; a narrow table's key word as put()
+    /// stored it in dirtyKeys_[rid] (the first keyWidth little-endian bytes).  Valid until the row is erased or re-put.
+    [[nodiscard]] std::span<const uint8_t> keyOf(uint32_t rid) const noexcept {
+        if (headerLen_) return keyOfRow(rowAddr(rid));
+        return {reinterpret_cast<const uint8_t*>(&dirtyKeys_[rid]), keyWidth_};
+    }
+
     // Header-key compares since construction, and the rids in primary-slot order.  Tests only.
     uint64_t arenaKeyReadsForTest() const noexcept { return arenaKeyReads_; }
     std::vector<uint32_t> slotOrderForTest() const {
@@ -561,7 +568,7 @@ private:
     // markDirty() only takes a rid per its public signature) so
     // drainDirty() can emit `key` for upserts too, not just deletes.
     std::vector<uint8_t>  dirty_;
-    std::vector<uint64_t> dirtyKeys_;   // TODO: on a wide table this holds the hashed slot word, not the key; do not consume it
+    std::vector<uint64_t> dirtyKeys_;   // narrow table: the key word put() stored (keyOf reads it); wide table: the hashed slot word, never read
     std::vector<uint32_t> dirtyList_; // rids marked dirty this interval, each pushed once (coalesced)
 
     struct DeletedEntry { uint32_t rid; uint64_t key; };

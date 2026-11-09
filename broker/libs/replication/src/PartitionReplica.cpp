@@ -682,6 +682,53 @@ Offset PartitionReplica::appendControlBatch(std::span<const uint8_t> controlBatc
     return baseOffset;
 }
 
+bool PartitionReplica::isLeaseDataBatch(std::span<const uint8_t> batch) noexcept
+{
+    namespace b = rune::protocol::batch;
+    if (batch.size() < static_cast<std::size_t>(b::kRecordBatchOverhead)) return false;
+    const uint8_t* p = batch.data();
+    if (p[b::kMagicOffset] != 2) return false;
+    const auto attrs = static_cast<uint16_t>(p[b::kAttributesOffset] |
+                                             (static_cast<uint16_t>(p[b::kAttributesOffset + 1]) << 8));
+    if ((attrs & static_cast<uint16_t>(b::kAttrControl | b::kAttrTransactional)) != 0) return false;
+    rune::protocol::RecordBatchReader r(p, batch.size());
+    return static_cast<std::size_t>(r.totalLength()) == batch.size() && r.ensureValid();
+}
+
+Offset PartitionReplica::appendLeaseBatch(std::span<const uint8_t> batch)
+{
+    if (!acceptsProduce() || appendRefusedForTest_) return kAppendNotLeader;   // retriable (also while incomplete)
+    if (!isLeaseDataBatch(batch)) return kAppendInvalidBatch;
+    ++rtAppends_;
+    if (!committedIsrMeetsMinIsr_(true)) return kAppendMinIsr;   // lease records are always acks=all
+
+    const int32_t lastOffsetDelta = rune::protocol::RecordBatchReader(batch.data(), batch.size()).lastOffsetDelta();
+    Offset baseOffset = logEndOffset_();
+    if (memoryBacked_) {
+        batchScratch_.assign(batch.begin(), batch.end());
+        const auto u = static_cast<uint64_t>(baseOffset);
+        for (int i = 0; i < 8; ++i) batchScratch_[static_cast<std::size_t>(i)] = static_cast<uint8_t>(u >> (8 * i));
+        rune::protocol::RecordBatchReader::stampLeaderEpoch(batchScratch_.data(), static_cast<int32_t>(epoch_));
+        refreshTransientEvictionFloor_();   // Phase 2b E2: never evict uncommitted data
+        if (memLog_->appendNoSync(batchScratch_.data(), batchScratch_.size(),
+                                  baseOffset + lastOffsetDelta) < 0) return kAppendBackPressure;
+    } else {
+        // Zero-copy restamp (pwritev): the caller's bytes are never mutated.
+        diskLog_->appendNoSyncRestamp(batch.data(), batch.size(), lastOffsetDelta, baseOffset);
+        if (externalFollowerFlush_) {
+            followerFlushRequested_ = true;   // the owning worker submits it (never inline)
+        } else {
+            diskLog_->sync();
+        }
+    }
+
+    leaderState_.setLeaderLogEndOffset(logEndOffset_());
+    recomputeHw();
+    publishCleanerState();
+    if (cfg_.pushOnAppend) (void)pushToFollowers();
+    return baseOffset;
+}
+
 // ---------------------------------------------------------------------------
 // Leader: append with an explicit record key (CP-1 compaction support)
 // ---------------------------------------------------------------------------

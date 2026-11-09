@@ -28,6 +28,8 @@ static_assert(kLeaseSpecBytes == 39);
 inline constexpr uint64_t    kLeaseMinTtlFloorMs  = 1000;
 inline constexpr uint64_t    kLeaseMaxTtlMs       = 9'000'000'000'000;
 inline constexpr std::size_t kMaxLeaseKeyBytes    = 128;
+/// The largest lease.expiry_batch (records per Expire batch).
+inline constexpr uint16_t    kMaxLeaseExpiryBatch = 4096;
 
 namespace lease_detail {
 inline void put(uint8_t* p, uint64_t v, int n) noexcept {
@@ -90,7 +92,7 @@ inline constexpr std::string_view kLeaseExpiryBatchRangeText        = "lease.exp
     if (s.checkpoint > 1) return kLeaseCheckpointText;
     if (s.checkpointIntervalMs < 1000 || s.checkpointIntervalMs > 86'400'000) return kLeaseCheckpointIntervalRangeText;
     if (s.checkpointRate < 1 || s.checkpointRate > 100'000) return kLeaseCheckpointRateRangeText;
-    if (s.expiryBatch < 1 || s.expiryBatch > 4096) return kLeaseExpiryBatchRangeText;
+    if (s.expiryBatch < 1 || s.expiryBatch > kMaxLeaseExpiryBatch) return kLeaseExpiryBatchRangeText;
     return std::nullopt;
 }
 

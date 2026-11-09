@@ -629,6 +629,15 @@ public:
     /// CONTROL attribute — i.e. a prebuilt txn marker.
     [[nodiscard]] static bool isControlBatch(std::span<const uint8_t> bytes) noexcept;
 
+    /// The data-batch sibling of appendControlBatch (lease Expire / Checkpoint, spec 9.1): a whole, CRC-valid, NON-control
+    /// magic-2 batch, appended as is (no makeBatch_ wrapping), acks=all.  Same gates and post-append sequence as
+    /// appendControlBatch.  Returns the base offset, or kAppendNotLeader / kAppendInvalidBatch / kAppendMinIsr /
+    /// kAppendBackPressure (in-memory ring full).  Nothing is appended on any refusal.
+    Offset appendLeaseBatch(std::span<const uint8_t> batch);
+
+    /// True iff `batch` is exactly one whole, CRC-valid record batch with neither the CONTROL nor the TRANSACTIONAL attribute.
+    [[nodiscard]] static bool isLeaseDataBatch(std::span<const uint8_t> batch) noexcept;
+
     /// CP-1: append a single record with an explicit (non-empty) key.
     ///
     /// Builds a one-record RecordBatch with the supplied key and value bytes,

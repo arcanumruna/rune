@@ -39,7 +39,8 @@ add_library(rune_node
 add_library(rune_checked_write
     src/CheckedWriteHook.cpp
     src/VerdictSource.cpp
-    src/lease/LeaseIndex.cpp)
+    src/lease/LeaseIndex.cpp
+    src/lease/LeaseRuntime.cpp)
 target_include_directories(rune_checked_write PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     ${RUNE_PROTOCOL_INCLUDE})
@@ -1432,6 +1433,13 @@ if(BUILD_TESTING)
             target_include_directories(rune_checked_writes_verdict_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
             target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_checked_writes_verdict_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # Lease topics Task 10: the expiry emitter on a real worker.  AllocWindow.cpp replaces the global operator new (the
+            # no-allocation test), so this is its own binary.
+            add_executable(rune_lease_emitter_tests tests/node/LeaseEmitterTest.cpp tests/support/AllocWindow.cpp)
+            target_include_directories(rune_lease_emitter_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
+            target_link_libraries(rune_lease_emitter_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_lease_emitter_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # The namespace fetch gate on the default consume paths (worker-owned, group, filtered subscriptions; legacy PushRead).
             add_executable(rune_ns_fetch_adv_tests tests/node/NsFetchGateAdversarialRegressionTest.cpp)

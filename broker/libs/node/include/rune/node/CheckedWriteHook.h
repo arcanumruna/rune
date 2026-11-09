@@ -201,13 +201,6 @@ public:
     [[nodiscard]] bool checked() const noexcept { return checked_; }
 
 private:
-    struct SpecVersionRef { const rune::codec::Descriptor* descriptor = nullptr; uint16_t version = 0; uint32_t installSeq = 0; };
-    /// The highest INSTALLED version (a refused version has no descriptor; maxVersion() counts it).
-    [[nodiscard]] SpecVersionRef latestInstalled_() const noexcept {
-        for (int v = state_.spec->maxVersion(); v >= 0; --v)
-            if (const SpecVersion* sv = state_.spec->versionFor(static_cast<uint16_t>(v))) return {&sv->descriptor, static_cast<uint16_t>(v), sv->installSeq};
-        return {};
-    }
     [[nodiscard]] rune::storage::HookStaged patchKeyZeroIds_(const uint8_t* batch, std::size_t len) noexcept;
     template <class LogT>
     [[nodiscard]] rune::storage::HookStaged stageLease_(LogT& log, const uint8_t* batch, std::size_t len) noexcept;
@@ -317,7 +310,7 @@ rune::storage::HookStaged CheckedWriteHook::stageLease_(LogT& log, const uint8_t
     const uint8_t* cur = batch;
     std::size_t curLen = len;
     if (replacements != 0) {
-        const SpecVersionRef latest = latestInstalled_();
+        const LeaseWriter latest = latestLeaseWriter(*state_.spec);
         if (latest.descriptor == nullptr) [[unlikely]] return {ErrorCode::Internal, nullptr, 0};
         std::size_t count = 0;
         const bool ok = rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& r) {

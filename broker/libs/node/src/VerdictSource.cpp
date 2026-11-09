@@ -1,5 +1,6 @@
 #include <cassert>
 #include <rune/node/VerdictSource.h>
+#include <rune/node/lease/LeaseEntryStore.h>
 
 #include <rune/codec/Record.h>
 #include <rune/protocol/BatchRebuild.h>
@@ -489,6 +490,18 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
                 state_->staleBrokerLogged = true;
                 spdlog::warn("lease judge: topic {} partition {}: a stale broker record (offset {}) was rejected; further ones are counted only",
                              srcTopicId_, partition_, rec.offset);
+            }
+            // The wheels learn that a record of theirs was refused (LeaseEntryEvent::OwnRecordRejected).  Live judging only: judge() is
+            // the live path (replay and rebuild fold through foldLeaseIndexBatch, which never reaches here), the same path that pushes the
+            // accepted events in apply_().  A record is accepted (apply_ pushes one event) XOR rejected (this branch pushes one), so the
+            // fold-event cap accounting (one event per record) holds.
+            if (members_[i].kind == rune::view::VerdictViewKind::LeaseIndex) {
+                const rune::view::ProspectRow& pr = members_[i].prospect.rows[0];
+                LeaseEvent ev;
+                ev.kind   = LeaseEventKind::BrokerRejected;
+                ev.rid    = pr.existed ? pr.rid : lease::kLeaseNil;
+                ev.offset = rec.offset;
+                state_->leaseEvents.buf.push_back(ev);
             }
         }
         else ++stats_.rejectionsConstraint;
