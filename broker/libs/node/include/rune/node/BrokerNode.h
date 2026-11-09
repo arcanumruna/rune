@@ -2344,7 +2344,7 @@ public:
     }
 
     /// Test-only fault injection: called (on the start() thread) at named startup
-    /// phases ("build-gateway" = offset/txn/metadata rebuilds + admin build).
+    /// phases ("offset-recover", "txn-recover", "metadata-recover" = the system logs' recovery, which yields the fused startup gate).
     /// Set before start().
     void setStartupPhaseHookForTest(std::function<void(std::string_view)> hook) {
         startupPhaseHookForTest_ = std::move(hook);

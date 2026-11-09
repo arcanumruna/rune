@@ -12,8 +12,9 @@ namespace rune::node {
 /// Interim pumper for an Invoker driver + its invoker client, run by its own
 /// AgentRunner (Aeron: a composite of the driver and client-conductor invokers).
 /// Fused runtime (spec §3.2): the runtime's driver + client exist from step 3 of
-/// BrokerNode::start(), long before worker 0's loop runs; this agent keeps them
-/// serviced through every startup phase, however long.  Hand-off: the runner is
+/// BrokerNode::start(), long before worker 0's loop runs; this agent services the
+/// driver always and the client whenever the starter is out of it (a resolve's sleep or a
+/// StartupClientGate::Yield).  Hand-off: the runner is
 /// stopped and JOINED, then the next owner binds itself (bindPumpThread) at its
 /// first pass — never two pumpers.  Startup resolves on that client use the
 /// default (sleep-poll) AeronPump while this agent runs; `gate` keeps the starter thread and this one out of

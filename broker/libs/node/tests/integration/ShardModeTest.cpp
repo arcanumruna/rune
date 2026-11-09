@@ -897,7 +897,7 @@ TEST(ShardModeRegression, SlowStartupPhaseDoesNotKillShardClient) {
     cfg.shardClientLivenessTimeoutNs = kLivenessNs;
     BrokerNode node{cfg};
     node.setStartupPhaseHookForTest([](std::string_view phase) {
-        if (phase == "build-gateway")                         // the injected fault: a slow rebuild
+        if (phase == "metadata-recover")                      // the injected fault: a slow recovery
             std::this_thread::sleep_for(std::chrono::nanoseconds{2 * kLivenessNs});
     });
     node.start();
@@ -957,12 +957,13 @@ TEST(ShardModeRegression, SequentialShardResolveKeepsEarlierShardsAlive) {
 }
 
 // The last shard's driver start blocks for 2x the client liveness timeout.  No shard client may exist yet
-// while a driver is constructed, so every shard must still serve.
-TEST(ShardModeRegression, SlowShardDriverStartKeepsEarlierShardClientsAliveRegression) {
+// while a driver is constructed, so every shard must still serve.  Fused: the runtime client (worker 0's) exists
+// and is serviced by the interim pump, which the stall must let through.
+static void slowShardDriverStartKeepsEarlierShardClientsAlive(bool fused) {
     TmpDir dir{"slowdrv"}, cdir{"slowdrvc"};
     constexpr int32_t kWorkers = 3;
     const auto ports = ShardPorts::discover(1, kWorkers);
-    auto cfg = makeShardConfig(0, dir.path, ports, 1, kWorkers, /*fused=*/false);
+    auto cfg = makeShardConfig(0, dir.path, ports, 1, kWorkers, fused);
     constexpr int32_t kTopicParts = 12;
     constexpr int64_t kLivenessNs = 2'000'000'000;           // > driver timer interval (1 s)
     cfg.shardClientLivenessTimeoutNs = kLivenessNs;
@@ -987,6 +988,14 @@ TEST(ShardModeRegression, SlowShardDriverStartKeepsEarlierShardClientsAliveRegre
         EXPECT_TRUE(ack.has_value()) << "shard " << w << " does not serve";
     }
     node.stop();
+}
+
+TEST(ShardModeRegression, SlowShardDriverStartKeepsEarlierShardClientsAliveRegression) {
+    slowShardDriverStartKeepsEarlierShardClientsAlive(false);
+}
+
+TEST(ShardModeFusedRegression, SlowShardDriverStartKeepsTheRuntimeClientAliveRegression) {
+    slowShardDriverStartKeepsEarlierShardClientsAlive(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,10 +1270,11 @@ TEST(ShardModeFusedRegression, ThreeNodeAcksAllCommitsWithFusedRuntimes) {
 }
 
 // The runtime's invoker driver + client exist from step 3 of start() (consensus,
-// replication and gateway are built on them), long before worker 0 runs.  A slow
-// startup phase (offset/txn/metadata rebuilds) must not leave them unpumped for
-// longer than the client liveness timeout — the driver would time the runtime
-// client out (its subscriptions/publications vanish; nothing serves).
+// replication and gateway are built on them), long before worker 0 runs.  The
+// system-log recoveries make no client call, so they yield the startup gate: a slow
+// one must not leave the client unpumped for longer than its liveness timeout — the
+// driver would time the runtime client out (nothing serves).  The other startup
+// phases are not covered: the production liveness (1 h) is what keeps them safe.
 TEST(ShardModeFusedRegression, SlowStartupPhaseDoesNotKillTheRuntimeClient) {
     TmpDir dir{"fslow"}, cdir{"fslowc"};
     const auto ports = ShardPorts::discover(1, 1);
@@ -1273,7 +1283,7 @@ TEST(ShardModeFusedRegression, SlowStartupPhaseDoesNotKillTheRuntimeClient) {
     cfg.shardClientLivenessTimeoutNs = kLivenessNs;          // every invoker driver of the node
     BrokerNode node{cfg};
     node.setStartupPhaseHookForTest([](std::string_view phase) {
-        if (phase == "build-gateway")                         // the injected fault: a slow rebuild
+        if (phase == "metadata-recover")                      // the injected fault: a slow recovery
             std::this_thread::sleep_for(std::chrono::nanoseconds{2 * kLivenessNs});
     });
     node.start();
@@ -1316,6 +1326,7 @@ TEST(ShardModeFusedRegression, StartFailureStillClosesTheRuntimeDriver) {
     node.setHaltHandler(&HaltCapture::handler, &halt);
     node.setRecoveryFaultForTest(EIO);
     EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_EQ(rune::aeronutil::StartupClientGate::heldHere(), nullptr) << "a failed start left the starter thread holding the gate";
     EXPECT_EQ(halt.await(1'000ms), BrokerNode::kExitStorageFailure);
     std::thread stopper([&] { node.stop(); });
     stopper.join();

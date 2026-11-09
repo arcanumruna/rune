@@ -258,11 +258,25 @@ std::unique_ptr<rune::consensus::BackoffIdleStrategy> makeShapedBackoff(const No
     return std::make_unique<rune::consensus::BackoffIdleStrategy>(
         s.spins, s.yields, std::chrono::nanoseconds{s.minParkNs}, std::chrono::nanoseconds{s.maxParkNs});
 }
+
+/// Releases the fused startup gate when start() unwinds, on the starter thread (its TLS must not keep a dead gate).
+struct ReleaseGateOnUnwind {
+    rune::aeronutil::StartupClientGate& gate;
+    ~ReleaseGateOnUnwind() { gate.release(); }
+};
+
+/// A system log's recovery is storage only (no aeron_ call), so the fused interim pump may service the client meanwhile.
+void recoverSystemLog(rune::storage::Log& log, const std::function<void(std::string_view)>& phaseHook, std::string_view phase) {
+    rune::aeronutil::StartupClientGate::Yield pumpMayRun;
+    if (phaseHook) phaseHook(phase);   // test-only fault injection
+    log.recover();
+}
 } // namespace
 
 void BrokerNode::start() {
     if (started_) return; // idempotent (controller-owned flag, F9a)
     started_ = true;
+    ReleaseGateOnUnwind releaseStartupGate{startupGate_};
     // F9a fix round 1: the thread that starts the node is the ONE leadership
     // observer (isLeader/leaderId/... drain the ring; others are refused).
     // Bound before the control thread exists (ordered by its start).
@@ -500,14 +514,16 @@ void BrokerNode::start() {
         }
         // Fused: the runtime's invoker driver + conductor are serviced by an
         // interim pump runner from HERE until worker 0 takes them over (step
-        // 7b) — every startup phase, however long, keeps them live (time-
-        // independent: no phase may out-last the client liveness timeout).
+        // 7b).  The runner invokes the client only while the starter is out of
+        // it: during a resolve's sleep or a StartupClientGate::Yield.  Between
+        // those the client is unserviced, which is safe because the in-process
+        // client liveness is 1 h (kInProcessLivenessNs); a test that lowers it
+        // must keep every other phase shorter.
         // Startup resolves on aeron_ then use the default sleep-poll pump,
         // exactly as with thread placement's driver/conductor threads.
         if (config_.fused()) {
-            // The starter holds the gate until the hand-off, so the interim pump invokes aeron_ only while a resolve
-            // sleeps.  Any new non-client wait in start() longer than ~2 s (the shard clients' liveness) must hold a
-            // StartupClientGate::Yield, like the build-gateway hook and the shard-driver stall.
+            // Any new wait in start() longer than ~2 s (the test-lowered shard client liveness) that makes no
+            // aeron_ call must hold a StartupClientGate::Yield, like the system-log recoveries and the shard-driver stall.
             startupGate_.acquire();   // released by stopStartupPump_()
             startupPumpAgent_  = std::make_unique<DriverPumpAgent>(*nodeDriver_, *aeron_, startupGate_);
             startupPumpIdle_   = makeBackoffIdle(config_.idleMaxParkUs);
@@ -2059,10 +2075,6 @@ void BrokerNode::refuseStartOnFailedRecovery_() {
 }
 
 void BrokerNode::buildGateway() {
-    if (startupPhaseHookForTest_) {
-        rune::aeronutil::StartupClientGate::Yield pumpMayRun;
-        startupPhaseHookForTest_("build-gateway");
-    }   // test-only fault injection
     // Capture config_ by value (immutable after construction).
     const std::string clientChannel  = config_.clientEndpoint.channel;
     const int32_t     clientStreamId = config_.clientEndpoint.streamId;
@@ -2342,7 +2354,7 @@ void BrokerNode::buildGateway() {
             // One partition Log for all committed offsets (compact key/value encoding).
             offsetLog_ = std::make_unique<rune::storage::Log>(
                 offsetDir.string(), config_.offsetLogSegmentRollBytes);
-            offsetLog_->recover();
+            recoverSystemLog(*offsetLog_, startupPhaseHookForTest_, "offset-recover");
             refuseStartOnDamagedSystemLog_();   // #839: before offsetStore_->rebuildFromLog() (its first reader)
 
             // Wrap in a PartitionReplica for the __consumer_offsets topic.
@@ -2488,7 +2500,7 @@ void BrokerNode::buildGateway() {
             fs::create_directories(txnDir);
 
             txnLog_ = std::make_unique<rune::storage::Log>(txnDir.string(), config_.offsetLogSegmentRollBytes);
-            txnLog_->recover();
+            recoverSystemLog(*txnLog_, startupPhaseHookForTest_, "txn-recover");
             refuseStartOnDamagedSystemLog_();   // #839: before the txn store's rebuild (its first reader)
 
             const NodeId selfId = static_cast<NodeId>(config_.nodeId);
@@ -2677,7 +2689,7 @@ void BrokerNode::buildGateway() {
             fs::create_directories(metaDir);
 
             metadataLog_ = std::make_unique<rune::storage::Log>(metaDir.string(), config_.offsetLogSegmentRollBytes);
-            metadataLog_->recover();
+            recoverSystemLog(*metadataLog_, startupPhaseHookForTest_, "metadata-recover");
             refuseStartOnDamagedSystemLog_();   // #839: before metadataService_->rebuildFromLog() (its first reader)
 
             const NodeId selfId = static_cast<NodeId>(config_.nodeId);
