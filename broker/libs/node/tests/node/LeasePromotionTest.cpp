@@ -360,12 +360,12 @@ TEST(LeasePromotionArmingRegression, GrowFailedGrantNeverEarlyRegression) {
         EXPECT_EQ(k.rt()->stats().growFailures, 0u) << "the new runtime";
         k.rt()->setGrowThrowForTest(false);
         k.r.passes(3);
-        ASSERT_TRUE(k.rt()->promotionDone());
+        EXPECT_TRUE(k.rt()->promotionDone());   // (EXPECT: a mutant that keeps the chunk-0 runtime must still reach the Expire assertions below)
         k.advanceMs(1000);
         const int64_t ver = k.versionOf(key);
         const auto fr = k.keepAlive({E(key, ver)});
-        ASSERT_EQ(fr.size(), 1u);
-        EXPECT_EQ(fr[0].es[0].code, 0);
+        EXPECT_EQ(fr.size(), 1u) << "answered at once (a due key would park)";   // (EXPECT: a mutant must still reach the Expire assertions)
+        if (!fr.empty()) EXPECT_EQ(fr[0].es[0].code, 0);
         auto expiresOf = [&] {
             std::size_t n = 0;
             for (const auto& s : withOp(k.r, rec::LeaseOp::Expire)) n += s.key == keyOf(key) ? 1 : 0;
