@@ -832,29 +832,31 @@ TEST(LeaseEmitterRegression, NamespaceByteCapRegression) {
     }
 }
 
-// 20. (F7) Both doWork paths run leaseDuty_: the classic doWork (shard mode off, the rig's default) and doWorkShard_.  (A grant needs the ack
-// sink's session version, so the rig cannot grant without enableAcks; the classic path is what every other cell here drives, and this cell
-// pins it beside the shard path.)  The Expire is in the log and the entry is Emitting, then Free after the fold.
+// 20. (F7) Both doWork paths run leaseDuty_.  The rig drives its worker in shard mode (doWorkShard_; ensureDriver_ sets it) once the ack sink is
+// on, and a grant needs the ack sink's session version, so the classic doWork leg grants in shard mode and then flips the (single-threaded)
+// worker to the classic path for the expiry.  The Expire is in the log and the entry is Emitting, then Free after the fold.
 // Mutation: remove the leaseDuty_ call of a path -> that leg red.
 TEST(LeaseEmitterRegression, DoWorkPathsRegression) {
-    for (const bool shard : {false, true}) {
+    for (const bool classic : {true, false}) {
         Em e;
         VerdictRig& r = e.r;
-        if (shard) r.worker->setShardMode(true);
-        ASSERT_TRUE(e.produce({grantRec(1)})) << "shard " << shard;
-        ASSERT_TRUE(r.driveUntilJudged()) << "shard " << shard;
-        ASSERT_TRUE(e.waitRuntime()) << "shard " << shard;
-        ASSERT_EQ(e.entry(1).state, LeaseEntryState::Armed) << "shard " << shard;
+        ASSERT_TRUE(r.worker->shardMode()) << "the rig's default is the shard path";
+        ASSERT_TRUE(e.produce({grantRec(1)})) << "classic " << classic;
+        ASSERT_TRUE(r.driveUntilJudged()) << "classic " << classic;
+        ASSERT_TRUE(e.waitRuntime()) << "classic " << classic;
+        ASSERT_EQ(e.entry(1).state, LeaseEntryState::Armed) << "classic " << classic;
         const uint32_t rid = e.ridOf(1);   // the row is gone after the fold: keep the rid
+        if (classic) r.worker->setShardMode(false);
+        ASSERT_EQ(r.worker->shardMode(), !classic);
         e.advanceMs(5000 + 1);
         r.holdJudge(true);
         r.pass();
-        ASSERT_EQ(expires(r).size(), 1u) << "shard " << shard << ": the Expire is in the log";
-        EXPECT_EQ(e.entry(1).state, LeaseEntryState::Emitting) << "shard " << shard;
+        ASSERT_EQ(expires(r).size(), 1u) << "classic " << classic << ": the Expire is in the log";
+        EXPECT_EQ(e.entry(1).state, LeaseEntryState::Emitting) << "classic " << classic;
         r.holdJudge(false);
         ASSERT_TRUE(r.driveUntilJudged());
         r.passes(3);
-        EXPECT_EQ(e.rt()->timers().entry(rid).state, LeaseEntryState::Free) << "shard " << shard << ": the fold ended the key";
+        EXPECT_EQ(e.rt()->timers().entry(rid).state, LeaseEntryState::Free) << "classic " << classic << ": the fold ended the key";
         EXPECT_EQ(expires(r).size(), 1u);
     }
 }
