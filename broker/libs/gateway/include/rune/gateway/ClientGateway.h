@@ -3306,7 +3306,7 @@ private:
     // F15-FU1 (#112): transaction-registration verification (see onRemoteVerifyTxnPartition).
     struct VerifyAnswer {
         int32_t topicId = 0; int32_t partition = 0; int64_t producerId = -1; int16_t producerEpoch = 0;
-        int64_t reqId = 0; int16_t code = 0;
+        int64_t reqId = 0; int16_t code = 0; bool votes = false;
     };
     struct VerifyInFlight {
         VerifyAnswer req;            ///< the worker's request (code unset)

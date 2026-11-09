@@ -602,7 +602,8 @@ struct WorkerReturn {
         /// may be appended to topicId / partition.  correlationId = the worker's request id (echoed by the
         /// TxnVerifyResult op), targetReplicaId / incarnation = the replica.  The runtime answers EVERY request
         /// exactly once (the coordinator's code, or a retriable NotCoordinator when it cannot be asked or a
-        /// remote ask is lost to a reconnect / coordinator change).  Rides sbe ReturnType::TXN_VERIFY_REQUEST.
+        /// remote ask is lost to a reconnect / coordinator change).  baseOffset = 1 when the partition is a verdict source
+        /// (it votes), else 0.  Rides sbe ReturnType::TXN_VERIFY_REQUEST.
         TxnVerifyRequest = 8,
         /// Checked writes Part 07: the answer to a ScanViewRows op.  errorCode = ViewRowResponse status, recordCount =
         /// rows in the page, readTopicId = viewTopicId; the chunk is [nextTokenLen u32][token][rowsLen u32][rows].

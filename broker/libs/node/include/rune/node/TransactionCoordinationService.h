@@ -245,8 +245,9 @@ public:
     /// record that registered it is committed (a coordinator failover keeps it, so
     /// the partition's marker is always written).  Cold: a pid → transaction scan
     /// on a cache miss (pidIndex_, re-validated on every hit).
+    /// votes: the partition is a verdict source; it becomes a vote candidate of the transaction whatever this node's catalog knows (L9).
     int16_t verifyTxnPartition(int64_t producerId, int16_t producerEpoch, int32_t topicId, int32_t partition,
-                               int64_t nowNs) override;
+                               int64_t nowNs, bool votes) override;
     [[nodiscard]] bool    coordinatesLocally() const override { return isLocalCoordinator(); }
     [[nodiscard]] int32_t coordinatorNode() const override { return leaderIdFn_ ? leaderIdFn_() : -1; }
     /// #112: the cluster's metadata feature level (setMetadataFeatureLevel) includes the verification.
@@ -494,6 +495,8 @@ private:
     /// 0 while the gate's transaction is still the Ongoing one the votes were asked for, else the EndTxn(commit) answer.
     [[nodiscard]] int16_t staleVoteCode_(const VoteGate& g);
     void noteVoteCandidates_(const rune::protocol::client::TxnTopicPartitionView& parts, bool votesOn);
+    VoteCandidates& candidatesOf_(const rune::transaction::TransactionMetadata& m);
+    void noteVoteTarget_(const rune::transaction::TransactionMetadata& m, const std::string& topic, int32_t topicId, int32_t partition);
     /// True when EndTxn(commit) of txnIdScratch_ opened a vote gate (the answer is deferred).
     bool startVoteGate_(const rune::protocol::client::EndTxn& msg, int64_t nowNs);
     void sendVote_(const VoteGate& g, VoteTarget& t, int64_t nowNs);

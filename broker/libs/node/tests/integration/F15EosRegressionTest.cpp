@@ -7441,14 +7441,14 @@ TEST(TxnVerifyRegression, PlaceholderRegistrationOfAnUnappliedTopicIsNeverVerifi
         return (r && r->results.size() == 1) ? r->results[0].errorCode : int16_t{-1};
     };
     const int16_t added = add();
-    const int16_t verified = T.tcs->verifyTxnPartition(T.pid, T.epoch, kLateTopic, 0, 100);
+    const int16_t verified = T.tcs->verifyTxnPartition(T.pid, T.epoch, kLateTopic, 0, 100, false);
     EXPECT_FALSE(added == 0 && verified == 0)
         << "a placeholder registration (its marker is skipped) was confirmed: the batch would pin the LSO forever";
     // The catalog applies the topic: the producer's retry registers and verifies it (never a non-retriable refusal
     // of a correctly registered partition).
     ASSERT_EQ(T.m.topics.createTopicAt(kLateTopic, rune::node::TopicSpec{"late-topic", 1}), kLateTopic);
     if (added != 0) EXPECT_EQ(add(), 0);
-    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, kLateTopic, 0, 200), 0)
+    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, kLateTopic, 0, 200, false), 0)
         << "a registered partition was refused once its topic resolved";
 }
 
@@ -7468,9 +7468,9 @@ TEST(TxnVerifyRegression, UnappliedTopicIsRefusedRetriablyByEveryTxnRequestRegre
         T.out.data(), T.tcs->handleAddPartitions(f.data(), f.size(), 1, T.out.data(), T.out.size()));
     ASSERT_TRUE(r && r->results.size() == 2);
     for (const auto& pr : r->results) EXPECT_EQ(pr.errorCode, kConcurrentTxns) << "topic " << pr.topicId;
-    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, 0, 0, 10), kInvalidTxnState)
+    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, 0, 0, 10, false), kInvalidTxnState)
         << "the known partition of a refused request was registered anyway";
-    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, kLate, 0, 10), kConcurrentTxns)
+    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, kLate, 0, 10, false), kConcurrentTxns)
         << "an unknown topic must be refused retriably by the verification";
 
     // TxnOffsetCommit naming an unapplied topic: retriable, nothing recorded under a placeholder.
@@ -7497,8 +7497,8 @@ TEST(TxnVerifyRegression, UnappliedTopicIsRefusedRetriablyByEveryTxnRequestRegre
         T.out.data(), T.tcs->handleAddPartitions(f.data(), f.size(), 1, T.out.data(), T.out.size()));
     ASSERT_TRUE(r && r->results.size() == 2);
     for (const auto& pr : r->results) EXPECT_EQ(pr.errorCode, 0);
-    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, kLate, 0, 20), 0);
-    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, 0, 0, 20), 0);
+    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, kLate, 0, 20, false), 0);
+    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, 0, 0, 20, false), 0);
 }
 
 // ---- PR #589 re-check 1 (adversarial, the shared topic lookup) ---------------------------------------------------

@@ -1319,3 +1319,24 @@ TEST(CheckedWritesTxnWorkerRegression, TransactionBoundNeedsAVerdictSourceRegres
     EXPECT_FALSE(Worker::txnJudgedForTest(ws, false, 5));
     EXPECT_FALSE(Worker::txnJudgedForTest(ws, true, 5));
 }
+
+// L9: the first transactional batch's verification request tells the coordinator whether this partition votes, from the partition's
+// own catalog: a verdict source reports true, a plain topic false.
+TEST(CheckedWritesTxnWorker, VerifyRequestReportsThatTheSourceVotes) {
+    Ki k;
+    k.r.worker->setTxnVerification(true);
+    EXPECT_EQ(txnProduce(k, 80, 4, 0), static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+    ASSERT_EQ(k.r.worker->txnVerifyRequestsSentForTest(), 1u);
+    EXPECT_TRUE(k.r.lastVerifyVotes());
+
+    VerdictRig plain;
+    plain.typed();
+    plain.enableAcks();
+    plain.passes(30);
+    plain.worker->setTxnVerification(true);
+    const auto a = plain.ack(plain.produceFrame({ups(4)}, kLeader, 81, 0, /*txn=*/true));
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+    ASSERT_EQ(plain.worker->txnVerifyRequestsSentForTest(), 1u);
+    EXPECT_FALSE(plain.lastVerifyVotes());
+}

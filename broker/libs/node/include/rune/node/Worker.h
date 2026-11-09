@@ -9921,6 +9921,8 @@ private:
             q.epoch       = epoch;
             q.reqId       = a.reqId;
             q.replicaId   = replica != nullptr ? replica->registryId() : 0;
+            const PartitionWriteState* ws = writeOf_(replica);
+            q.votes       = ws != nullptr && ws->isVerdictSource();
             q.incarnation = replica != nullptr ? replica->incarnation() : 0;
             ++verifyOutTail_;
             ++txnVerifyRequestsSent_;
@@ -9954,6 +9956,7 @@ private:
             q.correlationId   = static_cast<int64_t>(o.reqId);
             q.targetReplicaId = o.replicaId;
             q.incarnation     = o.incarnation;
+            q.baseOffset      = o.votes ? 1 : 0;   // TxnVerifyRequest: 1 = this partition is a verdict source and votes (L9)
             if (!tryWriteReturn_(q)) break;
             ++verifyOutHead_;
             ++flushed;
@@ -9996,6 +9999,7 @@ private:
         uint32_t replicaId   = 0;
         uint32_t incarnation = 0;
         int16_t  epoch       = 0;
+        bool     votes       = false;   ///< the partition is a verdict source when the verify is asked
     };
     static_assert((kTxnVerifyOutboxCapacity & (kTxnVerifyOutboxCapacity - 1)) == 0, "power of two");
     std::array<TxnVerifyOut, kTxnVerifyOutboxCapacity> verifyOutbox_{};
