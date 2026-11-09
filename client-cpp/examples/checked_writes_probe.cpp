@@ -42,6 +42,15 @@
 //   rp-verify      a subscription from 0 on user and character holds no offset a write was refused at.
 //   rp-compact     accepted updates on user and character until both leaders report rejectedNotCompacted 0.
 //
+// The transaction legs (Part 11) run against the golden script's `character` topic and a `ledger` topic {entryId key, account, amount,
+// memo} with the view `balances` (balance >= 0).  Each transaction writes two characters and two ledger entries of 1 through a
+// transactional producer (acks All); the result line is `txn <user> <code> <constraintName> <failingOffset> <w<worker>u<user>k<k>> <first entryId>`.
+//   txn-setup      prints TXN_CHARACTER_TOPIC_ID, TXN_LEDGER_TOPIC_ID and CHECKED-WRITES-TXN-SETUP: OK once the topics and views exist.
+//   txn-run        --worker <i> --users <a>-<b>: per user six transactions that fit account_stats, a seventh the cap refuses, and one
+//                  that overdraws the user's account (the workers share the users: per user six transactions fit in all).  Writes the tag txn-run and txn-run-progress-w<i>.
+//   txn-verify     a read_committed subscription from 0 holds every committed transaction whole, no refused one, and a transaction
+//                  whose answer was lost whole or not at all; the account_stats and balances rows agree with it.
+//
 // Environment: RUNE_TARGET, RUNE_EGRESS_HOST + RUNE_EGRESS_PORT, RUNE_DATA_DIR, RUNE_USER / RUNE_PASSWORD_FILE /
 // RUNE_TLS_CA_FILE, RUNE_TIMEOUT_MS, KI_E2E_SHARED (a writable directory shared between legs), KI_E2E_THREADS.
 
@@ -1050,6 +1059,233 @@ int runRpCompact() {
     return 0;
 }
 
+// ---- Transactions ----------------------------------------------------------------------------------------------------
+
+/// The ledger topic's record (hand-written like the test support's RpLedger: [blockLength:u16][version:u16] then the fields, little-endian).
+struct TxnLedger {
+    static constexpr std::string_view kSchemaName = "ledger";
+    static constexpr uint16_t kVersion = 1, kBlockLength = 40;
+    static const uint64_t kFingerprint;
+
+    uint64_t entryId = 0, account = 0;
+    int64_t  amount = 0;
+
+    [[nodiscard]] std::size_t encodedSize() const noexcept { return 4 + kBlockLength; }
+    [[nodiscard]] std::size_t encode(uint8_t* b) const noexcept {
+        std::memset(b, 0, encodedSize());
+        std::memcpy(b, &kBlockLength, 2);
+        std::memcpy(b + 2, &kVersion, 2);
+        std::memcpy(b + 4, &entryId, 8);
+        std::memcpy(b + 12, &account, 8);
+        std::memcpy(b + 20, &amount, 8);
+        return encodedSize();
+    }
+    [[nodiscard]] uint64_t key() const noexcept { return entryId; }
+};
+const uint64_t TxnLedger::kFingerprint = rune::codec::fingerprint(rune::codec::DescriptorBuilder("ledger", 1)
+    .add("entryId", rune::codec::PrimType::UInt64, 1, /*isKey=*/true)
+    .add("account", rune::codec::PrimType::UInt64)
+    .add("amount", rune::codec::PrimType::Int64)
+    .addFixedStr("memo", 16)
+    .build());
+using TxnLedgerTyped = TypedTopic<TxnLedger, ProducerRef>;
+
+constexpr int      kTxnCommitted = 6;           // transactions of two characters per user before account_stats (cap 12) is full
+constexpr uint64_t kTxnEntryBase = 1'000'000'000;   // the entry ids of worker w, user u: (w + 1) * kTxnEntryBase + u * 1000 + k * 10 + {0, 1}; the overdraw's is + 900
+constexpr int      kTxnWaitS = 120;
+
+/// One transactional producer (acks All) over the character and ledger topics.
+struct TxnWriter {
+    Producer       producer;
+    RpCharTyped    characters;
+    TxnLedgerTyped ledger;
+    TxnWriter(Client& c, const std::string& txnId)
+        : producer(c.producer([&] {
+              ProducerConfig pc;
+              pc.acks                 = Acks::All;
+              pc.lingerUs             = 1;
+              pc.transactionalId      = txnId;
+              pc.transactionTimeoutMs = 60'000;
+              return pc;
+          }())),
+          characters(c.openTopicAndWait<RpCharacter>("character", producer, 60s)), ledger(c.openTopicAndWait<TxnLedger>("ledger", producer, 60s)) {
+        producer.initTransactionsAndWait(std::chrono::seconds(kTxnWaitS));
+    }
+    ~TxnWriter() { producer.closeImmediately(); }
+};
+
+/// One transaction: a character per name of `names` for `user`, a ledger entry of `amount` on `account` per id from `firstEntry` (`entries` of them).
+/// The line's code is 0 for a commit, the vote's code for a no, kClientErr when the answer was lost (the transaction is then aborted if it can be).
+RpLine txnRun(std::unique_ptr<TxnWriter>& w, Client& c, const std::string& txnId, uint64_t user, uint64_t account, const std::vector<std::string>& names,
+              uint64_t firstEntry, int entries, int64_t amount, const std::string& tag) {
+    RpLine l{"txn", user, kClientErr, 0, -1, tag, firstEntry};
+    try {
+        w->producer.beginTransaction();
+        for (const std::string& name : names) {
+            RpCharacter ch;
+            ch.userId = user;
+            ch.gender = 1;
+            std::snprintf(ch.name.data(), ch.name.size(), "%s", name.c_str());
+            if (!w->characters.insertAndWait(ch, std::chrono::seconds(kTxnWaitS)).ok()) throw std::runtime_error("a character write was refused");
+        }
+        for (int i = 0; i < entries; ++i) {
+            TxnLedger e;
+            e.entryId = firstEntry + static_cast<uint64_t>(i);
+            e.account = account;
+            e.amount  = amount;
+            if (!w->ledger.upsertAndWait(e, std::chrono::seconds(kTxnWaitS)).ok()) throw std::runtime_error("a ledger write was refused");
+        }
+        const TxnCommitResult r = w->producer.commitTransactionAndWait(std::chrono::seconds(kTxnWaitS));
+        l.code         = r.ok ? 0 : r.code;
+        l.constraintId = r.constraintId;
+        l.offset       = r.failingOffset;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s threw: %s\n", tag.c_str(), e.what());
+        try { w->producer.abortTransactionAndWait(30s); } catch (const std::exception&) { w = std::make_unique<TxnWriter>(c, txnId); }   // a fenced or broken producer starts over
+    }
+    return l;
+}
+
+int runTxnSetup() {
+    Client c(makeConfig());
+    c.connectAndWait();
+    const auto state = latestCatalog(c);
+    const auto* character = state.topicByName(rune::catalog::kDefaultNsId, "character");
+    const auto* ledger = state.topicByName(rune::catalog::kDefaultNsId, "ledger");
+    if (character == nullptr || ledger == nullptr) { fail("CHECKED-WRITES-TXN-SETUP", "the character or the ledger topic is missing"); return 1; }
+    for (const char* view : {"character_name", "account_stats", "balances"})
+        if (state.viewByName(rune::catalog::kDefaultNsId, view) == nullptr) { fail("CHECKED-WRITES-TXN-SETUP", std::string("the view ") + view + " is missing"); return 1; }
+    std::printf("TXN_CHARACTER_TOPIC_ID=%d\nTXN_LEDGER_TOPIC_ID=%d\nCHECKED-WRITES-TXN-SETUP: OK\n", character->topicId, ledger->topicId);
+    std::fflush(stdout);
+    return 0;
+}
+
+int runTxnRun(const Args& a) {
+    Client c(makeConfig());
+    c.connectAndWait();
+    const int threads = static_cast<int>(envInt("KI_E2E_THREADS", 4));
+    std::vector<std::vector<RpLine>> lines(static_cast<std::size_t>(threads));
+    {
+        Progress progress("txn-run", a.worker);
+        std::vector<std::thread> ts;
+        for (int t = 0; t < threads; ++t)
+            ts.emplace_back([&, t] {
+                const std::string txnId = "txn-probe-w" + std::to_string(a.worker) + "-t" + std::to_string(t);
+                auto w = std::make_unique<TxnWriter>(c, txnId);
+                for (uint64_t u = a.lo + static_cast<uint64_t>(t); u <= a.hi; u += static_cast<uint64_t>(threads)) {
+                    const std::string base = "w" + std::to_string(a.worker) + "u" + std::to_string(u);
+                    const uint64_t entries = static_cast<uint64_t>(a.worker + 1) * kTxnEntryBase + u * 1000;
+                    for (int k = 0; k <= kTxnCommitted; ++k) {   // the seventh is the cap's: account_stats refuses it
+                        const std::string tag = base + "k" + std::to_string(k);
+                        lines[static_cast<std::size_t>(t)].push_back(txnRun(w, c, txnId, u, u, {tag + "a", tag + "b"}, entries + static_cast<uint64_t>(k) * 10, 2, 1, tag));
+                        ++progress.done;
+                    }
+                    // One character for another user and a debit of the account's whole balance and more: balances refuses it.
+                    const std::string tag = base + "od";
+                    lines[static_cast<std::size_t>(t)].push_back(txnRun(w, c, txnId, kRpPairBase + u, u, {tag}, entries + 900, 1, -1000, tag));
+                    ++progress.done;
+                }
+            });
+        for (auto& t : ts) t.join();
+    }
+    std::vector<RpLine> all;
+    for (const auto& l : lines) all.insert(all.end(), l.begin(), l.end());
+    saveRpLines(c, "txn-run", a.worker, all);
+    std::printf("CHECKED-WRITES-TXN-RUN: DONE worker=%d txns=%zu\n", a.worker, all.size());
+    std::fflush(stdout);
+    return 0;
+}
+
+/// What a read_committed reader of the character and ledger topics has seen.
+struct TxnTap {
+    std::mutex            mu;
+    std::set<std::string> names;
+    std::set<uint64_t>    entries;
+    bool has(const std::string& n) { std::lock_guard<std::mutex> g(mu); return names.contains(n); }
+    bool has(uint64_t id) { std::lock_guard<std::mutex> g(mu); return entries.contains(id); }
+};
+
+int runTxnVerify() {
+    const auto lines = readRpLines({"txn-run-w"});
+    int committed = 0, refused = 0, lost = 0;
+    for (const RpLine& l : lines) {
+        if (l.code == 0) ++committed;
+        else if (l.code == kClientErr) ++lost;
+        else if (l.code == kConstraintViolation) ++refused;
+        else { fail("CHECKED-WRITES-TXN-VERIFY", l.name + " voted " + std::to_string(l.code)); return 1; }
+    }
+    if (committed == 0 || refused == 0) { fail("CHECKED-WRITES-TXN-VERIFY", "the result files hold no committed or no refused transaction"); return 1; }
+
+    Client c(makeConfig());
+    c.connectAndWait();
+    RpWriter w(c);
+    TxnTap tap;
+    SubscribeOptions so;
+    so.from      = From::earliest();
+    so.isolation = Isolation::ReadCommitted;
+    const TopicHandle ledger = c.topic("ledger");
+    SubscriptionSet characterSet = c.subscribe(w.characters.handle(), AllPartitions{}, so, [&](const Record& r) {
+        if (r.value.size() < 36) return;
+        const char* name = reinterpret_cast<const char*>(r.value.data()) + 20;
+        std::lock_guard<std::mutex> g(tap.mu);
+        tap.names.insert(std::string(name, strnlen(name, 16)));
+    });
+    SubscriptionSet ledgerSet = c.subscribe(ledger, AllPartitions{}, so, [&](const Record& r) {
+        if (r.value.size() < 12) return;
+        uint64_t id = 0;
+        std::memcpy(&id, r.value.data() + 4, sizeof id);
+        std::lock_guard<std::mutex> g(tap.mu);
+        tap.entries.insert(id);
+    });
+    // A committed transaction's records are all delivered; wait for them, then a quiet window for a refused record that is going to land.
+    const auto names = [](const RpLine& l) { return l.name.find("od") != std::string::npos ? std::vector<std::string>{l.name} : std::vector<std::string>{l.name + "a", l.name + "b"}; };
+    const auto entryCount = [](const RpLine& l) { return l.name.find("od") != std::string::npos ? 1 : 2; };
+    const auto delivered = [&] {
+        for (const RpLine& l : lines) {
+            if (l.code != 0) continue;
+            for (const std::string& n : names(l)) if (!tap.has(n)) return false;
+            for (int i = 0; i < entryCount(l); ++i) if (!tap.has(l.id + static_cast<uint64_t>(i))) return false;
+        }
+        return true;
+    };
+    for (const auto deadline = Clock::now() + std::chrono::seconds(envInt("KI_E2E_VERIFY_S", 300)); Clock::now() < deadline && !delivered();) std::this_thread::sleep_for(100ms);
+    std::this_thread::sleep_for(5s);
+    int bad = 0;
+    std::map<uint64_t, std::pair<int64_t, int64_t>> perUser;   // the first user a transaction is for -> {characters, balance} it leaves visible
+    for (const RpLine& l : lines) {
+        bool all = true, none = true;
+        for (const std::string& n : names(l)) { const bool v = tap.has(n); all = all && v; none = none && !v; }
+        for (int i = 0; i < entryCount(l); ++i) { const bool v = tap.has(l.id + static_cast<uint64_t>(i)); all = all && v; none = none && !v; }
+        if (l.code == 0 && !all) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", l.name + ": a committed transaction is not whole"); }
+        else if (l.code != 0 && l.code != kClientErr && !none) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", l.name + ": a refused transaction is visible"); }
+        else if (l.code == kClientErr && !all && !none) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", l.name + ": a transaction whose answer was lost is torn"); }
+        if (all && l.name.find("od") == std::string::npos) { perUser[l.key].first += 2; perUser[l.key].second += 2; }
+    }
+    if (bad != 0) return 1;
+
+    // The views agree with what is visible.
+    const auto state = latestCatalog(c);
+    RpView stats(state, "account_stats"), balances(state, "balances");
+    for (const auto& [user, expect] : perUser) {
+        stats.builder.clear();
+        balances.builder.clear();
+        const auto statsKey   = keyBytes(stats.builder.setUInt("userId", user).key());
+        const auto balanceKey = keyBytes(balances.builder.setUInt("account", user).key());
+        const auto [characters, balance] = expect;
+        bool ok = false;
+        for (const auto deadline = Clock::now() + 120s; Clock::now() < deadline && !ok; std::this_thread::sleep_for(200ms)) {
+            const auto s = rpRowWhenReady(c, stats, statsKey, 0, 10s);
+            const auto b = rpRowWhenReady(c, balances, balanceKey, 0, 10s);
+            ok = s && b && static_cast<int64_t>(stats.u(*s, "characters")) == characters && static_cast<int64_t>(balances.u(*b, "balance")) == balance;
+        }
+        if (!ok) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", "user " + std::to_string(user) + ": account_stats or balances never reached " + std::to_string(characters) + " / " + std::to_string(balance)); }
+    }
+    if (bad != 0) return 1;
+    std::printf("CHECKED-WRITES-TXN-VERIFY: OK committed=%d refused=%d lost=%d\n", committed, refused, lost);
+    std::fflush(stdout);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1069,6 +1305,13 @@ int main(int argc, char** argv) {
         }
         if (mode == "ai-verify") return runAiVerify();
         if (mode == "ai-refusals") return runAiRefusals();
+        if (mode == "txn-setup") return runTxnSetup();
+        if (mode == "txn-verify") return runTxnVerify();
+        if (mode == "txn-run") {
+            Args a;
+            if (!parseArgs(argc, argv, a)) { std::fprintf(stderr, "usage: txn-run --worker <i> --users <a>-<b>\n"); return 2; }
+            return runTxnRun(a);
+        }
         if (mode == "rp-setup") return runRpSetup();
         if (mode == "rp-verify") return runRpVerify();
         if (mode == "rp-compact") return runRpCompact();
@@ -1084,6 +1327,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "CHECKED-WRITES-PROBE: %s threw: %s\n", mode.c_str(), e.what());
         return 1;
     }
-    std::fprintf(stderr, "CHECKED-WRITES-PROBE: mode must be setup, race, lifecycle, verify, refusals, an ai-* or an rp-* mode (got '%s')\n", mode.c_str());
+    std::fprintf(stderr, "CHECKED-WRITES-PROBE: mode must be setup, race, lifecycle, verify, refusals, an ai-*, an rp-* or a txn-* mode (got '%s')\n", mode.c_str());
     return 2;
 }

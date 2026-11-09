@@ -1951,7 +1951,8 @@ if(BUILD_TESTING)
                        tests/client/CheckedWritesBrokerRegressionTest.cpp
                        tests/client/CheckedWritesTransientViewBrokerRegressionTest.cpp
                        tests/client/CheckedWritesQlBrokerRegressionTest.cpp
-                       tests/client/CheckedWritesRegressorsPathRegressionTest.cpp)
+                       tests/client/CheckedWritesRegressorsPathRegressionTest.cpp
+                       tests/client/CheckedWritesTxnBrokerRegressionTest.cpp)
         target_compile_definitions(rune_client_broker_tests PRIVATE RUNE_QL_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/ql/tests/golden")
         # Phase 2b B Task 8b: ClaimBrokerRegressionTest compiles against the client's build-time generated all-fixed
         # `position.gen.h` (rune_gen_claim_schemas); the embedded client builds it under its own binary dir.
@@ -1965,9 +1966,9 @@ if(BUILD_TESTING)
         # rest of the binary is functional and runs in parallel.
         set(RUNE_CLIENT_BROKER_LATENCY_TESTS
             "AuthGatesRegression.FullScramLoginMedianUnder5msRegression:AuthGatesRegression.FirstLegTimingDoesNotRevealUserExistenceRegression")
-        # The two whole scenarios of the regressors path stay as stress; their default cuts are the tests around them.
+        # The two whole scenarios of the regressors path and the 1,000-transaction run stay as stress; their default cuts are the tests around them.
         set(RUNE_CLIENT_BROKER_STRESS_TESTS
-            "CheckedWritesRegressorsPathRegression.TheWholeScenarioThreeNodesRegression:CheckedWritesRegressorsPathRegression.FailoverDuringDropFinishesTheDropThreeNodesRegression")
+            "CheckedWritesRegressorsPathRegression.TheWholeScenarioThreeNodesRegression:CheckedWritesRegressorsPathRegression.FailoverDuringDropFinishesTheDropThreeNodesRegression:CheckedWritesTxnBrokerRegression.*FullLength*")
         gtest_discover_tests(rune_client_broker_tests TEST_FILTER "${RUNE_CLIENT_BROKER_LATENCY_TESTS}"
                              PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE LABELS latency)
         gtest_discover_tests(rune_client_broker_tests TEST_FILTER "${RUNE_CLIENT_BROKER_STRESS_TESTS}"
