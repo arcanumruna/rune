@@ -778,6 +778,7 @@ public:
     /// One worker pass; the driver and the client conductor run in it too (Invoker), so the rig is single-threaded.
     int pass() {
         now += 1'000'000;
+        if (tuning_.durabilityTier == 2) std::this_thread::sleep_for(std::chrono::microseconds(50));   // a Strict append waits for an fsync that takes wall-clock time
         ++passNo_;
         if (delayedSpecIn_ > 0 && --delayedSpecIn_ == 0) EXPECT_TRUE(worker->tryEnqueueOp(specOp_(true)));
         pumpAeron_();
