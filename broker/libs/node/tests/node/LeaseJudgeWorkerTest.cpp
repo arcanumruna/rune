@@ -368,16 +368,21 @@ TEST(LeaseJudgeWorkerRegression, LeaseRebuildAfterCompactionRegression) {
     VerdictRig& r = g.r;
     ASSERT_TRUE(g.send({RawRec{keyOf(1), leaseValue(1, 0, "a1", 1, 0, 1, 7000), 1}}));   // grant, TTL 7000
     const int64_t version = int64_t(*colsOf(r, 1, kV1Columns).v[0]);
+    ASSERT_TRUE(g.send({RawRec{keyOf(1), leaseValue(1, version, "u0", 1, 0, 8, 7000), 2}}));   // update, holder 8: superseded below
     ASSERT_TRUE(g.send({RawRec{keyOf(1), leaseValue(1, version, "u1", 1, 0, 9, 7000), 2}}));   // update, holder 9: carries the row's TTL (the judge requires it)
-    ASSERT_EQ(r.readLog().data.size(), 2u);
+    ASSERT_EQ(r.readLog().data.size(), 3u);
+    const int64_t latest = r.readLog().data.back().offset;
     const Cols live = colsOf(r, 1, kV1Columns);   // the live row before the demote
     ASSERT_EQ(live.v[1], 7000u);
 
-    for (int i = 0; i < 6 && r.readLog().data.size() > 1; ++i) {
+    for (int i = 0; i < 6 && r.readLog().data.size() > 2; ++i) {
         r.replica->setLastCleanOffset(0);
         (void)r.compact(1'000'000 + i * 5'000);
     }
-    ASSERT_EQ(r.readLog().data.size(), 1u) << "the grant is compacted away: only the update of key 1 is left";
+    const auto kept = r.readLog().data;
+    ASSERT_EQ(kept.size(), 2u) << "the superseded update is compacted away; the live grant and the latest update are kept";
+    EXPECT_EQ(kept[0].offset, version) << "the live version's grant survives compaction";
+    EXPECT_EQ(kept[1].offset, latest);
 
     ASSERT_NE(r.stats(), nullptr);
     const uint64_t rebuilds = r.stats()->keyIndexRebuilds;

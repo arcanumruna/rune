@@ -1,6 +1,7 @@
 #include <rune/storage/BatchHeaderCursor.h>
 #include <rune/storage/LogCleaner.h>
 #include <cstring>
+#include <rune/protocol/LeaseRecord.h>
 #include <rune/protocol/RecordBatch.h>
 #include <spdlog/spdlog.h>
 #include <rune/storage/ControlMarkerLayout.h>
@@ -11,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <climits>
 #include <filesystem>
@@ -439,6 +441,36 @@ void appendStampedControlBatch(std::vector<uint8_t>& out, const uint8_t* batch, 
     const uint32_t crc = rune::protocol::crc32c(p + b::kAttributesOffset, len - static_cast<std::size_t>(b::kAttributesOffset));
     for (int i = 0; i < 4; ++i) p[b::kCrcOffset + i] = static_cast<uint8_t>(crc >> (i * 8));
 }
+// ---- Lease mode (CleanerTopicMode::Lease) ----------------------------------------------------------------------------
+namespace rec = rune::protocol::record;
+
+// A lease row's version (its grant's offset): value bytes [4, 12), LE int64; -2 when the value is too short (never an offset).
+int64_t leaseVersion(std::string_view val) noexcept {
+    if (val.size() < rec::kLeaseVersionValueOffset + 8) return -2;
+    uint64_t u = 0;
+    std::memcpy(&u, val.data() + rec::kLeaseVersionValueOffset, 8);   // the host is little-endian (the whole log format is)
+    return static_cast<int64_t>(u);
+}
+
+enum class LeaseKeep : uint8_t { Drop, Keep, AsLatest };
+// Lease mode, after the clean-boundary, rejected and null-key checks.  AsLatest = the caller runs its existing "this is the
+// latest" path (tombstone horizon) with the lease tombstone predicate.
+LeaseKeep leaseKeep(const std::optional<SkimpyOffsetMap::LeaseEntry>& e, uint8_t attrs, std::string_view val,
+                    int64_t offset) noexcept {
+    if (rec::leaseOpOf(attrs) == rec::LeaseOp::Checkpoint) {
+        if (!e) return LeaseKeep::Keep;
+        if (e->checkpointOffset > offset) return LeaseKeep::Drop;           // a newer Checkpoint
+        if (e->latest == SkimpyOffsetMap::kNoRecord) return LeaseKeep::Keep; // no newer row record mapped
+        if (e->liveVersion == SkimpyOffsetMap::kLeaseEnded || e->liveVersion != leaseVersion(val)) return LeaseKeep::Drop;
+        return LeaseKeep::Keep;
+    }
+    if (e && e->latest > offset) {
+        if (e->liveVersion != SkimpyOffsetMap::kLeaseEnded && e->liveVersion == offset) return LeaseKeep::Keep;   // the live grant
+        return LeaseKeep::Drop;
+    }
+    return LeaseKeep::AsLatest;
+}
+
 // D3b: the rewrite's handling of one control batch (shared by every path).
 // Returns true iff the segment's content changed.
 bool rewriteControlBatch(std::vector<uint8_t>& out, const uint8_t* batch, std::size_t len,
@@ -475,6 +507,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
                                            Offset fromOffset, Offset toOffset,
                                            SkimpyOffsetMap& map) {
     prefixBytesRead_ = 0;
+    if (mode_ == CleanerTopicMode::Lease) map.enableLeaseAux();
     TxnCleanState& txn = map.txnState();
     txn.clear();
     if (fromOffset >= toOffset) { txn.finish(toOffset, markerRemovalBound_); map.verdictState().clear(); if (window_) window_->clear(); return -1; }
@@ -518,13 +551,17 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
 
                 bool full = false;
                 if (!isControlBatch(r) && !(isTransactionalBatch(r) && txn.isAborted(r.producerId(), r.baseOffset())))
-                    r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
-                              int64_t offset, int64_t /*ts*/) {
+                    r.forEachRecord([&](std::string_view key, std::string_view val,
+                              int64_t offset, int64_t /*ts*/, uint8_t attrs) {
                     if (full) return;
                     if (offset < from || offset >= toOffset) return;
                     if (key.empty()) return; // null-key: not compactable
                     if (verdicts.isRejected(offset)) return;   // a rejected record is never the latest
-                    if (!map.put(key, offset)) {
+                    bool ok;
+                    if (mode_ == CleanerTopicMode::Plain) ok = map.put(key, offset);
+                    else if (rec::leaseOpOf(attrs) == rec::LeaseOp::Checkpoint) ok = map.putLeaseCheckpoint(key, offset);
+                    else ok = map.putLease(key, offset, leaseVersion(val), rec::isTombstone(attrs, val.size(), {.lease = true}));
+                    if (!ok) {
                         // Map is full — stop the pass.  latestOffset() holds the
                         // highest offset that made it into the map.
                         full = true;
@@ -557,6 +594,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
                                          const std::vector<int64_t>& bases,
                                          Offset fromOffset, Offset toOffset,
                                          OffsetMap& map) {
+    assert(mode_ == CleanerTopicMode::Plain);   // lease mode runs on the SkimpyOffsetMap engines only
     prefixBytesRead_ = 0;
     TxnCleanState& txn = map.txnState();
     txn.clear();
@@ -638,7 +676,7 @@ bool LogCleaner::rewriteSegmentImpl(
     Offset fromOffset, Offset cleanBoundaryOffset,
     int64_t nowNs, int64_t deleteRetentionMs,
     int64_t nowMs, bool* changed, const ProducerTails* tails, const TxnCleanState* txn, VerdictCleanState* verdicts,
-    std::optional<int64_t> nextSegBase)
+    std::optional<int64_t> nextSegBase, const SkimpyOffsetMap* leaseMap)
 {
     if (changed) *changed = false;
     if (damaged_.has_value()) return false;   // uncleanable: nothing read, nothing changed
@@ -898,14 +936,27 @@ bool LogCleaner::rewriteSegmentImpl(
             // clean-prefix-only key not rewritten in the dirty section) is RETAINED
             // — never dropped (no data loss).  For a dirty-range record the map
             // always contains the key, so "absent" implies a clean-prefix-only key.
-            auto latest = getLatest(key);
-            if (latest.has_value() && offset < *latest) {
-                modified = true;
-                return; // superseded by a higher-offset copy in the dirty map — drop
+            std::optional<Offset> latest;
+            if (leaseMap == nullptr) {
+                latest = getLatest(key);
+                if (latest.has_value() && offset < *latest) {
+                    modified = true;
+                    return; // superseded by a higher-offset copy in the dirty map — drop
+                }
+            } else {
+                // Lease mode: the live grant and the live version's Checkpoint survive (leaseKeep).
+                const auto le = leaseMap->getLease(key);
+                switch (leaseKeep(le, attributes, val, offset)) {
+                    case LeaseKeep::Drop:     modified = true; return;
+                    case LeaseKeep::Keep:     keep(); return;
+                    case LeaseKeep::AsLatest: break;
+                }
+                if (le && le->latest != SkimpyOffsetMap::kNoRecord) latest = le->latest;
             }
 
             // This is the latest.  If it's a tombstone, handle delete-horizon.
-            if (isTombstone(val)) {
+            const bool tomb = leaseMap != nullptr ? rec::isTombstone(attributes, val.size(), {.lease = true}) : isTombstone(val);
+            if (tomb) {
                 // CP-8: KIP-534 delete-horizon stamping/dropping.
                 //
                 // Case A: batch already has a horizon stamp (from a prior clean pass).
@@ -929,6 +980,9 @@ bool LogCleaner::rewriteSegmentImpl(
                 }
 
                 // No horizon stamp yet.
+                // Lease mode: the horizon is the cleaner's own stamp only; broker records carry timestamp 0, so the legacy
+                // nowNs path below would drop every lease tombstone at once.
+                if (leaseMap != nullptr && nowMs < 0) { assert(nowMs >= 0); keep(); return; }
                 if (nowMs >= 0) {
                     // CP-8: first time compacting this tombstone — stamp the horizon.
                     // The tombstone is RETAINED in this pass.  It will be dropped
@@ -1044,10 +1098,11 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetM
                                 Offset fromOffset, Offset cleanBoundaryOffset,
                                 int64_t nowNs, int64_t deleteRetentionMs,
                                 int64_t nowMs, std::optional<int64_t> nextSegBase) {
+    assert(mode_ == CleanerTopicMode::Plain);   // lease mode runs on the SkimpyOffsetMap engines only
     return rewriteSegmentImpl(dir, segBase,
         [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
         fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs, nullptr,
-        &map.producerTails(), &map.txnState(), &map.verdictState(), nextSegBase);
+        &map.producerTails(), &map.txnState(), &map.verdictState(), nextSegBase, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,7 +1115,8 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, SkimpyO
     return rewriteSegmentImpl(dir, segBase,
         [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
         fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs, nullptr,
-        &map.producerTails(), &map.txnState(), &map.verdictState(), nextSegBase);
+        &map.producerTails(), &map.txnState(), &map.verdictState(), nextSegBase,
+        mode_ == CleanerTopicMode::Lease ? &map : nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,6 +1125,7 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, SkimpyO
 void LogCleaner::compact(Log& log, OffsetMap& map,
                          Offset firstDirtyOffset, Offset cleanBoundaryOffset,
                          int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs) {
+    assert(mode_ == CleanerTopicMode::Plain);   // lease mode runs on the SkimpyOffsetMap engines only
     const std::string& dir = log.dir();
     rewriteSegmentsRead_ = 0;
     if (damaged_.has_value()) return;   // uncleanable until restart
@@ -1480,7 +1537,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
         bool changed = false;
         rewriteSegmentImpl(dir, b, getLatest, globalDirtyStart, passEnd,
                            nowNs, deleteRetentionMs, nowMs, &changed, &map.producerTails(), &map.txnState(), &map.verdictState(),
-                           successorOf(sealedBases, b));
+                           successorOf(sealedBases, b), mode_ == CleanerTopicMode::Lease ? &map : nullptr);
         if (damaged_.has_value()) break;   // the pass stops at the damaged segment; finished segments stand
 
         // A segment needs a swap enqueue iff its on-disk content changed (records
@@ -1815,15 +1872,28 @@ void LogCleaner::mergeGroupWithMap(
                 // whose key is absent from the map (clean-prefix-only keys).  This
                 // re-cleans the clean prefix [logStart, globalDirtyStart) against
                 // the dirty section — the cross-round convergence fix.
-                auto latest = map.get(key);
-                if (latest.has_value() && offset < *latest) { modified = true; return; }
+                std::optional<Offset> latest;
+                if (mode_ == CleanerTopicMode::Plain) {
+                    latest = map.get(key);
+                    if (latest.has_value() && offset < *latest) { modified = true; return; }
+                } else {
+                    // Lease mode: the live grant and the live version's Checkpoint survive (leaseKeep).
+                    const auto le = map.getLease(key);
+                    switch (leaseKeep(le, attributes, val, offset)) {
+                        case LeaseKeep::Drop:     modified = true; return;
+                        case LeaseKeep::Keep:     keep2(); return;
+                        case LeaseKeep::AsLatest: break;
+                    }
+                    if (le && le->latest != SkimpyOffsetMap::kNoRecord) latest = le->latest;
+                }
 
-                if (isTombstone(val)) {
+                if (mode_ == CleanerTopicMode::Lease ? rec::isTombstone(attributes, val.size(), {.lease = true}) : isTombstone(val)) {
                     const bool pinned = window != nullptr && (window->pinsTombstone(key) || (!latest && offset >= heldFrom_));   // Part 06
                     if (batchHasHorizon) {
                         if (horizonExpired && !pinned) { modified = true; return; }
                         keepWithHorizon2(batchHorizonMs); return;
                     }
+                    if (mode_ == CleanerTopicMode::Lease && nowMs < 0) { assert(nowMs >= 0); keep2(); return; }   // KIP-534 stamp only
                     if (nowMs >= 0) {
                         modified = true;
                         keepWithHorizon2(nowMs + deleteRetentionMs); return;

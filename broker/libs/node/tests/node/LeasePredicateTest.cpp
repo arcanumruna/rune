@@ -444,9 +444,11 @@ TEST(LeasePredicateWorkerRegression, RebuildFoldsLikeLiveRegression) {
         const Snapshot after = snap(r, keys[i].first, keys[i].second);
         EXPECT_TRUE(after == before[i]) << "id " << keys[i].first << " addr " << keys[i].second;
     }
-    EXPECT_FALSE(snap(r, 3, "a3").proj.has_value());
-    EXPECT_FALSE(snap(r, 3, "a3").byAddr.has_value());
-    EXPECT_FALSE(snap(r, 3, "a3").cnt.has_value());
+    const Snapshot b2 = snap(r, 2, "b2");
+    ASSERT_TRUE(b2.proj.has_value());
+    EXPECT_TRUE(containsBytes(*b2.proj, "b2")) << "the update is folded by value";
+    EXPECT_TRUE(b2.byAddr.has_value());
+    EXPECT_FALSE(snap(r, 2, "a2").byAddr.has_value()) << "the update moved the addr index off a2";
 }
 
 TEST(LeasePredicateWorkerRegression, PersistedRebuildFoldsLikeLiveRegression) {
@@ -489,7 +491,7 @@ TEST(LeasePredicateWorkerRegression, PersistedRebuildFoldsLikeLiveRegression) {
         ASSERT_NE(inst, nullptr);
         EXPECT_GT(inst->foldCursor, 0) << "view " << v << " recovered";
     }
-    r.pauseAgent = false;
+    r.pauseAgent = false;   // the old views' queued frames drain now, after recovery, by design
     r.passes(60);
     ASSERT_TRUE(r.driveUntilJudged());
     r.passes(60);
@@ -497,9 +499,11 @@ TEST(LeasePredicateWorkerRegression, PersistedRebuildFoldsLikeLiveRegression) {
         const Snapshot after = snap(r, keys[i].first, keys[i].second);
         EXPECT_TRUE(after == before[i]) << "id " << keys[i].first << " addr " << keys[i].second;
     }
-    EXPECT_FALSE(snap(r, 3, "a3").proj.has_value());
-    EXPECT_FALSE(snap(r, 3, "a3").byAddr.has_value());
-    EXPECT_FALSE(snap(r, 3, "a3").cnt.has_value());
+    const Snapshot b2 = snap(r, 2, "b2");
+    ASSERT_TRUE(b2.proj.has_value());
+    EXPECT_TRUE(containsBytes(*b2.proj, "b2")) << "the update is folded by value";
+    EXPECT_TRUE(b2.byAddr.has_value());
+    EXPECT_FALSE(snap(r, 2, "a2").byAddr.has_value()) << "the update moved the addr index off a2";
 }
 
 TEST(LeasePredicateWorkerRegression, VerdictMemberSeesLeaseTombstoneRegression) {
@@ -593,6 +597,11 @@ TEST(LeasePredicateWorkerRegression, NonLeaseTopicUnchangedRegression) {
     r.promote();
     r.passes(30);
     r.driveUntilFolded(kProj, r.leo());
-    EXPECT_TRUE(rowOf(r, kProj, idKey(2)).has_value()) << "a plain topic never reads lease op bits";
-    EXPECT_TRUE(rowOf(r, kProj, idKey(3)).has_value()) << "a plain topic never reads lease op bits";
+    const auto row2 = rowOf(r, kProj, idKey(2));
+    const auto row3 = rowOf(r, kProj, idKey(3));
+    ASSERT_TRUE(row2.has_value()) << "a plain topic never reads lease op bits";
+    ASSERT_TRUE(row3.has_value()) << "a plain topic never reads lease op bits";
+    EXPECT_GE(std::count(row2->begin(), row2->end(), uint8_t(30)), 1) << "the revoke-bit record upserted its value";
+    EXPECT_GE(std::count(row3->begin(), row3->end(), uint8_t(40)), 1) << "the checkpoint-bit record upserted its value";
+    EXPECT_NE(*row2, *row3);
 }

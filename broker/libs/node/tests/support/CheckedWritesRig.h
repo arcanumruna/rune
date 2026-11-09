@@ -1011,6 +1011,7 @@ public:
         cleaner.setMarkerRemovalBound(replica->cleanerMarkerRemovalBound());
         cleaner.setVerdictBounds(out.bound, markerEnd);
         cleaner.setProducerTailDepth(autoInc_ ? rune::storage::kRetryWindowSize : 1);   // what BrokerNode configures the partition with
+        cleaner.setTopicMode(lease_ ? rune::storage::CleanerTopicMode::Lease : rune::storage::CleanerTopicMode::Plain);   // likewise
         const int64_t previousPassEnd = replica->cleanerProgress();
         cleaner.setPreviousPassEnd(previousPassEnd);
         cleaner.setDeferredInstall(&cleanedSeq_);
@@ -1188,6 +1189,7 @@ private:
         c.replicaLagMaxMs = 1'000'000; c.replicaLagMaxOffset = 1'000'000;
         c.fetchIntervalNs = 1'000'000'000LL; c.isrCheckIntervalNs = 1'000'000'000LL;
         c.maxFetchBytes = 1 << 20; c.pushOnAppend = false;
+        c.leaseTopic = lease_.has_value();   // a restarted partition carries it (the first open() precedes createLeaseTopic)
         replica = std::make_unique<rune::replication::PartitionReplica>(c, rune::replication::Role::Leader, 1, isr_, isr_, log.get(), &transport_);
         worker = std::make_unique<Worker>(0);
         worker->setFilterConfig(filter::FilterConfig{});

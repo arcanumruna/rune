@@ -1339,6 +1339,7 @@ void BrokerNode::buildReplication() {
             // E3 Task 5: forward async-durability tier (0=Leader, 1=Majority, 2=Strict).
             pcfg.durabilityTier = spec->durabilityTier;
             pcfg.producerTailDepth = spec->autoIncrement ? rune::storage::kRetryWindowSize : 1;
+            pcfg.leaseTopic = spec->leaseTopic;
 
             // Determine the transport:
             //
@@ -1527,6 +1528,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         pcfg.durability = static_cast<rune::replication::DurabilityMode>(spec.durability);
         pcfg.durabilityTier = spec.durabilityTier;
         pcfg.producerTailDepth = spec.autoIncrement ? rune::storage::kRetryWindowSize : 1;
+        pcfg.leaseTopic = spec.leaseTopic;
 
         const bool onPerWorkerPlane =
             (topicId >= 0 && !perWorkerReplTransports_.empty());

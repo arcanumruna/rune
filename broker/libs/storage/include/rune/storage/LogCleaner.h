@@ -12,6 +12,11 @@
 
 namespace rune::storage {
 
+/// How a log's records are compacted.  Plain: latest record per key (an empty value is a tombstone).  Lease: a lease topic
+/// (PartitionConfig::leaseTopic) - the latest record per key, the live grant it descends from, and the Checkpoint of the live
+/// version; Revoke / Expire are the tombstones; a lease cleaner's offset map carries an aux array (up to 2x the dedupe budget).
+enum class CleanerTopicMode : uint8_t { Plain, Lease };
+
 /// CP-8: A contiguous group of sealed segments to be coalesced into one
 /// cleaned output segment by groupSegmentsBySize().
 struct SegmentGroup {
@@ -98,6 +103,10 @@ public:
         if (depth <= 1) window_.reset();
         else if (!window_ || window_->depth() != depth) window_.emplace(depth);
     }
+    /// The log's compaction mode (PartitionReplica::leaseTopic); Plain by default.  Lease is honoured by the bounded
+    /// SkimpyOffsetMap engines (produceCleanedRangeBounded / produceCleanedGroupBounded / produceCleanedFileBounded).
+    void setTopicMode(CleanerTopicMode m) noexcept { mode_ = m; }
+    [[nodiscard]] CleanerTopicMode topicMode() const noexcept { return mode_; }
     /// Part 06: the previous pass's cleanedThrough.  When the watermark is held and a map built from it fills below this offset
     /// (the pass would redo the last one), produceCleanedRangeBounded maps the keys from here instead: the pass still compacts
     /// above it, the watermark stays, and a tombstone at or above the watermark whose key that map lacks is kept (its insert may
@@ -422,7 +431,8 @@ private:
                             const ProducerTails* tails = nullptr,
                             const TxnCleanState* txn = nullptr,
                             VerdictCleanState* verdicts = nullptr,
-                            std::optional<int64_t> nextSegBase = std::nullopt);
+                            std::optional<int64_t> nextSegBase = std::nullopt,
+                            const SkimpyOffsetMap* leaseMap = nullptr);
 
     /// Rewrite a single segment, keeping only records whose offset matches the
     /// latest entry in `map` (or is past cleanBoundaryOffset).  Tombstones
@@ -455,6 +465,7 @@ private:
                            int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs,
                            Throttler* throttler, bool* changed,
                            std::optional<int64_t> afterGroupBase = std::nullopt);
+    CleanerTopicMode mode_ = CleanerTopicMode::Plain;
     int64_t producerIdExpirationMs_ = ProducerTails::kDefaultExpirationMs;
     std::optional<ProducerBatchWindow> window_{};   ///< depth > 1 only
     int64_t windowNowMs_ = -1;                       ///< the window's expiry clock: the last produceCleanedRangeBounded's nowMs

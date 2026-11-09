@@ -206,6 +206,8 @@ struct PartitionConfig {
     /// Checked writes Part 06: producer-state batches kept per producer; an autoincrement topic keeps the whole
     /// retry window, any other topic only the latest batch.
     int  producerTailDepth = 1;
+    /// Lease topic: the cleaner compacts it in CleanerTopicMode::Lease (keeps the live grant and the live version's checkpoint).
+    bool leaseTopic = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -1055,6 +1057,7 @@ public:
     /// Log-start-offset: segments entirely below this are deleted. 0 = disabled.
     [[nodiscard]] int64_t     logStartOffset()         const noexcept { return cfg_.logStartOffset; }
     [[nodiscard]] int         producerTailDepth()      const noexcept { return cfg_.producerTailDepth; }
+    [[nodiscard]] bool        leaseTopic()             const noexcept { return cfg_.leaseTopic; }
     /// CP-2: offset up to which the log has already been compacted (cleaned watermark).
     /// Initially 0; advanced by runBoundedCompaction after each segment is cleaned.
     /// Atomic so test threads can poll without a TSan race (cleaner/duty threads write it).

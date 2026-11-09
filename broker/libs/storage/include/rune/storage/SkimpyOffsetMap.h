@@ -30,11 +30,17 @@
 //   Probe: i = (hash & mask_); then i = (i+1) & mask_ until empty or match.
 //   Eviction: none — table is STATIC capacity.  Once full, put() returns false.
 //
+// Lease mode (CleanerTopicMode::Lease): enableLeaseAux() allocates, once and on the cold cleaner thread, a parallel
+// 16-byte-per-slot array (LeaseAux, same index as the table) holding the live grant's version and the key's latest
+// Checkpoint offset.  A lease cleaner therefore uses up to 2x the dedupe byte budget (table + aux).  Plain mode never
+// allocates it.
+//
 // Thread-safety: NOT thread-safe. Intended for single-thread cleaner use.
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
 #include <bit>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -167,6 +173,91 @@ public:
         }
     }
 
+    // --- Lease mode (see the header comment) ---------------------------------
+    /// Per-slot lease state, parallel to table_ (same index).
+    struct LeaseAux { int64_t liveVersion; int64_t checkpointOffset; };   // 16 B
+    /// liveVersion of a key whose latest non-Checkpoint record is a tombstone (or that has none).
+    static constexpr int64_t kLeaseEnded = std::numeric_limits<int64_t>::min();
+    /// The entry offset of a key of which only Checkpoints are mapped.
+    static constexpr Offset  kNoRecord   = -1;
+
+    /// Allocates aux_ (capacity_ entries) if empty; idempotent.  Entries are written on insert: no reset needed.
+    void enableLeaseAux() {
+        if (!aux_) aux_.reset(new LeaseAux[capacity_]);
+    }
+    [[nodiscard]] bool leaseAuxEnabled() const noexcept { return static_cast<bool>(aux_); }
+
+    /// A non-Checkpoint record: like put(); when it inserts or raises the entry's offset it also sets liveVersion
+    /// (= ended ? kLeaseEnded : version).  false = full (as put).
+    bool putLease(std::string_view key, Offset offset, int64_t version, bool ended) noexcept {
+        assert(aux_);
+        if (key.empty()) return true;
+        const uint64_t h = hash(key);
+        std::size_t i = h & mask_;
+        for (;;) {
+            Entry& e = table_[i];
+            if (e.hash == kEmpty) {
+                if (size_ >= maxSlots_) return false;
+                e.hash   = h;
+                e.offset = offset;
+                aux_[i]  = {ended ? kLeaseEnded : version, -1};
+                ++size_;
+                if (offset > latestOffset_) latestOffset_ = offset;
+                return true;
+            }
+            if (e.hash == h) {
+                if (offset > e.offset) {
+                    e.offset = offset;
+                    aux_[i].liveVersion = ended ? kLeaseEnded : version;
+                    if (offset > latestOffset_) latestOffset_ = offset;
+                }
+                return true;
+            }
+            i = (i + 1) & mask_;
+        }
+    }
+
+    /// A Checkpoint: inserts an entry with offset kNoRecord (liveVersion kLeaseEnded, checkpointOffset = offset) when
+    /// absent, else raises checkpointOffset; raises latestOffset_ either way.  false = full.
+    bool putLeaseCheckpoint(std::string_view key, Offset offset) noexcept {
+        assert(aux_);
+        if (key.empty()) return true;
+        const uint64_t h = hash(key);
+        std::size_t i = h & mask_;
+        for (;;) {
+            Entry& e = table_[i];
+            if (e.hash == kEmpty) {
+                if (size_ >= maxSlots_) return false;
+                e.hash   = h;
+                e.offset = kNoRecord;
+                aux_[i]  = {kLeaseEnded, offset};
+                ++size_;
+                if (offset > latestOffset_) latestOffset_ = offset;
+                return true;
+            }
+            if (e.hash == h) {
+                if (offset > aux_[i].checkpointOffset) aux_[i].checkpointOffset = offset;
+                if (offset > latestOffset_) latestOffset_ = offset;
+                return true;
+            }
+            i = (i + 1) & mask_;
+        }
+    }
+
+    struct LeaseEntry { Offset latest; int64_t liveVersion; Offset checkpointOffset; };
+    [[nodiscard]] std::optional<LeaseEntry> getLease(std::string_view key) const noexcept {
+        assert(aux_);
+        if (key.empty()) return std::nullopt;
+        const uint64_t h = hash(key);
+        std::size_t i = h & mask_;
+        for (;;) {
+            const Entry& e = table_[i];
+            if (e.hash == kEmpty) return std::nullopt;
+            if (e.hash == h)      return LeaseEntry{e.offset, aux_[i].liveVersion, aux_[i].checkpointOffset};
+            i = (i + 1) & mask_;
+        }
+    }
+
     /// Number of distinct keys currently held.
     [[nodiscard]] std::size_t size()    const noexcept { return size_; }
     /// Maximum slots before put() returns false.
@@ -259,6 +350,7 @@ private:
     }
 
     std::unique_ptr<Entry[]> table_;
+    std::unique_ptr<LeaseAux[]> aux_;   ///< lease mode only (enableLeaseAux)
     ProducerTails        tails_;
     TxnCleanState        txn_;
     VerdictCleanState    verdict_;
