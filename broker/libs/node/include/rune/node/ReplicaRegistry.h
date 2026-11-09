@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -38,6 +39,9 @@ public:
     void setProcessIncarnation(int64_t inc) noexcept { processIncarnation_ = inc; }
     /// ISR v3 Step 6: this node's storage id (storage.meta), stamped on every replica added from now on.
     void setStorageId(int64_t id) noexcept { storageId_ = id; }
+    /// Election batch: this process's OS boot id (StorageIdentity::osBootId), stamped on every replica added from now on.
+    void setBootId(std::string id) { bootId_ = std::move(id); }
+    [[nodiscard]] const std::string& bootId() const noexcept { return bootId_; }
     /// TEST ONLY (NodeConfig::testHoldFollowerFetchesMs): every replica added from now on emits no follower fetch
     /// until the steady clock reaches `deadlineNs`.
     void setHoldFetchesUntilForTest(int64_t deadlineNs) noexcept { holdFetchesUntilNs_ = deadlineNs; }
@@ -68,6 +72,7 @@ public:
         // incarnation on its FetchRequests (0 = untracked: unit rigs).
         if (processIncarnation_ != 0) replica->setProcessIncarnation(processIncarnation_);
         if (storageId_ != 0) replica->setStorageId(storageId_);   // ISR v3 Step 6
+        if (!bootId_.empty()) replica->setBootId(bootId_);
         if (holdFetchesUntilNs_ != 0) replica->holdFetchesUntilForTest(holdFetchesUntilNs_);
         if (dropInternalIsrUntilNs_ != 0) replica->dropInternalIsrUntilForTest(dropInternalIsrUntilNs_);
         if (lineageIdentity_ != 0) replica->setLineageIdentity(lineageIdentity_);   // E2 C1 residual N1
@@ -308,6 +313,7 @@ private:
     std::vector<uint32_t> freeIds_;
     int64_t processIncarnation_ = 0;   ///< KIP-903 (see setProcessIncarnation)
     int64_t storageId_ = 0;            ///< ISR v3 Step 6 (see setStorageId)
+    std::string bootId_;               ///< Election batch (see setBootId)
     int64_t dropInternalIsrUntilNs_ = 0;   ///< test seam (see setDropInternalIsrUntilForTest)
     int64_t holdFetchesUntilNs_ = 0;   ///< test seam (see setHoldFetchesUntilForTest)
     int64_t lineageIdentity_    = 0;   ///< E2 C1 residual N1

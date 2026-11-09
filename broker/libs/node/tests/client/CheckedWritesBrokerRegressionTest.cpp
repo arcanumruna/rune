@@ -2333,6 +2333,44 @@ uint64_t backfillId(uint64_t i) { return i + i / 7 * 3; }
 
 }  // namespace
 
+// Election batch (F4/F5): after the controller crashes (no restart), a surviving node becomes controller and leads the coordinator
+// partitions -1/-2 within 2 s with the dead node out of their ISR, and InitProducerId completes within 3 s of the crash.
+TEST(CheckedWritesBrokerRegression, ControllerCrashCoordinatorsRecoverWithinBoundsRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    using Clock = std::chrono::steady_clock;
+    Cluster c = startCluster("ele7");
+    const int32_t a = awaitController(c);
+    ASSERT_GT(a, 0);
+    const int32_t seed = a == 1 ? 2 : 1;
+    ASSERT_TRUE(waitFor([&] {
+        for (int32_t t : {-1, -2})
+            for (const int32_t m : {1, 2, 3})
+                if (!leaderHoldsInIsr(c.node(a), t, 0, m)) return false;
+        return true;
+    }, 10s));
+    rc::Client client(patientConfig(c, seed));
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::All;
+    pcfg.lingerUs = 1;
+    pcfg.transactionalId = "ele7";
+    rc::Producer tp = client.producer(pcfg);
+    client.connectAndWait(10s);
+    c.crash(a);
+    const auto t0 = Clock::now();
+    ASSERT_TRUE(waitFor([&] {
+        for (const int32_t n : c.runningNodes()) {
+            if (!c.node(n).isLeader()) continue;
+            for (int32_t t : {-1, -2}) {
+                if (!leaderHoldsInIsr(c.node(n), t, 0, n) || leaderHoldsInIsr(c.node(n), t, 0, a)) return false;
+            }
+            return true;
+        }
+        return false;
+    }, 2s)) << "the coordinators were not led again within 2 s of the controller crash";
+    ASSERT_NO_THROW(tp.initTransactionsAndWait(3s));
+    EXPECT_LT(Clock::now() - t0, 3s) << "InitProducerId after the controller crash";
+}
+
 TEST(CheckedWritesBrokerRegression, AutoIncEndToEndShardRegression) {
     OneBroker b("cw-ai-e2e", OneBroker::Runtime::Shard);
     awaitLevel(b.node());

@@ -1060,6 +1060,28 @@ TEST(ShardModeRegression, StorageFailureHaltsBrokerWithExitCode) {
     node.stop();
 }
 
+// Election fix round 1: a halted storage failure revokes every leader-boot certificate for the rest of this OS boot, so a restart in the
+// same boot vouches for no log.  RED: onStorageFailure_ does not record the storage-failed-boot sentinel.
+TEST(ShardModeRegression, StorageFailureRevokesTheBootCertificateForTheRestartRegression) {
+    TmpDir dir{"failboot"};
+    const auto ports = ShardPorts::discover(1, 1);
+    const auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false);
+    {
+        BrokerNode node{cfg};
+        node.start();
+        EXPECT_EQ(node.bootIdForTest(), rune::node::StorageIdentity::osBootId());
+        HaltCapture halt;
+        node.setHaltHandler(&HaltCapture::handler, &halt);
+        node.raiseStorageFailureForTest(dir.path.string(), EIO);
+        EXPECT_EQ(halt.await(1'000ms), BrokerNode::kExitStorageFailure);
+        node.stop();
+    }
+    BrokerNode restarted{cfg};
+    restarted.start();
+    EXPECT_TRUE(restarted.bootIdForTest().empty()) << "a restart in the same boot vouches for a log after a storage failure";
+    restarted.stop();
+}
+
 TEST(ShardModeRegression, RefusesIoBackendThatCannotSubmit) {
     TmpDir dir{"iobk"};
     const auto ports = ShardPorts::discover(1, 1);

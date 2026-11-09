@@ -1169,6 +1169,10 @@ void BrokerNode::buildReplication() {
         config_.dataDir, std::chrono::duration_cast<std::chrono::nanoseconds>(
                              std::chrono::system_clock::now().time_since_epoch()).count()));
     replicaRegistry_->setStorageId(storage_.id);   // ISR v3 Step 6: stamped next to the incarnation
+    {
+        const std::string boot = StorageIdentity::osBootId();
+        replicaRegistry_->setBootId(StorageIdentity::storageFailedThisBoot(config_.dataDir, boot) ? std::string{} : boot);
+    }
     if (config_.testHoldFollowerFetchesMs > 0)   // TEST-ONLY (B-I8): a member that cannot catch up yet
         replicaRegistry_->setHoldFetchesUntilForTest(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
@@ -1966,6 +1970,8 @@ void BrokerNode::buildWorkerPool() {
 void BrokerNode::onStorageFailure_(const std::string& logDir, int err) {
     if (haltRaised_) return;
     haltRaised_ = true;
+    if (!StorageIdentity::markStorageFailedThisBoot(config_.dataDir, StorageIdentity::osBootId()))
+        spdlog::critical("BrokerNode[{}]: could not record the storage failure in {}", config_.nodeId, config_.dataDir);
     spdlog::critical("BrokerNode[{}]: STORAGE FAILURE — fsync failed on {} (errno={}: {}). "
                      "The log is permanently failed; HALTING the broker (exit {}). Restart "
                      "recovery truncates to the last valid batch; replication re-heals it.",
@@ -4373,6 +4379,7 @@ void BrokerNode::buildCatalog_() {
     if (replicaRegistry_ && replicaRegistry_->processIncarnation() != 0)
         catalogReplica_->setProcessIncarnation(replicaRegistry_->processIncarnation());
     catalogReplica_->setStorageId(storage_.id);   // ISR v3 Step 6
+    if (replicaRegistry_) catalogReplica_->setBootId(replicaRegistry_->bootId());
     if (config_.testHoldFollowerFetchesMs > 0)
         catalogReplica_->holdFetchesUntilForTest(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
@@ -4467,6 +4474,7 @@ void BrokerNode::buildSecurity_() {
     if (replicaRegistry_ && replicaRegistry_->processIncarnation() != 0)
         securityReplica_->setProcessIncarnation(replicaRegistry_->processIncarnation());
     securityReplica_->setStorageId(storage_.id);   // ISR v3 Step 6
+    if (replicaRegistry_) securityReplica_->setBootId(replicaRegistry_->bootId());
     if (config_.testHoldFollowerFetchesMs > 0)
         securityReplica_->holdFetchesUntilForTest(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
