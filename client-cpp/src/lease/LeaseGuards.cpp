@@ -120,13 +120,15 @@ void LeaseGuards::arm(uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq
     Block* b = find_(sid);
     if (b == nullptr || slot >= b->capacity) return;
     GuardEntry& e = b->entries[slot];
-    if (e.gen != gen || e.state == GuardEntry::State::Free) {   // a new lease in the slot
+    if (e.state != GuardEntry::State::Free && newer(e.gen, gen)) return;   // an arm of a lease that already left the slot
+    if (e.state == GuardEntry::State::Free || newer(gen, e.gen)) {   // a new lease in the slot: adopt it
+        killProducers_(e);   // the producers of the old lease are blocked for good, never left bound to a reused block
         e.gen = gen; e.state = GuardEntry::State::Armed; e.armSeq = armSeq; e.atRiskNs = atRiskNs;
-        e.nProducers = 0;
-        for (auto*& p : e.producers) p = nullptr;
         e.nEdge = 0; e.pendEnded = false;
     } else if (e.state == GuardEntry::State::Ended) {
         return;
+    } else if (!newer(armSeq, e.armSeq)) {
+        return;   // the same lease: an older (or the same) arm is a no-op, the newer deadline stays
     } else if (e.state == GuardEntry::State::Tripped) {
         e.armSeq = armSeq; e.atRiskNs = atRiskNs;
         if (atRiskNs > nowNs) {
@@ -141,6 +143,16 @@ void LeaseGuards::arm(uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq
     if (atRiskNs < minArmedNs_) minArmedNs_ = atRiskNs;
 }
 
+void LeaseGuards::killProducers_(GuardEntry& e) noexcept {
+    for (uint32_t i = 0; i < e.nProducers; ++i)
+        if (e.producers[i] != nullptr) {
+            e.producers[i]->failGuarded(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk));
+            e.producers[i]->guardKill();
+            e.producers[i] = nullptr;
+        }
+    e.nProducers = 0;
+}
+
 void LeaseGuards::failProducers_(GuardEntry& e) noexcept {
     for (uint32_t i = 0; i < e.nProducers; ++i)
         if (e.producers[i] != nullptr) e.producers[i]->failGuarded(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk));
@@ -150,9 +162,17 @@ void LeaseGuards::end(uint32_t sid, uint32_t slot, uint32_t gen) {
     Block* b = find_(sid);
     if (b == nullptr || slot >= b->capacity) return;
     GuardEntry& e = b->entries[slot];
-    if (e.gen != gen || e.state == GuardEntry::State::Free || e.state == GuardEntry::State::Ended) return;
-    e.state = GuardEntry::State::Ended;   // blocks the bound producers first ...
-    failProducers_(e);                    // ... then fails what they accepted
+    if (e.state != GuardEntry::State::Free && newer(e.gen, gen)) return;   // the end of a lease that already left the slot
+    if (e.state == GuardEntry::State::Free || newer(gen, e.gen)) {         // ended before anything of it was applied: adopt as Ended
+        killProducers_(e);
+        e.gen = gen; e.state = GuardEntry::State::Ended; e.armSeq = 0; e.atRiskNs = 0;
+        e.nEdge = 0;
+    } else if (e.state == GuardEntry::State::Ended) {
+        return;
+    } else {
+        e.state = GuardEntry::State::Ended;   // blocks the bound producers first ...
+        failProducers_(e);                    // ... then fails what they accepted
+    }
     e.pendEnded = true;
     enlist_(*b, slot);
     flush_(*b);
@@ -163,12 +183,7 @@ OpTarget LeaseGuards::release(uint32_t sid) {
     OpTarget none{};
     if (b == nullptr) return none;
     for (uint32_t s = 0; s < b->capacity; ++s) {
-        GuardEntry& e = b->entries[s];
-        for (uint32_t i = 0; i < e.nProducers; ++i)
-            if (e.producers[i] != nullptr) {
-                e.producers[i]->failGuarded(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk));
-                e.producers[i]->guardKill();
-            }
+        killProducers_(b->entries[s]);
     }
     OpTarget t = b->target;
     b->entries.reset();
@@ -185,17 +200,24 @@ void LeaseGuards::ack(uint32_t sid, uint64_t consumedTotal) {
     flush_(*b);
 }
 
-void LeaseGuards::bind(uint32_t sid, uint32_t slot, uint32_t gen, producer::ProducerImpl& p) {
+void LeaseGuards::refuseBind_(Block& b, uint32_t slot, uint32_t gen, producer::ProducerImpl& p) noexcept {
+    p.guardKill();
+    if (b.posted - b.acked < b.pool) deliver_(b, GuardEvent::BindRefused, slot, gen, 0);
+    else ++droppedBindRefused_;
+}
+
+void LeaseGuards::bind(uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq, int64_t atRiskNs, producer::ProducerImpl& p,
+                       int64_t nowNs) {
     Block* b = find_(sid);
-    if (b == nullptr || slot >= b->capacity) { p.guardKill(); return; }
+    if (b == nullptr || slot >= b->capacity) { p.guardKill(); return; }   // fail closed (the session gates binds on its block)
+    if (p.guardBound()) { refuseBind_(*b, slot, gen, p); return; }        // a producer is bound to at most one guard: blocked for good
     GuardEntry& e = b->entries[slot];
-    if (e.gen != gen || e.state == GuardEntry::State::Free || e.state == GuardEntry::State::Ended ||
-        e.nProducers >= kMaxGuardProducers) {
-        p.guardKill();
-        if (b->posted - b->acked < b->pool) deliver_(*b, GuardEvent::BindRefused, slot, gen, 0);
-        else ++droppedBindRefused_;
+    if (e.state != GuardEntry::State::Free && (newer(e.gen, gen) || (e.gen == gen && e.state == GuardEntry::State::Ended))) {
+        refuseBind_(*b, slot, gen, p);   // the lease already left the slot
         return;
     }
+    arm(sid, slot, gen, armSeq, atRiskNs, nowNs);   // adopts a newer generation; the same lease keeps the newer of the two arms
+    if (e.nProducers >= kMaxGuardProducers) { refuseBind_(*b, slot, gen, p); return; }
     e.producers[e.nProducers++] = &p;
     p.guardAttach(&e, gen);
     if (e.state == GuardEntry::State::Tripped) p.failGuarded(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk));
@@ -218,6 +240,8 @@ void LeaseGuards::unbindProducer(producer::ProducerImpl& p) noexcept {
 }
 
 void LeaseGuards::recomputeMin_() noexcept {
+    // Control-plane cost: runs at most once per armed deadline passing (amortized over a keepalive period) and on release, never per
+    // produce; O(sessions * capacity) there.
     int64_t m = INT64_MAX;
     for (Block& b : blocks_) {
         if (!b.used) continue;

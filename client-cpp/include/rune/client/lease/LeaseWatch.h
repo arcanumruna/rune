@@ -19,7 +19,9 @@
 //
 // Identity is (key, lease_version).  Granted for a held (k, v) is ignored; Granted at another version emits Vanished for the old one, then
 // Granted; Updated / Revoked / Expired for an unknown (k, v) are ignored.  A partition whose subscription breaks (or whose scan is answered
-// with a non-retriable error) is re-run: its live entries are marked unconfirmed, the partition is rescanned and re-subscribed, and when its
+// with a transient non-retriable error) is re-run, after a per-partition exponential backoff (1 ms doubling to a 1 s cap, reset when the
+// partition reaches Live); a DEFINITIVE answer (NotAuthorized, UnknownTopic, InvalidRequest, or the duty thread refusing the request as
+// malformed) fails the watch (failed(), one Failed event): its live entries are marked unconfirmed, the partition is rescanned and re-subscribed, and when its
 // scan ends every entry still unconfirmed is emitted Vanished and removed.  isReady() STAYS true during a re-run (a recipe keeps seeing the
 // old set until the rescan settles; spec 3.3); Ready is emitted once.
 //
@@ -86,7 +88,8 @@ public:
 
     /// Starts the watch (once): up to 16 prefixes (each up to 127 bytes; an empty prefix means every key).  The prefixes are copied in; every
     /// prefix that extends another one is dropped, exact duplicates are kept once.  InvalidArgument: no prefix, too many or too long, already
-    /// started, a closed topic handle or one whose schema layout is unknown.
+    /// started, a closed topic handle or one whose schema layout is unknown, or a topic whose widest key plus lease view row (plus the
+    /// 48-byte ring record header) does not fit the 2048-byte record ring payload (kRecPayload): such a row could never be watched.
     [[nodiscard]] OpResult startFromNow(std::span<const std::span<const uint8_t>> prefixes);
 
     int  doWork(int64_t nowNs);
@@ -95,9 +98,12 @@ public:
     [[nodiscard]] uint64_t resubscribes() const noexcept { return resubscribes_; }
 
     void setHandler(LeaseEventFn fn, void* ctx) noexcept { handler_ = Cb{fn, ctx}; }
-    /// Up to 8 observers (the LeaseSession registers one).  false when full.  An observer must outlive the watch or be removed first.
-    [[nodiscard]] bool addObserver(LeaseEventFn fn, void* ctx) noexcept;
+    /// Up to 8 observers (the LeaseSession registers one).  false when full.  An observer must outlive the watch or be removed first,
+    /// or give a `gone` callback: the watch calls it (owner thread) from its destructor, so the observer can forget the watch.
+    using WatchGoneFn = void (*)(void* ctx, LeaseWatchBase* watch);
+    [[nodiscard]] bool addObserver(LeaseEventFn fn, void* ctx, WatchGoneFn gone = nullptr) noexcept;
     bool removeObserver(void* ctx) noexcept;
+    [[nodiscard]] uint32_t observerCount() const noexcept;   ///< observers registered (tests)
 
     /// Names: -1 when full, after startFromNow, empty/too long, or when another name collides in the index.
     [[nodiscard]] int32_t registerName(std::span<const uint8_t> name);
@@ -116,9 +122,10 @@ public:
     [[nodiscard]] uint64_t scansIssued() const noexcept { return scansIssued_; }
     [[nodiscard]] uint64_t subscriptionsOpened() const noexcept { return subsOpened_; }
     [[nodiscard]] uint64_t reruns() const noexcept { return reruns_; }
+    [[nodiscard]] uint64_t ringOverflows() const noexcept { return ringOverflows_; }   ///< record-ring Overflow markers acted on
 
 private:
-    struct Cb { LeaseEventFn fn = nullptr; void* ctx = nullptr; };
+    struct Cb { LeaseEventFn fn = nullptr; void* ctx = nullptr; WatchGoneFn gone = nullptr; };
     struct PageBound { uint64_t lastHash = 0; int64_t asOf = 0; };
     struct HandoffRec { uint32_t at = 0, keyLen = 0, valLen = 0; int64_t offset = 0, version = 0; uint8_t op = 0; };
 
@@ -147,6 +154,7 @@ private:
         uint32_t                    nextGen = 1;
         uint32_t                    scanSeq = 0;
         bool                        everLive = false;
+        int64_t                     backoffNs = 0;   ///< the next Broken delay (0 = the 1 ms floor); doubles to 1 s, reset when the partition is Live
         // page bounds of this epoch: prefix j's pages are pages[pageBegin[j] .. pageBegin[j] + pageCount[j])
         std::array<uint32_t, kMaxPrefixes> pageBegin{}, pageCount{};
         uint32_t                    pagesUsed = 0;
@@ -236,7 +244,7 @@ private:
     std::array<Cb, kMaxObservers> observers_{};
     Cb                       handler_{};
     bool                     started_ = false, ready_ = false, failed_ = false;
-    uint64_t                 resubscribes_ = 0, scansIssued_ = 0, subsOpened_ = 0, reruns_ = 0;
+    uint64_t                 resubscribes_ = 0, scansIssued_ = 0, subsOpened_ = 0, reruns_ = 0, ringOverflows_ = 0;
     int64_t                  lastNowNs_ = 0;
 };
 

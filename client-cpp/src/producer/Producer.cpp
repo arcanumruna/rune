@@ -346,9 +346,9 @@ SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const 
     return r;
 }
 
-bool Producer::bindGuard(uint32_t sid, uint32_t slot, uint32_t gen) noexcept {
-    if (!impl_ || impl_->guardBound()) return false;
-    return impl_->submitGuardBind(sid, slot, gen);
+bool Producer::bindGuard(uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq, int64_t atRiskNs) noexcept {
+    if (!impl_) return false;   // submitGuardBind refuses a second bind (an issuing-thread flag; guard_ is duty-owned)
+    return impl_->submitGuardBind(sid, slot, gen, armSeq, atRiskNs);
 }
 
 SendResult Producer::trySendLease(int32_t topicId, int32_t partition, std::span<const uint8_t> key,

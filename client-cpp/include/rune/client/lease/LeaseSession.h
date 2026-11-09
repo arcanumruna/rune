@@ -15,7 +15,9 @@
 // Guarded producers: bindProducer(ref, producer) BEFORE the producer's first write to the lease's data, on the thread that writes (the
 // bind travels the producer's ring, FIFO with its writes; a write submitted before the bind is not guarded).  At most 8 producers per
 // lease.  A producer whose lease left the session (lost, removed, revoked, ended) stays blocked for good: bind a new producer to a new
-// lease.  Blocked writes complete DeliveryFailed with errorCode ClientErrorCode::LeaseAtRisk.
+// lease.  A producer is bound to at most one lease, ever: a second bindProducer is refused (InvalidArgument).  bindProducer returns
+// BackPressured until the session's guard block exists (the first doWork after construction): call it again.  Blocked writes
+// complete DeliveryFailed with errorCode ClientErrorCode::LeaseAtRisk.
 #pragma once
 
 #include <rune/client/Client.h>
@@ -41,6 +43,7 @@ enum class LostReason : uint8_t {
     WatchedExpired,
     WatchedVanished,
     SessionRefused,
+    RevokeRefused,   ///< revoke(): the broker could not be asked to revoke (the topic is closed or the key does not fit); the lease expires after its ttl
 };
 
 enum class AtRiskEdge : uint8_t { Entered, Cleared };
@@ -53,9 +56,14 @@ struct LeaseRef {
 };
 
 struct LeaseSessionOptions {
-    uint32_t maxDelayMs = 100;   ///< d: the longest the application may take to act on a callback; ttl/2 + d must stay below ttl - ttl/50
-    uint32_t atRiskNum  = 1;     ///< a lease is at risk atRiskNum/atRiskDen of its ttl after the last answered keepalive was SENT
-    uint32_t atRiskDen  = 2;     ///< 0 < atRiskNum < atRiskDen
+    /// d: the longest the application may take to act on a callback, and the longest an answer to a keepalive may take.  add() refuses a
+    /// lease unless its at-risk offset (min(ttl * atRiskNum / atRiskDen, ttl - ttl/50 - 2d)) is at least ttl/3 + d: the next keepalive
+    /// goes out ttl/3 after a send and its answer may take d, so a healthy lease must never be at risk before it can be renewed.
+    uint32_t maxDelayMs = 100;
+    /// A lease is at risk atRiskNum/atRiskDen of its ttl after the last answered keepalive was SENT.  0 < atRiskNum < atRiskDen and
+    /// 3 * atRiskNum > atRiskDen (the at-risk point lies beyond the keepalive period ttl/3); the constructor throws otherwise.
+    uint32_t atRiskNum  = 1;
+    uint32_t atRiskDen  = 2;
 };
 
 enum class LeaseEntryState : uint8_t { Free, Held, AtRisk, Losing, Revoking };
@@ -89,7 +97,9 @@ public:
     struct Held { Timing t; };
     struct AtRiskS { Timing t; int64_t sinceNs = 0; };
     struct Losing { LostReason reason = LostReason::MarginExpired; bool closeAfter = false; };
-    struct Revoking { bool sent = false; };
+    /// notify: revoke() (fire onLost(RevokeRefused) when the broker cannot be asked); close() and the close-after-lost path do not.
+    /// refused: the revoke was refused for good; the entry waits only for its GuardEnd to be posted, then it is freed.
+    struct Revoking { bool sent = false; bool notify = false; bool refused = false; };
     using State = std::variant<Free, Held, AtRiskS, Losing, Revoking>;
 
     struct Entry {
@@ -104,7 +114,8 @@ public:
         int64_t  ttlNs = 0;
         uint32_t armSeq = 0;
         uint8_t  nProducers = 0;
-        uint8_t  cmdPending = 0;   // bit 0: a GuardArm to repost, bit 1: a GuardEnd to repost
+        uint8_t  cmdPending = 0;   // bit 0: a GuardArm to repost, bit 1: a GuardEnd to repost, bit 2: a revoke to resend
+        int64_t  lastAtRiskNs = 0; // the atRisk deadline of the latest postArm_ CALL (even one that failed): a producer bind carries it
     };
 
     LeaseSessionCore(Client& client, Entry* entries, uint32_t* cand, uint32_t capacity, Callbacks cb, const LeaseSessionOptions& opts);
@@ -121,19 +132,27 @@ public:
     void close();
     [[nodiscard]] bool isClosed() const noexcept { return closed_ && live_ == 0; }
     void onWatchedEnd(int32_t topicId, int32_t partition, std::span<const uint8_t> key, int64_t version, LostReason reason);
-    /// Task 16: registers this session as an observer of `watch` (up to 8 observers per watch): a Revoked / Expired / Vanished event of a
-    /// held (topic, key, version) ends that lease (WatchedRevoked / WatchedExpired / WatchedVanished).  false when the watch has no free slot.
+    /// Task 16: registers this session as an observer of `watch` (up to 8 observers per watch, up to 8 watches per session): a Revoked /
+    /// Expired / Vanished event of a held (topic, key, version) ends that lease (WatchedRevoked / WatchedExpired / WatchedVanished).
+    /// false when the watch or the session has no free slot, or the watch is already observed.  Either side may be destroyed first.
     [[nodiscard]] bool observe(LeaseWatchBase& watch);
     bool unobserve(LeaseWatchBase& watch) noexcept;
+    /// The watch is being destroyed (called by the watch, owner thread): forget it.  Either side may be destroyed first.
+    void onWatchGone(LeaseWatchBase* watch) noexcept;
     int  doWork(int64_t nowNs);
 
     // ---- observers (tests) ----
+    [[nodiscard]] uint32_t observedCount() const noexcept;
     [[nodiscard]] uint32_t liveCount() const noexcept { return live_; }
     [[nodiscard]] LeaseEntryState stateOf(LeaseRef ref) const noexcept;
     [[nodiscard]] uint32_t sessionId() const noexcept { return sid_; }
     [[nodiscard]] bool refused() const noexcept { return refused_; }
     [[nodiscard]] uint64_t requestsSent() const noexcept { return requestsSent_; }
     [[nodiscard]] uint64_t okAnswers() const noexcept { return okAnswers_; }   ///< keepalive entries answered Ok so far
+    /// Producers whose bind the guard refused: each was blocked for good (a second bind of the producer, a lease that already left, a full lease).
+    [[nodiscard]] uint64_t bindRefused() const noexcept { return bindRefused_; }
+    /// Leases whose revoke the topic refused for good (a closed topic, a key the topic cannot revoke): the entry ended, the lease expires by ttl.
+    [[nodiscard]] uint64_t revokeRefused() const noexcept { return revokeRefused_; }
     [[nodiscard]] Completions& queue() noexcept { return cq_; }
 
 private:
@@ -153,6 +172,9 @@ private:
     [[nodiscard]] LeaseRef refOf_(uint32_t slot) const noexcept { return LeaseRef{slot, entries_[slot].gen}; }
     [[nodiscard]] int64_t margin_(const Entry& e, int64_t sentNs) const noexcept;
     [[nodiscard]] int64_t atRiskAt_(const Entry& e, int64_t sentNs) const noexcept;
+    [[nodiscard]] int64_t partNs_(int64_t ttlNs) const noexcept;           ///< ttl * atRiskNum / atRiskDen
+    [[nodiscard]] int64_t atRiskOffsetNs_(int64_t ttlNs) const noexcept;   ///< the at-risk point after a send: min(partNs_, ttl - ttl/50 - 2d)
+    enum class RevokeSend : uint8_t { Sent, Retry, Refused };
     [[nodiscard]] bool postGuard_(detail::HubCommand::Op op, uint32_t slot, uint64_t gen, int64_t b, int64_t c);
     [[nodiscard]] bool postArm_(uint32_t slot, Entry& e, int64_t atRiskNs);
     void   postEnd_(uint32_t slot, Entry& e);
@@ -166,7 +188,10 @@ private:
     void   onRevoked_(const Completion& c);
     void   onEnded_(uint32_t slot);
     void   setPending_(Entry& e, uint8_t bit) noexcept { e.cmdPending |= bit; anyPending_ = true; }
-    bool   sendRevoke_(uint32_t slot, bool closeKind);
+    RevokeSend sendRevoke_(uint32_t slot, bool closeKind);
+    void   issueRevoke_(uint32_t slot);        ///< sends the revoke of a Revoking entry, retries or ends it when refused for good
+    void   refuseRevoke_(uint32_t slot);
+    void   finishRefused_(uint32_t slot);
     void   bestEffortRevoke_(LeaseTopicCore* topic, const uint8_t* key, uint8_t keyLen, int64_t version, uint32_t slot, uint32_t gen);
     int    retryPending_();
     int    timeWork_(int64_t nowNs);
@@ -196,7 +221,10 @@ private:
     bool         posted_ = false;      // a guard command / revoke went out this pass: drain again
     uint64_t     requestsSent_ = 0;
     uint64_t     okAnswers_    = 0;
+    uint64_t     bindRefused_  = 0;
+    uint64_t     revokeRefused_ = 0;
     uint32_t     groupsUsed_ = 0;
+    std::array<LeaseWatchBase*, LeaseWatchBase::kMaxObservers> watches_{};   ///< the watches this session observes (owner thread)
     std::array<Group, kMaxGroups>     groups_{};
     std::array<Request, kMaxRequests> requests_{};
     std::array<rune::protocol::client::LeaseKeepAlive::Entry, kMaxKeepAliveEntries> kaEntries_{};
@@ -219,8 +247,9 @@ public:
 
     /// Starts keeping the lease of `keyRow.key()` alive.  `grantSentNs` is the client-clock time at which the caller SENT the grant (or
     /// the update that produced `version`); `ttlMs` the lease's ttl.  An invalid ref (and *err set) when: the key is outside 1..128
-    /// bytes, ttlMs is 0 or above the topic's max, ttl/2 + d >= ttl - ttl/50, no free slot, 64 groups in use, a topic of another
-    /// client, a closed or refused session.
+    /// bytes or not the topic's key width, ttlMs is 0 or above the topic's max, the at-risk offset is below ttl/3 + d (see
+    /// LeaseSessionOptions), no free slot, 64 groups in use, a topic of another client, a closed or refused session.  The topic must
+    /// outlive the session's leases on it (the topic counts them; its destructor asserts none is left).
     template <class T>
     [[nodiscard]] LeaseRef add(LeaseTopic<T>& topic, const T& keyRow, int64_t version, uint64_t ttlMs, int64_t grantSentNs,
                                OpResult* err = nullptr) {
@@ -248,9 +277,10 @@ public:
         core_.onWatchedEnd(topicId, partition, key, version, reason);
     }
     /// Watches `watch` (a LeaseWatch over a topic whose leases this session keeps): its ends of a held lease are this session's losses.  The
-    /// watch calls the session from its own doWork(), on the thread that owns both; destroy the watch (or unobserve) before the session.
+    /// watch calls the session from its own doWork(), on the thread that owns both; either side may be destroyed first (they forget each other).
     [[nodiscard]] bool observe(LeaseWatchBase& watch) { return core_.observe(watch); }
     bool unobserve(LeaseWatchBase& watch) noexcept { return core_.unobserve(watch); }
+    [[nodiscard]] uint32_t observedCount() const noexcept { return core_.observedCount(); }
     int doWork(int64_t nowNs) { return core_.doWork(nowNs); }
 
     [[nodiscard]] uint32_t liveCount() const noexcept { return core_.liveCount(); }

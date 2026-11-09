@@ -120,8 +120,7 @@ void LeaseTopicCore::setRevokeTemplate(std::span<const uint8_t> row, std::span<c
 OpResult LeaseTopicCore::revokeKey(std::span<const uint8_t> key, int64_t version, const LeaseOptions& opts, CompletionTarget target,
                                    Token token) noexcept {
     if (closed_ || revokeRow_.size() < kMinLeaseRowBytes || revokeRow_.size() > scratch_.size()) return OpResult::InvalidArgument;
-    if (revokeKeyWidth_ == 0 || key.size() != revokeKeyWidth_ || revokeKeyOffset_ + revokeKeyWidth_ > revokeRow_.size())
-        return OpResult::InvalidArgument;
+    if (!revokeKeyFits(key.size())) return OpResult::InvalidArgument;
     std::memcpy(scratch_.data(), revokeRow_.data(), revokeRow_.size());
     std::memcpy(scratch_.data() + revokeKeyOffset_, key.data(), key.size());   // the row's key column must equal the record key
     return write(OpKind::LeaseRevoke, key, revokeRow_.size(), version, opts, target, token);

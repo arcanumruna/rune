@@ -89,7 +89,7 @@ inline constexpr int32_t kMsgTier2Discard  = 6; // #341: a Tier-2 slot whose bui
 inline constexpr int32_t kMsgClaimCreditLost = 7; // #322: a credit claim aborted off its queue's owner thread
 inline constexpr int32_t kMsgDirectClaimAbort = 8; // #656: an Invoker claim aborted / destroyed off its owner thread: the owner rolls it back (payload: the claim's gen, 8 bytes LE, then one byte: 1 = the claim held cq / bq credit)
 
-inline constexpr int32_t kMsgGuardBind = 10; // Task 15: bind this producer to a lease guard slot; payload sid u32, slot u32, gen u32 (LE); applied in FIFO order with the producer's own writes
+inline constexpr int32_t kMsgGuardBind = 10; // Task 15: bind this producer to a lease guard slot; payload sid u32, slot u32, gen u32, armSeq u32, atRiskNs i64 (LE, 24 bytes); applied in FIFO order with the producer's own writes
 
 inline constexpr int32_t kMsgSendLeaseRecord = 9; // Task 14a: SEND_LEASE_RECORD - a lease topic write (key up to 128 bytes; layout below)
 
@@ -1053,8 +1053,10 @@ public:
         /// F8c C7: the handle's §3.3 release (HubCommand::HandleRelease).
         /// Absent (bare rig): no duty side — the handle frees the impl alone.
         detail::HubCommandSink release = nullptr;
-        /// Task 15 (duty side): attach `impl` to guard slot (sid, slot, gen) of the Client's LeaseGuards.
-        void (*guardBind)(void* ctx, ProducerImpl& impl, uint32_t sid, uint32_t slot, uint32_t gen) noexcept = nullptr;
+        /// Task 15 (duty side): attach `impl` to guard slot (sid, slot, gen) of the Client's LeaseGuards; (armSeq, atRiskNs) is the
+        /// arm state of the lease at the time of the bind (checkpoint D H3: the bind carries it, so ring order cannot kill it).
+        void (*guardBind)(void* ctx, ProducerImpl& impl, uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq,
+                          int64_t atRiskNs) noexcept = nullptr;
     };
     /// Set once by Client::producer() before the handle is returned.
     void setHooks(const Hooks& h) noexcept { hooks_ = h; }
@@ -1236,9 +1238,10 @@ public:
     void guardKill() noexcept { guard_ = GuardRef{nullptr, 0, true, true}; }   // blocked for good
     void guardDetach() noexcept { guard_ = GuardRef{}; }
     [[nodiscard]] bool guardBound() const noexcept { return guard_.bound; }
-    /// Issuing side: bind this producer to guard slot (sid, slot, gen).  Ring mode: a kMsgGuardBind ring message, FIFO with
-    /// the producer's writes; Direct mode (the owner is the duty thread): applied at once.  False: the ring refused it.
-    [[nodiscard]] bool submitGuardBind(uint32_t sid, uint32_t slot, uint32_t gen) noexcept;
+    /// Issuing side: bind this producer to guard slot (sid, slot, gen) carrying the lease's arm state (armSeq, atRiskNs).  Ring mode:
+    /// a kMsgGuardBind ring message, FIFO with the producer's writes; Direct mode (the owner is the duty thread): applied at once.
+    /// False: refused (a second bind of this producer, or the ring refused it).
+    [[nodiscard]] bool submitGuardBind(uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq, int64_t atRiskNs) noexcept;
     /// Authentication (D26): every batch IN FLIGHT (already sent, unanswered) completes BrokerError `errorCode`
     /// (SessionRevoked) — the answer the broker's closing session can no longer give.  Records not yet sent
     /// are left to the caller's terminal failure path.  Duty thread.
@@ -2292,6 +2295,9 @@ private:
         bool                      dead  = false;   ///< the guard is gone (session released) or refused the bind: blocked for good
     };
     GuardRef     guard_{};
+    /// Checkpoint D H2: set by the ISSUING (application / writing) thread when it submitted a bind; owned by that thread alone (the
+    /// duty-owned guard_ is never read there).  A producer is bound to at most one guard, ever.
+    bool         guardBindIssued_ = false;
     /// Fails the partition's unsent work (builder, Tier-2) and in-flight batches with `st` / `errorCode`.
     void guardFailPartition_(PartitionState& ps, OpStatus st, uint16_t errorCode) noexcept;
     /// The per-record ack target of AckToken sends: none, the scalar form, or the full-Completion form (one enum, no flags).

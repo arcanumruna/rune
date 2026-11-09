@@ -52,6 +52,7 @@ LeaseSessionCore::LeaseSessionCore(Client& client, Entry* entries, uint32_t* can
     , den_(opts.atRiskDen)
     , cq_(client, queueConfig_(capacity)) {
     if (num_ == 0 || num_ >= den_) throw std::invalid_argument("LeaseSession: need 0 < atRiskNum < atRiskDen");
+    if (3ull * num_ <= den_) throw std::invalid_argument("LeaseSession: need 3 * atRiskNum > atRiskDen (at risk beyond the keepalive period)");
     nextWorkNs_ = INT64_MAX;
     sid_        = cq_.cqRef();
     pool_       = 2u * capacity + kPoolExtra;
@@ -83,9 +84,19 @@ LeaseSessionCore::~LeaseSessionCore() {
         HubCommand rel;
         rel.op     = HubCommand::Op::GuardRelease;
         rel.handle = sid_;
-        for (int i = 0; i < 4096; ++i)
-            if (client_.submitGuardCommand(rel)) break;   // bounded: a full ring drains, a closed client never accepts
+        // A full command ring drains (the duty thread runs on its own): retry under the client's wait idle strategy until accepted or the
+        // client is closed (a closed client never accepts, and its duty thread no longer touches the guard).  In Invoker mode a refusal
+        // can only be a closed client or a non-owner thread, neither of which a retry helps.
+        DefaultWaitIdle idle;
+        while (!client_.submitGuardCommand(rel)) {
+            if (client_.commandsClosed() || client_.invokerMode()) break;
+            idle.idle();
+        }
     }
+    for (LeaseWatchBase*& w : watches_)   // the watches still alive forget this session
+        if (w != nullptr) { (void)w->removeObserver(this); w = nullptr; }
+    for (uint32_t i = 0; i < capacity_; ++i)   // the leases still held leave their topics (see LeaseTopicCore::leaseRef)
+        if (entries_[i].topic != nullptr) { entries_[i].topic->leaseUnref(); entries_[i].topic = nullptr; }
     releasePool_();
 }
 
@@ -126,9 +137,14 @@ int64_t LeaseSessionCore::margin_(const Entry& e, int64_t sentNs) const noexcept
     return satAdd(sentNs, e.ttlNs - e.ttlNs / 50) - dNs_;
 }
 
+int64_t LeaseSessionCore::partNs_(int64_t ttlNs) const noexcept {
+    return static_cast<int64_t>(static_cast<__int128>(ttlNs) * num_ / den_);
+}
+int64_t LeaseSessionCore::atRiskOffsetNs_(int64_t ttlNs) const noexcept {
+    return std::min(partNs_(ttlNs), ttlNs - ttlNs / 50 - 2 * dNs_);
+}
 int64_t LeaseSessionCore::atRiskAt_(const Entry& e, int64_t sentNs) const noexcept {
-    const auto part = static_cast<int64_t>(static_cast<__int128>(e.ttlNs) * num_ / den_);
-    return std::min(satAdd(sentNs, part), margin_(e, sentNs) - dNs_);
+    return std::min(satAdd(sentNs, partNs_(e.ttlNs)), margin_(e, sentNs) - dNs_);
 }
 
 bool LeaseSessionCore::postGuard_(HubCommand::Op op, uint32_t slot, uint64_t gen, int64_t b, int64_t c) {
@@ -144,6 +160,7 @@ bool LeaseSessionCore::postGuard_(HubCommand::Op op, uint32_t slot, uint64_t gen
 }
 
 bool LeaseSessionCore::postArm_(uint32_t slot, Entry& e, int64_t atRiskNs) {
+    e.lastAtRiskNs = atRiskNs;   // recorded even when the post fails and is left pending: a bind carries the latest state
     return postGuard_(HubCommand::Op::GuardArm, slot, e.gen, static_cast<int64_t>(++e.armSeq), atRiskNs);
 }
 
@@ -156,6 +173,7 @@ void LeaseSessionCore::freeEntry_(uint32_t slot) {
     if (e.group >= 0 && groups_[static_cast<std::size_t>(e.group)].refs != 0) --groups_[static_cast<std::size_t>(e.group)].refs;
     e.group      = -1;
     e.st         = Free{};
+    if (e.topic != nullptr) e.topic->leaseUnref();
     e.topic      = nullptr;
     e.nProducers = 0;
     e.cmdPending = 0;
@@ -171,9 +189,10 @@ LeaseRef LeaseSessionCore::add(LeaseTopicCore& topic, std::span<const uint8_t> k
     };
     if (closed_ || refused_ || topic.closed() || &topic.client() != &client_) return fail(OpResult::InvalidArgument);
     if (key.empty() || key.size() > rune::protocol::kMaxLeaseKeyBytes || version < 0) return fail(OpResult::InvalidArgument);
+    if (topic.hasFixedKeyWidth() && !topic.revokeKeyFits(key.size())) return fail(OpResult::InvalidArgument);   // the revoke could never be sent
     if (ttlMs == 0 || ttlMs > topic.spec().maxTtlMs || ttlMs > static_cast<uint64_t>(INT64_MAX / kNsPerMs)) return fail(OpResult::InvalidArgument);
     const auto ttlNs = static_cast<int64_t>(ttlMs) * kNsPerMs;
-    if (ttlNs / 2 + dNs_ >= ttlNs - ttlNs / 50) return fail(OpResult::InvalidArgument);
+    if (atRiskOffsetNs_(ttlNs) < ttlNs / 3 + dNs_) return fail(OpResult::InvalidArgument);   // would flap at-risk before a keepalive can renew it
     uint32_t slot = capacity_;
     for (uint32_t i = 0; i < capacity_; ++i)
         if (std::holds_alternative<Free>(entries_[i].st)) { slot = i; break; }
@@ -198,6 +217,7 @@ LeaseRef LeaseSessionCore::add(LeaseTopicCore& topic, std::span<const uint8_t> k
     e.version    = version;
     e.ttlNs      = ttlNs;
     e.armSeq     = 0;
+    e.lastAtRiskNs = 0;
     e.nProducers = 0;
     e.cmdPending = 0;
     Timing t;
@@ -214,6 +234,7 @@ LeaseRef LeaseSessionCore::add(LeaseTopicCore& topic, std::span<const uint8_t> k
     }
     ++groups_[static_cast<std::size_t>(group)].refs;
     e.st = Held{t};
+    topic.leaseRef();
     ++live_;
     noteWork_(std::min(t.nextSendNs, t.marginNs));
     return LeaseRef{slot, e.gen};
@@ -227,12 +248,42 @@ OpResult LeaseSessionCore::remove(LeaseRef ref) {
     return OpResult::Accepted;
 }
 
-bool LeaseSessionCore::sendRevoke_(uint32_t slot, bool closeKind) {
+LeaseSessionCore::RevokeSend LeaseSessionCore::sendRevoke_(uint32_t slot, bool closeKind) {
     Entry& e = entries_[slot];
     const OpResult r = e.topic->revokeKey(std::span<const uint8_t>(e.key, e.keyLen), e.version, LeaseOptions{}, CompletionTarget(cq_),
                                           revokeToken(closeKind ? kKindClose : kKindBestEffort, slot, e.gen));
-    if (r == OpResult::Accepted) posted_ = true;
-    return r == OpResult::Accepted;
+    if (r == OpResult::Accepted) { posted_ = true; return RevokeSend::Sent; }
+    // InvalidArgument (a closed topic, a key the topic cannot revoke) and Closed never change: permanent.  BackPressured / QueueFull pass.
+    return (r == OpResult::InvalidArgument || r == OpResult::Closed) ? RevokeSend::Refused : RevokeSend::Retry;
+}
+
+void LeaseSessionCore::issueRevoke_(uint32_t slot) {
+    Entry& e = entries_[slot];
+    switch (sendRevoke_(slot, true)) {
+    case RevokeSend::Sent:    std::get<Revoking>(e.st).sent = true; break;
+    case RevokeSend::Retry:   setPending_(e, 4); break;
+    case RevokeSend::Refused: refuseRevoke_(slot); break;
+    }
+}
+
+void LeaseSessionCore::refuseRevoke_(uint32_t slot) {
+    Entry& e = entries_[slot];
+    ++revokeRefused_;
+    e.cmdPending &= static_cast<uint8_t>(~4u);
+    std::get<Revoking>(e.st).refused = true;
+    // The guard's End goes first (it blocks the producers); when it cannot be posted yet the retry frees the entry.
+    if ((e.cmdPending & 2u) != 0) {
+        if (!postGuard_(HubCommand::Op::GuardEnd, slot, e.gen, 0, 0)) { anyPending_ = true; return; }
+        e.cmdPending &= static_cast<uint8_t>(~2u);
+    }
+    finishRefused_(slot);
+}
+
+void LeaseSessionCore::finishRefused_(uint32_t slot) {
+    const bool notify = std::get<Revoking>(entries_[slot].st).notify;
+    const LeaseRef ref{slot, entries_[slot].gen};
+    freeEntry_(slot);   // the lease expires by its ttl
+    if (notify) cb_.lost(cb_.ctx, ref, LostReason::RevokeRefused);
 }
 
 OpResult LeaseSessionCore::revoke(LeaseRef ref) {
@@ -243,10 +294,9 @@ OpResult LeaseSessionCore::revoke(LeaseRef ref) {
         return OpResult::Accepted;
     }
     if (std::holds_alternative<Revoking>(e->st)) return OpResult::Accepted;
-    e->st = Revoking{false};
+    e->st = Revoking{false, true, false};
     postEnd_(ref.slot, *e);
-    if (sendRevoke_(ref.slot, true)) std::get<Revoking>(e->st).sent = true;
-    else setPending_(*e, 4);
+    issueRevoke_(ref.slot);
     return OpResult::Accepted;
 }
 
@@ -260,7 +310,8 @@ OpResult LeaseSessionCore::bindProducer(LeaseRef ref, Producer& producer) {
     Entry* e = resolve_(ref);
     if (e == nullptr || timing_(*e) == nullptr || refused_) return OpResult::InvalidArgument;
     if (!producer.ownedBy(client_) || e->nProducers >= kMaxGuardProducers) return OpResult::InvalidArgument;
-    if (!producer.bindGuard(sid_, ref.slot, e->gen)) return OpResult::InvalidArgument;
+    if (!guardReady_) return OpResult::BackPressured;   // the guard block is not there yet (Reserved not seen): try again after doWork
+    if (!producer.bindGuard(sid_, ref.slot, e->gen, e->armSeq, e->lastAtRiskNs)) return OpResult::InvalidArgument;
     ++e->nProducers;
     return OpResult::Accepted;
 }
@@ -271,10 +322,9 @@ void LeaseSessionCore::close() {
         Entry& e = entries_[slot];
         if (auto* l = std::get_if<Losing>(&e.st)) { l->closeAfter = true; continue; }
         if (timing_(e) == nullptr) continue;
-        e.st = Revoking{false};
+        e.st = Revoking{false, false, false};
         postEnd_(slot, e);
-        if (sendRevoke_(slot, true)) std::get<Revoking>(e.st).sent = true;
-        else setPending_(e, 4);
+        issueRevoke_(slot);
     }
 }
 
@@ -306,8 +356,34 @@ void watchThunk(void* ctx, const LeaseEvent& ev) {
 }
 }  // namespace
 
-bool LeaseSessionCore::observe(LeaseWatchBase& watch) { return watch.addObserver(&watchThunk, this); }
-bool LeaseSessionCore::unobserve(LeaseWatchBase& watch) noexcept { return watch.removeObserver(this); }
+namespace {
+void goneThunk(void* ctx, LeaseWatchBase* watch) { static_cast<LeaseSessionCore*>(ctx)->onWatchGone(watch); }
+}  // namespace
+
+bool LeaseSessionCore::observe(LeaseWatchBase& watch) {
+    std::size_t free = watches_.size();
+    for (std::size_t i = 0; i < watches_.size(); ++i) {
+        if (watches_[i] == &watch) return false;
+        if (watches_[i] == nullptr && free == watches_.size()) free = i;
+    }
+    if (free == watches_.size() || !watch.addObserver(&watchThunk, this, &goneThunk)) return false;
+    watches_[free] = &watch;
+    return true;
+}
+bool LeaseSessionCore::unobserve(LeaseWatchBase& watch) noexcept {
+    for (LeaseWatchBase*& w : watches_)
+        if (w == &watch) { w = nullptr; return watch.removeObserver(this); }
+    return false;
+}
+void LeaseSessionCore::onWatchGone(LeaseWatchBase* watch) noexcept {
+    for (LeaseWatchBase*& w : watches_)
+        if (w == watch) w = nullptr;
+}
+uint32_t LeaseSessionCore::observedCount() const noexcept {
+    uint32_t n = 0;
+    for (const LeaseWatchBase* w : watches_) n += w != nullptr;
+    return n;
+}
 
 // ---------------------------------------------------------------------------------------------------------------------------------
 // The work pass
@@ -363,7 +439,10 @@ void LeaseSessionCore::onGuardEvent_(const Completion& c, int64_t nowNs) {
             if (entries_[s].gen == g && !std::holds_alternative<Free>(entries_[s].st)) freeEntry_(s);
         }
         return;
-    case GuardEvent::BindRefused: return;   // the producer was killed (blocked for good); nothing for the session to undo
+    case GuardEvent::BindRefused:   // the producer was killed (blocked for good): its place in the lease is free again
+        ++bindRefused_;
+        if (slot < capacity_ && entries_[slot].gen == gen && entries_[slot].nProducers > 0) --entries_[slot].nProducers;
+        return;
     default: break;
     }
     if (slot >= capacity_ || entries_[slot].gen != gen) return;   // an event of a lease that left the session
@@ -402,9 +481,8 @@ void LeaseSessionCore::onEnded_(uint32_t slot) {
     Entry& after = entries_[slot];
     if (after.gen != gen || !std::holds_alternative<Losing>(after.st)) return;   // the callback removed it: no revoke
     if (closeAfter || std::get<Losing>(after.st).closeAfter) {
-        after.st = Revoking{false};
-        if (sendRevoke_(slot, true)) std::get<Revoking>(after.st).sent = true;
-        else setPending_(after, 4);
+        after.st = Revoking{false, false, false};
+        issueRevoke_(slot);
         return;
     }
     freeEntry_(slot);
@@ -441,6 +519,12 @@ void LeaseSessionCore::onKeepAlive_(const Completion& c, int64_t nowNs) {
             Entry& e = entries_[req.slot[i]];
             if (Timing* t = timing_(e); t != nullptr && t->inFlightReq == static_cast<int32_t>(r)) {   // missing reply
                 t->inFlightReq = -1;
+                if (c.status == OpStatus::BrokerError && c.errorCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::Throttled)) {
+                    // The client's control table was full: the request never left.  Again soon (the entry's cadence moved on a whole period).
+                    const uint64_t ms = c.aux > 0 ? static_cast<uint64_t>(c.aux) : 0;
+                    const int64_t ns = ms > static_cast<uint64_t>(INT64_MAX / kNsPerMs) ? INT64_MAX : static_cast<int64_t>(ms) * kNsPerMs;
+                    t->nextSendNs = std::min(t->nextSendNs, satAdd(req.sendNs, std::max(e.ttlNs / 12, ns)));
+                }
                 noteWork_(t->nextSendNs);
             }
         }
@@ -495,15 +579,22 @@ int LeaseSessionCore::retryPending_() {
             else if (t == nullptr) e.cmdPending &= ~1u;
         }
         if ((e.cmdPending & 2u) != 0) {
-            if (postGuard_(HubCommand::Op::GuardEnd, slot, e.gen, 0, 0)) { e.cmdPending &= ~2u; ++work; }
+            if (postGuard_(HubCommand::Op::GuardEnd, slot, e.gen, 0, 0)) {
+                e.cmdPending &= ~2u;
+                ++work;
+                if (const auto* r = std::get_if<Revoking>(&e.st); r != nullptr && r->refused) { finishRefused_(slot); continue; }
+            }
         }
         if ((e.cmdPending & 4u) != 0) {
-            if (auto* r = std::get_if<Revoking>(&e.st); r != nullptr && !r->sent && sendRevoke_(slot, true)) {
-                r->sent = true;
+            auto* r = std::get_if<Revoking>(&e.st);
+            if (r == nullptr || r->sent || r->refused) {
                 e.cmdPending &= ~4u;
-                ++work;
-            } else if (r == nullptr || r->sent) {
-                e.cmdPending &= ~4u;
+            } else {
+                switch (sendRevoke_(slot, true)) {
+                case RevokeSend::Sent:    r->sent = true; e.cmdPending &= ~4u; ++work; break;
+                case RevokeSend::Retry:   break;
+                case RevokeSend::Refused: refuseRevoke_(slot); ++work; if (std::holds_alternative<Free>(e.st)) continue; break;
+                }
             }
         }
         any = any || e.cmdPending != 0;

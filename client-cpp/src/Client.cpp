@@ -346,9 +346,9 @@ Client::Client(ClientConfig cfg, const detail::ClientTestOptions& opts)
     // F8c C3: control ops (connect / ping / DDL / listTopics) from app threads.
     agent_.setControlOpFn([this](const uint8_t* rec, std::size_t len) { applyControlOpRecord_(rec, len); });
     leaseGuards_.configure(cfg_.maxLeaseSessions, detail::CompletionSink{&Client::deliverTrampoline_, this});
-    pendingCtl_.reserve(64);
+    pendingCtl_.reserve(kCtlTableCap);   // fixed for the lease ops (applyControlOp_ refuses them when full); cold ops may still grow it
     ctlScratch_.reserve(512);
-    framePool_.reserve(64);
+    framePool_.reserve(kCtlTableCap);
     cqSlots_.reserve(kMaxCqs);
     cqFree_.assign(kMaxCqs, 0);  // FIFO ring of released slots (I3)
     releases_.reserve(16);       // C7: handle releases (cold; grows only on a burst of releases)
@@ -2063,6 +2063,13 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
         completeCtl_(p, OpStatus::BrokerTooOld, ddlNoValue(p.op));
         return;
     }
+    if (pendingCtl_.size() >= kCtlTableCap &&
+        (h.op == OpKind::LeaseKeepAlive || h.op == OpKind::LeaseTimeToLive || h.op == OpKind::ScanLeases)) {
+        // Fixed capacity (no growth, no allocation): a lease op that finds the table full is refused with Throttled, retry-after 1 ms.  Its
+        // owner (a LeaseSession's keepalive, a LeaseWatch's scan) already retries a Throttled answer on its own cadence.
+        completeCtl_(p, OpStatus::BrokerError, ddlNoValue(p.op), 1, static_cast<uint16_t>(rpc::ErrorCode::Throttled));
+        return;
+    }
     ctlScratch_.assign(frame.begin(), frame.end());
     rpc::detail::putLE64(ctlScratch_.data(), 8, machine.sessionId());
     rpc::detail::putLE64(ctlScratch_.data(), 16, p.corrId);
@@ -2146,7 +2153,7 @@ void Client::completeCtl_(PendingCtl& p, OpStatus st, int64_t value, int64_t aux
         p.target.reservedBytes = 48u * (1u + static_cast<uint32_t>(p.multiCount - p.multiAnswered));
     }
     deliver_(p.target, c, payload, ov);
-    if (auto* rp = std::get_if<RoutedCtlPending>(&p.ddl); rp != nullptr && rp->frame.capacity() != 0 && framePool_.size() < 64) {
+    if (auto* rp = std::get_if<RoutedCtlPending>(&p.ddl); rp != nullptr && rp->frame.capacity() != 0 && framePool_.size() < kCtlTableCap) {
         framePool_.push_back(std::move(rp->frame));   // Task 14a: recycle (the pool's capacity is reserved in the ctor)
     }
 }
@@ -6745,8 +6752,10 @@ void Client::applyGuardCommand_(const detail::HubCommand& cmd) {
     }
 }
 
-void Client::guardBindTrampoline_(void* ctx, producer::ProducerImpl& impl, uint32_t sid, uint32_t slot, uint32_t gen) noexcept {
-    static_cast<Client*>(ctx)->leaseGuards_.bind(sid, slot, gen, impl);
+void Client::guardBindTrampoline_(void* ctx, producer::ProducerImpl& impl, uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq,
+                                  int64_t atRiskNs) noexcept {
+    auto* c = static_cast<Client*>(ctx);
+    c->leaseGuards_.bind(sid, slot, gen, armSeq, atRiskNs, impl, c->now());
 }
 
 bool Client::submitGuardCommand(const detail::HubCommand& cmd) {

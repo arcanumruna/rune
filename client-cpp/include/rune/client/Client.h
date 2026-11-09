@@ -1055,6 +1055,8 @@ public:
     /// Task 15: submits a guard command (GuardReserve/Arm/End/Release/Ack) to the duty thread: applied in place on the duty thread, else
     /// through the agent's command ring.  False when the ring is full or closed.
     [[nodiscard]] bool submitGuardCommand(const detail::HubCommand& cmd);
+    /// True once the command ring is closed (the client closed): the duty thread no longer applies guard commands or runs handlers.
+    [[nodiscard]] bool commandsClosed() const noexcept { return agent_.commandRingClosed(); }
     /// LeaseTimeToLive (wire 98).  Completion: OpKind::LeaseTimeToLive, value = version, aux = remainingMs (-1 none), payload =
     /// the 32 LE bytes {grantedTtlMs u64, remainingMs i64, version i64, holder u64}.
     OpResult leaseTimeToLive(int32_t topicId, int32_t partition, std::span<const uint8_t> key, uint32_t timeoutMs,
@@ -2190,7 +2192,8 @@ private:
     void applyHubCommand_(const detail::HubCommand& cmd);
     /// Task 15: GuardReserve/Arm/End/Release/Ack (duty thread).
     void applyGuardCommand_(const detail::HubCommand& cmd);
-    static void guardBindTrampoline_(void* ctx, producer::ProducerImpl& impl, uint32_t sid, uint32_t slot, uint32_t gen) noexcept;
+    static void guardBindTrampoline_(void* ctx, producer::ProducerImpl& impl, uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq,
+                                     int64_t atRiskNs) noexcept;
     /// Task 15: one LeaseKeepAliveResponse frame for the multi-entry pending op at index i.
     void onKeepAliveBatchAnswer_(std::size_t i, const rune::protocol::client::LeaseKeepAliveResponse& r);
     std::vector<uint8_t> batchFrame_;   // leaseKeepAliveBatch's encode buffer (owner thread; grown once)
@@ -2320,6 +2323,8 @@ private:
     static_assert(kClientCorrIdTag == producer::coordcorr::kClientCounterTag,
                   "the coordinator id tag (bit 58) is chosen disjoint from this counter's");
     int64_t                 nextCorrId_ = kClientCorrIdTag | 1;   // duty-owned correlation counter
+    /// The capacity of the pending control table and of the recycled-frame pool (both reserved in the constructor).
+    static constexpr std::size_t kCtlTableCap = 256;
     std::vector<PendingCtl> pendingCtl_;               // ping / define / get, by corrId (linear: cold)
     // Catalog history (F14): this Client's random 64-bit instance id (drawn once
     // at construction, never 0; immutable) and the duty thread's DDL counter.

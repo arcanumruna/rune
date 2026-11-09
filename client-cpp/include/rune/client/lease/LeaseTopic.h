@@ -13,6 +13,8 @@
 // Threading: NOT thread-safe - one owner thread (the Producer's rule).  Move-only.
 #pragma once
 
+#include <cassert>
+
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
 #include <rune/client/TypedTopic.h>
@@ -44,6 +46,22 @@ public:
                    uint32_t opTimeoutMs);
     LeaseTopicCore(LeaseTopicCore&&) noexcept            = default;
     LeaseTopicCore& operator=(LeaseTopicCore&&) noexcept = default;
+    /// The topic must outlive every lease a LeaseSession holds on it (the session keeps a pointer to it): the sessions count their leases
+    /// here (owner thread only) and the destructor asserts none is left.
+    ~LeaseTopicCore() {
+        assert(leaseRefs_.n == 0 && "a LeaseTopic was destroyed while a LeaseSession still holds leases on it");
+    }
+    void leaseRef() noexcept { ++leaseRefs_.n; }
+    void leaseUnref() noexcept { if (leaseRefs_.n != 0) --leaseRefs_.n; }
+    [[nodiscard]] uint32_t leaseRefs() const noexcept { return leaseRefs_.n; }
+
+    /// The topic has a fixed-width key column that a revoke can patch (the schema was readable).
+    [[nodiscard]] bool hasFixedKeyWidth() const noexcept { return revokeKeyWidth_ != 0; }
+    [[nodiscard]] uint32_t revokeKeyWidth() const noexcept { return revokeKeyWidth_; }
+    /// A key of `keySize` bytes can be revoked from the stored template (the check revokeKey applies).
+    [[nodiscard]] bool revokeKeyFits(std::size_t keySize) const noexcept {
+        return revokeKeyWidth_ != 0 && keySize == revokeKeyWidth_ && revokeKeyOffset_ + revokeKeyWidth_ <= revokeRow_.size();
+    }
 
     [[nodiscard]] int32_t topicId() const noexcept { return topicId_; }
     [[nodiscard]] int32_t leaseViewTopicId() const noexcept { return viewTopicId_; }
@@ -105,6 +123,13 @@ public:
                                                 std::chrono::nanoseconds timeout, LeaseTtlInfo* info = nullptr);
 
 private:
+    struct LeaseRefs {   // moved-from reads zero
+        uint32_t n = 0;
+        LeaseRefs() = default;
+        LeaseRefs(LeaseRefs&& o) noexcept : n(o.n) { o.n = 0; }
+        LeaseRefs& operator=(LeaseRefs&& o) noexcept { n = o.n; o.n = 0; return *this; }
+    };
+    LeaseRefs                    leaseRefs_{};
     Client*                      client_ = nullptr;
     Producer                     producer_;
     int32_t                      topicId_        = -1;

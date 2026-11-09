@@ -1899,12 +1899,15 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                 return ControlledAction::CONTINUE;
             }
             if (msgTypeId == kMsgGuardBind) {   // Task 15: in FIFO order with the records before it
-                if (len >= 12 && hooks_.guardBind != nullptr) {
-                    uint32_t sid, slot, gen;
+                if (len >= 24 && hooks_.guardBind != nullptr) {
+                    uint32_t sid, slot, gen, armSeq;
+                    int64_t  atRiskNs;
                     std::memcpy(&sid, p, 4);
                     std::memcpy(&slot, p + 4, 4);
                     std::memcpy(&gen, p + 8, 4);
-                    hooks_.guardBind(hooks_.ctx, *this, sid, slot, gen);
+                    std::memcpy(&armSeq, p + 12, 4);
+                    std::memcpy(&atRiskNs, p + 16, 8);
+                    hooks_.guardBind(hooks_.ctx, *this, sid, slot, gen, armSeq, atRiskNs);
                 }
                 return ControlledAction::CONTINUE;
             }
@@ -4049,20 +4052,25 @@ int ProducerImpl::refuseRingTxn_(int limit) noexcept {
     return n;
 }
 
-bool ProducerImpl::submitGuardBind(uint32_t sid, uint32_t slot, uint32_t gen) noexcept {
-    if (hooks_.guardBind == nullptr) return false;
+bool ProducerImpl::submitGuardBind(uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq, int64_t atRiskNs) noexcept {
+    if (hooks_.guardBind == nullptr || guardBindIssued_) return false;
     if (mode_ == IngressMode::Direct) {
         // Direct ingress: the owner IS the duty thread and appends in place - the bind is applied here, in the owner's own
         // program order with its writes (no ring hop to reorder against).
         if (std::this_thread::get_id() != dutyThreadId_) return false;
-        hooks_.guardBind(hooks_.ctx, *this, sid, slot, gen);
+        guardBindIssued_ = true;
+        hooks_.guardBind(hooks_.ctx, *this, sid, slot, gen, armSeq, atRiskNs);
         return true;
     }
-    uint8_t p[12];
+    uint8_t p[24];
     std::memcpy(p, &sid, 4);
     std::memcpy(p + 4, &slot, 4);
     std::memcpy(p + 8, &gen, 4);
-    return writeToRing(kMsgGuardBind, p, sizeof p);   // FIFO with this producer's records
+    std::memcpy(p + 12, &armSeq, 4);
+    std::memcpy(p + 16, &atRiskNs, 8);
+    if (!writeToRing(kMsgGuardBind, p, sizeof p)) return false;   // FIFO with this producer's records
+    guardBindIssued_ = true;
+    return true;
 }
 
 void ProducerImpl::guardFailPartition_(PartitionState& ps, OpStatus st, uint16_t errorCode) noexcept {

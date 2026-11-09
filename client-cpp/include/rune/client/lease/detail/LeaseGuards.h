@@ -60,13 +60,21 @@ public:
 
     /// GuardReserve.  `target` is the session queue's pinned target.  Delivers Reserved / ReserveFailed.
     void reserve(uint32_t sid, uint32_t capacity, uint32_t pool, const OpTarget& target);
+    /// Wrap-aware order of per-slot generations and arm sequence numbers (both only grow): a is newer than b.
+    [[nodiscard]] static constexpr bool newer(uint32_t a, uint32_t b) noexcept { return static_cast<int32_t>(a - b) > 0; }
+    /// GuardArm.  A stale generation is ignored; a newer one (or a Free slot) is ADOPTED (the producers listed under the old one are
+    /// killed); the same generation applies only with a newer armSeq (an older or equal arm is a no-op).
     void arm(uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq, int64_t atRiskNs, int64_t nowNs);
+    /// GuardEnd.  A stale generation is ignored; a newer one (or a Free slot) is adopted as Ended.
     void end(uint32_t sid, uint32_t slot, uint32_t gen);
     /// GuardRelease: frees the block; returns its pinned target (kNoCqRef cqRef when there was none).
     OpTarget release(uint32_t sid);
     void ack(uint32_t sid, uint64_t consumedTotal);
-    /// Attaches `p` (kMsgGuardBind, duty thread); a refusal kills the producer's guard (blocked for good) and posts BindRefused.
-    void bind(uint32_t sid, uint32_t slot, uint32_t gen, producer::ProducerImpl& p);
+    /// Attaches `p` (kMsgGuardBind, duty thread).  The bind carries the arm state of its lease (armSeq, atRiskNs), so the ring order
+    /// of the hub ring (GuardArm / GuardEnd) and the producer ring (the bind) cannot matter: a newer generation or a Free slot is
+    /// adopted first, then `p` is attached.  A refusal (a producer already bound or dead, a stale or ended generation, a full slot)
+    /// kills the producer's guard (blocked for good) and posts BindRefused.
+    void bind(uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq, int64_t atRiskNs, producer::ProducerImpl& p, int64_t nowNs);
     /// The producer is going away (duty thread).
     void unbindProducer(producer::ProducerImpl& p) noexcept;
     /// Duty cycle, after the agent drain: trips every Armed slot whose deadline passed.  One compare when none is due.
@@ -97,6 +105,10 @@ private:
     void enlist_(Block& b, uint32_t slot) noexcept;
     void flush_(Block& b) noexcept;
     void failProducers_(GuardEntry& e) noexcept;
+    /// Fails and kills (blocks for good) every producer listed under `e`, and empties the list.  Invariant: every producer whose
+    /// guard_.entry points at an entry is listed in it, or is killed.
+    void killProducers_(GuardEntry& e) noexcept;
+    void refuseBind_(Block& b, uint32_t slot, uint32_t gen, producer::ProducerImpl& p) noexcept;
     void recomputeMin_() noexcept;
 
     std::vector<Block> blocks_;

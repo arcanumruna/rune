@@ -20,6 +20,7 @@ namespace rp = rune::protocol;
 constexpr int64_t  kNsPerMs     = 1'000'000;
 constexpr uint32_t kNone        = 0xFFFFFFFFu;
 constexpr uint32_t kRecPayload  = 2048;     // the most key + value bytes one ring record carries
+constexpr int64_t  kMaxBackoffNs = 1000 * kNsPerMs;   // a broken partition re-runs after 1 ms, 2 ms ... up to 1 s
 constexpr uint32_t kRecBytesAvg = 192;      // handoff arena bytes per buffered record
 constexpr uint32_t kMarkerBytes = detail::CompletionRing::completionRecordBytes(0);   // 48
 constexpr uint16_t kKindRecord = 1, kKindOverflow = 2, kKindFatal = 3;
@@ -148,24 +149,34 @@ LeaseWatchBase::LeaseWatchBase(Client& client, detail::LeaseTopicCore& topic, co
 }
 
 LeaseWatchBase::~LeaseWatchBase() {
+    for (Cb& o : observers_)   // the sessions observing this watch forget it first (owner thread; they never call a destroyed watch)
+        if (o.fn != nullptr && o.gone != nullptr) { const Cb c = o; o = Cb{}; c.gone(c.ctx, this); }
     for (Part& pt : parts_)
         if (pt.sub) pt.sub->unsubscribe();
-    for (int i = 0; i < 4'000'000; ++i) {   // capped: a handler of the duty thread holds a pointer to the ring, which is freed after this body
+    // A handler of the duty thread holds a pointer to the ring, which is freed after this body: wait until every subscription is finished,
+    // or the client is closed (its duty thread then runs no handler).  Never a bare spin: the wait idle strategy backs off.
+    DefaultWaitIdle idle;
+    for (;;) {
         bool all = true;
         for (const Part& pt : parts_)
             if (pt.sub && !pt.sub->finished()) { all = false; break; }
-        if (all) break;
+        if (all || client_.commandsClosed()) break;
         if (client_.invokerMode()) (void)client_.doWork();
-        else std::this_thread::yield();
+        else idle.idle();
     }
     parts_.clear();
 }
 
-bool LeaseWatchBase::addObserver(LeaseEventFn fn, void* ctx) noexcept {
+bool LeaseWatchBase::addObserver(LeaseEventFn fn, void* ctx, WatchGoneFn gone) noexcept {
     if (fn == nullptr) return false;
     for (Cb& o : observers_)
-        if (o.fn == nullptr) { o = Cb{fn, ctx}; return true; }
+        if (o.fn == nullptr) { o = Cb{fn, ctx, gone}; return true; }
     return false;
+}
+uint32_t LeaseWatchBase::observerCount() const noexcept {
+    uint32_t n = 0;
+    for (const Cb& o : observers_) n += o.fn != nullptr;
+    return n;
 }
 bool LeaseWatchBase::removeObserver(void* ctx) noexcept {
     for (Cb& o : observers_)
@@ -199,6 +210,10 @@ void LeaseWatchBase::fail_() {
 OpResult LeaseWatchBase::startFromNow(std::span<const std::span<const uint8_t>> prefixes) {
     if (started_ || failed_ || core_.closed() || core_.viewRowLen() == 0) return OpResult::InvalidArgument;
     if (prefixes.empty() || prefixes.size() > kMaxPrefixes) return OpResult::InvalidArgument;
+    // A record of the watched topic travels the ring as key + value: refuse a topic whose widest key and lease row cannot (it would fail
+    // the watch as Fatal at the first record).
+    if (std::size_t{core_.hasFixedKeyWidth() ? core_.revokeKeyWidth() : kMaxKey} + core_.viewRowLen() + kMarkerBytes > kRecPayload)
+        return OpResult::InvalidArgument;
     for (const auto& p : prefixes)
         if (p.size() > kMaxPrefixLen) return OpResult::InvalidArgument;
     std::array<bool, kMaxPrefixes> drop{};
@@ -266,6 +281,7 @@ void LeaseWatchBase::onRingItem_(const Completion& c, std::span<const uint8_t> p
         return;
     }
     case kKindOverflow:
+        ++ringOverflows_;
         if (std::holds_alternative<Scanning>(pt.st)) {
             overflowAt_(pi, c.value);
         } else if (std::holds_alternative<Live>(pt.st)) {   // every earlier record of this subscription was applied by this drain
@@ -302,6 +318,7 @@ void LeaseWatchBase::onScanCompletion_(const Completion& c, std::span<const uint
     switch (c.status) {
     case OpStatus::Closed:
     case OpStatus::ResultTooLarge:
+    case OpStatus::InvalidArgument:   // the duty thread refused the request as malformed: it will be again
         fail_();
         return;
     case OpStatus::Timeout:
@@ -314,6 +331,12 @@ void LeaseWatchBase::onScanCompletion_(const Completion& c, std::span<const uint
             c.errorCode == static_cast<uint16_t>(rp::client::ErrorCode::NotLeader) ||
             c.errorCode == static_cast<uint16_t>(rp::client::ErrorCode::AuthUnavailable)) {
             sp->retryAtNs = lastNowNs_ + kNsPerMs;   // max(1 ms, retry-after): a scan answer carries no retry-after hint
+            return;
+        }
+        if (c.errorCode == static_cast<uint16_t>(rp::client::ErrorCode::NotAuthorized) ||
+            c.errorCode == static_cast<uint16_t>(rp::client::ErrorCode::UnknownTopic) ||
+            c.errorCode == static_cast<uint16_t>(rp::client::ErrorCode::InvalidRequest)) {
+            fail_();   // definitive: a rescan answers the same
             return;
         }
         toBroken_(pi, lastNowNs_);
@@ -366,6 +389,7 @@ void LeaseWatchBase::stepPart_(int32_t p, int64_t nowNs) {
             pt.sub.reset();
             pt.st = Live{};
             ++resubscribes_;
+            pt.backoffNs = 0;
             openSubscription_(p, cursor);
             pt.everLive = true;
         }
@@ -466,8 +490,9 @@ void LeaseWatchBase::scanDone_(int32_t p) {
     if (const auto* ov = std::get_if<Overflowed>(&pt.st)) {
         pt.st = Resubscribing{ov->cursor};
     } else {
-        pt.st       = Live{};
-        pt.everLive = true;
+        pt.st        = Live{};
+        pt.everLive  = true;
+        pt.backoffNs = 0;
     }
 }
 
@@ -476,7 +501,9 @@ void LeaseWatchBase::toBroken_(int32_t p, int64_t nowNs) {
     pt.curGen = 0;
     pt.hn = pt.hbytes = 0;
     if (pt.sub && !pt.sub->finished()) pt.sub->unsubscribe();
-    pt.st = Broken{nowNs + kNsPerMs};
+    const int64_t wait = pt.backoffNs < kNsPerMs ? kNsPerMs : pt.backoffNs;
+    pt.backoffNs = std::min(wait * 2, kMaxBackoffNs);
+    pt.st = Broken{nowNs + wait};
 }
 
 void LeaseWatchBase::startRerun_(int32_t p) {

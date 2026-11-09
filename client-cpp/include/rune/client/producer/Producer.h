@@ -807,7 +807,7 @@ public:
 
     /// Internal (Task 15; LeaseSession::bindProducer): binds this producer to a lease-session guard slot.  The bind travels the producer's own
     /// ring (FIFO with its writes) or, Direct ingress, is applied in place.  False: no impl, the ring refused it, or it is already bound.
-    [[nodiscard]] bool bindGuard(uint32_t sid, uint32_t slot, uint32_t gen) noexcept;
+    [[nodiscard]] bool bindGuard(uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq, int64_t atRiskNs) noexcept;
 
     /// Send one record with `intent` and wait for its verdict: the Send completion, unchanged (status Ok with
     /// value = the record's offset; BrokerError with errorCode 56 / 57 and constraintIdOf() for a refused intent;

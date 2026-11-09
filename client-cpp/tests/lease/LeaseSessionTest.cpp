@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -194,10 +195,11 @@ struct SRig {
         if (makeSession) makeSessionNow(maxDelayMs);
         t0 = g_now;
     }
-    void makeSessionNow(uint32_t maxDelayMs = 100) {
+    void makeSessionNow(uint32_t maxDelayMs = 100, bool settleNow = true) {
         rc::LeaseSessionOptions o;
         o.maxDelayMs = maxDelayMs;
         session = std::make_unique<Session>(*client, OnLostF{&cb}, OnRiskF{&cb}, o);
+        if (settleNow) settle(4);   // the guard block's Reserved answer reaches the session (bindProducer is BackPressured before it)
     }
     ~SRig() {
         session.reset();
@@ -318,6 +320,10 @@ TEST(LeaseSessionRegression, BatchingPerTopicPartitionRegression) {
     // a second lease topic (another topic id) on the same client
     r.gw.schemaTopicId = 2;
     auto topicB = r.openTopic();
+    struct SessionFirst {   // the topic must outlive the session's leases on it
+        SRig<64>& rig;
+        ~SessionFirst() { rig.session.reset(); }
+    } sessionFirst{r};
     r.gw.kaAutoOk = true;
     const int64_t t0 = g_now;
     std::vector<std::set<uint64_t>> perPart[2];
@@ -387,15 +393,15 @@ TEST(LeaseSessionRegression, SpreadNotBurstyRegression) {
 
 TEST(LeaseSessionRegression, MaxDelayValidationRegression) {
     {
-        SRig<4> r(invokerCfg(5007, 5008), 1, /*maxDelayMs=*/479);
+        SRig<4> r(invokerCfg(5007, 5008), 1, /*maxDelayMs=*/166);
         rc::OpResult err = rc::OpResult::Accepted;
-        EXPECT_NE(r.add(1, 5, 1000, 0, &err).slot, 0xFFFFFFFFu) << "500 + 479 < 980";
+        EXPECT_NE(r.add(1, 5, 1000, 0, &err).slot, 0xFFFFFFFFu) << "at-risk offset 500 >= ttl/3 + d = 333.33 + 166";
         EXPECT_EQ(err, rc::OpResult::Accepted);
     }
     {
-        SRig<4> r(invokerCfg(5009, 5010), 1, /*maxDelayMs=*/480);
+        SRig<4> r(invokerCfg(5009, 5010), 1, /*maxDelayMs=*/167);
         rc::OpResult err = rc::OpResult::Accepted;
-        EXPECT_EQ(r.add(1, 5, 1000, 0, &err).slot, 0xFFFFFFFFu) << "500 + 480 >= 980";
+        EXPECT_EQ(r.add(1, 5, 1000, 0, &err).slot, 0xFFFFFFFFu) << "at-risk offset 500 < ttl/3 + d = 333.33 + 167";
         EXPECT_EQ(err, rc::OpResult::InvalidArgument);
         EXPECT_EQ(r.session->liveCount(), 0u);
     }
@@ -413,12 +419,14 @@ TEST(LeaseSessionRegression, MaxDelayValidationRegression) {
     EXPECT_EQ(r.session->add(r.topic->core(), wide, 5, 3000, g_now, &err).slot, 0xFFFFFFFFu);   // 129-byte key
     EXPECT_EQ(err, rc::OpResult::InvalidArgument);
     std::vector<uint8_t> k128(128, 7);
-    EXPECT_NE(r.session->add(r.topic->core(), k128, 5, 3000, g_now, &err).slot, 0xFFFFFFFFu);   // 128 is fine
+    err = rc::OpResult::Accepted;
+    EXPECT_EQ(r.session->add(r.topic->core(), k128, 5, 3000, g_now, &err).slot, 0xFFFFFFFFu) << "128 bytes is not the topic's 8-byte key width";
+    EXPECT_EQ(err, rc::OpResult::InvalidArgument);
     (void)k0;
     // slot overflow: Capacity 4
-    for (uint64_t id = 1; id <= 3; ++id) EXPECT_NE(r.add(id).slot, 0xFFFFFFFFu);
+    for (uint64_t id = 1; id <= 4; ++id) EXPECT_NE(r.add(id).slot, 0xFFFFFFFFu);
     err = rc::OpResult::Accepted;
-    EXPECT_EQ(r.add(4, 5, 3000, 0, &err).slot, 0xFFFFFFFFu) << "the 5th add: no free slot";
+    EXPECT_EQ(r.add(5, 5, 3000, 0, &err).slot, 0xFFFFFFFFu) << "the 5th add: no free slot";
     EXPECT_EQ(err, rc::OpResult::InvalidArgument);
     // the 65th group (64 groups = 64 distinct (topic, partition) pairs)
     SRig<100> g(invokerCfg(5013, 5014), 128);
@@ -533,7 +541,8 @@ TEST(LeaseSessionRegression, OnLostEachTriggerRegression) {
 TEST(LeaseSessionRegression, SessionRefusedOnLostRegression) {
     auto cfg = invokerCfg(5017, 5018);
     cfg.maxLeaseSessions = 0;   // the duty side has no block for this session
-    SRig<4> r(cfg);
+    SRig<4> r(cfg, 1, 100, /*makeSession=*/false);
+    r.makeSessionNow(100, /*settleNow=*/false);   // the refusal is not seen yet: add() still accepts
     rc::OpResult err = rc::OpResult::Accepted;
     ASSERT_NE(r.add(1, 5, 3000, 0, &err).slot, 0xFFFFFFFFu);
     r.settle();
@@ -1219,4 +1228,449 @@ TEST(LeaseSessionRegression, GuardEventPoolCoalesceRegression) {
     EXPECT_LT(evs.size(), 40u) << "the surplus was coalesced";
     cmd(rc::detail::HubCommand::Op::GuardRelease, 0);
     r.client->doWork();
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Checkpoint D: the guard invariants (H1 / H2 / H3), revoke refusal (M1), flapping parameters (M3)
+// ---------------------------------------------------------------------------------------------------------------------------
+
+// H1: a producer bound to a lease whose slot is reused by a new lease is blocked for GOOD.  Every producer whose guard entry points
+// into a block is listed in that entry or killed, so a later session's block (same address, generation 1 again) cannot unblock it.
+TEST(LeaseSessionRegression, ReusedSlotKeepsOldProducerBlockedRegression) {
+    SRig<4> r(invokerCfg(5909, 5910));
+    rc::Producer p = r.client->testProducerWithRingCap(guardedCfg(), 64 * 1024);
+    awaitProducerId(r, p);
+    rc::Completions pq(*r.client);
+    const rc::TopicHandle topic{1, 1};
+    const auto a = r.add(1);
+    ASSERT_EQ(r.session->bindProducer(a, p), rc::OpResult::Accepted);
+    r.settle();
+    ASSERT_EQ(r.session->remove(a), rc::OpResult::Accepted);
+    r.settle();
+    const auto b = r.add(2);
+    ASSERT_EQ(b.slot, a.slot);
+    r.settle();
+    Drain d;
+    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal, pq, 1), rc::SendResult::Ok);
+    p.flush();
+    r.settle(30);
+    d.run(pq);
+    ASSERT_EQ(d.failed, 1);
+    r.session.reset();
+    r.makeSessionNow();
+    r.settle();
+    const auto c = r.add(3);
+    ASSERT_NE(c.slot, 0xFFFFFFFFu);
+    r.settle();
+    const std::size_t frames = r.gw.produceFrameBytes.size();
+    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal, pq, 2), rc::SendResult::Ok);
+    p.flush();
+    r.settle(30);
+    d.run(pq);
+    EXPECT_EQ(r.gw.produceFrameBytes.size(), frames) << "the old lease's producer stays blocked for good";
+    EXPECT_EQ(d.failed, 2);
+}
+
+// H2: a producer is bound to at most one guard.  The issuing side refuses the second bind (without reading duty-owned state) ...
+TEST(LeaseSessionRegression, SecondBindRefusedRegression) {
+    SRig<4> r(invokerCfg(5911, 5912));
+    rc::Producer p = r.client->testProducerWithRingCap(guardedCfg(), 64 * 1024);
+    awaitProducerId(r, p);
+    rc::Completions pq(*r.client);
+    const rc::TopicHandle topic{1, 1};
+    const auto a = r.add(1);
+    const auto b = r.add(2);
+    ASSERT_EQ(r.session->bindProducer(a, p), rc::OpResult::Accepted);
+    EXPECT_EQ(r.session->bindProducer(b, p), rc::OpResult::InvalidArgument) << "already bound to a lease";
+    r.settle();
+    ASSERT_EQ(r.session->remove(a), rc::OpResult::Accepted);
+    r.settle();
+    Drain d;
+    const std::size_t frames = r.gw.produceFrameBytes.size();
+    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal, pq, 1), rc::SendResult::Ok);
+    p.flush();
+    r.settle(30);
+    d.run(pq);
+    EXPECT_EQ(r.gw.produceFrameBytes.size(), frames) << "the first lease's end blocks the producer";
+    EXPECT_EQ(d.failed, 1);
+}
+
+namespace {
+
+/// A bare LeaseGuards (no Client): its events are recorded, producers are bare ProducerImpls.
+struct BareGuards {
+    rc::detail::LeaseGuards guards;
+    std::vector<std::pair<rc::detail::GuardEvent, uint32_t>> events;   // (event, gen)
+    static void sink(void* ctx, const rc::detail::OpTarget&, const rc::Completion& c, std::span<const uint8_t>) noexcept {
+        static_cast<BareGuards*>(ctx)->events.emplace_back(static_cast<rc::detail::GuardEvent>(c.reserved0 & 0xFFu), static_cast<uint32_t>(c.aux));
+    }
+    static constexpr uint32_t kSid = 7;
+    explicit BareGuards(uint32_t capacity = 2) {
+        guards.configure(1, rc::detail::CompletionSink{&BareGuards::sink, this});
+        rc::detail::OpTarget t;
+        guards.reserve(kSid, capacity, 64, t);
+    }
+    [[nodiscard]] int count(rc::detail::GuardEvent e) const {
+        return static_cast<int>(std::count_if(events.begin(), events.end(), [&](const auto& x) { return x.first == e; }));
+    }
+};
+rc::ProducerConfig bareProducerCfg() {
+    rc::ProducerConfig c;
+    c.acks = rc::Acks::None;
+    c.lingerUs = 0;
+    c.batchBytes = 64 * 1024;
+    c.maxInFlight = 8;
+    return c;
+}
+constexpr int64_t kFar = INT64_MAX / 2;
+
+}  // namespace
+
+// ... and the duty side kills a producer that is bound or dead already (the issuing flag bypassed).
+TEST(LeaseSessionRegression, DutySideDoubleBindKillsRegression) {
+    BareGuards g;
+    rune::client::producer::ProducerImpl p(bareProducerCfg());
+    g.guards.arm(BareGuards::kSid, 0, 1, 1, kFar, 0);
+    g.guards.arm(BareGuards::kSid, 1, 1, 1, kFar, 0);
+    g.guards.bind(BareGuards::kSid, 0, 1, 1, kFar, p, 0);
+    ASSERT_TRUE(p.guardBound());
+    ASSERT_FALSE(p.guardBlocks_());
+    EXPECT_EQ(g.count(rc::detail::GuardEvent::BindRefused), 0);
+    g.guards.bind(BareGuards::kSid, 1, 1, 1, kFar, p, 0);   // the same producer again
+    EXPECT_TRUE(p.guardBlocks_()) << "a second bind kills the producer: blocked for good";
+    EXPECT_EQ(g.count(rc::detail::GuardEvent::BindRefused), 1);
+    g.guards.unbindProducer(p);
+}
+
+namespace {
+// The five events of the H3 table: the hub ring carries Arm(g1), End(g1), Arm(g2) in that order; the producer ring carries the binds.
+enum class Ev { Arm1, End1, Arm2, Bind1, Bind2 };
+}
+
+// H3: the bind carries the arm state of its lease, so the order in which the two rings are drained cannot kill a correctly bound producer.
+TEST(LeaseGuardOrderRegression, EveryRingInterleavingRegression) {
+    const Ev hub[3] = {Ev::Arm1, Ev::End1, Ev::Arm2};
+    const Ev prod[2] = {Ev::Bind1, Ev::Bind2};
+    int orders = 0;
+    for (unsigned mask = 0; mask < 32; ++mask) {
+        if (__builtin_popcount(mask) != 2) continue;   // which 2 of the 5 positions are binds
+        ++orders;
+        std::vector<Ev> seq;
+        int h = 0, pi = 0;
+        for (int i = 0; i < 5; ++i) seq.push_back(((mask >> i) & 1u) != 0 ? prod[pi++] : hub[h++]);
+        SCOPED_TRACE("mask " + std::to_string(mask));
+        BareGuards g;
+        rune::client::producer::ProducerImpl p1(bareProducerCfg()), p2(bareProducerCfg());
+        bool end1 = false, g2 = false, bound1 = false, bound2 = false;
+        constexpr uint32_t S = BareGuards::kSid;
+        for (const Ev e : seq) {
+            switch (e) {
+            case Ev::Arm1:  g.guards.arm(S, 0, 1, 3, 100, 0); break;   // lease 1: armSeq 3, a near deadline (a stale arm applied to lease 2 would trip it)
+            case Ev::End1:  g.guards.end(S, 0, 1); end1 = true; break;
+            case Ev::Arm2:  g.guards.arm(S, 0, 2, 1, kFar, 0); g2 = true; break;
+            case Ev::Bind1: g.guards.bind(S, 0, 1, 3, 100, p1, 0); bound1 = true; break;
+            case Ev::Bind2: g.guards.bind(S, 0, 2, 1, kFar, p2, 0); bound2 = true; g2 = true; break;
+            }
+            if (bound1) {
+                ASSERT_TRUE(p1.guardBound());
+                EXPECT_EQ(p1.guardBlocks_(), end1 || g2) << "a producer of lease 1 is blocked once lease 1 ended or lease 2 arrived";
+            }
+            if (bound2) {
+                ASSERT_TRUE(p2.guardBound());
+                EXPECT_FALSE(p2.guardBlocks_()) << "the producer of the live lease 2 is never killed by ring order";
+            }
+        }
+        EXPECT_TRUE(p1.guardBlocks_());
+        EXPECT_FALSE(p2.guardBlocks_());
+        EXPECT_EQ(g.guards.testState(S, 0), static_cast<int>(rc::detail::GuardEntry::State::Armed)) << "lease 2 owns the slot, Armed";
+        EXPECT_EQ(g.guards.trip(1000), 0) << "no stale deadline of lease 1 leaked into lease 2";
+        g.guards.unbindProducer(p1);
+        g.guards.unbindProducer(p2);
+    }
+    EXPECT_EQ(orders, 10);
+}
+
+// An older arm (lower armSeq) of the same lease never moves the deadline, in either direction.
+TEST(LeaseGuardOrderRegression, StaleArmIgnoredRegression) {
+    constexpr uint32_t S = BareGuards::kSid;
+    {
+        BareGuards g;
+        g.guards.arm(S, 0, 1, 1, 100, 0);
+        g.guards.arm(S, 0, 1, 2, 1000, 0);
+        g.guards.arm(S, 0, 1, 1, 100, 0);   // the older arm arrives late: the later deadline stays
+        EXPECT_EQ(g.guards.trip(500), 0);
+        EXPECT_EQ(g.guards.testState(S, 0), static_cast<int>(rc::detail::GuardEntry::State::Armed));
+    }
+    {
+        BareGuards g;
+        g.guards.arm(S, 0, 1, 2, 100, 0);
+        g.guards.arm(S, 0, 1, 1, 1000, 0);   // an older arm with a later deadline cannot extend it
+        EXPECT_EQ(g.guards.trip(500), 1);
+        EXPECT_EQ(g.guards.testState(S, 0), static_cast<int>(rc::detail::GuardEntry::State::Tripped));
+    }
+    {   // wrap-aware: seq 0xFFFFFFFF is older than 1 after the wrap
+        BareGuards g;
+        g.guards.arm(S, 0, 1, 0xFFFFFFFFu, 1000, 0);
+        g.guards.arm(S, 0, 1, 1, 2000, 0);
+        g.guards.arm(S, 0, 1, 0xFFFFFFFFu, 100, 0);
+        EXPECT_EQ(g.guards.trip(1500), 0) << "deadline 2000 stays";
+        EXPECT_EQ(g.guards.trip(2500), 1);
+    }
+}
+
+// M1: a revoke the topic refuses for good (a closed topic) ends the entry; close() must not hang on a revoke that can never be sent.
+TEST(LeaseSessionRegression, CloseAfterTopicCloseClosesRegression) {
+    SRig<4> r(invokerCfg(5913, 5914));
+    ASSERT_NE(r.add(1).slot, 0xFFFFFFFFu);
+    r.topic->close();
+    r.session->close();
+    const int64_t end = g_now + 20'000 * kMs;
+    for (int i = 0; i < 400 && g_now < end && !r.session->isClosed(); ++i) r.at(g_now + 50 * kMs);
+    EXPECT_TRUE(r.session->isClosed());
+    EXPECT_EQ(r.session->core().revokeRefused(), 1u);
+    EXPECT_TRUE(r.cb.lost.empty()) << "close() fires no callback";
+    EXPECT_EQ(r.session->liveCount(), 0u);
+}
+
+TEST(LeaseSessionRegression, RevokeAfterTopicCloseLostRegression) {
+    SRig<4> r(invokerCfg(5915, 5916));
+    const auto ref = r.add(1);
+    ASSERT_NE(ref.slot, 0xFFFFFFFFu);
+    r.topic->close();
+    ASSERT_EQ(r.session->revoke(ref), rc::OpResult::Accepted);
+    r.settle();
+    ASSERT_EQ(r.cb.lost.size(), 1u);
+    EXPECT_EQ(r.cb.lost[0].why, rc::LostReason::RevokeRefused);
+    EXPECT_EQ(r.cb.lost[0].ref, ref);
+    EXPECT_EQ(r.session->stateOf(ref), rc::LeaseEntryState::Free);
+    EXPECT_EQ(r.session->liveCount(), 0u);
+    EXPECT_EQ(r.session->core().revokeRefused(), 1u);
+}
+
+TEST(LeaseSessionRegression, AddWrongKeyWidthRegression) {
+    SRig<4> r(invokerCfg(5917, 5918));
+    for (const std::size_t n : {std::size_t{1}, std::size_t{7}, std::size_t{9}, std::size_t{128}}) {
+        std::vector<uint8_t> k(n, 3);
+        rc::OpResult err = rc::OpResult::Accepted;
+        EXPECT_EQ(r.session->add(r.topic->core(), k, 5, 3000, g_now, &err).slot, 0xFFFFFFFFu) << n;
+        EXPECT_EQ(err, rc::OpResult::InvalidArgument) << n;
+    }
+    EXPECT_EQ(r.session->liveCount(), 0u);
+    std::vector<uint8_t> ok(8, 3);
+    rc::OpResult err = rc::OpResult::Accepted;
+    EXPECT_NE(r.session->add(r.topic->core(), ok, 5, 3000, g_now, &err).slot, 0xFFFFFFFFu);
+    EXPECT_EQ(err, rc::OpResult::Accepted);
+}
+
+// M3: add() refuses parameters that would flap at-risk: the at-risk offset must be at least ttl/3 + d (the next keepalive goes ttl/3
+// after a send and its answer may take d).
+TEST(LeaseSessionRegression, AddRefusesFlappingParamsRegression) {
+    {
+        SRig<4> r(invokerCfg(5919, 5920), 1, /*maxDelayMs=*/400);
+        rc::OpResult err = rc::OpResult::Accepted;
+        EXPECT_EQ(r.add(1, 5, 1000, 0, &err).slot, 0xFFFFFFFFu) << "ttl 1000, d 400: offset 500 < 333 + 400";
+        EXPECT_EQ(err, rc::OpResult::InvalidArgument);
+    }
+    {
+        SRig<4> r(invokerCfg(5921, 5922), 1, /*maxDelayMs=*/100);
+        rc::OpResult err = rc::OpResult::Accepted;
+        EXPECT_NE(r.add(1, 5, 1000, 0, &err).slot, 0xFFFFFFFFu);
+        EXPECT_EQ(err, rc::OpResult::Accepted);
+    }
+    {   // the exact boundary: ttl 3000, offset 1500 == ttl/3 + d = 1000 + 500
+        SRig<4> r(invokerCfg(5923, 5924), 1, /*maxDelayMs=*/500);
+        rc::OpResult err = rc::OpResult::Accepted;
+        EXPECT_NE(r.add(1, 5, 3000, 0, &err).slot, 0xFFFFFFFFu) << "offset == ttl/3 + d is accepted";
+        EXPECT_EQ(err, rc::OpResult::Accepted);
+    }
+    {
+        SRig<4> r(invokerCfg(5925, 5926), 1, /*maxDelayMs=*/501);
+        rc::OpResult err = rc::OpResult::Accepted;
+        EXPECT_EQ(r.add(1, 5, 3000, 0, &err).slot, 0xFFFFFFFFu) << "one ms more is refused";
+        EXPECT_EQ(err, rc::OpResult::InvalidArgument);
+    }
+    // the constructor: the at-risk point must lie beyond the keepalive period
+    SRig<4> r(invokerCfg(5927, 5928), 1, 100, /*makeSession=*/false);
+    rc::LeaseSessionOptions o;
+    o.atRiskNum = 1;
+    o.atRiskDen = 3;
+    EXPECT_THROW((rc::LeaseSession<4, OnLostF, OnRiskF>(*r.client, OnLostF{&r.cb}, OnRiskF{&r.cb}, o)), std::invalid_argument);
+    o.atRiskNum = 2;
+    o.atRiskDen = 5;
+    EXPECT_NO_THROW((rc::LeaseSession<4, OnLostF, OnRiskF>(*r.client, OnLostF{&r.cb}, OnRiskF{&r.cb}, o)));
+}
+
+// ... and at the accepted boundary a healthy lease never flaps (the reviewer's probe: ttl 1000, d 400 flapped before the check).
+TEST(LeaseSessionRegression, NoFlapAtBoundaryRegression) {
+    SRig<4> r(invokerCfg(5929, 5930), 1, /*maxDelayMs=*/500);
+    r.gw.kaAutoOk = true;
+    const int64_t t = g_now;
+    rc::OpResult err = rc::OpResult::Accepted;
+    ASSERT_NE(r.add(1, 5, 3000, t, &err).slot, 0xFFFFFFFFu);
+    const int64_t end = t + 3000 * kMs;
+    for (int64_t x = t; x < end;) { x += 10 * kMs; r.at(x); }
+    EXPECT_EQ(r.cb.entered(), 0);
+    EXPECT_TRUE(r.cb.lost.empty());
+}
+
+// A bind the duty side refuses (the lease ended before the bind reached it) blocks the producer for good and is counted by the session.
+TEST(LeaseSessionRegression, BindRefusedAfterEndRegression) {
+    SRig<4> r(invokerCfg(5931, 5932));
+    rc::Producer p = r.client->testProducerWithRingCap(guardedCfg(), 64 * 1024);
+    awaitProducerId(r, p);
+    rc::Completions pq(*r.client);
+    const rc::TopicHandle topic{1, 1};
+    const auto a = r.add(1);
+    ASSERT_EQ(r.session->bindProducer(a, p), rc::OpResult::Accepted);   // the bind waits in the producer's ring ...
+    ASSERT_EQ(r.session->remove(a), rc::OpResult::Accepted);             // ... the End is applied at once (Invoker, in place)
+    r.settle();
+    EXPECT_EQ(r.session->core().bindRefused(), 1u);
+    Drain d;
+    const std::size_t frames = r.gw.produceFrameBytes.size();
+    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal, pq, 1), rc::SendResult::Ok);
+    p.flush();
+    r.settle(30);
+    d.run(pq);
+    EXPECT_EQ(r.gw.produceFrameBytes.size(), frames);
+    EXPECT_EQ(d.failed, 1);
+}
+
+// Thread mode: the two rings are drained by the runner at its own pace.  bindProducer is BackPressured until the guard block exists, then
+// the bind (carrying the arm state) always lands on a live lease: the producer sends and is acknowledged.
+TEST(LeaseSessionRegression, ThreadModeBindAfterAddRegression) {
+    auto cfg = invokerCfg(5933, 5934);
+    cfg.runnerMode = rc::RunnerMode::Thread;
+    cfg.nanoClock  = nullptr;   // the real clock: the runner thread must not read the test's fake one
+    struct Pump {   // the stub broker runs on its own thread; nothing else touches it until it is joined
+        std::atomic<bool> stop{false};
+        std::thread       t;
+        ~Pump() { stop = true; if (t.joinable()) t.join(); }
+    } pump;
+    rc::Client client(cfg);   // the client first: it owns the media driver the stub broker attaches to
+    std::unique_ptr<test_support::InvokerGateway> gw = std::make_unique<test_support::InvokerGateway>(
+        cfg.dataDir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId, cfg.egressChannel, cfg.egressStreamId);
+    gw->idempotence            = true;
+    gw->replySchemas           = true;
+    gw->schemaBlob             = rune::codec::serialize(leaseDescriptor());
+    gw->schemaTopicId          = 1;
+    gw->schemaPartitionCount   = 1;
+    gw->schemaLeaseViewTopicId = 9;
+    rune::protocol::TopicKeyFeatures f;
+    f.keyIndex = true;
+    gw->schemaKeyFeatures = f;
+    gw->schemaLease       = kSpec;
+    gw->produceLeaseTrailer = [] {
+        std::vector<uint8_t> t(16);
+        const int64_t v = 77;
+        const uint64_t ttl = 5000;
+        std::memcpy(t.data(), &v, 8);
+        std::memcpy(t.data() + 8, &ttl, 8);
+        return t;
+    }();
+    const auto wallEnd = std::chrono::steady_clock::now() + std::chrono::seconds(20);   // the pump's own hard cap
+    pump.t = std::thread([&] {
+        while (!pump.stop.load() && std::chrono::steady_clock::now() < wallEnd) gw->pump();
+    });
+    {
+        client.connectAndWait(std::chrono::seconds(10));
+        auto topic = client.openLeaseTopicAndWait<Row>("lease_t", {}, std::chrono::seconds(10));
+        Cb cb;
+        {
+            rc::LeaseSession<4, OnLostF, OnRiskF> session(client, OnLostF{&cb}, OnRiskF{&cb}, rc::LeaseSessionOptions{});
+            rc::Producer p = client.producer(guardedCfg());
+            rc::Completions pq(client);
+            const auto softEnd = std::chrono::steady_clock::now() + std::chrono::seconds(2);   // the 2 s wall cap of every wait below
+            rc::DefaultWaitIdle idle;
+            auto waitFor = [&](auto&& pred) {
+                while (!pred()) {
+                    if (std::chrono::steady_clock::now() >= softEnd) return false;
+                    (void)session.doWork(client.nowNs());
+                    idle.idle();
+                }
+                return true;
+            };
+            ASSERT_TRUE(waitFor([&] { return p.producerId() >= 0; }));
+            const auto ref = session.add(topic, Row{1}, 5, 3000, client.nowNs());
+            ASSERT_NE(ref.slot, 0xFFFFFFFFu);
+            ASSERT_TRUE(waitFor([&] { return session.stateOf(ref) == rc::LeaseEntryState::Held; }));
+            rc::OpResult br = rc::OpResult::BackPressured;
+            ASSERT_TRUE(waitFor([&] { br = session.bindProducer(ref, p); return br != rc::OpResult::BackPressured; }));
+            ASSERT_EQ(br, rc::OpResult::Accepted);
+            ASSERT_EQ(p.trySend(rc::TopicHandle{1, 1}, rc::Key(uint64_t{1}), kVal, pq, 1), rc::SendResult::Ok);
+            p.flush();
+            Drain d;
+            ASSERT_TRUE(waitFor([&] { d.run(pq); return d.ok + d.failed + d.other > 0; }));
+            EXPECT_EQ(d.ok, 1) << "failed " << d.failed << " other " << d.other;
+            EXPECT_EQ(d.failed, 0);
+            EXPECT_EQ(session.core().bindRefused(), 0u);
+            EXPECT_EQ(cb.entered(), 0);
+            EXPECT_TRUE(cb.lost.empty());
+        }
+    }
+    pump.stop = true;
+    pump.t.join();
+    EXPECT_FALSE(gw->produceFrameBytes.empty()) << "the guarded producer's record reached the broker";
+}
+
+// L7: the client's pending control table is fixed (reserved once): five sessions' worth of keepalive requests (320, more than the table
+// holds) allocate nothing in steady state; the requests the full table refuses (Throttled) are sent again soon and every lease stays kept.
+TEST(LeaseSessionRegression, PendingCtlNoGrowRegression) {
+    using Session = SRig<64>::Session;
+    SRig<64> r(invokerCfg(5935, 5936), /*partitions=*/64);
+    r.gw.kaAutoOk = true;
+    r.cb.risk.reserve(8192);
+    r.cb.lost.reserve(1024);
+    std::vector<std::unique_ptr<Session>> extra;
+    for (int i = 0; i < 4; ++i) {
+        extra.push_back(std::make_unique<Session>(*r.client, OnLostF{&r.cb}, OnRiskF{&r.cb}, rc::LeaseSessionOptions{}));
+    }
+    std::vector<Session*> all{r.session.get()};
+    for (auto& e : extra) all.push_back(e.get());
+    // five keys per partition, one per session: every session has 64 groups, so 64 requests in flight each
+    std::vector<std::vector<uint64_t>> ids(64);
+    for (uint64_t id = 1; id < 1'000'000; ++id) {
+        auto& v = ids[static_cast<std::size_t>(r.topic->partitionOf(Row{id}))];
+        if (v.size() < 5) v.push_back(id);
+        bool full = true;
+        for (const auto& x : ids) full = full && x.size() == 5;
+        if (full) break;
+    }
+    for (const auto& v : ids) ASSERT_EQ(v.size(), 5u);
+    for (int s = 0; s < 5; ++s) r.settle();   // every session's guard block exists
+    const int64_t t0 = g_now;
+    for (std::size_t s = 0; s < all.size(); ++s)
+        for (std::size_t p = 0; p < 64; ++p) ASSERT_NE(all[s]->add(*r.topic, Row{ids[p][s]}, 5, 3000, t0).slot, 0xFFFFFFFFu);
+    long clientAllocs = 0, sessionAllocs = 0;
+    auto counted = [&](long& bucket, auto&& fn) {
+        alloc_counter::startThisThread();
+        fn();
+        bucket += alloc_counter::stopThisThread();
+    };
+    int64_t x = t0;
+    auto cycleMs = [&](int ms) {
+        const int64_t end = x + ms * kMs;
+        for (int i = 0; i < 100 && x < end; ++i) {   // 50 ms steps
+            x += 50 * kMs;
+            g_now = x;
+            for (int k = 0; k < 6; ++k) {
+                counted(clientAllocs, [&] { r.client->doWork(); });
+                r.gw.pump();   // the stub allocates: outside the windows
+                for (Session* s : all) counted(sessionAllocs, [&] { (void)s->doWork(g_now); });
+            }
+        }
+    };
+    cycleMs(2200);   // warm-up: the frame pool, the high-water marks
+    clientAllocs = sessionAllocs = 0;
+    uint64_t okBefore = 0;
+    for (Session* s : all) okBefore += s->core().okAnswers();
+    cycleMs(2000);
+    uint64_t okAfter = 0;
+    for (Session* s : all) okAfter += s->core().okAnswers();
+    EXPECT_EQ(clientAllocs, 0L) << "the pending control table and its frame pool never grow";
+    EXPECT_EQ(sessionAllocs, 0L);
+    EXPECT_GE(okAfter - okBefore, 320u * 3 / 2) << "every lease's keepalives keep being sent and answered (" << okAfter - okBefore << ")";
+    EXPECT_TRUE(r.cb.lost.empty());
+    for (Session* s : all) EXPECT_EQ(s->liveCount(), 64u);
+    for (auto& e : extra) e.reset();   // the sessions go before the topic
+    r.session.reset();
 }

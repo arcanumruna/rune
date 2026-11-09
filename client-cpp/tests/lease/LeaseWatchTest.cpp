@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -302,6 +303,7 @@ std::vector<Bytes> byHash(std::vector<Bytes> keys) {
 // released late), random handoff buffers (ring and list overflows), random page sizes and random prefix sets.  One rig for every seed.
 TEST(LeaseWatchHandoffRegression, ScanPlusSubscriptionEqualsFreshFoldSeededRegression) {
     WRig r(invokerCfg(5101, 5102, 2), 2);
+    uint64_t totalResubscribes = 0, totalRingOverflows = 0;
     for (uint32_t seed = 1; seed <= 20; ++seed) {
         SCOPED_TRACE("seed " + std::to_string(seed));
         std::mt19937 rng(seed);
@@ -340,7 +342,8 @@ TEST(LeaseWatchHandoffRegression, ScanPlusSubscriptionEqualsFreshFoldSeededRegre
         ASSERT_EQ(startWith(w, prefixes), rc::OpResult::Accepted);
         r.stub->hold = rng() % 2 == 0;
         for (int round = 0; round < 60; ++round) {
-            const int n = rng() % 8 == 0 ? 40 : static_cast<int>(rng() % 3);
+            int n = rng() % 8 == 0 ? 40 : static_cast<int>(rng() % 3);
+            if (seed % 4 == 0 && round == 20) n = 800;   // a burst far past the 32 KiB record ring (about 320 records a partition)
             for (int i = 0; i < n; ++i) mutate();
             if (rng() % 6 == 0) {
                 if (r.stub->hold) r.stub->release();
@@ -358,7 +361,14 @@ TEST(LeaseWatchHandoffRegression, ScanPlusSubscriptionEqualsFreshFoldSeededRegre
         EXPECT_EQ(rec.bad, 0);
         EXPECT_EQ(rec.readies, 1);
         EXPECT_EQ(rec.count(Kind::Vanished), 0) << "no break: a record older than its page's asOf is never replayed over the page";
+        totalResubscribes += w.resubscribes();
+        totalRingOverflows += w.ringOverflows();
     }
+    // The run must actually exercise the overflow -> resubscribe path, or its equality assertions prove nothing about it.
+    std::fprintf(stderr, "[seeded fold] resubscribes=%llu ringOverflows=%llu\n", static_cast<unsigned long long>(totalResubscribes),
+                 static_cast<unsigned long long>(totalRingOverflows));
+    EXPECT_GT(totalResubscribes, 0u);
+    EXPECT_GT(totalRingOverflows, 0u);
 }
 
 // Rule 3 over hash ranges: page 2 of a scan is computed at its arrival, AFTER a record that the subscription (opened at page 1's asOf)
@@ -785,4 +795,124 @@ TEST(LeaseWatchHandoffRegression, SessionObservesWatchRegression) {
     ASSERT_EQ(r.cb.lost.size(), 2u);
     EXPECT_EQ(r.cb.lost[1].why, rc::LostReason::WatchedExpired);
     EXPECT_TRUE(r.session->unobserve(w));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Checkpoint D: definitive vs transient scan errors (M2), the oversize row (L1), session / watch lifetimes (L2)
+// ---------------------------------------------------------------------------------------------------------------------------
+
+// M2: a scan answered with a DEFINITIVE error (a rescan answers the same) fails the watch: failed() and the Failed event, once.
+TEST(LeaseWatchHandoffRegression, DefinitiveScanErrorFailsRegression) {
+    for (const auto code : {rpc::ErrorCode::NotAuthorized, rpc::ErrorCode::UnknownTopic, rpc::ErrorCode::InvalidRequest}) {
+        SCOPED_TRACE("code " + std::to_string(static_cast<int>(code)));
+        WRig r(invokerCfg(5901, 5902, 1), 1);
+        r.stub->parts[0].grant(kb(1));
+        r.stub->errorCode = static_cast<int16_t>(code);
+        r.stub->errorNext = 1'000'000;
+        rc::LeaseWatchBase w(*r.client, r.topic->core());
+        Recorder rec;
+        w.setHandler(&Recorder::fn, &rec);
+        ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+        const int64_t end = g_now + 600 * kMs;
+        for (int i = 0; i < 300 && g_now < end && !w.failed(); ++i) { g_now += 2 * kMs; r.round(w); }
+        EXPECT_TRUE(w.failed());
+        for (int i = 0; i < 20; ++i) { g_now += 2 * kMs; r.round(w); }
+        EXPECT_LE(r.stub->seen.size(), 1u) << "no rescan of a definitive answer";
+        EXPECT_EQ(rec.failures, 1);
+        EXPECT_FALSE(w.isReady());
+    }
+}
+
+// ... while any other error is a transient break: the partition is re-run after 1, 2, 4, 8, 16 ms (doubling, 1 s cap), then goes Live.
+TEST(LeaseWatchHandoffRegression, TransientScanErrorBacksOffRegression) {
+    WRig r(invokerCfg(5903, 5904, 1), 1);
+    r.stub->parts[0].grant(kb(1));
+    r.stub->errorCode = static_cast<int16_t>(rpc::ErrorCode::Internal);
+    r.stub->errorNext = 5;
+    std::vector<int64_t> at;   // when each ScanLeases request reached the broker
+    r.stub->onRequest = [&](const LeaseStub::ScanSeen&) { at.push_back(g_now); };
+    rc::LeaseWatchBase w(*r.client, r.topic->core());
+    Recorder rec;
+    w.setHandler(&Recorder::fn, &rec);
+    ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+    const int64_t end = g_now + 2000 * kMs;
+    for (int i = 0; i < 1500 && g_now < end && !w.isReady(); ++i) { g_now += kMs; r.round(w); }
+    ASSERT_TRUE(w.isReady());
+    EXPECT_FALSE(w.failed());
+    ASSERT_GE(at.size(), 6u);
+    const int64_t want[5] = {1, 2, 4, 8, 16};
+    for (int k = 0; k < 5; ++k) {
+        const int64_t gap = (at[static_cast<std::size_t>(k) + 1] - at[static_cast<std::size_t>(k)]) / kMs;
+        EXPECT_GE(gap, want[k]) << "retry " << k;
+        EXPECT_LE(gap, want[k] + 3) << "retry " << k << " (a few rounds of slack)";
+    }
+    EXPECT_EQ(w.reruns(), 5u);
+    EXPECT_EQ(rec.readies, 1);
+    EXPECT_EQ(rec.bad, 0);
+}
+
+// L1: a topic whose widest key + lease view row cannot ride one ring record is refused at start (it would fail as Fatal at the first record).
+TEST(LeaseWatchHandoffRegression, OversizeRowRefusedRegression) {
+    WRig r(invokerCfg(5905, 5906, 1), 1);
+    {
+        rc::LeaseWatchBase ok(*r.client, r.topic->core());
+        EXPECT_EQ(startWith(ok, {Bytes{}}), rc::OpResult::Accepted) << "the regular row fits";
+    }
+    using rune::codec::PrimType;
+    auto b = rune::codec::DescriptorBuilder("lease_t", 1)
+                 .add("lease_version", PrimType::Int64, 1, false)
+                 .add("lease_ttl_ms", PrimType::UInt64, 1, false)
+                 .add("lease_holder", PrimType::UInt64, 1, false)
+                 .add("lease_remaining_ms", PrimType::UInt64, 1, false)
+                 .add("id", PrimType::UInt64, 1, /*isKey=*/true);
+    for (int i = 0; i < 250; ++i) b.add("f" + std::to_string(i), PrimType::Int64, 1, false);
+    std::vector<uint8_t> row(44);
+    (void)Row{}.encode(row.data());
+    r.topic->core().setRevokeTemplate(row, rune::codec::serialize(b.build()));
+    ASSERT_GT(r.topic->core().viewRowLen(), 2048u - 48u - 8u);
+    rc::LeaseWatchBase w(*r.client, r.topic->core());
+    EXPECT_EQ(startWith(w, {Bytes{}}), rc::OpResult::InvalidArgument);
+    EXPECT_FALSE(w.failed());
+    EXPECT_EQ(w.scansIssued(), 0u);
+}
+
+// L2: either side of an observe may be destroyed first; the survivor forgets the other and is never called through a dangling pointer.
+TEST(LeaseWatchHandoffRegression, SessionDestroyedWhileObservingRegression) {
+    WRig r(invokerCfg(5907, 5908, 1), 1);
+    r.makeSession();
+    r.stub->parts[0].setRow(kb(1), 5, 0);
+    rc::LeaseWatchBase w(*r.client, r.topic->core());
+    ASSERT_TRUE(r.session->observe(w));
+    EXPECT_FALSE(r.session->observe(w)) << "observed once";
+    EXPECT_EQ(w.observerCount(), 1u);
+    EXPECT_EQ(r.session->observedCount(), 1u);
+    ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive(w, [&] { return w.isReady(); }));
+    r.session.reset();
+    ASSERT_EQ(w.observerCount(), 0u) << "the destroyed session left the watch's observer list";
+    (void)r.stub->parts[0].rawEnd(kb(1), 5, Op::Revoke);   // the watch goes through an event
+    r.rounds(w, 20);
+    EXPECT_EQ(w.liveCount(), 0u);
+    EXPECT_FALSE(w.failed());
+}
+
+TEST(LeaseWatchHandoffRegression, WatchDestroyedWhileObservedRegression) {
+    WRig r(invokerCfg(5909, 5910, 1), 1);
+    r.makeSession();
+    ASSERT_NE(r.session->add(*r.topic, Row{1}, 5, 3000, g_now).slot, 0xFFFFFFFFu);
+    r.stub->parts[0].setRow(Bytes(8, 0), 5, 0);
+    {
+        rc::LeaseWatchBase w(*r.client, r.topic->core());
+        ASSERT_TRUE(r.session->observe(w));
+        ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+        ASSERT_TRUE(r.drive(w, [&] { return w.isReady(); }));
+        EXPECT_EQ(r.session->observedCount(), 1u);
+    }
+    ASSERT_EQ(r.session->observedCount(), 0u) << "the destroyed watch left the session's record";
+    for (int i = 0; i < 20; ++i) { g_now += 10 * kMs; r.client->doWork(); r.gw.pump(); r.session->doWork(g_now); }   // the session is driven on
+    EXPECT_EQ(r.session->liveCount(), 1u);
+    rc::LeaseWatchBase w2(*r.client, r.topic->core());
+    EXPECT_TRUE(r.session->observe(w2)) << "its slot is free again";
+    EXPECT_TRUE(r.session->unobserve(w2));
+    EXPECT_EQ(w2.observerCount(), 0u);
 }

@@ -1214,6 +1214,18 @@ hold one session per client, for example one per tenant client for case claims (
     the producer before any re-send, and was not built. Its mutation (skip the guard's block in `appendRecord_`) turns
     `GuardBlocksReconnectResendRegression` red instead; that test has a second leg (trip, rearm, new in-flight writes, trip
     again: the second trip fails them and a reconnect sends no frame).
+  - **Checkpoint D fixes (as built).** (H1) A guard slot that is re-armed or ended at a newer generation kills the
+    producers still listed on it before it is reused; a stale generation is ignored (wrap-aware compare). (H2) A producer
+    binds to at most one guard: the issuing thread keeps a flag and the duty side refuses a second bind (`BindRefused`,
+    counted by `bindRefused()`). (H3) `kMsgGuardBind` is 24 bytes and carries `(sid, slot, gen, armSeq, atRiskNs)`; the
+    duty side adopts the arm state from the bind, so the hub ring and the producer ring drain in any order (same
+    generation applies only with a newer `armSeq`). `bindProducer` returns `BackPressured` until the guard is ready.
+    (M1) A revoke refused as `InvalidArgument` or `Closed` is permanent: GuardEnd is posted, the entry is freed and
+    `onLost(RevokeRefused)` fires from `revoke()` only. (M3) `add` refuses parameters that would flap: the at-risk offset
+    is `min(partNs, ttl - ttl/50 - 2d)` and must be at least `ttl/3 + d`; the constructor throws when `3*num <= den`.
+    A fixed-width topic refuses a key that does not fit the revoke key. (L3) The session destructor retries
+    `GuardRelease` with the idle strategy until accepted or the client is closed. (L7) Lease control requests arriving
+    at a full control table (256) complete with `Throttled`; the session reschedules them soon.
 
 ### 12.3 `LeaseMutex` and `LeaseElection` (etcd `concurrency.Mutex` / `Election`)
 
@@ -1312,6 +1324,13 @@ These are client recipes over a one-partition lease topic keyed by `path string(
     (indexed min-heap per name).
   - **Not in this task.** The leader-change-mid-scan 3-node test and the compacted-log-start test move to Task 17.
     `rune_client_lease_watch_handoff_resubscribes_total` is not exported; `resubscribes()` is the observer.
+  - **Checkpoint D fixes (as built).** (M2) A scan completing with `InvalidArgument`, or `BrokerError` of NotAuthorized,
+    UnknownTopic or InvalidRequest, fails the watch; any other error moves the partition to a re-run with a per-partition
+    backoff of 1 ms doubling to 1 s, reset when it reaches Live. (L1) `startFromNow` returns `InvalidArgument` when a
+    maximal key plus row plus marker would not fit a record. (L2) The session registers as an observer of a watch
+    (`observe`, at most 8); the watch notifies observers when destroyed and the session unobserves when destroyed.
+    (L3) The watch destructor waits with the idle strategy until its subscriptions finish or the client is closed
+    (Invoker mode pumps `doWork`). `ringOverflows()` counts record-ring overflows.
 
 ## 13. The Rune-backed discovery library (deliverable)
 
