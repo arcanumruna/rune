@@ -38,9 +38,10 @@
 #                 TXN-RACE: 4 probes run transactions of two characters and two ledger entries over the same users (per user six
 #                 fit account_stats, a seventh and an overdraw are refused), the `character` leader `docker kill`ed at ~30 % (first half of the users) and
 #                 the consensus leader, the transaction coordinator, at ~60 % (second half, its probes seeded on another node), each restarted once progress resumes (per user at most
-#                 six Ok, every other answer 55, a lost answer only on a killed node's transaction); TXN-VERIFY: a read_committed
-#                 subscription from 0 holds every committed transaction whole, no refused one, a lost one whole or not at all, and
-#                 account_stats and balances agree; TXN-RESTART: all three nodes restarted, TXN-VERIFY again and a new transaction
+#                 six Ok, every other answer 55; the workers share the names u<user>k<k>a / b and race for them; a lost answer only on a
+#                 transaction that overlaps a kill window, no transaction longer than the transaction timeout and a pass); TXN-VERIFY: a read_committed
+#                 subscription from 0 holds every committed transaction whole, no refused one, a lost one whole or not at all, each name
+#                 in one committed transaction with character_name mapping it to that transaction's character, and account_stats and balances agree; TXN-RESTART: all three nodes restarted, TXN-VERIFY again and a new transaction
 #                 commits.  Bounded at 600 s per race.  Prints TXN: OK;
 #  10. print CHECKED-WRITES-E2E: OK.
 #
@@ -88,6 +89,8 @@ TXN_USERS="${TXN_E2E_USERS:-64}"
 TXN_USER_BASE=10000    # the transaction users are 10001..: none has characters from leg 8
 TXN_PER_USER=8         # the probe's per-user transactions: six that fit, the cap's, the overdraw
 TXN_FITTING=6          # transactions of two characters that fit account_stats.max_characters
+TXN_TIMEOUT_MS=60000   # the probe's transactionTimeoutMs
+TXN_PASS_MS=5000       # one pass of the coordinator's timeout sweep and the vote retry on top of it
 RP_CHARS=13            # creates per user and probe (the probe's kRpCharsPerUser)
 RP_CAP=12              # account_stats.max_characters
 RP_PAIR_BASE=1000000   # the probe's kRpPairBase: the users of the Foo / foo pairs
@@ -126,6 +129,7 @@ dc() {
 }
 cname() { dc ps -a -q "rune-$1" | head -1; }   # the container id of node <n> (1-3)
 now_s() { date +%s; }
+now_ms() { date +%s%3N; }   # GNU date on the VM; the probes write epoch ms from the same host clock (the containers share it), so the two are comparable
 
 [ -d "${FLIGHT_RECORDER_DIR}" ] || fail "missing flight-recorder checkout (set FLIGHT_RECORDER_DIR)"
 [ -d "${ARCANUM_METRICS_DIR}" ] || fail "missing arcanum-metrics checkout (set ARCANUM_METRICS_DIR)"
@@ -721,18 +725,23 @@ log "Leg 9b: TXN-RACE: ${WORKERS} probes run ${TXN_PER_USER} transactions per us
 txn_half=$(( TXN_USERS / 2 ))
 txn_total=$(( WORKERS * TXN_USERS * TXN_PER_USER ))
 txn_start=$(now_s)
+txn_windows="${WORK_DIR}/txn-kill-windows.txt"   # "<kill ms> <resumed ms>" per kill: a lost answer is allowed only inside one
+: > "${txn_windows}"
 # txn_kill <node 0-2> <progress share in percent> <what>: kill it at the share of all the transactions, restart it once progress resumes
 txn_kill() {
     wait_until "${RACE_S}" "${3} kill point" progress_at_least $(( txn_total * $2 / 100 )) txn-run \
         || { out_of "txn-run-0" | tail -20 >&2; fail "txn-run never reached $2 % within ${RACE_S}s (at $(race_progress txn-run) of ${txn_total})"; }
     BASE=$(race_progress txn-run)
     log "Leg 9: killing node $1, the ${3}, at ${BASE} of ${txn_total} transactions"
+    local killed_ms
+    killed_ms=$(now_ms)
     kill_node "$1"
     RESUME_AT=$(( BASE + 20 ))
     [ "${RESUME_AT}" -le "${txn_total}" ] || RESUME_AT="${txn_total}"
     wait_until "${RESUME_WAIT_S}" "txn-run resuming" progress_at_least "${RESUME_AT}" txn-run \
         || { out_of "txn-run-0" | tail -20 >&2; fail "txn-run: no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the ${3} kill"; }
     restart_node "$1"
+    echo "${killed_ms} $(now_ms)" >> "${txn_windows}"
 }
 # txn_half_run <first worker number> <first user> <last user> : WORKERS probes over the users; the seed node is neither the character
 # leader nor the coordinator (a probe does not outlive its seed), so each half starts by reading both.
@@ -769,8 +778,16 @@ txn_half_wait "${WORKERS}"
 log "Leg 9b: done in $(( $(now_s) - txn_start )) s"
 txn_files=("${SHARED}"/txn-run-w*.txt)
 [ "${#txn_files[@]}" -eq $(( 2 * WORKERS )) ] || fail "${#txn_files[@]} transaction result files, want $(( 2 * WORKERS ))"
-awk -v per="${TXN_PER_USER}" -v workers="${WORKERS}" -v fitting="${TXN_FITTING}" -v users="${TXN_USERS}" -v ubase="${TXN_USER_BASE}" '
-    { if ($3 != 0 && $3 != 55 && $3 != 20000) { other[$3]++; next }
+awk -v per="${TXN_PER_USER}" -v workers="${WORKERS}" -v fitting="${TXN_FITTING}" -v users="${TXN_USERS}" -v ubase="${TXN_USER_BASE}" \
+    -v limit="$(( TXN_TIMEOUT_MS + TXN_PASS_MS ))" -v windows="$(tr '\n' ';' < "${txn_windows}")" '
+    BEGIN { nw = split(windows, w, ";") }
+    { if ($9 - $8 > limit) { if (shown++ < 10) printf "%s: took %d ms\n", $6, $9 - $8; bad = 1 }
+      if ($3 == 20000) {
+          inside = 0
+          for (i = 1; i < nw; i++) { split(w[i], b, " "); if ($8 <= b[2] && $9 >= b[1]) inside = 1 }
+          if (!inside) { if (shown++ < 10) printf "%s: a lost answer outside every kill window\n", $6; bad = 1 }
+      }
+      if ($3 != 0 && $3 != 55 && $3 != 20000) { other[$3]++; next }
       if ($6 ~ /od$/) { if ($3 == 0) { if (shown++ < 10) printf "%s: an overdraw committed\n", $6; bad = 1 } next }
       u = $2; n[u]++
       if ($3 == 0) ok[u]++; else if ($3 == 20000) lost[u]++ }
@@ -785,7 +802,7 @@ awk -v per="${TXN_PER_USER}" -v workers="${WORKERS}" -v fitting="${TXN_FITTING}"
         }
         exit bad
     }' "${txn_files[@]}" > "${WORK_DIR}/txn-run-check.txt" \
-    || { cat "${WORK_DIR}/txn-run-check.txt" >&2; fail "the transaction race broke 'per user at most ${TXN_FITTING} Ok, every other answer 55, no overdraw commits' (20000 = a lost answer, only a killed node's)"; }
+    || { cat "${WORK_DIR}/txn-run-check.txt" >&2; fail "the transaction race broke 'per user at most ${TXN_FITTING} Ok, every other answer 55, no overdraw commits' (20000 = a lost answer, only inside a kill window; none longer than ${TXN_TIMEOUT_MS} ms + ${TXN_PASS_MS} ms)"; }
 log "Leg 9b OK"
 
 LEG="leg 9c TXN-VERIFY"
@@ -798,10 +815,12 @@ restart_all
 if [ "$(partition_leader "${RP_CHARACTER_TOPIC}" 0)" = "0" ]; then SEED_NODE=2; else SEED_NODE=1; fi
 leg txn-verify-restart "${RACE_S}" "CHECKED-WRITES-TXN-VERIFY: OK" txn-verify
 leg txn-run-restart "${RACE_S}" "CHECKED-WRITES-TXN-RUN: DONE" txn-run --worker 9 --users "$(( TXN_USER_BASE + TXN_USERS + 1 ))-$(( TXN_USER_BASE + TXN_USERS + 2 ))"
-awk -v fitting="${TXN_FITTING}" '
-    { if ($6 ~ /od$/) { if ($3 != 55) { if (shown++ < 10) printf "%s: the overdraw gave %d\n", $6, $3; bad = 1 } next }
+awk -v fitting="${TXN_FITTING}" -v per="${TXN_PER_USER}" -v u1="$(( TXN_USER_BASE + TXN_USERS + 1 ))" -v u2="$(( TXN_USER_BASE + TXN_USERS + 2 ))" '
+    { if ($6 ~ /od$/) { if ($3 != 55) { if (shown++ < 10) printf "%s: the overdraw gave %d\n", $6, $3; bad = 1 } x = $6; sub(/^u/, "", x); sub(/od$/, "", x); od[x + 0]++; next }
       ok[$2] += ($3 == 0); refused[$2] += ($3 == 55) ; n[$2]++ }
-    END { for (u in n) if (ok[u] != fitting || refused[u] != 1) { if (shown++ < 10) printf "user %d: %d Ok, %d refused\n", u, ok[u], refused[u]; bad = 1 } exit bad }' \
+    END { for (u = u1; u <= u2; u++)
+              if (n[u] != per - 1 || od[u] != 1 || ok[u] != fitting || refused[u] != 1) { if (shown++ < 10) printf "user %d: %d transactions, %d Ok, %d refused, %d overdraws\n", u, n[u], ok[u], refused[u], od[u]; bad = 1 }
+          exit bad }' \
     "${SHARED}/txn-run-w9.txt" > "${WORK_DIR}/txn-restart-check.txt" \
     || { cat "${WORK_DIR}/txn-restart-check.txt" >&2; fail "after the restart a fresh user did not get ${TXN_FITTING} committed transactions and one refused"; }
 leg txn-verify-final "${RACE_S}" "CHECKED-WRITES-TXN-VERIFY: OK" txn-verify

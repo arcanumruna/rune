@@ -77,7 +77,8 @@ std::string schema(bool replicas) {
     const std::string ledger = "topic ledger { entryId uint64, account uint64, amount int64, memo string(16) } partitions 1" + std::string(replicas ? three : "") +
                                " key entryId with (cleanup.policy = compact)";
     if (!replicas) character.replace(character.find(three), three.size(), "");
-    return stmt(character) + stmt(goldenStatement("view character_name key")) + stmt(goldenStatement("view account_stats key")) + stmt(ledger) +
+    return stmt(character) + stmt(goldenStatement("view character_name key")) + stmt(goldenStatement("view account_stats key")) +
+           stmt("create view character_by_id key characterId as select * from character") + stmt(ledger) +
            stmt("create view balances key account as select sum(amount) as balance from ledger group by account constraint non_negative check (balance >= 0)");
 }
 
@@ -319,12 +320,12 @@ struct Shard {
 
 /// Every character created in a transaction of `txns` two-topic transactions (two characters and two ledger entries of 1 for a user, six
 /// transactions per user, so the 12th slot fills last) is visible on each partition whole at once: a reader of account_stats and balances
-/// sees only even counts.
+/// sees only even counts, and character_by_id shows both characters of a transaction or neither.
 void expectEachPartitionVisibleInOneStep(const char* tag, int txns) {
     Shard s(tag);
     s.setUp();
     ASSERT_FALSE(::testing::Test::HasFatalFailure());
-    ViewHandle stats(s.b.node(), "account_stats"), balances(s.b.node(), "balances");
+    ViewHandle stats(s.b.node(), "account_stats"), balances(s.b.node(), "balances"), byId(s.b.node(), "character_by_id");
     TxnClient writer(s.b.clientConfig(), "tx-allyes");
     rc::Client& reader = *s.b.connectClient();
     std::atomic<uint64_t> user{1};
@@ -332,10 +333,26 @@ void expectEachPartitionVisibleInOneStep(const char* tag, int txns) {
     std::atomic<int> reads{0};
     std::mutex mu;
     std::string torn;
+    std::array<uint64_t, 2> ids{};   // the characters of the transaction being committed, published before its commit
     std::jthread watcher([&] {
         while (!done) {
             const uint64_t u = user;
+            std::array<uint64_t, 2> pair;
+            {
+                std::lock_guard<std::mutex> g(mu);
+                pair = ids;
+            }
             try {
+                if (pair[0] != 0) {   // a row seen means the other must be seen by a later read
+                    for (const bool reversed : {false, true}) {
+                        const bool first = readRow(reader, byId, byId.keyOf(pair[reversed ? 1 : 0]), 1s).has_value();
+                        const bool second = readRow(reader, byId, byId.keyOf(pair[reversed ? 0 : 1]), 1s).has_value();
+                        if (first && !second) {
+                            std::lock_guard<std::mutex> g(mu);
+                            torn = "character_by_id shows " + std::to_string(pair[reversed ? 1 : 0]) + " without " + std::to_string(pair[reversed ? 0 : 1]);
+                        }
+                    }
+                }
                 const auto characters = readRow(reader, stats, stats.keyOf(u), 1s);
                 const auto balance    = readRow(reader, balances, balances.keyOf(u), 1s);
                 const int64_t n = characters ? stats.i(*characters, "characters") : 0, sum = balance ? balances.i(*balance, "balance") : 0;
@@ -352,10 +369,15 @@ void expectEachPartitionVisibleInOneStep(const char* tag, int txns) {
         const uint64_t u = 1 + static_cast<uint64_t>(i) / 6;
         user = u;
         writer.begin();
-        ASSERT_TRUE(writer.create(u, "a" + std::to_string(i)).ok());
-        ASSERT_TRUE(writer.create(u, "b" + std::to_string(i)).ok());
+        const rc::WriteResult a = writer.create(u, "a" + std::to_string(i)), b = writer.create(u, "b" + std::to_string(i));
+        ASSERT_TRUE(a.ok());
+        ASSERT_TRUE(b.ok());
         ASSERT_TRUE(writer.put(++entryId, u, 1).ok());
         ASSERT_TRUE(writer.put(++entryId, u, 1).ok());
+        {
+            std::lock_guard<std::mutex> g(mu);
+            ids = {a.key(), b.key()};
+        }
         const rc::TxnCommitResult r = writer.commit();
         ASSERT_TRUE(r.ok) << "transaction " << i << " voted " << r.code;
     }
@@ -619,18 +641,24 @@ TEST(CheckedWritesTxnBrokerRegression, OldClientTransactionOnAConstrainedSourceS
 
 /// Three brokers with the schema (3 replicas), short elections and a client config that notices a dead node fast.
 struct Cluster {
+    std::shared_ptr<VoteGate>   votes = std::make_shared<VoteGate>();   // sees every vote a coordinator sends, holds none
     catalog_cluster::ThreeNodes c;
     int32_t                     characterTopic = -1, ledgerTopic = -1, ctl = -1;
 
     explicit Cluster(const char* tag)
-        : c(catalog_cluster::ThreeNodes::startWith(tag, [](NodeConfig& cfg) {
-              cfg.unservableWarmupMs      = 50;
-              cfg.runtimePlacement        = NodeConfig::RuntimePlacement::Fused;
-              cfg.electionTimeoutMs       = 40;
-              cfg.readLeaseMaxMs          = 50;
-              cfg.brokerLivenessTimeoutMs = 150;
-              cfg.verdictIntervalMs       = 20;
-          })) {}
+        : c(catalog_cluster::ThreeNodes::startWith(
+              tag,
+              [](NodeConfig& cfg) {
+                  cfg.unservableWarmupMs      = 50;
+                  cfg.runtimePlacement        = NodeConfig::RuntimePlacement::Fused;
+                  cfg.electionTimeoutMs       = 40;
+                  cfg.readLeaseMaxMs          = 50;
+                  cfg.brokerLivenessTimeoutMs = 150;
+                  cfg.verdictIntervalMs       = 20;
+              },
+              [gate = votes](int, BrokerNode& n) {
+                  n.setTxnVoteHoldForTest([gate](std::string_view topic, int32_t, int64_t pid, int16_t) { return gate->holds(topic, pid); });
+              })) {}
     void setUp() {
         ASSERT_TRUE(waitFor([&] { return c.awaitCatalogLeader(1ms); }, 10s));
         for (const int id : c.runningNodes()) awaitLevel(c.node(id));
@@ -653,23 +681,50 @@ struct Cluster {
         cfg.keepaliveIntervalNs = std::chrono::nanoseconds(100ms).count();
         return cfg;
     }
+    /// Makes the controller resign until it is not `node`; ctl is the new one.
+    void moveControllerOff(int node) {
+        for (int tries = 0; ctl == node && tries < 10; ++tries) {
+            if (!c.node(ctl).resignConsensusForTest()) continue;
+            const int old = ctl;
+            waitFor([&] {
+                for (BrokerNode* n : c.live())
+                    if (n->isLeader() && n->nodeIdForTest() != old) { ctl = n->nodeIdForTest(); return true; }
+                return false;
+            }, 5s);
+        }
+    }
     int32_t leaderOf(int32_t topic) {
         std::vector<int32_t> leaders;
         return catalog_cluster::awaitLeaders(c, topic, 1, leaders, 30s) ? leaders[0] : -1;
     }
 };
 
-/// `victim` is crashed while a transaction of one character and one ledger entry (ids `entryId`) commits through a client seeded on `seed`,
-/// then a transaction of a fresh producer commits on the survivors.  The crashed one's rows are both visible or neither, to a read_committed reader.
+/// `victim` is crashed once the transaction's vote has gone out to `character`, while a transaction of one character and one ledger entry
+/// (ids `entryId`) commits through a client seeded on `seed`.  The commit still answers yes within the transaction timeout and a pass, then a
+/// transaction of a fresh producer commits on the survivors.  The crashed one's rows are both visible or neither, to a read_committed reader.
 void expectCrashMidVoteLeavesAllOrNothing(Cluster& k, int victim, int seed, const char* name, uint64_t entryId) {
-    TxnClient t(k.config(seed), std::string("tx-") + name, 5'000);
+    constexpr int32_t timeoutMs = 5'000;
+    TxnClient t(k.config(seed), std::string("tx-") + name, timeoutMs);
+    const int64_t pid = t.prod->producerId();
+    ASSERT_GE(pid, 0);
     t.begin();
     ASSERT_TRUE(t.create(1, name).ok());
     ASSERT_TRUE(t.put(entryId, 1, 5).ok());
-    std::thread killer([&] { k.c.crash(victim); });
     std::optional<rc::TxnCommitResult> r;
-    try { r = t.commit(30s); } catch (const std::exception&) {}
-    killer.join();
+    std::string thrown;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point done;
+    std::thread committer([&] {
+        try { r = t.commit(30s); } catch (const std::exception& e) { thrown = e.what(); }
+        done = std::chrono::steady_clock::now();
+    });
+    const bool voted = waitFor([&] { return k.votes->saw("character", pid); }, 10s);
+    if (voted) k.c.crash(victim);
+    committer.join();
+    ASSERT_TRUE(voted) << "the vote never went out";
+    ASSERT_TRUE(r.has_value()) << "the commit threw: " << thrown;
+    EXPECT_TRUE(r->ok) << "the commit answered " << r->code;
+    EXPECT_LT(done - t0, std::chrono::milliseconds(timeoutMs) + 1500ms) << "the commit waited past the transaction timeout and a pass";
 
     const int survivor = k.c.runningNodes().front();
     ASSERT_NE(survivor, victim);
@@ -685,16 +740,17 @@ void expectCrashMidVoteLeavesAllOrNothing(Cluster& k, int victim, int seed, cons
     Reader reader(k.config(survivor), k.characterTopic, k.ledgerTopic);
     ASSERT_TRUE(waitFor([&] { return reader.hasName("After") && reader.hasEntry(entryId + 1); }, 10s)) << "the later transaction is visible";
     EXPECT_EQ(reader.hasName(name), reader.hasEntry(entryId)) << "the crashed transaction is whole or absent";
-    if (r && r->ok) EXPECT_TRUE(reader.hasName(name)) << "an acknowledged commit is visible";
+    EXPECT_TRUE(reader.hasName(name)) << "an acknowledged commit is visible";
 }
 
 TEST(CheckedWritesTxnBrokerRegression, VoterLeaderCrashMidVoteThreeNodesRegression) {
     Cluster k("cw11_voter");
     k.setUp();
     ASSERT_FALSE(HasFatalFailure());
-    int victim = k.leaderOf(k.ledgerTopic);
-    if (victim == k.ctl) victim = k.leaderOf(k.characterTopic);
-    if (victim == k.ctl) victim = k.ctl % 3 + 1;
+    const int victim = k.leaderOf(k.characterTopic);
+    k.moveControllerOff(victim);
+    ASSERT_EQ(k.leaderOf(k.characterTopic), victim) << "character moved with the controller";
+    ASSERT_TRUE(victim > 0 && victim != k.ctl) << "character is led by " << victim << ", the controller is " << k.ctl;
     expectCrashMidVoteLeavesAllOrNothing(k, victim, k.ctl, "Voter", 1);
 }
 
