@@ -81,6 +81,7 @@
 #include <cstdint>
 #include <cstdlib>   // std::abort (LOW-1 fail-stop)
 #include <deque>
+#include <limits>
 #include <utility>
 #include <optional>
 #include <variant>
@@ -791,8 +792,10 @@ public:
     /// re-elected while another live ISR member exists (fix round 1 MAJOR-1).
     /// The request is recorded and decided by the next rebalance tick
     /// (decideBumps_): failover to another live ISR member (co-partition units
-    /// together, the requester leaves the ISR), else — the requester is the
-    /// sole in-sync replica — the same assignment at a new epoch.  The caller
+    /// together; the requester leaves the ISR, except a coordinator-partition
+    /// requester whose LEO shows an intact log, see requesterHoldsPrefix_), else —
+    /// the requester is the sole in-sync replica — the same assignment at a new
+    /// epoch.  The caller
     /// validated (leader, leaderEpoch, partitionEpoch) against the committed
     /// assignment: a re-send overwrites the same request, a stale one never
     /// reaches here, so no decision is ever taken twice.
@@ -1633,12 +1636,17 @@ public:
             // Coordinator partitions are not in the balancer's topic set: the
             // same rule here — another live ISR member leads.  The requester
             // leaves the ISR (re-admitted by the new leader's AlterIsr) unless it
-            // only hit the restart fence: its log is intact, and an ISR without it
-            // can lose its last live member before it is re-admitted.
-            // The coordinator services run only on the controller: its own -1 / -2 replica is re-elected in place, never moved away.
-            const bool controllerInPlace = (topicId == -1 || topicId == -2) && q.requester == selfId_ && q.reason == BumpReason::Fence;
+            // only hit the restart fence AND its reported LEO is at or above the
+            // position the controller holds for every other live ISR member (the
+            // log survived the restart): an ISR without it can lose its last live
+            // member before it is re-admitted.  Without that evidence (a power-lost
+            // log, or no position known) it leaves.
+            // The coordinator services run only on the controller: its own -1 / -2 replica is re-elected in place, never moved away,
+            // under the same evidence.
+            const bool holdsPrefix = topicId < 0 && q.reason == BumpReason::Fence && requesterHoldsPrefix_(topicId, partition, q, *pa);
+            const bool controllerInPlace = (topicId == -1 || topicId == -2) && q.requester == selfId_ && holdsPrefix;
             if (topicId < 0 && !controllerInPlace) {
-                const bool requesterStays = q.reason == BumpReason::Fence && !isShutting_(q.requester);
+                const bool requesterStays = holdsPrefix && !isShutting_(q.requester);
                 for (int32_t n : pa->isr) {
                     if (n == q.requester || isShutting_(n)) continue;
                     if (std::find(eligible_.begin(), eligible_.end(), n) == eligible_.end()) continue;
@@ -3566,6 +3574,21 @@ private:
         int64_t incarnation    = 0;
     };
     std::unordered_map<int64_t, BumpRequest> bumpRequests_;
+    /// Positive evidence that a restart-fenced coordinator-partition leader still holds the committed prefix: the controller knows
+    /// the position of at least one other live ISR member (positions_, fed from the controller node's own replica) and the
+    /// requester's reported LEO (clamped to int32) is at or above every such position.
+    [[nodiscard]] bool requesterHoldsPrefix_(int32_t topicId, int32_t partition, const BumpRequest& q,
+                                             const rune::metadata::PartitionAssignment& pa) const {
+        bool known = false;
+        for (int32_t n : pa.isr) {
+            if (n == q.requester || isShutting_(n) || !isEligible_(n)) continue;
+            const auto pos = positions_.get(topicId, partition, n);
+            if (!pos) continue;
+            if (q.leo < std::min<int64_t>(pos->logEndPosition, std::numeric_limits<int32_t>::max())) return false;
+            known = true;
+        }
+        return known;
+    }
     /// Controlled shutdown: node → {its newest incarnation seen, stopping?}.
     std::unordered_map<int32_t, NodeLifecycle> nodeLifecycle_;
     std::vector<int32_t> shuttingScratch_;

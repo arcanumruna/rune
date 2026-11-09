@@ -1280,7 +1280,7 @@ TEST(EpochRestartControllerRegression, SoleIsrBumpReelectsSameLeaderPastFenceReg
 
 namespace {
 /// A coordinator-partition leader bump from the current leader of (-1, 0): the restart fence, or a memory-backed restart.
-rune::replication::AlterIsrMsg coordinatorBump(CtlRig& c, bool memory = false) {
+rune::replication::AlterIsrMsg coordinatorBump(CtlRig& c, bool memory = false, int32_t leo = 0) {
     const auto& a = c.paOf(-1);
     rune::replication::AlterIsrMsg m{};
     m.topicId = -1; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
@@ -1288,7 +1288,12 @@ rune::replication::AlterIsrMsg coordinatorBump(CtlRig& c, bool memory = false) {
     m.partitionEpoch = a.partitionEpoch;
     m.isr[0] = a.leaderEpoch;
     m.isr[1] = rune::replication::AlterIsrMsg::kBumpFenceValid | (memory ? rune::replication::AlterIsrMsg::kBumpMemoryBacked : 0);
+    m.isr[2] = leo;
     return m;
+}
+/// The controller's position table holds `leo` for `node`'s -1 replica (the controller node's own replica reports it).
+void reportCoordinatorLeo(CtlRig& c, int32_t node, int64_t leo) {
+    c.svc->reportReplicaPosition(-1, 0, node, c.paOf(-1).leaderEpoch, leo);
 }
 }  // namespace
 
@@ -1307,7 +1312,8 @@ TEST(EpochRestartControllerRegression, CoordinatorBumpKeepsTheRequesterInTheIsrR
     const int32_t requester = c.paOf(-1).leaderNode;
     ASSERT_EQ(requester, 2);
     ASSERT_EQ(c.paOf(-1).isr.size(), 2u);
-    (void)c.svc->onAlterIsr(coordinatorBump(c));
+    reportCoordinatorLeo(c, 3, 10);
+    (void)c.svc->onAlterIsr(coordinatorBump(c, /*memory=*/false, /*leo=*/10));   // the log survived: its LEO covers node 3's
     (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
     c.drive(50);
     ASSERT_EQ(c.paOf(-1).leaderNode, 3) << "the restarted leader was re-elected over a live ISR member";
@@ -1319,8 +1325,44 @@ TEST(EpochRestartControllerRegression, CoordinatorBumpKeepsTheRequesterInTheIsrR
     EXPECT_EQ(c.paOf(-1).leaderNode, requester) << "the partition stayed leaderless with a live in-sync member";
 }
 
+// A power-lost restarted leader (its LEO is below a surviving ISR member's) does not stay in the ISR: the member holding the
+// committed data leads and the requester rejoins as a follower and truncates.  RED: the requester stayed in the ISR, and would
+// be elected with the truncated log when the member that took over dies.
+TEST(EpochRestartControllerRegression, CoordinatorBumpOfAPowerLostRequesterDropsItFromTheIsrRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    (void)c.svc->onAlterIsr(coordinatorBump(c, /*memory=*/true));   // node 2 leads, ISR {2, 3}
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    const int32_t requester = c.paOf(-1).leaderNode;
+    ASSERT_EQ(requester, 2);
+    reportCoordinatorLeo(c, 3, 10);
+    (void)c.svc->onAlterIsr(coordinatorBump(c, /*memory=*/false, /*leo=*/7));   // node 2 lost its unflushed tail
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    EXPECT_EQ(c.paOf(-1).leaderNode, 3);
+    EXPECT_EQ(std::count(c.paOf(-1).isr.begin(), c.paOf(-1).isr.end(), requester), 0) << "the power-lost requester stayed in the ISR";
+}
+
+// The controller's own coordinator replica is power-lost at the restart fence (its LEO is below a surviving ISR member's): it is
+// not re-elected in place over the member that holds the committed data.  RED: re-elected in place, the survivor truncates to it.
+TEST(EpochRestartControllerRegression, CoordinatorBumpOfAPowerLostControllerIsNotReelectedInPlaceRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_EQ(c.paOf(-1).leaderNode, 1);
+    reportCoordinatorLeo(c, 2, 10);
+    reportCoordinatorLeo(c, 3, 10);
+    (void)c.svc->onAlterIsr(coordinatorBump(c, /*memory=*/false, /*leo=*/7));
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    EXPECT_NE(c.paOf(-1).leaderNode, 1) << "a power-lost controller replica was re-elected over members holding the committed data";
+}
+
 // The controller's own coordinator replica refuses at the restart fence.  The coordinator services run only on the controller, so
-// moving the partition to another member is an outage: it is re-elected in place, at an epoch past its fence, ISR unchanged.
+// moving the partition to another member is an outage: with its LEO covering every other ISR member's it is re-elected in place, at
+// an epoch past its fence, ISR unchanged.
 // RED: the partition moved to another ISR member.
 TEST(EpochRestartControllerRegression, CoordinatorBumpOfTheControllerReelectsItInPlaceRegression) {
     CtlRig c(/*userTopics=*/false);
@@ -1328,7 +1370,9 @@ TEST(EpochRestartControllerRegression, CoordinatorBumpOfTheControllerReelectsItI
     c.drive(50);
     const auto before = c.paOf(-1);
     ASSERT_EQ(before.leaderNode, 1);
-    auto bump = coordinatorBump(c);
+    reportCoordinatorLeo(c, 2, 10);
+    reportCoordinatorLeo(c, 3, 10);
+    auto bump = coordinatorBump(c, /*memory=*/false, /*leo=*/10);
     bump.isr[0] = before.leaderEpoch + 5;
     (void)c.svc->onAlterIsr(bump);
     (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
