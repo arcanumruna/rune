@@ -38,6 +38,7 @@ struct LogRec {
     int64_t     remainingMs = 0;   ///< the lease_remaining_ms column (Checkpoint only)
     std::string key;
     int64_t     rxNs      = 0;     ///< lease-clock reading at or after the append (see above)
+    bool        carry     = false; ///< a transient lease topic's Carry (a Put with intent Upsert, appended only by the broker; spec A.3)
 };
 
 struct End {
@@ -65,6 +66,9 @@ struct KeyModel {
     std::vector<End> ends;          ///< in log order
     std::set<int64_t> seenGrants;   ///< every grant record in the log
     uint64_t checkpoints = 0;
+    // ---- transient lease topics (spec Appendix A) ----
+    bool lenient = false;                 ///< the fold was reset (the tap fell behind the ring): it replays the ring, whose head has lost history
+    std::vector<int64_t> lostVersions;    ///< versions of leases a full restart killed (the fence leg keeps alive / updates / revokes them: LeaseNotFound)
 };
 
 class Model {
@@ -135,37 +139,60 @@ public:
         KeyModel& m = key(k);
         switch (r.op) {
         case RecOp::Put:
+            if (r.carry) {   // a Carry (spec A.3): the live row verbatim.  Data folds see an upsert of the same row.
+                if (m.foldLive == r.version) {
+                    if (r.a != m.foldA) return "T2: a Carry of " + m.name + " version " + std::to_string(r.version) + " (offset " + std::to_string(r.offset) + ") carries a=" + std::to_string(r.a) +
+                                               " but the log's current row has a=" + std::to_string(m.foldA) + ": a stale row was copied";
+                    ++carries;
+                    return {};
+                }
+                for (const End& e : m.ends)
+                    if (e.version == r.version) { ++staleCarries; return {}; }   // after the key's end: a stale broker record, never applied
+                if (m.foldLive == 0 && m.lenient) { m.foldLive = r.version; m.foldA = r.a; ++carries; return {}; }   // the ring replay's first sight of a live lease
+                return "T2: a Carry of " + m.name + " version " + std::to_string(r.version) + " (offset " + std::to_string(r.offset) + ") but the log's live version is " + std::to_string(m.foldLive);
+            }
             if (r.version == r.offset) {   // a grant
-                if (m.foldLive != 0) return "I1: grant record " + std::to_string(r.offset) + " of " + m.name + " while version " + std::to_string(m.foldLive) + " has no end record";
-                if (!m.seenGrants.empty() && r.version <= *m.seenGrants.rbegin()) return "I2: grant record " + std::to_string(r.version) + " of " + m.name + " does not exceed an earlier one";
-                m.seenGrants.insert(r.version);
+                const bool replay = m.lenient && m.seenGrants.count(r.version) != 0;
+                if (!replay) {
+                    if (m.foldLive != 0 && !m.lenient) return "I1: grant record " + std::to_string(r.offset) + " of " + m.name + " while version " + std::to_string(m.foldLive) + " has no end record";
+                    if (!m.seenGrants.empty() && r.version <= *m.seenGrants.rbegin() && !m.lenient) return "I2: grant record " + std::to_string(r.version) + " of " + m.name + " does not exceed an earlier one";
+                    m.seenGrants.insert(r.version);
+                }
                 m.foldLive = r.version;
                 m.foldA = r.a;
                 const bool acked = std::find(m.granted.begin(), m.granted.end(), r.version) != m.granted.end();   // acked, then maybe revoked / expired before the tap showed it
-                if (m.live != r.version && !m.doubt && !acked) {
+                if (!replay && m.live != r.version && !m.doubt && !acked) {
                     // the log shows a grant the driver never saw acknowledged and had no call in doubt for
                     return "log: grant record " + std::to_string(r.version) + " of " + m.name + " that no acknowledged call produced (live " + std::to_string(m.live) + ")";
                 }
-                if (m.doubt && m.live != r.version && !acked) {   // an in-doubt grant landed: adopt it (no acknowledged bound: lo stays 0)
+                if (!replay && m.doubt && m.live != r.version && !acked) {   // an in-doubt grant landed: adopt it (no acknowledged bound: lo stays 0)
                     m.live = r.version;
                     m.granted.push_back(r.version);
                     m.lo = m.grantLo = 0;
                 }
             } else {   // an update keeps the lease's version
-                if (m.foldLive != r.version) return "log: update record " + std::to_string(r.offset) + " of " + m.name + " for version " + std::to_string(r.version) + " but the live version is " + std::to_string(m.foldLive);
+                if (m.foldLive != r.version) {
+                    if (!(m.lenient && m.foldLive == 0)) return "log: update record " + std::to_string(r.offset) + " of " + m.name + " for version " + std::to_string(r.version) + " but the live version is " + std::to_string(m.foldLive);
+                    m.foldLive = r.version;   // a reset fold: the ring head has lost the grant
+                }
                 m.foldA = r.a;
             }
             return {};
         case RecOp::Revoke:
         case RecOp::Expire: {
             for (const End& e : m.ends)
-                if (e.version == r.version) return "I4: a second end record (offset " + std::to_string(r.offset) + ") for " + m.name + " version " + std::to_string(r.version);
-            if (m.foldLive != r.version) return "I4: end record " + std::to_string(r.offset) + " of " + m.name + " for version " + std::to_string(r.version) + " but the log's live version is " + std::to_string(m.foldLive);
+                if (e.version == r.version) {
+                    if (m.lenient) return {};   // a replay of an end already folded
+                    return "I4: a second end record (offset " + std::to_string(r.offset) + ") for " + m.name + " version " + std::to_string(r.version);
+                }
+            const bool orphan = m.foldLive != r.version;
+            if (orphan && !m.lenient) return "I4: end record " + std::to_string(r.offset) + " of " + m.name + " for version " + std::to_string(r.version) + " but the log's live version is " + std::to_string(m.foldLive);
             m.ends.push_back(End{r.version, r.op, r.rxNs});
-            m.foldLive = 0;
+            if (!orphan) m.foldLive = 0;
             if (r.op == RecOp::Revoke) {
                 if (!m.pendingRevoke.erase(r.version)) {
                     if (m.live == r.version && m.doubt) m.live = 0;   // an in-doubt revoke landed
+                    else if (m.lenient && m.live != r.version) {}      // the replay of an acknowledged revoke whose pending mark a reset dropped
                     else return "log: a Revoke record of " + m.name + " version " + std::to_string(r.version) + " that no acknowledged revoke produced";
                 }
             } else {
@@ -174,6 +201,7 @@ public:
                     return "I3: Expire of " + m.name + " version " + std::to_string(r.version) + " seen at " + std::to_string(r.rxNs) + " ns, before the acknowledged deadline " + std::to_string(m.lo) +
                            " ns (" + std::to_string((m.lo - r.rxNs) / 1000) + " us early, slack " + std::to_string(slackNs / 1000) + " us)";
                 if (m.live == r.version) m.live = 0;
+                else if (m.lenient && (m.live == 0 || r.version < m.live)) {}   // the replay of an end the driver already knows
                 else if (m.live != 0) return "I1: Expire of version " + std::to_string(r.version) + " while the driver's live version of " + m.name + " is " + std::to_string(m.live);
                 else return "I4: Expire of " + m.name + " version " + std::to_string(r.version) + " that the driver believes already ended (an acknowledged revoke: " +
                             (m.pendingRevoke.count(r.version) ? "yes" : "no") + ")";
@@ -218,6 +246,29 @@ public:
         return best;
     }
 
+    /// A full restart of a transient lease topic: the rings were reborn, every lease is lost (spec A.6).  Each key starts over (offsets, so
+    /// versions, restart from the new ring's start); the versions it held stay in `lostVersions` for the LeaseNotFound probes.
+    void rebirth() {
+        for (KeyModel& m : keys_) {
+            KeyModel f;
+            f.name         = m.name;
+            f.lostVersions = m.lostVersions;
+            for (int64_t v : m.granted) f.lostVersions.push_back(v);
+            if (m.live != 0 && (f.lostVersions.empty() || f.lostVersions.back() != m.live)) f.lostVersions.push_back(m.live);
+            if (f.lostVersions.size() > 8) f.lostVersions.erase(f.lostVersions.begin(), f.lostVersions.end() - 8);
+            m = std::move(f);
+        }
+    }
+    /// The tap fell behind the ring (or the ring was reborn under it): the fold of `k` is recomputed from the ring's contents, which replay
+    /// from its head.  The acknowledged side (live, granted, deadlines) stays: the ring must still show every live lease (T2).
+    void resetFold(int k) {
+        KeyModel& m = key(k);
+        m.foldLive = 0;
+        m.foldA    = 0;
+        m.pendingRevoke.clear();
+        m.lenient  = true;
+    }
+
     /// Ends the doubt on `k`: the key's state is what the log fold says.
     void resolve(int k) {
         KeyModel& m = key(k);
@@ -233,6 +284,9 @@ public:
     /// The state the log fold implies for `k`, to compare with a lease view row.
     struct Fold { int64_t live; uint64_t a; };
     [[nodiscard]] Fold fold(int k) const { return Fold{key(k).foldLive, key(k).foldA}; }
+
+    uint64_t carries      = 0;   ///< Carry records folded
+    uint64_t staleCarries = 0;   ///< Carry records seen after their key's end (a stale broker record: never applied)
 
 private:
     std::vector<KeyModel> keys_;

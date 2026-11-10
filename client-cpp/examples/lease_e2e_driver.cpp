@@ -24,6 +24,13 @@
 //                 time is CLOCK_REALTIME, taken in the handler: Expire records carry timestamp 0).  Writes FILE-ready (READY) once the
 //                 initial scan is done and the live set holds ready-live leases.  Ends on F, on expect-expired distinct Expired keys
 //                 (plus 2 s to catch duplicates), or at max-s.  Fails on a (key, version) Expired twice.
+//   transient   --topic T --out FILE --down-file F --go-file F [--count N] [--partitions N] [--define 0|1] [--max-s N]
+//                 Task 32 (spec Appendix A): a TRANSIENT lease topic (max_ttl 1000 ms, the smallest) through a FULL broker restart, one
+//                 client process throughout.  Defines the topic, grants N keys (after the gen-0 fence), runs a LeaseWatch, keeps every key
+//                 alive and writes `READY live=<n>` to FILE.  When F=--down-file exists the keepalives stop (the script is stopping the
+//                 brokers); when --go-file exists (all three are back) it expects: keepalives of the old keys are LeaseNotFound (T5);
+//                 grants are held (Throttled / client timeout) while the new lineage fences, then succeed (T4); the watch ends every old
+//                 key exactly once (A.7).  Prints `TRANSIENT ...` and LEASE-E2E-TRANSIENT: OK, or LEASE-E2E-TRANSIENT: FAIL: <reason>.
 //   scale-hold  --topic T --count N --ttl-ms N --out FILE [--stop-file F] [--max-s N]
 //                 grants N leases through 3 LeaseSessions (one session holds at most 4095), writes `HELD <n>` and keeps them alive,
 //                 appending `ALIVE lost=<n> atrisk=<n> ok=<n>` every second.
@@ -95,6 +102,8 @@ using rune::gen::LeaseClaim;
 namespace {
 
 constexpr uint16_t kKeyExists = static_cast<uint16_t>(rune::protocol::client::ErrorCode::KeyExists);
+constexpr uint16_t kNotFound  = static_cast<uint16_t>(rune::protocol::client::ErrorCode::LeaseNotFound);
+constexpr uint16_t kThrottled = static_cast<uint16_t>(rune::protocol::client::ErrorCode::Throttled);
 
 // ---- plumbing ---------------------------------------------------------------------------------------------------------
 
@@ -493,6 +502,197 @@ int runWatch(const Args& a) {
     if (expectExpired > 0 && static_cast<int64_t>(ctx.expired.size()) != expectExpired)
         return failWith("WATCH", std::to_string(ctx.expired.size()) + " Expired keys, want " + std::to_string(expectExpired));
     return ok("WATCH", "expired=" + std::to_string(ctx.expired.size()) + " events=" + std::to_string(ctx.expiredEvents));
+}
+
+
+// ---- transient ---------------------------------------------------------------------------------------------------------
+
+/// The transient leg's watch log: which keys are live, how often each ended (Revoked / Expired / Vanished all end a lease).
+struct TransientLog {
+    std::map<std::string, int64_t> live;
+    std::map<std::string, int>     ended;
+    int                            bad = 0, failed = 0;
+    static void fn(void* ctx, const rc::LeaseEvent& e) {
+        auto&             w = *static_cast<TransientLog*>(ctx);
+        const std::string k = keyText(e.key);
+        switch (e.kind) {
+        case rc::LeaseEventKind::Granted: w.live[k] = e.version; break;
+        case rc::LeaseEventKind::Revoked:
+        case rc::LeaseEventKind::Expired:
+        case rc::LeaseEventKind::Vanished:
+            if (w.live.erase(k) == 0) ++w.bad;   // an end for a lease the watch never saw live
+            ++w.ended[k];
+            break;
+        case rc::LeaseEventKind::Failed: ++w.failed; break;
+        default: break;
+        }
+    }
+};
+
+/// Lease topics Task 32 (spec Appendix A, A.6 / A.7): a TRANSIENT lease topic through a FULL broker restart, one client process throughout.
+///   before : define the topic (max_ttl 1000 ms, the smallest legal), wait out the generation-0 fence (grants are Throttled until the runtime is
+///            ready, then judged as usual), grant --count keys, start a LeaseWatch, keep every key alive; write "READY live=N" to --out;
+///   --down-file exists : the script is about to stop all three brokers (the keepalives stop; the watch keeps running);
+///   --go-file exists   : the script has restarted all three brokers.  The restart emptied the rings (T4/T5):
+///     - every old key's keepalive answers LeaseNotFound (never Ok), judged once the broker answers again;
+///     - grants are held (Throttled; the client retries it until its op timeout) while the new lineage's fence runs, then succeed;
+///     - the watch reports every old key ended exactly once (A.7: the watch reruns on the data reset and ends the keys it lost).
+int runTransient(const Args& a) {
+    const std::string topic = a.str("topic", "transient"), out = a.str("out"), downFile = a.str("down-file"), goFile = a.str("go-file");
+    const int64_t     count = a.num("count", 20), maxS = a.num("max-s", 300);
+    constexpr int64_t kTtlMs = 1000;   // the smallest legal max_ttl (kLeaseMinTtlFloorMs): the shortest fence
+    if (downFile.empty() || goFile.empty()) return failWith("TRANSIENT", "--down-file and --go-file are required");
+    const int64_t startMs = realtimeMs();
+    const auto    over    = [&] { return realtimeMs() - startMs > maxS * 1000; };
+
+    rc::Client c(makeConfig());
+    c.connectAndWait();
+    if (a.num("define", 1) != 0) {
+        rc::TopicOptions to;
+        to.replicationFactor = 3;
+        rune::protocol::LeaseSpec spec;
+        spec.ttlMs                = kTtlMs;
+        spec.minTtlMs             = kTtlMs;
+        spec.maxTtlMs             = kTtlMs;
+        spec.checkpoint           = 0;
+        spec.checkpointIntervalMs = 1000;
+        to.lease                  = spec;
+        to.config.cleanupPolicy   = 1;
+        const auto r = c.defineTopicAndWait(topic, static_cast<uint32_t>(a.num("partitions", 2)), "claim", claimBlob(), rc::Persistence::Transient, to, {}, 60s);
+        if (r.errorCode != 0) return failWith("TRANSIENT", "define " + topic + ": error " + std::to_string(r.errorCode) + " " + r.detail);
+    }
+    auto lt = c.openLeaseTopicAndWait<LeaseClaim>(topic, {}, 30s);
+    rc::LeaseOptions o;
+    o.ttlMs  = kTtlMs;
+    o.holder = 1;
+
+    // The generation-0 fence opens at once, but the first partition leaders and lease runtimes take a moment: a warm-up key retried (bounded)
+    // until a grant is answered.  Its lease is not used (it expires on its own).
+    {
+        bool warm = false;
+        for (int i = 0; i < 60 && !warm && !over(); ++i) {
+            const rc::LeaseResult g = lt.grantAndWait(claimRow("tw-warm"), o, 2s);
+            warm = g.ok() || g.errorCode == kKeyExists;
+            if (!warm) std::this_thread::sleep_for(500ms);
+        }
+        if (!warm) return failWith("TRANSIENT", "no grant was answered Ok in the first generation (the gen-0 fence must open at once)");
+    }
+    struct Old { std::string key; int64_t version; };
+    std::vector<Old> olds;
+    for (int64_t i = 0; i < count; ++i) {
+        char key[32];
+        std::snprintf(key, sizeof key, "tk-%04lld", static_cast<long long>(i));
+        const rc::LeaseResult g = lt.grantAndWait(claimRow(key), o, 10s);
+        if (!g.ok()) return failWith("TRANSIENT", std::string("grant ") + key + ": status " + std::to_string(int(g.status)) + " err " + std::to_string(g.errorCode));
+        olds.push_back({key, g.version});
+    }
+
+    TransientLog          log;
+    rc::LeaseWatchOptions wo;
+    wo.maxLive = 4096;
+    wo.maxRows = 256;
+    rc::LeaseWatch<LeaseClaim> watch(c, lt, wo);
+    watch.setHandler(&TransientLog::fn, &log);
+    const std::vector<uint8_t>     none;
+    const std::span<const uint8_t> prefixes[] = {std::span<const uint8_t>(none)};
+    if (watch.startFromNow(prefixes) != rc::OpResult::Accepted) return failWith("TRANSIENT", "startFromNow refused");
+    const auto driveWatch = [&] {
+        watch.doWork(c.nowNs());
+        if (watch.failed() || log.failed != 0) return false;
+        return true;
+    };
+    const auto keepAll = [&]() -> std::string {   // every old key kept alive; "" = all Ok
+        for (const Old& k : olds) {
+            const rc::LeaseResult r = lt.keepAliveOnceAndWait(claimRow(k.key), k.version, {}, 5s);
+            if (!r.ok()) return k.key + ": status " + std::to_string(int(r.status)) + " err " + std::to_string(r.errorCode);
+            if (!driveWatch()) return "the watch failed";
+        }
+        return {};
+    };
+
+    // before the restart: the watch is ready with every key live; the keys are kept alive until the script is about to stop the brokers
+    int64_t lastKeepMs = 0;
+    bool    ready = false;
+    while (!fileExists(downFile)) {
+        if (over()) return failWith("TRANSIENT", "the script never signalled the restart within " + std::to_string(maxS) + " s");
+        if (!driveWatch()) return failWith("TRANSIENT", "the watch failed before the restart");
+        const int64_t now = realtimeMs();
+        if (now - lastKeepMs >= 250) {
+            if (const std::string e = keepAll(); !e.empty()) return failWith("TRANSIENT", "a lease was lost before the restart: " + e);
+            lastKeepMs = realtimeMs();
+        }
+        if (!ready && watch.isReady() && log.live.size() >= olds.size()) {
+            for (const Old& k : olds)
+                if (log.live.count(k.key) == 0) return failWith("TRANSIENT", "the watch is ready without " + k.key + " live");
+            appendLine(out, "READY live=" + std::to_string(log.live.size()));
+            ready = true;
+        }
+        idle();
+    }
+    if (!ready) return failWith("TRANSIENT", "the script signalled the restart before the watch was ready with every key live");
+    // the brokers are going down: no more keepalives; the watch keeps running until the script reports them back
+    while (!fileExists(goFile)) {
+        if (over()) return failWith("TRANSIENT", "the script never reported the brokers back within " + std::to_string(maxS) + " s");
+        if (!driveWatch()) return failWith("TRANSIENT", "the watch failed during the restart");
+        idle();
+    }
+
+    // after the restart: serve first (an old key's keepalive is LeaseNotFound, never Ok), then grants are held until the fence opens
+    int64_t servedMs = 0, grantedMs = 0, held = 0, heldAfterServed = 0;
+    for (int i = 0; grantedMs == 0; ++i) {
+        if (over()) return failWith("TRANSIENT", "no grant succeeded after the restart within " + std::to_string(maxS) + " s (the fence must end)");
+        if (!driveWatch()) return failWith("TRANSIENT", "the watch failed after the restart");
+        if (servedMs == 0) {
+            const rc::LeaseResult r = lt.keepAliveOnceAndWait(claimRow(olds[0].key), olds[0].version, {}, 3s);
+            if (r.ok()) return failWith("TRANSIENT", "T5: the keepalive of " + olds[0].key + " succeeded after a full restart (its lease must be gone)");
+            if (r.errorCode == kNotFound) servedMs = realtimeMs();
+            else std::this_thread::sleep_for(100ms);
+            continue;
+        }
+        char key[32];
+        std::snprintf(key, sizeof key, "tp-%04d", i);
+        const rc::LeaseResult g = lt.grantAndWait(claimRow(key), o, 1s);
+        if (g.ok()) {
+            grantedMs = realtimeMs();
+        } else if (g.errorCode == kThrottled || g.status == rc::OpStatus::Timeout) {
+            ++held;   // held by the fence (the client retries a Throttled answer until its op timeout)
+            ++heldAfterServed;
+        } else {
+            return failWith("TRANSIENT", "a grant after the restart answered status " + std::to_string(int(g.status)) + " err " + std::to_string(g.errorCode) + ", want Throttled then Ok");
+        }
+    }
+    // every old lease: gone (T5)
+    for (const Old& k : olds) {
+        rc::LeaseResult r;
+        for (int t = 0; t < 10; ++t) {
+            r = lt.keepAliveOnceAndWait(claimRow(k.key), k.version, {}, 3s);
+            if (r.ok() || r.errorCode == kNotFound) break;
+            std::this_thread::sleep_for(100ms);
+        }
+        if (r.ok()) return failWith("TRANSIENT", "T5: the keepalive of " + k.key + " succeeded after a full restart (its lease must be gone)");
+        if (r.errorCode != kNotFound) return failWith("TRANSIENT", "the keepalive of " + k.key + " answered status " + std::to_string(int(r.status)) + " err " + std::to_string(r.errorCode) + ", want LeaseNotFound");
+    }
+    // the watch ends every old key exactly once (A.7), then 2 s more: a duplicate would show
+    int64_t doneAtMs = 0;
+    for (;;) {
+        if (over()) return failWith("TRANSIENT", "the watch did not end every old key within " + std::to_string(maxS) + " s");
+        if (!driveWatch()) return failWith("TRANSIENT", "the watch failed while ending the old keys");
+        bool all = true;
+        for (const Old& k : olds) all = all && log.ended.count(k.key) != 0;
+        const int64_t now = realtimeMs();
+        if (all && doneAtMs == 0) doneAtMs = now;
+        if (doneAtMs != 0 && now - doneAtMs >= 2000) break;
+        idle();
+    }
+    for (const Old& k : olds)
+        if (log.ended[k.key] != 1) return failWith("TRANSIENT", "T5: the watch ended " + k.key + " " + std::to_string(log.ended[k.key]) + " times, want exactly once");
+    if (log.bad != 0) return failWith("TRANSIENT", std::to_string(log.bad) + " ends for leases the watch never saw live");
+    std::printf("TRANSIENT old=%zu served_ms=%lld first_grant_ms=%lld grants_held=%lld held_after_served=%lld\n", olds.size(), static_cast<long long>(servedMs),
+                static_cast<long long>(grantedMs), static_cast<long long>(held), static_cast<long long>(heldAfterServed));
+    // The fence (max_ttl + extend after the new leader is ready) is not observable from a client: held_after_served 0 only means the client
+    // reconnected after the fence had run; the broker-side proof is LeaseStressRegression.Transient*Regression (T4).
+    if (heldAfterServed == 0) std::printf("TRANSIENT note: the first grant after the first answer was already accepted (the client reconnected after the fence)\n");
+    return ok("TRANSIENT", "old=" + std::to_string(olds.size()));
 }
 
 // ---- scale-hold --------------------------------------------------------------------------------------------------------
@@ -929,6 +1129,7 @@ int usage() {
                  "  scan        --topic T [--expect-present K] [--expect-absent K]\n"
                  "  hold        --topic T --key K --ttl-ms N --out FILE [--keep-ms N] [--stop-file F] [--max-s N]\n"
                  "  watch       --topic T --log FILE --ready FILE --stop-file F [--max-s N] [--ready-live N] [--expect-expired N]\n"
+                 "  transient   --topic T --out FILE --down-file F --go-file F [--count N] [--partitions N] [--define 0|1] [--max-s N]\n"
                  "  scale-hold  --topic T --count N --ttl-ms N --out FILE [--stop-file F] [--max-s N]\n"
                  "  ckpt-poll   --topic T --key K [--below N] [--max-s N]\n"
                  "  elect       --topic T --tag X --out FILE [--name N] [--stop-file F] [--max-s N]\n"
@@ -951,6 +1152,7 @@ int main(int argc, char** argv) {
         if (mode == "scan") return runScan(a);
         if (mode == "hold") return runHold(a);
         if (mode == "watch") return runWatch(a);
+        if (mode == "transient") return runTransient(a);
         if (mode == "scale-hold") return runScaleHold(a);
         if (mode == "ckpt-poll") return runCkptPoll(a);
         if (mode == "elect") return runElect(a);

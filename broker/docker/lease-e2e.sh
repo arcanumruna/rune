@@ -26,6 +26,9 @@
 #                  a new grant works;
 #   6. ELECTION:   two LeaseElection candidates on e2e/elect (TTL 3 s, one lease session each); the leader is SIGSTOPped past the TTL,
 #                  the other leads with a LARGER fencing token; the first is resumed and must report LOST and a REFUSED fenced write.
+#   7. TRANSIENT:  a transient lease topic (max_ttl 1 s) with 20 held leases and a LeaseWatch goes through a FULL restart of all 3 nodes (every
+#                  ring is empty, a new lineage): each old key's keepalive is LeaseNotFound, grants are held (Throttled) until the fence opens
+#                  and then succeed, the watch ends each old key exactly once (spec Appendix A.6 / A.7);
 #
 # Clock.  Expire / Checkpoint records carry timestamp 0, so every lateness is measured on RECEIVE time: the watcher stamps each
 # event with CLOCK_REALTIME (ms) in its handler, and the script's `date +%s%3N` is the same domain (containers share the host
@@ -80,6 +83,8 @@ SCALE_COUNT=10000
 GUARD_TTL_MS=3000
 CKPT_TTL_MS=15000
 ELECT_TTL_MS=3000
+TRANSIENT_TTL_MS=1000   # the smallest legal max_ttl (kLeaseMinTtlFloorMs): the shortest rebirth fence
+TRANSIENT_KEYS=20
 NS="e2e"
 
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
@@ -686,5 +691,25 @@ touch "${SHARED}/elect-b.stop"
 wait_until 60 "candidate B to stop" bg_done elect-b || { out_of elect-b | tail -20 >&2; fail "B did not stop"; }
 bg_leg_check elect-b "LEASE-E2E-ELECT: OK"
 leg_end ELECTION "${LEG_S}"
+
+# ---------------------------------------------------------------------------
+# Leg 7: TRANSIENT (a transient lease topic through a FULL restart of the cluster, the default config; spec Appendix A.6 / A.7).
+# ---------------------------------------------------------------------------
+leg_begin TRANSIENT "a transient lease topic (max_ttl ${TRANSIENT_TTL_MS} ms) through a full restart of all 3 nodes: LeaseNotFound for every old key, grants held then Ok, the watch ends each old key once..."
+rm -f "${SHARED}"/transient*
+drv_start transient $(( LEG_S + 90 )) "${APP_USER}" app.pw transient --topic transient --partitions 2 --count "${TRANSIENT_KEYS}" --out /shared/transient.out --down-file /shared/transient.down --go-file /shared/transient.go --max-s $(( LEG_S + 60 ))
+wait_until 180 "the transient driver ready" has_line transient.out READY || { out_of transient | tail -20 >&2; fail "the transient driver did not report READY (topic defined, ${TRANSIENT_KEYS} keys granted, the watch live on all of them) within 180s"; }
+log "TRANSIENT: ${TRANSIENT_KEYS} leases held and watched; stopping all 3 nodes..."
+touch "${SHARED}/transient.down"
+sleep 1
+for id in 0 1 2; do kill_node "${id}"; done
+for id in 0 1 2; do start_node "${id}"; done
+for id in 0 1 2; do await_links "${id}"; done
+log "TRANSIENT: all 3 nodes are back (every ring is empty); the driver judges the new lineage..."
+touch "${SHARED}/transient.go"
+wait_until $(( LEG_S + 60 )) "the transient driver to finish" bg_done transient || { out_of transient | tail -30 >&2; fail "the transient driver did not finish within $(( LEG_S + 60 ))s of the restart"; }
+bg_leg_check transient "LEASE-E2E-TRANSIENT: OK"
+log "TRANSIENT: $(grep -E '^TRANSIENT ' "${WORK_DIR}/transient.out" | head -2 | tr '\n' ' ')"
+leg_end TRANSIENT "$(( LEG_S + 120 ))"
 
 echo "LEASE-E2E: OK"
