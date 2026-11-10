@@ -2134,9 +2134,10 @@ full restart, and fencing by version does not hold across a full restart. Plan p
 - Broker appends (`Expire`, `Checkpoint`, `Carry`, the fence) may use the reserve. If even the reserve is full, a
   broker append is refused `kAppendBackPressure` and counted in `rune_lease_expiry_backlog`, as §9.1 says; the next
   cycle retries. An `Expire` frees its key's anchor once it folds, so expiry makes room for the next one.
-- `InMemoryLog` gets `appendKeepingFree(data, len, lastOffset, reserve)`, which refuses `kRefusedFull` instead of
-  dipping into the reserve; plain `append` is unchanged. The replica uses it for client batches on a transient
-  lease partition only.
+- `InMemoryLog` gets a produce reserve (`setProduceReserve(bytes)`), applied only by `appendNoSyncRestamp`, the
+  client produce path: it refuses `kRefusedFull` instead of dipping into the reserve. Every other append (replication,
+  control batches, the lease emitter) is unchanged. The replica arms it on the leader of a transient lease partition
+  only (`prepareTransientAppend`).
 
 ### A.5 Sizing rule
 

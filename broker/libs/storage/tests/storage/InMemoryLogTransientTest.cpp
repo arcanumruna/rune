@@ -11,6 +11,7 @@
 #include <rune/protocol/client/Protocol.h>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -282,4 +283,150 @@ TEST(InMemoryLogMultiBatchSpanRegression, SpanOfMoreBatchesThanTheEntryCapIsRefu
     const auto b2b = batchAt(2, 1);
     ASSERT_EQ(log.appendNoSync(b2b.data(), b2b.size(), 2), 2) << "the entry cap evicts per batch";
     EXPECT_EQ(log.logStartOffset(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Lease topics (spec A.3 / A.4): the produce reserve and bytesFrom().
+// ---------------------------------------------------------------------------
+#include <random>
+
+namespace {
+// A ring of 5 batches of length L, reserve L.  State: used = 3L (+1 for `plusOne`).
+struct ReserveRing {
+    std::vector<uint8_t> x = batchOf(1);
+    std::vector<uint8_t> y = batchOf(1, 101);
+    std::size_t L = x.size();
+    InMemoryLog log{5 * batchOf(1).size(), 1024};
+    int64_t base = -1;
+    // free = 2L (reserve + len) when !plusOne, 2L-1 when plusOne.
+    explicit ReserveRing(bool plusOne, int64_t floor) {
+        EXPECT_EQ(y.size(), L + 1);
+        log.setEvictionFloor(floor);
+        log.setProduceReserve(L);
+        EXPECT_GE(log.appendNoSync(x.data(), x.size(), 0), 0);
+        EXPECT_GE(log.appendNoSync(x.data(), x.size(), 1), 0);
+        const auto& third = plusOne ? y : x;
+        EXPECT_GE(log.appendNoSync(third.data(), third.size(), 2), 0);
+    }
+};
+} // namespace
+
+TEST(InMemoryLogReserveRegression, ReserveBoundariesRegression) {
+    // free == reserve + len: lands (floor blocking everything or not).
+    for (const int64_t floor : {int64_t{0}, std::numeric_limits<int64_t>::max()}) {
+        ReserveRing r(false, floor);
+        ASSERT_EQ(r.log.appendNoSyncRestamp(r.x.data(), r.x.size(), 0, r.base), 4) << "floor=" << floor;
+        EXPECT_EQ(r.log.logStartOffset(), 0);
+    }
+    // free == reserve + len - 1, floor blocks: refused, nothing evicted, counters unchanged.
+    {
+        ReserveRing r(true, 0);
+        EXPECT_EQ(r.log.appendNoSyncRestamp(r.x.data(), r.x.size(), 0, r.base), InMemoryLog::kRefusedFull);
+        EXPECT_EQ(r.log.logStartOffset(), 0);
+        EXPECT_EQ(r.log.logEndOffset(), 3);
+        EXPECT_EQ(r.log.evictedRecords(), 0u);
+        EXPECT_EQ(r.log.fullRefusals(), 1u);
+    }
+    // ... the same append, reserve not applied (plain append): lands without evicting.
+    {
+        ReserveRing r(true, 0);
+        ASSERT_EQ(r.log.appendNoSync(r.x.data(), r.x.size(), 3), 3);
+        EXPECT_EQ(r.log.logStartOffset(), 0);
+        EXPECT_EQ(r.log.evictedRecords(), 0u);
+    }
+    // free == reserve + len - 1, floor lets one batch go: the reserve evicts it and lands.
+    {
+        ReserveRing r(true, 1);
+        ASSERT_EQ(r.log.appendNoSyncRestamp(r.x.data(), r.x.size(), 0, r.base), 4);
+        EXPECT_EQ(r.log.logStartOffset(), 1);
+    }
+    // ... and with NO floor the reserve evicts as needed.
+    {
+        ReserveRing r(true, std::numeric_limits<int64_t>::max());
+        ASSERT_EQ(r.log.appendNoSyncRestamp(r.x.data(), r.x.size(), 0, r.base), 4);
+        EXPECT_EQ(r.log.logStartOffset(), 1);
+    }
+    // Reserve 0 behaves exactly as before: the same state lands at once.
+    {
+        ReserveRing r(true, 0);
+        r.log.setProduceReserve(0);
+        EXPECT_EQ(r.log.produceReserve(), 0u);
+        ASSERT_EQ(r.log.appendNoSyncRestamp(r.x.data(), r.x.size(), 0, r.base), 4);
+        EXPECT_EQ(r.log.logStartOffset(), 0);
+        EXPECT_EQ(r.log.fullRefusals(), 0u);
+    }
+}
+
+TEST(InMemoryLogReserveRegression, WrapPaddingCountsRegression) {
+    const auto x = batchOf(1);
+    const std::size_t L = x.size();
+    const auto z = batchOf(1, 100 + L / 2);
+    const std::size_t Z = z.size();
+    ASSERT_GT(Z, L);
+    ASSERT_LE(Z, 2 * L);
+    InMemoryLog log(5 * L, 1024);
+    log.setEvictionFloor(0);
+    for (int i = 0; i < 4; ++i) ASSERT_GE(log.appendNoSync(x.data(), x.size(), i), 0);   // tail = 4L, la = L < Z: wraps
+    log.setProduceReserve(L);
+    int64_t base = -1;
+    log.setEvictionFloor(2);   // offsets 0 and 1 may go; 2 may not
+    // After evicting 0 and 1: used 2L + (Z + L padding) + reserve L = 4L + Z > 5L.  Without the padding it would fit.
+    EXPECT_EQ(log.appendNoSyncRestamp(z.data(), Z, 0, base), InMemoryLog::kRefusedFull);
+    EXPECT_EQ(log.logStartOffset(), 0);
+    EXPECT_EQ(log.evictedRecords(), 0u) << "a refusal evicted";
+    log.setEvictionFloor(3);   // offset 2 may go too
+    ASSERT_EQ(log.appendNoSyncRestamp(z.data(), Z, 0, base), 5);
+    EXPECT_EQ(log.logStartOffset(), 3);
+}
+
+TEST(InMemoryLogBytesFromRegression, MatchesEvictionRegression) {
+    InMemoryLog empty(1 << 12, 64);
+    EXPECT_EQ(empty.bytesFrom(0), 0u);
+    EXPECT_EQ(empty.bytesFrom(-5), 0u);
+
+    constexpr std::size_t kCap = 6000;
+    InMemoryLog log(kCap, 64);
+    std::mt19937_64 rng(0xC0FFEE);
+    struct E { int64_t base; int64_t last; std::size_t len; const uint8_t* ptr; };
+    std::vector<E> all;
+    const uint8_t* ringBase = nullptr;
+    int checked = 0, wrapsSeen = 0;
+    for (int step = 0; step < 600; ++step) {
+        const auto b = batchOf(1 + static_cast<int>(rng() % 3), 20 + static_cast<std::size_t>(rng() % 700));
+        int64_t base = -1;
+        const int64_t next = log.appendNoSyncRestamp(b.data(), b.size(), deltaOf(b), base);
+        ASSERT_GT(next, 0);
+        const auto v = log.readView(base, static_cast<int32_t>(b.size()));
+        ASSERT_FALSE(v.empty());
+        if (all.empty()) ringBase = v.data;   // the first append lands at ring offset 0
+        all.push_back({base, next - 1, b.size(), v.data});
+        // The live entries, oldest first.
+        std::vector<E> live;
+        for (const auto& e : all) if (e.last >= log.logStartOffset()) live.push_back(e);
+        ASSERT_FALSE(live.empty());
+        // Oracle: bytes of the suffix = sum of lengths + the padding after each pre-wrap batch.
+        std::size_t suffix = 0;
+        std::vector<std::size_t> expect(live.size());
+        for (std::size_t k = live.size(); k-- > 0;) {
+            suffix += live[k].len;
+            if (k + 1 < live.size() && live[k + 1].ptr < live[k].ptr) {
+                suffix += kCap - static_cast<std::size_t>(live[k].ptr - ringBase) - live[k].len;
+                ++wrapsSeen;
+            }
+            expect[k] = suffix;
+        }
+        for (std::size_t k = 0; k < live.size(); ++k) {
+            ASSERT_EQ(log.bytesFrom(live[k].base), expect[k]) << "step " << step << " entry " << k;
+            if (live[k].last > live[k].base) ASSERT_EQ(log.bytesFrom(live[k].base + 1), expect[k]) << "mid-batch offset";
+            ++checked;
+        }
+        ASSERT_EQ(log.bytesFrom(log.logStartOffset()), expect[0]);
+        ASSERT_EQ(log.bytesFrom(log.logStartOffset() - 1), expect[0]);
+        ASSERT_EQ(log.bytesFrom(std::numeric_limits<int64_t>::min()), expect[0]);
+        ASSERT_EQ(log.bytesFrom(log.logEndOffset()), 0u);
+        ASSERT_EQ(log.bytesFrom(log.logEndOffset() + 1000), 0u);
+    }
+    EXPECT_GT(checked, 1000);
+    EXPECT_GT(wrapsSeen, 100) << "the run must exercise wrap padding";
+    EXPECT_GT(log.logStartOffset(), 0) << "the run must exercise eviction";
 }

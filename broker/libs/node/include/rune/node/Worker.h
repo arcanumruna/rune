@@ -3563,8 +3563,17 @@ private:
             } else {
                 installAutoInc_(*sl.write, static_cast<int32_t>(sl.replica->partitionId()));
             }
+            armLeaseTransient_(sl.replica, sl.write.get());
         }
         rebuildWriteById_();
+    }
+
+    /// Lease topics (spec A.3/A.4): a memory-backed replica whose topic carries a lease spec runs the lease floors and the
+    /// produce reserve.  Idempotent; called wherever a slot's write state is installed or the replica is (re)attached.
+    void armLeaseTransient_(rune::replication::PartitionReplica* r, const PartitionWriteState* w) noexcept {
+        if (r->isDiskBacked()) return;
+        const bool want = w != nullptr && w->spec != nullptr && w->spec->lease.has_value();
+        if (r->leaseTransient() != want) r->setLeaseTransient(want);
     }
 
     [[nodiscard]] TopicWriteSpec& writeSpecOf_(int32_t topicId) {
@@ -7583,6 +7592,7 @@ private:
                     installAutoInc_(*slot.write, static_cast<int32_t>(r->partitionId()));
                 }
             bindVerdictHooks_(slot);
+            armLeaseTransient_(slot.replica, slot.write.get());
             next.push_back(std::move(slot));
         }
         // A state not carried over is freed below: its judge and key index go first (the replica may be gone, the judge is not).

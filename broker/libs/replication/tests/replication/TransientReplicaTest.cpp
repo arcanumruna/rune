@@ -7,8 +7,10 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/InMemoryLog.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/LeaseRecord.h>
 
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string>
 #include <vector>
@@ -319,4 +321,133 @@ TEST(TransientReplicaRegression, TransientResetFeedsTheTruncationFloorRegression
     ASSERT_EQ(r2.transientLogResetsForTest(), 1u);
     EXPECT_EQ(r2.takeTruncationFloor(), r2.lastTruncationOffset());
     EXPECT_EQ(r2.takeTruncationFloor(), std::numeric_limits<Offset>::max());
+}
+
+// ===========================================================================
+// Lease topics (spec A.3 / A.4): the leader's lease floor, the follower's
+// leader-start floor, and the produce reserve.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> frameOfBatches(int64_t first, int n) {   // n ~1.1 KiB stamped batches from `first`
+    std::vector<uint8_t> f;
+    for (int64_t b = first; b < first + n; ++b) {
+        const auto x = stampedBatch(b, 1024);
+        f.insert(f.end(), x.begin(), x.end());
+    }
+    return f;
+}
+FetchResponseMsg frameMsg(const std::vector<uint8_t>& f, Offset hw, Offset leaderStart) {
+    FetchResponseMsg r{};
+    r.leaderEpoch = 1; r.partition = 0; r.topicId = 7; r.errorCode = 0;
+    r.highWatermark = hw; r.logStartOffset = leaderStart;
+    r.records = std::span<const uint8_t>(f);
+    return r;
+}
+} // namespace
+
+TEST(TransientLeaseFloorRegression, LeaderNeverEvictsAtOrAboveLeaseFloorRegression) {
+    rune::storage::InMemoryLog mem(8 * 1024, 1000);
+    InMemoryTransport transport;
+    PartitionReplica r1(tcfg(1), Role::Leader, 1, {1}, {1}, &mem, &transport);
+    r1.setLeaseTransient(true);
+    const std::vector<uint8_t> payload(1024, 0x5A);
+    for (int i = 0; i < 3; ++i) ASSERT_GE(r1.append(std::span<const uint8_t>(payload), false), 0);
+    ASSERT_EQ(r1.highWatermark(), 3) << "a one-node ISR commits at once";
+    r1.setLeaseFloor(1);   // the 2nd batch is the head anchor
+    int refused = 0;
+    for (int i = 0; i < 64 && refused == 0; ++i)
+        if (r1.append(std::span<const uint8_t>(payload), false) < 0) ++refused;
+    EXPECT_EQ(refused, 1) << "the ring must refuse, not evict the batch at the lease floor";
+    EXPECT_EQ(mem.logStartOffset(), 1) << "the batch below the floor was evicted, the one at the floor never";
+    EXPECT_GE(mem.fullRefusals(), 1u);
+    r1.setLeaseFloor(std::numeric_limits<Offset>::max());   // floor lifted: HW alone rules, appends resume
+    EXPECT_GE(r1.append(std::span<const uint8_t>(payload), false), 0);
+    EXPECT_GT(mem.logStartOffset(), 1);
+}
+
+TEST(TransientLeaseFloorRegression, FollowerKeepsTheLeadersStartRegression) {
+    rune::storage::InMemoryLog mem(8 * 1024, 1000);   // holds ~7 of the ~1.1 KiB batches
+    InMemoryTransport transport;
+    PartitionReplica r2(tcfg(2), Role::Follower, 1, {1, 2}, {1, 2}, &mem, &transport);
+    r2.setLeaseTransient(true);
+    // f1 (3 batches) needs 3 batches' room PLUS the wrap gap (tail 5 batches in): all of 0..2 must go.
+    const auto f0 = frameOfBatches(0, 5), f1 = frameOfBatches(5, 3);
+    r2.applyReplicated(frameMsg(f0, 0, 0));
+    ASSERT_EQ(r2.logEndOffset(), 5);
+    // The leader still holds from 2; its HW is far above: the follower may evict 0 and 1 only (not enough).
+    r2.applyReplicated(frameMsg(f1, 5, 2));
+    EXPECT_EQ(r2.leaderLogStartForTest(), 2);
+    EXPECT_EQ(r2.logEndOffset(), 5) << "applying needs the batch at 2: refused, never evicted";
+    EXPECT_GE(r2.transientApplyFullRefusals(), 1u);
+    EXPECT_EQ(mem.logStartOffset(), 0) << "a refusal evicts nothing";
+    // A frame with a lower start (an error frame carries 0) does not lower it.
+    r2.applyReplicated(frameMsg(f1, 5, 0));
+    EXPECT_EQ(r2.leaderLogStartForTest(), 2);
+    EXPECT_EQ(r2.logEndOffset(), 5);
+    EXPECT_LE(mem.logStartOffset(), 2);
+    // The leader's start moves on: the follower evicts up to it and applies.
+    r2.applyReplicated(frameMsg(f1, 5, 4));
+    EXPECT_EQ(r2.leaderLogStartForTest(), 4);
+    EXPECT_EQ(r2.logEndOffset(), 8);
+    EXPECT_LE(mem.logStartOffset(), 4) << "evicted at or above the leader's start";
+    EXPECT_EQ(mem.logStartOffset(), 3);
+}
+
+TEST(TransientLeaseFloorRegression, PlainTransientUnchangedRegression) {
+    rune::storage::InMemoryLog mem(8 * 1024, 1000);
+    InMemoryTransport transport;
+    PartitionReplica r2(tcfg(2), Role::Follower, 1, {1, 2}, {1, 2}, &mem, &transport);
+    r2.setLeaseTransient(false);
+    EXPECT_FALSE(r2.leaseTransient());
+    const auto f0 = frameOfBatches(0, 5), f1 = frameOfBatches(5, 5);
+    r2.applyReplicated(frameMsg(f0, 0, 0));
+    r2.applyReplicated(frameMsg(f1, 5, 2));   // the leader's start is ignored: committed records go
+    EXPECT_EQ(r2.transientApplyFullRefusals(), 0u);
+    EXPECT_EQ(r2.logEndOffset(), 10);
+    EXPECT_GT(mem.logStartOffset(), 2) << "a plain transient follower evicts below its HW";
+    // A plain leader's floor is its HW, whatever the lease floor says.
+    rune::storage::InMemoryLog memL(8 * 1024, 1000);
+    PartitionReplica r1(tcfg(1), Role::Leader, 1, {1}, {1}, &memL, &transport);
+    const std::vector<uint8_t> payload(1024, 0x5A);
+    for (int i = 0; i < 3; ++i) ASSERT_GE(r1.append(std::span<const uint8_t>(payload), false), 0);
+    r1.setLeaseFloor(0);   // a lease floor means nothing on a plain transient topic
+    for (int i = 0; i < 64; ++i) ASSERT_GE(r1.append(std::span<const uint8_t>(payload), false), 0) << i;
+    EXPECT_GT(memL.logStartOffset(), 0);
+}
+
+TEST(TransientLeaseFloorRegression, ReserveOnlyForClientAppendsRegression) {
+    constexpr std::size_t kCapBytes = 256 * 1024;
+    rune::storage::InMemoryLog mem(kCapBytes, 100'000);
+    InMemoryTransport transport;
+    PartitionReplica r1(tcfg(1), Role::Leader, 1, {1}, {1}, &mem, &transport);
+    r1.setLeaseTransient(true);
+    ASSERT_EQ(r1.leaseReserveBytes(), 64u * 1024u);
+    r1.setLeaseFloor(0);   // nothing may be evicted
+    const std::vector<uint8_t> payload(1024, 0x5A);
+    // Fill with broker-shaped appends until the free space is within one batch of the reserve.
+    while (mem.capacityBytes() - r1.transientBytesFrom(0) > r1.leaseReserveBytes() + 4096)
+        ASSERT_GE(r1.append(std::span<const uint8_t>(payload), false), 0);
+    // A client-shaped append (what the worker does after prepareTransientAppend) walks into the reserve: refused.
+    r1.prepareTransientAppend();
+    EXPECT_EQ(mem.produceReserve(), r1.leaseReserveBytes());
+    rune::protocol::RecordBatchBuilder cb(0, 1000);
+    cb.append("k", std::string(1024, 'c'), 1000);
+    const auto clientBatch = cb.build();
+    int64_t base = -1, rc = 0, landed = 0;
+    for (int i = 0; i < 64 && (rc = mem.appendNoSyncRestamp(clientBatch.data(), clientBatch.size(), 0, base)) >= 0; ++i) ++landed;
+    EXPECT_EQ(rc, rune::storage::InMemoryLog::kRefusedFull);
+    EXPECT_LT(landed, 64);
+    const std::size_t freeNow = mem.capacityBytes() - r1.transientBytesFrom(0);
+    EXPECT_LT(freeNow, r1.leaseReserveBytes() + clientBatch.size()) << "the client stopped at the reserve";
+    EXPECT_GE(freeNow, r1.leaseReserveBytes() - clientBatch.size()) << "the reserve is intact";
+    // A broker lease batch still lands in the very same state.
+    rune::protocol::RecordBatchBuilder lb(0, 0);
+    lb.append("a", "1", 0, rune::protocol::record::withLeaseOp(0, rune::protocol::record::LeaseOp::Expire));
+    const auto leaseBatch = lb.build();
+    ASSERT_TRUE(PartitionReplica::isLeaseDataBatch(leaseBatch));
+    EXPECT_GE(r1.appendLeaseBatch(leaseBatch), 0) << "the broker's own append may use the reserve";
+    // A follower or a non-lease leader never arms it.
+    r1.setLeaseTransient(false);
+    r1.prepareTransientAppend();
+    EXPECT_EQ(mem.produceReserve(), 0u);
 }

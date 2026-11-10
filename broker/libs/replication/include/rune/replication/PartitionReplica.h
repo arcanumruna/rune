@@ -1396,7 +1396,36 @@ public:
     /// the current high watermark before an append that bypasses this replica
     /// (the worker produce path appends to memoryLog() directly).  No-op on a
     /// disk partition.  Owner thread.
-    void prepareTransientAppend() noexcept { refreshTransientEvictionFloor_(); }
+    void prepareTransientAppend() noexcept {
+        refreshTransientEvictionFloor_();
+        // Lease topics (spec A.4): only CLIENT appends (appendNoSyncRestamp) see the
+        // reserve, and only on the leader; broker appends and replication never do.
+        if (memoryBacked_)
+            memLog_->setProduceReserve(role_ == Role::Leader && leaseTransient_ ? leaseReserveBytes_ : 0);
+    }
+    /// Lease topics (spec A.3/A.4), owner thread, memory-backed only: arm the lease
+    /// floors and the produce reserve (max(capacity / 8, 64 KiB)).  Off = plain transient.
+    void setLeaseTransient(bool on) noexcept {
+        if (!memoryBacked_ || memLog_ == nullptr) return;
+        leaseTransient_ = on;
+        leaseReserveBytes_ = on ? std::max<std::size_t>(memLog_->capacityBytes() / 8, 64U * 1024U) : 0;
+        if (!on) leaseFloor_ = kNoLeaseFloor;
+        refreshTransientEvictionFloor_();
+    }
+    [[nodiscard]] bool leaseTransient() const noexcept { return leaseTransient_; }
+    [[nodiscard]] std::size_t leaseReserveBytes() const noexcept { return leaseReserveBytes_; }
+    /// The leader's lease floor (min of the head anchor and the fence anchor, A.3/A.6);
+    /// kNoLeaseFloor = none.  Kept by the worker's lease runtime.
+    void setLeaseFloor(Offset floor) noexcept { leaseFloor_ = floor; refreshTransientEvictionFloor_(); }
+    [[nodiscard]] Offset leaseFloor() const noexcept { return leaseFloor_; }
+    [[nodiscard]] Offset leaderLogStartForTest() const noexcept { return leaderLogStart_; }
+    /// Ring bytes held from offset `o` on (InMemoryLog::bytesFrom); 0 when disk-backed.
+    [[nodiscard]] std::size_t transientBytesFrom(Offset o) const noexcept {
+        return memoryBacked_ && memLog_ != nullptr ? memLog_->bytesFrom(o) : 0;
+    }
+    [[nodiscard]] std::size_t transientCapacityBytes() const noexcept {
+        return memoryBacked_ && memLog_ != nullptr ? memLog_->capacityBytes() : 0;
+    }
     /// Follower ring restarts at the leader's ring start / replicated applies the ring refused.
     [[nodiscard]] uint64_t transientLogResetsForTest() const noexcept { return transientLogResets_; }
     [[nodiscard]] uint64_t transientApplyRefusalsForTest() const noexcept {
@@ -1414,9 +1443,21 @@ private:
     uint64_t transientApplyTooLargeRefusals_ = 0;
     /// The ring never evicts at/above what is not committed: the leader's HW
     /// (min-ISR-gated served HW), a follower's followerHw_.
+    /// Lease topics (A.3): the leader also keeps min(HW, leaseFloor_); a follower
+    /// also keeps what the leader still holds (leaderLogStart_).
     void refreshTransientEvictionFloor_() noexcept {
-        if (memoryBacked_) memLog_->setEvictionFloor(role_ == Role::Leader ? highWatermark() : followerHw_);
+        if (!memoryBacked_) return;
+        if (role_ == Role::Leader) memLog_->setEvictionFloor(leaseTransient_ ? std::min(highWatermark(), leaseFloor_) : highWatermark());
+        else memLog_->setEvictionFloor(leaseTransient_ ? std::min(followerHw_, leaderLogStart_) : followerHw_);
     }
+    void resetLeaderLogStart_() noexcept {
+        leaderLogStart_ = memoryBacked_ && memLog_ != nullptr ? memLog_->logStartOffset() : 0;
+    }
+    static constexpr Offset kNoLeaseFloor = std::numeric_limits<Offset>::max();
+    bool        leaseTransient_    = false;
+    std::size_t leaseReserveBytes_ = 0;
+    Offset      leaseFloor_        = kNoLeaseFloor;
+    Offset      leaderLogStart_    = 0;
     /// Kafka leader-epoch stamp of the ACTIVE log (disk Log or ring).
     void stampEpochOnLog_(int32_t epoch) noexcept {
         if (memoryBacked_) { if (memLog_ != nullptr) memLog_->setLeaderEpochStamp(epoch); }
@@ -1426,8 +1467,9 @@ private:
     /// is committed by THIS frame already — free it before the append, so a ring
     /// full of records the frame commits is not refused for a wasted round trip.
     void refreshTransientApplyFloor_(Offset leaderHw) noexcept {
-        if (memoryBacked_)
-            memLog_->setEvictionFloor(std::max(followerHw_, std::min(logEndOffset_(), leaderHw)));
+        if (!memoryBacked_) return;
+        const Offset base = std::max(followerHw_, std::min(logEndOffset_(), leaderHw));
+        memLog_->setEvictionFloor(leaseTransient_ ? std::min(base, leaderLogStart_) : base);
     }
     /// A replicated apply the ring refused (`rc` < 0): kRefusedFull is counted and
     /// logged (rate-limited) — retried once the HW moves; kRefusedTooLarge (a batch

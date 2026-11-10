@@ -405,6 +405,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
     epoch_ = newEpoch;
     if (role_ != Role::Leader) ++leadershipGeneration_;   // F15 S4: a new leadership (not an epoch bump)
     role_  = Role::Leader;
+    resetLeaderLogStart_();   // lease topics: the leader's own start is the reference
 
     // Use the full assigned replica set (RF), NOT the (possibly leader-only) ISR,
     // as the IsrManager's replica set (see configuredReplicas_).
@@ -530,6 +531,7 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     epoch_    = leaderEpoch;
     if (role_ != Role::Follower) ++leadershipGeneration_;   // F15 S4
     role_     = Role::Follower;
+    resetLeaderLogStart_();   // lease topics (A.3): a new leadership epoch restarts the leader-start floor
     leaderId_ = leaderId;
     resetIsrProposal_();
     followerHw_ = 0;
@@ -844,6 +846,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         // (the control plane will correct the leaderId via the next metadata push).
         ++leadershipGeneration_;   // F15 S4: self-demotion ends this leadership
         role_     = Role::Follower;
+        resetLeaderLogStart_();
         resetIsrProposal_();       // a follower owns no proposal (A-M3 / B-M2)
         epoch_    = req.leaderEpoch;
         leaderId_ = req.followerId; // best-effort; coordinator will correct
@@ -1474,6 +1477,10 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // captured, so the fast-ack below fetches from the new position at once.
     if (memoryBacked_ && role_ == Role::Follower && resp.logStartOffset > logEndOffset_()) [[unlikely]]
         resetTransientLogTo_(resp.logStartOffset);
+    // Lease topics (spec A.3): never evict what the leader still holds.  Monotone
+    // within a leadership epoch (an error frame may carry 0); BEFORE the apply floors.
+    if (memoryBacked_ && leaseTransient_ && role_ == Role::Follower)
+        leaderLogStart_ = std::max(leaderLogStart_, resp.logStartOffset);
     // (FR: applyReplicated entry is measured by the ReplFetchRespApply SPAN; the
     //  control→worker handoff that delivers this op is ReplFragRecv→ReplWorkerOpRun.)
 
@@ -3848,6 +3855,7 @@ void PartitionReplica::resetTransientLogTo_(Offset start)
     const Offset was       = logEndOffset_();
     const Offset prevStart = memLog_->logStartOffset();
     memLog_->resetTo(start);
+    leaderLogStart_ = start;   // lease topics: the ring now starts at the leader's start
     // F15 §2.1 step 3 parity (truncateLog): the log's existing content changed —
     // every held record is gone.  Bump the generation, cut at the OLD ring start
     // (nothing below it was held), so parked waiters, the RC state and a view
