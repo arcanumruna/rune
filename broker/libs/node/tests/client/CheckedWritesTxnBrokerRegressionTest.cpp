@@ -612,6 +612,67 @@ TEST(CheckedWritesTxnBrokerRegression, OppositeOrderLocksResolveByTimeoutShardRe
 
 TEST(CheckedWritesTxnBrokerRegression, OppositeOrderLocksResolveByTimeoutFullLengthShardRegression) { expectOppositeOrderResolvesByTimeout("cw11_orderfl", 2'000); }
 
+/// The e2e leg 9b in small (checked_writes_probe txn-run): four workers of four producers race 16 users for the same two character names per
+/// transaction, each crediting its own ledger account (two transactions racing on both topics resolve only by the transaction timeout, R11d).
+/// Per user six commit (the account_stats cap is 12 characters), every other answer is 55, an overdraw of the worker's account is refused by
+/// balances; none fails, none waits for the transaction timeout.  Differences from the probe: the ids are the Shard's, and an `od` character is named per
+/// worker (the probe's is shared).
+TEST(CheckedWritesTxnBrokerRegression, RacingTwoTopicTransactionsFullLengthShardRegression) {
+    Shard s("cw11_race");
+    s.setUp();
+    ASSERT_FALSE(HasFatalFailure());
+    constexpr int workers = 4, perWorker = 4, users = 16, rounds = 7;
+    std::vector<rc::ClientConfig> configs;   // a config takes the next data dir of the broker rig: made here, not in the threads
+    for (int i = 0; i < workers * perWorker; ++i) configs.push_back(s.b.clientConfig());
+    std::atomic<int> ok[users] = {}, refused{0}, overdrawn{0}, other{0}, slow{0};
+    std::mutex mu;
+    std::string failure;
+    {
+        std::vector<std::jthread> threads;
+        for (int w = 0; w < workers * perWorker; ++w)
+            threads.emplace_back([&, w] {
+                try {
+                    TxnClient t(configs[w], "tx-race-" + std::to_string(w), 5'000);
+                    const int worker = w / perWorker;
+                    for (int u = w % perWorker; u < users; u += perWorker) {
+                        const uint64_t user = 100 + static_cast<uint64_t>(u), account = user * 1000 + static_cast<uint64_t>(worker);
+                        for (int k = 0; k <= rounds; ++k) {   // k0-k6 fit account_stats in all; the od debits the account's whole balance and more
+                            const bool od = k == rounds;
+                            const std::string tag = "u" + std::to_string(u) + (od ? "od" : "k" + std::to_string(k));
+                            const uint64_t entryId = 1 + 2 * (static_cast<uint64_t>(u * (rounds + 1) + k) * workers * perWorker + static_cast<uint64_t>(w));
+                            t.begin();
+                            std::vector<rc::WriteResult> writes;
+                            if (od) {
+                                writes = {t.create(user + 1000, tag + "w" + std::to_string(worker)), t.put(entryId, account, -1000)};
+                            } else {
+                                writes = {t.create(user, tag + "a"), t.create(user, tag + "b"), t.put(entryId, account, 1), t.put(entryId + 1, account, 1)};
+                            }
+                            const auto bad = std::find_if(writes.begin(), writes.end(), [](const rc::WriteResult& r) { return !r.ok(); });
+                            if (bad != writes.end()) {   // the name race lost at the write: a refusal, the transaction is abandoned
+                                t.prod->abortTransactionAndWait(30s);
+                                ++(bad->code() == kConstraintViolation ? refused : other);
+                                continue;
+                            }
+                            const auto t0 = std::chrono::steady_clock::now();
+                            const rc::TxnCommitResult r = t.commit();
+                            if (std::chrono::steady_clock::now() - t0 > 1s) ++slow;
+                            if (od) ++(isConstraint(r, *t.client, "balances", "non_negative") ? overdrawn : other);
+                            else ++(r.ok ? ok[u] : r.code == kConstraintViolation ? refused : other);
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> g(mu);
+                    failure = e.what();
+                }
+            });
+    }
+    EXPECT_EQ(failure, "");
+    EXPECT_EQ(other.load(), 0) << "an answer other than ok, 55 or the overdraw's (a 19 among them)";
+    EXPECT_EQ(slow.load(), 0) << "a commit took over 1 s";
+    EXPECT_EQ(overdrawn.load(), users * workers) << "every overdraw is refused by balances";
+    for (int u = 0; u < users; ++u) EXPECT_EQ(ok[u].load(), 6) << "user " << u;
+}
+
 TEST(CheckedWritesTxnBrokerRegression, OldClientTransactionOnAConstrainedSourceShardRegression) {
     Shard s("cw11_old");
     s.setUp();

@@ -47,8 +47,9 @@
 // transactional producer (acks All); the result line is `txn <user> <code> <constraintName> <failingOffset> <u<user>k<k>> <first entryId> <start ms> <end ms> <character ids>`.
 //   txn-setup      prints TXN_CHARACTER_TOPIC_ID, TXN_LEDGER_TOPIC_ID and CHECKED-WRITES-TXN-SETUP: OK once the topics and views exist.
 //   txn-run        --worker <i> --users <a>-<b>: per user six transactions that fit account_stats, a seventh the cap refuses, and one
-//                  that overdraws the user's account (the workers share the users and the names u<user>k<k>a / b: per user six
-//                  transactions fit in all, a worker that loses the name race answers 55).  Writes the tag txn-run and txn-run-progress-w<i>;
+//                  that overdraws the worker's account of the user (the workers share the users and the names u<user>k<k>a / b: per user six
+//                  transactions fit in all, a worker that loses the name race answers 55; each worker credits its own ledger account, as two
+//                  transactions racing on both topics resolve only by the transaction timeout, R11d).  Writes the tag txn-run and txn-run-progress-w<i>;
 //                  a line ends with the transaction's start and end in epoch ms (the host's clock) and its two assigned character ids.
 //   txn-verify     a read_committed subscription from 0 holds every committed transaction whole, no refused one, and a transaction
 //                  whose answer was lost whole or not at all; the account_stats and balances rows agree with it.
@@ -1091,6 +1092,7 @@ using TxnLedgerTyped = TypedTopic<TxnLedger, ProducerRef>;
 constexpr int      kTxnCommitted = 6;           // transactions of two characters per user before account_stats (cap 12) is full
 constexpr uint64_t kTxnEntryBase = 1'000'000'000;   // the entry ids of worker w, user u: (w + 1) * kTxnEntryBase + u * 1000 + k * 10 + {0, 1}; the overdraw's is + 900
 constexpr int      kTxnWaitS = 120;
+constexpr uint64_t accountOf(int worker, uint64_t user) { return user * 1000 + static_cast<uint64_t>(worker); }   // the ledger account of worker w for user u: distinct per worker, and for every user
 
 /// One transactional producer (acks All) over the character and ledger topics.
 struct TxnWriter {
@@ -1185,12 +1187,12 @@ int runTxnRun(const Args& a) {
                     const uint64_t entries = static_cast<uint64_t>(a.worker + 1) * kTxnEntryBase + u * 1000;
                     for (int k = 0; k <= kTxnCommitted; ++k) {   // the seventh is the cap's: account_stats refuses it
                         const std::string tag = base + "k" + std::to_string(k);
-                        lines[static_cast<std::size_t>(t)].push_back(txnRun(w, c, txnId, u, u, {tag + "a", tag + "b"}, entries + static_cast<uint64_t>(k) * 10, 2, 1, tag));
+                        lines[static_cast<std::size_t>(t)].push_back(txnRun(w, c, txnId, u, accountOf(a.worker, u), {tag + "a", tag + "b"}, entries + static_cast<uint64_t>(k) * 10, 2, 1, tag));
                         ++progress.done;
                     }
-                    // One character for another user and a debit of the account's whole balance and more: balances refuses it.
+                    // One character for another user and a debit of the worker's account's whole balance and more: balances refuses it.
                     const std::string tag = base + "od";
-                    lines[static_cast<std::size_t>(t)].push_back(txnRun(w, c, txnId, kRpPairBase + u, u, {tag}, entries + 900, 1, -1000, tag));
+                    lines[static_cast<std::size_t>(t)].push_back(txnRun(w, c, txnId, kRpPairBase + u, accountOf(a.worker, u), {tag}, entries + 900, 1, -1000, tag));
                     ++progress.done;
                 }
             });
@@ -1267,7 +1269,8 @@ int runTxnVerify() {
     const auto state = latestCatalog(c);
     RpView nameView(state, "character_name");
     int bad = 0;
-    std::map<uint64_t, std::pair<int64_t, int64_t>> perUser;   // the first user a transaction is for -> {characters, balance} it leaves visible
+    std::map<uint64_t, int64_t> perUser;                        // the first user a transaction is for -> the characters it leaves visible
+    std::map<uint64_t, int64_t> perAccount;                     // a worker's ledger account of a user -> the balance it leaves visible (the worker is in the entry id)
     std::map<std::string, std::string> nameOwner;               // a name -> the transaction that delivers it
     for (const RpLine& l : lines) {
         bool all = true, none = true;
@@ -1291,25 +1294,29 @@ int runTxnVerify() {
             const auto row = rpRowWhenReady(c, nameView, keyBytes(nameView.builder.setString("name", n).key()), 0, 30s);
             if (!row || nameView.u(*row, "characterId") != idsOf(l)[i]) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", "character_name does not map " + n + " to character " + std::to_string(idsOf(l)[i])); }
         }
-        if (l.name.find("od") == std::string::npos) { perUser[l.key].first += 2; perUser[l.key].second += 2; }
+        if (l.name.find("od") == std::string::npos) { perUser[l.key] += 2; perAccount[accountOf(static_cast<int>(l.id / kTxnEntryBase) - 1, l.key)] += 2; }
     }
     if (bad != 0) return 1;
 
     // The views agree with what is visible.
     RpView stats(state, "account_stats"), balances(state, "balances");
-    for (const auto& [user, expect] : perUser) {
+    for (const auto& [user, characters] : perUser) {
         stats.builder.clear();
-        balances.builder.clear();
-        const auto statsKey   = keyBytes(stats.builder.setUInt("userId", user).key());
-        const auto balanceKey = keyBytes(balances.builder.setUInt("account", user).key());
-        const auto [characters, balance] = expect;
         bool ok = false;
         for (const auto deadline = Clock::now() + 120s; Clock::now() < deadline && !ok; std::this_thread::sleep_for(200ms)) {
-            const auto s = rpRowWhenReady(c, stats, statsKey, 0, 10s);
-            const auto b = rpRowWhenReady(c, balances, balanceKey, 0, 10s);
-            ok = s && b && static_cast<int64_t>(stats.u(*s, "characters")) == characters && static_cast<int64_t>(balances.u(*b, "balance")) == balance;
+            const auto s = rpRowWhenReady(c, stats, keyBytes(stats.builder.setUInt("userId", user).key()), 0, 10s);
+            ok = s && static_cast<int64_t>(stats.u(*s, "characters")) == characters;
         }
-        if (!ok) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", "user " + std::to_string(user) + ": account_stats or balances never reached " + std::to_string(characters) + " / " + std::to_string(balance)); }
+        if (!ok) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", "user " + std::to_string(user) + ": account_stats never reached " + std::to_string(characters)); }
+    }
+    for (const auto& [account, balance] : perAccount) {
+        balances.builder.clear();
+        bool ok = false;
+        for (const auto deadline = Clock::now() + 120s; Clock::now() < deadline && !ok; std::this_thread::sleep_for(200ms)) {
+            const auto b = rpRowWhenReady(c, balances, keyBytes(balances.builder.setUInt("account", account).key()), 0, 10s);
+            ok = b && static_cast<int64_t>(balances.u(*b, "balance")) == balance;
+        }
+        if (!ok) { ++bad; fail("CHECKED-WRITES-TXN-VERIFY", "account " + std::to_string(account) + ": balances never reached " + std::to_string(balance)); }
     }
     if (bad != 0) return 1;
     std::printf("CHECKED-WRITES-TXN-VERIFY: OK committed=%d refused=%d lost=%d\n", committed, refused, lost);
