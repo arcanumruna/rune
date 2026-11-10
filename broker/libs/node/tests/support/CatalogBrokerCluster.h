@@ -15,6 +15,7 @@
 #include <rune/node/StorageIdentity.h>
 
 #include <gtest/gtest.h>
+#include <openssl/crypto.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
@@ -222,6 +223,9 @@ struct ThreeNodes {
     /// their start() on one thread each and returns when all are up (joining the starters; a node's start() does not wait for its peers).
     void startNodes(const std::vector<int>& ids) {
         for (const int id : ids) prepareNode(id);
+        // OpenSSL loads its config once, on the first thread that needs it; a starter thread that does so exits with
+        // its per-thread RCU record unfreed (LeakSanitizer, auth clusters), so load it here on the long-lived caller.
+        OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG, nullptr);
         std::vector<std::exception_ptr> failed(ids.size());
         std::vector<std::thread> starters;
         for (std::size_t i = 0; i < ids.size(); ++i)
