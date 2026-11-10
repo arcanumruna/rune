@@ -137,7 +137,8 @@ const Row kRows[] = {
      [](DefineTopicMsg& m) { m.keyFeatures.autoIncrementMax = 5; }, false},
     {"LeftoverAutoIncReserve", 6, kInvalidRequest, "autoincrement.max and autoincrement.reserve need autoincrement",
      [](DefineTopicMsg& m) { m.keyFeatures.autoIncrementReserve = 7; }, false},
-    {"Transient", 6, kInvalidRequest, "transient lease topics are not supported yet", [](DefineTopicMsg& m) { m.persistence = 1; }, true},
+    {"TransientDefaultMaxTtl", 6, kInvalidRequest, "a transient lease topic needs lease.max_ttl",
+     [](DefineTopicMsg& m) { m.persistence = 1; m.lease->maxTtlMs = rp::LeaseSpec{}.maxTtlMs; }, true},
     {"CleanupDelete", 6, kInvalidRequest, "a lease topic is compacted and keeps every live lease",
      [](DefineTopicMsg& m) { m.config.cleanupPolicy = 0; }, true},
     {"RetentionMs", 6, kInvalidRequest, "a lease topic is compacted and keeps every live lease",
@@ -264,6 +265,22 @@ TEST(LeaseDdlRegression, SystemColumnsFirstRegression) {
 }
 
 // ── stored lease, lease view, formatVer ──────────────────────────────────────
+// Spec A.2: a transient lease topic with an explicit lease.max_ttl is accepted and stored as transient with its lease spec.
+TEST(LeaseDdlTransientRegression, TransientWithMaxTtlAcceptedRegression) {
+    CatalogDdlRig rig("leasetransient");
+    serve(rig);
+    DefineTopicMsg m = leaseMsg(rig, "tr");
+    m.persistence = 1;
+    m.lease->maxTtlMs = 60'000;
+    ASSERT_EQ(submit(rig, m).code, kOk);
+    const cat::TopicObject* t = topicOf(rig, "tr");
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->persistence, cat::Persistence::Transient);
+    ASSERT_TRUE(t->lease.has_value());
+    EXPECT_EQ(*t->lease, *m.lease);
+    EXPECT_EQ(t->lease->maxTtlMs, 60'000);
+}
+
 TEST(LeaseDdlRegression, LeaseStoredRegression) {
     CatalogDdlRig rig("leasestored");
     serve(rig);
@@ -535,8 +552,10 @@ TEST(LeaseDdlRegression, RuleOrderRegression) {
     const Case cases[] = {
         {"LevelBeforeSpec", 5, kInvalidRequest, "cluster below lease feature level",
          [](CatalogDdlRig&, DefineTopicMsg& m) { m.lease->minTtlMs = 70'000; }},
-        {"TransientBeforeRetention", 6, kInvalidRequest, "transient lease topics are not supported yet",
-         [](CatalogDdlRig&, DefineTopicMsg& m) { m.persistence = 1; m.config.retentionMs = 1000; }},
+        {"TransientBeforeRetention", 6, kInvalidRequest, "a transient lease topic needs lease.max_ttl",
+         [](CatalogDdlRig&, DefineTopicMsg& m) {
+             m.persistence = 1; m.lease->maxTtlMs = rp::LeaseSpec{}.maxTtlMs; m.config.retentionMs = 1000;
+         }},
         {"AutoIncrementBeforeReservedName", 6, kInvalidRequest, "a lease topic cannot use autoincrement",
          [](CatalogDdlRig&, DefineTopicMsg& m) {
              m.blob = blobOf(PrimType::UInt64, 0, "id", {"lease_x"}); m.keyFeatures.autoIncrement = true;

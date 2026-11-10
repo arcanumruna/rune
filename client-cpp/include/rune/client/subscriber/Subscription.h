@@ -122,8 +122,9 @@ struct SubscribeOptions {
 enum class RecordOp : uint8_t { Upsert, Insert, Update, Delete };
 
 /// What a record of a LEASE topic means (Record::leaseOp()).  Checkpoint records never reach a handler: the subscription
-/// consumes them (Task 14a), the value exists for completeness.
-enum class LeaseRecordOp : uint8_t { Granted, Updated, Revoked, Expired, Checkpoint };
+/// consumes them (Task 14a), the value exists for completeness.  Carried is a broker re-append of a live row on a
+/// transient lease topic (spec A.3); it is appended last because the values are stored as uint8 elsewhere.
+enum class LeaseRecordOp : uint8_t { Granted, Updated, Revoked, Expired, Checkpoint, Carried };
 
 struct Record {
     int64_t                  offset;    // absolute offset in the partition log
@@ -146,7 +147,8 @@ struct Record {
 
     /// The lease meaning of this record - meaningful on a lease topic ONLY (elsewhere bits 2-3 are reserved and 0, which
     /// reads as Granted / Updated).  A Put is Granted when its lease_version equals its own offset (a grant's version is
-    /// the offset the broker assigned it), else Updated.
+    /// the offset the broker assigned it), else Updated.  A Put with intent 0 is Carried: a broker re-append of a live row on
+    /// a transient lease topic (spec A.3), checked before the version test; its op() stays Upsert.
     [[nodiscard]] LeaseRecordOp leaseOp() const noexcept {
         switch (rune::protocol::record::leaseOpOf(attributes)) {
         case rune::protocol::record::LeaseOp::Revoke:     return LeaseRecordOp::Revoked;
@@ -154,6 +156,7 @@ struct Record {
         case rune::protocol::record::LeaseOp::Checkpoint: return LeaseRecordOp::Checkpoint;
         case rune::protocol::record::LeaseOp::Put:        break;
         }
+        if (rune::protocol::record::intentOf(attributes) == 0) return LeaseRecordOp::Carried;
         if (value.size() >= rune::protocol::record::kLeaseVersionValueOffset + 8) {
             int64_t v = 0;
             std::memcpy(&v, value.data() + rune::protocol::record::kLeaseVersionValueOffset, 8);

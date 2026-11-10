@@ -540,6 +540,32 @@ TEST(LeaseWatchHandoffRegression, IdentityDedupRegression) {
     EXPECT_EQ(rec.bad, 0);
 }
 
+// Spec A.3: a Carried record (Put, intent 0: a broker re-append of a live row) emits no event - neither for a live (key, version) nor for
+// an unknown key.
+TEST(LeaseWatchCarryRegression, CarriedRecordEmitsNoEventRegression) {
+    WRig r(invokerCfg(5191, 5192, 1), 1);
+    const Bytes A = kb(1);
+    LeaseModel& m = r.stub->parts[0];
+    m.grant(A);   // offset 0, version 0
+    rc::LeaseWatchBase w(*r.client, r.topic->core());
+    Recorder rec;
+    w.setHandler(&Recorder::fn, &rec);
+    ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive(w, [&] { return w.isReady(); }));
+    r.rounds(w, 20);
+    ASSERT_EQ(rec.count(Kind::Granted, &A), 1);
+    const std::size_t before = rec.evs.size();
+    (void)m.rawCarry(A, 0);           // the live row's own (key, version), re-appended
+    (void)m.rawCarry(kb(2), 5);       // a key the watch never saw
+    (void)m.rawCarry(A, 12345);       // an unknown version of a live key
+    r.rounds(w, 40);
+    EXPECT_EQ(rec.evs.size(), before) << "a Carried record emits nothing";
+    EXPECT_TRUE(w.isLive(A, 0));
+    EXPECT_EQ(w.liveCount(), 1u);
+    EXPECT_EQ(rec.bad, 0);
+    EXPECT_EQ(rec.readies, 1);
+}
+
 // A broken subscription re-runs its partition: rescan, resubscribe, and whatever the rescan does not confirm is Vanished; the confirmed
 // entries are not granted twice; isReady() stays true throughout.
 TEST(LeaseWatchHandoffRegression, BreakRerunsRegression) {

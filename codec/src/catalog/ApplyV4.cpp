@@ -5,7 +5,8 @@
 //                              name '<t>.leases' fits and is free in the namespace.  The commit installs the topic AND
 //                              its lease view (objectId + 1, viewTopicId + 1): two object ids and two topic ids.
 //   AlterTopicConfig lease.*   the lease keys (7..12) need a lease topic; each lands in a copy of the LeaseSpec, which
-//                              must pass validateLeaseSpec; the other keys run the formatVer-3 rules
+//                              must pass validateLeaseSpec (on a transient topic
+//                              max_ttl can only be raised, spec A.2); the other keys run the formatVer-3 rules
 //   every other kind           the formatVer-3 rules
 //
 // The state-driven lease rules (guardBefore / guardStaged / excludeLeaseViews / commitLeaseViewDrop) run for every
@@ -150,6 +151,9 @@ std::expected<StagedV2, ApplyError> alterConfig(const CatalogState& s, const Cat
         if (const std::string why = applyLeaseKey(spec, c); !why.empty()) return fail(offset, e, why);
     }
     if (const auto why = rp::validateLeaseSpec(spec)) return fail(offset, e, std::string(*why));
+    // Spec A.2: a live lease keeps its TTL across an alter, so a lower max_ttl would shorten the rebirth wait below a lost lease's TTL.
+    if (topic->persistence == Persistence::Transient && spec.maxTtlMs < topic->lease->maxTtlMs)
+        return fail(offset, e, "a transient lease topic's max_ttl can only be raised");
     topic->lease = spec;
     return staged;
 }

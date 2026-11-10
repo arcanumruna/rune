@@ -161,3 +161,37 @@ TEST(LeaseOpClassificationRegression, CheckpointDroppedRegression) {
     EXPECT_EQ(seen.size(), 3u);
     EXPECT_EQ(raw->nextOffset, 5);
 }
+
+// Spec A.3: a Put with intent 0 on a lease topic is a broker Carry, whatever its version; op() of it stays Upsert.
+TEST(LeaseRecordOpRegression, CarriedRegression) {
+    using rc::LeaseRecordOp;
+    using rc::RecordOp;
+    struct Row {
+        uint8_t        attrs;
+        LeaseRecordOp  leaseOp;
+        RecordOp       op;
+        const char*    what;
+        int64_t        offset = 40;
+    };
+    const Row rows[] = {
+        {0x00, LeaseRecordOp::Carried, RecordOp::Upsert, "Put intent 0, version == offset"},
+        {0x01, LeaseRecordOp::Granted, RecordOp::Insert, "Put intent 1, version == offset"},
+        {0x02, LeaseRecordOp::Updated, RecordOp::Update, "Put intent 2 (version != offset)", 41},
+        {0x0C, LeaseRecordOp::Checkpoint, RecordOp::Upsert, "Checkpoint"},
+    };
+    const std::string v = leaseValue(40);
+    for (const Row& row : rows) {
+        rc::Record r{};
+        r.offset     = row.offset;
+        r.attributes = row.attrs;
+        r.value      = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size());
+        EXPECT_EQ(r.leaseOp(), row.leaseOp) << row.what;
+        EXPECT_EQ(r.op(), row.op) << row.what;
+    }
+    // A Carried record with a version != offset is also Carried (the intent decides, not the version).
+    rc::Record r{};
+    r.offset     = 41;
+    r.attributes = 0x00;
+    r.value      = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size());
+    EXPECT_EQ(r.leaseOp(), LeaseRecordOp::Carried);
+}

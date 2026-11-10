@@ -566,6 +566,48 @@ TEST(LeaseCatalogRegression, AlterKeysRegression) {
 }
 
 // 10 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Spec A.2: a transient lease topic's max_ttl can only be raised (a live lease keeps its TTL across an alter); a persisted
+// lease topic's can go down.
+TEST(LeaseCatalogRegression, TransientMaxTtlOnlyRisesRegression) {
+    const rp::LeaseSpec base{.ttlMs = 10'000, .minTtlMs = 1'000, .maxTtlMs = 60'000, .maxKeys = 100, .expiryBatch = 64,
+                             .checkpoint = 0, .checkpointIntervalMs = 1'000, .checkpointRate = 1};
+    const auto make = [&](rc::CatalogState& s, rc::Persistence p) {
+        auto o = leaseOps(0, base);
+        o.persistence = p;
+        auto a = put(s, v4(o, "inst", 1, 0));
+        ASSERT_TRUE(a.has_value()) << a.error().detail;
+        ASSERT_EQ(s.topicByObjectId(1)->persistence, p);
+    };
+    {   // transient: up is applied
+        rc::CatalogState s;
+        make(s, rc::Persistence::Transient);
+        auto a = put(s, v4(cfg({{rc::ConfigKey::LeaseMaxTtlMs, 120'000}}), "inst", 1, 1));
+        ASSERT_TRUE(a.has_value()) << a.error().detail;
+        EXPECT_EQ(s.topicByObjectId(1)->lease->maxTtlMs, 120'000);
+        // the same value again (not lower) is applied too
+        auto same = put(s, v4(cfg({{rc::ConfigKey::LeaseMaxTtlMs, 120'000}}), "inst", 1, 2));
+        EXPECT_TRUE(same.has_value());
+    }
+    {   // transient: down is refused, state untouched
+        rc::CatalogState s;
+        make(s, rc::Persistence::Transient);
+        const uint64_t before = s.digest();
+        const auto r = put(s, v4(cfg({{rc::ConfigKey::LeaseMaxTtlMs, 30'000}}), "inst", 1, 1));
+        ASSERT_FALSE(r.has_value());
+        EXPECT_EQ(r.error().code, Code::Precondition);
+        EXPECT_TRUE(has(r.error().detail, "a transient lease topic's max_ttl can only be raised")) << r.error().detail;
+        EXPECT_EQ(s.digest(), before);
+        EXPECT_EQ(s.topicByObjectId(1)->lease->maxTtlMs, 60'000);
+    }
+    {   // persisted: down is still applied
+        rc::CatalogState s;
+        make(s, rc::Persistence::Disk);
+        auto a = put(s, v4(cfg({{rc::ConfigKey::LeaseMaxTtlMs, 30'000}}), "inst", 1, 1));
+        ASSERT_TRUE(a.has_value()) << a.error().detail;
+        EXPECT_EQ(s.topicByObjectId(1)->lease->maxTtlMs, 30'000);
+    }
+}
+
 TEST(LeaseCatalogRegression, AlterSchemaGuardsRegression) {
     auto refuses = [](rc::ResolvedAlterOp o, const char* text) {
         rc::CatalogState s;

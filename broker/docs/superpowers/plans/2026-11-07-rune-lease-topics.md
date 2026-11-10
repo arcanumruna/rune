@@ -1465,13 +1465,12 @@ Spec A.3 (`Carry`), A.6 (fence record).
 
 - [ ] `isLeaseCarry(attrs, traits)`: lease topic, op `Put`, intent `Upsert`. `kLeaseFenceVersion = -1` and
   `isLeaseFence(value)`: `lease_version` (value bytes `[4, 12)`) equals −1. Both `constexpr`, no allocation.
-- [ ] `leaseOp()` gains `Carried`. `LeaseSession` ignores it. `LeaseWatch` ignores a `Carried` record of a key it
-  holds at that version, and takes one for a key it does not hold as that key's current row.
+- [ ] `leaseOp()` gains `Carried`. `LeaseSession` ignores it. `LeaseWatch` drops it like a `Checkpoint`.
 - [ ] The write hook already refuses a client `upsert`; add a test proving a client `Put`+`Upsert` and a client
   `Checkpoint` with version −1 are refused `InvalidRequest` on a transient lease topic.
 - [ ] Tests: `LeaseCarryClassifyRegression.*` (every op × intent → the right `leaseOp()`; mutation: classify
-  `Put`+`Upsert` as `Updated` → red), `LeaseWatchCarryRegression.*` (known key at the same version → no event;
-  unknown key → present, no `Granted` event).
+  `Put`+`Upsert` as `Updated` → red), `LeaseWatchCarryRegression.*` (a `Carried` record emits no event, known
+  key or not).
 
 ### Task 26: DDL — accept transient lease topics
 

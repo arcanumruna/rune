@@ -79,14 +79,14 @@ public:
     // ---- writes (each appends one log record and folds it) ----
     int64_t grant(const Bytes& key, uint64_t holder = 0) {
         const int64_t o = static_cast<int64_t>(log.size());
-        log.push_back({key, static_cast<uint8_t>(0), value(o, key, holder, keyWidth)});   // Put; version == offset reads as Granted
+        log.push_back({key, static_cast<uint8_t>(1), value(o, key, holder, keyWidth)});   // Put|insert; version == offset reads as Granted (intent 0 would be a Carry)
         table[key] = Held{o, o, o, holder};
         return o;
     }
     int64_t update(const Bytes& key) {
         const int64_t o = static_cast<int64_t>(log.size());
         Held& h = table.at(key);
-        log.push_back({key, static_cast<uint8_t>(0), value(h.version, key, h.holder, keyWidth)});   // Put; version != offset reads as Updated
+        log.push_back({key, static_cast<uint8_t>(2), value(h.version, key, h.holder, keyWidth)});   // Put|update; version != offset reads as Updated
         h.updated = o;
         return o;
     }
@@ -108,6 +108,12 @@ public:
         return o;
     }
     int64_t rawPut(const Bytes& key, int64_t version) {
+        const int64_t o = static_cast<int64_t>(log.size());
+        log.push_back({key, static_cast<uint8_t>(version == o ? 1 : 2), value(version, key)});   // never intent 0 (a Carry)
+        return o;
+    }
+    /// A broker Carry (Put, intent 0) of an arbitrary (key, version) that does not touch the view (spec A.3).
+    int64_t rawCarry(const Bytes& key, int64_t version) {
         const int64_t o = static_cast<int64_t>(log.size());
         log.push_back({key, static_cast<uint8_t>(0), value(version, key)});
         return o;

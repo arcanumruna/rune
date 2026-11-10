@@ -25,6 +25,7 @@ constexpr uint32_t kRecBytesAvg = 192;      // handoff arena bytes per buffered 
 constexpr uint32_t kMarkerBytes = detail::CompletionRing::completionRecordBytes(0);   // 48
 constexpr uint16_t kKindRecord = 1, kKindOverflow = 2, kKindFatal = 3;
 constexpr uint8_t  kOpCheckpoint = static_cast<uint8_t>(LeaseRecordOp::Checkpoint);
+constexpr uint8_t  kOpCarried    = static_cast<uint8_t>(LeaseRecordOp::Carried);
 
 [[nodiscard]] uint32_t pow2AtLeast(uint64_t v, uint32_t floor) noexcept {
     uint64_t p = floor;
@@ -67,7 +68,7 @@ struct RingWriter {
     void operator()(const Record& r) noexcept {
         if (dropped) return;
         const auto lop = static_cast<uint8_t>(r.leaseOp());
-        if (lop == kOpCheckpoint) return;
+        if (lop == kOpCheckpoint || lop == kOpCarried) return;
         const std::size_t kl = r.key.size(), vl = r.value.size();
         if (kl > 255 || kl + vl > kRecPayload) return marker(kKindFatal, r.offset);
         const uint32_t need = detail::CompletionRing::completionRecordBytes(static_cast<uint32_t>(kl + vl));
@@ -629,6 +630,7 @@ void LeaseWatchBase::applyRecord_(int32_t p, int64_t offset, uint8_t op, int64_t
         return;
     }
     case LeaseRecordOp::Checkpoint:
+    case LeaseRecordOp::Carried:   // spec A.3: the grant or the scan already gave the row; a skipped one is a reset/clamp that reruns the scan
         return;
     }
 }

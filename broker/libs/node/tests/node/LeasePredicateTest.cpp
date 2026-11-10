@@ -605,3 +605,32 @@ TEST(LeasePredicateWorkerRegression, NonLeaseTopicUnchangedRegression) {
     EXPECT_GE(std::count(row3->begin(), row3->end(), uint8_t(40)), 1) << "the checkpoint-bit record upserted its value";
     EXPECT_NE(*row2, *row3);
 }
+
+// Spec A.3 / A.6: a Carry is Put with intent 0 on a lease topic; the fence is a Checkpoint whose version is -1.
+TEST(LeasePredicateRegression, CarryAndFencePredicatesRegression) {
+    for (int op = 0; op < 4; ++op) {
+        for (int intent = 0; intent < 4; ++intent) {
+            for (const bool lease : {true, false}) {
+                const uint8_t attrs = uint8_t((op << rec::kAttrLeaseOpShift) | intent);
+                const rec::TopicTraits t{.lease = lease};
+                const bool expected = lease && op == int(rec::LeaseOp::Put) && intent == 0;
+                EXPECT_EQ(rec::isLeaseCarry(attrs, t), expected) << "op " << op << " intent " << intent << " lease " << lease;
+            }
+        }
+    }
+    const auto valueWith = [](int64_t version) {
+        std::vector<uint8_t> v(40, 0);
+        std::memcpy(v.data() + 4, &version, 8);
+        return v;
+    };
+    const uint8_t ckpt = uint8_t(rec::LeaseOp::Checkpoint) << rec::kAttrLeaseOpShift;
+    const uint8_t put  = uint8_t(rec::LeaseOp::Put) << rec::kAttrLeaseOpShift;
+    const rec::TopicTraits lease{.lease = true}, plain{};
+    const auto fence = valueWith(-1), five = valueWith(5);
+    EXPECT_TRUE(rec::isLeaseFence(ckpt, fence.data(), fence.size(), lease));
+    EXPECT_FALSE(rec::isLeaseFence(ckpt, five.data(), five.size(), lease));
+    EXPECT_FALSE(rec::isLeaseFence(put, fence.data(), fence.size(), lease));
+    EXPECT_FALSE(rec::isLeaseFence(ckpt, fence.data(), 11, lease));
+    EXPECT_TRUE(rec::isLeaseFence(ckpt, fence.data(), 12, lease));
+    EXPECT_FALSE(rec::isLeaseFence(ckpt, fence.data(), fence.size(), plain));
+}

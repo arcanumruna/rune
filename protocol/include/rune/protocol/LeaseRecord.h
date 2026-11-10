@@ -3,12 +3,14 @@
 //
 // Record attribute bits 2-3 carry the lease op ONLY on lease topics; on every other topic they stay reserved and
 // refused (kAttrReservedMask).  Intent bits 0-1 are unchanged (L21): a grant is Put|insert(1), an update is
-// Put|update(2), a revoke is Revoke|update(2); records the broker writes itself carry intent 0.
+// Put|update(2), a revoke is Revoke|update(2); records the broker writes itself carry intent 0:
+// a Carry is Put with intent 0 and the fence is Checkpoint with version -1 (transient lease topics, spec A.3/A.6).
 //
 // A lease topic's value is the full row: the 4-byte schema-version prefix, then the four u64 system columns
 // (version, ttl, holder, remaining), then the user columns.
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #include "RecordBatch.h"
 
@@ -56,6 +58,23 @@ struct TopicTraits {
 /// True only for a Checkpoint op on a lease topic; always false on any other topic.
 [[nodiscard]] constexpr bool isLeaseControl(uint8_t attrs, TopicTraits t) noexcept {
     return t.lease && leaseOpOf(attrs) == LeaseOp::Checkpoint;
+}
+
+/// Spec A.3: a Carry is a broker re-append of a live row (Put, intent 0).  Clients cannot send it (a client upsert on a
+/// lease topic is refused).  Always false on a non-lease topic.
+[[nodiscard]] constexpr bool isLeaseCarry(uint8_t attrs, TopicTraits t) noexcept {
+    return t.lease && leaseOpOf(attrs) == LeaseOp::Put && intentOf(attrs) == 0;
+}
+
+/// The lease_version a fence record carries.
+inline constexpr int64_t kLeaseFenceVersion = -1;
+
+/// Spec A.6: the partition's fence record (a Checkpoint whose version is -1), never a row.  False on a non-lease topic.
+[[nodiscard]] inline bool isLeaseFence(uint8_t attrs, const uint8_t* value, std::size_t valueLen, TopicTraits t) noexcept {
+    if (!t.lease || leaseOpOf(attrs) != LeaseOp::Checkpoint || valueLen < kLeaseVersionValueOffset + 8) return false;
+    int64_t v = 0;
+    std::memcpy(&v, value + kLeaseVersionValueOffset, 8);
+    return v == kLeaseFenceVersion;
 }
 
 } // namespace rune::protocol::record

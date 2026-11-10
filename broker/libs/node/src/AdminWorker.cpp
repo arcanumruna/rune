@@ -1490,7 +1490,9 @@ std::optional<DdlRejection> leaseDefineRefusal(const DefineTopicMsg& m, const ru
     if (m.keyFeatures.keyIndex) return reject(kInvalidRequest, "a lease topic's key index is its lease view");
     if (m.keyFeatures.partitioner != rp::Partitioner::Fnv1a)
         return reject(kInvalidRequest, "the modulo partitioner needs autoincrement");
-    if (m.persistence == 1) return reject(kInvalidRequest, "transient lease topics are not supported yet");
+    // Spec A.2: the default 9e12 ms max_ttl would make the rebirth wait of a transient lease topic endless.
+    if (m.persistence == 1 && m.lease->maxTtlMs == rp::LeaseSpec{}.maxTtlMs)
+        return reject(kInvalidRequest, "a transient lease topic needs lease.max_ttl");
     if (m.config.cleanupPolicy != 1 || m.config.retentionMs != -1 || m.config.retentionBytes != -1)
         return reject(kInvalidRequest, "a lease topic is compacted and keeps every live lease");
     for (const auto& f : d->fields)

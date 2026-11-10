@@ -2098,10 +2098,10 @@ full restart, and fencing by version does not hold across a full restart. Plan p
     the row's anchor.
   - **Replay** (a promotion rebuild) creates the row from a `Carry` when the row is absent, as it does from a
     `Checkpoint` (`LeaseIndex.cpp:296-299`), so a ring whose start is after the grant rebuilds every live lease.
-  - **Consumers.** `record.leaseOp()` returns a new value, `Carried`. `LeaseSession` ignores it. `LeaseWatch`
-    ignores a `Carried` record whose key it holds at that version; for a key it does not hold, it treats the record
-    as the row's current state (it can only meet one after a reset). A plain typed subscription sees a repeat of the
-    current row.
+  - **Consumers.** `record.leaseOp()` returns a new value, `Carried`. `LeaseSession` ignores it. `LeaseWatch` drops
+    it like a `Checkpoint`: the key's grant or the scan already gave the watch that row, and a subscription that
+    skipped both is clamped or reset, which reruns the scan (A.7). A plain typed subscription sees a repeat of the
+    current row (`op()` is `Upsert`).
 - **The emission gate.** A `Carry` is built only for an entry in `Armed`, with the gate of §9.1 open (`Ready`, HW at
   the leadership start, `lastAppended[k] ≤ judgedThrough`), exactly like a scheduled `Checkpoint`. So the lease
   view's row is current when it is copied. No keepalive parks on a `Carry` and no wheel state is added: the record
