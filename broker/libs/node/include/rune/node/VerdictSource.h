@@ -456,11 +456,10 @@ private:
         stepParked_   = parked;
         parkedOnLock_ = onLock;
         parkedFreed_  = overlaysFreed_;
-        parkedHw_     = passHw_;
     }
     /// This source's own park still holds: a lock pause until it gives an overlay back (the locking transaction's marker applied, or
-    /// its judgement ended), a lookup park until the HW moves past where it scanned.  Only then may it take the set from a parked holder.
-    [[nodiscard]] bool parkHolds_() const noexcept { return stepParked_ && (parkedOnLock_ ? overlaysFreed_ == parkedFreed_ : passHw_ <= parkedHw_); }
+    /// its judgement ended), a lookup park until the lookup is decided.  Only then may it take the set from a parked holder.
+    [[nodiscard]] bool parkHolds_() const noexcept { return stepParked_ && (parkedOnLock_ ? overlaysFreed_ == parkedFreed_ : !ordinaryWalk_.lookup.decided); }
     void   releaseOverlay_(int32_t overlay) noexcept {
         txnPool_->release(overlay);
         ++overlaysFreed_;
@@ -571,7 +570,6 @@ private:
     bool                        stepParked_ = false;      // this source last parked on the set, waiting for a marker: while that holds (parkHolds_) it takes it from no other parked holder
     bool                        parkedOnLock_ = false;
     uint64_t                    overlaysFreed_ = 0, parkedFreed_ = 0;   // overlays this source gave back, in all and when it parked
-    int64_t                     parkedHw_ = 0;            // passHw_ when it parked
     int64_t                     failCapacityAt_ = -1;
     TxnProbe                    probe_;
     std::vector<OrdinaryTxn>    ordinary_;
@@ -812,7 +810,11 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
         OrdinaryWalk& w = ordinaryWalk_;
         if (w.marker != o.marker) w = {o.marker, o.first};
         if (!txnPool_->holdsOneStep(oneStepClaim_)) {
-            if (!txnPool_->oneStepClaimable() || (parkHolds_() && txnPool_->oneStepHeld())) return false;   // another source is mid-segment, or parked while this one's own wait holds: wait for it
+            if (!txnPool_->oneStepClaimable()) return false;   // another source is mid-segment: wait for it
+            if (txnPool_->oneStepHeld() && stepParked_) {   // parked as this one is: take the set only once this one's own wait is over
+                if (!parkedOnLock_ && !w.lookup.decided) (void)lookupTxn_(readRange, o.marker);   // reads the log and the lookup, not the set
+                if (parkHolds_()) return false;
+            }
             oneStepClaim_ = txnPool_->claimOneStep();
             stepParked_ = false;
             w.collectFrom = -1;   // another source may have taken the set mid-segment: note the keys again
@@ -933,7 +935,7 @@ bool VerdictSource::lookupTxn_(ReadRangeFn& readRange, int64_t end) noexcept {
         budget -= std::min(budget, len);
         return !l.decided && budget > 0;
     });
-    parkOneStep_(!l.decided && l.from >= passHw_);   // scanned to the HW: only T's marker decides it
+    if (txnPool_->holdsOneStep(oneStepClaim_)) parkOneStep_(!l.decided && l.from >= passHw_);   // scanned to the HW: only T's marker decides it
     return l.decided;
 }
 

@@ -2385,6 +2385,50 @@ TEST(CheckedWritesTxnJudgeRegression, SourceWhoseLookupResolvedTakesTheSetFromAP
     EXPECT_TRUE(b.indexed(5)) << "T1's insert supersedes O_B's delete";
 }
 
+// slow-bc re-review 2: two lookup-parked sources on partitions that keep taking writes.  Their HW moves on every pass while T0's marker
+// has not landed, so neither lookup is decided: neither takes the set.  RED (a park that ends when the HW moves): both took it on every
+// pass, collecting their segments anew.
+TEST(CheckedWritesTxnJudgeRegression, LookupParkedHoldersNeverTradeTheSetUnderTrafficRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    for (JudgeRig* r : {&a, &b}) {
+        const int64_t key = r == &a ? 4 : 5;
+        r->log.data({del(key)}, 55);                  // 10, O
+        r->log.data({{key, 1, false, kInsert}}, 66);  // 11, T0
+        r->log.judge(66, 11);                         // 12
+        r->log.marker(55, true);                      // 13
+    }
+    for (int i = 0; i < 8 && (a.vs.judgeCursor() < 13 || b.vs.judgeCursor() < 13 || !a.pool.oneStepClaimable()); ++i) {
+        a.drive();
+        b.drive();
+    }
+    ASSERT_EQ(a.vs.judgeCursor(), 13) << "A's O waits for T0's marker";
+    ASSERT_EQ(b.vs.judgeCursor(), 13) << "B's O waits for T0's marker";
+    ASSERT_TRUE(a.pool.oneStepHeld() && a.pool.oneStepClaimable()) << "the holder is parked";
+    const uint64_t claims = a.pool.oneStepClaimsForTest();
+    for (int64_t i = 0; i < 20; ++i) {
+        a.log.data({{1000 + i}});
+        a.drive();
+        b.log.data({{2000 + i}});
+        b.drive();
+    }
+    EXPECT_EQ(a.pool.oneStepClaimsForTest(), claims) << "no collect anew while both lookups wait for T0's marker";
+    a.log.marker(66, true);
+    b.log.marker(66, true);
+    for (int i = 0; i < 16 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_EQ(b.vs.judgeCursor(), b.log.next);
+    EXPECT_TRUE(a.indexed(4)) << "T0's insert supersedes O's delete";
+    EXPECT_TRUE(b.indexed(5));
+    EXPECT_TRUE(a.indexed(1019) && b.indexed(2019));
+}
+
 // I3: accepted(r), an ordinary transaction committed below J.
 TEST(CheckedWritesTxnJudge, OrdinaryCommittedBelowJConflicts) {
     JudgeRig r(VoteMembers{100});
