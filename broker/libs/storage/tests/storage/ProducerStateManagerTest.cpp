@@ -1306,3 +1306,63 @@ TEST(UnknownProducerIdRegression, ProtocolIllegalSequencesStayOutOfOrderRegressi
     EXPECT_TRUE(m.validate(0, 5, 0, 0, -1, 0).isOos());
     EXPECT_TRUE(m.validate(0, 5, 0, 0, 4, 3).isOos());
 }
+
+// #953: compaction dropped seq 2..5 of P (and the cleaner P's ProducerTails) while seq 0..1 survive.  The rebuilt entry
+// carries lastSequence 1 although the broker really appended 5: P's next in-order batch (seq 6) looks like a forward gap.
+// The broker cannot vouch for it, so it answers UnknownProducerId (the client re-sequences), never OutOfOrderSequence.
+TEST(UnknownProducerIdRegression, ProducerStateRebuildUnvouchedRegression) {
+    const std::string dir = tmpPath("psm_953_unvouched");
+    fs::create_directories(dir);
+    {
+        rune::storage::Log log(dir);
+        log.recover();
+        for (int32_t s = 0; s < 2; ++s) {
+            const auto b = d6Batch(/*P*/ 9, 0, s, log.logEndOffset());
+            ASSERT_GE(log.append(b, log.logEndOffset()), 0);
+        }
+        auto rebuild = [&](ProducerStateManager& m) {
+            ASSERT_TRUE(m.rebuildFromLog(0, log, log.logEndOffset(), 0));
+            ASSERT_NE(m.entry(0, 9, 0), nullptr);
+            ASSERT_EQ(m.entry(0, 9, 0)->lastSequence, 1);
+            ASSERT_TRUE(m.entry(0, 9, 0)->rebuilt);
+        };
+        {   // (a) the forward gap on a rebuilt entry
+            ProducerStateManager m; rebuild(m);
+            EXPECT_TRUE(m.validate(0, 9, 0, 0, 6, 6).isUnknownProducerId()) << "(a) rebuilt entry, forward gap";
+        }
+        {   // (b) a live update vouches again, a gap is OOS
+            ProducerStateManager m; rebuild(m);
+            m.update(0, 9, 0, 1, 0, 6, 100);   // new epoch, live
+            EXPECT_FALSE(m.entry(0, 9, 0)->rebuilt);
+            EXPECT_TRUE(m.validate(0, 9, 0, 1, 8, 8).isOos()) << "(b) vouched again";
+        }
+        {   // (c) next in order
+            ProducerStateManager m; rebuild(m);
+            EXPECT_TRUE(m.validate(0, 9, 0, 0, 2, 2).isAccept()) << "(c) next in order";
+        }
+        {   // (d) exact retransmit of seq 1
+            ProducerStateManager m; rebuild(m);
+            const auto r = m.validate(0, 9, 0, 0, 1, 1);
+            EXPECT_TRUE(r.isDuplicate()) << "(d)";
+            EXPECT_EQ(r.retryBaseOffset, 1) << "(d) the original offset";
+        }
+        {   // (e) overlap: the existing answer (same as a vouched entry)
+            ProducerStateManager m; rebuild(m);
+            ProducerStateManager live;
+            live.update(0, 9, 0, 0, 0, 0, 0);
+            live.update(0, 9, 0, 0, 1, 1, 1);
+            const auto got = m.validate(0, 9, 0, 0, 0, 1);
+            const auto want = live.validate(0, 9, 0, 0, 0, 1);
+            EXPECT_EQ(got.isOos(), want.isOos()) << "(e)";
+            EXPECT_EQ(got.isDuplicate(), want.isDuplicate()) << "(e)";
+            EXPECT_EQ(got.isUnknownProducerId(), want.isUnknownProducerId()) << "(e)";
+        }
+        {   // (f) no rebuild: a forward gap stays OOS
+            ProducerStateManager m;
+            m.update(0, 9, 0, 0, 0, 0, 0);
+            m.update(0, 9, 0, 0, 1, 1, 1);
+            EXPECT_TRUE(m.validate(0, 9, 0, 0, 6, 6).isOos()) << "(f) live entry, forward gap";
+        }
+    }
+    fs::remove_all(dir);
+}

@@ -17,6 +17,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <random>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -84,6 +86,10 @@ struct SessionIo {
     /// Send one encoded client→gateway frame.
     /// Returns true if the frame was accepted by the underlying transport.
     virtual bool sendFrame(const uint8_t* buf, std::size_t len) = 0;
+
+    /// Send one frame in CLEAR even on an encrypted session (never sealed).  Only the encrypted session's probe Ping uses it
+    /// (SessionMachine::tickConnected).  Default: the ordinary send (an IO that never seals).
+    virtual bool sendClearFrame(const uint8_t* buf, std::size_t len) { return sendFrame(buf, len); }
 
     /// Retarget the transport at a new ingress endpoint (redirect / notleader).
     /// FIX F8: noexcept + returns success.  A false return means the retarget
@@ -388,6 +394,7 @@ public:
         // ClientAgent refuse it earlier with std::invalid_argument.
         (void)ownSecret_.assign(cfg_.password);
         detail::wipeString(cfg_.password);
+        buildKeepaliveEcho_();
     }
 
     // Non-copyable, non-movable (holds reference to io_).
@@ -409,6 +416,14 @@ public:
             if (retiredSealed_[i] == sid) return true;
         return false;
     }
+    /// U2: true when `nonce` is one of the last two probe nonces this ENCRYPTED session sent (see the probe in tick).  A restarted
+    /// gateway holds no keys, so it answers the clear probe Ping with a clear UnknownSession echoing the nonce; the agent accepts
+    /// that one clear frame (and only that) on an encrypted session.  Allocation-free; the nonces clear with the keys.
+    [[nodiscard]] bool isProbeNonce(int64_t nonce) const noexcept {
+        return cryptoState_.encrypted && nonce != 0 && (nonce == probeNonces_[0] || nonce == probeNonces_[1]);
+    }
+    /// The most recent probe nonce sent (0 = none yet); for tests and diagnostics.
+    [[nodiscard]] int64_t lastProbeNonce() const noexcept { return probeNonces_[probeNext_ ^ 1u]; }
     [[nodiscard]] int64_t      keepaliveCorrelationId() const noexcept { return cfg_.keepaliveCorrelationId; }
     [[nodiscard]] int64_t      correlationId() const noexcept { return correlationId_; }
     [[nodiscard]] int           redirectCount() const noexcept { return redirectCount_; }
@@ -1214,6 +1229,8 @@ private:
     void discardCrypto_() noexcept {
         retireSealedSessionId_();
         cryptoState_ = CryptoState{};
+        probeNonces_ = {};
+        probeNext_ = 0;
     }
 
     /// Encode + send a ConnectRequest using the current config.
@@ -1911,12 +1928,32 @@ private:
             // answers with a Pong, so even an idle session proves liveness inside
             // responseTimeoutNs.  Its correlationId (<= 0, per session) is never an
             // application ping's id (those start at 1) and routes the Pong back.
+            // L22: the echo (built once in the constructor) is the egress stream id plus the declared egress channel, so a gateway that
+            // restarted and forgot this session can still answer UnknownSession on that channel.  The Pong ignores the echo.
             const std::size_t n = rune::client::codec::encodePing(
-                scratch_.data(), kScratchCap, std::string_view{},
+                scratch_.data(), kScratchCap, std::string_view(keepaliveEcho_.data(), keepaliveEchoLen_),
                 sessionId_,
                 cfg_.keepaliveCorrelationId);
             if (n > 0) {
                 io_.sendFrame(scratch_.data(), n);
+            }
+            // U2: an ENCRYPTED session also sends a clear "probe" Ping right after the keepalive.  A gateway that restarted holds
+            // no session keys: it cannot open the sealed keepalive, and a notice it sends is clear text, which the agent drops for an
+            // encrypted session.  The probe is what such a gateway CAN read: it carries a fresh random negative nonce as its
+            // correlationId, the same echo as the keepalive, and the restarted gateway answers a clear UnknownSession that echoes the
+            // nonce; the agent accepts a clear UnknownSession for this session only with one of the last two nonces.
+            // Security: an off-path forger needs the 40-bit random session id AND the latest 62-bit nonce; an on-path attacker can
+            // already drop traffic.  Cost: one small clear frame per encrypted node session per keepalive interval; a live gateway
+            // drops it before any AEAD attempt (clearFramesOnEncryptedSessionDropped); an older gateway fails the AEAD on it and drops it.
+            if (cryptoState_.encrypted && keepaliveEchoLen_ != 0) {
+                // A nonce in [-(2^62), -kProbeNonceFloor]: never a keepalive's id (-(index + 1)) or an application ping's (positive), so the
+                // gateway can tell the clear probe from a sealed Ping by its correlationId alone (the header carries nothing else).
+                const int64_t nonce = -static_cast<int64_t>(kProbeNonceFloor + probeRng_() % ((uint64_t{1} << 62) - kProbeNonceFloor + 1));
+                probeNonces_[probeNext_] = nonce;
+                probeNext_ = static_cast<uint8_t>(probeNext_ ^ 1u);
+                const std::size_t pn = rune::client::codec::encodePing(
+                    scratch_.data(), kScratchCap, std::string_view(keepaliveEcho_.data(), keepaliveEchoLen_), sessionId_, nonce);
+                if (pn > 0) io_.sendClearFrame(scratch_.data(), pn);
             }
         }
     }
@@ -1938,6 +1975,39 @@ private:
     // ------------------------------------------------------------------------
     SessionIo&    io_;
     SessionConfig cfg_;
+
+    // Keepalive Ping echo: [int32 LE egressStreamId][declared egress channel].  Mirrors the gateway's Connect cap
+    // (rune::node::SessionAckSink::kMaxChannelBytes = 255); a longer channel sends the empty echo.
+    static constexpr std::size_t kMaxEchoChannelBytes = 255;
+    std::array<char, 4 + kMaxEchoChannelBytes> keepaliveEcho_{};
+    std::size_t                                keepaliveEchoLen_ = 0;
+
+    void buildKeepaliveEcho_() noexcept {
+        keepaliveEchoLen_ = 0;
+        if (cfg_.egressChannel.size() > kMaxEchoChannelBytes) {
+            return;
+        }
+        const auto stream = static_cast<uint32_t>(cfg_.egressStreamId);
+        for (int i = 0; i < 4; ++i) {
+            keepaliveEcho_[static_cast<std::size_t>(i)] = static_cast<char>((stream >> (8 * i)) & 0xFF);
+        }
+        std::memcpy(keepaliveEcho_.data() + 4, cfg_.egressChannel.data(), cfg_.egressChannel.size());
+        keepaliveEchoLen_ = 4 + cfg_.egressChannel.size();
+    }
+
+    /// U2: the encrypted session's probe nonces (the last two; 0 = none) and the per-machine generator, seeded once.
+    static std::mt19937_64 seedProbeRng_() noexcept {
+        try {
+            std::random_device rd;
+            return std::mt19937_64{(static_cast<uint64_t>(rd()) << 32) ^ rd()};
+        } catch (...) {   // no entropy source: fall back to the clock (a nonce is a rendezvous token, not a key)
+            return std::mt19937_64{static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count())};
+        }
+    }
+    static constexpr uint64_t kProbeNonceFloor = uint64_t{1} << 32;   // mirrored by ClientGateway::kProbeNonceFloor
+    std::array<int64_t, 2> probeNonces_{};
+    uint8_t                probeNext_ = 0;
+    std::mt19937_64        probeRng_  = seedProbeRng_();
 
     SessionState  state_            = SessionState::Disconnected;
     int64_t       sessionId_        = 0;

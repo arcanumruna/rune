@@ -42,6 +42,7 @@ struct Rec {
 struct TestLog {
     rune::storage::InMemoryLog log{1 << 20, 256};
     bool                       failNext = false;
+    int64_t logEndOffset() const noexcept { return log.logEndOffset(); }
     int64_t appendNoSyncRestamp(const uint8_t* b, std::size_t len, int32_t lastOffsetDelta, int64_t& base) {
         if (failNext) { failNext = false; throw std::runtime_error("append"); }
         return log.appendNoSyncRestamp(b, len, lastOffsetDelta, base);

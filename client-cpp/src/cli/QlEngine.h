@@ -100,8 +100,12 @@ struct PCreateView {
 struct PSelect     { rune::ql::SelectDef def; };
 struct PShowTopic  { std::string name; };
 struct PShowView   { std::string name; };
+/// Lease statements (Task 22 executes them; until then running one fails locally).
+struct PShowLeases  { rune::ql::ShowLeasesDef def; };
+struct PShowLease   { rune::ql::ShowLeaseDef def; };
+struct PRevokeLease { rune::ql::RevokeLeaseDef def; };
 using Prepared = std::variant<PDefine, PAlter, PAlterConfig, PDropTopic, PDropView, PHistory, PAsOf, PDiff, PSecurity, PSecShow,
-                              PCreateView, PSelect, PShowTopic, PShowView>;
+                              PCreateView, PSelect, PShowTopic, PShowView, PShowLeases, PShowLease, PRevokeLease>;
 
 /// Statement `n` of a script (1-based) sees this id: {hi, lo + n - 1}.
 struct IdSeq {
@@ -258,6 +262,9 @@ struct QlRun {
     bool run(const PSelect& s, const rune::client::DdlOptions&);
     bool run(const PShowTopic& s, const rune::client::DdlOptions&);
     bool run(const PShowView& s, const rune::client::DdlOptions&);
+    bool run(const PShowLeases& s, const rune::client::DdlOptions&);
+    bool run(const PShowLease& s, const rune::client::DdlOptions&);
+    bool run(const PRevokeLease& s, const rune::client::DdlOptions&);
 
 private:
     /// Waits for this run's last DDL, then reads the catalog tail: the state the next statement plans against.

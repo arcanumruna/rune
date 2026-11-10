@@ -35,6 +35,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -57,6 +58,12 @@ struct Recorder {
     std::vector<int32_t>                    bootViewInstalls;  // viewTopicIds installed through the BOOT sink
     std::vector<int32_t>                    liveViewInstalls;  // ... through the LIVE sink
     std::vector<std::pair<int, std::string>> storageFailures;
+    // Lease topics: what the lease-aware effects carried (not in `sequence` except writeSpecChanged).
+    std::vector<SinkSpec>                   sinkSpecs;          // every sinkApplied
+    std::vector<std::optional<rune::protocol::LeaseSpec>> topicLeases;   // every topicApplied: its lease
+    std::vector<std::pair<int32_t, std::string>> droppedNames;  // every topicDropped: (id, name)
+    std::vector<std::vector<rune::catalog::ConfigChange>> configChanges;   // every topicConfig
+    std::vector<rune::catalog::TopicObject> writeSpecTopics;    // every writeSpecChanged: the topic after the event
     std::function<void()>                   onTopicApplied;    // test hook, runs inside topicApplied
     std::function<void(int32_t topicId)>    onTopicAppliedId;  // test hook (may throw: a simulated crash)
     // Namespaces Task 5: what the control thread's mirror learns from the effects (nsId-aware), not in `sequence`.
@@ -66,6 +73,7 @@ struct Recorder {
     void clear() {
         appliedOffsets.clear(); appliedDigests.clear(); halts.clear(); sequence.clear();
         bootViewInstalls.clear(); liveViewInstalls.clear(); storageFailures.clear();
+        sinkSpecs.clear(); topicLeases.clear(); droppedNames.clear(); configChanges.clear(); writeSpecTopics.clear();
         onTopicApplied = nullptr;
         onTopicAppliedId = nullptr;
         objects = rune::gateway::ObjectIndex{};
@@ -78,18 +86,26 @@ struct Recorder {
             if (onTopicApplied) onTopicApplied();
             if (onTopicAppliedId) onTopicAppliedId(t.topicId);
             objects.onTopic(t.nsId, t.topicId, t.name);
+            topicLeases.push_back(t.lease);
             sequence.push_back("topicApplied:" + std::to_string(t.topicId));
         };
         e.sinkApplied = [this](const SinkSpec& s) {
             objects.onView(s.nsId, s.topicId, s.name);
+            sinkSpecs.push_back(s);
             sequence.push_back("sinkApplied:" + std::to_string(s.topicId));
         };
         e.namespaceUpserted = [this](const rune::catalog::NamespaceRecord& r) { nsUpserts.push_back(r); };
-        e.topicDropped = [this](int32_t id, uint32_t, const std::string&) {
+        e.topicDropped = [this](int32_t id, uint32_t, const std::string& name) {
             objects.onDropped(id);
+            droppedNames.emplace_back(id, name);
             sequence.push_back("topicDropped:" + std::to_string(id));
         };
-        e.topicConfig = [this](int32_t id, std::span<const rune::catalog::ConfigChange>) {
+        e.writeSpecChanged = [this](const rune::catalog::TopicObject& t) {
+            writeSpecTopics.push_back(t);
+            sequence.push_back("writeSpecChanged:" + std::to_string(t.topicId));
+        };
+        e.topicConfig = [this](int32_t id, std::span<const rune::catalog::ConfigChange> ch) {
+            configChanges.emplace_back(ch.begin(), ch.end());
             sequence.push_back("topicConfig:" + std::to_string(id));
         };
         e.schemaChanged = [this](const rune::catalog::TopicObject& t, uint16_t) {

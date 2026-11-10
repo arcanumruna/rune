@@ -18,6 +18,7 @@
 
 #include <rune/catalog/CatalogFile.h>
 #include <rune/codec/AlterOps.h>
+#include <rune/codec/LeaseColumns.h>
 #include <rune/codec/Serialize.h>
 #include <rune/codec/ViewKeyEncoding.h>
 #include <rune/codec/ViewPlanAuthored.h>
@@ -150,6 +151,19 @@ std::string formatSchemaDefinition(const cat::TopicObject& t) {
     return o.str();
 }
 
+std::expected<std::vector<uint8_t>, std::string> stripLeaseColumns(std::span<const uint8_t> storedBlob,
+                                                                   std::string_view topicName) {
+    rune::codec::Descriptor d;
+    try {
+        d = rune::codec::deserialize(storedBlob);
+    } catch (const std::exception&) {
+        return std::unexpected("lease topic '" + std::string(topicName) + "' does not start with the lease system columns");
+    }
+    auto stripped = rune::codec::stripLeaseColumns(std::move(d), topicName);
+    if (!stripped) return std::unexpected(std::move(stripped.error()));
+    return rune::codec::serialize(*stripped);
+}
+
 std::string formatTopicDefinition(const cat::TopicObject& t) {
     const cat::TopicConfig& c = t.config;
     std::ostringstream o;
@@ -160,9 +174,22 @@ std::string formatTopicDefinition(const cat::TopicObject& t) {
       << "  kind " << (t.schema ? "typed" : "raw") << "\n";
     if (t.schema) {
         const rune::protocol::TopicKeyFeatures& kf = t.schema->keyFeatures;
-        o << "  key.index " << (kf.keyIndex ? "on" : "off") << "\n"
-          << "  autoincrement " << (kf.autoIncrement ? "on (reserve " + std::to_string(kf.autoIncrementReserve) + ", max " + std::to_string(kf.autoIncrementMax) + ")" : "off") << "\n"
+        // A lease topic's key index is implied: the `lease view <t>.leases` line below says it.
+        if (!t.lease) o << "  key.index " << (kf.keyIndex ? "on" : "off") << "\n";
+        o << "  autoincrement " << (kf.autoIncrement ? "on (reserve " + std::to_string(kf.autoIncrementReserve) + ", max " + std::to_string(kf.autoIncrementMax) + ")" : "off") << "\n"
           << "  partitioner " << (kf.partitioner == rune::protocol::Partitioner::Modulo ? "modulo" : "fnv1a") << "\n";
+    }
+    if (t.lease) {
+        const rune::protocol::LeaseSpec& l = *t.lease;
+        o << "  lease.ttl " << l.ttlMs << "\n"
+          << "  lease.min_ttl " << l.minTtlMs << "\n"
+          << "  lease.max_ttl " << l.maxTtlMs << "\n"
+          << "  lease.max_keys " << l.maxKeys << "\n"
+          << "  lease.expiry_batch " << l.expiryBatch << "\n"
+          << "  lease.checkpoint " << (l.checkpoint != 0 ? "on" : "off") << "\n"
+          << "  lease.checkpoint_interval " << l.checkpointIntervalMs << "\n"
+          << "  lease.checkpoint_rate " << l.checkpointRate << "\n"
+          << "  lease view " << t.name << rune::codec::kLeaseViewSuffix << "\n";
     }
     o
       << "  config.cleanupPolicy " << int{c.cleanupPolicy} << "\n"
@@ -185,6 +212,15 @@ std::string formatTopicDefinition(const cat::TopicObject& t) {
 
 std::string formatViewDefinition(const cat::ViewObject& v) {
     std::ostringstream o;
+    if (v.kind == cat::ViewKind::LeaseIndex) {   // a plan-less sink the broker made beside its lease topic (named `<topic>.leases`)
+        static constexpr std::string_view kSuffix = rune::codec::kLeaseViewSuffix;
+        const std::string_view topic = std::string_view(v.name).ends_with(kSuffix)
+                                           ? std::string_view(v.name).substr(0, v.name.size() - kSuffix.size())
+                                           : std::string_view(v.name);
+        o << "view " << v.name << " (objectId " << v.objectId << ", version " << v.version << ")\n"
+          << "  lease view of topic " << topic << "\n";
+        return o.str();
+    }
     o << "view " << v.name << " (objectId " << v.objectId << ", version " << v.version << ")\n"
       << "  sources";
     for (const auto& s : v.def.sourceNames) o << " " << s;
@@ -744,8 +780,16 @@ std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st
                 rc::TopicOptions topic;
                 topic.replicationFactor = o.replicationFactor;
                 topic.config = o.config;   // F32: assigned whole
+                topic.keyFeatures = o.schema ? o.schema->keyFeatures : rune::protocol::TopicKeyFeatures{};
+                topic.lease = o.lease;
                 static const std::vector<uint8_t> kNoBlob;
-                const std::vector<uint8_t>& blob = o.schema ? o.schema->descriptorBlob : kNoBlob;
+                std::vector<uint8_t> userBlob;   // a lease topic: the stored blob minus the broker-added system columns
+                if (o.lease && o.schema) {
+                    auto stripped = stripLeaseColumns(std::span<const uint8_t>(o.schema->descriptorBlob), e.objectName);
+                    if (!stripped) return stripped.error();
+                    userBlob = std::move(*stripped);
+                }
+                const std::vector<uint8_t>& blob = (o.lease && o.schema) ? userBlob : (o.schema ? o.schema->descriptorBlob : kNoBlob);
                 const auto r = c.defineTopicAndWait(e.objectName, static_cast<uint32_t>(o.partitions),
                                                     o.schema ? o.schema->keyField : std::string(),
                                                     std::span<const uint8_t>(blob.data(), blob.size()),
@@ -758,7 +802,8 @@ std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st
                 const auto r = c.defineTopicAndWait(
                     e.objectName, static_cast<uint32_t>(top->partitions), o.schema.keyField,
                     std::span<const uint8_t>(o.schema.descriptorBlob.data(), o.schema.descriptorBlob.size()),
-                    clientPersistence(top->persistence), {}, ddl, t);
+                    clientPersistence(top->persistence),
+                    [&] { rc::TopicOptions to; to.keyFeatures = o.schema.keyFeatures; return to; }(), ddl, t);
                 return failureOf(r.errorCode, r.detail);
             } else if constexpr (std::is_same_v<T, cat::AlterSchemaOps>) {
                 const cat::TopicObject* top = st.topicByName(e.nsId, e.objectName);

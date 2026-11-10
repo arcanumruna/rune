@@ -91,6 +91,10 @@
 #include <unordered_set>
 #include <vector>
 
+// Lease topics A.6: the MSM image goes to v2 (lineage generation) at the lease level; metadata cannot see this header.
+static_assert(rune::metadata::kMsmImageV2FeatureLevel == rune::replication::MetadataFeature::kLeases,
+              "MSM image v2 level must be the lease feature level");
+
 namespace rune::node {
 
 // ---------------------------------------------------------------------------
@@ -1250,6 +1254,7 @@ public:
         // N1: the record carries the reporting leader's process identity.
         r.l = rune::metadata::decideTransientLineage(rec, m.leaderId, pa.leaderEpoch, m.isr[2], mintLineage_(),
                                                      incarnationOf_(m), pa.cleanElection);   // N3: unclean mints
+        r.withGeneration = msm_.featureLevel() >= rune::replication::MetadataFeature::kLeases;   // spec A.6
         noteLineageDecision_(r, rec);
         pendingLineageRecords_.push_back(r);
         drainDynamicQueue();
@@ -1260,8 +1265,9 @@ public:
         const bool minted = prev == nullptr || prev->lineage != r.l.lineage;
         ++(minted ? lineagesMinted_ : lineagesKept_);
         spdlog::info("MetadataService[{}]: transient topicId={} partition={} leader {} epoch {}: data lineage {} "
-                     "{:#x} (minted at epoch {})", selfId_, r.topicId, r.partition, r.l.confirmedLeader,
-                     r.l.confirmedEpoch, minted ? "MINTED" : "kept", r.l.lineage, r.l.mintEpoch);
+                     "{:#x} (minted at epoch {}, generation {})", selfId_, r.topicId, r.partition,
+                     r.l.confirmedLeader, r.l.confirmedEpoch, minted ? "MINTED" : "kept", r.l.lineage, r.l.mintEpoch,
+                     r.l.generation);
     }
     uint64_t mintLineage_() noexcept {
         // splitmix64 over (time, counter, node): unique per decision, non-zero.
@@ -1299,14 +1305,23 @@ public:
     /// failover commits: its committed identity no longer matches (or is not
     /// yet known) — never trusted.  Runtime thread.
     [[nodiscard]] uint64_t trustedTransientLineage(int32_t topicId, int32_t partition) const noexcept {
+        const rune::metadata::TransientLineage* rec = trustedTransientLineageRecord(topicId, partition);
+        return rec != nullptr ? rec->lineage : rune::metadata::kLineageUntrusted;
+    }
+    /// The record trustedTransientLineage answers from, or nullptr when the lineage is not trusted (same
+    /// rules).  Lease topics (spec A.6): the control thread posts it (token, generation) to the owning worker.
+    [[nodiscard]] const rune::metadata::TransientLineage* trustedTransientLineageRecord(int32_t topicId,
+                                                                                         int32_t partition) const noexcept {
         const rune::metadata::TransientLineage* rec = msm_.lineage(topicId, partition);
-        if (rec == nullptr) return rune::metadata::kLineageUntrusted;
+        if (rec == nullptr) return nullptr;
         const int64_t live = lineageAuthorityIncarnation_ != 0 ? lineageAuthorityIncarnation_
                                                                : knownProcessIdentity(rec->confirmedLeader);
-        if (live == 0) return rune::metadata::kLineageUntrusted;   // the leader has not (re)registered yet
-        return rune::metadata::lineageConfirmedFor(rec, msm_.assignment(topicId, partition), live)
-                   ? rec->lineage : rune::metadata::kLineageUntrusted;
+        if (live == 0) return nullptr;   // the leader has not (re)registered yet
+        return rune::metadata::lineageConfirmedFor(rec, msm_.assignment(topicId, partition), live) ? rec : nullptr;
     }
+    /// The committed assignment map (control thread; Task 27: the lease lineage fanout walks it).
+    [[nodiscard]] const auto& committedMapForFanout() const noexcept { return msm_.committedMap(); }
+    [[nodiscard]] uint64_t committedMapVersion() const noexcept { return msm_.committedVersion(); }
     /// TEST-ONLY: see NodeConfig::testUserDecisionHoldMs.  The window opens the first time this controller is
     /// ready and is never re-armed (one-shot per process).
     void setUserDecisionHoldForTest(int64_t ns) noexcept { userDecisionHoldNs_ = ns; }
@@ -1373,6 +1388,7 @@ private:
             r.topicId = t; r.partition = p;
             r.l = rune::metadata::decideTransientLineage(rec, selfId_, pa.leaderEpoch, src, mintLineage_(),
                                                          lineageAuthorityIncarnation_);
+            r.withGeneration = msm_.featureLevel() >= rune::replication::MetadataFeature::kLeases;   // spec A.6
             noteLineageDecision_(r, rec);
             pendingLineageRecords_.push_back(r);
         });

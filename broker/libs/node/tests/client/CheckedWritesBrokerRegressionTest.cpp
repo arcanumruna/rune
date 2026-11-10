@@ -3083,12 +3083,15 @@ struct ViewColumns {
     std::vector<std::string> names;
 
     ViewColumns(BrokerNode& n, const std::string& view) {
-        const auto blob = n.onAdminThreadForTest([&n, &view] {
-            return n.adminWorkerAgentForTest()->worker().applier().state().viewByName(rune::catalog::kDefaultNsId, view)->def.outputDescriptorBlob;
+        const auto blob = n.onAdminThreadForTest([&n, &view]() -> std::optional<std::vector<uint8_t>> {
+            const auto* v = n.adminWorkerAgentForTest()->worker().applier().state().viewByName(rune::catalog::kDefaultNsId, view);
+            if (v == nullptr) return std::nullopt;
+            return v->def.outputDescriptorBlob;
         });
+        if (!blob) throw std::runtime_error("view '" + view + "' is not in this node's catalog");
         std::vector<PrimType> types;
         std::vector<uint16_t> widths;
-        for (const auto& f : rune::codec::deserialize(blob).fields) {
+        for (const auto& f : rune::codec::deserialize(*blob).fields) {
             names.push_back(f.name);
             types.push_back(f.type);
             widths.push_back(f.type == PrimType::FixedStr ? f.fixedLen : uint16_t{0});
@@ -3580,6 +3583,140 @@ TEST(CheckedWritesBrokerRegression, KeyIndexOnASixteenByteKeyShardRegression) {
     EXPECT_EQ(again.status(), rc::OpStatus::BrokerError);
     EXPECT_EQ(again.code(), static_cast<uint16_t>(rune::protocol::client::ErrorCode::KeyExists));
     prod.closeImmediately();
+}
+
+// ===========================================================================================================
+// #953: an expired producer resurrected by a rebuild keeps writing (real broker, default config).
+// ===========================================================================================================
+namespace {
+
+struct StoredBatch {
+    int64_t producerId; int32_t baseSequence; int32_t lastSequence; int32_t recordCount;
+    std::vector<std::string> values;   ///< the batch's record values (empty string = tombstone)
+};
+
+/// Every batch in the partition's log, in offset order (control batches included), read on the owner thread.
+std::vector<StoredBatch> storedBatches(BrokerNode& n, int32_t topicId, int32_t partition) {
+    return n.onOwnerThreadForTest(topicId, partition, [](rune::replication::PartitionReplica& r) {
+        std::vector<StoredBatch> out;
+        rune::storage::Log& log = *r.log();
+        int64_t next = 0;
+        const int64_t leo = log.logEndOffset();
+        while (next < leo) {
+            const std::vector<uint8_t> data = log.read(next, 1 << 22);
+            if (data.empty()) { ++next; continue; }   // read() does not skip a compaction gap on its own
+            const int64_t before = next;
+            std::size_t pos = 0;
+            while (pos < data.size()) {
+                rune::protocol::RecordBatchReader reader(data.data() + pos, data.size() - pos);
+                if (!reader.ensureValid()) break;
+                const auto tl = static_cast<std::size_t>(reader.totalLength());
+                out.push_back({reader.producerId(), reader.baseSequence(), reader.baseSequence() + reader.lastOffsetDelta(), reader.recordCount(), {}});
+                if (!reader.isControl())
+                    reader.forEachRecord([&](std::string_view, std::string_view v, int64_t, int64_t) { out.back().values.emplace_back(v); });
+                next = std::max(next, reader.baseOffset() + reader.lastOffsetDelta() + 1);
+                if (tl == 0) break;
+                pos += tl;
+            }
+            if (next == before) break;
+        }
+        return out;
+    });
+}
+
+}  // namespace
+
+// Producer P writes key B (seq 0) then key A x4 (seq 1..4); producer Q supersedes every A, so P's later batches compact to
+// empty.  The cleaner keeps an emptied last batch only while P is unexpired, so once P expires only P's seq-0 batch survives
+// and the restart rebuild resurrects P with lastSequence 0; P's next in-order batch (seq 5) is a forward gap.  RED (drop
+// `|| e.rebuilt` in ProducerStateManager::validate): the ack is BrokerError code 20 (OutOfOrderSequence).
+TEST(CheckedWritesBrokerRegression, ExpiredProducerResurrectedByRebuildRegression) {
+    using Rec = KeyRec<uint64_t>;
+    constexpr uint16_t kOutOfOrderSequence = 20;
+    OneBroker b("pid-expiry", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client client(b.clientConfig());   // not a connectClient() client: it survives b.restart()
+    client.connectAndWait(30s);
+    rc::TopicOptions to;
+    to.config.cleanupPolicy             = 1;
+    to.config.segmentRollBytes          = 256;
+    to.config.minCleanableDirtyRatioPpm = 1;
+    to.config.fileDeleteDelayMs         = 50;
+    const auto t = client.defineTopicAndWait("pidx", 1, "k", rune::codec::serialize(Rec::descriptor()), rc::Persistence::Disk, to, {}, 60s);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+
+    rc::ProducerConfig pcfg;
+    pcfg.acks     = rc::Acks::All;   // acks Leader/All producers are idempotent
+    pcfg.lingerUs = 1;
+    rc::Producer pProd = client.producer(pcfg);
+    rc::Producer qProd = client.producer(pcfg);
+    rc::TypedTopic<Rec, rc::ProducerRef> p = client.openTopicAndWait<Rec>("pidx", pProd, 30s);
+    rc::TypedTopic<Rec, rc::ProducerRef> q = client.openTopicAndWait<Rec>("pidx", qProd, 30s);
+
+    const auto write = [](auto& topic, int i) { return topic.upsertAndWait(Rec::make(i), 30s); };
+    const int kB = 1, kA = 2, kC = 3;
+    ASSERT_TRUE(write(p, kB).ok());
+    for (int i = 0; i < 4; ++i) ASSERT_TRUE(write(p, kA).ok());
+    ASSERT_TRUE(write(q, kA).ok());
+    const int64_t pidBefore = pProd.producerId();
+
+    // The default expiry is days; the cleaner's clock goes past it.
+    const int64_t expiryMs = b.node().onCleanerThreadForTest([&] { return b.node().cleanerForTest()->producerIdExpirationMsForTest(); });
+    ASSERT_GT(expiryMs, 0);
+    const int64_t t0 = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    b.node().setCleanerNowForTest([later = t0 + expiryMs + 24LL * 3600 * 1000] { return later; });
+
+    // Precondition (never vacuous): P's only surviving batch is the key-B one (seq 0).
+    int filler = 1000;
+    std::vector<StoredBatch> seen;
+    ASSERT_TRUE(waitFor([&] {
+        (void)write(q, filler++);
+        seen = storedBatches(b.node(), t.topicId, 0);
+        if (seen.empty() || seen.front().baseSequence != 0 || seen.front().recordCount != 1) return false;
+        const int64_t pid = seen.front().producerId;
+        std::size_t mine = 0;
+        for (const StoredBatch& s : seen) mine += s.producerId == pid;
+        return mine == 1;
+    }, 10s)) << "P's later batches never compacted away; " << seen.size() << " batches";
+    const int64_t pid = seen.front().producerId;
+    if (pidBefore >= 0) EXPECT_EQ(pidBefore, pid);
+
+    b.restart();
+
+    // The same client and producer reconnect; retry until a definite answer.
+    std::set<std::string> errors;
+    std::optional<rc::WriteResult> lastOpt;
+    EXPECT_TRUE(waitFor([&] {
+        lastOpt = write(p, kC);
+        const rc::WriteResult& r = *lastOpt;
+        if (r.ok()) return true;
+        if (r.status() == rc::OpStatus::BrokerError && r.code() == kOutOfOrderSequence) return true;
+        errors.insert(std::to_string(static_cast<int>(r.status())) + "/" + std::to_string(r.code()));
+        return false;
+    }, 60s));
+    std::string seenErrors;
+    for (const std::string& e : errors) seenErrors += e + " ";
+    ASSERT_TRUE(lastOpt.has_value());
+    const rc::WriteResult& last = *lastOpt;
+    EXPECT_TRUE(last.ok()) << "status " << static_cast<int>(last.status()) << " code " << last.code() << "; earlier: " << seenErrors;
+    EXPECT_NE(last.code(), kOutOfOrderSequence);
+    std::cerr << "pid-expiry: producer id before " << pidBefore << ", after " << pProd.producerId() << ", log pid " << pid
+              << "; errors before OK: " << seenErrors << "\n";
+    for (const StoredBatch& s : seen)
+        std::cerr << "pid-expiry: batch pid " << s.producerId << " seq " << s.baseSequence << ".." << s.lastSequence << " n " << s.recordCount << "\n";
+
+    std::size_t cValues = 0;
+    for (const StoredBatch& sb : storedBatches(b.node(), t.topicId, 0))
+        for (const std::string& v : sb.values) {
+            uint64_t k = 0;
+            if (v.size() >= 12) std::memcpy(&k, v.data() + 4, 8);
+            cValues += k == Rec::make(kC).k;
+        }
+    EXPECT_EQ(cValues, 1u) << "key C reads back exactly once";
+    pProd.closeImmediately();
+    qProd.closeImmediately();
+    client.close();
 }
 
 // Smoke test: the node that coordinates the producer id crashes once the client has opened a session on it, and the new coordinator

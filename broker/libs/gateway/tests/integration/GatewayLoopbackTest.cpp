@@ -689,11 +689,11 @@ TEST_F(GatewayLoopbackFixture, UnknownTemplateId_DropsAndKeepsServing) {
                           client.egressStreamId, client.egressChannel, 6, scratch_);
     const int64_t sid = resp.assignedSessionId;
 
-    // Craft a frame with templateId=99 (unknown), correct schemaId/version.
+    // Craft a frame with templateId=102 (unknown; 96-101 are lease topics since client 18), correct schemaId/version.
     {
         pc::MessageHeader hdr;
         hdr.blockLength   = 0;
-        hdr.templateId    = 99;   // unknown — triggers UnknownTemplate in checkFrame
+        hdr.templateId    = 102;  // unknown — triggers UnknownTemplate in checkFrame
         hdr.schemaId      = pc::kSchemaId;
         hdr.version       = pc::kProtocolVersion;
         hdr.sessionId     = 0;

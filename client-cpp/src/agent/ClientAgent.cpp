@@ -115,7 +115,9 @@ ClientAgent::ClientAgent(AgentConfig cfg)
 void ClientAgent::init() {
     mnDebug_ = std::getenv("RUNE_MN_DEBUG") != nullptr;
     produceAcks_.reserve(static_cast<std::size_t>(cfg_.egressPollLimit) * 4);
+    // Task 14a: room for the lease trailers (kMaxVerdictEntries x 16 bytes) on top of the verdicts - sized once, here.
     verdictBytes_.reserve(65536 * 8);
+    leaseTrailerBytes_.reserve(std::size_t{rune::protocol::client::ProduceResponse::kMaxVerdictEntries} * 16);   // Task 14a: a cycle of lease trailers
     // Seed the endpoint-keyed session collection with the seed session
     // (sessions_[0]).  Its IO adapter targets the transport default ingress
     // channel, so its control frames fast-path back to the default offer (the
@@ -404,6 +406,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     // work-done signals (the IdleStrategy backs off on 0 for idle cycles).
     // Single-node: exactly one session (the seed) — same cost as before.
     for (auto& s : sessions_) {
+        if (s->responsePort != 0 && s->machine.state() == session::SessionState::Connected) checkResponseEgress_(*s, nowNs);
         s->machine.tick(nowNs);
     }
 
@@ -801,6 +804,20 @@ bool ClientAgent::answersAnInFlightConnect_(const uint8_t* buf) const noexcept {
     return false;
 }
 
+bool ClientAgent::acceptsProbeNotice_(const uint8_t* buf, std::size_t len, int64_t headerSid) noexcept {
+    const auto err = codec::decodeErrorResponse(buf, len);
+    if (!err || err->code != static_cast<int16_t>(::rune::protocol::client::ErrorCode::UnknownSession)) return false;   // any other clear frame
+    for (const auto& sp : sessions_) {
+        const session::SessionMachine& m = sp->machine;
+        if (m.sessionId() == headerSid && err->sessionId == headerSid && m.isProbeNonce(err->correlationId)) {
+            ++probeNoticesAccepted_;
+            return true;
+        }
+    }
+    ++probeNoticesRejected_;
+    return false;
+}
+
 void ClientAgent::dispatchEgressFrame(int64_t nowNs,
                                        const uint8_t* buf,
                                        std::size_t    len) noexcept
@@ -882,14 +899,21 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
                     // try the next candidate before giving up.
                 }
             }
+            // U2: the ONE clear frame an encrypted session accepts: a clear ErrorResponse{UnknownSession} for that session echoing
+            // one of its latest probe nonces (a restarted gateway holds no keys; its notice is clear text).  Everything else clear
+            // is dropped.  Security: an off-path forger needs the 40-bit random session id AND the latest 62-bit nonce; an on-path
+            // attacker can already drop traffic.
+            bool probeNotice = false;
             if (!decrypted && sawEncryptedCandidate) {
-                return;  // every encrypted candidate failed auth — drop
+                if (peekedTid == codec::TemplateId::ErrorResponse)
+                    probeNotice = acceptsProbeNotice_(buf, len, sid);
+                if (!probeNotice) return;  // every encrypted candidate failed auth (or a clear frame) — drop
             }
             // #426: a frame naming a session whose keys were discarded (a new connect episode began while the broker
             // still held the old session and sealed its answer under the old key) is old-episode ciphertext: no live
             // key opens it and it is never decoded as plaintext.  The only clear frame still dispatched is an
             // ErrorResponse answering the new episode's in-flight ConnectRequest.
-            if (!decrypted && sawRetiredCandidate &&
+            if (!decrypted && !probeNotice && sawRetiredCandidate &&
                 !(peekedTid == codec::TemplateId::ErrorResponse && answersAnInFlightConnect_(buf))) {
                 return;
             }
@@ -899,7 +923,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             // in-flight ConnectRequest (a pre-TLS Redirect / NotLeader / refusal, handled as unauthenticated by the
             // session machine).  Any UDP sender can put a frame on this egress; a clear ProduceResponse{OK} would
             // otherwise complete a produce, a clear Redirect move a TLS session.
-            if (!decrypted && cfg_.session.offerCrypto && cfg_.session.requireCrypto &&
+            if (!decrypted && !probeNotice && cfg_.session.offerCrypto && cfg_.session.requireCrypto &&
                 !(peekedTid == codec::TemplateId::ErrorResponse && answersAnInFlightConnect_(buf))) [[unlikely]] {
                 ++clearFramesDropped_;
                 return;
@@ -1221,6 +1245,14 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
                     verdictBytes_.insert(verdictBytes_.end(), opt->verdictBytes.begin(), opt->verdictBytes.end());
                     if (verdictBytes_.capacity() != cap) ++verdictArenaGrowths_;
                 }
+                if (opt->hasLease) {   // Task 14a: the lease trailer rides its own preallocated arena (cleared with the acks)
+                    ack.hasLease    = true;
+                    ack.leaseCount  = opt->leaseCount;
+                    ack.leaseOffset = static_cast<uint32_t>(leaseTrailerBytes_.size());
+                    const std::size_t cap = leaseTrailerBytes_.capacity();
+                    leaseTrailerBytes_.insert(leaseTrailerBytes_.end(), opt->leaseBytes.begin(), opt->leaseBytes.end());
+                    if (leaseTrailerBytes_.capacity() != cap) ++leaseArenaGrowths_;
+                }
                 produceAcks_.push_back(ack);
             }
         }
@@ -1246,6 +1278,10 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
 
 bool SessionEndpointIo::sendFrame(const uint8_t* buf, std::size_t len) {
     return agent->offerControlTo(*owner, buf, len);
+}
+
+bool SessionEndpointIo::sendClearFrame(const uint8_t* buf, std::size_t len) {
+    return agent->offerControlTo(*owner, buf, len, /*clear=*/true);
 }
 
 bool SessionEndpointIo::retarget(const std::string& newIngressChannel) noexcept {
@@ -1358,7 +1394,7 @@ bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
     return true;
 }
 
-bool ClientAgent::offerControlTo(Session& owner, const uint8_t* buf, std::size_t len) noexcept {
+bool ClientAgent::offerControlTo(Session& owner, const uint8_t* buf, std::size_t len, bool clear) noexcept {
     if (failed_) [[unlikely]] return false;  // T15b: a failed client does no I/O
     // client<->broker TLS/AEAD (Task 6b): seal under the SENDING session's own
     // CryptoState (D4 r2: by identity — never a lookup by endpoint string, which
@@ -1369,7 +1405,9 @@ bool ClientAgent::offerControlTo(Session& owner, const uint8_t* buf, std::size_t
     // while encrypted==false) and are defensively exempt by templateId too
     // (see sealForDestination_).  Plaintext path (crypto off) is byte-
     // identical to before Task 6b.
-    if (!sealForDestination_(owner.machine, buf, len)) {
+    // `clear` (the encrypted session's probe Ping only): sent unsealed; the machine sends it in Connected, so the seal gate's
+    // state checks would pass anyway.
+    if (!clear && !sealForDestination_(owner.machine, buf, len)) {
         return false;  // seal failed — DROP, do not transmit
     }
     // The seed → the default publication (wherever it points: byte-identical
@@ -1393,6 +1431,18 @@ bool ClientAgent::offerControlTo(Session& owner, const uint8_t* buf, std::size_t
     // whatever it answers (ConnectResponse, ErrorResponse, a late answer to an older Connect): the pair is spent.
     if (isConnect && accepted && owner.responsePort != 0) [[unlikely]] owner.pair = ResponsePair::Spent;
     return accepted;
+}
+
+void ClientAgent::checkResponseEgress_(Session& s, int64_t nowNs) noexcept {
+    // #989: the gateway answers this session on ONE response publication, and Aeron pins the pair's subscription to it.
+    // When that image closes (the gateway closed it or died), no gateway can reach this pair again: a restarted one
+    // cannot even send UnknownSession.  The session is gone, exactly as if the gateway had said so: resume / reconnect
+    // now (a Connect builds a fresh pair), never after the response timeout.  Mirrors AeronCluster.pollEgress.
+    const bool lost = (&s == &seedSession()) ? transport_.seedResponseEgressLost() : transport_.responseEgressLost(s.ctlPub);
+    if (!lost) [[likely]] return;
+    ++responseEgressLosses_;
+    s.machine.onErrorResponse(static_cast<int16_t>(::rune::protocol::client::ErrorCode::UnknownSession),
+                              "response egress closed", 0, nowNs, s.machine.sessionId());
 }
 
 void ClientAgent::rePairSessionResponse_(Session& s) noexcept {

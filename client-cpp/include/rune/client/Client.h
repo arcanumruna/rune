@@ -75,7 +75,11 @@
 #include <rune/protocol/client/NamespaceUsageMessages.h>
 #include <rune/protocol/client/StatsMessages.h>
 #include <rune/client/NamespaceLimitFields.h>
+#include <rune/client/lease/LeaseOptions.h>
+#include <rune/client/lease/detail/LeaseGuards.h>
+#include <rune/protocol/client/LeaseMessages.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -96,6 +100,9 @@
 #include <vector>
 
 namespace rune::client {
+
+template <class T> class LeaseTopic;   // Task 14a: lease/LeaseTopic.h
+
 
 // ---------------------------------------------------------------------------
 // Bytes alias
@@ -151,6 +158,8 @@ struct TopicOptions {
     rune::protocol::TopicConfig config{};
     /// Checked writes (broker >= 10): the key index and its options; the default sends nothing.
     rune::protocol::TopicKeyFeatures keyFeatures{};
+    /// A lease topic (broker >= 11); the broker adds the four lease system columns.
+    std::optional<rune::protocol::LeaseSpec> lease;
 };
 
 /// Result of DropTopic / DropView / AlterView / AlterTopicConfig (DdlResponse 78).
@@ -174,9 +183,13 @@ struct TopicSchemaResult {
     /// (TopicSchemaResponse trailing field); <= 0 = not reported (pre-2b broker)
     /// — typed topics then route over 1 partition (typedPartitionCount).
     int32_t              partitionCount = 0;
-    /// Checked writes: the topic's key features when the broker sent them (it does iff they are not the defaults);
+    /// Checked writes: the topic's key features when the broker sent them (it does iff they are not the defaults OR the topic is a lease topic);
     bool                             hasKeyFeatures = false;
     rune::protocol::TopicKeyFeatures keyFeatures{};
+    /// Lease topics: the topic's lease spec when the broker sent it (broker >= 11 to a lease-aware session).
+    std::optional<rune::protocol::LeaseSpec> lease;
+    /// Lease topics (Task 14a): the topic id of the lease view (`<topic>.leases`), from the catalog; -1 = none.
+    int32_t leaseViewTopicId = -1;
 };
 
 // ---------------------------------------------------------------------------
@@ -359,6 +372,8 @@ using NanoClock = int64_t (*)() noexcept;
 inline constexpr std::size_t kMaxPasswordBytes = detail::kMaxPasswordBytes;
 
 struct ClientConfig {
+    /// Task 15: how many LeaseSessions may be open at once on this client (0 = lease sessions refused).
+    uint32_t    maxLeaseSessions = 64;
     std::string gatewayChannel   = "aeron:ipc";
     int32_t     gatewayStreamId  = 1;
     std::string egressChannel    = "aeron:ipc";
@@ -425,6 +440,9 @@ struct ClientConfig {
     NanoClock  nanoClock  = nullptr;
     // Aeron client liveness: in Invoker mode doWork() must run at least this often.
     int64_t    aeronClientLivenessTimeoutNs = 10'000'000'000LL;
+    // #989: the embedded driver's image liveness timeout (0 = Aeron's 10 s): how soon a response-mode session sees its
+    // gateway's response publication die (and reconnects), when the gateway crashed without closing it.
+    int64_t    aeronImageLivenessTimeoutNs = 0;
     // T15 D1: run the embedded driver + Aeron conductor on the duty thread even in
     // RunnerMode::Thread (DriverMode::Invoker: no driver thread, no conductor
     // thread — the runner pumps both).  Default false: a plain Client keeps its
@@ -644,6 +662,8 @@ public:
     /// constructing thread.  Re-entry from a callback fired inside the duty cycle
     /// returns 0 without running a nested cycle.  Thread mode: throws logic_error.
     int doWork();
+    /// Whether this client runs in RunnerMode::Invoker (the owner pumps doWork()).
+    [[nodiscard]] bool invokerMode() const noexcept { return cfg_.runnerMode == RunnerMode::Invoker; }
 
     /// A7 park-until-work (Invoker owner): the embedded invoker driver's socket-readiness fds — park in
     /// ppoll() on them when doWork() returned 0 instead of spinning; a datagram (an ack, a status message)
@@ -742,8 +762,11 @@ public:
     /// Fix round 5 (N4-I1) test hook: final-leg HandshakeFailed verdicts the agent applied.
     [[nodiscard]] uint64_t testHandshakeFinalLegFailures() const noexcept { return agent_.handshakeFinalLegFailures(); }
     [[nodiscard]] uint64_t testStaleSessionNotices() const noexcept { return agent_.staleSessionNotices(); }
+    /// #989: sessions resumed because their response pair's gateway publication closed.
+    [[nodiscard]] uint64_t testResponseEgressLosses() const noexcept { return agent_.responseEgressLosses(); }
     /// Test hook (duty-cycle thread only): the seed session's current broker session id (0 = none).
     [[nodiscard]] int64_t testSeedSessionId() const noexcept { return agent_.seedSession().machine.sessionId(); }
+    [[nodiscard]] uint64_t testSeedStaleSessionLosses() const noexcept { return agent_.seedSession().machine.staleSessionLosses(); }
     [[nodiscard]] std::size_t testPendingUnsubscribes() const noexcept { return subscriberHub_.pendingUnsubscribes(); }
     [[nodiscard]] uint64_t testIngressFatalDropped() const noexcept { return agent_.ingressFatalDropped(); }
     /// DR client bug 2: ring-drained frames dropped after the transport refused
@@ -932,7 +955,8 @@ public:
     //   DefineTopic    value = topicId, aux = version; a broker errorCode in the
     //                  response -> BrokerError (errorCode, value/aux kept).
     //   GetTopicSchema value = topicId, aux = version (+ a key-features flag, see schemaAuxOf), payload = descriptor
-    //                  blob, then the 14-byte key-features block when the aux flag says so (schemaBlobOf strips it)
+    //                  blob; aux bit 16 = the 14-byte key-features block follows it, and aux bit 17 = the 39 lease
+    //                  bytes follow that (bit 17 is set only together with bit 16); schemaBlobOf strips both
     //                  (polled form: up to maxResultBytes, else
     //                  ResultTooLarge with value = the real size),
     //                  reserved0 = the topic's partitionCount (Phase 2b; <= 0
@@ -1008,6 +1032,53 @@ public:
     OpResult getStats(rune::protocol::client::StatsScope scope, int32_t objectId, int32_t partition,
                       CompletionTarget target, Token token);
 
+    // ---- Lease topics (Task 14a): routed lease control ops (use LeaseTopic<T>; these are its building blocks) ----
+    /// GetTopicSchema(name, fingerprint) completing as OpKind::OpenLeaseTopic (same value/aux/payload as GetTopicSchema).  A seed
+    /// whose brokerVersion is known and below kBrokerVersionLeases ends it BrokerTooOld, nothing sent.
+    OpResult openLeaseTopicSchema(std::string_view name, uint64_t requestedFingerprint, CompletionTarget target, Token token);
+    /// openLeaseTopicSchema, blocking (cold).  Throws like getTopicSchemaAndWait; a non-lease topic throws (InvalidArgument),
+    /// a broker below kBrokerVersionLeases throws (BrokerTooOld).  Used by openLeaseTopicAndWait<T>.
+    TopicSchemaResult openLeaseSchemaAndWait(std::string_view name, uint64_t requestedFingerprint,
+                                             std::chrono::nanoseconds timeout);
+    /// Task 14a: the typed lease handle of the lease topic `name` (see lease/LeaseTopic.h, which defines this).  The async
+    /// form completes OpKind::OpenLeaseTopic with the schema payload; build the handle from it with LeaseTopic<T>::fromOpen.
+    template <class T>
+    OpResult openLeaseTopic(std::string_view name, CompletionTarget target, Token token) {
+        return openLeaseTopicSchema(name, T::kFingerprint, target, token);
+    }
+    template <class T>
+    [[nodiscard]] LeaseTopic<T> openLeaseTopicAndWait(std::string_view name, const LeaseTopicConfig& cfg = {},
+                                                      std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+    /// LeaseKeepAlive (wire 96) with ONE entry.  `timeoutMs` 0 = the ping timeout.  Completion: OpKind::LeaseKeepAlive, Ok with
+    /// aux = the lease's ttlMs, or BrokerError with errorCode = the entry's code.  Zero-alloc after warm-up.
+    OpResult leaseKeepAlive(int32_t topicId, int32_t partition, std::span<const uint8_t> key, int64_t version,
+                            uint32_t timeoutMs, CompletionTarget target, Token token);
+    /// Task 15: LeaseKeepAlive with `entries` (1..256) for ONE topic partition, for a LeaseSession.  `target.cq` is required and the CALLER has
+    /// already reserved 48 x (1 + entries.size()) bytes on it (one reserve(48) per entry plus one for the terminal): nothing is reserved or
+    /// unreserved here.  Accepted is followed by one completion per answered entry (OpKind::LeaseKeepAlive, reserved0 = the entry index, aux =
+    /// the ttlMs, errorCode = the entry's code, 48 reserved bytes) and exactly one terminal (reserved0 == kLeaseKeepAliveTerminal, status Ok
+    /// when every entry was answered, else the failure; it returns 48 x (1 + unanswered) bytes).  An index answered twice, or >= entries, is
+    /// dropped.  InvalidArgument when the frame exceeds leaseKeepAliveBudgetBytes(); on any non-Accepted result the caller unreserves.
+    OpResult leaseKeepAliveBatch(int32_t topicId, int32_t partition, std::span<const rune::protocol::client::LeaseKeepAlive::Entry> entries,
+                                 uint32_t timeoutMs, CompletionTarget target, Token token);
+    /// The most bytes one leaseKeepAliveBatch frame may encode (the smaller of the transport frame and the command ring's record limit).
+    [[nodiscard]] std::size_t leaseKeepAliveBudgetBytes() const noexcept;
+    /// The injected (or steady) monotonic clock, the one every duty-side deadline uses.
+    [[nodiscard]] int64_t nowNs() const noexcept { return now(); }
+    /// Task 15: submits a guard command (GuardReserve/Arm/End/Release/Ack) to the duty thread: applied in place on the duty thread, else
+    /// through the agent's command ring.  False when the ring is full or closed.
+    [[nodiscard]] bool submitGuardCommand(const detail::HubCommand& cmd);
+    /// True once the command ring is closed (the client closed): the duty thread no longer applies guard commands or runs handlers.
+    [[nodiscard]] bool commandsClosed() const noexcept { return agent_.commandRingClosed(); }
+    /// LeaseTimeToLive (wire 98).  Completion: OpKind::LeaseTimeToLive, value = version, aux = remainingMs (-1 none), payload =
+    /// the 32 LE bytes {grantedTtlMs u64, remainingMs i64, version i64, holder u64}.
+    OpResult leaseTimeToLive(int32_t topicId, int32_t partition, std::span<const uint8_t> key, uint32_t timeoutMs,
+                             CompletionTarget target, Token token);
+    /// ScanLeases (wire 100) on the lease view.  Completion: OpKind::ScanLeases, value = asOfOffset, aux = bit_cast<int64_t>(lastHash),
+    /// reserved0 = rowCount | (done << 31), payload = the rows verbatim.
+    OpResult scanLeases(int32_t viewTopicId, int32_t partition, std::span<const uint8_t> prefix, uint64_t resumeHash, bool first,
+                        uint16_t maxRows, uint32_t timeoutMs, CompletionTarget target, Token token);
+
     // ---- Catalog history (Task 5): DDL with the DDL extension ---------------
     // Every DDL (the overloads above included, with default DdlOptions) carries
     // the DDL extension: statement, clientName, a 128-bit requestId (F14) and
@@ -1050,6 +1121,13 @@ public:
     /// many further notes were dropped past kMaxDdlRetryNotes since the last take.
     /// Invoker owner thread only (std::logic_error otherwise).
     std::size_t takeDdlRetryNotes(std::vector<DdlRetryNote>& out);
+
+    /// L22 fix 2: route-hint counters of the partition-routed control ops (view reads, lease ops).  The owner thread or a duty-cycle
+    /// callback (Thread mode: the latest values the duty thread published on its status ring).
+    [[nodiscard]] uint64_t routeHintHits() const;      ///< ops that started on a remembered leader
+    [[nodiscard]] uint64_t routeHintLearned() const;   ///< hints stored from a followed Redirect
+    [[nodiscard]] uint64_t routeHintCleared() const;   ///< hints dropped (NotLeader, Redirect from a hinted node, lost session)
+    [[nodiscard]] uint64_t ctlRedirectsFollowed() const;   ///< Redirects followed by routed control ops
 
     OpResult dropTopic(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token);
     OpResult dropView(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token);
@@ -1579,7 +1657,22 @@ private:
         std::string          endpoint;       // the node it goes to ("" = the seed); a Redirect moves it
         uint32_t             requestLo = 0;  // the generated requestId's lo (0 = an explicit requestId)
         DdlRetry             retry{};
+        // L22 fix 2: the partition a partition-routed op (view reads, lease ops) is served by; routeTopic -1 = not
+        // partition-routed.  routePartition kRouteAnyPartition = the frame names no single partition.
+        int32_t              routeTopic = -1;
+        int32_t              routePartition = -1;
+        bool                 hinted = false;   // `endpoint` came from the route-hint table and no Redirect was followed yet
     };
+    static constexpr int32_t kRouteAnyPartition = -2;
+    /// L22 fix 2: the node that last answered a partition-routed op for (topic, partition) - the next op starts there
+    /// instead of at the seed (which would Redirect it, two round trips per op).  Direct-mapped; a collision overwrites.
+    struct RouteHint {
+        int32_t     topic = -1;
+        int32_t     partition = -1;
+        std::string endpoint;
+    };
+    static constexpr std::size_t kRouteHintSlots = 256;
+    static constexpr std::size_t kRouteEndpointReserve = 128;
     /// The DDL ops (the ones that carry the DDL extension, plus the bootstrap).
     [[nodiscard]] static constexpr bool isDdlOp(OpKind op) noexcept {
         return op == OpKind::DefineTopic || op == OpKind::AlterTopic || op == OpKind::CreateView ||
@@ -1592,7 +1685,8 @@ private:
     /// GetViewRow (a view row is served only by its source partition's leader).
     [[nodiscard]] static constexpr bool isRoutedCtlOp(OpKind op) noexcept {
         return isDdlOp(op) || op == OpKind::GetViewRow || op == OpKind::GetViewRowK || op == OpKind::ScanViewRows ||
-               op == OpKind::GetStats;
+               op == OpKind::GetStats || op == OpKind::LeaseKeepAlive || op == OpKind::LeaseTimeToLive ||
+               op == OpKind::ScanLeases || op == OpKind::OpenLeaseTopic;
     }
     /// A DDL that is not in flight (its frame waits for the resend pump).
     [[nodiscard]] static bool ddlWaitsForResend(const DdlRetry& r) noexcept {
@@ -1615,6 +1709,12 @@ private:
         struct CtlAwaitingSeed { std::vector<uint8_t> frame; };
         std::variant<std::monostate, RoutedCtlPending, CtlAwaitingSeed> ddl;   // catalog history: a DDL's own state
         detail::SecretString newPassword;   // review B I4: a self SET PASSWORD's plaintext until its answer (wiped always)
+        /// Task 15: a multi-entry LeaseKeepAlive (leaseKeepAliveBatch).  multiCount > 0: each answered entry delivers its own completion
+        /// (reserved0 = the entry index, 48 reserved bytes); the op's terminal completion (reserved0 == kLeaseKeepAliveTerminal) carries
+        /// 48 x (1 + unanswered entries).  multiBits marks the entries answered so far (a duplicate or out-of-range index is dropped).
+        uint16_t                multiCount    = 0;
+        uint16_t                multiAnswered = 0;
+        std::array<uint64_t, 4> multiBits{};
     };
 
     /// Header of a kMsgControlOp ring record (followed by the op's frame).
@@ -1631,6 +1731,9 @@ private:
         // counter); 0 = the frame carries an explicit requestId (or is not a DDL).
         uint32_t          requestIdAt   = 0;
         uint16_t          secretLen     = 0;   // review B I4: trailing bytes of the record's frame area that are a secret, not wire
+        uint32_t          timeoutMs     = 0;   // Task 14a: a per-op deadline (0 = the op kind's configured default)
+        uint16_t          multiCount    = 0;   // Task 15: entries of a leaseKeepAliveBatch (0 = an ordinary op)
+        uint16_t          pad2          = 0;
     };
 
     /// A handler completion deferred while close() runs (delivered after every
@@ -1805,7 +1908,7 @@ private:
     /// op's PendingCtl::newPassword (a self SET PASSWORD's plaintext, installed on OK) — never sent, wiped on any outcome.
     OpResult issueControl_(OpKind op, CompletionTarget target, Token token,
                            std::span<const uint8_t> frame, uint32_t payloadHint, uint32_t requestIdAt = 0,
-                           std::span<const uint8_t> secret = {});
+                           std::span<const uint8_t> secret = {}, uint32_t timeoutMs = 0, uint16_t multiCount = 0);
     // ---- Catalog history (Task 5): DDL issue + answers (duty thread, cold) ----
     /// The DDL extension of `ddl` (views into `ddl` / cfg_; requestId as given).
     [[nodiscard]] rune::protocol::client::DdlExtension ddlExt_(const DdlOptions& ddl) const noexcept;
@@ -1908,7 +2011,7 @@ private:
     /// an ack that arrived earlier in the same poll is applied before a resend.
     int  routeBufferedAcks_();
     [[nodiscard]] int64_t now() const noexcept {
-        return cfg_.nanoClock != nullptr ? cfg_.nanoClock() : nowNs();
+        return cfg_.nanoClock != nullptr ? cfg_.nanoClock() : steadyNs_();
     }
 
     /// Shared implementation of producer() / testProducerWithRingCap().
@@ -2133,6 +2236,13 @@ private:
     /// F8a: apply one hub command on the duty thread (ring drain, close drain,
     /// or directly when a handle is used on the duty thread).
     void applyHubCommand_(const detail::HubCommand& cmd);
+    /// Task 15: GuardReserve/Arm/End/Release/Ack (duty thread).
+    void applyGuardCommand_(const detail::HubCommand& cmd);
+    static void guardBindTrampoline_(void* ctx, producer::ProducerImpl& impl, uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq,
+                                     int64_t atRiskNs) noexcept;
+    /// Task 15: one LeaseKeepAliveResponse frame for the multi-entry pending op at index i.
+    void onKeepAliveBatchAnswer_(std::size_t i, const rune::protocol::client::LeaseKeepAliveResponse& r);
+    std::vector<uint8_t> batchFrame_;   // leaseKeepAliveBatch's encode buffer (owner thread; grown once)
     /// fix3 I3: the duty-thread DIRECT application (acts on the impl).
     void applyHubCommandDirect_(const detail::HubCommand& cmd);
     /// The thread whose handle calls take the duty path: the Thread-mode runner;
@@ -2206,7 +2316,7 @@ private:
     // Helpers
     // -------------------------------------------------------------------------
 
-    static int64_t nowNs() noexcept {
+    static int64_t steadyNs_() noexcept {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
@@ -2259,6 +2369,8 @@ private:
     static_assert(kClientCorrIdTag == producer::coordcorr::kClientCounterTag,
                   "the coordinator id tag (bit 58) is chosen disjoint from this counter's");
     int64_t                 nextCorrId_ = kClientCorrIdTag | 1;   // duty-owned correlation counter
+    /// The capacity of the pending control table and of the recycled-frame pool (both reserved in the constructor).
+    static constexpr std::size_t kCtlTableCap = 256;
     std::vector<PendingCtl> pendingCtl_;               // ping / define / get, by corrId (linear: cold)
     // Catalog history (F14): this Client's random 64-bit instance id (drawn once
     // at construction, never 0; immutable) and the duty thread's DDL counter.
@@ -2279,6 +2391,24 @@ private:
     [[nodiscard]] bool seedCannotReconnect_() const noexcept;
     int driveAwaitingSeed_();
     std::vector<uint8_t>    ctlScratch_;               // frame patch buffer (reused)
+    std::vector<std::vector<uint8_t>> framePool_;      // Task 14a: recycled RoutedCtlPending frames (zero-alloc routed ops)
+    std::vector<std::string>          endpointPool_;   // L22 fix 2: recycled RoutedCtlPending endpoints (capacity reserved)
+    std::array<RouteHint, kRouteHintSlots> routeHints_;
+    /// The route-hint counters (duty thread); app threads read them through routeStats_ (Thread mode), never these words.
+    struct RouteStats {
+        uint64_t hits = 0, learned = 0, cleared = 0, redirects = 0;
+    };
+    static_assert(sizeof(RouteStats) == 32);
+    RouteStats routeStatsDuty_{};
+    bool       routeStatsDirty_ = false;   // duty: a newer value than the ring holds
+    mutable detail::StatusRing<RouteStats> routeStats_;   // duty -> owner (Thread mode)
+    mutable RouteStats routeStatsCache_{};                // owner: latest drained
+    void publishRouteStats_() noexcept;
+    [[nodiscard]] const RouteStats& routeStatsView_() const;
+    [[nodiscard]] static std::size_t routeSlot_(int32_t topic, int32_t partition) noexcept;
+    /// Forget the hint d.endpoint was taken from / learned (only while it still names d.endpoint).
+    void forgetRouteHint_(const RoutedCtlPending& d) noexcept;
+    void learnRouteHint_(const RoutedCtlPending& d);
     // closing_: written by the closing thread after the runner is joined (or
     // on the Invoker owner); read only on the duty / closing thread.
     bool                    closing_ = false;
@@ -2349,6 +2479,7 @@ private:
     // ---- CB-2: ProducerHub + topic registry ----------------------------------
     // Hub is owned by Client and wired into the agent before start().
     producer::ProducerHub producerHub_;
+    detail::LeaseGuards leaseGuards_;   // Task 15: duty-owned lease-session guard blocks
 
     std::vector<PendingRelease> releases_;  // duty-thread owned (C7)
     std::vector<PendingRelease> orphans_;   // duty-thread owned (C7 F1): orphaned, not yet applied

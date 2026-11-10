@@ -16,6 +16,7 @@
 
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/protocol/NamespaceLimits.h>
+#include <rune/replication/ReplicationMessages.h>
 
 #include <gtest/gtest.h>
 
@@ -23,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <string>
 
 using rune::node::test::CatalogDdlRig;
@@ -42,8 +44,8 @@ std::array<uint8_t, 4> maskOf(std::size_t field) {
 /// A limits record with ONE field set (index in wire order).
 rp::NamespaceLimits limitsWith(std::size_t field, uint64_t v) {
     uint8_t b[rp::kNamespaceLimitsBytes] = {};
-    if (field < 28) rp::detail::putLimitU64(b + 8 * field, v);
-    else            rp::detail::putLimitU32(b + 28 * 8, static_cast<uint32_t>(v));
+    if (rp::limitFieldWidth(field) == 8) rp::detail::putLimitU64(b + rp::limitFieldOffset(field), v);
+    else                                 rp::detail::putLimitU32(b + rp::limitFieldOffset(field), static_cast<uint32_t>(v));
     rp::NamespaceLimits l;
     (void)rp::decodeLimits(b, sizeof(b), l);
     return l;
@@ -379,4 +381,55 @@ TEST(LimitEnforcementTableRegression, SetLimitsWarnsWhenRetentionIsClampedRegres
     const auto other = rig.setNamespaceLimits("a", maskOf(0), limitsWith(0, 100));
     ASSERT_EQ(other.code, kOk);
     EXPECT_TRUE(other.detail.empty());
+}
+
+// ---- Lease topics Task 21: max-leases (field 29) is gated on the cluster feature level and stores nothing below it ----
+namespace {
+std::optional<rp::NamespaceLimits> storedLimits(CatalogDdlRig& rig, const std::string& name) {
+    const auto page = rig.listNamespaces(0, 100);
+    if (!page) return std::nullopt;
+    for (const auto& n : page->namespaces) if (n.name == name) return n.limits;
+    return std::nullopt;
+}
+constexpr uint16_t kInvalid = 39;
+}  // namespace
+
+TEST(LimitFieldOldLevelRegression, MaxLeasesNeedsTheLeaseFeatureLevelRegression) {
+    namespace MetadataFeature = rune::replication::MetadataFeature;
+    {   // below kLeases: bit 29 is refused for a Create and for a SetLimits; no event is written
+        CatalogDdlRig rig("lim_leases_old");
+        rp::NamespaceLimits boot; boot.maxLeases = 16'777'216;   // the boot default is NOT stored below the level
+        rig.setNamespaceDefaults(boot); rig.restart(); rig.becomeServingLeader();
+        rig.admin().setClusterFeatureLevel(MetadataFeature::kLeases - 1);
+        const std::size_t before = eventCount(rig);
+        const auto c = rig.createNamespace("a", maskOf(rp::kNsLimitFieldMaxLeases), limitsWith(rp::kNsLimitFieldMaxLeases, 5));
+        EXPECT_EQ(c.code, kInvalid) << c.detail;
+        EXPECT_EQ(eventCount(rig), before) << "a refused DDL wrote an event";
+        // A Create WITHOUT bit 29 stores maxLeases = 0 (not the boot default): the event carries nothing an old broker would read.
+        const auto ok = rig.createNamespace("a");
+        ASSERT_EQ(ok.code, kOk) << ok.detail;
+        const auto st = storedLimits(rig, "a");
+        ASSERT_TRUE(st.has_value());
+        EXPECT_EQ(st->maxLeases, 0u);
+        const std::size_t mid = eventCount(rig);
+        const auto s = rig.setNamespaceLimits("a", maskOf(rp::kNsLimitFieldMaxLeases), limitsWith(rp::kNsLimitFieldMaxLeases, 5));
+        EXPECT_EQ(s.code, kInvalid) << s.detail;
+        EXPECT_EQ(eventCount(rig), mid);
+        // Another limit still works below the level, and leaves maxLeases at 0.
+        ASSERT_EQ(rig.setNamespaceLimits("a", maskOf(0), limitsWith(0, 100)).code, kOk);
+        EXPECT_EQ(storedLimits(rig, "a")->maxLeases, 0u);
+    }
+    {   // at kLeases: without bit 29 the boot default applies; with bit 29 = 5 the value is stored
+        CatalogDdlRig rig("lim_leases_new");
+        rp::NamespaceLimits boot; boot.maxLeases = 16'777'216;
+        rig.setNamespaceDefaults(boot); rig.restart(); rig.becomeServingLeader();
+        rig.admin().setClusterFeatureLevel(MetadataFeature::kLeases);
+        ASSERT_EQ(rig.createNamespace("d").code, kOk);
+        EXPECT_EQ(storedLimits(rig, "d")->maxLeases, boot.maxLeases);
+        const auto five = rig.createNamespace("e", maskOf(rp::kNsLimitFieldMaxLeases), limitsWith(rp::kNsLimitFieldMaxLeases, 5));
+        ASSERT_EQ(five.code, kOk) << five.detail;
+        EXPECT_EQ(storedLimits(rig, "e")->maxLeases, 5u);
+        ASSERT_EQ(rig.setNamespaceLimits("e", maskOf(rp::kNsLimitFieldMaxLeases), limitsWith(rp::kNsLimitFieldMaxLeases, 0)).code, kOk);
+        EXPECT_EQ(storedLimits(rig, "e")->maxLeases, 0u) << "0 = unlimited is storable";
+    }
 }

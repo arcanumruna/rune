@@ -94,6 +94,9 @@ struct ViewTableKeys {
     uint8_t  prefixWidth = 0;
     uint64_t hashSeed = 0;
     uint64_t hashMaskForTest = ~uint64_t{0};   // AND-ed into every hash; 0 makes every key collide
+    /// Optional per-row auxiliary bytes (0 = none: no allocation, no cost).  Chunked like the rows and grown by appendChunk()
+    /// with them; the table only zero-fills them (the owner sets what it needs when it creates a row).
+    uint32_t auxBytesPerRow = 0;
 };
 
 enum class PrefixScan : uint8_t { End, Stopped, CursorGone };
@@ -119,6 +122,37 @@ public:
     // Returns a pointer to the row for `key`, or nullptr if absent.
     const uint8_t* get(uint64_t key) const noexcept;
     const uint8_t* get(const ViewKey& key) const noexcept;
+
+    // The dense row id of `key`'s row (stable while the row lives), or false when absent.  Cold-path identity for
+    // consumers that track rows by id (the lease wheels).
+    bool ridOf(const ViewKey& key, uint32_t& rid) const noexcept;
+
+    // One probe instead of get() + ridOf(): the row of `key` and its row id (rid untouched when absent -> nullptr).
+    const uint8_t* find(const ViewKey& key, uint32_t& rid) const noexcept;
+    // put() that also reports the row id (one probe instead of put() + ridOf()).
+    uint8_t* put(const ViewKey& key, uint32_t& rid);
+    // The row at a live row id (from find / put): no probe.  Writing through it does NOT mark the row dirty (the owner of a
+    // table whose dirty set is discarded, the lease index, uses it for in-place updates).
+    uint8_t* rowOf(uint32_t rid) noexcept { return rowAddr(rid); }
+    const uint8_t* rowOf(uint32_t rid) const noexcept { return rowAddr(rid); }
+
+    // The auxiliary area of row `rid` (ViewTableKeys::auxBytesPerRow bytes, zero-filled when its chunk was allocated; a row id
+    // reused after erase() keeps its old bytes, the owner resets them).  Stable address (chunked).  Requires auxBytesPerRow > 0.
+    uint8_t* aux(uint32_t rid) noexcept {
+        assert(auxBytes_ > 0 && rid < auxChunks_.size() * rowsPerChunk_);
+        return auxChunks_[rid >> chunkShift_].get() + (rid & chunkMask_) * auxBytes_;
+    }
+    const uint8_t* aux(uint32_t rid) const noexcept {
+        assert(auxBytes_ > 0 && rid < auxChunks_.size() * rowsPerChunk_);
+        return auxChunks_[rid >> chunkShift_].get() + (rid & chunkMask_) * auxBytes_;
+    }
+    [[nodiscard]] uint32_t auxBytesPerRow() const noexcept { return static_cast<uint32_t>(auxBytes_); }
+    // Every row id ever handed out is below this (a never-used id is bumped from it; erased ids go to the free-list and are
+    // reused first).  A consumer that walks rows by id (the lease promotion pass) walks [0, ridHighWater()) and asks its own
+    // liveness marker which of them hold a row.
+    [[nodiscard]] uint32_t ridHighWater() const noexcept { return nextRid_; }
+    // Row ids addressable without another chunk (rowsPerChunk x chunks).
+    [[nodiscard]] size_t ridCapacity() const noexcept { return chunks_.size() * rowsPerChunk_; }
 
     // Removes `key`. Returns false if `key` was not present. O(1):
     // backward-shift in the index, the row-id returned to the free-list;
@@ -187,6 +221,13 @@ public:
         return {payload - headerLen_, headerLen_};
     }
 
+    /// The key bytes of live row `rid` (keyWidth bytes): a wide table's row header; a narrow table's key word as put()
+    /// stored it in dirtyKeys_[rid] (the first keyWidth little-endian bytes).  Valid until the row is erased or re-put.
+    [[nodiscard]] std::span<const uint8_t> keyOf(uint32_t rid) const noexcept {
+        if (headerLen_) return keyOfRow(rowAddr(rid));
+        return {reinterpret_cast<const uint8_t*>(&dirtyKeys_[rid]), keyWidth_};
+    }
+
     // Header-key compares since construction, and the rids in primary-slot order.  Tests only.
     uint64_t arenaKeyReadsForTest() const noexcept { return arenaKeyReads_; }
     std::vector<uint32_t> slotOrderForTest() const {
@@ -207,7 +248,7 @@ public:
     // Namespaces Phase 2 Task 12 (D26): the row-slab memory, chunkCount x bytes per chunk.  O(1) and incremental by
     // construction (chunks only ever append), so the view set charges it without scanning.
     size_t memoryBytes() const noexcept {
-        return chunks_.size() * rowsPerChunk_ * rowStride_ + poolBytes_ + (outer_.cap + outer_.ocap) * kSlotBytes;
+        return chunks_.size() * rowsPerChunk_ * (rowStride_ + auxBytes_) + poolBytes_ + (outer_.cap + outer_.ocap) * kSlotBytes;
     }
 
     // Task 5 test/bench hooks (Task 7's benchmark depends on these):
@@ -379,7 +420,7 @@ private:
     Probe probeOf(uint64_t narrowKey) const noexcept { return {narrowKey, hashOfWord(narrowKey), nullptr}; }
     Probe probeOf(const ViewKey& key) const noexcept;
 
-    uint8_t*       putImpl(const Probe& p);
+    uint8_t*       putImpl(const Probe& p, uint32_t* ridOut = nullptr);
     const uint8_t* getImpl(const Probe& p) const noexcept;
     bool           eraseImpl(const Probe& p) noexcept;
 
@@ -516,6 +557,8 @@ private:
     uint64_t  hashMask_    = ~uint64_t{0};
     uint32_t  headerLen_   = 0;  // keyWidth_ when wide (> 8), else 0
     size_t    rowStride_   = 0;  // headerLen_ + layout_.rowLen
+    size_t    auxBytes_    = 0;  // ViewTableKeys::auxBytesPerRow
+    std::vector<std::unique_ptr<uint8_t[]>> auxChunks_;   // parallel to chunks_ (empty when auxBytes_ == 0)
     mutable uint64_t arenaKeyReads_ = 0;
 
     SlotIndex main_;   // key -> rid
@@ -557,7 +600,7 @@ private:
     // markDirty() only takes a rid per its public signature) so
     // drainDirty() can emit `key` for upserts too, not just deletes.
     std::vector<uint8_t>  dirty_;
-    std::vector<uint64_t> dirtyKeys_;   // TODO: on a wide table this holds the hashed slot word, not the key; do not consume it
+    std::vector<uint64_t> dirtyKeys_;   // narrow table: the key word put() stored (keyOf reads it); wide table: the hashed slot word, never read
     std::vector<uint32_t> dirtyList_; // rids marked dirty this interval, each pushed once (coalesced)
     size_t                dirtyReserved_ = 0;   // the dirty set's bytes after its reserve (reserveDirty_)
     size_t                window_ = 0;          // the bytes the last drained window used (trimDirty's hysteresis)

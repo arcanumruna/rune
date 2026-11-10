@@ -1,4 +1,6 @@
+#include <cassert>
 #include <rune/node/VerdictSource.h>
+#include <rune/node/lease/LeaseEntryStore.h>
 
 #include <rune/codec/Record.h>
 #include <rune/view/CheckEval.h>
@@ -340,11 +342,14 @@ void VerdictSource::addMember_(ViewInstance* inst, rune::view::VerdictViewKind k
     std::array<bool, 256> taken{};
     for (const Member& x : members_) taken[x.slot] = true;
     m.slot = static_cast<uint8_t>(std::find(taken.begin(), taken.end(), false) - taken.begin());
-    if (kind == rune::view::VerdictViewKind::KeyIndex) {
+    if (kind == rune::view::VerdictViewKind::KeyIndex || kind == rune::view::VerdictViewKind::LeaseIndex) {
+        const bool lease = kind == rune::view::VerdictViewKind::LeaseIndex;
         const uint16_t keyField = inst->plan.keyFieldId[0];
         const auto it = std::find_if(inst->evolvingSrc.fields.begin(), inst->evolvingSrc.fields.end(), [&](const auto& f) { return f.id == keyField; });
         const uint32_t width = it == inst->evolvingSrc.fields.end() ? 0 : rune::codec::fieldWidth(*it);
-        if (width == 0 || width > rune::codec::kMaxTopicKeyBytes) throw std::invalid_argument("key index: the source key field must be fixed-width, 1 to 16 bytes");
+        if (width == 0 || width > (lease ? rune::codec::kMaxLeaseKeyBytes : rune::codec::kMaxTopicKeyBytes))
+            throw std::invalid_argument(lease ? "lease index: the source key field must be fixed-width, 1 to 128 bytes"
+                                              : "key index: the source key field must be fixed-width, 1 to 16 bytes");
         m.keyWidth = static_cast<uint8_t>(width);
     }
     auto at = std::lower_bound(members_.begin(), members_.end(), viewObjectId, [](const Member& x, uint64_t id) { return x.objectId < id; });
@@ -484,6 +489,14 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     state.rejected.noteCovered(judgeCursor_);
     state.retainedPlans.pruneLeftBelow(state.rejected.watermark(), state.constraintSets);   // the members that left below W judge nothing more
     for (Member& m : members_) discardAhead_(m);
+    // A lease index may have been rebuilt with another row layout (a new column) since the prospect was reserved; its rows
+    // change ids with the rebuild, so the events of the old table are void.
+    for (Member& m : members_)
+        if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
+            m.prospect.reserve(m.inst->layout, nullptr);
+            m.inst->rebuildEpoch = hooks_.nextLeaseEpoch != nullptr ? hooks_.nextLeaseEpoch(hooks_.ctx) : m.inst->rebuildEpoch + 1;
+        }
+    state.leaseEvents.buf.clear();
     activeSet_ = *state.constraintSets.setAt(judgeCursor_);
     setFrom_   = judgeCursor_;
     sawEmptyChange_ = false;
@@ -513,6 +526,16 @@ void VerdictSource::stall_(StallReason reason) noexcept {
     stallReason_ = reason;
     spdlog::error("verdict judge stalled: topic {} partition {}: {}", srcTopicId_, partition_,
                   reason == StallReason::Full ? "rejected index full" : reason == StallReason::OutOfOrder ? "rejection out of order" : "view capacity exhausted");
+}
+
+// Cold (once per wait): the judge or a replay holds at a lease record whose writer layout is not installed on this worker yet.
+void VerdictSource::noteLayoutWait_(int64_t offset, uint16_t version) noexcept {
+    if (layoutWaitVersion_ == version) return;   // once per (topic, partition, version): this source is the (topic, partition)
+    layoutWaitVersion_ = version;
+    ++stats_.leaseLayoutWaits;
+    spdlog::warn("lease index waits for a schema layout: topic {} partition {}: the record at offset {} is written at version {}, which is "
+                 "not installed (or has a field the index layout lacks); held until it is",
+                 srcTopicId_, partition_, offset, version);
 }
 
 void VerdictSource::waitForInstall_(const ConstraintSet& set) noexcept {
@@ -547,16 +570,46 @@ rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::S
         const KeyIndexFold f{i.table, m.keyWidth, m.slot, locks};
         return prepareKeyIndex(f, rec, m.prospect, chain);
     }
+    if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
+        // The writer is the spec's descriptor of the record's version (the one the produce hook validated against), never the
+        // instance's own evolving copy: that lags the spec after a Drop and when the schema ops arrive in either order.
+        rune::view::SourceRecord r = rec;
+        r.writer = state_ != nullptr && state_->spec != nullptr ? leaseWriterOf(*state_->spec, r.value) : nullptr;
+        const LeaseIndexFold f{i.table, i.layout, i.evolvingSrc, m.keyWidth, &i.leaseCover, &i.leaseTransient};
+        const bool refused = r.writer == nullptr && state_ != nullptr && state_->spec != nullptr && r.value.size() >= 4 &&
+                             state_->spec->versionRefused(detail::le16(r.value.data() + 2));   // a refused version is a definite answer
+        return prepareLeaseIndex(f, r, m.prospect, refused, state_ != nullptr && state_->spec != nullptr ? leaseInstallSeqOf(*state_->spec, r.value) : 0u);
+    }
+    bool skip = false;
+    const rune::view::SourceRecord r = dataRecord_(rec, skip);
+    if (skip) {   // a Checkpoint: invisible to a data member
+        m.prospect.clear();
+        return rune::view::PrepareStatus::Ok;
+    }
     if (i.agg) {
         rune::view::AggregateFold f = aggregateFoldOf(i);
         f.member = m.slot;
         f.locks = locks;
-        return rune::view::prepareAggregate(f, rec, m.prospect, chain);
+        return rune::view::prepareAggregate(f, r, m.prospect, chain);
     }
     rune::view::ProjectionFold f = projectionFoldOf(i);
     f.member = m.slot;
     f.locks = locks;
-    return rune::view::prepareProjection(f, rec, m.prospect, chain);
+    return rune::view::prepareProjection(f, r, m.prospect, chain);
+}
+
+// What a data member (not the key / lease index) sees of `rec` (spec 6.6): on a lease topic a Checkpoint is skipped and a
+// Revoke / Expire becomes a tombstone (empty value, no writer).  One helper for prepare_, apply_ and the verdict, so they agree.
+rune::view::SourceRecord VerdictSource::dataRecord_(const rune::view::SourceRecord& rec, bool& skip) const noexcept {
+    rune::view::SourceRecord r = rec;
+    skip = false;
+    if (state_ == nullptr || state_->spec == nullptr || !state_->spec->lease) return r;
+    if (!rune::view::leaseDataView({.lease = true}, r.attributes, r.value)) {
+        skip = true;
+        return r;
+    }
+    if (r.value.empty()) r.writer = nullptr;
+    return r;
 }
 
 void VerdictSource::apply_(Member& m, const rune::view::SourceRecord& rec) noexcept {
@@ -567,12 +620,22 @@ void VerdictSource::apply_(Member& m, const rune::view::SourceRecord& rec) noexc
         stats_.keyIndexSkippedMalformed += m.prospect.stats.skippedMalformed;
         return;
     }
+    if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
+        stats_.keyIndexSkippedMalformed += m.prospect.stats.skippedMalformed;
+        LeaseIndexFold f{i.table, i.layout, i.evolvingSrc, m.keyWidth, &i.leaseCover, &i.leaseTransient};
+        LeaseEvent ev;
+        if (applyLeaseRecord(f, rec, m.prospect, ev)) state_->leaseEvents.buf.push_back(ev);   // grows only past kLeaseFoldEventCap (judgeBatches_ counts it)
+        return;
+    }
+    bool skip = false;
+    const rune::view::SourceRecord r = dataRecord_(rec, skip);
+    if (skip) return;   // a Checkpoint applies nothing (prepare_ cleared the prospect)
     if (i.agg) {
         rune::view::AggregateFold f = aggregateFoldOf(i);
-        rune::view::applyAggregate(f, rec, m.prospect);
+        rune::view::applyAggregate(f, r, m.prospect);
     } else {
         rune::view::ProjectionFold f = projectionFoldOf(i);
-        rune::view::applyProjection(f, rec, m.prospect);
+        rune::view::applyProjection(f, r, m.prospect);
     }
     const rune::view::FoldStats& st = m.prospect.stats;
     i.counters.skippedMalformed += st.skippedMalformed;
@@ -599,9 +662,41 @@ void VerdictSource::discardKeyIndexDirty_(ViewInstance& inst) noexcept {
 
 Verdict VerdictSource::verdictOf_(const Member& m, const rune::view::SourceRecord& rec) const noexcept {
     if (m.kind == rune::view::VerdictViewKind::KeyIndex) return evaluateIntent(rec, m.prospect);
-    if (m.kind == rune::view::VerdictViewKind::Unique || m.kind == rune::view::VerdictViewKind::Check)
-        return evaluateConstraints(ConstraintFold{m.inst->plan, m.inst->layout, m.inst->table}, rec, m.prospect);
-    if (m.kind != rune::view::VerdictViewKind::TestReject || rec.value.empty()) return {};   // tombstones are never rejected
+    if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
+        using rune::protocol::client::ErrorCode;
+        namespace lr = rune::protocol::record;
+        // The fence record (spec A.6) is no row and is never judged: accepted (prepare / apply recognise it by the same predicate).
+        if (lr::isLeaseFence(rec.attributes, reinterpret_cast<const uint8_t*>(rec.value.data()), rec.value.size(), {.lease = true})) return {};
+        // A malformed lease record (a wrong key width, a value shorter than the system columns, a projection that does not fit)
+        // is refused, never accepted without an apply: an accepted record the index never saw would let a second grant through.
+        // The replay skips rejected offsets, so the log stays deterministic.
+        if (m.prospect.op == rune::view::ProspectOp::None) {
+            // A broker Expire / Checkpoint whose key has no row is a stale broker record, even when its projection is malformed:
+            // it has no producer to retry, so it takes the reserved stale-broker slot like any other (judge()).  A Carry (Put,
+            // intent 0) is a broker record too: with no operation (a malformed projection) it is stale whether or not its row exists.
+            const lr::LeaseOp op = lr::leaseOpOf(rec.attributes);
+            if ((op == lr::LeaseOp::Expire || op == lr::LeaseOp::Checkpoint) && lr::intentOf(rec.attributes) == 0 && !m.prospect.rows[0].existed)
+                return {rune::view::kVerdictStaleBroker, 0};
+            if (op == lr::LeaseOp::Put && lr::intentOf(rec.attributes) == 0) return {rune::view::kVerdictStaleBroker, 0};
+            return {static_cast<uint16_t>(ErrorCode::InvalidRequest), 0};
+        }
+        if (rec.value.empty()) return {static_cast<uint16_t>(ErrorCode::InvalidRequest), 0};   // a lease record carries its full row
+        const ViewInstance& i = *m.inst;
+        const uint8_t* row = m.prospect.rows[0].existed ? i.table.rowOf(m.prospect.rows[0].rid) : nullptr;   // found once, by prepare_
+        const LeaseRowState st{row != nullptr, row != nullptr ? leaseRowVersion(row, i.layout) : 0, row != nullptr ? leaseRowTtl(row, i.layout) : 0};
+        const uint32_t maxKeys = state_ != nullptr && state_->spec != nullptr && state_->spec->lease ? state_->spec->lease->maxKeys : UINT32_MAX;
+        return {judgeLease(st, rec.attributes, leaseRecordVersion(rec.value), leaseRecordRemaining(rec.value), i.table.size(), maxKeys), 0};
+    }
+    if (m.kind == rune::view::VerdictViewKind::Unique || m.kind == rune::view::VerdictViewKind::Check) {
+        bool skippedData = false;
+        const rune::view::SourceRecord dr = dataRecord_(rec, skippedData);
+        if (skippedData) return {};   // a lease checkpoint is invisible to a data member
+        return evaluateConstraints(ConstraintFold{m.inst->plan, m.inst->layout, m.inst->table}, dr, m.prospect);
+    }
+    if (m.kind != rune::view::VerdictViewKind::TestReject) return {};
+    bool skipped = false;
+    const rune::view::SourceRecord dr = dataRecord_(rec, skipped);
+    if (skipped || dr.value.empty()) return {};   // tombstones (a lease Revoke / Expire too) and lease checkpoints are never rejected
     const Verdict reject{static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation), rune::view::constraintIdOf(m.objectId, 1)};
     switch (m.rule.mode) {
     case TestRejectRule::Mode::TagEquals: {
@@ -630,6 +725,7 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
             stall_(StallReason::Capacity);
             return {};
         }
+        if (s == rune::view::PrepareStatus::Pending) return Verdict::held();   // the record's layout is not installed yet: no verdict, the caller holds
         if (s == rune::view::PrepareStatus::Locked) {   // P11-4: the judge pauses here, records nothing
             txnStop_ = TxnStop::Locked;
             notePause_(rec.offset);
@@ -639,15 +735,40 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
     for (const std::size_t i : active_) {
         const Verdict v = verdictOf_(members_[i], rec);
         if (v.accepted()) continue;
-        return recordRejection_(rec.offset, v) ? v : Verdict{};
+        assert(!v.isHeld() && "a held verdict is never recorded");
+        if (!recordRejection_(rec.offset, v)) return {};
+        if (members_[i].kind == rune::view::VerdictViewKind::LeaseIndex) {
+            // The wheels learn that a record of theirs was refused (LeaseEntryEvent::OwnRecordRejected).  Live judging only: judge() is
+            // the live path (replay and rebuild fold through foldLeaseIndexBatch, which never reaches here), the same path that pushes the
+            // accepted events in apply_().  A record is accepted (apply_ pushes one event) XOR rejected (this branch pushes one), so the
+            // fold-event cap accounting (one event per record) holds.
+            if (v.code == rune::view::kVerdictStaleBroker) {
+                const rune::view::ProspectRow& pr = members_[i].prospect.rows[0];
+                LeaseEvent ev;
+                ev.kind   = LeaseEventKind::BrokerRejected;
+                ev.rid    = pr.existed ? pr.rid : lease::kLeaseNil;
+                ev.offset = rec.offset;
+                ev.version = leaseRecordVersion(rec.value);   // the version the refused record carries (the entry compares it with its row)
+                state_->leaseEvents.buf.push_back(ev);
+            }
+            if (members_[i].prospect.op == rune::view::ProspectOp::None)
+                stats_.keyIndexSkippedMalformed += members_[i].prospect.stats.skippedMalformed;
+        }
+        return v;
     }
     for (const std::size_t i : active_) apply_(members_[i], rec);
     return {};
 }
 
-// False: the index refused it and the judge stalled.
+// False: the index refused it and the judge stalled.  A stale broker record (a lease Expire / Checkpoint / Carry) has no producer to
+// retry: when the index is full it takes the one reserved slot, so a broker record never stalls the judge.  Everything else stalls
+// on a full index.
 bool VerdictSource::recordRejection_(int64_t offset, const Verdict& v) noexcept {
-    if (!state_->rejected.add(offset, v.code, v.constraintId)) {
+    const bool stale = v.code == rune::view::kVerdictStaleBroker;
+    const uint64_t outOfOrder = stale ? state_->rejected.outOfOrder() : 0;
+    bool added = state_->rejected.add(offset, v.code, v.constraintId);
+    if (!added && stale && state_->rejected.outOfOrder() == outOfOrder) added = state_->rejected.add(offset, v.code, v.constraintId, /*reserved=*/true);
+    if (!added) {
         stallRoom_ = 1;
         stall_(state_->rejected.size() >= state_->rejected.capacity() ? StallReason::Full : StallReason::OutOfOrder);
         return false;
@@ -677,6 +798,16 @@ void VerdictSource::countRejection_(const Verdict& v) noexcept {
     using rune::protocol::client::ErrorCode;
     if (v.code == static_cast<uint16_t>(ErrorCode::KeyExists)) ++stats_.rejectionsKeyExists;
     else if (v.code == static_cast<uint16_t>(ErrorCode::KeyNotFound)) ++stats_.rejectionsKeyNotFound;
+    else if (v.code == static_cast<uint16_t>(ErrorCode::LeaseNotFound)) ++stats_.rejectionsLeaseNotFound;
+    else if (v.code == static_cast<uint16_t>(ErrorCode::LeaseLimitExceeded)) ++stats_.rejectionsLeaseLimit;
+    else if (v.code == rune::view::kVerdictStaleBroker) {
+        ++stats_.leaseRejectedStaleBroker;
+        if (!state_->staleBrokerLogged) {
+            state_->staleBrokerLogged = true;
+            spdlog::warn("lease judge: topic {} partition {}: a stale broker record was rejected; further ones are counted only",
+                         srcTopicId_, partition_);
+        }
+    }
     else ++stats_.rejectionsConstraint;
     ++rejectedThisPass_;
     // 56 and 57 file under constraintId 0 here; rejectionsKeyExists / rejectionsKeyNotFound tell them apart.
@@ -974,7 +1105,8 @@ void VerdictSource::noteKeyZeroRejection_(const Verdict& v, const rune::view::So
 int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, int64_t upTo, const rune::view::AbortedTxnFilter& aborted,
                            rune::view::SpanReader reader) {
     ViewInstance& inst = *m.inst;
-    const rune::view::FoldSkip skip{.aborted = aborted, .rejected = &state_->rejected};
+    const rune::view::FoldSkip skip{.aborted = aborted, .rejected = &state_->rejected,
+                                    .traits = {.lease = state_->spec != nullptr && state_->spec->lease}};
     int64_t cursor = inst.foldCursor;
     const int64_t bound = inst.maxRecordsPerPass > 0 ? std::min(upTo, cursor + inst.maxRecordsPerPass) : upTo;
     struct JudgeCtx { VerdictSource* self; Member* m; } jc{this, &m};
@@ -1001,6 +1133,18 @@ int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, in
         inst.foldCursor = cursor;
         inst.counters.skippedAborted += st.skippedAborted;
         txnStats(st);
+        discardKeyIndexDirty_(inst);
+        return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedRejected);
+    }
+    if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
+        LeaseIndexFold f{inst.table, inst.layout, inst.evolvingSrc, m.keyWidth, &inst.leaseCover, &inst.leaseTransient};
+        bool held = false;
+        uint16_t heldVersion = 0;
+        const rune::view::FoldStats st = foldLeaseIndexBatch(f, *state_->spec, m.prospect, view, bound, cursor, skip, &held, &heldVersion);
+        inst.foldCursor = cursor;
+        if (held) noteLayoutWait_(cursor, heldVersion);   // the replay stops AT the record; the next duty cycle retries
+        else layoutWaitVersion_ = -1;
+        inst.counters.skippedAborted += st.skippedAborted;
         discardKeyIndexDirty_(inst);
         return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedRejected);
     }
@@ -1066,6 +1210,7 @@ void VerdictSource::closeSpan_(int64_t producerId) noexcept {
 int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t limit, int64_t hardLimit, const rune::view::AbortedTxnFilter& aborted) {
     namespace proto = rune::protocol;
     int work = 0;
+    const bool leaseSource = isLeaseSource_();
     txnStop_ = TxnStop::None;
     refreshLocks_();
     std::size_t pos = 0;
@@ -1126,6 +1271,14 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
             ++work;
             continue;
         }
+        if (leaseSource) {
+            // Back-pressure: never drop an event, never stall.  A batch that would overflow a non-empty buffer waits for the
+            // consumer; one that alone exceeds the whole cap is judged into an empty buffer (it grows once, counted).
+            const std::size_t records = static_cast<std::size_t>(last - r.baseOffset() + 1);
+            const std::size_t held = state_->leaseEvents.buf.size();
+            if (held != 0 && held + records > kLeaseFoldEventCap) break;
+            if (held == 0 && records > kLeaseFoldEventCap) ++stats_.leaseEventOverflows;
+        }
         if ((attrs & proto::batch::kAttrTransactional) != 0) {   // P11-2: deferred or ordinary, skipped here; else the judge waits
             if (last >= hardLimit) break;
             if (!txnBatchDeferred_(r.producerId(), r.baseOffset(), r.lastOffsetDelta() + 1)) {
@@ -1151,20 +1304,27 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
             continue;
         }
         judgeCursor_ = std::max(judgeCursor_, r.baseOffset());
-        bool halt = false;
+        bool halt = false, hold = false;
         const bool walked = rune::protocol::forEachRecordSpan(view.data + pos, view.len - pos, [&](const rune::protocol::RecordSpan& span) {
-            if (halt || stalled_ || txnStop_ == TxnStop::Locked) return;
+            if (halt || hold || stalled_ || txnStop_ == TxnStop::Locked) return;
             if (span.offset >= limit) { halt = true; return; }
             if (span.offset < judgeCursor_) return;
             const rune::view::SourceRecord rec = recordOf_(span);
             lastIntent_ = rec.intent;
             const Verdict v = judge(rec);
+            if (v.isHeld()) {   // hold AT this record: no verdict, no advance (like back-pressure); the next duty cycle retries
+                hold = true;
+                noteLayoutWait_(span.offset, writerVersionOf(span.value, 0));
+                return;
+            }
+            layoutWaitVersion_ = -1;
             if (stalled_ || txnStop_ == TxnStop::Locked) return;
             if (keyZero && !v.accepted()) [[unlikely]] noteKeyZeroRejection_(v, rec);
             judgeCursor_ = span.offset + 1;
             judgedRecord_ = true;
             ++work;
         });
+        if (hold) break;   // judgeCursor_ is the held record's offset
         if (stalled_ || txnStop_ == TxnStop::Locked) break;
         if (!walked && !halt) break;   // a record that does not fit its batch: stop, never advance past it
         judgeCursor_ = halt ? limit : std::max(judgeCursor_, last + 1);
@@ -1178,15 +1338,23 @@ void VerdictSource::syncMemberCursors_() noexcept {
     for (const std::size_t i : active_) {
         ViewInstance& inst = *members_[i].inst;
         inst.foldCursor = judgeCursor_;
-        if (members_[i].kind == rune::view::VerdictViewKind::KeyIndex) discardKeyIndexDirty_(inst);
+        if (members_[i].kind == rune::view::VerdictViewKind::KeyIndex || members_[i].kind == rune::view::VerdictViewKind::LeaseIndex)
+            discardKeyIndexDirty_(inst);
         if (inst.claims) inst.counters.uniqueConflicts = inst.claims->extras();
     }
 }
 
+bool VerdictSource::isLeaseSource_() const noexcept {
+    return std::any_of(active_.begin(), active_.end(), [&](std::size_t i) { return members_[i].kind == rune::view::VerdictViewKind::LeaseIndex; });
+}
+
+// A lease source's writer is the spec's descriptor of the record's version (leaseWriterOf), any other source's the first member's.
 rune::view::SourceRecord VerdictSource::recordOf_(const rune::protocol::RecordSpan& span) noexcept {
     ViewInstance& first = *members_[active_.front()].inst;
-    rune::view::SourceRecord rec{span.key, span.value, span.offset, rune::protocol::record::intentOf(span.attributes), nullptr};
-    if (!span.value.empty()) rec.writer = &first.vdc.materializedFor(writerVersionOf(span.value, first.vdc.defaultVersion()));
+    rune::view::SourceRecord rec{span.key, span.value, span.offset, rune::protocol::record::intentOf(span.attributes), nullptr, span.attributes};
+    if (!span.value.empty())
+        rec.writer = isLeaseSource_() ? leaseWriterOf(*state_->spec, span.value)
+                                      : &first.vdc.materializedFor(writerVersionOf(span.value, first.vdc.defaultVersion()));
     return rec;
 }
 

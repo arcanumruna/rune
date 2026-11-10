@@ -2,6 +2,7 @@
 #include <rune/node/WorkerViewSet.h>
 #include <rune/node/AdminChannels.h>   // Task 19: ViewPlanUpdateMsg + decodeViewPlanUpdate
 
+#include <rune/codec/Fingerprint.h>    // rune::codec::fingerprint (the lease view fingerprint)
 #include <rune/codec/Serialize.h>      // rune::codec::deserialize
 #include <rune/codec/UnicodeLower.h>   // unicodeVersionSupported
 #include <rune/codec/ViewKeyEncoding.h>  // decodeKeyComponent
@@ -1207,8 +1208,10 @@ void WorkerViewSet::dropSourceTopic(int32_t srcTopicId) {
     for (auto it = keyIndexes_.begin(); it != keyIndexes_.end();) {
         if (!ofTopic(*it)) { ++it; continue; }
         releaseMem_(it->second);
+        releaseLeases_(it->second);
         it = keyIndexes_.erase(it);
     }
+    std::erase_if(leaseViews_, [&](const LeaseViewMap& m) { return m.src == srcTopicId; });
 }
 
 // Cold.  The key index is built over the source's evolving schema, as every view is: the judge decodes each writer version through it.
@@ -1217,6 +1220,15 @@ static const rune::codec::Descriptor* keyIndexSource(const TopicWriteSpec& spec)
     if (!spec.evolving || spec.keyWidth == 0) return nullptr;
     const bool hasKey = std::any_of(spec.evolving->fields.begin(), spec.evolving->fields.end(), [&](const auto& f) { return f.id == spec.keyFieldId; });
     return hasKey ? &*spec.evolving : nullptr;
+}
+
+// A lease index's row layout source: the spec's merge of the evolving descriptor and every installed version
+// (TopicWriteSpec::leaseLayoutSource); nullopt until a schema has landed, or when the key cannot be indexed.
+static std::optional<rune::codec::Descriptor> leaseIndexSource(const TopicWriteSpec& spec) {
+    if (spec.keyWidth == 0) return std::nullopt;
+    std::optional<rune::codec::Descriptor> src = spec.leaseLayoutSource();
+    if (!src || std::none_of(src->fields.begin(), src->fields.end(), [&](const auto& f) { return f.id == spec.keyFieldId; })) return std::nullopt;
+    return src;
 }
 
 // A key index no leadership has activated yet: its first activation keeps it (it holds nothing), a later one rebuilds it.
@@ -1233,19 +1245,44 @@ static ViewInstance freshKeyIndex(int32_t srcTopicId, int32_t partition, const T
     return inst;
 }
 
+// A lease topic's index: the same instance, over the lease row layout (one column per evolving field, plus the offsets).
+static ViewInstance freshLeaseIndex(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec, const rune::codec::Descriptor& src,
+                                    rune::view::ViewTableKeys keys, int64_t replayCap) {
+    keys.auxBytesPerRow = spec.leaseTransient ? kLeaseTransientAuxBytes : kLeaseAuxBytes;   // lastAppended per row (the produce path's Throttled retry); a transient topic adds the anchor list
+    ViewInstance inst(leaseIndexPlan(srcTopicId, spec.keyFieldId), leaseIndexRowLayout(src), src, /*persist=*/false,
+                      partition, /*indexSlots=*/4096, kLeaseIndexChunkBytes, keys);
+    inst.maxRecordsPerPass = replayCap;
+    inst.foldLeadership = kNeverActivated;
+    inst.leaseTransient.transient = spec.leaseTransient;
+    inst.layoutGen = spec.leaseLayoutGen;
+    // The lease view's output fingerprint: LAYOUT ONLY (field ids, column types, widths, offsets of the row layout just built; no names),
+    // mixed with the lease index plan fingerprint (leaseViewLayoutFingerprint).
+    inst.leaseViewFp = leaseViewFingerprintOf(src);
+    return inst;
+}
+
 // A new leadership starts from the local log: an instance carried over could hold what a follower-time compaction removed.
+// A lease index also rebuilds when its row layout is out of date (the evolving descriptor gained a column), even before its
+// first activation: it holds nothing then, but its layout cannot take the new column.
 void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen) {
     const auto it = keyIndexes_.find(instKey(srcTopicId, partition));
-    if (it == keyIndexes_.end() || it->second.foldLeadership == leaderGen) return;   // already fresh for this leadership (the judge may be held)
-    if (it->second.foldLeadership != kNeverActivated) {
-        const rune::codec::Descriptor* src = keyIndexSource(spec);
+    if (it == keyIndexes_.end()) return;
+    const bool staleLayout = spec.lease && (it->second.layoutGen != spec.leaseLayoutGen || it->second.leaseTransient.transient != spec.leaseTransient);   // the transient flag is fixed at create: a mismatch is defensive
+    if (it->second.foldLeadership == leaderGen && !staleLayout) return;   // already fresh for this leadership and layout (the judge may be held)
+    if (it->second.foldLeadership != kNeverActivated || staleLayout) {
+        const std::optional<rune::codec::Descriptor> leaseSrc = spec.lease ? leaseIndexSource(spec) : std::nullopt;
+        const rune::codec::Descriptor* src = spec.lease ? (leaseSrc ? &*leaseSrc : nullptr) : keyIndexSource(spec);
         if (src == nullptr) {   // the spec can no longer be indexed: nothing stale stays behind
             judge.removeVerdictView(it->second.plan.viewTopicId);
             eraseKeyIndex_(it->first);
             return;
         }
         releaseMem_(it->second);
-        it->second = freshKeyIndex(srcTopicId, partition, spec, *src, rune::view::ViewTableKeys{spec.keyWidth, 0, hashSeed_, hashMask_});
+        releaseLeases_(it->second);   // the rebuilt (empty) index re-charges as it replays
+        const rune::view::ViewTableKeys keys{spec.keyWidth, 0, hashSeed_, hashMask_};
+        const uint32_t epoch = it->second.rebuildEpoch;
+        it->second = spec.lease ? freshLeaseIndex(srcTopicId, partition, spec, *src, keys, leaseReplayCap_) : freshKeyIndex(srcTopicId, partition, spec, *src, keys);
+        it->second.rebuildEpoch = epoch;   // the activation that follows bumps it
         ++judge.statsMut().keyIndexRebuilds;
     }
     it->second.foldCursor = judge.logStart();
@@ -1272,7 +1309,7 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
         for (const int32_t id : sit->second) anyTemplate = anyTemplate || isVerdictTemplate_(id);
     const uint64_t key = instKey(srcTopicId, partition);
     auto vit = verdictSources_.find(key);
-    if (!anyTemplate && !write.spec->keyIndex && write.constraintSets.latest().empty()) {
+    if (!anyTemplate && !write.spec->keyIndex && !write.spec->lease && write.constraintSets.latest().empty()) {
         if (vit == verdictSources_.end()) return nullptr;
         // The set was dropped: the judge stays until it has passed the drop and holds no member.
         if (vit->second->hasMembers() || vit->second->judgedThrough() <= write.constraintSets.lastChangeOffset()) {
@@ -1287,7 +1324,7 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     }
     if (vit == verdictSources_.end()) {
         auto v = std::make_unique<VerdictSource>(srcTopicId, partition);
-        v->setViewHooks(VerdictViewHooks{this, &checkpointHook_, &discardHook_, &retiredHook_});
+        v->setViewHooks(VerdictViewHooks{this, &checkpointHook_, &discardHook_, &retiredHook_, &nextLeaseEpochHook_});
         v->setVerdictIntervalNs(verdictIntervalNs_);
         v->holdJudgeForTest(holdJudges_);
         v->bindTxn(&txnOverlays_, batchOverlay_, txnJudgedRecordsMax_);
@@ -1297,6 +1334,16 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     const std::size_t membersBefore = judge->memberCountForTest();
     judge->bindState(&write);
     write.verdicts = judge;
+    if (write.spec->lease) write.leaseEvents.reserveOnce();
+    if (write.spec->lease && !judge->hasMember(0, kLeaseIndexPlanFingerprint)) {
+        if (const std::optional<rune::codec::Descriptor> src = leaseIndexSource(*write.spec)) {
+            ViewInstance& inst = keyIndexes_.try_emplace(key, freshLeaseIndex(srcTopicId, partition, *write.spec, *src, rune::view::ViewTableKeys{write.spec->keyWidth, 0, hashSeed_, hashMask_}, leaseReplayCap_)).first->second;
+            // Adopted under an already-activated judge: the lease index must replay the log under that leadership (it holds a
+            // row layout, not a fold), so the judge activates again instead of treating the fresh index as live.
+            if (judge->activated()) judge->requestReactivation();
+            judge->addVerdictView(&inst, rune::view::VerdictViewKind::LeaseIndex, 0, kLeaseIndexPlanFingerprint);
+        }
+    }
     if (write.spec->keyIndex && !judge->hasMember(0, kKeyIndexPlanFingerprint)) {
         if (const rune::codec::Descriptor* src = keyIndexSource(*write.spec)) {
             ViewInstance& inst = keyIndexes_.try_emplace(key, freshKeyIndex(srcTopicId, partition, *write.spec, *src, rune::view::ViewTableKeys{write.spec->keyWidth, 0, hashSeed_, hashMask_})).first->second;
@@ -1456,6 +1503,8 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
     }
     if (write.spec->keyIndex && std::none_of(want.begin(), want.end(), [](const ConstraintSetMember& m) { return m.kind == rune::view::VerdictViewKind::KeyIndex; }))
         want.push_back(ConstraintSetMember{0, rune::view::VerdictViewKind::KeyIndex, kKeyIndexPlanFingerprint});
+    if (write.spec->lease && std::none_of(want.begin(), want.end(), [](const ConstraintSetMember& m) { return m.kind == rune::view::VerdictViewKind::LeaseIndex; }))
+        want.push_back(ConstraintSetMember{0, rune::view::VerdictViewKind::LeaseIndex, kLeaseIndexPlanFingerprint});
     std::sort(want.begin(), want.end(), [](const ConstraintSetMember& a, const ConstraintSetMember& b) { return a.viewObjectId < b.viewObjectId; });
     ConstraintSet desired;
     desired.catalogThrough = catalogThrough_;   // a change request is stamped with the position it was computed at
@@ -1487,11 +1536,14 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
     return work;
 }
 
-int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, int64_t nowNs, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns) {
+int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, int64_t nowNs, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns,
+                                       std::size_t leaseEventBytes, bool lease) {
     if (const auto kit = keyIndexes_.find(instKey(srcTopicId, partition)); kit != keyIndexes_.end()) {
+        kit->second.extraMemBytes = leaseEventBytes;   // a lease partition's event buffer is part of its lease view's memory
         adoptNs_(kit->second, ns);
         quietPass_(kit->second, nowNs);   // a pass that applied to it restarted the clock (discardKeyIndexDirty_)
         chargeMem_(kit->second);
+        if (lease) chargeLeases_(kit->second);   // Task 21: never a checked-writes key index that is not a lease topic
     }
     const auto sit = subscriptionIndex_.find(srcTopicId);
     if (sit == subscriptionIndex_.end()) return 0;
@@ -1568,6 +1620,8 @@ void WorkerViewSet::beginDiscard_(ViewInstance& inst, ViewDiscardReason reason) 
     const std::size_t indexSlots = inst.plan.sizing.capacity != 0 ? ceilPow2(inst.plan.sizing.capacity) : std::size_t{4096};
     const std::size_t chunkBytes = inst.plan.sizing.chunkBytes != 0 ? static_cast<std::size_t>(inst.plan.sizing.chunkBytes) : (std::size_t{32} << 20);
     inst.table = rune::view::ViewTable(inst.layout, indexSlots, chunkBytes, inst.tableKeys);
+    inst.leaseTransient.anchors = LeaseAnchorList{};   // the anchor list lives in the table's aux
+    inst.leaseTransient.fence   = LeaseFenceState{};
     if (inst.agg) inst.agg.emplace(rune::view::buildAggLayout(inst.plan, inst.evolvingSrc).value(), indexSlots, chunkBytes, inst.tableKeys);
     if (inst.keyed) buildKeyedTables(inst, indexSlots, chunkBytes);
     inst.foldCursor = 0;

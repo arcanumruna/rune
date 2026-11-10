@@ -10,6 +10,8 @@
 #include <rune/catalog/CatalogQueries.h>
 #include <rune/cli/CatalogCommands.h>
 #include <rune/cli/Cli.h>
+#include <rune/codec/Descriptor.h>
+#include <rune/codec/Serialize.h>
 
 #include <gtest/gtest.h>
 
@@ -224,6 +226,188 @@ TEST(RuneCliBrokerRegression, ReplayClusterIdDefaultsToTheFromArgumentVerbatim) 
     EXPECT_EQ(d[1].event.replayedFrom->clusterId, src.endpoint());
     EXPECT_EQ(d[0].event.principal.requestId, rune::cli::replayRequestId(src.endpoint(), 0));
     EXPECT_EQ(d[1].event.principal.requestId, rune::cli::replayRequestId(src.endpoint(), 1));
+}
+
+// Lease Task 3c: a lease topic, a key.index topic and an autoincrement topic defined with the CLIENT primitives
+// (TopicOptions::lease / keyFeatures) on a real broker, then replayed by the real CLI onto a fresh broker.  The
+// target's catalog fingerprints, stored descriptor, lease and key features equal the source's.
+TEST(RuneCliBrokerRegression, LeaseTopicClientBrokerRegression) {
+    namespace cd = rune::codec;
+    OneBroker src("cli_lease_src"), dst("cli_lease_dst");
+    const rune::protocol::LeaseSpec spec{.ttlMs = 10000, .minTtlMs = 1000, .maxTtlMs = 60000, .maxKeys = 1,
+                                         .expiryBatch = 64, .checkpoint = 0, .checkpointIntervalMs = 1000,
+                                         .checkpointRate = 1};
+    rune::client::Client* c = src.connectClient();
+    {
+        cd::DescriptorBuilder d("inst");
+        d.addFixedStr("id", 64, 1, /*isKey=*/true).add("note", cd::PrimType::Int32);
+        const auto blob = cd::serialize(d.build());
+        rune::client::TopicOptions o;
+        o.config.cleanupPolicy = 1;
+        o.config.retentionMs   = -1;
+        o.config.retentionBytes = -1;
+        o.lease = spec;
+        const auto r = c->defineTopicAndWait("inst", 1, "id", blob, rune::client::Persistence::Disk, o, {}, 10s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+    }
+    {
+        cd::DescriptorBuilder d("kidx");
+        d.add("id", cd::PrimType::UInt64, 1, /*isKey=*/true).add("v", cd::PrimType::Int32);
+        rune::client::TopicOptions o;
+        o.keyFeatures.keyIndex = true;
+        const auto r = c->defineTopicAndWait("kidx", 1, "id", cd::serialize(d.build()), rune::client::Persistence::Disk, o, {}, 10s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+    }
+    {
+        cd::DescriptorBuilder d("auto");
+        d.add("id", cd::PrimType::UInt64, 1, /*isKey=*/true).add("v", cd::PrimType::Int32);
+        rune::client::TopicOptions o;
+        o.keyFeatures.keyIndex = true;
+        o.keyFeatures.autoIncrement = true;
+        o.config.cleanupPolicy = 1;
+        o.keyFeatures.autoIncrementReserve = 77;
+        const auto r = c->defineTopicAndWait("auto", 1, "id", cd::serialize(d.build()), rune::client::Persistence::Disk, o, {}, 10s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+    }
+
+    const auto sc = c->getTopicSchemaAndWait("inst", 0, 10s);
+    ASSERT_EQ(sc.errorCode, 0);
+    ASSERT_TRUE(sc.lease.has_value()) << "the schema result carries the lease";
+    EXPECT_EQ(*sc.lease, spec);
+    const auto stored = cd::deserialize(sc.descriptorBlob);
+    ASSERT_GE(stored.fields.size(), 5u);
+    EXPECT_EQ(stored.fields[0].name, "lease_version");
+    EXPECT_EQ(stored.fields[1].name, "lease_ttl_ms");
+    EXPECT_EQ(stored.fields[2].name, "lease_holder");
+    EXPECT_EQ(stored.fields[3].name, "lease_remaining_ms");
+    EXPECT_EQ(stored.fields[4].name, "id");
+
+    std::string out, err;
+    ASSERT_EQ(runCli({"catalog", "replay", "--from", src.endpoint(), "--into", dst.endpoint(), "--cluster-id", "src"}, &out, &err), 0)
+        << err;
+    const auto s = src.catalogEvents(), d = dst.catalogEvents();
+    ASSERT_EQ(d.size(), s.size());
+    for (std::size_t i = 0; i < d.size(); ++i)
+        EXPECT_EQ(d[i].event.fingerprint, s[i].event.fingerprint) << "offset " << i;
+
+    rcat::CatalogReplayer sr, dr;
+    for (const auto& e : s) ASSERT_TRUE(sr.feedDecoded(e.offset, e.event).has_value());
+    for (const auto& e : d) ASSERT_TRUE(dr.feedDecoded(e.offset, e.event).has_value());
+    for (const char* name : {"inst", "kidx", "auto"}) {
+        const auto* st = sr.state().topicByName(rune::catalog::kDefaultNsId, name);
+        const auto* dt = dr.state().topicByName(rune::catalog::kDefaultNsId, name);
+        ASSERT_NE(st, nullptr) << name;
+        ASSERT_NE(dt, nullptr) << name;
+        ASSERT_TRUE(st->schema && dt->schema) << name;
+        EXPECT_EQ(dt->lease, st->lease) << name;
+        EXPECT_EQ(dt->schema->keyFeatures, st->schema->keyFeatures) << name;
+        EXPECT_EQ(dt->schema->evolvingBlob, st->schema->evolvingBlob) << name;
+    }
+    EXPECT_EQ(dr.state().topicByName(rune::catalog::kDefaultNsId, "inst")->lease, std::optional<rune::protocol::LeaseSpec>(spec));
+    EXPECT_TRUE(dr.state().topicByName(rune::catalog::kDefaultNsId, "kidx")->schema->keyFeatures.keyIndex) << "replay keeps key.index";
+    EXPECT_TRUE(dr.state().topicByName(rune::catalog::kDefaultNsId, "auto")->schema->keyFeatures.autoIncrement) << "replay keeps autoincrement";
+    EXPECT_EQ(dr.state().topicByName(rune::catalog::kDefaultNsId, "auto")->schema->keyFeatures.autoIncrementReserve, 77u);
+
+    // The target broker itself answers the same schema and lease.
+    const auto tc = dst.connectClient()->getTopicSchemaAndWait("inst", 0, 10s);
+    ASSERT_EQ(tc.errorCode, 0);
+    EXPECT_EQ(tc.descriptorBlob, sc.descriptorBlob);
+    ASSERT_TRUE(tc.lease.has_value());
+    EXPECT_EQ(*tc.lease, spec);
+}
+
+// Lease Task 3c fix round: the replay matrix.  Source catalog: an untyped topic adopted by a define carrying a schema and
+// key.index (CreateSchemaOps must carry the key features), a lease topic altered three ways (AddField, lease.ttl,
+// lease.checkpoint), and a lease topic that is dropped.  The target ends up with the same schema, lease and key
+// features; the dropped topic and its lease view are gone.
+TEST(RuneCliBrokerRegression, LeaseReplayMatrixAndReplayCarriesKeyFeaturesRegression) {
+    namespace cd = rune::codec;
+    namespace rpc = rune::protocol::client;
+    OneBroker src("cli_lease_mx_src"), dst("cli_lease_mx_dst");
+    rune::client::Client* c = src.connectClient();
+    const auto leaseBlob = [](const char* name) {
+        cd::DescriptorBuilder d(name);
+        d.addFixedStr("id", 64, 1, /*isKey=*/true).add("note", cd::PrimType::Int32);
+        return cd::serialize(d.build());
+    };
+    rune::client::TopicOptions leased;
+    leased.lease = rune::protocol::LeaseSpec{.ttlMs = 10000, .minTtlMs = 1000, .maxTtlMs = 60000, .maxKeys = 1,
+                                             .expiryBatch = 64, .checkpoint = 1, .checkpointIntervalMs = 1000,
+                                             .checkpointRate = 1};
+    leased.config.cleanupPolicy = 1;
+    leased.config.retentionMs = -1;
+    leased.config.retentionBytes = -1;
+
+    ASSERT_EQ(c->defineTopicAndWait("adopt", 1, "", {}, rune::client::Persistence::Disk, {}, {}, 10s).errorCode, 0);
+    {   // the adoption: a define of the existing untyped topic with a schema and key.index on
+        cd::DescriptorBuilder d("adopt");
+        d.add("id", cd::PrimType::UInt64, 1, /*isKey=*/true).add("v", cd::PrimType::Int32);
+        rune::client::TopicOptions o;
+        o.keyFeatures.keyIndex = true;
+        const auto r = c->defineTopicAndWait("adopt", 1, "id", cd::serialize(d.build()), rune::client::Persistence::Disk, o, {}, 10s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+    }
+    ASSERT_EQ(c->defineTopicAndWait("inst", 1, "id", leaseBlob("inst"), rune::client::Persistence::Disk, leased, {}, 10s).errorCode, 0);
+    {
+        cd::AlterOp add{};
+        add.type = cd::AlterOpType::Add;
+        add.name = "extra";
+        add.primType = cd::PrimType::Int64;
+        const auto ops = cd::encodeAlterOps({add});
+        const auto r = c->alterTopicAndWait("inst", 0, ops, {}, 10s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+    }
+    {
+        const rpc::ConfigChangeWire ttl[] = {{static_cast<uint8_t>(rune::protocol::ConfigKey::LeaseTtlMs), 20000}};
+        ASSERT_EQ(c->alterTopicConfigAndWait("inst", 0, ttl, {}, 10s).errorCode, 0);
+        const rpc::ConfigChangeWire ckpt[] = {{static_cast<uint8_t>(rune::protocol::ConfigKey::LeaseCheckpoint), 0}};
+        ASSERT_EQ(c->alterTopicConfigAndWait("inst", 0, ckpt, {}, 10s).errorCode, 0);
+    }
+    ASSERT_EQ(c->defineTopicAndWait("gone", 1, "id", leaseBlob("gone"), rune::client::Persistence::Disk, leased, {}, 10s).errorCode, 0);
+    ASSERT_EQ(c->dropTopicAndWait("gone", {}, 10s).errorCode, 0);
+
+    std::string out, err;
+    ASSERT_EQ(runCli({"catalog", "replay", "--from", src.endpoint(), "--into", dst.endpoint(), "--cluster-id", "src"}, &out, &err), 0)
+        << err;
+    const auto s = src.catalogEvents(), d = dst.catalogEvents();
+    ASSERT_EQ(d.size(), s.size());
+    for (std::size_t i = 0; i < d.size(); ++i)
+        EXPECT_EQ(d[i].event.fingerprint, s[i].event.fingerprint) << "offset " << i;
+
+    rcat::CatalogReplayer sr, dr;
+    for (const auto& e : s) ASSERT_TRUE(sr.feedDecoded(e.offset, e.event).has_value());
+    for (const auto& e : d) ASSERT_TRUE(dr.feedDecoded(e.offset, e.event).has_value());
+    const auto* adopt = dr.state().topicByName(rune::catalog::kDefaultNsId, "adopt");
+    ASSERT_NE(adopt, nullptr);
+    ASSERT_TRUE(adopt->schema.has_value());
+    EXPECT_TRUE(adopt->schema->keyFeatures.keyIndex) << "the adoption's key.index crosses the replay";
+    const auto* si = sr.state().topicByName(rune::catalog::kDefaultNsId, "inst");
+    const auto* di = dr.state().topicByName(rune::catalog::kDefaultNsId, "inst");
+    ASSERT_TRUE(si && di && si->schema && di->schema);
+    EXPECT_EQ(di->schema->evolvingBlob, si->schema->evolvingBlob);
+    EXPECT_EQ(di->lease, si->lease);
+    ASSERT_TRUE(di->lease.has_value());
+    EXPECT_EQ(di->lease->ttlMs, 20000u);
+    EXPECT_EQ(di->lease->checkpoint, 0);
+    EXPECT_EQ(dr.state().topicByName(rune::catalog::kDefaultNsId, "gone"), nullptr);
+
+    // The target broker itself: the adopted topic, the altered lease topic and its lease view serve; the dropped ones do not.
+    rune::client::Client* t = dst.connectClient();
+    const auto ta = t->getTopicSchemaAndWait("adopt", 0, 10s);
+    ASSERT_EQ(ta.errorCode, 0);
+    EXPECT_TRUE(ta.keyFeatures.keyIndex);
+    const auto sa = c->getTopicSchemaAndWait("inst", 0, 10s);
+    const auto ti = t->getTopicSchemaAndWait("inst", 0, 10s);
+    ASSERT_EQ(ti.errorCode, 0);
+    EXPECT_EQ(ti.descriptorBlob, sa.descriptorBlob);
+    ASSERT_TRUE(ti.lease.has_value());
+    EXPECT_EQ(ti.lease, sa.lease);
+    EXPECT_NE(t->getTopicSchemaAndWait("gone", 0, 10s).errorCode, 0);
+    EXPECT_NE(t->getTopicSchemaAndWait("gone.leases", 0, 10s).errorCode, 0);
+    // The lease views, as the replayed catalogs hold them (a lease view has no schema of its own to ask a broker for).
+    EXPECT_NE(sr.state().viewByName(rune::catalog::kDefaultNsId, "inst.leases"), nullptr) << "the source holds inst.leases";
+    EXPECT_NE(dr.state().viewByName(rune::catalog::kDefaultNsId, "inst.leases"), nullptr) << "inst.leases present on the target";
+    EXPECT_EQ(dr.state().viewByName(rune::catalog::kDefaultNsId, "gone.leases"), nullptr);
 }
 
 TEST(RuneCliBrokerRegression, ReplayRemapsViewSourcesOntoTheTargetsOwnTopicIds) {

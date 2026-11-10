@@ -583,3 +583,56 @@ TEST(SkimpyOffsetMapRegression, BudgetBoundsTheTableBytesRegression) {
     EXPECT_EQ(one.capacity() * SkimpyOffsetMap::kEntryBytes, static_cast<std::size_t>(kMiB)) << "allocated, not only computed";
     EXPECT_EQ(one.maxSlots(), SkimpyOffsetMap::sizingForBudget(kMiB).maxSlots);
 }
+
+// ---- Lease aux (Task 8 matrix cells) ----
+TEST(SkimpyOffsetMapLeaseAuxRegression, CheckpointThenRowKeepsBothRegression) {
+    SkimpyOffsetMap m(16);
+    m.enableLeaseAux();
+    ASSERT_TRUE(m.putLeaseCheckpoint("k", 3));
+    ASSERT_TRUE(m.putLease("k", 7, /*version=*/2, /*ended=*/false));
+    const auto e = m.getLease("k");
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->checkpointOffset, 3);
+    EXPECT_EQ(e->latest, 7);
+    EXPECT_EQ(e->liveVersion, 2);
+}
+
+TEST(SkimpyOffsetMapLeaseAuxRegression, LowerRowOffsetChangesNothingRegression) {
+    SkimpyOffsetMap m(16);
+    m.enableLeaseAux();
+    ASSERT_TRUE(m.putLease("k", 9, 4, false));
+    ASSERT_TRUE(m.putLease("k", 5, 1, true));
+    const auto e = m.getLease("k");
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->latest, 9);
+    EXPECT_EQ(e->liveVersion, 4);
+}
+
+TEST(SkimpyOffsetMapLeaseAuxRegression, CheckpointOnlyKeyHasNoRecordRegression) {
+    SkimpyOffsetMap m(16);
+    m.enableLeaseAux();
+    ASSERT_TRUE(m.putLeaseCheckpoint("k", 6));
+    const auto e = m.getLease("k");
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->latest, SkimpyOffsetMap::kNoRecord);
+    EXPECT_EQ(e->checkpointOffset, 6);
+}
+
+TEST(SkimpyOffsetMapLeaseAuxRegression, FullMapRefusesNewCheckpointKeyRegression) {
+    SkimpyOffsetMap m(4);
+    m.enableLeaseAux();
+    const char* keys[] = {"a", "b", "c", "d"};
+    for (std::size_t i = 0; i < 4; ++i) ASSERT_TRUE(m.putLease(keys[i], static_cast<int64_t>(i), 0, false));
+    ASSERT_TRUE(m.isFull());
+    EXPECT_FALSE(m.putLeaseCheckpoint("new-key", 10));
+    EXPECT_TRUE(m.putLeaseCheckpoint("c", 10));
+    EXPECT_EQ(m.getLease("c")->checkpointOffset, 10);
+}
+
+TEST(SkimpyOffsetMapLeaseAuxRegression, LowerCheckpointKeepsTheHigherRegression) {
+    SkimpyOffsetMap m(16);
+    m.enableLeaseAux();
+    ASSERT_TRUE(m.putLeaseCheckpoint("k", 8));
+    ASSERT_TRUE(m.putLeaseCheckpoint("k", 2));
+    EXPECT_EQ(m.getLease("k")->checkpointOffset, 8);
+}

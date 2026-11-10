@@ -626,7 +626,7 @@ private:
     /// A unique value of a FIXED size (kValueBytes): the builder's high-water mark is bounded by the record count.
     static constexpr std::size_t kValueBytes = 24;
     std::string value(const char* tag) {
-        char buf[kValueBytes + 1];
+        char buf[kValueBytes + 48];   // the formatted text is always longer than kValueBytes (24 pad dots); its first kValueBytes are kept
         std::snprintf(buf, sizeof buf, "%.4s-%u-%llu........................", tag, seed_, static_cast<unsigned long long>(nextValue_++));
         return std::string(buf, kValueBytes);
     }

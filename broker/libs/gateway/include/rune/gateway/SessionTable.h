@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <random>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -223,7 +224,14 @@ struct Session {
 // ---------------------------------------------------------------------------
 class SessionTable {
 public:
-    SessionTable() = default;
+    // L22 Part A: the 40-bit counter starts at a per-boot random value in [1, 2^39) (Aeron picks its publication session ids the
+    // same way), so a restarted node never re-issues an id of its previous life: a client still holding one cannot have its
+    // frames run inside another client's new session.  The first id is idStart_ + 1; at least 2^39 ids remain per boot.
+    SessionTable() {
+        std::random_device rd;
+        const uint64_t r = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+        idStart_ = nextId_ = static_cast<int64_t>(r % ((uint64_t{1} << 39) - 1)) + 1;
+    }
 
     // No copies — owns ExclusivePublications via shared_ptr (but the table
     // itself is not meant to be copied).
@@ -231,7 +239,7 @@ public:
     SessionTable& operator=(const SessionTable&) = delete;
 
     // -----------------------------------------------------------------------
-    // nextSessionId() — monotonically-increasing, starts at 1, OR-ed with the
+    // nextSessionId() — monotonically-increasing, starts at a per-boot random value (idStart_ + 1), OR-ed with the
     // cluster id prefix (setIdPrefix): ((nodeId + 1) << 40) | counter makes a
     // session id unique across the cluster's nodes (a client holds one session
     // per node and demultiplexes by id).  Always positive.
@@ -245,9 +253,11 @@ public:
         return idPrefix_ | nextId_;
     }
     /// How many session ids were ever handed out (accepted connects; test observability).
-    [[nodiscard]] uint64_t sessionsAllocated() const noexcept { return static_cast<uint64_t>(nextId_); }
+    [[nodiscard]] uint64_t sessionsAllocated() const noexcept { return static_cast<uint64_t>(nextId_ - idStart_); }
     /// Cluster-unique ids: the prefix OR-ed into every id (0 = none, tests).
     void setIdPrefix(int64_t prefix) noexcept { idPrefix_ = prefix; }
+    /// Test seam: fixes the counter start (the first id is start + 1).  Valid only before the first id is handed out.
+    void setIdStartForTest(int64_t start) noexcept { idStart_ = nextId_ = start; }
 
     // -----------------------------------------------------------------------
     // add() — insert a new session.  Returns a reference valid until remove().
@@ -316,6 +326,7 @@ public:
 
 private:
     int64_t                              nextId_   = 0;
+    int64_t                              idStart_  = 0;
     int64_t                              idPrefix_ = 0;
     std::unordered_map<int64_t, Session> sessions_;
 };

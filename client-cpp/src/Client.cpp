@@ -36,6 +36,8 @@
 #include <rune/codec/ViewPlanAuthored.h>
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/client/NamespaceMessages.h>
+#include <rune/protocol/client/LeaseMessages.h>
+#include <rune/protocol/LeaseSpec.h>
 
 #include <concurrent/BackOffIdleStrategy.h>
 #include <concurrent/YieldingIdleStrategy.h>
@@ -58,6 +60,7 @@ namespace rune::client {
 
 static_assert(Key::kMaxInline == rune::codec::kMaxTopicKeyBytes, "a topic key field is at most as wide as a Key");
 static_assert(kMaxPasswordBytes == detail::FixedSecret::kCapacity);
+static_assert(producer::kLeaseKeySlot == rune::protocol::kMaxLeaseKeyBytes, "the lease send slot is the lease key width");
 
 namespace {
 
@@ -262,6 +265,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c, const detail::ClientTest
     acfg.session.requireCrypto = c.requireCrypto;
     if (c.testAnnounceClientVersion > 0) acfg.session.clientVersion = c.testAnnounceClientVersion;   // test only
     acfg.transport.clientLivenessTimeoutNs = c.aeronClientLivenessTimeoutNs;
+    acfg.transport.imageLivenessTimeoutNs  = c.aeronImageLivenessTimeoutNs;   // #989
     // F12: malformed env values are reported (once per Client construction —
     // this runs once per Client, never per cycle), not silently dropped.
     for (const std::string& w : transport::applyEnvOverrides(acfg.transport)) {
@@ -346,8 +350,12 @@ Client::Client(ClientConfig cfg, const detail::ClientTestOptions& opts)
     agent_.setHubCommandFn([this](const detail::HubCommand& cmd) { applyHubCommand_(cmd); });
     // F8c C3: control ops (connect / ping / DDL / listTopics) from app threads.
     agent_.setControlOpFn([this](const uint8_t* rec, std::size_t len) { applyControlOpRecord_(rec, len); });
-    pendingCtl_.reserve(64);
+    leaseGuards_.configure(cfg_.maxLeaseSessions, detail::CompletionSink{&Client::deliverTrampoline_, this});
+    pendingCtl_.reserve(kCtlTableCap);   // fixed for the lease ops (applyControlOp_ refuses them when full); cold ops may still grow it
     ctlScratch_.reserve(512);
+    framePool_.reserve(kCtlTableCap);
+    endpointPool_.reserve(kCtlTableCap);
+    for (auto& h : routeHints_) h.endpoint.reserve(kRouteEndpointReserve);
     cqSlots_.reserve(kMaxCqs);
     cqFree_.assign(kMaxCqs, 0);  // FIFO ring of released slots (I3)
     releases_.reserve(16);       // C7: handle releases (cold; grows only on a burst of releases)
@@ -1316,9 +1324,79 @@ Completion Client::groupAndWaitTrampoline_(void* ctx, const char* what, std::chr
 // F8c C3: control ops — app-thread issue path
 // ---------------------------------------------------------------------------
 
+namespace {
+/// L22 fix 2: the (topic, partition) a partition-routed control frame is served by; false = not a partition-routed op.
+/// Spans only, no allocation.  The frames without a partition field (GetViewRow, ScanViewRows, a GetViewRowK that leaves the
+/// partition to the broker) share one bucket per topic.
+constexpr int32_t kAnyPart = -2;   // == Client::kRouteAnyPartition
+bool routeOfFrame(OpKind op, const uint8_t* b, std::size_t n, int32_t& topic, int32_t& partition) noexcept {
+    namespace rpc = rune::protocol::client;
+    switch (op) {
+    case OpKind::GetViewRow:
+        if (const auto m = rpc::GetViewRow::decode(b, n)) { topic = m->viewTopicId; partition = kAnyPart; return true; }
+        return false;
+    case OpKind::GetViewRowK:
+        if (const auto m = rpc::GetViewRowK::decode(b, n)) {
+            topic = m->viewTopicId; partition = m->partition >= 0 ? m->partition : kAnyPart; return true;
+        }
+        return false;
+    case OpKind::ScanViewRows:
+        if (const auto m = rpc::ScanViewRows::decode(b, n)) { topic = m->viewTopicId; partition = kAnyPart; return true; }
+        return false;
+    case OpKind::LeaseKeepAlive:
+        if (const auto m = rpc::LeaseKeepAlive::decode(b, n)) { topic = m->topicId; partition = m->partition; return true; }
+        return false;
+    case OpKind::LeaseTimeToLive:
+        if (const auto m = rpc::LeaseTimeToLive::decode(b, n)) { topic = m->topicId; partition = m->partition; return true; }
+        return false;
+    case OpKind::ScanLeases:
+        if (const auto m = rpc::ScanLeases::decode(b, n)) { topic = m->viewTopicId; partition = m->partition; return true; }
+        return false;
+    default: return false;
+    }
+}
+}  // namespace
+
+std::size_t Client::routeSlot_(int32_t topic, int32_t partition) noexcept {
+    const uint32_t h = (static_cast<uint32_t>(topic) * 0x9E3779B1u) ^ (static_cast<uint32_t>(partition) * 0x85EBCA77u);
+    return static_cast<std::size_t>((h ^ (h >> 15)) & (kRouteHintSlots - 1));
+}
+void Client::forgetRouteHint_(const RoutedCtlPending& d) noexcept {
+    if (d.routeTopic < 0) return;
+    RouteHint& h = routeHints_[routeSlot_(d.routeTopic, d.routePartition)];
+    if (h.topic != d.routeTopic || h.partition != d.routePartition || h.endpoint.empty() || h.endpoint != d.endpoint) return;
+    h.topic = -1;
+    h.partition = -1;
+    h.endpoint.clear();
+    ++routeStatsDuty_.cleared; routeStatsDirty_ = true;
+}
+void Client::learnRouteHint_(const RoutedCtlPending& d) {
+    if (d.routeTopic < 0 || d.endpoint.empty()) return;
+    RouteHint& h = routeHints_[routeSlot_(d.routeTopic, d.routePartition)];
+    h.topic = d.routeTopic;
+    h.partition = d.routePartition;
+    h.endpoint.assign(d.endpoint);   // capacity reserved at construction: no allocation for an endpoint within it
+    ++routeStatsDuty_.learned; routeStatsDirty_ = true;
+}
+void Client::publishRouteStats_() noexcept {
+    if (!routeStatsDirty_) [[likely]] return;
+    if (cfg_.runnerMode != RunnerMode::Thread) { routeStatsDirty_ = false; return; }   // Invoker: the owner reads the duty words
+    routeStatsDirty_ = !routeStats_.tryPublish(routeStatsDuty_);   // refused (owner not draining): retried next cycle, newest wins
+}
+const Client::RouteStats& Client::routeStatsView_() const {
+    // Invoker owner or a duty-cycle callback: the duty words; a Thread-mode owner: the latest status the duty thread published.
+    if (cfg_.runnerMode != RunnerMode::Thread || std::this_thread::get_id() == dutyThreadId_) return routeStatsDuty_;
+    (void)routeStats_.drainLatest(routeStatsCache_);
+    return routeStatsCache_;
+}
+uint64_t Client::routeHintHits() const { return routeStatsView_().hits; }
+uint64_t Client::routeHintLearned() const { return routeStatsView_().learned; }
+uint64_t Client::routeHintCleared() const { return routeStatsView_().cleared; }
+uint64_t Client::ctlRedirectsFollowed() const { return routeStatsView_().redirects; }
+
 OpResult Client::issueControl_(OpKind op, CompletionTarget target, Token token,
                                std::span<const uint8_t> wireFrame, uint32_t payloadHint, uint32_t requestIdAt,
-                               std::span<const uint8_t> secret) {
+                               std::span<const uint8_t> secret, uint32_t timeoutMs, uint16_t multiCount) {
     // A secret rides after the wire frame in the same record (the duty thread splits it off).
     std::vector<uint8_t> withSecret;
     std::span<const uint8_t> frame = wireFrame;
@@ -1346,8 +1424,15 @@ OpResult Client::issueControl_(OpKind op, CompletionTarget target, Token token,
     h.op          = op;
     h.requestIdAt = requestIdAt;
     h.secretLen   = static_cast<uint16_t>(secret.size());
+    h.timeoutMs   = timeoutMs;
+    h.multiCount  = multiCount;
     Completions* q = target.cq;
-    if (q != nullptr) {
+    if (multiCount != 0) {   // Task 15: the caller reserved 48 x (1 + entries) itself; nothing to reserve or give back here
+        if (q == nullptr || q->client_ != this) return OpResult::InvalidArgument;
+        if (!q->onOwnerThread()) return OpResult::WrongThread;
+        h.reservedBytes = 48u * (1u + multiCount);
+        h.cqRef         = q->cqRef_;
+    } else if (q != nullptr) {
         if (q->client_ != this) return OpResult::InvalidArgument;
         if (!q->onOwnerThread()) return OpResult::WrongThread;
         const uint32_t r  = q->reservationFor(op, payloadHint);
@@ -1358,7 +1443,7 @@ OpResult Client::issueControl_(OpKind op, CompletionTarget target, Token token,
     } else {
         h.handler = target.handler;
     }
-    auto unreserve = [&] { if (q != nullptr) q->unreserve(h.reservedBytes); };
+    auto unreserve = [&] { if (q != nullptr && multiCount == 0) q->unreserve(h.reservedBytes); };
 
     // Inside a duty cycle (a callback on the duty thread): the state is ours —
     // apply now.  Everywhere else (an app thread, the Invoker owner between
@@ -1438,7 +1523,9 @@ OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::st
     msg.config            = rune::protocol::convertTopicConfig<rpc::TopicConfigWire>(topic.config);
     msg.hasExt            = true;   // catalog history: every DDL carries the extension
     msg.ext               = ddlExt_(ddl);
-    msg.hasKeyFeatures    = topic.keyFeatures != rune::protocol::TopicKeyFeatures{};
+    msg.hasLease          = topic.lease.has_value();
+    msg.lease             = topic.lease.value_or(rune::protocol::LeaseSpec{});
+    msg.hasKeyFeatures    = topic.keyFeatures != rune::protocol::TopicKeyFeatures{} || msg.hasLease;   // the lease block follows the key block
     msg.keyFeatures       = topic.keyFeatures;
     std::vector<uint8_t> frame(msg.encodedSize());
     const std::size_t n = msg.encode(frame.data());
@@ -1567,11 +1654,27 @@ bool defineKeyFeaturesTooOld(std::span<const uint8_t> frame, int32_t brokerVersi
     return d && d->hasKeyFeatures;
 }
 
+// A DefineTopic that carries a lease cannot go to a broker below v11.  `brokerVersion` 0 = unknown: sent.
+bool defineLeaseTooOld(std::span<const uint8_t> frame, int32_t brokerVersion) {
+    namespace rpc = rune::protocol::client;
+    if (brokerVersion < 1 || brokerVersion >= rpc::kBrokerVersionLeases) return false;
+    const auto d = rpc::DefineTopic::decode(frame.data(), frame.size());
+    return d && d->hasLease;
+}
+
 // SD11: GetViewRowK / ScanViewRows / GetStats are served from broker v10 on.  `brokerVersion` 0 = unknown: sent.
 bool checkedWritesReadTooOld(rune::client::OpKind op, int32_t brokerVersion) noexcept {
     return (op == rune::client::OpKind::GetViewRowK || op == rune::client::OpKind::ScanViewRows || op == rune::client::OpKind::GetStats) &&
            brokerVersion >= 1 &&
            brokerVersion < rune::protocol::client::kBrokerVersionCheckedWrites;
+}
+
+// Task 14a: the lease ops are served from broker v11 on.  `brokerVersion` 0 = unknown: sent.
+bool leaseOpTooOld(rune::client::OpKind op, int32_t brokerVersion) noexcept {
+    using rune::client::OpKind;
+    return (op == OpKind::OpenLeaseTopic || op == OpKind::LeaseKeepAlive || op == OpKind::LeaseTimeToLive ||
+            op == OpKind::ScanLeases) &&
+           brokerVersion >= 1 && brokerVersion < rune::protocol::client::kBrokerVersionLeases;
 }
 }  // namespace
 
@@ -1820,6 +1923,90 @@ OpResult Client::scanView(int32_t viewTopicId, std::span<const uint8_t> prefix, 
     return issueControl_(OpKind::ScanViewRows, target, token, std::span<const uint8_t>(frame.data(), n), 0);
 }
 
+OpResult Client::openLeaseTopicSchema(std::string_view name, uint64_t requestedFingerprint, CompletionTarget target,
+                                      Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::GetTopicSchema msg;
+    msg.topicName            = name;
+    msg.requestedFingerprint = requestedFingerprint;
+    std::vector<uint8_t> frame(msg.encodedSize() + 32u);
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::OpenLeaseTopic, target, token, std::span<const uint8_t>(frame.data(), n), 0);
+}
+
+OpResult Client::leaseKeepAlive(int32_t topicId, int32_t partition, std::span<const uint8_t> key, int64_t version,
+                                uint32_t timeoutMs, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    if (key.empty() || key.size() > rune::protocol::kMaxLeaseKeyBytes) return OpResult::InvalidArgument;
+    const rpc::LeaseKeepAlive::Entry e{key, version};
+    rpc::LeaseKeepAlive msg;
+    msg.topicId   = topicId;
+    msg.partition = partition;
+    msg.entries   = std::span<const rpc::LeaseKeepAlive::Entry>(&e, 1);
+    uint8_t frame[rpc::MessageHeader::ENCODED_SIZE + rpc::LeaseKeepAlive::BODY_FIXED + 1 + rune::protocol::kMaxLeaseKeyBytes + 8 + 16];
+    if (msg.encodedSize() > sizeof frame) return OpResult::InvalidArgument;
+    const std::size_t n = msg.encode(frame);
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::LeaseKeepAlive, target, token, std::span<const uint8_t>(frame, n), 0, 0, {}, timeoutMs);
+}
+
+std::size_t Client::leaseKeepAliveBudgetBytes() const noexcept {
+    const std::size_t ring = agent_.commandMsgLimit();
+    const std::size_t viaRing = ring > sizeof(ControlOpHeader) ? ring - sizeof(ControlOpHeader) : 0;
+    return std::min(agent_.maxFrameLength(), viaRing);
+}
+
+OpResult Client::leaseKeepAliveBatch(int32_t topicId, int32_t partition,
+                                     std::span<const rune::protocol::client::LeaseKeepAlive::Entry> entries,
+                                     uint32_t timeoutMs, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    if (target.cq == nullptr || entries.empty() || entries.size() > rpc::kLeaseKeepAliveMaxEntries) return OpResult::InvalidArgument;
+    rpc::LeaseKeepAlive msg;
+    msg.topicId   = topicId;
+    msg.partition = partition;
+    msg.entries   = entries;
+    if (!msg.fits() || msg.encodedSize() > leaseKeepAliveBudgetBytes()) return OpResult::InvalidArgument;
+    if (batchFrame_.size() < msg.encodedSize()) batchFrame_.resize(msg.encodedSize());   // grows to the largest batch, then reused
+    const std::size_t n = msg.encode(batchFrame_.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::LeaseKeepAlive, target, token, std::span<const uint8_t>(batchFrame_.data(), n), 0, 0, {}, timeoutMs,
+                         static_cast<uint16_t>(entries.size()));
+}
+
+OpResult Client::leaseTimeToLive(int32_t topicId, int32_t partition, std::span<const uint8_t> key, uint32_t timeoutMs,
+                                 CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    if (key.empty() || key.size() > rune::protocol::kMaxLeaseKeyBytes) return OpResult::InvalidArgument;
+    rpc::LeaseTimeToLive msg;
+    msg.topicId   = topicId;
+    msg.partition = partition;
+    msg.key       = key;
+    uint8_t frame[rpc::MessageHeader::ENCODED_SIZE + 8 + 1 + rune::protocol::kMaxLeaseKeyBytes + 16];
+    if (msg.encodedSize() > sizeof frame) return OpResult::InvalidArgument;
+    const std::size_t n = msg.encode(frame);
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::LeaseTimeToLive, target, token, std::span<const uint8_t>(frame, n), 0, 0, {}, timeoutMs);
+}
+
+OpResult Client::scanLeases(int32_t viewTopicId, int32_t partition, std::span<const uint8_t> prefix, uint64_t resumeHash,
+                            bool first, uint16_t maxRows, uint32_t timeoutMs, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::ScanLeases msg;
+    msg.viewTopicId = viewTopicId;
+    msg.partition   = partition;
+    msg.resumeHash  = resumeHash;
+    msg.first       = first ? 1 : 0;
+    msg.maxRows     = maxRows;
+    msg.prefix      = prefix;
+    if (!msg.fits()) return OpResult::InvalidArgument;
+    uint8_t frame[rpc::MessageHeader::ENCODED_SIZE + 32 + rpc::kScanLeasesMaxPrefixBytes + 16];
+    if (msg.encodedSize() > sizeof frame) return OpResult::InvalidArgument;
+    const std::size_t n = msg.encode(frame);
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::ScanLeases, target, token, std::span<const uint8_t>(frame, n), 0, 0, {}, timeoutMs);
+}
+
 OpResult Client::getStats(rune::protocol::client::StatsScope scope, int32_t objectId, int32_t partition,
                           CompletionTarget target, Token token) {
     namespace rpc = rune::protocol::client;
@@ -1876,6 +2063,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     p.target.handler       = h.handler;
     p.target.reservedBytes = h.reservedBytes;
     p.target.cqRef         = h.cqRef;
+    p.multiCount           = h.multiCount;
     pinCqSlot_(p.target);  // I3: the slot stays out of reuse until this op completes
     // close()'s final drain, or T15b: failed for good (no session can answer) —
     // an accepted op completes exactly once, Closed.
@@ -1936,18 +2124,27 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     p.corrId     = nextCorrId_++;
     // Catalog history (fix round 0, A): a DDL has its own deadline — the whole
     // op, its Redirect hops and its NotLeader budget (budgetEnd <= deadline).
-    p.deadlineNs = nsAfter(nowNs, isDdlOp(h.op) ? cfg_.ddlTimeoutMs : cfg_.pingTimeoutMs);
+    p.deadlineNs = nsAfter(nowNs, h.timeoutMs != 0 ? static_cast<int64_t>(h.timeoutMs)
+                                  : (isDdlOp(h.op) ? cfg_.ddlTimeoutMs : cfg_.pingTimeoutMs));
     if (h.op == OpKind::DefineTopic) {
         if (auto d = rpc::DefineTopic::decode(frame.data(), frame.size())) {
             p.topicName = std::string(d->topicName);
-            if (defineKeyFeaturesTooOld(frame, agent_.sessionBrokerVersion(0))) {
+            if (defineKeyFeaturesTooOld(frame, agent_.sessionBrokerVersion(0)) ||
+                defineLeaseTooOld(frame, agent_.sessionBrokerVersion(0))) {
                 completeCtl_(p, OpStatus::BrokerTooOld, ddlNoValue(p.op));
                 return;
             }
         }
     }
-    if (checkedWritesReadTooOld(h.op, agent_.sessionBrokerVersion(0))) {
+    if (checkedWritesReadTooOld(h.op, agent_.sessionBrokerVersion(0)) || leaseOpTooOld(h.op, agent_.sessionBrokerVersion(0))) {
         completeCtl_(p, OpStatus::BrokerTooOld, ddlNoValue(p.op));
+        return;
+    }
+    if (pendingCtl_.size() >= kCtlTableCap &&
+        (h.op == OpKind::LeaseKeepAlive || h.op == OpKind::LeaseTimeToLive || h.op == OpKind::ScanLeases)) {
+        // Fixed capacity (no growth, no allocation): a lease op that finds the table full is refused with Throttled, retry-after 1 ms.  Its
+        // owner (a LeaseSession's keepalive, a LeaseWatch's scan) already retries a Throttled answer on its own cadence.
+        completeCtl_(p, OpStatus::BrokerError, ddlNoValue(p.op), 1, static_cast<uint16_t>(rpc::ErrorCode::Throttled));
         return;
     }
     ctlScratch_.assign(frame.begin(), frame.end());
@@ -1976,9 +2173,36 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             rpc::detail::putLE64(ctlScratch_.data(), static_cast<int>(h.requestIdAt + 8u),
                                  static_cast<int64_t>(d.requestLo));
         }
-        d.frame = ctlScratch_;
+        if (!framePool_.empty()) {   // Task 14a: a recycled frame - the routed op allocates nothing after warm-up
+            d.frame = std::move(framePool_.back());
+            framePool_.pop_back();
+        }
+        d.frame.assign(ctlScratch_.begin(), ctlScratch_.end());
+        if (!endpointPool_.empty()) {   // L22 fix 2: a recycled endpoint string (capacity kept)
+            d.endpoint = std::move(endpointPool_.back());
+            endpointPool_.pop_back();
+        }
+        if (routeOfFrame(h.op, ctlScratch_.data(), ctlScratch_.size(), d.routeTopic, d.routePartition)) {
+            const RouteHint& hint = routeHints_[routeSlot_(d.routeTopic, d.routePartition)];
+            if (hint.topic == d.routeTopic && hint.partition == d.routePartition && !hint.endpoint.empty()) {
+                d.endpoint.assign(hint.endpoint);   // starts on the remembered leader, not the seed
+                d.hinted = true;
+                ++routeStatsDuty_.hits; routeStatsDirty_ = true;
+            }
+        } else {
+            d.routeTopic = -1;
+            d.routePartition = -1;
+        }
         DdlOfferedOn on;
-        switch (offerDdl_(d, nowNs, on)) {
+        auto offered = offerDdl_(d, nowNs, on);
+        if (d.hinted && offered != transport::AeronTransport::OfferResult::Accepted) {
+            // The remembered node's session is not up (it may be the node that died): never wait on it - the seed redirects.
+            forgetRouteHint_(d);
+            d.endpoint.clear();
+            d.hinted = false;
+            offered = offerDdl_(d, nowNs, on);
+        }
+        switch (offered) {
         case transport::AeronTransport::OfferResult::Accepted: d.retry = DdlSent{0, on}; break;
         case transport::AeronTransport::OfferResult::Retry:    d.retry = DdlUnsentOnSeed{}; break;   // the pump re-offers
         case transport::AeronTransport::OfferResult::Fatal:
@@ -2023,8 +2247,20 @@ void Client::completeCtl_(PendingCtl& p, OpStatus st, int64_t value, int64_t aux
     c.errorCode = errorCode;
     c.reserved0 = reserved0;   // GetTopicSchema: partitionCount (Phase 2b C)
     // Catalog history: a DDL reports its generated requestId's lo (requestIdOf).
-    if (const auto* d = std::get_if<RoutedCtlPending>(&p.ddl)) c.reserved0 = d->requestLo;
+    if (const auto* d = std::get_if<RoutedCtlPending>(&p.ddl); d != nullptr && isDdlOp(p.op)) c.reserved0 = d->requestLo;   // Task 14a: the lease ops carry their own reserved0
+    if (p.multiCount != 0) {   // Task 15: the terminal of a leaseKeepAliveBatch returns the credit of every unanswered entry plus its own
+        c.reserved0 = kLeaseKeepAliveTerminal;
+        p.target.reservedBytes = 48u * (1u + static_cast<uint32_t>(p.multiCount - p.multiAnswered));
+    }
     deliver_(p.target, c, payload, ov);
+    if (auto* rp = std::get_if<RoutedCtlPending>(&p.ddl); rp != nullptr && rp->frame.capacity() != 0 && framePool_.size() < kCtlTableCap) {
+        framePool_.push_back(std::move(rp->frame));   // Task 14a: recycle (the pool's capacity is reserved in the ctor)
+    }
+    if (auto* rp = std::get_if<RoutedCtlPending>(&p.ddl); rp != nullptr && rp->endpoint.capacity() != 0 && endpointPool_.size() < kCtlTableCap) {
+        rp->endpoint.clear();
+        if (rp->endpoint.capacity() < kRouteEndpointReserve) rp->endpoint.reserve(kRouteEndpointReserve);   // cold: after a followed Redirect
+        endpointPool_.push_back(std::move(rp->endpoint));   // L22 fix 2: recycle, as the frame
+    }
 }
 
 Client::PendingCtl Client::takeCtl_(std::size_t i) {
@@ -2075,7 +2311,8 @@ int Client::driveAwaitingSeed_() {
             continue;
         }
         if (pendingCtl_[i].op == OpKind::DefineTopic &&
-            defineKeyFeaturesTooOld(a->frame, agent_.sessionBrokerVersion(0))) {
+            (defineKeyFeaturesTooOld(a->frame, agent_.sessionBrokerVersion(0)) ||
+             defineLeaseTooOld(a->frame, agent_.sessionBrokerVersion(0)))) {
             PendingCtl dead = takeCtl_(i);
             completeCtl_(dead, OpStatus::BrokerTooOld, ddlNoValue(dead.op));
             ++work;
@@ -2214,7 +2451,11 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view message, int64_t now
     }
     // The leader's own session (the seed never moves for a DDL: it carries the
     // data ops / subscriptions); the same frame, so the same requestId.
+    ++routeStatsDuty_.redirects; routeStatsDirty_ = true;
+    forgetRouteHint_(d);   // the node it was sent to (a remembered one included) is not the leader any more
+    d.hinted = false;
     d.endpoint = toChannel(std::string(endpoint));
+    learnRouteHint_(d);
     if (redirect.responsePort != 0) agent_.setSessionResponsePort(d.endpoint, redirect.responsePort);
     DdlOfferedOn on;
     switch (offerDdl_(d, nowNs, on)) {
@@ -2242,6 +2483,10 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view message, int64_t now
 void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs, uint16_t failCode) {
     PendingCtl& p = pendingCtl_[i];
     RoutedCtlPending& d = std::get<RoutedCtlPending>(p.ddl);
+    if (std::holds_alternative<DdlSent>(d.retry) || std::holds_alternative<DdlNotLeaderSeen>(d.retry)) {   // an answer to an in-flight request
+        forgetRouteHint_(d);
+        if (d.hinted) { d.endpoint.clear(); d.hinted = false; }   // a remembered node that is no leader: the resend goes to the seed
+    }
     int     redirects   = 0;
     int64_t budgetEndNs = 0;
     int64_t backoffNs   = 0;
@@ -2323,7 +2568,9 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                 continue;
             }
             if (agent_.connectedEpoch(on->sessionIndex) != on->sessionEpoch) [[unlikely]] {
+                forgetRouteHint_(*d);   // its node's session is gone: the next op must not start there
                 d->endpoint.clear();   // toward the seed: it redirects to the current leader
+                d->hinted = false;
                 setDdlRetry_(*d, DdlAwaitingResend{redirects, budgetEndNs, backoffNs, nowNs,
                                                    DdlResendCause::SessionLost});
                 ++work;
@@ -2432,8 +2679,10 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
             heldRedirects   = hld->redirects;
             heldBudgetEndNs = hld->budgetEndNs;
         } else if (!std::holds_alternative<DdlUnsentOnSeed>(d->retry)) { ++i; continue; }
-        if ((p.op == OpKind::DefineTopic && defineKeyFeaturesTooOld(d->frame, agent_.sessionBrokerVersion(0))) ||
-            checkedWritesReadTooOld(p.op, agent_.sessionBrokerVersion(0))) {
+        if ((p.op == OpKind::DefineTopic && (defineKeyFeaturesTooOld(d->frame, agent_.sessionBrokerVersion(0)) ||
+                                         defineLeaseTooOld(d->frame, agent_.sessionBrokerVersion(0)))) ||
+            checkedWritesReadTooOld(p.op, agent_.sessionBrokerVersion(0)) ||
+            leaseOpTooOld(p.op, agent_.sessionBrokerVersion(0))) {
             PendingCtl dead = takeCtl_(i);   // queued before the seed connected: the version is known now
             completeCtl_(dead, OpStatus::BrokerTooOld, ddlNoValue(dead.op));
             ++work;
@@ -2698,6 +2947,8 @@ void Client::sweepControl_(int64_t nowNs) {
     }
     for (std::size_t i = 0; i < pendingCtl_.size();) {
         if (nowNs >= pendingCtl_[i].deadlineNs) {
+            // L22 fix 2: an op that timed out toward a remembered node got no answer from it: forget the hint, the next op asks the seed.
+            if (const auto* rp = std::get_if<RoutedCtlPending>(&pendingCtl_[i].ddl)) forgetRouteHint_(*rp);
             PendingCtl p = takeCtl_(i);  // removed first: the delivery may issue a new op
             completeCtl_(p, OpStatus::Timeout);
         } else {
@@ -3021,6 +3272,29 @@ DefineTopicResult Client::defineTopicAndWait(std::string_view name, uint32_t par
     return result;
 }
 
+TopicSchemaResult Client::openLeaseSchemaAndWait(std::string_view name, uint64_t requestedFingerprint,
+                                                 std::chrono::nanoseconds timeout) {
+    TopicSchemaResult result;
+    andWait_("openLeaseTopic()", timeout, 64u << 10,
+             [&](Completions& q, Token t) { return openLeaseTopicSchema(name, requestedFingerprint, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("openLeaseTopic()", c, p);
+                 result.topicId          = static_cast<int32_t>(c.value);
+                 result.version          = static_cast<uint16_t>(c.aux);
+                 result.errorCode        = c.errorCode;
+                 result.partitionCount   = static_cast<int32_t>(c.reserved0);
+                 result.hasKeyFeatures   = schemaHasKeyFeatures(c);
+                 if (result.hasKeyFeatures) result.keyFeatures = schemaKeyFeaturesOf(c, p);
+                 result.lease            = schemaLeaseOf(c, p);
+                 result.leaseViewTopicId = schemaLeaseViewTopicIdOf(c, p);
+                 if (c.status == OpStatus::Ok) {
+                     const auto blob = schemaBlobOf(c, p);
+                     result.descriptorBlob.assign(blob.begin(), blob.end());
+                 }
+             });
+    return result;
+}
+
 TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, std::chrono::nanoseconds timeout) {
     return getTopicSchemaAndWait(name, /*requestedFingerprint=*/0, timeout);
 }
@@ -3041,8 +3315,9 @@ std::string_view lineageErrorName(uint16_t code) noexcept {
         "TransientLogFull", "PartitionDataReset", "", "", "", "", "" /* 44..48: authErrorName (#225) */, "RecordEgressUnavailable", "UnstableOffsetCommit",
         "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused",
         "ConstraintViolation", "KeyExists", "KeyNotFound", "AutoIncrementExhausted", "ViewKeyExpressionInvalid",
-        "ViewConstraintInvalid", "ViewUniqueInvalid", "TxnTooLarge", "TxnConflict"};
-    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::TxnConflict) + 1,
+        "ViewConstraintInvalid", "ViewUniqueInvalid", "TxnTooLarge", "TxnConflict",
+        "LeaseNotFound", "LeaseLimitExceeded", "LeaseTtlTooLarge"};
+    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::LeaseTtlTooLarge) + 1,
                   "lineageErrorName: one name per rune::protocol::client::ErrorCode");
     if (const char* auth = authErrorName(code)) return auth;   // #225: the one source of the 44..48 names
     return code < std::size(kNames) ? kNames[code] : std::string_view("UnknownErrorCode");
@@ -3143,6 +3418,8 @@ TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, uint64_t 
                  result.partitionCount = static_cast<int32_t>(c.reserved0);  // Phase 2b C
                 result.hasKeyFeatures = schemaHasKeyFeatures(c);
                 if (result.hasKeyFeatures) result.keyFeatures = schemaKeyFeaturesOf(c, p);
+                result.lease          = schemaLeaseOf(c, p);
+                result.leaseViewTopicId = schemaLeaseViewTopicIdOf(c, p);
                  if (c.status == OpStatus::Ok) {
                     const auto blob = schemaBlobOf(c, p);
                     result.descriptorBlob.assign(blob.begin(), blob.end());
@@ -3626,6 +3903,9 @@ int Client::dutyCycle(int64_t nowNs) {
     // 2. ProduceResponses → hub with plain calls (O(1) ordinal routing).
     work += routeBufferedAcks_();
 
+    // 2b. Task 15: lease-session guards trip BEFORE the producers drain/flush, so a write accepted after a deadline never leaves.
+    work += leaseGuards_.trip(nowNs);
+
     // 3. Producer drain/flush through AgentProduceSink (no per-cycle std::function).
     work += producerDuty_(nowNs);
 
@@ -3846,6 +4126,7 @@ void Client::revisitSkippedMdc_() noexcept {
 }
 
 void Client::syncSeedSession_() noexcept {
+    publishRouteStats_();
     const auto& m = agent_.seedSession().machine;
     const session::SessionState st  = m.state();
     const int64_t               sid = m.sessionId();
@@ -3903,7 +4184,7 @@ int Client::routeBufferedAcks_() {
     bool notLeader = false;
     for (const auto& a : acks) {
         producerHub_.onProduceResponse(a.correlationId, a.baseOffset, a.errorCode, a.logStartOffset, a.hasVerdicts,
-                                       agent_.verdictBytes(a), a.assignedBase);
+                                       agent_.verdictBytes(a), a.assignedBase, agent_.leaseBytes(a));
         notLeader |= a.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
     }
     agent_.clearProduceAcks();
@@ -4757,6 +5038,21 @@ void Client::onEgressFrame(codec::TemplateId tid,
             }
         }
 
+        // Lease topics: a TRANSIENT lease topic's push subscription whose cursor fell below the ring start is ENDED by the
+        // broker (never skipped ahead): the same scoped shape with PartitionDataReset.  It finishes with brokerErrorCode 43
+        // and is not re-armed (the owner - a LeaseWatch - rescans).  The Unsubscribe it sends releases the worker's entry.
+        if (opt->correlationId == 0 && ec == rpc::ErrorCode::PartitionDataReset) [[unlikely]] {
+            if (const int64_t subId = subscriptionOfScopedError(opt->message); subId > 0) {
+                const auto snap = agent_.stateAndSessionId();
+                (void)subscriberHub_.failActiveSubscription(
+                    subId, SubscriptionFailReason::DataReset, nextCorrId_++, snap.sessionId,
+                    [this](int32_t /*streamId*/, const uint8_t* fbuf, std::size_t flen) -> bool {
+                        return agent_.submitSend(fbuf, flen);
+                    },
+                    static_cast<uint16_t>(rpc::ErrorCode::PartitionDataReset));
+            }
+        }
+
         std::string msg(opt->message);
         if (msg.empty()) {
             msg = "ErrorResponse code: " + std::to_string(opt->code);
@@ -5030,8 +5326,16 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (!opt) break;
 
         if (const std::size_t i = findCtl_(opt->correlationId);
-            i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::GetTopicSchema) {
+            i < pendingCtl_.size() &&
+            (pendingCtl_[i].op == OpKind::GetTopicSchema || pendingCtl_[i].op == OpKind::OpenLeaseTopic)) {
             PendingCtl p = takeCtl_(i);
+            if (p.op == OpKind::OpenLeaseTopic && opt->errorCode == 0 && !opt->hasLease) {
+                // Task 14a (L3): the topic is not a lease topic - refused here, nothing lease-shaped is ever sent for it.
+                constexpr std::string_view kWhy = "openLeaseTopic: the topic is not a lease topic";
+                completeCtl_(p, OpStatus::InvalidArgument, 0, 0, 0,
+                             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()), kWhy.size()));
+                break;
+            }
             if (opt->errorCode == 0 && opt->version != 0) {   // version 0: an untyped topic's kind probe - nothing to cache
                 // Task 11 / F8c C3: the per-topic schema cache is written HERE,
                 // on the duty thread (was an app-thread write under mtx_).
@@ -5044,9 +5348,16 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 payload.resize(payload.size() + rune::protocol::kTopicKeyFeaturesWireLen);
                 rune::protocol::putTopicKeyFeatures(payload.data() + payload.size() - rune::protocol::kTopicKeyFeaturesWireLen,
                                                     opt->keyFeatures);
+                if (opt->hasLease) {
+                    payload.resize(payload.size() + kSchemaLeaseBlockBytes);
+                    uint8_t* lb = payload.data() + payload.size() - kSchemaLeaseBlockBytes;
+                    rune::protocol::encodeLeaseSpec(opt->lease, lb);
+                    const uint32_t lv = static_cast<uint32_t>(opt->leaseViewTopicId);   // Task 14a: after the spec, i32 LE
+                    for (int b = 0; b < 4; ++b) lb[rune::protocol::kLeaseSpecBytes + b] = static_cast<uint8_t>(lv >> (8 * b));
+                }
             }
             completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
-                         opt->topicId, schemaAuxOf(opt->version, opt->hasKeyFeatures),
+                         opt->topicId, schemaAuxOf(opt->version, opt->hasKeyFeatures, opt->hasLease),
                          opt->errorCode, payload,
                          detail::CompletionRing::Overflow::TooLarge,
                          static_cast<uint32_t>(opt->partitionCount));  // Phase 2b C (<=0 = not reported)
@@ -5209,6 +5520,82 @@ void Client::onEgressFrame(codec::TemplateId tid,
         break;
     }
 
+    // ---- Task 14a: LeaseKeepAliveResponse (97).  A ONE-entry keepAliveOnce completes on the FIRST answering frame; every later
+    // frame for its correlation id finds no pending op (findCtl_ == end) and is DROPPED (client rule 112fafb1 item 9).
+    case codec::TemplateId::LeaseKeepAliveResponse: {
+        namespace rpc = rune::protocol::client;
+        auto opt = rpc::LeaseKeepAliveResponse::decode(buf, len);
+        if (!opt) break;
+        if (const std::size_t i = findCtl_(opt->correlationId);
+            i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::LeaseKeepAlive) {
+            if (pendingCtl_[i].multiCount != 0) {
+                onKeepAliveBatchAnswer_(i, *opt);
+                break;
+            }
+            uint16_t idx = 0, code = 0;
+            uint64_t ttl = 0;
+            const uint8_t* e0 = opt->entryBytes.data();   // count >= 1 (decode): the first entry answers the one request entry
+            idx  = rpc::detail::getLE16(e0, 0);
+            code = rpc::detail::getLE16(e0, 2);
+            ttl  = static_cast<uint64_t>(rpc::detail::getLE64(e0, 4));
+            if (idx != 0 && idx != rpc::kLeaseWholeRequest) break;   // not an answer to our one entry: ignored
+            if (code == static_cast<uint16_t>(rpc::ErrorCode::NotLeader) ||
+                code == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // routed: re-sent within the retry budget
+                onDdlNotLeader_(i, {}, now(), code);
+                break;
+            }
+            PendingCtl p = takeCtl_(i);
+            completeCtl_(p, code == 0 ? OpStatus::Ok : OpStatus::BrokerError, 0, static_cast<int64_t>(ttl), code);
+        }
+        break;
+    }
+
+    // ---- Task 14a: LeaseTimeToLiveResponse (99): payload = 32 LE bytes {granted u64, remaining i64, version i64, holder u64}.
+    case codec::TemplateId::LeaseTimeToLiveResponse: {
+        namespace rpc = rune::protocol::client;
+        auto opt = rpc::LeaseTimeToLiveResponse::decode(buf, len);
+        if (!opt) break;
+        if (const std::size_t i = findCtl_(opt->correlationId);
+            i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::LeaseTimeToLive) {
+            if (opt->code == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable) ||
+                opt->code == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {
+                onDdlNotLeader_(i, {}, now(), opt->code);
+                break;
+            }
+            PendingCtl p = takeCtl_(i);
+            uint8_t body[32];
+            rpc::detail::putLE64(body, 0, static_cast<int64_t>(opt->grantedTtlMs));
+            rpc::detail::putLE64(body, 8, opt->remainingMs);
+            rpc::detail::putLE64(body, 16, opt->version);
+            rpc::detail::putLE64(body, 24, static_cast<int64_t>(opt->holder));
+            completeCtl_(p, opt->code == 0 ? OpStatus::Ok : OpStatus::BrokerError, opt->code == 0 ? opt->version : 0,
+                         opt->code == 0 ? opt->remainingMs : 0, opt->code,
+                         opt->code == 0 ? std::span<const uint8_t>(body, 32) : std::span<const uint8_t>{});
+        }
+        break;
+    }
+
+    // ---- Task 14a: ScanLeasesResponse (101): value = asOfOffset, aux = lastHash bits, reserved0 = rowCount | done << 31.
+    case codec::TemplateId::ScanLeasesResponse: {
+        namespace rpc = rune::protocol::client;
+        auto opt = rpc::ScanLeasesResponse::decode(buf, len);
+        if (!opt) break;
+        if (const std::size_t i = findCtl_(opt->correlationId);
+            i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::ScanLeases) {
+            if (opt->code == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable) ||
+                opt->code == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {
+                onDdlNotLeader_(i, {}, now(), opt->code);
+                break;
+            }
+            PendingCtl p = takeCtl_(i);
+            const uint32_t meta = static_cast<uint32_t>(opt->rowCount) | (static_cast<uint32_t>(opt->done) << 31);
+            completeCtl_(p, opt->code == 0 ? OpStatus::Ok : OpStatus::BrokerError, opt->asOfOffset,
+                         static_cast<int64_t>(opt->lastHash), opt->code, opt->rows,
+                         detail::CompletionRing::Overflow::TooLarge, meta);
+        }
+        break;
+    }
+
     // ---- StatsResponse (92): the payload is everything after count; value = count ----
     case codec::TemplateId::StatsResponse: {
         namespace rpc = rune::protocol::client;
@@ -5327,6 +5714,7 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool 
         hk.sendAndWait = &Client::groupAndWaitTrampoline_;   // P5-10: a timed-out or closed sendAndWait is a Completion
         hk.release    = &Client::hubCommandTrampoline_;  // C7: HandleRelease
         hk.pinTarget  = &Client::pinTargetTrampoline_;   // Phase 2b F Task 8: txn ops read from the producer ring
+        hk.guardBind  = &Client::guardBindTrampoline_;   // Task 15: kMsgGuardBind, applied FIFO in the producer drain
         impl->setHooks(hk);
     }
 
@@ -5682,6 +6070,7 @@ int Client::reapReleases_() noexcept {
             case K::Producer: {
                 auto* p = static_cast<producer::ProducerImpl*>(r.impl);
                 if (p->releasable()) {
+                    leaseGuards_.unbindProducer(*p);   // Task 15: a lease guard must not keep a dangling producer
                     producerHub_.remove(p);
                     if (p->detachDuty()) delete p;  // the handle let go first
                     done = true;
@@ -6448,6 +6837,102 @@ void Client::onGroupFetchRefused_(int64_t corrId, bool redirect, std::string_vie
     (void)groupConsumerHub_.reconcileFetch();
 }
 
+void Client::onKeepAliveBatchAnswer_(std::size_t i, const rune::protocol::client::LeaseKeepAliveResponse& r) {
+    namespace rpc = rune::protocol::client;
+    const uint16_t n = pendingCtl_[i].multiCount;
+    // A routing refusal of the whole request, before any entry was answered: re-sent within the retry budget (like the one-entry form).
+    if (pendingCtl_[i].multiAnswered == 0 && r.count >= 1) {
+        const uint16_t idx0  = rpc::detail::getLE16(r.entryBytes.data(), 0);
+        const uint16_t code0 = rpc::detail::getLE16(r.entryBytes.data(), 2);
+        if (idx0 == rpc::kLeaseWholeRequest && (code0 == static_cast<uint16_t>(rpc::ErrorCode::NotLeader) ||
+                                                code0 == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable))) {
+            onDdlNotLeader_(i, {}, now(), code0);
+            return;
+        }
+    }
+    auto deliverEntry = [&](uint16_t idx, uint16_t code, uint64_t ttl) {
+        PendingCtl& p = pendingCtl_[i];
+        p.multiBits[idx >> 6] |= uint64_t{1} << (idx & 63u);
+        ++p.multiAnswered;
+        Completion c;
+        c.token     = p.token;
+        c.aux       = static_cast<int64_t>(ttl);
+        c.op        = OpKind::LeaseKeepAlive;
+        c.status    = code == 0 ? OpStatus::Ok : OpStatus::BrokerError;
+        c.errorCode = code;
+        c.reserved0 = idx;
+        DutyTarget t = p.target;
+        t.counted       = false;   // the op's one pin is released by its terminal
+        t.reservedBytes = 48u;
+        deliver_(t, c, {}, detail::CompletionRing::Overflow::TooLarge);
+    };
+    for (uint16_t k = 0; k < r.count; ++k) {
+        const uint8_t* e = r.entryBytes.data() + std::size_t{k} * rpc::LeaseKeepAliveResponse::kEntryBytes;
+        const uint16_t idx  = rpc::detail::getLE16(e, 0);
+        const uint16_t code = rpc::detail::getLE16(e, 2);
+        const uint64_t ttl  = static_cast<uint64_t>(rpc::detail::getLE64(e, 4));
+        if (idx == rpc::kLeaseWholeRequest) {   // answers every entry not yet answered with this code
+            for (uint16_t x = 0; x < n; ++x)
+                if ((pendingCtl_[i].multiBits[x >> 6] & (uint64_t{1} << (x & 63u))) == 0) deliverEntry(x, code, ttl);
+            continue;
+        }
+        if (idx >= n) continue;   // out of range: dropped
+        if ((pendingCtl_[i].multiBits[idx >> 6] & (uint64_t{1} << (idx & 63u))) != 0) continue;   // a duplicate: dropped
+        deliverEntry(idx, code, ttl);
+    }
+    if (pendingCtl_[i].multiAnswered == n || r.final != 0) {
+        const bool all = pendingCtl_[i].multiAnswered == n;
+        PendingCtl p = takeCtl_(i);
+        completeCtl_(p, all ? OpStatus::Ok : OpStatus::BrokerError);
+    }
+}
+
+void Client::applyGuardCommand_(const detail::HubCommand& cmd) {
+    using Op = detail::HubCommand::Op;
+    const auto sid  = static_cast<uint32_t>(cmd.handle);
+    const auto lo   = static_cast<uint32_t>(static_cast<uint64_t>(cmd.a) & 0xFFFFFFFFu);
+    const auto hi   = static_cast<uint32_t>(static_cast<uint64_t>(cmd.a) >> 32);
+    auto unpin = [this](const detail::OpTarget& t) {
+        if (!t.counted || t.cqRef == kNoCqRef) return;
+        const uint32_t idx = cqRefIndex(t.cqRef);
+        if (idx >= cqSlots_.size()) return;
+        --cqSlots_[idx].targets;
+        maybeRecycleCqSlot_(idx);
+    };
+    switch (cmd.op) {
+    case Op::GuardReserve: {
+        detail::OpTarget t = detail::decodeTargetWords(cmd.b, cmd.c);
+        t.counted = false;
+        pinCqSlot_(t);   // the block keeps the session queue's slot out of reuse until GuardRelease
+        leaseGuards_.reserve(sid, lo, hi, t);
+        if (t.counted && !leaseGuards_.has(sid)) unpin(t);
+        return;
+    }
+    case Op::GuardArm:     leaseGuards_.arm(sid, lo, hi, static_cast<uint32_t>(cmd.b), cmd.c, now()); return;
+    case Op::GuardEnd:     leaseGuards_.end(sid, lo, hi); return;
+    case Op::GuardRelease: unpin(leaseGuards_.release(sid)); return;
+    case Op::GuardAck:     leaseGuards_.ack(sid, static_cast<uint64_t>(cmd.a)); return;
+    default: return;
+    }
+}
+
+void Client::guardBindTrampoline_(void* ctx, producer::ProducerImpl& impl, uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq,
+                                  int64_t atRiskNs) noexcept {
+    auto* c = static_cast<Client*>(ctx);
+    c->leaseGuards_.bind(sid, slot, gen, armSeq, atRiskNs, impl, c->now());
+}
+
+bool Client::submitGuardCommand(const detail::HubCommand& cmd) {
+    if (agent_.commandRingClosed()) return false;
+    const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
+    if (onDuty) {   // the duty thread (the Invoker owner, in or outside a cycle) owns the guard state: apply in place
+        applyHubCommandDirect_(cmd);
+        return true;
+    }
+    if (cfg_.runnerMode == RunnerMode::Invoker) return false;
+    return agent_.submitHubCommand(cmd) == agent::ClientAgent::Submit::Accepted;
+}
+
 void Client::applyHubCommand_(const detail::HubCommand& cmd) {
     syncSeedSession_();  // fix4 I-1: the hubs act on the session's CURRENT state
     using Op = detail::HubCommand::Op;
@@ -6471,6 +6956,13 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
         return;
     case Op::ClientSetCallback:
         applySetCallback_(static_cast<int>(cmd.a), reinterpret_cast<void*>(cmd.handle));
+        return;
+    case Op::GuardReserve:
+    case Op::GuardArm:
+    case Op::GuardEnd:
+    case Op::GuardRelease:
+    case Op::GuardAck:
+        applyGuardCommand_(cmd);
         return;
     default:
         break;

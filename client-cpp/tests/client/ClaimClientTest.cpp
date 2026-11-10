@@ -87,7 +87,7 @@ struct Rig {
 std::vector<uint8_t> bytes(std::string_view s) { return {s.begin(), s.end()}; }
 
 void fill(std::span<uint8_t> b, std::string_view s) {
-    std::memcpy(b.data(), s.data(), std::min(b.size(), s.size()));
+    if (!s.empty()) std::memcpy(b.data(), s.data(), std::min(b.size(), s.size()));
 }
 
 std::vector<std::string> valuesOf(const test_support::InvokerGateway& gw, int32_t partition) {

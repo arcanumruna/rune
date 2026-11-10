@@ -29,7 +29,8 @@ namespace rune::node {
 // consumes the alterable keys, the replica's construction-time config is never
 // touched):
 //   kPolicyMsgType: [topicId:i32][count:u16][(key:u8, value:i64) * count]
-//   key = rune::protocol::ConfigKey's byte (RetentionMs .. MaxCompactionLagMs;
+//   key = rune::protocol::ConfigKey's byte (RetentionMs .. MaxCompactionLagMs, keys 1..6; keys 7..12 are the lease keys
+//   and the cleaner filters to 1..6, lease Task 3;
 //   MinCleanableDirtyRatioPpm in parts per million).  Entries MERGE into the
 //   topic's override (an AlterTopicConfig names only the keys it changes);
 //   count == 0 CLEARS the topic's override (its drop).  Idempotent.

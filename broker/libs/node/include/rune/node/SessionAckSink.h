@@ -100,6 +100,7 @@
 #include <array>
 #include <cassert>
 #include <bit>
+#include <stdexcept>
 #include <cstdint>
 #include <limits>
 #include <cstring>
@@ -116,7 +117,7 @@ namespace rune::node {
 
 inline constexpr uint32_t kNoVerdictRun = 0xFFFF'FFFFu;
 
-struct AckEntry {
+struct alignas(64) AckEntry {
     int64_t sessionId     = 0;
     int64_t correlationId = 0;
     int64_t baseOffset    = 0;
@@ -133,77 +134,114 @@ struct AckEntry {
     /// Unknown-session hold (I1): the lifecycle-ring producer position sampled
     /// at the first flush that saw this ack with no session; -1 = not held.
     int64_t sessionPos    = -1;
-    /// D6: with errorCode == UnknownProducerId, the partition's log start
-    /// (ProduceResponse.logStartOffset); -1 = not carried.
-    int64_t logStartOffset = -1;
-    /// Client 17 (checked writes): the key a key-0 create was assigned (0 = none), and the verdict trailer of a View ack
-    /// (verdictCount entries at verdictRun in the worker's arena; kNoVerdictRun = none).  A session below 17 never sees them.
-    uint64_t assignedBase  = 0;
+    /// ONE slot for the two values that are never meaningful together (keeps the entry one cache line): errorCode == 0 = the
+    /// key a key-0 create was assigned (0 = none, Client 17); errorCode != 0 = the log start of an UnknownProducerId (D6) or the
+    /// retry-after of a Throttled (-1 = none).  The error code decides; use the accessors.
+    int64_t aux_           = -1;
+    /// Client 17 (checked writes): the verdict trailer of a View ack (verdictCount entries at verdictRun in the worker's
+    /// arena; kNoVerdictRun = none).  A session below 17 never sees it.
     uint32_t verdictRun    = kNoVerdictRun;
     uint16_t verdictCount  = 0;
     uint8_t  hasVerdicts   = 0;
+    /// Client 18 (lease topics): the lease trailer, 2 x leaseCount units at leaseRun (kNoVerdictRun = none).
+    uint32_t leaseRun      = kNoVerdictRun;
+    uint16_t leaseCount    = 0;
+    uint8_t  hasLease      = 0;
+
+    [[nodiscard]] int64_t assignedBase() const noexcept   { return errorCode == 0 && aux_ > 0 ? aux_ : 0; }
+    [[nodiscard]] int64_t logStartOffset() const noexcept { return errorCode != 0 ? aux_ : -1; }
+    void setAssignedBase(int64_t v) noexcept   { aux_ = v; }   ///< only on an ok ack
+    void setLogStartOffset(int64_t v) noexcept { aux_ = v; }   ///< only on an error ack
 };
+static_assert(sizeof(AckEntry) == 64, "AckEntry is one cache line");
 
 inline constexpr uint32_t kVerdictAckArenaEntries = 65536;
+static_assert(std::has_single_bit(kVerdictAckArenaEntries), "the arena is a power of two");
 
-/// The verdict trailers of the acks queued in a sink: 8-byte entries {recordIndex u16, code u16, constraintId u32} in a ring,
-/// plus a ring of run records.  A run never wraps (one that does not fit before the end starts at 0 when the head allows) and
-/// is freed when its ack is claimed, dropped or failed; the head advances over freed runs, so the arena frees in allocation
-/// order.  Both tables are allocated once, at construction.
+/// The verdict and lease trailers of the acks queued in a sink: 8-byte units in a binary buddy allocator over a power-of-two
+/// table.  A run is the block at its first unit (the run id); it is freed when its ack is claimed, dropped or failed, in ANY
+/// order, and a freed block merges with its free buddy, so one ack held for a long time (a parked duplicate, a Lost session)
+/// never blocks the space freed after it.  A request of n units takes the 2^ceil(log2 n) block; reserve and free are
+/// O(log capacity).  Every table is allocated once, at construction.
 class VerdictAckArena {
 public:
-    explicit VerdictAckArena(uint32_t entries = kVerdictAckArenaEntries, uint32_t maxRuns = 32768)
-        : bytes_(std::size_t{entries} * 8), runs_(maxRuns), capacity_(entries) {}
+    explicit VerdictAckArena(uint32_t entries = kVerdictAckArenaEntries)
+        : bytes_(std::size_t{entries} * 8), next_(entries), prev_(entries), count_(entries), order_(entries), state_(entries, kInterior),
+          capacity_(entries) {
+        assert(entries != 0 && (entries & (entries - 1)) == 0 && "the arena is a power of two");
+        while ((1u << maxOrder_) < entries) ++maxOrder_;
+        heads_.fill(kNone);
+        push_(0, maxOrder_);
+    }
 
-    /// False = full: the caller defers the release.
+    /// False = no free block of the size: the caller defers the release.
     [[nodiscard]] bool reserveVerdicts(uint16_t n, uint32_t& run) noexcept {
-        if (runCount_ == runs_.size() || n > capacity_) return false;
-        uint32_t start;
-        if (runCount_ == 0) {
-            head_ = tail_ = start = 0;
-            wrapped_ = false;
-        } else if (!wrapped_) {
-            if (tail_ + n <= capacity_) start = tail_;
-            else if (n <= head_) { start = 0; wrapped_ = true; }
-            else return false;
-        } else {
-            if (tail_ + n > head_) return false;
-            start = tail_;
+        const uint32_t want = n == 0 ? 1u : n;
+        if (want > capacity_) return false;
+        uint8_t k = 0;
+        while ((1u << k) < want) ++k;
+        uint8_t j = k;
+        while (j <= maxOrder_ && heads_[j] == kNone) ++j;
+        if (j > maxOrder_) return false;
+        const uint32_t start = heads_[j];
+        unlink_(start, j);
+        while (j > k) {   // split: the upper half stays free
+            --j;
+            push_(start + (1u << j), j);
         }
-        const uint32_t slot = (runHead_ + runCount_) % static_cast<uint32_t>(runs_.size());
-        runs_[slot] = Run{start, n, false};
-        ++runCount_;
-        tail_ = start + n;
+        order_[start] = k;
+        state_[start] = kUsed;
+        count_[start] = n;
         used_ += n;
-        run = slot;
+        run = start;
         return true;
     }
     [[nodiscard]] std::span<uint8_t> entries(uint32_t run) noexcept {
-        return {bytes_.data() + std::size_t{runs_[run].start} * 8, std::size_t{runs_[run].count} * 8};
+        return {bytes_.data() + std::size_t{run} * 8, std::size_t{count_[run]} * 8};
     }
+    /// Idempotent: a run already freed (or never reserved) is a no-op.
     void free(uint32_t run) noexcept {
-        Run& r = runs_[run];
-        if (r.freed) return;
-        r.freed = true;
-        used_ -= r.count;
-        while (runCount_ != 0 && runs_[runHead_].freed) {
-            runHead_ = (runHead_ + 1) % static_cast<uint32_t>(runs_.size());
-            --runCount_;
+        if (run >= capacity_ || state_[run] != kUsed) return;
+        used_ -= count_[run];
+        uint32_t start = run;
+        uint8_t k = order_[run];
+        state_[run] = kInterior;
+        while (k < maxOrder_) {
+            const uint32_t buddy = start ^ (1u << k);
+            if (state_[buddy] != kFree || order_[buddy] != k) break;
+            unlink_(buddy, k);
+            state_[buddy] = kInterior;
+            start = std::min(start, buddy);
+            ++k;
         }
-        if (runCount_ == 0) { head_ = tail_ = 0; wrapped_ = false; return; }
-        const uint32_t h = runs_[runHead_].start;
-        if (h < head_) wrapped_ = false;
-        head_ = h;
+        push_(start, k);
     }
     [[nodiscard]] std::size_t used() const noexcept { return used_; }
 
 private:
-    struct Run { uint32_t start, count; bool freed; };
-    std::vector<uint8_t> bytes_;
-    std::vector<Run>     runs_;
+    static constexpr uint32_t kNone = 0xFFFF'FFFFu;
+    static constexpr uint8_t  kInterior = 0, kFree = 1, kUsed = 2;   // state of a block's first unit
+    void push_(uint32_t start, uint8_t k) noexcept {
+        state_[start] = kFree;
+        order_[start] = k;
+        prev_[start] = kNone;
+        next_[start] = heads_[k];
+        if (heads_[k] != kNone) prev_[heads_[k]] = start;
+        heads_[k] = start;
+    }
+    void unlink_(uint32_t start, uint8_t k) noexcept {
+        if (prev_[start] != kNone) next_[prev_[start]] = next_[start];
+        else heads_[k] = next_[start];
+        if (next_[start] != kNone) prev_[next_[start]] = prev_[start];
+    }
+    std::vector<uint8_t>     bytes_;
+    std::vector<uint32_t>    next_, prev_;   // free-list links, indexed by a free block's first unit
+    std::vector<uint16_t>    count_;         // a used block's requested units
+    std::vector<uint8_t>     order_, state_;
+    std::array<uint32_t, 33> heads_{};
     uint32_t capacity_;
-    uint32_t head_ = 0, tail_ = 0, runHead_ = 0, runCount_ = 0, used_ = 0;
-    bool     wrapped_ = false;
+    uint8_t  maxOrder_ = 0;
+    uint32_t used_ = 0;
 };
 
 enum class PubFind : uint8_t { Pending, Ready, Error };
@@ -217,7 +255,7 @@ public:
     static constexpr std::size_t kMaxChannelSlots  = 256;              // announcements awaiting add()
     /// Bound: Worker.h (static_asserts there).  D8c fix round 1: 2 x the
     /// worker's reserve (owed ceiling + drain + poll = 16384) — the other half is
-    /// the gateway-routed share (Worker::kRoutedAckBudget).  48 B each (D6 logStartOffset): 1.5 MiB,
+    /// the gateway-routed share (Worker::kRoutedAckBudget).  64 B each (one cache line): 2 MiB,
     /// heap (setShardClient).
     static constexpr std::size_t kAckCapacity      = 32768;
     static constexpr std::size_t kMaxChannelBytes  = 255;
@@ -343,6 +381,15 @@ public:
         }
         if (!listed && !std::holds_alternative<PubFailed>(st)) unresolved_[unresolvedCount_++] = sessionId;
         return true;
+    }
+
+    /// The client version a session announced (D6), or -1 when this worker has not seen the announce of a POSITIVE session id (the gateway op
+    /// can reach the worker before the announce in the same pass).  Read by the lease write hook, which answers -1 with a
+    /// retriable code and only a KNOWN version below kClientVersionLeases with InvalidRequest.
+    [[nodiscard]] int32_t clientVersionOf(int64_t sessionId) const noexcept {
+        if (sessionId <= 0) return 0;   // an id that can never be announced is a definite answer, never a retry (a retry would hang)
+        const std::size_t idx = find_(sessionId);
+        return idx == kNone ? -1 : clientVersion_[idx];
     }
 
     /// NAT-safe egress (Task 6, cold): announce a RESPONSE-MODE session.  Like announce(), but no channel and no
@@ -492,8 +539,13 @@ public:
     /// Part 04: the verdict trailer of a View ack lives in the sink until the ack is claimed, dropped or failed.
     [[nodiscard]] bool reserveVerdicts(uint16_t n, uint32_t& run) noexcept { return verdicts_.reserveVerdicts(n, run); }
     [[nodiscard]] std::span<uint8_t> verdictEntries(uint32_t run) noexcept { return verdicts_.entries(run); }
+    /// Frees a run whose ack turned into an error before it was enqueued (an error ack never carries a trailer).
+    void freeVerdictRun(uint32_t run) noexcept { verdicts_.free(run); }
     [[nodiscard]] std::size_t verdictsUsedForTest() const noexcept { return verdicts_.used(); }
-    void resizeVerdictArenaForTest(uint32_t entries) { verdicts_ = VerdictAckArena(entries); }
+    void resizeVerdictArenaForTest(uint32_t entries) {
+        if (!std::has_single_bit(entries)) throw std::invalid_argument("resizeVerdictArenaForTest: the arena is a power of two");
+        verdicts_ = VerdictAckArena(entries);
+    }
     /// Acks claimed whole / offered because they exceed one claim (test visibility).
     [[nodiscard]] uint64_t claimFramesForTest() const noexcept { return claimedFrames_ - offerFramesForTest(); }
     [[nodiscard]] uint64_t offerFramesForTest() const noexcept {
@@ -597,7 +649,7 @@ private:
                         // 19/23) — ++*sendSeq happens inside sealRecordsFrame,
                         // so acks and Records draw from one monotonic
                         // sequence under the one b2c key, never two.
-                        const std::size_t plainLen = rune::protocol::client::ProduceResponse::encodedSizeFor(ver, a.hasVerdicts != 0, a.verdictCount);
+                        const std::size_t plainLen = rune::protocol::client::ProduceResponse::encodedSizeFor(ver, a.hasVerdicts != 0, a.verdictCount, a.hasLease != 0, a.leaseCount);
                         encode_(a, ver, ackPlainScratch_.data());
                         const std::size_t n = sealRecordsFrame(*sealCtx, ackPlainScratch_.data(), plainLen,
                                                                ackSealedScratch_.data(), ackSealedScratch_.size());
@@ -619,7 +671,7 @@ private:
                         pos = policy_.claim(r->pub, n,
                                             [&](uint8_t* dst) { std::memcpy(dst, ackSealedScratch_.data(), n); });
                     } else {
-                        pos = policy_.claim(r->pub, rune::protocol::client::ProduceResponse::encodedSizeFor(ver, a.hasVerdicts != 0, a.verdictCount),
+                        pos = policy_.claim(r->pub, rune::protocol::client::ProduceResponse::encodedSizeFor(ver, a.hasVerdicts != 0, a.verdictCount, a.hasLease != 0, a.leaseCount),
                                             [&](uint8_t* dst) { encode_(a, ver, dst); });
                     }
                     if (pos > 0) [[likely]] {
@@ -1364,12 +1416,15 @@ private:
         r.errorCode      = a.errorCode;
         r.partition      = a.partition;
         r.baseOffset     = a.baseOffset;
-        r.logStartOffset = a.logStartOffset;
+        r.logStartOffset = a.logStartOffset();
         // Client 17: encodeFor writes these only for a session at 17 or later.
-        r.assignedBase   = a.assignedBase;
+        r.assignedBase   = static_cast<uint64_t>(a.assignedBase());
         r.hasVerdicts    = a.hasVerdicts != 0;
         r.verdictCount   = a.verdictCount;
         if (a.verdictCount != 0) r.verdictBytes = verdicts_.entries(a.verdictRun);
+        r.hasLease       = a.hasLease != 0;
+        r.leaseCount     = a.leaseCount;
+        if (a.hasLease != 0) r.leaseBytes = verdicts_.entries(a.leaseRun);
         // Task 14 (D28): a Throttled retry-after only to a v14+ client (encodeFor answers it InvalidRequest), as the
         // gateway path does.
         if (a.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::Throttled) &&
@@ -1382,6 +1437,7 @@ private:
 
     void freeVerdicts_(const AckEntry& a) noexcept {
         if (a.verdictCount != 0) [[unlikely]] verdicts_.free(a.verdictRun);
+        if (a.hasLease != 0) [[unlikely]] verdicts_.free(a.leaseRun);
     }
 
     PubPolicy                                                        policy_;
@@ -1440,7 +1496,7 @@ private:
     // Task 23: fixed scratch for the ENCRYPTED ack-seal path (flushAcks_'s
     // seal branch). Unlike Records (RecordsSealScratch, a GROW-ONCE vector —
     // batches are unbounded), a ProduceResponse has a compile-time-bounded
-    // max size (kMaxEncodedSize: the 54 B client-17 frame plus a 4096-entry verdict trailer), so a fixed
+    // max size (kMaxEncodedSize: the 54 B client-17 frame plus either a 4096-entry verdict trailer or 2048 verdict and 2048 lease entries), so a fixed
     // std::array is strictly simpler than grow-once here and still Rule-4
     // zero-allocation (no vector, no resize, ever). One instance per sink
     // (one per worker — shared-nothing); reused for every sealed ack, one at

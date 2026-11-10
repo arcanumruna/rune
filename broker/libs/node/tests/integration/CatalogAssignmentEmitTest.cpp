@@ -5612,12 +5612,11 @@ TEST(LeaderMoveFenceRegression, AFencedMoveNeverDelaysAnotherPartitionsRecordsRe
     for (int32_t n : b.isr) if (n != b.leaderNode && n != L0) out = n;
     if (out < 0) for (int32_t n : b.isr) if (n != b.leaderNode) out = n;
     ASSERT_GE(out, 0);
-    ASSERT_TRUE(c.svc->onAlterIsr(shrinkOut(b, out)) || true);
     rune::replication::AlterIsrMsg m{};
     m.topicId = 1; m.partition = 0; m.leaderId = b.leaderNode; m.leaderEpoch = b.leaderEpoch;
     m.partitionEpoch = b.partitionEpoch; m.isrCount = 0;
     for (const int32_t n : b.isr) if (n != out) m.isr[m.isrCount++] = n;
-    (void)c.svc->onAlterIsr(m);
+    ASSERT_TRUE(c.svc->onAlterIsr(m)) << "t1's ISR edit is enqueued behind t0's fenced move";
     c.drive(10);
     if (out != L0) EXPECT_FALSE(has(c.paOf(1).isr, out)) << "t1's record waited behind t0's fenced move";
     EXPECT_EQ(c.paOf(0).leaderNode, L0);

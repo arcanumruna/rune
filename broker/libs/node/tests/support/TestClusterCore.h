@@ -21,6 +21,7 @@
 // order keeps its ids.  A failure is `ADD_FAILURE()` + -1 — a deadline is a failure, never a hang.
 #include "TestNodeConfig.h"
 #include "ShardTestClient.h"
+#include "LeaseTestClock.h"
 
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
@@ -138,6 +139,21 @@ public:
         return fail_(-1, "timed out; " + last);
     }
 
+    /// L18 (lease topics Task 17): inject a lease clock into every worker of the cluster's node (single-node clusters only - see
+    /// LeaseTestClock.h) and move it forward.  installLeaseClock() before the first lease topic; advanceLeaseClock(ns) any time.
+    /// False: more than one node (the read lease runs on the real clock there).
+    bool installLeaseClock() {
+        if (nodes_.size() != 1) return false;
+        leaseClock_.install(*nodes_[0]);
+        return true;
+    }
+    bool advanceLeaseClock(int64_t ns) {
+        if (nodes_.size() != 1) return false;
+        leaseClock_.advance(nodes_[0], ns);
+        return true;
+    }
+    [[nodiscard]] LeaseTestClock& leaseClock() noexcept { return leaseClock_; }
+
     /// How many Redirect answers this cluster followed / NotLeader answers it retried (test observability).
     [[nodiscard]] std::size_t redirectsFollowed() const noexcept { return redirectsFollowed_; }
     [[nodiscard]] std::size_t notLeaderRetries() const noexcept { return notLeaderRetries_; }
@@ -232,6 +248,7 @@ private:
     uint64_t                                         counter_ = 0;
     std::size_t                                      redirectsFollowed_ = 0;
     std::size_t                                      notLeaderRetries_  = 0;
+    LeaseTestClock                                   leaseClock_;
 };
 
 } // namespace rune::node::test

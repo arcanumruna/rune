@@ -36,13 +36,18 @@
 // return a real progress count (records folded + deltas pushed/held) so the
 // node's idle strategy never backs off while view work is pending.
 
+#include <algorithm>
+#include <cstring>
 #include <memory>
+#include <optional>
 
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/node/VerdictSource.h>
+#include <rune/node/lease/LeaseIndex.h>
 #include <rune/node/ViewInstance.h>
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/NsSlotTable.h>
+#include <rune/view/ViewRow.h>
 
 #include <spdlog/spdlog.h>
 
@@ -124,6 +129,10 @@ public:
     // materializeRecoveryInstancesFor (checkpoint load + RebuildingViews +
     // serve-guard), NOT lazily created Ready by the plain driveFolds path.
     int drainInstalls();
+
+    /// Test seam: what drainInstalls does for a frame with ViewPlanUpdateMsg.recovery set, after its installView (the view's
+    /// instances are materialized from their checkpoints and rebuilt by driveRebuild).
+    void markRecoveryForTest(int32_t viewTopicId) { recoveryViews_.insert(viewTopicId); }
 
     /// Test seams: throw away one instance's rows exactly as recovery does, and read where its checkpoint stands.
     bool beginDiscardForTest(int32_t viewTopicId, int32_t partition, ViewDiscardReason reason) {
@@ -271,7 +280,9 @@ public:
     // The slowest foldCursor over the views interested in (srcTopicId, partition): a View ack may fire once this passes
     // its last offset.  INT64_MAX when no view is interested.  An instance that was never created counts 0, and with
     // `leadership != 0` so does one folded under another leadership (its table says nothing about this one).  `judged` is false on a memory-backed replica:
-    // its verdict views are skipped (no judge ever folds them).
+    // its verdict views are skipped (no judge ever folds them).  A view paused at the namespace's view-memory limit is skipped:
+    // it folds nothing until the limit is raised, and its reads answer ViewPaused (never a stale row), so waiting for it would
+    // only turn every View ack of the source into a 20 s Internal timeout - and expire every lease kept alive over it.
     [[nodiscard]] int64_t minFoldCursor(int32_t srcTopicId, int32_t partition, uint64_t leadership = 0, bool judged = true) const noexcept {
         const auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end()) return INT64_MAX;
@@ -280,6 +291,7 @@ public:
             if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.retiring) continue;   // a dropped verdict view is judged to its drop, never waited for
             if (!judged && isVerdictTemplate_(viewTopicId)) continue;   // #808: a memory-backed replica never hosts a judge (SD9), so its verdict views are never folded and never waited for
             const auto vit = views_.find(instKey(viewTopicId, partition));
+            if (vit != views_.end() && std::holds_alternative<ViewPaused>(vit->second.pause)) continue;   // never waited for: reads answer ViewPaused
             const int64_t cursor = vit == views_.end() || (leadership != 0 && vit->second.foldLeadership != leadership) ? 0 : vit->second.foldCursor;
             if (cursor < min) min = cursor;
         }
@@ -295,6 +307,7 @@ public:
             if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.retiring) continue;
             if (!judged && isVerdictTemplate_(viewTopicId)) continue;
             const auto vit = views_.find(instKey(viewTopicId, partition));
+            if (vit != views_.end() && std::holds_alternative<ViewPaused>(vit->second.pause)) continue;   // never waited for: reads answer ViewPaused
             const int64_t cursor = vit == views_.end() || (leadership != 0 && vit->second.foldLeadership != leadership) ? 0 : vit->second.foldCursor;
             if (cursor < min) { min = cursor; holder = viewTopicId; }
         }
@@ -326,6 +339,14 @@ public:
             viewSkip.rejected = &write->rejected;
             if (judge != nullptr) {
                 work += syncConstraintSet_(srcTopicId, *judge, *write);
+                // A lease index whose row layout is out of date (an AddField reached the evolving descriptor) activates again
+                // under the same leadership: the rebuild below replaces it, the activation replays the log into it.
+                if (write->spec->lease && leaseLayoutStale_(srcTopicId, partition, *write->spec)) judge->requestReactivation();
+                // Every fresh lease table starts with lastAppended = -1 for rows whose updates in [judgedThrough, LEO) are unjudged.
+                // ASSIGNED, not max'ed: a leader never truncates within its leadership, and everything appended before this activation
+                // is <= LEO - 1, so a value left by an earlier leadership (an untracked update at 100, a demote, a truncation to 80,
+                // a re-promotion) must not outlive it: it would hold readiness false until unrelated records push the judge past 100.
+                if (write->spec->lease && judge->activationPending()) write->leaseUntrackedThrough = (transientSrc != nullptr ? transientSrc->logEnd : b.logEnd) - 1;   // a ring's end is its TransientBounds, `b` is the disk log's
                 if (judge->activationPending()) rebuildKeyIndex_(srcTopicId, partition, *judge, *write->spec, leaderGen);
                 // P11-2: the judge reads to the HW (`judgeBound`, -1 = `bound`); the other views still fold below the LSO and K.
                 work += judge->driveJudge(readRange, judgeBound < 0 ? bound : judgeBound, nowNs, *write, skip.aborted, bound);
@@ -336,7 +357,9 @@ public:
                     txnOverlays_.trim(nowNs);
                 }
                 viewBound = std::min(bound, judge->judgedThrough());
-                work += flipVerdictMembers_(srcTopicId, partition, bound, nowNs, leaderGen, leaderHwConfirmed, ns);
+                work += flipVerdictMembers_(srcTopicId, partition, bound, nowNs, leaderGen, leaderHwConfirmed, ns, write->leaseEvents.reservedBytes(), write->spec->lease.has_value());
+                // The lease events stay in the buffer: Worker::leaseDuty_ consumes and clears them every doWork, right after driveViews_
+                // (the judge runs once per doWork per partition, so the fold-event cap accounting sees an emptied buffer).
             } else {
                 viewBound = std::min(bound, write->verdictKnownThrough());
             }
@@ -426,6 +449,116 @@ public:
     [[nodiscard]] std::size_t keyIndexSizeForTest(int32_t src, int32_t partition) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
         return it == keyIndexes_.end() ? 0 : it->second.table.size();
+    }
+    /// The produce path's window on the lease index of (src, partition): its table, layout and layout descriptor.  Null table when
+    /// the partition has none.  Non-const: the produce hook writes the table's per-row lastAppended.
+    [[nodiscard]] LeaseIndexRef leaseIndexOf(int32_t src, int32_t partition) noexcept { return leaseIndexFor(src, partition, 0, false, false).ref; }
+    /// The produce path's ONE lookup: the lease index window and whether it is ready (leaseIndexReady's rule with the caller's facts).
+    struct LeaseIndexLookup {
+        LeaseIndexRef ref;
+        bool          ready      = false;
+        bool          catchingUp = false;   ///< not ready only because the judge / fold has not passed this leadership's latest updates yet
+        int64_t       foldCursor = -1;   ///< the index's fold cursor (the lease view read's read-your-writes barrier); -1: no index
+        uint64_t      viewFp     = 0;    ///< the lease view's output fingerprint over the current layout (leaseViewFingerprint)
+    };
+    [[nodiscard]] LeaseIndexLookup leaseIndexFor(int32_t src, int32_t partition, uint64_t currentLeaderGen, bool isLeader, bool hwConfirmed) noexcept {
+        const uint64_t key = instKey(src, partition);
+        const auto it = keyIndexes_.find(key);
+        if (it == keyIndexes_.end()) return {};
+        ViewInstance& inst = it->second;
+        const LeaseReadiness rd = leaseReadiness_(inst, key, currentLeaderGen, isLeader, hwConfirmed);
+        return LeaseIndexLookup{LeaseIndexRef{&inst.table, &inst.layout, &inst.evolvingSrc, &inst.leaseCover, &inst.leaseTransient},
+                                rd == LeaseReadiness::Ready, rd == LeaseReadiness::CatchingUp, inst.foldCursor, inst.leaseViewFp};
+    }
+    /// Lease view point reads (spec 7.1): the source topic of a lease view (`<topic>.leases`), -1 when `viewTopicId` is not one.  The
+    /// mapping comes from the catalog (the write spec's leaseViewTopicId), never from id arithmetic.  A flat scan of the (few) lease
+    /// topics of this worker: no hashing on the read path.
+    [[nodiscard]] int32_t leaseSourceOfView(int32_t viewTopicId) const noexcept {
+        for (const LeaseViewMap& m : leaseViews_)
+            if (m.view == viewTopicId) return m.src;
+        return -1;
+    }
+    /// Cold: the write spec of lease topic `srcTopicId` names `viewTopicId` as its lease view (idempotent; a changed view id replaces the old).
+    void noteLeaseView(int32_t srcTopicId, int32_t viewTopicId) {
+        for (LeaseViewMap& m : leaseViews_)
+            if (m.src == srcTopicId) { m.view = viewTopicId; return; }
+        leaseViews_.push_back({viewTopicId, srcTopicId});
+    }
+    /// The lease view's output fingerprint for (src, partition) over its CURRENT row layout; 0 when the partition has no lease index.  It
+    /// changes when the layout does (a column added by AlterSchema).  How a client learns it is a schema lookup (Task 14).
+    [[nodiscard]] uint64_t leaseViewFingerprint(int32_t src, int32_t partition) const noexcept {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it == keyIndexes_.end() ? 0 : it->second.leaseViewFp;
+    }
+    /// A lease index row's column `slot` (up to 8 bytes, little-endian) for the 8-byte wire key `key`; nullopt: no such row, or the column is null.
+    /// `slots` (if given) receives the layout's column count.
+    [[nodiscard]] std::optional<uint64_t> leaseColumnForTest(int32_t src, int32_t partition, uint64_t key, uint16_t slot, std::size_t* slots = nullptr) const {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        if (it == keyIndexes_.end()) return std::nullopt;
+        if (slots != nullptr) *slots = it->second.layout.slotType.size();
+        const uint8_t* row = it->second.table.get(key);
+        if (row == nullptr || slot >= it->second.layout.slotType.size() || rune::view::isNull(row, it->second.layout, slot)) return std::nullopt;
+        uint64_t v = 0;
+        std::memcpy(&v, row + it->second.layout.slotOffset[slot], std::min<std::size_t>(8, it->second.layout.slotWidth[slot]));
+        return v;
+    }
+    /// Test seam: the records one replay pass of a lease index covers (applies to indexes built after the call).
+    void setLeaseReplayCapForTest(int64_t records) noexcept { leaseReplayCap_ = records; }
+    /// A lease index's rebuild epoch (see ViewInstance::rebuildEpoch); 0: none.
+    [[nodiscard]] uint32_t leaseRebuildEpoch(int32_t src, int32_t partition) const noexcept {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it == keyIndexes_.end() ? 0 : it->second.rebuildEpoch;
+    }
+    /// True when the lease index of (src, partition) reflects every judged record of the replica's CURRENT leadership.  The
+    /// caller (Task 9) passes the replica's facts: its current leadership generation, whether it is the leader and whether its
+    /// HW is confirmed for that leadership.  True only when all hold: the judge is bound to `currentLeaderGen` and activated, the
+    /// index was folded under `currentLeaderGen`, its fold cursor has reached the judge's, and its layout is current.  After a
+    /// demote or a new leadership it is false until the judge activates under the new generation (a stale-leader index is never
+    /// ready).  The wheels (Task 9) arm only from a ready index.
+    [[nodiscard]] bool leaseIndexReady(int32_t src, int32_t partition, uint64_t currentLeaderGen, bool isLeader, bool hwConfirmed) const noexcept {
+        if (!isLeader || !hwConfirmed) return false;
+        const uint64_t key = instKey(src, partition);
+        const auto kit = keyIndexes_.find(key);
+        return kit != keyIndexes_.end() && leaseReady_(kit->second, key, currentLeaderGen, isLeader, hwConfirmed);
+    }
+private:
+    /// NotReady: the index does not serve this leadership (or this layout) at all.  CatchingUp: it does, but the judge has not passed
+    /// an update the index could not track, or the fold trails the judge - a pass or two away (a read waits, bounded, instead of failing).
+    enum class LeaseReadiness : uint8_t { NotReady, CatchingUp, Ready };
+    [[nodiscard]] LeaseReadiness leaseReadiness_(const ViewInstance& inst, uint64_t key, uint64_t currentLeaderGen, bool isLeader,
+                                                 bool hwConfirmed) const noexcept {
+        if (!isLeader || !hwConfirmed) return LeaseReadiness::NotReady;
+        const auto vit = verdictSources_.find(key);
+        if (vit == verdictSources_.end()) return LeaseReadiness::NotReady;
+        const VerdictSource& judge = *vit->second;
+        const PartitionWriteState* w = judge.boundState();
+        if (w == nullptr || w->spec == nullptr || !w->spec->lease) return LeaseReadiness::NotReady;
+        if (!judge.activated() || judge.leadershipGeneration() != currentLeaderGen || inst.foldLeadership != currentLeaderGen ||
+            inst.layoutGen != w->spec->leaseLayoutGen)
+            return LeaseReadiness::NotReady;
+        const int64_t judged = judge.judgedThrough();
+        return inst.foldCursor >= judged && judged > w->leaseUntrackedThrough   // updates appended before the table tracked them are judged
+                   ? LeaseReadiness::Ready
+                   : LeaseReadiness::CatchingUp;
+    }
+    [[nodiscard]] bool leaseReady_(const ViewInstance& inst, uint64_t key, uint64_t currentLeaderGen, bool isLeader, bool hwConfirmed) const noexcept {
+        return leaseReadiness_(inst, key, currentLeaderGen, isLeader, hwConfirmed) == LeaseReadiness::Ready;
+    }
+public:
+    /// The partition stopped leading: its lease event buffer (~320 KiB) is released and no longer counted in the lease view's
+    /// memory.  The next leader pass re-reserves it (ensureVerdictSource, cold).  Cold; idempotent.
+    void releaseLeaseEvents(int32_t src, int32_t partition, PartitionWriteState& write) {
+        write.leaseEvents.release();
+        if (const auto it = keyIndexes_.find(instKey(src, partition)); it != keyIndexes_.end()) {
+            it->second.extraMemBytes = 0;
+            chargeMem_(it->second);
+            releaseLeases_(it->second);   // Task 21: a follower holds no lease state, so it counts no leases; the next leader pass re-charges
+        }
+    }
+    /// Test seam: the memory the lease view of (src, partition) is accounted with (table plus the event buffer), 0 when none.
+    [[nodiscard]] std::size_t leaseViewMemoryForTest(int32_t src, int32_t partition) const {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it == keyIndexes_.end() ? 0 : instanceMemory_(it->second);
     }
     [[nodiscard]] const ViewInstance* keyIndexForTest(int32_t src, int32_t partition) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
@@ -537,12 +670,14 @@ public:
         if (nsSlots_.nsIdAt(slot) != nsId) {
             if (!nsSlots_.place(slot, nsId)) { ++nsSlotMismatches_; return; }
             nsViewMem_[slot] = 0; nsViewMemOver_[slot] = 0;   // a reused slot starts from zero usage
+            nsLeases_[slot] = 0; nsLeasesOver_[slot] = 0;
         }
         nsSlots_.setLimits(slot, l);   // the over decision is the aggregator's (ViewMemOver): a raised limit clears it there
     }
     void onNsSlotFreed(uint16_t slot, uint32_t nsId) {
         if (!nsSlots_.release(slot, nsId)) { ++nsSlotMismatches_; return; }
         nsViewMem_[slot] = 0; nsViewMemOver_[slot] = 0;
+        nsLeases_[slot] = 0; nsLeasesOver_[slot] = 0;
     }
     /// Task 14 (D26): the aggregator's decision (node total over maxViewMemoryBytes).  Tag-checked: a message for a
     /// namespace that no longer owns the slot is counted and ignored.  The fold gate reads the byte on the next pass.
@@ -550,6 +685,16 @@ public:
         if (!nsTagMatches(slot, nsId)) return;
         nsViewMemOver_[slot] = on ? 1 : 0;
     }
+    /// Lease topics Task 21: the aggregator's decision (node total of live leases at or over maxLeases).  Tag-checked like
+    /// onViewMemOver.  Read by the checked-write hook on the next write (never paused, never refuses anything but a grant).
+    void onLeasesOver(uint16_t slot, uint32_t nsId, bool on) noexcept {
+        if (!nsTagMatches(slot, nsId)) return;
+        nsLeasesOver_[slot] = on ? 1 : 0;
+    }
+    /// Lease topics Task 21: the live lease rows of the lease partitions this worker LEADS, per namespace slot; and whether the
+    /// namespace is at or over max-leases (node total).
+    [[nodiscard]] uint64_t nsLeases(uint16_t slot) const noexcept { return slot < nsLeases_.size() ? nsLeases_[slot] : 0; }
+    [[nodiscard]] bool     nsLeasesOver(uint16_t slot) const noexcept { return slot < nsLeasesOver_.size() && nsLeasesOver_[slot] != 0; }
     /// Task 12: the namespace's view memory on this worker (sum of its instances' chunk bytes) and whether it is over.
     [[nodiscard]] uint64_t nsViewMemBytes(uint16_t slot) const noexcept { return slot < nsViewMem_.size() ? nsViewMem_[slot] : 0; }
     [[nodiscard]] bool     nsViewMemOver(uint16_t slot) const noexcept { return slot < nsViewMemOver_.size() && nsViewMemOver_[slot] != 0; }
@@ -564,6 +709,8 @@ public:
         nsSlots_.reset(capacity);
         nsViewMem_.assign(nsSlots_.capacity(), 0);
         nsViewMemOver_.assign(nsSlots_.capacity(), 0);
+        nsLeases_.assign(nsSlots_.capacity(), 0);
+        nsLeasesOver_.assign(nsSlots_.capacity(), 0);
     }
     [[nodiscard]] uint32_t nsSlotCapacity() const noexcept { return nsSlots_.capacity(); }
     [[nodiscard]] const NsSlotTable& nsSlotsForTest() const noexcept { return nsSlots_; }
@@ -575,6 +722,10 @@ private:
     // sized to the slot table; the over byte is set only by the aggregator's ViewMemOver message (Task 14).
     std::vector<uint64_t> nsViewMem_     = std::vector<uint64_t>(NsSlotTable::kDefaultCapacity, 0);
     std::vector<uint8_t>  nsViewMemOver_ = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
+    // Lease topics Task 21: per-slot live lease rows of the partitions this worker leads, and the over byte (set only by the
+    // aggregator's LeasesOver message).  Sized and reset exactly where nsViewMem_ is.
+    std::vector<uint64_t> nsLeases_     = std::vector<uint64_t>(NsSlotTable::kDefaultCapacity, 0);
+    std::vector<uint8_t>  nsLeasesOver_ = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
     uint64_t viewPauses_ = 0, viewResumes_ = 0;
 
     // The tables, their dirty sets' growth and a held delta: a long window between checkpoints (P11-9) is view memory too.  A
@@ -586,7 +737,8 @@ private:
     // (they are live).  An instance that is not driven (its source partition is not led here) keeps its charge, a kept window
     // included, until a pass drives it again.
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
-        std::size_t m = inst.table.memoryBytes() + inst.table.dirtyBytes() + (inst.pendingValid ? inst.pendingDelta.capacity() : 0);
+        std::size_t m = inst.table.memoryBytes() + inst.table.dirtyBytes() + (inst.pendingValid ? inst.pendingDelta.capacity() : 0) +
+                        inst.extraMemBytes;   // lease topics: the lease event buffer
         if (inst.owners) m += inst.owners->memoryBytes() + inst.owners->dirtyBytes();
         if (inst.claims) m += inst.claims->indexTable().memoryBytes() + inst.claims->extrasTable().memoryBytes();
         if (inst.agg) {
@@ -650,6 +802,21 @@ private:
             nsViewMem_[inst.nsSlot] -= std::min<uint64_t>(nsViewMem_[inst.nsSlot], inst.memCharged);
         }
         inst.memCharged = 0;
+    }
+    /// Lease topics Task 21: charge the lease index's live rows to its slot (one compare when nothing changed).  A lease index only.
+    void chargeLeases_(ViewInstance& inst) noexcept {
+        if (inst.nsSlot == kNoNsSlot) return;
+        const uint64_t n = inst.table.size();
+        if (n == inst.leasesCharged) return;
+        if (!nsSlots_.matches(inst.nsSlot, inst.nsId)) { ++nsSlotMismatches_; return; }   // stale tag: never charge another namespace
+        nsLeases_[inst.nsSlot] = nsLeases_[inst.nsSlot] + n - inst.leasesCharged;
+        inst.leasesCharged = n;
+    }
+    void releaseLeases_(ViewInstance& inst) noexcept {
+        if (inst.nsSlot == kNoNsSlot || inst.leasesCharged == 0) return;
+        if (nsSlots_.matches(inst.nsSlot, inst.nsId))
+            nsLeases_[inst.nsSlot] -= std::min<uint64_t>(nsLeases_[inst.nsSlot], inst.leasesCharged);
+        inst.leasesCharged = 0;
     }
     /// The first drive that carries the source's namespace tag adopts it (cold, once per instance).
     void adoptNs_(ViewInstance& inst, NsTag ns) noexcept {
@@ -772,12 +939,18 @@ private:
     /// position the logged set was computed at, or while a drained plan install or uninstall has no mark yet.  The request must then be left unasked; one that goes ahead stamps `catalogThrough_`.
     [[nodiscard]] bool catalogBehind_(int32_t srcTopicId, VerdictSource& judge, const PartitionWriteState& write);
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
-    int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, int64_t nowNs, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
+    int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, int64_t nowNs, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, std::size_t leaseEventBytes, bool lease);
     void rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen);
+    int64_t leaseReplayCap_ = kLeaseIndexReplayRecordsPerPass;   // the records one replay pass of a lease index covers
+    [[nodiscard]] bool leaseLayoutStale_(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec) const noexcept {
+        const auto it = keyIndexes_.find(instKey(srcTopicId, partition));
+        return it != keyIndexes_.end() && it->second.layoutGen != spec.leaseLayoutGen;
+    }
     // Inline: Worker.h's rebuildRcSlots_ reaches it, and that header is built into libraries that do not link rune_node.
     void eraseKeyIndex_(uint64_t key) {
         if (const auto it = keyIndexes_.find(key); it != keyIndexes_.end()) {
             releaseMem_(it->second);
+            releaseLeases_(it->second);
             keyIndexes_.erase(it);
         }
     }
@@ -792,6 +965,7 @@ private:
     void eraseInstance_(int32_t viewTopicId, int32_t partition);
     static int  checkpointHook_(void* ctx, ViewInstance& inst) { return static_cast<WorkerViewSet*>(ctx)->pushVerdictCheckpoint_(inst); }
     static void discardHook_(void* ctx, ViewInstance& inst, ViewDiscardReason reason) { static_cast<WorkerViewSet*>(ctx)->beginDiscard_(inst, reason); }
+    static uint32_t nextLeaseEpochHook_(void* ctx) { return ++static_cast<WorkerViewSet*>(ctx)->leaseEpochCounter_; }
     static void retiredHook_(void* ctx, int32_t viewTopicId, int32_t partition) {
         static_cast<WorkerViewSet*>(ctx)->retiredQueue_.push_back({viewTopicId, partition});
     }
@@ -812,7 +986,10 @@ private:
     // The key index of a key.index partition: a verdict member of its judge that is in neither views_ nor templates_.  Rebuilt from the
     // local log at every activation; never persisted.  unordered_map keeps the node's address across the move-assign that rebuilds it.
     std::unordered_map<uint64_t, ViewInstance> keyIndexes_;
+    struct LeaseViewMap { int32_t view, src; };
+    std::vector<LeaseViewMap> leaseViews_;   // lease view sink id -> source topic; cold-maintained from the write specs, scanned by lease view reads
     bool holdJudges_ = false;
+    uint32_t leaseEpochCounter_ = 0;   // one per WorkerViewSet: every activation of ANY lease index takes the next value (never repeats)
     struct Retired { int32_t viewTopicId, partition; };
     bool installsSinceMark_ = false;   // a verdict plan install or uninstall was drained whose catalog mark has not been: the gate stays closed
     int64_t catalogThrough_ = -1;   // the latest catalog position this node's control thread marked here; never moves back (#788)

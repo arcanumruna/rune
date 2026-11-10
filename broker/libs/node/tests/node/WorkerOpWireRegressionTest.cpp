@@ -39,6 +39,28 @@ TEST(WorkerOpWireRegression, WriteSpecUpdateRoundTripsRegression) {
     EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::FILTER), 11);
 }
 
+// Lease topics Task 11a: the keepalive / TimeToLive / scan ops, their tail kind and the three results are append-only values,
+// numbered after checked writes Part 11 (TxnVote = 36, TxnVoteResult = 11).
+TEST(WorkerOpWireRegression, LeaseOpsRoundTripRegression) {
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::LEASE_KEEP_ALIVE), 37);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::LEASE_TIME_TO_LIVE), 38);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::SCAN_LEASES), 39);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::NS_LEASES_OVER), 40);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::TRANSIENT_LINEAGE), 41);
+    EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::LEASE_REQUEST), 14);
+    EXPECT_EQ(static_cast<int>(rune::node::WorkerOp::Type::LeaseKeepAlive), 37);
+    EXPECT_EQ(static_cast<int>(rune::node::WorkerOp::Type::LeaseTimeToLive), 38);
+    EXPECT_EQ(static_cast<int>(rune::node::WorkerOp::Type::ScanLeases), 39);
+    EXPECT_EQ(static_cast<int>(rune::node::WorkerOp::Type::NsLeasesOver), 40);
+    EXPECT_EQ(static_cast<int>(rune::node::WorkerOp::Type::TransientLineage), 41);
+    EXPECT_EQ(static_cast<int>(rune::node::WorkerReturn::Type::LeaseKeepAliveResult), 12);
+    EXPECT_EQ(static_cast<int>(rune::node::WorkerReturn::Type::LeaseTimeToLiveResult), 13);
+    EXPECT_EQ(static_cast<int>(rune::node::WorkerReturn::Type::ScanLeasesResult), 14);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::TXN_VOTE), 36) << "the value before them is unchanged";
+    EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::TXN_VOTE_RESULT), 11) << "the value before them is unchanged";
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::GET_STATS), 35);
+}
+
 TEST(CheckedWritesTxnRing, TxnVoteOpRoundTrips) {
     EXPECT_EQ(static_cast<int>(rune::node::WorkerOp::Type::TxnVote), static_cast<int>(sbe::OpType::Value::TXN_VOTE));
     std::array<char, 512> buf{};

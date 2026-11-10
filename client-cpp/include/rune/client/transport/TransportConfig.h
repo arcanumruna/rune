@@ -54,6 +54,8 @@ inline constexpr int64_t kMinClientLivenessTimeoutNs = 1'000'000'000LL;
 /// Liveness cap: 1 hour.  The transport derives publication_unblock_timeout =
 /// 1.5x liveness, which the driver conductor casts to int64 (overflow > ~6.1e18).
 inline constexpr int64_t kMaxClientLivenessTimeoutNs = 3'600'000'000'000LL;
+/// #989: image liveness floor: above the driver's default 1 s timer interval, which checks it.
+inline constexpr int64_t kMinImageLivenessTimeoutNs = 1'000'000'000LL;
 /// aeron::Context DEFAULT_MEDIA_DRIVER_TIMEOUT_MS (Context.h:133): how long the
 /// Aeron C++ client tolerates a stale driver heartbeat before closing itself.
 inline constexpr long kAeronDefaultMediaDriverTimeoutMs = 10'000;
@@ -106,6 +108,10 @@ struct TransportConfig {
     /// owning thread must call dutyCycle() at least this often, otherwise the
     /// Aeron ClientConductor inter-service timeout closes the client.
     int64_t clientLivenessTimeoutNs = 10'000'000'000LL;
+    /// #989: the driver's image liveness timeout: how long a silent image (a publisher that died without closing) stays
+    /// before it is unavailable, so how soon a response-mode session sees its gateway's response publication gone.
+    /// 0 = Aeron's default (10 s); else [kMinImageLivenessTimeoutNs, kMaxClientLivenessTimeoutNs].
+    int64_t imageLivenessTimeoutNs = 0;
     /// The driver CnC's counter-values buffer: 0 = Aeron's default (8 MiB), else
     /// [kMinDriverCountersBytes, kMaxDriverCountersBytes] (ClientConfig::driverCountersBytes).
     std::size_t driverCountersBytes = 0;
@@ -180,6 +186,11 @@ struct TransportConfig {
         (c.driverCountersBytes < kMinDriverCountersBytes || c.driverCountersBytes > kMaxDriverCountersBytes)) {
         return "driverCountersBytes must be 0 (Aeron default) or in [1048576, 524288000]: " +
                std::to_string(c.driverCountersBytes);
+    }
+    if (c.imageLivenessTimeoutNs != 0 &&
+        (c.imageLivenessTimeoutNs < kMinImageLivenessTimeoutNs || c.imageLivenessTimeoutNs > kMaxClientLivenessTimeoutNs)) {
+        return "imageLivenessTimeoutNs must be 0 (Aeron default) or in [1000000000, 3600000000000]: " +
+               std::to_string(c.imageLivenessTimeoutNs);
     }
     if (!c.aeronDir.empty() && c.driverCountersBytes != 0) {
         return "driverCountersBytes sizes the client's own embedded driver: it cannot be set together with aeronDir";

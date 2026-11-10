@@ -116,6 +116,9 @@ struct ProduceResponseView {
     bool     hasVerdicts   = false;
     uint16_t verdictCount  = 0;
     std::span<const uint8_t> verdictBytes;   // verdictCount x {recordIndex u16, code u16, constraintId u32}
+    bool     hasLease      = false;          // client 18: the lease trailer is present (an ack of a lease topic)
+    uint16_t leaseCount    = 0;
+    std::span<const uint8_t> leaseBytes;     // leaseCount x {leaseVersion i64, ttlMs u64}, entry i for record i
 };
 
 /// Encode a ProduceResponse frame (rpc::ProduceResponse::ENCODED_SIZE = 46
@@ -156,6 +159,9 @@ inline std::optional<ProduceResponseView> decodeProduceResponse(const uint8_t* b
     v.hasVerdicts    = opt->hasVerdicts;
     v.verdictCount   = opt->verdictCount;
     v.verdictBytes   = opt->verdictBytes;
+    v.hasLease       = opt->hasLease;
+    v.leaseCount     = opt->leaseCount;
+    v.leaseBytes     = opt->leaseBytes;
     return v;
 }
 

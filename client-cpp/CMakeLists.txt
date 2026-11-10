@@ -275,7 +275,10 @@ set(RUNE_CLAIM_GEN_HEADERS
     "${RUNE_CLAIM_GEN_DIR}/gen/ki_account.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/ai_user.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/rp_user.gen.h"
-    "${RUNE_CLAIM_GEN_DIR}/gen/rp_character.gen.h")
+    "${RUNE_CLAIM_GEN_DIR}/gen/rp_character.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/lease_claim.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/lease_wide.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/lease_evo.gen.h")
 add_custom_command(
     OUTPUT  ${RUNE_CLAIM_GEN_HEADERS}
     COMMAND $<TARGET_FILE:rune_gen_claim_schemas> "${RUNE_CLAIM_GEN_DIR}/gen"
@@ -510,6 +513,12 @@ if(aeron_FOUND)
         src/catalog/CatalogReader.cpp
         src/security/SecurityDdl.cpp
         src/security/SecurityReader.cpp
+        src/lease/LeaseTopic.cpp
+        src/lease/LeaseWire.cpp
+        src/lease/LeaseGuards.cpp
+        src/lease/LeaseSession.cpp
+        src/lease/LeaseWatch.cpp
+        src/lease/LeaseRecipe.cpp
     )
     target_include_directories(rune_client_api PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -826,6 +835,28 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
             find_library(UUID_LIB_CHECKED_WRITES_PROBE uuid)
             if(UUID_LIB_CHECKED_WRITES_PROBE)
                 target_link_libraries(checked_writes_probe PRIVATE ${UUID_LIB_CHECKED_WRITES_PROBE})
+            endif()
+        endif()
+    endif()
+
+    # ── Lease topics Task 19 — Phase 1 e2e driver (broker/docker/lease-e2e.sh) ──
+    #
+    # lease_e2e_driver.cpp includes the build-time generated lease_claim.gen.h (tests/support/GenClaimSchemas.cpp), so the driver image
+    # needs tests/ in its context.
+    if(TARGET generate_claim_schema_headers)
+        add_executable(lease_e2e_driver examples/lease_e2e_driver.cpp)
+        add_dependencies(lease_e2e_driver generate_claim_schema_headers)
+        target_include_directories(lease_e2e_driver PRIVATE ${RUNE_PROTOCOL_INCLUDE} "${RUNE_CLAIM_GEN_DIR}/gen" "${CMAKE_CURRENT_SOURCE_DIR}/examples")
+        target_link_libraries(lease_e2e_driver PRIVATE
+            rune_client_api
+            rune_client_producer
+            rune_client_subscriber
+            rune_codec
+        )
+        if(UNIX AND NOT APPLE)
+            find_library(UUID_LIB_LEASE_E2E_DRIVER uuid)
+            if(UUID_LIB_LEASE_E2E_DRIVER)
+                target_link_libraries(lease_e2e_driver PRIVATE ${UUID_LIB_LEASE_E2E_DRIVER})
             endif()
         endif()
     endif()
@@ -1158,6 +1189,7 @@ if(BUILD_TESTING)
         tests/client/ViewRowCodecTest.cpp
         tests/client/CheckedWritesViewKeyBuilderTest.cpp   # checked writes Part 07
         tests/client/PlayerEventSchemaTest.cpp   # Phase 2c Task 4
+        tests/client/LeasesRowDecodeTest.cpp   # lease topics Task 14b
     )
     target_include_directories(rune_schema_codec_smoke_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include "${RUNE_CLAIM_GEN_DIR}/gen")
     if(TARGET generate_claim_schema_headers)   # #377: guarded like the generator itself
@@ -1608,6 +1640,7 @@ if(BUILD_TESTING)
         tests/detail/CoordRouteTest.cpp
         tests/support/FreePortRegressionTest.cpp   # 429 / 370
         tests/support/AtomicFileRegressionTest.cpp   # 44
+        tests/lease/LeaseScanHashTest.cpp   # lease topics Task 16: the shared scan hash
     )
     target_include_directories(rune_pure_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1653,6 +1686,10 @@ if(BUILD_TESTING)
             tests/client/TypedClaimTest.cpp
             tests/client/CheckedWritesTypedTopicCqTest.cpp   # checked writes: TypedTopic cq forms, ProducerRef
             tests/client/CheckedWritesClientStatsTest.cpp    # checked writes Part 08: getStats over GetStats 91
+            tests/client/LeaseTopicTest.cpp                  # lease topics Task 14a: LeaseTopic<T> writes and requests
+            tests/lease/LeaseSessionTest.cpp                 # lease topics Task 15: LeaseSession and the produce guard
+            tests/lease/LeaseWatchTest.cpp                   # lease topics Task 16: LeaseWatch (hash-range handoff)
+            tests/lease/LeaseRecipeTest.cpp                  # lease topics Task 20: LeaseOwnership / LeaseElection
             tests/client/IngressEndpointRoutingTest.cpp
             tests/client/ClientResponseEgressRegressionTest.cpp   # NAT egress Task 7
             tests/producer/ProducerRouteParkTest.cpp
@@ -1876,6 +1913,7 @@ if(BUILD_TESTING)
     add_executable(rune_cli_catalog_tests
         tests/RuneCliCatalogTest.cpp
         tests/CheckedWritesQlCliTest.cpp
+        tests/LeaseQlCliTest.cpp
     )
     target_include_directories(rune_cli_catalog_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/src/cli)   # QlEngine.h (internal)
     target_compile_definitions(rune_cli_catalog_tests PRIVATE

@@ -1880,7 +1880,7 @@ private:
         deps.respondError = [record](int64_t, int64_t corr, uint16_t code, std::string_view message) {
             record(corr, Answer{code, -1, 0, std::string(message), 0, -1, 0, Answer::Kind::Error});
         };
-        deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t, int32_t, const std::vector<uint8_t>&, uint16_t, const rune::protocol::TopicKeyFeatures&) {};
+        deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t, int32_t, const std::vector<uint8_t>&, uint16_t, const rune::protocol::TopicKeyFeatures&, const std::optional<rune::protocol::LeaseSpec>&, int32_t) {};
         br->admin = std::make_unique<AdminWorker>(br->schemas, id, std::move(deps), &br->views, br->replica.get(), nullptr);
         (void)br->admin->bootCatalog(BootEffects{effectsFor_(*br, /*live=*/false)}, LiveEffects{effectsFor_(*br, /*live=*/true)});
         // BrokerNode's boot order: the topic-dir reconcile (the production reconcileTopicDirs) settles the dirs

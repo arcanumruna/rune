@@ -217,6 +217,37 @@ TEST(CheckedWritesConsumerRegression, DropWhileUnbuiltClearsTheVerdictHooksRegre
     EXPECT_EQ(s.r.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady);
 }
 
+// Lease Task 18 finding: a typed partition (it has a write state) is served by its leader only, at any isolation: a follower
+// holds no verdict state, so Worker::verdictBound_ delivers nothing there.  The owning worker publishes that bit
+// (PartitionReplica::publishLeaderOnlyReads) as soon as the write state exists - no constraint set needed - and keeps it across a restart.
+// RED: publish `sl.write && constraintSets.size() != 0` in Worker::publishVerdictCleanerBounds_.
+TEST(CheckedWritesConsumerRegression, TypedPartitionIsLeaderOnlyRegression) {
+    VerdictRig r;
+    r.typed();
+    r.passes(50);
+    EXPECT_TRUE(r.replica->gatewayLeaderOnlyReads()) << "a typed partition is leader-only with no constraint set";
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(50);
+    EXPECT_TRUE(r.replica->gatewayLeaderOnlyReads());
+    r.restart(/*reinstall=*/false);
+    r.passes(300);
+    EXPECT_TRUE(r.replica->gatewayLeaderOnlyReads()) << "still leader-only after a restart";
+}
+
+// Checkpoint E ownership minor: a slot made for a replica that already carries a published leader-only bit starts from it, so a stale
+// `true` on an untyped partition (an ownership change hands the worker a replica another worker published) is corrected on the first pass.
+// RED: leave RcSlot::leaderOnlyReadsPublished at false when the slot is created (Worker::rebuildRcSlots_).
+TEST(CheckedWritesConsumerRegression, StaleLeaderOnlyBitIsCorrectedWhenTheSlotIsRebuiltRegression) {
+    VerdictRig r;
+    ASSERT_EQ(r.produce({{1, 10, 1}}), 0);   // never typed: no write state
+    r.passes(20);
+    ASSERT_FALSE(r.replica->gatewayLeaderOnlyReads());
+    r.replica->publishLeaderOnlyReads(true);   // a stale bit
+    r.worker->setOwnedDirect(Worker::OwnedSet{r.replica.get()});   // an ownership apply rebuilds the slots
+    r.passes(20);
+    EXPECT_FALSE(r.replica->gatewayLeaderOnlyReads());
+}
+
 TEST(CheckedWritesConsumer, UntypedTopicPaysOneBranch) {
     VerdictRig r;
     ASSERT_EQ(r.produce({{1, 10, 1}, {2, 20, 9}}), 0);   // never typed: no write state
@@ -345,4 +376,58 @@ TEST(CheckedWritesConsumerRegression, LeaderWithoutTheInstallDeliversNothingAbov
     std::vector<uint64_t> ids;
     for (const auto& d : s.r.collect(sub).records) ids.push_back(d.id);
     EXPECT_EQ(ids, (std::vector<uint64_t>{1, 4}));
+}
+
+// Checkpoint E review (adversarial): the gateway's leader-only criterion (PartitionReplica::gatewayLeaderOnlyReads, once = a non-empty
+// constraint-set timeline) was narrower than the worker's hold (Worker::verdictBound_: ANY write state + RC not Ready -> -1).
+// A follower that never led since boot has an empty timeline (only the leadership scan feeds it), so the gateway accepts a
+// read_uncommitted subscription there, and the worker answers it with nothing, forever: a silent stall.
+namespace {
+int64_t pushBoundOn(VerdictRig& r, int64_t from) {
+    WorkerOp op;
+    op.type = WorkerOp::Type::PushRead;
+    op.subscriptionId = 77; op.sessionId = 4277; op.topicId = VerdictRig::kSrc; op.partition = 0;
+    op.nextOffset = from; op.hwBound = r.leo();
+    op.replica = r.replica.get(); op.logPtr = r.log.get();
+    EXPECT_TRUE(r.worker->tryEnqueueOp(std::move(op)));
+    int64_t bound = -2;
+    r.now += 1'000'000;
+    r.worker->doWork(r.now);
+    r.worker->drainReturn([&](WorkerReturn w) {
+        if (w.type == WorkerReturn::Type::PushReadResult) bound = w.pushEffectiveBound();
+    }, [](const TxnReturn&) {});
+    return bound;
+}
+}  // namespace
+
+// A typed topic WITHOUT any constraint set, on a follower: the gateway says "followers serve it" and the worker serves nothing.
+TEST(CheckedWritesConsumerAdversarialRegression, TypedFollowerServedByGatewayIsNeverDeliveredAdversarialRegression) {
+    VerdictRig r;
+    r.typed();
+    r.passes(50);
+    r.demote();
+    r.replicate({VerdictRig::batch({{1, 10, 1}, {2, 20, 1}})});
+    r.passes(50);
+    ASSERT_GT(r.replica->highWatermark(), 0);
+    const bool gatewayRefuses = r.replica->gatewayLeaderOnlyReads() || r.replica->leaseTopic();
+    const int64_t bound = pushBoundOn(r, 0);
+    EXPECT_TRUE(gatewayRefuses || bound > 0)
+        << "SILENT STALL: the gateway accepts a read_uncommitted subscription on this follower (no verdict source published) "
+           "but the worker's bound is " << bound;
+}
+
+// A verdict source (a replicated constraint-set change) on a follower that never led: the timeline is fed by the leadership
+// scan only, so the bit stays false and the gateway accepts the subscription the worker never serves.
+TEST(CheckedWritesConsumerAdversarialRegression, FollowerNeverLedVerdictSourceIsNotPublishedAdversarialRegression) {
+    VerdictRig r;
+    r.typed();
+    r.passes(50);
+    r.demote();
+    r.replicate({VerdictRig::changeBatch(1, {{kObj, static_cast<uint8_t>(rune::view::VerdictViewKind::TestReject), tagRule(9).fingerprint()}}),
+                 VerdictRig::batch({{1, 10, 1}, {2, 20, 9}})});
+    r.passes(50);
+    ASSERT_GT(r.replica->highWatermark(), 0);
+    const int64_t bound = pushBoundOn(r, 0);
+    EXPECT_TRUE(r.replica->gatewayLeaderOnlyReads() || bound > 0)
+        << "SILENT STALL: a follower holding a logged constraint set publishes no verdict source (gateway accepts) and serves bound " << bound;
 }

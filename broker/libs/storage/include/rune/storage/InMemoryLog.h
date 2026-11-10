@@ -49,6 +49,20 @@
 //   kRefusedTooLarge: a batch larger than the whole ring (never storable).
 //   resetTo(): restart EMPTY at an offset (follower below the leader's ring start).
 //
+// Lease topics (spec A.3, A.4):
+//   bytesFrom(offset): the ring bytes (wrap padding included) held by the entries
+//     whose lastOffset >= offset — exactly bytesUsed_ after evicting every entry
+//     before them.  O(log n), no allocation.
+//   setProduceReserve(bytes): a free-space reserve applied ONLY by
+//     appendNoSyncRestamp (the client produce path).  The fit test becomes
+//     `used + need + reserve <= maxBytes_`.  With an eviction floor the
+//     simulate-first loop keeps its no-side-effect refusal: it may evict more
+//     below-floor batches to make the reserve, and refuses kRefusedFull (counted
+//     in fullRefusals_) when the floor stops it.  Without a floor it evicts as
+//     needed.  An EMPTY ring has nothing left to evict, so a batch that fits the
+//     ring itself is stored even if the reserve cannot be honoured.  Every other
+//     append (replication, control batches, the lease emitter) never sees it.
+//
 // Namespace: rune::storage   C++23
 // ---------------------------------------------------------------------------
 
@@ -151,7 +165,7 @@ public:
         if (len < static_cast<std::size_t>(rune::protocol::batch::kBaseOffsetOffset + 8)) [[unlikely]]
             return kRefusedTooLarge;
         const int64_t base = logEndOffset_;
-        const int64_t r = appendImpl(batch, len, base + static_cast<int64_t>(lastOffsetDelta));
+        const int64_t r = appendImpl(batch, len, base + static_cast<int64_t>(lastOffsetDelta), 1, produceReserve_);
         if (r < 0) return r;
         uint8_t* dst = ring_.data() + backEntry().ringOffset;
         const auto ub = static_cast<uint64_t>(base);
@@ -177,6 +191,26 @@ public:
     /// The owning replica sets it to its high watermark before each append.
     void setEvictionFloor(int64_t offset) noexcept { evictionFloor_ = offset; }
     [[nodiscard]] int64_t evictionFloor() const noexcept { return evictionFloor_; }
+
+    /// Free-space reserve for appendNoSyncRestamp only (spec A.4); 0 = none.
+    void setProduceReserve(std::size_t bytes) noexcept { produceReserve_ = bytes; }
+    [[nodiscard]] std::size_t produceReserve() const noexcept { return produceReserve_; }
+
+    /// Ring bytes (wrap padding included) held by entries with lastOffset >= offset
+    /// (spec A.3).  offset <= logStart -> everything; offset >= logEnd or empty -> 0.
+    [[nodiscard]] std::size_t bytesFrom(int64_t offset) const noexcept {
+        if (entryCount_ == 0 || offset >= logEndOffset_) return 0;
+        if (offset <= logStartOffset_) return bytesUsed_;
+        std::size_t lo = 0, hi = entryCount_;
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2;
+            if (entryAt(mid).lastOffset < offset) lo = mid + 1; else hi = mid;
+        }
+        if (lo == entryCount_) return 0;
+        const std::size_t ro = entryAt(lo).ringOffset;
+        const std::size_t before = ro >= head_ ? ro - head_ : (maxBytes_ - head_) + ro;
+        return bytesUsed_ - before;
+    }
 
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes) {
         if (startOffset < logStartOffset_ || entryCount_ == 0) {
@@ -450,7 +484,7 @@ private:
     // whole batches (validated by countSpanBatches_) — one entry per batch.
     // -----------------------------------------------------------------------
     int64_t appendImpl(const uint8_t* data, std::size_t len, int64_t lastOffset,
-                       std::size_t nEntries = 1) {
+                       std::size_t nEntries = 1, std::size_t reserve = 0) {
         // Phase 2b E2: a batch larger than the whole ring can never be stored
         // (was an assert — a release build corrupted the ring).
         if (len > maxBytes_) [[unlikely]] return kRefusedTooLarge;
@@ -464,7 +498,7 @@ private:
             // change whether a wrap is needed).
             if (evictionFloor_ == kNoEvictionFloor) {
                 // Plain DropOldest: any batch may go — evict until it fits.
-                while (entryCount_ > 0 && !fitsAfterEviction_(bytesUsed_, tail_, entryCount_, len, nEntries))
+                while (entryCount_ > 0 && !fitsAfterEviction_(bytesUsed_, tail_, entryCount_, len, nEntries, reserve))
                     evictOldest();
             } else {
                 // Phase 2b E2: never evict at/above the floor (uncommitted data
@@ -476,7 +510,7 @@ private:
                 // allocation; the common case (fits at once) is one check.
                 std::size_t sBytes = bytesUsed_, sHead = head_, sTail = tail_, sCount = entryCount_;
                 std::size_t phys = entryHead_, nEvict = 0;
-                while (sCount > 0 && !fitsAfterEviction_(sBytes, sTail, sCount, len, nEntries)) {
+                while (sCount > 0 && !fitsAfterEviction_(sBytes, sTail, sCount, len, nEntries, reserve)) {
                     const Entry& e = entries_[phys];
                     if (e.lastOffset >= evictionFloor_) [[unlikely]] {
                         ++fullRefusals_;
@@ -498,7 +532,7 @@ private:
             const std::size_t la = maxBytes_ - tail_;
             const bool ww = (len > la);
             const std::size_t need = len + (ww ? la : 0);
-            if (bytesUsed_ + need > maxBytes_ || entryCount_ + nEntries > maxRecords_) {
+            if (bytesUsed_ + need + reserve > maxBytes_ || entryCount_ + nEntries > maxRecords_) {
                 ++fullRefusals_;
                 return kRefusedFull; // sentinel: ring full, caller must retry later
             }
@@ -550,10 +584,11 @@ private:
 
     /// The fit test of the eviction loop, against a (possibly simulated) ring state.
     [[nodiscard]] bool fitsAfterEviction_(std::size_t used, std::size_t tail, std::size_t count,
-                                          std::size_t len, std::size_t nEntries) const noexcept {
+                                          std::size_t len, std::size_t nEntries,
+                                          std::size_t reserve) const noexcept {
         const std::size_t la   = maxBytes_ - tail;
         const std::size_t need = len + (len > la ? la : 0);   // + the trailing gap when it wraps
-        return used + need <= maxBytes_ && count + nEntries <= maxRecords_;
+        return used + need + reserve <= maxBytes_ && count + nEntries <= maxRecords_;
     }
 
     // O(1) eviction — advances head_ past the oldest batch (and any leading
@@ -613,6 +648,7 @@ private:
     int64_t               logEndOffset_   = 0;
     static constexpr int64_t kNoEvictionFloor = std::numeric_limits<int64_t>::max();
     int64_t               evictionFloor_  = kNoEvictionFloor;   ///< E2: see setEvictionFloor
+    std::size_t           produceReserve_ = 0;   ///< A.4: see setProduceReserve
     int32_t               leaderEpochStamp_ = -1;                                   ///< E2: see setLeaderEpochStamp
     uint32_t              nsId_           = 0;   // see setNsTag()
     uint16_t              nsSlot_         = 0;

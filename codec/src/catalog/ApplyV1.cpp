@@ -244,6 +244,9 @@ void applyConfigChanges(TopicConfig& c, const AlterTopicConfigOps& o) noexcept {
         case ConfigKey::MinCleanableDirtyRatioPpm: c.minCleanableDirtyRatioPpm = static_cast<int32_t>(ch.value); break;
         case ConfigKey::MinCompactionLagMs:        c.minCompactionLagMs = ch.value; break;
         case ConfigKey::MaxCompactionLagMs:        c.maxCompactionLagMs = ch.value; break;
+        case ConfigKey::LeaseTtlMs: case ConfigKey::LeaseMinTtlMs: case ConfigKey::LeaseMaxTtlMs:
+        case ConfigKey::LeaseCheckpoint: case ConfigKey::LeaseCheckpointIntervalMs: case ConfigKey::LeaseCheckpointRate:
+            break;   // formatVer 4: ApplyV4 applies the lease.* keys; they never reach the v1 rules
         }
     }
 }

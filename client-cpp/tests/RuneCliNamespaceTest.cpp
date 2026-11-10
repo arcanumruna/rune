@@ -7,6 +7,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -25,10 +27,10 @@ CliRun runCli(std::vector<std::string> args) {
 }
 } // namespace
 
-// Every one of the 29 mask fields has a distinct flag, `--<name> N` sets exactly that field and its mask bit.
+// Every one of the 30 mask fields has a distinct flag, `--<name> N` sets exactly that field and its mask bit.
 TEST(NamespaceCliRegression, FlagsCoverEveryLimitRegression) {
     ASSERT_EQ(rcl::kNamespaceLimitFields.size(), rp::kNamespaceLimitFieldCount);
-    ASSERT_EQ(rcl::kNamespaceLimitFields.size(), 29u);
+    ASSERT_EQ(rcl::kNamespaceLimitFields.size(), 30u);
     std::set<std::string_view> names;
     for (const auto& f : rcl::kNamespaceLimitFields) EXPECT_TRUE(names.insert(f.name).second) << f.name;
     // Distinct member pointers: no two flags write the same field.
@@ -44,7 +46,7 @@ TEST(NamespaceCliRegression, FlagsCoverEveryLimitRegression) {
             EXPECT_EQ(rcl::namespaceLimitGet(p->values, j), i == j ? 1000 + i : 0u) << i << "/" << j;
         }
     }
-    // All 29 at once: the full mask.
+    // All 30 at once: the full mask.
     std::vector<std::string> all, rest;
     for (std::size_t i = 0; i < rcl::kNamespaceLimitFields.size(); ++i) {
         all.push_back("--" + std::string(rcl::kNamespaceLimitFields[i].name));
@@ -57,6 +59,7 @@ TEST(NamespaceCliRegression, FlagsCoverEveryLimitRegression) {
     EXPECT_EQ(p->values.maxTopics, 1u);
     EXPECT_EQ(p->values.lowestMinInsync, 28u);
     EXPECT_EQ(p->values.featureBits, 29u);
+    EXPECT_EQ(p->values.maxLeases, 30u);
     // Refusals: a missing / non-numeric / negative / over-u32 feature-bits value, the same flag twice.
     for (const std::vector<std::string>& bad : std::vector<std::vector<std::string>>{
              {"--max-topics"}, {"--max-topics", "x"}, {"--max-topics", "-1"}, {"--max-topics", "1", "--max-topics", "2"},
@@ -85,6 +88,21 @@ TEST(NamespaceCliRegression, LimitSetsBuildAPatchOfOnlyTheNamedFieldsRegression)
     EXPECT_FALSE(rune::cli::namespaceLimitSetsPatch({"nope=1"}).has_value());
 }
 
+// Lease topics Task 21: `--max-leases N` is mask bit 29 (byte 3, bit 5) and nothing else; feature-bits stays index 28.
+TEST(NamespaceCliRegression, MaxLeasesFlagSetsBit29Regression) {
+    EXPECT_EQ(rcl::namespaceLimitIndex("max-leases"), std::optional<std::size_t>(29));
+    EXPECT_EQ(rcl::namespaceLimitIndex("feature-bits"), std::optional<std::size_t>(28));
+    std::vector<std::string> args = {"--max-leases", "9"}, rest;
+    const auto p = rune::cli::parseNamespaceLimitFlags(args, rest);
+    ASSERT_TRUE(p.has_value()) << p.error();
+    EXPECT_EQ(p->values.maxLeases, 9u);
+    EXPECT_EQ(p->present, (std::array<uint8_t, 4>{0, 0, 0, 0x20}));
+    const auto s = rune::cli::namespaceLimitSetsPatch({"max-leases=0"});
+    ASSERT_TRUE(s.has_value()) << s.error();
+    EXPECT_TRUE(s->has(29));
+    EXPECT_EQ(s->values.maxLeases, 0u);
+}
+
 // `limits <ns> --set k=v`: only the named fields change, every other keeps the value read from the broker.
 TEST(NamespaceCliRegression, LimitsSetReadModifyWriteRegression) {
     rp::NamespaceLimits base{};
@@ -105,7 +123,7 @@ TEST(NamespaceCliRegression, LimitsSetReadModifyWriteRegression) {
     // The printed limits and the list output carry the values.
     const std::string lim = rune::cli::formatNamespaceLimits(*r);
     EXPECT_NE(lim.find("max-topics"), std::string::npos);
-    EXPECT_EQ(std::count(lim.begin(), lim.end(), '\n'), 29);
+    EXPECT_EQ(std::count(lim.begin(), lim.end(), '\n'), 30);
     rpc::NamespaceInfo a{1, "a", 0, *r}, b{2, "b\"q", 2, base};
     const std::string table = rune::cli::formatNamespacesTable({a, b});
     EXPECT_EQ(table.substr(0, table.find('\n')), "nsId  name  state");
@@ -114,7 +132,7 @@ TEST(NamespaceCliRegression, LimitsSetReadModifyWriteRegression) {
     const std::string json = rune::cli::formatNamespacesJson({a, b});
     EXPECT_EQ(json.rfind("[{\"nsId\":1,\"name\":\"a\",\"state\":\"active\",\"limits\":{\"max-topics\":7,", 0), 0u) << json;
     EXPECT_NE(json.find("\"name\":\"b\\\"q\""), std::string::npos) << json;
-    EXPECT_NE(json.find("\"feature-bits\":3}"), std::string::npos) << json;
+    EXPECT_NE(json.find("\"feature-bits\":3,\"max-leases\":129}"), std::string::npos) << json;
     EXPECT_EQ(json.back(), '\n');
 }
 
@@ -212,7 +230,7 @@ TEST(NamespaceCliRegression, UsageFormatRegression) {
     EXPECT_NE(squeezed.find("\nmax-partitions-total 0 7\n"), std::string::npos) << t;
     EXPECT_NE(squeezed.find("\nmax-disk-bytes 1000 400\n"), std::string::npos) << t;
     EXPECT_NE(squeezed.find("\nmax-schemas 0 -\n"), std::string::npos) << t;
-    EXPECT_EQ(std::count(t.begin(), t.end(), '\n'), 1 + 1 + 29) << "state line + header + one row per limit";
+    EXPECT_EQ(std::count(t.begin(), t.end(), '\n'), 1 + 1 + 30) << "state line + header + one row per limit";
     const std::string j = rune::cli::formatNamespaceUsageJson("ac\"me", r);
     EXPECT_EQ(j.rfind("{\"name\":\"ac\\\"me\",\"state\":\"suspended-read-only\",\"limits\":{\"max-topics\":5,", 0), 0u) << j;
     EXPECT_NE(j.find("\"usage\":{\"max-topics\":3,"), std::string::npos) << j;
@@ -233,8 +251,8 @@ void expectPatchExactly(const rcl::NamespaceLimitsPatch& p, const std::vector<st
     }
     for (std::size_t i = 0; i < named.size(); ++i)
         if (!named[i]) EXPECT_FALSE(p.has(i)) << ctx << ": unnamed field " << rcl::kNamespaceLimitFields[i].name << " is in the mask";
-    // Bits 29..31 of the 4-byte mask name no field: never sent.
-    EXPECT_EQ(p.present[3] & 0xE0u, 0u) << ctx;
+    // Bits 30..31 of the 4-byte mask name no field: never sent.
+    EXPECT_EQ(p.present[3] & 0xC0u, 0u) << ctx;
 }
 } // namespace
 
@@ -255,7 +273,7 @@ TEST(NamespaceCliRegression, LimitSetsPatchEveryFieldCombinationAdversarialRegre
             EXPECT_FALSE(rune::cli::namespaceLimitSetsPatch({name + "=4294967296"}).has_value());
         EXPECT_FALSE(rune::cli::namespaceLimitSetsPatch({name + "=18446744073709551616"}).has_value()) << name;
     }
-    // All 29 at once, in reverse order.
+    // All 30 at once, in reverse order.
     std::vector<std::string> all;
     std::vector<std::pair<std::size_t, uint64_t>> want;
     for (std::size_t i = n; i-- > 0;) {

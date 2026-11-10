@@ -97,6 +97,19 @@ struct HubCommand {
         /// a = Token, b / c = target; completes Ok once
         /// every one of them settled (each bounded by its own deadline).
         ClientDrain     = 51,
+
+        // ---- LeaseSession produce guard (Task 15; LeaseGuards.h).  handle = the session id (its Completions' CqRef) ----------
+        /// a = capacity | pool << 32; b / c = the session queue's target (encodeTarget).  The duty side pins the queue, allocates
+        /// the block and answers with a Reserved / ReserveFailed LeaseGuard completion.
+        GuardReserve    = 60,
+        /// a = slot | gen << 32, b = armSeq, c = the at-risk instant (client clock, ns).
+        GuardArm        = 61,
+        /// a = slot | gen << 32.  Answered with exactly one Ended event (when the generation matches).
+        GuardEnd        = 62,
+        /// Frees the block and unpins the queue.
+        GuardRelease    = 63,
+        /// a = the number of guard events the session consumed so far (monotonic): the event pool credit.
+        GuardAck        = 64,
     };
 
     Op       op     = Op::SubscribeAdd;

@@ -84,7 +84,28 @@ struct SinkSpec {
     uint32_t                     nsId       = 0;   // the namespace that owns the view (and so its sink)
     /// The source topic's key features: the sink routes a key like its source (partitioner).
     rune::protocol::TopicKeyFeatures sourceKeyFeatures{};
+    /// A lease topic's lease view (`<topic>.leases`): a catalog-only sink with NO plan - never viewInstalled, and the
+    /// gateway is never told to await a plan for it.
+    bool leaseView = false;
+    /// A lease view: the lease topic that owns it (from the catalog, `ViewObject::leaseTopicObjectId`'s topic id); -1 otherwise.  The
+    /// gateway routes a read of the view by it and authorises the read as READ on that topic; the workers learn it from the write spec.
+    int32_t leaseSourceTopicId = -1;
+    /// A lease view: the lease topic's key type (rune::codec::PrimType) and width in bytes (0: unknown).  The gateway narrows a legacy GetViewRow's
+    /// u64 key to this width before it picks the partition (the worker does the same with the same helper, lease/LeaseKey.h).
+    uint8_t leaseKeyType  = 0;
+    uint8_t leaseKeyWidth = 0;
 };
+
+/// A lease view's sink must name its lease topic (the gateway authorises its reads as READ on that topic): a lease-view sink without
+/// one is a catalog the broker cannot serve safely, and is refused (fail closed) by every consumer of a SinkSpec - the live decoder's
+/// frame rule (AdminChannels.h) and the boot sink (BrokerNode::bootSinkApplied_) share this one rule.
+[[nodiscard]] inline constexpr bool leaseViewSinkValid(bool leaseView, int32_t leaseSourceTopicId) noexcept {
+    return !leaseView || leaseSourceTopicId >= 0;
+}
+[[nodiscard]] inline bool leaseViewSinkValid(const SinkSpec& s) noexcept { return leaseViewSinkValid(s.leaseView, s.leaseSourceTopicId); }
+
+/// The sink of a lease view (cold; exposed so a test can pin what it mirrors from a hand-built state).
+[[nodiscard]] SinkSpec leaseSinkSpecOf(const rune::catalog::ViewObject& v, const rune::catalog::CatalogState& state);
 
 /// The admin-thread effect sink.  Production = ring encoders (AdminWorkerAgent);
 /// tests = recorders.  An empty function is skipped.
@@ -100,6 +121,9 @@ struct CatalogEffects {
     std::function<void(uint32_t nsId)>                                   namespaceErased;
     std::function<void(int32_t topicId, uint32_t nsId, const std::string& name)> topicDropped;   // DropTopic, retired sink
     std::function<void(int32_t topicId, std::span<const rune::catalog::ConfigChange>)> topicConfig;
+    // A lease topic's lease.* keys (7..12) changed: the topic AFTER the event, so the workers' write spec follows.
+    // Fires after topicConfig.
+    std::function<void(const rune::catalog::TopicObject&)>               writeSpecChanged;
     // Validators fan-out of versions fromVersion..current: live passes the current version (earlier ones were
     // posted by earlier events), boot passes 1 (workers start empty).
     std::function<void(const rune::catalog::TopicObject&, uint16_t fromVersion)> schemaChanged;

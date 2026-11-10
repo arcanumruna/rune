@@ -1948,6 +1948,52 @@ TEST_P(GatewayLargeBatchPushRegression, AboveMaxMessageLengthAnswersErrorNoSilen
         << "cursor advanced past an undelivered batch (silent loss)";
 }
 
+// Lease-transient (gateway-pushed PushRead): a PushReadResult answered PartitionDataReset (43) fails the subscription once,
+// non-retriably (the same lifecycle as #839's StorageError): ONE ErrorResponse code 43 naming the subscription, correlationId 0,
+// the cursor parked, and no further PushRead is issued for it.  Mutation: map 43 to ReturnRing in the gateway's error branch ->
+// the client gets MessageTooLarge (14), red.
+TEST_P(GatewayLargeBatchPushRegression, PushReadDataResetFailsSubscriptionRegression)
+{
+    if (!GetParam()) GTEST_SKIP() << "the gateway-pushed PushRead path exists only with a worker pool";
+    Egress eg;
+    Conn c = connect("aeron:ipc", kEgressBase + 73, eg);
+    const int64_t subId = subscribe(c, eg, kPartitionA0, 73);
+    const int64_t subOther = subscribe(c, eg, kPartitionA1, 74);
+
+    rune::node::WorkerReturn ret;
+    ret.type           = rune::node::WorkerReturn::Type::PushReadResult;
+    ret.subscriptionId = subId;
+    ret.sessionId      = c.sid;
+    ret.readTopicId    = kTopicIdA;
+    ret.readPartition  = kPartitionA0;
+    ret.newNextOffset  = 0;
+    ret.errorCode      = static_cast<int16_t>(pc::ErrorCode::PartitionDataReset);
+    gw_->handleWorkerReturnForTest(ret);
+
+    pump([&]() { return !eg.errors.empty(); }, c.egressSub.get(), &eg.fa, kPumpIter, "PartitionDataReset error");
+    ASSERT_EQ(eg.errors.size(), 1u);
+    EXPECT_EQ(eg.errors[0].code, static_cast<int16_t>(pc::ErrorCode::PartitionDataReset));
+    EXPECT_EQ(eg.errors[0].code, 43);
+    EXPECT_EQ(eg.errors[0].correlationId, 0);
+    const std::string want = "subscription " + std::to_string(subId) + " topic " + std::to_string(kTopicIdA) +
+                             " partition " + std::to_string(kPartitionA0) + " offset 0";
+    EXPECT_NE(eg.errors[0].message.find(want), std::string::npos) << "got: " << eg.errors[0].message;
+
+    // Parked: records appended afterwards are never read for the failed subscription (no PushRead for it), the other flows.
+    appendSized(kPartitionA0, 16);
+    appendSized(kPartitionA1, 16);
+    pump([&]() { return eg.recordsFor(subOther) >= 1; }, c.egressSub.get(), &eg.fa, kPumpIter, "other subscription");
+    for (int i = 0; i < 200; ++i) {
+        gw_->doWork(nowNs());
+        pool_->doWork(nowNs());
+        c.egressSub->poll(eg.fa.handler(), 64);
+    }
+    EXPECT_EQ(eg.recordsFor(subId), 0u) << "nothing is delivered after the end";
+    EXPECT_EQ(eg.errors.size(), 1u) << "exactly one error, no spin";
+    EXPECT_EQ(gw_->subscriptionNextOffsetForTest(subId), 0) << "the cursor stays parked";
+    EXPECT_EQ(eg.recordsFor(subOther), 1u);
+}
+
 TEST_P(GatewayLargeBatchPushRegression, BackPressuredLargeOfferRetriesWithoutLoss)
 {
     Egress eg;

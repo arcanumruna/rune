@@ -34,6 +34,7 @@
 // avoid a circular CMake target dep; rune_gateway does NOT link rune_node).
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/lease/LeaseKey.h>
 #include <rune/node/SessionAckSink.h>
 // E5.1.2d: shared produce-batch helper now in rune_storage (leaf lib, no circular dep).
 #include <rune/storage/ProducePath.h>
@@ -159,6 +160,7 @@ ClientGateway::ClientGateway(TestConstructTag,
 {
     pendingAcks_.reserve(kMaxPendingAcks);
     drainingRegistrations_.reserve(kMaxPendingConnects);
+    sessions_.setIdStartForTest(0);   // a test gateway hands out 1, 2, ... (the produce handler answers session 1); a real one starts per boot at random
 }
 
 // G1.1: Test-only constructor — also wires leaderView_.
@@ -178,6 +180,7 @@ ClientGateway::ClientGateway(TestConstructTag,
 {
     pendingAcks_.reserve(kMaxPendingAcks);
     drainingRegistrations_.reserve(kMaxPendingConnects);
+    sessions_.setIdStartForTest(0);   // a test gateway hands out 1, 2, ... (the produce handler answers session 1); a real one starts per boot at random
 }
 
 void ClientGateway::injectPendingHandshakeForTest(int64_t sessionId)
@@ -852,6 +855,7 @@ int ClientGateway::doWork(int64_t nowNs) {
         imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost client images (m-c)
     }
     pollPendingConnects(nowNs);
+    work += pollUnknownSessionNotices_(nowNs);   // L22 Part B
     work += advanceInlinePsmScans_();   // I3: budgeted inline producer-state rebuilds
     // Task 13: SessionClose ops a full worker ring refused earlier — never dropped.
     if (shardMode_ && workerPool_) work += sessionAnnouncer_.retryCloses(*workerPool_);
@@ -1199,6 +1203,17 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         if (peekedTid != pc::TemplateId::Connect &&
             peekedTid != pc::TemplateId::HandshakeContinue) {
             if (Session* s = sessions_.find(hdrOpt->sessionId); s != nullptr && s->crypto.encrypted) {
+                // U2: the header does not tell a clear frame from a sealed one (a sealed frame keeps the clear header, schema id
+                // included, and appends the crypto sub-header), so the probe is recognised by what only it carries: a Ping whose
+                // correlationId is at or below -kProbeNonceFloor.  Sealed Pings never carry one (a keepalive's is -(session index + 1),
+                // an application ping's is positive), and the client draws every probe nonce at or below it.  A probe naming a KNOWN
+                // encrypted session is dropped here, before any AEAD attempt: it is not tamper or replay evidence (a live gateway
+                // gets it every keepalive interval from each encrypted session), so it reaches neither the tamper nor the replay
+                // accounting.  (A restarted gateway, which knows no session, answers it from handlePing's unknown branch.)
+                if (peekedTid == pc::TemplateId::Ping && hdrOpt->correlationId <= -kProbeNonceFloor) [[unlikely]] {
+                    ++clearFramesOnEncryptedSessionDropped_;
+                    return true;
+                }
                 // Plaintext is always kCryptoOverhead (28) bytes SHORTER than
                 // the wire frame — `len` bytes of capacity is always enough.
                 // noexcept-adjacent hot path: vector::resize can throw
@@ -1307,6 +1322,9 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::GetViewRowK:
         case pc::TemplateId::ScanViewRows:
         case pc::TemplateId::GetStats:
+        case pc::TemplateId::LeaseKeepAlive:
+        case pc::TemplateId::LeaseTimeToLive:
+        case pc::TemplateId::ScanLeases:
             if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
                 sessions_.touch(hdr->sessionId, nowNs_);
             }
@@ -1439,6 +1457,16 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             break;
         case pc::TemplateId::GetStats:
             handleGetStats(buf, len);
+            break;
+        // Lease topics Task 11b / 13b: keepalive / TimeToLive / ScanLeases route to the partition leader's worker.
+        case pc::TemplateId::LeaseKeepAlive:
+            handleLeaseKeepAlive(buf, len);
+            break;
+        case pc::TemplateId::LeaseTimeToLive:
+            handleLeaseTimeToLive(buf, len);
+            break;
+        case pc::TemplateId::ScanLeases:
+            handleScanLeases(buf, len);
             break;
         default:
             // ConnectResponse, ErrorResponse, Pong, MetadataResponse (broker→client),
@@ -2259,9 +2287,7 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
             }
         }
         if (pc_entry.responseEgress) {
-            pc_entry.replyChannel = "aeron:udp?control=" + responseControlEndpoint_ +
-                                    "|control-mode=response|response-correlation-id=" +
-                                    std::to_string(image.correlation_id);
+            responseChannelFor_(image.correlation_id, pc_entry.replyChannel);
         } else {
             pc_entry.replyChannel = pc_entry.egressChannel;
             if (wantsResponse) {
@@ -2365,9 +2391,7 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // DR-15 fix round 2 (LOW-4): a reply HOSTNAME is resolved off-thread by the
     // cold resolver (never by a driver conductor on a duty thread); the session
     // stays pending — bounded by the connect timeout — until the hub answers.
-    const std::string_view replyHost = rune::consensus::PeerHostTable::endpointHost(pc_entry.egressChannel);
-    if (!pc_entry.responseEgress && hostResolver_.valid() && !replyHost.empty() &&
-        !rune::consensus::PeerHostTable::isNumericHost(replyHost)) [[unlikely]] {
+    if (!pc_entry.responseEgress && hostResolver_.valid() && channelNamesHostname_(pc_entry.egressChannel)) [[unlikely]] {
         pc_entry.awaitingResolve = true;
         // Fix round 3 (concern 2): a momentarily full resolve ring no longer
         // drops the Connect — the pending connect is kept (ResolveOfferPending)
@@ -2416,14 +2440,19 @@ void ClientGateway::drainHandshakeOutbound_(PendingConnect& pending)
 //   - Otherwise → leave in pending for next cycle.
 // Never blocks.
 // ---------------------------------------------------------------------------
+std::shared_ptr<aeron::ExclusivePublication> ClientGateway::placeholderPub_()
+{
+    static unsigned char placeholder alignas(64)[512];
+    return std::shared_ptr<aeron::ExclusivePublication>(
+        reinterpret_cast<aeron::ExclusivePublication*>(placeholder), [](aeron::ExclusivePublication*) {});
+}
+
 bool ClientGateway::registerConnectEgress_(PendingConnect& pending)
 {
     if (testEgressFn_ && !aeron_) [[unlikely]] {
         // Test gateways never reach Aeron (issue #236 tests drive real Connects): a placeholder reply publication,
         // never dereferenced while testEgressFn_ intercepts every pre-session offer (offerOnPub_).
-        static unsigned char placeholder alignas(64)[512];
-        pending.resolvedPub = std::shared_ptr<aeron::ExclusivePublication>(
-            reinterpret_cast<aeron::ExclusivePublication*>(placeholder), [](aeron::ExclusivePublication*) {});
+        pending.resolvedPub = placeholderPub_();
         return true;
     }
     try {
@@ -2445,22 +2474,41 @@ bool ClientGateway::registerConnectEgress_(PendingConnect& pending)
 // ring is full right now (the caller keeps the connect pending and retries).
 bool ClientGateway::offerHostResolve_(PendingConnect& pending)
 {
-    // Fix round 4 (N12): allocated once per connect; a refused offer keeps it
-    // (retried each poll with no new allocation); the ring takes it on success.
-    if (!pending.resolveHost)
-        pending.resolveHost = std::make_unique<std::string>(
-            rune::consensus::PeerHostTable::endpointHost(pending.egressChannel));
-    if (!hostResolver_.req->offer(rune::consensus::kHostResolveRequest, pending.sessionId,
-                                  static_cast<int64_t>(reinterpret_cast<std::intptr_t>(pending.resolveHost.get()))))
+    return offerHostResolveOf_(pending.resolveHost, pending.egressChannel, pending.sessionId);
+}
+
+// The ONE resolver offer (the Connect path and the unknown-session notice path).  Fix round 4 (N12): allocated once per request;
+// a refused offer keeps it in `holder` (retried with no new allocation); the ring takes it on success.
+bool ClientGateway::offerHostResolveOf_(std::unique_ptr<std::string>& holder, std::string_view channel, int64_t id)
+{
+    if (!holder) holder = std::make_unique<std::string>(rune::consensus::PeerHostTable::endpointHost(channel));
+    if (!hostResolver_.req->offer(rune::consensus::kHostResolveRequest, id,
+                                  static_cast<int64_t>(reinterpret_cast<std::intptr_t>(holder.get()))))
         return false;
-    (void)pending.resolveHost.release();   // owned by the resolver from here (it deletes it)
+    (void)holder.release();   // owned by the resolver from here (it deletes it)
     return true;
+}
+
+bool ClientGateway::channelNamesHostname_(std::string_view channel)
+{
+    const std::string_view host = rune::consensus::PeerHostTable::endpointHost(channel);
+    return !host.empty() && !rune::consensus::PeerHostTable::isNumericHost(host);
+}
+
+std::string ClientGateway::channelWithResolvedHost_(std::string_view channel, int64_t ip)
+{
+    in_addr a{};
+    a.s_addr = static_cast<uint32_t>(ip);
+    char buf[INET_ADDRSTRLEN] = {};
+    ::inet_ntop(AF_INET, &a, buf, sizeof buf);
+    return rune::consensus::PeerHostTable::withEndpointHost(channel, buf);
 }
 
 int ClientGateway::pollHostResolutions_()
 {
     if (!hostResolver_.valid()) [[likely]] return 0;
     return hostResolver_.resp->poll([this](std::int32_t type, std::int64_t id, std::int64_t ip) {
+        if (id < 0) { onNoticeResolved_(id, type == rune::consensus::kHostResolved, ip); return; }   // an unknown-session notice's answer
         for (auto it = pendingConnects_.begin(); it != pendingConnects_.end(); ++it) {
             if (it->sessionId != id || !it->awaitingResolve) continue;
             if (type != rune::consensus::kHostResolved) {
@@ -2470,11 +2518,7 @@ int ClientGateway::pollHostResolutions_()
                 pendingConnects_.erase(it);
                 return;
             }
-            in_addr a{};
-            a.s_addr = static_cast<uint32_t>(ip);
-            char buf[INET_ADDRSTRLEN] = {};
-            ::inet_ntop(AF_INET, &a, buf, sizeof buf);
-            it->egressChannel   = rune::consensus::PeerHostTable::withEndpointHost(it->egressChannel, buf);
+            it->egressChannel   = channelWithResolvedHost_(it->egressChannel, ip);
             it->replyChannel    = it->egressChannel;   // only a declared-path entry ever awaits a resolve
             it->awaitingResolve = false;
             if ((shardMode_ && it->egressChannel.size() > rune::node::SessionAckSink::kMaxChannelBytes) ||
@@ -3110,6 +3154,27 @@ void ClientGateway::handlePing(const uint8_t* buf, std::size_t len, int64_t nowN
 
     Session* session = sessions_.find(pingOpt->sessionId);
     if (!session) {
+        // L22 Part B: a keepalive Ping (correlationId <= 0) carries [int32 LE egressStreamId][declared egress channel] as its echo.  A
+        // gateway that restarted and forgot the session answers ErrorResponse{UnknownSession} on that declared channel, so the client
+        // reconnects at once instead of waiting for its response timeout.  Anything else stays unanswerable.
+        //
+        // Security: an unauthenticated Ping makes the gateway open a publication to a channel the sender names, which Connect
+        // does too (before auth).  What bounds it: one notice per pending (host, channel, stream, sid); 16 entries; ONE pending
+        // entry per source host (sourceHostOf_, in every auth mode: a single sender cannot squat the table); a hostname endpoint is
+        // resolved off-thread by the cold resolver (or refused when there is none), never inline on the conductor or duty thread.
+        // An encrypted session's probe Ping (clear, carrying a random nonce as its correlationId) takes this same path.
+        constexpr std::size_t kMaxCh = rune::node::SessionAckSink::kMaxChannelBytes;
+        constexpr std::string_view kUdpPrefix = "aeron:udp?";
+        if (pingOpt->correlationId <= 0 && pingOpt->echo.size() > 4 && pingOpt->echo.size() <= 4 + kMaxCh &&
+            std::string_view(pingOpt->echo.data() + 4, pingOpt->echo.size() - 4).starts_with(kUdpPrefix)) {
+            const auto* e = reinterpret_cast<const uint8_t*>(pingOpt->echo.data());
+            const int32_t stream = static_cast<int32_t>(static_cast<uint32_t>(e[0]) | (static_cast<uint32_t>(e[1]) << 8) |
+                                                        (static_cast<uint32_t>(e[2]) << 16) | (static_cast<uint32_t>(e[3]) << 24));
+            if (answerUnknownSession_(std::string_view(pingOpt->echo.data() + 4, pingOpt->echo.size() - 4), stream, pingOpt->sessionId,
+                                      pingOpt->correlationId, nowNs) != UnknownSessionNotice::Queued)
+                noteUnanswerable_(buf, len, "Ping for unknown session (notice deduped or dropped)");
+            return;
+        }
         noteUnanswerable_(buf, len, "Ping for unknown session");
         return;
     }
@@ -3411,6 +3476,164 @@ void ClientGateway::evictOldClientMember_(Session& session, uint16_t tid, const 
     ++oldClientSessionWideEvictions_;
 }
 
+void ClientGateway::responseChannelFor_(int64_t imageCorrelationId, std::string& out) const
+{
+    out.assign("aeron:udp?control=");
+    out.append(responseControlEndpoint_);
+    out.append("|control-mode=response|response-correlation-id=");
+    out.append(std::to_string(imageCorrelationId));
+}
+
+ClientGateway::UnknownSessionNotice ClientGateway::answerUnknownSession_(std::string_view channel, int32_t streamId, int64_t sid,
+                                                                       int64_t correlationId, int64_t nowNs)
+{
+    static_assert(sizeof(UnknownSessionEntry::channel) == rune::node::SessionAckSink::kMaxChannelBytes);
+    if (channel.empty() || channel.size() > rune::node::SessionAckSink::kMaxChannelBytes) {
+        ++unknownSessionNoticesDropped_;
+        return UnknownSessionNotice::Dropped;
+    }
+    UnknownSessionEntry* slot = nullptr;
+    for (auto& e : unknownNotices_) {
+        if (e.state == NoticeState::Free) { if (slot == nullptr) slot = &e; continue; }
+        if (e.streamId != streamId || std::string_view(e.channel.data(), e.channelLen) != channel) continue;
+        for (uint8_t i = 0; i < e.nSids; ++i)
+            if (e.sids[i] == sid) { ++unknownSessionNoticesDeduped_; return UnknownSessionNotice::Deduped; }
+        if (e.nSids >= kUnknownSessionNoticeSids || e.nSent != 0) { ++unknownSessionNoticesDropped_; return UnknownSessionNotice::Dropped; }
+        e.sids[e.nSids] = sid;
+        e.corrs[e.nSids] = correlationId;
+        ++e.nSids;
+        return UnknownSessionNotice::Queued;
+    }
+    const bool testGateway = testEgressFn_ && !aeron_;   // the intercepting test egress: a placeholder publication, never dereferenced
+    if (slot == nullptr || (!aeron_ && !testGateway)) { ++unknownSessionNoticesDropped_; return UnknownSessionNotice::Dropped; }
+    // Fairness (the Connect path's key, in every auth mode): ONE pending entry per source host, so a single sender cannot squat the
+    // 16-entry table.  Cold: an unknown session only, after the table-room check above.
+    const std::string srcHost = sourceHostOf_(channel);
+    const std::size_t hostLen = std::min(srcHost.size(), kNoticeSrcHostBytes);
+    for (const auto& e : unknownNotices_) {
+        if (e.state != NoticeState::Free && std::string_view(e.srcHost.data(), e.srcHostLen) == std::string_view(srcHost.data(), hostLen)) {
+            ++unknownSessionNoticesDropped_;
+            return UnknownSessionNotice::Dropped;
+        }
+    }
+    slot->pub.reset();
+    slot->registrationId = -1;
+    std::memcpy(slot->channel.data(), channel.data(), channel.size());
+    slot->channelLen = static_cast<uint16_t>(channel.size());
+    slot->streamId = streamId;
+    slot->sids[0] = sid;
+    slot->corrs[0] = correlationId;
+    slot->nSids = 1;
+    slot->nSent = 0;
+    slot->startNs = nowNs;
+    std::memcpy(slot->srcHost.data(), srcHost.data(), hostLen);
+    slot->srcHostLen = static_cast<uint8_t>(hostLen);
+    const auto drop = [&]() {
+        slot->state = NoticeState::Free;
+        slot->channelLen = 0;
+        slot->nSids = 0;
+        ++unknownSessionNoticesDropped_;
+        return UnknownSessionNotice::Dropped;
+    };
+    if (channelNamesHostname_(channel)) {
+        // A hostname is never resolved inline (a driver conductor would block on DNS): off-thread through the cold resolver,
+        // exactly as the declared-egress Connect path does (DR-15); without one the notice is refused.
+        if (!hostResolver_.valid()) return drop();
+        slot->resolveId = kNoticeResolveIdBase + ++noticeResolveSeq_;
+        std::unique_ptr<std::string> holder;
+        if (!offerHostResolveOf_(holder, channel, slot->resolveId)) return drop();   // a full ring: best-effort, the client re-probes
+        slot->state = NoticeState::Resolving;
+        return UnknownSessionNotice::Queued;
+    }
+    if (!startNoticePub_(*slot, testGateway)) return drop();
+    return UnknownSessionNotice::Queued;
+}
+
+bool ClientGateway::startNoticePub_(UnknownSessionEntry& e, bool testGateway)
+{
+    e.pub.reset();
+    e.registrationId = -1;
+    e.state = NoticeState::Registering;
+    if (testGateway) { e.pub = placeholderPub_(); return true; }
+    try {
+        // Exactly the call the declared-egress Connect path makes for pc_entry.replyChannel.
+        e.registrationId = aeron_->addExclusivePublication(
+            rune::node::withSparseTerms(std::string_view(e.channel.data(), e.channelLen)), e.streamId);
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+void ClientGateway::onNoticeResolved_(int64_t id, bool resolved, int64_t ip)
+{
+    for (auto& e : unknownNotices_) {
+        if (e.state != NoticeState::Resolving || e.resolveId != id) continue;
+        const auto release = [&e] { e.state = NoticeState::Free; e.channelLen = 0; e.nSids = 0; e.nSent = 0; };
+        if (!resolved) { release(); ++unknownSessionNoticesDropped_; return; }
+        const std::string ch = channelWithResolvedHost_(std::string_view(e.channel.data(), e.channelLen), ip);
+        if (ch.size() > rune::node::SessionAckSink::kMaxChannelBytes) { release(); ++unknownSessionNoticesDropped_; return; }
+        std::memcpy(e.channel.data(), ch.data(), ch.size());
+        e.channelLen = static_cast<uint16_t>(ch.size());
+        if (!startNoticePub_(e, testEgressFn_ && !aeron_)) { release(); ++unknownSessionNoticesDropped_; }
+        return;
+    }
+    // Not pending any more (abandoned): nothing registered, nothing to release.
+}
+
+int ClientGateway::pollUnknownSessionNotices_(int64_t nowNs)
+{
+    int work = 0;
+    for (auto& e : unknownNotices_) {
+        if (e.state == NoticeState::Free) continue;
+        const auto release = [&e] {
+            e.pub.reset();   // closes the publication; Aeron's linger delivers what was offered
+            e.state = NoticeState::Free;
+            e.channelLen = 0;
+            e.registrationId = -1;
+            e.nSids = 0;
+            e.nSent = 0;
+        };
+        if (nowNs - e.startNs > kUnknownSessionNoticeAbandonNs) {   // a resource bound for a vanished client, not a convergence timer
+            const bool resolving = e.state == NoticeState::Resolving;
+            const bool resolved = e.pub != nullptr;
+            const int64_t reg = e.registrationId;
+            release();
+            if (!resolving && !resolved) abandonRegistration_(reg);
+            ++unknownSessionNoticesAbandoned_;
+            ++work;
+            continue;
+        }
+        if (e.state == NoticeState::Resolving) continue;   // the resolver's answer moves it on (onNoticeResolved_)
+        if (!e.pub) {
+            try {
+                if (aeron_) e.pub = aeron_->findExclusivePublication(e.registrationId);
+            } catch (...) {   // ERRORED_MEDIA_DRIVER: the conductor already cleaned up
+                release();
+                ++unknownSessionNoticesAbandoned_;
+                ++work;
+                continue;
+            }
+            if (!e.pub) continue;
+        }
+        e.state = NoticeState::Sending;
+        if (!testEgressFn_ && !e.pub->isConnected()) continue;
+        while (e.nSent < e.nSids) {
+            pc::ErrorResponse err;
+            err.sessionId     = e.sids[e.nSent];
+            err.correlationId = e.corrs[e.nSent];
+            err.code          = static_cast<int16_t>(pc::ErrorCode::UnknownSession);
+            const std::size_t encoded = err.encode(scratch_.data());
+            if (!offerOnPub_(*e.pub, scratch_.data(), encoded)) break;   // back-pressured: retried on the next poll
+            ++e.nSent;
+            ++unknownSessionNoticesSent_;
+            ++work;
+        }
+        if (e.nSent == e.nSids) release();
+    }
+    return work;
+}
+
 void ClientGateway::noteUnanswerable_(const uint8_t* buf, std::size_t len, const char* why)
 {
     if (unanswerableFrames_++ % 1024 != 0) return;
@@ -3551,11 +3774,13 @@ void ClientGateway::forgetDroppedTopic(int32_t topicId, int32_t partitions,
     }
 }
 
-bool ClientGateway::readCommittedServableHere_(int32_t topicId, int32_t partition) const noexcept
+bool ClientGateway::servableHere_(int32_t topicId, int32_t partition, uint8_t isolation) const noexcept
 {
     if (replicaRegistry_ == nullptr || topicId < 0) return true;   // unreplicated / internal: unchanged
     const GatewayReplicaView v{replicaRegistry_->lookupHandle(topicId, partition)};
-    return !v || v.publishedLeader();
+    if (!v) return true;
+    const bool rc = isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted);
+    return (!rc && !v.leaderOnlyReads()) || v.publishedLeader();
 }
 
 void ClientGateway::scanMovedAwaySlice_()
@@ -3621,7 +3846,8 @@ bool ClientGateway::movedAway_(Subscription& sub) const noexcept
     // here, the first time a sweep sees the registered replica — so that
     // replica's later removal retires it instead of leaving it silent.
     sub.hadReplica = true;
-    return sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
+    // Checked writes: records needing verdicts are deliverable by the leader only, at any isolation (servableHere_).
+    return (sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) || v.leaderOnlyReads()) &&
            !v.publishedLeader();
 }
 
@@ -4611,6 +4837,7 @@ rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s
     op.isolation            = s.isolation;
     op.isGroup              = s.isGroup;
     op.groupCarrierReceived = s.groupCarrierReceived;
+    op.fromEarliest         = s.fromEarliest;
     op.logPtr               = log;
     op.replica              = const_cast<rune::replication::PartitionReplica*>(rep);
     op.egressPub            = egressPub;
@@ -4758,10 +4985,10 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
                                               int32_t topicId, int32_t partition,
                                               int64_t nextOffset, uint8_t isolation,
                                               bool isGroup, bool groupCarrierReceived,
-                                              int64_t subscribeCorrId)
+                                              int64_t subscribeCorrId, bool fromEarliest)
 {
     BufferedSubscribe s{subId, subscribeCorrId, sessionId, topicId, partition,
-                        nextOffset, isolation, isGroup, groupCarrierReceived};
+                        nextOffset, isolation, isGroup, groupCarrierReceived, fromEarliest};
 
     rune::gateway::Session* sess = sessions_.find(sessionId);
 
@@ -5304,10 +5531,12 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // BEFORE any subscription is registered — the one registration point both
     // worker modes go through (shard mode forwards the registered sub to the
     // owning worker below).  Also covers a group carrier switching to it (5a).
-    if (msg.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
-        !readCommittedServableHere_(msg.topicId, partition)) [[unlikely]] {
-        spdlog::debug("ClientGateway: read_committed Subscribe to topicId={} partition={} on a follower — "
-                      "NotLeader (retriable)", msg.topicId, partition);
+    // Checked writes: a partition whose records need verdicts (a lease topic, a typed partition) is served by its
+    // leader only, at any isolation: a typed partition (it has a write state) is served by its leader only, a follower holds
+    // no verdict state, so its verdict bound never moves.
+    if (!servableHere_(msg.topicId, partition, msg.isolation)) [[unlikely]] {
+        spdlog::debug("ClientGateway: Subscribe to topicId={} partition={} (isolation {}) on a follower — "
+                      "NotLeader (retriable)", msg.topicId, partition, msg.isolation);
         sendSubRedirect(std::string{}, msg.correlationId);
         return;
     }
@@ -5567,6 +5796,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     sub.partition      = partition;
     sub.nextOffset     = nextOffset;
     sub.isolation      = msg.isolation;
+    sub.fromEarliest   = msg.fromOffset == kFromEarliest;
     sub.subscribeCorrId = msg.correlationId;
     sub.hadReplica      = replicaRegistry_ != nullptr &&
                           static_cast<bool>(replicaRegistry_->lookupHandle(msg.topicId, partition));
@@ -5596,7 +5826,8 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         forwardSubscribeToWorker_(subId, msg.sessionId, msg.topicId, partition,
                                   nextOffset, msg.isolation,
                                   /*isGroup=*/false, /*groupCarrierReceived=*/false,
-                                  /*subscribeCorrId=*/msg.correlationId);
+                                  /*subscribeCorrId=*/msg.correlationId,
+                                  /*fromEarliest=*/msg.fromOffset == kFromEarliest);
     }
     if (okOwed) return;   // F1: the OK (and the lineage note) follow the egress, or the refusal replaces them
 
@@ -5951,8 +6182,28 @@ void ClientGateway::forgetViewSource(int32_t viewTopicId)
     if (it != viewSources_.end() && it->first == viewTopicId) viewSources_.erase(it);
 }
 
+int32_t ClientGateway::leaseSourceOfView_(int32_t viewTopicId) const noexcept
+{
+    // The registry's sink spec (viewSinkSpec is null for a Dropped / unknown id): -1 for every non-lease view.  Control-plane facts only,
+    // O(1), no allocation.
+    if (topicRegistry_ == nullptr) return -1;
+    const rune::node::TopicSpec* sp = topicRegistry_->viewSinkSpec(viewTopicId);
+    return sp != nullptr ? sp->leaseSourceTopicId : -1;
+}
+
+std::optional<rune::gateway::Denial> ClientGateway::authorizeViewRead_(const rune::gateway::PermissionTable& perms,
+                                                                       int32_t viewTopicId) const
+{
+    // Spec 7.1 / 14.1: a lease view read needs READ on the lease TOPIC; a VIEW grant on `<topic>.leases` is not consulted.  A hidden
+    // (foreign namespace) topic answers exactly like a missing id (authorizeTopicIdHere_ is the one rule for both).
+    if (const int32_t src = leaseSourceOfView_(viewTopicId); src >= 0)
+        return authorizeTopicIdHere_(perms, src, 0, rune::security::Operation::Read, rune::security::ResourceType::Topic);
+    return authorizeTopicIdHere_(perms, viewTopicId, 0, rune::security::Operation::Read, rune::security::ResourceType::View);
+}
+
 int32_t ClientGateway::viewSourceOf_(int32_t viewTopicId) const noexcept
 {
+    if (const int32_t lease = leaseSourceOfView_(viewTopicId); lease >= 0) return lease;   // a lease view: its lease topic (the registry's)
     const auto it = std::lower_bound(viewSources_.begin(), viewSources_.end(), viewTopicId,
                                      [](const auto& e, int32_t id) { return e.first < id; });
     return (it != viewSources_.end() && it->first == viewTopicId) ? it->second : -1;
@@ -6357,6 +6608,7 @@ void ClientGateway::pushSubscriptionsPass_()
             op.isolation           = sub.isolation;
             op.isGroup             = sub.isGroup;
             op.freshCursor         = sub.cursorFresh;   // M2
+            op.fromEarliest        = sub.fromEarliest;  // lease-transient: only a fresh Earliest cursor may be raised
             op.groupCarrierReceived = sub.groupCarrierReceived;
 
             if (!workerPool_->tryEnqueueOp(sub.topicId, sub.partition, std::move(op))) {
@@ -7721,6 +7973,109 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             return;
         }
 
+        // Lease topics Task 11b: a worker's LeaseKeepAlive answer.  The gateway keeps no per-request state: EVERY return is one
+        // LeaseKeepAliveResponse frame (a request may get several - the decided entries at once, each parked entry later), the
+        // chunk is already the wire entry bytes ({index u16, code u16, ttlMs u64} x count).  A session that is gone drops it.
+        if (ret.type == rune::node::WorkerReturn::Type::LeaseKeepAliveResult) {
+            Session* session = sessions_.find(ret.sessionId);
+            if (!session) return;
+            using LKR = pc::LeaseKeepAliveResponse;
+            const std::span<const uint8_t> chunk = ret.chunkBytes();
+            const std::size_t count = static_cast<std::size_t>(ret.recordCount > 0 ? ret.recordCount : 0);
+            if (count < 1 || count > LKR::kMaxEntries || chunk.size() != count * LKR::kEntryBytes) [[unlikely]] {
+                // A worker bug (its chunk is built by the lease runtime, never by a client): count it, say so, answer Internal.
+                // Decided (11b(d)): the gateway is stateless per request.  This Internal is a FINAL answer, yet a later return for the same
+                // correlation id is still forwarded; the CLIENT drops any lease frame for a correlation id it has already completed
+                // (Task 14, spec 12.2).  No per-correlation state here.
+                noteLeaseReturnMalformed_("LeaseKeepAliveResult", ret.recordCount, chunk.size());
+                const std::size_t n = encodeRejection(static_cast<uint16_t>(pc::TemplateId::LeaseKeepAlive), ret.sessionId,
+                                                      ret.correlationId, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                                                      scratch_.data(), scratch_.size());
+                sendAnswer_(*session, scratch_.data(), n);
+                return;
+            }
+            // The chunk already is the wire entry layout ({index u16, code u16, ttlMs u64} x count): write the fixed part
+            // (header, final, count) and copy it behind it, no per-entry re-encode.
+            uint8_t* const out = scratch_.data();
+            pc::lease_wire::putHeader(out, LKR::BODY_FIXED, LKR::TEMPLATE_ID, ret.sessionId, ret.correlationId);
+            out[pc::lease_wire::kBase] = ret.lastOffset == 1 ? 1 : 0;
+            pc::detail::putLE16(out, pc::lease_wire::kBase + 1, static_cast<uint16_t>(count));
+            const std::size_t fixed = pc::MessageHeader::ENCODED_SIZE + LKR::BODY_FIXED;
+            std::memcpy(out + fixed, chunk.data(), chunk.size());
+            sendAnswer_(*session, out, fixed + chunk.size());
+            return;
+        }
+
+        // Lease topics Task 11b: a worker's LeaseTimeToLive answer: errorCode = the code, baseOffset = remainingMs, lastOffset =
+        // the lease version, chunk = {grantedTtlMs u64, holder u64}.
+        if (ret.type == rune::node::WorkerReturn::Type::LeaseTimeToLiveResult) {
+            Session* session = sessions_.find(ret.sessionId);
+            if (!session) return;
+            pc::LeaseTimeToLiveResponse resp;
+            resp.sessionId     = ret.sessionId;
+            resp.correlationId = ret.correlationId;
+            resp.code          = static_cast<uint16_t>(ret.errorCode);
+            resp.remainingMs   = ret.baseOffset;
+            resp.version       = ret.lastOffset;
+            const std::span<const uint8_t> chunk = ret.chunkBytes();
+            if (chunk.size() != 16) [[unlikely]] {
+                noteLeaseReturnMalformed_("LeaseTimeToLiveResult", 0, chunk.size());
+                const std::size_t n = encodeRejection(static_cast<uint16_t>(pc::TemplateId::LeaseTimeToLive), ret.sessionId,
+                                                      ret.correlationId, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                                                      scratch_.data(), scratch_.size());
+                sendAnswer_(*session, scratch_.data(), n);
+                return;
+            }
+            resp.grantedTtlMs = static_cast<uint64_t>(pc::detail::getLE64(chunk.data(), 0));
+            resp.holder       = static_cast<uint64_t>(pc::detail::getLE64(chunk.data(), 8));
+            sendAnswer_(*session, scratch_.data(), resp.encode(scratch_.data()));
+            return;
+        }
+
+        // Lease topics Task 13b: a worker's ScanLeases answer: errorCode = the code, baseOffset = asOfOffset, lastOffset = lastHash (bit-cast),
+        // recordCount = rows, isolation = done; the chunk is the encoded rows, forwarded as they are after a structural check (the rows
+        // tile the chunk exactly and number recordCount - a worker bug otherwise, answered Internal).
+        if (ret.type == rune::node::WorkerReturn::Type::ScanLeasesResult) {
+            Session* session = sessions_.find(ret.sessionId);
+            if (!session) return;
+            const std::span<const uint8_t> chunk = ret.chunkBytes();
+            bool ok = ret.recordCount >= 0 && ret.recordCount <= 0xFFFF && chunk.size() <= pc::kScanLeasesMaxPageBytes &&
+                      (ret.errorCode == 0 || (chunk.empty() && ret.recordCount == 0));
+            if (ok) {
+                std::size_t pos = 0;
+                int32_t rows = 0;
+                while (pos < chunk.size()) {
+                    if (pos + 1 > chunk.size()) { ok = false; break; }
+                    const std::size_t klen = chunk[pos];
+                    if (pos + 1 + klen + 4 > chunk.size()) { ok = false; break; }
+                    const std::size_t rlen = static_cast<uint32_t>(pc::detail::getLE32(chunk.data(), static_cast<int>(pos + 1 + klen)));
+                    if (rlen > chunk.size() - (pos + 1 + klen + 4)) { ok = false; break; }
+                    pos += 1 + klen + 4 + rlen;
+                    ++rows;
+                }
+                ok = ok && rows == ret.recordCount;
+            }
+            if (!ok) [[unlikely]] {
+                noteLeaseReturnMalformed_("ScanLeasesResult", ret.recordCount, chunk.size());
+                const std::size_t n = encodeRejection(static_cast<uint16_t>(pc::TemplateId::ScanLeases), ret.sessionId, ret.correlationId,
+                                                      static_cast<uint16_t>(pc::ErrorCode::Internal), scratch_.data(), scratch_.size());
+                sendAnswer_(*session, scratch_.data(), n);
+                return;
+            }
+            pc::ScanLeasesResponse resp;
+            resp.sessionId     = ret.sessionId;
+            resp.correlationId = ret.correlationId;
+            resp.code          = static_cast<uint16_t>(ret.errorCode);
+            resp.asOfOffset    = ret.baseOffset;
+            resp.lastHash      = static_cast<uint64_t>(ret.lastOffset);
+            resp.done          = ret.isolation == 1 ? 1 : 0;
+            resp.rowCount      = static_cast<uint16_t>(ret.recordCount);
+            resp.rows          = chunk;
+            static_assert(pc::MessageHeader::ENCODED_SIZE + pc::ScanLeasesResponse::BODY_FIXED + pc::kScanLeasesMaxPageBytes <= kScratchSize);
+            sendAnswer_(*session, scratch_.data(), resp.encode(scratch_.data()));
+            return;
+        }
+
         // ===================================================================
         // ProduceResult
         // ===================================================================
@@ -7819,10 +8174,14 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 Subscription& sub = it->second;
                 sub.failed         = true;
                 sub.errorOwed      = true;
-                // #839: StorageError = a damaged stored batch (CorruptBatch); anything else = the return ring.
+                // #839: StorageError = a damaged stored batch (CorruptBatch); lease-transient: PartitionDataReset = the
+                // cursor fell below the ring (RingEvicted); anything else = the return ring.
                 const bool corrupt = ret.errorCode ==
                     static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError);
+                const bool evicted = ret.errorCode ==
+                    static_cast<int16_t>(rune::protocol::client::ErrorCode::PartitionDataReset);
                 sub.failedCause    = corrupt ? rune::node::PushTooLargeCause::CorruptBatch
+                                   : evicted ? rune::node::PushTooLargeCause::RingEvicted
                                              : rune::node::PushTooLargeCause::ReturnRing;
                 sub.failedFrameLen = 0;
                 spdlog::error("ClientGateway: subscription {} (topicId={} partition={} offset={}) failed: "
@@ -7830,8 +8189,9 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                               ret.subscriptionId, ret.readTopicId, ret.readPartition, ret.newNextOffset,
                               ret.errorCode,
                               corrupt ? "a stored batch is corrupt (damaged log segment)"
-                                      : "a stored batch exceeds the worker return ring",
-                              corrupt ? "StorageError" : "MessageTooLarge");
+                              : evicted ? "the cursor fell below the transient ring start (records lost)"
+                                        : "a stored batch exceeds the worker return ring",
+                              corrupt ? "StorageError" : evicted ? "PartitionDataReset" : "MessageTooLarge");
                 if (Session* session = sessions_.find(sub.sessionId))
                     trySendOwedPushError_(sub, *session);
                 return;
@@ -8761,7 +9121,8 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
                                                      m.persistence, m.replicationFactor, m.config,
                                                      ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session, res.nsId),
                                                      adopt ? std::string_view(adopt->detail) : std::string_view{},
-                                                     m.hasKeyFeatures ? m.keyFeatures : rune::protocol::TopicKeyFeatures{}),
+                                                     m.hasKeyFeatures ? m.keyFeatures : rune::protocol::TopicKeyFeatures{},
+                                                     m.hasLease ? std::optional<rune::protocol::LeaseSpec>(m.lease) : std::nullopt),
                        "DefineTopic: admin ring full", "DefineTopic: request larger than the admin ring message");
 }
 
@@ -10859,8 +11220,7 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     // Authentication Task 12 (spec §2.1, D22): READ on the view's topic id - one byte load; a hidden and a missing id
     // answer alike.
     if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
-        if (deny_(*session, authorizeTopicIdHere_(perms, m.viewTopicId, 0, rune::security::Operation::Read,
-                                                             rune::security::ResourceType::View), buf, len))
+        if (deny_(*session, authorizeViewRead_(perms, m.viewTopicId), buf, len))
             return;
 
     // #721: a view of a DELETING namespace is gone for readers, a root session included (one compare when none deletes).
@@ -10874,10 +11234,23 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     // view id yields partition 0 and the worker answers UnknownView.
     uint8_t keyLe[8];
     for (int i = 0; i < 8; ++i) keyLe[i] = static_cast<uint8_t>(m.keyU64 >> (8 * i));
+    std::size_t keyLen = sizeof keyLe;
+    // Lease topics Task 13b: a lease topic partitions on its key's own width (a UInt32 key is 4 bytes), so the legacy u64 is narrowed to that
+    // width - by the helper the worker reads the row with - before it picks the partition; a value the key type cannot hold is InvalidRequest.
+    if (leaseSourceOfView_(m.viewTopicId) >= 0) {
+        const rune::node::TopicSpec* sp = topicRegistry_->viewSinkSpec(m.viewTopicId);
+        std::array<uint8_t, 8> narrowed{};
+        keyLen = rune::node::lease::leaseKeyFromLegacyU64(m.keyU64, static_cast<rune::codec::PrimType>(sp->leaseKeyType), sp->leaseKeyWidth, narrowed);
+        if (keyLen == 0) {
+            (void)rejectRequest_(buf, len, pc::ViewRowResponse::kInvalidRequest, "GetViewRow: key does not fit the lease topic's key type");
+            return;
+        }
+        std::memcpy(keyLe, narrowed.data(), sizeof keyLe);
+    }
     int32_t partition = 0;
     if (topicRegistry_) {
         const int32_t p = topicRegistry_->partitionForKey(
-            m.viewTopicId, std::span<const uint8_t>(keyLe, sizeof keyLe));
+            m.viewTopicId, std::span<const uint8_t>(keyLe, keyLen));
         if (p >= 0) partition = p;
     }
     if (const uint16_t gate = viewRowGate_(m.viewTopicId, partition); gate != kViewRowNoGate) {
@@ -10934,8 +11307,7 @@ Session* ClientGateway::checkedViewReadSession_(const uint8_t* buf, std::size_t 
         return nullptr;
     }
     if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
-        if (deny_(*session, authorizeTopicIdHere_(perms, viewTopicId, 0, rune::security::Operation::Read,
-                                                  rune::security::ResourceType::View), buf, len))
+        if (deny_(*session, authorizeViewRead_(perms, viewTopicId), buf, len))
             return nullptr;
     if (inDeletingNs_(viewTopicId)) [[unlikely]] {
         (void)rejectRequest_(buf, len, pc::ViewRowResponse::kUnknownView, "view read: namespace is being deleted");
@@ -11031,6 +11403,172 @@ void ClientGateway::handleGetStats(const uint8_t* buf, std::size_t len)
     op.recordCount   = static_cast<int32_t>(m->scope);
     if (!workerPool_->tryEnqueueOp(routeTopic, m->partition, std::move(op)))
         (void)rejectRequest_(buf, len, SR::kBusy, "GetStats: worker ring full");
+}
+
+// Lease topics Task 11b: the checks both lease requests share, in the fixed order (the caller has decoded the body and found the
+// session): client version -> authorisation -> pool / registry / deleting namespace / unknown topic -> lease topic and partition range
+// -> the partition's leader.  A refusal is answered here (the lease response itself, or a route refusal) and false returned.
+// A foreign-namespace topic id gets no permission bits, so it is answered exactly like a nonexistent one (NotAuthorized).
+bool ClientGateway::leaseRouteAdmit_(Session& session, int64_t sessionId, int64_t corr, int32_t topicId, int32_t partition,
+                                     rune::security::Operation op, const uint8_t* buf, std::size_t len, const char* what)
+{
+    using EC = pc::ErrorCode;
+    if (session.clientVersion < pc::kClientVersionLeases) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(EC::InvalidRequest), what);
+        return false;
+    }
+    if (const PermissionTable& perms = permsOf_(session); !perms.isAllowAll())
+        if (const auto denial = authorizeTopicIdHere_(perms, topicId, partition, op, rune::security::ResourceType::Topic)) {
+            if (denial->code != static_cast<uint16_t>(EC::NotAuthorized)) {   // not applied here yet: retriable
+                sendRouteRefusal_(session, sessionId, corr, {});
+                return false;
+            }
+            (void)deny_(session, denial, buf, len);
+            return false;
+        }
+    if (!workerPool_ || topicRegistry_ == nullptr || inDeletingNs_(topicId)) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(EC::UnknownTopic), what);
+        return false;
+    }
+    const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
+    if (spec == nullptr) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(EC::UnknownTopic), what);
+        return false;
+    }
+    if (!spec->leaseTopic || partition < 0 || partition >= spec->partitionCount) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(EC::InvalidRequest), what);
+        return false;
+    }
+    if (std::string_view ep; partitionLedElsewhere_(topicId, partition, ep)) {
+        sendRouteRefusal_(session, sessionId, corr, ep);
+        return false;
+    }
+    return true;
+}
+
+// Lease topics Task 11b: the enqueue outcome of a lease request.  Only Full is back-pressure (Throttled, retry-after 1 ms); TooLarge
+// can never fit one worker-ingress frame, so a retry would loop forever: the non-retriable MessageTooLarge, loudly.
+void ClientGateway::answerLeaseEnqueue_(rune::node::EnqueueResult er, int32_t topicId, int32_t partition, const uint8_t* buf,
+                                        std::size_t len, const char* what)
+{
+    if (er == rune::node::EnqueueResult::Enqueued) return;
+    if (er == rune::node::EnqueueResult::TooLarge) [[unlikely]] {
+        // Rate-limited like noteLeaseReturnMalformed_ (first, then every 1024th): a client can repeat this request at wire speed.
+        if (leaseEnqueueTooLarge_++ % 1024 == 0)
+            spdlog::error("ClientGateway: {} for topicId={} partition={} ({} B) exceeds the worker ingress frame; MessageTooLarge "
+                          "(total={})", what, topicId, partition, len, leaseEnqueueTooLarge_);
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge), what);
+        return;
+    }
+    (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Throttled), what);
+}
+
+// Lease topics Task 11b: a lease worker return the gateway cannot forward as it is (chunk / count mismatch) is a broker bug.
+void ClientGateway::noteLeaseReturnMalformed_(const char* what, int32_t recordCount, std::size_t chunkBytes)
+{
+    if (leaseReturnMalformed_++ % 1024 == 0)
+        spdlog::error("ClientGateway: malformed {} from a worker: recordCount={} chunk={} B; answered Internal (total={})", what,
+                      recordCount, chunkBytes, leaseReturnMalformed_);
+}
+
+// Lease topics Task 11b: LeaseKeepAlive (96).  WRITE on the topic; the worker answers one LeaseKeepAliveResult per decided group.
+void ClientGateway::handleLeaseKeepAlive(const uint8_t* buf, std::size_t len)
+{
+    const auto m = pc::LeaseKeepAlive::decode(buf, len);
+    if (!m) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "LeaseKeepAlive body undecodable");
+        return;
+    }
+    Session* session = sessions_.find(m->sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "LeaseKeepAlive for unknown session");
+        return;
+    }
+    if (!leaseRouteAdmit_(*session, m->sessionId, m->correlationId, m->topicId, m->partition, rune::security::Operation::Write, buf, len,
+                          "LeaseKeepAlive refused"))
+        return;
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::LeaseKeepAlive;
+    op.topicId       = m->topicId;
+    op.partition     = m->partition;
+    op.sessionId     = m->sessionId;
+    op.correlationId = m->correlationId;
+    op.recordCount   = static_cast<int32_t>(m->count);
+    op.leaseTail     = m->entryBytes;
+    answerLeaseEnqueue_(workerPool_->enqueueOp(m->topicId, m->partition, std::move(op)), m->topicId, m->partition, buf, len,
+                        "LeaseKeepAlive");
+}
+
+// Lease topics Task 11b: LeaseTimeToLive (98).  READ on the topic.
+void ClientGateway::handleLeaseTimeToLive(const uint8_t* buf, std::size_t len)
+{
+    const auto m = pc::LeaseTimeToLive::decode(buf, len);
+    if (!m) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "LeaseTimeToLive body undecodable");
+        return;
+    }
+    Session* session = sessions_.find(m->sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "LeaseTimeToLive for unknown session");
+        return;
+    }
+    if (!leaseRouteAdmit_(*session, m->sessionId, m->correlationId, m->topicId, m->partition, rune::security::Operation::Read, buf, len,
+                          "LeaseTimeToLive refused"))
+        return;
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::LeaseTimeToLive;
+    op.topicId       = m->topicId;
+    op.partition     = m->partition;
+    op.sessionId     = m->sessionId;
+    op.correlationId = m->correlationId;
+    op.leaseTail     = m->key;
+    answerLeaseEnqueue_(workerPool_->enqueueOp(m->topicId, m->partition, std::move(op)), m->topicId, m->partition, buf, len,
+                        "LeaseTimeToLive");
+}
+
+// Lease topics Task 13b: ScanLeases (100) - one page of a lease partition's rows in hash order.  The request names the lease VIEW
+// (`<topic>.leases`); the read is authorised as READ on the lease TOPIC (spec 7.1: a VIEW grant on the lease view is not consulted) and routed
+// to the SOURCE topic's partition leader.  Every refusal is a ScanLeasesResponse with done = 1 (encodeRejection).
+void ClientGateway::handleScanLeases(const uint8_t* buf, std::size_t len)
+{
+    const auto m = pc::ScanLeases::decode(buf, len);
+    if (!m) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "ScanLeases body undecodable");
+        return;
+    }
+    Session* session = sessions_.find(m->sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "ScanLeases for unknown session");
+        return;
+    }
+    if (session->clientVersion < pc::kClientVersionLeases) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "ScanLeases: client version below leases");
+        return;
+    }
+    // The id must be a lease view; the lease topic is the registry's (the catalog's), never viewTopicId - 1.  Anything else is answered
+    // exactly like a missing id (the auth rule: a hidden and a missing id are the same), so the scan cannot probe other objects.
+    const int32_t src = leaseSourceOfView_(m->viewTopicId);
+    if (src < 0) {
+        if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
+            if (deny_(*session, authorizeTopicIdHere_(perms, m->viewTopicId, 0, rune::security::Operation::Read, rune::security::ResourceType::Topic), buf, len))
+                return;
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::UnknownTopic), "ScanLeases: not a lease view");
+        return;
+    }
+    if (!leaseRouteAdmit_(*session, m->sessionId, m->correlationId, src, m->partition, rune::security::Operation::Read, buf, len,
+                          "ScanLeases refused"))
+        return;
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::ScanLeases;
+    op.topicId       = src;
+    op.partition     = m->partition;
+    op.sessionId     = m->sessionId;
+    op.correlationId = m->correlationId;
+    op.nextOffset    = static_cast<int64_t>(m->resumeHash);
+    op.recordCount   = static_cast<int32_t>(m->maxRows);
+    op.isolation     = m->first;
+    op.leaseTail     = m->prefix;
+    answerLeaseEnqueue_(workerPool_->enqueueOp(src, m->partition, std::move(op)), src, m->partition, buf, len, "ScanLeases");
 }
 
 void ClientGateway::handleGetViewRowK(const uint8_t* buf, std::size_t len)
@@ -11143,9 +11681,8 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
         return -1;
     }
     // E2 Task 11 ruling: read_committed only where it is served (a leader).
-    if (isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
-        !readCommittedServableHere_(topicId, partition)) [[unlikely]] {
-        spdlog::debug("ClientGateway::addGroupSubscription: read_committed on a follower topicId={} "
+    if (!servableHere_(topicId, partition, isolation)) [[unlikely]] {   // read_committed, or records needing verdicts
+        spdlog::debug("ClientGateway::addGroupSubscription: leader-only read on a follower topicId={} "
                       "partition={} — refused (NotLeader)", topicId, partition);
         return -1;
     }
@@ -11293,6 +11830,23 @@ bool ClientGateway::sendControlFrame(int64_t sessionId,
                     ddlDowngradeScratch_[at + 1] = 0;
                     buf = ddlDowngradeScratch_.data();
                 }
+            }
+        }
+    }
+    // Lease topics: a TopicSchemaResponse's lease block is for v18+ sessions only.  An older client gets the frame a
+    // v17 broker would have sent (the key block only when the features are non-default).  Cold: only that template.
+    if (session->clientVersion < pc::kClientVersionLeases && len > pc::MessageHeader::ENCODED_SIZE) [[unlikely]] {
+        if (const auto h = pc::MessageHeader::decode(buf, len);
+            h && h->templateId == static_cast<uint16_t>(pc::TemplateId::TopicSchemaResponse)) {
+            if (auto resp = pc::TopicSchemaResponse::decode(buf, len); resp && resp->hasLease) {
+                resp->hasLease       = false;
+                resp->lease          = {};
+                resp->hasKeyFeatures = resp->keyFeatures != rune::protocol::TopicKeyFeatures{};
+                ddlDowngradeScratch_.resize(resp->encodedSize());
+                const std::size_t n = resp->encode(ddlDowngradeScratch_.data());
+                ddlDowngradeScratch_.resize(n);
+                buf = ddlDowngradeScratch_.data();
+                len = n;
             }
         }
     }

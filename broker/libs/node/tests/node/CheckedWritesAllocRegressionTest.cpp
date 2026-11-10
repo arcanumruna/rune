@@ -272,6 +272,78 @@ TEST(CheckedWritesAllocRegression, SteadyStateIntentJudgingAllocatesNothingFullL
     runSteadyStateIntentJudging(5000);
 }
 
+// Lease topics Task 5c (hard rule): View acks with a lease trailer allocate nothing in steady state - the stored batch read-back,
+// the row lookups, both trailer runs.  Keys 1..16 are granted once; every round updates one (valid, accepted), grants it again
+// (KeyExists) and updates it at a wrong version (LeaseNotFound), so each ack carries a lease run and a verdict run.
+TEST(LeaseWriteHookAllocRegression, LeaseAckNoAllocRegression) {
+    VerdictRig r;
+    r.createLeaseTopic(1000);
+    r.passes(30);
+    WorkerOp level;
+    level.type = WorkerOp::Type::ClusterFeatureLevel; level.nextOffset = rune::replication::MetadataFeature::kLeases;
+    r.send(std::move(level));
+    r.enableAcks(rune::protocol::client::kClientVersionLeases);
+    r.passes(30);
+    const auto keyOf = [](uint64_t id) { std::string k(8, '\0'); for (int i = 0; i < 8; ++i) k[std::size_t(i)] = char(id >> (8 * i)); return k; };
+    const auto value = [](uint64_t id, int64_t ver) {
+        std::vector<uint8_t> b(60, 0);
+        b[0] = 56;
+        b[2] = 1;
+        for (int i = 0; i < 8; ++i) { b[4 + std::size_t(i)] = uint8_t(uint64_t(ver) >> (8 * i)); b[36 + std::size_t(i)] = uint8_t(id >> (8 * i)); }
+        const uint64_t ttl = 5000;
+        for (int i = 0; i < 8; ++i) b[12 + std::size_t(i)] = uint8_t(ttl >> (8 * i));
+        b[20] = 1;
+        return b;
+    };
+    int32_t seq = 0;
+    std::vector<RawRec> grants;
+    for (uint64_t id = 1; id <= 16; ++id) grants.push_back(RawRec{keyOf(id), value(id, 0), 1});
+    const auto g = r.ack(r.produceBytes(VerdictRig::rawBatch(grants, 11, seq), rune::protocol::client::kAcksWireView, 11, seq));
+    seq += 16;
+    ASSERT_TRUE(g);
+    ASSERT_EQ(g->code, 0);
+    r.passes(60);
+    const auto drive = [&](int round) -> uint64_t {
+        const uint64_t id = uint64_t(round % 16) + 1;
+        const int64_t ver = g->baseOffset + int64_t(id) - 1;
+        (void)r.produceBytes(VerdictRig::rawBatch({RawRec{keyOf(id), value(id, ver), 2}, RawRec{keyOf(id), value(id, 0), 1},
+                                                   RawRec{keyOf(id), value(id, ver + 1000), 2}}, 11, seq),
+                             rune::protocol::client::kAcksWireView, 11, seq);
+        seq += 3;
+        uint64_t allocs = 0;
+        {
+            rune::testing::AllocWindow w;
+            for (int i = 0; i < 3; ++i) {
+                r.now += 1'000'000;
+                r.worker->doWork(r.now);
+                r.worker->drainReturnView([](WorkerReturn&&) {});
+            }
+            allocs = w.count();
+        }
+        r.passes(1);   // the ack and egress polling are the rig's
+        return allocs;
+    };
+    for (int i = 0; i < 300; ++i) (void)drive(i);
+    r.passes(100);
+    const std::size_t acksBefore = r.ackOrder().size();
+    uint64_t total = 0, worst = 0;
+    for (int i = 300; i < 2300; ++i) {
+        const uint64_t a = drive(i);
+        total += a;
+        worst = std::max(worst, a);
+    }
+    r.passes(100);
+    ASSERT_GE(r.ackOrder().size() - acksBefore, 2000u) << "every measured batch was acked";
+    const auto lastAck = r.ack(r.ackOrder().back(), 0);
+    ASSERT_TRUE(lastAck);
+    const auto& last = *lastAck;
+    EXPECT_EQ(last.code, 0);
+    EXPECT_TRUE(last.hasLease) << "the measured acks carry the lease trailer";
+    EXPECT_EQ(last.leases.size(), 3u);
+    EXPECT_EQ(last.verdicts.size(), 2u);
+    EXPECT_EQ(total, 0u) << "worst batch allocated " << worst;
+}
+
 // Part 06 (hard rule): key-0 creates, imports above the counter and updates from 8 idempotent producers allocate nothing in steady
 // state - the reservations (every 64 ids), the in-place patching of the ids and the side-window records included.  A batch holds
 // only key-0 creates, or only imports, or only updates.  Every create is a new id, so the warm-up runs until the

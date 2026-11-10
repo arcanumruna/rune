@@ -694,6 +694,52 @@ TEST_P(CatalogEffectsRegression, FailedDirRenameIsRetriedAndNeverDeletesInPlaceR
     EXPECT_TRUE(n.awaitPathGone(rune::node::topicsRoot(n.dataDir(), 0) / "t", 15s)) << "the retried rename completed";
 }
 
+// Checkpoint C (security): a lease view sink that names no lease topic fails CLOSED.  The boot sink does not register it (no TopicSpec, so
+// no registry sink, no write-spec view id) and counts it; the gateway never lists it, so a read of its id is a missing id (UnknownView /
+// NotAuthorized), never served.
+// Mutation: drop the leaseViewSinkValid check in BrokerNode::bootSinkApplied_ -> the sink is registered: red.
+TEST(LeaseEffectsRegression, BootLeaseSinkWithoutSourceFailsClosedRegression) {
+    SingleNode n("lease_boot_closed");
+    rune::node::SinkSpec bad;
+    bad.topicId = 40; bad.name = "ghost.leases"; bad.partitions = 2; bad.keyField = "id";
+    bad.leaseView = true; bad.leaseSourceTopicId = -1;
+    ASSERT_FALSE(rune::node::leaseViewSinkValid(bad));
+    rune::node::SinkSpec good = bad;
+    good.topicId = 41; good.name = "real.leases"; good.leaseSourceTopicId = 7;
+    ASSERT_TRUE(rune::node::leaseViewSinkValid(good));
+    rune::node::SinkSpec plain = bad;
+    plain.topicId = 42; plain.name = "plain_view"; plain.leaseView = false;
+    ASSERT_TRUE(rune::node::leaseViewSinkValid(plain));
+
+    std::vector<TopicSpec> out;
+    EXPECT_EQ(n.node()->bootSinkAppliedForTest(bad, out), 0u) << "an invalid lease sink is NOT registered";
+    EXPECT_TRUE(out.empty());
+    EXPECT_EQ(n.node()->onControlThreadForTest([&] { return n.node()->leaseSinkRefused(); }), 1u);
+    // The registry of the running node has no sink for the refused id either.
+    EXPECT_EQ(n.node()->onControlThreadForTest([&] { return n.node()->gatewayForTest()->topicRegistry()->viewSinkSpec(40) == nullptr; }), true);
+}
+
+// Checkpoint C: a REFUSED live lease-view frame (flags bit 3, no source id) is never awaited: the gateway must not hold a forever-NotReady id.
+// Mutation: decide "lease view" from the decoded message (ok && leaseView) instead of the raw flags byte -> awaiting: red.
+TEST(LeaseEffectsRegression, RefusedLiveLeaseFrameNotAwaitingRegression) {
+    SingleNode n("lease_live_refused");
+    rune::protocol::TopicConfig c;
+    c.cleanupPolicy = 1;
+    c.partitionKey  = "id";
+    std::vector<uint8_t> f(catalogTopicAppliedWireLen("ghost.leases", c));   // no lease-view source: the decoder refuses the frame
+    writeCatalogTopicApplied(f.data(), 50, "ghost.leases", 2, 0, /*persistence=*/0, c, /*nsId=*/0, {}, std::nullopt, /*leaseView=*/true);
+    n.postRaw(kA2cCatalogSinkApplied, std::move(f));
+    ASSERT_TRUE(SingleNode::awaitTrue([&] { return n.node()->onControlThreadForTest([&] { return n.node()->leaseSinkRefused(); }) == 1u; }, 10s));
+    EXPECT_FALSE(n.node()->onControlThreadForTest([&] { return n.node()->gatewayForTest()->viewSinkAwaitingPlan(50); }))
+        << "a refused lease frame is not awaited";
+    EXPECT_EQ(n.node()->onControlThreadForTest([&] { return n.node()->gatewayForTest()->topicRegistry()->viewSinkSpec(50) == nullptr; }), true);
+    // Control: a plain (non-lease) sink frame IS awaited until its plan arrives.
+    std::vector<uint8_t> g(catalogTopicAppliedWireLen("plain_view", c));
+    writeCatalogTopicApplied(g.data(), 51, "plain_view", 1, 0, /*persistence=*/1, c);
+    n.postRaw(kA2cCatalogSinkApplied, std::move(g));
+    EXPECT_TRUE(SingleNode::awaitTrue([&] { return n.node()->onControlThreadForTest([&] { return n.node()->gatewayForTest()->viewSinkAwaitingPlan(51); }); }, 10s));
+}
+
 INSTANTIATE_TEST_SUITE_P(Modes, CatalogEffectsRegression,
                          ::testing::Values(Mode::Shard, Mode::ShardFused, Mode::Legacy),
                          [](const ::testing::TestParamInfo<Mode>& i) { return std::string(modeName(i.param)); });

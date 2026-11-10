@@ -534,6 +534,13 @@ if(BUILD_BENCHMARKS)
     target_link_libraries(NamespaceHotPathBench PRIVATE rune_storage rune_replication rune_transaction rune_node rune_view rune_codec
                           benchmark::benchmark)
 
+    # ── LeaseWheelBench (lease topics Task 9) — the lease timer wheel and entry store; gates are asserted in Task 23.
+    add_executable(LeaseWheelBench
+        benchmark/BenchmarkMain.cpp
+        benchmark/LeaseWheelBench.cpp)
+    target_include_directories(LeaseWheelBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/benchmark ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(LeaseWheelBench PRIVATE rune_node benchmark::benchmark)
+
     # QlPlanBench: the QL planner, from the same ql/ sources the embedded client builds (which is absent without BUILD_TESTING).
     if(NOT TARGET rune_ql)
         file(GLOB RUNE_QL_SRCS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../ql/src/*.cpp)

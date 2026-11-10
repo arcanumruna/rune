@@ -165,11 +165,11 @@ public:
     }
     static void setField(rune::protocol::NamespaceLimits& l, int field, uint64_t v) {
         uint64_t* p = &l.maxTopics;
-        if (field < 28) p[field] = v; else l.featureBits = static_cast<uint32_t>(v);
+        if (field < 28) p[field] = v; else if (field == 28) l.featureBits = static_cast<uint32_t>(v); else l.maxLeases = v;
     }
     static uint64_t getField(const rune::protocol::NamespaceLimits& l, int field) {
         const uint64_t* p = &l.maxTopics;
-        return field < 28 ? p[field] : l.featureBits;
+        return field < 28 ? p[field] : field == 28 ? l.featureBits : l.maxLeases;
     }
 
     // ── sessions ──────────────────────────────────────────────────────────────────────────────────────────────────

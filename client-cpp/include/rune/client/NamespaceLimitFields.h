@@ -1,8 +1,8 @@
 #pragma once
-// NamespaceLimitFields.h — the 29 mask-addressable NamespaceLimits fields (spec §5.2, plan D13) by index, with their
+// NamespaceLimitFields.h — the 30 mask-addressable NamespaceLimits fields (spec §5.2, plan D13) by index, with their
 // kebab-case names, shared by the client API (NamespaceLimitsPatch) and the CLI (`rune namespace create --<name> N`,
 // `rune namespace limits <ns> --set <name>=N`).  Index i is presentMask bit i: 28 u64 fields in declaration order,
-// then featureBits (u32).  Control plane only.
+// then featureBits (u32), then maxLeases (u64, index 29).  Control plane only.
 
 #include <rune/protocol/NamespaceLimits.h>
 #include <rune/protocol/client/NamespaceMessages.h>
@@ -52,6 +52,7 @@ inline constexpr std::array<NamespaceLimitField, rune::protocol::kNamespaceLimit
     {"lowest-acks", &NamespaceLimits::lowestAcks},
     {"lowest-min-insync", &NamespaceLimits::lowestMinInsync},
     {"feature-bits", nullptr},
+    {"max-leases", &NamespaceLimits::maxLeases},
 }};
 inline constexpr std::size_t kNamespaceFeatureBitsField = 28;
 
@@ -92,8 +93,8 @@ struct NamespaceLimitsPatch {
     }
 };
 
-/// Every one of the 29 fields present (setNamespaceLimits sends the FULL record).
+/// Every one of the 30 fields present (setNamespaceLimits sends the FULL record).
 inline constexpr std::array<uint8_t, rune::protocol::client::kNamespacePresentMaskBytes> kNamespaceFullMask{
-    0xFF, 0xFF, 0xFF, 0x1F};
+    0xFF, 0xFF, 0xFF, 0x3F};
 
 } // namespace rune::client

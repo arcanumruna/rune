@@ -10,6 +10,7 @@
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/GroupMessages.h>
+#include <rune/protocol/client/LeaseMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/MetadataMessages.h>
@@ -588,6 +589,7 @@ public:
     struct SchemaAnswer {
         int32_t topicId = -1; uint16_t version = 0; uint16_t errorCode = 0; int32_t partitionCount = 0;
         std::vector<uint8_t> blob;
+        std::optional<rune::protocol::LeaseSpec> lease;   // lease topics: the TopicSchemaResponse's lease block (client >= 18)
         bool operator==(const SchemaAnswer&) const = default;
     };
     /// `rid` (Task 11): {0,0} = a fresh requestId; set = this DDL's id (a retry re-sends the SAME id).
@@ -605,6 +607,23 @@ public:
         std::vector<uint8_t> buf(m.encodedSize());
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    /// A lease topic define (client >= 18): the lease block rides after the key features; compacted, keep every live lease.
+    int64_t sendDefineLeaseTopic(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,
+                                 uint32_t partitions, const std::vector<uint8_t>& descriptor,
+                                 const rune::protocol::LeaseSpec& lease, rune::protocol::RequestId rid = {}) {
+        pc::DefineTopic m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.partitionCount = partitions;
+        m.keyField = "id"; m.validate = true; m.persistence = 0;
+        m.descriptorBlob = descriptor.data(); m.descriptorLen = static_cast<uint32_t>(descriptor.size());
+        m.hasExt = true; m.ext.clientName = "shard-test-client"; m.ext.requestId = ridOr_(rid);
+        m.config = boundedTestTopicConfig();
+        m.config.cleanupPolicy = 1; m.config.retentionMs = -1; m.config.retentionBytes = -1;
+        m.hasKeyFeatures = true;
+        m.hasLease = true; m.lease = lease;
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return len != 0 && send(ch, stream, buf.data(), len) ? m.correlationId : 0;
     }
     int64_t sendCreateView(const std::string& ch, int32_t stream, int64_t sid, std::string_view viewName,
                            std::string_view keyField, uint8_t persistence, const std::vector<uint8_t>& plan,
@@ -709,6 +728,28 @@ public:
         std::vector<uint8_t> buf(pc::GetViewRow::ENCODED_SIZE);
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    /// Lease topics Task 13a review: a GetViewRowK point read (typed key bytes) of `partition` (-1 = the gateway hashes the key);
+    /// the answer by awaitViewRowOrError.
+    int64_t sendGetViewRowK(const std::string& ch, int32_t stream, int64_t sid, int32_t viewTopicId,
+                            std::span<const uint8_t> key, int32_t partition = -1, uint64_t fingerprint = 0) {
+        pc::GetViewRowK m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.viewTopicId = viewTopicId; m.partition = partition;
+        m.requestedFingerprint = fingerprint; m.key = key;
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    /// Lease topics Checkpoint C: a raw ScanLeases (100) of `partition` on the lease view `viewTopicId`.  Call captureRawAnswers() first and
+    /// read the answer with awaitRaw (a ScanLeasesResponse, or an ErrorResponse for a Redirect).  0 = not sent.
+    int64_t sendScanLeases(const std::string& ch, int32_t stream, int64_t sid, int32_t viewTopicId, int32_t partition, uint64_t resumeHash,
+                           bool first, uint16_t maxRows, std::span<const uint8_t> prefix = {}) {
+        pc::ScanLeases m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.viewTopicId = viewTopicId; m.partition = partition;
+        m.resumeHash = resumeHash; m.first = first ? 1 : 0; m.maxRows = maxRows; m.prefix = prefix;
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return len != 0 && send(ch, stream, buf.data(), len) ? m.correlationId : 0;
     }
     std::optional<uint16_t> awaitViewRow(int64_t corr, Clock::time_point deadline) {
         const auto r = awaitIn_(viewRows_, corr, deadline);
@@ -1064,7 +1105,8 @@ private:
                 if (auto r = pc::TopicSchemaResponse::decode(p, n))
                     schemas_[r->correlationId] = SchemaAnswer{
                         r->topicId, r->version, r->errorCode, r->partitionCount,
-                        std::vector<uint8_t>(r->descriptorBlob, r->descriptorBlob + r->descriptorLen)};
+                        std::vector<uint8_t>(r->descriptorBlob, r->descriptorBlob + r->descriptorLen),
+                        r->hasLease ? std::optional<rune::protocol::LeaseSpec>(r->lease) : std::nullopt};
                 break;
             case pc::TemplateId::MetadataResponse:
                 if (auto r = pc::MetadataResponse::decode(p, n)) {

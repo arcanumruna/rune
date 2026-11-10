@@ -146,7 +146,7 @@ protected:
             lastDefineTopicId_ = topicId; lastDefineError_ = err;
             defineResults_.push_back(err);
         };
-        deps.respondGet   = [](int64_t, int64_t, int32_t, uint16_t, int32_t, const std::vector<uint8_t>&, uint16_t, const rune::protocol::TopicKeyFeatures&) {};
+        deps.respondGet   = [](int64_t, int64_t, int32_t, uint16_t, int32_t, const std::vector<uint8_t>&, uint16_t, const rune::protocol::TopicKeyFeatures&, const std::optional<rune::protocol::LeaseSpec>&, int32_t) {};
         deps.respondAlter = [this](int64_t, int64_t, int32_t topicId, uint16_t version, uint16_t err) {
             alterResults_.push_back(AlterResult{topicId, version, err});
         };
@@ -204,7 +204,7 @@ protected:
             const auto n = static_cast<std::size_t>(len);
             if (tid == kA2cCatalogTopicApplied || tid == kA2cCatalogSinkApplied) {   // Task 12: sinks have their own type
                 CatalogTopicAppliedMsg m;
-                ASSERT_TRUE(decodeCatalogTopicApplied(p, n, m));
+                ASSERT_TRUE(decodeCatalogTopicApplied(p, n, m, tid == kA2cCatalogSinkApplied));
                 appliedIds_.push_back(m.topicId);
                 if (m.config.cleanupPolicy == 1) {   // a view sink (the production sink: a compacted table)
                     lastSinkKeyField_      = m.config.partitionKey;

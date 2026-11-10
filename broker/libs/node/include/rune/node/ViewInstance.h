@@ -26,6 +26,7 @@
 #include <rune/view/ViewTable.h>
 
 #include <rune/node/NsSlotTable.h>
+#include <rune/node/lease/LeaseFoldEvents.h>   // LeaseCoverCache
 #include <rune/node/ViewCheckpointScan.h>
 #include <rune/node/ViewSnapshotChannel.h>   // ViewDiscardReason
 
@@ -256,6 +257,12 @@ struct ViewInstance {
     uint16_t                           nsSlot          = kNoNsSlot;
     uint32_t                           nsId            = 0;
     std::size_t                        memCharged      = 0;
+    // Lease topics Task 21: the live lease rows (the lease index's table size) charged to the namespace's nsLeases while this
+    // worker LEADS the partition.  Only a lease index is ever charged.
+    uint64_t                           leasesCharged   = 0;
+    // A lease index: the reserved bytes of the partition's lease event buffer (PartitionWriteState::leaseEvents), counted with the
+    // table in the memory charged to the namespace (WorkerViewSet::instanceMemory_).
+    std::size_t                        extraMemBytes   = 0;
     bool                               windowKept      = false;   // a drain left dirty capacity kept (WorkerViewSet::releaseWindow_)
     int64_t                            quietSinceNs    = -1;      // the pass the quiet clock started: the first quietPass_ at or after the last window ended
 
@@ -264,6 +271,21 @@ struct ViewInstance {
     // only while it equals the replica's CURRENT generation (an ex-leader's frozen
     // table, or a new leader's not-yet-folded one, is never served).
     uint64_t                           foldLeadership  = 0;
+
+    // A lease index: the TopicWriteSpec::leaseLayoutGen its row layout was built under.  A newer one means the evolving
+    // descriptor gained a column, so the index is rebuilt (WorkerViewSet::rebuildKeyIndex_).
+    uint32_t                           layoutGen       = 0;
+    // A lease index: bumped by every activation of its judge (the lease events are cleared and the rows may have been rebuilt,
+    // so row ids changed).  Carried over a rebuild.  The wheels (Task 9) re-arm from the table when it changes.
+    uint32_t                           rebuildEpoch    = 0;
+    // A lease index: the writer descriptors already proven covered by this instance's layout (a rebuilt layout is a new instance,
+    // so it starts empty).
+    LeaseCoverCache                    leaseCover;
+    // A lease index: the transient topic's anchor list and fence record (LeaseIndex.h).  Reset together with the table.
+    LeaseTransientState                leaseTransient{};
+    // A lease index: the output fingerprint of the lease view (`<topic>.leases`) over THIS layout - the fingerprint of the layout
+    // source mixed with the lease index plan fingerprint (WorkerViewSet::freshLeaseIndex).  A lease view read pins it.
+    uint64_t                           leaseViewFp     = 0;
 
     // Cumulative fold-anomaly counters (see ViewFoldCounters).
     ViewFoldCounters                   counters;

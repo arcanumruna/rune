@@ -719,6 +719,8 @@ public:
         cleaner.setTxnJudgeBound(best.replica->cleanerTxnJudgeBound());   // Part 11: the TxnJudges no member checkpoint needs
         // Part 06: an autoincrement partition keeps each live producer's whole retry window (ProducerBatchWindow.h).
         cleaner.setProducerTailDepth(best.replica->producerTailDepth());
+        cleaner.setTopicMode(best.replica->leaseTopic() ? rune::storage::CleanerTopicMode::Lease
+                                                        : rune::storage::CleanerTopicMode::Plain);
         const int64_t previousPassEnd = best.replica->cleanerProgress();
         cleaner.setPreviousPassEnd(previousPassEnd);
         // Fix round 2 (Kafka-style): the cleaner NEVER replaces / deletes a

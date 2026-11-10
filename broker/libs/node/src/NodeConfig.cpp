@@ -989,7 +989,8 @@ ConfigResult parseNodeConfig(
             "RUNE_NS_DEFAULT_MAX_CONNECTIONS_PER_USER", "RUNE_NS_DEFAULT_MAX_SESSIONS_PER_USER",
             "RUNE_NS_DEFAULT_MAX_OPEN_TXNS", "RUNE_NS_DEFAULT_MAX_TXN_TIME_MS", "RUNE_NS_DEFAULT_MAX_VIEW_MEMORY_BYTES",
             "RUNE_NS_DEFAULT_MIN_REPLICATION_FACTOR", "RUNE_NS_DEFAULT_MAX_REPLICATION_FACTOR",
-            "RUNE_NS_DEFAULT_LOWEST_ACKS", "RUNE_NS_DEFAULT_LOWEST_MIN_INSYNC", "RUNE_NS_DEFAULT_FEATURE_BITS"};
+            "RUNE_NS_DEFAULT_LOWEST_ACKS", "RUNE_NS_DEFAULT_LOWEST_MIN_INSYNC", "RUNE_NS_DEFAULT_FEATURE_BITS",
+            "RUNE_NS_DEFAULT_MAX_LEASES"};
         uint8_t enc[rune::protocol::kNamespaceLimitsBytes];
         rune::protocol::encodeLimits(cfg.nsDefaultLimits, enc);
         for (std::size_t i = 0; i < rune::protocol::kNamespaceLimitFieldCount; ++i) {
@@ -998,7 +999,7 @@ ConfigResult parseNodeConfig(
             const std::string_view sv = trim(v);
             uint64_t parsed = 0;
             auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), parsed);
-            const bool isFeatureBits = i == rune::protocol::kNamespaceLimitFieldCount - 1;
+            const bool isFeatureBits = i == 28;
             if (sv.empty() || ec != std::errc{} || ptr != sv.data() + sv.size() ||
                 (isFeatureBits && parsed > UINT32_MAX))
                 return {{}, std::string(kNsDefaultVars[i]) + " must be a non-negative integer" +
@@ -1007,8 +1008,8 @@ ConfigResult parseNodeConfig(
                 parsed > static_cast<uint64_t>(NodeConfig::kMaxDurationMs))
                 return {{}, std::string("RUNE_NS_DEFAULT_MAX_TXN_TIME_MS must be an integer in [0, ") +
                                 std::to_string(NodeConfig::kMaxDurationMs) + "] ms (0 = unlimited), got: " + v};
-            if (isFeatureBits) rune::protocol::detail::putLimitU32(enc + 28 * 8, static_cast<uint32_t>(parsed));
-            else               rune::protocol::detail::putLimitU64(enc + 8 * i, parsed);
+            if (isFeatureBits) rune::protocol::detail::putLimitU32(enc + rune::protocol::limitFieldOffset(i), static_cast<uint32_t>(parsed));
+            else               rune::protocol::detail::putLimitU64(enc + rune::protocol::limitFieldOffset(i), parsed);
         }
         if (!rune::protocol::decodeLimits(enc, sizeof(enc), cfg.nsDefaultLimits))
             return {{}, "RUNE_NS_DEFAULT_*: internal limits encoding error"};

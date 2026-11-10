@@ -102,7 +102,7 @@ TEST(NamespaceQlRegression, MalformedQualifiedNamesAreParseErrorsRegression) {
         {"GRANT ROLE 'a//r' TO USER u;", "one '/'"},
         {"GRANT ADMIN ON NAMESPACE 'a/b' TO ROLE r;", "a namespace name has no '/'"},
         {"GRANT ADMIN ON NAMESPACE PREFIX 'a' TO ROLE r;", "a namespace name"},
-        {"GRANT FLY ON TOPIC t TO USER u;", "'admin' or 'truncate'"},
+        {"GRANT FLY ON TOPIC t TO USER u;", "'truncate' or 'import'"},
     };
     for (const auto& c : cases) {
         auto r = ql::parse(c.src);

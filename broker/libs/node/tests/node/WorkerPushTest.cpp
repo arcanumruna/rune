@@ -38,6 +38,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <string>
 #include <thread>
@@ -1020,6 +1021,142 @@ TEST_F(TransientOwnedPushRegression, OwnershipMovedParksTheSubscriptionAndNeverR
     for (std::size_t i = 0; i < c.baseOffsets.size(); ++i) EXPECT_EQ(c.baseOffsets[i], static_cast<int64_t>(i));
 }
 
+// ===========================================================================
+// Lease topics (Task 31): a TRANSIENT LEASE topic never skips a cursor ahead silently - a watch would miss a Revoke / Expire / grant.
+// A cursor below the ring start ENDS the subscription with ErrorResponse{PartitionDataReset 43, correlationId 0}; only the fresh cursor
+// of an Earliest subscribe is raised.  A plain transient topic keeps today's skip.
+// ===========================================================================
+class TransientLeaseEvictedPushRegression : public TransientOwnedPushRegression {
+protected:
+    struct Run {
+        std::vector<int64_t>         bases;
+        std::vector<F19Egress::Err>  errors;
+        Worker::WorkerSubscription::PushState state = Worker::WorkerSubscription::PushState::Live;
+        int64_t  nextOffset = 0, ringStart = 0;
+        uint64_t skips = 0, freshRaised = 0, recordsSkipped = 0;
+    };
+    WorkerOp subOp(rune::replication::PartitionReplica* r, int64_t from, bool fromEarliest) {
+        WorkerOp op = ringSubscribeOp(1, r, from);
+        op.fromEarliest = fromEarliest;
+        return op;
+    }
+    /// `deliverFirst` records are delivered, then the producer outruns the reader (20 more records, the ring evicts past its cursor)
+    /// and the worker passes again.  deliverFirst == 0: the ring is already evicted when the subscription is bound.
+    Run run(int base, bool lease, int64_t from, bool fromEarliest, int deliverFirst) {
+        Run out;
+        rune::storage::InMemoryLog mem(8 * 1024, 1000);   // ~7 x 1 KiB batches fit
+        int64_t next = 0;
+        if (deliverFirst == 0) { for (int i = 0; i < 20; ++i) next = appendRing(mem, next, 1000); }
+        else                   { for (int i = 0; i < deliverFirst; ++i) next = appendRing(mem, next, 1000); }
+        NullT t;
+        rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &mem, &t);
+        rep.setRegistryHandle(3, static_cast<uint32_t>(500 + base));
+        rep.onLeaderLogAppended();
+
+        const std::string controlEp = freeEndpoint();
+        const char* control = controlEp.c_str();
+        WorkerEgress eg(aeron_, control, base);
+        EXPECT_TRUE(eg.resolved());
+        auto sub = resolveSub(control, freeEndpoint(), base);
+        EXPECT_NE(sub, nullptr);
+        EXPECT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+        Worker w(0, kRingBytes, kRingBytes);
+        w.setWorkerEgress(&eg);
+        w.setOwnedDirect(Worker::OwnedSet{&rep});
+        // The flag Worker::armLeaseTransient_ derives from the topic's write spec (lease, memory-backed): set after the ownership apply,
+        // which re-derives it (no spec here).  The ring's eviction is driven by the test, not by the lease floor.
+        if (lease) rep.setLeaseTransient(true);
+        const auto freeRing = [&] { mem.setEvictionFloor(std::numeric_limits<int64_t>::max()); };
+        freeRing();
+        EXPECT_TRUE(w.tryEnqueueOp(subOp(&rep, from, fromEarliest)));
+        F19Egress c;
+        const auto pass = [&] { w.doWork(1); sub->poll(c.fa.handler(), 64); };
+        if (deliverFirst > 0) {
+            EXPECT_TRUE(waitFor([&]() { pass(); return static_cast<int>(c.records.size()) >= deliverFirst; }, 10s));
+            EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, deliverFirst);
+            freeRing();
+            for (int i = 0; i < 20; ++i) next = appendRing(mem, next, 1000);   // the producer outruns the reader
+            rep.onLeaderLogAppended();
+            EXPECT_GT(mem.logStartOffset(), deliverFirst) << "precondition: unread records were evicted";
+        }
+        // Give the worker enough passes to push everything / end; both outcomes are quiescent afterwards.
+        EXPECT_TRUE(waitFor([&]() { pass(); return !c.errors.empty() || (!c.records.empty() && c.records.back().baseOffset == next - 1); }, 10s));
+        for (int i = 0; i < 200; ++i) pass();   // nothing more may follow an end (no second error, no further Records)
+        for (const auto& r : c.records) out.bases.push_back(r.baseOffset);
+        out.errors         = c.errors;
+        out.state          = w.subscriptionsForTest()[0].pushState;
+        out.nextOffset     = w.subscriptionsForTest()[0].nextOffset;
+        out.ringStart      = mem.logStartOffset();
+        out.skips          = w.transientCursorSkipsForTest();
+        out.freshRaised    = w.transientFreshCursorsRaisedForTest();
+        out.recordsSkipped = w.transientRecordsSkippedForTest();
+        return out;
+    }
+};
+
+TEST_F(TransientLeaseEvictedPushRegression, LaggingReaderEndsRegression) {
+    // An Earliest subscriber that delivered 4 records and then fell behind the ring: the subscription ENDS (43), nothing is skipped.
+    const Run r = run(3301, /*lease=*/true, /*from=*/0, /*fromEarliest=*/true, /*deliverFirst=*/4);
+    ASSERT_EQ(r.errors.size(), 1u) << "exactly one terminal error";
+    EXPECT_EQ(r.errors[0].code, static_cast<int16_t>(rune::protocol::client::ErrorCode::PartitionDataReset));
+    EXPECT_EQ(r.errors[0].code, 43);
+    EXPECT_EQ(r.errors[0].correlationId, 0);
+    EXPECT_NE(r.errors[0].message.find("subscription 1 topic 10 partition 0 offset 4:"), std::string::npos) << r.errors[0].message;
+    EXPECT_EQ(r.state, Worker::WorkerSubscription::PushState::Failed);
+    EXPECT_EQ(r.nextOffset, 4) << "the cursor is parked, never moved to the ring start";
+    EXPECT_EQ(r.bases, (std::vector<int64_t>{0, 1, 2, 3})) << "no record after the end";
+    EXPECT_EQ(r.skips, 0u);
+    EXPECT_EQ(r.recordsSkipped, 0u);
+}
+
+TEST_F(TransientLeaseEvictedPushRegression, PlainTransientLaggingReaderStillSkipsRegression) {
+    // The same state on a plain transient topic: skipped as today (counter +1, no error), delivery resumes at the ring start.
+    const Run r = run(3302, /*lease=*/false, 0, /*fromEarliest=*/true, 4);
+    EXPECT_TRUE(r.errors.empty());
+    EXPECT_EQ(r.state, Worker::WorkerSubscription::PushState::Live);
+    EXPECT_EQ(r.skips, 1u);
+    ASSERT_FALSE(r.bases.empty());
+    EXPECT_EQ(r.bases.back(), 23);
+    EXPECT_EQ(r.nextOffset, 24);
+}
+
+TEST_F(TransientLeaseEvictedPushRegression, FreshExplicitBelowStartEndsRegression) {
+    // A fresh EXPLICIT cursor (a watch's resume at asOf + 1) below the ring start: the subscription ends at once, nothing is raised.
+    const Run r = run(3303, /*lease=*/true, /*from=*/3, /*fromEarliest=*/false, /*deliverFirst=*/0);
+    EXPECT_EQ(r.errors.size(), 1u);
+    ASSERT_FALSE(r.errors.empty());
+    EXPECT_EQ(r.errors[0].code, 43);
+    EXPECT_EQ(r.errors[0].correlationId, 0);
+    EXPECT_NE(r.errors[0].message.find("subscription 1 topic 10 partition 0 offset 3:"), std::string::npos) << r.errors[0].message;
+    EXPECT_EQ(r.state, Worker::WorkerSubscription::PushState::Failed);
+    EXPECT_GT(r.ringStart, 3) << "precondition: the cursor is below the ring start";
+    EXPECT_EQ(r.nextOffset, 3);
+    EXPECT_TRUE(r.bases.empty());
+    EXPECT_EQ(r.skips, 0u);
+    EXPECT_EQ(r.freshRaised, 0u);
+}
+
+TEST_F(TransientLeaseEvictedPushRegression, PlainTransientFreshExplicitBelowStartStillRaisedRegression) {
+    const Run r = run(3304, /*lease=*/false, 3, /*fromEarliest=*/false, 0);
+    EXPECT_TRUE(r.errors.empty());
+    EXPECT_EQ(r.freshRaised, 1u);
+    ASSERT_FALSE(r.bases.empty());
+    EXPECT_EQ(r.bases.front(), r.ringStart);
+}
+
+TEST_F(TransientLeaseEvictedPushRegression, EarliestRaisedRegression) {
+    // Earliest on a lease topic (the gateway resolves it to 0): raised to the ring start, delivery follows, no error.
+    const Run r = run(3305, /*lease=*/true, /*from=*/0, /*fromEarliest=*/true, /*deliverFirst=*/0);
+    EXPECT_TRUE(r.errors.empty());
+    EXPECT_EQ(r.state, Worker::WorkerSubscription::PushState::Live);
+    ASSERT_FALSE(r.bases.empty());
+    EXPECT_GT(r.ringStart, 0) << "precondition: the ring evicted";
+    EXPECT_EQ(r.bases.front(), r.ringStart) << "resumed AT the ring start";
+    EXPECT_EQ(r.bases.back(), 19);
+    EXPECT_EQ(r.freshRaised, 1u);
+    EXPECT_EQ(r.skips, 0u);
+}
 
 } // namespace
 

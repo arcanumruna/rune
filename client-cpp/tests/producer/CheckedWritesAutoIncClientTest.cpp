@@ -414,6 +414,35 @@ TEST(CheckedWritesAutoIncClientRegression, SchemaKeyFeaturesRoundTripToTheResult
     EXPECT_EQ(result.descriptorBlob, r.gw.schemaBlob);
 }
 
+TEST(CheckedWritesAutoIncClientRegression, LeaseSchemaResultRegression) {
+    const rune::protocol::LeaseSpec spec{.ttlMs = 10000, .minTtlMs = 1000, .maxTtlMs = 60000, .maxKeys = 1,
+                                         .expiryBatch = 64, .checkpoint = 0, .checkpointIntervalMs = 1000,
+                                         .checkpointRate = 1};
+    rune::protocol::TopicKeyFeatures f;
+    f.keyIndex = true;
+    f.partitioner = Partitioner::Modulo;
+    for (const bool withLease : {true, false}) {
+        Rig r(invokerCfg(withLease ? 4655 : 4657, withLease ? 4656 : 4658));
+        r.gw.replySchemas = true;
+        r.gw.schemaBlob   = rune::codec::serialize(stubDescriptor());
+        r.gw.schemaKeyFeatures = f;
+        if (withLease) r.gw.schemaLease = spec;
+        r.connect();
+        rc::TopicSchemaResult result;
+        r.whilePumping([&] { result = r.client->getTopicSchemaAndWait("autoinc_stub", StubRecord::kFingerprint); });
+        EXPECT_EQ(result.errorCode, 0);
+        ASSERT_TRUE(result.hasKeyFeatures);
+        EXPECT_EQ(result.keyFeatures, f) << "the key block is read from before the lease block";
+        EXPECT_EQ(result.descriptorBlob, r.gw.schemaBlob) << "the blob excludes both trailing blocks";
+        if (withLease) {
+            ASSERT_TRUE(result.lease.has_value());
+            EXPECT_EQ(*result.lease, spec);
+        } else {
+            EXPECT_FALSE(result.lease.has_value());
+        }
+    }
+}
+
 // ---- Task 6: the ack of a key-0 batch: assignedBase + i * stride, StoredIdUnknown ----
 
 namespace {

@@ -5,6 +5,8 @@
 #include <vector>
 #include <expected>
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/LeaseSpec.h>
+#include <optional>
 #include <rune/protocol/client/SecurityMessages.h>
 #include "rune/ql/Ast.h"
 #include <rune/codec/Descriptor.h>
@@ -29,6 +31,7 @@ struct DefineTopicPlan {
     int16_t              replicas = 0;                      // 0 = broker default
     TopicCreateConfig    config;                            // from `with (…)`; defaults when absent
     rune::protocol::TopicKeyFeatures keyFeatures{};         // `autoincrement`, key.index, autoincrement.*
+    std::optional<rune::protocol::LeaseSpec> lease;         // `lease topic …`: the spec with every `lease.*` setting applied
 };
 
 [[nodiscard]] DefineTopicPlan applyPlan(const TopicDef&);

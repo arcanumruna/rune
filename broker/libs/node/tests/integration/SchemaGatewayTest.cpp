@@ -199,8 +199,9 @@ struct SgHarness {
             ASSERT_TRUE(agent->postEgressFrame(session, f, r.encode(f)));
         };
         deps.respondGet = [this](int64_t session, int64_t corr, int32_t tid, uint16_t ver, int32_t parts,
-                                 const std::vector<uint8_t>& blob, uint16_t err, const rune::protocol::TopicKeyFeatures& keyFeatures) {
-            agent->postTopicSchemaResponse(session, corr, tid, ver, parts, blob, err, keyFeatures);
+                                 const std::vector<uint8_t>& blob, uint16_t err, const rune::protocol::TopicKeyFeatures& keyFeatures,
+                                 const std::optional<rune::protocol::LeaseSpec>& lease, int32_t leaseView) {
+            agent->postTopicSchemaResponse(session, corr, tid, ver, parts, blob, err, keyFeatures, lease, leaseView);
         };
         deps.respondAlter = [this](int64_t session, int64_t corr, int32_t tid, uint16_t newVer, uint16_t err) {
             pc::AlterTopicResponse r; r.sessionId=session; r.correlationId=corr;
@@ -251,7 +252,7 @@ struct SgHarness {
             if (tid != kA2cCatalogTopicApplied) return;
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer()+off);
             CatalogTopicAppliedMsg m;
-            ASSERT_TRUE(decodeCatalogTopicApplied(p, (std::size_t)len, m));
+            ASSERT_TRUE(decodeCatalogTopicApplied(p, (std::size_t)len, m, false));
             applied.push_back(m);
             if (!realControl) return;
             rune::node::TopicSpec spec;
@@ -676,9 +677,9 @@ TEST(SchemaGatewayRegression, CatalogTopicAppliedCarriesTheAuthoritativeSpecThro
     std::vector<uint8_t> f(catalogTopicAppliedWireLen("x", rune::protocol::TopicConfig{}));
     writeCatalogTopicApplied(f.data(), 1, "x", 1, 0, /*persistence=*/1, rune::protocol::TopicConfig{});
     CatalogTopicAppliedMsg m;
-    ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m));
+    ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m, false));
     f[4 + 2 + 1 + 4 + 2] = 2;   // the persistence byte
-    EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m));
+    EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m, false));
 }
 
 // Checked writes Part 06: the key features (autoincrement, the partitioner) ride the frame after nsId; a frame
@@ -689,17 +690,17 @@ TEST(CheckedWritesAutoIncRouting, CatalogTopicAppliedCarriesTheKeyFeatures) {
     std::vector<uint8_t> f(catalogTopicAppliedWireLen("x", c));
     writeCatalogTopicApplied(f.data(), 1, "x", 2, 0, /*persistence=*/0, c, /*nsId=*/7, kf);
     CatalogTopicAppliedMsg m;
-    ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m));
+    ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m, false));
     EXPECT_EQ(m.nsId, 7u);
     EXPECT_TRUE(m.keyFeatures.autoIncrement);
     EXPECT_EQ(m.keyFeatures.partitioner, rune::protocol::Partitioner::Modulo);
 
     std::vector<uint8_t> extra = f;
     extra.push_back(0);
-    EXPECT_FALSE(decodeCatalogTopicApplied(extra.data(), extra.size(), m)) << "one extra byte";
+    EXPECT_FALSE(decodeCatalogTopicApplied(extra.data(), extra.size(), m, false)) << "one extra byte";
     std::vector<uint8_t> badPartitioner = f;
     badPartitioner.back() = 2;
-    EXPECT_FALSE(decodeCatalogTopicApplied(badPartitioner.data(), badPartitioner.size(), m));
+    EXPECT_FALSE(decodeCatalogTopicApplied(badPartitioner.data(), badPartitioner.size(), m, false));
 }
 
 TEST(CheckedWritesAutoIncRoutingRegression, CatalogTopicAppliedWithoutFeatureBytesStillDecodesRegression) {
@@ -709,11 +710,11 @@ TEST(CheckedWritesAutoIncRoutingRegression, CatalogTopicAppliedWithoutFeatureByt
                              {.autoIncrement = true, .partitioner = rune::protocol::Partitioner::Modulo});
     f.resize(f.size() - kCatalogTopicAppliedFeatureBytes);   // the frame an older broker posted
     CatalogTopicAppliedMsg m;
-    ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m));
+    ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m, false));
     EXPECT_EQ(m.nsId, 7u);
     EXPECT_EQ(m.keyFeatures, rune::protocol::TopicKeyFeatures{});
     f.pop_back();
-    EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m)) << "a torn nsId";
+    EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m, false)) << "a torn nsId";
 }
 
 // ---------------------------------------------------------------------------

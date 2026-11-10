@@ -40,7 +40,9 @@ add_library(rune_node
 # cycle (VerdictSource appends through PartitionReplica), which CMake resolves by repeating the archives.
 add_library(rune_checked_write
     src/CheckedWriteHook.cpp
-    src/VerdictSource.cpp)
+    src/VerdictSource.cpp
+    src/lease/LeaseIndex.cpp
+    src/lease/LeaseRuntime.cpp)
 target_include_directories(rune_checked_write PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     ${RUNE_PROTOCOL_INCLUDE})
@@ -847,12 +849,16 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesFeatureLevelTest.cpp
         tests/node/CheckedWritesWriteStateTest.cpp
         tests/node/CheckedWritesHookTest.cpp
+        tests/node/LeaseWriteHookTest.cpp
         tests/node/CheckedWritesMinFoldCursorTest.cpp
         tests/node/CheckedWritesValidationMatrixTest.cpp
         tests/node/CheckedWritesWorkerTest.cpp
         tests/node/CheckedWritesSpecFanoutTest.cpp
         tests/node/CheckedWritesDdlTest.cpp
         tests/node/CheckedWritesKeyIndexDdlTest.cpp
+        tests/node/LeaseDdlTest.cpp
+        tests/node/LeaseJudgeTest.cpp
+        tests/node/LeaseLineageFanoutTest.cpp
         tests/node/CheckedWritesAutoIncDdlTest.cpp
         tests/node/CheckedWritesTimelineTest.cpp
         tests/node/CheckedWritesVerdictSourceTest.cpp
@@ -870,9 +876,11 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesConstraintDdlTest.cpp
         tests/node/CheckedWritesConstraintVerdictTest.cpp
         tests/node/CheckedWritesTxnJudgeTest.cpp
-        ${RUNE_BROKER_DIR}/../ql/tests/CheckedWritesQlFuzzTest.cpp)
+        ${RUNE_BROKER_DIR}/../ql/tests/CheckedWritesQlFuzzTest.cpp
+        ${RUNE_BROKER_DIR}/../ql/tests/LeaseQlTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
+        ${RUNE_BROKER_DIR}/../ql/src
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_checked_writes_tests PRIVATE
         rune_node
@@ -1344,6 +1352,34 @@ if(BUILD_TESTING)
                 PROPERTIES TIMEOUT 180
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            # Lease topics Task 3b: the broker effects of a lease topic (a plan-less lease view sink) over a REAL
+            # single-node BrokerNode and real Aeron: create / restart / drop / restart.
+            add_executable(rune_lease_topic_broker_tests
+                tests/integration/LeaseTopicBrokerTest.cpp)
+            target_include_directories(rune_lease_topic_broker_tests PRIVATE
+                ${RUNE_PROTOCOL_INCLUDE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(rune_lease_topic_broker_tests PRIVATE
+                rune_node
+                rune_view
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_lease_topic_broker_tests
+                PROPERTIES TIMEOUT 180
+                ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # Lease topics Task 9: the lease wheels, the entry store and the four-state machine.  Header-only and standard
+            # library only, so this target links no broker library and never rebuilds one.
+            add_executable(rune_lease_wheel_tests
+                tests/node/LeaseWheelTest.cpp
+                tests/support/AllocWindow.cpp)
+            target_include_directories(rune_lease_wheel_tests PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
+            target_link_libraries(rune_lease_wheel_tests PRIVATE GTest::gtest_main)
+            target_compile_options(rune_lease_wheel_tests PRIVATE -Werror=switch)
+            gtest_discover_tests(rune_lease_wheel_tests PROPERTIES TIMEOUT 120)
+
             # EmbeddedDriver: one driver, one pumping thread (spec §3.6).
             add_executable(rune_embedded_driver_tests tests/node/EmbeddedDriverTest.cpp tests/node/DriverWakePollProbe.c)
             target_link_libraries(rune_embedded_driver_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
@@ -1404,7 +1440,7 @@ if(BUILD_TESTING)
             gtest_discover_tests(rune_checked_writes_ack_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Checked writes Part 04: the verdict pipeline on a real Worker.
-            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesKeyIndexWideTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp tests/node/CheckedWritesCatalogGateTest.cpp tests/node/CheckedWritesConstraintWorkerTest.cpp tests/node/CheckedWritesConstraintChangeTest.cpp tests/node/CheckedWritesTxnWorkerTest.cpp tests/node/CheckedWritesTxnVisibilityTest.cpp)
+            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesKeyIndexWideTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp tests/node/CheckedWritesCatalogGateTest.cpp tests/node/CheckedWritesConstraintWorkerTest.cpp tests/node/CheckedWritesConstraintChangeTest.cpp tests/node/CheckedWritesTxnWorkerTest.cpp tests/node/CheckedWritesTxnVisibilityTest.cpp tests/node/LeaseJudgeWorkerTest.cpp tests/node/LeasePredicateTest.cpp tests/node/LeaseCleanerRebuildTest.cpp)
             target_include_directories(rune_checked_writes_verdict_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
             target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view rune_ql aeron::aeron GTest::gtest_main)
             # The full-length runs (over 1 s alone) carry LABELS stress; the default runs half the steps.
@@ -1413,6 +1449,13 @@ if(BUILD_TESTING)
                                  PROPERTIES TIMEOUT 300 LABELS stress ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
             gtest_discover_tests(rune_checked_writes_verdict_tests TEST_FILTER "-${RUNE_CW_VERDICT_STRESS_TESTS}"
                                  PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # Lease topics Task 10: the expiry emitter on a real worker.  AllocWindow.cpp replaces the global operator new (the
+            # no-allocation test), so this is its own binary.
+            add_executable(rune_lease_emitter_tests tests/node/LeaseEmitterTest.cpp tests/node/LeaseParkTableTest.cpp tests/node/LeaseKeepAliveTest.cpp tests/node/LeaseCheckpointTest.cpp tests/node/LeasePromotionTest.cpp tests/node/LeaseViewReadTest.cpp tests/node/LeaseScanTest.cpp tests/node/LeaseMatrixUnitTest.cpp tests/node/LeaseFenceTest.cpp ${RUNE_BROKER_DIR}/libs/gateway/tests/LeaseGatewayRouteTest.cpp tests/support/AllocWindow.cpp)
+            target_include_directories(rune_lease_emitter_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
+            target_link_libraries(rune_lease_emitter_tests PRIVATE rune_node rune_replication rune_codec rune_view rune_ql aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_lease_emitter_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # The namespace fetch gate on the default consume paths (worker-owned, group, filtered subscriptions; legacy PushRead).
             add_executable(rune_ns_fetch_adv_tests tests/node/NsFetchGateAdversarialRegressionTest.cpp)
@@ -1428,7 +1471,7 @@ if(BUILD_TESTING)
 
             # Checked writes Part 03 (hard rule): the write hook and the View acks allocate nothing.  Replaces the global
             # operator new (binary-wide) - its own binary; later checked-writes parts extend it.
-            add_executable(rune_checked_writes_alloc_regression_tests tests/node/CheckedWritesAllocRegressionTest.cpp tests/node/CheckedWritesAutoIncAllocTest.cpp tests/node/CheckedWritesViewReadAllocTest.cpp tests/support/AllocWindow.cpp)
+            add_executable(rune_checked_writes_alloc_regression_tests tests/node/CheckedWritesAllocRegressionTest.cpp tests/node/CheckedWritesAutoIncAllocTest.cpp tests/node/LeaseWriteHookAllocTest.cpp tests/node/CheckedWritesViewReadAllocTest.cpp tests/support/AllocWindow.cpp)
             target_include_directories(rune_checked_writes_alloc_regression_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
             target_link_libraries(rune_checked_writes_alloc_regression_tests PRIVATE rune_node rune_replication rune_codec rune_view rune_ql aeron::aeron GTest::gtest_main)
             # The full-length transaction mix (over 1 s alone) carries LABELS stress; the default runs a shorter one of the same mix.
@@ -1960,7 +2003,18 @@ if(BUILD_TESTING)
                        tests/client/CheckedWritesTransientViewBrokerRegressionTest.cpp
                        tests/client/CheckedWritesQlBrokerRegressionTest.cpp
                        tests/client/CheckedWritesRegressorsPathRegressionTest.cpp
-                       tests/client/CheckedWritesTxnBrokerRegressionTest.cpp)
+                       tests/client/CheckedWritesTxnBrokerRegressionTest.cpp
+                       tests/client/LeaseTopicBrokerTest.cpp
+                       tests/client/LeaseIntegrationTest.cpp
+                       tests/client/LeaseRaceTest.cpp
+                       tests/client/LeaseMatrixTest.cpp
+                       tests/client/LeaseNamespaceTest.cpp
+                       tests/client/LeaseLineageBrokerTest.cpp
+                       tests/client/LeaseTransientTest.cpp
+                       tests/client/LeaseTrioTest.cpp
+                       tests/client/LeaseRouteHintTest.cpp
+                       tests/client/LeaseRecipeBrokerTest.cpp
+                       tests/client/GatewayUnknownSessionTest.cpp)
         target_compile_definitions(rune_client_broker_tests PRIVATE RUNE_QL_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/ql/tests/golden")
         # Phase 2b B Task 8b: ClaimBrokerRegressionTest compiles against the client's build-time generated all-fixed
         # `position.gen.h` (rune_gen_claim_schemas); the embedded client builds it under its own binary dir.
@@ -2002,6 +2056,16 @@ if(BUILD_TESTING)
         target_link_libraries(rune_checked_writes_catalog_gate_cluster_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_ql rune_catalog
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_checked_writes_catalog_gate_cluster_tests PROPERTIES TIMEOUT 600)
+
+        # Lease topics Task 18 (spec 16.4): the seeded model-checked lease stress.  Leg S: one real broker with the injected lease clock;
+        # leg T: three real brokers on the real clock.  One ctest case per seed (gtest discovery); labelled stress.
+        add_executable(rune_lease_stress_tests tests/integration/LeaseStressTest.cpp)
+        add_dependencies(rune_lease_stress_tests generate_claim_schema_headers)
+        target_include_directories(rune_lease_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/tests/support ${CMAKE_BINARY_DIR}/rune-client/claim-gen)
+        target_link_libraries(rune_lease_stress_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
+                              rune_client_view rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_lease_stress_tests PROPERTIES TIMEOUT 1800 LABELS stress)
 
         # Namespaces Task 11: the REAL client namespace API and the REAL `rune namespace` / `rune ql` CLI against ONE
         # real authenticating BrokerNode.

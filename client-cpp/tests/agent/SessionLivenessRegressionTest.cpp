@@ -116,3 +116,53 @@ TEST(SessionLivenessRegression, SilentSessionStillTimesOut) {
     a.tickSessionsForTest(T0 + kTimeout + 1);
     EXPECT_NE(m.state(), sm::SessionState::Connected);
 }
+
+// Checkpoint E (U2): an ENCRYPTED session drops every clear frame except one: a clear ErrorResponse{UnknownSession} for that session
+// echoing one of its two latest probe nonces (a restarted gateway holds no keys, so its notice is clear text).  A wrong nonce, another
+// session id or any other clear template is dropped; the first two are counted.
+// RED: accept the notice without the nonce check (acceptsProbeNotice_ -> isProbeNonce).
+TEST(ClientAgentRegression, ClearUnknownSessionNeedsProbeNonceRegression) {
+    rca::ClientAgent a(cfg());
+    sm::SessionMachine& m = a.sessionMachineForTest(0);
+    connect(a, m, /*sid=*/0x5500000007LL, T0);
+    m.cryptoState().encrypted = true;   // the session is sealed from here on (no keys: the frames below are all clear)
+    int observed = 0;
+    a.setEgressObserver([&](rcc::TemplateId, const uint8_t*, std::size_t) { ++observed; });
+    const int64_t sid = m.sessionId();
+    EXPECT_EQ(m.lastProbeNonce(), 0) << "no probe before the first keepalive";
+    a.tickSessionsForTest(T0 + 150 * kMs);   // the keepalive interval elapsed: the probe goes out
+    const int64_t nonce = m.lastProbeNonce();
+    ASSERT_LT(nonce, 0);
+    ASSERT_GE(nonce, -(int64_t{1} << 62));
+    ASSERT_LE(nonce, -(int64_t{1} << 32)) << "never a keepalive's id or an application ping's";
+    a.tickSessionsForTest(T0 + 300 * kMs);
+    const int64_t nonce2 = m.lastProbeNonce();
+    ASSERT_NE(nonce2, nonce);
+    ASSERT_TRUE(m.isProbeNonce(nonce)) << "the last two nonces are kept";
+    const auto notice = [&](int64_t headerSid, int64_t corr) {
+        std::array<uint8_t, 128> buf{};
+        const std::size_t n = rcc::encodeErrorResponse(buf.data(), buf.size(), static_cast<int16_t>(rpc::ErrorCode::UnknownSession), "", headerSid, corr);
+        EXPECT_GT(n, 0u);
+        a.dispatchEgressFrameForTest(T0 + 400 * kMs, buf.data(), n);
+    };
+    notice(sid, nonce + 1);                                  // wrong nonce
+    EXPECT_EQ(m.state(), sm::SessionState::Connected);
+    EXPECT_EQ(a.probeNoticesRejected(), 1u);
+    notice(sid, 0);                                          // no nonce at all
+    EXPECT_EQ(m.state(), sm::SessionState::Connected);
+    EXPECT_EQ(a.probeNoticesRejected(), 2u);
+    notice(sid + 1, nonce2);                                 // another session's id with a right nonce
+    EXPECT_EQ(m.state(), sm::SessionState::Connected);
+    EXPECT_EQ(a.probeNoticesAccepted(), 0u);
+    {   // any other clear template naming the session
+        const int before = observed;
+        std::array<uint8_t, 128> buf{};
+        const std::size_t n = rcc::encodePong(buf.data(), buf.size(), "", sid, nonce2);
+        ASSERT_GT(n, 0u);
+        a.dispatchEgressFrameForTest(T0 + 400 * kMs, buf.data(), n);
+        EXPECT_EQ(observed, before) << "a clear Pong on an encrypted session is dropped";
+    }
+    notice(sid, nonce);                                      // the right session and an old but kept nonce
+    EXPECT_EQ(a.probeNoticesAccepted(), 1u);
+    EXPECT_EQ(m.state(), sm::SessionState::Resuming) << "handled exactly like an UnknownSession on that session";
+}

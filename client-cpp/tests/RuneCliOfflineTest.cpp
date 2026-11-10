@@ -98,7 +98,10 @@ TEST(CheckedWritesCliRegression, ErrorCodeNamesCoverEveryCodeThroughTxnConflictR
     EXPECT_EQ(errorCodeName(61), "ViewUniqueInvalid");
     EXPECT_EQ(errorCodeName(62), "TxnTooLarge");
     EXPECT_EQ(errorCodeName(63), "TxnConflict");
-    EXPECT_EQ(errorCodeName(64), "UnknownErrorCode");
+    EXPECT_EQ(errorCodeName(64), "LeaseNotFound");
+    EXPECT_EQ(errorCodeName(65), "LeaseLimitExceeded");
+    EXPECT_EQ(errorCodeName(66), "LeaseTtlTooLarge");
+    EXPECT_EQ(errorCodeName(67), "UnknownErrorCode");
 }
 
 // Checked writes Part 08: `rune stats (topic | view) <name> [--partition N] [--json] --broker host:port`.

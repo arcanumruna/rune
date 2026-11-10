@@ -124,17 +124,17 @@ struct Rig {
 
     /// A gateway PushRead (legacy-mode subscription read) for the transient partition.
     /// `fresh`: the gateway's bind-time cursor (WorkerOp::freshCursor, E2 M2).
-    void pushRead(int64_t subId, int64_t from, uint8_t isolation = 0, bool fresh = false) {
+    void pushRead(int64_t subId, int64_t from, uint8_t isolation = 0, bool fresh = false, bool fromEarliest = false) {
         WorkerOp op;
         op.type = WorkerOp::Type::PushRead; op.topicId = kTopic; op.partition = 0;
         op.subscriptionId = subId; op.sessionId = 1; op.nextOffset = from;
-        op.hwBound = INT64_MAX; op.isolation = isolation; op.freshCursor = fresh;
+        op.hwBound = INT64_MAX; op.isolation = isolation; op.freshCursor = fresh; op.fromEarliest = fromEarliest;
         op.logPtr = nullptr;   // the gateway holds no disk Log for a transient partition
         ASSERT_TRUE(pool.tryEnqueueOp(kTopic, 0, std::move(op)));
     }
     /// pushRead + passes until ITS PushReadResult (bounded).
-    std::optional<WorkerReturn> readOnce(int64_t subId, int64_t from, uint8_t isolation = 0, bool fresh = false) {
-        pushRead(subId, from, isolation, fresh);
+    std::optional<WorkerReturn> readOnce(int64_t subId, int64_t from, uint8_t isolation = 0, bool fresh = false, bool fromEarliest = false) {
+        pushRead(subId, from, isolation, fresh, fromEarliest);
         for (int i = 0; i < 64; ++i) {
             pass();
             std::optional<WorkerReturn> got;

@@ -10,6 +10,7 @@
 // the existing segment scanner.
 // ---------------------------------------------------------------------------
 
+#include <system_error>
 #include <type_traits>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/BatchPrefix.h>
@@ -432,6 +433,8 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
     epoch_ = newEpoch;
     if (role_ != Role::Leader) ++leadershipGeneration_;   // F15 S4: a new leadership (not an epoch bump)
     role_  = Role::Leader;
+    resetLeaderLogStart_();   // lease topics: the leader's own start is the reference
+    if (leaseTransient_) leaseFloor_ = 0;   // lease topics: evict nothing until the worker's first duty pass pushes the real floor (A.3)
 
     // Use the full assigned replica set (RF), NOT the (possibly leader-only) ISR,
     // as the IsrManager's replica set (see configuredReplicas_).
@@ -557,6 +560,7 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     epoch_    = leaderEpoch;
     if (role_ != Role::Follower) ++leadershipGeneration_;   // F15 S4
     role_     = Role::Follower;
+    resetLeaderLogStart_();   // lease topics (A.3): a new leadership epoch restarts the leader-start floor
     leaderId_ = leaderId;
     resetIsrProposal_();
     followerHw_ = 0;
@@ -710,6 +714,56 @@ Offset PartitionReplica::appendControlBatch(std::span<const uint8_t> controlBatc
     return baseOffset;
 }
 
+bool PartitionReplica::isLeaseDataBatch(std::span<const uint8_t> batch) noexcept
+{
+    namespace b = rune::protocol::batch;
+    if (batch.size() < static_cast<std::size_t>(b::kRecordBatchOverhead)) return false;
+    const uint8_t* p = batch.data();
+    if (p[b::kMagicOffset] != 2) return false;
+    const auto attrs = static_cast<uint16_t>(p[b::kAttributesOffset] |
+                                             (static_cast<uint16_t>(p[b::kAttributesOffset + 1]) << 8));
+    if ((attrs & static_cast<uint16_t>(b::kAttrControl | b::kAttrTransactional)) != 0) return false;
+    rune::protocol::RecordBatchReader r(p, batch.size());
+    // The broker's own batch carries no producer identity: a batch with one would enter the idempotence / transaction state.
+    if (r.producerId() != -1 || r.producerEpoch() != -1 || r.baseSequence() != -1) return false;
+    return static_cast<std::size_t>(r.totalLength()) == batch.size() && r.ensureValid();
+}
+
+Offset PartitionReplica::appendLeaseBatch(std::span<const uint8_t> batch)
+{
+    if (!acceptsProduce() || appendRefusedForTest_) return kAppendNotLeader;   // retriable (also while incomplete)
+    if (leaseAppendThrowForTest_) throw std::system_error(std::make_error_code(std::errc::no_space_on_device), "test: lease append");
+    if (!isLeaseDataBatch(batch)) return kAppendInvalidBatch;
+    ++rtAppends_;
+    if (!committedIsrMeetsMinIsr_(true)) return kAppendMinIsr;   // lease records are always acks=all
+
+    const int32_t lastOffsetDelta = rune::protocol::RecordBatchReader(batch.data(), batch.size()).lastOffsetDelta();
+    Offset baseOffset = logEndOffset_();
+    if (memoryBacked_) {
+        batchScratch_.assign(batch.begin(), batch.end());
+        const auto u = static_cast<uint64_t>(baseOffset);
+        for (int i = 0; i < 8; ++i) batchScratch_[static_cast<std::size_t>(i)] = static_cast<uint8_t>(u >> (8 * i));
+        rune::protocol::RecordBatchReader::stampLeaderEpoch(batchScratch_.data(), static_cast<int32_t>(epoch_));
+        refreshTransientEvictionFloor_();   // Phase 2b E2: never evict uncommitted data
+        if (memLog_->appendNoSync(batchScratch_.data(), batchScratch_.size(),
+                                  baseOffset + lastOffsetDelta) < 0) return kAppendBackPressure;
+    } else {
+        // Zero-copy restamp (pwritev): the caller's bytes are never mutated.
+        diskLog_->appendNoSyncRestamp(batch.data(), batch.size(), lastOffsetDelta, baseOffset);
+        if (externalFollowerFlush_) {
+            followerFlushRequested_ = true;   // the owning worker submits it (never inline)
+        } else {
+            diskLog_->sync();
+        }
+    }
+
+    leaderState_.setLeaderLogEndOffset(logEndOffset_());
+    recomputeHw();
+    publishCleanerState();
+    if (cfg_.pushOnAppend) (void)pushToFollowers();
+    return baseOffset;
+}
+
 // ---------------------------------------------------------------------------
 // Leader: append with an explicit record key (CP-1 compaction support)
 // ---------------------------------------------------------------------------
@@ -821,6 +875,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         // (the control plane will correct the leaderId via the next metadata push).
         ++leadershipGeneration_;   // F15 S4: self-demotion ends this leadership
         role_     = Role::Follower;
+        resetLeaderLogStart_();
         resetIsrProposal_();       // a follower owns no proposal (A-M3 / B-M2)
         epoch_    = req.leaderEpoch;
         leaderId_ = req.followerId; // best-effort; coordinator will correct
@@ -1451,6 +1506,10 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // captured, so the fast-ack below fetches from the new position at once.
     if (memoryBacked_ && role_ == Role::Follower && resp.logStartOffset > logEndOffset_()) [[unlikely]]
         resetTransientLogTo_(resp.logStartOffset);
+    // Lease topics (spec A.3): never evict what the leader still holds.  Monotone
+    // within a leadership epoch (an error frame may carry 0); BEFORE the apply floors.
+    if (memoryBacked_ && leaseTransient_ && role_ == Role::Follower)
+        leaderLogStart_ = std::max(leaderLogStart_, resp.logStartOffset);
     // (FR: applyReplicated entry is measured by the ReplFetchRespApply SPAN; the
     //  control→worker handoff that delivers this op is ReplFragRecv→ReplWorkerOpRun.)
 
@@ -3828,6 +3887,7 @@ void PartitionReplica::resetTransientLogTo_(Offset start)
     const Offset was       = logEndOffset_();
     const Offset prevStart = memLog_->logStartOffset();
     memLog_->resetTo(start);
+    leaderLogStart_ = start;   // lease topics: the ring now starts at the leader's start
     // F15 §2.1 step 3 parity (truncateLog): the log's existing content changed —
     // every held record is gone.  Bump the generation, cut at the OLD ring start
     // (nothing below it was held), so parked waiters, the RC state and a view

@@ -46,7 +46,7 @@ namespace rune::codec {
 /// @param d       The descriptor to generate code for.
 /// @param nspace  The C++ namespace to emit the struct in (default "rune::gen").
 [[nodiscard]] std::string generateHeader(const Descriptor& d,
-                                         std::string_view nspace = "rune::gen");
+                                         std::string_view nspace = "rune::gen", bool isLease = false);
 
 /// #418: the type of schema `version` of the topic whose EVOLVING descriptor (every field ever declared, with its
 /// lifetime: what `rune schema generate` fetches) is `evolving`.  The generated decode() / Decoder place every
@@ -55,7 +55,11 @@ namespace rune::codec {
 /// generateHeader(d, d.version): `d` is taken as the lineage, so a descriptor that hides a DROP (a materialized
 /// one) places the versions before that DROP wrongly — give it the evolving descriptor.
 /// @throws std::invalid_argument when `version` is 0 or after evolving.version.
+/// Lease topics (Task 14b): `isLease` marks `evolving` as a lease topic's stored schema (its first four fields must be exactly
+/// the lease system columns, all fields fixed-width, else std::invalid_argument).  The type then gains
+/// `withLease(version, ttlMs, holder)`, its Encoder / ClaimEncoder lose the lease_remaining_ms setter, and a `<T>LeasesRow`
+/// (alias T::LeasesRow) with a generated `decode(row)` of the lease view's row follows it.  false: the header is unchanged.
 [[nodiscard]] std::string generateHeader(const Descriptor& evolving, uint16_t version,
-                                         std::string_view nspace = "rune::gen");
+                                         std::string_view nspace = "rune::gen", bool isLease = false);
 
 } // namespace rune::codec

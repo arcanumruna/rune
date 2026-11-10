@@ -385,7 +385,8 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     EXPECT_EQ(sbe::OpType::get(32), sbe::OpType::Value::WRITE_SPEC_UPDATE);
     EXPECT_EQ(sbe::TailKind::get(12), sbe::TailKind::Value::WRITE_SPEC);
     EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::WRITE_SPEC_UPDATE), "WRITE_SPEC_UPDATE");
-    // Checked writes Parts 07, 08 and 11 appended ops 33-36, returns 9-11 and tail kind 13; the next free values are unassigned.
+    // Checked writes Parts 07, 08 and 11 appended ops 33-36, returns 9-11 and tail kind 13; lease topics appended ops
+    // 37-41, returns 12-14 and tail kind 14 after them.
     EXPECT_EQ(static_cast<int>(sbe::OpType::Value::GET_VIEW_ROW_K), 33);
     EXPECT_EQ(static_cast<int>(sbe::OpType::Value::SCAN_VIEW_ROWS), 34);
     EXPECT_EQ(static_cast<int>(sbe::OpType::Value::GET_STATS), 35);
@@ -402,9 +403,23 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     EXPECT_EQ(sbe::OpType::get(36), sbe::OpType::Value::TXN_VOTE);
     EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::TXN_VOTE_RESULT), 11);
     EXPECT_EQ(sbe::ReturnType::get(11), sbe::ReturnType::Value::TXN_VOTE_RESULT);
-    EXPECT_THROW((void)sbe::OpType::get(37), std::runtime_error);
-    EXPECT_THROW((void)sbe::ReturnType::get(12), std::runtime_error);
-    EXPECT_THROW((void)sbe::TailKind::get(14), std::runtime_error);
+    // Lease topics Tasks 11a, 13b, 21 and 27: keepalive / TimeToLive / ScanLeases / NsLeasesOver / TransientLineage
+    // (ops 37-41, returns 12-14, tail 14), appended after checked writes Part 11.
+    EXPECT_EQ(sbe::OpType::get(37), sbe::OpType::Value::LEASE_KEEP_ALIVE);
+    EXPECT_EQ(sbe::OpType::get(38), sbe::OpType::Value::LEASE_TIME_TO_LIVE);
+    EXPECT_EQ(sbe::OpType::get(39), sbe::OpType::Value::SCAN_LEASES);
+    EXPECT_EQ(sbe::OpType::get(40), sbe::OpType::Value::NS_LEASES_OVER);
+    EXPECT_EQ(sbe::OpType::get(41), sbe::OpType::Value::TRANSIENT_LINEAGE);
+    EXPECT_EQ(sbe::ReturnType::get(12), sbe::ReturnType::Value::LEASE_KEEP_ALIVE_RESULT);
+    EXPECT_EQ(sbe::ReturnType::get(13), sbe::ReturnType::Value::LEASE_TIME_TO_LIVE_RESULT);
+    EXPECT_EQ(sbe::ReturnType::get(14), sbe::ReturnType::Value::SCAN_LEASES_RESULT);
+    EXPECT_EQ(sbe::TailKind::get(14), sbe::TailKind::Value::LEASE_REQUEST);
+    EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::LEASE_KEEP_ALIVE), "LEASE_KEEP_ALIVE");
+    EXPECT_STREQ(sbe::ReturnType::c_str(sbe::ReturnType::Value::SCAN_LEASES_RESULT), "SCAN_LEASES_RESULT");
+    // The next free values are unassigned.
+    EXPECT_THROW((void)sbe::OpType::get(42), std::runtime_error);
+    EXPECT_THROW((void)sbe::ReturnType::get(15), std::runtime_error);
+    EXPECT_THROW((void)sbe::TailKind::get(15), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------

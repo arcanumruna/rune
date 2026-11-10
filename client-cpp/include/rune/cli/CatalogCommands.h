@@ -19,6 +19,7 @@
 #endif
 
 #include <cstdint>
+#include <expected>
 #include <istream>
 #include <optional>
 #include <ostream>
@@ -72,6 +73,12 @@ template <class RefreshFn, class LookupFn, class NowFn, class PauseFn>
 [[nodiscard]] std::string formatTopicDefinition(const rune::catalog::TopicObject&);
 [[nodiscard]] std::string formatSchemaDefinition(const rune::catalog::TopicObject&);
 [[nodiscard]] std::string formatViewDefinition(const rune::catalog::ViewObject&);
+/// `catalog replay` of a lease topic: the broker stores the descriptor with the four lease system columns at ids 0..3 and
+/// the user fields shifted +4, but a lease DefineTopic carries the USER descriptor only.  Removes the four columns
+/// (lease_version, lease_ttl_ms, lease_holder, lease_remaining_ms) and subtracts 4 from every remaining id; the error
+/// is "lease topic '<name>' does not start with the lease system columns" when they are not the first four fields.
+[[nodiscard]] std::expected<std::vector<uint8_t>, std::string> stripLeaseColumns(std::span<const uint8_t> storedBlob,
+                                                                                 std::string_view topicName);
 /// `+ topic NAME` | `- view NAME` | `~ topic NAME: field, field`  (no newline)
 [[nodiscard]] std::string formatDiffEntry(const rune::catalog::DiffEntry&);
 

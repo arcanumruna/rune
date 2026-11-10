@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <set>
 
 namespace rune::gateway {
 namespace {
@@ -190,6 +191,37 @@ TEST(SessionTableTest, ReAdd_AfterRemove_FindsNewEntry) {
     Session* s = t.find(sid);
     ASSERT_NE(s, nullptr);
     EXPECT_EQ(s->lastSeenNs, 42LL);
+}
+
+// L22 Part A: a node and its restart (two fresh tables, the same prefix) never hand out the same id.
+TEST(SessionTableRegression, RestartDoesNotReuseIdsRegression) {
+    constexpr int64_t kPrefix = int64_t{2} << 40;
+    SessionTable a, b;
+    a.setIdPrefix(kPrefix);
+    b.setIdPrefix(kPrefix);
+    std::set<int64_t> ids;
+    for (int i = 0; i < 1000; ++i) ids.insert(a.nextSessionId());
+    ASSERT_EQ(ids.size(), 1000u);
+    for (int i = 0; i < 1000; ++i) EXPECT_EQ(ids.count(b.nextSessionId()), 0u) << "an id of the previous life was re-issued";
+}
+
+TEST(SessionTableRegression, AllocatedCountUnchangedRegression) {
+    constexpr int64_t kPrefix = int64_t{3} << 40;
+    SessionTable t;
+    t.setIdPrefix(kPrefix);
+    for (int i = 0; i < 5; ++i) {
+        const int64_t id = t.nextSessionId();
+        EXPECT_GT(id, 0);
+        EXPECT_EQ(id & ~((int64_t{1} << 40) - 1), kPrefix);
+    }
+    EXPECT_EQ(t.sessionsAllocated(), 5u);
+}
+
+TEST(SessionTableRegression, IdStartSeamFixesTheFirstIdRegression) {
+    SessionTable t;
+    t.setIdStartForTest(100);
+    EXPECT_EQ(t.nextSessionId(), 101);
+    EXPECT_EQ(t.sessionsAllocated(), 1u);
 }
 
 } // namespace

@@ -2718,7 +2718,10 @@ TEST(ClientAuthErrorsRegression, AuthErrorNamesCoverNamespaceCodesRegression) {
     EXPECT_STREQ(rc::authErrorName(61), "ViewUniqueInvalid");
     EXPECT_STREQ(rc::authErrorName(62), "TxnTooLarge");
     EXPECT_STREQ(rc::authErrorName(63), "TxnConflict");
-    EXPECT_EQ(rc::authErrorName(64), nullptr);
+    EXPECT_STREQ(rc::authErrorName(64), "LeaseNotFound");
+    EXPECT_STREQ(rc::authErrorName(65), "LeaseLimitExceeded");
+    EXPECT_STREQ(rc::authErrorName(66), "LeaseTtlTooLarge");
+    EXPECT_EQ(rc::authErrorName(67), nullptr);
 }
 
 // ---------------------------------------------------------------------------

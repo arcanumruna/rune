@@ -307,7 +307,7 @@ TEST(TypedClaim, StringKeyClaimMatchesSendForShortKeys) {
     for (const auto k : keys) {
         ShortKey rec;
         rec.code.fill('\0');
-        std::memcpy(rec.code.data(), k.data(), k.size());
+        if (!k.empty()) std::memcpy(rec.code.data(), k.data(), k.size());
         rec.v = 77;
         topic.send(rec);
         auto w = topic.claim(k);

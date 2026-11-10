@@ -82,7 +82,9 @@ struct AdminDeps {
     std::function<void(int64_t session, int64_t corr, int32_t topicId,
                        uint16_t version, int32_t partitionCount,
                        const std::vector<uint8_t>& blob,
-                       uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures)> respondGet;
+                       uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures,
+                       const std::optional<rune::protocol::LeaseSpec>& lease,
+                       int32_t leaseViewTopicId)> respondGet;
     /// AlterTopicResponse (69).  On OK `newVersion` is the new schema version; on
     /// an error, the current one (the client re-reads and retries its CAS).
     std::function<void(int64_t session, int64_t corr, int32_t topicId,

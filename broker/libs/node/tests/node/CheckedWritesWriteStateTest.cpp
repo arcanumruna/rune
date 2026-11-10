@@ -357,3 +357,196 @@ TEST(CheckedWritesValidationFuzzRegression, RandomMutationsAgreeWithTheModel) {
         }
     }
 }
+
+// ═══ Lease topics: the write spec's lease block and the system-column layout guard ═══
+
+namespace {
+
+rune::codec::Descriptor leaseDescriptor(uint16_t keyWidth = 64) {
+    rune::codec::DescriptorBuilder d("inst");
+    d.add("lease_version", PrimType::Int64).add("lease_ttl_ms", PrimType::UInt64)
+        .add("lease_holder", PrimType::UInt64).add("lease_remaining_ms", PrimType::UInt64)
+        .addFixedStr("id", keyWidth, 1, /*isKey=*/true);
+    return d.build();
+}
+
+}  // namespace
+
+TEST(LeaseWriteSpecRegression, WireRoundTrip) {
+    rune::protocol::LeaseSpec ls;
+    ls.ttlMs = 4242; ls.maxKeys = 9; ls.checkpoint = 0;
+    TopicWriteSpecWire w;
+    w.topicId = 6; w.keyFieldId = 4; w.keyType = PrimType::FixedStr; w.keyWidth = 128; w.keyIndex = true;
+    w.lease = ls;
+    w.leaseViewTopicId = 7;
+    EXPECT_EQ(kTopicWriteSpecLeaseWireLen, 52u);   // + the lease view's sink id (Task 13a)
+    ASSERT_EQ(topicWriteSpecWireLen(w), 52u);
+    std::vector<uint8_t> buf(52);
+    ASSERT_EQ(encodeTopicWriteSpec(w, buf), 52u);
+    EXPECT_EQ(buf[8] & 8, 8);
+    const auto back = decodeTopicWriteSpec(buf);
+    ASSERT_TRUE(back);
+    EXPECT_EQ(*back, w);
+    ASSERT_TRUE(back->lease.has_value());
+    EXPECT_EQ(*back->lease, ls);
+
+    // the 9 and 26 byte forms are unchanged
+    TopicWriteSpecWire plain;
+    plain.topicId = 6;
+    uint8_t nine[kTopicWriteSpecWireLen];
+    ASSERT_EQ(encodeTopicWriteSpec(plain, nine), 9u);
+    EXPECT_TRUE(decodeTopicWriteSpec(nine));
+    TopicWriteSpecWire ai;
+    ai.topicId = 6; ai.autoIncrement = true; ai.partitionCount = 2;
+    uint8_t tw[kTopicWriteSpecAutoIncWireLen];
+    ASSERT_EQ(encodeTopicWriteSpec(ai, tw), 26u);
+    EXPECT_TRUE(decodeTopicWriteSpec(tw));
+
+    // lease + autoincrement together: refused on decode
+    auto both = buf;
+    both[8] |= 4;
+    EXPECT_FALSE(decodeTopicWriteSpec(both));
+    // a 52-byte frame without bit 3
+    auto noBit = buf;
+    noBit[8] &= static_cast<uint8_t>(~8u);
+    EXPECT_FALSE(decodeTopicWriteSpec(noBit));
+    // bit 3 on a 9-byte frame
+    auto shortBit = std::vector<uint8_t>(buf.begin(), buf.begin() + 9);
+    EXPECT_FALSE(decodeTopicWriteSpec(shortBit));
+    // bits 5-7 (bit 4 is leaseTransient since Task 29)
+    for (int bit = 5; bit < 8; ++bit) {
+        auto b = buf;
+        b[8] |= static_cast<uint8_t>(1u << bit);
+        EXPECT_FALSE(decodeTopicWriteSpec(b)) << "bit " << bit;
+    }
+    // cut at every length
+    for (std::size_t n = 0; n < 52; ++n) {
+        const bool good = n == 9 || n == 26;
+        const auto cut = decodeTopicWriteSpec(std::span<const uint8_t>(buf.data(), n));
+        EXPECT_FALSE(cut.has_value()) << "cut to " << n << (good ? " (a legal length, but bit 3 is set)" : "");
+    }
+}
+
+TEST(WriteSpecWireRegression, LeaseTransientBitRegression) {
+    rune::protocol::LeaseSpec ls;
+    ls.ttlMs = 4242; ls.maxKeys = 9;
+    for (const bool transient : {false, true}) {
+        TopicWriteSpecWire w;
+        w.topicId = 6; w.keyFieldId = 4; w.keyType = PrimType::FixedStr; w.keyWidth = 16;
+        w.lease = ls; w.leaseViewTopicId = 7; w.leaseTransient = transient;
+        std::vector<uint8_t> buf(kTopicWriteSpecLeaseWireLen);
+        ASSERT_EQ(encodeTopicWriteSpec(w, buf), kTopicWriteSpecLeaseWireLen);
+        EXPECT_EQ(buf[8], transient ? 0x18 : 0x08);
+        const auto back = decodeTopicWriteSpec(buf);
+        ASSERT_TRUE(back);
+        EXPECT_EQ(back->leaseTransient, transient);
+        EXPECT_EQ(*back, w);
+        TopicWriteSpec spec;
+        spec.setFacts(*back);
+        EXPECT_EQ(spec.leaseTransient, transient);
+    }
+    // bit 4 without bit 3 (a 9-byte frame, and a 26-byte autoincrement frame)
+    TopicWriteSpecWire plain;
+    plain.topicId = 6;
+    uint8_t nine[kTopicWriteSpecWireLen];
+    ASSERT_EQ(encodeTopicWriteSpec(plain, nine), 9u);
+    nine[8] |= 0x10;
+    EXPECT_FALSE(decodeTopicWriteSpec(nine));
+    TopicWriteSpecWire ai;
+    ai.topicId = 6; ai.autoIncrement = true; ai.partitionCount = 2;
+    uint8_t tw[kTopicWriteSpecAutoIncWireLen];
+    ASSERT_EQ(encodeTopicWriteSpec(ai, tw), 26u);
+    tw[8] |= 0x10;
+    EXPECT_FALSE(decodeTopicWriteSpec(tw));
+    // bit 5 (and 6, 7) stay refused, with or without a lease
+    TopicWriteSpecWire lw;
+    lw.topicId = 6; lw.lease = ls;
+    std::vector<uint8_t> buf(kTopicWriteSpecLeaseWireLen);
+    ASSERT_EQ(encodeTopicWriteSpec(lw, buf), kTopicWriteSpecLeaseWireLen);
+    for (int bit = 5; bit < 8; ++bit) {
+        auto b = buf;
+        b[8] |= static_cast<uint8_t>(1u << bit);
+        EXPECT_FALSE(decodeTopicWriteSpec(b)) << "bit " << bit;
+    }
+    // the catalog's persistence rides the wire: Transient -> true, Disk -> false, no lease -> false
+    rune::catalog::TopicObject t = topicOf(leaseDescriptor(16), "id", true);
+    t.lease = ls;
+    t.persistence = rune::catalog::Persistence::Transient;
+    ASSERT_TRUE(writeSpecWireOf(t));
+    EXPECT_TRUE(writeSpecWireOf(t)->leaseTransient);
+    t.persistence = rune::catalog::Persistence::Disk;
+    EXPECT_FALSE(writeSpecWireOf(t)->leaseTransient);
+    t.lease.reset();
+    t.persistence = rune::catalog::Persistence::Transient;
+    EXPECT_FALSE(writeSpecWireOf(t)->leaseTransient);
+}
+
+TEST(LeaseWriteSpecRegression, KeyWidthRealRegression) {
+    rune::catalog::TopicObject lease = topicOf(leaseDescriptor(128), "id", true);
+    lease.lease = rune::protocol::LeaseSpec{};
+    const auto w = writeSpecWireOf(lease);
+    ASSERT_TRUE(w);
+    EXPECT_EQ(w->keyWidth, 128) << "a lease topic's key may be a string(128)";
+    ASSERT_TRUE(w->lease.has_value());
+    EXPECT_EQ(*w->lease, rune::protocol::LeaseSpec{});
+
+    rune::catalog::TopicObject plain = topicOf(leaseDescriptor(128), "id", true);
+    const auto p = writeSpecWireOf(plain);
+    ASSERT_TRUE(p);
+    EXPECT_EQ(p->keyWidth, 0) << "the same key on a non-lease topic is not a topic key";
+    EXPECT_FALSE(p->lease.has_value());
+}
+
+TEST(LeaseWriteSpecRegression, LayoutBreakRefusedRegression) {
+    TopicWriteSpecWire facts;
+    facts.topicId = 9; facts.lease = rune::protocol::LeaseSpec{};
+
+    auto bad = leaseDescriptor();
+    bad.fields[0].offset = 8;   // lease_version moved off offset 0
+    ASSERT_FALSE(leaseLayoutOk(bad));
+    ASSERT_TRUE(leaseLayoutOk(leaseDescriptor()));
+
+    TopicWriteSpec spec;
+    EXPECT_EQ(spec.setFacts(facts), 0u);
+    EXPECT_FALSE(spec.installVersion(1, bad));
+    EXPECT_EQ(spec.descriptorFor(1), nullptr);
+    EXPECT_TRUE(spec.installVersion(1, leaseDescriptor()));
+    EXPECT_NE(spec.descriptorFor(1), nullptr);
+
+    // the spec arrives AFTER the version (the production order: SchemaUpdate, then WriteSpecUpdate): the bad one is erased
+    TopicWriteSpec late;
+    EXPECT_TRUE(late.installVersion(1, bad));   // no lease known yet
+    EXPECT_TRUE(late.installVersion(2, leaseDescriptor()));
+    EXPECT_EQ(late.setFacts(facts), 1u);
+    EXPECT_EQ(late.descriptorFor(1), nullptr);
+    EXPECT_NE(late.descriptorFor(2), nullptr);
+
+    // a non-lease spec guards nothing
+    TopicWriteSpec nolease;
+    EXPECT_TRUE(nolease.installVersion(1, bad));
+    TopicWriteSpecWire plainFacts;
+    plainFacts.topicId = 9;
+    EXPECT_EQ(nolease.setFacts(plainFacts), 0u);
+    EXPECT_NE(nolease.descriptorFor(1), nullptr);
+}
+
+TEST(LeaseWriteSpecRegression, RefusedVersionAnswersRejectNotVersionAheadRegression) {
+    TopicWriteSpecWire facts;
+    facts.topicId = 9; facts.legacyValidate = true; facts.lease = rune::protocol::LeaseSpec{};
+    auto bad = leaseDescriptor();
+    bad.fields[0].offset = 8;
+    TopicWriteSpec spec;
+    spec.setFacts(facts);
+    ASSERT_TRUE(spec.installVersion(1, leaseDescriptor()));
+    ASSERT_FALSE(spec.installVersion(2, bad));   // refused: the slot stays null
+    EXPECT_EQ(spec.descriptorFor(2), nullptr);
+    EXPECT_EQ(spec.maxVersion(), 2u);
+
+    const char value[8] = {0, 0, 2, 0, 0, 0, 0, 0};   // a record at version 2
+    rune::protocol::RecordSpan r;
+    r.value = std::string_view(value, sizeof value);
+    EXPECT_EQ(checkTypedRecord(spec, r, 5), TypedCheck::Reject) << "a refused version is final, not retriable";
+    const char ahead[8] = {0, 0, 3, 0, 0, 0, 0, 0};
+    r.value = std::string_view(ahead, sizeof ahead);
+    EXPECT_EQ(checkTypedRecord(spec, r, 5), TypedCheck::VersionAhead) << "a later version is still ahead";
+}

@@ -8,6 +8,8 @@
 #include <vector>
 #include <algorithm>
 #include <utility>
+#include <cstring>
+#include <span>
 using namespace rune::view;
 using rune::codec::DescriptorBuilder; using rune::codec::PrimType; using rune::codec::FieldValue;
 
@@ -355,4 +357,141 @@ TEST(ViewTableMigrationRegression, EraseThenReinsertAlreadyMigratedKeyDuringMigr
         ASSERT_NE(t.get(v), nullptr) << "lost key " << v;
         EXPECT_EQ(readSlot(t.get(v), L, 1).i, 2) << "key " << v << " corrupted (possible rid aliasing)";
     }
+}
+
+// The optional per-row auxiliary area (lease topics' lastAppended): chunked and grown with the rows.
+TEST(ViewTableAuxRegression, AuxSurvivesGrowthAcrossChunksRegression) {
+    RowLayout L = hpLayout();
+    ViewTableKeys keys;
+    keys.auxBytesPerRow = 8;
+    ViewTable t(L, 4096, /*chunkBytes=*/L.rowLen * 4, keys);   // a handful of rows per chunk
+    const std::size_t perChunk = t.ridCapacity();
+    ASSERT_GE(perChunk, 1u);
+    const uint64_t n = perChunk * 3 + 5;
+    std::vector<uint32_t> rids;
+    for (uint64_t k = 1; k <= n; ++k) {
+        (void)t.put(k);
+        uint32_t rid = 0;
+        ASSERT_TRUE(t.ridOf(ViewKey::fromU64(k), rid));
+        const int64_t v = int64_t(k) * 1000 - 7;
+        std::memcpy(t.aux(rid), &v, 8);
+        rids.push_back(rid);
+    }
+    ASSERT_GE(t.chunkCount(), 3u) << "the rids span at least 3 chunks";
+    for (uint64_t k = 1; k <= n; ++k) {   // read back after all the growth
+        int64_t v = 0;
+        std::memcpy(&v, std::as_const(t).aux(rids[k - 1]), 8);
+        EXPECT_EQ(v, int64_t(k) * 1000 - 7) << k;
+    }
+}
+
+TEST(ViewTableAuxRegression, NoAuxAllocatesNothingExtraRegression) {
+    RowLayout L = hpLayout();
+    ViewTable plain(L, 4096, L.rowLen * 4);
+    ViewTableKeys keys;
+    keys.auxBytesPerRow = 8;
+    ViewTable withAux(L, 4096, L.rowLen * 4, keys);
+    EXPECT_EQ(plain.auxBytesPerRow(), 0u);
+    EXPECT_EQ(withAux.memoryBytes() - plain.memoryBytes(), withAux.ridCapacity() * 8) << "the aux area is exactly 8 bytes per addressable row";
+    const uint64_t n = plain.ridCapacity() * 2;
+    for (uint64_t k = 1; k <= n; ++k) { (void)plain.put(k); (void)withAux.put(k); }
+    EXPECT_EQ(plain.chunkCount(), withAux.chunkCount());
+    EXPECT_EQ(withAux.memoryBytes() - plain.memoryBytes(), withAux.ridCapacity() * 8);
+}
+
+
+// ---- keyOf(rid): the key bytes of a live row, narrow and wide (lease emitter, Task 10) ----
+namespace {
+RowLayout keyOfLayout() {
+    return buildRowLayout(DescriptorBuilder("v", 1).add("id", PrimType::Int64, 1, true).add("hp", PrimType::Int32).build());
+}
+bool keyBytesEqual(std::span<const uint8_t> a, std::span<const uint8_t> b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
+}
+}  // namespace
+
+TEST(ViewTableKeyOfRegression, NarrowEightByteKeyReuseAndGrow) {
+    RowLayout L = keyOfLayout();
+    ViewTable t(L, 16, 1u << 12, ViewTableKeys{8, 0, 7});
+    const uint64_t k1 = 1, k2 = (uint64_t{1} << 40) + 7;
+    t.put(k1);
+    t.put(k2);
+    uint32_t r1 = 0, r2 = 0;
+    ASSERT_TRUE(t.ridOf(ViewKey::fromU64(k1), r1));
+    ASSERT_TRUE(t.ridOf(ViewKey::fromU64(k2), r2));
+    EXPECT_TRUE(keyBytesEqual(t.keyOf(r1), ViewKey::fromU64(k1).span()));
+    EXPECT_TRUE(keyBytesEqual(t.keyOf(r2), ViewKey::fromU64(k2).span()));
+    // erase one and re-put a different key: the freed rid is reused, keyOf returns the new key
+    ASSERT_TRUE(t.erase(k1));
+    const uint64_t k3 = 0x1122334455667788ull;
+    t.put(k3);
+    uint32_t r3 = 0;
+    ASSERT_TRUE(t.ridOf(ViewKey::fromU64(k3), r3));
+    EXPECT_EQ(r3, r1) << "the freed row id is reused";
+    EXPECT_TRUE(keyBytesEqual(t.keyOf(r3), ViewKey::fromU64(k3).span()));
+    EXPECT_TRUE(keyBytesEqual(t.keyOf(r2), ViewKey::fromU64(k2).span()));
+    // grow far past the load factor (several index migrations, several row chunks)
+    std::vector<std::pair<uint64_t, uint32_t>> all{{k3, r3}, {k2, r2}};
+    for (uint64_t i = 100; i < 20000; ++i) {
+        t.put(i * 2654435761ull);
+        uint32_t r = 0;
+        ASSERT_TRUE(t.ridOf(ViewKey::fromU64(i * 2654435761ull), r));
+        all.emplace_back(i * 2654435761ull, r);
+    }
+    for (const auto& [k, r] : all) ASSERT_TRUE(keyBytesEqual(t.keyOf(r), ViewKey::fromU64(k).span())) << k;
+}
+
+TEST(ViewTableKeyOfRegression, NarrowFourByteKey) {
+    RowLayout L = keyOfLayout();
+    ViewTable t(L, 16, 1u << 12, ViewTableKeys{4, 0, 9});
+    const uint8_t kb[4] = {1, 2, 3, 4};
+    const uint8_t kc[4] = {0xFF, 0, 0x80, 0x7F};
+    const ViewKey a = ViewKey::fromBytes(kb), c = ViewKey::fromBytes(kc);
+    t.put(a);
+    t.put(c);
+    uint32_t ra = 0, rc = 0;
+    ASSERT_TRUE(t.ridOf(a, ra));
+    ASSERT_TRUE(t.ridOf(c, rc));
+    ASSERT_EQ(t.keyOf(ra).size(), 4u);
+    EXPECT_TRUE(keyBytesEqual(t.keyOf(ra), a.span()));
+    EXPECT_TRUE(keyBytesEqual(t.keyOf(rc), c.span()));
+    ASSERT_TRUE(t.erase(a));
+    const uint8_t kd[4] = {9, 8, 7, 6};
+    const ViewKey d = ViewKey::fromBytes(kd);
+    t.put(d);
+    uint32_t rd = 0;
+    ASSERT_TRUE(t.ridOf(d, rd));
+    EXPECT_EQ(rd, ra);
+    EXPECT_TRUE(keyBytesEqual(t.keyOf(rd), d.span()));
+}
+
+TEST(ViewTableKeyOfRegression, WideSixteenByteKey) {
+    RowLayout L = keyOfLayout();
+    ViewTable t(L, 16, 1u << 12, ViewTableKeys{16, 0, 11});
+    auto mk = [](uint8_t seed, uint32_t i) {
+        uint8_t b[16];
+        for (int j = 0; j < 16; ++j) b[j] = static_cast<uint8_t>(seed + j * 3 + (i >> (j % 4)));
+        std::memcpy(b + 4, &i, 4);
+        return ViewKey::fromBytes(b);
+    };
+    std::vector<std::pair<ViewKey, uint32_t>> all;
+    for (uint32_t i = 0; i < 6000; ++i) {
+        const ViewKey k = mk(5, i);
+        t.put(k);
+        uint32_t r = 0;
+        ASSERT_TRUE(t.ridOf(k, r));
+        ASSERT_TRUE(keyBytesEqual(t.keyOf(r), k.span()));
+        all.emplace_back(k, r);
+    }
+    // erase one and re-put a different key that reuses the rid
+    const auto [victim, vr] = all[10];
+    ASSERT_TRUE(t.erase(victim));
+    const ViewKey fresh = mk(200, 999999);
+    t.put(fresh);
+    uint32_t fr = 0;
+    ASSERT_TRUE(t.ridOf(fresh, fr));
+    EXPECT_EQ(fr, vr);
+    EXPECT_TRUE(keyBytesEqual(t.keyOf(fr), fresh.span()));
+    all[10] = {fresh, fr};
+    for (const auto& [k, r] : all) ASSERT_TRUE(keyBytesEqual(t.keyOf(r), k.span()));
 }

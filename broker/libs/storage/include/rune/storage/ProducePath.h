@@ -122,6 +122,8 @@ struct ProduceOutcome {
     bool     logFull = false;
     /// The active write hook's assigned key for a key-0 create (0 = none).
     uint64_t assignedBase = 0;
+    /// Throttled by the write hook: how long the client should wait before the retry (ns); 0 = none.  Set by the caller.
+    int64_t  retryAfterNs = 0;
 
     [[nodiscard]] bool isOK() const noexcept {
         return error == rune::protocol::client::ErrorCode::OK;

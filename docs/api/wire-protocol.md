@@ -463,6 +463,9 @@ rejection counts of a topic's verdict source, `constraintId = viewObjectId << 16
 | 61 | `ViewUniqueInvalid` | Client 17: a `unique` clause does not compile. | DDL compile error |
 | 62 | `TxnTooLarge` | Client 17: a transaction has more records on a partition than `RUNE_TXN_JUDGED_RECORDS_MAX`. The whole transaction aborts. | vote in `EndTxnResponse`, or the `Produce` that takes it past the limit |
 | 63 | `TxnConflict` | Client 17: another writer wrote one of the transaction's keys after its write and before its commit. The whole transaction aborts. | vote in `EndTxnResponse` |
+| 64 | `LeaseNotFound` | Client 18: no live lease for the key, or a lease at a different version. A session below 18 is answered `InvalidRequest` (39). | per-record verdict of a `View` ack on a lease topic, or a `LeaseKeepAlive` entry |
+| 65 | `LeaseLimitExceeded` | Client 18: the topic's `lease.max_keys` or the namespace's max leases is reached. | per-record verdict of a grant |
+| 66 | `LeaseTtlTooLarge` | Client 18: the requested TTL is above the topic's `lease.max_ttl`. | `Produce` / `LeaseKeepAlive` error |
 
 The broker-internal storage errors (`rune::protocol::ErrorCode`, [`Errors.h`](../../protocol/include/rune/protocol/Errors.h))
 are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRecord`=2, `InvalidRecordBatch`=3,

@@ -21,8 +21,10 @@
 // bytes inline; the consumer rebuilds owning strings / vectors on its own thread.
 // Cold path (DDL is rare): the per-op owning containers are acceptable here.
 
+#include <rune/node/CatalogApplier.h>   // leaseViewSinkValid (the one fail-closed rule for a lease view sink)
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/LeaseSpec.h>
 #include <rune/protocol/NamespaceLimits.h>   // NamespaceDdlMsg (namespaces Task 7)
 #include <rune/catalog/CatalogEvent.h>   // rune::catalog::ConfigChange (AlterTopicConfig)
 #include <rune/catalog/NamespaceRegistry.h>   // NamespaceRecord (kA2cNamespaceUpserted, namespaces Task 9)
@@ -285,6 +287,7 @@ struct DefineTopicMsg {
     std::string                 adoptDenial;
     uint32_t                    nsId = 0;   // namespaces Task 7: the namespace the object lives in (0 = default)
     rune::protocol::TopicKeyFeatures keyFeatures{};   // checked writes Part 05: key.index at create / adoption
+    std::optional<rune::protocol::LeaseSpec> lease;   // lease topics: the spec of a lease topic's CreateTopic
 };
 
 /// AlterTopic: the client's CAS expectation (expectedVersion = the topic's SCHEMA
@@ -542,6 +545,7 @@ struct Sizer {
         n += 4 + b.size();
     }
     void str32(std::string_view s) noexcept { bytes32({reinterpret_cast<const uint8_t*>(s.data()), s.size()}); }
+    void raw(std::span<const uint8_t> b) noexcept { n += b.size(); }
 };
 
 struct Writer {
@@ -564,6 +568,10 @@ struct Writer {
         p += b.size();
     }
     void str32(std::string_view s) noexcept { bytes32({reinterpret_cast<const uint8_t*>(s.data()), s.size()}); }
+    void raw(std::span<const uint8_t> b) noexcept {
+        if (!b.empty()) std::memcpy(p, b.data(), b.size());
+        p += b.size();
+    }
 };
 
 /// Checked reader: every short read clears `ok` (and reads nothing further).
@@ -692,6 +700,13 @@ template <class W> void layout(W& w, const DefineTopicMsg& m) {
     w.u8((m.keyFeatures.keyIndex ? 1 : 0) | (m.keyFeatures.autoIncrement ? 2 : 0));
     w.u8(static_cast<uint8_t>(m.keyFeatures.partitioner));
     w.u64(m.keyFeatures.autoIncrementMax); w.u32(m.keyFeatures.autoIncrementReserve);
+    // lease topics: ALWAYS [hasLease u8], then (when 1) the 39 bytes of encodeLeaseSpec.
+    w.u8(m.lease ? 1 : 0);
+    if (m.lease) {
+        std::array<uint8_t, rune::protocol::kLeaseSpecBytes> lb{};
+        rune::protocol::encodeLeaseSpec(*m.lease, lb.data());
+        w.raw({lb.data(), lb.size()});
+    }
 }
 template <class W> void layout(W& w, const AlterTopicMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.u16(m.expectedVersion); w.str16(m.topicName);
@@ -829,6 +844,16 @@ inline DdlRequest decodeDefineTopic(const uint8_t* buf, std::size_t len) {
     m.keyFeatures.partitioner          = static_cast<rune::protocol::Partitioner>(r.ok ? partitioner : 0);
     m.keyFeatures.autoIncrementMax     = r.u64();
     m.keyFeatures.autoIncrementReserve = r.u32();
+    const uint8_t hasLease = r.u8();
+    if (r.ok && hasLease > 1) r.fail("an unknown hasLease byte");
+    if (r.ok && hasLease == 1) {
+        if (r.need(rune::protocol::kLeaseSpecBytes)) {
+            rune::protocol::LeaseSpec ls;
+            if (rune::protocol::decodeLeaseSpec(r.b + r.pos, rune::protocol::kLeaseSpecBytes, ls)) m.lease = ls;
+            else r.fail("a malformed lease spec");   // never a plain define
+            r.pos += rune::protocol::kLeaseSpecBytes;
+        }
+    }
     return admin_wire::finish(r, std::move(m), kTidDefineTopic);
 }
 inline DdlRequest decodeAlterTopic(const uint8_t* buf, std::size_t len) {
@@ -1474,8 +1499,13 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
 //                             fileDeleteDelayMs:i64 durability:u8 durabilityTier:u8
 //                             coPartitionGroupLen:u16 + bytes, partitionKeyLen:u16 + bytes
 //                             [nsId:u32]   (namespaces Task 5: the owning namespace)
-//                             [flags:u8 (bit0 keyIndex, bit1 autoIncrement)][partitioner:u8]   (checked writes Part 06;
-//                             a frame without these two bytes is Fnv1a with no autoincrement; appended LAST)
+//                             [flags:u8 (bit0 keyIndex, bit1 autoIncrement, bit2 lease topic, bit3 lease view sink)]
+//                             [partitioner:u8][39-byte LeaseSpec block iff bit2]   (checked writes Part 06;
+//                             a frame without these two bytes is Fnv1a with no autoincrement; appended LAST;
+//                             bits 2 and 3 never both)
+//                             [leaseSourceTopicId:i32][leaseKeyType:u8][leaseKeyWidth:u8] iff bit3 and the id is known   (lease
+//                             topics Task 13a / 13b: the lease view's source topic and that topic's key type / width, from the
+//                             catalog; the decoder REFUSES a bit-3 frame without them: a lease view that names no topic is not served)
 //   kA2cCatalogTopicDropped : [topicId:i32][nameLen:u16 + name][nsId:u32]
 //   kA2cCatalogTopicConfig  : [topicId:i32][count:u16][(key:u8, value:i64) * count]
 //   kA2cViewUninstall       : [viewTopicId:i32]
@@ -1521,22 +1551,35 @@ struct CatalogTopicAppliedMsg {
     rune::protocol::TopicConfig config;
     uint32_t                    nsId              = 0;   // the owning namespace (names are per namespace)
     rune::protocol::TopicKeyFeatures keyFeatures{};   // only keyIndex, autoIncrement and partitioner travel
+    std::optional<rune::protocol::LeaseSpec> lease;   // flags bit 2: a lease topic
+    bool                        leaseViewFlag     = false;   // the RAW flags bit 3, set even when the frame is refused (the caller must never await a plan for it)
+    bool                        leaseView         = false;   // flags bit 3: the sink of a lease topic's lease view (no plan)
+    int32_t                     leaseSourceTopicId = -1;     // bit 3 + 6 trailing bytes: the lease topic that owns the view; -1: not carried
+    uint8_t                     leaseKeyType       = 0;      // ... and its key's rune::codec::PrimType
+    uint8_t                     leaseKeyWidth      = 0;      // ... and its key's width in bytes (0: not known)
 };
 
 /// The key-feature flags and partitioner bytes after nsId.
 inline constexpr std::size_t kCatalogTopicAppliedFeatureBytes = 2;
+/// The trailing bytes of a lease view frame: [leaseSourceTopicId i32][leaseKeyType u8][leaseKeyWidth u8].
+inline constexpr std::size_t kCatalogLeaseViewSourceBytes = 6;
 
 /// 0 = cannot be encoded (a string longer than a u16 prefix holds).
 [[nodiscard]] inline std::size_t catalogTopicAppliedWireLen(std::string_view name,
-                                                            const rune::protocol::TopicConfig& c) noexcept {
+                                                            const rune::protocol::TopicConfig& c,
+                                                            bool lease = false, bool leaseViewSource = false) noexcept {
     if (name.size() > kMaxStr16 || c.coPartitionGroup.size() > kMaxStr16 || c.partitionKey.size() > kMaxStr16)
         return 0;
-    return 4 + 2 + name.size() + 4 + 2 + 1 + topicConfigWireLen(c) + 4 + kCatalogTopicAppliedFeatureBytes;
+    return 4 + 2 + name.size() + 4 + 2 + 1 + topicConfigWireLen(c) + 4 + kCatalogTopicAppliedFeatureBytes +
+           (lease ? rune::protocol::kLeaseSpecBytes : 0) + (leaseViewSource ? kCatalogLeaseViewSourceBytes : 0);
 }
 
 inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_view name, int32_t partitions,
                                      int16_t rf, uint8_t persistence, const rune::protocol::TopicConfig& c,
-                                     uint32_t nsId = 0, const rune::protocol::TopicKeyFeatures& kf = {}) {
+                                     uint32_t nsId = 0, const rune::protocol::TopicKeyFeatures& kf = {},
+                                     const std::optional<rune::protocol::LeaseSpec>& lease = std::nullopt,
+                                     bool leaseView = false, int32_t leaseSourceTopicId = -1, uint8_t leaseKeyType = 0,
+                                     uint8_t leaseKeyWidth = 0) {
     using namespace admin_wire;
     putI32(p, topicId); p += 4;
     p = putStr16(p, name);
@@ -1558,11 +1601,21 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
     p = putStr16(p, c.coPartitionGroup);
     p = putStr16(p, c.partitionKey);
     putU32(p, nsId); p += 4;
-    *p++ = static_cast<uint8_t>((kf.keyIndex ? 1u : 0u) | (kf.autoIncrement ? 2u : 0u));
-    *p   = static_cast<uint8_t>(kf.partitioner);
+    *p++ = static_cast<uint8_t>((kf.keyIndex ? 1u : 0u) | (kf.autoIncrement ? 2u : 0u) | (lease ? 4u : 0u) |
+                                (leaseView ? 8u : 0u));
+    *p++ = static_cast<uint8_t>(kf.partitioner);
+    if (lease) rune::protocol::encodeLeaseSpec(*lease, p);
+    if (leaseView && leaseSourceTopicId >= 0) {   // sized by catalogTopicAppliedWireLen(.., leaseViewSource)
+        putI32(p, leaseSourceTopicId); p += 4;
+        *p++ = leaseKeyType;
+        *p++ = leaseKeyWidth;
+    }
 }
 
-[[nodiscard]] inline bool decodeCatalogTopicApplied(const uint8_t* buf, std::size_t len, CatalogTopicAppliedMsg& m) {
+/// `sink` is the frame TYPE: false = kA2cCatalogTopicApplied (feature bit 3, "lease view", is refused), true =
+/// kA2cCatalogSinkApplied (bit 2, "lease", is refused: a sink never carries a lease block).  Bit 2 with bit 1
+/// (autoIncrement) is refused on both.
+[[nodiscard]] inline bool decodeCatalogTopicApplied(const uint8_t* buf, std::size_t len, CatalogTopicAppliedMsg& m, bool sink) {
     using namespace admin_wire;
     std::size_t pos = 0;
     if (len < 4) return false;
@@ -1591,14 +1644,43 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
     if (pos + 4 > len) return false;
     m.nsId = getU32(buf + pos); pos += 4;
     m.keyFeatures = {};
+    m.lease.reset();
+    m.leaseViewFlag = false;
+    m.leaseView = false;
+    m.leaseSourceTopicId = -1;
+    m.leaseKeyType = 0;
+    m.leaseKeyWidth = 0;
     if (pos != len) {   // the feature bytes; a frame without them is Fnv1a, no autoincrement
-        if (pos + kCatalogTopicAppliedFeatureBytes != len || (buf[pos] & 0xFC) != 0 ||
+        m.leaseViewFlag = (buf[pos] & 8u) != 0;   // the RAW bit, before any refusal below
+        const uint8_t forbidden = sink ? 0x04 : 0x08;   // a sink has no lease block; a topic is never a lease view
+        if (pos + kCatalogTopicAppliedFeatureBytes > len || (buf[pos] & 0xF0) != 0 || (buf[pos] & forbidden) != 0 ||
+            (buf[pos] & 0x06) == 0x06 ||
             buf[pos + 1] > static_cast<uint8_t>(rune::protocol::Partitioner::Modulo))
             return false;
+        const bool hasLease = (buf[pos] & 4u) != 0;
+        const bool isLeaseView = (buf[pos] & 8u) != 0;
+        const std::size_t body = len - pos - kCatalogTopicAppliedFeatureBytes;   // 39 with a lease block; 0 or 6 (the source id, key type, key width) for a lease view
+        if (isLeaseView) {   // a lease view frame always names its lease topic (in-process ring: no skew)
+            if (body != kCatalogLeaseViewSourceBytes || hasLease) return false;
+            m.leaseSourceTopicId = getI32(buf + pos + kCatalogTopicAppliedFeatureBytes);
+            if (!leaseViewSinkValid(/*leaseView*/true, m.leaseSourceTopicId)) return false;
+            m.leaseKeyType  = buf[pos + kCatalogTopicAppliedFeatureBytes + 4];
+            m.leaseKeyWidth = buf[pos + kCatalogTopicAppliedFeatureBytes + 5];
+        } else if (body != (hasLease ? rune::protocol::kLeaseSpecBytes : 0)) {
+            return false;
+        }
         m.keyFeatures.keyIndex      = (buf[pos] & 1u) != 0;
         m.keyFeatures.autoIncrement = (buf[pos] & 2u) != 0;
         m.keyFeatures.partitioner   = static_cast<rune::protocol::Partitioner>(buf[pos + 1]);
-        pos += kCatalogTopicAppliedFeatureBytes;
+        m.leaseView                 = (buf[pos] & 8u) != 0;
+        if (hasLease) {
+            rune::protocol::LeaseSpec spec{};
+            if (!rune::protocol::decodeLeaseSpec(buf + pos + kCatalogTopicAppliedFeatureBytes,
+                                                 rune::protocol::kLeaseSpecBytes, spec))
+                return false;
+            m.lease = spec;
+        }
+        pos = len;
     }
     return pos == len && m.topicId >= 0 && m.partitions > 0 && !m.name.empty();
 }
@@ -1867,25 +1949,32 @@ template <typename Write>
     return true;
 }
 
-// ---- F3 round 7, item 4: descriptor size is bounded BY CONSTRUCTION ----
+// ---- F3 round 7, item 4: descriptor size is bounded by the request ring ----
 // A descriptor reaches the admin thread only inside a DefineTopic on the request
 // ring (O2O ring: maxMsgLength = capacity / 8), whose fixed framing (catalog
 // history Task 9 layout) is session + corr + partitions + validate + the three
 // length prefixes + persistence + rf + the config block + the meta's fixed part.
 // The SchemaUpdate that re-posts it on the admin→control ring carries only a
-// 6-byte header in front, so every committed descriptor fits.
+// 6-byte header in front, so every descriptor the REQUEST carries fits.  A lease define's STORED descriptor is larger than
+// the request's (it gains the four lease system columns, and an RCD1 blob is re-serialized); that growth is not bounded
+// here but by the append-time catalogEventEffectsRefusal.  The static_assert below keeps >= 128 bytes of margin for the
+// four columns (4 x ~30 B) under the SchemaUpdate bound.
 // statement(4) + clientName(2) + sourceAddress(2) + authenticated(2, auth Task 10) + sessionId + requestId hi/lo + flag.
 inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 1;
 // The trailing adoptDenial length prefix (2, issue #129), the nsId (4, namespaces), then the
 // key features (checked writes Part 05).
 inline constexpr std::size_t kDefineTopicFixedBytes =
-    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes + 2 + 4 + rune::protocol::kTopicKeyFeaturesWireLen;
+    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes + 2 + 4 + rune::protocol::kTopicKeyFeaturesWireLen +
+    1 + rune::protocol::kLeaseSpecBytes;   // lease topics: [hasLease u8][LeaseSpec]
 inline constexpr std::size_t kMaxDescriptorViaRequestRing =
     static_cast<std::size_t>(kAdminRequestRingBytes) / 8 - kDefineTopicFixedBytes;
 static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing) <=
                   static_cast<std::size_t>(kAdminToControlRingBytes) / 8,
               "every descriptor the admin request ring can deliver must fit one "
               "SchemaUpdate on the admin->control ring");
+static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing + 128) <=
+                  static_cast<std::size_t>(kAdminToControlRingBytes) / 8,
+              "the SchemaUpdate bound must keep 128 bytes of margin for a lease topic's four system columns");
 
 // A FilterSchema carries the same descriptor a SchemaUpdate does, so it fits the ring by the same bound.
 static_assert(filterSchemaWireLen(kMaxDescriptorViaRequestRing) <=

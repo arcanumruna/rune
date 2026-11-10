@@ -157,8 +157,13 @@ TEST(FilterSchemaRegression, BuildRejectsTheSentinelVersionRegression) {
 TEST(FilterSchema, EmptyFixedStrHasItsOwnReason) {
     DescriptorBuilder b("t");
     b.addTagged("k", 0, PrimType::UInt64, 1, 0xFFFF, true, {});
-    b.addFixedStrTagged("z", 1, 0, 1, 0xFFFF, false);
-    const FilterSchema s = FilterSchema::build(b.build(), 1);
+    b.addFixedStrTagged("z", 1, 1, 1, 0xFFFF, false);
+    // The builder refuses width 0 at DDL admission (#667), but a width-0 FixedStr is legal on replay of a historical
+    // event, so the filter still has to classify it: zero the width after building.
+    Descriptor d = b.build();
+    d.fields[1].fixedLen = 0;
+    d.blockLength = computeOffsets(d.fields);
+    const FilterSchema s = FilterSchema::build(d, 1);
     EXPECT_EQ(s.field(s.indexOfTag(1)).why, FilterSchema::Ineligible::FixedStrEmpty);
     auto bytes = std::vector<uint8_t>{1, 1, 1, 0, static_cast<uint8_t>(PrimType::FixedStr), 1, 1};
     auto p = parseFilter(bytes, s);

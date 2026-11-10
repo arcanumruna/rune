@@ -212,6 +212,7 @@ enum class PushTooLargeCause : uint8_t {
     EgressFrame,   ///< F19: the Records frame exceeds the egress maxMessageLength
     ReturnRing,    ///< F15 S3 I-4: a stored batch exceeds the worker return ring
     CorruptBatch,  ///< #839: a stored batch at the cursor is damaged (a damaged log segment); code StorageError
+    RingEvicted,   ///< transient LEASE topic: the cursor fell below the ring start (records lost); code PartitionDataReset
 };
 
 /// Encode the error that fails a push subscription whose next batch at
@@ -252,12 +253,20 @@ inline std::size_t encodePushTooLargeError(uint8_t* buf, int64_t sessionId, int6
               static_cast<long long>(subscriptionId), topicId, partition,
               static_cast<long long>(atOffset));
         break;
+    case PushTooLargeCause::RingEvicted:
+        m = std::snprintf(msg, sizeof msg,
+              "subscription %lld topic %d partition %d offset %lld: the cursor fell below the transient ring start "
+              "(records lost; re-read the partition)",
+              static_cast<long long>(subscriptionId), topicId, partition,
+              static_cast<long long>(atOffset));
+        break;
     }
     pc::ErrorResponse err;
     err.sessionId     = sessionId;
     err.correlationId = 0;
-    err.code          = static_cast<int16_t>(cause == PushTooLargeCause::CorruptBatch ? pc::ErrorCode::StorageError
-                                                                                      : pc::ErrorCode::MessageTooLarge);
+    err.code          = static_cast<int16_t>(cause == PushTooLargeCause::CorruptBatch  ? pc::ErrorCode::StorageError
+                                             : cause == PushTooLargeCause::RingEvicted ? pc::ErrorCode::PartitionDataReset
+                                                                                       : pc::ErrorCode::MessageTooLarge);
     err.message       = std::string_view(
         msg, m > 0 ? static_cast<std::size_t>(m < static_cast<int>(sizeof msg) ? m : sizeof msg - 1) : 0u);
     return err.encode(buf);

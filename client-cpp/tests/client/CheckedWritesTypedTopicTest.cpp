@@ -278,3 +278,102 @@ TEST(CheckedWritesTypedTopic, AnEmptyEncodingIsRefusedByTheIntentWrites) {
     EXPECT_THROW((void)topic.upsertAndWait(EmptyEncoding{}), std::invalid_argument);
     EXPECT_TRUE(script.sent.empty());
 }
+
+// ── GetTopicSchema completion helpers (lease topics) ─────────────────────────
+
+namespace {
+struct SchemaRow {
+    const char* name;
+    int64_t     aux;
+    std::size_t blobLen, withKf, withLease;   // the payload: blob, then 14 (key block) and 39 (lease block) bytes
+    std::size_t truncatedTo;                  // 0 = the payload as built; else cut to this many bytes
+    bool        expectKf, expectLease;
+    std::size_t expectBlob;
+};
+}  // namespace
+
+TEST(CheckedWritesTypedTopic, SchemaCompletionHelpersRegression) {
+    using rune::protocol::kLeaseSpecBytes;
+    using rune::protocol::kTopicKeyFeaturesWireLen;
+    rune::protocol::TopicKeyFeatures kf;
+    kf.keyIndex             = true;
+    kf.autoIncrement        = true;
+    kf.partitioner          = rune::protocol::Partitioner::Modulo;
+    kf.autoIncrementMax     = 123456;
+    kf.autoIncrementReserve = 77;
+    rune::protocol::LeaseSpec lease;
+    lease.ttlMs = 4242;
+    lease.maxKeys = 9;
+    lease.checkpoint = 0;
+    constexpr std::size_t B = 20, K = kTopicKeyFeaturesWireLen, L = rc::kSchemaLeaseBlockBytes;
+    const int64_t none = rc::schemaAuxOf(5, false), k = rc::schemaAuxOf(5, true), kl = rc::schemaAuxOf(5, true, true),
+                  l = rc::schemaAuxOf(5, false, true);
+    ASSERT_EQ(l >> 17, 1);
+    const SchemaRow rows[] = {
+        // aux none: nothing after the blob is interpreted
+        {"none/blob", none, B, 0, 0, 0, false, false, B},
+        {"none/blob+14", none, B, K, 0, 0, false, false, B + K},
+        {"none/blob+14+39", none, B, K, L, 0, false, false, B + K + L},
+        // bit 16
+        {"16/blob+14", k, B, K, 0, 0, true, false, B},
+        // bits 16+17
+        {"16+17/blob+14+39", kl, B, K, L, 0, true, true, B},
+        // bit 17 alone is no lease and no key block: the whole payload is the blob
+        {"17/blob", l, B, 0, 0, 0, false, false, B},
+        {"17/blob+14+39", l, B, K, L, 0, false, false, B + K + L},
+        // payload shorter than the tail the aux promises: the whole payload is the blob, nothing is decoded
+        {"16/short", k, B, K, 0, 10, false, false, 10},
+        {"16+17/short", kl, B, K, L, 10, false, false, 10},
+        {"16+17/shorter than 53", kl, B, K, L, K + L - 1, false, false, K + L - 1},
+    };
+    for (const SchemaRow& row : rows) {
+        SCOPED_TRACE(row.name);
+        std::vector<uint8_t> payload(B, 0xAB);
+        if (row.withKf) { payload.resize(B + K); rune::protocol::putTopicKeyFeatures(payload.data() + B, kf); }
+        if (row.withLease) { payload.resize(B + K + L); rune::protocol::encodeLeaseSpec(lease, payload.data() + B + K); }
+        if (row.truncatedTo != 0) payload.resize(row.truncatedTo);
+        rc::Completion c{};
+        c.aux = row.aux;
+        EXPECT_EQ(rc::schemaBlobOf(c, payload).size(), row.expectBlob);
+        EXPECT_EQ(rc::schemaKeyFeaturesOf(c, payload), row.expectKf ? kf : rune::protocol::TopicKeyFeatures{});
+        const auto got = rc::schemaLeaseOf(c, payload);
+        ASSERT_EQ(got.has_value(), row.expectLease);
+        if (row.expectLease) EXPECT_EQ(*got, lease);
+    }
+    {   // ResultTooLarge: no payload bytes at all (value = the real size)
+        SCOPED_TRACE("ResultTooLarge");
+        rc::Completion c{};
+        c.status = rc::OpStatus::ResultTooLarge;
+        c.aux    = kl;
+        const std::span<const uint8_t> empty;
+        EXPECT_EQ(rc::schemaBlobOf(c, empty).size(), 0u);
+        EXPECT_EQ(rc::schemaKeyFeaturesOf(c, empty), rune::protocol::TopicKeyFeatures{});
+        EXPECT_FALSE(rc::schemaLeaseOf(c, empty).has_value());
+    }
+}
+
+TEST(CheckedWritesTypedTopic, FromSchemaOnALeaseCompletionKeepsTheDescriptorUnchangedRegression) {
+    struct FakeClient {
+        StubProducer p;
+        StubProducer producer() const { return p; }
+    };
+    Script script;
+    FakeClient client{StubProducer{&script}};
+    auto payload = rune::codec::serialize(rune::gen::Position::descriptor());
+    const std::size_t blobLen = payload.size();
+    payload.resize(blobLen + rune::protocol::kTopicKeyFeaturesWireLen + rune::protocol::kLeaseSpecBytes + 4);   // + the i32 lease-view topic id (Task 14a)
+    rune::protocol::putTopicKeyFeatures(payload.data() + blobLen, rune::protocol::TopicKeyFeatures{});
+    rune::protocol::encodeLeaseSpec(rune::protocol::LeaseSpec{},
+                                    payload.data() + blobLen + rune::protocol::kTopicKeyFeaturesWireLen);
+    rc::Completion c{};
+    c.value     = 12;
+    c.aux       = rc::schemaAuxOf(3, true, true);
+    c.reserved0 = 8;
+    const auto topic = rc::TypedTopic<rune::gen::Position, StubProducer>::fromSchema(client, c, payload);
+    EXPECT_EQ(topic.handle().topicId, 12);
+    EXPECT_EQ(topic.boundVersion(), 3);
+    const auto blob = rc::schemaBlobOf(c, payload);
+    ASSERT_EQ(blob.size(), blobLen) << "no trailer bytes in the descriptor blob";
+    EXPECT_EQ(std::vector<uint8_t>(blob.begin(), blob.end()),
+              rune::codec::serialize(rune::gen::Position::descriptor()));
+}

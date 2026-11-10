@@ -341,8 +341,9 @@ public:
     /// subscription-scoped ErrorResponse, correlationId 0): it finishes with
     /// `reason` and is unsubscribed like unsubscribe() (the broker parked it).
     /// False if no active subscription has that id.  Duty thread.
+    /// `brokerCode` (when non-zero) is what brokerErrorCode() reports once it is finished.
     bool failActiveSubscription(int64_t subscriptionId, SubscriptionFailReason reason, int64_t unsubCorrId,
-                                int64_t sessionId, const SendFn& submitFn);
+                                int64_t sessionId, const SendFn& submitFn, uint16_t brokerCode = 0);
 
     /// Phase 2c: (topicId, partition) the PENDING Subscribe `correlationId` asked for (the refusal text names
     /// them).  False when it is not pending.  Cold.

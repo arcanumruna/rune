@@ -1,6 +1,8 @@
 #pragma once
 // CheckedWritesRig.h - checked writes Part 04: one Worker over a leader partition (topic 6, partition 0) with a tag-capable
 // source {id uint64 key, v int64, tag uint8}, TestReject views and a projection, driven pass by pass without a driver.
+#include <cassert>
+#include <rune/aeronutil/testing/FreePort.h>
 #include <rune/codec/Evolve.h>
 #include <rune/codec/Filter.h>
 #include <rune/crypto/Aead.h>
@@ -38,6 +40,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -83,7 +86,7 @@ inline rune::codec::Descriptor verdictSourceDescriptor() { return keyedSourceDes
 struct Rec { uint64_t id; int64_t v; uint8_t tag = 0; bool del = false; uint8_t intent = 0; };
 
 /// A record of any source schema: the wire key and the value block (empty = a tombstone).
-struct RawRec { std::string key; std::vector<uint8_t> value; };
+struct RawRec { std::string key; std::vector<uint8_t> value; uint8_t attrs = 0; };   // attrs: the record attribute byte (a lease topic's op and intent)
 
 /// What a consumer received: one record of a delivered batch.
 inline constexpr uint16_t kTombstoneTag = 0xFFFF;   ///< Delivered::tag of a tombstone
@@ -106,7 +109,17 @@ struct AutoIncShape {
 
 /// The replica and worker settings a cell may change: minIsr and durabilityTier (2 = Strict) of the partition, the acks=all commit-wait (0 = the default),
 /// and the partition of topic 6 the rig owns (an autoincrement cell at P > 1 owns another than 0).
-struct RigTuning { int minIsr = 1; uint8_t durabilityTier = 1; int64_t ackTimeoutNs = 0; int32_t partition = 0; };
+struct RigTuning {
+    int minIsr = 1; uint8_t durabilityTier = 1; int64_t ackTimeoutNs = 0; int32_t partition = 0;
+    /// A Worker owned by someone else (a WorkerPool behind a ClientGateway): the rig drives it instead of building its own.  The owner must
+    /// outlive the rig's use of it and must not be asked to restart().
+    Worker* hostWorker = nullptr;
+    /// The view set's table hash seed (Task 13b): two rigs with different seeds probe their ViewTables differently, as two nodes do.
+    uint64_t hashSeed = 0;
+};
+/// The rig's worker: owned (the default) or borrowed from a WorkerPool (RigTuning::hostWorker, never deleted by the rig).
+struct RigWorkerDelete { bool owns = true; void operator()(Worker* w) const noexcept { if (owns) delete w; } };
+using RigWorkerPtr = std::unique_ptr<Worker, RigWorkerDelete>;
 
 /// Part 09: the constrained views of the spec's examples, by their QL statements.
 enum class ConstrainedView : uint8_t { CharacterName, AccountStats, AccountCharacters, PerGender, Ledger, UserIdentity, PcName };
@@ -114,8 +127,10 @@ enum class ConstrainedView : uint8_t { CharacterName, AccountStats, AccountChara
 class VerdictRig {
 public:
     static constexpr int32_t kSrc = 6;
+    static constexpr int32_t kLeaseView = 7;   ///< the lease view's sink id the rig's write spec names (the catalog's, as in production)
     static constexpr int kMaxPass = 4000;
     static constexpr int kMaxFlushWait = 1'000'000;   ///< compact(): passes to wait for an in-flight async flush (a hang guard)
+    bool leaseTransient = false;   ///< the write spec of a lease topic created from now on is a transient one (flags bit 4)
     bool pauseAgent = false;   ///< pass() skips the IO agent: a discard frame stays unacked (CheckpointDiscardPending)
     ViewBackupPolicy backupPolicy{};   ///< the agent's view-backup policy (set before the first persisted install)
     /// The view checkpoint directory (the committed files, and backup/ under it).
@@ -126,11 +141,16 @@ public:
     explicit VerdictRig(bool follower = false, int64_t rollBytes = 64LL * 1024 * 1024, RigTuning tuning = {})
         : isr_(follower ? std::vector<rune::replication::NodeId>{1, 2} : std::vector<rune::replication::NodeId>{1}),
           rollBytes_(rollBytes), tuning_(tuning), viewDir_(rigTmpPath("views")), logDir_(rigTmpPath("log")) {
-        vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string());
+        vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string(), tuning_.hashSeed);
         open();
     }
     ~VerdictRig() {
         std::error_code ec;
+        // A hosted worker outlives the rig: it must not keep the replica / view set that die here.
+        if (tuning_.hostWorker != nullptr) {
+            worker->setOwnedDirect(Worker::OwnedSet{});
+            worker->setViewSet(nullptr);
+        }
         worker.reset();
         vs.reset();
         std::filesystem::remove_all(viewDir_, ec);
@@ -496,6 +516,79 @@ public:
         f.schemaUpdateBlob = rune::codec::serialize(evolving);
         send(std::move(f));
     }
+    /// A lease topic's source schema: the four lease system columns, then id (key, field 4) and addr string(16); version 2 adds port uint32.
+    /// Rows are [u16 blockLength][u16 version][block].
+    static rune::codec::Descriptor leaseSourceDescriptor(uint16_t latest = 1) {
+        using rune::codec::PrimType;
+        rune::codec::DescriptorBuilder d("inst", latest);
+        d.add("lease_version", PrimType::Int64).add("lease_ttl_ms", PrimType::UInt64).add("lease_holder", PrimType::UInt64)
+            .add("lease_remaining_ms", PrimType::UInt64).add("id", PrimType::UInt64, 1, true).addFixedStr("addr", 16);
+        if (latest >= 2) d.add("port", PrimType::UInt32, 2);
+        return d.build();
+    }
+    /// A lease topic (spec with max_keys) on the source; returns once the lease index is member 0 of the logged set.
+    void createLeaseTopic(uint32_t maxKeys = 1000, std::optional<rune::codec::Descriptor> src = std::nullopt) {
+        rune::protocol::LeaseSpec ls;
+        ls.maxKeys = maxKeys;
+        createLeaseTopicSpec(ls, std::move(src));
+    }
+    /// The same with the whole lease spec (Task 12: checkpoint keys).
+    void createLeaseTopicSpec(const rune::protocol::LeaseSpec& ls, std::optional<rune::codec::Descriptor> src = std::nullopt,
+                              KeyShape key = KeyShape{rune::codec::PrimType::UInt64}) {
+        lease_ = ls;
+        keyFieldId_ = 4;
+        useSource(src ? std::move(*src) : leaseSourceDescriptor(), key);
+        for (int i = 0; i < kMaxPass && !leaseIndexLogged(); ++i) pass();
+        ASSERT_TRUE(leaseIndexLogged()) << "the lease index never became the logged set's member";
+    }
+    /// The ALTER seam of the lease.* keys: the catalog applier hands the worker the same WriteSpecUpdate op, which replaces the lease block
+    /// of the topic's write spec in place (the running lease runtime reads it per call).
+    void alterLeaseSpec(const rune::protocol::LeaseSpec& ls) {
+        lease_ = ls;
+        send(specOp_(false));
+    }
+    [[nodiscard]] bool leaseIndexLogged() const {
+        const PartitionWriteState* w = writeState();
+        if (w == nullptr) return false;
+        const ConstraintSet& set = w->constraintSets.latest();
+        return set.count > 0 && set.members[0].kind == rune::view::VerdictViewKind::LeaseIndex;
+    }
+    /// Schema version 2 adds `port` (SchemaUpdate materialized as of 2, then the FilterSchema evolving blob): a layout change of the lease index.
+    void addLeasePort() {
+        customSrc_ = leaseSourceDescriptor(2);
+        WorkerOp v;
+        v.type = WorkerOp::Type::SchemaUpdate; v.topicId = kSrc; v.clientVersion = 2;
+        v.schemaUpdateBlob = rune::codec::serialize(rune::codec::materializeAsOf(*customSrc_, 2));
+        send(std::move(v));
+        WorkerOp f;
+        f.type = WorkerOp::Type::FilterSchema; f.topicId = kSrc; f.clientVersion = 2;
+        f.schemaUpdateBlob = rune::codec::serialize(*customSrc_);
+        send(std::move(f));
+    }
+    /// One half of a lease topic's schema change, so a test can deliver the two in either order: the SchemaUpdate (the
+    /// descriptor materialized as of `version`) installs the writer version; the FilterSchema (the evolving blob) is what
+    /// moves the lease index's row layout.
+    void leaseSchemaUpdate(const rune::codec::Descriptor& evolving, uint16_t version) {
+        customSrc_ = evolving;
+        WorkerOp v;
+        v.type = WorkerOp::Type::SchemaUpdate; v.topicId = kSrc; v.clientVersion = version;
+        v.schemaUpdateBlob = rune::codec::serialize(rune::codec::materializeAsOf(evolving, version));
+        send(std::move(v));
+    }
+    void leaseFilterSchema(const rune::codec::Descriptor& evolving, uint16_t version) {
+        customSrc_ = evolving;
+        WorkerOp f;
+        f.type = WorkerOp::Type::FilterSchema; f.topicId = kSrc; f.clientVersion = version;
+        f.schemaUpdateBlob = rune::codec::serialize(evolving);
+        send(std::move(f));
+    }
+    /// The source schema a restart() reinstalls (a restarted node knows fewer versions than its log holds until their SchemaUpdates re-arrive).
+    void setSourceForRestart(rune::codec::Descriptor d) { customSrc_ = std::move(d); }
+    /// WorkerViewSet::leaseIndexReady with the replica's current facts (what Task 9 passes).
+    [[nodiscard]] bool leaseReady() const {
+        return vs->leaseIndexReady(kSrc, tuning_.partition, replica->leadershipGeneration(), replica->role() == rune::replication::Role::Leader,
+                                   replica->highWatermark() >= replica->leadershipStartOffset());
+    }
     /// The judges of this rig (created later ones too) do not run: nothing is activated, replayed or judged.
     void holdJudge(bool on) {
         holdJudge_ = on;
@@ -544,8 +637,12 @@ public:
         std::erase_if(installs_, [&](const auto& i) { return i.first == viewTopic; });
     }
     /// A compiled view over the source set by useSource().
-    void installKeyedView(const rune::view::CompileResult& c) {
-        installs_.emplace_back(c.plan.viewTopicId, [=, this, src = *customSrc_] { vs->installView(c.plan, c.rowLayout, src, false); });
+    void installKeyedView(const rune::view::CompileResult& c, bool persisted = false) {
+        if (persisted && !agent) agent = std::make_unique<ViewSnapshotIoAgent>(channel, viewDir_.string(), /*fsyncMs=*/0, backupPolicy);
+        installs_.emplace_back(c.plan.viewTopicId, [=, this, src = *customSrc_] {
+            vs->installView(c.plan, c.rowLayout, src, persisted, persisted && recovering_);
+            if (persisted && recovering_) vs->markRecoveryForTest(c.plan.viewTopicId);   // as drainInstalls marks a restart install
+        });
         installs_.back().second();
     }
     /// The source topic's schema is `d` (its first field the key, of shape `key`) instead of {id, v, tag}.  A restart keeps it.
@@ -562,6 +659,10 @@ public:
     /// `specDelayPasses`: the write spec carrying key.index reaches the worker that many passes after restart() returns; until then the
     /// topic is typed without it (the leader scan restores the logged set from the log).
     void restart(bool reinstall = true, int64_t cutTo = -1, int specDelayPasses = 0) {
+        if (tuning_.hostWorker != nullptr) {   // not an assert: it must hold in Release too
+            ADD_FAILURE() << "VerdictRig::restart(): a hosted worker cannot restart";
+            std::abort();
+        }
         const int64_t clean = replica->lastCleanOffset();   // what LogCleanerAgent's checkpoint reloads (a cut forgets it)
         worker.reset();
         vs.reset();
@@ -569,7 +670,7 @@ public:
         if (cutTo >= 0) (void)log->truncateTo(cutTo);
         log.reset();
         epoch_ = 1;   // the new replica starts at epoch 1
-        vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string());
+        vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string(), tuning_.hashSeed);
         vs->holdJudgesForTest(holdJudge_);
         vs->setPassCapForTest(viewPassCap_);
         open();
@@ -689,7 +790,9 @@ private:
     }
     [[nodiscard]] WorkerOp specOp_(bool keyIndex) const {
         TopicWriteSpecWire w;
-        w.topicId = kSrc; w.keyFieldId = 0; w.keyType = keyShape_.type; w.legacyValidate = false; w.keyIndex = keyIndex;
+        w.topicId = kSrc; w.keyFieldId = keyFieldId_; w.lease = lease_; w.keyType = keyShape_.type; w.legacyValidate = false; w.keyIndex = keyIndex;
+        if (lease_) w.leaseViewTopicId = kLeaseView;
+        w.leaseTransient = lease_.has_value() && leaseTransient;
         w.keyWidth = static_cast<uint8_t>(keyWidthOf(keyShape_));
         if (autoInc_) {
             w.autoIncrement = true; w.partitioner = rune::protocol::Partitioner::Modulo;
@@ -799,6 +902,9 @@ public:
             if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
             else if (r.type == WorkerReturn::Type::ViewRowResult || r.type == WorkerReturn::Type::ViewScanResult) viewAnswers_.push_back(std::move(r));
             else if (r.type == WorkerReturn::Type::StatsResult) statsAnswers_.push_back(std::move(r));
+            else if (r.type == WorkerReturn::Type::LeaseKeepAliveResult) leaseKaAnswers.push_back(std::move(r));
+            else if (r.type == WorkerReturn::Type::LeaseTimeToLiveResult) leaseTtlAnswers.push_back(std::move(r));
+            else if (r.type == WorkerReturn::Type::ScanLeasesResult) leaseScanAnswers.push_back(std::move(r));
             else noteTxnReturn_(r);
         }, [](const TxnReturn&) {});
         if (everyPass_) everyPass_();
@@ -832,7 +938,7 @@ public:
     static std::vector<uint8_t> rawBatch(const std::vector<RawRec>& recs, int64_t pid = -1, int32_t seq = -1) {
         rune::protocol::RecordBatchBuilder b(0, 1000);
         if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
-        for (const auto& r : recs) b.append(r.key, {reinterpret_cast<const char*>(r.value.data()), r.value.size()}, 1000, 0);
+        for (const auto& r : recs) b.append(r.key, {reinterpret_cast<const char*>(r.value.data()), r.value.size()}, 1000, r.attrs);
         return b.build();
     }
 
@@ -876,6 +982,27 @@ public:
         ADD_FAILURE() << "the view stayed NotReady";
         return {};
     }
+    /// Lease view reads (Task 13a): enqueue one GetViewRowK / GetViewRow / ScanViewRows op, no pass, no NotReady retry.  `fingerprint` 0: unpinned.
+    void postViewReadOp(WorkerOp::Type type, int32_t view, std::span<const uint8_t> keyOrPrefix, int64_t minOffset = -1, uint64_t fingerprint = 0) {
+        WorkerOp op;
+        op.type = type; op.topicId = view; op.partition = tuning_.partition; op.sessionId = 1; op.correlationId = ++corr;
+        op.hwBound = static_cast<int64_t>(fingerprint);
+        if (type == WorkerOp::Type::GetViewRow) {
+            uint64_t k = 0;
+            std::memcpy(&k, keyOrPrefix.data(), std::min<std::size_t>(8, keyOrPrefix.size()));
+            op.nextOffset = static_cast<int64_t>(k);
+            EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
+            return;
+        }
+        std::vector<uint8_t> tail;
+        tail.push_back(static_cast<uint8_t>(keyOrPrefix.size()));
+        tail.insert(tail.end(), keyOrPrefix.begin(), keyOrPrefix.end());
+        tail.push_back(0);
+        op.nextOffset = minOffset; op.viewReadTail = tail;
+        EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
+    }
+    /// The view answers collected by pass() so far (taken).
+    std::vector<WorkerReturn> takeViewAnswers() { return std::exchange(viewAnswers_, {}); }
     /// One answer to a GetStats: the status (the worker's internal not-leader sentinel sets notLeader), the stat entries and the constraint entries.
     struct StatsReply {
         uint16_t status = 0;
@@ -1050,6 +1177,9 @@ public:
                 worker->drainReturn([&](WorkerReturn r) {
                     if (r.type == WorkerReturn::Type::PushReadResult) { chunk.assign(r.chunkBytes().begin(), r.chunkBytes().end()); next = r.newNextOffset; }
                     if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
+                    if (r.type == WorkerReturn::Type::LeaseKeepAliveResult) leaseKaAnswers.push_back(std::move(r));
+                    if (r.type == WorkerReturn::Type::LeaseTimeToLiveResult) leaseTtlAnswers.push_back(std::move(r));
+                    if (r.type == WorkerReturn::Type::ScanLeasesResult) leaseScanAnswers.push_back(std::move(r));
                     noteTxnReturn_(r);
                 }, [](const TxnReturn&) {});
                 absorb_(box, chunk.data(), chunk.size());
@@ -1081,8 +1211,11 @@ public:
         uint64_t assignedBase = 0;
         bool    hasVerdicts = false;
         std::vector<std::tuple<uint16_t, uint16_t, uint32_t>> verdicts;
+        std::vector<std::pair<int64_t, uint64_t>> leases;   ///< client 18: {leaseVersion, ttlMs} per record
+        bool    hasLease = false;
         std::size_t frameLen = 0;
         int64_t step = 0;
+        int64_t retryAfter = -1;   ///< a Throttled answer's retry-after (ns), from the response's logStartOffset field
     };
     static constexpr int32_t kIngressStream = 7601, kAckStream = 7602;
     static constexpr int64_t kAckSession = 5;
@@ -1332,6 +1465,7 @@ public:
         cleaner.setMarkerRemovalBound(replica->cleanerMarkerRemovalBound());
         cleaner.setVerdictBounds(out.bound, markerEnd);
         cleaner.setProducerTailDepth(autoInc_ ? rune::storage::kRetryWindowSize : 1);   // what BrokerNode configures the partition with
+        cleaner.setTopicMode(lease_ ? rune::storage::CleanerTopicMode::Lease : rune::storage::CleanerTopicMode::Plain);   // likewise
         const int64_t previousPassEnd = replica->cleanerProgress();
         cleaner.setPreviousPassEnd(previousPassEnd);
         cleaner.setDeferredInstall(&cleanedSeq_);
@@ -1376,9 +1510,11 @@ public:
     ViewSnapshotChannel channel;
     std::unique_ptr<WorkerViewSet> vs;
     std::unique_ptr<ViewSnapshotIoAgent> agent;   ///< only with a persisted view: it writes the checkpoint files
-    std::unique_ptr<Worker> worker;
+    RigWorkerPtr worker;
     int64_t now = 0, corr = 0;
     std::vector<int16_t> produceAnswers;
+    std::vector<WorkerReturn> leaseKaAnswers, leaseTtlAnswers, leaseScanAnswers;   ///< lease topics Task 11a: the LeaseKeepAlive / LeaseTimeToLive returns the passes drained
+
     std::vector<int32_t> deltaViewIds;   ///< the view topic of every checkpoint frame the worker pushed (only without a persisted view's agent)
 
 private:
@@ -1471,8 +1607,10 @@ private:
             const auto r = rune::protocol::client::ProduceResponse::decode(wire, wireLen);
             if (!r) return;
             Ack a;
-            a.code = r->errorCode; a.baseOffset = r->baseOffset; a.assignedBase = r->assignedBase; a.hasVerdicts = r->hasVerdicts; a.frameLen = static_cast<std::size_t>(l) - (ackEncrypted_ ? rune::protocol::client::kCryptoOverhead : 0); a.step = passNo_;
+            a.code = r->errorCode; a.baseOffset = r->baseOffset; a.assignedBase = r->assignedBase; a.hasVerdicts = r->hasVerdicts; a.frameLen = static_cast<std::size_t>(l) - (ackEncrypted_ ? rune::protocol::client::kCryptoOverhead : 0); a.step = passNo_; a.retryAfter = r->logStartOffset;
             r->forEachVerdict([&](uint16_t i, uint16_t code, uint32_t cid) { a.verdicts.emplace_back(i, code, cid); });
+            a.hasLease = r->hasLease;
+            r->forEachLease([&](uint32_t, int64_t v, uint64_t ttl) { a.leases.emplace_back(v, ttl); });
             if (acksSeen_.emplace(r->correlationId, std::move(a)).second) ackOrder_.push_back(r->correlationId);
         }).handler(), 64);
     }
@@ -1507,8 +1645,9 @@ private:
         c.replicaLagMaxMs = 1'000'000; c.replicaLagMaxOffset = 1'000'000;
         c.fetchIntervalNs = 1'000'000'000LL; c.isrCheckIntervalNs = 1'000'000'000LL;
         c.maxFetchBytes = 1 << 20; c.pushOnAppend = false;
+        c.leaseTopic = lease_.has_value();   // a restarted partition carries it (the first open() precedes createLeaseTopic)
         replica = std::make_unique<rune::replication::PartitionReplica>(c, rune::replication::Role::Leader, 1, isr_, isr_, log.get(), &transport_);
-        worker = std::make_unique<Worker>(0);
+        worker = tuning_.hostWorker != nullptr ? RigWorkerPtr(tuning_.hostWorker, RigWorkerDelete{false}) : RigWorkerPtr(new Worker(0), RigWorkerDelete{true});
         worker->setFilterConfig(filter::FilterConfig{});
         if (tuning_.ackTimeoutNs != 0) worker->setAckTimeoutNs(tuning_.ackTimeoutNs);
         worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
@@ -1538,6 +1677,8 @@ private:
         return set.count > 0 && set.members[0].kind == rune::view::VerdictViewKind::KeyIndex;
     }
     std::optional<AutoIncShape> autoInc_;
+    std::optional<rune::protocol::LeaseSpec> lease_;   ///< createLeaseTopic(): the write spec's lease block
+    uint16_t keyFieldId_ = 0;
     uint64_t grantEpoch_ = 0;
     rune::ql::TopicDef srcTopic_;   ///< the QL statement of the source (createQlTopic)
     int constrainedGen_ = 0;

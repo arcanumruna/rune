@@ -95,6 +95,7 @@ public:
         bool                        preV8       = false;   // no DDL extension (requestId {0,0})
         uint32_t                    nsId        = 0;       // namespaces Task 7: the topic's namespace
         rune::protocol::TopicKeyFeatures keyFeatures{};
+        std::optional<rune::protocol::LeaseSpec> lease;
     };
 
     /// `fdLimit` / `fdReadySegments` (issue #296): AdminDeps::fdLimit / readySegmentsPerPartition (0 = unknown limit).
@@ -201,6 +202,7 @@ public:
         m.meta = meta_(a.statement, a.clientName, a.requestId, a.preV8);
         m.nsId = a.nsId;
         m.keyFeatures = a.keyFeatures;
+        m.lease = a.lease;
         return submit_(DdlRequest{std::move(m)});
     }
 
@@ -313,6 +315,8 @@ public:
         uint16_t code = 0; int32_t topicId = -1; uint16_t version = 0; int32_t partitionCount = 0;
         std::vector<uint8_t> blob;
         rune::protocol::TopicKeyFeatures keyFeatures{};
+        std::optional<rune::protocol::LeaseSpec> lease;
+        int32_t leaseViewTopicId = -1;
     };
     SchemaAnswer getSchema(const std::string& name, uint64_t fingerprint = 0, uint32_t nsId = 0) {
         const int64_t corr = ++corr_;
@@ -563,8 +567,9 @@ private:
         deps.nsDefaults.limits = nsDefaults_;
         deps.respondGet = [this](int64_t, int64_t corr, int32_t topicId, uint16_t version, int32_t partitions,
                                  const std::vector<uint8_t>& blob, uint16_t code,
-                                 const rune::protocol::TopicKeyFeatures& keyFeatures) {
-            gets_[corr] = SchemaAnswer{code, topicId, version, partitions, blob, keyFeatures};
+                                 const rune::protocol::TopicKeyFeatures& keyFeatures,
+                                 const std::optional<rune::protocol::LeaseSpec>& lease, int32_t leaseViewTopicId) {
+            gets_[corr] = SchemaAnswer{code, topicId, version, partitions, blob, keyFeatures, lease, leaseViewTopicId};
         };
         // Task 23: the catalog read egress (counts only — zero-alloc, so the idle-reader gate
         // measures the admin pass, never the rig).

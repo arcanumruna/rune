@@ -15,6 +15,7 @@
 #include <rune/node/WorkerOp.h>
 
 #include <rune_protocol_internal_sbe/MessageHeader.h>
+#include <rune_protocol_internal_sbe/OpType.h>
 #include <rune_protocol_internal_sbe/ReturnType.h>
 #include <rune_protocol_internal_sbe/TxnReturn.h>
 #include <rune_protocol_internal_sbe/TxnReturnKind.h>
@@ -52,6 +53,31 @@ static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::StatsResult) ==
 static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::TxnVoteResult) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::TXN_VOTE_RESULT),
               "WorkerReturn::TxnVoteResult must stay on sbe ReturnType::TXN_VOTE_RESULT");
+
+// Lease topics Task 11a: the lease results ride sbe ReturnType values 12-14.
+static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::LeaseKeepAliveResult) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::LEASE_KEEP_ALIVE_RESULT),
+              "WorkerReturn::LeaseKeepAliveResult must stay on sbe ReturnType::LEASE_KEEP_ALIVE_RESULT");
+static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::LeaseTimeToLiveResult) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::LEASE_TIME_TO_LIVE_RESULT),
+              "WorkerReturn::LeaseTimeToLiveResult must stay on sbe ReturnType::LEASE_TIME_TO_LIVE_RESULT");
+static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::ScanLeasesResult) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::SCAN_LEASES_RESULT),
+              "WorkerReturn::ScanLeasesResult must stay on sbe ReturnType::SCAN_LEASES_RESULT");
+// ... and the lease ops on sbe OpType 37-39.
+static_assert(static_cast<std::uint8_t>(WorkerOp::Type::LeaseKeepAlive) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::LEASE_KEEP_ALIVE) &&
+              static_cast<std::uint8_t>(WorkerOp::Type::LeaseTimeToLive) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::LEASE_TIME_TO_LIVE) &&
+              static_cast<std::uint8_t>(WorkerOp::Type::ScanLeases) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::SCAN_LEASES),
+              "the lease WorkerOp types must stay on sbe OpType 37-39");
+static_assert(static_cast<std::uint8_t>(WorkerOp::Type::NsLeasesOver) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::NS_LEASES_OVER),
+              "WorkerOp::NsLeasesOver must stay on sbe OpType::NS_LEASES_OVER");
+static_assert(static_cast<std::uint8_t>(WorkerOp::Type::TransientLineage) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::TRANSIENT_LINEAGE),
+              "WorkerOp::TransientLineage must stay on sbe OpType::TRANSIENT_LINEAGE");
 
 // ---------------------------------------------------------------------------
 // WorkerReturn (template id 2)

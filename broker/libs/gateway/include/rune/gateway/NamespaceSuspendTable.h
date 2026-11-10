@@ -27,11 +27,11 @@ struct SuspendRow {
     SuspendAction ra;
 };
 
-inline constexpr uint16_t kSuspendTableSpan = 96;   // template ids 0..95
+inline constexpr uint16_t kSuspendTableSpan = 102;   // template ids 0..101
 
-inline constexpr std::array<uint16_t, 39> kDispatchedTemplates = {
+inline constexpr std::array<uint16_t, 42> kDispatchedTemplates = {
     1, 3, 4, 6, 8, 10, 12, 14, 16, 18, 21, 32, 34, 36, 38, 40, 42, 45, 47, 49, 51, 53,
-    64, 66, 68, 70, 72, 74, 75, 76, 77, 79, 80, 81, 82, 84, 88, 89, 91};
+    64, 66, 68, 70, 72, 74, 75, 76, 77, 79, 80, 81, 82, 84, 88, 89, 91, 96, 98, 100};
 
 namespace detail {
 constexpr SuspendRow row(uint16_t tid) noexcept {
@@ -46,7 +46,8 @@ constexpr SuspendRow row(uint16_t tid) noexcept {
     case 16: case 40: case 45: case 47: case 49: case 51: case 53:
     case 64: case 68: case 70: case 74: case 75: case 76: case 77: case 79: case 80:
         return {tid, R, R};
-    // reads: served under ReadOnly, refused under RejectAll
+    // reads: served under ReadOnly, refused under RejectAll.  Lease topics: 96 (LeaseKeepAlive) is a read here, not a write -
+    // a keepalive appends nothing a client can see (spec 8.1) - so ReadOnly serves it; 98 / 100 are reads.
     default: return {tid, A, R};
     }
 }

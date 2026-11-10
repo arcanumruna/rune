@@ -121,6 +121,7 @@ struct SessionEndpointIo : session::SessionIo {
         : agent(a), endpoint(std::move(ep)) {}
 
     bool sendFrame(const uint8_t* buf, std::size_t len) override;
+    bool sendClearFrame(const uint8_t* buf, std::size_t len) override;
     bool retarget(const std::string& newIngressChannel) noexcept override;
     /// NAT-safe egress: the Redirect's `#port` names the target gateway's response-control port.
     bool retargetWithResponsePort(const std::string& newIngressChannel, int32_t responsePort) noexcept override;
@@ -674,6 +675,9 @@ public:
         uint16_t verdictCount  = 0;
         uint32_t verdictOffset = 0;       ///< into the agent's verdict bytes (verdictBytes())
         uint64_t assignedBase  = 0;       ///< client 17: the first broker-assigned id of a key-0 batch (0 = none)
+        bool     hasLease      = false;   ///< client 18: the lease trailer follows (leaseCount x 16 bytes at leaseOffset)
+        uint16_t leaseCount    = 0;
+        uint32_t leaseOffset   = 0;       ///< into the lease-trailer arena (leaseBytes())
     };
     [[nodiscard]] std::span<const ProduceAck> produceAcks() const noexcept {
         return {produceAcks_.data(), produceAcks_.size()};
@@ -682,7 +686,13 @@ public:
     [[nodiscard]] std::span<const uint8_t> verdictBytes(const ProduceAck& a) const noexcept {
         return {verdictBytes_.data() + a.verdictOffset, std::size_t{a.verdictCount} * 8};
     }
-    void clearProduceAcks() noexcept { produceAcks_.clear(); verdictBytes_.clear(); }
+    /// The 16-byte lease entries of `a` {leaseVersion i64 LE, ttlMs u64 LE}, entry i for record i; valid until clearProduceAcks().
+    [[nodiscard]] std::span<const uint8_t> leaseBytes(const ProduceAck& a) const noexcept {
+        return {leaseTrailerBytes_.data() + a.leaseOffset, std::size_t{a.leaseCount} * 16};
+    }
+    void clearProduceAcks() noexcept { produceAcks_.clear(); verdictBytes_.clear(); leaseTrailerBytes_.clear(); }
+    /// Task 14a: how often the lease-trailer arena outgrew its reserve (a cycle of more than kMaxVerdictEntries lease entries).
+    [[nodiscard]] uint64_t leaseArenaGrowths() const noexcept { return leaseArenaGrowths_; }
     /// Test seam: discards the next `n` ProduceResponses (a lost ack).
     void dropProduceAcksForTest(int n) noexcept { dropProduceAcks_ = n; }
     /// Times the trailer bytes had to grow (a duty cycle with more verdicts than ever before).
@@ -849,6 +859,11 @@ public:
     [[nodiscard]] uint64_t staleFramesDropped() const noexcept { return staleFramesDropped_; }
     /// F-A C1: session-fatal notices for a session this client already left (dropped, never applied).
     [[nodiscard]] uint64_t staleSessionNotices() const noexcept { return staleSessionNotices_; }
+    /// #989: sessions resumed because their response pair's gateway publication closed (duty thread only).
+    [[nodiscard]] uint64_t responseEgressLosses() const noexcept { return responseEgressLosses_; }
+    /// U2: clear UnknownSession notices accepted for an encrypted session (probe nonce echoed) / refused (wrong nonce or session).
+    [[nodiscard]] uint64_t probeNoticesAccepted() const noexcept { return probeNoticesAccepted_; }
+    [[nodiscard]] uint64_t probeNoticesRejected() const noexcept { return probeNoticesRejected_; }
     [[nodiscard]] uint64_t ingressOfferRefused() const noexcept { return ingressOfferRefused_; }
     [[nodiscard]] uint64_t ingressFatalDropped() const noexcept { return ingressFatalDropped_; }
     /// DR client bug 2: ring-drained control frames dropped because the transport
@@ -1187,6 +1202,8 @@ private:
     void onWorkerBindAck_(const uint8_t* buf, std::size_t len) noexcept;
     /// Replace `s`'s spent response pair (request publication + response subscription) with a fresh one.  Cold.
     void rePairSessionResponse_(Session& s) noexcept;
+    /// #989: a Connected response-mode session whose pair's gateway publication closed is resumed (see the .cpp).
+    void checkResponseEgress_(Session& s, int64_t nowNs) noexcept;
     /// One cold pass per doWork over the (small) table: offer the WorkerBind for every entry whose session is
     /// Connected with a token and whose bound sid is not the session's current one.  Returns binds sent.
     int serviceWorkerBinds_() noexcept;
@@ -1221,6 +1238,8 @@ private:
     std::vector<uint32_t>       freeRoutes_;
     int                         dropProduceAcks_ = 0;
     std::vector<ProduceAck>     produceAcks_;  // reserved in the ctor; owner clears
+    std::vector<uint8_t>        leaseTrailerBytes_;   // Task 14a: the lease trailers of produceAcks_, cleared with them
+    uint64_t                    leaseArenaGrowths_ = 0;
     std::vector<uint8_t>        verdictBytes_; // the trailers of produceAcks_, cleared with them; grows only for a larger duty cycle
     uint64_t                    verdictArenaGrowths_ = 0;
     bool                        mnDebug_ = false;  // RUNE_MN_DEBUG, read ONCE
@@ -1236,6 +1255,13 @@ private:
     std::vector<uint8_t>        egressDecryptScratch_;
     /// PR #476 review: frames in clear dropped because this client requires crypto (dispatchEgressFrame).
     uint64_t                    clearFramesDropped_ = 0;
+    /// U2: clear UnknownSession notices accepted on an encrypted session (sessionId + one of its last two probe nonces) / clear
+    /// UnknownSession notices naming an encrypted session that were refused (wrong nonce, wrong session).
+    uint64_t                    probeNoticesAccepted_ = 0;
+    uint64_t                    probeNoticesRejected_ = 0;
+    /// True when `buf` (an undecrypted frame naming an encrypted session) is a clear ErrorResponse{UnknownSession} for that
+    /// session echoing one of its probe nonces.  Counts accepted / rejected clear notices.
+    [[nodiscard]] bool acceptsProbeNotice_(const uint8_t* buf, std::size_t len, int64_t headerSid) noexcept;
     /// An ErrorResponse whose correlation id is a session's in-flight ConnectRequest (the connect leg's answer).
     [[nodiscard]] bool answersAnInFlightConnect_(const uint8_t* buf) const noexcept;
     uint32_t sessionIndexFor_(const std::string& endpoint) noexcept;
@@ -1276,7 +1302,8 @@ private:
         ++rejectedSessions_;
         ++rejectedEpoch_;
     }
-    bool offerControlTo(Session& owner, const uint8_t* buf, std::size_t len) noexcept;
+    /// `clear`: send `buf` unsealed even on an encrypted session (only the probe Ping, SessionIo::sendClearFrame).
+    bool offerControlTo(Session& owner, const uint8_t* buf, std::size_t len, bool clear = false) noexcept;
     /// Open a NEW session to `endpoint` (async connect, disjoint corrId range).
     Session& openSession_(const std::string& endpoint) noexcept;
     /// T15a fix1 I1: point the default ingress publication (the seed session's
@@ -1361,6 +1388,7 @@ private:
     // only on the duty thread / after the runner is joined).
     uint64_t staleFramesDropped_  = 0;
     uint64_t staleSessionNotices_ = 0;   ///< F-A C1 (duty thread only)
+    uint64_t responseEgressLosses_ = 0;  ///< #989 (duty thread only)
     uint64_t ingressOfferRefused_ = 0;
     uint64_t ingressFatalDropped_ = 0;
     // DR client bug 2: the duty-clock time the transport first refused the

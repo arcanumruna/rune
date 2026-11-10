@@ -130,7 +130,8 @@ int runLive(const std::string& topic,
         rune::codec::Descriptor d = rune::codec::deserialize(
             std::span<const uint8_t>(r.descriptorBlob.data(),
                                      r.descriptorBlob.size()));
-        std::string hdr = rune::codec::generateHeader(d);
+        // A lease topic (the reply carries the lease block) also gets withLease() and <T>::LeasesRow (Task 14b).
+        std::string hdr = rune::codec::generateHeader(d, d.version, "rune::gen", r.lease.has_value());
 
         // Write <outDir>/<topic>.gen.h.
         std::filesystem::path dir(outDir);

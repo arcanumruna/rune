@@ -261,17 +261,20 @@ TEST(CheckedWritesClientStats, BlockingFormReportsBrokerTooOldAsAStatus) {
     r.gw.advertisedBrokerVersion = rpc::kBrokerVersionCheckedWrites - 1;
     r.connect();
     rc::StatsResult res;
-    int done[2];
-    ASSERT_EQ(::pipe(done), 0);
-    // The blocking form pumps the client itself; the fake gateway must keep running beside it, until the pipe says it returned.
+    // The blocking form pumps the client itself; the fake gateway must keep running beside it.  The pump thread stops
+    // when the pipe becomes readable (no shared flag), or at its failure-only deadline.
+    int stop[2];
+    ASSERT_EQ(::pipe(stop), 0);
     std::thread pump([&] {
-        pollfd p{done[0], POLLIN, 0};
-        while (::poll(&p, 1, 0) == 0) r.gw.pump();
+        pollfd pfd{stop[0], POLLIN, 0};
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (::poll(&pfd, 1, 0) == 0 && std::chrono::steady_clock::now() < deadline) r.gw.pump();
     });
     res = r.client->getStatsAndWait(rpc::StatsScope::TopicPartition, 3, 0, std::chrono::seconds(5));
-    (void)!::write(done[1], "x", 1);
+    const char b = 0;
+    (void)!::write(stop[1], &b, 1);
     pump.join();
-    ::close(done[0]);
-    ::close(done[1]);
+    ::close(stop[0]);
+    ::close(stop[1]);
     EXPECT_EQ(res.status, rc::StatsResult::kBrokerTooOld);
 }

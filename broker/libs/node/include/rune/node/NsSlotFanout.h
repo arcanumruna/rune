@@ -10,7 +10,7 @@
 //            always precedes the first op of a topic that carries its slot).  Capacity = 2 * slotCapacity * workerCount
 //            (one outstanding assign and one release per slot): a post on a full FIFO is impossible by construction and
 //            is counted and logged at CRITICAL (never a silent drop).
-//   LATEST-WINS (the rate / disk Throttle kinds and ViewMemOver, posted at the aggregator's tick rate): a fixed table
+//   LATEST-WINS (the rate / disk Throttle kinds, ViewMemOver and LeasesOver, posted at the aggregator's tick rate): a fixed table
 //            latest_[slot * kKinds + kind] plus, per worker, a dirty list.  A post overwrites the slot's value and marks
 //            it dirty for every worker; an offer delivers the LAST value once.  With a full ring the table stays dirty,
 //            so sustained throttling costs no memory.
@@ -37,9 +37,10 @@ namespace rune::node {
 
 class NsSlotFanout {
 public:
-    /// The rate / disk throttle kinds plus ViewMemOver: the latest-wins table has one column for each.
-    static constexpr std::size_t kKinds = kThrottleKinds + 1;
+    /// The rate / disk throttle kinds plus ViewMemOver and LeasesOver: the latest-wins table has one column for each.
+    static constexpr std::size_t kKinds = kThrottleKinds + 2;
     static constexpr std::size_t kViewMemOverKind = kThrottleKinds;
+    static constexpr std::size_t kLeasesOverKind  = kThrottleKinds + 1;   // Lease topics Task 21
 
     /// Cold, startup, before the first post: sizes every store.  Calling it again resets them (nothing pending).
     void configure(uint32_t slotCapacity, int32_t workerCount) {
@@ -64,6 +65,7 @@ public:
         postLatest_(m.slot, k, m.nsId, m.untilNs);
     }
     void post(const ViewMemOver& m) { postLatest_(m.slot, kViewMemOverKind, m.nsId, m.on ? 1 : 0); }   // Task 14
+    void post(const LeasesOver& m) { postLatest_(m.slot, kLeasesOverKind, m.nsId, m.on ? 1 : 0); }     // Lease topics Task 21
 
     /// Control thread, every duty cycle.  Returns the number of ops enqueued.
     template <class Pool>
@@ -116,9 +118,9 @@ public:
                 const Latest& l = latest_[cell];
                 const uint16_t slot = static_cast<uint16_t>(cell / kKinds);
                 const std::size_t kind = cell % kKinds;
-                WorkerOp op = kind == kViewMemOverKind
-                    ? makeViewMemOverOp(ViewMemOver{slot, l.nsId, l.value != 0})
-                    : makeThrottleOp(Throttle{slot, l.nsId, static_cast<ThrottleKind>(kind), l.value});
+                WorkerOp op = kind == kViewMemOverKind ? makeViewMemOverOp(ViewMemOver{slot, l.nsId, l.value != 0})
+                            : kind == kLeasesOverKind  ? makeLeasesOverOp(LeasesOver{slot, l.nsId, l.value != 0})
+                            : makeThrottleOp(Throttle{slot, l.nsId, static_cast<ThrottleKind>(kind), l.value});
                 const EnqueueResult r = pool.worker(w).enqueueOp(std::move(op));
                 if (r == EnqueueResult::Full) { ringFull = true; list[kept++] = cell; continue; }
                 if (r == EnqueueResult::Enqueued) { ++enqueued_; ++work; }

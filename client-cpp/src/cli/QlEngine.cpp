@@ -17,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <type_traits>
 
 #include <fcntl.h>
@@ -206,9 +207,10 @@ std::string_view errorCodeName(uint16_t code) noexcept {
         "PasswordChangeRequired", "AuthUnavailable", "RecordEgressUnavailable", "UnstableOffsetCommit",
         "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused",
         "ConstraintViolation", "KeyExists", "KeyNotFound", "AutoIncrementExhausted", "ViewKeyExpressionInvalid",
-        "ViewConstraintInvalid", "ViewUniqueInvalid", "TxnTooLarge", "TxnConflict"};
+        "ViewConstraintInvalid", "ViewUniqueInvalid", "TxnTooLarge", "TxnConflict",
+        "LeaseNotFound", "LeaseLimitExceeded", "LeaseTtlTooLarge"};
 #ifdef RUNE_CLI_LIVE_ENABLED
-    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::TxnConflict) + 1,
+    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::LeaseTtlTooLarge) + 1,
                   "errorCodeName: one name per rune::protocol::client::ErrorCode");
     static_assert(static_cast<uint16_t>(rune::protocol::client::ErrorCode::TopicExists) == 25,
                   "errorCodeName: the table is indexed by the enum's values");
@@ -352,6 +354,15 @@ std::optional<Prepared> prepare(const ql::Statement& st, const PrepareOptions& o
                     return Prepared{PShowTopic{s.name}};
                 } else if constexpr (std::is_same_v<T, ql::ShowViewDef>) {
                     return Prepared{PShowView{s.name}};
+                } else if constexpr (std::is_same_v<T, ql::ShowLeasesDef>) {
+                    why = "'show leases' is not available yet";   // Task 22 prepares it; refused before anything is issued
+                    return std::nullopt;
+                } else if constexpr (std::is_same_v<T, ql::ShowLeaseDef>) {
+                    why = "'show lease' is not available yet";
+                    return std::nullopt;
+                } else if constexpr (std::is_same_v<T, ql::RevokeLeaseDef>) {
+                    why = "'revoke lease' is not available yet";
+                    return std::nullopt;
                 } else if constexpr (std::is_same_v<T, ql::ShowHistoryDef>) {
                     PHistory p;
                     p.text = "show history";
@@ -444,6 +455,13 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
                 if (kf.keyIndex) out << " key.index";
                 if (kf.autoIncrementReserve != rune::protocol::kAutoIncrementReserveDefault) out << " autoincrement.reserve " << kf.autoIncrementReserve;
                 if (kf.autoIncrementMax != rune::protocol::kAutoIncrementMaxDefault) out << " autoincrement.max " << kf.autoIncrementMax;
+                if (d.lease) {
+                    const auto& l = *d.lease;
+                    out << " lease lease.ttl " << l.ttlMs << " lease.min_ttl " << l.minTtlMs << " lease.max_ttl " << l.maxTtlMs
+                        << " lease.max_keys " << l.maxKeys << " lease.expiry_batch " << l.expiryBatch << " lease.checkpoint "
+                        << (l.checkpoint != 0 ? "on" : "off") << " lease.checkpoint_interval " << l.checkpointIntervalMs
+                        << " lease.checkpoint_rate " << l.checkpointRate;
+                }
                 if (d.descriptorBlob.empty()) out << " raw\n";
                 else out << "\n" << descriptorText(d.descriptorBlob);
             } else if constexpr (std::is_same_v<T, PAlter>) {
@@ -517,6 +535,15 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
                 out << "show topic " << s.name << "\n";
             } else if constexpr (std::is_same_v<T, PShowView>) {
                 out << "show view " << s.name << "\n";
+            } else if constexpr (std::is_same_v<T, PShowLeases>) {
+                const auto& d = s.def;
+                out << "show leases " << d.topic;
+                if (d.prefix) out << " where " << d.keyColumn << " like '" << *d.prefix << "%'";
+                out << " limit " << d.limit << "\n";
+            } else if constexpr (std::is_same_v<T, PShowLease>) {
+                out << "show lease " << s.def.topic << " key " << literalText(s.def.key) << "\n";
+            } else if constexpr (std::is_same_v<T, PRevokeLease>) {
+                out << "revoke lease " << s.def.topic << " key " << literalText(s.def.key) << "\n";
             } else if constexpr (std::is_same_v<T, PSecurity>) {
                 out << s.plan.statement << "\n";   // the REDACTED statement (D10): a password literal never prints
             } else {
@@ -852,6 +879,7 @@ bool QlRun::run(const PDefine& s, const rc::DdlOptions& ddl) {
     topic.replicationFactor = d.replicas;
     topic.config = d.config;   // F32: the whole struct, never field by field
     topic.keyFeatures = d.keyFeatures;
+    topic.lease = d.lease;
     const auto r = broker.client().defineTopicAndWait(
         d.name, d.partitions, d.keyField, std::span<const uint8_t>(d.descriptorBlob.data(), d.descriptorBlob.size()),
         d.persistence == ql::Persistence::Transient ? rc::Persistence::Transient : rc::Persistence::Disk, topic,
@@ -1387,6 +1415,11 @@ bool QlRun::run(const PShowTopic& s, const rc::DdlOptions&) {
     out << *stats;
     return true;
 }
+
+// Task 22 replaces these: the lease statements are refused at prepare, so a script never reaches run() with one.
+bool QlRun::run(const PShowLeases&, const rc::DdlOptions&) { throw std::logic_error("unreachable: refused at prepare"); }
+bool QlRun::run(const PShowLease&, const rc::DdlOptions&) { throw std::logic_error("unreachable: refused at prepare"); }
+bool QlRun::run(const PRevokeLease&, const rc::DdlOptions&) { throw std::logic_error("unreachable: refused at prepare"); }
 
 bool QlRun::run(const PShowView& s, const rc::DdlOptions&) {
     if (!refreshCatalog()) return false;

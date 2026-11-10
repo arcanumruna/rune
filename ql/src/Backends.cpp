@@ -1,5 +1,6 @@
 #include "rune/ql/Backends.h"
 #include "ConfigKeys.h"
+#include <rune/codec/LeaseColumns.h>
 #include <rune/codec/Serialize.h>
 #include <rune/codec/UnicodeLower.h>
 #include <rune/codec/ViewKeyEncoding.h>
@@ -48,6 +49,12 @@ void applySetting(DefineTopicPlan& plan, const ConfigSetting& s) {
         case F::KeyIndex:            plan.keyFeatures.keyIndex = s.value != 0; break;
         case F::AutoIncrementReserve: plan.keyFeatures.autoIncrementReserve = static_cast<uint32_t>(s.value); break;
         case F::AutoIncrementMax:    plan.keyFeatures.autoIncrementMax = static_cast<uint64_t>(s.value); break;
+        case F::LeaseTtl: case F::LeaseMinTtl: case F::LeaseMaxTtl: case F::LeaseMaxKeys: case F::LeaseExpiryBatch:
+        case F::LeaseCheckpoint: case F::LeaseCheckpointInterval: case F::LeaseCheckpointRate:
+            if (!plan.lease) throw std::logic_error("lease setting '" + s.key + "' on a topic without a lease (not produced by the parser)");
+            if (const auto refusal = detail::applyLeaseSetting(*plan.lease, spec->field, s.value))
+                throw std::logic_error("lease setting '" + s.key + "': " + std::string(*refusal) + " (the parser validated it)");
+            break;
     }
 }
 
@@ -62,6 +69,10 @@ DefineTopicPlan applyPlan(const TopicDef& td) {
     plan.persistence = td.persistence;
     plan.replicas = td.replicas;
     for (const auto& f : td.fields) plan.keyFeatures.autoIncrement |= f.autoIncrement;
+    if (td.lease) {
+        plan.lease = rune::protocol::LeaseSpec{};
+        plan.config.cleanupPolicy = 1;   // compact; `with` may restate it.  deleteRetentionMs stays: the broker substitutes its lease default
+    }
     for (const auto& s : td.with) applySetting(plan, s);
     return plan;
 }
@@ -187,6 +198,10 @@ ViewSource viewSourceOf(const TopicDef& td) {
     src.name = td.name;
     src.keyField = td.keyField;
     if (!td.fields.empty()) src.descriptor = toDescriptor(td);
+    // A lease topic's stored schema starts with the four lease system columns (ids 0..3, user ids + 4); a script view
+    // over it must see them exactly as the broker's catalog does.
+    if (td.lease && !rune::codec::prependLeaseColumns(src.descriptor))
+        throw std::logic_error("lease topic '" + td.name + "': a field id no longer fits after the lease columns");
     src.partitions = static_cast<int32_t>(td.partitions);
     src.transient = td.persistence == Persistence::Transient;
     return src;

@@ -24,6 +24,7 @@
 #include <rune/client/detail/StatusRing.h>
 
 #include <rune/codec/FilterWire.h>
+#include <rune/protocol/LeaseRecord.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <concepts>
@@ -120,6 +121,11 @@ struct SubscribeOptions {
 // ---------------------------------------------------------------------------
 enum class RecordOp : uint8_t { Upsert, Insert, Update, Delete };
 
+/// What a record of a LEASE topic means (Record::leaseOp()).  Checkpoint records never reach a handler: the subscription
+/// consumes them (Task 14a), the value exists for completeness.  Carried is a broker re-append of a live row on a
+/// transient lease topic (spec A.3); it is appended last because the values are stored as uint8 elsewhere.
+enum class LeaseRecordOp : uint8_t { Granted, Updated, Revoked, Expired, Checkpoint, Carried };
+
 struct Record {
     int64_t                  offset;    // absolute offset in the partition log
     int64_t                  timestamp; // producer timestamp, epoch MILLISECONDS (wire contract, Kafka parity)
@@ -129,9 +135,34 @@ struct Record {
     uint8_t                  attributes = 0; // the record's attributes byte; bits 0-1 are the write intent
 
     [[nodiscard]] RecordOp op() const noexcept {
+        // Lease topics (Task 14a): a Revoke or Expire record is the lease's deletion, whatever its value (the row is kept in it).
+        // On every other topic bits 2-3 are reserved (refused on produce), so this never fires there.
+        if (const auto lop = rune::protocol::record::leaseOpOf(attributes);
+            lop == rune::protocol::record::LeaseOp::Revoke || lop == rune::protocol::record::LeaseOp::Expire)
+            return RecordOp::Delete;
         if (value.empty()) return RecordOp::Delete;
         const uint8_t intent = rune::protocol::record::intentOf(attributes);
         return intent == 1 ? RecordOp::Insert : intent == 2 ? RecordOp::Update : RecordOp::Upsert;
+    }
+
+    /// The lease meaning of this record - meaningful on a lease topic ONLY (elsewhere bits 2-3 are reserved and 0, which
+    /// reads as Granted / Updated).  A Put is Granted when its lease_version equals its own offset (a grant's version is
+    /// the offset the broker assigned it), else Updated.  A Put with intent 0 is Carried: a broker re-append of a live row on
+    /// a transient lease topic (spec A.3), checked before the version test; its op() stays Upsert.
+    [[nodiscard]] LeaseRecordOp leaseOp() const noexcept {
+        switch (rune::protocol::record::leaseOpOf(attributes)) {
+        case rune::protocol::record::LeaseOp::Revoke:     return LeaseRecordOp::Revoked;
+        case rune::protocol::record::LeaseOp::Expire:     return LeaseRecordOp::Expired;
+        case rune::protocol::record::LeaseOp::Checkpoint: return LeaseRecordOp::Checkpoint;
+        case rune::protocol::record::LeaseOp::Put:        break;
+        }
+        if (rune::protocol::record::intentOf(attributes) == 0) return LeaseRecordOp::Carried;
+        if (value.size() >= rune::protocol::record::kLeaseVersionValueOffset + 8) {
+            int64_t v = 0;
+            std::memcpy(&v, value.data() + rune::protocol::record::kLeaseVersionValueOffset, 8);
+            if (v == offset) return LeaseRecordOp::Granted;
+        }
+        return LeaseRecordOp::Updated;
     }
 };
 
@@ -204,6 +235,11 @@ enum class SubscriptionFailReason : int32_t {
     /// (ErrorResponse{StorageError 26} naming this subscription); the client released it.  Re-subscribing from the
     /// same offset meets the same damage; resume past it only if losing those records is acceptable.
     CorruptBatch = 10,
+    /// Lease topics: the broker ENDED this subscription of a transient lease topic because its cursor fell below the
+    /// partition's in-memory ring start (records it had not read were evicted), or an explicit resume offset was already
+    /// below it (ErrorResponse{PartitionDataReset 43} naming this subscription).  Records are lost, so the broker never
+    /// skips ahead silently: the application re-reads the partition's state (a LeaseWatch rescans).  brokerErrorCode() is 43.
+    DataReset = 11,
 };
 
 struct SubscriptionStatus {

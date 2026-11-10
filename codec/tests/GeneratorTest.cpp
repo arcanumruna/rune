@@ -2,6 +2,7 @@
 #include "FilterTestSupport.h"
 #include <gtest/gtest.h>
 #include <rune/codec/Generator.h>
+#include <rune/codec/LeaseColumns.h>
 #include <rune/codec/Record.h>
 #include <stdexcept>
 #include <string>
@@ -199,4 +200,53 @@ TEST(GeneratorRegression, AFieldNameEndingInUnderscoreIsRejectedRegression) {
         EXPECT_THROW((void)generateHeader(d), std::invalid_argument) << name;
     }
     EXPECT_NO_THROW((void)generateHeader(DescriptorBuilder("t").add("_n", PrimType::Int64).add("a_b", PrimType::Int64).build()));
+}
+
+// ── Lease topics (Task 14b): withLease, <T>LeasesRow, no lease_remaining_ms setter ─────────────────────────────────────────────
+
+namespace {
+Descriptor leaseDescriptor() {
+    auto d = DescriptorBuilder("lease_t").addFixedStr("id", 8, 1, true).add("n", PrimType::UInt64).build();
+    EXPECT_TRUE(prependLeaseColumns(d));
+    return d;
+}
+}  // namespace
+
+TEST(GeneratorLeaseRegression, WithLeaseCodegenRegression) {
+    const Descriptor d = leaseDescriptor();
+    const std::string hdr = generateHeader(d, d.version, "rune::gen", true);
+    EXPECT_NE(hdr.find("LeaseT& withLease(int64_t version_, uint64_t ttlMs_, uint64_t holder_) noexcept"), std::string::npos) << hdr;
+    EXPECT_NE(hdr.find("lease_remaining_ms = 0;"), std::string::npos) << "withLease zeroes the broker-computed column";
+    EXPECT_NE(hdr.find("using LeasesRow = LeaseTLeasesRow;"), std::string::npos);
+    EXPECT_NE(hdr.find("struct LeaseTLeasesRow {"), std::string::npos);
+    EXPECT_NE(hdr.find("#include <optional>"), std::string::npos);
+    // The flyweight writers have a setter for every column but lease_remaining_ms.
+    EXPECT_NE(hdr.find("LeaseTEncoder lease_version(int64_t v)"), std::string::npos);
+    EXPECT_NE(hdr.find("LeaseTEncoder lease_holder(uint64_t v)"), std::string::npos);
+    EXPECT_EQ(hdr.find("lease_remaining_ms(uint64_t v)"), std::string::npos) << "no lease_remaining_ms setter in Encoder or ClaimEncoder";
+    EXPECT_NE(hdr.find("uint64_t lease_remaining_ms = {};"), std::string::npos) << "the member stays, for decode";
+    EXPECT_NE(hdr.find("lease_remaining_ms() const noexcept"), std::string::npos) << "the Decoder still reads it";
+}
+
+TEST(GeneratorLeaseRegression, NonLeaseHeaderHasNoLeaseHelpersRegression) {
+    const Descriptor d = leaseDescriptor();
+    const std::string hdr = generateHeader(d);
+    EXPECT_EQ(hdr.find("withLease"), std::string::npos);
+    EXPECT_EQ(hdr.find("LeasesRow"), std::string::npos);
+    EXPECT_EQ(hdr.find("#include <optional>"), std::string::npos);
+    EXPECT_NE(hdr.find("lease_remaining_ms(uint64_t v)"), std::string::npos) << "without isLease the setter is generated as before";
+}
+
+TEST(GeneratorLeaseRegression, LeaseGenerationRefusesAForeignSchemaRegression) {
+    const auto plain = DescriptorBuilder("plain").add("id", PrimType::Int64, 1, true).build();
+    EXPECT_THROW((void)generateHeader(plain, plain.version, "rune::gen", true), std::invalid_argument) << "no lease columns";
+    Descriptor swapped = leaseDescriptor();
+    std::swap(swapped.fields[0].name, swapped.fields[1].name);
+    EXPECT_THROW((void)generateHeader(swapped, swapped.version, "rune::gen", true), std::invalid_argument) << "columns out of order";
+    Descriptor retyped = leaseDescriptor();
+    retyped.fields[3].type = PrimType::Int64;
+    EXPECT_THROW((void)generateHeader(retyped, retyped.version, "rune::gen", true), std::invalid_argument) << "a column of another type";
+    auto withVar = DescriptorBuilder("lease_v").add("id", PrimType::Int64, 1, true).add("s", PrimType::String).build();
+    ASSERT_TRUE(prependLeaseColumns(withVar));
+    EXPECT_THROW((void)generateHeader(withVar, withVar.version, "rune::gen", true), std::invalid_argument) << "a variable-length field";
 }

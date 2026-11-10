@@ -189,6 +189,48 @@ TEST(TransientDataPathRegression, FreshCursorBelowTheRingStartIsNotCountedAsLagR
     EXPECT_EQ(rig.worker().transientRecordsSkippedForTest(), static_cast<uint64_t>(start));
 }
 
+// Transient LEASE topic (gateway-pushed PushRead): a cursor below the ring start is never raised silently.  Non-fresh or
+// fresh-but-not-Earliest -> the read is answered PartitionDataReset (43) and the cursor does not move; a fresh Earliest
+// cursor is raised as on a plain transient topic; a plain transient topic is unchanged.
+// Mutation: drop the lease branch in Worker::servePushRead_ -> the first case is raised and answered with data, red.
+TEST(TransientLeaseEvictedPushRegression, PushReadBelowStartAnswersDataResetRegression) {
+    constexpr int16_t kDataReset = static_cast<int16_t>(pc::ErrorCode::PartitionDataReset);
+    Rig rig(/*ringBytes=*/8 * 1024, /*maxBatches=*/1000);
+    for (int i = 0; i < 20; ++i) ASSERT_EQ(rig.produce(batchOf(1, 1000), 0), kOk);
+    const int64_t start = rig.mem.logStartOffset();
+    ASSERT_GT(start, 0) << "precondition: the ring evicted committed records";
+
+    // Plain transient: raised as today.
+    const auto plain = rig.readOnce(20, /*from=*/0);
+    ASSERT_TRUE(plain.has_value());
+    EXPECT_EQ(plain->errorCode, 0);
+    EXPECT_FALSE(plain->chunk.empty());
+    EXPECT_EQ(rig.worker().transientCursorSkipsForTest(), 1u);
+
+    rig.rep->setLeaseTransient(true);
+    ASSERT_TRUE(rig.rep->leaseTransient());
+    const uint64_t endsBefore = rig.worker().leaseRingEndsForTest();
+
+    const auto lagging = rig.readOnce(21, /*from=*/0);   // not fresh: a reader that fell behind
+    ASSERT_TRUE(lagging.has_value());
+    EXPECT_EQ(lagging->errorCode, kDataReset);
+    EXPECT_TRUE(lagging->chunk.empty());
+    EXPECT_EQ(lagging->newNextOffset, 0) << "the cursor does not move";
+
+    const auto freshExplicit = rig.readOnce(22, /*from=*/0, 0, /*fresh=*/true, /*fromEarliest=*/false);
+    ASSERT_TRUE(freshExplicit.has_value());
+    EXPECT_EQ(freshExplicit->errorCode, kDataReset);
+
+    const auto earliest = rig.readOnce(23, /*from=*/0, 0, /*fresh=*/true, /*fromEarliest=*/true);
+    ASSERT_TRUE(earliest.has_value());
+    EXPECT_EQ(earliest->errorCode, 0) << "Earliest is raised";
+    ASSERT_FALSE(earliest->chunk.empty());
+    EXPECT_EQ(rune::protocol::RecordBatchReader(earliest->chunk.data(), earliest->chunk.size()).baseOffset(), start);
+
+    EXPECT_EQ(rig.worker().leaseRingEndsForTest(), endsBefore + 2);
+    EXPECT_EQ(rig.worker().transientCursorSkipsForTest(), 1u) << "no lease-topic read counted as a skip";
+}
+
 TEST(TransientDataPathRegression, ReadCommittedHoldsTheOpenTransactionUntilItsCommitRegression) {
     Rig rig;
     constexpr int64_t kPid = 7;
@@ -399,6 +441,29 @@ TEST(TransientDataPathRegression, RcRingRebuildPinsAnOpenTxnWhoseFirstBatchWasEv
     EXPECT_TRUE(rc.aborted().isAborted(kA, a1)) << "the abort covers A's in-ring batch";
     rc.onMarker(kB, mem.logEndOffset() + 1, true);
     EXPECT_EQ(rc.lso(INT64_MAX), INT64_MAX) << "nothing open";
+}
+
+// #953: the RC build feeds the producer state from a scan; an entry it rebuilds may carry a stale lastSequence (the
+// newer batches were compacted away), so a forward gap on it answers UnknownProducerId, never OutOfOrderSequence.
+TEST(UnknownProducerIdRegression, RcBuildProducerStateRebuildUnvouchedRegression) {
+    rune::storage::InMemoryLog mem(8 * 1024, 1000);
+    constexpr int64_t kP = 13;
+    ringPut(mem, batchOf(1, 50, kP, 0, 0));   // seq 0 survives; seq 2..5 are "compacted away"
+    ringPut(mem, batchOf(1, 50, kP, 0, 1));
+    rune::storage::ProducerStateManager psm;
+    rune::node::RcState rc;
+    rc.reserve(64);
+    rc.reserveRingRebuild();
+    rc.bindProducerState(&psm, 7, 0);
+    rune::node::RcFacts f;
+    f.leader = true; f.epoch = 1;
+    (void)rc.advance(f, nullptr, rune::node::RcState::kDefaultScanBytesPerPass, &mem);
+    ASSERT_TRUE(rc.ready());
+    ASSERT_NE(psm.entry(7, kP, 0), nullptr);
+    EXPECT_EQ(psm.entry(7, kP, 0)->lastSequence, 1);
+    EXPECT_TRUE(psm.entry(7, kP, 0)->rebuilt);
+    EXPECT_TRUE(psm.validate(7, kP, 0, 0, 6, 6).isUnknownProducerId()) << "a forward gap on a rebuilt entry";
+    EXPECT_TRUE(psm.validate(7, kP, 0, 0, 2, 2).isAccept()) << "the next in order";
 }
 
 // ---------------------------------------------------------------------------

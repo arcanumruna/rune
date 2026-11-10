@@ -25,10 +25,13 @@ struct SourceRecord {
     int64_t                        offset = 0;
     uint8_t                        intent = 0;            // rune::protocol::record::intentOf(attributes)
     const rune::codec::Descriptor* writer = nullptr;      // materialized writer version; nullptr = the fold resolves it
+    uint8_t                        attributes = 0;        // the record's full attributes byte (lease topics: the lease op, bits 2-3)
 };
 
 // Locked: the record reads or writes a row a held TxnOverlay locks; nothing was written.
-enum class PrepareStatus : uint8_t { Ok, Malformed, CapacityExhausted, Locked };
+// Pending: the record cannot be prepared YET (a lease record whose writer layout the worker has not installed): the caller
+// holds at this record and retries on the next duty cycle; it is neither accepted nor rejected.
+enum class PrepareStatus : uint8_t { Ok, Malformed, CapacityExhausted, Locked, Pending };
 enum class ProspectOp : uint8_t { None, Upsert, Erase, Move };
 
 // Touched aggregate rows of one prepared record, in fixed slots (never allocates after reserve).
@@ -99,6 +102,7 @@ struct ProspectRow {
     uint8_t* image   = nullptr;   // the prospective view-row image; valid until the Prospect is cleared
     bool     removed = false;     // the row is gone after apply
     bool     existed = false;     // the row exists in the table now (a chained prepare: in the chain, else the table)
+    uint32_t rid     = UINT32_MAX;  // lease index: the existing row's id (valid when existed), found once by prepare
     const uint8_t* before = nullptr;   // a chained prepare: the existing row's image before this record (Prospect::before)
     bool     ownedByOther = false;   // unique: the key is owned by another source key
     bool     promoted = false;       // unique: the owner leaves and an extra takes the row (computed by apply)

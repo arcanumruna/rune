@@ -6,6 +6,7 @@
 // walks the committed log, follows the logged constraint-set changes and emits durable verdict markers.
 #include <rune/codec/PrimType.h>
 #include <rune/node/VerdictState.h>
+#include <rune/node/lease/LeaseIndex.h>
 #include <rune/node/ViewInstance.h>
 #include <rune/node/WriteState.h>
 #include <rune/protocol/BatchRebuild.h>
@@ -77,6 +78,9 @@ struct VerdictViewHooks {
     void (*discard)(void* ctx, ViewInstance&, ViewDiscardReason) = nullptr;
     /// A retiring member left this partition's set for good (W passed its drop): the owner may erase the partition's instance.
     void (*retired)(void* ctx, int32_t viewTopicId, int32_t partition) = nullptr;
+    /// The next lease rebuild epoch of the owner: strictly increasing across every lease index of the owner, so an index erased and
+    /// re-created never repeats an epoch a runtime already holds (null: the instance's own counter).
+    uint32_t (*nextLeaseEpoch)(void* ctx) = nullptr;
 };
 
 /// Part 11: the source keys of one transaction with their last offsets (P11-3, P11-3a), and the other producers' markers and TxnJudge
@@ -275,6 +279,8 @@ public:
 
     /// Prepares every member of the active set for `rec`, evaluates them in set order, applies all or none.  A rejection
     /// is added to the index and returned.  A full index or an exhausted prospect sets stalled() and applies nothing.
+    /// Returns Verdict::held() (isHeld(), never recorded) when a lease record's layout is not installed yet: nothing was judged.
+    /// Public for the unit rigs (CheckedWritesKeyIndexTest drives it directly).
     [[nodiscard]] rune::view::Verdict judge(const rune::view::SourceRecord& rec) noexcept;
 
     /// One duty-pass of the judge over the committed range below `bound` (the HW, P11-2).  `readRange(from, to)` returns whole
@@ -352,6 +358,11 @@ public:
     /// A leadership has activated this judge and no new one is pending: what it folds now belongs to that leadership.
     [[nodiscard]] bool activated() const noexcept { return generation_ != kUnbound && !needsActivation_; }
     [[nodiscard]] int64_t logStart() const noexcept { return logStart_; }
+    /// The leadership generation this judge is bound to (kUnbound-equivalent ~0 until bindLeader).
+    [[nodiscard]] uint64_t leadershipGeneration() const noexcept { return generation_; }
+    /// Cold: activate again under the same leadership (bindLeader's new-generation path, without a new generation): a lease
+    /// index whose row layout changed is rebuilt by the owner, then replayed from the log by the activation.
+    void requestReactivation() noexcept { needsActivation_ = true; }
 
     /// `planRecordPayload` (P9-8, a Unique or Check member): the type-20 value requestChange appends when the member joins.
     void addVerdictView(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint = 0,
@@ -534,6 +545,7 @@ private:
     void   countRejection_(const rune::view::Verdict& v) noexcept;
     [[nodiscard]] bool indexHasRoom_(std::size_t n) noexcept;
     [[nodiscard]] rune::view::SourceRecord recordOf_(const rune::protocol::RecordSpan& span) noexcept;
+    [[nodiscard]] bool isLeaseSource_() const noexcept;   // an active member is a lease index
     int    emitMarkers_(PartitionWriteState& state, int64_t nowNs);
     int    pushCheckpoints_(PartitionWriteState& state);
     int    dropRetired_(PartitionWriteState& state);
@@ -544,12 +556,14 @@ private:
     enum class StallReason : uint8_t { None, Full, OutOfOrder, Capacity };
     void   stall_(StallReason reason) noexcept;
     void   waitForInstall_(const ConstraintSet& set) noexcept;
+    void   noteLayoutWait_(int64_t offset, uint16_t version) noexcept;
     int64_t extendOverEmptySets_(int64_t offset) const noexcept;
     rune::view::PrepareStatus prepare_(Member& m, const rune::view::SourceRecord& rec, rune::view::TxnOverlay* chain,
                                        const rune::view::TxnLockSet* locks) noexcept;
     /// P6-13: a rejected record of a key-0 batch burns its id; a KeyExists on one is a reused id (counted and logged).
     void   noteKeyZeroRejection_(const rune::view::Verdict& v, const rune::view::SourceRecord& rec) noexcept;
     void   apply_(Member& m, const rune::view::SourceRecord& rec) noexcept;
+    rune::view::SourceRecord dataRecord_(const rune::view::SourceRecord& rec, bool& skip) const noexcept;
     /// Retention may have trimmed the log below a member's cursor: an empty member starts at the log start, one with rows is
     /// discarded (BelowLogStart), as is one with an open span that lost its first batches.  False when it was discarded.
     bool   clampToLogStart_(Member& m) {
@@ -576,6 +590,7 @@ private:
     int64_t                     logStart_ = 0;
     bool                        needsActivation_ = false;
     bool                        stalled_ = false, waitingForInstall_ = false, held_ = false;
+    int32_t                     layoutWaitVersion_ = -1;   // the writer version a layout wait is in progress for (counted and logged once); -1 none
     StallReason                 stallReason_ = StallReason::None;
     std::size_t                 stallRoom_ = 1;   ///< the index entries the stalled rejection waits for
     ConstraintSetMember         waitingFor_;

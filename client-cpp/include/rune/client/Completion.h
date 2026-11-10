@@ -17,7 +17,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <rune/protocol/LeaseSpec.h>
 #include <type_traits>
 
 namespace rune::client {
@@ -60,7 +62,29 @@ enum class OpKind : uint8_t {
     ListNamespaces,     ///< Client::listNamespaces(afterNsId, max, target, token) / listNamespaces(timeout)
     NamespaceUsage,     ///< Phase 2 Task 16: Client::namespaceUsage(name, target, token) / namespaceUsage(name, timeout)
     GetStats,           ///< Client::getStats() / getStatsAndWait(); value = the stat count, payload = decodeStatsPayload's input
+    // Lease topics (Task 14a).  Payloads and fields: see the as-built table in the lease-topics design spec, section 12.1.
+    OpenLeaseTopic,     ///< Client::openLeaseTopicSchema(); same fields as GetTopicSchema (value = topic id, aux = schemaAuxOf, reserved0 = partition count, payload = blob + key features + lease block)
+    LeaseGrant,         ///< LeaseTopic::grant(); Ok: value = the granted leaseVersion, aux = the ttl in ms
+    LeaseUpdate,        ///< LeaseTopic::update(); Ok: value = the new leaseVersion, aux = the ttl in ms
+    LeaseRevoke,        ///< LeaseTopic::revoke(); Ok: value = the revoked leaseVersion, aux = the ttl in ms
+    LeaseKeepAlive,     ///< LeaseTopic::keepAliveOnce(); Ok: aux = the ttl in ms
+    LeaseTimeToLive,    ///< LeaseTopic::timeToLive(); value = version, aux = remaining ms, payload = 32-byte LeaseTtlInfo
+    ScanLeases,         ///< LeaseTopic::scanLeases(); value = asOfOffset, aux = lastHash, reserved0 = rowCount | done << 31, payload = rows
+    LeaseCampaign,      ///< Task 20: a LeaseOwnership / LeaseElection claim ended: Ok = owner (value = the lease_version, the fencing token), else DeliveryFailed + a ClientErrorCode
+    LeaseWatchReady,    ///< Task 16: the LeaseWatch's internal record ring (no application producer)
+    LeaseGuard,         ///< Task 15: a LeaseSession's produce-guard event (detail::GuardEvent): token = the session id, value = slot, aux = gen, reserved0 = event | armSeq << 8; never carries credit
 };
+
+/// Client-local error codes (Completion::errorCode): the range 0xFF00-0xFFFE is never on the wire and never a broker code.
+enum class ClientErrorCode : uint16_t {
+    LeaseAtRisk  = 0xFF01,   ///< a guarded producer's write failed because its lease is at risk or gone (LeaseSession)
+    LeaseClaimed = 0xFF02,   ///< a LeaseOwnership::tryClaim found the name owned by another lease (its own key was revoked again)
+    LeaseLost    = 0xFF03,   ///< a pending claim / campaign ended because its lease was lost (LeaseSession onLost)
+    LeaseReleased = 0xFF04,  ///< a pending claim / campaign ended because the caller released it first
+    LeaseWatchFailed = 0xFF05,   ///< a pending claim / campaign ended because the shared watch failed; recreate the watch and the recipe
+};
+/// The terminal completion of a Client::leaseKeepAliveBatch request (Completion::reserved0); entry completions carry the entry index.
+inline constexpr uint32_t kLeaseKeepAliveTerminal = 0xFFFF;
 
 enum class OpStatus : uint8_t {
     Ok = 0,
@@ -112,6 +136,9 @@ enum class OpStatus : uint8_t {
     case 61: return "ViewUniqueInvalid";
     case 62: return "TxnTooLarge";
     case 63: return "TxnConflict";
+    case 64: return "LeaseNotFound";
+    case 65: return "LeaseLimitExceeded";
+    case 66: return "LeaseTtlTooLarge";
     default: return nullptr;
     }
 }
@@ -147,24 +174,49 @@ static_assert(sizeof(Completion) == 40);
 /// Checked writes: the broker-assigned id of a Send (aux), 0 = none.
 [[nodiscard]] constexpr uint64_t assignedKeyOf(const Completion& c) noexcept { return static_cast<uint64_t>(c.aux); }
 
+/// The lease block of a GetTopicSchema payload: the LeaseSpec's 39 wire bytes, then the lease view's topic id (i32 LE; Task 14a).
+inline constexpr std::size_t kSchemaLeaseBlockBytes = rune::protocol::kLeaseSpecBytes + 4;
+
 /// GetTopicSchema: aux = the schema version (bits 0-15); bit 16 set when the broker sent a key-features block, which then
-/// follows the descriptor blob in the payload as its 14 wire bytes (putTopicKeyFeatures).
-[[nodiscard]] constexpr int64_t schemaAuxOf(uint16_t version, bool hasKeyFeatures) noexcept {
-    return static_cast<int64_t>(version) | (hasKeyFeatures ? int64_t{1} << 16 : 0);
+/// follows the descriptor blob in the payload as its 14 wire bytes (putTopicKeyFeatures); bit 17 set when it also sent a
+/// lease block (lease topics), which follows the key-features block as the LeaseSpec's 39 wire bytes (encodeLeaseSpec) and the lease view's topic id (i32 LE).
+[[nodiscard]] constexpr int64_t schemaAuxOf(uint16_t version, bool hasKeyFeatures, bool hasLease = false) noexcept {
+    return static_cast<int64_t>(version) | (hasKeyFeatures ? int64_t{1} << 16 : 0) | (hasLease ? int64_t{1} << 17 : 0);
 }
 [[nodiscard]] constexpr bool schemaHasKeyFeatures(const Completion& c) noexcept { return ((c.aux >> 16) & 1) != 0; }
-/// The descriptor blob of a GetTopicSchema payload, without the key-features block.
+[[nodiscard]] constexpr bool schemaHasLease(const Completion& c) noexcept {
+    return ((c.aux >> 16) & 1) != 0 && ((c.aux >> 17) & 1) != 0;   // the lease block rides behind the key block
+}
+/// The descriptor blob of a GetTopicSchema payload, without the key-features and lease blocks.
 [[nodiscard]] constexpr std::span<const uint8_t> schemaBlobOf(const Completion& c, std::span<const uint8_t> payload) noexcept {
-    return schemaHasKeyFeatures(c) && payload.size() >= rune::protocol::kTopicKeyFeaturesWireLen
-               ? payload.first(payload.size() - rune::protocol::kTopicKeyFeaturesWireLen) : payload;
+    const std::size_t tail = (schemaHasKeyFeatures(c) ? rune::protocol::kTopicKeyFeaturesWireLen : 0u) +
+                             (schemaHasLease(c) ? kSchemaLeaseBlockBytes : 0u);
+    return payload.size() >= tail ? payload.first(payload.size() - tail) : payload;
 }
 /// The key features of a GetTopicSchema completion (the defaults when the broker sent none).
 [[nodiscard]] inline rune::protocol::TopicKeyFeatures schemaKeyFeaturesOf(const Completion& c, std::span<const uint8_t> payload) noexcept {
     rune::protocol::TopicKeyFeatures f;
-    if (schemaHasKeyFeatures(c) && payload.size() >= rune::protocol::kTopicKeyFeaturesWireLen)
-        (void)rune::protocol::getTopicKeyFeatures(payload.data() + payload.size() - rune::protocol::kTopicKeyFeaturesWireLen,
-                                                  rune::protocol::kTopicKeyFeaturesWireLen, f);
+    const std::size_t lease = schemaHasLease(c) ? kSchemaLeaseBlockBytes : 0u;
+    const std::size_t kf    = rune::protocol::kTopicKeyFeaturesWireLen;
+    if (schemaHasKeyFeatures(c) && payload.size() >= kf + lease)
+        (void)rune::protocol::getTopicKeyFeatures(payload.data() + payload.size() - lease - kf, kf, f);
     return f;
+}
+/// The lease spec of a GetTopicSchema completion; nullopt when the broker sent none.
+[[nodiscard]] inline std::optional<rune::protocol::LeaseSpec> schemaLeaseOf(const Completion& c, std::span<const uint8_t> payload) noexcept {
+    rune::protocol::LeaseSpec l;
+    if (schemaHasLease(c) && payload.size() >= rune::protocol::kTopicKeyFeaturesWireLen + kSchemaLeaseBlockBytes &&
+        rune::protocol::decodeLeaseSpec(payload.data() + payload.size() - kSchemaLeaseBlockBytes,
+                                        rune::protocol::kLeaseSpecBytes, l))
+        return l;
+    return std::nullopt;
+}
+/// The lease view's topic id of a GetTopicSchema completion of a lease topic (the catalog's id, never derived); -1 when none.
+[[nodiscard]] inline int32_t schemaLeaseViewTopicIdOf(const Completion& c, std::span<const uint8_t> payload) noexcept {
+    if (!schemaHasLease(c) || payload.size() < rune::protocol::kTopicKeyFeaturesWireLen + kSchemaLeaseBlockBytes) return -1;
+    const uint8_t* p = payload.data() + payload.size() - 4;
+    return static_cast<int32_t>(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                                (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24));
 }
 
 /// One rejected record of a judged batch, decoded from its 8-byte wire entry (u16 record index, u16 code, u32 constraintId, LE).

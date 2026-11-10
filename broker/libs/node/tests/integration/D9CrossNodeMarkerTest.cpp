@@ -1811,13 +1811,13 @@ TEST(D9BrokerNodeWiringRegression, MarkerForARemotelyLedPartitionLandsThroughThe
     EXPECT_EQ(sent, 1u) << "the marker was not forwarded to the remote leader";
 
     bool landed = false;
-    while (!landed) {
+    for (int i = 0; i < 2'000'000 && !landed; ++i) {
         landed = L.onOwnerThreadForTest(0, part, [](PartitionReplica& r) { return controlBatchCount(*r.log()) == 1; });
         std::this_thread::yield();
     }
     ASSERT_TRUE(landed) << "the marker never landed on the remote leader through the node wiring";
     std::size_t inFlight = 1;
-    while (inFlight != 0) {
+    for (int i = 0; i < 2'000'000 && inFlight != 0; ++i) {
         inFlight = C.onControlThreadForTest([&] { return C.gatewayForTest()->remoteMarkersInFlightForTest(); });
         std::this_thread::yield();
     }

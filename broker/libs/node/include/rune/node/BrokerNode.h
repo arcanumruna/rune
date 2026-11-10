@@ -137,6 +137,7 @@ extern "C" {
 #include <map>
 #include <optional>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -268,7 +269,8 @@ public:
                                                  const rune::protocol::TopicConfigView& config,
                                                  const rune::gateway::DdlMetaView& meta,
                                                  std::string_view adoptDenial,
-                                                 const rune::protocol::TopicKeyFeatures& keyFeatures) override {
+                                                 const rune::protocol::TopicKeyFeatures& keyFeatures,
+                                                 const std::optional<rune::protocol::LeaseSpec>& lease) override {
         DefineTopicMsg m;
         m.session        = sessionId;
         m.corr           = correlationId;
@@ -284,6 +286,7 @@ public:
         m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         m.adoptDenial.assign(adoptDenial);
         m.keyFeatures = keyFeatures;
+        m.lease       = lease;
         return submitDdl_(m);
     }
 
@@ -794,7 +797,9 @@ public:
     /// never dropped.
     void postTopicSchemaResponse(int64_t session, int64_t corr, int32_t topicId, uint16_t version,
                                  int32_t partitionCount, const std::vector<uint8_t>& blob,
-                                 uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures) {
+                                 uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures,
+                                 const std::optional<rune::protocol::LeaseSpec>& lease = std::nullopt,
+                                 int32_t leaseViewTopicId = -1) {
         namespace pc = rune::protocol::client;
         pc::TopicSchemaResponse resp;
         resp.sessionId      = session;
@@ -803,7 +808,10 @@ public:
         resp.version        = version;
         resp.errorCode      = errorCode;
         resp.partitionCount = partitionCount;   // Phase 2b Part C
-        resp.hasKeyFeatures = keyFeatures != rune::protocol::TopicKeyFeatures{};
+        resp.hasLease       = lease.has_value();
+        resp.lease          = lease.value_or(rune::protocol::LeaseSpec{});
+        resp.leaseViewTopicId = resp.hasLease ? leaseViewTopicId : -1;
+        resp.hasKeyFeatures = keyFeatures != rune::protocol::TopicKeyFeatures{} || resp.hasLease;   // the key block precedes the lease block
         resp.keyFeatures    = keyFeatures;
         resp.descriptorBlob = blob.empty() ? nullptr : blob.data();
         resp.descriptorLen  = static_cast<uint32_t>(blob.size());
@@ -1223,11 +1231,15 @@ private:
     void postCatalogTopicApplied_(int32_t topicId, std::string_view name, int32_t partitions, int16_t rf,
                                   rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c,
                                   uint32_t nsId, const rune::protocol::TopicKeyFeatures& kf,
-                                  int32_t typeId = kA2cCatalogTopicApplied) {
-        const std::size_t len = catalogTopicAppliedWireLen(name, c);
+                                  int32_t typeId = kA2cCatalogTopicApplied,
+                                  const std::optional<rune::protocol::LeaseSpec>& lease = std::nullopt,
+                                  bool leaseView = false, int32_t leaseSourceTopicId = -1, uint8_t leaseKeyType = 0,
+                                  uint8_t leaseKeyWidth = 0) {
+        const std::size_t len = catalogTopicAppliedWireLen(name, c, lease.has_value(), leaseView && leaseSourceTopicId >= 0);
         const uint8_t pers = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
         postCatalog_(typeId, len, [&](uint8_t* p) {
-            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c, nsId, kf);
+            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c, nsId, kf, lease, leaseView, leaseSourceTopicId, leaseKeyType,
+                                     leaseKeyWidth);
         });
     }
 
@@ -1256,7 +1268,11 @@ private:
 
     /// Checked writes: a typed topic's write spec (the key facts), after its validators.  No-op for an untyped topic.
     void postCatalogWriteSpec_(const rune::catalog::TopicObject& t) {
-        const auto w = writeSpecWireOf(t);
+        // A lease topic's lease view id comes from the applied catalog (never `topicId + 1`): the workers map the view to its source with it.
+        int32_t leaseView = -1;
+        if (t.lease)
+            if (const rune::catalog::ViewObject* lv = worker_.applier().state().leaseViewOf(t.objectId)) leaseView = lv->def.viewTopicId;
+        const auto w = writeSpecWireOf(t, leaseView);
         if (!w) return;
         postCatalog_(kA2cWriteSpec, topicWriteSpecWireLen(*w), [&](uint8_t* p) {
             (void)encodeTopicWriteSpec(*w, std::span<uint8_t>(p, topicWriteSpecWireLen(*w)));
@@ -1284,7 +1300,8 @@ private:
             postCatalogValidator_(t, 1);
             postCatalogWriteSpec_(t);
             postCatalogTopicApplied_(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence, t.config, t.nsId,
-                                     t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{});
+                                     t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{},
+                                     kA2cCatalogTopicApplied, t.lease);
         };
         fx.sinkApplied = [this](const SinkSpec& s) {
             // A view sink is a keyed, compacted table (Task 19's sink spec), every broker (rf 0).
@@ -1292,7 +1309,8 @@ private:
             c.cleanupPolicy = 1;   // Compact
             c.partitionKey  = s.keyField;
             postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf*/0, s.persistence, c, s.nsId, s.sourceKeyFeatures,
-                                     kA2cCatalogSinkApplied);   // Task 12 (N5)
+                                     kA2cCatalogSinkApplied, std::nullopt, s.leaseView, s.leaseSourceTopicId, s.leaseKeyType,
+                                     s.leaseKeyWidth);   // Task 12 (N5); Task 13a: the lease view's source and its key
         };
         fx.namespaceUpserted = [this](const rune::catalog::NamespaceRecord& r) {   // namespaces Task 9: login mirror
             postCatalog_(kA2cNamespaceUpserted, namespaceUpsertedWireLen(r.name),
@@ -1306,14 +1324,22 @@ private:
                          [&](uint8_t* p) { writeCatalogTopicDropped(p, topicId, name, nsId); });
         };
         fx.topicConfig = [this](int32_t topicId, std::span<const rune::catalog::ConfigChange> changes) {
-            const std::size_t n = changes.size();
+            // Only keys 1..kLastConfigKeyV3 reach the cleaner (it refuses a policy message with any other key): the
+            // lease.* keys (7..12) travel as a write-spec update (writeSpecChanged) instead.
+            std::size_t n = 0;
+            for (const auto& ch : changes)
+                if (static_cast<uint8_t>(ch.key) <= static_cast<uint8_t>(rune::protocol::kLastConfigKeyV3)) ++n;
+            if (n == 0) return;
             postCatalog_(kA2cCatalogTopicConfig, n > kMaxCatalogConfigEntries ? 0 : catalogTopicConfigWireLen(n),
                          [&](uint8_t* p) {
                 writeCatalogTopicConfigHeader(p, topicId, static_cast<uint16_t>(n));
-                for (std::size_t i = 0; i < n; ++i)
-                    writeCatalogTopicConfigEntry(p, i, static_cast<uint8_t>(changes[i].key), changes[i].value);
+                std::size_t i = 0;
+                for (const auto& ch : changes)
+                    if (static_cast<uint8_t>(ch.key) <= static_cast<uint8_t>(rune::protocol::kLastConfigKeyV3))
+                        writeCatalogTopicConfigEntry(p, i++, static_cast<uint8_t>(ch.key), ch.value);
             });
         };
+        fx.writeSpecChanged = [this](const rune::catalog::TopicObject& t) { postCatalogWriteSpec_(t); };
         fx.schemaChanged = [this](const rune::catalog::TopicObject& t, uint16_t fromVersion) {
             postCatalogValidator_(t, fromVersion);
             postCatalogWriteSpec_(t);
@@ -1816,12 +1842,19 @@ public:
     }
     /// Test-only (Task 16): the topics / dropped ids the boot replay produced (immutable after start()).
     [[nodiscard]] const std::vector<TopicSpec>& bootTopicsForTest() const noexcept { return bootTopics_; }
+    /// Test-only: feed the boot replay's sink one view sink (startup thread's code path) into `out`; returns out.size().
+    std::size_t bootSinkAppliedForTest(const SinkSpec& sp, std::vector<TopicSpec>& out) { bootSinkApplied_(sp, out); return out.size(); }
+    /// Lease sinks refused for naming no lease topic (boot or live).  Written by the startup thread at boot, then by the control thread:
+    /// read it on the control thread (onControlThreadForTest) once started.
+    [[nodiscard]] uint64_t leaseSinkRefused() const noexcept { return leaseSinkRefused_; }
     [[nodiscard]] std::size_t nsDirMismatchesAtBootForTest() const noexcept { return nsDirMismatchesAtBoot_; }
     [[nodiscard]] const std::vector<int32_t>& bootDroppedIdsForTest() const noexcept { return bootDroppedIds_; }
     /// Test-only (F6): the open-file need the boot budget estimated from bootTopics_ (immutable after start()).
     [[nodiscard]] uint64_t fdNeedAtBootForTest() const noexcept { return fdNeedAtBoot_; }
     /// Test-only (Task 16): the applier's effects phase ("Live" once the admin thread ran),
     /// read ON the admin thread.
+    /// CONTROL thread (onControlThreadForTest): how many kA2cCatalogSinkApplied frames this broker has drained.
+    [[nodiscard]] uint64_t sinkAppliedDrainedForTest() const noexcept { return sinkAppliedDrained_; }
     [[nodiscard]] std::string catalogApplierPhaseForTest() {
         return onAdminThreadForTest([this]() { return std::string{adminWorkerAgent_->worker().applier().phaseName()}; });
     }
@@ -2016,6 +2049,8 @@ public:
     /// Fix round 1 (I2): the cleaner keeps swapping replica views but holds its
     /// ACK — the retire gate (a dropped topic's Logs, collectRetired) must hold.
     void holdCleanerViewAckForTest(bool on);
+    /// TEST-ONLY (#953): the cleaner's cycle clock (epoch ms; drives producer-id expiry) - the next cycles see `nowMs`.
+    void setCleanerNowForTest(std::function<int64_t()> nowMs);
     /// Fix round 1 (M6): run `f()` on the CLEANER (LogCleanerAgent) thread —
     /// test reads of cleaner-owned state (its policy overrides).  Same contract
     /// as onAdminThreadForTest.
@@ -2057,6 +2092,15 @@ public:
     template <class = void>
     uint64_t testConnectsAccepted() {
         return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->sessionsAllocated() : 0; });
+    }
+    /// Test-only (L22 Part B): {sent, deduped, dropped, abandoned} unknown-session notices of the gateway (read on the control thread).
+    template <class = void>
+    std::array<uint64_t, 4> testUnknownSessionNotices() {
+        return onControlThreadForTest([this]() -> std::array<uint64_t, 4> {
+            if (!gateway_) return {};
+            return {gateway_->unknownSessionNoticesSent(), gateway_->unknownSessionNoticesDeduped(), gateway_->unknownSessionNoticesDropped(),
+                    gateway_->unknownSessionNoticesAbandoned()};
+        });
     }
     template <class = void>
     int64_t processIdentityForTest() {
@@ -2267,6 +2311,7 @@ public:
         return cleanerAgent_ ? cleanerAgent_->dedupeBufferBytesForTest() : -2;
     }
     /// Test-only (#658): bytes the cleaner's dedupe table really allocated (-2 = no cleaner).
+    /// The table only: once the cleaner runs a lease pass it also holds a same-capacity lease side table of the same size (2x in all).
     [[nodiscard]] int64_t cleanerDedupeTableBytesForTest() const noexcept {
         return cleanerAgent_ ? static_cast<int64_t>(cleanerAgent_->dedupeTableBytes()) : -2;
     }
@@ -2540,7 +2585,9 @@ private:
     //      PendingCreateBehindDrop{spec} (FIFO per name) and runs right after
     //      that name's rename succeeded: the reused name starts EMPTY.
     // -----------------------------------------------------------------------
-    void onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView = false);
+    void onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView = false, const CatalogTopicAppliedMsg* decoded = nullptr);   // decoded: the caller's decode of a sink frame
+    void bootSinkApplied_(const SinkSpec& sp, std::vector<TopicSpec>& out);   // the boot sink's effect (fail closed on a lease view without a topic)
+    void noteLeaseSinkRefused_(int32_t viewTopicId, const char* where);
     void runCatalogCreate_(const TopicSpec& spec);
     int  serviceCreatesAwaitingSpec_();   // control thread: build a parked create once its spec reached every worker
     void postBootWriteSpecs_();           // startup thread: every booted typed topic's validators + write spec -> schemaFanout_
@@ -2576,6 +2623,8 @@ private:
     void ensureProcessIncarnation_();
     static uint64_t transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept;
     static bool isTransientTopicTrampoline_(void* ctx, int32_t topicId) noexcept;
+    /// Lease topics Task 27: a TRANSIENT lease topic (the lineage fanout's predicate).
+    static bool isTransientLeaseTopicTrampoline_(void* ctx, int32_t topicId) noexcept;
     /// ISR v3 Step 6: the storage manifest markers.  Each runs once, on the control thread (cold fsync), when the
     /// class first exists durably: the internal-ISR knowledge file / the first committed __cluster_metadata apply.
     void markConsensusWhenPresent_();
@@ -3037,6 +3086,9 @@ private:
     SchemaFanout                                 schemaFanout_;
     TopicDroppedFanout                           topicDroppedFanout_;   // R-M1: drop -> every worker (control thread)
     uint64_t                                     adminToControlRejects_ = 0;   // control thread only
+    uint64_t                                     leaseSinkRefused_ = 0;        // startup thread at boot, then the control thread (never concurrently)
+    std::set<int32_t>                            leaseSinkRefusedIds_;         // ... the view ids already logged critical
+    uint64_t                                     sinkAppliedDrained_ = 0;      // control thread only: kA2cCatalogSinkApplied frames drained
     std::function<void(std::string_view)>        startupPhaseHookForTest_;
     HaltHandler                                  haltHandler_ = nullptr;
     void*                                        haltCtx_     = nullptr;

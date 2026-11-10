@@ -263,6 +263,7 @@ const char* subFailName(SubscriptionFailReason r, uint16_t code) {
     case SubscriptionFailReason::SessionLost:     return "SessionLost";
     case SubscriptionFailReason::TimedOut:        return "TimedOut";
     case SubscriptionFailReason::CorruptBatch:    return "CorruptBatch";
+    case SubscriptionFailReason::DataReset:       return "DataReset";
     default:                                      return "Ended";
     }
 }

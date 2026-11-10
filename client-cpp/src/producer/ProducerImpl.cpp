@@ -19,6 +19,7 @@
 #include <rune/protocol/client/TxnMessages.h>
 #include <rune/protocol/Crc32c.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/LeaseRecord.h>
 #include <flight_recorder/FlightRecorder.h>
 
 #include <concurrent/BackOffIdleStrategy.h>
@@ -112,6 +113,25 @@ inline void writeRecordHeader(uint8_t* d, int32_t topicId, int32_t partition, co
     if (keyLen > 0) std::memcpy(d + kRecKeyBytesOff, key, keyLen);
     d[kRecFlagsOff] = flags;
     writeLE64(d, kRecCorrIdOff, ackHandle);
+}
+
+/// Task 14a: the SEND_LEASE_RECORD header [0..150] - the ONE writer of the lease form (ring and deferred arena).
+inline void writeLeaseRecordHeader(uint8_t* d, int32_t topicId, int32_t partition, std::span<const uint8_t> key,
+                                   uint8_t flags, uint8_t leaseKind, int64_t ackHandle, uint32_t valueLen) noexcept {
+    writeLE32(d, kLeaseRecTopicIdOff, topicId);
+    writeLE32(d, kLeaseRecPartOff, partition);
+    d[kLeaseRecKeyLenOff] = static_cast<uint8_t>(key.size());
+    std::memset(d + kLeaseRecKeyBytesOff, 0, kLeaseKeySlot);
+    if (!key.empty()) std::memcpy(d + kLeaseRecKeyBytesOff, key.data(), key.size());
+    d[kLeaseRecFlagsOff] = flags;
+    d[kLeaseRecKindOff]  = leaseKind;
+    writeLE64(d, kLeaseRecCorrIdOff, ackHandle);
+    writeLE32u(d, kLeaseRecValLenOff, valueLen);
+}
+/// A well-formed lease ring message: the header, a key of 1..128 bytes and the whole value.
+[[nodiscard]] inline bool leaseMessageFits(std::size_t len, uint8_t keyLen, uint32_t valueLen) noexcept {
+    return keyLen >= 1 && keyLen <= kLeaseKeySlot &&
+           static_cast<uint64_t>(len) >= static_cast<uint64_t>(kLeaseRecHeaderSize) + valueLen;
 }
 
 /// Well-formedness of a ring message, shared by the drain and every discard / refuse walk (#328): a message the
@@ -311,6 +331,11 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     publishStatus_();   // FD9: a bare rig reports its rig id
     // Checked writes: a View claim's rebased verdict list (8 B per record) lives here; sized once, never resized.
     if (viewSent_()) claimVerdictScratch_.reserve(8u * static_cast<std::size_t>(rune::protocol::client::kMaxJudgedBatchRecords));
+    // Task 14a: a lease-writes producer keeps its in-flight writes' completion kinds here (sized once).
+    if (cfg_.leaseWrites) {
+        leaseWrites_ = true;
+        leaseKinds_  = detail::FlatIndexMap(4096);
+    }
     // Tier-2 slot pool geometry only: the pool itself (tier2Slots x 2 x tier2SlotBytes, ~8 MiB by default) is
     // allocated ONCE by the first batch() / bindBatchThread() (ensureTier2Pool_, #393), so a producer that never
     // uses Tier-2 reserves nothing.  Sized once; steady state never allocates.  Every slot starts on the app's
@@ -438,6 +463,67 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
         }
         return false; // preserve noexcept contract
     }
+}
+
+bool ProducerImpl::submitSendLeaseRecord(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
+                                         std::span<const uint8_t> value, int64_t ackHandle, uint8_t flags,
+                                         uint8_t leaseKind) noexcept {
+    // The lease form of submitSendRecord: the same claim / write-in-place / commit-or-abort discipline.
+    const std::size_t totalLen = static_cast<std::size_t>(kLeaseRecHeaderSize) + value.size();
+    aeron::util::index_t idx = -1;
+    bool committed = false;
+    try {
+        idx = ring_.tryClaim(kMsgSendLeaseRecord, totalLen);
+        if (idx < 0) return false;   // INSUFFICIENT_CAPACITY -> back-pressure
+        uint8_t* dst = ring_.base() + idx;
+        writeLeaseRecordHeader(dst, topicId, partition, key, flags, leaseKind, ackHandle, static_cast<uint32_t>(value.size()));
+        if (!value.empty()) std::memcpy(dst + kLeaseRecValBytesOff, value.data(), value.size());
+        ring_.commit(idx);
+        committed = true;
+        FLIGHT_RECORDER_MARK_PRODUCE(flight_recorder::Site::ClientAppSend, static_cast<uint32_t>(ackHandle));
+        return true;
+    } catch (...) {
+        if (committed) return true;
+        if (idx >= 0) {
+            try { ring_.abort(idx); } catch (...) {}
+        }
+        return false;
+    }
+}
+
+SendResult ProducerImpl::trySubmitLease(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
+                                        std::span<const uint8_t> value, int64_t ackHandle, RejectReason* why,
+                                        uint8_t intent, uint8_t leaseOp, uint8_t leaseKind) noexcept {
+    if (key.empty() || key.size() > static_cast<std::size_t>(kLeaseKeySlot)) {
+        if (why != nullptr) *why = RejectReason::MessageTooLarge;
+        return SendResult::InvalidArgument;
+    }
+    const uint8_t flags = static_cast<uint8_t>((ackHandle != 0 ? kFlagWantAck : 0) | (intent << kFlagIntentShift) |
+                                               (leaseOp << kFlagLeaseOpShift));
+    RejectReason w = RejectReason::None;
+    SendResult r;
+    if (mode_ == IngressMode::Direct) {
+        r = tryAppendLeaseDirect_(topicId, partition, key, value, ackHandle, w, flags, leaseKind);
+    } else if (txnGate_ == TxnGate::Closed) {
+        w = RejectReason::NotInTransaction;
+        r = SendResult::NotInTransaction;
+    } else if (key.size() + value.size() > rune::client::Producer::kMaxRecordBytes) {
+        w = RejectReason::MessageTooLarge;
+        r = SendResult::MessageTooLarge;
+    } else if (static_cast<std::size_t>(kLeaseRecHeaderSize) + value.size() > static_cast<std::size_t>(ring_.maxMsgLength())) {
+        w = RejectReason::ValueTooLarge;
+        r = SendResult::ValueTooLarge;
+    } else if (submitSendLeaseRecord(topicId, partition, key, value, ackHandle, flags, leaseKind)) {
+        r = SendResult::Ok;
+    } else if (ring_.closed()) {
+        w = RejectReason::Closed;
+        r = SendResult::Closed;
+    } else {
+        w = RejectReason::BackPressured;
+        r = SendResult::BackPressured;
+    }
+    if (why != nullptr) *why = r == SendResult::Ok ? RejectReason::None : w;
+    return r;
 }
 
 int64_t ProducerImpl::steadyNowNs_() noexcept {
@@ -589,14 +675,72 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
     return SendResult::Ok;
 }
 
+SendResult ProducerImpl::tryAppendLeaseDirect_(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
+                                               std::span<const uint8_t> value, int64_t ackHandle, RejectReason& why,
+                                               uint8_t flags, uint8_t leaseKind) noexcept {
+    // The lease twin of tryAppendDirect_: the same owner-thread, gate, closed, claim and deferral rules.
+    if (std::this_thread::get_id() != dutyThreadId_) {
+        why = RejectReason::WrongThread;
+        return SendResult::WrongThread;
+    }
+    if (txnGate_ != TxnGate::NotTransactional) [[unlikely]] {
+        if (txnGate_ == TxnGate::Closed || txnIntakeShut_()) {
+            why = RejectReason::NotInTransaction;
+            return SendResult::NotInTransaction;
+        }
+    }
+    if (directClosed_) {
+        why = RejectReason::Closed;
+        return SendResult::Closed;
+    }
+    if (std::holds_alternative<DirectClaimOpen>(directClaim_)) [[unlikely]] {
+        why = RejectReason::ClaimHeld;
+        return SendResult::ClaimHeld;
+    }
+    if (key.size() + value.size() > rune::client::Producer::kMaxRecordBytes) [[unlikely]] {
+        why = RejectReason::MessageTooLarge;
+        return SendResult::MessageTooLarge;
+    }
+    if (inDuty_) [[unlikely]] return deferLeaseRecord_(topicId, partition, key, value, flags, leaseKind, ackHandle, why);
+    if (!deferred_.empty()) [[unlikely]] {
+        if (!settleDeferredFor_(topicId, partition)) {
+            why = RejectReason::PartitionDeferred;
+            return SendResult::BackPressured;
+        }
+        if (const SendResult again = recheckAfterSettle_(); again != SendResult::Ok) {
+            why = again == SendResult::Closed ? RejectReason::Closed : RejectReason::NotInTransaction;
+            return again;
+        }
+    }
+    try {
+        const auto a = appendRecord_(topicId, partition, key.data(), static_cast<uint8_t>(key.size()),
+                                     value.data(), static_cast<uint32_t>(value.size()), flags,
+                                     static_cast<uint64_t>(ackHandle), lastNowNs_, 0, leaseKind);
+        if (a == rune::client::detail::ControlledAction::ABORT) {
+            why = RejectReason::BackPressured;
+            return SendResult::BackPressured;
+        }
+    } catch (const std::length_error&) {
+        why = RejectReason::Unaddressable;
+        return SendResult::InvalidTopic;
+    } catch (...) {
+        why = RejectReason::BackPressured;
+        return SendResult::BackPressured;
+    }
+    why = RejectReason::None;
+    FLIGHT_RECORDER_MARK_PRODUCE(flight_recorder::Site::ClientAppSend, static_cast<uint32_t>(ackHandle));
+    return SendResult::Ok;
+}
+
 void ProducerImpl::enableDirectIngress(const DirectIngress& d) {
     t2Thread_ = d.owner;  // Invoker mode: the owner thread is the Tier-2 issuing thread
     // Clamps: the arena must fit two max-size records and one partition's share
     // must fit one (a legal deferred send can never livelock as back-pressure),
     // and one partition may hold at most its share (default min(arena/2,
     // 4 x batchBytes)) so a stalled partition cannot exhaust the arena.
-    constexpr std::size_t kMaxRec = DeferredArena::recordSize(
-        static_cast<std::size_t>(kRecHeaderSize) + kKeyZeroTrailerBytes + rune::client::Producer::kMaxRecordBytes);
+    constexpr std::size_t kMaxRec = DeferredArena::recordSize(std::max<std::size_t>(
+        static_cast<std::size_t>(kRecHeaderSize) + kKeyZeroTrailerBytes + rune::client::Producer::kMaxRecordBytes,
+        static_cast<std::size_t>(kLeaseRecHeaderSize) + rune::client::Producer::kMaxRecordBytes));   // Task 14a: the lease form too
     const std::size_t want = cfg_.directDeferredBytes > 0
                                  ? static_cast<std::size_t>(cfg_.directDeferredBytes) : 0u;
     // #344/#699: the largest possible claim is one whole builder, so the quarantine reserve is exactly that: an abandon
@@ -672,6 +816,47 @@ SendResult ProducerImpl::deferRecord_(int32_t topicId, int32_t partition,
     }
     why = RejectReason::None;
     return SendResult::Ok;  // the handle (if any) is owned by the producer now
+}
+
+SendResult ProducerImpl::deferLeaseRecord_(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
+                                           std::span<const uint8_t> value, uint8_t flags, uint8_t leaseKind,
+                                           int64_t ackHandle, RejectReason& why) noexcept {
+    // deferRecord_'s lease twin: the arena holds the SEND_LEASE_RECORD bytes (type kMsgSendLeaseRecord).
+    PartitionState* ps = findPartition_(topicId, partition);
+    if (ps == nullptr && partitions_.size() + deferredUnknown_ >= maxPartitions_) {
+        why = RejectReason::Unaddressable;
+        return SendResult::InvalidTopic;
+    }
+    const uint32_t len = static_cast<uint32_t>(kLeaseRecHeaderSize + value.size());
+    const std::size_t size = DeferredArena::recordSize(len);
+    if (ps != nullptr ? ps->deferredBytes + size > deferPartitionCap_
+                      : deferredUnknownBytes_ + size > deferPartitionCap_) {
+        why = RejectReason::DeferredFull;
+        return SendResult::BackPressured;
+    }
+    DeferredHdr h;
+    h.len       = len;
+    h.type      = static_cast<uint8_t>(kMsgSendLeaseRecord);
+    h.flags     = ps == nullptr ? kDefUnknownPartition : uint8_t{0};
+    h.topicId   = topicId;
+    h.partition = partition;
+    h.submitNs  = lastNowNs_;
+    uint8_t* d = pushDeferred_(h);
+    if (d == nullptr) {
+        why = RejectReason::DeferredFull;
+        return SendResult::BackPressured;
+    }
+    writeLeaseRecordHeader(d, topicId, partition, key, flags, leaseKind, ackHandle, static_cast<uint32_t>(value.size()));
+    if (!value.empty()) std::memcpy(d + kLeaseRecValBytesOff, value.data(), value.size());
+    if (ps != nullptr) {
+        ++ps->deferredCount;
+        ps->deferredBytes += static_cast<uint32_t>(size);
+    } else {
+        ++deferredUnknown_;
+        deferredUnknownBytes_ += size;
+    }
+    why = RejectReason::None;
+    return SendResult::Ok;
 }
 
 RejectReason ProducerImpl::deferTier2_(uint32_t slot) noexcept {
@@ -823,6 +1008,8 @@ uint64_t ProducerImpl::takeDeferredHandle_(std::size_t off, bool* tier2, int32_t
     }
     if (tier2 != nullptr) *tier2 = false;
     if (recordCount != nullptr) *recordCount = 1;
+    if (h->type == kMsgSendLeaseRecord) [[unlikely]]
+        return (p[kLeaseRecFlagsOff] & kFlagWantAck) ? static_cast<uint64_t>(readLE64(p, kLeaseRecCorrIdOff)) : 0u;
     return (p[kRecFlagsOff] & kFlagWantAck) ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
 }
 
@@ -910,6 +1097,25 @@ void ProducerImpl::applyDeferred_() noexcept {
                 t2Return_(slot);
                 lostWhat = "(Tier-2 batch) could not be queued";
             }
+        } else if (!keep && h->type == kMsgSendLeaseRecord) {
+            // Task 14a: the lease form (same rules as the plain record below; the kind travels with the record).
+            const uint8_t* p = deferred_.payload(r);
+            const uint8_t flags = p[kLeaseRecFlagsOff];
+            const uint64_t handle = static_cast<uint64_t>(readLE64(p, kLeaseRecCorrIdOff));
+            try {
+                if (failAt != 0 && ++visited >= failAt && visited < failEnd) [[unlikely]] {
+                    throw std::runtime_error("test seam: forced deferred apply failure");
+                }
+                const uint32_t valueLen = readLE32u(p, kLeaseRecValLenOff);
+                const auto a = appendRecord_(h->topicId, h->partition, p + kLeaseRecKeyBytesOff, p[kLeaseRecKeyLenOff],
+                                             p + kLeaseRecValBytesOff, valueLen, flags, handle, h->submitNs, 0,
+                                             p[kLeaseRecKindOff]);
+                if (a == ControlledAction::ABORT) keep = true;
+                else applied = true;
+            } catch (...) {
+                lostRec.handle = (flags & kFlagWantAck) ? handle : 0u;
+                lostWhat = "could not be applied";
+            }
         } else if (!keep) {
             const uint8_t* p = deferred_.payload(r);
             const uint8_t flags = p[kRecFlagsOff];
@@ -987,7 +1193,7 @@ bool ProducerImpl::debugArenaConsistent() noexcept {
         const DeferredHdr* h = deferred_.hdr(r);
         const std::size_t n = DeferredArena::recordSize(h->len);
         if (n < sizeof(DeferredHdr) || r + n > tail) return false;
-        if (h->type != 0 && h->type != kMsgSendRecord && h->type != kMsgTier2Batch) return false;
+        if (h->type != 0 && h->type != kMsgSendRecord && h->type != kMsgSendLeaseRecord && h->type != kMsgTier2Batch) return false;
         if (h->type != 0) {
             ++live;
             if (h->flags & kDefUnknownPartition) {
@@ -1368,6 +1574,14 @@ void ProducerImpl::completeHandle_(uint64_t h, OpKind op, int64_t value, int64_t
                                    uint16_t errorCode, uint32_t constraintId, std::span<const uint8_t> payload,
                                    uint32_t reservedBytes) noexcept {
     if (h == 0 || h == ackhandle::kClaimContinuation) return;   // 0: void; the sentinel is never a handle (defence in depth)
+    if (op == OpKind::Send && leaseWrites_) [[unlikely]] {
+        // Task 14a: a lease write completes as its own kind, whichever path completes it (ack, timeout, discard, close).  A
+        // delivery failure of a lease write is its op timeout (the writer's deliveryTimeoutMs IS the handle's opTimeout).
+        if (const uint8_t k = takeLeaseKind_(h); k != 0) {
+            op = static_cast<OpKind>(k);
+            if (st == OpStatus::DeliveryFailed) st = OpStatus::Timeout;
+        }
+    }
     const bool cq = ackhandle::isCq(h);
     if (cq && hooks_.cqDeliver == nullptr) return;  // bare rig: no registry
     if (!cq && onAck_.kind == AckHandler::Kind::None) return;
@@ -1605,6 +1819,25 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                 return a;
             }
 
+            if (msgTypeId == kMsgSendLeaseRecord) {
+                // Task 14a: the lease form of the SEND_RECORD branch above (key up to 128 bytes, the completion kind).
+                const std::size_t sz = static_cast<std::size_t>(len);
+                if (sz < static_cast<std::size_t>(kLeaseRecHeaderSize)) return ControlledAction::CONTINUE;
+                const uint8_t  keyLen    = p[kLeaseRecKeyLenOff];
+                const uint8_t  flags     = p[kLeaseRecFlagsOff];
+                const uint64_t ackHandle = static_cast<uint64_t>(readLE64(p, kLeaseRecCorrIdOff));
+                const uint32_t valueLen  = readLE32u(p, kLeaseRecValLenOff);
+                FLIGHT_RECORDER_MARK_VAL_PRODUCE(flight_recorder::Site::ClientAgentDrain,
+                                         static_cast<uint32_t>(ackHandle), static_cast<double>(valueLen));
+                if (!leaseMessageFits(sz, keyLen, valueLen)) return ControlledAction::CONTINUE;
+                const ControlledAction a =
+                    appendRecord_(readLE32(p, kLeaseRecTopicIdOff), readLE32(p, kLeaseRecPartOff), p + kLeaseRecKeyBytesOff,
+                                  keyLen, p + kLeaseRecValBytesOff, valueLen, flags, ackHandle, nowNs, 0u,
+                                  p[kLeaseRecKindOff]);
+                if (a == ControlledAction::ABORT) lastDrainStop_ = DrainStop::Blocked;
+                return a;
+            }
+
             if (msgTypeId == kMsgFlush) {
                 // F12: only dirty partitions have anything to flush (O(dirty)).
                 for (const uint32_t slot : dirty_) partitions_[slot]->flushRequested = true;
@@ -1644,6 +1877,13 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                 FLIGHT_RECORDER_MARK_VAL_PRODUCE(flight_recorder::Site::ClientAgentDrain,
                                          static_cast<uint32_t>(ackHandle),
                                          static_cast<double>(static_cast<uint64_t>(n) * recLen));
+                if (guard_.bound && guardBlocks_()) [[unlikely]] {   // Task 15: see appendRecord_
+                    const uint16_t code = static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk);
+                    emitUnsentBatchAck_(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff), static_cast<int32_t>(n),
+                                        OpStatus::DeliveryFailed, n, code);
+                    completeHandle_(ackHandle, OpKind::Send, -1, 0, OpStatus::DeliveryFailed, code, 0, {}, batchCompletionBytes(n));
+                    return ControlledAction::CONTINUE;
+                }
                 PartitionState& ps = getOrCreatePartition(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff));
                 const uint8_t keyLen = p[kRecKeyLenOff];
                 if (admitBatch_(ps, keyLen, n, recLen, ackHandle) == ControlledAction::ABORT) {
@@ -1660,6 +1900,19 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
             }
             if (msgTypeId == kMsgClaimCreditLost) {
                 noteClaimCreditLost_();
+                return ControlledAction::CONTINUE;
+            }
+            if (msgTypeId == kMsgGuardBind) {   // Task 15: in FIFO order with the records before it
+                if (len >= 24 && hooks_.guardBind != nullptr) {
+                    uint32_t sid, slot, gen, armSeq;
+                    int64_t  atRiskNs;
+                    std::memcpy(&sid, p, 4);
+                    std::memcpy(&slot, p + 4, 4);
+                    std::memcpy(&gen, p + 8, 4);
+                    std::memcpy(&armSeq, p + 12, 4);
+                    std::memcpy(&atRiskNs, p + 16, 8);
+                    hooks_.guardBind(hooks_.ctx, *this, sid, slot, gen, armSeq, atRiskNs);
+                }
                 return ControlledAction::CONTINUE;
             }
 
@@ -1831,9 +2084,17 @@ void ProducerImpl::noteAppended_(PartitionState& ps, int32_t firstIndex, int32_t
 
 rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     int32_t topicId, int32_t partition, const uint8_t* keyBytes, uint8_t keyLen,
-    const uint8_t* valBytes, uint32_t valueLen, uint8_t flags, uint64_t ackHandle, int64_t nowNs, uint32_t idStride)
+    const uint8_t* valBytes, uint32_t valueLen, uint8_t flags, uint64_t ackHandle, int64_t nowNs, uint32_t idStride,
+    uint8_t leaseKind)
 {
     using rune::client::detail::ControlledAction;
+    if (guard_.bound && guardBlocks_()) [[unlikely]] {
+        // Task 15: a guarded producer whose lease is at risk (or gone) appends nothing: the record fails at once.
+        const uint16_t code = static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk);
+        emitUnsentBatchAck_(topicId, partition, 1, OpStatus::DeliveryFailed, 1, code);
+        completeHandle_((flags & kFlagWantAck) ? ackHandle : 0u, OpKind::Send, -1, 0, OpStatus::DeliveryFailed, code);
+        return ControlledAction::CONTINUE;
+    }
     PartitionState& ps = getOrCreatePartition(topicId, partition);
     if (admitRecord_(ps, keyLen, valueLen, flags, ackHandle) == ControlledAction::ABORT) {
         return ControlledAction::ABORT;
@@ -1842,7 +2103,14 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     const int32_t index = ps.builder->recordCount();
     const std::string_view kv(reinterpret_cast<const char*>(keyBytes), static_cast<std::size_t>(keyLen));
     const std::string_view vv(reinterpret_cast<const char*>(valBytes), static_cast<std::size_t>(valueLen));
-    ps.builder->append(kv, vv, wallMs(), static_cast<uint8_t>((flags & kFlagIntentMask) >> kFlagIntentShift));
+    uint8_t attrs = static_cast<uint8_t>((flags & kFlagIntentMask) >> kFlagIntentShift);
+    if (leaseKind != 0) [[unlikely]] {   // Task 14a: a lease write - the record's lease op rides in its attribute bits 2-3
+        attrs = rune::protocol::record::withLeaseOp(
+            attrs, static_cast<rune::protocol::record::LeaseOp>((flags & kFlagLeaseOpMask) >> kFlagLeaseOpShift));
+        // The completion kind of this handle; inserted BEFORE the commit (it may grow, i.e. throw).
+        if ((flags & kFlagWantAck) && ackHandle != 0) leaseKinds_.insert(static_cast<int64_t>(ackHandle), leaseKind);
+    }
+    ps.builder->append(kv, vv, wallMs(), attrs);
     // ---- committed: nothing below throws -----------------------------------
     noteAppended_(ps, index, 1, flags, ackHandle, nowNs);
     return ControlledAction::CONTINUE;
@@ -2343,6 +2611,10 @@ int ProducerImpl::flushBatches(
         const uint32_t slot = dirty_[di];
         PartitionState& ps = *partitions_[slot];
         ++flushVisits_;
+        if (guard_.bound && guardBlocks_()) [[unlikely]] {   // Task 15: a blocked guarded producer sends nothing
+            guardFailPartition_(ps, OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk));
+            continue;
+        }
         // ---- EOS-OOS: parked batches whose older batches all resolved go out
         // again FIRST, oldest-first — a new batch sent ahead of them would only
         // meet the same sequence gap.  Back-pressure: nothing new this pass.
@@ -2618,7 +2890,7 @@ constexpr bool isPartitionRefusal_(uint16_t code) noexcept {
 
 void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
                                      int64_t logStartOffset, bool hasVerdicts, std::span<const uint8_t> verdicts,
-                                     uint64_t assignedBase)
+                                     uint64_t assignedBase, std::span<const uint8_t> leases)
 {
     const DutyScope duty(*this);  // fix1 C1
     if (!batchcorr::isBatch(correlationId) || batchcorr::ordinal(correlationId) != ordinal_) return;
@@ -2662,7 +2934,9 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         else
             emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, 0,
                           OpStatus::Ok, units, b->producerEpoch, b->producerId);
-        if (hasVerdicts && !verdicts.empty())
+        if (leaseWrites_) [[unlikely]]   // Task 14a: lease writes - each record from its verdict entry and its lease trailer entry
+            completeLeaseSlice_(ps, b->ackStart, b->ackCount, verdicts, leases, dupSeq, static_cast<uint16_t>(errorCode));
+        else if (hasVerdicts && !verdicts.empty())
             completeVerdictSlice_(ps, b->ackStart, b->ackCount, off, b->tier2, b->atomic, b->recordCount, verdicts, dupSeq ? 0 : assignedBase, b->idStride);
         else if (idsUnknown)   // stored, but the ids are not known: never Ok without them
             completeSlice_(ps, b->ackStart, b->ackCount, off, OpStatus::StoredIdUnknown, static_cast<uint16_t>(errorCode), b->tier2, b->recordCount);
@@ -2811,12 +3085,24 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         FLIGHT_RECORDER_MARK_ARG_VAL_PRODUCE(flight_recorder::Site::ClientRetriable, flight_recorder::foldCorr(correlationId),
                                      static_cast<uint16_t>(ec), 0.0);
         const int64_t hint = logStartOffset > 0 ? logStartOffset : kRetriableBackoffNs;
-        const int64_t backoffNs = std::min<int64_t>(std::max<int64_t>(hint, 1'000'000LL), cfg_.produceTimeoutMs * 1'000'000LL);
-        b->attemptDeadlineNs = lastNowNs_ + backoffNs;
-        b->retriableBackoff  = true;
-        ++throttledBackoffs_;
-        if (b->attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b->attemptDeadlineNs;
-        return;
+        // A retry-after at or past the batch's delivery deadline can never be retried in time (a lease topic's rebirth
+        // fence): fail it NOW instead of parking it (it would block the partition, then time out in doubt).
+        const int64_t deadline = b->firstSendNs + cfg_.deliveryTimeoutMs * 1'000'000LL;
+        if (lastNowNs_ + hint >= deadline) {
+            ++throttledFailFast_;
+            if (b->attempts == 1) {
+                failRefusedBeforeAppend_(ps, b, ec, units);
+                return;
+            }
+            // A retransmit: an earlier attempt may be stored - falls through to the outcome-unknown path (D) below.
+        } else {
+            const int64_t backoffNs = std::min<int64_t>(std::max<int64_t>(hint, 1'000'000LL), cfg_.produceTimeoutMs * 1'000'000LL);
+            b->attemptDeadlineNs = lastNowNs_ + backoffNs;
+            b->retriableBackoff  = true;
+            ++throttledBackoffs_;
+            if (b->attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b->attemptDeadlineNs;
+            return;
+        }
     }
     // Phase 2b E2 (ruling 2): TransientLogFull (42) — the leader's transient
     // ring is full of not-yet-replicated records; definitely not appended, the
@@ -2848,26 +3134,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     if (ec >= static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed) &&
         ec <= static_cast<int16_t>(rune::protocol::client::ErrorCode::PasswordChangeRequired) &&
         b->attempts == 1) {
-        // The newest sequences were never used: give them back, so the next batch continues the sequence.
-        // Otherwise the later in-flight batches meet the gap (OutOfOrderSequence) and C3 re-sequences them.
-        const bool givenBack = b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch &&
-                               b->baseSequence + b->recordCount == ps.nextBaseSequence;
-        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
-                      OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
-        // #700: a batch definitely not appended whose sequence is given back leaves no gap: the transaction can abort
-        // without an epoch bump.  A batch behind a newer one in flight keeps its sequence (a gap): BumpEpoch.
-        txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec),
-                     givenBack ? AbortKind::Plain : AbortKind::BumpEpoch);
-        completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
-                       static_cast<uint16_t>(ec), b->tier2, b->recordCount);
-        if (givenBack) ps.nextBaseSequence = b->baseSequence;
-        releaseResolved_(ps, *b);
-        reclaimAckRing_(ps);
-        if (isPartitionRefusal_(static_cast<uint16_t>(ec))) {
-            failBuilder_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));   // #689
-            // #689: the queued Tier-2 batches go too - none is sent to a refused partition
-            failQueuedTier2_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));
-        }
+        failRefusedBeforeAppend_(ps, b, ec, units);
         return;
     }
     // D: rejected, but an earlier attempt may be stored — outcome unknown (44..47 after a retransmit too).
@@ -2877,6 +3144,29 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
                    static_cast<uint16_t>(ec), b->tier2, b->recordCount);
     markUnresolved_(ps, *b);
+    releaseResolved_(ps, *b);
+    reclaimAckRing_(ps);
+    if (isPartitionRefusal_(static_cast<uint16_t>(ec))) {
+        failBuilder_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));   // #689
+        // #689: the queued Tier-2 batches go too - none is sent to a refused partition
+        failQueuedTier2_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));
+    }
+}
+
+void ProducerImpl::failRefusedBeforeAppend_(PartitionState& ps, InFlightBatch* b, int16_t ec, uint32_t units) noexcept {
+    // The newest sequences were never used: give them back, so the next batch continues the sequence.
+    // Otherwise the later in-flight batches meet the gap (OutOfOrderSequence) and C3 re-sequences them.
+    const bool givenBack = b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch &&
+                           b->baseSequence + b->recordCount == ps.nextBaseSequence;
+    emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
+                  OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
+    // #700: a batch definitely not appended whose sequence is given back leaves no gap: the transaction can abort
+    // without an epoch bump.  A batch behind a newer one in flight keeps its sequence (a gap): BumpEpoch.
+    txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec),
+                 givenBack ? AbortKind::Plain : AbortKind::BumpEpoch);
+    completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
+                   static_cast<uint16_t>(ec), b->tier2, b->recordCount);
+    if (givenBack) ps.nextBaseSequence = b->baseSequence;
     releaseResolved_(ps, *b);
     reclaimAckRing_(ps);
     if (isPartitionRefusal_(static_cast<uint16_t>(ec))) {
@@ -3237,6 +3527,51 @@ void ProducerImpl::completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, 
                             std::span<const uint8_t>(claimVerdictScratch_.data(), k * 8), bytes);
         }
         i += span - 1;
+    }
+}
+
+void ProducerImpl::completeLeaseSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, std::span<const uint8_t> verdicts,
+                                       std::span<const uint8_t> leases, bool dupSeq, uint16_t dupCode) noexcept {
+    // Task 14a (spec 6.3): one record per lease write.  Per record i:
+    //   a dupSeq answer (a retry outside the dedupe window)  -> VerdictUnknown (stored, the verdict is gone);
+    //   a verdict entry (code c)                              -> RecordsRejected / c, except DuplicateSequence (21) on a
+    //                                                            LeaseGrant -> VerdictUnknown (the grant may have been stored);
+    //   accepted                                              -> Ok with value = leaseVersion, aux = ttlMs from trailer entry i;
+    //                                                            no such entry -> StoredIdUnknown (never Ok without the version).
+    const auto le16 = [](const uint8_t* p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); };
+    const auto le32 = [](const uint8_t* p) {
+        return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+    };
+    constexpr uint16_t kDuplicateSequence = static_cast<uint16_t>(rune::protocol::client::ErrorCode::DuplicateSequence);
+    const std::size_t nv = verdicts.size() / 8;
+    const std::size_t nl = leases.size() / 16;
+    std::size_t next = 0;   // verdict entries are in ascending record order
+    for (int32_t i = 0; i < ackCount; ++i) {
+        uint64_t h = 0;
+        const int32_t span = takeHandleSpan_(ps, ackStart, i, ackCount, h);
+        i += span - 1;
+        const int32_t rec = i - (span - 1);
+        while (next < nv && le16(verdicts.data() + next * 8) < static_cast<uint16_t>(rec)) ++next;
+        if (h == 0) continue;
+        const uint8_t k = takeLeaseKind_(h);
+        const OpKind op = k != 0 ? static_cast<OpKind>(k) : OpKind::Send;
+        if (dupSeq) {
+            completeHandle_(h, op, -1, 0, OpStatus::VerdictUnknown, dupCode);
+        } else if (next < nv && le16(verdicts.data() + next * 8) == static_cast<uint16_t>(rec)) {
+            const uint8_t* e = verdicts.data() + next * 8;
+            ++next;
+            const uint16_t code = le16(e + 2);
+            if (code == kDuplicateSequence && op == OpKind::LeaseGrant)
+                completeHandle_(h, op, -1, 0, OpStatus::VerdictUnknown, code, le32(e + 4));
+            else
+                completeHandle_(h, op, -1, 0, OpStatus::RecordsRejected, code, le32(e + 4));
+        } else if (static_cast<std::size_t>(rec) < nl) {
+            const uint8_t* e = leases.data() + static_cast<std::size_t>(rec) * 16;
+            completeHandle_(h, op, readLE64(e, 0), readLE64(e, 8), OpStatus::Ok, 0);
+        } else {
+            ++leaseTrailerMissing_;
+            completeHandle_(h, op, -1, 0, OpStatus::StoredIdUnknown, 0);
+        }
     }
 }
 
@@ -3622,6 +3957,13 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
                 const int32_t part = readLE32(p, kRecPartOff);
                 emitUnsentBatchAck_(tid, part, 1, st, 1, errorCode);
                 completeHandle_(h, OpKind::Send, -1, 0, st, errorCode);
+            } else if (type == kMsgSendLeaseRecord && len >= kLeaseRecHeaderSize &&
+                       leaseMessageFits(len, p[kLeaseRecKeyLenOff], readLE32u(p, kLeaseRecValLenOff))) {
+                // Task 14a: a lease write never sent (the kind is taken from the handle in completeHandle_).
+                const uint64_t h = (p[kLeaseRecFlagsOff] & kFlagWantAck)
+                                       ? static_cast<uint64_t>(readLE64(p, kLeaseRecCorrIdOff)) : 0u;
+                emitUnsentBatchAck_(readLE32(p, kLeaseRecTopicIdOff), readLE32(p, kLeaseRecPartOff), 1, st, 1, errorCode);
+                completeHandle_(h, OpKind::Send, -1, 0, st, errorCode);
             } else if (type == kMsgTier2Batch && len >= kT2TokenSize) {
                 const uint32_t slot = static_cast<uint32_t>(readLE64(p, 0));
                 const Tier2Slot& e = tier2Pool_[slot];
@@ -3682,7 +4024,7 @@ int ProducerImpl::refuseRingTxn_(int limit) noexcept {
         [&](int32_t type, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
             aeron::util::index_t len) -> ControlledAction {
             const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
-            if (type != kMsgSendRecord && type != kMsgTier2Batch && type != kMsgClaimBatch && type != kMsgFlush &&
+            if (type != kMsgSendRecord && type != kMsgSendLeaseRecord && type != kMsgTier2Batch && type != kMsgClaimBatch && type != kMsgFlush &&
                 type != kMsgTier2Discard && type != kMsgClaimCreditLost) {
                 // Not ours (Task 8: kMsgTxnControl - an abort issued in AbortableError arrives HERE): left in the
                 // ring for the normal drain to apply.  Swallowing it would leave its op pending for ever.
@@ -3693,6 +4035,13 @@ int ProducerImpl::refuseRingTxn_(int limit) noexcept {
                 const uint64_t h = (p[kRecFlagsOff] & kFlagWantAck) ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
                 emitBatchAck_(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff), -1, 1, -1, BatchAck::kClientFailure,
                               o.status, 1, -1);
+                if (h != 0) completeHandle_(h, OpKind::Send, -1, 0, o.status, o.errorCode);
+                else ++voids;
+            } else if (type == kMsgSendLeaseRecord && len >= kLeaseRecHeaderSize &&
+                       leaseMessageFits(len, p[kLeaseRecKeyLenOff], readLE32u(p, kLeaseRecValLenOff))) {
+                const uint64_t h = (p[kLeaseRecFlagsOff] & kFlagWantAck) ? static_cast<uint64_t>(readLE64(p, kLeaseRecCorrIdOff)) : 0u;
+                emitBatchAck_(readLE32(p, kLeaseRecTopicIdOff), readLE32(p, kLeaseRecPartOff), -1, 1, -1,
+                              BatchAck::kClientFailure, o.status, 1, -1);
                 if (h != 0) completeHandle_(h, OpKind::Send, -1, 0, o.status, o.errorCode);
                 else ++voids;
             } else if (type == kMsgTier2Batch && len >= kT2TokenSize) {
@@ -3728,6 +4077,42 @@ int ProducerImpl::refuseRingTxn_(int limit) noexcept {
         poison_(o.status, o.errorCode, AbortKind::Plain);
     }
     return n;
+}
+
+bool ProducerImpl::submitGuardBind(uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq, int64_t atRiskNs) noexcept {
+    if (hooks_.guardBind == nullptr || guardBindIssued_) return false;
+    if (mode_ == IngressMode::Direct) {
+        // Direct ingress: the owner IS the duty thread and appends in place - the bind is applied here, in the owner's own
+        // program order with its writes (no ring hop to reorder against).
+        if (std::this_thread::get_id() != dutyThreadId_) return false;
+        guardBindIssued_ = true;
+        hooks_.guardBind(hooks_.ctx, *this, sid, slot, gen, armSeq, atRiskNs);
+        return true;
+    }
+    uint8_t p[24];
+    std::memcpy(p, &sid, 4);
+    std::memcpy(p + 4, &slot, 4);
+    std::memcpy(p + 8, &gen, 4);
+    std::memcpy(p + 12, &armSeq, 4);
+    std::memcpy(p + 16, &atRiskNs, 8);
+    if (!writeToRing(kMsgGuardBind, p, sizeof p)) return false;   // FIFO with this producer's records
+    guardBindIssued_ = true;
+    return true;
+}
+
+void ProducerImpl::guardFailPartition_(PartitionState& ps, OpStatus st, uint16_t errorCode) noexcept {
+    ps.inflight.forEachLive([&](InFlightBatch& b) { failBatch_(ps, b, st, errorCode); });
+    failBuilder_(ps, st, errorCode);
+    failQueuedTier2_(ps, st, errorCode);
+    ps.builderBytes   = 0;
+    ps.batchStartNs   = 0;
+    ps.flushRequested = false;
+    ps.resendParked   = false;
+    ps.routeResend    = false;
+    ps.routeParked    = false;
+    ps.laneWait       = false;
+    ps.dirty          = false;
+    reclaimAckRing_(ps);
 }
 
 void ProducerImpl::failRoutedBroker(RouteFailFn pred, void* ctx) noexcept {

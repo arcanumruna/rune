@@ -206,6 +206,8 @@ struct PartitionConfig {
     /// Checked writes Part 06: producer-state batches kept per producer; an autoincrement topic keeps the whole
     /// retry window, any other topic only the latest batch.
     int  producerTailDepth = 1;
+    /// Lease topic: the cleaner compacts it in CleanerTopicMode::Lease (keeps the live grant and the live version's checkpoint).
+    bool leaseTopic = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -565,6 +567,8 @@ public:
     [[nodiscard]] int64_t followerStorageForTest(NodeId n) const noexcept { return slotStorage_(n); }   // ISR v3 Step 6
     /// TEST ONLY (ISR v3 Step 7): append() refuses (kAppendNotLeader) while set - a leader whose append is refused.
     void setAppendRefusedForTest(bool on) noexcept { appendRefusedForTest_ = on; }
+    /// TEST ONLY (lease topics Task 11a): appendLeaseBatch throws std::system_error while set - a failed storage under the broker's own append.
+    void setLeaseAppendThrowForTest(bool on) noexcept { leaseAppendThrowForTest_ = on; }
     /// TEST ONLY (ISR v3 Step 9, B-I8): emit no follower fetch / ack until the steady clock reaches `deadlineNs`.
     void holdFetchesUntilForTest(int64_t deadlineNs) noexcept { fetchHoldUntilNs_ = deadlineNs; }
     /// TEST SEAM (CP2 C1-R): ignore inbound internal-ISR proposals until this steady-clock time (a dead link from the leader).
@@ -633,6 +637,15 @@ public:
     /// True iff `bytes` is exactly one whole, CRC-valid record batch with the
     /// CONTROL attribute — i.e. a prebuilt txn marker.
     [[nodiscard]] static bool isControlBatch(std::span<const uint8_t> bytes) noexcept;
+
+    /// The data-batch sibling of appendControlBatch (lease Expire / Checkpoint, spec 9.1): a whole, CRC-valid, NON-control
+    /// magic-2 batch, appended as is (no makeBatch_ wrapping), acks=all.  Same gates and post-append sequence as
+    /// appendControlBatch.  Returns the base offset, or kAppendNotLeader / kAppendInvalidBatch / kAppendMinIsr /
+    /// kAppendBackPressure (in-memory ring full).  Nothing is appended on any refusal.
+    Offset appendLeaseBatch(std::span<const uint8_t> batch);
+
+    /// True iff `batch` is exactly one whole, CRC-valid record batch with neither the CONTROL nor the TRANSACTIONAL attribute.
+    [[nodiscard]] static bool isLeaseDataBatch(std::span<const uint8_t> batch) noexcept;
 
     /// CP-1: append a single record with an explicit (non-empty) key.
     ///
@@ -914,6 +927,11 @@ public:
     void publishCleanerVerdictBound(Offset bound) noexcept { publishedVerdictBound_.store(bound, std::memory_order_release); }
     [[nodiscard]] Offset cleanerVerdictBound() const noexcept { return publishedVerdictBound_.load(std::memory_order_acquire); }
     [[nodiscard]] Offset cleanerVerdictMarkerEnd() const noexcept { return publishedVerdictMarkerEnd_.load(std::memory_order_acquire); }
+    // Checked writes: a typed partition (it has a write state) is served by its leader only: a follower holds no verdict state
+    // (plan 04, P4-1), so Worker::verdictBound_ delivers nothing there.  The owning worker publishes that bit (exactly its
+    // fail-closed rule) and the gateway moves such a subscription off a demoted leader.
+    void publishLeaderOnlyReads(bool on) noexcept { publishedLeaderOnlyReads_.store(on, std::memory_order_release); }
+    [[nodiscard]] bool gatewayLeaderOnlyReads() const noexcept { return publishedLeaderOnlyReads_.load(std::memory_order_acquire); }
     // Part 11: the cleaner may remove a TxnJudge (type 19) only below this offset (the owning worker's judge: every member checkpoint
     // is past it).  0 (the default) = keep every one.
     void publishCleanerTxnJudgeBound(Offset bound) noexcept { publishedTxnJudgeBound_.store(bound, std::memory_order_release); }
@@ -1066,6 +1084,7 @@ public:
     /// Log-start-offset: segments entirely below this are deleted. 0 = disabled.
     [[nodiscard]] int64_t     logStartOffset()         const noexcept { return cfg_.logStartOffset; }
     [[nodiscard]] int         producerTailDepth()      const noexcept { return cfg_.producerTailDepth; }
+    [[nodiscard]] bool        leaseTopic()             const noexcept { return cfg_.leaseTopic; }
     /// CP-2: offset up to which the log has already been compacted (cleaned watermark).
     /// Initially 0; advanced by runBoundedCompaction after each segment is cleaned.
     /// Atomic so test threads can poll without a TSan race (cleaner/duty threads write it).
@@ -1388,7 +1407,38 @@ public:
     /// the current high watermark before an append that bypasses this replica
     /// (the worker produce path appends to memoryLog() directly).  No-op on a
     /// disk partition.  Owner thread.
-    void prepareTransientAppend() noexcept { refreshTransientEvictionFloor_(); }
+    void prepareTransientAppend() noexcept {
+        refreshTransientEvictionFloor_();
+        // Lease topics (spec A.4): only CLIENT appends (appendNoSyncRestamp) see the
+        // reserve, and only on the leader; broker appends and replication never do.
+        if (memoryBacked_)
+            memLog_->setProduceReserve(role_ == Role::Leader && leaseTransient_ ? leaseReserveBytes_ : 0);
+    }
+    /// Lease topics (spec A.3/A.4), owner thread, memory-backed only: arm the lease
+    /// floors and the produce reserve (max(capacity / 8, 64 KiB)).  Off = plain transient.
+    void setLeaseTransient(bool on) noexcept {
+        if (!memoryBacked_ || memLog_ == nullptr) return;
+        leaseTransient_ = on;
+        leaseReserveBytes_ = on ? std::max<std::size_t>(memLog_->capacityBytes() / 8, 64U * 1024U) : 0;
+        // A lease-transient leader evicts nothing until its worker's first duty pass pushes the real floor (a new leader must never
+        // evict an anchor before its lease index is ready); a plain transient partition has no lease floor.
+        leaseFloor_ = on ? Offset{0} : kNoLeaseFloor;
+        refreshTransientEvictionFloor_();
+    }
+    [[nodiscard]] bool leaseTransient() const noexcept { return leaseTransient_; }
+    [[nodiscard]] std::size_t leaseReserveBytes() const noexcept { return leaseReserveBytes_; }
+    /// The leader's lease floor (min of the head anchor and the fence anchor, A.3/A.6);
+    /// kNoLeaseFloor = none.  Kept by the worker's lease runtime.
+    void setLeaseFloor(Offset floor) noexcept { leaseFloor_ = floor; refreshTransientEvictionFloor_(); }
+    [[nodiscard]] Offset leaseFloor() const noexcept { return leaseFloor_; }
+    [[nodiscard]] Offset leaderLogStartForTest() const noexcept { return leaderLogStart_; }
+    /// Ring bytes held from offset `o` on (InMemoryLog::bytesFrom); 0 when disk-backed.
+    [[nodiscard]] std::size_t transientBytesFrom(Offset o) const noexcept {
+        return memoryBacked_ && memLog_ != nullptr ? memLog_->bytesFrom(o) : 0;
+    }
+    [[nodiscard]] std::size_t transientCapacityBytes() const noexcept {
+        return memoryBacked_ && memLog_ != nullptr ? memLog_->capacityBytes() : 0;
+    }
     /// Follower ring restarts at the leader's ring start / replicated applies the ring refused.
     [[nodiscard]] uint64_t transientLogResetsForTest() const noexcept { return transientLogResets_; }
     [[nodiscard]] uint64_t transientApplyRefusalsForTest() const noexcept {
@@ -1406,9 +1456,21 @@ private:
     uint64_t transientApplyTooLargeRefusals_ = 0;
     /// The ring never evicts at/above what is not committed: the leader's HW
     /// (min-ISR-gated served HW), a follower's followerHw_.
+    /// Lease topics (A.3): the leader also keeps min(HW, leaseFloor_); a follower
+    /// also keeps what the leader still holds (leaderLogStart_).
     void refreshTransientEvictionFloor_() noexcept {
-        if (memoryBacked_) memLog_->setEvictionFloor(role_ == Role::Leader ? highWatermark() : followerHw_);
+        if (!memoryBacked_) return;
+        if (role_ == Role::Leader) memLog_->setEvictionFloor(leaseTransient_ ? std::min(highWatermark(), leaseFloor_) : highWatermark());
+        else memLog_->setEvictionFloor(leaseTransient_ ? std::min(followerHw_, leaderLogStart_) : followerHw_);
     }
+    void resetLeaderLogStart_() noexcept {
+        leaderLogStart_ = memoryBacked_ && memLog_ != nullptr ? memLog_->logStartOffset() : 0;
+    }
+    static constexpr Offset kNoLeaseFloor = std::numeric_limits<Offset>::max();
+    bool        leaseTransient_    = false;
+    std::size_t leaseReserveBytes_ = 0;
+    Offset      leaseFloor_        = kNoLeaseFloor;
+    Offset      leaderLogStart_    = 0;
     /// Kafka leader-epoch stamp of the ACTIVE log (disk Log or ring).
     void stampEpochOnLog_(int32_t epoch) noexcept {
         if (memoryBacked_) { if (memLog_ != nullptr) memLog_->setLeaderEpochStamp(epoch); }
@@ -1418,8 +1480,9 @@ private:
     /// is committed by THIS frame already — free it before the append, so a ring
     /// full of records the frame commits is not refused for a wasted round trip.
     void refreshTransientApplyFloor_(Offset leaderHw) noexcept {
-        if (memoryBacked_)
-            memLog_->setEvictionFloor(std::max(followerHw_, std::min(logEndOffset_(), leaderHw)));
+        if (!memoryBacked_) return;
+        const Offset base = std::max(followerHw_, std::min(logEndOffset_(), leaderHw));
+        memLog_->setEvictionFloor(leaseTransient_ ? std::min(base, leaderLogStart_) : base);
     }
     /// A replicated apply the ring refused (`rc` < 0): kRefusedFull is counted and
     /// logged (rate-limited) — retried once the HW moves; kRefusedTooLarge (a batch
@@ -1920,6 +1983,7 @@ private:
     int64_t proposalSeq_ = 0;                  ///< never reset; id = ++proposalSeq_
     int64_t storageId_ = 0;                    ///< this node's storage id (setStorageId)
     bool    appendRefusedForTest_ = false;     ///< setAppendRefusedForTest
+    bool    leaseAppendThrowForTest_ = false;  ///< setLeaseAppendThrowForTest
     int64_t dropInternalIsrUntilNs_ = 0;       ///< dropInternalIsrUntilForTest (0 = off)
     int64_t fetchHoldUntilNs_ = 0;             ///< holdFetchesUntilForTest (steady-clock ns, 0 = off)
     uint64_t olderSendAnswers_ = 0;            ///< answers to an older send of the pending proposal
@@ -2167,6 +2231,7 @@ private:
     std::atomic<Offset> publishedTxnJudgeBound_{0};   // Part 11: until the worker publishes, no TxnJudge is removed
     Offset retentionHold_ = std::numeric_limits<Offset>::max();   // owner thread only
     std::atomic<Offset> publishedVerdictMarkerEnd_{0};
+    std::atomic<bool>   publishedLeaderOnlyReads_{false};   ///< publishLeaderOnlyReads (owner: the worker)
     // D3b fix round 1: min fetch position over every assigned replica — see
     // cleanerMarkerRemovalBound().  0 until the first leader publication.
     std::atomic<Offset> publishedMarkerBoundForCleaner_{0};

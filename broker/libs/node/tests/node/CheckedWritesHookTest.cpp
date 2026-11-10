@@ -440,6 +440,23 @@ TEST(CheckedWritesHook, TopicFactsTakeTheSpecAndTheLoggedSet) {
     EXPECT_FALSE(topicHookFactsOf(h.state).keyIndexActive) << "the key index is member 0 or the fact is false";
 }
 
+TEST(CheckedWritesHookRegression, ProvidesKeyIndexRegression) {
+    using K = rune::view::VerdictViewKind;
+    EXPECT_TRUE(providesKeyIndex(K::KeyIndex));
+    EXPECT_TRUE(providesKeyIndex(K::LeaseIndex));
+    EXPECT_FALSE(providesKeyIndex(K::Unique));
+    EXPECT_FALSE(providesKeyIndex(K::Check));
+    EXPECT_FALSE(providesKeyIndex(K::TestReject));
+    Hooked h;
+    ConstraintSet lease;
+    lease.id = 3;
+    lease.count = 1;
+    lease.members[0] = ConstraintSetMember{0, K::LeaseIndex, kKeyIndexPlanFingerprint};
+    h.state.constraintSets.onChange(7, lease);
+    EXPECT_TRUE(topicHookFactsOf(h.state).keyIndexActive) << "a logged set whose member 0 is the lease index";
+    EXPECT_FALSE(topicHookFactsOf(h.state).keyIndex) << "the spec's key.index fact is unchanged";
+}
+
 TEST(CheckedWritesHook, AnIntentWaitsForTheLoggedKeyIndexThenPasses) {
     Hooked h;
     h.spec.keyIndex = true;

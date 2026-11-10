@@ -158,7 +158,7 @@ WalkOut walkView(const rune::storage::LogReadView& view, int64_t from, int64_t b
             }
         }
         bool stopped = false;
-        r.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t /*timestamp*/) {
+        r.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t /*timestamp*/, uint8_t attributes) {
             if (stopped) return;
             if (offset >= bound) { stopped = true; return; }   // never fold past the bound
             if (offset < from) return;                         // folded by a previous (mid-batch-stopped) pass
@@ -166,7 +166,10 @@ WalkOut walkView(const rune::storage::LogReadView& view, int64_t from, int64_t b
                 ++stats.skippedRejected;   // the judge rejected it: no view ever applies it
                 return;
             }
-            onRecord(key, value, offset);
+            // Lease topics (spec 6.6): a Checkpoint is invisible, a Revoke/Expire folds as an empty value (a delete).
+            std::string_view v = value;
+            if (!leaseDataView(skip.traits, attributes, v)) [[unlikely]] { ++stats.skippedControl; return; }
+            onRecord(key, v, offset);
         });
         if (stopped) {
             // P11-9: the pass cap cut an atomic batch; reads hold until the next pass applies the rest.

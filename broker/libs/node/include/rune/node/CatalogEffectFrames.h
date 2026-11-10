@@ -42,6 +42,10 @@ namespace rune::node {
 [[nodiscard]] std::optional<std::string> viewEffectFramesError(const rune::catalog::ViewObject& v,
                                                                const rune::catalog::CatalogState& state,
                                                                std::size_t maxFrame);
+/// A lease topic's lease view (kind LeaseIndex): a plan-less sink, so only its TopicApplied frame is sized.
+[[nodiscard]] std::optional<std::string> leaseViewEffectFramesError(const rune::catalog::ViewObject& v,
+                                                                    const rune::catalog::CatalogState& state,
+                                                                    std::size_t maxFrame);
 /// Every frame the LIVE effects of `e` (applied as `a`, `after` = the state it
 /// produced) post.  nullopt = all fit.
 [[nodiscard]] std::optional<std::string> eventEffectFramesError(const rune::catalog::CatalogState& after,

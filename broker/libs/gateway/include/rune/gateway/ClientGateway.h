@@ -1,4 +1,5 @@
 #pragma once
+#include <limits>
 #include <rune/storage/ZeroedBytes.h>
 #include <rune/consensus/PeerResolution.h>
 
@@ -659,6 +660,10 @@ public:
         const Session* s = sessions_.find(sid);
         const auto* a = s ? std::get_if<rune::gateway::AuthAuthenticated>(&s->auth) : nullptr;
         return a ? &a->perms.table() : nullptr;
+    }
+    /// Test seam: the namespace gate of an existing session (what an upserted suspended namespace sets; RejectAll would also revoke it).
+    void setSessionNsGateForTest(int64_t sid, rune::catalog::NsStateTag tag) {
+        if (Session* s = sessions_.find(sid)) s->nsGate = tag;
     }
     /// Test seam: the auth state of an existing session.
     void setSessionAuthForTest(int64_t sid, rune::gateway::SessionAuth a) {
@@ -1430,6 +1435,35 @@ public:
     }
     /// Sessions ever accepted (monotonic; control thread).
     [[nodiscard]] uint64_t sessionsAllocated() const noexcept { return sessions_.sessionsAllocated(); }
+    /// L22 Part B counters (control thread): notices offered / the same (channel, stream, session) already pending / table full or no room / not
+    /// done within kUnknownSessionNoticeAbandonNs.
+    [[nodiscard]] uint64_t unknownSessionNoticesSent() const noexcept { return unknownSessionNoticesSent_; }
+    [[nodiscard]] uint64_t unknownSessionNoticesDeduped() const noexcept { return unknownSessionNoticesDeduped_; }
+    [[nodiscard]] uint64_t unknownSessionNoticesDropped() const noexcept { return unknownSessionNoticesDropped_; }
+    [[nodiscard]] uint64_t unknownSessionNoticesAbandoned() const noexcept { return unknownSessionNoticesAbandoned_; }
+    /// Test seam: the notice path of a Ping for an unknown session, for a given declared channel + stream (no real Ping needed).
+    int answerUnknownSessionForTest(std::string_view channel, int32_t streamId, int64_t sid, int64_t correlationId, int64_t nowNs) {
+        return static_cast<int>(answerUnknownSession_(channel, streamId, sid, correlationId, nowNs));
+    }
+    int pollUnknownSessionNoticesForTest(int64_t nowNs) { return pollUnknownSessionNotices_(nowNs); }
+    /// Marks a session encrypted without keys (U2 test: a clear frame is dropped before any AEAD attempt, so none is needed).
+    bool markSessionEncryptedForTest(int64_t sid) noexcept {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr) return false;
+        s->crypto.encrypted = true;
+        return true;
+    }
+    [[nodiscard]] std::size_t pendingNoticeCountForTest() const noexcept {
+        std::size_t n = 0;
+        for (const auto& e : unknownNotices_) n += e.state != NoticeState::Free ? 1u : 0u;
+        return n;
+    }
+    /// The channel of the i-th non-free notice entry (after a resolve: the address form).
+    [[nodiscard]] std::string pendingNoticeChannelForTest(std::size_t i) const {
+        for (const auto& e : unknownNotices_)
+            if (e.state != NoticeState::Free && i-- == 0) return std::string(e.channel.data(), e.channelLen);
+        return {};
+    }
 
     // -----------------------------------------------------------------------
     // subscriptionCount — number of active subscriptions (for tests).
@@ -1476,6 +1510,13 @@ public:
     /// keep the vector sorted by view id; the read is a lower_bound (zero-alloc).
     void noteViewSource(int32_t viewTopicId, int32_t sourceTopicId);
     void forgetViewSource(int32_t viewTopicId);
+    /// Lease topics Task 13a: the lease topic of lease view `viewTopicId` (`<topic>.leases`), -1 when it is not one.  ONE source of truth:
+    /// the TopicRegistry's view-sink spec (TopicSpec::leaseSourceTopicId, from the catalog), so it dies with dropTopic and cannot leak.
+    /// A read of a lease view is authorised as READ on its SOURCE topic (spec 7.1, 14.1): a VIEW grant on the lease view is not consulted.
+    [[nodiscard]] int32_t leaseSourceOfView_(int32_t viewTopicId) const noexcept;
+    /// The authorisation of a view read: READ on the source topic for a lease view, READ on the view otherwise.
+    [[nodiscard]] std::optional<rune::gateway::Denial> authorizeViewRead_(const rune::gateway::PermissionTable& perms,
+                                                                           int32_t viewTopicId) const;
     [[nodiscard]] int32_t viewSourceOf_(int32_t viewTopicId) const noexcept;   // -1 = unknown
     [[nodiscard]] int32_t nthViewSinkOfSource_(int32_t sourceTopicId, std::size_t n) const noexcept;   // -1 = none
     [[nodiscard]] bool viewSinkAwaitingPlan(int32_t viewTopicId) const noexcept {
@@ -1557,6 +1598,10 @@ public:
     void applyGetViewRowKForTest(const uint8_t* buf, std::size_t len) { handleGetViewRowK(buf, len); }
     void applyScanViewRowsForTest(const uint8_t* buf, std::size_t len) { handleScanViewRows(buf, len); }
     void applyGetStatsForTest(const uint8_t* buf, std::size_t len) { handleGetStats(buf, len); }
+    [[nodiscard]] uint64_t leaseReturnMalformed() const noexcept { return leaseReturnMalformed_; }
+    void applyLeaseKeepAliveForTest(const uint8_t* buf, std::size_t len) { handleLeaseKeepAlive(buf, len); }
+    void applyLeaseTimeToLiveForTest(const uint8_t* buf, std::size_t len) { handleLeaseTimeToLive(buf, len); }
+    void applyScanLeasesForTest(const uint8_t* buf, std::size_t len) { handleScanLeases(buf, len); }
     [[nodiscard]] uint64_t rejectedRequestsForTest() const noexcept { return rejectedRequests_; }
     // No-hang fix round 2: inject a session with a NON-NULL placeholder egress
     // (never dereferenced: makeForTest's TestEgressFn intercepts every offer of
@@ -1854,6 +1899,8 @@ private:
         // (WorkerOp::freshCursor) so a transient ring start above it is not
         // counted / warned as a reader that fell behind.
         bool cursorFresh = true;
+        /// The client asked for Earliest (resolved to the partition start): sent with every PushRead (WorkerOp::fromEarliest).
+        bool fromEarliest = false;
         const rune::replication::PartitionReplica* transientReplica = nullptr;
         uint64_t transientClassRegGen = UINT64_MAX;
         uint64_t transientClassCatGen = UINT64_MAX;
@@ -1998,7 +2045,7 @@ private:
     void forwardSubscribeToWorker_(int64_t subId, int64_t sessionId, int32_t topicId,
                                    int32_t partition, int64_t nextOffset, uint8_t isolation,
                                    bool isGroup, bool groupCarrierReceived,
-                                   int64_t subscribeCorrId = 0);
+                                   int64_t subscribeCorrId = 0, bool fromEarliest = false);
     /// Forget subscription `subId` on its owning worker (queued behind its Subscribe, never dropped).  Issue #109:
     /// `endCode` != 0 ENDS it - the worker emits ErrorResponse{endCode, its Subscribe correlation id, endDetail} after
     /// its last Records.  Returns true when the worker owns the end (the caller must not answer it); false when the
@@ -2028,6 +2075,7 @@ private:
         uint8_t isolation          = 0;
         bool    isGroup            = false;
         bool    groupCarrierReceived = false;
+        bool    fromEarliest       = false;  // the client asked for Earliest (resolved to the start): see WorkerOp::fromEarliest
     };
     struct PendingRecordEgress {
         int64_t regId         = -1;  // addExclusivePublication registration (in flight)
@@ -2150,6 +2198,17 @@ private:
     void handleScanViewRows (const uint8_t* buf, std::size_t len);
     // Checked writes Part 08: GetStats (91) - the same route; the worker answers a StatsResult (StatsResponse 92).
     void handleGetStats     (const uint8_t* buf, std::size_t len);
+    // Lease topics Task 11b: LeaseKeepAlive (96) / LeaseTimeToLive (98) - the worker answers LeaseKeepAliveResult /
+    // LeaseTimeToLiveResult (LeaseKeepAliveResponse 97 / LeaseTimeToLiveResponse 99).  Task 13b: ScanLeases (100) - a ScanLeasesResult
+    // (ScanLeasesResponse 101).
+    void handleLeaseKeepAlive (const uint8_t* buf, std::size_t len);
+    void handleLeaseTimeToLive(const uint8_t* buf, std::size_t len);
+    void handleScanLeases     (const uint8_t* buf, std::size_t len);
+    void answerLeaseEnqueue_(rune::node::EnqueueResult er, int32_t topicId, int32_t partition, const uint8_t* buf, std::size_t len,
+                             const char* what);
+    void noteLeaseReturnMalformed_(const char* what, int32_t recordCount, std::size_t chunkBytes);
+    [[nodiscard]] bool leaseRouteAdmit_(Session& session, int64_t sessionId, int64_t corr, int32_t topicId, int32_t partition,
+                                        rune::security::Operation op, const uint8_t* buf, std::size_t len, const char* what);
     [[nodiscard]] Session* checkedViewReadSession_(const uint8_t* buf, std::size_t len, int64_t sessionId,
                                                    int32_t viewTopicId, const char* what);
     void enqueueViewRead_(const uint8_t* buf, std::size_t len, Session& session, rune::node::WorkerOp& op);
@@ -2233,6 +2292,54 @@ private:
     // session, no response type): counted, warn-logged rate-limited (first,
     // then every 1024th — never a per-frame log on the produce path).
     void noteUnanswerable_(const uint8_t* buf, std::size_t len, const char* why);
+    // L22 Part B: a keepalive Ping for a session this gateway has forgotten (it restarted) is answered ErrorResponse{UnknownSession} on the
+    // client's DECLARED egress channel + stream (carried in the Ping's echo: [int32 LE stream][channel]).  The reply publication is
+    // registered asynchronously (a bounded, preallocated table keyed by channel + stream); pollUnknownSessionNotices_ offers the
+    // notices and closes it.  Cold path (an unknown session only).
+    enum class UnknownSessionNotice : uint8_t { Queued, Deduped, Dropped };
+    static constexpr std::size_t kUnknownSessionNoticeCap = 16;
+    static constexpr std::size_t kUnknownSessionNoticeSids = 4;
+    static constexpr int64_t     kUnknownSessionNoticeAbandonNs = 5'000'000'000LL;
+    /// Free: unused.  Resolving: the declared channel names a HOSTNAME, offered to the cold resolver (never resolved by a
+    /// conductor or duty thread); the answer rewrites `channel` to the address.  Registering: addExclusivePublication was
+    /// called, the publication is not yet found.  Sending: the publication is up; notices are offered on it.
+    enum class NoticeState : uint8_t { Free, Resolving, Registering, Sending };
+    static constexpr std::size_t kNoticeSrcHostBytes = 64;   // the fairness key, truncated (both sides of a compare truncate alike)
+    static constexpr int64_t     kNoticeResolveIdBase = std::numeric_limits<int64_t>::min() / 2;   // negative: never a session id
+    struct UnknownSessionEntry {
+        NoticeState state = NoticeState::Free;
+        std::array<char, 255> channel{};   // SessionAckSink::kMaxChannelBytes
+        uint16_t channelLen = 0;
+        int64_t resolveId = 0;             // Resolving: the id the resolver answers with (unique, so a stale answer matches nothing)
+        std::array<char, kNoticeSrcHostBytes> srcHost{};   // the source host (sourceHostOf_) that owns this pending entry
+        uint8_t srcHostLen = 0;
+        int32_t streamId = 0;
+        int64_t registrationId = -1;
+        std::shared_ptr<aeron::ExclusivePublication> pub;
+        std::array<int64_t, kUnknownSessionNoticeSids> sids{};
+        std::array<int64_t, kUnknownSessionNoticeSids> corrs{};
+        uint8_t nSids = 0;
+        uint8_t nSent = 0;
+        int64_t startNs = 0;
+    };
+    UnknownSessionNotice answerUnknownSession_(std::string_view channel, int32_t streamId, int64_t sid, int64_t correlationId, int64_t nowNs);
+    /// The shared resolve pieces of the Connect path and the notice path (one copy): does this declared channel name a hostname;
+    /// offer a host to the cold resolver under `id` (`holder` keeps the allocation across a refused offer); the channel with the
+    /// answered address (network order) in place of the host.
+    [[nodiscard]] static bool channelNamesHostname_(std::string_view channel);
+    bool offerHostResolveOf_(std::unique_ptr<std::string>& holder, std::string_view channel, int64_t id);
+    [[nodiscard]] static std::string channelWithResolvedHost_(std::string_view channel, int64_t ipNetworkOrder);
+    /// Register the notice entry's publication (the call the Connect path makes for its reply channel); false = refused.
+    bool startNoticePub_(UnknownSessionEntry& e, bool testGateway);
+    void onNoticeResolved_(int64_t id, bool resolved, int64_t ip);
+    int64_t noticeResolveSeq_ = 0;
+    int pollUnknownSessionNotices_(int64_t nowNs);
+    static std::shared_ptr<aeron::ExclusivePublication> placeholderPub_();
+    /// "aeron:udp?control=<responseControlEndpoint_>|control-mode=response|response-correlation-id=<imageCorrelationId>" into `out`
+    /// (the Connect path's response-mode reply channel).
+    void responseChannelFor_(int64_t imageCorrelationId, std::string& out) const;
+    std::array<UnknownSessionEntry, kUnknownSessionNoticeCap> unknownNotices_{};
+    uint64_t unknownSessionNoticesSent_ = 0, unknownSessionNoticesDeduped_ = 0, unknownSessionNoticesDropped_ = 0, unknownSessionNoticesAbandoned_ = 0;
     // Task 13 fix round 1: shard-mode session lifecycle helpers.
     /// Worker ack-table slots in use or about to be (I2): accepted sessions +
     /// closes not yet queued on every worker + pending connects whose
@@ -2888,6 +2995,7 @@ private:
     std::vector<int32_t> viewSinksAwaitingPlan_;
     /// C1: sorted by view topic id — (view, its source topic).  Control thread only.
     std::vector<std::pair<int32_t, int32_t>> viewSources_;
+    /// Lease topics Task 13a: sorted by view topic id - (lease view, its lease topic).  Control thread writes; reads are a lower_bound.
     /// Answer a data/read op that reached a broker which does not lead its
     /// partition: ErrorResponse{Redirect, endpoint}, or the bare NotLeader when the
     /// endpoint is empty or too long for the frame.  Queued (sendAnswer_), never dropped.
@@ -3110,6 +3218,8 @@ private:
     void onControlRecordRefused_(const rune::node::WorkerReturn& ret);
     void onControlRecordAppended_(const rune::node::WorkerReturn& ret);
     uint64_t controlRecordsRefused_ = 0;
+    uint64_t leaseReturnMalformed_  = 0;   // lease worker returns with a bad count / chunk (a broker bug), answered Internal
+    uint64_t leaseEnqueueTooLarge_  = 0;   // lease requests that can never fit one worker-ingress frame, answered MessageTooLarge
     uint64_t produceBackPressured_  = 0;   // M5: produces answered NotLeader on back-pressure
 
     // -----------------------------------------------------------------------
@@ -3205,7 +3315,10 @@ private:
     /// published leader (GatewayReplicaView::publishedLeader); no replica
     /// (unreplicated / internal) → true, unchanged.  Cold (subscribe time, and
     /// the demotion sweep on a routed role change — retireReadCommittedMovedAway_).
-    [[nodiscard]] bool readCommittedServableHere_(int32_t topicId, int32_t partition) const noexcept;
+    /// Checked writes: the same holds at ANY isolation for a partition whose
+    /// records need verdicts (GatewayReplicaView::leaderOnlyReads) — the judge
+    /// runs on the leader only, a follower's verdict bound never moves.
+    [[nodiscard]] bool servableHere_(int32_t topicId, int32_t partition, uint8_t isolation) const noexcept;
     /// Task 11 carry (E2 Task 13): a plain read_committed subscription accepted
     /// while this node led the partition, which it no longer leads (demoted:
     /// controlled shutdown, failover, a higher epoch) — no RC state serves it
@@ -3252,7 +3365,8 @@ private:
     }
     /// Moved-away verdict for one plain subscription during a sweep: true when
     /// this node can no longer serve it — its replica was removed (any
-    /// isolation) or, read_committed, it is no longer a published leader.
+    /// isolation) or, read_committed or leader-only reads (checked writes), it
+    /// is no longer a published leader.
     /// M5: also records hadReplica the first time it sees a registered replica.
     [[nodiscard]] bool movedAway_(Subscription& sub) const noexcept;
     int  pumpMarkerQueue_();
@@ -3633,6 +3747,8 @@ public:
     bool clientFrameHeldForTest(const uint8_t* buf, std::size_t len) { return produceFrameHeld_(buf, len); }
     /// Issue #116: encrypted client frames dropped because they name another receiver (a worker-bound frame).
     [[nodiscard]] uint64_t c2bWrongReceiverDropsForTest() const noexcept { return c2bWrongReceiverDrops_; }
+    /// U2: clear probe Pings (correlationId <= -kProbeNonceFloor) that named a known encrypted session; dropped before any AEAD attempt.
+    [[nodiscard]] uint64_t clearFramesOnEncryptedSessionDropped() const noexcept { return clearFramesOnEncryptedSessionDropped_; }
     /// PR #528 review (issue #116, mixed-version cluster): answer MetadataRequests as a broker below
     /// kBrokerVersionReceiverKeys does - the worker ingressEndpoint without the receiver-id trailer.
     void emulatePreReceiverKeyMetadataForTest(bool on) noexcept { preReceiverKeyMetadataForTest_ = on; }
@@ -3959,6 +4075,9 @@ private:
     // END of the object so no hot member's offset moves.
     uint64_t rejectedRequests_      = 0;       // answered with an error instead of dropped
     uint64_t unanswerableFrames_    = 0;       // dropped: no header / no session / no response type
+    /// A client's clear probe Ping carries a correlationId at or below -kProbeNonceFloor (SessionMachine::kProbeNonceFloor, mirrored).
+    static constexpr int64_t kProbeNonceFloor = int64_t{1} << 32;
+    uint64_t clearFramesOnEncryptedSessionDropped_ = 0;   // a clear frame naming a KNOWN encrypted session: dropped before any AEAD
     uint64_t c2bWrongReceiverDrops_ = 0;       // issue #116: encrypted frames naming another receiver (control thread)
     bool     preReceiverKeyMetadataForTest_ = false;   // test seam: metadata as a broker < 7 sends it (cold)
     uint64_t spillExpiries_         = 0;       // sessions expired because the egress spill was full

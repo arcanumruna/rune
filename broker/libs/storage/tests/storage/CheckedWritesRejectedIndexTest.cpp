@@ -113,6 +113,26 @@ TEST(CheckedWritesRejectedIndex, CountAtOrAfter) {
     EXPECT_EQ(idx.countAtOrAfter(21), 0u);
 }
 
+// Lease topics: one slot past capacity() is for a broker-written record only (a stale Expire / Checkpoint has no producer).
+TEST(CheckedWritesRejectedIndex, ReservedSlotRegression) {
+    RejectedOffsetIndex idx;
+    idx.reserve(2);
+    EXPECT_EQ(idx.capacity(), 2u);
+    EXPECT_TRUE(idx.add(1, 55, 1));
+    EXPECT_TRUE(idx.add(2, 55, 1));
+    EXPECT_FALSE(idx.add(3, 55, 1));                 // full for a client record
+    EXPECT_EQ(idx.size(), 2u);
+    EXPECT_TRUE(idx.add(4, 0xFFFE, 0, /*reserved=*/true));   // the reserved slot
+    EXPECT_FALSE(idx.add(5, 0xFFFE, 0, /*reserved=*/true));  // taken: a second one is refused
+    EXPECT_FALSE(idx.add(6, 55, 1));
+    EXPECT_EQ(idx.size(), 3u);
+    EXPECT_EQ(idx.capacity(), 2u);
+    EXPECT_EQ(idx.nextRejectedAtOrAfter(0), 1);
+    EXPECT_EQ(idx.nextRejectedAtOrAfter(3), 4);      // offsets still ascend
+    EXPECT_FALSE(idx.add(3, 0xFFFE, 0, true));       // out of order is still refused
+    EXPECT_EQ(idx.outOfOrder(), 1u);
+}
+
 TEST(CheckedWritesRejectedIndex, InsertRunOutOfOrder) {
     auto idx = indexWith({50, 60});
     const std::vector<int64_t> run{10, 11, 12};

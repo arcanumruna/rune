@@ -185,6 +185,21 @@ struct WorkerOp {
         // the vote token, producerId / producerEpoch = the transaction, roleEpoch = the target leader epoch + 1 (0 = unchecked),
         // sessionId = the origin node (-1 = local).  No tail.  Ownership-gated like AppendControlRecord; answered with TxnVoteResult.
         TxnVote                   = 36, ///< coordinator → worker: vote on a transaction's commit
+        // Lease topics Task 11a: gateway → the lease partition leader's worker.  topicId / partition / sessionId / correlationId as GetStats;
+        // not ownership-gated in the switch (the handlers check the replica themselves).  LeaseKeepAlive: recordCount = the entry count
+        // (1..256), leaseTail (TailKind LEASE_REQUEST) = the request's validated entries [keyLen u8][key][version i64 LE].
+        // LeaseTimeToLive: leaseTail = the key bytes.  ScanLeases (39, Task 13b): topicId = the SOURCE topic, nextOffset = resumeHash (the u64 bit-cast),
+        // recordCount = maxRows (1..1024), isolation = first (0/1), leaseTail = the key prefix (<= 127 bytes).
+        LeaseKeepAlive            = 37, ///< gateway → worker: keepalive entries of one lease partition
+        LeaseTimeToLive           = 38, ///< gateway → worker: the remaining time of one lease key
+        ScanLeases                = 39, ///< gateway → worker: a page of the lease rows in hash order (Task 13b)
+        // Lease topics Task 21: control → EVERY worker (cold: on a change only), see NsRingMessages.h.  Never ownership-gated.
+        NsLeasesOver              = 40, ///< control → worker: nsSlot is at or over max-leases on this node (or back under)
+        // Lease topics Task 27 (spec A.6): control → the partition's OWNING worker on its OP ring (cold: once per leadership
+        // of a transient lease partition; LeaseLineageFanout), ownership-gated like TxnVerifyResult.  topicId / partition = the
+        // partition, nextOffset = the leader epoch, correlationId = the lineage token (uint64 bit-cast to int64), hwBound = the
+        // lineage generation.  No tail.  (41 = TRANSIENT_LINEAGE.)
+        TransientLineage          = 41, ///< control → worker: the committed data lineage of a transient lease partition
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -378,7 +393,8 @@ struct WorkerOp {
     // `deferAck` (rune-internal-ring.xml) is a FLAG BYTE, not a bool:
     //   bit 0 (kOpFlagDeferAck = 0x01)     — this deferAck (acks=all, steady state)
     //   bit 1 (kOpFlagCrcValidated = 0x02) — crcValidated (below; Produce only)
-    //   bit 2 (kOpFlagFreshCursor = 0x04)  — freshCursor (PushRead only; E2 M2)
+    //   bit 2 (kOpFlagFreshCursor = 0x04)  — freshCursor (PushRead only; E2 M2) / fromEarliest (Subscribe only)
+    //   bit 3 (kOpFlagPushReadFromEarliest = 0x08) — fromEarliest (PushRead only; shares the bit with grantAll, SessionAnnounce only)
     // Writer: Worker::enqueueOp only.  Readers MUST mask the bit they need
     // (executeProduceWire_ does); `deferAck() != 0` is wrong.  Rename the
     // schema field to `flags` the next time rune-protocol's schema is touched.
@@ -427,6 +443,11 @@ struct WorkerOp {
     /// that fell behind: counted apart, never warned.  Carried as bit 2 of the
     /// wire flag byte (kOpFlagFreshCursor) — no protocol change.
     bool    freshCursor    = false;
+    /// Subscribe only: the client asked for Earliest (the gateway resolved it to the partition start, 0 on a transient
+    /// partition).  On a transient LEASE topic only such a fresh cursor is raised to the ring start; any other cursor below
+    /// it ends the subscription (PushTooLargeCause::RingEvicted).  Wire: bit kOpFlagFromEarliest of the `deferAck` flag byte
+    /// (shares bit 2 with freshCursor, which is PushRead only).  PushRead carries it too: bit kOpFlagPushReadFromEarliest.
+    bool    fromEarliest   = false;
 
     // -----------------------------------------------------------------------
     // BecomeLeader / BecomeFollower-specific fields
@@ -496,6 +517,10 @@ struct WorkerOp {
     // Checked writes Part 07: a GetViewRowK / ScanViewRows op's [keyOrPrefixLen u8][bytes][tokenLen u8][token], TailKind::VIEW_READ.
     // A view valid only for the synchronous tryEnqueueOp call, like filterBytes.
     std::span<const uint8_t> viewReadTail;
+
+    // Lease topics Task 11a: a LeaseKeepAlive op's raw validated entries / a LeaseTimeToLive op's key bytes, TailKind::LEASE_REQUEST.
+    // A view valid only for the synchronous tryEnqueueOp call.
+    std::span<const uint8_t> leaseTail;
 
     // Authentication Task 15: a PeerLinkKeys op's key material, [sendMaster 32][recvMaster 32] (the tail on the wire).
     // topicId = the peer node id, partition = the link epoch.
@@ -617,6 +642,18 @@ struct WorkerReturn {
         /// baseOffset = failingOffset, lastOffset = the judge offset (-1 = none), sessionId = the origin node.  The vote fields
         /// mean something only when errorCode == 0: a NotLeader answer leaves recordCount 0, which is NOT a yes vote.
         TxnVoteResult = 11,
+        /// Lease topics Task 11a: answers of a LeaseKeepAlive op (one return per decided group of entries, and one per parked entry once
+        /// answered).  errorCode = 0, recordCount = the entry count (1..256), lastOffset = final (0/1), sessionId / correlationId echoed;
+        /// the chunk is count x 12 bytes, each {index u16, code u16, ttlMs u64} little-endian - exactly the wire entry layout of
+        /// LeaseKeepAliveResponse.  A request-level refusal is one entry with index kLeaseWholeRequest (0xFFFF).
+        LeaseKeepAliveResult = 12,
+        /// Lease topics Task 11a: the answer to a LeaseTimeToLive op.  errorCode = the client code, baseOffset = remainingMs (-1 = none),
+        /// lastOffset = the lease version, sessionId / correlationId echoed; the chunk is 16 bytes {grantedTtlMs u64, holder u64} LE.
+        LeaseTimeToLiveResult = 13,
+        /// Lease topics Task 13b: the answer to a ScanLeases op.  errorCode = the client code, baseOffset = asOfOffset (the lease index's fold
+        /// cursor at the walk, exclusive), lastOffset = lastHash (the u64 bit-cast), recordCount = the rows in the page, isolation = done (0/1);
+        /// the chunk is the encoded rows, recordCount x { keyLen u8, key, rowLen u32 LE, row payload } (LeaseMessages.h).
+        ScanLeasesResult = 14,
     };
 
     Type    type = Type::ProduceResult;
@@ -662,6 +699,11 @@ struct WorkerReturn {
     uint32_t verdictRun    = 0;
     uint16_t verdictCount  = 0;
     uint8_t  hasVerdicts   = 0;
+    // Client 18 (lease topics): the lease trailer of a View ack (hasLease with leaseCount x {leaseVersion, ttlMs} = 2 x
+    // leaseCount arena units at leaseRun).  Worker-local only: NOT encoded.
+    uint32_t leaseRun      = 0;
+    uint16_t leaseCount    = 0;
+    uint8_t  hasLease      = 0;
 
     // Non-owning pointer to the replica.  Task 10 round 4: the runtime never
     // dereferences it — it refers to the replica by (targetReplicaId,
@@ -746,6 +788,8 @@ inline constexpr uint8_t kOpFlagDeferAck     = 0x01;   ///< WorkerOp::deferAck (
 inline constexpr uint8_t kOpFlagCrcValidated = 0x02;   ///< WorkerOp::crcValidated (Produce only)
 inline constexpr uint8_t kOpFlagGrantAll     = 0x08;   ///< WorkerOp::grantAll (SessionAnnounce only; authentication Task 13)
 inline constexpr uint8_t kOpFlagFreshCursor  = 0x04;   ///< WorkerOp::freshCursor (PushRead only; E2 M2)
+inline constexpr uint8_t kOpFlagFromEarliest = 0x04;   ///< WorkerOp::fromEarliest (Subscribe only; shares the bit with the PushRead-only freshCursor)
+inline constexpr uint8_t kOpFlagPushReadFromEarliest = 0x08;   ///< WorkerOp::fromEarliest (PushRead only; shares the bit with the SessionAnnounce-only grantAll)
 inline constexpr uint8_t kOpFlagKeyPending   = 0x10;   ///< WorkerOp::keyPending (SessionAnnounce only)
 inline constexpr uint8_t kOpFlagResponseBind = 0x20;   ///< WorkerOp::responseBind (SessionAnnounce only; NAT-safe egress)
 inline constexpr uint8_t kOpFlagSessionEgress = 0x40;  ///< WorkerOp::sessionEgress (Subscribe only; NAT-safe egress)

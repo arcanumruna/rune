@@ -609,6 +609,45 @@ TEST(TransientGatewayRegression, ReadCommittedSubscriptionOnADemotedLeaderAnswer
     EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 1u);
 }
 
+// Lease Task 18 finding (checked writes): a partition whose records need verdicts is served by its leader only, at ANY
+// isolation - the judge runs there, and a follower's verdict bound (Worker::verdictBound_) never moves.  A read_uncommitted
+// subscription accepted while this node led it used to stay registered after a demotion and push nothing, forever (the
+// lease stress tap froze on a demoted seed).  Now it is moved off like read_committed (bare NotLeader, dropped), and a
+// read_uncommitted Subscribe on a follower of such a partition is refused NotLeader.  A partition without verdicts keeps
+// its follower reads (the test above).
+// RED: drop `|| v.leaderOnlyReads()` from ClientGateway::movedAway_ (the first) or from servableHere_ (the second).
+TEST(TransientGatewayRegression, VerdictSourceUncommittedSubscriptionOnADemotedLeaderAnswersNotLeaderRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.rep->publishLeaderOnlyReads(true);   // the owning worker saw a logged constraint set
+    r.subscribe(sid, -2, 63, /*read_uncommitted=*/0);
+    ASSERT_TRUE(r.subscribed.count(63));
+    r.gw.pushSubscriptionsForTest();
+    r.pass();
+    EXPECT_FALSE(r.errors.count(63)) << "a LEADER's subscription was retired";
+    r.rep->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    const auto h = r.reg.lookupHandle(0, 0);
+    r.reg.setIntendedRole(0, 0, h.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
+    for (int i = 0; i < 4; ++i) { r.gw.pushSubscriptionsForTest(); r.pass(); }
+    ASSERT_TRUE(r.errors.count(63))
+        << "SILENT STALL: the demoted leader kept a read_uncommitted subscription to records needing verdicts";
+    EXPECT_EQ(r.errors[63], kNotLeader);
+    EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 1u);
+}
+
+TEST(TransientGatewayRegression, VerdictSourceUncommittedSubscribeOnAFollowerIsRefusedNotLeaderRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.rep->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    r.subscribe(sid, -2, 64, /*read_uncommitted=*/0);
+    ASSERT_TRUE(r.subscribed.count(64)) << "precondition: a follower serves read_uncommitted without verdicts";
+    r.rep->publishLeaderOnlyReads(true);
+    r.subscribe(sid, -2, 65, /*read_uncommitted=*/0);
+    ASSERT_TRUE(r.errors.count(65)) << "a follower accepted a read_uncommitted subscription to records needing verdicts";
+    EXPECT_EQ(r.errors[65], kNotLeader);
+    EXPECT_FALSE(r.subscribed.count(65));
+}
+
 // ---------------------------------------------------------------------------
 // Task 13 fix round 1 — every way a node stops serving a subscription reaches
 // the client (no silent stall):

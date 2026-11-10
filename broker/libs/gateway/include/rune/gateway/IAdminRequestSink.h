@@ -18,6 +18,7 @@
 // Namespace: rune::gateway.  C++23.
 
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/LeaseSpec.h>
 #include <rune/protocol/client/NamespaceMessages.h>
 #include <rune/protocol/client/SecurityMessages.h>
 
@@ -97,7 +98,8 @@ struct IAdminRequestSink {
                                           int16_t replicationFactor,
                                           const rune::protocol::TopicConfigView& config,
                                           const DdlMetaView& meta, std::string_view adoptDenial,
-                                          const rune::protocol::TopicKeyFeatures& keyFeatures) = 0;
+                                          const rune::protocol::TopicKeyFeatures& keyFeatures,
+                                          const std::optional<rune::protocol::LeaseSpec>& lease) = 0;
 
     // GetTopicSchema (66) — a read, no DDL extension.  requestedFingerprint
     // (Task 13): 0 = latest; non-zero = the SPECIFIC version whose per-version

@@ -64,6 +64,7 @@
 #include <rune/node/IdleShape.h>
 #include <rune/node/PersistenceMode.h>
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/LeaseSpec.h>
 #include <rune/protocol/NamespaceLimits.h>
 #include <rune/node/PemFile.h>   // Task 9: loadPemFile() — re-exported here for config callers
 
@@ -96,6 +97,12 @@ struct TopicSpec {
     /// VLS B.2: a view's sink -- a replica-less, catalog-only namespace (no log, no dir, no replica); its rows live
     /// in the source owner's WorkerViewSet.  Set by the catalog sink effect (live and boot) only.
     bool        viewSink       = false;
+    /// Lease topics Task 13a: a lease view's sink (`<topic>.leases`) names its lease topic here (the catalog's id; -1: not a lease
+    /// view).  The gateway's one source of truth for the lease view -> source mapping: auth (READ on the topic) and routing.
+    int32_t     leaseSourceTopicId = -1;
+    /// ... and that lease topic's key: its rune::codec::PrimType and width in bytes (0: unknown), from the catalog.
+    uint8_t     leaseKeyType  = 0;
+    uint8_t     leaseKeyWidth = 0;
     /// Replicas per partition (DDL replicationFactor); 0 = every node (the
     /// default).  Clamped to the cluster size.
     int16_t     replicationFactor = 0;
@@ -164,6 +171,11 @@ struct TopicSpec {
     /// A view sink carries its source's partitioner.
     rune::protocol::Partitioner partitioner   = rune::protocol::Partitioner::Fnv1a;
     bool                        autoIncrement = false;
+
+    /// Lease topics: true for a lease topic (set once by the catalog sink effect, live and boot; it never changes).  The
+    /// lease VALUES are deliberately not copied here: they live only in the worker write spec, which writeSpecChanged
+    /// keeps current, so the control thread never holds a stale copy.
+    bool leaseTopic = false;
 };
 
 struct PeerConfig {
@@ -232,6 +244,9 @@ enum class ClientTransport : uint8_t { TlsOptional = 0, RequireTls = 1, Plaintex
 /// True when this broker was built with the RUNE_TLS CMake option (the default).  A non-TLS build refuses
 /// authentication and every RUNE_TLS_* / RUNE_REQUIRE_TLS variable (issue #11).
 [[nodiscard]] bool tlsBuild() noexcept;
+
+struct NodeConfig;
+[[nodiscard]] inline int64_t leaderHeartbeatTimeoutNs(const NodeConfig& c) noexcept;
 
 struct NodeConfig {
     /// "Derive from the host" sentinel for the Aeron transport sizes (mtu, socket
@@ -550,7 +565,11 @@ struct NodeConfig {
     /// RUNE_MAX_NAMESPACES (namespaces Task 7): the cluster-wide namespace cap, `default` included.
     int32_t maxNamespaces = 1024;
     /// RUNE_NS_DEFAULT_* (namespaces Task 7): the cluster default limits an omitted CreateNamespace field takes.
-    rune::protocol::NamespaceLimits nsDefaultLimits{};
+    rune::protocol::NamespaceLimits nsDefaultLimits = [] {
+        rune::protocol::NamespaceLimits l{};
+        l.maxLeases = 16'777'216;   // lease topics spec §14.2; RUNE_NS_DEFAULT_MAX_LEASES overrides, 0 = unlimited
+        return l;
+    }();
     /// RUNE_GROUP_MIN_SESSION_TIMEOUT_MS / RUNE_GROUP_MAX_SESSION_TIMEOUT_MS (#499): the bounds a JoinGroup's session
     /// timeout is clamped into.  0 = the GroupCoordinationService default (1 s / 30 min).
     int32_t groupMinSessionTimeoutMs = 0;
@@ -674,8 +693,7 @@ struct NodeConfig {
     /// leader-heartbeat timeout (max(electionTimeout, 3 x statusInterval)) - the same derivation as the runtime's.
     [[nodiscard]] int64_t effectiveBrokerLivenessMs() const noexcept {
         if (brokerLivenessTimeoutMs > 0) return brokerLivenessTimeoutMs;
-        const int64_t hb = electionTimeoutMs > 3 * electionStatusIntervalMs ? electionTimeoutMs : 3 * electionStatusIntervalMs;
-        return 3 * hb;
+        return 3 * (leaderHeartbeatTimeoutNs(*this) / 1'000'000);
     }
 
     // Milestone E1: number of in-process partition workers. Each owned shard is
@@ -1121,6 +1139,9 @@ struct NodeConfig {
     /// minutes-slow.
     static constexpr int64_t kMinCleanerDedupeBufferBytes = int64_t{1} << 20;
     static constexpr int64_t kMaxCleanerDedupeBufferBytes = int64_t{1} << 32;
+    /// A node hosting lease topics also allocates, on the first lease pass, a lease side table (SkimpyOffsetMap::LeaseAux,
+    /// 16 B per slot) with the same slot count as the table: sizeof(LeaseAux) == kEntryBytes == 16, so a lease cleaner uses
+    /// up to 2x this budget in total (table + side table).
     int64_t cleanerDedupeBufferBytes = int64_t{128} << 20;
 
     // PSM fix round 1 (I1, Kafka producer.id.expiration.ms): compaction keeps the
@@ -1255,6 +1276,14 @@ struct NodeConfig {
     static std::string shardPeerReplChannel(const PeerConfig& p, int32_t w);  // <p.host>:<p.replBasePort+w>
     static std::string shardIngressEndpoint(const PeerConfig& p, int32_t w);  // "<p.host>:<p.ingressBasePort+w>"
 };
+
+/// The leader heartbeat timeout (ns) the Election derives from this config: max(electionTimeout, 3 x electionStatusInterval).  The one
+/// formula for a lease key's promotion grace (spec 9.7) - BrokerNode hands it to every Worker (setLeaseExtendNs).
+[[nodiscard]] inline int64_t leaderHeartbeatTimeoutNs(const NodeConfig& c) noexcept {
+    const int64_t timeout = c.electionTimeoutMs * 1'000'000LL;
+    const int64_t status3 = 3 * c.electionStatusIntervalMs * 1'000'000LL;
+    return timeout > status3 ? timeout : status3;
+}
 
 struct ConfigResult {
     std::optional<NodeConfig> config;

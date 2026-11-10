@@ -228,6 +228,29 @@ TEST_F(CheckedWritesVerdictAckRegression, ViewRetryOutsideTheWindowIsDuplicateSe
     EXPECT_EQ(r.leo(), leoBefore);
 }
 
+// Lease topics Task 5c: a session below 18 never sees a lease trailer, and a non-lease topic never carries one to any session.
+TEST_F(CheckedWritesVerdictAckRegression, LeaseAckTrailerSessionBelow18Regression) {
+    const int64_t c = r.produceFrame({{1, 1, 1}, {2, 2, 9}, {3, 3, 1}, {4, 4, 9}}, kAcksView);
+    const auto a = r.ack(c);
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, 0);
+    EXPECT_TRUE(a->hasVerdicts);
+    EXPECT_FALSE(a->hasLease);
+    EXPECT_TRUE(a->leases.empty());
+    EXPECT_EQ(a->frameLen, 54u + 2 + 8 * 2) << "the v17 frame is unchanged";
+    // an 18 session on the same non-lease topic: still no lease trailer
+    VerdictRig o;
+    o.typed();
+    o.installRejectView(kRej, kObj, tagRule(9));
+    o.enableAcks(rune::protocol::client::kClientVersionLeases);
+    o.passes(60);
+    const auto b = o.ack(o.produceFrame({{1, 1, 1}, {2, 2, 9}, {3, 3, 1}, {4, 4, 9}}, kAcksView));
+    ASSERT_TRUE(b);
+    EXPECT_EQ(b->code, 0);
+    EXPECT_FALSE(b->hasLease) << "a non-lease topic's ack has no lease trailer";
+    EXPECT_EQ(b->frameLen, 54u + 2 + 8 * 2);
+}
+
 // A replay waits for the marker that commits its verdicts; an ack of the same partition behind it waits too, so the acks of a
 // connection leave in the order the batches were written.
 TEST(CheckedWritesVerdictAckRigRegression, ReplayNotYetCommittedKeepsTheAcksBehindItInOrderRegression) {
@@ -474,4 +497,80 @@ TEST(CheckedWritesVerdictAckRigRegression, ReplayAfterRestartAndJudgeErasureRepo
         EXPECT_EQ(again->verdicts, first->verdicts);
         EXPECT_EQ(o.leo(), leoBefore) << "a replay appends nothing";
     }
+}
+
+// Lease topics: the largest ack (2048 verdicts + 2048 leases, sealed) is ONE Aeron message on an ack publication at
+// kMinAckTermBytes.  AckEntry cannot carry lease entries before the write hook (Task 5), so the ProduceResponse is
+// encoded with encodeFor at the maximum, sealed as the sink seals it, and offered through the sink's own policy.
+TEST(CheckedWritesVerdictAckRigRegression, MaxSizeSealedLeaseAckOffersRegression) {
+    namespace pc = rune::protocol::client;
+    rune::node::EmbeddedDriverConfig dc;
+    dc.dir = (std::filesystem::temp_directory_path() / ("rune_maxack_" + std::to_string(::getpid()))).string();
+    dc.termBufferBytes = 64 * 1024;
+    dc.countersValuesBytes = rune::node::kTestClientCountersBytes;
+    rune::node::EmbeddedDriver driver(dc, rune::node::DriverMode::Invoker);
+    aeron::Context ctx; ctx.aeronDir(dc.dir); ctx.useConductorAgentInvoker(true);
+    auto aeronClient = aeron::Aeron::connect(ctx);
+    auto pump = [&] { driver.doWork(); aeronClient->conductorAgentInvoker().invoke(); };
+
+    AeronSessionPubPolicy pol;
+    pol.client = aeronClient.get();
+    const int64_t preg = pol.add("aeron:ipc", 4711);
+    ASSERT_GT(preg, 0);
+    const int64_t sreg = aeronClient->addSubscription("aeron:ipc", 4711);
+    AeronSessionPubPolicy::PubHandle pub;
+    std::shared_ptr<aeron::Subscription> sub;
+    for (int i = 0; i < 100'000 && !(pub && sub && pub->isConnected()); ++i) {
+        pump();
+        if (!pub) (void)pol.find(preg, pub);
+        if (!sub) sub = aeronClient->findSubscription(sreg);
+    }
+    ASSERT_TRUE(pub && sub && pub->isConnected());
+    EXPECT_GE(pub->maxMessageLength(), static_cast<int32_t>(pc::ProduceResponse::kMaxEncodedSize + pc::kCryptoOverhead));
+
+    std::vector<uint8_t> verdicts(8u * 2048), leases(16u * 2048);
+    for (std::size_t i = 0; i < verdicts.size(); ++i) verdicts[i] = static_cast<uint8_t>(i * 13 + 1);
+    for (std::size_t i = 0; i < leases.size(); ++i) leases[i] = static_cast<uint8_t>(i * 31 + 3);
+    pc::ProduceResponse r;
+    r.sessionId = 7; r.correlationId = 9; r.baseOffset = 1234; r.assignedBase = 5;
+    r.hasVerdicts = true; r.verdictCount = 2048; r.verdictBytes = verdicts;
+    r.hasLease = true; r.leaseCount = 2048; r.leaseBytes = leases;
+    std::vector<uint8_t> plain(pc::ProduceResponse::kMaxEncodedSize);
+    const std::size_t plainLen = r.encodeFor(plain.data(), pc::kClientVersionLeases);
+    ASSERT_EQ(plainLen, pc::ProduceResponse::kMaxEncodedSize);
+
+    rune::crypto::AeadKey key{};
+    for (std::size_t i = 0; i < sizeof(key.bytes); ++i) key.bytes[i] = static_cast<uint8_t>(i + 3);
+    const uint8_t prefix[4] = {1, 2, 3, 4};
+    rune::crypto::AeadCipher cipher(rune::crypto::Cipher::Aes256Gcm, key, prefix);
+    uint64_t seq = 0;
+    RecordsSealCtx sctx;
+    sctx.send = &cipher; sctx.sendSeq = &seq; sctx.cipher = static_cast<uint8_t>(rune::crypto::Cipher::Aes256Gcm);
+    std::vector<uint8_t> sealed(plainLen + pc::kCryptoOverhead);
+    const std::size_t n = sealRecordsFrame(sctx, plain.data(), plainLen, sealed.data(), sealed.size());
+    ASSERT_EQ(n, plainLen + pc::kCryptoOverhead);
+
+    int64_t pos = 0;
+    for (int i = 0; i < 1000 && pos <= 0; ++i) {
+        pump();
+        pos = pol.claim(pub, n, [&](uint8_t* dst) { std::memcpy(dst, sealed.data(), n); });
+    }
+    ASSERT_GT(pos, 0) << "the largest sealed ack was refused";
+    EXPECT_EQ(pol.offered(), 1u);
+
+    std::vector<uint8_t> got;
+    aeron::FragmentAssembler assembler([&](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l, aeron::Header&) {
+        got.assign(b.buffer() + o, b.buffer() + o + l);
+    });
+    auto handler = assembler.handler();
+    for (int i = 0; i < 100'000 && got.empty(); ++i) {
+        pump();
+        sub->poll(handler, 10);
+    }
+    EXPECT_EQ(got, sealed);
+    const auto d = pc::ProduceResponse::decode(plain.data(), plainLen);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->verdictCount, 2048u);
+    EXPECT_EQ(d->leaseCount, 2048u);
+    EXPECT_EQ(std::memcmp(d->leaseBytes.data(), leases.data(), leases.size()), 0);
 }

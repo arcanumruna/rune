@@ -29,6 +29,7 @@ struct TopicDef {
     // Appended after the original members so existing positional aggregate init keeps compiling.
     int16_t replicas = 0;              // 0 = broker default; parse bound 0..32767 (F31)
     std::vector<ConfigSetting> with;   // creation-time config, parse order
+    bool lease = false;                // `lease topic …` (lease.* settings allowed)
 };
 struct ParseError { std::size_t line = 0; std::size_t col = 0; std::string message; };
 
@@ -121,12 +122,20 @@ struct SelectDef { std::vector<std::string> columns; /* empty = * */ std::string
 struct ShowTopicDef { std::string name; };
 struct ShowViewDef  { std::string name; };
 
-// Security statements, then CreateViewDef, SelectDef, ShowTopicDef, ShowViewDef, are APPENDED: the existing indices never move.
+// ── lease statements (lease topics, spec section 5) ──────────────────────────
+// show leases := "show" "leases" NAME ["where" IDENT "like" STRING] ["limit" INT] ";"   (keyColumn / prefix only with a where)
+// show lease  := "show" "lease" NAME "key" KEYLIT ";"       revoke lease := "revoke" "lease" NAME "key" KEYLIT ";"
+struct ShowLeasesDef { std::string topic; std::string keyColumn; std::optional<std::string> prefix; uint32_t limit = 100; };
+struct ShowLeaseDef  { std::string topic; Literal key; };
+struct RevokeLeaseDef { std::string topic; Literal key; };
+
+// Security statements, then CreateViewDef, SelectDef, ShowTopicDef, ShowViewDef, then the three lease statements, are APPENDED: the existing indices never move.
 using Statement = std::variant<TopicDef, AlterTopicDef, AlterTopicConfigDef, DropTopicDef, DropViewDef,
                                ShowHistoryDef, ShowAsOfDef, DiffDef,
                                CreateUserDef, AlterUserDef, DropUserDef, CreateRoleDef, DropRoleDef, GrantDef, RevokeDef,
                                GrantRoleDef, RevokeRoleDef, ShowUsersDef, ShowRolesDef, ShowGrantsDef,
-                               ShowSecurityHistoryDef, CreateViewDef, SelectDef, ShowTopicDef, ShowViewDef>;
+                               ShowSecurityHistoryDef, CreateViewDef, SelectDef, ShowTopicDef, ShowViewDef,
+                               ShowLeasesDef, ShowLeaseDef, RevokeLeaseDef>;
 
 /// The canonical text of `s` with every password literal replaced by '<redacted>' (D10) — the ONLY statement
 /// text a client sends for a security statement.  Keywords upper-case, names quoted when not a plain IDENT.

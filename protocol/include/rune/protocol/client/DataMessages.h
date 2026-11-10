@@ -1,10 +1,13 @@
 #pragma once
+#include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <optional>
 #include <span>
 #include <string_view>
+#include "../LeaseRecord.h"
 #include "Codec.h"
 #include "MessageHeader.h"
 #include "Protocol.h"
@@ -202,6 +205,14 @@ struct Produce {
 // Client version 17 (checked writes): blockLength 30, `assignedBase` u64 at body offset 22 (0 = none), then an
 // optional trailer [count u16][count x {recordIndex u16, code u16, constraintId u32}]: present only on a View ack of a
 // verdict source; count 0 = every record was accepted.  A session below 17 is sent the exact 46 / 38 byte frames.
+//
+// Client version 18 (lease topics): after the verdict trailer an optional lease trailer
+// [hasLease u8 = 1][count u16][count x {leaseVersion i64, ttlMs u64}].  A lease trailer REQUIRES the verdict trailer
+// (so decode is unambiguous): encodeFor writes the verdict trailer (count 0 when there are no verdicts) whenever it
+// writes a lease trailer.  A session below 18 is never sent a lease trailer; its frame is byte-identical to version 17.
+// {hasVerdicts=false, hasLease=true} therefore decodes as hasVerdicts=true with count 0; a v18 reader treats an empty
+// verdict trailer as "no verdicts".  A lease trailer holds at most record::kMaxLeaseBatchRecords entries (so does the
+// verdict trailer that precedes it), which keeps the largest ack inside one Aeron message.
 // ---------------------------------------------------------------------------
 struct ProduceResponse {
     int64_t sessionId      = 0;
@@ -214,6 +225,9 @@ struct ProduceResponse {
     bool     hasVerdicts   = false;   // client 17: the verdict trailer is present (a View ack of a verdict source)
     uint16_t verdictCount  = 0;
     std::span<const uint8_t> verdictBytes;   // verdictCount x 8 encoded entries; zero-copy on decode
+    bool     hasLease      = false;   // client 18: the lease trailer is present (a produce to a lease topic)
+    uint16_t leaseCount    = 0;
+    std::span<const uint8_t> leaseBytes;     // leaseCount x 16 encoded {i64 leaseVersion, u64 ttlMs}; zero-copy on decode
 
     static constexpr uint16_t TEMPLATE_ID   = static_cast<uint16_t>(TemplateId::ProduceResponse); // 17
     static constexpr uint16_t BODY_FIXED    = 22;  // errorCode(2) + partition(4) + baseOffset(8) + logStartOffset(8)
@@ -224,7 +238,11 @@ struct ProduceResponse {
     static constexpr std::size_t ENCODED_SIZE    = MessageHeader::ENCODED_SIZE + BODY_FIXED;    // 46
     static constexpr std::size_t ENCODED_SIZE_V0 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V0; // 38
     static constexpr std::size_t ENCODED_SIZE_V17 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V17; // 54
-    static constexpr std::size_t kMaxEncodedSize = ENCODED_SIZE_V17 + 2 + 8 * std::size_t{kMaxVerdictEntries};   // 32,824
+    // Either a verdict-only ack (4096 entries) or a lease ack (verdict + lease trailers, each at most
+    // kMaxLeaseBatchRecords): the larger of the two, 49,211 B.
+    static constexpr std::size_t kMaxEncodedSize = std::max(
+        ENCODED_SIZE_V17 + 2 + 8 * std::size_t{kMaxVerdictEntries},
+        ENCODED_SIZE_V17 + 2 + 8 * record::kMaxLeaseBatchRecords + 3 + 16 * record::kMaxLeaseBatchRecords);
 
     /// Encode the full frame (46 bytes) into buf.  Returns 46.
     std::size_t encode(uint8_t* buf) const noexcept {
@@ -259,8 +277,25 @@ struct ProduceResponse {
         const std::size_t n = encodedSizeFor(clientVersion);
         return (withVerdicts && clientUnderstandsCheckedWrites(clientVersion)) ? n + 2 + 8 * std::size_t{count} : n;
     }
+    /// The frame size with the optional verdict and lease trailers (a lease trailer is client 18 only and always
+    /// carries the verdict trailer, count 0 when there are no verdicts).
+    [[nodiscard]] static constexpr std::size_t encodedSizeFor(int32_t clientVersion, bool withVerdicts, uint16_t verdictCount_,
+                                                              bool withLease, uint16_t leaseCount_) noexcept {
+        if (withLease && clientUnderstandsLeases(clientVersion))
+            return encodedSizeFor(clientVersion, true, withVerdicts ? verdictCount_ : uint16_t{0}) + 3 + 16 * std::size_t{leaseCount_};
+        return encodedSizeFor(clientVersion, withVerdicts, verdictCount_);
+    }
     [[nodiscard]] std::size_t encodedSize(int32_t clientVersion) const noexcept {
-        return encodedSizeFor(clientVersion, hasVerdicts, verdictCount);
+        return encodedSizeFor(clientVersion, hasVerdicts, verdictCount, hasLease, leaseCount);
+    }
+
+    /// Visit the lease entries: fn(index, leaseVersion, ttlMs).
+    template <class Fn>
+    void forEachLease(Fn&& fn) const noexcept {
+        for (uint32_t i = 0; i < leaseCount; ++i) {
+            const uint8_t* e = leaseBytes.data() + 16 * std::size_t{i};
+            fn(static_cast<uint16_t>(i), detail::getLE64(e, 0), static_cast<uint64_t>(detail::getLE64(e, 8)));
+        }
     }
 
     /// Visit the verdict entries: fn(recordIndex, code, constraintId).
@@ -286,6 +321,11 @@ struct ProduceResponse {
     std::size_t encodeFor(uint8_t* buf, int32_t clientVersion) const noexcept {
         const bool full = clientUnderstandsUnknownProducerId(clientVersion);
         const bool v17  = clientUnderstandsCheckedWrites(clientVersion);
+        // Precondition: verdictCount <= kMaxVerdictEntries; with a lease trailer also leaseCount and verdictCount
+        // <= record::kMaxLeaseBatchRecords (the decoder refuses anything larger).
+        assert(verdictCount <= kMaxVerdictEntries);
+        assert(!(hasLease && clientUnderstandsLeases(clientVersion)) ||
+               (leaseCount <= record::kMaxLeaseBatchRecords && verdictCount <= record::kMaxLeaseBatchRecords));
         MessageHeader hdr;
         hdr.blockLength   = v17 ? BODY_FIXED_V17 : full ? BODY_FIXED : BODY_FIXED_V0;
         hdr.templateId    = TEMPLATE_ID;
@@ -305,10 +345,17 @@ struct ProduceResponse {
         detail::putLE64 (buf, fixedBase + 14, logStartOffset);
         if (!v17) return ENCODED_SIZE;
         detail::putLE64 (buf, fixedBase + 22, assignedBase);
-        if (!hasVerdicts) return ENCODED_SIZE_V17;
-        detail::putLE16 (buf, static_cast<int>(ENCODED_SIZE_V17), verdictCount);
-        if (verdictCount != 0) std::memcpy(buf + ENCODED_SIZE_V17 + 2, verdictBytes.data(), 8 * std::size_t{verdictCount});
-        return ENCODED_SIZE_V17 + 2 + 8 * std::size_t{verdictCount};
+        const bool lease = hasLease && clientUnderstandsLeases(clientVersion);
+        if (!hasVerdicts && !lease) return ENCODED_SIZE_V17;
+        const uint16_t vc = hasVerdicts ? verdictCount : uint16_t{0};
+        detail::putLE16 (buf, static_cast<int>(ENCODED_SIZE_V17), vc);
+        if (vc != 0) std::memcpy(buf + ENCODED_SIZE_V17 + 2, verdictBytes.data(), 8 * std::size_t{vc});
+        std::size_t pos = ENCODED_SIZE_V17 + 2 + 8 * std::size_t{vc};
+        if (!lease) return pos;
+        buf[pos] = 1;
+        detail::putLE16(buf, static_cast<int>(pos + 1), leaseCount);
+        if (leaseCount != 0) std::memcpy(buf + pos + 3, leaseBytes.data(), 16 * std::size_t{leaseCount});
+        return pos + 3 + 16 * std::size_t{leaseCount};
     }
 
     /// Decode a full frame from buf[0..avail-1].
@@ -342,15 +389,26 @@ struct ProduceResponse {
         // The verdict trailer: exactly [count u16] + count x 8 bytes after the block.
         if (avail < blockEnd + 2) return std::nullopt;
         const uint16_t count = detail::getLE16(buf, static_cast<int>(blockEnd));
-        if (count > kMaxVerdictEntries || avail != blockEnd + 2 + 8 * std::size_t{count}) return std::nullopt;
+        const std::size_t verdictEnd = blockEnd + 2 + 8 * std::size_t{count};
+        if (count > kMaxVerdictEntries || avail < verdictEnd) return std::nullopt;
         msg.hasVerdicts  = true;
         msg.verdictCount = count;
         msg.verdictBytes = std::span<const uint8_t>(buf + blockEnd + 2, 8 * std::size_t{count});
+        if (avail == verdictEnd) return msg;
+        // The lease trailer (client 18): exactly [1][count u16] + count x 16 bytes after the verdict trailer.
+        if (avail < verdictEnd + 3 || buf[verdictEnd] != 1) return std::nullopt;
+        const uint16_t lc = detail::getLE16(buf, static_cast<int>(verdictEnd + 1));
+        if (lc > record::kMaxLeaseBatchRecords || count > record::kMaxLeaseBatchRecords ||
+            avail != verdictEnd + 3 + 16 * std::size_t{lc}) return std::nullopt;
+        msg.hasLease   = true;
+        msg.leaseCount = lc;
+        msg.leaseBytes = std::span<const uint8_t>(buf + verdictEnd + 3, 16 * std::size_t{lc});
         return msg;
     }
 };
 
 static_assert(kMaxJudgedBatchRecords == ProduceResponse::kMaxVerdictEntries);
+static_assert(ProduceResponse::kMaxEncodedSize == 49211);
 
 // ---------------------------------------------------------------------------
 // Subscribe  (templateId 18)  client→broker

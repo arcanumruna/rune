@@ -49,6 +49,19 @@ TEST(GeneratedRoundTrip, EncodeDecodeMatches) {
     EXPECT_EQ(fName.bytes, "Alice");
 }
 
+// A default-constructed row (the lease client encodes T{} as its revoke template) has an empty string_view, whose data() is null: the
+// generated encode() must not hand that null to memcpy (UBSan: "null pointer passed as argument 2"; red under UBSan without the guard).
+TEST(GeneratedRoundTripRegression, EmptyVarFieldEncodesWithoutNullCopyRegression) {
+    const rune::gen::Characters c{};
+    ASSERT_EQ(c.name.data(), nullptr);
+    std::vector<uint8_t> buf(c.encodedSize());
+    ASSERT_EQ(c.encode(buf.data()), buf.size());
+    const Descriptor& d = rune::gen::Characters::descriptor();
+    const auto fName = readField(d, buf, d.find("name")->id);
+    EXPECT_TRUE(fName.present);
+    EXPECT_TRUE(fName.bytes.empty());
+}
+
 TEST(GeneratedRoundTrip, FingerprintMatchesRuntimeDescriptor) {
     // The generated kFingerprint must match fingerprint(descriptor())
     const Descriptor& d = rune::gen::Characters::descriptor();

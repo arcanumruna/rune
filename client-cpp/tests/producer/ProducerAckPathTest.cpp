@@ -1177,6 +1177,84 @@ TEST(ProducerSequence, NotAuthorizedOnARetransmitStaysOutcomeUnknownRegression) 
     EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1));
 }
 
+// ---- Throttled (53) fail-fast: a retry-after that lands at/past the batch's delivery deadline ----
+namespace {
+ProducerConfig throttledCfg() {
+    ProducerConfig c = ackCfg(8, /*lingerUs=*/0);
+    c.produceTimeoutMs = 500;
+    c.deliveryTimeoutMs = 1'000;
+    return c;
+}
+constexpr int16_t kThrottled = 53;
+}  // namespace
+
+TEST(ProducerThrottledFailFastRegression, RetryAfterPastDeadlineFailsNowRegression) {
+    ProducerImpl impl(throttledCfg());
+    AckLedger L;
+    L.attachBatches(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    sendOne(impl, sink, 0);
+    ASSERT_EQ(cap.frames.size(), 1u);
+    const int16_t e0 = cap.frames[0].epoch;
+    impl.onProduceResponse(cap.frames[0].corrId, -1, kThrottled, 5'000'000'000LL);   // retry-after 5 s > 1 s deadline
+    ASSERT_EQ(L.batchAcks.size(), 1u) << "completed at once";
+    EXPECT_EQ(L.batchAcks[0].errorCode, kThrottled);
+    EXPECT_EQ(impl.throttledFailFast(), 1u);
+    EXPECT_EQ(impl.throttledBackoffs(), 0u);
+    EXPECT_FALSE(impl.hasInFlight());
+    // never re-sent: past the retry-after nothing goes out
+    impl.retransmitStalled(kNow + 6'000'000'000LL, sink);
+    impl.flushBatches(kNow + 6'000'000'000LL, 42, sink);
+    EXPECT_EQ(cap.frames.size(), 1u);
+    // the partition is not blocked: the next send goes at once with the given-back sequence, no epoch bump
+    sendOne(impl, sink, 0);
+    ASSERT_EQ(cap.frames.size(), 2u);
+    EXPECT_EQ(cap.frames[1].epoch, e0);
+    EXPECT_EQ(cap.frames[1].baseSequence, 0);
+    impl.onProduceResponse(cap.frames[1].corrId, 7, 0);
+    ASSERT_EQ(L.batchAcks.size(), 2u);
+    EXPECT_EQ(L.batchAcks[1].errorCode, 0);
+    EXPECT_EQ(impl.producerEpoch(), e0);
+}
+
+TEST(ProducerThrottledFailFastRegression, RetryAfterWithinDeadlineStillRetriesRegression) {
+    ProducerImpl impl(throttledCfg());
+    AckLedger L;
+    L.attachBatches(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    sendOne(impl, sink, 0);
+    ASSERT_EQ(cap.frames.size(), 1u);
+    impl.onProduceResponse(cap.frames[0].corrId, -1, kThrottled, 100'000'000LL);   // 100 ms < 1 s deadline
+    EXPECT_TRUE(L.batchAcks.empty());
+    EXPECT_EQ(impl.throttledFailFast(), 0u);
+    EXPECT_EQ(impl.throttledBackoffs(), 1u);
+    impl.retransmitStalled(kNow + 101'000'000LL, sink);
+    ASSERT_EQ(cap.frames.size(), 2u) << "re-sent after the retry-after";
+    impl.onProduceResponse(cap.frames[1].corrId, 7, 0);
+    ASSERT_EQ(L.batchAcks.size(), 1u);
+    EXPECT_EQ(L.batchAcks[0].errorCode, 0);
+}
+
+TEST(ProducerThrottledFailFastRegression, RetransmitThrottledIsOutcomeUnknownRegression) {
+    ProducerImpl impl(throttledCfg());
+    AckLedger L;
+    L.attachBatches(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    sendOne(impl, sink, 0);
+    const int16_t e0 = cap.frames[0].epoch;
+    ASSERT_EQ(impl.retransmitStalled(kNow + 600'000'000LL, sink), 1);   // past produceTimeoutMs, within the deadline
+    ASSERT_EQ(cap.frames.size(), 2u);
+    impl.onProduceResponse(cap.frames[1].corrId, -1, kThrottled, 5'000'000'000LL);
+    ASSERT_EQ(L.batchAcks.size(), 1u);
+    EXPECT_EQ(L.batchAcks[0].errorCode, kThrottled);
+    EXPECT_EQ(impl.throttledFailFast(), 1u);
+    EXPECT_FALSE(impl.hasInFlight());
+    EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1)) << "outcome unknown: re-identified";
+}
+
 // ---- C7 adversarial review (#222): the definite-non-append path against every sibling path ----
 
 // #222: the NEWEST batch is refused on its first attempt while an older one is still in flight (another lane's answer

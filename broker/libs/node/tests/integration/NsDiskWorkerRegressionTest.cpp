@@ -72,7 +72,7 @@ int answerOf(Rig& rig) {
     g_loop.now += AggLoop::kTick;
     if (g_loop.agg.doWork(g_loop.now) > 0)
         g_loop.agg.drain([&](const rune::node::Throttle& t) { rig.worker().applyNsThrottleDirect(t.slot, t.nsId, t.kind, t.untilNs); },
-                         [&](const rune::node::ViewMemOver&) {});
+                         [&](const rune::node::ViewMemOver&) {}, [&](const rune::node::LeasesOver&) {});
     return code;
 }
 /// Settle without a produce answer (after a scan or a limit change).

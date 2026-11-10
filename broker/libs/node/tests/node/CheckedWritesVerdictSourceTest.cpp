@@ -1106,3 +1106,39 @@ TEST(CheckedWritesVerdictSourceRegression, MemberCatchUpReadsPastTheJudgeCursorA
 TEST(CheckedWritesVerdictSourceRegression, MemberCatchUpReadsPastAJudgeCursorAtTheBoundRegression) {
     catchUpAcrossTheGapAtTheBound("cw-judge-at-bound", /*markerAboveHw=*/false);
 }
+
+TEST(LeaseNumbersRegression, VerdictViewKindLeaseIndexPinnedRegression) {
+    using rune::view::VerdictViewKind;
+    EXPECT_EQ(static_cast<int>(VerdictViewKind::KeyIndex), 1);
+    EXPECT_EQ(static_cast<int>(VerdictViewKind::Unique), 2);
+    EXPECT_EQ(static_cast<int>(VerdictViewKind::Check), 3);
+    EXPECT_EQ(static_cast<int>(VerdictViewKind::LeaseIndex), 4);
+    EXPECT_EQ(static_cast<int>(VerdictViewKind::TestReject), 200);
+}
+
+TEST(CheckedWritesVerdictSourceRegression, LeaseIndexAccepts128ByteKeyRegression) {
+    const auto build = [](rune::codec::Descriptor src, VerdictViewKind kind) {
+        ViewInstance inst(keyIndexPlan(5, 0), keyIndexRowLayout(), std::move(src), false, 0, 4096, kKeyIndexChunkBytes);
+        VerdictSource vs(5, 0);
+        vs.addVerdictView(&inst, kind, 0, kKeyIndexPlanFingerprint);
+    };
+    const auto str = [](uint16_t n) { return rune::codec::DescriptorBuilder("w", 1).addFixedStr("k", n, 1, true).build(); };
+    EXPECT_NO_THROW(build(str(128), VerdictViewKind::LeaseIndex));
+    EXPECT_NO_THROW(build(str(1), VerdictViewKind::LeaseIndex));
+    try {
+        build(str(129), VerdictViewKind::LeaseIndex);
+        ADD_FAILURE() << "129 bytes must throw";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_STREQ(e.what(), "lease index: the source key field must be fixed-width, 1 to 128 bytes");
+    }
+    const auto text = rune::codec::DescriptorBuilder("t", 1).add("k", P::String, 1, true).build();
+    EXPECT_THROW(build(text, VerdictViewKind::LeaseIndex), std::invalid_argument);
+    // the key index keeps its own bound and text
+    EXPECT_NO_THROW(build(str(16), VerdictViewKind::KeyIndex));
+    try {
+        build(str(17), VerdictViewKind::KeyIndex);
+        ADD_FAILURE() << "17 bytes must throw";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_STREQ(e.what(), "key index: the source key field must be fixed-width, 1 to 16 bytes");
+    }
+}

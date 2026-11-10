@@ -1,5 +1,6 @@
 // include/rune/codec/PrimType.h
 #pragma once
+#include <cstddef>
 #include <cstdint>
 namespace rune::codec {
 enum class PrimType : uint8_t { Int32, Int64, UInt16, UInt32, UInt64, Float64, Bool, Enum, String, Bytes, FixedStr };
@@ -22,6 +23,17 @@ constexpr bool isTopicKeyType(PrimType t, uint32_t width) noexcept {
   switch (t) {
     case PrimType::Int32: case PrimType::UInt16: case PrimType::UInt32: case PrimType::Int64: case PrimType::UInt64: return true;
     case PrimType::FixedStr: return width >= 1 && width <= kMaxTopicKeyBytes;
+    default: return false;
+  }
+}
+
+/// A lease topic's key may be a string(N) up to this width (equal to rune::protocol::kMaxLeaseKeyBytes; ApplyV4.cpp asserts it).
+inline constexpr std::size_t kMaxLeaseKeyBytes = 128;
+/// isTopicKeyType, except a FixedStr may be up to kMaxLeaseKeyBytes wide.
+constexpr bool isLeaseTopicKeyType(PrimType t, std::size_t width) noexcept {
+  switch (t) {
+    case PrimType::Int32: case PrimType::UInt16: case PrimType::UInt32: case PrimType::Int64: case PrimType::UInt64: return true;
+    case PrimType::FixedStr: return width >= 1 && width <= kMaxLeaseKeyBytes;
     default: return false;
   }
 }

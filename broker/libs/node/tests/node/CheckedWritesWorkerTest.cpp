@@ -288,3 +288,49 @@ TEST(CheckedWritesWorker, ControlRecordsAreNeverValidated) {
     ASSERT_FALSE(r.returns.empty());
     EXPECT_EQ(r.returns.back().type, WorkerReturn::Type::ControlRecordAppended);
 }
+
+namespace {
+rune::codec::Descriptor leaseDescriptorForWorker(const char* firstName) {
+    using rune::codec::PrimType;
+    rune::codec::DescriptorBuilder d("inst");
+    d.add(firstName, PrimType::Int64).add("lease_ttl_ms", PrimType::UInt64)
+        .add("lease_holder", PrimType::UInt64).add("lease_remaining_ms", PrimType::UInt64)
+        .addFixedStr("id", 64, 1, /*isKey=*/true);
+    return d.build();
+}
+void sendLeaseSpec(Rig& r) {
+    TopicWriteSpecWire w;
+    w.topicId = kTopic; w.lease = rune::protocol::LeaseSpec{};
+    WorkerOp op;
+    op.type = WorkerOp::Type::WriteSpecUpdate; op.topicId = w.topicId;
+    op.schemaUpdateBlob.resize(topicWriteSpecWireLen(w));
+    ASSERT_EQ(encodeTopicWriteSpec(w, op.schemaUpdateBlob), topicWriteSpecWireLen(w));
+    r.send(std::move(op));
+}
+}  // namespace
+
+// Lease review R4: a lease layout break is refused AND counted at the worker, on both arrival orders.
+TEST(LeaseWorkerRegression, LayoutBreakIsRefusedAndCountedRegression) {
+    {   // the write spec first: the bad SchemaUpdate is refused and counted
+        Rig r;
+        sendLeaseSpec(r);
+        r.sendVersion(leaseDescriptorForWorker("lease_version"), 1);
+        EXPECT_EQ(r.worker->leaseLayoutRefusedForTest(), 0u);
+        ASSERT_NE(r.worker->writeStateForTest(kTopic, 0), nullptr);
+        r.sendVersion(leaseDescriptorForWorker("lease_versionX"), 2);
+        EXPECT_EQ(r.worker->leaseLayoutRefusedForTest(), 1u);
+        EXPECT_EQ(r.worker->writeStateForTest(kTopic, 0)->spec->descriptorFor(2), nullptr) << "the bad version is not installed";
+        EXPECT_NE(r.worker->writeStateForTest(kTopic, 0)->spec->descriptorFor(1), nullptr);
+    }
+    {   // the bad version first, then the lease facts: setFacts erases it and the count rises by the erased number
+        Rig r;
+        r.sendVersion(leaseDescriptorForWorker("lease_versionX"), 1);
+        r.sendVersion(leaseDescriptorForWorker("lease_version"), 2);
+        EXPECT_EQ(r.worker->leaseLayoutRefusedForTest(), 0u);
+        sendLeaseSpec(r);
+        EXPECT_EQ(r.worker->leaseLayoutRefusedForTest(), 1u);
+        ASSERT_NE(r.worker->writeStateForTest(kTopic, 0), nullptr);
+        EXPECT_EQ(r.worker->writeStateForTest(kTopic, 0)->spec->descriptorFor(1), nullptr);
+        EXPECT_NE(r.worker->writeStateForTest(kTopic, 0)->spec->descriptorFor(2), nullptr);
+    }
+}

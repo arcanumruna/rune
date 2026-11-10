@@ -1363,6 +1363,7 @@ void BrokerNode::buildReplication() {
             // E3 Task 5: forward async-durability tier (0=Leader, 1=Majority, 2=Strict).
             pcfg.durabilityTier = spec->durabilityTier;
             pcfg.producerTailDepth = spec->autoIncrement ? rune::storage::kRetryWindowSize : 1;
+            pcfg.leaseTopic = spec->leaseTopic;
 
             // Determine the transport:
             //
@@ -1551,6 +1552,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         pcfg.durability = static_cast<rune::replication::DurabilityMode>(spec.durability);
         pcfg.durabilityTier = spec.durabilityTier;
         pcfg.producerTailDepth = spec.autoIncrement ? rune::storage::kRetryWindowSize : 1;
+        pcfg.leaseTopic = spec.leaseTopic;
 
         const bool onPerWorkerPlane =
             (topicId >= 0 && !perWorkerReplTransports_.empty());
@@ -1723,6 +1725,8 @@ void BrokerNode::buildWorkerPool() {
         workerPool_->worker(i).setDesiredFragmentLimit(config_.gatewayFragmentLimit);
         workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
         workerPool_->worker(i).setVerdictIntervalNs(config_.verdictIntervalMs * 1'000'000LL);
+        // Lease topics Task 11a: a promoted lease key is granted the leader heartbeat timeout (Election: max(electionTimeout, 3 x statusInterval)).
+        workerPool_->worker(i).setLeaseExtendNs(leaderHeartbeatTimeoutNs(config_));
         workerPool_->worker(i).setTxnJudgedRecordsMax(config_.txnJudgedRecordsMax);
         workerPool_->worker(i).setBackgroundSyncIntervalNs(config_.workerSyncIntervalMs * 1'000'000LL);
         if (!config_.ioWorkerCpus.empty()) workerPool_->worker(i).setIoWorkerCpus(config_.ioWorkerCpus);
@@ -2994,6 +2998,9 @@ void BrokerNode::buildGateway() {
     // Issue #82 (VLS Part A): a multi-node broker serves a view row only under a controller-granted read lease, handed
     // to each worker behind the role ops it covers.  A single node leads alone: unbounded.  Issue #486: the controller
     // commits a leader move that drops the old leader from the ISR only once that leader's lease has ended.
+    // Lease topics Task 27 (A.6): single node and multi node both post a led transient lease partition's lineage.
+    if (workerPool_ && metadataService_)
+        runtimeAgent_->enableLeaseLineageFanout(&BrokerNode::isTransientLeaseTopicTrampoline_, this);
     if (!config_.isSingleNode() && election_ && workerPool_) {
         for (int32_t i = 0; i < workerPool_->workerCount(); ++i) workerPool_->worker(i).requireViewReadLease();
         runtimeAgent_->enableReadLeaseFanout(workerPool_->workerCount());
@@ -4135,7 +4142,8 @@ TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m);   // defined wi
 // would have built).
 TopicSpec bootSpecOfFrame(uint32_t nsId, int32_t topicId, const std::string& name, int32_t partitions, int16_t rf,
                           rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c,
-                          const rune::protocol::TopicKeyFeatures& kf) {
+                          const rune::protocol::TopicKeyFeatures& kf,
+                          const std::optional<rune::protocol::LeaseSpec>& lease = std::nullopt) {
     CatalogTopicAppliedMsg m;
     m.nsId              = nsId;
     m.topicId           = topicId;
@@ -4145,6 +4153,7 @@ TopicSpec bootSpecOfFrame(uint32_t nsId, int32_t topicId, const std::string& nam
     m.persistence       = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
     m.config            = c;
     m.keyFeatures       = kf;
+    m.lease             = lease;
     return topicSpecFromCatalog(m);
 }
 
@@ -4186,17 +4195,9 @@ void BrokerNode::bootFromCatalog_() {
     sink.topicApplied = [&catalogTopics, this](const cat::TopicObject& t) {
         bootObjects_.onTopic(t.nsId, t.topicId, t.name);
         catalogTopics.push_back(bootSpecOfFrame(t.nsId, t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence,
-                                                t.config, t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{}));
+                                                t.config, t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{}, t.lease));
     };
-    sink.sinkApplied = [&catalogTopics, this](const SinkSpec& sp) {   // a view's sink: a keyed, compacted table, every broker
-        bootObjects_.onView(sp.nsId, sp.topicId, sp.name);
-        rune::protocol::TopicConfig c;
-        c.cleanupPolicy = 1;   // Compact
-        c.partitionKey  = sp.keyField;
-        TopicSpec bs = bootSpecOfFrame(sp.nsId, sp.topicId, sp.name, sp.partitions, /*rf*/0, sp.persistence, c, sp.sourceKeyFeatures);
-        bs.viewSink = true;   // VLS B.2: catalog-only -- no dir, no log, no replica
-        catalogTopics.push_back(std::move(bs));
-    };
+    sink.sinkApplied = [&catalogTopics, this](const SinkSpec& sp) { bootSinkApplied_(sp, catalogTopics); };
     const int replayed = bootApplier_->replayLocal(*catalogLog_, BootEffects{std::move(sink)});   // throws: refuse boot
     if (replayed >= 0) ++bootReplays_;
     std::sort(catalogTopics.begin(), catalogTopics.end(),
@@ -4553,12 +4554,13 @@ void BrokerNode::buildAdminWorker() {
         deps.respondGet = [this](int64_t session, int64_t corr, int32_t topicId,
                                  uint16_t version, int32_t partitionCount,
                                  const std::vector<uint8_t>& blob,
-                                 uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures) {
+                                 uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures,
+                                 const std::optional<rune::protocol::LeaseSpec>& lease, int32_t leaseViewTopicId) {
             if (!adminWorkerAgent_) return;
             // Fix round 3: the encode / post / MessageTooLarge logic lives in
             // AdminWorkerAgent::postTopicSchemaResponse (directly testable).
             adminWorkerAgent_->postTopicSchemaResponse(session, corr, topicId, version, partitionCount,
-                                                       blob, errorCode, keyFeatures);
+                                                       blob, errorCode, keyFeatures, lease, leaseViewTopicId);
         };
         deps.respondCreateView = [this](int64_t session, int64_t corr, int32_t viewTopicId,
                                         uint64_t outputFingerprint, uint16_t errorCode) {
@@ -5267,12 +5269,26 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             // cleaner's policy ring.  Every handler is idempotent (see BrokerNode.h).
             if (tid == kA2cCatalogTopicApplied) { onCatalogTopicApplied_(p, n); return; }
             if (tid == kA2cCatalogSinkApplied) {   // Task 12 (N5): a view sink — gated until its plan is on every worker
-                if (gateway_ && n >= 4) {
+                // A lease view sink has no plan: nothing to await (and it is never viewInstalled).
+                ++sinkAppliedDrained_;
+                CatalogTopicAppliedMsg decoded;   // decoded once; onCatalogTopicApplied_ reuses it
+                const bool ok = decodeCatalogTopicApplied(p, n, decoded, /*sink*/true);
+                // The raw flags bit decides, not the decode: a REFUSED lease frame must never be awaited (a forever-NotReady id).
+                const bool leaseView = decoded.leaseViewFlag;
+                if (!ok && leaseView) {
+                    int32_t refusedId = -1;
+                    if (n >= 4) std::memcpy(&refusedId, p, 4);
+                    noteLeaseSinkRefused_(refusedId, "live");
+                }
+                if (gateway_ && n >= 4 && !leaseView) {
                     int32_t viewTopicId;
                     std::memcpy(&viewTopicId, p, 4);
                     gateway_->noteViewSinkAwaitingPlan(viewTopicId);
                 }
-                onCatalogTopicApplied_(p, n, /*isView*/true);
+                // Lease topics Task 13a: a lease view reads and routes by its SOURCE topic and its read is authorised as READ on that topic.
+                // The mapping lives in the TopicRegistry's sink spec (TopicSpec::leaseSourceTopicId, set by topicSpecFromCatalog on this live
+                // path and by the boot sink): it dies with dropTopic, so there is nothing to forget.
+                onCatalogTopicApplied_(p, n, /*isView*/true, ok ? &decoded : nullptr);
                 return;
             }
             if (tid == kA2cCatalogTopicDropped) {
@@ -5359,7 +5375,8 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     if (workerPool_) work += topicDroppedFanout_.pump(*workerPool_);   // R-M1
     if (workerPool_ && nsAggregator_.slotCapacity() != 0) {            // Namespaces Phase 2 Task 14 (D28): one tick per period
         if (nsAggregator_.doWork(nowNs) > 0)
-            nsAggregator_.drain([&](const Throttle& t) { nsSlotFanout_.post(t); }, [&](const ViewMemOver& v) { nsSlotFanout_.post(v); });
+            nsAggregator_.drain([&](const Throttle& t) { nsSlotFanout_.post(t); }, [&](const ViewMemOver& v) { nsSlotFanout_.post(v); },
+                                  [&](const LeasesOver& l) { nsSlotFanout_.post(l); });
     }
     if (workerPool_) work += nsSlotFanout_.pump(*workerPool_);         // Namespaces Phase 2 Task 8 (D22)
     publishNsSlotMetrics_();
@@ -5943,6 +5960,10 @@ TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m) {
     s.partitionKey           = c.partitionKey;
     s.partitioner            = m.keyFeatures.partitioner;
     s.autoIncrement          = m.keyFeatures.autoIncrement;
+    s.leaseTopic             = m.lease.has_value();
+    s.leaseSourceTopicId     = m.leaseView ? m.leaseSourceTopicId : -1;   // Task 13a: a lease view sink names its lease topic
+    s.leaseKeyType           = m.leaseView ? m.leaseKeyType : 0;           // Task 13b: ... and that topic's key
+    s.leaseKeyWidth          = m.leaseView ? m.leaseKeyWidth : 0;
     return s;
 }
 } // namespace
@@ -5958,6 +5979,9 @@ bool BrokerNode::catalogTopicServesForTest(int32_t topicId) {
 void BrokerNode::holdCleanerViewAckForTest(bool on) {
     onCleanerThreadForTest([this, on]() { cleanerAgent_->setHoldViewAckForTest(on); });
 }
+void BrokerNode::setCleanerNowForTest(std::function<int64_t()> nowMs) {
+    onCleanerThreadForTest([this, f = std::move(nowMs)]() mutable { cleanerAgent_->setNowForTest(std::move(f)); });
+}
 void BrokerNode::holdDroppedDirPurgeForTest(bool on) {
     onAdminThreadForTest([this, on]() { adminWorkerAgent_->setHoldDroppedDirPurgeForTest(on); });
 }
@@ -5971,13 +5995,42 @@ bool BrokerNode::catalogNameHeldByDrop_(uint32_t nsId, const std::string& name) 
     return false;
 }
 
-void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView) {
-    CatalogTopicAppliedMsg m;
-    if (!decodeCatalogTopicApplied(p, n, m)) {
+/// The boot replay's sink effect (also the catalog-checkpoint restore's: one lambda calls this).  A lease view sink that names no lease
+/// topic is NOT registered - no TopicSpec, no write-spec view id - because the gateway authorises a lease view's reads as READ on its
+/// topic and routes by it; it is logged critical once per view id and counted (leaseSinkRefused_).  Fail closed.
+void BrokerNode::bootSinkApplied_(const SinkSpec& sp, std::vector<TopicSpec>& out) {
+    if (!leaseViewSinkValid(sp)) {
+        noteLeaseSinkRefused_(sp.topicId, "boot");
+        return;
+    }
+    bootObjects_.onView(sp.nsId, sp.topicId, sp.name);
+    rune::protocol::TopicConfig c;
+    c.cleanupPolicy = 1;   // Compact
+    c.partitionKey  = sp.keyField;
+    TopicSpec bs = bootSpecOfFrame(sp.nsId, sp.topicId, sp.name, sp.partitions, /*rf*/0, sp.persistence, c, sp.sourceKeyFeatures);
+    bs.viewSink = true;   // VLS B.2: catalog-only -- no dir, no log, no replica
+    bs.leaseSourceTopicId = sp.leaseView ? sp.leaseSourceTopicId : -1;   // Task 13a: the gateway registry holds the lease view's source
+    bs.leaseKeyType       = sp.leaseView ? sp.leaseKeyType : 0;          // Task 13b: ... and that topic's key
+    bs.leaseKeyWidth      = sp.leaseView ? sp.leaseKeyWidth : 0;
+    out.push_back(std::move(bs));
+}
+
+void BrokerNode::noteLeaseSinkRefused_(int32_t viewTopicId, const char* where) {
+    ++leaseSinkRefused_;
+    if (leaseSinkRefusedIds_.insert(viewTopicId).second) {
+        spdlog::critical("BrokerNode[{}]: the lease view sink (id={}) names no lease topic ({}): it is REFUSED - not registered, not served "
+                         "(fail closed); the catalog is damaged", config_.nodeId, viewTopicId, where);
+    }
+}
+
+void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView, const CatalogTopicAppliedMsg* decoded) {
+    CatalogTopicAppliedMsg local;
+    if (decoded == nullptr && !decodeCatalogTopicApplied(p, n, local, /*sink*/isView)) {
         if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
             spdlog::error("BrokerNode[{}]: malformed kA2cCatalogTopicApplied (len={}) skipped", config_.nodeId, n);
         return;
     }
+    const CatalogTopicAppliedMsg& m = decoded != nullptr ? *decoded : local;
     // Authentication Task 12 (spec §6): the gateway's ObjectIndex and every authenticated session's permission table
     // learn the object at the moment the catalog effect is applied here (idempotent), before it is built.
     if (gateway_) gateway_->onCatalogObjectApplied(m.nsId, m.topicId, m.name, isView);
@@ -6057,7 +6110,12 @@ void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
 void BrokerNode::postBootWriteSpecs_() {
     if (!workerPool_ || !bootApplier_ || !schemaRegistry_) return;
     for (const rune::catalog::TopicObject* t : bootApplier_->state().topics()) {
-        const auto w = writeSpecWireOf(*t);
+        // Task 13a: a lease topic names its lease view (the catalog's id) in the boot write spec too, or a worker could not map
+        // `<topic>.leases` to its source until the admin thread's later (idempotent) post.
+        int32_t leaseView = -1;
+        if (t->lease)
+            if (const rune::catalog::ViewObject* lv = bootApplier_->state().leaseViewOf(t->objectId)) leaseView = lv->def.viewTopicId;
+        const auto w = writeSpecWireOf(*t, leaseView);
         if (!w) continue;
         for (uint16_t v = 1; v <= t->schema->schemaVersion; ++v)
             if (const RegistryEntry* e = schemaRegistry_->byIdVersion(t->topicId, v))
@@ -6898,6 +6956,13 @@ bool BrokerNode::isTransientTopicTrampoline_(void* ctx, int32_t topicId) noexcep
     if (self->topicRegistry_ == nullptr) return false;
     const TopicSpec* spec = self->topicRegistry_->topic(topicId);
     return spec != nullptr && spec->persistence == PersistenceMode::Transient;
+}
+
+bool BrokerNode::isTransientLeaseTopicTrampoline_(void* ctx, int32_t topicId) noexcept {
+    auto* self = static_cast<BrokerNode*>(ctx);
+    if (self->topicRegistry_ == nullptr) return false;
+    const TopicSpec* spec = self->topicRegistry_->topic(topicId);
+    return spec != nullptr && spec->leaseTopic && spec->persistence == PersistenceMode::Transient;
 }
 
 uint64_t BrokerNode::transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept {

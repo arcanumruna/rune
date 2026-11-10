@@ -7,6 +7,7 @@
 #include <rune/protocol/client/DataMessages.h>
 
 #include <gtest/gtest.h>
+#include <random>
 
 #include <algorithm>
 #include <bit>
@@ -406,7 +407,7 @@ TEST(SessionAckSinkRegression, RegistrationThatResolvedToErrorIsNeverDrained) {
 namespace {
 AckEntry unknownPid(int64_t sid, int64_t corr, int64_t logStart) {
     AckEntry a{sid, corr, 0, 3, static_cast<int16_t>(pc::ErrorCode::UnknownProducerId)};
-    a.logStartOffset = logStart;
+    a.setLogStartOffset(logStart);
     return a;
 }
 std::optional<pc::ProduceResponse> sentTo(const FakePolicy::State& st, int64_t sid) {
@@ -1166,7 +1167,7 @@ TEST(SessionAckSinkRegression, MassCloseOfEverySessionKeepsEveryTombstoneRegress
 namespace {
 AckEntry v17Ack(int64_t sid, int64_t corr, uint64_t assignedBase, bool trailer) {
     AckEntry a{sid, corr, 5, 2, 0};
-    a.assignedBase = assignedBase;
+    a.setAssignedBase(static_cast<int64_t>(assignedBase));
     a.hasVerdicts  = trailer ? 1 : 0;
     return a;
 }
@@ -1280,16 +1281,72 @@ TEST(CheckedWritesAckSink, ArenaRunsAreFreedOnClaimDropAndFail) {
 }
 
 TEST(CheckedWritesAckSink, ArenaReusesTheFreedRegionAndRefusesWhenFull) {
-    VerdictAckArena a(16, 4);
-    uint32_t r1, r2, r3;
-    ASSERT_TRUE(a.reserveVerdicts(10, r1));
-    EXPECT_FALSE(a.reserveVerdicts(10, r2)) << "no room before the end and none at the start";
-    ASSERT_TRUE(a.reserveVerdicts(6, r2));
+    VerdictAckArena a(16);
+    uint32_t r1, r2, r3, r4, r5;
+    ASSERT_TRUE(a.reserveVerdicts(10, r1)) << "10 units take the whole 16-unit block";
+    EXPECT_FALSE(a.reserveVerdicts(1, r2)) << "full";
     a.free(r1);
-    ASSERT_TRUE(a.reserveVerdicts(10, r3)) << "wraps to 0 once the head advanced";
-    EXPECT_EQ(a.used(), 16u);
-    a.free(r2); a.free(r3);
+    ASSERT_TRUE(a.reserveVerdicts(6, r2));   // an 8-unit block
+    ASSERT_TRUE(a.reserveVerdicts(4, r3));
+    ASSERT_TRUE(a.reserveVerdicts(4, r4));
+    EXPECT_FALSE(a.reserveVerdicts(1, r5)) << "every block is used";
+    EXPECT_EQ(a.used(), 14u) << "used() counts the requested units";
+    a.free(r3);
+    ASSERT_TRUE(a.reserveVerdicts(3, r5)) << "the freed 4-unit block is reused";
+    a.free(r2); a.free(r4); a.free(r5);
     EXPECT_EQ(a.used(), 0u);
+    ASSERT_TRUE(a.reserveVerdicts(16, r1)) << "every freed block merged back into one";
+}
+
+// Review I1 (lease Task 5c): the arena freed only in allocation order, so one run held for a long time (a known-old duplicate
+// parked on its fire condition, a Lost or back-pressured session's queued ack) blocked every run reserved after it, worker-wide.
+TEST(VerdictAckArenaRegression, FreesOutOfOrderRegression) {
+    VerdictAckArena a(64);
+    uint32_t held, r;
+    ASSERT_TRUE(a.reserveVerdicts(1, held));   // never freed during the churn
+    for (int i = 0; i < 1000; ++i) {
+        ASSERT_TRUE(a.reserveVerdicts(32, r)) << "run " << i << " behind a held run";
+        a.free(r);
+    }
+    a.free(held);
+    ASSERT_TRUE(a.reserveVerdicts(64, r));
+}
+
+TEST(VerdictAckArenaRegression, MergesBuddiesInAnyFreeOrderRegression) {
+    VerdictAckArena a(16);
+    std::array<uint32_t, 16> runs{};
+    for (auto& run : runs) ASSERT_TRUE(a.reserveVerdicts(1, run));
+    std::mt19937 rng(7);
+    std::array<std::size_t, 16> order{};
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    for (int round = 0; round < 50; ++round) {
+        std::shuffle(order.begin(), order.end(), rng);
+        for (const std::size_t i : order) { a.free(runs[i]); a.free(runs[i]); }   // a second free is a no-op
+        EXPECT_EQ(a.used(), 0u);
+        uint32_t whole;
+        ASSERT_TRUE(a.reserveVerdicts(16, whole)) << "round " << round;
+        a.free(whole);
+        for (auto& run : runs) ASSERT_TRUE(a.reserveVerdicts(1, run));
+    }
+}
+
+TEST(SessionAckSinkRegression, BlockedSessionNeverStallsAnotherSessionsTrailersRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    s.resizeVerdictArenaForTest(64);
+    ASSERT_TRUE(s.announce(7, "c7", 1, pc::kClientVersionCheckedWrites));   // publication 1
+    pass(s); pass(s);
+    ASSERT_TRUE(s.announce(9, "c9", 1, pc::kClientVersionCheckedWrites));   // publication 2
+    pass(s); pass(s);
+    st->blocked.insert(1);                                  // session 7's publication back-pressures: its ack stays queued
+    ASSERT_TRUE(s.enqueue(withRun(s, 7, 1, 1)));
+    s.flush(0, 0);
+    ASSERT_TRUE(s.holding(7)) << "vacuity guard: session 7's ack (and its run) is held";
+    ASSERT_EQ(s.verdictsUsedForTest(), 1u);
+    for (int i = 0; i < 100; ++i) {
+        ASSERT_TRUE(s.enqueue(withRun(s, 9, 100 + i, 32))) << i;   // withRun asserts the reserve succeeded
+        s.flush(0, 0);
+        ASSERT_EQ(s.verdictsUsedForTest(), 1u) << "session 9's run was freed on its claim; only session 7's is held (" << i << ")";
+    }
 }
 
 TEST(CheckedWritesAckSink, AckTermIsNeverBelowTheFloor) {
@@ -1297,4 +1354,67 @@ TEST(CheckedWritesAckSink, AckTermIsNeverBelowTheFloor) {
     EXPECT_EQ(withAckTermLength("aeron:udp?endpoint=h:1|term-length=64k", 0), "aeron:udp?endpoint=h:1|term-length=524288");
     EXPECT_EQ(withAckTermLength("aeron:udp?term-length=1048576", 65536), "aeron:udp?term-length=1048576");
     EXPECT_EQ(withAckTermLength("aeron:udp?endpoint=h:1", 0), "aeron:udp?endpoint=h:1|term-length=524288");
+}
+
+// H1 (lease write hook): a positive id this worker has not seen announced yet is retriable (-1); an id that can never be announced
+// (<= 0) is a definite answer (0, which the hook maps to InvalidRequest), so a client can never retry one forever.
+TEST(SessionAckSinkRegression, ClientVersionOfNonPositiveSessionIsDefiniteRegression) {
+    FakePolicy pol;
+    Sink s(pol);
+    ASSERT_TRUE(s.announce(7, "c", 1, 18));
+    EXPECT_EQ(s.clientVersionOf(7), 18);
+    EXPECT_EQ(s.clientVersionOf(8), -1) << "a positive id not announced yet: retriable";
+    EXPECT_EQ(s.clientVersionOf(0), 0) << "session 0 never announces: definite";
+    EXPECT_EQ(s.clientVersionOf(-1), 0);
+    EXPECT_EQ(s.clientVersionOf(INT64_MIN), 0);
+}
+
+// ===========================================================================
+// Task 23 (reduced): AckEntry is one cache line; its single aux slot is read by the error code.
+// ===========================================================================
+static_assert(sizeof(AckEntry) == 64, "AckEntry is one cache line");
+
+TEST(SessionAckSinkAckEntryRegression, AckEntryIsOneCacheLineRegression) {
+    EXPECT_EQ(sizeof(AckEntry), 64u);
+    EXPECT_EQ(alignof(AckEntry), 64u);
+}
+
+TEST(SessionAckSinkAckEntryRegression, AckAuxSlotByErrorCodeRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ASSERT_TRUE(s.announce(7, "c7", 1, pc::kClientVersion));
+    ASSERT_TRUE(s.announce(8, "c8", 1, pc::kClientVersionNamespaces - 1));
+    pass(s); pass(s);
+    // 1: an ok ack with an assigned base
+    AckEntry ok{7, 1, 5, 2, 0};
+    ok.setAssignedBase(77);
+    // 2: UnknownProducerId with a log start
+    AckEntry unk{7, 2, 0, 3, static_cast<int16_t>(pc::ErrorCode::UnknownProducerId)};
+    unk.setLogStartOffset(5);
+    // 3: Throttled with a retry-after, to a v14+ session and to one below
+    AckEntry thr{7, 3, 0, 3, static_cast<int16_t>(pc::ErrorCode::Throttled)};
+    thr.setLogStartOffset(9);
+    AckEntry thrOld{8, 4, 0, 3, static_cast<int16_t>(pc::ErrorCode::Throttled)};
+    thrOld.setLogStartOffset(9);
+    // 4: any other error ack carries neither value (the slot keeps its -1)
+    AckEntry failed{7, 5, 5, 2, static_cast<int16_t>(pc::ErrorCode::NotLeader)};
+    for (const AckEntry& a : {ok, unk, thr, thrOld, failed}) ASSERT_TRUE(s.enqueue(a));
+    pass(s);
+    auto frame = [&](int64_t corr) {
+        for (const auto& [pub, f] : st->sent)
+            if (auto r = pc::ProduceResponse::decode(f.data(), f.size()); r && r->correlationId == corr) return r;
+        return std::optional<pc::ProduceResponse>{};
+    };
+    auto r1 = frame(1); ASSERT_TRUE(r1);
+    EXPECT_EQ(r1->assignedBase, 77u);
+    EXPECT_EQ(r1->logStartOffset, -1);
+    auto r2 = frame(2); ASSERT_TRUE(r2);
+    EXPECT_EQ(r2->logStartOffset, 5);
+    EXPECT_EQ(r2->assignedBase, 0u);
+    auto r3 = frame(3); ASSERT_TRUE(r3);
+    EXPECT_EQ(r3->logStartOffset, 9);
+    auto r4 = frame(4); ASSERT_TRUE(r4);
+    EXPECT_EQ(r4->logStartOffset, -1) << "a pre-v14 client gets no retry-after";
+    auto r5 = frame(5); ASSERT_TRUE(r5);
+    EXPECT_EQ(r5->logStartOffset, -1) << "an error ack without a log start";
+    EXPECT_EQ(r5->assignedBase, 0u);
 }

@@ -12,6 +12,7 @@
 //   | produce-bytes/s      | throttled                      | limit raised / removed mid-tick | the next tick clears (or shortens) it      | NsLimitAggregatorRegression.LimitRaisedMidTickRegression
 //   | max-disk-bytes       | node total of two workers      | below / at / above, then drop  | Throttle{Disk, INT64_MAX} then {Disk, 0}   | NsLimitAggregatorRegression.DiskIsTheNodeTotalRegression
 //   | max-view-memory      | node total of two workers      | below / above / below          | ViewMemOver on, then off                   | NsLimitAggregatorRegression.ViewMemIsTheNodeTotalRegression
+//   | max-leases           | node total of two workers      | below / at / above / below     | LeasesOver on at >= limit, then off; limit 0 never on | NsLimitAggregatorRegression.LeasesOverBroadcastOnChangeRegression
 //   | any                  | a report for a stale nsId      | slot recreated                 | dropped and counted, never applied         | NsLimitAggregatorRegression.StaleNsIdReportDroppedRegression
 //   | any                  | slot released and reassigned   | old debt                       | the new owner starts clear                 | NsLimitAggregatorRegression.RecreatedSlotStartsClearRegression
 #include <gtest/gtest.h>
@@ -39,6 +40,7 @@ struct Rig {
     int64_t now = 1'000'000'000;
     std::vector<Throttle> throttles;
     std::vector<ViewMemOver> viewMem;
+    std::vector<LeasesOver> leases;
     uint64_t cum[kNsMetrics] = {};
 
     explicit Rig(const NamespaceLimits& l, uint32_t sources = 1) {
@@ -50,7 +52,7 @@ struct Rig {
     int tick() {
         now += kTick;
         const int n = agg.doWork(now);
-        agg.drain([&](const Throttle& t) { throttles.push_back(t); }, [&](const ViewMemOver& v) { viewMem.push_back(v); });
+        agg.drain([&](const Throttle& t) { throttles.push_back(t); }, [&](const ViewMemOver& v) { viewMem.push_back(v); }, [&](const LeasesOver& l) { leases.push_back(l); });
         return n;
     }
     void add(NsMetric m, uint64_t delta, uint32_t source = 0) {
@@ -238,6 +240,54 @@ TEST(NsLimitAggregatorRegression, ViewMemIsTheNodeTotalRegression) {
     rig.tick();
     ASSERT_EQ(rig.viewMem.size(), 2u);
     EXPECT_FALSE(rig.viewMem[1].on);
+}
+
+// Lease topics Task 21: max-leases is a node total, over AT the limit (the next grant would exceed it), broadcast on change only.
+TEST(NsLimitAggregatorRegression, LeasesOverBroadcastOnChangeRegression) {
+    NamespaceLimits l;
+    l.maxLeases = 5;
+    Rig rig(l, 2);
+    EXPECT_TRUE(rig.agg.report(0, kSlot, kNs, NsMetric::Leases, 3));
+    EXPECT_TRUE(rig.agg.report(1, kSlot, kNs, NsMetric::Leases, 1));
+    rig.tick();
+    EXPECT_TRUE(rig.leases.empty()) << "4 < 5 is not over";
+    EXPECT_TRUE(rig.agg.report(1, kSlot, kNs, NsMetric::Leases, 2));
+    rig.tick();
+    ASSERT_EQ(rig.leases.size(), 1u) << "3 + 2 == the limit: the next grant would exceed it";
+    EXPECT_TRUE(rig.leases[0].on);
+    EXPECT_EQ(rig.leases[0].nsId, kNs);
+    EXPECT_EQ(rig.leases[0].slot, kSlot);
+    rig.tick();
+    rig.tick();
+    EXPECT_EQ(rig.leases.size(), 1u) << "no change, no event";
+    EXPECT_TRUE(rig.viewMem.empty());
+    EXPECT_TRUE(rig.agg.report(1, kSlot, kNs, NsMetric::Leases, 1));
+    rig.tick();
+    ASSERT_EQ(rig.leases.size(), 2u);
+    EXPECT_FALSE(rig.leases[1].on);
+    // A report for a stale nsId is dropped: it never moves the count.
+    const uint64_t stale = rig.agg.staleReports();
+    EXPECT_FALSE(rig.agg.report(0, kSlot, kNs + 1, NsMetric::Leases, 1000));
+    EXPECT_EQ(rig.agg.staleReports(), stale + 1);
+    rig.tick();
+    EXPECT_EQ(rig.leases.size(), 2u);
+    EXPECT_EQ(rig.agg.totalOf(kSlot, NsMetric::Leases), 4u);
+    // Limit 0 is unlimited: never on, however many leases.
+    NamespaceLimits u;
+    Rig un(u);
+    EXPECT_TRUE(un.agg.report(0, kSlot, kNs, NsMetric::Leases, 1'000'000'000));
+    un.tick(); un.tick();
+    EXPECT_TRUE(un.leases.empty());
+    // A limit raised while over clears it on the next tick.
+    EXPECT_TRUE(rig.agg.report(0, kSlot, kNs, NsMetric::Leases, 5));
+    rig.tick();
+    ASSERT_EQ(rig.leases.size(), 3u);
+    EXPECT_TRUE(rig.leases[2].on);
+    NamespaceLimits more; more.maxLeases = 100;
+    rig.agg.onSlotAssign(kSlot, kNs, more);
+    rig.tick();
+    ASSERT_EQ(rig.leases.size(), 4u);
+    EXPECT_FALSE(rig.leases[3].on);
 }
 
 TEST(NsLimitAggregatorRegression, StaleNsIdReportDroppedRegression) {

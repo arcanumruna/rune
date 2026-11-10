@@ -650,6 +650,12 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
                 // this thread): deliver nothing more of the batch.
                 if (!impl.active) return;
                 if (absOffset < dropBelow) [[unlikely]] return;   // delivered before the move
+                // Task 14a: a lease Checkpoint record is the broker's own bookkeeping - never delivered, but its offset is
+                // consumed so the resume position moves past it (bits 2-3 are reserved, and refused on produce, elsewhere).
+                if (rune::protocol::record::leaseOpOf(attributes) == rune::protocol::record::LeaseOp::Checkpoint) [[unlikely]] {
+                    impl.nextOffset = absOffset + 1;
+                    return;
+                }
 
                 Record rec;
                 rec.partition = partitionOfRecords;
@@ -1254,11 +1260,12 @@ bool SubscriberHub::failPendingSubscribe(int64_t correlationId, SubscriptionFail
 }
 
 bool SubscriberHub::failActiveSubscription(int64_t subscriptionId, SubscriptionFailReason reason,
-                                           int64_t unsubCorrId, int64_t sessionId, const SendFn& submitFn)
+                                           int64_t unsubCorrId, int64_t sessionId, const SendFn& submitFn, uint16_t brokerCode)
 {
     const auto it = activeById_.find(subscriptionId);
     if (it == activeById_.end() || !it->second->active) return false;
     it->second->failReason = reason;  // before the finish: the final snapshot carries it
+    if (brokerCode != 0) it->second->brokerErrorCode = brokerCode;
     return unsubscribe(it->second->correlationId, unsubCorrId, sessionId, submitFn);
 }
 

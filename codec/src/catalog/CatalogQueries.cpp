@@ -197,8 +197,8 @@ void diffType(ObjectType type, const std::vector<const Obj*>& a, const std::vect
     addPairs(byName, a, true);
     addPairs(byName, b, false);
     for (const auto& [key, p] : byName) {
-        const uint64_t fa = p.first ? fingerprintOf(*p.first) : 0;
-        const uint64_t fb = p.second ? fingerprintOf(*p.second) : 0;
+        const uint64_t fa = p.first ? layeredFingerprint(*p.first) : 0;
+        const uint64_t fb = p.second ? layeredFingerprint(*p.second) : 0;
         if (p.first && p.second && fa == fb) continue;
         DiffEntry d{.change = !p.first ? DiffEntry::Change::Added
                             : !p.second ? DiffEntry::Change::Removed
@@ -271,6 +271,7 @@ std::vector<std::string> changedFields(const TopicObject& a, const TopicObject& 
     if (x.durabilityTier != y.durabilityTier) out.emplace_back("config.durabilityTier");
     if (x.coPartitionGroup != y.coPartitionGroup) out.emplace_back("config.coPartitionGroup");
     if (x.partitionKey != y.partitionKey) out.emplace_back("config.partitionKey");
+    if (a.lease != b.lease) out.emplace_back("lease");
     if (a.schema.has_value() != b.schema.has_value()) out.emplace_back("schema");
     else if (a.schema) schemaFields(*a.schema, *b.schema, out);
     return out;
@@ -281,6 +282,7 @@ std::vector<std::string> changedFields(const ViewObject& a, const ViewObject& b)
     if (a.version != b.version) out.emplace_back("version");
     if (a.def.sinkPartitions != b.def.sinkPartitions) out.emplace_back("view.sinkPartitions");
     if (a.def.persistence != b.def.persistence) out.emplace_back("view.persistence");
+    if (a.kind != b.kind) out.emplace_back("view.kind");
     if (a.def.keyField != b.def.keyField) out.emplace_back("view.keyField");
     if (a.def.sourceNames != b.def.sourceNames) out.emplace_back("view.sources");
     if (a.def.normalizedPlanBlob != b.def.normalizedPlanBlob) out.emplace_back("view.plan");

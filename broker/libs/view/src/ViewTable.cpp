@@ -83,6 +83,7 @@ ViewTable::ViewTable(RowLayout layout, size_t initialIndexSlots, size_t chunkByt
     : layout_(std::move(layout)), keyWidth_(keys.keyWidth), prefixWidth_(keys.prefixWidth), hashSeed_(keys.hashSeed),
       hashMask_(keys.hashMaskForTest), headerLen_(keys.keyWidth > 8 ? keys.keyWidth : 0),
       rowStride_(headerLen_ + static_cast<size_t>(layout_.rowLen)) {
+    auxBytes_ = keys.auxBytesPerRow;
     assert(keyWidth_ <= rune::codec::kMaxViewKeyBytes && "ViewTable: keyWidth over kMaxViewKeyBytes");
     assert(initialIndexSlots > 0 && std::has_single_bit(initialIndexSlots) &&
            "ViewTable: initialIndexSlots must be a power of two");
@@ -129,6 +130,12 @@ void ViewTable::appendChunk() {
         std::unique_ptr<uint8_t[]> chunk(new uint8_t[bytes]);
         std::memset(chunk.get(), 0, bytes);
         chunks_.push_back(std::move(chunk));
+        if (auxBytes_ > 0) {
+            const size_t abytes = rowsPerChunk_ * auxBytes_;
+            std::unique_ptr<uint8_t[]> a(new uint8_t[abytes]);
+            std::memset(a.get(), 0, abytes);
+            auxChunks_.push_back(std::move(a));
+        }
     }
     // dirty_/dirtyKeys_ are indexed by rid and must cover every valid rid.
     // Grown here (alongside the row slab) rather than on index rehash:
@@ -319,6 +326,18 @@ uint8_t* ViewTable::put(uint64_t key) {
     return putImpl(probeOf(key));
 }
 uint8_t* ViewTable::put(const ViewKey& key) { return putImpl(probeOf(key)); }
+uint8_t* ViewTable::put(const ViewKey& key, uint32_t& rid) { return putImpl(probeOf(key), &rid); }
+
+const uint8_t* ViewTable::find(const ViewKey& key, uint32_t& rid) const noexcept {
+    const Probe p = probeOf(key);
+    const size_t pi = findP(p);
+    if (pi != static_cast<size_t>(-1)) { rid = main_.rid[pi]; return rowAddr(rid); }
+    if (main_.migrating) {
+        const size_t oi = findO(p);
+        if (oi != static_cast<size_t>(-1)) { rid = main_.orid[oi]; return rowAddr(rid); }
+    }
+    return nullptr;
+}
 
 const uint8_t* ViewTable::get(uint64_t key) const noexcept {
     assert(keyWidth_ <= 8 && prefixWidth_ == 0);
@@ -326,13 +345,24 @@ const uint8_t* ViewTable::get(uint64_t key) const noexcept {
 }
 const uint8_t* ViewTable::get(const ViewKey& key) const noexcept { return getImpl(probeOf(key)); }
 
+bool ViewTable::ridOf(const ViewKey& key, uint32_t& rid) const noexcept {
+    const Probe p = probeOf(key);
+    const size_t pi = findP(p);
+    if (pi != static_cast<size_t>(-1)) { rid = main_.rid[pi]; return true; }
+    if (main_.migrating) {
+        const size_t oi = findO(p);
+        if (oi != static_cast<size_t>(-1)) { rid = main_.orid[oi]; return true; }
+    }
+    return false;
+}
+
 bool ViewTable::erase(uint64_t key) noexcept {
     assert(keyWidth_ <= 8 && prefixWidth_ == 0);
     return eraseImpl(probeOf(key));
 }
 bool ViewTable::erase(const ViewKey& key) noexcept { return eraseImpl(probeOf(key)); }
 
-uint8_t* ViewTable::putImpl(const Probe& p) {
+uint8_t* ViewTable::putImpl(const Probe& p, uint32_t* ridOut) {
     main_.maybePrezero(sz_);
     if (main_.migrating) {
         // Deferring the grow-check while already migrating is safe: NEW
@@ -352,6 +382,7 @@ uint8_t* ViewTable::putImpl(const Probe& p) {
         const uint32_t rid = main_.rid[pi];
         dirtyKeys_[rid] = p.word;
         markDirty(rid);
+        if (ridOut != nullptr) *ridOut = rid;
         return rowAddr(rid); // idempotent upsert: existing key in NEW/primary, no dup
     }
     if (main_.migrating) {
@@ -360,6 +391,7 @@ uint8_t* ViewTable::putImpl(const Probe& p) {
             const uint32_t rid = main_.orid[oi];
             dirtyKeys_[rid] = p.word;
             markDirty(rid);
+            if (ridOut != nullptr) *ridOut = rid;
             return rowAddr(rid); // idempotent upsert: existing key still only in OLD
         }
     }
@@ -401,6 +433,7 @@ uint8_t* ViewTable::putImpl(const Probe& p) {
     dirtyKeys_[rid] = p.word;
     markDirty(rid);
     if (prefixWidth_) prefixInsert(p, rid);
+    if (ridOut != nullptr) *ridOut = rid;
     return row;
 }
 

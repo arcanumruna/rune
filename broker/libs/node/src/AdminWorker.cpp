@@ -8,6 +8,8 @@
 #include <rune/node/CatalogEffectFrames.h>
 #include <rune/node/ConstraintDdlRules.h>
 #include <rune/node/FdBudget.h>
+#include <rune/node/lease/LeaseIndex.h>
+#include <rune/protocol/client/LeaseMessages.h>
 #include <rune/node/PersistenceMode.h>
 
 #include <rune/catalog/CatalogFingerprint.h>
@@ -15,6 +17,7 @@
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/Evolve.h>
 #include <rune/codec/Fingerprint.h>
+#include <rune/codec/LeaseColumns.h>
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -259,6 +262,17 @@ uint64_t requestFingerprint(const DdlRequest& req) noexcept {
             f.u(static_cast<uint64_t>(c.maxCompactionLagMs)); f.u(static_cast<uint64_t>(c.retentionCheckMs));
             f.u(static_cast<uint64_t>(c.fileDeleteDelayMs)); f.u(c.durability); f.u(c.durabilityTier);
             f.s(c.coPartitionGroup); f.s(c.partitionKey);
+            // Mixed in ONLY when set, so every pre-existing request keeps its fingerprint.
+            if (!(m.keyFeatures == rune::protocol::TopicKeyFeatures{})) {
+                uint8_t kb[rune::protocol::kTopicKeyFeaturesWireLen];
+                rune::protocol::putTopicKeyFeatures(kb, m.keyFeatures);
+                f.u(0x4B46u); h_bytes(f, kb, sizeof kb);
+            }
+            if (m.lease) {
+                uint8_t lb[rune::protocol::kLeaseSpecBytes];
+                rune::protocol::encodeLeaseSpec(*m.lease, lb);
+                f.u(0x4C53u); h_bytes(f, lb, sizeof lb);
+            }
         } else if constexpr (std::is_same_v<M, AlterTopicMsg>) {
             f.s(m.topicName); f.u(m.expectedVersion); f.b(m.opsBlob);
         } else if constexpr (std::is_same_v<M, CreateViewMsg>) {
@@ -287,6 +301,7 @@ DdlRejection encodeErrorAnswer(cat::EncodeError e) {
     case cat::EncodeError::ReservedKind:
     case cat::EncodeError::BadEnum:
     case cat::EncodeError::NeedsFormatV3:
+    case cat::EncodeError::NeedsFormatV4:
         break;
     }
     return reject(kInvalidRequest, "the catalog event cannot be encoded: " + std::string{cat::encodeErrorName(e)});
@@ -655,35 +670,40 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     if (!named && msg.requestedFingerprint == rune::protocol::client::kSchemaKindFingerprint) {
         // Checked writes kind probe: an untyped topic is OK with no blob (a raw handle binds to it).
         if (const cat::TopicObject* t = applier_.state().topicByName(msg.nsId, msg.name)) {
-            deps_.respondGet(msg.session, msg.corr, t->topicId, 0, t->partitions, {}, kOK, {});
+            deps_.respondGet(msg.session, msg.corr, t->topicId, 0, t->partitions, {}, kOK, {}, std::nullopt, -1);
             return;
         }
     }
     if (!named) {
-        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {});
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {}, std::nullopt, -1);
         return;
     }
     const cat::TopicObject* topic = applier_.state().topicByName(msg.nsId, msg.name);
     const rune::protocol::TopicKeyFeatures features = topic != nullptr && topic->schema ? topic->schema->keyFeatures : rune::protocol::TopicKeyFeatures{};
+    // Task 14a: a lease topic's answer names its lease view's sink topic id, read from the catalog (never topicId + 1).
+    const auto leaseViewIdOf = [this](const cat::TopicObject* t) -> int32_t {
+        const cat::ViewObject* lv = t != nullptr && t->lease ? applier_.state().leaseViewOf(t->objectId) : nullptr;
+        return lv != nullptr ? lv->def.viewTopicId : -1;
+    };
     if (msg.requestedFingerprint == rune::protocol::client::kSchemaLineageFingerprint) {
         // #418: the topic's lineage - the latest entry's EVOLVING blob (every field ever declared, with its
         // lifetime), so a typed reader can place a record of any version.
         deps_.respondGet(msg.session, msg.corr, named->topicId, named->version, named->partitionCount,
-                         named->descriptorBlob, kOK, features);
+                         named->descriptorBlob, kOK, features, topic ? topic->lease : std::nullopt, leaseViewIdOf(topic));
         return;
     }
     const RegistryEntry* e = (msg.requestedFingerprint == 0 || msg.requestedFingerprint == rune::protocol::client::kSchemaKindFingerprint)
                                  ? named
                                  : reg_.byFingerprint(named->topicId, msg.requestedFingerprint);
     if (!e) {
-        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {});
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {}, std::nullopt, -1);
         return;
     }
     // The wire blob is the MATERIALIZED-as-of-version descriptor (its fingerprint
     // is e->fingerprint), never the evolving blob; the partition count is the
     // topic's (the latest entry).
     deps_.respondGet(msg.session, msg.corr, e->topicId, e->version, named->partitionCount,
-                     rune::codec::serialize(e->descriptor), kOK, features);
+                     rune::codec::serialize(e->descriptor), kOK, features, topic ? topic->lease : std::nullopt, leaseViewIdOf(topic));
 }
 
 void AdminWorker::respondList_(const ListNamespacesMsg& m) {
@@ -1299,7 +1319,7 @@ void AdminWorker::respond_(const DdlRequest& req, const Response& r) {
     // frames have no detail field) — InvalidRequest (spec §9), and (checked writes) the schema and view
     // refusals whose reason names what to change.
     const bool viaError = !r.detail.empty() && deps_.respondError &&
-                          (r.code == kInvalidRequest || r.code == kInvalidSchema || r.code == kViewSourceNotFound ||
+                          (r.code == kInvalidRequest || r.code == kInvalidSchema || r.code == kInvalidTopicName || r.code == kViewSourceNotFound ||
                            r.code == kViewFieldUnresolved || r.code == kViewKeyInvalid || r.code == kViewNotCoPartitioned || r.code == kViewKeyExpressionInvalid ||
                            r.code == kViewConstraintInvalid || r.code == kViewUniqueInvalid);
     auto byTemplate = [&](uint16_t tid, int64_t session, int64_t corr) {
@@ -1367,7 +1387,9 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
     // leader's wall clock when the event is built for its append).
     const DdlMeta& meta = metaOf(req);
     const int64_t session = std::visit([](const auto& m) { return m.session; }, req);
-    b->formatVer                 = clusterFeatureLevel_ >= rune::replication::MetadataFeature::kCheckedWrites ? cat::kFormatV3 : cat::kCurrentFormatVer;
+    b->formatVer                 = clusterFeatureLevel_ >= rune::replication::MetadataFeature::kLeases          ? cat::kFormatV4
+                                 : clusterFeatureLevel_ >= rune::replication::MetadataFeature::kCheckedWrites ? cat::kFormatV3
+                                                                                                              : cat::kCurrentFormatVer;
     b->statement                 = meta.statement;
     b->principal.sessionId       = meta.sessionId != 0 ? meta.sessionId : session;
     b->principal.clientName      = meta.clientName;
@@ -1440,6 +1462,53 @@ std::optional<DdlRejection> keyFeaturesRefusal(const rune::protocol::TopicKeyFea
     return std::nullopt;
 }
 
+// A lease topic's fields are fixed-width: the lease view holds every user column in a fixed-width row.
+std::string leaseFixedWidthDetail(const std::string& name, rune::codec::PrimType type) {
+    return "a lease topic's fields are fixed-width: '" + name + "' is " + (type == rune::codec::PrimType::String ? "string" : "bytes") +
+           "; use string(N)";
+}
+
+// A lease topic's row (the lease view's row in a ScanLeases page) must fit one page.  `evolving` holds the system columns.
+constexpr const char* kLeaseRowTooBigDetail = "a lease topic's row must fit one ScanLeases page";
+bool leaseRowTooBig(const rune::codec::Descriptor& evolving, const std::string& keyField) {
+    std::size_t keyWidth = 0;
+    for (const auto& f : evolving.fields)
+        if (f.untilVersion == 0xFFFF && f.name == keyField) { keyWidth = rune::codec::fieldWidth(f); break; }
+    try {
+        return leaseScanRowBytes(evolving, keyWidth) > rune::protocol::client::kScanLeasesMaxPageBytes;
+    } catch (const std::invalid_argument&) {
+        return false;   // a var-len field: refused by its own rule
+    }
+}
+
+// Lease topics: the admin-only rules of a NEW lease define (the catalog's V4 apply rules are the replay half).  Judged in
+// the documented order; nullopt = fine.  `d` is the user's descriptor (null for an untyped define).
+std::optional<DdlRejection> leaseDefineRefusal(const DefineTopicMsg& m, const rune::codec::Descriptor* d, int16_t level) {
+    namespace rp = rune::protocol;
+    if (level < rune::replication::MetadataFeature::kLeases) return reject(kInvalidRequest, "cluster below lease feature level");
+    if (const auto why = rp::validateLeaseSpec(*m.lease)) return reject(kInvalidRequest, std::string(*why));
+    if (d == nullptr || m.keyField.empty() || d->find(m.keyField) == nullptr)
+        return reject(kInvalidRequest, "a lease topic needs a typed, keyed topic");
+    if (m.keyFeatures.autoIncrement) return reject(kInvalidRequest, "a lease topic cannot use autoincrement");
+    if (m.keyFeatures.keyIndex) return reject(kInvalidRequest, "a lease topic's key index is its lease view");
+    if (m.keyFeatures.partitioner != rp::Partitioner::Fnv1a)
+        return reject(kInvalidRequest, "the modulo partitioner needs autoincrement");
+    // Spec A.2: the default 9e12 ms max_ttl would make the rebirth wait of a transient lease topic endless.
+    if (m.persistence == 1 && m.lease->maxTtlMs == rp::LeaseSpec{}.maxTtlMs)
+        return reject(kInvalidRequest, "a transient lease topic needs lease.max_ttl");
+    if (m.config.cleanupPolicy != 1 || m.config.retentionMs != -1 || m.config.retentionBytes != -1)
+        return reject(kInvalidRequest, "a lease topic is compacted and keeps every live lease");
+    for (const auto& f : d->fields)
+        if (f.name.starts_with("lease_")) return reject(kInvalidRequest, "lease_ field names are reserved");
+    // Any other key feature (autoincrement.max / .reserve without autoincrement) is the non-lease answer.
+    if (m.keyFeatures != rp::TopicKeyFeatures{})
+        return reject(kInvalidRequest, "autoincrement.max and autoincrement.reserve need autoincrement");
+    // The last lease rule, as in QL's parser.
+    for (const auto& f : d->fields)
+        if (rune::codec::isVarLen(f.type)) return reject(kInvalidSchema, leaseFixedWidthDetail(f.name, f.type));
+    return std::nullopt;
+}
+
 }  // namespace
 
 AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat::CatalogState& s) const {
@@ -1467,7 +1536,11 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
                 if (const rune::codec::FieldDescriptor* k = d.find(m.keyField); k != nullptr) {
                     keyWidth = rune::codec::fieldWidth(*k);
                     keyType  = k->type;
-                    if (!rune::codec::isTopicKeyType(k->type, keyWidth))
+                    if (m.lease) {
+                        if (!rune::codec::isLeaseTopicKeyType(k->type, keyWidth))
+                            keyRefusal = reject(kInvalidSchema, "key field '" + m.keyField + "' is " + keyTypeSpelling(*k) +
+                                                                    ": a lease topic key is an integer or string(N) with N <= 128");
+                    } else if (!rune::codec::isTopicKeyType(k->type, keyWidth))
                         keyRefusal = reject(kInvalidSchema, "key field '" + m.keyField + "' is " + keyTypeSpelling(*k) +
                                                                 ": a topic key is an integer or string(N) with N <= 16");
                 }
@@ -1495,6 +1568,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     if (const cat::TopicObject* t = s.topicByName(m.nsId, m.name)) {
         if (t->schema) return Rejected(reject(kTopicExists, {}, t->topicId, t->schema->schemaVersion));
         if (m.blob.empty()) return Rejected(reject(kTopicExists, {}, t->topicId, 0));   // untyped, nothing to adopt
+        if (m.lease) return Rejected(reject(kInvalidRequest, "a lease topic needs a new topic"));
         if (keyRefusal) return Rejected(std::move(*keyRefusal));
         if (auto why = keyFeaturesRefusal(features, TopicShape{true, !m.keyField.empty(), t->persistence == cat::Persistence::Transient},
                                           keyType, m.partitionCount, m.config, /*adoption=*/true, clusterFeatureLevel_))
@@ -1519,9 +1593,28 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         return Rejected(reject(kTopicExists, {}, v->def.viewTopicId, out ? out->version : uint16_t{0}));
     }
     if (auto fold = foldCollision(s, m.nsId, m.name)) return Rejected(std::move(*fold));
+    if (m.lease) {
+        // L15: the lease view '<name>.leases' is created with the topic, so its name is judged here (the apply rule is the
+        // replay half).  The codec keeps the suffix private: ".leases" is 7 bytes.
+        constexpr std::string_view kLeaseViewSuffix = ".leases";
+        const std::string viewName = m.name + std::string(kLeaseViewSuffix);
+        if (viewName.size() > cat::kMaxTopicNameBytes)
+            return Rejected(reject(kInvalidTopicName, "the lease view name '" + viewName + "' is too long"));
+        if (const cat::TopicObject* t = s.topicByName(m.nsId, viewName))
+            return Rejected(reject(kTopicExists, {}, t->topicId, t->schema ? t->schema->schemaVersion : uint16_t{0}));
+        if (const cat::ViewObject* v = s.viewByName(m.nsId, viewName)) {
+            const RegistryEntry* out = reg_.byId(v->def.viewTopicId);
+            return Rejected(reject(kTopicExists, {}, v->def.viewTopicId, out ? out->version : uint16_t{0}));
+        }
+        if (auto fold = foldCollision(s, m.nsId, viewName)) return Rejected(std::move(*fold));
+    }
     if (keyRefusal) return Rejected(std::move(*keyRefusal));
-    if (auto why = keyFeaturesRefusal(features, TopicShape{!m.blob.empty(), !m.keyField.empty(), m.persistence == 1},
-                                      keyType, m.partitionCount, m.config, /*adoption=*/false, clusterFeatureLevel_))
+    std::optional<rune::codec::Descriptor> userDesc;   // set for a typed define (already known to deserialize)
+    if (!m.blob.empty()) userDesc = rune::codec::deserialize(std::span<const uint8_t>(m.blob.data(), m.blob.size()));
+    if (m.lease) {
+        if (auto why = leaseDefineRefusal(m, userDesc ? &*userDesc : nullptr, clusterFeatureLevel_)) return Rejected(std::move(*why));
+    } else if (auto why = keyFeaturesRefusal(features, TopicShape{!m.blob.empty(), !m.keyField.empty(), m.persistence == 1},
+                                             keyType, m.partitionCount, m.config, /*adoption=*/false, clusterFeatureLevel_))
         return Rejected(std::move(*why));
 
     // Spec §8: the replication factor is bounded by the brokers and the minIsr.
@@ -1545,8 +1638,11 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     if (rf > 0 && rf < deps_.topicMinIsr)
         return Rejected(reject(kInvalidRequest, "replicationFactor " + std::to_string(rf) + " < minIsr " +
                                                     std::to_string(deps_.topicMinIsr)));
-    // THE config rule (one validator, the library's — Task 2).
-    if (auto err = cat::topicConfigError(m.config)) return Rejected(reject(kInvalidRequest, *err));
+    // THE config rule (one validator, the library's — Task 2).  A lease topic's tombstone retention defaults to 1 hour
+    // (the lease view needs the deletes of an expired lease for a while, not a day).
+    rune::protocol::TopicConfig config = m.config;
+    if (m.lease && config.deleteRetentionMs == rune::protocol::TopicConfig{}.deleteRetentionMs) config.deleteRetentionMs = 3'600'000;
+    if (auto err = cat::topicConfigError(config)) return Rejected(reject(kInvalidRequest, *err));
 
     e.objectId    = s.nextObjectId();
     e.prevVersion = 0;
@@ -1556,8 +1652,21 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     op.partitions        = m.partitionCount;
     op.replicationFactor = m.replicationFactor;
     op.persistence       = m.persistence == 1 ? cat::Persistence::Transient : cat::Persistence::Disk;
-    op.config            = m.config;
-    if (!m.blob.empty()) op.schema = cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag, features};
+    op.config            = config;
+    if (m.lease) {
+        // L5: the system columns lead the stored descriptor; the user's key field stays marked as it was.
+        rune::codec::Descriptor d = std::move(*userDesc);
+        constexpr const char* kTagsExhausted = "field tags are exhausted after the 4 lease system columns";
+        if (!rune::codec::prependLeaseColumns(d)) return Rejected(reject(kInvalidSchema, kTagsExhausted));
+        uint32_t past = 0;
+        for (const auto& f : d.fields) past = std::max<uint32_t>(past, uint32_t{f.id} + 1);
+        if (past > 0xFFFF) return Rejected(reject(kInvalidSchema, kTagsExhausted));
+        if (leaseRowTooBig(d, m.keyField)) return Rejected(reject(kInvalidSchema, kLeaseRowTooBigDetail));
+        op.schema = cat::SchemaDef{m.keyField, m.validate, rune::codec::serialize(d), static_cast<uint16_t>(past), features};
+        op.lease  = *m.lease;
+    } else if (!m.blob.empty()) {
+        op.schema = cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag, features};
+    }
     e.ops = std::move(op);
     return e;
 }
@@ -1593,6 +1702,17 @@ AdminWorker::Built AdminWorker::buildAlter_(const AlterTopicMsg& m, const cat::C
     }
     // The compatibility gate (the engine apply runs): SchemaIncompatible.
     if (!rune::codec::checkCompatibility(*ops, mode)) return Rejected(reject(kSchemaIncompatible, {}, topicId, cur));
+    if (t->lease)
+        for (const auto& op : *ops)
+            if (op.type == rune::codec::AlterOpType::Add && rune::codec::isVarLen(op.primType))
+                return Rejected(reject(kInvalidSchema, leaseFixedWidthDetail(op.name, op.primType), topicId, cur));
+    if (t->lease) {   // the grown row must still fit one ScanLeases page (an ALTER that fails to apply is refused by the catalog)
+        uint16_t nextTag = t->schema->nextTag;
+        if (auto grown = rune::codec::applyOps(rune::codec::deserialize(t->schema->evolvingBlob), *ops, nextTag,
+                                               static_cast<uint16_t>(cur + 1));
+            grown && leaseRowTooBig(*grown, t->schema->keyField))
+            return Rejected(reject(kInvalidSchema, kLeaseRowTooBigDetail, topicId, cur));
+    }
     // F20: stored resolved to durable tags.
     auto resolved = cat::resolveAlterOps(*t->schema, std::span<const rune::codec::AlterOp>(ops->data(), ops->size()));
     if (!resolved) return Rejected(reject(kInvalidSchema, resolved.error(), topicId, cur));
@@ -1736,6 +1856,7 @@ AdminWorker::Built AdminWorker::buildAlterView_(const AlterViewMsg& m, const cat
     if (m.persistence > 1) return Rejected(reject(kInvalidSchema));   // a direct submit
     const cat::ViewObject* v = s.viewByName(m.nsId, m.name);
     if (v == nullptr) return Rejected(reject(kUnknownTopic, "no view named " + quotedName(m.name)));
+    if (v->kind == cat::ViewKind::LeaseIndex) return Rejected(reject(kViewNotAlterable));   // a lease view follows its topic
     if (m.expectedVersion != 0 && m.expectedVersion != v->version)
         return Rejected(reject(kSchemaConflict, "view " + quotedName(m.name) + " is at version " + std::to_string(v->version),
                                v->def.viewTopicId, static_cast<uint16_t>(std::min<uint32_t>(v->version, 0xFFFF))));
@@ -1755,6 +1876,8 @@ AdminWorker::Built AdminWorker::buildAlterView_(const AlterViewMsg& m, const cat
 AdminWorker::Built AdminWorker::buildDropView_(const DropViewMsg& m, const cat::CatalogState& s) const {
     const cat::ViewObject* v = s.viewByName(m.nsId, m.name);
     if (v == nullptr) return Rejected(reject(kUnknownTopic, "no view named " + quotedName(m.name)));
+    if (v->kind == cat::ViewKind::LeaseIndex)
+        return Rejected(reject(kInvalidRequest, quotedName(m.name) + " is a lease view; drop its lease topic"));
     cat::CatalogEvent e;
     e.nsId        = m.nsId;
     e.objectName  = v->name;
@@ -1766,7 +1889,10 @@ AdminWorker::Built AdminWorker::buildDropView_(const DropViewMsg& m, const cat::
 }
 
 AdminWorker::Built AdminWorker::buildDropTopic_(const DropTopicMsg& m, const cat::CatalogState& s) const {
-    if (s.viewByName(m.nsId, m.name)) return Rejected(reject(kInvalidRequest, quotedName(m.name) + " is a view; use DROP VIEW"));
+    if (const cat::ViewObject* v = s.viewByName(m.nsId, m.name))
+        return Rejected(reject(kInvalidRequest, v->kind == cat::ViewKind::LeaseIndex
+                                                    ? quotedName(m.name) + " is a lease view; drop its lease topic"
+                                                    : quotedName(m.name) + " is a view; use DROP VIEW"));
     const cat::TopicObject* t = s.topicByName(m.nsId, m.name);
     if (t == nullptr) return Rejected(reject(kUnknownTopic, "no topic named " + quotedName(m.name)));
     if (const cat::ViewObject* v = s.viewReading(m.nsId, m.name))
@@ -1785,6 +1911,12 @@ AdminWorker::Built AdminWorker::buildAlterConfig_(const AlterTopicConfigMsg& m, 
     if (s.viewByName(m.nsId, m.name)) return Rejected(reject(kViewNotAlterable));
     const cat::TopicObject* t = s.topicByName(m.nsId, m.name);
     if (t == nullptr) return Rejected(reject(kUnknownTopic, "no topic named " + quotedName(m.name)));
+    // Lease topics: the lease.* keys (above kLastConfigKeyV3) are formatVer 4 events; below the lease feature level
+    // some broker could not decode them.
+    if (clusterFeatureLevel_ < rune::replication::MetadataFeature::kLeases)
+        for (const auto& c : m.changes)
+            if (static_cast<uint8_t>(c.key) > static_cast<uint8_t>(rune::protocol::kLastConfigKeyV3))
+                return Rejected(reject(kInvalidRequest, "lease.* keys need every broker at feature level 6"));
     if (m.expectedVersion != 0 && m.expectedVersion != t->version)
         return Rejected(reject(kSchemaConflict, "topic " + quotedName(m.name) + " is at version " + std::to_string(t->version),
                                t->topicId));
@@ -1845,6 +1977,9 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
             return Rejected(reject(kInvalidRequest, "max-txn-time-ms must be at most " +
                                                         std::to_string(NodeConfig::kMaxDurationMs) +
                                                         " (30 days), got " + std::to_string(m.limits.maxTxnTimeMs)));
+        if (pc::namespaceMaskHas(m.mask, rune::protocol::kNsLimitFieldMaxLeases) &&
+            clusterFeatureLevel_ < rune::replication::MetadataFeature::kLeases)
+            return Rejected(reject(kInvalidRequest, "max-leases needs every broker at the lease feature level"));
         if (!rune::catalog::validNamespaceName(m.name))
             return Rejected(reject(kInvalidRequest, "invalid namespace name " + quotedName(m.name)));
         if (nss.byName(m.name) != nullptr)
@@ -1876,7 +2011,11 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
         e.prevVersion = 0;
         e.newVersion  = 1;
         // The FULL record at request time: absent fields from this broker's current defaults.
-        e.ops = cat::NamespaceCreatedOps{m.name, resolveLimits(m.mask, m.limits, deps_.nsDefaults.limits)};
+        rune::protocol::NamespaceLimits created = resolveLimits(m.mask, m.limits, deps_.nsDefaults.limits);
+        // Below the lease feature level the record carries maxLeases = 0: the catalog event holds nothing an old broker
+        // would read as a limit (the default 16 777 216 is applied only once every broker understands the field).
+        if (clusterFeatureLevel_ < rune::replication::MetadataFeature::kLeases) created.maxLeases = 0;
+        e.ops = cat::NamespaceCreatedOps{m.name, created};
         return e;
     }
     case pc::NamespaceDdlKind::SetLimits: {
@@ -1885,6 +2024,9 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
             return Rejected(reject(kInvalidRequest, "max-txn-time-ms must be at most " +
                                                         std::to_string(NodeConfig::kMaxDurationMs) +
                                                         " (30 days), got " + std::to_string(m.limits.maxTxnTimeMs)));
+        if (pc::namespaceMaskHas(m.mask, rune::protocol::kNsLimitFieldMaxLeases) &&
+            clusterFeatureLevel_ < rune::replication::MetadataFeature::kLeases)
+            return Rejected(reject(kInvalidRequest, "max-leases needs every broker at the lease feature level"));
         const cat::NamespaceRecord* rec = nss.byName(m.name);
         if (rec == nullptr) return Rejected(reject(kUnknownTopic, "no namespace named " + quotedName(m.name)));
         // The untouched predefined default holds no event-carried limits: its base is the boot defaults.
@@ -1895,7 +2037,9 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
         e.objectName  = rec->name;
         e.prevVersion = rec->version;
         e.newVersion  = rec->version + 1;
-        e.ops = cat::NamespaceLimitsSetOps{resolveLimits(m.mask, m.limits, base)};
+        rune::protocol::NamespaceLimits updated = resolveLimits(m.mask, m.limits, base);
+        if (clusterFeatureLevel_ < rune::replication::MetadataFeature::kLeases) updated.maxLeases = 0;   // as for a Create
+        e.ops = cat::NamespaceLimitsSetOps{updated};
         return e;
     }
     case pc::NamespaceDdlKind::Suspend:

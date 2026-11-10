@@ -13,6 +13,8 @@
 //          constant: the clear is derived from the counters of the next tick (rule 16).
 //   disk   (D25) - the node total across workers; at or over maxDiskBytes -> Throttle{Disk, INT64_MAX}, else 0.
 //   view memory (D26) - the node total; over maxViewMemoryBytes -> ViewMemOver{on}, else off.
+//   leases (Lease topics Task 21) - the node total of the live lease rows the workers' LEADING lease partitions hold; at or
+//          over maxLeases (!= 0) -> LeasesOver{on}, else off (at the limit the next grant would exceed it).
 //
 // Broadcast on change only.  Every message carries (slot, nsId); a report or a limit refresh for an nsId that the slot does
 // not hold is dropped and counted (staleReports).  Zero allocation after configure(): every table is sized there.
@@ -30,9 +32,9 @@
 
 namespace rune::node {
 
-/// What a reporter measures.  Rates are cumulative counters; DiskBytes / ViewMemBytes are gauges (current bytes).
+/// What a reporter measures.  Rates are cumulative counters; DiskBytes / ViewMemBytes / Leases are gauges (bytes / bytes / live lease rows).
 enum class NsMetric : uint8_t { ProduceBytes = 0, ProduceRecords = 1, FetchBytes = 2, RequestOps = 3, QueryCycles = 4,
-                                DiskBytes = 5, ViewMemBytes = 6, kCount = 7 };
+                                DiskBytes = 5, ViewMemBytes = 6, Leases = 7, kCount = 8 };
 inline constexpr std::size_t kNsMetrics = static_cast<std::size_t>(NsMetric::kCount);
 
 class NsLimitAggregator {
@@ -57,8 +59,9 @@ public:
         debt_.assign(cap * kThrottleKinds, 0);
         sentUntil_.assign(cap * kThrottleKinds, 0);
         sentViewOver_.assign(cap, 0);
+        sentLeasesOver_.assign(cap, 0);
         events_.clear();
-        events_.reserve(cap * (kThrottleKinds + 1));
+        events_.reserve(cap * (kThrottleKinds + 2));
         started_ = false;
     }
 
@@ -93,12 +96,16 @@ public:
     /// One tick per tickNs; zero allocation.  Returns the number of messages produced.
     int doWork(int64_t nowNs);
 
-    /// The messages produced since the last drain, in order.  `f(const Throttle&)` / `g(const ViewMemOver&)`.
-    template <class F, class G>
-    void drain(F&& f, G&& g) {
+    /// The messages produced since the last drain, in order.  `f(const Throttle&)` / `g(const ViewMemOver&)` /
+    /// `h(const LeasesOver&)`.
+    template <class F, class G, class H>
+    void drain(F&& f, G&& g, H&& h) {
         for (const Event& e : events_) {
-            if (e.isThrottle) f(e.throttle);
-            else g(e.viewMem);
+            switch (e.kind) {
+                case EventKind::Throttle:    f(e.throttle); break;
+                case EventKind::ViewMemOver: g(e.viewMem); break;
+                case EventKind::LeasesOver:  h(e.leases); break;
+            }
         }
         events_.clear();
     }
@@ -123,10 +130,12 @@ public:
     [[nodiscard]] uint32_t visitedLastTickForTest() const noexcept { return visitedLastTick_; }
 
 private:
+    enum class EventKind : uint8_t { Throttle, ViewMemOver, LeasesOver };
     struct Event {
-        bool isThrottle;
+        EventKind kind;
         Throttle throttle;
         ViewMemOver viewMem;
+        LeasesOver leases;
     };
     void resetSlot_(uint16_t slot) noexcept;
     void emitThrottle_(uint16_t slot, ThrottleKind k, int64_t until);
@@ -145,6 +154,7 @@ private:
     std::vector<uint64_t> debt_;        // [slot][throttle kind]
     std::vector<int64_t>  sentUntil_;   // [slot][throttle kind] the last broadcast deadline
     std::vector<uint8_t>  sentViewOver_;
+    std::vector<uint8_t>  sentLeasesOver_;
     std::vector<Event>    events_;
 };
 

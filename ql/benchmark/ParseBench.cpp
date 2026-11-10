@@ -1,6 +1,7 @@
 // rune-ql parse benchmark — validates the microsecond-parse claim.
 // Measures the cost of parse() on the 'characters' DDL end-to-end.
 #include <benchmark/benchmark.h>
+#include "rune/ql/Backends.h"
 #include "rune/ql/Parser.h"
 
 static constexpr std::string_view kCharactersDDL =
@@ -26,6 +27,22 @@ static void BM_ParseTransientTopic(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_ParseTransientTopic);
+
+// Lease topics Task 4: `lease topic` DDL with every lease.* setting - parse plus applyPlan (control plane, recorded not gated).
+static constexpr std::string_view kLeaseTopicDDL =
+    "lease topic inst { id uint64, addr string(64) } partitions 4 replicas 3 key id with (lease.ttl = 5000, lease.min_ttl = 2000, "
+    "lease.max_ttl = 60000, lease.max_keys = 10, lease.expiry_batch = 8, lease.checkpoint = off, lease.checkpoint_interval = 2000, "
+    "lease.checkpoint_rate = 5);";
+
+static void BM_LeaseTopicDdl(benchmark::State& state) {
+    for (auto _ : state) {
+        auto result = rune::ql::parse(kLeaseTopicDDL);
+        auto plan = rune::ql::applyPlan(std::get<rune::ql::TopicDef>(*result));
+        benchmark::DoNotOptimize(plan);
+    }
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_LeaseTopicDdl);
 
 // Phase 2b Part D: a three-statement console script, and the per-line classification.
 static constexpr std::string_view kScript3 =

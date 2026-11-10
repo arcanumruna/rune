@@ -207,12 +207,22 @@ def stem(rel: str) -> str:
     return Path(rel).stem
 
 
+# After `atomic<T> name(`: an empty list or a parameter declaration (a type then a
+# name, or a cv/elaborated keyword) makes `name` a function returning an atomic
+# (ring_atomic::word), not an atomic object; `atomic<int> x(0)` stays tracked.
+FUNC_PARAMS_RE = re.compile(
+    r"\s*(?:\)|(?:const|volatile|unsigned|signed|struct|class|typename|enum)\b"
+    r"|(?:::)?\w+(?:::\w+)*(?:\s*<[^()]*?>)?\s*[*&]*\s*\w+\s*[,)=\[])")
+
+
 def collect_atomic_names(cleans: dict):
     """{file stem: identifiers declared atomic in Stem.h / Stem.cpp}."""
     names = {}
     for rel, clean in cleans.items():
         if "atomic" in clean or "_Atomic" in clean:
             for m in ATOMIC_DECL_RE.finditer(clean):
+                if clean[m.end() - 1] == "(" and FUNC_PARAMS_RE.match(clean, m.end()):
+                    continue
                 names.setdefault(stem(rel), set()).add(m.group(1))
         if "mutex" in clean or "condition_variable" in clean or "once_flag" in clean:
             for m in MUTEX_DECL_RE.finditer(clean):
@@ -427,6 +437,13 @@ SELFTEST_FILES = {
     "libs/a/MuDecl.cpp": "void M2() { muX_.lock(); muX_.unlock(); }\n",
     "libs/a/StdLock.h": "void l2() { std::lock(a, b); std::try_lock(a, b); }\n",
     "libs/a/SplitImpl.cpp": "int v(AllowedTok& t) { return t.allowedMember_.load(std::memory_order_relaxed) + t.allowedMember_++; }\n",
+    # A function returning an atomic_ref is not an atomic object: `.fnWord` elsewhere is a plain field.
+    "libs/a/AtomicFn.h": "template <typename T>\ninline std::atomic_ref<T> fnWord(const B& b, int offset) { return {}; }\n"
+                         "std::atomic_ref<int> fnNoArgs();\n",
+    "libs/a/PlainWordUse.cpp": "int pw(P& p) { return p.fnWord + p->fnNoArgs; }\n",
+    # Direct-initialised atomics stay tracked.
+    "libs/a/DirectInit.h": "std::atomic<int> direct_(0);\n",
+    "libs/a/DirectInitUse.cpp": "int di(D& d) { return d.direct_; }\n",
 }
 SELFTEST_ALLOWLIST = """
 # comment
@@ -452,6 +469,7 @@ SELFTEST_EXPECT_VIOLATION_PATHS = {
     "libs/a/AeronAddOrdered.h", "libs/a/AeronUpdater.h", "libs/a/AeronAlias.h",
     "libs/a/AeronUsingConc.h", "libs/a/AeronUsingAtomic.h", "libs/a/MuDecl.h",
     "libs/a/MuDecl.cpp", "libs/a/StdLock.h", "libs/a/SplitImpl.cpp",
+    "libs/a/AtomicFn.h", "libs/a/DirectInit.h", "libs/a/DirectInitUse.cpp",
 }
 
 

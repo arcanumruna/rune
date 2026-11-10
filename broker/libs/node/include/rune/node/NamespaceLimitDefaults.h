@@ -22,7 +22,7 @@ struct NamespaceLimitDefaults {
 };
 
 /// The full record: field i from `given` when `mask` marks it present, else from `base`.  Fields are resolved on the
-/// encoded little-endian layout (28 u64 slots at 8*i, then featureBits u32 at 224); reserved fields come from `base`.
+/// encoded little-endian layout (rp::limitFieldOffset / limitFieldWidth: 28 u64 slots at 8*i, featureBits u32 at 224, maxLeases u64 at 232); reserved fields come from `base`.
 [[nodiscard]] inline rune::protocol::NamespaceLimits
 resolveLimits(const std::array<uint8_t, rune::protocol::client::kNamespacePresentMaskBytes>& mask,
               const rune::protocol::NamespaceLimits& given, const rune::protocol::NamespaceLimits& base) noexcept {
@@ -33,8 +33,8 @@ resolveLimits(const std::array<uint8_t, rune::protocol::client::kNamespacePresen
     rp::encodeLimits(base, out);
     for (std::size_t i = 0; i < rp::kNamespaceLimitFieldCount; ++i) {
         if (!rp::client::namespaceMaskHas(mask, i)) continue;
-        const std::size_t off   = i < 28 ? 8 * i : 28 * 8;
-        const std::size_t width = i < 28 ? 8 : 4;
+        const std::size_t off   = rp::limitFieldOffset(i);
+        const std::size_t width = rp::limitFieldWidth(i);
         std::memcpy(out + off, g + off, width);
     }
     rp::NamespaceLimits r;

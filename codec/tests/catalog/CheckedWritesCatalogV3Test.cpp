@@ -222,9 +222,9 @@ TEST(CheckedWritesCatalogV3, FingerprintIgnoresDefaultFeatures) {
     EXPECT_NE(s3.digest(), sk.digest());
 }
 
-TEST(CheckedWritesCatalogV3, FormatFourHasNoRules) {
+TEST(CheckedWritesCatalogV3, FormatFiveHasNoRules) {
     rc::CatalogState s;
-    auto e = event(4, rc::CreateTopicOps{.topicId = 0}, "t", 1, 0);
+    auto e = event(5, rc::CreateTopicOps{.topicId = 0}, "t", 1, 0);
     EXPECT_EQ(rc::apply(s, e, 0).error().code, rc::ApplyError::Code::UnsupportedFormat);
     EXPECT_EQ(rc::previewFingerprint(s, e).error().code, rc::ApplyError::Code::UnsupportedFormat);
 }

@@ -21,6 +21,8 @@ namespace rune::protocol::client {
 //
 // Total = 24 + 2 + echo.size()
 // ---------------------------------------------------------------------------
+// A keepalive Ping (correlationId <= 0) carries [int32 LE egressStreamId][declared egress channel bytes] as its echo (empty when the
+// channel exceeds 255 bytes), so a gateway that has forgotten the session can still answer UnknownSession on that channel.
 struct Ping {
     int64_t       sessionId     = 0;
     int64_t       correlationId = 0;

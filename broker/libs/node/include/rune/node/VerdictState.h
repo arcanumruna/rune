@@ -64,6 +64,14 @@ public:
         while (!changes_.empty() && changes_.back().offset >= offset) changes_.pop_back();
     }
     [[nodiscard]] std::size_t size() const noexcept { return changes_.size(); }
+    /// Lease topics (spec 6.3, a known-old duplicate update): true when no set this partition logged has a member other than the
+    /// lease index, so the version compare was the only judgment an update ever met.  Cold.
+    [[nodiscard]] bool onlyLeaseIndexEver() const noexcept {
+        return std::all_of(changes_.begin(), changes_.end(), [](const Change& c) {
+            return std::all_of(c.set.members.begin(), c.set.members.begin() + c.set.count,
+                               [](const ConstraintSetMember& m) { return m.kind == rune::view::VerdictViewKind::LeaseIndex; });
+        });
+    }
     /// The offset of the first change after the member's latest join whose set lacks it; INT64_MAX while it is in latest() or never was.
     [[nodiscard]] int64_t leaveOffsetOf(const ConstraintSetMember& member) const noexcept {
         int64_t leave = INT64_MAX;
@@ -180,7 +188,12 @@ private:
 struct VerdictSourceStats {
     uint64_t rejectionsConstraint = 0, markersWritten = 0, markerAppendRetries = 0, judgeWaitsForInstall = 0, verdictStalls = 0,
              verdictCheckpointsDiscarded = 0, verdictUnknownDuplicates = 0, verdictReplays = 0,
-             rejectionsKeyExists = 0, rejectionsKeyNotFound = 0, keyIndexRebuilds = 0, keyIndexSkippedMalformed = 0, candidateSwaps = 0, retainedPlanInstalls = 0;
+             rejectionsKeyExists = 0, rejectionsKeyNotFound = 0, keyIndexRebuilds = 0, keyIndexSkippedMalformed = 0, candidateSwaps = 0, retainedPlanInstalls = 0,
+             rejectionsLeaseNotFound = 0, rejectionsLeaseLimit = 0,
+             leaseRejectedStaleBroker = 0,   // a broker Expire / Checkpoint whose lease moved on (kVerdictStaleBroker)
+             leaseEventOverflows = 0,        // one batch larger than the whole fold-event buffer, judged into an empty one
+             leaseLayoutWaits = 0,           // the judge (or a replay) held at a lease record whose writer layout is not installed yet
+             leaseAckReadFailures = 0;       // a lease View ack whose stored batch could not be read back (the ack answered Internal)
     struct PerConstraint { uint32_t constraintId = 0; uint64_t rejections = 0; };
     std::array<PerConstraint, 256> perConstraint{};
     uint16_t perConstraintCount = 0;

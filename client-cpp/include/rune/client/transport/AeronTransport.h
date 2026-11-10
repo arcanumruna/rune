@@ -564,6 +564,13 @@ public:
     /// the pair (see SeedRePairing).  True = a re-pair is in flight (or already was); false = nothing to pair.
     bool rePairSeedResponse(int32_t responsePort) noexcept;
     bool rePairResponsePublication(PubHandle h) noexcept;
+    /// #989: the gateway's response publication of the seed's pair in force / of the pair of handle `h` connected and
+    /// then closed (the gateway closed it or died: its image went unavailable).  True once per pair, at that edge.  A restarted gateway can never reach
+    /// that subscription again (see above), so its session is gone: the caller reconnects, as Aeron Cluster's client
+    /// does when its egress image closes (AeronCluster.pollEgress).  False while a seed re-pair is in flight.  Hot-path
+    /// safe: one image check of one subscription.
+    bool seedResponseEgressLost() noexcept;
+    bool responseEgressLost(PubHandle h) noexcept;
 
 private:
     // ---- Configuration -------------------------------------------------------
@@ -729,7 +736,15 @@ private:
         Kind        kind = Kind::SharedMdc;
         uint32_t    mdcRefs = 0;   ///< SharedMdc only: users of this Live slot (addSubSlot_ ++; retireSubSlot_ --, Retired at 0)
         State       state = State::Live;   ///< Retired: not polled, released by reapRetiredSubs_(); Free: reusable
+        /// #989, ResponsePair only: the gateway's response publication seen from here.  AwaitImage = none connected yet;
+        /// Connected = one was; Lost = it closed after that (terminal: Aeron pins this subscription to that one
+        /// publication, so nothing can reach it again).  Advanced by responseEgressLost_().
+        enum class Egress : uint8_t { AwaitImage, Connected, Lost };
+        Egress      egress = Egress::AwaitImage;
     };
+    /// #989: advance subSlots_[idx]'s Egress state; true exactly once, at Connected -> Lost.  -1 / not Ready / not a
+    /// response pair = false.
+    bool responseEgressLost_(int32_t idx) noexcept;
     /// Open a subscription slot; its index, or -1 on allocation failure.  Cold.  SharedMdc is idempotent among Live
     /// SharedMdc slots (one more user); ResponsePair always opens a fresh slot.  Every successful call is one OWNER of
     /// the slot and must be matched by one retireSubSlot_ on its release path.
