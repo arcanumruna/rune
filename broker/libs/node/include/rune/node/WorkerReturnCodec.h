@@ -49,8 +49,12 @@ static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::ViewScanResult) ==
 static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::StatsResult) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::STATS_RESULT),
               "WorkerReturn::StatsResult must stay on sbe ReturnType::STATS_RESULT");
+// Checked writes Part 11: TxnVoteResult rides sbe ReturnType::TXN_VOTE_RESULT (value 11).
+static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::TxnVoteResult) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::TXN_VOTE_RESULT),
+              "WorkerReturn::TxnVoteResult must stay on sbe ReturnType::TXN_VOTE_RESULT");
 
-// Lease topics Task 11a: the lease results ride sbe ReturnType values 11 and 12.
+// Lease topics Task 11a: the lease results ride sbe ReturnType values 12-14.
 static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::LeaseKeepAliveResult) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::LEASE_KEEP_ALIVE_RESULT),
               "WorkerReturn::LeaseKeepAliveResult must stay on sbe ReturnType::LEASE_KEEP_ALIVE_RESULT");
@@ -60,14 +64,14 @@ static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::LeaseTimeToLiveResul
 static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::ScanLeasesResult) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::SCAN_LEASES_RESULT),
               "WorkerReturn::ScanLeasesResult must stay on sbe ReturnType::SCAN_LEASES_RESULT");
-// ... and the lease ops on sbe OpType 36-38.
+// ... and the lease ops on sbe OpType 37-39.
 static_assert(static_cast<std::uint8_t>(WorkerOp::Type::LeaseKeepAlive) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::LEASE_KEEP_ALIVE) &&
               static_cast<std::uint8_t>(WorkerOp::Type::LeaseTimeToLive) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::LEASE_TIME_TO_LIVE) &&
               static_cast<std::uint8_t>(WorkerOp::Type::ScanLeases) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::SCAN_LEASES),
-              "the lease WorkerOp types must stay on sbe OpType 36-38");
+              "the lease WorkerOp types must stay on sbe OpType 37-39");
 static_assert(static_cast<std::uint8_t>(WorkerOp::Type::NsLeasesOver) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::NS_LEASES_OVER),
               "WorkerOp::NsLeasesOver must stay on sbe OpType::NS_LEASES_OVER");

@@ -23,6 +23,7 @@
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/catalog/CatalogReplayer.h>
 #include <rune/client/Client.h>
+#include <rune/client/transport/TransportConfig.h>
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
@@ -55,7 +56,7 @@ public:
     enum class Runtime { Legacy, Shard };
 
     explicit OneBroker(const std::string& tag, Runtime runtime = Runtime::Legacy,
-                       std::function<void(NodeConfig&)> tweak = {})
+                       std::function<void(NodeConfig&)> tweak = {}, std::function<void(BrokerNode&)> beforeStart = {})
         : dir_(std::filesystem::temp_directory_path() /
                ("rune_onebroker_" + tag + "_" + std::to_string(::getpid()) + "_" + std::to_string(seq_()++))) {
         std::filesystem::remove_all(dir_);
@@ -84,6 +85,7 @@ public:
         }
         if (tweak) tweak(cfg);
         tweak_   = std::move(tweak);
+        beforeStart_ = std::move(beforeStart);
         cfg_     = cfg;
         channel_ = cfg.clientEndpoint.channel;
         startNode_();
@@ -106,6 +108,7 @@ public:
         c.egressChannel   = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
         c.egressStreamId  = 2;
         c.dataDir         = (dir_ / ("client" + std::to_string(clients_.size()))).string();
+        c.driverCountersBytes = rune::client::transport::kMinDriverCountersBytes;   // a client's few counters: a small CnC (#883)
         auto client = std::make_unique<rune::client::Client>(c);
         client->connectAndWait(std::chrono::seconds(20));
         clients_.push_back(std::move(client));
@@ -121,6 +124,7 @@ public:
         c.egressChannel   = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
         c.egressStreamId  = 2;
         c.dataDir         = (dir_ / ("own_client" + std::to_string(ownClients_++))).string();
+        c.driverCountersBytes = rune::client::transport::kMinDriverCountersBytes;   // a client's few counters: a small CnC (#883)
         return c;
     }
 
@@ -310,6 +314,7 @@ private:
     void startNode_() {
         if (tweak_) tweak_(cfg_);   // re-read on every start: a test that changes what the tweak captures restarts with it
         node_ = std::make_unique<BrokerNode>(cfg_);
+        if (beforeStart_) beforeStart_(*node_);
         node_->start();
         if (!node_->awaitLeader(std::chrono::seconds(30)))
             throw std::runtime_error("OneBroker: the node never became the leader");
@@ -325,6 +330,7 @@ private:
     int                                                ownClients_ = 0;
     NodeConfig                                         cfg_;
     std::function<void(NodeConfig&)>                   tweak_;
+    std::function<void(BrokerNode&)>                   beforeStart_;
     std::unique_ptr<BrokerNode>                        node_;
     std::vector<std::unique_ptr<rune::client::Client>> clients_;
 };

@@ -142,19 +142,24 @@
            scope 1) or of a view partition (scope 2).  topicId = the topic / view, partition; no tail.  Answered with
            STATS_RESULT. -->
       <validValue name="GET_STATS">35</validValue>
+      <!-- Checked writes Part 11: coordinator -> the partition leader's worker: vote on a transaction's commit.
+           correlationId = the vote token, producerId / producerEpoch = the transaction, roleEpoch = the target leader
+           epoch + 1 (0 = unchecked), sessionId = the origin node (-1 = local); no tail.  Ownership-gated like
+           APPEND_CONTROL_RECORD.  Answered with TXN_VOTE_RESULT. -->
+      <validValue name="TXN_VOTE">36</validValue>
       <!-- Lease topics Task 11a: gateway -> the lease partition leader's worker.  LEASE_KEEP_ALIVE: recordCount = the entry count, tail
            (TailKind = LEASE_REQUEST) = the request's validated entries [keyLen u8][key][version i64]; LEASE_TIME_TO_LIVE: tail =
            the key bytes.  SCAN_LEASES (Task 13b): tail = the key prefix bytes (LEASE_REQUEST), nextOffset = resumeHash, recordCount = maxRows, isolation = first (0/1).  Answered with LEASE_KEEP_ALIVE_RESULT / LEASE_TIME_TO_LIVE_RESULT / SCAN_LEASES_RESULT. -->
-      <validValue name="LEASE_KEEP_ALIVE">36</validValue>
-      <validValue name="LEASE_TIME_TO_LIVE">37</validValue>
-      <validValue name="SCAN_LEASES">38</validValue>
+      <validValue name="LEASE_KEEP_ALIVE">37</validValue>
+      <validValue name="LEASE_TIME_TO_LIVE">38</validValue>
+      <validValue name="SCAN_LEASES">39</validValue>
       <!-- Lease topics Task 21: control -> EVERY worker (cold: on a CHANGE only), no tail.  NS_LEASES_OVER: topicId = nsSlot,
            nextOffset = nsId, partition = 0 / 1 (the namespace is at or over max-leases on this node).  Never ownership-gated. -->
-      <validValue name="NS_LEASES_OVER">39</validValue>
+      <validValue name="NS_LEASES_OVER">40</validValue>
       <!-- Lease topics Task 27 (spec A.6): control -> the partition's OWNING worker (cold: once per leadership of a transient
            lease partition), no tail.  TRANSIENT_LINEAGE: topicId / partition, nextOffset = the leader epoch, correlationId = the
            lineage token (uint64 bit-cast), hwBound = the lineage generation. -->
-      <validValue name="TRANSIENT_LINEAGE">40</validValue>
+      <validValue name="TRANSIENT_LINEAGE">41</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -234,15 +239,21 @@
       <!-- Checked writes Part 08: the answer to a GET_STATS op.  errorCode = StatsResponse status, recordCount = stat
            entries; the chunk is [count x 10 B][nConstraints u16][n x 12 B]. -->
       <validValue name="STATS_RESULT">10</validValue>
+      <!-- Checked writes Part 11: the answer to a TXN_VOTE op, on existing scalars.  correlationId = the vote token,
+           errorCode = transport status, recordCount = the vote code (0 = yes), newNextOffset = constraintId,
+           baseOffset = failingOffset, lastOffset = the judge offset (-1 = none), sessionId = the origin node.
+           The vote fields mean something only when errorCode == 0: a NotLeader answer leaves recordCount 0, which is NOT a
+           yes vote. -->
+      <validValue name="TXN_VOTE_RESULT">11</validValue>
       <!-- Lease topics Task 11a: LEASE_KEEP_ALIVE_RESULT: recordCount = entry count, lastOffset = final, chunk = count x
            {index u16, code u16, ttlMs u64} LE.  LEASE_TIME_TO_LIVE_RESULT: errorCode = code, baseOffset = remainingMs (-1 none),
            lastOffset = version, chunk = {grantedTtlMs u64, holder u64} LE. -->
-      <validValue name="LEASE_KEEP_ALIVE_RESULT">11</validValue>
-      <validValue name="LEASE_TIME_TO_LIVE_RESULT">12</validValue>
+      <validValue name="LEASE_KEEP_ALIVE_RESULT">12</validValue>
+      <validValue name="LEASE_TIME_TO_LIVE_RESULT">13</validValue>
       <!-- Lease topics Task 13b: SCAN_LEASES_RESULT: errorCode = code, baseOffset = asOfOffset (the lease index's fold cursor, exclusive),
            lastOffset = lastHash (the u64 bit-cast), recordCount = rowCount, isolation = done (0/1), chunk = the encoded rows
            [keyLen u8][key][rowLen u32 LE][row payload]. -->
-      <validValue name="SCAN_LEASES_RESULT">13</validValue>
+      <validValue name="SCAN_LEASES_RESULT">14</validValue>
     </enum>
 
     <!-- F15: TxnReturn::kind -->

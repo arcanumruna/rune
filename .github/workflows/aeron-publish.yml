@@ -1,0 +1,54 @@
+# Publishes the forked aeron (recipe in conan/aeron) to the Conan remote: the recipe plus its Linux Release binary, so
+# workflows that only download dependencies (rune-cli.yml) resolve it.  Run it once per new aeron/<version> pin.
+#
+# Repository settings (same as client-cpp-release.yml):
+#   vars.CONAN_REMOTE_URL, secrets.CONAN_LOGIN_USERNAME, secrets.CONAN_PASSWORD
+name: aeron-publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'aeron version to export and upload (the pin in conandata.yml)'
+        required: true
+        default: '1.51.0-rune.3'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aeron-publish-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends uuid-dev
+          python3 -m pip install --user "conan>=2,<3" "cmake>=3.31"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Add the Conan remote
+        env:
+          CONAN_REMOTE_URL: ${{ vars.CONAN_REMOTE_URL }}
+          CONAN_LOGIN_USERNAME_ARTIFACTORY: ${{ secrets.CONAN_LOGIN_USERNAME }}
+          CONAN_PASSWORD_ARTIFACTORY: ${{ secrets.CONAN_PASSWORD }}
+        run: |
+          conan profile detect --force
+          conan remote add artifactory "$CONAN_REMOTE_URL"
+          conan remote login artifactory
+
+      # The same settings rune-cli.yml installs with, so its `conan install` finds this binary.
+      - name: Build aeron
+        run: |
+          conan export conan/aeron --version="${{ inputs.version }}"
+          conan install --requires="aeron/${{ inputs.version }}" --build=missing -s build_type=Release -c tools.build:jobs=4
+
+      - name: Upload to the Conan remote
+        run: conan upload "aeron/${{ inputs.version }}" --remote=artifactory -c

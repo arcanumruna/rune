@@ -50,6 +50,17 @@ TEST(TxnVerifyStateRegression, FirstBatchAsksOnceAndIsAdmittedOnceVerifiedRegres
     EXPECT_EQ(s.admit(7, 0).kind, K::Admit) << "Verified holds until the append (or the marker) consumes it";
 }
 
+// Part 11: a vote answered with no open transaction here ends a verification the producer cached, so a late batch asks again.
+TEST(TxnVerifyStateRegression, VoteWithoutAnOpenTransactionDropsTheVerifiedEntryRegression) {
+    Rc s;
+    const TxnAdmission a = s.admit(7, 1);
+    ASSERT_EQ(a.kind, K::RequestVerify);
+    s.rc.onVerifyAnswer(7, 1, a.reqId, 0);
+    ASSERT_EQ(s.admit(7, 1).kind, K::Admit);
+    s.rc.onVote(7, 1);
+    EXPECT_EQ(s.admit(7, 1).kind, K::RequestVerify);
+}
+
 // The coordinator's refusal (never registered, fenced, wrong epoch) answers the next batch with that code —
 // non-retriable — once; a later batch asks again (the producer may have registered since).
 TEST(TxnVerifyStateRegression, RefusalAnswersItsCodeOnceThenAsksAgainRegression) {

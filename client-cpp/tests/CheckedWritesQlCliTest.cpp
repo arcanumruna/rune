@@ -9,6 +9,7 @@
 
 #include <rune/catalog/CatalogFingerprint.h>
 #include <rune/catalog/CatalogState.h>
+#include <rune/client/ConstraintNames.h>
 #include <rune/client/view/ViewKeyBuilder.h>
 #include <rune/client/view/ViewRowCodec.h>
 #include <rune/codec/Serialize.h>
@@ -472,16 +473,6 @@ TEST(CheckedWritesQlCli, ShowViewPrintsTheKeyColumnForAV1ShapedAggregate) {
     EXPECT_NE(text.find("  keyspec userId\n  unique no\n  group by (userId)\n"), std::string::npos) << text;
 }
 
-TEST(CheckedWritesQlCliRegression, ConstraintLabelsComeFromTheOwningViewsPlanRegression) {
-    cat::ViewObject v = viewObjectOf(
-        "create view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= 12);");
-    v.objectId = 5;
-    EXPECT_EQ(eng::constraintLabel(v, 1), "account_stats.max_characters");
-    EXPECT_EQ(eng::constraintLabel(v, 0), "account_stats.unique");
-    EXPECT_EQ(eng::constraintLabel(v, 7), "account_stats.#7");   // an ordinal the current plan lacks never throws
-    EXPECT_EQ(eng::constraintLabel(cat::CatalogState{}, (5u << 16) | 1u), "constraint#327681");   // no view owns it
-}
-
 TEST(CheckedWritesQlCli, UnauthorizedSourceNotesTheConstraintRows) {
     rune::cli::PartitionStats p;
     p.partition = 0;
@@ -508,7 +499,8 @@ TEST(CheckedWritesQlCli, ShowStatsTextNotesAnOldBrokerAndFailsOnOtherRefusals) {
     EXPECT_EQ(*ok, "  partition 2\n    (no counters)\n");
 }
 
-TEST(CheckedWritesQlCli, ConstraintLabelOfAStatsResponseNamesTheOwningView) {
+TEST(CheckedWritesQlCli, StatsTextNamesConstraints) {
+    constexpr uint64_t kX = 5;
     cat::CatalogState state;
     const auto stamped = [&](cat::Ops ops, const std::string& name, uint64_t objectId) {
         cat::CatalogEvent e{.formatVer = cat::kFormatV1};
@@ -528,12 +520,22 @@ TEST(CheckedWritesQlCli, ConstraintLabelOfAStatsResponseNamesTheOwningView) {
         filler.topicId = i; filler.partitions = 1; filler.replicationFactor = 1;
         ASSERT_TRUE(cat::apply(state, stamped(filler, "filler" + std::to_string(i), static_cast<uint64_t>(i) + 1), i));
     }
-    cat::ViewDef def = viewObjectOf(
-        "create view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= 12);").def;
+    cat::ViewDef def = viewObjectOf("create unique view character_name key (userId, name) as select characterId from character;").def;
     def.viewTopicId = 4; def.sinkPartitions = 1;
-    ASSERT_TRUE(cat::apply(state, stamped(cat::CreateViewOps{def}, "account_stats", 5), 4));
-    EXPECT_EQ(eng::constraintLabel(state, (5u << 16) | 1u), "account_stats.max_characters");
-    EXPECT_EQ(eng::constraintLabel(state, (6u << 16) | 1u), "constraint#393217");
+    ASSERT_TRUE(cat::apply(state, stamped(cat::CreateViewOps{def}, "character_name", kX), 4));
+
+    rune::cli::PartitionStats p;
+    p.result.constraints = {{static_cast<uint32_t>(kX << 16), 2}, {0x00990001u, 1}};
+    for (const auto& k : p.result.constraints)
+        p.constraintLabels.push_back(eng::constraintLabel(rune::client::resolveConstraintName(state, {}, k.constraintId), k.constraintId));
+    EXPECT_EQ(p.constraintLabels, (std::vector<std::string>{"character_name.unique", "0x00990001"}));
+    const std::vector<rune::cli::PartitionStats> parts{p};
+    const std::string text = rune::cli::formatStatsText(parts);
+    EXPECT_NE(text.find("    constraint character_name.unique 2\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("    constraint 0x00990001 1\n"), std::string::npos) << text;
+    const std::string json = rune::cli::formatStatsJson("view", "character_name", parts);
+    EXPECT_NE(json.find(R"("constraints": [{"constraintId": 327680, "label": "character_name.unique", "rejections": 2}, )"), std::string::npos) << json;
+    EXPECT_NE(json.find(R"({"constraintId": 10027009, "label": "0x00990001", "rejections": 1}])"), std::string::npos) << json;
 }
 
 TEST(CheckedWritesQlCli, StatsJsonEscapesControlCharacters) {

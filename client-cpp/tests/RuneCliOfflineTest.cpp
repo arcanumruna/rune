@@ -80,8 +80,8 @@ TEST(CheckedWritesCli, PlanMarksRawTopics) {
     EXPECT_NE(out2.str().find("topic p partitions 1 replicas 0 persistence disk key id\n"), std::string::npos) << out2.str();
 }
 
-// Checked writes Part 03: every code through ViewUniqueInvalid has a name.
-TEST(CheckedWritesCliRegression, ErrorCodeNamesCoverEveryCodeThroughViewUniqueInvalidRegression) {
+// Checked writes Part 03: every code through TxnConflict has a name.
+TEST(CheckedWritesCliRegression, ErrorCodeNamesCoverEveryCodeThroughTxnConflictRegression) {
     using rune::cli::engine::errorCodeName;
     EXPECT_EQ(errorCodeName(47), "PasswordChangeRequired");
     EXPECT_EQ(errorCodeName(48), "AuthUnavailable");
@@ -96,10 +96,12 @@ TEST(CheckedWritesCliRegression, ErrorCodeNamesCoverEveryCodeThroughViewUniqueIn
     EXPECT_EQ(errorCodeName(59), "ViewKeyExpressionInvalid");
     EXPECT_EQ(errorCodeName(60), "ViewConstraintInvalid");
     EXPECT_EQ(errorCodeName(61), "ViewUniqueInvalid");
-    EXPECT_EQ(errorCodeName(62), "LeaseNotFound");
-    EXPECT_EQ(errorCodeName(63), "LeaseLimitExceeded");
-    EXPECT_EQ(errorCodeName(64), "LeaseTtlTooLarge");
-    EXPECT_EQ(errorCodeName(65), "UnknownErrorCode");
+    EXPECT_EQ(errorCodeName(62), "TxnTooLarge");
+    EXPECT_EQ(errorCodeName(63), "TxnConflict");
+    EXPECT_EQ(errorCodeName(64), "LeaseNotFound");
+    EXPECT_EQ(errorCodeName(65), "LeaseLimitExceeded");
+    EXPECT_EQ(errorCodeName(66), "LeaseTtlTooLarge");
+    EXPECT_EQ(errorCodeName(67), "UnknownErrorCode");
 }
 
 // Checked writes Part 08: `rune stats (topic | view) <name> [--partition N] [--json] --broker host:port`.

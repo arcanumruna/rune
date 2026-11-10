@@ -721,9 +721,9 @@ TEST(LeaseWriteHookWorkerRegression, RevokeNoRowUnchangedRegression) {
     ASSERT_EQ(a1->code, 0);
     ASSERT_EQ(a2->code, 0);
     ASSERT_EQ(a1->verdicts.size(), 1u);
-    EXPECT_EQ(std::get<1>(a1->verdicts[0]), 62);
+    EXPECT_EQ(std::get<1>(a1->verdicts[0]), 64);
     ASSERT_EQ(a2->verdicts.size(), 1u);
-    EXPECT_EQ(std::get<1>(a2->verdicts[0]), 62);
+    EXPECT_EQ(std::get<1>(a2->verdicts[0]), 64);
     std::vector<std::vector<uint8_t>> values;
     for (const auto& s : storedRecords(r)) if (s.offset >= before) values.push_back(s.value);
     ASSERT_EQ(values.size(), 2u);
@@ -1216,7 +1216,7 @@ TEST(LeaseWriteHookWorkerRegression, LeaseAckTrailerRegression) {
     EXPECT_EQ(a->leases[4], (std::pair<int64_t, uint64_t>{-1, 0})) << "a rejected record";
     ASSERT_EQ(a->verdicts.size(), 1u);
     EXPECT_EQ(std::get<0>(a->verdicts[0]), 4);
-    EXPECT_EQ(std::get<1>(a->verdicts[0]), 62);
+    EXPECT_EQ(std::get<1>(a->verdicts[0]), 64);
     EXPECT_EQ(a->frameLen, 54u + 2 + 8 * 1 + 3 + 16 * 5);
 }
 
@@ -1286,10 +1286,10 @@ TEST(LeaseWriteHookWorkerRegression, LeaseKnownOldDuplicateTableRegression) {
     const std::vector<Verd> expect = {
         Verd{{0, 21, 0}},   // grant k1: the client maps it to VerdictUnknown
         Verd{{0, 21, 0}},   // grant k2
-        Verd{{0, 62, 0}},   // revoke k2
+        Verd{{0, 64, 0}},   // revoke k2
         Verd{},             // update of live k1: Ok
-        Verd{{0, 62, 0}},   // update of k2, not live
-        Verd{{0, 62, 0}},   // revoke of k1 at another version
+        Verd{{0, 64, 0}},   // update of k2, not live
+        Verd{{0, 64, 0}},   // revoke of k1 at another version
     };
     for (std::size_t i = 0; i < d.batches.size(); ++i) {
         const auto a = l.produceNoSeq(d.batches[i], d.seqs[i]);
@@ -1335,7 +1335,7 @@ TEST(LeaseWriteHookWorkerRegression, LeaseKnownOldDuplicateIndexNotReadyThrottle
 
 // Review C1 (lease Task 5c): a known-old duplicate is found before the hook, so its key and value were never checked.  A 4 KiB
 // key on an update was copied into a 128-byte ViewKey on the worker's stack; a short value was read as version 0.  Each one
-// is now answered "not live" (62).
+// is now answered "not live" (64).
 TEST(LeaseWriteHookWorkerRegression, LeaseKnownOldDuplicateOversizedKeyAdversarialRegression) {
     Leased l;
     VerdictRig& r = l.r;
@@ -1355,7 +1355,7 @@ TEST(LeaseWriteHookWorkerRegression, LeaseKnownOldDuplicateOversizedKeyAdversari
         EXPECT_EQ(a->baseOffset, -1) << i;
         ASSERT_TRUE(a->hasLease) << i;
         EXPECT_EQ(a->leases, (Lease{{-1, 0}})) << i;
-        EXPECT_EQ(a->verdicts, (Verd{{0, 62, 0}})) << i;
+        EXPECT_EQ(a->verdicts, (Verd{{0, 64, 0}})) << i;
         EXPECT_EQ(r.leo(), leo) << i;
     }
     const auto live = l.produceNoSeq(d.batches[3], seq);   // the real duplicate is still answered live

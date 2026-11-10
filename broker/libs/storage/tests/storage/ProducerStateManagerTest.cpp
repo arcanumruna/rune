@@ -1232,7 +1232,8 @@ TEST(UnknownProducerIdRegression, RebuiltStateAfterRetentionAnswersUnknownProduc
         EXPECT_FALSE(rebuilt.validate(0, 7, 0, 0, 6, 6).isOos());
         EXPECT_TRUE(rebuilt.validate(0, 7, 0, 1, 0, 0).isAccept()) << "P re-sequenced at seq 0 (new epoch)";
         EXPECT_TRUE(rebuilt.validate(0, 7, 0, 0, 0, 0).isAccept()) << "seq 0 on any epoch: trust-on-first-use";
-        // Q was rebuilt (#953): the broker cannot vouch for a forward gap, so it is UnknownProducerId, not OOS; epochs unchanged.
+        // Q is known, epochs unchanged; a rebuilt entry cannot vouch past the log: a gap is UnknownProducerId until the first
+        // live append (#953).
         EXPECT_TRUE(rebuilt.validate(0, 8, 0, 3, 14, 14).isUnknownProducerId()) << "rebuilt entry + gap";
         EXPECT_TRUE(rebuilt.validate(0, 8, 0, 2, 12, 12).isFenced()) << "lower epoch";
         EXPECT_TRUE(rebuilt.validate(0, 8, 0, 4, 5, 5).isOos()) << "higher epoch, seq != 0";
@@ -1274,6 +1275,32 @@ TEST(UnknownProducerIdRegression, MarkerOnlyRebuiltEntryAnswersUnknownProducerId
     fs::remove_all(dir);
 }
 
+// #953: the cleaner dropped an expired producer's newest batches (seq 2..5) and kept the older ones (seq 0, 1).  A leader rebuilt
+// from that log knows P only up to seq 1: P's next batch (seq 6) is an unknown producer's, not "known entry + gap"
+// OutOfOrderSequence, which the client hands to the application as a failed write.  The same cut by retention, for every
+// rebuilt entry: its lastSequence is the last the log still holds.
+TEST(UnknownProducerIdRegression, RebuiltEntryWhoseNewestBatchesAreGoneAnswersUnknownProducerIdRegression) {
+    const std::string dir = tmpPath("psm_953");
+    fs::create_directories(dir);
+    {
+        rune::storage::Log log(dir, /*segmentRollBytes=*/1 << 20);
+        log.recover();
+        auto put = [&](const std::vector<uint8_t>& b) { ASSERT_GE(log.append(b, log.logEndOffset()), 0); };
+        for (int32_t s = 0; s < 2; ++s) put(d6Batch(/*P*/ 7, 0, s, log.logEndOffset()));   // P's sequences 2..5 were compacted away
+
+        ProducerStateManager rebuilt;
+        ASSERT_TRUE(rebuilt.rebuildFromLog(0, log, log.logEndOffset(), 0));
+        ASSERT_NE(rebuilt.entry(0, 7, 0), nullptr) << "precondition: the remnant made an entry";
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 0, 6, 6).isUnknownProducerId()) << "P's next batch past the log's last";
+        EXPECT_FALSE(rebuilt.validate(0, 7, 0, 0, 6, 6).isOos());
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 1, 0, 0).isAccept()) << "P re-sequenced at seq 0 (new epoch)";
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 0, 2, 2).isAccept()) << "the log's next sequence";
+        rebuilt.update(0, 7, 0, 0, 2, 2, log.logEndOffset());   // appended live: lastSequence is exact again
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 0, 5, 5).isOos()) << "a real gap after a live append is OOS";
+    }
+    fs::remove_all(dir);
+}
+
 TEST(UnknownProducerIdRegression, ProtocolIllegalSequencesStayOutOfOrderRegression) {
     ProducerStateManager m;
     EXPECT_TRUE(m.validate(0, 5, 0, 0, -1, 0).isOos());
@@ -1284,7 +1311,7 @@ TEST(UnknownProducerIdRegression, ProtocolIllegalSequencesStayOutOfOrderRegressi
 // carries lastSequence 1 although the broker really appended 5: P's next in-order batch (seq 6) looks like a forward gap.
 // The broker cannot vouch for it, so it answers UnknownProducerId (the client re-sequences), never OutOfOrderSequence.
 TEST(UnknownProducerIdRegression, ProducerStateRebuildUnvouchedRegression) {
-    const std::string dir = tmpPath("psm_953");
+    const std::string dir = tmpPath("psm_953_unvouched");
     fs::create_directories(dir);
     {
         rune::storage::Log log(dir);
@@ -1297,7 +1324,7 @@ TEST(UnknownProducerIdRegression, ProducerStateRebuildUnvouchedRegression) {
             ASSERT_TRUE(m.rebuildFromLog(0, log, log.logEndOffset(), 0));
             ASSERT_NE(m.entry(0, 9, 0), nullptr);
             ASSERT_EQ(m.entry(0, 9, 0)->lastSequence, 1);
-            ASSERT_TRUE(m.entry(0, 9, 0)->unvouched);
+            ASSERT_TRUE(m.entry(0, 9, 0)->rebuilt);
         };
         {   // (a) the forward gap on a rebuilt entry
             ProducerStateManager m; rebuild(m);
@@ -1306,7 +1333,7 @@ TEST(UnknownProducerIdRegression, ProducerStateRebuildUnvouchedRegression) {
         {   // (b) a live update vouches again, a gap is OOS
             ProducerStateManager m; rebuild(m);
             m.update(0, 9, 0, 1, 0, 6, 100);   // new epoch, live
-            EXPECT_FALSE(m.entry(0, 9, 0)->unvouched);
+            EXPECT_FALSE(m.entry(0, 9, 0)->rebuilt);
             EXPECT_TRUE(m.validate(0, 9, 0, 1, 8, 8).isOos()) << "(b) vouched again";
         }
         {   // (c) next in order

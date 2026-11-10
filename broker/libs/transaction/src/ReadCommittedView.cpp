@@ -18,6 +18,7 @@
 #include <rune/storage/Log.h>
 #include <rune/storage/LogReadView.h>
 // rune-protocol RecordBatch: little-endian field accessors (unified).
+#include <rune/protocol/BatchRebuild.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <algorithm>
@@ -187,7 +188,10 @@ void LsoTracker::popDeadFront_() noexcept
 void LsoTracker::onProduceBatch(ProducerId producerId, int64_t batchBaseOffset)
 {
     if (producerId < 0) return;               // non-transactional batch; no effect on LSO
-    if (find_(producerId) != nullptr) return; // already open: keep the earlier firstOffset
+    if (Slot* s = find_(producerId)) {         // already open: keep the earlier firstOffset
+        fifo_[s->pos & fifoMask_].inherited = false;
+        return;
+    }
 
     ensureRoom_();
     uint64_t pos = tail_;
@@ -240,6 +244,58 @@ int64_t LsoTracker::firstOffsetOf(ProducerId producerId) const noexcept
     return s ? fifo_[s->pos & fifoMask_].firstOffset : -1;
 }
 
+void LsoTracker::markVoted(ProducerId producerId, int16_t epoch) noexcept
+{
+    if (producerId < 0) return;
+    if (Slot* s = find_(producerId)) {
+        int16_t& voted = fifo_[s->pos & fifoMask_].votedEpoch;
+        voted = std::max(voted, epoch);
+    }
+}
+
+void LsoTracker::addRecords(ProducerId producerId, int32_t records, bool intent) noexcept
+{
+    if (producerId < 0) return;
+    if (Slot* s = find_(producerId)) {
+        FifoEntry& e = fifo_[s->pos & fifoMask_];
+        e.records += records;
+        e.intent = e.intent || intent;
+    }
+}
+
+bool LsoTracker::hasIntent(ProducerId producerId) const noexcept
+{
+    if (producerId < 0) return false;
+    const Slot* s = find_(producerId);
+    return s != nullptr && fifo_[s->pos & fifoMask_].intent;
+}
+
+int64_t LsoTracker::recordsOf(ProducerId producerId) const noexcept
+{
+    if (producerId < 0) return 0;
+    const Slot* s = find_(producerId);
+    return s != nullptr ? fifo_[s->pos & fifoMask_].records : 0;
+}
+
+bool LsoTracker::votedAt(ProducerId producerId, int16_t epoch) const noexcept
+{
+    if (producerId < 0) return false;
+    const Slot* s = find_(producerId);
+    return s != nullptr && fifo_[s->pos & fifoMask_].votedEpoch == epoch;
+}
+
+void LsoTracker::markInherited() noexcept
+{
+    for (uint64_t p = head_; p != tail_; ++p) fifo_[p & fifoMask_].inherited = true;
+}
+
+bool LsoTracker::openVerified(ProducerId producerId) const noexcept
+{
+    if (producerId < 0) return false;
+    const Slot* s = find_(producerId);
+    return s != nullptr && !fifo_[s->pos & fifoMask_].inherited;
+}
+
 void LsoTracker::clear() noexcept
 {
     // N4: both indexes are reset here, in one place.
@@ -283,6 +339,12 @@ RcBuilder::Result RcBuilder::step(const uint8_t* batch, std::size_t avail)
         const int64_t producerId = reader.producerId();
         if (producerId >= 0) {
             tracker_->onProduceBatch(producerId, res.baseOffset);
+            bool intent = tracker_->hasIntent(producerId);
+            if (trackIntents_ && !intent)
+                (void)rune::protocol::forEachRecordSpan(batch, static_cast<std::size_t>(totalLen), [&](const rune::protocol::RecordSpan& span) {
+                    intent = intent || rune::protocol::record::intentOf(span.attributes) != 0;
+                });
+            tracker_->addRecords(producerId, reader.recordCount(), intent);
             res.outcome = Outcome::TxnData;
         }
     }
@@ -303,7 +365,7 @@ void ReadCommittedView::rebuild(rune::storage::Log* log, int64_t hw)
     // Zero-copy chunks of whole batches; the same classification step the
     // owning worker's incremental build runs (S4).
     constexpr int32_t kChunkBytes = 1 << 20;
-    RcBuilder builder(tracker_, abortedIndex_);
+    RcBuilder builder(tracker_, abortedIndex_, /*trackIntents=*/false);
     int64_t cursor = log->logStartOffset();
     const int64_t end = std::min(hw, log->logEndOffset());
     while (cursor < end) {
@@ -354,8 +416,7 @@ std::vector<uint8_t> ReadCommittedView::read(rune::storage::Log* log,
     if (fetchOffset >= limit) return {};
 
     // Read from the log.  The log returns raw batch bytes.
-    auto raw = log->read(fetchOffset, maxBytes > 0 ? maxBytes : 1 << 20);
-    if (raw.empty()) return {};
+    auto raw = log->readPastEmptied(fetchOffset, maxBytes > 0 ? maxBytes : 1 << 20, limit);
 
     // Walk the batch stream, collecting batches that pass the filter.
     std::vector<uint8_t> out;

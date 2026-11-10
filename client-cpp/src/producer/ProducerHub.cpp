@@ -156,6 +156,9 @@ bool ProducerHub::onCoordinatorResponse(uint16_t templateId, const uint8_t* buf,
         if (!m) return false;
         a.kind = ReqKind::EndTxn;
         a.errorCode = m->errorCode;
+        a.constraintId  = m->constraintId;
+        a.failingOffset = m->failingOffset;
+        a.hasVote       = m->hasVote;
         break;
     }
     case rpc::TemplateId::ErrorResponse: {

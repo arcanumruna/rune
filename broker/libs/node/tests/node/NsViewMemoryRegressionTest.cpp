@@ -1,5 +1,5 @@
 // NsViewMemoryRegressionTest.cpp - namespaces Phase 2 Task 12 (D26): a namespace's view-memory limit pauses its views at an
-// offset and resumes them.  Deterministic: a WorkerViewSet driven over a simulated committed log (no Aeron, no clocks);
+// offset and resumes them.  Deterministic: a WorkerViewSet driven over a simulated committed log (no Aeron; a test clock);
 // the paused read is answered by a real Worker (GetViewRow op -> ViewRowResult).
 //
 // Interaction matrix (limit x {below, at, above} x view state / peer):
@@ -38,6 +38,7 @@
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/ViewRow.h>
 
+#include "support/AllocWindow.h"
 #include "support/LimitEnforcementTable.h"
 
 using namespace rune::node;
@@ -109,6 +110,20 @@ struct SimLog {
         batches.push_back({b.build(), end, n});
         end += n;
     }
+    /// Appends `rounds` rewrites of keys firstKey .. firstKey+n-1 (a tombstone, then the upsert, per key) as ONE batch.
+    void appendRewrites(int64_t firstKey, int n, int rounds) {
+        rune::protocol::RecordBatchBuilder b(end, 0);
+        for (int r = 0; r < rounds; ++r) {
+            for (int i = 0; i < n; ++i) {
+                const auto kb = le(static_cast<uint64_t>(firstKey + i), 8);
+                b.append(sv(kb), {}, 0);
+                const auto vb = character(firstKey + i, static_cast<int32_t>((firstKey + i) * 10));
+                b.append(sv(kb), sv(vb), 0);
+            }
+        }
+        batches.push_back({b.build(), end, 2 * n * rounds});
+        end += 2 * n * rounds;
+    }
     rune::storage::LogReadView read(int64_t from, int64_t /*to*/) const {
         if (from < start) return {};
         for (const B& b : batches)
@@ -175,14 +190,14 @@ struct Rig {
         settle();
     }
     void release(uint16_t slot, uint32_t ns) { vs.onNsSlotFreed(slot, ns); limits_.erase(slot); }
-    int drive(int32_t srcTopic, uint16_t slot, uint32_t ns, const SimLog& log, uint64_t gen = 0) {
+    int drive(int32_t srcTopic, uint16_t slot, uint32_t ns, const SimLog& log, uint64_t gen = 0, int64_t nowNs = 0) {
         auto rd = [&](int64_t f, int64_t t) { return log.read(f, t); };
-        const int n = vs.driveFolds(srcTopic, 0, rd, log.end, rv::kNoSkip, 0, nullptr, gen, true, NsTag{slot, ns},
+        const int n = vs.driveFolds(srcTopic, 0, rd, log.end, rv::kNoSkip, nowNs, nullptr, gen, true, NsTag{slot, ns},
                                 nullptr, nullptr, SourceLogBounds{log.start, log.end});
         settle();
         return n;
     }
-    int driveA(const SimLog& log, uint64_t gen = 0) { return drive(kSrcA, kSlotA, kNsA, log, gen); }
+    int driveA(const SimLog& log, uint64_t gen = 0, int64_t nowNs = 0) { return drive(kSrcA, kSlotA, kNsA, log, gen, nowNs); }
     const uint8_t* row(int32_t view, int64_t key, WorkerViewSet::RowStatus& rs) {
         const rv::RowLayout* L = nullptr;
         return vs.getRow(view, 0, static_cast<uint64_t>(key), L, &rs);
@@ -455,4 +470,160 @@ TEST(NsViewMemoryRegression, SetViewSetReplaysBootSlotsRegression) {
     auto rd = [&](int64_t f, int64_t t) { return log.read(f, t); };
     vs.driveFolds(kSrcA, 0, rd, log.end, rv::kNoSkip, 0, nullptr, 0, true, NsTag{3, 7});
     EXPECT_GT(vs.nsViewMemBytes(3), 0u);
+}
+
+// REGRESSION (P11-9, Task 8 step 7; T7 re-review 3; review 2 I-C): the dirty set grows with the window between two checkpoints,
+// which an ordinary transaction's span can make long, so its growth is charged as view memory (LongSpanChargeComesBackDown...).  A
+// transient view's window is one pass: the growth is given back when the pass discards it, and the charge comes back down with it.
+TEST(WorkerViewSetRegression, TransientDirtyGrowthIsGivenBackAfterThePassRegression) {
+    Rig rig(/*limit chunks*/ 0);
+    SimLog log;
+    log.append(1, 20000);   // one pass dirties every row: past twice the dirty list's reserve
+    rig.driveA(log);
+    const ViewInstance* inst = rig.vs.instanceForTest(kViewA, 0);
+    ASSERT_NE(inst, nullptr);
+    EXPECT_EQ(inst->table.dirtyBytes(), 0u);
+    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), inst->table.memoryBytes());
+}
+
+// REGRESSION (review 6 I-1): the hysteresis keeps a window's dirty capacity when the window before was at least half its size, so
+// two long spans in a row, or a ramp of at most 2x per window, were kept at their push, and a view gone quiet never drained again:
+// the growth stayed charged for good.  A caught-up pass once the view has been quiet for a second gives it back (review 7 I-1).
+namespace {
+constexpr int64_t kQuietNs = 1'000'000'000;   // WorkerViewSet::kQuietGiveBackNs
+
+size_t churnThenQuiet(std::initializer_list<int> longWindows, size_t& steady, size_t& kept) {
+    Rig rig(/*limit chunks*/ 0);
+    SimLog log;
+    log.append(1, 2000);
+    rig.driveA(log);
+    const ViewInstance* inst = rig.vs.instanceForTest(kViewA, 0);
+    for (int w = 0; w < 6; ++w) {   // steady churn: one rewrite of every row per window
+        log.appendRewrites(1, 2000, 1);
+        rig.driveA(log);
+    }
+    steady = inst->table.dirtyBytes();
+    for (int rounds : longWindows) {
+        log.appendRewrites(1, 2000, rounds);
+        rig.driveA(log);
+    }
+    kept = inst->table.dirtyBytes();
+    rig.driveA(log, 0, 1);             // quiet: nothing new
+    rig.driveA(log, 0, 1 + kQuietNs);  // and for a second
+    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), inst->table.memoryBytes() + inst->table.dirtyBytes());
+    return inst->table.dirtyBytes();
+}
+}  // namespace
+
+TEST(WorkerViewSetRegression, TwoLongWindowsThenQuietGiveBackTheirChargeRegression) {
+    size_t steady = 0, kept = 0;
+    const size_t quiet = churnThenQuiet({10, 10}, steady, kept);
+    ASSERT_GT(steady, 0u) << "steady churn keeps its dirty set";
+    ASSERT_GT(kept, steady) << "the second long window is kept at its push";
+    EXPECT_LE(quiet, steady) << "the quiet pass gives the long windows' growth back";
+}
+
+TEST(WorkerViewSetRegression, RampThenQuietGivesBackItsChargeRegression) {
+    size_t steady = 0, kept = 0;
+    const size_t quiet = churnThenQuiet({2, 4, 8, 16}, steady, kept);
+    ASSERT_GT(steady, 0u) << "steady churn keeps its dirty set";
+    ASSERT_GT(kept, steady) << "a ramp of at most 2x per window is kept at its push";
+    EXPECT_LE(quiet, steady) << "the quiet pass gives the ramp's growth back";
+}
+
+// REGRESSION (review 7 I-1): the worker runs a caught-up pass between nearly every two windows (it spins into the next pass, and
+// parks for at most a millisecond), so giving a kept window back on the first quiet pass reallocated it on every window: N-2
+// regressed.  It is kept while windows come less than a second apart, and given back after a second of quiet.
+TEST(WorkerViewSetRegression, SteadyChurnWithIdlePassesKeepsItsDirtySetUntilQuietRegression) {
+    Rig rig(/*limit chunks*/ 0);
+    SimLog log;
+    log.append(1, 2000);
+    int64_t now = 0;
+    rig.driveA(log, 0, now);
+    const ViewInstance* inst = rig.vs.instanceForTest(kViewA, 0);
+    const auto window = [&] {
+        log.appendRewrites(1, 2000, 1);
+        rig.driveA(log, 0, now += 1'000'000);
+        rig.driveA(log, 0, now += 1'000'000);   // the caught-up pass after it
+    };
+    for (int w = 0; w < 6; ++w) window();   // warm-up
+    const size_t steady = inst->table.dirtyBytes();
+    ASSERT_GT(steady, 0u) << "steady churn keeps its dirty set";
+    uint64_t allocs = 0;
+    for (int w = 0; w < 20; ++w) {
+        log.appendRewrites(1, 2000, 1);   // the log's own allocation is outside the window
+        {
+            rune::testing::AllocWindow aw;
+            rig.driveA(log, 0, now += 1'000'000);
+            rig.driveA(log, 0, now += 1'000'000);
+            allocs += aw.count();
+        }
+        EXPECT_EQ(inst->table.dirtyBytes(), steady);
+    }
+    EXPECT_EQ(allocs, 0u) << "idle passes between windows give nothing back";
+    rig.driveA(log, 0, now + kQuietNs);
+    EXPECT_EQ(inst->table.dirtyBytes(), 0u) << "a second of quiet gives it back";
+    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), inst->table.memoryBytes());
+}
+
+// REGRESSION (review 7 I-2): a view paused by the namespace gate returns before the caught-up check, so a kept window was never
+// given back: the reclaimable charge kept the namespace over its limit and every view on it paused for good.
+TEST(WorkerViewSetRegression, PausedViewGivesBackItsKeptWindowRegression) {
+    Rig rig(/*limit chunks*/ 0);
+    SimLog log;
+    log.append(1, 2000);
+    rig.driveA(log);
+    const ViewInstance* inst = rig.vs.instanceForTest(kViewA, 0);
+    for (int rounds : {1, 1, 1, 1, 1, 1, 10, 10}) {
+        log.appendRewrites(1, 2000, rounds);
+        rig.driveA(log);
+    }
+    const size_t kept = inst->table.dirtyBytes();
+    ASSERT_GT(kept, 0u) << "the second long window is kept at its push";
+    rig.assign(kSlotA, kNsA, inst->table.memoryBytes() + kept / 2);
+    ASSERT_TRUE(rig.vs.nsViewMemOver(kSlotA));
+    rig.driveA(log, 0, 1);   // well under a second of quiet
+    EXPECT_TRUE(std::holds_alternative<ViewPaused>(inst->pause));
+    EXPECT_EQ(inst->table.dirtyBytes(), 0u) << "the paused view gives its kept window back";
+    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), inst->table.memoryBytes());
+    rig.driveA(log, 0, 2);
+    EXPECT_TRUE(std::holds_alternative<ViewRunning>(inst->pause)) << "the pause it caused is lifted";
+}
+
+// REGRESSION (review 8 I-2, m-2): a paused view returned before step 1's flush, so a delta held on a full ring never left, its push's
+// trim never ran, and the window it drained stayed charged: the pause held for good.  The held delta was not charged either.
+TEST(WorkerViewSetRegression, PausedViewWithAHeldDeltaGivesBackItsWindowRegression) {
+    Rig rig(/*limit chunks*/ 0);
+    rv::ViewPlan plan = hpPlan(kSrcB);
+    plan.persistence = 0;
+    const rune::codec::Descriptor* srcs[] = {&rig.src};
+    const auto comp = rv::compileView(plan, srcs, kViewB).value();
+    rig.vs.installView(comp.plan, comp.rowLayout, rig.src, /*persisted*/ true);
+    rig.assign(kSlotB, kNsB, 0);
+    SimLog log;
+    log.append(1, 2000);
+    rig.drive(kSrcB, kSlotB, kNsB, log);
+    const ViewInstance* inst = rig.vs.instanceForTest(kViewB, 0);
+    ASSERT_NE(inst, nullptr);
+    for (const std::size_t len : {std::size_t{4096}, std::size_t{256}, std::size_t{16}, std::size_t{0}})   // nothing drains the ring
+        for (int i = 0; i < 4096; ++i) {
+            const auto c = rig.channel.deltas.tryClaim(99, len);
+            if (c < 0) break;
+            rig.channel.deltas.commit(c);
+        }
+    log.appendRewrites(1, 2000, 10);   // a long window
+    rig.drive(kSrcB, kSlotB, kNsB, log, 0, 1);
+    ASSERT_TRUE(inst->pendingValid) << "the delta is held on the full ring";
+    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotB), inst->table.memoryBytes() + inst->table.dirtyBytes() + inst->pendingDelta.capacity())
+        << "the held delta is charged";
+    rig.assign(kSlotB, kNsB, inst->table.memoryBytes() + inst->table.dirtyBytes() / 2);
+    rig.drive(kSrcB, kSlotB, kNsB, log, 0, 2);
+    ASSERT_TRUE(std::holds_alternative<ViewPaused>(inst->pause));
+    rig.channel.deltas.drain([](int32_t, aeron::concurrent::AtomicBuffer&, OneToOneByteRing::index_t, OneToOneByteRing::index_t) {});
+    rig.drive(kSrcB, kSlotB, kNsB, log, 0, 3);   // the IO agent caught up
+    EXPECT_FALSE(inst->pendingValid) << "the paused view flushes its held delta";
+    EXPECT_EQ(inst->table.dirtyBytes(), 0u) << "and gives its window back";
+    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotB), inst->table.memoryBytes());
+    rig.drive(kSrcB, kSlotB, kNsB, log, 0, 4);
+    EXPECT_TRUE(std::holds_alternative<ViewRunning>(inst->pause)) << "the pause it caused is lifted";
 }

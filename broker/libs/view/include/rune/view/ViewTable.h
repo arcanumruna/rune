@@ -212,6 +212,7 @@ public:
     [[nodiscard]] std::size_t prefixPoolChunksForTest() const noexcept { return poolChunks_.size(); }
 
     [[nodiscard]] uint8_t keyWidth() const noexcept { return keyWidth_; }
+    [[nodiscard]] uint32_t rowLen() const noexcept { return layout_.rowLen; }
     [[nodiscard]] uint8_t prefixWidth() const noexcept { return prefixWidth_; }
     [[nodiscard]] uint64_t hashSeedForTest() const noexcept { return hashSeed_; }
 
@@ -283,6 +284,31 @@ public:
     // interval. noexcept, no allocation beyond dirtyList_'s own
     // (amortized, reserve()'d) growth.
     void markDirty(uint32_t rid) noexcept;
+    // A row was dirtied or deleted since the last drainDirty(): a checkpoint now would carry a delta.
+    [[nodiscard]] bool hasDirty() const noexcept { return !dirtyList_.empty() || !deleted_.empty(); }
+    // The dirty set's growth past twice its warm-start reserve (P11-9): it grows with the window between two checkpoints, which an
+    // ordinary transaction's span can make long, so the view set charges it as view memory.  trimDirty gives it back.
+    [[nodiscard]] size_t dirtyBytes() const noexcept {
+        const size_t b = dirtyList_.capacity() * sizeof(uint32_t) + deleted_.capacity() * sizeof(DeletedEntry) + deletedKeyBytes_.capacity();
+        return b > 2 * dirtyReserved_ ? b - 2 * dirtyReserved_ : 0;
+    }
+    // After a drain: a dirty set grown past twice its reserve is reallocated at the reserve, which follows the index (a grown
+    // table's warm start).  Hysteresis: a window that used at least a quarter of the capacity and is at most twice the window
+    // before it is churn and keeps it (no allocation per drain); a much larger window (a long span's) or a small one gives it back.
+    // An empty drain is not a window.  A kept capacity is at most about four times the last window, which may itself be long (two
+    // long spans in a row, a ramp): the owner gives it back with trimQuiet once the view has been quiet a while, or pauses.
+    void trimDirty() {
+        if (hasDirty() || dirtyBytes() == 0) return;
+        const size_t cap = dirtyList_.capacity() * sizeof(uint32_t) + deleted_.capacity() * sizeof(DeletedEntry) + deletedKeyBytes_.capacity();
+        if (4 * window_ >= cap && window_ <= 2 * lastWindow_) return;
+        giveBackDirty_();
+    }
+    // The view is quiet (or paused): a kept capacity is given back, so it carries no charge for its last windows.
+    void trimQuiet() {
+        if (hasDirty()) return;
+        window_ = lastWindow_ = 0;
+        if (dirtyBytes() != 0) giveBackDirty_();
+    }
 
     // Calls `emit(rid, row, deleted, key)` once for every row dirtied (an
     // upsert: `row` is the live row pointer, `deleted` is false) or deleted
@@ -306,6 +332,7 @@ public:
     template<class Fn>
     void drainDirty(Fn&& emit) {
         assert(keyWidth_ <= 8 && prefixWidth_ == 0);
+        noteWindow_();
         for (const auto& d : deleted_) {
             emit(d.rid, nullptr, /*deleted*/true, d.key);
         }
@@ -326,6 +353,7 @@ public:
     // keyWidth little-endian bytes of the slot word).  Same order: deletes, then upserts.
     template<class Fn>
     void drainDirtyKeyed(Fn&& emit) {
+        noteWindow_();
         for (size_t n = 0; n < deleted_.size(); ++n) {
             const DeletedEntry& d = deleted_[n];
             if (headerLen_) {
@@ -574,10 +602,31 @@ private:
     std::vector<uint8_t>  dirty_;
     std::vector<uint64_t> dirtyKeys_;   // narrow table: the key word put() stored (keyOf reads it); wide table: the hashed slot word, never read
     std::vector<uint32_t> dirtyList_; // rids marked dirty this interval, each pushed once (coalesced)
+    size_t                dirtyReserved_ = 0;   // the dirty set's bytes after its reserve (reserveDirty_)
+    size_t                window_ = 0;          // the bytes the last drained window used (trimDirty's hysteresis)
+    size_t                lastWindow_ = 0;      // the bytes the window before it used
 
     struct DeletedEntry { uint32_t rid; uint64_t key; };
     std::vector<DeletedEntry> deleted_; // erase()'d {rid,key} pairs pending drainDirty()
     std::vector<uint8_t> deletedKeyBytes_; // wide tables: keyWidth_ bytes per deleted_ entry, in the same order
+    void noteWindow_() noexcept {
+        const size_t w = dirtyList_.size() * sizeof(uint32_t) + deleted_.size() * sizeof(DeletedEntry) + deletedKeyBytes_.size();
+        if (w == 0) return;   // an empty drain is not a window: trimDirty judges the last real one
+        lastWindow_ = window_;
+        window_ = w;
+    }
+    void giveBackDirty_() {
+        std::vector<uint32_t>().swap(dirtyList_);
+        std::vector<DeletedEntry>().swap(deleted_);
+        std::vector<uint8_t>().swap(deletedKeyBytes_);
+        reserveDirty_();
+    }
+    void reserveDirty_() {
+        dirtyList_.reserve(main_.cap);
+        deleted_.reserve(256);
+        deletedKeyBytes_.reserve(256 * headerLen_);
+        dirtyReserved_ = dirtyList_.capacity() * sizeof(uint32_t) + deleted_.capacity() * sizeof(DeletedEntry) + deletedKeyBytes_.capacity();
+    }
 };
 
 } // namespace rune::view

@@ -207,7 +207,7 @@ std::string_view errorCodeName(uint16_t code) noexcept {
         "PasswordChangeRequired", "AuthUnavailable", "RecordEgressUnavailable", "UnstableOffsetCommit",
         "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused",
         "ConstraintViolation", "KeyExists", "KeyNotFound", "AutoIncrementExhausted", "ViewKeyExpressionInvalid",
-        "ViewConstraintInvalid", "ViewUniqueInvalid",
+        "ViewConstraintInvalid", "ViewUniqueInvalid", "TxnTooLarge", "TxnConflict",
         "LeaseNotFound", "LeaseLimitExceeded", "LeaseTtlTooLarge"};
 #ifdef RUNE_CLI_LIVE_ENABLED
     static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::LeaseTtlTooLarge) + 1,
@@ -717,6 +717,7 @@ LiveOptions liveOptionsOf(const support::ParsedArgs& a, const std::string& endpo
     o.streamIn     = a.value("--cli-stream-in");
     o.streamOut    = a.value("--cli-stream-out");
     o.dataDir      = a.value("--cli-data-dir");
+    o.aeronDir     = a.value("--cli-aeron-dir");
     o.verbose      = verbose;
     o.user         = a.value("--user");
     o.passwordFile = a.value("--password-file");
@@ -765,6 +766,7 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
     }
     try {
         cfg.dataDir = resolveDataDir(o.dataDir, dir_);   // empty = a private scratch directory, removed on close (#315)
+        cfg.aeronDir = o.aeronDir;
     } catch (const std::exception& e) {   // #680: a bad TMPDIR is a clean failure, not an exception past the secrets
         lastFailure_ = std::string("cannot create the client's data directory: ") + e.what();
         if (!quietFailure) err << "rune: " << lastFailure_ << "\n";
@@ -1249,20 +1251,24 @@ std::expected<void, std::string> partitionRange(int32_t partitions, int32_t only
 
 }  // namespace
 
-std::string constraintLabel(const cat::ViewObject& v, uint16_t ordinal) {
-    if (ordinal == 0) return v.name + ".unique";
-    const auto plan = rune::view::deserializeAuthored(v.def.normalizedPlanBlob);
-    if (!plan || ordinal > plan->constraints.size()) return v.name + ".#" + std::to_string(ordinal);
-    return v.name + "." + plan->constraints[ordinal - 1].name;
+std::string constraintLabel(const std::optional<rc::ConstraintName>& name, uint32_t constraintId) {
+    if (name) return name->view + "." + name->constraint;
+    char hex[16];
+    std::snprintf(hex, sizeof hex, "0x%08x", constraintId);
+    return hex;
 }
 
-std::string constraintLabel(const cat::CatalogState& state, uint32_t constraintId) {
-    for (const cat::ViewObject* v : state.views())
-        if ((v->objectId & 0xFFFF) == (constraintId >> 16)) return constraintLabel(*v, static_cast<uint16_t>(constraintId & 0xFFFF));
-    return "constraint#" + std::to_string(constraintId);
+namespace {
+
+// A miss refreshes the catalog and may free the objects the stats were read for, so this runs after the last use of them.
+void labelConstraints(rc::Client& c, std::vector<PartitionStats>& stats) {
+    for (PartitionStats& ps : stats)
+        for (const auto& k : ps.result.constraints) ps.constraintLabels.push_back(constraintLabel(c.constraintName(k.constraintId), k.constraintId));
 }
 
-std::expected<std::vector<PartitionStats>, std::string> topicStats(rc::Client& c, const cat::CatalogState& state, const cat::TopicObject& t, int32_t only) {
+}  // namespace
+
+std::expected<std::vector<PartitionStats>, std::string> topicStats(rc::Client& c, const cat::TopicObject& t, int32_t only) {
     int32_t from = 0, to = 0;
     if (auto r = partitionRange(t.partitions, only, from, to); !r) return std::unexpected(std::move(r.error()));
     std::vector<PartitionStats> out;
@@ -1270,9 +1276,9 @@ std::expected<std::vector<PartitionStats>, std::string> topicStats(rc::Client& c
         auto r = c.getStatsAndWait(rpc::StatsScope::TopicPartition, t.topicId, p, kCatalogWait);
         if (r.status != rc::StatsResult::kOk) return std::unexpected(statsRefusal(p, r.status));
         PartitionStats ps{p, std::move(r), {}};
-        for (const auto& k : ps.result.constraints) ps.constraintLabels.push_back(constraintLabel(state, k.constraintId));
         out.push_back(std::move(ps));
     }
+    labelConstraints(c, out);
     return out;
 }
 
@@ -1299,14 +1305,12 @@ std::expected<std::vector<PartitionStats>, std::string> viewStats(rc::Client& c,
             } else if (src.status != rc::StatsResult::kOk) {
                 return std::unexpected(statsRefusal(p, src.status));
             }
-            for (const auto& k : src.constraints) {
-                if ((k.constraintId >> 16) != (v.objectId & 0xFFFF)) continue;
-                ps.result.constraints.push_back(k);
-                ps.constraintLabels.push_back(constraintLabel(v, static_cast<uint16_t>(k.constraintId & 0xFFFF)));
-            }
+            for (const auto& k : src.constraints)
+                if ((k.constraintId >> 16) == (v.objectId & 0xFFFF)) ps.result.constraints.push_back(k);
         }
         out.push_back(std::move(ps));
     }
+    labelConstraints(c, out);
     return out;
 }
 
@@ -1406,7 +1410,7 @@ bool QlRun::run(const PShowTopic& s, const rc::DdlOptions&) {
     const cat::TopicObject* t = broker.client().catalogReader().state().topicByName(cat::kDefaultNsId, s.name);
     if (t == nullptr) return fail("no topic '" + s.name + "'");
     out << formatTopicDefinition(*t);
-    const auto stats = showStatsText(topicStats(broker.client(), broker.client().catalogReader().state(), *t, -1));
+    const auto stats = showStatsText(topicStats(broker.client(), *t, -1));
     if (!stats) return fail(stats.error());
     out << *stats;
     return true;

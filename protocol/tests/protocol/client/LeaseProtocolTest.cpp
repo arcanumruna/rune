@@ -314,12 +314,12 @@ TEST(LeaseProtocolRegression, TimeToLiveRoundTripRegression) {
     EXPECT_FALSE(rc::LeaseTimeToLive::decode(hb.data(), hb.size()).has_value());
 
     rc::LeaseTimeToLiveResponse r;
-    r.sessionId = 5; r.correlationId = 6; r.code = 62; r.grantedTtlMs = 30000; r.remainingMs = -1;
+    r.sessionId = 5; r.correlationId = 6; r.code = 64; r.grantedTtlMs = 30000; r.remainingMs = -1;
     r.version = 77; r.holder = 0xDEADBEEFCAFEF00Dull;
     const Bytes rf = encodeVec(r);
     const auto rd = rc::LeaseTimeToLiveResponse::decode(rf.data(), rf.size());
     ASSERT_TRUE(rd.has_value());
-    EXPECT_EQ(rd->code, 62);
+    EXPECT_EQ(rd->code, 64);
     EXPECT_EQ(rd->grantedTtlMs, 30000u);
     EXPECT_EQ(rd->remainingMs, -1);
     EXPECT_EQ(rd->version, 77);
@@ -406,7 +406,7 @@ TEST(LeaseProtocolRegression, TruncatedAtEveryOffsetRegression) {
     std::vector<Bytes> frames;
     frames.push_back(keepAliveFrame({k1, k2}));
     {
-        const rc::LeaseKeepAliveResponse::Entry es[2] = {{0, 0, 100}, {1, 62, 0}};
+        const rc::LeaseKeepAliveResponse::Entry es[2] = {{0, 0, 100}, {1, 64, 0}};
         rc::LeaseKeepAliveResponse m; m.final = 1; m.entries = std::span<const rc::LeaseKeepAliveResponse::Entry>(es, 2);
         frames.push_back(encodeVec(m));
     }
@@ -788,9 +788,9 @@ TEST(LeaseProtocolRegression, TemplateDispatchRegression) {
 }
 
 TEST(LeaseProtocolRegression, NumbersPinnedRegression) {
-    EXPECT_EQ(static_cast<int>(rc::ErrorCode::LeaseNotFound), 62);
-    EXPECT_EQ(static_cast<int>(rc::ErrorCode::LeaseLimitExceeded), 63);
-    EXPECT_EQ(static_cast<int>(rc::ErrorCode::LeaseTtlTooLarge), 64);
+    EXPECT_EQ(static_cast<int>(rc::ErrorCode::LeaseNotFound), 64);
+    EXPECT_EQ(static_cast<int>(rc::ErrorCode::LeaseLimitExceeded), 65);
+    EXPECT_EQ(static_cast<int>(rc::ErrorCode::LeaseTtlTooLarge), 66);
     EXPECT_EQ(rc::kClientVersionLeases, 18);
     EXPECT_EQ(rc::kClientVersion, 18);
     EXPECT_EQ(rc::kBrokerVersionLeases, 11);

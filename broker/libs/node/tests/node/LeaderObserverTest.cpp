@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <csignal>
 #include <thread>
 
 using rune::node::LeaderObserver;
@@ -91,4 +92,31 @@ TEST(LeaderObserverRegression, SecondThreadObserverIsRefused) {
         t.join();
     }, "");
     EXPECT_EQ(o.observe().term, 4) << "the bound observer still drains (ring untouched)";
+}
+
+// A node started on a worker thread binds that thread; the test seam (BrokerNode::bindLeaderObserverForTest) is the one explicit rebind.
+// The starter, which no longer observes, is then the foreign thread.
+TEST(LeaderObserverRegression, BoundObserverIsReplacedOnlyByTheTestSeam) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    LeaderObserver o{1};
+    std::thread starter([&o] { o.bindObserver(); o.publish({/*leaderId=*/1, /*term=*/7, /*isLeader=*/true}); });
+    starter.join();
+    o.bindObserver();   // the seam, from the thread that observes
+    EXPECT_EQ(o.observe().term, 7) << "the rebound thread drains what the starter published";
+    EXPECT_EXIT({
+        std::thread t([&o] { (void)o.observe(); });
+        t.join();
+    }, ::testing::KilledBySignal(SIGABRT), "") << "any other thread is refused";
+}
+
+// A foreign observe() is refused without taking the observer role over: the bound thread stays the observer.
+TEST(LeaderObserverRegression, TheBoundThreadStaysTheObserverAfterAForeignObserveIsRefusedRegression) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    LeaderObserver o{1};
+    o.bindObserver();
+    EXPECT_EXIT({
+        std::thread t([&o] { (void)o.observe(); });
+        t.join();
+    }, ::testing::KilledBySignal(SIGABRT), "");
+    EXPECT_EQ(o.observe().leaderId, -1) << "the bound thread is still the observer";
 }

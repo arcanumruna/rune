@@ -298,6 +298,31 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
 // Role transitions
 // ---------------------------------------------------------------------------
 
+void PartitionReplica::setBootId(std::string id) {
+    bootId_      = std::move(id);
+    ledThisBoot_ = false;
+    if (bootId_.empty() || memoryBacked_ || diskLog_ == nullptr) return;
+    FILE* f = std::fopen((diskLog_->dir() + "/leader-boot").c_str(), "rb");
+    if (f == nullptr) return;
+    char buf[64];
+    const std::size_t n = std::fread(buf, 1, sizeof buf, f);
+    std::fclose(f);
+    ledThisBoot_ = n == bootId_.size() && std::memcmp(buf, bootId_.data(), n) == 0;
+}
+
+void PartitionReplica::dropLeaderBoot_() {
+    ledThisBoot_ = false;
+    if (!memoryBacked_ && diskLog_ != nullptr) std::remove((diskLog_->dir() + "/leader-boot").c_str());
+}
+
+bool PartitionReplica::writeLeaderBoot_() const {
+    // No fsync: the marker vouches for this boot only, whose page cache holds it; a torn or lost marker never matches (fail closed).
+    FILE* f = std::fopen((diskLog_->dir() + "/leader-boot").c_str(), "wb");
+    if (f == nullptr) return false;
+    const bool wrote = std::fwrite(bootId_.data(), 1, bootId_.size(), f) == bootId_.size();
+    return std::fclose(f) == 0 && wrote;
+}
+
 void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int32_t partitionEpoch)
 {
     // Hot-path B F7: a newer role while a leadership awaits its durable fence.
@@ -364,7 +389,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
         }
         if (logDirOffline_ || noFence || (!fenceFile_.empty() && !persistLedEpoch_(newEpoch))) {
             // A failed fence write takes the log dir offline (sticky, N1).
-            if (!noFence && !fenceFile_.empty()) logDirOffline_ = true;
+            if (!noFence && !fenceFile_.empty()) { logDirOffline_ = true; dropLeaderBoot_(); }
             if (newEpoch > restartFenceEpoch_) restartFenceEpoch_ = newEpoch;
             fenceEstablished_ = true;
             if (fenceUnknown_) {
@@ -383,6 +408,9 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
     }
     staleLead_.pending = false;
     storageHoldBackoffNs_ = 0;   // the gate let this leadership through: the next hold starts a new sequence
+    // Election batch: this leadership was granted under the election invariant (its log holds the committed prefix); from now on, in this
+    // OS boot, nothing this log held is lost.  Written once per replica per boot (cold).
+    if (!ledThisBoot_ && !bootId_.empty() && !memoryBacked_ && diskLog_ != nullptr) ledThisBoot_ = writeLeaderBoot_();
     report_.pending    = false;
     // E2 final fix wave (C1 multi-node): a TRANSIENT leader reports, for this
     // leadership, the leader epoch its ring's data came from (-1: unborn) — the
@@ -1770,7 +1798,7 @@ void PartitionReplica::rebuildEpochCacheFromLog_()
     bool gapped = false;
     for (int guard = 0; at < leo && guard < (1 << 20); ++guard) {
         // Copying read (cold): never leaves sealed segments mapped (lazy maps).
-        const std::vector<uint8_t> buf = onLog([&](auto& L) { return L.read(at, 1 << 20); });
+        const std::vector<uint8_t> buf = memoryBacked_ ? memLog_->read(at, 1 << 20) : diskLog_->readPastEmptied(at, 1 << 20, leo);
         if (buf.empty()) break;
         struct { const uint8_t* data; std::size_t len; } v{buf.data(), buf.size()};
         (void)assignEpochsFromBatches_(v.data, v.len);
@@ -2098,6 +2126,7 @@ void PartitionReplica::enableEpochState_() noexcept
                     spdlog::critical("PartitionReplica[topic={} part={}]: updating {} failed — log FAILED "
                                      "(fail-stop)", cfg_.topicId, cfg_.partitionId, ES::path(dir));
                     logDirOffline_ = true;
+                    dropLeaderBoot_();
                     if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->markStorageFailed(EIO);
                     return;   // es_ stays enabled: nothing is ever written to a legacy file
                 }
@@ -2322,6 +2351,7 @@ bool PartitionReplica::epochStateWriteCompleted(uint64_t seq, int err)
             const int32_t pe = pendingLead_.partitionEpoch;
             cancelPendingLeadership_();
             logDirOffline_ = true;
+            dropLeaderBoot_();
             if (e > restartFenceEpoch_) restartFenceEpoch_ = e;
             fenceEstablished_ = true;
             refuseStaleLeadership_(e, pe);
@@ -2330,6 +2360,7 @@ bool PartitionReplica::epochStateWriteCompleted(uint64_t seq, int err)
             // Like every other storage failure on the log: fail-stop (the owner
             // routes it to the broker halt).
             logDirOffline_ = true;
+            dropLeaderBoot_();
             diskLog_->markStorageFailed(err);
         }
         pushEpochCap_();
@@ -2506,7 +2537,7 @@ void PartitionReplica::reconcileEpochCacheWithLog_()
     Offset expect = from;    // CP3 I2: contiguity of the re-derived region
     bool gapped = false;
     for (int guard = 0; from < leo && guard < (1 << 20); ++guard) {
-        const std::vector<uint8_t> buf = diskLog_->read(from, 1 << 20);   // cold, copying read
+        const std::vector<uint8_t> buf = diskLog_->readPastEmptied(from, 1 << 20, leo);   // cold, copying read
         if (buf.empty()) break;
         Offset next = from;
         std::size_t pos = 0;
@@ -3716,7 +3747,7 @@ int PartitionReplica::requestLeaderEpochBump_(int64_t nowNs)
     m.isrCount       = AlterIsrMsg::kLeaderEpochBump;
     m.partitionEpoch = staleLead_.partitionEpoch;
     m.isr[0] = static_cast<int32_t>(restartFenceEpoch_);   // L2: the controller jumps past it
-    m.isr[1] = AlterIsrMsg::kBumpFenceValid | bumpFlags_();
+    m.isr[1] = AlterIsrMsg::kBumpFenceValid | bumpFlags_() | (ledThisBoot_ ? AlterIsrMsg::kBumpLedThisBoot : 0);
     const Offset leo = logEndOffset_();
     m.isr[2] = static_cast<int32_t>(std::min<Offset>(leo, std::numeric_limits<int32_t>::max()));
     m.isr[3] = static_cast<int32_t>(static_cast<uint64_t>(processIncarnation_) & 0xffffffffu);

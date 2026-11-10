@@ -153,6 +153,7 @@ OpResult BatchBuilder::submit_(uint64_t ackHandle) {
         // Seal the RecordBatch bytes ONCE into the slot (kept across a rejected send for a
         // retry).  baseSequence / producerId / epoch are patched by the agent.
         t.recordCount = t.builder.recordCount();
+        t.atomic      = true;
         t.builder.buildInto(t.batchBytes);
         t.builder.reset(0, 0);
         state_ = State::Built;

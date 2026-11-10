@@ -181,8 +181,8 @@ ProducerStateManager::validate(int32_t topicId,
     if (baseSequence > e.lastSequence) {
         // lastSequence == -1 means no batch appended yet in this epoch → expect 0.
         if (baseSequence == e.lastSequence + 1) return ValidationResult::accept();
-        // D6 L1: a rebuilt marker-only entry knows the epoch, not the producer's sequence.
-        if (e.markerOnly || e.unvouched) return ValidationResult::unknownProducer();
+        // D6 L1 / #953: a rebuilt entry knows the log's last sequence, not the producer's.
+        if (e.rebuilt) return ValidationResult::unknownProducer();
         return ValidationResult::oos();   // forward gap
     }
 
@@ -249,8 +249,7 @@ void ProducerStateManager::update(int32_t topicId,
     // Record the batch in the retry window (circular, evicts oldest when full).
     e.push(baseSequence, lastSequence, baseOffset);
     e.lastSequence = lastSequence;
-    e.markerOnly   = false;   // D6 L1: a sequence of this epoch is known now
-    e.unvouched    = fromRebuild;   // #953: a rebuilt lastSequence may be stale; a live append vouches again
+    e.rebuilt      = fromRebuild;   // a live append makes lastSequence exact
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +264,7 @@ void ProducerStateManager::fenceEpoch(int32_t topicId, int64_t producerId, int32
     if (producerEpoch <= e.producerEpoch) return;
     e.producerEpoch = producerEpoch;
     e.lastSequence  = -1;
-    e.markerOnly    = fromRebuild;   // D6 L1: no sequence of this epoch survives in the log
+    e.rebuilt       = fromRebuild;   // D6 L1: no sequence of this epoch survives in the log
     e.resetWindow();
 }
 

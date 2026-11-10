@@ -25,6 +25,8 @@
 // Election timing (all optional; defaults are fast-but-safe for co-located clusters):
 //   RUNE_ELECTION_TIMEOUT_MS        — int64 ms, default 150. Max wait per election round.
 //   RUNE_VERDICT_INTERVAL_MS        — int64 ms, default 100. How often a verdict source writes a marker for accepted-only progress.
+//   RUNE_TXN_JUDGED_RECORDS_MAX     — int32 in [1, 1048576], default 4096. The most records of one partition a transaction may
+//                                     have judged; a larger one is voted TxnTooLarge (62).
 //   RUNE_ELECTION_STATUS_INTERVAL_MS — int64 ms, default 20. Canvass/heartbeat cadence.
 //   RUNE_STARTUP_CANVASS_TIMEOUT_MS — int64 ms, default 100. Extended canvass on first boot.
 //   RUNE_MIN_ISR                    — int32, minimum ISR size for acks=All gate. Default:
@@ -331,11 +333,20 @@ struct NodeConfig {
     /// short value to prove no startup phase starves an invoker driver.  No env var.
     static constexpr int64_t kInProcessLivenessNs = 3'600'000'000'000LL;
     int64_t shardClientLivenessTimeoutNs = kInProcessLivenessNs;
+    /// TEST-ONLY: the embedded drivers' client liveness (ms) before shardClientLivenessTimeoutNs overrides it, in place of Aeron's 10 s
+    /// default, and the floor of inProcessDriverTimeoutMs: a test freezes the process past it in a fraction of the time, and without
+    /// the node's own liveness the freeze kills it.  0 = Aeron's 10 s; never set in production.
+    long testAeronLivenessDefaultMs = 0;
+    /// TEST-ONLY: the idle sleep (ms) of the node's runtime Aeron client conductor (thread placement) in place of Aeron's 16 ms, so a
+    /// test's every client-conductor round trip (a gateway egress publication, a subscription) does not wait out two 16 ms sleeps.
+    /// 0 = Aeron's 16 ms; never set in production.
+    long testAeronClientIdleSleepMs = 0;
     /// The in-process clients' media-driver timeout (ms) matching shardClientLivenessTimeoutNs (never below
-    /// Aeron's 10 s default).
+    /// Aeron's 10 s default, or testAeronLivenessDefaultMs when set).
     [[nodiscard]] long inProcessDriverTimeoutMs() const noexcept {
         const long ms = static_cast<long>(shardClientLivenessTimeoutNs / 1'000'000);
-        return ms > 10'000 ? ms : 10'000;
+        const long floorMs = testAeronLivenessDefaultMs > 0 ? testAeronLivenessDefaultMs : 10'000;
+        return ms > floorMs ? ms : floorMs;
     }
     [[nodiscard]] bool shardMode() const noexcept { return workerMode == WorkerMode::Shard; }
     [[nodiscard]] bool fused() const noexcept { return runtimePlacement == RuntimePlacement::Fused; }
@@ -345,8 +356,15 @@ struct NodeConfig {
     // Increase for cross-datacenter deployments.
     int64_t electionTimeoutMs        = 150;  // default 150 ms
     int64_t verdictIntervalMs        = 100;  // RUNE_VERDICT_INTERVAL_MS (checked writes SD14)
+    int32_t txnJudgedRecordsMax      = 4096; // RUNE_TXN_JUDGED_RECORDS_MAX (checked writes P11-1)
+    static constexpr int32_t kTxnJudgedRecordsMaxCeiling = 1'048'576;
     int64_t electionStatusIntervalMs =  20;  // default  20 ms
     int64_t startupCanvassTimeoutMs  = 100;  // default 100 ms
+    /// A young controller process decides no user-partition leadership until it has held the replicas' "cannot serve" reports
+    /// this long (one report TTL).  Test clusters shorten it; production keeps the TTL.  A value below BrokerNode::kUnservableReportPeriodNs
+    /// (500 ms) disables the guard: no replica has reported "cannot serve" yet when it ends.
+    static constexpr int64_t kDefaultUnservableWarmupMs = 2'000;
+    int64_t unservableWarmupMs       = kDefaultUnservableWarmupMs;
 
     // Controlled shutdown (RUNE_CONTROLLED_SHUTDOWN_MS): on a graceful stop
     // signal main() hands this node's partition leadership (and, on the
@@ -370,6 +388,11 @@ struct NodeConfig {
     // edge, never re-armed by a later re-election.  0 (default): no hold;
     // never set in production.
     int64_t testUserDecisionHoldMs = 0;
+
+    // TEST-ONLY: L, the longest view read lease a controller grants or a broker holds (ms).  The leader-move fence
+    // W = L x 1.0201 follows it (issue #491), so a restart waits W before the controller fails a leader over.  Safety
+    // bound: only tests lower it, the same on every node; never set in production.  Default 200.
+    int64_t readLeaseMaxMs = 200;
 
     // TEST-ONLY: the client gateway's session lease (a session silent, or Lost on a worker, this long
     // is reaped).  Lets a stall-past-the-lease test stall a few seconds instead of outlasting the
@@ -834,6 +857,14 @@ struct NodeConfig {
     // 1 MiB (measured 2026-10-03, 3-node acks=all: >= 16 MiB throughput, no 100+ ms term-rotation stalls,
     // 16x less /dev/shm).  Max Aeron message = term/8 = 128 KiB -> the batch limit (batchLimitFormula).
     int32_t aeronTermBufferBytes         = 1024 * 1024;
+    /// Counter-values buffer of each embedded driver's CnC (EmbeddedDriverConfig::countersValuesBytes).  0 = Aeron's default
+    /// (8 MiB of values + 32 MiB of metadata, zero-filled when the driver starts).  Test brokers set Aeron's 1 MiB minimum.
+    int32_t aeronCountersValuesBytes     = 0;
+    /// Receiver status-message timeout of each embedded driver (EmbeddedDriverConfig::statusMessageTimeoutNs).  0 = Aeron's default (200 ms).
+    int64_t aeronStatusMessageTimeoutNs  = 0;
+    /// TEST-ONLY: how soon an embedded driver reads a silent client's publication as NOT_CONNECTED and closes its image
+    /// (EmbeddedDriverConfig::silentPeerTimeoutNs).  0 = Aeron's defaults (5 s and 10 s); never set in production.
+    int64_t testSilentPeerTimeoutNs = 0;
     /// RUNE_AERON_CONTROL_TERM_BYTES: term of the worker's per-session ACK publications only — small so a
     /// term rotation never cleans 16 MiB inside the worker pass.  NOT the gateway egress publications:
     /// consumer record pushes travel there (max message = term/8 must cover the largest batch).

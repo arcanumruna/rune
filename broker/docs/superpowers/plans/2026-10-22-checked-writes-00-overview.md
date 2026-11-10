@@ -35,7 +35,8 @@ The plans were written against `3c1ad01d` (the merge-base of the plan branch; cl
 
 ### RB1 — Scope
 
-- **Part 11 is dropped.** No part builds the transaction vote. Everything owned by 11 (C18, `TxnConflict`, `TxnTooLarge`, the cluster templates, `TxnVote` ops and return types, `kAttrAtomic`, stats 11–20, R11a–R11d, the §16.12 cross-check) is out. Part 03's refusal of a transactional batch to a constrained source (03 rule 7) is permanent until a follow-up issue reopens §9b. R03c stays: the client never sets `View` on a transactional send.
+- **Reinstated 2026-11-07 (owner decision):** Part 11 ships with Part 09 on one branch; its plan's "Refresh 2026-11-07" section supersedes this bullet and the numbering below (TxnTooLarge = 62, TxnConflict = 63).
+- ~~**Part 11 is dropped.**~~ No part builds the transaction vote. Everything owned by 11 (C18, `TxnConflict`, `TxnTooLarge`, the cluster templates, `TxnVote` ops and return types, `kAttrAtomic`, stats 11–20, R11a–R11d, the §16.12 cross-check) is out. Part 03's refusal of a transactional batch to a constrained source (03 rule 7) is permanent until a follow-up issue reopens §9b. R03c stays: the client never sets `View` on a transactional send.
 - **Part 01 is done by #589 (merge `f71596cc`).** It has no branch and no PR. RB3 says what later parts use instead.
 - **R-ORD becomes:** 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09, with 10 after 03 (beside 04–08), and 09 after 10. Autoincrement is usable after 06; `unique` and `check` after 09.
 
@@ -43,13 +44,13 @@ The plans were written against `3c1ad01d` (the merge-base of the plan branch; cl
 
 | Space | Plan value | Value on main | Owner |
 |---|---|---|---|
-| `ErrorCode` (51–54 are `NamespaceSuspended`, `NamespaceLimitExceeded`, `Throttled`, `ViewPaused`) | 51 `ConstraintViolation`, 52 `KeyExists`, 53 `KeyNotFound`, 54 `AutoIncrementExhausted`, 55 `TxnTooLarge`, 56 `ViewKeyExpressionInvalid`, 57 `ViewConstraintInvalid`, 58 `ViewUniqueInvalid`, 59 `TxnConflict` | **55** `ConstraintViolation`, **56** `KeyExists`, **57** `KeyNotFound`, **58** `AutoIncrementExhausted`, **59** `ViewKeyExpressionInvalid`, **60** `ViewConstraintInvalid`, **61** `ViewUniqueInvalid`; `TxnTooLarge` and `TxnConflict` are not added. Next free 62 | 03 |
-| `errorCodeName` (`QlEngine.cpp`), `produceErrorForClient` | names 48–58, map 51–58 below v12 | names through 61, `static_assert` on `ViewUniqueInvalid`; map 55–61 to `InvalidRequest` below `kClientVersionCheckedWrites` | 03 |
+| `ErrorCode` (51–54 are `NamespaceSuspended`, `NamespaceLimitExceeded`, `Throttled`, `ViewPaused`) | 51 `ConstraintViolation`, 52 `KeyExists`, 53 `KeyNotFound`, 54 `AutoIncrementExhausted`, 55 `TxnTooLarge`, 56 `ViewKeyExpressionInvalid`, 57 `ViewConstraintInvalid`, 58 `ViewUniqueInvalid`, 59 `TxnConflict` | **55** `ConstraintViolation`, **56** `KeyExists`, **57** `KeyNotFound`, **58** `AutoIncrementExhausted`, **59** `ViewKeyExpressionInvalid`, **60** `ViewConstraintInvalid`, **61** `ViewUniqueInvalid` (03); **62** `TxnTooLarge`, **63** `TxnConflict` (11). Next free 64 | 03, 11 |
+| `errorCodeName` (`QlEngine.cpp`), `produceErrorForClient` | names 48–58, map 51–58 below v12 | names through 63, `static_assert` on `TxnConflict`; map 55–63 to `InvalidRequest` below `kClientVersionCheckedWrites` | 03, 11 |
 | Client version | `kClientVersionCheckedWrites = kClientVersion = 12`; "v11 client" | **17**; "v11" means 16 | 03 |
 | Broker version | `kBrokerVersionCheckedWrites = kBrokerVersion = 7`; "v6 broker" | **10**; "v6" means 9 | 03 |
 | Cluster feature level | `MetadataFeature::kCheckedWrites = 4` (4 is `kTxnPartitionVerify`); "below level 4" | **5**, `kLatest = kCheckedWrites`; "below level 4" means below 5 | 02 |
-| `WorkerOp::Type` / SBE `OpType` (26–30 are taken) | 26 `ClusterFeatureLevel`, 27 `WriteSpecUpdate`, 29 `GetViewRowK`, 30 `ScanViewRows`, 31 `GetStats` | **31** `ClusterFeatureLevel`, **32** `WriteSpecUpdate` (02); **33** `GetViewRowK`, **34** `ScanViewRows` (07); **35** `GetStats` (08). Next free 36 | 02, 07, 08 |
-| `WorkerReturn::Type` / SBE `ReturnType` (8 is `TXN_VERIFY_REQUEST`) | 9 `ViewScanResult`, 10 `StatsResult` | unchanged (9, 10). Next free 11 | 07, 08 |
+| `WorkerOp::Type` / SBE `OpType` (26–30 are taken) | 26 `ClusterFeatureLevel`, 27 `WriteSpecUpdate`, 29 `GetViewRowK`, 30 `ScanViewRows`, 31 `GetStats` | **31** `ClusterFeatureLevel`, **32** `WriteSpecUpdate` (02); **33** `GetViewRowK`, **34** `ScanViewRows` (07); **35** `GetStats` (08); **36** `TxnVote` (11). Next free 37 | 02, 07, 08, 11 |
+| `WorkerReturn::Type` / SBE `ReturnType` (8 is `TXN_VERIFY_REQUEST`) | 9 `ViewScanResult`, 10 `StatsResult` | unchanged (9, 10); **11** `TxnVoteResult` (11). Next free 12 | 07, 08, 11 |
 | SBE `TailKind` | 12 `WRITE_SPEC`, 13 `VIEW_READ` | unchanged | 02, 07 |
 | Client `TemplateId` (81–87 are namespaces and `WorkerBind`; the view range ends at 95) | 81 `GetViewRowK`, 82 `ScanViewRows`, 83 `ScanViewRowsResponse`, 84 `GetStats`, 85 `StatsResponse` | **88**, **89**, **90** (07); **91**, **92** (08). Next free 93 | 07, 08 |
 | Control → admin message (`AdminChannels.h`; the `kMsg` ids are one space shared by several rings, 36 is the highest) | `kMsgClusterFeatureLevel = 26` | **37** (26 is in fact free; 37 is kept). Next free 38 | 02 |
@@ -137,6 +138,8 @@ Catalog `formatVer 2` is namespaces (`kFormatV2`, `kCurrentFormatVer`, `ApplyV2`
 **Part 09.** `ThreeNodes::startWith(tag, tweak)` replaces `start(tag, tweak)`. A restart is `stop(id)` or `crash(id)` followed by `startNode(id)`; there is no `restart` / `restartAll`.
 
 **Part 10.** Views over a transient source get the source topic's `NsTag` once 37 is lifted, so they are charged and paused (`NsViewMemOver`) and read-throttled like any view. Add one namespace cell.
+
+**Part 11.** Its plan's "Refresh 2026-11-07" section (R-1 numbers, R-2 rulings) applies on top of this section.
 
 **Aeron 1.51.** Aeron no longer ships `concurrent/ringbuffer/RecordDescriptor.h`; any plan code needing it includes `rune/protocol/ring/RecordDescriptor.h`.
 
@@ -743,7 +746,7 @@ Each item names the owning part. Other parts use the name exactly as given.
 
 ### Code and number registry (every number the program takes)
 
-> Superseded where it differs by **RB2** (Rebase to `main` 750c836b). Part 11 rows are dropped (RB1).
+> Superseded where it differs by **RB2** (Rebase to `main` 750c836b). Part 11 is reinstated (RB1); its numbers are RB2's and its plan's Refresh R-1 (cluster templates 15 and 16).
 
 Each row gives the number, its name and its owning part. A part takes a new number only from the next free value of its row and adds it here first.
 

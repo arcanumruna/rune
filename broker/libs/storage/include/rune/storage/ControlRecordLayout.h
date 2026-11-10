@@ -1,16 +1,20 @@
 #pragma once
-// ControlRecordLayout.h -- control records of the checked-writes pipeline (types 16-19; 20 is Part 09's).
+// ControlRecordLayout.h -- control records of the checked-writes pipeline (types 16-20).
 //
 // A control batch with attributes = kAttrControl ONLY (0x0020, transactional clear), producerId / producerEpoch /
 // baseSequence = -1 and one record in standard record framing.  The record key is the int16 LE type, the value is
-// [version u8 = 1][payload], all little-endian.  producerId -1 keeps these out of TxnCleanState and the PSM feed.
+// [version u8 = 1 (kConstraintSetChange: 2)][payload], all little-endian.  producerId -1 keeps these out of TxnCleanState and the PSM feed.
 // Builders write into a caller buffer with baseOffset 0 (appendControlBatch restamps it, CRC-safe) and never allocate.
 //
 //   kVerdictMarker       [fromOffset i64][finalThrough i64][constraintSetId u32][count u32]
 //                        count x [offsetDelta u32][code u16][constraintId u32]
-//   kConstraintSetChange [constraintSetId u32][count u16] count x [viewObjectId u64][kind u8][planFingerprint u64]
+//   kConstraintSetChange [constraintSetId u32][catalogThrough i64][count u16] count x [viewObjectId u64][kind u8][planFingerprint u64]
+//                        (version byte 2: the catalog position the set was computed at, #788; a version-1 change is unparseable)
 //   kReservation         [reservedThroughN u64]
-//   kTxnJudge (11) is recognised and skipped by every reader; its payload is that part's.
+//   kVerdictPlan         [viewObjectId u64][planFingerprint u64][kind u8][planLen u32][plan][outLen u32][output descriptor][srcLen u32][source descriptor]
+//                        (the plan of a joining unique or check member, appended just below its change record; at most kMaxVerdictPlanBytes in all)
+//   kTxnJudge            [producerId i64][producerEpoch i16][firstOffset i64]
+//                        (the leader's vote record for the transaction of producerId whose first batch on this partition is at firstOffset)
 #include <rune/protocol/Crc32c.h>
 #include <rune/protocol/RecordBatch.h>
 
@@ -26,19 +30,28 @@ inline constexpr int16_t     kReservation         = 16;
 inline constexpr int16_t     kVerdictMarker       = 17;
 inline constexpr int16_t     kConstraintSetChange = 18;
 inline constexpr int16_t     kTxnJudge            = 19;
+inline constexpr int16_t     kVerdictPlan         = 20;
 inline constexpr int         kUnparseable         = -1;
 inline constexpr uint8_t     kPayloadVersion      = 1;
+inline constexpr uint8_t     kChangePayloadVersion = 2;
 inline constexpr std::size_t kMaxMarkerEntries    = 4096;
+/// A marker with the maximum entries may end inside a transaction span: its finalThrough is no point to restart from.
+constexpr bool closesCoverage(std::size_t count) noexcept { return count < kMaxMarkerEntries; }
+inline constexpr std::size_t kMaxVerdictPlanBytes = 65536;
 
 struct MarkerEntry  { uint32_t offsetDelta; uint16_t code; uint32_t constraintId; };
 struct MarkerHeader { int64_t fromOffset; int64_t finalThrough; uint32_t constraintSetId; uint32_t count; };
 struct ChangeMember { uint64_t viewObjectId; uint8_t kind; uint64_t planFingerprint; };
+struct VerdictPlanHeader { uint64_t viewObjectId; uint64_t planFingerprint; uint8_t kind; };
 
 inline constexpr std::size_t kMarkerFixedBytes = 1 + 8 + 8 + 4 + 4;
 inline constexpr std::size_t kMarkerEntryBytes = 4 + 2 + 4;
-inline constexpr std::size_t kChangeFixedBytes = 1 + 4 + 2;
+inline constexpr std::size_t kChangeFixedBytes = 1 + 4 + 8 + 2;
 inline constexpr std::size_t kChangeMemberBytes = 8 + 1 + 8;
 inline constexpr std::size_t kReservationBytes  = 1 + 8;
+inline constexpr std::size_t kTxnJudgeBytes     = 1 + 8 + 2 + 8;
+
+struct TxnJudgeRecord { int64_t producerId; int16_t producerEpoch; int64_t firstOffset; };
 
 namespace detail {
 
@@ -128,7 +141,7 @@ inline std::optional<std::span<const uint8_t>> valueOf(const uint8_t* batch, std
     type = get<int16_t>(batch + pos);
     pos += 2;
     if (!getZigzag(batch, len, pos, vlen) || vlen < 1 || pos + static_cast<std::size_t>(vlen) + 1 != len) return std::nullopt;
-    if (batch[pos] != kPayloadVersion || batch[len - 1] != 0) return std::nullopt;
+    if (batch[pos] != (type == kConstraintSetChange ? kChangePayloadVersion : kPayloadVersion) || batch[len - 1] != 0) return std::nullopt;
     return std::span<const uint8_t>(batch + pos, static_cast<std::size_t>(vlen));
 }
 
@@ -143,6 +156,35 @@ inline std::optional<std::span<const uint8_t>> valueOf(const uint8_t* batch, std
 
 [[nodiscard]] constexpr std::size_t reservationBatchBytes() noexcept { return detail::batchBytes(kReservationBytes); }
 
+inline constexpr std::size_t kTxnJudgeBatchBytes = detail::batchBytes(kTxnJudgeBytes);
+
+/// The whole type-20 value: [version u8][viewObjectId u64][planFingerprint u64][kind u8] then three u32-prefixed blobs.
+[[nodiscard]] constexpr std::size_t verdictPlanPayloadBytes(std::size_t planLen, std::size_t outLen, std::size_t srcLen) noexcept {
+    return 1 + 8 + 8 + 1 + 3 * 4 + planLen + outLen + srcLen;
+}
+
+/// The whole type-20 batch around a payload of `payloadBytes`.
+[[nodiscard]] constexpr std::size_t verdictPlanBatchBytes(std::size_t payloadBytes) noexcept { return detail::batchBytes(payloadBytes); }
+
+/// Writes the type-20 value (verdictPlanPayloadBytes of the blobs) into `out`; 0 = `out` too small or over kMaxVerdictPlanBytes.
+inline std::size_t writeVerdictPlanPayload(std::span<uint8_t> out, const VerdictPlanHeader& h, std::span<const uint8_t> plan,
+                                           std::span<const uint8_t> outDesc, std::span<const uint8_t> srcDesc) noexcept {
+    const std::size_t total = verdictPlanPayloadBytes(plan.size(), outDesc.size(), srcDesc.size());
+    if (total > kMaxVerdictPlanBytes || out.size() < total) return 0;
+    uint8_t* d = out.data();
+    std::size_t p = 0;
+    d[p++] = kPayloadVersion;
+    detail::put<uint64_t>(d + p, h.viewObjectId); p += 8;
+    detail::put<uint64_t>(d + p, h.planFingerprint); p += 8;
+    d[p++] = h.kind;
+    for (const std::span<const uint8_t> blob : {plan, outDesc, srcDesc}) {
+        detail::put<uint32_t>(d + p, static_cast<uint32_t>(blob.size())); p += 4;
+        if (!blob.empty()) std::memcpy(d + p, blob.data(), blob.size());
+        p += blob.size();
+    }
+    return total;
+}
+
 /// 0 = `out` too small.
 inline std::size_t buildReservation(std::span<uint8_t> out, uint64_t reservedThroughN) noexcept {
     const std::size_t total = reservationBatchBytes();
@@ -152,6 +194,18 @@ inline std::size_t buildReservation(std::span<uint8_t> out, uint64_t reservedThr
     detail::put<uint64_t>(out.data() + p, reservedThroughN); p += 8;
     detail::sealBatch(out.data(), p);
     return total;
+}
+
+/// 0 = `out` too small.
+inline std::size_t buildTxnJudge(std::span<uint8_t> out, const TxnJudgeRecord& r) noexcept {
+    if (out.size() < kTxnJudgeBatchBytes) return 0;
+    std::size_t p = detail::beginBatch(out.data(), kTxnJudge, kTxnJudgeBytes);
+    out[p++] = kPayloadVersion;
+    detail::put<int64_t>(out.data() + p, r.producerId); p += 8;
+    detail::put<int16_t>(out.data() + p, r.producerEpoch); p += 2;
+    detail::put<int64_t>(out.data() + p, r.firstOffset); p += 8;
+    detail::sealBatch(out.data(), p);
+    return kTxnJudgeBatchBytes;
 }
 
 /// 0 = `out` too small, or `entries.size() != h.count`, or more than kMaxMarkerEntries.
@@ -176,15 +230,17 @@ inline std::size_t buildVerdictMarker(std::span<uint8_t> out, const MarkerHeader
     return total;
 }
 
-inline std::size_t buildConstraintSetChange(std::span<uint8_t> out, uint32_t constraintSetId, std::span<const ChangeMember> members) noexcept {
+/// `catalogThrough`: the catalog position the set was computed at; a leader asks for a change only once its catalog has applied it.
+inline std::size_t buildConstraintSetChange(std::span<uint8_t> out, uint32_t constraintSetId, int64_t catalogThrough, std::span<const ChangeMember> members) noexcept {
     if (members.size() > UINT16_MAX) return 0;
     const std::size_t total = changeBatchBytes(static_cast<uint16_t>(members.size()));
     if (out.size() < total) return 0;
     const std::size_t valueLen = kChangeFixedBytes + members.size() * kChangeMemberBytes;
     std::size_t p = detail::beginBatch(out.data(), kConstraintSetChange, valueLen);
     uint8_t* d = out.data();
-    d[p++] = kPayloadVersion;
+    d[p++] = kChangePayloadVersion;
     detail::put<uint32_t>(d + p, constraintSetId); p += 4;
+    detail::put<int64_t>(d + p, catalogThrough); p += 8;
     detail::put<uint16_t>(d + p, static_cast<uint16_t>(members.size())); p += 2;
     for (const ChangeMember& m : members) {
         detail::put<uint64_t>(d + p, m.viewObjectId); p += 8;
@@ -195,7 +251,27 @@ inline std::size_t buildConstraintSetChange(std::span<uint8_t> out, uint32_t con
     return total;
 }
 
-/// A validated checked-writes control batch (type 16-19): the type and the value view into the batch bytes.  Obtain one only from
+/// 0 = `out` too small, or the payload is over kMaxVerdictPlanBytes.
+inline std::size_t buildVerdictPlan(std::span<uint8_t> out, const VerdictPlanHeader& h, std::span<const uint8_t> plan,
+                                    std::span<const uint8_t> outDesc, std::span<const uint8_t> srcDesc) noexcept {
+    const std::size_t valueLen = verdictPlanPayloadBytes(plan.size(), outDesc.size(), srcDesc.size());
+    if (valueLen > kMaxVerdictPlanBytes || out.size() < verdictPlanBatchBytes(valueLen)) return 0;
+    const std::size_t p = detail::beginBatch(out.data(), kVerdictPlan, valueLen);
+    (void)writeVerdictPlanPayload(out.subspan(p), h, plan, outDesc, srcDesc);
+    detail::sealBatch(out.data(), p + valueLen);
+    return verdictPlanBatchBytes(valueLen);
+}
+
+/// The type-20 batch around a payload writeVerdictPlanPayload built; 0 = `out` too small.
+inline std::size_t wrapVerdictPlan(std::span<uint8_t> out, std::span<const uint8_t> payload) noexcept {
+    if (out.size() < verdictPlanBatchBytes(payload.size())) return 0;
+    const std::size_t p = detail::beginBatch(out.data(), kVerdictPlan, payload.size());
+    std::memcpy(out.data() + p, payload.data(), payload.size());
+    detail::sealBatch(out.data(), p + payload.size());
+    return verdictPlanBatchBytes(payload.size());
+}
+
+/// A validated checked-writes control batch (type 16-20): the type and the value view into the batch bytes.  Obtain one only from
 /// parseControl, which runs the framing and the CRC once; the view overloads below do no CRC and trust it.
 struct ControlRecord {
     int16_t                  type;
@@ -203,15 +279,15 @@ struct ControlRecord {
 };
 
 /// Validates `batch` once (framing + CRC32C) and returns its type and value; nullopt for anything that is not a well-formed control
-/// batch of type 16-19 (a transaction marker, a data batch, a damaged or truncated batch, type 20 and above).
+/// batch of type 16-20 (a transaction marker, a data batch, a damaged or truncated batch, type 21 and above).
 [[nodiscard]] inline std::optional<ControlRecord> parseControl(const uint8_t* batch, std::size_t len) noexcept {
     int16_t type = 0;
     const auto v = detail::valueOf(batch, len, type);
-    if (!v || type < kReservation || type > kTxnJudge) return std::nullopt;
+    if (!v || type < kReservation || type > kVerdictPlan) return std::nullopt;
     return ControlRecord{type, *v};
 }
 
-/// The type (16-19) of a well-formed checked-writes control batch, else kUnparseable.
+/// The type (16-20) of a well-formed checked-writes control batch, else kUnparseable.
 [[nodiscard]] inline int recordType(const uint8_t* batch, std::size_t len) noexcept {
     const auto c = parseControl(batch, len);
     return c ? c->type : kUnparseable;
@@ -264,22 +340,54 @@ bool forEachMarkerEntry(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept
 }
 
 /// false when `c` is not a change record or holds more members than `out`.
-[[nodiscard]] inline bool parseConstraintSetChange(const ControlRecord& c, uint32_t& setId, std::span<ChangeMember> out, uint16_t& count) noexcept {
+[[nodiscard]] inline bool parseConstraintSetChange(const ControlRecord& c, uint32_t& setId, int64_t& catalogThrough, std::span<ChangeMember> out, uint16_t& count) noexcept {
     if (c.type != kConstraintSetChange || c.value.size() < kChangeFixedBytes) return false;
     const uint8_t* p = c.value.data() + 1;
     setId = detail::get<uint32_t>(p);
-    count = detail::get<uint16_t>(p + 4);
+    catalogThrough = detail::get<int64_t>(p + 4);
+    count = detail::get<uint16_t>(p + 12);
     if (c.value.size() != kChangeFixedBytes + count * kChangeMemberBytes || count > out.size()) return false;
-    p += 6;
+    p += 14;
     for (uint16_t i = 0; i < count; ++i, p += kChangeMemberBytes)
         out[i] = ChangeMember{detail::get<uint64_t>(p), p[8], detail::get<uint64_t>(p + 9)};
     return true;
 }
 /// false when `batch` is not a change record or holds more members than `out`.
-[[nodiscard]] inline bool parseConstraintSetChange(const uint8_t* batch, std::size_t len, uint32_t& setId,
+[[nodiscard]] inline bool parseConstraintSetChange(const uint8_t* batch, std::size_t len, uint32_t& setId, int64_t& catalogThrough,
                                                    std::span<ChangeMember> out, uint16_t& count) noexcept {
     const auto c = parseControl(batch, len);
-    return c && parseConstraintSetChange(*c, setId, out, count);
+    return c && parseConstraintSetChange(*c, setId, catalogThrough, out, count);
+}
+
+/// false when `c` is not a plan record or its blob lengths do not add up.  The spans view into the batch bytes.
+[[nodiscard]] inline bool parseVerdictPlan(const ControlRecord& c, VerdictPlanHeader& h, std::span<const uint8_t>& plan,
+                                           std::span<const uint8_t>& outDesc, std::span<const uint8_t>& srcDesc) noexcept {
+    constexpr std::size_t kFixed = verdictPlanPayloadBytes(0, 0, 0);
+    if (c.type != kVerdictPlan || c.value.size() < kFixed || c.value.size() > kMaxVerdictPlanBytes) return false;
+    const uint8_t* d = c.value.data();
+    const std::size_t end = c.value.size();
+    VerdictPlanHeader got{detail::get<uint64_t>(d + 1), detail::get<uint64_t>(d + 9), d[17]};
+    std::size_t p = 18;
+    std::span<const uint8_t> blobs[3];
+    for (std::span<const uint8_t>& blob : blobs) {
+        if (p + 4 > end) return false;
+        const std::size_t n = detail::get<uint32_t>(d + p);
+        p += 4;
+        if (n > end - p) return false;
+        blob = std::span<const uint8_t>(d + p, n);
+        p += n;
+    }
+    if (p != end) return false;
+    h = got;
+    plan = blobs[0];
+    outDesc = blobs[1];
+    srcDesc = blobs[2];
+    return true;
+}
+[[nodiscard]] inline bool parseVerdictPlan(const uint8_t* batch, std::size_t len, VerdictPlanHeader& h, std::span<const uint8_t>& plan,
+                                           std::span<const uint8_t>& outDesc, std::span<const uint8_t>& srcDesc) noexcept {
+    const auto c = parseControl(batch, len);
+    return c && parseVerdictPlan(*c, h, plan, outDesc, srcDesc);
 }
 
 [[nodiscard]] inline std::optional<uint64_t> parseReservation(const ControlRecord& c) noexcept {
@@ -289,6 +397,16 @@ bool forEachMarkerEntry(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept
 [[nodiscard]] inline std::optional<uint64_t> parseReservation(const uint8_t* batch, std::size_t len) noexcept {
     const auto c = parseControl(batch, len);
     return c ? parseReservation(*c) : std::nullopt;
+}
+
+[[nodiscard]] inline std::optional<TxnJudgeRecord> parseTxnJudge(const ControlRecord& c) noexcept {
+    if (c.type != kTxnJudge || c.value.size() != kTxnJudgeBytes) return std::nullopt;
+    const uint8_t* p = c.value.data() + 1;
+    return TxnJudgeRecord{detail::get<int64_t>(p), detail::get<int16_t>(p + 8), detail::get<int64_t>(p + 10)};
+}
+[[nodiscard]] inline std::optional<TxnJudgeRecord> parseTxnJudge(const uint8_t* batch, std::size_t len) noexcept {
+    const auto c = parseControl(batch, len);
+    return c ? parseTxnJudge(*c) : std::nullopt;
 }
 
 }  // namespace rune::storage::control_record

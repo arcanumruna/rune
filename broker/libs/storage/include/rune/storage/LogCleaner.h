@@ -147,6 +147,8 @@ public:
     /// Part 04: a verdict source's committed watermark W (nothing at or above it is cleaned) and the end of the markers
     /// below it (the pre-pass reads that far for markers).  Defaults: not a verdict source.
     void setVerdictBounds(Offset bound, Offset markerEnd) noexcept { verdictBound_ = bound; verdictMarkerEnd_ = markerEnd; }
+    /// Part 11: a TxnJudge record below this offset may be removed (default 0: none is).
+    void setTxnJudgeBound(Offset bound) noexcept { txnJudgeBound_ = bound; }
     /// Segment files the rewrite phase of the last pass read (test/accounting).
     [[nodiscard]] int64_t lastRewriteSegmentsRead() const noexcept { return rewriteSegmentsRead_; }
 
@@ -482,6 +484,7 @@ private:
     Offset  markerRemovalBound_     = 0;
     Offset  verdictBound_           = std::numeric_limits<Offset>::max();
     Offset  verdictMarkerEnd_       = 0;
+    Offset  txnJudgeBound_          = 0;
     int64_t rewriteSegmentsRead_    = 0;
     std::optional<Damaged> damaged_{};   ///< sticky uncleanable state (see uncleanable())
     /// A walk of `segBase` stopped at `pos` short of its end: enter the uncleanable state (first time: log once).

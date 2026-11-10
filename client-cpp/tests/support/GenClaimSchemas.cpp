@@ -16,6 +16,10 @@
 //   lease_evo    version 2 of a lease schema with a field DROPPED between live ones (a UInt32, gone Int64 until 2, tag string(4),
 //                flag Bool, ratio Float64, kind Enum, w UInt16): the LeasesRow decode skips the dropped slot (LeasesRowDecodeRegression)
 //   ai_user      userId UInt64 KEY, provider UInt16, subject string(64), createdAt Int64 (the same probe: the autoincrement e2e)
+//   rp_user      the RegressorsPath golden script's `user` topic (schema name "user"): userId UInt64 KEY, provider UInt16,
+//                subject string(64), createdAt Int64 (the same probe: the REGRESSORSPATH e2e)
+//   rp_character the golden script's `character` topic (schema name "character"): characterId UInt64 KEY, userId UInt64,
+//                name string(16), gender/hairSkin/hairSheet/headSkin UInt16, createdAt/lastPlayed Int64
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Generator.h>
 #include <rune/codec/LeaseColumns.h>
@@ -105,6 +109,23 @@ int main(int argc, char** argv) {
                         .build();
     if (!rune::codec::prependLeaseColumns(leaseEvo)) return 1;
     if (!rune::codec::prependLeaseColumns(leaseClaim) || !rune::codec::prependLeaseColumns(leaseWide)) return 1;
+    const auto rpUser = DescriptorBuilder("user")
+                            .add("userId", PrimType::UInt64, 1, true)
+                            .add("provider", PrimType::UInt16)
+                            .addFixedStr("subject", 64)
+                            .add("createdAt", PrimType::Int64)
+                            .build();
+    const auto rpCharacter = DescriptorBuilder("character")
+                                 .add("characterId", PrimType::UInt64, 1, true)
+                                 .add("userId", PrimType::UInt64)
+                                 .addFixedStr("name", 16)
+                                 .add("gender", PrimType::UInt16)
+                                 .add("hairSkin", PrimType::UInt16)
+                                 .add("hairSheet", PrimType::UInt16)
+                                 .add("headSkin", PrimType::UInt16)
+                                 .add("createdAt", PrimType::Int64)
+                                 .add("lastPlayed", PrimType::Int64)
+                                 .build();
     const std::string dir = argv[1];
     return write(dir + "/position.gen.h", position) && write(dir + "/tick_sample.gen.h", tick) &&
                    write(dir + "/long_key.gen.h", longKey) &&
@@ -115,6 +136,8 @@ int main(int argc, char** argv) {
                    write(dir + "/lease_claim.gen.h", leaseClaim, true) &&
                    write(dir + "/lease_wide.gen.h", leaseWide, true) &&
                    write(dir + "/lease_evo.gen.h", leaseEvo, true) &&
+                   write(dir + "/rp_user.gen.h", rpUser) &&
+                   write(dir + "/rp_character.gen.h", rpCharacter) &&
                    write(dir + "/player_event.gen.h", rune::examples::playerEventDescriptor())
                ? 0
                : 1;

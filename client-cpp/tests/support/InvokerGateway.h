@@ -678,6 +678,7 @@ struct InvokerGateway {
     }
     // T15b fix round 1 (shard lifecycle / gates):
     std::set<int> silentEndpoints;   // ConnectRequests arriving on these endpoints are never answered
+    std::set<int> noPongEndpoints;   // Pings arriving on these endpoints are never answered (replyPongs elsewhere)
     int16_t       connectErrorCode = 0;  // != 0: every ConnectRequest -> ConnectResponse{code}
     int           connectErrorFirstN = 0;       // the first N ConnectRequests -> ConnectResponse{connectErrorFirstCode}, then normal
     int16_t       connectErrorFirstCode = 0;
@@ -2251,7 +2252,7 @@ private:
                                                                "ping refused", pv->sessionId,
                                                                pv->correlationId);
                 send(0, out.data(), n);
-            } else if (replyPongs) {
+            } else if (replyPongs && noPongEndpoints.count(endpoint) == 0) {
                 std::vector<uint8_t> out(64 + pv->echo.size());
                 const std::size_t n =
                     rcc::encodePong(out.data(), out.size(), pv->echo, pv->sessionId, pv->correlationId);

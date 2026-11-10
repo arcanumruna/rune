@@ -51,6 +51,7 @@
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/GroupCoordinationService.h>
 #include <rune/node/TransactionCoordinationService.h>
+#include <rune/node/TxnVoteWiring.h>
 #include <rune/node/MetadataService.h>
 #include <rune/node/WorkerPool.h>
 #include <rune/node/Worker.h>
@@ -1553,6 +1554,10 @@ public:
     void setHaltHandler(HaltHandler h, void* ctx) noexcept { haltHandler_ = h; haltCtx_ = ctx; }
     /// Test-only: drive the runtime's storage-failure path directly.
     void raiseStorageFailureForTest(const std::string& logDir, int err) { onStorageFailure_(logDir, err); }
+    /// Test-only: drive the runtime's invariant-halt path directly.
+    void raiseInvariantViolationForTest(const std::string& what) { onInvariantViolation_(what); }
+    /// Test-only: the boot id this process's replicas vouch with (empty after a storage failure in this boot).
+    [[nodiscard]] std::string bootIdForTest() const { return replicaRegistry_->bootId(); }
     /// Test-only: during start(), re-run one user log's recovery with this msync
     /// errno injected (exercises the refuse-to-start path).
     void setRecoveryFaultForTest(int err) noexcept { recoveryFaultForTest_ = err; }
@@ -1574,10 +1579,15 @@ public:
     // {leaderId, term, isLeader} snapshot on LeaderObserver's ring whenever it
     // changes.  isLeader()/leaderId()/leadershipTermId()/awaitLeader()/
     // publishRole()/leaderClientEndpoint() DRAIN that ring: they must be called
-    // from the ONE observer thread: the thread that called start() (enforced —
-    // any other thread is refused: critical log, abort in debug builds).  Node-internal (control-thread) code uses
+    // from the ONE observer thread: the thread that called start() (or the thread
+    // bound by bindLeaderObserverForTest); any other thread is refused: critical
+    // log + abort in all builds.  Node-internal (control-thread) code uses
     // LeaderObserver::computeOnControl() instead — never these.
     // -----------------------------------------------------------------------
+
+    /// Test-only: make the CALLING thread the observer (start() bound the thread that ran it).  Legal only while no thread observes:
+    /// a fixture that starts nodes on worker threads and joins them calls it before the first observe().
+    void bindLeaderObserverForTest() noexcept { leaderObserver_.bindObserver(); }
 
     bool   isLeader()  const noexcept;
     rune::consensus::NodeId leaderId() const noexcept;
@@ -1859,6 +1869,8 @@ public:
     void holdSecurityApplyAtBootForTest(bool on) noexcept { holdSecurityApplyAtBootForTest_ = on; }
     /// Test seam, before start(): the namespace reaper issues nothing until its budget is raised.
     void holdReaperAtBootForTest(bool on) noexcept { holdReaperAtBootForTest_ = on; }
+    /// Test seam, before start(): the transaction coordinator holds a vote while `fn` returns true for it (the control thread calls it).
+    void setTxnVoteHoldForTest(TransactionCoordinationService::VoteFnOverride fn) { txnVoteHoldForTest_ = std::move(fn); }
     /// Catalog history Task 22 (checklist 1): a REAL crash for the 3-node slice - stop() without the
     /// controlled-shutdown protocol (no halt, no consensus hand-off, no goodbye to the members): the
     /// threads are joined and the transport torn down, nothing is answered or flushed on purpose.
@@ -2212,6 +2224,10 @@ public:
 
     /// Test-only: the node-level embedded driver (spec §3.6 one-pumper counters).
     EmbeddedDriver* driverForTest() const noexcept { return nodeDriver_.get(); }
+    /// Test-only: the media-driver timeout (ms) of the runtime client (worker < 0) or of a worker's client.
+    [[nodiscard]] long clientDriverTimeoutMsForTest(int32_t worker) const {
+        return (worker < 0 ? aeron_ : shardClients_[static_cast<std::size_t>(worker)])->context().mediaDriverTimeout();
+    }
 
     /// Test-only: does the runtime have a thread of its own?  `thread` placement:
     /// true while running; `fused` placement (spec §3.2): always false — the
@@ -2357,6 +2373,7 @@ public:
         for (const auto& d : shardDrivers_) n += d ? 1u : 0u;
         return n;
     }
+    [[nodiscard]] std::size_t shardClientCountForTest() const noexcept { return shardClients_.size(); }
     /// Test-only (R-M1): TopicDropped ops the control thread delivered to worker rings (one per worker per
     /// drop) / still pending.  Control-thread state: read inside onControlThreadForTest.
     [[nodiscard]] uint64_t topicDroppedEnqueuedForTest() const noexcept { return topicDroppedFanout_.enqueuedForTest(); }
@@ -2384,7 +2401,7 @@ public:
     }
 
     /// Test-only fault injection: called (on the start() thread) at named startup
-    /// phases ("build-gateway" = offset/txn/metadata rebuilds + admin build).
+    /// phases ("offset-recover", "txn-recover", "metadata-recover" = the system logs' recovery, which yields the fused startup gate).
     /// Set before start().
     void setStartupPhaseHookForTest(std::function<void(std::string_view)> hook) {
         startupPhaseHookForTest_ = std::move(hook);
@@ -2398,10 +2415,11 @@ public:
         shardResolveStallForTest_       = stall;
     }
 
-    /// Test-only fault: after shard `worker`'s driver is built, block the start thread for `stall` (a slow driver start).
-    void setShardDriverBuildStallForTest(int32_t worker, std::chrono::milliseconds stall) noexcept {
+    /// Test-only fault: after shard `worker`'s driver is built, the start thread runs `stall` (a slow driver start),
+    /// holding no startup gate.
+    void setShardDriverBuildStallForTest(int32_t worker, std::function<void()> stall) {
         shardDriverBuildStallWorkerForTest_ = worker;
-        shardDriverBuildStallForTest_       = stall;
+        shardDriverBuildStallForTest_       = std::move(stall);
     }
 
     /// Test-only (DR-15 fix round 1): the peer-hostname resolve function of this
@@ -2754,6 +2772,7 @@ private:
     std::unique_ptr<rune::replication::PartitionReplica>            txnReplica_;
     std::unique_ptr<rune::transaction::ReplicatedTxnStateStore>     txnState_;
     std::unique_ptr<TransactionCoordinationService>                 txnCoordService_;
+    VoteCandidateTopics                                             voteCandidateTopics_;   // control-thread-owned; the coordinator's vote predicate reads it
 
     // -----------------------------------------------------------------------
     // Cluster metadata (MD1 wiring — created in buildGateway()).
@@ -2846,6 +2865,7 @@ private:
     bool                                                  holdCatalogApplyAtBootForTest_ = false;
     bool holdSecurityApplyAtBootForTest_ = false;   // issue #15 test seam (startup thread, before start)
     bool holdReaperAtBootForTest_ = false;          // test seam (startup thread, before start)
+    TransactionCoordinationService::VoteFnOverride txnVoteHoldForTest_;   // test seam (before start)
     std::vector<int32_t>                                  topicsAtReplicationBuild_;   // serving topic ids when replication was built
     std::thread::id                                       controlThreadId_;   // start() (controller); see controlThreadIdForTest
     // Control thread: the last consensus-driven catalog role posted (single node).
@@ -2967,7 +2987,7 @@ private:
     std::unique_ptr<rune::consensus::BackoffIdleStrategy> viewSnapshotIoIdleStrategy_;
     rune::consensus::MonotonicNanoClock                   viewSnapshotIoClock_;
     std::unique_ptr<rune::consensus::AgentRunner>         viewSnapshotIoRunner_;
-    struct ViewFanoutPending { ViewPlanUpdateMsg msg; int32_t nextWorker = 0; };
+    struct ViewFanoutPending { ViewPlanUpdateMsg msg; int32_t nextWorker = 0; int64_t catalogMark = -1; };   // catalogMark >= 0: a kCatalogMarkMsgType frame, msg unused
     std::vector<ViewFanoutPending>                        viewFanoutBacklog_;  // control-thread-owned
 
     // Catalog history Task 8 (control-thread-owned): the drop sequence's states
@@ -3024,6 +3044,7 @@ private:
     std::size_t                                           nsDirMismatchesAtBoot_ = 0;   // '*.deleting' dirs of a live namespace (fatal)
     CleanerViewChannel*                                   cleanerViewChannel_ = nullptr;   // owned by runtimeAgent_
     void fanoutViewPlan_(ViewPlanUpdateMsg msg);   // control thread
+    void fanoutCatalogMark_(int64_t appliedThrough);   // control thread: behind every queued plan frame
     int  pumpViewFanout_();                        // control thread (every cycle)
     // Restart recovery (catalog history Task 9): every live view is reinstalled
     // by the __catalog boot replay (AdminWorker::bootCatalog, the boot sink's
@@ -3103,7 +3124,7 @@ private:
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};
     int32_t                                      shardDriverBuildStallWorkerForTest_ = -1;
-    std::chrono::milliseconds                    shardDriverBuildStallForTest_{0};
+    std::function<void()>                        shardDriverBuildStallForTest_;
     void buildShardRuntimes_();
     void attachShardRuntimes_();
     void teardownShardRuntimes_() noexcept;
@@ -3171,6 +3192,7 @@ private:
     std::unique_ptr<EmbeddedDriver> nodeDriver_;   // node-level driver (runtime / legacy workers)
     // Fused placement only: services the runtime's invoker driver + client from
     // aeron_ connect until worker 0 takes them over (joined at the hand-off).
+    rune::aeronutil::StartupClientGate             startupGate_;   // starter thread vs the pump: one thread in aeron_ at a time
     std::unique_ptr<DriverPumpAgent>               startupPumpAgent_;
     std::unique_ptr<rune::consensus::IdleStrategy> startupPumpIdle_;
     std::unique_ptr<rune::consensus::AgentRunner>  startupPumpRunner_;

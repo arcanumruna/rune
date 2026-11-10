@@ -21,6 +21,7 @@ constexpr ErrorCode OK  = ErrorCode::OK;
 constexpr ErrorCode IR  = ErrorCode::InvalidRequest;
 constexpr ErrorCode NL  = ErrorCode::NotLeader;
 constexpr ErrorCode NA  = ErrorCode::NotAuthorized;
+constexpr ErrorCode TL  = ErrorCode::TxnTooLarge;
 constexpr ErrorCode EXH = ErrorCode::AutoIncrementExhausted;
 using H = HookRefusal;
 
@@ -61,6 +62,8 @@ struct Row { const char* why; Shape shape; WriteFacts f; TopicHookFacts t; Error
 
 constexpr WriteFacts kIdemView = F(3, true, false, false, false, true);
 constexpr WriteFacts withImport(WriteFacts f) { f.importGranted = true; return f; }
+constexpr WriteFacts withTxn(WriteFacts f, int64_t records, bool judged) { f.txnRecords = records; f.txnJudged = judged; return f; }
+constexpr WriteFacts withKnob(WriteFacts f, int32_t knob) { f.txnJudgedRecordsMax = knob; return f; }
 
 const std::vector<Row>& rows() {
     static const std::vector<Row> r = {
@@ -76,9 +79,9 @@ const std::vector<Row>& rows() {
         {"10 insert explicit, acks 1 (11.2 row 2)", InsertExplicit, F(1, true, false, false, false, true), T(1,0,0,0), IR, H::ExplicitKeyNeedsIdempotentAndView},
         {"11 update, not idempotent", Update, F(3, false, false, false, false, true), T(1,0,0,0), IR, H::ExplicitKeyNeedsIdempotentAndView},
         {"12 removeExisting, acks 2 qualifies", RemoveExisting, F(2, true, false, false, false, true), T(1,0,0,0), OK, H::None},
-        {"13 update in a transaction (11.2 row 6)", Update, F(3, true, true, false, false, true), T(1,0,0,0), IR, H::IntentInTxnOrAtomicBatch},
-        {"14 plain in a transaction on a constrained source (11.2 row 5)", Plain, F(1, false, true, false, false, true), T(0,0,1,0), IR, H::TxnOnConstrainedSource},
-        {"15 plain atomic batch on a constrained source", Plain, F(1, false, false, true, false, true), T(0,0,1,0), IR, H::TxnOnConstrainedSource},
+        {"13 update in a transaction (11.2 row 6, lifted by P11-14)", Update, F(3, true, true, false, false, true), T(1,0,0,0), OK, H::None},
+        {"14 plain in a transaction on a constrained source (11.2 row 5, lifted by P11-14)", Plain, F(1, false, true, false, false, true), T(0,0,1,0), OK, H::None},
+        {"15 plain atomic batch on a constrained source", Plain, F(1, false, false, true, false, true), T(0,0,1,0), OK, H::None},
         {"16 plain transaction, key index only", Plain, F(1, false, true, false, false, true), T(1,0,0,0), OK, H::None},
         {"17 key-0 creates, acks 1 (11.2 row 3)", KeyZero, F(1, true, false, false, false, true), T(1,1,0,0), OK, H::None},
         {"18 key-0 creates, acks 0", KeyZero, F(0, true, false, false, false, true), T(1,1,0,0), IR, H::KeyZeroCreateNeedsIdempotentAll},
@@ -101,18 +104,18 @@ const std::vector<Row>& rows() {
         {"34 update, acks 1 (All without View)", Update, F(1, true, false, false, false, true), T(1,0,0,0), IR, H::ExplicitKeyNeedsIdempotentAndView},
         {"35 update, acks 0", Update, F(0, true, false, false, false, true), T(1,0,0,0), IR, H::ExplicitKeyNeedsIdempotentAndView},
         {"36 removeExisting, not idempotent, acks 2", RemoveExisting, F(2, false, false, false, false, true), T(1,0,0,0), IR, H::ExplicitKeyNeedsIdempotentAndView},
-        {"37 update in an atomic batch", Update, F(3, true, false, true, false, true), T(1,0,0,0), IR, H::IntentInTxnOrAtomicBatch},
+        {"37 update in an atomic batch", Update, F(3, true, false, true, false, true), T(1,0,0,0), OK, H::None},
         {"38 insert explicit in a transaction, no key index", InsertExplicit, F(3, true, true, false, false, true), T(0,0,0,0), IR, H::NoKeyIndex},
-        {"39 update, transactional on a constrained source: rule 6 first", Update, F(3, true, true, false, false, true), T(1,0,1,0), IR, H::IntentInTxnOrAtomicBatch},
+        {"39 update, transactional on a constrained source", Update, F(3, true, true, false, false, true), T(1,0,1,0), OK, H::None},
         {"40 plain, neither txn nor atomic, constrained source", Plain, F(1, false, false, false, false, true), T(0,0,1,0), OK, H::None},
-        {"41 plain transaction, constrained source, below the level", Plain, F(1, false, true, false, false, false), T(0,0,1,0), IR, H::TxnOnConstrainedSource},
+        {"41 plain transaction, constrained source, below the level", Plain, F(1, false, true, false, false, false), T(0,0,1,0), OK, H::None},
         {"42 key-0 creates, acks 2 (View without All)", KeyZero, F(2, true, false, false, false, true), T(1,1,0,0), IR, H::KeyZeroCreateNeedsIdempotentAll},
         {"43 key-0 creates, acks 3, idempotent, unconstrained", KeyZero, kIdemView, T(1,1,0,0), OK, H::None},
         {"44 key-0 creates with no key index", KeyZero, kIdemView, T(0,1,0,0), IR, H::NoKeyIndex},
         {"45 key-0 creates below the level", KeyZero, F(1, true, false, false, false, false), T(1,1,0,0), IR, H::LevelTooLow},
         {"46 key-0 mixed, not idempotent: mixed first", KeyZeroMixed, F(0, false, false, false, false, true), T(1,1,0,0), IR, H::MixedKeyZeroBatch},
-        {"47 key-0 creates in an atomic batch on a constrained source", KeyZero, kIdemView, T(1,1,1,0), OK, H::None},
-        {"48 key-0 creates in a transaction on a constrained source", KeyZero, F(3, true, true, false, false, true), T(1,1,1,0), IR, H::TxnOnConstrainedSource},
+        {"47 key-0 creates in an atomic batch on a constrained source, acks 3", KeyZero, F(3, true, false, true, false, true), T(1,1,1,0), OK, H::None},
+        {"48 key-0 creates in a transaction on a constrained source", KeyZero, F(3, true, true, false, false, true), T(1,1,1,0), OK, H::None},
         {"49 4096 records, acks 3, verdict source", ManyPlain, kIdemView, T(0,0,0,1), OK, H::None},
         {"50 4097 records, acks 2, verdict source", ManyPlainOver, F(2, false, false, false, false, true), T(0,0,0,1), IR, H::ViewBatchTooLarge},
         {"51 4097 records, acks 1, verdict source", ManyPlainOver, F(1, true, false, false, false, true), T(0,0,0,1), OK, H::None},
@@ -125,7 +128,7 @@ const std::vector<Row>& rows() {
         {"58 verdict source flag alone does not refuse", Plain, F(1, false, false, false, false, true), T(0,0,0,1), OK, H::None},
         {"59 plain transaction on a verdict source", Plain, F(3, true, true, false, false, true), T(0,0,0,1), OK, H::None},
         {"60 plain acks 3 atomic, unconstrained", Plain, F(3, true, false, true, false, true), T(0,0,0,0), OK, H::None},
-        {"61 removeExisting in an atomic batch", RemoveExisting, F(3, true, false, true, false, true), T(1,0,0,0), IR, H::IntentInTxnOrAtomicBatch},
+        {"61 removeExisting in an atomic batch", RemoveExisting, F(3, true, false, true, false, true), T(1,0,0,0), OK, H::None},
         {"62 insert explicit, acks 3, idempotent, all topic facts", InsertExplicit, kIdemView, T(1,1,1,1), OK, H::None},
         {"63 reserved bits under legacy and no level", Reserved, F(3, true, true, true, true, false), T(1,1,1,1), IR, H::ReservedBits},
         {"64 plain acks 1 below the level", Plain, F(1, true, false, false, false, false), T(0,0,0,0), OK, H::None},
@@ -150,6 +153,26 @@ const std::vector<Row>& rows() {
         {"81 update on an autoincrement topic", Update, F(3, true, false, false, false, true), T(1,1,0,0), OK, H::None},
         {"82 key-0 creates in legacy mode", KeyZero, F(1, true, false, false, true, true), T(1,1,0,0), IR, H::LegacyMode},
         {"83 key-0 creates, counter not ready, exhausted never evaluated", KeyZeroWindowFull, F(1, true, false, false, false, true), T(1,1,0,0,-1,0), NL, H::AutoIncActivating},
+        // Part 11 (P11-14): rule 10 and the transactional exceptions of rules 5 and 8
+        {"84 atomic batch of 4097 records, acks 1, verdict source (rule 10)", ManyPlainOver, F(1, true, false, true, false, true), T(0,0,0,1), IR, H::AtomicBatchTooLarge},
+        {"85 atomic batch of 4096 records, acks 1, verdict source", ManyPlain, F(1, true, false, true, false, true), T(0,0,0,1), OK, H::None},
+        {"86 atomic batch of 4097 records, not a verdict source", ManyPlainOver, F(1, true, false, true, false, true), T(0,0,0,0), OK, H::None},
+        {"87 atomic batch of 4097 records, acks 3: the View bound first", ManyPlainOver, F(3, true, false, true, false, true), T(0,0,0,1), IR, H::ViewBatchTooLarge},
+        {"88 transaction of 4097 records, verdict source: only atomic batches are held whole", ManyPlainOver, F(1, true, true, false, false, true), T(0,0,0,1), OK, H::None},
+        {"89 atomic batch of 4097 records under a raised knob", ManyPlainOver, withKnob(F(1, true, false, true, false, true), 8192), T(0,0,0,1), OK, H::None},
+        {"90 atomic batch of 4096 records under a knob of 4095", ManyPlain, withKnob(F(1, true, false, true, false, true), 4095), T(0,0,0,1), IR, H::AtomicBatchTooLarge},
+        {"91 update in a transaction, acks 1: the vote is the verdict", Update, F(1, true, true, false, false, true), T(1,0,0,0), OK, H::None},
+        {"92 update in a transaction, not idempotent", Update, F(1, false, true, false, false, true), T(1,0,0,0), IR, H::ExplicitKeyNeedsIdempotentAndView},
+        {"93 update in an atomic batch, acks 1: an atomic batch still needs View", Update, F(1, true, false, true, false, true), T(1,0,0,0), IR, H::ExplicitKeyNeedsIdempotentAndView},
+        {"94 key-0 creates in a transaction on a constrained source, acks 1", KeyZero, F(1, true, true, false, false, true), T(1,1,1,0), OK, H::None},
+        {"95 key-0 creates in an atomic batch on a constrained source, acks 1", KeyZero, F(1, true, false, true, false, true), T(1,1,1,0), IR, H::KeyZeroCreateNeedsView},
+        // Part 11 (P11-7): a judged transaction past the knob
+        {"96 plain record taking a judged transaction past the knob", Plain, withTxn(F(1, true, true, false, false, true), 4096, true), T(0,0,0,1), TL, H::TxnTooLarge},
+        {"97 plain record landing a judged transaction on the knob", Plain, withTxn(F(1, true, true, false, false, true), 4095, true), T(0,0,0,1), OK, H::None},
+        {"98 plain record past the knob, transaction not judged whole", Plain, withTxn(F(1, true, true, false, false, true), 4096, false), T(0,0,0,1), OK, H::None},
+        {"99 intent record past the knob: its own intent judges the transaction whole", InsertExplicit, withTxn(F(1, true, true, false, false, true), 4096, false), T(1,0,0,1), TL, H::TxnTooLarge},
+        {"100 intent record past the knob, not a verdict source", InsertExplicit, withTxn(F(1, true, true, false, false, true), 4096, false), T(1,0,0,0), OK, H::None},
+        {"101 judged transaction past the knob, not transactional", Plain, withTxn(F(1, true, false, false, false, true), 4096, true), T(0,0,0,1), OK, H::None},
     };
     return r;
 }
@@ -163,13 +186,15 @@ static_assert(isRow(ManyPlainOver, kIdemView, T(0,0,0,1), IR, H::ViewBatchTooLar
 static_assert(isRow(Reserved, F(0, false, false, false, true, false), T(0,0,0,0), IR, H::ReservedBits));
 static_assert(isRow(KeyZero, F(1, true, false, false, false, true), T(1,1,0,0), OK, H::None));
 static_assert(isRow(KeyZero, F(1, true, false, false, false, true), T(1,1,1,0), IR, H::KeyZeroCreateNeedsView));
+static_assert(isRow(KeyZero, F(1, true, true, false, false, true), T(1,1,1,0), OK, H::None));
+static_assert(isRow(ManyPlainOver, F(1, true, false, true, false, true), T(0,0,0,1), IR, H::AtomicBatchTooLarge));
 static_assert(isRow(InsertExplicit, kIdemView, T(1,0,0,0,0), NL, H::KeyIndexActivating));
 static_assert(isRow(InsertExplicit, kIdemView, T(1,0,0,0,1), OK, H::None));
 
 }  // namespace
 
 TEST(CheckedWritesRequirementTable, PinnedRows) {
-    ASSERT_EQ(rows().size(), 83u);
+    ASSERT_EQ(rows().size(), 101u);
     for (const Row& r : rows()) {
         const auto v = evaluateRequirements(intentsOf(r.shape), r.f, r.t);
         EXPECT_EQ(v.code, r.code) << r.why;
@@ -182,22 +207,24 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
     const auto feeds = [](int fact, H h) {
         switch (fact) {
         case 0: return h == H::LegacyMode || h == H::LevelTooLow || h == H::ExplicitKeyNeedsIdempotentAndView ||
-                       h == H::KeyZeroCreateNeedsIdempotentAll || h == H::KeyZeroCreateNeedsView || h == H::ViewBatchTooLarge;   // acks
+                       h == H::KeyZeroCreateNeedsIdempotentAll || h == H::KeyZeroCreateNeedsView || h == H::ViewBatchTooLarge;   // acks All
         case 1: return h == H::ExplicitKeyNeedsIdempotentAndView || h == H::KeyZeroCreateNeedsIdempotentAll;                      // idempotent
-        case 2: return h == H::IntentInTxnOrAtomicBatch || h == H::TxnOnConstrainedSource;                                         // transactional
-        case 3: return h == H::IntentInTxnOrAtomicBatch || h == H::TxnOnConstrainedSource;                                         // atomic
+        case 2: return h == H::ExplicitKeyNeedsIdempotentAndView || h == H::KeyZeroCreateNeedsView || h == H::TxnTooLarge;                               // transactional
+        case 3: return h == H::AtomicBatchTooLarge;                                                                                // atomic
         case 4: return h == H::ImportNotGranted;                                                                                   // import
         case 5: return h == H::LegacyMode;                                                                                         // legacy
         case 6: return h == H::LevelTooLow;                                                                                        // level
         case 7: return h == H::NoKeyIndex || h == H::KeyIndexActivating;                                                           // keyIndex
         case 8: return h == H::UpsertOnAutoIncrement || h == H::ImportNotGranted || h == H::ImportOutOfRange || h == H::AutoIncExhausted ||
                        h == H::AutoIncWindowFull || h == H::AutoIncActivating;                                                     // autoIncrement
-        case 9: return h == H::TxnOnConstrainedSource || h == H::KeyZeroCreateNeedsView;                                           // constrained
-        case 10: return h == H::ViewBatchTooLarge;                                                                                 // verdict source
+        case 9: return h == H::KeyZeroCreateNeedsView;                                                                             // constrained
+        case 10: return h == H::ViewBatchTooLarge || h == H::AtomicBatchTooLarge || h == H::TxnTooLarge;                                                 // verdict source
         case 11: return h == H::KeyIndexActivating;                                                                                // keyIndexActive
         case 12: return h == H::AutoIncActivating;                                                                                 // autoIncReady
         case 13: return h == H::AutoIncExhausted;                                                                                  // exhausted
-        default: return h == H::AutoIncWindowFull;                                                                                 // window full
+        case 14: return h == H::AutoIncWindowFull;                                                                                 // window full
+        default: return h == H::LegacyMode || h == H::LevelTooLow || h == H::ExplicitKeyNeedsIdempotentAndView ||
+                        h == H::KeyZeroCreateNeedsView || h == H::ViewBatchTooLarge;                                               // acks View
         }
     };
     const auto build = [](uint32_t m, BatchIntents& b, WriteFacts& f, TopicHookFacts& t) {
@@ -208,7 +235,7 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         t = {};
         t.keyIndex = m & 256; t.autoIncrement = m & 512; t.constrainedSource = m & 1024; t.verdictSource = m & 2048; t.keyIndexActive = m & 4096; t.autoIncReady = m & 8192;
     };
-    // Matrix B: every intent shape x reserved bits on / off x records {1, 4096, 4097} x the 15 facts (import and the three autoincrement ones included).
+    // Matrix B: every intent shape x reserved bits on / off x records {1, 4096, 4097} x the 16 facts (the View bit, import and the three autoincrement ones included).
     const Shape shapes[] = {Plain, InsertExplicit, Update, RemoveExisting, KeyZero, KeyZeroMixed, PlainUpsert};
     const auto flip = [](uint32_t m, int fact) {
         switch (fact) {
@@ -226,10 +253,12 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         case 11: return m ^ 4096u;
         case 12: return m ^ 8192u;
         case 13: return m ^ 16384u;
-        default: return m ^ 32768u;
+        case 14: return m ^ 32768u;
+        default: return m ^ 2u;
         }
     };
     int cells = 0;
+    std::vector<RequirementVerdict> out(65536);   // every verdict of a block, so a flipped fact's verdict is a lookup
     for (Shape s : shapes)
     for (const bool reserved : {false, true})
     for (const int32_t records : {1, 4096, 4097}) {
@@ -239,22 +268,25 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         for (uint32_t m = 0; m < 65536; ++m) {
             BatchIntents bm = b; WriteFacts f; TopicHookFacts t;
             build(m, bm, f, t);
-            const auto v = evaluateRequirements(bm, f, t);
+            out[m] = evaluateRequirements(bm, f, t);
+        }
+        for (uint32_t m = 0; m < 65536; ++m) {
+            BatchIntents bm = b; WriteFacts f; TopicHookFacts t;
+            build(m, bm, f, t);
+            const RequirementVerdict v = out[m];
             ++cells;
             const bool view = f.acks & 2;
-            if (!b.anyIntent && !(b.plainUpsert && t.autoIncrement) && !b.reservedBits && !view && !((f.transactional || f.atomicBatch) && t.constrainedSource)) {
+            if (!b.anyIntent && !(b.plainUpsert && t.autoIncrement) && !b.reservedBits && !view && !(f.atomicBatch && t.verdictSource && records > f.txnJudgedRecordsMax)) {
                 ASSERT_EQ(v.code, OK) << "(i) shape " << s << " records " << records << " m " << m;
             }
             if (b.reservedBits) ASSERT_EQ(v.why, H::ReservedBits) << "(ii)";
             if (!b.reservedBits && f.legacyMode && (b.anyIntent || view)) ASSERT_EQ(v.why, H::LegacyMode) << "(iii)";
             if (v.code != OK) {
                 const bool retriable = v.why == H::KeyIndexActivating || v.why == H::AutoIncActivating || v.why == H::AutoIncWindowFull;
-                ASSERT_EQ(v.code, retriable ? NL : v.why == H::ImportNotGranted ? NA : v.why == H::AutoIncExhausted ? EXH : IR) << "(iv)";
+                ASSERT_EQ(v.code, retriable ? NL : v.why == H::ImportNotGranted ? NA : v.why == H::AutoIncExhausted ? EXH : v.why == H::TxnTooLarge ? TL : IR) << "(iv)";
             }
-            for (int fact = 0; fact < 15; ++fact) {
-                BatchIntents b2 = b; WriteFacts f2; TopicHookFacts t2;
-                build(flip(m, fact), b2, f2, t2);
-                const auto w = evaluateRequirements(b2, f2, t2);
+            for (int fact = 0; fact < 16; ++fact) {
+                const RequirementVerdict w = out[flip(m, fact)];
                 if (w.why != v.why) ASSERT_TRUE(feeds(fact, v.why) || feeds(fact, w.why)) << "(v) fact " << fact << " shape " << s << " reserved " << reserved << " records " << records << " m " << m;
             }
         }

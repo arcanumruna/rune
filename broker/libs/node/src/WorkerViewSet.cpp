@@ -82,15 +82,12 @@ RecoveredCheckpoint readCheckpointFile(const std::string& dir, int32_t viewTopic
 
 const char* checkpointFormat(const ViewInstance& inst) noexcept { return inst.keyed ? "v3" : inst.agg ? "v2" : "v1"; }
 
-// The owner map of a keyed projection: wire key -> the view key of its current row (a row of keyWidth bytes).
-void buildKeyedTables(ViewInstance& inst, std::size_t indexSlots, std::size_t chunkBytes) {
-    if (inst.keyed->ownerMapped) {
-        rune::view::RowLayout ownerRow;
-        ownerRow.rowLen = inst.keyed->keyWidth;
-        inst.owners.emplace(std::move(ownerRow), indexSlots, chunkBytes,
-                            rune::view::ViewTableKeys{inst.keyed->wireKeyWidth, 0, inst.tableKeys.hashSeed, inst.tableKeys.hashMaskForTest});
-    }
-    inst.prospect.reserve(inst.layout, inst.agg ? &inst.agg->layout : nullptr);
+// The row lengths of UniqueClaims' two tables (UniqueClaims.h): index [owner W][extraCount u32][head W][flags u8] and
+// extras [N K][prev W][next W][links u8][image].
+struct ClaimsRowLens { uint32_t index, extras; };
+ClaimsRowLens claimsRowLensOf(const ViewInstance& inst) noexcept {
+    const uint32_t K = inst.keyed->keyWidth, W = inst.keyed->wireKeyWidth;
+    return {2 * W + 5, K + 2 * W + 1 + inst.layout.rowLen};
 }
 
 // Replays checkpoint records into one instance: v1 into the output table for a
@@ -106,9 +103,9 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
                        std::span<const std::span<const uint8_t>> deltas,
                        std::size_t& appliedOut) {
     appliedOut = 0;
-    rune::view::ViewTable* tables[6] = {};
-    uint32_t lens[6];
-    uint8_t keyLens[6];
+    rune::view::ViewTable* tables[8] = {};
+    uint32_t lens[8] = {};
+    uint8_t keyLens[8] = {};
     std::size_t nTables = 0;
     if (inst.keyed && inst.agg) {
         using namespace rune::view;
@@ -136,6 +133,16 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
             lens[rune::view::kKeyedTableOwners]    = inst.keyed->keyWidth;
             keyLens[rune::view::kKeyedTableOwners] = inst.keyed->wireKeyWidth;
             nTables = 2;
+        }
+        if (inst.claims) {
+            tables[rune::view::kKeyedTableUniqueIndex]  = &inst.claims->indexTable();
+            tables[rune::view::kKeyedTableUniqueExtras] = &inst.claims->extrasTable();
+            const ClaimsRowLens c = claimsRowLensOf(inst);
+            lens[rune::view::kKeyedTableUniqueIndex]  = c.index;
+            lens[rune::view::kKeyedTableUniqueExtras] = c.extras;
+            keyLens[rune::view::kKeyedTableUniqueIndex]  = static_cast<uint8_t>(inst.keyed->keyWidth);
+            keyLens[rune::view::kKeyedTableUniqueExtras] = inst.keyed->wireKeyWidth;
+            nTables = 8;
         }
     } else if (inst.agg) {
         tables[rune::view::kAggTableView]         = &inst.table;
@@ -193,6 +200,10 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
         ++appliedOut;
     }
     gidsDone();
+    if (inst.claims) {
+        inst.claims->recountAfterReplay();
+        inst.counters.uniqueConflicts = inst.claims->extras();
+    }
     return last;
 }
 
@@ -228,10 +239,15 @@ int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
                     b.viewRows * (wide + inst.layout.rowLen) + b.blockRows * (aux + a.blockRow.rowLen) + b.groupIdRows * (wide + 8);
     } else if (inst.keyed) {
         const KeyedFoldSpec& k = *inst.keyed;
-        fixed += kCheckpointV3HeaderBytes + (k.ownerMapped ? 2 : 1) * kCheckpointV3TableHeaderBytes;
+        fixed += kCheckpointV3HeaderBytes + (inst.claims ? 4 : k.ownerMapped ? 2 : 1) * kCheckpointV3TableHeaderBytes;
         // A move: the old row's delete, the new row's upsert and, with an owner map, the owner's upsert.
         perRecord = checkpointV3EntryHeaderBytes(static_cast<uint8_t>(k.keyWidth)) * 2 + inst.layout.rowLen;
         if (k.ownerMapped) perRecord += checkpointV3EntryHeaderBytes(k.wireKeyWidth) + k.keyWidth;
+        // Claims: a move touches two index entries and up to kMaxExtrasRowsPerRecord extras.
+        if (inst.claims) {
+            const ClaimsRowLens c = claimsRowLensOf(inst);
+            perRecord += 2 * (checkpointV3EntryHeaderBytes(static_cast<uint8_t>(k.keyWidth)) + c.index) + kMaxExtrasRowsPerRecord * (checkpointV3EntryHeaderBytes(k.wireKeyWidth) + c.extras);
+        }
     } else if (inst.agg) {
         const AggLayout& a = inst.agg->layout;
         const std::size_t nTables = a.numBlockCols > 0 ? 4 : 3;
@@ -252,7 +268,9 @@ int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
 } // namespace
 
 WorkerViewSet::WorkerViewSet(ViewSnapshotChannel& channel, std::string viewDataDir, uint64_t hashSeed)
-    : channel_(channel), viewDataDir_(std::move(viewDataDir)), hashSeed_(hashSeed) {}
+    : channel_(channel), viewDataDir_(std::move(viewDataDir)), hashSeed_(hashSeed) {
+    txnOverlays_.supersedeKeys.seed(hashSeed);
+}
 
 void WorkerViewSet::installView(rune::view::CompiledViewPlan plan,
                                 rune::view::RowLayout layout,
@@ -270,10 +288,9 @@ void WorkerViewSet::installView(rune::view::CompiledViewPlan plan,
     }
 
     // Bug A: insert_or_assign would otherwise RESET a previously-latched
-    // underRecovery back to its default (false) on a re-install (e.g.
-    // installViewForRecovery re-registering the same template for a second
-    // partition) unless the caller re-asserts it — every recovery call site
-    // below does.
+    // underRecovery back to its default (false) on a re-install unless the
+    // caller re-asserts it.  installViewForRecovery no longer re-installs an
+    // existing template.
     templates_.insert_or_assign(
         viewTopicId,
         ViewTemplate{std::move(plan), std::move(layout), std::move(evolvingSrc), persisted,
@@ -326,10 +343,18 @@ int WorkerViewSet::drainInstalls() {
     return channel_.install.drain(
         [this](int32_t tid, aeron::concurrent::AtomicBuffer& b,
                aeron::util::index_t off, aeron::util::index_t len) {
-            if (tid != ViewSnapshotChannel::kInstallMsgType) return;
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            if (tid == ViewSnapshotChannel::kCatalogMarkMsgType) {
+                int64_t appliedThrough;
+                std::memcpy(&appliedThrough, p, sizeof appliedThrough);
+                catalogThrough_ = std::max(catalogThrough_, appliedThrough);
+                if (installsSinceMark_) { installsSinceMark_ = false; ++verdictEpoch_; }   // the sync reruns even when the position did not move
+                return;
+            }
+            if (tid != ViewSnapshotChannel::kInstallMsgType) return;
             const ViewPlanUpdateMsg m = decodeViewPlanUpdate(p, static_cast<std::size_t>(len));
             if (m.uninstall) {   // catalog history Task 8: DropView / AlterView retired it
+                if (isVerdictTemplate_(m.viewTopicId)) installsSinceMark_ = true;
                 (void)uninstallView(m.viewTopicId);
                 return;
             }
@@ -340,10 +365,12 @@ int WorkerViewSet::drainInstalls() {
             if (!plan) {
                 spdlog::error("WorkerViewSet: install for viewTopicId={} dropped — "
                               "compiled plan failed to deserialize", m.viewTopicId);
+                noteRefused_(0, rune::view::verdictPlanFingerprint(m.planBlob));
                 return;
             }
             if (plan->unicodeVersion != 0 && !rune::codec::unicodeVersionSupported(plan->unicodeVersion)) {
                 ++installRefusals_;
+                noteRefused_(plan->viewObjectId, rune::view::verdictPlanFingerprint(m.planBlob));
                 const auto part = [](uint32_t v, int shift) { return (v >> shift) & 0xFFu; };
                 spdlog::critical("VIEW-UNICODE-UNSUPPORTED view={} unicode={}.{}.{} — this broker has {}.{}.{}; the view is not installed",
                                  m.viewTopicId, part(plan->unicodeVersion, 16), part(plan->unicodeVersion, 8), part(plan->unicodeVersion, 0),
@@ -360,6 +387,7 @@ int WorkerViewSet::drainInstalls() {
             } catch (const std::exception& ex) {
                 spdlog::error("WorkerViewSet: install for viewTopicId={} dropped — "
                               "descriptor deserialize failed: {}", m.viewTopicId, ex.what());
+                noteRefused_(plan->viewObjectId, rune::view::verdictPlanFingerprint(m.planBlob));
                 return;
             }
             rune::view::RowLayout layout;
@@ -368,11 +396,26 @@ int WorkerViewSet::drainInstalls() {
             } catch (const std::exception& ex) {
                 spdlog::error("WorkerViewSet: install for viewTopicId={} dropped — "
                               "buildRowLayout failed: {}", m.viewTopicId, ex.what());
+                noteRefused_(plan->viewObjectId, rune::view::verdictPlanFingerprint(m.planBlob));
                 return;
             }
             const int32_t viewTopicId = plan->viewTopicId;
+            const std::optional<rune::view::VerdictViewKind> kind = rune::view::verdictKindOf(*plan);
+            const uint64_t objectId = plan->viewObjectId;
             installView(std::move(*plan), std::move(layout), std::move(srcDesc),
                         /*persisted=*/m.persistence == 0, /*underRecovery=*/m.recovery);
+            if (kind) {   // a unique or check view: its source's judge drives it
+                installsSinceMark_ = true;
+                ViewTemplate& tpl = templates_.at(viewTopicId);
+                ++verdictEpoch_;
+                tpl.isVerdict = true;
+                tpl.verdictKind = *kind;
+                tpl.verdictObjectId = objectId;
+                tpl.verdictFingerprint = rune::view::verdictPlanFingerprint(m.planBlob);
+                tpl.planRecordPayload.resize(rune::storage::control_record::verdictPlanPayloadBytes(m.planBlob.size(), m.outDescBlob.size(), m.srcDescBlob.size()));
+                if (rune::storage::control_record::writeVerdictPlanPayload(tpl.planRecordPayload, {objectId, tpl.verdictFingerprint, static_cast<uint8_t>(*kind)}, m.planBlob, m.outDescBlob, m.srcDescBlob) == 0)
+                    tpl.planRecordPayload.clear();   // over the cap: AdminWorker refuses such a view (P9-9)
+            }
             // Task 19b: a RESTART-recovery install registers the template here
             // but defers the per-(view, partition) instance to
             // materializeRecoveryInstancesFor (checkpoint load + serve-guard),
@@ -393,8 +436,14 @@ int WorkerViewSet::drainSnapshotAcks(int limit) {
     }
     return channel_.done.drain(
         [this](int32_t type, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len) {
-            if (type != kDiscardDoneMsgType || len < kDiscardDoneMsgBytes) return;   // kDoneMsgType: durable-offset acks, not needed here
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            if (type == ViewSnapshotChannel::kDoneMsgType && len >= static_cast<aeron::util::index_t>(ViewSnapshotChannel::kDoneMsgBytes)) {
+                // A discard in flight: the ack is the old stream's (the agent acks in order, its discard last).
+                if (const auto it = views_.find(instKey(static_cast<int32_t>(readU32LE(p)), static_cast<int32_t>(readU32LE(p + 4)))); it != views_.end() && checkpointSettled(it->second))
+                    it->second.lastDurableO = std::max(it->second.lastDurableO, static_cast<int64_t>(readU32LE(p + 8) | (uint64_t{readU32LE(p + 12)} << 32)));
+                return;
+            }
+            if (type != kDiscardDoneMsgType || len < kDiscardDoneMsgBytes) return;
             onDiscardDone_(static_cast<int32_t>(readU32LE(p)), static_cast<int32_t>(readU32LE(p + 4)),
                            static_cast<int32_t>(readU32LE(p + 8)), static_cast<ViewDiscardReason>(p[12]));
         },
@@ -618,6 +667,7 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
             return nullptr;
         }
     }
+    if (passCapForTest_ > 0) inst.maxRecordsPerPass = passCapForTest_;
 
     // Bug A fix (whole-branch re-review): a view installed FOR RESTART
     // RECOVERY must never serve a lazily-created DEFAULT-READY instance, even
@@ -653,6 +703,7 @@ void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopi
     inst.foldCursor   = std::max<int64_t>(recoveredO, 0);
     if (recoveredO >= 0) inst.transientCursor = CursorRecoveredUnreconciled{};
     inst.lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
+    inst.lastDurableO = recoveredO;
     inst.readiness = (inst.foldCursor >= committedTail) ? ViewReadiness::Ready
                                                         : ViewReadiness::RebuildingViews;
     applyRecoveredCheckpoint_(inst, rc, scan, applied, SourceLogBounds{});   // bounds unknown here: the first driveView_ pass repeats the check
@@ -715,8 +766,9 @@ void WorkerViewSet::installViewForRecovery(
     const int32_t viewTopicId = plan.viewTopicId;
 
     // Register the plan template + reactor index exactly as the normal path
-    // does (moves plan/layout/evolvingSrc into templates_).  underRecovery is
-    // deliberately left FALSE on this call: this function constructs + loads
+    // does (moves plan/layout/evolvingSrc into templates_) when none exists yet.
+    // underRecovery is deliberately FALSE here (cleared on an existing
+    // template): this function constructs + loads
     // THIS (view, partition) instance explicitly below, from the CALLER-
     // supplied base/deltasInOrder (which may be synthetic test spans, not
     // necessarily this worker's on-disk file) — latching underRecovery=true
@@ -724,10 +776,14 @@ void WorkerViewSet::installViewForRecovery(
     // re-apply viewDataDir_'s on-disk file for this SAME instance via
     // loadRecoveryCheckpoint_.  The latch is set true right after (below),
     // so it is in place before this call returns.
-    installView(std::move(plan), std::move(layout), std::move(evolvingSrc), persisted);
+    // An existing template is kept as it is: re-registering it would wipe what drainInstalls learned of a unique or check
+    // view no judge has attached yet (a candidate still building at a restart), and the member would leave the set.
+    if (const auto tit = templates_.find(viewTopicId); tit != templates_.end())
+        tit->second.underRecovery = false;
+    else
+        installView(std::move(plan), std::move(layout), std::move(evolvingSrc), persisted);
 
-    // Eagerly build the (view, partition) instance from the just-installed
-    // template (recovery is partition-specific; it must not wait for a lazy
+    // Eagerly build the (view, partition) instance from the template (recovery is partition-specific; it must not wait for a lazy
     // first driveFolds).  underRecovery is still false at this point, so
     // getOrCreate_ default-constructs a plain Ready instance (no auto-load);
     // its readiness is set definitively by the explicit replay() below.
@@ -757,6 +813,7 @@ void WorkerViewSet::installViewForRecovery(
     inst->foldCursor   = std::max<int64_t>(recoveredO, 0);
     if (recoveredO >= 0) inst->transientCursor = CursorRecoveredUnreconciled{};
     inst->lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
+    inst->lastDurableO = recoveredO;
 
     // REBUILDING_VIEWS unless the source is already caught up (then Ready now:
     // e.g. a brand-new view over an empty source, committedTail == 0).  Local
@@ -941,7 +998,7 @@ int WorkerViewSet::buildAndPushKeyedCheckpoint_(ViewInstance& inst) {
     };
     // The record's tables in id order: the view, then the owner map (a projection) or contributors, groups, blocks and groupIds.
     struct Part { rune::view::ViewTable* table; uint8_t id; uint8_t keyLen; uint32_t rowLen; };
-    Part parts[5];
+    Part parts[7];
     std::size_t nParts = 0;
     const rune::view::KeyedFoldSpec& k = *inst.keyed;
     if (inst.agg) {
@@ -955,8 +1012,13 @@ int WorkerViewSet::buildAndPushKeyedCheckpoint_(ViewInstance& inst) {
     } else {
         parts[nParts++] = {&inst.table, rune::view::kKeyedTableView, static_cast<uint8_t>(k.keyWidth), inst.layout.rowLen};
         if (inst.owners) parts[nParts++] = {&*inst.owners, rune::view::kKeyedTableOwners, k.wireKeyWidth, k.keyWidth};
+        if (inst.claims) {   // in the same record as tables 0 and 1: a recovery never sees the rows without their claims
+            const ClaimsRowLens c = claimsRowLensOf(inst);
+            parts[nParts++] = {&inst.claims->indexTable(), rune::view::kKeyedTableUniqueIndex, static_cast<uint8_t>(k.keyWidth), c.index};
+            parts[nParts++] = {&inst.claims->extrasTable(), rune::view::kKeyedTableUniqueExtras, k.wireKeyWidth, c.extras};
+        }
     }
-    std::size_t b[6] = {};
+    std::size_t b[8] = {};
     for (std::size_t t = 0; t < nParts; ++t) {
         drainInto(*parts[t].table, parts[t].rowLen);
         b[t + 1] = keyedEntries_.size();
@@ -971,7 +1033,7 @@ int WorkerViewSet::buildAndPushKeyedCheckpoint_(ViewInstance& inst) {
             if (rowOffsets_[i] != SIZE_MAX) keyedEntries_[i].row = rowScratch_.data() + rowOffsets_[i];
         }
     }
-    rune::view::KeyedTableDelta tds[5];
+    rune::view::KeyedTableDelta tds[7];
     for (std::size_t t = 0; t < nParts; ++t) {
         tds[t] = {parts[t].id, parts[t].keyLen, parts[t].rowLen, std::span<const rune::view::KeyedDirtyEntry>(keyedEntries_.data() + b[t], b[t + 1] - b[t])};
     }
@@ -985,6 +1047,12 @@ int WorkerViewSet::buildAndPushKeyedCheckpoint_(ViewInstance& inst) {
 
 int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
     if (!checkpointSettled(inst)) return 0;   // belt and braces: driveView_ step 0a already returned
+    // P11-0: no checkpoint inside an open span (a refold from it would never see the span's records below it) or an application in
+    // progress.  The dirty rows wait for the first cursor outside every span.
+    if (inst.spanFence.fenced() || inst.spanFence.straddles(inst.foldCursor)) [[unlikely]] {
+        if (viewTablesDirty(inst)) ++inst.counters.vetoedCheckpointPushes;   // a push refused, not a pass with nothing to push
+        return 0;
+    }
     if (inst.keyed) return buildAndPushKeyedCheckpoint_(inst);
     dirtyEntries_.clear();
     rowOffsets_.clear();
@@ -1060,6 +1128,7 @@ int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
 bool WorkerViewSet::tryPushDelta_(ViewInstance& inst) {
     const std::size_t frameLen =
         ViewSnapshotChannel::kDeltaHeaderBytes + inst.pendingDelta.size();
+    if (inst.pendingSent != 0 || frameLen > static_cast<std::size_t>(channel_.deltas.maxMsgLength())) [[unlikely]] return tryPushDeltaParts_(inst);
 
     const auto claim =
         channel_.deltas.tryClaim(ViewSnapshotChannel::kDeltaMsgType, frameLen);
@@ -1073,7 +1142,46 @@ bool WorkerViewSet::tryPushDelta_(ViewInstance& inst) {
     channel_.deltas.commit(claim);
 
     inst.pendingValid = false;
+    releaseWindow_(inst);
     return true;
+}
+
+// P11-9: a delta past one ring message (a claim that large throws), as part frames; on back-pressure the rest goes next pass.
+bool WorkerViewSet::tryPushDeltaParts_(ViewInstance& inst) {
+    const std::size_t room = static_cast<std::size_t>(channel_.deltas.maxMsgLength()) - ViewSnapshotChannel::kDeltaPartHeaderBytes;
+    while (inst.pendingSent < inst.pendingDelta.size()) {
+        const std::size_t n = std::min(room, inst.pendingDelta.size() - inst.pendingSent);
+        const auto claim = channel_.deltas.tryClaim(ViewSnapshotChannel::kDeltaPartMsgType, ViewSnapshotChannel::kDeltaPartHeaderBytes + n);
+        if (claim < 0) return false;   // ring full: the run resumes here next pass
+        uint8_t* dst = channel_.deltas.base() + claim;
+        writeI32LE(dst, inst.plan.viewTopicId);
+        writeI32LE(dst + 4, inst.partition);
+        writeI32LE(dst + 8, static_cast<int32_t>(inst.pendingSent));
+        dst[12] = inst.pendingSent + n < inst.pendingDelta.size() ? 1 : 0;
+        dst[13] = dst[14] = dst[15] = 0;
+        std::memcpy(dst + ViewSnapshotChannel::kDeltaPartHeaderBytes, inst.pendingDelta.data() + inst.pendingSent, n);
+        channel_.deltas.commit(claim);
+        inst.pendingSent += n;
+    }
+    inst.pendingSent  = 0;
+    inst.pendingValid = false;
+    std::vector<uint8_t>().swap(inst.pendingDelta);   // a run's buffer is past one message: give it back
+    releaseWindow_(inst);
+    return true;
+}
+
+void WorkerViewSet::installConstrainedViewForTest(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout, rune::codec::Descriptor src, bool persisted) {
+    const int32_t viewTopicId = plan.viewTopicId;
+    const rune::view::VerdictViewKind kind = *rune::view::verdictKindOf(plan);
+    const uint64_t objectId = plan.viewObjectId;
+    const uint64_t fingerprint = rune::view::verdictPlanFingerprint(rune::view::serialize(plan));
+    installView(std::move(plan), std::move(layout), std::move(src), persisted);
+    ViewTemplate& tpl = templates_.at(viewTopicId);
+    ++verdictEpoch_;
+    tpl.isVerdict = true;
+    tpl.verdictKind = kind;
+    tpl.verdictObjectId = objectId;
+    tpl.verdictFingerprint = fingerprint;
 }
 
 void WorkerViewSet::installTestVerdictViewForTest(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout,
@@ -1093,6 +1201,7 @@ void WorkerViewSet::dropSourceTopic(int32_t srcTopicId) {
     const auto ofTopic = [&](const auto& kv) { return static_cast<int32_t>(kv.first >> 32) == srcTopicId; };
     std::erase_if(verdictSources_, [&](const auto& kv) {
         if (!ofTopic(kv)) return false;
+        releaseJudge_(*kv.second);
         if (PartitionWriteState* s = kv.second->boundState()) s->verdicts = nullptr;   // the state may outlive its judge
         return true;
     });
@@ -1180,6 +1289,19 @@ void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, Verd
     it->second.foldLeadership = leaderGen;
 }
 
+namespace {
+/// The set in force at `from`, or a change record above it, names the plan: the judge still judges with it, or will after a switch.
+bool namedFrom(const PartitionWriteState& write, int64_t from, uint64_t viewObjectId, uint64_t planFingerprint) {
+    const auto names = [&](const ConstraintSet& set) {
+        return std::any_of(set.members.begin(), set.members.begin() + set.count, [&](const ConstraintSetMember& m) { return m.viewObjectId == viewObjectId && m.planFingerprint == planFingerprint; });
+    };
+    if (names(*write.constraintSets.setAt(from))) return true;
+    for (int64_t a = write.constraintSets.nextChangeAtOrAfter(from); a != INT64_MAX; a = write.constraintSets.nextChangeAtOrAfter(a + 1))
+        if (names(*write.constraintSets.setAt(a + 1))) return true;
+    return false;
+}
+}  // namespace
+
 VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t partition, PartitionWriteState& write) {
     const auto sit = subscriptionIndex_.find(srcTopicId);
     bool anyTemplate = false;
@@ -1190,7 +1312,11 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     if (!anyTemplate && !write.spec->keyIndex && !write.spec->lease && write.constraintSets.latest().empty()) {
         if (vit == verdictSources_.end()) return nullptr;
         // The set was dropped: the judge stays until it has passed the drop and holds no member.
-        if (vit->second->hasMembers() || vit->second->judgedThrough() <= write.constraintSets.lastChangeOffset()) return vit->second.get();
+        if (vit->second->hasMembers() || vit->second->judgedThrough() <= write.constraintSets.lastChangeOffset()) {
+            installRetainedPlan_(srcTopicId, *vit->second, write);
+            return vit->second.get();
+        }
+        releaseJudge_(*vit->second);
         write.verdicts = nullptr;
         verdictSources_.erase(vit);
         eraseKeyIndex_(key);
@@ -1201,9 +1327,11 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
         v->setViewHooks(VerdictViewHooks{this, &checkpointHook_, &discardHook_, &retiredHook_, &nextLeaseEpochHook_});
         v->setVerdictIntervalNs(verdictIntervalNs_);
         v->holdJudgeForTest(holdJudges_);
+        v->bindTxn(&txnOverlays_, batchOverlay_, txnJudgedRecordsMax_);
         vit = verdictSources_.emplace(key, std::move(v)).first;
     }
     VerdictSource* judge = vit->second.get();
+    const std::size_t membersBefore = judge->memberCountForTest();
     judge->bindState(&write);
     write.verdicts = judge;
     if (write.spec->lease) write.leaseEvents.reserveOnce();
@@ -1223,19 +1351,110 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
             judge->addVerdictView(&inst, rune::view::VerdictViewKind::KeyIndex, 0, kKeyIndexPlanFingerprint);
         }
     }
-    if (sit == subscriptionIndex_.end()) return judge;
-    for (const int32_t id : sit->second) {
+    installRetainedPlan_(srcTopicId, *judge, write);
+    const auto sit2 = subscriptionIndex_.find(srcTopicId);   // the install may have added the source
+    for (const int32_t id : sit2 == subscriptionIndex_.end() ? std::span<const int32_t>{} : std::span<const int32_t>(sit2->second)) {
         const ViewTemplate& tpl = templates_.at(id);
-        if (!tpl.isVerdict || tpl.retiring || judge->hasView(id)) continue;
+        if (!tpl.isVerdict || judge->hasView(id)) continue;
+        // A retiring view still judges the records below its drop, on the partitions whose activated judge's log names it (a fresh judge may already be past the drop).
+        if (tpl.retiring && (!judge->activated() || !namedFrom(write, judge->judgedThrough(), tpl.verdictObjectId, tpl.verdictFingerprint))) continue;
+        // P9-5: the plan of a logged member's object under another fingerprint builds as a candidate (the member keeps judging), unless a
+        // logged set the judge has yet to judge with names it: that is a member of record.  While this worker's catalog is behind the
+        // logged set a plan is a stale one or not yet known to be a replacement: nothing is built.
+        const ConstraintSet& logged = write.constraintSets.latest();
+        const bool candidate = tpl.verdictKind != rune::view::VerdictViewKind::TestReject &&
+            std::any_of(logged.members.begin(), logged.members.begin() + logged.count,
+                        [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint != tpl.verdictFingerprint; }) &&
+            !namedFrom(write, judge->judgedThrough(), tpl.verdictObjectId, tpl.verdictFingerprint);
+        if (candidate && catalogBehind_(srcTopicId, *judge, write)) continue;
         ViewInstance* inst = getOrCreate_(id, partition, INT64_MAX);
         if (inst == nullptr) continue;
-        judge->installTestVerdictViewForTest(inst, tpl.verdictObjectId, tpl.testRule);
+        if (tpl.verdictKind == rune::view::VerdictViewKind::TestReject) judge->installTestVerdictViewForTest(inst, tpl.verdictObjectId, tpl.testRule);
+        else if (candidate) judge->addCandidate(inst, tpl.verdictKind, tpl.verdictObjectId, tpl.verdictFingerprint, tpl.planRecordPayload);
+        else judge->addVerdictView(inst, tpl.verdictKind, tpl.verdictObjectId, tpl.verdictFingerprint, tpl.planRecordPayload);
+        if (tpl.retiring) judge->markLeaving(id);
     }
+    if (judge->memberCountForTest() != membersBefore) reserveTxnOverlays_(*judge);
     return judge;
 }
 
+void WorkerViewSet::growTxnOverlays_(int64_t nowNs) {
+    txnOverlays_.grow(nowNs);
+    for (auto& kv : verdictSources_) kv.second->bindTxn(&txnOverlays_, batchOverlay_, txnJudgedRecordsMax_);
+}
+
+// The reserve bound (Task 4's precondition): rows >= txnJudgedRecordsMax x the judge's per-record need, rows as long as its
+// longest table's.  Only grows: one judge's members never shrink another's overlays.
+void WorkerViewSet::reserveTxnOverlays_(const VerdictSource& judge) {
+    const auto need = judge.overlayNeed();
+    const std::size_t rows = static_cast<std::size_t>(std::max(txnJudgedRecordsMax_, 0)) * need.rowsPerRecord;
+    txnOverlays_.reserveFor(rows, need.maxRowLen);
+    // The atomic batch's overlay: a batch has at most a batch's records, bounded by the same cap as a transaction.
+    if (rows > batchOverlayRows_ || need.maxRowLen > batchOverlayRowLen_) {
+        batchOverlayRows_ = std::max(batchOverlayRows_, rows);
+        batchOverlayRowLen_ = std::max(batchOverlayRowLen_, need.maxRowLen);
+        batchOverlay_[0].reserve(batchOverlayRows_, batchOverlayRowLen_);
+    }
+}
+
+void WorkerViewSet::installRetainedPlan_(int32_t srcTopicId, VerdictSource& judge, const PartitionWriteState& write) {
+    if (!judge.waitingForInstall()) return;
+    const ConstraintSetMember& want = judge.waitingFor();
+    const RetainedVerdictPlan* r = write.retainedPlans.find(want.viewObjectId, want.planFingerprint);
+    // A lagging catalog keeps the judge waiting for its own install (#788); one that refused the plan must not be overruled by the log.
+    if (r == nullptr || std::any_of(refusedPlans_.begin(), refusedPlans_.end(), [&](const RefusedPlan& x) { return x.fingerprint == r->planFingerprint; })) return;
+    if (judge.retainedTriedEpoch == verdictEpoch_ && judge.retainedTriedFingerprint == r->planFingerprint) return;
+    if (catalogBehind_(srcTopicId, judge, write)) return;
+    judge.retainedTriedEpoch = verdictEpoch_;   // decoded once per judge and template change, whatever comes of it
+    judge.retainedTriedFingerprint = r->planFingerprint;
+    std::optional<rune::view::CompiledViewPlan> plan = rune::view::deserializeCompiledViewPlan(r->plan);
+    rune::codec::Descriptor outDesc, srcDesc;
+    rune::view::RowLayout layout;
+    if (plan && (plan->unicodeVersion == 0 || rune::codec::unicodeVersionSupported(plan->unicodeVersion))) {
+        try {
+            outDesc = rune::codec::deserialize(r->outputDescriptor);
+            srcDesc = rune::codec::deserialize(r->sourceDescriptor);
+            layout = rune::view::buildRowLayout(outDesc);
+        } catch (const std::exception&) {
+            plan.reset();
+        }
+    } else {
+        plan.reset();
+    }
+    if (!plan) {
+        if (std::find(unreadablePlans_.begin(), unreadablePlans_.end(), r->planFingerprint) == unreadablePlans_.end()) {
+            unreadablePlans_.push_back(r->planFingerprint);
+            spdlog::critical("VERDICT-PLAN-UNREADABLE view={} fp={:#x}", r->viewObjectId, r->planFingerprint);
+        }
+        return;
+    }
+    if (templates_.contains(plan->viewTopicId)) return;   // the catalog's own template names it: the attach below judges with that one
+    const int32_t viewTopicId = plan->viewTopicId;
+    // In memory whatever the plan says: it only judges up to its drop and serves no reads.
+    installView(std::move(*plan), std::move(layout), std::move(srcDesc), /*persisted=*/false);
+    ViewTemplate& tpl = templates_.at(viewTopicId);
+    tpl.isVerdict = true;
+    tpl.retiring = true;
+    tpl.verdictKind = r->kind;
+    tpl.verdictObjectId = r->viewObjectId;
+    tpl.verdictFingerprint = r->planFingerprint;
+    ++verdictEpoch_;
+    ++judge.statsMut().retainedPlanInstalls;
+}
+
+bool WorkerViewSet::catalogBehind_(int32_t srcTopicId, VerdictSource& judge, const PartitionWriteState& write) {
+    const ConstraintSet& logged = write.constraintSets.latest();
+    if (catalogThrough_ >= logged.catalogThrough && !installsSinceMark_) return false;
+    // Either the logged set was computed at a catalog position this worker has not applied, or a plan install or uninstall is
+    // drained whose mark is not: any difference from the installed templates is a newer DDL change, never a stale one.  The sync
+    // reruns when a mark, an install or a new logged change moves one of its keys.
+    spdlog::debug("constraint set sync: topic {} partition {}: catalog gate closed, applied through {} (installs since the mark: {}) < logged set {} computed at {}; keeping the logged set",
+                  srcTopicId, judge.partition(), catalogThrough_, installsSinceMark_, logged.id, logged.catalogThrough);
+    return true;
+}
+
 int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write) {
-    if (judge.constraintSyncEpoch == verdictEpoch_ && judge.constraintSyncChange == write.constraintSets.lastChangeOffset()) return 0;
+    if (!judge.hasCandidates() && judge.constraintSyncEpoch == verdictEpoch_ && judge.constraintSyncChange == write.constraintSets.lastChangeOffset() && judge.constraintSyncCatalog == catalogThrough_) return 0;
     const ConstraintSet& logged = write.constraintSets.latest();
     const auto sit = subscriptionIndex_.find(srcTopicId);
     std::vector<ConstraintSetMember>& want = constraintWant_;
@@ -1257,7 +1476,12 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
             }
         }
         why[i] = live ? 0 : (gone ? (replacedBy[i] != 0 ? 1 : 2) : 3);
-        if (live || !gone) want.push_back(m);   // a retiring view's plan installed again stays (#786)
+        // P9-5: the logged member keeps judging while its replacement builds as a candidate; the swap is asked for once it caught up.
+        const bool building = replacedBy[i] != 0 && judge.hasMember(m.viewObjectId, m.planFingerprint) &&
+                              judge.hasCandidate(m.viewObjectId, replacedBy[i]) && !judge.candidateCaughtUp(m.viewObjectId, replacedBy[i]);
+        // A replacement this node refused leaves no template: the member stays and the judge fails closed rather than dropping a live constraint.
+        const bool refused = !live && replacedBy[i] == 0 && std::any_of(refusedPlans_.begin(), refusedPlans_.end(), [&](const RefusedPlan& r) { return r.viewObjectId == m.viewObjectId; });
+        if (live || !gone || building || refused) want.push_back(m);   // a retiring view's plan installed again stays (#786)
     }
     if (sit != subscriptionIndex_.end()) {
         for (const int32_t id : sit->second) {
@@ -1266,11 +1490,15 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
             if (tpl.retiring) {
                 const bool inLogged = std::any_of(want.begin(), want.end(), [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
                 const bool wasLogged = std::any_of(logged.members.begin(), logged.members.begin() + logged.count, [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
+                if (!namedFrom(write, judge.judgedThrough(), tpl.verdictObjectId, tpl.verdictFingerprint))
+                    judge.removeCandidate(tpl.verdictObjectId, tpl.verdictFingerprint);   // its view went before any change named it
                 if (!inLogged && !wasLogged && !judge.hasView(id)) retiredQueue_.push_back({id, judge.partition()});   // never joined a set
                 continue;
             }
             const bool present = std::any_of(want.begin(), want.end(), [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
-            if (!present) want.push_back(ConstraintSetMember{tpl.verdictObjectId, tpl.verdictKind, tpl.verdictFingerprint});
+            const bool building = judge.hasCandidate(tpl.verdictObjectId, tpl.verdictFingerprint) && !judge.candidateCaughtUp(tpl.verdictObjectId, tpl.verdictFingerprint) &&
+                                  std::any_of(want.begin(), want.end(), [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId; });
+            if (!present && !building) want.push_back(ConstraintSetMember{tpl.verdictObjectId, tpl.verdictKind, tpl.verdictFingerprint});
         }
     }
     if (write.spec->keyIndex && std::none_of(want.begin(), want.end(), [](const ConstraintSetMember& m) { return m.kind == rune::view::VerdictViewKind::KeyIndex; }))
@@ -1279,10 +1507,11 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
         want.push_back(ConstraintSetMember{0, rune::view::VerdictViewKind::LeaseIndex, kLeaseIndexPlanFingerprint});
     std::sort(want.begin(), want.end(), [](const ConstraintSetMember& a, const ConstraintSetMember& b) { return a.viewObjectId < b.viewObjectId; });
     ConstraintSet desired;
+    desired.catalogThrough = catalogThrough_;   // a change request is stamped with the position it was computed at
     desired.count = static_cast<uint8_t>(std::min(want.size(), desired.members.size()));
     std::copy_n(want.begin(), desired.count, desired.members.begin());
     int work = 0;
-    if (!desired.sameMembers(logged)) {
+    if (!catalogBehind_(srcTopicId, judge, write) && !desired.sameMembers(logged)) {
         const int64_t r = judge.requestChange(desired);
         if (r == VerdictSource::kChangeDeferred) return 0;   // not yet bound or activated: ask again next pass
         work = r >= 0 ? 1 : 0;
@@ -1291,8 +1520,8 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
         if (spdlog::should_log(spdlog::level::debug)) {
             const auto d = judge.diagSnapshot();
             spdlog::debug("constraint set sync: topic {} partition {}: logged set {} ({} members) -> wanted {} members, change at offset {} (result {}), "
-                          "leader generation {}", srcTopicId, judge.partition(), logged.id, logged.count, desired.count, write.constraintSets.lastChangeOffset(),
-                          r, d.leaderGeneration);
+                          "leader generation {}, catalog gate open: applied through {} >= logged set computed at {}", srcTopicId, judge.partition(), logged.id, logged.count,
+                          desired.count, write.constraintSets.lastChangeOffset(), r, d.leaderGeneration, catalogThrough_, logged.catalogThrough);
             for (uint8_t i = 0; i < logged.count; ++i) {
                 static constexpr const char* kWhy[] = {"live", "replaced", "gone", "kept (plan not installed here)"};
                 spdlog::debug("constraint set sync: topic {} partition {}: member object {} fingerprint {}: {}{}", srcTopicId, judge.partition(),
@@ -1303,13 +1532,16 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
     }
     judge.constraintSyncEpoch = verdictEpoch_;
     judge.constraintSyncChange = write.constraintSets.lastChangeOffset();
+    judge.constraintSyncCatalog = catalogThrough_;
     return work;
 }
 
-int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, std::size_t leaseEventBytes, bool lease) {
+int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, int64_t nowNs, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns,
+                                       std::size_t leaseEventBytes, bool lease) {
     if (const auto kit = keyIndexes_.find(instKey(srcTopicId, partition)); kit != keyIndexes_.end()) {
         kit->second.extraMemBytes = leaseEventBytes;   // a lease partition's event buffer is part of its lease view's memory
         adoptNs_(kit->second, ns);
+        quietPass_(kit->second, nowNs);   // a pass that applied to it restarted the clock (discardKeyIndexDirty_)
         chargeMem_(kit->second);
         if (lease) chargeLeases_(kit->second);   // Task 21: never a checked-writes key index that is not a lease topic
     }
@@ -1321,6 +1553,7 @@ int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, in
         if (vit == views_.end()) continue;
         ViewInstance& inst = vit->second;
         adoptNs_(inst, ns);
+        quietPass_(inst, nowNs);   // as the key index: a push restarts the clock, so a member whose judge stopped (stall, install wait, Locked) gives back too
         chargeMem_(inst);
         if (inst.foldLeadership != leaderGen) {
             inst.foldLeadership = leaderGen;
@@ -1392,9 +1625,12 @@ void WorkerViewSet::beginDiscard_(ViewInstance& inst, ViewDiscardReason reason) 
     if (inst.agg) inst.agg.emplace(rune::view::buildAggLayout(inst.plan, inst.evolvingSrc).value(), indexSlots, chunkBytes, inst.tableKeys);
     if (inst.keyed) buildKeyedTables(inst, indexSlots, chunkBytes);
     inst.foldCursor = 0;
+    inst.spanFence.clear();
     inst.lastEncodedO = -1;
+    inst.lastDurableO = -1;
     inst.transientCursor = CursorFresh{};
     inst.readiness = ViewReadiness::RebuildingViews;
+    inst.counters.uniqueConflicts = 0;
     ++inst.counters.checkpointDiscards;
     chargeMem_(inst);
     spdlog::info("VIEW-DISCARD view={} partition={} reason={}", inst.plan.viewTopicId, inst.partition, viewDiscardReasonName(reason));

@@ -702,18 +702,27 @@ TEST(FilterGroupRegression, BudgetStopsTheScanAtTheBatchThatWouldExceedItRegress
 }
 
 TEST(FilterGroupRegression, ScanSourceIdentityIsEnforcedRegression) {
-    // Debug: add() asserts on a foreign scan source.  Release: add() is addOrRefuse(); that path is exercised in
-    // every build type through the public addOrRefuse() hook (a TU compiled with NDEBUG would break the ODR of the
+    // Without NDEBUG: add() asserts on a foreign scan source.  With NDEBUG (any build type): add() is addOrRefuse();
+    // that path is exercised in every build through the public addOrRefuse() hook (a TU compiled with NDEBUG would break the ODR of the
     // header-only class).
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     Rig r;
     EXPECT_DEBUG_DEATH({ (void)r.g.add(0, worldEq(r.schema, 1), r.schema, kSrc + 1); }, "scan source");
+#ifdef NDEBUG
+    // add()'s assert and EXPECT_DEBUG_DEATH both key on NDEBUG: here the statement ran in this process, and add()
+    // refused and counted like addOrRefuse() does.
+    constexpr uint64_t kRefusedByAdd = 1;
+#else
+    constexpr uint64_t kRefusedByAdd = 0;   // add() died in the death-test child
+#endif
+    EXPECT_EQ(r.g.groupCounters().sourceRefused, kRefusedByAdd);
+    EXPECT_TRUE(r.g.empty());
     const uint32_t id = r.g.addOrRefuse(0, worldEq(r.schema, 1), r.schema, kSrc + 1);
     EXPECT_EQ(id, kNil);
-    EXPECT_EQ(r.g.groupCounters().sourceRefused, 1u);
+    EXPECT_EQ(r.g.groupCounters().sourceRefused, kRefusedByAdd + 1);
     EXPECT_TRUE(r.g.empty());
     EXPECT_NE(r.add(0, worldEq(r.schema, 1)), kNil) << "the group's own source is accepted";
-    EXPECT_EQ(r.g.groupCounters().sourceRefused, 1u);
+    EXPECT_EQ(r.g.groupCounters().sourceRefused, kRefusedByAdd + 1);
 }
 
 constexpr std::size_t kRealBudget = 128 * 1024;   // Worker kPushPassBudgetBytes

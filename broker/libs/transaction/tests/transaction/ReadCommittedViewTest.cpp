@@ -22,7 +22,9 @@
 
 #include <atomic>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -403,6 +405,54 @@ TEST(ReadCommittedViewRebuildTest, DataBatchesWithNoControlsOpenTxns)
     f.view.rebuild(&f.log, hw);
     // Both producers are open → LSO = min(0, 1) = 0
     EXPECT_EQ(f.view.lso(hw), 0);
+}
+
+// Part 11 (P11-7): a rebuild from the log restores the open transaction's record count, so a leader change keeps the produce bound.
+TEST(ReadCommittedViewRebuildTest, RebuildCountsTheOpenTransactionsRecords)
+{
+    RcvFixture f;
+    for (int i = 0; i < 3; ++i) appendData(f.log, 1);
+    appendData(f.log, 2);
+    appendControlMarker(f.log, 2, ControlType::Commit);
+    appendData(f.log, 2);
+    f.view.rebuild(&f.log, f.hw());
+    EXPECT_EQ(f.tracker.recordsOf(1), 3);
+    EXPECT_EQ(f.tracker.recordsOf(2), 1) << "the reopened transaction counts from its own first batch";
+    EXPECT_EQ(f.tracker.recordsOf(9), 0);
+}
+
+// Part 11: a record with an intent marks its open transaction when the scan tracks intents; a builder that does not never parses records.
+// A reopened transaction starts without the mark.
+TEST(ReadCommittedViewRebuildTest, RebuildRestoresTheTransactionsIntentMark)
+{
+    const auto txnBatch = [](int64_t pid, bool intent) {
+        rune::protocol::RecordBatchBuilder builder(0, 0);
+        builder.setProducerId(pid);
+        builder.setTransactional(true);
+        builder.append({}, "plain", 0);
+        if (intent) builder.append({}, "intent", 0, 1);
+        return builder.build();
+    };
+    const auto step = [](RcBuilder& b, const std::vector<uint8_t>& batch) { (void)b.step(batch.data(), batch.size()); };
+    LsoTracker tracker;
+    AbortedTxnIndex aborted;
+    RcBuilder tracking(&tracker, &aborted, /*trackIntents=*/true);
+    step(tracking, txnBatch(1, true));
+    step(tracking, txnBatch(2, false));
+    EXPECT_TRUE(tracker.hasIntent(1));
+    EXPECT_FALSE(tracker.hasIntent(2));
+    EXPECT_FALSE(tracker.hasIntent(9));
+    const auto commit = ControlMarker::build(1, 0, ControlType::Commit, 0);
+    (void)tracking.step(commit.data(), commit.size());
+    step(tracking, txnBatch(1, false));
+    EXPECT_EQ(tracker.recordsOf(1), 1);
+    EXPECT_FALSE(tracker.hasIntent(1)) << "the reopened transaction starts without the mark";
+
+    LsoTracker plainTracker;
+    RcBuilder headersOnly(&plainTracker, &aborted, /*trackIntents=*/false);
+    step(headersOnly, txnBatch(1, true));
+    EXPECT_EQ(plainTracker.recordsOf(1), 2);
+    EXPECT_FALSE(plainTracker.hasIntent(1)) << "the records are not parsed";
 }
 
 TEST(ReadCommittedViewRebuildTest, CommitMarkerClosesTransaction)
@@ -1335,4 +1385,125 @@ TEST(ReadCommittedEdgeTest, SamePidAbortThenCommitRebuildMatchesIncremental)
         << "rebuild must NOT flag txn2 data (committed) as aborted";
 
     fs::remove_all(tmpDir);
+}
+
+// Part 11: the vote mark lives with the open transaction and follows it through every move of its entry.
+TEST(LsoTrackerVoteMarkRegression, MarkIsPerEpochNeverLowersAndTheMarkerClearsIt)
+{
+    LsoTracker tracker(4);
+    tracker.onProduceBatch(1, 0);
+    EXPECT_FALSE(tracker.votedAt(1, 1));
+    tracker.markVoted(1, 1);
+    tracker.markVoted(1, 0);   // a stale vote of an older epoch
+    EXPECT_TRUE(tracker.votedAt(1, 1));
+    EXPECT_FALSE(tracker.votedAt(1, 0));
+    EXPECT_FALSE(tracker.votedAt(2, 1)) << "another producer";
+    tracker.onControlMarker(1, 5, true);
+    EXPECT_FALSE(tracker.votedAt(1, 1));
+    tracker.onProduceBatch(1, 10);   // the next transaction reuses the slot
+    EXPECT_FALSE(tracker.votedAt(1, 1)) << "starts unvoted";
+}
+
+TEST(LsoTrackerVoteMarkRegression, MarkSurvivesTheOutOfOrderShift)
+{
+    LsoTracker tracker(4);
+    tracker.onProduceBatch(1, 10);
+    tracker.markVoted(1, 3);
+    tracker.onProduceBatch(2, 5);   // below the newest first offset: pid 1's entry shifts
+    EXPECT_TRUE(tracker.votedAt(1, 3));
+    EXPECT_FALSE(tracker.votedAt(2, 3));
+    EXPECT_EQ(tracker.outOfOrderInserts(), 1u);
+}
+
+TEST(LsoTrackerVoteMarkRegression, MarkSurvivesCompactionAndGrowth)
+{
+    LsoTracker tracker(4);
+    for (int64_t pid : {1, 10, 11, 12}) tracker.onProduceBatch(pid, pid);
+    tracker.markVoted(11, 2);
+    tracker.onControlMarker(10, 100, true);
+    tracker.onControlMarker(12, 101, true);
+    tracker.onProduceBatch(20, 20);   // the ring is full with dead entries before pid 11: compacted in place, pid 11 moves
+    EXPECT_EQ(tracker.growths(), 0u);
+    EXPECT_TRUE(tracker.votedAt(11, 2));
+    EXPECT_FALSE(tracker.votedAt(1, 2));
+    EXPECT_FALSE(tracker.votedAt(20, 2));
+    for (int64_t pid = 30; pid < 36; ++pid) tracker.onProduceBatch(pid, pid);   // all live: the ring doubles
+    EXPECT_GT(tracker.growths(), 0u);
+    EXPECT_TRUE(tracker.votedAt(11, 2));
+    EXPECT_FALSE(tracker.votedAt(30, 2));
+}
+
+TEST(LsoTrackerVoteMarkRegression, InheritedTransactionIsVerifiedAgainUntilItsNextBatch)
+{
+    LsoTracker tracker(4);
+    tracker.onProduceBatch(1, 0);
+    EXPECT_TRUE(tracker.openVerified(1));
+    tracker.markInherited();
+    EXPECT_FALSE(tracker.openVerified(1));
+    EXPECT_FALSE(tracker.openVerified(2)) << "no open transaction";
+    tracker.onProduceBatch(1, 8);   // its next batch, admitted after the verification
+    EXPECT_TRUE(tracker.openVerified(1));
+}
+
+// A segment compaction emptied: the read continues at the next segment instead of answering empty forever.
+TEST(ReadCommittedViewReadTest, ReadContinuesPastASegmentCompactionEmptiedRegression)
+{
+    const std::string dir = makeTmpDir();
+    const auto put = [&dir](int64_t base, const std::vector<uint8_t>& bytes) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(fs::path(dir) / name, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    put(0, {});
+    auto bytes = makeDataBatch(10, -1);
+    const auto second = makeDataBatch(11, -1);
+    bytes.insert(bytes.end(), second.begin(), second.end());
+    put(10, bytes);
+
+    rune::storage::Log log(dir);
+    log.recover();
+    ASSERT_EQ(log.segmentBaseOffsets().size(), 2u);
+    LsoTracker tracker;
+    AbortedTxnIndex abortedIndex;
+    ReadCommittedView view(&tracker, &abortedIndex);
+    const int64_t hw = log.logEndOffset();
+    ASSERT_EQ(hw, 12);
+    view.rebuild(&log, hw);
+
+    const auto offsets = readOffsets(view.read(&log, hw, 0, 1 << 20, IsolationLevel::ReadUncommitted));
+    ASSERT_EQ(offsets.size(), 2u);
+    EXPECT_EQ(offsets[0], 10);
+    EXPECT_EQ(offsets[1], 11);
+
+    fs::remove_all(dir);
+}
+
+// Torn bytes in an earlier segment end the read there: it must not skip to the next segment.
+TEST(ReadCommittedViewReadTest, ReadStopsAtATornBatchRegression)
+{
+    const std::string dir = makeTmpDir();
+    const auto put = [&dir](int64_t base, const std::vector<uint8_t>& bytes) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(fs::path(dir) / name, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    const auto first = makeDataBatch(0, -1);
+    put(0, first);
+    put(10, makeDataBatch(10, -1));
+
+    rune::storage::Log log(dir);
+    log.recover();
+    LsoTracker tracker;
+    AbortedTxnIndex abortedIndex;
+    ReadCommittedView view(&tracker, &abortedIndex);
+    const int64_t hw = log.logEndOffset();
+    ASSERT_EQ(hw, 11);
+    view.rebuild(&log, hw);
+    put(0, std::vector<uint8_t>(first.size(), 0xFF));
+
+    EXPECT_TRUE(view.read(&log, hw, 0, 1 << 20, IsolationLevel::ReadUncommitted).empty());
+
+    fs::remove_all(dir);
 }

@@ -63,6 +63,7 @@
 // paths (onTxnBatch, lso, isAborted, ready) never allocate once reserve()d.
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/ControlMarkerLayout.h>
+#include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogReadView.h>
@@ -129,6 +130,7 @@ struct RcVerdictHooks {
     void* ctx = nullptr;
     void (*dataBatch)(void* ctx, const uint8_t* batch, std::size_t len, int64_t baseOffset) noexcept = nullptr;
     void (*end)(void* ctx) noexcept = nullptr;
+    void (*marker)(void* ctx, int64_t producerId, int64_t offset, bool commit) noexcept = nullptr;   ///< a COMMIT / ABORT marker, appended or scanned
 };
 
 /// A fixed-capacity open-addressing set of producer ids (>= 0): linear probing at
@@ -442,10 +444,11 @@ public:
     // ---- §2.1: append-time updates (same invocation as the append) --------
     /// A TRANSACTIONAL data batch appended at `base` (not a duplicate).  Only
     /// reachable while Ready (the produce gate) — anything else halts (m4).
-    void onTxnBatch(int64_t producerId, int64_t base) {
+    void onTxnBatch(int64_t producerId, int64_t base, int32_t records, bool intent) {
         if (!ready()) [[unlikely]]
             haltInvariant_("a producerId >= 0 data batch was appended while the RC state is not Ready");
         tracker_.onProduceBatch(producerId, base);
+        tracker_.addRecords(producerId, records, intent);
         if (verify_.size() != 0) [[unlikely]] verify_.erase(producerId);   // #112: a Verified entry is consumed
     }
     /// A COMMIT / ABORT control batch appended at `offset`.
@@ -462,6 +465,13 @@ public:
         // Unbuilt: nothing — the build starts at LEO > offset and scans it.
     }
 
+    /// Part 11: this partition answers a vote for (producerId, epoch).  An open transaction of the producer takes no more batches until its
+    /// marker; without one, a verification the producer cached is dropped, so a late batch asks the coordinator again.
+    void onVote(int64_t producerId, int16_t epoch) noexcept {
+        if (tracker_.firstOffsetOf(producerId) >= 0) tracker_.markVoted(producerId, epoch);
+        else if (verify_.size() != 0) verify_.erase(producerId);
+    }
+
     // ---- F15-FU1 (#112): transaction-registration verification -------------
     /// The produce gate for a TRANSACTIONAL data batch of (producerId, epoch), Ready
     /// only.  An open transaction of the producer here admits it (it was verified, or
@@ -473,7 +483,7 @@ public:
     [[nodiscard]] TxnAdmission admitTxnBatch(int64_t producerId, int16_t epoch, uint64_t& nextReqId,
                                              bool canRequest = true) noexcept {
         using K = TxnAdmission::Kind;
-        if (tracker_.firstOffsetOf(producerId) >= 0) [[likely]] return {};
+        if (tracker_.openVerified(producerId)) [[likely]] return {};   // a transaction rebuilt from the log is verified again first
         TxnVerifySet::Entry* e = verify_.find(producerId);
         if (e != nullptr && e->epoch == epoch) {
             switch (e->state) {
@@ -675,9 +685,14 @@ private:
         verify_.clear();    // #112: a new leadership verifies anew (its open txns come from the log)
         st_ = Unbuilt{};
     }
+    void feedMarker_(rune::transaction::RcBuilder::Outcome outcome, int64_t producerId, int64_t offset) noexcept {
+        using O = rune::transaction::RcBuilder::Outcome;
+        if (outcome == O::CommitMarker || outcome == O::AbortMarker) verdict_.marker(verdict_.ctx, producerId, offset, outcome == O::CommitMarker);
+    }
     void applyMarker_(int64_t producerId, int64_t offset, bool commit) {
         const int64_t first = tracker_.onControlMarker(producerId, offset, commit);
         if (!commit && first >= 0) aborted_.onAbortMarker(producerId, first, offset);
+        if (verdict_.marker != nullptr) verdict_.marker(verdict_.ctx, producerId, offset, commit);
     }
     static std::size_t pageSize_() noexcept {
         static const std::size_t p = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
@@ -836,7 +851,7 @@ private:
             StepProfile* prof; uint64_t t0;
             ~ParseClock() { if (prof) prof->parseNs += clock_() - t0; }
         } parseClock{profile_, profile_ ? clock_() : 0};
-        rune::transaction::RcBuilder builder(&tracker_, &aborted_);
+        rune::transaction::RcBuilder builder(&tracker_, &aborted_, verdict_.ctx != nullptr);
         std::size_t pos = 0;
         while (pos + kOverhead <= res) {
             RecordBatchReader r(p + pos, res - pos);
@@ -870,11 +885,18 @@ private:
                 if (out.outcome == rune::transaction::RcBuilder::Outcome::Invalid) [[unlikely]]
                     haltInvariant_("RcBuilder refused a whole batch inside the log's written bytes");
                 if (psm_ != nullptr) feedProducerState_(r, out.outcome, p + pos, len);
+                if (out.outcome == rune::transaction::RcBuilder::Outcome::Ignored && (r.attributes() & rune::protocol::batch::kAttrControl) != 0 &&
+                    r.producerId() < 0) [[unlikely]] {   // a TxnJudge in the log: its open transaction is voted, whether or not the judge takes the record
+                    if (const auto j = rune::storage::control_record::parseTxnJudge(p + pos, len); j && tracker_.firstOffsetOf(j->producerId) == j->firstOffset)
+                        tracker_.markVoted(j->producerId, j->producerEpoch);
+                }
                 if (verdict_.batch != nullptr && out.outcome == rune::transaction::RcBuilder::Outcome::Ignored &&
                     (r.attributes() & rune::protocol::batch::kAttrControl) != 0 && r.producerId() < 0) [[unlikely]]
                     verdict_.batch(verdict_.ctx, p + pos, len, base);
                 if (verdict_.dataBatch != nullptr && r.producerId() >= 0 && (r.attributes() & rune::protocol::batch::kAttrControl) == 0) [[unlikely]]
                     verdict_.dataBatch(verdict_.ctx, p + pos, len, base);
+                if (verdict_.marker != nullptr) [[unlikely]]
+                    feedMarker_(out.outcome, r.producerId(), base);
                 s.cursor = last + 1;
             }
             pos += len;
@@ -971,7 +993,7 @@ private:
             if (verdict_.begin != nullptr) verdict_.begin(verdict_.ctx, ring.logStartOffset(), ring.logEndOffset());   // the feed restarts too
         }
         RingScanning& cur = rs;
-        rune::transaction::RcBuilder builder(&tracker_, &aborted_);
+        rune::transaction::RcBuilder builder(&tracker_, &aborted_, /*trackIntents=*/false);   // a ring (transient) partition has no key index, so no intents
         // #37: base << min(boost, 40), saturating (an unboosted build keeps the plain budget).
         const std::size_t base  = static_cast<std::size_t>(budget > 0 ? budget : 1);
         const unsigned    shift = std::min<uint32_t>(cur.boost, 40u);
@@ -1007,6 +1029,8 @@ private:
                 verdict_.batch(verdict_.ctx, v.data, v.len, r.baseOffset());
             if (verdict_.dataBatch != nullptr && r.producerId() >= 0 && (r.attributes() & kAttrControl) == 0) [[unlikely]]
                 verdict_.dataBatch(verdict_.ctx, v.data, v.len, r.baseOffset());
+            if (verdict_.marker != nullptr) [[unlikely]]
+                feedMarker_(out.outcome, r.producerId(), r.baseOffset());
             bytes     += v.len;
             cur.cursor = v.nextOffset;
         }
@@ -1016,6 +1040,7 @@ private:
             // The tail lies wholly at or above target: replayed in order (§2.2).
             for (const TailEvent& e : tail_) applyMarker_(e.producerId, e.offset, e.commit);
             tail_.clear();
+            tracker_.markInherited();
             st_ = Ready{cur.epoch, cur.logGen, cur.leadGen};
             if (verdict_.end != nullptr) verdict_.end(verdict_.ctx);
         }
@@ -1026,6 +1051,7 @@ private:
         // keeps the FIFO / range order (§2.2).
         for (const TailEvent& e : tail_) applyMarker_(e.producerId, e.offset, e.commit);
         tail_.clear();
+        tracker_.markInherited();
         st_ = Ready{s.epoch, s.logGen, s.leadGen};
         if (verdict_.end != nullptr) verdict_.end(verdict_.ctx);
     }

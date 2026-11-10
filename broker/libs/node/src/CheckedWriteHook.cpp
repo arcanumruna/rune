@@ -69,7 +69,9 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
         }
         if (facts_.clientVersion < pc::kClientVersionLeases || !facts_.levelLeases) return refuseLease(HookRefusal::LeaseClientVersion);
         if (!pc::acksView(facts_.acks)) return refuseLease(HookRefusal::LeaseNeedsView);
-        if (facts_.transactional) return refuseLease(HookRefusal::LeaseInTxn);   // explicit: the View bit is cleared for a transaction, but the rule must not depend on that
+        // explicit: the View bit is cleared for a transaction, but the rule must not depend on that.  An atomic batch is refused alike:
+        // the lease index judges record by record (no batch overlay), and checked writes Part 11 no longer refuses one on a constrained source.
+        if (facts_.transactional || facts_.atomicBatch) return refuseLease(HookRefusal::LeaseInTxn);
         if (recordCount < 0 || static_cast<std::size_t>(recordCount) > rec::kMaxLeaseBatchRecords) return refuseLease(HookRefusal::LeaseBatchTooLarge);
     }
     const uint8_t reservedMask = lease ? static_cast<uint8_t>(rec::kAttrReservedMask & ~rec::kAttrLeaseOpMask) : rec::kAttrReservedMask;
@@ -156,6 +158,7 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
         refusal_ = HookRefusal::LeaseMaxLeases;
         return pc::ErrorCode::NamespaceLimitExceeded;
     }
+    anyIntent_ = intents.anyIntent;
     intents.keyZeroCreate = keyZeroCreates > 0;
     intents.mixedKeyZero  = keyZeroCreates > 0 && keyZeroCreates < recordCount;
     if (autoInc) [[unlikely]] {

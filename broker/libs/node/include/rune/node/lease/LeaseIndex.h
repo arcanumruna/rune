@@ -143,12 +143,12 @@ struct LeaseRowState {
 /// record's lease_version (value bytes [4,12)); a grant ignores it.  `recordRemainingMs` is the record's lease_remaining_ms (bytes [28,36)).
 ///
 /// Exact order, per record kind (the first match answers):
-///   Put + Insert:    row present -> KeyExists (56); liveCount >= maxKeys -> LeaseLimitExceeded (63); remaining != 0 -> 39; accept.
+///   Put + Insert:    row present -> KeyExists (56); liveCount >= maxKeys -> LeaseLimitExceeded (65); remaining != 0 -> 39; accept.
 ///                    The grant's TTL is taken as written (the produce hook clamps it before append).
-///   Put + Existing:  row absent or version differs -> LeaseNotFound (62); accept.
+///   Put + Existing:  row absent or version differs -> LeaseNotFound (64); accept.
 ///   Put + Upsert(0) = Carry (a broker re-append of a live row, spec A.3): row absent or version differs -> kVerdictStaleBroker; accept
 ///                    (the row is not modified, only its anchor moves).
-///   Revoke+Existing: row absent or version differs -> LeaseNotFound (62); accept.
+///   Revoke+Existing: row absent or version differs -> LeaseNotFound (64); accept.
 ///   Expire / Checkpoint (intent 0): row absent or version differs -> kVerdictStaleBroker; accept (the broker copies the row).
 ///   anything else -> InvalidRequest (39).
 /// An update or revoke's TTL and remaining are NOT checked (spec 6.4: the judge keeps the row's TTL and remaining; the

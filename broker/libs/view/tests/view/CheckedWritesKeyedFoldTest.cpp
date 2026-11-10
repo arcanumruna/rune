@@ -194,6 +194,7 @@ struct KeyedRig {
     VersionDescriptorCache vdc;
     ViewTable table;
     ViewTable ownerTable;
+    std::optional<UniqueClaims> claims;   // unique and owner-mapped
     Prospect prospect;
     ProjectionFold pf;
     FoldStats total;
@@ -207,7 +208,8 @@ struct KeyedRig {
         : src(std::move(evolving)), comp(std::move(c)), spec(*buildKeyedFoldSpec(comp.plan, src)), vdc(src),
           table(comp.rowLayout, 256, 1u << 16, {uint8_t(spec.keyWidth), uint8_t(spec.prefixWidth), 7}),
           ownerTable(ownerLayout(spec.keyWidth), 256, 1u << 16, {spec.wireKeyWidth, 0, 7}),
-          pf{comp.plan, comp.rowLayout, vdc, table, keyType, &spec, spec.ownerMapped ? &ownerTable : nullptr} {
+          claims(comp.plan.unique && spec.ownerMapped ? std::optional<UniqueClaims>(std::in_place, spec.keyWidth, spec.wireKeyWidth, comp.rowLayout.rowLen, keyType, 7, 256, 1u << 16) : std::nullopt),
+          pf{comp.plan, comp.rowLayout, vdc, table, keyType, &spec, spec.ownerMapped ? &ownerTable : nullptr, claims ? &*claims : nullptr} {
         prospect.reserve(comp.rowLayout, nullptr);
     }
     void add(const FoldStats& s) {
@@ -426,12 +428,13 @@ TEST(CheckedWritesKeyedFold, StringSourceKeyedViewUsesTheWireKey) {
     EXPECT_EQ(rig.total.deleted, 1u);
 }
 
-TEST(CheckedWritesKeyedFold, UniqueConflictIsSkippedAndCounted) {
+TEST(CheckedWritesKeyedFold, UniqueConflictBecomesAnExtraClaimant) {
     const auto d = characterSource();
     KeyedRig rig(lowerView(d, true), d);
     rig.fold(charRec(d, 7, "Foo", 0, 1));
     rig.fold(charRec(d, 9, "foo", 0, 2));
-    EXPECT_EQ(rig.total.keyConflicts, 1u);
+    EXPECT_EQ(rig.claims->extras(), 1u);
+    EXPECT_EQ(rig.total.keyConflicts, 0u);
     EXPECT_EQ(rig.table.size(), 1u);
     EXPECT_FALSE(rig.owner(9).has_value());
     ASSERT_TRUE(rig.owner(7).has_value());

@@ -230,6 +230,13 @@ public:
             }
             return !anyPending;
         }, rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers (errors stop it)
+        if (pump.deadlineExpired())
+            for (const Resolving& r : resolving_) {
+                if (r.regId >= 0)
+                    spdlog::error("AeronPubRegistry: publication {} stream {} not answered by the driver within the startup deadline", r.channel, streamId_);
+                else
+                    spdlog::error("AeronPubRegistry: peer {} stream {} did not resolve within the startup deadline", r.channel, streamId_);
+            }
         broker_      = broker;
         allResolved_ = resolving_.empty() && configured_;
     }
@@ -826,6 +833,9 @@ private:
             spdlog::error("WorkerReplicationTransport[{}]: addSubscription {} stream {} failed: {}",
                           workerId_, inboundChannel_, inboundStreamId_, e.what());
         }
+        if (!sub_ && pump.deadlineExpired())
+            spdlog::error("WorkerReplicationTransport[{}]: inbound {} stream {} not answered by the driver within the startup deadline",
+                          workerId_, inboundChannel_, inboundStreamId_);
         // sub_ == nullptr → resolved() returns false.
     }
 

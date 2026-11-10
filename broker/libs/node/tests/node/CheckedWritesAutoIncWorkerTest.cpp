@@ -531,7 +531,7 @@ TEST(CheckedWritesAutoIncWorker, AbortedTransactionBurnsItsIds) {
     Producer p{r, 42};
     EXPECT_EQ(p.createIds(1), std::vector<uint64_t>{3});
     ASSERT_TRUE(r.driveUntilJudged());
-    EXPECT_EQ(r.keyIndexKeys(), (std::set<std::string>{"3"}));
+    EXPECT_EQ(r.keyIndexKeys(), (std::set<uint64_t>{3}));
     EXPECT_EQ(r.autoIncStats().idsBurned, 2u);
 }
 
@@ -984,7 +984,7 @@ TEST(RcRingVerdictFeedRegression, ControlBatchesFedRegression) {
     };
     std::vector<uint8_t> change(cr::changeBatchBytes(1));
     const cr::ChangeMember member{.viewObjectId = 7, .kind = 1, .planFingerprint = 99};
-    ASSERT_EQ(cr::buildConstraintSetChange(change, 5, std::span<const cr::ChangeMember>(&member, 1)), change.size());
+    ASSERT_EQ(cr::buildConstraintSetChange(change, 5, -1, std::span<const cr::ChangeMember>(&member, 1)), change.size());
     std::vector<uint8_t> marker(cr::markerBatchBytes(0));
     ASSERT_EQ(cr::buildVerdictMarker(marker, cr::MarkerHeader{.fromOffset = 0, .finalThrough = 2, .constraintSetId = 5, .count = 0}, {}), marker.size());
     appendData(0);

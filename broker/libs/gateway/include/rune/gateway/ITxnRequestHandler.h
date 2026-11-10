@@ -131,11 +131,12 @@ struct ITxnRequestHandler {
     // ONGOING transaction and that registration is durable; NotCoordinator /
     // ConcurrentTransactions = cannot answer now (retriable); ProducerFenced /
     // InvalidProducerEpoch / InvalidTxnState = never (non-retriable).  Synchronous,
-    // control thread, cold (once per transaction and partition).  Default (test
-    // doubles): NotCoordinator.
+    // control thread, cold (once per transaction and partition).  votes = the partition
+    // is a verdict source: the coordinator counts it a vote candidate whatever its own
+    // catalog knows (L9).  Default (test doubles): NotCoordinator.
     static constexpr int16_t kVerifyNotCoordinator = 14;   // pc::ErrorCode::NotCoordinator
     virtual int16_t verifyTxnPartition(int64_t /*producerId*/, int16_t /*producerEpoch*/, int32_t /*topicId*/,
-                                       int32_t /*partition*/, int64_t /*nowNs*/) {
+                                       int32_t /*partition*/, int64_t /*nowNs*/, bool /*votes*/) {
         return kVerifyNotCoordinator;
     }
     // #112: true when this node coordinates transactions (verifyTxnPartition answers

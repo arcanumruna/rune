@@ -6,6 +6,7 @@
 #include <rune/node/NodeConfig.h>
 #include <rune/node/TopicFeatureRules.h>
 #include <rune/node/CatalogEffectFrames.h>
+#include <rune/node/ConstraintDdlRules.h>
 #include <rune/node/FdBudget.h>
 #include <rune/node/lease/LeaseIndex.h>
 #include <rune/protocol/client/LeaseMessages.h>
@@ -26,7 +27,9 @@
 #include <rune/security/SecurityQueries.h>
 #include <rune/replication/WorkerReplicationTransport.h>   // the __catalog plane (Task 6)
 #include <rune/view/AggState.h>      // rune::view::isAggregateView (Phase 2a)
+#include <rune/storage/ControlRecordLayout.h>
 #include <rune/view/PlanCompiler.h>  // rune::view::compileView
+#include <rune/view/Verdict.h>
 #include <rune/view/ViewPlan.h>
 
 #include <spdlog/spdlog.h>
@@ -1770,9 +1773,6 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
         if (!atLevel) return Rejected(reject(kInvalidRequest, "plan v2 needs the checked-writes feature level"));
         if (authored->sources[0].keyField != sourceKeyField) return wrongKeyField();
     }
-    // TODO(checked writes Part 09): unique and check constraints.
-    if (authored->unique) return Rejected(reject(kViewUniqueInvalid, "unique views are not available yet"));
-    if (!authored->constraints.empty()) return Rejected(reject(kViewConstraintInvalid, "check constraints are not available yet"));
     auto compiled = rv::compileView(*authored,
                                     std::span<const rune::codec::Descriptor* const>(srcDescs.data(), srcDescs.size()),
                                     viewTopicId);
@@ -1815,6 +1815,19 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
     compiled->plan.viewObjectId = viewObjectId;
     def.compiledPlanBlob     = rv::serialize(compiled->plan);
     def.outputDescriptorBlob = rune::codec::serialize(compiled->outputDescriptor);
+    if (rv::verdictKindOf(compiled->plan)) {
+        if (const auto why = featureRefusal(DbFeature::Constraint, topicShapeOf(*first))) return Rejected(reject(kInvalidRequest, std::string(*why)));
+        std::size_t membersAfter = 1 + (first->schema->keyFeatures.keyIndex ? 1 : 0);
+        for (const cat::ViewObject* v : s.views()) {
+            if (v->objectId == viewObjectId || v->nsId != nsId || v->def.sourceNames.front() != def.sourceNames.front()) continue;
+            const auto other = rv::deserializeCompiledViewPlan(v->def.compiledPlanBlob);
+            if (other && rv::verdictKindOf(*other)) ++membersAfter;
+        }
+        const std::size_t planRecordBytes = rune::storage::control_record::verdictPlanPayloadBytes(
+            def.compiledPlanBlob.size(), def.outputDescriptorBlob.size(), rune::codec::serialize(*srcDescs[0]).size());
+        if (auto why = constrainedViewRefusal(viewObjectId, compiled->plan.constraints.size(), membersAfter, planRecordBytes))
+            return Rejected(reject(kViewConstraintInvalid, std::move(*why)));
+    }
     (void)name;
     return def;
 }

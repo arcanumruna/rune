@@ -2,6 +2,7 @@
 // CheckedWritesMatrixExpectations.h - the checked-writes interaction matrix, shared by the parts (plan 04 P4-15, R03d).
 // Every part owns an id range of Op and Entity; Timing is append-only.  expect() chains the per-part expectNN by the op's range.
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -13,7 +14,8 @@ enum class Op : uint16_t {
     AutoCreate1 = 40, AutoCreate8 = 41, ImportBelow = 42, ImportAbove = 43, UpdateAssigned = 44, RemoveExistingAssigned = 45,   // 06: 40-59
     ViewUpsertNew = 60, ViewUpdateNonKey = 61, ViewRename = 62, ViewMoveGroup = 63, ViewDelete = 64, ViewDeleteThenReuse = 65,   // 07: 60-79
     ViewDuplicateRetry = 66, ViewPointRead = 67, ViewPrefixScan = 68,
-    /* 09: 80-99, 11: 100-119 */
+    CCreate = 80, CUpdateNonKey = 81, CRename = 82, CMove = 83, CRemove = 84, CRemoveExisting = 85, CDeleteThenReuse = 86,   // 09: 80-99
+    TxnCreate = 100, TxnRename = 101, TxnMove = 102, TxnRemoveExisting = 103, TxnSelfCollidingCreates = 104, TxnUpdateNonKey = 105, AtomicBatch = 106,   // 11: 100-119
     ViewAckLV = 120, ViewAckAV = 121,                                                                   // 03: 120-139
 };
 enum class Entity : uint16_t {
@@ -22,6 +24,10 @@ enum class Entity : uint16_t {
     KeyNew = 20, KeyExisting = 21, KeyEarlierInBatch = 22, KeyRemovedEarlier = 23, KeyRejectedEarlier = 24, KeyBeforeIndex = 25,   // 05: 20-39
     P1U64 = 40, P4U64 = 41, P1U32 = 42, P2I64 = 43, AtReservationEdge = 44, NearMax = 45, Constrained = 46,                  // 06: 40-59
     KeyU16 = 60, KeyU32 = 61, KeyU64 = 62, KeyI64 = 63, KeyStr16 = 64, KeyComposite = 65, KeyCompositeWide = 66, KeyLower = 67, KeyMaxWidth = 68,   // 07: 60-79
+    G11Free = 80, G11Taken = 81, G12Free = 82, G12Taken = 83, OverFree = 84, OverTaken = 85, G11Self = 86, G12Self = 87, OverSelf = 88,   // 09: 80-99
+    DupOwner = 89, DupExtra = 90,
+    AllPass = 100, FailsUnique = 101, FailsCheck = 102, SecondPartitionNo = 103, KeyAbsent = 104, OutsideWriteSameKey = 105,   // 11: 100-119
+    OutsideWriteLockedRow = 106, RacingTxnSameName = 107,
     AckNoViews = 120, AckOneView = 121, AckTwoViewsLate = 122, AckTransientSource = 123,                 // 03: 120-139
 };
 enum class Timing : uint16_t {
@@ -30,6 +36,9 @@ enum class Timing : uint16_t {
     CreateOnNonEmpty, ReplaceDuringWrites, DropDuringWrites,
     TxnCommitBehind, TxnAbortBehind, LeaderLossParked, AckDeadline, StrictTier, GatewayRouted,           // appended for 03
     RetryAfterWindow,                                                                                    // appended for 04 (R04e)
+    CoordinatorFailoverVotesOut, VoterFailoverBeforeJudge, VoterFailoverAfterJudge, CoordinatorFailoverBeforeCommit,   // appended for 11
+    TimeoutDuringVote, TimeoutWhileLocked, AbortAfterYes,
+    ConstraintCreatedWhileOpen, ConstraintDroppedWhileOpen, ConstraintReplacedWhileOpen,
 };
 enum class Part : uint8_t { P03 = 3, P04 = 4, P05 = 5, P06 = 6, P07 = 7, P09 = 9, P11 = 11 };
 
@@ -61,6 +70,12 @@ enum class Check : uint8_t {
     RacingIds,            ///< 06 Racing x a create: the two batches' ids are disjoint and contiguous
     CollidingPair,        ///< 06 Racing / SelfCollidingBatch x an import, update or remove: the pair of verdicts of collidingCodes06
     AutoVerdict,          ///< 06 an import, update or remove: the trailer is verdict06
+    ConstraintTable,      ///< 09 Single: the trailer is the Single table's verdicts (single09), checked against the model
+    TxnTable,             ///< 11 Single: character's vote (and the later writer's verdict) is the Single table's (single11), checked against the model
+    TxnAborted,           ///< 11 TimeoutDuringVote, TimeoutWhileLocked, AbortAfterYes: nothing of the transaction is visible anywhere
+    TxnSameReply,         ///< 11 CoordinatorFailoverVotesOut, VoterFailoverAfterJudge: one TxnJudge per (producer, epoch) and an identical reply
+    TxnNewJudge,          ///< 11 VoterFailoverBeforeJudge: the cut TxnJudge is gone, one survives, and the answer equals Single's
+    TxnEveryPartition,    ///< 11 CoordinatorFailoverBeforeCommit: one vote reply per partition of the persisted set
 };
 
 struct Expected {
@@ -74,6 +89,7 @@ struct Expected {
 [[nodiscard]] inline bool isP05(const Cell& c) noexcept { return c.op >= Op::Insert && c.op < Op::AutoCreate1; }
 [[nodiscard]] inline bool isP06(const Cell& c) noexcept { return c.op >= Op::AutoCreate1 && c.op < static_cast<Op>(60); }
 
+[[nodiscard]] inline bool isP09(const Cell& c) noexcept { return c.op >= Op::CCreate && c.op <= Op::CDeleteThenReuse; }
 [[nodiscard]] inline bool isP07(const Cell& c) noexcept { return c.op >= Op::ViewUpsertNew && c.op <= Op::ViewPrefixScan; }
 
 [[nodiscard]] inline Expected expect03(const Cell& c) {
@@ -118,8 +134,6 @@ struct Expected {
 
 [[nodiscard]] inline Expected expect05(const Cell& c) {
     if (c.timing == Timing::ReplaceDuringWrites || c.timing == Timing::DropDuringWrites) return {false, "key.index is immutable (no replace or drop)"};
-    if (c.entity == Entity::KeyRejectedEarlier && (c.timing == Timing::TxnCommitBehind || c.timing == Timing::TxnAbortBehind))
-        return {false, "the TestReject member makes the source constrained, and transactions are refused there before Part G"};
     switch (c.timing) {
     case Timing::FailoverAppendHw: case Timing::TruncateTail: return {true, nullptr, Check::NotLeaderFirst};
     case Timing::LeaderLossParked: return {true, nullptr, Check::NotLeaderParked};
@@ -162,8 +176,6 @@ inline constexpr uint32_t kConstraintId06 = (7u << 16) | 1u;
 [[nodiscard]] inline Expected expect06(const Cell& c) {
     if ((c.timing == Timing::ReplaceDuringWrites || c.timing == Timing::DropDuringWrites) && c.entity != Entity::Constrained)
         return {false, "no constraint member to replace or drop"};
-    if ((c.timing == Timing::TxnCommitBehind || c.timing == Timing::TxnAbortBehind) && c.entity == Entity::Constrained)
-        return {false, "transactions are refused on a constrained source"};
     if (c.entity == Entity::NearMax && c.op == Op::AutoCreate8) return {true, nullptr, Check::AutoExhausted};
     if (c.entity == Entity::NearMax && c.op == Op::ImportAbove) return {true, nullptr, Check::ImportOutOfRange};
     switch (c.timing) {
@@ -195,7 +207,169 @@ inline constexpr uint32_t kConstraintId06 = (7u << 16) | 1u;
     return {};
 }
 
-[[nodiscard]] inline Expected expect(const Cell& c) { return isP07(c) ? expect07(c) : isP06(c) ? expect06(c) : isP05(c) ? expect05(c) : isP03(c) ? expect03(c) : expect04(c); }
+// ---- Part 09 (view constraints): 7 ops x 11 entities x 15 timings ----
+/// A character of the Part 09 scenarios.  id 0 = a key-0 create (the broker assigns the id); intent 1 = create, 2 = update, 0 = upsert.
+struct Char09 { uint64_t id = 0; uint64_t userId = 0; std::string name; int64_t lastPlayed = 0; uint8_t intent = 0; bool del = false; };
+/// `setup` is written before the constrained views exist (unjudged below their change records); `op` is the batch the cell sends.
+struct Scenario09 { std::vector<Char09> setup; std::vector<Char09> op; };
+
+inline constexpr uint64_t kUserU09 = 1, kUserW09 = 2, kUserV09 = 3;
+/// Source keys sit above the counter's first reservation, so the first setup write moves the counter past all of them.
+inline constexpr uint64_t kIdBase09 = 100000;
+inline constexpr uint32_t kNameCid09 = 7u << 16, kStatsCid09 = (8u << 16) | 1u;   ///< character_name (ordinal 0), account_stats (ordinal 1)
+
+[[nodiscard]] inline bool isDup09(Entity e) noexcept { return e == Entity::DupOwner || e == Entity::DupExtra; }
+[[nodiscard]] inline bool isSelf09(Entity e) noexcept { return e == Entity::G11Self || e == Entity::G12Self || e == Entity::OverSelf; }
+[[nodiscard]] inline bool isTaken09(Entity e) noexcept { return e == Entity::G11Taken || e == Entity::G12Taken || e == Entity::OverTaken; }
+
+[[nodiscard]] inline Scenario09 scenario09(Op op, Entity e) {
+    const auto id = [](uint64_t k) { return kIdBase09 + k; };
+    const int n = (e == Entity::G11Free || e == Entity::G11Taken || e == Entity::G11Self) ? 11
+                : (e == Entity::G12Free || e == Entity::G12Taken || e == Entity::G12Self) ? 12
+                : isDup09(e) ? 5 : 14;
+    Scenario09 s;
+    for (int k = 1; k <= n; ++k) s.setup.push_back({id(static_cast<uint64_t>(k)), kUserU09, "u" + std::to_string(k)});
+    if (isDup09(e)) {
+        s.setup[4].name = "Dup";
+        s.setup.push_back({id(9), kUserW09, "dup"});
+        s.setup.push_back({id(101), kUserW09, "w2"});
+        s.setup.push_back({id(102), kUserW09, "w3"});
+        if (e == Entity::DupOwner) s.setup.push_back({id(12), kUserW09, "DUP"});   // a second extra, so that the promoted one is the smallest of two
+    } else {
+        s.setup.push_back({id(101), kUserW09, isTaken09(e) ? "foo" : "w1"});
+        s.setup.push_back({id(102), kUserW09, "w2"});
+        s.setup.push_back({id(103), kUserW09, "w3"});
+    }
+    if (op == Op::CMove)
+        for (uint64_t k = 1; k <= 5; ++k) s.setup.push_back({id(200 + k), kUserV09, "v" + std::to_string(k)});
+
+    const Char09 c = e == Entity::DupOwner ? s.setup[4] : e == Entity::DupExtra ? s.setup[static_cast<std::size_t>(n)] : s.setup.front();
+    const Char09 moved = s.setup.size() > static_cast<std::size_t>(n) + 3 ? s.setup[static_cast<std::size_t>(n) + 3] : c;   // CMove: the first of V's
+    std::string x = isTaken09(e) ? (e == Entity::G11Taken ? "Foo" : "foo") : "Xnew";
+    if (isSelf09(e)) x = "U1";
+    if (isDup09(e)) x = op == Op::CRename ? "Renamed" : "DUP";
+    switch (op) {
+    case Op::CCreate: s.op = {{0, kUserU09, x, 0, 1}}; break;
+    case Op::CUpdateNonKey: s.op = {{c.id, c.userId, c.name, 777, 2}}; break;
+    case Op::CRename: s.op = {{c.id, c.userId, x, 0, 2}}; break;
+    case Op::CMove: s.op = {{moved.id, kUserU09, moved.name, 0, 2}}; break;
+    case Op::CRemove: s.op = {{c.id, 0, "", 0, 0, true}}; break;
+    case Op::CRemoveExisting: s.op = {{c.id, 0, "", 0, 2, true}}; break;
+    default: s.op = {{c.id, 0, "", 0, 0, true}, {0, kUserU09, c.name, 0, 1}}; break;   // CDeleteThenReuse
+    }
+    return s;
+}
+
+/// The verdict of one op record at the Single timing: Ok, N (character_name, ordinal 0) or M (account_stats, ordinal 1).
+enum class V09 : uint8_t { Ok, N, M };
+
+/// The Single table of the plan's Interaction matrix A, one entry per record of the op's batch; empty = the pair is not applicable.
+[[nodiscard]] inline std::vector<V09> single09(Op op, Entity e) {
+    constexpr V09 O = V09::Ok, N = V09::N, M = V09::M;
+    switch (op) {
+    case Op::CCreate:
+        switch (e) {
+        case Entity::G11Free: return {O};
+        case Entity::G12Free: case Entity::OverFree: return {M};
+        case Entity::G11Taken: case Entity::G12Taken: case Entity::OverTaken: case Entity::DupOwner: return {N};
+        default: return {};
+        }
+    case Op::CUpdateNonKey:
+        return isSelf09(e) || isDup09(e) ? std::vector<V09>{O} : std::vector<V09>{};
+    case Op::CRename:
+        switch (e) {
+        case Entity::G11Taken: case Entity::G12Taken: case Entity::OverTaken: return {N};
+        default: return {O};
+        }
+    case Op::CMove:
+        switch (e) {
+        case Entity::G11Self: return {O};
+        case Entity::G12Self: case Entity::OverSelf: return {M};
+        default: return {};
+        }
+    case Op::CRemove: case Op::CRemoveExisting:
+        return isSelf09(e) || isDup09(e) ? std::vector<V09>{O} : std::vector<V09>{};
+    case Op::CDeleteThenReuse:
+        switch (e) {
+        case Entity::G11Self: case Entity::G12Self: return {O, O};
+        case Entity::OverSelf: return {O, M};
+        case Entity::DupOwner: return {O, N};
+        default: return {};
+        }
+    default: return {};
+    }
+}
+
+// ---- Part 11 (transaction votes): the Single table ----
+/// A verdict of the Single table: Ok, N (character_name), M (account_stats), K (KeyNotFound) or C (TxnConflict).
+enum class V11 : uint8_t { Ok, N, M, K, C };
+
+/// The Single table of the plan's Interaction matrix A: `character`'s verdict of the transaction (or atomic batch) and, for OutsideWriteLockedRow, of
+/// producer 78's create after the vote; for RacingTxnSameName, of the second transaction (the second batch).  Empty = the pair is not applicable.
+/// The ledger partition's own vote (SecondPartitionNo) is not `character`'s.
+[[nodiscard]] inline std::vector<V11> single11(Op op, Entity e) {
+    constexpr V11 O = V11::Ok, N = V11::N, M = V11::M, K = V11::K, C = V11::C;
+    const bool create = op == Op::TxnCreate || op == Op::TxnSelfCollidingCreates;
+    switch (e) {
+    case Entity::AllPass: return {op == Op::TxnSelfCollidingCreates ? N : O};
+    case Entity::SecondPartitionNo: return op == Op::AtomicBatch ? std::vector<V11>{} : std::vector<V11>{op == Op::TxnSelfCollidingCreates ? N : O};
+    case Entity::FailsUnique: return {op == Op::TxnCreate || op == Op::TxnRename || op == Op::AtomicBatch || op == Op::TxnSelfCollidingCreates ? N : O};
+    case Entity::FailsCheck: return {create || op == Op::TxnMove || op == Op::AtomicBatch ? M : O};
+    case Entity::KeyAbsent: return create || op == Op::AtomicBatch ? std::vector<V11>{} : std::vector<V11>{K};
+    case Entity::OutsideWriteSameKey: return create || op == Op::AtomicBatch ? std::vector<V11>{} : std::vector<V11>{C};
+    case Entity::OutsideWriteLockedRow:
+        switch (op) {
+        case Op::TxnCreate: case Op::TxnMove: return {O, M};
+        case Op::TxnSelfCollidingCreates: return {N, O};
+        case Op::AtomicBatch: return {M, O};
+        default: return {O, O};
+        }
+    default:   // RacingTxnSameName
+        switch (op) {
+        case Op::TxnCreate: case Op::TxnRename: return {O, N};
+        case Op::TxnMove: return {O, M};
+        case Op::TxnRemoveExisting: return {O, K};
+        case Op::TxnSelfCollidingCreates: return {N, O};
+        case Op::AtomicBatch: return {O, N};
+        default: return {O, O};
+        }
+    }
+}
+
+[[nodiscard]] inline Expected expect09(const Cell& c) {
+    if (c.op == Op::CCreate && (isSelf09(c.entity) || c.entity == Entity::DupExtra))
+        return {false, c.entity == Entity::DupExtra ? "the duplicate's name is the DupOwner cell" : "a new record owns no name yet"};
+    if ((c.op == Op::CUpdateNonKey || c.op == Op::CRemove || c.op == Op::CRemoveExisting || c.op == Op::CDeleteThenReuse) && c.entity <= Entity::OverTaken)
+        return {false, "the op keeps C's own name"};
+    if (c.op == Op::CDeleteThenReuse && c.entity == Entity::DupExtra) return {false, "covered by CRemove x DupExtra"};
+    if (c.op == Op::CMove && !isSelf09(c.entity)) return {false, "a move keeps the name; the entity names the target group"};
+    if (c.timing == Timing::RetryAfterWindow) return {true, nullptr, Check::RetryOutsideWindow};
+    return {true, nullptr, c.timing == Timing::Single ? Check::ConstraintTable : Check::Trailer};
+}
+
+[[nodiscard]] inline bool isP11(const Cell& c) noexcept { return c.op >= Op::TxnCreate && c.op <= Op::AtomicBatch; }
+
+/// The seven timings that vote or end a transaction: an atomic batch has neither.
+[[nodiscard]] inline bool isVoteTiming11(Timing t) noexcept { return t >= Timing::CoordinatorFailoverVotesOut && t <= Timing::AbortAfterYes; }
+
+[[nodiscard]] inline Expected expect11(const Cell& c) {
+    const bool create = c.op == Op::TxnCreate || c.op == Op::TxnSelfCollidingCreates;
+    const bool batch = c.op == Op::AtomicBatch;
+    if (batch && isVoteTiming11(c.timing)) return {false, "an atomic batch has no vote and no marker"};
+    if (batch && c.entity == Entity::SecondPartitionNo) return {false, "an atomic batch lives on one partition"};
+    if ((create || batch) && (c.entity == Entity::KeyAbsent || c.entity == Entity::OutsideWriteSameKey))
+        return {false, "a key-0 create's id is new; no earlier key and no outside write can hit it"};
+    switch (c.timing) {
+    case Timing::TimeoutDuringVote: case Timing::TimeoutWhileLocked: case Timing::AbortAfterYes: return {true, nullptr, Check::TxnAborted};
+    case Timing::CoordinatorFailoverVotesOut: case Timing::VoterFailoverAfterJudge: return {true, nullptr, Check::TxnSameReply};
+    case Timing::VoterFailoverBeforeJudge: return {true, nullptr, Check::TxnNewJudge};
+    case Timing::CoordinatorFailoverBeforeCommit: return {true, nullptr, Check::TxnEveryPartition};
+    case Timing::Single: return {true, nullptr, Check::TxnTable};
+    default: return {true, nullptr, Check::Trailer};
+    }
+}
+
+[[nodiscard]] inline Expected expect(const Cell& c) { return isP11(c) ? expect11(c) : isP09(c) ? expect09(c) : isP07(c) ? expect07(c) : isP06(c) ? expect06(c) : isP05(c) ? expect05(c) : isP03(c) ? expect03(c) : expect04(c); }
 
 [[nodiscard]] inline std::vector<Cell> cellsFor(Part part) {
     std::vector<Cell> out;
@@ -236,6 +410,21 @@ inline constexpr uint32_t kConstraintId06 = (7u << 16) | 1u;
                                                             : std::vector<Timing>(std::begin(writes), std::end(writes));
                 for (const Timing t : ts) out.push_back({o, static_cast<Entity>(e), t});
             }
+    } else if (part == Part::P09) {
+        const Timing t09[] = {Timing::Single, Timing::BackToBack, Timing::SelfCollidingBatch, Timing::Racing, Timing::RetryBeforeJudge, Timing::RetryAfterJudge,
+                              Timing::FailoverAppendHw, Timing::FailoverHwFold, Timing::FailoverFoldMarker, Timing::TruncateTail, Timing::RestartDuringRebuild,
+                              Timing::CreateOnNonEmpty, Timing::ReplaceDuringWrites, Timing::DropDuringWrites, Timing::RetryAfterWindow};
+        for (uint16_t op = static_cast<uint16_t>(Op::CCreate); op <= static_cast<uint16_t>(Op::CDeleteThenReuse); ++op)
+            for (uint16_t e = static_cast<uint16_t>(Entity::G11Free); e <= static_cast<uint16_t>(Entity::DupExtra); ++e)
+                for (const Timing t : t09) out.push_back({static_cast<Op>(op), static_cast<Entity>(e), t});
+    } else if (part == Part::P11) {
+        const Timing t11[] = {Timing::Single, Timing::FailoverHwFold, Timing::RestartDuringRebuild,
+                              Timing::CoordinatorFailoverVotesOut, Timing::VoterFailoverBeforeJudge, Timing::VoterFailoverAfterJudge, Timing::CoordinatorFailoverBeforeCommit,
+                              Timing::TimeoutDuringVote, Timing::TimeoutWhileLocked, Timing::AbortAfterYes,
+                              Timing::ConstraintCreatedWhileOpen, Timing::ConstraintDroppedWhileOpen, Timing::ConstraintReplacedWhileOpen};
+        for (uint16_t op = static_cast<uint16_t>(Op::TxnCreate); op <= static_cast<uint16_t>(Op::AtomicBatch); ++op)
+            for (uint16_t e = static_cast<uint16_t>(Entity::AllPass); e <= static_cast<uint16_t>(Entity::RacingTxnSameName); ++e)
+                for (const Timing t : t11) out.push_back({static_cast<Op>(op), static_cast<Entity>(e), t});
     } else if (part == Part::P04) {
         for (uint16_t op = 0; op <= static_cast<uint16_t>(Op::DeleteFreesCap); ++op)
             for (uint16_t e = 0; e <= static_cast<uint16_t>(Entity::OldWriters); ++e) {
@@ -282,7 +471,12 @@ inline const char* nameOf(Op o) {
     case Op::ViewUpsertNew: return "ViewUpsertNew"; case Op::ViewUpdateNonKey: return "ViewUpdateNonKey"; case Op::ViewRename: return "ViewRename";
     case Op::ViewMoveGroup: return "ViewMoveGroup"; case Op::ViewDelete: return "ViewDelete"; case Op::ViewDeleteThenReuse: return "ViewDeleteThenReuse";
     case Op::ViewDuplicateRetry: return "ViewDuplicateRetry"; case Op::ViewPointRead: return "ViewPointRead"; case Op::ViewPrefixScan: return "ViewPrefixScan";
-    case Op::ImportAbove: return "ImportAbove"; case Op::UpdateAssigned: return "UpdateAssigned"; case Op::RemoveExistingAssigned: return "RemoveExistingAssigned"; case Op::ViewAckLV: return "ViewAckLV"; case Op::ViewAckAV: return "ViewAckAV";
+    case Op::ImportAbove: return "ImportAbove"; case Op::UpdateAssigned: return "UpdateAssigned"; case Op::RemoveExistingAssigned: return "RemoveExistingAssigned"; case Op::CCreate: return "CCreate"; case Op::CUpdateNonKey: return "CUpdateNonKey"; case Op::CRename: return "CRename"; case Op::CMove: return "CMove";
+    case Op::CRemove: return "CRemove"; case Op::CRemoveExisting: return "CRemoveExisting"; case Op::CDeleteThenReuse: return "CDeleteThenReuse";
+    case Op::TxnCreate: return "TxnCreate"; case Op::TxnRename: return "TxnRename"; case Op::TxnMove: return "TxnMove";
+    case Op::TxnRemoveExisting: return "TxnRemoveExisting"; case Op::TxnSelfCollidingCreates: return "TxnSelfCollidingCreates";
+    case Op::TxnUpdateNonKey: return "TxnUpdateNonKey"; case Op::AtomicBatch: return "AtomicBatch";
+    case Op::ViewAckLV: return "ViewAckLV"; case Op::ViewAckAV: return "ViewAckAV";
     }
     return "?";
 }
@@ -292,6 +486,13 @@ inline const char* nameOf(Entity e) {
     case Entity::FilteredSubscription: return "FilteredSubscription"; case Entity::ReplayFromStart: return "ReplayFromStart";
     case Entity::OtherViews: return "OtherViews"; case Entity::TwoVerdictViews: return "TwoVerdictViews";
     case Entity::ViewAckWriter: return "ViewAckWriter"; case Entity::OldWriters: return "OldWriters";
+    case Entity::G11Free: return "G11Free"; case Entity::G11Taken: return "G11Taken"; case Entity::G12Free: return "G12Free"; case Entity::G12Taken: return "G12Taken";
+    case Entity::OverFree: return "OverFree"; case Entity::OverTaken: return "OverTaken"; case Entity::G11Self: return "G11Self"; case Entity::G12Self: return "G12Self";
+    case Entity::OverSelf: return "OverSelf"; case Entity::DupOwner: return "DupOwner"; case Entity::DupExtra: return "DupExtra";
+    case Entity::AllPass: return "AllPass"; case Entity::FailsUnique: return "FailsUnique"; case Entity::FailsCheck: return "FailsCheck";
+    case Entity::SecondPartitionNo: return "SecondPartitionNo"; case Entity::KeyAbsent: return "KeyAbsent";
+    case Entity::OutsideWriteSameKey: return "OutsideWriteSameKey"; case Entity::OutsideWriteLockedRow: return "OutsideWriteLockedRow";
+    case Entity::RacingTxnSameName: return "RacingTxnSameName";
     case Entity::AckNoViews: return "AckNoViews"; case Entity::AckOneView: return "AckOneView";
     case Entity::AckTwoViewsLate: return "AckTwoViewsLate"; case Entity::AckTransientSource: return "AckTransientSource";
     case Entity::KeyNew: return "KeyNew"; case Entity::KeyExisting: return "KeyExisting"; case Entity::KeyEarlierInBatch: return "KeyEarlierInBatch";
@@ -318,6 +519,11 @@ inline const char* nameOf(Timing t) {
     case Timing::LeaderLossParked: return "LeaderLossParked"; case Timing::AckDeadline: return "AckDeadline";
     case Timing::StrictTier: return "StrictTier"; case Timing::GatewayRouted: return "GatewayRouted";
     case Timing::RetryAfterWindow: return "RetryAfterWindow";
+    case Timing::CoordinatorFailoverVotesOut: return "CoordinatorFailoverVotesOut"; case Timing::VoterFailoverBeforeJudge: return "VoterFailoverBeforeJudge";
+    case Timing::VoterFailoverAfterJudge: return "VoterFailoverAfterJudge"; case Timing::CoordinatorFailoverBeforeCommit: return "CoordinatorFailoverBeforeCommit";
+    case Timing::TimeoutDuringVote: return "TimeoutDuringVote"; case Timing::TimeoutWhileLocked: return "TimeoutWhileLocked"; case Timing::AbortAfterYes: return "AbortAfterYes";
+    case Timing::ConstraintCreatedWhileOpen: return "ConstraintCreatedWhileOpen"; case Timing::ConstraintDroppedWhileOpen: return "ConstraintDroppedWhileOpen";
+    case Timing::ConstraintReplacedWhileOpen: return "ConstraintReplacedWhileOpen";
     }
     return "?";
 }

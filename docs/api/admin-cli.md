@@ -90,9 +90,12 @@ Prints the counters of every partition of a topic or view, each read from the pa
 | `--broker host:port` | Any broker (or `RUNE_BROKER`). |
 
 Text: a `partition N` line, then one `<name> <value>` line per reported counter in id order and one `constraint <name> <rejections>`
-line per constraint, labelled `<view>.unique` or `<view>.<constraint name>`. A view's constraint counts are the rejections its source
+line per constraint, labelled `<view>.unique` or `<view>.<constraint name>` (`constraint character_name.unique 3`,
+`constraint account_stats.max_characters 1`), or `0x%08x` of the constraint id when no view definition names it. A view that was dropped or replaced
+still gives its name. `rune stats view <unique view>` also prints `uniqueConflicts`, the number of extra claimants that share a key with its owner. A view's constraint counts are the rejections its source
 partition's judge recorded, so `rune stats view` reads the source partition too. A counter the partition does not have is not printed,
 and a partition with none prints `(no counters)`.
+A topic that is a verdict source also prints the transaction vote counters, ids 11 to 20 (`txnVotesYes` to `txnMarkerWithoutVote`); see the [wire protocol](wire-protocol.md#stats-client-version-17).
 
 ```text
 $ rune stats topic character --broker rune-1:40200
@@ -107,6 +110,16 @@ $ rune stats topic character --broker rune-1:40200
     autoIncrementCounter 1049
     autoIncrementReservedThrough 4097
     autoIncrementIdsBurned 0
+    txnVotesYes 0
+    txnVotesNo 0
+    txnVotesNoConstraintViolation 0
+    txnVotesNoKeyExists 0
+    txnVotesNoKeyNotFound 0
+    txnVotesNoTxnTooLarge 0
+    txnVoteLatencyNsMax 0
+    txnVoteLatencyNsTotal 0
+    foldPausedOnTxnLockNs 0
+    txnMarkerWithoutVote 0
 ```
 
 JSON, with the same names and the constraints as `{constraintId, label, rejections}`:

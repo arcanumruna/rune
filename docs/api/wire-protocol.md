@@ -35,7 +35,7 @@ feature's version in the older way; an authentication-enabled broker answers a `
 | 9 | Authentication: frames 12 to 15, 79 and 80, error codes 44 to 47. |
 | 10 | `TxnOffsetCommit` member block (`generationId`, `memberId` after the entries; KIP-447); `UnstableOffsetCommit` (50). An older broker ignores the block; a broker answers a session below 10 `NotCoordinator` instead of 50. |
 | 11 | Subscription filters: the optional filter trailer on `Subscribe` and `JoinGroup`, the refusal `detail` trailer on their responses (broker version 6). |
-| 17 | Checked writes (broker version 10): the `Produce` `acks` byte carries bit 1 (`View`), `ProduceResponse` carries `assignedBase` and an optional verdict trailer, and error codes 55 to 61 exist. A session below 17 is never sent 55 to 61 (it is answered `InvalidRequest`) and keeps the 46-byte `ProduceResponse`. |
+| 17 | Checked writes (broker version 10): the `Produce` `acks` byte carries bit 1 (`View`), `ProduceResponse` carries `assignedBase` and an optional verdict trailer, the `EndTxnResponse` vote trailer, and error codes 55 to 63 exist. A session below 17 is never sent 55 to 63 (it is answered `InvalidRequest`) and keeps the 46-byte `ProduceResponse` and the 26-byte `EndTxnResponse`. |
 
 ## Frame catalogue
 
@@ -91,7 +91,7 @@ security 64 to 95.
 | 51 | `TxnOffsetCommit` | C→B | `producerId`, `producerEpoch`, `transactionalId`, `groupId`, `entries`, then optionally (client 10) `generationId` i32 + `memberId` |
 | 52 | `TxnOffsetCommitResponse` | B→C | `results` |
 | 53 | `EndTxn` | C→B | `producerId`, `producerEpoch`, `commit`, `transactionalId` |
-| 54 | `EndTxnResponse` | B→C | `errorCode` |
+| 54 | `EndTxnResponse` | B→C | `errorCode`, then (v17, only after a no vote) `constraintId`, `failingOffset` |
 | 64 | `DefineTopic` | C→B | `topicName`, `partitionCount`, `keyField`, `validate` (sent as 1 for a typed topic; a broker of this version ignores it, typed topics always validate), `descriptorBlob`, `persistence`, `replicationFactor`, DDL extension, key features (optional; sent only when the features are not the defaults, and only to a broker of version 10 or later) |
 | 65 | `DefineTopicResponse` | B→C | `topicId`, `version`, `errorCode` |
 | 66 | `GetTopicSchema` | C→B | `topicName`, `requestedFingerprint` (0 = latest; `~0` = the evolving lineage) |
@@ -149,7 +149,7 @@ The `recordBatch` of `Produce` and `Records` is the on-disk batch, Kafka v2 layo
 | 12 | `partitionLeaderEpoch` (excluded from the CRC) | i32 |
 | 16 | `magic` (always `2`) | i8 |
 | 17 | `crc` (CRC-32C from offset 21 to the end) | u32 |
-| 21 | `attributes` (bit 4 transactional, bit 5 control, bit 6 delete horizon in `baseTimestamp`) | i16 |
+| 21 | `attributes` (bit 4 transactional, bit 5 control, bit 6 delete horizon in `baseTimestamp`, bit 7 atomic) | i16 |
 | 23 | `lastOffsetDelta` | i32 |
 | 27 | `baseTimestamp` (epoch **milliseconds**) | i64 |
 | 35 | `maxTimestamp` (epoch milliseconds) | i64 |
@@ -229,19 +229,52 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
   the original `baseOffset` and the original verdicts once the committed watermark W has passed the batch; a retry outside
   the window on a verdict source is answered `DuplicateSequence` (21) with no trailer. An ack with more than one claim
   (thousands of rejections, up to 32,824 bytes) is offered rather than claimed; ack publications have a term of at least 512 KiB.
-- **Control records 16 to 19** are control batches with producer id -1 in the log: 16 reservation, 17 verdict marker,
-  18 constraint-set change, 19 transaction judge. Consumers never receive them and the transaction readers ignore them.
+- **Control records 16 to 20** are control batches with producer id -1 in the log: 16 reservation, 17 verdict marker,
+  18 constraint-set change, 19 transaction judge, 20 verdict plan. Consumers never receive them and the transaction readers ignore them.
+- **Transaction judge record** (type 19, `kTxnJudge`): the value is `[version u8 = 1][producerId i64][producerEpoch i16][firstOffset i64]`
+  (little-endian, 19 bytes; the record key is the type). The leader appends it when it has the coordinator's vote request for the transaction; the
+  judge reads everything from `firstOffset` up to it as one unit, and the commit or abort marker then finalizes the verdict.
+  The cleaner keeps the ones a restart or a new leader still needs to judge an undecided transaction.
+- **Atomic batch** (`attributes` bit 7, `kAttrAtomic`): on a verdict source the batch is all or nothing on its partition. If any
+  record is rejected, every record is, and a `View` ack carries one trailer entry (`recordIndex` 0). A session below 17 never sets it.
+- **`EndTxnResponse` vote trailer** (client version 17): when a commit is voted no, the 26-byte frame grows to 38 bytes
+  (`blockLength` 14). A session below 17, and every answer that is not a vote, keeps the 26-byte frame.
+
+  | Offset (body) | Size | Field |
+  |---|---|---|
+  | 0 | 2 | `errorCode`: the vote, 55, 56, 57, 62 or 63 |
+  | 2 | 4 | `constraintId` (`viewObjectId << 16 \| ordinal`; 0 when the code names none) |
+  | 6 | 8 | `failingOffset`: the log offset of the record that failed, -1 for none |
+
+  After a no the transaction is already aborted on every partition.
+- **Verdict plan record** (type 20, `kVerdictPlan`): the plan of a `unique` or `check` view that joins a verdict source, appended just
+  below its constraint-set change record so that every leader judges with the same plan. The value is little-endian, at most 65,536 bytes
+  in all (a larger plan is refused at DDL):
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | 1 | version, 1 |
+  | 1 | 8 | `viewObjectId` |
+  | 9 | 8 | `planFingerprint` |
+  | 17 | 1 | `kind` (2 `unique`, 3 `check`) |
+  | 18 | 4 + n | `planLen`, then the serialized plan |
+  | | 4 + n | `outLen`, then the output descriptor |
+  | | 4 + n | `srcLen`, then the source descriptor |
+
+  The cleaner keeps type-20 records. Consumers never receive them.
 - **Reservation record** (type 16): the payload is `[version u8][reservedThroughN u64]`. An autoincrement leader appends
   it before it hands out ids above the last reserved `n`; a new leader starts above the highest one it reads. Every reader
   skips it, so it never reaches a consumer.
 - **Limits and refusals**: the client sends at most 4096 records in a `View` batch (a verdict source refuses more). A `View` produce is answered `InvalidRequest` on the
   legacy gateway stream, while the cluster feature level is below checked writes, or without a replica to fold from. A
-  `View` bit on a transactional batch is ignored. Error codes 55 to 61 are sent only to sessions at 17 or above.
+  `View` bit on a transactional batch is ignored: the transaction commit carries the verdict. An atomic batch with more records than
+  `RUNE_TXN_JUDGED_RECORDS_MAX` on a verdict source is answered `InvalidRequest` (39). Error codes 55 to 63 are sent only to sessions at 17 or above.
 - **Intents** (record `attributes` bits 0-1, see [Record batch](#record-batch-v2)) are judged against the topic's key
   index when the batch is folded, in offset order, each record against the accepted records before it. A rejected intent
-  is a `View` trailer entry with `code` 56 or 57 and `constraintId` 0. An intent is refused with `InvalidRequest` on a
-  topic without `key.index`, on the legacy gateway stream, below feature level 5, without an idempotent producer and the
-  `View` bit, or inside a transaction or an atomic batch. While a new key index has not yet been logged in the partition's constraint set
+  is a `View` trailer entry with `code` 56 or 57 and `constraintId` 0. In a transaction it is judged at the vote and a no names
+  its code in the `EndTxnResponse`. An intent is refused with `InvalidRequest` on a
+  topic without `key.index`, on the legacy gateway stream, below feature level 5, or without an idempotent producer and either
+  the `View` bit or a transaction. While a new key index has not yet been logged in the partition's constraint set
   the broker answers `NotLeader` (retriable). Plain upserts and deletes need none of this and are never rejected by the
   key index.
 - On an untyped (raw) topic the broker stores the record intent bits as sent and does not interpret them.
@@ -301,8 +334,7 @@ while the cluster is below the checked-writes feature level.
   prefix of the wrong width and a token of the wrong length are `InvalidRequest`.
 - Error codes 59 to 61 are `CreateView` refusals sent to sessions at 17 or above: 59 `ViewKeyExpressionInvalid` (a key
   component that does not compile: a type that is not an integer, enum, bool or `string(N)`, `lower()` on a type other than
-  `string(N)`, a duplicate component, a key wider than 128 bytes), 60 `ViewConstraintInvalid` and 61 `ViewUniqueInvalid`. `check` and `unique`
-  clauses are refused (60 and 61) until the view-constraint engine ships.
+  `string(N)`, a duplicate component, a key wider than 128 bytes), 60 `ViewConstraintInvalid` and 61 `ViewUniqueInvalid`.
 - A view whose key is not exactly the source key needs a source with one partition (`ViewNotCoPartitioned`).
 
 ## Encrypted frames (TLS 1.3 / AEAD)
@@ -330,7 +362,7 @@ topic or view. The leader's owning worker answers, so a read costs about as much
   out of range, a client below 17), 6 busy (the worker ring is full), 45 not authorized. Status 2 is never sent: a broker that does
   not lead the partition, or leads a view that is not ready yet, answers an `ErrorResponse` `Redirect` (3) or `NotLeader` (2) and the
   client follows it as it does for `GetViewRow`.
-- **An id is present only when the counter exists** on the partition: a topic without a judge reports none of ids 1 to 7, one
+- **An id is present only when the counter exists** on the partition: a topic without a judge reports none of ids 1 to 7 and 11 to 20, one
   without `autoincrement` none of 8 to 10, so a client asks `StatsResult::get(id)` and treats an absent id as "not applicable".
 
 | Id | Name | Scope | Meaning |
@@ -345,8 +377,17 @@ topic or view. The leader's owning worker answers, so a read costs about as much
 | 8 | `autoIncrementCounter` | topic | The next id the partition would assign. |
 | 9 | `autoIncrementReservedThrough` | topic | The highest id reserved in the log (0 = none). |
 | 10 | `autoIncrementIdsBurned` | topic | Ids taken and never stored: a refused or failed batch, a reservation a failover left unused. |
-| 11 to 20 | transaction vote counters | topic | Defined, not reported yet (the transaction judge, Part 09). |
-| 32 | `uniqueConflicts` | view | Defined, not reported yet (the view-constraint engine, Part 09). |
+| 11 | `txnVotesYes` | topic | Transaction votes answered yes. |
+| 12 | `txnVotesNo` | topic | Transaction votes answered no. |
+| 13 | `txnVotesNoConstraintViolation` | topic | No votes with `ConstraintViolation` (55). |
+| 14 | `txnVotesNoKeyExists` | topic | No votes with `KeyExists` (56). |
+| 15 | `txnVotesNoKeyNotFound` | topic | No votes with `KeyNotFound` (57). |
+| 16 | `txnVotesNoTxnTooLarge` | topic | No votes with `TxnTooLarge` (62). |
+| 17 | `txnVoteLatencyNsMax` | topic | The longest wait from a vote request to its answer, in nanoseconds. |
+| 18 | `txnVoteLatencyNsTotal` | topic | The sum of those waits. |
+| 19 | `foldPausedOnTxnLockNs` | topic | Nanoseconds the judge paused other writers' verdicts on a row a transaction had locked. |
+| 20 | `txnMarkerWithoutVote` | topic | Transaction markers that arrived with no vote taken. A coordinator-bug alarm: it stays 0. |
+| 32 | `uniqueConflicts` | view | Extra claimants of a `unique` view's keys: live source records that share a key with its owner. Reported for a `unique` view only. |
 | 33 | `scanRows` | view | Rows returned by scans. |
 | 34 | `scanPages` | view | `ScanViewRows` pages served. |
 | 35 | `transientRecordsEvicted` | view | Records a transient source dropped before the view folded them. |
@@ -418,8 +459,13 @@ rejection counts of a topic's verdict source, `constraintId = viewObjectId << 16
 | 57 | `KeyNotFound` | Client 17: `update` or delete-existing on a key that is absent. Never visible. | per-record verdict of a `View` ack |
 | 58 | `AutoIncrementExhausted` | Client 17: the counter reached `autoincrement.max`. Nothing is stored and the counter is unchanged. | not retried |
 | 59 | `ViewKeyExpressionInvalid` | Client 17: a view key expression does not compile (a bad type, `lower()` on a non-string, a duplicate or over-wide key, the identity rule). | DDL compile error |
-| 60 | `ViewConstraintInvalid` | Client 17: a `check` constraint does not compile. Until the view-constraint engine ships, any view with a `check`. | DDL compile error |
-| 61 | `ViewUniqueInvalid` | Client 17: a `unique` clause does not compile. Until the view-constraint engine ships, any `unique` view. | DDL compile error |
+| 60 | `ViewConstraintInvalid` | Client 17: a `check` that does not compile, or a constraint limit (32 verdict views, object id 65536 or above, plan record over 65,536 bytes). | DDL compile error |
+| 61 | `ViewUniqueInvalid` | Client 17: a `unique` clause does not compile. | DDL compile error |
+| 62 | `TxnTooLarge` | Client 17: a transaction has more records on a partition than `RUNE_TXN_JUDGED_RECORDS_MAX`. The whole transaction aborts. | vote in `EndTxnResponse`, or the `Produce` that takes it past the limit |
+| 63 | `TxnConflict` | Client 17: another writer wrote one of the transaction's keys after its write and before its commit. The whole transaction aborts. | vote in `EndTxnResponse` |
+| 64 | `LeaseNotFound` | Client 18: no live lease for the key, or a lease at a different version. A session below 18 is answered `InvalidRequest` (39). | per-record verdict of a `View` ack on a lease topic, or a `LeaseKeepAlive` entry |
+| 65 | `LeaseLimitExceeded` | Client 18: the topic's `lease.max_keys` or the namespace's max leases is reached. | per-record verdict of a grant |
+| 66 | `LeaseTtlTooLarge` | Client 18: the requested TTL is above the topic's `lease.max_ttl`. | `Produce` / `LeaseKeepAlive` error |
 
 The broker-internal storage errors (`rune::protocol::ErrorCode`, [`Errors.h`](../../protocol/include/rune/protocol/Errors.h))
 are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRecord`=2, `InvalidRecordBatch`=3,
@@ -432,6 +478,11 @@ are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRe
   `InternalIsr`, `InternalIsrAck`, `OffsetsForLeaderEpochRequest`/`Response`, `ReconcileFetchRequest`/`Response`. Broker to
   broker only; inter-broker frames are sealed with the cluster key
   ([operations](../operations.md#the-cluster-key)).
+- **Transaction vote** (cluster plane, `schemaId 112`, hand-rolled little-endian blocks after the 8-byte header): template 15
+  `TxnVote`, coordinator to partition leader (40-byte block: `coordinatorNodeId`, `coordinatorEpoch`, `token`, `topicId`,
+  `partition`, `producerId`, `producerEpoch`, `leaderEpoch`), and template 16 `TxnVoteResponse`, leader to coordinator (48-byte
+  block: `token`, `topicId`, `partition`, `producerId`, `coordinatorEpoch`, `producerEpoch`, `errorCode` for the transport,
+  `code` for the vote, `constraintId`, `failingOffset`).
 - **Internal ring** (`schemaId 7`, SBE, `schema/rune-internal-ring.xml`): messages between threads of one process
   (`WorkerOp`, `WorkerReturn`, `FlushRequest`, `FlushCompletion`). They never cross a wire.
 - **Conformance vectors**: `protocol/conformance/` holds generated golden vectors for the client frames; see its

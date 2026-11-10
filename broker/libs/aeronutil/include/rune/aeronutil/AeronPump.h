@@ -14,11 +14,57 @@
 //     reported a registration error) stops resolve() on the next check.
 #include <Aeron.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <thread>
 
 namespace rune::aeronutil {
+
+/// Fused startup: the starter thread and the interim pump thread share ONE invoker-mode Aeron client, whose
+/// add* / find* / invoke are not mutually thread-safe (an unlocked append to the conductor's registering list can
+/// race its compaction and lose a registration, whose driver answer is then ignored forever).  The starter holds
+/// the gate while it works, AeronPump::resolve drops it around its sleeps, and the pump thread invokes the client
+/// only while it can take the gate.  Spin-based so a different thread may release a hold (stop paths).
+class StartupClientGate {
+public:
+    /// Pump thread: true = the client is yours for one invoke; unlock() afterwards.
+    [[nodiscard]] bool tryLock() noexcept { return !busy_.exchange(true, std::memory_order_acquire); }
+    void unlock() noexcept { busy_.store(false, std::memory_order_release); }
+
+    /// Starter thread: hold the gate until release() (resolve() lets go around its sleeps).
+    void acquire() noexcept {
+        while (!tryLock()) std::this_thread::yield();
+        holder_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        held() = this;
+    }
+    /// Idempotent; also valid from another thread than the holder.
+    void release() noexcept {
+        if (held() == this) held() = nullptr;   // the TLS pointer must not outlive the gate's owner
+        if (holder_.exchange(std::thread::id{}, std::memory_order_relaxed) != std::thread::id{}) unlock();
+    }
+    /// The gate this thread currently holds, else nullptr.
+    [[nodiscard]] static StartupClientGate* heldHere() noexcept {
+        StartupClientGate* g = held();
+        return g && g->holder_.load(std::memory_order_relaxed) == std::this_thread::get_id() ? g : nullptr;
+    }
+
+    /// Lets the pump thread through for a long non-client stall of the holder, then takes the gate back.
+    class Yield {
+    public:
+        Yield() noexcept : gate_(heldHere()) { if (gate_) gate_->release(); }
+        ~Yield() { if (gate_) gate_->acquire(); }
+        Yield(const Yield&) = delete;
+        Yield& operator=(const Yield&) = delete;
+    private:
+        StartupClientGate* gate_;
+    };
+
+private:
+    static StartupClientGate*& held() noexcept { thread_local StartupClientGate* g = nullptr; return g; }
+    std::atomic<bool>           busy_{false};
+    std::atomic<std::thread::id> holder_{};
+};
 
 class AeronPump {
 public:
@@ -41,13 +87,19 @@ public:
         return w;
     }
 
-    /// "No deadline of our own": resolve until Aeron ANSWERS — find yields, a registration error is
-    /// reported (find throws / sets `failed`), or the driver refuses the pump.  The bound is Aeron's:
-    /// ClientConductor::find* throws DriverTimeoutException once a registration is older than the
-    /// client's driverTimeoutMs (default 10 s, wall clock), in threaded AND invoker modes.  Production
-    /// startup resolves use this instead of Rune's own tighter 5 s cap, which made a loaded node refuse
-    /// to start (D8 2026-10-03).  Pass exactly kUntilAnswered (any other huge budget overflows).
+    /// "No budget of our own": resolve until Aeron ANSWERS — find yields, a registration error is
+    /// reported (find throws / sets `failed`), or the driver refuses the pump.  Aeron's own bound
+    /// (DriverTimeoutException after driverTimeoutMs) is 1 h in-process, so kUntilAnswered is capped by
+    /// startupDeadline() (default 60 s, well past a loaded node's D8 2026-10-03 start): a registration whose
+    /// answer never arrives fails loudly (deadlineExpired()) instead of hanging.  Pass exactly kUntilAnswered
+    /// (any other huge budget overflows).
     static constexpr std::chrono::milliseconds kUntilAnswered = std::chrono::milliseconds::max();
+    static constexpr std::chrono::milliseconds kDefaultStartupDeadline{60'000};
+
+    AeronPump& withStartupDeadline(std::chrono::milliseconds d) noexcept { startupDeadline_ = d; return *this; }
+    [[nodiscard]] std::chrono::milliseconds startupDeadline() const noexcept { return startupDeadline_; }
+    /// True once any kUntilAnswered resolve gave up at startupDeadline().
+    [[nodiscard]] bool deadlineExpired() const noexcept { return deadlineExpired_; }
 
     /// Probe `find` until it yields a truthy value, `budget` elapses (never, for kUntilAnswered),
     /// `*failed` becomes true (find saw a hard registration error), or the driver refuses to be
@@ -56,13 +108,23 @@ public:
     auto resolve(Find&& find, std::chrono::milliseconds budget,
                  const bool* failed = nullptr) -> decltype(find()) {
         using clock = std::chrono::steady_clock;
-        const bool bounded = budget != kUntilAnswered;
-        const auto deadline = bounded ? clock::now() + budget : clock::time_point::max();
+        const bool capped = budget == kUntilAnswered;
+        const auto deadline = clock::now() + (capped ? startupDeadline_ : budget);
+        bool lastTry = false;
         for (;;) {
             auto r = find();
-            if (r || (failed && *failed) || (bounded && clock::now() >= deadline)) return r;
+            if (r || (failed && *failed)) return r;
+            if (clock::now() >= deadline) {
+                // After a process pause the pump thread has not run since the resume: one more pump or sleep, then find.
+                if (lastTry) { if (capped) deadlineExpired_ = true; return r; }
+                lastTry = true;
+            }
             if (invoker()) {
                 if (pump() < 0) return r;                      // refused: fail fast
+            } else if (StartupClientGate* g = StartupClientGate::heldHere()) {
+                g->release();                                  // the pump thread services the client meanwhile
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                g->acquire();
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds{1});
             }
@@ -79,6 +141,8 @@ private:
     aeron::Aeron* client_ = nullptr;
     uint64_t      pumps_  = 0;
     bool          refused_ = false;
+    bool          deadlineExpired_ = false;
+    std::chrono::milliseconds startupDeadline_ = kDefaultStartupDeadline;
 };
 
 } // namespace rune::aeronutil

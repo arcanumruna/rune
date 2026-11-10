@@ -179,7 +179,7 @@ struct Rig {
         release();
     }
     // The lease request handlers: keepAlive answers per `kaMode`, timeToLive per `ttl*`, scans per `scanPages`.
-    int      kaMode = 0;   // 0 ok(ttl 5000), 1 entry code 62, 2 whole-request NotLeader once then ok, 3 never answers, 4 ok twice
+    int      kaMode = 0;   // 0 ok(ttl 5000), 1 entry code 64, 2 whole-request NotLeader once then ok, 3 never answers, 4 ok twice
     int      kaSeen = 0;
     int64_t  ttlRemaining = -1;
     bool     ttlAnswers = true;
@@ -203,7 +203,7 @@ struct Rig {
                 const std::size_t k = r.encode(out.data());
                 gw.send(ep, out.data(), k);
             };
-            if (kaMode == 1) reply(0, 62, 0);
+            if (kaMode == 1) reply(0, 64, 0);
             else if (kaMode == 2 && kaSeen == 1) reply(rpc::kLeaseWholeRequest, static_cast<uint16_t>(rpc::ErrorCode::NotLeader), 0);
             else { reply(0, 0, 5000); if (kaMode == 4) reply(0, 0, 5000); }
         };
@@ -327,7 +327,7 @@ TEST(LeaseTopicRegression, GrantErrorsRegression) {
     const Case cases[] = {
         {"verdict KeyExists", 0, 56, OpStatus::RecordsRejected, 56},
         {"verdict 21 on a grant", 0, 21, OpStatus::VerdictUnknown, 0},
-        {"batch error 64", 1, 64, OpStatus::BrokerError, 64},
+        {"batch error 66", 1, 66, OpStatus::BrokerError, 66},
         {"batch InvalidRequest", 1, 39, OpStatus::BrokerError, 39},
     };
     int streams = 4810;
@@ -369,11 +369,11 @@ TEST(LeaseTopicRegression, UpdateRevokeOkAndNotFoundRegression) {
     EXPECT_EQ(v.outcome().c.op, OpKind::LeaseRevoke);
     EXPECT_EQ(v.outcome().c.status, OpStatus::Ok);
 
-    r.gw.produceVerdicts = verdict(62);
+    r.gw.produceVerdicts = verdict(64);
     auto nf = cq.issue([&](rc::Completions& q, rc::Token t) { return topic.revoke(Row{6}, 1, {}, q, t); });
     ASSERT_TRUE(r.drive([&] { return nf.ready(); }));
     EXPECT_EQ(nf.outcome().c.status, OpStatus::RecordsRejected);
-    EXPECT_EQ(nf.outcome().c.errorCode, 62);
+    EXPECT_EQ(nf.outcome().c.errorCode, 64);
 
     ASSERT_EQ(r.gw.produceFrameBytes.size(), 3u);
     const auto upd = recordsOf(r.gw.produceFrameBytes[0]);
@@ -546,11 +546,11 @@ TEST(LeaseTopicRegression, KeepAliveAndTtlRegression) {
     EXPECT_EQ(ok.outcome().c.status, OpStatus::Ok);
     EXPECT_EQ(ok.outcome().c.aux, 5000);
 
-    r.kaMode = 1;   // entry 0 refused with 62
+    r.kaMode = 1;   // entry 0 refused with 64
     auto nf = cq.issue([&](rc::Completions& q, rc::Token t) { return topic.keepAliveOnce(Row{1}, 77, {}, q, t); });
     ASSERT_TRUE(r.drive([&] { return nf.ready(); }));
     EXPECT_EQ(nf.outcome().c.status, OpStatus::BrokerError);
-    EXPECT_EQ(nf.outcome().c.errorCode, 62);
+    EXPECT_EQ(nf.outcome().c.errorCode, 64);
 
     r.kaMode = 2; r.kaSeen = 0;   // whole-request NotLeader: re-sent, then answered
     auto nl = cq.issue([&](rc::Completions& q, rc::Token t) { return topic.keepAliveOnce(Row{1}, 77, {}, q, t); });

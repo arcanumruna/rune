@@ -156,6 +156,16 @@ struct ShardIngressEndpoint {
     int32_t     egressControlBasePort = 0;
 };
 
+// Checked writes Part 11: the coordinator's vote result (see ClientGateway::sendTxnVote).
+struct TxnVoteResult {
+    int16_t  errorCode     = 0;    ///< non-zero (NotLeader): transport failure, the other fields mean nothing
+    uint16_t code          = 0;    ///< 0 = yes
+    uint32_t constraintId  = 0;
+    int64_t  failingOffset = -1;
+};
+using TxnVoteSink = void (*)(void* ctx, int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch,
+                             int32_t coordinatorEpoch, const TxnVoteResult&) noexcept;
+
 // ---------------------------------------------------------------------------
 // ClientGateway
 // ---------------------------------------------------------------------------
@@ -711,9 +721,10 @@ public:
             std::shared_ptr<const rune::metadata::RoutingImage> img) noexcept {
         routingImage_ = std::move(img);
         // D9: a partition whose leadership moved fails its in-flight remote
-        // markers NotLeader (event-driven; the TCS retry re-routes) — done by
-        // the next marker pump of this same thread (review LOW-7: never calls
-        // into the coordinator from inside the routing publish).
+        // markers and its in-flight remote votes (Part 11) NotLeader
+        // (event-driven; the TCS retry re-routes) — done by the next marker
+        // pump of this same thread (review LOW-7: never calls into the
+        // coordinator from inside the routing publish).
         routingChangedForMarkers_ = true;
     }
 
@@ -1131,6 +1142,9 @@ public:
         bool (*sendVerify)(void* ctx, int32_t toNode, const rune::replication::VerifyTxnPartitionMsg& m) = nullptr;
         bool (*sendVerifyResponse)(void* ctx, int32_t toNode,
                                    const rune::replication::VerifyTxnPartitionResponseMsg& r) = nullptr;
+        // Checked writes Part 11: the coordinator's vote and the leader's answer (same plane, same ctx).
+        bool (*sendVote)(void* ctx, int32_t toNode, const rune::replication::TxnVoteMsg& m) = nullptr;
+        bool (*sendVoteResponse)(void* ctx, int32_t toNode, const rune::replication::TxnVoteResponseMsg& r) = nullptr;
     };
     void setTxnMarkerChannel(const TxnMarkerChannel& ch) noexcept { txnMarkerChannel_ = ch; }
     /// Leader side: a coordinator's marker for a partition this node leads.
@@ -1177,11 +1191,46 @@ public:
     /// Test-only: doWork's verification step at `nowNs`.
     int pumpTxnVerifyForTest(int64_t nowNs) { nowNs_ = nowNs; return pumpTxnVerify_(); }
 
+    // -----------------------------------------------------------------------
+    // Checked writes Part 11: the transaction coordinator's vote on a partition.
+    //
+    // sendTxnVote asks the partition's leader whether the transaction (producerId, producerEpoch) may commit there.  It
+    // returns a token >= 0, and that token gets EXACTLY ONE sink call unless purgeTxnVotes drops it first: the leader's
+    // vote (from this node's worker or, over the cluster plane, from the remote leader), or errorCode NotLeader when it
+    // could not answer.  -1 means no call follows (no route, no vote channel, a full op ring, a refused plane send, a
+    // full table): a transport error, retried by the caller with backoff.  A result is never delivered from inside
+    // sendTxnVote; the sink may call sendTxnVote again.  `coordinatorEpoch` rides back to the sink unchanged.  Runtime
+    // thread, cold.
+    // -----------------------------------------------------------------------
+    void setTxnVoteSink(TxnVoteSink sink, void* ctx) noexcept { voteSink_ = sink; voteSinkCtx_ = ctx; }
+    int64_t sendTxnVote(int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch, int32_t coordinatorEpoch);
+    static constexpr std::size_t kMaxTxnVotesInFlight = 16384;
+    /// Silently drops the votes asked under a coordinator epoch below @p olderThan (no sink call); the coordinator's
+    /// unload and load call it beside purgeQueuedMarkers.  \returns the number dropped.  Control thread only.
+    std::size_t purgeTxnVotes(int32_t olderThan);
+    /// Leader side: a coordinator on another node asks for the vote on a partition this node leads.
+    void onRemoteTxnVote(const rune::replication::TxnVoteMsg& m);
+    /// Coordinator side: the partition leader's answer.
+    void onRemoteTxnVoteResponse(const rune::replication::TxnVoteResponseMsg& r);
+    static void onTxnVoteThunk(void* self, const rune::replication::TxnVoteMsg& m) {
+        static_cast<ClientGateway*>(self)->onRemoteTxnVote(m);
+    }
+    static void onTxnVoteResponseThunk(void* self, const rune::replication::TxnVoteResponseMsg& r) {
+        static_cast<ClientGateway*>(self)->onRemoteTxnVoteResponse(r);
+    }
+    [[nodiscard]] std::size_t txnVotesInFlightForTest() const noexcept { return votesInFlight_.size(); }
+    [[nodiscard]] bool txnVoteSinkSetForTest() const noexcept { return voteSink_ != nullptr; }
+    [[nodiscard]] std::size_t remoteTxnVotesForTest() const noexcept { return remoteVotes_.size(); }
+    [[nodiscard]] std::size_t txnVoteResponsesQueuedForTest() const noexcept { return pendingVoteResponses_.size(); }
+    /// Test-only: the token of the last vote issued.
+    [[nodiscard]] int64_t lastVoteTokenForTest() const noexcept { return nextVoteToken_ - 1; }
+
     /// Review MAJOR-1: the cluster plane's link to `peer` came back (down→up
     /// edge; -1 = a new inbound image whose peer is unknown) — every remote
     /// marker in flight to it (to everyone for -1) is RE-SENT with the SAME
     /// token by the next marker pump.  A remote marker completes only on a real
     /// answer or a leadership change — never on a timer.
+    /// Part 11: every remote vote in flight to it is re-sent with the same token; a refused re-send completes NotLeader.
     /// #112: every verification forwarded to that peer (to anyone for -1) is
     /// answered NotCoordinator (retriable) — its ask or answer may be lost.
     void onPlaneReconnect(int32_t peer) {
@@ -3371,7 +3420,7 @@ private:
     // F15-FU1 (#112): transaction-registration verification (see onRemoteVerifyTxnPartition).
     struct VerifyAnswer {
         int32_t topicId = 0; int32_t partition = 0; int64_t producerId = -1; int16_t producerEpoch = 0;
-        int64_t reqId = 0; int16_t code = 0;
+        int64_t reqId = 0; int16_t code = 0; bool votes = false;
     };
     struct VerifyInFlight {
         VerifyAnswer req;            ///< the worker's request (code unset)
@@ -3398,6 +3447,34 @@ private:
     int64_t nextVerifyToken_ = initialMarkerToken_();   ///< per-boot incarnation in the high bits (as markers)
     bool failAllRemoteVerifies_ = false;
     int32_t lastVerifyCoordinator_ = -1;   ///< the node the in-flight asks went to (sweep on change)
+    // Checked writes Part 11: votes this node's coordinator has asked, by token.
+    struct VoteInFlight {
+        int32_t topicId = 0; int32_t partition = 0; int64_t producerId = -1; int16_t producerEpoch = 0;
+        int32_t coordinatorEpoch = 0;
+        int32_t remoteNode = -1; int32_t remoteLeaderEpoch = -1;   ///< the leader the vote went to, -1 = the local worker
+    };
+    void onTxnVoteResult_(const rune::node::WorkerReturn& ret);
+    bool sendRemoteVote_(int64_t token, const VoteInFlight& v);
+    void completeVotesNotLeader_(const std::vector<int64_t>& tokens);
+    void failRemoteVotesOnLeaderChange_();
+    std::unordered_map<int64_t, VoteInFlight> votesInFlight_;
+    // Leader side: votes taken from another node's coordinator whose answer is still owed, by (origin node, origin token).
+    struct RemoteVoteKey {
+        int32_t origin = -1; int64_t token = 0;
+        bool operator==(const RemoteVoteKey& o) const noexcept { return origin == o.origin && token == o.token; }
+    };
+    struct RemoteVoteKeyHash {
+        std::size_t operator()(const RemoteVoteKey& k) const noexcept {
+            return std::hash<int64_t>{}(k.token) ^ (static_cast<std::size_t>(static_cast<uint32_t>(k.origin)) << 20);
+        }
+    };
+    std::unordered_map<RemoteVoteKey, rune::replication::TxnVoteResponseMsg, RemoteVoteKeyHash> remoteVotes_;   ///< the answer's echo fields
+    void answerRemoteVote_(int32_t toNode, const rune::replication::TxnVoteResponseMsg& r);
+    int  pumpVoteResponses_();
+    std::deque<std::pair<int32_t, rune::replication::TxnVoteResponseMsg>> pendingVoteResponses_;
+    int64_t nextVoteToken_ = initialMarkerToken_();   ///< per-boot incarnation in the high bits (as markers)
+    TxnVoteSink voteSink_    = nullptr;
+    void*       voteSinkCtx_ = nullptr;
     uint64_t txnVerifiesForwarded_      = 0;
     uint64_t txnVerifiesServedForPeers_ = 0;
     std::vector<int32_t> verifyReconnectedPeers_;

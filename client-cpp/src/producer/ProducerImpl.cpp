@@ -234,27 +234,30 @@ inline bool offerFresh(const Sink& sink, int32_t topicId, int32_t partition, int
     }
 }
 
+// ORs `setAttrs` into the attributes of a SEALED RecordBatch and patches its CRC incrementally.
+inline void orBatchAttributes(uint8_t* batch, std::size_t len, uint16_t setAttrs) noexcept {
+    namespace rb = rune::protocol::batch;
+    uint8_t oldA[2];
+    std::memcpy(oldA, batch + rb::kAttributesOffset, 2);
+    const uint16_t a = static_cast<uint16_t>(rune::protocol::detail::getLE16(batch + rb::kAttributesOffset) | setAttrs);
+    batch[rb::kAttributesOffset]     = static_cast<uint8_t>(a);
+    batch[rb::kAttributesOffset + 1] = static_cast<uint8_t>(a >> 8);
+    const uint32_t c0 = rune::protocol::detail::getLE32(batch + rb::kCrcOffset);
+    const uint32_t c1 = rune::client::detail::crc32cPatch(c0, len - rb::kAttributesOffset, 0, oldA,
+                                                          batch + rb::kAttributesOffset, 2);
+    for (int i = 0; i < 4; ++i) batch[rb::kCrcOffset + i] = static_cast<uint8_t>(c1 >> (8 * i));
+}
+
 // Backlog B2: re-stamps producerId / producerEpoch / baseSequence (14 contiguous
 // bytes) of a SEALED RecordBatch at `batch` (`len` bytes) and patches its CRC
 // incrementally — bit-exact with a full recompute, without rescanning the batch.
-// Phase 2b F Task 6: `setAttrs` (kAttrTransactional for a transactional producer)
-// is OR-ed into the attributes (inside the CRC range: patched the same way).  A
-// plain producer passes 0 and its attributes are never touched.
+// `setAttrs` (kAttrTransactional of a transactional producer, kAttrAtomic of a
+// Tier-2 batch) is OR-ed into the attributes, patched the same way; 0 leaves them alone.
 inline void restampBatchIdentityAndAttributes(uint8_t* batch, std::size_t len, int64_t producerId,
                                               int16_t producerEpoch, int32_t baseSequence,
                                               uint16_t setAttrs) noexcept {
     namespace rb = rune::protocol::batch;
-    if (setAttrs != 0) [[unlikely]] {
-        uint8_t oldA[2];
-        std::memcpy(oldA, batch + rb::kAttributesOffset, 2);
-        const uint16_t a = static_cast<uint16_t>(rune::protocol::detail::getLE16(batch + rb::kAttributesOffset) | setAttrs);
-        batch[rb::kAttributesOffset]     = static_cast<uint8_t>(a);
-        batch[rb::kAttributesOffset + 1] = static_cast<uint8_t>(a >> 8);
-        const uint32_t c0 = rune::protocol::detail::getLE32(batch + rb::kCrcOffset);
-        const uint32_t c1 = rune::client::detail::crc32cPatch(c0, len - rb::kAttributesOffset, 0, oldA,
-                                                              batch + rb::kAttributesOffset, 2);
-        for (int i = 0; i < 4; ++i) batch[rb::kCrcOffset + i] = static_cast<uint8_t>(c1 >> (8 * i));
-    }
+    if (setAttrs != 0) orBatchAttributes(batch, len, setAttrs);
     constexpr std::size_t kOff = rb::kProducerIdOffset;
     constexpr std::size_t kN   = rb::kRecordCountOffset - rb::kProducerIdOffset;
     static_assert(rb::kProducerEpochOffset == rb::kProducerIdOffset + 8 &&
@@ -1511,6 +1514,7 @@ RejectReason ProducerImpl::submitTier2Bytes(int32_t topicId, int32_t partition, 
     const uint32_t slot = tier2Acquire();
     if (slot == kNoTier2Slot) return RejectReason::BackPressured;
     tier2Pool_[slot].batchBytes.assign(bytes.begin(), bytes.end());
+    tier2Pool_[slot].atomic = false;
     RejectReason why = RejectReason::None;
     try {
         why = submitTier2Batch(topicId, partition, ackHandle, recordCount, slot);
@@ -2287,6 +2291,7 @@ bool ProducerImpl::encodeAndSend(
         b.lastSendTick      = ++sendTick_;
         b.ingressStreamId   = ps.ingressStreamId;
         b.tier2             = false;
+        b.atomic            = false;
         b.idStride          = ps.openKind != 0 ? ps.keyZeroStride : 0;
         b.laneGen           = ps.laneGen;  // NEW-4(b): attempt 0 on the current lane
         b.laneFirstTag      = 0;
@@ -2353,7 +2358,7 @@ bool ProducerImpl::encodeAndSendTier2(
     // producerId_/producerEpoch_/baseSequence_ to -1 — see RecordBatch.h), so
     // entry.batchBytes is ALREADY -1/-1/-1 with a CRC computed over exactly
     // those values: nothing to patch, and ps.nextBaseSequence is left
-    // untouched (see the Tier-1 path in encodeAndSend for the same rule).
+    // untouched (see the Tier-1 path in encodeAndSend for the same rule).  Only kAttrAtomic is patched in.
     //
     // acks=Leader/All: patch this instance's real id and the next sequence
     // into the pre-built RecordBatch bytes.  Use the named constants from
@@ -2368,7 +2373,9 @@ bool ProducerImpl::encodeAndSendTier2(
         // no rescan of the batch.  NOT advanced until the offer succeeds (below):
         // a back-pressured retry re-stamps the SAME values (a zero delta).
         restampBatchIdentityAndAttributes(b.data(), b.size(), ps.producerId, ps.epoch, ps.nextBaseSequence,
-                                          txnBatchAttrs_);
+                                          static_cast<uint16_t>(txnBatchAttrs_ | (entry.atomic ? rb::kAttrAtomic : 0)));
+    } else if (entry.atomic) {
+        orBatchAttributes(b.data(), b.size(), rb::kAttrAtomic);   // acks=None: the broker still judges the batch as a unit
     }
 
     // Encode the Produce wire frame.
@@ -2468,6 +2475,7 @@ bool ProducerImpl::encodeAndSendTier2(
         ib.lastSendTick      = ++sendTick_;
         ib.ingressStreamId   = ps.ingressStreamId;
         ib.tier2             = true;
+        ib.atomic            = entry.atomic;
         ib.idStride          = 0;
         ib.laneGen           = ps.laneGen;  // NEW-4(b)
         ib.laneFirstTag      = 0;
@@ -2913,11 +2921,11 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         const bool idsUnknown = b->idStride != 0 && (dupSeq || (!hasTrailer && (off < 0 || assignedBase == 0)));
         if (hasVerdicts && !verdicts.empty()) {
             const int16_t firstCode = static_cast<int16_t>(verdicts[2] | (verdicts[3] << 8));
-            if (b->recordCount > 1)   // stored and judged: the real base, the first code, and every rejection
+            if (b->recordCount > 1 && !b->atomic)   // stored and judged: the real base, the first code, and every rejection
                 emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, firstCode,
                               OpStatus::RecordsRejected, units, b->producerEpoch, b->producerId, verdicts);
-            else                      // a 1-record batch keeps single-record semantics
-                emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, firstCode,
+            else                      // a 1-record batch keeps single-record semantics; an atomic batch is all or nothing
+                emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, firstCode,
                               OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
         }
         else if (dupSeq && viewSent_() && !idsUnknown)
@@ -2929,7 +2937,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         if (leaseWrites_) [[unlikely]]   // Task 14a: lease writes - each record from its verdict entry and its lease trailer entry
             completeLeaseSlice_(ps, b->ackStart, b->ackCount, verdicts, leases, dupSeq, static_cast<uint16_t>(errorCode));
         else if (hasVerdicts && !verdicts.empty())
-            completeVerdictSlice_(ps, b->ackStart, b->ackCount, off, b->tier2, b->recordCount, verdicts, dupSeq ? 0 : assignedBase, b->idStride);
+            completeVerdictSlice_(ps, b->ackStart, b->ackCount, off, b->tier2, b->atomic, b->recordCount, verdicts, dupSeq ? 0 : assignedBase, b->idStride);
         else if (idsUnknown)   // stored, but the ids are not known: never Ok without them
             completeSlice_(ps, b->ackStart, b->ackCount, off, OpStatus::StoredIdUnknown, static_cast<uint16_t>(errorCode), b->tier2, b->recordCount);
         else if (dupSeq && viewSent_())   // stored, but this retry's verdicts are gone: never per-record errors
@@ -3451,7 +3459,7 @@ void ProducerImpl::completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t
 }
 
 void ProducerImpl::completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset, bool tier2,
-                                         int32_t recordCount, std::span<const uint8_t> verdicts, uint64_t assignedBase, uint32_t idStride) noexcept {
+                                         bool atomic, int32_t recordCount, std::span<const uint8_t> verdicts, uint64_t assignedBase, uint32_t idStride) noexcept {
     const auto le16 = [](const uint8_t* p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); };
     const auto le32 = [](const uint8_t* p) {
         return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
@@ -3468,12 +3476,15 @@ void ProducerImpl::completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, 
             const int64_t base = baseOffset >= 0 ? baseOffset : -1;
             if (n == 0) {
                 completeHandle_(h, OpKind::Tier2Batch, base, recordCount, OpStatus::Ok, 0);
+            } else if (atomic) {   // all-or-nothing: the batch completes once with the broker's code, whatever the entry count.
+                completeHandle_(h, OpKind::Tier2Batch, base, recordCount, OpStatus::BrokerError,
+                                le16(verdicts.data() + 2), le32(verdicts.data() + 4));
             } else if (recordCount > 1) {
                 // One completion reports every record: the trailer's entries are the batch's own (0-based) - passed through.
                 completeHandle_(h, OpKind::Tier2Batch, base, recordCount, OpStatus::RecordsRejected, le16(verdicts.data() + 2),
                                 le32(verdicts.data() + 4), verdicts.first(n * 8));
             } else {   // a 1-record batch keeps single-record semantics
-                completeHandle_(h, OpKind::Tier2Batch, -1, recordCount, OpStatus::BrokerError, le16(verdicts.data() + 2), le32(verdicts.data() + 4));
+                completeHandle_(h, OpKind::Tier2Batch, base, recordCount, OpStatus::BrokerError, le16(verdicts.data() + 2), le32(verdicts.data() + 4));
             }
             continue;
         }
@@ -3487,7 +3498,7 @@ void ProducerImpl::completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, 
             if (next < n && le16(verdicts.data() + next * 8) == static_cast<uint16_t>(i)) {
                 const uint8_t* e = verdicts.data() + next * 8;
                 ++next;
-                completeHandle_(h, OpKind::Send, -1, 0, OpStatus::BrokerError, le16(e + 2), le32(e + 4));
+                completeHandle_(h, OpKind::Send, base, 0, OpStatus::BrokerError, le16(e + 2), le32(e + 4));
             } else {
                 completeHandle_(h, OpKind::Send, base, idOf(i), okSt, 0);
             }
@@ -3589,7 +3600,7 @@ void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t bas
     // first rejection's code.
     const bool stored = st == OpStatus::RecordsRejected;
     if (batchAckFn_ != nullptr) {
-        BatchAck a{topicId, partition, (errorCode == 0 || stored) ? baseOffset : -1, baseSequence,
+        BatchAck a{topicId, partition, baseOffset, baseSequence,
                    recordCount, errorCode, producerEpoch, producerId};
         a.rejectedCount = static_cast<uint32_t>(rejections.size() / 8);
         a.rejections    = rejections.empty() ? nullptr : rejections.data();
@@ -3600,7 +3611,7 @@ void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t bas
     Completion c;
     c.token = (static_cast<uint64_t>(static_cast<uint32_t>(topicId)) << 32) |
               static_cast<uint32_t>(partition);
-    c.value = (errorCode == 0 || stored) ? baseOffset : -1;
+    c.value = baseOffset;
     c.aux   = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(baseSequence)) << 32) |
                                    static_cast<uint32_t>(recordCount));
     c.op            = OpKind::BatchAck;

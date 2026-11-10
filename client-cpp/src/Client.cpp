@@ -18,6 +18,7 @@
 //     Completions back (producer-close).
 
 #include <rune/client/Client.h>
+#include <rune/client/ConstraintNames.h>
 #include <rune/client/transport/ResponseChannel.h>
 #include <rune/client/agent/AgentProduceSink.h>
 #include <rune/client/detail/CpuAffinity.h>
@@ -121,6 +122,8 @@ void validateConfigInPlace(ClientConfig& c) {
     }
     if (c.ddlRetryBudget.count() < 0 || c.viewReadRetryBudget.count() < 0)
         throw std::invalid_argument("ClientConfig: ddlRetryBudget / viewReadRetryBudget must be >= 0");
+    if (c.ddlRetryBackoff.count() < 1)
+        throw std::invalid_argument("ClientConfig: ddlRetryBackoff must be >= 1 ms");
     if (c.traceDdlRetries && c.runnerMode != RunnerMode::Invoker)
         throw std::invalid_argument("ClientConfig::traceDdlRetries requires RunnerMode::Invoker "
                                     "(the notes are duty-thread state, read by the Invoker owner)");
@@ -209,6 +212,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c, const detail::ClientTest
     acfg.transport.dataDir         = c.dataDir;
     acfg.transport.termBufferLength = c.termBufferBytes;
     acfg.transport.driverCountersBytes = c.driverCountersBytes;
+    acfg.transport.aeronDir        = c.aeronDir;
 
     // Session egress config (for ConnectRequest body).
     acfg.session.egressChannel  = opts.declaredEgressChannel.empty() ? c.egressChannel : opts.declaredEgressChannel;
@@ -2411,7 +2415,6 @@ void Client::failDdl_(std::size_t i, uint16_t code, std::string_view detail, int
 }
 
 namespace {
-constexpr int64_t kDdlInitialBackoffNs = 100'000'000;     // 100 ms
 constexpr std::string_view kDdlNodeRejected =
     "the DDL's node session was rejected (the user was revoked there or its login was refused)";
 constexpr int64_t kDdlMaxBackoffNs     = 1'000'000'000;   // 1 s
@@ -2489,7 +2492,7 @@ void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t now
     if (const auto* st = std::get_if<DdlSent>(&d.retry)) {
         redirects   = st->redirects;
         budgetEndNs = std::min(p.deadlineNs, nsAfter(nowNs, (isDdlOp(p.op) ? cfg_.ddlRetryBudget : cfg_.viewReadRetryBudget).count()));
-        backoffNs   = kDdlInitialBackoffNs;
+        backoffNs   = cfg_.ddlRetryBackoff.count() * 1'000'000;
     } else if (const auto* n = std::get_if<DdlNotLeaderSeen>(&d.retry)) {
         redirects   = n->redirects;
         budgetEndNs = n->budgetEndNs;
@@ -2544,7 +2547,7 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
         // budget (started now if no NotLeader was seen yet).
         const DdlOfferedOn* on = nullptr;
         int redirects = 0;
-        int64_t budgetEndNs = 0, backoffNs = kDdlInitialBackoffNs;
+        int64_t budgetEndNs = 0, backoffNs = cfg_.ddlRetryBackoff.count() * 1'000'000;
         if (const auto* st = std::get_if<DdlSent>(&d->retry)) {
             on = &st->on;
             redirects = st->redirects;
@@ -3102,6 +3105,18 @@ CatalogReader& Client::catalogReader() {
     return *catalogReader_;
 }
 
+std::optional<ConstraintName> Client::constraintName(uint32_t constraintId) {
+    return constraintName(constraintId, kConstraintNameRefreshTimeout);
+}
+
+std::optional<ConstraintName> Client::constraintName(uint32_t constraintId, std::chrono::milliseconds refreshTimeout) {
+    CatalogReader& r = catalogReader();
+    if (constraintId == 0) return std::nullopt;
+    if (auto name = resolveConstraintName(r.state(), r.events(), constraintId)) return name;
+    if (!r.refresh(refreshTimeout)) return std::nullopt;
+    return resolveConstraintName(r.state(), r.events(), constraintId);
+}
+
 namespace {
 CatalogReadError asOfError(const rune::catalog::ReplayError& e) {
     return CatalogReadError{CatalogReadError::Kind::Replay, rune::catalog::describe(e), e.offset, 0};
@@ -3299,7 +3314,7 @@ std::string_view lineageErrorName(uint16_t code) noexcept {
         "TransientLogFull", "PartitionDataReset", "", "", "", "", "" /* 44..48: authErrorName (#225) */, "RecordEgressUnavailable", "UnstableOffsetCommit",
         "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused",
         "ConstraintViolation", "KeyExists", "KeyNotFound", "AutoIncrementExhausted", "ViewKeyExpressionInvalid",
-        "ViewConstraintInvalid", "ViewUniqueInvalid",
+        "ViewConstraintInvalid", "ViewUniqueInvalid", "TxnTooLarge", "TxnConflict",
         "LeaseNotFound", "LeaseLimitExceeded", "LeaseTtlTooLarge"};
     static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::LeaseTtlTooLarge) + 1,
                   "lineageErrorName: one name per rune::protocol::client::ErrorCode");
@@ -3341,7 +3356,7 @@ TopicHandle Client::rawTopicAndWait(std::string_view name, std::chrono::nanoseco
     return TopicHandle{r.topicId, r.partitionCount > 0 ? r.partitionCount : 1, TopicKind::Raw};
 }
 
-void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::chrono::nanoseconds remaining) {
+TopicSchemaResult Client::resolveOpenTopicFailure(std::string_view name, uint64_t fingerprint, uint16_t code, std::chrono::nanoseconds remaining) {
     constexpr auto kUnknownTopic = static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownTopic);
     const auto refused = [&](uint16_t c) {
         std::string msg = "openTopic: the broker refused '" + std::string(name) + "' (error " + std::to_string(c);
@@ -3354,6 +3369,7 @@ void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::ch
         // (the kind probe: a typed topic answers like the latest schema, an untyped one OK with no blob).
         TopicSchemaResult kind;
         bool probed = true;
+        const auto probeStarted = std::chrono::steady_clock::now();
         try {
             kind = getTopicSchemaAndWait(name, rune::protocol::client::kSchemaKindFingerprint, remaining);
         } catch (const std::exception&) {
@@ -3365,9 +3381,24 @@ void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::ch
             if (kind.errorCode == 0 && kind.descriptorBlob.empty())
                 throw std::runtime_error("openTopic: '" + std::string(name) + "' is an untyped (raw) topic; a TypedTopic "
                                          "binds only to a typed topic (use rawTopicAndWait)");
-            if (kind.errorCode == 0)
-                throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
-            code = kind.errorCode;
+            if (kind.errorCode == 0) {
+                // The first answer may predate the topic's apply on this node, and the type may be bound to an older version
+                // than the latest one the probe answered: ask for the caller's fingerprint once more.
+                // With no budget left, or a retry that times out, the probe's answer stands: the type is stale.
+                const auto left = remaining - (std::chrono::steady_clock::now() - probeStarted);
+                if (left > std::chrono::nanoseconds::zero()) {
+                    try {
+                        TopicSchemaResult again = getTopicSchemaAndWait(name, fingerprint, left);
+                        if (again.errorCode == 0) return again;
+                        code = again.errorCode;
+                    } catch (const std::exception&) {
+                    }
+                }
+                if (code == kUnknownTopic)
+                    throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
+            } else {
+                code = kind.errorCode;
+            }
         }
     }
     throw std::runtime_error(refused(code));
@@ -6228,6 +6259,8 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
                                     SubscribeOptions&        opts,
                                     RecordHandler            handler)
 {
+    // A handle no topic answers to (Client::topic of a name absent from ClientConfig::topics) would deliver nothing, silently.
+    if (!topic.valid() && !isEventLogTopic(topic.topicId)) throw std::invalid_argument("subscribe(): invalid topic handle");
     // Build the impl.  Its immutable fields are written HERE, before the
     // SubscribeAdd command is committed to the agent ring (which publishes them
     // to the duty thread); every other field is duty-thread owned from then on.
@@ -6475,9 +6508,9 @@ int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
         const auto     st = agent_.sessionStateAt(i);
         const uint8_t  up = st == session::SessionState::Connected ? 1 : 0;
         const bool failed = f != routeConnectFailuresSeen_[i];
-        const bool lost   = routeSessionUp_[i] != 0 && up == 0;  // review MEDIUM-1: a Connected leader dropped
+        const bool lost   = routeSessionUp_[i] == kRouteSessionUp && up == 0;  // review MEDIUM-1: a Connected leader dropped
         routeConnectFailuresSeen_[i] = f;
-        routeSessionUp_[i]           = up;
+        routeSessionUp_[i]           = up != 0 ? kRouteSessionUp : lost || routeSessionUp_[i] == kRouteSessionLost ? kRouteSessionLost : uint8_t{0};
         if (i == 0) {
             // The seed has its own reconnect path (and the seed failover).  DR client
             // bug 1: its broker may lead partitions routed through it — a seed
@@ -6485,6 +6518,8 @@ int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
             if ((failed || lost) && agent_.multiNodeRouting()) ask = true;
             continue;
         }
+        if (routeSessionUp_[i] == kRouteSessionLost && agent_.routesUseSession(i))
+            scheduleMetadataRefresh();   // level: a leader that was live and is down keeps being asked about (backoff-paced) until an answer moves the route
         if (!failed && !lost && st != session::SessionState::Disconnected) [[likely]] continue;
         if (!agent_.routesUseSession(i)) continue;
         ask = ask || failed || lost;
@@ -7392,10 +7427,15 @@ void Client::onCoordinatorRedirect_(const std::string& message) {
     // That node's ONE session (lazily opened / re-driven) — 0 = the seed is there.
     const uint32_t idx = agent_.coordinatorSessionIndex(channel, now());
     if (idx == 0) coordRoute_ = detail::CoordSeed{};
-    else          coordRoute_ = detail::CoordRemote{idx, channel, agent_.sessionConnectFailuresAt(idx), std::nullopt};
+    else          coordRoute_ = detail::CoordRemote{idx, channel, agent_.sessionConnectFailuresAt(idx), std::nullopt, staleLossesAt_(idx)};
     groupConsumerHub_.onCoordinatorMoved();   // members -> Rejoining (there)
     producerHub_.onCoordinatorMoved();        // Phase 2b F: AwaitCoordinator requests re-send
     syncCoordinatorSession_();                // already connected: they join at once
+}
+
+uint64_t Client::staleLossesAt_(uint32_t idx) const noexcept {
+    const session::SessionMachine& m = agent_.sessionMachineAt(idx);
+    return m.staleSessionLosses() - m.ownStallLosses();
 }
 
 // D4: see syncSeedSession_ / onCoordinatorRedirect_.  Duty thread.
@@ -7408,14 +7448,19 @@ void Client::syncCoordinatorSession_() noexcept {
         // it to Backoff): back to the seed, whose node answers again with the
         // current coordinator.  Paced by that session's own connect / backoff
         // cycle (each failure is one event), never a spin.
-        // A coordinator node that CRASHED: its session goes stale, then retries against a dead endpoint for
-        // minutes before any of the exhausted-budget states above - so a session that stays down for
-        // kCoordDownFallbackNs is given up too (level-triggered; the seed names the current coordinator, and
-        // each fallback is paced by this grace, never a spin).
+        // A coordinator session that went stale (a crashed node stopped answering for responseTimeoutNs; not a stall of
+        // this client) is given up at once, as a routed leader's lost session is re-asked about (watchProduceRoutes_):
+        // the seed names the current coordinator.  Any other outage of a coordinator that was up is given up after
+        // kCoordDownFallbackNs, so a seed that still names the dead node is followed at that pace, never a spin.
+        // A session that has not been Connected since it became the coordinator is given up after coordNeverUpGraceNs_: it
+        // starts at the metadata backoff and doubles on each such give-up up to kCoordDownFallbackNs, so a seed that keeps
+        // naming a node that never connects is asked at a growing pace.  It resets once a coordinator session is Connected.
         const int64_t nowNs = now();
-        const bool downTooLong =
-            detail::coordDownTooLong(*rm, st == session::SessionState::Connected, nowNs, kCoordDownFallbackNs);
-        const bool gaveUp = downTooLong ||
+        const bool downTooLong = detail::coordDownTooLong(*rm, st == session::SessionState::Connected, nowNs,
+                                                          rm->wasUp ? kCoordDownFallbackNs : coordNeverUpGraceNs_);
+        if (rm->wasUp) coordNeverUpGraceNs_ = kMetadataBackoffInitNs;
+        const bool lost = staleLossesAt_(rm->idx) != rm->staleBase;
+        const bool gaveUp = downTooLong || lost ||
                             st == session::SessionState::Disconnected ||
                             st == session::SessionState::Rejected ||
                             st == session::SessionState::Closed ||
@@ -7423,6 +7468,10 @@ void Client::syncCoordinatorSession_() noexcept {
                              agent_.sessionConnectFailuresAt(rm->idx) != rm->failBase);
         if (gaveUp) {
             ++coordinatorFallbacks_;
+            if (!rm->wasUp) {
+                scheduleMetadataRefresh();
+                coordNeverUpGraceNs_ = std::min(coordNeverUpGraceNs_ * 2, kCoordDownFallbackNs);
+            }
             if (st == session::SessionState::Rejected || st == session::SessionState::Closed) {
                 coordRejected_ = detail::RejectedCoord{rm->channel, metadataResponses_};   // r2 LOW-3
             }

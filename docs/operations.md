@@ -468,6 +468,41 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
   while a member of the logged set is not installed on its worker.
 - After a crash that lost the marker tail a verdict view backs up and rebuilds a checkpoint ahead of its local markers
   (`verdictCheckpointsDiscarded`). When the rejected-offset index is full the judge stalls and raises `verdictStalls`.
+- **Transactions.** A transaction that writes to a verdict source is judged at a `TxnJudge` record (control record 19) that
+  the leader appends when the coordinator asks for its vote. The leader's cleaner removes a `TxnJudge` once the transaction's
+  COMMIT or ABORT lies below W and every persisted constraint view has checkpointed past it. As with all compaction and
+  retention, only the partition's leader cleans: a follower keeps every record it has replicated, these included, until it
+  leads and its own cleaner passes over them (follower cleaning: #990). A node restart does not change this.
+  - **Votes.** The coordinator asks the leader of every partition the transaction wrote to whether it votes yes. The judge answers
+    once it has judged the transaction whole, applying its records provisionally and locking the rows it wrote; the commit or
+    abort marker then finalizes the result in one step. Counters are ids 11 to 20 of `rune stats topic <t>`: `txnVotesYes`,
+    `txnVotesNo`, one counter each for 55, 56, 57 and 62 (`TxnConflict` no votes count only in `txnVotesNo`), `txnVoteLatencyNsMax` and `txnVoteLatencyNsTotal`.
+  - **Lock pause.** While a transaction holds a row locked, the verdicts of other writers' records that touch the row wait for its
+    marker; the time is `foldPausedOnTxnLockNs`. A distributed lock wait ends at the transaction timeout at the latest, when the
+    coordinator aborts the transaction. A judgement never waits for another transaction's marker to free an overlay: the worker adds
+    one when every overlay holds a lock, and drops it again once it is free and the pool has not grown for 10 s.
+  - **`txnMarkerWithoutVote`** counts markers that arrived for a transaction nobody asked a vote for. It stays 0; a non-zero
+    value is a coordinator bug.
+  - **Size.** A transaction over `RUNE_TXN_JUDGED_RECORDS_MAX` records on one partition is voted `TxnTooLarge` (62); an atomic batch
+    over it to a verdict source is refused with `InvalidRequest` (39), see [configuration](configuration.md).
+  - **Persisted constrained views.** A persisted view of a verdict source checkpoints while the judge runs ahead of undecided
+    transactions, and a restart backfills from the `TxnJudge` records at or above its checkpoint.
+- **Constraint views** (`unique` and `check`, see [Constraints](api/ql.md#constraints)) join and leave the set through
+  change records in the source log, so every leader judges a record with the set that was active at its offset.
+  - **Create.** The leader appends the view's plan (control record 20) and then the change record at offset `A`. The view builds
+    from the log start: below `A` it folds records without judging them (data from before the constraint), from `A` on they are
+    judged. Delivery of records at or above `A` waits until the view has caught up, so creating a constraint on a large topic pauses
+    delivery of new records for the build. Writes are not refused.
+  - **Replace.** The old view keeps judging while the new one builds. The leader then appends the change record at `S` and swaps the two
+    in one step, so no record goes unjudged.
+  - **Drop.** The leader appends a change record without the view. The dropped plan stays installed until the committed watermark
+    W has passed that record, because a failover can still make a new leader judge the records below it. Drop followed by create
+    leaves a gap in which writes are not judged.
+  - **Plan records.** The cleaner keeps control record 20; they are small and one is written per joining member. A leader whose catalog has not installed a view of the logged set waits (`judgeWaitsForInstall`) rather than
+    judge without it.
+  - **`uniqueConflicts`** (view stat 32, `rune stats view <unique view>`) counts the extra claimants of a `unique` view's keys: live
+    source records that share a key with its owner, from data written before the view existed. It rises while the view builds, from 0 to the duplicate count; once the view has built it only falls, as owners are deleted or
+    renamed and the next claimant is promoted. Remove duplicates before a back-fill.
 
 ## Key index
 

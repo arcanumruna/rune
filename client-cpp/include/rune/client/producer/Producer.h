@@ -271,7 +271,8 @@ struct ProducerConfig {
 ///                  answered a retransmit as a known-old duplicate — the record
 ///                  IS in the log, its offset is no longer known: Kafka
 ///                  DUPLICATE_SEQUENCE parity)
-///   BrokerError    errorCode = the broker's ErrorCode, baseOffset = -1
+///   BrokerError    errorCode = the broker's ErrorCode, baseOffset = -1 (a
+///                  View rejection: the rejected record's offset)
 ///   DeliveryFailed delivery timeout / redirect budget exhausted / a deferred
 ///                  record that could not be applied, baseOffset = -1
 ///   SessionLost    the redirect reconnect failed (no answer possible)
@@ -320,12 +321,12 @@ struct AckToken {
 // a builder, the Tier-2 queue or the deferred arena: baseSequence = -1,
 // errorCode = kClientFailure).  A Tier-2 batch is one BatchAck.
 // Checked writes (View): a batch of >= 2 records whose records were judged reports EVERY rejection in its BatchAck (see
-// rejectedCount / rejections below), never only the first; a 1-record batch keeps errorCode = its rejection, baseOffset -1.
+// rejectedCount / rejections below), never only the first; a 1-record batch keeps errorCode = its rejection, baseOffset = its offset.
 struct BatchAck {
     static constexpr int16_t kClientFailure = -1;  ///< delivery timeout / redirect exhausted / closed
     int32_t topicId      = 0;
     int32_t partition    = 0;
-    int64_t baseOffset   = -1;  ///< -1 unless errorCode == 0
+    int64_t baseOffset   = -1;  ///< -1 unless errorCode == 0 or the batch's records were judged
     int32_t baseSequence = 0;
     int32_t recordCount  = 0;
     int16_t errorCode    = 0;   ///< 0 OK; >0 broker ErrorCode; kClientFailure
@@ -335,7 +336,7 @@ struct BatchAck {
     /// rotation).  Handler form (onBatchAck) only; -1 in the Completions form
     /// (batchAcksTo / batchAckOf: no room in a Completion) and when not sequenced.
     int64_t producerId = -1;
-    /// Checked writes (View, a batch of >= 2 records): the batch was STORED and judged, and the records listed here were
+    /// Checked writes (View, a non-atomic batch of >= 2 records; an atomic BatchBuilder batch is all or nothing: errorCode set, rejectedCount 0): the batch was STORED and judged, and the records listed here were
     /// rejected; every other record was accepted at baseOffset + its index.  `errorCode != 0` with `rejectedCount > 0` means
     /// exactly that (baseOffset is the real base, errorCode the FIRST rejection's code).  `rejections` points at
     /// `rejectedCount` 8-byte LE entries (u16 record index, u16 code, u32 constraintId), ascending index; valid only during the
@@ -594,6 +595,16 @@ private:
     std::variant<Refused, Open, Settled> state_{Refused{}};
 };
 
+/// commitTransactionAndWait()'s outcome.  `ok` false: a partition voted no and the transaction is aborted - `code` is
+/// the vote (55 / 56 / 57 / 62 / 63), `constraintId` the constraint (0 when none), `failingOffset` the record's offset (-1: none).
+struct TxnCommitResult {
+    bool     ok            = true;
+    uint16_t code          = 0;
+    uint32_t constraintId  = 0;
+    int64_t  failingOffset = -1;
+};
+
+
 // ---------------------------------------------------------------------------
 // Producer
 //
@@ -679,10 +690,10 @@ public:
     /// failure path; the void path has no acknowledgement to lose.
     /// A non-Upsert `intent` (here and in every send form below) is refused locally, before anything is queued or
     /// reserved, with SendResult::WriteNotAllowed (the blocking forms throw std::invalid_argument naming the
-    /// rule): on a raw handle, without View in the producer's acks, in a transaction, or Insert with an empty value.
+    /// rule): on a raw handle, without View in the producer's acks (a transactional producer needs none), or Insert with an empty value.
     /// A View producer also refuses every send on a raw handle.
     /// On a Modulo (autoincrement) handle a live Upsert is refused too, and so is a key-0 create from a producer that is not
-    /// idempotent or whose acks lack All; a key-0 create needs neither View nor Part G.
+    /// idempotent or whose acks lack All; a key-0 create is not refused locally for lacking View.
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
                                      WriteIntent intent = WriteIntent::Upsert) noexcept;
 
@@ -859,7 +870,7 @@ public:
     /// bytes without View, or for n == 1), so a verdict list never overflows the queue; a claim whose completion record cannot
     /// fit one queue record (an eighth of the queue's capacity), or whose reservation exceeds Completions::maxReservation(),
     /// returns MessageTooLarge with nothing reserved (4096 records fit a default queue).
-    /// A claim of ONE record keeps single-record semantics (BrokerError, value -1).
+    /// A claim of ONE record keeps single-record semantics (BrokerError, value = its offset).
     [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen,
                                         Completions& cq, Token token) noexcept;
     /// claimBatch whose single completion goes to the onAck() handler (same value rule as above).
@@ -1025,7 +1036,8 @@ public:
                                          std::chrono::nanoseconds timeout = kDefaultTxnWait);
     void sendOffsetsToTransactionAndWait(std::span<const OffsetEntry> offsets, const GroupMetadata& group,
                                          std::chrono::nanoseconds timeout = kDefaultTxnWait);
-    void commitTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
+    /// Throws for every failure except a no vote, which comes back in the result (the transaction is aborted).
+    TxnCommitResult commitTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
     void abortTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
     void flushAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
 
@@ -1130,10 +1142,11 @@ private:
     OpResult issueTxn_(std::uint8_t kind, const CompletionTarget& target, Token token,
                        std::span<const OffsetEntry> offsets, std::string_view groupId,
                        int32_t generationId = -1, std::string_view memberId = {});
-    /// The *AndWait body: issue + wait + map the completion to an exception.
+    /// The *AndWait body: issue + wait + map the completion to an exception.  `vote` (a commit): a no vote fills it and
+    /// does not throw.
     void txnAndWait_(const char* what, std::chrono::nanoseconds timeout, std::uint8_t kind,
                      std::span<const OffsetEntry> offsets, std::string_view groupId,
-                     int32_t generationId = -1, std::string_view memberId = {});
+                     int32_t generationId = -1, std::string_view memberId = {}, TxnCommitResult* vote = nullptr);
     /// T15b M3: the one send body; `part` computed once by the caller.
     [[nodiscard]] SendResult trySendPart_(TopicHandle topic, int32_t part, const Key& key,
                                           std::span<const uint8_t> value, WriteIntent intent) noexcept;

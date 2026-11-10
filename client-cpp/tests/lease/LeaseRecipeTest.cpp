@@ -197,7 +197,7 @@ struct Applier {
                 updates.push_back(r.key);
                 updateValues.push_back(r.value);
                 if (m.held(r.key) && m.table.at(r.key).version == version) { (void)m.update(r.key); out = version; }
-                else err = 62;   // LeaseNotFound: the broker no longer knows this (key, version)
+                else err = 64;   // LeaseNotFound: the broker no longer knows this (key, version)
             } else if (op == Op::Revoke) {
                 revokes.push_back(r.key);
                 if (m.held(r.key) && m.table.at(r.key).version == version) { (void)m.revoke(r.key); out = version; }

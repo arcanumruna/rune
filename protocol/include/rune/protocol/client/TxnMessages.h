@@ -423,14 +423,21 @@ struct EndTxn {
 // Total = 24 + 2 = 26 bytes
 // ===========================================================================
 struct EndTxnResponse {
-    int64_t sessionId     = 0;
-    int64_t correlationId = 0;
-    int16_t errorCode     = 0;  // ErrorCode value; 0 = OK
+    int64_t  sessionId     = 0;
+    int64_t  correlationId = 0;
+    int16_t  errorCode     = 0;  // ErrorCode value; 0 = OK
+    // The vote trailer (client version 17): the constraint id and the offset a transaction-vote rejection names.
+    // Written only by encodeFor(), only for a session >= kClientVersionCheckedWrites and only when hasVote.
+    uint32_t constraintId  = 0;
+    int64_t  failingOffset = -1;
+    bool     hasVote       = false;
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::EndTxnResponse); // 54
     static constexpr uint16_t BODY_FIXED  = 2;  // errorCode(2)
+    static constexpr uint16_t BODY_FIXED_V17 = 14;  // errorCode(2) + constraintId(4) + failingOffset(8)
 
-    static constexpr std::size_t ENCODED_SIZE = MessageHeader::ENCODED_SIZE + BODY_FIXED; // 26
+    static constexpr std::size_t ENCODED_SIZE     = MessageHeader::ENCODED_SIZE + BODY_FIXED; // 26
+    static constexpr std::size_t ENCODED_SIZE_V17 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V17; // 38
 
     /// Encode the full frame (26 bytes) into buf.  Returns 26.
     std::size_t encode(uint8_t* buf) const noexcept {
@@ -447,6 +454,26 @@ struct EndTxnResponse {
         detail::putLE16s(buf, fixedBase + 0, errorCode);
 
         return ENCODED_SIZE;
+    }
+
+    /// The frame for a session that connected with `clientVersion`: the 38-byte frame with the vote trailer from
+    /// kClientVersionCheckedWrites on when hasVote, else exactly encode()'s 26 bytes.  Returns the bytes written.
+    std::size_t encodeFor(uint8_t* buf, int32_t clientVersion) const noexcept {
+        if (!hasVote || !clientUnderstandsCheckedWrites(clientVersion)) return encode(buf);
+        MessageHeader hdr;
+        hdr.blockLength   = BODY_FIXED_V17;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+
+        constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
+        detail::putLE16s(buf, fixedBase + 0, errorCode);
+        detail::putLE32 (buf, fixedBase + 2, static_cast<int32_t>(constraintId));
+        detail::putLE64 (buf, fixedBase + 6, failingOffset);
+        return ENCODED_SIZE_V17;
     }
 
     /// Decode a full frame from buf[0..avail-1].
@@ -466,6 +493,12 @@ struct EndTxnResponse {
 
         constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
         msg.errorCode = detail::getLE16s(buf, fixedBase + 0);
+        if (hdr.blockLength >= BODY_FIXED_V17) {
+            if (avail < ENCODED_SIZE_V17) return std::nullopt;
+            msg.constraintId  = static_cast<uint32_t>(detail::getLE32(buf, fixedBase + 2));
+            msg.failingOffset = detail::getLE64(buf, fixedBase + 6);
+            msg.hasVote       = true;
+        }
 
         return msg;
     }

@@ -4,6 +4,7 @@
 #include <rune/consensus/AeronIngress.h>
 #include <rune/consensus/IngressRing.h>
 #include <rune/gateway/ClientGateway.h>
+#include <rune/node/DriverPumpAgent.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/node/UdpMessageSink.h>
@@ -22,6 +23,8 @@
 #include <atomic>
 #include <filesystem>
 #include <string>
+#include <cstring>
+#include <new>
 #include <thread>
 
 using namespace rune::node;
@@ -43,7 +46,13 @@ struct InvokerShard {
         aeron::Context ctx; ctx.aeronDir(dir.string()); ctx.useConductorAgentInvoker(true);
         client = aeron::Aeron::connect(ctx);
     }
-    ~InvokerShard() { client.reset(); driver.reset(); std::error_code ec; fs::remove_all(dir, ec); }
+    ~InvokerShard() {
+        client.reset();
+        driver->close();
+        EXPECT_FALSE(driver->isOpen()) << "closed off its pump thread: the driver leaked (join, then bindPumpThread)";
+        driver.reset();
+        std::error_code ec; fs::remove_all(dir, ec);
+    }
     rune::aeronutil::AeronPump pump() { return driver->pumpWith(client.get()); }
 };
 }
@@ -267,4 +276,126 @@ TEST(AeronPumpRegression, UntilAnsweredHasNoDeadlineOfItsOwn) {
                               rune::aeronutil::AeronPump::kUntilAnswered, &failed))
         << "a registration error (failed) still stops it";
     EXPECT_EQ(calls, 7);
+}
+
+// ---------------------------------------------------------------------------
+// Fused startup: the starter thread and the interim DriverPumpAgent thread share one invoker-mode client, whose
+// add*/find*/invoke race (a registration lost to an unlocked append vs compaction is never answered: the startNodes
+// hang).  The gate keeps one thread in the client at a time.
+// ---------------------------------------------------------------------------
+TEST(StartupClientGateRegression, ResolveLetsThePumpThreadInOnlyWhileItSleeps) {
+    rune::aeronutil::StartupClientGate gate;
+    std::atomic<bool> inFind{false}, stop{false}, sawFree{false}, violated{false};
+    std::thread pumpThread([&] {
+        while (!stop.load()) {
+            if (gate.tryLock()) {
+                if (inFind.load()) violated = true;   // took the client while the starter was inside it
+                sawFree = true;
+                gate.unlock();
+            }
+            std::this_thread::yield();
+        }
+    });
+    gate.acquire();
+    int calls = 0;
+    rune::aeronutil::AeronPump pump;
+    const auto r = pump.resolve([&]() -> std::shared_ptr<int> {
+        inFind = true;
+        const bool done = ++calls == 20;
+        std::this_thread::sleep_for(100us);
+        inFind = false;
+        return done ? std::make_shared<int>(1) : nullptr;
+    }, rune::aeronutil::AeronPump::kUntilAnswered);
+    EXPECT_TRUE(r);
+    EXPECT_FALSE(gate.tryLock()) << "resolve() returns still holding the gate";
+    gate.release();
+    stop = true;
+    pumpThread.join();
+    EXPECT_FALSE(violated.load());
+    EXPECT_TRUE(sawFree.load()) << "resolve() never let the pump thread in while it slept";
+}
+
+TEST(StartupClientGateRegression, TheInterimPumpDoesNotInvokeTheClientWhileTheStarterHoldsTheGate) {
+    InvokerShard s;
+    rune::aeronutil::StartupClientGate gate;
+    DriverPumpAgent agent(*s.driver, *s.client, gate);
+    gate.acquire();
+    const int64_t reg = s.client->addSubscription("aeron:ipc", 7101);
+    for (int i = 0; i < 200; ++i) {
+        (void)agent.doWork(0);
+        std::this_thread::sleep_for(100us);
+    }
+    EXPECT_FALSE(s.client->findSubscription(reg)) << "the pump invoked the client under the starter's hold";
+    gate.release();
+    std::shared_ptr<aeron::Subscription> sub;
+    for (int i = 0; i < 2000 && !(sub = s.client->findSubscription(reg)); ++i) {
+        (void)agent.doWork(0);
+        std::this_thread::sleep_for(100us);
+    }
+    EXPECT_TRUE(sub);
+}
+
+TEST(StartupClientGateRegression, StarterAddsAgainstARunningPumpAreAllAnswered) {
+    InvokerShard s;
+    rune::aeronutil::StartupClientGate gate;
+    DriverPumpAgent agent(*s.driver, *s.client, gate);
+    std::atomic<bool> stop{false};
+    std::thread pumpThread([&] { while (!stop.load()) { (void)agent.doWork(0); std::this_thread::yield(); } });
+    gate.acquire();
+    int resolved = 0;
+    for (int i = 0; i < 100; ++i) {
+        const int64_t reg = s.client->addSubscription("aeron:ipc", 7200 + i);
+        rune::aeronutil::AeronPump pump;
+        pump.withStartupDeadline(5s);
+        resolved += pump.resolve([&] { return s.client->findSubscription(reg); }, rune::aeronutil::AeronPump::kUntilAnswered) ? 1 : 0;
+    }
+    gate.release();
+    stop = true;
+    pumpThread.join();
+    s.driver->bindPumpThread();                 // hand-off back: the pump thread bound it, this thread closes it
+    EXPECT_EQ(resolved, 100);
+}
+
+TEST(StartupDeadlineRegression, AnUnansweredResolveFailsAtTheDeadlineNamingTheChannelAndStream) {
+    EXPECT_EQ(rune::aeronutil::AeronPump{}.startupDeadline(), 60s);
+    InvokerShard s;   // nothing pumps its driver: the answer never comes
+    rune::aeronutil::AeronPump pump;
+    pump.withStartupDeadline(100ms);
+    const auto t0 = std::chrono::steady_clock::now();
+    WorkerIngress ing(s.client, "aeron:ipc", 7301, pump);
+    EXPECT_FALSE(ing.resolved());
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 1s);
+
+    rune::aeronutil::AeronPump bounded;
+    EXPECT_FALSE(bounded.resolve([] { return std::shared_ptr<int>{}; }, 10ms));
+    EXPECT_FALSE(bounded.deadlineExpired()) << "an explicit budget is not the startup deadline";
+    pump.withStartupDeadline(20ms);
+    EXPECT_FALSE(pump.resolve([] { return std::shared_ptr<int>{}; }, rune::aeronutil::AeronPump::kUntilAnswered));
+    EXPECT_TRUE(pump.deadlineExpired());
+    EXPECT_FALSE(pump.resolve([] { return std::shared_ptr<int>{}; }, 5ms));
+    EXPECT_TRUE(pump.deadlineExpired()) << "a later bounded expiry does not clear it";
+}
+
+TEST(StartupDeadlineRegression, AResolveAnsweredRightAfterTheDeadlineStillSucceeds) {
+    // A process pause longer than the deadline: the answer is there, the pump thread just has not run since the resume.
+    rune::aeronutil::AeronPump pump;
+    pump.withStartupDeadline(0ms);
+    int calls = 0;
+    EXPECT_TRUE(pump.resolve([&] { return ++calls == 2 ? std::make_shared<int>(1) : std::shared_ptr<int>{}; },
+                             rune::aeronutil::AeronPump::kUntilAnswered));
+    EXPECT_FALSE(pump.deadlineExpired());
+}
+
+TEST(StartupClientGateRegression, ReleaseClearsTheStarterThreadsHeldPointer) {
+    using Gate = rune::aeronutil::StartupClientGate;
+    alignas(Gate) unsigned char storage[sizeof(Gate)];
+    auto* gate = new (storage) Gate;
+    gate->acquire();
+    EXPECT_EQ(Gate::heldHere(), gate);
+    gate->release();
+    gate->~Gate();
+    // The dead gate's storage is reused by something that looks like a gate held by this very thread.
+    const std::thread::id self = std::this_thread::get_id();
+    for (std::size_t off = 0; off + sizeof(self) <= sizeof(storage); off += sizeof(self)) std::memcpy(storage + off, &self, sizeof(self));
+    EXPECT_EQ(Gate::heldHere(), nullptr) << "the starter thread still points at a gate that no longer exists";
 }

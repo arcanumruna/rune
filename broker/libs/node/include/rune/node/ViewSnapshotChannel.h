@@ -42,6 +42,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 namespace rune::node {
@@ -107,13 +108,30 @@ struct ViewSnapshotChannel {
     // in its own doWork (WorkerViewSet::drainInstalls) and calls installView on
     // ITS OWN thread — shared-nothing (installView is never called cross-thread).
     static constexpr int32_t     kInstallMsgType   = 3;
+    // control -> worker on `install`: {appliedThrough i64}, the catalog position the node has applied (#788).  Sent after the plan
+    // installs and uninstalls of the events it covers, through the same FIFO.
+    static constexpr int32_t     kCatalogMarkMsgType = 7;
     // 4 was the checkpoint-truncate "reset" frame.  Retired (replaced by kDiscardMsgType = 5, discard + backup): the value is never reused.
     static constexpr std::size_t kDeltaHeaderBytes = 8;  // viewTopicId i32 + partition i32
+    // P11-9: a delta past one message goes as a run of these, in order, for one (view, partition): [view i32][part i32][at u32]
+    // [more u8][pad 3], then the delta's bytes from `at`.  at 0 starts a run.  The IO agent writes each part as it comes and moves
+    // the durable offset (the ack) only on the part without `more`; a run cut short is a torn tail that recovery drops.
+    static constexpr int32_t     kDeltaPartMsgType     = 8;
+    static constexpr std::size_t kDeltaPartHeaderBytes = 16;
     static constexpr std::size_t kDoneMsgBytes      = 16; // viewTopicId i32 + partition i32 + O i64
 
     OneToOneByteRing deltas{1 << 20};  // worker -> IO
     OneToOneByteRing done{4096};       // IO -> worker (durable-offset acks)
     OneToOneByteRing install{1 << 20}; // control -> worker (compiled view plans; Task 19)
 };
+
+/// False: the ring is full.
+inline bool encodeCatalogMark(OneToOneByteRing& ring, int64_t appliedThrough) {
+    const auto idx = ring.tryClaim(ViewSnapshotChannel::kCatalogMarkMsgType, sizeof appliedThrough);
+    if (idx < 0) return false;
+    std::memcpy(ring.base() + idx, &appliedThrough, sizeof appliedThrough);
+    ring.commit(idx);
+    return true;
+}
 
 } // namespace rune::node

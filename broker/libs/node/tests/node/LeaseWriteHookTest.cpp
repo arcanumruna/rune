@@ -433,7 +433,7 @@ TEST(LeaseWriteHookRegression, UpdateThenRevokeSameBatchRefusedRegression) {
     const Outcome far = r.write(batchOf({updateOf(3, 5), grantOf(9), revokeOf(7, 5), updateOf(1, 5), revokeOf(1, 5)}), false);   // refused even when far apart
     EXPECT_EQ(far.why, H::LeaseUpdateThenRevoke);
     EXPECT_EQ(r.write(batchOf({updateOf(1, 5), revokeOf(2, 6)}), false).code, OKC) << "different keys";
-    EXPECT_EQ(r.write(batchOf({revokeOf(1, 5), updateOf(1, 5)}), false).code, OKC) << "revoke then update: the judge answers the update 62";
+    EXPECT_EQ(r.write(batchOf({revokeOf(1, 5), updateOf(1, 5)}), false).code, OKC) << "revoke then update: the judge answers the update 64";
     EXPECT_EQ(r.write(batchOf({updateOf(1, 5), updateOf(1, 5)}), false).code, OKC);
     EXPECT_EQ(r.write(batchOf({revokeOf(1, 5), revokeOf(1, 5)}), false).code, OKC);
     // many updates (hash clustering), one revoke of the last: still found

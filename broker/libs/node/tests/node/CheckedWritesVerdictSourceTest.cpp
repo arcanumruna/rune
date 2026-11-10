@@ -118,6 +118,7 @@ struct Member {
 struct Rig {
     Log log;
     PartitionWriteState st;
+    TxnOverlayPool pool;
     VerdictSource vs{5, 0};
     std::vector<std::unique_ptr<Member>> members;
 
@@ -127,6 +128,7 @@ struct Rig {
         return *members.back();
     }
     void start() {
+        vs.bindTxn(&pool, {}, 0);   // replay folds against the pool's supersede keys; production always binds one
         vs.bindState(&st);
         vs.bindLeader(nullptr, 1, 0);
     }
@@ -357,7 +359,7 @@ TEST(CheckedWritesVerdictSource, FeedMergesMarkersAndChanges) {
     PartitionWriteState st;
     std::vector<uint8_t> change(cr::changeBatchBytes(1));
     const cr::ChangeMember cm{7, uint8_t(VerdictViewKind::TestReject), 1234};
-    ASSERT_NE(cr::buildConstraintSetChange(change, 1, std::span<const cr::ChangeMember>(&cm, 1)), 0u);
+    ASSERT_NE(cr::buildConstraintSetChange(change, 1, -1, std::span<const cr::ChangeMember>(&cm, 1)), 0u);
     verdictFeedBatch(&st, change.data(), change.size(), 10);
     std::vector<uint8_t> marker(cr::markerBatchBytes(1));
     const cr::MarkerEntry me{2, kViolation, 0x00070001};
@@ -411,7 +413,7 @@ TEST(CheckedWritesVerdictSource, JudgeSeesTheRecordIntent) {
 
 namespace {
 
-// Types 16 and 19 have no builder yet: a value of exactly six bytes ([version][5 bytes]) is what the old txn-marker
+// Types 16 and 19 have no builder: a value of exactly six bytes ([version][5 bytes]) is what the old txn-marker
 // reader accepted, so a reader without the hardening mistakes it for a marker.
 std::vector<uint8_t> controlOfType(int16_t type, int64_t base) {
     std::vector<uint8_t> b;
@@ -420,7 +422,11 @@ std::vector<uint8_t> controlOfType(int16_t type, int64_t base) {
         (void)cr::buildVerdictMarker(b, cr::MarkerHeader{0, 0, 0, 0}, {});
     } else if (type == cr::kConstraintSetChange) {
         b.resize(cr::changeBatchBytes(0));
-        (void)cr::buildConstraintSetChange(b, 1, {});
+        (void)cr::buildConstraintSetChange(b, 1, -1, {});
+    } else if (type == cr::kVerdictPlan) {
+        const std::vector<uint8_t> blob(24, 0x42);
+        b.resize(cr::verdictPlanBatchBytes(cr::verdictPlanPayloadBytes(blob.size(), blob.size(), blob.size())));
+        (void)cr::buildVerdictPlan(b, cr::VerdictPlanHeader{7, 0xF00D, 2}, blob, blob, blob);
     } else {
         b.resize(cr::detail::batchBytes(6));
         std::size_t p = cr::detail::beginBatch(b.data(), type, 6);
@@ -473,24 +479,24 @@ struct TmpDir {
 
 }  // namespace
 
-TEST(CheckedWritesControlRecordRegression, EveryLogReaderSkipsTypes16To19Regression) {
+TEST(CheckedWritesControlRecordRegression, EveryLogReaderSkipsTypes16To20Regression) {
     namespace tx = rune::transaction;
-    for (const auto& lookalike : {txnFramedLookalike(-1, 0), txnFramedLookalike(5, cr::kVerdictMarker), txnFramedLookalike(-1, cr::kTxnJudge)}) {
+    for (const auto& lookalike : {txnFramedLookalike(-1, 0), txnFramedLookalike(5, cr::kVerdictMarker), txnFramedLookalike(-1, cr::kTxnJudge), txnFramedLookalike(-1, cr::kVerdictPlan)}) {
         tx::LsoTracker tracker(8);
         tx::AbortedTxnIndex aborted;
-        tx::RcBuilder builder(&tracker, &aborted);
+        tx::RcBuilder builder(&tracker, &aborted, false);
         EXPECT_EQ(builder.step(lookalike.data(), lookalike.size()).outcome, tx::RcBuilder::Outcome::Ignored);
         tx::ControlMarkerPayload payload{};
         EXPECT_FALSE(tx::ControlMarker::extract(lookalike.data(), 0, payload, lookalike.size()));
     }
-    for (const int16_t type : {cr::kReservation, cr::kVerdictMarker, cr::kConstraintSetChange, cr::kTxnJudge}) {
+    for (const int16_t type : {cr::kReservation, cr::kVerdictMarker, cr::kConstraintSetChange, cr::kTxnJudge, cr::kVerdictPlan}) {
         SCOPED_TRACE("control record type " + std::to_string(type));
         const std::vector<uint8_t> ctl = controlOfType(type, 0);
 
         {   // (1) RcBuilder::step
             tx::LsoTracker tracker(8);
             tx::AbortedTxnIndex aborted;
-            tx::RcBuilder builder(&tracker, &aborted);
+            tx::RcBuilder builder(&tracker, &aborted, false);
             const auto res = builder.step(ctl.data(), ctl.size());
             EXPECT_EQ(res.outcome, tx::RcBuilder::Outcome::Ignored);
             EXPECT_EQ(tracker.lso(100), 100);
@@ -676,6 +682,54 @@ TEST(CheckedWritesVerdictSourceRegression, RetireIsPerPartitionRegression) {
     EXPECT_TRUE(st[1].rejected.isRejected(3)) << "partition 1 judged below its drop with the member";
     EXPECT_GE(st[1].markers.committedThrough(), 11);
     EXPECT_TRUE(vs.verdictSource(5, 1) == nullptr || vs.verdictSource(5, 1)->judgedThrough() >= log[1].next);
+}
+
+// A retiring view is attached only by a judge that is activated: partition 1's fresh judge is already past the drop and would never retire it.
+TEST(CheckedWritesVerdictSourceRegression, FreshJudgePastTheDropDoesNotAttachRetiringViewRegression) {
+    ViewSnapshotChannel channel;
+    const std::string dir = (std::filesystem::temp_directory_path() / ("rune-cw-retire-fresh-" + std::to_string(::getpid()))).string();
+    struct Cleanup { std::string d; ~Cleanup() { std::error_code ec; std::filesystem::remove_all(d, ec); } } cleanup{dir};
+    WorkerViewSet vs(channel, dir);
+    const rune::codec::Descriptor src = tagSource();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    const TestRejectRule rule = tagEquals(9);
+    constexpr int32_t kViewTopic = 0x40000001;
+    constexpr uint64_t kObject = 7;
+    auto comp = rune::view::compileView(tagView(), srcs, kViewTopic).value();
+    vs.installTestVerdictViewForTest(comp.plan, comp.rowLayout, src, false, kObject, rule);
+
+    Log log[2];
+    TopicWriteSpec spec;
+    PartitionWriteState st[2];
+    for (int p = 0; p < 2; ++p) {
+        st[p].spec = &spec;
+        log[p].control();                                                             // 0: the set
+        std::vector<Rec> a, b;
+        for (int i = 1; i <= 9; ++i) a.push_back({i, i == 3 ? 9 : 1});
+        log[p].data(a);                                                               // 1..9
+        log[p].control();                                                             // 10: the drop
+        for (int i = 11; i <= 15; ++i) b.push_back({i, 1});
+        log[p].data(b);                                                               // 11..15
+        st[p].constraintSets.onChange(0, setOf(1, {{kObject, rule.fingerprint()}}));
+        st[p].constraintSets.onChange(10, setOf(2, {}));
+    }
+    const auto drive = [&](int p) {
+        auto readRange = [&](int64_t from, int64_t) { return log[p].read(from); };
+        vs.driveFolds(5, p, readRange, log[p].next, rune::view::kNoSkip, 200'000'000, nullptr, 1, true, {}, &st[p], vs.ensureVerdictSource(5, p, st[p]));
+        verdictOnHw(st[p], 1'000'000);
+    };
+    vs.ensureVerdictSource(5, 0, st[0])->bindLeader(nullptr, 1, 0);
+    ASSERT_TRUE(vs.uninstallView(kViewTopic));   // partition 0 judges it: it retires
+    st[1].rejected.reserve(kIndexReserve);
+    st[1].rejected.noteCovered(16);              // partition 1's previous leader finished the drop
+    VerdictSource* fresh = vs.ensureVerdictSource(5, 1, st[1]);
+    ASSERT_NE(fresh, nullptr);
+    fresh->bindLeader(nullptr, 1, 0);
+    EXPECT_EQ(fresh->memberCountForTest(), 0u) << "not activated: it holds nothing it could retire";
+    for (int i = 0; i < 4; ++i) drive(1);
+    EXPECT_EQ(vs.verdictSource(5, 1)->memberCountForTest(), 0u) << "past the drop, it never attaches the view";
+    for (int i = 0; i < 4; ++i) drive(0);
+    EXPECT_EQ(vs.retiringVerdictTemplatesForTest(), 0u) << "partition 0 passed its drop and nothing else holds the view";
 }
 
 // A View ack waits for the views of the source to fold past it; a verdict view that was dropped and is only judged up to its
@@ -909,7 +963,7 @@ TEST(CheckedWritesVerdictSourceRegression, RebuildAcrossACompactionGapBeforeTheM
     };
     std::vector<uint8_t> change(cr::changeBatchBytes(1));
     const cr::ChangeMember cm{x.objectId, uint8_t(VerdictViewKind::TestReject), x.rule.fingerprint()};
-    (void)cr::buildConstraintSetChange(change, 1, std::span<const cr::ChangeMember>(&cm, 1));
+    (void)cr::buildConstraintSetChange(change, 1, -1, std::span<const cr::ChangeMember>(&cm, 1));
     put(change, 0, 1);                                                  // 0: the set {x}
     data(1, {{1, 1}});                                                  // 1
     data(2, {{2, 9}});                                                  // 2: rejected, compacted away
@@ -945,7 +999,9 @@ TEST(CheckedWritesVerdictSourceRegression, RebuildAcrossACompactionGapBeforeTheM
     verdictOnHw(st, log.logEndOffset());
     ASSERT_EQ(st.rejected.coveredThrough(), 3);
 
+    TxnOverlayPool pool;
     VerdictSource vs{5, 0};
+    vs.bindTxn(&pool, {}, 0);
     vs.installTestVerdictViewForTest(x.inst.get(), x.objectId, x.rule);
     vs.bindState(&st);
     vs.bindLeader(nullptr, 1, log.logStartOffset());
@@ -984,7 +1040,7 @@ void catchUpAcrossTheGapAtTheBound(const char* name, bool markerAboveHw) {
     };
     std::vector<uint8_t> change(cr::changeBatchBytes(1));
     const cr::ChangeMember cm{x.objectId, uint8_t(VerdictViewKind::TestReject), x.rule.fingerprint()};
-    (void)cr::buildConstraintSetChange(change, 1, std::span<const cr::ChangeMember>(&cm, 1));
+    (void)cr::buildConstraintSetChange(change, 1, -1, std::span<const cr::ChangeMember>(&cm, 1));
     put(change, 0, 1);
     data(1, {{1, 1}});
     data(2, {{2, 9}});
@@ -1022,7 +1078,9 @@ void catchUpAcrossTheGapAtTheBound(const char* name, bool markerAboveHw) {
     ASSERT_EQ(st.markers.committedThrough(), 3);
     ASSERT_EQ(st.rejected.coveredThrough(), K);
 
+    TxnOverlayPool pool;
     VerdictSource vs{5, 0};
+    vs.bindTxn(&pool, {}, 0);
     vs.installTestVerdictViewForTest(x.inst.get(), x.objectId, x.rule);
     vs.bindState(&st);
     vs.bindLeader(nullptr, 1, log.logStartOffset());

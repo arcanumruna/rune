@@ -204,7 +204,7 @@ and NAT egress merged. What exists today (line numbers are hints; use the quoted
    mutation is recorded in the commit message.
 
 **Numbers (symbolic in the code until Task 1 assigns them; Decision L14).** Values free at the current tip:
-- error codes `kErrLeaseNotFound = 62`, `kErrLeaseLimitExceeded = 63`, `kErrLeaseTtlTooLarge = 64` (client
+- error codes (moved from 62–64 when main's checked writes Part 11 took 62/63 for `TxnTooLarge`/`TxnConflict`) `kErrLeaseNotFound = 64`, `kErrLeaseLimitExceeded = 65`, `kErrLeaseTtlTooLarge = 66` (client
   `ErrorCode::LeaseNotFound`, `LeaseLimitExceeded`, `LeaseTtlTooLarge`);
 - `kClientVersionLeases = 18` (= `kClientVersion`), `kBrokerVersionLeases = 11` (= `kBrokerVersion`);
 - `MetadataFeature::kLeases = 6` (= `kLatest`);
@@ -366,7 +366,7 @@ settlements. The items below are open points the spec leaves to the implementati
   - The revoke re-encode carries the row's TTL and remaining. The judge does not check an update's or revoke's TTL or
     remaining.
   - Task 5c: the lease ack trailer is filled at `View`-ack fire; a known-old duplicate is answered from the index
-    (grant 21, live update no verdict, else 62, entries `{-1, 0}`, `Throttled` 1 ms while not ready or the arena is
+    (grant 21, live update no verdict, else 64, entries `{-1, 0}`, `Throttled` 1 ms while not ready or the arena is
     full).
   - Task 8 keeps the live version's grant record as well as its checkpoint and its latest record. This is a merge
     gate.
@@ -518,7 +518,7 @@ Spec §5.3 (gates), §6.1, §6.2, §6.6 (predicates), §8.1–§8.3 (wire), §20
 **Files:**
 - Create: `protocol/include/rune/protocol/LeaseRecord.h`, `protocol/include/rune/protocol/LeaseSpec.h`,
   `protocol/include/rune/protocol/client/LeaseMessages.h`; test `protocol/tests/LeaseProtocolTest.cpp`.
-- Modify: `protocol/include/rune/protocol/client/Protocol.h` (codes 62–64, templates 96–101, `kClientVersionLeases`,
+- Modify: `protocol/include/rune/protocol/client/Protocol.h` (codes 64–66, templates 96–101, `kClientVersionLeases`,
   `kClientVersion`, `kBrokerVersionLeases`, `kBrokerVersion`); `client/Dispatch.h` (`isKnownTemplate` lease range
   96–101; comments); `client/DataMessages.h` (`ProduceResponse` lease trailer, L2); `client/SchemaMessages.h`
   (`DefineTopic` optional `LeaseSpec` after `persistence`, presence byte; `TopicSchemaResponse` lease trailer, L3);
@@ -581,7 +581,7 @@ struct ScanLeasesResponse { int64_t sessionId, correlationId; uint16_t code; int
   - `…SchemaLeaseTrailerRegression`, `…DefineTopicLeaseSpecRegression`: present/absent; old bytes decode unchanged.
   - `…LeaseSpecValidateRegression`: each §5.2 bound at min−1, min, max, max+1; `min_ttl < 1000` refused (R11).
   - `…TemplateDispatchRegression`: 96–101 known; 93–95 and 102–111 `UnknownTemplate`.
-  - `…NumbersPinnedRegression`: codes 62–64, client 18, broker 11, `kLeases = 6`, `LeaseIndex = 4` (L14).
+  - `…NumbersPinnedRegression`: codes 64–66, client 18, broker 11, `kLeases = 6`, `LeaseIndex = 4` (L14).
   Mutation: swap two `LeaseSpec` fields → the golden hex prefix in `DefineTopicLeaseSpecRegression` fails; make
   `isTombstone` ignore `TopicTraits` → `PredicatesRegression` fails.
 - [ ] **Step 2:** implement. Run `ctest --test-dir build -R 'LeaseProtocol|ProtocolDispatch|DataMessages|SchemaMessages' --output-on-failure -j8`.
@@ -954,7 +954,7 @@ Spec §8.1, §8.2, §9.3 (keepalive race), §9.6 (demotion, drop); L11, L13.
 **Files:**
 - Create: `broker/libs/node/include/rune/node/lease/LeaseParkTable.h`, `LeaseKeepAliveServer.h`,
   `src/lease/LeaseKeepAliveServer.cpp`.
-- Modify: `WorkerOp.h` (op types `LeaseKeepAlive = 36`, `LeaseTimeToLive = 37`, `ScanLeases = 38` (served in Task
+- Modify: `WorkerOp.h` (op types `LeaseKeepAlive = 37`, `LeaseTimeToLive = 38`, `ScanLeases = 39` (served in Task
   13)); the worker return codec (answers per entry with correlation id and `index`; `final`); `Worker.h` (dispatch).
 - Modify: `broker/libs/gateway/src/ClientGateway.cpp` (dispatch 96, 98, 100: decode, session version gate
   (`InvalidRequest` below 18), namespace-scoped topic resolution (foreign = missing), authorisation (`WRITE` for
@@ -1052,7 +1052,7 @@ view's readiness gate is the existing one). Test: `broker/libs/node/tests/node/L
 
 **As built (Task 13b).** The scan hash is `wyhash64(key, seed = source topic id)`, not xxh3 (spec §8.3): the storage tables already link
 it; `ScanLeasesRegression.ScanHashGoldenRegression` pins it. The page is selected in `Worker::executeScanLeases_` (worker op 38,
-return `ScanLeasesResult = 13`) from one walk of the rids with a bounded max-heap plus a 64-entry tie list, then heapsorted; the
+return `ScanLeasesResult = 14`) from one walk of the rids with a bounded max-heap plus a 64-entry tie list, then heapsorted; the
 gateway (`handleScanLeases`) requires a lease view id and authorises READ on the SOURCE topic. The lease-view sink frame also carries the
 key type and width, so the gateway narrows a legacy u64 `GetViewRow` with the worker's helper before it picks the partition.
 
@@ -1378,7 +1378,7 @@ suspension names are rows of `LeaseMatrixTiming.TimingCellRegression` (BrokerExp
 SuspendRejectAll; Revoke has only RejectAll): ReadOnlyServesKeepAlivesRefusesWrites = Grant/Update/KeepAlive1_SuspendReadOnly;
 ReadOnlyUnkeptStillExpires = BrokerExpire_SuspendReadOnly; RejectAllStillExpires (M16) = BrokerExpire_SuspendRejectAll;
 RejectAllRefusesKeepAlives = KeepAlive1_SuspendRejectAll (strengthened: 6 s before and 6 s after the suspension, so a served keepalive would
-leave the lease alive). The ring op `NS_LEASES_OVER` (39) was added to `OpType.h` by hand (the generated header is committed). `ql/src/ConfigKeys.h`
+leave the lease alive). The ring op `NS_LEASES_OVER` (40 since the merge with checked writes Part 11, which took 36 for `TXN_VOTE`) is in `OpType.h`, regenerated from the schema. `ql/src/ConfigKeys.h`
 has no namespace keys, so there is no QL change. Usage (85) stays at 29 fields (`kNamespaceUsageFieldCount`).
 Found and fixed here: an ordinary view paused at max-view-memory-bytes held every View ack of its source until the 20 s
 timeout (Internal), so a paused user view over a lease topic stalled keepalives and let leases expire. `WorkerViewSet::minFoldCursor`

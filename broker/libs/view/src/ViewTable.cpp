@@ -111,9 +111,7 @@ ViewTable::ViewTable(RowLayout layout, size_t initialIndexSlots, size_t chunkByt
     // grow in steady state (a reserve() here just gives them a warm start
     // so the first interval's push_backs don't reallocate); dirty_/
     // dirtyKeys_ are sized to the rid space by appendChunk(), below.
-    dirtyList_.reserve(main_.cap);
-    deleted_.reserve(256);
-    deletedKeyBytes_.reserve(256 * headerLen_);
+    reserveDirty_();
 
     if (prefixWidth_) {
         outer_.init(initialIndexSlots, true, hashSeed_, hashMask_);
@@ -593,6 +591,7 @@ void ViewTable::prefixInsert(const Probe& p, uint32_t rid) {
         } else {
             id = static_cast<uint32_t>(sets_.size());
             sets_.emplace_back();
+            setFree_.reserve(sets_.capacity());   // prefixErase pushes freed set ids on the worker
             setPrefixBytes_.resize(sets_.size() * prefixWidth_);
         }
         std::memcpy(setPrefixBytes_.data() + size_t{id} * prefixWidth_, prefix, prefixWidth_);

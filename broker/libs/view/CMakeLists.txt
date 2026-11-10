@@ -8,7 +8,10 @@ add_library(rune_view STATIC
     src/AggState.cpp
     src/AggFold.cpp
     src/PlanSources.cpp
-    src/KeyedFold.cpp)
+    src/KeyedFold.cpp
+    src/CheckEval.cpp
+    src/UniqueClaims.cpp
+    src/TxnOverlay.cpp)
 target_include_directories(rune_view PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     ${RUNE_PROTOCOL_INCLUDE}
@@ -36,8 +39,18 @@ if(BUILD_TESTING)
         tests/view/CheckedWritesViewTablePrefixTest.cpp
         tests/view/CheckedWritesViewCheckpointV3Test.cpp
         tests/view/CheckedWritesKeyedFoldTest.cpp
-        tests/view/CheckedWritesKeyedAggTest.cpp)
+        tests/view/CheckedWritesKeyedAggTest.cpp
+        tests/view/CheckedWritesCheckEvalTest.cpp
+        tests/view/CheckedWritesUniqueFoldTest.cpp
+        tests/view/CheckedWritesTxnOverlayTest.cpp
+        tests/view/CheckedWritesTxnFoldTest.cpp
+        ../node/tests/support/AllocWindow.cpp)
+    target_include_directories(rune_view_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../node/tests/support)
     target_link_libraries(rune_view_tests PRIVATE rune_view rune_codec GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_view_tests)
+    # T7 review 5, N2: the overlay's spare row reads as zeroes when malloc scribbles fresh blocks, as ASan does.
+    add_test(NAME CheckedWritesTxnOverlaySpareRowUnderScribbleRegression
+             COMMAND rune_view_tests --gtest_filter=*.ShortOverlayRowsNeverReachTheSpareRow:*.OverlayRowsShorterThanATableRowAreCapacityExhausted:*.ReserveZeroesOnlyTheSpareRowRegression)
+    set_tests_properties(CheckedWritesTxnOverlaySpareRowUnderScribbleRegression PROPERTIES ENVIRONMENT "MallocScribble=1;MallocPreScribble=1;MALLOC_PERTURB_=170")
 endif()

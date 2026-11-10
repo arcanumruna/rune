@@ -531,7 +531,8 @@ TEST(ProducePathUnknownProducerIdRegression, RebuiltAfterRetentionAnswersUnknown
     EXPECT_EQ(a.baseOffset, leo);
     EXPECT_EQ(a.logStartOffset, -1) << "logStartOffset is carried only with UnknownProducerId";
 
-    // Rebuilt producer (#953): a gap is UnknownProducerId (unvouched), lower epoch still fenced.
+    // Known producer Q: a rebuilt entry cannot vouch past the log's last sequence, so a gap is UnknownProducerId until
+    // the first live append (#953); a lower epoch is still fenced.
     auto qGap = makeBatch(1, kQ, 2, 20);
     EXPECT_EQ(callHelper(qGap, log, rebuilt, 1, 0, kQ, 2, 20).error, pc::ErrorCode::UnknownProducerId);
     auto qOld = makeBatch(1, kQ, 1, 12);

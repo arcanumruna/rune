@@ -148,6 +148,7 @@ static rune::node::NodeConfig makeSmokeConfig(const fs::path& dataDir) {
     cfg.clientEndpoint.streamId = 1;
 
     cfg.workerCount = rune::node::test::workerCountFromEnv();
+    cfg.unservableWarmupMs = 50;
 
     return cfg;
 }
@@ -293,7 +294,7 @@ static int countDeletedFiles(const std::string& dir) {
     return n;
 }
 
-// Wait (bounded) for a condition to become true, polling every 50 ms.
+// Wait (bounded) for a condition to become true, polling every 5 ms.
 template <typename Pred>
 static bool waitFor(Pred&& pred,
                     std::chrono::milliseconds timeout = 6s) {
@@ -301,9 +302,15 @@ static bool waitFor(Pred&& pred,
     const auto deadline = clk::now() + timeout;
     while (clk::now() < deadline) {
         if (pred()) return true;
-        std::this_thread::sleep_for(50ms);
+        std::this_thread::sleep_for(5ms);
     }
     return pred();
+}
+
+// Wait (bounded) for the node's cleaner to complete `cycles` more cycles.
+static bool awaitCleanerCycles(rune::node::BrokerNode& node, uint64_t cycles) {
+    const uint64_t c0 = node.cleanerCyclesForTest();
+    return waitFor([&] { return node.cleanerCyclesForTest() >= c0 + cycles; }, 10s);
 }
 
 // ===========================================================================
@@ -402,7 +409,9 @@ TEST(CompactionRetentionSmoke, CompactHappyPath_LatestPerKey) {
     // No test-thread replica calls needed (TSan-clean: duty thread owns replica).
 
     // Wait for the cleaner to run (it runs on its own thread).
-    std::this_thread::sleep_for(3000ms);
+    ASSERT_TRUE(waitFor([&] {
+        return node.onOwnerThreadForTest(0, 0, [](rune::replication::PartitionReplica& r) { return r.lastCleanOffset(); }) > 0;
+    }, 10s)) << "Smoke1: the cleaner never compacted the log";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -464,7 +473,7 @@ TEST(CompactionRetentionSmoke, TombstoneLifecycle_KIP534) {
 
     constexpr int64_t kRoll = 128;
     // Short delete-retention: the stamped horizon expires between Phase A and Phase C (see below).
-    constexpr int64_t kTombRetentionMs = 3'000LL;
+    constexpr int64_t kTombRetentionMs = 150LL;
 
     // Topics exist only through DDL: boot once to create the topic in the catalog (the same properties in every
     // phase).  segment.bytes is immutable in the catalog, so Phase C keeps kRoll (it ran with 64 MiB when the
@@ -732,7 +741,7 @@ TEST(CompactionRetentionSmoke, DeleteRetention_TimeAndSize) {
     // No test-thread replica calls (duty-thread-only invariant).
 
     // Wait for retention to run.
-    std::this_thread::sleep_for(2000ms);
+    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -1019,7 +1028,7 @@ TEST(CompactionRetentionSmoke, IdempotentDedup_SurvivesRetention) {
     // HW advanced by becomeLeader() on duty-cycle thread.
     // No test-thread replica calls (duty-thread-only invariant).
 
-    std::this_thread::sleep_for(2000ms);
+    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -1111,7 +1120,7 @@ TEST(CompactionRetentionSmoke, RestartResume_Checkpoint) {
         };
         ASSERT_TRUE(rune::node::test::hasReplica(node));
 
-        std::this_thread::sleep_for(1500ms);
+        ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
 
         waitFor([&] { return lastClean() > 0; }, 2s);
         watermarkAfterFirst = lastClean();
@@ -1142,7 +1151,7 @@ TEST(CompactionRetentionSmoke, RestartResume_Checkpoint) {
         };
         ASSERT_TRUE(rune::node::test::hasReplica(node2));
 
-        std::this_thread::sleep_for(1500ms);
+        ASSERT_TRUE(awaitCleanerCycles(node2, 3)) << "the cleaner never completed 3 cycles";
 
         waitFor([&] { return lastClean2() >= watermarkAfterFirst; }, 2s);
 
@@ -1219,7 +1228,7 @@ TEST(CompactionRetentionSmoke, HwLeo_NonPerturbation) {
     // HW advanced to LEO by becomeLeader() on the duty-cycle thread.
     // No test-thread replica calls (duty-thread-only invariant).
 
-    std::this_thread::sleep_for(2500ms);
+    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -1314,7 +1323,7 @@ TEST(CompactionRetentionSmoke, AppendDuringCompaction_Correctness) {
         // No test-thread replica calls (duty-thread-only invariant).
 
         // Give cleaner 1.5 s to work.
-        std::this_thread::sleep_for(1500ms);
+        ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
         node.stop();
     }
 
@@ -1348,7 +1357,7 @@ TEST(CompactionRetentionSmoke, AppendDuringCompaction_Correctness) {
         // HW advanced by becomeLeader() on duty-cycle thread.
         // No test-thread replica calls (duty-thread-only invariant).
 
-        std::this_thread::sleep_for(2000ms);
+        ASSERT_TRUE(awaitCleanerCycles(node2, 3)) << "the cleaner never completed 3 cycles";
 
         using sclock = std::chrono::steady_clock;
         const auto t0 = sclock::now();
@@ -1436,7 +1445,7 @@ TEST(CompactionRetentionSmoke, Failover_HwBounded_NoResurrection) {
     // No test-thread replica calls (duty-thread-only invariant).
 
     // Let the cleaner compact some records (as leader).
-    std::this_thread::sleep_for(2000ms);
+    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -1704,7 +1713,7 @@ TEST(CompactionRetentionSmoke, RetentionAfterRestart) {
 //
 // This test drives the FULL post-restart new-leader path through a REAL
 // BrokerNode:
-//   Phase 1: pre-write 200 updates × 4 keys (r-MAJOR so the NEWEST value per key
+//   Phase 1: pre-write 80 records over 4 keys (r-MAJOR so the NEWEST value per key
 //            lands at the very end → in the ACTIVE, un-compacted segment).
 //   Phase 2: start node #1 (leader) → cleaner compacts the sealed prefix →
 //            checkpoint persisted to disk → stop.
@@ -1714,10 +1723,10 @@ TEST(CompactionRetentionSmoke, RetentionAfterRestart) {
 //   Phase 4: assert through the HW-BOUNDED SERVE PATH (PartitionReplica::read,
 //            the same code the gateway uses) that BOTH hold:
 //              (A) CONVERGENCE: exactly one live record per key (no superseded).
-//              (B) TAIL DELIVERY: the newest value per key (v199-region) is
+//              (B) TAIL DELIVERY: the newest value per key (v19-region) is
 //                  present and HW-bounded (served from the active segment).
 //
-// Non-vacuous: 200 records → 4 keys.  Before compaction there are 200 records;
+// Non-vacuous: 80 records → 4 keys.  Before compaction there are 80 records;
 // a passing test requires the served set to collapse to exactly 4 AND to carry
 // the maximum seq per key.  If the new leader fails to re-compact, arm (A) sees
 // > 4; if it drops the active tail, arm (B) sees a stale value.
@@ -1740,10 +1749,12 @@ static void serveScanLatestPerKey(
     liveCountOut = 0;
     // Gateway resolves "Earliest" to logStartOffset (bug-1 fix 0ec0592), NOT 0.
     int64_t cursor = log.logStartOffset();
+    std::vector<uint8_t> buf(1 << 20);
     while (cursor < hwBound) {
-        auto bytes = log.read(cursor, 1 << 20);
-        if (bytes.empty()) break;
-        RecordBatchReader r(bytes.data(), bytes.size());
+        ReadIntoStatus st{};
+        const auto view = log.readInto(cursor, 1 << 20, buf.data(), buf.size(), st, hwBound);   // hops over a segment compaction emptied (D26)
+        if (st != ReadIntoStatus::Ok) break;
+        RecordBatchReader r(view.data, view.len);
         if (!r.ensureValid()) break;
         bool advanced = false;
         r.forEach([&](std::string_view k, std::string_view v,
@@ -1762,10 +1773,10 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
     SmokeDir tmp{"smoke12_restart_converge_"};
 
     constexpr int   K        = 4;     // distinct keys
-    constexpr int   R        = 50;    // updates per key (200 records total)
-    constexpr int   kRecords = K * R; // 200
+    constexpr int   R        = 20;    // updates per key (80 records total)
+    constexpr int   kRecords = K * R; // 80
     constexpr int64_t kRoll  = 128;   // tiny roll → many sealed segments + active tail
-    constexpr int   kSentinelAnchors = 4; // seal 196-199 below the active boundary
+    constexpr int   kSentinelAnchors = 4; // seal 76-79 below the active boundary
 
     rune::node::TopicSpec ts;
     ts.name                   = "restart-converge";
@@ -1799,7 +1810,7 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
             }
         }
         // Anchor appends on a SENTINEL key: force the segment holding the newest
-        // per-key values (offsets 196-199) to SEAL and a fresh active segment to
+        // per-key values (offsets 76-79) to SEAL and a fresh active segment to
         // form above them.  Without this, keys whose newest value lands in the
         // (never-compacted) active segment keep their superseded sealed copies —
         // which is EXPECTED Kafka behaviour (active segment is never in the cleaner
@@ -1816,8 +1827,8 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
             << "Smoke12: tiny roll must form many segments; got " << segsBefore;
     }
 
-    // Expected newest value per DATA key = v(R-1) = v49.  All now in SEALED
-    // segments (the sentinel anchor pushed 196-199 below the active boundary).
+    // Expected newest value per DATA key = v(R-1) = v19.  All now in SEALED
+    // segments (the sentinel anchor pushed 76-79 below the active boundary).
 
     int64_t leoBefore = 0;
     {
@@ -1836,7 +1847,10 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
         ASSERT_TRUE(node.awaitLeader(3s)) << "Smoke12 P2: must self-elect";
         ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
             << "Smoke12 P2: replication bridge must propagate within 2 s";
-        std::this_thread::sleep_for(3000ms);  // let the cleaner run several passes
+        // The sealed prefix is compacted once the cleaner has passed the data keys' last records (offsets below the sentinel anchors).
+        ASSERT_TRUE(waitFor([&] {
+            return node.onOwnerThreadForTest(0, 0, [](rune::replication::PartitionReplica& r) { return r.lastCleanOffset(); }) >= K * R;
+        }, 10s)) << "Smoke12 P2: the cleaner never compacted the sealed prefix";
         node.stop();
     }
 
@@ -1852,9 +1866,10 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
         ASSERT_TRUE(node2.awaitLeader(3s)) << "Smoke12 P3: must self-elect";
         ASSERT_TRUE(waitFor([&] { return node2.replicationIsLeaderForTest(); }, 2s))
             << "Smoke12 P3: replication bridge must propagate within 2 s";
-        // Give the new leader ample time to re-run its incremental cleaner passes
-        // to convergence (the observed e2e failure is that it does not).
-        std::this_thread::sleep_for(5000ms);
+        // The new leader re-runs its incremental cleaner passes (the observed e2e failure is that it does not converge).
+        const uint64_t c0 = node2.cleanerCyclesForTest();
+        ASSERT_TRUE(waitFor([&] { return node2.cleanerCyclesForTest() >= c0 + 3; }, 10s))
+            << "Smoke12 P3: the new leader's cleaner never completed a pass";
         node2.stop();  // duty + cleaner threads joined → on-disk state is final.
     }
 
@@ -1872,7 +1887,7 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
     }
 
     // Count how many times each DATA key (key0..K-1) is served.  These keys' newest
-    // values (v49) are all in SEALED segments (the sentinel anchor pushed them below
+    // values (v19) are all in SEALED segments (the sentinel anchor pushed them below
     // the active boundary), so a correct new leader MUST converge them to exactly one
     // record each.  The sentinel key is excluded from the strict count because its
     // own newest value lands in the never-compacted active segment (expected Kafka
@@ -1883,10 +1898,12 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
         finalLog2.recover();
         int64_t c = finalLog2.logStartOffset();
         const int64_t hw = finalLog2.logEndOffset();
+        std::vector<uint8_t> buf(1 << 20);
         while (c < hw) {
-            auto by = finalLog2.read(c, 1 << 20);
-            if (by.empty()) break;
-            RecordBatchReader r(by.data(), by.size());
+            ReadIntoStatus st{};
+            const auto view = finalLog2.readInto(c, 1 << 20, buf.data(), buf.size(), st, hw);
+            if (st != ReadIntoStatus::Ok) break;
+            RecordBatchReader r(view.data, view.len);
             if (!r.ensureValid()) break;
             bool adv = false;
             r.forEach([&](std::string_view k, std::string_view, int64_t o, int64_t) {
@@ -1913,7 +1930,7 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
         ASSERT_NE(it, served.end())
             << "Smoke12 Arm B FAILED — key '" << key << "' MISSING from the served "
                "(HW-bounded) set after restart. The new leader dropped the newest "
-               "tail record. (This is the e2e 'missing 196-199' shape.)";
+               "tail record. (This is the e2e 'missing 76-79' shape.)";
         EXPECT_EQ(it->second, v)
             << "Smoke12 Arm B FAILED — key '" << key << "' served STALE value '"
             << it->second << "' (expected newest '" << v << "').";

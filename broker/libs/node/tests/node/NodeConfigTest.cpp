@@ -1,4 +1,5 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/consensus/ReadLease.h>
 #include <rune/node/TlsStartupPolicy.h>
 #include <rune/node/AuthDevMode.h>
 #include <rune/catalog/TopicName.h>
@@ -77,6 +78,16 @@ static std::map<std::string, std::string> legacyEnv(std::map<std::string, std::s
 // ---------------------------------------------------------------------------
 // Happy-path tests
 // ---------------------------------------------------------------------------
+
+TEST(NodeConfigTest, InProcessLivenessDefaultsToOneHourRegression) {
+    const NodeConfig cfg;
+    EXPECT_EQ(cfg.shardClientLivenessTimeoutNs, 3'600'000'000'000LL) << "only tests lower it";
+    EXPECT_EQ(cfg.inProcessDriverTimeoutMs(), 3'600'000);
+}
+
+TEST(NodeConfigTest, ReadLeaseMaxDefaultsToTheProductionBoundRegression) {
+    EXPECT_EQ(NodeConfig{}.readLeaseMaxMs * 1'000'000, rune::consensus::kReadLeaseMaxNs) << "#491: tests lower it, the default is the safety bound";
+}
 
 TEST(NodeConfigTest, ValidThreeNodeConfig) {
     auto r = parseNodeConfig(fakeEnv(base3node()));
@@ -3633,6 +3644,28 @@ TEST(NodeConfigRegression, LeadingWhitespaceOrSignIsRefusedByTheStrictMsKnobsReg
             EXPECT_FALSE(r.error.empty()) << "'" << bad << "' was accepted";
             EXPECT_NE(r.error.find(var), std::string::npos) << r.error;
         }
+    }
+}
+
+// Checked writes P11-1: the records one transaction may have judged on a partition; 1-1,048,576, default 4096.
+TEST(NodeConfig, TxnJudgedRecordsMaxIsRangeChecked) {
+    auto withValue = [&](const char* v) {
+        auto env = base3node();
+        if (v != nullptr) env["RUNE_TXN_JUDGED_RECORDS_MAX"] = v;
+        return parseNodeConfig(fakeEnv(env));
+    };
+    const auto def = withValue(nullptr);
+    ASSERT_TRUE(def.error.empty()) << def.error;
+    EXPECT_EQ(def.config->txnJudgedRecordsMax, 4096);
+    for (const char* ok : {"1", "1048576"}) {
+        const auto r = withValue(ok);
+        ASSERT_TRUE(r.error.empty()) << r.error;
+        EXPECT_EQ(r.config->txnJudgedRecordsMax, std::stoi(ok));
+    }
+    for (const char* bad : {"0", "-1", "1048577", "abc", "4096x"}) {
+        const auto r = withValue(bad);
+        EXPECT_FALSE(r.error.empty()) << bad << " was accepted";
+        EXPECT_NE(r.error.find("RUNE_TXN_JUDGED_RECORDS_MAX"), std::string::npos) << r.error;
     }
 }
 

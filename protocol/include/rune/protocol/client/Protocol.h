@@ -251,12 +251,21 @@ enum class ErrorCode : uint16_t {
     ViewKeyExpressionInvalid = 59,  // DDL compile error: a view key expression
     ViewConstraintInvalid    = 60,  // DDL compile error: a unique / check constraint
     ViewUniqueInvalid        = 61,  // DDL compile error: a unique clause
+    TxnTooLarge              = 62,  // a transaction (or atomic batch) overran a vote window; the whole transaction aborts.  Vote, definite
+    TxnConflict              = 63,  // a newer write of another writer landed before its TxnJudge; the transaction aborts.  Vote, definite
     // Lease topics (client version 18, kClientVersionLeases): sent ONLY to a session >= 18; an older client is answered
     // InvalidRequest (39).
-    LeaseNotFound            = 62,  // no live lease for the key, or a different version.  Definite
-    LeaseLimitExceeded       = 63,  // lease.max_keys or the namespace max-leases is reached.  Definite
-    LeaseTtlTooLarge         = 64,  // the requested TTL is above lease.max_ttl.  Definite
+    LeaseNotFound            = 64,  // no live lease for the key, or a different version.  Definite
+    LeaseLimitExceeded       = 65,  // lease.max_keys or the namespace max-leases is reached.  Definite
+    LeaseTtlTooLarge         = 66,  // the requested TTL is above lease.max_ttl.  Definite
 };
+
+/// True for the codes a transaction vote can answer EndTxn(commit) with: 55, 56, 57, 62 and 63.
+[[nodiscard]] constexpr bool isTxnVoteCode(uint16_t code) noexcept {
+    return code == static_cast<uint16_t>(ErrorCode::ConstraintViolation) || code == static_cast<uint16_t>(ErrorCode::KeyExists) ||
+           code == static_cast<uint16_t>(ErrorCode::KeyNotFound) || code == static_cast<uint16_t>(ErrorCode::TxnTooLarge) ||
+           code == static_cast<uint16_t>(ErrorCode::TxnConflict);
+}
 
 // ---------------------------------------------------------------------------
 // Client versions (ConnectRequest.clientVersion) — behaviour gates.  The wire
@@ -413,9 +422,9 @@ inline constexpr int32_t kClientVersionResponseEgress             = 16;
 //   (produceErrorForClient answers InvalidRequest) and keeps the exact 46 / 38 byte ProduceResponse.
 //   GetViewRowK / ScanViewRows / GetStats are gated on the same constants.
 inline constexpr int32_t kClientVersionCheckedWrites              = 17;
-// 18 — lease topics: error codes 62-64, templates 96-101 (LeaseKeepAlive .. ScanLeasesResponse), a lease trailer on the
+// 18 — lease topics: error codes 64-66, templates 96-101 (LeaseKeepAlive .. ScanLeasesResponse), a lease trailer on the
 //   ProduceResponse (after the verdict trailer), a lease trailer on the TopicSchemaResponse, and the optional LeaseSpec
-//   block on DefineTopic.  A broker >= 11 serves them.  A session below 18 is never sent 62-64 (produceErrorForClient
+//   block on DefineTopic.  A broker >= 11 serves them.  A session below 18 is never sent 64-66 (produceErrorForClient
 //   answers InvalidRequest), a lease trailer or templates 96-101, and keeps byte-identical frames.
 inline constexpr int32_t kClientVersionLeases                     = 18;
 inline constexpr int32_t kClientVersion                           = kClientVersionLeases;  // what this protocol's client announces
@@ -542,13 +551,13 @@ inline constexpr int32_t kBrokerVersion                           = kBrokerVersi
     return clientVersion >= kClientVersionFilter;
 }
 
-/// True when a session that connected with `clientVersion` may be answered the checked-writes codes 55-61 and the
+/// True when a session that connected with `clientVersion` may be answered the checked-writes codes 55-63 and the
 /// 54-byte ProduceResponse (version 17).
 [[nodiscard]] constexpr bool clientUnderstandsCheckedWrites(int32_t clientVersion) noexcept {
     return clientVersion >= kClientVersionCheckedWrites;
 }
 
-/// True when a session that connected with `clientVersion` may be answered the lease codes 62-64, templates 96-101 and
+/// True when a session that connected with `clientVersion` may be answered the lease codes 64-66, templates 96-101 and
 /// the lease trailers (version 18).
 [[nodiscard]] constexpr bool clientUnderstandsLeases(int32_t clientVersion) noexcept {
     return clientVersion >= kClientVersionLeases;
@@ -569,10 +578,10 @@ inline constexpr int32_t kBrokerVersion                           = kBrokerVersi
         return ErrorCode::NotLeader;   // issue #112: a pre-v13 client's retriable code
     if ((ec == ErrorCode::NamespaceSuspended || ec == ErrorCode::NamespaceLimitExceeded || ec == ErrorCode::Throttled) && clientVersion < kClientVersionNamespaces) [[unlikely]]
         return ErrorCode::InvalidRequest;   // namespaces Phase 2 Task 11: the namespace codes (51-53) exist only for a v14+ client
-    if (ec >= ErrorCode::ConstraintViolation && ec <= ErrorCode::ViewUniqueInvalid && !clientUnderstandsCheckedWrites(clientVersion)) [[unlikely]]
-        return ErrorCode::InvalidRequest;   // checked writes: 55-61 exist only for a v17+ client
+    if (ec >= ErrorCode::ConstraintViolation && ec <= ErrorCode::TxnConflict && !clientUnderstandsCheckedWrites(clientVersion)) [[unlikely]]
+        return ErrorCode::InvalidRequest;   // checked writes: 55-63 exist only for a v17+ client
     if (ec >= ErrorCode::LeaseNotFound && ec <= ErrorCode::LeaseTtlTooLarge && !clientUnderstandsLeases(clientVersion)) [[unlikely]]
-        return ErrorCode::InvalidRequest;   // lease topics: 62-64 exist only for a v18+ client
+        return ErrorCode::InvalidRequest;   // lease topics: 64-66 exist only for a v18+ client
     return ec;
 }
 

@@ -515,7 +515,7 @@ TEST(LeaseEmitterRegression, RevokeAfterExpireRegression) {
     const auto ack = r.ack(c);
     ASSERT_TRUE(ack);
     ASSERT_EQ(ack->verdicts.size(), 1u);
-    EXPECT_EQ(std::get<1>(ack->verdicts[0]), 62) << "LeaseNotFound";
+    EXPECT_EQ(std::get<1>(ack->verdicts[0]), 64) << "LeaseNotFound";
 }
 
 // 9. Namespace gates do not pause expiry.  The worker has no per-partition "suspended" state (ReadOnly / RejectAll are enforced at the
@@ -1038,7 +1038,9 @@ TEST(LeaseEmitterRegression, IdleSkipsLookupsRegression) {
 // 23. (F9) Roll back-pressure: while the log's roll is deferred (a provisioned log with no ready segment) the emitter appends nothing, and
 // does once a segment is ready.  Mutation: drop the rollDeferred check in leaseDuty_: the Expire lands while held: red.
 TEST(LeaseEmitterRegression, RollDeferredHoldsExpiresRegression) {
-    Em e(1000, {}, false, true, /*rollBytes=*/100);
+    // rollBytes below the smallest batch (61 bytes of batch overhead plus a record): every segment holds one batch and is full, so the
+    // active one is full whatever the last control record's size (a v2 constraint-set change is 102 bytes, a marker 95).
+    Em e(1000, {}, false, true, /*rollBytes=*/64);
     VerdictRig& r = e.r;
     ASSERT_TRUE(e.produce({grantRec(1), grantRec(2)}));
     ASSERT_TRUE(r.driveUntilJudged());

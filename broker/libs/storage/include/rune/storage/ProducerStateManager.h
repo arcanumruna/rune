@@ -25,14 +25,17 @@
 //                       retryBaseOffset == -1 (offset unknown).  Either way
 //                       coveredLastOffset is the log offset the answer's ack
 //                       condition must cover.
-//   OutOfOrderSequence— forward gap, or a batch partially overlapping
-//                       lastSequence (base <= lastSequence < end).
+//   OutOfOrderSequence— forward gap on a live entry, or a batch partially
+//                       overlapping lastSequence (base <= lastSequence < end).
 //   InvalidProducerEpoch — producerEpoch < tracked epoch (zombie fenced).
 //   UnknownProducerId — D6 (Kafka UNKNOWN_PRODUCER_ID): no entry for (topic,
 //                       pid, partition) and baseSequence != 0.  The state does
 //                       not know this producer (retention / compaction /
 //                       memory-ring eviction removed all its batches before a
-//                       rebuild) — NOT appended.  Answered only from a PROVEN
+//                       rebuild) — NOT appended.  Also a forward gap on a
+//                       rebuilt entry no live append has updated yet (#953:
+//                       its lastSequence is the log's, which may have lost the
+//                       producer's newest batches).  Answered only from a PROVEN
 //                       state (the callers' gates); the client tells retention
 //                       from loss with the partition's logStartOffset.
 //
@@ -112,15 +115,10 @@ struct ProducerStateEntry {
     uint8_t windowHead{0};       // next slot to write (oldest when full)
     uint8_t windowCount{0};      // slots filled so far (capped at kRetryWindowSize)
     int32_t lastSequence{-1};    // last seq appended (-1 = no batch yet)
-    // D6 review L1: the entry was made by a rebuild from a control MARKER only (its data batches gone) — no
-    // sequence is known in this epoch, so a first batch at seq != 0 is an UNKNOWN producer, not a gap.
-    // Cleared by the first data update().
-    bool    markerOnly{false};
-    // #953: the entry was made or advanced by a REBUILD scan.  Compaction can drop a producer's newest batches
-    // (and the cleaner its ProducerTails) while an older batch survives, so the rebuilt lastSequence may be stale:
-    // the broker cannot vouch that a forward gap is real.  A forward gap on it answers UnknownProducerId (the client
-    // re-sequences), never OutOfOrderSequence.  Cleared by the next live update().
-    bool    unvouched{false};
+    // D6 review L1 / #953: the entry was made by a rebuild, so lastSequence is only the last the log still holds (a marker-only
+    // entry knows none; the cleaner drops an expired producer's newest batches first) — a first batch past it is an UNKNOWN
+    // producer, not a gap.  Cleared by the first live update().
+    bool    rebuilt{false};
     /// D9 review MAJOR-2 (Kafka ProducerStateEntry.coordinatorEpoch): the
     /// coordinator epoch of the last COMMIT/ABORT marker applied for this
     /// producer on this partition (-1 = none).  Raise-only; rebuilt from the
@@ -162,7 +160,7 @@ struct ValidationResult {
         Duplicate,
         OutOfOrderSequence,
         InvalidProducerEpoch,
-        UnknownProducerId,     ///< D6: no entry + baseSequence != 0 (NOT appended)
+        UnknownProducerId,     ///< D6: no entry + baseSequence != 0, or a rebuilt entry's gap (NOT appended)
     };
 
     Status  status{Status::Accept};

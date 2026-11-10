@@ -44,9 +44,10 @@ public:
         TXN_VERIFY_REQUEST = static_cast<std::uint8_t>(8),
         VIEW_SCAN_RESULT = static_cast<std::uint8_t>(9),
         STATS_RESULT = static_cast<std::uint8_t>(10),
-        LEASE_KEEP_ALIVE_RESULT = static_cast<std::uint8_t>(11),
-        LEASE_TIME_TO_LIVE_RESULT = static_cast<std::uint8_t>(12),
-        SCAN_LEASES_RESULT = static_cast<std::uint8_t>(13),
+        TXN_VOTE_RESULT = static_cast<std::uint8_t>(11),
+        LEASE_KEEP_ALIVE_RESULT = static_cast<std::uint8_t>(12),
+        LEASE_TIME_TO_LIVE_RESULT = static_cast<std::uint8_t>(13),
+        SCAN_LEASES_RESULT = static_cast<std::uint8_t>(14),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
 
@@ -65,9 +66,10 @@ public:
             case static_cast<std::uint8_t>(8): return TXN_VERIFY_REQUEST;
             case static_cast<std::uint8_t>(9): return VIEW_SCAN_RESULT;
             case static_cast<std::uint8_t>(10): return STATS_RESULT;
-            case static_cast<std::uint8_t>(11): return LEASE_KEEP_ALIVE_RESULT;
-            case static_cast<std::uint8_t>(12): return LEASE_TIME_TO_LIVE_RESULT;
-            case static_cast<std::uint8_t>(13): return SCAN_LEASES_RESULT;
+            case static_cast<std::uint8_t>(11): return TXN_VOTE_RESULT;
+            case static_cast<std::uint8_t>(12): return LEASE_KEEP_ALIVE_RESULT;
+            case static_cast<std::uint8_t>(13): return LEASE_TIME_TO_LIVE_RESULT;
+            case static_cast<std::uint8_t>(14): return SCAN_LEASES_RESULT;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
 
@@ -89,6 +91,7 @@ public:
             case TXN_VERIFY_REQUEST: return "TXN_VERIFY_REQUEST";
             case VIEW_SCAN_RESULT: return "VIEW_SCAN_RESULT";
             case STATS_RESULT: return "STATS_RESULT";
+            case TXN_VOTE_RESULT: return "TXN_VOTE_RESULT";
             case LEASE_KEEP_ALIVE_RESULT: return "LEASE_KEEP_ALIVE_RESULT";
             case LEASE_TIME_TO_LIVE_RESULT: return "LEASE_TIME_TO_LIVE_RESULT";
             case SCAN_LEASES_RESULT: return "SCAN_LEASES_RESULT";

@@ -148,6 +148,7 @@ inline constexpr std::size_t kCheckpointV3TableHeaderBytes = 1 + 1 + 4 + 4;  // 
 [[nodiscard]] constexpr std::size_t checkpointV3EntryHeaderBytes(uint8_t keyLen) noexcept { return 4 + 1 + keyLen; }
 
 inline constexpr uint8_t kKeyedTableView = 0, kKeyedTableOwners = 1;   // projections
+inline constexpr uint8_t kKeyedTableUniqueIndex = 6, kKeyedTableUniqueExtras = 7;   // unique projections, with tables 0 and 1
 inline constexpr uint8_t kKeyedTableContributors = 2, kKeyedTableGroups = 3, kKeyedTableBlocks = 4, kKeyedTableGroupIds = 5;   // keyed aggregates
 
 struct KeyedDirtyEntry {

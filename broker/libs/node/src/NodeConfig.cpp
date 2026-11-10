@@ -903,6 +903,14 @@ ConfigResult parseNodeConfig(
         err = parseOptionalInt64Ms(getenv_fn, "RUNE_VERDICT_INTERVAL_MS", cfg.verdictIntervalMs);
         if (!err.empty()) return {{}, err};
 
+        if (const char* raw = getenv_fn("RUNE_TXN_JUDGED_RECORDS_MAX"); raw && !std::string_view(raw).empty()) {
+            int32_t v{};
+            if (!parseInt32(raw, v) || v < 1 || v > NodeConfig::kTxnJudgedRecordsMaxCeiling)
+                return {{}, std::string("RUNE_TXN_JUDGED_RECORDS_MAX must be an integer in [1, ") +
+                                std::to_string(NodeConfig::kTxnJudgedRecordsMaxCeiling) + "], got '" + raw + "'"};
+            cfg.txnJudgedRecordsMax = v;
+        }
+
         err = parseOptionalInt64Ms(getenv_fn, "RUNE_ELECTION_STATUS_INTERVAL_MS",
                                    cfg.electionStatusIntervalMs);
         if (!err.empty()) return {{}, err};

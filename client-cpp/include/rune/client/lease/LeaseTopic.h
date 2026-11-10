@@ -24,6 +24,7 @@
 #include <rune/protocol/LeaseSpec.h>
 #include <rune/protocol/PartitionHash.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -397,8 +398,16 @@ LeaseTopic<T> LeaseTopic<T>::fromOpen(Client& client, const Completion& c, std::
 template <class T>
 LeaseTopic<T> Client::openLeaseTopicAndWait(std::string_view name, const LeaseTopicConfig& cfg,
                                             std::chrono::nanoseconds timeout) {
-    const TopicSchemaResult r = openLeaseSchemaAndWait(name, T::kFingerprint, timeout);
-    if (r.errorCode != 0) throwOpenTopicFailure(name, r.errorCode, timeout);
+    const auto started = std::chrono::steady_clock::now();
+    const auto left = [&] { return timeout - (std::chrono::steady_clock::now() - started); };
+    TopicSchemaResult r = openLeaseSchemaAndWait(name, T::kFingerprint, timeout);
+    if (r.errorCode != 0) {
+        // Issue #22: throws unless the topic now answers for T's fingerprint (the first answer predated its apply here);
+        // then the lease request is asked once more for its lease facts, which the plain schema answer does not carry.
+        (void)resolveOpenTopicFailure(name, T::kFingerprint, r.errorCode, left());
+        r = openLeaseSchemaAndWait(name, T::kFingerprint, std::max(left(), std::chrono::nanoseconds::zero()));
+        if (r.errorCode != 0) (void)resolveOpenTopicFailure(name, T::kFingerprint, r.errorCode, std::chrono::nanoseconds::zero());
+    }
     if (!r.lease) throw std::invalid_argument("openLeaseTopic: '" + std::string(name) + "' is not a lease topic");
     if (!schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob)))
         throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");

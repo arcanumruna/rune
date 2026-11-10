@@ -28,7 +28,7 @@ using rune::view::VerdictViewKind;
 
 namespace {
 
-constexpr uint16_t kKeyExists = 56, kNotFound = 62, kLimit = 63, kInvalid = 39;
+constexpr uint16_t kKeyExists = 56, kNotFound = 64, kLimit = 65, kInvalid = 39;
 constexpr uint16_t kStale = rune::view::kVerdictStaleBroker;
 
 // Row slots of the test descriptor: 0..3 system, 4 id (key), 5 addr, 6 port, then the two offset columns.

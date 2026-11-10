@@ -74,6 +74,14 @@ public:
     using Clock = std::chrono::steady_clock;
     static constexpr const char* kPw = "user-password-12345";
 
+    /// The broker and its admin only (no builder, topics or view), and the admin's client is the rig's: each client is an embedded
+    /// driver of its own.
+    struct Bare {};
+    AuthRig(Bare, const std::string& tag) : b_(tag, {}) {
+        b_.bootstrapAdmin();
+        w_ = &b_.admin();
+        c().captureRawAnswers(true);
+    }
     explicit AuthRig(const std::string& tag = "enf", AuthBroker::Options options = {}) : b_(tag, std::move(options)) {
         b_.bootstrapAdmin();
         w_ = &b_.wire();
@@ -176,7 +184,7 @@ public:
     /// returns the new nsId.  Throws when the broker refuses (a test precondition).
     uint32_t createNamespace(const std::string& name) {
         if (nsWire_ == nullptr) {
-            nsWire_ = &b_.wire();
+            nsWire_ = &b_.admin();   // a second session on the admin's client
             const auto l = nsWire_->connectAndLogin(ch(), "admin", AuthBroker::kAdminPassword,
                                                     rune::protocol::client::kClientVersionNamespaces);
             if (!l.ok()) throw std::runtime_error("AuthRig: the v14 admin login failed");

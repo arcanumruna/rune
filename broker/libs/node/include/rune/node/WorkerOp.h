@@ -181,21 +181,25 @@ struct WorkerOp {
         // Checked writes Part 08: gateway → the partition leader's worker: the counters of a topic partition (recordCount =
         // StatsScope 1, topicId = the topic) or of a view partition (scope 2, topicId = the view).  No tail.  Not ownership-gated.
         GetStats                  = 35, ///< gateway → worker: the stats of one topic or view partition
+        // Checked writes Part 11: coordinator → the partition leader's worker: vote on a transaction's commit.  correlationId =
+        // the vote token, producerId / producerEpoch = the transaction, roleEpoch = the target leader epoch + 1 (0 = unchecked),
+        // sessionId = the origin node (-1 = local).  No tail.  Ownership-gated like AppendControlRecord; answered with TxnVoteResult.
+        TxnVote                   = 36, ///< coordinator → worker: vote on a transaction's commit
         // Lease topics Task 11a: gateway → the lease partition leader's worker.  topicId / partition / sessionId / correlationId as GetStats;
         // not ownership-gated in the switch (the handlers check the replica themselves).  LeaseKeepAlive: recordCount = the entry count
         // (1..256), leaseTail (TailKind LEASE_REQUEST) = the request's validated entries [keyLen u8][key][version i64 LE].
-        // LeaseTimeToLive: leaseTail = the key bytes.  ScanLeases (38, Task 13b): topicId = the SOURCE topic, nextOffset = resumeHash (the u64 bit-cast),
+        // LeaseTimeToLive: leaseTail = the key bytes.  ScanLeases (39, Task 13b): topicId = the SOURCE topic, nextOffset = resumeHash (the u64 bit-cast),
         // recordCount = maxRows (1..1024), isolation = first (0/1), leaseTail = the key prefix (<= 127 bytes).
-        LeaseKeepAlive            = 36, ///< gateway → worker: keepalive entries of one lease partition
-        LeaseTimeToLive           = 37, ///< gateway → worker: the remaining time of one lease key
-        ScanLeases                = 38, ///< gateway → worker: a page of the lease rows in hash order (Task 13b)
+        LeaseKeepAlive            = 37, ///< gateway → worker: keepalive entries of one lease partition
+        LeaseTimeToLive           = 38, ///< gateway → worker: the remaining time of one lease key
+        ScanLeases                = 39, ///< gateway → worker: a page of the lease rows in hash order (Task 13b)
         // Lease topics Task 21: control → EVERY worker (cold: on a change only), see NsRingMessages.h.  Never ownership-gated.
-        NsLeasesOver              = 39, ///< control → worker: nsSlot is at or over max-leases on this node (or back under)
+        NsLeasesOver              = 40, ///< control → worker: nsSlot is at or over max-leases on this node (or back under)
         // Lease topics Task 27 (spec A.6): control → the partition's OWNING worker on its OP ring (cold: once per leadership
         // of a transient lease partition; LeaseLineageFanout), ownership-gated like TxnVerifyResult.  topicId / partition = the
         // partition, nextOffset = the leader epoch, correlationId = the lineage token (uint64 bit-cast to int64), hwBound = the
-        // lineage generation.  No tail.  (40 = TRANSIENT_LINEAGE.)
-        TransientLineage          = 40, ///< control → worker: the committed data lineage of a transient lease partition
+        // lineage generation.  No tail.  (41 = TRANSIENT_LINEAGE.)
+        TransientLineage          = 41, ///< control → worker: the committed data lineage of a transient lease partition
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -623,7 +627,8 @@ struct WorkerReturn {
         /// may be appended to topicId / partition.  correlationId = the worker's request id (echoed by the
         /// TxnVerifyResult op), targetReplicaId / incarnation = the replica.  The runtime answers EVERY request
         /// exactly once (the coordinator's code, or a retriable NotCoordinator when it cannot be asked or a
-        /// remote ask is lost to a reconnect / coordinator change).  Rides sbe ReturnType::TXN_VERIFY_REQUEST.
+        /// remote ask is lost to a reconnect / coordinator change).  baseOffset = 1 when the partition is a verdict source
+        /// (it votes), else 0.  Rides sbe ReturnType::TXN_VERIFY_REQUEST.
         TxnVerifyRequest = 8,
         /// Checked writes Part 07: the answer to a ScanViewRows op.  errorCode = ViewRowResponse status, recordCount =
         /// rows in the page, readTopicId = viewTopicId; the chunk is [nextTokenLen u32][token][rowsLen u32][rows].
@@ -632,18 +637,23 @@ struct WorkerReturn {
         /// recordCount = stat entries, readTopicId / readPartition = the object, isolation = the StatsScope; the chunk is
         /// [count x 10 B][nConstraints u16][n x 12 B].
         StatsResult = 10,
+        /// Checked writes Part 11: the answer to a TxnVote op, on existing scalars.  correlationId = the vote token, errorCode =
+        /// transport status (NotLeader when gated out), recordCount = the vote code (0 = yes), newNextOffset = constraintId,
+        /// baseOffset = failingOffset, lastOffset = the judge offset (-1 = none), sessionId = the origin node.  The vote fields
+        /// mean something only when errorCode == 0: a NotLeader answer leaves recordCount 0, which is NOT a yes vote.
+        TxnVoteResult = 11,
         /// Lease topics Task 11a: answers of a LeaseKeepAlive op (one return per decided group of entries, and one per parked entry once
         /// answered).  errorCode = 0, recordCount = the entry count (1..256), lastOffset = final (0/1), sessionId / correlationId echoed;
         /// the chunk is count x 12 bytes, each {index u16, code u16, ttlMs u64} little-endian - exactly the wire entry layout of
         /// LeaseKeepAliveResponse.  A request-level refusal is one entry with index kLeaseWholeRequest (0xFFFF).
-        LeaseKeepAliveResult = 11,
+        LeaseKeepAliveResult = 12,
         /// Lease topics Task 11a: the answer to a LeaseTimeToLive op.  errorCode = the client code, baseOffset = remainingMs (-1 = none),
         /// lastOffset = the lease version, sessionId / correlationId echoed; the chunk is 16 bytes {grantedTtlMs u64, holder u64} LE.
-        LeaseTimeToLiveResult = 12,
+        LeaseTimeToLiveResult = 13,
         /// Lease topics Task 13b: the answer to a ScanLeases op.  errorCode = the client code, baseOffset = asOfOffset (the lease index's fold
         /// cursor at the walk, exclusive), lastOffset = lastHash (the u64 bit-cast), recordCount = the rows in the page, isolation = done (0/1);
         /// the chunk is the encoded rows, recordCount x { keyLen u8, key, rowLen u32 LE, row payload } (LeaseMessages.h).
-        ScanLeasesResult = 13,
+        ScanLeasesResult = 14,
     };
 
     Type    type = Type::ProduceResult;

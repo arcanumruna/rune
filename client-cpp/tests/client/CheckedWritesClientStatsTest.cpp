@@ -12,9 +12,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <poll.h>
 #include <string>
 #include <thread>
-#include <poll.h>
 #include <unistd.h>
 #include <vector>
 

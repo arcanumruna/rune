@@ -74,6 +74,9 @@ struct WriteFacts {
     /// A transient lease topic's rebirth fence (spec A.6): > 0 = a grant is answered Throttled with this retry-after (ns); 0 = grants are
     /// judged as usual.  Updates, revokes and keepalives are never held.  A persisted lease topic never sets it.
     int64_t leaseGrantHoldNs   = 0;
+    int32_t txnJudgedRecordsMax = 4096;   ///< the node's bound on a batch the judge holds whole (rule 10)
+    int64_t txnRecords         = 0;       ///< a transactional batch: the records its open transaction already has here
+    bool    txnJudged          = false;   ///< a transactional batch: the judge judges its transaction whole (vote or marker) without this batch's own intents
 };
 
 /// Whether a verdict view of this kind provides the key index (member 0 of a logged set): a lease index is a key index
@@ -125,12 +128,13 @@ struct BatchIntents {
     uint32_t leaseGrants      = 0;       ///< lease topic: records that are grants (Put + insert)
 };
 
+/// IntentInTxnOrAtomicBatch and TxnOnConstrainedSource are unused since Part 11 (P11-14); their values keep the counter array's indices.
 enum class HookRefusal : uint8_t {
     None, ReservedBits, ValidationFailed, VersionAhead, LegacyMode, LevelTooLow, NoKeyIndex,
     ExplicitKeyNeedsIdempotentAndView, IntentInTxnOrAtomicBatch, TxnOnConstrainedSource,
     KeyZeroCreateNeedsIdempotentAll, KeyZeroCreateNeedsView, MixedKeyZeroBatch, ViewBatchTooLarge,
     ViewWithoutReplica, KeyIndexActivating, UpsertOnAutoIncrement, ImportNotGranted, ImportOutOfRange,
-    AutoIncExhausted, AutoIncWindowFull, AutoIncActivating,
+    AutoIncExhausted, AutoIncWindowFull, AutoIncActivating, AtomicBatchTooLarge, TxnTooLarge,
     LeaseSessionUnannounced, LeaseUpdateThenRevoke, LeaseRevokeIndexNotReady, LeaseRevokeBehindUpdate, LeaseRevokeBatchTooLarge,
     LeaseClientVersion, LeaseNeedsView, LeaseInTxn, LeaseBatchTooLarge, LeaseBadRecord, LeaseTtlTooLarge, LeaseViewMemOver,
     LeaseMaxLeases, LeaseFenced,
@@ -153,13 +157,11 @@ struct RequirementVerdict {
     if (f.legacyMode && (b.anyIntent || view)) return refuse(HookRefusal::LegacyMode);
     if (!f.levelCheckedWrites && (b.anyIntent || view)) return refuse(HookRefusal::LevelTooLow);
     if (b.anyIntent && !t.keyIndex && !t.lease) return refuse(HookRefusal::NoKeyIndex);
-    if (b.explicitKeyIntent && (!f.idempotent || !view)) return refuse(HookRefusal::ExplicitKeyNeedsIdempotentAndView);
-    if (b.explicitKeyIntent && (f.transactional || f.atomicBatch)) return refuse(HookRefusal::IntentInTxnOrAtomicBatch);
-    if ((f.transactional || f.atomicBatch) && t.constrainedSource) return refuse(HookRefusal::TxnOnConstrainedSource);
+    if (b.explicitKeyIntent && (!f.idempotent || (!view && !f.transactional))) return refuse(HookRefusal::ExplicitKeyNeedsIdempotentAndView);
     if (b.keyZeroCreate) {
         if (b.mixedKeyZero) return refuse(HookRefusal::MixedKeyZeroBatch);
         if (!f.idempotent || !acksAll(f.acks)) return refuse(HookRefusal::KeyZeroCreateNeedsIdempotentAll);
-        if (t.constrainedSource && !view) return refuse(HookRefusal::KeyZeroCreateNeedsView);
+        if (t.constrainedSource && !view && !f.transactional) return refuse(HookRefusal::KeyZeroCreateNeedsView);
     }
     if (t.autoIncrement) {
         if (b.plainUpsert) return refuse(HookRefusal::UpsertOnAutoIncrement);
@@ -168,6 +170,13 @@ struct RequirementVerdict {
         if (b.keyZeroCreate && b.autoIncExhausted) return {ErrorCode::AutoIncrementExhausted, HookRefusal::AutoIncExhausted};
     }
     if (view && b.records > kMaxJudgedBatchRecords && t.verdictSource) return refuse(HookRefusal::ViewBatchTooLarge);
+    if (f.atomicBatch && t.verdictSource && b.records > f.txnJudgedRecordsMax) return refuse(HookRefusal::AtomicBatchTooLarge);
+    // P11-7: a transaction the judge judges whole is TxnTooLarge past the knob at its vote or marker, and the marker's rejection needs one
+    // index entry per record; the batch that takes it past the knob is refused here.  Records are always counted (at append, or by the log
+    // scan after a failover).  What escapes: a transaction whose batches were all admitted before the source was judged whole, and the
+    // records a transient ring evicted before its rebuild; the judge keeps its loud stall for more than 2^24 of them.
+    if (f.transactional && t.verdictSource && (f.txnJudged || b.anyIntent) && f.txnRecords + b.records > f.txnJudgedRecordsMax)
+        return {ErrorCode::TxnTooLarge, HookRefusal::TxnTooLarge};
     if (t.autoIncrement) {
         if ((b.keyZeroCreate || b.explicitInsert) && !t.autoIncReady) return {ErrorCode::NotLeader, HookRefusal::AutoIncActivating};
         if (b.keyZeroCreate && b.autoIncWindowFull) return {ErrorCode::NotLeader, HookRefusal::AutoIncWindowFull};
@@ -204,6 +213,8 @@ public:
     /// With a Throttled answer: how long the client should wait before the retry (ns); 0 otherwise.
     [[nodiscard]] int64_t retryAfterNs() const noexcept { return retryAfterNs_; }
     [[nodiscard]] bool checked() const noexcept { return checked_; }
+    /// check() ran clean and a record carries an intent.
+    [[nodiscard]] bool anyIntent() const noexcept { return anyIntent_; }
 
 private:
     [[nodiscard]] rune::storage::HookStaged patchKeyZeroIds_(const uint8_t* batch, std::size_t len) noexcept;
@@ -219,6 +230,7 @@ private:
     std::span<uint8_t>   scratch_;   // key-0 batches are copied here to patch their ids
     HookRefusal          refusal_ = HookRefusal::None;
     bool                 checked_ = false;
+    bool                 anyIntent_ = false;
     AutoIncPlan          plan_;
     uint32_t             keyZeroCount_ = 0;
     uint32_t             leaseGrants_  = 0;   // lease topic: the grants check() found (stage() stamps them)

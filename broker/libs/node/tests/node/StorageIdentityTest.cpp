@@ -490,3 +490,26 @@ TEST(StorageIdentityRegression, ConsensusClassIsPresentOnlyOnceTheTermLogHoldsDa
     touch(t.path / "term.log", "y");
     EXPECT_TRUE(StorageIdentity::isPresent(d, StorageIdentity::Class::Consensus));
 }
+
+// Election fix round 1: the storage-failed sentinel vouches only for the boot that wrote it.  RED: storageFailedThisBoot() ignores the match.
+TEST(StorageIdentityRegression, StorageFailedSentinelMatchesOnlyThisBootRegression) {
+    TmpDir t("storage_failed");
+    const std::string d = t.str();
+    EXPECT_FALSE(StorageIdentity::storageFailedThisBoot(d, "boot-a")) << "no sentinel yet";
+    ASSERT_TRUE(StorageIdentity::markStorageFailedThisBoot(d, "boot-a"));
+    EXPECT_TRUE(StorageIdentity::storageFailedThisBoot(d, "boot-a"));
+    EXPECT_FALSE(StorageIdentity::storageFailedThisBoot(d, "boot-b")) << "another boot";
+    EXPECT_FALSE(StorageIdentity::storageFailedThisBoot(d, "")) << "unknown boot id";
+}
+
+#if defined(__linux__) || defined(__APPLE__)
+// Election batch: the OS boot id is read from the kernel and is stable within a process.  RED: osBootId() returns "".
+TEST(StorageIdentityRegression, OsBootIdIsReadFromTheKernelRegression) {
+    const std::string id = StorageIdentity::osBootId();
+    EXPECT_FALSE(id.empty());
+    EXPECT_EQ(id, StorageIdentity::osBootId());
+#if defined(__linux__)
+    EXPECT_EQ(id.size(), 36u);
+#endif
+}
+#endif

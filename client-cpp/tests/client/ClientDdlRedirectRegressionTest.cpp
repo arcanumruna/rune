@@ -731,6 +731,41 @@ TEST(ClientDdlRedirectRegression, TraceDdlRetriesRecordsEveryFollowedRedirectAnd
     }
 }
 
+// ClientConfig::ddlRetryBackoff is the first NotLeader backoff (default 100 ms, doubling): the knob sets it, and it must be >= 1 ms.
+TEST(ClientDdlRedirectRegression, DdlRetryBackoffDefaultsTo100msAndTheKnobTakesEffectRegression) {
+    EXPECT_EQ(rc::ClientConfig{}.ddlRetryBackoff, std::chrono::milliseconds(100));
+    int32_t stream = 3984;
+    for (const auto backoff : {std::chrono::milliseconds(100), std::chrono::milliseconds(7)}) {
+        SCOPED_TRACE(backoff.count());
+        rc::ClientConfig cfg = invokerCfg(stream, stream + 1);
+        stream += 2;
+        cfg.traceDdlRetries = true;
+        if (backoff.count() != 100) cfg.ddlRetryBackoff = backoff;
+        Rig r(cfg);
+        r.connect();
+        int calls = 0;
+        r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+            auto m = pc::DropTopic::decode(f, len);
+            ASSERT_TRUE(m.has_value());
+            if (calls++ == 0) { r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId); return; }
+            pc::DdlResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId; resp.newVersion = 2;
+            r.gw.sendDdlResponse(ep, resp);
+        };
+        test_support::TestCq cq(r.client);
+        auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+        ASSERT_TRUE(f.accepted());
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/1'000'000));
+        ASSERT_TRUE(f.ok()) << f.describe();
+        std::vector<rc::Client::DdlRetryNote> notes;
+        (void)r.client.takeDdlRetryNotes(notes);
+        ASSERT_EQ(notes.size(), 1u);
+        EXPECT_EQ(notes[0].backoffMs, backoff.count());
+    }
+    rc::ClientConfig bad = invokerCfg(stream, stream + 1);
+    bad.ddlRetryBackoff = std::chrono::milliseconds(0);
+    EXPECT_THROW(rc::Client{bad}, std::invalid_argument);
+}
+
 // ── fix round 1, R2: tracing is Invoker-only and enforced ───────────────────
 
 TEST(ClientDdlRedirectRegression, TraceDdlRetriesIsRefusedOutsideInvokerModeRegression) {

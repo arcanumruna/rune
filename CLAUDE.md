@@ -73,6 +73,9 @@ regression.
 zero-alloc, shared-nothing, ring-only, no-virtual and benchmarked. Control-plane and admin work (DDL, commits, I/O)
 goes off the hot path onto its own worker.
 
+Database features (checked writes: `key.index`, `autoincrement`, `unique` and `check` views, judged transactions) need a typed,
+keyed topic; a topic without them takes one branch and nothing else. Details and test binaries: [broker/CLAUDE.md](broker/CLAUDE.md).
+
 ## 3. Testing policy
 
 - **Interaction matrix.** Every feature is tested across its full matrix: every operation × every related or

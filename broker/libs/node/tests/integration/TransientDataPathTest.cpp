@@ -461,7 +461,7 @@ TEST(UnknownProducerIdRegression, RcBuildProducerStateRebuildUnvouchedRegression
     ASSERT_TRUE(rc.ready());
     ASSERT_NE(psm.entry(7, kP, 0), nullptr);
     EXPECT_EQ(psm.entry(7, kP, 0)->lastSequence, 1);
-    EXPECT_TRUE(psm.entry(7, kP, 0)->unvouched);
+    EXPECT_TRUE(psm.entry(7, kP, 0)->rebuilt);
     EXPECT_TRUE(psm.validate(7, kP, 0, 0, 6, 6).isUnknownProducerId()) << "a forward gap on a rebuilt entry";
     EXPECT_TRUE(psm.validate(7, kP, 0, 0, 2, 2).isAccept()) << "the next in order";
 }
@@ -568,8 +568,7 @@ TEST(TransientDataPathRegression, RcRingRebuildIsBudgetedPerStepAndEqualsTheOneS
         if (x == nullptr) continue;
         EXPECT_EQ(x->producerEpoch, y->producerEpoch) << "producer " << pid;
         EXPECT_EQ(x->lastSequence, y->lastSequence) << "producer " << pid;
-        EXPECT_EQ(x->markerOnly, y->markerOnly) << "producer " << pid;
-        EXPECT_EQ(x->unvouched, y->unvouched) << "producer " << pid;
+        EXPECT_EQ(x->rebuilt, y->rebuilt) << "producer " << pid;
         EXPECT_EQ(x->coordinatorEpoch, y->coordinatorEpoch) << "producer " << pid;
     }
 }

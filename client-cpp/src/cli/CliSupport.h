@@ -48,7 +48,7 @@ struct ParsedArgs {
 };
 
 // The test-only overrides the schema commands already accept (not advertised).
-inline constexpr std::string_view kHiddenValueFlags[] = {"--cli-stream-in", "--cli-stream-out", "--cli-data-dir",
+inline constexpr std::string_view kHiddenValueFlags[] = {"--cli-stream-in", "--cli-stream-out", "--cli-data-dir", "--cli-aeron-dir",
                                                          "--cli-egress", "--user", "--password-file",   // the global flags too (Task 8)
                                                          "--tls-ca", "--tls-host",                      // issue #13
                                                          "--gateway-response-port"};                    // NAT-safe egress (D7)

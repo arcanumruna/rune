@@ -442,6 +442,13 @@ public:
     /// every start; 0 = untracked).  Stamped on every FetchRequest this replica
     /// sends; set once before the replica is driven (ReplicaRegistry::add).
     void setProcessIncarnation(int64_t inc) noexcept { processIncarnation_ = inc; }
+    /// Election batch: this process's OS boot id ("" = unknown: never vouched).  A disk-backed replica reads <log dir>/leader-boot
+    /// here; equal = it led this partition earlier in this boot, so its leader-epoch bumps carry kBumpLedThisBoot.  Cold (registry add).
+    /// Assumes an operator does not restore an old log dir without a reboot, and storage does not silently drop dirty pages on a
+    /// writeback error without a reboot.  A detected storage failure (fsync error, log dir offline) revokes the certificate for the rest
+    /// of this boot (storage-failed-boot sentinel, dropLeaderBoot_); if even the sentinel cannot be written the device is unwritable and
+    /// the restart's recovery cannot write the log either.
+    void setBootId(std::string id);
     /// E2 C1 residual N1: this PROCESS's node-control identity (the nonce the
     /// node registers with every controller, ControlledShutdown).  Carried in
     /// the transient lineage report and committed with the lineage, so the
@@ -925,6 +932,10 @@ public:
     // fail-closed rule) and the gateway moves such a subscription off a demoted leader.
     void publishLeaderOnlyReads(bool on) noexcept { publishedLeaderOnlyReads_.store(on, std::memory_order_release); }
     [[nodiscard]] bool gatewayLeaderOnlyReads() const noexcept { return publishedLeaderOnlyReads_.load(std::memory_order_acquire); }
+    // Part 11: the cleaner may remove a TxnJudge (type 19) only below this offset (the owning worker's judge: every member checkpoint
+    // is past it).  0 (the default) = keep every one.
+    void publishCleanerTxnJudgeBound(Offset bound) noexcept { publishedTxnJudgeBound_.store(bound, std::memory_order_release); }
+    [[nodiscard]] Offset cleanerTxnJudgeBound() const noexcept { return publishedTxnJudgeBound_.load(std::memory_order_acquire); }
     // D3b fix round 1: the minimum fetch position over EVERY assigned replica (not
     // just the ISR), published by the duty/owning thread in publishCleanerState().
     // A txn marker below it is held by every replica, so the cleaner may remove it;
@@ -2046,6 +2057,8 @@ private:
     /// not controller-managed).  Set by every becomeLeader.
     int32_t committedPartitionEpoch_ = -1;
     int64_t processIncarnation_      = 0;    ///< KIP-903 (see setProcessIncarnation)
+    std::string bootId_;                     ///< Election batch (see setBootId)
+    bool        ledThisBoot_ = false;        ///< <log dir>/leader-boot holds bootId_: this replica led in this OS boot
     // Internal quorum mode (MAJOR-2/3, see setInternalIsrKnowledge).
     InternalIsrKnowledge* isrKnowledge_     = nullptr;
     bool     internalSeedPending_ = false;   ///< leadership seed (every replica) not yet replaced by a committed ISR
@@ -2128,6 +2141,9 @@ public:
     static constexpr int64_t kAlterIsrResendNsForTest = 50'000'000LL;   // == kAlterIsrResendNs
 private:
     [[nodiscard]] int32_t bumpFlags_() const noexcept;
+    bool writeLeaderBoot_() const;
+    /// A storage failure on the log dir revokes the leader-boot certificate: clears ledThisBoot_ and unlinks the marker.
+    void dropLeaderBoot_();
     bool fenceEstablished_ = false;          ///< no-fence-file mode: the first leadership was refused
     /// D21 review L2: both leader-epoch-state slots were corrupt — the epochs an
     /// earlier incarnation led at are unknown (an epoch led with no surviving
@@ -2212,6 +2228,7 @@ private:
     // D3b: first unstable offset (LSO) for the cleaner — see publishCleanerLso().
     std::atomic<Offset> publishedLsoForCleaner_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso};
     std::atomic<Offset> publishedVerdictBound_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso};
+    std::atomic<Offset> publishedTxnJudgeBound_{0};   // Part 11: until the worker publishes, no TxnJudge is removed
     Offset retentionHold_ = std::numeric_limits<Offset>::max();   // owner thread only
     std::atomic<Offset> publishedVerdictMarkerEnd_{0};
     std::atomic<bool>   publishedLeaderOnlyReads_{false};   ///< publishLeaderOnlyReads (owner: the worker)

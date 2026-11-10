@@ -9,6 +9,7 @@
 #include <rune/protocol/client/CryptoEnvelope.h>
 #include <rune/codec/FilterPredicate.h>
 #include <rune/codec/Serialize.h>
+#include <rune/node/AdminChannels.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/Worker.h>
@@ -25,7 +26,10 @@
 #include <rune/storage/LogCleaner.h>
 #include <rune/storage/SkimpyOffsetMap.h>
 #include <rune/transaction/ControlMarker.h>
+#include <rune/ql/Backends.h>
+#include <rune/ql/Parser.h>
 #include <rune/view/PlanCompiler.h>
+#include <rune/view/Verdict.h>
 
 #include <Aeron.h>
 #include <FragmentAssembler.h>
@@ -44,6 +48,7 @@
 #include <set>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <string>
@@ -115,6 +120,9 @@ struct RigTuning {
 /// The rig's worker: owned (the default) or borrowed from a WorkerPool (RigTuning::hostWorker, never deleted by the rig).
 struct RigWorkerDelete { bool owns = true; void operator()(Worker* w) const noexcept { if (owns) delete w; } };
 using RigWorkerPtr = std::unique_ptr<Worker, RigWorkerDelete>;
+
+/// Part 09: the constrained views of the spec's examples, by their QL statements.
+enum class ConstrainedView : uint8_t { CharacterName, AccountStats, AccountCharacters, PerGender, Ledger, UserIdentity, PcName };
 
 class VerdictRig {
 public:
@@ -198,6 +206,300 @@ public:
     void requestKeyIndex() {
         keyIndexOn_ = true;
         ASSERT_TRUE(worker->tryEnqueueOp(specOp_(true)));
+    }
+    /// Part 09: a typed source of schema `d` (its first field the uint64 key), key-indexed, with autoincrement or without; returns once the
+    /// first leadership scan made it ready.  A restart brings the topic back the same way.
+    void createSourceTopic(rune::codec::Descriptor d, bool autoIncrement) {
+        customSrc_ = std::move(d);
+        if (autoIncrement) { createAutoIncTopic(); return; }
+        createKeyIndex(KeyShape{}, true);
+        for (int i = 0; i < kMaxPass && !keyIndexLogged_(); ++i) pass();
+        ASSERT_TRUE(keyIndexLogged_()) << "the key index never became the logged set's member";
+    }
+    /// Part 09: topic 1 of the spec's character examples, as the rig's source.
+    struct Char { uint64_t id = 0; uint64_t userId = 0; std::string name; uint16_t gender = 0; int64_t lastPlayed = 0; uint8_t intent = 0; bool tombstone = false; };
+    static constexpr const char* kCharacterTopic = "topic character { characterId uint64, userId uint64, name string(16), gender uint16, lastPlayed int64 } partitions 1 key characterId;";
+    static constexpr const char* kLedgerTopic = "topic entry { entryId uint64, account uint64, amount int64, memo string(16) } partitions 1 key entryId;";
+    /// The rig's source from a QL topic statement; the views of createConstrainedView() are authored over it.
+    void createQlTopic(const char* statement, bool autoIncrement) {
+        srcTopic_ = parseTopic(statement);
+        createSourceTopic(rune::ql::toDescriptor(srcTopic_), autoIncrement);
+    }
+    static rune::ql::TopicDef parseTopic(const char* statement) {
+        auto parsed = rune::ql::parse(statement);
+        if (!parsed) throw std::runtime_error(parsed.error().message);
+        return std::get<rune::ql::TopicDef>(*parsed);
+    }
+    void createCharacterTopic(bool autoIncrement = true) { createQlTopic(kCharacterTopic, autoIncrement); }
+    void createLedgerTopic() { createQlTopic(kLedgerTopic, false); }
+    /// One record of the current source: the wire key and the key field are `key`; `ints` / `strs` set the other fields by name.
+    struct SrcRecord {
+        uint64_t key = 0; uint8_t intent = 0; bool tombstone = false;
+        std::vector<std::pair<std::string, uint64_t>> ints;
+        std::vector<std::pair<std::string, std::string>> strs;
+    };
+    [[nodiscard]] std::vector<uint8_t> sourceBatch(std::span<const SrcRecord> recs, int64_t pid = -1, int32_t seq = -1, bool txn = false, bool atomic = false) const {
+        const rune::codec::Descriptor& d = *customSrc_;
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
+        b.setTransactional(txn);
+        const auto put = [&](std::vector<uint8_t>& val, const char* field, uint64_t v) {
+            const auto* f = d.find(field);
+            for (uint32_t i = 0; i < rune::codec::fieldWidth(*f); ++i) val[4 + f->offset + i] = static_cast<uint8_t>(v >> (8 * i));
+        };
+        for (const SrcRecord& r : recs) {
+            std::string key(8, '\0');
+            for (int i = 0; i < 8; ++i) key[static_cast<std::size_t>(i)] = static_cast<char>(r.key >> (8 * i));
+            if (r.tombstone) { b.append(key, {}, 1000, r.intent); continue; }
+            std::vector<uint8_t> val(4 + d.blockLength, 0);
+            val[0] = static_cast<uint8_t>(d.blockLength); val[1] = static_cast<uint8_t>(d.blockLength >> 8);
+            val[2] = static_cast<uint8_t>(d.version); val[3] = static_cast<uint8_t>(d.version >> 8);
+            put(val, d.fields[0].name.c_str(), r.key);
+            for (const auto& [name, v] : r.ints) put(val, name.c_str(), v);
+            for (const auto& [name, text] : r.strs) {
+                const auto* f = d.find(name.c_str());
+                std::copy(text.begin(), text.end(), val.begin() + 4 + f->offset);
+            }
+            b.append(key, {reinterpret_cast<const char*>(val.data()), val.size()}, 1000, r.intent);
+        }
+        std::vector<uint8_t> out = b.build();
+        if (atomic) setBatchAttribute(out, rune::protocol::batch::kAttrAtomic);
+        return out;
+    }
+    /// ORs `bit` into a built batch's attributes and re-seals its CRC.
+    static void setBatchAttribute(std::vector<uint8_t>& b, int16_t bit) {
+        namespace pb = rune::protocol::batch;
+        const auto attrs = static_cast<uint16_t>(rune::protocol::detail::getLE16(b.data() + pb::kAttributesOffset) | static_cast<uint16_t>(bit));
+        b[pb::kAttributesOffset] = static_cast<uint8_t>(attrs);
+        b[pb::kAttributesOffset + 1] = static_cast<uint8_t>(attrs >> 8);
+        const uint32_t crc = rune::protocol::crc32c(b.data() + pb::kAttributesOffset, b.size() - static_cast<std::size_t>(pb::kAttributesOffset));
+        for (int i = 0; i < 4; ++i) b[static_cast<std::size_t>(pb::kCrcOffset + i)] = static_cast<uint8_t>(crc >> (i * 8));
+    }
+    /// A Produce frame of source records (enableAcks() first); returns its correlation id.
+    int64_t appendRecords(std::span<const SrcRecord> recs, uint8_t wireAcks, int64_t pid = -1, int32_t seq = -1, bool txn = false, bool atomic = false) {
+        return produceBytes(sourceBatch(recs, pid, seq, txn, atomic), wireAcks, pid, seq);
+    }
+    [[nodiscard]] static SrcRecord srcOf(const Char& c) {
+        return SrcRecord{c.id, c.intent, c.tombstone, {{"userId", c.userId}, {"gender", c.gender}, {"lastPlayed", static_cast<uint64_t>(c.lastPlayed)}}, {{"name", c.name}}};
+    }
+    int64_t appendCharacters(std::span<const Char> chars, uint8_t wireAcks, int64_t pid = -1, int32_t seq = -1, bool txn = false, bool atomic = false) {
+        std::vector<SrcRecord> recs;
+        for (const Char& c : chars) recs.push_back(srcOf(c));
+        return appendRecords(recs, wireAcks, pid, seq, txn, atomic);
+    }
+    struct Entry { uint64_t id = 0; uint64_t account = 0; int64_t amount = 0; std::string memo; bool tombstone = false; };
+    int64_t appendEntries(std::span<const Entry> entries, uint8_t wireAcks, int64_t pid = -1, int32_t seq = -1, bool txn = false, bool atomic = false) {
+        std::vector<SrcRecord> recs;
+        for (const Entry& e : entries) recs.push_back(SrcRecord{e.id, 0, e.tombstone, {{"account", e.account}, {"amount", static_cast<uint64_t>(e.amount)}}, {{"memo", e.memo}}});
+        return appendRecords(recs, wireAcks, pid, seq, txn, atomic);
+    }
+    /// A batch the way a previous leader wrote it: this node takes it by replication and leads again, so the write hook never
+    /// sees it.  Returns its base offset.
+    int64_t appendTxnReplicated(std::vector<uint8_t> batch) {
+        const int64_t base = leo();
+        demote();
+        replicate({std::move(batch)});
+        promote();
+        for (int i = 0; i < kMaxPass && worker->writeStateForTest(kSrc, tuning_.partition) == nullptr; ++i) pass();
+        return base;
+    }
+    /// A TxnJudge of `pid` for the transaction from `firstOffset`, appended to the leader's log and recorded as the worker records its own,
+    /// without the worker's open-transaction guard (a J after the marker).  Returns its offset.
+    int64_t appendTxnJudge(int64_t pid, int64_t firstOffset) {
+        const rune::storage::control_record::TxnJudgeRecord rec{pid, 0, firstOffset};
+        std::vector<uint8_t> b(rune::storage::control_record::kTxnJudgeBatchBytes);
+        EXPECT_EQ(rune::storage::control_record::buildTxnJudge(b, rec), b.size());
+        const int64_t base = replica->appendControlBatch(b, false);
+        EXPECT_GE(base, 0);
+        EXPECT_NE(const_cast<PartitionWriteState*>(writeState())->txn.onJudgeRecord(base, rec), nullptr);
+        return base;
+    }
+
+    // ---- Part 11 (contract addition 19): votes and the ends of transactions ----
+    struct VoteReply { int16_t errorCode = 0; uint16_t code = 0; uint32_t constraintId = 0; int64_t failingOffset = -1; int64_t judgeOffset = -1; };
+    /// A coordinator's vote request for (pid, epoch) on this partition; one pass.  Returns its token.
+    int64_t sendVote(int32_t topicId, int64_t pid, int16_t epoch) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::TxnVote; op.topicId = topicId; op.partition = tuning_.partition; op.replica = replica.get();
+        op.logPtr = log.get(); op.correlationId = ++voteToken_; op.producerId = pid; op.producerEpoch = epoch; op.sessionId = -1;
+        op.targetReplicaId = replica->registryId(); op.incarnation = replica->incarnation();
+        EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
+        pass();
+        return voteToken_;
+    }
+    /// Whether the worker's most recent verification request reported its partition as a verdict source.
+    [[nodiscard]] bool lastVerifyVotes() const { return lastVerifyVotes_; }
+    /// The coordinator's answer `code`, as (pid, epoch), to the worker's most recent verification request of any producer; one pass.
+    void answerVerify(int64_t pid, int16_t epoch, int16_t code) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::TxnVerifyResult; op.topicId = kSrc; op.partition = tuning_.partition; op.replica = replica.get();
+        op.logPtr = log.get(); op.correlationId = lastVerifyReqId_; op.producerId = pid; op.producerEpoch = epoch;
+        op.replicatedPayload.errorCode = code;
+        op.targetReplicaId = replica->registryId(); op.incarnation = replica->incarnation();
+        EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
+        pass();
+    }
+    [[nodiscard]] std::optional<VoteReply> voteReply(int64_t token) const {
+        const auto it = voteReplies_.find(token);
+        return it == voteReplies_.end() ? std::nullopt : std::optional<VoteReply>(it->second);
+    }
+    [[nodiscard]] std::size_t voteRepliesOf(int64_t token) const { return static_cast<std::size_t>(voteReplyCount_.count(token) ? voteReplyCount_.at(token) : 0); }
+    /// Passes (the follower fetching every 8th) until the vote is answered.
+    [[nodiscard]] bool driveUntilVoted(int64_t token, int cap = 2000) {
+        for (int i = 0; i < cap; ++i) {
+            if (voteReplies_.count(token) != 0) return true;
+            if (isr_.size() > 1 && i % 8 == 0) followerFetch();
+            pass();
+        }
+        return voteReplies_.count(token) != 0;
+    }
+    struct TxnEnd { bool committed = false; std::vector<std::pair<int32_t, VoteReply>> votes; };
+    /// Votes, then writes the commit marker on a yes, the abort marker otherwise.
+    TxnEnd commitTxn(int64_t pid) {
+        TxnEnd end;
+        const int64_t tok = sendVote(kSrc, pid, 0);
+        EXPECT_TRUE(driveUntilVoted(tok)) << "the vote was never answered";
+        const auto r = voteReply(tok);
+        if (r) end.votes.emplace_back(kSrc, *r);
+        end.committed = r && r->errorCode == 0 && r->code == 0;
+        marker(pid, end.committed);
+        return end;
+    }
+    /// The base offset the ControlRecordAppended answer of `pid`'s marker carried (nullopt: not answered yet).
+    [[nodiscard]] std::optional<int64_t> markerAnswer(int64_t pid) const {
+        const auto it = markerAnswers_.find(9000 + pid);
+        return it == markerAnswers_.end() ? std::nullopt : std::optional<int64_t>(it->second);
+    }
+    void clearMarkerAnswer(int64_t pid) { markerAnswers_.erase(9000 + pid); }
+    /// Runs `fn` after every pass from now on (test only).
+    void onEveryPass(std::function<void()> fn) { everyPass_ = std::move(fn); }
+    /// The offsets of the TxnJudge records (type 19) in the log.
+    [[nodiscard]] std::vector<int64_t> txnJudgeOffsetsInLog() const {
+        std::vector<int64_t> out;
+        for (int64_t off = 0; off < leo();) {
+            const auto v = log->readView(off, 1 << 20);
+            if (v.empty()) break;
+            for (std::size_t p = 0; p + 12 <= v.len;) {
+                int32_t blen = 0;
+                std::memcpy(&blen, v.data + p + 8, 4);
+                const std::size_t total = 12 + static_cast<std::size_t>(blen);
+                if (p + total > v.len) break;
+                if (rune::storage::control_record::recordType(v.data + p, total) == rune::storage::control_record::kTxnJudge)
+                    out.push_back(rune::protocol::RecordBatchReader(v.data + p, total).baseOffset());
+                p += total;
+            }
+            off = v.nextOffset;
+        }
+        return out;
+    }
+    /// One int64 (or unsigned) output slot of a constrained view's row at `key` (nullopt: no row).
+    [[nodiscard]] std::optional<int64_t> viewInt64(int32_t viewTopicId, uint64_t key, uint16_t outSlot = 0) {
+        const auto c = std::find_if(constrained.begin(), constrained.end(), [&](const auto& kv) { return kv.second.topicId == viewTopicId; });
+        if (c == constrained.end()) { ADD_FAILURE() << "no constrained view " << viewTopicId; return std::nullopt; }
+        const ViewInstance* inst = vs->instanceForTest(viewTopicId, tuning_.partition);
+        const uint8_t* row = inst != nullptr ? inst->table.get(key) : nullptr;
+        if (row == nullptr) return std::nullopt;
+        const auto f = rune::view::readSlot(row, c->second.comp.rowLayout, outSlot);
+        return f.type == rune::codec::PrimType::Int64 ? f.i : static_cast<int64_t>(f.u);
+    }
+    /// The output slot of `column` in a constrained view's row.
+    [[nodiscard]] uint16_t outSlotOf(int32_t viewTopicId, const char* column) const {
+        for (const auto& [v, live] : constrained)
+            if (live.topicId == viewTopicId)
+                for (std::size_t i = 0; i < live.comp.outputDescriptor.fields.size(); ++i)
+                    if (live.comp.outputDescriptor.fields[i].name == column) return static_cast<uint16_t>(i);
+        ADD_FAILURE() << "no column " << column;
+        return 0;
+    }
+
+    struct ConstrainedLive { int32_t topicId; rune::view::CompileResult comp; };
+    std::map<ConstrainedView, ConstrainedLive> constrained;   ///< the views created and not dropped
+
+    [[nodiscard]] static uint64_t objectIdOf(ConstrainedView v) { return 7 + static_cast<uint64_t>(v); }
+    [[nodiscard]] static std::string statementOf(ConstrainedView v, int64_t cap) {
+        switch (v) {
+        case ConstrainedView::CharacterName: return "create unique view character_name key lower(name) as nameKey as select characterId from character;";
+        case ConstrainedView::AccountStats:
+            return "create view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= " + std::to_string(cap) + ");";
+        case ConstrainedView::AccountCharacters: return "create view account_characters key (userId, characterId) as select name, gender, lastPlayed from character;";
+        case ConstrainedView::PerGender:
+            return "create view per_gender key (userId, gender) as select count(*) as n from character group by userId, gender constraint two_per_gender check (n <= 2);";
+        case ConstrainedView::Ledger:
+            return "create view balances key account as select sum(amount) as balance from entry group by account constraint non_negative check (balance >= 0);";
+        case ConstrainedView::UserIdentity: return "create unique view user_identity key (provider, subject) as select userId from user;";
+        case ConstrainedView::PcName: return "create unique view pc_name key lower(name) as nameKey as select id from pc;";
+        }
+        return {};
+    }
+    /// The compiled plan of `v` over `topic` (the source topic srcTopicId), as the AdminWorker authors it.
+    [[nodiscard]] static rune::view::CompileResult authorConstrainedView(const rune::ql::TopicDef& topic, int32_t srcTopicId, ConstrainedView v, int64_t cap, int32_t viewTopicId) {
+        auto parsed = rune::ql::parse(statementOf(v, cap));
+        if (!parsed) throw std::runtime_error(parsed.error().message);
+        auto authored = rune::ql::applyViewPlan(std::get<rune::ql::CreateViewDef>(*parsed), rune::ql::viewSourceOf(topic));
+        if (!authored) throw std::runtime_error(authored.error().message);
+        authored->sources[0].topicId = srcTopicId;
+        const rune::codec::Descriptor src = rune::ql::toDescriptor(topic);
+        const rune::codec::Descriptor* srcs[] = {&src};
+        auto compiled = rune::view::compileView(*authored, srcs, viewTopicId);
+        if (!compiled) throw std::runtime_error(compiled.error().message);
+        compiled->plan.viewObjectId = objectIdOf(v);
+        compiled->plan.persistence = 1;
+        compiled->plan.sizing.chunkBytes = 1u << 20;   // not the 32 MiB row-slab default: a model seed builds these tables at every restart
+        return std::move(*compiled);
+    }
+    /// A view topic id for the `generation`-th plan of `v`.
+    [[nodiscard]] static int32_t constrainedTopicId(ConstrainedView v, int generation) { return static_cast<int32_t>(0x40000000 + objectIdOf(v) + 0x100 * static_cast<uint64_t>(generation)); }
+    /// The view is created: its install frame and the catalog mark of the event.  Returns its view topic id.
+    int32_t createConstrainedView(ConstrainedView v, int64_t cap = 12, bool persisted = false) {
+        auto comp = authorConstrainedView(srcTopic_, kSrc, v, cap, constrainedTopicId(v, ++constrainedGen_));
+        const int32_t id = comp.plan.viewTopicId;
+        installCompiledView(comp, objectIdOf(v), persisted);
+        constrained[v] = ConstrainedLive{id, std::move(comp)};
+        return id;
+    }
+    /// The same object under a new plan: one event (install of the new plan, uninstall of the old, one mark).
+    void replaceConstrainedView(ConstrainedView v, int64_t cap, bool persisted = false) {
+        auto comp = authorConstrainedView(srcTopic_, kSrc, v, cap, constrainedTopicId(v, ++constrainedGen_));
+        const int32_t id = comp.plan.viewTopicId;
+        replaceCompiledView(constrained.at(v).topicId, std::pair{comp, objectIdOf(v)}, persisted);
+        constrained[v] = ConstrainedLive{id, std::move(comp)};
+    }
+    void dropConstrainedView(ConstrainedView v) {
+        replaceCompiledView(constrained.at(v).topicId, std::nullopt);
+        constrained.erase(v);
+    }
+    /// The plan fingerprint the judge knows `v` by.
+    [[nodiscard]] uint64_t fingerprintOf(ConstrainedView v, bool persisted) const {
+        rune::view::CompiledViewPlan plan = constrained.at(v).comp.plan;
+        plan.persistence = persisted ? 0 : 1;
+        return rune::view::verdictPlanFingerprint(rune::view::serialize(plan));
+    }
+    [[nodiscard]] const ViewInstance* constrainedInstance(ConstrainedView v) const { return vs->instanceForTest(constrained.at(v).topicId, tuning_.partition); }
+    [[nodiscard]] std::size_t uniqueConflicts(ConstrainedView v) const {
+        const ViewFoldCounters* c = vs->foldCounters(constrained.at(v).topicId, tuning_.partition);
+        return c == nullptr ? 0 : c->uniqueConflicts;
+    }
+
+    /// The control thread's install frame of a compiled view, then the catalog mark of the event.  `persisted` views need the IO agent.
+    void installCompiledView(rune::view::CompileResult c, uint64_t objectId, bool persisted = false) {
+        c.plan.viewObjectId = objectId;
+        c.plan.persistence = persisted ? 0 : 1;
+        if (persisted && !agent) agent = std::make_unique<ViewSnapshotIoAgent>(channel, viewDir_.string(), /*fsyncMs=*/0, backupPolicy);
+        installs_.emplace_back(c.plan.viewTopicId, [=, this, src = *customSrc_] { sendInstall_(c, src, persisted); });
+        installs_.back().second();
+        catalogMark(++catalogPos_);
+    }
+    /// A replace or drop event: the new plan is installed (if any) and the old view uninstalled before the one mark of the event.
+    void replaceCompiledView(int32_t oldTopic, std::optional<std::pair<rune::view::CompileResult, uint64_t>> next, bool persisted = false) {
+        std::erase_if(installs_, [&](const auto& i) { return i.first == oldTopic; });
+        if (next) {
+            next->first.plan.viewObjectId = next->second;
+            next->first.plan.persistence = persisted ? 0 : 1;
+            installs_.emplace_back(next->first.plan.viewTopicId, [=, this, c = next->first, src = *customSrc_] { sendInstall_(c, src, persisted); });
+            installs_.back().second();
+        }
+        ASSERT_TRUE(uninstallEncoded_(oldTopic));
+        catalogMark(++catalogPos_);
     }
     /// Schema version 2 drops the source's v field: its SchemaUpdate (materialized as of 2) and its FilterSchema (the evolving blob).  Default key only.
     void dropValueField() {
@@ -292,16 +594,17 @@ public:
         holdJudge_ = on;
         vs->holdJudgesForTest(on);
     }
-    /// The ids in [0, 4096) the key index holds, as decimal strings; the table's size must be that many.
-    std::set<std::string> keyIndexKeys() {
-        std::set<std::string> out;
+    /// The ids in [0, 4096) the key index holds; the table's size must be that many.
+    std::set<uint64_t> keyIndexKeys() {
+        std::set<uint64_t> out;
         const uint32_t kw = keyWidthOf(keyShape_);
+        const std::size_t held = vs->keyIndexSizeForTest(kSrc, tuning_.partition);
         std::string key(kw, '\0');
-        for (uint64_t id = 0; id < 4096; ++id) {
+        for (uint64_t id = 0; id < 4096 && out.size() < held; ++id) {   // every key found: the rest of the range holds none
             for (uint32_t i = 0; i < kw; ++i) key[i] = i < 8 ? static_cast<char>(id >> (8 * i)) : '\0';
-            if (vs->keyIndexContainsForTest(kSrc, tuning_.partition, key)) out.insert(std::to_string(id));
+            if (vs->keyIndexContainsForTest(kSrc, tuning_.partition, key)) out.insert(out.end(), id);
         }
-        EXPECT_EQ(out.size(), vs->keyIndexSizeForTest(kSrc, tuning_.partition)) << "a key outside [0, 4096)";
+        EXPECT_EQ(out.size(), held) << "a key outside [0, 4096)";
         return out;
     }
 
@@ -311,9 +614,16 @@ public:
         installs_.emplace_back(viewTopicId, [=, this] { installRejectViewNow_(viewTopicId, objectId, rule, name, persisted); });
         installs_.back().second();
     }
-    void installProjection(int32_t viewTopicId, const char* name = "proj") {
-        installs_.emplace_back(viewTopicId, [=, this] { installProjectionNow_(viewTopicId, name); });
+    /// `persisted`: installed by the control thread's frame (a restarted node recovers it from its checkpoint).
+    void installProjection(int32_t viewTopicId, const char* name = "proj", bool persisted = false) {
+        if (persisted && !agent) agent = std::make_unique<ViewSnapshotIoAgent>(channel, viewDir_.string(), /*fsyncMs=*/0, backupPolicy);
+        installs_.emplace_back(viewTopicId, [=, this] { installProjectionNow_(viewTopicId, name, persisted); });
         installs_.back().second();
+    }
+    /// Every view instance folds at most `n` records a pass (0 = the cap derived from the delta ring), across restarts too.
+    void setViewPassCap(int64_t n) {
+        viewPassCap_ = n;
+        vs->setPassCapForTest(n);
     }
     /// count(*) of the records folded per id (a view key is an 8-byte field: the tag cannot group).
     void installCountById(int32_t viewTopicId, const char* name = "cnt") {
@@ -362,11 +672,13 @@ public:
         epoch_ = 1;   // the new replica starts at epoch 1
         vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string(), tuning_.hashSeed);
         vs->holdJudgesForTest(holdJudge_);
+        vs->setPassCapForTest(viewPassCap_);
         open();
         if (cutTo < 0) replica->setLastCleanOffset(clean);
         typedWith_(5, keyShape_, keyIndexOn_ && specDelayPasses == 0);
         recovering_ = true;
         if (reinstall) reinstallAll();
+        if (catalogPos_ >= 0) catalogMark(catalogPos_);
         passes(3);
         delayedSpecIn_ = keyIndexOn_ ? specDelayPasses : 0;
     }
@@ -380,6 +692,8 @@ public:
     /// The replica cuts its log (a follower meeting a new leader's history): the log generation moves.
     void truncateReplicaTo(int64_t offset) { replica->truncateLogForTest(offset); passes(5); }
     /// Another replica takes over: this node's tail above the HW is gone and no memory survives.
+    /// From now on every install frame the rig sends carries a descriptor the worker refuses.
+    bool refuseInstalls = false;
     void failover(bool reinstall = true) { restart(reinstall, replica->highWatermark()); }
     void reinstallAll() { for (auto& i : installs_) i.second(); }
     void demote() {
@@ -427,14 +741,53 @@ public:
         resp.records = std::span<const uint8_t>(bytes.data(), bytes.size());
         replica->applyReplicated(resp);
     }
+    /// The control thread's catalog mark: the node has applied the catalog through `through`, behind every install it sent before.
+    void catalogMark(int64_t through) {
+        ASSERT_TRUE(encodeCatalogMark(channel.install, through));
+        passes(3);
+    }
+    /// The control thread's uninstall frame of a view, without the catalog mark that follows it in production.
+    void uninstallFrame(int32_t viewTopicId) {
+        rune::node::ViewPlanUpdateMsg m;
+        m.viewTopicId = viewTopicId;
+        m.uninstall = true;
+        ASSERT_TRUE(encodeViewPlanUpdate(channel.install, ViewSnapshotChannel::kInstallMsgType, m));
+        passes(3);
+    }
+    /// A verdict marker batch without rejections (base offset 0, stamped by replicate()).
+    static std::vector<uint8_t> markerBatch(int64_t from, int64_t finalThrough, uint32_t setId) {
+        std::vector<uint8_t> b(rune::storage::control_record::markerBatchBytes(0));
+        EXPECT_EQ(rune::storage::control_record::buildVerdictMarker(b, rune::storage::control_record::MarkerHeader{from, finalThrough, setId, 0}, {}), b.size());
+        return b;
+    }
     /// A constraint-set change batch (base offset 0, stamped by replicate()).
-    static std::vector<uint8_t> changeBatch(uint32_t setId, std::vector<rune::storage::control_record::ChangeMember> members) {
+    static std::vector<uint8_t> changeBatch(uint32_t setId, std::vector<rune::storage::control_record::ChangeMember> members, int64_t catalogThrough = -1) {
         std::vector<uint8_t> b(rune::storage::control_record::changeBatchBytes(static_cast<uint16_t>(members.size())));
-        EXPECT_EQ(rune::storage::control_record::buildConstraintSetChange(b, setId, members), b.size());
+        EXPECT_EQ(rune::storage::control_record::buildConstraintSetChange(b, setId, catalogThrough, members), b.size());
         return b;
     }
 
 private:
+    void sendInstall_(const rune::view::CompileResult& c, const rune::codec::Descriptor& src, bool persisted) {
+        rune::node::ViewPlanUpdateMsg m;
+        m.viewTopicId = c.plan.viewTopicId;
+        m.persistence = persisted ? 0 : 1;
+        m.recovery    = recovering_;
+        m.planBlob    = rune::view::serialize(c.plan);
+        m.outDescBlob = rune::codec::serialize(c.outputDescriptor);
+        m.srcDescBlob = rune::codec::serialize(src);
+        if (refuseInstalls) m.outDescBlob = {1, 2, 3};   // the worker refuses a plan whose descriptor does not decode
+        EXPECT_TRUE(encodeViewPlanUpdate(channel.install, ViewSnapshotChannel::kInstallMsgType, m));
+        passes(3);
+    }
+    bool uninstallEncoded_(int32_t viewTopicId) {
+        rune::node::ViewPlanUpdateMsg m;
+        m.viewTopicId = viewTopicId;
+        m.uninstall = true;
+        const bool ok = encodeViewPlanUpdate(channel.install, ViewSnapshotChannel::kInstallMsgType, m);
+        passes(3);
+        return ok;
+    }
     [[nodiscard]] WorkerOp specOp_(bool keyIndex) const {
         TopicWriteSpecWire w;
         w.topicId = kSrc; w.keyFieldId = keyFieldId_; w.lease = lease_; w.keyType = keyShape_.type; w.legacyValidate = false; w.keyIndex = keyIndex;
@@ -494,7 +847,7 @@ private:
         ASSERT_TRUE(comp.has_value());
         vs->installView(comp->plan, comp->rowLayout, src, /*persisted=*/false);
     }
-    void installProjectionNow_(int32_t viewTopicId, const char* name) {
+    void installProjectionNow_(int32_t viewTopicId, const char* name, bool persisted) {
         const auto src = verdictSourceDescriptor();
         rune::view::ViewPlan v;
         v.viewName = name; v.key = "id"; v.sources = {{kSrc, "id"}};
@@ -505,17 +858,22 @@ private:
         const rune::codec::Descriptor* srcs[] = {&src};
         auto comp = rune::view::compileView(v, srcs, viewTopicId);
         ASSERT_TRUE(comp.has_value());
+        if (persisted) {
+            comp->plan.persistence = 0;
+            sendInstall_(*comp, src, true);
+            return;
+        }
         vs->installView(comp->plan, comp->rowLayout, src, /*persisted=*/false);
     }
 
 public:
 
     /// `shape`: the source's key; the wire key and the value's id field are that wide (the id's little-endian bytes, zero padded).
-    static std::vector<uint8_t> batch(const std::vector<Rec>& recs, int64_t pid = -1, int32_t seq = -1, const KeyShape& shape = {}, bool txn = false) {
+    static std::vector<uint8_t> batch(const std::vector<Rec>& recs, int64_t pid = -1, int32_t seq = -1, const KeyShape& shape = {}, bool txn = false, int16_t epoch = 0) {
         const uint32_t kw = keyWidthOf(shape);
         const auto idByte = [](uint64_t id, uint32_t i) { return static_cast<uint8_t>(i < 8 ? id >> (8 * i) : 0); };
         rune::protocol::RecordBatchBuilder b(0, 1000);
-        if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
+        if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq); }
         b.setTransactional(txn);
         for (const auto& r : recs) {
             std::vector<uint8_t> key(kw), val;
@@ -532,8 +890,8 @@ public:
     }
 
     /// One worker pass; the driver and the client conductor run in it too (Invoker), so the rig is single-threaded.
-    int pass() {
-        now += 1'000'000;
+    int pass(int64_t advanceNs = 1'000'000) {
+        now += advanceNs;
         ++passNo_;
         if (delayedSpecIn_ > 0 && --delayedSpecIn_ == 0) EXPECT_TRUE(worker->tryEnqueueOp(specOp_(true)));
         pumpAeron_();
@@ -547,7 +905,9 @@ public:
             else if (r.type == WorkerReturn::Type::LeaseKeepAliveResult) leaseKaAnswers.push_back(std::move(r));
             else if (r.type == WorkerReturn::Type::LeaseTimeToLiveResult) leaseTtlAnswers.push_back(std::move(r));
             else if (r.type == WorkerReturn::Type::ScanLeasesResult) leaseScanAnswers.push_back(std::move(r));
+            else noteTxnReturn_(r);
         }, [](const TxnReturn&) {});
+        if (everyPass_) everyPass_();
         if (agent) { if (!pauseAgent) (void)agent->doWork(now); }
         else channel.deltas.drain([this](int32_t, aeron::concurrent::AtomicBuffer& buf, OneToOneByteRing::index_t off, OneToOneByteRing::index_t) {
             int32_t viewTopicId;
@@ -758,10 +1118,8 @@ public:
     void enableEgress() {
         if (egress_) return;
         ensureDriver_();
-        const std::string control = "127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
-        const std::string local   = "127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
-        egress_ = std::make_unique<WorkerEgress>(aeron_, control.c_str(), 3001, driver_->pumpWith(aeron_.get()));
-        const int64_t reg = aeron_->addSubscription("aeron:udp?control=" + control + "|control-mode=dynamic|endpoint=" + local, 3001);
+        egress_ = WorkerEgress::ipcForTest(aeron_, 3001, driver_->pumpWith(aeron_.get()));
+        const int64_t reg = aeron_->addSubscription("aeron:ipc", 3001);
         ASSERT_TRUE(egress_->resolved());
         while (!(sub_ && sub_->isConnected() && egress_->isConnected())) {
             if (!sub_) sub_ = aeron_->findSubscription(reg);
@@ -822,6 +1180,7 @@ public:
                     if (r.type == WorkerReturn::Type::LeaseKeepAliveResult) leaseKaAnswers.push_back(std::move(r));
                     if (r.type == WorkerReturn::Type::LeaseTimeToLiveResult) leaseTtlAnswers.push_back(std::move(r));
                     if (r.type == WorkerReturn::Type::ScanLeasesResult) leaseScanAnswers.push_back(std::move(r));
+                    noteTxnReturn_(r);
                 }, [](const TxnReturn&) {});
                 absorb_(box, chunk.data(), chunk.size());
                 cursors_[subId] = next;
@@ -889,15 +1248,15 @@ public:
         wireAcks_();
     }
     /// A Produce frame on the worker's ingress; returns its correlation id.  `recs` is one batch.
-    int64_t produceFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool txn = false) {
-        return produceBytes(batch(recs, pid, seq, keyShape_, txn), acks, pid, seq);
+    int64_t produceFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool txn = false, int16_t epoch = 0) {
+        return produceBytes(batch(recs, pid, seq, keyShape_, txn, epoch), acks, pid, seq, epoch);
     }
     /// A Produce frame carrying `bytes` as its batch (a hand-made one); returns its correlation id.
-    int64_t produceBytes(const std::vector<uint8_t>& bytes, uint8_t acks, int64_t pid = -1, int32_t seq = -1) {
+    int64_t produceBytes(const std::vector<uint8_t>& bytes, uint8_t acks, int64_t pid = -1, int32_t seq = -1, int16_t epoch = 0) {
         const int64_t c = ++corr;
         rune::protocol::client::Produce m;
         m.sessionId = kAckSession; m.correlationId = c; m.topicId = kSrc; m.partition = tuning_.partition; m.partitionKnown = 1;
-        m.acks = acks; m.producerId = pid; m.producerEpoch = 0; m.baseSequence = seq;
+        m.acks = acks; m.producerId = pid; m.producerEpoch = epoch; m.baseSequence = seq;
         m.recordBatch = std::span<const uint8_t>(bytes);
         std::vector<uint8_t> f(m.encodedSize()); m.encode(f.data());
         if (ackEncrypted_) f = sealC2b_(f);
@@ -936,10 +1295,16 @@ public:
         passes(3);
     }
     /// Drives until the ack of `corr` arrived (or `maxPasses`).
+    /// A Strict ack also waits for its fsync, which takes wall-clock time: up to 5 s more of passes that do not move `now`.
     std::optional<Ack> ack(int64_t c, int maxPasses = 600) {
         for (int i = 0; i < maxPasses; ++i) {
             if (const auto it = acksSeen_.find(c); it != acksSeen_.end()) return it->second;
             pass();
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (tuning_.durabilityTier == 2 && acksSeen_.count(c) == 0 && std::chrono::steady_clock::now() < deadline) {
+            pass(0);
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
         if (const auto it = acksSeen_.find(c); it != acksSeen_.end()) return it->second;
         return std::nullopt;
@@ -984,10 +1349,23 @@ public:
     }
 
     // ---- the log, read back ----
-    struct RigLogRec { int64_t offset; uint64_t id; int64_t v; uint8_t tag; bool del; uint8_t intent = 0; uint64_t valueId = 0; };   ///< valueId: the value's own key field
-    struct RigChange { int64_t offset; std::vector<rune::storage::control_record::ChangeMember> members; };
+    struct RigLogRec { int64_t offset; uint64_t id; int64_t v; uint8_t tag; bool del; uint8_t intent = 0; uint64_t valueId = 0; std::string name; int64_t producerId = -1; bool txn = false; bool atomic = false; int64_t batchBase = -1; };   ///< valueId: the value's own key field; name: the string(16) after the first 8-byte column (a character's name), empty if the value ends before it; batchBase: the base offset of its batch
+    struct RigChange { int64_t offset; std::vector<rune::storage::control_record::ChangeMember> members; int64_t catalogThrough = -1; };
     struct RigMarker { int64_t offset; rune::storage::control_record::MarkerHeader header; std::vector<std::tuple<int64_t, uint16_t, uint32_t>> entries; bool horizon = false; };
-    struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; std::vector<std::pair<int64_t, uint64_t>> reservations; };   ///< reservations: (offset, reserved-through n)
+    struct RigPlan { int64_t offset; rune::storage::control_record::VerdictPlanHeader header; std::vector<uint8_t> plan, outputDescriptor, sourceDescriptor; };   ///< a type-20 record
+    struct RigTxnMarker { int64_t offset; int64_t producerId; bool commit; };   ///< a COMMIT / ABORT marker
+    struct RigJudge { int64_t offset; int64_t producerId; int16_t epoch; int64_t firstOffset; };   ///< a TxnJudge record
+    struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; std::vector<std::pair<int64_t, uint64_t>> reservations; std::vector<RigPlan> plans; std::vector<RigTxnMarker> txnMarkers; std::vector<RigJudge> judges;
+        /// One past the last record that gets a verdict: an aborted transaction's records get none, and no marker covers a trailing range of them.
+        [[nodiscard]] int64_t judgedEnd() const {
+            int64_t end = 0;
+            for (const RigLogRec& d : data) {
+                const auto m = std::find_if(txnMarkers.begin(), txnMarkers.end(), [&](const RigTxnMarker& x) { return x.producerId == d.producerId && x.offset > d.offset; });
+                if (!d.txn || m == txnMarkers.end() || m->commit) end = d.offset + 1;
+            }
+            return end;
+        }
+    };   ///< reservations: (offset, reserved-through n)
 
     /// Every data record, change record and marker below `through`, in offset order, straight from the segments.
     [[nodiscard]] RigLog readLog(int64_t through = INT64_MAX) const;
@@ -1017,6 +1395,19 @@ public:
         const VerdictSource* judge = vs->verdictSource(kSrc, tuning_.partition);
         const PartitionWriteState* w = writeState();
         ADD_FAILURE() << "judgedThrough " << (judge ? judge->judgedThrough() : -9) << " committed " << (w ? w->markers.committedThrough() : -9) << " target " << target << " leo " << leo() << " hw " << replica->highWatermark() << " waiting " << (judge ? judge->waitingForInstall() : -1) << " stalled " << (judge ? judge->stalled() : -1) << " stalls " << (stats() ? stats()->verdictStalls : 0) << " waitsInstall " << (stats() ? stats()->judgeWaitsForInstall : 0) << " markers " << (w ? w->markers.appendedThrough() : -9);
+        return false;
+    }
+
+    /// Passes until the judge reached `target` (default: the end of the log).  Its markers are not waited for: a stretch under no
+    /// constraint carries none, and a change to a non-empty set is marked with the next record.
+    bool driveUntilJudgeReaches(int64_t target = -1) {
+        if (target < 0) target = dataEnd();
+        for (int i = 0; i < kMaxPass; ++i) {
+            const VerdictSource* judge = vs->verdictSource(kSrc, tuning_.partition);
+            if (judge == nullptr || judge->judgedThrough() >= target) return true;
+            if (isr_.size() > 1 && i % 8 == 0) followerFetch();
+            pass();
+        }
         return false;
     }
 
@@ -1262,6 +1653,7 @@ private:
         worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
         worker->setViewSet(vs.get());
         if (rcScanBytesPerPass != 0) worker->setRcScanBytesPerPass(rcScanBytesPerPass);
+        if (rcProbe != nullptr) worker->setRcResidencyProbeForTest(rcProbe, nullptr);
         if (assignedBaseReserve_ != 0) worker->setAssignedBaseReserveForTest(assignedBaseReserve_);
         if (egress_) worker->setWorkerEgress(egress_.get());
         wireAcks_();
@@ -1270,6 +1662,7 @@ private:
     std::vector<rune::replication::NodeId> isr_;
  public:
     int32_t rcScanBytesPerPass = 0;   ///< the leadership scan budget of a (re)started worker; 0 = the default
+    RcResidencyProbe rcProbe = nullptr;   ///< the leadership scan's residency probe of a (re)started worker; nullptr = the default
     /// The side window's producer capacity of every autoincrement partition installed from now on, this worker's and a restarted one's.
     void reserveAssignedBases(std::size_t producers) {
         assignedBaseReserve_ = producers;
@@ -1287,6 +1680,9 @@ private:
     std::optional<rune::protocol::LeaseSpec> lease_;   ///< createLeaseTopic(): the write spec's lease block
     uint16_t keyFieldId_ = 0;
     uint64_t grantEpoch_ = 0;
+    rune::ql::TopicDef srcTopic_;   ///< the QL statement of the source (createQlTopic)
+    int constrainedGen_ = 0;
+    int64_t catalogPos_ = -1;   ///< the catalog position of the last view event the rig sent a mark for
     int64_t rollBytes_;
     RigTuning tuning_;
     uint64_t cleanedSeq_ = 0;
@@ -1297,7 +1693,26 @@ private:
     std::optional<rune::codec::Descriptor> customSrc_;   ///< useSource(): the source's schema
     std::vector<WorkerReturn> viewAnswers_;
     std::vector<WorkerReturn> statsAnswers_;
+    int64_t voteToken_ = 70'000;
+    std::map<int64_t, VoteReply> voteReplies_;
+    std::map<int64_t, int> voteReplyCount_;
+    std::map<int64_t, int64_t> markerAnswers_;   ///< ControlRecordAppended: correlation id -> base offset (or -1 - errorCode)
+    std::function<void()> everyPass_;
+    void noteTxnReturn_(const WorkerReturn& r) {
+        if (r.type == WorkerReturn::Type::TxnVoteResult) {
+            voteReplies_[r.correlationId] = VoteReply{r.errorCode, static_cast<uint16_t>(r.recordCount), static_cast<uint32_t>(r.newNextOffset), r.baseOffset, r.lastOffset};
+            ++voteReplyCount_[r.correlationId];
+        } else if (r.type == WorkerReturn::Type::TxnVerifyRequest) {
+            lastVerifyReqId_ = r.correlationId;
+            lastVerifyVotes_ = r.baseOffset != 0;
+        } else if (r.type == WorkerReturn::Type::ControlRecordAppended) {
+            markerAnswers_[r.correlationId] = r.errorCode == 0 ? r.baseOffset : -1 - r.errorCode;
+        }
+    }
     bool keyIndexOn_ = false, holdJudge_ = false;
+    int64_t lastVerifyReqId_ = 0;
+    bool lastVerifyVotes_ = false;
+    int64_t viewPassCap_ = 0;
     int delayedSpecIn_ = 0;
     std::filesystem::path viewDir_, logDir_;
     NullPartitionTransport transport_;
@@ -1325,24 +1740,48 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
             const uint8_t* b = v.data + p;
             rune::protocol::RecordBatchReader r(b, total);
             if ((r.attributes() & rune::protocol::batch::kAttrControl) == 0) {
+                const auto push = [&](VerdictRig::RigLogRec rec) {
+                    rec.producerId = r.producerId();
+                    rec.txn = (r.attributes() & rune::protocol::batch::kAttrTransactional) != 0;
+                    rec.atomic = (r.attributes() & rune::protocol::batch::kAttrAtomic) != 0;
+                    rec.batchBase = r.baseOffset();
+                    out.data.push_back(std::move(rec));
+                };
                 (void)rune::protocol::forEachRecordSpan(b, total, [&](const rune::protocol::RecordSpan& rs) {
                     if (rs.offset >= through) return;
                     uint64_t id = 0;
                     const std::size_t kw = rs.key.size();   // the wire key is the id, kw bytes wide
                     for (std::size_t i = 0; i < std::min<std::size_t>(kw, 8); ++i) id |= uint64_t(uint8_t(rs.key[i])) << (8 * i);
                     const auto intent = static_cast<uint8_t>(rs.attributes & 0x03);
-                    if (rs.value.empty()) { out.data.push_back({rs.offset, id, 0, 0, true, intent, id}); return; }
+                    if (rs.value.empty()) { push({rs.offset, id, 0, 0, true, intent, id}); return; }
                     const auto* val = reinterpret_cast<const uint8_t*>(rs.value.data());
                     uint64_t x = 0, valueId = 0;
                     for (int i = 0; i < 8; ++i) x |= uint64_t(val[4 + kw + i]) << (8 * i);
                     for (std::size_t i = 0; i < std::min<std::size_t>(kw, 8); ++i) valueId |= uint64_t(val[4 + i]) << (8 * i);
-                    out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(rs.value.size() > 4 + kw + 8 ? val[4 + kw + 8] : 0), false, intent, valueId});   // a topic with no tag field ends after the int64
+                    std::string name;
+                    if (rs.value.size() >= 4 + kw + 8 + 16) name.assign(reinterpret_cast<const char*>(val + 4 + kw + 8), strnlen(reinterpret_cast<const char*>(val + 4 + kw + 8), 16));
+                    push({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(rs.value.size() > 4 + kw + 8 ? val[4 + kw + 8] : 0), false, intent, valueId, std::move(name)});   // a topic with no tag field ends after the int64
                 });
             } else if (r.baseOffset() < through) {
-                if (const auto c = crl::parseControl(b, total); c && c->type == crl::kConstraintSetChange) {
+                const auto c = crl::parseControl(b, total);
+                const int endType = (r.attributes() & rune::protocol::batch::kAttrTransactional) != 0 ? rune::storage::control_marker::controlType(b, total) : rune::storage::control_marker::kUnparseable;
+                if (endType != rune::storage::control_marker::kUnparseable) {
+                    out.txnMarkers.push_back({r.baseOffset(), r.producerId(), endType == rune::storage::control_marker::kCommit});
+                } else if (c && c->type == crl::kTxnJudge) {
+                    if (const auto j = crl::parseTxnJudge(*c)) out.judges.push_back({r.baseOffset(), j->producerId, j->producerEpoch, j->firstOffset});
+                } else if (c && c->type == crl::kConstraintSetChange) {
                     std::array<crl::ChangeMember, 32> ms{};
-                    uint32_t setId = 0; uint16_t n = 0;
-                    if (crl::parseConstraintSetChange(*c, setId, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n)});
+                    uint32_t setId = 0; int64_t catalogThrough = -1; uint16_t n = 0;
+                    if (crl::parseConstraintSetChange(*c, setId, catalogThrough, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n), catalogThrough});
+                } else if (c && c->type == crl::kVerdictPlan) {
+                    VerdictRig::RigPlan pl{r.baseOffset(), {}, {}, {}, {}};
+                    std::span<const uint8_t> planBlob, outBlob, srcBlob;
+                    if (crl::parseVerdictPlan(b, total, pl.header, planBlob, outBlob, srcBlob)) {
+                        pl.plan.assign(planBlob.begin(), planBlob.end());
+                        pl.outputDescriptor.assign(outBlob.begin(), outBlob.end());
+                        pl.sourceDescriptor.assign(srcBlob.begin(), srcBlob.end());
+                        out.plans.push_back(std::move(pl));
+                    }
                 } else if (const auto reserved = crl::parseReservation(b, total)) {
                     out.reservations.emplace_back(r.baseOffset(), *reserved);
                 } else if (c && c->type == crl::kVerdictMarker) {
@@ -1359,5 +1798,52 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
 }
 
 inline VerdictRig::RigLog VerdictRig::readLog(int64_t through) const { return readLogOf(*log, through); }
+
+/// Contract addition 19 (R-2h): one transaction over two topics, each led by its own rig (set up by `setup`), ended as its coordinator does:
+/// both partitions vote, and the transaction commits on both only when both voted yes.
+struct TxnPair {
+    VerdictRig a, b;
+    /// `follower` / `rollBytes`: both rigs' replica and segment settings (VerdictRig's).
+    explicit TxnPair(const std::function<void(VerdictRig&)>& setup, bool follower = false, int64_t rollBytes = 64LL * 1024 * 1024) : a(follower, rollBytes), b(follower, rollBytes) {
+        setup(a);
+        setup(b);
+    }
+    /// Producer `pid`'s records on each topic, written by the previous leaders.
+    void write(int64_t pid, const std::vector<Rec>& onA, const std::vector<Rec>& onB) {
+        (void)a.appendTxnReplicated(VerdictRig::batch(onA, pid, 0, {}, /*txn=*/true));
+        (void)b.appendTxnReplicated(VerdictRig::batch(onB, pid, 0, {}, /*txn=*/true));
+        a.passes(30);
+        b.passes(30);
+    }
+    /// Both votes (0 = a, 1 = b), then the decision's markers on both: commit only when both voted yes.
+    VerdictRig::TxnEnd commit(int64_t pid) {
+        VerdictRig::TxnEnd end;
+        end.committed = true;
+        int32_t index = 0;
+        for (VerdictRig* r : {&a, &b}) {
+            const int64_t tok = r->sendVote(VerdictRig::kSrc, pid, 0);
+            EXPECT_TRUE(r->driveUntilVoted(tok));
+            const auto v = r->voteReply(tok);
+            if (v) end.votes.emplace_back(index, *v);
+            ++index;
+            end.committed = end.committed && v && v->errorCode == 0 && v->code == 0;
+        }
+        mark_(pid, end.committed);
+        return end;
+    }
+    /// The abort markers on both, as after a timeout or another partition's no.
+    VerdictRig::TxnEnd abort(int64_t pid) {
+        mark_(pid, false);
+        return {};
+    }
+
+private:
+    void mark_(int64_t pid, bool commit) {
+        for (VerdictRig* r : {&a, &b}) {
+            r->marker(pid, commit);
+            EXPECT_TRUE(commit ? r->driveUntilJudged() : r->driveUntilJudgeReaches());   // an abort leaves nothing to mark
+        }
+    }
+};
 
 }  // namespace rune::node::cw

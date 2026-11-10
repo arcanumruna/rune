@@ -465,7 +465,7 @@ TEST(LeaseSessionRegression, OnLostEachTriggerRegression) {
         for (std::size_t i = ka; i < r.kaCount(); ++i) EXPECT_FALSE(hasKey(r.gw.kaSeen[i], 1)) << "no request carries a lost key";
         EXPECT_EQ(r.cb.lost.size(), 1u) << "exactly once";
     }
-    // ---- NotFound: per-entry 62
+    // ---- NotFound: per-entry 64
     {
         r.cb.lost.clear();
         const int64_t t = g_now;
@@ -473,7 +473,7 @@ TEST(LeaseSessionRegression, OnLostEachTriggerRegression) {
         const std::size_t ka = r.kaCount(), frames = r.gw.produceFrameBytes.size();
         r.at(t + 1000 * kMs);
         ASSERT_EQ(r.kaCount(), ka + 1);
-        const test_support::InvokerGateway::KaAnswer a{0, 62, 0};
+        const test_support::InvokerGateway::KaAnswer a{0, 64, 0};
         r.gw.answerKa(ka, std::span(&a, 1), true);
         r.settle();
         ASSERT_EQ(r.cb.lost.size(), 1u);
@@ -879,8 +879,8 @@ TEST(LeaseSessionRegression, LocalOnLostRevokesBestEffortRegression) {
     ASSERT_EQ(revs.size(), 1u);
     EXPECT_EQ(revs[0].key, keyBytes(7));
     EXPECT_EQ(le64(revs[0].value, 4), 11) << "fenced at the held version";
-    // the broker answers 62 for the revoke: nothing else happens
-    r.gw.produceVerdicts = verdicts({62});
+    // the broker answers 64 for the revoke: nothing else happens
+    r.gw.produceVerdicts = verdicts({64});
     r.gw.replyAcks = true;
     for (const auto& pr : r.gw.held) r.gw.ack(pr);
     r.settle();
@@ -909,10 +909,10 @@ TEST(LeaseSessionRegression, CloseRevokesAllRegression) {
     r.settle(30);
     EXPECT_EQ(revokeFrames(r.gw, frames), 5u) << "five fenced revokes";
     EXPECT_FALSE(r.session->isClosed()) << "not closed until the revokes are answered";
-    // one of the five answers 62
+    // one of the five answers 64
     std::vector<test_support::InvokerGateway::Produced> held = r.gw.held;
     ASSERT_FALSE(held.empty());
-    r.gw.produceVerdicts = verdicts({0, 0, 62, 0, 0});
+    r.gw.produceVerdicts = verdicts({0, 0, 64, 0, 0});
     r.gw.replyAcks = true;
     for (const auto& pr : held) r.gw.ack(pr);
     r.settle(30);

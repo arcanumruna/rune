@@ -98,7 +98,7 @@ Herald 00 D12. Lease semantics are unchanged.
 
 Concrete values are assigned at implementation time, after whichever of this work and checked-writes Part 11 merges
 first. At 33de61d9 the free values are:
-- error codes 62–64 (`ErrorCode` ends at 61, `Protocol.h:246`);
+- error codes 64–66 (checked writes Part 11 took 62 `TxnTooLarge` and 63 `TxnConflict`);
 - client version 18 (`kClientVersion = 17`);
 - broker version 11 (`kBrokerVersion = kBrokerVersionCheckedWrites = 10`, `Protocol.h:448`);
 - feature level 6 (`kLatest = kCheckedWrites = 5`, `ReplicationMessages.h:481-483`);
@@ -517,7 +517,7 @@ lease topic they carry the lease op. On every other topic they stay refused, exa
       the usual `View` fire condition.
     - On the wire a grant duplicate carries `DuplicateSequence` (21) as its per-record verdict. The client maps 21 on
       a lease grant to `VerdictUnknown` (Task 14).
-    - A live update carries no verdict (accepted). Any other update or revoke carries `LeaseNotFound` (62).
+    - A live update carries no verdict (accepted). Any other update or revoke carries `LeaseNotFound` (64).
     - Every lease-trailer entry of a known-old duplicate is `{version -1, ttl 0}`.
     - While the lease index is not ready, or the sink's verdict arena is full, the duplicate is answered `Throttled`
       (53) with a 1 ms retry-after.

@@ -401,6 +401,11 @@ struct ClientConfig {
     // (transport::kMinDriverCountersBytes) holds 8192 of them and starts the driver ~4x faster.  Else [1 MiB, 500 MiB].
     std::size_t driverCountersBytes = 0;
 
+    /// Empty = the client starts its own embedded driver under dataDir.  Else the aeron dir of a media driver that is already running
+    /// (a test fixture shares one among its clients): the client starts none, attaches to it and leaves it running at close.
+    /// The attached driver's settings apply; the client's driver knobs are ignored, and driverCountersBytes is refused.
+    std::string aeronDir;
+
     // Explicit Aeron knobs (spec §4.1/§4.3).  Env overrides (RUNE_CLIENT_AERON_MTU,
     // RUNE_AERON_SOCKET_BUFFER_BYTES, RUNE_CLIENT_AERON_DRIVER_IDLE) win; a
     // malformed env value is logged once at construction and not applied.
@@ -549,6 +554,8 @@ struct ClientConfig {
     // ViewRowResult::kNotLeader.  Bounded by the read's own deadline
     // (pingTimeoutMs) too.  Independent of the DDL knobs (#76).
     std::chrono::milliseconds viewReadRetryBudget{5'000};
+    // ddlRetryBackoff: the first NotLeader backoff of a DDL / view read (doubling to 1 s).
+    std::chrono::milliseconds ddlRetryBackoff{100};
     // ddlTimeoutMs: the deadline of EVERY DDL (DefineTopic, AlterTopic,
     // CreateView, DropTopic, DropView, AlterView, AlterTopicConfig) — the whole
     // op, its Redirect hops and NotLeader retries included; no answer by then ->
@@ -1263,6 +1270,12 @@ public:
     /// constructing thread) — e.g. for its non-blocking beginRefresh / pollRefresh.
     /// Any other thread: std::logic_error (every runner mode).
     CatalogReader& catalogReader();
+    /// The view and constraint a rejection's constraintId names (WriteResult::constraintId, BatchVerdicts), from the
+    /// cached catalog and, on a miss, from one refresh of catalogReader() bounded by `refreshTimeout` (the default is
+    /// kConstraintNameRefreshTimeout); nullopt for id 0 (the key index) and for ids no view definition ever had.
+    /// Dropped and replaced views still resolve.  Blocking like catalogHistory; owner thread only (std::logic_error).
+    std::optional<ConstraintName> constraintName(uint32_t constraintId);
+    std::optional<ConstraintName> constraintName(uint32_t constraintId, std::chrono::milliseconds refreshTimeout);
 
     // ---- Authentication (Task 8): security DDL and reads of `__security` ----------------------------------
     /// Every security DDL.  The VERIFIER is built here from the plan's password (D9: at least
@@ -1411,10 +1424,11 @@ public:
         return T::lineage(rune::codec::deserialize(std::span<const uint8_t>(r.descriptorBlob)));
     }
 
-    /// Internal (Issue #22): the open failure for a GetTopicSchema(name, fingerprint) error `code`; cold path, throws,
-    /// never returns.  @p remaining is what is left of the caller's wait budget (the UnknownTopic probe waits at most
+    /// Internal (Issue #22): the open failure for a GetTopicSchema(name, fingerprint) error `code`; cold path, throws
+    /// unless the probe finds the topic now answers for `fingerprint` (the first answer predated its apply): then that
+    /// answer.  @p remaining is what is left of the caller's wait budget (the UnknownTopic probe waits at most
     /// that long and is skipped when nothing is left).
-    [[noreturn]] void throwOpenTopicFailure(std::string_view name, uint16_t code, std::chrono::nanoseconds remaining);
+    TopicSchemaResult resolveOpenTopicFailure(std::string_view name, uint64_t fingerprint, uint16_t code, std::chrono::nanoseconds remaining);
 
     /// Issue #435: the message for a failed schema-lineage request.  On UnknownTopic it probes the latest schema
     /// (fingerprint 0): served -> the broker predates lineage; UnknownTopic -> the topic does not exist.  Runs on the
@@ -1495,6 +1509,8 @@ public:
     ///     can never be carried by the transport (over its max message length).
     ///     A Subscribe the transport later rejects permanently (Fatal) finishes
     ///     the Subscription instead (finished() turns true, never bound).
+    ///   - Throws std::invalid_argument (nothing submitted) for an invalid handle
+    ///     (topicId -1: Client::topic of a name absent from ClientConfig::topics).
     ///
     /// Demand / back-pressure: default is broker-paced push (the broker pauses
     /// when egress back-pressure applies, per GB-3).
@@ -1584,7 +1600,7 @@ private:
         const auto started = std::chrono::steady_clock::now();
         TopicSchemaResult r = getTopicSchemaAndWait(name, T::kFingerprint, timeout);
         if (r.errorCode != 0)   // Issue #22: missing topic / stale type / another refusal
-            throwOpenTopicFailure(name, r.errorCode, timeout - (std::chrono::steady_clock::now() - started));
+            r = resolveOpenTopicFailure(name, T::kFingerprint, r.errorCode, timeout - (std::chrono::steady_clock::now() - started));
         if (!schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
             throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
         }
@@ -1855,12 +1871,13 @@ private:
     // ---- D4 coordinator route (duty thread only) ----------------------------
     // Kafka's coordinator connection: empty = the seed (byte-identical to the
     // pre-D4 client until a NotCoordinator answer names another node).
-    detail::CoordRoute coordRoute_;   // #362: CoordSeed, or CoordRemote{session index, channel, failBase, downSince}
+    detail::CoordRoute coordRoute_;   // #362: CoordSeed, or CoordRemote{session index, channel, failBase, downSince, staleBase, wasUp}
     [[nodiscard]] uint32_t coordIdx() const noexcept { return detail::coordIdxOf(coordRoute_); }
-    // A coordinator that stays down past kCoordDownFallbackNs is given up like an exhausted connect budget (back to
-    // the seed, which names the CURRENT coordinator): a crashed coordinator node's session otherwise retries for
-    // minutes and every txn / group op waits on it.
+    [[nodiscard]] uint64_t staleLossesAt_(uint32_t idx) const noexcept;   // session idx's stale-session losses, not the client's own stalls
+    // A coordinator session that stays down past kCoordDownFallbackNs is given up like an exhausted connect budget (back to the
+    // seed, which names the CURRENT coordinator); one that went stale is given up at once.
     static constexpr int64_t kCoordDownFallbackNs = 5'000'000'000LL;
+    int64_t     coordNeverUpGraceNs_ = kMetadataBackoffInitNs;   // grace of a coordinator session never Connected; doubles per give-up
     uint64_t    coordinatorRedirects_ = 0;   // coordinator moves followed
     uint64_t    coordinatorFallbacks_ = 0;   // coordinator sessions given up (back to the seed)
     // r2 LOW-3: a coordinator channel whose session was Rejected / Closed, and
@@ -2127,7 +2144,8 @@ private:
     /// no session is Connected (the caller arms the backoff refresh).
     bool sendMetadataRequestAnywhere_() noexcept;
     std::vector<uint64_t> routeConnectFailuresSeen_;  // DR-7: per session, last seen connectFailures()
-    std::vector<uint8_t>  routeSessionUp_;            // DR-7 review M1: per session, Connected last pass
+    static constexpr uint8_t kRouteSessionUp = 1, kRouteSessionLost = 2;
+    std::vector<uint8_t>  routeSessionUp_;            // DR-7 review M1: per session, Connected last pass (kRouteSessionUp) or dropped since (kRouteSessionLost)
     uint64_t              heldOffersSeen_ = 0;        // DR-7: last seen agent_.heldOffers()
     uint64_t              rejectedEpochSeen_ = 0;     // issue #60: agent_.rejectedEpoch() at the last route sweep
     uint64_t              routedBrokerSweeps_ = 0;    // issue #60: failRoutedBroker sweeps run (test-visible)

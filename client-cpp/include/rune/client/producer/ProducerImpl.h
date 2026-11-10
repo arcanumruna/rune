@@ -280,6 +280,7 @@ struct Tier2Slot {
     int32_t  topicId     = 0;
     int32_t  partition   = 0;
     uint64_t ackHandle   = 0;  // ackhandle:: tagged token of the batch (0 = none)
+    bool     atomic      = false;  // BatchBuilder batches are all-or-nothing per partition (kAttrAtomic)
     int32_t  recordCount = 0;
     int64_t  enqueuedNs  = 0;  // agent clock when drained (delivery deadline if never sent)
     uint32_t next        = kNoTier2Slot;  // intrusive FIFO link (duty only)
@@ -1884,7 +1885,7 @@ private:
     /// (code, constraintId); a Tier-2 batch completes once, with its first rejection.
     /// A key-0 batch (`idStride` != 0): an accepted record's aux is its id, assignedBase + i * idStride (no base: StoredIdUnknown).
     void completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset, bool tier2,
-                               int32_t recordCount, std::span<const uint8_t> verdicts, uint64_t assignedBase, uint32_t idStride) noexcept;
+                               bool atomic, int32_t recordCount, std::span<const uint8_t> verdicts, uint64_t assignedBase, uint32_t idStride) noexcept;
     /// Completes the handles of slice [ackStart, ackStart+ackCount): record i ->
     /// baseOffset + i (Ok), or -1 with `st` / `errorCode`.  `tier2`: the slice
     /// is one Tier-2 batch (op Tier2Batch, aux = recordCount).  Zeroes each
@@ -2235,9 +2236,9 @@ private:
     /// NOT consulted: records ahead of a control op in the ring were drained before it applied (FD1).
     [[nodiscard]] bool txnDataSettled_() const noexcept;
     void completeTxn_(const TxnOp& op, OpKind kind, OpStatus st, uint16_t errorCode, std::string_view text,
-                      int64_t value = 0, int64_t aux = 0) noexcept;
+                      int64_t value = 0, int64_t aux = 0, uint32_t reserved0 = 0) noexcept;
     void completeJoined_(const TxnJoiners& j, OpKind kind, OpStatus st, uint16_t errorCode,
-                         std::string_view text) noexcept;
+                         std::string_view text, int64_t value = 0, uint32_t reserved0 = 0) noexcept;
     void refuseTxn_(const TxnControl& c, OpStatus st, uint16_t errorCode, std::string_view text) noexcept;
     /// Decode a kMsgTxnControl payload (duty thread); a CQ target is marked producerOp.  False: the message is
     /// shorter than its header (nothing can be completed).  A SendOffsets over the caps / truncated decodes with
@@ -2250,10 +2251,12 @@ private:
     void enterFatal_(OpStatus st, uint16_t errorCode, std::string_view text) noexcept;
     /// EndTxn's final OK (or an unstarted transaction): the epoch bump first when required, else Ready.
     void endDone_(int64_t nowNs) noexcept;
-    /// Committing / Aborting -> Ready; the op and its joiners complete Ok.
+    /// Committing / Aborting -> Ready; the op and its joiners complete Ok.  finishVotedNo_: the same, a commit that a
+    /// partition voted no on (the transaction is aborted on the broker): BrokerError with the vote's fields.
     /// #345: does any partition's next base sequence exceed kTxnSeqBumpAt?  (control path: a scan of the partitions)
     [[nodiscard]] bool seqBumpDue_() const noexcept;
     void finishTxn_() noexcept;
+    void finishVotedNo_(const CoordAnswer& a) noexcept;
     /// The pending end op's deadline: InDoubt, the op completes Timeout.  `releaseSlot`: false when the link
     /// itself expired the slot (it releases it afterwards).
     void endExpired_(bool releaseSlot) noexcept;

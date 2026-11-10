@@ -93,6 +93,15 @@ TEST(EmbeddedDriverRegression, TestClientCountersShrinkTheCncRegression) {
     a.reset();
 }
 
+// A broker's driver takes its counters buffer from NodeConfig; the default stays Aeron's.
+// Mutation: fromNode not copying aeronCountersValuesBytes -> 0 -> red.
+TEST(EmbeddedDriverRegression, NodeConfigCountersBytesReachTheDriverConfigRegression) {
+    NodeConfig n;
+    EXPECT_EQ(EmbeddedDriverConfig::fromNode(n, "d").countersValuesBytes, 0);
+    n.aeronCountersValuesBytes = kTestClientCountersBytes;
+    EXPECT_EQ(EmbeddedDriverConfig::fromNode(n, "d").countersValuesBytes, kTestClientCountersBytes);
+}
+
 TEST(EmbeddedDriver, InvokerModeRoundTripOnOneThreadOnly) {
     TmpDir d;
     EmbeddedDriver drv(cfgAt(d.path), DriverMode::Invoker);

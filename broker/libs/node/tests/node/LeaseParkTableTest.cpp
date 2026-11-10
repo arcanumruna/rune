@@ -59,10 +59,10 @@ TEST(LeaseParkTableRegression, FinalOnLastOfRequestRegression) {
     EXPECT_EQ(g[0].index, 0); EXPECT_EQ(g[0].final, 0);
     EXPECT_EQ(g[1].index, 2); EXPECT_EQ(g[1].final, 0) << "index 1 is still parked";
     EXPECT_EQ(t.requestsInUse(), 1u);
-    t.answerChain(b, 62, 0);
+    t.answerChain(b, 64, 0);
     g = drainAll(t);
     ASSERT_EQ(g.size(), 1u);
-    EXPECT_EQ(g[0].index, 1); EXPECT_EQ(g[0].final, 1); EXPECT_EQ(g[0].code, 62);
+    EXPECT_EQ(g[0].index, 1); EXPECT_EQ(g[0].final, 1); EXPECT_EQ(g[0].code, 64);
     EXPECT_EQ(g[0].session, 1); EXPECT_EQ(g[0].corr, 2);
     EXPECT_EQ(t.requestsInUse(), 0u) << "the request is released with its final answer";
     EXPECT_EQ(t.inUse(), 0u);

@@ -221,7 +221,9 @@ public:
     ///   - self in the committed ISR: move here (clean, leaderEpoch + 1);
     ///   - a live leader in its ISR: keep it (self catches up first);
     ///   - else FailoverElection over ISR ∩ live (never unclean): a live ISR
-    ///     member, or NO_LEADER keeping the ISR lineage.
+    ///     member, or NO_LEADER keeping the ISR lineage;
+    ///   - a pending restart-fence requester (`requester`) that is not proven intact is never elected nor kept in the ISR while another
+    ///     live ISR member exists; an intact one is kept (re-elected in place by decideBumps_ when it leads).
     static std::optional<rune::metadata::PartitionAssignment> decideCoordinatorPartition(
         int32_t topicId, int32_t partition, int32_t selfId,
         const rune::metadata::PartitionAssignment* cur,
@@ -231,7 +233,8 @@ public:
         const std::vector<int32_t>& replicas,
         bool selfShutting = false,
         const std::vector<int32_t>* avoid = nullptr,
-        const std::vector<int32_t>* shutting = nullptr)
+        const std::vector<int32_t>* shutting = nullptr,
+        int32_t requester = -1, bool requesterIntact = false)
     {
         namespace rm = rune::metadata;
         auto in = [](int32_t n, const std::vector<int32_t>& v) {
@@ -267,13 +270,24 @@ public:
         }
         std::vector<int32_t> live = eligible;
         if (!in(selfId, live)) live.push_back(selfId);   // the controller is live
-        bool healthyIsr = false;   // a live, non-avoided ISR member exists
-        for (int32_t n : cur->isr) healthyIsr = healthyIsr || (in(n, live) && !avoided(n));
+        // Election batch (F1/F3/E9): `requester` is the committed leader whose restart-fence bump is pending.  Unless its log is proven
+        // intact (kBumpLedThisBoot) it is neither elected nor kept in the ISR while another live ISR member exists (MAJOR-1); with none,
+        // nothing is decided here (decideBumps_ re-elects the sole in-sync replica past its fence).
+        const bool unproven = requester >= 0 && !requesterIntact;
+        if (unproven) {
+            bool other = false;
+            for (int32_t n : cur->isr) other = other || (n != requester && in(n, live));
+            if (!other) return std::nullopt;
+        }
+        auto proven = [&](int32_t n) { return !unproven || n != requester; };
+        bool healthyIsr = false;   // a live, non-avoided, proven ISR member exists
+        for (int32_t n : cur->isr) healthyIsr = healthyIsr || (in(n, live) && !avoided(n) && proven(n));
         const bool steer = healthyIsr && avoid != nullptr && !avoid->empty();
-        if (cur->leaderNode == selfId && !(steer && avoided(selfId))) return std::nullopt;
+        if (cur->leaderNode == selfId && proven(selfId) && !(steer && avoided(selfId))) return std::nullopt;
         // The leadership CANDIDATES (live, minus the avoided when steering); the
         // ISR keeps every live member (a halted broker still replicates).
         std::vector<int32_t> candidates = live;
+        if (unproven) std::erase(candidates, requester);
         if (steer) std::erase_if(candidates, [&](int32_t n) { return avoided(n); });
         // I1: a stopping member is never ELECTED either while a live, non-stopping candidate in the ISR exists
         // (otherwise it re-enters the ISR as the leader).  With none, the rules below apply unchanged (Kafka: a
@@ -285,7 +299,7 @@ public:
         if (in(selfId, cur->isr) && !selfShutting && in(selfId, candidates)) {   // a stopping controller never takes one
             chg.newLeader = selfId;
             chg.newIsr.push_back(selfId);
-            for (int32_t n : cur->isr) if (n != selfId && in(n, live) && !stopping(n)) chg.newIsr.push_back(n);
+            for (int32_t n : cur->isr) if (n != selfId && in(n, live) && !stopping(n) && proven(n)) chg.newIsr.push_back(n);
         } else if (cur->leaderNode != rm::NO_LEADER && in(cur->leaderNode, candidates) &&
                    in(cur->leaderNode, cur->isr)) {
             return std::nullopt;   // (a halted leader is not a candidate when steering: replaced)
@@ -302,7 +316,7 @@ public:
             if (chg.newLeader != rm::NO_LEADER) {
                 chg.newIsr.push_back(chg.newLeader);
                 for (int32_t n : cur->isr)
-                    if (n != chg.newLeader && in(n, live) && !stopping(n)) chg.newIsr.push_back(n);
+                    if (n != chg.newLeader && in(n, live) && !stopping(n) && proven(n)) chg.newIsr.push_back(n);
             } else {
                 chg.newIsr = cur->isr;   // offline: keep the lineage (Kafka)
             }
@@ -335,10 +349,20 @@ public:
                 haltedScratch_.clear();
                 for (const auto& [n, st] : nodeLifecycle_) if (st.securityHalted) haltedScratch_.push_back(n);
             }
+            const auto* cur = msm_.assignment(k.topicId, k.partition);
+            int32_t requester = -1;
+            bool requesterIntact = false;
+            if (const auto b = bumpRequests_.find(partitionKey_(k.topicId, k.partition)); b != bumpRequests_.end() && cur != nullptr &&
+                cur->leaderNode == b->second.requester && cur->leaderEpoch == b->second.leaderEpoch &&
+                cur->partitionEpoch == b->second.partitionEpoch) {
+                if (b->second.reason == BumpReason::LostCommitted) continue;   // decideBumps_ strips it (failOverWithout_)
+                requester       = b->second.requester;
+                requesterIntact = bumpIntact_(b->second);
+            }
             const auto next = decideCoordinatorPartition(
-                k.topicId, k.partition, selfId_, msm_.assignment(k.topicId, k.partition),
+                k.topicId, k.partition, selfId_, cur,
                 eligibleNodes, &positions_, bootstrapEpoch, coordinatorReplicas_, isShutting_(selfId_),
-                (k.topicId == -6 || k.topicId == -7) ? &haltedScratch_ : nullptr, &shuttingNodes_());   // I1: every coordinator partition
+                (k.topicId == -6 || k.topicId == -7) ? &haltedScratch_ : nullptr, &shuttingNodes_(), requester, requesterIntact);   // I1: every coordinator partition
             if (!next) continue;
             rune::metadata::BalancerRecord br;
             br.isr      = next->isr;
@@ -440,7 +464,7 @@ public:
     [[nodiscard]] std::size_t unplaceableTopicCount() const noexcept { return unplaceable_.size(); }
     /// I1 (round 5): a controller whose PROCESS has held the broadcast reports for
     /// less than `ns` defers user-partition leader elections until it has (it may
-    /// lack a fresh "cannot serve" report).  BrokerNode sets kUnservableReportTtlNs
+    /// lack a fresh "cannot serve" report).  BrokerNode sets NodeConfig::unservableWarmupMs (one TTL by default)
     /// multi-node; 0 (unit rigs) = off.
     void setUnservableReportWarmup(int64_t ns) noexcept { unservableWarmupNs_ = ns; }
     [[nodiscard]] bool unservableWarmingUp() const noexcept {
@@ -792,7 +816,8 @@ public:
     /// would write a second history under one epoch).  Kafka parity: every
     /// establishment of leadership gets a NEW epoch, and a restarted ex-leader
     /// (which may have lost acked records — power loss, a memory log) is NOT
-    /// re-elected while another live ISR member exists (fix round 1 MAJOR-1).
+    /// re-elected while another live ISR member exists (fix round 1 MAJOR-1), unless its bump proves an intact log
+    /// (kBumpLedThisBoot): it is then re-elected in place.
     /// The request is recorded and decided by the next rebalance tick
     /// (decideBumps_): failover to another live ISR member (co-partition units
     /// together, the requester leaves the ISR), else — the requester is the
@@ -817,9 +842,15 @@ public:
                                                                               : BumpReason::Fence;
         r.leo            = m.isr[2];
         r.incarnation    = incarnationOf_(m);
+        r.ledThisBoot    = (m.isr[1] & rr::AlterIsrMsg::kBumpLedThisBoot) != 0;
         noteIncarnation_(m.leaderId, r.incarnation, logDirFailed);
         if (logDirFailed) markOffline_(m.topicId, m.partition, m.leaderId, r.incarnation);
-        bumpRequests_[partitionKey_(m.topicId, m.partition)] = r;
+        const int64_t key = partitionKey_(m.topicId, m.partition);
+        // A below-committed verdict on this leadership (onBelowCommittedReport_) is never replaced by the leader's own fence bump.
+        if (const auto it = bumpRequests_.find(key); it != bumpRequests_.end() && it->second.reason == BumpReason::LostCommitted &&
+            it->second.requester == r.requester && it->second.leaderEpoch == r.leaderEpoch && it->second.partitionEpoch == r.partitionEpoch)
+            return false;
+        bumpRequests_[key] = r;
         return false;   // decided (and enqueued) by the next rebalance tick
     }
 
@@ -1578,6 +1609,7 @@ public:
     // Task 11 fix round 4: live "cannot serve" reports + the BLOCKED partitions derived from them.
     std::vector<UnservableReport>       unservable_;
     std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion> electionExcludedScratch_;
+    std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion> bumpOffered_;   ///< validBumpRequests_ scratch (capacity persists)
     int64_t                             firstPassNs_    = -1;   // I1: this process's first doWork
     uint64_t                            warmupLogged_   = 0;
     int64_t                             unservableWarmupNs_ = 0;  // I1: 0 = off (unit rigs)
@@ -1609,7 +1641,7 @@ public:
     /// member — are re-elected at a new epoch; a MEMORY-backed requester (its
     /// log is empty after the restart) yields instead to the live replica that
     /// reported the most records, if any holds more than it (never wipe
-    /// followers to an empty leader).
+    /// followers to an empty leader).  An intact requester (bumpIntact_) is never excluded, so it reaches the in-place branch.
     void decideBumps_(std::vector<rune::metadata::BalancerRecord>& recs, int maxRecords,
                       const std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion>& offered) {
         for (auto it = bumpRequests_.begin(); it != bumpRequests_.end();) {
@@ -1646,23 +1678,7 @@ public:
             br.rec.topicId        = topicId;
             br.rec.partition      = partition;
             br.rec.partitionEpoch = pa->partitionEpoch + 1;
-            // Coordinator partitions are not in the balancer's topic set: the
-            // same rule here — another live ISR member leads, the requester
-            // leaves the ISR (re-admitted by the new leader's AlterIsr).
-            if (topicId < 0) {
-                for (int32_t n : pa->isr) {
-                    if (n == q.requester || isShutting_(n)) continue;
-                    if (std::find(eligible_.begin(), eligible_.end(), n) == eligible_.end()) continue;
-                    br.rec.leaderNode  = n;
-                    br.rec.leaderEpoch = pa->leaderEpoch + 1;
-                    br.isr.push_back(n);
-                    for (int32_t o : pa->isr) if (o != n && o != q.requester) br.isr.push_back(o);
-                    break;
-                }
-            }
-            if (!br.isr.empty()) {
-                ++bumpFailovers_;   // coordinator failover decided above
-            } else if (q.reason == BumpReason::LogDirFailed || (q.reason == BumpReason::MemoryEmpty && q.leo == 0)) {
+            if (q.reason == BumpReason::LogDirFailed || (q.reason == BumpReason::MemoryEmpty && q.leo == 0)) {
                 // N1: an offline log dir is never re-granted; N2: an EMPTY
                 // memory leader is not re-elected blind — the partition goes
                 // leaderless (Kafka offline, ISR lineage kept); the memory case
@@ -1974,9 +1990,9 @@ public:
         }
     }
 
-    /// Requests still matching the committed assignment and decidable now.
-    void validBumpExclusions_(std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion>& out) {
-        out.clear();
+    /// Requests still matching the committed assignment and decidable now (not busy): every one is offered to decideBumps_.
+    void validBumpRequests_(std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion>& offered) {
+        offered.clear();
         for (auto it = bumpRequests_.begin(); it != bumpRequests_.end();) {
             const int32_t topicId   = static_cast<int32_t>(it->first >> 32);
             const int32_t partition = static_cast<int32_t>(static_cast<uint32_t>(it->first));
@@ -1990,8 +2006,18 @@ public:
             bool busy = inflight_.count(it->first) != 0;
             for (const auto& p : pendingDynamicRecords_)
                 busy = busy || (p.rec.topicId == topicId && p.rec.partition == partition);
-            if (!busy) out.push_back({topicId, partition, q.requester});
+            if (!busy) offered.push_back({topicId, partition, q.requester});
             ++it;
+        }
+    }
+    /// The balancer's MAJOR-1 exclusions: the offered requests whose requester is not proven intact (they fail over and leave the ISR),
+    /// plus the N1 / N2 marks.  An intact requester is not excluded: the balancer keeps it and decideBumps_ re-elects it in place.
+    void bumpExclusions_(const std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion>& offered,
+                         std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion>& out) const {
+        out.clear();
+        for (const auto& o : offered) {
+            const auto it = bumpRequests_.find(partitionKey_(o.topicId, o.partition));
+            if (it == bumpRequests_.end() || !bumpIntact_(it->second)) out.push_back(o);
         }
         // N1 / N2: never (re-)elected by the balancer while marked.
         for (const auto& o : offlineReplicas_) out.push_back({o.topicId, o.partition, o.node});
@@ -2252,15 +2278,24 @@ public:
                 spdlog::info("MetadataService[{}]: user-partition leader elections deferred until this process has "
                              "held the replicas' 'cannot serve' reports for {} ms", selfId_,
                              unservableWarmupNs_ / 1'000'000);
-            return coord;
+            // F4: coordinator partitions never waited for the "cannot serve" reports (they are only sent for topicId >= 0, and
+            // reconcileCoordinatorPartitions above already decides them): their bump requests are decided now.  The fencing pass
+            // elects nobody (ISR only, live leaders only): it runs for every partition.
+            validBumpRequests_(bumpOffered_);
+            std::erase_if(bumpOffered_, [](const rune::metadata::DynamicBalancerInputs::LeaderExclusion& o) { return o.topicId >= 0; });
+            std::vector<rune::metadata::BalancerRecord> recs;
+            decideBumps_(recs, maxRecordsPerCycle, bumpOffered_);
+            fenceIsrs_(effective, recs);
+            const std::size_t n = recs.size();
+            if (n > 0) emitDynamicAssignment(recs);
+            return coord + n;
         }
         if (configuredTopics_.empty()) {
             // Coordinator partitions only: their bump requests (MAJOR-1).
-            std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion> ex;
-            validBumpExclusions_(ex);
+            validBumpRequests_(bumpOffered_);
             std::vector<rune::metadata::BalancerRecord> recs;
             decideStorageResets_(recs, maxRecordsPerCycle);
-            decideBumps_(recs, maxRecordsPerCycle, ex);
+            decideBumps_(recs, maxRecordsPerCycle, bumpOffered_);
             decideLeaderless_(recs, maxRecordsPerCycle);
             // Fencing (dead + controlled-shutdown nodes) of the coordinator
             // ISRs — review D3: else a stopping node never leaves them.
@@ -2315,7 +2350,8 @@ public:
         }
         std::erase_if(dataPlaneAliveScratch_, [this](int32_t n) { return storageRegs_.find(n) != storageRegs_.end(); });
         in.dataPlaneAliveLeaders = dataPlaneAliveScratch_;
-        validBumpExclusions_(in.excludedLeaders);   // MAJOR-1
+        validBumpRequests_(bumpOffered_);
+        bumpExclusions_(bumpOffered_, in.excludedLeaders);   // MAJOR-1
         unservableExclusions_(in.electionExcluded);  // Task 11 fix round 4 (election only)
         // Controlled shutdown: stopping nodes are AVOIDED as leaders (soft —
         // see DynamicBalancerInputs::avoidLeaders): the partitions they lead
@@ -2384,7 +2420,7 @@ public:
         // MAJOR-1: the bump requests the balancer did not fail over (before
         // the fencing pass: a partition with a record is skipped there).
         decideStorageResets_(recs, maxRecordsPerCycle);   // ISR v3: after the balancer, before the bumps
-        decideBumps_(recs, maxRecordsPerCycle, in.excludedLeaders);
+        decideBumps_(recs, maxRecordsPerCycle, bumpOffered_);
         decideLeaderless_(recs, maxRecordsPerCycle);   // N2
         fenceIsrs_(effective, recs);
         confirmStorageRegs_(recs);
@@ -3452,7 +3488,7 @@ private:
         const auto it = predecessors_.find(key);
         if (it == predecessors_.end()) return nullptr;
         Predecessors& ps = it->second;
-        const int64_t w = rune::consensus::kReadLeaseFenceWaitNs;
+        const int64_t w = readLeaseFenceWaitNs_;
         for (std::size_t i = 0; i < ps.n;) {
             if (lastNowNs_ - ps.e[i].movedAtNs >= w) ps.e[i] = ps.e[--ps.n]; else ++i;
         }
@@ -3463,8 +3499,10 @@ private:
     /// every removal from an ISR is fenced then.  fn(ctx, nowNs) = past that W.  nullptr (unit tests) = always young.
 public:
     using ControllerSettled = bool (*)(void* ctx, int64_t nowNs) noexcept;
+    void setReadLeaseFenceWaitNs(int64_t w) noexcept { readLeaseFenceWaitNs_ = w; }
     void setControllerSettled(ControllerSettled fn, void* ctx) noexcept { settledFn_ = fn; settledCtx_ = ctx; }
 private:
+    int64_t           readLeaseFenceWaitNs_ = rune::consensus::kReadLeaseFenceWaitNs;   // W: the election's, set with it
     ControllerSettled settledFn_  = nullptr;
     void*             settledCtx_ = nullptr;
     [[nodiscard]] bool controllerYoung_() const noexcept {
@@ -3479,7 +3517,7 @@ private:
         const auto inNew = [&](int32_t n) { for (const int32_t m : br.isr) if (m == n) return true; return false; };
         Predecessors* ps = livePredecessors_(key);
         const bool young = controllerYoung_();
-        const bool overflow = ps != nullptr && lastNowNs_ - ps->overflowAtNs < rune::consensus::kReadLeaseFenceWaitNs;
+        const bool overflow = ps != nullptr && lastNowNs_ - ps->overflowAtNs < readLeaseFenceWaitNs_;
         const auto isPredecessor = [&](int32_t n) {
             if (ps == nullptr) return false;
             for (std::size_t i = 0; i < ps->n; ++i) if (ps->e[i].node == n) return true;
@@ -3573,8 +3611,14 @@ private:
         BumpReason reason = BumpReason::Fence;
         int32_t leo            = -1;      ///< the requester's LEO (clamped)
         int64_t incarnation    = 0;
+        bool    ledThisBoot    = false;   ///< kBumpLedThisBoot: the requester led this partition earlier in this OS boot
     };
     std::unordered_map<int64_t, BumpRequest> bumpRequests_;
+    /// Election batch: the requester's log provably holds the committed prefix (kBumpLedThisBoot on a restart-fence bump) and it can lead:
+    /// it stays in the ISR and is re-elected in place.  Storage-pending nodes are not eligible (runDynamicRebalanceOnTick).
+    [[nodiscard]] bool bumpIntact_(const BumpRequest& q) const noexcept {
+        return q.ledThisBoot && q.reason == BumpReason::Fence && isEligible_(q.requester) && !isShutting_(q.requester);
+    }
     /// Controlled shutdown: node → {its newest incarnation seen, stopping?}.
     std::unordered_map<int32_t, NodeLifecycle> nodeLifecycle_;
     std::vector<int32_t> shuttingScratch_;
