@@ -2179,7 +2179,7 @@ TEST(ShardModeRegression, PausedInvokerClientResumingWithoutReadingIsFoundNotRea
 // again its small backlog drains (typically in ONE worker pass: no Progress signal) and the Released edge itself
 // refreshes the lease — it must not be reaped in the same gateway cycle as it recovers.
 namespace {
-// `burst` frames go out before the worker's append is awaited: the fast default fills the pipe in a tenth of the round trips.
+// Up to `burst` frames go out before the worker's append is awaited: the fast default fills the pipe in a tenth of the round trips.
 void runHeldDirectClientRecoveringAfterTheLeaseIsNotReapedOnRelease(bool fast) {
     const int burst = fast ? 16 : 1;
     const ClientTimeouts timeouts = fast ? ClientTimeouts{100ms, 150ms, true} : ClientTimeouts{300ms, kHeldLease, false};
@@ -2191,11 +2191,6 @@ void runHeldDirectClientRecoveringAfterTheLeaseIsNotReapedOnRelease(bool fast) {
     ASSERT_EQ(defineShardTopic({&node}), 0);
     const std::string gw = gatewayChannel(ports, 0), direct = workerIngressChannel(ports, 0, 0);
     auto onGw = [&](auto&& f) { return node.onControlThreadForTest([&] { return f(*node.gatewayForTest()); }); };
-    auto acksPending = [&] {
-        return node.onOwnerThreadForTest(0, 0, [&](rune::replication::PartitionReplica&) {
-            return node.workerForTest(0)->sessionAcksPendingForTest();
-        });
-    };
     ShardTestClient a(ad.path, 1 << 20, /*legacyTransport=*/false, DriverMode::Threaded, timeouts.ackWindowBytes());
     const int64_t sidA = a.connect(gw, kClientStream);
     ASSERT_GT(sidA, 0);
@@ -2205,25 +2200,39 @@ void runHeldDirectClientRecoveringAfterTheLeaseIsNotReapedOnRelease(bool fast) {
     // worker holds acks (the client's egress window is full).  So no frame waits refused in A's image: nothing is
     // admitted after the drain (an admitted produce's ack notification is liveness too, F23), and the held backlog
     // is a single ack — one window update takes it, in one pass, with no Progress signal: only the Released edge
-    // can refresh the lease.  (The fast default sends `burst` frames at a time: the backlog is at most `burst` acks, still one pass.)
+    // can refresh the lease.  The fast default sends up to `burst` frames at a time, but only as many as A's ack
+    // publication still has room for (a claim succeeds while its position is below the limit), so the last frames
+    // still go one at a time: a burst crossing the hold would leave its later frames refused, never appended.
+    struct AckPub { std::size_t pending; int64_t position, limit; };
+    auto ackPub = [&] {
+        return node.onOwnerThreadForTest(0, 0, [&](rune::replication::PartitionReplica&) {
+            const auto* w = node.workerForTest(0);
+            const auto& pub = std::get<SessionAckSink::PubReady>(*w->ackSinkForTest()->stateForTest(sidA)).pub;
+            return AckPub{w->sessionAcksPendingForTest(), pub->position(), pub->publicationLimit()};
+        });
+    };
     auto leo = [&] {
         return node.onOwnerThreadForTest(0, 0, [](rune::replication::PartitionReplica& r) {
             return r.log()->logEndOffset();
         });
     };
     constexpr int64_t c0 = 60'000'000;
-    int64_t sent = 0;
+    int64_t sent = 0, ackBytes = 0;                                    // one ack's frame, measured on the first
     const int64_t leo0 = leo();
-    while (sent < 200'000 && acksPending() == 0) {
-        for (int i = 0; i < burst; ++i) {
+    for (AckPub p = ackPub(); sent < 200'000 && p.pending == 0;) {
+        const int64_t n = ackBytes == 0 ? 1 : std::clamp<int64_t>((p.limit - p.position) / ackBytes, 1, burst);
+        for (int64_t i = 0; i < n; ++i) {
             ASSERT_TRUE(a.produce(direct, kClientStream, sidA, c0 + sent, 0, 0, /*acks=*/0, batch));
             ++sent;
         }
         ASSERT_TRUE(awaitBrokerState([&] { return leo() >= leo0 + sent; }, 10s)) << "frame " << sent << " never appended";
+        const AckPub q = ackPub();
+        if (ackBytes == 0 && q.pending == 0) ackBytes = q.position - p.position;
+        p = q;
     }
     ASSERT_LT(sent, 200'000);
     ASSERT_TRUE(awaitBrokerState([&] { return onGw([&](auto& g) { return g.sessionHeldForTest(sidA); }); }, 10s))
-        << "the worker holds A's acks (sent=" << sent << ", pending=" << acksPending() << ")";
+        << "the worker holds A's acks (sent=" << sent << ", pending=" << ackPub().pending << ")";
     const auto lastSent = std::chrono::steady_clock::now();
     // A's app is silent past the whole lease (no keepalive, no read); its driver thread keeps the publication up.
     const auto silent = timeouts.lease + (fast ? 50ms : 500ms);
@@ -2233,12 +2242,19 @@ void runHeldDirectClientRecoveringAfterTheLeaseIsNotReapedOnRelease(bool fast) {
         << "the held bound must keep A while it is silent";
     ASSERT_GE(onGw([&](auto& g) { return g.sessionLastSeenNsForTest(sidA); }), 0);
     ASSERT_FALSE(onGw([&](auto& g) { return g.sessionLostForTest(sidA); })) << "its driver is alive: never Lost";
-    for (int64_t c = c0; c < c0 + sent; ++c)                           // A reads everything
-        ASSERT_TRUE(a.awaitProduceResponse(c).has_value()) << "ack " << c - c0 << " of " << sent;
-    ASSERT_TRUE(awaitBrokerState([&] { return onGw([&](auto& g) {
-        return !g.sessionHeldForTest(sidA) || g.sessionLastSeenNsForTest(sidA) < 0; }); }, 10s));
-    EXPECT_GE(onGw([&](auto& g) { return g.sessionLastSeenNsForTest(sidA); }), 0)
-        << "reaped in the cycle it was Released (the release did not refresh its lease)";
+    // A reads everything on its own thread while the gateway is watched: the check sees the Released edge within a
+    // poll, not after the whole read, which can outlast the fast lease under load and let a refreshed lease expire.
+    int64_t read = 0;
+    std::thread reader([&] {
+        while (read < sent && a.awaitProduceResponse(c0 + read).has_value()) ++read;
+    });
+    const bool settled = awaitBrokerState([&] { return onGw([&](auto& g) {
+        return !g.sessionHeldForTest(sidA) || g.sessionLastSeenNsForTest(sidA) < 0; }); }, 10s);
+    const int64_t lastSeen = onGw([&](auto& g) { return g.sessionLastSeenNsForTest(sidA); });
+    reader.join();
+    ASSERT_EQ(read, sent) << "acks read";
+    ASSERT_TRUE(settled);
+    EXPECT_GE(lastSeen, 0) << "reaped in the cycle it was Released (the release did not refresh its lease)";
     node.stop();
 }
 } // namespace
