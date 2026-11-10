@@ -1,3 +1,5 @@
+# Designators out of declaration order are an error in GCC but silent in Clang: make Clang refuse them too (Checkpoint C).
+add_compile_options($<$<CXX_COMPILER_ID:AppleClang,Clang>:-Werror=reorder-init-list>)
 add_library(rune_node
     src/NodeConfig.cpp
     src/StorageIdentity.cpp

@@ -447,7 +447,7 @@ TEST(CheckedWritesConstraintWorkerRegression, PreExistingDuplicatesSurviveCompac
     c.settle();
     EXPECT_EQ(c.owner("dup"), 5);
     EXPECT_EQ(c.uniqueConflicts(CV::CharacterName), 2u);
-    const auto del = p.sendAck({Char{.id = 5, .tombstone = true, .intent = 0}});
+    const auto del = p.sendAck({Char{.id = 5, .intent = 0, .tombstone = true}});
     ASSERT_TRUE(del);
     c.settle();
     EXPECT_EQ(c.owner("dup"), 9);
