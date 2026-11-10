@@ -336,7 +336,7 @@ rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::S
         // instance's own evolving copy: that lags the spec after a Drop and when the schema ops arrive in either order.
         rune::view::SourceRecord r = rec;
         r.writer = state_ != nullptr && state_->spec != nullptr ? leaseWriterOf(*state_->spec, r.value) : nullptr;
-        const LeaseIndexFold f{i.table, i.layout, i.evolvingSrc, m.keyWidth, &i.leaseCover};
+        const LeaseIndexFold f{i.table, i.layout, i.evolvingSrc, m.keyWidth, &i.leaseCover, &i.leaseTransient};
         const bool refused = r.writer == nullptr && state_ != nullptr && state_->spec != nullptr && r.value.size() >= 4 &&
                              state_->spec->versionRefused(detail::le16(r.value.data() + 2));   // a refused version is a definite answer
         return prepareLeaseIndex(f, r, m.prospect, refused, state_ != nullptr && state_->spec != nullptr ? leaseInstallSeqOf(*state_->spec, r.value) : 0u);
@@ -379,7 +379,7 @@ void VerdictSource::apply_(Member& m, const rune::view::SourceRecord& rec) noexc
     }
     if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
         stats_.keyIndexSkippedMalformed += m.prospect.stats.skippedMalformed;
-        LeaseIndexFold f{i.table, i.layout, i.evolvingSrc, m.keyWidth, &i.leaseCover};
+        LeaseIndexFold f{i.table, i.layout, i.evolvingSrc, m.keyWidth, &i.leaseCover, &i.leaseTransient};
         LeaseEvent ev;
         if (applyLeaseRecord(f, rec, m.prospect, ev)) state_->leaseEvents.buf.push_back(ev);   // grows only past kLeaseFoldEventCap (judgeBatches_ counts it)
         return;
@@ -412,16 +412,20 @@ Verdict VerdictSource::verdictOf_(const Member& m, const rune::view::SourceRecor
     if (m.kind == rune::view::VerdictViewKind::KeyIndex) return evaluateIntent(rec, m.prospect);
     if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
         using rune::protocol::client::ErrorCode;
+        namespace lr = rune::protocol::record;
+        // The fence record (spec A.6) is no row and is never judged: accepted (prepare / apply recognise it by the same predicate).
+        if (lr::isLeaseFence(rec.attributes, reinterpret_cast<const uint8_t*>(rec.value.data()), rec.value.size(), {.lease = true})) return {};
         // A malformed lease record (a wrong key width, a value shorter than the system columns, a projection that does not fit)
         // is refused, never accepted without an apply: an accepted record the index never saw would let a second grant through.
         // The replay skips rejected offsets, so the log stays deterministic.
         if (m.prospect.op == rune::view::ProspectOp::None) {
             // A broker Expire / Checkpoint whose key has no row is a stale broker record, even when its projection is malformed:
-            // it has no producer to retry, so it takes the reserved stale-broker slot like any other (judge()).
-            namespace lr = rune::protocol::record;
+            // it has no producer to retry, so it takes the reserved stale-broker slot like any other (judge()).  A Carry (Put,
+            // intent 0) is a broker record too: with no operation (a malformed projection) it is stale whether or not its row exists.
             const lr::LeaseOp op = lr::leaseOpOf(rec.attributes);
             if ((op == lr::LeaseOp::Expire || op == lr::LeaseOp::Checkpoint) && lr::intentOf(rec.attributes) == 0 && !m.prospect.rows[0].existed)
                 return {rune::view::kVerdictStaleBroker, 0};
+            if (op == lr::LeaseOp::Put && lr::intentOf(rec.attributes) == 0) return {rune::view::kVerdictStaleBroker, 0};
             return {static_cast<uint16_t>(ErrorCode::InvalidRequest), 0};
         }
         if (rec.value.empty()) return {static_cast<uint16_t>(ErrorCode::InvalidRequest), 0};   // a lease record carries its full row
@@ -545,7 +549,7 @@ int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, in
         return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedRejected);
     }
     if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
-        LeaseIndexFold f{inst.table, inst.layout, inst.evolvingSrc, m.keyWidth, &inst.leaseCover};
+        LeaseIndexFold f{inst.table, inst.layout, inst.evolvingSrc, m.keyWidth, &inst.leaseCover, &inst.leaseTransient};
         bool held = false;
         uint16_t heldVersion = 0;
         const rune::view::FoldStats st = foldLeaseIndexBatch(f, *state_->spec, m.prospect, view, bound, cursor, skip, &held, &heldVersion);

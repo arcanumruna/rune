@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <map>
 #include <cstring>
 #include <random>
 #include <memory>
@@ -138,17 +139,23 @@ struct Rig {
     ConstraintSet                 set;
 
     /// `installedThrough`: the schema versions the spec has installed (0 = all of the evolving descriptor's).
-    explicit Rig(uint32_t maxKeys = 100, rune::codec::Descriptor ev = evolvingDesc(), uint16_t installedThrough = 0) : evolving(std::move(ev)) {
+    /// `mode`: Legacy = no aux (the pre-Task-29 tests), Persisted = the production persisted lease table (aux 8), Transient = the production
+    /// transient one (aux 32, spec.leaseTransient, the anchor list kept).
+    enum class Mode : uint8_t { Legacy, Persisted, Transient };
+    explicit Rig(uint32_t maxKeys = 100, rune::codec::Descriptor ev = evolvingDesc(), uint16_t installedThrough = 0, Mode mode = Mode::Legacy) : evolving(std::move(ev)) {
         spec.topicId    = 5;
         spec.keyFieldId = 4;
         spec.keyWidth   = 8;
         spec.lease      = rune::protocol::LeaseSpec{};
         spec.lease->maxKeys = maxKeys;
+        spec.leaseTransient = mode == Mode::Transient;
         for (uint16_t v = 1; v <= (installedThrough != 0 ? installedThrough : evolving.version); ++v) spec.installVersion(v, rune::codec::materializeAsOf(evolving, v));   // the writers' descriptors come from the spec
         spec.evolving = evolving;
         st.spec = &spec;
         st.leaseEvents.reserveOnce();
-        index = std::make_unique<ViewInstance>(leaseIndexPlan(5, 4), leaseIndexRowLayout(evolving), evolving, false, 0, 4096, kLeaseIndexChunkBytes);
+        rune::view::ViewTableKeys keys{8, 0, 0, ~uint64_t{0}, mode == Mode::Transient ? kLeaseTransientAuxBytes : mode == Mode::Persisted ? kLeaseAuxBytes : 0u};
+        index = std::make_unique<ViewInstance>(leaseIndexPlan(5, 4), leaseIndexRowLayout(evolving), evolving, false, 0, 4096, kLeaseIndexChunkBytes, keys);
+        index->leaseTransient.transient = spec.leaseTransient;
         vs.addVerdictView(index.get(), VerdictViewKind::LeaseIndex, 0, kLeaseIndexPlanFingerprint);
         set.id = 1;
         set.members[set.count++] = {0, VerdictViewKind::LeaseIndex, kLeaseIndexPlanFingerprint};
@@ -195,6 +202,15 @@ struct Rig {
         return s.substr(0, s.find('\0'));
     }
     [[nodiscard]] bool isNull(uint64_t id, uint16_t slot) const { return rune::view::isNull(row(id), index->layout, slot); }
+    [[nodiscard]] uint32_t ridOf(uint64_t id) const { return ridIn(index->table, id); }
+    static uint32_t ridIn(const rune::view::ViewTable& t, uint64_t id) {
+        uint8_t k[8];
+        putKey(k, id);
+        uint32_t rid = kLeaseAnchorNil;
+        (void)t.find(rune::view::ViewKey::fromBytes({k, 8}), rid);
+        return rid;
+    }
+    static void putKey(uint8_t* k, uint64_t id) { for (int i = 0; i < 8; ++i) k[i] = uint8_t(id >> (8 * i)); }
 };
 
 }  // namespace
@@ -210,7 +226,7 @@ TEST(LeaseJudgeTableRegression, JudgeLeaseTableRegression) {
         {"revoke",           at(rec::LeaseOp::Revoke, 2),     kNotFound, 0,       kNotFound},
         {"expire",           at(rec::LeaseOp::Expire, 0),     kStale, 0,          kStale},
         {"checkpoint",       at(rec::LeaseOp::Checkpoint, 0), kStale, 0,          kStale},
-        {"upsert",           at(rec::LeaseOp::Put, 0),        kInvalid, kInvalid, kInvalid},
+        {"carry",            at(rec::LeaseOp::Put, 0),        kStale, 0,          kStale},   // Task 29: Put + Upsert(0) is a Carry (was InvalidRequest x3)
         {"putIntent3",       at(rec::LeaseOp::Put, 3),        kInvalid, kInvalid, kInvalid},
         {"revokeInsert",     at(rec::LeaseOp::Revoke, 1),     kInvalid, kInvalid, kInvalid},
         {"revokeNoIntent",   at(rec::LeaseOp::Revoke, 0),     kInvalid, kInvalid, kInvalid},
@@ -356,7 +372,7 @@ TEST(LeaseJudgeTableRegression, TableRegression) {
     EXPECT_EQ(r.index->table.size(), 2u);
 
     // the rest: shapes the judge never accepts
-    EXPECT_EQ(r.judgeOne({1, 0, valueOf({})}), kInvalid);                                               // upsert
+    EXPECT_EQ(r.judgeOne({1, 0, valueOf({})}), kStale);                                                 // a Carry of another version (Task 29; was InvalidRequest)
     EXPECT_EQ(r.judgeOne({1, uint8_t(rec::withLeaseOp(1, rec::LeaseOp::Revoke)), valueOf({})}), kInvalid);
     EXPECT_EQ(r.judgeOne({1, uint8_t(rec::withLeaseOp(1, rec::LeaseOp::Expire)), valueOf({})}), kInvalid);
     EXPECT_EQ(r.judgeOne({1, 3, valueOf({})}), kInvalid);                                               // reserved intent
@@ -388,7 +404,7 @@ TEST(LeaseJudgeTableRegression, TableRegression) {
     EXPECT_EQ(s.rejectionsKeyExists, 1u);
     EXPECT_EQ(s.rejectionsLeaseLimit, 1u);
     EXPECT_GE(s.rejectionsLeaseNotFound, 6u);
-    EXPECT_EQ(s.leaseRejectedStaleBroker, 4u);
+    EXPECT_EQ(s.leaseRejectedStaleBroker, 5u);   // + the Carry of another version (Task 29: was an InvalidRequest, now a stale broker record)
     EXPECT_FALSE(r.vs.stalled());
 }
 
@@ -1193,4 +1209,383 @@ TEST(LeaseEncodeRoundTripRegression, NullEnumEncodesFirstWhitelistedValueRegress
     std::memcpy(row.data() + layout.slotOffset[5], &seven, 4);
     ASSERT_EQ(encodeLeaseValue(row.data(), layout, ev, w, 2, value.data(), value.size()), m);
     EXPECT_EQ(value[4 + kind.offset], 7);
+}
+
+
+// ═══ Task 29: the anchor list, the Carry, the fence record ═══
+
+namespace {
+
+constexpr uint8_t kCarryA = 0;   // Put | intent 0
+LRec carry(uint64_t id, int64_t ver, LV v = {}) { v.id = id; v.ver = ver; return {id, kCarryA, valueOf(v)}; }
+
+// The live row of `id` as the value a broker Carry would re-append.
+LV liveValueOf(const Rig& r, uint64_t id) {
+    LV v;
+    v.id = id;
+    v.ver = int64_t(r.col(id, 0));
+    v.ttl = r.col(id, 1);
+    v.holder = r.col(id, 2);
+    v.rem = r.col(id, 3);
+    v.addr = r.addr(id);
+    v.port = r.col32(id, kPortSlot);
+    return v;
+}
+LRec carryOfLive(const Rig& r, uint64_t id) { return carry(id, int64_t(r.col(id, 0)), liveValueOf(r, id)); }
+
+uint32_t recBytes(const LRec& r) { return kLeaseAnchorRecordOverhead + uint32_t(r.keyLen) + uint32_t(r.value.size()); }
+
+struct Anchored { int64_t anchor; uint32_t bytes; };
+using AnchorModel = std::map<uint64_t, Anchored>;
+
+// Walks the list head -> tail; checks every invariant against the model.  `idSlotOffset`: the key column's row offset.
+void expectList(const rune::view::ViewTable& t, const rune::view::RowLayout& layout, const LeaseTransientState& ts, const AnchorModel& model) {
+    const auto u32 = [&](uint32_t rid, std::size_t off) { uint32_t v; std::memcpy(&v, t.aux(rid) + off, 4); return v; };
+    uint32_t rid = ts.anchors.head, prev = kLeaseAnchorNil;
+    int64_t last = -1;
+    uint64_t bytes = 0;
+    std::map<uint64_t, Anchored> seen;
+    std::size_t steps = 0;
+    while (rid != kLeaseAnchorNil) {
+        ASSERT_LE(++steps, model.size() + 1) << "the list loops or is longer than the model";
+        ASSERT_EQ(u32(rid, 20), prev) << "prev mirrors next";
+        const int64_t anchor = leaseAnchorOf(t, rid);
+        ASSERT_GT(anchor, last) << "strictly increasing anchors";
+        last = anchor;
+        uint64_t key;
+        std::memcpy(&key, t.rowOf(rid) + layout.slotOffset[kIdSlot], 8);
+        seen[key] = {anchor, leaseAnchorBytesOf(t, rid)};
+        bytes += leaseAnchorBytesOf(t, rid);
+        prev = rid;
+        rid = u32(rid, 24);
+    }
+    ASSERT_EQ(ts.anchors.tail, prev);
+    ASSERT_EQ(seen.size(), model.size());
+    for (const auto& [k, m] : model) {
+        const auto it = seen.find(k);
+        ASSERT_NE(it, seen.end()) << "key " << k;
+        EXPECT_EQ(it->second.anchor, m.anchor) << "key " << k;
+        EXPECT_EQ(it->second.bytes, m.bytes) << "key " << k;
+    }
+    EXPECT_EQ(ts.anchors.count, model.size());
+    EXPECT_EQ(ts.anchors.liveBytes, bytes);
+    int64_t minAnchor = INT64_MAX;
+    uint64_t modelBytes = 0;
+    for (const auto& [k, m] : model) { minAnchor = std::min(minAnchor, m.anchor); modelBytes += m.bytes; }
+    EXPECT_EQ(leaseAnchorHead(t, ts.anchors), minAnchor);
+    EXPECT_EQ(ts.anchors.liveBytes, modelBytes);
+    EXPECT_EQ(t.size(), model.size());
+}
+
+// Replays the whole log of `r` into a fresh table with a fresh transient state.
+struct TransientReplay {
+    rune::view::RowLayout                  layout;
+    std::unique_ptr<rune::view::ViewTable> table;
+    LeaseTransientState                    ts;
+    int64_t                                cursor = 0;
+    TransientReplay(Rig& r, int64_t from, bool withState = true) : layout(r.index->layout) {
+        rune::view::ViewTableKeys keys{8, 0, 0, ~uint64_t{0}, kLeaseTransientAuxBytes};
+        table = std::make_unique<rune::view::ViewTable>(layout, 4096, kLeaseIndexChunkBytes, keys);
+        ts.transient = true;
+        rune::view::Prospect prospect;
+        prospect.reserve(layout, nullptr);
+        LeaseIndexFold f{*table, layout, r.evolving, 8, nullptr, withState ? &ts : nullptr};
+        const rune::view::FoldSkip skip{.aborted = {}, .rejected = &r.st.rejected};
+        cursor = from;
+        (void)foldLeaseIndexBatch(f, r.spec, prospect, r.log.read(from), r.log.next, cursor, skip);
+    }
+    [[nodiscard]] uint64_t col(uint64_t id, uint16_t slot) const {
+        const uint8_t* row = table->get(id);
+        uint64_t v = 0;
+        if (row != nullptr) std::memcpy(&v, row + layout.slotOffset[slot], 8);
+        return v;
+    }
+    [[nodiscard]] uint32_t rid(uint64_t id) const { return Rig::ridIn(*table, id); }
+};
+
+}  // namespace
+
+TEST(LeaseCarryJudgeRegression, JudgeTableRegression) {
+    const uint8_t carryAttrs = rec::withLeaseOp(0, rec::LeaseOp::Put);
+    constexpr uint64_t kTtl = 100;
+    EXPECT_EQ(judgeLease({false, 0, 0}, carryAttrs, 7, 0, 0, 10), kStale);        // absent
+    EXPECT_EQ(judgeLease({true, 7, kTtl}, carryAttrs, 7, 0, 1, 10), 0);           // present, same version
+    EXPECT_EQ(judgeLease({true, 7, kTtl}, carryAttrs, 8, 0, 1, 10), kStale);      // present, different version
+    EXPECT_EQ(judgeLease({true, 7, kTtl}, carryAttrs, 7, 4000, 1, 10), 0);        // a checkpointed row's carry (remaining > 0)
+    EXPECT_EQ(judgeLease({true, 7, kTtl}, carryAttrs, 7, 0, 10, 10), 0);          // the live-key limit is not consulted
+}
+
+TEST(LeaseCarryJudgeRegression, LiveCarryRegression) {
+    Rig r(100, evolvingDesc(), 0, Rig::Mode::Transient);
+    r.start();
+    int64_t g = 0, ck = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0;
+    LV a; a.ttl = 5000; a.holder = 9; a.addr = "carried"; a.port = 77;
+    ASSERT_EQ(r.judgeOne(grant(1, a), &g), 0);
+    ASSERT_EQ(r.judgeOne(checkpoint(1, g, 3000), &ck), 0);
+    ASSERT_EQ(r.col(1, 3), 3000u);
+    const std::size_t rowLen = r.index->layout.rowLen;
+    const std::vector<uint8_t> before(r.row(1), r.row(1) + rowLen);
+    const std::size_t events = r.st.leaseEvents.buf.size();
+
+    // a carry of the live row: accepted, the row byte-identical, the anchor moves, a Carried event
+    ASSERT_EQ(r.judgeOne(carryOfLive(r, 1), &c1), 0);
+    EXPECT_EQ(r.st.rejected.find(c1), nullptr);
+    EXPECT_EQ(std::memcmp(before.data(), r.row(1), rowLen), 0) << "a Carry modifies no column, no offset column";
+    EXPECT_EQ(int64_t(r.col(1, kUpdatedSlot)), ck) << "lease_updated_offset is the checkpoint's, not the carry's";
+    EXPECT_EQ(r.col(1, 3), 3000u);
+    EXPECT_EQ(leaseAnchorOf(r.index->table, r.ridOf(1)), c1);
+    ASSERT_EQ(r.st.leaseEvents.buf.size(), events + 1);
+    const LeaseEvent& ev = r.st.leaseEvents.buf.back();
+    EXPECT_EQ(ev.kind, LeaseEventKind::Carried);
+    EXPECT_EQ(ev.rid, r.ridOf(1));
+    EXPECT_EQ(ev.version, g);
+    EXPECT_EQ(ev.offset, c1);
+    EXPECT_EQ(ev.remainingMs, 3000u);
+    EXPECT_EQ(ev.ttlMs, 5000u);
+
+    // another version: stale, BrokerRejected, nothing moves
+    const std::size_t events2 = r.st.leaseEvents.buf.size();
+    EXPECT_EQ(r.judgeOne(carry(1, g + 1, liveValueOf(r, 1)), &c2), kStale);
+    EXPECT_EQ(std::memcmp(before.data(), r.row(1), rowLen), 0);
+    EXPECT_EQ(leaseAnchorOf(r.index->table, r.ridOf(1)), c1);
+    ASSERT_EQ(r.st.leaseEvents.buf.size(), events2 + 1);
+    EXPECT_EQ(r.st.leaseEvents.buf.back().kind, LeaseEventKind::BrokerRejected);
+
+    // an absent key
+    EXPECT_EQ(r.judgeOne(carry(2, 5), &c3), kStale);
+    EXPECT_EQ(r.row(2), nullptr);
+
+    // a malformed carry of a present key (value cut below the system columns): stale, not InvalidRequest
+    LRec bad = carryOfLive(r, 1);
+    bad.value.resize(4 + rec::kLeaseSystemBytes - 1);
+    EXPECT_EQ(r.judgeOne(bad, &c4), kStale);
+    EXPECT_EQ(std::memcmp(before.data(), r.row(1), rowLen), 0);
+    EXPECT_EQ(leaseAnchorOf(r.index->table, r.ridOf(1)), c1);
+    EXPECT_EQ(r.index->leaseTransient.anchors.count, 1u);
+}
+
+TEST(LeaseAnchorListRegression, RandomSequencesMatchModelRegression) {
+    for (uint32_t seed = 1; seed <= 200; ++seed) {
+        SCOPED_TRACE(seed);
+        std::mt19937_64 rng(seed);
+        Rig r(100, evolvingDesc(), 0, Rig::Mode::Transient);
+        r.start();
+        AnchorModel model;
+        std::map<uint64_t, int64_t> versionOf;
+        for (int op = 0; op < 300; ++op) {
+            const uint64_t id = 1 + rng() % 32;
+            const bool present = model.count(id) != 0;
+            const int64_t right = present ? versionOf[id] : 5, ver = (rng() % 4 != 0) ? right : right + 1 + int64_t(rng() % 50);
+            LV v; v.addr = "s" + std::to_string(op); v.holder = rng() % 5;
+            LRec rec1;
+            enum Kind { Grant, Update, Carry, Revoke, Expire, Checkpoint } kind = Kind(rng() % 6);
+            switch (kind) {
+            case Grant:      rec1 = grant(id, v); break;
+            case Update:     rec1 = update(id, ver, v); break;
+            case Carry: {
+                LV lv = present ? liveValueOf(r, id) : v;
+                rec1 = carry(id, ver, lv);
+                break;
+            }
+            case Revoke:     rec1 = revoke(id, ver); break;
+            case Expire:     rec1 = expire(id, ver); break;
+            case Checkpoint: rec1 = checkpoint(id, ver, 1 + rng() % 4000, v); break;
+            }
+            int64_t off = 0;
+            const uint16_t code = r.judgeOne(rec1, &off);
+            if (code == 0) {
+                switch (kind) {
+                case Grant:      model[id] = {off, recBytes(rec1)}; versionOf[id] = off; break;
+                case Update:
+                case Carry:      model[id] = {off, recBytes(rec1)}; break;
+                case Revoke:
+                case Expire:     model.erase(id); break;
+                case Checkpoint: break;   // a checkpoint of a present row does not move the anchor
+                }
+            }
+            expectList(r.index->table, r.index->layout, r.index->leaseTransient, model);
+            if (::testing::Test::HasFatalFailure()) return;
+            if (::testing::Test::HasFailure()) { ADD_FAILURE() << "op " << op << " kind " << int(kind) << " code " << code; return; }
+        }
+        // the whole log replayed into a fresh table builds the same list
+        TransientReplay rp(r, 0);
+        ASSERT_EQ(rp.table->size(), model.size());
+        expectList(*rp.table, rp.layout, rp.ts, model);
+        if (::testing::Test::HasFailure()) return;
+        for (const auto& [k, m] : model) EXPECT_EQ(rp.col(k, 0), r.col(k, 0)) << "version of key " << k;
+    }
+}
+
+TEST(LeaseAnchorListRegression, ReusedRowIdStartsUnlinkedRegression) {
+    Rig r(100, evolvingDesc(), 0, Rig::Mode::Transient);
+    r.start();
+    int64_t gA = 0, gB = 0;
+    ASSERT_EQ(r.judgeOne(grant(1), &gA), 0);
+    const uint32_t ridA = r.ridOf(1);
+    ASSERT_EQ(r.judgeOne(revoke(1, gA)), 0);
+    ASSERT_EQ(r.judgeOne(grant(2), &gB), 0);
+    ASSERT_EQ(r.ridOf(2), ridA) << "B reuses A's row id";
+    const LeaseAnchorList& l = r.index->leaseTransient.anchors;
+    EXPECT_EQ(l.count, 1u);
+    EXPECT_EQ(l.head, ridA);
+    EXPECT_EQ(l.tail, ridA);
+    EXPECT_EQ(leaseAnchorOf(r.index->table, ridA), gB);
+    EXPECT_EQ(leaseAnchorHead(r.index->table, l), gB);
+    AnchorModel model{{2, {gB, kLeaseAnchorRecordOverhead + 8 + uint32_t(valueOf({}).size())}}};
+    expectList(r.index->table, r.index->layout, r.index->leaseTransient, model);
+}
+
+TEST(LeaseAnchorListRegression, PersistedKeepsEightBytesRegression) {
+    Rig r(100, evolvingDesc(), 0, Rig::Mode::Persisted);
+    r.start();
+    EXPECT_EQ(r.index->table.auxBytesPerRow(), kLeaseAuxBytes);
+    EXPECT_EQ(kLeaseAuxBytes, 8u);
+    int64_t g = 0;
+    ASSERT_EQ(r.judgeOne(grant(1), &g), 0);
+    ASSERT_EQ(r.judgeOne(update(1, g)), 0);
+    ASSERT_EQ(r.judgeOne(checkpoint(1, g, 100)), 0);
+    ASSERT_EQ(r.judgeOne(carryOfLive(r, 1)), 0);
+    const LeaseAnchorList& l = r.index->leaseTransient.anchors;
+    EXPECT_EQ(l.count, 0u);
+    EXPECT_EQ(l.liveBytes, 0u);
+    EXPECT_EQ(l.head, kLeaseAnchorNil);
+    EXPECT_EQ(leaseAnchorOf(r.index->table, r.ridOf(1)), -1);
+    EXPECT_EQ(leaseLastAppended(r.index->table, r.ridOf(1)), -1);
+    setLeaseLastAppended(r.index->table, r.ridOf(1), 1234);
+    EXPECT_EQ(leaseLastAppended(r.index->table, r.ridOf(1)), 1234);
+    EXPECT_EQ(leaseAnchorHead(r.index->table, l), INT64_MAX);
+}
+
+TEST(LeaseCarryReplayRegression, RingAfterGrantRebuildsRegression) {
+    Rig r(100, evolvingDesc(), 0, Rig::Mode::Transient);
+    r.start();
+    int64_t gA = 0, ck = 0, cr1 = 0, gB = 0, u2 = 0;
+    LV a; a.ttl = 7000; a.holder = 11; a.addr = "ring"; a.port = 4242;
+    ASSERT_EQ(r.judgeOne(grant(1, a), &gA), 0);
+    ASSERT_EQ(r.judgeOne(checkpoint(1, gA, 2500), &ck), 0);
+    ASSERT_EQ(r.judgeOne(carryOfLive(r, 1), &cr1), 0);
+    ASSERT_EQ(r.judgeOne(grant(2), &gB), 0);
+    const uint32_t bytesA = recBytes(carryOfLive(r, 1)), bytesB = recBytes(grant(2));
+
+    const auto check = [&](const TransientReplay& rp, const char* what) {
+        SCOPED_TRACE(what);
+        ASSERT_NE(rp.table->get(uint64_t(1)), nullptr);
+        EXPECT_EQ(int64_t(rp.col(1, 0)), gA) << "version == the grant offset";
+        EXPECT_EQ(rp.col(1, 1), 7000u);
+        EXPECT_EQ(rp.col(1, 2), 11u);
+        EXPECT_EQ(rp.col(1, 3), 2500u);
+        EXPECT_EQ(int64_t(rp.col(1, kGrantedSlot)), gA);
+        const uint8_t* row = rp.table->get(uint64_t(1));
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(row + rp.layout.slotOffset[kAddrSlot]), 4), "ring");
+        uint32_t port; std::memcpy(&port, row + rp.layout.slotOffset[kPortSlot], 4);
+        EXPECT_EQ(port, 4242u);
+        EXPECT_EQ(leaseAnchorOf(*rp.table, rp.rid(1)), cr1);
+        EXPECT_EQ(leaseAnchorOf(*rp.table, rp.rid(2)), gB);
+        EXPECT_EQ(rp.ts.anchors.head, rp.rid(1));
+        EXPECT_EQ(rp.ts.anchors.tail, rp.rid(2));
+        EXPECT_EQ(rp.ts.anchors.liveBytes, uint64_t(bytesA) + bytesB);
+    };
+    const TransientReplay fromCarry(r, cr1);
+    check(fromCarry, "ring starts at the carry");
+    EXPECT_EQ(int64_t(fromCarry.col(1, kUpdatedSlot)), cr1);
+    const TransientReplay fromZero(r, 0);
+    check(fromZero, "replay from 0");
+    EXPECT_EQ(fromZero.col(1, 3), fromCarry.col(1, 3));
+
+    // carry, then an update of the holder: the ring starts at the carry, the update moves the anchor
+    LV h2 = liveValueOf(r, 1); h2.holder = 99;
+    ASSERT_EQ(r.judgeOne(update(1, gA, h2), &u2), 0);
+    const TransientReplay again(r, cr1);
+    EXPECT_EQ(again.col(1, 2), 99u);
+    EXPECT_EQ(leaseAnchorOf(*again.table, again.rid(1)), u2);
+    EXPECT_EQ(again.ts.anchors.tail, again.rid(1));
+}
+
+namespace {
+LRec fenceRec(uint64_t lineage, uint64_t ttl, uint64_t remaining) {
+    LV v; v.ttl = ttl;
+    return checkpoint(lineage, rec::kLeaseFenceVersion, remaining, v);
+}
+}  // namespace
+
+TEST(LeaseFenceRecordRegression, LiveAndReplayRegression) {
+    Rig r(100, evolvingDesc(), 0, Rig::Mode::Transient);
+    r.start();
+    constexpr uint64_t kLineage = 0x1122334455667788ull;
+    int64_t g = 0;
+    ASSERT_EQ(r.judgeOne(grant(1), &g), 0);
+    const uint64_t malformed = r.vs.stats().keyIndexSkippedMalformed;
+    const std::size_t events = r.st.leaseEvents.buf.size();
+    const std::size_t size = r.index->table.size();
+
+    int64_t f1 = 0, f2 = 0;
+    EXPECT_EQ(r.judgeOne(fenceRec(kLineage, 5000, 3000), &f1), 0);
+    EXPECT_EQ(r.st.rejected.find(f1), nullptr);
+    EXPECT_EQ(r.index->table.size(), size);
+    EXPECT_EQ(r.st.leaseEvents.buf.size(), events) << "a fence record changes nothing in the wheels";
+    EXPECT_EQ(r.vs.stats().keyIndexSkippedMalformed, malformed);
+    const LeaseFenceState& fe = r.index->leaseTransient.fence;
+    EXPECT_TRUE(fe.present);
+    EXPECT_EQ(fe.lineage, kLineage);
+    EXPECT_EQ(fe.ttlMs, 5000u);
+    EXPECT_EQ(fe.remainingMs, 3000u);
+    EXPECT_EQ(fe.offset, f1);
+    EXPECT_EQ(r.index->leaseTransient.fenceMalformed, 0u);
+
+    EXPECT_EQ(r.judgeOne(fenceRec(kLineage, 5000, 0), &f2), 0);
+    EXPECT_EQ(fe.remainingMs, 0u);
+    EXPECT_EQ(fe.offset, f2);
+    EXPECT_EQ(r.row(kLineage), nullptr);
+
+    TransientReplay rp(r, 0);
+    EXPECT_TRUE(rp.ts.fence.present);
+    EXPECT_EQ(rp.ts.fence.lineage, kLineage);
+    EXPECT_EQ(rp.ts.fence.ttlMs, 5000u);
+    EXPECT_EQ(rp.ts.fence.remainingMs, 0u);
+    EXPECT_EQ(rp.ts.fence.offset, f2);
+    EXPECT_EQ(rp.ts.fenceMalformed, 0u);
+    EXPECT_EQ(rp.table->size(), 1u);
+
+    // the fold's key-width check does not apply to a fence record: a fold over a 16-byte key index takes it too
+    {
+        rune::view::ViewTableKeys keys{16, 0, 0, ~uint64_t{0}, kLeaseTransientAuxBytes};
+        rune::view::ViewTable table(r.index->layout, 4096, kLeaseIndexChunkBytes, keys);
+        LeaseTransientState ts; ts.transient = true;
+        rune::view::Prospect prospect;
+        prospect.reserve(r.index->layout, nullptr);
+        LeaseIndexFold f{table, r.index->layout, r.evolving, 16, nullptr, &ts};
+        const rune::view::FoldSkip skip{.aborted = {}, .rejected = &r.st.rejected};
+        int64_t cursor = f1;
+        const auto st = foldLeaseIndexBatch(f, r.spec, prospect, r.log.read(f1), r.log.next, cursor, skip);
+        EXPECT_EQ(st.skippedMalformed, 0u);
+        EXPECT_EQ(table.size(), 0u);
+        EXPECT_TRUE(ts.fence.present);
+        EXPECT_EQ(ts.fence.offset, f2);
+    }
+}
+
+TEST(LeaseFenceRecordRegression, PersistedIgnoredRegression) {
+    Rig r(100, evolvingDesc(), 0, Rig::Mode::Persisted);
+    r.start();
+    int64_t f = 0;
+    EXPECT_EQ(r.judgeOne(fenceRec(0xABCDull, 5000, 3000), &f), 0);
+    EXPECT_EQ(r.st.rejected.find(f), nullptr);
+    EXPECT_EQ(r.index->table.size(), 0u);
+    EXPECT_FALSE(r.index->leaseTransient.fence.present);
+    EXPECT_EQ(r.index->leaseTransient.fenceIgnored, 1u);
+    EXPECT_EQ(r.index->leaseTransient.fenceMalformed, 0u);
+}
+
+TEST(LeaseFenceRecordRegression, MalformedRegression) {
+    Rig r(100, evolvingDesc(), 0, Rig::Mode::Transient);
+    r.start();
+    LRec bad = fenceRec(0x77, 5000, 3000);
+    bad.keyLen = 4;
+    int64_t f = 0;
+    EXPECT_EQ(r.judgeOne(bad, &f), 0);
+    EXPECT_EQ(r.st.rejected.find(f), nullptr);
+    EXPECT_EQ(r.index->leaseTransient.fenceMalformed, 1u);
+    EXPECT_FALSE(r.index->leaseTransient.fence.present);
+    EXPECT_EQ(r.index->table.size(), 0u);
+    EXPECT_EQ(r.index->leaseTransient.fenceIgnored, 0u);
 }

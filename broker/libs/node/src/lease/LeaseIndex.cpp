@@ -227,6 +227,7 @@ uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion
             if (!sameVersion) return static_cast<uint16_t>(ErrorCode::LeaseNotFound);
             return 0;   // the record's TTL and remaining are not checked (spec 6.4); apply keeps the row's
         }
+        if (intent == 0) return sameVersion ? 0 : rune::view::kVerdictStaleBroker;   // a Carry (spec A.3): only the anchor moves
         break;
     case lr::LeaseOp::Revoke:
         if (intent == kExisting) {
@@ -270,6 +271,12 @@ PrepareStatus prepareLeaseIndex(const LeaseIndexFold& f, const rune::view::Sourc
     p.clear();
     p.rows[0].existed = false;   // a record refused before its key is probed has no row: the verdict reads this (stale broker record)
     p.rows[0].rid     = UINT32_MAX;
+    // The fence record (spec A.6) is no row: recognised before any key handling, never malformed, no writer needed.
+    if (lr::isLeaseFence(r.attributes, reinterpret_cast<const uint8_t*>(r.value.data()), r.value.size(), {.lease = true})) {
+        p.rowCount = 0;
+        p.op       = rune::view::ProspectOp::None;
+        return PrepareStatus::Ok;
+    }
     if (r.key.size() != f.keyWidth) {
         p.stats.skippedMalformed = 1;
         return PrepareStatus::Malformed;
@@ -318,7 +325,26 @@ PrepareStatus prepareLeaseIndex(const LeaseIndexFold& f, const rune::view::Sourc
     return PrepareStatus::Ok;
 }
 
+namespace {
+// Spec A.6: the fence record changes no row and no wheel.  Honoured only on a transient lease topic; a persisted one counts and ignores it.
+void applyLeaseFence_(LeaseIndexFold& f, const rune::view::SourceRecord& r) noexcept {
+    LeaseTransientState* t = f.transient;
+    if (t == nullptr) return;
+    if (!t->transient) { ++t->fenceIgnored; return; }
+    if (r.key.size() != 8 || r.value.size() < lr::kLeaseRemainingValueOffset + 8) { ++t->fenceMalformed; return; }
+    t->fence = LeaseFenceState{true, loadU64(reinterpret_cast<const uint8_t*>(r.key.data())), leaseRecordTtl(r.value), leaseRecordRemaining(r.value), r.offset};
+}
+[[nodiscard]] inline bool anchorsOn(const LeaseIndexFold& f) noexcept { return f.transient != nullptr && f.transient->transient; }
+[[nodiscard]] inline uint32_t anchorBytesOf(const rune::view::SourceRecord& r) noexcept {
+    return kLeaseAnchorRecordOverhead + static_cast<uint32_t>(r.key.size()) + static_cast<uint32_t>(r.value.size());
+}
+}  // namespace
+
 bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& r, const rune::view::Prospect& p, LeaseEvent& ev) noexcept {
+    if (lr::isLeaseFence(r.attributes, reinterpret_cast<const uint8_t*>(r.value.data()), r.value.size(), {.lease = true})) {
+        applyLeaseFence_(f, r);
+        return false;
+    }
     if (p.op == rune::view::ProspectOp::None || r.value.empty()) return false;
     const rune::view::RowLayout& l = f.layout;
     const rune::view::ViewKey& key = p.rows[0].key;
@@ -330,6 +356,29 @@ bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& r, cons
     switch (op) {
     case lr::LeaseOp::Put: {
         if (p.rows[0].image == nullptr) return false;
+        const bool anchors = anchorsOn(f);
+        if (lr::intentOf(r.attributes) == 0) {   // a Carry (spec A.3): the live row is NOT modified, only its anchor moves
+            const uint32_t bytes = anchorBytesOf(r);
+            uint8_t* row;
+            if (p.rows[0].existed) {
+                rid = p.rows[0].rid;
+                row = f.table.rowOf(rid);
+            } else {   // replay of a ring that starts at the Carry: it holds the full row, exactly like a compacted update
+                row = f.table.put(key, rid);
+                std::memcpy(row, p.rows[0].image, l.rowLen);
+                setSlotU64(row, l, grantedSlot, slotU64(row, l, kLeaseVersionSlot));
+                setSlotU64(row, l, updatedSlot, static_cast<uint64_t>(r.offset));
+                setLeaseLastAppended(f.table, rid, -1);
+                if (anchors) initLeaseAnchor(f.table, rid);
+            }
+            if (anchors) leaseAnchorMoveToTail(f.table, f.transient->anchors, rid, r.offset, bytes);
+            ev.kind = LeaseEventKind::Carried;
+            ev.rid = rid;
+            ev.version = static_cast<int64_t>(slotU64(row, l, kLeaseVersionSlot));
+            ev.ttlMs = slotU64(row, l, kLeaseTtlSlot);
+            ev.remainingMs = slotU64(row, l, kLeaseRemainingSlot);
+            return true;
+        }
         if (lr::intentOf(r.attributes) == static_cast<uint8_t>(lr::Intent::Insert)) {
             uint8_t* row = f.table.put(key, rid);
             std::memcpy(row, p.rows[0].image, l.rowLen);
@@ -338,6 +387,10 @@ bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& r, cons
             setSlotU64(row, l, grantedSlot, static_cast<uint64_t>(r.offset));
             setSlotU64(row, l, updatedSlot, static_cast<uint64_t>(r.offset));
             setLeaseLastAppended(f.table, rid, -1);   // a fresh row (a reused row id keeps its old aux bytes)
+            if (anchors) {
+                initLeaseAnchor(f.table, rid);
+                leaseAnchorMoveToTail(f.table, f.transient->anchors, rid, r.offset, anchorBytesOf(r));
+            }
             ev.kind = LeaseEventKind::Granted;
             ev.rid = rid;
             ev.version = r.offset;
@@ -353,6 +406,10 @@ bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& r, cons
             setSlotU64(created, l, grantedSlot, slotU64(created, l, kLeaseVersionSlot));
             setSlotU64(created, l, updatedSlot, static_cast<uint64_t>(r.offset));
             setLeaseLastAppended(f.table, rid, -1);
+            if (anchors) {
+                initLeaseAnchor(f.table, rid);
+                leaseAnchorMoveToTail(f.table, f.transient->anchors, rid, r.offset, anchorBytesOf(r));
+            }
             ev.kind = LeaseEventKind::Updated;
             ev.rid = rid;
             ev.version = static_cast<int64_t>(slotU64(created, l, kLeaseVersionSlot));
@@ -372,6 +429,7 @@ bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& r, cons
         copySlot(kLeaseHolderSlot);
         for (uint16_t s = kLeaseSystemSlots; s < n; ++s) copySlot(s);   // version, ttl, remaining and the offsets stay
         setSlotU64(row, l, updatedSlot, static_cast<uint64_t>(r.offset));
+        if (anchors) leaseAnchorMoveToTail(f.table, f.transient->anchors, rid, r.offset, anchorBytesOf(r));
         ev.kind = LeaseEventKind::Updated;
         ev.rid = rid;
         ev.version = static_cast<int64_t>(slotU64(row, l, kLeaseVersionSlot));
@@ -390,6 +448,7 @@ bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& r, cons
         ev.version = static_cast<int64_t>(slotU64(row, l, kLeaseVersionSlot));
         ev.ttlMs = slotU64(row, l, kLeaseTtlSlot);
         ev.remainingMs = slotU64(row, l, kLeaseRemainingSlot);
+        if (anchorsOn(f)) leaseAnchorUnlink(f.table, f.transient->anchors, rid);   // before the erase: the next put may reuse this row id
         setLeaseLastAppended(f.table, rid, kLeaseRowErased);   // the promotion pass walks row ids: this one holds no row now
         (void)f.table.erase(key);
         return true;
@@ -405,7 +464,13 @@ bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& r, cons
         }
         setSlotU64(row, l, kLeaseRemainingSlot, loadU64(reinterpret_cast<const uint8_t*>(r.value.data()) + lr::kLeaseRemainingValueOffset));
         setSlotU64(row, l, updatedSlot, static_cast<uint64_t>(r.offset));
-        if (absent) setLeaseLastAppended(f.table, rid, -1);
+        if (absent) {
+            setLeaseLastAppended(f.table, rid, -1);
+            if (anchorsOn(f)) {
+                initLeaseAnchor(f.table, rid);
+                leaseAnchorMoveToTail(f.table, f.transient->anchors, rid, r.offset, anchorBytesOf(r));
+            }
+        }
         ev.kind = LeaseEventKind::Checkpointed;
         ev.rid = rid;
         ev.version = static_cast<int64_t>(slotU64(row, l, kLeaseVersionSlot));

@@ -1139,11 +1139,12 @@ static ViewInstance freshKeyIndex(int32_t srcTopicId, int32_t partition, const T
 // A lease topic's index: the same instance, over the lease row layout (one column per evolving field, plus the offsets).
 static ViewInstance freshLeaseIndex(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec, const rune::codec::Descriptor& src,
                                     rune::view::ViewTableKeys keys, int64_t replayCap) {
-    keys.auxBytesPerRow = kLeaseAuxBytes;   // lastAppended per row (the produce path's Throttled retry)
+    keys.auxBytesPerRow = spec.leaseTransient ? kLeaseTransientAuxBytes : kLeaseAuxBytes;   // lastAppended per row (the produce path's Throttled retry); a transient topic adds the anchor list
     ViewInstance inst(leaseIndexPlan(srcTopicId, spec.keyFieldId), leaseIndexRowLayout(src), src, /*persist=*/false,
                       partition, /*indexSlots=*/4096, kLeaseIndexChunkBytes, keys);
     inst.maxRecordsPerPass = replayCap;
     inst.foldLeadership = kNeverActivated;
+    inst.leaseTransient.transient = spec.leaseTransient;
     inst.layoutGen = spec.leaseLayoutGen;
     // The lease view's output fingerprint: LAYOUT ONLY (field ids, column types, widths, offsets of the row layout just built; no names),
     // mixed with the lease index plan fingerprint (leaseViewLayoutFingerprint).
@@ -1157,7 +1158,7 @@ static ViewInstance freshLeaseIndex(int32_t srcTopicId, int32_t partition, const
 void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen) {
     const auto it = keyIndexes_.find(instKey(srcTopicId, partition));
     if (it == keyIndexes_.end()) return;
-    const bool staleLayout = spec.lease && it->second.layoutGen != spec.leaseLayoutGen;
+    const bool staleLayout = spec.lease && (it->second.layoutGen != spec.leaseLayoutGen || it->second.leaseTransient.transient != spec.leaseTransient);   // the transient flag is fixed at create: a mismatch is defensive
     if (it->second.foldLeadership == leaderGen && !staleLayout) return;   // already fresh for this leadership and layout (the judge may be held)
     if (it->second.foldLeadership != kNeverActivated || staleLayout) {
         const std::optional<rune::codec::Descriptor> leaseSrc = spec.lease ? leaseIndexSource(spec) : std::nullopt;
@@ -1386,6 +1387,8 @@ void WorkerViewSet::beginDiscard_(ViewInstance& inst, ViewDiscardReason reason) 
     const std::size_t indexSlots = inst.plan.sizing.capacity != 0 ? ceilPow2(inst.plan.sizing.capacity) : std::size_t{4096};
     const std::size_t chunkBytes = inst.plan.sizing.chunkBytes != 0 ? static_cast<std::size_t>(inst.plan.sizing.chunkBytes) : (std::size_t{32} << 20);
     inst.table = rune::view::ViewTable(inst.layout, indexSlots, chunkBytes, inst.tableKeys);
+    inst.leaseTransient.anchors = LeaseAnchorList{};   // the anchor list lives in the table's aux
+    inst.leaseTransient.fence   = LeaseFenceState{};
     if (inst.agg) inst.agg.emplace(rune::view::buildAggLayout(inst.plan, inst.evolvingSrc).value(), indexSlots, chunkBytes, inst.tableKeys);
     if (inst.keyed) buildKeyedTables(inst, indexSlots, chunkBytes);
     inst.foldCursor = 0;

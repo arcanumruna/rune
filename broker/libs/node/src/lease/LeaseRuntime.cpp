@@ -302,7 +302,7 @@ void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNow
             }
             continue;   // otherwise a stale record of another leadership
         }
-        const bool present = ev.kind == LeaseEventKind::Updated || ev.kind == LeaseEventKind::Checkpointed;   // the row is in the table: the event carries its values
+        const bool present = ev.kind == LeaseEventKind::Updated || ev.kind == LeaseEventKind::Checkpointed || ev.kind == LeaseEventKind::Carried;   // the row is in the table: the event carries its values
         if (present && !timers_.covers(rid)) {   // a row created by a fold (an absent-row replay) past the entry store: cover it cold
             bool growFailed = false;
             if (!coverOrCount_(rid, growFailed)) {
@@ -331,6 +331,7 @@ void LeaseRuntime::onEvents(std::span<const LeaseEvent> events, int64_t leaseNow
                 foldStep_(rid, e.state == LeaseEntryState::Emitting && e.inflightOffset == ev.offset ? LeaseEntryEvent::OwnRecordFolds
                                                                                                     : LeaseEntryEvent::EndFolds, ev, leaseNowNs, parks, spec);
                 break;
+            case LeaseEventKind::Carried: break;   // the row is unchanged: no fold step (Task 30 adds the own-carry handling)
             case LeaseEventKind::Granted:
             case LeaseEventKind::BrokerRejected: break;   // handled above
         }

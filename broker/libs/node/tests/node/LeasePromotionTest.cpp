@@ -303,6 +303,39 @@ TEST(LeasePromotionArmingRegression, FoldOfFreeRowLinksRegression) {
     EXPECT_EQ(k.entry(2).deadlineNs, ready + 1000 * kMs + 4000 * kMs) << "a Checkpointed fold of a Free entry: its remaining";
 }
 
+// Task 29: a Carried event (a Carry re-appended a live row, spec A.3) is a present-row event with no fold step: an Armed entry keeps its state,
+// deadline and checkpoint time; a Free entry on a live row is linked like an Updated one.
+// Mutation: drop Carried from `present` in LeaseRuntime::onEvents: the Free entry stays Free: red.  Mutation: step the entry with OtherUpdateFolds on
+// Carried: the Armed entry's checkpoint time / deadline move: red.
+TEST(LeaseCarryJudgeRegression, RuntimeCarriedIsNoStepRegression) {
+    Lk k(specWith(1000, 0, 1000, 1000));
+    ASSERT_TRUE(setup(k, {1, 2}, 5000));
+    ASSERT_EQ(k.entry(1).state, LeaseEntryState::Armed);
+    const auto armed = k.entry(1);
+    k.advanceMs(300);
+    LeaseEvent cv;
+    cv.kind = LeaseEventKind::Carried; cv.rid = k.ridOf(1); cv.offset = 900; cv.version = armed.inflightOffset; cv.ttlMs = 5000; cv.remainingMs = 0;
+    k.r.worker->onEventsForTest(VerdictRig::kSrc, 0, std::span<const LeaseEvent>(&cv, 1), k.leaseNow);
+    EXPECT_EQ(k.entry(1).state, LeaseEntryState::Armed);
+    EXPECT_EQ(k.entry(1).deadlineNs, armed.deadlineNs);
+    EXPECT_EQ(k.entry(1).checkpointNs, armed.checkpointNs);
+    EXPECT_EQ(k.entry(1).inflightOffset, armed.inflightOffset);
+
+    // a Free entry on a live row (the promotion pass held back): linked like an Updated fold
+    k.r.worker->setLeaseExtendNs(1000 * kMs);
+    k.r.worker->setLeasePromotionChunkForTest(0);
+    k.r.demote();
+    k.r.promote();
+    ASSERT_TRUE(k.waitRuntime());
+    const int64_t ready = k.rt()->readyNs();
+    ASSERT_EQ(k.entry(2).state, LeaseEntryState::Free);
+    LeaseEvent c2;
+    c2.kind = LeaseEventKind::Carried; c2.rid = k.ridOf(2); c2.offset = 901; c2.ttlMs = 5000; c2.remainingMs = 0;
+    k.r.worker->onEventsForTest(VerdictRig::kSrc, 0, std::span<const LeaseEvent>(&c2, 1), k.leaseNow);
+    EXPECT_EQ(k.entry(2).state, LeaseEntryState::Armed);
+    EXPECT_EQ(k.entry(2).deadlineNs, ready + 1000 * kMs + 5000 * kMs) << "linked at the promotion deadline, like an Updated fold of a Free entry";
+}
+
 // 8. The idle skip waits for the promotion pass: with no events and no wheel due, every duty cycle still advances the walk until it is done
 // (hasPendingWork is true while promotionDone() is false); once done, the idle passes cost no lookup again.
 // Mutation: drop the `|| !promotionDone()` term from LeaseRuntime::hasPendingWork: the passes are skipped, the walk stalls at 1 row: red.

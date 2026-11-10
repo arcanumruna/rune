@@ -13,6 +13,7 @@
 // starts with the four u64 system columns (rune::protocol::record::kLease*ValueOffset).
 #include <rune/codec/Descriptor.h>
 #include <rune/node/WriteState.h>
+#include <rune/node/lease/LeaseEntryStore.h>
 #include <rune/node/lease/LeaseFoldEvents.h>
 #include <rune/protocol/LeaseRecord.h>
 #include <rune/storage/LogReadView.h>
@@ -24,6 +25,7 @@
 #include <rune/view/ViewTable.h>
 
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstring>
 #include <cstdint>
@@ -49,6 +51,19 @@ inline constexpr uint16_t kLeaseOffsetSlots   = 2;   // lease_granted_offset, le
 /// update or revoke of the key that the produce path has appended (spec 6.4, R8), -1 = none.  It stays here; the entry store
 /// (Task 9) does not hold it.
 inline constexpr uint32_t kLeaseAuxBytes = 8;
+
+/// Per-row aux bytes of a TRANSIENT lease topic's table (spec A.3): the anchor list.  Layout:
+///   [0,8)   lastAppended (unchanged meaning)      [8,16)  anchor offset, i64 (-1 = not linked)
+///   [16,20) anchor bytes, u32                     [20,24) prev row id, u32 (kLeaseAnchorNil = none)
+///   [24,28) next row id, u32 (kLeaseAnchorNil)    [28,32) zero padding
+/// A row's ANCHOR is the offset of the newest log record that holds its full state (a grant, an update, a Carry or a replay-created
+/// checkpoint); the list is ordered by anchor, oldest at the head, so the head anchor is the oldest offset the ring must keep.
+inline constexpr uint32_t kLeaseTransientAuxBytes = 32;
+/// kLeaseAnchorNil (LeaseFoldEvents.h) is the nil row id of the anchor list: the lease entry store's nil.
+static_assert(kLeaseAnchorNil == lease::kLeaseNil, "the anchor list and the lease entry store share one nil row id");
+/// The anchor bytes of one record: kLeaseAnchorRecordOverhead + key size + value size, an ESTIMATE of the record's ring bytes
+/// (the batch and record framing, rounded).  The ring's real accounting is Task 30's; this only has to be monotone and stable.
+inline constexpr uint32_t kLeaseAnchorRecordOverhead = 24;
 
 inline constexpr std::string_view kLeaseGrantedOffsetColumn = "lease_granted_offset";
 inline constexpr std::string_view kLeaseUpdatedOffsetColumn = "lease_updated_offset";
@@ -131,6 +146,8 @@ struct LeaseRowState {
 ///   Put + Insert:    row present -> KeyExists (56); liveCount >= maxKeys -> LeaseLimitExceeded (63); remaining != 0 -> 39; accept.
 ///                    The grant's TTL is taken as written (the produce hook clamps it before append).
 ///   Put + Existing:  row absent or version differs -> LeaseNotFound (62); accept.
+///   Put + Upsert(0) = Carry (a broker re-append of a live row, spec A.3): row absent or version differs -> kVerdictStaleBroker; accept
+///                    (the row is not modified, only its anchor moves).
 ///   Revoke+Existing: row absent or version differs -> LeaseNotFound (62); accept.
 ///   Expire / Checkpoint (intent 0): row absent or version differs -> kVerdictStaleBroker; accept (the broker copies the row).
 ///   anything else -> InvalidRequest (39).
@@ -171,6 +188,65 @@ inline void setLeaseLastAppended(rune::view::ViewTable& t, uint32_t rid, int64_t
 inline constexpr int64_t kLeaseRowErased = INT64_MIN;
 [[nodiscard]] inline bool leaseRowLive(const rune::view::ViewTable& t, uint32_t rid) noexcept { return leaseLastAppended(t, rid) != kLeaseRowErased; }
 
+namespace detail {
+inline constexpr std::size_t kAnchorOff = 8, kAnchorBytesOff = 16, kAnchorPrevOff = 20, kAnchorNextOff = 24;
+[[nodiscard]] inline bool hasAnchorAux(const rune::view::ViewTable& t) noexcept { return t.auxBytesPerRow() >= kLeaseTransientAuxBytes; }
+template <typename T> [[nodiscard]] inline T auxGet(const rune::view::ViewTable& t, uint32_t rid, std::size_t off) noexcept {
+    T v;
+    std::memcpy(&v, t.aux(rid) + off, sizeof(v));
+    return v;
+}
+template <typename T> inline void auxSet(rune::view::ViewTable& t, uint32_t rid, std::size_t off, T v) noexcept { std::memcpy(t.aux(rid) + off, &v, sizeof(v)); }
+}  // namespace detail
+
+/// The row's anchor offset; -1 when it is not linked or the table has no anchor aux.
+[[nodiscard]] inline int64_t leaseAnchorOf(const rune::view::ViewTable& t, uint32_t rid) noexcept {
+    return detail::hasAnchorAux(t) ? detail::auxGet<int64_t>(t, rid, detail::kAnchorOff) : -1;
+}
+[[nodiscard]] inline uint32_t leaseAnchorBytesOf(const rune::view::ViewTable& t, uint32_t rid) noexcept {
+    return detail::hasAnchorAux(t) ? detail::auxGet<uint32_t>(t, rid, detail::kAnchorBytesOff) : 0;
+}
+/// A fresh row: anchor -1, bytes 0, prev / next nil (a reused row id keeps its old aux bytes).
+inline void initLeaseAnchor(rune::view::ViewTable& t, uint32_t rid) noexcept {
+    if (!detail::hasAnchorAux(t)) return;
+    detail::auxSet<int64_t>(t, rid, detail::kAnchorOff, -1);
+    detail::auxSet<uint32_t>(t, rid, detail::kAnchorBytesOff, 0);
+    detail::auxSet<uint32_t>(t, rid, detail::kAnchorPrevOff, kLeaseAnchorNil);
+    detail::auxSet<uint32_t>(t, rid, detail::kAnchorNextOff, kLeaseAnchorNil);
+    detail::auxSet<uint32_t>(t, rid, 28, 0);
+}
+/// Takes the row out of the list (a no-op when it is not linked).
+inline void leaseAnchorUnlink(rune::view::ViewTable& t, LeaseAnchorList& l, uint32_t rid) noexcept {
+    if (!detail::hasAnchorAux(t) || detail::auxGet<int64_t>(t, rid, detail::kAnchorOff) < 0) return;
+    const uint32_t prev = detail::auxGet<uint32_t>(t, rid, detail::kAnchorPrevOff), next = detail::auxGet<uint32_t>(t, rid, detail::kAnchorNextOff);
+    if (prev != kLeaseAnchorNil) detail::auxSet<uint32_t>(t, prev, detail::kAnchorNextOff, next); else l.head = next;
+    if (next != kLeaseAnchorNil) detail::auxSet<uint32_t>(t, next, detail::kAnchorPrevOff, prev); else l.tail = prev;
+    --l.count;
+    l.liveBytes -= detail::auxGet<uint32_t>(t, rid, detail::kAnchorBytesOff);
+    detail::auxSet<int64_t>(t, rid, detail::kAnchorOff, -1);
+    detail::auxSet<uint32_t>(t, rid, detail::kAnchorBytesOff, 0);
+    detail::auxSet<uint32_t>(t, rid, detail::kAnchorPrevOff, kLeaseAnchorNil);
+    detail::auxSet<uint32_t>(t, rid, detail::kAnchorNextOff, kLeaseAnchorNil);
+}
+/// Links (or re-links) the row at the tail with this anchor.  Anchors only grow: live and replay both fold in offset order.
+inline void leaseAnchorMoveToTail(rune::view::ViewTable& t, LeaseAnchorList& l, uint32_t rid, int64_t offset, uint32_t bytes) noexcept {
+    if (!detail::hasAnchorAux(t)) return;
+    leaseAnchorUnlink(t, l, rid);
+    assert((l.tail == kLeaseAnchorNil || offset > detail::auxGet<int64_t>(t, l.tail, detail::kAnchorOff)) && "lease anchors only grow");
+    detail::auxSet<int64_t>(t, rid, detail::kAnchorOff, offset);
+    detail::auxSet<uint32_t>(t, rid, detail::kAnchorBytesOff, bytes);
+    detail::auxSet<uint32_t>(t, rid, detail::kAnchorPrevOff, l.tail);
+    detail::auxSet<uint32_t>(t, rid, detail::kAnchorNextOff, kLeaseAnchorNil);
+    if (l.tail != kLeaseAnchorNil) detail::auxSet<uint32_t>(t, l.tail, detail::kAnchorNextOff, rid); else l.head = rid;
+    l.tail = rid;
+    ++l.count;
+    l.liveBytes += bytes;
+}
+/// The oldest anchor (the head's), INT64_MAX when the list is empty.
+[[nodiscard]] inline int64_t leaseAnchorHead(const rune::view::ViewTable& t, const LeaseAnchorList& l) noexcept {
+    return l.head == kLeaseAnchorNil || !detail::hasAnchorAux(t) ? INT64_MAX : detail::auxGet<int64_t>(t, l.head, detail::kAnchorOff);
+}
+
 /// The produce path's non-virtual window on a partition's lease index (WorkerViewSet::leaseIndexOf): the table (rows and the
 /// per-row `lastAppended`), its row layout and the descriptor the layout was built from.  Null `table` = no index.
 struct LeaseIndexRef {
@@ -178,6 +254,7 @@ struct LeaseIndexRef {
     const rune::view::RowLayout*   layout  = nullptr;
     const rune::codec::Descriptor* outDesc = nullptr;
     LeaseCoverCache*               cover   = nullptr;   ///< the instance's slot maps (nullptr: encode scans)
+    LeaseTransientState*           transient = nullptr; ///< the instance's anchor list and fence (Task 30 reads it)
 };
 
 /// The exact inverse of projectLeaseRow: writes a lease record value for `writer` (version `writerVersion`) from a row image:
@@ -201,6 +278,9 @@ struct LeaseIndexFold {
     uint8_t                           keyWidth = 0;
     /// Optional (nullptr: always scan): the instance's cache of per-version slot maps (proven covered by `layout`).
     LeaseCoverCache*                  cover = nullptr;
+    /// Optional (nullptr: no anchors, fence records ignored uncounted): the instance's anchor list and fence.  Anchors are kept only
+    /// when `transient->transient`.  LAST, so existing brace inits still compile.
+    LeaseTransientState*              transient = nullptr;
 };
 
 /// Prepares one record: the key (width checked), whether its row exists, and for a Put or Checkpoint the projected row image

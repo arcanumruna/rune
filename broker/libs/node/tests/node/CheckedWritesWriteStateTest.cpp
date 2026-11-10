@@ -413,8 +413,8 @@ TEST(LeaseWriteSpecRegression, WireRoundTrip) {
     // bit 3 on a 9-byte frame
     auto shortBit = std::vector<uint8_t>(buf.begin(), buf.begin() + 9);
     EXPECT_FALSE(decodeTopicWriteSpec(shortBit));
-    // bits 4-7
-    for (int bit = 4; bit < 8; ++bit) {
+    // bits 5-7 (bit 4 is leaseTransient since Task 29)
+    for (int bit = 5; bit < 8; ++bit) {
         auto b = buf;
         b[8] |= static_cast<uint8_t>(1u << bit);
         EXPECT_FALSE(decodeTopicWriteSpec(b)) << "bit " << bit;
@@ -425,6 +425,60 @@ TEST(LeaseWriteSpecRegression, WireRoundTrip) {
         const auto cut = decodeTopicWriteSpec(std::span<const uint8_t>(buf.data(), n));
         EXPECT_FALSE(cut.has_value()) << "cut to " << n << (good ? " (a legal length, but bit 3 is set)" : "");
     }
+}
+
+TEST(WriteSpecWireRegression, LeaseTransientBitRegression) {
+    rune::protocol::LeaseSpec ls;
+    ls.ttlMs = 4242; ls.maxKeys = 9;
+    for (const bool transient : {false, true}) {
+        TopicWriteSpecWire w;
+        w.topicId = 6; w.keyFieldId = 4; w.keyType = PrimType::FixedStr; w.keyWidth = 16;
+        w.lease = ls; w.leaseViewTopicId = 7; w.leaseTransient = transient;
+        std::vector<uint8_t> buf(kTopicWriteSpecLeaseWireLen);
+        ASSERT_EQ(encodeTopicWriteSpec(w, buf), kTopicWriteSpecLeaseWireLen);
+        EXPECT_EQ(buf[8], transient ? 0x18 : 0x08);
+        const auto back = decodeTopicWriteSpec(buf);
+        ASSERT_TRUE(back);
+        EXPECT_EQ(back->leaseTransient, transient);
+        EXPECT_EQ(*back, w);
+        TopicWriteSpec spec;
+        spec.setFacts(*back);
+        EXPECT_EQ(spec.leaseTransient, transient);
+    }
+    // bit 4 without bit 3 (a 9-byte frame, and a 26-byte autoincrement frame)
+    TopicWriteSpecWire plain;
+    plain.topicId = 6;
+    uint8_t nine[kTopicWriteSpecWireLen];
+    ASSERT_EQ(encodeTopicWriteSpec(plain, nine), 9u);
+    nine[8] |= 0x10;
+    EXPECT_FALSE(decodeTopicWriteSpec(nine));
+    TopicWriteSpecWire ai;
+    ai.topicId = 6; ai.autoIncrement = true; ai.partitionCount = 2;
+    uint8_t tw[kTopicWriteSpecAutoIncWireLen];
+    ASSERT_EQ(encodeTopicWriteSpec(ai, tw), 26u);
+    tw[8] |= 0x10;
+    EXPECT_FALSE(decodeTopicWriteSpec(tw));
+    // bit 5 (and 6, 7) stay refused, with or without a lease
+    TopicWriteSpecWire lw;
+    lw.topicId = 6; lw.lease = ls;
+    std::vector<uint8_t> buf(kTopicWriteSpecLeaseWireLen);
+    ASSERT_EQ(encodeTopicWriteSpec(lw, buf), kTopicWriteSpecLeaseWireLen);
+    for (int bit = 5; bit < 8; ++bit) {
+        auto b = buf;
+        b[8] |= static_cast<uint8_t>(1u << bit);
+        EXPECT_FALSE(decodeTopicWriteSpec(b)) << "bit " << bit;
+    }
+    // the catalog's persistence rides the wire: Transient -> true, Disk -> false, no lease -> false
+    rune::catalog::TopicObject t = topicOf(leaseDescriptor(16), "id", true);
+    t.lease = ls;
+    t.persistence = rune::catalog::Persistence::Transient;
+    ASSERT_TRUE(writeSpecWireOf(t));
+    EXPECT_TRUE(writeSpecWireOf(t)->leaseTransient);
+    t.persistence = rune::catalog::Persistence::Disk;
+    EXPECT_FALSE(writeSpecWireOf(t)->leaseTransient);
+    t.lease.reset();
+    t.persistence = rune::catalog::Persistence::Transient;
+    EXPECT_FALSE(writeSpecWireOf(t)->leaseTransient);
 }
 
 TEST(LeaseWriteSpecRegression, KeyWidthRealRegression) {

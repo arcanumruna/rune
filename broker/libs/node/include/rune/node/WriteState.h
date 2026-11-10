@@ -39,7 +39,8 @@ inline constexpr uint32_t kNoKeyOffset = 0xFFFFFFFF;
 /// The WriteSpecUpdate tail: [topicId i32][keyFieldId u16][keyType u8][keyWidth u8][flags u8: bit0 legacyValidate, bit1 keyIndex,
 /// bit2 autoIncrement], then, with autoIncrement only, [partitioner u8][autoIncrementMax u64][autoIncrementReserve u32]
 /// [partitionCount i32] (26 bytes in all); or, with bit3 (lease; never with autoIncrement), the 39-byte LeaseSpec block
-/// (rune::protocol::encodeLeaseSpec) at byte 9, then [leaseViewTopicId i32] at byte 48 (52 bytes in all).  Bits 4-7 are refused.
+/// (rune::protocol::encodeLeaseSpec) at byte 9, then [leaseViewTopicId i32] at byte 48 (52 bytes in all).  Bit 4 (leaseTransient: the lease
+/// topic's catalog persistence is Transient) is legal ONLY with bit 3; the length is unchanged.  Bits 5-7 are refused.
 struct TopicWriteSpecWire {
     int32_t              topicId        = -1;
     uint16_t             keyFieldId     = kNoKeyField;   ///< the key field's durable tag; kNoKeyField = a keyless topic
@@ -53,6 +54,7 @@ struct TopicWriteSpecWire {
     uint32_t             autoIncrementReserve = rune::protocol::kAutoIncrementReserveDefault;
     int32_t              partitionCount = 0;
     std::optional<rune::protocol::LeaseSpec> lease;      ///< a lease topic's spec; rides the wire as flags bit 3 + 39 bytes
+    bool                 leaseTransient = false;         ///< a lease topic whose catalog persistence is Transient; flags bit 4, legal only with bit 3
     int32_t              leaseViewTopicId = -1;          ///< a lease topic: the sink topic id of its lease view (`<topic>.leases`), from the catalog; rides after the LeaseSpec block
     bool operator==(const TopicWriteSpecWire&) const = default;
 };
@@ -73,7 +75,7 @@ inline std::size_t encodeTopicWriteSpec(const TopicWriteSpecWire& w, std::span<u
     std::memcpy(out.data() + 4, &w.keyFieldId, 2);
     out[6] = static_cast<uint8_t>(w.keyType);
     out[7] = w.keyWidth;
-    out[8] = static_cast<uint8_t>((w.legacyValidate ? 1 : 0) | (w.keyIndex ? 2 : 0) | (w.autoIncrement ? 4 : 0) | (w.lease ? 8 : 0));
+    out[8] = static_cast<uint8_t>((w.legacyValidate ? 1 : 0) | (w.keyIndex ? 2 : 0) | (w.autoIncrement ? 4 : 0) | (w.lease ? 8 : 0) | (w.leaseTransient ? 0x10 : 0));
     if (w.lease) {
         rune::protocol::encodeLeaseSpec(*w.lease, out.data() + 9);
         std::memcpy(out.data() + 9 + rune::protocol::kLeaseSpecBytes, &w.leaseViewTopicId, 4);
@@ -93,7 +95,7 @@ inline std::size_t encodeTopicWriteSpec(const TopicWriteSpecWire& w, std::span<u
         return std::nullopt;
     const bool autoInc  = (in[8] & 4) != 0;
     const bool hasLease = (in[8] & 8) != 0;
-    if ((in[8] & 0xF0) != 0 || (autoInc && hasLease) || autoInc != (in.size() == kTopicWriteSpecAutoIncWireLen) ||
+    if ((in[8] & 0xE0) != 0 || ((in[8] & 0x10) != 0 && !hasLease) || (autoInc && hasLease) || autoInc != (in.size() == kTopicWriteSpecAutoIncWireLen) ||
         hasLease != (in.size() == kTopicWriteSpecLeaseWireLen))
         return std::nullopt;
     TopicWriteSpecWire w;
@@ -103,6 +105,7 @@ inline std::size_t encodeTopicWriteSpec(const TopicWriteSpecWire& w, std::span<u
     w.keyWidth       = in[7];
     w.legacyValidate = (in[8] & 1) != 0;
     w.keyIndex       = (in[8] & 2) != 0;
+    w.leaseTransient = (in[8] & 0x10) != 0;
     if (hasLease) {
         rune::protocol::LeaseSpec spec{};
         if (!rune::protocol::decodeLeaseSpec(in.data() + 9, rune::protocol::kLeaseSpecBytes, spec)) return std::nullopt;
@@ -129,6 +132,7 @@ inline std::size_t encodeTopicWriteSpec(const TopicWriteSpecWire& w, std::span<u
     w.legacyValidate = t.schema->validate;
     w.keyIndex       = t.schema->keyFeatures.keyIndex;
     w.lease          = t.lease;
+    w.leaseTransient = t.lease.has_value() && t.persistence == rune::catalog::Persistence::Transient;
     if (t.lease) w.leaseViewTopicId = leaseViewTopicId;
     if (const auto& f = t.schema->keyFeatures; f.autoIncrement) {
         w.autoIncrement        = true;
@@ -188,6 +192,7 @@ public:
     uint32_t              autoIncrementReserve = rune::protocol::kAutoIncrementReserveDefault;
     int32_t               partitionCount = 0;
     std::optional<rune::protocol::LeaseSpec> lease;   ///< a lease topic's spec (set by setFacts)
+    bool                  leaseTransient = false;     ///< a lease topic whose persistence is Transient (set by setFacts; fixed at create)
     /// A lease topic: bumped when leaseLayoutSource() gains a field id (an AddField, through installVersion or FilterSchema,
     /// whichever delivers the id first), so the lease index, whose row layout has one column per source field, is rebuilt
     /// from the log (WorkerViewSet::rebuildKeyIndex_).  That is
@@ -287,6 +292,7 @@ public:
         autoIncrementReserve = w.autoIncrementReserve;
         partitionCount = w.partitionCount;
         lease          = w.lease;
+        leaseTransient = w.leaseTransient && w.lease.has_value();
         hasFacts_      = true;
         uint32_t erased = 0;
         for (auto& sv : versions_) {

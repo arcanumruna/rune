@@ -419,7 +419,7 @@ public:
         const auto it = keyIndexes_.find(key);
         if (it == keyIndexes_.end()) return {};
         ViewInstance& inst = it->second;
-        return LeaseIndexLookup{LeaseIndexRef{&inst.table, &inst.layout, &inst.evolvingSrc, &inst.leaseCover}, leaseReady_(inst, key, currentLeaderGen, isLeader, hwConfirmed),
+        return LeaseIndexLookup{LeaseIndexRef{&inst.table, &inst.layout, &inst.evolvingSrc, &inst.leaseCover, &inst.leaseTransient}, leaseReady_(inst, key, currentLeaderGen, isLeader, hwConfirmed),
                                 inst.foldCursor, inst.leaseViewFp};
     }
     /// Lease view point reads (spec 7.1): the source topic of a lease view (`<topic>.leases`), -1 when `viewTopicId` is not one.  The
