@@ -406,6 +406,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
     if (role_ != Role::Leader) ++leadershipGeneration_;   // F15 S4: a new leadership (not an epoch bump)
     role_  = Role::Leader;
     resetLeaderLogStart_();   // lease topics: the leader's own start is the reference
+    if (leaseTransient_) leaseFloor_ = 0;   // lease topics: evict nothing until the worker's first duty pass pushes the real floor (A.3)
 
     // Use the full assigned replica set (RF), NOT the (possibly leader-only) ISR,
     // as the IsrManager's replica set (see configuredReplicas_).

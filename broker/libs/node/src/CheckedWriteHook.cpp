@@ -175,6 +175,12 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
     // The retriable lease answers come after every definite refusal: a revoke is re-encoded from the row, so the row must be
     // current (L19).  Nothing is stored; the client retries after retryAfterNs().
     if (lease && v.code == pc::ErrorCode::OK && leaseRevokes_ != 0) [[unlikely]] return checkLeaseBatch_(batch, len, 0, leaseRevokes_);
+    // The rebirth fence (spec A.6): a grant waits while the partition may have lost committed leases.  Same place as the revoke retry.
+    if (lease && v.code == pc::ErrorCode::OK && intents.leaseGrants > 0 && facts_.leaseGrantHoldNs > 0) [[unlikely]] {
+        refusal_      = HookRefusal::LeaseFenced;
+        retryAfterNs_ = facts_.leaseGrantHoldNs;
+        return pc::ErrorCode::Throttled;
+    }
     return v.code;
 }
 

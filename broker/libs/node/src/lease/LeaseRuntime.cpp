@@ -1,6 +1,7 @@
 // LeaseRuntime.cpp - lease topics Task 10: see LeaseRuntime.h.
 #include <rune/node/lease/LeaseRuntime.h>
 
+#include <rune/node/WriteState.h>
 #include <rune/node/lease/LeaseIndex.h>
 #include <rune/protocol/BatchRebuild.h>
 #include <rune/protocol/LeaseRecord.h>
@@ -681,5 +682,180 @@ uint32_t LeaseRuntime::emitCheckpoints(LeaseEmitWork& work, const LeaseIndexRef&
     for (uint32_t i = 0; i < n; ++i) timers_.scheduleCheckpoint(work.rids[i], leaseNowNs);   // Armed, due again next cycle; no tokens spent
     return 0;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
+// Transient lease topics: the rebirth fence (spec A.6) and carry (spec A.3).
+// ---------------------------------------------------------------------------------------------------------------------------------------
+
+uint64_t LeaseRuntime::lineageOf_(const FenceState& s) noexcept {
+    if (const auto* d = std::get_if<FenceDeciding>(&s)) return d->lineage;
+    if (const auto* f = std::get_if<FenceFencing>(&s)) return f->lineage;
+    if (const auto* o = std::get_if<FenceOpen>(&s)) return o->lineage;
+    return 0;
+}
+
+bool LeaseRuntime::fenceNoteChanged(const LeaseLineageNote& note, int32_t leaderEpoch) const noexcept {
+    return transient_ && note.leaderEpoch >= 0 && note.leaderEpoch == leaderEpoch && !std::holds_alternative<FenceAwait>(fence_) &&
+           note.lineage != lineageOf_(fence_);
+}
+
+void LeaseRuntime::fenceDecide_(const LeaseFenceState& f, uint64_t lineage, uint32_t generation, uint64_t maxTtlMs) noexcept {
+    // The A.6 table.  The fence record counts only when it is this lineage's; another lineage's (or none) decides by the generation.
+    if (f.present && f.lineage == lineage) {
+        if (f.remainingMs == 0) { fence_ = FenceOpen{lineage}; return; }
+        fence_ = FenceFencing{lineage, satAdd(readyNs_, satAdd(extendNs_, msToNsSat(f.remainingMs)))};
+        return;
+    }
+    if (generation == 0) { fence_ = FenceDeciding{lineage, -1, 0, 0}; return; }
+    fence_ = FenceDeciding{lineage, -1, maxTtlMs, satAdd(readyNs_, satAdd(extendNs_, msToNsSat(maxTtlMs)))};
+}
+
+int64_t LeaseRuntime::appendFenceRecord_(LeaseEmitWork& work, const LeaseWriter& writer, uint64_t lineage, uint64_t ttlMs, uint64_t remainingMs,
+                                         PartitionReplica& replica) {
+    namespace rec = rune::protocol::record;
+    const std::size_t len = encodeLeaseFenceValue(writer, ttlMs, remainingMs, work.valueTmp.data(), work.valueTmp.size());
+    if (len == 0) {
+        ++stats_.encodeFailures;
+        return kAppendThrew;
+    }
+    char key[8];
+    for (int i = 0; i < 8; ++i) key[i] = static_cast<char>(lineage >> (8 * i));
+    work.builder.reset(0, 0);
+    work.builder.append(std::string_view(key, 8), std::string_view(reinterpret_cast<const char*>(work.valueTmp.data()), len), /*timestamp=*/0,
+                        rec::withLeaseOp(0, rec::LeaseOp::Checkpoint));
+    work.builder.buildInto(work.batch);
+    const int64_t base = appendBatch(replica, std::span<const uint8_t>(work.batch.data(), work.batch.size()), stats_, "fence");
+    if (base >= 0) {
+        lastBatchBytes_ = work.batch.size();
+        ++stats_.fenceAppended;
+    } else if (base == PartitionReplica::kAppendNotLeader) {
+        ++stats_.notLeaderStops;
+    }
+    return base;
+}
+
+uint32_t LeaseRuntime::fenceStep(const LeaseLineageNote& note, int32_t leaderEpoch, const LeaseIndexRef& ref, LeaseEmitWork& work,
+                                 const LeaseWriter& writer, int64_t leaseNowNs, uint64_t maxTtlMs, PartitionReplica& replica) {
+    if (!transient_ || ref.transient == nullptr || writer.descriptor == nullptr) return 0;
+    const LeaseFenceState& f = ref.transient->fence;
+    const bool noteHere = note.leaderEpoch >= 0 && note.leaderEpoch == leaderEpoch;   // a note of another leadership is no note
+    // A new lineage within this runtime's life (a re-minted lineage for the same leadership): decide again.
+    if (noteHere && !std::holds_alternative<FenceAwait>(fence_) && note.lineage != lineageOf_(fence_)) fence_ = FenceAwait{};
+    if (std::holds_alternative<FenceAwait>(fence_)) {
+        if (!noteHere) return 0;
+        fenceDecide_(f, note.lineage, note.generation, maxTtlMs);
+    }
+    // The deadline: never early, the same >= the Expire wheel uses on this clock.  The open record is appended in this same call.
+    if (const auto* fz = std::get_if<FenceFencing>(&fence_); fz != nullptr && leaseNowNs >= fz->deadlineNs) fence_ = FenceDeciding{fz->lineage, -1, 0, 0};
+    if (auto* d = std::get_if<FenceDeciding>(&fence_)) {
+        if (d->appendFrom < 0) {
+            const int64_t base = appendFenceRecord_(work, writer, d->lineage, maxTtlMs, d->remainingMs, replica);
+            if (base >= 0) {
+                d->appendFrom = base;
+                return 1;
+            }
+            ++stats_.fenceAppendDeferred;   // refused: stays Deciding, retried next pass
+            return 0;
+        }
+        if (f.present && f.lineage == d->lineage && f.offset >= d->appendFrom)   // the record folded
+            fence_ = d->thenDeadlineNs == 0 ? FenceState{FenceOpen{d->lineage}} : FenceState{FenceFencing{d->lineage, d->thenDeadlineNs}};
+    }
+    return 0;
+}
+
+uint32_t LeaseRuntime::emitCarries(LeaseEmitWork& work, const LeaseIndexRef& ref, const LeaseWriter& writer, int64_t judgedThrough,
+                                   int64_t leaseNowNs, std::size_t byteCap, std::size_t hardCap, uint32_t maxRecords, PartitionReplica& replica) {
+    namespace rec = rune::protocol::record;
+    if (!transient_ || writer.descriptor == nullptr || ref.table == nullptr || ref.layout == nullptr || ref.transient == nullptr) return 0;
+    const LeaseTransientState& ts = *ref.transient;
+    if (fenceCarryFrom_ >= 0 && ts.fence.present && ts.fence.offset >= fenceCarryFrom_) fenceCarryFrom_ = -1;   // the carried fence folded
+    carryWanted_ = false;
+    const int64_t floor = leaseTransientFloor(*ref.table, ts);
+    if (floor == INT64_MAX) return 0;
+    const std::size_t cap = replica.transientCapacityBytes();
+    if (ts.anchors.liveBytes > cap / 4 && cap != 0 && (!carryWarned_ || leaseNowNs - carryWarnNs_ >= 60'000'000'000)) {
+        carryWarned_ = true;
+        carryWarnNs_ = leaseNowNs;
+        spdlog::warn("lease runtime: topic {} partition {}: live lease bytes {} exceed a quarter of the transient ring ({} bytes); grants and updates will be refused soon",
+                     topicId_, partition_, ts.anchors.liveBytes, cap);
+    }
+    if (!leaseShouldCarry(replica.transientBytesFrom(floor), ts.anchors.liveBytes, cap)) return 0;
+    uint32_t total = 0;
+    // The fence first: when it is the oldest thing the ring holds it is carried before any row (a promoted leader must find it).
+    if (ts.fence.present && ts.fence.offset < leaseAnchorHead(*ref.table, ts.anchors) && fenceCarryFrom_ < 0) {
+        const auto* fz = std::get_if<FenceFencing>(&fence_);
+        if (fz != nullptr || std::holds_alternative<FenceOpen>(fence_)) {
+            const uint64_t remaining = fz == nullptr ? 0 : (leaseNowNs >= fz->deadlineNs ? 1 : ceilRemainingMs(fz->deadlineNs, leaseNowNs));
+            const int64_t base = appendFenceRecord_(work, writer, ts.fence.lineage, ts.fence.ttlMs, remaining, replica);
+            if (base >= 0) {
+                fenceCarryFrom_ = base;
+                ++total;
+            } else {
+                if (base == PartitionReplica::kAppendMinIsr || base == PartitionReplica::kAppendBackPressure) ++stats_.carryBacklog;
+                carryWanted_ = true;
+                return 0;
+            }
+        }
+    }
+    const uint16_t* const slotOf = ref.cover != nullptr
+        ? leaseSlotMapFor(*ref.cover, writer.version, writer.installSeq, *ref.layout, *ref.outDesc, *writer.descriptor) : nullptr;
+    if (ref.cover != nullptr && slotOf == nullptr) {
+        ++stats_.encodeFailures;
+        return total;
+    }
+    maxRecords = std::min<uint32_t>(maxRecords, rune::protocol::kMaxLeaseExpiryBatch);
+    work.builder.reset(0, 0);
+    uint32_t n       = 0;
+    uint32_t visited = 0;
+    bool full        = false;
+    for (uint32_t rid = ts.anchors.head; rid != kLeaseAnchorNil && visited < maxRecords && !full; rid = leaseAnchorNextOf(*ref.table, rid)) {
+        ++visited;
+        if (!timers_.covers(rid) || timers_.entry(rid).state != LeaseEntryState::Armed ||   // not promoted yet, or a checkpoint / clear / expire is in flight
+            leaseLastAppended(*ref.table, rid) >= judgedThrough) {                         // an update or revoke of the key is appended but not judged
+            ++stats_.carryDeferred;
+            carryWanted_ = true;
+            continue;
+        }
+        const uint8_t* row = ref.table->rowOf(rid);
+        const std::span<const uint8_t> key = ref.table->keyOf(rid);
+        const std::size_t len = encodeLeaseValue(row, *ref.layout, *ref.outDesc, *writer.descriptor, writer.version, work.valueTmp.data(),
+                                                 work.valueTmp.size(), slotOf);
+        if (len == 0) {
+            ++stats_.encodeFailures;
+            ++stats_.carryDeferred;
+            continue;
+        }
+        switch (fitRecord(work.builder, n, key.size(), len, byteCap, hardCap)) {
+            case Fit::Ok: break;
+            case Fit::Full: full = true; carryWanted_ = true; continue;
+            case Fit::Oversized: ++stats_.oversizedDeferred; ++stats_.carryDeferred; continue;
+        }
+        work.builder.append(std::string_view(reinterpret_cast<const char*>(key.data()), key.size()),
+                            std::string_view(reinterpret_cast<const char*>(work.valueTmp.data()), len), /*timestamp=*/0,
+                            rec::withLeaseOp(0, rec::LeaseOp::Put));   // intent 0: a Carry
+        work.rids[n++] = rid;
+    }
+    if (n == 0) return total;
+    work.builder.buildInto(work.batch);
+    const int64_t base = appendBatch(replica, std::span<const uint8_t>(work.batch.data(), work.batch.size()), stats_, "carry");
+    if (base >= 0) {
+        // The gate of every carried key closes until its Carry is judged: the next pass cannot carry it twice, and an Expire or a
+        // Checkpoint never re-encodes the row before the Carry folds.
+        for (uint32_t i = 0; i < n; ++i) setLeaseLastAppended(*ref.table, work.rids[i], base + static_cast<int64_t>(i));
+        lastBatchBytes_ = work.batch.size();
+        stats_.carried += n;
+        ++stats_.carryBatches;
+        return total + n;
+    }
+    carryWanted_ = true;   // refused: no event will wake an idle pass, so keep running until a pass appends or finds nothing to do
+    if (base == PartitionReplica::kAppendNotLeader) ++stats_.notLeaderStops;
+    else if (base == PartitionReplica::kAppendMinIsr || base == PartitionReplica::kAppendBackPressure) stats_.carryBacklog += n;
+    else if (base != kAppendThrew) {
+        assert(false && "appendLeaseBatch refused a batch the emitter built");
+        ++stats_.encodeFailures;
+    }
+    return total;
+}
+
 
 }  // namespace rune::node::lease

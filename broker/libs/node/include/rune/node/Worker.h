@@ -618,6 +618,14 @@ public:
         if (w == nullptr || w->leaseLineage.leaderEpoch < 0) return std::nullopt;
         return w->leaseLineage;
     }
+    /// Test seam (lease topics Task 30): the live bytes of the partition's anchor list (0: no index / not transient).
+    [[nodiscard]] uint64_t leaseTransientLiveBytesForTest(int32_t topicId, int32_t partition) {
+        const PartitionWriteState* w = writeOf_(findOwnedReplica_(topicId, partition));
+        if (w == nullptr || viewSet_ == nullptr) return 0;
+        const rune::replication::PartitionReplica* r = findOwnedReplica_(topicId, partition);
+        const auto lk = viewSet_->leaseIndexFor(topicId, partition, r->leadershipGeneration(), true, true);
+        return lk.ref.transient != nullptr ? lk.ref.transient->anchors.liveBytes : 0;
+    }
     [[nodiscard]] uint64_t leaseLineageNotesForTest() const noexcept { return leaseLineageNotes_; }
     [[nodiscard]] uint64_t leaseLineageStaleForTest() const noexcept { return leaseLineageStale_; }
     void setLeaseBatchCapForTest(std::size_t bytes) noexcept { leaseBatchCapOverrideForTest_ = bytes; }
@@ -7722,7 +7730,8 @@ private:
             // nothing is emitted while idle, and the first non-idle pass (an event, a due wheel, a clear) checks the epoch before it
             // emits.  The leadership generation is a cheap member read and is still checked here.
             if (w->leaseRuntime && w->leaseEvents.buf.empty() && w->leaseRuntime->leaderGeneration() == gen && leaseParks_->queued() == 0 &&
-                !w->leaseRuntime->hasPendingWork(leaseNowNs))
+                !w->leaseRuntime->hasPendingWork(leaseNowNs) &&
+                !(w->spec->leaseTransient && w->leaseRuntime->fenceNoteChanged(w->leaseLineage, static_cast<int32_t>(replica->epoch()))))   // a new lineage note decides the fence again
                 continue;
             const int32_t topicId   = replica->topicId();
             const int32_t partition = static_cast<int32_t>(replica->partitionId());
@@ -7730,13 +7739,15 @@ private:
             ++leaseDutyLookups_;
             const WorkerViewSet::LeaseIndexLookup lk = viewSet_->leaseIndexFor(topicId, partition, gen, true, hwConfirmed);
             const uint64_t epoch    = viewSet_->leaseRebuildEpoch(topicId, partition);
+            // A transient lease leader holds every anchor and the fence: the ring floor is the index's, and evicts nothing until it is ready.
+            if (w->spec->leaseTransient) pushLeaseFloor_(replica, lk);
             if (w->leaseRuntime && !w->leaseRuntime->sameIdentity(gen, epoch))
                 dropLeaseRuntime_(*w, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
             if (!w->leaseRuntime && lk.ready) {   // cold; the live keys at creation are armed by the promotion pass below, at this time (T_ready)
                 try {
                     if (!leaseEmitWork_) leaseEmitWork_ = std::make_unique<lease::LeaseEmitWork>(kLeaseEmitReserveBytes);
                     w->leaseRuntime = std::make_unique<lease::LeaseRuntime>(gen, epoch, w->spec->lease->maxKeys, leaseNowNs, topicId, partition,
-                                                                            leaseExtendNs_, leasePromotionChunk_);
+                                                                            leaseExtendNs_, leasePromotionChunk_, w->spec->leaseTransient);
                 } catch (const std::bad_alloc&) {
                     // No runtime: nothing is tracked, nothing expires.  A pass with no runtime is never idle-skipped (the skip above requires
                     // `w->leaseRuntime`), so the next pass retries the creation (at a later ready time, which only delays expiry).
@@ -7784,9 +7795,30 @@ private:
                 work += static_cast<int>(checkpointed);
                 noteLeaseAppended_(replica, w->leaseRuntime->lastBatchBytes());
             }
+            if (w->spec->leaseTransient) [[unlikely]] {   // the rebirth fence (A.6), then carry (A.3); a persisted lease topic never runs either (T6)
+                const uint32_t fenced = w->leaseRuntime->fenceStep(w->leaseLineage, static_cast<int32_t>(replica->epoch()), lk.ref, *leaseEmitWork_,
+                                                                    writer, leaseNowNs, lspec.maxTtlMs, *replica);
+                if (fenced != 0) {
+                    work += static_cast<int>(fenced);
+                    noteLeaseAppended_(replica, w->leaseRuntime->lastBatchBytes());
+                }
+                const uint32_t carried = w->leaseRuntime->emitCarries(*leaseEmitWork_, lk.ref, writer, w->judgedThrough, leaseNowNs, cap, hardCap,
+                                                                       lspec.expiryBatch, *replica);
+                if (carried != 0) {
+                    work += static_cast<int>(carried);
+                    noteLeaseAppended_(replica, w->leaseRuntime->lastBatchBytes());
+                }
+                pushLeaseFloor_(replica, lk);   // the appends above moved nothing, but the pass is the floor's refresh point
+            }
         }
         drainLeaseParks_();   // the folds, the clears and the demotions above queued their answers
         return work;
+    }
+
+    /// Transient lease leader (A.3/A.6): the ring's eviction floor is the lease index's (min of the head anchor and the fence record);
+    /// 0 = evict nothing while the index is not ready.  INT64_MAX (nothing anchored) means no lease floor.
+    void pushLeaseFloor_(rune::replication::PartitionReplica* replica, const WorkerViewSet::LeaseIndexLookup& lk) noexcept {
+        replica->setLeaseFloor(lk.ready && lk.ref.transient != nullptr && lk.ref.table != nullptr ? leaseTransientFloor(*lk.ref.table, *lk.ref.transient) : 0);
     }
 
     /// The byte cap of one lease batch: the reserve, narrowed by the namespace's and the intake's batch limits (and the test seam).
@@ -11003,6 +11035,13 @@ private:
                                                                 replica->role() == rune::replication::Role::Leader, hwConfirmed);   // one lookup
                     facts.leaseIndex      = lookup.ref;
                     facts.leaseIndexReady = lookup.ready;
+                }
+                if (ws->spec->leaseTransient) [[unlikely]] {   // the rebirth fence (A.6): grants wait; a persisted lease topic never computes it
+                    const lease::LeaseRuntime* const rt = ws->leaseRuntime.get();
+                    facts.leaseGrantHoldNs = rt != nullptr && replica != nullptr && viewSet_ != nullptr &&
+                                                     rt->sameIdentity(replica->leadershipGeneration(), viewSet_->leaseRebuildEpoch(f.topicId, f.partition))
+                                                 ? rt->grantHoldNs(leaseNow_())
+                                                 : kLeaseRetryAfterNs;
                 }
             }
             lastWriteFacts_ = facts;

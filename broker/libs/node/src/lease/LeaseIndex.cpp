@@ -208,6 +208,24 @@ std::size_t encodeLeaseValue(const uint8_t* row, const rune::view::RowLayout& la
     return total;
 }
 
+std::size_t encodeLeaseFenceValue(const LeaseWriter& writer, uint64_t ttlMs, uint64_t remainingMs, uint8_t* out, std::size_t cap) noexcept {
+    if (writer.descriptor == nullptr) return 0;
+    const std::size_t total = 4u + writer.descriptor->blockLength;
+    if (total > cap || total < 4u + lr::kLeaseSystemBytes) return 0;
+    std::memset(out, 0, total);
+    out[0] = static_cast<uint8_t>(writer.descriptor->blockLength);
+    out[1] = static_cast<uint8_t>(writer.descriptor->blockLength >> 8);
+    out[2] = static_cast<uint8_t>(writer.version);
+    out[3] = static_cast<uint8_t>(writer.version >> 8);
+    const auto putU64 = [out](std::size_t off, uint64_t v) noexcept {
+        for (std::size_t i = 0; i < 8; ++i) out[off + i] = static_cast<uint8_t>(v >> (8 * i));
+    };
+    putU64(lr::kLeaseVersionValueOffset, static_cast<uint64_t>(lr::kLeaseFenceVersion));
+    putU64(lr::kLeaseTtlValueOffset, ttlMs);
+    putU64(lr::kLeaseRemainingValueOffset, remainingMs);
+    return total;
+}
+
 uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion, uint64_t recordRemainingMs,
                     uint64_t liveCount, uint32_t maxKeys) noexcept {
     using rune::protocol::client::ErrorCode;

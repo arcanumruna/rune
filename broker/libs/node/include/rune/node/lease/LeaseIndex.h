@@ -246,6 +246,24 @@ inline void leaseAnchorMoveToTail(rune::view::ViewTable& t, LeaseAnchorList& l, 
 [[nodiscard]] inline int64_t leaseAnchorHead(const rune::view::ViewTable& t, const LeaseAnchorList& l) noexcept {
     return l.head == kLeaseAnchorNil || !detail::hasAnchorAux(t) ? INT64_MAX : detail::auxGet<int64_t>(t, l.head, detail::kAnchorOff);
 }
+/// The next row after `rid` in the anchor list (newer anchors); kLeaseAnchorNil at the tail or when the table has no anchor aux.
+[[nodiscard]] inline uint32_t leaseAnchorNextOf(const rune::view::ViewTable& t, uint32_t rid) noexcept {
+    return detail::hasAnchorAux(t) ? detail::auxGet<uint32_t>(t, rid, detail::kAnchorNextOff) : kLeaseAnchorNil;
+}
+/// The oldest ring offset a transient lease partition must keep (spec A.3/A.6): min(head anchor, fence record).  INT64_MAX = no floor.
+[[nodiscard]] inline int64_t leaseTransientFloor(const rune::view::ViewTable& t, const LeaseTransientState& s) noexcept {
+    const int64_t head = leaseAnchorHead(t, s.anchors);
+    return s.fence.present && s.fence.offset < head ? s.fence.offset : head;
+}
+/// Spec A.3 "When to carry": the ring bytes from the floor to the tail (`used`) exceed half the capacity and at least a quarter of the
+/// capacity is reclaimable (`used - liveBytes`).  cap 0 (no ring) never carries.
+[[nodiscard]] constexpr bool leaseShouldCarry(std::size_t used, uint64_t liveBytes, std::size_t cap) noexcept {
+    return cap != 0 && used > cap / 2 && used >= liveBytes && used - liveBytes >= cap / 4;
+}
+/// The value of a fence record (spec A.6): a Checkpoint value for `writer` whose lease_version is kLeaseFenceVersion (-1), lease_ttl_ms
+/// `ttlMs`, holder 0 and lease_remaining_ms `remainingMs`; user columns zero.  Returns the bytes written, 0 when `cap` is too small,
+/// there is no descriptor or the writer's block cannot hold the system columns.  No allocation.
+[[nodiscard]] std::size_t encodeLeaseFenceValue(const LeaseWriter& writer, uint64_t ttlMs, uint64_t remainingMs, uint8_t* out, std::size_t cap) noexcept;
 
 /// The produce path's non-virtual window on a partition's lease index (WorkerViewSet::leaseIndexOf): the table (rows and the
 /// per-row `lastAppended`), its row layout and the descriptor the layout was built from.  Null `table` = no index.

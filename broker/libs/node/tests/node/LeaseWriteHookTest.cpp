@@ -539,6 +539,49 @@ TEST(LeaseWriteHookRegression, RevokeBehindUpdateThrottledRegression) {
     EXPECT_EQ(r.write(batchOf({revokeOf(1, 5), updateOf(2, -1)}), false).code, IR);
 }
 
+// Lease topics Task 30 (spec A.6): the rebirth fence holds GRANTS only.  A hold > 0 answers a clean grant Throttled with the hold as its
+// retry-after and stores nothing; updates, revokes and a hold of 0 are judged as usual; a definite refusal still wins over the hold.
+TEST(LeaseWriteHookRegression, FenceHoldsGrantsOnlyRegression) {
+    constexpr int64_t kHold = 7'000'000;
+    {
+        Rig r;
+        r.preload(4);
+        r.facts.leaseGrantHoldNs = kHold;
+        const Outcome g = r.write(one(grantOf(1)), false);
+        EXPECT_EQ(g.code, ErrorCode::Throttled);
+        EXPECT_EQ(g.why, H::LeaseFenced);
+        EXPECT_EQ(g.retryAfterNs, kHold);
+        EXPECT_EQ(r.tlog.logEndOffset(), 4) << "nothing stored";
+        // a batch with a grant among updates is held as a whole
+        EXPECT_EQ(r.write(batchOf({updateOf(2, 5), grantOf(1)}), false).code, ErrorCode::Throttled);
+        // a definite refusal wins over the hold (a grant over max_ttl)
+        EXPECT_EQ(r.write(one(grantOf(1, maxTtl() + 1)), false).code, TTL);
+        EXPECT_EQ(r.write(batchOf({grantOf(1), updateOf(2, -1)}), false).code, IR);
+        EXPECT_EQ(r.tlog.logEndOffset(), 4);
+    }
+    {
+        Rig r;
+        r.installV2();
+        r.withIndex();
+        r.preload(4);
+        r.addRow(1, 5);
+        r.facts.leaseGrantHoldNs = kHold;
+        const Outcome u = r.write(one(updateOf(1, 5)), false);
+        EXPECT_EQ(u.code, OKC) << "an update is never held";
+        EXPECT_EQ(u.why, H::None);
+        r.state.judgedThrough = r.tlog.logEndOffset();
+        const Outcome v = r.write(one(revokeOf(1, 5)), false);
+        EXPECT_EQ(v.code, OKC) << "a revoke is never held";
+        EXPECT_EQ(v.why, H::None);
+    }
+    {
+        Rig r;
+        r.preload(4);
+        r.facts.leaseGrantHoldNs = 0;
+        EXPECT_EQ(r.write(one(grantOf(1)), false).code, OKC) << "hold 0: grants are judged as usual";
+    }
+}
+
 TEST(LeaseWriteHookRegression, RevokeWhileIndexNotReadyThrottledRegression) {
     Rig r;
     r.withIndex();

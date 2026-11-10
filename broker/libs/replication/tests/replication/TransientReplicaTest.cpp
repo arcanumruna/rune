@@ -365,6 +365,31 @@ TEST(TransientLeaseFloorRegression, LeaderNeverEvictsAtOrAboveLeaseFloorRegressi
     EXPECT_GT(mem.logStartOffset(), 1);
 }
 
+// Lease topics Task 30: a lease-transient leader evicts nothing until its worker pushes the real floor (a new leader must never evict an
+// anchor before its lease index is ready).  Plain transient partitions keep no lease floor.
+TEST(TransientLeaseFloorRegression, NewLeaderEvictsNothingUntilTheFloorIsPushedRegression) {
+    rune::storage::InMemoryLog mem(8 * 1024, 1000);
+    InMemoryTransport transport;
+    PartitionReplica r1(tcfg(1), Role::Leader, 1, {1}, {1}, &mem, &transport);
+    EXPECT_EQ(r1.leaseFloor(), std::numeric_limits<Offset>::max()) << "plain transient: no lease floor";
+    r1.setLeaseTransient(true);
+    EXPECT_EQ(r1.leaseFloor(), 0) << "arming the lease floors evicts nothing until the worker pushes the real one";
+    r1.setLeaseFloor(std::numeric_limits<Offset>::max());
+    const std::vector<uint8_t> payload(1024, 0x5A);
+    for (int i = 0; i < 3; ++i) ASSERT_GE(r1.append(std::span<const uint8_t>(payload), false), 0);
+    r1.becomeLeader(2, {1});
+    EXPECT_EQ(r1.leaseFloor(), 0) << "a new leadership starts with the floor at 0";
+    int refused = 0;
+    for (int i = 0; i < 64 && refused == 0; ++i)
+        if (r1.append(std::span<const uint8_t>(payload), false) < 0) ++refused;
+    EXPECT_EQ(refused, 1) << "the ring refuses instead of evicting";
+    EXPECT_EQ(mem.logStartOffset(), 0);
+    r1.setLeaseTransient(false);
+    EXPECT_EQ(r1.leaseFloor(), std::numeric_limits<Offset>::max());
+    r1.becomeLeader(3, {1});
+    EXPECT_EQ(r1.leaseFloor(), std::numeric_limits<Offset>::max()) << "a plain transient leader is unchanged";
+}
+
 TEST(TransientLeaseFloorRegression, FollowerKeepsTheLeadersStartRegression) {
     rune::storage::InMemoryLog mem(8 * 1024, 1000);   // holds ~7 of the ~1.1 KiB batches
     InMemoryTransport transport;

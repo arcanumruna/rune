@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <variant>
 #include <vector>
 
 namespace rune::replication { class PartitionReplica; }
@@ -26,6 +27,7 @@ namespace rune::replication { class PartitionReplica; }
 namespace rune::node {
 struct LeaseIndexRef;
 struct LeaseWriter;
+struct LeaseLineageNote;   // WriteState.h (which includes this header)
 }
 
 namespace rune::node::lease {
@@ -60,6 +62,13 @@ struct LeaseRuntimeStats {
     uint64_t checkpointBacklog  = 0;   ///< records of checkpoint batches refused with kAppendMinIsr / kAppendBackPressure (per attempt)
     uint64_t promotionLinked    = 0;   ///< entries the promotion pass linked (Free rows armed at the promotion deadline)
     uint64_t clearExamined      = 0;   ///< flushClears: live ring entries handled (flag set and position current); stale ones are skipped for free
+    // Transient lease topics (spec A.3, A.6).  There is no Prometheus lease exporter yet: these and fenceStateCode() are the metrics.
+    uint64_t carried            = 0;   ///< Carry records appended
+    uint64_t carryBatches       = 0;   ///< successful appends of carry rows
+    uint64_t carryDeferred      = 0;   ///< head rows skipped by a carry pass (gate closed, entry not Armed, not covered, oversized)
+    uint64_t carryBacklog       = 0;   ///< records of carry / fence-carry batches refused with kAppendMinIsr / kAppendBackPressure
+    uint64_t fenceAppended      = 0;   ///< fence records appended (the decision's, the open record, and the fence carry)
+    uint64_t fenceAppendDeferred = 0;  ///< fence appends refused (retried next pass)
 };
 
 /// The outcome of one keepalive entry: parked = no answer now (the park table holds it); else `code` (0 = Ok) and `ttlMs`
@@ -89,10 +98,13 @@ public:
     /// runtime's ready time (promotionDeadline).  `extendNs`: the leader heartbeat timeout (a promoted key's grace, spec 9.7).
     /// `topicId` / `partition` name the partition on the park table's slots.
     /// `promotionChunk`: the row ids one promotion pass walks (the worker passes kLeasePromotionChunk; a test seam lowers it).
+    /// `transient`: a transient lease topic (spec A.3, A.6): the rebirth fence starts at FenceAwait and carries run.  A persisted lease
+    /// topic's runtime starts and stays FenceOpen and never runs fence or carry code (T6).
     LeaseRuntime(uint64_t leaderGen, uint64_t rebuildEpoch, uint32_t maxKeys, int64_t leaseNowNs, int32_t topicId = 0, int32_t partition = 0,
-                 int64_t extendNs = 0, uint32_t promotionChunk = kLeasePromotionChunk)
+                 int64_t extendNs = 0, uint32_t promotionChunk = kLeasePromotionChunk, bool transient = false)
         : gen_(leaderGen), epoch_(rebuildEpoch), timers_(maxKeys, leaseNowNs), readyNs_(leaseNowNs), extendNs_(extendNs),
-          topicId_(topicId), partition_(partition), promoteChunk_(promotionChunk), clearPos_(timers_.capacity(), 0) {}
+          topicId_(topicId), partition_(partition), promoteChunk_(promotionChunk), transient_(transient),
+          fence_(transient ? FenceState{FenceAwait{}} : FenceState{FenceOpen{0}}), clearPos_(timers_.capacity(), 0) {}
     LeaseRuntime(const LeaseRuntime&)            = delete;
     LeaseRuntime& operator=(const LeaseRuntime&) = delete;
 
@@ -104,8 +116,33 @@ public:
     /// keepalive waiting for its clear, or the promotion pass still walking rows (it is not a wheel: it advances every pass until done).
     [[nodiscard]] bool hasPendingWork(int64_t leaseNowNs) const noexcept {
         return timers_.deadline().nextCheckNs() <= leaseNowNs || timers_.checkpoint().nextCheckNs() <= leaseNowNs || clearHead_ != clearTail_ ||
-               !promotionDone();
+               !promotionDone() || fencePending_(leaseNowNs);
     }
+    /// The rebirth fence's states (spec A.6), each holding exactly the fields it needs.
+    struct FenceAwait {};                                    ///< no lineage note for this leadership yet
+    struct FenceDeciding { uint64_t lineage; int64_t appendFrom; uint64_t remainingMs; int64_t thenDeadlineNs; };   ///< appendFrom -1: not appended yet; thenDeadlineNs 0: Open after the fold
+    struct FenceFencing { uint64_t lineage; int64_t deadlineNs; };
+    struct FenceOpen { uint64_t lineage; };
+    using FenceState = std::variant<FenceAwait, FenceDeciding, FenceFencing, FenceOpen>;
+
+    [[nodiscard]] bool transient() const noexcept { return transient_; }
+    [[nodiscard]] const FenceState& fenceState() const noexcept { return fence_; }
+    /// 0 Await, 1 Deciding, 2 Fencing, 3 Open (the gauge).
+    [[nodiscard]] uint8_t fenceStateCode() const noexcept { return static_cast<uint8_t>(fence_.index()); }
+    /// How long (ns) a grant waits before its retry (the Throttled retry-after): 0 = grants are judged as usual (Open, and every persisted
+    /// runtime); Fencing: the time to the deadline rounded up to whole ms, clamped to [1 ms, 1 s]; Await / Deciding: 1 ms.
+    [[nodiscard]] int64_t grantHoldNs(int64_t leaseNowNs) const noexcept {
+        constexpr int64_t kMs = 1'000'000, kMax = 1'000'000'000;
+        if (const auto* f = std::get_if<FenceFencing>(&fence_)) {
+            if (leaseNowNs >= f->deadlineNs) return kMs;   // the open record is due / in flight
+            const int64_t diff = f->deadlineNs - leaseNowNs;
+            const int64_t ms   = diff / kMs + (diff % kMs != 0 ? 1 : 0);
+            return std::min<int64_t>(kMax, std::max<int64_t>(1, ms) * kMs);
+        }
+        return std::holds_alternative<FenceOpen>(fence_) ? 0 : kMs;
+    }
+    /// The idle skip must see a new lineage note: true when the note is for this leadership and names another lineage than the fence's.
+    [[nodiscard]] bool fenceNoteChanged(const LeaseLineageNote& note, int32_t leaderEpoch) const noexcept;
     [[nodiscard]] bool promotionDone() const noexcept { return promoteDone_; }
     [[nodiscard]] uint32_t promoteCursorForTest() const noexcept { return promoteCursor_; }
     /// True once a fold of a PRESENT row (a Granted event, or a row created by a fold) could not grow the entry store (bad_alloc): that row
@@ -189,6 +226,19 @@ public:
     uint32_t emitCheckpoints(LeaseEmitWork& work, const LeaseIndexRef& ref, const LeaseWriter& writer, int64_t judgedThrough, int64_t leaseNowNs,
                              std::size_t byteCap, std::size_t hardCap, const rune::protocol::LeaseSpec& spec, rune::replication::PartitionReplica& replica);
 
+    /// The rebirth fence (spec A.6), once per duty pass on a transient runtime, after emitCheckpoints.  `note` is the partition's lineage note
+    /// (TransientLineage op), `leaderEpoch` the replica's epoch: a note of another epoch is no note for this leadership.  Decides from the
+    /// fence record the fold found (`ref.transient->fence`), appends the fence record the decision table asks for and the open record at the
+    /// deadline, and moves the state when they fold.  Returns the records appended (0 or 1).  Allocates nothing.
+    uint32_t fenceStep(const LeaseLineageNote& note, int32_t leaderEpoch, const LeaseIndexRef& ref, LeaseEmitWork& work, const LeaseWriter& writer,
+                       int64_t leaseNowNs, uint64_t maxTtlMs, rune::replication::PartitionReplica& replica);
+    /// Carry (spec A.3), transient runtimes only, after fenceStep: when the ring bytes from the floor pass the thresholds, re-appends the
+    /// fence record if it is the oldest anchor, then the head rows of the anchor list (as Put intent 0, rows verbatim) whose gate is open,
+    /// at most `maxRecords` rows visited.  Returns the records appended.
+    uint32_t emitCarries(LeaseEmitWork& work, const LeaseIndexRef& ref, const LeaseWriter& writer, int64_t judgedThrough, int64_t leaseNowNs,
+                         std::size_t byteCap, std::size_t hardCap, uint32_t maxRecords, rune::replication::PartitionReplica& replica);
+    [[nodiscard]] int64_t fenceCarryFromForTest() const noexcept { return fenceCarryFrom_; }
+
     [[nodiscard]] const LeaseRuntimeStats& stats() const noexcept { return stats_; }
     [[nodiscard]] LeaseTimers& timersForTest() noexcept { return timers_; }
     [[nodiscard]] const LeaseTimers& timers() const noexcept { return timers_; }
@@ -228,6 +278,21 @@ private:
     /// Cold-grows the entry store to cover `rid`: true = covered; false = past maxKeys (counted) or the growth threw (counted, growFailed).
     [[nodiscard]] bool coverOrCount_(uint32_t rid, bool& growFailed);
 
+    /// Whether the fence or a carry needs a duty pass although no wheel is due and no event arrived.
+    [[nodiscard]] bool fencePending_(int64_t leaseNowNs) const noexcept {
+        if (!transient_) return false;
+        if (fenceCarryFrom_ >= 0 || carryWanted_) return true;
+        if (std::holds_alternative<FenceAwait>(fence_) || std::holds_alternative<FenceDeciding>(fence_)) return true;
+        if (const auto* f = std::get_if<FenceFencing>(&fence_)) return leaseNowNs >= f->deadlineNs;
+        return false;
+    }
+    [[nodiscard]] static uint64_t lineageOf_(const FenceState& s) noexcept;
+    /// Decides the fence from the replayed fence record (the A.6 table); appends nothing.
+    void fenceDecide_(const LeaseFenceState& f, uint64_t lineage, uint32_t generation, uint64_t maxTtlMs) noexcept;
+    /// One fence-shaped record (key = lineage, 8 bytes LE) as its own batch.  The base offset, or the negative refusal code of appendLeaseBatch.
+    [[nodiscard]] int64_t appendFenceRecord_(LeaseEmitWork& work, const LeaseWriter& writer, uint64_t lineage, uint64_t ttlMs, uint64_t remainingMs,
+                                            rune::replication::PartitionReplica& replica);
+
     static constexpr uint32_t kClearRingCap = 2 * kLeaseParkTableEntries;   ///< a power of two; the live entries are flagged rids with parks, <= the park table
     uint64_t         gen_, epoch_;
     LeaseTimers      timers_;
@@ -241,6 +306,12 @@ private:
     uint32_t         promoteCursor_  = 0;
     uint32_t         promoteChunk_   = kLeasePromotionChunk;
     bool             rebuildOwed_    = false;
+    bool             transient_      = false;
+    FenceState       fence_;
+    int64_t          fenceCarryFrom_ = -1;   ///< a fence carry is in flight until the folded fence's offset reaches this (-1: none)
+    bool             carryWanted_    = false;   ///< the last carry pass was refused or skipped rows: run again without waiting for an event
+    bool             carryWarned_    = false;
+    int64_t          carryWarnNs_    = 0;    ///< the lease clock of the last live-bytes warning
     int64_t          ckptWindow_     = -1;   ///< the checkpoint rate window (seconds since readyNs_) ckptUsed_ counts
     uint32_t         ckptUsed_       = 0;
     uint32_t         clearMask_ = kClearRingCap - 1;   ///< the ring's capacity - 1 (a test seam lowers it)

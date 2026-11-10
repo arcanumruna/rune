@@ -1409,7 +1409,9 @@ public:
         if (!memoryBacked_ || memLog_ == nullptr) return;
         leaseTransient_ = on;
         leaseReserveBytes_ = on ? std::max<std::size_t>(memLog_->capacityBytes() / 8, 64U * 1024U) : 0;
-        if (!on) leaseFloor_ = kNoLeaseFloor;
+        // A lease-transient leader evicts nothing until its worker's first duty pass pushes the real floor (a new leader must never
+        // evict an anchor before its lease index is ready); a plain transient partition has no lease floor.
+        leaseFloor_ = on ? Offset{0} : kNoLeaseFloor;
         refreshTransientEvictionFloor_();
     }
     [[nodiscard]] bool leaseTransient() const noexcept { return leaseTransient_; }

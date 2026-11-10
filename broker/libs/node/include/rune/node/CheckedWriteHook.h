@@ -71,6 +71,9 @@ struct WriteFacts {
     LeaseIndexRef  leaseIndex;                ///< the partition's lease index (null table: none)
     bool    leaseIndexReady    = false;       ///< that index reflects every judged record of this leadership (leaseIndexReady)
     LeaseHookWork* leaseWork   = nullptr;     ///< the worker's lease work area (required for a lease topic)
+    /// A transient lease topic's rebirth fence (spec A.6): > 0 = a grant is answered Throttled with this retry-after (ns); 0 = grants are
+    /// judged as usual.  Updates, revokes and keepalives are never held.  A persisted lease topic never sets it.
+    int64_t leaseGrantHoldNs   = 0;
 };
 
 /// Whether a verdict view of this kind provides the key index (member 0 of a logged set): a lease index is a key index
@@ -130,7 +133,7 @@ enum class HookRefusal : uint8_t {
     AutoIncExhausted, AutoIncWindowFull, AutoIncActivating,
     LeaseSessionUnannounced, LeaseUpdateThenRevoke, LeaseRevokeIndexNotReady, LeaseRevokeBehindUpdate, LeaseRevokeBatchTooLarge,
     LeaseClientVersion, LeaseNeedsView, LeaseInTxn, LeaseBatchTooLarge, LeaseBadRecord, LeaseTtlTooLarge, LeaseViewMemOver,
-    LeaseMaxLeases,
+    LeaseMaxLeases, LeaseFenced,
     Count_
 };
 
