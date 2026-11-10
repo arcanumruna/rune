@@ -40,7 +40,7 @@
 //   rp-restart     --users <a>-<b>: the account_stats row of each user, then a 13th create.  Tag rp-restart.
 //   rp-lifecycle   --users <a>-<b>: removeExisting one character, count, reuse its name for another user, removeExisting again.
 //   rp-verify      a subscription from 0 on user and character holds no offset a write was refused at.
-//   rp-compact     accepted updates on user and character until both leaders report rejectedNotCompacted 0.
+//   rp-compact     1,600 accepted updates on user and character, sealing the segments of the refused records.
 //
 // The transaction legs (Part 11) run against the golden script's `character` topic and a `ledger` topic {entryId key, account, amount,
 // memo} with the view `balances` (balance >= 0).  Each transaction writes two characters and two ledger entries of 1 through a
@@ -1037,9 +1037,6 @@ int runRpCompact() {
     if (login == nullptr || chosen == nullptr) { fail("CHECKED-WRITES-RP-COMPACT", "the result files hold no accepted login or character"); return 1; }
     Client c(makeConfig());
     c.connectAndWait();
-    const auto state = latestCatalog(c);
-    const int32_t userTopic      = state.topicByName(rune::catalog::kDefaultNsId, "user")->topicId;
-    const int32_t characterTopic = state.topicByName(rune::catalog::kDefaultNsId, "character")->topicId;
     RpWriter w(c);
     RpUser u;
     u.userId   = login->id;
@@ -1050,18 +1047,11 @@ int runRpCompact() {
     ch.userId      = chosen->key;
     ch.gender      = 1;
     std::snprintf(ch.name.data(), ch.name.size(), "%s", chosen->name.c_str());
-    const auto clean = [&](int32_t topic) {
-        const StatsResult r = c.getStatsAndWait(rune::protocol::client::StatsScope::TopicPartition, topic, 0, 10s);
-        return r.status == StatsResult::kOk && r.get(rune::protocol::client::StatId::rejectedNotCompacted) == std::optional<int64_t>(0);
-    };
+    // 1,600 rewrites per topic seal the 64 KiB segments that hold the refused records.  The writes stop before the script asks the
+    // leaders (only a leader compacts) for rejectedNotCompacted: the cleaner makes no headway while the log is being written.
     const auto wait = std::chrono::seconds(kWriteWaitS);
-    const auto deadline = Clock::now() + std::chrono::seconds(envInt("KI_E2E_RP_COMPACT_S", 300));
-    while (!(clean(userTopic) && clean(characterTopic))) {
-        if (Clock::now() >= deadline) { fail("CHECKED-WRITES-RP-COMPACT", "rejectedNotCompacted never reached 0 on both topics"); return 1; }
-        for (int i = 0; i < 64; ++i) {   // accepted rewrites of one key each: the segments seal and the cleaner has something to compact
-            if (!w.users.updateAndWait(u, wait).ok() || !w.characters.updateAndWait(ch, wait).ok()) { fail("CHECKED-WRITES-RP-COMPACT", "an accepted update was refused"); return 1; }
-        }
-    }
+    for (int i = 0; i < 1600; ++i)
+        if (!w.users.updateAndWait(u, wait).ok() || !w.characters.updateAndWait(ch, wait).ok()) { fail("CHECKED-WRITES-RP-COMPACT", "an accepted update was refused"); return 1; }
     std::printf("CHECKED-WRITES-RP-COMPACT: OK\n");
     std::fflush(stdout);
     return 0;
