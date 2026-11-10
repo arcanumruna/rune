@@ -413,7 +413,11 @@ int runRefusals() {
     expectRefused(c.defineTopicAndWait("ki_transient", 1, "id", blob, Persistence::Transient, to, {}, 60s), "transient", "key.index needs a persisted topic");
     expectRefused(c.defineTopicAndWait("ki_untyped", 1, "", std::span<const uint8_t>{}, Persistence::Disk, to, {}, 60s), "untyped", "key.index needs a typed topic");
     expectRefused(c.defineTopicAndWait("ki_keyless", 1, "", rune::codec::serialize(keyless), Persistence::Disk, to, {}, 60s), "keyless", "key.index needs a key");
-    expectRefused(c.defineTopicAndWait("ki_wide", 1, "k", rune::codec::serialize(wide), Persistence::Disk, to, {}, 60s), "string(9) key", "key.index needs a key of at most 8 bytes");
+    // Part 07 lifted SD8 (the key index takes wire keys up to 16 bytes): a string(9) key is accepted now.
+    if (const auto r = c.defineTopicAndWait("ki_wide", 1, "k", rune::codec::serialize(wide), Persistence::Disk, to, {}, 60s); r.errorCode != 0) {
+        ++bad;
+        fail("CHECKED-WRITES-REFUSALS", "string(9) key: error " + std::to_string(r.errorCode) + " '" + r.detail + "', want 0 (key.index takes keys up to 16 bytes)");
+    }
     if (bad != 0) return 1;
     std::printf("CHECKED-WRITES-REFUSALS: OK\n");
     std::fflush(stdout);
