@@ -191,13 +191,13 @@ public:
         const int lead = now[0];
         ASSERT_NE(lead, old);
         ASSERT_TRUE(await(lead, [](const Seen& s) { return s.activated; })) << "the new leader never activated its judge";
-        std::this_thread::sleep_for(1s);   // a stale set is logged within a few judge passes
+        std::this_thread::sleep_for(300ms);   // a stale set is logged within a few 20 ms judge passes
         const Seen held = seen(lead);
         EXPECT_EQ(held.changes, 2u) << "the new leader logged a change over the newer DDL change (#788)";
         EXPECT_EQ(held.members, logged.members);
         EXPECT_EQ(held.firstFingerprint, logged.firstFingerprint);
         applyDdl(lead, shape, kAhead);   // its catalog and plans catch up
-        std::this_thread::sleep_for(1s);
+        std::this_thread::sleep_for(300ms);
         const Seen after = seen(lead);
         EXPECT_EQ(after.changes, 2u) << "the caught-up leader changed the set again";
         EXPECT_FALSE(after.waitingForInstall) << "the judge still waits for a plan the leader installed";
