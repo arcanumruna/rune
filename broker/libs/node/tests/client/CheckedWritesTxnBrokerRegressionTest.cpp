@@ -850,13 +850,15 @@ struct Cluster {
     /// Makes the controller resign until it is not `node`; ctl is the new one.
     void moveControllerOff(int node) {
         for (int tries = 0; ctl == node && tries < 10; ++tries) {
-            if (!c.node(ctl).resignConsensusForTest()) continue;
             const int old = ctl;
-            waitFor([&] {
+            const auto moved = [&] {
                 for (BrokerNode* n : c.live())
                     if (n->isLeader() && n->nodeIdForTest() != old) { ctl = n->nodeIdForTest(); return true; }
                 return false;
-            }, 5s);
+            };
+            // A resign is refused until a follower caught up (under load, for a while): retry it until it is taken or the lead moved.
+            if (!waitFor([&] { return moved() || c.node(old).resignConsensusForTest(); }, 5s)) continue;
+            waitFor(moved, 5s);
         }
     }
     int32_t leaderOf(int32_t topic) {

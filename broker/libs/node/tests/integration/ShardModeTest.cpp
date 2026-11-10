@@ -2219,8 +2219,7 @@ void runHeldDirectClientRecoveringAfterTheLeaseIsNotReapedOnRelease(bool fast) {
             ASSERT_TRUE(a.produce(direct, kClientStream, sidA, c0 + sent, 0, 0, /*acks=*/0, batch));
             ++sent;
         }
-        int spins = 0;
-        while (leo() < leo0 + sent) ASSERT_LT(++spins, 100'000) << "frame " << sent << " never appended";
+        ASSERT_TRUE(awaitBrokerState([&] { return leo() >= leo0 + sent; }, 10s)) << "frame " << sent << " never appended";
     }
     ASSERT_LT(sent, 200'000);
     ASSERT_TRUE(awaitBrokerState([&] { return onGw([&](auto& g) { return g.sessionHeldForTest(sidA); }); }, 10s))
