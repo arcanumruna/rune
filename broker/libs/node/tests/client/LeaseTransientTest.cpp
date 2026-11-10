@@ -11,6 +11,7 @@
 #include <rune/client/lease/LeaseWatch.h>
 #include <rune/consensus/LeaseClock.h>
 #include <rune/node/Worker.h>
+#include <rune/protocol/LeaseRecord.h>
 #include <rune/protocol/client/Protocol.h>
 
 #include <gtest/gtest.h>
@@ -535,6 +536,77 @@ TEST(LeaseTransientBrokerRegression, FencedGrantAnswersThrottledAtOnceRegression
     EXPECT_EQ(log.granted["k-fenced"], 1) << "the watch saw exactly one Granted";
     EXPECT_EQ(log.live["k-fenced"], g2.version);
     EXPECT_EQ(log.bad, 0);
+}
+
+// F10: a client cannot forge the broker's own record shapes on a transient lease topic.  (a) a Put with intent 0 (Upsert) has the shape of a
+// Carry (the broker re-appends a live lease with its original version), (b) a Checkpoint with version -1 and an 8-byte key has the shape of
+// the rebirth fence record.  Both go over the wire through the lease producer's raw send (the LeaseTopic API only builds grants, updates and
+// revokes) with the fence open, and the hook refuses them (InvalidRequest): the ring end and the ScanLeases result do not move.
+// Mutation: the hook accepts a Put with intent 0 / a client Checkpoint -> the record is appended and the ring end moves, red.
+TEST(LeaseTransientBrokerRegression, ClientCannotForgeCarryOrFenceRegression) {
+    LeaseBrokerRig rig("lease-tr-forge", 60'000, 1000, 60'000, [](rune::node::NodeConfig& c) { c.memoryLogRingBytes = kRingBytes; });
+    const auto d = defineTransientLease(rig, "tr");
+    ASSERT_EQ(d.errorCode, 0) << d.detail;
+    rc::Client& c = rig.ua();
+    auto lt = c.openLeaseTopicAndWait<LeaseClaim>("tr", {}, 30s);
+    rc::LeaseOptions o;
+    o.ttlMs = 60'000;
+    const rc::LeaseResult g = grantRetrying(lt, rig.row("k-live", 1), o);   // waits the generation-0 fence open
+    ASSERT_TRUE(g.ok()) << int(g.status) << " " << g.errorCode;
+    RingSnap before = ringOf(rig, lt.topicId());
+    ASSERT_TRUE(before.has);
+    ASSERT_EQ(before.fence, 3) << "the fence is open";
+    const auto scanBefore = scanAll(c, lt);
+    ASSERT_EQ(scanBefore.size(), 1u);
+
+    rc::ProducerConfig pc;
+    pc.acks              = rc::Acks::All | rc::Acks::View;
+    pc.lingerUs          = 100;
+    pc.leaseWrites       = true;
+    pc.produceTimeoutMs  = 20'000;
+    pc.deliveryTimeoutMs = 20'000;
+    rc::Producer prod = c.producer(pc);
+    rc::CompletionsConfig qc;
+    qc.maxResultBytes = 1u << 10;
+    qc.capacityBytes  = 1u << 16;
+    rc::Completions q(c, qc);
+
+    // A lease value as the client builds one: [u16 blockLength][u16 version] then the system columns (version, ttl, holder, remaining).
+    const auto value = [](int64_t version) {
+        std::vector<uint8_t> v(256, 0);
+        v[0] = 0xFC; v[1] = 0; v[2] = 1; v[3] = 0;
+        for (int i = 0; i < 8; ++i) {
+            v[rune::protocol::record::kLeaseVersionValueOffset + std::size_t(i)] = uint8_t(uint64_t(version) >> (8 * i));
+            v[rune::protocol::record::kLeaseTtlValueOffset + std::size_t(i)]     = uint8_t(uint64_t(60'000) >> (8 * i));
+        }
+        return v;
+    };
+    struct Forged { const char* name; rc::WriteIntent intent; rune::protocol::record::LeaseOp op; int64_t version; };
+    const Forged forged[] = {
+        {"Put intent 0 (the Carry shape)", rc::WriteIntent::Upsert, rune::protocol::record::LeaseOp::Put, 5},
+        {"Checkpoint version -1, 8-byte key (the fence shape)", rc::WriteIntent::Upsert, rune::protocol::record::LeaseOp::Checkpoint, -1},
+        {"Checkpoint version -1, intent Existing", rc::WriteIntent::Update, rune::protocol::record::LeaseOp::Checkpoint, -1},
+    };
+    const uint8_t key8[8] = {'k', '-', 'l', 'i', 'v', 'e', 0, 0};
+    rc::Token token = 1;
+    for (const Forged& f : forged) {
+        SCOPED_TRACE(f.name);
+        const auto v = value(f.version);
+        ASSERT_EQ(prod.trySendLease(lt.topicId(), 0, std::span<const uint8_t>(key8, 8), std::span<const uint8_t>(v.data(), v.size()), f.intent,
+                                    static_cast<uint8_t>(f.op), rc::OpKind::LeaseUpdate, q, token),
+                  rc::SendResult::Ok);
+        rc::Completion cc{};
+        bool           got = false;
+        (void)q.waitFor(token, 30s, [&](const rc::Completion& comp, std::span<const uint8_t>) { cc = comp; got = true; });
+        ASSERT_TRUE(got) << "no completion within the cap";
+        EXPECT_NE(cc.status, rc::OpStatus::Ok);
+        EXPECT_EQ(cc.errorCode, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest));
+        ++token;
+        const RingSnap after = ringOf(rig, lt.topicId());
+        EXPECT_EQ(after.end, before.end) << "a refused forgery appends nothing";
+        EXPECT_EQ(after.fence, 3);
+    }
+    EXPECT_EQ(scanAll(c, lt), scanBefore) << "ScanLeases unchanged";
 }
 
 // ================================================================================================ 3-NODE

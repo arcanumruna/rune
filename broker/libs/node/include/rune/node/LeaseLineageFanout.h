@@ -13,8 +13,8 @@
 // (the worker executes its op ring in order).  A full ring, an untrusted lineage and held role ops are retried on the
 // next pass; nothing is lost.
 //
-// Control thread only.  The posted table grows with the led transient lease partitions only (control plane, cold: one
-// entry per partition, one op per leadership).
+// Control thread only.  The posted table holds the led transient lease partitions only (control plane, cold: one entry per
+// partition, one op per leadership; a partition no longer led is swept out on the next pass).
 #include <cstdint>
 #include <unordered_map>
 
@@ -34,23 +34,31 @@ public:
              Enqueue&& enqueue) {
         if (!changed && !retry_) return 0;
         retry_ = false;
+        ++pass_;
         int posted = 0;
         forEachLed([&](int32_t topicId, int32_t partition, int32_t epoch) {
+            const int64_t key = (static_cast<int64_t>(topicId) << 32) | static_cast<uint32_t>(partition);
+            const auto it = posted_.find(key);
+            if (it != posted_.end()) it->second.seenPass = pass_;   // still led: kept by the sweep below
             const rune::metadata::TransientLineage* rec = trusted(topicId, partition);
             if (rec == nullptr) { retry_ = true; return; }
-            const int64_t key = (static_cast<int64_t>(topicId) << 32) | static_cast<uint32_t>(partition);
-            if (const auto it = posted_.find(key);
-                it != posted_.end() && it->second.epoch == epoch && it->second.lineage == rec->lineage)
-                return;
+            if (it != posted_.end() && it->second.epoch == epoch && it->second.lineage == rec->lineage) return;
             const int32_t w = workerOf(topicId, partition);
             if (pendingFor(w)) { retry_ = true; ++held_; return; }
             if (!enqueue(w, topicId, partition, epoch, rec->lineage, rec->generation)) { retry_ = true; return; }
-            posted_[key] = Posted{epoch, rec->lineage};
+            posted_[key] = Posted{epoch, rec->lineage, pass_};
             ++posted;
             ++postedTotal_;
         });
+        // A partition no longer led here (leadership moved, topic dropped) leaves the table: it never grows past the led partitions.
+        for (auto it = posted_.begin(); it != posted_.end();) {
+            if (it->second.seenPass != pass_) it = posted_.erase(it);
+            else ++it;
+        }
         return posted;
     }
+
+    [[nodiscard]] std::size_t trackedForTest() const noexcept { return posted_.size(); }
 
     [[nodiscard]] uint64_t postedForTest() const noexcept { return postedTotal_; }
     /// Times a post waited because role ops for the worker were still pending.
@@ -59,9 +67,10 @@ public:
     [[nodiscard]] bool retryingForTest() const noexcept { return retry_; }
 
 private:
-    struct Posted { int32_t epoch; uint64_t lineage; };
+    struct Posted { int32_t epoch; uint64_t lineage; uint64_t seenPass; };
     std::unordered_map<int64_t, Posted> posted_;   // key = (topicId << 32) | partition
     bool     retry_       = false;
+    uint64_t pass_        = 0;
     uint64_t postedTotal_ = 0;
     uint64_t held_        = 0;
 };

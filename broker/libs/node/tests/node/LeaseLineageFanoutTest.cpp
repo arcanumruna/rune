@@ -105,3 +105,33 @@ TEST(LeaseLineageFanoutRegression, NoScanWhenUnchangedRegression) {
     EXPECT_EQ(r.step(false), 0);
     EXPECT_EQ(r.scans, scans) << "nothing changed and nothing to retry: the map is not walked";
 }
+
+TEST(LeaseLineageFanoutRegression, SweepsUnledPartitionsRegression) {
+    Rig r;
+    r.led = {{1, 0, 3}, {1, 1, 3}};
+    EXPECT_EQ(r.step(true), 2);
+    EXPECT_EQ(r.fan.trackedForTest(), 2u);
+    r.led = {{1, 0, 3}};   // p1 is no longer led here
+    EXPECT_EQ(r.step(true), 0) << "p0 is not re-posted";
+    EXPECT_EQ(r.fan.trackedForTest(), 1u);
+    r.led = {{1, 0, 3}, {1, 1, 3}};   // p1 led again; its entry was swept, so it is posted again
+    EXPECT_EQ(r.step(true), 1);
+    EXPECT_EQ(r.sent.back().p, 1);
+    EXPECT_EQ(r.fan.trackedForTest(), 2u);
+    r.led = {{1, 0, 3}, {1, 1, 4}};   // p1 at a NEW epoch: posted once
+    EXPECT_EQ(r.step(true), 1);
+    EXPECT_EQ(r.sent.back().epoch, 4);
+    EXPECT_EQ(r.step(true), 0);
+    EXPECT_EQ(r.fan.trackedForTest(), 2u);
+}
+
+TEST(LeaseLineageFanoutRegression, UntrustedLineageKeepsPartitionTrackedRegression) {
+    Rig r;
+    EXPECT_EQ(r.step(true), 1);
+    EXPECT_EQ(r.fan.trackedForTest(), 1u);
+    r.trustedNow = false;   // p0 is still led but its lineage is untrusted this pass
+    EXPECT_EQ(r.step(true), 0);
+    EXPECT_EQ(r.fan.trackedForTest(), 1u) << "a still-led partition is never swept";
+    r.trustedNow = true;
+    EXPECT_EQ(r.step(true), 0) << "same (epoch, lineage): not re-posted after the untrusted pass";
+}

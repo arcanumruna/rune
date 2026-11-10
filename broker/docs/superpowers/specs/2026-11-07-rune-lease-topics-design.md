@@ -2170,7 +2170,7 @@ full restart, and fencing by version does not hold across a full restart. Plan p
   - `AwaitLineage`: a new leadership before its `TransientLineage` op arrives. Grants are answered `Throttled` (53)
     with a 1 ms retry-after.
   - `Deciding{record offset}`: the leader appended a fence record and waits for it to fold. Grants: `Throttled`.
-  - `Fencing{deadline}`: grants are answered `Throttled` with a retry-after of `min(deadline − now, 1 s)`.
+  - `Fencing{deadline}`: grants are answered `Throttled` with a retry-after of `deadline − now` (whole ms, at least 1 ms).
     Updates, revokes and keepalives of rows that exist are served normally.
   - `Open`: grants are judged as usual.
 - **The decision (on the lineage op), from the fence record replay found for this partition:**
@@ -2192,8 +2192,9 @@ full restart, and fencing by version does not hold across a full restart. Plan p
 - **Why the generation is needed.** Without it a leader cannot tell a brand-new partition (no fence needed) from a
   reborn one: both have an empty ring. With it, only generation 0 opens at once.
 - **Cost, stated plainly.** After a full restart or an unclean election, no grant succeeds for `max_ttl` plus the
-  leader heartbeat timeout. The client library resends a `Throttled` grant within the caller's deadline (§12), so a
-  `LeaseSession` grant either succeeds after the wait or times out.
+  leader heartbeat timeout. The client library resends a `Throttled` grant only when the retry-after falls inside the
+  caller's deadline (§12); otherwise the grant fails at once with `Throttled` (definitely not stored), so it never holds
+  the partition's later writes behind it and never lands after the caller was told it failed.
 
 ### A.7 Watchers and holders (T5)
 

@@ -122,6 +122,7 @@ public:
     static constexpr int32_t kLeaseView = 7;   ///< the lease view's sink id the rig's write spec names (the catalog's, as in production)
     static constexpr int kMaxPass = 4000;
     static constexpr int kMaxFlushWait = 1'000'000;   ///< compact(): passes to wait for an in-flight async flush (a hang guard)
+    bool leaseTransient = false;   ///< the write spec of a lease topic created from now on is a transient one (flags bit 4)
     bool pauseAgent = false;   ///< pass() skips the IO agent: a discard frame stays unacked (CheckpointDiscardPending)
     ViewBackupPolicy backupPolicy{};   ///< the agent's view-backup policy (set before the first persisted install)
     /// The view checkpoint directory (the committed files, and backup/ under it).
@@ -438,6 +439,7 @@ private:
         TopicWriteSpecWire w;
         w.topicId = kSrc; w.keyFieldId = keyFieldId_; w.lease = lease_; w.keyType = keyShape_.type; w.legacyValidate = false; w.keyIndex = keyIndex;
         if (lease_) w.leaseViewTopicId = kLeaseView;
+        w.leaseTransient = lease_.has_value() && leaseTransient;
         w.keyWidth = static_cast<uint8_t>(keyWidthOf(keyShape_));
         if (autoInc_) {
             w.autoIncrement = true; w.partitioner = rune::protocol::Partitioner::Modulo;

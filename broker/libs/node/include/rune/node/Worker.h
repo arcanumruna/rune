@@ -628,6 +628,7 @@ public:
     }
     [[nodiscard]] uint64_t leaseLineageNotesForTest() const noexcept { return leaseLineageNotes_; }
     [[nodiscard]] uint64_t leaseLineageStaleForTest() const noexcept { return leaseLineageStale_; }
+    [[nodiscard]] uint64_t leaseLineageParkedForTest() const noexcept { return leaseLineageParked_; }
     void setLeaseBatchCapForTest(std::size_t bytes) noexcept { leaseBatchCapOverrideForTest_ = bytes; }
     /// Test seam (Task 12): the promotion pass's chunk (row ids per pass) of runtimes created afterwards; 0 keeps every entry Free.
     void setLeasePromotionChunkForTest(uint32_t chunk) noexcept { leasePromotionChunk_ = chunk; }
@@ -2991,16 +2992,35 @@ private:
         }
     }
 
-    // Lease topics Task 27 (spec A.6): keep the note of the highest leader epoch.  Cold (once per leadership).  Nothing reads the
-    // note yet (Task 30, the rebirth fence).
+    // Lease topics Task 27 (spec A.6): keep the note of the highest leader epoch (the rebirth fence reads it).  Cold (once per leadership).
+    // The control thread posts each (leader epoch, lineage) ONCE (LeaseLineageFanout), so a note that finds no owned write state yet
+    // (ownership or the write spec not adopted on this worker) is never dropped: it is kept per partition (the highest epoch wins) and
+    // adopted by leaseDuty_ once the write state exists - otherwise the fence would wait in Await until the next leader change.
     [[gnu::cold]] void executeTransientLineage_(sbe::WorkerOp& op) {
-        PartitionWriteState* w = writeOf_(findOwnedReplica_(op.topicId(), op.partition()));
-        if (w == nullptr) return;   // not owned here (any more)
-        ++leaseLineageNotes_;
         const auto epoch = static_cast<int32_t>(op.nextOffset());
-        if (epoch < w->leaseLineage.leaderEpoch) { ++leaseLineageStale_; return; }
-        w->leaseLineage = LeaseLineageNote{epoch, static_cast<uint64_t>(op.correlationId()),
-                                           static_cast<uint32_t>(op.hwBound())};
+        const LeaseLineageNote note{epoch, static_cast<uint64_t>(op.correlationId()), static_cast<uint32_t>(op.hwBound())};
+        PartitionWriteState* w = writeOf_(findOwnedReplica_(op.topicId(), op.partition()));
+        if (w == nullptr) {
+            ++leaseLineageParked_;
+            const int64_t key = (static_cast<int64_t>(op.topicId()) << 32) | static_cast<uint32_t>(op.partition());
+            auto [it, fresh] = pendingLineage_.try_emplace(key, note);
+            if (!fresh && it->second.leaderEpoch <= epoch) it->second = note;
+            return;
+        }
+        applyLineageNote_(*w, note);
+    }
+    void applyLineageNote_(PartitionWriteState& w, const LeaseLineageNote& note) noexcept {
+        ++leaseLineageNotes_;
+        if (note.leaderEpoch < w.leaseLineage.leaderEpoch) { ++leaseLineageStale_; return; }
+        w.leaseLineage = note;
+    }
+    // leaseDuty_ (cold: only while a parked note exists): adopt the parked note of (topicId, partition) into its write state.
+    [[gnu::cold]] [[gnu::noinline]] void adoptParkedLineage_(PartitionWriteState& w, int32_t topicId, int32_t partition) {
+        const int64_t key = (static_cast<int64_t>(topicId) << 32) | static_cast<uint32_t>(partition);
+        const auto it = pendingLineage_.find(key);
+        if (it == pendingLineage_.end()) return;
+        applyLineageNote_(w, it->second);
+        pendingLineage_.erase(it);
     }
 
     // Issues #109 / #196: an enforcement fence was reached on one of this worker's rings - every op queued before it
@@ -7415,6 +7435,8 @@ private:
     uint64_t    opsRefusedNotOwned_ = 0;
     uint64_t    leaseLineageNotes_  = 0;   // Task 27: TransientLineage ops applied to an owned partition
     uint64_t    leaseLineageStale_  = 0;   // ... of those, older than the held note's epoch (ignored)
+    uint64_t    leaseLineageParked_ = 0;   // TransientLineage ops that found no owned write state yet (kept in pendingLineage_)
+    std::unordered_map<int64_t, LeaseLineageNote> pendingLineage_;   // (topicId << 32 | partition) -> the parked note (cold, tiny)
     uint64_t    ownershipAcks_      = 0;
     uint64_t    followerSideOps_    = 0;   // OLE responses + reconcile requests executed here
     static constexpr bool gatedByOwnership_(WorkerOp::Type t) noexcept {
@@ -7840,6 +7862,8 @@ private:
                 w->leaseEvents.buf.clear();
                 continue;
             }
+            if (!pendingLineage_.empty() && w->spec->leaseTransient) [[unlikely]]
+                adoptParkedLineage_(*w, replica->topicId(), static_cast<int32_t>(replica->partitionId()));
             const uint64_t gen = replica->leadershipGeneration();
             // Idle skip (F8): a runtime of this leadership with no event to fold, no wheel due, no clear owed, no promotion walk left and no
             // parked answer queued has nothing to do, so the pass costs no index lookup.  Skipping the rebuild-epoch check while idle is safe:

@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include "AllocWindow.h"
+#include "LeaseRig.h"
 
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Evolve.h>
@@ -784,4 +785,45 @@ TEST(LeaseCarryAllocRegression, ZeroAllocRegression) {
     }
     EXPECT_GT(carried, 0u) << "the passes did real carry work";
     EXPECT_EQ(allocs, 0u);
+}
+
+// ═══ Worker level: a lineage note that arrives before the worker owns the partition's write state ═══
+
+// The control thread posts each (leader epoch, lineage) ONCE.  A note that meets no write state yet (the write spec not installed on the
+// worker) is parked and adopted once the write state exists; otherwise the fence would wait in Await until the next leader change.
+// Mutation: executeTransientLineage_ returns without storing in the no-write-state branch -> the note stays nullopt and the fence stays Await.
+TEST(LeaseLineageRegression, NoteBeforeOwnershipIsAdoptedRegression) {
+    int64_t leaseNow = 1'000'000'000;
+    ltr::VerdictRig r;
+    r.worker->setLeaseClockForTest(&leaseNow);
+    r.leaseTransient = true;
+    ASSERT_EQ(r.worker->leaseLineageParkedForTest(), 0u);
+    // The note first: the replica is owned, but no write spec (hence no write state) has been installed.
+    WorkerOp note;
+    note.type = WorkerOp::Type::TransientLineage; note.topicId = ltr::VerdictRig::kSrc; note.partition = 0;
+    note.nextOffset = r.replica->epoch(); note.correlationId = static_cast<int64_t>(kL1); note.hwBound = 0;
+    r.send(std::move(note));
+    EXPECT_EQ(r.worker->leaseLineageParkedForTest(), 1u);
+    EXPECT_FALSE(r.worker->leaseLineageForTest(ltr::VerdictRig::kSrc, 0).has_value());
+    EXPECT_EQ(r.worker->leaseRuntimeForTest(ltr::VerdictRig::kSrc, 0), nullptr);
+    // The write spec (transient lease) arrives; the lease duty adopts the parked note.
+    rune::protocol::LeaseSpec ls;
+    ls.maxKeys = 1000;
+    ls.maxTtlMs = kMaxTtl;
+    r.createLeaseTopicSpec(ls);
+    WorkerOp level;
+    level.type = WorkerOp::Type::ClusterFeatureLevel; level.nextOffset = rune::replication::MetadataFeature::kLeases;
+    r.send(std::move(level));
+    int passes = 0;
+    for (; passes < ltr::kCap; ++passes) {
+        r.pass();
+        const auto* rt = r.worker->leaseRuntimeForTest(ltr::VerdictRig::kSrc, 0);
+        if (rt != nullptr && rt->fenceStateCode() != kAwait) break;
+    }
+    ASSERT_LT(passes, ltr::kCap) << "the fence never left Await: the parked note was lost";
+    const auto got = r.worker->leaseLineageForTest(ltr::VerdictRig::kSrc, 0);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->leaderEpoch, r.replica->epoch());
+    EXPECT_EQ(got->lineage, kL1);
+    EXPECT_EQ(got->generation, 0u);
 }
