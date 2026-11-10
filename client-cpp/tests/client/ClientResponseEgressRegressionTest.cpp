@@ -7,6 +7,7 @@
 #include <filesystem>
 #include "../support/FreePort.h"
 #include "../support/InvokerGateway.h"
+#include "../support/OwnDriverGateway.h"
 #include "../support/TestCompletions.h"
 
 #include <rune/client/Client.h>
@@ -18,6 +19,7 @@
 #include <chrono>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -64,6 +66,8 @@ struct Options {
     bool tls               = false;   ///< sessions are TLS: the fake serves the test certificate
     int  partitions        = 1;
     bool declaredReachable = false;   ///< the fake's declared egress publication reaches the client (an older broker)
+    bool ownDriver         = false;   ///< the fake broker runs on its own media driver (survives a client transport rebuild)
+    int  connectTimeoutMs  = 0;       ///< != 0: ClientConfig::connectTimeoutMs
     bool unroutableDeclared() const { return !declaredReachable; }
 };
 
@@ -73,13 +77,22 @@ struct Rig {
     int32_t                      in, eg;
     rc::ClientConfig             c;
     rc::Client                   client;
-    test_support::InvokerGateway gw;
+    std::string                  declaredEgress;
+    std::unique_ptr<test_support::BrokerHost>     host;     // ownDriver: the broker's own driver + gateway
+    std::unique_ptr<test_support::InvokerGateway> plainGw;  // otherwise: the gateway on the client's driver
+    test_support::InvokerGateway&                 gw;
 
     Rig(int32_t inStream, int32_t egStream, const Options& o = {})
         : in(inStream), eg(egStream), c(makeCfg(inStream, egStream, gwPort, gwResp, o)), client(c),
-          gw(c.dataDir + "/aeron", loopback(gwPort), inStream,
-             o.declaredReachable ? c.egressChannel : ("aeron:udp?endpoint=192.0.2.1:" + std::to_string(freePort())),
-             egStream) {
+          declaredEgress(o.declaredReachable ? c.egressChannel : ("aeron:udp?endpoint=192.0.2.1:" + std::to_string(freePort()))),
+          host(o.ownDriver ? std::make_unique<test_support::BrokerHost>(test_support::BrokerHost::uniqueDir(), loopback(gwPort),
+                                                                         inStream, declaredEgress, egStream)
+                           : nullptr),
+          plainGw(o.ownDriver ? nullptr
+                              : std::make_unique<test_support::InvokerGateway>(c.dataDir + "/aeron", loopback(gwPort), inStream,
+                                                                               declaredEgress, egStream)),
+          gw(host ? host->gw : *plainGw) {
+        gw.replyOnAnnouncedEgress = false;
         gw.responseCtl[0]      = "127.0.0.1:" + std::to_string(gwResp);
         gw.issueBindToken      = true;
         gw.uniqueSessionIds    = true;
@@ -104,6 +117,7 @@ struct Rig {
         c.dataDir = std::filesystem::temp_directory_path().string() + "/resp_egress_" + std::to_string(::getpid()) + "_" +
                     std::to_string(g_ctr++);
         c.runnerMode = rc::RunnerMode::Invoker;
+        if (o.connectTimeoutMs != 0) c.connectTimeoutMs = o.connectTimeoutMs;
         if (o.fakeClock) { g_clockFrozen = false; c.nanoClock = &fakeNow; g_clockOffsetNs = 0; }
         if (o.tls) {
             c.offerCrypto = true;
@@ -119,7 +133,7 @@ struct Rig {
 
     // One worker serving `partition`: its ingress endpoint (own stream), response-control port and bind gate.
     struct Worker { int endpoint; uint16_t port; uint16_t resp; int32_t stream; };
-    Worker addWorker(int partition, int32_t stream, bool responseMode = true) {
+    Worker addWorker(int partition, int32_t stream, bool responseMode = true, int32_t leader = 0) {
         Worker w{0, freePort(), freePort(), stream};
         w.endpoint = gw.addEndpoint(loopback(w.port), stream);
         if (responseMode) {
@@ -129,7 +143,7 @@ struct Rig {
         test_support::InvokerGateway::PartitionAd ad;
         ad.topicId             = 1;
         ad.partition           = partition;
-        ad.leaderId            = 0;
+        ad.leaderId            = leader;
         ad.leaderEpoch         = 1;
         ad.ingressStreamId     = stream;
         ad.ingressEndpoint     = "127.0.0.1:" + std::to_string(w.port);
@@ -651,6 +665,93 @@ TEST(ClientResponseEgressRegression, ReconnectBuildsAFreshResponsePairRegression
     EXPECT_NE(r.gw.binds[1].imageSid, r.gw.binds[0].imageSid);
     EXPECT_TRUE(r.gw.binds[1].firstOnImage);
     ASSERT_EQ(r.sendAcked(p, 0, 2), 2) << "produce completes on the fresh pair";
+}
+
+// The Aeron client closes and the transport is rebuilt: the seed and the worker both reconnect on FRESH response pairs
+// (the old pairs died with the old driver), the worker is bound again, and produce completes — the declared egress is
+// unreachable, so the acks came back on the new response path.
+TEST(ClientResponseEgressRegression, ResponseModeSessionsReconnectOnFreshPairsAfterRebuildRegression) {
+    Options o;
+    o.ownDriver        = true;
+    o.fakeClock        = true;
+    Rig r(4260, 4261, o);
+    const auto w = r.addWorker(0, 4262);
+    connectThenFreeze(r);
+    if (::testing::Test::HasFatalFailure()) return;
+    ASSERT_TRUE(r.drive([&] { return r.client.testWorkerBindAcksAccepted() == 1u; }));
+    auto p = r.client.producer(noLinger());
+    ASSERT_EQ(r.sendAcked(p, 0, 2), 2);
+    auto imagesAt = [&](int endpoint) {
+        std::size_t n = 0;
+        for (const auto& [key, frames] : r.gw.framesOnImage) n += key.first == endpoint ? 1 : 0;
+        return n;
+    };
+    const std::size_t gwImages = imagesAt(0), wkImages = imagesAt(w.endpoint);
+    const auto        bindsBefore = r.gw.binds.size();
+
+    r.client.testInjectTransportFault();
+    ASSERT_TRUE(r.drive([&] {
+        g_fakeNowNs += 50'000;   // the fresh UDP links need real time: the fake clock creeps, so the connect retry falls due
+        return r.client.testTransportRebuilds() == 1 && r.gw.binds.size() > bindsBefore &&
+               r.client.testWorkerBindAcksAccepted() >= 2u && r.client.state() == rc::session::SessionState::Connected;
+    })) << "binds=" << r.gw.binds.size() << " connects=" << r.gw.connectsArrived;
+    EXPECT_GT(imagesAt(0), gwImages) << "the seed's Connect rides a fresh request image";
+    EXPECT_GT(imagesAt(w.endpoint), wkImages) << "the worker's WorkerBind rides a fresh worker image";
+    bool bound = false;
+    for (std::size_t i = bindsBefore; i < r.gw.binds.size(); ++i) bound = bound || (r.gw.binds[i].firstOnImage && r.gw.binds[i].accepted);
+    EXPECT_TRUE(bound) << "the worker is bound again: a WorkerBind first on its fresh image, accepted";
+    EXPECT_TRUE(r.client.testSeedResponseCorrelated());
+    ASSERT_EQ(r.sendAcked(p, 0, 2), 2) << "produce completes on the fresh pairs";
+    EXPECT_EQ(r.gw.producesBeforeBind, 0);
+}
+
+// A subscription homed on a LEADER node's session (not the seed's) when the Aeron client closes: the node session comes
+// back on a fresh pair, the subscription is re-armed from its position (no duplicate, no gap) and the leader's worker is
+// bound again — one more WorkerBind per entry, although the resumed session may keep its id.
+TEST(ClientResponseEgressRegression, HomedSubscriptionReArmsFromPositionAfterRebuildRegression) {
+    Options o;
+    o.ownDriver = true;
+    o.fakeClock = true;
+    Rig r(4270, 4271, o);
+    const uint16_t bPort = freePort(), bResp = freePort();
+    const int      b     = r.gw.addNode(loopback(bPort), r.in);
+    r.gw.responseCtl[b]  = "127.0.0.1:" + std::to_string(bResp);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", static_cast<int32_t>(bPort), bResp}};
+    const auto w = r.addWorker(0, 4272, true, /*leader*/ 1);
+    r.gw.subscribeLeader = {{0, b}};   // the seed redirects the Subscribe to the leader
+    ASSERT_TRUE(r.connect());
+    std::vector<int64_t> offsets;
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [&](const rc::Record& rec) { offsets.push_back(rec.offset); });
+    const auto armedOnLeader = [&](int64_t notCorr) {
+        const auto* s = r.gw.latestSubscription(1, 0);
+        return s != nullptr && s->endpoint == b && s->corrId != notCorr;
+    };
+    ASSERT_TRUE(r.drive([&] { return armedOnLeader(0); }, 4'000'000)) << "the subscription never homed on the leader (node 1)";
+    const auto before = *r.gw.latestSubscription(1, 0);
+    r.gw.pushRecords(before, 0, 3);
+    ASSERT_TRUE(r.drive([&] { return offsets.size() == 3; }, 4'000'000));
+    ASSERT_GE(r.client.testWorkerBindCount(), 1u);
+    const uint64_t bindsSentBefore = r.client.testWorkerBindsSent();
+    const std::size_t entries      = r.client.testWorkerBindCount();
+
+    r.client.testInjectTransportFault();
+    ASSERT_TRUE(r.drive([&] {
+        g_fakeNowNs += 50'000;   // the fresh UDP links need real time: the fake clock creeps, so the connect retry falls due
+        return r.client.testTransportRebuilds() == 1 && armedOnLeader(before.corrId);
+    }, 4'000'000)) << "no re-arm on the leader: connects=" << r.gw.connectsArrived << " subs=" << r.gw.subscribed.size();
+    const auto after = *r.gw.latestSubscription(1, 0);
+    EXPECT_EQ(after.fromOffset, 3) << "re-armed from the subscription's position";
+    ASSERT_TRUE(r.drive([&] {
+        g_fakeNowNs += 50'000;
+        return r.client.testWorkerBindsSent() >= bindsSentBefore + entries;
+    }, 4'000'000)) << "every worker entry is bound again: sent " << r.client.testWorkerBindsSent() << " before " << bindsSentBefore
+                   << " entries " << entries;
+    r.gw.pushRecords(after, 0, 6);   // the broker replays from the earliest it holds: 0..2 are duplicates
+    ASSERT_TRUE(r.drive([&] { return offsets.size() >= 6; }, 4'000'000)) << "delivered: " << offsets.size();
+    for (std::size_t i = 0; i < offsets.size(); ++i) EXPECT_EQ(offsets[i], static_cast<int64_t>(i)) << "duplicate or gap at " << i;
+    EXPECT_EQ(offsets.size(), 6u);
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::None);
 }
 
 // ---- C-A: a response pair is spent when a Connect is ACCEPTED by its publication ----------------------------------------

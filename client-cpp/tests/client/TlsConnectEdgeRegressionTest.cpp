@@ -14,7 +14,9 @@
 #include "../support/TestCompletions.h"
 #include "../support/PlainInitPid.h"
 #include "../support/AeronTestErrors.h"
+#include "../support/FreePort.h"
 #include "../support/InvokerGateway.h"
+#include <rune/client/transport/AeronTransport.h>
 #include <rune/client/Client.h>
 #include <rune/client/codec/Codec.h>
 #include <rune/client/codec/CryptoFrame.h>
@@ -72,7 +74,7 @@ struct TwoLegTlsGateway {
     int connectsSeen = 0, plaintextConnects = 0;
     int framesBeforeKeys = 0;     // a non-handshake frame before the broker side had keys for its session
     int unopenable = 0;           // a non-handshake frame that does not open under its session's keys
-    int subscribesSeen = 0, joinGroupsSeen = 0, metadataSeen = 0, initPidsSeen = 0, pingsSeen = 0;
+    int subscribesSeen = 0, joinGroupsSeen = 0, metadataSeen = 0, initPidsSeen = 0, pingsSeen = 0, producesSeen = 0;
     std::vector<uint16_t> earlyTids;   // the templates of framesBeforeKeys (diagnostics)
 
     // Knobs.
@@ -82,6 +84,8 @@ struct TwoLegTlsGateway {
     /// HandshakeContinueResponse{HandshakeFailed}, re-offered `failRepeats` more times — the real
     /// broker re-offers it reliably) for connects whose corrId is >= failFinalLegFromCorr.
     bool failFinalLeg = false;
+    /// Own-driver (UDP) rig: every Connect gets a fresh egress publication, as the broker's per-session one, and sends wait on real time.
+    bool freshPubPerConnect = false;
     /// Review B I2: the ConnectResponse is v9 with authMode Required / MustAuthenticate — after its TLS the client logs in.
     bool requireAuth = false;
     int64_t failFinalLegFromCorr = 0;
@@ -111,11 +115,14 @@ struct TwoLegTlsGateway {
     std::shared_ptr<aeron::ExclusivePublication> gwPub;
     std::unique_ptr<aeron::FragmentAssembler> gwAsm;
     std::function<void()> idle_;   // pumps the Invoker client while the gateway waits for the ring (no sleeping)
+    std::string egCh_;
+    int32_t     egStr_ = 0;
 
     /// `idle` runs while the gateway waits for its publications: an Invoker client's embedded
     /// driver only works while its owner pumps it.
-    TwoLegTlsGateway(const std::string& aeronDir, int32_t in, int32_t eg, const std::function<void()>& idle = {})
-        : idle_(idle) {
+    TwoLegTlsGateway(const std::string& aeronDir, int32_t in, int32_t eg, const std::function<void()>& idle = {},
+                     const std::string& inCh = "aeron:ipc", const std::string& egCh = "aeron:ipc")
+        : idle_(idle), egCh_(egCh), egStr_(eg) {
         serverPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.pem");
         serverKey = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.key");
         aeron::Context ctx;
@@ -123,8 +130,8 @@ struct TwoLegTlsGateway {
         ctx.aeronDir(aeronDir);
         ctx.useConductorAgentInvoker(true);   // simulated-time test: the conductor runs only when pumped, never on wall time
         gwAeron = aeron::Aeron::connect(ctx);
-        const int64_t subId = gwAeron->addSubscription("aeron:ipc", in);
-        const int64_t pubId = gwAeron->addExclusivePublication("aeron:ipc", eg);
+        const int64_t subId = gwAeron->addSubscription(inCh, in);
+        const int64_t pubId = gwAeron->addExclusivePublication(egCh, eg);
         for (int i = 0; i < kPumpMax * 10; ++i) {   // hard iteration cap: a failing setup ends, never hangs
             invokeConductor();
             if (!gwSub) gwSub = gwAeron->findSubscription(subId);
@@ -165,6 +172,15 @@ struct TwoLegTlsGateway {
         }
         return w;
     }
+    void renewEgressPub() {
+        gwPub.reset();
+        const int64_t id = gwAeron->addExclusivePublication(egCh_, egStr_);
+        for (const auto deadline = std::chrono::steady_clock::now() + 5s; !gwPub && std::chrono::steady_clock::now() < deadline;) {
+            invokeConductor();
+            gwPub = gwAeron->findExclusivePublication(id);
+            if (idle_) idle_();
+        }
+    }
     void sendFinalLegFailure(int64_t sid, int64_t corr) {
         std::vector<uint8_t> resp;
         const std::size_t rn = rcc::encodeHandshakeContinueResponse(
@@ -174,7 +190,9 @@ struct TwoLegTlsGateway {
     }
     void sendRaw(const uint8_t* b, std::size_t n) {
         aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(b), static_cast<aeron::util::index_t>(n));
-        for (int i = 0; i < 5'000 && gwPub->offer(ab, 0, static_cast<aeron::util::index_t>(n)) <= 0; ++i)
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        for (int i = 0; gwPub->offer(ab, 0, static_cast<aeron::util::index_t>(n)) <= 0 &&
+                        (freshPubPerConnect ? std::chrono::steady_clock::now() < deadline : i < 5'000); ++i)
         {
             invokeConductor();
             if (idle_) idle_();   // back-pressured: let the client drain its egress (no sleeping)
@@ -189,6 +207,7 @@ struct TwoLegTlsGateway {
             auto c = rcc::decodeConnectRequest(buf, len);
             if (!c) return;
             ++connectsSeen;
+            if (freshPubPerConnect) renewEgressPub();
             if (c->cipherList.empty() || c->handshakeBytes.empty()) { ++plaintextConnects; return; }
             const int64_t sid = 40 + connectsSeen;
             if (seedSid == 0 && c->correlationId < 1'000'000'000'000LL) seedSid = sid;
@@ -266,6 +285,7 @@ struct TwoLegTlsGateway {
             const std::size_t on = rcc::openEgressFrame(it->second.keys, buf, len, opened, sizeof opened);
             if (on == 0) { ++unopenable; return; }
             const auto t = static_cast<rcc::TemplateId>(*tid);
+            if (*tid == static_cast<uint16_t>(rune::protocol::client::TemplateId::Produce)) ++producesSeen;
             if (t == rcc::TemplateId::Subscribe) ++subscribesSeen;
             if (t == rcc::TemplateId::MetadataRequest) ++metadataSeen;
             if (*tid == static_cast<uint16_t>(rune::protocol::client::TemplateId::JoinGroup)) ++joinGroupsSeen;
@@ -295,9 +315,13 @@ struct TwoLegTlsGateway {
 struct Rig {
     static constexpr int32_t kInStr = 4114, kEgStr = 4115;
     std::string agentDir = uniqueDir();
+    std::string brokerDir;                                    // ownDriver: the broker's own media driver
+    std::unique_ptr<rune::client::transport::AeronTransport> brokerDriver;
     std::unique_ptr<Client> client;
     std::unique_ptr<TwoLegTlsGateway> gw;
-    explicit Rig(bool twoLeg = true, bool login = false) {
+    bool realTime = false;   // ownDriver: UDP setup takes real time, so the simulated clock follows it
+    /// ownDriver: the gateway runs on its own driver and the client reaches it over UDP, so a transport rebuild keeps it.
+    explicit Rig(bool twoLeg = true, bool login = false, bool ownDriver = false, bool requireCrypto = true) {
         g_nowNs = 1'000'000'000;
         ClientConfig cfg;
         if (login) { cfg.username = "ws1"; cfg.password = "correct horse battery"; }
@@ -305,7 +329,11 @@ struct Rig {
         cfg.egressChannel  = "aeron:ipc"; cfg.egressStreamId  = kEgStr;
         cfg.dataDir = agentDir; cfg.connectTimeoutMs = 8000; cfg.pingTimeoutMs = 8000;
         cfg.idleMode = IdleMode::LowLatency;
-        cfg.offerCrypto = true; cfg.requireCrypto = true;
+        cfg.offerCrypto = true; cfg.requireCrypto = requireCrypto;
+        const auto port = rune::client::testing::allocFreeUdpPortRange(2);
+        const std::string inCh = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port), egCh = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port + 1);
+        if (ownDriver) { cfg.gatewayChannel = inCh; cfg.egressChannel = egCh; cfg.connectTimeoutMs = 1000; }
+        realTime = ownDriver;
         cfg.tlsTrustPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/ca.pem");
         cfg.tlsExpectHost = "localhost";
         cfg.runnerMode = RunnerMode::Invoker;   // every test drives the client itself, on the injected clock
@@ -314,15 +342,27 @@ struct Rig {
         cfg.topics.push_back(ts);
         client = std::make_unique<Client>(cfg);
         // The gateway waits for the client's embedded driver to create the rings: pump the client meanwhile.
-        gw = std::make_unique<TwoLegTlsGateway>(agentDir + "/aeron", kInStr, kEgStr,
-                                                [this] { (void)client->doWork(); });
+        if (ownDriver) {
+            brokerDir = uniqueDir();
+            rune::client::transport::TransportConfig hc;
+            hc.ingressChannel = "aeron:ipc"; hc.ingressStreamId = 1; hc.egressChannel = "aeron:ipc"; hc.egressStreamId = 2;
+            hc.dataDir = brokerDir; hc.driverMode = rune::client::transport::DriverMode::Thread;
+            brokerDriver = std::make_unique<rune::client::transport::AeronTransport>(hc);
+            brokerDriver->start();
+            gw = std::make_unique<TwoLegTlsGateway>(brokerDir + "/aeron", kInStr, kEgStr, [this] { (void)client->doWork(); }, inCh, egCh);
+            gw->freshPubPerConnect = true;
+        } else {
+            gw = std::make_unique<TwoLegTlsGateway>(agentDir + "/aeron", kInStr, kEgStr,
+                                                    [this] { (void)client->doWork(); });
+        }
         gw->twoLeg = twoLeg;
     }
     ~Rig() {
         client->close();
         gw.reset();
         client.reset();
-        try { std::filesystem::remove_all(agentDir); } catch (...) {}
+        brokerDriver.reset();
+        try { std::filesystem::remove_all(agentDir); if (!brokerDir.empty()) std::filesystem::remove_all(brokerDir); } catch (...) {}
     }
     void step() {
         gw->poll(16);
@@ -337,6 +377,18 @@ struct Rig {
     }
     /// Returns as soon as p() holds; the step count (d / 1 ms) is the hard cap, so a failure ends, never hangs.
     template <class Pred> bool pumpWithin(std::chrono::milliseconds d, Pred p) {
+        if (realTime) {
+            const auto t0 = std::chrono::steady_clock::now();
+            auto       last = t0;
+            while (std::chrono::steady_clock::now() - t0 < d) {
+                if (p()) return true;
+                const auto now = std::chrono::steady_clock::now();
+                g_nowNs += std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count();
+                last = now;
+                step();
+            }
+            return p();
+        }
         for (int64_t i = 0; i < d.count(); ++i) {
             if (p()) return true;
             g_nowNs += kTickNs;
@@ -737,4 +789,43 @@ TEST(TlsConnectEdgeRegression, APlaintextEpisodeWithANewIdNeverReadsTheOldSealed
                                              r.gw->lastUniqueSessionId() != sidA; }));
     r.within(200, [] { return false; });
     EXPECT_FALSE(rec.ready()) << "an ack sealed under episode A's key was read in clear: " << rec.describe();
+}
+
+// The Aeron client closes and the transport is rebuilt under offered and under required crypto: the resume is a fresh
+// TLS episode (a plaintext resume would be answered HandshakeFailed and end the session for good), the seed ends
+// Connected on new keys, and produce works.
+namespace {
+void encryptedSessionResumesAfterRebuild(bool requireCrypto) {
+    Rig r(/*twoLeg=*/false, /*login=*/false, /*ownDriver=*/true, requireCrypto);
+    test_support::TestCq cq(*r.client);
+    auto conn = cq.issue([&](Completions& q, Token t) { return r.client->connect(q, t); });
+    ASSERT_TRUE(r.pumpWithin(8s, [&] { return conn.ready(); }));
+    EXPECT_NO_THROW(conn.check());
+    ASSERT_TRUE(r.pumpWithin(5s, [&] { return r.gw->seedEncrypted(); }));
+    const int connectsBefore = r.gw->connectsSeen;
+    r.client->testInjectTransportFault();
+    EXPECT_TRUE(r.pumpWithin(10s, [&] {
+        return r.client->testTransportRebuilds() == 1 && r.gw->connectsSeen > connectsBefore &&
+               r.client->state() == rcs::SessionState::Connected;
+    })) << "no encrypted resume after the rebuild: connects " << r.gw->connectsSeen << ", state " << int(r.client->state());
+    EXPECT_NE(r.client->state(), rcs::SessionState::Rejected);
+    EXPECT_EQ(r.gw->plaintextConnects, 0) << "every resume carries a fresh ClientHello";
+    ProducerConfig pc;
+    pc.acks     = Acks::Leader;
+    pc.lingerUs = 0;
+    auto producer = r.client->producer(pc);
+    const uint8_t val[] = {1, 2, 3};
+    const int producesBefore = r.gw->producesSeen;
+    EXPECT_EQ(producer.trySend(r.client->topic("inventory"), Key(uint64_t{1}), std::span<const uint8_t>(val)), SendResult::Ok);
+    EXPECT_TRUE(r.pumpWithin(5s, [&] { return r.gw->producesSeen > producesBefore; })) << "produce does not reach the broker after the rebuild";
+    EXPECT_EQ(r.gw->unopenable, 0) << "a frame that does not open under the new keys";
+    EXPECT_EQ(r.gw->framesBeforeKeys, 0);
+}
+}  // namespace
+
+TEST(TlsConnectEdgeRegression, EncryptedSessionResumesAfterRebuildRegression) {
+    for (const bool require : {true, false}) {
+        SCOPED_TRACE(require ? "required crypto" : "offered crypto");
+        encryptedSessionResumesAfterRebuild(require);
+    }
 }
