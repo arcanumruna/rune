@@ -95,8 +95,9 @@ repo_tag() {
     (cd "${d}" && find . -type f -not -path './.lease-e2e-work*' -not -path './.auth.*' -print0 | LC_ALL=C sort -z | xargs -0 cat | sha256_stdin) | cut -c1-12
 }
 rune_auth_init
-export RUNE_IMAGE_TAG="$(repo_tag "${BROKER_REPO}")-lease-e2e"
-export QL_IMAGE="rune-ql-probe:$(repo_tag "${CLIENT_REPO}")"
+RUNE_IMAGE_TAG="$(repo_tag "${BROKER_REPO}")-lease-e2e"
+QL_IMAGE="rune-ql-probe:$(repo_tag "${CLIENT_REPO}")"
+export RUNE_IMAGE_TAG QL_IMAGE
 DRIVER_IMAGE="rune-lease-e2e-driver:$(repo_tag "${CLIENT_REPO}")"
 BUILT_IMAGES=""   # images this run created (removed at teardown by exact name); an image that existed before the run is never listed
 BROKER_IMAGE="rune-broker-node:${RUNE_IMAGE_TAG}"
@@ -618,7 +619,7 @@ log "CHECKPOINT: received - (L + extend ${EXTEND_MS} + R ${BR}) = $(( RECV - (BL
 if [ "${RECV}" -gt "${DEADLINE}" ]; then
     OVER=$(( RECV - DEADLINE ))
     [ "${OVER}" -ge 1000 ] || log "CHECKPOINT: over the bound by only ${OVER} ms (< 1 s): L stands in for T_ready, which is a little later; judge: L=${BL} extend=${EXTEND_MS} R=${BR} bound=${BOUND_MS} received=${RECV}"
-    fail "ckpt-1 Expired received ${OVER} ms after L + extend + R + ${BOUND_MS} ms (L=${BL}, R=${BR}, received=${RECV})"
+    fail "ckpt-1 Expired received ${OVER} ms after L + extend + R + ${BOUND_MS} ms (kills ${KILLS}, last kill K=${BK}, L=${BL}, R=${BR}, received=${RECV})"
 fi
 stop_watcher ckpt-watch
 leg_end CHECKPOINT "${LEG_S}"
