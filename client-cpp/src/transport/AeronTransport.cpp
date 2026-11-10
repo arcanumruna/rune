@@ -378,14 +378,13 @@ bool AeronTransport::rebuild(int32_t seedResponsePort) noexcept {
         s.res.reset();                              // a response pair's old subscription is pinned to a dead image
         s.egress = SubSlot::Egress::AwaitImage;
     }
-    const int64_t awaitDeadlineNs = resolveNow_() + kResolveTimeoutNs;
     for (PubSlot& ps : pubSlots_) {
         ps.res.reset();
         ps.addChannel.clear();                      // the response subscription has a new registration id
         int32_t sub = -1;
         if (const auto* c = std::get_if<PubSlot::Correlated>(&ps.mode)) sub = c->subSlot;
         else if (const auto* a = std::get_if<PubSlot::AwaitResponseSub>(&ps.mode)) sub = a->subSlot;
-        if (sub >= 0) ps.mode = PubSlot::AwaitResponseSub{sub, awaitDeadlineNs};
+        if (sub >= 0) ps.mode = PubSlot::AwaitResponseSub{sub, 0};   // the deadline starts once the new client is up
     }
     ingressPub_.reset();
     egressSub_.reset();
@@ -399,6 +398,10 @@ bool AeronTransport::rebuild(int32_t seedResponsePort) noexcept {
         if ((rebuildFailures_++ & 63u) == 0) std::fprintf(stderr, "rune-client: rebuilding the transport failed (%llu so far): %s\n", static_cast<unsigned long long>(rebuildFailures_), e.what());
         state_ = Lifecycle::Down;
         return false;
+    }
+    const int64_t awaitDeadlineNs = resolveNow_() + kResolveTimeoutNs;
+    for (PubSlot& ps : pubSlots_) {
+        if (auto* a = std::get_if<PubSlot::AwaitResponseSub>(&ps.mode); a != nullptr && a->deadlineNs == 0) a->deadlineNs = awaitDeadlineNs;
     }
     state_ = Lifecycle::Started;
     return true;

@@ -70,8 +70,9 @@ struct SendOutcome {
 
 /// Read every partition of the topic from the beginning through a NEW client seeded on `via`, until every
 /// seq in `mustSee` was delivered and nothing new arrived for 1 s (bounded).  Returns seq -> times seen.
-std::map<int, int> readBack(ThreeNodes& c, int via, const rc::TopicSpec& spec, const std::set<int>& mustSee) {
-    auto cfg = clientConfigFor(c, via);
+std::map<int, int> readBack(ThreeNodes& c, int via, const rc::TopicSpec& spec, const std::set<int>& mustSee,
+                            const std::function<rc::ClientConfig(int)>& configFor = nullptr) {
+    auto cfg = configFor ? configFor(via) : clientConfigFor(c, via);
     cfg.topics = {spec};
     auto reader = connectClient(c, cfg);
     std::mutex mu;
@@ -967,13 +968,29 @@ void tlsFailover(const char* tag, bool shard, bool require) {
     cfg.tlsTrustPem = acfg.tlsTrustPem; cfg.tlsExpectHost = "localhost";
     cfg.reconnectForeverAfterLive = shard;
     cfg.connectTimeoutMs = 5'000; cfg.pingTimeoutMs = 30'000;
-    auto client = connectClient(c, cfg);
+    auto client = std::make_unique<rc::Client>(cfg);
+    rc::GroupConfig gcfg;
+    gcfg.autoCommit = true; gcfg.autoCommitIntervalMs = 500; gcfg.sessionTimeoutMs = 10'000;
+    auto gc = client->subscribeGroup("g", {"events"}, gcfg);
+    SubLedger gled;
+    gc.onRecords([&](const rc::RecordSet& rs) {
+        rs.forEachRecord([&](std::string_view, std::string_view v, int64_t off, int64_t) {
+            std::lock_guard lk(gled.mu);
+            gled.seqs[rs.partition].insert(seqOf(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size())));
+            gled.offs[rs.partition].insert(off);
+        });
+    });
+    client->connectAndWait(30s);
     rc::ProducerConfig pcfg;
     pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.produceTimeoutMs = 30'000; pcfg.deliveryTimeoutMs = 60'000;
     auto producer = client->producer(pcfg);
     rc::Completions cq(*client);
     const rc::TopicHandle th = client->topic("events");
+    SubLedger led, led2;
+    rc::SubscribeOptions so;
+    so.from = rc::From::earliest();
+    auto s0 = client->subscribe(th, 0, so, led.handler(0));   // p0 is bound on the seed's session
     auto sendOne = [&](int seq) {
         uint64_t k = static_cast<uint64_t>(seq) * 16;
         while (rc::Key(k).partition(kPartitions) != seq % kPartitions) ++k;
@@ -1092,13 +1109,29 @@ void tlsShardStallPastTheLease(const char* tag, bool require) {
     cfg.reconnectForeverAfterLive = true;
     cfg.aeronClientLivenessTimeoutNs = 60'000'000'000LL;   // a shard client's Aeron survives the stall (it runs 1 h)
     cfg.connectTimeoutMs = 5'000; cfg.pingTimeoutMs = kLeaseMs;
-    auto client = connectClient(c, cfg);
+    auto client = std::make_unique<rc::Client>(cfg);
+    rc::GroupConfig gcfg;
+    gcfg.autoCommit = true; gcfg.autoCommitIntervalMs = 500; gcfg.sessionTimeoutMs = 10'000;
+    auto gc = client->subscribeGroup("g", {"events"}, gcfg);
+    SubLedger gled;
+    gc.onRecords([&](const rc::RecordSet& rs) {
+        rs.forEachRecord([&](std::string_view, std::string_view v, int64_t off, int64_t) {
+            std::lock_guard lk(gled.mu);
+            gled.seqs[rs.partition].insert(seqOf(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size())));
+            gled.offs[rs.partition].insert(off);
+        });
+    });
+    client->connectAndWait(30s);
     rc::ProducerConfig pcfg;
     pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.produceTimeoutMs = 30'000; pcfg.deliveryTimeoutMs = 60'000;
     auto producer = client->producer(pcfg);
     rc::Completions cq(*client);
     const rc::TopicHandle th = client->topic("events");
+    SubLedger led, led2;
+    rc::SubscribeOptions so;
+    so.from = rc::From::earliest();
+    auto s0 = client->subscribe(th, 0, so, led.handler(0));   // p0 is bound on the seed's session
     std::map<rc::Token, rc::OpStatus> done;
     auto pump = [&] {
         (void)client->doWork();
@@ -1325,13 +1358,29 @@ void aeronClosedByStall(ThreeNodes& c, const std::function<rc::ClientConfig(int)
     cfg.runnerMode = rc::RunnerMode::Invoker;
     cfg.aeronClientLivenessTimeoutNs = rune::client::transport::kMinClientLivenessTimeoutNs;
     cfg.connectTimeoutMs = 5'000; cfg.pingTimeoutMs = 30'000;
-    auto client = connectClient(c, cfg);
+    auto client = std::make_unique<rc::Client>(cfg);
+    rc::GroupConfig gcfg;
+    gcfg.autoCommit = true; gcfg.autoCommitIntervalMs = 500; gcfg.sessionTimeoutMs = 10'000;
+    auto gc = client->subscribeGroup("g", {"events"}, gcfg);
+    SubLedger gled;
+    gc.onRecords([&](const rc::RecordSet& rs) {
+        rs.forEachRecord([&](std::string_view, std::string_view v, int64_t off, int64_t) {
+            std::lock_guard lk(gled.mu);
+            gled.seqs[rs.partition].insert(seqOf(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size())));
+            gled.offs[rs.partition].insert(off);
+        });
+    });
+    client->connectAndWait(30s);
     rc::ProducerConfig pcfg;
     pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.produceTimeoutMs = 30'000; pcfg.deliveryTimeoutMs = 60'000;
     auto producer = client->producer(pcfg);
     rc::Completions cq(*client);
     const rc::TopicHandle th = client->topic("events");
+    SubLedger led, led2;
+    rc::SubscribeOptions so;
+    so.from = rc::From::earliest();
+    auto s0 = client->subscribe(th, 0, so, led.handler(0));   // p0 is bound on the seed's session
     std::map<rc::Token, rc::OpStatus> done;
     auto pump = [&] {
         (void)client->doWork();
@@ -1351,32 +1400,80 @@ void aeronClosedByStall(ThreeNodes& c, const std::function<rc::ClientConfig(int)
         }
         return false;
     };
-    auto pumpUntilAcked = [&](std::size_t n, std::chrono::milliseconds within) {
-        for (const auto deadline = Clock::now() + within; Clock::now() < deadline && done.size() < n;) {
+    auto pumpUntil = [&](const auto& pred, std::chrono::milliseconds within) {
+        for (const auto deadline = Clock::now() + within; Clock::now() < deadline && !pred();) {
             pump();
             std::this_thread::sleep_for(1ms);
         }
+        return pred();
     };
     for (int seq = 0; seq < 9; ++seq) ASSERT_TRUE(sendOne(seq));
-    pumpUntilAcked(9, 30s);
-    ASSERT_EQ(done.size(), 9u) << "precondition: produce works";
+    ASSERT_TRUE(pumpUntil([&] { return done.size() >= 9u && led.count(0) >= 3u; }, 30s)) << "precondition: produce and the p0 subscription work";
 
+    constexpr int kInflight = 5, kAfter = 30, kTotal = 9 + kInflight + kAfter;
+    for (int seq = 9; seq < 9 + kInflight; ++seq) ASSERT_TRUE(sendOne(seq));   // in flight when the owner stalls
     std::this_thread::sleep_for(2s);   // the owner stalls past the 1 s Aeron liveness; the brokers keep running
 
-    constexpr int kAfter = 30;
-    for (int seq = 9; seq < 9 + kAfter; ++seq) {
+    for (int seq = 9 + kInflight; seq < kTotal; ++seq) {
         ASSERT_TRUE(sendOne(seq)) << "send refused, client state " << int(client->state());
         for (int i = 0; i < 20; ++i) { pump(); std::this_thread::sleep_for(1ms); }
     }
-    pumpUntilAcked(9u + kAfter, 40s);
+    pumpUntil([&] { return done.size() >= static_cast<std::size_t>(kTotal); }, 40s);
     int ok = 0;
-    for (int seq = 9; seq < 9 + kAfter; ++seq) ok += done.count(seq + 1) != 0 && done[seq + 1] == rc::OpStatus::Ok ? 1 : 0;
+    std::set<int> acked;
+    for (int seq = 0; seq < kTotal; ++seq) {
+        if (done.count(seq + 1) != 0 && done[seq + 1] == rc::OpStatus::Ok) { acked.insert(seq); if (seq >= 9) ++ok; }
+    }
     EXPECT_GE(client->testTransportRebuilds(), 1u) << "the closed Aeron client was rebuilt";
     EXPECT_NE(client->state(), rune::client::session::SessionState::Rejected);
-    EXPECT_EQ(ok, kAfter) << "records produced after the stall are acked";
+    EXPECT_EQ(ok, kInflight + kAfter) << "the records in flight at the stall and those produced after it are acked";
+
+    // The seed-bound subscription ends SessionLost (never silent); a re-subscribe from its position sees every
+    // p0 record exactly once across the two readers.
+    ASSERT_TRUE(pumpUntil([&] { return !s0.active(); }, 40s)) << "the seed-bound subscription stayed active across the rebuild";
+    EXPECT_EQ(s0.failReason(), rc::SubscriptionFailReason::SessionLost);
+    rc::SubscribeOptions o2;
+    o2.from = rc::From::offset(s0.position());
+    auto r0 = client->subscribe(th, 0, o2, led2.handler(0));
+    auto p0Complete = [&] {
+        for (int seq = 0; seq < kTotal; seq += kPartitions) if (!led.has(0, seq) && !led2.has(0, seq)) return false;
+        return true;
+    };
+    EXPECT_TRUE(pumpUntil(p0Complete, 40s)) << "every p0 record is delivered by the ended subscription or its re-subscribe";
+    {
+        std::lock_guard a(led.mu), b(led2.mu);
+        EXPECT_EQ(led.dupes, 0);
+        EXPECT_EQ(led2.dupes, 0);
+        for (int64_t off : led2.offs[0]) EXPECT_EQ(led.offs[0].count(off), 0u) << "offset " << off << " delivered before the end and after the re-subscribe";
+    }
+
+    // The group member keeps consuming every partition after the rebuild.
+    auto groupHasAfterStall = [&] {
+        std::lock_guard lk(gled.mu);
+        for (int seq = 9 + kInflight; seq < kTotal; ++seq) if (gled.seqs[seq % kPartitions].count(seq) == 0) return false;
+        return true;
+    };
+    EXPECT_TRUE(pumpUntil(groupHasAfterStall, 40s)) << "the group member consumes the records produced after the stall";
+    {
+        std::lock_guard lk(gled.mu);
+        for (int32_t p = 0; p < kPartitions; ++p) {
+            const auto& o = gled.offs[p];
+            if (!o.empty()) EXPECT_EQ(static_cast<int64_t>(o.size()), *o.rbegin() - *o.begin() + 1) << "a gap on partition " << p;
+        }
+    }
+
     rc::DefineTopicResult d2;
     EXPECT_NO_THROW(d2 = client->defineTopicAndWait("after", 1, "", {}, kDisk, {}, {}, 30s));
     EXPECT_EQ(d2.errorCode, 0) << d2.detail;
+
+    // Exactly once on the brokers: a fresh reader sees every acked record once.
+    const auto seen = readBack(c, c.runningNodes().front(), spec, acked, configFor);
+    for (int seq : acked) {
+        const auto it = seen.find(seq);
+        EXPECT_EQ(it == seen.end() ? 0 : it->second, 1) << "seq " << seq << " is not on the log exactly once";
+    }
+    r0.unsubscribe();
+    gc.close();
     producer.close();
     client->close();
 }

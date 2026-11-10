@@ -109,9 +109,10 @@ struct ChildLedger {
         }
         const rc::OpStatus st = grp.close(30s);
         grp.pollEvents(report);
+        const uint64_t rebuilds = grp.shard(0).client().testTransportRebuilds() + grp.shard(1).client().testTransportRebuilds();
         writeLine(out, "S " + std::to_string(accepted) + " " + std::to_string(l0.records + l1.records) + " " +
                            std::to_string(l0.ok + l1.ok) + " " + std::to_string(l0.failed + l1.failed) + " " +
-                           std::to_string(static_cast<int>(st)));
+                           std::to_string(static_cast<int>(st)) + " " + std::to_string(rebuilds));
     } catch (const std::exception& e) {
         writeLine(out, std::string("X ") + e.what());
         ::_exit(2);
@@ -172,8 +173,10 @@ constexpr int32_t     kPlainEg      = 3953;
             if (sent == 0) std::this_thread::yield();  // back-pressured
         }
         const rc::OpStatus st = producer.closeAndWait(30s);
+        client.close();   // the duty thread is gone: the rebuild count is safe to read
         writeLine(out, "S " + std::to_string(accepted) + " " + std::to_string(l.records) + " " + std::to_string(l.ok) +
-                           " " + std::to_string(l.failed) + " " + std::to_string(static_cast<int>(st)));
+                           " " + std::to_string(l.failed) + " " + std::to_string(static_cast<int>(st)) + " " +
+                           std::to_string(client.testTransportRebuilds()));
     } catch (const std::exception& e) {
         writeLine(out, std::string("X ") + e.what());
         ::_exit(2);
@@ -315,10 +318,11 @@ TEST(ShardDrGateRegression, SigstopPast15sThenSigcontRecoversLiveExactlyOnce) {
     ASSERT_EQ(::waitpid(child.pid, &status, 0), child.pid);
     child.pid = -1;
     ASSERT_EQ(summary.rfind("S ", 0), 0u) << summary;
-    long long accepted = 0, records = 0, ok = 0, failed = 0;
+    long long accepted = 0, records = 0, ok = 0, failed = 0, rebuilds = 0;
     int       closeSt  = -1;
-    ASSERT_EQ(std::sscanf(summary.c_str(), "S %lld %lld %lld %lld %d", &accepted, &records, &ok, &failed, &closeSt),
-              5);
+    ASSERT_EQ(std::sscanf(summary.c_str(), "S %lld %lld %lld %lld %d %lld", &accepted, &records, &ok, &failed, &closeSt, &rebuilds),
+              6);
+    EXPECT_GE(rebuilds, 1) << "the stall closed the Aeron clients and the transports were rebuilt";
     EXPECT_EQ(records, accepted) << "every accepted record completed exactly once";
     EXPECT_EQ(ok, accepted) << "none failed: the stall stayed under the delivery timeout";
     EXPECT_EQ(failed, 0);
@@ -431,9 +435,10 @@ TEST(ShardDrGateRegression, PlainClientSigstopPastAeronTimeoutsRecoversRegressio
     ASSERT_EQ(::waitpid(child.pid, &status, 0), child.pid);
     child.pid = -1;
     ASSERT_EQ(summary.rfind("S ", 0), 0u) << summary;
-    long long accepted = 0, records = 0, ok = 0, failed = 0;
+    long long accepted = 0, records = 0, ok = 0, failed = 0, rebuilds = 0;
     int       closeSt  = -1;
-    ASSERT_EQ(std::sscanf(summary.c_str(), "S %lld %lld %lld %lld %d", &accepted, &records, &ok, &failed, &closeSt), 5);
+    ASSERT_EQ(std::sscanf(summary.c_str(), "S %lld %lld %lld %lld %d %lld", &accepted, &records, &ok, &failed, &closeSt, &rebuilds), 6);
+    EXPECT_GE(rebuilds, 1) << "the stall closed the Aeron client and the transport was rebuilt";
     EXPECT_EQ(records, accepted) << "every accepted record completed exactly once";
     EXPECT_EQ(ok, accepted);
     EXPECT_EQ(failed, 0);

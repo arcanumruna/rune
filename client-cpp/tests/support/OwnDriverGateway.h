@@ -10,7 +10,6 @@
 
 #include <rune/client/transport/AeronTransport.h>
 
-#include <atomic>
 #include <filesystem>
 #include <string>
 #include <unistd.h>
@@ -29,9 +28,9 @@ struct BrokerHost {
     InvokerGateway                          gw;  // destroyed first: its Aeron client goes before the driver
 
     static std::string uniqueDir() {
-        static std::atomic<int> n{0};
+        static int n = 0;   // test thread only
         return std::filesystem::temp_directory_path().string() + "/own_broker_" + std::to_string(::getpid()) + "_" +
-               std::to_string(n.fetch_add(1));
+               std::to_string(n++);
     }
     static rune::client::transport::TransportConfig hostConfig(const std::string& dir) {
         rune::client::transport::TransportConfig c;

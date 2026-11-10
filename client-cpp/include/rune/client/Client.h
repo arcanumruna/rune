@@ -667,7 +667,8 @@ public:
 
     /// A7 park-until-work (Invoker owner): the embedded invoker driver's socket-readiness fds — park in
     /// ppoll() on them when doWork() returned 0 instead of spinning; a datagram (an ack, a status message)
-    /// wakes the owner.  0 fds in Thread driver mode or off Linux.  Valid until close.
+    /// wakes the owner.  0 fds in Thread driver mode or off Linux.  Valid until the next doWork(): a transport
+    /// rebuild replaces them; re-query before each park.
     [[nodiscard]] int wakeFds(int* out, int max) const noexcept { return agent_.wakeFds(out, max); }
 
     /// True while the Aeron client is closed (invoker owner stalled past aeronClientLivenessTimeoutNs, or the driver
