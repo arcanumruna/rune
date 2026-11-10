@@ -6,6 +6,7 @@
 #include "client/OneBroker.h"
 #include "client/support/RegressorsPathRecords.h"
 #include "support/CatalogBrokerCluster.h"
+#include "support/SharedClientDriver.h"
 
 #include <QlEngine.h>
 #include <rune/cli/Cli.h>
@@ -20,6 +21,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
 #include <set>
 #include <sstream>
@@ -39,9 +41,11 @@ namespace {
 constexpr uint16_t kKeyExists = 56;
 constexpr rc::Acks kAllView   = rc::Acks::All | rc::Acks::View;
 
-/// Every broker here runs the shard runtime: its client stream is catalog_cluster::kClientStream.
-int runCli(std::vector<std::string> args, std::string* out = nullptr, std::string* err = nullptr) {
+/// Every broker here runs the shard runtime: its client stream is catalog_cluster::kClientStream.  `aeronDir`: attach to that media driver,
+/// not an embedded one of the run's own.
+int runCli(std::vector<std::string> args, std::string* out = nullptr, std::string* err = nullptr, const std::string& aeronDir = {}) {
     args.insert(args.end(), {"--cli-stream-in", std::to_string(catalog_cluster::kClientStream)});
+    if (!aeronDir.empty()) args.insert(args.end(), {"--cli-aeron-dir", aeronDir});
     std::stringstream o, e;
     const int code = rune::cli::run(std::move(args), o, e);
     if (out) *out = o.str();
@@ -50,8 +54,8 @@ int runCli(std::vector<std::string> args, std::string* out = nullptr, std::strin
 }
 
 /// `rune ql -e <text> --broker <endpoint>`
-int ql(const std::string& endpoint, const std::string& text, std::string* out = nullptr, std::string* err = nullptr) {
-    return runCli({"ql", "-e", text, "--broker", endpoint}, out, err);
+int ql(const std::string& endpoint, const std::string& text, std::string* out = nullptr, std::string* err = nullptr, const std::string& aeronDir = {}) {
+    return runCli({"ql", "-e", text, "--broker", endpoint}, out, err, aeronDir);
 }
 
 struct TmpDir {
@@ -249,29 +253,32 @@ TEST(CheckedWritesQlBrokerRegression, RegressorsPathOutcomesThreeNodesRegression
     const std::vector<std::string> statements = rune::cli::engine::splitStatements(script.str());
     ASSERT_EQ(statements.size(), 7u);
 
+    // The runs of `rune ql` share one media driver (an embedded one per run costs 40-75 ms of it here), started while the cluster does.
+    auto driverStart = std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
     ThreeNodes c = startCluster("cw09_ql");
+    const auto driver = driverStart.get();
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     for (const int id : c.runningNodes()) awaitLevel(c.node(id));
     ASSERT_FALSE(HasFatalFailure());
     const std::string ep = clusterEndpoint(c, 1);
     for (std::size_t i = 0; i < statements.size(); ++i) {
         std::string out, err;
-        EXPECT_EQ(ql(ep, statements[i], &out, &err), 0) << "statement " << i << ": " << statements[i] << "\n" << err;
+        EXPECT_EQ(ql(ep, statements[i], &out, &err, driver->dir()), 0) << "statement " << i << ": " << statements[i] << "\n" << err;
         EXPECT_TRUE(err.empty()) << "statement " << i << ": " << err;
         // Node 1 may apply this statement's catalog change a moment after its leader answered it.
         std::string why;
         ASSERT_TRUE(c.awaitCatalogDigestsEqual(30s, &why)) << "statement " << i << ": " << why;
     }
     std::string out, err;
-    ASSERT_EQ(ql(ep, "show topic user;", &out, &err), 0) << err;
+    ASSERT_EQ(ql(ep, "show topic user;", &out, &err, driver->dir()), 0) << err;
     EXPECT_NE(out.find("partitions 1"), std::string::npos) << out;
     EXPECT_NE(out.find("key.index on"), std::string::npos) << out;
     EXPECT_NE(out.find("autoincrement on (reserve 4096, max 9007199254740991)"), std::string::npos) << out;
     EXPECT_NE(out.find("partitioner modulo"), std::string::npos) << out;
     EXPECT_NE(out.find("autoIncrementCounter 1"), std::string::npos) << out;
-    ASSERT_EQ(ql(ep, "show topic character;", &out, &err), 0) << err;
+    ASSERT_EQ(ql(ep, "show topic character;", &out, &err, driver->dir()), 0) << err;
     EXPECT_NE(out.find("partitions 1"), std::string::npos) << out;
-    ASSERT_EQ(ql(ep, "show view device_history;", &out, &err), 0) << err;
+    ASSERT_EQ(ql(ep, "show view device_history;", &out, &err, driver->dir()), 0) << err;
     EXPECT_NE(out.find("keyspec (userId, deviceFp)"), std::string::npos) << out;
     EXPECT_NE(out.find("group by (userId, deviceFp)"), std::string::npos) << out;
 }
