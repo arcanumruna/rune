@@ -80,6 +80,9 @@ struct EmbeddedDriverConfig {
     /// (read from CnC).  Must exceed the driver timer interval (1 s).  Test-only
     /// override (shard startup-gap regression); never set in production.
     int64_t     clientLivenessTimeoutNs = 0;
+    /// 0 = Aeron default (10 s).  Test-only: the client liveness before clientLivenessTimeoutNs overrides it
+    /// (NodeConfig::testAeronLivenessDefaultMs).
+    int64_t     testDefaultClientLivenessNs = 0;
     /// 0 = Aeron default (1 s, or a tenth of a shorter clientLivenessTimeoutNs).  Test-only: the driver closes a lingering
     /// image at its next timer, so a shorter timer lets a test wait less without shortening the client liveness.
     int64_t     timerIntervalNs = 0;

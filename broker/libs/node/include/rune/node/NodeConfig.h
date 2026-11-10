@@ -318,9 +318,10 @@ struct NodeConfig {
     /// short value to prove no startup phase starves an invoker driver.  No env var.
     static constexpr int64_t kInProcessLivenessNs = 3'600'000'000'000LL;
     int64_t shardClientLivenessTimeoutNs = kInProcessLivenessNs;
-    /// TEST-ONLY: the floor (ms) of inProcessDriverTimeoutMs in place of Aeron's 10 s default, so a test can freeze the process
-    /// past it in a fraction of the time.  0 = 10 s; never set in production.
-    long testInProcessDriverTimeoutFloorMs = 0;
+    /// TEST-ONLY: the liveness (ms) the in-process drivers and clients have before the node sets its own (shardClientLivenessTimeoutNs),
+    /// in place of Aeron's 10 s defaults, and the floor of inProcessDriverTimeoutMs: a test freezes the process past it in a fraction
+    /// of the time, and without the node's own liveness the freeze kills it.  0 = Aeron's 10 s; never set in production.
+    long testAeronLivenessDefaultMs = 0;
     /// TEST-ONLY: the idle sleep (ms) of the node's runtime Aeron client conductor (thread placement) in place of Aeron's 16 ms, so a
     /// test's every client-conductor round trip (a gateway egress publication, a subscription) does not wait out two 16 ms sleeps.
     /// 0 = Aeron's 16 ms; never set in production.
@@ -329,7 +330,7 @@ struct NodeConfig {
     /// Aeron's 10 s default).
     [[nodiscard]] long inProcessDriverTimeoutMs() const noexcept {
         const long ms = static_cast<long>(shardClientLivenessTimeoutNs / 1'000'000);
-        const long floorMs = testInProcessDriverTimeoutFloorMs > 0 ? testInProcessDriverTimeoutFloorMs : 10'000;
+        const long floorMs = testAeronLivenessDefaultMs > 0 ? testAeronLivenessDefaultMs : 10'000;
         return ms > floorMs ? ms : floorMs;
     }
     [[nodiscard]] bool shardMode() const noexcept { return workerMode == WorkerMode::Shard; }

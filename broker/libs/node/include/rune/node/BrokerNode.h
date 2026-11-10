@@ -2178,6 +2178,10 @@ public:
 
     /// Test-only: the node-level embedded driver (spec §3.6 one-pumper counters).
     EmbeddedDriver* driverForTest() const noexcept { return nodeDriver_.get(); }
+    /// Test-only: the media-driver timeout (ms) of the runtime client (worker < 0) or of a worker's client.
+    [[nodiscard]] long clientDriverTimeoutMsForTest(int32_t worker) const {
+        return (worker < 0 ? aeron_ : shardClients_[static_cast<std::size_t>(worker)])->context().mediaDriverTimeout();
+    }
 
     /// Test-only: does the runtime have a thread of its own?  `thread` placement:
     /// true while running; `fused` placement (spec §3.2): always false — the

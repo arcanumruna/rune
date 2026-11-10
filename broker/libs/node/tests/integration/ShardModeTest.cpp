@@ -2534,14 +2534,32 @@ TEST(ShardModeRegression, BrokerSurvivesAProcessFreezePastAeronLivenessDefaultSt
     expectBrokerSurvivesAFreeze(makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true), 12s, 5s);   // the default placement
 }
 
-// The same with the floor under the in-process client's driver timeout lowered to 0.3 s: the freeze is past it, the broker's own
-// (1 h) liveness must still carry the client and the driver.
+// The same with Aeron's client and driver liveness defaults lowered to 0.3 s: the freeze is past them, the broker's own (1 h) liveness
+// must still carry the client and the driver.  RED without either override (EmbeddedDriver's clientLivenessTimeoutNs, BrokerNode's
+// mediaDriverTimeout).
 TEST(ShardModeRegression, BrokerSurvivesAProcessFreezePastALoweredLivenessFloorRegression) {
     TmpDir dir{"freezef"};
     const auto ports = ShardPorts::discover(1, 1);
     NodeConfig cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true);
-    cfg.testInProcessDriverTimeoutFloorMs = 300;
+    cfg.testAeronLivenessDefaultMs = 300;
     expectBrokerSurvivesAFreeze(cfg, 500ms, 300ms);
+}
+
+// The clients' half: the runtime client and every worker's client wait for their driver the node's liveness, not Aeron's default (lowered
+// to 0.3 s here).  A freeze cannot show it deterministically - the client's check races the driver's first heartbeat after the resume.
+// RED without BrokerNode's mediaDriverTimeout on either client.
+TEST(ShardModeRegression, InProcessClientsWaitForTheirDriverTheNodesLivenessRegression) {
+    TmpDir dir{"cliveness"};
+    const auto ports = ShardPorts::discover(1, 2);
+    NodeConfig cfg = makeShardConfig(0, dir.path, ports, 1, 2, /*fused=*/false);
+    cfg.testAeronLivenessDefaultMs = 300;
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    const long want = static_cast<long>(cfg.shardClientLivenessTimeoutNs / 1'000'000);
+    EXPECT_EQ(node.clientDriverTimeoutMsForTest(-1), want) << "the runtime client";
+    for (int32_t w = 0; w < 2; ++w) EXPECT_EQ(node.clientDriverTimeoutMsForTest(w), want) << "worker " << w;
+    node.stop();
 }
 
 // ===========================================================================
