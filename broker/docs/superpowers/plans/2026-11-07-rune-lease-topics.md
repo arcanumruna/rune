@@ -1416,6 +1416,12 @@ Spec §15.1 (budgets), §16.6; CLAUDE.md §2 latency budgets.
 - [ ] If the bench box is unavailable: the PR says so and one issue per gate is filed (Execution context).
 - [ ] Commit and push.
 
+**As built (Task 23, reduced):** `AckEntry` is back to 64 bytes (`alignas(64)`, `static_assert(sizeof == 64)`). `assignedBase`
+and `logStartOffset` were never both meaningful (an error ack carries the log start / retry-after, an ok ack the assigned
+base), so they share one slot, `aux_`, read through `assignedBase()` / `logStartOffset()` by the error code; `setAssignedBase`
+is called only on an ok ack (no path rewrites the error code of a queued ack, so there is no separate fail setter). Regressions:
+`AckEntryIsOneCacheLineRegression`, `AckAuxSlotByErrorCodeRegression`. The benchmark gates above remain owed (#841-#845).
+
 ### Task 24: docs
 
 Spec §20 P2.5.

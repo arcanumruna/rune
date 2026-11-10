@@ -2351,13 +2351,13 @@ private:
         // D6: an UnknownProducerId result carries the log start in baseOffset
         // (the carrier does not grow); the sink gates it per session version.
         if (ret.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::UnknownProducerId))
-            a.logStartOffset = ret.baseOffset;
+            a.setLogStartOffset(ret.baseOffset);
         // Namespaces Phase 2 Task 14 (D28): Throttled's retry-after (ns, in lastOffset) rides logStartOffset, as on
         // the gateway path; the sink drops it for a client below v14.
         else if (ret.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::Throttled))
-            a.logStartOffset = ret.lastOffset;
-        a.assignedBase = ret.assignedBase;
+            a.setLogStartOffset(ret.lastOffset);
         if (ok) {
+            a.setAssignedBase(static_cast<int64_t>(ret.assignedBase));
             a.hasVerdicts  = ret.hasVerdicts;
             a.verdictCount = ret.verdictCount;
             a.verdictRun   = ret.hasVerdicts != 0 ? ret.verdictRun : kNoVerdictRun;

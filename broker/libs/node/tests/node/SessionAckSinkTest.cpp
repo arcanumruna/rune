@@ -407,7 +407,7 @@ TEST(SessionAckSinkRegression, RegistrationThatResolvedToErrorIsNeverDrained) {
 namespace {
 AckEntry unknownPid(int64_t sid, int64_t corr, int64_t logStart) {
     AckEntry a{sid, corr, 0, 3, static_cast<int16_t>(pc::ErrorCode::UnknownProducerId)};
-    a.logStartOffset = logStart;
+    a.setLogStartOffset(logStart);
     return a;
 }
 std::optional<pc::ProduceResponse> sentTo(const FakePolicy::State& st, int64_t sid) {
@@ -1167,7 +1167,7 @@ TEST(SessionAckSinkRegression, MassCloseOfEverySessionKeepsEveryTombstoneRegress
 namespace {
 AckEntry v17Ack(int64_t sid, int64_t corr, uint64_t assignedBase, bool trailer) {
     AckEntry a{sid, corr, 5, 2, 0};
-    a.assignedBase = assignedBase;
+    a.setAssignedBase(static_cast<int64_t>(assignedBase));
     a.hasVerdicts  = trailer ? 1 : 0;
     return a;
 }
@@ -1367,4 +1367,54 @@ TEST(SessionAckSinkRegression, ClientVersionOfNonPositiveSessionIsDefiniteRegres
     EXPECT_EQ(s.clientVersionOf(0), 0) << "session 0 never announces: definite";
     EXPECT_EQ(s.clientVersionOf(-1), 0);
     EXPECT_EQ(s.clientVersionOf(INT64_MIN), 0);
+}
+
+// ===========================================================================
+// Task 23 (reduced): AckEntry is one cache line; its single aux slot is read by the error code.
+// ===========================================================================
+static_assert(sizeof(AckEntry) == 64, "AckEntry is one cache line");
+
+TEST(SessionAckSinkAckEntryRegression, AckEntryIsOneCacheLineRegression) {
+    EXPECT_EQ(sizeof(AckEntry), 64u);
+    EXPECT_EQ(alignof(AckEntry), 64u);
+}
+
+TEST(SessionAckSinkAckEntryRegression, AckAuxSlotByErrorCodeRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ASSERT_TRUE(s.announce(7, "c7", 1, pc::kClientVersion));
+    ASSERT_TRUE(s.announce(8, "c8", 1, pc::kClientVersionNamespaces - 1));
+    pass(s); pass(s);
+    // 1: an ok ack with an assigned base
+    AckEntry ok{7, 1, 5, 2, 0};
+    ok.setAssignedBase(77);
+    // 2: UnknownProducerId with a log start
+    AckEntry unk{7, 2, 0, 3, static_cast<int16_t>(pc::ErrorCode::UnknownProducerId)};
+    unk.setLogStartOffset(5);
+    // 3: Throttled with a retry-after, to a v14+ session and to one below
+    AckEntry thr{7, 3, 0, 3, static_cast<int16_t>(pc::ErrorCode::Throttled)};
+    thr.setLogStartOffset(9);
+    AckEntry thrOld{8, 4, 0, 3, static_cast<int16_t>(pc::ErrorCode::Throttled)};
+    thrOld.setLogStartOffset(9);
+    // 4: any other error ack carries neither value (the slot keeps its -1)
+    AckEntry failed{7, 5, 5, 2, static_cast<int16_t>(pc::ErrorCode::NotLeader)};
+    for (const AckEntry& a : {ok, unk, thr, thrOld, failed}) ASSERT_TRUE(s.enqueue(a));
+    pass(s);
+    auto frame = [&](int64_t corr) {
+        for (const auto& [pub, f] : st->sent)
+            if (auto r = pc::ProduceResponse::decode(f.data(), f.size()); r && r->correlationId == corr) return r;
+        return std::optional<pc::ProduceResponse>{};
+    };
+    auto r1 = frame(1); ASSERT_TRUE(r1);
+    EXPECT_EQ(r1->assignedBase, 77u);
+    EXPECT_EQ(r1->logStartOffset, -1);
+    auto r2 = frame(2); ASSERT_TRUE(r2);
+    EXPECT_EQ(r2->logStartOffset, 5);
+    EXPECT_EQ(r2->assignedBase, 0u);
+    auto r3 = frame(3); ASSERT_TRUE(r3);
+    EXPECT_EQ(r3->logStartOffset, 9);
+    auto r4 = frame(4); ASSERT_TRUE(r4);
+    EXPECT_EQ(r4->logStartOffset, -1) << "a pre-v14 client gets no retry-after";
+    auto r5 = frame(5); ASSERT_TRUE(r5);
+    EXPECT_EQ(r5->logStartOffset, -1) << "an error ack without a log start";
+    EXPECT_EQ(r5->assignedBase, 0u);
 }

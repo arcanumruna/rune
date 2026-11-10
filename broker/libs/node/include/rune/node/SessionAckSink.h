@@ -117,7 +117,7 @@ namespace rune::node {
 
 inline constexpr uint32_t kNoVerdictRun = 0xFFFF'FFFFu;
 
-struct AckEntry {
+struct alignas(64) AckEntry {
     int64_t sessionId     = 0;
     int64_t correlationId = 0;
     int64_t baseOffset    = 0;
@@ -134,12 +134,12 @@ struct AckEntry {
     /// Unknown-session hold (I1): the lifecycle-ring producer position sampled
     /// at the first flush that saw this ack with no session; -1 = not held.
     int64_t sessionPos    = -1;
-    /// D6: with errorCode == UnknownProducerId, the partition's log start
-    /// (ProduceResponse.logStartOffset); -1 = not carried.
-    int64_t logStartOffset = -1;
-    /// Client 17 (checked writes): the key a key-0 create was assigned (0 = none), and the verdict trailer of a View ack
-    /// (verdictCount entries at verdictRun in the worker's arena; kNoVerdictRun = none).  A session below 17 never sees them.
-    uint64_t assignedBase  = 0;
+    /// ONE slot for the two values that are never meaningful together (keeps the entry one cache line): errorCode == 0 = the
+    /// key a key-0 create was assigned (0 = none, Client 17); errorCode != 0 = the log start of an UnknownProducerId (D6) or the
+    /// retry-after of a Throttled (-1 = none).  The error code decides; use the accessors.
+    int64_t aux_           = -1;
+    /// Client 17 (checked writes): the verdict trailer of a View ack (verdictCount entries at verdictRun in the worker's
+    /// arena; kNoVerdictRun = none).  A session below 17 never sees it.
     uint32_t verdictRun    = kNoVerdictRun;
     uint16_t verdictCount  = 0;
     uint8_t  hasVerdicts   = 0;
@@ -147,7 +147,13 @@ struct AckEntry {
     uint32_t leaseRun      = kNoVerdictRun;
     uint16_t leaseCount    = 0;
     uint8_t  hasLease      = 0;
+
+    [[nodiscard]] int64_t assignedBase() const noexcept   { return errorCode == 0 && aux_ > 0 ? aux_ : 0; }
+    [[nodiscard]] int64_t logStartOffset() const noexcept { return errorCode != 0 ? aux_ : -1; }
+    void setAssignedBase(int64_t v) noexcept   { aux_ = v; }   ///< only on an ok ack
+    void setLogStartOffset(int64_t v) noexcept { aux_ = v; }   ///< only on an error ack
 };
+static_assert(sizeof(AckEntry) == 64, "AckEntry is one cache line");
 
 inline constexpr uint32_t kVerdictAckArenaEntries = 65536;
 static_assert(std::has_single_bit(kVerdictAckArenaEntries), "the arena is a power of two");
@@ -249,7 +255,7 @@ public:
     static constexpr std::size_t kMaxChannelSlots  = 256;              // announcements awaiting add()
     /// Bound: Worker.h (static_asserts there).  D8c fix round 1: 2 x the
     /// worker's reserve (owed ceiling + drain + poll = 16384) — the other half is
-    /// the gateway-routed share (Worker::kRoutedAckBudget).  48 B each (D6 logStartOffset): 1.5 MiB,
+    /// the gateway-routed share (Worker::kRoutedAckBudget).  64 B each (one cache line): 2 MiB,
     /// heap (setShardClient).
     static constexpr std::size_t kAckCapacity      = 32768;
     static constexpr std::size_t kMaxChannelBytes  = 255;
@@ -1410,9 +1416,9 @@ private:
         r.errorCode      = a.errorCode;
         r.partition      = a.partition;
         r.baseOffset     = a.baseOffset;
-        r.logStartOffset = a.logStartOffset;
+        r.logStartOffset = a.logStartOffset();
         // Client 17: encodeFor writes these only for a session at 17 or later.
-        r.assignedBase   = a.assignedBase;
+        r.assignedBase   = static_cast<uint64_t>(a.assignedBase());
         r.hasVerdicts    = a.hasVerdicts != 0;
         r.verdictCount   = a.verdictCount;
         if (a.verdictCount != 0) r.verdictBytes = verdicts_.entries(a.verdictRun);
