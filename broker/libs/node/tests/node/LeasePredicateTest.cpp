@@ -384,6 +384,7 @@ TEST(LeasePredicateWorkerRegression, CheckpointInvisibleToUserViewsRegression) {
     VerdictRig& r = g.r;
     installAll(r);
     ASSERT_TRUE(g.send({grantRec(1, "a1")}));
+    ASSERT_TRUE(r.driveUntilJudged());   // the live fold has every record (a fixed pass count races the driver under TSan)
     r.passes(30);
     const Snapshot before = snap(r, 1, "a1");
     ASSERT_TRUE(before.proj && before.byAddr && before.cnt);
@@ -427,6 +428,7 @@ TEST(LeasePredicateWorkerRegression, RebuildFoldsLikeLiveRegression) {
     ASSERT_TRUE(g.send({checkpointRec(1, liveVersion(r, 1), "ck")}));   // a differing addr: a fold of it would show
     ASSERT_TRUE(g.send({updateRec(2, liveVersion(r, 2), "b2")}));
     ASSERT_TRUE(g.send({revokeRec(3, liveVersion(r, 3), "a3")}));
+    ASSERT_TRUE(r.driveUntilJudged());   // the live fold has every record (a fixed pass count races the driver under TSan)
     r.passes(30);
     const std::pair<uint64_t, const char*> keys[] = {{1, "a1"}, {2, "a2"}, {2, "b2"}, {3, "a3"}};
     std::vector<Snapshot> before;
@@ -467,6 +469,7 @@ TEST(LeasePredicateWorkerRegression, PersistedRebuildFoldsLikeLiveRegression) {
     ASSERT_TRUE(g.send({checkpointRec(1, liveVersion(r, 1), "ck")}));   // a differing addr: a fold of it would show
     ASSERT_TRUE(g.send({updateRec(2, liveVersion(r, 2), "b2")}));
     ASSERT_TRUE(g.send({revokeRec(3, liveVersion(r, 3), "a3")}));
+    ASSERT_TRUE(r.driveUntilJudged());   // the live fold has every record (a fixed pass count races the driver under TSan)
     r.passes(30);
     const std::pair<uint64_t, const char*> keys[] = {{1, "a1"}, {2, "a2"}, {2, "b2"}, {3, "a3"}};
     std::vector<Snapshot> before;

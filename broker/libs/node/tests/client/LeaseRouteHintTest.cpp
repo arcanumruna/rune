@@ -35,11 +35,12 @@ TEST(LeaseRouteHintRegression, KeepAliveGoesStraightToLeaderRegression) {
     const rc::LeaseResult g = lt.grantAndWait(lt3::row("hint", 1), o);
     ASSERT_TRUE(g.ok());
     auto& c = t.client();
-    const uint64_t red0 = c.ctlRedirectsFollowed(), hit0 = c.routeHintHits();
+    const lt3::RouteCounters r0 = lt3::settledRouteCounters(c);
     for (int i = 0; i < 20; ++i) ASSERT_TRUE(lt.keepAliveOnceAndWait(lt3::row("hint"), g.version).ok()) << i;
-    EXPECT_LE(c.ctlRedirectsFollowed() - red0, 1u) << "only the first keepalive is redirected";
-    EXPECT_GE(c.routeHintHits() - hit0, 19u) << "every later keepalive starts on the remembered leader";
-    EXPECT_GE(c.routeHintLearned(), 1u);
+    const lt3::RouteCounters r1 = lt3::settledRouteCounters(c);
+    EXPECT_LE(r1.redirects - r0.redirects, 1u) << "only the first keepalive is redirected";
+    EXPECT_GE(r1.hits - r0.hits, 19u) << "every later keepalive starts on the remembered leader";
+    EXPECT_GE(r1.learned, 1u);
 }
 
 TEST(LeaseRouteHintRegression, HintClearedOnLeaderChangeRegression) {
@@ -53,8 +54,8 @@ TEST(LeaseRouteHintRegression, HintClearedOnLeaderChangeRegression) {
     ASSERT_TRUE(g.ok());
     auto& c = t.client();
     for (int i = 0; i < 5; ++i) ASSERT_TRUE(lt.keepAliveOnceAndWait(lt3::row("hint"), g.version).ok()) << i;
+    const uint64_t cleared0 = lt3::settledRouteCounters(c).cleared;
     ASSERT_GE(c.routeHintLearned(), 1u);
-    const uint64_t cleared0 = c.routeHintCleared();
     (void)t.killLeader(*topic, 0);
     const int32_t newLeader = t.leaderOf(*topic, 0);
     ASSERT_GT(newLeader, 0);
@@ -62,16 +63,17 @@ TEST(LeaseRouteHintRegression, HintClearedOnLeaderChangeRegression) {
     bool ok = false;
     rc::LeaseOptions ko;
     ko.opTimeoutMs = 300;
-    while (!ok && msSince(t0) < 1500) {
+    const int64_t budgetMs = lt3::kSanitized ? 15'000 : 1500;   // the 1.5 s budget in a plain build; under a sanitizer only "they recover"
+    while (!ok && msSince(t0) < budgetMs) {
         try { ok = lt.keepAliveOnceAndWait(lt3::row("hint"), g.version, ko).ok(); } catch (const std::exception&) {}
         if (!ok) std::this_thread::sleep_for(20ms);
     }
     EXPECT_TRUE(ok) << "keepalives succeed again within 1.5 s of the new leader";
-    EXPECT_GT(c.routeHintCleared(), cleared0) << "the hint naming the dead leader was dropped";
+    EXPECT_GT(lt3::settledRouteCounters(c).cleared, cleared0) << "the hint naming the dead leader was dropped";
     if (newLeader != t.seedNode()) {   // a seed-led partition is served without a Redirect: nothing to remember
-        const uint64_t hit0 = c.routeHintHits();
+        const uint64_t hit0 = lt3::settledRouteCounters(c).hits;
         for (int i = 0; i < 20; ++i) ASSERT_TRUE(lt.keepAliveOnceAndWait(lt3::row("hint"), g.version).ok()) << i;
-        EXPECT_GE(c.routeHintHits() - hit0, 15u) << "the hint now names the new leader";
+        EXPECT_GE(lt3::settledRouteCounters(c).hits - hit0, 15u) << "the hint now names the new leader";
     }
 }
 
@@ -101,8 +103,9 @@ TEST(LeaseRouteHintRegression, ViewReadGoesStraightToLeaderRegression) {
         std::this_thread::sleep_for(50ms);
     }
     ASSERT_GE(c.routeHintLearned(), 1u) << "the first read followed a Redirect to the leader";
-    const uint64_t red0 = c.ctlRedirectsFollowed(), hit0 = c.routeHintHits();
+    const lt3::RouteCounters r1 = lt3::settledRouteCounters(c);
     for (int i = 0; i < 20; ++i) (void)read();
-    EXPECT_EQ(c.ctlRedirectsFollowed() - red0, 0u) << "no further Redirect";
-    EXPECT_GE(c.routeHintHits() - hit0, 20u) << "every later read starts on the remembered leader";
+    const lt3::RouteCounters r2 = lt3::settledRouteCounters(c);
+    EXPECT_EQ(r2.redirects - r1.redirects, 0u) << "no further Redirect";
+    EXPECT_GE(r2.hits - r1.hits, 20u) << "every later read starts on the remembered leader";
 }
