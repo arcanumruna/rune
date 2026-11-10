@@ -258,11 +258,25 @@ std::unique_ptr<rune::consensus::BackoffIdleStrategy> makeShapedBackoff(const No
     return std::make_unique<rune::consensus::BackoffIdleStrategy>(
         s.spins, s.yields, std::chrono::nanoseconds{s.minParkNs}, std::chrono::nanoseconds{s.maxParkNs});
 }
+
+/// Releases the fused startup gate when start() unwinds, on the starter thread (its TLS must not keep a dead gate).
+struct ReleaseGateOnUnwind {
+    rune::aeronutil::StartupClientGate& gate;
+    ~ReleaseGateOnUnwind() { gate.release(); }
+};
+
+/// A system log's recovery is storage only (no aeron_ call), so the fused interim pump may service the client meanwhile.
+void recoverSystemLog(rune::storage::Log& log, const std::function<void(std::string_view)>& phaseHook, std::string_view phase) {
+    rune::aeronutil::StartupClientGate::Yield pumpMayRun;
+    if (phaseHook) phaseHook(phase);   // test-only fault injection
+    log.recover();
+}
 } // namespace
 
 void BrokerNode::start() {
     if (started_) return; // idempotent (controller-owned flag, F9a)
     started_ = true;
+    ReleaseGateOnUnwind releaseStartupGate{startupGate_};
     // F9a fix round 1: the thread that starts the node is the ONE leadership
     // observer (isLeader/leaderId/... drain the ring; others are refused).
     // Bound before the control thread exists (ordered by its start).
@@ -490,6 +504,7 @@ void BrokerNode::start() {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
         ctx.mediaDriverTimeout(config_.inProcessDriverTimeoutMs());   // in-process driver: survive own stalls
+        if (config_.testAeronClientIdleSleepMs > 0) ctx.idleSleepDuration(config_.testAeronClientIdleSleepMs);   // TEST-ONLY
         // Spec §3.2 fused placement: the runtime client has no conductor thread
         // either — its conductor runs in worker 0's pass (during start(): in the
         // interim pump runner below).
@@ -500,12 +515,17 @@ void BrokerNode::start() {
         }
         // Fused: the runtime's invoker driver + conductor are serviced by an
         // interim pump runner from HERE until worker 0 takes them over (step
-        // 7b) — every startup phase, however long, keeps them live (time-
-        // independent: no phase may out-last the client liveness timeout).
+        // 7b).  The runner invokes the client only while the starter is out of
+        // it: during a resolve's sleep or a StartupClientGate::Yield.  Between
+        // those the client is unserviced, which is safe because the in-process
+        // client liveness is 1 h (kInProcessLivenessNs); a test that lowers it
+        // must keep every other phase shorter.  A new long wait in start() that makes no aeron_ call
+        // holds a StartupClientGate::Yield, like the system-log recoveries and the shard-driver stall.
         // Startup resolves on aeron_ then use the default sleep-poll pump,
         // exactly as with thread placement's driver/conductor threads.
         if (config_.fused()) {
-            startupPumpAgent_  = std::make_unique<DriverPumpAgent>(*nodeDriver_, *aeron_);
+            startupGate_.acquire();   // released by stopStartupPump_()
+            startupPumpAgent_  = std::make_unique<DriverPumpAgent>(*nodeDriver_, *aeron_, startupGate_);
             startupPumpIdle_   = makeBackoffIdle(config_.idleMaxParkUs);
             startupPumpRunner_ = std::make_unique<rune::consensus::AgentRunner>(
                 *startupPumpAgent_, *startupPumpIdle_, clock_);
@@ -1150,6 +1170,10 @@ void BrokerNode::buildReplication() {
         config_.dataDir, std::chrono::duration_cast<std::chrono::nanoseconds>(
                              std::chrono::system_clock::now().time_since_epoch()).count()));
     replicaRegistry_->setStorageId(storage_.id);   // ISR v3 Step 6: stamped next to the incarnation
+    {
+        const std::string boot = StorageIdentity::osBootId();
+        replicaRegistry_->setBootId(StorageIdentity::storageFailedThisBoot(config_.dataDir, boot) ? std::string{} : boot);
+    }
     if (config_.testHoldFollowerFetchesMs > 0)   // TEST-ONLY (B-I8): a member that cannot catch up yet
         replicaRegistry_->setHoldFetchesUntilForTest(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
@@ -1699,6 +1723,7 @@ void BrokerNode::buildWorkerPool() {
         workerPool_->worker(i).setDesiredFragmentLimit(config_.gatewayFragmentLimit);
         workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
         workerPool_->worker(i).setVerdictIntervalNs(config_.verdictIntervalMs * 1'000'000LL);
+        workerPool_->worker(i).setTxnJudgedRecordsMax(config_.txnJudgedRecordsMax);
         workerPool_->worker(i).setBackgroundSyncIntervalNs(config_.workerSyncIntervalMs * 1'000'000LL);
         if (!config_.ioWorkerCpus.empty()) workerPool_->worker(i).setIoWorkerCpus(config_.ioWorkerCpus);
         workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
@@ -1944,6 +1969,8 @@ void BrokerNode::buildWorkerPool() {
 //   TODO(Milestone B): per-peer client endpoints for exact REDIRECT.
 // ---------------------------------------------------------------------------
 void BrokerNode::onStorageFailure_(const std::string& logDir, int err) {
+    if (!StorageIdentity::markStorageFailedThisBoot(config_.dataDir, StorageIdentity::osBootId()))
+        spdlog::critical("BrokerNode[{}]: could not record the storage failure in {}", config_.nodeId, config_.dataDir);
     if (haltRaised_) return;
     haltRaised_ = true;
     spdlog::critical("BrokerNode[{}]: STORAGE FAILURE — fsync failed on {} (errno={}: {}). "
@@ -2054,7 +2081,6 @@ void BrokerNode::refuseStartOnFailedRecovery_() {
 }
 
 void BrokerNode::buildGateway() {
-    if (startupPhaseHookForTest_) startupPhaseHookForTest_("build-gateway");   // test-only fault injection
     // Capture config_ by value (immutable after construction).
     const std::string clientChannel  = config_.clientEndpoint.channel;
     const int32_t     clientStreamId = config_.clientEndpoint.streamId;
@@ -2334,7 +2360,7 @@ void BrokerNode::buildGateway() {
             // One partition Log for all committed offsets (compact key/value encoding).
             offsetLog_ = std::make_unique<rune::storage::Log>(
                 offsetDir.string(), config_.offsetLogSegmentRollBytes);
-            offsetLog_->recover();
+            recoverSystemLog(*offsetLog_, startupPhaseHookForTest_, "offset-recover");
             refuseStartOnDamagedSystemLog_();   // #839: before offsetStore_->rebuildFromLog() (its first reader)
 
             // Wrap in a PartitionReplica for the __consumer_offsets topic.
@@ -2480,7 +2506,7 @@ void BrokerNode::buildGateway() {
             fs::create_directories(txnDir);
 
             txnLog_ = std::make_unique<rune::storage::Log>(txnDir.string(), config_.offsetLogSegmentRollBytes);
-            txnLog_->recover();
+            recoverSystemLog(*txnLog_, startupPhaseHookForTest_, "txn-recover");
             refuseStartOnDamagedSystemLog_();   // #839: before the txn store's rebuild (its first reader)
 
             const NodeId selfId = static_cast<NodeId>(config_.nodeId);
@@ -2557,11 +2583,12 @@ void BrokerNode::buildGateway() {
                 [this]() -> NodeId { return leaderObserver_.computeOnControl().leaderId; });
 
             txnCoordService_->setGateway(gateway_.get());
+            if (txnVoteHoldForTest_) txnCoordService_->setVoteHoldFn(txnVoteHoldForTest_);
             // D9 review MEDIUM-3: the stuck-markers gauge → its Aeron counter.
             txnCoordService_->setStuckMarkersSink(&BrokerNode::publishStuckMarkers_, this);
             txnCoordService_->setStuckTxnOffsetsSink(&BrokerNode::publishStuckTxnOffsets_, this);   // #359
 
-            gateway_->setTxnService(txnCoordService_.get());
+            wireTxnVote(*gateway_, *txnCoordService_, voteCandidateTopics_);
             // Phase 2b F Task 11: a committed transaction's consumer-group offsets (TxnOffsetCommit) are applied to
             // the group coordinator's offset store - without this they were accepted and silently dropped.
             if (groupCoordService_) {
@@ -2609,12 +2636,16 @@ void BrokerNode::buildGateway() {
                 replTransport_->setTxnVerifyHandlers(
                     &rune::gateway::ClientGateway::onVerifyTxnPartitionThunk,
                     &rune::gateway::ClientGateway::onVerifyTxnPartitionResponseThunk, gateway_.get());
+                replTransport_->setTxnVoteHandlers(&rune::gateway::ClientGateway::onTxnVoteThunk,
+                                                   &rune::gateway::ClientGateway::onTxnVoteResponseThunk, gateway_.get());
                 gateway_->setTxnMarkerChannel(rune::gateway::ClientGateway::TxnMarkerChannel{
                     &rune::replication::AeronPartitionTransport::sendWriteTxnMarkerThunk,
                     &rune::replication::AeronPartitionTransport::sendWriteTxnMarkerResponseThunk,
                     replTransport_.get(),
                     &rune::replication::AeronPartitionTransport::sendVerifyTxnPartitionThunk,
-                    &rune::replication::AeronPartitionTransport::sendVerifyTxnPartitionResponseThunk});
+                    &rune::replication::AeronPartitionTransport::sendVerifyTxnPartitionResponseThunk,
+                    &rune::replication::AeronPartitionTransport::sendTxnVoteThunk,
+                    &rune::replication::AeronPartitionTransport::sendTxnVoteResponseThunk});
             }
 
             spdlog::info("BrokerNode[{}]: TransactionCoordinationService wired (txn state at {})",
@@ -2625,7 +2656,7 @@ void BrokerNode::buildGateway() {
             spdlog::error("BrokerNode[{}]: TransactionCoordinationService setup failed: {}; "
                           "transactions will not work", nodeId, ex.what());
             if (groupCoordService_) groupCoordService_->setTxnOffsetHoldProbe(nullptr, nullptr);   // #438
-            txnCoordService_.reset();
+            releaseTxnCoordinator(gateway_.get(), txnCoordService_);
             txnState_.reset();
             txnReplica_.reset();
             txnLog_.reset();
@@ -2669,7 +2700,7 @@ void BrokerNode::buildGateway() {
             fs::create_directories(metaDir);
 
             metadataLog_ = std::make_unique<rune::storage::Log>(metaDir.string(), config_.offsetLogSegmentRollBytes);
-            metadataLog_->recover();
+            recoverSystemLog(*metadataLog_, startupPhaseHookForTest_, "metadata-recover");
             refuseStartOnDamagedSystemLog_();   // #839: before metadataService_->rebuildFromLog() (its first reader)
 
             const NodeId selfId = static_cast<NodeId>(config_.nodeId);
@@ -2815,7 +2846,8 @@ void BrokerNode::buildGateway() {
                 metadataService_->setAllowSurvivorElection(config_.survivorLeaderElection);
                 // Task 11 fix round 5 (I1): a young controller process waits one
                 // report TTL before deciding user-partition leadership.
-                metadataService_->setUnservableReportWarmup(MetadataService::kUnservableReportTtlNs);
+                static_assert(NodeConfig::kDefaultUnservableWarmupMs * 1'000'000 == MetadataService::kUnservableReportTtlNs, "the default warm-up is one report TTL");
+                metadataService_->setUnservableReportWarmup(config_.unservableWarmupMs * 1'000'000);
                 // D15: the metadata feature level is raised only once every
                 // member advertised it (its node-control registration).
                 metadataService_->setClusterMembers(balancerNodes);
@@ -2965,6 +2997,9 @@ void BrokerNode::buildGateway() {
     if (!config_.isSingleNode() && election_ && workerPool_) {
         for (int32_t i = 0; i < workerPool_->workerCount(); ++i) workerPool_->worker(i).requireViewReadLease();
         runtimeAgent_->enableReadLeaseFanout(workerPool_->workerCount());
+        election_->setReadLeaseMaxNs(config_.readLeaseMaxMs * 1'000'000LL);
+        if (metadataService_)
+            metadataService_->setReadLeaseFenceWaitNs(election_->readLeaseFenceWaitNs());
         if (metadataService_)
             metadataService_->setLeaderMoveFence(
                 [](void* e, int32_t old, int64_t nowNs) noexcept {
@@ -4346,6 +4381,7 @@ void BrokerNode::buildCatalog_() {
     if (replicaRegistry_ && replicaRegistry_->processIncarnation() != 0)
         catalogReplica_->setProcessIncarnation(replicaRegistry_->processIncarnation());
     catalogReplica_->setStorageId(storage_.id);   // ISR v3 Step 6
+    if (replicaRegistry_) catalogReplica_->setBootId(replicaRegistry_->bootId());
     if (config_.testHoldFollowerFetchesMs > 0)
         catalogReplica_->holdFetchesUntilForTest(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
@@ -4440,6 +4476,7 @@ void BrokerNode::buildSecurity_() {
     if (replicaRegistry_ && replicaRegistry_->processIncarnation() != 0)
         securityReplica_->setProcessIncarnation(replicaRegistry_->processIncarnation());
     securityReplica_->setStorageId(storage_.id);   // ISR v3 Step 6
+    if (replicaRegistry_) securityReplica_->setBootId(replicaRegistry_->bootId());
     if (config_.testHoldFollowerFetchesMs > 0)
         securityReplica_->holdFetchesUntilForTest(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
@@ -4863,13 +4900,14 @@ void BrokerNode::stop() {
     workerPool_.reset();      // E1: holds non-owning replica ptrs; drop before replicaRegistry_ frees them
     // TX-3: destroy txn coordination service before gateway (holds gateway* + txnState*).
     if (groupCoordService_) groupCoordService_->setTxnOffsetHoldProbe(nullptr, nullptr);   // #438: its ctx goes
-    txnCoordService_.reset(); // TransactionCoordinationService (no Aeron resources, holds gateway*)
+    releaseTxnCoordinator(gateway_.get(), txnCoordService_); // TransactionCoordinationService (no Aeron resources, holds gateway*)
     // CG-6: destroy group coordination service before gateway (it holds a gateway* ref).
     groupCoordService_.reset(); // GroupCoordinationService (no Aeron resources, holds gateway* + offsets*)
     // D9: the transport outlives the gateway — drop its marker handlers (ctx = gateway).
     if (replTransport_) {
         replTransport_->setTxnMarkerHandlers(nullptr, nullptr, nullptr);
         replTransport_->setTxnVerifyHandlers(nullptr, nullptr, nullptr);   // #112
+        replTransport_->setTxnVoteHandlers(nullptr, nullptr, nullptr);
         replTransport_->setPlaneReconnectHandler(nullptr, nullptr);
     }
     gateway_.reset();         // ClientGateway: deregisters Subscription + ExclusivePubs
@@ -5005,8 +5043,18 @@ void BrokerNode::fanoutViewPlan_(ViewPlanUpdateMsg msg) {
     } else if (auto plan = rune::view::deserializeCompiledViewPlan(msg.planBlob);
                plan && !plan->sourceTopicId.empty()) {
         if (gateway_) gateway_->noteViewSource(msg.viewTopicId, plan->sourceTopicId[0]);
+        voteCandidateTopics_.noteViewSources(plan->sourceTopicId);
     }
     viewFanoutBacklog_.push_back(ViewFanoutPending{std::move(msg), 0});
+    (void)pumpViewFanout_();
+}
+
+void BrokerNode::fanoutCatalogMark_(int64_t appliedThrough) {
+    // The mark queues behind every plan install and uninstall of the events it covers (#788); an undelivered mark ahead of nothing else is raised in place.
+    if (!viewFanoutBacklog_.empty() && viewFanoutBacklog_.back().catalogMark >= 0 && viewFanoutBacklog_.back().nextWorker == 0)
+        viewFanoutBacklog_.back().catalogMark = std::max(viewFanoutBacklog_.back().catalogMark, appliedThrough);
+    else
+        viewFanoutBacklog_.push_back(ViewFanoutPending{{}, 0, appliedThrough});
     (void)pumpViewFanout_();
 }
 
@@ -5017,13 +5065,14 @@ int BrokerNode::pumpViewFanout_() {
     for (auto& pend : viewFanoutBacklog_) {
         while (pend.nextWorker < n) {
             ViewSnapshotChannel* ch = viewSnapshotChannels_[pend.nextWorker].get();
-            if (ch && !encodeViewPlanUpdate(ch->install,
-                                            ViewSnapshotChannel::kInstallMsgType, pend.msg))
+            if (ch && !(pend.catalogMark >= 0 ? encodeCatalogMark(ch->install, pend.catalogMark)
+                                              : encodeViewPlanUpdate(ch->install, ViewSnapshotChannel::kInstallMsgType, pend.msg)))
                 break;   // ring full → retry next cycle (FIFO: later plans wait)
             ++pend.nextWorker;
             ++work;
         }
         if (pend.nextWorker < n) break;   // FIFO back-pressure
+        if (pend.catalogMark >= 0) { ++done; continue; }
         // Task 12 (N5): the plan is on every worker's install ring — a worker
         // drains it before answering a GetViewRow it has no plan for.
         if (gateway_ && !pend.msg.uninstall) gateway_->noteViewPlanDelivered(pend.msg.viewTopicId);
@@ -5168,6 +5217,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                 if (decodeCatalogApplied(p, n, offset, digest)) {
                     catalogAppliedValue_ = offset;
                     publishCatalogMetrics_();
+                    fanoutCatalogMark_(offset);
                 } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]] {
                     spdlog::error("BrokerNode[{}]: malformed kA2cCatalogApplied (len={}) skipped", config_.nodeId, n);
                 }
@@ -5272,8 +5322,10 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                 return;
             }
             if (tid == kA2cWriteSpec) {   // checked writes: a typed topic's write spec -> every worker, behind its schema versions
-                if (const auto w = decodeTopicWriteSpec(std::span<const uint8_t>(p, n)))
+                if (const auto w = decodeTopicWriteSpec(std::span<const uint8_t>(p, n))) {
+                    voteCandidateTopics_.noteWriteSpec(w->topicId, w->keyIndex);
                     schemaFanout_.postWriteSpec(w->topicId, std::vector<uint8_t>(p, p + n));
+                }
                 else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
                     spdlog::error("BrokerNode[{}]: malformed kA2cWriteSpec (len={}) skipped", config_.nodeId, n);
                 return;
@@ -5668,7 +5720,7 @@ void BrokerNode::anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& clie
                 }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
             } catch (const std::exception& e) { err = e.what(); }
         }
-        if (!s) refuse(ch, err.empty() ? std::string("not resolved") : err);
+        if (!s) refuse(ch, err.empty() ? std::string(pump.deadlineExpired() ? "the driver did not answer within the startup deadline" : "not resolved") : err);
         bindAnchorSubs_.push_back(std::move(s));
         bindAnchorChannels_.push_back(ch);
     }
@@ -5686,7 +5738,7 @@ void BrokerNode::anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& clie
                 }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
             } catch (const std::exception& e) { err = e.what(); }
         }
-        if (!p) refuse(ch, err.empty() ? std::string("not resolved") : err);
+        if (!p) refuse(ch, err.empty() ? std::string(pump.deadlineExpired() ? "the driver did not answer within the startup deadline" : "not resolved") : err);
         bindAnchorPubs_.push_back(std::move(p));
         bindAnchorChannels_.push_back(ch);
     }
@@ -6038,6 +6090,7 @@ void BrokerNode::dropRuntimeTopic_(int32_t topicId, uint32_t nsId, const std::st
     // posted on every path below (pending create, gap id, live topic): the id is dropped on this broker.
     if (workerPool_) topicDroppedFanout_.post(topicId);
     schemaFanout_.forgetTopic(topicId);
+    voteCandidateTopics_.forget(topicId);
     // A typed create still waiting for its spec never ran: forget it, like one waiting behind a drop (below).
     const auto awaitingSpec = pendingCreatesAwaitingSpec_.size();
     std::erase_if(pendingCreatesAwaitingSpec_, [topicId](const TopicSpec& s) { return s.topicId == topicId; });
@@ -6563,6 +6616,7 @@ void BrokerNode::stopStartupPump_() noexcept {
     startupPumpRunner_.reset();
     startupPumpAgent_.reset();
     startupPumpIdle_.reset();
+    startupGate_.release();
 }
 
 // ---------------------------------------------------------------------------
@@ -6627,8 +6681,10 @@ void BrokerNode::buildShardRuntimes_() {
         dcfg.idleStrategy = config_.driverIdleStrategy.empty() ? std::string("sleep-ns") : config_.driverIdleStrategy;
         dcfg.clientLivenessTimeoutNs = config_.shardClientLivenessTimeoutNs;
         shardDrivers_.push_back(std::make_unique<EmbeddedDriver>(std::move(dcfg), DriverMode::Invoker));
-        if (w == shardDriverBuildStallWorkerForTest_) [[unlikely]]
-            std::this_thread::sleep_for(shardDriverBuildStallForTest_);
+        if (w == shardDriverBuildStallWorkerForTest_) [[unlikely]] {
+            rune::aeronutil::StartupClientGate::Yield pumpMayRun;
+            shardDriverBuildStallForTest_();
+        }
         pumpOwnDrivers();
     }
     // Phase 2: clients.

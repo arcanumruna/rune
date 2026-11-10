@@ -208,8 +208,8 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
   `BrokerError` with `errorCode` 55 to 57 and `constraintIdOf(completion)`; a `claimBatch` or Tier-2 batch of two or more records completes once and reports every
   record: `Ok` when all were accepted, else `RecordsRejected` (15) with `value` = the base offset, the first rejection's
   `errorCode`, and a payload of every rejection (`BatchVerdicts`: `rejectedCount()`, `rejection(k)`, `accepted(i)`,
-  `offsetOf(i)`); the other records were stored at base + index. A batch of one record keeps the single-record form
-  (`BrokerError`, value -1). The completion reserves its full size up front (`claimBatch` above the queue's record
+  `offsetOf(i)`, an accepted record's offset, -1 for a rejected one); the other records were stored at base + index. A batch of one record keeps the single-record form
+  (`BrokerError`; `value`, like a rejected single `send`, is the rejected record's own offset). The completion reserves its full size up front (`claimBatch` above the queue's record
   limit returns `MessageTooLarge`). A retry inside the broker's window replays the original verdicts; a retry outside it completes the whole batch
   with `OpStatus::VerdictUnknown` (`errorCode` 21). `OpStatus::StoredIdUnknown` (13) is the same for a key-0 create (see [Autoincrement](#autoincrement)). A transactional
   producer never sends the `View` bit. `SendResult::WriteNotAllowed` reports a write the broker refuses for the topic. On an untyped (raw) topic the broker stores the record intent bits as sent and does not interpret them.
@@ -243,12 +243,12 @@ in offset order, against the records accepted before it:
 | `Update` | empty (removeExisting) | `KeyNotFound` (57) when the key is absent |
 
 - **Requirements**: intents need `Acks::All | Acks::View` (or `Acks::Leader | Acks::View`) and an idempotent producer
-  (every acked producer is). A rejected record is never visible; its completion is `BrokerError` with `errorCode` 56 or 57
+  (every acked producer is), or a transactional producer (the transaction's commit judges them). A rejected record is never visible; its completion is `BrokerError` with `errorCode` 56 or 57
   and `constraintIdOf(completion)` 0. A topic without a key index answers an intent `InvalidRequest`.
 - **Refused locally**: these sends return `SendResult::WriteNotAllowed` (nothing is queued and no completion follows), and
   the blocking forms throw `std::invalid_argument` with the text in quotes: an intent on a raw handle ("intents need a typed
-  topic"), any send of a `View` producer on a raw handle ("acks View needs a typed topic"), an intent without `View` ("intents
-  need acks including View"), an intent on a transactional producer ("intents inside a transaction need Part G"), and an
+  topic"), any send of a `View` producer on a raw handle ("acks View needs a typed topic"), an intent without `View` on a
+  non-transactional producer ("intents need acks including View"), and an
   `Insert` with an empty value ("an insert needs a value"). Tier-2 batches and claims carry no intent.
 - **Retries**: a lost ack is retried and replays the original verdict, so a retried `Insert` gets its own `Ok`, never
   `KeyExists` against itself. A retry outside the broker's window completes with `OpStatus::VerdictUnknown`.
@@ -278,6 +278,51 @@ completes `Ok` with `value` = the offset and `aux` = the id (`assignedKeyOf(comp
 - **Orphaned rows**: an `insertAndWait` that times out may have created the row. Look it up through a unique view before
   inserting again.
 
+### Constraint violations
+
+A write that breaks a `unique` view or a `check` constraint (see [Constraints](ql.md#constraints)) completes with
+`OpStatus::BrokerError` and `errorCode` 55 (`ConstraintViolation`). It needs `Acks::All | Acks::View`: without `View` the
+broker still rejects the record, but the writer is not told.
+
+- **`WriteResult`**: `code()` is 55, `constraintId()` is `viewObjectId << 16 | ordinal` (ordinal 0 is the view's `unique`
+  clause, `k` its `k`-th `constraint`) and `offset()` is the rejected record's own offset. A `Completion` of a single send or of
+  `claimBatch(1)`, a 1-record Tier-2 batch and a 1-record `BatchAck` all carry that offset in `value`. A batch of two or more
+  records completes once with `RecordsRejected` (15) and reports every rejection; a rejected record's offset is `value + rejection(k).index`
+  (`BatchVerdicts::offsetOf(i)` gives an accepted record's offset and -1 for a rejected one).
+- **`Client::constraintName(id)`** returns the `ConstraintName{view, constraint}` an id names (`character_name` / `unique`,
+  `account_stats` / `max_characters`), or `std::nullopt` for id 0 (the key index) and for an id no view ever had. A view that
+  was dropped or replaced since the write still resolves. A miss is answered from one catalog refresh, bounded by
+  `kConstraintNameRefreshTimeout` (5 s; the two-argument form takes another bound), so the call blocks. Call it only from the
+  thread that owns the `Client`; any other thread gets `std::logic_error`.
+- **Racing writers.** The loser of two inserts of one unique key is judged after the winner, so the winner's row is already
+  folded: read the unique view with `minOffset` set to the loser's `offset()`.
+
+```cpp
+// auth-server, login: two first logins race for one (provider, subject)
+rp::gen::User u{.provider = provider, .subject = subject, .createdAt = now};
+WriteResult r = users.insertAndWait(u);              // key 0: the broker assigns userId
+uint64_t userId = r.key();
+if (r.code() == 55) {                                // user_identity already holds this identity
+    auto kb = v::ViewKeyBuilder::fromCatalog(state, "user_identity");
+    kb->setUInt("provider", provider).setString("subject", subject);
+    ViewReadOptions ro{.minOffset = r.offset(), .partition = kb->partition()};
+    ViewRowResult row = client.getViewRowAndWait(identityViewTopicId, *kb->key(), ro, 5s);
+    userId = /* the userId column of row */;         // the winner's id
+}
+
+// character-server, POST /character (the user id comes from the verified JWT)
+WriteResult r = characters.insertAndWait(rp::gen::Character{.userId = u, .name = req.name /* ... */});
+if (r.ok()) return created(r.key());                 // the new characterId
+if (r.code() == 55) {
+    const auto c = client.constraintName(r.constraintId());
+    if (c && c->view == "character_name") return conflict();       // 409 name taken
+    if (c && c->constraint == "max_characters") return badRequest(); // 400 too many characters
+}
+
+// character-server, DELETE /character/{id}
+WriteResult d = characters.removeExistingAndWait(id);  // code() 57 (KeyNotFound) -> 404; a delete is never a 55
+```
+
 ### Acknowledgements
 
 Three zero-allocation ways to learn the outcome of a record:
@@ -303,7 +348,7 @@ if (p.trySend(events, Key(uint64_t{42}), bytes, cq, /*token=*/7) == SendResult::
 ### Batches and flush
 
 ```cpp
-auto batch = p.batch(events, Key(uint64_t{42}));   // one atomic append to one partition: contiguous offsets; View producers get a verdict per record
+auto batch = p.batch(events, Key(uint64_t{42}));   // one atomic append to one partition: contiguous offsets; View producers get a verdict per record. On a verdict source it is all or nothing
 batch.add(bytes);
 batch.send();
 p.flush();
@@ -316,6 +361,8 @@ A batch is built in a preallocated pool slot (`ProducerConfig::tier2Slots`, defa
 `batch()` is single-thread per producer (the creating thread, or the thread that last called `bindBatchThread()`, with no
 builder live): from another thread it returns a refused builder whose `send()` is `WrongThread`. A builder made when every
 slot is in use is refused too (`send()` is `BackPressured`, nothing stored): rebuild the whole batch. `send()` is `[[nodiscard]]`.
+A batch to a verdict source is all or nothing. A rejected one has one completion, `BrokerError` with the code in `errorCode`, the
+constraint id in `constraintIdOf` and the batch's base offset in `value`; it carries no per-record verdicts.
 
 ### Zero-copy claims
 
@@ -461,7 +508,10 @@ try {
     tp.send(out, Key(uint64_t{2}), b);
     const OffsetEntry offsets[] = {{topicId, partition, nextOffset}};
     tp.sendOffsetsToTransactionAndWait(offsets, "economy");   // the consumer group's input offsets
-    tp.commitTransactionAndWait();             // outputs and offsets, atomically
+    const TxnCommitResult r = tp.commitTransactionAndWait();   // outputs and offsets, atomically
+    if (!r.ok) {   // a partition voted no: the transaction is already aborted, begin the next one
+        const auto name = client.constraintName(r.constraintId);   // r.code 55 / 56 / 57 / 62 / 63, r.failingOffset
+    }
 } catch (const std::runtime_error&) {
     if (tp.state() == TxnState::FatalError) return;   // fenced: a newer producer with this id took over
     tp.abortTransactionAndWait();              // roll back
@@ -471,6 +521,12 @@ try {
 - `TxnState`: `Uninitialized`, `Initializing`, `Ready`, `InTransaction`, `CommittingTransaction`,
   `AbortingTransaction`, `AbortableError`, `FatalError`. After a timeout in `CommittingTransaction` the outcome is in doubt:
   retry the same `commitTransactionAndWait()`.
+- **A no vote.** On a topic with constraints, `commitTransactionAndWait()` returns a `TxnCommitResult` (`ok`, `code`,
+  `constraintId`, `failingOffset`) instead of throwing. `code` is 55, 56, 57, 62 or 63; resolve `constraintId` with
+  `Client::constraintName`. After a no the transaction is already aborted and the producer is `Ready`: call `beginTransaction()`
+  for the next one. A retried commit after a coordinator failover gets the same no. Every other failure still throws.
+- **`View` on a transactional producer** is ignored on sends: the verdict comes from the commit, and a commit that returns `ok`
+  means the rows are final on every partition.
 - Sequences continue across transactions under one epoch. After a commit lands, if any partition's sequence counter is
   above 2^30 the commit also bumps the epoch (one `InitProducerId`, every partition restarts at 0) and completes `Ok` once
   the bump is answered; if that bump fails the commit still completes `Ok` (it landed) and the producer is `FatalError`.
@@ -568,7 +624,7 @@ players.send(p);                                                       // routed
   `(…, Completions& cq, Token token)`; `upsert(rec)` (the same as `send(rec)`) and `remove(key)` also have a
   fire-and-forget form. Each has an `…AndWait(…, timeout = kDefaultWriteWait /* 30 s */)` that returns a `WriteResult`:
   `ok()`, `status()` (`Ok`, `BrokerError`, `Timeout`, `BrokerTooOld`, `VerdictUnknown`, `DeliveryFailed`, `Closed` when
-  the client closes first), `code()` (56, 57, 39 or 24 for a `BrokerError`), `constraintId()`, `offset()` and `key()`
+  the client closes first), `code()` (55, 56, 57, 39 or 24 for a `BrokerError`; see [Constraint violations](#constraint-violations)), `constraintId()`, `offset()` and `key()`
   (the broker-assigned key of an autoincrement create, not the record's; 0 for every other write). A local refusal (see
   [Write intents](#write-intents)) or an over-long key throws `std::invalid_argument`. An oversized record throws
   `std::invalid_argument` from the `…AndWait` forms and `std::length_error` from the token forms. `remove` and
@@ -676,7 +732,7 @@ for (int restarts = 0;;) {                                                      
   The completion's `OpKind` is `GetViewRowK` or `ScanViewRows`; decode a scan's payload with `rune::client::view::decodeScanPayload`.
 - Both calls end `BrokerTooOld` without sending when the seed's `brokerVersion` is below `kBrokerVersionCheckedWrites` (10).
 - The refusals at create time are error codes 59 (`ViewKeyExpressionInvalid`), 60 (`ViewConstraintInvalid`) and 61 (`ViewUniqueInvalid`);
-  the broker refuses a plan with `unique` (61) or `check` constraints (60) until the view-constraint engine ships.
+  see [Constraints](ql.md#constraints) for what a `unique` or `check` view is refused for.
   A view whose key is not exactly the source key needs a one-partition source.
 
 ### Stats

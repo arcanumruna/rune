@@ -144,7 +144,7 @@ TEST_P(Cell, QlPlanMeetsTheBroker) {
             EXPECT_EQ(compiled->plan.keyWidth, c.width) << viewText(c);
         }
     }
-    if (c.kind == Kind::Unique) return;   // the admin refuses every unique view before Part 09 (CheckedWritesQlCompile.UniqueViewIsRefusedBeforePart09)
+    if (c.kind == Kind::Unique) return;   // the unique cell's admin answer is CheckedWritesQlCompile.UniqueViewIsAccepted
 
     CatalogDdlRig rig("cwqm");
     serving(rig);
@@ -158,7 +158,7 @@ INSTANTIATE_TEST_SUITE_P(CheckedWritesQlCompileMatrix, Cell, ::testing::Range(0,
 
 TEST(CheckedWritesQlCompileMatrixCount, CellCountIsPinned) { EXPECT_EQ(cells().size(), 49u); }
 
-TEST(CheckedWritesQlCompile, UniqueViewIsRefusedBeforePart09) {
+TEST(CheckedWritesQlCompile, UniqueViewIsAccepted) {
     const ql::TopicDef topic = topicOf(std::string("topic src ") + kSource + " partitions 1 key id;");
     const auto plan = ql::applyViewPlan(viewOf("create unique view v key (lower(name) as nameKey, id) as select n from src;"), ql::viewSourceOf(topic));
     ASSERT_TRUE(plan.has_value());
@@ -166,8 +166,7 @@ TEST(CheckedWritesQlCompile, UniqueViewIsRefusedBeforePart09) {
     serving(rig);
     ASSERT_EQ(defineTopic(rig, topic).code, 0);
     const auto a = submitView(rig, *plan, "src");
-    EXPECT_EQ(a.code, codeOf(ErrorCode::ViewUniqueInvalid));
-    EXPECT_EQ(a.detail, "unique views are not available yet");
+    EXPECT_EQ(a.code, 0) << a.detail;
 }
 
 TEST(CheckedWritesQlCompile, GroupByOrderIsTheCompilersRule) {

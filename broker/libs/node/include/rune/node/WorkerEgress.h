@@ -61,13 +61,32 @@ public:
                  int32_t                       streamId,
                  rune::aeronutil::AeronPump    pump   = {},
                  std::chrono::milliseconds     budget = rune::aeronutil::AeronPump::kUntilAnswered) noexcept
+        : WorkerEgress(std::move(aeron), controlEndpoint, "aeron:udp?control-mode=dynamic|control=" + controlEndpoint, streamId, pump, budget) {}
+
+    // Test seam: the egress on aeron:ipc, for in-process rigs whose consumers share the worker's driver.  A UDP MDC egress costs
+    // such a rig a sendmsg and a recvmsg per driver pass.
+    [[nodiscard]] static std::unique_ptr<WorkerEgress> ipcForTest(std::shared_ptr<aeron::Aeron> aeron, int32_t streamId,
+                                                                  rune::aeronutil::AeronPump pump = {}) {
+        return std::unique_ptr<WorkerEgress>(new WorkerEgress(std::move(aeron), "", "aeron:ipc", streamId, pump,
+                                                              rune::aeronutil::AeronPump::kUntilAnswered));
+    }
+
+    // Non-copyable, non-movable (single-owner resource handle).
+    WorkerEgress(const WorkerEgress&)            = delete;
+    WorkerEgress& operator=(const WorkerEgress&) = delete;
+    WorkerEgress(WorkerEgress&&)                 = delete;
+    WorkerEgress& operator=(WorkerEgress&&)      = delete;
+    ~WorkerEgress() = default;
+
+private:
+    WorkerEgress(std::shared_ptr<aeron::Aeron> aeron, std::string controlEndpoint, std::string channel, int32_t streamId,
+                 rune::aeronutil::AeronPump pump, std::chrono::milliseconds budget) noexcept
         : aeron_(std::move(aeron))
         , controlEndpoint_(std::move(controlEndpoint))
         , streamId_(streamId)
+        , channel_(std::move(channel))
     {
         if (!aeron_) return;  // null aeron_ → unresolved (unit tests w/o driver)
-
-        channel_ = "aeron:udp?control-mode=dynamic|control=" + controlEndpoint_;
 
         // A driver registration error (bad channel, ...) makes add/find THROW;
         // this ctor is noexcept, so it becomes a logged resolve failure.
@@ -86,16 +105,12 @@ public:
         } catch (const std::exception& e) {
             spdlog::error("WorkerEgress: addExclusivePublication {} stream {} failed: {}", channel_, streamId_, e.what());
         }
+        if (!pub_ && pump.deadlineExpired())
+            spdlog::error("WorkerEgress: publication {} stream {} not answered by the driver within the startup deadline", channel_, streamId_);
         // pub_ == nullptr → resolved() returns false; caller handles.
     }
 
-    // Non-copyable, non-movable (single-owner resource handle).
-    WorkerEgress(const WorkerEgress&)            = delete;
-    WorkerEgress& operator=(const WorkerEgress&) = delete;
-    WorkerEgress(WorkerEgress&&)                 = delete;
-    WorkerEgress& operator=(WorkerEgress&&)      = delete;
-    ~WorkerEgress() = default;
-
+public:
     [[nodiscard]] bool     resolved() const noexcept { return pub_ != nullptr; }
     // Raw pub accessor — used by the worker's push loop to send to the shared MDC
     // pub via the common sendEncodedToPub_ helper (broadcast/hybrid fallback).

@@ -62,7 +62,9 @@ AeronPartitionTransport::AeronPartitionTransport(
                         rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers
     if (!sub_) {
         throw std::runtime_error(
-            "AeronPartitionTransport: ingress subscription not resolved (driver refused the pump)");
+            "AeronPartitionTransport: ingress subscription " + ingressChannel + " stream " + std::to_string(ingressStreamId) +
+            (pump.deadlineExpired() ? " not answered by the driver within the startup deadline"
+                                    : " not resolved (driver refused the pump)"));
     }
 }
 
@@ -446,6 +448,22 @@ bool AeronPartitionTransport::sendVerifyTxnPartitionResponse(NodeId to, const Ve
     return enqueueOutbound(static_cast<int32_t>(to), wire, len);
 }
 
+bool AeronPartitionTransport::sendTxnVote(NodeId to, const TxnVoteMsg& msg)
+{
+    uint8_t wire[TxnVoteMsg::TOTAL_SIZE];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    if (len == 0 || to == static_cast<NodeId>(selfId_)) [[unlikely]] return false;   // never re-entrant
+    return enqueueOutbound(static_cast<int32_t>(to), wire, len);
+}
+
+bool AeronPartitionTransport::sendTxnVoteResponse(NodeId to, const TxnVoteResponseMsg& msg)
+{
+    uint8_t wire[TxnVoteResponseMsg::TOTAL_SIZE];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    if (len == 0 || to == static_cast<NodeId>(selfId_)) [[unlikely]] return false;   // never re-entrant
+    return enqueueOutbound(static_cast<int32_t>(to), wire, len);
+}
+
 int AeronPartitionTransport::notePlaneReconnects_()
 {
     int events = 0;
@@ -762,6 +780,18 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         VerifyTxnPartitionResponseMsg r{};
         if (VerifyTxnPartitionResponseMsg::decode(buf, len, r) && txnVerifyRespHandler_ != nullptr)
             txnVerifyRespHandler_(txnVerifyCtx_, r);
+        return Action::CONTINUE;
+    }
+    if (tid == TxnVoteMsg::TEMPLATE_ID) [[unlikely]] {
+        // Part 11: a transaction coordinator asks for the vote on a partition this node leads.
+        TxnVoteMsg m{};
+        if (TxnVoteMsg::decode(buf, len, m) && txnVoteHandler_ != nullptr) txnVoteHandler_(txnVoteCtx_, m);
+        return Action::CONTINUE;
+    }
+    if (tid == TxnVoteResponseMsg::TEMPLATE_ID) [[unlikely]] {
+        // Part 11: the partition leader's vote on a transaction this node coordinates.
+        TxnVoteResponseMsg r{};
+        if (TxnVoteResponseMsg::decode(buf, len, r) && txnVoteRespHandler_ != nullptr) txnVoteRespHandler_(txnVoteCtx_, r);
         return Action::CONTINUE;
     }
     if (tid == InternalIsrMsg::TEMPLATE_ID || tid == InternalIsrAckMsg::TEMPLATE_ID) [[unlikely]] {

@@ -19,6 +19,7 @@
 #include <rune/view/ViewCheckpoint.h>
 #include <rune/view/KeyedFold.h>
 #include <rune/view/RecordFold.h>
+#include <rune/view/UniqueClaims.h>
 #include <rune/view/ViewFold.h>
 #include <rune/view/ViewPlan.h>
 #include <rune/view/ViewRow.h>
@@ -130,8 +131,15 @@ struct ViewFoldCounters {
     uint64_t skippedNoKey            = 0;   // keyed projection: a live record with an absent key component
     uint64_t keyConflicts            = 0;   // keyed projection: a unique key already owned by another source key
     uint64_t ownerMoves              = 0;   // keyed projection: a row moved to another key
+    uint64_t uniqueConflicts         = 0;   // unique view gauge: the current number of extra claimants
+    uint64_t uniquePromotions        = 0;   // unique view: an extra claimant became the owner of a key
     uint64_t scanRows                = 0;   // rows served by scanPage
     uint64_t scanPages               = 0;   // pages served by scanPage
+    uint64_t txnSpanTableFull        = 0;   // P11-9: a transactional batch found the span fence full and applied at its offsets
+    uint64_t txnSuperseded           = 0;   // P11-3a: a committed transaction's record another writer superseded before its marker
+    uint64_t txnReadFailed           = 0;   // P11-9: a span read-back below its marker failed (I/O error, damaged segment); retried next pass
+    uint64_t txnNoteWaits            = 0;   // P11-3a: a marker application waited for the worker's supersede key set
+    uint64_t vetoedCheckpointPushes  = 0;   // P11-0: a checkpoint not pushed because the cursor stood inside an open span
 };
 
 // Where the persisted checkpoint of an instance stands in a discard (one explicit state, each holding only what it needs):
@@ -209,6 +217,7 @@ struct ViewInstance {
     // key; only when the key is not the source key) and the fixed prospect the fold prepares each record into.
     std::optional<rune::view::KeyedFoldSpec> keyed;
     std::optional<rune::view::ViewTable>     owners;
+    std::optional<rune::view::UniqueClaims>  claims;   // engaged iff the view is unique and owner-mapped
     rune::view::Prospect                     prospect;
     int32_t                            partition       = 0;
     int64_t                            foldCursor      = 0;
@@ -218,6 +227,8 @@ struct ViewInstance {
     // separately by the view-snapshot IO agent's `done` ring (consumed in
     // Task 19).  Never mistake it for a durable/recoverable offset.
     int64_t                            lastEncodedO    = -1;
+    // The O of the last checkpoint the IO agent synced (its `done` ack) or recovery loaded; -1: none.  A restart replays from it.
+    int64_t                            lastDurableO    = -1;
     bool                               persisted       = true;
     // PERSISTED instances only: the most source records one fold pass may cover
     // (bound' = min(bound, foldCursor + maxRecordsPerPass)), derived at creation
@@ -245,6 +256,8 @@ struct ViewInstance {
     uint16_t                           nsSlot          = kNoNsSlot;
     uint32_t                           nsId            = 0;
     std::size_t                        memCharged      = 0;
+    bool                               windowKept      = false;   // a drain left dirty capacity kept (WorkerViewSet::releaseWindow_)
+    int64_t                            quietSinceNs    = -1;      // the pass the quiet clock started: the first quietPass_ at or after the last window ended
 
     // C1 (Task 22 fix round 1): the source replica's leadershipGeneration() this
     // table is caught up under; 0 = never driven by a leader.  A read is served
@@ -260,6 +273,11 @@ struct ViewInstance {
     // dirty rows, so no delta is ever lost or double-counted.
     std::vector<uint8_t>               pendingDelta;
     bool                               pendingValid    = false;
+    // A held delta past one ring message goes as a run of part frames (P11-9): the bytes of it already framed.
+    std::size_t                        pendingSent     = 0;
+    // P11-0 / P11-9 (contract addition 13): the transactions this instance's fold met and has not applied yet, and whether an
+    // application is in progress (reads held).  Consistent with foldCursor: every reset of the cursor clears it.
+    rune::view::TxnSpanFence           spanFence;
     // Part 04 (P4-4) / view backups: where this instance's checkpoint file stands in a discard (see CheckpointState).  Anything but
     // CheckpointLive means the instance folds nothing, checkpoints nothing and serves NotReady.
     CheckpointState                    checkpoint{CheckpointLive{}};
@@ -277,6 +295,34 @@ struct ViewInstance {
           persisted(persist) {}
 };
 
+/// The tables a keyed instance adds to its view table (also a discard's rebuild): the owner map of an owner-mapped projection, the
+/// claims of a unique one, and the prospect its fold prepares each record into.
+inline void buildKeyedTables(ViewInstance& inst, std::size_t indexSlots, std::size_t chunkBytes) {
+    const rune::view::KeyedFoldSpec& k = *inst.keyed;
+    if (k.ownerMapped) {
+        rune::view::RowLayout ownerRow;
+        ownerRow.rowLen = k.keyWidth;
+        inst.owners.emplace(std::move(ownerRow), indexSlots, chunkBytes,
+                            rune::view::ViewTableKeys{k.wireKeyWidth, 0, inst.tableKeys.hashSeed, inst.tableKeys.hashMaskForTest});
+        if (inst.plan.unique) {
+            const auto key = std::find_if(inst.evolvingSrc.fields.begin(), inst.evolvingSrc.fields.end(), [&](const auto& f) { return f.id == inst.plan.keyFieldId[0]; });
+            inst.claims.emplace(k.keyWidth, k.wireKeyWidth, inst.layout.rowLen, key->type, inst.tableKeys.hashSeed, indexSlots, chunkBytes);
+        }
+    }
+    inst.prospect.reserve(inst.layout, inst.agg ? &inst.agg->layout : nullptr);
+}
+
+/// The instance's fold inputs: a keyed instance adds its spec, owner map and claims, or its group ids.
+[[nodiscard]] inline rune::view::ProjectionFold projectionFoldOf(ViewInstance& i) noexcept {
+    return {i.plan, i.layout, i.vdc, i.table, rune::view::viewKeyType(i.plan), i.keyed ? &*i.keyed : nullptr,
+            i.owners ? &*i.owners : nullptr, i.claims ? &*i.claims : nullptr};
+}
+[[nodiscard]] inline rune::view::AggregateFold aggregateFoldOf(ViewInstance& i) noexcept {
+    AggInstance& a = *i.agg;
+    return {i.plan, i.layout, a.layout, i.vdc, i.table, a.contributors, a.groups, a.blocksOrNull(),
+            i.keyed ? &*i.keyed : nullptr, i.keyed ? &*a.groupIds : nullptr, i.keyed ? &a.nextGroupId : nullptr};
+}
+
 /// True while the instance's checkpoint file and tables agree (no discard in flight).  An index compare.
 [[nodiscard]] inline bool checkpointSettled(const ViewInstance& i) noexcept { return i.checkpoint.index() == 0; }
 
@@ -288,6 +334,14 @@ struct ViewInstance {
            (!i.agg->groupIds || i.agg->groupIds->size() == 0);
 }
 
+/// True when some table of the instance has a row its next checkpoint would carry.
+[[nodiscard]] inline bool viewTablesDirty(const ViewInstance& i) noexcept {
+    if (i.table.hasDirty() || (i.owners && i.owners->hasDirty())) return true;
+    if (!i.agg) return false;
+    return i.agg->contributors.hasDirty() || i.agg->groups.hasDirty() || (i.agg->blocks && i.agg->blocks->hasDirty()) ||
+           (i.agg->groupIds && i.agg->groupIds->hasDirty());
+}
+
 /// The log range a source partition holds: retention may have trimmed it below a cursor (logStart); logEnd bounds a checkpoint.
 /// The default (0, INT64_MAX) says nothing, so a caller without a disk log (a transient source, a unit test) changes no behaviour.
 struct SourceLogBounds {
@@ -295,12 +349,14 @@ struct SourceLogBounds {
     int64_t logEnd   = INT64_MAX;
 };
 
-/// Retention trimmed the source below this instance's cursor.  An instance holding no rows starts at the log start (true);
-/// one holding rows folded from records that no longer exist cannot be trusted: false = the caller discards it (BelowLogStart).
+/// Retention trimmed the source below this instance's cursor, or below an open span's first batch.  An instance holding no rows
+/// below the log start starts there (true).  One holding rows folded from records that no longer exist, or standing at a marker
+/// whose span lost its first batches, cannot be trusted: false = the caller discards it (BelowLogStart) and it refolds.
 [[nodiscard]] inline bool startAtLogStart(ViewInstance& i, int64_t logStart) noexcept {
-    if (!viewTablesEmpty(i)) return false;
+    if (i.foldCursor >= logStart || !viewTablesEmpty(i)) return false;
     i.counters.sourceRecordsTrimmed += static_cast<uint64_t>(logStart - i.foldCursor);
     i.foldCursor   = logStart;
+    i.spanFence.clear();   // every open span started below the old cursor: its records are gone
     i.lastEncodedO = logStart - 1;
     return true;
 }

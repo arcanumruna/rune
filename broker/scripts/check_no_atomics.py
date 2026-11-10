@@ -61,8 +61,12 @@ malformed-allowlist rejection on synthetic fixtures before scanning the tree.
 """
 import re
 import sys
+from bisect import bisect_right
 from collections import Counter
 from pathlib import Path
+
+
+_PLAIN_RUN_RE = re.compile(r"[^/'\"]+")
 
 
 def strip_comments_and_strings(text: str) -> str:
@@ -100,9 +104,13 @@ def strip_comments_and_strings(text: str) -> str:
             j = min(j + 1, n)
             out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
             i = j
-        else:
+        elif c == "/":
             out.append(c)
             i += 1
+        else:
+            m = _PLAIN_RUN_RE.match(text, i)
+            out.append(m.group())
+            i = m.end()
     return "".join(out)
 
 
@@ -114,30 +122,47 @@ STD_NAMES = (
     r"|jthread|stop_source|stop_token|stop_callback"
     r"|promise|future|shared_future|async|packaged_task"
 )
+# Every STD_NAMES match contains one of these: a file holding none of them cannot match a std family regex.
+STD_LITERALS = ("atomic", "memory_order", "kill_dependency", "mutex", "lock", "condition_variable", "semaphore",
+                "latch", "barrier", "once_flag", "call_once", "jthread", "stop_", "promise", "future", "async",
+                "packaged_task")
+# Candidate scan for the std:: / ::std:: / alias:: family: every such match contains this, and it starts with a literal
+# (the exact regex's leading lookbehind makes re try every position).
+STD_SCAN_RE = re.compile(r"::\s*(?:" + STD_NAMES + r")\b")
 
+SYNC_INCLUDE = (r"#\s*include\s*<(?:atomic|mutex|shared_mutex|condition_variable|semaphore|latch|barrier"
+                r"|stop_token|future|stdatomic\.h|semaphore\.h)>")
+
+# (regex, label, literals): every match contains one of the literals, so a file holding none of them skips the regex.
 PLAIN_FAMILIES = [
-    (r"(?:__c11_|__)?atomic_\w+", "atomic_* builtin/free function"),
-    (r"\b__ATOMIC_\w+", "__ATOMIC_* order"),
-    (r"\b_Atomic\b", "_Atomic"),
-    (r"\b__sync_\w+", "__sync builtin"),
-    (r"\bthread_local\b", "thread_local"),
-    (r"\bsem_\w+\s*\(", "POSIX semaphore"),
-    (r"\bpthread_(?:mutex|spin|rwlock|barrier|cond)\w*", "pthread lock/cond/barrier"),
-    (r"\bpthread_once\b", "pthread_once"),
-    (r"\bos_unfair_lock\w*", "os_unfair_lock"),
-    (r"\bdispatch_semaphore\w*", "dispatch_semaphore"),
-    (r"\bOSAtomic\w*", "OSAtomic"),
-    (r"(?<![\w])(?:asm|__asm|__asm__)\b", "inline asm"),
-    (r"#\s*include\s*<(?:atomic|mutex|shared_mutex|condition_variable|semaphore|latch|barrier"
-     r"|stop_token|future|stdatomic\.h|semaphore\.h)>", "sync header include"),
-    (r"\b\w*(?:Ordered|Volatile|Release|Acquire)\s*\(", "Aeron ordered/volatile/release/acquire accessor"),
-    (r"\bproposeM(?:ax|in)(?:Ordered|Release)?\s*\(", "Aeron propose* accessor"),
-    (r"\bAtomicArrayUpdater\b", "Aeron AtomicArrayUpdater"),
-    (r"\b(?:compareAndSet|getAndAdd|getAndSet|addAndGet)\w*\s*\(", "Aeron CAS/RMW accessor"),
-    (r"\baeron::concurrent::atomic::", "aeron::concurrent::atomic"),
-    (r"\bAtomicCounter\b", "Aeron AtomicCounter"),
+    (r"atomic_\w+", "atomic_* builtin/free function", ("atomic_",)),
+    (r"\b__ATOMIC_\w+", "__ATOMIC_* order", ("__ATOMIC_",)),
+    (r"\b_Atomic\b", "_Atomic", ("_Atomic",)),
+    (r"\b__sync_\w+", "__sync builtin", ("__sync_",)),
+    (r"\bthread_local\b", "thread_local", ("thread_local",)),
+    (r"\bsem_\w+\s*\(", "POSIX semaphore", ("sem_",)),
+    (r"\bpthread_(?:mutex|spin|rwlock|barrier|cond)\w*", "pthread lock/cond/barrier", ("pthread_",)),
+    (r"\bpthread_once\b", "pthread_once", ("pthread_once",)),
+    (r"\bos_unfair_lock\w*", "os_unfair_lock", ("os_unfair_lock",)),
+    (r"\bdispatch_semaphore\w*", "dispatch_semaphore", ("dispatch_semaphore",)),
+    (r"\bOSAtomic\w*", "OSAtomic", ("OSAtomic",)),
+    (r"(?<![\w])(?:asm|__asm|__asm__)\b", "inline asm", ("asm",)),
+    (SYNC_INCLUDE, "sync header include", (SYNC_INCLUDE,)),
+    (r"(?:Ordered|Volatile|Release|Acquire)\s*\(", "Aeron ordered/volatile/release/acquire accessor",
+     ("Ordered", "Volatile", "Release", "Acquire")),
+    (r"\bproposeM(?:ax|in)(?:Ordered|Release)?\s*\(", "Aeron propose* accessor", ("proposeM",)),
+    (r"\bAtomicArrayUpdater\b", "Aeron AtomicArrayUpdater", ("AtomicArrayUpdater",)),
+    (r"\b(?:compareAndSet|getAndAdd|getAndSet|addAndGet)\w*\s*\(", "Aeron CAS/RMW accessor",
+     ("compareAndSet", "getAndAdd", "getAndSet", "addAndGet")),
+    (r"\baeron::concurrent::atomic::", "aeron::concurrent::atomic", ("aeron::concurrent::atomic::",)),
+    (r"\bAtomicCounter\b", "Aeron AtomicCounter", ("AtomicCounter",)),
 ]
-PLAIN_RE = [(re.compile(p), label) for p, label in PLAIN_FAMILIES]
+PLAIN_RE = [(re.compile(p), label, lits) for p, label, lits in PLAIN_FAMILIES]
+# One superset scan for all plain families: every match contains one of the literals (regex fragments); find_hits
+# re-checks each candidate line with the exact family regex, so this only decides which lines are looked at.
+PLAIN_SCAN_RE = re.compile("|".join(lit for _, _, lits in PLAIN_FAMILIES for lit in lits))
+STD_LITERALS_RE = re.compile("|".join(STD_LITERALS))
+DECLTYPE_RE = re.compile("decltype")
 
 USING_STD_RE = re.compile(r"\busing\s+namespace\s+(?:::)?std\s*;")
 ALIAS_RE = re.compile(r"\bnamespace\s+(\w+)\s*=\s*(?:::)?std\s*;")
@@ -154,7 +179,7 @@ ATOMIC_DECL_RE = re.compile(
     r"(?:\b(?:\w+::)*atomic(?:_ref)?\s*<[^;{}()]*?>|\b_Atomic\s*\([^)]*\)|\b_Atomic\s+[\w:\s*]+?)"
     r"\s*[*&]?\s*(\w+)\s*(?:[{=;\[]|\()")
 
-CATEGORIES = {"RING", "CLEANER", "CRASH-ORDER", "CPU-HINT", "CYCLE-COUNTER", "SLICE-B", "UNSCOPED", "DEBUG-ONLY"}
+CATEGORIES = {"RING", "CLEANER", "CRASH-ORDER", "CPU-HINT", "CYCLE-COUNTER", "SLICE-B", "UNSCOPED", "DEBUG-ONLY", "STARTUP"}
 SOURCE_EXTS = {".cpp", ".h", ".hpp", ".cc", ".cxx", ".ipp", ".inl"}
 SKIP_DIR_NAMES = {"tests", "build", "build-fast", "build-tsan", "build-release",
                   "cmake-build-debug", "cmake-build-release", ".git", "_deps"}
@@ -186,11 +211,34 @@ def collect_atomic_names(cleans: dict):
     """{file stem: identifiers declared atomic in Stem.h / Stem.cpp}."""
     names = {}
     for rel, clean in cleans.items():
-        for m in ATOMIC_DECL_RE.finditer(clean):
-            names.setdefault(stem(rel), set()).add(m.group(1))
-        for m in MUTEX_DECL_RE.finditer(clean):
-            names.setdefault(stem(rel), set()).add(m.group(1))
+        if "atomic" in clean or "_Atomic" in clean:
+            for m in ATOMIC_DECL_RE.finditer(clean):
+                names.setdefault(stem(rel), set()).add(m.group(1))
+        if "mutex" in clean or "condition_variable" in clean or "once_flag" in clean:
+            for m in MUTEX_DECL_RE.finditer(clean):
+                names.setdefault(stem(rel), set()).add(m.group(1))
     return names
+
+
+def candidate_lines(clean: str, regexes):
+    """Sorted line numbers (1-based, splitlines() numbering) where some (regex, gate) scan may match.
+
+    One whole-text search per regex instead of one search per line and regex.  No pattern uses ^, $ or a
+    lookbehind/\\b that a line break can satisfy differently from a line edge, so a match inside a line is also a
+    match of the whole text: the result is a superset, and find_hits re-checks each line on its own."""
+    starts = [0]
+    for part in clean.splitlines(keepends=True):
+        starts.append(starts[-1] + len(part))
+    found = set()
+    for rx, gate in regexes:
+        if gate is not None and not gate.search(clean):
+            continue
+        pos = 0
+        while (m := rx.search(clean, pos)) is not None:
+            ln = bisect_right(starts, m.start())
+            found.add(ln)
+            pos = starts[ln] if ln < len(starts) else len(clean) + 1
+    return sorted(ln for ln in found if ln < len(starts))
 
 
 def find_hits(raw: str, clean: str, atomic_names, rel: str = ""):
@@ -219,13 +267,20 @@ def find_hits(raw: str, clean: str, atomic_names, rel: str = ""):
     if own:
         use_rx = re.compile(r"(?<![\w])(?:" + "|".join(re.escape(n) for n in sorted(own)) + r")\b")
     raw_lines = raw.splitlines()
+    lines = clean.splitlines()
     hits = []
-    for i, line in enumerate(clean.splitlines(), start=1):
+    scans = [(STD_SCAN_RE, STD_LITERALS_RE)] + [(rx, STD_LITERALS_RE) for rx in std_rx[1:]]   # [1:]: bare names
+    scans.append((PLAIN_SCAN_RE, None))
+    scans += [(rx, None) for rx in (aeron_rx, member_rx, use_rx) if rx is not None]
+    if decl_rx is not None:
+        scans.append((decl_rx, DECLTYPE_RE))
+    for i in candidate_lines(clean, scans):
+        line = lines[i - 1]
         label = None
         if any(r.search(line) for r in std_rx):
             label = "std sync facility"
         else:
-            for rx, lab in PLAIN_RE:
+            for rx, lab, _ in PLAIN_RE:
                 if rx.search(line):
                     label = lab
                     break

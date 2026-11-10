@@ -32,9 +32,9 @@ Rec rmEx(uint64_t id) { return Rec{id, 0, 0, true, 2}; }
 
 TestRejectRule tagRule(uint8_t tag) { TestRejectRule r; r.mode = TestRejectRule::Mode::TagEquals; r.tag = tag; return r; }
 
-std::set<std::string> idSet(uint64_t lo, uint64_t hi) {
-    std::set<std::string> out;
-    for (uint64_t i = lo; i <= hi; ++i) out.insert(std::to_string(i));
+std::set<uint64_t> idSet(uint64_t lo, uint64_t hi) {
+    std::set<uint64_t> out;
+    for (uint64_t i = lo; i <= hi; ++i) out.insert(out.end(), i);
     return out;
 }
 

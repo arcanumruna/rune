@@ -1279,6 +1279,196 @@ TEST(EpochRestartControllerRegression, SoleIsrBumpReelectsSameLeaderPastFenceReg
 }
 
 namespace {
+/// A coordinator-partition leader bump from the current leader of (-1, 0): the restart fence, or a memory-backed restart.
+rune::replication::AlterIsrMsg coordinatorBump(CtlRig& c, bool memory = false, int32_t leo = 0, bool ledThisBoot = false) {
+    const auto& a = c.paOf(-1);
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = -1; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+    m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = a.partitionEpoch;
+    m.isr[0] = a.leaderEpoch;
+    m.isr[1] = rune::replication::AlterIsrMsg::kBumpFenceValid | (memory ? rune::replication::AlterIsrMsg::kBumpMemoryBacked : 0) |
+               (ledThisBoot ? rune::replication::AlterIsrMsg::kBumpLedThisBoot : 0);
+    m.isr[2] = leo;
+    return m;
+}
+/// The controller's position table holds `leo` for `node`'s -1 replica (the controller node's own replica reports it).
+void reportCoordinatorLeo(CtlRig& c, int32_t node, int64_t leo) {
+    c.svc->reportReplicaPosition(-1, 0, node, c.paOf(-1).leaderEpoch, leo);
+}
+}  // namespace
+
+// A restarted coordinator-partition leader may have lost acked records (power loss): it leaves the ISR when another live member
+// takes over, and rejoins as a follower that truncates, even when its reported LEO covers every position the controller knows.
+// The controller holds no committed HW of the partition, so no LEO it reports is evidence of an intact log.  RED: the requester
+// stayed in the ISR, and would be elected with a truncated log when the member that took over dies.
+TEST(EpochRestartControllerRegression, CoordinatorBumpDropsTheRequesterFromTheIsrRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    (void)c.svc->onAlterIsr(coordinatorBump(c, /*memory=*/true));   // node 2 leads, ISR {2, 3}
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_EQ(c.paOf(-1).leaderNode, 2);
+    reportCoordinatorLeo(c, 3, 10);
+    (void)c.svc->onAlterIsr(coordinatorBump(c, /*memory=*/false, /*leo=*/10));
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    EXPECT_EQ(c.paOf(-1).leaderNode, 3);
+    EXPECT_EQ(std::count(c.paOf(-1).isr.begin(), c.paOf(-1).isr.end(), 2), 0) << "the restarted requester stayed in the ISR";
+}
+
+// The controller's own coordinator replica refuses at the restart fence.  Its log may have lost acked records like any other
+// requester's, so the partition moves to another ISR member and the controller leaves the ISR, even with a LEO that covers the
+// positions it last saw.  RED: re-elected in place, a survivor could truncate to a power-lost log.
+TEST(EpochRestartControllerRegression, CoordinatorBumpOfTheControllerMovesTheLeaderAwayRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_EQ(c.paOf(-1).leaderNode, 1);
+    reportCoordinatorLeo(c, 2, 10);
+    reportCoordinatorLeo(c, 3, 10);
+    auto bump = coordinatorBump(c, /*memory=*/false, /*leo=*/10);
+    bump.isr[0] = c.paOf(-1).leaderEpoch + 5;
+    (void)c.svc->onAlterIsr(bump);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    EXPECT_NE(c.paOf(-1).leaderNode, 1) << "the controller was re-elected in place";
+    EXPECT_EQ(std::count(c.paOf(-1).isr.begin(), c.paOf(-1).isr.end(), 1), 0);
+}
+
+// Only the live member left in the ISR is the requester: it is re-elected at an epoch past its fence, the other ISR members being
+// dead.
+TEST(EpochRestartControllerRegression, CoordinatorBumpWithNoOtherLiveIsrMemberReelectsTheRequesterRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    (void)c.svc->onAlterIsr(coordinatorBump(c, /*memory=*/true));   // node 2 leads, ISR {2, 3}
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_EQ(c.paOf(-1).leaderNode, 2);
+    const int32_t le = c.paOf(-1).leaderEpoch;
+    (void)c.svc->onAlterIsr(coordinatorBump(c));
+    (void)c.svc->runDynamicRebalanceOnTick({2}, nullptr);   // node 3 is dead
+    c.drive(50);
+    EXPECT_EQ(c.paOf(-1).leaderNode, 2);
+    EXPECT_EQ(c.paOf(-1).leaderEpoch, le + 1);
+}
+
+// Election batch (F1): a restarted ex-leader whose bump proves an intact log (it led this partition earlier in this OS boot) is
+// re-elected in place and stays in the ISR, so it still outlives the other members.  RED: bumpExclusions_ excludes intact requests
+// too: the requester fails over and is dropped, and the later tick goes NO_LEADER.
+TEST(EpochRestartControllerRegression, IntactBumpIsReelectedInPlaceAndOutlivesTheOtherMembersRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    auto m = c.bump(le);
+    m.isr[1] |= rune::replication::AlterIsrMsg::kBumpLedThisBoot;
+    (void)c.svc->onAlterIsr(m);
+    c.tick();
+    EXPECT_EQ(c.pa().leaderNode, L);
+    EXPECT_EQ(c.pa().leaderEpoch, le + 1);
+    EXPECT_EQ(c.pa().isr.size(), 3u) << "an intact requester left the ISR";
+    c.tick({L});   // the other members are dead
+    EXPECT_EQ(c.pa().leaderNode, L);
+    EXPECT_EQ(c.pa().isr, std::vector<int32_t>{L});
+}
+
+// Election batch (F1, coordinators): an intact non-controller requester that the controller keeps leads in place, ISR unchanged.
+// RED: reconcile passes requesterIntact = false: node 3 leads and 2 is dropped, then NO_LEADER.
+TEST(EpochRestartControllerRegression, CoordinatorIntactBumpKeepsTheRequesterLeadingRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    (void)c.svc->onAlterIsr(coordinatorBump(c, /*memory=*/true));   // node 2 leads, ISR {2, 3}
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_EQ(c.paOf(-1).leaderNode, 2);
+    const int32_t le = c.paOf(-1).leaderEpoch;
+    (void)c.svc->onAlterIsr(coordinatorBump(c, false, 0, /*ledThisBoot=*/true));
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    EXPECT_EQ(c.paOf(-1).leaderNode, 2);
+    EXPECT_EQ(c.paOf(-1).leaderEpoch, le + 1);
+    EXPECT_EQ(c.paOf(-1).isr, (std::vector<int32_t>{2, 3}));
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2}, nullptr);   // node 3 dies
+    c.drive(50);
+    EXPECT_EQ(c.paOf(-1).leaderNode, 2);
+    EXPECT_EQ(c.paOf(-1).isr, std::vector<int32_t>{2});
+}
+
+// Election batch (F3): the controller's own coordinator replica led in this boot: it is re-elected in place, ISR unchanged.
+// RED: the self requester is treated as unproven: the partition moves away.
+TEST(EpochRestartControllerRegression, CoordinatorIntactBumpOfTheControllerReelectsItInPlaceRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_EQ(c.paOf(-1).leaderNode, 1);
+    const int32_t le = c.paOf(-1).leaderEpoch;
+    auto bump = coordinatorBump(c, false, 10, /*ledThisBoot=*/true);
+    bump.isr[0] = le + 5;
+    (void)c.svc->onAlterIsr(bump);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    EXPECT_EQ(c.paOf(-1).leaderNode, 1);
+    EXPECT_EQ(c.paOf(-1).leaderEpoch, le + 6);
+    EXPECT_EQ(c.paOf(-1).isr, (std::vector<int32_t>{1, 2, 3}));
+}
+
+// F5: a coordinator bump fails over through FailoverElection: the most complete ISR member leads (3 holds 10 records, 2 holds 5),
+// not the first live member in ISR order.  RED: the hand loop picks 2.
+TEST(EpochRestartControllerRegression, CoordinatorBumpFailsOverToTheMostCompleteMemberRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_EQ(c.paOf(-1).leaderNode, 1);
+    reportCoordinatorLeo(c, 2, 5);
+    reportCoordinatorLeo(c, 3, 10);
+    (void)c.svc->onAlterIsr(coordinatorBump(c, /*memory=*/true));
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    EXPECT_EQ(c.paOf(-1).leaderNode, 3);
+    EXPECT_EQ(std::count(c.paOf(-1).isr.begin(), c.paOf(-1).isr.end(), 1), 0);
+}
+
+// E9: the controller is in the ISR of a coordinator partition led by an unproven bump requester: the move to the controller drops the
+// requester from the ISR.  RED: the move-to-self ISR loop keeps every live member.
+TEST(EpochRestartControllerRegression, CoordinatorMoveToTheControllerDropsAnUnprovenRequesterRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    (void)c.svc->onAlterIsr(coordinatorBump(c, /*memory=*/true));   // node 2 leads, ISR {2, 3}
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_EQ(c.paOf(-1).leaderNode, 2);
+    c.readmit(1, -1);   // ISR {2, 3, 1}
+    (void)c.svc->onAlterIsr(coordinatorBump(c));
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    EXPECT_EQ(c.paOf(-1).leaderNode, 1);
+    EXPECT_EQ(c.paOf(-1).isr, (std::vector<int32_t>{1, 3}));
+}
+
+// E9: the same with an intact requester: the controller leads and the requester stays in the ISR.  RED: reconcile passes
+// requesterIntact = false.
+TEST(EpochRestartControllerRegression, CoordinatorMoveToTheControllerKeepsAnIntactRequesterRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    (void)c.svc->onAlterIsr(coordinatorBump(c, /*memory=*/true));   // node 2 leads, ISR {2, 3}
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_EQ(c.paOf(-1).leaderNode, 2);
+    c.readmit(1, -1);   // ISR {2, 3, 1}
+    (void)c.svc->onAlterIsr(coordinatorBump(c, false, 0, /*ledThisBoot=*/true));
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    EXPECT_EQ(c.paOf(-1).leaderNode, 1);
+    const auto& isr = c.paOf(-1).isr;
+    EXPECT_EQ(std::count(isr.begin(), isr.end(), 2), 1);
+    EXPECT_EQ(std::count(isr.begin(), isr.end(), 3), 1);
+}
+
+namespace {
 rune::replication::AlterIsrMsg leaderlessReport(int32_t node, int32_t epoch, int32_t leo, int64_t inc,
                                                 bool logDirFailed = false) {
     rune::replication::AlterIsrMsg m{};
@@ -3531,6 +3721,55 @@ TEST(CatalogUnservableRegression, YoungControllerDefersUserElectionsUntilItHeldT
     EXPECT_NE(s.svc2.assignment(0, 0)->leaderNode, h) << "the held report excludes it";
 }
 
+// F4: a coordinator bump is decided while the controller warms up (coordinators never wait for the "cannot serve" reports).
+// RED: the warm-up returns before decideBumps_: the epoch is unchanged.
+TEST(CatalogUnservableRegression, CoordinatorBumpIsDecidedWhileTheControllerWarmsUpRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_EQ(c.paOf(-1).leaderNode, 1);
+    const int32_t le = c.paOf(-1).leaderEpoch;
+    c.svc->setUnservableReportWarmup(3'600'000'000'000LL);
+    ASSERT_TRUE(c.svc->unservableWarmingUp());
+    auto bump = coordinatorBump(c, false, 10, /*ledThisBoot=*/true);
+    bump.isr[0] = le + 5;
+    (void)c.svc->onAlterIsr(bump);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    EXPECT_EQ(c.paOf(-1).leaderNode, 1);
+    EXPECT_EQ(c.paOf(-1).leaderEpoch, le + 6);
+}
+
+// F4: the warm-up pass still fences the ISRs of coordinator partitions: a dead member leaves.  RED: no fenceIsrs_ in the warm-up pass.
+TEST(CatalogUnservableRegression, CoordinatorIsrDropsADeadMemberWhileTheControllerWarmsUpRegression) {
+    CtlRig c(/*userTopics=*/false);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    c.svc->setUnservableReportWarmup(3'600'000'000'000LL);
+    ASSERT_TRUE(c.svc->unservableWarmingUp());
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2}, nullptr);
+    c.drive(50);
+    EXPECT_EQ(c.paOf(-1).leaderNode, 1);
+    EXPECT_EQ(c.paOf(-1).isr, (std::vector<int32_t>{1, 2}));
+}
+
+// F4: a user partition's bump waits for the end of the warm-up (the leader election needs the reports).  RED: the user bump is
+// decided during the warm-up.
+TEST(CatalogUnservableRegression, UserBumpWaitsOutTheWarmupRegression) {
+    CtlRig c;
+    c.svc->setUnservableReportWarmup(3'600'000'000'000LL);
+    ASSERT_TRUE(c.svc->unservableWarmingUp());
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    (void)c.svc->onAlterIsr(c.bump(le));
+    c.tick();
+    EXPECT_EQ(c.pa().leaderNode, L);
+    EXPECT_EQ(c.pa().leaderEpoch, le);
+    c.svc->setUnservableReportWarmup(0);
+    c.tick();
+    EXPECT_EQ(c.pa().leaderEpoch, le + 1);
+    EXPECT_NE(c.pa().leaderNode, L);
+}
+
 // Review I2: a TRANSIENT partition whose sole-ISR leader restarts EMPTY is
 // decided on the fresh reports of its live replicas — never waiting for (nor
 // electing) a replica that reports it cannot serve (it has no PartitionReplica:
@@ -4755,6 +4994,22 @@ TEST(StorageRegistrationRegression, BelowCommittedReportAtFeatureLevelOneIsDecid
     EXPECT_EQ(c.pa().mark.kind, rune::metadata::LeaderlessMark::Kind::None);
 }
 
+// Election batch: a follower's below-committed verdict on a leadership is never replaced by the leader's own intact fence bump (it
+// is re-sent every 50 ms): the leader still fails over.  RED: without the guard in bumpLeaderEpoch_, 2 is re-elected in place.
+TEST(StorageRegistrationRegression, LostCommittedVerdictOutlivesTheLeadersIntactFenceBumpRegression) {
+    CtlRig c(true, {}, rune::replication::MetadataFeature::kBase);
+    leaderTwoWithFullIsr(c);
+    const int32_t e = c.pa().leaderEpoch;
+    ASSERT_TRUE(sendReport(c, 1, e).answered);
+    auto m = c.bump(e);
+    m.isr[1] |= rune::replication::AlterIsrMsg::kBumpLedThisBoot;
+    (void)c.svc->onAlterIsr(m);
+    c.tick(); c.drive(50);
+    EXPECT_TRUE(c.pa().leaderNode == 1 || c.pa().leaderNode == 3) << "leader " << c.pa().leaderNode;
+    EXPECT_EQ(c.pa().leaderEpoch, e + 1);
+    EXPECT_FALSE(isrHasNode(c.pa(), 2));
+}
+
 // A report for an older leader epoch is answered Fenced and decides nothing.  RED: always Ok and record.
 TEST(StorageRegistrationRegression, BelowCommittedReportForAStaleEpochIsAnsweredFencedRegression) {
     CtlRig c;
@@ -5105,7 +5360,7 @@ TEST(LeaderMoveFenceRegression, EveryMoveThatDropsTheOldLeaderFromTheIsrWaitsFor
         for (NodeId n : {1, 2, 3}) if (n != L) others.push_back(n);
         expectMoveWaitsForTheOldLeadersLease(c, [&] { c.tick(others); }, "failover");
     }
-    {   // the coordinator-partition bump (decideBumps_ on a coordinator partition, controller path)
+    {   // the coordinator-partition bump of a memory-backed leader (decideBumps_ on a coordinator partition, controller path)
         CtlRig c(/*userTopics=*/false);
         (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
         c.drive(50);
@@ -5117,6 +5372,7 @@ TEST(LeaderMoveFenceRegression, EveryMoveThatDropsTheOldLeaderFromTheIsrWaitsFor
             m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
             m.partitionEpoch = a.partitionEpoch;
             m.isr[0] = -1;
+            m.isr[1] = rune::replication::AlterIsrMsg::kBumpMemoryBacked;
             (void)c.svc->onAlterIsr(m);
             (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
         }, "coordinator bump", /*topic=*/-1);

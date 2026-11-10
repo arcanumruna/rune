@@ -20,6 +20,8 @@
 #   UNSCOPED    — TEMPORARY: owned by neither slice yet; must be converted.
 #   DEBUG-ONLY  — a debug-build test record, compiled out of release builds
 #                 (no production coordination).
+#   STARTUP     — the fused-startup gate: the starter and interim pump threads share one
+#                 invoker-mode Aeron client, which no ring can carry (startup only).
 
 # ------------------------------------------------------------ RING
 libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | #include <atomic> | 1 | RING | agrona ring implementation internals
@@ -74,20 +76,20 @@ libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail, __ATOMIC_R
 libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + submitted, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ tail: LOW-4b partial-enter rollback of the unconsumed SQEs (single pushSqes_ submit path)
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | #include <atomic> | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | [[nodiscard]] inline bool compareAndSetInt64(const aeron::concurrent::AtomicBuffer& b, aeron::util::index_t offset, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
-libs/consensus/include/rune/consensus/detail/RingAtomics.h | [[nodiscard]] inline std::atomic_ref<T> word(const aeron::concurrent::AtomicBuffer& b, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | [[nodiscard]] inline std::atomic_ref<T> controlWord(const aeron::concurrent::AtomicBuffer& b, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | [[nodiscard]] inline std::int32_t getInt32Acquire(const aeron::concurrent::AtomicBuffer& b, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | [[nodiscard]] inline std::int64_t getInt64Acquire(const aeron::concurrent::AtomicBuffer& b, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | inline void putInt32Release(const aeron::concurrent::AtomicBuffer& b, aeron::util::index_t offset, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | inline void putInt64Release(const aeron::concurrent::AtomicBuffer& b, aeron::util::index_t offset, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | return std::atomic_ref<T>(*reinterpret_cast<T*>(b.buffer() + offset)); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
-libs/consensus/include/rune/consensus/detail/RingAtomics.h | return word<std::int32_t>(b, offset).load(std::memory_order_acquire); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
-libs/consensus/include/rune/consensus/detail/RingAtomics.h | return word<std::int64_t>(b, offset).compare_exchange_strong(expected, desired, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
-libs/consensus/include/rune/consensus/detail/RingAtomics.h | return word<std::int64_t>(b, offset).load(std::memory_order_acquire); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | return controlWord<std::int32_t>(b, offset).load(std::memory_order_acquire); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | return controlWord<std::int64_t>(b, offset).compare_exchange_strong(expected, desired, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | return controlWord<std::int64_t>(b, offset).load(std::memory_order_acquire); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | static_assert(std::atomic_ref<std::int32_t>::is_always_lock_free); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | static_assert(std::atomic_ref<std::int64_t>::is_always_lock_free); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | std::memory_order_seq_cst); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
-libs/consensus/include/rune/consensus/detail/RingAtomics.h | word<std::int32_t>(b, offset).store(v, std::memory_order_release); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
-libs/consensus/include/rune/consensus/detail/RingAtomics.h | word<std::int64_t>(b, offset).store(v, std::memory_order_release); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | controlWord<std::int32_t>(b, offset).store(v, std::memory_order_release); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | controlWord<std::int64_t>(b, offset).store(v, std::memory_order_release); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
 libs/node/src/UringFlushBackend.cpp | if (k < n) __atomic_store_n(sqTail_, tail + k, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ tail: A10 submitQueued withdraws SQEs the kernel did not consume
 
 # ------------------------------------------------------------ CLEANER
@@ -148,6 +150,9 @@ libs/replication/include/rune/replication/PartitionReplica.h | void publishClean
 libs/replication/include/rune/replication/PartitionReplica.h | [[nodiscard]] Offset cleanerVerdictBound() const noexcept { return publishedVerdictBound_.load(std::memory_order_acquire); } | 1 | CLEANER | verdict cleaner bound: owning worker publishes the verdict cleaning bound and marker end, LogCleanerAgent reads them
 libs/replication/include/rune/replication/PartitionReplica.h | [[nodiscard]] Offset cleanerVerdictMarkerEnd() const noexcept { return publishedVerdictMarkerEnd_.load(std::memory_order_acquire); } | 1 | CLEANER | verdict cleaner bound: owning worker publishes the verdict cleaning bound and marker end, LogCleanerAgent reads them
 libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<Offset> publishedVerdictBound_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso}; | 1 | CLEANER | verdict cleaner bound: owning worker publishes the verdict cleaning bound and marker end, LogCleanerAgent reads them
+libs/replication/include/rune/replication/PartitionReplica.h | void publishCleanerTxnJudgeBound(Offset bound) noexcept { publishedTxnJudgeBound_.store(bound, std::memory_order_release); } | 1 | CLEANER | Part 11 TxnJudge cleaner bound: the owning worker publishes the offset below which no member checkpoint needs a TxnJudge, LogCleanerAgent removes type-19 records only below it
+libs/replication/include/rune/replication/PartitionReplica.h | [[nodiscard]] Offset cleanerTxnJudgeBound() const noexcept { return publishedTxnJudgeBound_.load(std::memory_order_acquire); } | 1 | CLEANER | Part 11 TxnJudge cleaner bound: the owning worker publishes the offset below which no member checkpoint needs a TxnJudge, LogCleanerAgent removes type-19 records only below it
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<Offset> publishedTxnJudgeBound_{0}; | 1 | CLEANER | Part 11 TxnJudge cleaner bound: the owning worker publishes the offset below which no member checkpoint needs a TxnJudge, LogCleanerAgent removes type-19 records only below it
 libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<Offset> publishedVerdictMarkerEnd_{0}; | 1 | CLEANER | verdict cleaner bound: owning worker publishes the verdict cleaning bound and marker end, LogCleanerAgent reads them
 
 # ------------------------------------------------------------ CRASH-ORDER
@@ -235,3 +240,14 @@ libs/storage/src/Log.cpp | const uint8_t prev = snapMiddle_.exchange(mine, std::
 libs/node/include/rune/node/RuneMetricSlot.h | #include <atomic> | 1 | DEBUG-ONLY | D58 metric owner-tag record (NDEBUG compiles it out)
 libs/node/include/rune/node/RuneMetricSlot.h | std::atomic_ref<std::uint8_t>(*writtenBy_).fetch_or(metricOwnerBit(by), std::memory_order_relaxed); | 1 | DEBUG-ONLY | D58 metric owner-tag record: a second writer thread must not race the tag (NDEBUG compiles it out)
 libs/node/include/rune/node/BrokerNode.h | return std::atomic_ref<std::uint8_t>(b).load(std::memory_order_relaxed); | 1 | DEBUG-ONLY | D58 test seam reading the owner-tag record (always 0 in release builds)
+
+# ------------------------------------------------------------ STARTUP
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | #include <atomic> | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | [[nodiscard]] bool tryLock() noexcept { return !busy_.exchange(true, std::memory_order_acquire); } | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | void unlock() noexcept { busy_.store(false, std::memory_order_release); } | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | holder_.store(std::this_thread::get_id(), std::memory_order_relaxed); | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | if (holder_.exchange(std::thread::id{}, std::memory_order_relaxed) != std::thread::id{}) unlock(); | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | return g && g->holder_.load(std::memory_order_relaxed) == std::this_thread::get_id() ? g : nullptr; | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | static StartupClientGate*& held() noexcept { thread_local StartupClientGate* g = nullptr; return g; } | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | std::atomic<bool> busy_{false}; | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | std::atomic<std::thread::id> holder_{}; | 1 | STARTUP | fused-startup client gate (StartupClientGate)

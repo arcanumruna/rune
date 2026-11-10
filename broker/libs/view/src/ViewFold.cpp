@@ -35,6 +35,7 @@
 
 #include <rune/codec/Record.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/view/FoldWalk.h>
 
 namespace rune::view {
 
@@ -147,25 +148,94 @@ inline void writeKeyedRow(const CompiledViewPlan& plan, const KeyedFoldSpec& ks,
     }
 }
 
-PrepareStatus prepareKeyed(ProjectionFold& f, const SourceRecord& rec, Prospect& p) noexcept {
+// The tables of a projection as one prepare or apply sees them: its own, or through the chain and lock set in `x`.
+struct Stores {
+    ProjectionFold& f;
+    TxnAccess*      x;
+    TxnTable        table;
+    TxnTable        owners;   // no table behind it unless the view is owner-mapped
+    Stores(ProjectionFold& fold, TxnAccess* access) noexcept
+        : f(fold), x(access), table(&fold.table, OverlayTable::View, access), owners(fold.owners, OverlayTable::Owners, access) {}
+};
+
+// A live record with the derived key rows[0].key on a unique view.  Where the record leaves another key (owner O or extra E), the release
+// itself is applyUnique's: prepare only marks it (rows[1], uniquePromotions).
+PrepareStatus prepareUniqueLive(Stores& s, const SourceRecord& rec, Prospect& p, const Descriptor& d, const uint8_t* owner, bool mine) noexcept {
+    ProjectionFold& f = s.f;
+    const KeyedFoldSpec& ks = *f.keyed;
+    const UniqueClaims& cl = *f.claims;
+    ProspectRow& n = p.rows[0];
+    const uint8_t* extra = owner == nullptr ? cl.extraKeyOf(rec.key, s.x) : nullptr;
+    const bool extraOfN = extra != nullptr && std::memcmp(extra, n.key.bytes.data(), ks.keyWidth) == 0;
+    const bool taken = !mine && !extraOfN && cl.ownerOf(n.key, s.x) != nullptr;
+    const uint8_t* cur = s.table.get(n.key);
+
+    p.stats.applied = 1;
+    n.removed = false;
+    n.existed = cur != nullptr;
+    n.image = p.scratch.data();
+    if (mine && cur != nullptr) std::memcpy(n.image, cur, p.rowLen); else std::memset(n.image, 0, p.rowLen);
+    writeKeyedRow(f.plan, ks, f.layout, d, rec.value, n.key, n.image);
+    if (extraOfN) return PrepareStatus::Ok;   // P9-3: an extra keeping its key claims nothing new; only its stored image changes
+    p.op = ProspectOp::Upsert;
+    p.rowCount = 1;
+    n.ownedByOther = taken;
+    if (owner != nullptr && !mine) {
+        ProspectRow& old = p.rows[1];
+        old.key = ViewKey::fromBytes({owner, ks.keyWidth});
+        old.existed = true;
+        old.image = nullptr;
+        old.promoted = cl.hasExtras(old.key, s.x);
+        old.removed = !old.promoted;
+        p.stats.ownerMoves = 1;
+        p.stats.uniquePromotions = old.promoted ? 1 : 0;
+        if (!taken) {
+            p.op = ProspectOp::Move;
+            p.rowCount = 2;
+        }
+    }
+    return PrepareStatus::Ok;
+}
+
+PrepareStatus prepareKeyed(Stores& s, const SourceRecord& rec, Prospect& p) noexcept {
+    ProjectionFold& f = s.f;
     const KeyedFoldSpec& ks = *f.keyed;
     if (rec.key.size() != ks.wireKeyWidth) {
         p.stats.skippedMalformed = 1;
         return PrepareStatus::Malformed;
     }
     const ViewKey wire = ViewKey::fromBytes(asBytes(rec.key));
-    const uint8_t* owner = ks.ownerMapped ? f.owners->get(wire) : nullptr;
+    const uint8_t* owner = ks.ownerMapped ? s.owners.get(wire) : nullptr;
+    if (owner != nullptr) s.owners.pin(wire);   // every record of this source reads its owner entry first: a held one locks an outside Move or delete
+    const UniqueClaims* cl = f.claims;
     ProspectRow& n = p.rows[0];
 
     // Erases the row of the source key: through the owner map, or at the wire key itself.
     const auto eraseCurrent = [&]() noexcept {
+        if (cl != nullptr) {
+            if (owner == nullptr) return n.removed = cl->extraKeyOf(rec.key, s.x) != nullptr;   // an extra leaves quietly: applyUnique drops its claim
+            n.key = ViewKey::fromBytes({owner, ks.keyWidth});
+            if (s.x != nullptr) (void)s.table.get(n.key);   // a chained or lock-checked prepare touches the row apply erases or hands over
+            n.existed = true;
+            p.rowCount = 1;
+            if (cl->hasExtras(n.key, s.x)) {
+                p.op = ProspectOp::Upsert;
+                n.promoted = true;
+                p.stats.uniquePromotions = 1;
+            } else {
+                p.op = ProspectOp::Erase;
+                n.removed = true;
+            }
+            return true;
+        }
         if (ks.ownerMapped) {
             if (owner == nullptr) return false;
             n.key = ViewKey::fromBytes({owner, ks.keyWidth});
+            if (s.x != nullptr) (void)s.table.get(n.key);   // a chained or lock-checked prepare touches the row apply erases
             p.ownerOp = OwnerOp::Erase;
         } else {
             n.key = wire;
-            if (f.table.get(n.key) == nullptr) return false;
+            if (s.table.get(n.key) == nullptr) return false;
         }
         p.op = ProspectOp::Erase;
         p.rowCount = 1;
@@ -194,10 +264,12 @@ PrepareStatus prepareKeyed(ProjectionFold& f, const SourceRecord& rec, Prospect&
         }
     }
 
-    const uint8_t* cur = f.table.get(n.key);
+    const uint8_t* cur = s.table.get(n.key);
     const bool mine = owner != nullptr && std::memcmp(owner, n.key.bytes.data(), ks.keyWidth) == 0;
+    if (cl != nullptr) return prepareUniqueLive(s, rec, p, d, owner, mine);
     if (ks.ownerMapped) {
         if (cur != nullptr && !mine) {
+            s.table.pin(n.key);   // the row that decides the conflict
             p.stats.keyConflicts = 1;
             return PrepareStatus::Ok;
         }
@@ -222,112 +294,93 @@ PrepareStatus prepareKeyed(ProjectionFold& f, const SourceRecord& rec, Prospect&
     return PrepareStatus::Ok;
 }
 
-void applyKeyed(ProjectionFold& f, const SourceRecord& rec, const Prospect& p) noexcept {
+// Row O leaves its owner w and the smallest extra takes it over.
+void promoteExtra(Stores& st, const ViewKey& o, const ViewKey& w) noexcept {
+    ProjectionFold& f = st.f;
+    std::string_view s;
+    const uint8_t* image = nullptr;
+    (void)f.claims->smallestExtra(o, s, image, st.x);
+    const ViewKey sKey = ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(s.data()), s.size()});
+    std::memcpy(st.table.put(o), image, f.layout.rowLen);
+    f.claims->setOwner(o, s, st.x);
+    f.claims->removeExtra(s, st.x);
+    st.owners.erase(w);
+    std::memcpy(st.owners.put(sKey), o.bytes.data(), f.keyed->keyWidth);
+}
+
+// The owner O of w gives its key up: an extra takes the row, or the row goes.
+void releaseOwner(Stores& st, const ViewKey& o, const ViewKey& w) noexcept {
+    if (st.f.claims->hasExtras(o, st.x)) return promoteExtra(st, o, w);
+    st.table.erase(o);
+    st.f.claims->eraseOwner(o, st.x);
+    st.owners.erase(w);
+}
+
+void applyUnique(Stores& st, const SourceRecord& rec, const Prospect& p) noexcept {
+    ProjectionFold& f = st.f;
+    UniqueClaims& cl = *f.claims;
+    const ProspectRow& n = p.rows[0];
+    const ViewKey w = ViewKey::fromBytes(asBytes(rec.key));
+    if (p.op == ProspectOp::None) {   // an extra: updates its image or leaves
+        if (n.image != nullptr) cl.updateExtraImage(rec.key, n.image, st.x);
+        else if (n.removed) cl.removeExtra(rec.key, st.x);
+        return;
+    }
+    if (n.promoted) return promoteExtra(st, n.key, w);
+    if (p.op == ProspectOp::Erase) return releaseOwner(st, n.key, w);
+
+    const uint8_t* cur = st.owners.get(w);
+    const bool mine = cur != nullptr && std::memcmp(cur, n.key.bytes.data(), f.keyed->keyWidth) == 0;
+    if (!mine) {
+        if (cur != nullptr) releaseOwner(st, ViewKey::fromBytes({cur, f.keyed->keyWidth}), w);
+        else cl.removeExtra(rec.key, st.x);
+    }
+    if (n.ownedByOther) {   // unjudged: the smaller source key owns, the other becomes an extra
+        const ViewKey o = ViewKey::fromBytes({cl.ownerOf(n.key, st.x), f.keyed->wireKeyWidth});
+        const std::string_view ow(reinterpret_cast<const char*>(o.bytes.data()), o.len);
+        if (cl.compare(rec.key, ow) < 0) {
+            cl.addExtra(n.key, ow, st.table.get(n.key), st.x);
+            std::memcpy(st.table.put(n.key), n.image, p.rowLen);
+            cl.setOwner(n.key, rec.key, st.x);
+            st.owners.erase(o);
+            std::memcpy(st.owners.put(w), n.key.bytes.data(), f.keyed->keyWidth);
+        } else {
+            cl.addExtra(n.key, rec.key, n.image, st.x);
+        }
+        return;
+    }
+    std::memcpy(st.table.put(n.key), n.image, p.rowLen);
+    if (mine) return;
+    cl.setOwner(n.key, rec.key, st.x);
+    std::memcpy(st.owners.put(w), n.key.bytes.data(), f.keyed->keyWidth);
+}
+
+void applyKeyed(Stores& st, const SourceRecord& rec, const Prospect& p) noexcept {
     const ProspectRow& n = p.rows[0];
     switch (p.op) {
         case ProspectOp::None: break;
-        case ProspectOp::Erase: f.table.erase(n.key); break;
-        case ProspectOp::Move: f.table.erase(p.rows[1].key); [[fallthrough]];
-        case ProspectOp::Upsert: std::memcpy(f.table.put(n.key), n.image, p.rowLen); break;
+        case ProspectOp::Erase: st.table.erase(n.key); break;
+        case ProspectOp::Move: st.table.erase(p.rows[1].key); [[fallthrough]];
+        case ProspectOp::Upsert: std::memcpy(st.table.put(n.key), n.image, p.rowLen); break;
     }
     if (p.ownerOp == OwnerOp::None) return;
     const ViewKey wire = ViewKey::fromBytes(asBytes(rec.key));
-    if (p.ownerOp == OwnerOp::Erase) f.owners->erase(wire);
-    else std::memcpy(f.owners->put(wire), n.key.bytes.data(), f.keyed->keyWidth);
+    if (p.ownerOp == OwnerOp::Erase) st.owners.erase(wire);
+    else std::memcpy(st.owners.put(wire), n.key.bytes.data(), st.f.keyed->keyWidth);
 }
 
-// The batch walk both folds share: control and aborted batches are consumed whole, `onRecord(key, value, offset, stats)` sees
-// every other record in [cursor, bound) that the judge did not reject.  `cursor` is IN/OUT exactly as foldBatch documents it.
-template <class OnRecord>
-FoldStats walkCommitted(const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor, const FoldSkip& skip, OnRecord&& onRecord) {
-    FoldStats stats{};
-    // Resume point: a LogReadView is WHOLE batches, so when the caller's cursor
-    // sits mid-batch (a capped pass stopped there) the batch's records below it
-    // were already folded and must not be re-applied.
-    const FoldSkip foldSkip = skip;   // #537: by value (see AbortedTxnFilter::skips)
-    const int64_t from = cursor;
-    bool stopped = false;
-    bool corrupt = false;
-
-    // Highest offset this call has FULLY folded so far (every record of
-    // every batch up to and including this point was folded or validly
-    // skipped as control). Starts at view.baseOffset (nothing folded yet).
-    // LogReadView's contract is WHOLE batches only, so this only ever
-    // advances to a batch boundary -- never mid-batch.
-    int64_t walkedUpto = view.baseOffset;
-
-    size_t pos = 0;
-    while (pos < view.len) {
-        rune::protocol::RecordBatchReader r(view.data + pos, view.len - pos);
-        if (!r.ensureValid()) {
-            corrupt = true; // torn/corrupt tail: stop, do not advance past it
-            break;
-        }
-        const int16_t attrs = r.attributes();
-        if ((attrs & rune::protocol::batch::kAttrControl) != 0) {
-            ++stats.skippedControl;
-            pos += static_cast<size_t>(r.totalLength());
-            walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
-            continue;
-        }
-        if (isAbortedBatch(foldSkip, r, attrs)) [[unlikely]] {
-            // #537: an aborted transaction's batch is never applied.  Below the
-            // bound it is consumed whole, like a control batch; a batch the
-            // bound cuts (a capped pass) stops the walk exactly as a record
-            // past the bound does — the next pass resumes and skips it again.
-            if (r.baseOffset() + r.lastOffsetDelta() >= bound) { stopped = true; break; }
-            ++stats.skippedAborted;
-            pos += static_cast<size_t>(r.totalLength());
-            walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
-            continue;
-        }
-
-        r.forEachRecord([&](std::string_view key, std::string_view value,
-                             int64_t offset, int64_t /*timestamp*/) {
-            if (stopped) {
-                return; // already hit the uncommitted boundary this call
-            }
-            if (offset >= bound) {
-                stopped = true; // don't fold uncommitted records
-                return;
-            }
-            if (offset < from) {
-                return; // already folded by a previous (mid-batch-stopped) pass
-            }
-            if (isRejectedRecord(foldSkip, offset)) [[unlikely]] {
-                ++stats.skippedRejected;   // the judge rejected it: no view ever applies it
-                return;
-            }
-
-            onRecord(key, value, offset, stats);
-        });
-
-        if (stopped) {
-            break; // bound reached mid-batch: this batch was NOT fully folded
-        }
-        pos += static_cast<size_t>(r.totalLength());
-        walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1; // batch fully folded
-    }
-
-    // On a corrupt/torn break, never advance past the last fully-folded
-    // batch -- view.nextOffset describes the WHOLE view (including bytes we
-    // never validated), so using it here could skip records this call never
-    // folded. Otherwise (normal completion or a bound-stop), the walk either
-    // consumed the whole view or stopped exactly at a committed boundary, so
-    // the existing min(nextOffset, bound) cap is correct and tighter than
-    // walkedUpto would be when bound < nextOffset.
-    // Never move the resume point backwards (a corrupt batch at/after `from`).
-    cursor = std::max(from, corrupt ? walkedUpto : std::min(view.nextOffset, bound));
-    return stats;
+void applyTo(Stores& st, const SourceRecord& rec, const Prospect& p) noexcept {
+    if (st.f.claims != nullptr) return applyUnique(st, rec, p);
+    if (st.f.keyed != nullptr) return applyKeyed(st, rec, p);
+    if (p.op == ProspectOp::None) return;
+    const uint64_t k = p.rows[0].key.asU64();
+    if (p.op == ProspectOp::Erase) st.table.erase(k);
+    else std::memcpy(st.table.put(k), p.rows[0].image, p.rowLen);
 }
 
-} // namespace
-
-PrimType viewKeyType(const CompiledViewPlan& plan) noexcept { return resolveKeyType(plan); }
-
-PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p) noexcept {
-    p.clear();
-    if (f.keyed != nullptr) return prepareKeyed(f, rec, p);
+PrepareStatus prepareOne(Stores& st, const SourceRecord& rec, Prospect& p) noexcept {
+    ProjectionFold& f = st.f;
+    if (f.keyed != nullptr) return prepareKeyed(st, rec, p);
     uint64_t k = 0;
     if (!decodeWireKey(rec.key, f.keyType, k)) {
         p.stats.skippedMalformed = 1;
@@ -336,7 +389,7 @@ PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Pros
     ProspectRow& r = p.rows[0];
     r.key     = ViewKey::fromU64(k);
     p.rowCount = 1;
-    const uint8_t* cur = f.table.get(k);
+    const uint8_t* cur = st.table.get(k);
     r.existed = cur != nullptr;
     r.removed = false;
     r.image   = nullptr;
@@ -355,20 +408,45 @@ PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Pros
     return PrepareStatus::Ok;
 }
 
+} // namespace
+
+PrimType viewKeyType(const CompiledViewPlan& plan) noexcept { return resolveKeyType(plan); }
+
+PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p, TxnOverlay* chain) noexcept {
+    p.clear();
+    if (chain != nullptr && !rowsFit(*chain, {&f.table, f.owners, f.claims != nullptr ? &f.claims->indexTable() : nullptr,
+                                              f.claims != nullptr ? &f.claims->extrasTable() : nullptr}))
+        return PrepareStatus::CapacityExhausted;
+    TxnAccess x{chain, f.locks, f.member};
+    Stores st(f, chain != nullptr || f.locks != nullptr ? &x : nullptr);
+    PrepareStatus status = prepareOne(st, rec, p);
+    if (status == PrepareStatus::Ok && chain != nullptr && !x.locked) {
+        p.chained = true;
+        for (std::size_t i = 0; i < p.rowCount; ++i) {   // F11: applyTo overwrites a held image in place
+            ProspectRow& r = p.rows[i];
+            const uint8_t* cur = !r.existed ? nullptr : f.keyed != nullptr ? st.table.get(r.key) : st.table.get(r.key.asU64());
+            if (cur == nullptr) continue;
+            r.before = p.before.data() + i * p.rowLen;
+            std::memcpy(p.before.data() + i * p.rowLen, cur, p.rowLen);
+        }
+        applyTo(st, rec, p);   // the record's effect, written into the chain instead of the tables
+        if (chain->full()) status = PrepareStatus::CapacityExhausted;
+    }
+    return x.locked ? PrepareStatus::Locked : status;
+}
+
 void applyProjection(ProjectionFold& f, const SourceRecord& rec, const Prospect& p) noexcept {
-    if (f.keyed != nullptr) return applyKeyed(f, rec, p);
-    if (p.op == ProspectOp::None) return;
-    const uint64_t k = p.rows[0].key.asU64();
-    if (p.op == ProspectOp::Erase) f.table.erase(k);
-    else std::memcpy(f.table.put(k), p.rows[0].image, p.rowLen);
+    Stores st(f, nullptr);
+    applyTo(st, rec, p);
 }
 
 FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                      VersionDescriptorCache& vdc, ViewTable& table,
                      const rune::storage::LogReadView& view, int64_t bound,
-                     int64_t& cursor, const FoldSkip& skip) {
+                     int64_t& cursor, const FoldSkip& skip, TxnFold* txn) {
     const PrimType keyType = resolveKeyType(plan);
-    return walkCommitted(view, bound, cursor, skip, [&](std::string_view key, std::string_view value, int64_t, FoldStats& stats) {
+    FoldStats stats{};
+    walkFold(view, bound, cursor, skip, txn, stats, [&](std::string_view key, std::string_view value, int64_t) {
         uint64_t k = 0;
         if (!decodeWireKey(key, keyType, k)) {
             ++stats.skippedMalformed;
@@ -384,11 +462,13 @@ FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
         writeProjectionRow(plan, layout, d, value, table.put(k));
         ++stats.applied;
     });
+    return stats;
 }
 
 FoldStats foldProjectionBatch(ProjectionFold& f, Prospect& p, const rune::storage::LogReadView& view, int64_t bound,
-                              int64_t& cursor, const FoldSkip& skip) {
-    return walkCommitted(view, bound, cursor, skip, [&](std::string_view key, std::string_view value, int64_t offset, FoldStats& stats) {
+                              int64_t& cursor, const FoldSkip& skip, TxnFold* txn) {
+    FoldStats stats{};
+    walkFold(view, bound, cursor, skip, txn, stats, [&](std::string_view key, std::string_view value, int64_t offset) {
         const SourceRecord rec{key, value, offset, 0, nullptr};
         (void)prepareProjection(f, rec, p);   // a malformed record leaves op None: apply does nothing and the stats say why
         applyProjection(f, rec, p);
@@ -398,7 +478,9 @@ FoldStats foldProjectionBatch(ProjectionFold& f, Prospect& p, const rune::storag
         stats.skippedNoKey += p.stats.skippedNoKey;
         stats.keyConflicts += p.stats.keyConflicts;
         stats.ownerMoves += p.stats.ownerMoves;
+        stats.uniquePromotions += p.stats.uniquePromotions;
     });
+    return stats;
 }
 
 } // namespace rune::view

@@ -1,14 +1,19 @@
 // CheckedWritesQlBrokerRegressionTest.cpp - checked writes Part 08 Task 10: the REAL `rune` CLI (rune::cli::run) against REAL
-// brokers on the shard runtime.  The RegressorsPath DDL (unique and check refused until Part 09), select, show, stats and
+// brokers on the shard runtime.  The RegressorsPath DDL (unique and check views included), select, show, stats and
 // lower() literals.  Every wait is bounded.
+#include "client/CheckedWritesBrokerSupport.h"
 #include "client/ClusterClient.h"
 #include "client/OneBroker.h"
+#include "client/support/RegressorsPathRecords.h"
 #include "support/CatalogBrokerCluster.h"
+#include "support/SharedClientDriver.h"
 
 #include <QlEngine.h>
 #include <rune/cli/Cli.h>
 #include <rune/client/Client.h>
 #include <rune/client/producer/Producer.h>
+#include <rune/ql/Backends.h>
+#include <rune/ql/Parser.h>
 
 #include <gtest/gtest.h>
 
@@ -16,6 +21,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -34,9 +41,11 @@ namespace {
 constexpr uint16_t kKeyExists = 56;
 constexpr rc::Acks kAllView   = rc::Acks::All | rc::Acks::View;
 
-/// Every broker here runs the shard runtime: its client stream is catalog_cluster::kClientStream.
-int runCli(std::vector<std::string> args, std::string* out = nullptr, std::string* err = nullptr) {
+/// Every broker here runs the shard runtime: its client stream is catalog_cluster::kClientStream.  `aeronDir`: attach to that media driver,
+/// not an embedded one of the run's own.
+int runCli(std::vector<std::string> args, std::string* out = nullptr, std::string* err = nullptr, const std::string& aeronDir = {}) {
     args.insert(args.end(), {"--cli-stream-in", std::to_string(catalog_cluster::kClientStream)});
+    if (!aeronDir.empty()) args.insert(args.end(), {"--cli-aeron-dir", aeronDir});
     std::stringstream o, e;
     const int code = rune::cli::run(std::move(args), o, e);
     if (out) *out = o.str();
@@ -45,8 +54,8 @@ int runCli(std::vector<std::string> args, std::string* out = nullptr, std::strin
 }
 
 /// `rune ql -e <text> --broker <endpoint>`
-int ql(const std::string& endpoint, const std::string& text, std::string* out = nullptr, std::string* err = nullptr) {
-    return runCli({"ql", "-e", text, "--broker", endpoint}, out, err);
+int ql(const std::string& endpoint, const std::string& text, std::string* out = nullptr, std::string* err = nullptr, const std::string& aeronDir = {}) {
+    return runCli({"ql", "-e", text, "--broker", endpoint}, out, err, aeronDir);
 }
 
 struct TmpDir {
@@ -84,6 +93,10 @@ void awaitLevel(BrokerNode& n) {
         if (!raised) std::this_thread::sleep_for(25ms);
     }
     ASSERT_TRUE(raised) << "the cluster feature level reaches kCheckedWrites";
+}
+
+catalog_cluster::ThreeNodes startCluster(const std::string& tag) {
+    return catalog_cluster::ThreeNodes::startWith(tag, rune::node::test::cw_broker::fastFailover);
 }
 
 std::string clusterEndpoint(catalog_cluster::ThreeNodes& c, int id) {
@@ -229,51 +242,76 @@ bool qlEventually(const std::string& endpoint, const std::string& text, std::str
 
 }  // namespace
 
-// The acceptance case: every statement of the RegressorsPath script, one `rune ql -e` each.  Part 09 flips the two refusal rows.
-TEST(CheckedWritesQlBrokerRegression, RegressorsPathOutcomesBeforePart09ThreeNodesRegression) {
+// The acceptance case: every statement of the RegressorsPath script, one `rune ql -e` each.
+TEST(CheckedWritesQlBrokerRegression, RegressorsPathOutcomesThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    std::ifstream in(std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql");
+    const std::string golden = std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql";
+    std::ifstream in(golden);
     ASSERT_TRUE(in.good());
     std::stringstream script;
     script << in.rdbuf();
     const std::vector<std::string> statements = rune::cli::engine::splitStatements(script.str());
     ASSERT_EQ(statements.size(), 7u);
 
-    ThreeNodes c = ThreeNodes::start("cw08");
+    // The runs of `rune ql` share one media driver (an embedded one per run costs 40-75 ms of it here), started while the cluster does.
+    auto driverStart = std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
+    ThreeNodes c = startCluster("cw09_ql");
+    const auto driver = driverStart.get();
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     for (const int id : c.runningNodes()) awaitLevel(c.node(id));
     ASSERT_FALSE(HasFatalFailure());
     const std::string ep = clusterEndpoint(c, 1);
-
-    struct Expect { int exit; const char* err; };
-    const Expect expected[] = {
-        {0, nullptr},                                                                       // user
-        {1, "ViewUniqueInvalid (61) unique views are not available yet"},                   // user_identity
-        {0, nullptr},                                                                       // device_login
-        {0, nullptr},                                                                       // device_history
-        {0, nullptr},                                                                       // character
-        {1, "ViewUniqueInvalid (61) unique views are not available yet"},                   // character_name
-        {1, "ViewConstraintInvalid (60) check constraints are not available yet"},          // account_stats
-    };
     for (std::size_t i = 0; i < statements.size(); ++i) {
         std::string out, err;
-        EXPECT_EQ(ql(ep, statements[i], &out, &err), expected[i].exit) << "statement " << i << ": " << statements[i] << "\n" << err;
-        if (expected[i].err != nullptr) EXPECT_EQ(err, std::string("rune: ") + expected[i].err + "\n") << "statement " << i;
-        else EXPECT_TRUE(err.empty()) << "statement " << i << ": " << err;
+        EXPECT_EQ(ql(ep, statements[i], &out, &err, driver->dir()), 0) << "statement " << i << ": " << statements[i] << "\n" << err;
+        EXPECT_TRUE(err.empty()) << "statement " << i << ": " << err;
+        // Node 1 may apply this statement's catalog change a moment after its leader answered it.
+        std::string why;
+        ASSERT_TRUE(c.awaitCatalogDigestsEqual(30s, &why)) << "statement " << i << ": " << why;
     }
-
     std::string out, err;
-    ASSERT_EQ(ql(ep, "show topic user;", &out, &err), 0) << err;
+    ASSERT_EQ(ql(ep, "show topic user;", &out, &err, driver->dir()), 0) << err;
     EXPECT_NE(out.find("partitions 1"), std::string::npos) << out;
     EXPECT_NE(out.find("key.index on"), std::string::npos) << out;
     EXPECT_NE(out.find("autoincrement on (reserve 4096, max 9007199254740991)"), std::string::npos) << out;
     EXPECT_NE(out.find("partitioner modulo"), std::string::npos) << out;
     EXPECT_NE(out.find("autoIncrementCounter 1"), std::string::npos) << out;
-    ASSERT_EQ(ql(ep, "show topic character;", &out, &err), 0) << err;
+    ASSERT_EQ(ql(ep, "show topic character;", &out, &err, driver->dir()), 0) << err;
     EXPECT_NE(out.find("partitions 1"), std::string::npos) << out;
-    ASSERT_EQ(ql(ep, "show view device_history;", &out, &err), 0) << err;
+    ASSERT_EQ(ql(ep, "show view device_history;", &out, &err, driver->dir()), 0) << err;
     EXPECT_NE(out.find("keyspec (userId, deviceFp)"), std::string::npos) << out;
     EXPECT_NE(out.find("group by (userId, deviceFp)"), std::string::npos) << out;
+}
+
+// The whole script with `-f` on a fresh cluster.
+TEST(CheckedWritesQlBrokerRegression, RegressorsPathWholeScriptThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    const std::string golden = std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql";
+    ThreeNodes c = startCluster("cw09_ql_f");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    for (const int id : c.runningNodes()) awaitLevel(c.node(id));
+    ASSERT_FALSE(HasFatalFailure());
+    std::string out, err;
+    EXPECT_EQ(runCli({"ql", "-f", golden, "--broker", clusterEndpoint(c, 1)}, &out, &err), 0) << err;
+}
+
+// The record types of the RegressorsPath tests are the golden script's topics: the fingerprints match, without a broker.
+TEST(CheckedWritesQlBrokerRegression, RegressorsPathRecordFingerprintsMatchTheGoldenScript) {
+    std::ifstream in(std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql");
+    ASSERT_TRUE(in.good());
+    std::stringstream script;
+    script << in.rdbuf();
+    std::map<std::string, uint64_t> golden;
+    for (const std::string& statement : rune::cli::engine::splitStatements(script.str())) {
+        const auto parsed = rune::ql::parse(statement);
+        ASSERT_TRUE(parsed.has_value()) << statement;
+        if (const auto* topic = std::get_if<rune::ql::TopicDef>(&*parsed))
+            golden[topic->name] = rune::codec::fingerprint(rune::ql::toDescriptor(*topic));
+    }
+    ASSERT_TRUE(golden.contains("user"));
+    ASSERT_TRUE(golden.contains("character"));
+    EXPECT_EQ(golden["user"], RpUser::kFingerprint);
+    EXPECT_EQ(golden["character"], RpCharacter::kFingerprint);
 }
 
 // R08a: an aggregate over a per-login key counts every login.
@@ -499,7 +537,7 @@ TEST(CheckedWritesQlBrokerRegression, ScanSelectPagesShardRegression) {
 // A follower seed: the client follows the Redirect to the partition leader and prints the leader's counters.
 TEST(CheckedWritesQlBrokerRegression, StatsFromAFollowerRedirectsThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw08_stf");
+    ThreeNodes c = startCluster("cw08_stf");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     for (const int id : c.runningNodes()) awaitLevel(c.node(id));
     ASSERT_FALSE(HasFatalFailure());

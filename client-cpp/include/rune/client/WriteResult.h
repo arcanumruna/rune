@@ -5,11 +5,22 @@
 
 #include <chrono>
 #include <cstdint>
+#include <string>
 
 namespace rune::client {
 
 /// How long a typed *AndWait write waits for its verdict by default.
 inline constexpr std::chrono::seconds kDefaultWriteWait{30};
+
+/// How long Client::constraintName waits for one catalog refresh on a miss.
+inline constexpr std::chrono::milliseconds kConstraintNameRefreshTimeout{5000};
+
+/// The view and constraint a constraintId names (`character_name` / `unique`, `account_stats` / `max_characters`).
+struct ConstraintName {
+    std::string view;
+    std::string constraint;
+    bool operator==(const ConstraintName&) const = default;
+};
 
 class WriteResult {
 public:

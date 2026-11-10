@@ -135,7 +135,9 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
                         rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers (errors throw)
     if (!sub_) {
         throw std::runtime_error(
-            "ClientGateway: ingress subscription not resolved (driver refused the pump)");
+            "ClientGateway: ingress subscription " + clientChannel_ + " stream " + std::to_string(clientStreamId_) +
+            (pump.deadlineExpired() ? " not answered by the driver within the startup deadline"
+                                    : " not resolved (driver refused the pump)"));
     }
 }
 
@@ -6871,6 +6873,7 @@ int ClientGateway::resendRemoteMarkers_()
     // reconnected peer(s) with the SAME token.  Idempotent end to end: the
     // leader skips a copy still in flight there and re-answers otherwise; the
     // answer to any copy completes the marker once; copies stay FIFO per peer.
+    // Votes (Part 11) likewise, minus the queue: a refused re-send completes NotLeader.
     const bool all = resendAllRemoteMarkers_;
     resendAllRemoteMarkers_ = false;
     std::vector<int32_t> peers;
@@ -6885,8 +6888,21 @@ int ClientGateway::resendRemoteMarkers_()
         }
         ++resent;
     }
+    std::vector<int64_t> refused;   // votes carry no send queue: a refused re-send completes NotLeader and T10 retries
+    for (const auto& [token, v] : votesInFlight_) {
+        if (v.remoteNode < 0) continue;
+        if (!all && std::find(peers.begin(), peers.end(), v.remoteNode) == peers.end()) continue;
+        if (!sendRemoteVote_(token, v)) {
+            refused.push_back(token);
+            continue;
+        }
+        ++resent;
+    }
+    completeVotesNotLeader_(refused);
     if (resent > 0)
-        spdlog::info("ClientGateway: cluster-plane reconnect — re-sent {} in-flight remote marker(s)", resent);
+        spdlog::info("ClientGateway: cluster-plane reconnect — re-sent {} in-flight remote marker(s) and vote(s)", resent);
+    if (!refused.empty())
+        spdlog::info("ClientGateway: cluster-plane reconnect — {} remote vote(s) completed NotLeader (re-send refused)", refused.size());
     return resent;
 }
 
@@ -7068,9 +7084,11 @@ int ClientGateway::pumpTxnMarkers_()
     if (routingChangedForMarkers_) [[unlikely]] {
         routingChangedForMarkers_ = false;
         if (!markersInFlight_.empty()) failRemoteMarkersOnLeaderChange_();
+        if (!votesInFlight_.empty()) failRemoteVotesOnLeaderChange_();
     }
     if (!markerSendQueue_.empty()) work += pumpMarkerQueue_();   // worker-bound and D9 remote markers
     if (!pendingMarkerResponses_.empty()) [[unlikely]] work += pumpMarkerResponses_();
+    if (!pendingVoteResponses_.empty()) [[unlikely]] work += pumpVoteResponses_();
     if (replicaRegistry_ != nullptr && !lastRemoteMarker_.empty() &&
         replicaRegistry_->roleChanges() != seenRegistryRoleChanges_) [[unlikely]] {
         seenRegistryRoleChanges_ = replicaRegistry_->roleChanges();
@@ -7092,6 +7110,198 @@ int32_t ClientGateway::verifyCoordinatorNode_() const noexcept
     return (n < 0 || n == thisNodeId_) ? -1 : n;
 }
 
+int64_t ClientGateway::sendTxnVote(int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch,
+                                   int32_t coordinatorEpoch)
+{
+    if (votesInFlight_.size() >= kMaxTxnVotesInFlight) return -1;
+    const int64_t token = nextVoteToken_;
+    int32_t leaderEpoch = 0;
+    if (const int32_t leader = remoteMarkerLeader_(topicId, partition, leaderEpoch); leader >= 0) {
+        const VoteInFlight v{topicId, partition, producerId, producerEpoch, coordinatorEpoch, leader, leaderEpoch};
+        if (!sendRemoteVote_(token, v)) return -1;
+        ++nextVoteToken_;
+        votesInFlight_.emplace(token, v);
+        return token;
+    }
+    if (!routesToWorker_(topicId)) return -1;
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::TxnVote;
+    op.topicId       = topicId;
+    op.partition     = partition;
+    op.correlationId = token;
+    op.producerId    = producerId;
+    op.producerEpoch = producerEpoch;
+    op.sessionId     = -1;   // local origin
+    if (!workerPool_->tryEnqueueOp(topicId, partition, std::move(op))) return -1;
+    ++nextVoteToken_;
+    votesInFlight_.emplace(token, VoteInFlight{topicId, partition, producerId, producerEpoch, coordinatorEpoch});
+    return token;
+}
+
+bool ClientGateway::sendRemoteVote_(int64_t token, const VoteInFlight& v)
+{
+    if (txnMarkerChannel_.sendVote == nullptr) return false;
+    rune::replication::TxnVoteMsg m{};
+    m.coordinatorNodeId = thisNodeId_;
+    m.coordinatorEpoch  = v.coordinatorEpoch;
+    m.token             = token;
+    m.topicId           = v.topicId;
+    m.partition         = v.partition;
+    m.producerId        = v.producerId;
+    m.producerEpoch     = v.producerEpoch;
+    m.leaderEpoch       = v.remoteLeaderEpoch;
+    return txnMarkerChannel_.sendVote(txnMarkerChannel_.ctx, v.remoteNode, m);
+}
+
+void ClientGateway::completeVotesNotLeader_(const std::vector<int64_t>& tokens)
+{
+    TxnVoteResult res;
+    res.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+    for (const int64_t token : tokens) {
+        auto it = votesInFlight_.find(token);
+        if (it == votesInFlight_.end()) continue;   // completed by an earlier sink call
+        const VoteInFlight v = it->second;
+        votesInFlight_.erase(it);   // erased before the sink runs: it may send again
+        if (voteSink_ != nullptr)
+            voteSink_(voteSinkCtx_, v.topicId, v.partition, v.producerId, v.producerEpoch, v.coordinatorEpoch, res);
+    }
+}
+
+void ClientGateway::failRemoteVotesOnLeaderChange_()
+{
+    std::vector<int64_t> moved;   // cold: only with votes in flight on an image change
+    for (const auto& [token, v] : votesInFlight_) {
+        if (v.remoteNode < 0) continue;   // local votes are released by the worker
+        int32_t leader = -1;
+        int32_t epoch  = -1;
+        if (routingImage_) {
+            const auto& e = routingImage_->lookup(rune::metadata::gpidOf(v.topicId, v.partition));
+            leader = e.leaderNodeId;
+            epoch  = e.leaderEpoch;
+        }
+        if (leader != v.remoteNode || epoch != v.remoteLeaderEpoch) moved.push_back(token);
+    }
+    completeVotesNotLeader_(moved);
+}
+
+std::size_t ClientGateway::purgeTxnVotes(int32_t olderThan)
+{
+    return std::erase_if(votesInFlight_, [olderThan](const auto& kv) { return kv.second.coordinatorEpoch < olderThan; });
+}
+
+void ClientGateway::onTxnVoteResult_(const rune::node::WorkerReturn& ret)
+{
+    if (ret.sessionId >= 0) {   // a vote taken for another node's coordinator: answer it over the plane
+        auto it = remoteVotes_.find(RemoteVoteKey{static_cast<int32_t>(ret.sessionId), ret.correlationId});
+        if (it == remoteVotes_.end()) {
+            spdlog::warn("ClientGateway: TxnVoteResult for no remote vote origin={} token={} topic={} partition={}",
+                         ret.sessionId, ret.correlationId, ret.topicId, ret.partition);
+            return;
+        }
+        rune::replication::TxnVoteResponseMsg r = it->second;
+        remoteVotes_.erase(it);
+        r.errorCode     = ret.errorCode;
+        r.code          = static_cast<uint16_t>(ret.recordCount);
+        r.constraintId  = static_cast<uint32_t>(ret.newNextOffset);
+        r.failingOffset = ret.baseOffset;
+        answerRemoteVote_(static_cast<int32_t>(ret.sessionId), r);
+        return;
+    }
+    auto it = votesInFlight_.find(ret.correlationId);
+    if (it == votesInFlight_.end()) {   // answered already, or a stale incarnation's token
+        spdlog::debug("ClientGateway: TxnVoteResult for unknown token={} topic={} partition={}", ret.correlationId,
+                      ret.topicId, ret.partition);
+        return;
+    }
+    const VoteInFlight v = it->second;
+    votesInFlight_.erase(it);   // erased before the sink runs: it may send again
+    if (voteSink_ == nullptr) return;
+    TxnVoteResult r;
+    r.errorCode     = ret.errorCode;
+    r.code          = static_cast<uint16_t>(ret.recordCount);
+    r.constraintId  = static_cast<uint32_t>(ret.newNextOffset);
+    r.failingOffset = ret.baseOffset;
+    voteSink_(voteSinkCtx_, v.topicId, v.partition, v.producerId, v.producerEpoch, v.coordinatorEpoch, r);
+}
+
+void ClientGateway::onRemoteTxnVote(const rune::replication::TxnVoteMsg& m)
+{
+    namespace pcl = rune::protocol::client;
+    if (m.coordinatorNodeId < 0 || m.coordinatorNodeId == thisNodeId_) [[unlikely]] {   // no answer can reach such an origin
+        spdlog::warn("ClientGateway: TxnVote with origin node {} (this node {}) dropped (bug)", m.coordinatorNodeId, thisNodeId_);
+        return;
+    }
+    const RemoteVoteKey key{m.coordinatorNodeId, m.token};
+    if (remoteVotes_.contains(key)) return;   // a re-sent copy: the first one's answer is still owed
+    rune::replication::TxnVoteResponseMsg r{};
+    r.token            = m.token;
+    r.topicId          = m.topicId;
+    r.partition        = m.partition;
+    r.producerId       = m.producerId;
+    r.coordinatorEpoch = m.coordinatorEpoch;
+    r.producerEpoch    = m.producerEpoch;
+    // As for a remote marker, this node's routing image is not consulted: the worker's role and epoch gate decide.
+    const ServedPartition served = servedPartition_(m.topicId, m.partition);
+    const bool servable = served.kind == ServedPartition::Kind::Disk || served.kind == ServedPartition::Kind::Transient;
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::TxnVote;
+    op.topicId       = m.topicId;
+    op.partition     = m.partition;
+    op.correlationId = m.token;
+    op.producerId    = m.producerId;
+    op.producerEpoch = m.producerEpoch;
+    op.sessionId     = m.coordinatorNodeId;
+    op.roleEpoch     = m.leaderEpoch >= 0 ? m.leaderEpoch + 1 : 0;
+    if (!servable || m.topicId < 0 || !routesToWorker_(m.topicId) ||
+        !workerPool_->tryEnqueueOp(m.topicId, m.partition, std::move(op))) {
+        r.errorCode = static_cast<int16_t>(pcl::ErrorCode::NotLeader);   // the coordinator re-resolves and retries
+        answerRemoteVote_(m.coordinatorNodeId, r);
+        return;
+    }
+    remoteVotes_.emplace(key, r);
+}
+
+void ClientGateway::onRemoteTxnVoteResponse(const rune::replication::TxnVoteResponseMsg& r)
+{
+    auto it = votesInFlight_.find(r.token);
+    if (it == votesInFlight_.end() || it->second.remoteNode < 0 || it->second.topicId != r.topicId ||
+        it->second.partition != r.partition || it->second.producerId != r.producerId ||
+        it->second.producerEpoch != r.producerEpoch || it->second.coordinatorEpoch != r.coordinatorEpoch) {
+        spdlog::debug("ClientGateway: TxnVoteResponse for unknown token={} topic={} partition={}", r.token, r.topicId,
+                      r.partition);
+        return;
+    }
+    const VoteInFlight v = it->second;
+    votesInFlight_.erase(it);   // erased before the sink runs: it may send again
+    if (voteSink_ == nullptr) return;
+    TxnVoteResult res;
+    res.errorCode     = r.errorCode;
+    res.code          = r.code;
+    res.constraintId  = r.constraintId;
+    res.failingOffset = r.failingOffset;
+    voteSink_(voteSinkCtx_, v.topicId, v.partition, v.producerId, v.producerEpoch, v.coordinatorEpoch, res);
+}
+
+void ClientGateway::answerRemoteVote_(int32_t toNode, const rune::replication::TxnVoteResponseMsg& r)
+{
+    if (txnMarkerChannel_.sendVoteResponse == nullptr) return;   // unreachable: the vote came over the plane
+    // FIFO behind earlier back-pressured answers; never dropped.
+    if (!pendingVoteResponses_.empty() || !txnMarkerChannel_.sendVoteResponse(txnMarkerChannel_.ctx, toNode, r))
+        pendingVoteResponses_.emplace_back(toNode, r);
+}
+
+int ClientGateway::pumpVoteResponses_()
+{
+    int sent = 0;
+    while (!pendingVoteResponses_.empty()) {
+        const auto& [to, r] = pendingVoteResponses_.front();
+        if (!txnMarkerChannel_.sendVoteResponse(txnMarkerChannel_.ctx, to, r)) break;
+        pendingVoteResponses_.pop_front();
+        ++sent;
+    }
+    return sent;
+}
+
 void ClientGateway::onTxnVerifyRequest_(const rune::node::WorkerReturn& ret)
 {
     namespace pcl = rune::protocol::client;
@@ -7101,8 +7311,9 @@ void ClientGateway::onTxnVerifyRequest_(const rune::node::WorkerReturn& ret)
     a.producerId    = ret.producerId;
     a.producerEpoch = ret.producerEpoch;
     a.reqId         = ret.correlationId;
+    a.votes         = ret.baseOffset != 0;
     if (txnService_ != nullptr && txnService_->coordinatesLocally()) {
-        a.code = txnService_->verifyTxnPartition(a.producerId, a.producerEpoch, a.topicId, a.partition, nowNs_);
+        a.code = txnService_->verifyTxnPartition(a.producerId, a.producerEpoch, a.topicId, a.partition, nowNs_, a.votes);
         answerVerify_(a);
         return;
     }
@@ -7138,6 +7349,7 @@ bool ClientGateway::sendRemoteVerify_(int64_t token, VerifyInFlight& v)
     m.token           = token;
     m.producerId      = v.req.producerId;
     m.producerEpoch   = v.req.producerEpoch;
+    m.votes           = v.req.votes;
     if (!txnMarkerChannel_.sendVerify(txnMarkerChannel_.ctx, v.coordinator, m)) return false;
     v.sent = true;
     ++txnVerifiesForwarded_;
@@ -7177,7 +7389,7 @@ void ClientGateway::onRemoteVerifyTxnPartition(const rune::replication::VerifyTx
     rune::replication::VerifyTxnPartitionResponseMsg r{};
     static_cast<rune::replication::VerifyTxnPartitionMsg&>(r) = m;
     const bool local = txnService_ != nullptr && txnService_->coordinatesLocally();
-    r.errorCode = local ? txnService_->verifyTxnPartition(m.producerId, m.producerEpoch, m.topicId, m.partition, nowNs_)
+    r.errorCode = local ? txnService_->verifyTxnPartition(m.producerId, m.producerEpoch, m.topicId, m.partition, nowNs_, m.votes)
                         : static_cast<int16_t>(pcl::ErrorCode::NotCoordinator);   // the asker retries
     if (local) ++txnVerifiesServedForPeers_;
     if (txnMarkerChannel_.sendVerifyResponse == nullptr) return;   // unreachable: the ask came over the plane
@@ -7224,7 +7436,7 @@ int16_t ClientGateway::inlineTxnAdmission_(int32_t topicId, int32_t partition, c
         if (!txnService_->clusterVerifiesTxnPartitions()) return 0;
         return static_cast<int16_t>(pcl::ErrorCode::ConcurrentTransactions);
     }
-    const int16_t c = txnService_->verifyTxnPartition(pid, r.producerEpoch(), topicId, partition, nowNs_);
+    const int16_t c = txnService_->verifyTxnPartition(pid, r.producerEpoch(), topicId, partition, nowNs_, false);
     if (c == static_cast<int16_t>(pcl::ErrorCode::NotCoordinator)) return static_cast<int16_t>(pcl::ErrorCode::ConcurrentTransactions);
     return c;
 }
@@ -7376,6 +7588,10 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
         // F15-FU1 (#112): a partition's owning worker asks the transaction coordinator.
         if (ret.type == rune::node::WorkerReturn::Type::TxnVerifyRequest) [[unlikely]] {
             onTxnVerifyRequest_(ret);
+            return;
+        }
+        if (ret.type == rune::node::WorkerReturn::Type::TxnVoteResult) [[unlikely]] {
+            onTxnVoteResult_(ret);
             return;
         }
 

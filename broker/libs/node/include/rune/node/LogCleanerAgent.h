@@ -716,6 +716,7 @@ public:
         cleaner.setMarkerRemovalBound(markerRemovalBound);
         const int64_t verdictBound = best.replica->cleanerVerdictBound();   // the bound first, then the marker end that carries it
         cleaner.setVerdictBounds(verdictBound, best.replica->cleanerVerdictMarkerEnd());
+        cleaner.setTxnJudgeBound(best.replica->cleanerTxnJudgeBound());   // Part 11: the TxnJudges no member checkpoint needs
         // Part 06: an autoincrement partition keeps each live producer's whole retry window (ProducerBatchWindow.h).
         cleaner.setProducerTailDepth(best.replica->producerTailDepth());
         const int64_t previousPassEnd = best.replica->cleanerProgress();
@@ -835,8 +836,8 @@ public:
         // The guard also covers the ensureCheckpoint ordering hazard (a restored
         // checkpoint may already have bumped the watermark past passEnd).
         // A stamped marker or a producer tail turns removable with the clock alone: look again once the shorter of the two has passed.
-        if (leader && !damagedLog && !advance && !held && passResult.groups.empty())
-            stalledPasses_[best.log] = {best.inputs, nowMs + std::min(effectiveDeleteRetentionMs_(*best.replica), producerIdExpirationMs_)};
+        if (leader && !damagedLog && !advance && !(held && progress > previousPassEnd) && passResult.groups.empty())
+            stalledPasses_[best.log] = {best.inputs, nowMs + std::max(kStalledRetryFloorMs, std::min(effectiveDeleteRetentionMs_(*best.replica), producerIdExpirationMs_))};
         else stalledPasses_.erase(best.log);
         if (advance) best.replica->setLastCleanOffset(passEnd);
         if (held) best.replica->setCleanerProgress(progress);
@@ -1225,6 +1226,8 @@ private:
         bool operator==(const StalledPass&) const = default;
     };
     struct Stalled { StalledPass inputs; int64_t retryAtMs; };
+    /// A stalled log is looked at again at most this often: a delete retention of 0 would make every cycle the retry time and starve the others.
+    static constexpr int64_t kStalledRetryFloorMs = 100;
     std::unordered_map<const rune::storage::Log*, Stalled> stalledPasses_;   ///< cleaner thread; one entry per stalled log
     std::unordered_set<std::string> uncleanable_;   ///< #840: dirs of damaged logs (cleaner thread; cold)
     uint64_t passesStarted_ = 0;                    ///< test seam (cleaner thread)

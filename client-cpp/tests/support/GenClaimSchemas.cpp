@@ -11,6 +11,10 @@
 //                header `rune schema generate eos_out` writes from the broker's stored schema)
 //   ki_account   id UInt64 KEY, name string(16), n Int64 (examples/checked_writes_probe.cpp: the key index e2e)
 //   ai_user      userId UInt64 KEY, provider UInt16, subject string(64), createdAt Int64 (the same probe: the autoincrement e2e)
+//   rp_user      the RegressorsPath golden script's `user` topic (schema name "user"): userId UInt64 KEY, provider UInt16,
+//                subject string(64), createdAt Int64 (the same probe: the REGRESSORSPATH e2e)
+//   rp_character the golden script's `character` topic (schema name "character"): characterId UInt64 KEY, userId UInt64,
+//                name string(16), gender/hairSkin/hairSheet/headSkin UInt16, createdAt/lastPlayed Int64
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Generator.h>
 
@@ -79,6 +83,23 @@ int main(int argc, char** argv) {
                             .addFixedStr("subject", 64)
                             .add("createdAt", PrimType::Int64)
                             .build();
+    const auto rpUser = DescriptorBuilder("user")
+                            .add("userId", PrimType::UInt64, 1, true)
+                            .add("provider", PrimType::UInt16)
+                            .addFixedStr("subject", 64)
+                            .add("createdAt", PrimType::Int64)
+                            .build();
+    const auto rpCharacter = DescriptorBuilder("character")
+                                 .add("characterId", PrimType::UInt64, 1, true)
+                                 .add("userId", PrimType::UInt64)
+                                 .addFixedStr("name", 16)
+                                 .add("gender", PrimType::UInt16)
+                                 .add("hairSkin", PrimType::UInt16)
+                                 .add("hairSheet", PrimType::UInt16)
+                                 .add("headSkin", PrimType::UInt16)
+                                 .add("createdAt", PrimType::Int64)
+                                 .add("lastPlayed", PrimType::Int64)
+                                 .build();
     const std::string dir = argv[1];
     return write(dir + "/position.gen.h", position) && write(dir + "/tick_sample.gen.h", tick) &&
                    write(dir + "/long_key.gen.h", longKey) &&
@@ -86,6 +107,8 @@ int main(int argc, char** argv) {
                    write(dir + "/eos_out.gen.h", eosOut) &&
                    write(dir + "/ki_account.gen.h", kiAccount) &&
                    write(dir + "/ai_user.gen.h", aiUser) &&
+                   write(dir + "/rp_user.gen.h", rpUser) &&
+                   write(dir + "/rp_character.gen.h", rpCharacter) &&
                    write(dir + "/player_event.gen.h", rune::examples::playerEventDescriptor())
                ? 0
                : 1;

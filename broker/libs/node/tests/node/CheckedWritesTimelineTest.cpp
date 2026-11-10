@@ -40,8 +40,8 @@ TEST(CheckedWritesTimeline, OnChangeIsIdempotentAndTruncates) {
 
 TEST(CheckedWritesTimeline, MarkerLedgerPromotesOnHw) {
     MarkerLedger m;
-    EXPECT_TRUE(m.onMarker(15, 12));
-    EXPECT_TRUE(m.onMarker(30, 25));
+    EXPECT_TRUE(m.onMarker(15, 12, true));
+    EXPECT_TRUE(m.onMarker(30, 25, true));
     m.onHw(16);
     EXPECT_EQ(m.committedThrough(), 12);
     EXPECT_EQ(m.committedMarkerEnd(), 16);
@@ -53,8 +53,8 @@ TEST(CheckedWritesTimeline, MarkerLedgerPromotesOnHw) {
 
 TEST(CheckedWritesTimeline, MarkerLedgerTruncateDropsTheUncommittedTail) {
     MarkerLedger m;
-    EXPECT_TRUE(m.onMarker(15, 12));
-    EXPECT_TRUE(m.onMarker(30, 25));
+    EXPECT_TRUE(m.onMarker(15, 12, true));
+    EXPECT_TRUE(m.onMarker(30, 25, true));
     m.onHw(16);
     m.truncateFrom(20);
     m.onHw(31);
@@ -64,24 +64,24 @@ TEST(CheckedWritesTimeline, MarkerLedgerTruncateDropsTheUncommittedTail) {
 
 TEST(CheckedWritesTimeline, MarkerLedgerIsIdempotentAndFullRefuses) {
     MarkerLedger m;
-    EXPECT_TRUE(m.onMarker(15, 12));
-    EXPECT_TRUE(m.onMarker(15, 12));
+    EXPECT_TRUE(m.onMarker(15, 12, true));
+    EXPECT_TRUE(m.onMarker(15, 12, true));
     EXPECT_EQ(m.appendedThrough(), 12) << "the duplicate changes nothing";
-    for (int64_t i = 1; i < static_cast<int64_t>(MarkerLedger::kCapacity); ++i) EXPECT_TRUE(m.onMarker(15 + i, 12 + i));
+    for (int64_t i = 1; i < static_cast<int64_t>(MarkerLedger::kCapacity); ++i) EXPECT_TRUE(m.onMarker(15 + i, 12 + i, true));
     EXPECT_TRUE(m.full());
     constexpr int64_t kRingThrough = 12 + static_cast<int64_t>(MarkerLedger::kCapacity) - 1;
     EXPECT_EQ(m.appendedThrough(), kRingThrough);
-    EXPECT_FALSE(m.onMarker(100000, 1));
+    EXPECT_FALSE(m.onMarker(100000, 1, true));
     EXPECT_EQ(m.appendedThrough(), kRingThrough) << "a left-out marker below the coverage does not lower it";
-    EXPECT_TRUE(m.onMarker(100000, 1)) << "the left-out marker is remembered";
+    EXPECT_TRUE(m.onMarker(100000, 1, true)) << "the left-out marker is remembered";
     EXPECT_EQ(m.appendedThrough(), kRingThrough);
 }
 
 // A marker the full ring leaves out is in the log all the same: appendedThrough counts it until a cut removes it.
 TEST(CheckedWritesTimelineRegression, MarkerLedgerCountsAMarkerLeftOutWhenFullRegression) {
     MarkerLedger m;
-    for (int64_t i = 1; i <= static_cast<int64_t>(MarkerLedger::kCapacity); ++i) ASSERT_TRUE(m.onMarker(i, i));
-    EXPECT_FALSE(m.onMarker(2000, 3000));
+    for (int64_t i = 1; i <= static_cast<int64_t>(MarkerLedger::kCapacity); ++i) ASSERT_TRUE(m.onMarker(i, i, true));
+    EXPECT_FALSE(m.onMarker(2000, 3000, true));
     EXPECT_EQ(m.appendedThrough(), 3000);
     m.truncateFrom(2001);
     EXPECT_EQ(m.appendedThrough(), 3000) << "the cut is above it";
@@ -94,11 +94,55 @@ TEST(CheckedWritesTimelineRegression, MarkerLedgerCountsAMarkerLeftOutWhenFullRe
 // left-out marker (left_ holds the last one only), so the value is the ring's coverage: too low only re-marks more.
 TEST(CheckedWritesTimelineRegression, MarkerLedgerReFeedBelowTheLastLeftOutMarkerIsIgnoredRegression) {
     MarkerLedger m;
-    for (int64_t i = 0; i < static_cast<int64_t>(MarkerLedger::kCapacity); ++i) ASSERT_TRUE(m.onMarker(i, i));
-    EXPECT_FALSE(m.onMarker(2000, 3000));
-    EXPECT_FALSE(m.onMarker(2001, 4000));
-    EXPECT_TRUE(m.onMarker(2000, 3000)) << "already seen";
+    for (int64_t i = 0; i < static_cast<int64_t>(MarkerLedger::kCapacity); ++i) ASSERT_TRUE(m.onMarker(i, i, true));
+    EXPECT_FALSE(m.onMarker(2000, 3000, true));
+    EXPECT_FALSE(m.onMarker(2001, 4000, true));
+    EXPECT_TRUE(m.onMarker(2000, 3000, true)) << "already seen";
     m.truncateFrom(2001);
     EXPECT_LE(m.appendedThrough(), 3000) << "never above the coverage still in the log";
     EXPECT_EQ(m.appendedThrough(), static_cast<int64_t>(MarkerLedger::kCapacity) - 1);
+}
+
+// REGRESSION (#974): a full marker may end inside a transaction span: W stays at the last closing marker, and the chain is open until
+// a closing marker follows.
+TEST(CheckedWritesTimelineRegression, MarkerLedgerFullMarkerHoldsCommittedCoverageRegression) {
+    MarkerLedger m;
+    EXPECT_TRUE(m.onMarker(15, 12, true));
+    EXPECT_TRUE(m.onMarker(30, 25, false));
+    EXPECT_TRUE(m.chainOpen());
+    EXPECT_EQ(m.appendedThrough(), 25);
+    EXPECT_EQ(m.appendedClosedThrough(), 12);
+    m.onHw(31);
+    EXPECT_EQ(m.committedThrough(), 12);
+    EXPECT_EQ(m.committedMarkerEnd(), 31);
+    EXPECT_TRUE(m.onMarker(45, 40, true));
+    EXPECT_FALSE(m.chainOpen());
+    m.onHw(46);
+    EXPECT_EQ(m.committedThrough(), 40);
+}
+
+TEST(CheckedWritesTimelineRegression, MarkerLedgerLeftOutFullMarkerKeepsTheChainOpenRegression) {
+    MarkerLedger m;
+    for (int64_t i = 1; i <= static_cast<int64_t>(MarkerLedger::kCapacity); ++i) ASSERT_TRUE(m.onMarker(i, i, true));
+    EXPECT_FALSE(m.onMarker(2000, 3000, false));
+    EXPECT_TRUE(m.chainOpen());
+    m.truncateFrom(2001);
+    EXPECT_TRUE(m.chainOpen()) << "the left-out full marker below the cut stays";
+    EXPECT_EQ(m.appendedThrough(), 3000);
+    EXPECT_EQ(m.appendedClosedThrough(), static_cast<int64_t>(MarkerLedger::kCapacity));
+    EXPECT_FALSE(m.onMarker(2002, 3500, true));
+    EXPECT_FALSE(m.chainOpen());
+}
+
+// REGRESSION (slow-bc review 1): a committed full marker leaves the ring at the HW, and the leadership scan's truncate at the LEO rebuilt
+// appendedThrough without it: the new leader re-marked a marked range, and the chain read closed with no closing marker yet.
+TEST(CheckedWritesTimelineRegression, MarkerLedgerTruncateKeepsACommittedFullMarkersEndRegression) {
+    MarkerLedger m;
+    EXPECT_TRUE(m.onMarker(5, 100, true));
+    EXPECT_TRUE(m.onMarker(200, 9000, false));
+    m.onHw(201);
+    m.truncateFrom(10000);
+    EXPECT_EQ(m.appendedThrough(), 9000);
+    EXPECT_EQ(m.appendedClosedThrough(), 100);
+    EXPECT_TRUE(m.chainOpen()) << "no closing marker follows the committed full one";
 }

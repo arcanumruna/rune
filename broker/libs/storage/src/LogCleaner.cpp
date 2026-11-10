@@ -327,7 +327,7 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
             const int64_t base = r.baseOffset();
             if (base >= scanEnd) { pos = buf.size(); break; }   // the intended end of the scan, not damage
             const int64_t pid  = r.producerId();
-            if (pid < 0 && isControlBatch(r)) {   // a checked-writes control record (16-19)
+            if (pid < 0 && isControlBatch(r)) {   // a checked-writes control record (16-20)
                 if (const auto& c = ctl) {
                     switch (c->type) {
                     case cr::kVerdictMarker:
@@ -341,8 +341,9 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
                     case cr::kConstraintSetChange: {
                         std::array<cr::ChangeMember, 32> wire{};
                         uint32_t id = 0;
+                        int64_t catalogThrough = 0;
                         uint16_t count = 0;
-                        if (cr::parseConstraintSetChange(*c, id, wire, count)) verdicts.onConstraintSetChange(base, count != 0);
+                        if (cr::parseConstraintSetChange(*c, id, catalogThrough, wire, count)) verdicts.onConstraintSetChange(base, count != 0);
                         break;
                     }
                     case cr::kReservation:   // only one the leader's scan reads as a reservation (a bad payload must not outrank it)
@@ -408,7 +409,7 @@ MarkerAction markerAction(const rune::protocol::RecordBatchReader& r, const std:
                           int64_t batchLastOffset, Offset cleanBoundaryOffset, const TxnCleanState* txn, const VerdictCleanState* verdicts,
                           const ProducerBatchWindow* window, int64_t nowMs) {
     if (nowMs < 0 || batchLastOffset >= cleanBoundaryOffset) return MarkerAction::Keep;
-    if (r.producerId() < 0) {   // a checked-writes control record (16-19): its own rules
+    if (r.producerId() < 0) {   // a checked-writes control record (16-20): its own rules
         const int type = c ? c->type : rune::storage::control_record::kUnparseable;
         if (type == rune::storage::control_record::kUnparseable || verdicts == nullptr ||
             verdicts->keepsControlRecord(r.baseOffset(), static_cast<int16_t>(type)))
@@ -483,6 +484,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     // aborted txn data.  M3: these reads are throttled by the caller.
     VerdictCleanState& verdicts = map.verdictState();
     verdicts.clear();
+    verdicts.setTxnJudgeBound(txnJudgeBound_);
     std::optional<Damaged> scanDamage;
     prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_, window_ ? &*window_ : nullptr, windowNowMs_, producerIdExpirationMs_, scanDamage);
     if (scanDamage) { noteDamage_(dir, scanDamage->segBase, scanDamage->byteOffset); return -1; }   // incomplete state: no map
@@ -564,6 +566,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     // D3b: transaction pre-pass (+ producer tails) — see the bounded overload.
     VerdictCleanState& verdicts = map.verdictState();
     verdicts.clear();
+    verdicts.setTxnJudgeBound(txnJudgeBound_);
     std::optional<Damaged> scanDamage;
     prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_, window_ ? &*window_ : nullptr, windowNowMs_, producerIdExpirationMs_, scanDamage);
     if (scanDamage) { noteDamage_(dir, scanDamage->segBase, scanDamage->byteOffset); return; }   // incomplete state: no map

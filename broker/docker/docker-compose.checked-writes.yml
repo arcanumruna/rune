@@ -4,11 +4,14 @@
 #   docker compose -p rune-checked-writes-e2e -f docker/docker-compose.yml -f docker/docker-compose.auth.yml \
 #       -f docker/docker-compose.checked-writes.yml up -d rune-1 rune-2 rune-3
 #
-# One knob (docs/configuration.md): how often a verdict source's leader writes a verdict marker when nothing was rejected.
-# 20 ms instead of the 100 ms default keeps the markers, and so the 80,000 racing writes, quick.
+# Two knobs (docs/configuration.md): how often a verdict source's leader writes a verdict marker when nothing was rejected
+# (20 ms instead of the 100 ms default keeps the markers, and so the 80,000 racing writes, quick), and how long a stopped
+# producer's last batches survive compaction (60 s instead of 7 days, above the probes' 30 s timeout: on an autoincrement
+# topic those batches hold the refused writes leg 8f expects compacted).
 
 x-checked-writes-env: &checked-writes-env
   RUNE_VERDICT_INTERVAL_MS: "20"
+  RUNE_PRODUCER_ID_EXPIRATION_MS: "60000"
 
 services:
   rune-1:

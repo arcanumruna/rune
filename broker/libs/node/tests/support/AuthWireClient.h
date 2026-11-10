@@ -54,7 +54,8 @@ public:
     using Clock = std::chrono::steady_clock;
     using DdlAnswer = ShardTestClient::DdlAnswer;
 
-    explicit AuthWireClient(const std::filesystem::path& aeronDir) : cl_(aeronDir) { cl_.keepSessionsAlive(true); }
+    explicit AuthWireClient(const std::filesystem::path& aeronDir, long conductorIdleSleepMs = 0)
+        : cl_(aeronDir, 1 << 20, false, DriverMode::Threaded, 128 * 1024, conductorIdleSleepMs) { cl_.keepSessionsAlive(true); }
 
     [[nodiscard]] ShardTestClient& raw() noexcept { return cl_; }
     [[nodiscard]] const std::optional<pc::ConnectResponse>& lastConnect() const noexcept { return cl_.lastConnectResponse(); }

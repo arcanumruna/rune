@@ -385,9 +385,26 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     EXPECT_EQ(sbe::OpType::get(32), sbe::OpType::Value::WRITE_SPEC_UPDATE);
     EXPECT_EQ(sbe::TailKind::get(12), sbe::TailKind::Value::WRITE_SPEC);
     EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::WRITE_SPEC_UPDATE), "WRITE_SPEC_UPDATE");
-    EXPECT_THROW((void)sbe::OpType::get(33), std::runtime_error);
-    EXPECT_THROW((void)sbe::ReturnType::get(9), std::runtime_error);
-    EXPECT_THROW((void)sbe::TailKind::get(13), std::runtime_error);
+    // Checked writes Parts 07, 08 and 11 appended ops 33-36, returns 9-11 and tail kind 13; the next free values are unassigned.
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::GET_VIEW_ROW_K), 33);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::SCAN_VIEW_ROWS), 34);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::GET_STATS), 35);
+    EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::VIEW_SCAN_RESULT), 9);
+    EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::STATS_RESULT), 10);
+    EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::VIEW_READ), 13);
+    EXPECT_EQ(sbe::OpType::get(33), sbe::OpType::Value::GET_VIEW_ROW_K);
+    EXPECT_EQ(sbe::OpType::get(34), sbe::OpType::Value::SCAN_VIEW_ROWS);
+    EXPECT_EQ(sbe::OpType::get(35), sbe::OpType::Value::GET_STATS);
+    EXPECT_EQ(sbe::ReturnType::get(9), sbe::ReturnType::Value::VIEW_SCAN_RESULT);
+    EXPECT_EQ(sbe::ReturnType::get(10), sbe::ReturnType::Value::STATS_RESULT);
+    EXPECT_EQ(sbe::TailKind::get(13), sbe::TailKind::Value::VIEW_READ);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::TXN_VOTE), 36);
+    EXPECT_EQ(sbe::OpType::get(36), sbe::OpType::Value::TXN_VOTE);
+    EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::TXN_VOTE_RESULT), 11);
+    EXPECT_EQ(sbe::ReturnType::get(11), sbe::ReturnType::Value::TXN_VOTE_RESULT);
+    EXPECT_THROW((void)sbe::OpType::get(37), std::runtime_error);
+    EXPECT_THROW((void)sbe::ReturnType::get(12), std::runtime_error);
+    EXPECT_THROW((void)sbe::TailKind::get(14), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------

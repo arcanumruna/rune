@@ -21,7 +21,8 @@
 //     programming error and a silent "no leader" in release would hide it.
 //     Before bindObserver() nothing is published (the control thread is not
 //     running) and observe() returns the initial view without draining.
-//     There is no rebinding: bindObserver() runs once, from start().
+//     There is no rebinding in production: bindObserver() runs once, from
+//     start().  The one explicit rebind is BrokerNode::bindLeaderObserverForTest.
 //
 //   Everything the CONTROL thread itself needs (gateway leaderView, group / txn
 //   coordinators, admin role hook) MUST use computeOnControl(), never observe():

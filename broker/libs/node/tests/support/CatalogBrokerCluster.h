@@ -15,6 +15,7 @@
 #include <rune/node/StorageIdentity.h>
 
 #include <gtest/gtest.h>
+#include <openssl/crypto.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
@@ -23,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -110,6 +112,8 @@ inline NodeConfig makeConfig(int nodeId, const fs::path& dataDir, const Ports& p
     cfg.workerIngressBaseStreamId = kIngressStream;
     cfg.gatewayMinIsr = nodes == 1 ? 1 : 2;
     cfg.aeronTermBufferBytes = 1 << 20;
+    cfg.aeronCountersValuesBytes = kTestClientCountersBytes;   // a test broker owns a few dozen counters: a small CnC
+    cfg.aeronStatusMessageTimeoutNs = 20'000'000;   // a node driver's receivers announce their window every 20 ms, not 200: connects and restarts settle sooner
     cfg.cleanerDedupeBufferBytes = 1 << 20;   // the 128 MiB default made each TSan cleaner pass/restart minutes-long
     cfg.workerCoreBase = -1;   // tests never auto-pin busy-spinning workers (ctest -j)
     for (int i = 0; i < nodes; ++i) {
@@ -177,22 +181,25 @@ struct ThreeNodes {
     ThreeNodes(ThreeNodes&&) = default;
     ~ThreeNodes() {
         joinKillWatcher_();
-        for (auto it = nodes.rbegin(); it != nodes.rend(); ++it)
-            if (*it) (*it)->stop();
+        std::vector<std::thread> stoppers;
+        for (auto& n : nodes)
+            if (n) stoppers.emplace_back([&n] { n->stop(); });
+        for (auto& t : stoppers) t.join();
     }
 
     static ThreeNodes start(const std::string& tag, std::vector<int> startOnly = {1, 2, 3}, Mode mode = Mode::Shard) {
         ThreeNodes c(tag, mode);
-        for (int id : startOnly) c.startNode(id);
+        c.startNodes(startOnly);
         return c;
     }
 
     /// Applied to every node's config before it starts (catalog Task 12 fix round 1: a small MTU).
     std::function<void(NodeConfig&)> configTweak;
-    static ThreeNodes startWith(const std::string& tag, std::function<void(NodeConfig&)> tweak) {
+    static ThreeNodes startWith(const std::string& tag, std::function<void(NodeConfig&)> tweak, std::function<void(int, BrokerNode&)> before = {}) {
         ThreeNodes c(tag, Mode::Shard);
         c.configTweak = std::move(tweak);
-        for (int id : {1, 2, 3}) c.startNode(id);
+        c.beforeStart = std::move(before);
+        c.startNodes({1, 2, 3});
         return c;
     }
 
@@ -200,13 +207,35 @@ struct ThreeNodes {
     /// the pre-start test seams (holdCatalogApplyAtBootForTest).
     std::function<void(int, BrokerNode&)> beforeStart;
 
-    void startNode(int id) {
+    /// Builds node `id` (config, tweak, constructor, beforeStart) on the calling thread; it is not started.
+    void prepareNode(int id) {
         NodeConfig cfg = makeConfig(id, dirs[static_cast<std::size_t>(id - 1)]->path, ports, 3, mode);
         if (configTweak) configTweak(cfg);
         if (const auto f = storageFormatFor_[static_cast<std::size_t>(id - 1)]) cfg.storageFormat = *f;   // wipeRaw
         nodes[static_cast<std::size_t>(id - 1)] = std::make_unique<BrokerNode>(cfg);
         if (beforeStart) beforeStart(id, *nodes[static_cast<std::size_t>(id - 1)]);
+    }
+    void startNode(int id) {
+        prepareNode(id);
         nodes[static_cast<std::size_t>(id - 1)]->start();
+    }
+    /// Builds the nodes one after the other on the calling thread (the tweak and beforeStart hooks never run concurrently), then runs
+    /// their start() on one thread each and returns when all are up (joining the starters; a node's start() does not wait for its peers).
+    void startNodes(const std::vector<int>& ids) {
+        for (const int id : ids) prepareNode(id);
+        // OpenSSL loads its config once, on the first thread that needs it; a starter thread that does so exits with
+        // its per-thread RCU record unfreed (LeakSanitizer, auth clusters), so load it here on the long-lived caller.
+        OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG, nullptr);
+        std::vector<std::exception_ptr> failed(ids.size());
+        std::vector<std::thread> starters;
+        for (std::size_t i = 0; i < ids.size(); ++i)
+            starters.emplace_back([this, &ids, &failed, i] {
+                try { nodes[static_cast<std::size_t>(ids[i] - 1)]->start(); } catch (...) { failed[i] = std::current_exception(); }
+            });
+        for (auto& t : starters) t.join();
+        for (const auto& e : failed)
+            if (e) std::rethrow_exception(e);
+        for (const int id : ids) nodes[static_cast<std::size_t>(id - 1)]->bindLeaderObserverForTest();   // the joins order it after the starters
     }
     void stop(int id) {
         auto& n = nodes[static_cast<std::size_t>(id - 1)];

@@ -14,6 +14,8 @@
 //   Reuses the exact TransactionLog on-disk record layout (magic 0x544B4E4C,
 //   kFixedHeaderSize=52, CRC32C tail) so one decoder serves both the
 //   disk-based TransactionLog and this replicated store.
+//   Part 11 extends it: header byte 27 bit1 marks a vote-no trailer (code u16, constraintId u32, failingOffset i64)
+//   after the pending-offset section; a reader that predates it reads bit0 only and stops after the offsets.
 //
 // Key correctness properties:
 //   - put() uses replica->append(acksAll=TRUE) — majority durable.

@@ -82,6 +82,8 @@ enum class ReplicationTemplateId : uint16_t {
     WriteTxnMarkerResponse   = 12,  // D9: partition leader → txn coordinator (hand-rolled)
     VerifyTxnPartition       = 13,  // #112: partition leader → txn coordinator (hand-rolled)
     VerifyTxnPartitionResponse = 14,  // #112: txn coordinator → partition leader (hand-rolled)
+    TxnVote                  = 15,  // C18: txn coordinator → partition leader (hand-rolled)
+    TxnVoteResponse          = 16,  // C18: partition leader → txn coordinator (hand-rolled)
 };
 
 // DR-BUG-6: reconcile-pull template ids.  The reconcile request/response reuse
@@ -587,6 +589,11 @@ struct AlterIsrMsg {
     /// in its leadership).  isr[1] = this flag, `leaderId` = the reporter, isr[2] = the floor
     /// (clamped to int32), isr[3]/isr[4] = the reporter's incarnation, `proposalId` = reportId.
     static constexpr int32_t kBumpLeaderBelowCommitted = 2048;
+    /// Election batch: a partition bump's requester led this partition earlier in the CURRENT OS boot (<log dir>/leader-boot
+    /// holds this boot's id), so its log still holds every record it held then: the committed prefix.  The controller keeps such a
+    /// requester in the ISR and re-elects it in place.  An older controller ignores the bit (it drops the requester, as before);
+    /// a requester that does not set it is dropped (fail closed).  No feature level: both mixes fail closed.
+    static constexpr int32_t kBumpLedThisBoot = 4096;
     int32_t topicId        = 0;
     int32_t partition      = 0;
     NodeId  leaderId       = -1;
@@ -974,7 +981,8 @@ struct WriteTxnMarkerResponseMsg {
 //   token           : int64 @ +8    the requester's token (echoed back)
 //   producerId      : int64 @ +16
 //   partition       : int32 @ +24
-//   producerEpoch   : int16 @ +28   (+30..31 pad)
+//   producerEpoch   : int16 @ +28
+//   votes           : int16 @ +30   1 = the partition is a verdict source and votes (0 from a node that predates it)
 //
 // VerifyTxnPartitionResponse (template 14), same block with
 //   errorCode       : int16 @ +30   client ErrorCode (0 = the batch may open the txn)
@@ -991,6 +999,7 @@ struct VerifyTxnPartitionMsg {
     int32_t partition       = 0;
     int16_t producerEpoch   = 0;
     int16_t errorCode       = 0;   ///< the response only (template 14)
+    bool    votes           = false;   ///< the request only (template 13)
 
     std::size_t encodeAs(uint16_t templateId, uint8_t* buf, std::size_t cap) const noexcept {
         if (cap < TOTAL_SIZE) return 0;
@@ -1002,7 +1011,7 @@ struct VerifyTxnPartitionMsg {
         detail::write_le<int64_t>(p + 16, producerId);
         detail::write_le<int32_t>(p + 24, partition);
         detail::write_le<int16_t>(p + 28, producerEpoch);
-        detail::write_le<int16_t>(p + 30, templateId == TEMPLATE_ID ? int16_t{0} : errorCode);
+        detail::write_le<int16_t>(p + 30, templateId == TEMPLATE_ID ? int16_t{votes} : errorCode);
         return TOTAL_SIZE;
     }
     std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept { return encodeAs(TEMPLATE_ID, buf, cap); }
@@ -1018,7 +1027,9 @@ struct VerifyTxnPartitionMsg {
         m.producerId      = detail::read_le<int64_t>(p + 16);
         m.partition       = detail::read_le<int32_t>(p + 24);
         m.producerEpoch   = detail::read_le<int16_t>(p + 28);
-        m.errorCode       = templateId == TEMPLATE_ID ? int16_t{0} : detail::read_le<int16_t>(p + 30);
+        const int16_t at30 = detail::read_le<int16_t>(p + 30);
+        m.votes           = templateId == TEMPLATE_ID && at30 != 0;
+        m.errorCode       = templateId == TEMPLATE_ID ? int16_t{0} : at30;
         return true;
     }
     [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, VerifyTxnPartitionMsg& m) noexcept {
@@ -1031,6 +1042,131 @@ struct VerifyTxnPartitionResponseMsg : VerifyTxnPartitionMsg {
     std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept { return encodeAs(TEMPLATE_ID, buf, cap); }
     [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, VerifyTxnPartitionResponseMsg& m) noexcept {
         return decodeAs(TEMPLATE_ID, buf, len, m);
+    }
+};
+
+// ===========================================================================
+// C18 — the transaction vote (templates 15 / 16).  On EndTxn(commit) the coordinator asks the leader of every partition
+// the transaction touched whether it votes yes; the leader answers once its judge has judged the transaction.  Hand-rolled
+// fixed blocks like D9, little-endian.  The transactional id is not carried: the partition never needs it.
+//
+// TxnVote (template 15), fixed block 40 bytes:
+//   coordinatorNodeId : int32 @ +0    the coordinator (the answer goes there)
+//   coordinatorEpoch  : int32 @ +4
+//   token             : int64 @ +8    the coordinator's token (echoed back)
+//   topicId           : int32 @ +16
+//   partition         : int32 @ +20
+//   producerId        : int64 @ +24
+//   producerEpoch     : int16 @ +32   (+34..35 pad)
+//   leaderEpoch       : int32 @ +36   the leader epoch the coordinator believes (checked by the leader)
+//
+// TxnVoteResponse (template 16), fixed block 48 bytes:
+//   token             : int64 @ +0
+//   topicId           : int32 @ +8
+//   partition         : int32 @ +12
+//   producerId        : int64 @ +16
+//   coordinatorEpoch  : int32 @ +24
+//   producerEpoch     : int16 @ +28
+//   errorCode         : int16 @ +30   transport: 0, NotLeader or InvalidTxnState
+//   code              : uint16 @ +32  the vote: 0 = yes, else the rejection code   (+34..35 pad)
+//   constraintId      : uint32 @ +36
+//   failingOffset     : int64 @ +40
+// ===========================================================================
+struct TxnVoteMsg {
+    static constexpr uint16_t    TEMPLATE_ID  = 15;
+    static constexpr uint16_t    BLOCK_LENGTH = 40;
+    static constexpr std::size_t TOTAL_SIZE   = ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    int32_t coordinatorNodeId = -1;
+    int32_t coordinatorEpoch  = 0;
+    int64_t token             = 0;
+    int32_t topicId           = 0;
+    int32_t partition         = 0;
+    int64_t producerId        = -1;
+    int16_t producerEpoch     = 0;
+    int32_t leaderEpoch       = 0;
+
+    std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept {
+        if (cap < TOTAL_SIZE) return 0;
+        ReplicationMessageHeader::encode(buf, 0, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + ReplicationMessageHeader::ENCODED_SIZE;
+        detail::write_le<int32_t>(p + 0,  coordinatorNodeId);
+        detail::write_le<int32_t>(p + 4,  coordinatorEpoch);
+        detail::write_le<int64_t>(p + 8,  token);
+        detail::write_le<int32_t>(p + 16, topicId);
+        detail::write_le<int32_t>(p + 20, partition);
+        detail::write_le<int64_t>(p + 24, producerId);
+        detail::write_le<int16_t>(p + 32, producerEpoch);
+        detail::write_le<int16_t>(p + 34, 0);
+        detail::write_le<int32_t>(p + 36, leaderEpoch);
+        return TOTAL_SIZE;
+    }
+    [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, TxnVoteMsg& m) noexcept {
+        if (len < TOTAL_SIZE) return false;
+        const auto h = ReplicationMessageHeader::decode(buf, 0);
+        if (h.templateId != TEMPLATE_ID || h.blockLength < BLOCK_LENGTH) return false;
+        const uint8_t* p = buf + ReplicationMessageHeader::ENCODED_SIZE;
+        m.coordinatorNodeId = detail::read_le<int32_t>(p + 0);
+        m.coordinatorEpoch  = detail::read_le<int32_t>(p + 4);
+        m.token             = detail::read_le<int64_t>(p + 8);
+        m.topicId           = detail::read_le<int32_t>(p + 16);
+        m.partition         = detail::read_le<int32_t>(p + 20);
+        m.producerId        = detail::read_le<int64_t>(p + 24);
+        m.producerEpoch     = detail::read_le<int16_t>(p + 32);
+        m.leaderEpoch       = detail::read_le<int32_t>(p + 36);
+        return true;
+    }
+};
+
+struct TxnVoteResponseMsg {
+    static constexpr uint16_t    TEMPLATE_ID  = 16;
+    static constexpr uint16_t    BLOCK_LENGTH = 48;
+    static constexpr std::size_t TOTAL_SIZE   = ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    int64_t  token            = 0;
+    int32_t  topicId          = 0;
+    int32_t  partition        = 0;
+    int64_t  producerId       = -1;
+    int32_t  coordinatorEpoch = 0;
+    int16_t  producerEpoch    = 0;
+    int16_t  errorCode        = 0;
+    uint16_t code             = 0;
+    uint32_t constraintId     = 0;
+    int64_t  failingOffset    = -1;
+
+    std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept {
+        if (cap < TOTAL_SIZE) return 0;
+        ReplicationMessageHeader::encode(buf, 0, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + ReplicationMessageHeader::ENCODED_SIZE;
+        detail::write_le<int64_t>(p + 0,  token);
+        detail::write_le<int32_t>(p + 8,  topicId);
+        detail::write_le<int32_t>(p + 12, partition);
+        detail::write_le<int64_t>(p + 16, producerId);
+        detail::write_le<int32_t>(p + 24, coordinatorEpoch);
+        detail::write_le<int16_t>(p + 28, producerEpoch);
+        detail::write_le<int16_t>(p + 30, errorCode);
+        detail::write_le<uint16_t>(p + 32, code);
+        detail::write_le<int16_t>(p + 34, 0);
+        detail::write_le<uint32_t>(p + 36, constraintId);
+        detail::write_le<int64_t>(p + 40, failingOffset);
+        return TOTAL_SIZE;
+    }
+    [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, TxnVoteResponseMsg& m) noexcept {
+        if (len < TOTAL_SIZE) return false;
+        const auto h = ReplicationMessageHeader::decode(buf, 0);
+        if (h.templateId != TEMPLATE_ID || h.blockLength < BLOCK_LENGTH) return false;
+        const uint8_t* p = buf + ReplicationMessageHeader::ENCODED_SIZE;
+        m.token            = detail::read_le<int64_t>(p + 0);
+        m.topicId          = detail::read_le<int32_t>(p + 8);
+        m.partition        = detail::read_le<int32_t>(p + 12);
+        m.producerId       = detail::read_le<int64_t>(p + 16);
+        m.coordinatorEpoch = detail::read_le<int32_t>(p + 24);
+        m.producerEpoch    = detail::read_le<int16_t>(p + 28);
+        m.errorCode        = detail::read_le<int16_t>(p + 30);
+        m.code             = detail::read_le<uint16_t>(p + 32);
+        m.constraintId     = detail::read_le<uint32_t>(p + 36);
+        m.failingOffset    = detail::read_le<int64_t>(p + 40);
+        return true;
     }
 };
 

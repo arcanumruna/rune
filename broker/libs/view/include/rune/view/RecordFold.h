@@ -27,7 +27,8 @@ struct SourceRecord {
     const rune::codec::Descriptor* writer = nullptr;      // materialized writer version; nullptr = the fold resolves it
 };
 
-enum class PrepareStatus : uint8_t { Ok, Malformed, CapacityExhausted };
+// Locked: the record reads or writes a row a held TxnOverlay locks; nothing was written.
+enum class PrepareStatus : uint8_t { Ok, Malformed, CapacityExhausted, Locked };
 enum class ProspectOp : uint8_t { None, Upsert, Erase, Move };
 
 // Touched aggregate rows of one prepared record, in fixed slots (never allocates after reserve).
@@ -97,7 +98,10 @@ struct ProspectRow {
     ViewKey  key;
     uint8_t* image   = nullptr;   // the prospective view-row image; valid until the Prospect is cleared
     bool     removed = false;     // the row is gone after apply
-    bool     existed = false;     // the row exists in the table now
+    bool     existed = false;     // the row exists in the table now (a chained prepare: in the chain, else the table)
+    const uint8_t* before = nullptr;   // a chained prepare: the existing row's image before this record (Prospect::before)
+    bool     ownedByOther = false;   // unique: the key is owned by another source key
+    bool     promoted = false;       // unique: the owner leaves and an extra takes the row (computed by apply)
 };
 
 // Reserved once per ViewInstance at install; never grows.
@@ -107,6 +111,8 @@ struct Prospect {
     OwnerOp                      ownerOp  = OwnerOp::None;   // keyed: Put stores rows[0].key under the wire key
     std::array<ProspectRow, 2>   rows{};   // keyed Move: rows[0] is the new row, rows[1] the erased old one
     std::vector<uint8_t>         scratch;   // projection: 2 * rowLen
+    std::vector<uint8_t>         before;    // a chained prepare's before-images of rows[0..1], copied before the chain is written: 2 * rowLen
+    bool                         chained = false;
     RowOverlay                   overlay;   // aggregate: every touched row of the four tables
     FoldStats                    stats;     // what the fold would have counted for this record
     uint32_t                     rowLen = 0;
@@ -117,6 +123,12 @@ struct Prospect {
         rowCount = 0;
         ownerOp  = OwnerOp::None;
         stats    = {};
+        chained  = false;
+        for (ProspectRow& r : rows) {
+            r.image = nullptr;
+            r.before = nullptr;
+            r.removed = r.existed = r.ownedByOther = r.promoted = false;
+        }
         overlay.clear();
     }
 };
@@ -135,6 +147,7 @@ inline void RowOverlay::reserve(const RowLayout& view, const AggLayout& agg, std
 
 inline void Prospect::reserve(const RowLayout& layout, const AggLayout* agg) {
     rowLen = layout.rowLen;
+    before.assign(2u * layout.rowLen, 0);
     if (agg != nullptr) overlay.reserve(layout, *agg);
     else scratch.assign(2u * layout.rowLen, 0);
 }

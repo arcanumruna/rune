@@ -159,6 +159,26 @@ public:
     /// First offset of the open transaction for `producerId`, or -1 if not open.
     [[nodiscard]] int64_t firstOffsetOf(ProducerId producerId) const noexcept;
 
+    /// Part 11: this partition answered a vote (or holds a TxnJudge) for the producer's open transaction of `epoch`; the transaction
+    /// takes no more batches until its marker.  No effect when the producer has no open transaction.
+    void markVoted(ProducerId producerId, int16_t epoch) noexcept;
+    /// The mark never goes down: a stale vote of an older epoch lifts nothing.
+    /// The open transaction of `producerId` was voted on at exactly `epoch` (O(1)).
+    [[nodiscard]] bool votedAt(ProducerId producerId, int16_t epoch) const noexcept;
+
+    /// Part 11: `records` more records of the producer's open transaction on this partition (rebuilt from the log with the entry);
+    /// `intent` sticks to the transaction when one of them carries a write intent.
+    void addRecords(ProducerId producerId, int32_t records, bool intent) noexcept;
+    /// A record of the producer's open transaction on this partition carries an intent (O(1)).
+    [[nodiscard]] bool hasIntent(ProducerId producerId) const noexcept;
+    /// The records the producer's open transaction has on this partition; 0 when none is open (O(1)).
+    [[nodiscard]] int64_t recordsOf(ProducerId producerId) const noexcept;
+
+    /// Every open transaction now present was inherited from the log: it needs a fresh verification before its next batch.
+    void markInherited() noexcept;
+    /// The producer has an open transaction that no leadership change has left unverified (O(1)).
+    [[nodiscard]] bool openVerified(ProducerId producerId) const noexcept;
+
     /// Forget every open transaction: BOTH the pid table and the first-offset
     /// FIFO (N4).  Capacity is kept.
     void clear() noexcept;
@@ -175,6 +195,10 @@ private:
         int64_t    firstOffset = 0;
         ProducerId producerId  = -1;
         bool       live        = false;
+        int16_t    votedEpoch  = -1;   ///< Part 11: the epoch this partition voted at (-1 = not voted)
+        bool       inherited   = false; ///< Part 11: open since before this leadership; verified again by the next batch
+        int64_t    records     = 0;     ///< Part 11: the records the transaction has appended here
+        bool       intent      = false; ///< Part 11: one of them carries a write intent
     };
     struct Slot {
         ProducerId producerId = kEmptyPid;   ///< kEmptyPid = free
@@ -236,8 +260,9 @@ public:
         int64_t baseOffset  = 0;
     };
 
-    RcBuilder(LsoTracker* tracker, AbortedTxnIndex* abortedIndex) noexcept
-        : tracker_(tracker), abortedIndex_(abortedIndex) {}
+    /// `trackIntents`: a transactional batch's records are parsed for write intents (a typed partition's scan); otherwise only headers are read.
+    RcBuilder(LsoTracker* tracker, AbortedTxnIndex* abortedIndex, bool trackIntents) noexcept
+        : tracker_(tracker), abortedIndex_(abortedIndex), trackIntents_(trackIntents) {}
 
     /// Classify and apply the batch at `batch` (`avail` bytes readable).
     Result step(const uint8_t* batch, std::size_t avail);
@@ -245,6 +270,7 @@ public:
 private:
     LsoTracker*      tracker_;
     AbortedTxnIndex* abortedIndex_;
+    bool             trackIntents_;
 };
 
 // ---------------------------------------------------------------------------

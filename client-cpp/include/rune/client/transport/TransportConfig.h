@@ -109,6 +109,8 @@ struct TransportConfig {
     /// The driver CnC's counter-values buffer: 0 = Aeron's default (8 MiB), else
     /// [kMinDriverCountersBytes, kMaxDriverCountersBytes] (ClientConfig::driverCountersBytes).
     std::size_t driverCountersBytes = 0;
+    /// Non-empty: attach to the media driver running in this aeron dir instead of starting one (ClientConfig::aeronDir).
+    std::string aeronDir;
 };
 
 /// The aeron::Context::mediaDriverTimeout the transport applies (T15 R2).
@@ -178,6 +180,9 @@ struct TransportConfig {
         (c.driverCountersBytes < kMinDriverCountersBytes || c.driverCountersBytes > kMaxDriverCountersBytes)) {
         return "driverCountersBytes must be 0 (Aeron default) or in [1048576, 524288000]: " +
                std::to_string(c.driverCountersBytes);
+    }
+    if (!c.aeronDir.empty() && c.driverCountersBytes != 0) {
+        return "driverCountersBytes sizes the client's own embedded driver: it cannot be set together with aeronDir";
     }
     if (c.clientLivenessTimeoutNs > kMaxClientLivenessTimeoutNs) {
         return "clientLivenessTimeoutNs must be <= 3600000000000 (1 hour): " +

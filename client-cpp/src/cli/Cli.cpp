@@ -115,6 +115,7 @@ void printUsage(std::ostream& err) {
 //   --cli-stream-out <n>   override egressStreamId   (default 2)
 //   --cli-data-dir   <p>   override dataDir          (default and "": a private scratch directory,
 //                          removed when the command ends)
+//   --cli-aeron-dir  <p>   attach to the running media driver in <p> (default: the client's own)
 //   --cli-egress     <ch>  override egressChannel    (default "aeron:ipc")
 //                          Required for a real UDP broker: the broker publishes
 //                          responses back to this channel, so with a UDP gateway
@@ -163,6 +164,7 @@ rune::client::ClientConfig buildClientConfig(const std::vector<std::string>& arg
 
     // Aeron data directory: hidden test override, else a private scratch directory removed with `dir`.
     cfg.dataDir = rune::cli::support::resolveDataDir(flagValue(args, "--cli-data-dir"), dir);   // empty = scratch (#315)
+    cfg.aeronDir = flagValue(args, "--cli-aeron-dir");   // hidden: attach to a running driver (empty = the client's own)
 
     // Review B I6: the credential flags are global (--user / --password-file, RUNE_USER / RUNE_PASSWORD_FILE).
     rune::cli::support::applyCredentials(cfg, flagValue(args, "--user"), flagValue(args, "--password-file"));

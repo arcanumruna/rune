@@ -116,10 +116,11 @@ inline void checkIndex(VerdictRig& r, const CheckedWritesModel& model, const std
     EXPECT_EQ(r.writeState()->rejected.mismatches(), 0u) << "(a) the index counted mismatches";
 }
 
-/// (b) The markers carry the model's verdicts; unless a compaction removed superseded markers they cover the log without a gap.
+/// (b) The markers carry the model's verdicts and stop at an undecided transaction (coverageProblem); unless a compaction removed superseded markers they cover the log without a gap.
 inline void checkMarkers(const CheckedWritesModel& model, const VerdictRig::RigLog& log, int64_t target, bool compacted = false) {
     ASSERT_FALSE(log.markers.empty());
     ASSERT_FALSE(log.changes.empty());
+    EXPECT_EQ(model.coverageProblem(log), "") << "(b) the markers never end past a transaction the judge has not decided";
     int64_t reach = 0;
     const std::string problem = markerUnionProblem(log.markers, log.changes.front().offset, &reach);
     if (!compacted) EXPECT_EQ(problem, "") << "(b) markers cover the log without a gap and agree where they overlap";
@@ -167,10 +168,8 @@ inline void checkViews(VerdictRig& r, const CheckedWritesModel& model, const Ver
     }
 }
 
-/// (c) A subscription delivered exactly the accepted records (Filtered: the live tag-1 ones), with their intents; `alsoDelivered`
-/// are further log records the subscription delivers (a Raw one gets an aborted transaction's).
-inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64_t sub, bool filtered, const std::set<int64_t>* present = nullptr,
-                           const std::vector<VerdictRig::RigLogRec>* alsoDelivered = nullptr) {
+/// (c) A subscription delivered exactly the accepted records (Filtered: the live tag-1 ones), with their intents.
+inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64_t sub, bool filtered, const std::set<int64_t>* present = nullptr) {
     for (int i = 0; i < VerdictRig::kMaxPass && r.worker->rcStatusForTest(VerdictRig::kSrc, r.partition()) != Worker::kRcReady; ++i) r.pass();   // nothing is delivered while the leadership scan runs
     ASSERT_EQ(r.worker->rcStatusForTest(VerdictRig::kSrc, r.partition()), Worker::kRcReady);
     const auto& box = r.collect(sub);
@@ -184,7 +183,6 @@ inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64
         if (filtered && (a.del || a.tag != 1)) continue;
         addWant(a);
     }
-    if (alsoDelivered != nullptr) for (const auto& a : *alsoDelivered) addWant(a);
     std::sort(want.begin(), want.end());
     EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones, with their intents";
 }

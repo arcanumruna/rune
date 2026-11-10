@@ -78,7 +78,7 @@ void reservation(Log& log, int64_t off, uint64_t n) {
 void change(Log& log, int64_t off) {
     std::vector<cr::ChangeMember> ms{cr::ChangeMember{7, 3, 99}};
     std::vector<uint8_t> b(cr::changeBatchBytes(ms.size()));
-    (void)cr::buildConstraintSetChange(b, 1, ms);
+    (void)cr::buildConstraintSetChange(b, 1, -1, ms);
     stampBase(b, off);
     log.append(b, off);
 }
@@ -796,12 +796,16 @@ TEST(CheckedWritesAutoIncCleanerRegression, ManyExpiredProducersDoNotOverflowThe
     for (const bool coalesce : {false, true}) {
         SCOPED_TRACE(name(coalesce));
         const auto dir = tempDir();
+        constexpr int kExpired = 800;   // 800 producers of one batch: past the 64 KiB window
         {
-            Log log(dir.string(), /*segmentBytes=*/1);
+            Log log(dir.string(), /*segmentBytes=*/1 << 20);   // the batches aged together share one segment
             log.recover();
-            constexpr int kExpired = 800;   // 800 producers of one batch: past the 64 KiB window
             for (int i = 0; i < kExpired; ++i) rec(log, i, 1000 + i, 0, uint64_t(i), "insert");
             for (int i = 0; i < 10; ++i) rec(log, kExpired + i, -1, -1, uint64_t(i), "update");
+        }
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);   // from here on a segment per batch
+            log.recover();
             rec(log, kExpired + 10, 7, 0, 999'999, "live", now);
             pad(log, kExpired + 11);
             ageSegments(log, 0, kExpired + 10, exp + 60'000);
@@ -863,13 +867,17 @@ TEST(CheckedWritesAutoIncCleanerRegression, EvictedProducerWritingAgainIsTakenBa
     for (const bool coalesce : {false, true}) {
         SCOPED_TRACE(name(coalesce));
         const auto dir = tempDir();
+        constexpr int kN = 800;   // 800 producers: past the 64 KiB window
         {
-            Log log(dir.string(), /*segmentBytes=*/1);
+            Log log(dir.string(), /*segmentBytes=*/1 << 20);   // the batches aged together share one segment
             log.recover();
-            constexpr int kN = 800;   // 800 producers: past the 64 KiB window
             rec(log, 0, 7, 0, 5000, "old");   // the live producer's first batch, long before the rest
             for (int i = 0; i < kN; ++i) rec(log, 1 + i, 1000 + i, 0, uint64_t(i), "insert");
             for (int i = 0; i < kN; ++i) rec(log, 1 + kN + i, 1000 + i, 1, uint64_t(i), "again");   // each writes again, interleaved
+        }
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);   // from here on a segment per batch
+            log.recover();
             int64_t off = 1 + 2 * kN;
             int32_t seq7 = 1;
             for (int i = 0; i < 32; ++i, ++off) rec(log, off, 7, seq7++, 6000 + uint64_t(i), "live", now);

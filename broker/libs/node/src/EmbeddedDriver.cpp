@@ -20,6 +20,10 @@ EmbeddedDriverConfig EmbeddedDriverConfig::fromNode(const NodeConfig& c, std::st
     e.rcvWindowBytes    = c.aeronRcvWindowBytes;
     e.socketBufferBytes = c.aeronSocketBufferBytes;
     e.termBufferSparse  = c.aeronTermBufferSparse;
+    e.countersValuesBytes = c.aeronCountersValuesBytes;
+    e.statusMessageTimeoutNs = c.aeronStatusMessageTimeoutNs;
+    e.silentPeerTimeoutNs = c.testSilentPeerTimeoutNs;
+    e.testDefaultClientLivenessNs = static_cast<int64_t>(c.testAeronLivenessDefaultMs) * 1'000'000;
     e.maxMessagesPerSend = c.aeronMaxMessagesPerSend;
     e.udpGso             = c.aeronUdpGso;
     e.epollPoll          = c.aeronEpollPoll;
@@ -194,16 +198,25 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
                                  usedArgs + "' refused by Aeron (RUNE_AERON_DRIVER_IDLE / "
                                  "RUNE_AERON_DRIVER_IDLE_ARGS): " + why);
     }
-    if (cfg_.clientLivenessTimeoutNs > 0) {
-        // Aeron requires timer_interval < client_liveness < publication_unblock (aeron_driver_context.c, validate):
-        // derive both from the liveness, as the rune client does (AeronTransport.cpp).  Every publication on an
-        // embedded driver is written by this process, so a 1.5x-liveness unblock only matters if the process dies.
-        const auto livenessNs = static_cast<uint64_t>(cfg_.clientLivenessTimeoutNs);
+    // Aeron requires timer_interval < client_liveness < publication_unblock (aeron_driver_context.c, validate):
+    // derive both from the liveness, as the rune client does (AeronTransport.cpp).  Every publication on an
+    // embedded driver is written by this process, so a 1.5x-liveness unblock only matters if the process dies.
+    const auto setLiveness = [this](uint64_t livenessNs) {
         aeron_driver_context_set_client_liveness_timeout_ns(ctx_, livenessNs);
         if (aeron_driver_context_get_timer_interval_ns(ctx_) >= livenessNs)
             aeron_driver_context_set_timer_interval_ns(ctx_, livenessNs / 10);
         if (aeron_driver_context_get_publication_unblock_timeout_ns(ctx_) <= livenessNs)
             aeron_driver_context_set_publication_unblock_timeout_ns(ctx_, livenessNs + livenessNs / 2);
+    };
+    if (cfg_.testDefaultClientLivenessNs > 0) setLiveness(static_cast<uint64_t>(cfg_.testDefaultClientLivenessNs));   // TEST-ONLY
+    if (cfg_.clientLivenessTimeoutNs > 0) setLiveness(static_cast<uint64_t>(cfg_.clientLivenessTimeoutNs));
+    if (cfg_.timerIntervalNs > 0) aeron_driver_context_set_timer_interval_ns(ctx_, static_cast<uint64_t>(cfg_.timerIntervalNs));
+    if (cfg_.statusMessageTimeoutNs > 0) aeron_driver_context_set_rcv_status_message_timeout_ns(ctx_, static_cast<uint64_t>(cfg_.statusMessageTimeoutNs));
+    if (cfg_.silentPeerTimeoutNs > 0) {
+        const auto silentNs = static_cast<uint64_t>(cfg_.silentPeerTimeoutNs);
+        aeron_driver_context_set_publication_connection_timeout_ns(ctx_, silentNs);
+        aeron_driver_context_set_image_liveness_timeout_ns(ctx_, 4 * silentNs);
+        aeron_driver_context_set_timer_interval_ns(ctx_, silentNs / 10);
     }
     aeron_driver_context_set_dir_delete_on_start(ctx_, true);
     aeron_driver_context_set_dir_delete_on_shutdown(ctx_, cfg_.deleteDirOnShutdown);

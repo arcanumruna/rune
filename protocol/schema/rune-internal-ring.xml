@@ -142,6 +142,11 @@
            scope 1) or of a view partition (scope 2).  topicId = the topic / view, partition; no tail.  Answered with
            STATS_RESULT. -->
       <validValue name="GET_STATS">35</validValue>
+      <!-- Checked writes Part 11: coordinator -> the partition leader's worker: vote on a transaction's commit.
+           correlationId = the vote token, producerId / producerEpoch = the transaction, roleEpoch = the target leader
+           epoch + 1 (0 = unchecked), sessionId = the origin node (-1 = local); no tail.  Ownership-gated like
+           APPEND_CONTROL_RECORD.  Answered with TXN_VOTE_RESULT. -->
+      <validValue name="TXN_VOTE">36</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -219,6 +224,12 @@
       <!-- Checked writes Part 08: the answer to a GET_STATS op.  errorCode = StatsResponse status, recordCount = stat
            entries; the chunk is [count x 10 B][nConstraints u16][n x 12 B]. -->
       <validValue name="STATS_RESULT">10</validValue>
+      <!-- Checked writes Part 11: the answer to a TXN_VOTE op, on existing scalars.  correlationId = the vote token,
+           errorCode = transport status, recordCount = the vote code (0 = yes), newNextOffset = constraintId,
+           baseOffset = failingOffset, lastOffset = the judge offset (-1 = none), sessionId = the origin node.
+           The vote fields mean something only when errorCode == 0: a NotLeader answer leaves recordCount 0, which is NOT a
+           yes vote. -->
+      <validValue name="TXN_VOTE_RESULT">11</validValue>
     </enum>
 
     <!-- F15: TxnReturn::kind -->

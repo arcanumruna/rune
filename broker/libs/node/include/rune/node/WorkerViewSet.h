@@ -44,6 +44,8 @@
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/NsSlotTable.h>
 
+#include <spdlog/spdlog.h>
+
 namespace rune::node {
 
 /// The most row bytes (each row with its u32 length) one scanPage answers with.
@@ -71,9 +73,19 @@ public:
     [[nodiscard]] uint64_t installRefusals() const noexcept { return installRefusals_; }
     /// Test seam: tables created afterwards AND their hashes with `mask` (0 makes every key collide).
     void setHashMaskForTest(uint64_t mask) noexcept { hashMask_ = mask; }
+    /// Every instance created from now on folds at most `n` records a pass (0 = the derived cap).
+    void setPassCapForTest(int64_t n) noexcept { passCapForTest_ = n; }
     [[nodiscard]] const ViewInstance* instanceForTest(int32_t viewTopicId, int32_t partition) const {
         const auto it = views_.find(instKey(viewTopicId, partition));
         return it == views_.end() ? nullptr : &it->second;
+    }
+
+    struct VerdictIdentity { rune::view::VerdictViewKind kind; uint64_t objectId; uint64_t fingerprint; };
+    /// Test seam: how the installed view joins a judge's constraint set; nullopt for a view no judge drives.
+    [[nodiscard]] std::optional<VerdictIdentity> verdictIdentityForTest(int32_t viewTopicId) const {
+        const auto it = templates_.find(viewTopicId);
+        if (it == templates_.end() || !it->second.isVerdict) return std::nullopt;
+        return VerdictIdentity{it->second.verdictKind, it->second.verdictObjectId, it->second.verdictFingerprint};
     }
 
     // Register a view's plan/layout/source-descriptor/persistence and index it
@@ -152,7 +164,8 @@ public:
                                          int64_t committedTail, const SourceLogBounds& b = {});
 
     // Task 16: install a view FOR RECOVERY for ONE partition.  Registers the
-    // plan template (like installView) AND eagerly creates the (view, partition)
+    // plan template (like installView) unless one already exists, which is kept
+    // as it is, AND eagerly creates the (view, partition)
     // instance, then loads its on-disk checkpoint into the partition's table via
     // rune::view::replay(base, deltasInOrder) — setting foldCursor to the
     // recovered O (the highest applied checkpoint offset; 0 for an empty/missing
@@ -214,7 +227,6 @@ public:
                      const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
                      bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr,
                      SourceLogBounds b = {}) {
-        (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end()) return 0;
         int work = 0;
@@ -233,7 +245,7 @@ public:
             ViewInstance& inst = vit->second;
             adoptNs_(inst, ns);
             if (inst.readiness == ViewReadiness::Ready) continue;  // already caught up
-            work += driveView_(inst, readRange, rebuildTail, rskip, transientSrc, leaderGen, leaderHwConfirmed, b);
+            work += driveView_(inst, readRange, rebuildTail, rskip, nowNs, transientSrc, leaderGen, leaderHwConfirmed, b);
             if (inst.foldCursor >= rebuildTail && checkpointSettled(inst)) {
                 // N-C1: Ready only once the leader's HW reached its leadership start offset; else CatchingUp
                 // (never left RebuildingViews: that state gates elections).
@@ -301,8 +313,7 @@ public:
                    int64_t bound, const rune::view::FoldSkip& skip, int64_t nowNs,
                    const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
                      bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr, VerdictSource* judge = nullptr,
-                   SourceLogBounds b = {}) {
-        (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
+                   SourceLogBounds b = {}, int64_t judgeBound = -1) {
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end() && judge == nullptr) return 0;
         static const std::vector<int32_t> kNoViews;
@@ -316,9 +327,16 @@ public:
             if (judge != nullptr) {
                 work += syncConstraintSet_(srcTopicId, *judge, *write);
                 if (judge->activationPending()) rebuildKeyIndex_(srcTopicId, partition, *judge, *write->spec, leaderGen);
-                work += judge->driveJudge(readRange, bound, nowNs, *write, skip.aborted);
+                // P11-2: the judge reads to the HW (`judgeBound`, -1 = `bound`); the other views still fold below the LSO and K.
+                work += judge->driveJudge(readRange, judgeBound < 0 ? bound : judgeBound, nowNs, *write, skip.aborted, bound);
+                if (txnOverlays_.starved()) [[unlikely]] {
+                    growTxnOverlays_(nowNs);
+                    ++work;
+                } else {
+                    txnOverlays_.trim(nowNs);
+                }
                 viewBound = std::min(bound, judge->judgedThrough());
-                work += flipVerdictMembers_(srcTopicId, partition, bound, leaderGen, leaderHwConfirmed, ns);
+                work += flipVerdictMembers_(srcTopicId, partition, bound, nowNs, leaderGen, leaderHwConfirmed, ns);
             } else {
                 viewBound = std::min(bound, write->verdictKnownThrough());
             }
@@ -331,7 +349,7 @@ public:
             ViewInstance* inst = getOrCreate_(viewTopicId, partition, bound);
             if (inst == nullptr) continue;  // defensive: template must exist
             adoptNs_(*inst, ns);
-            work += driveView_(*inst, readRange, viewBound, viewSkip, transientSrc, leaderGen, leaderHwConfirmed, b);
+            work += driveView_(*inst, readRange, viewBound, viewSkip, nowNs, transientSrc, leaderGen, leaderHwConfirmed, b);
         }
         return work + finishRetired_();
     }
@@ -344,10 +362,17 @@ public:
     /// Creates or erases the judge of (src, partition) as its verdict templates and logged timeline require, and registers its
     /// members.  nullptr when the partition is not a verdict source.  Cheap when nothing changed.
     VerdictSource* ensureVerdictSource(int32_t srcTopicId, int32_t partition, PartitionWriteState& write);
-    /// The partition's write state is gone: its judge goes with it.
+    /// The partition's write state is gone: its judge goes with it, and finishRetired_ erases the retiring views no judge holds any
+    /// more (P9-6).  A judge not yet activated holds none, so a partition promoted in the same apply recovers its plan from its own
+    /// type-20 record: that fallback is why the log keeps them.
+    // Inline: Worker.h's rebuildRcSlots_ reaches it, and that header is built into libraries that do not link rune_node.
     void dropVerdictSource(int32_t srcTopicId, int32_t partition) {
+        if (const auto it = verdictSources_.find(instKey(srcTopicId, partition)); it != verdictSources_.end()) releaseJudge_(*it->second);
         verdictSources_.erase(instKey(srcTopicId, partition));
         eraseKeyIndex_(instKey(srcTopicId, partition));
+        if (const auto sit = subscriptionIndex_.find(srcTopicId); sit != subscriptionIndex_.end())
+            for (const int32_t id : sit->second)
+                if (isVerdictTemplate_(id) && templates_.at(id).retiring) retiredQueue_.push_back({id, partition});
     }
     [[nodiscard]] std::vector<uint64_t> verdictSourceKeysForTest() const {
         std::vector<uint64_t> keys;
@@ -359,10 +384,31 @@ public:
         verdictIntervalNs_ = ns;
         for (auto& kv : verdictSources_) kv.second->setVerdictIntervalNs(ns);
     }
+    /// Cold: the records a transaction may have to be judged (P11-1); every judge is bound again and the overlays re-reserved.  An
+    /// overlay or key set in use keeps its size until it is free (TxnOverlayPool).
+    void setTxnJudgedRecordsMax(int32_t n) {
+        txnJudgedRecordsMax_ = n;
+        for (auto& kv : verdictSources_) {
+            kv.second->bindTxn(&txnOverlays_, batchOverlay_, n);
+            reserveTxnOverlays_(*kv.second);
+        }
+    }
+    [[nodiscard]] int32_t txnJudgedRecordsMax() const noexcept { return txnJudgedRecordsMax_; }
+    [[nodiscard]] TxnOverlayPool& txnOverlaysForTest() noexcept { return txnOverlays_; }
     /// Cold: the source topic is gone; its judges and key indexes go with it.
     void dropSourceTopic(int32_t srcTopicId);
     /// Cold: a topic's write spec changed key.index, so syncConstraintSet_ must run again.
     void noteWriteSpecChange() noexcept { ++verdictEpoch_; }
+    /// Test seam: this worker's catalog position is at least `through` (a cluster test cannot hold one node's catalog back).
+    void raiseCatalogThroughForTest(int64_t through) noexcept { catalogThrough_ = std::max(catalogThrough_, through); }
+    [[nodiscard]] int64_t catalogThroughForTest() const noexcept { return catalogThrough_; }
+    /// A replacement plan of this object builds as a candidate in some judge.
+    [[nodiscard]] bool candidateForTest(uint64_t viewObjectId) const noexcept {
+        return std::any_of(verdictSources_.begin(), verdictSources_.end(), [&](const auto& kv) { return kv.second->candidateForTest(viewObjectId); });
+    }
+    [[nodiscard]] std::size_t retiringVerdictTemplatesForTest() const noexcept {
+        return static_cast<std::size_t>(std::count_if(templates_.begin(), templates_.end(), [](const auto& kv) { return kv.second.isVerdict && kv.second.retiring; }));
+    }
     /// Test seam: every judge, existing and later created, is held (nothing activates, replays or judges).
     void holdJudgesForTest(bool hold) noexcept {
         holdJudges_ = hold;
@@ -381,11 +427,17 @@ public:
         const auto it = keyIndexes_.find(instKey(src, partition));
         return it == keyIndexes_.end() ? 0 : it->second.table.size();
     }
+    [[nodiscard]] const ViewInstance* keyIndexForTest(int32_t src, int32_t partition) const {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it == keyIndexes_.end() ? nullptr : &it->second;
+    }
     /// -1: the partition has no key index.
     [[nodiscard]] int64_t keyIndexFoldCursorForTest(int32_t src, int32_t partition) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
         return it == keyIndexes_.end() ? -1 : it->second.foldCursor;
     }
+    /// Test seam: a unique or check view as the install frame would register it.
+    void installConstrainedViewForTest(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout, rune::codec::Descriptor src, bool persisted);
     /// Test seam: a TestReject verdict view (viewObjectId, rule) over the source of `plan`.
     void installTestVerdictViewForTest(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout, rune::codec::Descriptor src,
                                        bool persisted, uint64_t viewObjectId, TestRejectRule rule, bool underRecovery = false);
@@ -447,13 +499,19 @@ public:
     /// The serve path's view of one hosted instance (one lookup): the leadership it is caught up under and how far it
     /// folded (issue #82, the read-your-writes barrier).  nullptr leadership = not hosted.
     struct InstanceServeState { uint64_t leadership = 0; int64_t foldCursor = 0; bool hosted = false; bool ready = false;
-                                bool paused = false; int64_t pausedOffset = 0; };
+                                bool paused = false; int64_t pausedOffset = 0; bool fenced = false; };
     [[nodiscard]] InstanceServeState instanceServeState(int32_t viewTopicId, int32_t partition) const noexcept {
         const auto it = views_.find(instKey(viewTopicId, partition));
         if (it == views_.end()) return {};
         const ViewPaused* pz = std::get_if<ViewPaused>(&it->second.pause);
         return InstanceServeState{it->second.foldLeadership, it->second.foldCursor, true,
-                                  it->second.readiness == ViewReadiness::Ready, pz != nullptr, pz ? pz->offset : 0};
+                                  it->second.readiness == ViewReadiness::Ready, pz != nullptr, pz ? pz->offset : 0,
+                                  it->second.spanFence.fenced()};
+    }
+    /// P11-9 (contract addition 13): a transaction's or an atomic batch's application spans passes; its reads are held meanwhile.
+    [[nodiscard]] bool readFenced(int32_t viewTopicId, int32_t partition) const noexcept {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        return it != views_.end() && it->second.spanFence.fenced();
     }
 
     /// The (view, partition) instance's fold cursor, -1 when it is not hosted.  Tests only.
@@ -519,13 +577,23 @@ private:
     std::vector<uint8_t>  nsViewMemOver_ = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
     uint64_t viewPauses_ = 0, viewResumes_ = 0;
 
+    // The tables, their dirty sets' growth and a held delta: a long window between checkpoints (P11-9) is view memory too.  A
+    // pushed window gives a long span's growth back (releaseWindow_; ViewTable::trimDirty).  Churn past the reserve keeps its
+    // dirty sets, charged, while windows come less than kQuietGiveBackNs apart, and allocates nothing per drain; a driven pass
+    // after that long without a window ending (a push; a drain for the key index) gives them back (quietPass_: a caught-up
+    // view, any judge pass for a member or the key index), so such an instance carries no charge past its tables.  A paused
+    // view flushes a held delta and gives a kept window back on its first paused pass.  An open span's undrained rows stay
+    // (they are live).  An instance that is not driven (its source partition is not led here) keeps its charge, a kept window
+    // included, until a pass drives it again.
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
-        std::size_t m = inst.table.memoryBytes();
-        if (inst.owners) m += inst.owners->memoryBytes();
+        std::size_t m = inst.table.memoryBytes() + inst.table.dirtyBytes() + (inst.pendingValid ? inst.pendingDelta.capacity() : 0);
+        if (inst.owners) m += inst.owners->memoryBytes() + inst.owners->dirtyBytes();
+        if (inst.claims) m += inst.claims->indexTable().memoryBytes() + inst.claims->extrasTable().memoryBytes();
         if (inst.agg) {
             m += inst.agg->contributors.memoryBytes() + inst.agg->groups.memoryBytes();
-            if (inst.agg->blocks) m += inst.agg->blocks->memoryBytes();
-            if (inst.agg->groupIds) m += inst.agg->groupIds->memoryBytes();
+            m += inst.agg->contributors.dirtyBytes() + inst.agg->groups.dirtyBytes();
+            if (inst.agg->blocks) m += inst.agg->blocks->memoryBytes() + inst.agg->blocks->dirtyBytes();
+            if (inst.agg->groupIds) m += inst.agg->groupIds->memoryBytes() + inst.agg->groupIds->dirtyBytes();
         }
         return m;
     }
@@ -537,6 +605,44 @@ private:
         if (!nsSlots_.matches(inst.nsSlot, inst.nsId)) { ++nsSlotMismatches_; return; }   // stale tag: never charge another namespace
         nsViewMem_[inst.nsSlot] = nsViewMem_[inst.nsSlot] + m - inst.memCharged;
         inst.memCharged = m;
+    }
+    /// A window drained (pushed, or discarded by a transient view): the dirty sets give back their growth and the charge follows.
+    void releaseWindow_(ViewInstance& inst) {
+        std::size_t kept = 0;
+        eachDirtySet_(inst, [&kept](rune::view::ViewTable& t) {
+            t.trimDirty();
+            kept += t.dirtyBytes();
+        });
+        inst.windowKept = kept != 0;
+        inst.quietSinceNs = -1;
+        chargeMem_(inst);
+    }
+    /// Run on a view's caught-up pass and on every judge pass for a member or the key index, after any push or drain in it: a
+    /// kept dirty window is given back once no window has ended for kQuietGiveBackNs, on the pass's own clock.  Longer than
+    /// any steady producer's gap between windows, so steady churn keeps it however many passes fall between.
+    static constexpr int64_t kQuietGiveBackNs = 1'000'000'000;
+    void quietPass_(ViewInstance& inst, int64_t nowNs) {
+        if (!inst.windowKept) return;
+        if (inst.quietSinceNs < 0) inst.quietSinceNs = nowNs;
+        else if (nowNs - inst.quietSinceNs >= kQuietGiveBackNs) releaseQuiet_(inst);
+    }
+    /// Give a kept dirty window back (ViewTable::trimQuiet) and the charge follows.
+    void releaseQuiet_(ViewInstance& inst) {
+        eachDirtySet_(inst, [](rune::view::ViewTable& t) { t.trimQuiet(); });
+        chargeMem_(inst);
+        inst.windowKept = false;
+        inst.quietSinceNs = -1;
+    }
+    template <class F>
+    static void eachDirtySet_(ViewInstance& inst, F&& f) {
+        f(inst.table);
+        if (inst.owners) f(*inst.owners);
+        if (inst.agg) {
+            f(inst.agg->contributors);
+            f(inst.agg->groups);
+            if (inst.agg->blocks) f(*inst.agg->blocks);
+            if (inst.agg->groupIds) f(*inst.agg->groupIds);
+        }
     }
     void releaseMem_(ViewInstance& inst) noexcept {
         if (inst.nsSlot == kNoNsSlot || inst.memCharged == 0) return;
@@ -592,6 +698,12 @@ public:
         return it == views_.end() ? nullptr : &it->second.counters;
     }
 
+    // True when the (view, partition) instance is a unique view with a claims index (stat 32 is served).
+    [[nodiscard]] bool hasUniqueClaims(int32_t viewTopicId, int32_t partition) const {
+        auto it = views_.find(instKey(viewTopicId, partition));
+        return it != views_.end() && it->second.claims.has_value();
+    }
+
     // Count of live per-(view, partition) instances.
     [[nodiscard]] std::size_t instanceCount() const noexcept { return views_.size(); }
     // Count of installed view plans (partition-independent).
@@ -610,6 +722,7 @@ public:
         };
         std::size_t n = pending(inst.table);
         if (inst.owners) n += pending(*inst.owners);
+        if (inst.claims) n += pending(inst.claims->indexTable()) + pending(inst.claims->extrasTable());
         if (inst.agg) {
             n += pending(inst.agg->contributors) + pending(inst.agg->groups);
             if (inst.agg->blocks) n += pending(*inst.agg->blocks);
@@ -643,6 +756,7 @@ private:
         uint64_t                     verdictFingerprint = 0;
         TestRejectRule               testRule{};
         bool                         retiring = false;
+        std::vector<uint8_t>         planRecordPayload;   // P9-8: the type-20 value a judge appends when this unique or check view joins its set
     };
 
     [[nodiscard]] bool isVerdictTemplate_(int32_t viewTopicId) const noexcept {
@@ -654,8 +768,11 @@ private:
     [[nodiscard]] const ViewInstance* serveInstance_(int32_t viewTopicId, int32_t partition, const rune::view::RowLayout*& outLayout,
                                                      RowStatus* outStatus) const;
     void onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status, ViewDiscardReason reason);
+    /// The catalog gate every constraint-set change request passes (#788): true while this worker's catalog has not applied the
+    /// position the logged set was computed at, or while a drained plan install or uninstall has no mark yet.  The request must then be left unasked; one that goes ahead stamps `catalogThrough_`.
+    [[nodiscard]] bool catalogBehind_(int32_t srcTopicId, VerdictSource& judge, const PartitionWriteState& write);
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
-    int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
+    int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, int64_t nowNs, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
     void rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen);
     // Inline: Worker.h's rebuildRcSlots_ reaches it, and that header is built into libraries that do not link rune_node.
     void eraseKeyIndex_(uint64_t key) {
@@ -665,6 +782,9 @@ private:
         }
     }
     int finishRetired_();
+    /// P9-8: the plan a judge waits for, installed from the type-20 record of its log when the catalog does not have it: retiring and in
+    /// memory, it judges up to its drop.  Cold.
+    void installRetainedPlan_(int32_t srcTopicId, VerdictSource& judge, const PartitionWriteState& write);
     int pushVerdictCheckpoint_(ViewInstance& inst);
     void beginDiscard_(ViewInstance& inst, ViewDiscardReason reason);
     [[nodiscard]] bool tryPushDiscard_(ViewInstance& inst);
@@ -677,11 +797,31 @@ private:
     }
 
     std::unordered_map<uint64_t, std::unique_ptr<VerdictSource>> verdictSources_;   // (srcTopicId, partition) -> judge
+    // Part 11: the worker's transaction overlays, shared by its judges, and the atomic batch's (P11-6).  Reserved at member install.
+    TxnOverlayPool txnOverlays_;
+    std::array<rune::view::TxnOverlay, 1> batchOverlay_;
+    std::size_t batchOverlayRows_ = 0;
+    uint32_t batchOverlayRowLen_ = 0;
+    int32_t txnJudgedRecordsMax_ = 4096;
+    void reserveTxnOverlays_(const VerdictSource& judge);   // cold
+    void growTxnOverlays_(int64_t nowNs);   // cold
+    /// A judge about to go: the overlays it or its state's entries hold go back to the pool.
+    void releaseJudge_(VerdictSource& judge) noexcept {
+        if (PartitionWriteState* s = judge.boundState()) judge.releaseTxnOverlays(s->txn);
+    }
     // The key index of a key.index partition: a verdict member of its judge that is in neither views_ nor templates_.  Rebuilt from the
     // local log at every activation; never persisted.  unordered_map keeps the node's address across the move-assign that rebuilds it.
     std::unordered_map<uint64_t, ViewInstance> keyIndexes_;
     bool holdJudges_ = false;
     struct Retired { int32_t viewTopicId, partition; };
+    bool installsSinceMark_ = false;   // a verdict plan install or uninstall was drained whose catalog mark has not been: the gate stays closed
+    int64_t catalogThrough_ = -1;   // the latest catalog position this node's control thread marked here; never moves back (#788)
+    struct RefusedPlan { uint64_t viewObjectId, fingerprint; };
+    std::vector<RefusedPlan> refusedPlans_;   // the catalog installs this worker refused: the log never installs them instead, and the sync keeps their object's logged member
+    std::vector<uint64_t> unreadablePlans_;   // retained plans whose decode failure was logged
+    void noteRefused_(uint64_t viewObjectId, uint64_t fingerprint) {
+        if (std::none_of(refusedPlans_.begin(), refusedPlans_.end(), [&](const RefusedPlan& r) { return r.fingerprint == fingerprint; })) refusedPlans_.push_back({viewObjectId, fingerprint});
+    }
     uint64_t verdictEpoch_ = 0;   // bumped by every verdict template install, retire and erase; syncConstraintSet_ reruns on a change
     std::vector<Retired> retiredQueue_;   // the members the judges dropped, per partition
     std::vector<ConstraintSetMember> constraintWant_;   // syncConstraintSet_ scratch: grows once, never per pass
@@ -743,7 +883,7 @@ private:
     // progress count for the instance.
     template <class ReadRangeFn>
     int driveView_(ViewInstance& inst, ReadRangeFn&& readRange, int64_t bound,
-                   const rune::view::FoldSkip& skip,
+                   const rune::view::FoldSkip& skip, int64_t nowNs,
                    const TransientBounds* transientSrc, uint64_t leaderGen, bool leaderHwConfirmed, const SourceLogBounds& b) {
         int work = 0;
         // 0a. A discard in flight (the old checkpoint is being backed up): fold nothing, checkpoint nothing, serve NotReady until
@@ -753,9 +893,10 @@ private:
             return 0;
         }
         // 0c. Retention trimmed the disk source below this cursor (#726; a paused view, a stale checkpoint, a fresh view over a trimmed
-        //     log): an instance without rows starts at the log start; one with rows is backed up and rebuilt.  Pure arithmetic, so it
-        //     runs before the namespace pause return: a resumed view sees it on its first pass.
-        if (transientSrc == nullptr && inst.foldCursor < b.logStart) [[unlikely]] {
+        //     log): an instance without rows starts at the log start; one with rows is backed up and rebuilt, as is one whose open
+        //     span lost its first batches (its marker could never be applied).  Pure arithmetic, so it runs before the namespace
+        //     pause return: a resumed view sees it on its first pass.
+        if (transientSrc == nullptr && (inst.foldCursor < b.logStart || inst.spanFence.straddles(b.logStart))) [[unlikely]] {
             if (!startAtLogStart_(inst, b.logStart)) return 1;
         }
         // 0c'. #159: a persisted instance whose cursor is above the source log end holds rows from records the log no longer has
@@ -767,8 +908,14 @@ private:
             return 1;
         }
         // 00. Task 12 (D26): the namespace is over its view-memory limit -> pause at foldCursor (reads answer
-        //     ViewPaused); back under it -> resume from that same foldCursor.  Untagged instances skip this.
-        if (inst.nsSlot != kNoNsSlot && !nsViewGate_(inst)) return work;
+        //     ViewPaused); back under it -> resume from that same foldCursor.  Untagged instances skip this.  A paused view folds
+        //     nothing.  A held delta was folded already: it still leaves, and its push trims the window it drained.  A kept dirty
+        //     window is given back at once: both are reclaimable charge that would hold the pause.
+        if (inst.nsSlot != kNoNsSlot && !nsViewGate_(inst)) {
+            if (inst.pendingValid && !tryPushDelta_(inst)) return 1;   // the ring is full: keep the worker hot to retry it (step 1)
+            if (inst.windowKept) releaseQuiet_(inst);
+            return work;
+        }
         // 0. Phase 2b E: a TRANSIENT source — reconcile THIS instance's cursor
         //    against the source's live range (no extra hash lookups: the caller
         //    already holds the instance).  Disk sources pass nullptr.
@@ -805,7 +952,10 @@ private:
         // 2. Nothing new committed for this partition — caught up (checked before
         //    the capacity event so capacityExceeded_ counts folds that actually
         //    crossed the ceiling, not idle passes).
-        if (inst.foldCursor >= bound) return work;
+        if (inst.foldCursor >= bound) {
+            quietPass_(inst, nowNs);
+            return work;
+        }
         // 3. §15 #24: maxRows is an OBSERVABLE capacity-exceeded EVENT, NOT a
         //    fold-stop.  Crossing it increments capacityExceeded_ (the metric) but
         //    MUST NOT refuse the fold or freeze foldCursor — the table grows on
@@ -834,19 +984,25 @@ private:
         if (view.empty()) return work;
 
         int64_t cursor = inst.foldCursor;
+        // P11-0: a transaction applies at its commit marker, read back through readRange, within the pass cap.  A transient
+        // source keeps offset order (D6): its ring may have evicted a span's first batch and its read ignores the end.
+        rune::view::TxnFold txnFold{inst.spanFence, txnOverlays_.supersedeKeys, rune::view::spanReaderOf(readRange), inst.maxRecordsPerPass};
+        rune::view::TxnFold* const txn = transientSrc == nullptr ? &txnFold : nullptr;
         const rune::view::FoldStats st =
-            inst.keyed ? foldKeyed_(inst, view, passBound, cursor, skip)
+            inst.keyed ? foldKeyed_(inst, view, passBound, cursor, skip, txn)
           : inst.agg ? rune::view::foldAggregateBatch(inst.plan, inst.layout, inst.agg->layout,
                                                       inst.vdc, inst.table, inst.agg->contributors,
                                                       inst.agg->groups, inst.agg->blocksOrNull(), view,
-                                                      passBound, cursor, skip)
+                                                      passBound, cursor, skip, txn)
                      : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view,
-                                             passBound, cursor, skip);
+                                             passBound, cursor, skip, txn);
         work += cursor != inst.foldCursor;   // a pass across a compacted gap folds nothing but moves the cursor
         inst.foldCursor = cursor;
         chargeMem_(inst);   // Task 12: the pass may have appended chunks
         work += static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted +
-                                 st.skippedMalformed + st.skippedNoGroup + st.skippedNoKey + st.keyConflicts);
+                                 st.skippedMalformed + st.skippedNoGroup + st.skippedNoKey + st.keyConflicts) +
+                ((inst.spanFence.fenced() && st.txnReadFailed == 0) || st.txnNoteWaits != 0 ? 1 : 0);   // an application in progress, or one
+                                                                                                         // waiting for the key set, keeps the worker hot
         inst.counters.skippedAborted   += st.skippedAborted;
         inst.counters.skippedMalformed += st.skippedMalformed;
         inst.counters.skippedNoGroup   += st.skippedNoGroup;
@@ -857,6 +1013,18 @@ private:
         inst.counters.skippedNoKey     += st.skippedNoKey;
         inst.counters.keyConflicts     += st.keyConflicts;
         inst.counters.ownerMoves       += st.ownerMoves;
+        inst.counters.uniquePromotions += st.uniquePromotions;
+        inst.counters.txnSpanTableFull += st.txnSpanTableFull;
+        if (st.txnSpanTableFull != 0 && inst.counters.txnSpanTableFull == st.txnSpanTableFull)
+            spdlog::warn("WorkerViewSet: view {}: more than {} transactions open at once; the excess apply at their own offsets (P11-9)",
+                         inst.plan.viewName, rune::view::TxnSpanFence::kSlots);
+        inst.counters.txnSuperseded    += st.txnSuperseded;
+        inst.counters.txnReadFailed    += st.txnReadFailed;
+        if (st.txnReadFailed != 0 && inst.counters.txnReadFailed == st.txnReadFailed)
+            spdlog::warn("WorkerViewSet: view {} partition {}: a transaction's read-back below offset {} failed; its marker is retried each pass",
+                         inst.plan.viewName, inst.partition, inst.foldCursor);
+        inst.counters.txnNoteWaits     += st.txnNoteWaits;
+        if (inst.claims) inst.counters.uniqueConflicts = inst.claims->extras();
 
         // Bug A: this pass's OWN fold may be what just caught the instance up
         // to `bound` — flip it here too (see 1b's doc comment for why this
@@ -873,9 +1041,11 @@ private:
         //    pass), no allocation.
         if (!inst.persisted) {
             discardDirty_(inst);
+            releaseWindow_(inst);
             return work;
         }
         work += buildAndPushCheckpoint_(inst);
+        chargeMem_(inst);   // a held delta is charged (a pushed one was, by releaseWindow_)
         return work;
     }
 
@@ -894,15 +1064,13 @@ private:
 
     /// Folds [cursor, bound) of a keyed instance.
     static rune::view::FoldStats foldKeyed_(ViewInstance& inst, const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor,
-                                            const rune::view::FoldSkip& skip) {
+                                            const rune::view::FoldSkip& skip, rune::view::TxnFold* txn) {
         if (inst.agg) {
-            rune::view::AggregateFold f{inst.plan, inst.layout, inst.agg->layout, inst.vdc, inst.table, inst.agg->contributors, inst.agg->groups,
-                                        inst.agg->blocksOrNull(), &*inst.keyed, &*inst.agg->groupIds, &inst.agg->nextGroupId};
-            return rune::view::foldKeyedAggregateBatch(f, inst.prospect, view, bound, cursor, skip);
+            rune::view::AggregateFold f = aggregateFoldOf(inst);
+            return rune::view::foldKeyedAggregateBatch(f, inst.prospect, view, bound, cursor, skip, txn);
         }
-        rune::view::ProjectionFold f{inst.plan, inst.layout, inst.vdc, inst.table, rune::view::viewKeyType(inst.plan), &*inst.keyed,
-                                     inst.owners ? &*inst.owners : nullptr};
-        return rune::view::foldProjectionBatch(f, inst.prospect, view, bound, cursor, skip);
+        rune::view::ProjectionFold f = projectionFoldOf(inst);
+        return rune::view::foldProjectionBatch(f, inst.prospect, view, bound, cursor, skip, txn);
     }
 
     // Clear the dirty/deleted tracking of every table of an instance: every
@@ -915,6 +1083,10 @@ private:
         inst.table.drainDirtyKeyed(dropKeyed);   // also a key index: its table is as wide as the wire key
         if (inst.keyed) {
             if (inst.owners) inst.owners->drainDirtyKeyed(dropKeyed);
+            if (inst.claims) {
+                inst.claims->indexTable().drainDirtyKeyed(dropKeyed);
+                inst.claims->extrasTable().drainDirtyKeyed(dropKeyed);
+            }
             if (inst.agg) {
                 inst.agg->contributors.drainDirtyKeyed(dropKeyed);
                 inst.agg->groups.drainDirtyKeyed(dropKeyed);
@@ -935,6 +1107,7 @@ private:
     // [viewTopicId i32][partition i32][delta bytes].  Returns false (and keeps
     // pendingValid) on back-pressure; true once committed.
     [[nodiscard]] bool tryPushDelta_(ViewInstance& inst);
+    [[nodiscard]] bool tryPushDeltaParts_(ViewInstance& inst);
 
     /// Cold: the source log starts above this instance's cursor.  True = it now starts at the log start; false = it held rows
     /// from trimmed records and a BelowLogStart discard began.
@@ -944,6 +1117,7 @@ private:
     std::string          viewDataDir_;
     uint64_t             hashSeed_ = 0;
     uint64_t             hashMask_ = ~uint64_t{0};
+    int64_t              passCapForTest_ = 0;
     uint64_t             installRefusals_ = 0;
 
     std::unordered_map<int32_t, ViewTemplate>         templates_;        // viewTopicId -> plan template

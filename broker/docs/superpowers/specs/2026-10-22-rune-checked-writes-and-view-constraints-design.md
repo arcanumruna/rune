@@ -478,12 +478,12 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
   Acceptance alone writes nothing per record.
 - **Replication.** Markers replicate like any record. Consumers and folds skip them as data, as they skip transaction markers.
 - **The bitmap.** Each replica builds a local index of rejected offsets per segment from the markers, rebuilt at recovery. It follows `TxnCleanState` (`storage/include/rune/storage/TxnCleanState.h`), which already does this for aborted transactions.
-- **The verdict watermark `W`** is the highest `finalThrough` among committed markers. Every verdict below `W` is durable on every replica.
+- **The verdict watermark `W`** is the highest `finalThrough` among committed markers that hold fewer than the maximum 4096 entries; a full marker continues into the next and ends no coverage, because its split may fall inside a transaction span or an atomic batch. Every verdict below `W` is durable on every replica.
 - **The cleaner** on a verdict source:
   - compacts only below `W`;
   - drops rejected records;
   - never counts a rejected record as the latest for its key, so an accepted value is never removed in favor of a rejected one;
-  - drops a marker once every offset it lists is gone and a later marker carries a higher `finalThrough`, after the same grace period as tombstones.
+  - drops a marker once every offset it lists is gone and a later marker with fewer than the maximum 4096 entries carries a higher `finalThrough`, after the same grace period as tombstones.
   - On a `delete`-retention topic, rejected records and markers age out with everything else.
 - **Refold** (restart, view rebuild, new leader):
   - Below `W`, records are applied without being judged, skipping the ones the bitmap marks. A constraint change can therefore never overturn an old verdict.
@@ -645,11 +645,11 @@ Until this part ships, the §11.2 refusals apply.
    2. appends a `TxnJudge { producerId, epoch }` control record at offset J (§G.3);
    3. once the fold reaches J, judges **all** of the transaction's records on the partition together, in their offset order, against the view state at J;
    4. if they pass, applies them **provisionally**, keeps the before-image of every row they touch, and locks those rows (§G.4);
-   5. answers yes, or no with the first failing `(code, constraintId, offset)`. On no, it puts the before-images back at once.
+   5. answers yes, or no with the first failing `(code, constraintId, offset)`. On no, the rows T touches stay locked until T's abort marker, which the coordinator's decision or the transaction timeout bounds.
 4. If every vote is yes, the coordinator writes `PrepareCommit` and the markers, as today. If any vote is no, or a voter times out, it writes `PrepareAbort`, and `commitTransaction()` fails with that code and constraint id. The transaction is aborted, as in Postgres.
 5. The commit marker makes the provisional rows final in **one worker step**, and the abort marker restores the before-images in one worker step. Either way the rows unlock.
 
-- **Votes are idempotent.** A repeated `TxnVote` for the same producer and epoch is answered from the `TxnJudge` already in the log, so a retried `commitTransaction()` or a new coordinator gets the same answer. If the coordinator fails while votes are out, it recovers the transaction as `Ongoing`: the client retries the commit, or the transaction timeout aborts it. No new durable coordinator state is needed.
+- **Votes are idempotent.** A repeated `TxnVote` for the same producer and epoch is answered from the `TxnJudge` already in the log, so a retried `commitTransaction()` or a new coordinator gets the same answer. If the coordinator fails while votes are out, it recovers the transaction as `Ongoing`: the client retries the commit, or the transaction timeout aborts it. No new durable coordinator state is needed. Once the coordinator decided, the no is carried on its `PrepareAbort` and `CompleteAbort` records (no new record or state), so a retried `commitTransaction()` on a new coordinator gets the same no after the abort markers landed, when a partition no longer answers from its `TxnJudge`.
 
 **G.3 The judging order.** On a verdict source, a record outside a transaction is judged at its own offset. A transaction's records are judged together at their `TxnJudge` record.
 - **The fold no longer stops at an open transaction's first record.** It judges and applies other records past it, and defers the transaction's records to its `TxnJudge`. The order comes entirely from the log, so every leader and every refold uses the same one, as §8.4 requires.
@@ -657,6 +657,7 @@ Until this part ships, the §11.2 refusals apply.
 - **Failover.**
   - If the `TxnJudge` record committed, a new leader judges at it and reaches the same vote.
   - If it didn't, it was truncated, and the coordinator's retried vote appends a new one.
+  - If a failover cuts a chain of full markers short, the new leader restarts at the end of the last marker with fewer than 4096 entries, which lies outside every transaction span, and judges the whole span again.
 - **The verdict watermark** `W` (§8.5) never passes a `TxnJudge` whose transaction is undecided, so the cleaner never compacts across one.
 
 **G.4 Locks between the vote and the marker.** A provisionally applied row is locked from the vote until the marker, which is normally one coordinator round trip.
@@ -667,6 +668,7 @@ Until this part ships, the §11.2 refusals apply.
 - **View reads** of a provisional row return its before-image until the commit marker. Then the transaction's rows change in one worker step, so no read sees part of it (level 3a).
 - **Consumers** on a verdict source stay bounded as in §8.6. They never pass a deferred transaction's records until its marker, which is what `read_committed` gives today. On these partitions, `read_uncommitted` behaves the same way.
 - **Partitions that aren't verdict sources** get level 3a too. The fold never ends a step between a committed transaction's first record and its commit marker, so a committed transaction becomes visible in one step.
+- **Exceptions.** A view over a transient source keeps offset order and has no level 3a. A view with more than 64 transactions open across one stretch of its log applies the excess in offset order, without level 3a, counted in `txnSpanTableFull` and warned once per view instance.
 
 **G.6 Atomic batches** (`p.batch(...)`) on a verdict source are judged as a unit at their own offset, all records passing or none. They reuse the before-images: the fold applies the batch's records one by one within one worker step, and puts the before-images back if any record fails. No vote is needed, because a batch lives on one partition and in one append. The `View` ack carries a single verdict for the whole batch.
 
@@ -676,6 +678,7 @@ Until this part ships, the §11.2 refusals apply.
   - `commitTransaction()` and `commitTransactionAndWait()` return the code and the `constraintId` on a no vote.
   - A transactional producer whose acks include `View` also waits, on commit, until every voting partition has made the rows final.
   - Inside a transaction, sends are acked as `All`. The verdict comes from the commit, so `View` on a single send is ignored.
+  - **Rejected atomic batch.** The View ack carries one trailer entry `{recordIndex 0, code, constraintId}`, and the client completes the batch once with `BrokerError`, `value` = the batch's base offset. This deviates from the Task 12 design's "first failing record's index" (G.6 leaves the entry's index open): the rejected-offset index and the verdict markers store no failure position, and every rejected record of an atomic batch carries the same code. Owner ruling, Task 12c (Q1).
 - **Cost.** One extra coordinator round trip on commit, only for transactions that touch a voting partition, plus the `TxnJudge` record and the lock pause.
 
 ## 10. Rune QL and the CLI
@@ -730,6 +733,8 @@ Until this part ships, the §11.2 refusals apply.
 | 53 | `KeyNotFound` | `update` or delete-existing on a key that's absent | fold, per record | definite |
 | 54 | `AutoIncrementExhausted` | The counter has reached `autoincrement.max`. The batch isn't stored. | write | definite |
 | 55 | `TxnTooLarge` | A transaction wrote more than `txn.judged.records.max` records to one voting partition. The transaction aborts. | vote | definite |
+
+Numbering note: this table uses the design's numbers. As shipped (plan 00 RB2, plan 11 Refresh R-1), 51–54 are taken by main, so the codes are 55 `ConstraintViolation`, 56 `KeyExists`, 57 `KeyNotFound`, 58 `AutoIncrementExhausted`, 62 `TxnTooLarge` and 63 `TxnConflict` (§9b); 59–61 are the compile errors.
 
 A no vote (51–53, 55) is returned by `commitTransaction()`, with the constraint id, and the transaction is aborted.
 

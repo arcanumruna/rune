@@ -81,11 +81,11 @@ enum class OpStatus : uint8_t {
                      ///< failed locally (nothing was sent)
     StoredIdUnknown, ///< 13: stored; its id is unknown (the retry fell outside the dedupe window)
     VerdictUnknown,  ///< 14: stored, but its verdicts are unknown (a View retry fell outside the broker's dedupe window)
-    RecordsRejected, ///< 15: checked writes: a BATCH (a claimBatch of >= 2 records, a Tier-2 batch of >= 2, or a BatchAck of >= 2)
+    RecordsRejected, ///< 15: checked writes: a BATCH (a claimBatch of >= 2 records, a raw non-atomic Tier-2 batch of >= 2, or a non-atomic BatchAck of >= 2; an atomic batch is all or nothing: BrokerError)
                      ///< was stored and judged, and one or more of its records was rejected.  value = the batch's base offset
                      ///< (record 0), or -1 if unknown; errorCode / constraintIdOf(c) = the FIRST rejection's code / constraint
                      ///< id; the payload lists every rejection (read it with BatchVerdicts).  All accepted is a plain Ok with an
-                     ///< empty payload.  A 1-record claim / Tier-2 batch keeps single-record semantics (BrokerError, value -1).
+                     ///< empty payload.  A 1-record claim / Tier-2 batch keeps single-record semantics (BrokerError, value = the record's offset).
 };
 
 /// Authentication (codes 44..48, client version 9): the name of an auth-related Completion::errorCode when
@@ -110,6 +110,8 @@ enum class OpStatus : uint8_t {
     case 59: return "ViewKeyExpressionInvalid";
     case 60: return "ViewConstraintInvalid";
     case 61: return "ViewUniqueInvalid";
+    case 62: return "TxnTooLarge";
+    case 63: return "TxnConflict";
     default: return nullptr;
     }
 }

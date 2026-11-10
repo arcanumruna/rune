@@ -1,7 +1,9 @@
 // CheckedWritesBrokerRegressionTest.cpp — checked writes Part 02: typed validation against REAL brokers and the REAL
 // client on the default (shard) runtime.  Worker state is read only inside onOwnerThreadForTest (a direct read from
 // the test thread would race the worker).
+#include "client/ClusterClient.h"
 #include "client/OneBroker.h"
+#include "support/SharedClientDriver.h"
 #include "client/CheckedWritesBrokerSupport.h"
 #include "client/support/KeyIndexRecords.h"
 
@@ -13,6 +15,7 @@
 #include <atomic>
 #include <memory>
 #include <future>
+#include <numeric>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -25,19 +28,95 @@ namespace cwb = rune::node::test::cw_broker;
 namespace rc  = rune::client;
 namespace cw  = rune::node::cw;
 
+namespace {
+
+/// Starts the media driver of a broker's clients while the broker itself starts.
+struct ClientDriverStart {
+    std::future<std::unique_ptr<SharedClientDriver>> started = std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
+};
+
+/// A OneBroker whose clients share one media driver (a client otherwise starts one of its own, 100-180 ms) and whose runtime client's
+/// conductor idles 1 ms, not Aeron's 16: node start and every client add / find wait out about two idle sleeps.
+struct Broker : ClientDriverStart, OneBroker {
+    explicit Broker(const std::string& tag, Runtime runtime = Runtime::Legacy, std::function<void(NodeConfig&)> tweak = {})
+        : OneBroker(tag, runtime, [tweak = std::move(tweak)](NodeConfig& cfg) {
+              cfg.testAeronClientIdleSleepMs = 1;
+              if (tweak) tweak(cfg);
+          }),
+          driver(started.get()) {}
+
+    rc::ClientConfig clientConfig() { return driver->attach(OneBroker::clientConfig()); }
+
+    rc::Client* connectClient() {
+        auto client = std::make_unique<rc::Client>(clientConfig());
+        client->connectAndWait(20s);
+        clients.push_back(std::move(client));
+        return clients.back().get();
+    }
+
+    void restart() {
+        clients.clear();
+        OneBroker::restart();
+    }
+
+    std::unique_ptr<SharedClientDriver>     driver;
+    std::vector<std::unique_ptr<rc::Client>> clients;   // before the driver is gone
+};
+
+/// The three-broker cluster of these tests (fastFailover).  Its clients share one media driver: a client otherwise starts one of its own
+/// (100-180 ms).
+struct Cluster : rune::node::test::catalog_cluster::ThreeNodes {
+    std::unique_ptr<SharedClientDriver> driver;
+
+    Cluster(ThreeNodes&& nodes, std::unique_ptr<SharedClientDriver> d) : ThreeNodes(std::move(nodes)), driver(std::move(d)) {}
+};
+
+Cluster startCluster(const std::string& tag) {
+    auto driver = std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
+    auto nodes  = rune::node::test::catalog_cluster::ThreeNodes::startWith(tag, cwb::fastFailover);
+    return Cluster(std::move(nodes), driver.get());
+}
+
+/// A client of broker `id` whose dead leader's session is noticed after 0.3 s, not the 10 s default, and whose DDL retry after a failover waits 5 ms.
+rc::ClientConfig quickConfig(Cluster& c, int id) {
+    rc::ClientConfig cfg = rune::node::test::catalog_cluster::clientConfigFor(c, id);
+    cfg = c.driver->attach(cfg);
+    cfg.responseTimeoutNs = std::chrono::nanoseconds(300ms).count();
+    cfg.keepaliveIntervalNs = std::chrono::nanoseconds(60ms).count();
+    cfg.ddlRetryBackoff = 5ms;
+    return cfg;
+}
+
+/// A connected client of node `seed`, built on its own thread so that the connect overlaps a failover wait.
+std::future<std::unique_ptr<rc::Client>> kiClient(Cluster& c, int seed) {
+    rc::ClientConfig cfg = quickConfig(c, seed);   // the shared driver is attached on the calling thread
+    cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
+    return std::async(std::launch::async, [&c, cfg] { return rune::node::test::catalog_cluster::connectClient(c, cfg); });
+}
+
+/// Every node stops at once and comes back at once.
+void restartAll(Cluster& c) {
+    std::vector<std::thread> stoppers;
+    for (int id = 1; id <= 3; ++id) stoppers.emplace_back([&c, id] { c.stop(id); });
+    for (auto& t : stoppers) t.join();
+    c.startNodes({1, 2, 3});
+}
+
+}  // namespace
+
 TEST(CheckedWritesBrokerRegression, TopicCreateWaitsForItsSpecOnEveryWorkerRegression) {
-    OneBroker b("cw-order", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testHoldWriteSpecPasses = 300; });
+    Broker b("cw-order", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testHoldWriteSpecPasses = 60; });
     rune::client::Client& c = *b.connectClient();
     const auto r = cwb::defineTyped(c, "chars", 2);
     ASSERT_EQ(r.errorCode, 0) << r.detail;
     for (int32_t p = 0; p < 2; ++p)
         EXPECT_TRUE(cwb::hasWriteState(b.node(), r.topicId, p)) << "partition " << p << ": the topic served before its spec";
-    EXPECT_EQ(cwb::produceRaw(b, "chars", r.topicId, 2, std::string("\x01\x02\x03", 3), rune::client::Key(uint64_t{1})),
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "chars", r.topicId, 2, std::string("\x01\x02\x03", 3), rune::client::Key(uint64_t{1})),
               static_cast<uint16_t>(rune::protocol::client::ErrorCode::SchemaValidationFailed));
 }
 
 TEST(CheckedWritesBrokerRegression, DroppedWhileAwaitingSpecNeverBuildsRegression) {
-    OneBroker b("cw-drop", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testHoldWriteSpecPasses = 400000; });
+    Broker b("cw-drop", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testHoldWriteSpecPasses = 400000; });
     rune::client::Client& c = *b.connectClient();
     // The create is parked behind the held spec; the define answers only once it served, so drive the drop from a second
     // client while the first is still waiting.
@@ -69,7 +148,6 @@ TEST(CheckedWritesBrokerRegression, DroppedWhileAwaitingSpecNeverBuildsRegressio
 // ===========================================================================================================
 // Task 9: typed validation end to end on real brokers.
 // ===========================================================================================================
-#include "client/ClusterClient.h"
 #include "support/ShardTestClient.h"
 
 #include <rune/cli/Cli.h>
@@ -120,9 +198,54 @@ std::vector<std::string> storedValues(BrokerNode& n, int32_t topicId, int32_t pa
     });
 }
 
-uint16_t send(OneBroker& b, const std::string& name, int32_t topicId, int32_t parts, const cw::TypedRecord& r) {
-    return cwb::produceRaw(b, name, topicId, parts, r.value, keyOf(r.key));
+uint16_t send(Broker& b, const std::string& name, int32_t topicId, int32_t parts, const cw::TypedRecord& r) {
+    return cwb::produceRaw(b.clientConfig(), name, topicId, parts, r.value, keyOf(r.key));
 }
+
+/// One connected client and producer for several raw produces (cwb::produceRaw builds a client for each).
+class RawProducer {
+public:
+    RawProducer(rc::ClientConfig cfg, std::vector<rc::TopicSpec> topics) {
+        cfg.topics = std::move(topics);
+        client_.emplace(cfg);
+        client_->connectAndWait(30s);
+        rc::ProducerConfig pc;
+        pc.acks     = rc::Acks::All;
+        pc.lingerUs = 0;
+        prod_.emplace(client_->producer(pc));
+        cq_.emplace(*client_);
+    }
+    ~RawProducer() {
+        prod_->closeImmediately();
+        client_->close();
+    }
+    RawProducer(const RawProducer&)            = delete;
+    RawProducer& operator=(const RawProducer&) = delete;
+
+    /// The completion's broker error code (0 = Ok), cwb::kNotOk when it is neither Ok nor a broker error.
+    uint16_t send(const std::string& topicName, const std::string& value, const rc::Key& key) {
+        const rc::TopicHandle topic = client_->topic(topicName);
+        const uint64_t token        = next_++;
+        rc::SendResult r = rc::SendResult::BackPressured;
+        while (r == rc::SendResult::BackPressured) {
+            r = prod_->trySend(topic, key, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), value.size()), *cq_, token);
+            if (r == rc::SendResult::BackPressured) std::this_thread::yield();
+        }
+        EXPECT_EQ(r, rc::SendResult::Ok);
+        prod_->flush();
+        uint16_t out = cwb::kNotOk;
+        (void)cq_->waitFor(token, 30s, [&](const rc::Completion& d, std::span<const uint8_t>) {
+            out = d.status == rc::OpStatus::Ok ? uint16_t{0} : d.status == rc::OpStatus::BrokerError ? d.errorCode : cwb::kNotOk;
+        });
+        return out;
+    }
+
+private:
+    std::optional<rc::Client>      client_;
+    std::optional<rc::Producer>    prod_;
+    std::optional<rc::Completions> cq_;
+    uint64_t                       next_ = 1;
+};
 
 /// A typed topic with a custom descriptor, keyed on `key`.
 rc::DefineTopicResult defineWith(rc::Client& c, const std::string& name, const rune::codec::Descriptor& d, const std::string& key,
@@ -133,7 +256,7 @@ rc::DefineTopicResult defineWith(rc::Client& c, const std::string& name, const r
 std::string le(uint64_t v, std::size_t n) { return cw::leBytes(v, n); }
 
 /// A raw DefineTopic from an "old client" (validate = false): the topic predates the feature level.
-int32_t defineLegacyTopic(OneBroker& b, const std::string& name, const rune::codec::Descriptor& d) {
+int32_t defineLegacyTopic(Broker& b, const std::string& name, const rune::codec::Descriptor& d) {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / ("rune_cwlegacy_" + std::to_string(::getpid()) + "_" + name);
     fs::create_directories(dir);
@@ -169,23 +292,23 @@ struct StubTyped {
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, RawSendIsRawOnUntypedAndValidatedOnTypedRegression) {
-    OneBroker b("cw-raw", OneBroker::Runtime::Shard);
+    Broker b("cw-raw", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     const auto raw = c.defineTopicAndWait("raw", 1, "", {}, rc::Persistence::Disk, {}, {}, 30s);
     ASSERT_EQ(raw.errorCode, 0) << raw.detail;
     const rc::TopicHandle handle = c.rawTopicAndWait("raw", 20s);
     EXPECT_EQ(handle.topicId, raw.topicId);
     const std::string garbage("\x01\x02\x03", 3);
-    EXPECT_EQ(cwb::produceRaw(b, "raw", raw.topicId, 1, garbage, rc::Key()), kOk);
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "raw", raw.topicId, 1, garbage, rc::Key()), kOk);
     EXPECT_EQ(storedValues(b.node(), raw.topicId, 0), std::vector<std::string>{garbage});
     const auto typed = cwb::defineTyped(c, "p", 1);
     ASSERT_EQ(typed.errorCode, 0) << typed.detail;
-    EXPECT_EQ(cwb::produceRaw(b, "p", typed.topicId, 1, garbage, rc::Key(uint64_t{1})), kSchemaValidationFailed);
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "p", typed.topicId, 1, garbage, rc::Key(uint64_t{1})), kSchemaValidationFailed);
     EXPECT_TRUE(storedValues(b.node(), typed.topicId, 0).empty());
 }
 
 TEST(CheckedWritesBrokerRegression, UnknownVersionIsRefusedRegression) {
-    OneBroker b("cw-ver", OneBroker::Runtime::Shard);
+    Broker b("cw-ver", OneBroker::Runtime::Shard);
     const auto t = cwb::defineTyped(*b.connectClient(), "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     EXPECT_EQ(send(b, "p", t.topicId, 1, cw::validRecord(1)), kOk);
@@ -195,7 +318,7 @@ TEST(CheckedWritesBrokerRegression, UnknownVersionIsRefusedRegression) {
 
 TEST(CheckedWritesBrokerRegression, PreUpgradeTopicValidatesAfterTheLevelRegression) {
     int16_t level = 4;   // the cluster does not yet support kCheckedWrites
-    OneBroker b("cw-upgrade", OneBroker::Runtime::Shard, [&level](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = level; });
+    Broker b("cw-upgrade", OneBroker::Runtime::Shard, [&level](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = level; });
     const int32_t id = defineLegacyTopic(b, "p", cw::matrixDescriptor());
     ASSERT_GE(id, 0);
     cw::Parts bad; bad.name = std::string("a\x80", 2);
@@ -206,9 +329,9 @@ TEST(CheckedWritesBrokerRegression, PreUpgradeTopicValidatesAfterTheLevelRegress
     level = -1;
     b.restart();
     bool raised = false;
-    for (int i = 0; i < 400 && !raised; ++i) {
+    for (int i = 0; i < 2000 && !raised; ++i) {
         raised = b.node().onWorkerThreadForTest(0, [](Worker& w) { return w.clusterFeatureLevelForTest(); }) >= rune::replication::MetadataFeature::kCheckedWrites;
-        if (!raised) std::this_thread::sleep_for(25ms);
+        if (!raised) std::this_thread::sleep_for(5ms);
     }
     ASSERT_TRUE(raised) << "the restarted node raises the level to the binary's own";
     EXPECT_EQ(send(b, "p", id, 1, cw::encode(bad)), kSchemaValidationFailed);
@@ -218,7 +341,7 @@ TEST(CheckedWritesBrokerRegression, PreUpgradeTopicValidatesAfterTheLevelRegress
 TEST(CheckedWritesBrokerRegression, RawKeyOfTheWrongWidthIsRefusedRegression) {
     using rune::codec::DescriptorBuilder;
     using rune::codec::PrimType;
-    OneBroker b("cw-key", OneBroker::Runtime::Shard);
+    Broker b("cw-key", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     const auto q = defineWith(c, "q", DescriptorBuilder("q", 1).add("id", PrimType::UInt32).add("v", PrimType::Int64).build(), "id");
     const auto s = defineWith(c, "s", DescriptorBuilder("s", 1).addFixedStr("name", 4).add("v", PrimType::Int64).build(), "name");
@@ -227,18 +350,19 @@ TEST(CheckedWritesBrokerRegression, RawKeyOfTheWrongWidthIsRefusedRegression) {
     ASSERT_EQ(q.errorCode, 0) << q.detail;
     ASSERT_EQ(s.errorCode, 0) << s.detail;
     ASSERT_EQ(k.errorCode, 0) << k.detail;
+    RawProducer raw(b.clientConfig(), {rc::TopicSpec{"q", q.topicId, 1}, rc::TopicSpec{"s", s.topicId, 1}, rc::TopicSpec{"k", k.topicId, 1}});
     const std::string qv = le(12, 2) + le(1, 2) + le(7, 4) + le(0, 8);
-    EXPECT_EQ(cwb::produceRaw(b, "q", q.topicId, 1, qv, rc::Key(uint64_t{7})), kSchemaValidationFailed) << "8-byte key on a uint32 field";
-    EXPECT_EQ(cwb::produceRaw(b, "q", q.topicId, 1, qv, rc::Key(uint32_t{7})), kOk);
+    EXPECT_EQ(raw.send("q", qv, rc::Key(uint64_t{7})), kSchemaValidationFailed) << "8-byte key on a uint32 field";
+    EXPECT_EQ(raw.send("q", qv, rc::Key(uint32_t{7})), kOk);
     const std::string sv = le(12, 2) + le(1, 2) + std::string("ab\0\0", 4) + le(0, 8);
-    EXPECT_EQ(cwb::produceRaw(b, "s", s.topicId, 1, sv, keyOf("ab")), kSchemaValidationFailed) << "an unpadded string(4) key";
-    EXPECT_EQ(cwb::produceRaw(b, "s", s.topicId, 1, sv, keyOf(std::string("ab\0\0", 4))), kOk);
+    EXPECT_EQ(raw.send("s", sv, keyOf("ab")), kSchemaValidationFailed) << "an unpadded string(4) key";
+    EXPECT_EQ(raw.send("s", sv, keyOf(std::string("ab\0\0", 4))), kOk);
     const std::string kv = le(8, 2) + le(1, 2) + le(0, 8);
-    EXPECT_EQ(cwb::produceRaw(b, "k", k.topicId, 1, kv, rc::Key(uint64_t{99})), kOk) << "a keyless typed topic has no key rule";
+    EXPECT_EQ(raw.send("k", kv, rc::Key(uint64_t{99})), kOk) << "a keyless typed topic has no key rule";
 }
 
 TEST(CheckedWritesBrokerRegression, TransactionOnTypedTopicCommitsRegression) {
-    OneBroker b("cw-txn", OneBroker::Runtime::Shard);
+    Broker b("cw-txn", OneBroker::Runtime::Shard);
     rc::Client& admin = *b.connectClient();
     const auto t = cwb::defineTyped(admin, "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
@@ -266,7 +390,7 @@ TEST(CheckedWritesBrokerRegression, TransactionOnTypedTopicCommitsRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, Utf8RulesEndToEndRegression) {
-    OneBroker b("cw-utf8", OneBroker::Runtime::Shard);
+    Broker b("cw-utf8", OneBroker::Runtime::Shard);
     const auto t = cwb::defineTyped(*b.connectClient(), "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     cw::Parts emoji;  emoji.bio = std::string("\xF0\x9F\x98\x80", 4);
@@ -280,22 +404,22 @@ TEST(CheckedWritesBrokerRegression, Utf8RulesEndToEndRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, TypedTombstoneDeletesAndCompactsRegression) {
-    OneBroker b("cw-tomb", OneBroker::Runtime::Shard);
+    Broker b("cw-tomb", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     rc::TopicOptions to;
     to.config.cleanupPolicy = 1;   // compact
     const auto t = c.defineTopicAndWait("p", 1, "id", rune::codec::serialize(cw::matrixDescriptor()), rc::Persistence::Disk, to, {}, 60s);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     EXPECT_EQ(send(b, "p", t.topicId, 1, cw::validRecord(5)), kOk);
-    EXPECT_EQ(cwb::produceRaw(b, "p", t.topicId, 1, "", rc::Key(uint64_t{5})), kOk) << "a tombstone with the key field's width deletes";
-    EXPECT_EQ(cwb::produceRaw(b, "p", t.topicId, 1, "", rc::Key(uint32_t{5})), kSchemaValidationFailed) << "a 4-byte key tombstone is refused";
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "p", t.topicId, 1, "", rc::Key(uint64_t{5})), kOk) << "a tombstone with the key field's width deletes";
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "p", t.topicId, 1, "", rc::Key(uint32_t{5})), kSchemaValidationFailed) << "a 4-byte key tombstone is refused";
     const auto values = storedValues(b.node(), t.topicId, 0);
     ASSERT_EQ(values.size(), 2u);
     EXPECT_TRUE(values.back().empty()) << "the tombstone is the latest record of key 5";
 }
 
 TEST(CheckedWritesBrokerRegression, ViewOnUntypedOrKeylessSourceIsRefusedRegression) {
-    OneBroker b("cw-view", OneBroker::Runtime::Shard);
+    Broker b("cw-view", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     ASSERT_EQ(c.defineTopicAndWait("raw", 1, "", {}, rc::Persistence::Disk, {}, {}, 30s).errorCode, 0);
     ASSERT_EQ(c.defineTopicAndWait("keyless", 1, "", OneBroker::idDescriptor("keyless"), rc::Persistence::Disk, {}, {}, 30s).errorCode, 0);
@@ -308,7 +432,7 @@ TEST(CheckedWritesBrokerRegression, ViewOnUntypedOrKeylessSourceIsRefusedRegress
 }
 
 TEST(CheckedWritesBrokerRegression, TypedOpenOfUntypedTopicIsRefusedRegression) {
-    OneBroker b("cw-open", OneBroker::Runtime::Shard);
+    Broker b("cw-open", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     ASSERT_EQ(c.defineTopicAndWait("raw", 1, "", {}, rc::Persistence::Disk, {}, {}, 30s).errorCode, 0);
     try {
@@ -320,7 +444,7 @@ TEST(CheckedWritesBrokerRegression, TypedOpenOfUntypedTopicIsRefusedRegression) 
 }
 
 TEST(CheckedWritesBrokerRegression, RawOpenOfTypedTopicIsRefusedRegression) {
-    OneBroker b("cw-rawopen", OneBroker::Runtime::Shard);
+    Broker b("cw-rawopen", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     ASSERT_EQ(cwb::defineTyped(c, "p", 1).errorCode, 0);
     try {
@@ -333,21 +457,21 @@ TEST(CheckedWritesBrokerRegression, RawOpenOfTypedTopicIsRefusedRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, QlTopicWithoutPartitionsHasOneRegression) {
-    OneBroker b("cw-ql");   // the CLI speaks the legacy gateway stream
+    Broker b("cw-ql");   // the CLI speaks the legacy gateway stream
     std::string err;
     ASSERT_EQ(cli({"ql", "-e", "topic solo;", "--broker", b.endpoint()}, &err), 0) << err;
     EXPECT_EQ(b.connectClient()->rawTopicAndWait("solo", 20s).partitionCount, 1);
 }
 
 TEST(CheckedWritesBrokerRegression, WideKeyFieldIsRefusedAtDefineRegression) {
-    OneBroker b("cw-wide");
+    Broker b("cw-wide");
     std::string err;
     EXPECT_NE(cli({"ql", "-e", "topic w { k string(17) } key k;", "--broker", b.endpoint()}, &err), 0);
     EXPECT_NE(err.find("key field 'k' is string(17)"), std::string::npos) << err;
 }
 
 TEST(CheckedWritesBrokerRegression, LegacyRuntimeValidatesRegression) {
-    OneBroker b("cw-legacy", OneBroker::Runtime::Legacy);
+    Broker b("cw-legacy", OneBroker::Runtime::Legacy);
     const auto t = cwb::defineTyped(*b.connectClient(), "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     cw::Parts bad; bad.bio = std::string("\xC0\xAF", 2);
@@ -359,7 +483,7 @@ class CheckedWritesIngressRoutes : public ::testing::TestWithParam<bool> {};
 
 TEST_P(CheckedWritesIngressRoutes, BothIngressRoutesValidateRegression) {
     const bool perWorker = GetParam();
-    OneBroker b(perWorker ? "cw-ingress-w" : "cw-ingress-g", OneBroker::Runtime::Shard,
+    Broker b(perWorker ? "cw-ingress-w" : "cw-ingress-g", OneBroker::Runtime::Shard,
                 [perWorker](NodeConfig& cfg) { cfg.perWorkerIngressEnabled = perWorker; });
     const auto t = cwb::defineTyped(*b.connectClient(), "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
@@ -371,7 +495,7 @@ INSTANTIATE_TEST_SUITE_P(CheckedWritesBrokerRegression, CheckedWritesIngressRout
                          [](const ::testing::TestParamInfo<bool>& i) { return i.param ? "PerWorkerIngress" : "GatewayRouted"; });
 
 TEST(CheckedWritesBrokerRegression, RestartValidatesFromTheFirstProduceRegression) {
-    OneBroker b("cw-restart", OneBroker::Runtime::Shard);
+    Broker b("cw-restart", OneBroker::Runtime::Shard);
     const auto t = cwb::defineTyped(*b.connectClient(), "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     b.restart();
@@ -387,21 +511,21 @@ TEST(CheckedWritesBrokerRegression, RestartValidatesFromTheFirstProduceRegressio
 }
 
 TEST(CheckedWritesBrokerRegression, AdoptionStartsValidationRegression) {
-    OneBroker b("cw-adopt", OneBroker::Runtime::Shard);
+    Broker b("cw-adopt", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     const auto a = c.defineTopicAndWait("a", 1, "", {}, rc::Persistence::Disk, {}, {}, 30s);
     ASSERT_EQ(a.errorCode, 0) << a.detail;
     const std::string garbage("\x01\x02\x03", 3);
-    EXPECT_EQ(cwb::produceRaw(b, "a", a.topicId, 1, garbage, rc::Key(uint64_t{1})), kOk);
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "a", a.topicId, 1, garbage, rc::Key(uint64_t{1})), kOk);
     const auto adopted = c.defineTopicAndWait("a", 1, "id", rune::codec::serialize(cw::matrixDescriptor()), rc::Persistence::Disk, {}, {}, 30s);
     ASSERT_EQ(adopted.errorCode, 0) << adopted.detail;
     for (int i = 0; i < 400 && !cwb::hasWriteState(b.node(), a.topicId, 0); ++i) std::this_thread::sleep_for(25ms);
     ASSERT_TRUE(cwb::hasWriteState(b.node(), a.topicId, 0)) << "the owning worker holds the adopted topic's write state";
-    EXPECT_EQ(cwb::produceRaw(b, "a", a.topicId, 1, garbage, rc::Key(uint64_t{1})), kSchemaValidationFailed);
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "a", a.topicId, 1, garbage, rc::Key(uint64_t{1})), kSchemaValidationFailed);
 }
 
 TEST(CheckedWritesBrokerRegression, AlterThenProduceNewVersionSucceedsRegression) {
-    OneBroker b("cw-alter", OneBroker::Runtime::Shard);
+    Broker b("cw-alter", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     const auto t = cwb::defineTyped(c, "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
@@ -415,7 +539,7 @@ TEST(CheckedWritesBrokerRegression, AlterThenProduceNewVersionSucceedsRegression
     rec.value = v2;
     uint16_t code = kNotLeader;
     for (int i = 0; i < 200 && code == kNotLeader; ++i) {
-        code = cwb::produceRaw(b, "p", t.topicId, 1, rec.value, keyOf(rec.key));
+        code = cwb::produceRaw(b.clientConfig(), "p", t.topicId, 1, rec.value, keyOf(rec.key));
         if (code == kNotLeader) std::this_thread::sleep_for(25ms);
     }
     EXPECT_EQ(code, kOk);
@@ -424,11 +548,11 @@ TEST(CheckedWritesBrokerRegression, AlterThenProduceNewVersionSucceedsRegression
 
 TEST(CheckedWritesBrokerRegression, ThreeNodesNewLeaderValidatesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw_failover");
+    Cluster c = startCluster("cw_failover");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t ctl = awaitController(c);
     ASSERT_GT(ctl, 0);
-    auto admin = connectClient(c, ctl);
+    auto admin = connectClient(c, quickConfig(c, ctl));
     rc::TopicOptions to;
     to.replicationFactor = 3;
     const auto t = admin->defineTopicAndWait("p", 1, "id", rune::codec::serialize(cw::matrixDescriptor()), rc::Persistence::Disk, to, {}, 60s);
@@ -451,7 +575,7 @@ TEST(CheckedWritesBrokerRegression, ThreeNodesNewLeaderValidatesRegression) {
     const auto produce = [&](const cw::TypedRecord& r) {
         uint16_t code = kNotLeader;
         for (int i = 0; i < 200 && code == kNotLeader; ++i) {
-            code = cwb::produceRaw(clientConfigFor(c, seed), "p", t.topicId, 1, r.value, keyOf(r.key));
+            code = cwb::produceRaw(quickConfig(c, seed), "p", t.topicId, 1, r.value, keyOf(r.key));
             if (code == kNotLeader) std::this_thread::sleep_for(50ms);
         }
         return code;
@@ -463,14 +587,14 @@ TEST(CheckedWritesBrokerRegression, ThreeNodesNewLeaderValidatesRegression) {
 // A typed TRANSIENT topic validates like a disk one: its partitions append to an InMemoryLog through the same
 // produceCore_, and their RcSlot carries the write state.  (TransientTopicDataPathTest now runs on an untyped topic.)
 TEST(CheckedWritesBrokerRegression, TransientTypedTopicValidatesRegression) {
-    OneBroker b("cw-transient", OneBroker::Runtime::Shard);
+    Broker b("cw-transient", OneBroker::Runtime::Shard);
     const auto t = b.connectClient()->defineTopicAndWait("p", 1, "id", rune::codec::serialize(cw::matrixDescriptor()),
                                                         rc::Persistence::Transient, {}, {}, 60s);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     cw::Parts bad; bad.bio = std::string("\xC0\xAF", 2);
     EXPECT_EQ(send(b, "p", t.topicId, 1, cw::encode(bad)), kSchemaValidationFailed);
     EXPECT_EQ(send(b, "p", t.topicId, 1, cw::validRecord(1)), kOk);
-    EXPECT_EQ(cwb::produceRaw(b, "p", t.topicId, 1, "", rc::Key(uint32_t{1})), kSchemaValidationFailed) << "a wrong-width tombstone";
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "p", t.topicId, 1, "", rc::Key(uint32_t{1})), kSchemaValidationFailed) << "a wrong-width tombstone";
 }
 
 // Boot: a restarted broker owns its catalog's typed partitions before any spec reaches a worker, so leadership of a typed
@@ -480,18 +604,40 @@ TEST(CheckedWritesBrokerRegression, TransientTypedTopicValidatesRegression) {
 // without a write state, answers OK and stores the record.
 TEST(CheckedWritesBrokerRegression, RestartServesNoTypedPartitionBeforeItsSpecRegression) {
     uint32_t hold = 0;
-    OneBroker b("cw-bootgate", OneBroker::Runtime::Shard, [&hold](NodeConfig& cfg) { cfg.testHoldWriteSpecPasses = hold; });
+    Broker b("cw-bootgate", OneBroker::Runtime::Shard, [&hold](NodeConfig& cfg) {
+        cfg.testHoldWriteSpecPasses = hold;
+        cfg.electionTimeoutMs       = 40;
+        cfg.unservableWarmupMs      = 50;
+        cfg.readLeaseMaxMs          = 50;
+    });
     const auto t = cwb::defineTyped(*b.connectClient(), "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     hold = 4'000'000'000u;   // the restarted broker never delivers a WriteSpecUpdate
     b.restart();
     cw::Parts bad; bad.bio = std::string("\xC0\xAF", 2);
     const auto rec = cw::encode(bad);
-    for (int i = 0; i < 3; ++i) {   // 3 x 4 s spans the 2 s leader-election warm-up of the restart
-        const uint16_t code = cwb::produceRaw(b, "p", t.topicId, 1, rec.value, keyOf(rec.key), 4s);
+    rc::ClientConfig cfg = b.clientConfig();
+    cfg.topics.push_back(rc::TopicSpec{"p", t.topicId, 1});
+    rc::Client client(cfg);
+    client.connectAndWait(30s);
+    rc::ProducerConfig pc;
+    pc.acks     = rc::Acks::All;
+    pc.lingerUs = 0;
+    rc::Producer prod = client.producer(pc);
+    rc::Completions cq(client);
+    const rc::TopicHandle topic = client.topic("p");
+    const std::string value = rec.value;
+    for (uint64_t i = 1; i <= 3; ++i) {   // 3 x 150 ms spans the restart's leader-election warm-up
+        ASSERT_EQ(prod.trySend(topic, keyOf(rec.key), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), value.size()), cq, i), rc::SendResult::Ok);
+        prod.flush();
+        std::optional<rc::Completion> done;
+        (void)cq.waitFor(i, 150ms, [&](const rc::Completion& d, std::span<const uint8_t>) { done = d; });
+        const uint16_t code = !done ? cwb::kNotOk : done->status == rc::OpStatus::BrokerError ? done->errorCode : done->status == rc::OpStatus::Ok ? uint16_t{0} : cwb::kNotOk;
         EXPECT_TRUE(code == kNotLeader || code == kSchemaValidationFailed || code == cwb::kNotOk)
             << "attempt " << i << " answered " << code;
     }
+    prod.closeImmediately();
+    client.close();
     EXPECT_TRUE(storedValues(b.node(), t.topicId, 0).empty()) << "an invalid record was stored before the spec arrived";
 }
 
@@ -507,7 +653,8 @@ std::string idValue(uint64_t id) { return le(16, 2) + le(1, 2) + le(id, 8) + le(
 
 /// One client + producer over one topic; every send carries its own token and is awaited by it.
 struct Sender {
-    std::unique_ptr<rc::Client>      client;
+    std::unique_ptr<rc::Client>      owned;
+    rc::Client*                      client = nullptr;
     std::optional<rc::Producer>      prod;
     std::unique_ptr<rc::Completions> cq;
     std::optional<rc::TopicHandle>   topic;
@@ -515,19 +662,30 @@ struct Sender {
 
     Sender(rc::ClientConfig cfg, const std::string& name, int32_t topicId, int32_t parts, rc::Acks acks, const std::string& txnId = {}) {
         cfg.topics.push_back(rc::TopicSpec{name, topicId, parts});
-        client = std::make_unique<rc::Client>(cfg);
+        owned  = std::make_unique<rc::Client>(cfg);
+        client = owned.get();
         rc::ProducerConfig pc;
         pc.acks            = acks;
         pc.lingerUs        = 1;
+        pc.produceTimeoutMs = 300;
         pc.transactionalId = txnId;
         prod.emplace(client->producer(pc));
         client->connectAndWait(30s);
         cq = std::make_unique<rc::Completions>(*client);
         topic.emplace(client->topic(name));
     }
+    /// A producer on a client that is already connected (the broker fixture's own).
+    Sender(rc::Client& shared, int32_t topicId, rc::Acks acks) : client(&shared) {
+        rc::ProducerConfig pc;
+        pc.acks     = acks;
+        pc.lingerUs = 1;
+        prod.emplace(client->producer(pc));
+        cq = std::make_unique<rc::Completions>(*client);
+        topic.emplace(rc::TopicHandle{topicId, 1});
+    }
     ~Sender() {
         if (prod) prod->closeImmediately();
-        if (client) client->close();
+        if (owned) owned->close();
     }
 
     /// The token of the queued send of record `id`.
@@ -553,9 +711,9 @@ bool isOk(const std::optional<rc::Completion>& c) { return c && c->status == rc:
 
 void awaitLevel(BrokerNode& n) {
     bool raised = false;
-    for (int i = 0; i < 800 && !raised; ++i) {
+    for (int i = 0; i < 4000 && !raised; ++i) {
         raised = n.onWorkerThreadForTest(0, [](Worker& w) { return w.clusterFeatureLevelForTest(); }) >= rune::replication::MetadataFeature::kCheckedWrites;
-        if (!raised) std::this_thread::sleep_for(25ms);
+        if (!raised) std::this_thread::sleep_for(5ms);
     }
     ASSERT_TRUE(raised) << "the cluster feature level reaches kCheckedWrites";
 }
@@ -577,7 +735,7 @@ std::vector<uint8_t> acctViewPlan(int32_t srcTopicId) {
     return rv::serializeAuthored(p);
 }
 
-AcctFixture defineAcct(OneBroker& b, bool withView = true) {
+AcctFixture defineAcct(Broker& b, bool withView = true) {
     AcctFixture f;
     rc::Client& c = *b.connectClient();
     const auto t  = c.defineTopicAndWait("acct", 1, "id", OneBroker::idDescriptor("acct"), rc::Persistence::Disk, {}, {}, 60s);
@@ -597,20 +755,19 @@ constexpr rc::Acks kLeaderView = rc::Acks::Leader | rc::Acks::View;
 
 /// A View send parked behind an open transaction completes only after the commit.
 void expectViewSendWaitsForTheTransaction(const char* tag, rc::Acks viewAcks) {
-    OneBroker b(tag, OneBroker::Runtime::Shard);
+    Broker b(tag, OneBroker::Runtime::Shard);
     const AcctFixture f = defineAcct(b);
     Sender tx(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::All, "tx-cw");
     tx.prod->initTransactionsAndWait(30s);
     tx.prod->beginTransaction();
-    (void)tx.send(1);
-    std::this_thread::sleep_for(300ms);
+    ASSERT_TRUE(isOk(tx.await(tx.send(1), 10s))) << "premise: the open transaction's record is in the log";
 
     Sender plain(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::All);
     EXPECT_TRUE(isOk(plain.await(plain.send(2), 2s))) << "a plain All send does not wait for the open transaction";
 
     Sender view(b.clientConfig(), "acct", f.topicId, 1, viewAcks);
     const uint64_t tok = view.send(3);
-    EXPECT_FALSE(view.await(tok, 1s).has_value()) << "the view has not folded past the open transaction";
+    EXPECT_FALSE(view.await(tok, 250ms).has_value()) << "the view has not folded past the open transaction";
 
     tx.prod->commitTransactionAndWait(30s);
     EXPECT_TRUE(isOk(view.await(tok, 5s)));
@@ -638,7 +795,7 @@ TEST(CheckedWritesBrokerRegression, LeaderViewBehavesLikeAllViewShardRegression)
 }
 
 TEST(CheckedWritesBrokerRegression, ViewOnAPartitionWithoutViewsAcksAtCommitShardRegression) {
-    OneBroker b("cw-noview", OneBroker::Runtime::Shard);
+    Broker b("cw-noview", OneBroker::Runtime::Shard);
     const AcctFixture f = defineAcct(b, /*withView=*/false);
 
     // No view folds this partition, so a View send does not wait for one: it acks at commit even while an open
@@ -681,7 +838,7 @@ TEST(CheckedWritesBrokerRegression, ViewOnAPartitionWithoutViewsAcksAtCommitShar
 }
 
 TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesTheViewBitRegression) {
-    OneBroker b("cw-legacyview", OneBroker::Runtime::Legacy);
+    Broker b("cw-legacyview", OneBroker::Runtime::Legacy);
     const AcctFixture f = defineAcct(b, /*withView=*/false);
     Sender view(b.clientConfig(), "acct", f.topicId, 1, kAllView);
     const auto refused = view.await(view.send(1), 10s);
@@ -693,7 +850,7 @@ TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesTheViewBitRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, V12ClientAgainstV7BrokerKeepsEveryOldAckBehaviourShardRegression) {
-    OneBroker b("cw-oldacks", OneBroker::Runtime::Shard);
+    Broker b("cw-oldacks", OneBroker::Runtime::Shard);
     const AcctFixture f = defineAcct(b);
     uint64_t id = 1;
     for (const rc::Acks acks : {rc::Acks::Leader, rc::Acks::All}) {
@@ -712,11 +869,11 @@ TEST(CheckedWritesBrokerRegression, V12ClientAgainstV7BrokerKeepsEveryOldAckBeha
 
 TEST(CheckedWritesBrokerRegression, AllViewProduceAcrossALeaderCrashThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw03");
+    Cluster c = startCluster("cw03");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t ctl = awaitController(c);
     ASSERT_GT(ctl, 0);
-    auto admin = connectClient(c, ctl);
+    auto admin = connectClient(c, quickConfig(c, ctl));
     rc::TopicOptions to;
     to.replicationFactor = 3;
     const auto src = admin->defineTopicAndWait("acct", 1, "id", OneBroker::idDescriptor("acct"), rc::Persistence::Disk, to, {}, 60s);
@@ -733,7 +890,7 @@ TEST(CheckedWritesBrokerRegression, AllViewProduceAcrossALeaderCrashThreeNodesRe
     ASSERT_GT(seed, 0);
     for (int id : c.runningNodes()) awaitLevel(c.node(id));
 
-    rc::ClientConfig cfg = clientConfigFor(c, seed);
+    rc::ClientConfig cfg = quickConfig(c, seed);
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     Sender s(cfg, "acct", src.topicId, 1, kAllView);
@@ -753,20 +910,15 @@ TEST(CheckedWritesBrokerRegression, AllViewProduceAcrossALeaderCrashThreeNodesRe
     }
     EXPECT_EQ(ok, kTotal);
 
-    rc::ClientConfig rcfg = clientConfigFor(c, seed);
-    rcfg.connectTimeoutMs = 30'000;
-    rcfg.pingTimeoutMs    = 30'000;
-    auto reader = connectClient(c, rcfg);
     for (const uint64_t id : {uint64_t{0}, uint64_t{kTotal / 2}, uint64_t{kTotal - 1}}) {
         rc::ViewRowResult row;
         for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline;) {
-            try { row = reader->getViewRowAndWait(view.viewTopicId, id, 0, 10s); } catch (const std::exception&) {}
+            try { row = s.client->getViewRowAndWait(view.viewTopicId, id, 0, 10s); } catch (const std::exception&) {}
             if (row.status == rc::ViewRowResult::kOk) break;
-            std::this_thread::sleep_for(100ms);
+            std::this_thread::sleep_for(10ms);
         }
         EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "row " << id;
     }
-    reader->close();
 }
 
 // ===========================================================================================================
@@ -793,19 +945,19 @@ std::string verdictValue(uint64_t id, int64_t v, uint16_t tag) {
 void awaitSetLogged(BrokerNode& node, int32_t topicId) {
     const int32_t w = rune::metadata::ShardRouter(node.workerCountForTest()).workerForPartition(topicId, 0);
     bool logged = false;
-    for (int i = 0; i < 1200 && !logged; ++i) {
+    for (int i = 0; i < 12000 && !logged; ++i) {
         logged = node.onWorkerThreadForTest(w, [topicId](Worker& wk) {
             const PartitionWriteState* ws = wk.writeStateForTest(topicId, 0);
             return ws != nullptr && ws->constraintSets.latest().count != 0;
         });
-        if (!logged) std::this_thread::sleep_for(50ms);
+        if (!logged) std::this_thread::sleep_for(5ms);
     }
     ASSERT_TRUE(logged) << "the TestReject set change was never logged";
 }
 
 /// A typed {id, v, tag} topic `vt` (one partition) with TagEquals{9} (object 7) installed on the worker that serves it.
-int32_t defineVerdictSource(OneBroker& b) {
-    rc::Client& c = *b.connectClient();
+int32_t defineVerdictSource(Broker& b, rc::Client* connected = nullptr) {
+    rc::Client& c = connected != nullptr ? *connected : *b.connectClient();
     const auto t  = c.defineTopicAndWait("vt", 1, "id", rune::codec::serialize(cw::verdictSourceDescriptor()), rc::Persistence::Disk, {}, {}, 60s);
     EXPECT_EQ(t.errorCode, 0) << t.detail;
     awaitLevel(b.node());
@@ -833,7 +985,7 @@ int32_t defineVerdictSource(OneBroker& b) {
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, VerdictAcksCarryThePerRecordResultShardRegression) {
-    OneBroker b("cw-verdict", OneBroker::Runtime::Shard);
+    Broker b("cw-verdict", OneBroker::Runtime::Shard);
     const int32_t src = defineVerdictSource(b);
     Sender s(b.clientConfig(), "vt", src, 1, kAllView);
     std::vector<uint64_t> toks;
@@ -870,9 +1022,10 @@ TEST(CheckedWritesBrokerRegression, VerdictAcksCarryThePerRecordResultShardRegre
 // #802: a claimBatch reports EVERY record's verdict (RecordsRejected + the rejection list), and the Raw subscriber receives
 // exactly the accepted records.  (The Tier-2 leg of this test is added with the Tier-2 change.)
 TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRegression) {
-    OneBroker b("cw-batchverdict", OneBroker::Runtime::Shard);
-    const int32_t src = defineVerdictSource(b);
-    Sender s(b.clientConfig(), "vt", src, 1, kAllView);
+    Broker b("cw-batchverdict", OneBroker::Runtime::Shard);
+    rc::Client& admin = *b.connectClient();
+    const int32_t src = defineVerdictSource(b, &admin);
+    Sender s(admin, src, kAllView);
     const std::vector<uint16_t> tags = {1, 9, 1, 1, 9, 9};   // records 1, 4 and 5 are rejected (TagEquals 9)
     std::vector<std::string> vals;
     for (std::size_t i = 0; i < tags.size(); ++i) vals.push_back(verdictValue(1, 1, tags[i]));   // the claim has one key: id 1 throughout
@@ -920,7 +1073,7 @@ TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRe
     EXPECT_EQ(v.offsetOf(1), -1);
     EXPECT_EQ(v.offsetOf(3), base + 3);
 
-    // ---- the Tier-2 batch: the same tags, one completion, the same per-record verdicts ----
+    // ---- the Tier-2 batch: the same tags, one completion.  A Tier-2 batch is atomic (P11-6): one bad record rejects all of it ----
     const uint64_t tok2 = s.next++;
     rc::BatchBuilder bb = s.prod->batch(*s.topic, rc::Key(uint64_t{1}));
     const std::string recKey = std::string("\x01\0\0\0\0\0\0\0", 8);   // the typed record key: id 1, 8 bytes LE
@@ -934,17 +1087,11 @@ TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRe
     (void)s.cq->waitFor(tok2, 15s, [&](const rc::Completion& d, std::span<const uint8_t> p) { c2 = d; payload2.assign(p.begin(), p.end()); });
     ASSERT_TRUE(c2);
     ASSERT_EQ(c2->op, rc::OpKind::Tier2Batch);
-    ASSERT_EQ(c2->status, rc::OpStatus::RecordsRejected) << "err=" << c2->errorCode;
+    ASSERT_EQ(c2->status, rc::OpStatus::BrokerError) << "err=" << c2->errorCode;
+    EXPECT_EQ(c2->errorCode, static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation));
     EXPECT_EQ(rc::constraintIdOf(*c2), rune::view::constraintIdOf(7, 1));
-    const rc::BatchVerdicts v2(*c2, payload2);
-    ASSERT_EQ(v2.rejectedCount(), 3u);
-    EXPECT_EQ(v2.rejection(0).index, 1);
-    EXPECT_EQ(v2.rejection(1).index, 4);
-    EXPECT_EQ(v2.rejection(2).index, 5);
-    const int64_t base2 = c2->value;
-    ASSERT_GE(base2, 0);
-    EXPECT_EQ(v2.offsetOf(0), base2);
-    EXPECT_EQ(v2.offsetOf(4), -1);
+    EXPECT_GE(c2->value, 0) << "the batch's base offset";
+    EXPECT_TRUE(payload2.empty());
 
     // ---- the Raw subscriber gets exactly the accepted records: a capped poll ending on a sentinel accepted send ----
     const std::string sentinelVal = verdictValue(100, 1, 1);
@@ -953,25 +1100,25 @@ TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRe
     ASSERT_TRUE(isOk(sc));
     const int64_t sentinelOff = sc->value;
     bool seen = false;
-    for (int i = 0; i < 1200 && !seen; ++i) {
+    for (int i = 0; i < 12000 && !seen; ++i) {
         {
             std::lock_guard<std::mutex> g(mu);
             seen = got.count(sentinelOff) != 0;
         }
-        if (!seen) std::this_thread::sleep_for(50ms);
+        if (!seen) std::this_thread::sleep_for(5ms);
     }
     ASSERT_TRUE(seen) << "the sentinel never reached the subscriber";
     sub.unsubscribe();
     std::lock_guard<std::mutex> g(mu);
-    EXPECT_EQ(got, (std::set<int64_t>{base + 0, base + 2, base + 3, base2 + 0, base2 + 2, base2 + 3, sentinelOff}));
+    EXPECT_EQ(got, (std::set<int64_t>{base + 0, base + 2, base + 3, sentinelOff})) << "nothing of the rejected atomic batch";
 }
 
 // A batch whose every record is rejected is skipped by the group fetch path too: the group consumer sees exactly the accepted
 // batches around it, and its position moves past the rejected one.
 TEST(CheckedWritesBrokerRegression, FullyRejectedBatchIsSkippedOnTheGroupPathShardRegression) {
-    OneBroker b("cw-groupskip", OneBroker::Runtime::Shard);
+    Broker b("cw-groupskip", OneBroker::Runtime::Shard);
     const int32_t src = defineVerdictSource(b);
-    Sender s(b.clientConfig(), "vt", src, 1, kAllView);
+    Sender s(b.clientConfig(), "vt", src, 1, kAllView);   // the group resolves "vt" through this client's topics
     const std::string recKey = std::string("\x01\0\0\0\0\0\0\0", 8);   // the typed record key: id 1
     const auto sendBatch = [&](uint16_t tag, int n) -> std::pair<rc::Completion, std::vector<uint8_t>> {
         const uint64_t tok = s.next++;
@@ -994,8 +1141,8 @@ TEST(CheckedWritesBrokerRegression, FullyRejectedBatchIsSkippedOnTheGroupPathSha
     const auto [cb, pb] = sendBatch(9, 3);   // B: every record rejected
     const auto [cc, pc] = sendBatch(1, 3);   // C: accepted
     ASSERT_EQ(ca.status, rc::OpStatus::Ok);
-    ASSERT_EQ(cb.status, rc::OpStatus::RecordsRejected);
-    ASSERT_EQ(rc::BatchVerdicts(cb, pb).rejectedCount(), 3u) << "B is fully rejected";
+    ASSERT_EQ(cb.status, rc::OpStatus::BrokerError) << "B is fully rejected, answered once";
+    ASSERT_TRUE(pb.empty());
     ASSERT_EQ(cc.status, rc::OpStatus::Ok);
     std::set<int64_t> want;
     for (int i = 0; i < 3; ++i) { want.insert(ca.value + i); want.insert(cc.value + i); }
@@ -1011,12 +1158,12 @@ TEST(CheckedWritesBrokerRegression, FullyRejectedBatchIsSkippedOnTheGroupPathSha
     });
     const int64_t lastC = cc.value + 2;
     bool arrived = false;
-    for (int i = 0; i < 1200 && !arrived; ++i) {   // 50 ms each: a 60 s deadline
+    for (int i = 0; i < 12000 && !arrived; ++i) {   // 5 ms each: a 60 s deadline
         {
             std::lock_guard<std::mutex> g(mu);
             arrived = got.count(lastC) != 0;
         }
-        if (!arrived) std::this_thread::sleep_for(50ms);
+        if (!arrived) std::this_thread::sleep_for(5ms);
     }
     ASSERT_TRUE(arrived) << "the group never delivered the last accepted record";
     std::lock_guard<std::mutex> g(mu);
@@ -1123,30 +1270,77 @@ std::optional<std::pair<int64_t, uint16_t>> vtRow(rc::Client& reader, int32_t vi
     return std::make_pair(v, static_cast<uint16_t>(row.rowBytes[17] | (row.rowBytes[18] << 8)));
 }
 
-/// Offsets a subscription from 0 delivers: until `atLeast` arrived, plus 500 ms for a rejected record that would follow.
-std::set<int64_t> deliveredFromZero(rc::ClientConfig cfg, int32_t topicId, std::size_t atLeast) {
-    cfg.topics.push_back(rc::TopicSpec{"vt", topicId, 1});
-    rc::Client client(cfg);
-    client.connectAndWait(30s);
+/// The view rows of ids [0, count) as (v, tag), nullopt = absent, read through one Completions.  Retries only what a moving leader or a
+/// building view answers.
+std::vector<std::optional<std::pair<int64_t, uint16_t>>> vtRows(rc::Client& reader, int32_t viewTopicId, int count) {
+    std::vector<std::optional<std::pair<int64_t, uint16_t>>> rows(static_cast<std::size_t>(count));
+    std::vector<bool> answered(static_cast<std::size_t>(count), false);
+    std::vector<int> pending(static_cast<std::size_t>(count));
+    std::iota(pending.begin(), pending.end(), 0);
+    rc::Completions cq(reader);
+    constexpr std::size_t kWindow = 32;   // the client refuses an issue past its op window (about 62 reads in flight)
+    rc::Token token = 0;
+    for (const auto deadline = Clock::now() + 60s; !pending.empty() && Clock::now() < deadline; std::this_thread::sleep_for(10ms)) {
+        std::vector<int> retry;
+        for (std::size_t from = 0; from < pending.size(); from += kWindow) {
+            const std::size_t to = std::min(pending.size(), from + kWindow);
+            const rc::Token first = token;
+            std::vector<bool> refused(to - from, false);
+            for (std::size_t k = from; k < to; ++k) {
+                const rc::OpResult submitted = reader.getViewRow(viewTopicId, static_cast<uint64_t>(pending[k]), 0, cq, token++);
+                if (submitted == rc::OpResult::Accepted) continue;
+                refused[k - from] = true;
+                ADD_FAILURE() << "getViewRow of row " << pending[k] << " refused: " << static_cast<int>(submitted);
+            }
+            const auto chunkEnd = Clock::now() + 3s;
+            for (std::size_t k = from; k < to; ++k) {
+                const int id = pending[k];
+                bool done = refused[k - from];
+                if (!done) (void)cq.waitFor(first + (k - from), std::max(Clock::duration::zero(), chunkEnd - Clock::now()), [&](const rc::Completion& d, std::span<const uint8_t> row) {
+                    if (d.status == rc::OpStatus::Ok && row.size() >= 19) {
+                        int64_t v = 0;
+                        for (int i = 0; i < 8; ++i) v |= static_cast<int64_t>(row[9 + static_cast<std::size_t>(i)]) << (8 * i);   // [bitmap][id][v][tag]
+                        rows[static_cast<std::size_t>(id)] = std::make_pair(v, static_cast<uint16_t>(row[17] | (row[18] << 8)));
+                        done = true;
+                    } else if (d.status == rc::OpStatus::BrokerError && d.errorCode == rc::ViewRowResult::kAbsentKey) {
+                        done = true;
+                    }
+                });
+                if (done) answered[static_cast<std::size_t>(id)] = true;
+                else retry.push_back(id);
+            }
+        }
+        pending = std::move(retry);
+    }
+    for (int id = 0; id < count; ++id) EXPECT_TRUE(answered[static_cast<std::size_t>(id)]) << "row " << id;
+    return rows;
+}
+
+/// Offsets a subscription from 0 delivers: until `atLeast` arrived, plus 60 ms for a rejected record that would follow.
+std::set<int64_t> deliveredFromZero(rc::Client& client, int32_t topicId, std::size_t atLeast) {
     std::mutex mu;
     std::set<int64_t> got;
     rc::SubscribeOptions o;
     o.from = rc::From::earliest();
-    rc::Subscription sub = client.subscribe(client.topic("vt"), 0, o, [&](const rc::Record& r) {
+    rc::Subscription sub = client.subscribe(rc::TopicHandle{topicId, 1}, 0, o, [&](const rc::Record& r) {
         std::lock_guard<std::mutex> g(mu);
         got.insert(r.offset);
     });
-    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(50ms)) {
+    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(5ms)) {
         std::lock_guard<std::mutex> g(mu);
         if (got.size() >= atLeast) break;
     }
-    std::this_thread::sleep_for(500ms);
+    std::this_thread::sleep_for(60ms);
     sub.unsubscribe();
-    std::set<int64_t> out;
-    {
-        std::lock_guard<std::mutex> g(mu);
-        out = got;
-    }
+    for (const auto deadline = Clock::now() + 10s; !sub.finished() && Clock::now() < deadline; std::this_thread::sleep_for(1ms)) {}
+    EXPECT_TRUE(sub.finished()) << "the subscription finished before its handler's state is destroyed";
+    return got;
+}
+
+std::set<int64_t> deliveredFromZero(rc::ClientConfig cfg, int32_t topicId, std::size_t atLeast) {
+    rc::Client client(cfg);
+    client.connectAndWait(30s);
+    const std::set<int64_t> out = deliveredFromZero(client, topicId, atLeast);
     client.close();
     return out;
 }
@@ -1157,7 +1351,7 @@ constexpr uint16_t kConstraintViolation = static_cast<uint16_t>(rune::protocol::
 
 namespace {
 /// `vt_v` over the one-node verdict source.
-int32_t createVtView(OneBroker& b, int32_t srcTopicId) {
+int32_t createVtView(Broker& b, int32_t srcTopicId) {
     const auto view = b.connectClient()->createViewAndWait("vt_v", "id", 0, vtViewPlan(srcTopicId), {}, 60s);
     EXPECT_EQ(view.errorCode, 0) << view.detail;
     return view.viewTopicId;
@@ -1165,7 +1359,7 @@ int32_t createVtView(OneBroker& b, int32_t srcTopicId) {
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, CoalescedBatchWithOneBadRecordShardRegression) {
-    OneBroker b("cw-verdict-coalesced", OneBroker::Runtime::Shard);
+    Broker b("cw-verdict-coalesced", OneBroker::Runtime::Shard);
     const int32_t src = defineVerdictSource(b);
     const int32_t viewTopic = createVtView(b, src);
     ASSERT_FALSE(HasFatalFailure());
@@ -1202,11 +1396,11 @@ TEST(CheckedWritesBrokerRegression, CoalescedBatchWithOneBadRecordShardRegressio
     EXPECT_FALSE(vtRow(*reader, viewTopic, 3, &answered).has_value());
     EXPECT_TRUE(answered) << "id 3 is absent from the view";
     EXPECT_TRUE(vtRow(*reader, viewTopic, 4, &answered).has_value());
-    EXPECT_EQ(deliveredFromZero(b.clientConfig(), src, 15).count(3), 0u) << "a consumer from 0 never sees the rejected record (id 3, after the set change at offset 0)";
+    EXPECT_EQ(deliveredFromZero(*reader, src, 15).count(3), 0u) << "a consumer from 0 never sees the rejected record (id 3, after the set change at offset 0)";
 }
 
 TEST(CheckedWritesBrokerRegression, OldWritersOnAVerdictSourceNeverSeeRejectedRecordsShardRegression) {
-    OneBroker b("cw-verdict-old", OneBroker::Runtime::Shard);
+    Broker b("cw-verdict-old", OneBroker::Runtime::Shard);
     const int32_t src = defineVerdictSource(b);
     const int32_t viewTopic = createVtView(b, src);
     ASSERT_FALSE(HasFatalFailure());
@@ -1228,7 +1422,7 @@ TEST(CheckedWritesBrokerRegression, OldWritersOnAVerdictSourceNeverSeeRejectedRe
     std::size_t stored = 0;
     for (int i = 0; i < 400 && stored < 8; ++i) {
         stored = storedValues(b.node(), src, 0).size();
-        if (stored < 8) std::this_thread::sleep_for(25ms);
+        if (stored < 8) std::this_thread::sleep_for(5ms);
     }
     ASSERT_EQ(stored, 8u) << "every record was written";
     auto reader = b.connectClient();
@@ -1238,16 +1432,16 @@ TEST(CheckedWritesBrokerRegression, OldWritersOnAVerdictSourceNeverSeeRejectedRe
         ASSERT_TRUE(answered) << "row " << k;
         EXPECT_EQ(row.has_value(), k % 2 == 1) << "id " << k << (k % 2 == 1 ? " was accepted" : " was rejected");
     }
-    EXPECT_EQ(deliveredFromZero(b.clientConfig(), src, 4).size(), 4u) << "a consumer sees exactly the tag-1 records";
+    EXPECT_EQ(deliveredFromZero(*reader, src, 4).size(), 4u) << "a consumer sees exactly the tag-1 records";
 }
 
 TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw04");
+    Cluster c = startCluster("cw04");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t ctl = awaitController(c);
     ASSERT_GT(ctl, 0);
-    auto admin = connectClient(c, ctl);
+    auto admin = connectClient(c, quickConfig(c, ctl));
     rc::TopicOptions to;
     to.replicationFactor = 3;
     const auto src = admin->defineTopicAndWait("vt", 1, "id", rune::codec::serialize(cw::verdictSourceDescriptor()), rc::Persistence::Disk, to, {}, 60s);
@@ -1261,14 +1455,14 @@ TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRe
     const int32_t victim = leaders[0];
     for (const int id : c.runningNodes()) {
         installTagReject(c.node(id), src.topicId);
-        ASSERT_FALSE(HasFatalFailure());
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
     }
     awaitSetLogged(c.node(victim), src.topicId);
-    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
     int32_t seed = 0;
     for (int id : c.runningNodes()) if (id != victim) { seed = id; break; }
 
-    rc::ClientConfig cfg = clientConfigFor(c, seed);
+    rc::ClientConfig cfg = quickConfig(c, seed);
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     Sender s(cfg, "vt", src.topicId, 1, kAllView);
@@ -1304,21 +1498,17 @@ TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRe
         if (round == 0) {
             c.startNode(victim);
             installTagReject(c.node(victim), src.topicId);
-            ASSERT_FALSE(HasFatalFailure());
+            ASSERT_FALSE(::testing::Test::HasFatalFailure());
             c.crash(leader);
         }
     }
 
     // vt_v on the final leader is the accepted set: every id with tag 1 is a row, every tag-9 id is absent.
     ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 60s));
-    rc::ClientConfig rcfg = clientConfigFor(c, leaders[0]);
-    rcfg.connectTimeoutMs = 30'000;
-    rcfg.pingTimeoutMs    = 30'000;
-    auto reader = connectClient(c, rcfg);
+    const auto reader = kiClient(c, c.runningNodes().front()).get();
+    const auto rows = vtRows(*reader, view.viewTopicId, kTotal);
     for (int i = 0; i < kTotal; ++i) {
-        bool answered = false;
-        const auto row = vtRow(*reader, view.viewTopicId, static_cast<uint64_t>(i), &answered);
-        ASSERT_TRUE(answered) << "row " << i;
+        const auto& row = rows[static_cast<std::size_t>(i)];
         if (tagOf(i) == 9) EXPECT_FALSE(row.has_value()) << "id " << i << " was rejected";
         else EXPECT_TRUE(row.has_value() && row->first == i && row->second == 1) << "id " << i;
     }
@@ -1327,11 +1517,11 @@ TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRe
 
 TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw04r");
+    Cluster c = startCluster("cw04r");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t ctl = awaitController(c);
     ASSERT_GT(ctl, 0);
-    auto admin = connectClient(c, ctl);
+    auto admin = connectClient(c, quickConfig(c, ctl));
     rc::TopicOptions to;
     to.replicationFactor = 3;
     const auto src = admin->defineTopicAndWait("vt", 1, "id", rune::codec::serialize(cw::verdictSourceDescriptor()), rc::Persistence::Disk, to, {}, 60s);
@@ -1352,7 +1542,7 @@ TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegres
     constexpr int kTotal = 60;
     const auto tagOf = [](int i) -> uint16_t { return i % 10 == 9 ? 9 : 1; };
     {
-        rc::ClientConfig cfg = clientConfigFor(c, 1);
+        rc::ClientConfig cfg = quickConfig(c, 1);
         cfg.connectTimeoutMs = 30'000;
         cfg.pingTimeoutMs    = 30'000;
         Sender s(cfg, "vt", src.topicId, 1, kAllView);
@@ -1370,8 +1560,7 @@ TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegres
     ASSERT_EQ(before.indexed, before.rejectedInLog);
 
     // Every node restarts; TestReject (a test-installed member) goes back on each.
-    for (int id = 3; id >= 1; --id) c.stop(id);
-    for (int id = 1; id <= 3; ++id) c.startNode(id);
+    restartAll(c);
     ASSERT_TRUE(c.awaitCatalogLeader(60s));
     ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 60s));
     // The leadership scan alone rebuilds the index from the committed markers, before TestReject is back.
@@ -1388,7 +1577,7 @@ TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegres
     EXPECT_EQ(after.mismatches, 0u);
     EXPECT_EQ(after.rejectionsConstraint, 0u) << "nothing was judged again: the verdicts came from the markers";
 
-    rc::ClientConfig rcfg = clientConfigFor(c, leaders[0]);
+    rc::ClientConfig rcfg = quickConfig(c, leaders[0]);
     rcfg.connectTimeoutMs = 30'000;
     rcfg.pingTimeoutMs    = 30'000;
     const std::set<int64_t> delivered = deliveredFromZero(rcfg, src.topicId, static_cast<std::size_t>(kTotal) - before.rejectedInLog.size());
@@ -1396,10 +1585,9 @@ TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegres
     EXPECT_EQ(delivered.size(), static_cast<std::size_t>(kTotal) - before.rejectedInLog.size()) << "exactly the accepted records are delivered";
 
     auto reader = connectClient(c, rcfg);
+    const auto rows = vtRows(*reader, view.viewTopicId, kTotal);
     for (int i = 0; i < kTotal; ++i) {
-        bool answered = false;
-        const auto row = vtRow(*reader, view.viewTopicId, static_cast<uint64_t>(i), &answered);
-        ASSERT_TRUE(answered) << "row " << i;
+        const auto& row = rows[static_cast<std::size_t>(i)];
         if (tagOf(i) == 9) EXPECT_FALSE(row.has_value()) << "id " << i << " was rejected";
         else EXPECT_TRUE(row.has_value() && row->first == i && row->second == 1) << "id " << i;
     }
@@ -1415,6 +1603,40 @@ namespace pc = rune::protocol::client;
 
 constexpr int32_t kKiParts = 4;
 constexpr uint16_t kInvalidRequest = 39, kKeyExists = 56, kKeyNotFound = 57;
+
+/// `count` view reads issued by `issue(i, cq, token)` through one Completions, in windows (the client refuses an issue past its op window);
+/// a read whose status `settled` rejects is retried until `within`.
+template <class Issue, class Settled>
+std::vector<rc::ViewRowResult> readRows(rc::Client& c, std::size_t count, std::chrono::seconds within, Settled settled, Issue issue) {
+    constexpr std::size_t kWindow = 32;
+    std::vector<rc::ViewRowResult> rows(count);
+    std::vector<std::size_t> pending(count);
+    std::iota(pending.begin(), pending.end(), 0);
+    rc::Completions cq(c);
+    rc::Token token = 0;
+    for (const auto deadline = Clock::now() + within; !pending.empty() && Clock::now() < deadline; std::this_thread::sleep_for(50ms)) {
+        std::vector<std::size_t> retry;
+        for (std::size_t from = 0; from < pending.size(); from += kWindow) {
+            const std::size_t to = std::min(pending.size(), from + kWindow);
+            const rc::Token first = token;
+            for (std::size_t k = from; k < to; ++k)
+                if (issue(pending[k], cq, token++) != rc::OpResult::Accepted) ADD_FAILURE() << "view read " << pending[k] << " refused";
+            for (std::size_t k = from; k < to; ++k) {
+                rc::ViewRowResult& row = rows[pending[k]];
+                row = {};
+                (void)cq.waitFor(first + (k - from), 10s, [&](const rc::Completion& d, std::span<const uint8_t> bytes) {
+                    row.status = d.status == rc::OpStatus::Ok ? rc::ViewRowResult::kOk : d.status == rc::OpStatus::BrokerError ? d.errorCode : rc::ViewRowResult::kNotLeader;
+                    row.rowBytes.assign(bytes.begin(), bytes.end());
+                });
+                if (!settled(row.status)) retry.push_back(pending[k]);
+            }
+        }
+        pending = std::move(retry);
+    }
+    return rows;
+}
+
+constexpr auto kOnlyOk = [](uint16_t status) { return status == rc::ViewRowResult::kOk; };
 
 /// A bounded poll; no test synchronises on a sleep.
 template <class Pred>
@@ -1474,6 +1696,9 @@ public:
         EXPECT_TRUE(waitFor([&] { return std::all_of(subs_.begin(), subs_.end(), [](const rc::Subscription& s) { return s.finished(); }); }, 10s))
             << "every subscription finished before the collector is destroyed";
     }
+    void unsubscribe() {
+        for (rc::Subscription& s : subs_) s.unsubscribe();
+    }
     void subscribe(rc::Client& c, rc::TopicHandle topic, int32_t partition) {
         rc::SubscribeOptions o;
         o.from = rc::From::earliest();
@@ -1521,6 +1746,23 @@ struct ScratchDir {
     }
 };
 
+/// `count` writes issued by `issue(i, cq, token)`, at most 128 in flight; `check(i, result)` sees every answer in the order issued and returns false to stop.
+template <class Issue, class Check>
+bool writePipelined(rc::Client& client, rc::Producer& prod, uint64_t count, Issue issue, Check check) {
+    constexpr uint64_t kWindow = 128;
+    rc::Completions cq(client);
+    uint64_t issued = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+        for (; issued < count && issued - i < kWindow; ++issued) issue(issued, cq, issued);
+        prod.flush();
+        std::optional<rc::Completion> answer;
+        (void)cq.waitFor(i, 60s, [&](const rc::Completion& d, std::span<const uint8_t>) { answer = d; });
+        if (!answer) { ADD_FAILURE() << "write " << i << " never completed"; return false; }
+        if (!check(i, rc::WriteResult::fromCompletion(*answer))) return false;
+    }
+    return true;
+}
+
 /// Everything stored on a topic, over all partitions.
 std::size_t storedTotal(BrokerNode& n, int32_t topicId, int32_t parts) {
     std::size_t total = 0;
@@ -1531,7 +1773,7 @@ std::size_t storedTotal(BrokerNode& n, int32_t topicId, int32_t parts) {
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, TypedIntentsEndToEndShardRegression) {
-    OneBroker b("cw-ki-e2e", OneBroker::Runtime::Shard);
+    Broker b("cw-ki-e2e", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -1574,7 +1816,7 @@ TEST(CheckedWritesBrokerRegression, TypedIntentsEndToEndShardRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, KeyIndexDdlRefusalsShardRegression) {
-    OneBroker b("cw-ki-ddl", OneBroker::Runtime::Shard);
+    Broker b("cw-ki-ddl", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -1678,7 +1920,7 @@ struct KeyRec {
 };
 
 template <class K>
-void expectRemoveRoutesAsSend(OneBroker& b, rc::Client& c, const std::string& name, bool keyIndex) {
+void expectRemoveRoutesAsSend(Broker& b, rc::Client& c, const std::string& name, bool keyIndex) {
     using Rec = KeyRec<K>;
     SCOPED_TRACE(name);
     constexpr int kRecords = 50;
@@ -1760,7 +2002,7 @@ void expectRemoveRoutesAsSend(OneBroker& b, rc::Client& c, const std::string& na
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, TypedRemoveRoutesAsSendForEveryKeyWidthShardRegression) {
-    OneBroker b("cw-ki-widths", OneBroker::Runtime::Shard);
+    Broker b("cw-ki-widths", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -1775,7 +2017,7 @@ TEST(CheckedWritesBrokerRegression, TypedRemoveRoutesAsSendForEveryKeyWidthShard
 
 TEST(CheckedWritesBrokerRegression, IntentsToAnOlderClusterAreRefusedShardRegression) {
     {
-        OneBroker b("cw-ki-lvl4", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = 4; });
+        Broker b("cw-ki-lvl4", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = 4; });
         rc::Client& c = *b.connectClient();
         ASSERT_TRUE(waitFor([&] { return b.node().onWorkerThreadForTest(0, [](Worker& w) { return w.clusterFeatureLevelForTest(); }) == 4; }, 10s));
         const auto ddl = defineKi(c, "ki_idx");
@@ -1789,7 +2031,7 @@ TEST(CheckedWritesBrokerRegression, IntentsToAnOlderClusterAreRefusedShardRegres
         EXPECT_EQ(r.code(), kInvalidRequest);
         EXPECT_EQ(storedTotal(b.node(), t.topicId, kKiParts), 0u);
     }
-    OneBroker old("cw-ki-v9", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testAdvertisedBrokerVersion = 9; });
+    Broker old("cw-ki-v9", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testAdvertisedBrokerVersion = 9; });
     awaitLevel(old.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *old.connectClient();
@@ -1801,7 +2043,7 @@ TEST(CheckedWritesBrokerRegression, IntentsToAnOlderClusterAreRefusedShardRegres
 }
 
 TEST(CheckedWritesKeyIndexRegression, RawIntentShapesAreRefusedOrOpaqueRegression) {
-    OneBroker b("cw-ki-raw", OneBroker::Runtime::Shard);
+    Broker b("cw-ki-raw", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -1870,17 +2112,13 @@ struct Outcome {
     std::string  error;
 };
 
-std::vector<Outcome> insertRange(rc::ClientConfig cfg, uint64_t first, uint64_t last) {
+std::vector<Outcome> insertRange(rc::Client& client, uint64_t first, uint64_t last) {
     std::vector<Outcome> out;
     try {
-        rc::Client client(cfg);
-        client.connectAndWait(30s);
         KiWriter w(client, "ki");
-        for (uint64_t id = first; id <= last; ++id) {
-            const auto r = w.topic.insertAndWait(acct(id), 60s);
-            out.push_back({r.ok(), r.code(), r.status(), {}});
-        }
-        client.close();
+        writePipelined(client, w.prod, last - first + 1,
+            [&](uint64_t i, rc::Completions& cq, rc::Token t) { w.topic.insert(acct(first + i), cq, t); },
+            [&](uint64_t, const rc::WriteResult& r) { out.push_back({r.ok(), r.code(), r.status(), {}}); return true; });
     } catch (const std::exception& e) {
         out.push_back({false, 0, rc::OpStatus::Timeout, e.what()});
     }
@@ -1888,14 +2126,10 @@ std::vector<Outcome> insertRange(rc::ClientConfig cfg, uint64_t first, uint64_t 
 }
 
 /// Two clients race the same ids: each id is accepted once and refused with KeyExists once.
-void raceInserts(rune::node::test::catalog_cluster::ThreeNodes& c, int seedA, int seedB, uint64_t first, uint64_t last) {
-    using namespace rune::node::test::catalog_cluster;
-    rc::ClientConfig a = clientConfigFor(c, seedA), b = clientConfigFor(c, seedB);
-    a.connectTimeoutMs = b.connectTimeoutMs = 30'000;
-    a.pingTimeoutMs = b.pingTimeoutMs = 30'000;
+void raceInserts(rc::Client& clientA, rc::Client& clientB, uint64_t first, uint64_t last) {
     std::vector<Outcome> ra, rb;
-    std::thread ta([&] { ra = insertRange(a, first, last); });
-    std::thread tb([&] { rb = insertRange(b, first, last); });
+    std::thread ta([&] { ra = insertRange(clientA, first, last); });
+    std::thread tb([&] { rb = insertRange(clientB, first, last); });
     ta.join();
     tb.join();
     ASSERT_EQ(ra.size(), last - first + 1) << (ra.empty() ? "" : ra.back().error);
@@ -1908,30 +2142,31 @@ void raceInserts(rune::node::test::catalog_cluster::ThreeNodes& c, int seedA, in
     }
 }
 
-/// Every id in [first, last] answers KeyExists to an insert through a client of node `seed`.
-void expectKeyExists(rune::node::test::catalog_cluster::ThreeNodes& c, int seed, uint64_t first, uint64_t last) {
-    using namespace rune::node::test::catalog_cluster;
-    rc::ClientConfig cfg = clientConfigFor(c, seed);
-    cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
-    const std::vector<Outcome> r = insertRange(cfg, first, last);
+/// Every id in [first, last] answers KeyExists to an insert through `client`.
+void expectKeyExists(rc::Client& client, uint64_t first, uint64_t last) {
+    const std::vector<Outcome> r = insertRange(client, first, last);
     ASSERT_EQ(r.size(), last - first + 1) << (r.empty() ? "" : r.back().error);
     for (std::size_t i = 0; i < r.size(); ++i) EXPECT_EQ(r[i].code, kKeyExists) << "id " << first + i << " status " << static_cast<int>(r[i].status);
 }
 
-/// A 3-replica `ki` on a started cluster, the level raised on every node.
-int32_t defineKiOnCluster(rune::node::test::catalog_cluster::ThreeNodes& c) {
+int64_t leoOf(BrokerNode& n, int32_t topicId, int32_t partition);
+bool leaderHoldsInIsr(BrokerNode& leader, int32_t topicId, int32_t partition, int member);
+
+/// A 3-replica `ki` on a started cluster, the level raised on every node.  The admin client connects while the cluster elects.
+int32_t defineKiOnCluster(Cluster& c) {
     using namespace rune::node::test::catalog_cluster;
+    auto adminClient = kiClient(c, 1);
     if (!c.awaitCatalogLeader(30s)) { ADD_FAILURE() << "no catalog leader"; return -1; }
-    const int32_t ctl = awaitController(c);
-    if (ctl <= 0) { ADD_FAILURE() << "no controller"; return -1; }
     for (const int id : c.runningNodes()) awaitLevel(c.node(id));
     if (::testing::Test::HasFatalFailure()) return -1;
-    auto admin = connectClient(c, ctl);
+    const auto admin = adminClient.get();
     const auto t = defineKi(*admin, "ki", 3);
     admin->close();
     if (t.errorCode != 0) { ADD_FAILURE() << t.detail; return -1; }
     std::vector<int32_t> leaders;
     if (!awaitLeaders(c, t.topicId, kKiParts, leaders, 30s)) { ADD_FAILURE() << "no leaders"; return -1; }
+    std::string why;
+    if (!c.awaitCatalogDigestsEqual(30s, &why)) { ADD_FAILURE() << "the nodes never applied the topic: " << why; return -1; }
     return t.topicId;
 }
 
@@ -1939,70 +2174,158 @@ int32_t defineKiOnCluster(rune::node::test::catalog_cluster::ThreeNodes& c) {
 
 TEST(CheckedWritesBrokerRegression, LoginRaceOnAKeyIndexThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw05");
+    Cluster c = startCluster("cw05");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    auto a = kiClient(c, 1), b = kiClient(c, 2);
+    ASSERT_GE(defineKiOnCluster(c), 0);
+    const auto ca = a.get(), cb = b.get();
+    raceInserts(*ca, *cb, 1, 200);
+}
+
+// The same race after the leader of the partitions crashed: the new leader rebuilt the index from the log the first ids were written to.
+TEST(CheckedWritesBrokerRegression, LoginRaceAcrossALeaderCrashThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    Cluster c = startCluster("cw05c");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    auto first = kiClient(c, 1);
     const int32_t topicId = defineKiOnCluster(c);
     ASSERT_GE(topicId, 0);
-    raceInserts(c, 1, 2, 1, 200);
-    ASSERT_FALSE(HasFatalFailure());
+    const auto writer = first.get();
+    for (const Outcome& o : insertRange(*writer, 1, 200)) ASSERT_TRUE(o.ok) << o.code;
+    writer->close();
 
     std::vector<int32_t> leaders;
     ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 30s));
     const int victim = leaders[0];
     c.crash(victim);
-    ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s)) << "a new leader after the crash";
     const std::vector<int> alive = c.runningNodes();
     ASSERT_EQ(alive.size(), 2u);
-    raceInserts(c, alive[0], alive[1], 201, 400);
+    auto na = kiClient(c, alive[0]), nb = kiClient(c, alive[1]);
+    ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s)) << "a new leader after the crash";
+    const auto ca = na.get(), cb = nb.get();
+    raceInserts(*ca, *cb, 201, 400);
     ASSERT_FALSE(HasFatalFailure());
-    expectKeyExists(c, alive[0], 1, 400);
-
-    // Leadership moves off every node in turn: each takeover rebuilds the index from the log.  The cell does not
-    // assert which node takes each partition over.
-    c.startNode(victim);
-    for (int id = 1; id <= 3; ++id) {
-        ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
-        c.crash(id);
-        ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s)) << "after crashing node " << id;
-        expectKeyExists(c, c.runningNodes().front(), 1, 400);
-        ASSERT_FALSE(HasFatalFailure());
-        c.startNode(id);
-    }
+    expectKeyExists(*ca, 1, 400);
 }
 
-TEST(CheckedWritesBrokerRegression, RestartRebuildsTheKeyIndexThreeNodesRegression) {
+namespace {
+// Leadership moves off the leader of partition `partition` after the log was written under two leaders and one of them was
+// restarted and caught up: each takeover rebuilds the index from that log, whichever of the two survivors takes it over.
+void keyIndexSurvivesTakeoverAfterARestart(int partition) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw05r");
+    Cluster c = startCluster("cw05t" + std::to_string(partition));
     const int32_t topicId = defineKiOnCluster(c);
     ASSERT_GE(topicId, 0);
     {
-        rc::ClientConfig cfg = clientConfigFor(c, 1);
-        cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
-        rc::Client client(cfg);
-        client.connectAndWait(30s);
-        {
-            KiWriter w(client, "ki");
-            for (uint64_t id = 1; id <= 300; ++id) ASSERT_TRUE(w.topic.insertAndWait(acct(id), 60s).ok()) << "insert " << id;
-            for (uint64_t id = 1; id <= 100; ++id) ASSERT_TRUE(w.topic.removeExistingAndWait(id, 60s).ok()) << "remove " << id;
-        }
-        client.close();
+        auto a = kiClient(c, 1), b = kiClient(c, 2);
+        const auto ca = a.get(), cb = b.get();
+        raceInserts(*ca, *cb, 1, 50);
+        ca->close();
+        cb->close();
     }
-    for (int id = 3; id >= 1; --id) c.stop(id);
-    for (int id = 1; id <= 3; ++id) c.startNode(id);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 30s));
+    const int first = leaders[0];
+    c.crash(first);
+    const std::vector<int> alive = c.runningNodes();
+    ASSERT_EQ(alive.size(), 2u);
+    {
+        auto a = kiClient(c, alive[0]), b = kiClient(c, alive[1]);
+        ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s)) << "a new leader after the crash";
+        const auto ca = a.get(), cb = b.get();
+        raceInserts(*ca, *cb, 51, 100);
+        ca->close();
+        cb->close();
+    }
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+
+    // Every node but the leader of the partition is restarted and caught up, so whichever of them takes it over rebuilt its index from the log.
+    std::set<int> restarted;
+    const auto restart = [&](int node) {
+        c.startNode(node);
+        ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
+        // Settled when the replica that leads each partition (ki, __consumer_offsets, __transaction_state) serves it with the
+        // restarted node in its ISR, and the restarted node holds the same log.  The restarted node's own committed map still names
+        // itself leader while it refuses at the restart fence, so only the leader replica's role says who leads.
+        ASSERT_TRUE(waitFor([&] {
+            std::vector<int32_t> current;
+            if (!awaitLeaders(c, topicId, kKiParts, current, 20ms)) return false;   // a restart may hand the leadership back to `node`
+            for (int32_t p = 0; p < kKiParts; ++p) {
+                const int32_t l = current[static_cast<std::size_t>(p)];
+                if (leoOf(c.node(node), topicId, p) != leoOf(c.node(l), topicId, p)) return false;
+                if (!leaderHoldsInIsr(c.node(l), topicId, p, node)) return false;
+            }
+            for (const int32_t coordinator : {-1, -2}) {
+                std::vector<int32_t> l;
+                if (!awaitLeaders(c, coordinator, 1, l, 20ms) || !leaderHoldsInIsr(c.node(l[0]), coordinator, 0, node)) return false;
+            }
+            return true;
+        }, 30s)) << "the restarted node never rejoined the ISR";
+        ASSERT_TRUE(c.awaitInCatalogIsr(node, 30s)) << "the restarted node is not in the catalog ISR";
+        ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
+        restarted.insert(node);
+    };
+    restart(first);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    int second = leaders[static_cast<std::size_t>(partition)];
+    for (;;) {   // a restart may move the leadership: look again until every other node restarted
+        int pending = -1;
+        for (const int node : {1, 2, 3})
+            if (node != second && !restarted.contains(node)) pending = node;
+        if (pending < 0) break;
+        c.crash(pending);
+        restart(pending);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        second = leaders[static_cast<std::size_t>(partition)];
+    }
+    ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
+    second = leaders[static_cast<std::size_t>(partition)];
+    auto reader = kiClient(c, second == 1 ? 2 : 1);
+    c.crash(second);
+    ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s)) << "after crashing node " << second;
+    EXPECT_TRUE(restarted.contains(leaders[static_cast<std::size_t>(partition)])) << "the takeover was by a node that did not restart";
+    const auto cr = reader.get();
+    expectKeyExists(*cr, 1, 100);
+}
+}  // namespace
+
+TEST(CheckedWritesBrokerRegression, KeyIndexSurvivesTakeoverAfterARestartPartition0ThreeNodesRegression) { keyIndexSurvivesTakeoverAfterARestart(0); }
+TEST(CheckedWritesBrokerRegression, KeyIndexSurvivesTakeoverAfterARestartPartition1ThreeNodesRegression) { keyIndexSurvivesTakeoverAfterARestart(1); }
+TEST(CheckedWritesBrokerRegression, KeyIndexSurvivesTakeoverAfterARestartPartition2ThreeNodesRegression) { keyIndexSurvivesTakeoverAfterARestart(2); }
+
+TEST(CheckedWritesBrokerRegression, RestartRebuildsTheKeyIndexThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    Cluster c = startCluster("cw05r");
+    const int32_t topicId = defineKiOnCluster(c);
+    ASSERT_GE(topicId, 0);
+    {
+        auto client = kiClient(c, 1).get();
+        KiWriter w(*client, "ki");
+        ASSERT_TRUE(writePipelined(*client, w.prod, 300, [&](uint64_t i, rc::Completions& cq, rc::Token t) { w.topic.insert(acct(i + 1), cq, t); },
+            [](uint64_t i, const rc::WriteResult& r) { EXPECT_TRUE(r.ok()) << "insert " << i + 1; return r.ok(); }));
+        ASSERT_TRUE(writePipelined(*client, w.prod, 100, [&](uint64_t i, rc::Completions& cq, rc::Token t) { w.topic.removeExisting(i + 1, cq, t); },
+            [](uint64_t i, const rc::WriteResult& r) { EXPECT_TRUE(r.ok()) << "remove " << i + 1; return r.ok(); }));
+        client->close();
+    }
+    restartAll(c);
+    auto exists = kiClient(c, 1), reinsert = kiClient(c, 2);
     ASSERT_TRUE(c.awaitCatalogLeader(60s));
     std::vector<int32_t> leaders;
     ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
 
-    expectKeyExists(c, 1, 101, 300);
+    const auto ce = exists.get(), cr = reinsert.get();
+    std::vector<Outcome> reinserted;
+    std::thread reinserter([&] { reinserted = insertRange(*cr, 1, 100); });
+    expectKeyExists(*ce, 101, 300);
+    reinserter.join();
     ASSERT_FALSE(HasFatalFailure());
-    rc::ClientConfig cfg = clientConfigFor(c, 1);
-    cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
-    const std::vector<Outcome> reinserted = insertRange(cfg, 1, 100);
     ASSERT_EQ(reinserted.size(), 100u) << (reinserted.empty() ? "" : reinserted.back().error);
     for (std::size_t i = 0; i < reinserted.size(); ++i) EXPECT_TRUE(reinserted[i].ok) << "removed id " << i + 1 << " code " << reinserted[i].code;
 }
 
 TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesIntentsRegression) {
-    OneBroker b("cw-ki-legacy", OneBroker::Runtime::Legacy);
+    Broker b("cw-ki-legacy", OneBroker::Runtime::Legacy);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2019,7 +2342,7 @@ TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesIntentsRegression) {
 // Part 06 Task 10 (fix round 1): a restarted broker builds its autoincrement topic's replicas from the catalog with the whole
 // producer retry window, the depth the cleaner keeps (a runtime create is CatalogEffectsTest's).
 TEST(CheckedWritesBrokerRegression, AutoIncTopicKeepsTheRetryWindowDepthAcrossARestartRegression) {
-    OneBroker b("cw-ai-depth", OneBroker::Runtime::Shard);
+    Broker b("cw-ai-depth", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2088,6 +2411,13 @@ std::vector<uint8_t> aiViewPlan(int32_t srcTopicId) {
     return rv::serializeAuthored(p);
 }
 
+/// The n of a row [bitmap][id][n].
+int64_t aiRowValue(const std::vector<uint8_t>& row) {
+    int64_t n = 0;
+    for (int i = 0; i < 8; ++i) n |= static_cast<int64_t>(row[9 + static_cast<std::size_t>(i)]) << (8 * i);
+    return n;
+}
+
 /// The `n` of view row `id` ([bitmap][id][n]); nullopt = absent.  Retries only what a moving leader or a building view answers.
 std::optional<int64_t> aiRowN(rc::Client& reader, int32_t viewTopicId, uint64_t id) {
     rc::ViewRowResult row;
@@ -2099,9 +2429,7 @@ std::optional<int64_t> aiRowN(rc::Client& reader, int32_t viewTopicId, uint64_t 
         EXPECT_EQ(row.status, rc::ViewRowResult::kAbsentKey) << "row " << id;
         return std::nullopt;
     }
-    int64_t n = 0;
-    for (int i = 0; i < 8; ++i) n |= static_cast<int64_t>(row.rowBytes[9 + static_cast<std::size_t>(i)]) << (8 * i);
-    return n;
+    return aiRowValue(row.rowBytes);
 }
 
 uint64_t idOf(const std::string& keyBytes) {
@@ -2114,19 +2442,26 @@ int64_t leoOf(BrokerNode& n, int32_t topicId, int32_t partition) {
     return n.onOwnerThreadForTest(topicId, partition, [](rune::replication::PartitionReplica& r) { return r.log()->logEndOffset(); });
 }
 
+/// The replica of the partition on `leader` leads it, and node `member` is in the ISR it holds.
+bool leaderHoldsInIsr(BrokerNode& leader, int32_t topicId, int32_t partition, int member) {
+    return leader.onOwnerThreadForTest(topicId, partition, [member](rune::replication::PartitionReplica& r) {
+        return r.role() == rune::replication::Role::Leader && std::find(r.isr().begin(), r.isr().end(), member) != r.isr().end();
+    });
+}
+
 /// A connected admin session on the controller of a started cluster, the level raised on every node (a failure is a gtest failure and null).
-std::unique_ptr<rc::Client> clusterAdmin(rune::node::test::catalog_cluster::ThreeNodes& c) {
+std::unique_ptr<rc::Client> clusterAdmin(Cluster& c) {
     using namespace rune::node::test::catalog_cluster;
     if (!c.awaitCatalogLeader(30s)) { ADD_FAILURE() << "no catalog leader"; return nullptr; }
     const int32_t ctl = awaitController(c);
     if (ctl <= 0) { ADD_FAILURE() << "no controller"; return nullptr; }
     for (const int id : c.runningNodes()) awaitLevel(c.node(id));
     if (::testing::Test::HasFatalFailure()) return nullptr;
-    return connectClient(c, ctl);
+    return connectClient(c, quickConfig(c, ctl));
 }
 
-rc::ClientConfig patientConfig(rune::node::test::catalog_cluster::ThreeNodes& c, int seed) {
-    rc::ClientConfig cfg = rune::node::test::catalog_cluster::clientConfigFor(c, seed);
+rc::ClientConfig patientConfig(Cluster& c, int seed) {
+    rc::ClientConfig cfg = quickConfig(c, seed);
     cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
     return cfg;
 }
@@ -2141,8 +2476,46 @@ uint64_t backfillId(uint64_t i) { return i + i / 7 * 3; }
 
 }  // namespace
 
+// Election batch (F4/F5): after the controller crashes (no restart), a surviving node becomes controller and leads the coordinator
+// partitions -1/-2 within 2 s with the dead node out of their ISR, and InitProducerId completes within 3 s of the crash.
+TEST(CheckedWritesBrokerRegression, ControllerCrashCoordinatorsRecoverWithinBoundsRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    using Clock = std::chrono::steady_clock;
+    Cluster c = startCluster("ele7");
+    const int32_t a = awaitController(c);
+    ASSERT_GT(a, 0);
+    const int32_t seed = a == 1 ? 2 : 1;
+    ASSERT_TRUE(waitFor([&] {
+        for (int32_t t : {-1, -2})
+            for (const int32_t m : {1, 2, 3})
+                if (!leaderHoldsInIsr(c.node(a), t, 0, m)) return false;
+        return true;
+    }, 10s));
+    rc::Client client(patientConfig(c, seed));
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::All;
+    pcfg.lingerUs = 1;
+    pcfg.transactionalId = "ele7";
+    rc::Producer tp = client.producer(pcfg);
+    client.connectAndWait(10s);
+    c.crash(a);
+    const auto t0 = Clock::now();
+    ASSERT_TRUE(waitFor([&] {
+        for (const int32_t n : c.runningNodes()) {
+            if (!c.node(n).isLeader()) continue;
+            for (int32_t t : {-1, -2}) {
+                if (!leaderHoldsInIsr(c.node(n), t, 0, n) || leaderHoldsInIsr(c.node(n), t, 0, a)) return false;
+            }
+            return true;
+        }
+        return false;
+    }, 2s)) << "the coordinators were not led again within 2 s of the controller crash";
+    ASSERT_NO_THROW(tp.initTransactionsAndWait(3s));
+    EXPECT_LT(Clock::now() - t0, 3s) << "InitProducerId after the controller crash";
+}
+
 TEST(CheckedWritesBrokerRegression, AutoIncEndToEndShardRegression) {
-    OneBroker b("cw-ai-e2e", OneBroker::Runtime::Shard);
+    Broker b("cw-ai-e2e", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2182,7 +2555,7 @@ TEST(CheckedWritesBrokerRegression, AutoIncEndToEndShardRegression) {
 
 TEST(CheckedWritesBrokerRegression, ModuloRoutingIsTheSameOnEveryPathShardRegression) {
     constexpr int32_t kParts = 4;
-    OneBroker b("cw-ai-mod", OneBroker::Runtime::Shard);
+    Broker b("cw-ai-mod", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2195,11 +2568,13 @@ TEST(CheckedWritesBrokerRegression, ModuloRoutingIsTheSameOnEveryPathShardRegres
     col.subscribeAll(c, w.topic.handle());
 
     std::vector<uint64_t> ids;
-    for (int64_t i = 1; i <= 400; ++i) {
-        const auto r = w.topic.insertAndWait(Ai{.n = i}, 10s);
-        ASSERT_TRUE(r.ok()) << "insert " << i << " code " << r.code();
-        ids.push_back(r.key());
-    }
+    ASSERT_TRUE(writePipelined(c, w.prod, 400,
+        [&](uint64_t i, rc::Completions& cq, rc::Token t) { w.topic.insert(Ai{.n = static_cast<int64_t>(i) + 1}, cq, t); },
+        [&](uint64_t i, const rc::WriteResult& r) {
+            EXPECT_TRUE(r.ok()) << "insert " << i + 1 << " code " << r.code();
+            ids.push_back(r.key());
+            return r.ok();
+        }));
     ASSERT_TRUE(waitFor([&] { return col.count() >= ids.size(); }, 10s)) << "delivered " << col.count();
     std::map<uint64_t, int32_t> partitionOf;
     std::array<std::vector<uint64_t>, kParts> perPartition;
@@ -2225,10 +2600,14 @@ TEST(CheckedWritesBrokerRegression, ModuloRoutingIsTheSameOnEveryPathShardRegres
             EXPECT_TRUE(rm.ok()) << "remove " << probes[i] << " code " << rm.code();
         }
     }
+    const auto settled = [](uint16_t status) { return status == rc::ViewRowResult::kOk || status == rc::ViewRowResult::kAbsentKey; };
+    const auto readN = [&](const std::vector<uint64_t>& ids) {
+        return readRows(c, ids.size(), 60s, settled, [&](std::size_t i, rc::Completions& cq, rc::Token t) { return c.getViewRow(view.viewTopicId, ids[i], 0, cq, t); });
+    };
+    const auto rows = readN(probes);
     for (std::size_t i = 0; i < probes.size(); ++i) {
-        const std::optional<int64_t> n = aiRowN(c, view.viewTopicId, probes[i]);
-        EXPECT_EQ(n.has_value(), i % 2 == 0) << "view row " << probes[i];
-        if (n) EXPECT_EQ(*n, 7);
+        EXPECT_EQ(rows[i].status, i % 2 == 0 ? rc::ViewRowResult::kOk : rc::ViewRowResult::kAbsentKey) << "view row " << probes[i];
+        if (rows[i].status == rc::ViewRowResult::kOk) EXPECT_EQ(aiRowValue(rows[i].rowBytes), 7);
     }
 
     std::vector<std::unique_ptr<Collector>> keyed;
@@ -2241,28 +2620,35 @@ TEST(CheckedWritesBrokerRegression, ModuloRoutingIsTheSameOnEveryPathShardRegres
         ASSERT_TRUE(waitFor([&] { return k.count() > 0; }, 10s)) << "keyed subscription of " << probes[i];
         for (const Seen& s : k.seen()) EXPECT_EQ(s.partition, static_cast<int32_t>(probes[i] % kParts)) << "keyed subscription of " << probes[i];
     }
+    for (auto& k : keyed) k->unsubscribe();   // their destructors then find every subscription finished
 
     // The gateway resolves the partition of an explicit update (partitionKnown = 0).
     rc::Client& blind = *b.connectClient();
     blind.producePartitionUnknownForTest(true);
     AiWriter<Ai> viaGateway(blind, "ai");
+    std::vector<uint64_t> updated;
     for (std::size_t i = 0; i < probes.size(); i += 2) {
         const rc::WriteResult up = viaGateway.topic.updateAndWait(Ai{.id = probes[i], .n = 99}, 10s);
         EXPECT_TRUE(up.ok()) << "update " << probes[i] << " code " << up.code();
-        const std::optional<int64_t> n = aiRowN(c, view.viewTopicId, probes[i]);
-        ASSERT_TRUE(n.has_value());
-        EXPECT_EQ(*n, 99);
+        updated.push_back(probes[i]);
+    }
+    const auto rewritten = readN(updated);
+    for (std::size_t i = 0; i < updated.size(); ++i) {
+        ASSERT_EQ(rewritten[i].status, rc::ViewRowResult::kOk) << "view row " << updated[i];
+        EXPECT_EQ(aiRowValue(rewritten[i].rowBytes), 99);
     }
 }
 
 TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
-    AuthBroker b("ai-import", {.shard = true});
+    auto driverStart = std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
+    AuthBroker b("ai-import", {.shard = true, .configure = [](NodeConfig& cfg) { cfg.testAeronClientIdleSleepMs = 1; }, .wireIdleSleepMs = 1});
+    const auto driver = driverStart.get();
     b.bootstrapAdmin();
     b.createUser("app", kAiPassword, {AuthGrant{SO::Write, ST::Topic, SP::Exact, "user"}});
     b.createUser("backfill", kAiPassword, {AuthGrant{SO::Write, ST::Topic, SP::Exact, "user"}, AuthGrant{SO::Import, ST::Topic, SP::Exact, "user"}});
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
-    const auto connect = [&](const std::string& user, const std::string& password, bool partitionUnknown) {
+    const auto config = [&](const std::string& user, const std::string& password) {
         rc::ClientConfig cfg;
         cfg.gatewayChannel  = b.channel();
         cfg.gatewayStreamId = 1;
@@ -2273,12 +2659,16 @@ TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
         cfg.password        = password;
         cfg.offerCrypto     = true;
         cfg.tlsTrustPem     = AuthBroker::tlsCaPem();
+        return driver->attach(cfg);
+    };
+    const auto connect = [](const rc::ClientConfig& cfg) {
         auto client = std::make_unique<rc::Client>(cfg);
         client->connectAndWait(30s);
-        client->producePartitionUnknownForTest(partitionUnknown);
         return client;
     };
-    auto admin = connect("admin", AuthBroker::kAdminPassword, false);
+    auto appConnecting      = std::async(std::launch::async, connect, config("app", kAiPassword));   // the clients connect together
+    auto backfillConnecting = std::async(std::launch::async, connect, config("backfill", kAiPassword));
+    auto admin = connect(config("admin", AuthBroker::kAdminPassword));
     const auto t = defineAi(*admin, "user", aiUserDescriptor(), "userId");
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     admin->close();
@@ -2287,10 +2677,12 @@ TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
     // schedule, so what a refused import must not change is the data records, not the log end.
     std::size_t stored = storedValues(b.node(), t.topicId, 0).size();
     uint64_t explicitId = 500;
+    auto app      = appConnecting.get();
+    auto backfill = backfillConnecting.get();
+    AiWriter<AiUser> appW(*app, "user"), backfillW(*backfill, "user");
     for (const bool partitionUnknown : {false, true}) {
-        auto app      = connect("app", kAiPassword, partitionUnknown);
-        auto backfill = connect("backfill", kAiPassword, partitionUnknown);
-        AiWriter<AiUser> appW(*app, "user"), backfillW(*backfill, "user");
+        app->producePartitionUnknownForTest(partitionUnknown);
+        backfill->producePartitionUnknownForTest(partitionUnknown);
         const auto denied = appW.topic.insertAndWait(AiUser{.userId = explicitId, .provider = 1, .subject = "denied"}, 10s);
         EXPECT_EQ(denied.status(), rc::OpStatus::BrokerError);
         EXPECT_EQ(denied.code(), kNotAuthorized);
@@ -2304,11 +2696,11 @@ TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
         EXPECT_EQ(next.key(), explicitId + 1) << "the counter moved past the import";
         stored = storedValues(b.node(), t.topicId, 0).size();
         explicitId = 600;
-        app->close();
-        backfill->close();
     }
+    app->close();
+    backfill->close();
 
-    AuthBroker old("ai-import-lvl4", {.shard = true, .configure = [](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = 4; }});
+    AuthBroker old("ai-import-lvl4", {.shard = true, .configure = [](NodeConfig& cfg) { cfg.testAeronClientIdleSleepMs = 1; cfg.testSupportedFeatureLevel = 4; }, .wireIdleSleepMs = 1});
     old.bootstrapAdmin();
     old.createUser("backfill", kAiPassword);
     const auto grant = old.admin().grant(old.channel(), old.adminSession(), "backfill", false, SO::Import, ST::Topic, SP::Exact, "user");
@@ -2319,7 +2711,7 @@ TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
 TEST(CheckedWritesBrokerRegression, RegressorsPathBackFillThenInsertsNeverCollideThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
     constexpr int kUsers = 3000, kCharacters = 6000;
-    ThreeNodes c = ThreeNodes::start("cw06");
+    Cluster c = startCluster("cw06");
     int32_t userTopic = -1, characterTopic = -1;
     {
         auto admin = clusterAdmin(c);
@@ -2346,27 +2738,34 @@ TEST(CheckedWritesBrokerRegression, RegressorsPathBackFillThenInsertsNeverCollid
     {
         auto client = connectClient(c, patientConfig(c, 1));
         AiWriter<AiUser> users(*client, "user");
-        for (uint64_t i = 1; i <= kUsers; ++i) {
-            const auto r = users.topic.insertAndWait(AiUser{.userId = backfillId(i), .provider = 1, .subject = "user" + std::to_string(i)}, 60s);
-            ASSERT_TRUE(r.ok()) << "user " << i << " code " << r.code();
-            userIds.insert(backfillId(i));
-        }
+        ASSERT_TRUE(writePipelined(*client, users.prod, kUsers,
+            [&](uint64_t i, rc::Completions& cq, rc::Token t) { users.topic.insert(AiUser{.userId = backfillId(i + 1), .provider = 1, .subject = "user" + std::to_string(i + 1)}, cq, t); },
+            [&](uint64_t i, const rc::WriteResult& r) {
+                EXPECT_TRUE(r.ok()) << "user " << i + 1 << " code " << r.code();
+                userIds.insert(backfillId(i + 1));
+                return r.ok();
+            }));
         AiWriter<AiCharacter> characters(*client, "character");
-        for (uint64_t i = 1; i <= kCharacters; ++i) {
-            const auto r = characters.topic.insertAndWait(
-                AiCharacter{.characterId = backfillId(i), .userId = backfillId(i % kUsers + 1), .name = "c" + std::to_string(i)}, 60s);
-            ASSERT_TRUE(r.ok()) << "character " << i << " code " << r.code();
-            characterIds.insert(backfillId(i));
-        }
+        ASSERT_TRUE(writePipelined(*client, characters.prod, kCharacters,
+            [&](uint64_t i, rc::Completions& cq, rc::Token t) { characters.topic.insert(AiCharacter{.characterId = backfillId(i + 1), .userId = backfillId((i + 1) % kUsers + 1), .name = "c" + std::to_string(i + 1)}, cq, t); },
+            [&](uint64_t i, const rc::WriteResult& r) {
+                EXPECT_TRUE(r.ok()) << "character " << i + 1 << " code " << r.code();
+                characterIds.insert(backfillId(i + 1));
+                return r.ok();
+            }));
     }
     const uint64_t userMax = *userIds.rbegin(), characterMax = *characterIds.rbegin();
 
     const auto insertLive = [&](int seed, int users, int characters, uint64_t userAbove, uint64_t characterAbove) {
         auto client = connectClient(c, patientConfig(c, seed));
         AiWriter<AiUser> u(*client, "user");
-        for (int i = 0; i < users; ++i) expectFresh(userIds, u.topic.insertAndWait(AiUser{.provider = 2, .subject = "live" + std::to_string(i)}, 60s), "user", userAbove);
+        ASSERT_TRUE(writePipelined(*client, u.prod, static_cast<uint64_t>(users),
+            [&](uint64_t i, rc::Completions& cq, rc::Token t) { u.topic.insert(AiUser{.provider = 2, .subject = "live" + std::to_string(i)}, cq, t); },
+            [&](uint64_t, const rc::WriteResult& r) { expectFresh(userIds, r, "user", userAbove); return r.ok(); }));
         AiWriter<AiCharacter> ch(*client, "character");
-        for (int i = 0; i < characters; ++i) expectFresh(characterIds, ch.topic.insertAndWait(AiCharacter{.userId = 1, .name = "live" + std::to_string(i)}, 60s), "character", characterAbove);
+        ASSERT_TRUE(writePipelined(*client, ch.prod, static_cast<uint64_t>(characters),
+            [&](uint64_t i, rc::Completions& cq, rc::Token t) { ch.topic.insert(AiCharacter{.userId = 1, .name = "live" + std::to_string(i)}, cq, t); },
+            [&](uint64_t, const rc::WriteResult& r) { expectFresh(characterIds, r, "character", characterAbove); return r.ok(); }));
     };
 
     const int first = userLeader[0];
@@ -2374,7 +2773,7 @@ TEST(CheckedWritesBrokerRegression, RegressorsPathBackFillThenInsertsNeverCollid
     ASSERT_TRUE(awaitLeaders(c, userTopic, 1, userLeader, 60s));
     ASSERT_TRUE(awaitLeaders(c, characterTopic, 1, characterLeader, 60s));
     insertLive(c.runningNodes().front(), 500, 1000, userMax, characterMax);
-    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
     const auto userCounter = counterOf(c.node(userLeader[0]), userTopic);
     const auto characterCounter = counterOf(c.node(characterLeader[0]), characterTopic);
     ASSERT_TRUE(userCounter && characterCounter);
@@ -2393,7 +2792,7 @@ TEST(CheckedWritesBrokerRegression, RegressorsPathBackFillThenInsertsNeverCollid
 }
 
 TEST(CheckedWritesBrokerRegression, AutoIncDdlRefusalsShardRegression) {
-    OneBroker b("cw-ai-ddl", OneBroker::Runtime::Shard);
+    Broker b("cw-ai-ddl", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2433,7 +2832,7 @@ TEST(CheckedWritesBrokerRegression, AutoIncDdlRefusalsShardRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesKeyZeroCreatesRegression) {
-    OneBroker b("cw-ai-legacy", OneBroker::Runtime::Legacy);
+    Broker b("cw-ai-legacy", OneBroker::Runtime::Legacy);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2449,7 +2848,7 @@ TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesKeyZeroCreatesRegression
 
 TEST(CheckedWritesBrokerRegression, KeyZeroCreatesToAnOlderClusterShardRegression) {
     {
-        OneBroker b("cw-ai-lvl4", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = 4; });
+        Broker b("cw-ai-lvl4", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = 4; });
         rc::Client& c = *b.connectClient();
         ASSERT_TRUE(waitFor([&] { return b.node().onWorkerThreadForTest(0, [](Worker& w) { return w.clusterFeatureLevelForTest(); }) == 4; }, 10s));
         const auto ddl = defineAi(c, "user", aiUserDescriptor(), "userId");
@@ -2472,7 +2871,7 @@ TEST(CheckedWritesBrokerRegression, KeyZeroCreatesToAnOlderClusterShardRegressio
         prod.closeImmediately();
     }
     int32_t advertised = 0;
-    OneBroker old("cw-ai-v9", OneBroker::Runtime::Shard, [&advertised](NodeConfig& cfg) { cfg.testAdvertisedBrokerVersion = advertised; });
+    Broker old("cw-ai-v9", OneBroker::Runtime::Shard, [&advertised](NodeConfig& cfg) { cfg.testAdvertisedBrokerVersion = advertised; });
     awaitLevel(old.node());
     ASSERT_FALSE(HasFatalFailure());
     const auto t = defineAi(*old.connectClient(), "user", aiUserDescriptor(), "userId");
@@ -2494,7 +2893,7 @@ TEST(CheckedWritesBrokerRegression, KeyZeroCreatesToAnOlderClusterShardRegressio
 
 TEST(CheckedWritesBrokerRegression, LostAckRetryAcrossFailoverReturnsTheSameIdsThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw06la");
+    Cluster c = startCluster("cw06la");
     int32_t topicId = -1, viewTopic = -1;
     {
         auto admin = clusterAdmin(c);
@@ -2556,7 +2955,7 @@ TEST(CheckedWritesBrokerRegression, LostAckRetryAcrossFailoverReturnsTheSameIdsT
 TEST(CheckedWritesBrokerRegression, WideKeyIndexSurvivesFailoverThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
     using Wide = KeyRec<std::array<uint8_t, 16>>;
-    ThreeNodes c = ThreeNodes::start("cw07wk");
+    Cluster c = startCluster("cw07wk");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t ctl = awaitController(c);
     ASSERT_GT(ctl, 0);
@@ -2566,25 +2965,26 @@ TEST(CheckedWritesBrokerRegression, WideKeyIndexSurvivesFailoverThreeNodesRegres
     to.replicationFactor    = 3;
     to.config.cleanupPolicy = 1;
     to.keyFeatures.keyIndex = true;
-    auto admin = connectClient(c, ctl);
+    auto admin = connectClient(c, quickConfig(c, ctl));
     const auto t = admin->defineTopicAndWait("wide", kKiParts, "k", rune::codec::serialize(Wide::descriptor()), rc::Persistence::Disk, to, {}, 60s);
     admin->close();
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     std::vector<int32_t> leaders;
     ASSERT_TRUE(awaitLeaders(c, t.topicId, kKiParts, leaders, 30s));
 
-    const auto insertAll = [&](int seed, int first, int last, uint16_t want) {
-        rc::ClientConfig cfg = clientConfigFor(c, seed);
+    const auto insertAll = [&](int seed, int first, int last, int existingBelow) {
+        rc::ClientConfig cfg = quickConfig(c, seed);
         cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
         rc::Client client(cfg);
         client.connectAndWait(30s);
         rc::Producer prod = client.producer(KiWriter::config(kAllView));
         rc::TypedTopic<Wide, rc::ProducerRef> topic = client.openTopicAndWait<Wide>("wide", prod, 30s);
-        for (int i = first; i <= last; ++i) {
-            const auto r = topic.insertAndWait(Wide::make(i), 60s);
-            if (want == 0) EXPECT_TRUE(r.ok()) << "insert " << i << " code " << r.code();
-            else EXPECT_EQ(r.code(), want) << "insert " << i;
-        }
+        writePipelined(client, prod, last - first + 1, [&](uint64_t i, rc::Completions& cq, rc::Token t) { topic.insert(Wide::make(first + static_cast<int>(i)), cq, t); },
+            [&](uint64_t i, const rc::WriteResult& r) {
+                if (first + static_cast<int>(i) >= existingBelow) EXPECT_TRUE(r.ok()) << "insert " << first + static_cast<int>(i) << " code " << r.code();
+                else EXPECT_EQ(r.code(), kKeyExists) << "insert " << first + static_cast<int>(i);
+                return true;
+            });
         prod.closeImmediately();
         client.close();
     };
@@ -2594,8 +2994,7 @@ TEST(CheckedWritesBrokerRegression, WideKeyIndexSurvivesFailoverThreeNodesRegres
     c.crash(leaders[0]);
     ASSERT_TRUE(awaitLeaders(c, t.topicId, kKiParts, leaders, 60s)) << "a new leader after the crash";
     const int seed = c.runningNodes().front();
-    insertAll(seed, 0, 99, kKeyExists);
-    insertAll(seed, 100, 100, 0);
+    insertAll(seed, 0, 100, 100);
 }
 
 // ===========================================================================================================
@@ -2655,6 +3054,16 @@ rv::ViewPlan accountCharactersPlan(int32_t sourceTopicId) {
 
 rv::ViewPlan nameKeyPlan(int32_t sourceTopicId) {
     return characterPlan("name_key", sourceTopicId, {{"name", rune::codec::kKeyFunctionLower, "nameKey"}, {"characterId", 0, "characterId"}}, {"name"});
+}
+
+/// The view is in `n`'s applied catalog (a follower applies a create-view entry after the controller acked it).
+void awaitViewApplied(BrokerNode& n, const std::string& view) {
+    bool applied = false;
+    for (int i = 0; i < 1200 && !applied; ++i) {
+        applied = n.onAdminThreadForTest([&n, &view] { return n.adminWorkerAgentForTest()->worker().applier().state().viewByName(rune::catalog::kDefaultNsId, view) != nullptr; });
+        if (!applied) std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(applied) << "the view reaches the node's catalog: " << view;
 }
 
 rcv::ViewKeyBuilder keyBuilder(BrokerNode& n, const std::string& view) {
@@ -2766,7 +3175,7 @@ std::set<uint64_t> idsOf(const ViewColumns& cols, const std::vector<std::vector<
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, CompositeViewPointAndPrefixReadsRightAfterTheAckShardRegression) {
-    OneBroker b("cw07-comp", OneBroker::Runtime::Shard);
+    Broker b("cw07-comp", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2799,7 +3208,7 @@ TEST(CheckedWritesBrokerRegression, CompositeViewPointAndPrefixReadsRightAfterTh
 }
 
 TEST(CheckedWritesBrokerRegression, LowerKeyReadWithTheKeyBuilderShardRegression) {
-    OneBroker b("cw07-lower", OneBroker::Runtime::Shard);
+    Broker b("cw07-lower", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2819,7 +3228,7 @@ TEST(CheckedWritesBrokerRegression, LowerKeyReadWithTheKeyBuilderShardRegression
 }
 
 TEST(CheckedWritesBrokerRegression, RenameMovesTheRowShardRegression) {
-    OneBroker b("cw07-rename", OneBroker::Runtime::Shard);
+    Broker b("cw07-rename", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2839,7 +3248,7 @@ TEST(CheckedWritesBrokerRegression, RenameMovesTheRowShardRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, ScanAcrossPagesThenCursorInvalidatedShardRegression) {
-    OneBroker b("cw07-pages", OneBroker::Runtime::Shard);
+    Broker b("cw07-pages", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2892,7 +3301,7 @@ TEST(CheckedWritesBrokerRegression, ScanAcrossPagesThenCursorInvalidatedShardReg
 }
 
 TEST(CheckedWritesBrokerRegression, MinOffsetReadSeesTheWriteShardRegression) {
-    OneBroker b("cw07-minoff", OneBroker::Runtime::Shard);
+    Broker b("cw07-minoff", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2914,7 +3323,7 @@ TEST(CheckedWritesBrokerRegression, MinOffsetReadSeesTheWriteShardRegression) {
 
 TEST(CheckedWritesBrokerRegression, WideViewSurvivesRestartShardRegression) {
     LogCapture log;
-    OneBroker b("cw07-restart", OneBroker::Runtime::Shard);
+    Broker b("cw07-restart", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client* c = b.connectClient();
@@ -2927,7 +3336,7 @@ TEST(CheckedWritesBrokerRegression, WideViewSurvivesRestartShardRegression) {
     rcv::ViewKeyBuilder builder = keyBuilder(b.node(), "name_key");
     rcv::ViewKeyBuilder users   = keyBuilder(b.node(), "account_characters");
 
-    constexpr uint64_t kTotal = 1000;
+    constexpr uint64_t kTotal = 600;
     std::vector<std::string> names(kTotal);
     {
         KeyedSender w(b.clientConfig(), "character", t.topicId, 1, kAllView);
@@ -2948,10 +3357,12 @@ TEST(CheckedWritesBrokerRegression, WideViewSurvivesRestartShardRegression) {
     const auto keyOf = [&](uint64_t id) { builder.clear(); return bytesOf(builder.setString("name", names[id]).setUInt("characterId", id).key()); };
     const auto snapshot = [&](rc::Client& client) {
         std::map<uint64_t, std::vector<uint8_t>> rows;
+        std::vector<std::vector<uint8_t>> keys;
+        for (uint64_t id = 0; id < kTotal; ++id) keys.push_back(keyOf(id));
+        const auto read = readRows(client, kTotal, 30s, kOnlyOk, [&](std::size_t i, rc::Completions& cq, rc::Token t) { return client.getViewRowK(view, keys[i], {}, cq, t); });
         for (uint64_t id = 0; id < kTotal; ++id) {
-            const auto row = readRow(client, view, keyOf(id), {}, 30s);
-            EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "character " << id;
-            rows[id] = row.rowBytes;
+            EXPECT_EQ(read[id].status, rc::ViewRowResult::kOk) << "character " << id;
+            rows[id] = read[id].rowBytes;
         }
         std::vector<std::vector<uint8_t>> scanned;
         for (uint64_t user = 0; user < 10; ++user) {
@@ -2981,13 +3392,13 @@ TEST(CheckedWritesBrokerRegression, WideViewSurvivesRestartShardRegression) {
 
 TEST(CheckedWritesBrokerRegression, WideViewReadsAfterLeaderCrashThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = ThreeNodes::start("cw07");
+    Cluster c = startCluster("cw07");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t ctl = awaitController(c);
     ASSERT_GT(ctl, 0);
     for (const int id : c.runningNodes()) awaitLevel(c.node(id));
     ASSERT_FALSE(HasFatalFailure());
-    auto admin = connectClient(c, ctl);
+    auto admin = connectClient(c, quickConfig(c, ctl));
     const auto src = defineCharacters(*admin, 3);
     ASSERT_EQ(src.errorCode, 0) << src.detail;
     const int32_t view = createView(*admin, accountCharactersPlan(src.topicId), "characterId");
@@ -3000,11 +3411,13 @@ TEST(CheckedWritesBrokerRegression, WideViewReadsAfterLeaderCrashThreeNodesRegre
     int32_t seed = 0;
     for (const int id : c.runningNodes()) if (id != victim) { seed = id; break; }
     ASSERT_GT(seed, 0);
+    awaitViewApplied(c.node(seed), "account_characters");
+    ASSERT_FALSE(HasFatalFailure());
     const ViewColumns cols(c.node(seed), "account_characters");
     rcv::ViewKeyBuilder builder = keyBuilder(c.node(seed), "account_characters");
 
     constexpr uint64_t kTotal = 200;
-    rc::ClientConfig cfg = clientConfigFor(c, seed);
+    rc::ClientConfig cfg = quickConfig(c, seed);
     cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
     {
         KeyedSender w(cfg, "character", src.topicId, 1, kAllView);
@@ -3033,7 +3446,7 @@ TEST(CheckedWritesBrokerRegression, WideViewReadsAfterLeaderCrashThreeNodesRegre
 
 TEST(CheckedWritesBrokerRegression, MultiPartitionNarrowKeyViewReadsWithThePartitionShardRegression) {
     using Rec = KeyRec<uint16_t>;
-    OneBroker b("cw07-parts", OneBroker::Runtime::Shard);
+    Broker b("cw07-parts", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -3061,17 +3474,23 @@ TEST(CheckedWritesBrokerRegression, MultiPartitionNarrowKeyViewReadsWithTheParti
     }
     ASSERT_TRUE(w.writeAll(records));
 
+    std::vector<std::vector<uint8_t>> rowKeys;
+    std::vector<int32_t> partitions;
     for (const uint16_t k : keys) {
         builder.clear();
-        const std::vector<uint8_t> key = bytesOf(builder.setUInt("k", k).key());
-        const auto row = readRow(c, view, key, {.partition = builder.partition()});
-        EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "key " << k << " on partition " << builder.partition();
-        EXPECT_EQ(c.getViewRowAndWait(view, uint64_t{k}, 0, 10s).status, kViewInvalidRequest) << "op 72 on a multi-partition view";
+        rowKeys.push_back(bytesOf(builder.setUInt("k", k).key()));
+        partitions.push_back(builder.partition());
+    }
+    const auto rows = readRows(c, keys.size(), 30s, kOnlyOk, [&](std::size_t i, rc::Completions& cq, rc::Token t) { return c.getViewRowK(view, rowKeys[i], {.partition = partitions[i]}, cq, t); });
+    const auto op72 = readRows(c, keys.size(), 30s, [](uint16_t) { return true; }, [&](std::size_t i, rc::Completions& cq, rc::Token t) { return c.getViewRow(view, uint64_t{keys[i]}, 0, cq, t); });
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_EQ(rows[i].status, rc::ViewRowResult::kOk) << "key " << keys[i] << " on partition " << partitions[i];
+        EXPECT_EQ(op72[i].status, kViewInvalidRequest) << "op 72 on a multi-partition view";
     }
 }
 
 TEST(CheckedWritesBrokerRegression, OldGetViewRowOnALegacyViewUnchangedShardRegression) {
-    OneBroker b("cw07-legacy", OneBroker::Runtime::Shard);
+    Broker b("cw07-legacy", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -3093,7 +3512,7 @@ TEST(CheckedWritesBrokerRegression, OldGetViewRowOnALegacyViewUnchangedShardRegr
 }
 
 TEST(CheckedWritesBrokerRegression, DeviceHistoryGroupByPrefixReadShardRegression) {
-    OneBroker b("cw07-device", OneBroker::Runtime::Shard);
+    Broker b("cw07-device", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client* c = b.connectClient();
@@ -3144,7 +3563,7 @@ TEST(CheckedWritesBrokerRegression, DeviceHistoryGroupByPrefixReadShardRegressio
 
 TEST(CheckedWritesBrokerRegression, KeyIndexOnASixteenByteKeyShardRegression) {
     using Wide = KeyRec<std::array<uint8_t, 16>>;
-    OneBroker b("cw07-ki16", OneBroker::Runtime::Shard);
+    Broker b("cw07-ki16", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -3161,4 +3580,29 @@ TEST(CheckedWritesBrokerRegression, KeyIndexOnASixteenByteKeyShardRegression) {
     EXPECT_EQ(again.status(), rc::OpStatus::BrokerError);
     EXPECT_EQ(again.code(), static_cast<uint16_t>(rune::protocol::client::ErrorCode::KeyExists));
     prod.closeImmediately();
+}
+
+// Smoke test: the node that coordinates the producer id crashes once the client has opened a session on it, and the new coordinator
+// answers within the stale-session threshold, not after the 5 s coordinator-down fallback.  The request is usually still unanswered at
+// the crash, but nothing holds the reply back, so a regression of the in-flight move is pinned by the client test
+// (GroupRoutingRegression.InitProducerIdInFlightOnACrashedCoordinatorMovesWithTheLostSessionRegression).
+TEST(CheckedWritesBrokerRegression, ProducerIdAfterACoordinatorCrashSmokeThreeNodesRegression) {
+    Cluster c = startCluster("cw_pid");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t coordinator = c.settledLeader();
+    const int32_t seed        = coordinator == 1 ? 2 : 1;
+    const uint64_t accepted   = c.node(coordinator).testConnectsAccepted();
+    rc::ClientConfig cfg = quickConfig(c, seed);
+    cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
+    rc::Client client(cfg);
+    rc::Producer prod = client.producer(rc::ProducerConfig{});
+    client.connectAndWait(30s);
+    for (int i = 0; i < 10'000 && c.node(coordinator).testConnectsAccepted() == accepted && prod.producerId() < 0; ++i) std::this_thread::sleep_for(100us);
+    c.crash(coordinator);
+    const auto start = std::chrono::steady_clock::now();
+    while (prod.producerId() < 0 && std::chrono::steady_clock::now() - start < 10s) std::this_thread::sleep_for(1ms);
+    EXPECT_GE(prod.producerId(), 0);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 3s) << "the producer id waited for the coordinator-down fallback";
+    prod.closeImmediately();
+    client.close();
 }

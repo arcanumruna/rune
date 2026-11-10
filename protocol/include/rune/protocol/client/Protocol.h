@@ -244,7 +244,16 @@ enum class ErrorCode : uint16_t {
     ViewKeyExpressionInvalid = 59,  // DDL compile error: a view key expression
     ViewConstraintInvalid    = 60,  // DDL compile error: a unique / check constraint
     ViewUniqueInvalid        = 61,  // DDL compile error: a unique clause
+    TxnTooLarge              = 62,  // a transaction (or atomic batch) overran a vote window; the whole transaction aborts.  Vote, definite
+    TxnConflict              = 63,  // a newer write of another writer landed before its TxnJudge; the transaction aborts.  Vote, definite
 };
+
+/// True for the codes a transaction vote can answer EndTxn(commit) with: 55, 56, 57, 62 and 63.
+[[nodiscard]] constexpr bool isTxnVoteCode(uint16_t code) noexcept {
+    return code == static_cast<uint16_t>(ErrorCode::ConstraintViolation) || code == static_cast<uint16_t>(ErrorCode::KeyExists) ||
+           code == static_cast<uint16_t>(ErrorCode::KeyNotFound) || code == static_cast<uint16_t>(ErrorCode::TxnTooLarge) ||
+           code == static_cast<uint16_t>(ErrorCode::TxnConflict);
+}
 
 // ---------------------------------------------------------------------------
 // Client versions (ConnectRequest.clientVersion) — behaviour gates.  The wire
@@ -523,7 +532,7 @@ inline constexpr int32_t kBrokerVersion                           = kBrokerVersi
     return clientVersion >= kClientVersionFilter;
 }
 
-/// True when a session that connected with `clientVersion` may be answered the checked-writes codes 55-61 and the
+/// True when a session that connected with `clientVersion` may be answered the checked-writes codes 55-63 and the
 /// 54-byte ProduceResponse (version 17).
 [[nodiscard]] constexpr bool clientUnderstandsCheckedWrites(int32_t clientVersion) noexcept {
     return clientVersion >= kClientVersionCheckedWrites;
@@ -544,8 +553,8 @@ inline constexpr int32_t kBrokerVersion                           = kBrokerVersi
         return ErrorCode::NotLeader;   // issue #112: a pre-v13 client's retriable code
     if ((ec == ErrorCode::NamespaceSuspended || ec == ErrorCode::NamespaceLimitExceeded || ec == ErrorCode::Throttled) && clientVersion < kClientVersionNamespaces) [[unlikely]]
         return ErrorCode::InvalidRequest;   // namespaces Phase 2 Task 11: the namespace codes (51-53) exist only for a v14+ client
-    if (ec >= ErrorCode::ConstraintViolation && ec <= ErrorCode::ViewUniqueInvalid && !clientUnderstandsCheckedWrites(clientVersion)) [[unlikely]]
-        return ErrorCode::InvalidRequest;   // checked writes: 55-61 exist only for a v17+ client
+    if (ec >= ErrorCode::ConstraintViolation && ec <= ErrorCode::TxnConflict && !clientUnderstandsCheckedWrites(clientVersion)) [[unlikely]]
+        return ErrorCode::InvalidRequest;   // checked writes: 55-63 exist only for a v17+ client
     return ec;
 }
 

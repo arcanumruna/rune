@@ -511,7 +511,7 @@ int cmdStats(const std::vector<std::string>& args, std::ostream& out, std::ostre
                 err << "rune: no topic '" << name << "'\n";
                 return 1;
             }
-            stats = topicStats(broker.client(), state, *t, only);
+            stats = topicStats(broker.client(), *t, only);
         } else {
             const cat::ViewObject* v = state.viewByName(cat::kDefaultNsId, name);
             if (v == nullptr) {

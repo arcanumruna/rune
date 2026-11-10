@@ -282,7 +282,6 @@ const RefusalCase kRefusalCases[] = {
     {"insert on a raw handle", Acks::All | Acks::View, false, TopicKind::Raw, WriteIntent::Insert, false, "intents need a typed topic"},
     {"update without View", Acks::All, false, TopicKind::Typed, WriteIntent::Update, false, "intents need acks including View"},
     {"upsert with View on a raw handle", Acks::All | Acks::View, false, TopicKind::Raw, WriteIntent::Upsert, false, "acks View needs a typed topic"},
-    {"insert in a transaction", Acks::All | Acks::View, true, TopicKind::Typed, WriteIntent::Insert, false, "intents inside a transaction need Part G"},
     {"insert without a value", Acks::All | Acks::View, false, TopicKind::Typed, WriteIntent::Insert, true, "an insert needs a value"},
 };
 std::span<const uint8_t> valueOf(const RefusalCase& c) {

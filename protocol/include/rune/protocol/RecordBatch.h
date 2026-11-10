@@ -35,6 +35,7 @@ inline constexpr int16_t kAttrTransactional  = 0x0010; // bit 4: isTransactional
 // horizon (epoch-ms).  The layout is unchanged — no schema bump.  Any batch
 // that does NOT set this bit decodes exactly as before (full backward compat).
 inline constexpr int16_t kAttrDeleteHorizon  = 0x0040; // bit 6: delete-horizon in baseTimestamp
+inline constexpr int16_t kAttrAtomic         = 0x0080; // bit 7: the batch is all-or-nothing on its partition (checked writes)
 } // namespace rune::protocol::batch
 
 namespace rune::protocol::record {

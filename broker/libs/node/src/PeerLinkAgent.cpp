@@ -29,7 +29,8 @@ PeerLinkAgent::PeerLinkAgent(std::shared_ptr<aeron::Aeron> aeron, Params params,
     // Subscribe FIRST in spirit (the sink's publications resolve lazily): a peer's Hello must find a subscription.
     const int64_t regId = aeron_->addSubscription(params.bindChannel, params.streamId);
     sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); }, rune::aeronutil::AeronPump::kUntilAnswered);
-    if (!sub_) throw std::runtime_error("PeerLinkAgent: the peer-auth subscription did not resolve");
+    if (!sub_) throw std::runtime_error("PeerLinkAgent: the peer-auth subscription " + params.bindChannel + " stream " + std::to_string(params.streamId) +
+                                                (pump.deadlineExpired() ? " was not answered by the driver within the startup deadline" : " did not resolve"));
     peers_.reserve(params.peers.size());
     for (const auto& peer : params.peers)
         peers_.push_back(PeerSlot{peer.id, pl::PeerHandshake(params.selfId, peer.id, params.incarnation, params.keys), 0, 0});

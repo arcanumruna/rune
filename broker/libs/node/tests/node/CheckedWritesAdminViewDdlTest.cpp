@@ -165,20 +165,19 @@ TEST(CheckedWritesAdminViewDdl, BelowTheLevelPlanV2IsInvalidRequest) {
     EXPECT_EQ(b.code, kOk) << b.detail;
 }
 
-TEST(CheckedWritesAdminViewDdl, UniqueAndCheckAreNotAvailableYet) {
+TEST(CheckedWritesAdminViewDdl, UniqueAndCheckAreAccepted) {
     CatalogDdlRig rig("cwavu");
     atLevel(rig);
     ASSERT_EQ(define(rig, "character", "characterId", characterDescriptor()).code, kOk);
     auto u = accountCharacters(rig);
     u.unique = true;
     const auto a = createView(rig, u);
-    EXPECT_EQ(a.code, codeOf(ErrorCode::ViewUniqueInvalid));
-    EXPECT_EQ(a.detail, "unique views are not available yet");
+    EXPECT_EQ(a.code, kOk) << a.detail;
     auto c = accountCharacters(rig);
+    c.viewName = "account_checked";
     c.constraints = {{"genderSet", {column("gender")}}};
     const auto b = createView(rig, c);
-    EXPECT_EQ(b.code, codeOf(ErrorCode::ViewConstraintInvalid));
-    EXPECT_EQ(b.detail, "check constraints are not available yet");
+    EXPECT_EQ(b.code, kOk) << b.detail;
 }
 
 TEST(CheckedWritesAdminViewDdl, CompileKindsMapToTheirCodes) {

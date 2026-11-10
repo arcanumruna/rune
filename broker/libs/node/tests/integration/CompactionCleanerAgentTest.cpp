@@ -1331,7 +1331,7 @@ TEST(CompactionCleanerAgentRegression, ALogHeldAtItsVerdictCoverageIsNotRescanne
     const auto change = [&](int64_t offset) {
         const std::vector<cr::ChangeMember> members{cr::ChangeMember{7, 3, 99}};
         std::vector<uint8_t> b(cr::changeBatchBytes(static_cast<uint16_t>(members.size())));
-        (void)cr::buildConstraintSetChange(b, 1, members);
+        (void)cr::buildConstraintSetChange(b, 1, -1, members);
         control(std::move(b), offset);
     };
     const auto marker = [&](int64_t offset, int64_t from, int64_t through) {
@@ -2970,7 +2970,7 @@ TEST(CompactionCleanerAgentRegression, AHeldLogIsCleanedAgainWhenAMarkerHorizonP
     };
     const std::vector<cr::ChangeMember> members{cr::ChangeMember{7, 3, 99}};
     std::vector<uint8_t> change(cr::changeBatchBytes(static_cast<uint16_t>(members.size())));
-    (void)cr::buildConstraintSetChange(change, 1, members);
+    (void)cr::buildConstraintSetChange(change, 1, -1, members);
     control(std::move(change), 0);
     constexpr int64_t kPid = 9;
     log.append(r1Txn(1, "a", "1", kPid, 0, 0), 1);
@@ -3125,6 +3125,31 @@ TEST(PartitionReplicaCleanerSnapshotRegression, LsoStartsAtZeroUntilTheFirstRead
     EXPECT_EQ(internal.cleanerLastStableOffset(), PartitionReplica::kNoCleanerLso);
     fs::remove_all(dir);
     fs::remove_all(dir2);
+}
+
+// #953: the worker's disk scan (RcState) rebuilds a leader's producer state.  A log whose producer lost its newest batches
+// to the cleaner (seq 2..5 of an expired producer) yields an entry that only knows seq 1: the producer's next batch is an
+// unknown producer's, never OutOfOrderSequence.
+TEST(LogCleanerRcRebuildRegression, DiskScanEntryPastTheLogsLastSequenceAnswersUnknownProducerIdRegression) {
+    auto dir = cp6TempDir("953_rc_scan");
+    Log log(dir.string(), 1 << 20);
+    for (int32_t seq = 0; seq < 2; ++seq) {
+        rune::protocol::RecordBatchBuilder b(log.logEndOffset(), 1000);
+        b.setProducerId(7); b.setProducerEpoch(0); b.setBaseSequence(seq);
+        b.append("k", "v", 1000);
+        ASSERT_GE(log.append(b.build(), log.logEndOffset()), 0);
+    }
+    rune::storage::ProducerStateManager psm;
+    rune::node::RcState rc;
+    rc.bindProducerState(&psm, 1, 0);
+    rune::node::RcFacts f; f.leader = true; f.logGeneration = 1;
+    f.leadershipGeneration = 1; f.epoch = 1;
+    for (int i = 0; i < 100'000 && !rc.ready(); ++i) (void)rc.advance(f, &log, 1 << 20);
+    ASSERT_TRUE(rc.ready());
+    ASSERT_NE(psm.entry(1, 7, 0), nullptr);
+    EXPECT_TRUE(psm.validate(1, 7, 0, 0, 6, 6).isUnknownProducerId());
+    EXPECT_TRUE(psm.validate(1, 7, 0, 0, 2, 2).isAccept());
+    fs::remove_all(dir);
 }
 
 // Fix round 1 (4d): end to end — the read_committed state AND the producer state
@@ -3881,6 +3906,86 @@ TEST(CompactionCleanerAgentRegression, HeldAutoIncProgressNeverMovesBackRegressi
     EXPECT_EQ(prev, kOpenTxn) << "the passes reached the open transaction";
 
     fs::remove_all(dir);
+}
+
+// The same for a held log: its passes reached the cleaner's own limit (an open transaction), its watermark is held by an idle
+// producer's batch, and the segments past the limit keep its dirty ratio high (TheWholeScenarioThreeNodesRegression, 1 run in 5: the
+// cleaner was selecting the user topic's held log every cycle and the character topic was never cleaned).  Expected: N converges while
+// H is held out.  RED: a held pass that moved nothing was not marked stalled, and a stalled pass with a delete retention of 0 was retried every cycle, so H won every cycle.
+TEST(CompactionCleanerAgentRegression, AHeldLogWhosePassMovesNothingNeverStarvesTheOthersRegression) {
+    auto dirH = cp6TempDir("stall_held");
+    auto dirN = cp6TempDir("stall_held_n");
+    Log logH(dirH.string(), /*rollBytes=*/128);
+    Log logN(dirN.string(), /*rollBytes=*/128);
+    Cp6NullTransport transport;
+    {
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        RecordBatchBuilder b(0, nowMs);   // a live idempotent producer's only batch: holds the watermark at 0
+        b.setProducerId(77);
+        b.setProducerEpoch(0);
+        b.setBaseSequence(0);
+        b.append("idle", "v", nowMs);
+        logH.append(b.build(), 0);
+    }
+    constexpr int64_t kOpenTxn = 41;
+    for (int v = 1; v < kOpenTxn; ++v) logH.append(cp6Batch(v, "key_" + std::to_string(v), "v"), v);
+    {
+        RecordBatchBuilder b(kOpenTxn, 1000);   // never committed: the cleaner's limit
+        b.setProducerId(88);
+        b.setProducerEpoch(0);
+        b.setBaseSequence(0);
+        b.setTransactional(true);
+        b.append("txn", "v", 1000);
+        logH.append(b.build(), kOpenTxn);
+    }
+    for (int v = kOpenTxn + 1; v < kOpenTxn + 20; ++v) logH.append(cp6Batch(v, "after", "v"), v);
+    constexpr int kKeys = 150;
+    for (int i = 0; i < 2 * kKeys; ++i) logN.append(cp6Batch(i, "n" + std::to_string(i % kKeys), "v" + std::to_string(i)), i);
+    constexpr int kTails = 4;   // unique keys last: the active segment shadows no older copy, so converged = kKeys + kTails
+    for (int i = 2 * kKeys; i < 2 * kKeys + kTails; ++i) logN.append(cp6Batch(i, "tail" + std::to_string(i), "v"), i);
+
+    auto cfgH = makeCompactConfig(721, 0.0);
+    cfgH.producerTailDepth = rune::storage::kRetryWindowSize;
+    cfgH.deleteRetentionMs = 0;   // the retry time of a stalled pass is the shorter of this and the producer expiry
+    auto cfgN = makeCompactConfig(722, 0.0);
+    cfgN.deleteRetentionMs = 0;
+    auto make = [&](const auto& cfg, Log& log) {
+        auto r = std::make_unique<PartitionReplica>(cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+        r->publishCleanerLso(PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig: the scan is the only txn bound
+        r->publishCleanerVerdictBound(PartitionReplica::kNoCleanerLso);
+        r->becomeLeader(1, {1});
+        r->onLeaderLogAppended();
+        return r;
+    };
+    auto ownedH = make(cfgH, logH);
+    auto ownedN = make(cfgN, logN);
+    PartitionReplica* repH = ownedH.get();
+    rune::node::ReplicaRegistry registry;
+    registry.add(721, 0, std::move(ownedH));
+    registry.add(722, 0, std::move(ownedN));
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent duty(dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+    rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0, /*dedupeBufferBytes=*/1024);
+    ASSERT_LT(rune::storage::SkimpyOffsetMap::sizingForBudget(1024).maxSlots, static_cast<std::size_t>(kKeys))
+        << "precondition: N needs more than one pass";
+
+    int64_t nowNs = 0;
+    bool converged = false;
+    for (int i = 0; i < 4000 && !converged; ++i) {
+        if (i % 16 == 0) {
+            logN.reloadSegments();
+            logH.reloadSegments();
+            converged = cp6CountLiveRecords(logN) == kKeys + kTails;
+        }
+        nowNs += 1'000'000;
+        cleaner.doWork(nowNs);
+        duty.doWork(nowNs);
+    }
+    EXPECT_TRUE(converged) << "N still holds " << cp6CountLiveRecords(logN) << " records (" << kKeys + kTails << " keys): the held log starved it";
+    EXPECT_EQ(repH->lastCleanOffset(), 0) << "the idle producer holds H's watermark";
+    fs::remove_all(dirH);
+    fs::remove_all(dirN);
 }
 
 // A log whose pass cannot advance must not starve the others (TypedRemoveRoutesAsSendForEveryKeyWidthShardRegression on CI:

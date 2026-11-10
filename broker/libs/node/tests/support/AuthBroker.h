@@ -87,6 +87,8 @@ public:
         bool tlsOnly = false;
         /// Applied to the node's config last, before the start (a test's own knobs, e.g. the provisioner cap).
         std::function<void(NodeConfig&)> configure;
+        /// The conductor idle sleep of the raw-frame clients (wire(), bootstrapAdmin); 0 = Aeron's 16 ms.
+        long wireIdleSleepMs = 0;
     };
     static constexpr const char* kBootstrapPassword = "bootstrap-otp-123456";
     static constexpr const char* kAdminPassword     = "admin-password-1234";
@@ -207,7 +209,7 @@ public:
 
     /// A fresh raw-frame client (its own embedded driver).  Owned here: it never outlives the broker.
     AuthWireClient& wire() {
-        wires_.push_back(std::make_unique<AuthWireClient>(clientDir()));
+        wires_.push_back(std::make_unique<AuthWireClient>(clientDir(), opts_.wireIdleSleepMs));
         return *wires_.back();
     }
 

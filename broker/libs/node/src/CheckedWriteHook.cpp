@@ -93,6 +93,7 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
         refusal_ = HookRefusal::ValidationFailed;
         return pc::ErrorCode::SchemaValidationFailed;
     }
+    anyIntent_ = intents.anyIntent;
     intents.keyZeroCreate = keyZeroCreates > 0;
     intents.mixedKeyZero  = keyZeroCreates > 0 && keyZeroCreates < recordCount;
     if (autoInc) [[unlikely]] {

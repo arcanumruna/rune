@@ -15,7 +15,7 @@ std::vector<ConsumedRecord> PartitionApi::consume(int64_t fromOffset, int32_t ma
     int64_t cursor = fromOffset;
     int64_t hw = highWatermark();
     while (cursor < hw) {
-        auto bytes = log_.read(cursor, maxBytes);
+        auto bytes = log_.readPastEmptied(cursor, maxBytes, hw);
         if (bytes.empty()) break;
         size_t pos = 0;
         bool advanced = false;

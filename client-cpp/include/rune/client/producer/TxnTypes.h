@@ -60,6 +60,9 @@ struct CoordAnswer {
     int16_t                  errorCode;
     std::span<const uint8_t> frame;
     bool                     anyKind = false;
+    uint32_t                 constraintId  = 0;    ///< EndTxn: the vote trailer (client 17), valid when hasVote
+    int64_t                  failingOffset = -1;
+    bool                     hasVote       = false;
 };
 
 /// What an answer's (kind, errorCode) means (FD5 / FD6).  The link retries Retry / Rediscover itself and
@@ -72,6 +75,7 @@ enum class Verdict : uint8_t {
     Fatal,        ///< FatalError(BrokerError ec): InitProducerId any other code, 45 on InitProducerId / EndTxn, EndTxn 19
     Abortable,    ///< AbortableError(BrokerError ec): AddPartitions / AddOffsets / TxnOffsetCommit failures, 45 there
     Reject,       ///< 39 InvalidRequest: never retried; BrokerError(39) (AbortableError inside a transaction)
+    VotedNo,      ///< EndTxn: a partition voted no (55 / 56 / 57 / 62 / 63): the transaction is aborted, the answer is definite
 };
 
 /// Function pointer + context (no std::function): offer one frame to the coordinator session.

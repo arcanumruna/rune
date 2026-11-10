@@ -61,7 +61,9 @@ public:
         // pumped by this thread between probes; the default pump sleeps 1 ms.
         sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); }, rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers
         if (!sub_) {
-            throw std::runtime_error("AeronIngress: subscription not resolved within timeout");
+            throw std::runtime_error("AeronIngress: subscription " + channel + " stream " + std::to_string(streamId) +
+                                     (pump.deadlineExpired() ? " not answered by the driver within the startup deadline"
+                                                             : " not resolved"));
         }
     }
 
