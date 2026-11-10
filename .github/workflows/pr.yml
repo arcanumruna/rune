@@ -265,6 +265,10 @@ jobs:
         run: |
           python3 broker/scripts/check_no_rune_topics.py broker
           python3 broker/scripts/test_check_no_rune_topics.py
+      - name: No topics directory literal outside NamespacePaths
+        run: |
+          python3 broker/scripts/check_no_topics_literal.py broker
+          python3 broker/scripts/test_check_no_topics_literal.py
       - name: Bench launchers are auth compatible
         run: bash broker/bench/kafka-compare/check-auth-config.sh
 

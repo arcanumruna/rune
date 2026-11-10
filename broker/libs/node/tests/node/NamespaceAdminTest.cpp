@@ -301,7 +301,7 @@ TEST(NamespaceAdminRegression, TopicDdlLandsInNsRegression) {
     ASSERT_NE(t, nullptr);
     EXPECT_EQ(t->nsId, 1u);
     EXPECT_EQ(st.topicByName(cat::kDefaultNsId, "t"), nullptr) << "names are per namespace";
-    EXPECT_EQ(rune::node::topicsRoot(rig.root(), t->nsId), rig.root() / "ns-1" / "topics");
+    EXPECT_EQ(rune::node::topicsRoot(rig.root(), t->nsId), rig.root() / "ns-1" / rune::node::kTopicsDirName);
     // The same name in ns 0 is a different topic, not a duplicate.
     EXPECT_EQ(rig.define({.name = "t", .partitions = 1, .typed = true}).code, kCodeOk);
 }
