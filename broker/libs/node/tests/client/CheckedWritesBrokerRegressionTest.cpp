@@ -2411,7 +2411,6 @@ std::vector<uint8_t> aiViewPlan(int32_t srcTopicId) {
     return rv::serializeAuthored(p);
 }
 
-/// The `n` of view row `id` ([bitmap][id][n]); nullopt = absent.  Retries only what a moving leader or a building view answers.
 /// The n of a row [bitmap][id][n].
 int64_t aiRowValue(const std::vector<uint8_t>& row) {
     int64_t n = 0;
@@ -2419,6 +2418,7 @@ int64_t aiRowValue(const std::vector<uint8_t>& row) {
     return n;
 }
 
+/// The `n` of view row `id` ([bitmap][id][n]); nullopt = absent.  Retries only what a moving leader or a building view answers.
 std::optional<int64_t> aiRowN(rc::Client& reader, int32_t viewTopicId, uint64_t id) {
     rc::ViewRowResult row;
     for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(100ms)) {
@@ -2622,7 +2622,6 @@ TEST(CheckedWritesBrokerRegression, ModuloRoutingIsTheSameOnEveryPathShardRegres
     }
     for (auto& k : keyed) k->unsubscribe();   // their destructors then find every subscription finished
 
-
     // The gateway resolves the partition of an explicit update (partitionKnown = 0).
     rc::Client& blind = *b.connectClient();
     blind.producePartitionUnknownForTest(true);
@@ -2641,7 +2640,6 @@ TEST(CheckedWritesBrokerRegression, ModuloRoutingIsTheSameOnEveryPathShardRegres
 }
 
 TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
-
     auto driverStart = std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
     AuthBroker b("ai-import", {.shard = true, .configure = [](NodeConfig& cfg) { cfg.testAeronClientIdleSleepMs = 1; }, .wireIdleSleepMs = 1});
     const auto driver = driverStart.get();
@@ -2689,7 +2687,7 @@ TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
         EXPECT_EQ(denied.status(), rc::OpStatus::BrokerError);
         EXPECT_EQ(denied.code(), kNotAuthorized);
         EXPECT_EQ(storedValues(b.node(), t.topicId, 0).size(), stored) << "a refused import appends nothing";
-    const auto granted = backfillW.topic.insertAndWait(AiUser{.userId = explicitId, .provider = 1, .subject = "imported"}, 10s);
+        const auto granted = backfillW.topic.insertAndWait(AiUser{.userId = explicitId, .provider = 1, .subject = "imported"}, 10s);
         EXPECT_TRUE(granted.ok()) << "code " << granted.code();
         EXPECT_EQ(granted.key(), 0u) << "only a key-0 create is answered with an id (P6-10)";
         EXPECT_EQ(backfillW.topic.insertAndWait(AiUser{.userId = explicitId, .provider = 1, .subject = "again"}, 10s).code(), kKeyExists);
@@ -3339,7 +3337,6 @@ TEST(CheckedWritesBrokerRegression, WideViewSurvivesRestartShardRegression) {
     rcv::ViewKeyBuilder users   = keyBuilder(b.node(), "account_characters");
 
     constexpr uint64_t kTotal = 600;
-
     std::vector<std::string> names(kTotal);
     {
         KeyedSender w(b.clientConfig(), "character", t.topicId, 1, kAllView);
