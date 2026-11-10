@@ -16,8 +16,8 @@
 //              remove ok; insert ok; every 4th id then remove ok (the removed set the restart leg re-inserts).
 //   verify     subscribes from 0 on every partition and compares the delivered (id, op) multiset to the accepted writes in
 //              the result files.  Prints CHECKED-WRITES-VERIFY: OK.
-//   refusals   key.index on a transient topic, an untyped topic, a keyless topic and a string(9) key: InvalidRequest with
-//              the exact detail of each.  Prints CHECKED-WRITES-REFUSALS: OK.
+//   refusals   key.index on a transient topic, an untyped topic and a keyless topic: InvalidRequest with the exact detail of
+//              each; on a string(9) key it is accepted (keys up to 16 bytes).  Prints CHECKED-WRITES-REFUSALS: OK.
 //
 // The autoincrement legs (Part 06) use ai_user {userId key, provider, subject, createdAt} and write `<id> <op> <code>` where id is
 // the id the write was answered with (a key-0 create) or sent (an import); the user comes from RUNE_USER.
@@ -457,7 +457,10 @@ int runRefusals() {
     expectRefused(c.defineTopicAndWait("ki_transient", 1, "id", blob, Persistence::Transient, to, {}, 60s), "transient", "key.index needs a persisted topic");
     expectRefused(c.defineTopicAndWait("ki_untyped", 1, "", std::span<const uint8_t>{}, Persistence::Disk, to, {}, 60s), "untyped", "key.index needs a typed topic");
     expectRefused(c.defineTopicAndWait("ki_keyless", 1, "", rune::codec::serialize(keyless), Persistence::Disk, to, {}, 60s), "keyless", "key.index needs a key");
-    expectRefused(c.defineTopicAndWait("ki_wide", 1, "k", rune::codec::serialize(wide), Persistence::Disk, to, {}, 60s), "string(9) key", "key.index needs a key of at most 8 bytes");
+    if (const auto r = c.defineTopicAndWait("ki_wide", 1, "k", rune::codec::serialize(wide), Persistence::Disk, to, {}, 60s); r.errorCode != 0) {   // keys up to 16 bytes (Part 07)
+        ++bad;
+        fail("CHECKED-WRITES-REFUSALS", "string(9) key: error " + std::to_string(r.errorCode) + " '" + r.detail + "', want 0");
+    }
     if (bad != 0) return 1;
     std::printf("CHECKED-WRITES-REFUSALS: OK\n");
     std::fflush(stdout);

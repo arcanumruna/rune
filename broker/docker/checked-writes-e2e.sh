@@ -14,8 +14,8 @@
 #                 that produced it, and none of the 56 / 57 rejected ones;
 #   5. RESTART:   rolling restart of all three nodes (`docker restart`); re-inserting every live id gives 56, every removed id gives ok; VERIFY
 #                 again over the grown log (the key index was rebuilt from the log);
-#   6. REFUSALS:  key.index on a transient topic, an untyped topic, a keyless topic and a string(9) key give InvalidRequest with
-#                 the four exact messages;
+#   6. REFUSALS:  key.index on a transient topic, an untyped topic and a keyless topic give InvalidRequest with the three exact
+#                 messages; on a string(9) key it is accepted (keys up to 16 bytes);
 #   7. AUTOINC:   ai_user (1 partition, replicas 3, compact, autoincrement); the `backfill` user (write + import) imports ids 1-4999
 #                 in steps of 2 (ids kept); 4 `app` probes (write) create key-0 x 5,000 each, the partition leader `docker kill`ed at
 #                 ~30 % and restarted once progress resumes.  Check: every returned id is unique and above 4,999, none is StoredIdUnknown /
@@ -437,7 +437,7 @@ log "Leg 5 OK"
 # Leg 6: REFUSALS.
 # ---------------------------------------------------------------------------
 LEG="leg 6"
-log "Leg 6: REFUSALS: key.index on a transient, an untyped, a keyless and a string(9)-keyed topic..."
+log "Leg 6: REFUSALS: key.index on a transient, an untyped and a keyless topic; accepted on a string(9)-keyed one..."
 leg refusals "${LEG_S}" "CHECKED-WRITES-REFUSALS: OK" refusals
 log "Leg 6 OK"
 
