@@ -179,7 +179,7 @@ ATOMIC_DECL_RE = re.compile(
     r"(?:\b(?:\w+::)*atomic(?:_ref)?\s*<[^;{}()]*?>|\b_Atomic\s*\([^)]*\)|\b_Atomic\s+[\w:\s*]+?)"
     r"\s*[*&]?\s*(\w+)\s*(?:[{=;\[]|\()")
 
-CATEGORIES = {"RING", "CLEANER", "CRASH-ORDER", "CPU-HINT", "CYCLE-COUNTER", "SLICE-B", "UNSCOPED", "DEBUG-ONLY"}
+CATEGORIES = {"RING", "CLEANER", "CRASH-ORDER", "CPU-HINT", "CYCLE-COUNTER", "SLICE-B", "UNSCOPED", "DEBUG-ONLY", "STARTUP"}
 SOURCE_EXTS = {".cpp", ".h", ".hpp", ".cc", ".cxx", ".ipp", ".inl"}
 SKIP_DIR_NAMES = {"tests", "build", "build-fast", "build-tsan", "build-release",
                   "cmake-build-debug", "cmake-build-release", ".git", "_deps"}

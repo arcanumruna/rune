@@ -20,6 +20,8 @@
 #   UNSCOPED    — TEMPORARY: owned by neither slice yet; must be converted.
 #   DEBUG-ONLY  — a debug-build test record, compiled out of release builds
 #                 (no production coordination).
+#   STARTUP     — the fused-startup gate: the starter and interim pump threads share one
+#                 invoker-mode Aeron client, which no ring can carry (startup only).
 
 # ------------------------------------------------------------ RING
 libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | #include <atomic> | 1 | RING | agrona ring implementation internals
@@ -238,3 +240,14 @@ libs/storage/src/Log.cpp | const uint8_t prev = snapMiddle_.exchange(mine, std::
 libs/node/include/rune/node/RuneMetricSlot.h | #include <atomic> | 1 | DEBUG-ONLY | D58 metric owner-tag record (NDEBUG compiles it out)
 libs/node/include/rune/node/RuneMetricSlot.h | std::atomic_ref<std::uint8_t>(*writtenBy_).fetch_or(metricOwnerBit(by), std::memory_order_relaxed); | 1 | DEBUG-ONLY | D58 metric owner-tag record: a second writer thread must not race the tag (NDEBUG compiles it out)
 libs/node/include/rune/node/BrokerNode.h | return std::atomic_ref<std::uint8_t>(b).load(std::memory_order_relaxed); | 1 | DEBUG-ONLY | D58 test seam reading the owner-tag record (always 0 in release builds)
+
+# ------------------------------------------------------------ STARTUP
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | #include <atomic> | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | [[nodiscard]] bool tryLock() noexcept { return !busy_.exchange(true, std::memory_order_acquire); } | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | void unlock() noexcept { busy_.store(false, std::memory_order_release); } | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | holder_.store(std::this_thread::get_id(), std::memory_order_relaxed); | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | if (holder_.exchange(std::thread::id{}, std::memory_order_relaxed) != std::thread::id{}) unlock(); | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | return g && g->holder_.load(std::memory_order_relaxed) == std::this_thread::get_id() ? g : nullptr; | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | static StartupClientGate*& held() noexcept { thread_local StartupClientGate* g = nullptr; return g; } | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | std::atomic<bool> busy_{false}; | 1 | STARTUP | fused-startup client gate (StartupClientGate)
+libs/aeronutil/include/rune/aeronutil/AeronPump.h | std::atomic<std::thread::id> holder_{}; | 1 | STARTUP | fused-startup client gate (StartupClientGate)

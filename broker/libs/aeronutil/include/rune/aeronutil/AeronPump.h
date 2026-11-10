@@ -35,18 +35,18 @@ public:
     /// Starter thread: hold the gate until release() (resolve() lets go around its sleeps).
     void acquire() noexcept {
         while (!tryLock()) std::this_thread::yield();
-        owner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        holder_.store(std::this_thread::get_id(), std::memory_order_relaxed);
         held() = this;
     }
     /// Idempotent; also valid from another thread than the holder.
     void release() noexcept {
         if (held() == this) held() = nullptr;   // the TLS pointer must not outlive the gate's owner
-        if (owner_.exchange(std::thread::id{}, std::memory_order_relaxed) != std::thread::id{}) unlock();
+        if (holder_.exchange(std::thread::id{}, std::memory_order_relaxed) != std::thread::id{}) unlock();
     }
     /// The gate this thread currently holds, else nullptr.
     [[nodiscard]] static StartupClientGate* heldHere() noexcept {
         StartupClientGate* g = held();
-        return g && g->owner_.load(std::memory_order_relaxed) == std::this_thread::get_id() ? g : nullptr;
+        return g && g->holder_.load(std::memory_order_relaxed) == std::this_thread::get_id() ? g : nullptr;
     }
 
     /// Lets the pump thread through for a long non-client stall of the holder, then takes the gate back.
@@ -63,7 +63,7 @@ public:
 private:
     static StartupClientGate*& held() noexcept { thread_local StartupClientGate* g = nullptr; return g; }
     std::atomic<bool>           busy_{false};
-    std::atomic<std::thread::id> owner_{};
+    std::atomic<std::thread::id> holder_{};
 };
 
 class AeronPump {
