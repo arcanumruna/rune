@@ -232,7 +232,7 @@ struct DeferredTxn {
     int64_t     holdFrom = INT64_MAX;   ///< below firstOffset: an applied ordinary span holds it (the coverage never splits that span)
 };
 /// `judgeOffset`: the J the vote waits for; -1 while the worker's vote-time scan runs (only the worker answers those).
-struct ParkedVote { int64_t token = 0; int32_t originNode = -1; int64_t producerId = -1; int16_t epoch = -1; int64_t judgeOffset = -1; int64_t receivedNs = 0; };
+struct ParkedVote { int64_t token = 0; int32_t originNode = -1; int64_t producerId = -1; int16_t epoch = -1; int64_t judgeOffset = -1; int64_t receivedNs = 0; int64_t first = -1; };
 
 /// The transactions of one source between their TxnJudge record and their marker, in judge-offset order.  Everything is reserved
 /// by reserve(); no call allocates after it.  A full table refuses the record (nullptr): the judge waits there, never a verdict.
@@ -400,14 +400,14 @@ public:
         parked_.resize(kept);
         return n;
     }
-    /// fn(const ParkedVote&) for the producer's scanning votes (J -1), which leave the park; `bindTo` >= 0 binds them to that J instead.
+    /// fn(const ParkedVote&) for the scanning votes (J -1) of the producer's transaction from `first`, which leave the park; `bindTo` >= 0 binds them to that J instead.
     template <class Fn>
-    int takeScanning(int64_t producerId, int64_t bindTo, Fn&& fn) noexcept {
+    int takeScanning(int64_t producerId, int64_t first, int64_t bindTo, Fn&& fn) noexcept {
         int n = 0;
         std::size_t kept = 0;
         for (std::size_t i = 0; i < parked_.size(); ++i) {
             ParkedVote& v = parked_[i];
-            if (v.producerId == producerId && v.judgeOffset < 0) {
+            if (v.producerId == producerId && v.first == first && v.judgeOffset < 0) {
                 ++n;
                 if (bindTo >= 0) v.judgeOffset = bindTo;
                 else { fn(v); continue; }

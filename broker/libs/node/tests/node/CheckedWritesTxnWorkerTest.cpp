@@ -487,6 +487,38 @@ TEST(CheckedWritesTxnWorker, AbortWhileTheScanWaitsForTheHwWritesNoJudgeRegressi
     k.r.onEveryPass({});
 }
 
+// Final review I1: a transaction of the producer ends while its vote's scan waits for the HW, and the producer's next transaction
+// (a re-init's bumped epoch, or the same epoch after a failover abort) votes meanwhile.  The old scan answers only the votes parked
+// for its own transaction: the next one gets its own scan and J, and is judged.
+void nextTxnVoteIsJudgedByItsOwnScan(int16_t nextEpoch, int32_t nextSeq) {
+    Ki k(/*follower=*/true);
+    k.txn(48, {ins(7)});
+    ASSERT_EQ(k.vote(48).errorCode, 0);
+    k.r.marker(48, true);
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    k.txn(49, {ins(1)});
+    k.r.followerFetch();
+    (void)k.r.produceFrame({ups(2)}, kLeader, 49, 1, /*txn=*/true);
+    k.r.passes(5);
+    const int64_t first = k.r.sendVote(VerdictRig::kSrc, 49, 0);
+    k.r.passes(30);
+    ASSERT_FALSE(k.r.voteReply(first)) << "the scan waits for the HW";
+    k.r.marker(49, false);
+    (void)k.r.produceFrame({ins(7)}, kLeader, 49, nextSeq, /*txn=*/true, nextEpoch);   // the taken key
+    k.r.passes(5);
+    const int64_t second = k.r.sendVote(VerdictRig::kSrc, 49, nextEpoch);
+    k.r.passes(30);
+    ASSERT_FALSE(k.r.voteReply(second));
+    ASSERT_TRUE(k.r.driveUntilVoted(second));
+    EXPECT_EQ(k.r.voteReply(second)->errorCode, 0);
+    EXPECT_EQ(k.r.voteReply(second)->code, kKeyExists) << "the first transaction's scan answered the second's vote yes";
+    EXPECT_GE(k.r.voteReply(second)->judgeOffset, 0);
+    ASSERT_TRUE(k.r.driveUntilVoted(first));
+    EXPECT_EQ(k.r.worker->parkedVotesForTest(), 0);
+}
+TEST(CheckedWritesTxnWorkerRegression, EndedTxnScanDoesNotAnswerTheNextEpochsVoteRegression) { nextTxnVoteIsJudgedByItsOwnScan(1, 0); }
+TEST(CheckedWritesTxnWorkerRegression, EndedTxnScanDoesNotAnswerTheSameEpochsNextVoteRegression) { nextTxnVoteIsJudgedByItsOwnScan(0, 2); }
+
 // Task 7 (T7 review 1, F6): a vote the full park refuses leaves no scan behind: driven by the other parked votes, it would append a J
 // nobody waits for, or sit until the next vote.
 TEST(CheckedWritesTxnWorker, RefusedParkLeavesNoScanRegression) {

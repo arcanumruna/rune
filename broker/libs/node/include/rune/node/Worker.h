@@ -7944,10 +7944,11 @@ private:
             answerTxnVoteNotLeader_(op);
             return;
         }
+        v.first = first;
         bool scanned = false;
         if (const DeferredTxn* t = ws->txn.find(v.producerId); t != nullptr && t->firstOffset == first) {
             v.judgeOffset = t->judgeOffset;   // J is in the log: answered once the judge judged it
-        } else if (std::none_of(voteScans_.begin(), voteScans_.end(), [&](const VoteScan& s) { return s.ws == ws && s.producerId == v.producerId; })) {
+        } else if (std::none_of(voteScans_.begin(), voteScans_.end(), [&](const VoteScan& s) { return s.ws == ws && s.producerId == v.producerId && s.first == first; })) {
             if (voteScans_.size() >= kMaxVoteScans) {
                 answerTxnVoteNotLeader_(op);
                 return;
@@ -7972,7 +7973,7 @@ private:
         PartitionWriteState& ws = *s.ws;
         rune::replication::PartitionReplica& rep = *s.replica;
         const auto answerAll = [&](int16_t err, const TxnVoteAnswer& a) {
-            (void)ws.txn.takeScanning(s.producerId, -1, [&](const ParkedVote& v) { answerVote_(ws, v, err, a, -1, nowNs, true); });
+            (void)ws.txn.takeScanning(s.producerId, s.first, -1, [&](const ParkedVote& v) { answerVote_(ws, v, err, a, -1, nowNs, true); });
         };
         if (rep.role() != rune::replication::Role::Leader || rep.leadershipGeneration() != s.leaderGen || rep.log() == nullptr) {
             answerAll(static_cast<int16_t>(pc::ErrorCode::NotLeader), {});
@@ -8045,7 +8046,7 @@ private:
         }
         if (base < 0) return false;   // min-ISR or back-pressure: the next pass appends again
         (void)ws.txn.onJudgeRecord(base, rec);
-        (void)ws.txn.takeScanning(s.producerId, base, [](const ParkedVote&) {});
+        (void)ws.txn.takeScanning(s.producerId, s.first, base, [](const ParkedVote&) {});
         return true;
     }
 

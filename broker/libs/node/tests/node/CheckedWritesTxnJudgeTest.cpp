@@ -296,7 +296,7 @@ TEST(CheckedWritesTxnState, VoteBoundToAReplacedJudgeIsAnsweredWithNoneRegressio
     auto t = reserved();
     ASSERT_NE(t.onJudgeRecord(500, {77, 3, 400}), nullptr);
     ASSERT_TRUE(t.parkVote({1, 0, 77, 3, 500}));
-    ASSERT_TRUE(t.parkVote({2, 0, 77, 3, -1}));
+    ASSERT_TRUE(t.parkVote({2, 0, 77, 3, -1, 0, 850}));
     t.onMarker(77, 520, false);
     t.find(77)->phase = TxnPhase::Finalized;
     ASSERT_NE(t.onJudgeRecord(900, {77, 3, 850}), nullptr);
@@ -307,7 +307,7 @@ TEST(CheckedWritesTxnState, VoteBoundToAReplacedJudgeIsAnsweredWithNoneRegressio
     ASSERT_EQ(seen.size(), 1u);
     EXPECT_EQ(seen[0], std::make_pair(int64_t(1), false));
     EXPECT_EQ(t.parkedCount(), 1u);
-    EXPECT_EQ(t.takeScanning(77, 900, [](const ParkedVote&) {}), 1);
+    EXPECT_EQ(t.takeScanning(77, 850, 900, [](const ParkedVote&) {}), 1);
     EXPECT_EQ(t.drainAnswered([&](const ParkedVote& v, const DeferredTxn* d) { seen.emplace_back(v.token, d != nullptr); }), 1);
     EXPECT_EQ(seen[1], std::make_pair(int64_t(2), true));
 }
