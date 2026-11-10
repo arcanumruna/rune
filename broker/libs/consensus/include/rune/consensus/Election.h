@@ -661,7 +661,7 @@ private:
         }
     }
     uint64_t standDowns_ = 0;
-    /// Canvass, Nominate, CandidateBallot: true = this node must not stand (re-sends its StandDown when workCount > 0).
+    /// Canvass, Nominate, CandidateBallot: true = this node must not stand (a stood-down or resigned node re-sends its StandDown when workCount > 0; a held one never).
     bool candidacyBlocks_(int64_t nowNs, int workCount);
     /// Entry time of this node's current leadership (LeaderLogReplication);
     /// INT64_MIN = never led.  The failover-liveness grace (eligibleNodeIds).
