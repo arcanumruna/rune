@@ -1796,13 +1796,20 @@ private:
         }
     }
     void waitJudged_(VerdictRig& r, int64_t pid, bool commit) {
-        const int64_t upTo = &r == &a_ && racing_ && pid == kPid77 ? racingFrom_ : -1;   // the judge waits at the second transaction's first record
-        EXPECT_TRUE(commit ? r.driveUntilJudged(upTo) : r.driveUntilJudgeReaches(upTo));
+        if (&r != &a_ || !racing_ || pid != kPid77) {
+            EXPECT_TRUE(commit ? r.driveUntilJudged() : r.driveUntilJudgeReaches());
+            return;
+        }
+        // The judge waits at the second transaction's first record; the markers cover the records below it.  Not through it: a marker
+        // logged after 77's J may lie just below 79, and a marker is no record to cover.
+        EXPECT_TRUE(r.driveUntilJudgeReaches(racingFrom_));
+        if (commit) EXPECT_TRUE(r.driveUntilJudged(racingData_));
     }
     // Producer 78's create for U after the yes and before the marker: it touches U's locked account_stats row, so the judge pauses there.
     void afterVote_(int64_t pid) {
         if (pid != kPid77) return;
         if (racing_) {   // the judge waits at a transaction that is neither voted nor ended: 79 opens after J of 77
+            racingData_ = a_.dataEnd();
             racingFrom_ = a_.leo();
             writeTxn_(kPid79, second_);
         }
@@ -2248,6 +2255,7 @@ private:
     std::map<int64_t, bool> ended_;
     bool acksLost_ = false;
     int64_t racingFrom_ = -1;   ///< the first offset of transaction 79
+    int64_t racingData_ = -1;   ///< one past the last data or change record below it
     std::vector<int64_t> outside_;   ///< the offsets of producer 78's records
 };
 
