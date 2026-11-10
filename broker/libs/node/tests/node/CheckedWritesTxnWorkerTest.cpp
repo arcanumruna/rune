@@ -1046,6 +1046,24 @@ TEST(CheckedWritesTxnWorker, DemotedJudgeReleasesTheOneStepSetRegression) {
     EXPECT_FALSE(pool.oneStepHeld());
 }
 
+// A demoted judge is driven again only by a new leadership, which judges its transactions anew: the overlay a Locked transaction
+// holds goes back at the demotion, not when the judge is erased, and the next leadership still applies the transaction at its marker.
+TEST(CheckedWritesTxnWorkerRegression, DemotedJudgeReleasesItsLockedOverlaysRegression) {
+    Ki k;
+    auto& pool = k.r.vs->txnOverlaysForTest();
+    k.txn(56, {ins(5)});
+    ASSERT_EQ(k.vote(56).code, 0);
+    ASSERT_EQ(k.r.writeState()->txn.find(56)->phase, TxnPhase::Locked);
+    ASSERT_EQ(pool.freeCount(), rune::view::kTxnOverlaysPerWorker - 1);
+    k.r.demote();
+    EXPECT_EQ(pool.freeCount(), rune::view::kTxnOverlaysPerWorker) << "the demoted judge still holds the Locked transaction's overlay";
+    k.r.promote();
+    k.r.marker(56, true);
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{5}));
+    EXPECT_EQ(pool.freeCount(), rune::view::kTxnOverlaysPerWorker);
+}
+
 // A voted transaction aborted at its marker: a persisted member restarted from its checkpoint refolds to the leader's rows.
 TEST(CheckedWritesTxnWorker, VotedAbortedRefoldsEqual) {
     Persisted p;

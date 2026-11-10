@@ -312,11 +312,17 @@ public:
     /// it before the table is reset.
     void releaseTxnOverlays(TxnJudgeState& txn) noexcept;
     /// Gives back the one-step set this source holds mid-segment; its walk collects anew if it claims again.  The worker calls it
-    /// for a partition it no longer drives as leader, so a demoted source never keeps the other sources waiting.
+    /// for a partition it does not drive while its leadership scan rebuilds, so that source never keeps the other sources waiting.
     void releaseOneStep() noexcept {
         if (oneStepClaim_ != 0) txnPool_->releaseOneStep(oneStepClaim_);
         oneStepClaim_ = 0;
         stepParked_ = false;
+    }
+    /// The worker no longer drives this source as leader: the one-step set and every overlay its transactions hold go back, so a
+    /// demoted source neither keeps the other sources waiting nor holds the pool.  A new leadership re-activates it and judges them anew.
+    void releaseDemoted(TxnJudgeState& txn) noexcept {
+        if (txnLocks_.locked.empty()) releaseOneStep();
+        else releaseTxnOverlays(txn);
     }
     /// The leadership scan's begin: the overlays go back, and the judge re-activates from K once the scan is done (the table's
     /// entries are judged anew, so a reset Locked entry gets its apply).

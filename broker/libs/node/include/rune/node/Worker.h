@@ -7434,7 +7434,7 @@ private:
                 if (w == nullptr || (w->verdicts == nullptr && w->constraintSets.latest().empty() && !w->spec->keyIndex)) continue;   // a verdict source without its views still judges nothing, but is driven (it waits); a key index needs no view; a live judge is driven until ensureVerdictSource erases it (#807)
             }
             if (replica->role() != rune::replication::Role::Leader) {
-                if (PartitionWriteState* w = writeOf_(replica); w != nullptr && w->verdicts != nullptr) w->verdicts->releaseOneStep();   // T7 N3: a demoted judge is not driven
+                if (PartitionWriteState* w = writeOf_(replica); w != nullptr && w->verdicts != nullptr) w->verdicts->releaseDemoted(w->txn);   // T7 N3: a demoted judge is not driven
                 continue;
             }
             const RcState* rcState = rcServe_(replica, rcOf_(replica));
