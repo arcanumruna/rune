@@ -133,3 +133,16 @@ TEST(CheckedWritesTimelineRegression, MarkerLedgerLeftOutFullMarkerKeepsTheChain
     EXPECT_FALSE(m.onMarker(2002, 3500, true));
     EXPECT_FALSE(m.chainOpen());
 }
+
+// REGRESSION (slow-bc review 1): a committed full marker leaves the ring at the HW, and the leadership scan's truncate at the LEO rebuilt
+// appendedThrough without it: the new leader re-marked a marked range, and the chain read closed with no closing marker yet.
+TEST(CheckedWritesTimelineRegression, MarkerLedgerTruncateKeepsACommittedFullMarkersEndRegression) {
+    MarkerLedger m;
+    EXPECT_TRUE(m.onMarker(5, 100, true));
+    EXPECT_TRUE(m.onMarker(200, 9000, false));
+    m.onHw(201);
+    m.truncateFrom(10000);
+    EXPECT_EQ(m.appendedThrough(), 9000);
+    EXPECT_EQ(m.appendedClosedThrough(), 100);
+    EXPECT_TRUE(m.chainOpen()) << "no closing marker follows the committed full one";
+}

@@ -144,6 +144,7 @@ public:
     void onHw(int64_t hw) noexcept {
         while (count_ != 0 && at_(0).offset < hw) {
             committed_    = std::max(committed_, at_(0).closedThrough);
+            committedAppended_ = std::max(committedAppended_, at_(0).finalThrough);
             committedEnd_ = at_(0).offset + 1;
             head_         = (head_ + 1) % kCapacity;
             --count_;
@@ -160,7 +161,7 @@ public:
     void truncateFrom(int64_t offset) noexcept {
         while (count_ != 0 && at_(count_ - 1).offset >= offset) --count_;
         if (left_.offset >= offset) left_ = Slot{-1, 0, 0};   // a cut at or below the last marker left out: forget them all (re-marks more)
-        appended_ = std::max(committed_, left_.finalThrough);
+        appended_ = std::max({committed_, committedAppended_, left_.finalThrough});   // a committed full marker's end stays: it is in the log
         for (std::size_t i = 0; i < count_; ++i) appended_ = std::max(appended_, at_(i).finalThrough);
         appendedClosed_ = std::max(committed_, left_.closedThrough);
         for (std::size_t i = 0; i < count_; ++i) appendedClosed_ = std::max(appendedClosed_, at_(i).closedThrough);
@@ -172,6 +173,7 @@ private:
     std::array<Slot, kCapacity> ring_{};
     std::size_t head_ = 0, count_ = 0;
     int64_t committed_ = 0, committedEnd_ = 0, appended_ = 0, appendedClosed_ = 0;
+    int64_t committedAppended_ = 0;   // the highest finalThrough of a committed marker, full ones included
     Slot left_{-1, 0, 0};   // the markers a full ring left out: the last one's offset (-1 = none), the highest finalThrough
 };
 
