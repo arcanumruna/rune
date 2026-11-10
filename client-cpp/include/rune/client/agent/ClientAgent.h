@@ -1083,7 +1083,7 @@ private:
     // 7 retired (Phase 2b F: the txn-producer registration; transactions are Producer + transactionalId) - never reuse.
     static constexpr int32_t kMsgHubCommand = 8;          // F8a subscriber / group-consumer command
     static constexpr int32_t kMsgControlOp  = 9;          // F8c C3 client control op (header + frame)
-    static constexpr int32_t kMsgTestFault = 98;          // T15b test seam: transportClosed() -> true
+    static constexpr int32_t kMsgTestFault = 98;          // T15b test seam: transportClosed() -> true until the rebuild
     static constexpr int32_t kMsgTestNoop = 99;           // testFillCommandRing filler (dropped)
 
     // Task 1.3: per-session ConnectRequest correlationId range stride.  Session i

@@ -769,6 +769,24 @@ TEST(ClientShardRegression, RebuildFailureBacksOffWithoutSpinningRegression) {
     ASSERT_TRUE(r.drive([&] { return r.shard->client().testTransportRebuilds() == 1 && r.state() == rs::ShardState::Live; }, 10'000'000));
 }
 
+// The seed moved to another broker channel (a completed failover): the rebuild keeps it there, and the resume goes to
+// that broker, not back to the configured gateway.
+TEST(ClientShardRegression, RebuildKeepsTheFailedOverSeedChannelRegression) {
+    auto g = ownDriverGroup(3824, 3825);
+    const std::string ch2 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort());
+    OwnDriverRig r(g);
+    const int ep2 = r.gw().addEndpoint(ch2, g.base.gatewayStreamId);
+    r.connect();
+    ASSERT_TRUE(r.shard->client().testRetargetSeed(ch2));
+    ASSERT_TRUE(r.drive([&] { return r.gw().connectsAt[ep2] >= 1 && r.state() == rs::ShardState::Live; }, 100'000));
+    const int connectsAt2 = r.gw().connectsAt[ep2];
+    const int connectsAt1 = r.gw().connectsAt[0];
+    ASSERT_TRUE(faultAndRecover(r, 1));
+    EXPECT_EQ(r.shard->client().testSeedChannel(), ch2);
+    EXPECT_GT(r.gw().connectsAt[ep2], connectsAt2) << "the resume reached the failed-over broker";
+    EXPECT_EQ(r.gw().connectsAt[0], connectsAt1) << "and not the configured gateway";
+}
+
 // A seed Rejected stays terminal even when a transport fault happens at the same time.
 TEST(ClientShardRegression, SeedRejectedStaysTerminalEvenAfterTransportFaultRegression) {
     OwnDriverRig r(ownDriverGroup(3816, 3817));
@@ -799,17 +817,18 @@ TEST(ClientShardRegression, CloseDuringTransportDownIsBoundedExactlyOnceRegressi
     EXPECT_EQ(r.shard->status().state, rs::ShardState::Closed);
 }
 
-// An Agent-mode shard (its own duty thread, real clock) rebuilds after the transport fault too: Reconnecting, then
-// Live again, and the records accepted around the fault are acked exactly once.  The broker runs on its own driver,
-// pumped from this thread.
+// A Thread-runner client (its own duty thread and driver thread, real clock) rebuilds after the transport fault too: it
+// resumes and the records accepted around the fault are acked exactly once.  The broker runs on its own driver, pumped
+// from this thread.
 TEST(ClientShardRegression, ThreadModeClientRebuildsAfterTransportFaultRegression) {
     auto            g    = group(3820, 3821, 1, rs::ShardMode::Agent);
     const auto      port = rune::client::testing::allocFreeUdpPortRange(2);
     g.base.gatewayChannel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port);
     g.base.egressChannel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port + 1);
+    g.base.runnerMode     = rc::RunnerMode::Thread;
+    g.base.connectTimeoutMs = 300;   // the first resume is offered before the new UDP link is warm: retried at this timeout
     test_support::BrokerHost broker(test_support::BrokerHost::uniqueDir(), g.base.gatewayChannel, g.base.gatewayStreamId,
-                                    rs::shardClientConfig(g, 0).egressChannel, g.base.egressStreamId);
-    rs::ClientShard shard(g, 0);
+                                    g.base.egressChannel, g.base.egressStreamId);
     struct AtomicLedger {
         std::atomic<int64_t> ok{0}, records{0};
         static void on(void* ctx, const rc::BatchAck& a) noexcept {
@@ -818,30 +837,32 @@ TEST(ClientShardRegression, ThreadModeClientRebuildsAfterTransportFaultRegressio
             if (a.errorCode == 0) self->ok += a.recordCount;
         }
     } ledger;
-    shard.producer().onBatchAck(&AtomicLedger::on, &ledger);
-    std::vector<rs::ShardStatus> events;
+    rc::Client client(g.base);
+    auto       producer = client.producer(g.producer);
+    producer.onBatchAck(&AtomicLedger::on, &ledger);
     auto pumpUntil = [&](auto&& pred) {
         const auto deadline = std::chrono::steady_clock::now() + 10s;
         while (std::chrono::steady_clock::now() < deadline) {
             if (broker.gw.pump() == 0) std::this_thread::yield();
-            shard.pollEvents([&](const rs::ShardStatus& st) { events.push_back(st); });
             if (pred()) return true;
         }
         return false;
     };
     ASSERT_TRUE(pumpUntil([&] { return broker.gw.ready(); }));
-    rc::Completions cq(shard.client());
-    ASSERT_EQ(shard.connect(cq, 1), rc::OpResult::Accepted);
-    ASSERT_TRUE(pumpUntil([&] { return shard.status().state == rs::ShardState::Live; }));
-    const auto topic = shard.topic("t");
-    for (int i = 0; i < 5; ++i) ASSERT_EQ(shard.trySend(topic, keyFor(1), kVal), rc::SendResult::Ok);
-    shard.client().testInjectTransportFault();
-    for (int i = 0; i < 5; ++i) ASSERT_EQ(shard.trySend(topic, keyFor(2), kVal), rc::SendResult::Ok);
-    ASSERT_TRUE(pumpUntil([&] { return ledger.records.load() >= 10 && shard.client().testTransportRebuilds() == 1; }));
+    rc::Completions cq(client);
+    ASSERT_EQ(client.connect(cq, 1), rc::OpResult::Accepted);
+    ASSERT_TRUE(pumpUntil([&] { return client.state() == rc::session::SessionState::Connected; }));
+    const auto topic = client.topic("t");
+    for (int i = 0; i < 5; ++i) ASSERT_EQ(producer.trySend(topic, keyFor(1), kVal), rc::SendResult::Ok);
+    client.testInjectTransportFault();
+    for (int i = 0; i < 5; ++i) ASSERT_EQ(producer.trySend(topic, keyFor(2), kVal), rc::SendResult::Ok);
+    ASSERT_TRUE(pumpUntil([&] { return ledger.records.load() >= 10 && client.testTransportRebuilds() == 1; }));
     EXPECT_EQ(ledger.ok.load(), 10);
-    EXPECT_EQ(shard.status().state, rs::ShardState::Live);
-    for (const auto& e : events) EXPECT_NE(e.state, rs::ShardState::Failed);
-    shard.closeImmediately();
+    EXPECT_EQ(client.state(), rc::session::SessionState::Connected);
+    EXPECT_TRUE(client.testTransport().usesDriverThread());
+    EXPECT_EQ(client.testTransport().callerPumpViolations(), 0);
+    producer.closeAndWait(5s);
+    client.close();
 }
 
 #ifdef __linux__
