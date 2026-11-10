@@ -60,6 +60,7 @@ public:
         int64_t readyNs    = 0;
         int64_t deadlineNs = 0;       ///< the Fencing deadline (0 when not Fencing)
         uint64_t carried   = 0;       ///< Carry records appended
+        uint64_t checkpoints = 0;     ///< Checkpoint records appended (LeaseRuntime stats)
         bool    hasRing    = false;
         int64_t ringStart  = -1;      ///< memoryLog()->logStartOffset()
         int64_t ringEnd    = -1;      ///< memoryLog()->logEndOffset()
@@ -156,6 +157,7 @@ public:
                 r.readyNs = rt->readyNs();
                 if (const auto* f = std::get_if<rune::node::lease::LeaseRuntime::FenceFencing>(&rt->fenceState())) r.deadlineNs = f->deadlineNs;
                 r.carried = rt->stats().carried;
+                r.checkpoints = rt->stats().checkpointsAppended;
                 return r;
             });
             if (s.has || s.hasRing) return s;
@@ -199,6 +201,11 @@ public:
         if (!catalog_cluster::awaitLeaders(c_, t.id, t.partitions, leaders, 60s)) throw std::runtime_error("restartNode: no leaders");
     }
 
+    /// Checkpoint records the partition's current leader appended (0: no leader / runtime).
+    uint64_t checkpointsOnLeader(const Topic& t, int32_t partition) {
+        const int32_t l = leaderOf(t, partition);
+        return l > 0 ? runtimeOn(l, t.id, partition).checkpoints : 0;
+    }
     /// The ISR of (topic, partition) as running node `viewer` sees it.
     std::vector<int32_t> isrOn(int32_t viewer, const Topic& t, int32_t partition) {
         BrokerNode& n = c_.node(viewer);

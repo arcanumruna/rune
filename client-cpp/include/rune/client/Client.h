@@ -1122,11 +1122,12 @@ public:
     /// Invoker owner thread only (std::logic_error otherwise).
     std::size_t takeDdlRetryNotes(std::vector<DdlRetryNote>& out);
 
-    /// L22 fix 2: route-hint counters of the partition-routed control ops (view reads, lease ops).  Safe from any thread.
-    [[nodiscard]] uint64_t routeHintHits() const noexcept;      ///< ops that started on a remembered leader
-    [[nodiscard]] uint64_t routeHintLearned() const noexcept;   ///< hints stored from a followed Redirect
-    [[nodiscard]] uint64_t routeHintCleared() const noexcept;   ///< hints dropped (NotLeader, Redirect from a hinted node, lost session)
-    [[nodiscard]] uint64_t ctlRedirectsFollowed() const noexcept;   ///< Redirects followed by routed control ops
+    /// L22 fix 2: route-hint counters of the partition-routed control ops (view reads, lease ops).  The owner thread or a duty-cycle
+    /// callback (Thread mode: the latest values the duty thread published on its status ring).
+    [[nodiscard]] uint64_t routeHintHits() const;      ///< ops that started on a remembered leader
+    [[nodiscard]] uint64_t routeHintLearned() const;   ///< hints stored from a followed Redirect
+    [[nodiscard]] uint64_t routeHintCleared() const;   ///< hints dropped (NotLeader, Redirect from a hinted node, lost session)
+    [[nodiscard]] uint64_t ctlRedirectsFollowed() const;   ///< Redirects followed by routed control ops
 
     OpResult dropTopic(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token);
     OpResult dropView(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token);
@@ -2393,7 +2394,17 @@ private:
     std::vector<std::vector<uint8_t>> framePool_;      // Task 14a: recycled RoutedCtlPending frames (zero-alloc routed ops)
     std::vector<std::string>          endpointPool_;   // L22 fix 2: recycled RoutedCtlPending endpoints (capacity reserved)
     std::array<RouteHint, kRouteHintSlots> routeHints_;
-    uint64_t routeHintHits_ = 0, routeHintLearned_ = 0, routeHintCleared_ = 0, ctlRedirectsFollowed_ = 0;   // duty thread writes; diagnostics like routedBrokerSweeps_
+    /// The route-hint counters (duty thread); app threads read them through routeStats_ (Thread mode), never these words.
+    struct RouteStats {
+        uint64_t hits = 0, learned = 0, cleared = 0, redirects = 0;
+    };
+    static_assert(sizeof(RouteStats) == 32);
+    RouteStats routeStatsDuty_{};
+    bool       routeStatsDirty_ = false;   // duty: a newer value than the ring holds
+    mutable detail::StatusRing<RouteStats> routeStats_;   // duty -> owner (Thread mode)
+    mutable RouteStats routeStatsCache_{};                // owner: latest drained
+    void publishRouteStats_() noexcept;
+    [[nodiscard]] const RouteStats& routeStatsView_() const;
     [[nodiscard]] static std::size_t routeSlot_(int32_t topic, int32_t partition) noexcept;
     /// Forget the hint d.endpoint was taken from / learned (only while it still names d.endpoint).
     void forgetRouteHint_(const RoutedCtlPending& d) noexcept;

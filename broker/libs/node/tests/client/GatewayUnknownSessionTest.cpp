@@ -155,3 +155,79 @@ TEST(GatewayUnknownSessionRegression, StaleIdNeverLandsInAnotherSessionRegressio
     c1->close();
     c2->close();
 }
+
+// ---- #989 adversarial review (final whole-branch review) ----
+namespace {
+/// A NAT'd response-mode client (unreachable declared channel) on a follower of the catalog.
+struct RespClient {
+    Restarted r;
+    std::unique_ptr<rc::Client> client;
+    explicit RespClient(const char* tag) : r(tag, true) {}
+    void connect() {
+        ASSERT_TRUE(r.c.awaitCatalogLeader(30s));
+        r.node = aFollowerOfTheCatalog(r.c);
+        ASSERT_GT(r.node, 0);
+        rc::detail::ClientTestOptions opts;
+        opts.declaredEgressChannel = "aeron:udp?endpoint=192.0.2.1:40200";
+        client = std::make_unique<rc::Client>(slowTimeoutConfig(r.c, r.ports, r.node), opts);
+        client->connectAndWait(30s);
+        ASSERT_TRUE(client->testSeedResponseCorrelated()) << "vacuity guard: the session is response-paired";
+    }
+    bool pingOk() {
+        for (int i = 0; i < 50; ++i) {
+            try { (void)client->pingAndWait(std::span<const uint8_t>{}, 1s); return true; } catch (const std::exception&) {}
+        }
+        return false;
+    }
+};
+}  // namespace
+
+// Crash and restart, TWICE: the pair built by the first recovery must itself detect the second restart (its Egress state starts afresh,
+// a reused sub slot included).  Each recovery comes from the closed response image, never from the 60 s response timeout.
+TEST(GatewayUnknownSessionRegression, ResponseModeSecondRestartAlsoRecoversAdversarialRegression) {
+    RespClient rc1("unk-resp2");
+    ASSERT_NO_FATAL_FAILURE(rc1.connect());
+    for (uint64_t round = 1; round <= 2; ++round) {
+        const int64_t old = rc1.client->testSeedSessionId();
+        ASSERT_NE(old, 0);
+        rc1.r.c.crash(rc1.r.node);
+        rc1.r.c.startNode(rc1.r.node);
+        const bool recovered = pollUntil(6s, [&] { const int64_t s = rc1.client->testSeedSessionId(); return s != 0 && s != old; });
+        ASSERT_TRUE(recovered) << "round " << round << ": the session comes back within 6 s (response timeout is 60 s)";
+        EXPECT_EQ(rc1.client->testResponseEgressLosses(), round) << "round " << round << ": recovery came from the closed response image";
+        EXPECT_EQ(rc1.client->testSeedStaleSessionLosses(), 0u);
+        ASSERT_TRUE(rc1.pingOk()) << "round " << round << ": a request succeeds on the new session";
+        ASSERT_TRUE(rc1.client->testSeedResponseCorrelated()) << "round " << round << ": the new session is response-paired again";
+    }
+    rc1.client->close();
+}
+
+// A live but idle gateway is never taken for a dead one: an idle response-mode session outlives three image liveness timeouts with the
+// same session id and no response-egress loss (the gateway's publication heartbeats keep the image).
+TEST(GatewayUnknownSessionRegression, ResponseModeIdleSessionKeepsItsSessionAdversarialRegression) {
+    RespClient rc1("unk-respidle");
+    ASSERT_NO_FATAL_FAILURE(rc1.connect());
+    const int64_t sid = rc1.client->testSeedSessionId();
+    ASSERT_NE(sid, 0);
+    // Wait (bounded) three image liveness timeouts; the condition is the absence of a loss, so the poll runs to its deadline.
+    (void)pollUntil(std::chrono::milliseconds(3 * kImageLivenessNs / 1'000'000), [&] { return rc1.client->testResponseEgressLosses() != 0; });
+    EXPECT_EQ(rc1.client->testResponseEgressLosses(), 0u) << "an idle live gateway was taken for a dead one";
+    EXPECT_EQ(rc1.client->testSeedSessionId(), sid) << "the idle session was resumed for nothing";
+    EXPECT_TRUE(rc1.pingOk());
+    rc1.client->close();
+}
+
+// A graceful stop (the gateway closes its response publication) is detected too, and the restarted node serves the new session.
+TEST(GatewayUnknownSessionRegression, ResponseModeGracefulStopRecoversAdversarialRegression) {
+    RespClient rc1("unk-respstop");
+    ASSERT_NO_FATAL_FAILURE(rc1.connect());
+    const int64_t old = rc1.client->testSeedSessionId();
+    rc1.r.c.stop(rc1.r.node);
+    rc1.r.c.startNode(rc1.r.node);
+    const bool recovered = pollUntil(6s, [&] { const int64_t s = rc1.client->testSeedSessionId(); return s != 0 && s != old; });
+    EXPECT_TRUE(recovered) << "the session comes back within 6 s (response timeout is 60 s)";
+    EXPECT_EQ(rc1.client->testResponseEgressLosses(), 1u);
+    EXPECT_EQ(rc1.client->testSeedStaleSessionLosses(), 0u);
+    EXPECT_TRUE(rc1.pingOk());
+    rc1.client->close();
+}

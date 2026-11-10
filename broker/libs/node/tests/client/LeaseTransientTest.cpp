@@ -445,7 +445,7 @@ TEST(LeaseWatchEvictedAsOfRegression, SlowWatchRerunsRegression) {
     EXPECT_EQ(log.failed, 0);
 }
 
-// The rebirth fence's retry-after (the time left in the fence, which the broker clamps to 1 s: LeaseRuntime::grantHoldNs) lands at or
+// The rebirth fence's retry-after (the whole time left in the fence: LeaseRuntime::grantHoldNs) lands at or
 // past a grant's op timeout of 1 s: the grant is answered Throttled AT ONCE and never parked behind the fence.  A parked grant would block every later write of its partition, be reported as a Timeout (in doubt)
 // at its delivery deadline, and could still be appended after the fence opens although the caller was told it timed out.
 // Mutation: ProducerImpl's Throttled fail-fast branch removed -> the grant is held to its op timeout (Timeout, not Throttled), red.

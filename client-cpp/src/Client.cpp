@@ -1368,7 +1368,7 @@ void Client::forgetRouteHint_(const RoutedCtlPending& d) noexcept {
     h.topic = -1;
     h.partition = -1;
     h.endpoint.clear();
-    ++routeHintCleared_;
+    ++routeStatsDuty_.cleared; routeStatsDirty_ = true;
 }
 void Client::learnRouteHint_(const RoutedCtlPending& d) {
     if (d.routeTopic < 0 || d.endpoint.empty()) return;
@@ -1376,12 +1376,23 @@ void Client::learnRouteHint_(const RoutedCtlPending& d) {
     h.topic = d.routeTopic;
     h.partition = d.routePartition;
     h.endpoint.assign(d.endpoint);   // capacity reserved at construction: no allocation for an endpoint within it
-    ++routeHintLearned_;
+    ++routeStatsDuty_.learned; routeStatsDirty_ = true;
 }
-uint64_t Client::routeHintHits() const noexcept { return routeHintHits_; }
-uint64_t Client::routeHintLearned() const noexcept { return routeHintLearned_; }
-uint64_t Client::routeHintCleared() const noexcept { return routeHintCleared_; }
-uint64_t Client::ctlRedirectsFollowed() const noexcept { return ctlRedirectsFollowed_; }
+void Client::publishRouteStats_() noexcept {
+    if (!routeStatsDirty_) [[likely]] return;
+    if (cfg_.runnerMode != RunnerMode::Thread) { routeStatsDirty_ = false; return; }   // Invoker: the owner reads the duty words
+    routeStatsDirty_ = !routeStats_.tryPublish(routeStatsDuty_);   // refused (owner not draining): retried next cycle, newest wins
+}
+const Client::RouteStats& Client::routeStatsView_() const {
+    // Invoker owner or a duty-cycle callback: the duty words; a Thread-mode owner: the latest status the duty thread published.
+    if (cfg_.runnerMode != RunnerMode::Thread || std::this_thread::get_id() == dutyThreadId_) return routeStatsDuty_;
+    (void)routeStats_.drainLatest(routeStatsCache_);
+    return routeStatsCache_;
+}
+uint64_t Client::routeHintHits() const { return routeStatsView_().hits; }
+uint64_t Client::routeHintLearned() const { return routeStatsView_().learned; }
+uint64_t Client::routeHintCleared() const { return routeStatsView_().cleared; }
+uint64_t Client::ctlRedirectsFollowed() const { return routeStatsView_().redirects; }
 
 OpResult Client::issueControl_(OpKind op, CompletionTarget target, Token token,
                                std::span<const uint8_t> wireFrame, uint32_t payloadHint, uint32_t requestIdAt,
@@ -2176,7 +2187,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             if (hint.topic == d.routeTopic && hint.partition == d.routePartition && !hint.endpoint.empty()) {
                 d.endpoint.assign(hint.endpoint);   // starts on the remembered leader, not the seed
                 d.hinted = true;
-                ++routeHintHits_;
+                ++routeStatsDuty_.hits; routeStatsDirty_ = true;
             }
         } else {
             d.routeTopic = -1;
@@ -2440,7 +2451,7 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view message, int64_t now
     }
     // The leader's own session (the seed never moves for a DDL: it carries the
     // data ops / subscriptions); the same frame, so the same requestId.
-    ++ctlRedirectsFollowed_;
+    ++routeStatsDuty_.redirects; routeStatsDirty_ = true;
     forgetRouteHint_(d);   // the node it was sent to (a remembered one included) is not the leader any more
     d.hinted = false;
     d.endpoint = toChannel(std::string(endpoint));
@@ -4115,6 +4126,7 @@ void Client::revisitSkippedMdc_() noexcept {
 }
 
 void Client::syncSeedSession_() noexcept {
+    publishRouteStats_();
     const auto& m = agent_.seedSession().machine;
     const session::SessionState st  = m.state();
     const int64_t               sid = m.sessionId();

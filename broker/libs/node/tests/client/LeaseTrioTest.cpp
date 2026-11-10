@@ -139,13 +139,18 @@ void promotionBound(bool checkpoint) {
     rc::LeaseOptions o;
     o.ttlMs = 6000;
     constexpr int kKeys = 8;
+    const uint64_t ckpt0 = t.checkpointsOnLeader(topic, 0);
     std::map<int, int64_t> ver;
     for (int i = 0; i < kKeys; ++i) {
         const rc::LeaseResult g = lt.grantAndWait(lt3::row("pb-" + std::to_string(i), uint64_t(i)), o);
         ASSERT_TRUE(g.ok());
         ver[i] = g.version;
     }
-    std::this_thread::sleep_for(1500ms);   // a checkpoint interval passes: checkpoint records are in flight / appended
+    if (checkpoint) {   // a checkpoint pass covers every key: checkpoint records are in flight / appended
+        ASSERT_TRUE(LeaseTrio::until(30s, [&] { return t.checkpointsOnLeader(topic, 0) >= ckpt0 + kKeys; }));
+    } else {
+        std::this_thread::sleep_for(1500ms);   // the leases age by about one checkpoint interval (the same timeline as the checkpointing pass)
+    }
     // A keepalive of key 0 is the "clear" of its checkpoint (CheckpointClearLeaderKill): it re-arms to the full ttl, then the leader dies.
     const auto tKeep = Clk::now();
     const rc::LeaseResult ka = lt.keepAliveOnceAndWait(lt3::row("pb-0"), ver[0]);
@@ -190,13 +195,15 @@ TEST(LeaseTrioRegression, CheckpointInFlightRegression) {
     auto lt = t.open(topic);
     rc::LeaseOptions o;
     o.ttlMs = 60'000;
+    const uint64_t ckpt0 = t.checkpointsOnLeader(topic, 0);
     std::map<int, int64_t> ver;
     for (int i = 0; i < 12; ++i) {
         const rc::LeaseResult g = lt.grantAndWait(lt3::row("ck-" + std::to_string(i), uint64_t(i)), o);
         ASSERT_TRUE(g.ok());
         ver[i] = g.version;
     }
-    std::this_thread::sleep_for(2500ms);   // two checkpoint intervals: Checkpoint records for the live leases are appended
+    // Two checkpoint passes: Checkpoint records for every live lease are appended.
+    ASSERT_TRUE(LeaseTrio::until(30s, [&] { return t.checkpointsOnLeader(topic, 0) >= ckpt0 + 2 * 12; }));
     ASSERT_GT(t.killLeader(topic, 0), 0);
     for (int i = 0; i < 12; ++i) {
         const auto row = getRetried(lt, lt3::row("ck-" + std::to_string(i)));
@@ -421,6 +428,7 @@ void brokerCheckpointCell(bool followerRestart) {
     auto lt = t.open(topic);
     rc::LeaseOptions o;
     o.ttlMs = 90'000;
+    const uint64_t ckpt0 = t.checkpointsOnLeader(topic, 0);
     std::map<int, int64_t> ver;
     for (int i = 0; i < 4; ++i) {
         const rc::LeaseResult g = lt.grantAndWait(lt3::row("bc-" + std::to_string(i), uint64_t(i)), o);
@@ -438,7 +446,7 @@ void brokerCheckpointCell(bool followerRestart) {
             EXPECT_GT(info.remainingMs, 60'000) << when << ": a checkpointed lease keeps its time";
         }
     };
-    std::this_thread::sleep_for(1500ms);   // Checkpoint records are appended
+    ASSERT_TRUE(LeaseTrio::until(30s, [&] { return t.checkpointsOnLeader(topic, 0) >= ckpt0 + 4; }));   // Checkpoint records are appended
     check("before");
     if (followerRestart) {   // RestartOne: a follower dies and comes back
         const int32_t leader = t.leaderOf(topic, 0);
