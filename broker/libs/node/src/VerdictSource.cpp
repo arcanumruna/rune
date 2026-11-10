@@ -881,8 +881,9 @@ void VerdictSource::noteControl_(const rune::protocol::RecordBatchReader& r, con
 }
 
 // The chained read: T's records in order, every other producer's marker and TxnJudge noted for the scan.  The first failing record
-// is the answer; the records after it are chained for their rows only, so the overlay holds every row T's commit writes.  False:
-// past the cap (partial), or a pause, which restarts T from its first record with a cleared overlay (F3), or a stall.
+// is the answer; the records after it are chained for their rows only, so the overlay holds every row T's commit writes.  Past the
+// cap (partial) T's records are no longer read, but the walk goes on for the control batches, so T's own marker is still seen.
+// False: a pause, which restarts T from its first record with a cleared overlay (F3), or a stall.
 bool VerdictSource::readTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, const rune::view::AbortedTxnFilter& aborted) noexcept {
     namespace proto = rune::protocol;
     namespace cm = rune::storage::control_marker;
@@ -901,15 +902,14 @@ bool VerdictSource::readTxnBatch_(const rune::protocol::RecordBatchReader& r, co
         noteControl_(r, batch, len, jx_.producerId, keys);
         return true;
     }
-    if ((attrs & kTxnControl) != proto::batch::kAttrTransactional || r.producerId() != jx_.producerId || aborted.skips(r, attrs)) return true;
+    if ((attrs & kTxnControl) != proto::batch::kAttrTransactional || r.producerId() != jx_.producerId || jx_.partial || aborted.skips(r, attrs)) return true;
     rune::view::TxnOverlay& chain = txnPool_->at(jx_.overlay);
     ChainStep step = ChainStep::Ok;
     (void)proto::forEachRecordSpan(batch, len, [&](const proto::RecordSpan& span) {
-        if (step != ChainStep::Ok) return;
+        if (step != ChainStep::Ok || jx_.partial) return;
         if (jx_.records >= jx_.cap || !keys.note(span.key, span.offset)) {
             if (jx_.answer.code == 0) jx_.answer = {static_cast<uint16_t>(rune::protocol::client::ErrorCode::TxnTooLarge), 0, span.offset};
             jx_.partial = true;
-            step = ChainStep::Failed;
             return;
         }
         ++jx_.records;
@@ -928,7 +928,6 @@ bool VerdictSource::readTxnBatch_(const rune::protocol::RecordBatchReader& r, co
             jx_.answer = {};
         }
     });
-    if (step == ChainStep::Failed) jx_.done = true;
     return step == ChainStep::Ok;
 }
 

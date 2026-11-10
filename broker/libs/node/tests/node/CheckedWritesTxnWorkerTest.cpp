@@ -1593,6 +1593,21 @@ TEST(CheckedWritesTxnWorkerRegression, NoJudgedPastTheCapHoldsLaterUnitsUntilIts
     }
 }
 
+// A TxnJudge appended after T's COMMIT, once the judge passed the marker (so the entry did not exist at it), with T's records over
+// the knob.  The chained read still meets T's own marker past the cap: T is decided from the log, the judge passes J, and a later
+// unit is judged.  (An ABORT would skip T's records as aborted, so the cap is never reached.)
+TEST(CheckedWritesTxnWorkerRegression, JudgeAfterTheCommitOfATransactionOverTheCapIsDecidedAtJRegression) {
+    Ki k;
+    const int64_t first = k.txn(31, {ins(1), ins(2), ins(3)});
+    k.r.worker->setTxnJudgedRecordsMax(2);
+    (void)k.r.appendTxnReplicated(rune::transaction::ControlMarker::build(31, 0, rune::transaction::ControlType::Commit, 0));
+    ASSERT_TRUE(k.r.driveUntilJudgeReaches());
+    (void)k.r.appendTxnJudge(31, first);
+    ASSERT_TRUE(k.r.driveUntilJudgeReaches());
+    EXPECT_FALSE(k.r.writeState()->txn.holdsJudge());
+    EXPECT_EQ(voteOnThisLeader(k, 32, 3), 0) << "T's rows were rejected at its marker (committed without a vote)";
+}
+
 namespace {
 /// T = 31 {ins 5, ins 6}, then another writer's atomic batch X {ups 7, ups 8, ins 5}.  The earlier leadership's knob of 2 rejects X
 /// (TooLarge) and votes T yes; this one's knob of 3 accepts X, so T's ins 5 fails (KeyExists) at T's first record: a no that is not

@@ -283,6 +283,17 @@ public:
         for (int i = 0; i < kMaxPass && worker->writeStateForTest(kSrc, tuning_.partition) == nullptr; ++i) pass();
         return base;
     }
+    /// A TxnJudge of `pid` for the transaction from `firstOffset`, appended to the leader's log and recorded as the worker records its own,
+    /// without the worker's open-transaction guard (a J after the marker).  Returns its offset.
+    int64_t appendTxnJudge(int64_t pid, int64_t firstOffset) {
+        const rune::storage::control_record::TxnJudgeRecord rec{pid, 0, firstOffset};
+        std::vector<uint8_t> b(rune::storage::control_record::kTxnJudgeBatchBytes);
+        EXPECT_EQ(rune::storage::control_record::buildTxnJudge(b, rec), b.size());
+        const int64_t base = replica->appendControlBatch(b, false);
+        EXPECT_GE(base, 0);
+        EXPECT_NE(const_cast<PartitionWriteState*>(writeState())->txn.onJudgeRecord(base, rec), nullptr);
+        return base;
+    }
 
     // ---- Part 11 (contract addition 19): votes and the ends of transactions ----
     struct VoteReply { int16_t errorCode = 0; uint16_t code = 0; uint32_t constraintId = 0; int64_t failingOffset = -1; int64_t judgeOffset = -1; };

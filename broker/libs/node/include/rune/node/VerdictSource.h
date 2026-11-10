@@ -445,7 +445,7 @@ private:
         int64_t       producerId = -1, first = -1, end = -1, from = -1;
         int32_t       overlay = -1, records = 0;
         bool          atMarker = false, scanning = false, done = false;
-        bool          partial = false;        // the chained read stopped at the cap: the overlay lacks the rows of T's later records
+        bool          partial = false;        // the chained read passed the cap: the overlay lacks the rows of T's later records (the walk went on for control batches only)
         int64_t       endedAt = -1;           // the producer's own marker in (first, end): T ended there, before its TxnJudge
         bool          endedCommit = false;
         uint64_t      members = 0;            // membersEpoch_ at the start: a member change restarts the judgement
