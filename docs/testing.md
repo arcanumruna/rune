@@ -156,11 +156,12 @@ requests or pushes), and uploads the test logs when a run fails. Use its result 
 ## CI on pull requests
 
 `.github/workflows/pr.yml` is the only check that runs on a pull request. A PR runs the client build with examples and
-its `-R Regression -LE latency` suite, the source guards, and the broker build with the Regression suite on one shard
+its `-R Regression -LE latency` suite, codec, ql and crypto each built standalone with their whole `-LE latency`
+suite (the root build registers none of their tests, #960), the source guards, and the broker build with the Regression suite on one shard
 of six (shard = PR number mod 6, about one runner-hour). The full six-shard broker job runs on every push to `main`,
 nightly, and on PRs labelled `ci:full`. Latency gates and sanitizers never run there.
 `client-cpp/scripts/check_pr_workflow.py` (ctest `PrWorkflowRunsTheClientSuiteGuardRegression`) fails if that
-workflow loses its `pull_request` trigger or stops running the client suite.
+workflow loses its `pull_request` trigger or stops running the client suite or one of the library suites.
 
 ## Source guards
 

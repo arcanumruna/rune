@@ -8,7 +8,10 @@ Before .github/workflows/pr.yml no check ran on a pull request, so a PR merged w
   (b) the client is configured (cmake -S client-cpp) with -DBUILD_TESTING=ON and -DBUILD_EXAMPLES=ON, so every example
       compiles and the client tests exist;
   (c) a ctest run on the client build (--test-dir ... client ...) selects `-R Regression` and `-LE latency`;
-  (d) nothing selects `-L latency`: latency gates need an idle host and never run in CI.
+  (d) nothing selects `-L latency`: latency gates need an idle host and never run in CI;
+  (e) codec, ql and crypto each build standalone with -DBUILD_TESTING=ON and have their suite run with `-LE latency`
+      (#960: the root build registers none of their tests). A `matrix.lib` job counts when its `lib:` list names
+      the library; a literal `cmake -S <lib>` / `ctest --test-dir build-<lib>...` counts too.
 
 Comments are ignored; shell line continuations (a trailing backslash) are joined first.
 
@@ -77,7 +80,24 @@ def check(text):
     for l in lines:
         if re.search(r"(^|\s)-L\s+[\"']?latency", l):
             errors.append("(d) a step selects `-L latency` (latency gates never run in CI): " + l.strip())
+
+    matrix_libs = set()
+    for l in lines:
+        m = re.match(r"^\s+lib\s*:\s*\[([^\]]*)\]", l)
+        if m:
+            matrix_libs |= {x.strip().strip("'\"") for x in m.group(1).split(",")}
+    for lib in STANDALONE_LIBS:
+        ref = r"(?:\$\{\{\s*matrix\.lib\s*\}\}|" + lib + ")" if lib in matrix_libs else lib
+        cfg = [l for l in lines if re.search(r"\bcmake\b.*-S\s+" + ref + r"(\s|$)", l)]
+        if not cfg or not any("-DBUILD_TESTING=ON" in l for l in cfg):
+            errors.append(f"(e) no `cmake -S {lib}` configure step with -DBUILD_TESTING=ON")
+        runs = [l for l in lines if re.search(r"\bctest\b", l) and re.search(r"--test-dir\s+build-" + ref + r"(?=[/\s]|$)", l)]
+        if not any(re.search(r"(^|\s)-LE\s+[\"']?latency", l) for l in runs):
+            errors.append(f"(e) no `ctest --test-dir build-{lib}...` step with `-LE latency`")
     return errors
+
+
+STANDALONE_LIBS = ("codec", "ql", "crypto")
 
 
 GOOD = """\
@@ -99,6 +119,15 @@ jobs:
         run: |
           ctest --test-dir build-client/cmake -R Regression -LE latency -j4 \\
             --output-on-failure
+  libs:
+    strategy:
+      matrix:
+        lib: [codec, ql, crypto]
+    steps:
+      - name: Configure
+        run: cmake -S ${{ matrix.lib }} -B build-${{ matrix.lib }}/cmake -DBUILD_TESTING=ON
+      - name: Test suite
+        run: ctest --test-dir build-${{ matrix.lib }}/cmake -LE latency -j4
 """
 
 
@@ -116,6 +145,10 @@ def selftest():
         "d2": GOOD.replace("-j4 \\\n", "-j4 -L latency \\\n"),
         "a2": GOOD.replace("pull_request:", "push_request:"),
         "c3": GOOD.replace("--test-dir build-client/cmake", "--test-dir build-other/cmake"),
+        "e": GOOD.replace("lib: [codec, ql, crypto]", "lib: [codec, crypto]"),
+        "e2": GOOD.replace("-B build-${{ matrix.lib }}/cmake -DBUILD_TESTING=ON", "-B build-${{ matrix.lib }}/cmake"),
+        "e3": GOOD.replace("-LE latency -j4\n", "-j4\n"),
+        "e4": GOOD.replace("cmake -S ${{ matrix.lib }}", "cmake -S other"),
     }
     for rule, text in mutants.items():
         errs = check(text)
@@ -147,7 +180,7 @@ def main(argv):
         return 1
     errors = check(text)
     if errors:
-        print("check_pr_workflow: FAIL -- pr.yml no longer runs the client suite on pull requests:\n  " + "\n  ".join(errors))
+        print("check_pr_workflow: FAIL -- pr.yml no longer runs the client and library suites on pull requests:\n  " + "\n  ".join(errors))
         return 1
     print("check_pr_workflow: OK")
     return 0
