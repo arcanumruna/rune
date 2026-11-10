@@ -5,10 +5,10 @@
 // prints `LEASE-E2E-<NAME>: OK` on success, or `LEASE-E2E-<NAME>: FAIL: <reason>` (stderr) and exits non-zero.  usage (no argument,
 // -h/--help or an unknown subcommand) prints the table below and exits 2 without touching the network.
 //
-//   setup       --topic T --partitions N --ttl-ms N [--checkpoint 0|1] [--ckpt-interval-ms N] [--min-ttl-ms N] | --topic T --raw 1
+//   setup       --topic T --partitions N --ttl-ms N [--checkpoint 0|1] [--ckpt-interval-ms N] [--min-ttl-ms N] | --topic T --raw 1 [--partitions N]
 //                 defines the lease topic T (rf 3, compacted, descriptor lease_claim; the descriptor name is part of the schema
 //                 fingerprint the generated type checks, so a lease topic the typed driver opens is defined here, not by QL), or with
-//                 --raw 1 an untyped delete-policy topic of one partition (the GUARD leg's data topic); prints TOPIC_ID=<id>.
+//                 --raw 1 an untyped delete-policy topic (the GUARD leg's data topic, 3 partitions); prints TOPIC_ID=<id>.
 //   grant       --topic T --key K [--ttl-ms N] [--expect ok|exists]
 //                 one grant; prints `GRANT sent_ms=<realtime before the call> status=<ok|err> err=<code> version=<v>`.
 //   ttl         --topic T --key K [--expect live|absent]
@@ -37,7 +37,7 @@
 //                 `LEADER <tag> <token> <ms>` when it leads.  When its lease is lost it appends `LOST <tag> <reason> <ms>`, then tries a
 //                 FENCED update of its old key at its old token (the refused guarded write): `FENCED <tag> refused|accepted <err> <ms>`.
 //                 Ends on the stop file or at max-s.  Run two, SIGSTOP the leader past the ttl: the other leads with a larger token.
-//   guard       --lease-topic L --data-topic D --ttl-ms N --out FILE [--key K] [--ready-file F] [--window N] [--after-ms N]
+//   guard       --lease-topic L --data-topic D --ttl-ms N --out FILE [--key K] [--ready-file F] [--window N] [--after-ms N] [--data-partition P]
 //                 R5 (spec 12.2): holds a lease, binds a producer to it and sends sequence-numbered records.  After the script cut
 //                 the lease leader (onAtRisk Entered at E) an UNGUARDED producer (its own client session, not bound to the lease)
 //                 appends one marker record to the same partition at the first loop pass at or after E + d; the guarded producer
@@ -171,7 +171,7 @@ rc::ClientConfig makeConfig(int slot = 0) {
 
 LeaseClaim claimRow(std::string_view key) {
     LeaseClaim r;
-    std::memcpy(r.claim.data(), key.data(), std::min(key.size(), r.claim.size()));
+    if (!key.empty()) std::memcpy(r.claim.data(), key.data(), std::min(key.size(), r.claim.size()));
     return r;
 }
 std::string keyText(std::span<const uint8_t> key) {
@@ -227,7 +227,7 @@ int runSetup(const Args& a) {
     rc::TopicOptions to;
     to.replicationFactor = 3;
     if (a.num("raw", 0) != 0) {
-        const auto r = c.defineTopicAndWait(a.str("topic"), 1, "", std::span<const uint8_t>{}, rc::Persistence::Disk, to, {}, 60s);
+        const auto r = c.defineTopicAndWait(a.str("topic"), static_cast<uint32_t>(a.num("partitions", 1)), "", std::span<const uint8_t>{}, rc::Persistence::Disk, to, {}, 60s);
         if (r.errorCode != 0) return failWith("SETUP", "define " + a.str("topic") + ": error " + std::to_string(r.errorCode) + " " + r.detail);
         std::printf("TOPIC_ID=%d\n", r.topicId);
         return ok("SETUP");
@@ -611,6 +611,12 @@ int runGuard(const Args& a) {
     c.connectAndWait();
     auto lt   = c.openLeaseTopicAndWait<LeaseClaim>(a.str("lease-topic"), {}, 30s);
     auto data = c.rawTopicAndWait(a.str("data-topic"));
+    // Every guarded record and the marker go to ONE data partition (--data-partition, led by a node other than the lease leader): the
+    // first key that hashes there (the broker's own partitionForKey rule).
+    const int32_t dataPart = static_cast<int32_t>(a.num("data-partition", 0));
+    if (dataPart < 0 || dataPart >= data.partitionCount) return failWith("GUARD", "--data-partition " + std::to_string(dataPart) + " of " + std::to_string(data.partitionCount));
+    uint64_t dataKey = 0;
+    while (rc::Key(dataKey).partition(data.partitionCount) != dataPart) ++dataKey;
     int         lost = 0, enters = 0;
     int64_t     lostMs = 0, enteredMs = 0;
     std::string lostReason;
@@ -710,7 +716,7 @@ int runGuard(const Args& a) {
         if (enters != 0 && !markerSent && now >= enteredMs + dMs) {
             uint8_t val[16] = {};
             std::memcpy(val, &kMarkerSeq, 8);
-            const rc::SendResult r = mprod.trySend(mdata, rc::Key(kMarkerSeq), std::span<const uint8_t>(val, 16), mq, 0);
+            const rc::SendResult r = mprod.trySend(mdata, rc::Key(dataKey), std::span<const uint8_t>(val, 16), mq, 0);
             if (r == rc::SendResult::Ok) {
                 markerSent      = true;
                 markerSentMs    = realtimeMs();
@@ -730,7 +736,7 @@ int runGuard(const Args& a) {
             uint8_t           val[16] = {};
             std::memcpy(val, &seq, 8);
             sent.push_back(Sent{now, enters != 0, 0, -1, 0, 0, 0});
-            const rc::SendResult r = prod.trySend(data, rc::Key(static_cast<uint64_t>(seq)), std::span<const uint8_t>(val, 16), q, seq);
+            const rc::SendResult r = prod.trySend(data, rc::Key(dataKey), std::span<const uint8_t>(val, 16), q, seq);
             if (r == rc::SendResult::Ok) {
                 ++inflight;
                 nextSendMs = now + 1;
@@ -759,14 +765,14 @@ int runGuard(const Args& a) {
 
     appendLine(out, "ENTERED_MS=" + std::to_string(enteredMs));
     appendLine(out, "MARKER=" + std::to_string(markerOffset));
-    // Read the data topic from offset 0 (the data leader is reachable): seq -> offset.
+    // Read the guarded data partition from offset 0 (the data leader is reachable): seq -> offset.
     std::mutex                        mu;
     std::map<uint64_t, int64_t>       logged;      // seq -> offset
     int64_t                           lastGrowMs = realtimeMs(), maxLogged = -1;
     std::size_t                       nLogged = 0;
     rc::SubscribeOptions              so;
     so.from = rc::From::earliest();
-    rc::Subscription sub = c.subscribe(data, 0, so, [&](const rc::Record& r) {
+    rc::Subscription sub = c.subscribe(data, dataPart, so, [&](const rc::Record& r) {
         if (r.value.size() < 8) return;
         uint64_t seq = 0;
         std::memcpy(&seq, r.value.data(), 8);
@@ -899,7 +905,7 @@ int runElect(const Args& a) {
             appendLine(st.out, "LOST " + st.tag + " " + st.lostReason + " " + std::to_string(st.lostMs));
             // The guarded write: a fenced update of the old key at the old token must be refused (the lease is gone or re-granted).
             LeaseClaim row;
-            std::memcpy(row.claim.data(), oldKey.data(), std::min(oldKey.size(), row.claim.size()));
+            if (!oldKey.empty()) std::memcpy(row.claim.data(), oldKey.data(), std::min(oldKey.size(), row.claim.size()));
             const rc::LeaseResult u = lt.updateAndWait(row, st.token);
             appendLine(st.out, "FENCED " + st.tag + " " + (u.ok() ? "accepted" : "refused") + " " + std::to_string(u.errorCode) + " " + std::to_string(realtimeMs()));
             std::printf("ELECT lost reason=%s fenced=%s\n", st.lostReason.c_str(), u.ok() ? "accepted" : "refused");
@@ -917,7 +923,7 @@ int runElect(const Args& a) {
 int usage() {
     std::fprintf(stderr,
                  "usage: lease_e2e_driver <subcommand> [--flag value ...]\n"
-                 "  setup       --topic T --partitions N --ttl-ms N [--checkpoint 0|1] [--ckpt-interval-ms N] [--min-ttl-ms N] | --topic T --raw 1\n"
+                 "  setup       --topic T --partitions N --ttl-ms N [--checkpoint 0|1] [--ckpt-interval-ms N] [--min-ttl-ms N] | --topic T --raw 1 [--partitions N]\n"
                  "  grant       --topic T --key K [--ttl-ms N] [--expect ok|exists]\n"
                  "  ttl         --topic T --key K [--expect live|absent]\n"
                  "  scan        --topic T [--expect-present K] [--expect-absent K]\n"
@@ -926,7 +932,7 @@ int usage() {
                  "  scale-hold  --topic T --count N --ttl-ms N --out FILE [--stop-file F] [--max-s N]\n"
                  "  ckpt-poll   --topic T --key K [--below N] [--max-s N]\n"
                  "  elect       --topic T --tag X --out FILE [--name N] [--stop-file F] [--max-s N]\n"
-                 "  guard       --lease-topic L --data-topic D --ttl-ms N --out FILE [--key K] [--ready-file F] [--window N] [--after-ms N]\n"
+                 "  guard       --lease-topic L --data-topic D --ttl-ms N --out FILE [--key K] [--ready-file F] [--window N] [--after-ms N] [--data-partition P]\n"
                  "environment: RUNE_TARGET, RUNE_EGRESS_HOST, RUNE_EGRESS_PORT, RUNE_DATA_DIR, RUNE_USER, RUNE_PASSWORD_FILE, RUNE_TLS_CA_FILE\n");
     return 2;
 }

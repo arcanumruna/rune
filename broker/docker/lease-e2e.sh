@@ -388,19 +388,18 @@ topic_id() {   # <tag> -> the TOPIC_ID the driver printed
 drv_leg setup-basic 300 "${APP_USER}" app.pw "LEASE-E2E-SETUP: OK" setup --topic basic --partitions 2 --ttl-ms "${BASIC_TTL_MS}"
 drv_leg setup-scale 300 "${APP_USER}" app.pw "LEASE-E2E-SETUP: OK" setup --topic scale --partitions 4 --ttl-ms "${SCALE_TTL_MS}"
 drv_leg setup-guard 300 "${APP_USER}" app.pw "LEASE-E2E-SETUP: OK" setup --topic guard --partitions 1 --ttl-ms "${GUARD_TTL_MS}"
-drv_leg setup-guard-data 300 "${APP_USER}" app.pw "LEASE-E2E-SETUP: OK" setup --topic guard_data --raw 1
+drv_leg setup-guard-data 300 "${APP_USER}" app.pw "LEASE-E2E-SETUP: OK" setup --topic guard_data --raw 1 --partitions 3
 drv_leg setup-ckpt 300 "${APP_USER}" app.pw "LEASE-E2E-SETUP: OK" setup --topic ckpt --partitions 1 --ttl-ms "${CKPT_TTL_MS}" --checkpoint 1 --ckpt-interval-ms "${CKPT_INTERVAL_MS}"
 drv_leg setup-elect 300 "${APP_USER}" app.pw "LEASE-E2E-SETUP: OK" setup --topic elect --partitions 1 --ttl-ms "${ELECT_TTL_MS}"
 GUARD_ID=$(topic_id setup-guard) || true;  [ -n "${GUARD_ID}" ] || fail "setup printed no id for guard"
 GUARD_DATA_ID=$(topic_id setup-guard-data) || true;  [ -n "${GUARD_DATA_ID}" ] || fail "setup printed no id for guard_data"
 CKPT_ID=$(topic_id setup-ckpt) || true;  [ -n "${CKPT_ID}" ] || fail "setup printed no id for ckpt"
 # The `lease topic` DDL through QL (the rune-ql CLI image).  The typed driver cannot open it: the descriptor name is the topic name and
-# is part of the schema fingerprint of the generated lease_claim type; so the QL topic is checked by its own `show topic`.
+# is part of the schema fingerprint of the generated lease_claim type.  The DDL's own answer is the check: `show topic` reads __catalog,
+# which needs DESCRIBE ON CLUSTER (a namespace user cannot hold it), and the CLI's `show leases` is not available yet.
 (umask 077; echo "lease topic ql_lease { claim string(32), a uint64, b string(8) } partitions 1 replicas 3 key claim with (lease.ttl = 5000, lease.checkpoint = on, lease.checkpoint_interval = 5000);" > "${RUNE_AUTH_WORK_DIR}/ql-lease.rql")
 cli "${APP_USER}" app.pw ql -f /work/ql-lease.rql --broker "rune-1:${BROKER_PORT}" >/dev/null || fail "the QL 'lease topic' DDL failed"
 rm -f "${RUNE_AUTH_WORK_DIR}/ql-lease.rql"
-show=$(cli "${APP_USER}" app.pw ql -e "show topic ql_lease;" --broker "rune-2:${BROKER_PORT}" 2>&1) || { echo "${show}" >&2; fail "show topic ql_lease failed"; }
-echo "${show}" | grep -qi "lease" || { echo "${show}" >&2; log "setup: WARNING: 'show topic ql_lease' does not mention the lease"; }
 log "Setup OK: topics guard ${GUARD_ID}, guard_data ${GUARD_DATA_ID}, ckpt ${CKPT_ID}"
 
 # A cluster-admin watcher on e2e/basic serves BASIC, and a fresh one SUSPEND (restarted per leg: the GUARD and CHECKPOINT legs between them
@@ -475,29 +474,25 @@ leg_end SCALE "${SCALE_LEG_S}"
 # Leg 3: GUARD (R5).
 # ---------------------------------------------------------------------------
 leg_begin GUARD "a guarded producer; the driver is cut from the lease leader after the data leader is on another node..."
+# guard_data has 3 partitions, one led by each node (single-partition topics all prefer node 0, so a kill/restart can never split
+# them): the guarded producer writes to a guard_data partition whose leader is not the lease leader.
 placement_ok() {
-    DL=$(partition_leader "${GUARD_DATA_ID}" 0) || return 1
     LL=$(partition_leader "${GUARD_ID}" 0) || return 1
+    local p l
+    for p in 0 1 2; do
+        l=$(partition_leader "${GUARD_DATA_ID}" "${p}") || return 1
+        [ "${l}" != "${LL}" ] && { DP="${p}"; DL="${l}"; return 0; }
+    done
+    return 1
 }
-wait_until 120 "guard leaders" placement_ok || fail "the guard topics have no leaders"
-tries=0
-while [ "${DL}" = "${LL}" ]; do
-    tries=$(( tries + 1 ))
-    [ "${tries}" -le 3 ] || fail "the data and the lease leader are still on node ${LL} after 3 moves"
-    log "GUARD: both leaders on node ${LL}: moving them (try ${tries})"
-    OLD="${LL}"
-    kill_node "${OLD}"
-    restart_node "${OLD}"
-    wait_until 120 "the guard leaders moved" leader_not "${GUARD_ID}" "${OLD}" || true
-    wait_until 120 "guard leaders" placement_ok || fail "the guard topics have no leaders after the move"
-done
+wait_until 120 "guard leaders (a guard_data partition led off the lease leader)" placement_ok || fail "no guard_data partition is led by a node other than the lease leader"
 LIP=$(ip_of $(( LL + 1 )))
 [ -n "${LIP}" ] || fail "no ip for the lease leader rune-$(( LL + 1 ))"
 SEED_NODE=$(( DL + 1 ))   # the driver connects through the data leader, never through the node it is cut from
-log "GUARD: data leader node ${DL}, lease leader node ${LL}; the driver connects through rune-${SEED_NODE}"
+log "GUARD: data partition ${DP} led by node ${DL}, lease leader node ${LL}; the driver connects through rune-${SEED_NODE}"
 rm -f "${SHARED}"/guard*
 DRV_NET_ADMIN=1
-drv_start guard 400 "${APP_USER}" app.pw guard --lease-topic guard --data-topic guard_data --ttl-ms "${GUARD_TTL_MS}" --out /shared/guard.out --ready-file /shared/guard.ready
+drv_start guard 400 "${APP_USER}" app.pw guard --lease-topic guard --data-topic guard_data --data-partition "${DP}" --ttl-ms "${GUARD_TTL_MS}" --out /shared/guard.out --ready-file /shared/guard.ready
 DRV_NET_ADMIN=""
 GUARD_CTR="rune-lease-guard"
 wait_until 120 "the guard driver ready" has_line guard.ready READY || { out_of guard | tail -20 >&2; fail "the guard driver was not ready (lease granted, producer bound, 200 acks) within 120s"; }
