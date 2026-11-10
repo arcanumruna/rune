@@ -46,7 +46,13 @@ struct InvokerShard {
         aeron::Context ctx; ctx.aeronDir(dir.string()); ctx.useConductorAgentInvoker(true);
         client = aeron::Aeron::connect(ctx);
     }
-    ~InvokerShard() { client.reset(); driver.reset(); std::error_code ec; fs::remove_all(dir, ec); }
+    ~InvokerShard() {
+        client.reset();
+        driver->close();
+        EXPECT_FALSE(driver->isOpen()) << "closed off its pump thread: the driver leaked (join, then bindPumpThread)";
+        driver.reset();
+        std::error_code ec; fs::remove_all(dir, ec);
+    }
     rune::aeronutil::AeronPump pump() { return driver->pumpWith(client.get()); }
 };
 }
@@ -346,6 +352,7 @@ TEST(StartupClientGateRegression, StarterAddsAgainstARunningPumpAreAllAnswered) 
     gate.release();
     stop = true;
     pumpThread.join();
+    s.driver->bindPumpThread();                 // hand-off back: the pump thread bound it, this thread closes it
     EXPECT_EQ(resolved, 100);
 }
 
