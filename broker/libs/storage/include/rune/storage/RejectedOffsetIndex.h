@@ -4,6 +4,8 @@
 // One instance per partition replica (PartitionWriteState::rejected), worker-owned.  The leader's judge fills it with
 // add(); on every replica the RcState leadership scan merges the committed markers with onMarker().  Reserved at
 // creation: add() never allocates, and a full index refuses (the judge then stalls; a full index is never a verdict).
+#include "rune/storage/ControlRecordLayout.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -75,7 +77,7 @@ public:
             }
             if (lo == count || at(lo).offset != it->offset) ++mismatches_;
         }
-        covered_ = std::max(covered_, finalThrough);
+        if (control_record::closesCoverage(count)) covered_ = std::max(covered_, finalThrough);
     }
     void onMarker(int64_t fromOffset, int64_t finalThrough, std::span<const Entry> entries) {
         onMarker(fromOffset, finalThrough, entries.size(), [&](std::size_t i) { return entries[i]; });

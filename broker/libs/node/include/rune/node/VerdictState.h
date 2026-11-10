@@ -128,19 +128,23 @@ public:
 
     /// False: the ledger is full (emission waits) - the marker is in the log all the same, so appendedThrough counts it.  A marker
     /// at or below an offset already seen, a left-out one included, is ignored (idempotent: a scan re-feed never moves left_ back).
-    [[nodiscard]] bool onMarker(int64_t markerOffset, int64_t finalThrough) noexcept {
+    /// `closes`: the marker ends outside every span (closesCoverage); a full one may end inside a span, so it moves appendedThrough
+    /// but not the committed coverage.
+    [[nodiscard]] bool onMarker(int64_t markerOffset, int64_t finalThrough, bool closes) noexcept {
         if (markerOffset < committedEnd_ || markerOffset <= left_.offset || (count_ != 0 && markerOffset <= at_(count_ - 1).offset)) return true;
         appended_ = std::max(appended_, finalThrough);
+        if (closes) appendedClosed_ = std::max(appendedClosed_, finalThrough);
         if (count_ == kCapacity) {
-            left_ = Slot{markerOffset, std::max(left_.finalThrough, finalThrough)};
+            left_ = Slot{markerOffset, std::max(left_.finalThrough, finalThrough), closes ? std::max(left_.closedThrough, finalThrough) : left_.closedThrough};
             return false;
         }
-        at_(count_++) = Slot{markerOffset, finalThrough};
+        at_(count_++) = Slot{markerOffset, finalThrough, closes ? finalThrough : 0};
         return true;
     }
     void onHw(int64_t hw) noexcept {
         while (count_ != 0 && at_(0).offset < hw) {
-            committed_    = std::max(committed_, at_(0).finalThrough);
+            committed_    = std::max(committed_, at_(0).closedThrough);
+            committedAppended_ = std::max(committedAppended_, at_(0).finalThrough);
             committedEnd_ = at_(0).offset + 1;
             head_         = (head_ + 1) % kCapacity;
             --count_;
@@ -150,20 +154,27 @@ public:
     [[nodiscard]] int64_t committedThrough() const noexcept { return committed_; }
     [[nodiscard]] int64_t committedMarkerEnd() const noexcept { return committedEnd_; }
     [[nodiscard]] int64_t appendedThrough() const noexcept { return appended_; }
+    /// The highest end of an appended marker that closes coverage.
+    [[nodiscard]] int64_t appendedClosedThrough() const noexcept { return appendedClosed_; }
+    /// A full marker was appended that no closing marker follows yet.
+    [[nodiscard]] bool chainOpen() const noexcept { return appended_ > appendedClosed_; }
     void truncateFrom(int64_t offset) noexcept {
         while (count_ != 0 && at_(count_ - 1).offset >= offset) --count_;
-        if (left_.offset >= offset) left_ = Slot{-1, 0};   // a cut at or below the last marker left out: forget them all (re-marks more)
-        appended_ = std::max(committed_, left_.finalThrough);
+        if (left_.offset >= offset) left_ = Slot{-1, 0, 0};   // a cut at or below the last marker left out: forget them all (re-marks more)
+        appended_ = std::max({committed_, committedAppended_, left_.finalThrough});   // a committed full marker's end stays: it is in the log
         for (std::size_t i = 0; i < count_; ++i) appended_ = std::max(appended_, at_(i).finalThrough);
+        appendedClosed_ = std::max(committed_, left_.closedThrough);
+        for (std::size_t i = 0; i < count_; ++i) appendedClosed_ = std::max(appendedClosed_, at_(i).closedThrough);
     }
 
 private:
-    struct Slot { int64_t offset = 0; int64_t finalThrough = 0; };
+    struct Slot { int64_t offset = 0; int64_t finalThrough = 0; int64_t closedThrough = 0; };   // closedThrough: finalThrough of a closing marker, else 0
     Slot& at_(std::size_t i) noexcept { return ring_[(head_ + i) % kCapacity]; }
     std::array<Slot, kCapacity> ring_{};
     std::size_t head_ = 0, count_ = 0;
-    int64_t committed_ = 0, committedEnd_ = 0, appended_ = 0;
-    Slot left_{-1, 0};   // the markers a full ring left out: the last one's offset (-1 = none), the highest finalThrough
+    int64_t committed_ = 0, committedEnd_ = 0, appended_ = 0, appendedClosed_ = 0;
+    int64_t committedAppended_ = 0;   // the highest finalThrough of a committed marker, full ones included
+    Slot left_{-1, 0, 0};   // the markers a full ring left out: the last one's offset (-1 = none), the highest finalThrough
 };
 
 struct VerdictSourceStats {

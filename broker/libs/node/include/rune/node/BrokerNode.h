@@ -1528,6 +1528,8 @@ public:
     void setHaltHandler(HaltHandler h, void* ctx) noexcept { haltHandler_ = h; haltCtx_ = ctx; }
     /// Test-only: drive the runtime's storage-failure path directly.
     void raiseStorageFailureForTest(const std::string& logDir, int err) { onStorageFailure_(logDir, err); }
+    /// Test-only: drive the runtime's invariant-halt path directly.
+    void raiseInvariantViolationForTest(const std::string& what) { onInvariantViolation_(what); }
     /// Test-only: the boot id this process's replicas vouch with (empty after a storage failure in this boot).
     [[nodiscard]] std::string bootIdForTest() const { return replicaRegistry_->bootId(); }
     /// Test-only: during start(), re-run one user log's recovery with this msync
@@ -2178,6 +2180,10 @@ public:
 
     /// Test-only: the node-level embedded driver (spec §3.6 one-pumper counters).
     EmbeddedDriver* driverForTest() const noexcept { return nodeDriver_.get(); }
+    /// Test-only: the media-driver timeout (ms) of the runtime client (worker < 0) or of a worker's client.
+    [[nodiscard]] long clientDriverTimeoutMsForTest(int32_t worker) const {
+        return (worker < 0 ? aeron_ : shardClients_[static_cast<std::size_t>(worker)])->context().mediaDriverTimeout();
+    }
 
     /// Test-only: does the runtime have a thread of its own?  `thread` placement:
     /// true while running; `fused` placement (spec §3.2): always false — the

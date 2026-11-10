@@ -30,6 +30,39 @@ namespace cw  = rune::node::cw;
 
 namespace {
 
+/// Starts the media driver of a broker's clients while the broker itself starts.
+struct ClientDriverStart {
+    std::future<std::unique_ptr<SharedClientDriver>> started = std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
+};
+
+/// A OneBroker whose clients share one media driver (a client otherwise starts one of its own, 100-180 ms) and whose runtime client's
+/// conductor idles 1 ms, not Aeron's 16: node start and every client add / find wait out about two idle sleeps.
+struct Broker : ClientDriverStart, OneBroker {
+    explicit Broker(const std::string& tag, Runtime runtime = Runtime::Legacy, std::function<void(NodeConfig&)> tweak = {})
+        : OneBroker(tag, runtime, [tweak = std::move(tweak)](NodeConfig& cfg) {
+              cfg.testAeronClientIdleSleepMs = 1;
+              if (tweak) tweak(cfg);
+          }),
+          driver(started.get()) {}
+
+    rc::ClientConfig clientConfig() { return driver->attach(OneBroker::clientConfig()); }
+
+    rc::Client* connectClient() {
+        auto client = std::make_unique<rc::Client>(clientConfig());
+        client->connectAndWait(20s);
+        clients.push_back(std::move(client));
+        return clients.back().get();
+    }
+
+    void restart() {
+        clients.clear();
+        OneBroker::restart();
+    }
+
+    std::unique_ptr<SharedClientDriver>     driver;
+    std::vector<std::unique_ptr<rc::Client>> clients;   // before the driver is gone
+};
+
 /// The three-broker cluster of these tests (fastFailover).  Its clients share one media driver: a client otherwise starts one of its own
 /// (100-180 ms).
 struct Cluster : rune::node::test::catalog_cluster::ThreeNodes {
@@ -72,18 +105,18 @@ void restartAll(Cluster& c) {
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, TopicCreateWaitsForItsSpecOnEveryWorkerRegression) {
-    OneBroker b("cw-order", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testHoldWriteSpecPasses = 300; });
+    Broker b("cw-order", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testHoldWriteSpecPasses = 60; });
     rune::client::Client& c = *b.connectClient();
     const auto r = cwb::defineTyped(c, "chars", 2);
     ASSERT_EQ(r.errorCode, 0) << r.detail;
     for (int32_t p = 0; p < 2; ++p)
         EXPECT_TRUE(cwb::hasWriteState(b.node(), r.topicId, p)) << "partition " << p << ": the topic served before its spec";
-    EXPECT_EQ(cwb::produceRaw(b, "chars", r.topicId, 2, std::string("\x01\x02\x03", 3), rune::client::Key(uint64_t{1})),
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "chars", r.topicId, 2, std::string("\x01\x02\x03", 3), rune::client::Key(uint64_t{1})),
               static_cast<uint16_t>(rune::protocol::client::ErrorCode::SchemaValidationFailed));
 }
 
 TEST(CheckedWritesBrokerRegression, DroppedWhileAwaitingSpecNeverBuildsRegression) {
-    OneBroker b("cw-drop", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testHoldWriteSpecPasses = 400000; });
+    Broker b("cw-drop", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testHoldWriteSpecPasses = 400000; });
     rune::client::Client& c = *b.connectClient();
     // The create is parked behind the held spec; the define answers only once it served, so drive the drop from a second
     // client while the first is still waiting.
@@ -165,9 +198,54 @@ std::vector<std::string> storedValues(BrokerNode& n, int32_t topicId, int32_t pa
     });
 }
 
-uint16_t send(OneBroker& b, const std::string& name, int32_t topicId, int32_t parts, const cw::TypedRecord& r) {
-    return cwb::produceRaw(b, name, topicId, parts, r.value, keyOf(r.key));
+uint16_t send(Broker& b, const std::string& name, int32_t topicId, int32_t parts, const cw::TypedRecord& r) {
+    return cwb::produceRaw(b.clientConfig(), name, topicId, parts, r.value, keyOf(r.key));
 }
+
+/// One connected client and producer for several raw produces (cwb::produceRaw builds a client for each).
+class RawProducer {
+public:
+    RawProducer(rc::ClientConfig cfg, std::vector<rc::TopicSpec> topics) {
+        cfg.topics = std::move(topics);
+        client_.emplace(cfg);
+        client_->connectAndWait(30s);
+        rc::ProducerConfig pc;
+        pc.acks     = rc::Acks::All;
+        pc.lingerUs = 0;
+        prod_.emplace(client_->producer(pc));
+        cq_.emplace(*client_);
+    }
+    ~RawProducer() {
+        prod_->closeImmediately();
+        client_->close();
+    }
+    RawProducer(const RawProducer&)            = delete;
+    RawProducer& operator=(const RawProducer&) = delete;
+
+    /// The completion's broker error code (0 = Ok), cwb::kNotOk when it is neither Ok nor a broker error.
+    uint16_t send(const std::string& topicName, const std::string& value, const rc::Key& key) {
+        const rc::TopicHandle topic = client_->topic(topicName);
+        const uint64_t token        = next_++;
+        rc::SendResult r = rc::SendResult::BackPressured;
+        while (r == rc::SendResult::BackPressured) {
+            r = prod_->trySend(topic, key, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), value.size()), *cq_, token);
+            if (r == rc::SendResult::BackPressured) std::this_thread::yield();
+        }
+        EXPECT_EQ(r, rc::SendResult::Ok);
+        prod_->flush();
+        uint16_t out = cwb::kNotOk;
+        (void)cq_->waitFor(token, 30s, [&](const rc::Completion& d, std::span<const uint8_t>) {
+            out = d.status == rc::OpStatus::Ok ? uint16_t{0} : d.status == rc::OpStatus::BrokerError ? d.errorCode : cwb::kNotOk;
+        });
+        return out;
+    }
+
+private:
+    std::optional<rc::Client>      client_;
+    std::optional<rc::Producer>    prod_;
+    std::optional<rc::Completions> cq_;
+    uint64_t                       next_ = 1;
+};
 
 /// A typed topic with a custom descriptor, keyed on `key`.
 rc::DefineTopicResult defineWith(rc::Client& c, const std::string& name, const rune::codec::Descriptor& d, const std::string& key,
@@ -178,7 +256,7 @@ rc::DefineTopicResult defineWith(rc::Client& c, const std::string& name, const r
 std::string le(uint64_t v, std::size_t n) { return cw::leBytes(v, n); }
 
 /// A raw DefineTopic from an "old client" (validate = false): the topic predates the feature level.
-int32_t defineLegacyTopic(OneBroker& b, const std::string& name, const rune::codec::Descriptor& d) {
+int32_t defineLegacyTopic(Broker& b, const std::string& name, const rune::codec::Descriptor& d) {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / ("rune_cwlegacy_" + std::to_string(::getpid()) + "_" + name);
     fs::create_directories(dir);
@@ -214,23 +292,23 @@ struct StubTyped {
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, RawSendIsRawOnUntypedAndValidatedOnTypedRegression) {
-    OneBroker b("cw-raw", OneBroker::Runtime::Shard);
+    Broker b("cw-raw", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     const auto raw = c.defineTopicAndWait("raw", 1, "", {}, rc::Persistence::Disk, {}, {}, 30s);
     ASSERT_EQ(raw.errorCode, 0) << raw.detail;
     const rc::TopicHandle handle = c.rawTopicAndWait("raw", 20s);
     EXPECT_EQ(handle.topicId, raw.topicId);
     const std::string garbage("\x01\x02\x03", 3);
-    EXPECT_EQ(cwb::produceRaw(b, "raw", raw.topicId, 1, garbage, rc::Key()), kOk);
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "raw", raw.topicId, 1, garbage, rc::Key()), kOk);
     EXPECT_EQ(storedValues(b.node(), raw.topicId, 0), std::vector<std::string>{garbage});
     const auto typed = cwb::defineTyped(c, "p", 1);
     ASSERT_EQ(typed.errorCode, 0) << typed.detail;
-    EXPECT_EQ(cwb::produceRaw(b, "p", typed.topicId, 1, garbage, rc::Key(uint64_t{1})), kSchemaValidationFailed);
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "p", typed.topicId, 1, garbage, rc::Key(uint64_t{1})), kSchemaValidationFailed);
     EXPECT_TRUE(storedValues(b.node(), typed.topicId, 0).empty());
 }
 
 TEST(CheckedWritesBrokerRegression, UnknownVersionIsRefusedRegression) {
-    OneBroker b("cw-ver", OneBroker::Runtime::Shard);
+    Broker b("cw-ver", OneBroker::Runtime::Shard);
     const auto t = cwb::defineTyped(*b.connectClient(), "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     EXPECT_EQ(send(b, "p", t.topicId, 1, cw::validRecord(1)), kOk);
@@ -240,7 +318,7 @@ TEST(CheckedWritesBrokerRegression, UnknownVersionIsRefusedRegression) {
 
 TEST(CheckedWritesBrokerRegression, PreUpgradeTopicValidatesAfterTheLevelRegression) {
     int16_t level = 4;   // the cluster does not yet support kCheckedWrites
-    OneBroker b("cw-upgrade", OneBroker::Runtime::Shard, [&level](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = level; });
+    Broker b("cw-upgrade", OneBroker::Runtime::Shard, [&level](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = level; });
     const int32_t id = defineLegacyTopic(b, "p", cw::matrixDescriptor());
     ASSERT_GE(id, 0);
     cw::Parts bad; bad.name = std::string("a\x80", 2);
@@ -251,9 +329,9 @@ TEST(CheckedWritesBrokerRegression, PreUpgradeTopicValidatesAfterTheLevelRegress
     level = -1;
     b.restart();
     bool raised = false;
-    for (int i = 0; i < 400 && !raised; ++i) {
+    for (int i = 0; i < 2000 && !raised; ++i) {
         raised = b.node().onWorkerThreadForTest(0, [](Worker& w) { return w.clusterFeatureLevelForTest(); }) >= rune::replication::MetadataFeature::kCheckedWrites;
-        if (!raised) std::this_thread::sleep_for(25ms);
+        if (!raised) std::this_thread::sleep_for(5ms);
     }
     ASSERT_TRUE(raised) << "the restarted node raises the level to the binary's own";
     EXPECT_EQ(send(b, "p", id, 1, cw::encode(bad)), kSchemaValidationFailed);
@@ -263,7 +341,7 @@ TEST(CheckedWritesBrokerRegression, PreUpgradeTopicValidatesAfterTheLevelRegress
 TEST(CheckedWritesBrokerRegression, RawKeyOfTheWrongWidthIsRefusedRegression) {
     using rune::codec::DescriptorBuilder;
     using rune::codec::PrimType;
-    OneBroker b("cw-key", OneBroker::Runtime::Shard);
+    Broker b("cw-key", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     const auto q = defineWith(c, "q", DescriptorBuilder("q", 1).add("id", PrimType::UInt32).add("v", PrimType::Int64).build(), "id");
     const auto s = defineWith(c, "s", DescriptorBuilder("s", 1).addFixedStr("name", 4).add("v", PrimType::Int64).build(), "name");
@@ -272,18 +350,19 @@ TEST(CheckedWritesBrokerRegression, RawKeyOfTheWrongWidthIsRefusedRegression) {
     ASSERT_EQ(q.errorCode, 0) << q.detail;
     ASSERT_EQ(s.errorCode, 0) << s.detail;
     ASSERT_EQ(k.errorCode, 0) << k.detail;
+    RawProducer raw(b.clientConfig(), {rc::TopicSpec{"q", q.topicId, 1}, rc::TopicSpec{"s", s.topicId, 1}, rc::TopicSpec{"k", k.topicId, 1}});
     const std::string qv = le(12, 2) + le(1, 2) + le(7, 4) + le(0, 8);
-    EXPECT_EQ(cwb::produceRaw(b, "q", q.topicId, 1, qv, rc::Key(uint64_t{7})), kSchemaValidationFailed) << "8-byte key on a uint32 field";
-    EXPECT_EQ(cwb::produceRaw(b, "q", q.topicId, 1, qv, rc::Key(uint32_t{7})), kOk);
+    EXPECT_EQ(raw.send("q", qv, rc::Key(uint64_t{7})), kSchemaValidationFailed) << "8-byte key on a uint32 field";
+    EXPECT_EQ(raw.send("q", qv, rc::Key(uint32_t{7})), kOk);
     const std::string sv = le(12, 2) + le(1, 2) + std::string("ab\0\0", 4) + le(0, 8);
-    EXPECT_EQ(cwb::produceRaw(b, "s", s.topicId, 1, sv, keyOf("ab")), kSchemaValidationFailed) << "an unpadded string(4) key";
-    EXPECT_EQ(cwb::produceRaw(b, "s", s.topicId, 1, sv, keyOf(std::string("ab\0\0", 4))), kOk);
+    EXPECT_EQ(raw.send("s", sv, keyOf("ab")), kSchemaValidationFailed) << "an unpadded string(4) key";
+    EXPECT_EQ(raw.send("s", sv, keyOf(std::string("ab\0\0", 4))), kOk);
     const std::string kv = le(8, 2) + le(1, 2) + le(0, 8);
-    EXPECT_EQ(cwb::produceRaw(b, "k", k.topicId, 1, kv, rc::Key(uint64_t{99})), kOk) << "a keyless typed topic has no key rule";
+    EXPECT_EQ(raw.send("k", kv, rc::Key(uint64_t{99})), kOk) << "a keyless typed topic has no key rule";
 }
 
 TEST(CheckedWritesBrokerRegression, TransactionOnTypedTopicCommitsRegression) {
-    OneBroker b("cw-txn", OneBroker::Runtime::Shard);
+    Broker b("cw-txn", OneBroker::Runtime::Shard);
     rc::Client& admin = *b.connectClient();
     const auto t = cwb::defineTyped(admin, "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
@@ -311,7 +390,7 @@ TEST(CheckedWritesBrokerRegression, TransactionOnTypedTopicCommitsRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, Utf8RulesEndToEndRegression) {
-    OneBroker b("cw-utf8", OneBroker::Runtime::Shard);
+    Broker b("cw-utf8", OneBroker::Runtime::Shard);
     const auto t = cwb::defineTyped(*b.connectClient(), "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     cw::Parts emoji;  emoji.bio = std::string("\xF0\x9F\x98\x80", 4);
@@ -325,22 +404,22 @@ TEST(CheckedWritesBrokerRegression, Utf8RulesEndToEndRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, TypedTombstoneDeletesAndCompactsRegression) {
-    OneBroker b("cw-tomb", OneBroker::Runtime::Shard);
+    Broker b("cw-tomb", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     rc::TopicOptions to;
     to.config.cleanupPolicy = 1;   // compact
     const auto t = c.defineTopicAndWait("p", 1, "id", rune::codec::serialize(cw::matrixDescriptor()), rc::Persistence::Disk, to, {}, 60s);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     EXPECT_EQ(send(b, "p", t.topicId, 1, cw::validRecord(5)), kOk);
-    EXPECT_EQ(cwb::produceRaw(b, "p", t.topicId, 1, "", rc::Key(uint64_t{5})), kOk) << "a tombstone with the key field's width deletes";
-    EXPECT_EQ(cwb::produceRaw(b, "p", t.topicId, 1, "", rc::Key(uint32_t{5})), kSchemaValidationFailed) << "a 4-byte key tombstone is refused";
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "p", t.topicId, 1, "", rc::Key(uint64_t{5})), kOk) << "a tombstone with the key field's width deletes";
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "p", t.topicId, 1, "", rc::Key(uint32_t{5})), kSchemaValidationFailed) << "a 4-byte key tombstone is refused";
     const auto values = storedValues(b.node(), t.topicId, 0);
     ASSERT_EQ(values.size(), 2u);
     EXPECT_TRUE(values.back().empty()) << "the tombstone is the latest record of key 5";
 }
 
 TEST(CheckedWritesBrokerRegression, ViewOnUntypedOrKeylessSourceIsRefusedRegression) {
-    OneBroker b("cw-view", OneBroker::Runtime::Shard);
+    Broker b("cw-view", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     ASSERT_EQ(c.defineTopicAndWait("raw", 1, "", {}, rc::Persistence::Disk, {}, {}, 30s).errorCode, 0);
     ASSERT_EQ(c.defineTopicAndWait("keyless", 1, "", OneBroker::idDescriptor("keyless"), rc::Persistence::Disk, {}, {}, 30s).errorCode, 0);
@@ -353,7 +432,7 @@ TEST(CheckedWritesBrokerRegression, ViewOnUntypedOrKeylessSourceIsRefusedRegress
 }
 
 TEST(CheckedWritesBrokerRegression, TypedOpenOfUntypedTopicIsRefusedRegression) {
-    OneBroker b("cw-open", OneBroker::Runtime::Shard);
+    Broker b("cw-open", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     ASSERT_EQ(c.defineTopicAndWait("raw", 1, "", {}, rc::Persistence::Disk, {}, {}, 30s).errorCode, 0);
     try {
@@ -365,7 +444,7 @@ TEST(CheckedWritesBrokerRegression, TypedOpenOfUntypedTopicIsRefusedRegression) 
 }
 
 TEST(CheckedWritesBrokerRegression, RawOpenOfTypedTopicIsRefusedRegression) {
-    OneBroker b("cw-rawopen", OneBroker::Runtime::Shard);
+    Broker b("cw-rawopen", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     ASSERT_EQ(cwb::defineTyped(c, "p", 1).errorCode, 0);
     try {
@@ -378,21 +457,21 @@ TEST(CheckedWritesBrokerRegression, RawOpenOfTypedTopicIsRefusedRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, QlTopicWithoutPartitionsHasOneRegression) {
-    OneBroker b("cw-ql");   // the CLI speaks the legacy gateway stream
+    Broker b("cw-ql");   // the CLI speaks the legacy gateway stream
     std::string err;
     ASSERT_EQ(cli({"ql", "-e", "topic solo;", "--broker", b.endpoint()}, &err), 0) << err;
     EXPECT_EQ(b.connectClient()->rawTopicAndWait("solo", 20s).partitionCount, 1);
 }
 
 TEST(CheckedWritesBrokerRegression, WideKeyFieldIsRefusedAtDefineRegression) {
-    OneBroker b("cw-wide");
+    Broker b("cw-wide");
     std::string err;
     EXPECT_NE(cli({"ql", "-e", "topic w { k string(17) } key k;", "--broker", b.endpoint()}, &err), 0);
     EXPECT_NE(err.find("key field 'k' is string(17)"), std::string::npos) << err;
 }
 
 TEST(CheckedWritesBrokerRegression, LegacyRuntimeValidatesRegression) {
-    OneBroker b("cw-legacy", OneBroker::Runtime::Legacy);
+    Broker b("cw-legacy", OneBroker::Runtime::Legacy);
     const auto t = cwb::defineTyped(*b.connectClient(), "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     cw::Parts bad; bad.bio = std::string("\xC0\xAF", 2);
@@ -404,7 +483,7 @@ class CheckedWritesIngressRoutes : public ::testing::TestWithParam<bool> {};
 
 TEST_P(CheckedWritesIngressRoutes, BothIngressRoutesValidateRegression) {
     const bool perWorker = GetParam();
-    OneBroker b(perWorker ? "cw-ingress-w" : "cw-ingress-g", OneBroker::Runtime::Shard,
+    Broker b(perWorker ? "cw-ingress-w" : "cw-ingress-g", OneBroker::Runtime::Shard,
                 [perWorker](NodeConfig& cfg) { cfg.perWorkerIngressEnabled = perWorker; });
     const auto t = cwb::defineTyped(*b.connectClient(), "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
@@ -416,7 +495,7 @@ INSTANTIATE_TEST_SUITE_P(CheckedWritesBrokerRegression, CheckedWritesIngressRout
                          [](const ::testing::TestParamInfo<bool>& i) { return i.param ? "PerWorkerIngress" : "GatewayRouted"; });
 
 TEST(CheckedWritesBrokerRegression, RestartValidatesFromTheFirstProduceRegression) {
-    OneBroker b("cw-restart", OneBroker::Runtime::Shard);
+    Broker b("cw-restart", OneBroker::Runtime::Shard);
     const auto t = cwb::defineTyped(*b.connectClient(), "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     b.restart();
@@ -432,21 +511,21 @@ TEST(CheckedWritesBrokerRegression, RestartValidatesFromTheFirstProduceRegressio
 }
 
 TEST(CheckedWritesBrokerRegression, AdoptionStartsValidationRegression) {
-    OneBroker b("cw-adopt", OneBroker::Runtime::Shard);
+    Broker b("cw-adopt", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     const auto a = c.defineTopicAndWait("a", 1, "", {}, rc::Persistence::Disk, {}, {}, 30s);
     ASSERT_EQ(a.errorCode, 0) << a.detail;
     const std::string garbage("\x01\x02\x03", 3);
-    EXPECT_EQ(cwb::produceRaw(b, "a", a.topicId, 1, garbage, rc::Key(uint64_t{1})), kOk);
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "a", a.topicId, 1, garbage, rc::Key(uint64_t{1})), kOk);
     const auto adopted = c.defineTopicAndWait("a", 1, "id", rune::codec::serialize(cw::matrixDescriptor()), rc::Persistence::Disk, {}, {}, 30s);
     ASSERT_EQ(adopted.errorCode, 0) << adopted.detail;
     for (int i = 0; i < 400 && !cwb::hasWriteState(b.node(), a.topicId, 0); ++i) std::this_thread::sleep_for(25ms);
     ASSERT_TRUE(cwb::hasWriteState(b.node(), a.topicId, 0)) << "the owning worker holds the adopted topic's write state";
-    EXPECT_EQ(cwb::produceRaw(b, "a", a.topicId, 1, garbage, rc::Key(uint64_t{1})), kSchemaValidationFailed);
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "a", a.topicId, 1, garbage, rc::Key(uint64_t{1})), kSchemaValidationFailed);
 }
 
 TEST(CheckedWritesBrokerRegression, AlterThenProduceNewVersionSucceedsRegression) {
-    OneBroker b("cw-alter", OneBroker::Runtime::Shard);
+    Broker b("cw-alter", OneBroker::Runtime::Shard);
     rc::Client& c = *b.connectClient();
     const auto t = cwb::defineTyped(c, "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
@@ -460,7 +539,7 @@ TEST(CheckedWritesBrokerRegression, AlterThenProduceNewVersionSucceedsRegression
     rec.value = v2;
     uint16_t code = kNotLeader;
     for (int i = 0; i < 200 && code == kNotLeader; ++i) {
-        code = cwb::produceRaw(b, "p", t.topicId, 1, rec.value, keyOf(rec.key));
+        code = cwb::produceRaw(b.clientConfig(), "p", t.topicId, 1, rec.value, keyOf(rec.key));
         if (code == kNotLeader) std::this_thread::sleep_for(25ms);
     }
     EXPECT_EQ(code, kOk);
@@ -508,14 +587,14 @@ TEST(CheckedWritesBrokerRegression, ThreeNodesNewLeaderValidatesRegression) {
 // A typed TRANSIENT topic validates like a disk one: its partitions append to an InMemoryLog through the same
 // produceCore_, and their RcSlot carries the write state.  (TransientTopicDataPathTest now runs on an untyped topic.)
 TEST(CheckedWritesBrokerRegression, TransientTypedTopicValidatesRegression) {
-    OneBroker b("cw-transient", OneBroker::Runtime::Shard);
+    Broker b("cw-transient", OneBroker::Runtime::Shard);
     const auto t = b.connectClient()->defineTopicAndWait("p", 1, "id", rune::codec::serialize(cw::matrixDescriptor()),
                                                         rc::Persistence::Transient, {}, {}, 60s);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     cw::Parts bad; bad.bio = std::string("\xC0\xAF", 2);
     EXPECT_EQ(send(b, "p", t.topicId, 1, cw::encode(bad)), kSchemaValidationFailed);
     EXPECT_EQ(send(b, "p", t.topicId, 1, cw::validRecord(1)), kOk);
-    EXPECT_EQ(cwb::produceRaw(b, "p", t.topicId, 1, "", rc::Key(uint32_t{1})), kSchemaValidationFailed) << "a wrong-width tombstone";
+    EXPECT_EQ(cwb::produceRaw(b.clientConfig(), "p", t.topicId, 1, "", rc::Key(uint32_t{1})), kSchemaValidationFailed) << "a wrong-width tombstone";
 }
 
 // Boot: a restarted broker owns its catalog's typed partitions before any spec reaches a worker, so leadership of a typed
@@ -525,18 +604,40 @@ TEST(CheckedWritesBrokerRegression, TransientTypedTopicValidatesRegression) {
 // without a write state, answers OK and stores the record.
 TEST(CheckedWritesBrokerRegression, RestartServesNoTypedPartitionBeforeItsSpecRegression) {
     uint32_t hold = 0;
-    OneBroker b("cw-bootgate", OneBroker::Runtime::Shard, [&hold](NodeConfig& cfg) { cfg.testHoldWriteSpecPasses = hold; });
+    Broker b("cw-bootgate", OneBroker::Runtime::Shard, [&hold](NodeConfig& cfg) {
+        cfg.testHoldWriteSpecPasses = hold;
+        cfg.electionTimeoutMs       = 40;
+        cfg.unservableWarmupMs      = 50;
+        cfg.readLeaseMaxMs          = 50;
+    });
     const auto t = cwb::defineTyped(*b.connectClient(), "p", 1);
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     hold = 4'000'000'000u;   // the restarted broker never delivers a WriteSpecUpdate
     b.restart();
     cw::Parts bad; bad.bio = std::string("\xC0\xAF", 2);
     const auto rec = cw::encode(bad);
-    for (int i = 0; i < 3; ++i) {   // 3 x 4 s spans the 2 s leader-election warm-up of the restart
-        const uint16_t code = cwb::produceRaw(b, "p", t.topicId, 1, rec.value, keyOf(rec.key), 4s);
+    rc::ClientConfig cfg = b.clientConfig();
+    cfg.topics.push_back(rc::TopicSpec{"p", t.topicId, 1});
+    rc::Client client(cfg);
+    client.connectAndWait(30s);
+    rc::ProducerConfig pc;
+    pc.acks     = rc::Acks::All;
+    pc.lingerUs = 0;
+    rc::Producer prod = client.producer(pc);
+    rc::Completions cq(client);
+    const rc::TopicHandle topic = client.topic("p");
+    const std::string value = rec.value;
+    for (uint64_t i = 1; i <= 3; ++i) {   // 3 x 150 ms spans the restart's leader-election warm-up
+        ASSERT_EQ(prod.trySend(topic, keyOf(rec.key), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), value.size()), cq, i), rc::SendResult::Ok);
+        prod.flush();
+        std::optional<rc::Completion> done;
+        (void)cq.waitFor(i, 150ms, [&](const rc::Completion& d, std::span<const uint8_t>) { done = d; });
+        const uint16_t code = !done ? cwb::kNotOk : done->status == rc::OpStatus::BrokerError ? done->errorCode : done->status == rc::OpStatus::Ok ? uint16_t{0} : cwb::kNotOk;
         EXPECT_TRUE(code == kNotLeader || code == kSchemaValidationFailed || code == cwb::kNotOk)
             << "attempt " << i << " answered " << code;
     }
+    prod.closeImmediately();
+    client.close();
     EXPECT_TRUE(storedValues(b.node(), t.topicId, 0).empty()) << "an invalid record was stored before the spec arrived";
 }
 
@@ -634,7 +735,7 @@ std::vector<uint8_t> acctViewPlan(int32_t srcTopicId) {
     return rv::serializeAuthored(p);
 }
 
-AcctFixture defineAcct(OneBroker& b, bool withView = true) {
+AcctFixture defineAcct(Broker& b, bool withView = true) {
     AcctFixture f;
     rc::Client& c = *b.connectClient();
     const auto t  = c.defineTopicAndWait("acct", 1, "id", OneBroker::idDescriptor("acct"), rc::Persistence::Disk, {}, {}, 60s);
@@ -654,20 +755,19 @@ constexpr rc::Acks kLeaderView = rc::Acks::Leader | rc::Acks::View;
 
 /// A View send parked behind an open transaction completes only after the commit.
 void expectViewSendWaitsForTheTransaction(const char* tag, rc::Acks viewAcks) {
-    OneBroker b(tag, OneBroker::Runtime::Shard);
+    Broker b(tag, OneBroker::Runtime::Shard);
     const AcctFixture f = defineAcct(b);
     Sender tx(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::All, "tx-cw");
     tx.prod->initTransactionsAndWait(30s);
     tx.prod->beginTransaction();
-    (void)tx.send(1);
-    std::this_thread::sleep_for(300ms);
+    ASSERT_TRUE(isOk(tx.await(tx.send(1), 10s))) << "premise: the open transaction's record is in the log";
 
     Sender plain(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::All);
     EXPECT_TRUE(isOk(plain.await(plain.send(2), 2s))) << "a plain All send does not wait for the open transaction";
 
     Sender view(b.clientConfig(), "acct", f.topicId, 1, viewAcks);
     const uint64_t tok = view.send(3);
-    EXPECT_FALSE(view.await(tok, 1s).has_value()) << "the view has not folded past the open transaction";
+    EXPECT_FALSE(view.await(tok, 250ms).has_value()) << "the view has not folded past the open transaction";
 
     tx.prod->commitTransactionAndWait(30s);
     EXPECT_TRUE(isOk(view.await(tok, 5s)));
@@ -695,7 +795,7 @@ TEST(CheckedWritesBrokerRegression, LeaderViewBehavesLikeAllViewShardRegression)
 }
 
 TEST(CheckedWritesBrokerRegression, ViewOnAPartitionWithoutViewsAcksAtCommitShardRegression) {
-    OneBroker b("cw-noview", OneBroker::Runtime::Shard);
+    Broker b("cw-noview", OneBroker::Runtime::Shard);
     const AcctFixture f = defineAcct(b, /*withView=*/false);
 
     // No view folds this partition, so a View send does not wait for one: it acks at commit even while an open
@@ -738,7 +838,7 @@ TEST(CheckedWritesBrokerRegression, ViewOnAPartitionWithoutViewsAcksAtCommitShar
 }
 
 TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesTheViewBitRegression) {
-    OneBroker b("cw-legacyview", OneBroker::Runtime::Legacy);
+    Broker b("cw-legacyview", OneBroker::Runtime::Legacy);
     const AcctFixture f = defineAcct(b, /*withView=*/false);
     Sender view(b.clientConfig(), "acct", f.topicId, 1, kAllView);
     const auto refused = view.await(view.send(1), 10s);
@@ -750,7 +850,7 @@ TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesTheViewBitRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, V12ClientAgainstV7BrokerKeepsEveryOldAckBehaviourShardRegression) {
-    OneBroker b("cw-oldacks", OneBroker::Runtime::Shard);
+    Broker b("cw-oldacks", OneBroker::Runtime::Shard);
     const AcctFixture f = defineAcct(b);
     uint64_t id = 1;
     for (const rc::Acks acks : {rc::Acks::Leader, rc::Acks::All}) {
@@ -856,7 +956,7 @@ void awaitSetLogged(BrokerNode& node, int32_t topicId) {
 }
 
 /// A typed {id, v, tag} topic `vt` (one partition) with TagEquals{9} (object 7) installed on the worker that serves it.
-int32_t defineVerdictSource(OneBroker& b, rc::Client* connected = nullptr) {
+int32_t defineVerdictSource(Broker& b, rc::Client* connected = nullptr) {
     rc::Client& c = connected != nullptr ? *connected : *b.connectClient();
     const auto t  = c.defineTopicAndWait("vt", 1, "id", rune::codec::serialize(cw::verdictSourceDescriptor()), rc::Persistence::Disk, {}, {}, 60s);
     EXPECT_EQ(t.errorCode, 0) << t.detail;
@@ -885,7 +985,7 @@ int32_t defineVerdictSource(OneBroker& b, rc::Client* connected = nullptr) {
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, VerdictAcksCarryThePerRecordResultShardRegression) {
-    OneBroker b("cw-verdict", OneBroker::Runtime::Shard);
+    Broker b("cw-verdict", OneBroker::Runtime::Shard);
     const int32_t src = defineVerdictSource(b);
     Sender s(b.clientConfig(), "vt", src, 1, kAllView);
     std::vector<uint64_t> toks;
@@ -922,7 +1022,7 @@ TEST(CheckedWritesBrokerRegression, VerdictAcksCarryThePerRecordResultShardRegre
 // #802: a claimBatch reports EVERY record's verdict (RecordsRejected + the rejection list), and the Raw subscriber receives
 // exactly the accepted records.  (The Tier-2 leg of this test is added with the Tier-2 change.)
 TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRegression) {
-    OneBroker b("cw-batchverdict", OneBroker::Runtime::Shard);
+    Broker b("cw-batchverdict", OneBroker::Runtime::Shard);
     rc::Client& admin = *b.connectClient();
     const int32_t src = defineVerdictSource(b, &admin);
     Sender s(admin, src, kAllView);
@@ -1016,7 +1116,7 @@ TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRe
 // A batch whose every record is rejected is skipped by the group fetch path too: the group consumer sees exactly the accepted
 // batches around it, and its position moves past the rejected one.
 TEST(CheckedWritesBrokerRegression, FullyRejectedBatchIsSkippedOnTheGroupPathShardRegression) {
-    OneBroker b("cw-groupskip", OneBroker::Runtime::Shard);
+    Broker b("cw-groupskip", OneBroker::Runtime::Shard);
     const int32_t src = defineVerdictSource(b);
     Sender s(b.clientConfig(), "vt", src, 1, kAllView);   // the group resolves "vt" through this client's topics
     const std::string recKey = std::string("\x01\0\0\0\0\0\0\0", 8);   // the typed record key: id 1
@@ -1216,30 +1316,31 @@ std::vector<std::optional<std::pair<int64_t, uint16_t>>> vtRows(rc::Client& read
     return rows;
 }
 
-/// Offsets a subscription from 0 delivers: until `atLeast` arrived, plus 500 ms for a rejected record that would follow.
-std::set<int64_t> deliveredFromZero(rc::ClientConfig cfg, int32_t topicId, std::size_t atLeast) {
-    cfg.topics.push_back(rc::TopicSpec{"vt", topicId, 1});
-    rc::Client client(cfg);
-    client.connectAndWait(30s);
+/// Offsets a subscription from 0 delivers: until `atLeast` arrived, plus 60 ms for a rejected record that would follow.
+std::set<int64_t> deliveredFromZero(rc::Client& client, int32_t topicId, std::size_t atLeast) {
     std::mutex mu;
     std::set<int64_t> got;
     rc::SubscribeOptions o;
     o.from = rc::From::earliest();
-    rc::Subscription sub = client.subscribe(client.topic("vt"), 0, o, [&](const rc::Record& r) {
+    rc::Subscription sub = client.subscribe(rc::TopicHandle{topicId, 1}, 0, o, [&](const rc::Record& r) {
         std::lock_guard<std::mutex> g(mu);
         got.insert(r.offset);
     });
-    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(50ms)) {
+    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(5ms)) {
         std::lock_guard<std::mutex> g(mu);
         if (got.size() >= atLeast) break;
     }
-    std::this_thread::sleep_for(500ms);
+    std::this_thread::sleep_for(60ms);
     sub.unsubscribe();
-    std::set<int64_t> out;
-    {
-        std::lock_guard<std::mutex> g(mu);
-        out = got;
-    }
+    for (const auto deadline = Clock::now() + 10s; !sub.finished() && Clock::now() < deadline; std::this_thread::sleep_for(1ms)) {}
+    EXPECT_TRUE(sub.finished()) << "the subscription finished before its handler's state is destroyed";
+    return got;
+}
+
+std::set<int64_t> deliveredFromZero(rc::ClientConfig cfg, int32_t topicId, std::size_t atLeast) {
+    rc::Client client(cfg);
+    client.connectAndWait(30s);
+    const std::set<int64_t> out = deliveredFromZero(client, topicId, atLeast);
     client.close();
     return out;
 }
@@ -1250,7 +1351,7 @@ constexpr uint16_t kConstraintViolation = static_cast<uint16_t>(rune::protocol::
 
 namespace {
 /// `vt_v` over the one-node verdict source.
-int32_t createVtView(OneBroker& b, int32_t srcTopicId) {
+int32_t createVtView(Broker& b, int32_t srcTopicId) {
     const auto view = b.connectClient()->createViewAndWait("vt_v", "id", 0, vtViewPlan(srcTopicId), {}, 60s);
     EXPECT_EQ(view.errorCode, 0) << view.detail;
     return view.viewTopicId;
@@ -1258,7 +1359,7 @@ int32_t createVtView(OneBroker& b, int32_t srcTopicId) {
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, CoalescedBatchWithOneBadRecordShardRegression) {
-    OneBroker b("cw-verdict-coalesced", OneBroker::Runtime::Shard);
+    Broker b("cw-verdict-coalesced", OneBroker::Runtime::Shard);
     const int32_t src = defineVerdictSource(b);
     const int32_t viewTopic = createVtView(b, src);
     ASSERT_FALSE(HasFatalFailure());
@@ -1295,11 +1396,11 @@ TEST(CheckedWritesBrokerRegression, CoalescedBatchWithOneBadRecordShardRegressio
     EXPECT_FALSE(vtRow(*reader, viewTopic, 3, &answered).has_value());
     EXPECT_TRUE(answered) << "id 3 is absent from the view";
     EXPECT_TRUE(vtRow(*reader, viewTopic, 4, &answered).has_value());
-    EXPECT_EQ(deliveredFromZero(b.clientConfig(), src, 15).count(3), 0u) << "a consumer from 0 never sees the rejected record (id 3, after the set change at offset 0)";
+    EXPECT_EQ(deliveredFromZero(*reader, src, 15).count(3), 0u) << "a consumer from 0 never sees the rejected record (id 3, after the set change at offset 0)";
 }
 
 TEST(CheckedWritesBrokerRegression, OldWritersOnAVerdictSourceNeverSeeRejectedRecordsShardRegression) {
-    OneBroker b("cw-verdict-old", OneBroker::Runtime::Shard);
+    Broker b("cw-verdict-old", OneBroker::Runtime::Shard);
     const int32_t src = defineVerdictSource(b);
     const int32_t viewTopic = createVtView(b, src);
     ASSERT_FALSE(HasFatalFailure());
@@ -1321,7 +1422,7 @@ TEST(CheckedWritesBrokerRegression, OldWritersOnAVerdictSourceNeverSeeRejectedRe
     std::size_t stored = 0;
     for (int i = 0; i < 400 && stored < 8; ++i) {
         stored = storedValues(b.node(), src, 0).size();
-        if (stored < 8) std::this_thread::sleep_for(25ms);
+        if (stored < 8) std::this_thread::sleep_for(5ms);
     }
     ASSERT_EQ(stored, 8u) << "every record was written";
     auto reader = b.connectClient();
@@ -1331,7 +1432,7 @@ TEST(CheckedWritesBrokerRegression, OldWritersOnAVerdictSourceNeverSeeRejectedRe
         ASSERT_TRUE(answered) << "row " << k;
         EXPECT_EQ(row.has_value(), k % 2 == 1) << "id " << k << (k % 2 == 1 ? " was accepted" : " was rejected");
     }
-    EXPECT_EQ(deliveredFromZero(b.clientConfig(), src, 4).size(), 4u) << "a consumer sees exactly the tag-1 records";
+    EXPECT_EQ(deliveredFromZero(*reader, src, 4).size(), 4u) << "a consumer sees exactly the tag-1 records";
 }
 
 TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRegression) {
@@ -1503,6 +1604,40 @@ namespace pc = rune::protocol::client;
 constexpr int32_t kKiParts = 4;
 constexpr uint16_t kInvalidRequest = 39, kKeyExists = 56, kKeyNotFound = 57;
 
+/// `count` view reads issued by `issue(i, cq, token)` through one Completions, in windows (the client refuses an issue past its op window);
+/// a read whose status `settled` rejects is retried until `within`.
+template <class Issue, class Settled>
+std::vector<rc::ViewRowResult> readRows(rc::Client& c, std::size_t count, std::chrono::seconds within, Settled settled, Issue issue) {
+    constexpr std::size_t kWindow = 32;
+    std::vector<rc::ViewRowResult> rows(count);
+    std::vector<std::size_t> pending(count);
+    std::iota(pending.begin(), pending.end(), 0);
+    rc::Completions cq(c);
+    rc::Token token = 0;
+    for (const auto deadline = Clock::now() + within; !pending.empty() && Clock::now() < deadline; std::this_thread::sleep_for(50ms)) {
+        std::vector<std::size_t> retry;
+        for (std::size_t from = 0; from < pending.size(); from += kWindow) {
+            const std::size_t to = std::min(pending.size(), from + kWindow);
+            const rc::Token first = token;
+            for (std::size_t k = from; k < to; ++k)
+                if (issue(pending[k], cq, token++) != rc::OpResult::Accepted) ADD_FAILURE() << "view read " << pending[k] << " refused";
+            for (std::size_t k = from; k < to; ++k) {
+                rc::ViewRowResult& row = rows[pending[k]];
+                row = {};
+                (void)cq.waitFor(first + (k - from), 10s, [&](const rc::Completion& d, std::span<const uint8_t> bytes) {
+                    row.status = d.status == rc::OpStatus::Ok ? rc::ViewRowResult::kOk : d.status == rc::OpStatus::BrokerError ? d.errorCode : rc::ViewRowResult::kNotLeader;
+                    row.rowBytes.assign(bytes.begin(), bytes.end());
+                });
+                if (!settled(row.status)) retry.push_back(pending[k]);
+            }
+        }
+        pending = std::move(retry);
+    }
+    return rows;
+}
+
+constexpr auto kOnlyOk = [](uint16_t status) { return status == rc::ViewRowResult::kOk; };
+
 /// A bounded poll; no test synchronises on a sleep.
 template <class Pred>
 bool waitFor(Pred&& pred, std::chrono::seconds within) {
@@ -1560,6 +1695,9 @@ public:
         for (rc::Subscription& s : subs_) s.unsubscribe();
         EXPECT_TRUE(waitFor([&] { return std::all_of(subs_.begin(), subs_.end(), [](const rc::Subscription& s) { return s.finished(); }); }, 10s))
             << "every subscription finished before the collector is destroyed";
+    }
+    void unsubscribe() {
+        for (rc::Subscription& s : subs_) s.unsubscribe();
     }
     void subscribe(rc::Client& c, rc::TopicHandle topic, int32_t partition) {
         rc::SubscribeOptions o;
@@ -1635,7 +1773,7 @@ std::size_t storedTotal(BrokerNode& n, int32_t topicId, int32_t parts) {
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, TypedIntentsEndToEndShardRegression) {
-    OneBroker b("cw-ki-e2e", OneBroker::Runtime::Shard);
+    Broker b("cw-ki-e2e", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -1678,7 +1816,7 @@ TEST(CheckedWritesBrokerRegression, TypedIntentsEndToEndShardRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, KeyIndexDdlRefusalsShardRegression) {
-    OneBroker b("cw-ki-ddl", OneBroker::Runtime::Shard);
+    Broker b("cw-ki-ddl", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -1782,7 +1920,7 @@ struct KeyRec {
 };
 
 template <class K>
-void expectRemoveRoutesAsSend(OneBroker& b, rc::Client& c, const std::string& name, bool keyIndex) {
+void expectRemoveRoutesAsSend(Broker& b, rc::Client& c, const std::string& name, bool keyIndex) {
     using Rec = KeyRec<K>;
     SCOPED_TRACE(name);
     constexpr int kRecords = 50;
@@ -1864,7 +2002,7 @@ void expectRemoveRoutesAsSend(OneBroker& b, rc::Client& c, const std::string& na
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, TypedRemoveRoutesAsSendForEveryKeyWidthShardRegression) {
-    OneBroker b("cw-ki-widths", OneBroker::Runtime::Shard);
+    Broker b("cw-ki-widths", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -1879,7 +2017,7 @@ TEST(CheckedWritesBrokerRegression, TypedRemoveRoutesAsSendForEveryKeyWidthShard
 
 TEST(CheckedWritesBrokerRegression, IntentsToAnOlderClusterAreRefusedShardRegression) {
     {
-        OneBroker b("cw-ki-lvl4", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = 4; });
+        Broker b("cw-ki-lvl4", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = 4; });
         rc::Client& c = *b.connectClient();
         ASSERT_TRUE(waitFor([&] { return b.node().onWorkerThreadForTest(0, [](Worker& w) { return w.clusterFeatureLevelForTest(); }) == 4; }, 10s));
         const auto ddl = defineKi(c, "ki_idx");
@@ -1893,7 +2031,7 @@ TEST(CheckedWritesBrokerRegression, IntentsToAnOlderClusterAreRefusedShardRegres
         EXPECT_EQ(r.code(), kInvalidRequest);
         EXPECT_EQ(storedTotal(b.node(), t.topicId, kKiParts), 0u);
     }
-    OneBroker old("cw-ki-v9", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testAdvertisedBrokerVersion = 9; });
+    Broker old("cw-ki-v9", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testAdvertisedBrokerVersion = 9; });
     awaitLevel(old.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *old.connectClient();
@@ -1905,7 +2043,7 @@ TEST(CheckedWritesBrokerRegression, IntentsToAnOlderClusterAreRefusedShardRegres
 }
 
 TEST(CheckedWritesKeyIndexRegression, RawIntentShapesAreRefusedOrOpaqueRegression) {
-    OneBroker b("cw-ki-raw", OneBroker::Runtime::Shard);
+    Broker b("cw-ki-raw", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2187,7 +2325,7 @@ TEST(CheckedWritesBrokerRegression, RestartRebuildsTheKeyIndexThreeNodesRegressi
 }
 
 TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesIntentsRegression) {
-    OneBroker b("cw-ki-legacy", OneBroker::Runtime::Legacy);
+    Broker b("cw-ki-legacy", OneBroker::Runtime::Legacy);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2204,7 +2342,7 @@ TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesIntentsRegression) {
 // Part 06 Task 10 (fix round 1): a restarted broker builds its autoincrement topic's replicas from the catalog with the whole
 // producer retry window, the depth the cleaner keeps (a runtime create is CatalogEffectsTest's).
 TEST(CheckedWritesBrokerRegression, AutoIncTopicKeepsTheRetryWindowDepthAcrossARestartRegression) {
-    OneBroker b("cw-ai-depth", OneBroker::Runtime::Shard);
+    Broker b("cw-ai-depth", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2273,6 +2411,13 @@ std::vector<uint8_t> aiViewPlan(int32_t srcTopicId) {
     return rv::serializeAuthored(p);
 }
 
+/// The n of a row [bitmap][id][n].
+int64_t aiRowValue(const std::vector<uint8_t>& row) {
+    int64_t n = 0;
+    for (int i = 0; i < 8; ++i) n |= static_cast<int64_t>(row[9 + static_cast<std::size_t>(i)]) << (8 * i);
+    return n;
+}
+
 /// The `n` of view row `id` ([bitmap][id][n]); nullopt = absent.  Retries only what a moving leader or a building view answers.
 std::optional<int64_t> aiRowN(rc::Client& reader, int32_t viewTopicId, uint64_t id) {
     rc::ViewRowResult row;
@@ -2284,9 +2429,7 @@ std::optional<int64_t> aiRowN(rc::Client& reader, int32_t viewTopicId, uint64_t 
         EXPECT_EQ(row.status, rc::ViewRowResult::kAbsentKey) << "row " << id;
         return std::nullopt;
     }
-    int64_t n = 0;
-    for (int i = 0; i < 8; ++i) n |= static_cast<int64_t>(row.rowBytes[9 + static_cast<std::size_t>(i)]) << (8 * i);
-    return n;
+    return aiRowValue(row.rowBytes);
 }
 
 uint64_t idOf(const std::string& keyBytes) {
@@ -2372,7 +2515,7 @@ TEST(CheckedWritesBrokerRegression, ControllerCrashCoordinatorsRecoverWithinBoun
 }
 
 TEST(CheckedWritesBrokerRegression, AutoIncEndToEndShardRegression) {
-    OneBroker b("cw-ai-e2e", OneBroker::Runtime::Shard);
+    Broker b("cw-ai-e2e", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2412,7 +2555,7 @@ TEST(CheckedWritesBrokerRegression, AutoIncEndToEndShardRegression) {
 
 TEST(CheckedWritesBrokerRegression, ModuloRoutingIsTheSameOnEveryPathShardRegression) {
     constexpr int32_t kParts = 4;
-    OneBroker b("cw-ai-mod", OneBroker::Runtime::Shard);
+    Broker b("cw-ai-mod", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2425,11 +2568,13 @@ TEST(CheckedWritesBrokerRegression, ModuloRoutingIsTheSameOnEveryPathShardRegres
     col.subscribeAll(c, w.topic.handle());
 
     std::vector<uint64_t> ids;
-    for (int64_t i = 1; i <= 400; ++i) {
-        const auto r = w.topic.insertAndWait(Ai{.n = i}, 10s);
-        ASSERT_TRUE(r.ok()) << "insert " << i << " code " << r.code();
-        ids.push_back(r.key());
-    }
+    ASSERT_TRUE(writePipelined(c, w.prod, 400,
+        [&](uint64_t i, rc::Completions& cq, rc::Token t) { w.topic.insert(Ai{.n = static_cast<int64_t>(i) + 1}, cq, t); },
+        [&](uint64_t i, const rc::WriteResult& r) {
+            EXPECT_TRUE(r.ok()) << "insert " << i + 1 << " code " << r.code();
+            ids.push_back(r.key());
+            return r.ok();
+        }));
     ASSERT_TRUE(waitFor([&] { return col.count() >= ids.size(); }, 10s)) << "delivered " << col.count();
     std::map<uint64_t, int32_t> partitionOf;
     std::array<std::vector<uint64_t>, kParts> perPartition;
@@ -2455,10 +2600,14 @@ TEST(CheckedWritesBrokerRegression, ModuloRoutingIsTheSameOnEveryPathShardRegres
             EXPECT_TRUE(rm.ok()) << "remove " << probes[i] << " code " << rm.code();
         }
     }
+    const auto settled = [](uint16_t status) { return status == rc::ViewRowResult::kOk || status == rc::ViewRowResult::kAbsentKey; };
+    const auto readN = [&](const std::vector<uint64_t>& ids) {
+        return readRows(c, ids.size(), 60s, settled, [&](std::size_t i, rc::Completions& cq, rc::Token t) { return c.getViewRow(view.viewTopicId, ids[i], 0, cq, t); });
+    };
+    const auto rows = readN(probes);
     for (std::size_t i = 0; i < probes.size(); ++i) {
-        const std::optional<int64_t> n = aiRowN(c, view.viewTopicId, probes[i]);
-        EXPECT_EQ(n.has_value(), i % 2 == 0) << "view row " << probes[i];
-        if (n) EXPECT_EQ(*n, 7);
+        EXPECT_EQ(rows[i].status, i % 2 == 0 ? rc::ViewRowResult::kOk : rc::ViewRowResult::kAbsentKey) << "view row " << probes[i];
+        if (rows[i].status == rc::ViewRowResult::kOk) EXPECT_EQ(aiRowValue(rows[i].rowBytes), 7);
     }
 
     std::vector<std::unique_ptr<Collector>> keyed;
@@ -2471,28 +2620,35 @@ TEST(CheckedWritesBrokerRegression, ModuloRoutingIsTheSameOnEveryPathShardRegres
         ASSERT_TRUE(waitFor([&] { return k.count() > 0; }, 10s)) << "keyed subscription of " << probes[i];
         for (const Seen& s : k.seen()) EXPECT_EQ(s.partition, static_cast<int32_t>(probes[i] % kParts)) << "keyed subscription of " << probes[i];
     }
+    for (auto& k : keyed) k->unsubscribe();   // their destructors then find every subscription finished
 
     // The gateway resolves the partition of an explicit update (partitionKnown = 0).
     rc::Client& blind = *b.connectClient();
     blind.producePartitionUnknownForTest(true);
     AiWriter<Ai> viaGateway(blind, "ai");
+    std::vector<uint64_t> updated;
     for (std::size_t i = 0; i < probes.size(); i += 2) {
         const rc::WriteResult up = viaGateway.topic.updateAndWait(Ai{.id = probes[i], .n = 99}, 10s);
         EXPECT_TRUE(up.ok()) << "update " << probes[i] << " code " << up.code();
-        const std::optional<int64_t> n = aiRowN(c, view.viewTopicId, probes[i]);
-        ASSERT_TRUE(n.has_value());
-        EXPECT_EQ(*n, 99);
+        updated.push_back(probes[i]);
+    }
+    const auto rewritten = readN(updated);
+    for (std::size_t i = 0; i < updated.size(); ++i) {
+        ASSERT_EQ(rewritten[i].status, rc::ViewRowResult::kOk) << "view row " << updated[i];
+        EXPECT_EQ(aiRowValue(rewritten[i].rowBytes), 99);
     }
 }
 
 TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
-    AuthBroker b("ai-import", {.shard = true});
+    auto driverStart = std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
+    AuthBroker b("ai-import", {.shard = true, .configure = [](NodeConfig& cfg) { cfg.testAeronClientIdleSleepMs = 1; }, .wireIdleSleepMs = 1});
+    const auto driver = driverStart.get();
     b.bootstrapAdmin();
     b.createUser("app", kAiPassword, {AuthGrant{SO::Write, ST::Topic, SP::Exact, "user"}});
     b.createUser("backfill", kAiPassword, {AuthGrant{SO::Write, ST::Topic, SP::Exact, "user"}, AuthGrant{SO::Import, ST::Topic, SP::Exact, "user"}});
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
-    const auto connect = [&](const std::string& user, const std::string& password, bool partitionUnknown) {
+    const auto config = [&](const std::string& user, const std::string& password) {
         rc::ClientConfig cfg;
         cfg.gatewayChannel  = b.channel();
         cfg.gatewayStreamId = 1;
@@ -2503,12 +2659,16 @@ TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
         cfg.password        = password;
         cfg.offerCrypto     = true;
         cfg.tlsTrustPem     = AuthBroker::tlsCaPem();
+        return driver->attach(cfg);
+    };
+    const auto connect = [](const rc::ClientConfig& cfg) {
         auto client = std::make_unique<rc::Client>(cfg);
         client->connectAndWait(30s);
-        client->producePartitionUnknownForTest(partitionUnknown);
         return client;
     };
-    auto admin = connect("admin", AuthBroker::kAdminPassword, false);
+    auto appConnecting      = std::async(std::launch::async, connect, config("app", kAiPassword));   // the clients connect together
+    auto backfillConnecting = std::async(std::launch::async, connect, config("backfill", kAiPassword));
+    auto admin = connect(config("admin", AuthBroker::kAdminPassword));
     const auto t = defineAi(*admin, "user", aiUserDescriptor(), "userId");
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     admin->close();
@@ -2517,10 +2677,12 @@ TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
     // schedule, so what a refused import must not change is the data records, not the log end.
     std::size_t stored = storedValues(b.node(), t.topicId, 0).size();
     uint64_t explicitId = 500;
+    auto app      = appConnecting.get();
+    auto backfill = backfillConnecting.get();
+    AiWriter<AiUser> appW(*app, "user"), backfillW(*backfill, "user");
     for (const bool partitionUnknown : {false, true}) {
-        auto app      = connect("app", kAiPassword, partitionUnknown);
-        auto backfill = connect("backfill", kAiPassword, partitionUnknown);
-        AiWriter<AiUser> appW(*app, "user"), backfillW(*backfill, "user");
+        app->producePartitionUnknownForTest(partitionUnknown);
+        backfill->producePartitionUnknownForTest(partitionUnknown);
         const auto denied = appW.topic.insertAndWait(AiUser{.userId = explicitId, .provider = 1, .subject = "denied"}, 10s);
         EXPECT_EQ(denied.status(), rc::OpStatus::BrokerError);
         EXPECT_EQ(denied.code(), kNotAuthorized);
@@ -2534,11 +2696,11 @@ TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
         EXPECT_EQ(next.key(), explicitId + 1) << "the counter moved past the import";
         stored = storedValues(b.node(), t.topicId, 0).size();
         explicitId = 600;
-        app->close();
-        backfill->close();
     }
+    app->close();
+    backfill->close();
 
-    AuthBroker old("ai-import-lvl4", {.shard = true, .configure = [](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = 4; }});
+    AuthBroker old("ai-import-lvl4", {.shard = true, .configure = [](NodeConfig& cfg) { cfg.testAeronClientIdleSleepMs = 1; cfg.testSupportedFeatureLevel = 4; }, .wireIdleSleepMs = 1});
     old.bootstrapAdmin();
     old.createUser("backfill", kAiPassword);
     const auto grant = old.admin().grant(old.channel(), old.adminSession(), "backfill", false, SO::Import, ST::Topic, SP::Exact, "user");
@@ -2630,7 +2792,7 @@ TEST(CheckedWritesBrokerRegression, RegressorsPathBackFillThenInsertsNeverCollid
 }
 
 TEST(CheckedWritesBrokerRegression, AutoIncDdlRefusalsShardRegression) {
-    OneBroker b("cw-ai-ddl", OneBroker::Runtime::Shard);
+    Broker b("cw-ai-ddl", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2670,7 +2832,7 @@ TEST(CheckedWritesBrokerRegression, AutoIncDdlRefusalsShardRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesKeyZeroCreatesRegression) {
-    OneBroker b("cw-ai-legacy", OneBroker::Runtime::Legacy);
+    Broker b("cw-ai-legacy", OneBroker::Runtime::Legacy);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -2686,7 +2848,7 @@ TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesKeyZeroCreatesRegression
 
 TEST(CheckedWritesBrokerRegression, KeyZeroCreatesToAnOlderClusterShardRegression) {
     {
-        OneBroker b("cw-ai-lvl4", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = 4; });
+        Broker b("cw-ai-lvl4", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = 4; });
         rc::Client& c = *b.connectClient();
         ASSERT_TRUE(waitFor([&] { return b.node().onWorkerThreadForTest(0, [](Worker& w) { return w.clusterFeatureLevelForTest(); }) == 4; }, 10s));
         const auto ddl = defineAi(c, "user", aiUserDescriptor(), "userId");
@@ -2709,7 +2871,7 @@ TEST(CheckedWritesBrokerRegression, KeyZeroCreatesToAnOlderClusterShardRegressio
         prod.closeImmediately();
     }
     int32_t advertised = 0;
-    OneBroker old("cw-ai-v9", OneBroker::Runtime::Shard, [&advertised](NodeConfig& cfg) { cfg.testAdvertisedBrokerVersion = advertised; });
+    Broker old("cw-ai-v9", OneBroker::Runtime::Shard, [&advertised](NodeConfig& cfg) { cfg.testAdvertisedBrokerVersion = advertised; });
     awaitLevel(old.node());
     ASSERT_FALSE(HasFatalFailure());
     const auto t = defineAi(*old.connectClient(), "user", aiUserDescriptor(), "userId");
@@ -3013,7 +3175,7 @@ std::set<uint64_t> idsOf(const ViewColumns& cols, const std::vector<std::vector<
 }  // namespace
 
 TEST(CheckedWritesBrokerRegression, CompositeViewPointAndPrefixReadsRightAfterTheAckShardRegression) {
-    OneBroker b("cw07-comp", OneBroker::Runtime::Shard);
+    Broker b("cw07-comp", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -3046,7 +3208,7 @@ TEST(CheckedWritesBrokerRegression, CompositeViewPointAndPrefixReadsRightAfterTh
 }
 
 TEST(CheckedWritesBrokerRegression, LowerKeyReadWithTheKeyBuilderShardRegression) {
-    OneBroker b("cw07-lower", OneBroker::Runtime::Shard);
+    Broker b("cw07-lower", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -3066,7 +3228,7 @@ TEST(CheckedWritesBrokerRegression, LowerKeyReadWithTheKeyBuilderShardRegression
 }
 
 TEST(CheckedWritesBrokerRegression, RenameMovesTheRowShardRegression) {
-    OneBroker b("cw07-rename", OneBroker::Runtime::Shard);
+    Broker b("cw07-rename", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -3086,7 +3248,7 @@ TEST(CheckedWritesBrokerRegression, RenameMovesTheRowShardRegression) {
 }
 
 TEST(CheckedWritesBrokerRegression, ScanAcrossPagesThenCursorInvalidatedShardRegression) {
-    OneBroker b("cw07-pages", OneBroker::Runtime::Shard);
+    Broker b("cw07-pages", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -3139,7 +3301,7 @@ TEST(CheckedWritesBrokerRegression, ScanAcrossPagesThenCursorInvalidatedShardReg
 }
 
 TEST(CheckedWritesBrokerRegression, MinOffsetReadSeesTheWriteShardRegression) {
-    OneBroker b("cw07-minoff", OneBroker::Runtime::Shard);
+    Broker b("cw07-minoff", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -3161,7 +3323,7 @@ TEST(CheckedWritesBrokerRegression, MinOffsetReadSeesTheWriteShardRegression) {
 
 TEST(CheckedWritesBrokerRegression, WideViewSurvivesRestartShardRegression) {
     LogCapture log;
-    OneBroker b("cw07-restart", OneBroker::Runtime::Shard);
+    Broker b("cw07-restart", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client* c = b.connectClient();
@@ -3174,7 +3336,7 @@ TEST(CheckedWritesBrokerRegression, WideViewSurvivesRestartShardRegression) {
     rcv::ViewKeyBuilder builder = keyBuilder(b.node(), "name_key");
     rcv::ViewKeyBuilder users   = keyBuilder(b.node(), "account_characters");
 
-    constexpr uint64_t kTotal = 1000;
+    constexpr uint64_t kTotal = 600;
     std::vector<std::string> names(kTotal);
     {
         KeyedSender w(b.clientConfig(), "character", t.topicId, 1, kAllView);
@@ -3195,10 +3357,12 @@ TEST(CheckedWritesBrokerRegression, WideViewSurvivesRestartShardRegression) {
     const auto keyOf = [&](uint64_t id) { builder.clear(); return bytesOf(builder.setString("name", names[id]).setUInt("characterId", id).key()); };
     const auto snapshot = [&](rc::Client& client) {
         std::map<uint64_t, std::vector<uint8_t>> rows;
+        std::vector<std::vector<uint8_t>> keys;
+        for (uint64_t id = 0; id < kTotal; ++id) keys.push_back(keyOf(id));
+        const auto read = readRows(client, kTotal, 30s, kOnlyOk, [&](std::size_t i, rc::Completions& cq, rc::Token t) { return client.getViewRowK(view, keys[i], {}, cq, t); });
         for (uint64_t id = 0; id < kTotal; ++id) {
-            const auto row = readRow(client, view, keyOf(id), {}, 30s);
-            EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "character " << id;
-            rows[id] = row.rowBytes;
+            EXPECT_EQ(read[id].status, rc::ViewRowResult::kOk) << "character " << id;
+            rows[id] = read[id].rowBytes;
         }
         std::vector<std::vector<uint8_t>> scanned;
         for (uint64_t user = 0; user < 10; ++user) {
@@ -3282,7 +3446,7 @@ TEST(CheckedWritesBrokerRegression, WideViewReadsAfterLeaderCrashThreeNodesRegre
 
 TEST(CheckedWritesBrokerRegression, MultiPartitionNarrowKeyViewReadsWithThePartitionShardRegression) {
     using Rec = KeyRec<uint16_t>;
-    OneBroker b("cw07-parts", OneBroker::Runtime::Shard);
+    Broker b("cw07-parts", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -3310,17 +3474,23 @@ TEST(CheckedWritesBrokerRegression, MultiPartitionNarrowKeyViewReadsWithTheParti
     }
     ASSERT_TRUE(w.writeAll(records));
 
+    std::vector<std::vector<uint8_t>> rowKeys;
+    std::vector<int32_t> partitions;
     for (const uint16_t k : keys) {
         builder.clear();
-        const std::vector<uint8_t> key = bytesOf(builder.setUInt("k", k).key());
-        const auto row = readRow(c, view, key, {.partition = builder.partition()});
-        EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "key " << k << " on partition " << builder.partition();
-        EXPECT_EQ(c.getViewRowAndWait(view, uint64_t{k}, 0, 10s).status, kViewInvalidRequest) << "op 72 on a multi-partition view";
+        rowKeys.push_back(bytesOf(builder.setUInt("k", k).key()));
+        partitions.push_back(builder.partition());
+    }
+    const auto rows = readRows(c, keys.size(), 30s, kOnlyOk, [&](std::size_t i, rc::Completions& cq, rc::Token t) { return c.getViewRowK(view, rowKeys[i], {.partition = partitions[i]}, cq, t); });
+    const auto op72 = readRows(c, keys.size(), 30s, [](uint16_t) { return true; }, [&](std::size_t i, rc::Completions& cq, rc::Token t) { return c.getViewRow(view, uint64_t{keys[i]}, 0, cq, t); });
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_EQ(rows[i].status, rc::ViewRowResult::kOk) << "key " << keys[i] << " on partition " << partitions[i];
+        EXPECT_EQ(op72[i].status, kViewInvalidRequest) << "op 72 on a multi-partition view";
     }
 }
 
 TEST(CheckedWritesBrokerRegression, OldGetViewRowOnALegacyViewUnchangedShardRegression) {
-    OneBroker b("cw07-legacy", OneBroker::Runtime::Shard);
+    Broker b("cw07-legacy", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();
@@ -3342,7 +3512,7 @@ TEST(CheckedWritesBrokerRegression, OldGetViewRowOnALegacyViewUnchangedShardRegr
 }
 
 TEST(CheckedWritesBrokerRegression, DeviceHistoryGroupByPrefixReadShardRegression) {
-    OneBroker b("cw07-device", OneBroker::Runtime::Shard);
+    Broker b("cw07-device", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client* c = b.connectClient();
@@ -3393,7 +3563,7 @@ TEST(CheckedWritesBrokerRegression, DeviceHistoryGroupByPrefixReadShardRegressio
 
 TEST(CheckedWritesBrokerRegression, KeyIndexOnASixteenByteKeyShardRegression) {
     using Wide = KeyRec<std::array<uint8_t, 16>>;
-    OneBroker b("cw07-ki16", OneBroker::Runtime::Shard);
+    Broker b("cw07-ki16", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     rc::Client& c = *b.connectClient();

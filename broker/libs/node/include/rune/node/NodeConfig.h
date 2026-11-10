@@ -318,11 +318,20 @@ struct NodeConfig {
     /// short value to prove no startup phase starves an invoker driver.  No env var.
     static constexpr int64_t kInProcessLivenessNs = 3'600'000'000'000LL;
     int64_t shardClientLivenessTimeoutNs = kInProcessLivenessNs;
+    /// TEST-ONLY: the embedded drivers' client liveness (ms) before shardClientLivenessTimeoutNs overrides it, in place of Aeron's 10 s
+    /// default, and the floor of inProcessDriverTimeoutMs: a test freezes the process past it in a fraction of the time, and without
+    /// the node's own liveness the freeze kills it.  0 = Aeron's 10 s; never set in production.
+    long testAeronLivenessDefaultMs = 0;
+    /// TEST-ONLY: the idle sleep (ms) of the node's runtime Aeron client conductor (thread placement) in place of Aeron's 16 ms, so a
+    /// test's every client-conductor round trip (a gateway egress publication, a subscription) does not wait out two 16 ms sleeps.
+    /// 0 = Aeron's 16 ms; never set in production.
+    long testAeronClientIdleSleepMs = 0;
     /// The in-process clients' media-driver timeout (ms) matching shardClientLivenessTimeoutNs (never below
-    /// Aeron's 10 s default).
+    /// Aeron's 10 s default, or testAeronLivenessDefaultMs when set).
     [[nodiscard]] long inProcessDriverTimeoutMs() const noexcept {
         const long ms = static_cast<long>(shardClientLivenessTimeoutNs / 1'000'000);
-        return ms > 10'000 ? ms : 10'000;
+        const long floorMs = testAeronLivenessDefaultMs > 0 ? testAeronLivenessDefaultMs : 10'000;
+        return ms > floorMs ? ms : floorMs;
     }
     [[nodiscard]] bool shardMode() const noexcept { return workerMode == WorkerMode::Shard; }
     [[nodiscard]] bool fused() const noexcept { return runtimePlacement == RuntimePlacement::Fused; }
@@ -835,6 +844,9 @@ struct NodeConfig {
     int32_t aeronCountersValuesBytes     = 0;
     /// Receiver status-message timeout of each embedded driver (EmbeddedDriverConfig::statusMessageTimeoutNs).  0 = Aeron's default (200 ms).
     int64_t aeronStatusMessageTimeoutNs  = 0;
+    /// TEST-ONLY: how soon an embedded driver reads a silent client's publication as NOT_CONNECTED and closes its image
+    /// (EmbeddedDriverConfig::silentPeerTimeoutNs).  0 = Aeron's defaults (5 s and 10 s); never set in production.
+    int64_t testSilentPeerTimeoutNs = 0;
     /// RUNE_AERON_CONTROL_TERM_BYTES: term of the worker's per-session ACK publications only — small so a
     /// term rotation never cleans 16 MiB inside the worker pass.  NOT the gateway egress publications:
     /// consumer record pushes travel there (max message = term/8 must cover the largest batch).

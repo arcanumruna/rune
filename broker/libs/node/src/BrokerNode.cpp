@@ -504,6 +504,7 @@ void BrokerNode::start() {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
         ctx.mediaDriverTimeout(config_.inProcessDriverTimeoutMs());   // in-process driver: survive own stalls
+        if (config_.testAeronClientIdleSleepMs > 0) ctx.idleSleepDuration(config_.testAeronClientIdleSleepMs);   // TEST-ONLY
         // Spec §3.2 fused placement: the runtime client has no conductor thread
         // either — its conductor runs in worker 0's pass (during start(): in the
         // interim pump runner below).
@@ -1968,10 +1969,10 @@ void BrokerNode::buildWorkerPool() {
 //   TODO(Milestone B): per-peer client endpoints for exact REDIRECT.
 // ---------------------------------------------------------------------------
 void BrokerNode::onStorageFailure_(const std::string& logDir, int err) {
-    if (haltRaised_) return;
-    haltRaised_ = true;
     if (!StorageIdentity::markStorageFailedThisBoot(config_.dataDir, StorageIdentity::osBootId()))
         spdlog::critical("BrokerNode[{}]: could not record the storage failure in {}", config_.nodeId, config_.dataDir);
+    if (haltRaised_) return;
+    haltRaised_ = true;
     spdlog::critical("BrokerNode[{}]: STORAGE FAILURE — fsync failed on {} (errno={}: {}). "
                      "The log is permanently failed; HALTING the broker (exit {}). Restart "
                      "recovery truncates to the last valid batch; replication re-heals it.",

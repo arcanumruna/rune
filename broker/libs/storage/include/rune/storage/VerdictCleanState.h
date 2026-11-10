@@ -44,7 +44,7 @@ public:
             else if (!std::binary_search(rejected_.begin(), rejected_.end(), e.offset)) rejected_.insert(std::lower_bound(rejected_.begin(), rejected_.end(), e.offset), e.offset);
         markers_.push_back(Marker{markerOffset, finalThrough, entries.empty() ? -1 : entries.back().offset, listed_.size(), entries.size()});
         for (const auto& e : entries) listed_.push_back(e.offset);
-        events_.push_back(Event{markerOffset, fromOffset, finalThrough, true});
+        events_.push_back(Event{markerOffset, fromOffset, control_record::closesCoverage(entries.size()) ? finalThrough : 0, true});   // a full marker adds no coverage
     }
     void onConstraintSetChange(int64_t offset, bool nonEmpty) { events_.push_back(Event{offset, nonEmpty ? 1 : 0, 0, false}); }
     void onReservation(int64_t offset) noexcept { highestReservation_ = std::max(highestReservation_, offset); }
@@ -79,7 +79,7 @@ public:
             const Marker& m = markers_[i];
             if (m.offset >= markerRemovalBound) continue;                  // a replica has not fetched it
             const bool superseded = std::any_of(markers_.begin() + static_cast<std::ptrdiff_t>(i) + 1, markers_.end(),
-                                                [&](const Marker& later) { return later.finalThrough > m.finalThrough; });
+                                                [&](const Marker& later) { return later.finalThrough > m.finalThrough && control_record::closesCoverage(later.listedCount); });
             if (superseded) removable_.push_back(i);
         }
     }

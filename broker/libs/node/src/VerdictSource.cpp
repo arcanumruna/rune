@@ -286,8 +286,8 @@ VerdictSource::OverlayNeed VerdictSource::overlayNeed() const noexcept {
 }
 
 void VerdictSource::releaseTxnOverlays(TxnJudgeState& txn) noexcept {
-    txn.releaseOverlays([&](int32_t i) { txnPool_->release(i); });
-    if (jx_.atMarker && jx_.overlay >= 0) txnPool_->release(jx_.overlay);   // a deferred transaction's overlay is its entry's
+    txn.releaseOverlays([&](int32_t i) { releaseOverlay_(i); });
+    if (jx_.atMarker && jx_.overlay >= 0) releaseOverlay_(jx_.overlay);   // a deferred transaction's overlay is its entry's
     releaseOneStep();
     jx_ = {};
     resetChainLive_();
@@ -1193,7 +1193,7 @@ bool VerdictSource::endsBeforeJudge_(const rune::protocol::RecordBatchReader& r,
     if (t == nullptr || t->markerOffset >= 0 || t->phase == TxnPhase::Finalized || r.baseOffset() <= t->firstOffset || r.baseOffset() >= t->judgeOffset) return false;
     const int type = cm::controlType(batch, len);
     if (type == cm::kUnparseable || (type == cm::kCommit && ordinary_.size() == ordinary_.capacity())) return false;
-    if (t->overlay >= 0) txnPool_->release(t->overlay);
+    if (t->overlay >= 0) releaseOverlay_(t->overlay);
     t->overlay = -1;
     t->markerOffset = r.baseOffset();
     t->commit = type == cm::kCommit;
@@ -1344,7 +1344,7 @@ bool VerdictSource::applyTxnBatch_(const uint8_t* batch, std::size_t len, TxnKey
                 if (s == rune::view::PrepareStatus::CapacityExhausted) stall_(StallReason::Capacity);
                 if (s == rune::view::PrepareStatus::Locked) {
                     notePause_(span.offset);
-                    txnPool_->parkOneStep(oneStepClaim_, true);   // the lock clears at the holder's marker, which may wait for a vote the waiter judges
+                    parkOneStep_(true, /*onLock=*/true);   // the lock clears at the holder's marker, which may wait for a vote the waiter judges
                 }
                 if (s == rune::view::PrepareStatus::CapacityExhausted || s == rune::view::PrepareStatus::Locked) {
                     ok = false;
@@ -1359,11 +1359,12 @@ bool VerdictSource::applyTxnBatch_(const uint8_t* batch, std::size_t len, TxnKey
     return ok;
 }
 
-// P11-2: the markers cover [emitFrom, judgedThrough()); a deferred transaction holds them until it is decided.
+// P11-2: the markers cover [emitFrom, judgedThrough()); a deferred transaction holds them until it is decided.  A marker split at the
+// entry limit may end inside a span, so it is no coverage point (closesCoverage): the chain goes on until a marker with room to spare.
 int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
     const int64_t through = judgedThrough();
-    if (generation_ == kUnbound || through <= emitFrom_ || !(judgedRecord_ || sawEmptyChange_)) return 0;
-    const bool due = rejectedThisPass_ > 0 || sawEmptyChange_ || nowNs - lastMarkerNs_ >= intervalNs_ ||
+    if (generation_ == kUnbound || through <= emitFrom_ || !(judgedRecord_ || sawEmptyChange_ || state.markers.chainOpen())) return 0;
+    const bool due = rejectedThisPass_ > 0 || sawEmptyChange_ || state.markers.chainOpen() || nowNs - lastMarkerNs_ >= intervalNs_ ||
                      (checkpointCap_ != INT64_MAX && through - emitFrom_ >= checkpointCap_);
     if (!due) return 0;
     int work = 0;
@@ -1392,7 +1393,7 @@ int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
         }
         if (base == rune::replication::PartitionReplica::kAppendNotLeader) break;
         if (base < 0) { ++stats_.markerAppendRetries; break; }
-        (void)state.markers.onMarker(base, finalThrough);
+        (void)state.markers.onMarker(base, finalThrough, cr::closesCoverage(entryScratch_.size()));
         state.rejected.noteCovered(finalThrough);
         ++stats_.markersWritten;
         emitFrom_     = finalThrough;
@@ -1411,7 +1412,7 @@ int VerdictSource::pushCheckpoints_(PartitionWriteState& state) {
         if (inst.persisted && !inst.pendingValid && checkpointSettled(inst)) {
             // P4-4: a persisted member's delta leaves only once a marker in the local log covers the cursor it is stamped with, or
             // while it runs ahead of deferred transactions (P11-8 (a)).
-            if (state.markers.appendedThrough() < inst.foldCursor && !runsAheadAt_(inst.foldCursor)) continue;
+            if (state.markers.appendedClosedThrough() < inst.foldCursor && !runsAheadAt_(inst.foldCursor)) continue;
             // P11-8 (b): nor while a Locked transaction judged below its cursor is not applied (its delta would stamp rows the apply
             // changes).
             if (state.txn.lockedBelow(inst.foldCursor)) {

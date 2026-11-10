@@ -186,6 +186,29 @@ TEST(CheckedWritesVerdictCleanerRegression, MissingChangeRecordNeverUncapsRegres
     EXPECT_EQ(s.cleanLimit(), kMax) << "neither a change nor a marker: not a verdict source";
 }
 
+// REGRESSION (#974): a marker with the maximum entries may end inside a transaction span, so it adds no coverage and supersedes no marker.
+TEST(CheckedWritesVerdictCleanerRegression, FullMarkerDoesNotExtendCleanLimitRegression) {
+    std::vector<Entry> full;
+    for (std::size_t i = 0; i < cr::kMaxMarkerEntries; ++i) full.push_back({200 + int64_t(i), 55, 1});
+    VerdictCleanState s;
+    s.onConstraintSetChange(0, true);
+    s.onVerdictMarker(100, 0, 100, {});
+    s.onVerdictMarker(5000, 100, 9000, full);
+    s.finish(0, kMax, kMax);
+    EXPECT_EQ(s.cleanLimit(), 100);
+    s.markRemovalsBelow(kMax);
+    EXPECT_FALSE(s.markerRemovable(100)) << "only a closing marker supersedes";
+    s.clear();
+    s.onConstraintSetChange(0, true);
+    s.onVerdictMarker(100, 0, 100, {});
+    s.onVerdictMarker(5000, 100, 9000, full);
+    s.onVerdictMarker(5001, 9000, 9100, {});
+    s.finish(0, kMax, kMax);
+    s.markRemovalsBelow(kMax);
+    EXPECT_EQ(s.cleanLimit(), 9100);
+    EXPECT_TRUE(s.markerRemovable(100));
+}
+
 TEST(CheckedWritesVerdictCleaner, StaleBoundOnlyCleansLess) {
     VerdictCleanState s;
     s.onConstraintSetChange(0, true);

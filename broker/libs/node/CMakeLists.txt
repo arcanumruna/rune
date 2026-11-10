@@ -1925,7 +1925,9 @@ if(BUILD_TESTING)
         add_executable(rune_shard_mode_tests tests/integration/ShardModeTest.cpp)
         target_include_directories(rune_shard_mode_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_shard_mode_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_shard_mode_tests PROPERTIES TIMEOUT 360)
+        # The Stress variants wait out the real silent-client and process-freeze timeouts (seconds); each has a fast default beside it.
+        gtest_discover_tests(rune_shard_mode_tests TEST_FILTER "*Stress" PROPERTIES TIMEOUT 360 LABELS stress)
+        gtest_discover_tests(rune_shard_mode_tests TEST_FILTER "-*Stress" PROPERTIES TIMEOUT 360)
 
         # Phase 2b E2: TRANSIENT topics end to end in-process over real Aeron —
         # shard + legacy produce/subscribe, 3-node acks=all, restart (empty).
@@ -1987,10 +1989,10 @@ if(BUILD_TESTING)
         target_compile_definitions(rune_checked_writes_stress_tests PRIVATE RUNE_QL_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/ql/tests/golden")
         target_link_libraries(rune_checked_writes_stress_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
-        # The transaction stress has a fast default cut; every other case of the binary is a heavy stress run.
-        set(RUNE_CHECKED_WRITES_TXN_STRESS_TESTS "CheckedWritesTxnStressRegression.*")
-        gtest_discover_tests(rune_checked_writes_stress_tests TEST_FILTER "${RUNE_CHECKED_WRITES_TXN_STRESS_TESTS}" PROPERTIES TIMEOUT 30)
-        gtest_discover_tests(rune_checked_writes_stress_tests TEST_FILTER "-${RUNE_CHECKED_WRITES_TXN_STRESS_TESTS}" PROPERTIES TIMEOUT 1800 LABELS stress)
+        # Each family has a fast default (one seed of its set, a few steps, small segments; the transactions' short run); the History tests run
+        # on small segments too.  The full seed sets (one ctest case per seed) are stress.
+        gtest_discover_tests(rune_checked_writes_stress_tests TEST_FILTER "Seeds/*" PROPERTIES TIMEOUT 1800 LABELS stress)
+        gtest_discover_tests(rune_checked_writes_stress_tests TEST_FILTER "CheckedWritesStressFast.*:CheckedWritesStressHistory.*:CheckedWritesTxnStressRegression.*" PROPERTIES TIMEOUT 300)
 
         # Checked writes Part 09 Task 5a (#788): a lagging leader never undoes a newer constraint-set change, on three real brokers.
         add_executable(rune_checked_writes_catalog_gate_cluster_tests tests/integration/CheckedWritesCatalogGateClusterTest.cpp)

@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <functional>
 #include <system_error>
+#include <tuple>
 
 #include <rune/node/RcState.h>
 #include <rune/node/VerdictSource.h>
@@ -659,7 +661,43 @@ struct JudgeRig {
     int64_t countTo = -1;            // reads up to exactly it are counted in countedTo
     int     countedTo = 0;
     int64_t logStart = 0;            // a read from below it comes back empty, as the log's below its start
+    uint64_t gen = 1;
+    int64_t  nextAppend = 0;                // where the judge's next append without a replica lands
+    std::vector<int64_t> appendBases;       // the offset of each appended batch
     int drive(int64_t hw = INT64_MAX, int64_t now = 0) {
+        const std::size_t had = vs.appendedForTest().size();
+        const int work = driveOnce(hw, now);
+        for (std::size_t i = had; i < vs.appendedForTest().size(); ++i) {
+            appendBases.push_back(std::max(nextAppend, vs.judgeCursor()));
+            nextAppend = appendBases.back() + 1;
+        }
+        return work;
+    }
+    // A takeover: of the old leader's log only its first n markers survive; this node's scan reads them before it leads.
+    void takeOver(const JudgeRig& old, std::size_t n) {
+        st.rejected.truncateFrom(0);
+        st.markers.truncateFrom(0);
+        for (std::size_t i = 0; i < n; ++i) verdictFeedBatch(&st, old.vs.appendedForTest()[i].data(), old.vs.appendedForTest()[i].size(), old.appendBases[i]);
+        verdictOnHw(st, old.appendBases[n - 1] + 1);
+        vs.bindLeader(nullptr, ++gen, 0);
+    }
+    // A view discard as the worker does it: a member ahead of K is rebuilt from the log's start.
+    void rebuildViewsAheadOfK() {
+        vs.setViewHooks({nullptr, nullptr, [](void*, ViewInstance& inst, ViewDiscardReason) {
+            inst.table = rune::view::ViewTable(inst.layout, 4096, 1u << 16, inst.tableKeys);
+            inst.foldCursor = 0;
+            inst.spanFence.clear();
+        }, nullptr});
+    }
+    // The same on the old leader's own node: its views keep what they applied.
+    void failoverKeeping(std::size_t n) { takeOver(*this, n); }
+    // Drives until the judge has passed the whole log (at least once: a new leader judges again from K).
+    void settle() {
+        drive();
+        for (int i = 0; i < 16 && vs.judgedThrough() < log.next; ++i) drive();
+        ASSERT_EQ(vs.judgedThrough(), log.next);
+    }
+    int driveOnce(int64_t hw, int64_t now) {
         return vs.driveJudge([&](int64_t from, int64_t to) {
             counted += from >= countFrom;
             countedAt += from == countAt;
@@ -711,6 +749,29 @@ struct JudgeRig {
             if (!c || c->type != cr::kVerdictMarker) continue;
             if (const auto m = cr::parseMarker(*c)) out.push_back(m->header.finalThrough);
         }
+        return out;
+    }
+    // The entry counts of the appended verdict markers.
+    [[nodiscard]] std::vector<uint32_t> markerCounts() const {
+        std::vector<uint32_t> out;
+        for (const auto& b : vs.appendedForTest()) {
+            const auto c = cr::parseControl(b.data(), b.size());
+            if (!c || c->type != cr::kVerdictMarker) continue;
+            if (const auto m = cr::parseMarker(*c)) out.push_back(m->header.count);
+        }
+        return out;
+    }
+    // What a view of the log sees: the rejected entries and the key index's ids below `ids`.
+    struct Seen {
+        std::vector<std::tuple<int64_t, uint16_t, uint32_t>> rejected;
+        std::vector<int64_t> indexed;
+        bool operator==(const Seen&) const = default;
+    };
+    [[nodiscard]] Seen seen(int64_t ids) const {
+        Seen out;
+        st.rejected.forEachIn(0, INT64_MAX, [&](const rune::storage::RejectedOffsetIndex::Entry& e) { out.rejected.emplace_back(e.offset, e.code, e.constraintId); });
+        for (int64_t id = 0; id < ids; ++id)
+            if (indexed(id)) out.indexed.push_back(id);
         return out;
     }
     // The offsets the appended verdict markers list.
@@ -866,6 +927,199 @@ TEST(CheckedWritesTxnJudgeRegression, ActivationKNeverPassesAnUndecidedTxnRegres
     EXPECT_TRUE(r.st.rejected.isRejected(14));
     EXPECT_EQ(r.st.rejected.size(), 1u);
     EXPECT_LE(r.st.rejected.coveredThrough(), 12);
+}
+
+// REGRESSION (#974): the markers' 4096-entry split fell on the 4097th rejected offset, inside the span of a rejected P11-7 transaction T.
+// A failover after that first marker restarted the judge there, above all but the last record of T, which it judged as a transaction of
+// its own and applied.  A full marker is no coverage point: the restart is at the last closing marker and judges T whole.
+TEST(CheckedWritesTxnJudgeRegression, MarkerSplitNeverLandsInsideARejectedUnvotedTxnRegression) {
+    JudgeRig r(true);
+    r.vs.bindTxn(&r.pool, r.batch, 2);   // T's 3 records are over the cap: all rejected at the marker (TxnTooLarge)
+    r.start();
+    std::vector<Rec> plain;
+    for (int64_t id = 200; id < 200 + 4094; ++id) plain.push_back({id, 9});
+    r.log.data(plain);                   // 10-4103: rejected one by one
+    for (const int64_t id : {1, 2, 3}) r.log.data({{id}}, 77);   // 4104-4106, a batch each: the 4097th rejected offset is 4106
+    r.log.marker(77, true);              // 4107
+    r.drive();
+    ASSERT_EQ(r.st.rejected.size(), 4097u);
+    ASSERT_EQ(r.markerEnds().size(), 2u);
+    r.failoverKeeping(1);                // only the first marker is committed
+    r.settle();
+    for (const int64_t id : {1, 2, 3}) EXPECT_FALSE(r.indexed(id)) << "T's record " << id << " stays rejected after the failover";
+    EXPECT_EQ(r.st.rejected.size(), 4097u);
+}
+
+namespace {
+// n records of one tag in batches of 1000, ids from firstId, by producer pid (-1: plain); rec(i) overrides the record.
+void burst(JudgeRig& r, int n, int64_t pid, const std::function<Rec(int)>& rec) {
+    for (int i = 0; i < n;) {
+        std::vector<Rec> batch;
+        for (const int end = std::min(n, i + 1000); i < end; ++i) batch.push_back(rec(i));
+        r.log.data(batch, pid);
+    }
+}
+void burst(JudgeRig& r, int n, int64_t firstId, int32_t tag, int64_t pid = -1) {
+    burst(r, n, pid, [&](int i) { return Rec{firstId + i, tag}; });
+}
+// A closing marker at 10, then T (pid 77) whose first record fails, 4100 failing records of another writer inside its span, T's second
+// record and its commit marker: [10, 4113) holds 4102 rejections, the 4097th inside T's span.
+void interleavedRejectedSpan(JudgeRig& r) {
+    r.start();
+    r.drive(INT64_MAX, 2'000'000'000);
+    r.log.data({{1, 9}}, 77);
+    burst(r, 4100, 200, 9);
+    r.log.data({{2}}, 77);
+    r.log.marker(77, true);
+    r.drive();
+    ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{0, 4096, 6}));
+}
+}  // namespace
+
+// REGRESSION (#974, P11-7 span with other writers' rejections inside it): the failover restarts before T, which is judged whole.
+TEST(CheckedWritesTxnJudgeRegression, RejectedP11_7SpanSplitByInterleavedRejectionsSurvivesFailoverRegression) {
+    JudgeRig straight(true);
+    interleavedRejectedSpan(straight);
+    JudgeRig r(true);
+    interleavedRejectedSpan(r);
+    r.failoverKeeping(2);
+    r.settle();
+    EXPECT_FALSE(r.indexed(2)) << "T's second record stays rejected";
+    EXPECT_EQ(r.seen(300), straight.seen(300));
+    EXPECT_EQ(r.st.rejected.size(), 4102u);
+}
+
+// REGRESSION (#974, a transaction past the cap that no hook capped): the judge at the marker rejects all 5000 records, the cap is 4096.
+// A restart inside the span applied the tail within the cap.
+TEST(CheckedWritesTxnJudgeRegression, TooLargeEscapeSpanSplitSurvivesFailoverRegression) {
+    const auto build = [](JudgeRig& r) {
+        ConstraintSet later = r.set;
+        later.id = 2;
+        r.set.count--;   // the set at T's first record has no TestReject member
+        r.start();
+        r.drive(INT64_MAX, 2'000'000'000);
+        burst(r, 2500, 1000, 1, 77);
+        r.log.control();   // the member is created inside T
+        r.st.constraintSets.onChange(r.log.next - 1, later);
+        burst(r, 2500, 3500, 1, 77);
+        r.log.marker(77, true);
+        r.drive();
+        ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{0, 4096, 904}));
+    };
+    JudgeRig straight(true);
+    build(straight);
+    JudgeRig r(true);
+    build(r);
+    r.rebuildViewsAheadOfK();
+    r.failoverKeeping(2);
+    r.settle();
+    for (int64_t id = 1000; id < 6000; ++id) ASSERT_FALSE(r.indexed(id)) << id;
+    EXPECT_EQ(r.st.rejected.size(), 5000u);
+    EXPECT_EQ(r.seen(300), straight.seen(300));
+}
+
+// REGRESSION (#974, a rejected atomic batch): the split fell on a record of the batch, and the restart applied its tail record by record.
+TEST(CheckedWritesTxnJudgeRegression, RejectedAtomicBatchSplitSurvivesFailoverRegression) {
+    const auto build = [](JudgeRig& r) {
+        r.start();
+        r.drive(INT64_MAX, 2'000'000'000);
+        burst(r, 4000, 200, 9);
+        std::vector<Rec> atomic{{5000, 9}};
+        for (int64_t id = 5001; id < 5200; ++id) atomic.push_back({id});
+        r.log.data(atomic, -1, true);
+        r.drive();
+        ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{0, 4096, 104}));
+    };
+    JudgeRig straight(true);
+    build(straight);
+    JudgeRig r(true);
+    build(r);
+    r.failoverKeeping(2);
+    r.settle();
+    for (int64_t id = 5000; id < 5200; ++id) ASSERT_FALSE(r.indexed(id)) << id;
+    EXPECT_EQ(r.st.rejected.size(), 4200u);
+    EXPECT_EQ(r.seen(300), straight.seen(300));
+}
+
+// REGRESSION (#974, an applied ordinary span): the split fell inside T, and the restart applied only its tail and dropped its head.
+TEST(CheckedWritesTxnJudgeRegression, AppliedOrdinarySpanSplitSurvivesFailoverRegression) {
+    const auto logT = [](JudgeRig& r) {
+        r.log.data({{1}}, 77);
+        burst(r, 4100, -1, [](int) { return Rec{100, 1, false, kInsert}; });   // id 100 exists: KeyExists
+        r.log.data({{2}}, 77);
+        r.log.marker(77, true);
+    };
+    const auto build = [&](JudgeRig& r) {
+        r.start();
+        r.drive(INT64_MAX, 2'000'000'000);
+        logT(r);
+        r.drive();
+        ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{0, 4096, 4}));
+    };
+    JudgeRig straight(false);
+    build(straight);
+    JudgeRig old(false);
+    build(old);
+    JudgeRig r(false);   // a node that folded the log to its start takes over: its views have not applied T
+    r.start();
+    logT(r);
+    r.takeOver(old, 2);
+    r.settle();
+    EXPECT_TRUE(r.indexed(1));
+    EXPECT_TRUE(r.indexed(2));
+    EXPECT_FALSE(r.index->spanFence.fenced());
+    EXPECT_EQ(r.seen(300), straight.seen(300));
+}
+
+// REGRESSION (#974): W holds at the last closing marker while a full marker's chain is open.
+TEST(CheckedWritesTxnJudgeRegression, FullMarkerHoldsWatermarkRegression) {
+    JudgeRig r(true);
+    interleavedRejectedSpan(r);
+    ASSERT_EQ(r.appendBases.size(), 3u);
+    verdictOnHw(r.st, r.appendBases[1] + 1);   // the full marker is committed, the one that closes the chain is not
+    EXPECT_EQ(r.st.markers.committedThrough(), r.markerEnds()[0]);
+    EXPECT_EQ(r.st.rejected.watermark(), r.markerEnds()[0]);
+    verdictOnHw(r.st, r.appendBases[2] + 1);
+    EXPECT_EQ(r.st.markers.committedThrough(), r.markerEnds()[2]);
+}
+
+// REGRESSION (#974): a natural marker with exactly the maximum entries is open: a marker with none follows once the judge has passed it.
+TEST(CheckedWritesTxnJudgeRegression, ExactlyFullNaturalMarkerIsClosedByTheNextRegression) {
+    JudgeRig r(true);
+    r.start();
+    burst(r, 4096, 200, 9);
+    r.drive();
+    ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{4096}));
+    ASSERT_TRUE(r.st.markers.chainOpen());
+    r.drive();
+    EXPECT_EQ(r.markerCounts().size(), 1u) << "the marker record itself is not judged yet";
+    r.log.push(r.vs.appendedForTest()[0], 1);   // the marker reaches the log
+    r.drive();
+    ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{4096, 0}));
+    EXPECT_EQ(r.markerEnds()[1], r.log.next);
+    EXPECT_FALSE(r.st.markers.chainOpen());
+    verdictOnHw(r.st, r.appendBases[1] + 1);
+    EXPECT_EQ(r.st.markers.committedThrough(), r.markerEnds()[1]);
+}
+
+// REGRESSION (#974): the first record of T, all of it and its marker are judged in one pass, so the marker starts below T: 4096 records
+// of T and one of another writer inside its span are 4097 rejections, none below T's first record.
+TEST(CheckedWritesTxnJudgeRegression, OversizeOwnSpanFromBelowFirstEmitsValidMarkersRegression) {
+    JudgeRig r(true);
+    r.start();
+    burst(r, 2000, 77, [](int i) { return Rec{1000 + i, i == 0 ? 9 : 1}; });   // T's first record fails
+    r.log.data({{9000, 9}});
+    burst(r, 2096, 3000, 1, 77);
+    r.log.marker(77, true);
+    r.drive();
+    EXPECT_EQ(r.st.rejected.size(), 4097u);
+    ASSERT_EQ(r.markerCounts(), (std::vector<uint32_t>{4096, 1}));
+    EXPECT_EQ(r.markerEnds()[0], 4106);
+    EXPECT_EQ(r.markerEnds()[1], r.log.next);
+    r.failoverKeeping(1);
+    r.settle();
+    for (int64_t id = 1000; id < 3000 + 2096; ++id) ASSERT_FALSE(r.indexed(id)) << id;
+    EXPECT_EQ(r.st.rejected.size(), 4097u);
 }
 
 // A decided ordinary transaction whose marker the judge has not reached yet holds judgedThrough (and so K) at its first record.
@@ -2051,6 +2305,230 @@ TEST(CheckedWritesTxnJudgeRegression, LockPausedHolderLetsAnotherPartitionJudgeT
     EXPECT_EQ(a.tables(), plain.tables());
 }
 
+// #963: a holder paused on a lock that loses the one-step set after part of its transaction is applied resumes where it stopped.  O writes
+// key 3 below its paused write of key 4; the table is cleared of key 3 while B has the set, so a second apply of it would bring it back.
+TEST(CheckedWritesTxnJudgeRegression, LockPausedHolderNeverAppliesItsAppliedRecordsAgainRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    a.log.data({{4, 1, false, kInsert}}, 66);     // 10, T0
+    a.log.judge(66, 10);                          // 11
+    a.log.data({{3}}, 55);                        // 12, O
+    a.log.data({del(4)}, 55);                     // 13, O
+    a.log.marker(55, true);                       // 14
+    for (int i = 0; i < 4 && a.st.txn.stats.lockPauses == 0; ++i) a.drive();
+    ASSERT_EQ(a.st.txn.stats.lockPauses, 1u) << "O's delete of key 4 pauses on T0's row";
+    ASSERT_TRUE(a.indexed(3)) << "O's write of key 3 below it is applied";
+    b.log.data({{50}, {51}}, 88);                 // 10-11, 88
+    b.log.data({{60, 1, false, kInsert}}, 66);    // 12, T0
+    b.log.marker(88, true);                       // 13
+    b.log.judge(66, 12);                          // 14
+    const uint64_t claims = a.pool.oneStepClaimsForTest();
+    for (int i = 0; i < 8 && (b.st.txn.find(66) == nullptr || !b.st.txn.find(66)->judged); ++i) {
+        b.drive();
+        a.drive();
+    }
+    ASSERT_GT(a.pool.oneStepClaimsForTest(), claims) << "B took the set from the paused A";
+    ASSERT_TRUE(a.index->table.erase(3));
+    a.log.marker(66, true);
+    b.log.marker(66, true);
+    for (int i = 0; i < 8 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_FALSE(a.indexed(3)) << "key 3 is applied once, before the pause";
+    EXPECT_FALSE(a.indexed(4)) << "O's delete applies after T0's insert";
+}
+
+// #963: a holder whose lock pause ended is not parked any more.  O's first write waits on T0's row; once T0's marker lands O applies
+// in two segments (more keys than the set holds), and holds the set between them: B waits for it.
+TEST(CheckedWritesTxnJudgeRegression, ResumedHolderIsNoLongerParkedBetweenSegmentsRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    a.log.data({{4, 1, false, kInsert}}, 66);     // 10, T0
+    a.log.judge(66, 10);                          // 11
+    std::vector<Rec> big{del(4)};
+    for (int64_t id = 1000; id < 2100; ++id) big.push_back({id});
+    a.log.data(big, 55);                          // 12-1112, O: more keys than the one-step set holds
+    a.log.marker(55, true);
+    for (int i = 0; i < 4 && a.st.txn.stats.lockPauses == 0; ++i) a.drive();
+    ASSERT_EQ(a.st.txn.stats.lockPauses, 1u);
+    a.log.marker(66, true);
+    for (int i = 0; i < 4 && a.st.txn.stats.supersedeKeysOverflow == 0; ++i) a.drive();
+    ASSERT_EQ(a.st.txn.stats.supersedeKeysOverflow, 1u) << "O is applied in segments";
+    ASSERT_TRUE(a.pool.oneStepHeld());
+    ASSERT_FALSE(a.pool.oneStepClaimable()) << "A holds the set between its segments, parked no more";
+    b.log.data({{50}, {51}}, 88);                 // 10-11
+    const int64_t marker = b.log.next;
+    b.log.marker(88, true);
+    for (int i = 0; i < 2; ++i) b.drive();
+    EXPECT_EQ(b.vs.judgeCursor(), marker) << "88 waits for the set";
+    EXPECT_FALSE(b.indexed(51));
+    for (int i = 0; i < 16 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_TRUE(b.indexed(51));
+}
+
+// #964: two parked holders passed the set between them on every pass, each collecting its segment's keys anew.  A source that parked
+// when it lost the set waits for the holder to release it instead.
+TEST(CheckedWritesTxnJudgeRegression, ParkedHoldersNeverTakeTheSetFromEachOtherRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    for (JudgeRig* r : {&a, &b}) {
+        const int64_t key = r == &a ? 4 : 5;          // the rows T0 holds are the pool's: one key each
+        r->log.data({{key, 1, false, kInsert}}, 66);  // 10, T0
+        r->log.judge(66, 10);                         // 11
+        r->log.data({del(key)}, 55);                  // 12, O
+        r->log.marker(55, true);                      // 13
+    }
+    for (int i = 0; i < 4 && (a.st.txn.stats.lockPauses == 0 || b.st.txn.stats.lockPauses == 0); ++i) {
+        a.drive();
+        b.drive();
+    }
+    ASSERT_GE(a.st.txn.stats.lockPauses, 1u);
+    ASSERT_GE(b.st.txn.stats.lockPauses, 1u);
+    const uint64_t claims = a.pool.oneStepClaimsForTest();
+    for (int i = 0; i < 20; ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.pool.oneStepClaimsForTest(), claims) << "no collect anew while both wait for their markers";
+    a.log.marker(66, true);
+    b.log.marker(66, true);
+    for (int i = 0; i < 16 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_EQ(b.vs.judgeCursor(), b.log.next);
+    EXPECT_FALSE(a.indexed(4));
+    EXPECT_FALSE(b.indexed(5));
+}
+
+// slow-bc review 1 (the #964 guard against I1): a source whose own lock pause ended takes the set from a parked holder.  B pauses on
+// T1's row and A takes the set, pausing on T0's; T1's marker clears B's lock, and B's O must apply before B judges T0, whose marker A
+// waits for.  RED (a sticky "last parked" bit): B waits for A, A for T0's marker, T0's marker for B's vote.
+TEST(CheckedWritesTxnJudgeRegression, SourceWhoseLockClearedTakesTheSetFromAParkedHolderRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    b.log.data({{5, 1, false, kInsert}}, 67);     // 10, T1
+    b.log.judge(67, 10);                          // 11
+    b.log.data({del(5)}, 56);                     // 12, O_B
+    b.log.marker(56, true);                       // 13
+    for (int i = 0; i < 4 && b.st.txn.stats.lockPauses == 0; ++i) b.drive();
+    ASSERT_EQ(b.st.txn.stats.lockPauses, 1u) << "O_B's delete of key 5 pauses on T1's row";
+    a.log.data({{4, 1, false, kInsert}}, 66);     // 10, T0
+    a.log.judge(66, 10);                          // 11
+    a.log.data({del(4)}, 55);                     // 12, O_A
+    a.log.marker(55, true);                       // 13
+    for (int i = 0; i < 4 && a.st.txn.stats.lockPauses == 0; ++i) a.drive();
+    ASSERT_EQ(a.st.txn.stats.lockPauses, 1u) << "A took the set from the parked B and pauses on T0's row";
+    b.log.data({{60, 1, false, kInsert}}, 66);    // 14, T0
+    b.log.judge(66, 14);                          // 15
+    b.log.marker(67, true);                       // 16: T1's marker clears B's lock
+    for (int i = 0; i < 16 && (b.st.txn.find(66) == nullptr || !b.st.txn.find(66)->judged); ++i) {
+        b.drive();
+        a.drive();
+    }
+    ASSERT_NE(b.st.txn.find(66), nullptr);
+    EXPECT_TRUE(b.st.txn.find(66)->judged) << "B applied O_B and judged T0";
+    EXPECT_FALSE(b.indexed(5)) << "O_B's delete applies after T1's insert";
+}
+
+// The same through a lookup park: B's O_B waits for T1's marker past the HW, A takes the set and waits for T0's.  T1's marker moves B's
+// HW past where its lookup scanned, so B takes the set back.  RED (a sticky "last parked" bit): the I1 cycle.
+TEST(CheckedWritesTxnJudgeRegression, SourceWhoseLookupResolvedTakesTheSetFromAParkedHolderRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    b.log.data({del(5)}, 56);                     // 10, O_B
+    b.log.data({{5, 1, false, kInsert}}, 67);     // 11, T1
+    b.log.judge(67, 11);                          // 12
+    b.log.marker(56, true);                       // 13
+    for (int i = 0; i < 8 && !(a.pool.oneStepHeld() && a.pool.oneStepClaimable()); ++i) b.drive();
+    ASSERT_EQ(b.vs.judgeCursor(), 13) << "O_B waits for T1's marker";
+    a.log.data({del(4)}, 55);                     // 10, O_A
+    a.log.data({{4, 1, false, kInsert}}, 66);     // 11, T0
+    a.log.judge(66, 11);                          // 12
+    a.log.marker(55, true);                       // 13
+    const uint64_t claims = a.pool.oneStepClaimsForTest();
+    for (int i = 0; i < 4 && a.vs.judgeCursor() < 13; ++i) a.drive();
+    a.drive();
+    ASSERT_EQ(a.vs.judgeCursor(), 13) << "O_A waits for T0's marker";
+    ASSERT_GT(a.pool.oneStepClaimsForTest(), claims) << "A took the set from the parked B";
+    b.log.data({{60, 1, false, kInsert}}, 66);    // 14, T0
+    b.log.judge(66, 14);                          // 15
+    b.log.marker(67, true);                       // 16: decides B's lookup
+    for (int i = 0; i < 16 && (b.st.txn.find(66) == nullptr || !b.st.txn.find(66)->judged); ++i) {
+        b.drive();
+        a.drive();
+    }
+    ASSERT_NE(b.st.txn.find(66), nullptr);
+    EXPECT_TRUE(b.st.txn.find(66)->judged) << "B applied O_B and judged T0";
+    EXPECT_TRUE(b.indexed(5)) << "T1's insert supersedes O_B's delete";
+}
+
+// slow-bc re-review 2: two lookup-parked sources on partitions that keep taking writes.  Their HW moves on every pass while T0's marker
+// has not landed, so neither lookup is decided: neither takes the set.  RED (a park that ends when the HW moves): both took it on every
+// pass, collecting their segments anew.
+TEST(CheckedWritesTxnJudgeRegression, LookupParkedHoldersNeverTradeTheSetUnderTrafficRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    for (JudgeRig* r : {&a, &b}) {
+        const int64_t key = r == &a ? 4 : 5;
+        r->log.data({del(key)}, 55);                  // 10, O
+        r->log.data({{key, 1, false, kInsert}}, 66);  // 11, T0
+        r->log.judge(66, 11);                         // 12
+        r->log.marker(55, true);                      // 13
+    }
+    for (int i = 0; i < 8 && (a.vs.judgeCursor() < 13 || b.vs.judgeCursor() < 13 || !a.pool.oneStepClaimable()); ++i) {
+        a.drive();
+        b.drive();
+    }
+    ASSERT_EQ(a.vs.judgeCursor(), 13) << "A's O waits for T0's marker";
+    ASSERT_EQ(b.vs.judgeCursor(), 13) << "B's O waits for T0's marker";
+    ASSERT_TRUE(a.pool.oneStepHeld() && a.pool.oneStepClaimable()) << "the holder is parked";
+    const uint64_t claims = a.pool.oneStepClaimsForTest();
+    for (int64_t i = 0; i < 20; ++i) {
+        a.log.data({{1000 + i}});
+        a.drive();
+        b.log.data({{2000 + i}});
+        b.drive();
+    }
+    EXPECT_EQ(a.pool.oneStepClaimsForTest(), claims) << "no collect anew while both lookups wait for T0's marker";
+    a.log.marker(66, true);
+    b.log.marker(66, true);
+    for (int i = 0; i < 16 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_EQ(b.vs.judgeCursor(), b.log.next);
+    EXPECT_TRUE(a.indexed(4)) << "T0's insert supersedes O's delete";
+    EXPECT_TRUE(b.indexed(5));
+    EXPECT_TRUE(a.indexed(1019) && b.indexed(2019));
+}
+
 // I3: accepted(r), an ordinary transaction committed below J.
 TEST(CheckedWritesTxnJudge, OrdinaryCommittedBelowJConflicts) {
     JudgeRig r(VoteMembers{100});
@@ -3041,4 +3519,29 @@ TEST(CheckedWritesTxnJudgeRegression, RejectionBesideHeldEntriesWaitsForRetentio
     EXPECT_FALSE(r.vs.stalled());
     for (int64_t o = 13; o < 16; ++o) EXPECT_NE(r.st.rejected.find(o), nullptr) << o;
     EXPECT_EQ(r.vs.judgedThrough(), 16);
+}
+
+// REGRESSION (#974, the checkpoint gate): a persisted member's delta leaves only once a marker that closes coverage reaches its cursor.
+// A full marker appended over its records is no such marker: a restart from the checkpoint would start inside a span.
+TEST(CheckedWritesTxnJudgeRegression, CheckpointWaitsForAClosingMarkerNotAFullOneRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.index->persisted = true;
+    int pushes = 0;
+    VerdictViewHooks hooks;
+    hooks.ctx = &pushes;
+    hooks.checkpoint = [](void* ctx, ViewInstance& inst) { *static_cast<int*>(ctx) += inst.persisted; return 0; };
+    r.vs.setViewHooks(hooks);
+    r.log.data({{1}, {2}, {3}});   // 10..12
+    ASSERT_TRUE(r.st.markers.onMarker(5, 13, false));   // a full marker over them, no closing one after it yet
+    r.vs.bindLeader(nullptr, 2, 0);
+    r.drive();
+    ASSERT_EQ(r.vs.judgedThrough(), 13);
+    ASSERT_EQ(r.index->foldCursor, 13);
+    ASSERT_TRUE(r.st.markers.chainOpen());
+    EXPECT_EQ(pushes, 0);
+    r.log.data({{4}});   // 13: the judge's closing marker covers it
+    r.drive();
+    EXPECT_FALSE(r.st.markers.chainOpen());
+    EXPECT_GT(pushes, 0);
 }

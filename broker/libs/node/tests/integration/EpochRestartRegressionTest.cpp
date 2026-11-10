@@ -21,6 +21,7 @@
 #include "support/ShardTestClient.h"
 
 #include <rune/node/BrokerNode.h>
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
@@ -111,6 +112,8 @@ NodeConfig makeConfig(int nodeId, const fs::path& dataDir, const Ports& p,
     cfg.workerIngressBaseStreamId = kIngressStream;
     cfg.gatewayMinIsr = minIsr;
     cfg.aeronTermBufferBytes = 1 << 20;
+    cfg.aeronCountersValuesBytes = kTestClientCountersBytes;   // a test broker owns a few dozen counters: a small CnC
+    cfg.aeronStatusMessageTimeoutNs = 20'000'000;   // a node driver's receivers announce their window every 20 ms, not 200
     cfg.workerCoreBase = -1;
     for (int i = 0; i < 3; ++i) {
         PeerConfig pc;
@@ -507,11 +510,11 @@ TEST(EpochRestartRegression, SingleNodeRestartBumpsLeaderEpochRegression) {
     constexpr int32_t kParts = 3;
     TmpDir d0{"n0"}, d1{"n1"}, d2{"n2"};
     const auto ports = Ports::discover(3);
-    // A liveness timeout far above a node restart (~1 s in-process): the
+    // A liveness timeout above a node restart (~0.3 s in-process): the
     // restarted node is never declared dead.  stop() is a controlled shutdown
     // that moves the leadership away; the test pins the epoch bump and the
     // re-spread back to the victim.
-    constexpr int64_t kSlowLivenessMs = 3000;
+    constexpr int64_t kSlowLivenessMs = 1500;
     std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports, 2, kSlowLivenessMs),
                                   makeConfig(1, d1.path, ports, 2, kSlowLivenessMs),
                                   makeConfig(2, d2.path, ports, 2, kSlowLivenessMs)};

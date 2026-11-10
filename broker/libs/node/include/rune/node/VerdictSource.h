@@ -195,6 +195,7 @@ public:
         oneStepParked_ = false;
         return ++oneStepClaim_;
     }
+    [[nodiscard]] uint64_t oneStepClaimsForTest() const noexcept { return oneStepClaim_; }
     [[nodiscard]] bool holdsOneStep(uint64_t claim) const noexcept { return oneStepHeld_ && claim == oneStepClaim_; }
     void parkOneStep(uint64_t claim, bool parked) noexcept { oneStepParked_ = holdsOneStep(claim) ? parked : oneStepParked_; }
     void releaseOneStep(uint64_t claim) noexcept { oneStepHeld_ = oneStepHeld_ && claim != oneStepClaim_; }
@@ -283,6 +284,7 @@ public:
     void releaseOneStep() noexcept {
         if (oneStepClaim_ != 0) txnPool_->releaseOneStep(oneStepClaim_);
         oneStepClaim_ = 0;
+        stepParked_ = false;
     }
     /// The leadership scan's begin: the overlays go back, and the judge re-activates from K once the scan is done (the table's
     /// entries are judged anew, so a reset Locked entry gets its apply).
@@ -454,6 +456,20 @@ private:
     bool   rejectTxnRecords_(ReadRangeFn& readRange, int64_t producerId, int64_t first, int64_t end, const rune::view::AbortedTxnFilter& aborted,
                              rune::view::Verdict v) noexcept;
     void   endOrdinary_(const OrdinaryTxn& o) noexcept;
+    /// `onLock`: paused on a row one of this source's judged transactions holds, else waiting for a lookup's marker past the HW.
+    void   parkOneStep_(bool parked, bool onLock = false) noexcept {
+        txnPool_->parkOneStep(oneStepClaim_, parked);
+        stepParked_   = parked;
+        parkedOnLock_ = onLock;
+        parkedFreed_  = overlaysFreed_;
+    }
+    /// This source's own park still holds: a lock pause until it gives an overlay back (the locking transaction's marker applied, or
+    /// its judgement ended), a lookup park until the lookup is decided.  Only then may it take the set from a parked holder.
+    [[nodiscard]] bool parkHolds_() const noexcept { return stepParked_ && (parkedOnLock_ ? overlaysFreed_ == parkedFreed_ : !ordinaryWalk_.lookup.decided); }
+    void   releaseOverlay_(int32_t overlay) noexcept {
+        txnPool_->release(overlay);
+        ++overlaysFreed_;
+    }
     void   restartJudgement_() noexcept;
     [[nodiscard]] bool beginJudgement_(int64_t producerId, int64_t first, int64_t end, bool atMarker) noexcept;
     void   endJudgement_() noexcept;
@@ -557,6 +573,9 @@ private:
     };
     OrdinaryWalk                ordinaryWalk_;
     uint64_t                    oneStepClaim_ = 0;        // the pool's one-step set holds this source's collect while the claim stands
+    bool                        stepParked_ = false;      // this source last parked on the set, waiting for a marker: while that holds (parkHolds_) it takes it from no other parked holder
+    bool                        parkedOnLock_ = false;
+    uint64_t                    overlaysFreed_ = 0, parkedFreed_ = 0;   // overlays this source gave back, in all and when it parked
     int64_t                     failCapacityAt_ = -1;
     TxnProbe                    probe_;
     std::vector<OrdinaryTxn>    ordinary_;
@@ -604,9 +623,9 @@ inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int
         s.rejected.onMarker(m->header.fromOffset, m->header.finalThrough, m->header.count, [&](std::size_t i) {
             return rune::storage::RejectedOffsetIndex::Entry{m->offsetAt(static_cast<uint32_t>(i)), m->codeAt(static_cast<uint32_t>(i)), m->constraintIdAt(static_cast<uint32_t>(i))};
         });
-        if (!s.markers.onMarker(base, m->header.finalThrough)) {   // full: the slots below the HW are committed (the scan read them in order)
+        if (!s.markers.onMarker(base, m->header.finalThrough, cr::closesCoverage(m->header.count))) {   // full: the slots below the HW are committed (the scan read them in order)
             s.markers.onHw(std::min(base, s.scanHw));
-            (void)s.markers.onMarker(base, m->header.finalThrough);   // still full: 1024 uncommitted markers above the HW, counted in appendedThrough
+            (void)s.markers.onMarker(base, m->header.finalThrough, cr::closesCoverage(m->header.count));   // still full: 1024 uncommitted markers above the HW, counted in appendedThrough
         }
     } else if (c->type == cr::kConstraintSetChange) {
         std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};
@@ -798,7 +817,12 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
         if (w.marker != o.marker) w = {o.marker, o.first};
         if (!txnPool_->holdsOneStep(oneStepClaim_)) {
             if (!txnPool_->oneStepClaimable()) return false;   // another source is mid-segment: wait for it
+            if (txnPool_->oneStepHeld() && stepParked_) {   // parked as this one is: take the set only once this one's own wait is over
+                if (!parkedOnLock_ && !w.lookup.decided) (void)lookupTxn_(readRange, o.marker);   // reads the log and the lookup, not the set
+                if (parkHolds_()) return false;
+            }
             oneStepClaim_ = txnPool_->claimOneStep();
+            stepParked_ = false;
             w.collectFrom = -1;   // another source may have taken the set mid-segment: note the keys again
         }
         if (w.collectFrom < 0) {
@@ -821,7 +845,7 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
             w.checked = w.refill = false;
         }
         if (!w.checked && !checkOrdinary_(readRange, o, aborted, keys)) return false;
-        txnPool_->parkOneStep(oneStepClaim_, false);   // applyTxnBatch_ parks it again on a row a judged transaction holds
+        parkOneStep_(false);   // applyTxnBatch_ parks it again on a row a judged transaction holds
         // The apply walk shares the pass's budget too: it resumes past every batch it walked, plain ones included, as a Locked stop
         // resumes past the last record it applied.
         bool applied = true, more = false;
@@ -917,7 +941,7 @@ bool VerdictSource::lookupTxn_(ReadRangeFn& readRange, int64_t end) noexcept {
         budget -= std::min(budget, len);
         return !l.decided && budget > 0;
     });
-    txnPool_->parkOneStep(oneStepClaim_, !l.decided && l.from >= passHw_);   // scanned to the HW: only T's marker decides it
+    if (txnPool_->holdsOneStep(oneStepClaim_)) parkOneStep_(!l.decided && l.from >= passHw_);   // scanned to the HW: only T's marker decides it
     return l.decided;
 }
 
@@ -1005,7 +1029,7 @@ bool VerdictSource::judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedT
     }
     if (!runJudgement_(readRange, aborted)) return false;
     if (jx_.endedAt >= 0) {   // T ended before its J (abort before J): decided from the log, nothing to judge; a parked vote is answered NotLeader
-        txnPool_->release(t.overlay);
+        releaseOverlay_(t.overlay);
         t.overlay = -1;
         t.markerOffset = jx_.endedAt;   // decided, as endsBeforeJudge_ decides it: the producer's next TxnJudge is accepted
         t.commit = jx_.endedCommit;
@@ -1022,7 +1046,7 @@ bool VerdictSource::judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedT
     if (t.answer.code == 0) {
         t.phase = TxnPhase::Locked;
     } else {
-        txnPool_->release(t.overlay);
+        releaseOverlay_(t.overlay);
         t.overlay = -1;
         t.phase = TxnPhase::Finalized;
     }
@@ -1068,7 +1092,7 @@ bool VerdictSource::judgeAtMarker_(ReadRangeFn& readRange, const rune::view::Abo
                              : !rejectTxnRecords_(readRange, o.producerId, o.first, o.marker, aborted, {jx_.answer.code, jx_.answer.constraintId}))
         return false;
     noteMarkerWithoutVote_(o, jx_.answer.code == 0);
-    txnPool_->release(jx_.overlay);
+    releaseOverlay_(jx_.overlay);
     endJudgement_();
     endOrdinary_(o);
     return true;
@@ -1138,7 +1162,7 @@ bool VerdictSource::finalizeLocked_(ReadRangeFn& readRange, const rune::view::Ab
             }
             if (!applyTxnRecords_(readRange, t->producerId, t->firstOffset, t->judgeOffset, aborted, finalizeApplied_)) return false;
         }
-        txnPool_->release(t->overlay);
+        releaseOverlay_(t->overlay);
         t->overlay = -1;
         t->phase = TxnPhase::Finalized;
         closeSpan_(t->producerId);   // the step's postcondition: T was applied to every active member (no span is open here today)
