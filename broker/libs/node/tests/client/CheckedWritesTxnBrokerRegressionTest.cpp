@@ -712,19 +712,20 @@ TEST(CheckedWritesTxnBrokerRegression, UnrelatedTransactionsNeverWaitForEachOthe
     }
 }
 
-/// The e2e leg 9b in small (checked_writes_probe txn-run): four workers of four producers race 16 users for the same two character names per
+/// The e2e leg 9b in small (checked_writes_probe txn-run): `workers` workers of `perWorker` producers race `users` users for the same two character names per
 /// transaction, each crediting its own ledger account (two transactions racing on both topics resolve only by the transaction timeout, R11d).
 /// Per user six commit (the account_stats cap is 12 characters), every other answer is 55, an overdraw of the worker's account is refused by
 /// balances; none fails, none waits for the transaction timeout.  Differences from the probe: the ids are the Shard's, and an `od` character is named per
 /// worker (the probe's is shared).
-TEST(CheckedWritesTxnBrokerRegression, RacingTwoTopicTransactionsFullLengthShardRegression) {
-    Shard s("cw11_race");
+void expectRacingTwoTopicTransactions(const char* tag, int workers, int perWorker, int users) {
+    Shard s(tag);
     s.setUp();
-    ASSERT_FALSE(HasFatalFailure());
-    constexpr int workers = 4, perWorker = 4, users = 16, rounds = 7;
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    constexpr int rounds = 7;
     std::vector<rc::ClientConfig> configs;   // a config takes the next data dir of the broker rig: made here, not in the threads
     for (int i = 0; i < workers * perWorker; ++i) configs.push_back(s.b.clientConfig());
-    std::atomic<int> ok[users] = {}, refused{0}, overdrawn{0}, other{0}, slow{0};
+    std::vector<std::atomic<int>> ok(static_cast<std::size_t>(users));
+    std::atomic<int> refused{0}, overdrawn{0}, other{0}, slow{0};
     std::mutex mu;
     std::string failure;
     {
@@ -757,7 +758,7 @@ TEST(CheckedWritesTxnBrokerRegression, RacingTwoTopicTransactionsFullLengthShard
                             const rc::TxnCommitResult r = t.commit();
                             if (std::chrono::steady_clock::now() - t0 > 1s) ++slow;
                             if (od) ++(isConstraint(r, *t.client, "balances", "non_negative") ? overdrawn : other);
-                            else ++(r.ok ? ok[u] : r.code == kConstraintViolation ? refused : other);
+                            else ++(r.ok ? ok[static_cast<std::size_t>(u)] : r.code == kConstraintViolation ? refused : other);
                         }
                     }
                 } catch (const std::exception& e) {
@@ -770,8 +771,12 @@ TEST(CheckedWritesTxnBrokerRegression, RacingTwoTopicTransactionsFullLengthShard
     EXPECT_EQ(other.load(), 0) << "an answer other than ok, 55 or the overdraw's (a 19 among them)";
     EXPECT_EQ(slow.load(), 0) << "a commit took over 1 s";
     EXPECT_EQ(overdrawn.load(), users * workers) << "every overdraw is refused by balances";
-    for (int u = 0; u < users; ++u) EXPECT_EQ(ok[u].load(), 6) << "user " << u;
+    for (int u = 0; u < users; ++u) EXPECT_EQ(ok[static_cast<std::size_t>(u)].load(), 6) << "user " << u;
 }
+
+TEST(CheckedWritesTxnBrokerRegression, RacingTwoTopicTransactionsShardRegression) { expectRacingTwoTopicTransactions("cw11_race", 10, 1, 1); }
+
+TEST(CheckedWritesTxnBrokerRegression, RacingTwoTopicTransactionsFullLengthShardRegression) { expectRacingTwoTopicTransactions("cw11_racefl", 4, 4, 16); }
 
 TEST(CheckedWritesTxnBrokerRegression, OldClientTransactionOnAConstrainedSourceShardRegression) {
     Shard s("cw11_old");
