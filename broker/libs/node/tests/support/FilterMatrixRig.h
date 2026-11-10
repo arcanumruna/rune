@@ -160,6 +160,7 @@ struct Collector {
     struct Frame { int64_t subId, base; std::vector<uint8_t> bytes; int64_t atNs; };
     std::vector<Frame> frames;
     std::vector<std::string> errors;
+    std::vector<int16_t> errorCodes;   ///< the ErrorResponse codes, parallel to `errors`
     aeron::FragmentAssembler fa;
     Collector()
         : fa([this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len, aeron::Header&) {
@@ -168,7 +169,7 @@ struct Collector {
               if (auto r = pc::Records::decode(p, n))
                   frames.push_back({r->subscriptionId, r->baseOffset, {r->recordBatch.begin(), r->recordBatch.end()}, nowNs()});
               else if (auto e = pc::ErrorResponse::decode(p, n))
-                  errors.push_back(std::string(e->message));
+                  { errors.push_back(std::string(e->message)); errorCodes.push_back(e->code); }
           }) {}
 };
 
@@ -274,6 +275,9 @@ public:
     [[nodiscard]] Op op() const { return op_; }
     [[nodiscard]] Worker& w(std::size_t i = 0) { return *workers_.at(i); }
     [[nodiscard]] rune::storage::InMemoryLog* mem() { return mem_.get(); }
+    [[nodiscard]] rune::replication::PartitionReplica* replica() { return replica_.get(); }
+    [[nodiscard]] const std::vector<std::string>& errorMessages() const { return coll_.errors; }
+    [[nodiscard]] const std::vector<int16_t>& errorCodes() const { return coll_.errorCodes; }
     [[nodiscard]] int64_t logEnd() const { return transient() ? mem_->logEndOffset() : log_->logEndOffset(); }
     [[nodiscard]] int64_t logStart() const { return transient() ? mem_->logStartOffset() : log_->logStartOffset(); }
     [[nodiscard]] const std::vector<Rec>& recs() const { return recs_; }
@@ -312,7 +316,7 @@ public:
     }
 
     /// Subscribes the op's members on worker `wi` at `from`, ids idBase+1...  Returns them.
-    std::vector<Member> subscribeMembers(std::size_t wi, int64_t from, int64_t idBase = 0) {
+    std::vector<Member> subscribeMembers(std::size_t wi, int64_t from, int64_t idBase = 0, bool fromEarliest = false) {
         std::vector<Member> out;
         int fi = 0;
         for (const MK k : membersOf(op_)) {
@@ -322,7 +326,7 @@ public:
             m.worker = wi;
             m.filterIdx = k == MK::Unfiltered ? -1 : fi++;
             filters_.push_back(std::make_unique<FilterBuf>(filterFor(k)));
-            enqueue(wi, subscribeOp_(m.sub, from, k == MK::Unfiltered ? nullptr : filters_.back().get()));
+            enqueue(wi, subscribeOp_(m.sub, from, k == MK::Unfiltered ? nullptr : filters_.back().get(), fromEarliest));
             auto& v = client_[m.sub];
             if (!v.any && v.delivered.empty() && v.notes.empty()) { v.start = from; v.pos = from; }
             out.push_back(m);
@@ -593,9 +597,10 @@ private:
             std::this_thread::sleep_for(1ms);
         ASSERT_TRUE(egress_->isConnected() && sub_->isConnected());
     }
-    WorkerOp subscribeOp_(int64_t subId, int64_t from, const FilterBuf* f) {
+    WorkerOp subscribeOp_(int64_t subId, int64_t from, const FilterBuf* f, bool fromEarliest = false) {
         WorkerOp op;
         op.type = WorkerOp::Type::Subscribe;
+        op.fromEarliest = fromEarliest;
         op.subscriptionId = subId;
         op.sessionId = 4200 + subId;
         op.correlationId = 9000 + subId;

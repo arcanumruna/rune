@@ -599,6 +599,88 @@ INSTANTIATE_TEST_SUITE_P(FilterMatrixRegression, WorkerFilterMatrixTest, ::testi
                                     name(std::get<2>(i.param));
                          });
 
+// ---------------------------------------------------------------------------------------------------------------
+// Transient LEASE topics, FILTERED subscriptions: a cursor below the ring start is never raised silently (the same rule as
+// the unfiltered push pass).  Mutations: drop the lease branch in Worker::bindFilter_ (the first test) / in
+// FilterSourceImpl::skipEvicted (the third) -> red.
+// ---------------------------------------------------------------------------------------------------------------
+namespace {
+constexpr int16_t kPartitionDataReset = 43;
+const std::vector<PlayerRow> kEvictRows{rowM(), rowN(), rowW(), rowC(), rowP(), rowN(), rowM(), rowN(), rowC(), rowM(),
+                                        rowN(), rowW(), rowM(), rowN(), rowN(), rowC(), rowM(), rowN(), rowW(), rowN()};
+RigConfig smallRing() { RigConfig c; c.ringBytes = 12 * 1024; return c; }
+}  // namespace
+
+TEST(TransientLeaseEvictedPushRegression, FilteredFreshExplicitBelowStartEndsRegression) {
+    Rig r(Op::Eq, Entity::TransientRU, smallRing());
+    (void)start(r, 2, 40);
+    for (int i = 0; i < 30; ++i) r.append(kEvictRows);
+    ASSERT_GT(r.mem()->logStartOffset(), 3) << "precondition: the ring evicted";
+    r.replica()->setLeaseTransient(true);
+    const Ms ms = r.subscribeMembers(0, /*from=*/3);   // a fresh explicit cursor below the ring start
+    const std::size_t n = ms.size();
+    ASSERT_GT(n, 0u);
+    ASSERT_TRUE(r.pumpUntil([&] { return r.errorCodes().size() >= n; }));
+    r.settle(40ms);
+    ASSERT_EQ(r.errorCodes().size(), n) << "one terminal error per subscription, no more";
+    for (const int16_t c : r.errorCodes()) EXPECT_EQ(c, kPartitionDataReset);
+    for (const auto& s : r.w(0).subscriptionsForTest()) {
+        EXPECT_EQ(s.pushState, rune::node::Worker::WorkerSubscription::PushState::Failed);
+        EXPECT_EQ(s.nextOffset, 3) << "the cursor is parked";
+    }
+    EXPECT_EQ(r.w(0).filterGroupCountForTest(), 0u) << "no filter group was created";
+    EXPECT_EQ(r.w(0).transientFreshCursorsRaisedForTest(), 0u);
+    EXPECT_EQ(r.w(0).transientCursorSkipsForTest(), 0u);
+    for (const auto& m : ms) EXPECT_TRUE(r.view(m.sub).delivered.empty());
+}
+
+TEST(TransientLeaseEvictedPushRegression, FilteredEarliestRaisedRegression) {
+    Rig r(Op::Eq, Entity::TransientRU, smallRing());
+    (void)start(r, 2, 40);
+    for (int i = 0; i < 30; ++i) r.append(kEvictRows);
+    const int64_t ringStart = r.mem()->logStartOffset();
+    ASSERT_GT(ringStart, 0) << "precondition: the ring evicted";
+    r.replica()->setLeaseTransient(true);
+    const Ms ms = r.subscribeMembers(0, /*from=*/0, /*idBase=*/0, /*fromEarliest=*/true);   // Earliest resolves to 0
+    ASSERT_TRUE(r.converge(ms));
+    EXPECT_TRUE(r.errorCodes().empty()) << "Earliest is raised, never ended";
+    EXPECT_EQ(r.w(0).filterGroupCountForTest(), 1u) << "the members joined the group";
+    EXPECT_GE(r.w(0).transientFreshCursorsRaisedForTest(), 1u);
+    bool delivered = false;
+    for (const auto& m : ms) {
+        if (m.kind == MK::Unfiltered) continue;
+        for (const int64_t o : r.view(m.sub).delivered) { EXPECT_GE(o, ringStart); delivered = true; }
+    }
+    EXPECT_TRUE(delivered) << "records from the ring start were delivered";
+}
+
+TEST(TransientLeaseEvictedPushRegression, FilteredLaggingMemberEndsRegression) {
+    Rig r(Op::Eq, Entity::TransientRU, smallRing());
+    const int64_t b0 = start(r, 2, 40);
+    for (int i = 0; i < 3; ++i) r.append(kEvictRows);
+    const Ms ms = r.subscribeMembers(0, b0);
+    ASSERT_TRUE(r.converge(ms));
+    ASSERT_TRUE(r.errorCodes().empty());
+    const int64_t cursor = r.logEnd();
+    for (int i = 0; i < 30; ++i) r.append(kEvictRows);   // the producer outruns the reader (no pass meanwhile)
+    ASSERT_GT(r.mem()->logStartOffset(), cursor) << "precondition: unread records were evicted";
+    r.replica()->setLeaseTransient(true);   // the flag the lease floor path derives; set after the eviction (it freezes the ring floor)
+    const std::size_t nFiltered = filtered(ms).size();
+    ASSERT_GT(nFiltered, 0u);
+    ASSERT_TRUE(r.pumpUntil([&] { return r.errorCodes().size() >= nFiltered; }));
+    r.settle(40ms);
+    EXPECT_EQ(r.errorCodes().size(), nFiltered) << "one terminal error per filtered member";
+    for (const int16_t c : r.errorCodes()) EXPECT_EQ(c, kPartitionDataReset);
+    std::size_t failed = 0;
+    for (const auto& s : r.w(0).subscriptionsForTest())
+        if (s.pushState == rune::node::Worker::WorkerSubscription::PushState::Failed) ++failed;
+    EXPECT_EQ(failed, nFiltered);
+    EXPECT_EQ(r.w(0).transientCursorSkipsForTest(), 0u) << "nothing was skipped";
+    for (const auto& m : filtered(ms)) {
+        for (const int64_t o : r.view(m.sub).delivered) EXPECT_LT(o, cursor) << "a record after the loss was delivered";
+    }
+}
+
 // A worker that keeps passing while the client does not poll has frames in the egress; drainEgress() delivers them.
 TEST(FilterMatrixRigRegression, DrainEgressDeliversFramesOfAnUnpolledOwner) {
     Rig r(Op::Eq, Entity::DiskRU);

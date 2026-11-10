@@ -1560,6 +1560,8 @@ public:
                                                (op.crcValidated ? kOpFlagCrcValidated : 0u) |
                                                (op.importGranted ? kOpFlagImportGranted : 0u) |
                                                (op.freshCursor ? kOpFlagFreshCursor : 0u) |
+                                               (op.type == WorkerOp::Type::PushRead && op.fromEarliest
+                                                    ? kOpFlagPushReadFromEarliest : 0u) |
                                                (op.type == WorkerOp::Type::Subscribe && op.fromEarliest
                                                     ? kOpFlagFromEarliest : 0u) |
                                                (op.type == WorkerOp::Type::SessionAnnounce && op.grantAll
@@ -3707,6 +3709,13 @@ private:
         // log start is raised by the source's skipEvicted on the first pass.
         if (rune::replication::PartitionReplica* rep = subReplica_(s); s.logPtr == nullptr && rep != nullptr) {
             if (rune::storage::InMemoryLog* mem = rep->memoryLog()) {
+                if (rep->leaseTransient() && !s.fromEarliest && s.nextOffset < mem->logStartOffset()) [[unlikely]] {
+                    // A lease topic never raises an explicit cursor over lost records: stay unfiltered (cursorFresh stays set) and
+                    // the unfiltered push pass ends the subscription with PartitionDataReset.
+                    s.filter = SubUnfiltered{};
+                    filterBytes_.erase(s.subscriptionId);
+                    return;
+                }
                 s.nextOffset  = skipEvictedCursor_(*mem, s.nextOffset, true);
                 s.cursorFresh = false;
             }
@@ -3938,11 +3947,21 @@ private:
         }
         /// #839: the offset a disk read reached damage at (-1 = none this pass).
         [[nodiscard]] int64_t corruptAt() const noexcept { return corruptAt_; }
+        /// Lease-transient: the offset a read found already evicted from the ring (-1 = none this pass).
+        [[nodiscard]] int64_t evictedAt() const noexcept { return evictedAt_; }
         [[nodiscard]] bool readCommitted() const noexcept { return rc_ != nullptr; }
         [[nodiscard]] bool isAborted(int64_t pid, int64_t base) const noexcept { return rc_->isAborted(pid, base); }
         /// Transient: the ring start when `from` was evicted.  Disk: the log start when retention deleted `from`.
         [[nodiscard]] int64_t skipEvicted(int64_t from) noexcept {
-            if (mem_ != nullptr) return w_.skipEvictedCursor_(*mem_, from, false);
+            if (mem_ != nullptr) {
+                if (rep_ != nullptr && rep_->leaseTransient() && from < mem_->logStartOffset()) [[unlikely]] {
+                    // A lease topic never skips lost records: the read below the start is empty (InMemoryLog::readView), the
+                    // group stops for this pass and the members positioned at `from` end with PartitionDataReset.
+                    evictedAt_ = from;
+                    return from;
+                }
+                return w_.skipEvictedCursor_(*mem_, from, false);
+            }
             const int64_t start = s_.logPtr->logStartOffset();
             return from < start ? start : from;
         }
@@ -3955,6 +3974,7 @@ private:
         const PartitionWriteState* ws_ = nullptr;
         int64_t bound_ = 0;
         int64_t corruptAt_ = -1;
+        int64_t evictedAt_ = -1;
     };
 
     class FilterSinkImpl {
@@ -4065,6 +4085,24 @@ private:
         return work;
     }
 
+    /// Lease-transient (cold): the group's source found offset `at` evicted from the ring (`ringStart` = the ring start).  Every Live
+    /// filtered member positioned there ends with PartitionDataReset (an InSync member's position is the scan cursor); like
+    /// failFilteredCorrupt_ it never calls leaveFilter_ - the owed error is retried by the unfiltered pass.
+    [[gnu::cold]] [[gnu::noinline]] int failFilteredEvicted_(std::size_t gi, int64_t at, int64_t ringStart) {
+        int work = 0;
+        for (WorkerSubscription& s : subs_) {
+            if (!s.active || s.pushState != WorkerSubscription::PushState::Live) continue;
+            const SubFiltered* f = std::get_if<SubFiltered>(&s.filter);
+            if (f == nullptr || f->group != gi || positionOf_(s) != at) continue;
+            aeron::ExclusivePublication* pub = egressPubOf_(s);
+            if (pub == nullptr) continue;
+            RecordsSealCtx seal;
+            const RecordsSealCtx* sealPtr = sealCtxFor_(s.sessionId, seal);
+            work += failRingEvicted_(s, pub, sealPtr, at, ringStart);
+        }
+        return work;
+    }
+
     /// One pass over every live filtered group (fair: the walk starts where the budget ran out last time).
     int pushFilteredGroups_(int64_t nowNs, bool freshBudget) {
         const std::size_t n = filterGroups_.size();
@@ -4084,6 +4122,10 @@ private:
             work += g.pass(src, snk, *filterGroupSchemas_[gi], filterScratch_, nowNs, pushBudgetLeft_,
                            freshBudget && pushBudgetLeft_ == entry);
             if (src.corruptAt() >= 0) [[unlikely]] work += failFilteredCorrupt_(gi, src.corruptAt());
+            if (src.evictedAt() >= 0) [[unlikely]] {
+                const rune::storage::InMemoryLog* const ring = subReplica_(any) != nullptr ? subReplica_(any)->memoryLog() : nullptr;
+                work += failFilteredEvicted_(gi, src.evictedAt(), ring != nullptr ? ring->logStartOffset() : 0);
+            }
         }
         return work;
     }
@@ -5021,6 +5063,7 @@ private:
         uint32_t targetReplicaId = 0;
         uint32_t incarnation     = 0;
         bool     freshCursor     = false;   ///< E2 M2: the gateway's bind-time cursor (kOpFlagFreshCursor)
+        bool     fromEarliest    = false;   ///< the client asked for Earliest (kOpFlagPushReadFromEarliest; lease-transient raise exemption)
         rune::replication::PartitionReplica* replica = nullptr;
         rune::storage::Log*                  logPtr  = nullptr;
     };
@@ -5039,11 +5082,32 @@ private:
         a.isGroup         = op.isGroup() != 0;
         a.carrier         = op.groupCarrierReceived() != 0;
         a.freshCursor     = (op.deferAck() & kOpFlagFreshCursor) != 0;   // the wire flag byte (M2)
+        a.fromEarliest    = (op.deferAck() & kOpFlagPushReadFromEarliest) != 0;
         a.targetReplicaId = op.targetReplicaId();
         a.incarnation     = op.incarnation();
         a.replica         = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
         a.logPtr          = getLogFromWire_(op);
         servePushRead_(a, /*mayHold=*/true);
+    }
+
+    /// Lease-transient (cold): the gateway-pushed read's cursor is below the ring start.  Answered non-retriably with
+    /// PartitionDataReset; the cursor does not move (the gateway fails the subscription once, like #839's StorageError).
+    [[gnu::cold]] [[gnu::noinline]] void servePushReadRingEvicted_(const PushReadArgs& a) {
+        ++leaseRingEnds_;
+        WorkerReturn ret;
+        ret.type                 = WorkerReturn::Type::PushReadResult;
+        ret.subscriptionId       = a.subscriptionId;
+        ret.sessionId            = a.sessionId;
+        ret.readTopicId          = a.topicId;
+        ret.readPartition        = a.partition;
+        ret.newNextOffset        = a.nextOffset;
+        ret.hwBound              = a.hwBound;
+        ret.isolation            = a.isolation;
+        ret.isGroup              = a.isGroup;
+        ret.groupCarrierReceived = a.carrier;
+        ret.setPushEffectiveBound(-1);
+        ret.errorCode            = static_cast<int16_t>(rune::protocol::client::ErrorCode::PartitionDataReset);
+        enqueueReturn_(std::move(ret));
     }
 
     void servePushRead_(const PushReadArgs& in, bool mayHold) {
@@ -5056,7 +5120,13 @@ private:
         // serveHeldPushReads_) — never a ring this worker does not own.
         rune::storage::InMemoryLog* const mem =
             (log == nullptr && a.replica != nullptr) ? a.replica->memoryLog() : nullptr;
-        if (mem != nullptr) a.nextOffset = skipEvictedCursor_(*mem, a.nextOffset, a.freshCursor);
+        if (mem != nullptr) {
+            if (a.replica->leaseTransient() && a.nextOffset < mem->logStartOffset() && !(a.freshCursor && a.fromEarliest)) [[unlikely]] {
+                servePushReadRingEvicted_(a);   // a lease topic never skips lost records: the gateway fails the subscription (43)
+                return;
+            }
+            a.nextOffset = skipEvictedCursor_(*mem, a.nextOffset, a.freshCursor);
+        }
         else if (log != nullptr) a.nextOffset = raiseFreshDiskCursor_(*log, a.nextOffset, a.freshCursor);   // T2
         const int32_t topicId    = a.topicId;
         const int32_t partition  = a.partition;

@@ -1850,6 +1850,8 @@ private:
         // (WorkerOp::freshCursor) so a transient ring start above it is not
         // counted / warned as a reader that fell behind.
         bool cursorFresh = true;
+        /// The client asked for Earliest (resolved to the partition start): sent with every PushRead (WorkerOp::fromEarliest).
+        bool fromEarliest = false;
         const rune::replication::PartitionReplica* transientReplica = nullptr;
         uint64_t transientClassRegGen = UINT64_MAX;
         uint64_t transientClassCatGen = UINT64_MAX;

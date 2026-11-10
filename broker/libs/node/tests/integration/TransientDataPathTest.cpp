@@ -189,6 +189,48 @@ TEST(TransientDataPathRegression, FreshCursorBelowTheRingStartIsNotCountedAsLagR
     EXPECT_EQ(rig.worker().transientRecordsSkippedForTest(), static_cast<uint64_t>(start));
 }
 
+// Transient LEASE topic (gateway-pushed PushRead): a cursor below the ring start is never raised silently.  Non-fresh or
+// fresh-but-not-Earliest -> the read is answered PartitionDataReset (43) and the cursor does not move; a fresh Earliest
+// cursor is raised as on a plain transient topic; a plain transient topic is unchanged.
+// Mutation: drop the lease branch in Worker::servePushRead_ -> the first case is raised and answered with data, red.
+TEST(TransientLeaseEvictedPushRegression, PushReadBelowStartAnswersDataResetRegression) {
+    constexpr int16_t kDataReset = static_cast<int16_t>(pc::ErrorCode::PartitionDataReset);
+    Rig rig(/*ringBytes=*/8 * 1024, /*maxBatches=*/1000);
+    for (int i = 0; i < 20; ++i) ASSERT_EQ(rig.produce(batchOf(1, 1000), 0), kOk);
+    const int64_t start = rig.mem.logStartOffset();
+    ASSERT_GT(start, 0) << "precondition: the ring evicted committed records";
+
+    // Plain transient: raised as today.
+    const auto plain = rig.readOnce(20, /*from=*/0);
+    ASSERT_TRUE(plain.has_value());
+    EXPECT_EQ(plain->errorCode, 0);
+    EXPECT_FALSE(plain->chunk.empty());
+    EXPECT_EQ(rig.worker().transientCursorSkipsForTest(), 1u);
+
+    rig.rep->setLeaseTransient(true);
+    ASSERT_TRUE(rig.rep->leaseTransient());
+    const uint64_t endsBefore = rig.worker().leaseRingEndsForTest();
+
+    const auto lagging = rig.readOnce(21, /*from=*/0);   // not fresh: a reader that fell behind
+    ASSERT_TRUE(lagging.has_value());
+    EXPECT_EQ(lagging->errorCode, kDataReset);
+    EXPECT_TRUE(lagging->chunk.empty());
+    EXPECT_EQ(lagging->newNextOffset, 0) << "the cursor does not move";
+
+    const auto freshExplicit = rig.readOnce(22, /*from=*/0, 0, /*fresh=*/true, /*fromEarliest=*/false);
+    ASSERT_TRUE(freshExplicit.has_value());
+    EXPECT_EQ(freshExplicit->errorCode, kDataReset);
+
+    const auto earliest = rig.readOnce(23, /*from=*/0, 0, /*fresh=*/true, /*fromEarliest=*/true);
+    ASSERT_TRUE(earliest.has_value());
+    EXPECT_EQ(earliest->errorCode, 0) << "Earliest is raised";
+    ASSERT_FALSE(earliest->chunk.empty());
+    EXPECT_EQ(rune::protocol::RecordBatchReader(earliest->chunk.data(), earliest->chunk.size()).baseOffset(), start);
+
+    EXPECT_EQ(rig.worker().leaseRingEndsForTest(), endsBefore + 2);
+    EXPECT_EQ(rig.worker().transientCursorSkipsForTest(), 1u) << "no lease-topic read counted as a skip";
+}
+
 TEST(TransientDataPathRegression, ReadCommittedHoldsTheOpenTransactionUntilItsCommitRegression) {
     Rig rig;
     constexpr int64_t kPid = 7;

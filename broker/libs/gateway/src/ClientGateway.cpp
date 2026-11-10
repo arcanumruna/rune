@@ -5792,6 +5792,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     sub.partition      = partition;
     sub.nextOffset     = nextOffset;
     sub.isolation      = msg.isolation;
+    sub.fromEarliest   = msg.fromOffset == kFromEarliest;
     sub.subscribeCorrId = msg.correlationId;
     sub.hadReplica      = replicaRegistry_ != nullptr &&
                           static_cast<bool>(replicaRegistry_->lookupHandle(msg.topicId, partition));
@@ -6603,6 +6604,7 @@ void ClientGateway::pushSubscriptionsPass_()
             op.isolation           = sub.isolation;
             op.isGroup             = sub.isGroup;
             op.freshCursor         = sub.cursorFresh;   // M2
+            op.fromEarliest        = sub.fromEarliest;  // lease-transient: only a fresh Earliest cursor may be raised
             op.groupCarrierReceived = sub.groupCarrierReceived;
 
             if (!workerPool_->tryEnqueueOp(sub.topicId, sub.partition, std::move(op))) {
@@ -7954,10 +7956,14 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 Subscription& sub = it->second;
                 sub.failed         = true;
                 sub.errorOwed      = true;
-                // #839: StorageError = a damaged stored batch (CorruptBatch); anything else = the return ring.
+                // #839: StorageError = a damaged stored batch (CorruptBatch); lease-transient: PartitionDataReset = the
+                // cursor fell below the ring (RingEvicted); anything else = the return ring.
                 const bool corrupt = ret.errorCode ==
                     static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError);
+                const bool evicted = ret.errorCode ==
+                    static_cast<int16_t>(rune::protocol::client::ErrorCode::PartitionDataReset);
                 sub.failedCause    = corrupt ? rune::node::PushTooLargeCause::CorruptBatch
+                                   : evicted ? rune::node::PushTooLargeCause::RingEvicted
                                              : rune::node::PushTooLargeCause::ReturnRing;
                 sub.failedFrameLen = 0;
                 spdlog::error("ClientGateway: subscription {} (topicId={} partition={} offset={}) failed: "
@@ -7965,8 +7971,9 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                               ret.subscriptionId, ret.readTopicId, ret.readPartition, ret.newNextOffset,
                               ret.errorCode,
                               corrupt ? "a stored batch is corrupt (damaged log segment)"
-                                      : "a stored batch exceeds the worker return ring",
-                              corrupt ? "StorageError" : "MessageTooLarge");
+                              : evicted ? "the cursor fell below the transient ring start (records lost)"
+                                        : "a stored batch exceeds the worker return ring",
+                              corrupt ? "StorageError" : evicted ? "PartitionDataReset" : "MessageTooLarge");
                 if (Session* session = sessions_.find(sub.sessionId))
                     trySendOwedPushError_(sub, *session);
                 return;

@@ -390,6 +390,7 @@ struct WorkerOp {
     //   bit 0 (kOpFlagDeferAck = 0x01)     — this deferAck (acks=all, steady state)
     //   bit 1 (kOpFlagCrcValidated = 0x02) — crcValidated (below; Produce only)
     //   bit 2 (kOpFlagFreshCursor = 0x04)  — freshCursor (PushRead only; E2 M2) / fromEarliest (Subscribe only)
+    //   bit 3 (kOpFlagPushReadFromEarliest = 0x08) — fromEarliest (PushRead only; shares the bit with grantAll, SessionAnnounce only)
     // Writer: Worker::enqueueOp only.  Readers MUST mask the bit they need
     // (executeProduceWire_ does); `deferAck() != 0` is wrong.  Rename the
     // schema field to `flags` the next time rune-protocol's schema is touched.
@@ -441,7 +442,7 @@ struct WorkerOp {
     /// Subscribe only: the client asked for Earliest (the gateway resolved it to the partition start, 0 on a transient
     /// partition).  On a transient LEASE topic only such a fresh cursor is raised to the ring start; any other cursor below
     /// it ends the subscription (PushTooLargeCause::RingEvicted).  Wire: bit kOpFlagFromEarliest of the `deferAck` flag byte
-    /// (shares bit 2 with freshCursor, which is PushRead only).
+    /// (shares bit 2 with freshCursor, which is PushRead only).  PushRead carries it too: bit kOpFlagPushReadFromEarliest.
     bool    fromEarliest   = false;
 
     // -----------------------------------------------------------------------
@@ -778,6 +779,7 @@ inline constexpr uint8_t kOpFlagCrcValidated = 0x02;   ///< WorkerOp::crcValidat
 inline constexpr uint8_t kOpFlagGrantAll     = 0x08;   ///< WorkerOp::grantAll (SessionAnnounce only; authentication Task 13)
 inline constexpr uint8_t kOpFlagFreshCursor  = 0x04;   ///< WorkerOp::freshCursor (PushRead only; E2 M2)
 inline constexpr uint8_t kOpFlagFromEarliest = 0x04;   ///< WorkerOp::fromEarliest (Subscribe only; shares the bit with the PushRead-only freshCursor)
+inline constexpr uint8_t kOpFlagPushReadFromEarliest = 0x08;   ///< WorkerOp::fromEarliest (PushRead only; shares the bit with the SessionAnnounce-only grantAll)
 inline constexpr uint8_t kOpFlagKeyPending   = 0x10;   ///< WorkerOp::keyPending (SessionAnnounce only)
 inline constexpr uint8_t kOpFlagResponseBind = 0x20;   ///< WorkerOp::responseBind (SessionAnnounce only; NAT-safe egress)
 inline constexpr uint8_t kOpFlagSessionEgress = 0x40;  ///< WorkerOp::sessionEgress (Subscribe only; NAT-safe egress)
