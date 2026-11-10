@@ -68,6 +68,9 @@ static_assert(static_cast<std::uint8_t>(WorkerOp::Type::LeaseKeepAlive) ==
               static_cast<std::uint8_t>(WorkerOp::Type::ScanLeases) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::SCAN_LEASES),
               "the lease WorkerOp types must stay on sbe OpType 36-38");
+static_assert(static_cast<std::uint8_t>(WorkerOp::Type::NsLeasesOver) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::OpType::NS_LEASES_OVER),
+              "WorkerOp::NsLeasesOver must stay on sbe OpType::NS_LEASES_OVER");
 
 // ---------------------------------------------------------------------------
 // WorkerReturn (template id 2)

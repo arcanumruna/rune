@@ -542,7 +542,11 @@ struct NodeConfig {
     /// RUNE_MAX_NAMESPACES (namespaces Task 7): the cluster-wide namespace cap, `default` included.
     int32_t maxNamespaces = 1024;
     /// RUNE_NS_DEFAULT_* (namespaces Task 7): the cluster default limits an omitted CreateNamespace field takes.
-    rune::protocol::NamespaceLimits nsDefaultLimits{};
+    rune::protocol::NamespaceLimits nsDefaultLimits = [] {
+        rune::protocol::NamespaceLimits l{};
+        l.maxLeases = 16'777'216;   // lease topics spec §14.2; RUNE_NS_DEFAULT_MAX_LEASES overrides, 0 = unlimited
+        return l;
+    }();
     /// RUNE_GROUP_MIN_SESSION_TIMEOUT_MS / RUNE_GROUP_MAX_SESSION_TIMEOUT_MS (#499): the bounds a JoinGroup's session
     /// timeout is clamped into.  0 = the GroupCoordinationService default (1 s / 30 min).
     int32_t groupMinSessionTimeoutMs = 0;

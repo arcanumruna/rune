@@ -148,6 +148,9 @@
       <validValue name="LEASE_KEEP_ALIVE">36</validValue>
       <validValue name="LEASE_TIME_TO_LIVE">37</validValue>
       <validValue name="SCAN_LEASES">38</validValue>
+      <!-- Lease topics Task 21: control -> EVERY worker (cold: on a CHANGE only), no tail.  NS_LEASES_OVER: topicId = nsSlot,
+           nextOffset = nsId, partition = 0 / 1 (the namespace is at or over max-leases on this node).  Never ownership-gated. -->
+      <validValue name="NS_LEASES_OVER">39</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica

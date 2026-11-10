@@ -5320,7 +5320,8 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     if (workerPool_) work += topicDroppedFanout_.pump(*workerPool_);   // R-M1
     if (workerPool_ && nsAggregator_.slotCapacity() != 0) {            // Namespaces Phase 2 Task 14 (D28): one tick per period
         if (nsAggregator_.doWork(nowNs) > 0)
-            nsAggregator_.drain([&](const Throttle& t) { nsSlotFanout_.post(t); }, [&](const ViewMemOver& v) { nsSlotFanout_.post(v); });
+            nsAggregator_.drain([&](const Throttle& t) { nsSlotFanout_.post(t); }, [&](const ViewMemOver& v) { nsSlotFanout_.post(v); },
+                                  [&](const LeasesOver& l) { nsSlotFanout_.post(l); });
     }
     if (workerPool_) work += nsSlotFanout_.pump(*workerPool_);         // Namespaces Phase 2 Task 8 (D22)
     publishNsSlotMetrics_();

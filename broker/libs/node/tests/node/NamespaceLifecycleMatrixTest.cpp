@@ -384,7 +384,7 @@ void limitChangeMidTick(const TCell& p) {
     (void)agg.doWork(now);
     agg.onSlotAssign(kSlot, kNs, limitsWith(1000));
     std::vector<Throttle> got;
-    auto drain = [&] { agg.drain([&](const Throttle& t) { got.push_back(t); }, [](const ViewMemOver&) {}); };
+    auto drain = [&] { agg.drain([&](const Throttle& t) { got.push_back(t); }, [](const ViewMemOver&) {}, [](const LeasesOver&) {}); };
     ASSERT_TRUE(agg.report(0, kSlot, kNs, rc.metric, 100));   // limit x tick = 10: debt 90 -> 90 ms
     now += kTick;
     (void)agg.doWork(now);                                      // the read
@@ -410,11 +410,11 @@ void limitChangeMidTick(const TCell& p) {
     (void)a2.doWork(n2);
     a2.onSlotAssign(kSlot, kNs, limitsWith(100));
     std::vector<Throttle> g2;
-    a2.drain([&](const Throttle& t) { g2.push_back(t); }, [](const ViewMemOver&) {});
+    a2.drain([&](const Throttle& t) { g2.push_back(t); }, [](const ViewMemOver&) {}, [](const LeasesOver&) {});
     ASSERT_EQ(g2.size(), 1u);
     n2 += kTick;
     (void)a2.doWork(n2);
-    a2.drain([&](const Throttle& t) { g2.push_back(t); }, [](const ViewMemOver&) {});
+    a2.drain([&](const Throttle& t) { g2.push_back(t); }, [](const ViewMemOver&) {}, [](const LeasesOver&) {});
     ASSERT_EQ(g2.size(), 2u);
     EXPECT_GT(g2[1].untilNs, g2[0].untilNs) << "a lowered limit prolongs the deadline";
 }

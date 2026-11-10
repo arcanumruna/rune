@@ -175,6 +175,29 @@ TEST(CatalogV2Regression, NamespaceCreatedBodyLayoutRegression) {
     EXPECT_EQ(back, distinctLimits());
 }
 
+// Lease topics Task 21: maxLeases (limit field 29, the old reserved1 slot) rides the 256-byte limits record of both namespace events
+// verbatim: encode with 7, decode, get 7 (the codec zeroes no slot), and it is part of the fingerprint.
+TEST(CatalogV2Regression, MaxLeasesSurvivesTheCatalogEventRegression) {
+    rp::NamespaceLimits l = distinctLimits();
+    l.maxLeases = 7;
+    for (const std::size_t i : {std::size_t{0}, std::size_t{1}}) {   // NamespaceCreated, NamespaceLimitsSet
+        rc::CatalogEvent e = namespaceEvent(i);
+        if (i == 0) e.ops = rc::NamespaceCreatedOps{.name = "arena-7", .limits = l};
+        else        e.ops = rc::NamespaceLimitsSetOps{.limits = l};
+        const auto enc = rc::encode(e);
+        ASSERT_TRUE(enc.has_value()) << i;
+        const auto d = rc::decode(*enc);
+        ASSERT_TRUE(d.has_value()) << i;
+        const rp::NamespaceLimits& back = i == 0 ? std::get<rc::NamespaceCreatedOps>(d->ops).limits
+                                                 : std::get<rc::NamespaceLimitsSetOps>(d->ops).limits;
+        EXPECT_EQ(back.maxLeases, 7u) << "kind " << i;
+        EXPECT_EQ(back, l);
+    }
+    rp::NamespaceLimits other = l;
+    other.maxLeases = 8;
+    EXPECT_NE(rc::nsFingerprint(1, "a", l, rc::NsStateTag::Active), rc::nsFingerprint(1, "a", other, rc::NsStateTag::Active));
+}
+
 TEST(CatalogV2Regression, NamespaceDeleteStepBodyLayoutRegression) {
     // body = u8 ops tag (36) | u8 step; the ops blob is the tail, preceded by its u32 length (2).
     for (const uint8_t step : {rc::TxnsAborted, rc::GroupsTombstoned, rc::TxnStateTombstoned, rc::SecurityPurged}) {

@@ -268,7 +268,9 @@ public:
     // The slowest foldCursor over the views interested in (srcTopicId, partition): a View ack may fire once this passes
     // its last offset.  INT64_MAX when no view is interested.  An instance that was never created counts 0, and with
     // `leadership != 0` so does one folded under another leadership (its table says nothing about this one).  `judged` is false on a memory-backed replica:
-    // its verdict views are skipped (no judge ever folds them).
+    // its verdict views are skipped (no judge ever folds them).  A view paused at the namespace's view-memory limit is skipped:
+    // it folds nothing until the limit is raised, and its reads answer ViewPaused (never a stale row), so waiting for it would
+    // only turn every View ack of the source into a 20 s Internal timeout - and expire every lease kept alive over it.
     [[nodiscard]] int64_t minFoldCursor(int32_t srcTopicId, int32_t partition, uint64_t leadership = 0, bool judged = true) const noexcept {
         const auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end()) return INT64_MAX;
@@ -277,6 +279,7 @@ public:
             if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.retiring) continue;   // a dropped verdict view is judged to its drop, never waited for
             if (!judged && isVerdictTemplate_(viewTopicId)) continue;   // #808: a memory-backed replica never hosts a judge (SD9), so its verdict views are never folded and never waited for
             const auto vit = views_.find(instKey(viewTopicId, partition));
+            if (vit != views_.end() && std::holds_alternative<ViewPaused>(vit->second.pause)) continue;   // never waited for: reads answer ViewPaused
             const int64_t cursor = vit == views_.end() || (leadership != 0 && vit->second.foldLeadership != leadership) ? 0 : vit->second.foldCursor;
             if (cursor < min) min = cursor;
         }
@@ -292,6 +295,7 @@ public:
             if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.retiring) continue;
             if (!judged && isVerdictTemplate_(viewTopicId)) continue;
             const auto vit = views_.find(instKey(viewTopicId, partition));
+            if (vit != views_.end() && std::holds_alternative<ViewPaused>(vit->second.pause)) continue;   // never waited for: reads answer ViewPaused
             const int64_t cursor = vit == views_.end() || (leadership != 0 && vit->second.foldLeadership != leadership) ? 0 : vit->second.foldCursor;
             if (cursor < min) { min = cursor; holder = viewTopicId; }
         }
@@ -335,7 +339,7 @@ public:
                 if (judge->activationPending()) rebuildKeyIndex_(srcTopicId, partition, *judge, *write->spec, leaderGen);
                 work += judge->driveJudge(readRange, bound, nowNs, *write, skip.aborted);
                 viewBound = std::min(bound, judge->judgedThrough());
-                work += flipVerdictMembers_(srcTopicId, partition, bound, leaderGen, leaderHwConfirmed, ns, write->leaseEvents.reservedBytes());
+                work += flipVerdictMembers_(srcTopicId, partition, bound, leaderGen, leaderHwConfirmed, ns, write->leaseEvents.reservedBytes(), write->spec->lease.has_value());
                 // The lease events stay in the buffer: Worker::leaseDuty_ consumes and clears them every doWork, right after driveViews_
                 // (the judge runs once per doWork per partition, so the fold-event cap accounting sees an emptied buffer).
             } else {
@@ -489,6 +493,7 @@ public:
         if (const auto it = keyIndexes_.find(instKey(src, partition)); it != keyIndexes_.end()) {
             it->second.extraMemBytes = 0;
             chargeMem_(it->second);
+            releaseLeases_(it->second);   // Task 21: a follower holds no lease state, so it counts no leases; the next leader pass re-charges
         }
     }
     /// Test seam: the memory the lease view of (src, partition) is accounted with (table plus the event buffer), 0 when none.
@@ -594,12 +599,14 @@ public:
         if (nsSlots_.nsIdAt(slot) != nsId) {
             if (!nsSlots_.place(slot, nsId)) { ++nsSlotMismatches_; return; }
             nsViewMem_[slot] = 0; nsViewMemOver_[slot] = 0;   // a reused slot starts from zero usage
+            nsLeases_[slot] = 0; nsLeasesOver_[slot] = 0;
         }
         nsSlots_.setLimits(slot, l);   // the over decision is the aggregator's (ViewMemOver): a raised limit clears it there
     }
     void onNsSlotFreed(uint16_t slot, uint32_t nsId) {
         if (!nsSlots_.release(slot, nsId)) { ++nsSlotMismatches_; return; }
         nsViewMem_[slot] = 0; nsViewMemOver_[slot] = 0;
+        nsLeases_[slot] = 0; nsLeasesOver_[slot] = 0;
     }
     /// Task 14 (D26): the aggregator's decision (node total over maxViewMemoryBytes).  Tag-checked: a message for a
     /// namespace that no longer owns the slot is counted and ignored.  The fold gate reads the byte on the next pass.
@@ -607,6 +614,16 @@ public:
         if (!nsTagMatches(slot, nsId)) return;
         nsViewMemOver_[slot] = on ? 1 : 0;
     }
+    /// Lease topics Task 21: the aggregator's decision (node total of live leases at or over maxLeases).  Tag-checked like
+    /// onViewMemOver.  Read by the checked-write hook on the next write (never paused, never refuses anything but a grant).
+    void onLeasesOver(uint16_t slot, uint32_t nsId, bool on) noexcept {
+        if (!nsTagMatches(slot, nsId)) return;
+        nsLeasesOver_[slot] = on ? 1 : 0;
+    }
+    /// Lease topics Task 21: the live lease rows of the lease partitions this worker LEADS, per namespace slot; and whether the
+    /// namespace is at or over max-leases (node total).
+    [[nodiscard]] uint64_t nsLeases(uint16_t slot) const noexcept { return slot < nsLeases_.size() ? nsLeases_[slot] : 0; }
+    [[nodiscard]] bool     nsLeasesOver(uint16_t slot) const noexcept { return slot < nsLeasesOver_.size() && nsLeasesOver_[slot] != 0; }
     /// Task 12: the namespace's view memory on this worker (sum of its instances' chunk bytes) and whether it is over.
     [[nodiscard]] uint64_t nsViewMemBytes(uint16_t slot) const noexcept { return slot < nsViewMem_.size() ? nsViewMem_[slot] : 0; }
     [[nodiscard]] bool     nsViewMemOver(uint16_t slot) const noexcept { return slot < nsViewMemOver_.size() && nsViewMemOver_[slot] != 0; }
@@ -621,6 +638,8 @@ public:
         nsSlots_.reset(capacity);
         nsViewMem_.assign(nsSlots_.capacity(), 0);
         nsViewMemOver_.assign(nsSlots_.capacity(), 0);
+        nsLeases_.assign(nsSlots_.capacity(), 0);
+        nsLeasesOver_.assign(nsSlots_.capacity(), 0);
     }
     [[nodiscard]] uint32_t nsSlotCapacity() const noexcept { return nsSlots_.capacity(); }
     [[nodiscard]] const NsSlotTable& nsSlotsForTest() const noexcept { return nsSlots_; }
@@ -632,6 +651,10 @@ private:
     // sized to the slot table; the over byte is set only by the aggregator's ViewMemOver message (Task 14).
     std::vector<uint64_t> nsViewMem_     = std::vector<uint64_t>(NsSlotTable::kDefaultCapacity, 0);
     std::vector<uint8_t>  nsViewMemOver_ = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
+    // Lease topics Task 21: per-slot live lease rows of the partitions this worker leads, and the over byte (set only by the
+    // aggregator's LeasesOver message).  Sized and reset exactly where nsViewMem_ is.
+    std::vector<uint64_t> nsLeases_     = std::vector<uint64_t>(NsSlotTable::kDefaultCapacity, 0);
+    std::vector<uint8_t>  nsLeasesOver_ = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
     uint64_t viewPauses_ = 0, viewResumes_ = 0;
 
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
@@ -659,6 +682,21 @@ private:
             nsViewMem_[inst.nsSlot] -= std::min<uint64_t>(nsViewMem_[inst.nsSlot], inst.memCharged);
         }
         inst.memCharged = 0;
+    }
+    /// Lease topics Task 21: charge the lease index's live rows to its slot (one compare when nothing changed).  A lease index only.
+    void chargeLeases_(ViewInstance& inst) noexcept {
+        if (inst.nsSlot == kNoNsSlot) return;
+        const uint64_t n = inst.table.size();
+        if (n == inst.leasesCharged) return;
+        if (!nsSlots_.matches(inst.nsSlot, inst.nsId)) { ++nsSlotMismatches_; return; }   // stale tag: never charge another namespace
+        nsLeases_[inst.nsSlot] = nsLeases_[inst.nsSlot] + n - inst.leasesCharged;
+        inst.leasesCharged = n;
+    }
+    void releaseLeases_(ViewInstance& inst) noexcept {
+        if (inst.nsSlot == kNoNsSlot || inst.leasesCharged == 0) return;
+        if (nsSlots_.matches(inst.nsSlot, inst.nsId))
+            nsLeases_[inst.nsSlot] -= std::min<uint64_t>(nsLeases_[inst.nsSlot], inst.leasesCharged);
+        inst.leasesCharged = 0;
     }
     /// The first drive that carries the source's namespace tag adopts it (cold, once per instance).
     void adoptNs_(ViewInstance& inst, NsTag ns) noexcept {
@@ -770,7 +808,7 @@ private:
                                                      RowStatus* outStatus) const;
     void onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status, ViewDiscardReason reason);
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
-    int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, std::size_t leaseEventBytes);
+    int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, std::size_t leaseEventBytes, bool lease);
     void rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen);
     int64_t leaseReplayCap_ = kLeaseIndexReplayRecordsPerPass;   // the records one replay pass of a lease index covers
     [[nodiscard]] bool leaseLayoutStale_(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec) const noexcept {
@@ -781,6 +819,7 @@ private:
     void eraseKeyIndex_(uint64_t key) {
         if (const auto it = keyIndexes_.find(key); it != keyIndexes_.end()) {
             releaseMem_(it->second);
+            releaseLeases_(it->second);
             keyIndexes_.erase(it);
         }
     }

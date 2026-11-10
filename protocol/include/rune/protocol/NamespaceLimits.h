@@ -7,8 +7,10 @@
 //              0 = unlimited where §5.2 allows it, otherwise the value
 //   u32        featureBits (bit per feature, see kNsFeature*)
 //   u32        reserved0   (placement / password policy / encryption key: zero in Phase 1)
-//   3 x u64    reserved1..3 (carried as zero)
-// The first 29 fields (28 u64 + featureBits) are addressable by a presence mask (NamespaceDdl: bit i = field i).
+//   u64        maxLeases (field 29, lease topics; 0 = unlimited), then reserved2..3 (carried as zero)
+// The first 30 fields (28 u64 + featureBits + maxLeases) are addressable by a presence mask (NamespaceDdl: bit i =
+// field i).  Field i < 28 is a u64 at 8 * i, field 28 is the u32 featureBits at 224, field 29 is a u64 at 232:
+// limitFieldOffset / limitFieldWidth are the ONE place that knows this.
 
 #include <cstddef>
 #include <cstdint>
@@ -34,13 +36,14 @@ struct NamespaceLimits {
     // features (bit per feature: Compaction, Txns, Ql, Views, Sql, Redis, AnonymousRead, AuthScram)
     uint32_t featureBits = 0;
     uint32_t reserved0 = 0;   // placement / password policy / encryption key: zero in Phase 1
-    uint64_t reserved1 = 0, reserved2 = 0, reserved3 = 0;
+    uint64_t maxLeases = 0;   // field 29: max live leases per node's leader-held lease topics (0 = unlimited)
+    uint64_t reserved2 = 0, reserved3 = 0;
 
     bool operator==(const NamespaceLimits&) const = default;
 };
 
 inline constexpr std::size_t kNamespaceLimitsBytes      = 28 * 8 + 4 + 4 + 3 * 8;   // 256
-inline constexpr std::size_t kNamespaceLimitFieldCount  = 29;   // 28 u64 limits + featureBits
+inline constexpr std::size_t kNamespaceLimitFieldCount  = 30;   // 28 u64 limits + featureBits + maxLeases
 
 inline constexpr uint32_t kNsFeatureCompaction    = 1u << 0;
 inline constexpr uint32_t kNsFeatureTxns          = 1u << 1;
@@ -58,7 +61,19 @@ static_assert(offsetof(NamespaceLimits, featureBits) == 28 * 8);
 inline constexpr std::size_t kNsLimitFieldMaxTxnTimeMs = 22;
 static_assert(offsetof(NamespaceLimits, maxTxnTimeMs) == kNsLimitFieldMaxTxnTimeMs * 8,
               "kNsLimitFieldMaxTxnTimeMs must be maxTxnTimeMs's slot");
-static_assert(offsetof(NamespaceLimits, reserved1) == 28 * 8 + 8);
+inline constexpr std::size_t kNsLimitFieldMaxLeases = 29;
+static_assert(offsetof(NamespaceLimits, maxLeases) == 28 * 8 + 8);
+
+/// Byte offset of mask-addressable field `i` (0..kNamespaceLimitFieldCount-1) in the encoded record.
+[[nodiscard]] constexpr std::size_t limitFieldOffset(std::size_t i) noexcept {
+    return i < 28 ? 8 * i : i == 28 ? 28 * 8 : 28 * 8 + 8;
+}
+/// Byte width of mask-addressable field `i`: 8, except featureBits (field 28), which is 4.
+[[nodiscard]] constexpr std::size_t limitFieldWidth(std::size_t i) noexcept { return i == 28 ? 4 : 8; }
+static_assert(limitFieldOffset(kNsLimitFieldMaxLeases) == offsetof(NamespaceLimits, maxLeases),
+              "kNsLimitFieldMaxLeases must be maxLeases's slot");
+static_assert(limitFieldOffset(27) == 216 && limitFieldOffset(28) == 224 && limitFieldOffset(29) == 232);
+static_assert(limitFieldWidth(0) == 8 && limitFieldWidth(28) == 4 && limitFieldWidth(29) == 8);
 
 namespace detail {
 // The record is 28 u64 slots, then u32 featureBits, u32 reserved0, then 3 u64 slots; slot k of width w lives at the

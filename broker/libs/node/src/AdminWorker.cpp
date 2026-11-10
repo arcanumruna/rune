@@ -1962,6 +1962,9 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
             return Rejected(reject(kInvalidRequest, "max-txn-time-ms must be at most " +
                                                         std::to_string(NodeConfig::kMaxDurationMs) +
                                                         " (30 days), got " + std::to_string(m.limits.maxTxnTimeMs)));
+        if (pc::namespaceMaskHas(m.mask, rune::protocol::kNsLimitFieldMaxLeases) &&
+            clusterFeatureLevel_ < rune::replication::MetadataFeature::kLeases)
+            return Rejected(reject(kInvalidRequest, "max-leases needs every broker at the lease feature level"));
         if (!rune::catalog::validNamespaceName(m.name))
             return Rejected(reject(kInvalidRequest, "invalid namespace name " + quotedName(m.name)));
         if (nss.byName(m.name) != nullptr)
@@ -1993,7 +1996,11 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
         e.prevVersion = 0;
         e.newVersion  = 1;
         // The FULL record at request time: absent fields from this broker's current defaults.
-        e.ops = cat::NamespaceCreatedOps{m.name, resolveLimits(m.mask, m.limits, deps_.nsDefaults.limits)};
+        rune::protocol::NamespaceLimits created = resolveLimits(m.mask, m.limits, deps_.nsDefaults.limits);
+        // Below the lease feature level the record carries maxLeases = 0: the catalog event holds nothing an old broker
+        // would read as a limit (the default 16 777 216 is applied only once every broker understands the field).
+        if (clusterFeatureLevel_ < rune::replication::MetadataFeature::kLeases) created.maxLeases = 0;
+        e.ops = cat::NamespaceCreatedOps{m.name, created};
         return e;
     }
     case pc::NamespaceDdlKind::SetLimits: {
@@ -2002,6 +2009,9 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
             return Rejected(reject(kInvalidRequest, "max-txn-time-ms must be at most " +
                                                         std::to_string(NodeConfig::kMaxDurationMs) +
                                                         " (30 days), got " + std::to_string(m.limits.maxTxnTimeMs)));
+        if (pc::namespaceMaskHas(m.mask, rune::protocol::kNsLimitFieldMaxLeases) &&
+            clusterFeatureLevel_ < rune::replication::MetadataFeature::kLeases)
+            return Rejected(reject(kInvalidRequest, "max-leases needs every broker at the lease feature level"));
         const cat::NamespaceRecord* rec = nss.byName(m.name);
         if (rec == nullptr) return Rejected(reject(kUnknownTopic, "no namespace named " + quotedName(m.name)));
         // The untouched predefined default holds no event-carried limits: its base is the boot defaults.
@@ -2012,7 +2022,9 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
         e.objectName  = rec->name;
         e.prevVersion = rec->version;
         e.newVersion  = rec->version + 1;
-        e.ops = cat::NamespaceLimitsSetOps{resolveLimits(m.mask, m.limits, base)};
+        rune::protocol::NamespaceLimits updated = resolveLimits(m.mask, m.limits, base);
+        if (clusterFeatureLevel_ < rune::replication::MetadataFeature::kLeases) updated.maxLeases = 0;   // as for a Create
+        e.ops = cat::NamespaceLimitsSetOps{updated};
         return e;
     }
     case pc::NamespaceDdlKind::Suspend:

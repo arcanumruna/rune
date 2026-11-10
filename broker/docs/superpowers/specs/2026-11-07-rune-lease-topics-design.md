@@ -546,7 +546,7 @@ lease topic they carry the lease op. On every other topic they stay refused, exa
 | grant with `lease_ttl_ms < lease.min_ttl` (0 included) | **not refused:** raised to `min_ttl` in the same scratch patch |
 | update or revoke whose `lease_ttl_ms` differs from the live row's | not checked; the judge keeps the row's TTL |
 | any grant while the namespace's view memory is over its limit | `NamespaceLimitExceeded` (52). Every grant, not only a new key's: the hook does no index lookup, and a grant of a live key would be `KeyExists` anyway (amended 2026-11-08). |
-| a new-key grant while the node is over `max-leases` | `NamespaceLimitExceeded` (52) (Task 21) |
+| any grant while the node is at or over `max-leases` (a grant of a live key is `KeyExists` anyway) | `NamespaceLimitExceeded` (52) (Task 21) |
 | namespace `ReadOnly` or `RejectAll` | `NamespaceSuspended` (51), as for any write |
 | transactional produce | `InvalidRequest` |
 
@@ -1423,6 +1423,21 @@ authorises a read of a lease view as `READ` on its source topic, and a foreign n
   - It takes `NamespaceLimits.reserved1` (`NamespaceLimits.h:37`, renamed `maxLeases`). The field mask grows to 30
     (`:46`), behind `kFeatureLevelLeases`.
   - The default is 16 777 216.
+  - **As built (Task 21).**
+    - **Field.** `NamespaceLimits::maxLeases` is field 29 (u64 at byte 232). `kNamespaceLimitFieldCount` is 30, the presence mask
+      keeps bits 30..31 reserved, and `limitFieldOffset` / `limitFieldWidth` are the one place that knows the layout. The
+      default is 16 777 216, overridable by `RUNE_NS_DEFAULT_MAX_LEASES`; the CLI key is `max-leases`. A Create or SetLimits
+      that sets bit 29 is `InvalidRequest` below `MetadataFeature::kLeases`, and below that level the stored value is 0.
+      Usage (frame 85) keeps its 29 fields; live-lease usage ships with the metrics task (`rune_ns_leases`).
+    - **Count.** Each worker charges the live lease rows of the lease indexes it LEADS (`table.size()`, a tag-checked delta
+      through the view-memory path) and uncharges them on demote, topic drop, rebuild and slot release. The control-thread
+      aggregator sums the workers per node and broadcasts `LeasesOver` on change only (`used >= maxLeases`, `0` = unlimited).
+    - **Refusal.** `CheckedWriteHook` refuses a batch with a grant while over (`HookRefusal::LeaseMaxLeases`, 52) after the
+      view-memory refusal; updates, revokes, keepalives and expiry are never refused.
+    - **Lag and overshoot.** The limit is per node and the flag is one aggregator tick behind the count, so a burst can
+      overshoot by the grants in flight; it is not a fence.
+    - **Pausing.** An ordinary user view over the same namespace still pauses at `max-view-memory-bytes` and, as for every paused
+      view, holds the View acks of its source topic (filed as an issue); the lease view itself is never paused.
 - **Memory.** Lease-view memory counts toward `max-view-memory-bytes`. The view is never paused. While over the limit,
   new-key grants are refused, and keepalives, updates, revokes, expiry and checkpoints continue.
 - **Payload.** A row is up to the topic's max message bytes. System columns take 32 bytes.

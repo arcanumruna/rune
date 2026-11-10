@@ -67,6 +67,7 @@ struct WriteFacts {
     int32_t clientVersion      = 0;       ///< the producing session's announced client version (0 = not announced)
     bool    levelLeases        = false;   ///< the cluster feature level is at least MetadataFeature::kLeases
     bool    viewMemOver        = false;   ///< the namespace's view memory is over its limit (nsViewMemOver)
+    bool    leasesOver         = false;   ///< the namespace is at or over max-leases on this node (nsLeasesOver)
     LeaseIndexRef  leaseIndex;                ///< the partition's lease index (null table: none)
     bool    leaseIndexReady    = false;       ///< that index reflects every judged record of this leadership (leaseIndexReady)
     LeaseHookWork* leaseWork   = nullptr;     ///< the worker's lease work area (required for a lease topic)
@@ -129,6 +130,7 @@ enum class HookRefusal : uint8_t {
     AutoIncExhausted, AutoIncWindowFull, AutoIncActivating,
     LeaseSessionUnannounced, LeaseUpdateThenRevoke, LeaseRevokeIndexNotReady, LeaseRevokeBehindUpdate, LeaseRevokeBatchTooLarge,
     LeaseClientVersion, LeaseNeedsView, LeaseInTxn, LeaseBatchTooLarge, LeaseBadRecord, LeaseTtlTooLarge, LeaseViewMemOver,
+    LeaseMaxLeases,
     Count_
 };
 

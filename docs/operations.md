@@ -201,6 +201,7 @@ enforced, each with one precise code:
 | `max-retention-ms`, `max-retention-bytes` | a topic DDL above the maximum is refused; the cleaner applies `min(topic retention, namespace maximum)` | `NamespaceLimitExceeded (52)` at DDL |
 | `produce-bytes-per-sec`, `produce-records-per-sec`, `fetch-bytes-per-sec`, `request-ops-per-sec`, `query-cycles-per-sec` | a per-namespace aggregator compares the node's usage with `limit x elapsed` every `RUNE_NS_LIMIT_TICK_US` (default 10000) | `Throttled (53)` carrying a retry-after; the client library waits it out and retries. `fetch-bytes-per-sec` and `request-ops-per-sec` also apply to subscriptions: a throttled namespace is simply not pushed to until the throttle lapses, and a subscription's request ops are counted once per Subscribe |
 | `max-view-memory-bytes` | the node's view chunks | the namespace's views pause at their offset and a view read answers `ViewPaused (54)`; they resume when memory falls or the limit is raised |
+| `max-leases` | the node's live lease rows (leader-held) | a grant of a new lease key answers `NamespaceLimitExceeded (52)` while the node is at or over the limit; keepalives, updates, revokes and expiry continue; `0` = unlimited, default 16777216 (`RUNE_NS_DEFAULT_MAX_LEASES`), needs every broker at the lease feature level |
 
 - **`max-txn-time-ms` is at most 2592000000 (30 days).** A larger value on `CreateNamespace` or `SetLimits` is refused with
   `InvalidRequest (39)`; so is `RUNE_NS_DEFAULT_MAX_TXN_TIME_MS` above it, at startup.

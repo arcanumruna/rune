@@ -2936,6 +2936,9 @@ private:
         case WorkerOp::Type::NsViewMemOver:   // Task 14 (D26)
             applyNsViewMemOver_(static_cast<uint16_t>(op.topicId()), static_cast<uint32_t>(op.nextOffset()), op.partition() != 0);
             break;
+        case WorkerOp::Type::NsLeasesOver:    // Lease topics Task 21
+            applyNsLeasesOver_(static_cast<uint16_t>(op.topicId()), static_cast<uint32_t>(op.nextOffset()), op.partition() != 0);
+            break;
         case WorkerOp::Type::PeerLinkKeys:
             executePeerLinkKeysWire_(op);
             ackPeerLinkKeys_(op.topicId(), op.correlationId());   // installed or refused: the hold must not outlive it
@@ -7049,14 +7052,18 @@ public:
             case NsMetric::RequestOps:     return h.requestOps;
             case NsMetric::QueryCycles:    return h.queryCycles;
             case NsMetric::DiskBytes:      return static_cast<uint64_t>(nsDiskBytes_[slot]);
-            default:                       return viewSet_ != nullptr ? viewSet_->nsViewMemBytes(slot) : 0;
+            case NsMetric::ViewMemBytes:   return viewSet_ != nullptr ? viewSet_->nsViewMemBytes(slot) : 0;
+            case NsMetric::Leases:         return viewSet_ != nullptr ? viewSet_->nsLeases(slot) : 0;
+            case NsMetric::kCount:         break;
         }
+        return 0;
     }
     /// How often this worker reports its per-slot usage to the aggregator (set from RUNE_NS_LIMIT_TICK_US at start).
     void setNsReportIntervalNs(int64_t ns) noexcept { nsReportIntervalNs_ = ns < 1 ? 1 : ns; }
     /// Test seam: deliver an aggregator message exactly as the ring would.
     void applyNsThrottleDirect(uint16_t slot, uint32_t nsId, ThrottleKind k, int64_t untilNs) { applyNsThrottle_(slot, nsId, k, untilNs); }
     void applyNsViewMemOverDirect(uint16_t slot, uint32_t nsId, bool on) { applyNsViewMemOver_(slot, nsId, on); }
+    void applyNsLeasesOverDirect(uint16_t slot, uint32_t nsId, bool on) { applyNsLeasesOver_(slot, nsId, on); }
     /// Test seam: the usage report exactly as doWork sends it (every slot whose value changed since the last report).
     int reportNsUsageForTest() { return reportNsUsage_(); }
     /// Test seam: run the periodic disk scan now.
@@ -7153,6 +7160,11 @@ private:
         if (!checkNsTag_(slot, nsId)) return;
         if (viewSet_ != nullptr) viewSet_->onViewMemOver(slot, nsId, on);
     }
+    /// Lease topics Task 21: the aggregator's max-leases decision (cold, on a change only).
+    [[gnu::cold]] void applyNsLeasesOver_(uint16_t slot, uint32_t nsId, bool on) {
+        if (!checkNsTag_(slot, nsId)) return;
+        if (viewSet_ != nullptr) viewSet_->onLeasesOver(slot, nsId, on);
+    }
     /// Cold, paced: report every slot metric that changed since the last report to the aggregator (a SessionSignal on the
     /// return ring).  A full ring keeps the metric unreported (retried next interval) - never a spin, never dropped.
     int reportNsUsage_() {
@@ -7166,7 +7178,8 @@ private:
             const NsHot& h = nsHot_[sl];
             const uint64_t vals[kNsMetrics] = {h.produceBytes, h.produceRecords, h.fetchBytes, h.requestOps, h.queryCycles,
                                                static_cast<uint64_t>(nsDiskBytes_[sl]),
-                                               viewSet_ != nullptr ? viewSet_->nsViewMemBytes(static_cast<uint16_t>(sl)) : 0};
+                                               viewSet_ != nullptr ? viewSet_->nsViewMemBytes(static_cast<uint16_t>(sl)) : 0,
+                                               viewSet_ != nullptr ? viewSet_->nsLeases(static_cast<uint16_t>(sl)) : 0};
             for (std::size_t m = 0; m < kNsMetrics; ++m) {
                 uint64_t& last = nsLastReport_[sl * kNsMetrics + m];
                 if (vals[m] == last) continue;
@@ -10946,6 +10959,7 @@ private:
                 facts.clientVersion = ackSink_ ? ackSink_->clientVersionOf(f.sessionId) : 0;
                 facts.levelLeases   = clusterFeatureLevel_ >= rune::replication::MetadataFeature::kLeases;
                 facts.viewMemOver   = viewSet_ != nullptr && viewSet_->nsViewMemOver(nsTag.slot);
+                facts.leasesOver    = viewSet_ != nullptr && viewSet_->nsLeasesOver(nsTag.slot);
                 facts.leaseWork     = leaseHookWork_.get();
                 if (viewSet_ != nullptr && replica != nullptr) {
                     const bool hwConfirmed = replica->highWatermark() >= replica->leadershipStartOffset();

@@ -118,6 +118,8 @@ TEST(LeaseWriteHookRegression, RefusalTableRegression) {
         {"revoke version -1", none, [] { return one(revokeOf(1, -1)); }, IR, H::LeaseBadRecord},
         {"grant ttl max+1", none, [] { return one(grantOf(1, maxTtl() + 1)); }, TTL, H::LeaseTtlTooLarge},
         {"grant while viewMemOver", [](Rig& r) { r.facts.viewMemOver = true; }, [] { return one(grantOf(1)); }, NLE, H::LeaseViewMemOver},
+        {"grant while leasesOver", [](Rig& r) { r.facts.leasesOver = true; }, [] { return one(grantOf(1)); }, NLE, H::LeaseMaxLeases},
+        {"grant while viewMemOver AND leasesOver", [](Rig& r) { r.facts.viewMemOver = true; r.facts.leasesOver = true; }, [] { return one(grantOf(1)); }, NLE, H::LeaseViewMemOver},
         {"bit 4 set", none, [] { return one(withAttrs(grantOf(1), kGrantA | 0x10)); }, IR, H::ReservedBits},
         {"bit 7 set", none, [] { return one(withAttrs(updateOf(1, 5), kUpdateA | 0x80)); }, IR, H::ReservedBits},
         // accepted
@@ -128,6 +130,8 @@ TEST(LeaseWriteHookRegression, RefusalTableRegression) {
         {"2048 records", none, [] { return manyGrants(2048); }, OKC, H::None},
         {"update while viewMemOver", [](Rig& r) { r.facts.viewMemOver = true; }, [] { return one(updateOf(1, 5)); }, OKC, H::None},
         {"revoke while viewMemOver", [](Rig& r) { r.withIndex(); r.facts.viewMemOver = true; }, [] { return one(revokeOf(1, 5)); }, OKC, H::None},
+        {"update while leasesOver", [](Rig& r) { r.facts.leasesOver = true; }, [] { return one(updateOf(1, 5)); }, OKC, H::None},
+        {"revoke while leasesOver", [](Rig& r) { r.withIndex(); r.facts.leasesOver = true; }, [] { return one(revokeOf(1, 5)); }, OKC, H::None},
         {"update ttl differs", none, [] { return one(updateOf(1, 5, 7)); }, OKC, H::None},
         {"grant ttl max", none, [] { return one(grantOf(1, maxTtl())); }, OKC, H::None},
         {"grant ttl 0 (raised, not refused)", none, [] { return one(grantOf(1, 0)); }, OKC, H::None},

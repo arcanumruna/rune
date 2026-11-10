@@ -1349,13 +1349,28 @@ Spec §14.2, §14.3, §9.6 (namespace rows), G3.
 live-lease counter fed by the LeaseIndex fold (`rune_ns_leases`); `CheckedWriteHook` new-key-grant refusal while
 over `max-leases` or view memory; tests `broker/libs/node/tests/integration/LeaseNamespaceTest.cpp`.
 
-- [ ] **Step 1: failing tests** `LeaseNamespaceRegression.*`: `ReadOnlyServesKeepAlivesRefusesWritesRegression`,
+- [x] **Step 1: failing tests** `LeaseNamespaceRegression.*`: `ReadOnlyServesKeepAlivesRefusesWritesRegression`,
   `ReadOnlyUnkeptStillExpiresRegression`, `RejectAllStillExpiresRegression` (M16), `RejectAllRefusesKeepAlivesRegression`
   (every lease ends within TTL + bound), `ResumeNothingToRearmRegression`, `MaxLeasesRefusesNewKeyGrantRegression`
   (keepalive/update/revoke/expiry continue), `ViewMemoryOverRefusesNewGrantsOnlyRegression`,
   `NamespaceDeleteDropsLeaseTopicRegression`, `LimitFieldOldLevelRefusedRegression`.
-- [ ] **Step 2:** implement. Run `ctest --test-dir build -R 'LeaseNamespace|NamespaceLifecycle|NamespaceLimit' --output-on-failure -j8`;
+- [x] **Step 2:** implement. Run `ctest --test-dir build -R 'LeaseNamespace|NamespaceLifecycle|NamespaceLimit' --output-on-failure -j8`;
   commit and push.
+
+**As built (Task 21).** Spec §14.2 "As built (Task 21)" has the field, count, refusal and lag. Deviations from the step list:
+the broker tests are `broker/libs/node/tests/client/LeaseNamespaceTest.cpp` (suite `LeaseNamespaceRegression`: `MaxLeasesRefusesNewKeyGrant`,
+`MaxLeasesSetLimitsTakesEffect`, `ViewMemoryOverRefusesNewGrantsOnly`, `ResumeNothingToRearm`, `NamespaceDeleteDropsLeaseTopic`);
+`LimitFieldOldLevelRegression.MaxLeasesNeedsTheLeaseFeatureLevelRegression` (admin unit layer) replaces `LimitFieldOldLevelRefused`; the four
+suspension names are rows of `LeaseMatrixTiming.TimingCellRegression` (BrokerExpire, KeepAlive1, Grant, Update, Revoke x SuspendReadOnly /
+SuspendRejectAll; Revoke has only RejectAll): ReadOnlyServesKeepAlivesRefusesWrites = Grant/Update/KeepAlive1_SuspendReadOnly;
+ReadOnlyUnkeptStillExpires = BrokerExpire_SuspendReadOnly; RejectAllStillExpires (M16) = BrokerExpire_SuspendRejectAll;
+RejectAllRefusesKeepAlives = KeepAlive1_SuspendRejectAll (strengthened: 6 s before and 6 s after the suspension, so a served keepalive would
+leave the lease alive). The ring op `NS_LEASES_OVER` (39) was added to `OpType.h` by hand (the generated header is committed). `ql/src/ConfigKeys.h`
+has no namespace keys, so there is no QL change. Usage (85) stays at 29 fields (`kNamespaceUsageFieldCount`).
+Found and fixed here: an ordinary view paused at max-view-memory-bytes held every View ack of its source until the 20 s
+timeout (Internal), so a paused user view over a lease topic stalled keepalives and let leases expire. `WorkerViewSet::minFoldCursor`
+now skips a paused view (it folds nothing until resumed, and its reads answer ViewPaused). Regression:
+`LeaseNamespaceRegression.PausedUserViewNeverHoldsLeaseAcksRegression`.
 
 ### Task 22: metrics, `show lease(s)`, `revoke lease`, CLI
 

@@ -4,8 +4,11 @@
 //
 //   NamespaceUsage (84)          header | name var16                      (BODY_FIXED 0; empty name refused)
 //   NamespaceUsageResponse (85)  header | [fixed] code i16, state u8 | NamespaceLimits (kNamespaceLimitsBytes) |
-//                                usage u64 x kNamespaceLimitFieldCount (same field order as the limits; 0 = n/a)
+//                                usage u64 x kNamespaceUsageFieldCount (the first 29 limit fields' order; 0 = n/a)
 //                                state = catalog NsStateTag value.
+// The usage array stays 29 fields: the limits record grew a 30th field (maxLeases, lease topics), but this frame is an
+// exact-length one and an older client refuses a longer one, so the lease count is NOT reported here.  Live-lease usage
+// goes out with the deferred metrics task.
 // Decoders are bounds-checked, require the exact frame length and never read past `avail`.
 
 #include <array>
@@ -16,6 +19,9 @@
 #include "NamespaceMessages.h"
 
 namespace rune::protocol::client {
+
+/// Usage entries in NamespaceUsageResponse (85), fixed since client version 14; independent of the limit field count.
+inline constexpr std::size_t kNamespaceUsageFieldCount = 29;
 
 struct NamespaceUsageRequest {
     int64_t sessionId = 0, correlationId = 0;
@@ -48,13 +54,13 @@ struct NamespaceUsageResponse {
     int16_t code = 0;
     uint8_t state = 0;
     NamespaceLimits limits;
-    std::array<uint64_t, kNamespaceLimitFieldCount> usage{};
+    std::array<uint64_t, kNamespaceUsageFieldCount> usage{};
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::NamespaceUsageResponse);
     static constexpr uint16_t BODY_FIXED  = 3;
 
     [[nodiscard]] static constexpr std::size_t encodedSize() noexcept {
-        return MessageHeader::ENCODED_SIZE + BODY_FIXED + kNamespaceLimitsBytes + 8u * kNamespaceLimitFieldCount;
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + kNamespaceLimitsBytes + 8u * kNamespaceUsageFieldCount;
     }
     /// Zero-allocation encode; returns 0 when `cap` < encodedSize().
     std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept {

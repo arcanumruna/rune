@@ -24,12 +24,13 @@ void NsLimitAggregator::resetSlot_(uint16_t slot) noexcept {
         for (std::size_t m = 0; m < kNsMetrics; ++m) last_[(s * sources_ + src) * kNsMetrics + m] = 0;
     for (std::size_t k = 0; k < kThrottleKinds; ++k) { debt_[s * kThrottleKinds + k] = 0; sentUntil_[s * kThrottleKinds + k] = 0; }
     sentViewOver_[s] = 0;
+    sentLeasesOver_[s] = 0;
 }
 
 void NsLimitAggregator::emitThrottle_(uint16_t slot, ThrottleKind k, int64_t until) {
     sentUntil_[static_cast<std::size_t>(slot) * kThrottleKinds + static_cast<std::size_t>(k)] = until;
     Event e{};
-    e.isThrottle = true;
+    e.kind       = EventKind::Throttle;
     e.throttle   = Throttle{slot, slots_.nsIdAt(slot), k, until};
     if (events_.size() < events_.capacity()) events_.push_back(e);   // capacity covers every slot x kind: never drops
 }
@@ -91,8 +92,22 @@ int NsLimitAggregator::doWork(int64_t nowNs) {
             if (over != sentViewOver_[s]) {
                 sentViewOver_[s] = over;
                 Event e{};
-                e.isThrottle = false;
+                e.kind       = EventKind::ViewMemOver;
                 e.viewMem    = ViewMemOver{slot, slots_.nsIdAt(slot), over != 0};
+                if (events_.size() < events_.capacity()) events_.push_back(e);
+            }
+        }
+
+        // ---- leases (Lease topics Task 21): the node total of the leader-held live lease rows ----
+        {
+            const uint64_t used = total_[s * kNsMetrics + static_cast<std::size_t>(NsMetric::Leases)];
+            // `>=`: at the limit the next grant would exceed it.
+            const uint8_t over = (L.maxLeases != 0 && used >= L.maxLeases) ? 1 : 0;
+            if (over != sentLeasesOver_[s]) {
+                sentLeasesOver_[s] = over;
+                Event e{};
+                e.kind   = EventKind::LeasesOver;
+                e.leases = LeasesOver{slot, slots_.nsIdAt(slot), over != 0};
                 if (events_.size() < events_.capacity()) events_.push_back(e);
             }
         }

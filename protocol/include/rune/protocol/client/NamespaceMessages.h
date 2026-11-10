@@ -9,8 +9,8 @@
 //   NamespaceDdl (81)         header | ext (catalog DdlExtension layout) | kind u8 | name var16 |
 //                             presentMask u8[4] | NamespaceLimits (kNamespaceLimitsBytes)
 //                             kind 1 = Create, 2 = SetLimits (3..5 reserved for Phase 2).  presentMask bit i = limits
-//                             field i was given (kNamespaceLimitFieldCount = 29 fields: 28 u64 in declaration order,
-//                             then featureBits); bits 29..31 must be zero.
+//                             field i was given (kNamespaceLimitFieldCount = 30 fields: 28 u64 in declaration order,
+//                             then featureBits, then maxLeases); bits 30..31 must be zero.
 //   ListNamespaces (82)       header | [fixed] afterNsId u32, max u16
 //   ListNamespacesResponse(83) header | [fixed] count u16 | count x { nsId u32, name var16, state u8, limits } |
 //                             nextAfter u32
@@ -134,7 +134,7 @@ inline std::size_t NamespaceDdlRequest::encode(uint8_t* buf) const noexcept {
     const bool hasLimits = kind == NamespaceDdlKind::Create || kind == NamespaceDdlKind::SetLimits;
     if (kind == NamespaceDdlKind::Suspend && !validSuspendMode(static_cast<uint8_t>(mode))) return 0;
     if (!extFits(ext) || !fitsVarLen16(name.size())) return 0;
-    if (hasLimits && (presentMask[3] & 0xE0u) != 0) return 0;   // bits 29..31 are reserved
+    if (hasLimits && (presentMask[3] & 0xC0u) != 0) return 0;   // bits 30..31 are reserved
     std::size_t pos = detail::putAuthHeader(buf, TEMPLATE_ID, BODY_FIXED, sessionId, correlationId);
     pos += putExt(buf + pos, ext);
     buf[pos++] = k;
@@ -169,7 +169,7 @@ inline std::optional<NamespaceDdlRequest> NamespaceDdlRequest::decode(const uint
         return pos == avail ? std::optional<NamespaceDdlRequest>(std::move(m)) : std::nullopt;
     if (pos + kNamespacePresentMaskBytes + kNamespaceLimitsBytes > avail) return std::nullopt;
     for (std::size_t i = 0; i < kNamespacePresentMaskBytes; ++i) m.presentMask[i] = buf[pos++];
-    if ((m.presentMask[3] & 0xE0u) != 0) return std::nullopt;
+    if ((m.presentMask[3] & 0xC0u) != 0) return std::nullopt;   // bits 30..31 are reserved
     if (!decodeLimits(buf + pos, avail - pos, m.limits)) return std::nullopt;
     pos += kNamespaceLimitsBytes;
     if (pos != avail) return std::nullopt;

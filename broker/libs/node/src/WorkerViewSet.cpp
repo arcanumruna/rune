@@ -1099,6 +1099,7 @@ void WorkerViewSet::dropSourceTopic(int32_t srcTopicId) {
     for (auto it = keyIndexes_.begin(); it != keyIndexes_.end();) {
         if (!ofTopic(*it)) { ++it; continue; }
         releaseMem_(it->second);
+        releaseLeases_(it->second);
         it = keyIndexes_.erase(it);
     }
     std::erase_if(leaseViews_, [&](const LeaseViewMap& m) { return m.src == srcTopicId; });
@@ -1167,6 +1168,7 @@ void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, Verd
             return;
         }
         releaseMem_(it->second);
+        releaseLeases_(it->second);   // the rebuilt (empty) index re-charges as it replays
         const rune::view::ViewTableKeys keys{spec.keyWidth, 0, hashSeed_, hashMask_};
         const uint32_t epoch = it->second.rebuildEpoch;
         it->second = spec.lease ? freshLeaseIndex(srcTopicId, partition, spec, *src, keys, leaseReplayCap_) : freshKeyIndex(srcTopicId, partition, spec, *src, keys);
@@ -1303,11 +1305,12 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
     return work;
 }
 
-int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, std::size_t leaseEventBytes) {
+int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, std::size_t leaseEventBytes, bool lease) {
     if (const auto kit = keyIndexes_.find(instKey(srcTopicId, partition)); kit != keyIndexes_.end()) {
         kit->second.extraMemBytes = leaseEventBytes;   // a lease partition's event buffer is part of its lease view's memory
         adoptNs_(kit->second, ns);
         chargeMem_(kit->second);
+        if (lease) chargeLeases_(kit->second);   // Task 21: never a checked-writes key index that is not a lease topic
     }
     const auto sit = subscriptionIndex_.find(srcTopicId);
     if (sit == subscriptionIndex_.end()) return 0;

@@ -464,6 +464,10 @@ TEST_P(LeaseMatrixTiming, TimingCellRegression) {
         rc::LeaseOptions o = o10;
         const rc::LeaseResult g = lt.grantAndWait(r, o);
         ASSERT_TRUE(g.ok());
+        // Task 21: the RejectAll keepalive cell proves the keepalive was REFUSED, not merely that the lease ended: 6 s pass before the
+        // suspension and 6 s after, so a keepalive that was wrongly served (deadline 6 s + 10 s) would leave the lease alive at 12 s.
+        const bool splitAdvance = op == Op::KeepAlive1 && rejectAll;
+        if (splitAdvance) rig.advance(6s);
         suspend(rejectAll ? pc::NsSuspendMode::RejectAll : pc::NsSuspendMode::ReadOnly);
         // A suspended namespace answers NamespaceSuspended; RejectAll also ends the namespace's sessions (the call then fails without a code).
         auto refused = [&](const rc::LeaseResult& x) { return !x.ok() && (x.errorCode == kSuspended || rejectAll); };
@@ -481,7 +485,7 @@ TEST_P(LeaseMatrixTiming, TimingCellRegression) {
         }
         // Expiry never pauses (G3): an unkept lease ends under either suspension (the keepalive of ReadOnly writes nothing).
         const bool kept = op == Op::KeepAlive1 && !rejectAll;
-        rig.advance(12s);
+        rig.advance(splitAdvance ? 6s : 12s);
         resume();
         // Observed by the cluster admin (the namespace's own sessions ended under RejectAll).
         auto adminLt = rig.admin().openLeaseTopicAndWait<LeaseClaim>("a/t", {}, 30s);

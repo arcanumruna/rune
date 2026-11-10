@@ -938,6 +938,50 @@ TEST(LeaseJudgeWorkerRegression, LeaseEventBufferReleasedOnDemoteRegression) {
     EXPECT_TRUE(r.leaseReady());
 }
 
+// Lease topics Task 21: a worker counts the lease rows of the partitions it LEADS against the namespace's slot (max-leases): the
+// fold charges them, a demote uncharges (a follower holds no lease state), the next leader pass charges again, and a freed
+// slot reads zero.
+TEST(LeaseJudgeWorkerRegression, LeaseCountChargedWhileLeadingRegression) {
+    constexpr uint16_t kLeaseNsSlot = 3;
+    constexpr uint32_t kLeaseNsId = 91;
+    VerdictRig r(false);
+    r.worker->applyNsSlotAssignDirect(kLeaseNsSlot, kLeaseNsId, rune::protocol::NamespaceLimits{});
+    r.log->setNsTag(kLeaseNsId, kLeaseNsSlot);
+    r.createLeaseTopic(1000, std::nullopt);
+    r.passes(30);
+    const auto send = [&](const std::vector<RawRec>& recs) {
+        r.demote();
+        r.replicate({VerdictRig::rawBatch(recs)});
+        r.promote();
+        r.passes(30);
+        return r.driveUntilJudged();
+    };
+    ASSERT_TRUE(send({grantRec(1, "a1"), grantRec(2, "a2"), grantRec(3, "a3")}));
+    r.passes(30);
+    ASSERT_TRUE(r.leaseReady());
+    EXPECT_EQ(r.vs->nsLeases(kLeaseNsSlot), 3u) << "the leader counts its live lease rows";
+    EXPECT_EQ(r.vs->nsSlotMismatchesForTest(), 0u);
+
+    ASSERT_TRUE(send({grantRec(4, "a4")}));
+    r.passes(30);
+    EXPECT_EQ(r.vs->nsLeases(kLeaseNsSlot), 4u) << "a delta, not a re-add";
+
+    r.demote();
+    r.passes(10);
+    EXPECT_EQ(r.vs->nsLeases(kLeaseNsSlot), 0u) << "a follower holds no lease state: it counts none";
+
+    r.promote();
+    r.passes(30);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(30);
+    EXPECT_EQ(r.vs->nsLeases(kLeaseNsSlot), 4u) << "the next leader pass charges again, from the rebuilt index";
+
+    r.worker->applyNsSlotReleaseDirect(kLeaseNsSlot, kLeaseNsId);
+    EXPECT_EQ(r.vs->nsLeases(kLeaseNsSlot), 0u) << "a freed slot reads zero";
+    r.passes(30);
+    EXPECT_EQ(r.vs->nsLeases(kLeaseNsSlot), 0u) << "and a stale instance never charges the slot again";
+}
+
 // Item 4: AddField is a SchemaUpdate plus a FilterSchema; whichever arrives first, the index is rebuilt ONCE.
 TEST(LeaseJudgeWorkerRegression, LeaseSchemaOpsRebuildOnceRegression) {
     for (const bool updateFirst : {true, false}) {

@@ -3308,6 +3308,34 @@ TEST(NodeConfigRegression, MaxNamespacesReadWithoutGroupSessionTimeoutRegression
     EXPECT_NE(r.error.find("RUNE_MAX_NAMESPACES"), std::string::npos) << r.error;
 }
 
+// Lease topics Task 21: RUNE_NS_DEFAULT_MAX_LEASES (limit field 29).  Unset -> 16 777 216 (spec 14.2); set -> carried, 0 = unlimited;
+// feature-bits (field 28) still parses as a u32 at its own offset; garbage refuses startup.
+TEST(NodeConfigRegression, NsDefaultMaxLeasesRegression) {
+    auto env = base1node();
+    env["RUNE_AUTH"] = "disabled";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->nsDefaultLimits.maxLeases, 16'777'216u);
+    env["RUNE_NS_DEFAULT_MAX_LEASES"] = "7";
+    env["RUNE_NS_DEFAULT_FEATURE_BITS"] = "5";
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->nsDefaultLimits.maxLeases, 7u);
+    EXPECT_EQ(r.config->nsDefaultLimits.featureBits, 5u);
+    env["RUNE_NS_DEFAULT_MAX_LEASES"] = "0";
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->nsDefaultLimits.maxLeases, 0u);
+    env["RUNE_NS_DEFAULT_FEATURE_BITS"] = "4294967296";   // over u32: still refused
+    r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.config.has_value());
+    env["RUNE_NS_DEFAULT_FEATURE_BITS"] = "5";
+    env["RUNE_NS_DEFAULT_MAX_LEASES"] = "x";
+    r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.config.has_value());
+    EXPECT_NE(r.error.find("RUNE_NS_DEFAULT_MAX_LEASES"), std::string::npos) << r.error;
+}
+
 // Namespaces Phase 2 Task 14 (D28): RUNE_NS_LIMIT_TICK_US - default 10000, carried when set, range [1000, 1000000].
 TEST(NodeConfigRegression, NsLimitTickRegression) {
     auto env = base1node();

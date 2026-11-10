@@ -145,9 +145,15 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
         if (const pc::ErrorCode e = checkLeaseBatch_(batch, len, leaseUpdates_, 0); e != pc::ErrorCode::OK) return e;
     }
     // Every grant is refused while the namespace's view memory is over its limit (the hook has no index lookup; a grant
-    // of a live key would be KeyExists anyway).  The max-leases limit is Task 21.
+    // of a live key would be KeyExists anyway).  Keepalives, updates, revokes, expiry and checkpoints are never refused here.
     if (intents.leaseGrants > 0 && facts_.viewMemOver) [[unlikely]] {
         refusal_ = HookRefusal::LeaseViewMemOver;
+        return pc::ErrorCode::NamespaceLimitExceeded;
+    }
+    // Likewise while the namespace is at or over max-leases on this node (the aggregator's LeasesOver): every grant, for
+    // the same reason (no index lookup here, and a grant of a live key is KeyExists anyway).
+    if (intents.leaseGrants > 0 && facts_.leasesOver) [[unlikely]] {
+        refusal_ = HookRefusal::LeaseMaxLeases;
         return pc::ErrorCode::NamespaceLimitExceeded;
     }
     intents.keyZeroCreate = keyZeroCreates > 0;

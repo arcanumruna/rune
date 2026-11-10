@@ -189,6 +189,8 @@ struct WorkerOp {
         LeaseKeepAlive            = 36, ///< gateway → worker: keepalive entries of one lease partition
         LeaseTimeToLive           = 37, ///< gateway → worker: the remaining time of one lease key
         ScanLeases                = 38, ///< gateway → worker: a page of the lease rows in hash order (Task 13b)
+        // Lease topics Task 21: control → EVERY worker (cold: on a change only), see NsRingMessages.h.  Never ownership-gated.
+        NsLeasesOver              = 39, ///< control → worker: nsSlot is at or over max-leases on this node (or back under)
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the

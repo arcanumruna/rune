@@ -246,6 +246,9 @@ struct ViewInstance {
     uint16_t                           nsSlot          = kNoNsSlot;
     uint32_t                           nsId            = 0;
     std::size_t                        memCharged      = 0;
+    // Lease topics Task 21: the live lease rows (the lease index's table size) charged to the namespace's nsLeases while this
+    // worker LEADS the partition.  Only a lease index is ever charged.
+    uint64_t                           leasesCharged   = 0;
     // A lease index: the reserved bytes of the partition's lease event buffer (PartitionWriteState::leaseEvents), counted with the
     // table in the memory charged to the namespace (WorkerViewSet::instanceMemory_).
     std::size_t                        extraMemBytes   = 0;

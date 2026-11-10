@@ -30,7 +30,7 @@ rp::NamespaceLimits distinctLimits() {
     l.maxViewMemoryBytes = 23 * k;
     l.minReplicationFactor = 24 * k; l.maxReplicationFactor = 25 * k; l.lowestAcks = 26 * k; l.lowestMinInsync = 27 * k;
     l.featureBits = 0xA1B2C3D4u;    l.reserved0 = 0x0A0B0C0Du;
-    l.reserved1 = 0x1112131415161718ULL; l.reserved2 = 0x2122232425262728ULL; l.reserved3 = 0x3132333435363738ULL;
+    l.maxLeases = 0x1112131415161718ULL; l.reserved2 = 0x2122232425262728ULL; l.reserved3 = 0x3132333435363738ULL;
     return l;
 }
 
@@ -62,7 +62,7 @@ TEST(NamespaceMessagesRegression, LimitsRoundTripRegression) {
     // Golden prefix: field 0 = 0x00.. then field 1 = 0x01.. (little-endian, byte-wise, declaration order).
     static constexpr uint8_t kGoldenPrefix[16] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
     EXPECT_EQ(0, std::memcmp(buf.data(), kGoldenPrefix, sizeof kGoldenPrefix));
-    // featureBits @224 and reserved0 @228 are u32 LE; reserved1 @232 is u64 LE.
+    // featureBits @224 and reserved0 @228 are u32 LE; maxLeases @232 is u64 LE.
     EXPECT_EQ((std::vector<uint8_t>{0xD4, 0xC3, 0xB2, 0xA1, 0x0D, 0x0C, 0x0B, 0x0A}),
               (std::vector<uint8_t>(buf.begin() + 224, buf.begin() + 232)));
     EXPECT_EQ(buf[232], 0x18); EXPECT_EQ(buf[239], 0x11);
@@ -76,7 +76,12 @@ TEST(NamespaceMessagesRegression, LimitsRoundTripRegression) {
 TEST(NamespaceMessagesRegression, LimitsSizePinnedRegression) {
     EXPECT_EQ(rp::kNamespaceLimitsBytes, 256u);
     EXPECT_EQ(sizeof(rp::NamespaceLimits), 256u);
-    EXPECT_EQ(rp::kNamespaceLimitFieldCount, 29u);
+    EXPECT_EQ(rp::kNamespaceLimitFieldCount, 30u);
+    EXPECT_EQ(rp::kNsLimitFieldMaxLeases, 29u);
+    EXPECT_EQ(rp::limitFieldOffset(29), 232u);
+    EXPECT_EQ(rp::limitFieldWidth(29), 8u);
+    EXPECT_EQ(rp::limitFieldOffset(28), 224u);
+    EXPECT_EQ(rp::limitFieldWidth(28), 4u);
 }
 
 TEST(NamespaceMessagesRegression, DdlRoundTripRegression) {
@@ -84,7 +89,7 @@ TEST(NamespaceMessagesRegression, DdlRoundTripRegression) {
     const Case cases[] = {
         {pc::NamespaceDdlKind::Create,    {0x01, 0x00, 0x00, 0x00}},   // maxTopics only
         {pc::NamespaceDdlKind::SetLimits, {0x00, 0x80, 0x00, 0x10}},   // field 15 and field 28 (featureBits)
-        {pc::NamespaceDdlKind::SetLimits, {0xFF, 0xFF, 0xFF, 0x1F}},   // every field
+        {pc::NamespaceDdlKind::SetLimits, {0xFF, 0xFF, 0xFF, 0x3F}},   // every field (0..29)
         {pc::NamespaceDdlKind::Create,    {0x00, 0x00, 0x00, 0x00}},   // none
     };
     for (const auto& c : cases) {
@@ -105,7 +110,8 @@ TEST(NamespaceMessagesRegression, DdlRoundTripRegression) {
     EXPECT_TRUE(pc::namespaceMaskHas({0x00, 0x80, 0x00, 0x10}, 15));
     EXPECT_TRUE(pc::namespaceMaskHas({0x00, 0x80, 0x00, 0x10}, 28));
     EXPECT_FALSE(pc::namespaceMaskHas({0x00, 0x80, 0x00, 0x10}, 14));
-    EXPECT_FALSE(pc::namespaceMaskHas({0xFF, 0xFF, 0xFF, 0xFF}, 29));
+    EXPECT_TRUE(pc::namespaceMaskHas({0x00, 0x00, 0x00, 0x20}, 29));    // maxLeases
+    EXPECT_FALSE(pc::namespaceMaskHas({0xFF, 0xFF, 0xFF, 0xFF}, 30));
 
     // Encoder refusals: out-of-range kind, reserved mask bits.
     pc::NamespaceDdlRequest bad;
@@ -115,7 +121,7 @@ TEST(NamespaceMessagesRegression, DdlRoundTripRegression) {
     EXPECT_EQ(bad.encode(out.data()), 0u);
     bad.kind = static_cast<pc::NamespaceDdlKind>(0);
     EXPECT_EQ(bad.encode(out.data()), 0u);
-    bad.kind = pc::NamespaceDdlKind::Create; bad.presentMask = {0, 0, 0, 0x20};
+    bad.kind = pc::NamespaceDdlKind::Create; bad.presentMask = {0, 0, 0, 0x40};
     EXPECT_EQ(bad.encode(out.data()), 0u);
 }
 
@@ -140,7 +146,7 @@ TEST(NamespaceMessagesRegression, DdlTruncatedAtEveryOffsetRegression) {
     EXPECT_FALSE(pc::NamespaceDdlRequest::decode(k.data(), k.size()));
     k[kindOff] = 0;
     EXPECT_FALSE(pc::NamespaceDdlRequest::decode(k.data(), k.size()));
-    auto r = full; r[kindOff + 1 + 2 + m.name.size() + 3] = 0x20;
+    auto r = full; r[kindOff + 1 + 2 + m.name.size() + 3] = 0x40;
     EXPECT_FALSE(pc::NamespaceDdlRequest::decode(r.data(), r.size()));
     // ListNamespaces / ListNamespacesResponse: same exhaustive truncation.
     pc::ListNamespaces ln; ln.afterNsId = 5; ln.max = 100;
@@ -334,10 +340,41 @@ TEST(NamespaceUsageRegression, RoundTripRegression) {
     EXPECT_FALSE(pc::NamespaceUsageResponse::decode(extra.data(), extra.size()));
 }
 
+// Lease topics Task 21: bit 29 (maxLeases) is a valid mask bit and round-trips with its value; bit 30 is refused by both
+// the encoder and the decoder.  (The Usage frame stays exactly 29 usage fields: NamespaceUsageFixedSizeRegression.)
+TEST(NamespaceMessagesRegression, MaxLeasesMaskBit29AcceptedBit30RefusedRegression) {
+    pc::NamespaceDdlRequest m;
+    m.sessionId = 1; m.correlationId = 2; m.ext = ext(); m.kind = pc::NamespaceDdlKind::Create; m.name = "acme";
+    m.presentMask = {0, 0, 0, 0x20}; m.limits = distinctLimits(); m.limits.maxLeases = 7;
+    std::vector<uint8_t> b(m.encodedSize());
+    ASSERT_EQ(m.encode(b.data()), b.size());
+    gWire = b;
+    auto d = pc::NamespaceDdlRequest::decode(gWire.data(), gWire.size());
+    ASSERT_TRUE(d);
+    EXPECT_TRUE(pc::namespaceMaskHas(d->presentMask, 29));
+    EXPECT_EQ(d->limits.maxLeases, 7u);
+    m.presentMask = {0, 0, 0, 0x40};
+    EXPECT_EQ(m.encode(b.data()), 0u);
+    m.presentMask = {0, 0, 0, 0x80};
+    EXPECT_EQ(m.encode(b.data()), 0u);
+    const std::size_t kindOff = pc::MessageHeader::ENCODED_SIZE + pc::extEncodedSize(m.ext);
+    for (const uint8_t bad : {uint8_t{0x40}, uint8_t{0x80}}) {
+        auto r = gWire; r[kindOff + 1 + 2 + m.name.size() + 3] = bad;
+        EXPECT_FALSE(pc::NamespaceDdlRequest::decode(r.data(), r.size())) << int(bad);
+    }
+}
+
+TEST(NamespaceUsageRegression, NamespaceUsageFixedSizeRegression) {
+    EXPECT_EQ(pc::kNamespaceUsageFieldCount, 29u);
+    EXPECT_EQ(pc::NamespaceUsageResponse{}.usage.size(), 29u);
+    EXPECT_EQ(pc::NamespaceUsageResponse::encodedSize(), 24u + 3u + 256u + 8u * 29u);
+}
+
 TEST(NamespaceUsageRegression, ShortCapReturnsZeroRegression) {
     pc::NamespaceUsageResponse r;
     const std::size_t sz = pc::NamespaceUsageResponse::encodedSize();
-    EXPECT_EQ(sz, 24u + 3u + rp::kNamespaceLimitsBytes + 8u * 29u);
+    EXPECT_EQ(sz, 24u + 3u + rp::kNamespaceLimitsBytes + 8u * pc::kNamespaceUsageFieldCount);
+    EXPECT_EQ(pc::kNamespaceUsageFieldCount, 29u) << "Usage (85) is an exact-length frame: it must not grow with the limits";
     std::vector<uint8_t> b(sz);
     EXPECT_EQ(r.encode(b.data(), sz - 1), 0u);
     EXPECT_EQ(r.encode(b.data(), sz), sz);
