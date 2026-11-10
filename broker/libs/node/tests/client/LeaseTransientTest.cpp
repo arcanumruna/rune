@@ -770,14 +770,12 @@ TEST(LeaseTransientTrioRegression, FollowerRingResetThenPromotedRegression) {
     constexpr int K = 10;
     LeaseTrio t("lease-tr-fr", [](rune::node::NodeConfig& c) { c.memoryLogRingBytes = kRingBytes; });
     const auto topic = t.defineTransientLease("tl", 1, kLongTtlMs, 1000, kLongTtlMs);
-    // The election takes the most complete in-sync replica, ties to the LOWEST id.  F (restarted below) is the lower-id follower, X the higher one;
-    // the test's client is seeded on X, which is never stopped, so F is the one that wins when the leader dies.
-    const int32_t leader = t.leaderOf(topic, 0);
-    ASSERT_GT(leader, 0);
-    std::vector<int32_t> others;
-    for (int id : {1, 2, 3})
-        if (id != leader) others.push_back(id);
-    const int32_t follower = others[0], keeper = others[1];
+    // F (stopped and restarted below) is the partition's PREFERRED replica: once it is back in the ISR the preferred-leader pass moves the
+    // leadership to it - a deterministic promotion (a failover picks by the controller's position table, which may not know F yet).  The
+    // test's client is seeded on X, which is never stopped.
+    int32_t follower = -1;
+    ASSERT_TRUE(LeaseTrio::until(30s, [&] { return (follower = t.preferredOn(1, topic, 0)) > 0; }));
+    const int32_t keeper = follower == 1 ? 2 : 1;
     auto cfg = catalog_cluster::clientConfigFor(t.nodes(), keeper);
     cfg.ddlTimeoutMs = 60'000;
     auto client = catalog_cluster::connectClient(t.nodes(), cfg);
@@ -801,8 +799,10 @@ TEST(LeaseTransientTrioRegression, FollowerRingResetThenPromotedRegression) {
     ASSERT_TRUE(followerBefore.hasRing);
     t.nodes().stop(follower);
 
-    const auto leaderBefore = t.runtimeOn(leader, topic.id, 0);
-    ASSERT_TRUE(leaderBefore.has && leaderBefore.hasRing);
+    int32_t leader = -1;
+    ASSERT_TRUE(LeaseTrio::until(60s, [&] { leader = t.leaderOf(topic, 0); return leader > 0 && leader != follower; }));
+    LeaseTrio::RuntimeSnap leaderBefore;   // the new leader builds its lease runtime a moment after the election
+    ASSERT_TRUE(LeaseTrio::until(60s, [&] { leaderBefore = t.runtimeOn(leader, topic.id, 0); return leaderBefore.has && leaderBefore.hasRing; }));
     uint64_t counter = 0;
     int rounds = 0;
     while (t.runtimeOn(leader, topic.id, 0).ringStart <= followerBefore.ringEnd + 8 && rounds++ < 200) {   // hard cap
@@ -823,19 +823,8 @@ TEST(LeaseTransientTrioRegression, FollowerRingResetThenPromotedRegression) {
     EXPECT_GE(fol.ringEnd, leaderMoved.ringEnd) << "the follower caught up to the leader's ring end";
     EXPECT_GT(fol.usedBytes, 0u);
 
-    // Promote the restarted follower: kill the leader while it is not that follower (bounded rounds; each other victim is restarted).
-    int32_t cur = leader;
-    for (int round = 0; round < 6 && t.leaderOf(topic, 0) != follower; ++round) {
-        cur = t.leaderOf(topic, 0);
-        ASSERT_GT(cur, 0);
-        ASSERT_NE(cur, follower);
-        const int32_t killed = t.killLeader(topic, 0);
-        ASSERT_EQ(killed, cur);
-        if (t.leaderOf(topic, 0) != follower) {
-            t.restartNode(killed, topic);
-            ASSERT_TRUE(t.awaitIsrSize(topic, 0, 3, 90s));
-        }
-    }
+    // The preferred-leader pass promotes the restarted follower (bounded wait).
+    EXPECT_TRUE(LeaseTrio::until(60s, [&] { return t.leaderOf(topic, 0) == follower; }));
     ASSERT_EQ(t.leaderOf(topic, 0), follower) << "the restarted follower was promoted";
     expectEveryLeaseHeld(*client, lt, g, kLongTtlMs);
     const rc::LeaseResult fresh = opRetry([&] { return lt.grantAndWait(lt3::row("fresh", 7), o); });

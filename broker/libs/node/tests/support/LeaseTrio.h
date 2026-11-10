@@ -209,6 +209,16 @@ public:
             return pa != nullptr ? pa->isr : std::vector<int32_t>{};
         });
     }
+    /// The preferred replica (replicas[0]) of (topic, partition) as running node `viewer` sees it (-1: unknown).
+    int32_t preferredOn(int32_t viewer, const Topic& t, int32_t partition) {
+        BrokerNode& n = c_.node(viewer);
+        return n.onControlThreadForTest([&n, &t, partition]() -> int32_t {
+            const auto* ms = n.metadataServiceForTest();
+            if (ms == nullptr) return -1;
+            const auto* pa = ms->assignment(t.id, partition);
+            return pa != nullptr && !pa->replicas.empty() ? pa->replicas[0] : -1;
+        });
+    }
     /// True when every running node reports `want` in-sync replicas for the partition (bounded).
     bool awaitIsrSize(const Topic& t, int32_t partition, std::size_t want, std::chrono::milliseconds within) {
         return until(within, [&] {
