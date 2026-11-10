@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <memory>
 #include <cstdio>
 #include <cstdlib>
 #include <future>
@@ -527,10 +528,11 @@ struct ConsumerResult { std::map<int64_t, int> deliveries; std::set<int64_t> off
 
 /// A producer that owns its client (own Aeron driver) and its thread: it logs in on whichever broker answers, follows
 /// Redirects, re-logs-in after a restart, and hands its acked offsets back at join.  Shares nothing with the test.
-ProducerResult runProducer(std::stop_token stop, std::array<std::string, 3> channels, std::filesystem::path dir, int32_t topic,
+/// The client is built on the test thread (the thread's lambda owns it): the port allocator is single-threaded, and a
+/// producer and a consumer building theirs at once were handed the same egress port (EADDRINUSE).
+ProducerResult runProducer(std::stop_token stop, std::array<std::string, 3> channels, AuthWireClient& w, int32_t topic,
                            LastAck* lastAck) {
     ProducerResult out;
-    AuthWireClient w(dir);
     std::array<int64_t, 3> sid{};
     std::size_t node = 0;
     while (!stop.stop_requested()) {
@@ -563,9 +565,8 @@ ProducerResult runProducer(std::stop_token stop, std::array<std::string, 3> chan
 /// resubscribes elsewhere when its broker restarts.  `target` (a one-shot hand-off from the test: the last acked offset)
 /// tells it what "everything" is; it returns every offset it saw.
 ConsumerResult runConsumer(std::stop_token stop, std::future<int64_t> target, std::array<std::string, 3> channels,
-                           std::filesystem::path dir, int32_t topic, std::size_t batchBytes) {
+                           AuthWireClient& w, int32_t topic, std::size_t batchBytes) {
     ConsumerResult out;
-    AuthWireClient w(dir);
     std::array<int64_t, 3> sid{};
     std::size_t node = 0;
     int64_t want = -2;   // -2 = not told yet
@@ -659,12 +660,12 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
     // early ASSERT return destroys locals in reverse order, so each jthread is stopped and joined before them.
     std::jthread producer;
     std::jthread consumer;
-    producer = std::jthread([&pOut, &lastAck, ch = channels, prodDir, topic](std::stop_token st) {
-        try { pOut.set_value(runProducer(st, ch, prodDir, topic, &lastAck)); }
+    producer = std::jthread([&pOut, &lastAck, ch = channels, w = std::make_unique<AuthWireClient>(prodDir), topic](std::stop_token st) {
+        try { pOut.set_value(runProducer(st, ch, *w, topic, &lastAck)); }
         catch (...) { pOut.set_exception(std::current_exception()); }
     });
-    consumer = std::jthread([&cOut, ch = channels, consDir, topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
-        try { cOut.set_value(runConsumer(st, std::move(fut), ch, consDir, topic, batchBytes)); }
+    consumer = std::jthread([&cOut, ch = channels, w = std::make_unique<AuthWireClient>(consDir), topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
+        try { cOut.set_value(runConsumer(st, std::move(fut), ch, *w, topic, batchBytes)); }
         catch (...) { cOut.set_exception(std::current_exception()); }
     });
 
@@ -775,12 +776,12 @@ TEST(AuthClusterRegression, RehandshakeWhileWorkersSealIsRaceFreeRegression) {
     LastAck lastAck{0};
     std::jthread producer;
     std::jthread consumer;
-    producer = std::jthread([&pOut, &lastAck, ch = channels, prodDir, topic](std::stop_token st) {
-        try { pOut.set_value(runProducer(st, ch, prodDir, topic, &lastAck)); }
+    producer = std::jthread([&pOut, &lastAck, ch = channels, w = std::make_unique<AuthWireClient>(prodDir), topic](std::stop_token st) {
+        try { pOut.set_value(runProducer(st, ch, *w, topic, &lastAck)); }
         catch (...) { pOut.set_exception(std::current_exception()); }
     });
-    consumer = std::jthread([&cOut, ch = channels, consDir, topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
-        try { cOut.set_value(runConsumer(st, std::move(fut), ch, consDir, topic, batchBytes)); }
+    consumer = std::jthread([&cOut, ch = channels, w = std::make_unique<AuthWireClient>(consDir), topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
+        try { cOut.set_value(runConsumer(st, std::move(fut), ch, *w, topic, batchBytes)); }
         catch (...) { cOut.set_exception(std::current_exception()); }
     });
 
@@ -860,8 +861,9 @@ TEST(AuthClusterRegression, RehandshakeWhileWorkersSealIsRaceFreeRegression) {
 // RehandshakeWhileWorkersSealIsRaceFreeRegression).  Now a new epoch is installed receive-only on every plane first,
 // and the send switch and the Accept / Confirm wait until every plane acknowledged it.
 // Cells: the responder's or the initiator's workers held, on the pair that carries the partition's replication
-// traffic; a hold shorter than the handshake's kAwaitNs (the rekey completes once they release) and a longer one (the
-// initiator abandons the rekey and keeps its link; a second rekey then completes).  Expected in every cell: while the
+// traffic; a hold shorter than the handshake's kAwaitNs (the rekey completes once they release) and a longer one (a
+// held Accept makes the initiator abandon the rekey and keep its link, a held Confirm still completes it; a second rekey
+// then completes on a newer epoch).  Expected in every cell: while the
 // workers are held the initiator does not send under the new epoch, the pair ends on one newer epoch on every plane, no
 // plane drops a frame as UnknownEpoch, and an ack lands afterwards.  Mutation: PeerLinkAgent::absorb_ installing the
 // handshake's keys as given (send-and-receive at once) and sending the frame at once -> red.
@@ -897,12 +899,12 @@ TEST(AuthClusterRegression, RehandshakeWithWorkersSlowToInstallDropsNothingRegre
         auto cFut = cOut.get_future();
         const std::filesystem::path prodDir = t.cluster().clientsDir->path / "rks_prod", consDir = t.cluster().clientsDir->path / "rks_cons";
         LastAck lastAck{0};
-        std::jthread producer([&pOut, &lastAck, ch = channels, prodDir, topic](std::stop_token st) {
-            try { pOut.set_value(runProducer(st, ch, prodDir, topic, &lastAck)); }
+        std::jthread producer([&pOut, &lastAck, ch = channels, w = std::make_unique<AuthWireClient>(prodDir), topic](std::stop_token st) {
+            try { pOut.set_value(runProducer(st, ch, *w, topic, &lastAck)); }
             catch (...) { pOut.set_exception(std::current_exception()); }
         });
-        std::jthread consumer([&cOut, ch = channels, consDir, topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
-            try { cOut.set_value(runConsumer(st, std::move(fut), ch, consDir, topic, batchBytes)); }
+        std::jthread consumer([&cOut, ch = channels, w = std::make_unique<AuthWireClient>(consDir), topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
+            try { cOut.set_value(runConsumer(st, std::move(fut), ch, *w, topic, batchBytes)); }
             catch (...) { cOut.set_exception(std::current_exception()); }
         });
         ASSERT_TRUE(AuthTrio::until(60s, [&] {
@@ -946,16 +948,19 @@ TEST(AuthClusterRegression, RehandshakeWithWorkersSlowToInstallDropsNothingRegre
             std::this_thread::sleep_for(10ms);
         }
         ASSERT_TRUE(AuthTrio::until(60s, [&] { return keysSeen(held) > keysBefore; })) << "the held workers ran the keys";
+        // The first exchange took epoch was + 1 (the responder numbers them).  After a long hold the second one must end
+        // above it: the pair may sit on was + 1 (a held Confirm completed it) while the second rekey is still in flight.
+        uint32_t floor = was;
         if (cell.holdNs > rune::peerlink::PeerHandshake::kAwaitNs) {
-            // The initiator abandoned the rekey (its Accept or Confirm came after kAwaitNs) and kept its link: rekey again.
+            floor = was + 1;
             ASSERT_TRUE(AuthTrio::until(60s, [&] { return t.node(a).forcePeerRekeyForTest(b); })) << "a second rekey starts";
         }
         uint32_t ea = 0, eb = 0;
         ASSERT_TRUE(AuthTrio::until(60s, [&] {
             ea = t.node(a).peerLinksForTest().epochOf[b];
             eb = t.node(b).peerLinksForTest().epochOf[a];
-            return ea > was && ea == eb;
-        })) << a << "<->" << b << ": " << ea << " / " << eb << " (was " << was << ")";
+            return ea > floor && ea == eb;
+        })) << a << "<->" << b << ": " << ea << " / " << eb << " (was " << was << ", floor " << floor << ")";
         ASSERT_TRUE(AuthTrio::until(60s, [&] { return workersOn(a, b, ea) && workersOn(b, a, ea); }))
             << "a worker plane did not reach epoch " << ea;
         const int64_t mark = lastAck.load(std::memory_order_acquire);

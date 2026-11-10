@@ -410,6 +410,12 @@ int Election::canvass(int64_t nowNs)
 // ---------------------------------------------------------------------------
 int Election::nominate(int64_t nowNs)
 {
+    // The candidacy may block after the canvass nominated us (the storage hold engaged later in the same duty cycle,
+    // a withdrawal): never a pre-ballot or a term raise, back to the canvass.
+    if (candidacyBlocks_(nowNs, 0)) {
+        state(ElectionState::Canvass, nowNs, "candidacy blocked while nominating");
+        return 1;
+    }
     // Election.java:734-741: if deadline passed → become candidate
     if (nowNs >= nominationDeadlineNs_) {
         // D29 PreVote (Raft §9.6, a Rune extension): before raising the durable
@@ -473,6 +479,12 @@ int Election::nominate(int64_t nowNs)
 int Election::candidateBallot(int64_t nowNs)
 {
     int workCount = 0;
+    // As in nominate(): a hold or withdrawal engaged during the ballot never leads.  As on a timeout without quorum,
+    // the raised candidate term stays durable: RequestVotes at it are denied, a later nomination proposes a higher one.
+    if (candidacyBlocks_(nowNs, 0)) {
+        state(ElectionState::Canvass, nowNs, "candidacy blocked during the ballot");
+        return 1;
+    }
     // CRITICAL-R3: re-evaluate our own vote — knowledge learned from a peer
     // during the ballot may admit (or exclude) us.
     gateSelfVote_();
