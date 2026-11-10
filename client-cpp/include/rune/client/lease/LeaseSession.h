@@ -44,6 +44,7 @@ enum class LostReason : uint8_t {
     WatchedVanished,
     SessionRefused,
     RevokeRefused,   ///< revoke(): the broker could not be asked to revoke (the topic is closed or the key does not fit); the lease expires after its ttl
+    WatchFailed,     ///< a lease recipe's shared LeaseWatch failed (or was destroyed): the recipe cannot decide ownership any more and gave the lease back
 };
 
 enum class AtRiskEdge : uint8_t { Entered, Cleared };

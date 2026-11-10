@@ -159,7 +159,7 @@ struct Applier {
     LeaseStub*                    stub = nullptr;
     test_support::InvokerGateway* gw   = nullptr;
     std::deque<Unk>               unknown;
-    std::vector<Bytes>            grants, revokes, updates, updateValues;
+    std::vector<Bytes>            grants, grantValues, revokes, updates, updateValues;
     int                           reads = 0;
 
     int16_t apply() {
@@ -168,6 +168,7 @@ struct Applier {
         if (topic != 1 || recs.empty()) return 0;
         LeaseModel& m = stub->parts[0];
         std::vector<uint8_t> trailer, verdict;
+        int16_t              err = 0;
         const auto put64 = [](std::vector<uint8_t>& v, uint64_t x) { for (int i = 0; i < 8; ++i) v.push_back(static_cast<uint8_t>(x >> (8 * i))); };
         for (std::size_t i = 0; i < recs.size(); ++i) {
             const Rec& r  = recs[i];
@@ -177,6 +178,7 @@ struct Applier {
             int64_t out = 0;
             if (op == Op::Put && (r.attrs & 3) == 1) {   // grant (insert intent)
                 grants.push_back(r.key);
+                grantValues.push_back(r.value);
                 bool applied = !m.held(r.key);
                 if (!unknown.empty()) {
                     const Unk u = unknown.front();
@@ -195,6 +197,7 @@ struct Applier {
                 updates.push_back(r.key);
                 updateValues.push_back(r.value);
                 if (m.held(r.key) && m.table.at(r.key).version == version) { (void)m.update(r.key); out = version; }
+                else err = 62;   // LeaseNotFound: the broker no longer knows this (key, version)
             } else if (op == Op::Revoke) {
                 revokes.push_back(r.key);
                 if (m.held(r.key) && m.table.at(r.key).version == version) { (void)m.revoke(r.key); out = version; }
@@ -204,7 +207,7 @@ struct Applier {
         }
         gw->produceLeaseTrailer = trailer;
         gw->produceVerdicts     = verdict;
-        return 0;
+        return err;
     }
 };
 
@@ -827,4 +830,276 @@ TEST(LeaseRecipeRegression, RecipeNoAllocRegression) {
     EXPECT_EQ(allocs, 0L) << "claim / release / host / watch / session allocate nothing in steady state";
     EXPECT_FALSE(m.isOwner());
     (void)e;
+}
+
+// ---- REVIEW (batch Tasks 20/21/23): adversarial probes, uncommitted ----
+
+// A releases (its session entry is freed by the revoke's answer) and B joins in the SAME host.doWork: the session hands B the slot A
+// just freed (first free slot), host.mapRef(slot -> B), then A.pollReleasing() unmaps the slot by number only and erases B's mapping.
+// B's loss is then never routed to B: B stays isOwner() after its lease is gone.
+TEST(LeaseRecipeReviewAdversarialRegression, ReleasedSlotReusedKeepsLossRoutingAdversarialRegression) {
+    RRig r(invokerCfg(5291, 5292));
+    rc::LeaseOwnership a(*r.host, "jobs/a");
+    rc::LeaseOwnership b(*r.host, "jobs/b", r.cb.callbacks());
+    r.start();
+    Done da, db;
+    ASSERT_EQ(a.claim(da.target(), 1), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return da.v.size() == 1; }));
+    ASSERT_TRUE(a.isOwner());
+    // Back to back: A's release and B's claim go out together; both answers land in one round.
+    ASSERT_EQ(a.release(), rc::OpResult::Accepted);
+    ASSERT_EQ(b.claim(db.target(), 2), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return db.v.size() == 1; }));
+    ASSERT_EQ(db.v[0].status, rc::OpStatus::Ok);
+    ASSERT_TRUE(b.isOwner());
+    r.rounds(50);
+    // B's lease ends under it (the broker's expiry).
+    (void)r.model().expire(keyOf("jobs/b", r.session->holderId(), 2));   // A's grant was campaign 1 of the host, B's is 2
+    (void)r.drive([&] { return !r.cb.lost.empty() || r.cb.sessionLost != 0; }, 2000);
+    EXPECT_EQ(r.cb.sessionLost, 0) << "B's onLost was not routed to B: the host's slot map lost B's mapping";
+    EXPECT_EQ(r.cb.lost.size(), 1u) << "B's lost callback";
+    EXPECT_FALSE(b.isOwner()) << "B still believes it owns jobs/b after its lease ended";
+}
+
+// The shared watch fails (here: a name's heap is full, waitersPerName = 2 and two other candidates already wait) while a claim is
+// pending: the recipe ignores Failed, so the claim never completes and its lease stays in the session, kept alive, forever.
+TEST(LeaseRecipeReviewAdversarialRegression, WatchFailedCompletesPendingClaimAdversarialRegression) {
+    RRig r(invokerCfg(5293, 5294), /*names=*/16, /*waiters=*/2);
+    rc::LeaseOwnership m(*r.host, "jobs/w");
+    (void)r.foreign("jobs/w", 1);
+    (void)r.foreign("jobs/w", 2);
+    r.start();
+    Done d;
+    ASSERT_EQ(m.claim(d.target(), 7), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return r.applier.grants.size() == 1; }));
+    ASSERT_TRUE(r.drive([&] { return r.watch->failed(); }, 500)) << "the watch failed (the case under test)";
+    (void)r.drive([&] { return !d.v.empty(); }, 2000);
+    EXPECT_EQ(d.v.size(), 1u) << "a pending claim never completes once the shared watch failed";
+    EXPECT_EQ(r.session->liveCount(), d.v.empty() ? 1u : 0u);
+}
+
+// ---- Batch F fix round: recipe regressions ----
+
+// A2: the shared watch fails (a name heap is full, waitersPerName = 2) while A owns jobs/a and B's claim on jobs/w is joining: both recipes
+// end.  A's lost callback runs once with WatchFailed, B's pending claim completes LeaseWatchFailed, both leases are revoked and freed, and the
+// recipes refuse every later call.
+TEST(LeaseRecipeRegression, WatchFailedEndsOwnerAndWaiterRegression) {
+    RRig r(invokerCfg(5295, 5296), /*names=*/16, /*waiters=*/2);
+    rc::LeaseOwnership a(*r.host, "jobs/a", r.cb.callbacks());
+    rc::LeaseOwnership b(*r.host, "jobs/w");
+    (void)r.foreign("jobs/w", 1);
+    (void)r.foreign("jobs/w", 2);
+    r.start();
+    Done da, db;
+    ASSERT_EQ(a.claim(da.target(), 1), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return da.v.size() == 1; }));
+    ASSERT_TRUE(a.isOwner());
+    ASSERT_EQ(b.claim(db.target(), 2), rc::OpResult::Accepted);   // the third candidate of jobs/w: the heap overflows, the watch fails
+    ASSERT_TRUE(r.drive([&] { return r.watch->failed(); }, 500));
+    ASSERT_TRUE(r.drive([&] { return !db.v.empty() && r.session->liveCount() == 0; }, 2000));
+    ASSERT_EQ(db.v.size(), 1u);
+    EXPECT_EQ(db.v[0].status, rc::OpStatus::DeliveryFailed);
+    EXPECT_EQ(db.v[0].errorCode, static_cast<uint16_t>(rc::ClientErrorCode::LeaseWatchFailed));
+    EXPECT_FALSE(a.isOwner());
+    ASSERT_EQ(r.cb.lost.size(), 1u);
+    EXPECT_EQ(r.cb.lost[0], rc::LostReason::WatchFailed);
+    EXPECT_EQ(r.cb.sessionLost, 0);
+    EXPECT_EQ(r.applier.revokes.size(), 2u) << "both leases were given back";
+    r.rounds(50);
+    EXPECT_EQ(r.cb.lost.size(), 1u) << "the lost callback runs once";
+    EXPECT_FALSE(a.valid());
+    Done again;
+    EXPECT_EQ(a.claim(again.target(), 3), rc::OpResult::InvalidArgument);
+    EXPECT_EQ(b.tryClaim(again.target(), 4), rc::OpResult::InvalidArgument);
+}
+
+// A3: a host destroyed before its recipe gives the recipe's lease back (a fenced revoke), instead of keeping it alive in the session.
+TEST(LeaseRecipeRegression, HostGoneRevokesHeldLeaseRegression) {
+    RRig r(invokerCfg(5297, 5298));
+    rc::LeaseOwnership m(*r.host, "jobs/hg");
+    r.start();
+    Done d;
+    ASSERT_EQ(m.claim(d.target(), 1), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return d.v.size() == 1; }));
+    ASSERT_TRUE(m.isOwner());
+    const Bytes key = keyOf("jobs/hg", r.session->holderId(), 1);
+    ASSERT_TRUE(r.model().held(key));
+    r.fwd.host = nullptr;
+    r.host.reset();   // the host goes first
+    EXPECT_FALSE(m.valid());
+    for (int i = 0; i < 3000 && (r.model().held(key) || r.session->liveCount() != 0); ++i) {   // a round without the host
+        g_now += 20'000;
+        (void)r.stub->feed(0);
+        r.client->doWork();
+        r.gw.pump();
+        r.session->doWork(g_now);
+        r.watch->doWork(g_now);
+    }
+    EXPECT_FALSE(r.model().held(key)) << "the lease was revoked";
+    EXPECT_EQ(r.session->liveCount(), 0u) << "and the session entry is free";
+    ASSERT_EQ(r.applier.revokes.size(), 1u);
+    EXPECT_EQ(r.applier.revokes[0], key);
+}
+
+// A4: release() while the grant is in flight, the grant answered with an unknown outcome that DID land: the recipe reads the key and revokes it.
+TEST(LeaseRecipeRegression, AbandonedUnknownGrantIsReadAndRevokedRegression) {
+    RRig r(invokerCfg(5299, 5300));
+    rc::LeaseOwnership m(*r.host, "jobs/ab");
+    r.start();
+    Done d;
+    r.applier.unknown.push_back(Applier::Unk::Applied);   // the grant lands, its answer is VerdictUnknown
+    ASSERT_EQ(m.claim(d.target(), 1), rc::OpResult::Accepted);
+    ASSERT_EQ(m.release(), rc::OpResult::Accepted);
+    ASSERT_EQ(d.v.size(), 1u);
+    EXPECT_EQ(d.v[0].errorCode, static_cast<uint16_t>(rc::ClientErrorCode::LeaseReleased));
+    const Bytes key = keyOf("jobs/ab", r.session->holderId(), 1);
+    ASSERT_TRUE(r.drive([&] { return r.applier.reads == 1; }));
+    ASSERT_TRUE(r.drive([&] { return !r.applier.revokes.empty(); })) << "the landed grant is revoked";
+    EXPECT_EQ(r.applier.revokes[0], key);
+    ASSERT_TRUE(r.drive([&] { return !r.model().held(key); }));
+    EXPECT_FALSE(m.isOwner());
+}
+
+// A5: a refused call never overwrites the stored row: the re-grant after an unknown outcome carries the row of the campaign in flight.
+TEST(LeaseRecipeRegression, RefusedCallKeepsStoredRowRegression) {
+    RRig r(invokerCfg(5301, 5302));
+    rc::LeaseElection e(*r.host, "leader/rr", 128);
+    r.start();
+    std::array<uint8_t, 36 + kW> rowA{}, rowB{};
+    Row{}.encode(rowA.data());
+    Row{}.encode(rowB.data());
+    rowA[1] = 0xA1;
+    rowB[1] = 0xB2;
+    Done d, d2;
+    r.applier.unknown.push_back(Applier::Unk::NotApplied);
+    ASSERT_EQ(e.campaign(std::span<const uint8_t>(rowA), d.target(), 1), rc::OpResult::Accepted);
+    EXPECT_EQ(e.campaign(std::span<const uint8_t>(rowB), d2.target(), 2), rc::OpResult::InvalidArgument) << "not idle";
+    ASSERT_TRUE(r.drive([&] { return d.v.size() == 1; }));
+    EXPECT_EQ(d.v[0].status, rc::OpStatus::Ok);
+    ASSERT_EQ(r.applier.grantValues.size(), 2u) << "the unknown grant and its re-grant";
+    EXPECT_EQ(r.applier.grantValues[0][1], 0xA1);
+    EXPECT_EQ(r.applier.grantValues[1][1], 0xA1) << "the re-grant carries rowA, not the refused rowB";
+    EXPECT_TRUE(d2.v.empty());
+    // A proclaim that is refused (typed form: not even encoded) leaves the stored row too.
+    EXPECT_EQ(e.campaign(Row{}, d2.target(), 3), rc::OpResult::InvalidArgument) << "an owner is not idle";
+}
+
+// A6: a send that fails transiently (the host's queue has no credit: QueueFull) is retried by host.doWork, not ended.  The first grant is
+// answered with an unknown outcome; the key read that follows cannot be sent (the queue is out of credit), the campaign must not end: it
+// re-grants as soon as the answer of the first grant returned its credit.
+TEST(LeaseRecipeRegression, TransientSendFailureRetriesRegression) {
+    RRig r(invokerCfg(5303, 5304));
+    rc::LeaseOwnership m(*r.host, "jobs/tr");
+    r.start();
+    Done d;
+    r.applier.unknown.push_back(Applier::Unk::NotApplied);
+    ASSERT_EQ(m.claim(d.target(), 1), rc::OpResult::Accepted);
+    rc::Completions& q = r.host->core().queue();
+    const uint32_t   tiny = static_cast<uint32_t>(rc::detail::CompletionRing::completionRecordBytes(0));   // the smallest reservation
+    uint32_t         held = 0;
+    while (held < 5000000 && q.reserve(tiny) == rc::OpResult::Accepted) ++held;
+    ASSERT_GT(held, 0u);
+    ASSERT_EQ(q.reserve(tiny), rc::OpResult::QueueFull) << "no credit is left";
+    ASSERT_TRUE(r.drive([&] { return d.v.size() == 1; }));
+    for (uint32_t i = 0; i < held; ++i) q.unreserve(tiny);
+    EXPECT_EQ(d.v[0].status, rc::OpStatus::Ok) << "the campaign survived the QueueFull";
+    EXPECT_EQ(r.applier.reads, 0) << "the key read could not be sent";
+    EXPECT_EQ(r.applier.grants.size(), 2u);
+    EXPECT_TRUE(m.isOwner());
+}
+
+// A7: campaign numbers are unique per host: the answer of a recipe that is gone never completes a recipe attached later at the same index.
+TEST(LeaseRecipeRegression, StaleAnswerNeverReachesNewRecipeRegression) {
+    RRig r(invokerCfg(5305, 5306));
+    Done da, db;
+    {
+        rc::LeaseOwnership a(*r.host, "jobs/sa");
+        ASSERT_EQ(a.claim(da.target(), 1), rc::OpResult::Accepted);   // the grant is in flight when A goes
+    }
+    ASSERT_EQ(da.v.size(), 1u) << "A's pending claim completed at its destruction";
+    rc::LeaseOwnership b(*r.host, "jobs/sb");   // the same index A had
+    ASSERT_EQ(b.claim(db.target(), 2), rc::OpResult::Accepted);
+    r.start();
+    ASSERT_TRUE(r.drive([&] { return db.v.size() == 1; }));
+    EXPECT_EQ(db.v[0].status, rc::OpStatus::Ok);
+    const Bytes kb = keyOf("jobs/sb", r.session->holderId(), 2);
+    ASSERT_TRUE(r.model().held(kb)) << "B's own grant is campaign 2 of the host";
+    EXPECT_EQ(db.v[0].value, r.model().table.at(kb).version) << "B completed on its own answer, not on A's";
+    EXPECT_TRUE(b.isOwner());
+}
+
+// Matrix cell OwnTryClaim x BackToBack: a second tryClaim issued before the first's answer is refused (not idle): one grant, one completion.
+TEST(LeaseRecipeRegression, TryClaimBackToBackRegression) {
+    RRig r(invokerCfg(5307, 5308));
+    rc::LeaseOwnership m(*r.host, "jobs/b2b");
+    (void)r.foreign("jobs/b2b", 1);
+    r.start();
+    Done d, d2;
+    ASSERT_EQ(m.tryClaim(d.target(), 1), rc::OpResult::Accepted);
+    EXPECT_EQ(m.tryClaim(d2.target(), 2), rc::OpResult::InvalidArgument) << "back to back: the first is still settling";
+    EXPECT_EQ(m.claim(d2.target(), 3), rc::OpResult::InvalidArgument);
+    ASSERT_TRUE(r.drive([&] { return d.v.size() == 1; }));
+    EXPECT_EQ(d.v[0].errorCode, static_cast<uint16_t>(rc::ClientErrorCode::LeaseClaimed));
+    EXPECT_TRUE(d2.v.empty());
+    EXPECT_EQ(r.applier.grants.size(), 1u) << "the refused calls sent nothing";
+    EXPECT_FALSE(m.isOwner());
+}
+
+// Matrix cell ElectCampaign x Zombie: a leader whose lease is at risk (its keepalives are not answered; the key is still the lowest) is
+// suspended (isLeader() == false), and a waiter does NOT become the leader until the leader's key actually ends.
+TEST(LeaseRecipeRegression, ZombieLeaderSuspendsRegression) {
+    RRig r(invokerCfg(5309, 5310));
+    rc::LeaseElection e(*r.host, "leader/zb", 128, r.cb.callbacks());
+    r.start();
+    struct Seen { std::vector<int64_t> versions; };
+    Seen seen;
+    ASSERT_TRUE(e.observe(+[](void* c, int64_t v, std::span<const uint8_t>, std::span<const uint8_t>) { static_cast<Seen*>(c)->versions.push_back(v); }, &seen));
+    Done d;
+    ASSERT_EQ(e.campaign(Row{}, d.target(), 1), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return d.v.size() == 1; }));
+    const int64_t token = e.token();
+    const int64_t vw    = r.foreign("leader/zb", 1);   // the waiter, above the leader
+    r.rounds(40);
+    r.gw.kaAutoOk = false;
+    ASSERT_TRUE(r.drive([&] { g_now += 50 * kMs; return !r.cb.risk.empty(); }, 200));
+    EXPECT_FALSE(e.isLeader()) << "suspended while the lease is at risk";
+    r.rounds(60);
+    ASSERT_TRUE(e.leader().has_value());
+    EXPECT_EQ(e.leader()->first, token) << "the zombie's key is still the lowest: the waiter does not lead";
+    ASSERT_EQ(seen.versions.size(), 1u);
+    EXPECT_EQ(seen.versions[0], token) << "the waiter was not reported as the leader";
+    // The leader's key really ends: only then the waiter leads.
+    (void)r.model().expire(keyOf("leader/zb", r.session->holderId(), 1));
+    ASSERT_TRUE(r.drive([&] { return seen.versions.size() == 2; }));
+    EXPECT_EQ(seen.versions[1], vw);
+    EXPECT_FALSE(e.isLeader());
+    ASSERT_TRUE(r.drive([&] { return !r.cb.lost.empty(); }));
+    EXPECT_EQ(r.cb.lost.size(), 1u);
+}
+
+// Matrix cell ElectProclaim x AroundExpireAfterFold: a proclaim sent just before the leader learns its key expired is answered
+// LeaseNotFound by the broker and changes nothing; the leader then loses the name (lost callback once); a proclaim after that is refused.
+TEST(LeaseRecipeRegression, ProclaimAfterExpiryRegression) {
+    RRig r(invokerCfg(5311, 5312));
+    rc::LeaseElection e(*r.host, "leader/pe", 128, r.cb.callbacks());
+    r.start();
+    Done d, dp, dp2;
+    ASSERT_EQ(e.campaign(Row{}, d.target(), 1), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return d.v.size() == 1; }));
+    ASSERT_TRUE(e.isLeader());
+    const Bytes key = keyOf("leader/pe", r.session->holderId(), 1);
+    (void)r.model().expire(key);                       // the key ended and was folded; the leader has not heard yet
+    rc::Completions cq(*r.client);
+    std::vector<rc::Completion> got;
+    ASSERT_EQ(e.proclaim(Row{}, cq, 5), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { (void)cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) { got.push_back(c); }); return got.size() == 1; }));
+    EXPECT_NE(got[0].status, rc::OpStatus::Ok) << "the broker no longer knows the lease";
+    EXPECT_EQ(got[0].op, rc::OpKind::LeaseUpdate);
+    ASSERT_TRUE(r.drive([&] { return !r.cb.lost.empty(); }));
+    EXPECT_EQ(r.cb.lost.size(), 1u);
+    EXPECT_FALSE(e.isLeader());
+    EXPECT_EQ(e.proclaim(Row{}, cq, 6), rc::OpResult::InvalidArgument) << "no longer the leader";
+    r.rounds(40);
+    EXPECT_EQ(r.cb.lost.size(), 1u);
+    (void)dp; (void)dp2;
 }

@@ -88,8 +88,8 @@ void LeaseRecipeHostCore::mapRef(LeaseRef ref, int idx) noexcept {
     if (ref.slot < slotMapSize_) slotMap_[ref.slot] = static_cast<int16_t>(idx);
 }
 
-void LeaseRecipeHostCore::unmapRef(LeaseRef ref) noexcept {
-    if (ref.slot < slotMapSize_) slotMap_[ref.slot] = -1;
+void LeaseRecipeHostCore::unmapRef(LeaseRef ref, int idx) noexcept {
+    if (ref.slot < slotMapSize_ && slotMap_[ref.slot] == static_cast<int16_t>(idx)) slotMap_[ref.slot] = -1;
 }
 
 bool LeaseRecipeHostCore::onLost(LeaseRef ref, LostReason reason) {
@@ -119,6 +119,10 @@ int LeaseRecipeHostCore::doWork(int64_t /*nowNs*/) {
     if (releasing_ != 0) {   // the revokes the session finished: the entry is gone from the session
         for (uint32_t i = 0; i < capacity_ && releasing_ != 0; ++i)
             if (table_[i] != nullptr && table_[i]->releasing()) { table_[i]->pollReleasing(); ++n; }
+    }
+    if (retrying_ != 0) {   // the grants that could not be sent: try again
+        for (uint32_t i = 0; i < capacity_ && retrying_ != 0; ++i)
+            if (table_[i] != nullptr && table_[i]->retrying()) { table_[i]->pollRetrying(); ++n; }
     }
     return n;
 }
@@ -155,10 +159,12 @@ LeaseRecipeCore::~LeaseRecipeCore() {
     int64_t  version = 0;
     if (refOf_(ref, version)) {   // a lease still held leaves the session with a fenced revoke (best effort)
         (void)host_->session().revoke(ref);
-        host_->unmapRef(ref);
+        host_->unmapRef(ref, hostIdx_);
     } else if (const auto* r = std::get_if<Releasing>(&st_)) {
-        host_->unmapRef(r->ref);
+        host_->unmapRef(r->ref, hostIdx_);
         host_->noteReleasing(-1);
+    } else if (std::holds_alternative<Retrying>(st_)) {
+        host_->noteRetrying(-1);
     }
     st_ = Idle{};
     if (pend_.active) complete_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseReleased), -1);
@@ -167,6 +173,11 @@ LeaseRecipeCore::~LeaseRecipeCore() {
 
 void LeaseRecipeCore::hostGone() noexcept {
     if (watch_ != nullptr && nameId_ >= 0) (void)watch_->unbindName(nameId_, this);
+    // Runs inside the host's destructor: the host (and its session) are still valid.  A lease still held is given back (best effort; the
+    // slot map goes with the host, so nothing is unmapped).
+    LeaseRef ref;
+    int64_t  version = 0;
+    if (host_ != nullptr && refOf_(ref, version)) (void)host_->session().revoke(ref);
     if (pend_.active) complete_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseReleased), -1);
     host_    = nullptr;
     hostIdx_ = -1;
@@ -176,8 +187,44 @@ void LeaseRecipeCore::hostGone() noexcept {
 
 void LeaseRecipeCore::onWatchGone(void* ctx, LeaseWatchBase* /*watch*/) {
     auto* rc = static_cast<LeaseRecipeCore*>(ctx);
+    rc->endForWatch_();
     rc->watch_ = nullptr;
-    rc->valid_ = false;
+}
+
+/// The shared watch failed (terminally) or is being destroyed: a recipe cannot decide ownership without it, so it ends whatever it holds.
+void LeaseRecipeCore::endForWatch_() {
+    constexpr uint16_t kCode = static_cast<uint16_t>(ClientErrorCode::LeaseWatchFailed);
+    valid_ = false;
+    if (host_ == nullptr) {   // the host is gone (hostGone() ran): nothing is held; only a pending op can remain
+        complete_(OpStatus::DeliveryFailed, kCode, -1);
+        return;
+    }
+    if (std::holds_alternative<Granting>(st_) || std::holds_alternative<Reading>(st_)) {
+        st_ = Abandoned{campaignNo_};   // the answer in flight is cleaned up when it arrives
+        complete_(OpStatus::DeliveryFailed, kCode, -1);
+        return;
+    }
+    if (std::holds_alternative<Retrying>(st_)) {   // nothing in flight, nothing held
+        st_ = Idle{};
+        host_->noteRetrying(-1);
+        complete_(OpStatus::DeliveryFailed, kCode, -1);
+        return;
+    }
+    LeaseRef ref;
+    int64_t  version = 0;
+    if (!refOf_(ref, version)) return;   // Idle / Releasing / Abandoned: unchanged
+    const bool held = std::holds_alternative<Owner>(st_) || (std::holds_alternative<Suspended>(st_) && std::get<Suspended>(st_).wasOwner);
+    const OpResult r = host_->session().revoke(ref);
+    if (!refOf_(ref, version)) return;   // the session's refused-revoke callback already ended this recipe (onLost)
+    if (r == OpResult::Accepted) {
+        st_ = Releasing{ref};
+        host_->noteReleasing(+1);
+    } else {
+        host_->unmapRef(ref, hostIdx_);
+        st_ = Idle{};
+    }
+    complete_(OpStatus::DeliveryFailed, kCode, -1);
+    if (held && cb_.lost != nullptr) cb_.lost(cb_.ctx, LostReason::WatchFailed);
 }
 
 bool LeaseRecipeCore::refOf_(LeaseRef& ref, int64_t& version) const noexcept {
@@ -218,7 +265,7 @@ void LeaseRecipeCore::buildKey_(uint32_t campaignNo) {
 }
 
 OpResult LeaseRecipeCore::sendGrant_(int64_t& sentNs) {
-    const uint32_t no = campaignNo_ + 1;
+    const uint32_t no = host_->nextCampaignNo();   // unique per host
     buildKey_(no);
     LeaseOptions o;
     o.holder = host_->holderId();
@@ -238,7 +285,7 @@ OpResult LeaseRecipeCore::sendGrant_(int64_t& sentNs) {
 }
 
 OpResult LeaseRecipeCore::claim(Mode mode, std::span<const uint8_t> row, CompletionTarget target, Token token) {
-    if (row.size() > row_.size()) return OpResult::InvalidArgument;
+    if (!acceptsClaim() || row.size() > row_.size()) return OpResult::InvalidArgument;   // a refused call must not touch the stored row
     if (!row.empty()) std::memmove(row_.data(), row.data(), row.size());
     return claimStored(mode, row.size(), target, token);
 }
@@ -304,8 +351,16 @@ void LeaseRecipeCore::onCompletion(uint32_t tag, uint32_t no, const Completion& 
             return;
         }
         if (const auto* a = std::get_if<Abandoned>(&st_); a != nullptr && a->campaignNo == no) {
-            st_ = Idle{};
-            if (c.status == OpStatus::Ok) bestEffortRevoke_(c.value);   // granted after the caller let go: give it back
+            if (c.status == OpStatus::Ok) {
+                st_ = Idle{};
+                bestEffortRevoke_(c.value);   // granted after the caller let go: give it back
+            } else if (unknownOutcome(c.status)) {   // it may have landed: read the key; the read's answer revokes it when it is ours
+                const OpResult r = host_->topic().get(std::span<const uint8_t>(key_, keyLen_), -1, CompletionTarget(host_->queue()),
+                                                      LeaseRecipeHostCore::tokenOf(hostIdx_, LeaseRecipeHostCore::kTagRead, no));
+                if (r != OpResult::Accepted) st_ = Idle{};
+            } else {
+                st_ = Idle{};
+            }
         }
         return;
     }
@@ -337,7 +392,31 @@ void LeaseRecipeCore::startRead_(OpStatus unknown, uint16_t code, int64_t sentNs
     st_ = Reading{campaignNo_, sentNs, unknown, code};
     const OpResult r = host_->topic().get(std::span<const uint8_t>(key_, keyLen_), -1, CompletionTarget(host_->queue()),
                                           LeaseRecipeHostCore::tokenOf(hostIdx_, LeaseRecipeHostCore::kTagRead, campaignNo_));
-    if (r != OpResult::Accepted) regrant_(unknown, code);
+    if (r != OpResult::Accepted) failSend_(r, unknown, code);
+}
+
+/// A (re-)grant or key read that could not be sent.  Transient (BackPressured / QueueFull): Retrying, host.doWork re-sends the grant.
+/// Anything else: the campaign ends.
+void LeaseRecipeCore::failSend_(OpResult r, OpStatus unknown, uint16_t code) {
+    if (r == OpResult::BackPressured || r == OpResult::QueueFull) {
+        st_ = Retrying{unknown, code};
+        host_->noteRetrying(+1);
+        return;
+    }
+    st_ = Idle{};
+    complete_(OpStatus::DeliveryFailed, 0, -1);
+}
+
+void LeaseRecipeCore::pollRetrying() {
+    const auto* rt = std::get_if<Retrying>(&st_);
+    if (rt == nullptr) return;
+    int64_t sentNs = 0;
+    const OpResult r = sendGrant_(sentNs);   // nothing was sent: this does not count against kMaxRegrants
+    if (r == OpResult::BackPressured || r == OpResult::QueueFull) return;
+    host_->noteRetrying(-1);
+    if (r == OpResult::Accepted) { st_ = Granting{campaignNo_, sentNs}; return; }
+    st_ = Idle{};
+    complete_(OpStatus::DeliveryFailed, 0, -1);
 }
 
 void LeaseRecipeCore::regrant_(OpStatus unknown, uint16_t code) {
@@ -347,11 +426,7 @@ void LeaseRecipeCore::regrant_(OpStatus unknown, uint16_t code) {
         return;
     }
     int64_t sentNs = 0;
-    if (sendGrant_(sentNs) != OpResult::Accepted) {
-        st_ = Idle{};
-        complete_(OpStatus::DeliveryFailed, 0, -1);
-        return;
-    }
+    if (const OpResult r = sendGrant_(sentNs); r != OpResult::Accepted) { failSend_(r, unknown, code); return; }
     st_ = Granting{campaignNo_, sentNs};
 }
 
@@ -409,7 +484,7 @@ void LeaseRecipeCore::becomeOwner_(int64_t version, LeaseRef ref) {
 
 void LeaseRecipeCore::onWatchEvent(void* ctx, const LeaseEvent& ev) {
     auto* rc = static_cast<LeaseRecipeCore*>(ctx);
-    if (ev.kind == LeaseEventKind::Failed) return;
+    if (ev.kind == LeaseEventKind::Failed) { rc->endForWatch_(); return; }
     if (ev.kind == LeaseEventKind::Ready) {
         rc->observeCheck_(&ev);
         rc->settle_();
@@ -440,14 +515,14 @@ void LeaseRecipeCore::onLost(LostReason reason) {
     int64_t  version = 0;
     if (refOf_(ref, version)) {
         const bool held = std::holds_alternative<Owner>(st_) || std::holds_alternative<Suspended>(st_);
-        host_->unmapRef(ref);
+        host_->unmapRef(ref, hostIdx_);
         st_ = Idle{};
         complete_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseLost), -1);
         if (held && cb_.lost != nullptr) cb_.lost(cb_.ctx, reason);
         return;
     }
     if (const auto* r = std::get_if<Releasing>(&st_)) {   // the revoke's end, not a loss
-        host_->unmapRef(r->ref);
+        host_->unmapRef(r->ref, hostIdx_);
         host_->noteReleasing(-1);
         st_ = Idle{};
     }
@@ -476,12 +551,18 @@ OpResult LeaseRecipeCore::release() {
         complete_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseReleased), -1);
         return OpResult::Accepted;
     }
+    if (std::holds_alternative<Retrying>(st_)) {   // nothing in flight, nothing held
+        st_ = Idle{};
+        host_->noteRetrying(-1);
+        complete_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseReleased), -1);
+        return OpResult::Accepted;
+    }
     LeaseRef ref;
     int64_t  version = 0;
     if (!refOf_(ref, version)) return OpResult::InvalidArgument;   // idle, already releasing or abandoned
     const OpResult r = host_->session().revoke(ref);
     if (r != OpResult::Accepted) {   // the session no longer knows the lease
-        host_->unmapRef(ref);
+        host_->unmapRef(ref, hostIdx_);
         st_ = Idle{};
         complete_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseReleased), -1);
         return r;
@@ -495,13 +576,13 @@ OpResult LeaseRecipeCore::release() {
 void LeaseRecipeCore::pollReleasing() {
     const auto* r = std::get_if<Releasing>(&st_);
     if (r == nullptr || host_->session().stateOf(r->ref) != LeaseEntryState::Free) return;
-    host_->unmapRef(r->ref);
+    host_->unmapRef(r->ref, hostIdx_);
     host_->noteReleasing(-1);
     st_ = Idle{};
 }
 
 OpResult LeaseRecipeCore::proclaim(std::span<const uint8_t> row, CompletionTarget target, Token token) {
-    if (row.size() > row_.size()) return OpResult::InvalidArgument;
+    if (!acceptsProclaim() || row.size() > row_.size()) return OpResult::InvalidArgument;
     if (!row.empty()) std::memmove(row_.data(), row.data(), row.size());
     return proclaimStored(row.size(), target, token);
 }

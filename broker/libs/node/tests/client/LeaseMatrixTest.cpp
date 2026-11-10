@@ -299,7 +299,7 @@ INSTANTIATE_TEST_SUITE_P(Cells, LeaseMatrixBroker, testing::ValuesIn(cells()), c
 // the cell's exact scenario (Where::Mapped; the unit and worker layers pin the states a real client cannot freeze).
 // ============================================================================================================================
 namespace {
-enum class Where : uint8_t { OneNode, Trio, Mapped };
+enum class Where : uint8_t { OneNode, Trio, Mapped, Client };   // Client: a client unit test (client-cpp/tests/lease/LeaseRecipeTest.cpp)
 struct Cov { Op op; Timing timing; Where where; const char* test; };
 constexpr Cov kCoverage[] = {
     {Op::Grant, Timing::BackToBack, Where::OneNode, "LeaseMatrixTiming"},
@@ -381,6 +381,18 @@ constexpr Cov kCoverage[] = {
     {Op::AlterBounds, Timing::AlterMidLife, Where::OneNode, "LeaseMatrixTiming"},
     {Op::AlterCheckpoint, Timing::AlterMidLife, Where::OneNode, "LeaseMatrixTiming"},
     {Op::DropTopic, Timing::DropWithParked, Where::OneNode, "LeaseMatrixTiming"},
+    // Task 20 (the recipes): the client-side states a real broker cannot freeze run on the client unit rig (LeaseRecipeTest.cpp); the failover
+    // cells on the trio; the expiry cell on the 1-node broker.
+    {Op::OwnClaim, Timing::LeaderChangeFolded, Where::Trio, "LeaseRecipeTrioRegression.LeaderChangeFoldedRegression"},
+    {Op::OwnClaim, Timing::KnownOldDuplicate, Where::Client, "LeaseRecipeRegression.VerdictUnknownAdoptOrRecampaignRegression"},
+    {Op::OwnTryClaim, Timing::BackToBack, Where::Client, "LeaseRecipeRegression.TryClaimBackToBackRegression"},
+    {Op::OwnRelease, Timing::AroundExpireAfterFold, Where::Mapped, "LeaseRecipeBrokerRegression.HolderExpiresNextWaiterOwnsRegression"},
+    {Op::ElectCampaign, Timing::Zombie, Where::Client, "LeaseRecipeRegression.ZombieLeaderSuspendsRegression"},
+    {Op::ElectCampaign, Timing::KnownOldDuplicate, Where::Client, "LeaseRecipeRegression.RecampaignAlwaysNewKeyRegression"},
+    {Op::ElectCampaign, Timing::AtRiskPendingUnsent, Where::Client, "LeaseRecipeRegression.AtRiskSuspendsResumesRegression"},
+    {Op::ElectProclaim, Timing::AroundExpireAfterFold, Where::Client, "LeaseRecipeRegression.ProclaimAfterExpiryRegression"},
+    {Op::ElectResign, Timing::BackToBack, Where::Client, "LeaseRecipeReviewAdversarialRegression.ReleasedSlotReusedKeepsLossRoutingAdversarialRegression"},
+    {Op::ElectObserve, Timing::LeaderChangeFolded, Where::Trio, "LeaseRecipeTrioRegression.LeaderChangeFoldedRegression"},
 };
 }  // namespace
 

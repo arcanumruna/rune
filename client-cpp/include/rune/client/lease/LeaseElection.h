@@ -25,12 +25,14 @@ public:
     /// The typed form: `row` is a generated row of the topic (encodedSize() / encode()).
     template <class T>
     [[nodiscard]] OpResult campaign(const T& row, CompletionTarget target, Token token) {
+        if (!core_.acceptsClaim()) return OpResult::InvalidArgument;   // before encoding: a refused call must not touch the stored row
         const std::size_t n = encode_(row);
         return n == 0 ? OpResult::InvalidArgument : core_.claimStored(detail::LeaseRecipeCore::Mode::Claim, n, target, token);
     }
     [[nodiscard]] OpResult proclaim(std::span<const uint8_t> row, CompletionTarget target, Token token) { return core_.proclaim(row, target, token); }
     template <class T>
     [[nodiscard]] OpResult proclaim(const T& row, CompletionTarget target, Token token) {
+        if (!core_.acceptsProclaim()) return OpResult::InvalidArgument;
         const std::size_t n = encode_(row);
         return n == 0 ? OpResult::InvalidArgument : core_.proclaimStored(n, target, token);
     }

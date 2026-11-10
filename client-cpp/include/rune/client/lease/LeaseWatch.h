@@ -21,9 +21,9 @@
 // Granted; Updated / Revoked / Expired for an unknown (k, v) are ignored.  A partition whose subscription breaks (or whose scan is answered
 // with a transient non-retriable error) is re-run, after a per-partition exponential backoff (1 ms doubling to a 1 s cap, reset when the
 // partition reaches Live); a DEFINITIVE answer (NotAuthorized, UnknownTopic, InvalidRequest, or the duty thread refusing the request as
-// malformed) fails the watch (failed(), one Failed event): its live entries are marked unconfirmed, the partition is rescanned and re-subscribed, and when its
-// scan ends every entry still unconfirmed is emitted Vanished and removed.  isReady() STAYS true during a re-run (a recipe keeps seeing the
-// old set until the rescan settles; spec 3.3); Ready is emitted once.
+// malformed), or a full live set or a full name heap, FAILS the watch TERMINALLY: every subscription is cancelled, failed() is true, one Failed
+// event is emitted, isReady() is false and doWork does nothing afterwards; the watch must be recreated.  (Transient breaks above re-run as written;
+// Ready is emitted once.)  A lease recipe bound to a name ends whatever it holds on the Failed event (ClientErrorCode::LeaseWatchFailed).
 //
 // Memory.  Everything is allocated in the constructor (live set, name heaps, page bounds, handoff lists, record ring); doWork allocates
 // nothing.  Only (re)subscribing builds a std::function (cold, once per subscription).  No locks, no atomics, no virtual calls.

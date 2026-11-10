@@ -982,6 +982,34 @@ TEST(LeaseJudgeWorkerRegression, LeaseCountChargedWhileLeadingRegression) {
     EXPECT_EQ(r.vs->nsLeases(kLeaseNsSlot), 0u) << "and a stale instance never charges the slot again";
 }
 
+// Batch F (C3): freeing a namespace slot zeroes its lease count AT ONCE, while the key index of the dropped namespace still holds
+// charged rows, and the slot placed for another namespace starts from zero and is never charged by the stale instance.  Mutation:
+// skip the nsLeases_ reset in WorkerViewSet::onNsSlotFreed -> the freed slot still reads the old count, red.
+TEST(LeaseJudgeWorkerRegression, NsLeasesSlotFreedResetsRegression) {
+    constexpr uint16_t kSlot = 3;
+    constexpr uint32_t kOldNs = 91;
+    constexpr uint32_t kNewNs = 92;
+    VerdictRig r(false);
+    r.worker->applyNsSlotAssignDirect(kSlot, kOldNs, rune::protocol::NamespaceLimits{});
+    r.log->setNsTag(kOldNs, kSlot);
+    r.createLeaseTopic(1000, std::nullopt);
+    r.passes(30);
+    r.demote();
+    r.replicate({VerdictRig::rawBatch({grantRec(1, "a1"), grantRec(2, "a2")})});
+    r.promote();
+    r.passes(30);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(30);
+    ASSERT_EQ(r.vs->nsLeases(kSlot), 2u) << "precondition: the old namespace is charged";
+
+    r.worker->applyNsSlotReleaseDirect(kSlot, kOldNs);
+    EXPECT_EQ(r.vs->nsLeases(kSlot), 0u) << "the freed slot reads zero while the key index is still present";
+    r.worker->applyNsSlotAssignDirect(kSlot, kNewNs, rune::protocol::NamespaceLimits{});
+    EXPECT_EQ(r.vs->nsLeases(kSlot), 0u) << "the slot placed for another namespace starts from zero";
+    r.passes(30);
+    EXPECT_EQ(r.vs->nsLeases(kSlot), 0u) << "and the stale instance of the old namespace never charges it";
+}
+
 // Item 4: AddField is a SchemaUpdate plus a FilterSchema; whichever arrives first, the index is rebuilt ONCE.
 TEST(LeaseJudgeWorkerRegression, LeaseSchemaOpsRebuildOnceRegression) {
     for (const bool updateFirst : {true, false}) {

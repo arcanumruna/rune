@@ -19,8 +19,9 @@
 //
 // The key.  Every grant a recipe sends has a NEW key:  name + '/' + <holder id, 16 lowercase hex> + '-' + <campaign number, 8 lowercase hex>,
 // zero-padded to the topic's key width N (a string(N) column puts exactly N bytes, zero padded, on the wire).  The holder id is the session's
-// holderId() (a 64-bit random id drawn once); the campaign number counts EVERY grant the recipe sends (claim, tryClaim, campaign and the re-grant
-// after an unknown outcome), starting at 1.  A re-campaign after a release or a lost lease therefore never meets its old key (Herald F1).
+// holderId() (a 64-bit random id drawn once); the campaign number is drawn from the HOST's counter and counts EVERY grant any of its recipes sends (claim, tryClaim, campaign and the
+// re-grant after an unknown outcome), starting at 1: a number is unique per host, so the answer of a recipe that is gone never reaches a recipe
+// attached later at the same index.  A re-campaign after a release or a lost lease therefore never meets its old key (Herald F1).
 //
 // Completions.  claim / tryClaim / campaign take a CompletionTarget and a token and complete it exactly once with OpKind::LeaseCampaign: Ok
 // (value = the lease_version, the fencing token) when the recipe owns the name; DeliveryFailed with ClientErrorCode::LeaseClaimed (tryClaim, the
@@ -33,6 +34,14 @@
 // Unknown grant outcomes.  A grant answered VerdictUnknown, StoredIdUnknown, DeliveryFailed, Timeout or SessionLost may have been applied.  The
 // recipe reads its key from the lease view: live with lease_holder == its holder id -> adopted at that version (no second grant); anything else
 // -> a new grant with the next campaign number.  At most kMaxRegrants unknown outcomes in a row, then the campaign completes with the last status.
+// A grant that cannot be SENT (BackPressured / QueueFull) is retried by host.doWork until it can; it does not count as an unknown outcome.
+//
+// Ending.  release() on a campaign whose grant / read is in flight abandons it; the recipe cleans up the answer (an unknown grant outcome is read
+// and revoked when it landed).  DESTROYING a recipe (or its host) while the grant is in flight does not: its lease then ends at its TTL, like a
+// crashed client.  A recipe holding a lease gives it back (a fenced revoke) when it or its host is destroyed.  When the shared LeaseWatch fails
+// (terminally, see LeaseWatch.h) or is destroyed, every recipe bound to it ends: a pending claim completes DeliveryFailed +
+// ClientErrorCode::LeaseWatchFailed, a held lease is revoked and its `lost` callback runs once with LostReason::WatchFailed, and the recipe is
+// invalid() from then on (recreate the watch and the recipes).
 #pragma once
 
 #include <rune/client/Client.h>
@@ -91,6 +100,9 @@ public:
     [[nodiscard]] OpResult proclaim(std::span<const uint8_t> row, CompletionTarget target, Token token);
     [[nodiscard]] OpResult proclaimStored(std::size_t rowLen, CompletionTarget target, Token token);
     [[nodiscard]] std::span<uint8_t> rowBuffer() noexcept { return {row_.data(), row_.size()}; }
+    /// What the front ends check BEFORE they encode a row into rowBuffer(): a refused call must never overwrite the stored row.
+    [[nodiscard]] bool acceptsClaim() const noexcept { return valid_ && std::holds_alternative<Idle>(st_); }
+    [[nodiscard]] bool acceptsProclaim() const noexcept { return valid_ && std::holds_alternative<Owner>(st_); }
     [[nodiscard]] bool    isOwner() const noexcept { return std::holds_alternative<Owner>(st_); }
     [[nodiscard]] int64_t token() const noexcept { const auto* o = std::get_if<Owner>(&st_); return o != nullptr ? o->version : 0; }
     [[nodiscard]] std::optional<std::pair<int64_t, std::span<const uint8_t>>> leader() const noexcept;
@@ -108,6 +120,8 @@ public:
     void onCompletion(uint32_t tag, uint32_t campaignNo, const Completion& c, std::span<const uint8_t> payload);
     [[nodiscard]] bool releasing() const noexcept { return std::holds_alternative<Releasing>(st_); }
     void pollReleasing();
+    [[nodiscard]] bool retrying() const noexcept { return std::holds_alternative<Retrying>(st_); }
+    void pollRetrying();
     static void onWatchEvent(void* ctx, const LeaseEvent& ev);
     static void onWatchGone(void* ctx, LeaseWatchBase* watch);
     void hostGone() noexcept;
@@ -129,7 +143,8 @@ private:
     struct Suspended { int64_t version = 0; LeaseRef ref{}; bool wasOwner = false; };   ///< at risk: not an owner until Cleared
     struct Releasing { LeaseRef ref{}; };                                         ///< the session's fenced revoke is on its way
     struct Abandoned { uint32_t campaignNo = 0; };                                ///< released while the grant / read was in flight: clean up its answer
-    using State = std::variant<Idle, Granting, Reading, Joining, Waiting, Owner, Suspended, Releasing, Abandoned>;
+    struct Retrying { OpStatus unknown = OpStatus::Timeout; uint16_t unknownCode = 0; };   ///< the (re-)grant could not be sent (BackPressured / QueueFull): host.doWork re-sends it
+    using State = std::variant<Idle, Granting, Reading, Joining, Waiting, Owner, Suspended, Releasing, Abandoned, Retrying>;
 
     struct Pending {   ///< the campaign the caller waits for
         bool           active = false;
@@ -143,6 +158,8 @@ private:
     void complete_(OpStatus st, uint16_t err, int64_t value);
     void startRead_(OpStatus unknown, uint16_t code, int64_t sentNs);
     void regrant_(OpStatus unknown, uint16_t code);
+    void endForWatch_();
+    void failSend_(OpResult r, OpStatus unknown, uint16_t code);
     void join_(int64_t version, uint64_t ttlMs, int64_t sentNs);
     void settle_();
     void evaluate_(int64_t version, LeaseRef ref);
@@ -207,11 +224,15 @@ public:
     [[nodiscard]] int attach(LeaseRecipeCore* rc) noexcept;
     void detach(int idx) noexcept;
     void mapRef(LeaseRef ref, int idx) noexcept;
-    void unmapRef(LeaseRef ref) noexcept;
+    /// Clears the slot's mapping ONLY when `idx` still owns it (a slot the session reused for another recipe is not ours to clear).
+    void unmapRef(LeaseRef ref, int idx) noexcept;
     [[nodiscard]] static Token tokenOf(int idx, uint32_t tag, uint32_t campaignNo) noexcept {
         return (uint64_t{static_cast<uint32_t>(idx)} << 36) | (uint64_t{tag} << 32) | campaignNo;
     }
     void noteReleasing(int delta) noexcept { releasing_ = static_cast<uint32_t>(static_cast<int64_t>(releasing_) + delta); }
+    void noteRetrying(int delta) noexcept { retrying_ = static_cast<uint32_t>(static_cast<int64_t>(retrying_) + delta); }
+    /// The next campaign number: unique per host (every recipe's grants draw from it).
+    [[nodiscard]] uint32_t nextCampaignNo() noexcept { return ++nextCampaign_; }
 
 private:
     static CompletionsConfig queueConfig_(uint32_t capacity, uint32_t viewRowLen);
@@ -226,6 +247,8 @@ private:
     uint32_t          slotMapSize_;
     uint32_t          count_ = 0;
     uint32_t          releasing_ = 0;
+    uint32_t          retrying_ = 0;
+    uint32_t          nextCampaign_ = 0;
     bool              usable_ = false;
     Completions       cq_;
 };

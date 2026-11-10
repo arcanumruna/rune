@@ -1,6 +1,6 @@
 // LeaseMatrixUnitTest.cpp - lease topics Task 17a: the interaction matrix on the in-process lease worker (spec §21, plan "Interaction matrix").
 //
-//   LeaseMatrixRegression.MatrixCountRegression        pins 198 / 48 / 150 / 89 / 239 over all ops (and the implemented-only counts)
+//   LeaseMatrixRegression.MatrixCountRegression        pins 198 / 55 / 143 / 89 / 232 over all ops (and the implemented-only counts)
 //   LeaseMatrixUnitRegression.SequentialCellRegression  one TEST_P instance per applicable sequential cell of an entity the single-topic
 //                                                       rig can host (SameKeyVer, StaleVer, OtherKeySamePart, UserView) whose op is
 //                                                       implemented.  Each cell asserts the op's outcome AND that every other lease row,
@@ -42,16 +42,20 @@ inline constexpr MappedTiming kMappedTimings[] = {
 TEST(LeaseMatrixRegression, MatrixCountRegression) {
     const Counts all = countCells(false);
     EXPECT_EQ(all.sequential, 198u);
-    EXPECT_EQ(all.na, 48u);
-    EXPECT_EQ(all.applicable, 150u);
+    EXPECT_EQ(all.na, 55u) << "48 + the 7 recipe ops x OtherPart (a recipe needs a lease topic of ONE partition, spec 12.3)";
+    EXPECT_EQ(all.applicable, 143u);
     EXPECT_EQ(all.timing, 89u);
-    EXPECT_EQ(all.executed, 239u);
-    const Counts impl = countCells(true);   // Own* / Elect* are Task 20's: 38 sequential and 10 timing cells wait for it
-    EXPECT_EQ(impl.sequential, 15u * 9u);
-    EXPECT_EQ(impl.applicable, 112u);
-    EXPECT_EQ(impl.na, 135u - 112u);
-    EXPECT_EQ(impl.timing, 79u);
-    EXPECT_EQ(impl.executed, 191u);
+    EXPECT_EQ(all.executed, 232u);
+    const Counts impl = countCells(true);   // Task 20 built the Own* / Elect* ops: every op is implemented
+    EXPECT_EQ(impl.sequential, all.sequential);
+    EXPECT_EQ(impl.applicable, all.applicable);
+    EXPECT_EQ(impl.na, all.na);
+    EXPECT_EQ(impl.timing, all.timing);
+    EXPECT_EQ(impl.executed, all.executed);
+    for (std::size_t oi = 0; oi < kOps; ++oi) EXPECT_TRUE(implemented(Op(oi))) << name(Op(oi));
+    EXPECT_EQ(expect(Op::OwnTryClaim, Entity::SameKeyVer, Timing::Sequential).result, Result::Claimed);
+    EXPECT_EQ(expect(Op::OwnClaim, Entity::NonLeaseSameWorker, Timing::Sequential).result, Result::NotALeaseTopic);
+    EXPECT_TRUE(naRule(Op::ElectCampaign, Entity::OtherPart));
     // Every timing cell is run by a test of this task or mapped to a named existing test.
     for (const MappedTiming& m : kMappedTimings) {
         bool listed = false;
@@ -366,7 +370,9 @@ std::vector<Cell> unitCells() {
     std::vector<Cell> out;
     for (std::size_t oi = 0; oi < kOps; ++oi) {
         const Op o = Op(oi);
-        if (!implemented(o)) continue;
+        // The recipes are client-side compositions of Grant / Revoke / Update over a real client: their sequential cells run on the real
+        // 1-node broker (LeaseMatrixTest.cpp, LeaseMatrixRecipeRegression.SequentialCellRegression); their expectations are pinned above.
+        if (!implemented(o) || isRecipe(o)) continue;
         for (Entity e : {Entity::SameKeyVer, Entity::StaleVer, Entity::OtherKeySamePart, Entity::UserView})
             if (!naRule(o, e)) out.push_back({o, e});
     }

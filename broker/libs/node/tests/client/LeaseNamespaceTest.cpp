@@ -246,8 +246,9 @@ TEST(LeaseNamespaceRegression, ResumeNothingToRearmRegression) {
 }
 
 // Deleting a namespace drops its lease topics with it: the topic is gone (UnknownTopic), expiry appends nothing to a dropped topic
-// and the workers count no lease of the freed slot.  Mutation: skip the nsLeases_ reset in WorkerViewSet::onNsSlotFreed ->
-// the worker-side count stays non-zero, red.
+// and the workers count no lease of the freed slot.  Two paths uncharge (dropSourceTopic -> releaseLeases_, and the nsLeases_
+// reset in onNsSlotFreed); each ALONE leaves this test green (verified), so it is red only if both are skipped.  The reset alone is
+// pinned by LeaseJudgeWorkerRegression.NsLeasesSlotFreedResetsRegression.
 TEST(LeaseNamespaceRegression, NamespaceDeleteDropsLeaseTopicRegression) {
     LeaseBrokerRig rig("lease-ns-delete");
     auto lt = rig.ub().openLeaseTopicAndWait<LeaseClaim>("t", {}, 30s);

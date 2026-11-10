@@ -390,7 +390,7 @@ view is unchanged (or changed exactly as `expect` says).
 - **Entities (9):** `SameKeyVer` (L itself), `StaleVer` (k with v′ ≠ v), `OtherKeySamePart`, `OtherPart`,
   `OtherLeaseTopic`, `NonLeaseSameWorker`, `UserView` (U), `OtherNs` (same names in another namespace),
   `OldSession` (client version 17).
-- **n/a rule (`naRule`), 48 cells:**
+- **n/a rule (`naRule`), 55 cells:**
   - `StaleVer` applies only to ops that carry a version: `Update`, `Revoke`, `KeepAlive1`, `KeepAliveBatch`,
     `BrokerExpire`, `BrokerCheckpoint`, `ClearCheckpoint0` (broker records injected stale through the emitter test
     seam: expected defensive `StaleExpiry` / `StaleCheckpoint` and `stale_broker` + 1, which is the only place the
@@ -401,6 +401,8 @@ view is unchanged (or changed exactly as `expect` says).
   - `OtherNs` applies to the 9 client-surface ops (`Grant` … `WatchStart`) plus `AlterBounds`, `AlterCheckpoint`,
     `DropTopic` → **10 n/a**.
   - `OldSession` applies to the 9 client-surface ops → **13 n/a**.
+  - `OtherPart` does not apply to the 7 recipe ops (`OwnClaim` … `ElectObserve`): a recipe needs a lease topic of ONE
+    partition (spec §12.3), so there is no other partition → **7 n/a**.
   - Every other (op, entity) is applicable.
 - **Timings (28):** `Sequential`; `BackToBack` (second op before the first's ack); `AroundExpire{BeforePoll,
   AfterBuild, AfterCommit, AfterFold}`; `KeepAliveIn{Clearing, Checkpointing, Emitting, DueNotEmitted}`;
@@ -429,8 +431,8 @@ view is unchanged (or changed exactly as `expect` says).
   | OwnClaim, OwnTryClaim, OwnRelease | {LeaderChange.Folded, KnownOldDuplicate}, {BackToBack}, {AroundExpire.AfterFold} | 4 |
   | ElectCampaign, ElectProclaim, ElectResign, ElectObserve | {Zombie, KnownOldDuplicate, AtRiskPendingUnsent}, {AroundExpire.AfterFold}, {BackToBack}, {LeaderChange.Folded} | 6 |
 
-- **Pinned counts** (`LeaseMatrixRegression.MatrixCountRegression`): 22 × 9 = **198 sequential cells**, **48 n/a**,
-  **150 applicable**; **89 timing cells**; **239 executed**.
+- **Pinned counts** (`LeaseMatrixRegression.MatrixCountRegression`): 22 × 9 = **198 sequential cells**, **55 n/a**,
+  **143 applicable**; **89 timing cells**; **232 executed**.
 - **Expected outcomes.** `expect` encodes spec §21's table verbatim plus these rules, in order:
   1. `OldSession` × any → `InvalidRequest` (39) naming the version, before any lease state is touched; L unchanged.
   2. `OtherNs` × any → the answer of a missing object (byte-equal to a truly missing name), L unchanged.
@@ -1338,6 +1340,18 @@ resumes iff still lowest; `token()` = version.
 - [ ] **Step 3:** run `ctest --test-dir build -R 'LeaseRecipe' --output-on-failure -j8`; commit and push.
 
 **As built (Task 20).** See spec 12.3. The e2e election leg (`lease-e2e.sh`, `elect` driver subcommand) is written and syntax-checked (`bash -n`), not yet run on the VM; step 3 commit and push left to the orchestrator.
+
+**Batch F fix round (Tasks 20/21/23 review).** Recipe fixes, each with a `*Regression*` test and a mutation check: A1 the slot map is
+unmapped only by its owner (`unmapRef(ref, idx)`); A2 a failed or destroyed watch ends every recipe bound to it (`LeaseWatchFailed`
+0xFF05, `LostReason::WatchFailed`, `endForWatch_`); A3 `hostGone()` revokes a held lease; A4 an abandoned grant with an unknown outcome
+is read and revoked when it landed (destroying a recipe in flight keeps crash semantics: the lease ends at its TTL); A5 a refused
+`claim` / `proclaim` never overwrites the stored row (`acceptsClaim` / `acceptsProclaim`); A6 a transient send failure
+(BackPressured / QueueFull) moves to a `Retrying` state that `host.doWork` re-sends instead of ending the campaign; A7 campaign numbers
+are drawn from the host (unique per host). Matrix: the 7 recipe ops are n/a for `OtherPart` (one partition), `isLeaseOnly` includes them,
+`implemented()` is true for every op; the 1-node broker runner `LeaseMatrixRecipeRegression.SequentialCellRegression` drives the
+recipe cells against a real broker and the 10 timing cells are mapped in `kCoverage` (`Where::Client` is a client unit test).
+The seeded stress driver does not read `implemented()`: the recipes are client-side compositions of Grant / Revoke / Update, which the
+stress mix covers, and the recipe state machine has no shared broker state of its own.
 
 ### Task 21: `max-leases`, view memory, the suspension matrix
 

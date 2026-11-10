@@ -81,6 +81,7 @@ enum class ClientErrorCode : uint16_t {
     LeaseClaimed = 0xFF02,   ///< a LeaseOwnership::tryClaim found the name owned by another lease (its own key was revoked again)
     LeaseLost    = 0xFF03,   ///< a pending claim / campaign ended because its lease was lost (LeaseSession onLost)
     LeaseReleased = 0xFF04,  ///< a pending claim / campaign ended because the caller released it first
+    LeaseWatchFailed = 0xFF05,   ///< a pending claim / campaign ended because the shared watch failed; recreate the watch and the recipe
 };
 /// The terminal completion of a Client::leaseKeepAliveBatch request (Completion::reserved0); entry completions carry the entry index.
 inline constexpr uint32_t kLeaseKeepAliveTerminal = 0xFFFF;

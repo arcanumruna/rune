@@ -3,7 +3,7 @@
 // "Interaction matrix").  The unit table (LeaseMatrixUnitTest.cpp), the 1-node broker matrix (LeaseMatrixTest.cpp), the trio slice
 // (LeaseTrioTest.cpp), the seeded stress test (Task 18) and the e2e script (Tasks 19, 20) all read it.
 //
-//   22 ops x 9 entities = 198 sequential cells; 48 are n/a (naRule), 150 apply; 89 timing cells (timingsOf); 239 executed.
+//   22 ops x 9 entities = 198 sequential cells; 55 are n/a (naRule), 143 apply; 89 timing cells (timingsOf); 232 executed.
 //   expect() encodes the plan's rules 1-6 in order, on top of spec §21's table.
 //
 // Header-only and standard library only: pure functions and constexpr tables, no allocation outside the test helpers.
@@ -72,13 +72,16 @@ inline constexpr std::size_t kOps = std::size_t(Op::kCount), kEntities = std::si
     }
 }
 [[nodiscard]] constexpr bool isBrokerOp(Op o) noexcept { return o == Op::BrokerExpire || o == Op::BrokerCheckpoint || o == Op::ClearCheckpoint0; }
+/// The 7 Own / Elect ops (Task 20): client-side compositions of Grant / Revoke / Update over ONE lease topic of one partition.
+[[nodiscard]] constexpr bool isRecipe(Op o) noexcept { return std::size_t(o) >= std::size_t(Op::OwnClaim) && o != Op::kCount; }
 /// Ops answered only on a lease topic (keepalive, TimeToLive, ScanLeases, watch).
 [[nodiscard]] constexpr bool isLeaseOnly(Op o) noexcept {
     return o == Op::KeepAlive1 || o == Op::KeepAliveBatch || o == Op::TimeToLive || o == Op::ScanLeases || o == Op::WatchStart ||
-           o == Op::AlterBounds || o == Op::AlterCheckpoint;   // the lease.* keys of a plain topic are refused
+           o == Op::AlterBounds || o == Op::AlterCheckpoint ||   // the lease.* keys of a plain topic are refused
+           isRecipe(o);                                           // a recipe over a plain topic cannot be built
 }
-/// False for the 7 Own / Elect ops: Task 20 builds them and flips this.
-[[nodiscard]] constexpr bool implemented(Op o) noexcept { return std::size_t(o) < std::size_t(Op::OwnClaim); }
+/// Every op is built.
+[[nodiscard]] constexpr bool implemented(Op) noexcept { return true; }
 
 /// True when the (op, entity) cell does not exist (the plan's 48 n/a cells).
 [[nodiscard]] constexpr bool naRule(Op o, Entity e) noexcept {
@@ -92,6 +95,7 @@ inline constexpr std::size_t kOps = std::size_t(Op::kCount), kEntities = std::si
         }
     case Entity::OtherNs: return !(isClientSurface(o) || o == Op::AlterBounds || o == Op::AlterCheckpoint || o == Op::DropTopic);
     case Entity::OldSession: return !isClientSurface(o);
+    case Entity::OtherPart: return isRecipe(o);   // a recipe needs a lease topic of ONE partition (spec 12.3): there is no other partition
     default: return false;
     }
 }
@@ -171,6 +175,7 @@ enum class Result : uint8_t {
     NotALeaseTopic,      ///< rule 3: a lease-only op on a non-lease topic (UnknownTopic / NotAuthorized / local InvalidArgument)
     NoEffect,            ///< rule 3: a broker op on a non-lease topic: the partition is byte-identical to a run without it
     StaleVerdict,        ///< rule 6: a broker record of a lease that moved on: the defensive stale verdict
+    Claimed,             ///< a tryClaim that found the name owned: LeaseClaimed, its own key revoked again
     Absent,              ///< the cell is n/a
 };
 /// What an op does to the lease it addresses.
@@ -195,10 +200,25 @@ struct Outcome {
     switch (o) {
     case Op::Grant: return Effect::Created;
     case Op::Update: return Effect::Replaced;
-    case Op::Revoke: case Op::BrokerExpire: case Op::DropTopic: return Effect::Removed;
+    case Op::Revoke: case Op::BrokerExpire: case Op::DropTopic: case Op::OwnRelease: case Op::ElectResign: return Effect::Removed;
+    case Op::OwnClaim: case Op::ElectCampaign: return Effect::Created;   // the claimer's own key
+    case Op::ElectProclaim: return Effect::Replaced;
     case Op::KeepAlive1: case Op::KeepAliveBatch: return Effect::Rearmed;
     case Op::BrokerCheckpoint: case Op::ClearCheckpoint0: return Effect::Checkpointed;   // the row's remaining column changes (a clear writes 0)
     default: return Effect::None;                      // reads, scans, watch, alter (a bounds change touches no row)
+    }
+}
+
+/// The Own / Elect ops on the SameKeyVer scene: recipe A owns the name N (lease L), recipe B is another candidate.  A claim / campaign by B
+/// waits (L unchanged until A lets go); a tryClaim by B finds the name owned (Claimed); A's release / resign / proclaim end / replace L;
+/// B's observe reports L.
+[[nodiscard]] constexpr Outcome recipeOutcome(Op o) noexcept {
+    switch (o) {
+    case Op::OwnClaim: case Op::ElectCampaign: return {Result::Ok, Effect::Created, false, false};
+    case Op::OwnTryClaim: return {Result::Claimed, Effect::None, false, false};
+    case Op::OwnRelease: case Op::ElectResign: return {Result::Ok, Effect::Removed, true, false};
+    case Op::ElectProclaim: return {Result::Ok, Effect::Replaced, true, false};
+    default: return {Result::Ok, Effect::None, false, false};   // ElectObserve
     }
 }
 
@@ -229,6 +249,13 @@ struct Outcome {
         if (isBrokerOp(o)) return {Result::NoEffect, Effect::None, false, false};
         // grant / update / revoke on a plain topic are plain produces; alter / drop address the topic itself
         return {Result::Ok, Effect::None, false, false};
+    }
+    // The recipe ops: SameKeyVer is the scene above; the other entities run the same scene on another name (OtherKeySamePart) or another
+    // lease topic (OtherLeaseTopic), and L stays unchanged.
+    if (isRecipe(o)) {
+        Outcome out = recipeOutcome(o);
+        if (e != Entity::SameKeyVer) out.lChanged = false;
+        return out;
     }
     // A topic drop is topic-wide: for a cell that names a lease of the dropped topic itself, the whole topic (L, every key, U) goes.
     if (o == Op::DropTopic && (e == Entity::SameKeyVer || e == Entity::OtherKeySamePart || e == Entity::OtherPart || e == Entity::UserView))
