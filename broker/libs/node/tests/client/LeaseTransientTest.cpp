@@ -444,6 +444,99 @@ TEST(LeaseWatchEvictedAsOfRegression, SlowWatchRerunsRegression) {
     EXPECT_EQ(log.failed, 0);
 }
 
+// The rebirth fence's retry-after (the time left in the fence, which the broker clamps to 1 s: LeaseRuntime::grantHoldNs) lands at or
+// past a grant's op timeout of 1 s: the grant is answered Throttled AT ONCE and never parked behind the fence.  A parked grant would block every later write of its partition, be reported as a Timeout (in doubt)
+// at its delivery deadline, and could still be appended after the fence opens although the caller was told it timed out.
+// Mutation: ProducerImpl's Throttled fail-fast branch removed -> the grant is held to its op timeout (Timeout, not Throttled), red.
+TEST(LeaseTransientBrokerRegression, FencedGrantAnswersThrottledAtOnceRegression) {
+    LeaseBrokerRig rig("lease-tr-ffast");
+    const auto d = defineTransientLease(rig, "tr");
+    ASSERT_EQ(d.errorCode, 0) << d.detail;
+    rig.restart();   // a new lineage: the partition fences for max_ttl on the lease clock
+    auto lt = rig.ua().openLeaseTopicAndWait<LeaseClaim>("tr", {}, 30s);   // the default op timeout (ttl / 3)
+    rc::Client& c = rig.ua();
+
+    rc::LeaseOptions o;
+    o.ttlMs = 1000;
+    const LeaseClaim row = rig.row("k-fenced", 1);
+
+    // A watch from now: it must see exactly one Granted for the key, the successful one.
+    rc::LeaseWatchOptions wo;
+    wo.maxLive = 16;
+    rc::LeaseWatch<LeaseClaim> watch(c, lt, wo);
+    WLog log;
+    watch.setHandler(&WLog::fn, &log);
+    const std::vector<uint8_t> none;
+    const std::span<const uint8_t> prefixes[] = {std::span<const uint8_t>(none)};
+    ASSERT_EQ(watch.startFromNow(prefixes), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveWatch(watch, c, 30s, [&] { return watch.isReady(); }));
+
+    // The restarted leader is Fencing (polled, hard cap): from here on every grant must answer Throttled.
+    {
+        const auto end = Clk::now() + 30s;
+        while (ringOf(rig, d.topicId).fence != 2 && Clk::now() < end) std::this_thread::sleep_for(5ms);
+        ASSERT_EQ(ringOf(rig, d.topicId).fence, 2) << "the restarted leader never fenced";
+    }
+
+    // Timed: the fence answer comes well inside the op timeout.
+    const auto t0 = Clk::now();
+    const rc::LeaseResult g1 = lt.grantAndWait(row, o);
+    const auto grantMs = msSince(t0);
+    EXPECT_FALSE(g1.ok());
+    EXPECT_EQ(g1.errorCode, kThrottled) << "status " << int(g1.status);
+    EXPECT_NE(g1.status, rc::OpStatus::Timeout);
+    EXPECT_LT(grantMs, 500) << "the grant was held instead of answered";
+
+    // The partition is not blocked behind the refused grant: a revoke of an unknown key answers LeaseNotFound promptly.
+    const auto t1 = Clk::now();
+    const rc::LeaseResult rv = lt.revokeAndWait(rig.row("k-unknown"), 1);
+    EXPECT_FALSE(rv.ok());
+    EXPECT_EQ(rv.errorCode, kNotFound) << "status " << int(rv.status);
+    EXPECT_LT(msSince(t1), 500) << "the revoke queued behind a parked grant";
+    const rc::LeaseResult ka = lt.keepAliveOnceAndWait(rig.row("k-unknown"), 1);
+    EXPECT_EQ(ka.errorCode, kNotFound) << "status " << int(ka.status);
+
+    // Past the fence deadline the grant succeeds, and the refused ones never landed.
+    rig.advance(std::chrono::milliseconds(61'000));
+    const rc::LeaseResult g2 = grantRetrying(lt, row, o);
+    ASSERT_TRUE(g2.ok()) << int(g2.status) << " " << g2.errorCode;
+    ASSERT_TRUE(driveWatch(watch, c, 30s, [&] { return log.live.count("k-fenced") == 1; }));
+    driveWatch(watch, c, 300ms, [] { return false; });
+
+    rc::CompletionsConfig qc;
+    qc.maxResultBytes = 1u << 14;
+    qc.capacityBytes  = 1u << 18;
+    rc::Completions q(c, qc);
+    const int32_t part = lt.partitionOf(rig.row("k-fenced"));
+    int rows = 0;
+    int64_t rowVersion = -1;
+    bool done = false, firstPage = true;
+    uint64_t resume = 0;
+    for (int page = 0; page < 200 && !done; ++page) {
+        ASSERT_EQ(c.scanLeases(lt.leaseViewTopicId(), part, {}, resume, firstPage, 64, 10'000, q, 1), rc::OpResult::Accepted);
+        rc::Completion cc{};
+        (void)q.waitFor(1, 30s, [&](const rc::Completion& comp, std::span<const uint8_t> payload) {
+            cc = comp;
+            (void)rc::forEachLeaseRow(payload, [&](std::span<const uint8_t> key, std::span<const uint8_t> vrow) {
+                if (trimKey(reinterpret_cast<const char*>(key.data()), key.size()) != "k-fenced") return;
+                ++rows;
+                if (vrow.size() >= lt.core().viewVersionOffset() + 8) std::memcpy(&rowVersion, vrow.data() + lt.core().viewVersionOffset(), 8);
+            });
+        });
+        ASSERT_EQ(cc.status, rc::OpStatus::Ok);
+        const rc::LeaseScanPage pg = rc::LeaseScanPage::of(cc);
+        done      = pg.done;
+        resume    = pg.lastHash;
+        firstPage = false;
+    }
+    EXPECT_TRUE(done);
+    EXPECT_EQ(rows, 1) << "exactly one row for the key: no refused grant landed";
+    EXPECT_EQ(rowVersion, g2.version) << "the row is the successful grant's";
+    EXPECT_EQ(log.granted["k-fenced"], 1) << "the watch saw exactly one Granted";
+    EXPECT_EQ(log.live["k-fenced"], g2.version);
+    EXPECT_EQ(log.bad, 0);
+}
+
 // ================================================================================================ 3-NODE
 
 namespace {
@@ -721,12 +814,15 @@ TEST(LeaseTransientTrioRegression, FullRestartFencesThenLeaderChangeMidFenceRegr
 
     // During the fence: grants are held (Throttled), the old leases are gone, the watch ended every old key once.
     {
-        rc::LeaseOptions fo;
-        fo.opTimeoutMs = 1500;
         rc::LeaseResult held;
-        try { held = lt.grantAndWait(lt3::row("during", 1), fo); } catch (const std::exception&) { held = rc::LeaseResult{rc::OpStatus::Timeout, 0}; }
-        EXPECT_FALSE(held.ok()) << "a grant is held while the leader fences";
-        EXPECT_TRUE(held.errorCode == kThrottled || held.status == rc::OpStatus::Timeout) << "status " << int(held.status) << " code " << held.errorCode;
+        const auto t0 = Clk::now();
+        try { held = lt.grantAndWait(lt3::row("during", 1)); } catch (const std::exception&) { held = rc::LeaseResult{rc::OpStatus::Timeout, 0}; }
+        const auto elapsed = Clk::now() - t0;
+        EXPECT_FALSE(held.ok()) << "a grant is refused while the leader fences";
+        // The fence's retry-after is far past the grant's op timeout: the client fails it at once (Throttled), it is never held to a Timeout.
+        EXPECT_EQ(held.errorCode, kThrottled) << "status " << int(held.status);
+        EXPECT_NE(held.status, rc::OpStatus::Timeout);
+        EXPECT_LT(elapsed, 500ms) << "answered promptly, not held to the op timeout";
         std::printf("[trio-fence] held grant answered status %d code %u\n", int(held.status), unsigned(held.errorCode));
         for (const auto& [k, v] : g.version) {
             const rc::LeaseResult ka = opRetry([&] { return lt.keepAliveOnceAndWait(lt3::row(k), v); }, 30s);
@@ -760,21 +856,24 @@ TEST(LeaseTransientTrioRegression, FullRestartFencesThenLeaderChangeMidFenceRegr
 
     // Grants stay held until that deadline: every attempt that answers Ok must complete AFTER it (a held call may block for the client's delivery
     // timeout, so an attempt that starts before the deadline may legitimately finish after it).  Hard caps on the attempts and on the time.
-    rc::LeaseOptions fo;
-    fo.opTimeoutMs = 1000;
     bool granted = false;
     int  heldCount = 0;
-    for (int i = 0; i < 60 && !granted; ++i) {
+    bool sawThrottled = false;   // once the new leader's fence has answered Throttled the route exists: a Timeout is then never right
+    for (int i = 0; i < 2000 && !granted; ++i) {   // Throttled answers return at once: the cap is the lease clock below, this one a hard bound
         rc::LeaseResult r;
-        try { r = lt.grantAndWait(lt3::row("during", 2), fo); } catch (const std::exception&) { r = rc::LeaseResult{rc::OpStatus::Timeout, 0}; }
+        const int64_t startNs = rune::consensus::leaseClockNowNs();
+        try { r = lt.grantAndWait(lt3::row("during", 2)); } catch (const std::exception&) { r = rc::LeaseResult{rc::OpStatus::Timeout, 0}; }
         const int64_t doneNs = rune::consensus::leaseClockNowNs();
         if (r.ok()) {
             granted = true;
             EXPECT_GE(doneNs, deadline2) << "a grant completed " << (deadline2 - doneNs) / 1'000'000 << " ms before the second fence's deadline";
         } else {
             ++heldCount;
-            EXPECT_TRUE(r.errorCode == kThrottled || r.errorCode == kNotLeader || r.status == rc::OpStatus::Timeout)
-                << "status " << int(r.status) << " code " << r.errorCode;
+            // A Timeout is never the fence's answer.  The one tolerated Timeout is the window right after the kill, before the first Throttled:
+            // the client has no route to the new leader yet and its records are never sent.
+            sawThrottled = sawThrottled || r.errorCode == kThrottled;
+            EXPECT_TRUE(r.errorCode == kThrottled || r.errorCode == kNotLeader || (r.status == rc::OpStatus::Timeout && !sawThrottled))
+                << "status " << int(r.status) << " code " << r.errorCode << " (fence left at the start: " << (deadline2 - startNs) / 1'000'000 << " ms)";
         }
         if (!granted && doneNs > deadline2 + 20'000'000'000LL) break;
         if (!granted) std::this_thread::sleep_for(50ms);

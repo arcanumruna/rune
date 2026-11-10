@@ -113,6 +113,14 @@ public:
     ~LogTap() {
         for (auto& s : subs_)
             if (s) s->unsubscribe();
+        // The handler may still fire for records the duty thread dispatches before it applies the unsubscribe: the queue and its mutex must
+        // outlive the last call, so wait (hard cap 5 s) until every subscription is finished.
+        for (int i = 0; i < 5000; ++i) {
+            bool all = true;
+            for (auto& s : subs_) all = all && (!s || s->finished());
+            if (all) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
     [[nodiscard]] std::string describe() const {
         std::string d;
@@ -656,13 +664,13 @@ private:
                         return fail_("T4", "T4: grant during fence: " + m.name + " was granted at " + std::to_string(after) + " ns, " + std::to_string((fence - after) / lm::kNsPerMs) +
                                                " ms before the fence deadline (a lease lost in the restart may still be believed by its holder)");
                     fence = 0;
-                } else if (r.errorCode == kThrottled || r.status == rc::OpStatus::Timeout) {   // held: the client retries Throttled until its op timeout
+                } else if (r.errorCode == kThrottled) {   // the fence's retry-after is past the op timeout: the client fails the grant at once (nothing appended)
                     ++stats_.fenceThrottled;
                     noteHeld_(k, r, after, fence);
                     return true;
                 } else if (r.errorCode == kKeyExists) {
                     return fail_("T4", "a grant of " + m.name + " answered KeyExists during the fence: a row survived the full restart");
-                } else if (Env::kInjected) {
+                } else if (Env::kInjected) {   // incl. a Timeout: a grant during the fence must answer Throttled promptly, never be held
                     return fail_("T4", "a grant of " + m.name + " during the fence answered " + text_(r) + ", want Throttled");
                 } else {
                     noteHeld_(k, r, after, fence);
@@ -1106,12 +1114,11 @@ private:
                 const int k = probe_[static_cast<std::size_t>(pMax)];
                 rc::LeaseOptions o;
                 o.ttlMs        = 1000;
-                o.opTimeoutMs  = 1000;
                 rc::LeaseResult g;
                 try { g = ops_().grantAndWait(row_(k, 0), o, 1s); } catch (const std::exception&) { g = rc::LeaseResult{rc::OpStatus::Timeout, 0}; }
                 trace_("fence probe 2 ms short of the deadline: grant " + model_.key(k).name + " -> " + (g.ok() ? "Ok" : text_(g)));
                 if (g.ok()) return fail_("T4", "T4: grant during fence: a grant succeeded 2 ms before the fence deadline");
-                if (g.errorCode != kThrottled && g.status != rc::OpStatus::Timeout) return fail_("T4", "a grant 2 ms short of the fence deadline answered " + text_(g) + ", want Throttled");
+                if (g.errorCode != kThrottled) return fail_("T4", "a grant 2 ms short of the fence deadline answered " + text_(g) + ", want Throttled");
                 ++stats_.fencedShort;
                 noteHeld_(k, g, env_.nowNs(), dl);
             }
@@ -1262,6 +1269,11 @@ private:
         if constexpr (Env::kTransient) {
             if (restartsDone_ >= kMaxFullRestarts || nodeDown_ != 0) w[static_cast<std::size_t>(Step::FullRestart)] = 0;
             if (nodeDown_ != 0 || fenceActive_()) w[static_cast<std::size_t>(Step::Churn)] = 0;
+            // The leg must exercise carry (the test asserts it): a seed whose random walk has not rolled a Churn by step 40 gets one at the first
+            // step without a fence (the grants that now run during a fence change every seed's walk, so coverage can no longer rest on luck).
+            if constexpr (Env::kInjected) {
+                if (step_ >= 40 && stats_.steps[static_cast<std::size_t>(Step::Churn)] == 0 && nodeDown_ == 0 && !fenceActive_()) w[static_cast<std::size_t>(Step::Churn)] = 1000;
+            }
         }
         uint32_t total = 0;
         for (uint32_t x : w) total += x;
@@ -1287,11 +1299,6 @@ private:
                 for (int i = 0; i < 8 && model_.key(touched).live != 0; ++i) touched = pickKey_();
             }
             if (model_.key(touched).doubt) { ++stats_.skipped; trace_("grant skipped (doubt)"); break; }
-            if constexpr (Env::kTransient && Env::kInjected) {
-                // a held grant stays in the client's producer queue and holds every later write of its partition back until the injected clock
-                // opens the fence: one single-node grant is held per fence (stepAdvanceFence_'s probe), the rest wait
-                if (fenceUntilP_[static_cast<std::size_t>(keyPart_[static_cast<std::size_t>(touched)])] != 0) { ++stats_.skipped; trace_("grant skipped (fence)"); break; }
-            }
             if (!opGrant_(touched)) return false;
             if (model_.key(touched).live != 0 && model_.key(touched).kept) {
                 if (pick_(100) < 35) { model_.key(touched).kept = false; model_.key(touched).abandonedAtNs = env_.nowNs(); }   // granted and left alone

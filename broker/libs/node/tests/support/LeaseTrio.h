@@ -164,10 +164,12 @@ public:
     }
 
     /// Opens the topic; the client's catalog view may trail the DDL for a moment ("does not exist" / "generated type is stale"): bounded retries.
-    Lt open(const Topic& t) {
+    Lt open(const Topic& t, uint32_t opTimeoutMs = 0) {
         const auto end = lt3::Clock::now() + 90s;
+        rune::client::LeaseTopicConfig cfg;
+        cfg.opTimeoutMs = opTimeoutMs;   // the handle's op timeout = the writer's delivery timeout; 0 = ttl / 3
         for (;;) {
-            try { return client().openLeaseTopicAndWait<rune::gen::LeaseClaim>(t.name, {}, 30s); }
+            try { return client().openLeaseTopicAndWait<rune::gen::LeaseClaim>(t.name, cfg, 30s); }
             catch (const std::exception&) { if (lt3::Clock::now() >= end) throw; std::this_thread::sleep_for(200ms); }
         }
     }

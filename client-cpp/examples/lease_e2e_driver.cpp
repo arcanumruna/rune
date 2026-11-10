@@ -535,7 +535,7 @@ struct TransientLog {
 ///   --down-file exists : the script is about to stop all three brokers (the keepalives stop; the watch keeps running);
 ///   --go-file exists   : the script has restarted all three brokers.  The restart emptied the rings (T4/T5):
 ///     - every old key's keepalive answers LeaseNotFound (never Ok), judged once the broker answers again;
-///     - grants are held (Throttled; the client retries it until its op timeout) while the new lineage's fence runs, then succeed;
+///     - a grant during the new lineage's fence answers Throttled at once (never held to a Timeout), then succeeds;
 ///     - the watch reports every old key ended exactly once (A.7: the watch reruns on the data reset and ends the keys it lost).
 int runTransient(const Args& a) {
     const std::string topic = a.str("topic", "transient"), out = a.str("out"), downFile = a.str("down-file"), goFile = a.str("go-file");
@@ -654,9 +654,13 @@ int runTransient(const Args& a) {
         const rc::LeaseResult g = lt.grantAndWait(claimRow(key), o, 1s);
         if (g.ok()) {
             grantedMs = realtimeMs();
-        } else if (g.errorCode == kThrottled || g.status == rc::OpStatus::Timeout) {
-            ++held;   // held by the fence (the client retries a Throttled answer until its op timeout)
+        } else if (g.errorCode == kThrottled && g.status != rc::OpStatus::Timeout) {
+            // The fence's retry-after lands at/past the grant's op timeout: the client fails the grant at once (Throttled, nothing appended);
+            // inside the last op timeout of the fence it parks the grant and the fence's end lets it through.  A Timeout is never right.
+            ++held;
             ++heldAfterServed;
+        } else if (g.status == rc::OpStatus::Timeout) {
+            return failWith("TRANSIENT", "a grant after the restart timed out (held by the fence, in doubt): it must answer Throttled at once");
         } else {
             return failWith("TRANSIENT", "a grant after the restart answered status " + std::to_string(int(g.status)) + " err " + std::to_string(g.errorCode) + ", want Throttled then Ok");
         }

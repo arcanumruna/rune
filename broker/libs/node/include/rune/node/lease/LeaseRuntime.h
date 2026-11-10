@@ -130,14 +130,16 @@ public:
     /// 0 Await, 1 Deciding, 2 Fencing, 3 Open (the gauge).
     [[nodiscard]] uint8_t fenceStateCode() const noexcept { return static_cast<uint8_t>(fence_.index()); }
     /// How long (ns) a grant waits before its retry (the Throttled retry-after): 0 = grants are judged as usual (Open, and every persisted
-    /// runtime); Fencing: the time to the deadline rounded up to whole ms, clamped to [1 ms, 1 s]; Await / Deciding: 1 ms.
+    /// runtime); Fencing: the WHOLE time to the deadline rounded up to whole ms (at least 1 ms; never clamped shorter: a client whose
+    /// delivery deadline falls before it fails the grant at once with Throttled instead of parking the partition's writes behind it);
+    /// Await / Deciding: 1 ms.
     [[nodiscard]] int64_t grantHoldNs(int64_t leaseNowNs) const noexcept {
-        constexpr int64_t kMs = 1'000'000, kMax = 1'000'000'000;
+        constexpr int64_t kMs = 1'000'000;
         if (const auto* f = std::get_if<FenceFencing>(&fence_)) {
             if (leaseNowNs >= f->deadlineNs) return kMs;   // the open record is due / in flight
             const int64_t diff = f->deadlineNs - leaseNowNs;
             const int64_t ms   = diff / kMs + (diff % kMs != 0 ? 1 : 0);
-            return std::min<int64_t>(kMax, std::max<int64_t>(1, ms) * kMs);
+            return std::max<int64_t>(1, ms) * kMs;
         }
         return std::holds_alternative<FenceOpen>(fence_) ? 0 : kMs;
     }

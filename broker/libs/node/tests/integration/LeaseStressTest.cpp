@@ -68,7 +68,9 @@ public:
         if (r.errorCode != 0) throw std::runtime_error("define lease st: " + r.detail);
         topicId_ = r.topicId;
         rc::LeaseTopicConfig cfg;
-        cfg.opTimeoutMs = 20'000;   // wall time: a lease write slower than this is a hang, not a lease problem
+        // wall time: a lease write slower than this is a hang, not a lease problem.  The transient leg keeps the default op timeout (ttl / 3):
+        // a grant during the rebirth fence must fail at once with Throttled instead of being parked until a Timeout.
+        cfg.opTimeoutMs = Transient ? 0 : 20'000;
         opsClient_ = connect_("a/ua", lbr::kUserPw);   // the operations client is ours: RejectAll ends its session for good, and it is then replaced
         ops_.emplace(opsClient_->openLeaseTopicAndWait<LeaseClaim>("st", cfg, 30s));
         obsClient_ = connect_("admin", lbr::kAdminPw);   // the observer: the lease view reads and the log tap
@@ -177,7 +179,7 @@ public:
             opsClient_->close();
             opsClient_ = connect_("a/ua", lbr::kUserPw);
             rc::LeaseTopicConfig cfg;
-            cfg.opTimeoutMs = 20'000;
+            cfg.opTimeoutMs = Transient ? 0 : 20'000;   // see the constructor
             ops_.emplace(opsClient_->openLeaseTopicAndWait<LeaseClaim>("st", cfg, 30s));
             return true;
         } catch (const std::exception&) {

@@ -3077,12 +3077,24 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         FLIGHT_RECORDER_MARK_ARG_VAL_PRODUCE(flight_recorder::Site::ClientRetriable, flight_recorder::foldCorr(correlationId),
                                      static_cast<uint16_t>(ec), 0.0);
         const int64_t hint = logStartOffset > 0 ? logStartOffset : kRetriableBackoffNs;
-        const int64_t backoffNs = std::min<int64_t>(std::max<int64_t>(hint, 1'000'000LL), cfg_.produceTimeoutMs * 1'000'000LL);
-        b->attemptDeadlineNs = lastNowNs_ + backoffNs;
-        b->retriableBackoff  = true;
-        ++throttledBackoffs_;
-        if (b->attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b->attemptDeadlineNs;
-        return;
+        // A retry-after at or past the batch's delivery deadline can never be retried in time (a lease topic's rebirth
+        // fence): fail it NOW instead of parking it (it would block the partition, then time out in doubt).
+        const int64_t deadline = b->firstSendNs + cfg_.deliveryTimeoutMs * 1'000'000LL;
+        if (lastNowNs_ + hint >= deadline) {
+            ++throttledFailFast_;
+            if (b->attempts == 1) {
+                failRefusedBeforeAppend_(ps, b, ec, units);
+                return;
+            }
+            // A retransmit: an earlier attempt may be stored - falls through to the outcome-unknown path (D) below.
+        } else {
+            const int64_t backoffNs = std::min<int64_t>(std::max<int64_t>(hint, 1'000'000LL), cfg_.produceTimeoutMs * 1'000'000LL);
+            b->attemptDeadlineNs = lastNowNs_ + backoffNs;
+            b->retriableBackoff  = true;
+            ++throttledBackoffs_;
+            if (b->attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b->attemptDeadlineNs;
+            return;
+        }
     }
     // Phase 2b E2 (ruling 2): TransientLogFull (42) — the leader's transient
     // ring is full of not-yet-replicated records; definitely not appended, the
@@ -3114,26 +3126,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     if (ec >= static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed) &&
         ec <= static_cast<int16_t>(rune::protocol::client::ErrorCode::PasswordChangeRequired) &&
         b->attempts == 1) {
-        // The newest sequences were never used: give them back, so the next batch continues the sequence.
-        // Otherwise the later in-flight batches meet the gap (OutOfOrderSequence) and C3 re-sequences them.
-        const bool givenBack = b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch &&
-                               b->baseSequence + b->recordCount == ps.nextBaseSequence;
-        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
-                      OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
-        // #700: a batch definitely not appended whose sequence is given back leaves no gap: the transaction can abort
-        // without an epoch bump.  A batch behind a newer one in flight keeps its sequence (a gap): BumpEpoch.
-        txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec),
-                     givenBack ? AbortKind::Plain : AbortKind::BumpEpoch);
-        completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
-                       static_cast<uint16_t>(ec), b->tier2, b->recordCount);
-        if (givenBack) ps.nextBaseSequence = b->baseSequence;
-        releaseResolved_(ps, *b);
-        reclaimAckRing_(ps);
-        if (isPartitionRefusal_(static_cast<uint16_t>(ec))) {
-            failBuilder_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));   // #689
-            // #689: the queued Tier-2 batches go too - none is sent to a refused partition
-            failQueuedTier2_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));
-        }
+        failRefusedBeforeAppend_(ps, b, ec, units);
         return;
     }
     // D: rejected, but an earlier attempt may be stored — outcome unknown (44..47 after a retransmit too).
@@ -3143,6 +3136,29 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
                    static_cast<uint16_t>(ec), b->tier2, b->recordCount);
     markUnresolved_(ps, *b);
+    releaseResolved_(ps, *b);
+    reclaimAckRing_(ps);
+    if (isPartitionRefusal_(static_cast<uint16_t>(ec))) {
+        failBuilder_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));   // #689
+        // #689: the queued Tier-2 batches go too - none is sent to a refused partition
+        failQueuedTier2_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));
+    }
+}
+
+void ProducerImpl::failRefusedBeforeAppend_(PartitionState& ps, InFlightBatch* b, int16_t ec, uint32_t units) noexcept {
+    // The newest sequences were never used: give them back, so the next batch continues the sequence.
+    // Otherwise the later in-flight batches meet the gap (OutOfOrderSequence) and C3 re-sequences them.
+    const bool givenBack = b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch &&
+                           b->baseSequence + b->recordCount == ps.nextBaseSequence;
+    emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
+                  OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
+    // #700: a batch definitely not appended whose sequence is given back leaves no gap: the transaction can abort
+    // without an epoch bump.  A batch behind a newer one in flight keeps its sequence (a gap): BumpEpoch.
+    txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec),
+                 givenBack ? AbortKind::Plain : AbortKind::BumpEpoch);
+    completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
+                   static_cast<uint16_t>(ec), b->tier2, b->recordCount);
+    if (givenBack) ps.nextBaseSequence = b->baseSequence;
     releaseResolved_(ps, *b);
     reclaimAckRing_(ps);
     if (isPartitionRefusal_(static_cast<uint16_t>(ec))) {

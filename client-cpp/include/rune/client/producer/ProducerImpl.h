@@ -1635,6 +1635,8 @@ public:
     [[nodiscard]] uint64_t unknownProducerIdStateLoss() const noexcept { return unknownPidStateLoss_; }
     /// Task 14 (D28): batches re-sent after a Throttled (53) answer's retry-after.
     [[nodiscard]] uint64_t throttledBackoffs() const noexcept { return throttledBackoffs_; }
+    /// A Throttled (53) answer whose retry-after lands at/past the batch's delivery deadline: failed at once.
+    [[nodiscard]] uint64_t throttledFailFast() const noexcept { return throttledFailFast_; }
 
     // ---- Task 14 fix3 test seams (owner thread; never used in production) ----
     /// Parses the whole deferred arena and cross-checks it against the live
@@ -1971,6 +1973,8 @@ private:
     void failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st, uint16_t errorCode = 0);
     /// Fails the never-sent builder records of `ps` (handles + one BatchAck).
     void failBuilder_(PartitionState& ps, OpStatus st, uint16_t errorCode = 0);
+    /// Issue #222 / Throttled fail-fast: a batch's only attempt was refused before the append - definite failure.
+    void failRefusedBeforeAppend_(PartitionState& ps, InFlightBatch* b, int16_t ec, uint32_t units) noexcept;
     /// #689: fail (never send) every Tier-2 batch queued on ps.
     void failQueuedTier2_(PartitionState& ps, OpStatus st, uint16_t errorCode) noexcept;
     /// The Produce `acks` wire byte: bit 0 All, bit 1 View.  A transactional producer never sends View: its sends are
@@ -2379,6 +2383,7 @@ private:
     // ---- sendBlocking() support (app thread only) -----------------------------
     static int64_t steadyNowNs_() noexcept;
     ClockFn clock_   = &steadyNowNs_;   // overridable by setClockForTesting()
+    uint64_t throttledFailFast_ = 0;    // Throttled (53) answers failed at once (retry-after >= delivery deadline)
     uint64_t throttledBackoffs_ = 0;    // Task 14: Throttled (53) answers backed off
     uint64_t unknownPidStateLoss_ = 0;  // D6 review M1: rule U2 occurrences (diagnostic)
     PumpFn  pumpFn_  = nullptr;         // wired by Client::producer(), both modes (fix1 C1)

@@ -342,9 +342,10 @@ TEST(LeaseFenceDecisionRegression, NeverEarlyRegression) {
     ASSERT_EQ(r.rt->fenceStateCode(), kFencing);
     const int64_t deadline = r.deadlineOf();
     ASSERT_EQ(deadline, r.now + r.extendNs + 5000 * kMs);
-    // The hold: ceil to whole ms, clamped to [1 ms, 1 s].
+    // The hold: the whole time left, ceil to whole ms, at least 1 ms (never clamped shorter: the client fails a grant whose
+    // delivery deadline falls before it at once).
     r.now = deadline - 5 * 1000 * kMs;
-    EXPECT_EQ(r.rt->grantHoldNs(r.now), 1000 * kMs);
+    EXPECT_EQ(r.rt->grantHoldNs(r.now), 5000 * kMs);
     r.now = deadline - 250'500'000;
     EXPECT_EQ(r.rt->grantHoldNs(r.now), 251 * kMs);
     r.now = deadline - 1;

@@ -216,14 +216,24 @@ TEST(LeaseTransientBrokerRegression, RestartFencesGrantsRegression) {
     EXPECT_GE(fencing.deadlineNs, fencing.readyNs + kMaxTtlNs) << "at least max_ttl after the runtime's ready time";
     EXPECT_GT(runtimeOf(rig, d.topicId, rig.leaseNowNs()).holdNs, 0) << "a grant is held with a positive retry-after";
 
-    auto lt = rig.ua().openLeaseTopicAndWait<LeaseClaim>("tr", {}, 30s);
+    auto lt = rig.ua().openLeaseTopicAndWait<LeaseClaim>("tr", {}, 30s);   // the default op timeout (ttl / 3)
+    // During the fence the retry-after (the time left, about max_ttl) is far past the grant's op timeout: the grant answers Throttled at once - it is never
+    // parked behind the fence, so it can neither block the partition nor time out in doubt.
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        const rc::LeaseResult early = lt.grantAndWait(rig.row("k-early", 2), {});
+        EXPECT_FALSE(early.ok());
+        EXPECT_EQ(early.errorCode, kThrottledCode) << "status " << int(early.status);
+        EXPECT_NE(early.status, rc::OpStatus::Timeout);
+        EXPECT_LT(std::chrono::steady_clock::now() - t0, 500ms) << "answered at once, not held";
+    }
     std::atomic<bool> done{false};
     auto fut = std::async(std::launch::async, [&] {
         const rc::LeaseResult g = grantRetrying(lt, rig.row("k-new", 2), {});
         done = true;
         return g;
     });
-    // Up to 1 ms short of the deadline the fence still holds: the grant cannot finish (the client retries Throttled by itself).
+    // Up to 1 ms short of the deadline the fence still holds: the grant cannot finish (it keeps being answered Throttled).
     rig.advance(std::chrono::milliseconds((fencing.deadlineNs - rig.leaseNowNs()) / 1'000'000 - 1));
     std::this_thread::sleep_for(300ms);
     EXPECT_FALSE(done.load()) << "no grant before the deadline";
