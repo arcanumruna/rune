@@ -134,6 +134,7 @@ struct Rig {
     TopicWriteSpec                spec;
     Log                           log;
     PartitionWriteState           st;
+    TxnOverlayPool                pool;
     VerdictSource                 vs{5, 0};
     std::unique_ptr<ViewInstance> index;
     ConstraintSet                 set;
@@ -163,6 +164,7 @@ struct Rig {
     void start() {
         st.constraintSets.onChange(0, set);
         log.control();
+        vs.bindTxn(&pool, {}, 0);   // replay folds against the pool's supersede keys; production always binds one
         vs.bindState(&st);
         vs.bindLeader(nullptr, 1, 0);
         drive();

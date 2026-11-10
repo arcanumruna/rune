@@ -16,7 +16,23 @@
 #include <random>
 #include <vector>
 
+// The wall-clock bound of WideModelRegression guards a quadratic regression in a plain build; under ASan / TSan (5-15x) it is
+// meaningless (same convention as DutyPassLatencyGateTest). The model checks still run.
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#define RUNE_WHEEL_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#define RUNE_WHEEL_SANITIZED 1
+#endif
+#ifndef RUNE_WHEEL_SANITIZED
+#define RUNE_WHEEL_SANITIZED 0
+#endif
+
 namespace {
+
+constexpr bool kSanitized = RUNE_WHEEL_SANITIZED != 0;
 
 using namespace rune::node::lease;
 using S = LeaseEntryState;
@@ -811,5 +827,5 @@ TEST(LeaseWheelRegression, WideModelRegression) {
                 static_cast<unsigned long long>(handedTot));
     EXPECT_EQ(repairs, 0u);
     EXPECT_GT(handedTot, 0u);
-    EXPECT_LT(ms, 5000);
+    if (!kSanitized) EXPECT_LT(ms, 5000);
 }

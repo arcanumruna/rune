@@ -49,7 +49,7 @@ std::string keyName(const char* prefix, int i) {
     std::snprintf(b, sizeof b, "%s%02d", prefix, i);
     return b;
 }
-std::string trimKey(const char* p, std::size_t n) { return std::string(p, strnlen(p, n)); }
+std::string trimKey(const char* p, std::size_t n) { return n == 0 ? std::string{} : std::string(p, strnlen(p, n)); }   // Ready/Failed carry an empty key (null data)
 
 int64_t msSince(Clk::time_point t0) { return std::chrono::duration_cast<std::chrono::milliseconds>(Clk::now() - t0).count(); }
 
