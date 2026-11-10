@@ -503,7 +503,6 @@ void BrokerNode::start() {
             config_.effectiveAeronDir();
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
-        if (config_.testAeronLivenessDefaultMs > 0) ctx.mediaDriverTimeout(config_.testAeronLivenessDefaultMs);   // TEST-ONLY: Aeron's default, lowered
         ctx.mediaDriverTimeout(config_.inProcessDriverTimeoutMs());   // in-process driver: survive own stalls
         if (config_.testAeronClientIdleSleepMs > 0) ctx.idleSleepDuration(config_.testAeronClientIdleSleepMs);   // TEST-ONLY
         // Spec §3.2 fused placement: the runtime client has no conductor thread
@@ -6696,7 +6695,6 @@ void BrokerNode::buildShardRuntimes_() {
         pumpOwnDrivers();
         aeron::Context ctx;
         ctx.aeronDir(shardDir(w));
-        if (config_.testAeronLivenessDefaultMs > 0) ctx.mediaDriverTimeout(config_.testAeronLivenessDefaultMs);   // TEST-ONLY: Aeron's default, lowered
         ctx.mediaDriverTimeout(config_.inProcessDriverTimeoutMs());
         ctx.useConductorAgentInvoker(true);
         auto client = aeron::Aeron::connect(ctx);

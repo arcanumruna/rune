@@ -318,9 +318,9 @@ struct NodeConfig {
     /// short value to prove no startup phase starves an invoker driver.  No env var.
     static constexpr int64_t kInProcessLivenessNs = 3'600'000'000'000LL;
     int64_t shardClientLivenessTimeoutNs = kInProcessLivenessNs;
-    /// TEST-ONLY: the liveness (ms) the in-process drivers and clients have before the node sets its own (shardClientLivenessTimeoutNs),
-    /// in place of Aeron's 10 s defaults, and the floor of inProcessDriverTimeoutMs: a test freezes the process past it in a fraction
-    /// of the time, and without the node's own liveness the freeze kills it.  0 = Aeron's 10 s; never set in production.
+    /// TEST-ONLY: the embedded drivers' client liveness (ms) before shardClientLivenessTimeoutNs overrides it, in place of Aeron's 10 s
+    /// default, and the floor of inProcessDriverTimeoutMs: a test freezes the process past it in a fraction of the time, and without
+    /// the node's own liveness the freeze kills it.  0 = Aeron's 10 s; never set in production.
     long testAeronLivenessDefaultMs = 0;
     /// TEST-ONLY: the idle sleep (ms) of the node's runtime Aeron client conductor (thread placement) in place of Aeron's 16 ms, so a
     /// test's every client-conductor round trip (a gateway egress publication, a subscription) does not wait out two 16 ms sleeps.
