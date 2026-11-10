@@ -2934,8 +2934,9 @@ TEST(CheckedWritesModel, CoverageProblemFlagsAMarkerPastAnUndecidedTransaction) 
     EXPECT_EQ(problem(logOf(false, false, 5, 4)), "") << "an abort drops the records; ending at its marker is harmless";
 }
 
-// Between the TxnJudge and the marker a yes vote still holds K at the first record (it stays locked); a no vote is final at the TxnJudge.
-TEST(CheckedWritesModel, CoverageProblemAfterTheTxnJudgeDependsOnTheVote) {
+// Between the TxnJudge and the marker either vote holds K at the first record: a yes stays locked, and a no is no outcome (an earlier
+// leadership's yes can commit T over it).
+TEST(CheckedWritesModel, CoverageProblemAfterTheTxnJudgeWhateverTheVote) {
     using Log = VerdictRig::RigLog;
     const auto logOf = [](bool outsideWrite) {
         Log log;
@@ -2958,7 +2959,7 @@ TEST(CheckedWritesModel, CoverageProblemAfterTheTxnJudgeDependsOnTheVote) {
         return m.coverageProblem(log);
     };
     EXPECT_NE(problem(logOf(false)), "") << "a yes vote stays locked until its marker";
-    EXPECT_EQ(problem(logOf(true)), "") << "a TxnConflict no is final at the TxnJudge";
+    EXPECT_NE(problem(logOf(true)), "") << "a TxnConflict no waits for its marker too (an earlier leadership's yes can commit it)";
 }
 
 // Hand-built logs on a key-index and unique-name source: the order of the judge (constraints, then the conflict scan) and the waits of P11-4.

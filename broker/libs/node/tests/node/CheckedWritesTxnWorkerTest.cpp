@@ -1535,3 +1535,98 @@ TEST(CheckedWritesTxnWorkerRegression, RebuildAppliesACommitHeldInsideAnotherTxn
     k.r.passes(60);
     EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{2})) << "the rebuild applies 32's delete";
 }
+
+namespace {
+/// Producer `pid`'s one-insert transaction on this leader (no leadership change rebuilds the members first), and its vote.
+uint16_t voteOnThisLeader(Ki& k, int64_t pid, uint64_t id) {
+    const auto a = k.r.ack(k.r.produceBytes(VerdictRig::batch({ins(id)}, pid, 0, {}, /*txn=*/true), kLeader, pid, 0));
+    EXPECT_TRUE(a && a->code == 0);
+    return k.vote(pid).code;
+}
+}  // namespace
+
+// The coordinator commits T on every partition's yes, possibly an earlier leadership's: this one can judge T no (here a smaller
+// knob, TooLarge) and then see T's COMMIT.  The marker applies T, so its key is taken for the next transaction.
+TEST(CheckedWritesTxnWorkerRegression, CommitOfATransactionJudgedNoAppliesItRegression) {
+    Ki k;
+    k.txn(31, {ins(1), ins(2), ins(3)});
+    ASSERT_EQ(k.vote(31).code, 0) << "the earlier leadership's yes";
+    k.r.demote();
+    k.r.worker->setTxnJudgedRecordsMax(2);
+    k.r.promote();
+    k.r.passes(60);
+    const DeferredTxn* t = k.r.writeState()->txn.find(31);
+    ASSERT_TRUE(t != nullptr && t->judged);
+    ASSERT_EQ(t->answer.code, kTooLarge) << "this leadership judges it no";
+    EXPECT_EQ(voteOnThisLeader(k, 33, 9), 0) << "the no waiting for its marker holds no other transaction";
+    k.r.marker(33, true);
+    k.r.marker(31, true);
+    EXPECT_TRUE(k.r.driveUntilJudged());
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{1, 2, 3, 9})) << "the committed transaction is applied";
+    EXPECT_EQ(voteOnThisLeader(k, 32, 2), kKeyExists);
+}
+
+// Another leadership's markers cover past T's J (it judged T no and passed it) while T's marker is not in the log yet: K starts past
+// J here, and the rebuilt member's replay meets T undecided.  T's COMMIT applies it; an ABORT applies nothing.
+TEST(CheckedWritesTxnWorkerRegression, MarkerOfATransactionTheCoveragePassedDecidesItRegression) {
+    for (const bool commit : {true, false}) {
+        SCOPED_TRACE(commit ? "commit" : "abort");
+        Ki k;
+        k.txn(31, {ins(1), ins(2)});
+        const auto yes = k.vote(31);
+        ASSERT_EQ(yes.code, 0);
+        const uint32_t setId = k.r.writeState()->constraintSets.latest().id;
+        const int64_t covered = k.r.writeState()->rejected.coveredThrough();
+        k.r.demote();
+        k.r.replicate({VerdictRig::markerBatch(covered, yes.judgeOffset + 1, setId)});
+        k.r.promote();
+        ASSERT_GT(k.r.writeState()->rejected.coveredThrough(), yes.judgeOffset) << "K starts past J";
+        k.r.marker(31, commit);
+        EXPECT_TRUE(k.r.driveUntilJudged());
+        EXPECT_EQ(k.r.keyIndexKeys(), commit ? (std::set<uint64_t>{1, 2}) : std::set<uint64_t>{});
+        EXPECT_EQ(voteOnThisLeader(k, 32, 1), commit ? kKeyExists : 0);
+    }
+}
+
+// A pending yes (31) holds K below a later transaction (32) committed and applied meanwhile.  The re-activation starts the judge at
+// K, below 32's J, with 32 decided: the judge passed its J without stopping there, so the rebuilt member never applied 32.  And no
+// record after the activation set judgedRecord_, so no marker passed them.
+TEST(CheckedWritesTxnWorkerRegression, CommitDecidedAboveKIsAppliedAfterAReactivationRegression) {
+    Ki k;
+    k.txn(31, {ins(1)});
+    ASSERT_EQ(k.vote(31).code, 0);
+    k.txn(32, {ins(5)});
+    ASSERT_EQ(k.vote(32).code, 0);
+    k.r.marker(32, true);
+    k.r.passes(60);
+    ASSERT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{5}));
+    k.r.demotePromote();
+    k.r.passes(60);
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{5})) << "the decided commit above K survives the re-activation";
+    k.r.marker(31, false);
+    EXPECT_TRUE(k.r.driveUntilJudged()) << "the markers pass 31 (judged again, then aborted) and 32 with no other record after them";
+    EXPECT_EQ(voteOnThisLeader(k, 33, 5), kKeyExists);
+}
+
+// Design 3.1: an ordinary B opened inside an ordinary T's span (first, M], then D voted, opened after M but inside B's span.  Applying
+// B held D's hold at B's first record, inside T's span: the hold counts from the start of every applied span B lies in.
+TEST(CheckedWritesTxnWorkerRegression, HoldInsideChainedOrdinarySpansCountsFromTheFirstRegression) {
+    Ki k;
+    namespace tx = rune::transaction;
+    const int64_t first = k.r.leo();
+    k.r.demote();
+    k.r.replicate({VerdictRig::batch({ups(2)}, kRaPid, 0, {}, /*txn=*/true), VerdictRig::batch({ups(3)}, kRaPid + 1, 0, {}, /*txn=*/true),
+                   tx::ControlMarker::build(kRaPid, 0, tx::ControlType::Commit, 0), VerdictRig::batch({ins(4)}, kRaPid + 2, 0, {}, /*txn=*/true)});
+    k.r.promote();
+    const int64_t tok = k.r.sendVote(VerdictRig::kSrc, kRaPid + 2, 0);
+    k.r.marker(kRaPid + 1, true);
+    ASSERT_TRUE(k.r.driveUntilVoted(tok));
+    ASSERT_EQ(k.r.voteReply(tok)->code, 0);
+    for (int i = 0; i < 200 && !k.r.keyIndexKeys().contains(3); ++i) k.r.pass();
+    ASSERT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{2, 3})) << "T and B are applied while D waits for its marker";
+    EXPECT_LE(k.r.vs->verdictSource(VerdictRig::kSrc, 0)->judgedThrough(), first) << "the coverage is not inside T's span";
+    k.r.demotePromote();
+    k.r.marker(kRaPid + 2, true);
+    EXPECT_TRUE(k.r.driveUntilJudged());
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{2, 3, 4}));
+}

@@ -1804,7 +1804,10 @@ private:
         std::set<int64_t> present;
         for (const auto& d : log.data) present.insert(d.offset);
 
-        foldViews_(dataEnd_(log));
+        int64_t foldEnd = dataEnd_(log);   // a committed transaction applies at its marker: the views fold past it
+        for (const auto& m : log.txnMarkers)
+            if (m.commit) foldEnd = std::max(foldEnd, m.offset + 1);
+        foldViews_(foldEnd);
         checkIndex(rig_, model, &present);
         if (!log.data.empty() && !log.markers.empty() && !log.changes.empty()) checkMarkers(model, log, dataEnd_(log), compacted_);
         for (const Pending& p : pending_) {

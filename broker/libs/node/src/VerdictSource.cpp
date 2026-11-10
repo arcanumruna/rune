@@ -700,12 +700,13 @@ void VerdictSource::notePause_(int64_t offset) noexcept {
 }
 
 // Design 3.1: the coverage never lies inside (first, M] of an applied span, or a restart there would meet M with none of T's records
-// ahead of it.  A hold inside the span counts from its first record.
+// ahead of it.  A hold inside the span counts from its first record, or from the earlier applied span the span itself lies in.
 void VerdictSource::endOrdinary_(const OrdinaryTxn& o) noexcept {
     closeSpan_(o.producerId);
+    const int64_t from = std::min(o.first, o.holdFrom);
     for (OrdinaryTxn& x : ordinary_)
-        if (const int64_t at = std::min(x.first, x.holdFrom); o.first < at && at <= o.marker) x.holdFrom = o.first;
-    state_->txn.holdBelowSpan(o.first, o.marker);
+        if (const int64_t at = std::min(x.first, x.holdFrom); from < at && at <= o.marker) x.holdFrom = from;
+    state_->txn.holdBelowSpan(from, o.marker);
     ordinary_.erase(ordinary_.begin() + static_cast<std::ptrdiff_t>(markerAt_));
     ordinaryApplied_ = -1;
     ordinaryWalk_ = {};
@@ -1030,8 +1031,9 @@ int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, in
 }
 
 // D2/D3: a TxnJudge in a member's replay.  Decided (its entry Finalized, or replaced by the producer's next transaction): a
-// committed transaction applies here, an aborted one is dropped (a replaced entry's aborted batches are skipped by the filter).  Undecided: an active member drops the span, and finalizeLocked_ applies it
-// to every active member; any other member (a candidate, a joiner) waits here until it is decided.
+// committed transaction applies here, an aborted one is dropped (a replaced entry's aborted batches are skipped by the filter).  Locked: an active member drops the span, and finalizeLocked_ applies it
+// to every active member.  Any other undecided entry (one K passed unjudged: another leader's markers covered it before its marker
+// was known here), and a candidate or a joiner, waits here until it is decided.
 rune::view::JudgeDecision VerdictSource::judgeStep_(Member& m, const uint8_t* batch, std::size_t len, int64_t at) noexcept {
     if (len != cr::kTxnJudgeBatchBytes) return {};
     const auto j = cr::parseTxnJudge(batch, len);
@@ -1041,7 +1043,7 @@ rune::view::JudgeDecision VerdictSource::judgeStep_(Member& m, const uint8_t* ba
         if (t->phase != TxnPhase::Finalized) {
             const bool active = std::find(active_.begin(), active_.end(), static_cast<std::size_t>(&m - members_.data())) != active_.end();
             if (!active && !m.candidate) ++state_->txn.stats.joinerTxnWaits;
-            return {active ? rune::view::JudgeStep::Drop : rune::view::JudgeStep::Wait, j->producerId};
+            return {active && t->phase == TxnPhase::Locked ? rune::view::JudgeStep::Drop : rune::view::JudgeStep::Wait, j->producerId};
         }
         if (!t->commit) return {rune::view::JudgeStep::Drop, j->producerId};
     }
@@ -1092,9 +1094,9 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
                     txnStop_ = TxnStop::Judge;
                     break;
                 }
-                // A decided commit whose span a member's replay holds open: the member's fold applies it at this J, so the judge stops after it.
-                if (t != nullptr && t->judgeOffset == r.baseOffset() && t->phase == TxnPhase::Finalized && t->commit &&
-                    std::any_of(active_.begin(), active_.end(), [&](std::size_t i) { return members_[i].inst->spanFence.find(t->producerId) != nullptr; })) {
+                // A commit decided before the judge reached its J (a re-activation's K below it): the members' fold applies it at this J,
+                // from the span a replay holds open or as a backfill from its first record, so the judge stops after it.
+                if (t != nullptr && t->judgeOffset == r.baseOffset() && t->phase == TxnPhase::Finalized && t->commit && t->markerOffset > t->judgeOffset) {
                     judgeCursor_ = last + 1;
                     txnStop_ = TxnStop::Fold;
                     break;

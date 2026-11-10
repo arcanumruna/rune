@@ -242,7 +242,7 @@ public:
         for (const auto& v : log.markers)
             for (const ModelTxn& t : txns_) {
                 const int64_t through = v.header.finalThrough;
-                if ((t.marker < 0 || v.offset < t.marker) && !(t.judge >= 0 && v.offset > t.judge && t.vote && t.vote->code != 0) && through > t.first)
+                if ((t.marker < 0 || v.offset < t.marker) && through > t.first)
                     return "the marker at " + std::to_string(v.offset) + " ends at " + std::to_string(through) + ", past the first record " + std::to_string(t.first) + " of producer " + std::to_string(t.pid) + "'s undecided transaction";
                 if (t.judge < 0 && t.commit && t.first < through && through <= t.marker)
                     return "the marker at " + std::to_string(v.offset) + " ends at " + std::to_string(through) + ", inside the span " + std::to_string(t.first) + ".." + std::to_string(t.marker) + " of producer " + std::to_string(t.pid) + "'s transaction";

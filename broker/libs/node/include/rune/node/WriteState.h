@@ -314,8 +314,9 @@ public:
             }
     }
     /// An entry truncateFrom reset whose transaction lies below `covered`, the markers' coverage, with its marker known: a judge
-    /// before this one applied it (K never passes a transaction that is not Finalized), so nothing is left to do.  Not from the
-    /// judge's cursor: a reset Locked entry with J < cursor <= M still owes its apply (T5 N1).
+    /// before this one applied it (K never passes a transaction that is not Finalized), or the members' fold applies a commit at its
+    /// J (a replay waits there, or the judge stops there).  Not from the judge's cursor: a reset Locked entry with J < cursor <= M
+    /// still owes its apply (T5 N1).
     void finalizeDecided(int64_t covered) noexcept {
         for (DeferredTxn& t : txns_)
             if (t.phase == TxnPhase::AwaitJudge && t.markerOffset >= 0 && t.firstOffset < covered) t.phase = TxnPhase::Finalized;

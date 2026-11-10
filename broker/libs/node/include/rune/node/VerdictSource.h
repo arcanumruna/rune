@@ -1059,7 +1059,8 @@ bool VerdictSource::resolveMarkers_(ReadRangeFn& readRange, TxnKeySet& keys, int
     return found;
 }
 
-// P11-4: the judge stands at T's TxnJudge.  A yes locks T's rows in the overlay; a no releases it.  True: judged, the judge passed J.
+// P11-4: the judge stands at T's TxnJudge.  A yes locks T's rows in the overlay; a no releases it.  Either way T waits for its marker
+// (an earlier leadership's yes can commit T over this no): finalizeLocked_ applies a commit.  True: judged, the judge passed J.
 template <class ReadRangeFn>
 bool VerdictSource::judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept {
     DeferredTxn& t = *state_->txn.find(judgePid_);
@@ -1083,14 +1084,13 @@ bool VerdictSource::judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedT
     }
     t.answer = jx_.answer;
     t.judged = true;
+    judgedRecord_ = true;   // T's records: a marker passes them once T is decided, though no other record follows
     countVote_(t.answer);
-    if (t.answer.code == 0) {
-        t.phase = TxnPhase::Locked;
-    } else {
+    if (t.answer.code != 0) {
         releaseOverlay_(t.overlay);
         t.overlay = -1;
-        t.phase = TxnPhase::Finalized;
     }
+    t.phase = TxnPhase::Locked;
     endJudgement_();
     judgeCursor_ = t.judgeOffset + 1;
     txnStop_ = TxnStop::None;
@@ -1203,7 +1203,7 @@ bool VerdictSource::finalizeLocked_(ReadRangeFn& readRange, const rune::view::Ab
             }
             if (!applyTxnRecords_(readRange, t->producerId, t->firstOffset, t->judgeOffset, aborted, finalizeApplied_)) return false;
         }
-        releaseOverlay_(t->overlay);
+        if (t->overlay >= 0) releaseOverlay_(t->overlay);   // a no gave it back at its judgement
         t->overlay = -1;
         t->phase = TxnPhase::Finalized;
         closeSpan_(t->producerId);   // the step's postcondition: T was applied to every active member (no span is open here today)

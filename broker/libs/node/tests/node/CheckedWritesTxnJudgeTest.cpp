@@ -1292,7 +1292,7 @@ TEST(CheckedWritesTxnJudgeRegression, NoVoteAwaitingItsAbortIsNeverGivenUpRegres
     r.log.judge(77, 10);                     // 13
     r.drive();
     ASSERT_NE(r.st.txn.find(77), nullptr);
-    ASSERT_EQ(r.st.txn.find(77)->phase, TxnPhase::Finalized);
+    ASSERT_EQ(r.st.txn.find(77)->phase, TxnPhase::Locked);
     ASSERT_LT(r.st.txn.find(77)->markerOffset, 0);
     for (std::size_t i = 0; i + 1 < TxnJudgeState::kMaxTxns; ++i)
         ASSERT_NE(r.st.txn.onJudgeRecord(100'000 + int64_t(i), {1000 + int64_t(i), 0, 50'000 + int64_t(i)}), nullptr);
@@ -1457,7 +1457,7 @@ TEST(CheckedWritesTxnJudge, NoVoteCarriesTheFirstFailingRecord) {
     r.log.judge(77, 10);
     r.drive();
     const DeferredTxn* t = r.st.txn.find(77);
-    EXPECT_EQ(t->phase, TxnPhase::Finalized);
+    EXPECT_EQ(t->phase, TxnPhase::Locked);
     EXPECT_EQ(t->answer.code, kViolation);
     EXPECT_EQ(t->answer.constraintId, kTagId);
     EXPECT_EQ(t->answer.failingOffset, 11);
@@ -1566,7 +1566,7 @@ TEST(CheckedWritesTxnJudgeRegression, OutsideWriteNewerThanTheTxnsLastWriteVotes
     const DeferredTxn* t = r.st.txn.find(77);
     EXPECT_FALSE(r.st.rejected.isRejected(14));
     EXPECT_TRUE(r.rowed(4));
-    EXPECT_EQ(t->phase, TxnPhase::Finalized);
+    EXPECT_EQ(t->phase, TxnPhase::Locked);
     EXPECT_EQ(t->answer.code, 63);
     EXPECT_EQ(t->answer.constraintId, 0u);
     EXPECT_EQ(t->answer.failingOffset, 14);
@@ -1584,7 +1584,7 @@ TEST(CheckedWritesTxnJudgeRegression, ConstraintFailureIsAnsweredBeforeTheConfli
     r.log.judge(77, 12);             // 14
     r.drive();
     const DeferredTxn* t = r.st.txn.find(77);
-    EXPECT_EQ(t->phase, TxnPhase::Finalized);
+    EXPECT_EQ(t->phase, TxnPhase::Locked);
     EXPECT_EQ(t->answer.code, 55);
     EXPECT_EQ(t->answer.failingOffset, 12);
 }
