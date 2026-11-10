@@ -1802,12 +1802,13 @@ TEST(D9BrokerNodeWiringRegression, MarkerForARemotelyLedPartitionLandsThroughThe
     BrokerNode& L = *nodes[static_cast<std::size_t>(leader)];
 
     const auto marker = tx::ControlMarker::build(/*pid=*/4242, 0, tx::ControlType::Commit, /*coordinatorEpoch=*/1);
-    const auto rc = C.onControlThreadForTest([&] {
-        return C.gatewayForTest()->appendControlRecord(0, part, std::span<const uint8_t>(marker), 4242, true, 1);
+    // One hop: between two, the control loop can take the leader's answer and erase the in-flight entry.
+    const auto [rc, sent] = C.onControlThreadForTest([&] {
+        const int64_t r = C.gatewayForTest()->appendControlRecord(0, part, std::span<const uint8_t>(marker), 4242, true, 1);
+        return std::pair{r, C.gatewayForTest()->remoteMarkersInFlightForTest()};
     });
     ASSERT_EQ(rc, rune::gateway::ClientGateway::kControlRecordAsync);
-    EXPECT_EQ(C.onControlThreadForTest([&] { return C.gatewayForTest()->remoteMarkersInFlightForTest(); }), 1u)
-        << "the marker was not forwarded to the remote leader";
+    EXPECT_EQ(sent, 1u) << "the marker was not forwarded to the remote leader";
 
     bool landed = false;
     while (!landed) {
