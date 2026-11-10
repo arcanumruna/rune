@@ -3742,6 +3742,32 @@ TEST(ElectionStorageRegression, ReleaseRestoresAPendingStandDownRegression) {
     EXPECT_STREQ(e.candidacyName(), "Candidate");
 }
 
+// CI flake (StoodDownLeaderFlap...): a StandDown and the peer's canvass in one consensus step nominated the follower
+// before that cycle's hold reached it; the held node then pre-balloted, stood and won.  The hold engaged in NOMINATE
+// returns it to the canvass.  RED: nominate() without the candidacyBlocks_ check.
+TEST(ElectionStorageRegression, HoldEngagedWhileNominatingNeverStandsRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    auto e = makeSdElection(0, pub, nsf, tl, 42);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);
+    e.onRequestVote(0, 0, 1, 1, nowNs);
+    e.onNewLeadershipTerm(nowNs, 0, 1, 0, 0, 1, 0, 0, 0, 0, /*leader=*/1, 0, true, 0);
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    e.onStandDown(nowNs + 1, /*term=*/1, /*leader=*/1);
+    e.onCanvassPosition(0, 0, 1, 2);
+    e.doWork(nowNs + 2);
+    ASSERT_EQ(e.state(), ElectionState::Nominate);
+    e.setStorageHold(true, nowNs + 2);
+    nowNs += 2 + kElectionTimeoutNs;   // past any nomination deadline
+    e.doWork(nowNs);
+    EXPECT_EQ(e.state(), ElectionState::Canvass) << "the held node kept its nomination";
+    EXPECT_FALSE(e.preBallotActiveForTest()) << "the held node opened a pre-ballot";
+    EXPECT_TRUE(neverStands(e, pub, nowNs, /*term=*/1, 10)) << "the held node stood for election";
+}
+
 // R12: a candidate's term in a RequestVote is never founding evidence; a canvass carrying valid flags and no history is
 // "fresh", flags 0 (an old sender) and flag 1 are history.  RED: count candidateTermId, or read flag 0 as fresh.
 TEST(ElectionStorageRegression, CandidateTermIsNeverEvidenceAndFlagsAreRegression) {

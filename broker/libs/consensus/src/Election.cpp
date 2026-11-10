@@ -410,6 +410,12 @@ int Election::canvass(int64_t nowNs)
 // ---------------------------------------------------------------------------
 int Election::nominate(int64_t nowNs)
 {
+    // The candidacy may block after the canvass nominated us (the storage hold engaged later in the same duty cycle,
+    // a withdrawal): never a pre-ballot or a term raise, back to the canvass.
+    if (candidacyBlocks_(nowNs, 0)) {
+        state(ElectionState::Canvass, nowNs, "candidacy blocked while nominating");
+        return 1;
+    }
     // Election.java:734-741: if deadline passed → become candidate
     if (nowNs >= nominationDeadlineNs_) {
         // D29 PreVote (Raft §9.6, a Rune extension): before raising the durable
