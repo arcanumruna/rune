@@ -5,9 +5,8 @@
 **Owner ruling 2026-11-07:** Phase 3 (discovery library on Rune) is dropped; Herald builds its pod registry on Phase 1–2.
 
 **Owner ruling 2026-11-07 (later):** transient lease topics are allowed and persist nothing across a full restart
-(spec, top note and Appendix A). Tasks 3 and 4 below still refuse `transient lease topic`; the next session designs
-the transient tasks (eviction floor and carry, follower floor, the `max_ttl` grant wait after rebirth) and changes
-those refusals. Settled by the owner: nothing goes to disk, versions restart with the ring, and grants wait out
+(spec, top note and Appendix A). Tasks 3 and 4 below refuse `transient lease topic`; Phase 3 (Tasks 25-32, spec
+Appendix A, designed 2026-11-10) lifts that refusal and builds carry, the floors, the reserve and the rebirth fence. Settled by the owner: nothing goes to disk, versions restart with the ring, and grants wait out
 `max_ttl` after a full restart (spec top note). Task 1 is unaffected.
 
 
@@ -1448,6 +1447,157 @@ semantics, the local-`onLost` note of §12.2), `docs/api/wire-protocol.md` (temp
 
 - [ ] Write; check every code sample compiles in `client-cpp/examples/` (one example per recipe). Commit and push.
   **Checkpoint F** (Herald P0 leadership unblocked), then the final whole-branch review.
+
+## Phase 3: transient lease topics (spec Appendix A)
+
+Owner rulings 2026-11-07 (spec top note). Design 2026-11-10 (spec Appendix A). One review for the whole phase, at
+its end (owner: one review per batch). Focused `--gtest_filter` runs only. Implementers do not commit.
+
+**Phase interaction matrix:** spec A.8. **Phase review focus:** spec A.9.
+
+### Task 25: protocol and client classification of `Carry` and the fence record
+
+Spec A.3 (`Carry`), A.6 (fence record).
+
+**Files:** `protocol/include/rune/protocol/LeaseRecord.h`, the client `Record::leaseOp()` (`Subscription.h`),
+`client-cpp/src/lease/LeaseSession.cpp`, `client-cpp/src/lease/LeaseWatch.cpp`, the write hook
+(`broker/libs/node/src/CheckedWriteHook.cpp` lease branch).
+
+- [ ] `isLeaseCarry(attrs, traits)`: lease topic, op `Put`, intent `Upsert`. `kLeaseFenceVersion = -1` and
+  `isLeaseFence(value)`: `lease_version` (value bytes `[4, 12)`) equals −1. Both `constexpr`, no allocation.
+- [ ] `leaseOp()` gains `Carried`. `LeaseSession` ignores it. `LeaseWatch` ignores a `Carried` record of a key it
+  holds at that version, and takes one for a key it does not hold as that key's current row.
+- [ ] The write hook already refuses a client `upsert`; add a test proving a client `Put`+`Upsert` and a client
+  `Checkpoint` with version −1 are refused `InvalidRequest` on a transient lease topic.
+- [ ] Tests: `LeaseCarryClassifyRegression.*` (every op × intent → the right `leaseOp()`; mutation: classify
+  `Put`+`Upsert` as `Updated` → red), `LeaseWatchCarryRegression.*` (known key at the same version → no event;
+  unknown key → present, no `Granted` event).
+
+### Task 26: DDL — accept transient lease topics
+
+Spec A.2.
+
+**Files:** `broker/libs/node/src/AdminWorker.cpp` (`:1493` refusal, the lease alter path),
+`broker/libs/node/include/rune/node/TopicFeatureRules.h`, `broker/libs/node/tests/node/LeaseDdlTest.cpp`.
+
+- [ ] Remove the refusal. Refuse a transient lease topic whose `lease.max_ttl` is the default (9 × 10¹² ms) with
+  `InvalidRequest` "a transient lease topic needs lease.max_ttl". Refuse an alter that lowers `max_ttl` on a
+  transient lease topic with "a transient lease topic's max_ttl can only be raised".
+- [ ] The pins at `LeaseDdlTest.cpp:140` and `:538` change to: accepted with an explicit `max_ttl`, refused without.
+- [ ] Tests: `LeaseDdlTransientRegression.*` (create with/without `max_ttl`, alter up accepted, alter down refused,
+  persisted lease topic alter down still accepted; mutation: drop the default check → red).
+
+### Task 27: lineage generation and the worker lineage op
+
+Spec A.6 ("When a partition is reborn", "How the leader learns it").
+
+**Files:** `broker/libs/metadata/include/rune/metadata/MetadataExtensions.h` (`TransientLineage`, its record,
+`decideTransientLineage`), `broker/libs/node/include/rune/node/MetadataService.h` (both decision sites),
+`broker/libs/node/include/rune/node/WorkerOp.h`, a new `broker/libs/node/include/rune/node/LeaseLineageFanout.h`
+modelled on `ReadLeaseFanout.h`, `BrokerNode.cpp` wiring, `Worker.cpp` dispatch.
+
+- [ ] `TransientLineage::generation` (`uint32_t`). `decideTransientLineage`: kept → the record's generation; minted
+  with no record → 0; minted over a record → record + 1.
+- [ ] Record version 1 carries the generation; written only at the lease feature level, else version 0. Decode
+  accepts 0 (generation 0) and 1.
+- [ ] `WorkerOp::TransientLineage{topicId, partition, leaderEpoch, lineage, generation}`, posted by the fanout to the
+  owning worker for each transient LEASE partition this node leads once `lineageConfirmedFor` holds, behind the
+  pass's role ops; a full ring is retried next pass; posted once per (partition, leaderEpoch).
+- [ ] Tests: `LineageGenerationRegression.*` (table: no record / kept / minted over g / unclean → expected
+  generation; version 0 ↔ 1 round-trip and decode of both), `LeaseLineageFanoutRegression.*` (held behind pending
+  role ops, retried on a full ring, once per leadership, only lease topics), and a single-node restart test proving
+  generation ≥ 1 after a restart (`rebuildFromLog`).
+
+### Task 28: ring floor, `bytesFrom`, the reserve and the follower floor
+
+Spec A.3 (floors), A.4.
+
+**Files:** `broker/libs/storage/include/rune/storage/InMemoryLog.h`,
+`broker/libs/replication/include/rune/replication/PartitionReplica.h` / `src/PartitionReplica.cpp`,
+`broker/libs/storage/tests/storage/InMemoryLogTransientTest.cpp`,
+`broker/libs/replication/tests/replication/TransientReplicaTest.cpp`.
+
+- [ ] `InMemoryLog::bytesFrom(offset)`: ring bytes of entries whose `lastOffset ≥ offset` (padding included), no
+  allocation. `appendKeepingFree(data, len, lastOffset, reserve)`: like `append`, but `kRefusedFull` when fewer than
+  `reserve` bytes would stay free after the evictions the floor allows; nothing evicted on a refusal.
+- [ ] `PartitionReplica`: a lease floor provider (`setLeaseFloor(Offset)`, kept by the worker; `kNoEvictionFloor`
+  when none). Leader floor = `min(HW, leaseFloor)`. Follower floor on a lease partition = `min(followerHw, the
+  leader's logStartOffset from the last fetch answer or push)`. Client batches on a transient lease partition use
+  `appendKeepingFree` with `reserve = max(capacity / 8, 64 KiB)`; refusal → `TransientLogFull`. Broker lease appends
+  (`appendLeaseBatch`) keep plain `append`.
+- [ ] Check that a push carries the leader's `logStartOffset`; if it does not, add it.
+- [ ] Tests: `InMemoryLogReserveRegression.*` (reserve boundaries 0 / 1 / exact / exact+1 bytes, wrap padding, floor
+  blocking eviction), `InMemoryLogBytesFromRegression.*`, `TransientLeaseFloorRegression.*` (leader never evicts at
+  or above the lease floor; follower never evicts at or above the leader's start; a plain transient topic unchanged;
+  mutation: leader floor = HW only → red).
+
+### Task 29: `LeaseIndex` — anchors, `Carry` and the fence record
+
+Spec A.3 (anchor list, judge, replay), A.6 (fence record).
+
+**Files:** `broker/libs/node/include/rune/node/lease/LeaseIndex.h`, `src/lease/LeaseIndex.cpp`,
+`broker/libs/node/tests/node/LeaseJudgeTest.cpp`, `LeasePromotionTest.cpp`.
+
+- [ ] Aux 32 bytes on transient lease topics (8 on persisted): `lastAppended`, anchor offset, anchor bytes,
+  `prev` / `next`. The anchor list: append-at-tail on a fold that moves the anchor (grant, update, carry), unlink on
+  revoke / expire, `head()`, `liveBytes()`. Replay builds the same list.
+- [ ] Judge: `Carry` accepted iff the live row's version equals the record's (only the anchor moves); otherwise
+  `kVerdictStaleBroker`. Replay: a `Carry` for an absent row creates it (as a `Checkpoint` does).
+- [ ] The fence record (version −1) is recognised before any key handling, on the live path and in replay: it sets
+  the partition's fence state `{lineage, ttl, remaining, offset}`, never a row. On a persisted topic it is ignored and
+  counted.
+- [ ] Tests: `LeaseAnchorListRegression.*` (the list after every op sequence equals a model: sorted, head = min live
+  anchor, `liveBytes` = sum; seeded random sequences), `LeaseCarryJudgeRegression.*` (accept / stale × every row
+  state), `LeaseCarryReplayRegression.*` (a ring starting after the grant rebuilds the row, its version, TTL and
+  remaining), `LeaseFenceRecordRegression.*`.
+
+### Task 30: lease runtime — carry emission and the rebirth fence
+
+Spec A.3 ("When to carry", emission gate), A.6 (states, decision table, ending, carry of the fence).
+
+**Files:** `broker/libs/node/include/rune/node/lease/LeaseRuntime.h`, `src/lease/LeaseRuntime.cpp`, the worker's
+lease duty (`Worker::leaseDuty_`), the grant judge path, metrics (`rune_lease_transient_live_bytes`,
+`rune_lease_transient_carried`, fence state gauge).
+
+- [ ] Carry: at the end of each duty pass, when `bytesFrom(head) > capacity / 2` and `bytesFrom(head) − liveBytes ≥
+  capacity / 4`, append `Carry` for head keys in `Armed` with the gate open, up to the expiry batch / byte cap. The
+  fence record is carried when it is the oldest anchor. Push the floor (`min(head anchor, fence anchor)`) to the
+  replica after each fold that moves it. Warning (rate-limited) when `liveBytes > capacity / 4`.
+- [ ] Fence states `AwaitLineage` / `Deciding` / `Fencing` / `Open` (a `std::variant` of rich states, rule 3) and the
+  A.6 decision table on the `TransientLineage` op (after replay is ready). Grants answer `Throttled` with the A.6
+  retry-after in every state but `Open`. The fence ends through the expiry emitter's never-early path.
+- [ ] Tests: `LeaseFenceDecisionRegression.*` (every row of the A.6 table, plus a leader change in each state, with
+  the injected clock: grants refused until exactly `readyNs + extendNs + r`, accepted after; mutation: generation
+  ignored → red), `LeaseCarryEmitRegression.*` (thresholds at ±1 byte; gate closed skips; a racing update holds the
+  carry), `LeaseCarryAllocRegression` (zero allocations in carry and fence paths).
+
+### Task 31: `LeaseWatch` across a data reset
+
+Spec A.7.
+
+**Files:** `client-cpp/src/lease/LeaseWatch.cpp`, `client-cpp/include/rune/client/lease/LeaseWatch.h`,
+`broker/libs/node/tests/node/LeaseWatchTest.cpp` or the client test tree.
+
+- [ ] On each duty pass, a grown `dataResets` on a partition's subscription → `toBroken_` → rerun.
+- [ ] Find what a subscribe below a transient ring's start answers today; route a clamped start to the same rerun.
+- [ ] Tests: `LeaseWatchDataResetRegression.*` (old keys ended, new keys new, no stale key; mutation: ignore
+  `dataResets` → red), `LeaseWatchEvictedAsOfRegression.*`.
+
+### Task 32: broker integration, stress and e2e
+
+Spec A.8.
+
+**Files:** `broker/libs/node/tests/client/LeaseTransientTest.cpp` (new), `LeaseTrio.h`, `LeaseStressDriver.h`,
+`broker/docker/lease-e2e.sh`, `client-cpp/examples/lease_e2e_driver.cpp`.
+
+- [ ] 1-node: create, grant, carry under ring pressure with every lease kept, restart → fence → grant after the wait
+  (injected clock where the rig allows; otherwise `max_ttl` = the 1 s floor), watcher reset.
+- [ ] 3-node: leader change mid-fence and fence open; follower ring reset rebuilds every lease and view row; kill all
+  three → fence.
+- [ ] Stress: the seeded model checker gains a transient mode (ring pressure, carry, leader changes, full restart)
+  with the invariants T1–T5 checked after every step.
+- [ ] e2e leg: a transient lease topic through a full restart on the real broker (default config). Runs on the temp
+  box at the batch end, with the owner's OK.
 
 ## Spec gaps (decided here, recorded for review)
 

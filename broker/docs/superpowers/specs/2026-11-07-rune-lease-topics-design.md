@@ -41,7 +41,7 @@ rev 3 could not be built or could expire early.
 nothing: a lease on a transient topic does not survive a restart of every replica of its partition. After such a
 restart the partition is empty, watchers get `PartitionDataReset` (43), and holders get `kErrLeaseNotFound` and grant
 again. While any replica stays up, the ring is replicated in memory as for every transient topic, so a minority
-failure loses no lease. Appendix A is now the design input for this, not deferred work.
+failure loses no lease. Appendix A is the design (2026-11-10).
 
 **Owner rulings 2026-11-07 (transient restart):**
 - **Nothing goes to disk for a transient lease topic.** No version floor, no borrowed leader epoch, no file. After a
@@ -376,7 +376,7 @@ lease topic <name> { <field> <type>, ... } [ partitions <n> ] [ replicas <r> ] k
 
 - **Shape.** A lease topic is typed and keyed. Without a field list and `key`, the DDL is refused with
   `lease topic needs a typed, keyed topic`.
-- **Refused forms.** `autoincrement` is refused. `transient lease topic` is allowed (owner ruling 2026-11-07, top of this spec; design pending, Appendix A).
+- **Refused forms.** `autoincrement` is refused. `transient lease topic` is allowed (owner ruling 2026-11-07, top of this spec; design in Appendix A).
 - **Cleanup.** `cleanup.policy` is fixed to `compact`. Retention other than −1 is refused: a live lease's latest
   record must never be deleted by retention. `delete.retention.ms` defaults to 1 h (call).
 - **Key index.** The lease index is the topic's key index (§7.1); `key.index` is implied.
@@ -818,7 +818,8 @@ is a fixed-width `prefixWidth`, which a path prefix cannot use.
       next cycle tries again. While the partition cannot reach min-ISR, no `Expire` could become visible anyway. The
       append uses `acksAll = true`: an `Expire` is majority-durable, like any acks=all write.
     - `kAppendNotLeader`: the emitter stops, so a deposed leader appends nothing.
-    - `kAppendBackPressure` cannot happen on a persisted lease topic. On a transient one it can (owner ruling 2026-11-07, top note): design pending.
+    - `kAppendBackPressure` cannot happen on a persisted lease topic. On a transient one it can, once the ring's
+      reserve is used up (Appendix A.4): counted as backlog and retried, like `kAppendMinIsr`.
 - **Rule 16.** The TTL is a product semantic, not a convergence timeout. The timer decides only when the leader
   proposes an end. The judged log decides whether it ended. `extend` (§9.6) affects only *when* a promoted leader
   proposes, never *whether* an end is accepted.
@@ -2047,18 +2048,208 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 11. **Widths and orders.** Every §5.1 key-width site, and `ScanLeases`' hash order with its O(n) cost.
 12. **Vacuous tests.** Each §16.5 mutation turns a test red, and the stress invariants are checked after every step.
 
-## Appendix A. Transient lease topics (in scope since the owner ruling of 2026-11-07; design pending)
+## Appendix A. Transient lease topics (design, 2026-11-10)
 
-Transient lease topics are out of this spec (Coordinator's call). This is the analysis for a future spec.
+This is the design for `transient lease topic`, in scope since the owner rulings of 2026-11-07 (top of this spec).
+The rulings are fixed: nothing goes to disk, a full restart empties the partition, grants wait out `max_ttl` after a
+full restart, and fencing by version does not hold across a full restart. Plan phase 3 builds it. Calls marked
+"(call)" are the Coordinator's.
 
-- **Why it is separate.** Checked writes refuse key indexes on transient topics (`TopicFeatureRules.h:39-49`), because
-  verdict markers in a ring are lost on restart. A lease topic on a ring also needs:
-  - the latest record of every live lease, and its latest checkpoint, kept in the ring;
-  - a full reset delivered to watchers (`PartitionDataReset`, 43).
-- **The FIFO floor.** A transient lease partition would pin the ring's eviction floor with
-  `InMemoryLog::setEvictionFloor` (`InMemoryLog.h:178`, not `truncateTo` at `:271`) at the oldest live lease's
-  grant. So the ring must hold up to the longest TTL of traffic. Revision 3 makes that worse: TTLs reach 9 × 10⁹ s.
-- **Markers need space too,** below that floor.
-- **Ring-full behaviour.** Keepalives are not ring writes, so a full ring no longer turns back-pressure into lost
-  leases. Grants and updates refused with `TransientLogFull` are the remaining cost.
-- **Open for the future spec:** a sizing rule, or a lease-aware ring that moves a live lease's latest record forward.
+### A.1 What has to hold
+
+- **T1. A live lease is never lost while one replica of its partition stays up.** The ring must not evict a live
+  lease's latest data record, on the leader or on any follower that can become leader.
+- **T2. A view rebuilt from the ring has every live lease.** A follower that restarts its ring at the leader's ring
+  start (`resetTransientLogTo_`) folds the lease view and every user view from there. A `Checkpoint` is invisible to
+  data folds (§6.6), so the record that keeps a lease in the ring must be a data record.
+- **T3. `Expire` can always be appended.** A full ring must never stop expiry (§9.7).
+- **T4. No grant succeeds on a partition that may have lost committed leases** until every lost lease has run out.
+  This covers a full restart and an unclean election.
+- **T5. Watchers and holders learn of a loss.** Watchers get `PartitionDataReset` (43); holders get
+  `kErrLeaseNotFound` at their next keepalive.
+- **T6. Nothing on the hot path changes for a persisted lease topic or a plain transient topic.**
+
+### A.2 Declaration
+
+- `transient lease topic` is accepted. The refusal at `AdminWorker.cpp:1493` goes; `TopicFeatureRules` allows the
+  pair.
+- **`lease.max_ttl` must be set explicitly** on a transient lease topic (call). The default, 9 × 10¹² ms, would make
+  the rebirth wait (A.6) endless. A transient lease topic whose `max_ttl` is the default is refused
+  `InvalidRequest` ("a transient lease topic needs lease.max_ttl").
+- **`lease.max_ttl` can only be raised** on a transient lease topic (call). A live lease keeps its TTL across an alter
+  (§5), so after a lowering, the rebirth wait would be shorter than a lost lease's TTL. A lowering is refused
+  `InvalidRequest` ("a transient lease topic's max_ttl can only be raised"); recreate the topic to lower it.
+- The ring is the global transient ring (`memoryLogRingBytes`, 8 MiB default, `RUNE_TRANSIENT_LOG_RING_BYTES`).
+  There is no per-topic ring size. A.5 gives the sizing rule.
+
+### A.3 Carry: keeping live leases in the ring
+
+- **Anchor.** A live key's anchor is the offset of its latest data record: its grant, its latest `Update`, or its
+  latest `Carry`. Every record of the key after the anchor (checkpoints, a `Checkpoint(0)`) is after it in the ring
+  too, so keeping the anchor keeps the key's whole current state.
+- **`Carry`: a new broker record.** A `Carry` is a lease `Put` (op 0) with intent `Upsert` (0), appended only by the
+  broker. Clients can never send it: a client `upsert` on a lease topic is refused (§6.2). It carries the live row
+  verbatim from the lease view, re-encoded with the latest writer version, like `Expire` and `Checkpoint` (§6.2),
+  including `lease_version`, `lease_ttl_ms` and `lease_remaining_ms`.
+  - **Data folds** see an upsert of the same row: the lease view and user views are unchanged, and a view rebuilt
+    from a ring that starts after the grant still gets the row (T2).
+  - **The judge** accepts a `Carry` only when the live row's version equals the record's, like a `Checkpoint`;
+    otherwise it is a stale broker record (`kVerdictStaleBroker`, counted, never applied). Accepting it changes only
+    the row's anchor.
+  - **Replay** (a promotion rebuild) creates the row from a `Carry` when the row is absent, as it does from a
+    `Checkpoint` (`LeaseIndex.cpp:296-299`), so a ring whose start is after the grant rebuilds every live lease.
+  - **Consumers.** `record.leaseOp()` returns a new value, `Carried`. `LeaseSession` ignores it. `LeaseWatch`
+    ignores a `Carried` record whose key it holds at that version; for a key it does not hold, it treats the record
+    as the row's current state (it can only meet one after a reset). A plain typed subscription sees a repeat of the
+    current row.
+- **The emission gate.** A `Carry` is built only for an entry in `Armed`, with the gate of §9.1 open (`Ready`, HW at
+  the leadership start, `lastAppended[k] ≤ judgedThrough`), exactly like a scheduled `Checkpoint`. So the lease
+  view's row is current when it is copied. No keepalive parks on a `Carry` and no wheel state is added: the record
+  copies the row's `lease_remaining_ms` unchanged, so a keepalive after it follows the existing rules.
+- **The anchor list (leader only).** The lease table's per-row aux grows from 8 to 32 bytes on transient lease topics
+  (persisted lease topics keep 8): `lastAppended` (8), the anchor offset (8), the anchor record's bytes (4), and
+  `prev` / `next` row ids (4 + 4) of an intrusive list kept in anchor order. A fold that moves a row's anchor unlinks
+  it and appends it at the tail; anchors only grow, so the list stays sorted. A revoke or expire unlinks the row.
+  The head is the oldest anchor, in O(1). `liveBytes`, the sum of the anchors' record bytes, is kept with the list.
+  Replay builds the same list. Followers keep no list (they hold no lease index, §7).
+- **The leader's floor.** The leader sets the ring's eviction floor to `min(HW, head anchor, fence anchor)` (A.6)
+  instead of the HW alone (`PartitionReplica::refreshTransientEvictionFloor_`). The floor is refreshed at every fold
+  that moves the head and at every HW change.
+- **When to carry.** Let `used` be the ring bytes from the head anchor to the tail (`InMemoryLog::bytesFrom(offset)`,
+  new). At the end of each lease duty pass, if `used > capacity / 2` and `used − liveBytes ≥ capacity / 4` (at least
+  a quarter of the ring can be reclaimed), the leader appends `Carry` for the head keys whose gate is open, up to the
+  expiry batch size and byte cap per pass (§9.1). Head keys whose gate is closed are skipped this pass; the head
+  moves when one of them folds. Carry is not limited by `lease.checkpoint_rate`: it is how the ring makes room (call).
+- **The followers' floor.** A follower sets its floor to `min(followerHw, leader's ring start)`, the ring start the
+  leader sends in every fetch answer (`logStartOffset`) and push. It then evicts nothing the leader still holds, so a
+  promoted follower holds every anchor (T1). If the follower's ring is full of records at or above that floor, its
+  apply is refused and retried as the leader's start moves (`transientApplyFullRefusals`), as today. Every node
+  uses the same ring size (one global setting).
+
+### A.4 The reserve (T3)
+
+- A client append to a transient lease partition (grant, update, revoke) is refused `TransientLogFull` (42) when,
+  after evicting what the floor allows, fewer than `reserve` bytes would stay free. `reserve = max(capacity / 8,
+  64 KiB)` (call). A refusal appends nothing and is definite, like every `TransientLogFull`.
+- Broker appends (`Expire`, `Checkpoint`, `Carry`, the fence) may use the reserve. If even the reserve is full, a
+  broker append is refused `kAppendBackPressure` and counted in `rune_lease_expiry_backlog`, as §9.1 says; the next
+  cycle retries. An `Expire` frees its key's anchor once it folds, so expiry makes room for the next one.
+- `InMemoryLog` gets `appendKeepingFree(data, len, lastOffset, reserve)`, which refuses `kRefusedFull` instead of
+  dipping into the reserve; plain `append` is unchanged. The replica uses it for client batches on a transient
+  lease partition only.
+
+### A.5 Sizing rule
+
+- A transient lease partition needs a ring of at least 4 × its live bytes plus the reserve: carry starts at half the
+  ring, and a quarter must be reclaimable. With the 8 MiB default and 128-byte rows, that is about 14 000 live
+  leases per partition.
+- `rune_lease_transient_live_bytes` and `rune_lease_transient_carried` are new per-partition metrics. The leader logs
+  one warning (rate-limited) when `liveBytes > capacity / 4`. Past that, grants and updates are refused
+  `TransientLogFull` before the live set can crowd out expiry.
+
+### A.6 The rebirth fence (T4)
+
+- **When a partition is reborn.** The controller mints a new data lineage when a transient partition's ring may not
+  hold its committed data: a full restart, an unclean or survivor election (`decideTransientLineage`). The
+  `TransientLineage` record gets a `generation`: 0 for the partition's first lineage, `previous + 1` at every mint
+  (a kept lineage keeps its generation). The record goes to version 1. A version-1 record is written only when the
+  cluster feature level includes lease topics, so every node can decode it; until then the record stays version 0
+  and its generation reads as 0. Single node: the metadata log is local and durable (`rebuildFromLog`), so a restart
+  finds the previous lineage and mints generation ≥ 1.
+- **How the leader learns it.** The control thread posts `WorkerOp::TransientLineage{topicId, partition, leaderEpoch,
+  lineage, generation}` to the worker that owns a transient lease partition this node leads, once the lineage is
+  trusted for that leadership (`lineageConfirmedFor`). It is posted behind the role ops of the same metadata pass
+  (as `ReadLeaseFanout` does), so it never overtakes a demotion. A full ring is retried next pass.
+- **The fence record.** A `Checkpoint` (op 3) with `lease_version = −1` is the partition's fence record; no real
+  version is negative (a version is an offset). Its key is the lineage token (8 bytes, little-endian),
+  `lease_ttl_ms` is the fence length, and `lease_remaining_ms` is the time left (0 means open). The judge and replay
+  recognise it by the version before any key handling; it is never a row. Data folds skip it, and the client library
+  hides it, as for every `Checkpoint`.
+- **States (per partition, in the lease runtime):**
+  - `AwaitLineage`: a new leadership before its `TransientLineage` op arrives. Grants are answered `Throttled` (53)
+    with a 1 ms retry-after.
+  - `Deciding{record offset}`: the leader appended a fence record and waits for it to fold. Grants: `Throttled`.
+  - `Fencing{deadline}`: grants are answered `Throttled` with a retry-after of `min(deadline − now, 1 s)`.
+    Updates, revokes and keepalives of rows that exist are served normally.
+  - `Open`: grants are judged as usual.
+- **The decision (on the lineage op), from the fence record replay found for this partition:**
+
+| Replayed fence record | Lineage generation | The leader appends | Then |
+|---|---|---|---|
+| for this lineage, open | any | nothing | `Open` |
+| for this lineage, remaining `r > 0` | any | nothing | `Fencing{readyNs + extendNs + r}` (§9.7's promotion rule) |
+| none, or another lineage's | 0 | open fence record | `Deciding`, then `Open` |
+| none, or another lineage's | ≥ 1 | fence record with remaining = `max_ttl` | `Deciding`, then `Fencing{readyNs + extendNs + max_ttl}` |
+
+- **Ending the fence.** At the deadline the leader appends an open fence record (remaining 0) through the same
+  never-early path as an `Expire` (§9.2): the deadline is only ever late, and nothing compares clocks across nodes.
+  The fence goes `Open` when that record folds.
+- **Carry and the fence.** The fence record's offset is the fence anchor; the leader's floor includes it (A.3).
+  Carry re-appends it when it is the oldest anchor, with `lease_remaining_ms = ⌈deadline − now⌉` while fencing
+  (rounded up, so only late) or 0 when open. So the fence record is never evicted, and a promoted leader of the same
+  lineage always finds it.
+- **Why the generation is needed.** Without it a leader cannot tell a brand-new partition (no fence needed) from a
+  reborn one: both have an empty ring. With it, only generation 0 opens at once.
+- **Cost, stated plainly.** After a full restart or an unclean election, no grant succeeds for `max_ttl` plus the
+  leader heartbeat timeout. The client library resends a `Throttled` grant within the caller's deadline (§12), so a
+  `LeaseSession` grant either succeeds after the wait or times out.
+
+### A.7 Watchers and holders (T5)
+
+- A `LeaseWatch` subscription is a v7 plain subscription, so its resume claims the data lineage. On a reborn
+  partition the gateway answers `PartitionDataReset` (43). **Today the client library then restarts the
+  subscription at the ring start on its own and only counts it** (`Subscription.h:330`, `dataResets`), so a
+  `LeaseWatch` never learns of it and keeps keys from the lost lineage forever (found in this design pass). Fix: the
+  watch reads the subscription's `dataResets` on every duty pass; when it grows, the watch treats the partition as
+  broken (`toBroken_`, then `startRerun_`): it re-scans and re-subscribes as after any break (§12.4), every key the
+  new scan lacks is reported ended, and keys of the new lineage are reported as new.
+- A `LeaseWatch` whose subscription position is clamped to the ring start (its `asOf` was evicted before it bound)
+  treats it as a reset too, since records between `asOf` and the ring start are gone. The plan checks what a
+  subscribe below a transient ring's start answers today and routes it to the same path.
+- A holder's keepalive on a reborn partition finds no row: `kErrLeaseNotFound`, and `LeaseSession` reports `onLost`.
+
+### A.8 Interaction matrix (transient lease topics)
+
+Operations: grant, update, revoke, keepalive, `Expire`, `Checkpoint`, `Carry`, the fence records, `ScanLeases`,
+`LeaseWatch`. Each is tested against each of these states and timings:
+
+| State or timing | Expected |
+|---|---|
+| first lineage (generation 0), new topic | an open fence record, then grants judged as usual |
+| leader change, lineage kept, fence open | no fence; every live lease survives with its version |
+| leader change, lineage kept, mid-fence | `Fencing` continues at `readyNs + extendNs + r`; never shorter |
+| leader change while the fence record is unfolded (`Deciding`) | the new leader decides again from what replay found; the fence is never skipped |
+| full restart (generation ≥ 1) | grants `Throttled` for `max_ttl + extend`; keepalives `kErrLeaseNotFound`; watchers reset |
+| unclean or survivor election | the same as a full restart, for rows the survivor lacks; rows it holds keep serving |
+| ring at half with reclaimable bytes | `Carry` of head keys; the floor moves; no lease lost |
+| ring full of live leases | client appends `TransientLogFull`; `Expire` still appends from the reserve |
+| reserve used up | broker appends counted as backlog and retried; nothing early |
+| `Carry` racing a client update or revoke of the same key | the gate holds the `Carry` (`lastAppended`); never a stale row copied |
+| `Carry` folding after the key's `Expire` or `Revoke` | stale broker record, not applied |
+| follower ring reset to the leader's start | it rebuilds every live row (from grants or carries) and every view row |
+| follower that becomes leader after a reset | the same lease set and versions as the old leader |
+| `LeaseWatch` across a rebirth | every old key ended, every new key reported new, no stale key |
+| `LeaseWatch` whose `asOf` was evicted | a rerun; no missed end |
+| alter `max_ttl` up / down | up: accepted, later fences use it; down: refused |
+| drop topic mid-fence | the fence state goes with the partition; no leak |
+| persisted lease topic, plain transient topic | unchanged (T6) |
+
+### A.9 Review focus (transient lease topics)
+
+1. **T1 on every replica.** The leader's floor includes every anchor and the fence; followers never evict at or
+   above the leader's start; a promoted follower has every anchor.
+2. **T2.** A view rebuilt from a ring that starts after a grant has the row. `Carry` is a data record everywhere a
+   fold reads it.
+3. **The fence is never skipped.** Every row of the A.6 table, every leader change inside it, and the version-0 /
+   version-1 lineage record on a mixed cluster.
+4. **Never early.** The fence ends through the expiry path; a carried `lease_remaining_ms` is copied, never
+   recomputed shorter.
+5. **No silent client change.** Clients cannot send a `Carry` or a fence record; `leaseOp()` classifies both.
+6. **T6.** Persisted lease topics and plain transient topics run the same code paths as before, with no added
+   branch on the produce path.
+
+### A.10 Out of scope
+
+- A per-topic ring size.
+- Fencing by version across a full restart (owner ruling: use a persisted lease topic).
+- A lease-aware compaction of transient rings beyond carry.
