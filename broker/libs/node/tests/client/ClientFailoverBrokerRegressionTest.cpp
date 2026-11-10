@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <fstream>
+#include <functional>
 #include <optional>
 #include <sstream>
 #include <chrono>
@@ -1299,3 +1300,95 @@ void homedLeaderCrash(const char* tag, bool restart) {
 TEST(ClientFailoverBrokerRegression, HomedLeaderCrashedSubscriptionKeepsDeliveringRegression) { homedLeaderCrash("fo_hlc", false); }
 TEST(ClientFailoverBrokerRegression, HomedLeaderCrashedAndRestartedSubscriptionKeepsDeliveringRegression) { homedLeaderCrash("fo_hlr", true); }
 
+
+// ---------------------------------------------------------------------------------------------------------
+// The Aeron client closes (an owner stall past its liveness timeout): the client rebuilds the transport in place
+// and the sessions resume.  An Invoker-mode client with the smallest liveness (1 s) is not pumped for 2 s; every
+// record produced after the stall is acked Ok on the resumed sessions, the client never goes Rejected, and the
+// control plane works again.  RED on main: the client went "failing for good" (nothing was ever acked again).
+// ---------------------------------------------------------------------------------------------------------
+namespace {
+void aeronClosedByStall(ThreeNodes& c, const std::function<rc::ClientConfig(int)>& configFor) {
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    auto admin = connectClient(c, configFor(c.runningNodes().front()));
+    rc::TopicOptions to;
+    to.replicationFactor = 3;
+    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, kDisk, to, {}, 60s);
+    admin->close();
+    ASSERT_EQ(def.errorCode, 0) << def.detail;
+    const rc::TopicSpec spec{"events", def.topicId, kPartitions};
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, def.topicId, leaders, 30s));
+
+    auto cfg = configFor(leaders[0]);
+    cfg.topics = {spec};
+    cfg.runnerMode = rc::RunnerMode::Invoker;
+    cfg.aeronClientLivenessTimeoutNs = rune::client::transport::kMinClientLivenessTimeoutNs;
+    cfg.connectTimeoutMs = 5'000; cfg.pingTimeoutMs = 30'000;
+    auto client = connectClient(c, cfg);
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.produceTimeoutMs = 30'000; pcfg.deliveryTimeoutMs = 60'000;
+    auto producer = client->producer(pcfg);
+    rc::Completions cq(*client);
+    const rc::TopicHandle th = client->topic("events");
+    std::map<rc::Token, rc::OpStatus> done;
+    auto pump = [&] {
+        (void)client->doWork();
+        (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) { done[d.token] = d.status; });
+    };
+    auto sendOne = [&](int seq) {
+        uint64_t k = static_cast<uint64_t>(seq) * 16;
+        while (rc::Key(k).partition(kPartitions) != seq % kPartitions) ++k;
+        const std::string v = valueOf(seq);
+        for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline;) {
+            const auto r = producer.trySend(th, rc::Key(k), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()),
+                                            cq, static_cast<rc::Token>(seq) + 1);
+            if (r == rc::SendResult::Ok) return true;
+            if (r != rc::SendResult::QueueFull && r != rc::SendResult::BackPressured) return false;
+            pump();
+            std::this_thread::sleep_for(100us);
+        }
+        return false;
+    };
+    auto pumpUntilAcked = [&](std::size_t n, std::chrono::milliseconds within) {
+        for (const auto deadline = Clock::now() + within; Clock::now() < deadline && done.size() < n;) {
+            pump();
+            std::this_thread::sleep_for(1ms);
+        }
+    };
+    for (int seq = 0; seq < 9; ++seq) ASSERT_TRUE(sendOne(seq));
+    pumpUntilAcked(9, 30s);
+    ASSERT_EQ(done.size(), 9u) << "precondition: produce works";
+
+    std::this_thread::sleep_for(2s);   // the owner stalls past the 1 s Aeron liveness; the brokers keep running
+
+    constexpr int kAfter = 30;
+    for (int seq = 9; seq < 9 + kAfter; ++seq) {
+        ASSERT_TRUE(sendOne(seq)) << "send refused, client state " << int(client->state());
+        for (int i = 0; i < 20; ++i) { pump(); std::this_thread::sleep_for(1ms); }
+    }
+    pumpUntilAcked(9u + kAfter, 40s);
+    int ok = 0;
+    for (int seq = 9; seq < 9 + kAfter; ++seq) ok += done.count(seq + 1) != 0 && done[seq + 1] == rc::OpStatus::Ok ? 1 : 0;
+    EXPECT_GE(client->testTransportRebuilds(), 1u) << "the closed Aeron client was rebuilt";
+    EXPECT_NE(client->state(), rune::client::session::SessionState::Rejected);
+    EXPECT_EQ(ok, kAfter) << "records produced after the stall are acked";
+    rc::DefineTopicResult d2;
+    EXPECT_NO_THROW(d2 = client->defineTopicAndWait("after", 1, "", {}, kDisk, {}, {}, 30s));
+    EXPECT_EQ(d2.errorCode, 0) << d2.detail;
+    producer.close();
+    client->close();
+}
+}  // namespace
+
+TEST(ClientFailoverBrokerRegression, AeronClientClosedByStallRecoversAgainstRealBrokersRegression) {
+    ThreeNodes c = ThreeNodes::start("fo_aeron_stall");
+    aeronClosedByStall(c, [&](int id) { return clientConfigFor(c, id); });
+}
+
+TEST(ClientFailoverBrokerRegression, AeronClientClosedByStallRecoversAgainstRealBrokersUnderRequiredCryptoRegression) {
+    ThreeNodes c = tlsNodes("fo_aeron_stall_tls", /*require=*/true);
+    const std::string ca = readFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/ca.pem");
+    aeronClosedByStall(c, [&](int id) { return tlsClientConfig(c, id, ca, /*require=*/true); });
+}

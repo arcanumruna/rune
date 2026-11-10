@@ -24,7 +24,9 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <atomic>
 #include <thread>
+#include <fcntl.h>
 #include <unistd.h>
 #include <vector>
 
@@ -796,6 +798,68 @@ TEST(ClientShardRegression, CloseDuringTransportDownIsBoundedExactlyOnceRegressi
     EXPECT_EQ(r.ledger.failed, 5);
     EXPECT_EQ(r.shard->status().state, rs::ShardState::Closed);
 }
+
+// An Agent-mode shard (its own duty thread, real clock) rebuilds after the transport fault too: Reconnecting, then
+// Live again, and the records accepted around the fault are acked exactly once.  The broker runs on its own driver,
+// pumped from this thread.
+TEST(ClientShardRegression, ThreadModeClientRebuildsAfterTransportFaultRegression) {
+    auto            g    = group(3820, 3821, 1, rs::ShardMode::Agent);
+    const auto      port = rune::client::testing::allocFreeUdpPortRange(2);
+    g.base.gatewayChannel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port);
+    g.base.egressChannel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port + 1);
+    test_support::BrokerHost broker(test_support::BrokerHost::uniqueDir(), g.base.gatewayChannel, g.base.gatewayStreamId,
+                                    rs::shardClientConfig(g, 0).egressChannel, g.base.egressStreamId);
+    rs::ClientShard shard(g, 0);
+    struct AtomicLedger {
+        std::atomic<int64_t> ok{0}, records{0};
+        static void on(void* ctx, const rc::BatchAck& a) noexcept {
+            auto* self = static_cast<AtomicLedger*>(ctx);
+            self->records += a.recordCount;
+            if (a.errorCode == 0) self->ok += a.recordCount;
+        }
+    } ledger;
+    shard.producer().onBatchAck(&AtomicLedger::on, &ledger);
+    std::vector<rs::ShardStatus> events;
+    auto pumpUntil = [&](auto&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (broker.gw.pump() == 0) std::this_thread::yield();
+            shard.pollEvents([&](const rs::ShardStatus& st) { events.push_back(st); });
+            if (pred()) return true;
+        }
+        return false;
+    };
+    ASSERT_TRUE(pumpUntil([&] { return broker.gw.ready(); }));
+    rc::Completions cq(shard.client());
+    ASSERT_EQ(shard.connect(cq, 1), rc::OpResult::Accepted);
+    ASSERT_TRUE(pumpUntil([&] { return shard.status().state == rs::ShardState::Live; }));
+    const auto topic = shard.topic("t");
+    for (int i = 0; i < 5; ++i) ASSERT_EQ(shard.trySend(topic, keyFor(1), kVal), rc::SendResult::Ok);
+    shard.client().testInjectTransportFault();
+    for (int i = 0; i < 5; ++i) ASSERT_EQ(shard.trySend(topic, keyFor(2), kVal), rc::SendResult::Ok);
+    ASSERT_TRUE(pumpUntil([&] { return ledger.records.load() >= 10 && shard.client().testTransportRebuilds() == 1; }));
+    EXPECT_EQ(ledger.ok.load(), 10);
+    EXPECT_EQ(shard.status().state, rs::ShardState::Live);
+    for (const auto& e : events) EXPECT_NE(e.state, rs::ShardState::Failed);
+    shard.closeImmediately();
+}
+
+#ifdef __linux__
+// The Aeron client's sockets are new after a rebuild: the park-until-work fds are re-queried per park and differ from
+// the closed driver's.
+TEST(ClientShardRegression, WakeFdsAreReplacedAfterRebuildRegression) {
+    OwnDriverRig r(ownDriverGroup(3822, 3823));
+    r.connect();
+    int before[8], after[8];
+    const int nb = r.shard->wakeFds(before, 8);
+    ASSERT_GT(nb, 0);
+    ASSERT_TRUE(faultAndRecover(r, 1));
+    const int na = r.shard->wakeFds(after, 8);
+    ASSERT_GT(na, 0);
+    // The old fds were closed with the old driver; whatever the kernel reused, every fd now returned is open.
+    for (int i = 0; i < na; ++i) EXPECT_NE(::fcntl(after[i], F_GETFD), -1) << after[i];
+}
+#endif
 
 // ---- close -------------------------------------------------------------------------
 

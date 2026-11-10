@@ -149,7 +149,7 @@ public:
     /// A7 park-until-work: this INVOKER driver's socket-readiness fds (its receiver / sender transport
     /// pollers' epoll instances, rune_driver_wake.h) into `out` (at most `max`); returns how many.  0 in
     /// Thread mode (the driver thread consumes the sockets), before start() / after stop(), or off Linux.
-    /// Owned by the driver: valid until stop().  The pumping owner parks in ppoll() on them between passes.
+    /// Owned by the driver: valid until the next rebuild() or stop(): re-query before each park.  The pumping owner parks in ppoll() on them between passes.
     /// 0 as well when epoll-first polling is off (review C1: Aeron's stock poller can leave an EPOLLERR socket
     /// ready, so only epoll-first pollers, which consume every readiness, may be parked on).
     [[nodiscard]] int wakeFds(int* out, int max) const noexcept;
