@@ -173,12 +173,12 @@ struct UniqueRig {
     }
 };
 
-TxnLockSet lockSetOf(const TxnOverlay& o) {
-    TxnLockSet l;
-    l.locked[0] = &o;
-    l.count = 1;
-    return l;
-}
+// The lock set of one held overlay.
+struct HeldLock : TxnLockSet {
+    explicit HeldLock(const TxnOverlay& o) : held(&o) { locked = std::span<const TxnOverlay* const>(&held, 1); }
+    HeldLock(const HeldLock&) = delete;
+    const TxnOverlay* held;
+};
 
 }  // namespace
 
@@ -227,7 +227,7 @@ TEST(CheckedWritesTxnOverlay, LockedRowReportsLocked) {
     TxnOverlay held;
     held.reserve(64, r.chain.rows() + 512);
     ASSERT_EQ(r.prepare(2, 100, 5, &held), PrepareStatus::Ok);
-    const TxnLockSet locks = lockSetOf(held);
+    const HeldLock locks(held);
     const auto groups = probe(r.groups, r.agg.groupRow.rowLen, 300), view = probe(r.view, r.comp.rowLayout.rowLen, 300);
 
     EXPECT_EQ(r.prepare(3, 100, 5, nullptr, false, &locks), PrepareStatus::Locked);
@@ -250,7 +250,7 @@ TEST(CheckedWritesTxnOverlay, UniqueClaimsAreLockedToo) {
     TxnOverlay held;
     held.reserve(64, 256);
     ASSERT_EQ(r.prepare(1, "foo", &held), PrepareStatus::Ok);
-    const TxnLockSet locks = lockSetOf(held);
+    const HeldLock locks(held);
     EXPECT_EQ(r.prepare(2, "foo", nullptr, false, &locks), PrepareStatus::Locked);
     EXPECT_EQ(r.prepare(2, "bar", nullptr, false, &locks), PrepareStatus::Ok);
     EXPECT_EQ(r.table.size(), 0u);
@@ -272,7 +272,7 @@ TEST(CheckedWritesTxnOverlay, ErasingAnAbsentRowLocksIt) {
 TEST(CheckedWritesTxnOverlay, ReadingAnAbsentRowLocksIt) {
     AggRig r(userTotals());
     ASSERT_EQ(r.prepare(5, -1, 0, &r.chain), PrepareStatus::Ok);   // a tombstone of an unknown contributor
-    const TxnLockSet locks = lockSetOf(r.chain);
+    const HeldLock locks(r.chain);
     EXPECT_EQ(r.prepare(5, 100, 1, nullptr, false, &locks), PrepareStatus::Locked);
     EXPECT_EQ(r.prepare(6, 100, 1, nullptr, false, &locks), PrepareStatus::Ok);
 }
@@ -280,7 +280,7 @@ TEST(CheckedWritesTxnOverlay, ReadingAnAbsentRowLocksIt) {
 TEST(CheckedWritesTxnOverlay, AChainDoesNotLockItself) {
     AggRig r(userTotals());
     ASSERT_EQ(r.prepare(1, 100, 1, &r.chain), PrepareStatus::Ok);
-    const TxnLockSet locks = lockSetOf(r.chain);
+    const HeldLock locks(r.chain);
     EXPECT_EQ(r.prepare(2, 100, 1, &r.chain, false, &locks), PrepareStatus::Ok);
 }
 
@@ -314,7 +314,7 @@ TEST(CheckedWritesTxnOverlay, ARowThatDecidesAConflictIsLocked) {
     std::memcpy(u.owners.put(ViewKey::fromBytes(keyBytes(5))), n.bytes.data(), u.spec.keyWidth);
     ASSERT_EQ(u.prepare(2, "foo", &u.chain), PrepareStatus::Ok);
     EXPECT_EQ(u.p.stats.keyConflicts, 1u);
-    const TxnLockSet locks = lockSetOf(u.chain);
+    const HeldLock locks(u.chain);
     EXPECT_EQ(u.prepare(5, "", nullptr, false, &locks), PrepareStatus::Locked);   // c5 leaving would free the row c2 lost to
     EXPECT_EQ(u.prepare(3, "", nullptr, false, &locks), PrepareStatus::Ok);
     EXPECT_NE(u.table.get(n), nullptr);
@@ -325,7 +325,7 @@ TEST(CheckedWritesTxnOverlay, ARowAnotherSourceOwnsIsLockedForUniqueToo) {
     ASSERT_EQ(u.prepare(1, "foo", nullptr, true), PrepareStatus::Ok);
     ASSERT_EQ(u.prepare(2, "foo", &u.chain), PrepareStatus::Ok);
     EXPECT_TRUE(u.p.rows[0].ownedByOther);
-    const TxnLockSet locks = lockSetOf(u.chain);
+    const HeldLock locks(u.chain);
     EXPECT_EQ(u.prepare(1, "", nullptr, false, &locks), PrepareStatus::Locked);
 }
 
@@ -333,7 +333,7 @@ TEST(CheckedWritesTxnOverlay, OwnerMappedMineThenOutsideMoveIsLocked) {
     UniqueRig u(false);
     ASSERT_EQ(u.prepare(1, "foo", nullptr, true), PrepareStatus::Ok);
     ASSERT_EQ(u.prepare(1, "foo", &u.chain), PrepareStatus::Ok);   // updated in place: the row it holds is the one it owns
-    const TxnLockSet locks = lockSetOf(u.chain);
+    const HeldLock locks(u.chain);
     EXPECT_EQ(u.prepare(1, "bar", nullptr, false, &locks), PrepareStatus::Locked);   // a Move off that row
     EXPECT_EQ(u.prepare(1, "", nullptr, false, &locks), PrepareStatus::Locked);
     EXPECT_EQ(u.prepare(2, "bar", nullptr, false, &locks), PrepareStatus::Ok);
@@ -343,7 +343,7 @@ TEST(CheckedWritesTxnOverlay, UniqueMineThenOutsideDeleteIsLocked) {
     UniqueRig u;
     ASSERT_EQ(u.prepare(1, "foo", nullptr, true), PrepareStatus::Ok);
     ASSERT_EQ(u.prepare(1, "foo", &u.chain), PrepareStatus::Ok);
-    const TxnLockSet locks = lockSetOf(u.chain);
+    const HeldLock locks(u.chain);
     EXPECT_EQ(u.prepare(1, "", nullptr, false, &locks), PrepareStatus::Locked);
 }
 
@@ -351,7 +351,7 @@ TEST(CheckedWritesTxnOverlay, UniqueMineThenOutsideMoveIsLocked) {
     UniqueRig u;
     ASSERT_EQ(u.prepare(1, "foo", nullptr, true), PrepareStatus::Ok);
     ASSERT_EQ(u.prepare(1, "foo", &u.chain), PrepareStatus::Ok);
-    const TxnLockSet locks = lockSetOf(u.chain);
+    const HeldLock locks(u.chain);
     EXPECT_EQ(u.prepare(1, "bar", nullptr, false, &locks), PrepareStatus::Locked);
     EXPECT_EQ(u.prepare(2, "bar", nullptr, false, &locks), PrepareStatus::Ok);
 }
@@ -468,7 +468,7 @@ TEST(CheckedWritesTxnOverlay, ReservedOverlayAllocatesNothing) {
         return std::pair{sa, prepareProjection(pf, c, u.p, &u.chain)};
     };
     ASSERT_EQ(prepareBoth(0), (std::pair{PrepareStatus::Ok, PrepareStatus::Ok}));   // first sight of the writer version allocates
-    TxnLockSet locks = lockSetOf(r.chain);
+    const HeldLock locks(r.chain);
     rune::testing::AllocWindow w;
     for (int i = 0; i < 4096; ++i) {
         AggregateFold lf = r.fold(&locks);

@@ -1331,6 +1331,11 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     return judge;
 }
 
+void WorkerViewSet::growTxnOverlays_(int64_t nowNs) {
+    txnOverlays_.grow(nowNs);
+    for (auto& kv : verdictSources_) kv.second->bindTxn(&txnOverlays_, batchOverlay_, txnJudgedRecordsMax_);
+}
+
 // The reserve bound (Task 4's precondition): rows >= txnJudgedRecordsMax x the judge's per-record need, rows as long as its
 // longest table's.  Only grows: one judge's members never shrink another's overlays.
 void WorkerViewSet::reserveTxnOverlays_(const VerdictSource& judge) {

@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -130,6 +131,8 @@ private:
 
 /// The worker's transaction overlays.  `at(i)` is stable; an overlay is bound to one source key while it is acquired.  Each overlay
 /// has its key set (a judgement keeps both across passes); `oneStep()` is the key set of work done within one step (P11-3a).
+/// Only another transaction's marker frees an overlay a yes vote holds, and that marker may wait for a vote that needs one: when
+/// none is free the worker grows the pool by one (grow()) instead of making the judge wait, and trims the last one once it is free.
 class TxnOverlayPool {
 public:
     /// D1: one marker application's noted keys at a time, for every fold of the worker (path A and the members' replays).
@@ -156,14 +159,16 @@ public:
     }
     /// A reserve call left an overlay or a key set in use short: release() retries it once that one is free.
     [[nodiscard]] bool pending() const noexcept { return overlaysPending_ || keysPending_; }
-    /// A cleared overlay bound to `sourceKey`, or -1 when all are in use.
+    /// A cleared overlay bound to `sourceKey`, or -1 when all are in use: the pool is starved until an acquire succeeds.
     [[nodiscard]] int32_t acquire(uint64_t sourceKey) noexcept {
         for (std::size_t i = 0; i < overlays_.size(); ++i) {
             if (inUse_[i]) continue;
             inUse_[i] = true;
+            starved_ = false;
             overlays_[i].bind(sourceKey);
             return static_cast<int32_t>(i);
         }
+        starved_ = true;
         return -1;
     }
     void release(int32_t i) noexcept {
@@ -173,6 +178,31 @@ public:
             reserveKeys(0);
             reserveFor(0, 0);
         }
+    }
+    /// A judge is waiting for an overlay and none is free: the worker grows the pool.
+    [[nodiscard]] bool starved() const noexcept { return starved_ && freeCount() == 0; }
+    [[nodiscard]] std::size_t size() const noexcept { return overlays_.size(); }
+    /// Cold: one more overlay, reserved like the others.  Every judge binds again afterwards (its lock vector holds `size()`).
+    void grow(int64_t nowNs) {
+        grownAtNs_ = nowNs;
+        overlays_.emplace_back();
+        keys_.emplace_back();
+        inUse_.push_back(false);
+        reservedRows_.push_back(0);
+        reservedRowLen_.push_back(0);
+        reserveFor(0, 0);
+        reserveKeys(0);
+    }
+    /// Pops the last overlay once it is free, the pool is above its base size, no judge is waiting and the pool has not grown for
+    /// kTrimAfterNs (contention at the edge would otherwise reserve an overlay anew every pass).  A free overlay is bound to no
+    /// source (releaseOverlay_ refreshes the lock set).
+    void trim(int64_t nowNs) noexcept {
+        if (starved_ || overlays_.size() <= rune::view::kTxnOverlaysPerWorker || inUse_.back() || nowNs - grownAtNs_ < kTrimAfterNs) return;
+        overlays_.pop_back();
+        keys_.pop_back();
+        inUse_.pop_back();
+        reservedRows_.pop_back();
+        reservedRowLen_.pop_back();
     }
     [[nodiscard]] std::size_t freeCount() const noexcept { return static_cast<std::size_t>(std::count(inUse_.begin(), inUse_.end(), false)); }
     [[nodiscard]] rune::view::TxnOverlay& at(int32_t i) noexcept { return overlays_[static_cast<std::size_t>(i)]; }
@@ -199,21 +229,20 @@ public:
     [[nodiscard]] bool holdsOneStep(uint64_t claim) const noexcept { return oneStepHeld_ && claim == oneStepClaim_; }
     void parkOneStep(uint64_t claim, bool parked) noexcept { oneStepParked_ = holdsOneStep(claim) ? parked : oneStepParked_; }
     void releaseOneStep(uint64_t claim) noexcept { oneStepHeld_ = oneStepHeld_ && claim != oneStepClaim_; }
-    /// The acquired overlays bound to `sourceKey`.
-    [[nodiscard]] rune::view::TxnLockSet lockSetFor(uint64_t sourceKey) const noexcept {
-        rune::view::TxnLockSet set;
+    /// `out` is the acquired overlays bound to `sourceKey`; its capacity is the caller's (at least size(): no allocation).
+    void lockSetFor(uint64_t sourceKey, std::vector<const rune::view::TxnOverlay*>& out) const noexcept {
+        out.clear();
         for (std::size_t i = 0; i < overlays_.size(); ++i)
-            if (inUse_[i] && overlays_[i].sourceKey() == sourceKey) set.locked[set.count++] = &overlays_[i];
-        return set;
+            if (inUse_[i] && overlays_[i].sourceKey() == sourceKey) out.push_back(&overlays_[i]);
     }
 
 private:
-    std::array<rune::view::TxnOverlay, rune::view::kTxnOverlaysPerWorker> overlays_;
-    std::array<bool, rune::view::kTxnOverlaysPerWorker>                    inUse_{};
-    std::array<TxnKeySet, rune::view::kTxnOverlaysPerWorker>               keys_;
+    std::deque<rune::view::TxnOverlay>                                     overlays_{rune::view::kTxnOverlaysPerWorker};   // stable across grow()
+    std::vector<bool>                                                      inUse_ = std::vector<bool>(rune::view::kTxnOverlaysPerWorker);
+    std::deque<TxnKeySet>                                                  keys_{rune::view::kTxnOverlaysPerWorker};
     TxnKeySet                                                              oneStep_;
-    std::array<std::size_t, rune::view::kTxnOverlaysPerWorker>             reservedRows_{};
-    std::array<uint32_t, rune::view::kTxnOverlaysPerWorker>                reservedRowLen_{};
+    std::vector<std::size_t>                                               reservedRows_ = std::vector<std::size_t>(rune::view::kTxnOverlaysPerWorker);
+    std::vector<uint32_t>                                                  reservedRowLen_ = std::vector<uint32_t>(rune::view::kTxnOverlaysPerWorker);
     std::size_t                                                            rowsWanted_ = 0;
     uint32_t                                                               rowLenWanted_ = 0;
     bool                                                                   overlaysPending_ = false;
@@ -222,6 +251,9 @@ private:
     bool                                                                   oneStepHeld_ = false;
     bool                                                                   oneStepParked_ = false;   // the holder waits for another transaction's marker
     bool                                                                   keysPending_ = false;
+    bool                                                                   starved_ = false;   // an acquire found none free
+    int64_t                                                                grownAtNs_ = 0;
+    static constexpr int64_t                                               kTrimAfterNs = 10'000'000'000;
 };
 
 class VerdictSource {
@@ -469,6 +501,7 @@ private:
     void   releaseOverlay_(int32_t overlay) noexcept {
         txnPool_->release(overlay);
         ++overlaysFreed_;
+        refreshLocks_();   // the pool may pop this overlay
     }
     void   restartJudgement_() noexcept;
     [[nodiscard]] bool beginJudgement_(int64_t producerId, int64_t first, int64_t end, bool atMarker) noexcept;
@@ -482,9 +515,10 @@ private:
         for (Member& m : members_) m.chainLive = 0;
     }
     void   refreshLocks_() noexcept {
-        txnLocks_ = txnPool_ != nullptr ? txnPool_->lockSetFor(sourceKey_) : rune::view::TxnLockSet{};
+        if (txnPool_ != nullptr) txnPool_->lockSetFor(sourceKey_, txnLockPtrs_);
+        txnLocks_.locked = txnLockPtrs_;
     }
-    [[nodiscard]] const rune::view::TxnLockSet* lockSet_() const noexcept { return txnLocks_.count != 0 ? &txnLocks_ : nullptr; }
+    [[nodiscard]] const rune::view::TxnLockSet* lockSet_() const noexcept { return txnLocks_.locked.empty() ? nullptr : &txnLocks_; }
     void   notePause_(int64_t offset) noexcept;
     void   noteMarkerWithoutVote_(const OrdinaryTxn& o, bool applied) noexcept;          // cold
     void   countVote_(const TxnVoteAnswer& a) noexcept;
@@ -583,6 +617,7 @@ private:
     std::size_t                 owedStart_ = 0;           // rotates each pass: one owed marker far behind never starves the rest
     uint64_t                    sourceKey_ = 0;           // the overlays' source key: (topic, partition)
     rune::view::TxnLockSet      txnLocks_;
+    std::vector<const rune::view::TxnOverlay*> txnLockPtrs_;   // reserved to the pool's size in bindTxn: refreshLocks_ never allocates
     TxnJudgement                jx_;
     int64_t                     judgePid_ = -1;           // TxnStop::Judge: the producer whose TxnJudge the judge stands at
     int64_t                     overlayWaitAt_ = -1, lockPausedAt_ = -1;   // each wait counted once

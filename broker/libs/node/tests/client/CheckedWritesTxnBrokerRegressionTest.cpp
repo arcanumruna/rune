@@ -240,7 +240,7 @@ struct PlainClient {
         rc::BatchBuilder b = prod->batch(*ledgerHandle, rc::Key(entries.at(0).account));
         for (const RpLedger& e : entries) {
             std::vector<uint8_t> value(e.encodedSize());
-            e.encode(value.data());
+            (void)e.encode(value.data());
             char key[8];
             std::memcpy(key, &e.entryId, sizeof key);   // the record's key is its key field
             b.add(value, std::string_view(key, sizeof key));
@@ -550,6 +550,7 @@ struct VoteGate {
     }
     bool saw(const std::string& topic, int64_t pid) { std::lock_guard<std::mutex> g(mu); return seen.contains({topic, pid}); }
     void release() { std::lock_guard<std::mutex> g(mu); held.clear(); }
+    void release(const std::string& topic, int64_t pid) { std::lock_guard<std::mutex> g(mu); held.erase({topic, pid}); }
 };
 
 /// T1 and T2 rewrite the same character and the same ledger entry and commit at once, with the votes held so that T1's reaches `character` first
@@ -611,6 +612,63 @@ void expectOppositeOrderResolvesByTimeout(const char* tag, int32_t timeoutMs) {
 TEST(CheckedWritesTxnBrokerRegression, OppositeOrderLocksResolveByTimeoutShardRegression) { expectOppositeOrderResolvesByTimeout("cw11_order", 200); }
 
 TEST(CheckedWritesTxnBrokerRegression, OppositeOrderLocksResolveByTimeoutFullLengthShardRegression) { expectOppositeOrderResolvesByTimeout("cw11_orderfl", 2'000); }
+
+/// Eight two-topic transactions on unrelated users and accounts, with every character vote held until every ledger vote was judged yes:
+/// each yes holds a transaction overlay until its marker, and the markers wait for the character votes.  No row is shared, so no
+/// judgement may wait on another transaction: every commit answers OK within 1 s of the release (the pool grows instead of making a judge wait).
+TEST(CheckedWritesTxnBrokerRegression, UnrelatedTransactionsNeverWaitForEachOtherShardRegression) {
+    auto gate = std::make_shared<VoteGate>();
+    Shard s("cw11_unrelated", fastBroker, [gate](BrokerNode& n) {
+        n.setTxnVoteHoldForTest([gate](std::string_view topic, int32_t, int64_t pid, int16_t) { return gate->holds(topic, pid); });
+    });
+    s.setUp();
+    ASSERT_FALSE(HasFatalFailure());
+    constexpr std::size_t n = 8;   // the worker's base overlays (kTxnOverlaysPerWorker): all held by ledger yeses
+    std::vector<rc::ClientConfig> configs;
+    for (std::size_t i = 0; i < n; ++i) configs.push_back(s.b.clientConfig());
+    std::vector<std::unique_ptr<TxnClient>> t(n);
+    std::vector<int64_t> pid(n);
+    {
+        std::vector<std::jthread> threads;
+        for (std::size_t i = 0; i < n; ++i)
+            threads.emplace_back([&, i] {
+                t[i] = std::make_unique<TxnClient>(configs[i], "tx-unrelated-" + std::to_string(i), 3'000);
+                pid[i] = t[i]->prod->producerId();
+                t[i]->begin();
+                EXPECT_TRUE(t[i]->create(300 + i, "u" + std::to_string(i)).ok());
+                EXPECT_TRUE(t[i]->put(10 + i, 700 + i, 1).ok());
+            });
+    }
+    {   // no vote is sent before the commit
+        std::lock_guard<std::mutex> g(gate->mu);
+        for (std::size_t i = 0; i < n; ++i) gate->held.insert({"character", pid[i]});
+    }
+    const auto ledgerYes = [&] {
+        return s.b.node().onWorkerThreadForTest(0, [&](Worker& w) {
+            const TxnJudgeStats* st = w.txnStatsForTest(s.ledgerTopic, 0);
+            return st != nullptr ? st->votesYes : 0;
+        });
+    };
+    std::vector<std::optional<rc::TxnCommitResult>> r(n);
+    std::vector<std::string> error(n);
+    std::vector<std::chrono::steady_clock::time_point> done(n);
+    std::chrono::steady_clock::time_point released;
+    {
+        std::vector<std::jthread> threads;
+        for (std::size_t i = 0; i < n; ++i)
+            threads.emplace_back([&, i] {
+                try { r[i] = t[i]->commit(15s); } catch (const std::exception& e) { error[i] = e.what(); }
+                done[i] = std::chrono::steady_clock::now();
+            });
+        ASSERT_TRUE(waitFor([&] { return ledgerYes() >= n; }, 5s)) << "every ledger vote is judged yes and holds its overlay";
+        released = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n; ++i) gate->release("character", pid[i]);
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        EXPECT_TRUE(r[i] && r[i]->ok) << "commit " << i << " answered " << (r[i] ? r[i]->code : -1) << " " << error[i];
+        EXPECT_LT(done[i] - released, 1s) << "commit " << i << " waited " << std::chrono::duration_cast<std::chrono::milliseconds>(done[i] - released).count() << " ms";
+    }
+}
 
 /// The e2e leg 9b in small (checked_writes_probe txn-run): four workers of four producers race 16 users for the same two character names per
 /// transaction, each crediting its own ledger account (two transactions racing on both topics resolve only by the transaction timeout, R11d).

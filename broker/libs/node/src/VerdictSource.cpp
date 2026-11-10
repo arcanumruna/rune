@@ -255,6 +255,8 @@ void VerdictSource::bindTxn(TxnOverlayPool* pool, std::span<rune::view::TxnOverl
     batchOverlay_ = batchOverlay;
     txnJudgedRecordsMax_ = txnJudgedRecordsMax;
     pool->reserveKeys(static_cast<std::size_t>(std::max(txnJudgedRecordsMax, 0)));
+    txnLockPtrs_.reserve(pool->size());
+    refreshLocks_();   // the reserve may have moved the vector
 }
 
 VerdictSource::OverlayNeed VerdictSource::overlayNeed() const noexcept {

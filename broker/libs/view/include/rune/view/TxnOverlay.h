@@ -3,12 +3,12 @@
 // Part 11: the chained after-images of one transaction or atomic batch, and the row locks a held overlay puts on later records.
 // A chained prepare reads overlay-first and writes its record's effect into the overlay; the tables keep the before-images.
 #pragma once
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
 #include <memory>
+#include <span>
 
 #include <rune/view/ViewKey.h>
 #include <rune/view/ViewTable.h>
@@ -82,12 +82,11 @@ inline constexpr std::size_t kTxnOverlaysPerWorker = 8;
 
 // The overlays a worker holds for one source: a record that reads or writes one of their rows waits.
 struct TxnLockSet {
-    std::array<const TxnOverlay*, kTxnOverlaysPerWorker> locked{};
-    uint8_t                                              count = 0;
+    std::span<const TxnOverlay* const> locked;
     // `except` is the overlay being chained: a transaction never locks itself.
     [[nodiscard]] bool contains(uint8_t member, OverlayTable table, const ViewKey& key, const TxnOverlay* except = nullptr) const noexcept {
-        for (uint8_t i = 0; i < count; ++i)
-            if (locked[i] != except && locked[i]->contains(member, table, key)) return true;
+        for (const TxnOverlay* o : locked)
+            if (o != except && o->contains(member, table, key)) return true;
         return false;
     }
 };

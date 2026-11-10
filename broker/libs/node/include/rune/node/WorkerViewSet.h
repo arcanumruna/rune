@@ -329,6 +329,12 @@ public:
                 if (judge->activationPending()) rebuildKeyIndex_(srcTopicId, partition, *judge, *write->spec, leaderGen);
                 // P11-2: the judge reads to the HW (`judgeBound`, -1 = `bound`); the other views still fold below the LSO and K.
                 work += judge->driveJudge(readRange, judgeBound < 0 ? bound : judgeBound, nowNs, *write, skip.aborted, bound);
+                if (txnOverlays_.starved()) [[unlikely]] {
+                    growTxnOverlays_(nowNs);
+                    ++work;
+                } else {
+                    txnOverlays_.trim(nowNs);
+                }
                 viewBound = std::min(bound, judge->judgedThrough());
                 work += flipVerdictMembers_(srcTopicId, partition, bound, nowNs, leaderGen, leaderHwConfirmed, ns);
             } else {
@@ -798,6 +804,7 @@ private:
     uint32_t batchOverlayRowLen_ = 0;
     int32_t txnJudgedRecordsMax_ = 4096;
     void reserveTxnOverlays_(const VerdictSource& judge);   // cold
+    void growTxnOverlays_(int64_t nowNs);   // cold
     /// A judge about to go: the overlays it or its state's entries hold go back to the pool.
     void releaseJudge_(VerdictSource& judge) noexcept {
         if (PartitionWriteState* s = judge.boundState()) judge.releaseTxnOverlays(s->txn);

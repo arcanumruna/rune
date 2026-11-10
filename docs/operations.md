@@ -478,7 +478,8 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
     `txnVotesNo`, one counter each for 55, 56, 57 and 62 (`TxnConflict` no votes count only in `txnVotesNo`), `txnVoteLatencyNsMax` and `txnVoteLatencyNsTotal`.
   - **Lock pause.** While a transaction holds a row locked, the verdicts of other writers' records that touch the row wait for its
     marker; the time is `foldPausedOnTxnLockNs`. A distributed lock wait ends at the transaction timeout at the latest, when the
-    coordinator aborts the transaction.
+    coordinator aborts the transaction. A judgement never waits for another transaction's marker to free an overlay: the worker adds
+    one when every overlay holds a lock, and drops it again once it is free and the pool has not grown for 10 s.
   - **`txnMarkerWithoutVote`** counts markers that arrived for a transaction nobody asked a vote for. It stays 0; a non-zero
     value is a coordinator bug.
   - **Size.** A transaction over `RUNE_TXN_JUDGED_RECORDS_MAX` records on one partition is voted `TxnTooLarge` (62); an atomic batch

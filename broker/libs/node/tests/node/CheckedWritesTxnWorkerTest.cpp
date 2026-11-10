@@ -305,6 +305,31 @@ TEST(CheckedWritesTxnWorker, DroppingALockedJudgeReleasesItsOverlay) {
     ASSERT_TRUE(k.r.voteReply(tok));
 }
 
+// Only another transaction's marker frees an overlay a yes vote holds: with every overlay Locked the ninth vote must not wait for one.
+// The pool grows by one for it and trims back once the extra overlay is free and the pool has not grown for 10 s.
+TEST(CheckedWritesTxnWorkerRegression, NinthLockedTransactionGrowsThePoolRegression) {
+    Ki k;
+    auto& pool = k.r.vs->txnOverlaysForTest();
+    for (int64_t pid = 60; pid < 60 + int64_t(rune::view::kTxnOverlaysPerWorker); ++pid) {
+        k.txn(pid, {ins(pid)});
+        ASSERT_EQ(k.vote(pid).code, 0);
+    }
+    ASSERT_EQ(pool.freeCount(), 0u);
+    k.txn(99, {ins(99)});
+    EXPECT_EQ(k.vote(99).code, 0) << "answered with every other transaction still Locked";
+    EXPECT_EQ(pool.size(), rune::view::kTxnOverlaysPerWorker + 1);
+    EXPECT_LE(k.stats().txnOverlayWaits, 1u);
+    for (int64_t pid = 60; pid < 60 + int64_t(rune::view::kTxnOverlaysPerWorker); ++pid) k.r.marker(pid, true);
+    k.r.marker(99, true);
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    k.r.passes(3);
+    EXPECT_EQ(pool.size(), rune::view::kTxnOverlaysPerWorker + 1) << "kept while the pool grew less than 10 s ago";
+    k.r.now += 10'000'000'000;
+    k.r.passes(3);
+    EXPECT_EQ(pool.size(), rune::view::kTxnOverlaysPerWorker) << "the extra overlay is trimmed once free";
+    EXPECT_EQ(pool.freeCount(), rune::view::kTxnOverlaysPerWorker);
+}
+
 TEST(CheckedWritesTxnWorker, OwnershipLossWhileLockedReleasesItsOverlay) {
     Ki k;
     auto& pool = k.r.vs->txnOverlaysForTest();

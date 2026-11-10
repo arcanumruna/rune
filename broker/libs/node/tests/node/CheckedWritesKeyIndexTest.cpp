@@ -305,9 +305,9 @@ TEST(CheckedWritesTxnOverlay, ChainedKeyIndexInsertThenUpdate) {
     EXPECT_TRUE(p.rows[0].existed);
 
     // A held overlay locks the key for everyone else.
+    const rune::view::TxnOverlay* const held = &chain;
     rune::view::TxnLockSet locks;
-    locks.locked[0] = &chain;
-    locks.count = 1;
+    locks.locked = std::span<const rune::view::TxnOverlay* const>(&held, 1);
     const KeyIndexFold locked{table, 8, 0, &locks};
     EXPECT_EQ(prepareKeyIndex(locked, base, p), rune::view::PrepareStatus::Locked);
     // A chained delete of an absent key locks it too, so an outside insert cannot overtake the transaction's delete.

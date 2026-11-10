@@ -356,15 +356,20 @@ TEST(CheckedWritesTxnPool, AcquireReleaseAndLockSet) {
         ASSERT_GE(ids[i], 0);
     }
     EXPECT_EQ(pool.acquire(100), -1);
-    const rune::view::TxnLockSet set = pool.lockSetFor(100);
-    EXPECT_EQ(set.count, ids.size() / 2);
-    for (uint8_t i = 0; i < set.count; ++i) EXPECT_EQ(set.locked[i]->sourceKey(), 100u);
+    EXPECT_TRUE(pool.starved());
+    std::vector<const rune::view::TxnOverlay*> locked100, locked200;
+    pool.lockSetFor(100, locked100);
+    EXPECT_EQ(locked100.size(), ids.size() / 2);
+    for (const rune::view::TxnOverlay* o : locked100) EXPECT_EQ(o->sourceKey(), 100u);
     const auto key = rune::view::ViewKey::fromU64(5);
     ASSERT_NE(pool.at(ids[0]).put(0, rune::view::OverlayTable::KeyIndex, key, nullptr, 1), nullptr);
-    EXPECT_TRUE(pool.lockSetFor(100).contains(0, rune::view::OverlayTable::KeyIndex, key));
-    EXPECT_FALSE(pool.lockSetFor(200).contains(0, rune::view::OverlayTable::KeyIndex, key));
+    pool.lockSetFor(200, locked200);
+    EXPECT_TRUE(rune::view::TxnLockSet{locked100}.contains(0, rune::view::OverlayTable::KeyIndex, key));
+    EXPECT_FALSE(rune::view::TxnLockSet{locked200}.contains(0, rune::view::OverlayTable::KeyIndex, key));
     pool.release(ids[0]);
-    EXPECT_EQ(pool.lockSetFor(100).count, ids.size() / 2 - 1);
+    EXPECT_FALSE(pool.starved()) << "a release is what the waiting judge needed";
+    pool.lockSetFor(100, locked100);
+    EXPECT_EQ(locked100.size(), ids.size() / 2 - 1);
     EXPECT_EQ(pool.acquire(300), ids[0]);
     EXPECT_EQ(pool.at(ids[0]).rows(), 0u);
 }
@@ -1698,7 +1703,9 @@ TEST(CheckedWritesTxnJudge, NoFreeOverlayWaitsAtJ) {
     EXPECT_EQ(r.vs.judgeCursor(), 12);
     EXPECT_EQ(r.st.txn.find(77)->phase, TxnPhase::AwaitJudge);
     EXPECT_EQ(r.st.txn.stats.txnOverlayWaits, 1u) << "one wait, counted once";
-    for (const int32_t i : held) r.pool.release(i);
+    EXPECT_TRUE(r.pool.starved());
+    r.pool.grow(0);   // the worker's answer to a starved pool: no release needed
+    r.vs.bindTxn(&r.pool, r.batch, JudgeRig::kRecordsMax);
     r.drive();
     const DeferredTxn* t = r.st.txn.find(77);
     EXPECT_EQ(t->answer.code, kViolation);
