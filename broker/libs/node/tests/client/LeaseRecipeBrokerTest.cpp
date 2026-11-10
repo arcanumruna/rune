@@ -289,7 +289,7 @@ struct Side {
     [[nodiscard]] LeaseClaim keyRow() const {   // the lease row of the recipe's current key
         const auto k = own ? own->key() : elect->key();
         LeaseClaim r;
-        std::memcpy(r.claim.data(), k.data(), std::min<std::size_t>(k.size(), r.claim.size()));
+        if (!k.empty()) std::memcpy(r.claim.data(), k.data(), std::min<std::size_t>(k.size(), r.claim.size()));
         return r;
     }
     rc::OpResult claim(Done& d, rc::Token t) {

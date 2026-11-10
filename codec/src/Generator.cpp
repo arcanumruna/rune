@@ -862,7 +862,7 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
                   });
         for (const FieldDescriptor* f : varFields) {
             o << "        wr32_(uint32_t(" << f->name << ".size()));\n";
-            o << "        std::memcpy(p_, " << f->name << ".data(), " << f->name << ".size()); p_ += " << f->name << ".size();\n";
+            o << "        if (!" << f->name << ".empty()) std::memcpy(p_, " << f->name << ".data(), " << f->name << ".size()); p_ += " << f->name << ".size();\n";
         }
     }
 

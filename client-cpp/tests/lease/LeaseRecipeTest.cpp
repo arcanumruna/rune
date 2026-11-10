@@ -145,7 +145,7 @@ Bytes keyOf(std::string_view name, uint64_t holder, uint32_t no) {
     char suffix[40];
     std::snprintf(suffix, sizeof suffix, "/%016llx-%08x", static_cast<unsigned long long>(holder), no);
     Bytes k(kW, 0);
-    std::memcpy(k.data(), name.data(), name.size());
+    if (!name.empty()) std::memcpy(k.data(), name.data(), name.size());
     std::memcpy(k.data() + name.size(), suffix, 26);
     return k;
 }

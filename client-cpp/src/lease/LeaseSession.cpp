@@ -231,7 +231,7 @@ LeaseRef LeaseSessionCore::add(LeaseTopicCore& topic, std::span<const uint8_t> k
     e.partition = partition;
     e.group     = group;
     e.keyLen    = static_cast<uint8_t>(key.size());
-    std::memcpy(e.key, key.data(), key.size());
+    if (!key.empty()) std::memcpy(e.key, key.data(), key.size());
     e.version    = version;
     e.ttlNs      = ttlNs;
     e.armSeq     = 0;

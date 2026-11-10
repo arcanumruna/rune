@@ -63,7 +63,7 @@ inline uint64_t getBigEndian(std::span<const uint8_t> in) noexcept {
         case PrimType::Bool:   detail::putBigEndian(v.b ? 1 : 0, out); return true;
         case PrimType::FixedStr:
             if (v.bytes.size() > out.size()) return false;
-            std::memcpy(out.data(), v.bytes.data(), v.bytes.size());
+            if (!v.bytes.empty()) std::memcpy(out.data(), v.bytes.data(), v.bytes.size());
             std::fill(out.begin() + std::ptrdiff_t(v.bytes.size()), out.end(), uint8_t{0});
             return true;
         default: return false;

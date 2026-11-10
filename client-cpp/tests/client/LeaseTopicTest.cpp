@@ -66,7 +66,7 @@ struct WideRow {
         std::memset(b, 0, 36);
         b[0] = static_cast<uint8_t>(32 + k.size());
         b[2] = 1;
-        std::memcpy(b + 36, k.data(), k.size());
+        if (!k.empty()) std::memcpy(b + 36, k.data(), k.size());
         return 36 + k.size();
     }
 };

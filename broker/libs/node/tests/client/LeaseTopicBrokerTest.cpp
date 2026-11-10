@@ -73,9 +73,9 @@ int32_t defineLease(rc::Client& c, const std::string& name, uint32_t partitions,
 
 LeaseClaim claimRow(std::string_view key, uint64_t a = 0, std::string_view b = {}) {
     LeaseClaim r;
-    std::memcpy(r.claim.data(), key.data(), std::min(key.size(), r.claim.size()));
+    if (!key.empty()) std::memcpy(r.claim.data(), key.data(), std::min(key.size(), r.claim.size()));
     r.a = a;
-    std::memcpy(r.b.data(), b.data(), std::min(b.size(), r.b.size()));
+    if (!b.empty()) std::memcpy(r.b.data(), b.data(), std::min(b.size(), r.b.size()));
     return r;
 }
 

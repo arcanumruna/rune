@@ -32,7 +32,7 @@ using Clock = std::chrono::steady_clock;
 
 inline LeaseClaim row(std::string_view key, uint64_t a = 0) {
     LeaseClaim r;
-    std::memcpy(r.claim.data(), key.data(), std::min(key.size(), r.claim.size()));
+    if (!key.empty()) std::memcpy(r.claim.data(), key.data(), std::min(key.size(), r.claim.size()));
     r.a = a;
     return r;
 }

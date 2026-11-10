@@ -227,7 +227,7 @@ private:
     [[nodiscard]] LeaseClaim row_(int k, uint64_t a) const {
         LeaseClaim r;
         const std::string& n = model_.key(k).name;
-        std::memcpy(r.claim.data(), n.data(), std::min(n.size(), r.claim.size()));
+        if (!n.empty()) std::memcpy(r.claim.data(), n.data(), std::min(n.size(), r.claim.size()));
         r.a = a;
         return r;
     }

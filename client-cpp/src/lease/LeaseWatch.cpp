@@ -664,7 +664,7 @@ uint32_t LeaseWatchBase::insertLive_(int32_t p, std::span<const uint8_t> key, ui
     e.keyLen = static_cast<uint8_t>(key.size());
     e.used = true;
     e.confirmed = true;
-    std::memcpy(e.key, key.data(), key.size());
+    if (!key.empty()) std::memcpy(e.key, key.data(), key.size());
     uint32_t i = static_cast<uint32_t>(h) & slotMask_;
     while (slots_[i] != kNone) i = (i + 1) & slotMask_;
     slots_[i] = idx;
@@ -732,7 +732,7 @@ int32_t LeaseWatchBase::registerName(std::span<const uint8_t> name) {
     const uint32_t id = nNames_++;
     Name& n = names_[id];
     n.len = static_cast<uint8_t>(name.size());
-    std::memcpy(n.bytes, name.data(), name.size());
+    if (!name.empty()) std::memcpy(n.bytes, name.data(), name.size());
     n.heapBegin = id * o_.waitersPerName;
     n.heapSize = 0;
     nameMap_.insert(h, id);   // sized at construction for `names` entries: never grows

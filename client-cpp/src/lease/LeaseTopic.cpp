@@ -140,7 +140,7 @@ OpResult LeaseTopicCore::writeRaw(OpKind kind, std::span<const uint8_t> key, std
     if (row.size() > scratch_.size()) {   // cold: the high-water mark grows once
         try { scratch_.resize(row.size()); } catch (...) { return OpResult::InvalidArgument; }
     }
-    std::memcpy(scratch_.data(), row.data(), row.size());
+    if (!row.empty()) std::memcpy(scratch_.data(), row.data(), row.size());
     scratch_[2] = static_cast<uint8_t>(version_ & 0xffu);
     scratch_[3] = static_cast<uint8_t>((version_ >> 8) & 0xffu);
     return write(kind, key, row.size(), version, opts, target, token);

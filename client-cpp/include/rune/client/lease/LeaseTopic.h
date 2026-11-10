@@ -104,7 +104,7 @@ public:
     /// false (nothing written) when the topic has no fixed-width key column, the key is not exactly that wide or the row is too short.
     [[nodiscard]] bool patchKey(std::span<uint8_t> row, std::span<const uint8_t> key) const noexcept {
         if (!revokeKeyFits(key.size()) || revokeKeyOffset_ + revokeKeyWidth_ > row.size()) return false;
-        std::memcpy(row.data() + revokeKeyOffset_, key.data(), key.size());
+        if (!key.empty()) std::memcpy(row.data() + revokeKeyOffset_, key.data(), key.size());
         return true;
     }
     /// The size of the stored template row (0 = none).

@@ -67,7 +67,7 @@ ProducerConfig voidCfg() {
 std::vector<uint8_t> bytes(std::string_view s) { return {s.begin(), s.end()}; }
 
 void fill(std::span<uint8_t> b, std::string_view s) {
-    std::memcpy(b.data(), s.data(), std::min(b.size(), s.size()));
+    if (!s.empty()) std::memcpy(b.data(), s.data(), std::min(b.size(), s.size()));
 }
 
 // Ring mode: drain the producer ring and flush, a fixed number of passes (a
