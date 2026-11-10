@@ -235,6 +235,11 @@ enum class SubscriptionFailReason : int32_t {
     /// (ErrorResponse{StorageError 26} naming this subscription); the client released it.  Re-subscribing from the
     /// same offset meets the same damage; resume past it only if losing those records is acceptable.
     CorruptBatch = 10,
+    /// Lease topics: the broker ENDED this subscription of a transient lease topic because its cursor fell below the
+    /// partition's in-memory ring start (records it had not read were evicted), or an explicit resume offset was already
+    /// below it (ErrorResponse{PartitionDataReset 43} naming this subscription).  Records are lost, so the broker never
+    /// skips ahead silently: the application re-reads the partition's state (a LeaseWatch rescans).  brokerErrorCode() is 43.
+    DataReset = 11,
 };
 
 struct SubscriptionStatus {

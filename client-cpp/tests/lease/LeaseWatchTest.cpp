@@ -614,6 +614,50 @@ TEST(LeaseWatchHandoffRegression, BreakRerunsRegression) {
     EXPECT_EQ(w.liveCount(), 4u) << "A, C, D, E";
 }
 
+// A transient partition reborn under a live watch: the client restarts the subscription at the log start on its own (Subscription::dataResets
+// grows) - the watch notices, re-runs the partition, and the keys of the lost lineage end (Vanished) while the new lineage's keys are new.
+TEST(LeaseWatchDataResetRegression, ResetRerunsRegression) {
+    WRig r(invokerCfg(5191, 5192, 2), 2);
+    const Bytes A = kb(0), B = kb(4), C = kb(8), D = kb(12);   // all in partition 0 of the stub
+    r.stub->parts[0].grant(A);
+    r.stub->parts[0].grant(B);
+    rc::LeaseWatchBase w(*r.client, r.topic->core());
+    Recorder rec;
+    w.setHandler(&Recorder::fn, &rec);
+    ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive(w, [&] { return w.isReady() && r.stub->caughtUp(0); }));
+    r.rounds(w, 10);
+    ASSERT_EQ(rec.count(Kind::Granted, &A), 1);
+    ASSERT_EQ(rec.count(Kind::Granted, &B), 1);
+    ASSERT_EQ(w.dataResetRerunsForTest(), 0u);
+    const auto first = *r.gw.latestSubscription(1, 0);
+    r.gw.sendLineageNote(first, 1);
+    r.stub->parts[0].grant(D);   // a delivered record: the subscription has a position, so its resume claims the lineage
+    ASSERT_TRUE(r.drive(w, [&] { return rec.count(Kind::Granted, &D) == 1; }));
+    r.rounds(w, 10);
+    // the partition is reborn: a new lineage holding only C.  The resumed Subscribe (claim 1) is answered PartitionDataReset.
+    r.gw.partitionLineage[0] = 2;
+    { const std::size_t keyWidth = r.stub->parts[0].keyWidth; r.stub->parts[0] = LeaseModel{}; r.stub->parts[0].keyWidth = keyWidth; }
+    r.stub->parts[0].grant(C);
+    r.gw.sendError(0, static_cast<int16_t>(rpc::ErrorCode::NotLeader), "", first.sessionId, first.corrId);
+    ASSERT_TRUE(r.drive(w, [&] { g_now += kMs / 10; return r.gw.dataResetAnswers == 1 && w.dataResetRerunsForTest() >= 1; })) << "the watch noticed the reset: answers=" << r.gw.dataResetAnswers << " claims=" << r.gw.lineageClaims.size() << "/" << (r.gw.lineageClaims.empty() ? 0 : r.gw.lineageClaims.back()) << " subs=" << r.gw.subscribed.size() << " reruns=" << w.dataResetRerunsForTest();
+    g_now += 2 * kMs;   // the re-run waits for its backoff deadline
+    ASSERT_TRUE(r.drive(w, [&] { return settled(r, w, {Bytes{}}); }));
+    r.rounds(w, 30);
+    EXPECT_EQ(w.dataResetRerunsForTest(), 1u);
+    EXPECT_GE(w.reruns(), 1u);
+    EXPECT_FALSE(w.failed());
+    EXPECT_EQ(rec.count(Kind::Vanished, &A), 1) << "the old lineage's key ended";
+    EXPECT_EQ(rec.count(Kind::Vanished, &B), 1);
+    EXPECT_EQ(rec.count(Kind::Vanished, &D), 1);
+    EXPECT_EQ(rec.count(Kind::Vanished), 3);
+    EXPECT_EQ(rec.count(Kind::Granted, &C), 1) << "the new lineage's key is new";
+    EXPECT_EQ(rec.bad, 0);
+    EXPECT_EQ(actualLive(w), expectedLive(*r.stub, {Bytes{}}));
+    EXPECT_EQ(rec.held, actualLive(w));
+    EXPECT_EQ(w.liveCount(), 1u) << "only C: no stale key of the lost lineage remains";
+}
+
 // Ready is emitted once, after every partition is live, and never again (a re-run keeps isReady() true).
 TEST(LeaseWatchHandoffRegression, ReadyOnceRegression) {
     WRig r(invokerCfg(5115, 5116, 2), 2);

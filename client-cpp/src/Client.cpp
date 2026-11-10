@@ -5005,6 +5005,21 @@ void Client::onEgressFrame(codec::TemplateId tid,
             }
         }
 
+        // Lease topics: a TRANSIENT lease topic's push subscription whose cursor fell below the ring start is ENDED by the
+        // broker (never skipped ahead): the same scoped shape with PartitionDataReset.  It finishes with brokerErrorCode 43
+        // and is not re-armed (the owner - a LeaseWatch - rescans).  The Unsubscribe it sends releases the worker's entry.
+        if (opt->correlationId == 0 && ec == rpc::ErrorCode::PartitionDataReset) [[unlikely]] {
+            if (const int64_t subId = subscriptionOfScopedError(opt->message); subId > 0) {
+                const auto snap = agent_.stateAndSessionId();
+                (void)subscriberHub_.failActiveSubscription(
+                    subId, SubscriptionFailReason::DataReset, nextCorrId_++, snap.sessionId,
+                    [this](int32_t /*streamId*/, const uint8_t* fbuf, std::size_t flen) -> bool {
+                        return agent_.submitSend(fbuf, flen);
+                    },
+                    static_cast<uint16_t>(rpc::ErrorCode::PartitionDataReset));
+            }
+        }
+
         std::string msg(opt->message);
         if (msg.empty()) {
             msg = "ErrorResponse code: " + std::to_string(opt->code);

@@ -4,6 +4,7 @@
 #include "support/LeaseBrokerRig.h"
 
 #include <rune/client/lease/LeaseTopic.h>
+#include <rune/client/lease/LeaseWatch.h>
 #include <rune/node/Worker.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/codec/Descriptor.h>
@@ -14,7 +15,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <future>
+#include <map>
+#include <string>
 #include <optional>
 #include <thread>
 
@@ -95,6 +99,45 @@ rc::DefineTopicResult defineTransientLease(LeaseBrokerRig& rig, const char* name
     to.lease = lbr::spec(60'000, 1000, 60'000);   // an explicit max_ttl: a transient lease topic needs one
     to.config.cleanupPolicy = 1;
     return rig.ua().defineTopicAndWait(name, 1, "claim", lbr::claimBlob(), rc::Persistence::Transient, to, {}, 60s);
+}
+
+/// A watch's event log: the live set (key -> version), each key's end count, and protocol violations (an end of an unheld key).
+struct WLog {
+    std::map<std::string, int64_t> live;
+    std::map<std::string, int>     ended, granted;
+    int                            bad = 0, readies = 0, failed = 0;
+    static std::string keyOf(const rc::LeaseEvent& e) {
+        const std::string raw(reinterpret_cast<const char*>(e.key.data()), e.key.size());
+        return std::string(raw.c_str(), strnlen(raw.c_str(), raw.size()));
+    }
+    static void fn(void* c, const rc::LeaseEvent& e) {
+        auto& w = *static_cast<WLog*>(c);
+        const std::string k = keyOf(e);
+        switch (e.kind) {
+        case rc::LeaseEventKind::Granted: w.live[k] = e.version; ++w.granted[k]; break;
+        case rc::LeaseEventKind::Updated: break;
+        case rc::LeaseEventKind::Revoked:
+        case rc::LeaseEventKind::Expired:
+        case rc::LeaseEventKind::Vanished:
+            if (w.live.erase(k) == 0) ++w.bad;
+            ++w.ended[k];
+            break;
+        case rc::LeaseEventKind::Ready: ++w.readies; break;
+        case rc::LeaseEventKind::Failed: ++w.failed; break;
+        }
+    }
+};
+/// Drives the watch on this thread (real time, hard cap) until `done`.
+template <class P>
+bool driveWatch(rc::LeaseWatchBase& w, rc::Client& c, std::chrono::milliseconds within, P&& done) {
+    const auto end = std::chrono::steady_clock::now() + within;
+    while (std::chrono::steady_clock::now() < end) {
+        w.doWork(c.nowNs());
+        if (done()) return true;
+        std::this_thread::sleep_for(2ms);
+    }
+    w.doWork(c.nowNs());
+    return done();
 }
 
 }  // namespace
@@ -235,4 +278,64 @@ TEST(LeaseTransientBrokerRegression, PlainTransientTypedUnchangedRegression) {
         leaseHooked = leaseHooked || (s.leaseHook && s.leaseJudge);
     }
     EXPECT_TRUE(leaseHooked) << "the transient lease topic has its hook context and its judge";
+}
+
+// A transient lease topic's node restarts under a live watch: the partition is a new lineage.  The watch ends the lost keys by a sibling path: a single node's restart ends the seed-session subscription (SessionLost), the watch re-runs, and the keys of the lost
+// lineage end (exactly once each).  After the rebirth fence opens a new grant is reported, and the old keys are never reported again.
+// (The PartitionDataReset path itself - a resumed subscribe on a node session - is pinned by LeaseWatchDataResetRegression.ResetRerunsRegression
+// in the client unit tests; a single-node restart never reaches it.)
+// Mutation: LeaseWatchBase::stepPart_ ignores a finished subscription -> k1, k2 and k0 stay live forever, red.
+TEST(LeaseWatchDataResetRegression, RestartReportsOldKeysEndedRegression) {
+    LeaseBrokerRig rig("lease-wd-restart");
+    const auto d = defineTransientLease(rig, "tr");
+    ASSERT_EQ(d.errorCode, 0) << d.detail;
+    rc::Client& c = rig.ua();
+    auto lt = c.openLeaseTopicAndWait<LeaseClaim>("tr", {}, 30s);
+    ASSERT_TRUE(grantRetrying(lt, rig.row("k1", 1), {}).ok());
+    ASSERT_TRUE(grantRetrying(lt, rig.row("k2", 2), {}).ok());
+
+    rc::LeaseWatchOptions wo;
+    wo.maxLive = 256;
+    rc::LeaseWatch<LeaseClaim> watch(c, lt, wo);
+    WLog log;
+    watch.setHandler(&WLog::fn, &log);
+    const std::vector<uint8_t> none;
+    const std::span<const uint8_t> prefixes[] = {std::span<const uint8_t>(none)};
+    ASSERT_EQ(watch.startFromNow(prefixes), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveWatch(watch, c, 30s, [&] { return watch.isReady() && log.live.size() == 2; }));
+    // A record delivered through the subscription: the resume has a position, so it claims the lineage it was noted.
+    ASSERT_TRUE(grantRetrying(lt, rig.row("k0", 0), {}).ok());
+    ASSERT_TRUE(driveWatch(watch, c, 30s, [&] { return log.live.size() == 3; }));
+    ASSERT_EQ(watch.reruns(), 0u);
+
+    rig.restartKeepingClients();
+    const RuntimeSnap fencing = awaitFence(rig, d.topicId, 2);
+    ASSERT_TRUE(fencing.has);
+    ASSERT_EQ(fencing.fence, 2) << "the restarted leader fences";
+    ASSERT_TRUE(driveWatch(watch, c, 90s, [&] { return log.live.empty() && log.ended.size() == 3 && watch.reruns() >= 1; }))
+        << "the watch never noticed the new lineage: live=" << log.live.size() << " ended=" << log.ended.size()
+        << " reruns=" << watch.reruns();
+    for (const char* k : {"k0", "k1", "k2"}) EXPECT_EQ(log.ended[k], 1) << k << " ends exactly once";
+
+    // The fence opens (the injected lease clock), then a new grant is reported; the old keys never come back.
+    std::atomic<bool> granted{false};
+    auto fut = std::async(std::launch::async, [&] {
+        const rc::LeaseResult g = grantRetrying(lt, rig.row("k3", 3), {});
+        granted = true;
+        return g;
+    });
+    rig.advance(std::chrono::milliseconds((fencing.deadlineNs - rig.leaseNowNs()) / 1'000'000 + 5));
+    ASSERT_TRUE(driveWatch(watch, c, 90s, [&] { return log.live.count("k3") == 1; })) << "k3 is reported once the fence opens";
+    ASSERT_EQ(fut.wait_for(60s), std::future_status::ready);
+    EXPECT_TRUE(fut.get().ok());
+    driveWatch(watch, c, 1s, [] { return false; });
+    EXPECT_EQ(log.live.size(), 1u);
+    EXPECT_EQ(log.granted["k3"], 1);
+    for (const char* k : {"k0", "k1", "k2"}) {
+        EXPECT_EQ(log.ended[k], 1) << k << " is never reported again";
+        EXPECT_EQ(log.granted[k], 1) << k;
+    }
+    EXPECT_EQ(log.bad, 0);
+    EXPECT_FALSE(watch.failed());
+    EXPECT_EQ(log.failed, 0);
 }

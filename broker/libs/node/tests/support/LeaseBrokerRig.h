@@ -135,6 +135,14 @@ public:
         ua17_  = connect_("a/ua", lbr::kUserPw, 17);
     }
 
+    /// Like restart(), but the rig's clients stay open and reconnect on their own (a watch built on one survives the restart).  The
+    /// lease clock resumes on the real clock; the caller waits for the clients' sessions (e.g. by polling a request).
+    void restartKeepingClients() {
+        b_.restart(false);
+        clock_.resync();
+        clock_.install(b_.node());
+    }
+
     /// The user view's row bytes for `a` (the projected lease row), or nullopt when the view has none.
     std::optional<std::vector<uint8_t>> userViewRow(const lbr::LeaseClaim& r0) {
         const std::span<const uint8_t> key(reinterpret_cast<const uint8_t*>(r0.claim.data()), r0.claim.size());

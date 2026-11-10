@@ -1062,6 +1062,9 @@ public:
         /// start (no push pass has served it yet) — a transient ring start above
         /// it is not a reader that fell behind (see skipEvictedCursor_).
         bool cursorFresh = true;
+        /// The Subscribe asked for Earliest (gateway-resolved to the start): on a transient LEASE topic only a fresh cursor
+        /// of such a subscription is raised to the ring start; any other cursor below it ends the subscription.
+        bool fromEarliest = false;
         /// Phase 2c: SubFiltered = a member of filterGroups_[group] (its cursor is the group's while InSync: read it
         /// through FilterGroup::cursorOf, never `nextOffset` directly).
         std::variant<SubUnfiltered, SubFiltered> filter = SubUnfiltered{};
@@ -1557,6 +1560,8 @@ public:
                                                (op.crcValidated ? kOpFlagCrcValidated : 0u) |
                                                (op.importGranted ? kOpFlagImportGranted : 0u) |
                                                (op.freshCursor ? kOpFlagFreshCursor : 0u) |
+                                               (op.type == WorkerOp::Type::Subscribe && op.fromEarliest
+                                                    ? kOpFlagFromEarliest : 0u) |
                                                (op.type == WorkerOp::Type::SessionAnnounce && op.grantAll
                                                     ? kOpFlagGrantAll : 0u) |
                                                (op.type == WorkerOp::Type::SessionAnnounce && op.keyPending
@@ -3289,6 +3294,7 @@ private:
                 s.ns                   = subNsTag_(s);
                 if (NsHot* const m = nsReadMeter_(s.topicId, s.ns)) ++m->requestOps;   // once per Subscribe op applied
                 s.cursorFresh          = true;   // M2: a requested cursor again (rewind / re-seed)
+                s.fromEarliest         = (op.deferAck() & kOpFlagFromEarliest) != 0;
                 if (hasFilter) [[unlikely]] bindFilter_(si, filterTail);
                 return;
             }
@@ -3307,6 +3313,7 @@ private:
         s.groupCarrierReceived = op.groupCarrierReceived() != 0;
         s.egressPub            = reinterpret_cast<aeron::ExclusivePublication*>(op.egressPub());
         s.sessionEgress        = sessionEgress;
+        s.fromEarliest         = (op.deferAck() & kOpFlagFromEarliest) != 0;
         s.registryId           = op.targetReplicaId();
         s.incarnation          = op.incarnation();
         s.rc                   = rcOf_(subReplica_(s));
@@ -4187,6 +4194,23 @@ private:
         return sendPushTooLarge_(s, pub, seal, atOffset);
     }
 
+    /// Transient LEASE topic (cold): the cursor fell below the ring start - the records between were evicted unread.  The
+    /// subscription is parked at the cursor and ONE ErrorResponse{PartitionDataReset, correlationId 0} is owed (sent now, else
+    /// retried each pass); the client finishes the subscription and the owner re-reads the partition.  `skipEvictedCursor_`'s
+    /// counters are NOT touched: nothing was skipped.
+    [[gnu::cold]] [[gnu::noinline]] int failRingEvicted_(WorkerSubscription& s, aeron::ExclusivePublication* pub,
+                                                          const RecordsSealCtx* seal, int64_t atOffset, int64_t ringStart) {
+        spdlog::warn("Worker {}: push sub={} (topicId={} partition={}) of a transient lease topic fell below its ring: cursor {} < ring "
+                     "start {} - subscription ended (PartitionDataReset)", workerId_, s.subscriptionId, s.topicId, s.partition,
+                     atOffset, ringStart);
+        ++leaseRingEnds_;
+        s.pushState      = WorkerSubscription::PushState::ErrorOwed;
+        s.failedCause    = PushTooLargeCause::RingEvicted;
+        s.failedFrameLen = 0;
+        pushListDirty_   = true;
+        return sendPushTooLarge_(s, pub, seal, atOffset);
+    }
+
     /// The unfiltered push pass.  With no filtered group it walks every subscription (the pre-2c loop); with one it walks
     /// pushList_ - the subscriptions this pass must look at (unfiltered ones, and filtered ones that are not Live: an owed
     /// error) - so idle FILTERED subscribers cost it nothing and the push cost stays flat in their number (Task 16).
@@ -4298,6 +4322,16 @@ private:
                 (s.logPtr == nullptr && rep != nullptr) ? rep->memoryLog() : nullptr;
             if (s.logPtr == nullptr && mem == nullptr) continue;
             if (mem != nullptr) {   // TRANSIENT_EVICTED
+                // A transient LEASE topic never skips ahead silently (a LeaseWatch would miss a Revoke/Expire/grant): a cursor
+                // below the ring start ENDS the subscription with PartitionDataReset - except a fresh cursor of an Earliest
+                // subscribe, which is raised as always.
+                if (s.nextOffset < mem->logStartOffset()) [[unlikely]] {
+                    // rep->leaseTransient(): armLeaseTransient_ derives it from the write spec's lease on a memory-backed replica.
+                    if (rep->leaseTransient() && !(s.cursorFresh && s.fromEarliest)) {
+                        work += failRingEvicted_(s, egressPub, sealPtr, s.nextOffset, mem->logStartOffset());
+                        continue;
+                    }
+                }
                 s.nextOffset  = skipEvictedCursor_(*mem, s.nextOffset, s.cursorFresh);
                 s.cursorFresh = false;   // from now on the cursor is this push's own: a later skip is lag
             } else if (s.cursorFresh) [[unlikely]] {   // T2: the disk log start resolves here
@@ -6616,6 +6650,7 @@ public:
     /// reads whose cursor was below the ring start, and the records they skipped.
     [[nodiscard]] uint64_t transientFullRefusalsForTest() const noexcept { return transientFullRefusals_; }
     [[nodiscard]] uint64_t transientCursorSkipsForTest() const noexcept { return transientCursorSkips_; }
+    [[nodiscard]] uint64_t leaseRingEndsForTest() const noexcept { return leaseRingEnds_; }
     [[nodiscard]] uint64_t transientRecordsSkippedForTest() const noexcept { return transientRecordsSkipped_; }
     /// M2: fresh cursors (a subscribe below the ring start) raised to it — not lag.
     [[nodiscard]] uint64_t transientFreshCursorsRaisedForTest() const noexcept { return transientFreshCursorsRaised_; }
@@ -6633,6 +6668,7 @@ private:
     rune::storage::ZeroedBytes          pushScratch_{2 * kPushPassBudgetBytes + 64 * 1024};   // ZeroedBytes: memset, not a per-byte vector fill (Debug-build cost)
     uint64_t transientFullRefusals_   = 0;   ///< E2: ring refused a produce / marker (full or too large)
     uint64_t transientCursorSkips_    = 0;   ///< E2: reads whose cursor was below the ring start
+    uint64_t leaseRingEnds_           = 0;   ///< transient LEASE topics: subscriptions ended (PartitionDataReset) for a cursor below the ring start
     uint64_t transientRecordsSkipped_ = 0;   ///< E2: records those reads skipped (evicted unread)
     uint64_t transientFreshCursorsRaised_ = 0;   ///< E2 M2: bind-time cursors below the ring start (not lag)
     uint64_t                              pushReadMapFallbacks_ = 0;

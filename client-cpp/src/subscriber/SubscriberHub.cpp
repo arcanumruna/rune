@@ -1260,11 +1260,12 @@ bool SubscriberHub::failPendingSubscribe(int64_t correlationId, SubscriptionFail
 }
 
 bool SubscriberHub::failActiveSubscription(int64_t subscriptionId, SubscriptionFailReason reason,
-                                           int64_t unsubCorrId, int64_t sessionId, const SendFn& submitFn)
+                                           int64_t unsubCorrId, int64_t sessionId, const SendFn& submitFn, uint16_t brokerCode)
 {
     const auto it = activeById_.find(subscriptionId);
     if (it == activeById_.end() || !it->second->active) return false;
     it->second->failReason = reason;  // before the finish: the final snapshot carries it
+    if (brokerCode != 0) it->second->brokerErrorCode = brokerCode;
     return unsubscribe(it->second->correlationId, unsubCorrId, sessionId, submitFn);
 }
 

@@ -1994,7 +1994,7 @@ private:
     void forwardSubscribeToWorker_(int64_t subId, int64_t sessionId, int32_t topicId,
                                    int32_t partition, int64_t nextOffset, uint8_t isolation,
                                    bool isGroup, bool groupCarrierReceived,
-                                   int64_t subscribeCorrId = 0);
+                                   int64_t subscribeCorrId = 0, bool fromEarliest = false);
     /// Forget subscription `subId` on its owning worker (queued behind its Subscribe, never dropped).  Issue #109:
     /// `endCode` != 0 ENDS it - the worker emits ErrorResponse{endCode, its Subscribe correlation id, endDetail} after
     /// its last Records.  Returns true when the worker owns the end (the caller must not answer it); false when the
@@ -2024,6 +2024,7 @@ private:
         uint8_t isolation          = 0;
         bool    isGroup            = false;
         bool    groupCarrierReceived = false;
+        bool    fromEarliest       = false;  // the client asked for Earliest (resolved to the start): see WorkerOp::fromEarliest
     };
     struct PendingRecordEgress {
         int64_t regId         = -1;  // addExclusivePublication registration (in flight)

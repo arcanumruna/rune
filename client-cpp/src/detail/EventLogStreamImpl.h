@@ -507,6 +507,7 @@ std::optional<CatalogResult<void>> EventLogStream<P>::pollRefresh(int64_t nowNs,
                                                     replayer_.nextOffset(), 0});
         case SubscriptionFailReason::UndeliverableBatch:   // the broker parked the read: its next batch cannot be delivered
         case SubscriptionFailReason::CorruptBatch:         // #839: ... or is stored in a damaged log segment
+        case SubscriptionFailReason::DataReset:            // (transient lease topics only; an event-log read never gets it)
         case SubscriptionFailReason::BrokerTooOld:
             return std::unexpected(CatalogReadError{CatalogReadError::Kind::Rejected,
                                                     std::string(P::kName) + " read ended: the broker cannot serve it (" +

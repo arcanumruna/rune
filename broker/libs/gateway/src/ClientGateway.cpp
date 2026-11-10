@@ -4833,6 +4833,7 @@ rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s
     op.isolation            = s.isolation;
     op.isGroup              = s.isGroup;
     op.groupCarrierReceived = s.groupCarrierReceived;
+    op.fromEarliest         = s.fromEarliest;
     op.logPtr               = log;
     op.replica              = const_cast<rune::replication::PartitionReplica*>(rep);
     op.egressPub            = egressPub;
@@ -4980,10 +4981,10 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
                                               int32_t topicId, int32_t partition,
                                               int64_t nextOffset, uint8_t isolation,
                                               bool isGroup, bool groupCarrierReceived,
-                                              int64_t subscribeCorrId)
+                                              int64_t subscribeCorrId, bool fromEarliest)
 {
     BufferedSubscribe s{subId, subscribeCorrId, sessionId, topicId, partition,
-                        nextOffset, isolation, isGroup, groupCarrierReceived};
+                        nextOffset, isolation, isGroup, groupCarrierReceived, fromEarliest};
 
     rune::gateway::Session* sess = sessions_.find(sessionId);
 
@@ -5820,7 +5821,8 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         forwardSubscribeToWorker_(subId, msg.sessionId, msg.topicId, partition,
                                   nextOffset, msg.isolation,
                                   /*isGroup=*/false, /*groupCarrierReceived=*/false,
-                                  /*subscribeCorrId=*/msg.correlationId);
+                                  /*subscribeCorrId=*/msg.correlationId,
+                                  /*fromEarliest=*/msg.fromOffset == kFromEarliest);
     }
     if (okOwed) return;   // F1: the OK (and the lineage note) follow the egress, or the refusal replaces them
 

@@ -394,6 +394,15 @@ int LeaseWatchBase::step_(int64_t nowNs) {
 
 void LeaseWatchBase::stepPart_(int32_t p, int64_t nowNs) {
     Part& pt = parts_[static_cast<std::size_t>(p)];
+    // A transient partition that was reborn answered the subscription with a data reset (the client restarted it at the ring start on its
+    // own): the lineage this partition's keys came from is gone.  Rerun the partition (rescan; keys the new scan lacks end as Vanished).  The
+    // read follows the Subscription freshness rule (#473): eventually fresh, converges on the next pass.
+    if (pt.sub && !pt.sub->finished() && !std::holds_alternative<Idle>(pt.st) && !std::holds_alternative<Overflowed>(pt.st) &&
+        !std::holds_alternative<Broken>(pt.st) && pt.sub->dataResets() != pt.seenResets) {
+        ++dataResetReruns_;
+        toBroken_(p, nowNs);
+        return;
+    }
     if (auto* sc = std::get_if<Scanning>(&pt.st)) {
         if (pt.sub && pt.sub->finished()) { toBroken_(p, nowNs); return; }
         if (!sc->scan.inFlight && nowNs >= sc->scan.retryAtNs) (void)issueScan_(p, sc->scan);
@@ -433,6 +442,7 @@ void LeaseWatchBase::openSubscription_(int32_t p, int64_t fromOffset) {
         return;
     }
     pt.curGen = gen;
+    pt.seenResets = pt.sub->dataResets();
     ++subsOpened_;
 }
 

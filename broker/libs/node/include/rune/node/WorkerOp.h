@@ -389,7 +389,7 @@ struct WorkerOp {
     // `deferAck` (rune-internal-ring.xml) is a FLAG BYTE, not a bool:
     //   bit 0 (kOpFlagDeferAck = 0x01)     — this deferAck (acks=all, steady state)
     //   bit 1 (kOpFlagCrcValidated = 0x02) — crcValidated (below; Produce only)
-    //   bit 2 (kOpFlagFreshCursor = 0x04)  — freshCursor (PushRead only; E2 M2)
+    //   bit 2 (kOpFlagFreshCursor = 0x04)  — freshCursor (PushRead only; E2 M2) / fromEarliest (Subscribe only)
     // Writer: Worker::enqueueOp only.  Readers MUST mask the bit they need
     // (executeProduceWire_ does); `deferAck() != 0` is wrong.  Rename the
     // schema field to `flags` the next time rune-protocol's schema is touched.
@@ -438,6 +438,11 @@ struct WorkerOp {
     /// that fell behind: counted apart, never warned.  Carried as bit 2 of the
     /// wire flag byte (kOpFlagFreshCursor) — no protocol change.
     bool    freshCursor    = false;
+    /// Subscribe only: the client asked for Earliest (the gateway resolved it to the partition start, 0 on a transient
+    /// partition).  On a transient LEASE topic only such a fresh cursor is raised to the ring start; any other cursor below
+    /// it ends the subscription (PushTooLargeCause::RingEvicted).  Wire: bit kOpFlagFromEarliest of the `deferAck` flag byte
+    /// (shares bit 2 with freshCursor, which is PushRead only).
+    bool    fromEarliest   = false;
 
     // -----------------------------------------------------------------------
     // BecomeLeader / BecomeFollower-specific fields
@@ -772,6 +777,7 @@ inline constexpr uint8_t kOpFlagDeferAck     = 0x01;   ///< WorkerOp::deferAck (
 inline constexpr uint8_t kOpFlagCrcValidated = 0x02;   ///< WorkerOp::crcValidated (Produce only)
 inline constexpr uint8_t kOpFlagGrantAll     = 0x08;   ///< WorkerOp::grantAll (SessionAnnounce only; authentication Task 13)
 inline constexpr uint8_t kOpFlagFreshCursor  = 0x04;   ///< WorkerOp::freshCursor (PushRead only; E2 M2)
+inline constexpr uint8_t kOpFlagFromEarliest = 0x04;   ///< WorkerOp::fromEarliest (Subscribe only; shares the bit with the PushRead-only freshCursor)
 inline constexpr uint8_t kOpFlagKeyPending   = 0x10;   ///< WorkerOp::keyPending (SessionAnnounce only)
 inline constexpr uint8_t kOpFlagResponseBind = 0x20;   ///< WorkerOp::responseBind (SessionAnnounce only; NAT-safe egress)
 inline constexpr uint8_t kOpFlagSessionEgress = 0x40;  ///< WorkerOp::sessionEgress (Subscribe only; NAT-safe egress)

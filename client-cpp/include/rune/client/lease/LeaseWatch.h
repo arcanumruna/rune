@@ -131,6 +131,7 @@ public:
     [[nodiscard]] uint64_t scansIssued() const noexcept { return scansIssued_; }
     [[nodiscard]] uint64_t subscriptionsOpened() const noexcept { return subsOpened_; }
     [[nodiscard]] uint64_t reruns() const noexcept { return reruns_; }
+    [[nodiscard]] uint64_t dataResetRerunsForTest() const noexcept { return dataResetReruns_; }   ///< reruns caused by a data-reset subscription
     [[nodiscard]] uint64_t ringOverflows() const noexcept { return ringOverflows_; }   ///< record-ring Overflow markers acted on
 
 private:
@@ -163,6 +164,7 @@ private:
         uint32_t                    nextGen = 1;
         uint32_t                    scanSeq = 0;
         bool                        everLive = false;
+        uint32_t                    seenResets = 0;   ///< pt.sub->dataResets() when this subscription was opened; a bigger value = the partition was reborn
         int64_t                     backoffNs = 0;   ///< the next Broken delay (0 = the 1 ms floor); doubles to 1 s, reset when the partition is Live
         // page bounds of this epoch: prefix j's pages are pages[pageBegin[j] .. pageBegin[j] + pageCount[j])
         std::array<uint32_t, kMaxPrefixes> pageBegin{}, pageCount{};
@@ -254,7 +256,7 @@ private:
     std::array<Cb, kMaxObservers> observers_{};
     Cb                       handler_{};
     bool                     started_ = false, ready_ = false, failed_ = false;
-    uint64_t                 resubscribes_ = 0, scansIssued_ = 0, subsOpened_ = 0, reruns_ = 0, ringOverflows_ = 0;
+    uint64_t                 resubscribes_ = 0, scansIssued_ = 0, subsOpened_ = 0, reruns_ = 0, ringOverflows_ = 0, dataResetReruns_ = 0;
     int64_t                  lastNowNs_ = 0;
 };
 
