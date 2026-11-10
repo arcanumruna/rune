@@ -2966,6 +2966,9 @@ void BrokerNode::buildGateway() {
     // Issue #82 (VLS Part A): a multi-node broker serves a view row only under a controller-granted read lease, handed
     // to each worker behind the role ops it covers.  A single node leads alone: unbounded.  Issue #486: the controller
     // commits a leader move that drops the old leader from the ISR only once that leader's lease has ended.
+    // Lease topics Task 27 (A.6): single node and multi node both post a led transient lease partition's lineage.
+    if (workerPool_ && metadataService_)
+        runtimeAgent_->enableLeaseLineageFanout(&BrokerNode::isTransientLeaseTopicTrampoline_, this);
     if (!config_.isSingleNode() && election_ && workerPool_) {
         for (int32_t i = 0; i < workerPool_->workerCount(); ++i) workerPool_->worker(i).requireViewReadLease();
         runtimeAgent_->enableReadLeaseFanout(workerPool_->workerCount());
@@ -6897,6 +6900,13 @@ bool BrokerNode::isTransientTopicTrampoline_(void* ctx, int32_t topicId) noexcep
     if (self->topicRegistry_ == nullptr) return false;
     const TopicSpec* spec = self->topicRegistry_->topic(topicId);
     return spec != nullptr && spec->persistence == PersistenceMode::Transient;
+}
+
+bool BrokerNode::isTransientLeaseTopicTrampoline_(void* ctx, int32_t topicId) noexcept {
+    auto* self = static_cast<BrokerNode*>(ctx);
+    if (self->topicRegistry_ == nullptr) return false;
+    const TopicSpec* spec = self->topicRegistry_->topic(topicId);
+    return spec != nullptr && spec->leaseTopic && spec->persistence == PersistenceMode::Transient;
 }
 
 uint64_t BrokerNode::transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept {

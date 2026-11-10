@@ -151,6 +151,10 @@
       <!-- Lease topics Task 21: control -> EVERY worker (cold: on a CHANGE only), no tail.  NS_LEASES_OVER: topicId = nsSlot,
            nextOffset = nsId, partition = 0 / 1 (the namespace is at or over max-leases on this node).  Never ownership-gated. -->
       <validValue name="NS_LEASES_OVER">39</validValue>
+      <!-- Lease topics Task 27 (spec A.6): control -> the partition's OWNING worker (cold: once per leadership of a transient
+           lease partition), no tail.  TRANSIENT_LINEAGE: topicId / partition, nextOffset = the leader epoch, correlationId = the
+           lineage token (uint64 bit-cast), hwBound = the lineage generation. -->
+      <validValue name="TRANSIENT_LINEAGE">40</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica

@@ -222,16 +222,25 @@ private:
 //                int32 mintEpoch, int32 confirmedEpoch, int32 confirmedLeader,
 //                int64 incarnation
 //
+// Image v2 (written once featureLevel_ >= kMsmImageV2FeatureLevel, the lease level; lease topics A.6):
+//   v1, with the tag kImageV2Tag and per lineage one more uint32 `generation` after `incarnation`.
+//   v1/v0 images restore with generation 0.
+//
 // A v0 image restores as feature level 0, no marks, clean elections and NO
 // lineages (a transient group offset then answers "pending"/"none" until a
 // leadership re-confirms — never a stale offset).
 
 inline constexpr int64_t kMsmImageV1Tag = -0x52554E45'00000001LL;   // "RUNE" v1
+inline constexpr int64_t kMsmImageV2Tag = -0x52554E45'00000002LL;   // "RUNE" v2: lineages carry the generation
+/// The feature level (rune::replication::MetadataFeature::kLeases) from which images are written as v2;
+/// MetadataService.h static_asserts they agree (this library cannot see the replication header).
+inline constexpr int16_t kMsmImageV2FeatureLevel = 6;
 
 template<typename Writer>
 void MetadataStateMachine::snapshot(Writer& w) const
 {
-    w.writeInt64(kMsmImageV1Tag);
+    const bool v2 = featureLevel_ >= kMsmImageV2FeatureLevel;
+    w.writeInt64(v2 ? kMsmImageV2Tag : kMsmImageV1Tag);
     w.writeInt64(committedPos_);
     w.writeInt32(featureLevel_);
 
@@ -269,6 +278,7 @@ void MetadataStateMachine::snapshot(Writer& w) const
         w.writeInt32(l.confirmedEpoch);
         w.writeInt32(l.confirmedLeader);
         w.writeInt64(l.incarnation);
+        if (v2) w.writeInt32(static_cast<int32_t>(l.generation));
     }
 }
 
@@ -288,7 +298,8 @@ void MetadataStateMachine::restore(Reader& r)
     ++committedVersion_;
 
     const int64_t first = r.readInt64();
-    const bool v1 = first == kMsmImageV1Tag;
+    const bool v2 = first == kMsmImageV2Tag;
+    const bool v1 = v2 || first == kMsmImageV1Tag;
     committedPos_ = v1 ? r.readInt64() : first;
     if (v1) featureLevel_ = static_cast<int16_t>(r.readInt32());
     const int32_t count = r.readInt32();
@@ -333,6 +344,7 @@ void MetadataStateMachine::restore(Reader& r)
             l.confirmedEpoch  = r.readInt32();
             l.confirmedLeader = r.readInt32();
             l.incarnation     = r.readInt64();
+            if (v2) l.generation = static_cast<uint32_t>(r.readInt32());
             lineages_[lineageKey_(t, p)] = l;
         }
     }

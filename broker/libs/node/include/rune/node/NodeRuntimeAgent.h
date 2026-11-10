@@ -29,6 +29,7 @@
 #include <rune/node/AdminControlPlane.h>
 #include <rune/node/NodeConsensusAgent.h>
 #include <rune/node/ReadLeaseFanout.h>
+#include <rune/node/LeaseLineageFanout.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/node/GroupCoordinationService.h>
 #include <rune/node/TransactionCoordinationService.h>
@@ -191,6 +192,13 @@ public:
     void setBootHistory(bool h) noexcept { bootHistory_ = h; }
     /// Issue #82 (VLS A.5.1): hand the view read lease to `workers` workers (a multi-node broker).  Before start.
     void enableReadLeaseFanout(int32_t workers) { readLeaseFanout_.configure(workers); }
+    /// Lease topics Task 27 (spec A.6): post the lineage of every transient lease partition this node leads to its owning
+    /// worker.  `isTransientLease(ctx, topicId)`: the topic is a transient lease topic.  Before start.
+    void enableLeaseLineageFanout(bool (*isTransientLease)(void*, int32_t), void* ctx) noexcept {
+        leaseTopicFn_  = isTransientLease;
+        leaseTopicCtx_ = ctx;
+    }
+    [[nodiscard]] const LeaseLineageFanout& leaseLineageFanoutForTest() const noexcept { return leaseLineageFanout_; }
     /// Test-only, this agent's thread.
     [[nodiscard]] const ReadLeaseFanout& readLeaseFanoutForTest() const noexcept { return readLeaseFanout_; }
     /// CP3 I4: > 0 replaces the failover (broker liveness) timeout, 3 x the leader-heartbeat timeout by default.
@@ -633,6 +641,38 @@ private:
                     // If null (no topics / BalancerError): leave routingImage_ null too.
                 }
             }
+        }
+
+        // 2c. Lease topics Task 27 (spec A.6): the committed lineage of every transient lease partition this node leads goes to
+        //     its owning worker, behind the role ops derived above (LeaseLineageFanout).
+        if (leaseTopicFn_ != nullptr && metadataService_ && workerPool_ && bridge_) {
+            const uint64_t mapV = metadataService_->committedMapVersion();
+            const uint64_t linV = metadataService_->transientLineageVersion();
+            const bool changed  = mapV != leaseFanoutMapVersion_ || linV != leaseFanoutLineageVersion_;
+            leaseFanoutMapVersion_     = mapV;
+            leaseFanoutLineageVersion_ = linV;
+            work += leaseLineageFanout_.step(
+                changed,
+                [this](auto&& fn) {
+                    metadataService_->committedMapForFanout().forEach(
+                        [&](int32_t t, int32_t p, const rune::metadata::PartitionAssignment& pa) {
+                            if (t >= 0 && pa.leaderNode == selfId_ && leaseTopicFn_(leaseTopicCtx_, t))
+                                fn(t, p, pa.leaderEpoch);
+                        });
+                },
+                [this](int32_t t, int32_t p) { return metadataService_->trustedTransientLineageRecord(t, p); },
+                [this](int32_t t, int32_t p) { return workerPool_->ownerWorkerId(t, p); },
+                [this](int32_t w) { return bridge_->roleOpsPendingFor(w); },
+                [this](int32_t, int32_t t, int32_t p, int32_t epoch, uint64_t lineage, uint32_t generation) {
+                    WorkerOp op;
+                    op.type          = WorkerOp::Type::TransientLineage;
+                    op.topicId       = t;
+                    op.partition     = p;
+                    op.nextOffset    = epoch;
+                    op.correlationId = static_cast<int64_t>(lineage);
+                    op.hwBound       = static_cast<int64_t>(generation);
+                    return workerPool_->tryEnqueueOp(t, p, std::move(op));
+                });
         }
 
         // 3. Group coordination service — drive after bridge (sees current leadership).
@@ -1187,6 +1227,11 @@ private:
     rune::consensus::SbeConsensusPublisher*            canvassPublisher_  = nullptr;
     bool                                               bootHistory_       = false;
     int64_t                                            failoverTimeoutOverrideNs_ = 0;   ///< CP3 I4 (0 = default)
+    LeaseLineageFanout leaseLineageFanout_{};   // lease topics Task 27: the lineage of a led lease partition -> its worker
+    bool     (*leaseTopicFn_)(void*, int32_t) = nullptr;
+    void*    leaseTopicCtx_                   = nullptr;
+    uint64_t leaseFanoutMapVersion_           = UINT64_MAX;
+    uint64_t leaseFanoutLineageVersion_       = UINT64_MAX;
     ReadLeaseFanout readLeaseFanout_{};   // issue #82: the view read lease -> every worker
     bool                                               testCandidacyHold_ = false;
     /// R12 flags (every cycle) + the gate evaluation (A-M4: right after the consensus step, before the bridge).

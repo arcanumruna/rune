@@ -56,6 +56,9 @@ struct TransientLineage {
     int32_t  confirmedEpoch  = -1;
     int32_t  confirmedLeader = -1;
     int64_t  incarnation     = 0;
+    /// Lease topics (spec A.6): 0 = the partition's first lineage, previous + 1 at every mint over an
+    /// existing record (saturating); a kept lineage keeps it.
+    uint32_t generation      = 0;
 };
 
 struct PartitionAssignment {

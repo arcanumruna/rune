@@ -612,6 +612,14 @@ public:
         const PartitionWriteState* w = writeOf_(findOwnedReplica_(topicId, partition));
         return w == nullptr ? nullptr : w->leaseRuntime.get();
     }
+    /// Lease topics Task 27: the lineage note the control thread posted for the partition (nullopt: none / not owned).
+    [[nodiscard]] std::optional<LeaseLineageNote> leaseLineageForTest(int32_t topicId, int32_t partition) const noexcept {
+        const PartitionWriteState* w = writeOf_(findOwnedReplica_(topicId, partition));
+        if (w == nullptr || w->leaseLineage.leaderEpoch < 0) return std::nullopt;
+        return w->leaseLineage;
+    }
+    [[nodiscard]] uint64_t leaseLineageNotesForTest() const noexcept { return leaseLineageNotes_; }
+    [[nodiscard]] uint64_t leaseLineageStaleForTest() const noexcept { return leaseLineageStale_; }
     void setLeaseBatchCapForTest(std::size_t bytes) noexcept { leaseBatchCapOverrideForTest_ = bytes; }
     /// Test seam (Task 12): the promotion pass's chunk (row ids per pass) of runtimes created afterwards; 0 keeps every entry Free.
     void setLeasePromotionChunkForTest(uint32_t chunk) noexcept { leasePromotionChunk_ = chunk; }
@@ -2959,10 +2967,25 @@ private:
             ++readLeasesSeen_;
             if (op.nextOffset() > viewLeaseEndNs_) viewLeaseEndNs_ = op.nextOffset();
             break;
+        case WorkerOp::Type::TransientLineage:   // lease topics Task 27 (A.6): the committed lineage of a led lease partition
+            executeTransientLineage_(op);
+            break;
         case WorkerOp::Type::ClusterFeatureLevel:   // checked writes: the committed metadata feature level (only ever rises)
             if (op.nextOffset() > clusterFeatureLevel_) clusterFeatureLevel_ = static_cast<int16_t>(op.nextOffset());
             break;
         }
+    }
+
+    // Lease topics Task 27 (spec A.6): keep the note of the highest leader epoch.  Cold (once per leadership).  Nothing reads the
+    // note yet (Task 30, the rebirth fence).
+    [[gnu::cold]] void executeTransientLineage_(sbe::WorkerOp& op) {
+        PartitionWriteState* w = writeOf_(findOwnedReplica_(op.topicId(), op.partition()));
+        if (w == nullptr) return;   // not owned here (any more)
+        ++leaseLineageNotes_;
+        const auto epoch = static_cast<int32_t>(op.nextOffset());
+        if (epoch < w->leaseLineage.leaderEpoch) { ++leaseLineageStale_; return; }
+        w->leaseLineage = LeaseLineageNote{epoch, static_cast<uint64_t>(op.correlationId()),
+                                           static_cast<uint32_t>(op.hwBound())};
     }
 
     // Issues #109 / #196: an enforcement fence was reached on one of this worker's rings - every op queued before it
@@ -7262,6 +7285,8 @@ private:
         k ^= k >> 30; k *= 0xbf58476d1ce4e5b9ULL; k ^= k >> 27; k *= 0x94d049bb133111ebULL; return k ^ (k >> 31);
     }
     uint64_t    opsRefusedNotOwned_ = 0;
+    uint64_t    leaseLineageNotes_  = 0;   // Task 27: TransientLineage ops applied to an owned partition
+    uint64_t    leaseLineageStale_  = 0;   // ... of those, older than the held note's epoch (ignored)
     uint64_t    ownershipAcks_      = 0;
     uint64_t    followerSideOps_    = 0;   // OLE responses + reconcile requests executed here
     static constexpr bool gatedByOwnership_(WorkerOp::Type t) noexcept {
@@ -7279,6 +7304,7 @@ private:
         case WorkerOp::Type::AlterIsrResponse:
         case WorkerOp::Type::AppendControlRecord:
         case WorkerOp::Type::TxnVerifyResult:   // #112: a stale answer is dropped (the client's retry re-verifies)
+        case WorkerOp::Type::TransientLineage:  // Task 27: dropped when ownership moved (the new owner's leadership has a new epoch and gets its own note)
         case WorkerOp::Type::Subscribe:
             return true;
         default:

@@ -855,6 +855,7 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesKeyIndexDdlTest.cpp
         tests/node/LeaseDdlTest.cpp
         tests/node/LeaseJudgeTest.cpp
+        tests/node/LeaseLineageFanoutTest.cpp
         tests/node/CheckedWritesAutoIncDdlTest.cpp
         tests/node/CheckedWritesTimelineTest.cpp
         tests/node/CheckedWritesVerdictSourceTest.cpp
@@ -1984,6 +1985,7 @@ if(BUILD_TESTING)
                        tests/client/LeaseRaceTest.cpp
                        tests/client/LeaseMatrixTest.cpp
                        tests/client/LeaseNamespaceTest.cpp
+                       tests/client/LeaseLineageBrokerTest.cpp
                        tests/client/LeaseTrioTest.cpp
                        tests/client/LeaseRouteHintTest.cpp
                        tests/client/LeaseRecipeBrokerTest.cpp

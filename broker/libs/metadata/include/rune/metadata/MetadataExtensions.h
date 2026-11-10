@@ -70,10 +70,12 @@ struct FeatureLevelRecord {
 //    offset of another lineage as "none".  Internal, broker-to-broker; an older
 //    MSM skips the unknown type (MetadataStateMachine::apply default).
 //
-//    Wire (LE): [0..1] type=0x8002 [2] version=0 [3..6] topicId int32
+//    Wire (LE): [0..1] type=0x8002 [2] version=0|1 [3..6] topicId int32
 //               [7..10] partition int32 [11..18] lineage uint64
 //               [19..22] mintEpoch int32 [23..26] confirmedEpoch int32
 //               [27..30] confirmedLeader int32 [31..38] incarnation int64
+//               [39..42] generation uint32 (version 1 only, written only at the lease feature level so
+//               every member decodes it)
 // ---------------------------------------------------------------------------
 inline constexpr uint16_t kTransientLineageRecordType = 0x8002;
 
@@ -82,13 +84,17 @@ struct TransientLineageRecord {
     int32_t          partition = 0;
     TransientLineage l{};
     static constexpr std::size_t ENCODED_SIZE = 39;
+    static constexpr std::size_t ENCODED_SIZE_V1 = 43;
+    /// Not on the wire: chooses the encoding (true = version 1, carries `l.generation`).  decode() sets it.
+    bool withGeneration = false;
 
     std::size_t encode(uint8_t* buf, std::size_t len) const noexcept {
-        if (len < ENCODED_SIZE) return 0;
+        const std::size_t need = withGeneration ? ENCODED_SIZE_V1 : ENCODED_SIZE;
+        if (len < need) return 0;
         namespace d = rune::protocol::metadata::detail;
         buf[0] = static_cast<uint8_t>(kTransientLineageRecordType & 0xff);
         buf[1] = static_cast<uint8_t>(kTransientLineageRecordType >> 8);
-        buf[2] = 0;
+        buf[2] = withGeneration ? 1 : 0;
         d::putS32(buf, 3, topicId);
         d::putS32(buf, 7, partition);
         d::putS64(buf, 11, static_cast<int64_t>(l.lineage));
@@ -96,12 +102,14 @@ struct TransientLineageRecord {
         d::putS32(buf, 23, l.confirmedEpoch);
         d::putS32(buf, 27, l.confirmedLeader);
         d::putS64(buf, 31, l.incarnation);
-        return ENCODED_SIZE;
+        if (withGeneration) d::putS32(buf, 39, static_cast<int32_t>(l.generation));
+        return need;
     }
     static std::optional<TransientLineageRecord> decode(const uint8_t* buf, std::size_t len) noexcept {
         if (len < ENCODED_SIZE) return std::nullopt;
         const uint16_t type = static_cast<uint16_t>(buf[0] | (buf[1] << 8));
-        if (type != kTransientLineageRecordType || buf[2] != 0) return std::nullopt;
+        if (type != kTransientLineageRecordType || buf[2] > 1) return std::nullopt;
+        if (buf[2] == 1 && len < ENCODED_SIZE_V1) return std::nullopt;
         namespace d = rune::protocol::metadata::detail;
         TransientLineageRecord r;
         r.topicId           = d::getS32(buf, 3);
@@ -111,6 +119,10 @@ struct TransientLineageRecord {
         r.l.confirmedEpoch  = d::getS32(buf, 23);
         r.l.confirmedLeader = d::getS32(buf, 27);
         r.l.incarnation     = d::getS64(buf, 31);
+        if (buf[2] == 1) {
+            r.l.generation   = static_cast<uint32_t>(d::getS32(buf, 39));
+            r.withGeneration = true;
+        }
         if (r.l.lineage == 0) return std::nullopt;   // never a valid lineage
         return r;
     }
@@ -130,6 +142,8 @@ struct TransientLineageRecord {
 /// Residual N3: `cleanElection` false (the leader was not in the replaced
 /// assignment's ISR — an unclean / survivor election: it may lack committed
 /// records) always MINTS.
+/// Lease topics (spec A.6): the result's `generation` is the kept record's, or - a mint over an existing
+/// lineage - the record's + 1 (saturating at UINT32_MAX), or 0 for the partition's first lineage.
 [[nodiscard]] inline TransientLineage decideTransientLineage(const TransientLineage* rec, int32_t leader,
                                                              int32_t epoch, int32_t src, uint64_t freshToken,
                                                              int64_t incarnation = 0,
@@ -138,6 +152,10 @@ struct TransientLineageRecord {
     const bool keep = cleanElection && rec != nullptr && rec->lineage != 0 && src >= 0 &&
                       src >= rec->mintEpoch && src <= rec->confirmedEpoch;
     out.lineage         = keep ? rec->lineage : freshToken;
+    out.generation      = keep ? rec->generation
+                               : (rec != nullptr && rec->lineage != 0
+                                      ? (rec->generation == UINT32_MAX ? UINT32_MAX : rec->generation + 1)
+                                      : 0u);
     out.mintEpoch       = keep ? rec->mintEpoch : epoch;
     out.confirmedEpoch  = epoch;
     out.confirmedLeader = leader;
@@ -168,7 +186,7 @@ inline constexpr uint64_t kLineageUntrusted = UINT64_MAX;
 //    removeRuntimeTopic).  Topic ids are never reused (catalog ids), so a later
 //    assignment for the same id never exists.  An older MSM skips the type.
 //
-//    Wire (LE): [0..1] type=0x8003 [2] version=0 [3..6] topicId int32
+//    Wire (LE): [0..1] type=0x8003 [2] version=0|1 [3..6] topicId int32
 // ---------------------------------------------------------------------------
 inline constexpr uint16_t kRemoveTopicPlacementRecordType = 0x8003;
 
@@ -205,7 +223,7 @@ struct RemoveTopicPlacementRecord {
 //    ControllerTermRecord{term}: the first record of a controller's claim (Raft section 5.4.2); the MSM
 //    decodes and IGNORES it (it changes nothing, so followers apply it as a no-op).  Older MSMs skip both types.
 //
-//    NodeStorageRecord: [0..1] type=0x8004 [2] version=0 [3..6] node int32 [7..14] storageId int64
+//    NodeStorageRecord: [0..1] type=0x8004 [2] version=0|1 [3..6] node int32 [7..14] storageId int64
 //    ControllerTermRecord: [0..1] type=0x8005 [2] version=0 [3..10] term int64
 // ---------------------------------------------------------------------------
 inline constexpr uint16_t kNodeStorageRecordType     = 0x8004;

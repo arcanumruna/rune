@@ -320,6 +320,15 @@ private:
 /// One owned typed partition's write state, next to RcSlot.  Later parts append their per-partition members here.
 class VerdictSource;
 
+/// Lease topics Task 27 (spec A.6): the committed data lineage of the leadership this partition runs, as the control thread
+/// posted it (WorkerOp::TransientLineage).  The note of the highest leader epoch wins.  Nothing reads it yet (Task 30, the
+/// rebirth fence, does).
+struct LeaseLineageNote {
+    int32_t  leaderEpoch = -1;
+    uint64_t lineage     = 0;
+    uint32_t generation  = 0;
+};
+
 struct PartitionWriteState {
     const TopicWriteSpec*              spec = nullptr;
     rune::storage::RejectedOffsetIndex rejected;       ///< reserved when the partition becomes a verdict source (VerdictSource.cpp)
@@ -342,6 +351,7 @@ struct PartitionWriteState {
     /// and raised by onAppended for an untracked update; leaseIndexReady requires judgedThrough > it, so it converges as the judge
     /// advances past that offset (no timer).
     int64_t                            leaseUntrackedThrough = -1;
+    LeaseLineageNote                   leaseLineage{};       ///< a transient lease partition: the committed lineage (Task 27; unread until Task 30)
     LeaseFoldEvents                    leaseEvents;          ///< a lease topic: one event per accepted record, until the wheels consume them
     /// A lease topic's wheels and entries (Task 10): exist only on the partition leader while the lease index is ready, under one
     /// identity (leadership generation, lease rebuild epoch); Worker::leaseDuty_ creates and destroys it.  Cold-allocated.

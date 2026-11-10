@@ -191,6 +191,11 @@ struct WorkerOp {
         ScanLeases                = 38, ///< gateway → worker: a page of the lease rows in hash order (Task 13b)
         // Lease topics Task 21: control → EVERY worker (cold: on a change only), see NsRingMessages.h.  Never ownership-gated.
         NsLeasesOver              = 39, ///< control → worker: nsSlot is at or over max-leases on this node (or back under)
+        // Lease topics Task 27 (spec A.6): control → the partition's OWNING worker on its OP ring (cold: once per leadership
+        // of a transient lease partition; LeaseLineageFanout), ownership-gated like TxnVerifyResult.  topicId / partition = the
+        // partition, nextOffset = the leader epoch, correlationId = the lineage token (uint64 bit-cast to int64), hwBound = the
+        // lineage generation.  No tail.  (40 = TRANSIENT_LINEAGE.)
+        TransientLineage          = 40, ///< control → worker: the committed data lineage of a transient lease partition
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the

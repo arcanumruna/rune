@@ -2605,6 +2605,8 @@ private:
     void ensureProcessIncarnation_();
     static uint64_t transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept;
     static bool isTransientTopicTrampoline_(void* ctx, int32_t topicId) noexcept;
+    /// Lease topics Task 27: a TRANSIENT lease topic (the lineage fanout's predicate).
+    static bool isTransientLeaseTopicTrampoline_(void* ctx, int32_t topicId) noexcept;
     /// ISR v3 Step 6: the storage manifest markers.  Each runs once, on the control thread (cold fsync), when the
     /// class first exists durably: the internal-ISR knowledge file / the first committed __cluster_metadata apply.
     void markConsensusWhenPresent_();

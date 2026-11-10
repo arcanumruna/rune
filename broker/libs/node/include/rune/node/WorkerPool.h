@@ -544,6 +544,7 @@ public:
         case WorkerOp::Type::AlterIsrResponse:
         case WorkerOp::Type::AppendControlRecord:
         case WorkerOp::Type::TxnVerifyResult:   // F15-FU1 (#112)
+        case WorkerOp::Type::TransientLineage:  // lease topics Task 27
         case WorkerOp::Type::Subscribe:
             return true;
         default:

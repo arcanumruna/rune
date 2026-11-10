@@ -1499,3 +1499,111 @@ TEST(MetadataStateMachineRegression, ControllerTermRecordIsANoOpRegression) {
     EXPECT_EQ(msm.lossCount(), loss);
     EXPECT_EQ(ControllerTermRecord::decode(rb, rn)->term, 7);
 }
+
+// ---------------------------------------------------------------------------
+// Lease topics Task 27 (spec A.6): the lineage generation.
+// ---------------------------------------------------------------------------
+TEST(LineageGenerationRegression, DecideSetsGenerationRegression) {
+    TransientLineage rec;
+    rec.lineage = 7; rec.generation = 3; rec.mintEpoch = 2; rec.confirmedEpoch = 4;
+    // rec null: the partition's first lineage.
+    EXPECT_EQ(decideTransientLineage(nullptr, 1, 5, -1, 99).generation, 0u);
+    // kept: lineage and generation survive.
+    {
+        const auto o = decideTransientLineage(&rec, 1, 5, 3, 99);
+        EXPECT_EQ(o.lineage, 7u);
+        EXPECT_EQ(o.generation, 3u);
+    }
+    // src -1 (no data): minted over an existing record, generation + 1.
+    {
+        const auto o = decideTransientLineage(&rec, 1, 5, -1, 99);
+        EXPECT_EQ(o.lineage, 99u);
+        EXPECT_EQ(o.generation, 4u);
+    }
+    // an unclean election always mints.
+    {
+        const auto o = decideTransientLineage(&rec, 1, 5, 3, 99, 0, /*cleanElection=*/false);
+        EXPECT_EQ(o.lineage, 99u);
+        EXPECT_EQ(o.generation, 4u);
+    }
+    // saturates.
+    rec.generation = UINT32_MAX;
+    EXPECT_EQ(decideTransientLineage(&rec, 1, 5, -1, 99).generation, UINT32_MAX);
+}
+
+TEST(LineageGenerationRegression, RecordVersionsRoundTripRegression) {
+    TransientLineageRecord r;
+    r.topicId = 3; r.partition = 2;
+    r.l.lineage = 0xAB; r.l.mintEpoch = 1; r.l.confirmedEpoch = 2; r.l.confirmedLeader = 4;
+    r.l.incarnation = 9; r.l.generation = 0xDEADBEEFu;
+    uint8_t buf[64] = {};
+    // version 0: today's 39 bytes, the generation is not carried.
+    ASSERT_EQ(r.encode(buf, sizeof buf), 39u);
+    EXPECT_EQ(buf[2], 0);
+    auto d0 = TransientLineageRecord::decode(buf, 39);
+    ASSERT_TRUE(d0.has_value());
+    EXPECT_EQ(d0->l.generation, 0u);
+    EXPECT_FALSE(d0->withGeneration);
+    EXPECT_EQ(d0->l.lineage, 0xABu);
+    // version 1: 43 bytes.
+    r.withGeneration = true;
+    EXPECT_EQ(r.encode(buf, 42), 0u) << "a short buffer is refused";
+    ASSERT_EQ(r.encode(buf, sizeof buf), 43u);
+    EXPECT_EQ(buf[2], 1);
+    auto d1 = TransientLineageRecord::decode(buf, 43);
+    ASSERT_TRUE(d1.has_value());
+    EXPECT_EQ(d1->l.generation, 0xDEADBEEFu);
+    EXPECT_TRUE(d1->withGeneration);
+    // a cut version-1 record, and an unknown version.
+    EXPECT_FALSE(TransientLineageRecord::decode(buf, 42).has_value());
+    buf[2] = 2;
+    EXPECT_FALSE(TransientLineageRecord::decode(buf, 43).has_value());
+}
+
+TEST(LineageGenerationRegression, ImageCarriesGenerationRegression) {
+    auto build = [](int16_t level, uint32_t generation) {
+        auto msm = std::make_unique<MetadataStateMachine>();
+        int64_t pos = 0;
+        FeatureLevelRecord f; f.level = level;
+        uint8_t fb[8];
+        const std::size_t fn = f.encode(fb, sizeof fb);
+        msm->apply(fb, fn, pos);
+        msm->commit(pos++);
+        TransientLineageRecord r;
+        r.topicId = 1; r.partition = 0;
+        r.l.lineage = 0x77; r.l.mintEpoch = 2; r.l.confirmedEpoch = 2; r.l.confirmedLeader = 7;
+        r.l.generation = generation;
+        r.withGeneration = true;   // a record at the lease level; below it the committed record would be version 0
+        uint8_t lb[64];
+        const std::size_t ln = r.encode(lb, sizeof lb);
+        msm->apply(lb, ln, pos);
+        msm->commit(pos++);
+        return msm;
+    };
+    auto roundTrip = [](const MetadataStateMachine& msm) {
+        VecSnapshotWriter w;
+        msm.snapshot(w);
+        auto restored = std::make_unique<MetadataStateMachine>();
+        VecSnapshotReader r(w.data());
+        restored->restore(r);
+        EXPECT_TRUE(r.done());
+        return restored;
+    };
+    {   // at the lease level the image is v2 and carries the generation
+        auto msm = build(kMsmImageV2FeatureLevel, 5);
+        ASSERT_NE(msm->lineage(1, 0), nullptr);
+        EXPECT_EQ(msm->lineage(1, 0)->generation, 5u);
+        auto restored = roundTrip(*msm);
+        ASSERT_NE(restored->lineage(1, 0), nullptr);
+        EXPECT_EQ(restored->lineage(1, 0)->generation, 5u);
+        EXPECT_EQ(restored->lineage(1, 0)->lineage, 0x77u);
+        EXPECT_EQ(restored->featureLevel(), kMsmImageV2FeatureLevel);
+    }
+    {   // below it the image is v1: no generation travels, a restore reads 0
+        auto msm = build(kMsmImageV2FeatureLevel - 1, 5);
+        auto restored = roundTrip(*msm);
+        ASSERT_NE(restored->lineage(1, 0), nullptr);
+        EXPECT_EQ(restored->lineage(1, 0)->generation, 0u);
+        EXPECT_EQ(restored->lineage(1, 0)->lineage, 0x77u);
+    }
+}
