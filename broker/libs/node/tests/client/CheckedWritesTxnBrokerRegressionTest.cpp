@@ -430,6 +430,48 @@ TEST(CheckedWritesTxnBrokerRegression, TwoPartitionsOneNoNothingCommitsShardRegr
     EXPECT_EQ(balances.i(*balance, "balance"), 15);
 }
 
+// The e2e verifier's shape: a client with no static topics reads both topics read_committed from earliest, by the handles it opened, and
+// sees a committed transaction whole by its characters' assigned ids and its entry ids.  A name it never opened has no handle to read.
+TEST(CheckedWritesTxnBrokerRegression, VerifierReadsBothTopicsByOpenedHandlesShardRegression) {
+    Shard s("cw11_verify");
+    s.setUp();
+    ASSERT_FALSE(HasFatalFailure());
+    TxnClient t(s.b.clientConfig(), "tx-verify");
+    t.begin();
+    const rc::WriteResult a = t.create(9, "Vera"), b = t.create(9, "Vic");
+    ASSERT_TRUE(a.ok());
+    ASSERT_TRUE(b.ok());
+    ASSERT_TRUE(t.put(41, 9, 1).ok());
+    ASSERT_TRUE(t.put(42, 9, 1).ok());
+    ASSERT_TRUE(t.commit().ok);
+
+    rc::Client& c = *s.b.connectClient();
+    rc::Producer p = c.producer(rc::ProducerConfig{});
+    const auto characters = c.openTopicAndWait<RpCharacter>("character", p, 10s);
+    const auto ledger = c.openTopicAndWait<RpLedger>("ledger", p, 10s);
+    rc::SubscribeOptions so;
+    so.from      = rc::From::earliest();
+    so.isolation = rc::Isolation::ReadCommitted;
+    std::mutex mu;
+    std::set<uint64_t> ids, entries;
+    const auto idAt4 = [&](std::set<uint64_t>& into) {
+        return [&](const rc::Record& r) {
+            uint64_t id = 0;
+            std::memcpy(&id, r.value.data() + 4, sizeof id);
+            std::lock_guard<std::mutex> g(mu);
+            into.insert(id);
+        };
+    };
+    EXPECT_THROW((void)c.subscribe(c.topic("ledger"), rc::AllPartitions{}, so, idAt4(entries)), std::invalid_argument) << "a name absent from ClientConfig::topics";
+    rc::SubscriptionSet cs = c.subscribe(characters.handle(), rc::AllPartitions{}, so, idAt4(ids));
+    rc::SubscriptionSet ls = c.subscribe(ledger.handle(), rc::AllPartitions{}, so, idAt4(entries));
+    EXPECT_TRUE(waitFor([&] {
+        std::lock_guard<std::mutex> g(mu);
+        return ids.contains(a.key()) && ids.contains(b.key()) && entries.contains(41) && entries.contains(42);
+    }, 5s)) << "the committed transaction is whole";
+    p.closeImmediately();
+}
+
 TEST(CheckedWritesTxnBrokerRegression, AllYesEachPartitionVisibleInOneStepShardRegression) {
     expectEachPartitionVisibleInOneStep("cw11_step", 60);
 }

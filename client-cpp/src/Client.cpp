@@ -5872,6 +5872,8 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
                                     SubscribeOptions&        opts,
                                     RecordHandler            handler)
 {
+    // A handle no topic answers to (Client::topic of a name absent from ClientConfig::topics) would deliver nothing, silently.
+    if (!topic.valid() && !isEventLogTopic(topic.topicId)) throw std::invalid_argument("subscribe(): invalid topic handle");
     // Build the impl.  Its immutable fields are written HERE, before the
     // SubscribeAdd command is committed to the agent ring (which publishes them
     // to the duty thread); every other field is duty-thread owned from then on.

@@ -1151,7 +1151,10 @@ RpLine txnRun(std::unique_ptr<TxnWriter>& w, Client& c, const std::string& txnId
     } catch (const std::exception& e) {
         l.endMs = epochMs();   // the answer's arrival: not the abort and the writer rebuild below
         std::fprintf(stderr, "%s threw: %s\n", tag.c_str(), e.what());
-        try { w->producer.abortTransactionAndWait(30s); } catch (const std::exception&) { w = std::make_unique<TxnWriter>(c, txnId); }   // a fenced or broken producer starts over
+        try { w->producer.abortTransactionAndWait(30s); } catch (const std::exception&) {   // a fenced or broken producer starts over
+            w.reset();
+            try { w = std::make_unique<TxnWriter>(c, txnId); } catch (const std::exception& r) { std::fprintf(stderr, "%s: the writer was not rebuilt: %s\n", tag.c_str(), r.what()); }
+        }
     }
     return l;
 }
@@ -1175,13 +1178,19 @@ int runTxnRun(const Args& a) {
     c.connectAndWait();
     const int threads = static_cast<int>(envInt("KI_E2E_THREADS", 4));
     std::vector<std::vector<RpLine>> lines(static_cast<std::size_t>(threads));
+    std::atomic<int> broken{0};   // the threads whose writer could not be built: they stop, their remaining transactions unrun
     {
         Progress progress("txn-run", a.worker);
         std::vector<std::thread> ts;
         for (int t = 0; t < threads; ++t)
             ts.emplace_back([&, t] {
                 const std::string txnId = "txn-probe-w" + std::to_string(a.worker) + "-t" + std::to_string(t);
-                auto w = std::make_unique<TxnWriter>(c, txnId);
+                std::unique_ptr<TxnWriter> w;
+                try { w = std::make_unique<TxnWriter>(c, txnId); } catch (const std::exception& e) {
+                    std::fprintf(stderr, "%s: the writer was not built: %s\n", txnId.c_str(), e.what());
+                    ++broken;
+                    return;
+                }
                 for (uint64_t u = a.lo + static_cast<uint64_t>(t); u <= a.hi; u += static_cast<uint64_t>(threads)) {
                     const std::string base = "u" + std::to_string(u);   // the names are shared by the workers: they race for them
                     const uint64_t entries = static_cast<uint64_t>(a.worker + 1) * kTxnEntryBase + u * 1000;
@@ -1189,11 +1198,13 @@ int runTxnRun(const Args& a) {
                         const std::string tag = base + "k" + std::to_string(k);
                         lines[static_cast<std::size_t>(t)].push_back(txnRun(w, c, txnId, u, accountOf(a.worker, u), {tag + "a", tag + "b"}, entries + static_cast<uint64_t>(k) * 10, 2, 1, tag));
                         ++progress.done;
+                        if (!w) { ++broken; return; }
                     }
                     // One character for another user and a debit of the worker's account's whole balance and more: balances refuses it.
                     const std::string tag = base + "od";
                     lines[static_cast<std::size_t>(t)].push_back(txnRun(w, c, txnId, kRpPairBase + u, accountOf(a.worker, u), {tag}, entries + 900, 1, -1000, tag));
                     ++progress.done;
+                    if (!w) { ++broken; return; }
                 }
             });
         for (auto& t : ts) t.join();
@@ -1201,6 +1212,7 @@ int runTxnRun(const Args& a) {
     std::vector<RpLine> all;
     for (const auto& l : lines) all.insert(all.end(), l.begin(), l.end());
     saveRpLines(c, "txn-run", a.worker, all);
+    if (broken != 0) { fail("CHECKED-WRITES-TXN-RUN", std::to_string(broken.load()) + " of " + std::to_string(threads) + " writers could not be built: their threads stopped"); return 1; }
     std::printf("CHECKED-WRITES-TXN-RUN: DONE worker=%d txns=%zu\n", a.worker, all.size());
     std::fflush(stdout);
     return 0;
@@ -1234,7 +1246,7 @@ int runTxnVerify() {
     SubscribeOptions so;
     so.from      = From::earliest();
     so.isolation = Isolation::ReadCommitted;
-    const TopicHandle ledger = c.topic("ledger");
+    const TxnLedgerTyped ledger = c.openTopicAndWait<TxnLedger>("ledger", w.producer, 60s);   // no ClientConfig::topics: a handle only by opening
     SubscriptionSet characterSet = c.subscribe(w.characters.handle(), AllPartitions{}, so, [&](const Record& r) {
         if (r.value.size() < 36) return;
         uint64_t id = 0;
@@ -1244,7 +1256,7 @@ int runTxnVerify() {
         tap.names[std::string(name, strnlen(name, 16))] = id;
         tap.characters.insert(id);
     });
-    SubscriptionSet ledgerSet = c.subscribe(ledger, AllPartitions{}, so, [&](const Record& r) {
+    SubscriptionSet ledgerSet = c.subscribe(ledger.handle(), AllPartitions{}, so, [&](const Record& r) {
         if (r.value.size() < 12) return;
         uint64_t id = 0;
         std::memcpy(&id, r.value.data() + 4, sizeof id);

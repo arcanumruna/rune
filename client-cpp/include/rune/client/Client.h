@@ -1432,6 +1432,8 @@ public:
     ///     can never be carried by the transport (over its max message length).
     ///     A Subscribe the transport later rejects permanently (Fatal) finishes
     ///     the Subscription instead (finished() turns true, never bound).
+    ///   - Throws std::invalid_argument (nothing submitted) for an invalid handle
+    ///     (topicId -1: Client::topic of a name absent from ClientConfig::topics).
     ///
     /// Demand / back-pressure: default is broker-paced push (the broker pauses
     /// when egress back-pressure applies, per GB-3).
