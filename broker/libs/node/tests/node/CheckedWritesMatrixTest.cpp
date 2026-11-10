@@ -3014,6 +3014,22 @@ TEST(CheckedWritesModel, TxnJudgeOrderAndWaitsOnHandBuiltLogs) {
         EXPECT_EQ(m.judgeStop(), 5);
         EXPECT_FALSE(m.vote(79));
     }
+    {   // P11-4: 77 votes no at its first record (a name key 1 owns) and its marker is not in the log: its rows stay locked, the key of
+        // its record after the failing one included, so 79's TxnJudge on that key waits
+        const Log log = build([&](const auto& put, Log& l) {
+            put(1, "a", -1);
+            const int64_t first77 = put(2, "A", 77);
+            put(4, "d", 77);
+            const int64_t first79 = put(4, "e", 79);
+            l.judges.push_back({5, 77, 0, first77});
+            l.judges.push_back({6, 79, 0, first79});
+        });
+        const CheckedWritesModel m = judged(log);
+        ASSERT_TRUE(m.vote(77));
+        EXPECT_EQ(m.vote(77)->code, CheckedWritesModel::kConstraintViolation);
+        EXPECT_EQ(m.judgeStop(), 6);
+        EXPECT_FALSE(m.vote(79));
+    }
     {   // 78's yes-voted record on 77's key lies in 77's scan range, but its marker is not in the log: 77's TxnJudge waits for it
         const Log log = build([&](const auto& put, Log& l) {
             const int64_t first77 = put(1, "z", 77);

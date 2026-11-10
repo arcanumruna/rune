@@ -227,6 +227,7 @@ struct DeferredTxn {
     TxnVoteAnswer answer{};
     bool        judged = false;   ///< `answer` is the judge's, not a default
     int32_t     overlay = -1;
+    bool        holdsAll = false;   ///< a no judged past the cap: its overlay lacks some of T's rows, so nothing past J is judged until its marker
     int64_t     voteReceivedNs = 0;
     int64_t     holdFrom = INT64_MAX;   ///< below firstOffset: an applied ordinary span holds it (the coverage never splits that span)
 };
@@ -298,6 +299,7 @@ public:
             }
             t.phase = TxnPhase::AwaitJudge;
             t.overlay = -1;
+            t.holdsAll = false;
             t.answer = {};
             t.judged = false;
             t.records = 0;
@@ -326,6 +328,10 @@ public:
         for (DeferredTxn& t : txns_)
             if (t.phase == TxnPhase::Locked && t.markerOffset >= 0 && t.markerOffset < hw) return &t;
         return nullptr;
+    }
+    /// A Locked entry holds the judge at its J (holdsAll).
+    [[nodiscard]] bool holdsJudge() const noexcept {
+        return std::any_of(txns_.begin(), txns_.end(), [](const DeferredTxn& t) { return t.phase == TxnPhase::Locked && t.holdsAll; });
     }
     /// The first offset of the earliest entry not Finalized (INT64_MAX = none): K stays below it.  A Locked entry with its marker
     /// is not applied yet, so a marker alone decides nothing here.

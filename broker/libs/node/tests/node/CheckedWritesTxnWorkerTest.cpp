@@ -1537,11 +1537,18 @@ TEST(CheckedWritesTxnWorkerRegression, RebuildAppliesACommitHeldInsideAnotherTxn
 }
 
 namespace {
-/// Producer `pid`'s one-insert transaction on this leader (no leadership change rebuilds the members first), and its vote.
-uint16_t voteOnThisLeader(Ki& k, int64_t pid, uint64_t id) {
+/// Producer `pid`'s one-insert transaction on this leader (no leadership change rebuilds the members first), and its vote request,
+/// one pass.  Returns its token.
+int64_t sendVoteOnThisLeader(Ki& k, int64_t pid, uint64_t id) {
     const auto a = k.r.ack(k.r.produceBytes(VerdictRig::batch({ins(id)}, pid, 0, {}, /*txn=*/true), kLeader, pid, 0));
     EXPECT_TRUE(a && a->code == 0);
-    return k.vote(pid).code;
+    return k.r.sendVote(VerdictRig::kSrc, pid, 0);
+}
+/// The same, driven to its answer.
+uint16_t voteOnThisLeader(Ki& k, int64_t pid, uint64_t id) {
+    const int64_t tok = sendVoteOnThisLeader(k, pid, id);
+    EXPECT_TRUE(k.r.driveUntilVoted(tok)) << "the vote of " << pid << " was never answered";
+    return k.r.voteReply(tok).value_or(VerdictRig::VoteReply{-1}).code;
 }
 }  // namespace
 
@@ -1558,12 +1565,82 @@ TEST(CheckedWritesTxnWorkerRegression, CommitOfATransactionJudgedNoAppliesItRegr
     const DeferredTxn* t = k.r.writeState()->txn.find(31);
     ASSERT_TRUE(t != nullptr && t->judged);
     ASSERT_EQ(t->answer.code, kTooLarge) << "this leadership judges it no";
-    EXPECT_EQ(voteOnThisLeader(k, 33, 9), 0) << "the no waiting for its marker holds no other transaction";
-    k.r.marker(33, true);
     k.r.marker(31, true);
     EXPECT_TRUE(k.r.driveUntilJudged());
-    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{1, 2, 3, 9})) << "the committed transaction is applied";
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{1, 2, 3})) << "the committed transaction is applied";
     EXPECT_EQ(voteOnThisLeader(k, 32, 2), kKeyExists);
+}
+
+// The same flip: this leadership's no past the smaller knob chained only T's first two records, so its overlay lacks the row of
+// the third.  U, voted after J on that row, waits for T's marker: T's COMMIT applies T first (KeyExists), an ABORT lets U in.
+TEST(CheckedWritesTxnWorkerRegression, NoJudgedPastTheCapHoldsLaterUnitsUntilItsMarkerRegression) {
+    for (const bool commit : {true, false}) {
+        SCOPED_TRACE(commit ? "commit" : "abort");
+        Ki k;
+        k.txn(31, {ins(1), ins(2), ins(3)});
+        ASSERT_EQ(k.vote(31).code, 0) << "the earlier leadership's yes";
+        k.r.demote();
+        k.r.worker->setTxnJudgedRecordsMax(2);
+        k.r.promote();
+        k.r.passes(60);
+        ASSERT_EQ(k.r.writeState()->txn.find(31)->answer.code, kTooLarge);
+        const int64_t u = sendVoteOnThisLeader(k, 32, 3);
+        k.r.passes(60);
+        EXPECT_FALSE(k.r.voteReply(u)) << "U is not judged against views that lack T";
+        k.r.marker(31, commit);
+        ASSERT_TRUE(k.r.driveUntilVoted(u));
+        EXPECT_EQ(k.r.voteReply(u)->code, commit ? kKeyExists : 0);
+    }
+}
+
+namespace {
+/// T = 31 {ins 5, ins 6}, then another writer's atomic batch X {ups 7, ups 8, ins 5}.  The earlier leadership's knob of 2 rejects X
+/// (TooLarge) and votes T yes; this one's knob of 3 accepts X, so T's ins 5 fails (KeyExists) at T's first record: a no that is not
+/// TooLarge, after a yes.
+void judgeNoAfterAYes(Ki& k) {
+    k.r.worker->setTxnJudgedRecordsMax(2);
+    k.r.passes(3);
+    k.txn(31, {ins(5), ins(6)});
+    std::vector<uint8_t> x = VerdictRig::batch({ups(7), ups(8), ins(5)});
+    VerdictRig::setBatchAttribute(x, rune::protocol::batch::kAttrAtomic);
+    (void)k.r.appendTxnReplicated(x);
+    ASSERT_EQ(k.vote(31).code, 0) << "the earlier leadership's yes";
+    k.r.demote();
+    k.r.worker->setTxnJudgedRecordsMax(3);
+    k.r.promote();
+    k.r.passes(60);
+    const DeferredTxn* t = k.r.writeState()->txn.find(31);
+    ASSERT_TRUE(t != nullptr && t->judged);
+    ASSERT_EQ(t->answer.code, kKeyExists) << "this leadership judges it no";
+    ASSERT_EQ(t->answer.failingOffset, t->firstOffset);
+}
+}  // namespace
+
+// A no keeps every row T's commit writes locked until T's marker, the rows of the records after the failing one included.  U, voted
+// after J on T's second key, waits: T's COMMIT applies T first (KeyExists), an ABORT lets U in.
+TEST(CheckedWritesTxnWorkerRegression, NoKeepsTheRowsOfItsTransactionLockedUntilItsMarkerRegression) {
+    for (const bool commit : {true, false}) {
+        SCOPED_TRACE(commit ? "commit" : "abort");
+        Ki k;
+        judgeNoAfterAYes(k);
+        const int64_t u = sendVoteOnThisLeader(k, 32, 6);
+        k.r.passes(60);
+        EXPECT_FALSE(k.r.voteReply(u)) << "U is not judged against views that lack T";
+        k.r.marker(31, commit);
+        ASSERT_TRUE(k.r.driveUntilVoted(u));
+        EXPECT_EQ(k.r.voteReply(u)->code, commit ? kKeyExists : 0);
+    }
+}
+
+// The no's locks hold only T's rows: a unit on other rows is judged while T waits for its marker.
+TEST(CheckedWritesTxnWorkerRegression, NoNeverHoldsAUnitOnOtherRowsRegression) {
+    Ki k;
+    judgeNoAfterAYes(k);
+    const int64_t v = sendVoteOnThisLeader(k, 33, 9);
+    k.r.passes(60);
+    ASSERT_TRUE(k.r.voteReply(v)) << "judged at once";
+    EXPECT_EQ(k.r.voteReply(v)->code, 0);
+    EXPECT_LT(k.r.writeState()->txn.find(31)->markerOffset, 0) << "T is still undecided";
 }
 
 // Another leadership's markers cover past T's J (it judged T no and passed it) while T's marker is not in the log yet: K starts past

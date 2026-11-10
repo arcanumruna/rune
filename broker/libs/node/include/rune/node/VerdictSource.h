@@ -131,8 +131,9 @@ private:
 
 /// The worker's transaction overlays.  `at(i)` is stable; an overlay is bound to one source key while it is acquired.  Each overlay
 /// has its key set (a judgement keeps both across passes); `oneStep()` is the key set of work done within one step (P11-3a).
-/// Only another transaction's marker frees an overlay a yes vote holds, and that marker may wait for a vote that needs one: when
-/// none is free the worker grows the pool by one (grow()) instead of making the judge wait, and trims the last one once it is free.
+/// Only another transaction's marker frees an overlay a judged transaction holds, and that marker may wait for a vote that needs
+/// one: when none is free the worker grows the pool by one (grow()) instead of making the judge wait, and trims the last one once
+/// it is free.
 class TxnOverlayPool {
 public:
     /// D1: one marker application's noted keys at a time, for every fold of the worker (path A and the members' replays).
@@ -444,6 +445,7 @@ private:
         int64_t       producerId = -1, first = -1, end = -1, from = -1;
         int32_t       overlay = -1, records = 0;
         bool          atMarker = false, scanning = false, done = false;
+        bool          partial = false;        // the chained read stopped at the cap: the overlay lacks the rows of T's later records
         int64_t       endedAt = -1;           // the producer's own marker in (first, end): T ended there, before its TxnJudge
         bool          endedCommit = false;
         uint64_t      members = 0;            // membersEpoch_ at the start: a member change restarts the judgement
@@ -1026,6 +1028,10 @@ bool VerdictSource::runJudgement_(ReadRangeFn& readRange, const rune::view::Abor
     if (!jx_.scanning) {
         const bool read = walk([&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) { return readTxnBatch_(r, b, len, aborted); });
         if (stop || !read || budget == 0) return jx_.done;
+        if (jx_.answer.code != 0) {   // a record failed: nothing to scan
+            jx_.done = true;
+            return true;
+        }
         jx_.scanning = true;
         jx_.from = jx_.first + 1;
         jx_.resolveFrom = jx_.end;
@@ -1059,8 +1065,9 @@ bool VerdictSource::resolveMarkers_(ReadRangeFn& readRange, TxnKeySet& keys, int
     return found;
 }
 
-// P11-4: the judge stands at T's TxnJudge.  A yes locks T's rows in the overlay; a no releases it.  Either way T waits for its marker
-// (an earlier leadership's yes can commit T over this no): finalizeLocked_ applies a commit.  True: judged, the judge passed J.
+// P11-4: the judge stands at T's TxnJudge.  Whatever the vote, T's rows stay locked in the overlay until its marker (an earlier
+// leadership's yes can commit T over this no): finalizeLocked_ applies a commit.  A no past the cap locks only part of them, so it
+// holds the judge at J (DeferredTxn::holdsAll).  True: judged, the judge passed J.
 template <class ReadRangeFn>
 bool VerdictSource::judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept {
     DeferredTxn& t = *state_->txn.find(judgePid_);
@@ -1086,10 +1093,7 @@ bool VerdictSource::judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedT
     t.judged = true;
     judgedRecord_ = true;   // T's records: a marker passes them once T is decided, though no other record follows
     countVote_(t.answer);
-    if (t.answer.code != 0) {
-        releaseOverlay_(t.overlay);
-        t.overlay = -1;
-    }
+    t.holdsAll = jx_.partial;
     t.phase = TxnPhase::Locked;
     endJudgement_();
     judgeCursor_ = t.judgeOffset + 1;
@@ -1203,7 +1207,7 @@ bool VerdictSource::finalizeLocked_(ReadRangeFn& readRange, const rune::view::Ab
             }
             if (!applyTxnRecords_(readRange, t->producerId, t->firstOffset, t->judgeOffset, aborted, finalizeApplied_)) return false;
         }
-        if (t->overlay >= 0) releaseOverlay_(t->overlay);   // a no gave it back at its judgement
+        releaseOverlay_(t->overlay);
         t->overlay = -1;
         t->phase = TxnPhase::Finalized;
         closeSpan_(t->producerId);   // the step's postcondition: T was applied to every active member (no span is open here today)
@@ -1257,7 +1261,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
         const bool ordinaryHolds = std::any_of(ordinary_.begin(), ordinary_.end(), [&](const OrdinaryTxn& o) { return o.first < judgeCursor_; });
         const int64_t capFrom = judgedThrough() < judgeCursor_ ? runAheadFrom_() : judgedRecord_ || sawEmptyChange_ ? emitFrom_ : judgeCursor_;
         const int64_t passBound = std::min(bound, checkpointCap_ == INT64_MAX || ordinaryHolds || capFrom == INT64_MAX ? INT64_MAX : capFrom + checkpointCap_);
-        while (!stalled_) {
+        while (!stalled_ && !state.txn.holdsJudge()) {
             const int64_t A = state.constraintSets.nextChangeAtOrAfter(setFrom_);
             if (A != INT64_MAX && judgeCursor_ > A) {
                 if (!switchSet_(A, readRange, aborted, work)) break;

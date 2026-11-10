@@ -337,15 +337,16 @@ private:
         if (uniqueView_) rows.insert("n" + lowered_(rec.name));
         if (countView_) rows.insert("g" + std::to_string(rec.v));
     }
-    /// `recs` judged in order, each against the records before it (a chained overlay); the model's state is left as it was.
-    Chain chain_(const std::vector<const LogRec*>& recs, const std::vector<std::pair<uint64_t, uint64_t>>& set) {
+    /// `recs` judged in order, each against the records before it (a chained overlay); the model's state is left as it was.  `txn`: the
+    /// records after the failing one are chained for their rows (a transaction's locks), else the chain ends there.
+    Chain chain_(const std::vector<const LogRec*>& recs, const std::vector<std::pair<uint64_t, uint64_t>>& set, bool txn) {
         auto saved = std::make_tuple(latest_, live_, claimants_, characters_);
         Chain out;
         for (const LogRec* rec : recs) {
             addRows_(out.rows, *rec);
-            if ((out.verdict = firstVerdict_(set, *rec))) {
+            if (!out.verdict && (out.verdict = firstVerdict_(set, *rec))) {
                 out.failingOffset = rec->offset;
-                break;
+                if (!txn) break;
             }
             apply_(*rec);
         }
@@ -392,7 +393,7 @@ private:
         std::vector<const LogRec*> recs;
         for (std::size_t i = from; i < to; ++i) recs.push_back(&log.data[i]);
         if (!locked_.empty()) {
-            std::set<std::string> rows = chain_(recs, set).rows;
+            std::set<std::string> rows = chain_(recs, set, false).rows;
             if (!settle_(log, rows, recs.front()->offset)) return false;
         }
         if (recs.size() == 1) {
@@ -400,7 +401,7 @@ private:
                 verdicts_[recs.front()->offset] = *verdict;
                 return true;
             }
-        } else if (const Chain judged = chain_(recs, set); judged.verdict) {
+        } else if (const Chain judged = chain_(recs, set, false); judged.verdict) {
             for (const LogRec* rec : recs) verdicts_[rec->offset] = *judged.verdict;   // P11-6: the first failing record's verdict stands for the batch
             return true;
         }
@@ -412,7 +413,7 @@ private:
     }
 
     /// Whether the other transaction's records are applied before `end` in judge order: committed, voted yes below `end`, or applied at a marker below it.
-    /// A yes vote without its marker never gets here: its rows are locked, and settle_ stops the judge at the first unit that meets them.
+    /// A vote without its marker never gets here: its rows are locked, and settle_ stops the judge at the first unit that meets them.
     [[nodiscard]] static bool appliedBefore_(const ModelTxn& other, int64_t end) {
         if (other.marker < 0 || !other.commit) return false;
         return other.judge >= 0 ? other.judge < end && other.vote && other.vote->code == 0 : other.marker < end && other.applied;
@@ -437,7 +438,7 @@ private:
         ModelTxn& txn = txns_[t];
         std::vector<const LogRec*> recs;
         for (const int64_t offset : txn.offsets) recs.push_back(recordAt_(log, offset));
-        const Chain judged = chain_(recs, set);
+        const Chain judged = chain_(recs, set, true);
         rows = judged.rows;
         const int64_t end = txn.judge >= 0 ? txn.judge : txn.marker;
         if (judged.verdict) txn.vote = ModelVote{judged.verdict->code, judged.verdict->constraintId, judged.failingOffset, txn.judge};
@@ -450,12 +451,13 @@ private:
         if (locked_.empty()) return true;
         std::vector<const LogRec*> recs;
         for (const int64_t o : txns_[t].offsets) recs.push_back(recordAt_(log, o));
-        return settle_(log, chain_(recs, set).rows, offset);
+        return settle_(log, chain_(recs, set, true).rows, offset);
     }
     bool judgeTxn_(const VerdictRig::RigLog& log, const std::vector<std::pair<uint64_t, uint64_t>>& set, std::size_t t) {
         if (!settleTxn_(log, set, t, txns_[t].judge)) return false;
         std::set<std::string> rows;
-        if (judgeWhole_(log, set, t, rows)) locked_.push_back({t, std::move(rows)});
+        (void)judgeWhole_(log, set, t, rows);
+        locked_.push_back({t, std::move(rows)});   // whatever the vote: the marker may still commit it
         return true;
     }
     /// P11-1: the partition votes when it is a verdict source and the set at the transaction's first record or the latest one is constrained, or a record carries an intent.
@@ -471,7 +473,7 @@ private:
     }
     bool endTxn_(const VerdictRig::RigLog& log, const std::vector<std::pair<uint64_t, uint64_t>>& set, std::size_t t) {
         ModelTxn& txn = txns_[t];
-        if (txn.judge >= 0) {   // voted: a yes holds its rows until here
+        if (txn.judge >= 0) {   // voted: it holds its rows until here
             const auto at = std::find_if(locked_.begin(), locked_.end(), [&](const Locked& l) { return l.txn == t; });
             if (at != locked_.end()) finalize_(log, static_cast<std::size_t>(at - locked_.begin()), txn.marker);
             return true;
@@ -555,7 +557,7 @@ private:
     std::map<uint64_t, LogRec> latest_;
     std::map<uint64_t, LogRec> live_;
     uint64_t partitions_ = 1, partition_ = 0;
-    struct Locked { std::size_t txn; std::set<std::string> rows; };   ///< a transaction that voted yes and awaits its marker, with the rows it holds
+    struct Locked { std::size_t txn; std::set<std::string> rows; };   ///< a transaction that voted and awaits its marker, with the rows it holds
     std::vector<ModelTxn> txns_;
     std::vector<Locked> locked_;
     int64_t judgeStop_ = INT64_MAX;

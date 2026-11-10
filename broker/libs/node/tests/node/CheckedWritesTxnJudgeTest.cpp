@@ -1461,8 +1461,9 @@ TEST(CheckedWritesTxnJudge, NoVoteCarriesTheFirstFailingRecord) {
     EXPECT_EQ(t->answer.code, kViolation);
     EXPECT_EQ(t->answer.constraintId, kTagId);
     EXPECT_EQ(t->answer.failingOffset, 11);
-    EXPECT_EQ(t->overlay, -1);
-    EXPECT_EQ(r.freeOverlays(), rune::view::kTxnOverlaysPerWorker);
+    EXPECT_GE(t->overlay, 0) << "a no keeps T's rows locked until its marker";
+    EXPECT_FALSE(t->holdsAll);
+    EXPECT_EQ(r.freeOverlays(), rune::view::kTxnOverlaysPerWorker - 1);
     EXPECT_EQ(r.st.txn.stats.votesNoConstraint, 1u);
     EXPECT_EQ(r.st.rejected.size(), 0u) << "a vote rejects no offset";
 }
