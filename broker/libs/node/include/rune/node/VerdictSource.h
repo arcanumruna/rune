@@ -450,7 +450,21 @@ private:
     bool   rejectTxnRecords_(ReadRangeFn& readRange, int64_t producerId, int64_t first, int64_t end, const rune::view::AbortedTxnFilter& aborted,
                              rune::view::Verdict v) noexcept;
     void   endOrdinary_(const OrdinaryTxn& o) noexcept;
-    void   parkOneStep_(bool parked) noexcept { txnPool_->parkOneStep(oneStepClaim_, parked); stepParked_ = parked; }
+    /// `onLock`: paused on a row one of this source's judged transactions holds, else waiting for a lookup's marker past the HW.
+    void   parkOneStep_(bool parked, bool onLock = false) noexcept {
+        txnPool_->parkOneStep(oneStepClaim_, parked);
+        stepParked_   = parked;
+        parkedOnLock_ = onLock;
+        parkedFreed_  = overlaysFreed_;
+        parkedHw_     = passHw_;
+    }
+    /// This source's own park still holds: a lock pause until it gives an overlay back (the locking transaction's marker applied, or
+    /// its judgement ended), a lookup park until the HW moves past where it scanned.  Only then may it take the set from a parked holder.
+    [[nodiscard]] bool parkHolds_() const noexcept { return stepParked_ && (parkedOnLock_ ? overlaysFreed_ == parkedFreed_ : passHw_ <= parkedHw_); }
+    void   releaseOverlay_(int32_t overlay) noexcept {
+        txnPool_->release(overlay);
+        ++overlaysFreed_;
+    }
     void   restartJudgement_() noexcept;
     [[nodiscard]] bool beginJudgement_(int64_t producerId, int64_t first, int64_t end, bool atMarker) noexcept;
     void   endJudgement_() noexcept;
@@ -554,7 +568,10 @@ private:
     };
     OrdinaryWalk                ordinaryWalk_;
     uint64_t                    oneStepClaim_ = 0;        // the pool's one-step set holds this source's collect while the claim stands
-    bool                        stepParked_ = false;      // this source last parked on the set, waiting for a marker: it takes it from no other parked holder
+    bool                        stepParked_ = false;      // this source last parked on the set, waiting for a marker: while that holds (parkHolds_) it takes it from no other parked holder
+    bool                        parkedOnLock_ = false;
+    uint64_t                    overlaysFreed_ = 0, parkedFreed_ = 0;   // overlays this source gave back, in all and when it parked
+    int64_t                     parkedHw_ = 0;            // passHw_ when it parked
     int64_t                     failCapacityAt_ = -1;
     TxnProbe                    probe_;
     std::vector<OrdinaryTxn>    ordinary_;
@@ -795,7 +812,7 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
         OrdinaryWalk& w = ordinaryWalk_;
         if (w.marker != o.marker) w = {o.marker, o.first};
         if (!txnPool_->holdsOneStep(oneStepClaim_)) {
-            if (!txnPool_->oneStepClaimable() || (stepParked_ && txnPool_->oneStepHeld())) return false;   // another source is mid-segment, or parked as this one is: wait for it
+            if (!txnPool_->oneStepClaimable() || (parkHolds_() && txnPool_->oneStepHeld())) return false;   // another source is mid-segment, or parked while this one's own wait holds: wait for it
             oneStepClaim_ = txnPool_->claimOneStep();
             stepParked_ = false;
             w.collectFrom = -1;   // another source may have taken the set mid-segment: note the keys again
@@ -1004,7 +1021,7 @@ bool VerdictSource::judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedT
     }
     if (!runJudgement_(readRange, aborted)) return false;
     if (jx_.endedAt >= 0) {   // T ended before its J (abort before J): decided from the log, nothing to judge; a parked vote is answered NotLeader
-        txnPool_->release(t.overlay);
+        releaseOverlay_(t.overlay);
         t.overlay = -1;
         t.markerOffset = jx_.endedAt;   // decided, as endsBeforeJudge_ decides it: the producer's next TxnJudge is accepted
         t.commit = jx_.endedCommit;
@@ -1021,7 +1038,7 @@ bool VerdictSource::judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedT
     if (t.answer.code == 0) {
         t.phase = TxnPhase::Locked;
     } else {
-        txnPool_->release(t.overlay);
+        releaseOverlay_(t.overlay);
         t.overlay = -1;
         t.phase = TxnPhase::Finalized;
     }
@@ -1067,7 +1084,7 @@ bool VerdictSource::judgeAtMarker_(ReadRangeFn& readRange, const rune::view::Abo
                              : !rejectTxnRecords_(readRange, o.producerId, o.first, o.marker, aborted, {jx_.answer.code, jx_.answer.constraintId}))
         return false;
     noteMarkerWithoutVote_(o, jx_.answer.code == 0);
-    txnPool_->release(jx_.overlay);
+    releaseOverlay_(jx_.overlay);
     endJudgement_();
     endOrdinary_(o);
     return true;
@@ -1137,7 +1154,7 @@ bool VerdictSource::finalizeLocked_(ReadRangeFn& readRange, const rune::view::Ab
             }
             if (!applyTxnRecords_(readRange, t->producerId, t->firstOffset, t->judgeOffset, aborted, finalizeApplied_)) return false;
         }
-        txnPool_->release(t->overlay);
+        releaseOverlay_(t->overlay);
         t->overlay = -1;
         t->phase = TxnPhase::Finalized;
         closeSpan_(t->producerId);   // the step's postcondition: T was applied to every active member (no span is open here today)

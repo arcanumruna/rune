@@ -286,8 +286,8 @@ VerdictSource::OverlayNeed VerdictSource::overlayNeed() const noexcept {
 }
 
 void VerdictSource::releaseTxnOverlays(TxnJudgeState& txn) noexcept {
-    txn.releaseOverlays([&](int32_t i) { txnPool_->release(i); });
-    if (jx_.atMarker && jx_.overlay >= 0) txnPool_->release(jx_.overlay);   // a deferred transaction's overlay is its entry's
+    txn.releaseOverlays([&](int32_t i) { releaseOverlay_(i); });
+    if (jx_.atMarker && jx_.overlay >= 0) releaseOverlay_(jx_.overlay);   // a deferred transaction's overlay is its entry's
     releaseOneStep();
     jx_ = {};
     resetChainLive_();
@@ -1186,7 +1186,7 @@ bool VerdictSource::endsBeforeJudge_(const rune::protocol::RecordBatchReader& r,
     if (t == nullptr || t->markerOffset >= 0 || t->phase == TxnPhase::Finalized || r.baseOffset() <= t->firstOffset || r.baseOffset() >= t->judgeOffset) return false;
     const int type = cm::controlType(batch, len);
     if (type == cm::kUnparseable || (type == cm::kCommit && ordinary_.size() == ordinary_.capacity())) return false;
-    if (t->overlay >= 0) txnPool_->release(t->overlay);
+    if (t->overlay >= 0) releaseOverlay_(t->overlay);
     t->overlay = -1;
     t->markerOffset = r.baseOffset();
     t->commit = type == cm::kCommit;
@@ -1337,7 +1337,7 @@ bool VerdictSource::applyTxnBatch_(const uint8_t* batch, std::size_t len, TxnKey
                 if (s == rune::view::PrepareStatus::CapacityExhausted) stall_(StallReason::Capacity);
                 if (s == rune::view::PrepareStatus::Locked) {
                     notePause_(span.offset);
-                    parkOneStep_(true);   // the lock clears at the holder's marker, which may wait for a vote the waiter judges
+                    parkOneStep_(true, /*onLock=*/true);   // the lock clears at the holder's marker, which may wait for a vote the waiter judges
                 }
                 if (s == rune::view::PrepareStatus::CapacityExhausted || s == rune::view::PrepareStatus::Locked) {
                     ok = false;

@@ -2317,6 +2317,39 @@ TEST(CheckedWritesTxnJudgeRegression, ParkedHoldersNeverTakeTheSetFromEachOtherR
     EXPECT_FALSE(b.indexed(5));
 }
 
+// slow-bc review 1 (the #964 guard against I1): a source whose own lock pause ended takes the set from a parked holder.  B pauses on
+// T1's row and A takes the set, pausing on T0's; T1's marker clears B's lock, and B's O must apply before B judges T0, whose marker A
+// waits for.  RED (a sticky "last parked" bit): B waits for A, A for T0's marker, T0's marker for B's vote.
+TEST(CheckedWritesTxnJudgeRegression, SourceWhoseLockClearedTakesTheSetFromAParkedHolderRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    b.log.data({{5, 1, false, kInsert}}, 67);     // 10, T1
+    b.log.judge(67, 10);                          // 11
+    b.log.data({del(5)}, 56);                     // 12, O_B
+    b.log.marker(56, true);                       // 13
+    for (int i = 0; i < 4 && b.st.txn.stats.lockPauses == 0; ++i) b.drive();
+    ASSERT_EQ(b.st.txn.stats.lockPauses, 1u) << "O_B's delete of key 5 pauses on T1's row";
+    a.log.data({{4, 1, false, kInsert}}, 66);     // 10, T0
+    a.log.judge(66, 10);                          // 11
+    a.log.data({del(4)}, 55);                     // 12, O_A
+    a.log.marker(55, true);                       // 13
+    for (int i = 0; i < 4 && a.st.txn.stats.lockPauses == 0; ++i) a.drive();
+    ASSERT_EQ(a.st.txn.stats.lockPauses, 1u) << "A took the set from the parked B and pauses on T0's row";
+    b.log.data({{60, 1, false, kInsert}}, 66);    // 14, T0
+    b.log.judge(66, 14);                          // 15
+    b.log.marker(67, true);                       // 16: T1's marker clears B's lock
+    for (int i = 0; i < 16 && (b.st.txn.find(66) == nullptr || !b.st.txn.find(66)->judged); ++i) {
+        b.drive();
+        a.drive();
+    }
+    ASSERT_NE(b.st.txn.find(66), nullptr);
+    EXPECT_TRUE(b.st.txn.find(66)->judged) << "B applied O_B and judged T0";
+    EXPECT_FALSE(b.indexed(5)) << "O_B's delete applies after T1's insert";
+}
+
 // I3: accepted(r), an ordinary transaction committed below J.
 TEST(CheckedWritesTxnJudge, OrdinaryCommittedBelowJConflicts) {
     JudgeRig r(VoteMembers{100});
