@@ -18,6 +18,7 @@
 // with a deadline.  The child is always killed + reaped (RAII).
 #include "../support/InvokerGateway.h"
 
+#include <rune/client/Client.h>
 #include <rune/client/shard/ClientShard.h>
 
 #include <gtest/gtest.h>
@@ -111,6 +112,68 @@ struct ChildLedger {
         writeLine(out, "S " + std::to_string(accepted) + " " + std::to_string(l0.records + l1.records) + " " +
                            std::to_string(l0.ok + l1.ok) + " " + std::to_string(l0.failed + l1.failed) + " " +
                            std::to_string(static_cast<int>(st)));
+    } catch (const std::exception& e) {
+        writeLine(out, std::string("X ") + e.what());
+        ::_exit(2);
+    }
+    ::_exit(0);
+}
+
+constexpr const char* kPlainGateway = "aeron:udp?endpoint=127.0.0.1:24891";
+constexpr const char* kPlainEgress  = "aeron:udp?endpoint=127.0.0.1:24901";
+constexpr int32_t     kPlainCtl     = 3952;
+constexpr int32_t     kPlainEg      = 3953;
+
+// A plain Client with the default config (10 s Aeron liveness) under steady load; 'q' closes it and reports the ledger.
+[[noreturn]] void plainChildMain(int out, int in, const std::string& dir) {
+    try {
+        rc::ClientConfig cfg;
+        cfg.gatewayChannel  = kPlainGateway;
+        cfg.gatewayStreamId = kPlainCtl;
+        cfg.egressChannel   = kPlainEgress;
+        cfg.egressStreamId  = kPlainEg;
+        cfg.dataDir         = dir;
+        rc::TopicSpec t;
+        t.name           = "t";
+        t.topicId        = 1;
+        t.partitionCount = 8;
+        cfg.topics.push_back(t);
+        rc::Client client(cfg);
+        rc::Completions cq(client);
+        if (client.connect(cq, 1) != rc::OpResult::Accepted) throw std::runtime_error("connect refused");
+        rc::OpStatus connected = rc::OpStatus::Closed;
+        if (cq.waitFor(1, 30s, [&](const rc::Completion& c, std::span<const uint8_t>) { connected = c.status; }) != rc::Completions::Wait::Done ||
+            connected != rc::OpStatus::Ok) {
+            throw std::runtime_error("connect failed");
+        }
+        rc::ProducerConfig pc;
+        pc.acks     = rc::Acks::Leader;
+        pc.lingerUs = 0;
+        auto        producer = client.producer(pc);
+        ChildLedger l;
+        producer.onBatchAck(&ChildLedger::on, &l);
+        writeLine(out, "C");
+        const auto                 topic = client.topic("t");
+        const std::vector<uint8_t> val(64, 0x42);
+        int64_t                    accepted = 0;
+        uint64_t                   k        = 0;
+        for (;;) {
+            fd_set rd;
+            FD_ZERO(&rd);
+            FD_SET(in, &rd);
+            timeval tv{0, 0};
+            if (::select(in + 1, &rd, nullptr, nullptr, &tv) == 1) break;  // 'q'
+            int sent = 0;
+            for (; sent < 16; ++sent) {
+                if (producer.trySend(topic, rc::Key(k), val) != rc::SendResult::Ok) break;
+                ++accepted;
+                ++k;
+            }
+            if (sent == 0) std::this_thread::yield();  // back-pressured
+        }
+        const rc::OpStatus st = producer.closeAndWait(30s);
+        writeLine(out, "S " + std::to_string(accepted) + " " + std::to_string(l.records) + " " + std::to_string(l.ok) +
+                           " " + std::to_string(l.failed) + " " + std::to_string(static_cast<int>(st)));
     } catch (const std::exception& e) {
         writeLine(out, std::string("X ") + e.what());
         ::_exit(2);
@@ -284,6 +347,110 @@ TEST(ShardDrGateRegression, SigstopPast15sThenSigcontRecoversLiveExactlyOnce) {
     for (const auto& l : in.lines) {
         if (l.rfind("E ", 0) == 0) std::printf("[ DR gate ] %s\n", l.c_str());
     }
+    ::close(toParent[0]);
+    ::close(toChild[1]);
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+}
+
+// A plain Client with the DEFAULT config (10 s Aeron client liveness) is stopped for 12 s: its Aeron client closes.
+// After SIGCONT it rebuilds the transport, reconnects, and keeps producing; every accepted record completes once and
+// the broker's sequences per partition are exactly [0, acked).  RED on main: the Client went "failing for good" and
+// never produced again.
+TEST(ShardDrGateRegression, PlainClientSigstopPastAeronTimeoutsRecoversRegression) {
+    const std::string base = std::filesystem::temp_directory_path().string() + "/plain_drgate_" + std::to_string(::getpid());
+    int toParent[2], toChild[2];
+    ASSERT_EQ(::pipe(toParent), 0);
+    ASSERT_EQ(::pipe(toChild), 0);
+    ChildGuard child;
+    child.pid = ::fork();
+    ASSERT_GE(child.pid, 0);
+    if (child.pid == 0) {
+        ::close(toParent[0]);
+        ::close(toChild[1]);
+        plainChildMain(toParent[1], toChild[0], base + "/client");
+    }
+    ::close(toParent[1]);
+    ::close(toChild[0]);
+
+    rs::ShardGroupConfig hostCfg;
+    hostCfg.base.dataDir         = base + "/broker";
+    hostCfg.base.gatewayStreamId = 3962;
+    hostCfg.base.egressStreamId  = 3963;
+    hostCfg.shardCount           = 1;
+    hostCfg.mode                 = rs::ShardMode::Invoker;
+    rs::ClientShard              host(hostCfg, 0);
+    test_support::InvokerGateway gw(rs::shardClientConfig(hostCfg, 0).dataDir + "/aeron", kPlainGateway, kPlainCtl,
+                                    kPlainEgress, kPlainEg);
+    gw.replyOnAnnouncedEgress = true;
+    gw.uniqueSessionIds       = true;
+    Lines in;
+    in.fd = toParent[0];
+    auto pumpUntil = [&](auto&& pred, std::chrono::seconds limit) {
+        const auto deadline = std::chrono::steady_clock::now() + limit;
+        while (std::chrono::steady_clock::now() < deadline) {
+            host.doWork();
+            if (gw.pump() == 0) std::this_thread::yield();
+            in.poll();
+            if (pred()) return true;
+        }
+        return false;
+    };
+    auto crashed = [&] {
+        for (const auto& l : in.lines) {
+            if (l.rfind("X ", 0) == 0) return true;
+        }
+        return false;
+    };
+
+    ASSERT_TRUE(pumpUntil([&] { return crashed() || (!in.lines.empty() && in.lines[0] == "C" && gw.produced.size() > 200); }, 30s))
+        << "child never connected under load";
+    ASSERT_FALSE(crashed()) << in.lines.back();
+
+    ASSERT_EQ(::kill(child.pid, SIGSTOP), 0);
+    const auto stoppedAt = std::chrono::steady_clock::now();
+    (void)pumpUntil([&] { return std::chrono::steady_clock::now() >= stoppedAt + 2s; }, 5s);
+    const std::size_t producedAtStop = gw.produced.size();
+    (void)pumpUntil([&] { return std::chrono::steady_clock::now() >= stoppedAt + 12s; }, 20s);
+    EXPECT_EQ(gw.produced.size(), producedAtStop) << "a stopped process sends nothing";
+
+    ASSERT_EQ(::kill(child.pid, SIGCONT), 0);
+    ASSERT_TRUE(pumpUntil([&] { return crashed() || gw.produced.size() > producedAtStop + 200; }, 60s))
+        << "the client did not produce again after SIGCONT";
+    EXPECT_FALSE(crashed());
+
+    (void)!::write(toChild[1], "q", 1);
+    std::string summary;
+    ASSERT_TRUE(pumpUntil([&] {
+        for (const auto& l : in.lines) {
+            if (l.rfind("S ", 0) == 0 || l.rfind("X ", 0) == 0) summary = l;
+        }
+        return !summary.empty();
+    }, 60s));
+    int status = 0;
+    ASSERT_EQ(::waitpid(child.pid, &status, 0), child.pid);
+    child.pid = -1;
+    ASSERT_EQ(summary.rfind("S ", 0), 0u) << summary;
+    long long accepted = 0, records = 0, ok = 0, failed = 0;
+    int       closeSt  = -1;
+    ASSERT_EQ(std::sscanf(summary.c_str(), "S %lld %lld %lld %lld %d", &accepted, &records, &ok, &failed, &closeSt), 5);
+    EXPECT_EQ(records, accepted) << "every accepted record completed exactly once";
+    EXPECT_EQ(ok, accepted);
+    EXPECT_EQ(failed, 0);
+    EXPECT_EQ(closeSt, static_cast<int>(rc::OpStatus::Ok));
+
+    std::map<int32_t, std::set<int32_t>> seqs;
+    for (const auto& pr : gw.produced) {
+        for (int32_t q = 0; q < pr.records; ++q) seqs[pr.partition].insert(pr.baseSequence + q);
+    }
+    long long distinct = 0;
+    for (const auto& [p, set] : seqs) {
+        distinct += static_cast<long long>(set.size());
+        ASSERT_FALSE(set.empty());
+        EXPECT_EQ(*set.begin(), 0) << "partition " << p;
+        EXPECT_EQ(*set.rbegin(), static_cast<int32_t>(set.size()) - 1) << "partition " << p << ": a sequence gap";
+    }
+    EXPECT_EQ(distinct, ok);
     ::close(toParent[0]);
     ::close(toChild[1]);
     std::error_code ec;
