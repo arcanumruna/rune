@@ -7919,13 +7919,17 @@ private:
         }
         ParkedVote v{op.correlationId(), static_cast<int32_t>(op.sessionId()), op.producerId(), op.producerEpoch(), -1, passNowNs_};
         PartitionWriteState* ws = writeOf_(replica);
-        if (ws == nullptr || !ws->isVerdictSource() || !replica->isDiskBacked()) {   // nothing on this partition judges: yes
+        if (ws == nullptr || !replica->isDiskBacked()) {   // nothing on this partition judges: yes
             enqueueReturn_(voteReturn_(op.topicId(), op.partition(), v, 0, {}, -1));
             return;
         }
         const RcState* rc = rcServe_(replica, rcOf_(replica));
-        if (rc == nullptr) {   // the leadership scan has not rebuilt the open transactions yet
+        if (rc == nullptr) {   // the leadership scan has not rebuilt the open transactions, nor read the constraint sets, yet
             answerTxnVoteNotLeader_(op);
+            return;
+        }
+        if (!ws->isVerdictSource()) {   // the log names no constraint set and no view is installed: nothing judges, yes
+            enqueueReturn_(voteReturn_(op.topicId(), op.partition(), v, 0, {}, -1));
             return;
         }
         const int64_t first = rc->tracker().firstOffsetOf(v.producerId);

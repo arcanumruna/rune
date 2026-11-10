@@ -1503,6 +1503,7 @@ private:
         worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
         worker->setViewSet(vs.get());
         if (rcScanBytesPerPass != 0) worker->setRcScanBytesPerPass(rcScanBytesPerPass);
+        if (rcProbe != nullptr) worker->setRcResidencyProbeForTest(rcProbe, nullptr);
         if (assignedBaseReserve_ != 0) worker->setAssignedBaseReserveForTest(assignedBaseReserve_);
         if (egress_) worker->setWorkerEgress(egress_.get());
         wireAcks_();
@@ -1511,6 +1512,7 @@ private:
     std::vector<rune::replication::NodeId> isr_;
  public:
     int32_t rcScanBytesPerPass = 0;   ///< the leadership scan budget of a (re)started worker; 0 = the default
+    RcResidencyProbe rcProbe = nullptr;   ///< the leadership scan's residency probe of a (re)started worker; nullptr = the default
     /// The side window's producer capacity of every autoincrement partition installed from now on, this worker's and a restarted one's.
     void reserveAssignedBases(std::size_t producers) {
         assignedBaseReserve_ = producers;

@@ -392,6 +392,42 @@ TEST(CheckedWritesTxnWorker, JudgeLostInAFailoverIsJudgedAgainRegression) {
     EXPECT_EQ(v.judgeOffset, lost) << "the new J lands where the lost one was";
 }
 
+// A node's first leadership learns the constraint sets from its leadership scan: a vote that reaches it before the scan is done is
+// NotLeader, never a yes that skips the judge (the restarted node that took the partition back committed a taken name).
+TEST(CheckedWritesTxnWorkerRegression, VoteBeforeTheLeadershipScanIsNotLeaderRegression) {
+    VerdictRig r;
+    r.createQlTopic(VerdictRig::kCharacterTopic, false);
+    r.enableAcks();
+    r.passes(20);
+    r.createConstrainedView(ConstrainedView::CharacterName);
+    r.passes(20);
+    const auto write = [&](int64_t pid, const VerdictRig::Char& c) {
+        const std::vector<VerdictRig::SrcRecord> recs{VerdictRig::srcOf(c)};
+        (void)r.appendTxnReplicated(r.sourceBatch(recs, pid, 0, /*txn=*/true));
+        r.passes(30);
+    };
+    const auto vote = [&](int64_t pid) {
+        const int64_t tok = r.sendVote(VerdictRig::kSrc, pid, 0);
+        EXPECT_TRUE(r.driveUntilVoted(tok));
+        return r.voteReply(tok).value_or(VerdictRig::VoteReply{-1});
+    };
+    write(51, VerdictRig::Char{.id = 1, .userId = 1, .name = "Foo"});
+    ASSERT_EQ(vote(51).code, 0);
+    r.marker(51, true);
+    ASSERT_TRUE(r.driveUntilJudgeReaches());
+    write(52, VerdictRig::Char{.id = 2, .userId = 2, .name = "foo"});
+    r.rcProbe = [](void*, const uint8_t*, std::size_t) -> std::size_t { return 0; };   // nothing resident: the scan waits
+    r.restart(/*reinstall=*/false);   // its catalog has no view yet: only the scan can tell the source is constrained
+    const auto early = vote(52);
+    EXPECT_EQ(early.errorCode, kNotLeader) << "answered code " << early.code << " before the scan read the constraint set";
+    r.worker->setRcResidencyProbeForTest(nullptr, nullptr);
+    r.reinstallAll();
+    VerdictRig::VoteReply v = early;
+    for (int i = 0; i < 100 && v.errorCode == kNotLeader; ++i) v = vote(52);
+    EXPECT_EQ(v.errorCode, 0);
+    EXPECT_EQ(v.code, 55) << "the taken name is judged";
+}
+
 // The vote's scan appends J only once the transaction's last batch is below the HW: a J above an uncommitted batch could judge
 // records a failover drops.
 TEST(CheckedWritesTxnWorker, VoteWaitsForTheHw) {
