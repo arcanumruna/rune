@@ -7,7 +7,9 @@
 // stalled-owner test, which yields on Aeron's own conductor clock until
 // ClientConductor.h:436's condition holds (Aeron's clock cannot be injected).
 #include "../support/AllocCounter.h"
+#include "../support/FreePort.h"
 #include "../support/InvokerGateway.h"
+#include "../support/OwnDriverGateway.h"
 
 #include <rune/client/shard/ClientShard.h>
 
@@ -176,6 +178,88 @@ struct ShardRig {
         const std::size_t before = gw.produced.size();
         for (int i = 0; i < n; ++i) ASSERT_EQ(shard->trySend(topic, keyFor(partition), kVal), rc::SendResult::Ok);
         ASSERT_TRUE(drive([&] { return gw.produced.size() > before; }));
+    }
+};
+
+// The fake broker on its OWN driver (BrokerHost): a transport rebuild replaces the client's driver, never the broker's.
+// The shard reaches it over UDP.
+rs::ShardGroupConfig ownDriverGroup(int32_t in, int32_t eg) {
+    auto g          = invokerGroup(in, eg);
+    const auto port = rune::client::testing::allocFreeUdpPortRange(2);
+    g.base.gatewayChannel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port);
+    g.base.egressChannel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port + 1);
+    return g;
+}
+
+struct OwnDriverRig {
+    test_support::BrokerHost         broker;
+    std::unique_ptr<rs::ClientShard> shard;
+    BatchLedger                      ledger;
+    std::vector<rs::ShardStatus>     events;
+    explicit OwnDriverRig(const rs::ShardGroupConfig& g)
+        : broker(test_support::BrokerHost::uniqueDir(), g.base.gatewayChannel, g.base.gatewayStreamId,
+                 rs::shardClientConfig(g, 0).egressChannel, g.base.egressStreamId),
+          shard(std::make_unique<rs::ClientShard>(g, 0)) {}
+    ~OwnDriverRig() {
+        if (shard) shard->closeImmediately();
+    }
+    [[nodiscard]] test_support::InvokerGateway& gw() { return broker.gw; }
+    void step(int64_t advanceNs = 0) {
+        g_now += advanceNs;
+        shard->doWork();
+        gw().pump();
+        shard->pollBatchAcks([&](const rc::BatchAck& a) { ledger(a); });
+        shard->pollEvents([&](const rs::ShardStatus& s) { events.push_back(s); });
+    }
+    template <class P>
+    bool drive(P&& pred, int64_t advanceNs = 0) {
+        return driveUntil([&] { step(advanceNs); }, pred);
+    }
+    [[nodiscard]] rs::ShardState state() const { return shard->status().state; }
+    [[nodiscard]] bool saw(rs::ShardState s) const {
+        for (const auto& e : events) {
+            if (e.state == s) return true;
+        }
+        return false;
+    }
+    void connect() {
+        ASSERT_TRUE(drive([&] { return gw().ready(); }));
+        rc::Completions cq(shard->client());
+        ASSERT_EQ(shard->connect(cq, 1), rc::OpResult::Accepted);
+        bool         done = false;
+        rc::OpStatus st   = rc::OpStatus::Closed;
+        ASSERT_TRUE(drive([&] {
+            cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) {
+                if (c.token == 1) {
+                    done = true;
+                    st   = c.status;
+                }
+            });
+            return done;
+        }));
+        ASSERT_EQ(st, rc::OpStatus::Ok);
+        ASSERT_TRUE(drive([&] { return state() == rs::ShardState::Live && gw().metadataRequests > 0; }));
+    }
+    // Accept n records for `partition`.
+    void accept(int32_t partition, int n) {
+        const auto topic = shard->topic("t");
+        for (int i = 0; i < n; ++i) ASSERT_EQ(shard->trySend(topic, keyFor(partition), kVal), rc::SendResult::Ok);
+    }
+    // Send n records to `partition` and wait until the gateway received them.
+    void sendTo(int32_t partition, int n) {
+        const std::size_t before = gw().produced.size();
+        accept(partition, n);
+        ASSERT_TRUE(drive([&] { return gw().produced.size() > before; }));
+    }
+    // The owner stalls past the Aeron client liveness while only the broker runs; Aeron's clock cannot be injected, so
+    // this waits on it (ClientConductor.h:436: nowMs > timeOfLastDoWorkMs + interServiceTimeoutMs).  No tuned sleep.
+    void stallPastAeronLiveness(int64_t livenessNs) {
+        const long long livenessMs = livenessNs / 1'000'000;
+        const long long t0         = aeron::currentTimeMillis();
+        while (aeron::currentTimeMillis() <= t0 + livenessMs) {
+            gw().pump();
+            std::this_thread::yield();
+        }
     }
 };
 
@@ -543,32 +627,36 @@ TEST(ClientShardRegression, FailedThenClosedBothPublishedOnStatusRing) {
     EXPECT_EQ(r.shard->status().state, rs::ShardState::Closed);
 }
 
-// Review Focus 1: an owner stall past the Aeron client liveness timeout turns
-// sends into Closed — no ::exit, no hang — and the records accepted before the
-// stall complete Closed exactly once.  Aeron's conductor clock cannot be
-// injected (Aeron.cpp:43 hard-wires currentTimeMillis), so the test yields on
-// that clock until ClientConductor.h:436's condition holds — no tuned sleep.
-TEST(ClientShardRegression, StalledOwnerTurnsSendsIntoClosed) {
-    auto g = group(3806, 3807, 1, rs::ShardMode::Invoker);
-    // T15a I4: shards take the liveness from the group (default 1 h); this is
-    // an explicit override to the smallest value validate() accepts (1 s = 2x
-    // the Aeron client's 500 ms keepalive; Task 6's stall test uses the same).
+// An owner stall past the Aeron client liveness timeout closes the Aeron client.  The shard rebuilds the transport and
+// reconnects: Live -> Reconnecting -> Live, never Failed.  The records in flight at the stall and the ones accepted
+// during it are each acked Ok exactly once.  Aeron's conductor clock cannot be injected (Aeron.cpp:43 hard-wires
+// currentTimeMillis), so the stall yields on it (no tuned sleep).  RED on main: the shard went Failed{TransportClosed}
+// and every record completed Closed.
+TEST(ClientShardRegression, AeronClientClosedByOwnerStallRebuildsAndAcksExactlyOnceRegression) {
+    auto g = ownDriverGroup(3806, 3807);
+    // T15a I4: shards take the liveness from the group (default 1 h); an explicit override to the smallest value
+    // validate() accepts (1 s = 2x the Aeron client's 500 ms keepalive) is the shortest real close there is.
     g.aeronClientLivenessTimeoutNs = rune::client::transport::kMinClientLivenessTimeoutNs;
-    ShardRig r(g, 0);
+    OwnDriverRig r(g);
     r.connect();
-    r.gw.holdPartitions = {0, 1, 2, 3, 4, 5, 6, 7};
+    r.gw().holdPartitions = {0, 1, 2, 3, 4, 5, 6, 7};
     r.sendTo(2, 5);
-    // Stall exactly past Aeron's own condition (same clock, same comparison as
-    // ClientConductor.h:436: nowMs > timeOfLastDoWorkMs + interServiceTimeoutMs);
-    // t0 is taken after the last doWork.  No tuned sleep.
-    const long long livenessMs = g.aeronClientLivenessTimeoutNs / 1'000'000;
-    const long long t0         = aeron::currentTimeMillis();
-    while (aeron::currentTimeMillis() <= t0 + livenessMs) std::this_thread::yield();
-    ASSERT_TRUE(r.drive([&] { return r.shard->closed() && r.ledger.records >= 5; }));
-    EXPECT_EQ(r.ledger.records, 5);
-    EXPECT_EQ(r.ledger.failed, 5);
-    EXPECT_EQ(r.shard->trySend(r.shard->topic("t"), rc::Key(uint64_t{1}), kVal), rc::SendResult::Closed);
-    EXPECT_THROW(r.shard->send(r.shard->topic("t"), rc::Key(uint64_t{1}), kVal), std::runtime_error);
+    r.events.clear();
+    r.accept(3, 5);
+    r.stallPastAeronLiveness(g.aeronClientLivenessTimeoutNs);
+    ASSERT_TRUE(r.drive([&] { return r.saw(rs::ShardState::Reconnecting) || r.state() == rs::ShardState::Failed; }));
+    ASSERT_NE(r.state(), rs::ShardState::Failed) << "the closed Aeron client must be rebuilt, not fatal";
+    ASSERT_TRUE(r.drive([&] { return r.state() == rs::ShardState::Live; }, 1'000'000));
+    r.gw().holdPartitions.clear();
+    r.gw().releaseHeld();
+    ASSERT_TRUE(r.drive([&] { return r.ledger.records >= 10; }, 1'000'000));
+    for (int i = 0; i < 50; ++i) r.step(1'000'000);
+    EXPECT_EQ(r.ledger.records, 10) << "every accepted record acked exactly once";
+    EXPECT_EQ(r.ledger.ok, 10);
+    EXPECT_TRUE(r.ledger.contiguous);
+    EXPECT_TRUE(r.saw(rs::ShardState::Reconnecting));
+    EXPECT_FALSE(r.saw(rs::ShardState::Failed));
+    EXPECT_EQ(r.shard->trySend(r.shard->topic("t"), keyFor(1), kVal), rc::SendResult::Ok);
 }
 
 // ---- close -------------------------------------------------------------------------
