@@ -2,9 +2,9 @@
 # docker/checked-writes-e2e.sh - Checked writes Part 05: write intents and the key index on 3 authenticated brokers.
 #
 #   1. SETUP:     build the broker, the rune CLI and the checked_writes_probe images; generate the cluster key; `up` 3 nodes
-#                 with RUNE_VERDICT_INTERVAL_MS=20 (docker-compose.checked-writes.yml); bootstrap the first admin + the e2e
-#                 user (docker/lib/auth.sh); the probe defines ki_account (4 partitions, replicas 3, cleanup.policy = compact,
-#                 key.index on).  Bounded: a common consensus leader within 180 s;
+#                 with RUNE_VERDICT_INTERVAL_MS=20 and RUNE_PRODUCER_ID_EXPIRATION_MS=60000 (docker-compose.checked-writes.yml);
+#                 bootstrap the first admin + the e2e user (docker/lib/auth.sh); the probe defines ki_account (4 partitions,
+#                 replicas 3, cleanup.policy = compact, key.index on).  Bounded: a common consensus leader within 180 s;
 #   2. RACE:      4 probe containers insert the same 20,000 ids concurrently.  At ~30 % `docker kill` of the leader of
 #                 partition 0, restarted once progress resumes.  Check: for every id exactly one Ok across all workers and
 #                 every other result for it is 56 (KeyExists); no VerdictUnknown, no Timeout.  Bounded at 600 s;
@@ -38,7 +38,8 @@
 #                 TXN-RACE: 4 probes run transactions of two characters and two ledger entries over the same users (per user six
 #                 fit account_stats, a seventh and an overdraw are refused), the `character` leader `docker kill`ed at ~30 % (first half of the users) and
 #                 the consensus leader, the transaction coordinator, at ~60 % (second half, its probes seeded on another node), each restarted once progress resumes (per user at most
-#                 six Ok, every other answer 55; the workers share the names u<user>k<k>a / b and race for them; a lost answer only on a
+#                 six Ok, every other answer 55; the workers share the names u<user>k<k>a / b and race for them, each crediting its own
+#                 ledger account (a transaction racing another on both topics resolves only by the transaction timeout); a lost answer only on a
 #                 transaction that overlaps a kill window, no transaction longer than the transaction timeout and a pass); TXN-VERIFY: a read_committed
 #                 subscription from 0 holds every committed transaction whole, no refused one, a lost one whole or not at all, each name
 #                 in one committed transaction with character_name mapping it to that transaction's character, and account_stats and balances agree; TXN-RESTART: all three nodes restarted, TXN-VERIFY again and a new transaction
