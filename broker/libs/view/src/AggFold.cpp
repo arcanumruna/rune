@@ -706,7 +706,7 @@ StepOut aggStep(Ctx<T>& cx, VersionDescriptorCache& vdc, const rune::codec::Desc
     return {hadOld && oldGroup != g ? StepKind::Moved : StepKind::Upserted, g, oldGroup};
 }
 
-// The record's touched rows into the chain, keyed the way apply keys them.  TODO: merge with applyAggregate over a table accessor, as Stores does for projections.  A keyed view's new group takes the next gid (burned when
+// The record's touched rows into the chain, keyed the way apply keys them.  A keyed view's new group takes the next gid (burned when
 // the chain is released) and its key goes into the chain's groupIds; a dropped group's key leaves them.
 void chainRecord(AggregateFold& f, const RowOverlay& ov, const TxnTable& groups, const TxnTable& groupIds, TxnOverlay& chain) noexcept {
     using T = RowOverlay::Table;

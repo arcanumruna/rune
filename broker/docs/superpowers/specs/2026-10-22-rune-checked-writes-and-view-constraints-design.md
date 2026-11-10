@@ -645,7 +645,7 @@ Until this part ships, the §11.2 refusals apply.
    2. appends a `TxnJudge { producerId, epoch }` control record at offset J (§G.3);
    3. once the fold reaches J, judges **all** of the transaction's records on the partition together, in their offset order, against the view state at J;
    4. if they pass, applies them **provisionally**, keeps the before-image of every row they touch, and locks those rows (§G.4);
-   5. answers yes, or no with the first failing `(code, constraintId, offset)`. On no, it puts the before-images back at once.
+   5. answers yes, or no with the first failing `(code, constraintId, offset)`. On no, the rows T touches stay locked until T's abort marker, which the coordinator's decision or the transaction timeout bounds.
 4. If every vote is yes, the coordinator writes `PrepareCommit` and the markers, as today. If any vote is no, or a voter times out, it writes `PrepareAbort`, and `commitTransaction()` fails with that code and constraint id. The transaction is aborted, as in Postgres.
 5. The commit marker makes the provisional rows final in **one worker step**, and the abort marker restores the before-images in one worker step. Either way the rows unlock.
 
