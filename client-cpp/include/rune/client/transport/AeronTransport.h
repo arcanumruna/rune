@@ -125,10 +125,20 @@ public:
     }
 
     /// True once the Aeron client closed itself (inter-service timeout, driver
-    /// timeout).  Offers then fail; the owner decides whether to rebuild.
+    /// timeout), or while a failed rebuild() left no driver and no client.  Offers then fail;
+    /// the owner decides whether to rebuild.
     [[nodiscard]] bool closed() const noexcept {
-        return conductorFault_ != nullptr || (aeron_ && aeron_->isClosed());
+        return state_ == Lifecycle::Down || conductorFault_ != nullptr || (aeron_ && aeron_->isClosed());
     }
+
+    /// The Aeron client closed (closed()) or the owner wants a fresh one: every Aeron object is released in stop()'s
+    /// order (BR-3b), the embedded driver is closed, and a fresh driver + client are started; the seed pair is resolved
+    /// again on the CURRENT ingress channel (where a failover moved it) with `seedResponsePort` (the seed's current
+    /// response-control port).  Every PubHandle and sub slot keeps its key and re-resolves lazily; a response pair gets a
+    /// fresh subscription (the old one was pinned to a dead image).  An attached transport (cfg.aeronDir) leaves the
+    /// external driver alone and only reconnects.  true = up again; false = still closed (Down, cause logged), the owner
+    /// retries after its backoff.  Blocking and bounded like start(); owner thread only, never from a poll() callback.
+    bool rebuild(int32_t seedResponsePort) noexcept;
 
     /// The default ingress publication's current channel (changes on retarget()).
     /// Owner thread only.
@@ -659,7 +669,8 @@ private:
     // only by the single owner (see stop()), never concurrently with a pumper.
     // #510: a start() that threw is its own state holding the original error, so a
     // later start() rethrows it instead of reporting success.
-    enum class Lifecycle : uint8_t { Idle, Started, StartFailed, Stopped };
+    // Down: started, but the last rebuild() failed (no driver, no client); only rebuild() and stop() apply.
+    enum class Lifecycle : uint8_t { Idle, Started, StartFailed, Down, Stopped };
     void startBody_();   // start()'s steps; start() owns the lifecycle state around it
     Lifecycle          state_ = Lifecycle::Idle;
     std::exception_ptr startError_;   // cold: set only by a failed start()
@@ -753,6 +764,8 @@ private:
     /// marked here and released (with its assembler) at the start of the next poll().
     void retireSubSlot_(int32_t idx) noexcept;
     void reapRetiredSubs_() noexcept;
+    /// Release the slot's subscription and assembler now (rebuild() / a failed start()): the slot is Free.
+    void freeSubSlot_(SubSlot& s) noexcept;
     /// #763: a publication Resolution that leaves its owner goes through here, never `reset()`.  Ready: released now.
     /// Resolving / TimedOut: its driver registration is still pending and would later complete with nobody to release
     /// it, so it is parked in drainingPubs_ and polled (serviceDraining_, from poll()) until it is Ready (released) or
@@ -765,6 +778,7 @@ private:
     std::size_t drainingCount_ = 0;           // entries in drainingPubs_[0, drainingCount_)
     bool        warnedDrainOverflow_ = false;   // drainPub_ overflow: logged once
     uint32_t retiredSubs_ = 0;   // Retired slots awaiting reapRetiredSubs_()
+    uint64_t rebuildFailures_ = 0;   // failed rebuild() attempts; logged on the first and every 64th
     uint64_t freshSubsAdded_ = 0;   // fresh (response-pair) subscription slots added; test seam
     bool     warnedPlainResponse_ = false;   // responsePublicationHandle: logged once
     bool     warnedResponseGiveUp_ = false;   // offerOn fell back from a response pair to plain: logged once

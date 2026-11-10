@@ -183,8 +183,12 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     if (state_ == Lifecycle::Stopped) return 0;
     dutyNowNs_ = nowNs;  // the clock a session opened during this pass runs on
 
-    // T15b failed mode: no driver / conductor pumping, no I/O of any kind.
-    int totalWork = failed_ ? 0 : transport_.dutyCycle();  // invoker: driver + conductor; thread mode: 0
+    // The Aeron client closed: every session loses its transport at once, then the transport is rebuilt (paced).
+    if (ioUp() && transportClosed()) [[unlikely]] enterTransportDown_(nowNs);
+    int totalWork = 0;
+    if (transportDown()) [[unlikely]] totalWork += driveRebuild_(nowNs);
+    // Down / failed: no driver / conductor pumping, no I/O of any kind.
+    if (ioUp()) totalWork += transport_.dutyCycle();  // invoker: driver + conductor; thread mode: 0
 
     // ---- Step 1: Drain the command ring (bounded) ---------------------------
     // fix5 Important-2(d): deliberately NO unblock-on-no-progress here (nor in
@@ -245,7 +249,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
             using CA = rune::client::detail::ControlledAction;
             switch (msgTypeId) {
             case kMsgConnect:
-                if (failed_) break;  // T15b: a failed client never connects again
+                if (failedMode()) break;  // T15b: a failed client never connects again
                 seedSession().machine.connect(nowNs);
                 break;
 
@@ -254,7 +258,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 // transport was already retarget()ed to the leader; drop the
                 // stale follower session and connect fresh so the leader
                 // assigns a new sessionId.
-                if (failed_) break;
+                if (failedMode()) break;
                 seedSession().machine.forceReconnect(nowNs);
                 break;
 
@@ -271,7 +275,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 break;
 
             case kMsgSend:
-                if (failed_) {  // T15b: no I/O — the frame's session is gone for good
+                if (failedMode()) {  // T15b: no I/O — the frame's session is gone for good
                     ++staleFramesDropped_;
                     break;
                 }
@@ -376,7 +380,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
         cfg_.ringDrainLimit);
 
     totalWork += ringWork;
-    if (failed_) [[unlikely]] return totalWork;  // T15b: commands only — no poll, ticks or drain
+    if (!ioUp()) [[unlikely]] return totalWork;  // failed / transport down: commands only — no poll, ticks or drain
 
     // ---- Step 2: Poll egress (bounded) --------------------------------------
     // The fragment budget never exceeds the free room in the reserved ack buffer
@@ -398,6 +402,9 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     }
 
     totalWork += fragments;
+    if (const IoUp& up = std::get<IoUp>(io_); up.armed && sessions_[0]->connectEpoch != up.epoch) [[unlikely]] {
+        io_ = IoUp{kRebuildMinGapNs, 0, false};   // the seed reconnected after the rebuild: the outage is over
+    }
 
     // ---- Step 3: Tick every session machine ---------------------------------
     // tick() drives keepalive cadence and timeout handling.  It may emit frames
@@ -435,6 +442,46 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     }
 
     return totalWork;
+}
+
+// ---------------------------------------------------------------------------
+// Transport rebuild (the Aeron client closed)
+// ---------------------------------------------------------------------------
+
+void ClientAgent::enterTransportDown_(int64_t nowNs) noexcept {
+    const IoUp up = std::get<IoUp>(io_);
+    std::fprintf(stderr, "rune-client: the Aeron client closed — rebuilding the transport\n");
+    // Frames in flight are gone and the brokers may still hold the sessions: each Connected one resumes (an own loss,
+    // never a dead-broker failover) once the transport is back.
+    for (auto& s : sessions_) s->machine.onTransportLost(nowNs);
+    io_ = IoTransportDown{0, up.armed ? nowNs + up.gapNs : nowNs, up.armed ? std::min(up.gapNs * 2, kRebuildMaxGapNs) : up.gapNs};
+}
+
+int ClientAgent::driveRebuild_(int64_t nowNs) noexcept {
+    IoTransportDown& d = std::get<IoTransportDown>(io_);
+    if (nowNs < d.notBeforeNs) return 0;   // paced: the idle strategy parks
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!transport_.rebuild(seedSession().responsePort)) {
+        ++d.attempt;
+        const uint64_t mix    = (reinterpret_cast<uintptr_t>(this) ^ d.attempt) * 0x9E3779B97F4A7C15ULL;   // jitter: spreads the clients of one host
+        d.notBeforeNs = nowNs + d.gapNs + static_cast<int64_t>((mix >> 32) % (static_cast<uint64_t>(d.gapNs) / 4 + 1));
+        d.gapNs       = std::min(d.gapNs * 2, kRebuildMaxGapNs);
+        return 1;
+    }
+    testFault_ = false;
+    // The new transport has fresh response pairs; a worker pinned the old image, so every bind goes out again.
+    for (auto& s : sessions_) s->pair = ResponsePair::Fresh;
+    for (auto& e : workerBinds_) {
+        if (std::holds_alternative<WorkerBindEntry::Free>(e.state)) continue;
+        e.state = WorkerBindEntry::Unbound{};
+        e.pair  = ResponsePair::Fresh;
+    }
+    ++transportRebuilds_;
+    std::fprintf(stderr, "rune-client: transport rebuilt in %lld ms after %u failed attempt(s); sessions resume\n",
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()),
+                 d.attempt);
+    io_ = IoUp{d.gapNs, sessions_[0]->connectEpoch, true};
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -552,7 +599,9 @@ void ClientAgent::noteFatalDrop_(std::size_t len) noexcept {
 
 transport::AeronTransport::OfferResult ClientAgent::offerIngress_(const uint8_t* buf,
                                                                  std::size_t len) noexcept {
-    if (failed_) [[unlikely]] return transport::AeronTransport::OfferResult::Fatal;  // T15b: no I/O
+    if (!ioUp()) [[unlikely]] {   // failed: no I/O for good; transport down: the caller holds the frame
+        return transportDown() ? transport::AeronTransport::OfferResult::Retry : transport::AeronTransport::OfferResult::Fatal;
+    }
     if (testForcedOffers_ > 0) [[unlikely]] {
         --testForcedOffers_;
         return testForcedOffer_;
@@ -772,7 +821,7 @@ bool ClientAgent::retarget(const std::string& newIngressChannel, int32_t respons
 }
 
 bool ClientAgent::failoverSeedTo(const std::string& channel, int64_t nowNs, bool connectNow) noexcept {
-    if (failed_ || channel.empty()) return false;
+    if (!ioUp() || channel.empty()) return false;
     try {
         if (transport_.ingressChannel() != channel) {
             const int32_t port = knownResponsePort_(channel);
@@ -1395,7 +1444,7 @@ bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
 }
 
 bool ClientAgent::offerControlTo(Session& owner, const uint8_t* buf, std::size_t len, bool clear) noexcept {
-    if (failed_) [[unlikely]] return false;  // T15b: a failed client does no I/O
+    if (!ioUp()) [[unlikely]] return false;  // failed: no I/O; transport down: the caller holds the frame
     // client<->broker TLS/AEAD (Task 6b): seal under the SENDING session's own
     // CryptoState (D4 r2: by identity — never a lookup by endpoint string, which
     // a seed moved off its bootstrap shares with a session to that bootstrap).
@@ -1765,7 +1814,8 @@ transport::AeronTransport::OfferResult ClientAgent::offerOnSession(uint32_t inde
                                                                   std::size_t len) noexcept {
     using R = transport::AeronTransport::OfferResult;
     if (index == 0) return offerDefault(buf, len);  // the seed: offerDefault->offerIngress_ already seals
-    if (failed_ || index >= sessions_.size()) [[unlikely]] return R::Fatal;
+    if (index >= sessions_.size()) [[unlikely]] return R::Fatal;
+    if (!ioUp()) [[unlikely]] return transportDown() ? R::Retry : R::Fatal;
     // client<->broker TLS/AEAD (Task 6b): seal under session `index`'s OWN
     // CryptoState — its sessionId is already final in `buf` (every caller,
     // e.g. GroupConsumerHub's fetch routing, stamps it from
@@ -1785,7 +1835,7 @@ transport::AeronTransport::OfferResult ClientAgent::offerOnSession(uint32_t inde
 }
 
 uint32_t ClientAgent::coordinatorSessionIndex(const std::string& channel, int64_t nowNs) noexcept {
-    if (channel.empty() || failed_) return 0;
+    if (channel.empty() || !ioUp()) return 0;
     // D4 r2 MAJOR-1: the seed is the coordinator's session only where it
     // PHYSICALLY is (its default publication), not by its bootstrap identity.
     if (sameEndpoint(channel, transport_.ingressChannel())) return 0;
@@ -1808,7 +1858,8 @@ uint32_t ClientAgent::coordinatorSessionIndex(const std::string& channel, int64_
 transport::AeronTransport::OfferResult ClientAgent::offerToCoordinator(uint32_t index, const uint8_t* buf,
                                                                       std::size_t len) noexcept {
     using R = transport::AeronTransport::OfferResult;
-    if (failed_ || index >= sessions_.size()) [[unlikely]] return R::Fatal;
+    if (index >= sessions_.size()) [[unlikely]] return R::Fatal;
+    if (!ioUp()) [[unlikely]] return transportDown() ? R::Retry : R::Fatal;
     session::SessionMachine& m = sessions_[index]->machine;
     // Not Connected: held — the owner re-sends on this session's connect (the
     // group hub re-joins; the txn producer re-sends on the session change).
@@ -1832,7 +1883,7 @@ transport::AeronTransport::OfferResult ClientAgent::offerToEndpoint(const std::s
 }
 
 bool ClientAgent::reviveSession(uint32_t index, int64_t nowNs) noexcept {
-    if (failed_ || index == 0 || index >= sessions_.size()) return false;
+    if (!ioUp() || index == 0 || index >= sessions_.size()) return false;
     session::SessionMachine& m = sessions_[index]->machine;
     if (m.state() != session::SessionState::Disconnected) return false;
     m.connect(nowNs);

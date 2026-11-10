@@ -575,28 +575,49 @@ TEST(ClientShardRegression, DeliveryTimeoutFailsBatchNotShard) {
     EXPECT_FALSE(r.shard->closed());
 }
 
+// A terminal seed Rejected: the broker expires the session and answers every connect with a non-retriable code.
+void rejectSeed(test_support::InvokerGateway& gw) {
+    gw.connectErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::ProtocolVersion);
+    gw.expireSession(gw.assignedSessionId);
+}
+
 // ---- failure path ------------------------------------------------------------------
 
-// Review finding 2: the Aeron client closed (fault seam) -> Failed{TransportClosed};
-// every record accepted before the failure completes Closed exactly once; later
-// sends are Closed at once.
-TEST(ClientShardRegression, TransportFaultFailsShardCompletesAllClosedOnce) {
-    ShardRig r(invokerGroup(3840, 3841), 0);
+// The Aeron client closes (fault seam) with records in flight and others accepted but not yet sent: the transport is
+// rebuilt, the session resumes, and all 28 records are acked Ok exactly once (the gateway's sequences per partition stay
+// contiguous).  Was: Failed{TransportClosed} with every record Closed.
+TEST(ClientShardRegression, TransportFaultRebuildsInFlightAckedOnceRegression) {
+    OwnDriverRig r(ownDriverGroup(3840, 3841));
     r.connect();
-    r.gw.holdPartitions = {0, 1, 2, 3, 4, 5, 6, 7};
+    r.gw().holdPartitions = {0, 1, 2, 3, 4, 5, 6, 7};
     for (int32_t p = 0; p < 8; ++p) r.sendTo(p, 3);
-    const auto topic = r.shard->topic("t");
     // Accepted but not yet sent (no doWork between them and the fault).
-    for (int i = 0; i < 4; ++i) ASSERT_EQ(r.shard->trySend(topic, keyFor(i), kVal), rc::SendResult::Ok);
+    for (int i = 0; i < 4; ++i) r.accept(i, 1);
+    r.events.clear();
     r.shard->client().testInjectTransportFault();
-    ASSERT_TRUE(r.drive([&] { return r.shard->closed() && r.ledger.records >= 28; }));
-    for (int i = 0; i < 100; ++i) r.step(1'000'000);
+    ASSERT_TRUE(r.drive([&] { return r.shard->client().testTransportRebuilds() == 1 && r.state() == rs::ShardState::Live; }, 100'000));
+    r.gw().holdPartitions.clear();
+    r.gw().releaseHeld();
+    ASSERT_TRUE(r.drive([&] { return r.ledger.records >= 28; }));
+    for (int i = 0; i < 100; ++i) r.step();
     EXPECT_EQ(r.ledger.records, 28) << "every accepted record completes exactly once";
-    EXPECT_EQ(r.ledger.failed, 28);
-    EXPECT_EQ(r.state(), rs::ShardState::Failed);
-    EXPECT_EQ(r.shard->status().failure, rs::ShardFailure::TransportClosed);
-    EXPECT_EQ(r.shard->trySend(topic, keyFor(0), kVal), rc::SendResult::Closed);
-    EXPECT_THROW(r.shard->send(topic, keyFor(0), kVal), std::runtime_error);
+    EXPECT_EQ(r.ledger.ok, 28);
+    EXPECT_TRUE(r.ledger.contiguous);
+    EXPECT_EQ(r.shard->client().testTransportRebuilds(), 1u);
+    EXPECT_TRUE(r.saw(rs::ShardState::Reconnecting));
+    EXPECT_FALSE(r.saw(rs::ShardState::Failed));
+    std::map<int32_t, std::set<int32_t>> seqs;
+    for (const auto& pr : r.gw().produced) {
+        for (int32_t q = 0; q < pr.records; ++q) seqs[pr.partition].insert(pr.baseSequence + q);
+    }
+    int64_t distinct = 0;
+    for (const auto& [part, set] : seqs) {
+        distinct += static_cast<int64_t>(set.size());
+        EXPECT_EQ(*set.begin(), 0) << part;
+        EXPECT_EQ(*set.rbegin(), static_cast<int32_t>(set.size()) - 1) << "partition " << part << ": a sequence gap";
+    }
+    EXPECT_EQ(distinct, 28);
+    EXPECT_EQ(r.shard->trySend(r.shard->topic("t"), keyFor(0), kVal), rc::SendResult::Ok);
 }
 
 // M2: a failed shard does no I/O — no keepalives, no metadata, nothing — while
@@ -607,7 +628,7 @@ TEST(ClientShardRegression, FailedShardDoesNoIo) {
     for (int i = 0; i < 50; ++i) r.step(100'000'000);  // 5 s: keepalives flow (1 s cadence)
     const int liveFrames = r.gw.framesReceived;
     ASSERT_GT(liveFrames, 0);
-    r.shard->client().testInjectTransportFault();
+    rejectSeed(r.gw);
     ASSERT_TRUE(r.drive([&] { return r.state() == rs::ShardState::Failed; }));
     const int atFailure = r.gw.framesReceived;
     for (int i = 0; i < 100; ++i) r.step(100'000'000);  // 10 s of duty time
@@ -617,7 +638,7 @@ TEST(ClientShardRegression, FailedShardDoesNoIo) {
 TEST(ClientShardRegression, FailedThenClosedBothPublishedOnStatusRing) {
     ShardRig r(invokerGroup(3844, 3845), 0);
     r.connect();
-    r.shard->client().testInjectTransportFault();
+    rejectSeed(r.gw);
     ASSERT_TRUE(r.drive([&] { return r.saw(rs::ShardState::Failed); }));
     r.shard->closeImmediately();
     r.shard->pollEvents([&](const rs::ShardStatus& s) { r.events.push_back(s); });
@@ -646,7 +667,7 @@ TEST(ClientShardRegression, AeronClientClosedByOwnerStallRebuildsAndAcksExactlyO
     r.stallPastAeronLiveness(g.aeronClientLivenessTimeoutNs);
     ASSERT_TRUE(r.drive([&] { return r.saw(rs::ShardState::Reconnecting) || r.state() == rs::ShardState::Failed; }));
     ASSERT_NE(r.state(), rs::ShardState::Failed) << "the closed Aeron client must be rebuilt, not fatal";
-    ASSERT_TRUE(r.drive([&] { return r.state() == rs::ShardState::Live; }, 1'000'000));
+    ASSERT_TRUE(r.drive([&] { return r.state() == rs::ShardState::Live; }, 100'000));
     r.gw().holdPartitions.clear();
     r.gw().releaseHeld();
     ASSERT_TRUE(r.drive([&] { return r.ledger.records >= 10; }, 1'000'000));
@@ -696,7 +717,7 @@ TEST(ClientShardRegression, CloseOnFailedIsImmediate) {
     r.connect();
     r.gw.holdPartitions = {0, 1, 2, 3, 4, 5, 6, 7};
     r.sendTo(1, 3);
-    r.shard->client().testInjectTransportFault();
+    rejectSeed(r.gw);
     ASSERT_TRUE(r.drive([&] { return r.state() == rs::ShardState::Failed; }));
     // The clock is frozen: a close that waited for a drain would time out here.
     EXPECT_EQ(r.shard->closeAndWait(5s), rc::OpStatus::Closed);
@@ -768,7 +789,7 @@ TEST(ClientShardRegression, CloseImmediatelyFromLiveDegradedReconnectingFailed) 
             r.gw.replyConnects = false;
             r.gw.expireSession(r.gw.assignedSessionId);
         } else if (from == rs::ShardState::Failed) {
-            r.shard->client().testInjectTransportFault();
+            rejectSeed(r.gw);
         }
         ASSERT_TRUE(r.drive([&] { return r.state() == from; }, from == rs::ShardState::Degraded ? 1'000'000 : 0));
         r.shard->closeImmediately();

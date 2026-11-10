@@ -235,6 +235,7 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
             if (park && work == 0 && acks == 0 && out.sent == sentBefore && !(out.sent >= total && out.acked >= out.sent)) {
                 const bool clockBound = open && !blocked && out.sent < total;
                 const int64_t nextDue = clockBound ? schedule.scheduledNs(out.sent) : kNoNextSend;
+                parker.setFds(wfds, shard.wakeFds(wfds, 8));
                 parker.park(benchParkTimeoutNs(nextDue, monoNs(), kBenchMaxParkNs));
             }
             if (lost) {

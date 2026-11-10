@@ -698,15 +698,24 @@ public:
     /// Times the trailer bytes had to grow (a duty cycle with more verdicts than ever before).
     [[nodiscard]] uint64_t verdictArenaGrowths() const noexcept { return verdictArenaGrowths_; }
 
-    /// The Aeron client closed itself — or the T15b test fault was applied.
+    /// The Aeron client closed itself — or the T15b test fault was applied.  Cleared by the rebuild.
     [[nodiscard]] bool transportClosed() const noexcept { return testFault_ || transport_.closed(); }
 
-    /// T15b: the Client failed for good (Aeron client closed / seed Rejected).
+    /// T15b: the Client failed for good (the seed's terminal Rejected).
     /// From now on doWork() only drains the command ring: no driver / conductor
     /// pumping, no egress poll, no session ticks, no producer drain, and every
     /// offer is refused — no I/O at all.  Duty thread only.  Idempotent.
-    void enterFailedMode() noexcept { failed_ = true; }
-    [[nodiscard]] bool failedMode() const noexcept { return failed_; }
+    void enterFailedMode() noexcept { io_ = IoFailed{}; }
+    [[nodiscard]] bool failedMode() const noexcept { return std::holds_alternative<IoFailed>(io_); }
+    /// The Aeron client closed and the transport is being rebuilt (commands only, offers answer Retry, no I/O); duty thread.
+    [[nodiscard]] bool transportDown() const noexcept { return std::holds_alternative<IoTransportDown>(io_); }
+    /// Failed rebuild attempts of the current outage (0 while up or before the first attempt); duty thread.
+    [[nodiscard]] uint32_t rebuildAttempt() const noexcept {
+        const auto* d = std::get_if<IoTransportDown>(&io_);
+        return d != nullptr ? d->attempt : 0;
+    }
+    /// Successful transport rebuilds so far (duty thread; any thread after it stopped).
+    [[nodiscard]] uint64_t transportRebuilds() const noexcept { return transportRebuilds_; }
 
     /// T15b test seam (any thread): put the transport-fault command on the ring
     /// (the duty thread applies it: transportClosed() turns true).
@@ -821,7 +830,7 @@ public:
     /// AGENT-THREAD ONLY.
     bool offerToPartition(int32_t topicId, int32_t partition, int32_t ingressStreamId,
                           const uint8_t* buf, std::size_t len) noexcept {
-        if (failed_) [[unlikely]] return false;  // T15b: a failed client does no I/O
+        if (!ioUp()) [[unlikely]] return false;  // failed: no I/O; transport down: the caller holds the frame
         return offerProduceToLeader_(topicId, partition, ingressStreamId, buf, len, {});
     }
     /// Backlog B1: a freshly encoded frame whose RecordBatch CRC is still unset —
@@ -829,7 +838,7 @@ public:
     /// it (AeronTransport::offer).  AGENT-THREAD ONLY.
     bool offerToPartition(int32_t topicId, int32_t partition, int32_t ingressStreamId,
                           uint8_t* buf, std::size_t len, transport::FrameCrc crc) noexcept {
-        if (failed_) [[unlikely]] return false;  // T15b: a failed client does no I/O
+        if (!ioUp()) [[unlikely]] return false;  // failed: no I/O; transport down: the caller holds the frame
         return offerProduceToLeader_(topicId, partition, ingressStreamId, buf, len, crc);
     }
 
@@ -1365,7 +1374,22 @@ private:
     enum class Lifecycle : uint8_t { Idle, Started, StartFailed, Stopped };
     Lifecycle          state_ = Lifecycle::Idle;
     std::exception_ptr startError_;   // cold: set only by a failed start()
-    bool failed_    = false;  // T15b failed mode (duty thread only)
+    /// The I/O state (duty thread only), one explicit state: IoUp (normal), IoTransportDown (the Aeron client closed:
+    /// commands only until driveRebuild_ brings a fresh transport up; records wait), IoFailed (the seed's terminal
+    /// Rejected, T15b: no I/O for good).  IoUp carries the rebuild pacing across outages (storm control): a rebuild sets
+    /// `armed` and the seed's connectEpoch; until the seed's next Connected edge a new outage waits `gapNs` before its
+    /// first rebuild and each further rebuild doubles it, so a client that keeps closing never restarts the driver back
+    /// to back.  The edge resets it.
+    struct IoUp            { int64_t gapNs; uint64_t epoch; bool armed; };
+    struct IoTransportDown { uint32_t attempt; int64_t notBeforeNs; int64_t gapNs; };
+    struct IoFailed        {};
+    static constexpr int64_t kRebuildMinGapNs = 100'000'000;     // the seed failover's pacing: 100 ms doubling to 10 s
+    static constexpr int64_t kRebuildMaxGapNs = 10'000'000'000;
+    std::variant<IoUp, IoTransportDown, IoFailed> io_{IoUp{kRebuildMinGapNs, 0, false}};
+    [[nodiscard]] bool ioUp() const noexcept { return std::holds_alternative<IoUp>(io_); }
+    void enterTransportDown_(int64_t nowNs) noexcept;
+    int  driveRebuild_(int64_t nowNs) noexcept;
+    uint64_t transportRebuilds_ = 0;
     // The duty clock (ClientConfig::nanoClock, or the default clock) of the
     // current / latest doWork pass — the ONE clock every session machine runs
     // on.  A session opened lazily mid-pass (openSession_) stamps its connect

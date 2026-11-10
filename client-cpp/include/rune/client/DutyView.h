@@ -17,7 +17,8 @@ struct DutyView {
     int32_t               seedBackoffAttempt = 0;
     uint32_t              leaderSessions     = 0;  ///< routed leader-node sessions (besides the seed)
     uint64_t              leadersDownMask    = 0;  ///< bit i: leader session i not Connected (first 64)
-    bool                  transportFailed    = false;  ///< the Aeron client closed: the Client failed for good
+    bool                  transportDown      = false;  ///< the Aeron client closed: the transport is being rebuilt
+    uint32_t              transportRebuildAttempt = 0;  ///< failed rebuild attempts of this outage
     bool                  producerClosing    = false;  ///< a producer's intake is closed (begin-close / close)
 };
 

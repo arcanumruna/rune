@@ -69,15 +69,25 @@ TEST(ShardStateRegression, SeedRejectedIsFailedRejectedBeforeOrAfterLive) {
     }
 }
 
-TEST(ShardStateRegression, TransportFailedWinsOverEverything) {
-    for (const SS st : {SS::Connected, SS::Connecting, SS::Backoff, SS::Rejected}) {
-        rc::DutyView v      = view(st, true);
-        v.transportFailed   = true;
-        v.producerClosing   = true;
-        const auto s        = rs::deriveShardStatus(v, 0);
-        EXPECT_EQ(s.state, rs::ShardState::Failed);
-        EXPECT_EQ(s.failure, rs::ShardFailure::TransportClosed);
+TEST(ShardStateRegression, TransportDownIsReconnectingWithTheRebuildAttempt) {
+    for (const SS st : {SS::Connected, SS::Connecting, SS::Backoff, SS::Disconnected}) {
+        rc::DutyView v          = view(st, true);
+        v.transportDown         = true;
+        v.transportRebuildAttempt = 3;
+        const auto s            = rs::deriveShardStatus(v, 0);
+        EXPECT_EQ(s.state, rs::ShardState::Reconnecting) << static_cast<int>(st);
+        EXPECT_EQ(s.failure, rs::ShardFailure::None);
+        EXPECT_EQ(s.attempt, 3);
     }
+}
+
+TEST(ShardStateRegression, FailedOnlyForRejectedEvenWhileTransportDown) {
+    rc::DutyView v   = view(SS::Rejected, true);
+    v.transportDown  = true;
+    v.producerClosing = true;
+    const auto s     = rs::deriveShardStatus(v, 0);
+    EXPECT_EQ(s.state, rs::ShardState::Failed);
+    EXPECT_EQ(s.failure, rs::ShardFailure::Rejected);
 }
 
 TEST(ShardStateRegression, BeginCloseIsDrainingInAnyRunningState) {
