@@ -519,6 +519,40 @@ void nextTxnVoteIsJudgedByItsOwnScan(int16_t nextEpoch, int32_t nextSeq) {
 TEST(CheckedWritesTxnWorkerRegression, EndedTxnScanDoesNotAnswerTheNextEpochsVoteRegression) { nextTxnVoteIsJudgedByItsOwnScan(1, 0); }
 TEST(CheckedWritesTxnWorkerRegression, EndedTxnScanDoesNotAnswerTheSameEpochsNextVoteRegression) { nextTxnVoteIsJudgedByItsOwnScan(0, 2); }
 
+// Re-review of I1: the ended transaction's scan is answered even while the producer's next transaction already holds its J.  A third
+// scan finishing first moves the next transaction's scan ahead of the ended one, so J of the next one lands first.
+TEST(CheckedWritesTxnWorkerRegression, EndedTxnScanIsAnsweredWhileTheNextTxnHoldsItsJudgeRegression) {
+    Ki k(/*follower=*/true);
+    k.txn(48, {ins(7)});
+    ASSERT_EQ(k.vote(48).errorCode, 0);
+    k.r.marker(48, true);
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    k.txn(47, {ins(3)});
+    k.txn(49, {ins(1)});
+    k.r.followerFetch();
+    (void)k.r.produceFrame({ups(4)}, kLeader, 47, 1, /*txn=*/true);
+    (void)k.r.produceFrame({ups(2)}, kLeader, 49, 1, /*txn=*/true);
+    k.r.passes(5);
+    const int64_t other = k.r.sendVote(VerdictRig::kSrc, 47, 0);
+    const int64_t first = k.r.sendVote(VerdictRig::kSrc, 49, 0);
+    k.r.passes(30);
+    ASSERT_EQ(k.r.worker->voteScansForTest(), 2u);
+    k.r.marker(49, false);
+    (void)k.r.produceFrame({ins(7)}, kLeader, 49, 2, /*txn=*/true);   // the taken key
+    k.r.passes(5);
+    const int64_t second = k.r.sendVote(VerdictRig::kSrc, 49, 0);
+    k.r.passes(30);
+    ASSERT_EQ(k.r.worker->voteScansForTest(), 3u);
+    ASSERT_TRUE(k.r.driveUntilVoted(other));
+    ASSERT_TRUE(k.r.driveUntilVoted(second));
+    EXPECT_EQ(k.r.voteReply(second)->code, kKeyExists);
+    EXPECT_GE(k.r.voteReply(second)->judgeOffset, 0);
+    ASSERT_TRUE(k.r.driveUntilVoted(first, 300)) << "the ended transaction's vote waits for the next one's marker";
+    EXPECT_EQ(k.r.voteReply(first)->errorCode, 0);
+    EXPECT_EQ(k.r.voteReply(first)->code, 0);
+    EXPECT_EQ(k.r.worker->voteScansForTest(), 0u);
+}
+
 // Task 7 (T7 review 1, F6): a vote the full park refuses leaves no scan behind: driven by the other parked votes, it would append a J
 // nobody waits for, or sit until the next vote.
 TEST(CheckedWritesTxnWorker, RefusedParkLeavesNoScanRegression) {

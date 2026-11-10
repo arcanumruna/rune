@@ -8022,10 +8022,11 @@ private:
             answerAll(0, TxnVoteAnswer{static_cast<uint16_t>(pc::ErrorCode::TxnTooLarge), 0, -1});
             return true;
         }
-        // J lands only once the transaction is committed below it, and only when the judge's table takes it.
-        if (rep.highWatermark() <= s.last || !ws.txn.acceptsJudge(s.producerId)) return false;
+        // J lands only once the transaction is committed below it.
+        if (rep.highWatermark() <= s.last) return false;
         // The transaction ended while the scan waited (a coordinator's abort): a J past its marker would judge nothing, and it would
-        // hold K behind the marker.  As at the vote, no open transaction answers yes.
+        // hold K behind the marker.  As at the vote, no open transaction answers yes, also while the producer's next transaction holds
+        // the judge table's entry.
         if (const RcState* rc = rcServe_(&rep, rcOf_(&rep)); rc == nullptr) {
             return false;
         } else if (rc->tracker().firstOffsetOf(s.producerId) != s.first) {
@@ -8033,6 +8034,7 @@ private:
             answerAll(0, {});
             return true;
         }
+        if (!ws.txn.acceptsJudge(s.producerId)) return false;   // only when the judge's table takes it
         const rune::storage::control_record::TxnJudgeRecord rec{s.producerId, s.epoch, s.first};
         const std::size_t n = rune::storage::control_record::buildTxnJudge(txnJudgeScratch_, rec);
         rune::replication::Offset base;
