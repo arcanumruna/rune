@@ -193,8 +193,8 @@ private:
         viewId_ = r.viewTopicId;
     }
 
+    LeaseTestClock          clock_;   // before b_: destroyed after it, so no worker reads a freed cell (TSan, broker teardown)
     AuthBroker              b_;
-    LeaseTestClock          clock_;
     std::unique_ptr<Client> admin_, ua_, ub_, ua17_;
     Topic                   t_, t2_, bt_, n_;
     int32_t                 viewId_ = -1;
