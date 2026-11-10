@@ -968,29 +968,13 @@ void tlsFailover(const char* tag, bool shard, bool require) {
     cfg.tlsTrustPem = acfg.tlsTrustPem; cfg.tlsExpectHost = "localhost";
     cfg.reconnectForeverAfterLive = shard;
     cfg.connectTimeoutMs = 5'000; cfg.pingTimeoutMs = 30'000;
-    auto client = std::make_unique<rc::Client>(cfg);
-    rc::GroupConfig gcfg;
-    gcfg.autoCommit = true; gcfg.autoCommitIntervalMs = 500; gcfg.sessionTimeoutMs = 10'000;
-    auto gc = client->subscribeGroup("g", {"events"}, gcfg);
-    SubLedger gled;
-    gc.onRecords([&](const rc::RecordSet& rs) {
-        rs.forEachRecord([&](std::string_view, std::string_view v, int64_t off, int64_t) {
-            std::lock_guard lk(gled.mu);
-            gled.seqs[rs.partition].insert(seqOf(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size())));
-            gled.offs[rs.partition].insert(off);
-        });
-    });
-    client->connectAndWait(30s);
+    auto client = connectClient(c, cfg);
     rc::ProducerConfig pcfg;
     pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.produceTimeoutMs = 30'000; pcfg.deliveryTimeoutMs = 60'000;
     auto producer = client->producer(pcfg);
     rc::Completions cq(*client);
     const rc::TopicHandle th = client->topic("events");
-    SubLedger led, led2;
-    rc::SubscribeOptions so;
-    so.from = rc::From::earliest();
-    auto s0 = client->subscribe(th, 0, so, led.handler(0));   // p0 is bound on the seed's session
     auto sendOne = [&](int seq) {
         uint64_t k = static_cast<uint64_t>(seq) * 16;
         while (rc::Key(k).partition(kPartitions) != seq % kPartitions) ++k;
@@ -1109,29 +1093,13 @@ void tlsShardStallPastTheLease(const char* tag, bool require) {
     cfg.reconnectForeverAfterLive = true;
     cfg.aeronClientLivenessTimeoutNs = 60'000'000'000LL;   // a shard client's Aeron survives the stall (it runs 1 h)
     cfg.connectTimeoutMs = 5'000; cfg.pingTimeoutMs = kLeaseMs;
-    auto client = std::make_unique<rc::Client>(cfg);
-    rc::GroupConfig gcfg;
-    gcfg.autoCommit = true; gcfg.autoCommitIntervalMs = 500; gcfg.sessionTimeoutMs = 10'000;
-    auto gc = client->subscribeGroup("g", {"events"}, gcfg);
-    SubLedger gled;
-    gc.onRecords([&](const rc::RecordSet& rs) {
-        rs.forEachRecord([&](std::string_view, std::string_view v, int64_t off, int64_t) {
-            std::lock_guard lk(gled.mu);
-            gled.seqs[rs.partition].insert(seqOf(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size())));
-            gled.offs[rs.partition].insert(off);
-        });
-    });
-    client->connectAndWait(30s);
+    auto client = connectClient(c, cfg);
     rc::ProducerConfig pcfg;
     pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.produceTimeoutMs = 30'000; pcfg.deliveryTimeoutMs = 60'000;
     auto producer = client->producer(pcfg);
     rc::Completions cq(*client);
     const rc::TopicHandle th = client->topic("events");
-    SubLedger led, led2;
-    rc::SubscribeOptions so;
-    so.from = rc::From::earliest();
-    auto s0 = client->subscribe(th, 0, so, led.handler(0));   // p0 is bound on the seed's session
     std::map<rc::Token, rc::OpStatus> done;
     auto pump = [&] {
         (void)client->doWork();
