@@ -680,6 +680,123 @@ TEST(ClientShardRegression, AeronClientClosedByOwnerStallRebuildsAndAcksExactlyO
     EXPECT_EQ(r.shard->trySend(r.shard->topic("t"), keyFor(1), kVal), rc::SendResult::Ok);
 }
 
+namespace {
+// Injects the Aeron-client-closed fault and drives (slow fake clock: the rebuilt UDP link needs real time) until
+// the transport was rebuilt `n` times in all and the shard is Live again.
+bool faultAndRecover(OwnDriverRig& r, uint64_t n) {
+    r.shard->client().testInjectTransportFault();
+    return r.drive([&] { return r.shard->client().testTransportRebuilds() == n && r.state() == rs::ShardState::Live; }, 100'000);
+}
+}  // namespace
+
+// Records accepted while the transport is Down (after the fault, before the rebuild) are delivered after the rebuild,
+// in order, after the ones that were in flight.
+TEST(ClientShardRegression, RecordsAcceptedWhileTransportDownAreDeliveredInOrderRegression) {
+    OwnDriverRig r(ownDriverGroup(3808, 3809));
+    r.connect();
+    r.sendTo(1, 3);
+    r.shard->client().testInjectTransportFault();
+    r.step();
+    r.accept(1, 4);
+    ASSERT_TRUE(r.drive([&] { return r.ledger.records >= 7; }, 100'000));
+    for (int i = 0; i < 50; ++i) r.step(100'000);
+    EXPECT_EQ(r.ledger.records, 7);
+    EXPECT_EQ(r.ledger.ok, 7);
+    EXPECT_TRUE(r.ledger.contiguous) << "partition 1's sequences arrive in order";
+    EXPECT_EQ(r.shard->client().testTransportRebuilds(), 1u);
+}
+
+// A control op pending when the transport closes completes SessionLost; one issued after the rebuild completes Ok.
+TEST(ClientShardRegression, ControlOpsAcrossRebuildRegression) {
+    OwnDriverRig r(ownDriverGroup(3810, 3811));
+    r.connect();
+    rc::Completions cq(r.shard->client());
+    const uint8_t   echo[] = {1};
+    r.gw().replyPongs = false;
+    ASSERT_EQ(r.shard->client().ping(echo, cq, 5), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return r.gw().pings > 0; }));
+    r.shard->client().testInjectTransportFault();
+    rc::OpStatus first = rc::OpStatus::Ok;
+    bool         done  = false;
+    ASSERT_TRUE(r.drive([&] {
+        cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) { done = true; first = c.status; });
+        return done && r.shard->client().testTransportRebuilds() == 1 && r.state() == rs::ShardState::Live;
+    }, 100'000));
+    EXPECT_EQ(first, rc::OpStatus::SessionLost);
+    r.gw().replyPongs = true;
+    ASSERT_EQ(r.shard->client().ping(echo, cq, 6), rc::OpResult::Accepted);
+    rc::OpStatus second = rc::OpStatus::Closed;
+    done                = false;
+    ASSERT_TRUE(r.drive([&] {
+        cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) { done = true; second = c.status; });
+        return done;
+    }, 100'000));
+    EXPECT_EQ(second, rc::OpStatus::Ok);
+}
+
+// Every close recovers; the shard never goes Failed.
+TEST(ClientShardRegression, RepeatedTransportClosesRecoverEachTimeRegression) {
+    OwnDriverRig r(ownDriverGroup(3812, 3813));
+    r.connect();
+    for (uint64_t n = 1; n <= 3; ++n) {
+        r.sendTo(static_cast<int32_t>(n), 2);
+        ASSERT_TRUE(faultAndRecover(r, n)) << "close " << n;
+    }
+    ASSERT_TRUE(r.drive([&] { return r.ledger.records >= 6; }, 100'000));
+    EXPECT_EQ(r.ledger.ok, 6);
+    EXPECT_FALSE(r.saw(rs::ShardState::Failed));
+}
+
+// A rebuild that keeps failing is retried on a doubling gap (100 ms, 200 ms, ...): in one fake second there are
+// at most a handful of attempts, never one per duty cycle.  The shard stays Reconnecting and recovers once rebuilding works.
+TEST(ClientShardRegression, RebuildFailureBacksOffWithoutSpinningRegression) {
+    auto g = ownDriverGroup(3814, 3815);
+    const std::string goodChannel = g.base.gatewayChannel;
+    OwnDriverRig r(g);
+    r.connect();
+    r.shard->client().testSetSeedIngressChannel("aeron:udp?endpoint=256.0.0.1:1");
+    r.shard->client().testInjectTransportFault();
+    for (int i = 0; i < 1000; ++i) r.step(1'000'000);
+    EXPECT_EQ(r.shard->client().testTransportRebuilds(), 0u);
+    EXPECT_NE(r.state(), rs::ShardState::Failed);
+    EXPECT_EQ(r.state(), rs::ShardState::Reconnecting);
+    const auto st = r.shard->status();
+    EXPECT_GE(st.attempt, 2);
+    EXPECT_LE(st.attempt, 5) << "paced: 100 ms doubling, not per duty cycle";
+    r.shard->client().testSetSeedIngressChannel(goodChannel);
+    ASSERT_TRUE(r.drive([&] { return r.shard->client().testTransportRebuilds() == 1 && r.state() == rs::ShardState::Live; }, 10'000'000));
+}
+
+// A seed Rejected stays terminal even when a transport fault happens at the same time.
+TEST(ClientShardRegression, SeedRejectedStaysTerminalEvenAfterTransportFaultRegression) {
+    OwnDriverRig r(ownDriverGroup(3816, 3817));
+    r.connect();
+    rejectSeed(r.gw());
+    r.shard->client().testInjectTransportFault();
+    ASSERT_TRUE(r.drive([&] { return r.state() == rs::ShardState::Failed; }, 100'000));
+    EXPECT_EQ(r.shard->status().failure, rs::ShardFailure::Rejected);
+    for (int i = 0; i < 200; ++i) r.step(1'000'000);
+    EXPECT_EQ(r.state(), rs::ShardState::Failed);
+}
+
+// closeImmediately while the transport is down: bounded, every accepted record completes exactly once.
+TEST(ClientShardRegression, CloseDuringTransportDownIsBoundedExactlyOnceRegression) {
+    OwnDriverRig r(ownDriverGroup(3818, 3819));
+    r.connect();
+    r.gw().holdPartitions = {0, 1, 2, 3, 4, 5, 6, 7};
+    r.sendTo(1, 3);
+    r.accept(2, 2);
+    r.shard->client().testInjectTransportFault();
+    r.step();
+    const auto t0 = std::chrono::steady_clock::now();
+    r.shard->closeImmediately();
+    r.shard->pollBatchAcks([&](const rc::BatchAck& a) { r.ledger(a); });
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 5s);
+    EXPECT_EQ(r.ledger.records, 5) << "each accepted record completes exactly once";
+    EXPECT_EQ(r.ledger.failed, 5);
+    EXPECT_EQ(r.shard->status().state, rs::ShardState::Closed);
+}
+
 // ---- close -------------------------------------------------------------------------
 
 TEST(ClientShardRegression, BlockingCloseAndCloseAndWaitAreEquivalent) {

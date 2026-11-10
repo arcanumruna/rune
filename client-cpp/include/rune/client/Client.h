@@ -681,6 +681,8 @@ public:
     /// really rebuilt (a healthy one is torn down and restarted) and the
     /// sessions resume.
     void testInjectTransportFault() { (void)agent_.submitTestFault(); }
+    /// Moves the seed's physical ingress channel (the next rebuild() keeps it); duty thread / Invoker owner only.
+    void testSetSeedIngressChannel(const std::string& channel) { agent_.setSeedPhysicalIngressForTest(channel); }
     /// Transport rebuilds completed so far (duty thread, or after it stopped).
     [[nodiscard]] uint64_t testTransportRebuilds() const noexcept { return agent_.transportRebuilds(); }
     /// T15b test hook: duty cycles run in failed mode (Invoker owner, or after
