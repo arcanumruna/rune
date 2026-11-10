@@ -406,6 +406,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     // work-done signals (the IdleStrategy backs off on 0 for idle cycles).
     // Single-node: exactly one session (the seed) — same cost as before.
     for (auto& s : sessions_) {
+        if (s->responsePort != 0 && s->machine.state() == session::SessionState::Connected) checkResponseEgress_(*s, nowNs);
         s->machine.tick(nowNs);
     }
 
@@ -1430,6 +1431,18 @@ bool ClientAgent::offerControlTo(Session& owner, const uint8_t* buf, std::size_t
     // whatever it answers (ConnectResponse, ErrorResponse, a late answer to an older Connect): the pair is spent.
     if (isConnect && accepted && owner.responsePort != 0) [[unlikely]] owner.pair = ResponsePair::Spent;
     return accepted;
+}
+
+void ClientAgent::checkResponseEgress_(Session& s, int64_t nowNs) noexcept {
+    // #989: the gateway answers this session on ONE response publication, and Aeron pins the pair's subscription to it.
+    // When that image closes (the gateway closed it or died), no gateway can reach this pair again: a restarted one
+    // cannot even send UnknownSession.  The session is gone, exactly as if the gateway had said so: resume / reconnect
+    // now (a Connect builds a fresh pair), never after the response timeout.  Mirrors AeronCluster.pollEgress.
+    const bool lost = (&s == &seedSession()) ? transport_.seedResponseEgressLost() : transport_.responseEgressLost(s.ctlPub);
+    if (!lost) [[likely]] return;
+    ++responseEgressLosses_;
+    s.machine.onErrorResponse(static_cast<int16_t>(::rune::protocol::client::ErrorCode::UnknownSession),
+                              "response egress closed", 0, nowNs, s.machine.sessionId());
 }
 
 void ClientAgent::rePairSessionResponse_(Session& s) noexcept {

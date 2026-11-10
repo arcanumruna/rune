@@ -859,6 +859,8 @@ public:
     [[nodiscard]] uint64_t staleFramesDropped() const noexcept { return staleFramesDropped_; }
     /// F-A C1: session-fatal notices for a session this client already left (dropped, never applied).
     [[nodiscard]] uint64_t staleSessionNotices() const noexcept { return staleSessionNotices_; }
+    /// #989: sessions resumed because their response pair's gateway publication closed (duty thread only).
+    [[nodiscard]] uint64_t responseEgressLosses() const noexcept { return responseEgressLosses_; }
     /// U2: clear UnknownSession notices accepted for an encrypted session (probe nonce echoed) / refused (wrong nonce or session).
     [[nodiscard]] uint64_t probeNoticesAccepted() const noexcept { return probeNoticesAccepted_; }
     [[nodiscard]] uint64_t probeNoticesRejected() const noexcept { return probeNoticesRejected_; }
@@ -1200,6 +1202,8 @@ private:
     void onWorkerBindAck_(const uint8_t* buf, std::size_t len) noexcept;
     /// Replace `s`'s spent response pair (request publication + response subscription) with a fresh one.  Cold.
     void rePairSessionResponse_(Session& s) noexcept;
+    /// #989: a Connected response-mode session whose pair's gateway publication closed is resumed (see the .cpp).
+    void checkResponseEgress_(Session& s, int64_t nowNs) noexcept;
     /// One cold pass per doWork over the (small) table: offer the WorkerBind for every entry whose session is
     /// Connected with a token and whose bound sid is not the session's current one.  Returns binds sent.
     int serviceWorkerBinds_() noexcept;
@@ -1384,6 +1388,7 @@ private:
     // only on the duty thread / after the runner is joined).
     uint64_t staleFramesDropped_  = 0;
     uint64_t staleSessionNotices_ = 0;   ///< F-A C1 (duty thread only)
+    uint64_t responseEgressLosses_ = 0;  ///< #989 (duty thread only)
     uint64_t ingressOfferRefused_ = 0;
     uint64_t ingressFatalDropped_ = 0;
     // DR client bug 2: the duty-clock time the transport first refused the

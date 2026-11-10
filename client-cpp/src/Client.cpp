@@ -262,6 +262,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c, const detail::ClientTest
     acfg.session.requireCrypto = c.requireCrypto;
     if (c.testAnnounceClientVersion > 0) acfg.session.clientVersion = c.testAnnounceClientVersion;   // test only
     acfg.transport.clientLivenessTimeoutNs = c.aeronClientLivenessTimeoutNs;
+    acfg.transport.imageLivenessTimeoutNs  = c.aeronImageLivenessTimeoutNs;   // #989
     // F12: malformed env values are reported (once per Client construction —
     // this runs once per Client, never per cycle), not silently dropped.
     for (const std::string& w : transport::applyEnvOverrides(acfg.transport)) {

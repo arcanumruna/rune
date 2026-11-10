@@ -2,6 +2,8 @@
 // client's DECLARED egress channel (the keepalive Ping's echo is the egress stream id plus that channel), so the client reconnects at once
 // instead of at its response timeout; and a restarted node never re-issues a session id of its previous life.  THREE real brokers, a real client
 // whose responseTimeout is 60 s (recovery by timeout is impossible inside the deadlines).  Every wait is bounded.
+// #989, response mode: no restarted gateway can reach the client's response subscription (Aeron pins it to the old gateway's
+// response publication), so the client itself leaves the session when that publication's image closes, as Aeron Cluster's client does.
 #include "client/ClusterClient.h"
 
 #include <rune/client/Client.h>
@@ -21,7 +23,7 @@ using Clk = std::chrono::steady_clock;
 namespace {
 constexpr int64_t kResponseTimeoutNs = 60'000'000'000LL;
 
-/// The response ports of the trio, for the response-mode test only (DISABLED_ResponseModeRestartedNodeAnswersRegression).  Allocated once
+/// The response ports of the trio, for the response-mode test only (ResponseModeClientLeavesARestartedNodeRegression).  Allocated once
 /// per test; the tweak is re-applied when a node restarts, so the ports survive it.
 struct ResponsePorts {
     std::array<uint16_t, 3> gw{}, worker{};
@@ -40,9 +42,14 @@ struct ResponsePorts {
     }
 };
 
+constexpr int64_t kImageLivenessNs = 2'000'000'000LL;   // #989: the dead gateway's response image closes 2 s after its last frame
+
 rc::ClientConfig slowTimeoutConfig(ThreeNodes& c, const ResponsePorts* rp, int id, int64_t keepaliveNs = 0) {
     auto cfg = clientConfigFor(c, id);
-    if (rp != nullptr) cfg.gatewayResponseControlPort = rp->gw[static_cast<std::size_t>(id - 1)];
+    if (rp != nullptr) {
+        cfg.gatewayResponseControlPort = rp->gw[static_cast<std::size_t>(id - 1)];
+        cfg.aeronImageLivenessTimeoutNs = kImageLivenessNs;
+    }
     cfg.responseTimeoutNs = kResponseTimeoutNs;
     cfg.keepaliveIntervalNs = keepaliveNs;
     return cfg;
@@ -79,7 +86,13 @@ void recoverByNotice(const char* tag, bool appTrafficDuringOutage, bool response
     ASSERT_TRUE(r.c.awaitCatalogLeader(30s));
     r.node = aFollowerOfTheCatalog(r.c);
     ASSERT_GT(r.node, 0);
-    auto client = connectClient(r.c, slowTimeoutConfig(r.c, r.ports, r.node));
+    // #989: a response-mode client is a NAT'd one: it DECLARES an unreachable egress channel (TEST-NET-1), so nothing the restarted node
+    // sends on the declared path can reach it; only its own response pair can.
+    rc::detail::ClientTestOptions opts;
+    if (responseMode) opts.declaredEgressChannel = "aeron:udp?endpoint=192.0.2.1:40200";
+    auto client = std::make_unique<rc::Client>(slowTimeoutConfig(r.c, r.ports, r.node), opts);
+    client->connectAndWait(30s);
+    if (responseMode) ASSERT_TRUE(client->testSeedResponseCorrelated()) << "vacuity guard: the session is response-paired";
     const int64_t old = client->testSeedSessionId();
     ASSERT_NE(old, 0);
     ASSERT_EQ(client->testSeedStaleSessionLosses(), 0u);
@@ -89,9 +102,15 @@ void recoverByNotice(const char* tag, bool appTrafficDuringOutage, bool response
         try { (void)client->pingAndWait(std::span<const uint8_t>{}, 300ms); } catch (const std::exception&) {}
     }
     const bool recovered = pollUntil(5s, [&] { const int64_t s = client->testSeedSessionId(); return s != 0 && s != old; });
-    EXPECT_TRUE(recovered) << "the keepalive Ping alone brings the session back within 5 s (response timeout is 60 s)";
+    EXPECT_TRUE(recovered) << "the session comes back within 5 s (response timeout is 60 s)";
     EXPECT_EQ(client->testSeedStaleSessionLosses(), 0u) << "recovery came from the notice, not from the response timeout";
-    { const auto n = r.c.node(r.node).testUnknownSessionNotices(); EXPECT_GE(n[0], 1u) << "sent/deduped/dropped/abandoned = " << n[0] << "/" << n[1] << "/" << n[2] << "/" << n[3]; }
+    if (responseMode) {
+        EXPECT_EQ(client->testResponseEgressLosses(), 1u) << "recovery came from the closed response image";
+    } else {
+        EXPECT_EQ(client->testResponseEgressLosses(), 0u) << "a declared-egress session never takes the response-image path";
+        const auto n = r.c.node(r.node).testUnknownSessionNotices();
+        EXPECT_GE(n[0], 1u) << "sent/deduped/dropped/abandoned = " << n[0] << "/" << n[1] << "/" << n[2] << "/" << n[3];
+    }
     bool ok = false;
     for (int i = 0; i < 50 && !ok; ++i) {
         try { (void)client->pingAndWait(std::span<const uint8_t>{}, 1s); ok = true; } catch (const std::exception&) {}
@@ -105,10 +124,10 @@ TEST(GatewayUnknownSessionRegression, RestartedNodeAnswersUnknownSessionRegressi
 
 TEST(GatewayUnknownSessionRegression, IdleSessionPingGetsUnknownSessionRegression) { recoverByNotice("unk-idle", false); }
 
-// Response mode (gatewayResponseControlPort != 0 on gateway and client): the restarted gateway's notice publication on the response
-// channel never connects to the client's surviving response subscription, so recovery is by the response timeout only.  DISABLED until
-// that is solved (tracked in a GitHub issue).
-TEST(GatewayUnknownSessionRegression, DISABLED_ResponseModeRestartedNodeAnswersRegression) { recoverByNotice("unk-resp", true, true); }
+// #989, response mode (gatewayResponseControlPort != 0 on gateway and client): the restarted gateway cannot reach the client's response
+// subscription; the client leaves the session when the dead gateway's response image closes (2 s here), well inside 5 s and never at its
+// 60 s response timeout.  Red without ClientAgent::checkResponseEgress_.
+TEST(GatewayUnknownSessionRegression, ResponseModeClientLeavesARestartedNodeRegression) { recoverByNotice("unk-resp", true, true); }
 
 // Part A end to end: client 1's session id from the node's previous life is never handed to client 2 after the restart.
 TEST(GatewayUnknownSessionRegression, StaleIdNeverLandsInAnotherSessionRegression) {

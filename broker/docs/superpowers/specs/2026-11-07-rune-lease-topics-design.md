@@ -1608,9 +1608,10 @@ dropped the keepalive Ping of a session it no longer knew, and the client only r
 echoes `[int32 LE egressStreamId][declared egress channel]` (the Pong ignores it; a channel over 255 bytes sends the empty echo); an
 unknown-session Ping with that echo is answered `ErrorResponse{UnknownSession}` on the declared egress channel (a bounded 16-entry notice
 table keyed by channel and stream), so the client reconnects at once; the client also keeps route hints for partition-routed control ops.
-Limit: in response mode (`gatewayResponseControlPort != 0`) the notice publication does not connect to the client's surviving response
-subscription, so recovery there is by the response timeout (`GatewayUnknownSessionRegression.DISABLED_ResponseModeRestartedNodeAnswersRegression`;
-an issue is filed).
+In response mode (`gatewayResponseControlPort != 0`) no notice can reach the client: Aeron pins its response subscription to the old
+gateway's response publication. The client leaves the session itself when that publication's image closes (`ClientAgent::checkResponseEgress_`,
+as Aeron Cluster's client does), after the driver's image liveness timeout (`ClientConfig::aeronImageLivenessTimeoutNs`, Aeron's 10 s by
+default) and never at the response timeout (#989, `GatewayUnknownSessionRegression.ResponseModeClientLeavesARestartedNodeRegression`).
 Checkpoint E additions to L22: an ENCRYPTED session is covered by a probe (a restarted gateway holds no keys, so it cannot open the sealed
 keepalive and its notice is clear text, which the client drops for an encrypted session): right after each keepalive the client also sends
 a clear Ping with a fresh random negative nonce as its correlationId, and accepts a clear `UnknownSession` for that session only when it

@@ -435,6 +435,9 @@ struct ClientConfig {
     NanoClock  nanoClock  = nullptr;
     // Aeron client liveness: in Invoker mode doWork() must run at least this often.
     int64_t    aeronClientLivenessTimeoutNs = 10'000'000'000LL;
+    // #989: the embedded driver's image liveness timeout (0 = Aeron's 10 s): how soon a response-mode session sees its
+    // gateway's response publication die (and reconnects), when the gateway crashed without closing it.
+    int64_t    aeronImageLivenessTimeoutNs = 0;
     // T15 D1: run the embedded driver + Aeron conductor on the duty thread even in
     // RunnerMode::Thread (DriverMode::Invoker: no driver thread, no conductor
     // thread — the runner pumps both).  Default false: a plain Client keeps its
@@ -752,6 +755,8 @@ public:
     /// Fix round 5 (N4-I1) test hook: final-leg HandshakeFailed verdicts the agent applied.
     [[nodiscard]] uint64_t testHandshakeFinalLegFailures() const noexcept { return agent_.handshakeFinalLegFailures(); }
     [[nodiscard]] uint64_t testStaleSessionNotices() const noexcept { return agent_.staleSessionNotices(); }
+    /// #989: sessions resumed because their response pair's gateway publication closed.
+    [[nodiscard]] uint64_t testResponseEgressLosses() const noexcept { return agent_.responseEgressLosses(); }
     /// Test hook (duty-cycle thread only): the seed session's current broker session id (0 = none).
     [[nodiscard]] int64_t testSeedSessionId() const noexcept { return agent_.seedSession().machine.sessionId(); }
     [[nodiscard]] uint64_t testSeedStaleSessionLosses() const noexcept { return agent_.seedSession().machine.staleSessionLosses(); }

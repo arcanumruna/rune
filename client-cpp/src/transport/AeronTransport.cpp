@@ -617,6 +617,37 @@ bool AeronTransport::rePairSeedResponse(int32_t responsePort) noexcept {
     }
 }
 
+bool AeronTransport::responseEgressLost_(int32_t idx) noexcept {
+    if (idx < 0 || static_cast<std::size_t>(idx) >= subSlots_.size()) return false;
+    SubSlot& s = subSlots_[static_cast<std::size_t>(idx)];
+    if (s.kind != SubSlot::Kind::ResponsePair || s.state != SubSlot::State::Live) return false;
+    aeron::Subscription* sub = s.res.ready();
+    if (sub == nullptr) return false;
+    switch (s.egress) {
+        case SubSlot::Egress::AwaitImage:
+            if (sub->isConnected()) s.egress = SubSlot::Egress::Connected;
+            return false;
+        case SubSlot::Egress::Connected:
+            if (sub->isConnected()) return false;
+            s.egress = SubSlot::Egress::Lost;
+            return true;
+        case SubSlot::Egress::Lost:
+            return false;   // reported once, at the transition
+    }
+    return false;
+}
+
+bool AeronTransport::seedResponseEgressLost() noexcept {
+    if (!std::holds_alternative<SeedSteady>(seedPair_)) return false;
+    return responseEgressLost_(respSeedSlot_);
+}
+
+bool AeronTransport::responseEgressLost(PubHandle h) noexcept {
+    if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return false;
+    const auto* c = std::get_if<PubSlot::Correlated>(&pubSlots_[static_cast<std::size_t>(h)].mode);
+    return c != nullptr && responseEgressLost_(c->subSlot);
+}
+
 void AeronTransport::abandonSeedRePair_() noexcept {
     if (auto* rp = std::get_if<SeedRePairing>(&seedPair_)) {
         const int32_t sub = rp->subSlot;
@@ -796,11 +827,12 @@ int32_t AeronTransport::addSubSlot_(SubSlot::Kind kind, const std::string& chann
             s.kind     = kind;
             s.mdcRefs  = refs;
             s.state    = SubSlot::State::Live;
+            s.egress   = SubSlot::Egress::AwaitImage;   // #989: a reused slot starts a fresh pair
             return static_cast<int32_t>(i);
         }
         subSlots_.push_back(SubSlot{channel, streamId,
                                     Resolution<aeron::Subscription>{kResolveTimeoutNs, kResolveRetryNs},
-                                    nullptr, kind, refs, SubSlot::State::Live});
+                                    nullptr, kind, refs, SubSlot::State::Live, SubSlot::Egress::AwaitImage});
         return static_cast<int32_t>(subSlots_.size() - 1);
     } catch (...) {
         return -1;
@@ -1056,6 +1088,8 @@ void AeronTransport::startEmbeddedDriver() {
     static_assert(kMaxClientLivenessTimeoutNs <= INT64_MAX / 2);
     const auto livenessNs = static_cast<uint64_t>(cfg_.clientLivenessTimeoutNs);
     aeron_driver_context_set_client_liveness_timeout_ns(driverCtx_, livenessNs);
+    if (cfg_.imageLivenessTimeoutNs != 0)   // #989
+        aeron_driver_context_set_image_liveness_timeout_ns(driverCtx_, static_cast<uint64_t>(cfg_.imageLivenessTimeoutNs));
     if (aeron_driver_context_get_timer_interval_ns(driverCtx_) >= livenessNs) {
         aeron_driver_context_set_timer_interval_ns(driverCtx_, livenessNs / 10);
     }
