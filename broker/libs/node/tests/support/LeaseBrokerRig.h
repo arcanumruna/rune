@@ -115,6 +115,9 @@ public:
     const Topic&      bt() const noexcept { return bt_; }
     lbr::LeaseClaim   row(std::string_view key, uint64_t a = 0, std::string_view b = {}) const { return lbr::claimRow(key, a, b); }
 
+    /// The injected lease clock's current value (what every worker's lease clock reads).
+    int64_t leaseNowNs() const noexcept { return clock_.nowNs(); }
+
     /// Moves the injected lease clock of every worker; the broker's due Expire / Checkpoint work runs on its next doWork turns.
     void advance(std::chrono::milliseconds ms) { clock_.advance(&b_.node(), std::chrono::duration_cast<std::chrono::nanoseconds>(ms).count()); }
 

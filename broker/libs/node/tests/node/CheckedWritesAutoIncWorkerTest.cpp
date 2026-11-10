@@ -4,6 +4,7 @@
 #include "CheckedWritesRig.h"
 
 #include <rune/node/RcState.h>
+#include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/InMemoryLog.h>
 
 #include <spdlog/sinks/ringbuffer_sink.h>
@@ -955,4 +956,56 @@ TEST(CheckedWritesAutoIncCleanerRegression, LatestReservationInTheActiveSegmentS
     ASSERT_EQ(ids.size(), 1u);
     EXPECT_GT(ids[0], maxId) << "no id reuse";
     EXPECT_EQ(ids[0], before.back().second + 1) << "the counter resumes above the active reservation";
+}
+
+namespace {
+struct ControlFeed {
+    std::vector<int64_t> batchBases;
+    int dataBatches = 0;
+};
+void controlFeedBatch(void* c, const uint8_t*, std::size_t, int64_t base) noexcept { static_cast<ControlFeed*>(c)->batchBases.push_back(base); }
+void controlFeedData(void* c, const uint8_t*, std::size_t, int64_t) noexcept { ++static_cast<ControlFeed*>(c)->dataBatches; }
+}  // namespace
+
+// A transient lease topic is judged from a ring rebuild: the ring scan feeds the broker's control batches (constraint-set changes,
+// verdict markers) to the verdict hook exactly as the disk scan does, and only those (data batches reach dataBatch, never batch).
+// Mutation: remove the verdict_.batch feed from RcState::ringStep_ -> no control batch is seen, red.
+TEST(RcRingVerdictFeedRegression, ControlBatchesFedRegression) {
+    namespace cr = rune::storage::control_record;
+    rune::storage::InMemoryLog mem(1 << 20, 1000);
+    const auto appendData = [&](int32_t seq) {
+        auto b = producerBatch(9, seq);
+        int64_t base = 0;
+        ASSERT_GE(mem.appendNoSyncRestamp(b.data(), b.size(), 0, base), 0);
+    };
+    const auto appendControl = [&](const std::vector<uint8_t>& b) {
+        int64_t base = 0;
+        ASSERT_GE(mem.appendNoSyncRestamp(b.data(), b.size(), 0, base), 0);
+    };
+    std::vector<uint8_t> change(cr::changeBatchBytes(1));
+    const cr::ChangeMember member{.viewObjectId = 7, .kind = 1, .planFingerprint = 99};
+    ASSERT_EQ(cr::buildConstraintSetChange(change, 5, std::span<const cr::ChangeMember>(&member, 1)), change.size());
+    std::vector<uint8_t> marker(cr::markerBatchBytes(0));
+    ASSERT_EQ(cr::buildVerdictMarker(marker, cr::MarkerHeader{.fromOffset = 0, .finalThrough = 2, .constraintSetId = 5, .count = 0}, {}), marker.size());
+    appendData(0);
+    const int64_t changeAt = mem.logEndOffset();
+    appendControl(change);
+    appendData(1);
+    const int64_t markerAt = mem.logEndOffset();
+    appendControl(marker);
+    appendData(2);
+
+    ControlFeed feed;
+    RcState rc;
+    rc.reserve(8);
+    rc.reserveRingRebuild();
+    rc.setVerdictHooks(RcVerdictHooks{.batch = &controlFeedBatch, .ctx = &feed, .dataBatch = &controlFeedData});
+    RcFacts f;
+    f.leader = true; f.epoch = 1;
+    for (int i = 0; i < 64 && !rc.ready(); ++i) (void)rc.advance(f, nullptr, /*budget=*/1, &mem);
+    ASSERT_TRUE(rc.ready());
+    ASSERT_EQ(feed.batchBases.size(), 2u) << "exactly the two control batches reach batch()";
+    EXPECT_EQ(feed.batchBases[0], changeAt);
+    EXPECT_EQ(feed.batchBases[1], markerAt);
+    EXPECT_EQ(feed.dataBatches, 3);
 }

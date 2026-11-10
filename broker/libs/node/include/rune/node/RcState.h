@@ -1001,6 +1001,10 @@ private:
             if (out.outcome == rune::transaction::RcBuilder::Outcome::Invalid) [[unlikely]]
                 haltInvariant_("RcBuilder refused a whole batch of the ring (RC build)");
             if (psm_ != nullptr) feedProducerState_(r, out.outcome, v.data, v.len, /*markerFromRebuild=*/true);
+            // The ring scan feeds the broker's control batches (constraint-set changes, verdict markers) exactly as the disk scan does.
+            if (verdict_.batch != nullptr && out.outcome == rune::transaction::RcBuilder::Outcome::Ignored &&
+                (r.attributes() & kAttrControl) != 0 && r.producerId() < 0) [[unlikely]]
+                verdict_.batch(verdict_.ctx, v.data, v.len, r.baseOffset());
             if (verdict_.dataBatch != nullptr && r.producerId() >= 0 && (r.attributes() & kAttrControl) == 0) [[unlikely]]
                 verdict_.dataBatch(verdict_.ctx, v.data, v.len, r.baseOffset());
             bytes     += v.len;

@@ -255,6 +255,11 @@ inline void leaseAnchorMoveToTail(rune::view::ViewTable& t, LeaseAnchorList& l, 
     const int64_t head = leaseAnchorHead(t, s.anchors);
     return s.fence.present && s.fence.offset < head ? s.fence.offset : head;
 }
+/// The ring floor of a transient lease LEADER: the lease index's floor, held down to the latest constraint-set change (-1 = none) so the
+/// next leader still finds the set in the ring (on a disk log retention holds it; a ring evicts it like any record).
+[[nodiscard]] constexpr int64_t leaseLeaderFloor(int64_t anchorsFloor, int64_t lastChangeOffset) noexcept {
+    return lastChangeOffset >= 0 && lastChangeOffset < anchorsFloor ? lastChangeOffset : anchorsFloor;
+}
 /// Spec A.3 "When to carry": the ring bytes from the floor to the tail (`used`) exceed half the capacity and at least a quarter of the
 /// capacity is reclaimable (`used - liveBytes`).  cap 0 (no ring) never carries.
 [[nodiscard]] constexpr bool leaseShouldCarry(std::size_t used, uint64_t liveBytes, std::size_t cap) noexcept {

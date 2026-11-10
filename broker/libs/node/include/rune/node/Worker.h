@@ -7527,8 +7527,13 @@ private:
     // Part 04 (P4-1): the leadership scan of a disk partition with a write state feeds its verdict markers and constraint-set
     // changes into that state.
     // Part 06 (P6-7): an autoincrement partition's counter and side window are rebuilt by the same scan.
+    /// A replica that is judged (verdict feed, judge, lease index): every disk partition with a write state, and a transient LEASE
+    /// topic's partition.  SD9 still refuses every production constraint on a plain transient topic (#808), so those stay unjudged.
+    [[nodiscard]] static bool judgedReplica_(const rune::replication::PartitionReplica& r, const PartitionWriteState* w) noexcept {
+        return w != nullptr && (r.isDiskBacked() || (w->spec != nullptr && w->spec->lease && w->spec->leaseTransient));
+    }
     static void bindVerdictHooks_(RcSlot& slot) noexcept {
-        if (slot.write && slot.rc && slot.replica->isDiskBacked()) {
+        if (slot.rc && judgedReplica_(*slot.replica, slot.write.get())) {
             const bool autoInc = slot.write->spec->autoIncrement;
             slot.rc->setVerdictHooks(RcVerdictHooks{.begin = autoInc ? &autoIncFeedBegin : &verdictFeedBegin, .batch = &verdictFeedBatch, .ctx = slot.write.get(),
                                                     .dataBatch = autoInc ? &autoIncFeedDataBatch : nullptr,
@@ -7740,7 +7745,7 @@ private:
             const WorkerViewSet::LeaseIndexLookup lk = viewSet_->leaseIndexFor(topicId, partition, gen, true, hwConfirmed);
             const uint64_t epoch    = viewSet_->leaseRebuildEpoch(topicId, partition);
             // A transient lease leader holds every anchor and the fence: the ring floor is the index's, and evicts nothing until it is ready.
-            if (w->spec->leaseTransient) pushLeaseFloor_(replica, lk);
+            if (w->spec->leaseTransient) pushLeaseFloor_(replica, lk, *w);
             if (w->leaseRuntime && !w->leaseRuntime->sameIdentity(gen, epoch))
                 dropLeaseRuntime_(*w, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
             if (!w->leaseRuntime && lk.ready) {   // cold; the live keys at creation are armed by the promotion pass below, at this time (T_ready)
@@ -7808,7 +7813,8 @@ private:
                     work += static_cast<int>(carried);
                     noteLeaseAppended_(replica, w->leaseRuntime->lastBatchBytes());
                 }
-                pushLeaseFloor_(replica, lk);   // the appends above moved nothing, but the pass is the floor's refresh point
+                relogHeldConstraintSet_(replica, *w, lk);
+                pushLeaseFloor_(replica, lk, *w);   // the appends above moved nothing, but the pass is the floor's refresh point
             }
         }
         drainLeaseParks_();   // the folds, the clears and the demotions above queued their answers
@@ -7817,8 +7823,25 @@ private:
 
     /// Transient lease leader (A.3/A.6): the ring's eviction floor is the lease index's (min of the head anchor and the fence record);
     /// 0 = evict nothing while the index is not ready.  INT64_MAX (nothing anchored) means no lease floor.
-    void pushLeaseFloor_(rune::replication::PartitionReplica* replica, const WorkerViewSet::LeaseIndexLookup& lk) noexcept {
-        replica->setLeaseFloor(lk.ready && lk.ref.transient != nullptr && lk.ref.table != nullptr ? leaseTransientFloor(*lk.ref.table, *lk.ref.transient) : 0);
+    /// The latest constraint-set change is held too (leaseLeaderFloor): a ring evicts it like any record, after which the next leader
+    /// would find an empty timeline and never judge.
+    void pushLeaseFloor_(rune::replication::PartitionReplica* replica, const WorkerViewSet::LeaseIndexLookup& lk, const PartitionWriteState& w) noexcept {
+        replica->setLeaseFloor(lk.ready && lk.ref.transient != nullptr && lk.ref.table != nullptr
+                                   ? leaseLeaderFloor(leaseTransientFloor(*lk.ref.table, *lk.ref.transient),
+                                                      w.constraintSets.size() != 0 ? w.constraintSets.lastChangeOffset() : -1)
+                                   : 0);
+    }
+    /// The ring twin of verdictHousekeeping_'s re-log: when the latest constraint-set change is the oldest thing the ring holds and
+    /// the ring is half full of reclaimable bytes, the leader logs the set again (at most once per pass; a deferred request retries).
+    void relogHeldConstraintSet_(rune::replication::PartitionReplica* replica, PartitionWriteState& w, const WorkerViewSet::LeaseIndexLookup& lk) noexcept {
+        if (w.verdicts == nullptr || w.constraintSets.size() == 0 || w.constraintSets.latest().empty()) return;
+        if (replica->role() != rune::replication::Role::Leader || lk.ref.table == nullptr || lk.ref.transient == nullptr) return;
+        const RcState* rc = rcOf_(replica);
+        if (rc == nullptr || !rc->ready()) return;
+        const int64_t change = w.constraintSets.lastChangeOffset();
+        if (change < 0 || change >= leaseTransientFloor(*lk.ref.table, *lk.ref.transient)) return;   // something older is held: the change is safe
+        if (!leaseShouldCarry(replica->transientBytesFrom(change), lk.ref.transient->anchors.liveBytes, replica->transientCapacityBytes())) return;
+        (void)w.verdicts->requestChange(w.constraintSets.latest(), true);   // kChangeDeferred: retried next pass
     }
 
     /// The byte cap of one lease batch: the reserve, narrowed by the namespace's and the intake's batch limits (and the test seam).
@@ -8227,10 +8250,12 @@ private:
                       SourceLogBounds bounds = {}) {
         int work = 0;
         PartitionWriteState* write = writeOf_(replica);
-        // A judge lives only on a disk-backed replica (#808): SD9 refuses every production constraint on a transient topic, and the
-        // ring has no verdict feed, so a judge there would build its timeline from local requests alone and fail open.
-        VerdictSource* judge = (write != nullptr && replica->isDiskBacked()) ? viewSet_->ensureVerdictSource(topicId, partition, *write) : nullptr;
-        if (judge != nullptr) judge->bindLeader(replica, leaderGen, replica->log()->logStartOffset());
+        // A judge lives on a disk-backed replica and on a transient LEASE topic's ring (#808): SD9 refuses every production constraint on
+        // a plain transient topic, so a judge there would build its timeline from local requests alone and fail open.  The ring scan
+        // feeds the lease topic's control batches (RcState::ringStep_), so its timeline is rebuilt like a disk one.
+        VerdictSource* judge = judgedReplica_(*replica, write) ? viewSet_->ensureVerdictSource(topicId, partition, *write) : nullptr;
+        if (judge != nullptr)
+            judge->bindLeader(replica, leaderGen, replica->isDiskBacked() ? replica->log()->logStartOffset() : replica->memoryLog()->logStartOffset());
         TransientBounds tb;
         const TransientBounds* tbp = nullptr;
         if (transientRep != nullptr) {
@@ -8377,7 +8402,10 @@ private:
             spdlog::error("rejected index disagrees with the log: {} mismatches (topic {} partition {})", mismatches, sl.replica->topicId(), sl.replica->partitionId());
             w.mismatchesLogged = mismatches;
         }
-        if (!sl.replica->isDiskBacked()) return;
+        if (!sl.replica->isDiskBacked()) {
+            if (judgedReplica_(*sl.replica, &w)) w.rejected.dropBelow(sl.replica->memoryLog()->logStartOffset());   // a transient lease topic's ring evicted them
+            return;
+        }
         rune::storage::Log& log = *sl.replica->log();
         w.rejected.dropBelow(log.logStartOffset());
         // The latest committed set change outlives retention: a restart without it finds no verdict source.  So does the change
@@ -9741,11 +9769,20 @@ private:
             if (ws.verdicts != nullptr) ++ws.verdicts->statsMut().leaseAckReadFailures;
             return VerdictFill::TooMany;
         };
-        rune::storage::Log* log = rep.log();
-        if (log == nullptr) [[unlikely]] return fail();
-        rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
-        const rune::storage::LogReadView v = readNoFault_(log, base, pushScratch_.size(), entry.lastOffset + 1, st);
-        if (st != rune::storage::ReadIntoStatus::Ok) [[unlikely]] return fail();
+        // The stored batch: a disk log is read into the push scratch; a transient lease topic's ring is read in place (same thread).
+        rune::storage::LogReadView v;
+        if (rep.isDiskBacked()) {
+            rune::storage::Log* log = rep.log();
+            if (log == nullptr) [[unlikely]] return fail();
+            rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
+            v = readNoFault_(log, base, pushScratch_.size(), entry.lastOffset + 1, st);
+            if (st != rune::storage::ReadIntoStatus::Ok) [[unlikely]] return fail();
+        } else {
+            rune::storage::InMemoryLog* mem = rep.memoryLog();
+            if (mem == nullptr) [[unlikely]] return fail();
+            v = mem->readView(base, static_cast<int32_t>(std::min<std::size_t>(pushScratch_.size(), kPushMaxChunkBytes)));
+            if (v.empty()) [[unlikely]] return fail();
+        }
         const LeaseIndexRef ix = viewSet_ != nullptr
             ? viewSet_->leaseIndexFor(rep.topicId(), rep.partitionId(), rep.leadershipGeneration(),
                                       rep.role() == rune::replication::Role::Leader,

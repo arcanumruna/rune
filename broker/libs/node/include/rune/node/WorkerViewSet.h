@@ -335,7 +335,7 @@ public:
                 // ASSIGNED, not max'ed: a leader never truncates within its leadership, and everything appended before this activation
                 // is <= LEO - 1, so a value left by an earlier leadership (an untracked update at 100, a demote, a truncation to 80,
                 // a re-promotion) must not outlive it: it would hold readiness false until unrelated records push the judge past 100.
-                if (write->spec->lease && judge->activationPending()) write->leaseUntrackedThrough = b.logEnd - 1;
+                if (write->spec->lease && judge->activationPending()) write->leaseUntrackedThrough = (transientSrc != nullptr ? transientSrc->logEnd : b.logEnd) - 1;   // a ring's end is its TransientBounds, `b` is the disk log's
                 if (judge->activationPending()) rebuildKeyIndex_(srcTopicId, partition, *judge, *write->spec, leaderGen);
                 work += judge->driveJudge(readRange, bound, nowNs, *write, skip.aborted);
                 viewBound = std::min(bound, judge->judgedThrough());

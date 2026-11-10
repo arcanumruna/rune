@@ -564,6 +564,19 @@ TEST(LeaseCarryEmitRegression, ThresholdsRegression) {
     EXPECT_FALSE(leaseShouldCarry(0, 0, cap));
 }
 
+// A transient lease leader keeps the latest constraint-set change in its ring: the ring floor is the lease index's, held down to the
+// change.  Without it the change is evicted like any record and the next leader never judges.
+// Mutation: leaseLeaderFloor returns anchorsFloor unchanged -> the first expectation is red.
+TEST(LeaseCarryEmitRegression, ConstraintChangeHeldRegression) {
+    EXPECT_EQ(leaseLeaderFloor(500, 40), 40) << "the change is older than every anchor: it is held";
+    EXPECT_EQ(leaseLeaderFloor(INT64_MAX, 40), 40) << "nothing anchored: the change alone is the floor";
+    EXPECT_EQ(leaseLeaderFloor(30, 40), 30) << "an older anchor already holds the ring below the change";
+    EXPECT_EQ(leaseLeaderFloor(40, 40), 40);
+    EXPECT_EQ(leaseLeaderFloor(500, -1), 500) << "no change logged: the index floor alone";
+    EXPECT_EQ(leaseLeaderFloor(INT64_MAX, -1), INT64_MAX) << "no change, nothing anchored: no floor";
+    EXPECT_EQ(leaseLeaderFloor(500, 0), 0) << "a change at offset 0 is a real offset";
+}
+
 TEST(LeaseCarryEmitRegression, CarriesHeadKeysRegression) {
     FRig r;
     r.makeRuntime();
