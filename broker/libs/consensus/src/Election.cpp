@@ -479,6 +479,12 @@ int Election::nominate(int64_t nowNs)
 int Election::candidateBallot(int64_t nowNs)
 {
     int workCount = 0;
+    // As in nominate(): a hold or withdrawal engaged during the ballot never leads.  As on a timeout without quorum,
+    // the raised candidate term stays durable: RequestVotes at it are denied, a later nomination proposes a higher one.
+    if (candidacyBlocks_(nowNs, 0)) {
+        state(ElectionState::Canvass, nowNs, "candidacy blocked during the ballot");
+        return 1;
+    }
     // CRITICAL-R3: re-evaluate our own vote — knowledge learned from a peer
     // during the ballot may admit (or exclude) us.
     gateSelfVote_();
