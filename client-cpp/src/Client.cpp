@@ -50,7 +50,6 @@
 #include <fstream>
 #include <iterator>
 #include <random>
-#include <atomic>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -1356,15 +1355,6 @@ bool routeOfFrame(OpKind op, const uint8_t* b, std::size_t n, int32_t& topic, in
     default: return false;
     }
 }
-inline uint64_t bumpRelaxed(uint64_t& c) noexcept {
-    std::atomic_ref<uint64_t> r(c);
-    const uint64_t v = r.load(std::memory_order_relaxed) + 1;   // single writer (the duty thread)
-    r.store(v, std::memory_order_relaxed);
-    return v;
-}
-inline uint64_t loadRelaxed(const uint64_t& c) noexcept {
-    return std::atomic_ref<uint64_t>(const_cast<uint64_t&>(c)).load(std::memory_order_relaxed);   // libc++ has no atomic_ref<const T>::load
-}
 }  // namespace
 
 std::size_t Client::routeSlot_(int32_t topic, int32_t partition) noexcept {
@@ -1378,7 +1368,7 @@ void Client::forgetRouteHint_(const RoutedCtlPending& d) noexcept {
     h.topic = -1;
     h.partition = -1;
     h.endpoint.clear();
-    bumpRelaxed(routeHintCleared_);
+    ++routeHintCleared_;
 }
 void Client::learnRouteHint_(const RoutedCtlPending& d) {
     if (d.routeTopic < 0 || d.endpoint.empty()) return;
@@ -1386,12 +1376,12 @@ void Client::learnRouteHint_(const RoutedCtlPending& d) {
     h.topic = d.routeTopic;
     h.partition = d.routePartition;
     h.endpoint.assign(d.endpoint);   // capacity reserved at construction: no allocation for an endpoint within it
-    bumpRelaxed(routeHintLearned_);
+    ++routeHintLearned_;
 }
-uint64_t Client::routeHintHits() const noexcept { return loadRelaxed(routeHintHits_); }
-uint64_t Client::routeHintLearned() const noexcept { return loadRelaxed(routeHintLearned_); }
-uint64_t Client::routeHintCleared() const noexcept { return loadRelaxed(routeHintCleared_); }
-uint64_t Client::ctlRedirectsFollowed() const noexcept { return loadRelaxed(ctlRedirectsFollowed_); }
+uint64_t Client::routeHintHits() const noexcept { return routeHintHits_; }
+uint64_t Client::routeHintLearned() const noexcept { return routeHintLearned_; }
+uint64_t Client::routeHintCleared() const noexcept { return routeHintCleared_; }
+uint64_t Client::ctlRedirectsFollowed() const noexcept { return ctlRedirectsFollowed_; }
 
 OpResult Client::issueControl_(OpKind op, CompletionTarget target, Token token,
                                std::span<const uint8_t> wireFrame, uint32_t payloadHint, uint32_t requestIdAt,
@@ -2186,7 +2176,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             if (hint.topic == d.routeTopic && hint.partition == d.routePartition && !hint.endpoint.empty()) {
                 d.endpoint.assign(hint.endpoint);   // starts on the remembered leader, not the seed
                 d.hinted = true;
-                bumpRelaxed(routeHintHits_);
+                ++routeHintHits_;
             }
         } else {
             d.routeTopic = -1;
@@ -2450,7 +2440,7 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view message, int64_t now
     }
     // The leader's own session (the seed never moves for a DDL: it carries the
     // data ops / subscriptions); the same frame, so the same requestId.
-    bumpRelaxed(ctlRedirectsFollowed_);
+    ++ctlRedirectsFollowed_;
     forgetRouteHint_(d);   // the node it was sent to (a remembered one included) is not the leader any more
     d.hinted = false;
     d.endpoint = toChannel(std::string(endpoint));

@@ -2393,7 +2393,7 @@ private:
     std::vector<std::vector<uint8_t>> framePool_;      // Task 14a: recycled RoutedCtlPending frames (zero-alloc routed ops)
     std::vector<std::string>          endpointPool_;   // L22 fix 2: recycled RoutedCtlPending endpoints (capacity reserved)
     std::array<RouteHint, kRouteHintSlots> routeHints_;
-    uint64_t routeHintHits_ = 0, routeHintLearned_ = 0, routeHintCleared_ = 0, ctlRedirectsFollowed_ = 0;   // duty thread writes (atomic_ref)
+    uint64_t routeHintHits_ = 0, routeHintLearned_ = 0, routeHintCleared_ = 0, ctlRedirectsFollowed_ = 0;   // duty thread writes; diagnostics like routedBrokerSweeps_
     [[nodiscard]] static std::size_t routeSlot_(int32_t topic, int32_t partition) noexcept;
     /// Forget the hint d.endpoint was taken from / learned (only while it still names d.endpoint).
     void forgetRouteHint_(const RoutedCtlPending& d) noexcept;

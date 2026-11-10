@@ -16,7 +16,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -1541,11 +1540,19 @@ TEST(LeaseSessionRegression, ThreadModeBindAfterAddRegression) {
     auto cfg = invokerCfg(5933, 5934);
     cfg.runnerMode = rc::RunnerMode::Thread;
     cfg.nanoClock  = nullptr;   // the real clock: the runner thread must not read the test's fake one
-    struct Pump {   // the stub broker runs on its own thread; nothing else touches it until it is joined
-        std::atomic<bool> stop{false};
-        std::thread       t;
-        ~Pump() { stop = true; if (t.joinable()) t.join(); }
+    struct Pump {   // the stub broker runs on its own thread; nothing else touches it until it is joined.  Stopped through a pipe.
+        int         stop[2] = {-1, -1};
+        std::thread t;
+        void release() {
+            if (stop[1] >= 0 && t.joinable()) { const char b = 0; (void)!::write(stop[1], &b, 1); }
+            if (t.joinable()) t.join();
+        }
+        ~Pump() {
+            release();
+            for (int fd : stop) if (fd >= 0) ::close(fd);
+        }
     } pump;
+    ASSERT_EQ(::pipe(pump.stop), 0);
     rc::Client client(cfg);   // the client first: it owns the media driver the stub broker attaches to
     std::unique_ptr<test_support::InvokerGateway> gw = std::make_unique<test_support::InvokerGateway>(
         cfg.dataDir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId, cfg.egressChannel, cfg.egressStreamId);
@@ -1569,7 +1576,8 @@ TEST(LeaseSessionRegression, ThreadModeBindAfterAddRegression) {
     }();
     const auto wallEnd = std::chrono::steady_clock::now() + std::chrono::seconds(20);   // the pump's own hard cap
     pump.t = std::thread([&] {
-        while (!pump.stop.load() && std::chrono::steady_clock::now() < wallEnd) gw->pump();
+        pollfd pfd{pump.stop[0], POLLIN, 0};
+        while (::poll(&pfd, 1, 0) == 0 && std::chrono::steady_clock::now() < wallEnd) gw->pump();
     });
     {
         client.connectAndWait(std::chrono::seconds(10));
@@ -1607,8 +1615,7 @@ TEST(LeaseSessionRegression, ThreadModeBindAfterAddRegression) {
             EXPECT_TRUE(cb.lost.empty());
         }
     }
-    pump.stop = true;
-    pump.t.join();
+    pump.release();
     EXPECT_FALSE(gw->produceFrameBytes.empty()) << "the guarded producer's record reached the broker";
 }
 
