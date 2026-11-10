@@ -99,6 +99,7 @@ struct Rig {
     rune::codec::Descriptor src = tagSource();
     Log log;
     PartitionWriteState st;
+    TxnOverlayPool pool;
     VerdictSource vs{5, 0};
     std::unique_ptr<ViewInstance> index;
     std::unique_ptr<ViewInstance> reject;
@@ -107,6 +108,7 @@ struct Rig {
 
     explicit Rig(bool withIndex = true) {
         set.id = 1;
+        vs.bindTxn(&pool, {}, 0);   // replay folds against the pool's supersede keys; production always binds one
         if (!withIndex) return;
         index = std::make_unique<ViewInstance>(keyIndexPlan(5, src.find("id")->id), keyIndexRowLayout(), src, false, 0, 4096, kKeyIndexChunkBytes);
         vs.addVerdictView(index.get(), VerdictViewKind::KeyIndex, 0, kKeyIndexPlanFingerprint);

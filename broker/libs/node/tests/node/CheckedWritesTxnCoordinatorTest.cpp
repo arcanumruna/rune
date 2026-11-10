@@ -168,8 +168,9 @@ protected:
         (void)svc_->doWork(now_);
         EXPECT_EQ(answers_.frames.size(), 1u);
         const auto r = pc::AddPartitionsToTxnResponse::decode(answers_.frames.back().data(), answers_.frames.back().size());
+        const int16_t code = r && r->results.size() > 0 ? r->results[0].errorCode : int16_t{-1};   // r views the frame
         answers_.frames.clear();
-        return r && r->results.size() > 0 ? r->results[0].errorCode : int16_t{-1};
+        return code;
     }
 
     std::size_t endTxn(const std::string& txn, int64_t pid, int16_t epoch, bool commit) {

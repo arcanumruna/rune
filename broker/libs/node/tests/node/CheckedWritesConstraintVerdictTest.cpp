@@ -135,6 +135,7 @@ struct Rig {
     ql::TopicDef                   topic;
     Log                            log;
     PartitionWriteState            st;
+    TxnOverlayPool                 pool;
     VerdictSource                  vs{kSrc, 0};
     std::vector<std::unique_ptr<Mem>> mems;
     std::unique_ptr<ViewInstance>  index;
@@ -147,6 +148,7 @@ struct Rig {
         topic = std::get<ql::TopicDef>(*parsed);
         src   = ql::toDescriptor(topic);
         set.id = 1;
+        vs.bindTxn(&pool, {}, 0);   // replay folds against the pool's supersede keys; production always binds one
     }
     void keyIndex() {
         index = std::make_unique<ViewInstance>(keyIndexPlan(kSrc, src.find(topic.keyField.c_str())->id), keyIndexRowLayout(), src, false, 0, 4096, kKeyIndexChunkBytes);

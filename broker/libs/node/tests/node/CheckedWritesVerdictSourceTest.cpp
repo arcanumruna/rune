@@ -118,6 +118,7 @@ struct Member {
 struct Rig {
     Log log;
     PartitionWriteState st;
+    TxnOverlayPool pool;
     VerdictSource vs{5, 0};
     std::vector<std::unique_ptr<Member>> members;
 
@@ -127,6 +128,7 @@ struct Rig {
         return *members.back();
     }
     void start() {
+        vs.bindTxn(&pool, {}, 0);   // replay folds against the pool's supersede keys; production always binds one
         vs.bindState(&st);
         vs.bindLeader(nullptr, 1, 0);
     }
@@ -997,7 +999,9 @@ TEST(CheckedWritesVerdictSourceRegression, RebuildAcrossACompactionGapBeforeTheM
     verdictOnHw(st, log.logEndOffset());
     ASSERT_EQ(st.rejected.coveredThrough(), 3);
 
+    TxnOverlayPool pool;
     VerdictSource vs{5, 0};
+    vs.bindTxn(&pool, {}, 0);
     vs.installTestVerdictViewForTest(x.inst.get(), x.objectId, x.rule);
     vs.bindState(&st);
     vs.bindLeader(nullptr, 1, log.logStartOffset());
@@ -1074,7 +1078,9 @@ void catchUpAcrossTheGapAtTheBound(const char* name, bool markerAboveHw) {
     ASSERT_EQ(st.markers.committedThrough(), 3);
     ASSERT_EQ(st.rejected.coveredThrough(), K);
 
+    TxnOverlayPool pool;
     VerdictSource vs{5, 0};
+    vs.bindTxn(&pool, {}, 0);
     vs.installTestVerdictViewForTest(x.inst.get(), x.objectId, x.rule);
     vs.bindState(&st);
     vs.bindLeader(nullptr, 1, log.logStartOffset());
