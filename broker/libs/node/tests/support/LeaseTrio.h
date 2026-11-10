@@ -12,6 +12,7 @@
 #include <rune/client/lease/LeaseTopic.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
+#include <rune/node/Worker.h>
 #include <rune/protocol/LeaseSpec.h>
 
 #include <algorithm>
@@ -52,6 +53,21 @@ public:
     using Client = rune::client::Client;
     using Lt     = rune::client::LeaseTopic<rune::gen::LeaseClaim>;
     struct Topic { int32_t id = -1; int32_t partitions = 0; std::string name; };
+    /// What node `id`'s worker shows for (topic, partition): the lease runtime's fence, the ring's start / end and the carry count.
+    struct RuntimeSnap {
+        bool    has        = false;   ///< the node owns the partition and has a lease runtime
+        uint8_t fence      = 0;       ///< FenceState code (3 = Open, 2 = Fencing)
+        int64_t readyNs    = 0;
+        int64_t deadlineNs = 0;       ///< the Fencing deadline (0 when not Fencing)
+        uint64_t carried   = 0;       ///< Carry records appended
+        bool    hasRing    = false;
+        int64_t ringStart  = -1;      ///< memoryLog()->logStartOffset()
+        int64_t ringEnd    = -1;      ///< memoryLog()->logEndOffset()
+        uint64_t liveBytes = 0;       ///< live bytes of the lease anchor list (0: no index)
+        uint64_t usedBytes = 0;       ///< ring bytes held (wrap padding included)
+        uint64_t capBytes  = 0;       ///< the ring's capacity
+        uint64_t resets    = 0;       ///< follower ring resets to the leader's start (PartitionReplica::transientLogResetsForTest)
+    };
 
     explicit LeaseTrio(const std::string& tag, std::function<void(NodeConfig&)> tweak = {})
         : c_(catalog_cluster::ThreeNodes::startWith(tag, [t = std::move(tweak)](NodeConfig& cfg) { if (t) t(cfg); })) {
@@ -95,6 +111,58 @@ public:
         if (!catalog_cluster::awaitLeaders(c_, t.id, t.partitions, leaders, 60s)) throw std::runtime_error("no partition leaders for " + name);
         return t;
     }
+    /// A TRANSIENT lease topic of replication factor 3 (the ring is the log; an explicit max_ttl is required).
+    Topic defineTransientLease(const std::string& name, uint32_t partitions, uint32_t ttlMs, uint32_t minMs, uint32_t maxMs) {
+        rune::client::TopicOptions to;
+        to.replicationFactor = 3;
+        rune::protocol::LeaseSpec s{};
+        s.ttlMs = ttlMs;
+        s.minTtlMs = minMs;
+        s.maxTtlMs = maxMs;
+        s.maxKeys = 100'000;
+        s.expiryBatch = 64;
+        s.checkpoint = 0;
+        s.checkpointIntervalMs = 1000;
+        s.checkpointRate = 1000;
+        to.lease = s;
+        to.config.cleanupPolicy = 1;
+        const auto r = client().defineTopicAndWait(name, partitions, "claim", lt3::claimBlob(), rune::client::Persistence::Transient, to, {}, 90s);
+        if (r.errorCode != 0) throw std::runtime_error("define transient lease " + name + ": " + r.detail);
+        Topic t{r.topicId, static_cast<int32_t>(partitions), name};
+        std::vector<int32_t> leaders;
+        if (!catalog_cluster::awaitLeaders(c_, t.id, t.partitions, leaders, 60s)) throw std::runtime_error("no partition leaders for " + name);
+        return t;
+    }
+    /// The lease runtime / ring of (topic, partition) on running node `nodeId`, read on its worker thread (has == false: not owned there).
+    RuntimeSnap runtimeOn(int32_t nodeId, int32_t topicId, int32_t partition) {
+        BrokerNode& n = c_.node(nodeId);
+        for (int32_t w = 0; w < n.workerCountForTest(); ++w) {
+            const RuntimeSnap s = n.onWorkerThreadForTest(w, [topicId, partition](rune::node::Worker& wk) {
+                RuntimeSnap r;
+                const auto* rt = wk.leaseRuntimeForTest(topicId, partition);
+                if (const auto* rep = wk.findOwnedReplicaForTest(topicId, partition); rep != nullptr && rep->memoryLog() != nullptr) {
+                    const auto* mem = rep->memoryLog();
+                    r.hasRing   = true;
+                    r.ringStart = mem->logStartOffset();
+                    r.ringEnd   = mem->logEndOffset();
+                    r.usedBytes = mem->bytesFrom(0);
+                    r.capBytes  = rep->transientCapacityBytes();
+                    r.resets    = rep->transientLogResetsForTest();
+                }
+                r.liveBytes = wk.leaseTransientLiveBytesForTest(topicId, partition);
+                if (rt == nullptr) return r;
+                r.has     = true;
+                r.fence   = rt->fenceStateCode();
+                r.readyNs = rt->readyNs();
+                if (const auto* f = std::get_if<rune::node::lease::LeaseRuntime::FenceFencing>(&rt->fenceState())) r.deadlineNs = f->deadlineNs;
+                r.carried = rt->stats().carried;
+                return r;
+            });
+            if (s.has || s.hasRing) return s;
+        }
+        return {};
+    }
+
     /// Opens the topic; the client's catalog view may trail the DDL for a moment ("does not exist" / "generated type is stale"): bounded retries.
     Lt open(const Topic& t) {
         const auto end = lt3::Clock::now() + 90s;

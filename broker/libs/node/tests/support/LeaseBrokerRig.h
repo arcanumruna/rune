@@ -17,6 +17,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -68,8 +69,9 @@ public:
     using Client = rune::client::Client;
     struct Topic { int32_t id = -1; int32_t partitions = 0; };
 
-    explicit LeaseBrokerRig(const std::string& tag, uint32_t ttlMs = 60'000, uint32_t minMs = 1000, uint32_t maxMs = 600'000)
-        : b_(tag, opts_()) {
+    explicit LeaseBrokerRig(const std::string& tag, uint32_t ttlMs = 60'000, uint32_t minMs = 1000, uint32_t maxMs = 600'000,
+                             std::function<void(NodeConfig&)> configure = {})
+        : b_(tag, opts_(std::move(configure))) {
         b_.beforeStartForTest = [this](BrokerNode&) {};
         b_.bootstrapAdmin(lbr::kAdminPw);
         admin_ = connect_("admin", lbr::kAdminPw);
@@ -160,9 +162,10 @@ public:
     int32_t viewId() const noexcept { return viewId_; }
 
 private:
-    static AuthBroker::Options opts_() {
+    static AuthBroker::Options opts_(std::function<void(NodeConfig&)> configure) {
         AuthBroker::Options o;
         o.shard = true;
+        o.configure = std::move(configure);
         return o;
     }
     std::unique_ptr<Client> connect_(const std::string& user, const std::string& pw, int32_t announce = 0) {

@@ -4293,6 +4293,7 @@ private:
             // Parked: partition moved away (E2: the source is resolved below).  Issue #109: an ended one still owes
             // its terminal frame (its egress is the session's, not the partition's).
             if (!s.active && s.pushState != WorkerSubscription::PushState::EndOwed) continue;
+            if (s.topicId == pushHoldTopicForTest_) [[unlikely]] continue;   // test seam: a held (slow) reader; nothing else changes
 
             // Hybrid egress: prefer this consumer's UNICAST pub (independent
             // per-consumer offsets); fall back to the shared MDC pub (broadcast).
@@ -6721,6 +6722,9 @@ public:
     [[nodiscard]] uint64_t transientFullRefusalsForTest() const noexcept { return transientFullRefusals_; }
     [[nodiscard]] uint64_t transientCursorSkipsForTest() const noexcept { return transientCursorSkips_; }
     [[nodiscard]] uint64_t leaseRingEndsForTest() const noexcept { return leaseRingEnds_; }
+    /// Test seam (a slow reader): the push pass skips every subscription of `topicId` (-1 = none, the default) without reading, so
+    /// its cursor stays where it is while the ring moves on.
+    void holdPushForTest(int32_t topicId) noexcept { pushHoldTopicForTest_ = topicId; }
     [[nodiscard]] uint64_t transientRecordsSkippedForTest() const noexcept { return transientRecordsSkipped_; }
     /// M2: fresh cursors (a subscribe below the ring start) raised to it — not lag.
     [[nodiscard]] uint64_t transientFreshCursorsRaisedForTest() const noexcept { return transientFreshCursorsRaised_; }
@@ -6893,6 +6897,7 @@ private:
     std::unique_ptr<LeaseHookWork> leaseHookWork_;   // lease topics: the produce hook's work area (allocated once, cold)
     uint64_t leaseDutyLookups_ = 0;   // lookups leaseDuty_ made (test observability of the idle skip)
     std::unique_ptr<lease::LeaseEmitWork> leaseEmitWork_;   // lease topics Task 10: the Expire batch under construction (allocated once, cold)
+    int32_t pushHoldTopicForTest_ = -1;                      // test seam: the topic whose subscriptions the push pass skips (-1: none)
     std::size_t leaseBatchCapOverrideForTest_ = 0;           // test seam: a lease batch's byte cap (0: none)
     // Lease topics Task 11a: the keepalives parked until the log catches up (allocated once in the ctor, cold), the leader
     // heartbeat timeout a promoted key is granted on top of its remaining time (BrokerNode: setLeaseExtendNs), and the decided

@@ -1986,6 +1986,7 @@ if(BUILD_TESTING)
                        tests/client/LeaseMatrixTest.cpp
                        tests/client/LeaseNamespaceTest.cpp
                        tests/client/LeaseLineageBrokerTest.cpp
+                       tests/client/LeaseTransientTest.cpp
                        tests/client/LeaseTrioTest.cpp
                        tests/client/LeaseRouteHintTest.cpp
                        tests/client/LeaseRecipeBrokerTest.cpp
