@@ -2350,6 +2350,41 @@ TEST(CheckedWritesTxnJudgeRegression, SourceWhoseLockClearedTakesTheSetFromAPark
     EXPECT_FALSE(b.indexed(5)) << "O_B's delete applies after T1's insert";
 }
 
+// The same through a lookup park: B's O_B waits for T1's marker past the HW, A takes the set and waits for T0's.  T1's marker moves B's
+// HW past where its lookup scanned, so B takes the set back.  RED (a sticky "last parked" bit): the I1 cycle.
+TEST(CheckedWritesTxnJudgeRegression, SourceWhoseLookupResolvedTakesTheSetFromAParkedHolderRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    b.log.data({del(5)}, 56);                     // 10, O_B
+    b.log.data({{5, 1, false, kInsert}}, 67);     // 11, T1
+    b.log.judge(67, 11);                          // 12
+    b.log.marker(56, true);                       // 13
+    for (int i = 0; i < 8 && !(a.pool.oneStepHeld() && a.pool.oneStepClaimable()); ++i) b.drive();
+    ASSERT_EQ(b.vs.judgeCursor(), 13) << "O_B waits for T1's marker";
+    a.log.data({del(4)}, 55);                     // 10, O_A
+    a.log.data({{4, 1, false, kInsert}}, 66);     // 11, T0
+    a.log.judge(66, 11);                          // 12
+    a.log.marker(55, true);                       // 13
+    const uint64_t claims = a.pool.oneStepClaimsForTest();
+    for (int i = 0; i < 4 && a.vs.judgeCursor() < 13; ++i) a.drive();
+    a.drive();
+    ASSERT_EQ(a.vs.judgeCursor(), 13) << "O_A waits for T0's marker";
+    ASSERT_GT(a.pool.oneStepClaimsForTest(), claims) << "A took the set from the parked B";
+    b.log.data({{60, 1, false, kInsert}}, 66);    // 14, T0
+    b.log.judge(66, 14);                          // 15
+    b.log.marker(67, true);                       // 16: decides B's lookup
+    for (int i = 0; i < 16 && (b.st.txn.find(66) == nullptr || !b.st.txn.find(66)->judged); ++i) {
+        b.drive();
+        a.drive();
+    }
+    ASSERT_NE(b.st.txn.find(66), nullptr);
+    EXPECT_TRUE(b.st.txn.find(66)->judged) << "B applied O_B and judged T0";
+    EXPECT_TRUE(b.indexed(5)) << "T1's insert supersedes O_B's delete";
+}
+
 // I3: accepted(r), an ordinary transaction committed below J.
 TEST(CheckedWritesTxnJudge, OrdinaryCommittedBelowJConflicts) {
     JudgeRig r(VoteMembers{100});
