@@ -174,7 +174,6 @@ bool roundTrip(Transport& t, int32_t stream) {
         t.dutyCycle();
         t.offerOn(h, payload, sizeof payload);
         t.poll([&](const uint8_t*, std::size_t n) { got = got || n == sizeof payload; }, 10);
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     return got;
 }

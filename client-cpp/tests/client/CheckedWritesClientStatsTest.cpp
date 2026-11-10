@@ -8,11 +8,11 @@
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <poll.h>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -261,11 +261,17 @@ TEST(CheckedWritesClientStats, BlockingFormReportsBrokerTooOldAsAStatus) {
     r.gw.advertisedBrokerVersion = rpc::kBrokerVersionCheckedWrites - 1;
     r.connect();
     rc::StatsResult res;
-    std::atomic<bool> done{false};
-    // The blocking form pumps the client itself; the fake gateway must keep running beside it.
-    std::thread pump([&] { while (!done) r.gw.pump(); });
+    int done[2];
+    ASSERT_EQ(::pipe(done), 0);
+    // The blocking form pumps the client itself; the fake gateway must keep running beside it, until the pipe says it returned.
+    std::thread pump([&] {
+        pollfd p{done[0], POLLIN, 0};
+        while (::poll(&p, 1, 0) == 0) r.gw.pump();
+    });
     res = r.client->getStatsAndWait(rpc::StatsScope::TopicPartition, 3, 0, std::chrono::seconds(5));
-    done = true;
+    (void)!::write(done[1], "x", 1);
     pump.join();
+    ::close(done[0]);
+    ::close(done[1]);
     EXPECT_EQ(res.status, rc::StatsResult::kBrokerTooOld);
 }

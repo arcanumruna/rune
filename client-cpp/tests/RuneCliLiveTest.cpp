@@ -514,21 +514,14 @@ TEST(CliLive, AeronDirFlagAttachesToARunningDriver) {
     gw.getTopicId   = 0x40000001;
     gw.getVersion   = 1;
     gw.getErrorCode = static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic);
-    gw.start();
 
-    std::ostringstream out, err;
-    int rc = -1;
-    auto fut = std::async(std::launch::async, [&] {
-        rc = rune::cli::run({"schema", "get", "characters", "--cli-data-dir", cliDir, "--cli-aeron-dir", driverDir + "/aeron",
-                             "--cli-stream-in", std::to_string(kIn), "--cli-stream-out", std::to_string(kOut)}, out, err);
-    });
-    for (const auto deadline = std::chrono::steady_clock::now() + kCliTimeout;
-         fut.wait_for(kPollSleep) != std::future_status::ready && std::chrono::steady_clock::now() < deadline; )
-        gw.poll(16);
-    fut.wait();
+    const CliRunResult res = runCli(gw, driverDir + "/aeron",
+                                    {"schema", "get", "characters", "--cli-data-dir", cliDir, "--cli-aeron-dir", driverDir + "/aeron",
+                                     "--cli-stream-in", std::to_string(kIn), "--cli-stream-out", std::to_string(kOut)},
+                                    0ms);   // the driver is already running
 
-    EXPECT_EQ(gw.getsSeen.load(), 1) << "the CLI reached the gateway through the running driver; err=" << err.str();
-    EXPECT_EQ(rc, static_cast<int>(rpc::ErrorCode::UnknownTopic)) << err.str();
+    EXPECT_EQ(gw.getsSeen.load(), 1) << "the CLI reached the gateway through the running driver; err=" << res.err;
+    EXPECT_EQ(res.rc, static_cast<int>(rpc::ErrorCode::UnknownTopic)) << res.err;
     EXPECT_FALSE(std::filesystem::exists(cliDir + "/aeron")) << "the CLI started no driver of its own";
     EXPECT_FALSE(std::filesystem::exists(cliDir + "/aeron.lock"));
 
