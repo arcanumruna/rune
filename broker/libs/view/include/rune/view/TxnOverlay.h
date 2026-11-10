@@ -107,35 +107,17 @@ public:
 
     [[nodiscard]] ViewTable* table() const noexcept { return t_; }
 
+    // The plain fold (x == nullptr) inlines to the table call; the chain and lock work stays out of line in the *Txn helpers.
     [[nodiscard]] const uint8_t* get(const ViewKey& k) const noexcept {
-        const uint8_t* r = nullptr;
-        if (x_ != nullptr && probe(k, r)) return r;
-        r = t_ != nullptr ? t_->get(k) : nullptr;
-        if (r == nullptr) noteAbsent(k);
-        return r;
+        if (x_ == nullptr) return t_ != nullptr ? t_->get(k) : nullptr;
+        return getTxn(k, k);
     }
     [[nodiscard]] const uint8_t* get(uint64_t k) const noexcept {
-        const uint8_t* r = nullptr;
         if (x_ == nullptr) return t_ != nullptr ? t_->get(k) : nullptr;
-        const ViewKey vk = ViewKey::fromU64(k);
-        if (probe(vk, r)) return r;
-        r = t_ != nullptr ? t_->get(k) : nullptr;
-        if (r == nullptr) noteAbsent(vk);
-        return r;
+        return getTxn(ViewKey::fromU64(k), k);
     }
-    uint8_t* put(const ViewKey& k) noexcept {
-        if (x_ == nullptr) return t_->put(k);
-        touch(k);
-        if (x_->chain == nullptr) return t_->put(k);
-        return chainPut(k, t_->get(k));
-    }
-    uint8_t* put(uint64_t k) noexcept {
-        if (x_ == nullptr) return t_->put(k);
-        const ViewKey vk = ViewKey::fromU64(k);
-        touch(vk);
-        if (x_->chain == nullptr) return t_->put(k);
-        return chainPut(vk, t_->get(k));
-    }
+    uint8_t* put(const ViewKey& k) noexcept { return x_ == nullptr ? t_->put(k) : putTxn(k, k); }
+    uint8_t* put(uint64_t k) noexcept { return x_ == nullptr ? t_->put(k) : putTxn(ViewKey::fromU64(k), k); }
     // A present row that decides an outcome without being written: the chain holds an unchanged copy, so it locks like a write does.
     void pin(const ViewKey& k) noexcept {
         if (x_ == nullptr || x_->chain == nullptr || t_ == nullptr) return;
@@ -144,21 +126,31 @@ public:
         if (const uint8_t* row = t_->get(k)) chainPut(k, row);
         else noteAbsent(k);
     }
-    bool erase(const ViewKey& k) noexcept {
-        if (x_ == nullptr) return t_->erase(k);
-        touch(k);
-        if (x_->chain == nullptr) return t_->erase(k);
-        return chainErase(k, exists(k, t_ != nullptr && t_->get(k) != nullptr));
+    bool erase(const ViewKey& k) noexcept { return x_ == nullptr ? t_->erase(k) : eraseTxn(k, k); }
+    bool erase(uint64_t k) noexcept { return x_ == nullptr ? t_->erase(k) : eraseTxn(ViewKey::fromU64(k), k); }
+
+private:
+    // `vk` is the overlay's key for the row; `k` the table's own (the same ViewKey, or its u64).
+    template <class K>
+    const uint8_t* getTxn(const ViewKey& vk, const K& k) const noexcept {
+        const uint8_t* r = nullptr;
+        if (probe(vk, r)) return r;
+        r = t_ != nullptr ? t_->get(k) : nullptr;
+        if (r == nullptr) noteAbsent(vk);
+        return r;
     }
-    bool erase(uint64_t k) noexcept {
-        if (x_ == nullptr) return t_->erase(k);
-        const ViewKey vk = ViewKey::fromU64(k);
+    template <class K>
+    uint8_t* putTxn(const ViewKey& vk, const K& k) noexcept {
+        touch(vk);
+        if (x_->chain == nullptr) return t_->put(k);
+        return chainPut(vk, t_->get(k));
+    }
+    template <class K>
+    bool eraseTxn(const ViewKey& vk, const K& k) noexcept {
         touch(vk);
         if (x_->chain == nullptr) return t_->erase(k);
         return chainErase(vk, exists(vk, t_ != nullptr && t_->get(k) != nullptr));
     }
-
-private:
     void touch(const ViewKey& k) const noexcept {
         if (x_->locks != nullptr && x_->locks->contains(x_->member, id_, k, x_->chain)) x_->locked = true;
     }
@@ -180,7 +172,7 @@ private:
     }
     // A read that found the row absent still locks it: the chain's erased entry reads back as absent.
     void noteAbsent(const ViewKey& k) const noexcept {
-        if (x_ != nullptr && x_->chain != nullptr && t_ != nullptr) x_->chain->erase(x_->member, id_, k);
+        if (x_->chain != nullptr && t_ != nullptr) x_->chain->erase(x_->member, id_, k);
     }
     bool chainErase(const ViewKey& k, bool existed) noexcept {
         x_->chain->erase(x_->member, id_, k);

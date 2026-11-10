@@ -215,7 +215,7 @@ PrepareStatus prepareKeyed(Stores& s, const SourceRecord& rec, Prospect& p) noex
         if (cl != nullptr) {
             if (owner == nullptr) return n.removed = cl->extraKeyOf(rec.key, s.x) != nullptr;   // an extra leaves quietly: applyUnique drops its claim
             n.key = ViewKey::fromBytes({owner, ks.keyWidth});
-            (void)s.table.get(n.key);   // touches the row apply erases or hands over
+            if (s.x != nullptr) (void)s.table.get(n.key);   // a chained or lock-checked prepare touches the row apply erases or hands over
             n.existed = true;
             p.rowCount = 1;
             if (cl->hasExtras(n.key, s.x)) {
@@ -231,7 +231,7 @@ PrepareStatus prepareKeyed(Stores& s, const SourceRecord& rec, Prospect& p) noex
         if (ks.ownerMapped) {
             if (owner == nullptr) return false;
             n.key = ViewKey::fromBytes({owner, ks.keyWidth});
-            (void)s.table.get(n.key);   // touches the row apply erases
+            if (s.x != nullptr) (void)s.table.get(n.key);   // a chained or lock-checked prepare touches the row apply erases
             p.ownerOp = OwnerOp::Erase;
         } else {
             n.key = wire;
