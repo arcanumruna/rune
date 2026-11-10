@@ -2534,9 +2534,8 @@ TEST(ShardModeRegression, BrokerSurvivesAProcessFreezePastAeronLivenessDefaultSt
     expectBrokerSurvivesAFreeze(makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true), 12s, 5s);   // the default placement
 }
 
-// The same with Aeron's client and driver liveness defaults lowered to 0.3 s: the freeze is past them, the broker's own (1 h) liveness
-// must still carry the client and the driver.  RED without either override (EmbeddedDriver's clientLivenessTimeoutNs, BrokerNode's
-// mediaDriverTimeout).
+// The same with the embedded driver's liveness default lowered to 0.3 s: the freeze is past it, the broker's own (1 h) liveness must
+// still carry the driver.  RED without EmbeddedDriver's clientLivenessTimeoutNs override; the next test covers the clients.
 TEST(ShardModeRegression, BrokerSurvivesAProcessFreezePastALoweredLivenessFloorRegression) {
     TmpDir dir{"freezef"};
     const auto ports = ShardPorts::discover(1, 1);
@@ -2545,9 +2544,9 @@ TEST(ShardModeRegression, BrokerSurvivesAProcessFreezePastALoweredLivenessFloorR
     expectBrokerSurvivesAFreeze(cfg, 500ms, 300ms);
 }
 
-// The clients' half: the runtime client and every worker's client wait for their driver the node's liveness, not Aeron's default (lowered
-// to 0.3 s here).  A freeze cannot show it deterministically - the client's check races the driver's first heartbeat after the resume.
-// RED without BrokerNode's mediaDriverTimeout on either client.
+// The clients' half: the runtime client and every worker's client wait for their driver the node's liveness, not Aeron's 10 s default
+// nor the node's floor (lowered to 0.3 s here).  A freeze cannot show it deterministically - the client's check races the driver's
+// first heartbeat after the resume.  RED without BrokerNode's mediaDriverTimeout on either client.
 TEST(ShardModeRegression, InProcessClientsWaitForTheirDriverTheNodesLivenessRegression) {
     TmpDir dir{"cliveness"};
     const auto ports = ShardPorts::discover(1, 2);

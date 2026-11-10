@@ -327,7 +327,7 @@ struct NodeConfig {
     /// 0 = Aeron's 16 ms; never set in production.
     long testAeronClientIdleSleepMs = 0;
     /// The in-process clients' media-driver timeout (ms) matching shardClientLivenessTimeoutNs (never below
-    /// Aeron's 10 s default).
+    /// Aeron's 10 s default, or testAeronLivenessDefaultMs when set).
     [[nodiscard]] long inProcessDriverTimeoutMs() const noexcept {
         const long ms = static_cast<long>(shardClientLivenessTimeoutNs / 1'000'000);
         const long floorMs = testAeronLivenessDefaultMs > 0 ? testAeronLivenessDefaultMs : 10'000;
