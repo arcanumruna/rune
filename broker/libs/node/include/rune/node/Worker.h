@@ -602,6 +602,7 @@ public:
     void requireViewReadLease() noexcept { viewLeaseEndNs_ = kNoViewLease; }
     /// Test seam: read the lease clock from `*now` instead of LeaseClock (single-threaded drivers only).
     void setLeaseClockForTest(const int64_t* now) noexcept { leaseNowOverride_ = now; }
+    [[nodiscard]] int64_t leaseNowForTest() const noexcept { return leaseNow_(); }   ///< the lease clock this worker reads now
     /// Test seams (lease topics Task 10): the partition's lease runtime (nullptr: none), a lease batch byte cap override (0: none), and
     /// events injected as if the judge had produced them.
     [[nodiscard]] const lease::LeaseRuntime* leaseRuntimeForTest(int32_t topicId, int32_t partition) const noexcept {
@@ -4954,7 +4955,10 @@ private:
         // 2. Readiness: every fact of WorkerViewSet::leaseReady_ under this leadership (the judge past every update the index could not track).
         const WorkerViewSet::LeaseIndexLookup lk = viewSet_->leaseIndexFor(src, partition, srcRep->leadershipGeneration(), true,
                                                                            srcRep->highWatermark() >= srcRep->leadershipStartOffset());
-        if (lk.ref.table == nullptr || !lk.ready) return answer(static_cast<int16_t>(RS::kNotReady));
+        if (lk.ref.table == nullptr) return answer(static_cast<int16_t>(RS::kNotReady));
+        // CatchingUp (the judge has not passed an update the index could not track, or the fold trails it): held like the read-your-writes
+        // barrier below - the held-read list re-enters here every pass, NotReady at the deadline.
+        if (!lk.ready) return lk.catchingUp ? ViewServe::Hold : answer(static_cast<int16_t>(RS::kNotReady));
         // 3. Schema drift: a pinned (non-zero) fingerprint that is not the lease view's CURRENT one.  Checked here, after leadership, the
         //     read lease and readiness (a ready index is at the current layout generation, so lk.viewFp is the layout a row would be read
         //     with): a demoted partition answers the not-leader sentinel, an index still rebuilding for a new column answers NotReady, never

@@ -181,9 +181,11 @@ TEST(LeaseViewReadRegression, PointReadReadYourWritesRegression) {
     EXPECT_EQ(late->errorCode, int16_t(RS::kNotReady));
 }
 
-// 3. An index that is not ready answers NotReady - never the row it holds - and Ok once it is ready again.  Not ready: an update of a key with
-// no row, appended with the judge held (the hook cannot track it), as the emitter's NotReadyGate cell.
-// Mutation: drop `|| !lk.ready` in the lease branch -> the stale row is served: red.
+// 3. An index that is not ready never serves the row it holds, and serves Ok once it is ready again.  Not ready: an update of a key with
+// no row, appended with the judge held (the hook cannot track it), as the emitter's NotReadyGate cell.  The index still serves this leadership
+// (only the judge is behind), so the read is HELD like the read-your-writes barrier, and answers NotReady at the hold deadline (100 ms).
+// Mutation: drop `|| !lk.ready` in the lease branch -> the stale row is served: red.  Mutation: answer NotReady at once for CatchingUp ->
+// the read is answered inside the hold: red (a read racing the judge by one pass failed: Cells/LeaseMatrixRecipeRegression *_StaleVer).
 TEST(LeaseViewReadRegression, NotReadyNeverStaleRegression) {
     Lk k(noCheckpoints());
     grantKey1(k);
@@ -192,8 +194,24 @@ TEST(LeaseViewReadRegression, NotReadyNeverStaleRegression) {
     (void)k.send({ltr::updateRec(99, 0)});   // no row for key 99
     k.r.passes(30);
     ASSERT_FALSE(k.r.leaseReady());
-    EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, bytesOf(1))), int16_t(RS::kNotReady)) << "key 1 has a row, but the index is not ready";
-    EXPECT_EQ(statusOf(readOnce(k, WorkerOp::Type::GetViewRowK, bytesOf(99))), int16_t(RS::kNotReady));
+    const auto heldThenNotReady = [&](uint64_t id) {
+        (void)k.r.takeViewAnswers();
+        k.r.postViewReadOp(WorkerOp::Type::GetViewRowK, kView, bytesOf(id));
+        for (int i = 0; i < 90; ++i) {
+            k.r.pass();
+            if (!k.r.takeViewAnswers().empty()) return std::string("answered inside the hold at pass ") + std::to_string(i);
+        }
+        if (k.r.worker->heldViewReadsForTest() != 1u) return std::string("not held");
+        for (int i = 0; i < 30; ++i) {
+            k.r.pass();
+            auto a = k.r.takeViewAnswers();
+            if (a.empty()) continue;
+            return a.front().errorCode == int16_t(RS::kNotReady) ? std::string() : "answered " + std::to_string(a.front().errorCode);
+        }
+        return std::string("never answered");
+    };
+    EXPECT_EQ(heldThenNotReady(1), "") << "key 1 has a row, but the index is not ready";
+    EXPECT_EQ(heldThenNotReady(99), "");
     k.r.holdJudge(false);
     ASSERT_TRUE(k.r.driveUntilJudged());
     for (int i = 0; i < ltr::kCap && !k.r.leaseReady(); ++i) k.r.pass();

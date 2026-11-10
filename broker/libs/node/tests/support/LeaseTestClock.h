@@ -14,6 +14,7 @@
 #include <rune/consensus/LeaseClock.h>
 #include <rune/node/BrokerNode.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 
@@ -36,7 +37,14 @@ public:
         for (int32_t w = 0; w < n; ++w) {
             int64_t* cell = &cells_[static_cast<std::size_t>(w)];
             const int64_t v = totalNs_;
-            (void)node.onWorkerThreadForTest(w, [cell, v](Worker& wk) { *cell = v; wk.setLeaseClockForTest(cell); return 0; });
+            // Never behind what the worker already read: after a restart it polls the REAL clock until this runs on its thread, which
+            // may be later than resync() read it (the lease wheels assert a monotonic clock).
+            const int64_t set = node.onWorkerThreadForTest(w, [cell, v](Worker& wk) -> int64_t {
+                *cell = std::max(v, wk.leaseNowForTest());
+                wk.setLeaseClockForTest(cell);
+                return *cell;
+            });
+            totalNs_ = std::max(totalNs_, set);
         }
     }
     /// Moves the clock forward by `ns` on every worker of `node` (a stopped node: the total only, resumed by the next install()).

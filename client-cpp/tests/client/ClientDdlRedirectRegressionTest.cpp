@@ -861,9 +861,11 @@ TEST(ClientDdlRedirectRegression, GetViewRowRedirectIsFollowedToTheSourceLeaderA
     EXPECT_EQ(arrivedOn[1], leader) << "and is re-sent on the named leader's session";
 
     // The Redirect with no data op in flight must not retarget the seed (redirectBySeed_): the
-    // next read still starts on the seed.
+    // next read still starts on the seed.  It reads another view: the redirect taught a route
+    // hint for view 0x40000007 (GetViewRow hints are per view), and a hinted read starts on
+    // its leader by design (L22).
     arrivedOn.clear();
-    auto g = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 102, 0, q, t); });
+    auto g = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000008, 102, 0, q, t); });
     ASSERT_TRUE(r.drive([&] { return g.ready(); }, /*stepNs=*/1'000'000));
     ASSERT_TRUE(g.ok()) << g.describe();
     ASSERT_FALSE(arrivedOn.empty());

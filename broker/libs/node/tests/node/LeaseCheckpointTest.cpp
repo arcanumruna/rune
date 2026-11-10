@@ -445,7 +445,9 @@ TEST(LeaseCheckpointRegression, FullBatchLeavesRestRegression) {
 // 15. (F4d) Roll back-pressure: while the log's roll is deferred no checkpoint is appended (counted as a roll-deferred skip); they go out once a
 // segment is ready.  Mutation: drop the rollDeferred check in leaseDuty_: a Checkpoint lands while held: red.
 TEST(LeaseCheckpointRegression, RollDeferredSkipsCheckpointsRegression) {
-    Lk k(specWith(1000, 1, 1000, 1000), false, RigTuning{}, /*rollBytes=*/100);
+    // rollBytes below the smallest batch (61 bytes of batch overhead plus a record): every segment holds one batch and is full, so the
+    // active one is full whatever the last control record's size (a v2 constraint-set change is 102 bytes, a marker 95).
+    Lk k(specWith(1000, 1, 1000, 1000), false, RigTuning{}, /*rollBytes=*/64);
     ASSERT_TRUE(setup(k, {1, 2}, 5000));
     struct Hook { static bool fn(void*, rune::storage::Log*, rune::storage::Log::ProvisionDemand) noexcept { return true; } };
     rune::storage::testing::DemandChannelForTest demandCh{&Hook::fn, nullptr};

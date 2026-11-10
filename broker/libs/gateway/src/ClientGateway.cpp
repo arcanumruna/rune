@@ -160,6 +160,7 @@ ClientGateway::ClientGateway(TestConstructTag,
 {
     pendingAcks_.reserve(kMaxPendingAcks);
     drainingRegistrations_.reserve(kMaxPendingConnects);
+    sessions_.setIdStartForTest(0);   // a test gateway hands out 1, 2, ... (the produce handler answers session 1); a real one starts per boot at random
 }
 
 // G1.1: Test-only constructor — also wires leaderView_.
@@ -179,6 +180,7 @@ ClientGateway::ClientGateway(TestConstructTag,
 {
     pendingAcks_.reserve(kMaxPendingAcks);
     drainingRegistrations_.reserve(kMaxPendingConnects);
+    sessions_.setIdStartForTest(0);   // a test gateway hands out 1, 2, ... (the produce handler answers session 1); a real one starts per boot at random
 }
 
 void ClientGateway::injectPendingHandshakeForTest(int64_t sessionId)

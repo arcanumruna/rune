@@ -457,6 +457,7 @@ public:
     struct LeaseIndexLookup {
         LeaseIndexRef ref;
         bool          ready      = false;
+        bool          catchingUp = false;   ///< not ready only because the judge / fold has not passed this leadership's latest updates yet
         int64_t       foldCursor = -1;   ///< the index's fold cursor (the lease view read's read-your-writes barrier); -1: no index
         uint64_t      viewFp     = 0;    ///< the lease view's output fingerprint over the current layout (leaseViewFingerprint)
     };
@@ -465,8 +466,9 @@ public:
         const auto it = keyIndexes_.find(key);
         if (it == keyIndexes_.end()) return {};
         ViewInstance& inst = it->second;
-        return LeaseIndexLookup{LeaseIndexRef{&inst.table, &inst.layout, &inst.evolvingSrc, &inst.leaseCover, &inst.leaseTransient}, leaseReady_(inst, key, currentLeaderGen, isLeader, hwConfirmed),
-                                inst.foldCursor, inst.leaseViewFp};
+        const LeaseReadiness rd = leaseReadiness_(inst, key, currentLeaderGen, isLeader, hwConfirmed);
+        return LeaseIndexLookup{LeaseIndexRef{&inst.table, &inst.layout, &inst.evolvingSrc, &inst.leaseCover, &inst.leaseTransient},
+                                rd == LeaseReadiness::Ready, rd == LeaseReadiness::CatchingUp, inst.foldCursor, inst.leaseViewFp};
     }
     /// Lease view point reads (spec 7.1): the source topic of a lease view (`<topic>.leases`), -1 when `viewTopicId` is not one.  The
     /// mapping comes from the catalog (the write spec's leaseViewTopicId), never from id arithmetic.  A flat scan of the (few) lease
@@ -520,16 +522,27 @@ public:
         return kit != keyIndexes_.end() && leaseReady_(kit->second, key, currentLeaderGen, isLeader, hwConfirmed);
     }
 private:
-    [[nodiscard]] bool leaseReady_(const ViewInstance& inst, uint64_t key, uint64_t currentLeaderGen, bool isLeader, bool hwConfirmed) const noexcept {
-        if (!isLeader || !hwConfirmed) return false;
+    /// NotReady: the index does not serve this leadership (or this layout) at all.  CatchingUp: it does, but the judge has not passed
+    /// an update the index could not track, or the fold trails the judge - a pass or two away (a read waits, bounded, instead of failing).
+    enum class LeaseReadiness : uint8_t { NotReady, CatchingUp, Ready };
+    [[nodiscard]] LeaseReadiness leaseReadiness_(const ViewInstance& inst, uint64_t key, uint64_t currentLeaderGen, bool isLeader,
+                                                 bool hwConfirmed) const noexcept {
+        if (!isLeader || !hwConfirmed) return LeaseReadiness::NotReady;
         const auto vit = verdictSources_.find(key);
-        if (vit == verdictSources_.end()) return false;
+        if (vit == verdictSources_.end()) return LeaseReadiness::NotReady;
         const VerdictSource& judge = *vit->second;
         const PartitionWriteState* w = judge.boundState();
-        if (w == nullptr || w->spec == nullptr || !w->spec->lease) return false;
-        return judge.activated() && judge.leadershipGeneration() == currentLeaderGen && inst.foldLeadership == currentLeaderGen &&
-               inst.layoutGen == w->spec->leaseLayoutGen && inst.foldCursor >= judge.judgedThrough() &&
-               judge.judgedThrough() > w->leaseUntrackedThrough;   // updates appended before the table tracked them are judged
+        if (w == nullptr || w->spec == nullptr || !w->spec->lease) return LeaseReadiness::NotReady;
+        if (!judge.activated() || judge.leadershipGeneration() != currentLeaderGen || inst.foldLeadership != currentLeaderGen ||
+            inst.layoutGen != w->spec->leaseLayoutGen)
+            return LeaseReadiness::NotReady;
+        const int64_t judged = judge.judgedThrough();
+        return inst.foldCursor >= judged && judged > w->leaseUntrackedThrough   // updates appended before the table tracked them are judged
+                   ? LeaseReadiness::Ready
+                   : LeaseReadiness::CatchingUp;
+    }
+    [[nodiscard]] bool leaseReady_(const ViewInstance& inst, uint64_t key, uint64_t currentLeaderGen, bool isLeader, bool hwConfirmed) const noexcept {
+        return leaseReadiness_(inst, key, currentLeaderGen, isLeader, hwConfirmed) == LeaseReadiness::Ready;
     }
 public:
     /// The partition stopped leading: its lease event buffer (~320 KiB) is released and no longer counted in the lease view's
