@@ -138,7 +138,7 @@ TEST(LeaseCleanerRebuildRegression, KeepsGrantTtlAfterCleanRegression) {
 
 TEST(LeaseCleanerRebuildRegression, RebuildAfterCleanEqualsBeforeRegression) {
     constexpr uint64_t kKeys = 50;
-    constexpr uint64_t kUpdates = 4000;
+    constexpr uint64_t kUpdates = 400;   // #883: 20k updates + 2k checkpoints is enough volume; 4000 took 34 s under ASan
     constexpr uint64_t kCheckpointEvery = kUpdates / 40;
     Ready g(/*rollBytes=*/1);
     VerdictRig& r = g.r;

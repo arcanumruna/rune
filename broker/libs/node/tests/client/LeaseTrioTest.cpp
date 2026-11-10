@@ -244,8 +244,9 @@ TEST(LeaseTrioRegression, WholeClusterRestartRegression) {
 }
 
 // L22: a keepalive stream held at 50 ms (300 ms per-call deadline) keeps a lease alive through repeated leader changes; the longest gap
-// between two successful keepalives (the outage) is measured per change.  2 forced cycles (3 took ~25 s per test), each: kill the leader -> wait for the new leader ->
-// 2 s -> restart the node -> wait (bounded, 30 s) until the restarted node leads the partition again -> 3 s.  Two kinds of leader change happen
+// between two successful keepalives (the outage) is measured per change.  2 forced cycles, each: kill the leader -> wait for the new leader ->
+// 1.5 s -> restart the node -> wait (bounded, 30 s) until the restarted node leads the partition again -> 2 s (#883: one run measures both
+// kinds of change; it was run twice, once per test, at over 20 s each).  Two kinds of leader change happen
 // in a cycle: the KILL of the leader (a survivor is promoted) and the REJOIN of the killed node (leadership moves back).  A gap is classified
 // by where it STARTS: in [kill, restart) it is a kill gap, in [restart, next kill) a rejoin gap.  A stream still failing when the run ends
 // counts as a gap ending at the stop time.
@@ -284,16 +285,16 @@ Outage measureOutage(const char* tag) {
     });
     std::this_thread::sleep_for(500ms);
     std::vector<std::pair<int64_t, int64_t>> killWindows;   // [kill, restart) in ms since t0
-    for (int change = 0; change < 2; ++change) {   // 2 cycles: 3 take ~25 s per test (over the 20 s budget)
+    for (int change = 0; change < 2; ++change) {
         const int64_t killAt = msSince(t0);
         const int32_t dead = t.killLeader(topic, 0);   // returns once a survivor leads
-        std::this_thread::sleep_for(2s);
+        std::this_thread::sleep_for(1500ms);   // > the 1.5 s budget: a kill gap ends (or is over budget) before the restart
         const int64_t restartAt = msSince(t0);
         killWindows.push_back({killAt, restartAt});
         t.restartNode(dead, topic);
         // The restarted node takes the partition back (bounded): the rejoin leader change happens here, not inside the next kill.
         if (!LeaseTrio::until(30s, [&] { return t.leaderOf(topic, 0) == dead; })) std::fprintf(stderr, "L22: node %d did not lead again within 30 s\n", dead);
-        std::this_thread::sleep_for(3s);
+        std::this_thread::sleep_for(2s);
     }
     stop.store(true, std::memory_order_release);
     stream.join();
@@ -311,14 +312,10 @@ Outage measureOutage(const char* tag) {
 }
 }  // namespace
 
+// The leader change that follows the REJOIN of the killed node is a leader change too (L22 is a Herald budget for any forced change).
 TEST(LeaseTrioRegression, KeepAliveOutageUnderLeaderChangeRegression) {
     const Outage o = measureOutage("lease-trio-outage");
-    EXPECT_LT(o.killMaxMs, 1500) << "the longest keepalive outage after the kill of the leader, over 3 forced changes (L22)";
-}
-
-// The leader change that follows the REJOIN of the killed node is a leader change too (L22 is a Herald budget for any forced change).
-TEST(LeaseTrioRegression, KeepAliveOutageOnRejoinLeaderChangeRegression) {
-    const Outage o = measureOutage("lease-trio-outage-rejoin");
+    EXPECT_LT(o.killMaxMs, 1500) << "the longest keepalive outage after the kill of the leader, over 2 forced changes (L22)";
     EXPECT_LT(o.rejoinMaxMs, 1500) << "the longest keepalive outage when the restarted node takes the leadership back (L22)";
 }
 

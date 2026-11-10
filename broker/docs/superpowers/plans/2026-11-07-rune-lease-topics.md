@@ -1193,13 +1193,13 @@ running the applicable sequential cells against the in-process worker + stub gat
 - The injected lease clock is single-node only (a per-worker cell, shared-nothing). The trio runs the real lease clock with short
   TTLs, so `WholeClusterRestart` is a real-time restart; the 24 h / 400-day legs are covered by the single-node
   `CompactionRestart` (clean restart, injected clock).
-- `CompactionRestart` is 4 keys x 2 000 updates + 20 clock steps (recipe fallback); compaction itself is not forced (no seam;
+- `CompactionRestart` is 4 keys x 500 updates + 20 clock steps (2 000 until #883: over 20 s under sanitizers); compaction itself is not forced (no seam;
   covered by `LeaseJudgeWorkerRegression.LeaseRebuildAfterCompactionRegression`). `L22` uses 3 forced changes, not 50.
 - Broker-layer sequential matrix: 7 client-surface ops x non-n/a entities (56 cells); the rest is the unit table. Timing cells:
   18 on one node, the trio legs in `LeaseTrioTest.cpp`, the others mapped in the `kCoverage` table to existing tests
   (checked by `LeaseMatrixRegression.TimingCoverageRegression`).
-- Open: `KeepAliveOutageOnRejoinLeaderChangeRegression` fails on purpose (outage 1.64-1.72 s after a leader moves back to a rejoined
-  node, budget 1.5 s): an L22 finding for diagnosis. M4 is not turned red by `ContenderGrantsDoNotDeferExpire` (the deferral
+- Was open: the rejoin outage (1.64-1.72 s after a leader moves back to a rejoined node, budget 1.5 s), fixed by L22; since #883 the
+  rejoin budget is asserted by `KeepAliveOutageUnderLeaderChangeRegression` itself (one run measures both kinds of change). M4 is not turned red by `ContenderGrantsDoNotDeferExpire` (the deferral
   window is the judge lag). Closed at Checkpoint E: `LeaseEmitterRegression.ContenderGrantDoesNotDeferExpireRegression` (in-process,
   judge held) is red under M4; M1 (`ExtendAddedRegression`) and M3 (`CheckpointingParksRegression`) re-checked red. M16 has no pause
   code to mutate.

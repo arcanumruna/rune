@@ -1600,7 +1600,7 @@ All tests follow `docs/testing.md`:
 
 **As built (Task 17).** The named scenarios are `LeaseIntegrationRegression`, `LeaseRaceRegression` (single node, injected lease clock),
 `LeaseTrioRegression` and `LeaseWatchTrioRegression` (3 nodes, real clock, short TTLs). Deviations: the whole-cluster restart runs in
-real time on the trio (the 24 h / 400-day legs are the single-node injected-clock `CompactionRestart`, scaled to 4 keys x 2 000
+real time on the trio (the 24 h / 400-day legs are the single-node injected-clock `CompactionRestart`, scaled to 4 keys x 500
 updates); compaction is not forced on a real broker (no seam); the leader-outage test uses 3 forced changes and measures on
 the wall clock. The rejoin outage of 1.64-1.72 s (later 3.3-3.7 s) was a forgotten session, not a lease problem: a restarted gateway
 dropped the keepalive Ping of a session it no longer knew, and the client only recovered at its response timeout. Fixed

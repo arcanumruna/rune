@@ -127,9 +127,10 @@ TEST(LeaseIntegrationRegression, UpdateDoesNotRenewRegression) {
 }
 
 // A restart (clean stop and start) loses nothing: the same lease rows, with the remaining time kept to the broker's checkpoint
-// granularity.  4 keys x 2 000 updates (recipe fallback scale) with checkpoint intervals passed in between.
+// granularity.  4 keys x 500 updates with checkpoint intervals passed in between (#883: 2 000 took 26-29 s under sanitizers; the
+// restart replays 2 000 records either way).
 TEST(LeaseIntegrationRegression, CompactionRestartRegression) {
-    constexpr int kKeys = 4, kUpdates = 2000, kRounds = 20;
+    constexpr int kKeys = 4, kUpdates = 500, kRounds = 20;
     LeaseBrokerRig rig("lease-int-restart", 3'600'000, 1000, 86'400'000);
     auto lt = rig.ua().openLeaseTopicAndWait<LeaseClaim>("t", {}, 30s);
     rc::LeaseOptions o;
