@@ -2040,3 +2040,48 @@ TEST(ProducerTxnAllocRegression, AbortAndCloseWithAnOpenClaimAbandonWithoutAlloc
     EXPECT_EQ(cl.status(), OpStatus::Ok);
     EXPECT_TRUE(r.wire.empty());
 }
+
+// R7 / I-1: an EndTxn(commit) that was submitted but never offered (the coordinator session is down) has not left the client: the
+// guard's trip recalls it and the commit fails LeaseAtRisk.  Once the session returns, no EndTxn(commit) is ever offered.
+TEST(ProducerTxnGuardRegression, TripBeforeEndTxnOfferedFailsCommitRegression) {
+    Rig r;
+    r.initOk(42, 0);
+    r.startTxn();
+    ASSERT_TRUE(r.sendRecord(0));
+    r.addOk();
+    r.ticks(2);
+    ASSERT_EQ(r.wire.size(), 1u);
+    r.ackLastData();
+    rc::detail::GuardEntry entry;
+    entry.gen   = 1;
+    entry.state = rc::detail::GuardEntry::State::Armed;
+    r.impl->guardAttach(&entry, 1);
+    r.fake.sid = 0;   // the coordinator session is down: the link cannot offer
+    Op commit = r.commit();
+    for (int i = 0; i < 20 && r.impl->endTxnAttemptsForTest() == 0; ++i) r.tick();
+    ASSERT_EQ(r.impl->endTxnAttemptsForTest(), 1u) << "EndTxn(commit) was submitted";
+    r.ticks(5);
+    ASSERT_EQ(r.endTxns(), 0u) << "but never offered";
+    ASSERT_FALSE(commit.ready());
+    entry.state = rc::detail::GuardEntry::State::Tripped;
+    r.impl->failGuarded(OpStatus::DeliveryFailed, static_cast<uint16_t>(rc::ClientErrorCode::LeaseAtRisk));
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::DeliveryFailed);
+    EXPECT_EQ(commit.code(), static_cast<uint16_t>(rc::ClientErrorCode::LeaseAtRisk));
+    EXPECT_EQ(r.state(), TxnState::AbortableError);
+    r.fake.sid = 77;   // the session returns
+    r.ticks(100);
+    for (const auto& f : r.fake.offered) {
+        if (f.templateId != rpc::EndTxn::TEMPLATE_ID) continue;
+        const auto m = rpc::EndTxn::decode(f.head.data(), std::min<std::size_t>(f.len, f.head.size()));
+        ASSERT_TRUE(m.has_value());
+        EXPECT_EQ(m->commit, uint8_t{0}) << "no EndTxn(commit) is offered";
+    }
+    Op ab = r.abort();
+    r.ticks(5);
+    ASSERT_EQ(r.endTxns(), 1u);
+    r.endAnswer();
+    r.ticks(5);
+    ASSERT_TRUE(ab.ready());
+    EXPECT_EQ(ab.status(), OpStatus::Ok);
+}

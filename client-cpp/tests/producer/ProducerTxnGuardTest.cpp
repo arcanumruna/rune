@@ -5,6 +5,7 @@
 // an injected clock; the trip is made by advancing the clock past the armed at-risk instant with the keepalive answers withheld.
 // Nothing sleeps; every drive loop is capped.
 #include "../support/InvokerGateway.h"
+#include "../support/LeaseGatewayRig.h"
 #include "../support/TestCompletions.h"
 
 #include <rune/client/Client.h>
@@ -47,26 +48,7 @@ int64_t realNow() {
 }
 constexpr uint16_t kAtRisk = static_cast<uint16_t>(rc::ClientErrorCode::LeaseAtRisk);
 
-rune::codec::Descriptor leaseDescriptor() {
-    return rune::codec::DescriptorBuilder("lease_t", 1).add("id", rune::codec::PrimType::Int64, 1, /*isKey=*/true).build();
-}
-const uint64_t kFp = rune::codec::fingerprint(leaseDescriptor());
-
-struct Row {
-    static const uint64_t             kFingerprint;
-    static constexpr std::string_view kSchemaName = "lease_t";
-    uint64_t id = 0;
-    [[nodiscard]] uint64_t    key() const noexcept { return id; }
-    [[nodiscard]] std::size_t encodedSize() const noexcept { return 4 + 32 + 8; }
-    std::size_t encode(uint8_t* b) const noexcept {
-        std::memset(b, 0, 44);
-        b[0] = 40;
-        b[2] = 1;
-        std::memcpy(b + 36, &id, 8);
-        return 44;
-    }
-};
-const uint64_t Row::kFingerprint = kFp;
+using Row = test_support::LeaseRow;
 
 struct DataDirs {
     std::vector<std::string> dirs;
@@ -102,8 +84,6 @@ rc::ClientConfig invokerCfg() {
     return c;
 }
 
-const rune::protocol::LeaseSpec kSpec{.ttlMs = 6000, .minTtlMs = 1000, .maxTtlMs = 60000, .maxKeys = 100000,
-                                      .expiryBatch = 64, .checkpoint = 0, .checkpointIntervalMs = 1000, .checkpointRate = 1};
 
 struct Cb {
     int entered = 0, cleared = 0, lost = 0;
@@ -153,24 +133,7 @@ struct GRig {
     explicit GRig(const rc::ClientConfig& c)
         : client(std::make_unique<rc::Client>(c)),
           gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId, c.egressChannel, c.egressStreamId) {
-        gw.idempotence            = true;
-        gw.replySchemas           = true;
-        gw.schemaBlob             = rune::codec::serialize(leaseDescriptor());
-        gw.schemaTopicId          = 1;
-        gw.schemaPartitionCount   = 1;
-        gw.schemaLeaseViewTopicId = 9;
-        rune::protocol::TopicKeyFeatures f;
-        f.keyIndex = true;
-        gw.schemaKeyFeatures = f;
-        gw.schemaLease       = kSpec;
-        gw.produceLeaseTrailer = [] {
-            std::vector<uint8_t> t(16);
-            const int64_t v = 77;
-            const uint64_t ttl = 5000;
-            std::memcpy(t.data(), &v, 8);
-            std::memcpy(t.data() + 8, &ttl, 8);
-            return t;
-        }();
+        test_support::configureLeaseGateway(gw);
         connect();
         topic.emplace(openTopic());
         for (int i = 0; i < 4000 && topic->producer().producerId() < 0; ++i) { client->doWork(); gw.pump(); }
@@ -202,32 +165,8 @@ struct GRig {
         if (!pq) return;
         pq->poll([&](const rc::Completion& c, std::span<const uint8_t>) { got[c.token] = c; });
     }
-    void connect() {
-        for (int i = 0; i < 4000 && !gw.ready(); ++i) { client->doWork(); gw.pump(); }
-        ASSERT_TRUE(gw.ready());
-        test_support::TestCq cq(*client);
-        auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client->connect(q, t); });
-        for (int i = 0; i < 4000 && !f.ready(); ++i) { client->doWork(); gw.pump(); }
-        ASSERT_TRUE(f.ok()) << f.describe();
-        for (int i = 0; i < 4000 && gw.metadataRequests == 0; ++i) { client->doWork(); gw.pump(); }
-    }
-    rc::LeaseTopic<Row> openTopic() {
-        std::optional<rc::LeaseTopic<Row>> h;
-        int stop[2];
-        EXPECT_EQ(::pipe(stop), 0);
-        std::thread t([&] {
-            pollfd pfd{stop[0], POLLIN, 0};
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            while (::poll(&pfd, 1, 0) == 0 && std::chrono::steady_clock::now() < deadline) gw.pump();
-        });
-        h.emplace(client->openLeaseTopicAndWait<Row>("lease_t", {}));
-        const char b = 0;
-        (void)!::write(stop[1], &b, 1);
-        t.join();
-        ::close(stop[0]);
-        ::close(stop[1]);
-        return std::move(*h);
-    }
+    void connect() { test_support::connectGateway(*client, gw); }
+    rc::LeaseTopic<Row> openTopic() { return test_support::openLeaseTopic(*client, gw); }
     /// `rounds` hops of client / stub / session at the current clock.
     void settle(int rounds = 10) {
         for (int i = 0; i < rounds; ++i) {
@@ -351,15 +290,50 @@ TEST(ProducerTxnGuardRegression, CommitWithAllRecordsAckedBlockedAtRiskRegressio
     rc::Producer p = r.producer("tx-a", ref);
     p.beginTransaction();
     r.settle();
-    for (int i = 0; i < 3; ++i) r.sendAcked(p);
+    for (int i = 0; i < 3; ++i) ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
     ASSERT_EQ(p.state(), TxnState::InTransaction);
-    r.trip();
+    ASSERT_NO_FATAL_FAILURE(r.trip());
     EXPECT_EQ(p.state(), TxnState::AbortableError) << "the trip fails the open transaction";
     const rc::Token c = r.commit(p);
     ASSERT_TRUE(r.await(c));
     r.expectFailedAtRisk(c, "commit");
     EXPECT_EQ(r.endTxns(1), 0) << "no EndTxn(commit) leaves";
     EXPECT_EQ(p.state(), TxnState::AbortableError);
+}
+
+// I-7: a bind applied onto an already tripped lease must not re-enter the producer ring read (the old path ran failGuarded ->
+// failAllPending -> discardRing_ inside the drain's own controlledRead and left the ring head pointing at zeroed memory).
+TEST(ProducerTxnGuardRegression, BindOnTrippedLeaseKeepsRingAliveRegression) {
+    GRig r;
+    r.g_now_base = g_now;
+    const auto ref = r.addLease(1);
+    ASSERT_NO_FATAL_FAILURE(r.trip());
+    rc::Producer p = r.client->testProducerWithRingCap(txnCfg("tx-a"), 64 * 1024);
+    const rc::Token i = ++r.tok;
+    ASSERT_EQ(p.initTransactions(*r.pq, i), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.await(i));
+    ASSERT_EQ(r.got[i].status, OpStatus::Ok);
+    // back to back, no drive in between: bind, begin, send all sit in the ring together
+    ASSERT_EQ(r.session->bindProducer(ref, p), rc::OpResult::Accepted);
+    p.beginTransaction();
+    const rc::Token s = ++r.tok;
+    const rc::SendResult sr = p.trySend(r.data, rc::Key(uint64_t{1}), kVal, *r.pq, s);
+    ASSERT_TRUE(sr == rc::SendResult::Ok || sr == rc::SendResult::NotInTransaction) << static_cast<int>(sr);
+    r.settle();
+    if (sr == rc::SendResult::Ok) {
+        ASSERT_TRUE(r.await(s));
+        r.expectFailedAtRisk(s, "send onto the tripped lease");
+        EXPECT_EQ(r.got.size(), 2u) << "completed once";
+    }
+    const rc::Token a = r.abort(p);
+    ASSERT_TRUE(r.await(a)) << "the ring is alive: the abort is drained";
+    EXPECT_EQ(r.got[a].status, OpStatus::Ok);
+    EXPECT_EQ(p.state(), TxnState::Ready);
+    p.beginTransaction();
+    r.settle();
+    const rc::Token a2 = r.abort(p);
+    ASSERT_TRUE(r.await(a2));
+    EXPECT_EQ(r.got[a2].status, OpStatus::Ok);
 }
 
 TEST(ProducerTxnGuardRegression, TripFailsOpenTransactionRegression) {
@@ -372,23 +346,88 @@ TEST(ProducerTxnGuardRegression, TripFailsOpenTransactionRegression) {
     const rc::Token s1 = r.sendUnacked(p);
     const rc::Token s2 = r.sendUnacked(p);
     ASSERT_EQ(r.got.count(s1) + r.got.count(s2), 0u) << "unacked";
-    r.trip();
+    ASSERT_NO_FATAL_FAILURE(r.trip());
     r.settle();
     r.expectFailedAtRisk(s1, "send 1");
     r.expectFailedAtRisk(s2, "send 2");
     EXPECT_EQ(p.state(), TxnState::AbortableError);
     const rc::Token s3 = ++r.tok;
-    const rc::SendResult sr = p.trySend(r.data, rc::Key(uint64_t{1}), kVal, *r.pq, s3);
-    if (sr == rc::SendResult::Ok) {
-        ASSERT_TRUE(r.await(s3));
-        r.expectFailedAtRisk(s3, "send 3");
-    } else {
-        EXPECT_NE(sr, rc::SendResult::Ok) << "refused at the call";
-    }
+    ASSERT_EQ(p.trySend(r.data, rc::Key(uint64_t{1}), kVal, *r.pq, s3), rc::SendResult::Ok) << "the issuing-thread gate is still open";
+    ASSERT_TRUE(r.await(s3));
+    r.expectFailedAtRisk(s3, "send 3");
     const rc::Token c = r.commit(p);
     ASSERT_TRUE(r.await(c));
     r.expectFailedAtRisk(c, "commit");
     EXPECT_EQ(r.endTxns(1), 0);
+}
+
+// I-4: an abort already queued in the producer ring when the guard trips is still applied (the trip must not read the ring).
+TEST(ProducerTxnGuardRegression, AbortQueuedAtTripStillAbortsRegression) {
+    GRig r;
+    r.g_now_base = g_now;
+    const auto ref = r.addLease(1);
+    rc::Producer p = r.producer("tx-a", ref);
+    p.beginTransaction();
+    r.settle();
+    ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
+    const rc::Token a = r.abort(p);   // queued in the ring, no drive
+    ASSERT_NO_FATAL_FAILURE(r.trip());
+    ASSERT_TRUE(r.await(a));
+    EXPECT_EQ(r.got[a].status, OpStatus::Ok) << "an abort is never blocked";
+    EXPECT_EQ(r.endTxns(0), 1);
+    EXPECT_EQ(r.endTxns(1), 0);
+    EXPECT_EQ(p.state(), TxnState::Ready);
+}
+
+// I-3: a bind the guard refuses fails the open transaction at the refusal, like a trip does.
+TEST(ProducerTxnGuardRegression, RefusedBindFailsOpenTransactionRegression) {
+    GRig r;
+    r.g_now_base = g_now;
+    const auto ref = r.addLease(1);
+    rc::Producer p = r.producerUnbound("tx-a");
+    p.beginTransaction();
+    r.settle();
+    ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
+    ASSERT_EQ(p.state(), TxnState::InTransaction);
+    ASSERT_EQ(r.session->bindProducer(ref, p), rc::OpResult::Accepted);
+    ASSERT_EQ(r.session->remove(ref), rc::OpResult::Accepted);   // the End reaches the guard before the bind
+    r.settle();
+    ASSERT_EQ(r.session->core().bindRefused(), 1u);
+    EXPECT_EQ(p.state(), TxnState::AbortableError) << "the refusal fails the open transaction";
+    const rc::Token c = r.commit(p);
+    ASSERT_TRUE(r.await(c));
+    r.expectFailedAtRisk(c, "commit");
+    EXPECT_EQ(r.endTxns(1), 0);
+    const rc::Token a = r.abort(p);
+    ASSERT_TRUE(r.await(a));
+    EXPECT_EQ(r.got[a].status, OpStatus::Ok);
+    EXPECT_EQ(r.endTxns(0), 1);
+}
+
+// M-1: the guard blocks after AddOffsetsToTxn left and before the first TxnOffsetCommit: the offsets leg stops there.
+TEST(ProducerTxnGuardRegression, RefusedBindAfterAddOffsetsBlocksOffsetCommitRegression) {
+    GRig r;
+    r.g_now_base = g_now;
+    const auto ref = r.addLease(1);
+    rc::Producer p = r.producerUnbound("tx-a");
+    p.beginTransaction();
+    r.settle();
+    r.gw.holdAddOffsets = true;
+    const rc::OffsetEntry e{1, 0, 10};
+    const rc::Token o = ++r.tok;
+    ASSERT_EQ(p.sendOffsetsToTransaction(std::span<const rc::OffsetEntry>(&e, 1), "g", *r.pq, o), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return r.frames(TF::AddOffsets) == 1; })) << "AddOffsetsToTxn left";
+    ASSERT_EQ(r.got.count(o), 0u);
+    ASSERT_EQ(r.session->bindProducer(ref, p), rc::OpResult::Accepted);
+    ASSERT_EQ(r.session->remove(ref), rc::OpResult::Accepted);
+    r.settle();
+    ASSERT_EQ(r.session->core().bindRefused(), 1u);
+    r.gw.releaseAddOffsets();
+    ASSERT_TRUE(r.await(o));
+    r.expectFailedAtRisk(o, "sendOffsets");
+    EXPECT_EQ(r.frames(TF::AddOffsets), 1);
+    EXPECT_EQ(r.frames(TF::TxnOffsetCommit), 0) << "no TxnOffsetCommit leaves";
+    EXPECT_EQ(p.state(), TxnState::AbortableError);
 }
 
 TEST(ProducerTxnGuardRegression, TripDuringAwaitDataFailsCommitRegression) {
@@ -403,7 +442,7 @@ TEST(ProducerTxnGuardRegression, TripDuringAwaitDataFailsCommitRegression) {
     r.settle();
     ASSERT_EQ(p.state(), TxnState::CommittingTransaction);
     ASSERT_EQ(r.got.count(c), 0u) << "the commit waits for the unacked record";
-    r.trip();
+    ASSERT_NO_FATAL_FAILURE(r.trip());
     r.settle();
     r.expectFailedAtRisk(s, "send");
     r.expectFailedAtRisk(c, "commit");
@@ -418,12 +457,12 @@ TEST(ProducerTxnGuardRegression, TripAfterEndSentKeepsCommitRegression) {
     rc::Producer p = r.producer("tx-a", ref);
     p.beginTransaction();
     r.settle();
-    r.sendAcked(p);
+    ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
     r.gw.holdEndTxnReply = true;   // the coordinator decides the commit; its answer is withheld
     const rc::Token c = r.commit(p);
     ASSERT_TRUE(r.drive([&] { return r.endTxns(1) == 1; })) << "EndTxn(commit) left";
     ASSERT_EQ(r.got.count(c), 0u);
-    r.trip();
+    ASSERT_NO_FATAL_FAILURE(r.trip());
     EXPECT_EQ(r.got.count(c), 0u) << "the commit was sent inside the lease: its answer decides";
     EXPECT_EQ(p.state(), TxnState::CommittingTransaction);
     r.gw.releaseEndTxnReplies();
@@ -450,8 +489,8 @@ TEST(ProducerTxnGuardRegression, AbortAllowedWhileBlockedRegression) {
     rc::Producer p = r.producer("tx-a", ref);
     p.beginTransaction();
     r.settle();
-    r.sendAcked(p);
-    r.trip();
+    ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
+    ASSERT_NO_FATAL_FAILURE(r.trip());
     ASSERT_EQ(p.state(), TxnState::AbortableError);
     const rc::Token a = r.abort(p);
     ASSERT_TRUE(r.await(a));
@@ -468,15 +507,15 @@ TEST(ProducerTxnGuardRegression, BeginAgainAfterClearedRegression) {
     rc::Producer p = r.producer("tx-a", ref);
     p.beginTransaction();
     r.settle();
-    r.sendAcked(p);
-    r.trip();
+    ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
+    ASSERT_NO_FATAL_FAILURE(r.trip());
     const rc::Token a = r.abort(p);
     ASSERT_TRUE(r.await(a));
     ASSERT_EQ(r.got[a].status, OpStatus::Ok);
     ASSERT_NO_FATAL_FAILURE(r.rearm(1));
     p.beginTransaction();
     r.settle();
-    r.sendAcked(p);
+    ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
     const rc::Token c = r.commit(p);
     ASSERT_TRUE(r.await(c));
     EXPECT_EQ(r.got[c].status, OpStatus::Ok);
@@ -492,7 +531,7 @@ TEST(ProducerTxnGuardRegression, SendOffsetsBlockedAtRiskRegression) {
     rc::Producer p = r.producer("tx-a", ref);
     p.beginTransaction();
     r.settle();
-    r.trip();
+    ASSERT_NO_FATAL_FAILURE(r.trip());
     const rc::OffsetEntry e{1, 0, 10};
     const rc::Token t = ++r.tok;
     ASSERT_EQ(p.sendOffsetsToTransaction(std::span<const rc::OffsetEntry>(&e, 1), "g", *r.pq, t), rc::OpResult::Accepted);
@@ -510,7 +549,19 @@ TEST(ProducerTxnGuardRegression, GuardEndedIsFinalRegression) {
     rc::Producer p = r.producer("tx-a", ref);
     p.beginTransaction();
     r.settle();
-    r.sendAcked(p);
+    ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
+    // a keepalive of the lease, answered only after the loss (a late Ok of the dead lease)
+    r.at(r.g_now_base + kLeaseTtlMs * kMs / 3 + kMs);   // the ttl/3 keepalive goes out; its answer is withheld
+    std::size_t staleK = r.gw.kaSeen.size(), staleE = 0;
+    {
+        std::vector<uint8_t> key(8);
+        const uint64_t id = 1;
+        std::memcpy(key.data(), &id, 8);
+        for (std::size_t k = 0; k < r.gw.kaSeen.size(); ++k)
+            for (std::size_t e = 0; e < r.gw.kaSeen[k].entries.size(); ++e)
+                if (r.gw.kaSeen[k].entries[e].key == key) { staleK = k; staleE = e; }
+    }
+    ASSERT_LT(staleK, r.gw.kaSeen.size()) << "a keepalive carrying the lease was seen";
     r.at(g_now + kMarginAfter);   // MarginExpired: the lease is lost, the guard ends
     ASSERT_EQ(r.cb.lost, 1);
     const rc::Token c = r.commit(p);
@@ -518,10 +569,11 @@ TEST(ProducerTxnGuardRegression, GuardEndedIsFinalRegression) {
     r.expectFailedAtRisk(c, "commit after the lease was lost");
     EXPECT_EQ(r.endTxns(1), 0);
     // a late Ok keepalive answer of the dead lease does not unblock
-    if (!r.gw.kaSeen.empty()) {
-        const test_support::InvokerGateway::KaAnswer ok{0, 0, 3000};
-        r.gw.answerKa(r.gw.kaSeen.size() - 1, std::span(&ok, 1), true);
+    {
+        const test_support::InvokerGateway::KaAnswer ok{static_cast<uint16_t>(staleE), 0, 3000};
+        r.gw.answerKa(staleK, std::span(&ok, 1), true);
         r.settle();
+        EXPECT_EQ(r.cb.cleared, 0) << "the stale answer does not re-arm the dead lease";
     }
     const rc::Token a = r.abort(p);
     ASSERT_TRUE(r.await(a));
@@ -540,15 +592,16 @@ TEST(ProducerTxnGuardRegression, GuardEndedIsFinalRegression) {
     rc::Producer p2 = r.producer("tx-b", ref2);
     p2.beginTransaction();
     r.settle();
-    r.sendAcked(p2);
+    ASSERT_NO_FATAL_FAILURE(r.sendAcked(p2));
     const rc::Token c3 = r.commit(p2);
     ASSERT_TRUE(r.await(c3));
     EXPECT_EQ(r.got[c3].status, OpStatus::Ok);
     EXPECT_EQ(r.endTxns(1), 1);
 }
 
-// A bind the guard refuses (the lease left before the bind was applied) blocks the producer for good WITHOUT a trip: the open transaction
-// is not poisoned by a failGuarded, so the commit itself is what is refused (never EndTxn(commit)).
+// A bind the guard refuses (the lease left before the bind was applied) blocks the producer for good.  Here the transaction is begun AFTER
+// the refusal (nothing was open to fail: RefusedBindFailsOpenTransactionRegression covers that), so it is InTransaction and blocked: the
+// checks in endStep_ / offsetsStep_ are what refuse the commit and the offsets (never EndTxn(commit)).
 TEST(ProducerTxnGuardRegression, RefusedBindBlocksCommitRegression) {
     GRig r;
     r.g_now_base = g_now;
@@ -562,7 +615,7 @@ TEST(ProducerTxnGuardRegression, RefusedBindBlocksCommitRegression) {
     p.beginTransaction();
     r.settle();
     ASSERT_EQ(r.session->core().bindRefused(), 1u) << "the bind was refused: the lease had left";
-    ASSERT_EQ(p.state(), TxnState::InTransaction) << "blocked, not poisoned";
+    ASSERT_EQ(p.state(), TxnState::InTransaction) << "begun after the refusal: open and blocked";
     const rc::OffsetEntry e{1, 0, 10};
     const rc::Token o = ++r.tok;
     ASSERT_EQ(p.sendOffsetsToTransaction(std::span<const rc::OffsetEntry>(&e, 1), "g", *r.pq, o), rc::OpResult::Accepted);
@@ -597,7 +650,7 @@ TEST(ProducerTxnGuardRegression, UnboundTransactionalProducerUnchangedRegression
     GRig r;
     r.g_now_base = g_now;
     (void)r.addLease(1);
-    r.trip();   // a tripped lease of the session does not touch a producer that is not bound to it
+    ASSERT_NO_FATAL_FAILURE(r.trip());   // a tripped lease of the session does not touch a producer that is not bound to it
     rc::Producer p = r.producerUnbound("tx-u");
     ASSERT_EQ(p.state(), TxnState::Ready);                                  // 1: initTransactions
     p.beginTransaction();                                                    // 2: an empty transaction commits with no EndTxn
@@ -608,14 +661,14 @@ TEST(ProducerTxnGuardRegression, UnboundTransactionalProducerUnchangedRegression
     EXPECT_EQ(r.endTxnsAny(), 0);
     p.beginTransaction();                                                    // 3: data acked, commit -> one EndTxn(commit)
     r.settle();
-    r.sendAcked(p);
+    ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
     c = r.commit(p);
     ASSERT_TRUE(r.await(c));
     EXPECT_EQ(r.got[c].status, OpStatus::Ok);
     EXPECT_EQ(r.endTxns(1), 1);
     p.beginTransaction();                                                    // 4: data acked, abort -> one EndTxn(abort)
     r.settle();
-    r.sendAcked(p);
+    ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
     const rc::Token a = r.abort(p);
     ASSERT_TRUE(r.await(a));
     EXPECT_EQ(r.got[a].status, OpStatus::Ok);
@@ -696,7 +749,7 @@ TEST(ProducerTxnGuardRegression, GuardTxnMatrixRegression) {
         r.settle();
         switch (row.at) {
         case At::InTxnNoRecords: break;
-        case At::InTxnAcked: r.sendAcked(p); break;
+        case At::InTxnAcked: ASSERT_NO_FATAL_FAILURE(r.sendAcked(p)); break;
         case At::InTxnUnacked: pending = r.sendUnacked(p); break;
         case At::CommitAwaitData:
             (void)r.sendUnacked(p);
@@ -704,7 +757,7 @@ TEST(ProducerTxnGuardRegression, GuardTxnMatrixRegression) {
             r.settle();
             break;
         case At::CommitEndSent:
-            r.sendAcked(p);
+            ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
             r.gw.holdEndTxnReply = true;
             pending = r.commit(p);
             ASSERT_TRUE(r.drive([&] { return r.endTxns(1) == 1; }));
@@ -715,7 +768,7 @@ TEST(ProducerTxnGuardRegression, GuardTxnMatrixRegression) {
             r.settle();
             break;
         case At::ReadyAfterAbort: {
-            r.sendAcked(p);
+            ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
             const rc::Token a = r.abort(p);
             ASSERT_TRUE(r.await(a));
             ASSERT_EQ(r.got[a].status, OpStatus::Ok);

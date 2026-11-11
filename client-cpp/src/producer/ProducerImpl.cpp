@@ -1912,6 +1912,10 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                     std::memcpy(&armSeq, p + 12, 4);
                     std::memcpy(&atRiskNs, p + 16, 8);
                     hooks_.guardBind(hooks_.ctx, *this, sid, slot, gen, armSeq, atRiskNs);
+                    if (guardFailDue_) {   // I-7: the failure runs after this read (it must not nest a read of the ring)
+                        lastDrainStop_ = DrainStop::FlushToken;
+                        return ControlledAction::BREAK;
+                    }
                 }
                 return ControlledAction::CONTINUE;
             }
@@ -1943,6 +1947,10 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
             return ControlledAction::BREAK;
         },
         messageLimit);
+    if (guardFailDue_) [[unlikely]] {   // I-7 / I-3: a bind onto a tripped / refused guard, applied in the read above
+        guardFailDue_ = false;
+        failGuarded(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk));
+    }
     if (controlApplied) [[unlikely]] {
         const DutyScope duty(*this);   // runs what the op's handlers deferred (a close, deferred records)
     }
@@ -4096,6 +4104,10 @@ bool ProducerImpl::submitGuardBind(uint32_t sid, uint32_t slot, uint32_t gen, ui
         if (std::this_thread::get_id() != dutyThreadId_) return false;
         guardBindIssued_ = true;
         hooks_.guardBind(hooks_.ctx, *this, sid, slot, gen, armSeq, atRiskNs);
+        if (guardFailDue_) {   // no ring read here: fail now
+            guardFailDue_ = false;
+            failGuarded(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk));
+        }
         return true;
     }
     uint8_t p[24];
@@ -4179,6 +4191,11 @@ void ProducerImpl::failAllPending(OpStatus st, uint16_t errorCode) noexcept {
             if (discardRing_(st, INT_MAX, errorCode) == 0) break;
         }
     }
+    failAccepted_(st, errorCode);
+}
+
+void ProducerImpl::failAccepted_(OpStatus st, uint16_t errorCode) noexcept {
+    const DutyScope duty(*this);
     failDeferred_(st, errorCode);  // records deferred before this call were accepted: fail them too
     // Everything the producer accepted: in-flight batches + the current builder
     // + queued Tier-2 batches.  Indexed walk: a handler may append partitions

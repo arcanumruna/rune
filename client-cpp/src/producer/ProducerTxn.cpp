@@ -592,6 +592,15 @@ void ProducerImpl::poison_(OpStatus st, uint16_t errorCode, AbortKind kind) noex
     if (auto* ab = std::get_if<Aborting>(&txn_); ab != nullptr && kind == AbortKind::BumpEpoch) ab->kind = kind;
 }
 
+void ProducerImpl::guardRecallUnsentCommit_() noexcept {
+    auto* cm = std::get_if<Committing>(&txn_);
+    if (cm == nullptr || !coord_) return;
+    const auto* es = std::get_if<EndSent>(&cm->phase);
+    if (es == nullptr || es->attempt != EndTry::First || es->slot == nullptr || es->slot->offers != 0) return;
+    coord_->release(*es->slot);
+    cm->phase = AwaitData{};
+}
+
 void ProducerImpl::onTxnLegAnswer_(ReqKind kind, int16_t errorCode) noexcept {
     const uint16_t code = static_cast<uint16_t>(errorCode);
     switch (CoordinatorLink::classify(kind, errorCode)) {

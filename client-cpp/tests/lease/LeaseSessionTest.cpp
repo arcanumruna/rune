@@ -2,6 +2,7 @@
 // against the InvokerGateway stub broker, on a fake clock.  Every drive loop is capped; nothing sleeps.
 #include "../support/AllocCounter.h"
 #include "../support/InvokerGateway.h"
+#include "../support/LeaseGatewayRig.h"
 #include "../support/TestCompletions.h"
 
 #include <rune/client/Client.h>
@@ -44,26 +45,8 @@ int64_t realNow() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-rune::codec::Descriptor leaseDescriptor() {
-    return rune::codec::DescriptorBuilder("lease_t", 1).add("id", rune::codec::PrimType::Int64, 1, /*isKey=*/true).build();
-}
-const uint64_t kFp = rune::codec::fingerprint(leaseDescriptor());
-
-struct Row {
-    static const uint64_t             kFingerprint;
-    static constexpr std::string_view kSchemaName = "lease_t";
-    uint64_t id = 0;
-    [[nodiscard]] uint64_t    key() const noexcept { return id; }
-    [[nodiscard]] std::size_t encodedSize() const noexcept { return 4 + 32 + 8; }
-    std::size_t encode(uint8_t* b) const noexcept {
-        std::memset(b, 0, 44);
-        b[0] = 40;
-        b[2] = 1;
-        std::memcpy(b + 36, &id, 8);
-        return 44;
-    }
-};
-const uint64_t Row::kFingerprint = kFp;
+using test_support::leaseDescriptor;
+using Row = test_support::LeaseRow;
 
 struct DataDirs {
     std::vector<std::string> dirs;
@@ -96,8 +79,7 @@ rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
     return c;
 }
 
-const rune::protocol::LeaseSpec kSpec{.ttlMs = 6000, .minTtlMs = 1000, .maxTtlMs = 60000, .maxKeys = 100000,
-                                      .expiryBatch = 64, .checkpoint = 0, .checkpointIntervalMs = 1000, .checkpointRate = 1};
+const rune::protocol::LeaseSpec& kSpec = test_support::leaseSpec();
 
 std::vector<uint8_t> verdicts(const std::vector<uint16_t>& codes) {
     std::vector<uint8_t> v(codes.size() * 8, 0);
@@ -170,24 +152,7 @@ struct SRig {
     explicit SRig(const rc::ClientConfig& c, uint32_t partitions = 1, uint32_t maxDelayMs = 100, bool makeSession = true)
         : client(std::make_unique<rc::Client>(c)),
           gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId, c.egressChannel, c.egressStreamId) {
-        gw.idempotence            = true;
-        gw.replySchemas           = true;
-        gw.schemaBlob             = rune::codec::serialize(leaseDescriptor());
-        gw.schemaTopicId          = 1;
-        gw.schemaPartitionCount   = static_cast<int32_t>(partitions);
-        gw.schemaLeaseViewTopicId = 9;
-        rune::protocol::TopicKeyFeatures f;
-        f.keyIndex = true;
-        gw.schemaKeyFeatures = f;
-        gw.schemaLease       = kSpec;
-        gw.produceLeaseTrailer = [] {
-            std::vector<uint8_t> t(16);
-            const int64_t v = 77;
-            const uint64_t ttl = 5000;
-            std::memcpy(t.data(), &v, 8);
-            std::memcpy(t.data() + 8, &ttl, 8);
-            return t;
-        }();
+        test_support::configureLeaseGateway(gw, partitions);
         connect();
         topic.emplace(openTopic());
         awaitProducer();
@@ -214,40 +179,8 @@ struct SRig {
         }
         return false;
     }
-    void connect() {
-        for (int i = 0; i < 4000 && !gw.ready(); ++i) { client->doWork(); gw.pump(); }
-        ASSERT_TRUE(gw.ready());
-        test_support::TestCq cq(*client);
-        auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client->connect(q, t); });
-        for (int i = 0; i < 4000 && !f.ready(); ++i) { client->doWork(); gw.pump(); }
-        ASSERT_TRUE(f.ok()) << f.describe();
-        for (int i = 0; i < 4000 && gw.metadataRequests == 0; ++i) { client->doWork(); gw.pump(); }
-    }
-    template <class Fn>
-    void whilePumping(Fn&& fn) {
-        int stop[2];
-        ASSERT_EQ(::pipe(stop), 0);
-        std::thread t([&] {
-            pollfd pfd{stop[0], POLLIN, 0};
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            while (::poll(&pfd, 1, 0) == 0 && std::chrono::steady_clock::now() < deadline) gw.pump();
-        });
-        const auto release = [&] {
-            const char b = 0;
-            (void)!::write(stop[1], &b, 1);
-            t.join();
-            ::close(stop[0]);
-            ::close(stop[1]);
-        };
-        try { fn(); } catch (...) { release(); throw; }
-        release();
-    }
-    rc::LeaseTopic<Row> openTopic() {
-        std::optional<rc::LeaseTopic<Row>> h;
-        whilePumping([&] { h.emplace(client->openLeaseTopicAndWait<Row>("lease_t", {})); });
-        EXPECT_TRUE(h.has_value());
-        return std::move(*h);
-    }
+    void connect() { test_support::connectGateway(*client, gw); }
+    rc::LeaseTopic<Row> openTopic() { return test_support::openLeaseTopic(*client, gw); }
     void awaitProducer() {
         for (int i = 0; i < 4000 && topic->producer().producerId() < 0; ++i) { client->doWork(); gw.pump(); }
         ASSERT_GE(topic->producer().producerId(), 0);
