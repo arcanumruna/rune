@@ -518,6 +518,50 @@ namespace {
 
 int ackOrErrorCode(ShardTestClient& c, int64_t corr, std::chrono::milliseconds within);   // defined with the matrix
 
+/// #891 / #897 diagnostics: a bounded, de-duplicated log of the transitions of one client thread (connect / login /
+/// first ack / errors), stamped in ms since the trace was created.  Printed only when the test fails.
+class ClientTrace {
+public:
+    explicit ClientTrace(std::string who) : who_(std::move(who)), t0_(Clock3::now()) {}
+    void note(std::string ev) {
+        const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock3::now() - t0_).count();
+        const std::lock_guard lk(m_);
+        if (!entries_.empty() && entries_.back().ev == ev) { ++entries_.back().count; entries_.back().lastMs = ms; return; }
+        if (entries_.size() >= kCap) { entries_.erase(entries_.begin() + kCap / 2); ++dropped_; }   // keep the start and the latest
+        entries_.push_back({std::move(ev), ms, ms, 1});
+    }
+    void progress(int64_t v) noexcept { progress_.store(v, std::memory_order_relaxed); }
+    [[nodiscard]] int64_t progressValue() const noexcept { return progress_.load(std::memory_order_relaxed); }
+    [[nodiscard]] std::string dump() const {
+        const std::lock_guard lk(m_);
+        std::string out = "--- " + who_ + " transitions (" + std::to_string(entries_.size()) + " entries, " + std::to_string(dropped_) + " dropped) ---\n";
+        for (const auto& e : entries_) {
+            out += "  +" + std::to_string(e.firstMs) + " ms  " + e.ev;
+            if (e.count > 1) out += "  (x" + std::to_string(e.count) + ", last +" + std::to_string(e.lastMs) + " ms)";
+            out += "\n";
+        }
+        return out;
+    }
+private:
+    static constexpr std::size_t kCap = 200;
+    struct Entry { std::string ev; int64_t firstMs, lastMs; int count; };
+    std::string who_;
+    Clock3::time_point t0_;
+    mutable std::mutex m_;
+    std::vector<Entry> entries_;
+    int dropped_ = 0;
+    std::atomic<int64_t> progress_{0};
+};
+
+/// Prints both traces to stderr at scope exit iff the test has failed.  Declared BEFORE the client jthreads so they are
+/// joined first.
+struct TraceDumpOnFailure {
+    ClientTrace &p, &c;
+    ~TraceDumpOnFailure() {
+        if (::testing::Test::HasFailure()) std::fprintf(stderr, "%s%s", p.dump().c_str(), c.dump().c_str());
+    }
+};
+
 struct ProducerResult { std::vector<int64_t> acked; std::vector<Clock3::time_point> ackedAt; int attempts = 0; };
 /// Issue #403: the producer thread publishes the time of its latest ack (steady-clock ns; 0 = none yet) so the test
 /// thread waits for traffic by condition instead of a fixed sleep.  Written by the producer only (release), read by the
@@ -531,7 +575,8 @@ struct ConsumerResult { std::map<int64_t, int> deliveries; std::set<int64_t> off
 /// The client is built on the test thread (the thread's lambda owns it): the port allocator is single-threaded, and a
 /// producer and a consumer building theirs at once were handed the same egress port (EADDRINUSE).
 ProducerResult runProducer(std::stop_token stop, std::array<std::string, 3> channels, AuthWireClient& w, int32_t topic,
-                           LastAck* lastAck) {
+                           LastAck* lastAck, ClientTrace* tr = nullptr) {
+    const auto note = [tr](std::string ev) { if (tr) tr->note(std::move(ev)); };
     ProducerResult out;
     std::array<int64_t, 3> sid{};
     std::size_t node = 0;
@@ -539,21 +584,27 @@ ProducerResult runProducer(std::stop_token stop, std::array<std::string, 3> chan
         const std::size_t n = node % 3;
         if (sid[n] == 0) {
             const int64_t s = w.connect(channels[n], pc::kClientVersionAuth, 2s);
-            if (s > 0 && w.login(channels[n], s, "prod", {AuthTrio::kPw, AuthTrio::kPw}, 0, true, 5s).ok()) sid[n] = s;
-            else { ++node; std::this_thread::sleep_for(20ms); continue; }
+            note("connect node " + std::to_string(n + 1) + (s > 0 ? " -> session " + std::to_string(s) : std::string(" -> failed")));
+            if (s > 0) note("login sent node " + std::to_string(n + 1));
+            const auto l = s > 0 ? w.login(channels[n], s, "prod", {AuthTrio::kPw, AuthTrio::kPw}, 0, true, 5s) : AuthWireClient::Login{};
+            if (s > 0) note("login result node " + std::to_string(n + 1) + (l.ok() ? " ok" : " error code " + std::to_string(l.errorCode())));
+            if (s > 0 && l.ok()) sid[n] = s;
+            else { note("reconnect: leaving node " + std::to_string(n + 1)); ++node; std::this_thread::sleep_for(20ms); continue; }
         }
         auto& c = w.raw();
         const int64_t corr = c.nextCorrelationId();
         ++out.attempts;
-        if (!c.produce(channels[n], AuthWireClient::kClientStream, sid[n], corr, topic, 0, 1, makeCharBatch(1))) { sid[n] = 0; ++node; continue; }
+        if (!c.produce(channels[n], AuthWireClient::kClientStream, sid[n], corr, topic, 0, 1, makeCharBatch(1))) { note("produce not sent node " + std::to_string(n + 1)); sid[n] = 0; ++node; continue; }
         const int code = ackOrErrorCode(c, corr, 1s);
         if (code == 0) {
+            if (out.acked.empty()) note("first ack node " + std::to_string(n + 1));
             out.acked.push_back(c.ackFor(corr)->baseOffset);
             out.ackedAt.push_back(Clock3::now());
             lastAck->store(steadyNs(out.ackedAt.back()), std::memory_order_release);
             std::this_thread::sleep_for(10ms);
             continue;
         }
+        note("produce answer code " + std::to_string(code) + " node " + std::to_string(n + 1));
         if (code != 3 && code != 2) sid[n] = 0;   // no answer / revoked / refused: this broker's session is gone
         ++node;
         std::this_thread::sleep_for(10ms);
@@ -565,7 +616,8 @@ ProducerResult runProducer(std::stop_token stop, std::array<std::string, 3> chan
 /// resubscribes elsewhere when its broker restarts.  `target` (a one-shot hand-off from the test: the last acked offset)
 /// tells it what "everything" is; it returns every offset it saw.
 ConsumerResult runConsumer(std::stop_token stop, std::future<int64_t> target, std::array<std::string, 3> channels,
-                           AuthWireClient& w, int32_t topic, std::size_t batchBytes) {
+                           AuthWireClient& w, int32_t topic, std::size_t batchBytes, ClientTrace* tr = nullptr) {
+    const auto note = [tr](std::string ev) { if (tr) tr->note(std::move(ev)); };
     ConsumerResult out;
     std::array<int64_t, 3> sid{};
     std::size_t node = 0;
@@ -587,15 +639,20 @@ ConsumerResult runConsumer(std::stop_token stop, std::future<int64_t> target, st
         const std::size_t n = node % 3;
         if (sid[n] == 0) {
             const int64_t s = w.connect(channels[n], pc::kClientVersionAuth, 2s);
-            if (s > 0 && w.login(channels[n], s, "cons", {AuthTrio::kPw, AuthTrio::kPw}, 0, true, 5s).ok()) sid[n] = s;
-            else { ++node; std::this_thread::sleep_for(20ms); continue; }
+            note("connect node " + std::to_string(n + 1) + (s > 0 ? " -> session " + std::to_string(s) : std::string(" -> failed")));
+            if (s > 0) note("login sent node " + std::to_string(n + 1));
+            const auto l = s > 0 ? w.login(channels[n], s, "cons", {AuthTrio::kPw, AuthTrio::kPw}, 0, true, 5s) : AuthWireClient::Login{};
+            if (s > 0) note("login result node " + std::to_string(n + 1) + (l.ok() ? " ok" : " error code " + std::to_string(l.errorCode())));
+            if (s > 0 && l.ok()) sid[n] = s;
+            else { note("reconnect: leaving node " + std::to_string(n + 1)); ++node; std::this_thread::sleep_for(20ms); continue; }
         }
         auto& c = w.raw();
         const std::size_t firstRecord = c.records().size();   // subscription ids repeat per broker: only records from now on are ours
         const int64_t corr = c.subscribeIsolated(channels[n], AuthWireClient::kClientStream, sid[n], topic, 0, next, 0);
         const auto code = corr ? c.awaitSubscribeCode(corr, Clock3::now() + 3s) : std::nullopt;
-        if (!code || *code != 0) { if (!code || *code != 3) sid[n] = 0; ++node; std::this_thread::sleep_for(20ms); continue; }
+        if (!code || *code != 0) { note("subscribe node " + std::to_string(n + 1) + (code ? " code " + std::to_string(*code) : std::string(" no answer"))); if (!code || *code != 3) sid[n] = 0; ++node; std::this_thread::sleep_for(20ms); continue; }
         ++out.resubscribes;
+        note("subscribed node " + std::to_string(n + 1) + " from offset " + std::to_string(next));
         const int64_t sub = c.subscriptionIdOf(corr).value_or(0);
         std::size_t seenRecords = firstRecord;
         auto lastProgress = Clock3::now();
@@ -612,15 +669,37 @@ ConsumerResult runConsumer(std::stop_token stop, std::future<int64_t> target, st
                 }
                 lastProgress = Clock3::now();
             }
+            if (tr) tr->progress(static_cast<int64_t>(out.offsets.size()));
             while (out.offsets.count(next)) ++next;
             for (const auto& e : c.errors()) if (e.sessionId == sid[n] && e.code != 0) broken = true;
             learnTarget();
             if (want >= -1 && next > want) { out.complete = true; return out; }
-            if (Clock3::now() - lastProgress > 4s && want != -2) broken = true;   // told the target but starved: another broker
+            if (Clock3::now() - lastProgress > 4s && want != -2) { broken = true; note("starved 4 s after the target: leaving node " + std::to_string(n + 1)); }   // told the target but starved: another broker
         }
         sid[n] = 0;
         ++node;
     }
+    return out;
+}
+
+/// Per node: links established, security leader, replication leader; then the producer's lastAck and the consumer's
+/// received count.  Names the stalled half.  Used in the failure message of a "links and traffic" wait.
+std::string describeTraffic(AuthTrio& t, const std::atomic<int64_t>& lastAck, const ClientTrace& cons) {
+    std::string out = "\n";
+    bool linksOk = true;
+    int32_t secLeader = -1;
+    try { secLeader = settledSecurityLeader(t.cluster()); } catch (...) {}
+    for (int id : {1, 2, 3}) {
+        const uint64_t links = t.counter(id, typeIdOf(RuneMetric::PeerLinksEstablished)).value_or(0);
+        if (links != 2) linksOk = false;
+        bool repl = false;
+        try { repl = t.node(id).replicationIsLeaderForTest(); } catch (...) {}
+        out += "  node " + std::to_string(id) + ": PeerLinksEstablished=" + std::to_string(links) +
+               " securityLeader=" + (secLeader == id ? "yes" : "no") + " replicationLeader=" + (repl ? "yes" : "no") + "\n";
+    }
+    const int64_t ack = lastAck.load(std::memory_order_acquire);
+    out += "  producer lastAck=" + std::to_string(ack) + "  consumer received=" + std::to_string(cons.progressValue()) + "\n";
+    out += std::string("  stalled half: ") + (!linksOk && ack == 0 ? "BOTH (links != 2 and no ack)" : !linksOk ? "LINKS (PeerLinksEstablished != 2)" : ack == 0 ? "TRAFFIC (no ack ever)" : "neither (condition met late)") + "\n";
     return out;
 }
 
@@ -656,17 +735,21 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
     // everything the threads need is copied BEFORE they start: they never touch the trio while it restarts nodes
     const std::filesystem::path prodDir = t.cluster().clientsDir->path / "rot_prod", consDir = t.cluster().clientsDir->path / "rot_cons";
     LastAck lastAck{0};
+    ClientTrace pTrace("producer"), cTrace("consumer");
+    const TraceDumpOnFailure dumpTraces{pTrace, cTrace};   // after the jthreads' referents, before the jthreads
     // PR #604 review: the threads are declared AFTER everything they reference (lastAck, pOut, cOut, target) - an
     // early ASSERT return destroys locals in reverse order, so each jthread is stopped and joined before them.
     std::jthread producer;
     std::jthread consumer;
-    producer = std::jthread([&pOut, &lastAck, ch = channels, w = std::make_unique<AuthWireClient>(prodDir), topic](std::stop_token st) {
-        try { pOut.set_value(runProducer(st, ch, *w, topic, &lastAck)); }
-        catch (...) { pOut.set_exception(std::current_exception()); }
+    producer = std::jthread([&pOut, &lastAck, &pTrace, ch = channels, w = std::make_unique<AuthWireClient>(prodDir), topic](std::stop_token st) {
+        try { pOut.set_value(runProducer(st, ch, *w, topic, &lastAck, &pTrace)); }
+        catch (const std::exception& e) { pTrace.note(std::string("EXCEPTION: ") + e.what()); pOut.set_exception(std::current_exception()); }
+        catch (...) { pTrace.note("EXCEPTION: unknown"); pOut.set_exception(std::current_exception()); }
     });
-    consumer = std::jthread([&cOut, ch = channels, w = std::make_unique<AuthWireClient>(consDir), topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
-        try { cOut.set_value(runConsumer(st, std::move(fut), ch, *w, topic, batchBytes)); }
-        catch (...) { cOut.set_exception(std::current_exception()); }
+    consumer = std::jthread([&cOut, &cTrace, ch = channels, w = std::make_unique<AuthWireClient>(consDir), topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
+        try { cOut.set_value(runConsumer(st, std::move(fut), ch, *w, topic, batchBytes, &cTrace)); }
+        catch (const std::exception& e) { cTrace.note(std::string("EXCEPTION: ") + e.what()); cOut.set_exception(std::current_exception()); }
+        catch (...) { cTrace.note("EXCEPTION: unknown"); cOut.set_exception(std::current_exception()); }
     });
 
     auto allLinked = [&] {
@@ -675,7 +758,7 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
             return true;
         });
     };
-    ASSERT_TRUE(allLinked());
+    ASSERT_TRUE(allLinked()) << "initial links" << describeTraffic(t, lastAck, cTrace);
     struct Step { const char* name; std::string cur, next; };
     const std::vector<Step> steps = {{"K1|K2", k1, k2}, {"K2|K1", k2, k1}, {"K2", k2, ""}};
     struct Restart { Clock3::time_point start, end; const char* step; int node; };
@@ -687,7 +770,7 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
             const bool linked = allLinked();
             const double ms = std::chrono::duration<double, std::milli>(Clock3::now() - t0).count();
             std::printf("ROTATION step=%s node=%d restart+links-reestablished=%.0f ms\n", st.name, id, ms);
-            EXPECT_TRUE(linked) << "step " << st.name << ": links after restarting node " << id;
+            EXPECT_TRUE(linked) << "step " << st.name << ": links after restarting node " << id << describeTraffic(t, lastAck, cTrace);
             EXPECT_TRUE(awaitSecurityLeader(t.cluster(), 60s));
             const auto end = Clock3::now();
             restarts.push_back({t0, end, st.name, id});
@@ -695,7 +778,7 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
             // condition, for an ack that landed after this one ended (a fixed 4 s sleep made the "an ack landed after
             // each restart" check below a race against the load on the host).
             ASSERT_TRUE(AuthTrio::until(60s, [&] { return lastAck.load(std::memory_order_acquire) > steadyNs(end); }))
-                << "step " << st.name << ": no ack within 60 s after restarting node " << id;
+                << "step " << st.name << ": no ack within 60 s after restarting node " << id << describeTraffic(t, lastAck, cTrace);
         }
     }
     const auto loopEnd = Clock3::now();
@@ -774,21 +857,25 @@ TEST(AuthClusterRegression, RehandshakeWhileWorkersSealIsRaceFreeRegression) {
     auto cFut = cOut.get_future();
     const std::filesystem::path prodDir = t.cluster().clientsDir->path / "rkw_prod", consDir = t.cluster().clientsDir->path / "rkw_cons";
     LastAck lastAck{0};
+    ClientTrace pTrace("producer"), cTrace("consumer");
+    const TraceDumpOnFailure dumpTraces{pTrace, cTrace};   // after the jthreads' referents, before the jthreads
     std::jthread producer;
     std::jthread consumer;
-    producer = std::jthread([&pOut, &lastAck, ch = channels, w = std::make_unique<AuthWireClient>(prodDir), topic](std::stop_token st) {
-        try { pOut.set_value(runProducer(st, ch, *w, topic, &lastAck)); }
-        catch (...) { pOut.set_exception(std::current_exception()); }
+    producer = std::jthread([&pOut, &lastAck, &pTrace, ch = channels, w = std::make_unique<AuthWireClient>(prodDir), topic](std::stop_token st) {
+        try { pOut.set_value(runProducer(st, ch, *w, topic, &lastAck, &pTrace)); }
+        catch (const std::exception& e) { pTrace.note(std::string("EXCEPTION: ") + e.what()); pOut.set_exception(std::current_exception()); }
+        catch (...) { pTrace.note("EXCEPTION: unknown"); pOut.set_exception(std::current_exception()); }
     });
-    consumer = std::jthread([&cOut, ch = channels, w = std::make_unique<AuthWireClient>(consDir), topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
-        try { cOut.set_value(runConsumer(st, std::move(fut), ch, *w, topic, batchBytes)); }
-        catch (...) { cOut.set_exception(std::current_exception()); }
+    consumer = std::jthread([&cOut, &cTrace, ch = channels, w = std::make_unique<AuthWireClient>(consDir), topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
+        try { cOut.set_value(runConsumer(st, std::move(fut), ch, *w, topic, batchBytes, &cTrace)); }
+        catch (const std::exception& e) { cTrace.note(std::string("EXCEPTION: ") + e.what()); cOut.set_exception(std::current_exception()); }
+        catch (...) { cTrace.note("EXCEPTION: unknown"); cOut.set_exception(std::current_exception()); }
     });
 
     ASSERT_TRUE(AuthTrio::until(60s, [&] {
         for (int id : {1, 2, 3}) if (t.counter(id, typeIdOf(RuneMetric::PeerLinksEstablished)).value_or(0) != 2) return false;
         return lastAck.load(std::memory_order_acquire) > 0;
-    })) << "links established and traffic flowing";
+    })) << "links established and traffic flowing" << describeTraffic(t, lastAck, cTrace);
 
     // Every plane's UnknownEpoch drops (control ingress + legacy replication, admin plane, every worker) and the
     // authenticated frames every worker plane opened (the non-vacuity witness).
@@ -899,18 +986,22 @@ TEST(AuthClusterRegression, RehandshakeWithWorkersSlowToInstallDropsNothingRegre
         auto cFut = cOut.get_future();
         const std::filesystem::path prodDir = t.cluster().clientsDir->path / "rks_prod", consDir = t.cluster().clientsDir->path / "rks_cons";
         LastAck lastAck{0};
-        std::jthread producer([&pOut, &lastAck, ch = channels, w = std::make_unique<AuthWireClient>(prodDir), topic](std::stop_token st) {
-            try { pOut.set_value(runProducer(st, ch, *w, topic, &lastAck)); }
-            catch (...) { pOut.set_exception(std::current_exception()); }
+        ClientTrace pTrace("producer"), cTrace("consumer");
+        const TraceDumpOnFailure dumpTraces{pTrace, cTrace};
+        std::jthread producer([&pOut, &lastAck, &pTrace, ch = channels, w = std::make_unique<AuthWireClient>(prodDir), topic](std::stop_token st) {
+            try { pOut.set_value(runProducer(st, ch, *w, topic, &lastAck, &pTrace)); }
+            catch (const std::exception& e) { pTrace.note(std::string("EXCEPTION: ") + e.what()); pOut.set_exception(std::current_exception()); }
+            catch (...) { pTrace.note("EXCEPTION: unknown"); pOut.set_exception(std::current_exception()); }
         });
-        std::jthread consumer([&cOut, ch = channels, w = std::make_unique<AuthWireClient>(consDir), topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
-            try { cOut.set_value(runConsumer(st, std::move(fut), ch, *w, topic, batchBytes)); }
-            catch (...) { cOut.set_exception(std::current_exception()); }
+        std::jthread consumer([&cOut, &cTrace, ch = channels, w = std::make_unique<AuthWireClient>(consDir), topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
+            try { cOut.set_value(runConsumer(st, std::move(fut), ch, *w, topic, batchBytes, &cTrace)); }
+            catch (const std::exception& e) { cTrace.note(std::string("EXCEPTION: ") + e.what()); cOut.set_exception(std::current_exception()); }
+            catch (...) { cTrace.note("EXCEPTION: unknown"); cOut.set_exception(std::current_exception()); }
         });
         ASSERT_TRUE(AuthTrio::until(60s, [&] {
             for (int id : {1, 2, 3}) if (t.counter(id, typeIdOf(RuneMetric::PeerLinksEstablished)).value_or(0) != 2) return false;
             return lastAck.load(std::memory_order_acquire) > 0;
-        })) << "links established and traffic flowing";
+        })) << "links established and traffic flowing" << describeTraffic(t, lastAck, cTrace);
 
         auto unknownEpochDrops = [&](BrokerNode& n) {
             uint64_t d = n.peerLinksForTest().unknownEpochDrops + n.adminPeerUnknownEpochDropsForTest();
