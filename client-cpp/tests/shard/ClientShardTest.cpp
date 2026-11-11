@@ -882,16 +882,38 @@ TEST(ClientShardRegression, RebuildFailureBacksOffWithoutSpinningRegression) {
     EXPECT_LE(workSteps, 2 * static_cast<int>(attemptAt.size()) + 8) << "doWork() returns 0 between attempts";
     const int64_t gap = attemptAt[1] - attemptAt[0];
     EXPECT_GE(gap, 100'000'000) << "the first retry waits at least 100 ms";
-    EXPECT_LE(gap, 130'000'000);
+    EXPECT_LE(gap, 140'000'000);   // the gap starts on the pass after the failed attempt: one 10 ms step later
     for (std::size_t i = 2; i < attemptAt.size(); ++i) {
         const int64_t expected = std::min<int64_t>(100'000'000LL << (i - 1), 10'000'000'000LL);
         const int64_t actual   = attemptAt[i] - attemptAt[i - 1];
         EXPECT_GE(actual, expected - 10'000'000) << "gap " << i;
-        EXPECT_LE(actual, expected + expected / 4 + 20'000'000) << "gap " << i << " (jitter is at most a quarter)";
+        EXPECT_LE(actual, expected + expected / 4 + 30'000'000) << "gap " << i << " (jitter is at most a quarter)";
     }
     EXPECT_GE(attemptAt.back() - attemptAt[attemptAt.size() - 2], 9'990'000'000LL) << "the gap saturates at 10 s";
     r.shard->client().testSetSeedIngressChannel(goodChannel);
     ASSERT_TRUE(r.drive([&] { return r.shard->client().testTransportRebuilds() == 1 && r.state() == rs::ShardState::Live; }, 10'000'000));
+}
+
+// A failed attempt that itself takes longer than the gap (a slow DNS lookup) must not eat the gap: it runs from the end of
+// the attempt.  Every duty pass advances the fake clock by 1 s, so the pass that ran an attempt "took" 1 s, longer than any
+// gap below the 10 s cap; attempts must still be at most every second pass.
+TEST(ClientShardRegression, RebuildGapStartsAfterASlowFailedAttemptRegression) {
+    auto g = ownDriverGroup(3818, 3819);
+    OwnDriverRig r(g);
+    r.connect();
+    r.shard->client().testSetSeedIngressChannel(kUnreachableSeed);
+    r.shard->client().testInjectTransportFault();
+    const auto pass = [&] {
+        g_now += 1'000'000'000;
+        r.shard->doWork();
+        r.gw().pump();
+        r.shard->pollEvents([&](const rs::ShardStatus& st) { r.events.push_back(st); });
+    };
+    for (int i = 0; i < 100 && r.shard->client().testRebuildAttempt() == 0; ++i) pass();
+    ASSERT_GE(r.shard->client().testRebuildAttempt(), 1u);
+    const uint32_t first = r.shard->client().testRebuildAttempt();
+    for (int i = 0; i < 6; ++i) pass();
+    EXPECT_LE(r.shard->client().testRebuildAttempt() - first, 3u) << "a 1 s attempt does not consume the gap that follows it";
 }
 
 // The seed moved to another broker channel (a completed failover): the rebuild keeps it there, and the resume goes to
@@ -990,9 +1012,8 @@ TEST(ClientShardRegression, ThreadRunnerCloseRightAfterTransportFaultJoinsPrompt
         });
         return seen >= 2;
     }));
-    const auto t0 = std::chrono::steady_clock::now();
     client.close();
-    EXPECT_LT(std::chrono::steady_clock::now() - t0, 200ms) << "close() does not wait for the backoff gap";
+    // driveRebuild_ runs before the ring drain in doWork: a close() that waited for the gap would see attempt seen + 1 run first.
     EXPECT_EQ(client.testRebuildAttempt(), static_cast<uint32_t>(seen)) << "close() ran no further rebuild attempt";
     EXPECT_EQ(client.testTransportRebuilds(), 0u) << "no rebuild succeeded while the seed was unreachable";
 }

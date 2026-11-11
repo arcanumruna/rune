@@ -458,17 +458,21 @@ void ClientAgent::enterTransportDown_(int64_t nowNs) noexcept {
     // Frames in flight are gone and the brokers may still hold the sessions: each Connected one resumes (an own loss,
     // never a dead-broker failover) once the transport is back.
     for (auto& s : sessions_) s->machine.onTransportLost(nowNs);
-    io_ = IoTransportDown{0, up.armed ? nowNs + up.gapNs : nowNs, up.armed ? std::min(up.gapNs * 2, kRebuildMaxGapNs) : up.gapNs};
+    io_ = IoTransportDown{0, up.armed ? nowNs + up.gapNs : nowNs, up.armed ? std::min(up.gapNs * 2, kRebuildMaxGapNs) : up.gapNs, 0};
 }
 
 int ClientAgent::driveRebuild_(int64_t nowNs) noexcept {
     IoTransportDown& d = std::get<IoTransportDown>(io_);
+    if (d.waitNs != 0) {   // the gap runs from the end of the failed attempt, not from its start
+        d.notBeforeNs = nowNs + d.waitNs;
+        d.waitNs      = 0;
+    }
     if (nowNs < d.notBeforeNs) return 0;   // paced: the idle strategy parks
     const auto t0 = std::chrono::steady_clock::now();
     if (!transport_.rebuild(seedSession().responsePort)) {
         ++d.attempt;
         const uint64_t mix    = (reinterpret_cast<uintptr_t>(this) ^ d.attempt) * 0x9E3779B97F4A7C15ULL;   // jitter: spreads the clients of one host
-        d.notBeforeNs = nowNs + d.gapNs + static_cast<int64_t>((mix >> 32) % (static_cast<uint64_t>(d.gapNs) / 4 + 1));
+        d.waitNs      = d.gapNs + static_cast<int64_t>((mix >> 32) % (static_cast<uint64_t>(d.gapNs) / 4 + 1));
         d.gapNs       = std::min(d.gapNs * 2, kRebuildMaxGapNs);
         return 1;
     }

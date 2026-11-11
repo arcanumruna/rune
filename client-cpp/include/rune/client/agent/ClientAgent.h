@@ -1386,7 +1386,7 @@ private:
     /// first rebuild and each further rebuild doubles it, so a client that keeps closing never restarts the driver back
     /// to back.  The edge resets it.
     struct IoUp            { int64_t gapNs; uint64_t epoch; bool armed; };
-    struct IoTransportDown { uint32_t attempt; int64_t notBeforeNs; int64_t gapNs; };
+    struct IoTransportDown { uint32_t attempt; int64_t notBeforeNs; int64_t gapNs; int64_t waitNs; };   // waitNs: the gap a failed attempt left, turned into notBeforeNs on the next pass
     struct IoFailed        {};
     static constexpr int64_t kRebuildMinGapNs = 100'000'000;     // the seed failover's pacing: 100 ms doubling to 10 s
     static constexpr int64_t kRebuildMaxGapNs = 10'000'000'000;
