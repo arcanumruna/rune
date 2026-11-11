@@ -111,3 +111,9 @@ race:*.conan2/*aeron*/include/*
 # out or free it once the poller is done with it.  A missing acquire inside Aeron, to fix in the fork (#850) (TSan box:
 # NatEgressMatrixRegression.TlsAuthThreeNodesNewClientRegression).  That one Aeron function only.
 race:aeron_client_conductor_check_registering_resources
+
+# Aeron C media driver: aeron_feedback_delay_state_init seeds the NAK-delay PRNG once behind an unsynchronised
+# function-local `static bool is_seeded` (aeron_loss_detector.c). Several embedded drivers started on parallel threads of
+# ONE process (in-process 3-node test clusters: CatalogBrokerCluster::startNodes) race on that flag; both writers store
+# true and seed the PRNG. A production broker runs one driver per process. Scope: this one Aeron C function only.
+race:aeron_feedback_delay_state_init

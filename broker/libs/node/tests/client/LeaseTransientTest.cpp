@@ -49,7 +49,7 @@ std::string keyName(const char* prefix, int i) {
     std::snprintf(b, sizeof b, "%s%02d", prefix, i);
     return b;
 }
-std::string trimKey(const char* p, std::size_t n) { return std::string(p, strnlen(p, n)); }
+std::string trimKey(const char* p, std::size_t n) { return n == 0 ? std::string{} : std::string(p, strnlen(p, n)); }   // Ready/Failed carry an empty key (null data)
 
 int64_t msSince(Clk::time_point t0) { return std::chrono::duration_cast<std::chrono::milliseconds>(Clk::now() - t0).count(); }
 
@@ -71,6 +71,8 @@ struct RingSnap {
     uint64_t liveBytes = 0;
     uint8_t  fence     = 0;
     int64_t  readyNs   = 0, deadlineNs = 0;
+    int64_t  markedThrough = -1;   // the judge's verdict markers cover every record below this
+    bool     markerOpen    = false;
 };
 RingSnap ringOf(LeaseBrokerRig& rig, int32_t topic) {
     auto& node = rig.broker().node();
@@ -91,9 +93,25 @@ RingSnap ringOf(LeaseBrokerRig& rig, int32_t topic) {
                 if (const auto* f = std::get_if<rune::node::lease::LeaseRuntime::FenceFencing>(&rt->fenceState())) r.deadlineNs = f->deadlineNs;
             }
             r.liveBytes = wk.leaseTransientLiveBytesForTest(topic, 0);
+            if (const auto* ws = wk.writeStateForTest(topic, 0)) {
+                r.markedThrough = ws->markers.appendedClosedThrough();
+                r.markerOpen    = ws->markers.chainOpen();
+            }
             return r;
         });
         if (s.has) return s;
+    }
+    return {};
+}
+/// The ring once the judge has marked every record it judged: the last record is the verdict marker covering all before it.  The judge
+/// logs that marker up to its interval (100 ms) after the judged write was acked, so an end read right after an ack can still move.
+/// Polled under a hard wall-clock cap; `has` false when it never settles.
+RingSnap settledRingOf(LeaseBrokerRig& rig, int32_t topic) {
+    const auto end = Clk::now() + 10s;
+    for (int i = 0; i < 2000 && Clk::now() < end; ++i) {
+        const RingSnap s = ringOf(rig, topic);
+        if (s.has && !s.markerOpen && s.markedThrough == s.end - 1) return s;
+        std::this_thread::sleep_for(5ms);
     }
     return {};
 }
@@ -553,8 +571,9 @@ TEST(LeaseTransientBrokerRegression, ClientCannotForgeCarryOrFenceRegression) {
     o.ttlMs = 60'000;
     const rc::LeaseResult g = grantRetrying(lt, rig.row("k-live", 1), o);   // waits the generation-0 fence open
     ASSERT_TRUE(g.ok()) << int(g.status) << " " << g.errorCode;
-    RingSnap before = ringOf(rig, lt.topicId());
-    ASSERT_TRUE(before.has);
+    // Settled first: the verdict marker covering the grant is a broker append of its own (CI saw it land between the two reads).
+    RingSnap before = settledRingOf(rig, lt.topicId());
+    ASSERT_TRUE(before.has) << "the judge never marked the grant";
     ASSERT_EQ(before.fence, 3) << "the fence is open";
     const auto scanBefore = scanAll(c, lt);
     ASSERT_EQ(scanBefore.size(), 1u);
