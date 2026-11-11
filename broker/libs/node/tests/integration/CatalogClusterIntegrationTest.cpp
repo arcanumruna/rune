@@ -1684,29 +1684,45 @@ TEST(ThreeNodesRegression, AwaitCatalogIsrSizeFollowsTheCurrentLeaderRegression)
 }
 
 namespace {
-void racesPlacementBelowMinIsr(cm::Kind kind, bool holdAnswers) {
+// leaderProbe re-reads the catalog leader while the seam waits for the shrink (default: c.catalogLeaderId()); *leaderMovedOut
+// reports whether the seam saw the leader leave `lead` (#895).
+void racesPlacementBelowMinIsr(cm::Kind kind, bool holdAnswers, std::function<int(ThreeNodes&)> leaderProbe = {},
+                               bool* leaderMovedOut = nullptr) {
+    const bool defaultProbe = !leaderProbe;
+    const std::function<int(ThreeNodes&)> probe = defaultProbe ? std::function<int(ThreeNodes&)>([](ThreeNodes& c) { return c.catalogLeaderId(); })
+                                                               : std::move(leaderProbe);
+    bool moved = false;
     const CellParam param{kind, cm::Timing::CreateRacesPlacement, 0};
     CellSeams seams;
     seams.configTweak = [](NodeConfig& cfg) { cfg.replicaLagMaxMs = 1000; };
     seams.answerHoldInWindow = holdAnswers;
     seams.injectsStall = true;   // both followers' admin threads are frozen 4 s
-    seams.onLeaderSend = [](ThreeNodes& c, Rig& rig, int lead) {
+    seams.onLeaderSend = [&](ThreeNodes& c, Rig& rig, int lead) {
         std::vector<std::thread> th;
         for (int f : c.runningNodes())
             if (f != lead) th.emplace_back([&c, f] { try { c.node(f).onAdminThreadForTest([] { std::this_thread::sleep_for(4s); return 0; }, 15s); } catch (...) {} });
         bool shrunk = false;
         rig.pumping([&] {
-            for (const auto until = Clock::now() + 10s; Clock::now() < until && !shrunk;) {
+            for (const auto until = Clock::now() + 10s; Clock::now() < until && !shrunk && !moved;) {
                 shrunk = c.catalogIsrSizeOn(lead) == 1;
-                if (!shrunk) std::this_thread::sleep_for(50ms);
+                if (probe(c) != lead) moved = true;
+                if (!shrunk && !moved) std::this_thread::sleep_for(50ms);
             }
         });
-        EXPECT_TRUE(shrunk) << "vacuity guard: the catalog really is below minIsr while the DDL awaits its commit";
+        if (!moved) EXPECT_TRUE(shrunk) << "vacuity guard: the catalog really is below minIsr while the DDL awaits its commit";
         rig.pumping([&] { for (auto& t : th) t.join(); });
     };
     CellOutcome out;
     runCell(param, seams, &out);
+    if (leaderMovedOut) *leaderMovedOut = moved;
     if (::testing::Test::HasFatalFailure()) return;
+    if (moved || !out.perturbedWhy.empty()) {
+        std::fprintf(stderr, "[ perturbed ] below-minIsr seam: the catalog leader moved after it was resolved (seam saw the move: %d, cell evidence: '%s'); "
+                             "exact below-minIsr assertions skipped\n", moved ? 1 : 0, out.perturbedWhy.c_str());
+        if (moved && out.perturbedWhy.empty() && defaultProbe)
+            ADD_FAILURE() << "the seam saw the leader move but the cell recorded no evidence: a harness hole";
+        return;
+    }
     EXPECT_EQ(out.res.trace.find(": 2]"), std::string::npos) << "no NotLeader: " << out.res.trace;
     EXPECT_EQ(out.res.trace.find(": 6]"), std::string::npos) << "no Internal: " << out.res.trace;
     EXPECT_EQ(out.belowMinIsrOnLeader, 0u) << "the answer hold suppressed the pre-commit below-minIsr NotLeader";
@@ -1724,6 +1740,22 @@ TEST(CatalogClusterRegression, RacesPlacementWithTheCatalogBelowMinIsrBeforeComm
 // RED (checkpoint fix B): a GetViewRow answered AbsentKey for the sentinel the source holds (an unfolded / premature read).
 TEST(CatalogClusterRegression, RacesPlacementCreateViewWithTheCatalogBelowMinIsrNeverAnswersEarlyRegression) {
     racesPlacementBelowMinIsr(cm::Kind::CreateView, /*holdAnswers=*/true);
+}
+
+// T4 (#895): the seam's leader may move between the hook's read and the shrink wait (CI: n1 -> n2 right as the send happened); the seam must
+// see that itself (it would otherwise freeze the real leader and assert on a follower), skip the vacuity guard and report the move.
+// The probe returns the real leader once, then another running node.
+// RED: the loop's `probe(c) != lead` check removed -> moved stays false -> EXPECT_TRUE(moved) fails.
+TEST(CatalogClusterRegression, RacesPlacementBelowMinIsrSeamSeesALeaderMoveAfterResolutionRegression) {
+    bool moved = false;
+    std::atomic<int> calls{0};
+    racesPlacementBelowMinIsr(cm::Kind::CreateTopic, /*holdAnswers=*/true, [&](ThreeNodes& c) {
+        const int real = c.catalogLeaderId();
+        if (calls.fetch_add(1) == 0) return real;
+        for (int n : c.runningNodes()) if (n != real) return n;
+        return -1;
+    }, &moved);
+    EXPECT_TRUE(moved) << "the seam did not notice the leader move";
 }
 
 // T3 (sibling A, deterministic): the hold exceeds the gate's 5 s cap -> the gate answers the in-doubt Internal ("placement pending"),
