@@ -406,6 +406,9 @@ int WorkerViewSet::drainInstalls() {
                         /*persisted=*/m.persistence == 0, /*underRecovery=*/m.recovery);
             if (kind) {   // a unique or check view: its source's judge drives it
                 installsSinceMark_ = true;
+                // #940: this object installs again - its earlier refusals no longer keep its logged member.  The fingerprints
+                // stay: the log never installs a plan this worker refused.
+                for (RefusedPlan& r : refusedPlans_) if (r.viewObjectId == objectId) r.viewObjectId = 0;
                 ViewTemplate& tpl = templates_.at(viewTopicId);
                 ++verdictEpoch_;
                 tpl.isVerdict = true;

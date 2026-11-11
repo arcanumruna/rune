@@ -994,7 +994,7 @@ private:
     bool installsSinceMark_ = false;   // a verdict plan install or uninstall was drained whose catalog mark has not been: the gate stays closed
     int64_t catalogThrough_ = -1;   // the latest catalog position this node's control thread marked here; never moves back (#788)
     struct RefusedPlan { uint64_t viewObjectId, fingerprint; };
-    std::vector<RefusedPlan> refusedPlans_;   // the catalog installs this worker refused: the log never installs them instead, and the sync keeps their object's logged member
+    std::vector<RefusedPlan> refusedPlans_;   // the catalog installs this worker refused: the log never installs them instead, and the sync keeps their object's logged member (object 0: a later good install of the object ended that keep)
     std::vector<uint64_t> unreadablePlans_;   // retained plans whose decode failure was logged
     void noteRefused_(uint64_t viewObjectId, uint64_t fingerprint) {
         if (std::none_of(refusedPlans_.begin(), refusedPlans_.end(), [&](const RefusedPlan& r) { return r.fingerprint == fingerprint; })) refusedPlans_.push_back({viewObjectId, fingerprint});

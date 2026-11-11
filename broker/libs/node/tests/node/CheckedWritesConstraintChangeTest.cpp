@@ -444,6 +444,29 @@ TEST(CheckedWritesConstraintChangeRegression, RefusedReplacementKeepsTheLoggedMe
     EXPECT_EQ(c.dropOf(kStatsObj), -1);
 }
 
+// #940: a later good install of the object ends the keep its earlier refusal gave: fp2 refused, fp3 installs, the drop is logged.
+TEST(CheckedWritesConstraintChangeRegression, AGoodInstallClearsTheObjectsEarlierRefusalRegression) {
+    Cw c;
+    c.create(CV::AccountStats, 12);
+    c.append({ch(1, 6, "a")});
+    ASSERT_TRUE(c.r.driveUntilJudged());
+    c.r.refuseInstalls = true;
+    c.r.replaceConstrainedView(CV::AccountStats, 2);
+    c.r.passes(200);
+    ASSERT_EQ(c.dropOf(kStatsObj), -1) << "the refusal keeps the member";
+    c.r.refuseInstalls = false;
+    c.r.replaceConstrainedView(CV::AccountStats, 3);
+    const uint64_t fp3 = c.r.fingerprintOf(CV::AccountStats, false);
+    ASSERT_TRUE(c.passesUntil([&] {
+        c.r.followerFetch();
+        const auto changes = c.r.readLog().changes;
+        return std::any_of(changes.back().members.begin(), changes.back().members.end(), [&](const cr::ChangeMember& m) { return m.viewObjectId == kStatsObj && m.planFingerprint == fp3; });
+    })) << "the replacement never swapped in";
+    c.drop(CV::AccountStats);
+    c.r.passes(200);
+    EXPECT_NE(c.dropOf(kStatsObj), -1) << "the drop must be logged: no stale refusal keeps the dropped member";
+}
+
 // A restarted node installs its catalog's views for recovery, and the recovery pass materialized the instance of one no judge had attached
 // yet: re-registering the template wiped its verdict identity, the object had no plan to swap to, and the member left the set.  In
 // production that is a restart while a replacement candidate still builds (see RestartWhileACandidateBuilds...); this test reaches the same
