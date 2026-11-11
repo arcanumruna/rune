@@ -720,6 +720,10 @@ public:
     /// T15b test seam (any thread): put the transport-fault command on the ring
     /// (the duty thread applies it: transportClosed() turns true).
     bool submitTestFault() noexcept { return writeCommand(kMsgTestFault, nullptr, 0); }
+    /// Test seam: moves the seed's physical ingress on the duty thread (applied by the next command-ring drain).
+    bool submitTestSeedIngress(const std::string& channel) noexcept {
+        return writeCommand(kMsgTestSeedIngress, reinterpret_cast<const uint8_t*>(channel.data()), channel.size());
+    }
 
     /// T15b: the routed leader-node sessions (every session but the seed) and
     /// which of them are not Connected (bit i = session i + 1; the first 64).
@@ -1084,6 +1088,7 @@ private:
     static constexpr int32_t kMsgHubCommand = 8;          // F8a subscriber / group-consumer command
     static constexpr int32_t kMsgControlOp  = 9;          // F8c C3 client control op (header + frame)
     static constexpr int32_t kMsgTestFault = 98;          // T15b test seam: transportClosed() -> true until the rebuild
+    static constexpr int32_t kMsgTestSeedIngress = 97;    // test seam: setSeedPhysicalIngressForTest on the duty thread
     static constexpr int32_t kMsgTestNoop = 99;           // testFillCommandRing filler (dropped)
 
     // Task 1.3: per-session ConnectRequest correlationId range stride.  Session i

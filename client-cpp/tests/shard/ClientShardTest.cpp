@@ -975,10 +975,14 @@ TEST(ClientShardRegression, ThreadRunnerCloseRightAfterTransportFaultJoinsPrompt
         cq.poll([&](const rc::Completion&, std::span<const uint8_t>) { connected = true; });
         return connected;
     }));
+    client.testSetSeedIngressChannel(kUnreachableSeed);   // posted to the runner: every rebuild fails from here on
     client.testInjectTransportFault();
+    const auto downUntil = std::chrono::steady_clock::now() + 400ms;   // covers two failed attempts (gaps of 100 and 200 ms)
+    ASSERT_TRUE(pumpUntil([&] { return std::chrono::steady_clock::now() >= downUntil; }));
     const auto t0 = std::chrono::steady_clock::now();
     client.close();
-    EXPECT_LT(std::chrono::steady_clock::now() - t0, 5s);
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 400ms) << "close() does not wait for the next rebuild attempt";
+    EXPECT_EQ(client.testTransportRebuilds(), 0u) << "no rebuild succeeded while the seed was unreachable";
 }
 
 // A Thread-runner client (its own duty thread and driver thread, real clock) rebuilds after the transport fault too: it

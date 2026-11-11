@@ -266,6 +266,10 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 testFault_ = true;
                 break;
 
+            case kMsgTestSeedIngress:
+                setSeedPhysicalIngressForTest(std::string(reinterpret_cast<const char*>(buf.buffer() + offset), static_cast<std::size_t>(len)));
+                break;
+
             case kMsgDisconnect:
                 seedSession().machine.disconnect();
                 break;

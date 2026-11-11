@@ -682,8 +682,8 @@ public:
     /// really rebuilt (a healthy one is torn down and restarted) and the
     /// sessions resume.
     void testInjectTransportFault() { (void)agent_.submitTestFault(); }
-    /// Moves the seed's physical ingress channel (the next rebuild() keeps it); duty thread / Invoker owner only.
-    void testSetSeedIngressChannel(const std::string& channel) { agent_.setSeedPhysicalIngressForTest(channel); }
+    /// Moves the seed's physical ingress channel (the next rebuild() keeps it); applied on the duty thread at the next doWork().
+    void testSetSeedIngressChannel(const std::string& channel) { (void)agent_.submitTestSeedIngress(channel); }
     /// Moves the seed to `channel` as a completed failover would (Invoker owner only).
     bool testRetargetSeed(const std::string& channel) { return agent_.failoverSeedTo(channel, now(), true); }
     /// Transport rebuilds completed so far (duty thread, or after it stopped).
