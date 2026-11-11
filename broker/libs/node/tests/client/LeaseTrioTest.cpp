@@ -197,7 +197,9 @@ TEST(LeaseTrioRegression, CheckpointInFlightRegression) {
     o.ttlMs = 60'000;
     const uint64_t ckpt0 = t.checkpointsOnLeader(topic, 0);
     std::map<int, int64_t> ver;
+    Clk::time_point sent[12];
     for (int i = 0; i < 12; ++i) {
+        sent[i] = Clk::now();
         const rc::LeaseResult g = lt.grantAndWait(lt3::row("ck-" + std::to_string(i), uint64_t(i)), o);
         ASSERT_TRUE(g.ok());
         ver[i] = g.version;
@@ -212,7 +214,8 @@ TEST(LeaseTrioRegression, CheckpointInFlightRegression) {
         rc::LeaseTtlInfo info;
         ASSERT_TRUE(retried([&] { return lt.timeToLiveAndWait(lt3::row("ck-" + std::to_string(i)), &info); }).ok());
         EXPECT_LE(info.remainingMs, 60'000 + 1000) << "never more than the ttl";
-        EXPECT_GT(info.remainingMs, 50'000) << "a checkpointed lease keeps (nearly) its time through the change";
+        // Relative to the grant: the reads may come a seed failover (~10 s) after the kill when the leader was the seed.
+        EXPECT_GT(info.remainingMs, 60'000 - msSince(sent[i]) - 300) << "a checkpointed lease keeps its time through the change";
     }
 }
 
