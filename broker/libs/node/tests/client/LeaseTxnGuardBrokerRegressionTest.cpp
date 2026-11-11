@@ -333,7 +333,7 @@ void sendAcked(Actor& a, const std::vector<std::string>& vs, std::initializer_li
 /// A committed sentinel transaction, then R has seen it.  Returns after R delivered "sentinel".
 void sentinel(Actor& w, Reader& r, std::initializer_list<Actor*> pumped) {
     w.producer->beginTransaction();
-    sendAcked(w, {"sentinel"}, pumped);
+    ASSERT_NO_FATAL_FAILURE(sendAcked(w, {"sentinel"}, pumped));
     const rc::Token c = w.commit();
     ASSERT_TRUE(w.await(c, pumped));
     ASSERT_EQ(w.result(c).status, rc::OpStatus::Ok) << "sentinel commit, code " << w.result(c).errorCode;
@@ -343,12 +343,12 @@ void sentinel(Actor& w, Reader& r, std::initializer_list<Actor*> pumped) {
 void takeLease(Actor& a, uint64_t holder, uint64_t ttlMs, const std::string& txnId, bool bindProducer = true) {
     const rc::LeaseResult g = a.grantOnce(holder, ttlMs);
     ASSERT_TRUE(g.ok()) << int(g.status) << " " << g.errorCode;
-    a.keep(g, ttlMs);
+    ASSERT_NO_FATAL_FAILURE(a.keep(g, ttlMs));
     a.makeProducer(txnId);
     const rc::Token i = a.init();
     ASSERT_TRUE(a.await(i, {&a}));
     ASSERT_EQ(a.result(i).status, rc::OpStatus::Ok);
-    if (bindProducer) a.bind();
+    if (bindProducer) ASSERT_NO_FATAL_FAILURE(a.bind());
 }
 
 constexpr uint64_t kTtlMs = 2000;
@@ -362,16 +362,16 @@ TEST_P(LeaseTxnGuardBrokerRegression, GuardedCommitHappyPath) {
     Rig rig(GetParam(), "ltg_happy", kTtlMs);
     Actor  a(rig, 0, 0);
     Reader r(rig, 1, 1);
-    takeLease(a, 1, kTtlMs, "tx-1");
+    ASSERT_NO_FATAL_FAILURE(takeLease(a, 1, kTtlMs, "tx-1"));
     a.producer->beginTransaction();
     const auto vs = values("A", 10);
-    sendAcked(a, vs, {&a});
+    ASSERT_NO_FATAL_FAILURE(sendAcked(a, vs, {&a}));
     const rc::Token c = a.commit();
     ASSERT_TRUE(a.await(c, {&a}));
     ASSERT_EQ(a.result(c).status, rc::OpStatus::Ok) << "code " << a.result(c).errorCode;
     EXPECT_EQ(a.cb.lost, 0);
     EXPECT_EQ(a.cb.entered, 0);
-    sentinel(a, r, {&a});
+    ASSERT_NO_FATAL_FAILURE(sentinel(a, r, {&a}));
     auto expect = vs;
     expect.push_back("sentinel");
     EXPECT_EQ(sorted(r.seen), sorted(expect));
@@ -385,9 +385,9 @@ TEST_P(LeaseTxnGuardBrokerRegression, StalledHolderCannotCommit) {
     Actor  a(rig, 0, 0);
     Actor  b(rig, 1, 1);
     Reader r(rig, 2, 2);
-    takeLease(a, 1, kTtlMs, "tx-1");
+    ASSERT_NO_FATAL_FAILURE(takeLease(a, 1, kTtlMs, "tx-1"));
     a.producer->beginTransaction();
-    sendAcked(a, values("A", 5), {&a});
+    ASSERT_NO_FATAL_FAILURE(sendAcked(a, values("A", 5), {&a}));
 
     // A stalls: only B (and nobody else) is driven.  B's grant is refused (KeyExists) until the broker expires A's lease.
     rc::LeaseResult g;
@@ -398,41 +398,34 @@ TEST_P(LeaseTxnGuardBrokerRegression, StalledHolderCannotCommit) {
         for (const auto next = Clk::now() + 25ms; Clk::now() < next;) b.stepNoSession();
     }
     ASSERT_TRUE(g.ok()) << "B was never granted the lease: " << int(g.status) << " " << g.errorCode;
-    b.keep(g, kTtlMs);
+    ASSERT_NO_FATAL_FAILURE(b.keep(g, kTtlMs));
     b.makeProducer("tx-1");
     const rc::Token bi = b.init();
     ASSERT_TRUE(b.await(bi, {&b}));
     ASSERT_EQ(b.result(bi).status, rc::OpStatus::Ok);
-    b.bind();
+    ASSERT_NO_FATAL_FAILURE(b.bind());
     b.producer->beginTransaction();
-    sendAcked(b, values("B", 5), {&b});
+    ASSERT_NO_FATAL_FAILURE(sendAcked(b, values("B", 5), {&b}));
     const rc::Token bc = b.commit();
     ASSERT_TRUE(b.await(bc, {&b}));
     ASSERT_EQ(b.result(bc).status, rc::OpStatus::Ok) << "code " << b.result(bc).errorCode;
 
-    // A runs again.  Its next send is accepted (its transaction is still open client-side) and fails: Fenced by the broker, or LeaseAtRisk
-    // by the guard (the session learned the loss first).  Then its commit is refused too (never Ok).
+    // A runs again.  Its guard tripped before A's first drain (A's at-risk instant is earlier than the broker expiry B waited for), so its
+    // next send is accepted at the call (the transaction is still open client-side) and fails LeaseAtRisk, and its commit is refused with
+    // LeaseAtRisk too - never Ok, never a fence (the guard answers before the coordinator is asked).
     rc::Token st = 0;
     ASSERT_EQ(a.send("A-after", st), rc::SendResult::Ok);
     ASSERT_TRUE(a.await(st, {&a, &b}));
-    {
-        const rc::Completion s = a.result(st);
-        const bool risk = s.status == rc::OpStatus::DeliveryFailed && s.errorCode == kAtRisk;
-        EXPECT_TRUE(risk || s.status == rc::OpStatus::Fenced) << "A's send: status " << int(s.status) << " code " << s.errorCode;
-        std::fprintf(stderr, "[ltg] stalled holder's send: status %d code %u\n", int(s.status), unsigned(s.errorCode));
-    }
+    EXPECT_EQ(a.result(st).status, rc::OpStatus::DeliveryFailed) << "A's send: code " << a.result(st).errorCode;
+    EXPECT_EQ(a.result(st).errorCode, kAtRisk);
     const rc::Token ac = a.commit();
     ASSERT_TRUE(a.await(ac, {&a, &b}));
-    const rc::Completion res = a.result(ac);
-    const bool atRisk = res.status == rc::OpStatus::DeliveryFailed && res.errorCode == kAtRisk;
-    const bool fenced = res.status == rc::OpStatus::Fenced;
-    EXPECT_TRUE(atRisk || fenced) << "A's commit: status " << int(res.status) << " code " << res.errorCode;
-    EXPECT_NE(res.status, rc::OpStatus::Ok);
-    std::fprintf(stderr, "[ltg] stalled holder's commit: %s\n", atRisk ? "LeaseAtRisk" : fenced ? "Fenced" : "other");
+    EXPECT_EQ(a.result(ac).status, rc::OpStatus::DeliveryFailed) << "A's commit: code " << a.result(ac).errorCode;
+    EXPECT_EQ(a.result(ac).errorCode, kAtRisk);
     rc::Token st2 = 0;
-    EXPECT_NE(a.send("A-later", st2), rc::SendResult::Ok) << "after the refused commit A is outside a transaction";
+    EXPECT_EQ(a.send("A-later", st2), rc::SendResult::NotInTransaction) << "after the refused commit A is outside a transaction";
 
-    sentinel(b, r, {&b});
+    ASSERT_NO_FATAL_FAILURE(sentinel(b, r, {&b}));
     auto expect = values("B", 5);
     expect.push_back("sentinel");
     EXPECT_EQ(sorted(r.seen), sorted(expect)) << "R reads exactly B's records";
@@ -450,8 +443,46 @@ TEST_P(LeaseTxnGuardBrokerRegression, InitTransactionsAbortsOldOpenTransaction) 
     ASSERT_TRUE(a.await(ai, {&a}));
     ASSERT_EQ(a.result(ai).status, rc::OpStatus::Ok);
     a.producer->beginTransaction();
-    sendAcked(a, values("A", 3), {&a});
+    ASSERT_NO_FATAL_FAILURE(sendAcked(a, values("A", 3), {&a}));
 
+    b.makeProducer("tx-1");
+    const rc::Token bi = b.init();
+    ASSERT_TRUE(b.await(bi, {&a, &b}));
+    ASSERT_EQ(b.result(bi).status, rc::OpStatus::Ok);
+
+    // A's commit reaches the coordinator with the old epoch: Fenced.  (A sends nothing first: a record answered 17 / 18 by the partition
+    // leader would make the producer FatalError before its commit left, and the fence would then be produced locally.)
+    const rc::Token ac = a.commit();
+    ASSERT_TRUE(a.await(ac, {&a, &b}));
+    EXPECT_EQ(a.result(ac).status, rc::OpStatus::Fenced) << "A's commit: code " << a.result(ac).errorCode;
+    EXPECT_EQ(a.producer->state(), rc::TxnState::FatalError);
+    rc::Token st = 0;
+    EXPECT_EQ(a.send("A-later", st), rc::SendResult::NotInTransaction) << "after the fenced commit A is outside a transaction";
+
+    b.producer->beginTransaction();
+    ASSERT_NO_FATAL_FAILURE(sendAcked(b, values("B", 2), {&a, &b}));
+    const rc::Token bc = b.commit();
+    ASSERT_TRUE(b.await(bc, {&a, &b}));
+    ASSERT_EQ(b.result(bc).status, rc::OpStatus::Ok) << "code " << b.result(bc).errorCode;
+    ASSERT_NO_FATAL_FAILURE(sentinel(b, r, {&a, &b}));
+    auto expect = values("B", 2);
+    expect.push_back("sentinel");
+    EXPECT_EQ(sorted(r.seen), sorted(expect)) << "A's 3 records are never visible";
+}
+
+// The send-first order: A's record, sent after B's initTransactions(tx-1), is answered InvalidProducerEpoch / ProducerFenced by the partition
+// leader (a broker error, as EosBrokerRegression documents); the producer is FatalError(Fenced) then and its commit completes Fenced.
+TEST_P(LeaseTxnGuardBrokerRegression, InitTransactionsFencesOldProducersSend) {
+    Rig rig(GetParam(), "ltg_fsend", kTtlMs);
+    Actor  a(rig, 0, 0);
+    Actor  b(rig, 1, 1);
+    Reader r(rig, 2, 2);
+    a.makeProducer("tx-1");
+    const rc::Token ai = a.init();
+    ASSERT_TRUE(a.await(ai, {&a}));
+    ASSERT_EQ(a.result(ai).status, rc::OpStatus::Ok);
+    a.producer->beginTransaction();
+    ASSERT_NO_FATAL_FAILURE(sendAcked(a, values("A", 3), {&a}));
     b.makeProducer("tx-1");
     const rc::Token bi = b.init();
     ASSERT_TRUE(b.await(bi, {&a, &b}));
@@ -460,29 +491,49 @@ TEST_P(LeaseTxnGuardBrokerRegression, InitTransactionsAbortsOldOpenTransaction) 
     rc::Token st = 0;
     ASSERT_EQ(a.send("A-after", st), rc::SendResult::Ok);
     ASSERT_TRUE(a.await(st, {&a, &b}));
-    {
-        // The partition leader answers a fenced transactional produce with InvalidProducerEpoch (17) / ProducerFenced (18) as a broker error
-        // (EosBrokerRegression documents the same); the client turns it into Fenced on the commit.
-        const rc::Completion s = a.result(st);
-        const bool fencedCode = s.status == rc::OpStatus::BrokerError && (s.errorCode == 17 || s.errorCode == 18);
-        EXPECT_TRUE(s.status == rc::OpStatus::Fenced || fencedCode) << "A's send: status " << int(s.status) << " code " << s.errorCode;
-        std::fprintf(stderr, "[ltg] fenced producer's send: status %d code %u\n", int(s.status), unsigned(s.errorCode));
-    }
+    EXPECT_EQ(a.result(st).status, rc::OpStatus::BrokerError) << "A's send: code " << a.result(st).errorCode;
+    EXPECT_TRUE(a.result(st).errorCode == 17 || a.result(st).errorCode == 18) << "code " << a.result(st).errorCode;
+    EXPECT_EQ(a.producer->state(), rc::TxnState::FatalError);
     const rc::Token ac = a.commit();
     ASSERT_TRUE(a.await(ac, {&a, &b}));
     EXPECT_EQ(a.result(ac).status, rc::OpStatus::Fenced) << "A's commit: code " << a.result(ac).errorCode;
-    rc::Token st2 = 0;
-    EXPECT_NE(a.send("A-later", st2), rc::SendResult::Ok) << "after the fenced commit A is outside a transaction";
 
     b.producer->beginTransaction();
-    sendAcked(b, values("B", 2), {&a, &b});
+    ASSERT_NO_FATAL_FAILURE(sendAcked(b, values("B", 2), {&a, &b}));
     const rc::Token bc = b.commit();
     ASSERT_TRUE(b.await(bc, {&a, &b}));
     ASSERT_EQ(b.result(bc).status, rc::OpStatus::Ok) << "code " << b.result(bc).errorCode;
-    sentinel(b, r, {&a, &b});
+    ASSERT_NO_FATAL_FAILURE(sentinel(b, r, {&a, &b}));
     auto expect = values("B", 2);
     expect.push_back("sentinel");
-    EXPECT_EQ(sorted(r.seen), sorted(expect)) << "A's 3 records are never visible";
+    EXPECT_EQ(sorted(r.seen), sorted(expect)) << "A's records are never visible";
+}
+
+// The guard ALONE refuses the commit: no second producer exists, so the broker cannot fence A.  A's clock jumps past the at-risk instant
+// and the commit is issued before the client runs a pass: it completes DeliveryFailed / LeaseAtRisk with no EndTxn(commit) sent, so R
+// reads none of A's records; after the guard clears, A aborts and a fresh transaction commits.
+TEST_P(LeaseTxnGuardBrokerRegression, TrippedHolderCommitRefusedByGuardAlone) {
+    Rig rig(GetParam(), "ltg_alone", kTtlMs);
+    Actor  a(rig, 0, 0);
+    Reader r(rig, 1, 1);
+    ASSERT_NO_FATAL_FAILURE(takeLease(a, 1, kTtlMs, "tx-1"));
+    a.producer->beginTransaction();
+    ASSERT_NO_FATAL_FAILURE(sendAcked(a, values("A", 5), {&a}));
+    const uint64_t okBefore = a.session->core().okAnswers();
+    ASSERT_TRUE(pumpUntil({&a}, [&] { return a.session->core().okAnswers() > okBefore; })) << "no keepalive answered";
+    a.moveClock(1100 * kMs);
+    const rc::Token c = a.commit();   // before any step: the trip has not run yet
+    for (uint64_t i = 0; i < 2'000'000 && a.got.count(c) == 0; ++i) a.stepNoSession();
+    ASSERT_EQ(a.got.count(c), 1u) << "the commit completed";
+    EXPECT_EQ(a.result(c).status, rc::OpStatus::DeliveryFailed) << "code " << a.result(c).errorCode;
+    EXPECT_EQ(a.result(c).errorCode, kAtRisk);
+    EXPECT_EQ(a.producer->state(), rc::TxnState::AbortableError);
+    ASSERT_TRUE(pumpUntil({&a}, [&] { return a.cb.cleared >= 1; })) << "the guard was never cleared";
+    const rc::Token ab = a.abort();
+    ASSERT_TRUE(a.await(ab, {&a}));
+    ASSERT_EQ(a.result(ab).status, rc::OpStatus::Ok) << "abort, code " << a.result(ab).errorCode;
+    ASSERT_NO_FATAL_FAILURE(sentinel(a, r, {&a}));   // begins its own transaction
+    EXPECT_EQ(sorted(r.seen), (std::vector<std::string>{"sentinel"})) << "none of A's 5 records became visible";
 }
 
 // A begins, sends 2 (acked).  The at-risk instant passes (A's clock jumps; the broker's lease is untouched), A's session reads no answer:
@@ -491,29 +542,25 @@ TEST_P(LeaseTxnGuardBrokerRegression, AtRiskThenClearedContinues) {
     Rig rig(GetParam(), "ltg_risk", kTtlMs);
     Actor  a(rig, 0, 0);
     Reader r(rig, 1, 1);
-    takeLease(a, 1, kTtlMs, "tx-1");
+    ASSERT_NO_FATAL_FAILURE(takeLease(a, 1, kTtlMs, "tx-1"));
     a.producer->beginTransaction();
-    sendAcked(a, values("pre", 2), {&a});
+    ASSERT_NO_FATAL_FAILURE(sendAcked(a, values("pre", 2), {&a}));
 
     // Re-arm the guard from a fresh keepalive, then jump A's clock past the at-risk instant (ttl/2) but not the margin (about ttl).
     const uint64_t okBefore = a.session->core().okAnswers();
     ASSERT_TRUE(pumpUntil({&a}, [&] { return a.session->core().okAnswers() > okBefore; })) << "no keepalive answered";
     a.moveClock(1100 * kMs);
-    // The guard trips on the client's duty cycle (the clock passed the armed instant); the session reads that event, and the keepalive
-    // answers, only when it runs - so run the client alone until the risky writes completed.
-    for (int i = 0; i < 4; ++i) a.stepNoSession();
-    EXPECT_EQ(a.producer->state(), rc::TxnState::AbortableError) << "the trip failed the open transaction";
+    // The send is issued before the client runs a pass: it is accepted at the call, then the trip (the first pass) fails it.  The session
+    // reads that event, and the keepalive answers, only when it runs - so run the client alone until the risky write completed.
     rc::Token risky = 0;
-    const rc::SendResult sr = a.send("risky", risky, /*pumpSession=*/false);
-    if (sr == rc::SendResult::Ok) {
-        for (int i = 0; i < 2'000'000 && a.got.count(risky) == 0; ++i) a.stepNoSession();
-        ASSERT_EQ(a.got.count(risky), 1u) << "a risky write completes";
-        EXPECT_EQ(a.result(risky).status, rc::OpStatus::DeliveryFailed);
-        EXPECT_EQ(a.result(risky).errorCode, kAtRisk);
-    } else {
-        EXPECT_EQ(sr, rc::SendResult::NotInTransaction) << "the failed transaction refuses the write at the call";
-    }
-    std::fprintf(stderr, "[ltg] at-risk write: %s\n", sr == rc::SendResult::Ok ? "completed LeaseAtRisk" : "refused at the call");
+    ASSERT_EQ(a.send("risky", risky, /*pumpSession=*/false), rc::SendResult::Ok);
+    for (uint64_t i = 0; i < 2'000'000 && a.got.count(risky) == 0; ++i) a.stepNoSession();
+    ASSERT_EQ(a.got.count(risky), 1u) << "the risky write completes";
+    EXPECT_EQ(a.result(risky).status, rc::OpStatus::DeliveryFailed);
+    EXPECT_EQ(a.result(risky).errorCode, kAtRisk);
+    EXPECT_EQ(a.producer->state(), rc::TxnState::AbortableError) << "the trip failed the open transaction";
+    rc::Token later = 0;
+    EXPECT_EQ(a.send("later", later, /*pumpSession=*/false), rc::SendResult::NotInTransaction) << "the failed transaction refuses the write at the call";
     EXPECT_EQ(a.cb.entered, 0) << "the session has not run since the jump";
 
     // Keepalives resume: the guard is cleared.
@@ -525,11 +572,11 @@ TEST_P(LeaseTxnGuardBrokerRegression, AtRiskThenClearedContinues) {
     ASSERT_EQ(a.result(ab).status, rc::OpStatus::Ok) << "abort, code " << a.result(ab).errorCode;
     a.producer->beginTransaction();
     const auto vs = values("post", 4);
-    sendAcked(a, vs, {&a});
+    ASSERT_NO_FATAL_FAILURE(sendAcked(a, vs, {&a}));
     const rc::Token c = a.commit();
     ASSERT_TRUE(a.await(c, {&a}));
     ASSERT_EQ(a.result(c).status, rc::OpStatus::Ok) << "code " << a.result(c).errorCode;
-    sentinel(a, r, {&a});
+    ASSERT_NO_FATAL_FAILURE(sentinel(a, r, {&a}));
     auto expect = vs;
     expect.push_back("sentinel");
     EXPECT_EQ(sorted(r.seen), sorted(expect));
@@ -544,7 +591,7 @@ TEST_P(LeaseTxnGuardBrokerRegression, LeaderChangeMidCommitGuarded) {
     ASSERT_GT(victim, 0);
     Actor  a(rig, 0, 0, victim);
     Reader r(rig, 1, 1, victim);
-    takeLease(a, 1, 30'000, "tx-1");
+    ASSERT_NO_FATAL_FAILURE(takeLease(a, 1, 30'000, "tx-1"));
     a.producer->beginTransaction();
     std::vector<std::string> vs = values("L", 20);
     std::vector<rc::Token>   toks;
@@ -563,11 +610,12 @@ TEST_P(LeaseTxnGuardBrokerRegression, LeaderChangeMidCommitGuarded) {
         EXPECT_EQ(a.result(t).status, rc::OpStatus::Ok);
     }
     EXPECT_EQ(a.cb.lost, 0) << "the lease stays held";
+    EXPECT_EQ(a.cb.entered, 0) << "never at risk";
     EXPECT_EQ(a.session->stateOf(a.ref), rc::LeaseEntryState::Held);
 
     std::vector<int32_t> leaders;
     ASSERT_TRUE(awaitLeaders(*rig.three, rig.data.topicId, 1, leaders, 60s));
-    sentinel(a, r, {&a});
+    ASSERT_NO_FATAL_FAILURE(sentinel(a, r, {&a}));
     auto expect = vs;
     expect.push_back("sentinel");
     EXPECT_EQ(sorted(r.seen), sorted(expect)) << "every record exactly once";
