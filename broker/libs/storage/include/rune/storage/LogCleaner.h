@@ -56,6 +56,8 @@ struct CleanedGroup {
 struct RangeCleanResult {
     bool                 compacted = false;
     Offset               passEnd   = -1;
+    /// The pass ended below a sealed segment that is not at its <base>.log name yet (its staging rename is still queued), so the caller retries soon and must not treat the pass as stalled.
+    bool                 unreadable = false;
     /// Where the pass's rewrite ended: passEnd, or above it when a producer's retry window held the watermark back
     /// (setProducerTailDepth).  The owner keeps the max of this and the previous value (progress never moves back on a
     /// pass that stops short); the next pass's setPreviousPassEnd takes that max.

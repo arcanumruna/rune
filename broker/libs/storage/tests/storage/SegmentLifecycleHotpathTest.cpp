@@ -22,6 +22,8 @@
 #include <rune/storage/testing/DemandChannelForTest.h>
 #include <rune/storage/testing/ScopedNoDacOverride.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/LogCleaner.h>
+#include <rune/storage/SkimpyOffsetMap.h>
 #include <rune/storage/MappedFile.h>
 #include <fcntl.h>
 #include <rune/protocol/RecordBatch.h>
@@ -718,6 +720,68 @@ TEST(SegmentLifecycleRegression, QueuedTailRenameDoesNotBlockRetentionRegression
         (void)log.finalizeStagingRenames();
         EXPECT_TRUE(log.truncateTo(log.segmentBaseOffsets().back() + 1));
         EXPECT_FALSE(log.storageFailed());
+    }
+    fs::remove_all(dir);
+}
+
+// A sealed segment whose staging -> base rename is still queued is in the cleaner's snapshot but not at <base>.log yet.
+// The pass cannot read it, so it must end below it: a watermark moved past it would leave the values its records
+// supersede (its tombstones' keys) live for good, since no later map covers the skipped range.
+TEST(SegmentLifecycleRegression, CleanerPassEndsBelowASealedSegmentStillAtItsStagingNameRegression) {
+    const auto dir = freshDir("rune_slh_863");
+    {
+        Log log(dir.string(), 256);
+        log.recover();
+        int64_t off = 0;
+        while (log.segmentBaseOffsets().size() < 2) off = put(log, off);   // one inline segment sealed
+        ASSERT_EQ(log.provisionReady(1), 1);
+        while (log.segmentBaseOffsets().size() < 3) off = put(log, off);   // adopts: the rename is queued, never finalized here
+        ASSERT_EQ(log.provisionReady(1), 1);
+        while (log.segmentBaseOffsets().size() < 4) off = put(log, off);   // seals the adopted segment
+        auto bases = log.segmentBaseOffsets();
+        const int64_t active = bases.back();
+        bases.pop_back();
+        const int64_t staged = bases.back();
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(staged));
+        ASSERT_FALSE(fs::exists(dir / name)) << "precondition: the sealed segment is not at its name";
+        std::vector<int64_t> sizes(bases.size(), 1);
+        LogCleaner cleaner;
+        SkimpyOffsetMap map(1024);
+        const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 1'000'000, map, false, 1 << 20);
+        EXPECT_LE(res.passEnd, staged) << "the pass moved past a segment it could not read";
+    }
+    fs::remove_all(dir);
+}
+
+// Once the provisioner thread has renamed the staged segment, the next pass reads it and reaches the active segment.
+// RED by mutation: remove the missing-file loop (the first pass's unreadable is false and its passEnd is active).
+TEST(SegmentLifecycleRegression, CleanerPassResumesOnceTheStagedSegmentIsRenamedRegression) {
+    const auto dir = freshDir("rune_slh_863b");
+    {
+        Log log(dir.string(), 256);
+        log.recover();
+        int64_t off = 0;
+        while (log.segmentBaseOffsets().size() < 2) off = put(log, off);
+        ASSERT_EQ(log.provisionReady(1), 1);
+        while (log.segmentBaseOffsets().size() < 3) off = put(log, off);
+        ASSERT_EQ(log.provisionReady(1), 1);
+        while (log.segmentBaseOffsets().size() < 4) off = put(log, off);
+        auto bases = log.segmentBaseOffsets();
+        const int64_t active = bases.back();
+        bases.pop_back();
+        std::vector<int64_t> sizes(bases.size(), 1);
+        LogCleaner cleaner;
+        SkimpyOffsetMap map(1024);
+        const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 1'000'000, map, false, 1 << 20);
+        ASSERT_TRUE(res.unreadable);
+        ASSERT_GE(log.finalizeStagingRenames(), 1);
+        LogCleaner cleaner2;
+        SkimpyOffsetMap map2(1024);
+        const auto second = cleaner2.produceCleanedRangeBounded(log.dir(), bases, sizes, active,
+                                                               std::max<int64_t>(0, res.passEnd), 0, 1'000'000, map2, false, 1 << 20);
+        EXPECT_FALSE(second.unreadable);
+        EXPECT_EQ(second.passEnd, active);
     }
     fs::remove_all(dir);
 }

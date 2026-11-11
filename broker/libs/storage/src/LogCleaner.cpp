@@ -1444,6 +1444,26 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
         if (e.path().extension() == ".new") std::filesystem::remove(e.path());
     }
 
+    // A segment adopted from the provisioner's ready pool can be sealed and in the snapshot while its file still has the
+    // staging name (the rename to <base>.log is queued on the provisioner thread).  The scan would read it as empty, so
+    // the pass ends below it: the watermark never moves over records that were not read.
+    for (const int64_t b : sealedBases) {
+        if (b >= activeBase) break;
+        std::error_code existsEc;
+        if (!std::filesystem::exists(segmentLogPath(dir, b), existsEc)) {
+            activeBase = b;
+            result.unreadable = true;
+            break;
+        }
+    }
+    if (result.unreadable) {
+        result.passEnd = activeBase;
+        if (activeBase <= globalDirtyStart) {
+            result.passEnd = globalDirtyStart;   // nothing readable in the dirty range: no advance, nothing written
+            return result;
+        }
+    }
+
     // Fill the caller-owned dedupe map ONCE over the whole dirty section (clear()
     // reuses its backing array — no per-pass allocation).  The map holds the
     // HIGHEST offset per key in [globalDirtyStart, activeBase); it stops early (map

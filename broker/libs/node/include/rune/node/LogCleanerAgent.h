@@ -838,7 +838,8 @@ public:
         // The guard also covers the ensureCheckpoint ordering hazard (a restored
         // checkpoint may already have bumped the watermark past passEnd).
         // A stamped marker or a producer tail turns removable with the clock alone: look again once the shorter of the two has passed.
-        if (leader && !damagedLog && !advance && !(held && progress > previousPassEnd) && passResult.groups.empty())
+        // A pass cut short by a segment still at its staging name is not stalled: it is looked at again next cycle.
+        if (leader && !damagedLog && !advance && !(held && progress > previousPassEnd) && passResult.groups.empty() && !passResult.unreadable)
             stalledPasses_[best.log] = {best.inputs, nowMs + std::max(kStalledRetryFloorMs, std::min(effectiveDeleteRetentionMs_(*best.replica), producerIdExpirationMs_))};
         else stalledPasses_.erase(best.log);
         if (advance) best.replica->setLastCleanOffset(passEnd);
