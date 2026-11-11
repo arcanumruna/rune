@@ -555,6 +555,7 @@ private:
     std::size_t  owedCount_ = 0;
     int retryOwedReleases_(int64_t currentSessionId);
     detail::SendResult offerUnsubscribe_(int64_t subscriptionId, int64_t sessionId, int64_t corrId, uint32_t homeSession);
+    static void noteAppSeq_(SubscriptionImpl& impl, uint32_t seq) noexcept;
     /// The one builder of every status snapshot (ordinary, bind, final).
     [[nodiscard]] static SubscriptionStatus statusOf_(const SubscriptionImpl& impl, bool final) noexcept;
     /// A bind snapshot: the first uses the final-status reserve, a re-bind (resume, move) does not.

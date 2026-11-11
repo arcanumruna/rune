@@ -200,7 +200,7 @@ void SubscriberHub::applyCommand(const detail::HubCommand& cmd,
         if (impl == nullptr || !owns_(impl)) break;
         // The ring path: the handle has already answered its caller, so the command is applied whatever the verdict; its
         // number is echoed in the next snapshot (cmd.b), which is how the handle learns a refusal (no room, finished).
-        if (cmd.b != 0) impl->appSeqApplied = static_cast<uint32_t>(cmd.b);
+        noteAppSeq_(*impl, static_cast<uint32_t>(cmd.b));
         const bool applied = cmd.op == detail::HubCommand::Op::SubscribePause
                                  ? pause_(*impl, cmd.a, unsubCorrId, sessionId, submitFn)
                                  : resume_(*impl, unsubCorrId, sessionId, nowNs, submitFn);
@@ -515,13 +515,19 @@ bool SubscriberHub::unsubscribePaused_(SubscriptionImpl* impl)
     return true;
 }
 
+void SubscriberHub::noteAppSeq_(SubscriptionImpl& impl, uint32_t seq) noexcept
+{
+    // Only forward (wrap-safe): a command that was queued before a later direct one of the same handle never moves the echo back.
+    if (seq != 0 && static_cast<int32_t>(seq - impl.appSeqApplied) > 0) impl.appSeqApplied = seq;
+}
+
 bool SubscriberHub::pauseDirect(SubscriptionImpl& impl, int64_t resumeAt, uint32_t appSeq, int64_t unsubCorrId,
                                 int64_t sessionId, const SendFn& submitFn)
 {
     if (!owns_(&impl) || !impl.active) return false;
     if (resumeAt >= 0 && resumeAt > impl.pauseBound()) return false;
     const uint32_t prev = impl.appSeqApplied;
-    if (appSeq != 0) impl.appSeqApplied = appSeq;   // before the call: pause_ publishes the snapshot that carries the echo
+    noteAppSeq_(impl, appSeq);   // before the call: pause_ publishes the snapshot that carries the echo
     if (pause_(impl, resumeAt, unsubCorrId, sessionId, submitFn)) return true;
     impl.appSeqApplied = prev;
     return false;
@@ -532,7 +538,7 @@ bool SubscriberHub::resumeDirect(SubscriptionImpl& impl, uint32_t appSeq, int64_
 {
     if (!owns_(&impl) || !impl.active || !impl.paused) return false;
     const uint32_t prev = impl.appSeqApplied;
-    if (appSeq != 0) impl.appSeqApplied = appSeq;
+    noteAppSeq_(impl, appSeq);
     if (resume_(impl, newCorrId, sessionId, nowNs, submitFn)) return true;
     impl.appSeqApplied = prev;
     return false;

@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <string>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <random>
@@ -146,7 +147,7 @@ struct Rig {
             }
             if (cmd.op == Op::SubscribePause && cmd.c == 1) return rcd::HubSubmit::Accepted;   // not decidable here
         }
-        if (r->deferApp && !onDuty) { r->queued.push_back(cmd); return rcd::HubSubmit::Accepted; }
+        if (r->deferApp && (!onDuty || r->viaRing)) { r->queued.push_back(cmd); return rcd::HubSubmit::Accepted; }
         if (cmd.op == Op::HandleRelease) cmd.op = Op::Unsubscribe;
         r->hub.applyCommand(cmd, ++r->nextCorr, r->sid, r->noSend, r->nowNs);
         return rcd::HubSubmit::Accepted;
@@ -613,9 +614,14 @@ TEST(SubscriberPauseRegression, PauseMatrixRegression) {
     int cases = 0;
     for (const St s : states) {
         for (const int64_t at : resumeAts) {
-            for (const bool dutyHandle : {true, false}) {
-                SCOPED_TRACE(std::string(name(s)) + " resumeAt=" + std::to_string(at) + (dutyHandle ? " duty" : " app"));
+            // duty: a callback on the duty thread (Thread mode); invoker: the owner thread of an Invoker client (an app-path
+            // handle whose sink applies at once and answers with the hub's verdict); ring: an application thread (the
+            // command is applied through the ring and answered "accepted").
+            for (const int kind : {0, 1, 2}) {
+                const bool dutyHandle = kind == 0;
+                SCOPED_TRACE(std::string(name(s)) + " resumeAt=" + std::to_string(at) + (kind == 0 ? " duty" : kind == 1 ? " invoker" : " ring"));
                 Rig r;
+                r.viaRing = kind == 2;
                 r.open(11, dutyHandle);
                 int64_t bound = 0;
                 bool    finished = false, wasPaused = false, wasBound = false;
@@ -667,7 +673,7 @@ TEST(SubscriberPauseRegression, PauseMatrixRegression) {
             }
         }
     }
-    EXPECT_EQ(cases, 70);
+    EXPECT_EQ(cases, 105);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------
@@ -1214,4 +1220,423 @@ TEST(SubscriberPauseRegression, PauseOfAnUnadoptedSubscriptionRefusedRegression)
     EXPECT_FALSE(s2.paused());
     EXPECT_FALSE(s2.resume());
     EXPECT_FALSE(impl2->paused);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// I-6: the in-handler timings x handle kind x record position x refused Unsubscribe.
+// ---------------------------------------------------------------------------------------------------------------------------
+TEST(SubscriberPauseRegression, PauseInHandlerTimingMatrixRegression) {
+    enum class Op { PauseOff, PauseDefault, PauseOffThenResume, PauseDefaultThenResume, ResumeWhileRunning };
+    const char* opName[] = {"PauseOff", "PauseDefault", "PauseOffThenResume", "PauseDefaultThenResume", "ResumeWhileRunning"};
+    int cases = 0;
+    for (const bool dutyHandle : {true, false}) {
+        for (const Op op : {Op::PauseOff, Op::PauseDefault, Op::PauseOffThenResume, Op::PauseDefaultThenResume, Op::ResumeWhileRunning}) {
+            for (const int64_t k : {0, 4, 9}) {
+                for (const bool refuse : {false, true}) {
+                    SCOPED_TRACE(std::string(dutyHandle ? "duty " : "invoker ") + opName[static_cast<int>(op)] + " at " +
+                                 std::to_string(k) + (refuse ? " unsub refused" : ""));
+                    Rig r;
+                    r.open(11, dutyHandle);
+                    r.bind(40);
+                    r.tx.refuseUnsub = refuse;
+                    bool fired = false;
+                    r.hook = [&](const rc::Record& rec) {
+                        if (rec.offset != k || fired) return;
+                        fired = true;
+                        switch (op) {
+                        case Op::PauseOff:               EXPECT_TRUE(r.sub->pause(rec.offset)); break;
+                        case Op::PauseDefault:           EXPECT_TRUE(r.sub->pause()); break;
+                        case Op::PauseOffThenResume:     EXPECT_TRUE(r.sub->pause(rec.offset)); EXPECT_TRUE(r.sub->resume()); break;
+                        case Op::PauseDefaultThenResume: EXPECT_TRUE(r.sub->pause()); EXPECT_TRUE(r.sub->resume()); break;
+                        case Op::ResumeWhileRunning:     EXPECT_FALSE(r.sub->resume()); break;
+                        }
+                    };
+                    r.push(40, 0, 10);
+                    std::vector<int64_t> want;
+                    const bool pauses  = op != Op::ResumeWhileRunning;
+                    const bool resumes = op == Op::PauseOffThenResume || op == Op::PauseDefaultThenResume;
+                    const bool offset  = op == Op::PauseOff || op == Op::PauseOffThenResume;
+                    for (int64_t i = 0; i <= (pauses ? k : 9); ++i) want.push_back(i);
+                    EXPECT_EQ(r.got, want) << "the old frame stops at the pause";
+                    const int64_t pos = !pauses ? 10 : offset ? k : k + 1;
+                    EXPECT_EQ(r.impl->nextOffset, pos);
+                    EXPECT_EQ(r.impl->paused, pauses && !resumes);
+                    EXPECT_FALSE(r.sub->finished());
+                    if (pauses) {
+                        // The Unsubscribe is on the wire, or owed: it goes out once the transport accepts, exactly once.
+                        EXPECT_EQ(r.tx.unsubsFor(40), refuse ? 0 : 1);
+                        r.tx.refuseUnsub = false;
+                        for (int i = 0; i < 3; ++i) (void)r.hub.retryPendingUnsubscribes(r.sid);
+                        EXPECT_EQ(r.tx.unsubsFor(40), 1);
+                        EXPECT_EQ(r.hub.pendingUnsubscribes(), 0u);
+                    }
+                    if (resumes) {
+                        EXPECT_EQ(r.tx.lastSubFrom, pos);
+                        r.bindLast(41);
+                        if (pos < 10) r.push(41, pos, 10 - static_cast<int32_t>(pos));
+                        std::vector<int64_t> all = want;
+                        for (int64_t i = pos; i < 10; ++i) all.push_back(i);
+                        EXPECT_EQ(r.got, all) << "the rest exactly once (the refused record again for pause(offset))";
+                    } else if (pauses) {
+                        r.hub.setSessionConnected(false);   // a session loss does nothing to a paused subscription
+                        EXPECT_EQ(r.hub.endSeedBound(), 0);
+                        EXPECT_FALSE(r.sub->finished());
+                        EXPECT_TRUE(r.sub->paused());
+                        r.sub->unsubscribe();
+                        EXPECT_TRUE(r.sub->finished());
+                    }
+                    EXPECT_EQ(r.hub.pendingUnsubscribes(), 0u);
+                    ++cases;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(cases, 60);
+}
+
+// I-6: commands from the application thread that the duty thread applies a frame (or several) late.
+TEST(SubscriberPauseRegression, AppCommandsDelayedByFramesRegression) {
+    struct Case { const char* name; bool pauseFirst; bool resumeToo; int64_t at; };
+    const Case cases[] = {{"pause", true, false, -1}, {"pause then resume", true, true, -1}, {"pause(3)", true, false, 3},
+                          {"pause(3) then resume", true, true, 3}, {"pause above the snapshot", true, false, 7}};
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.name);
+        Rig r;
+        AppThread app;
+        r.deferApp = true;
+        r.open(11);
+        r.bind(40);
+        r.push(40, 0, 5);                                   // the snapshot says: position 5
+        bool p = false, rs = false;
+        app.run([&] { p = r.sub->pause(c.at); });
+        if (c.at == 7) { EXPECT_FALSE(p) << "above the app's last snapshot: refused, nothing queued"; EXPECT_TRUE(r.queued.empty()); continue; }
+        ASSERT_TRUE(p);
+        app.run([&] { EXPECT_TRUE(r.sub->paused()); if (c.resumeToo) rs = r.sub->resume(); });
+        EXPECT_EQ(rs, c.resumeToo);
+        r.push(40, 5, 5);                                   // a frame is dispatched before the ring is drained
+        EXPECT_EQ(r.got.size(), 10u) << "the pause had not been applied yet";
+        r.applyQueued();
+        r.hub.republishDirty();
+        bool paused = false;
+        app.run([&] { paused = r.sub->paused(); });
+        EXPECT_EQ(paused, r.impl->paused) << "the handle converges to the hub";
+        EXPECT_EQ(r.impl->paused, !c.resumeToo);
+        if (c.at >= 0) EXPECT_EQ(r.impl->nextOffset, c.at);
+        else           EXPECT_EQ(r.impl->nextOffset, 10);
+        if (!c.resumeToo) {                                 // and a later resume() from the application thread works
+            bool again = false;
+            app.run([&] { again = r.sub->resume(); });
+            EXPECT_TRUE(again);
+            r.applyQueued();
+            EXPECT_FALSE(r.impl->paused);
+        }
+    }
+}
+
+// I-2 / M-6: the owed list is full: the pause is refused (nothing changes), never silently dropped.
+TEST(SubscriberPauseRegression, FullOwedListRefusesThePauseRegression) {
+    Rig r;
+    r.open(11);
+    r.bind(40);
+    r.push(40, 0, 1);
+    r.tx.refuseUnsub = true;
+    int64_t id = 40;
+    int ok = 0;
+    for (int i = 0; i < 200 && r.sub->pause(); ++i) {   // every cycle owes one release
+        ++ok;
+        ASSERT_TRUE(r.sub->resume());
+        r.bindLast(++id);
+        r.push(id, i + 1, 1);
+    }
+    EXPECT_EQ(ok, 64) << "the fixed capacity of the owed list";
+    EXPECT_FALSE(r.sub->paused()) << "the 65th pause is refused";
+    EXPECT_EQ(r.hub.activeCount(), 1u) << "and the subscription is still bound and delivering";
+    const size_t before = r.got.size();
+    r.push(id, 65, 1);
+    EXPECT_EQ(r.got.size(), before + 1);
+    // Once the transport accepts again every owed release goes out, then a pause is possible again.
+    r.tx.refuseUnsub = false;
+    for (int i = 0; i < 3; ++i) (void)r.hub.retryPendingUnsubscribes(r.sid);
+    EXPECT_EQ(r.hub.pendingUnsubscribes(), 0u);
+    for (int64_t x = 40; x < id; ++x) EXPECT_EQ(r.tx.unsubsFor(x), 1) << "owed release of " << x;
+    EXPECT_TRUE(r.sub->pause());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// I-5: the second model-checked stress.  Operations: push (with a pause / pause + resume made inside the handler), direct
+// pause / pause(offset) / resume on the owner thread, application-thread pause / resume that the duty thread applies later
+// (applyQueued is its own operation), a session loss in every state, a leader move, a refusing transport, and the duty
+// cycle that retries owed releases.  Invariants: each offset is delivered exactly once, in order; the hub's paused state
+// and position equal the model's; the handle's paused() converges to the hub's once the ring is empty; every release the
+// broker is owed goes out exactly once, or is dropped with its session; nothing is left pending at the end.
+// ---------------------------------------------------------------------------------------------------------------------------
+namespace {
+struct StressTotals { long deliveries = 0, pauses = 0, resumes = 0, handlerPauseResume = 0, appOps = 0, applies = 0, moves = 0,
+                      lossesPaused = 0, lossesBound = 0, refusedPauses = 0, owedSent = 0, owedDropped = 0; };
+
+void runPauseStressEpisode(uint32_t seed, int episode, StressTotals& tot) {
+    std::mt19937 rng(seed * 7919u + static_cast<uint32_t>(episode) * 104729u + 1u);
+    auto rnd = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
+    SCOPED_TRACE("seed " + std::to_string(seed) + " episode " + std::to_string(episode));
+
+    Rig r;
+    r.open(11, /*dutyHandle=*/false);   // an Invoker-owner handle: direct calls get the hub's verdict, "app" calls are queued
+    r.deferApp = true;
+    enum class Inst { Pending, Bound, Paused };
+    Inst    inst         = Inst::Pending;
+    int64_t modelNext    = 0;
+    int64_t pendingFrom  = 0;
+    int64_t cursor       = 0;
+    int64_t instSubId    = 0;
+    int64_t lastBoundId  = 0;
+    int64_t idGen        = 100;
+    std::vector<std::pair<int64_t, int64_t>> staleOks;    // (corr, subId): pending Subscribes that were paused away
+    struct Owed { int64_t id; int64_t sid; };
+    std::vector<Owed>         owed;                         // the releases the hub must retry
+    std::map<int64_t, int>    expectUnsub;                  // broker subscription id -> how many Unsubscribes must reach the wire
+    int     handlerMode  = 0;   // 0 none, 1 pause(off), 2 pause(), 3 pause(off)+resume, 4 pause()+resume
+    int64_t pauseAtOffset = -1;
+    bool    ended        = false;
+
+    auto toPaused = [&] {
+        if (inst == Inst::Bound) {
+            lastBoundId = instSubId;
+            if (r.tx.refuseUnsub) owed.push_back({instSubId, r.sid});
+            else                  expectUnsub[instSubId] += 1;
+        }
+        if (inst == Inst::Pending) staleOks.emplace_back(r.corr, ++idGen);
+        inst = Inst::Paused;
+    };
+    auto settleOwed = [&] {   // what one duty cycle of retryPendingUnsubscribes does to the owed list
+        for (auto it = owed.begin(); it != owed.end();) {
+            if (it->sid != r.sid)          { expectUnsub[it->id] += 0; ++tot.owedDropped; it = owed.erase(it); }
+            else if (!r.tx.refuseUnsub)    { expectUnsub[it->id] += 1; ++tot.owedSent; it = owed.erase(it); }
+            else                           ++it;
+        }
+    };
+    auto dutyCycle = [&] { (void)r.hub.retryPendingUnsubscribes(r.sid); settleOwed(); };
+    auto ensureRoom = [&] {   // the owed list holds 64: keep the model away from the refusal (its own test covers it)
+        if (r.tx.refuseUnsub && owed.size() >= 60) { r.tx.refuseUnsub = false; dutyCycle(); r.tx.refuseUnsub = true; }
+    };
+    auto resumedNow = [&] { ++tot.resumes; pendingFrom = modelNext; inst = Inst::Pending; r.corr = r.tx.lastSubCorr; };
+
+    r.hook = [&](const rc::Record& rec) {
+        ++tot.deliveries;
+        EXPECT_EQ(inst, Inst::Bound);
+        EXPECT_EQ(rec.offset, modelNext);
+        modelNext = rec.offset + 1;
+        if (handlerMode != 0 && (pauseAtOffset < 0 || rec.offset >= pauseAtOffset)) {
+            const int mode = handlerMode;
+            handlerMode = 0;
+            const int unsubs = r.tx.unsubscribes;
+            if (mode == 1 || mode == 3) { EXPECT_TRUE(r.sub->pause(rec.offset)); modelNext = rec.offset; }
+            else                        { EXPECT_TRUE(r.sub->pause()); }
+            EXPECT_EQ(r.tx.unsubscribes, unsubs + (r.tx.refuseUnsub ? 0 : 1));
+            toPaused();
+            ++tot.pauses;
+            if (mode >= 3) {
+                EXPECT_TRUE(r.sub->resume());
+                ++tot.handlerPauseResume;
+                resumedNow();
+            }
+        }
+    };
+
+    for (int step = 0; step < 400 && !ended; ++step) {
+        ASSERT_FALSE(::testing::Test::HasFailure()) << "step " << step;
+        switch (rnd(0, 14)) {
+        case 0:
+        case 1: {   // the broker answers the pending Subscribe (and any stale one)
+            if (inst == Inst::Pending) {
+                instSubId = ++idGen;
+                r.hub.onSubscribeResponse(bindRsp(r.corr, instSubId, r.sid), 0, r.sid, r.noSend);
+                inst   = Inst::Bound;
+                cursor = std::max<int64_t>(0, pendingFrom - rnd(0, 3));
+            }
+            if (!staleOks.empty() && rnd(0, 1) == 0) {
+                const auto [c, id] = staleOks.back();
+                staleOks.pop_back();
+                const int unsubs = r.tx.unsubscribes;
+                r.hub.onSubscribeResponse(bindRsp(c, id, r.sid), 0, r.sid, r.noSend);
+                EXPECT_EQ(r.tx.unsubscribes, unsubs + (r.tx.refuseUnsub ? 0 : 1)) << "a late OK of a paused-away Subscribe is released once";
+            }
+            break;
+        }
+        case 2:
+        case 3:
+        case 4: {   // push a batch (to the live instance, or to an old one that must be dropped)
+            const int n = rnd(1, 6);
+            if (inst == Inst::Bound) {
+                ensureRoom();
+                const int pick = rnd(0, 19);
+                handlerMode   = pick == 0 ? 1 : pick == 1 ? 2 : pick == 2 ? 3 : pick == 3 ? 4 : 0;
+                pauseAtOffset = handlerMode != 0 && rnd(0, 1) ? cursor + rnd(0, n) : -1;
+                r.push(instSubId, cursor, n);
+                if (inst == Inst::Bound) cursor += n;
+                handlerMode = 0;
+            } else {
+                const size_t before = r.got.size();
+                r.push(lastBoundId != 0 ? lastBoundId : 9999, rnd(0, 50), n);
+                EXPECT_EQ(r.got.size(), before) << "a batch of a released instance is dropped";
+            }
+            break;
+        }
+        case 5: {   // pause() on the owner thread, outside a handler
+            ensureRoom();
+            const int unsubs = r.tx.unsubscribes;
+            EXPECT_TRUE(r.sub->pause());
+            EXPECT_EQ(r.tx.unsubscribes, unsubs + (inst == Inst::Bound && !r.tx.refuseUnsub ? 1 : 0));
+            if (inst != Inst::Paused) { toPaused(); ++tot.pauses; }
+            break;
+        }
+        case 6: {   // pause(offset) on the owner thread
+            ensureRoom();
+            const int64_t off = rnd(0, static_cast<int>(modelNext) + 2);
+            const bool want = off <= modelNext;
+            const bool ok = r.sub->pause(off);
+            EXPECT_EQ(ok, want) << "off " << off << " next " << modelNext;
+            if (ok) {
+                modelNext = off;
+                if (inst != Inst::Paused) { toPaused(); ++tot.pauses; }
+            }
+            break;
+        }
+        case 7: {   // resume() on the owner thread
+            const int subs = r.tx.subscribes;
+            const bool ok = r.sub->resume();
+            if (r.queued.empty()) EXPECT_EQ(ok, inst == Inst::Paused);
+            if (ok) {
+                EXPECT_EQ(inst, Inst::Paused) << "the hub resumes only a paused subscription";
+                EXPECT_EQ(r.tx.subscribes, subs + 1);
+                EXPECT_TRUE(r.tx.lastSubFrom == modelNext || (modelNext == 0 && r.tx.lastSubFrom == -2))
+                    << "from " << r.tx.lastSubFrom << " next " << modelNext;
+                resumedNow();
+            } else {
+                EXPECT_EQ(r.tx.subscribes, subs);
+            }
+            break;
+        }
+        case 8: {   // pause from the application thread: queued on the command ring
+            ++tot.appOps;
+            r.viaRing = true;
+            (void)r.sub->pause(rnd(0, 1) ? -1 : rnd(0, static_cast<int>(modelNext)));
+            r.viaRing = false;
+            break;
+        }
+        case 9: {   // resume from the application thread
+            ++tot.appOps;
+            r.viaRing = true;
+            (void)r.sub->resume();
+            r.viaRing = false;
+            break;
+        }
+        case 10: {  // the duty thread applies what is queued (a Records frame may have been dispatched before)
+            ensureRoom();
+            const auto q = r.queued;
+            for (const auto& cmd : q) {
+                if (cmd.op == rcd::HubCommand::Op::SubscribePause) {
+                    const int64_t eff = (cmd.a >= 0 && cmd.a <= modelNext) ? cmd.a : -1;   // above the bound: treated as "no offset"
+                    if (eff >= 0) modelNext = eff;
+                    if (inst != Inst::Paused) { toPaused(); ++tot.pauses; }
+                } else if (inst == Inst::Paused) {
+                    const int subs = r.tx.subscribes;
+                    r.hub.applyCommand(cmd, ++r.nextCorr, r.sid, r.noSend, r.nowNs);   // applied here: the Subscribe goes out
+                    EXPECT_EQ(r.tx.subscribes, subs + 1);
+                    resumedNow();
+                    continue;
+                }
+                r.hub.applyCommand(cmd, ++r.nextCorr, r.sid, r.noSend, r.nowNs);
+            }
+            r.queued.clear();
+            r.hub.republishDirty();
+            ++tot.applies;
+            break;
+        }
+        case 11: {  // a session loss
+            if (inst == Inst::Bound) {   // a bound one ends with SessionLost (as the hub does today): the episode is over
+                r.hub.setSessionConnected(false);
+                EXPECT_EQ(r.hub.endSeedBound(), 1);
+                EXPECT_TRUE(r.sub->finished());
+                EXPECT_EQ(r.sub->failReason(), rc::SubscriptionFailReason::SessionLost);
+                ++tot.lossesBound;
+                ended = true;
+            } else {                     // paused or pending: it outlives the loss
+                r.hub.setSessionConnected(false);
+                EXPECT_EQ(r.hub.endSeedBound(), 0);
+                r.sid += 1;
+                r.hub.setSessionConnected(true);
+                (void)r.hub.resendPending(r.sid, r.noSend);
+                staleOks.clear();
+                EXPECT_FALSE(r.sub->finished());
+                ++tot.lossesPaused;
+            }
+            break;
+        }
+        case 12: {  // a leader move
+            const int64_t newCorr = ++r.nextCorr;
+            ++r.nextCorr;
+            const int64_t oldId = instSubId;
+            const int unsubs = r.tx.unsubscribes;
+            const bool ok = r.hub.rearmMovedAway(r.corr, newCorr, newCorr + 1, r.sid, r.sid, 100 * kHour);
+            EXPECT_EQ(ok, inst == Inst::Bound);
+            if (ok) {
+                if (!r.tx.refuseUnsub) { expectUnsub[oldId] += 1; EXPECT_EQ(r.tx.unsubscribes, unsubs + 1); }
+                r.corr = newCorr;
+                inst = Inst::Pending;
+                pendingFrom = modelNext;
+                ++tot.moves;
+            }
+            break;
+        }
+        case 13: {  // the transport starts / stops refusing Unsubscribes
+            r.tx.refuseUnsub = !r.tx.refuseUnsub;
+            break;
+        }
+        case 14: {  // a duty cycle
+            dutyCycle();
+            break;
+        }
+        }
+        if (ended) break;
+        (void)r.sub->position();   // the handle drains its status ring
+        EXPECT_EQ(r.impl->paused, inst == Inst::Paused) << "step " << step;
+        EXPECT_EQ(r.impl->nextOffset, modelNext) << "step " << step;
+        EXPECT_EQ(r.hub.activeCount(), inst == Inst::Bound ? 1u : 0u);
+        EXPECT_EQ(r.hub.pendingCount(), inst == Inst::Pending ? 1u : 0u);
+        EXPECT_FALSE(r.sub->finished());
+        if (r.queued.empty()) EXPECT_EQ(r.sub->paused(), inst == Inst::Paused) << "the handle converges to the hub, step " << step;
+    }
+    // The end: the transport accepts; every owed release goes out (or is dropped with its session).
+    r.tx.refuseUnsub = false;
+    for (int i = 0; i < 3; ++i) dutyCycle();
+    EXPECT_EQ(r.hub.pendingUnsubscribes(), 0u) << "nothing left to retry";
+    EXPECT_TRUE(owed.empty());
+    for (const auto& [id, n] : expectUnsub) EXPECT_EQ(r.tx.unsubsFor(id), n) << "broker subscription " << id;
+    ++tot.deliveries;   // (keeps the totals non-trivial for an empty episode)
+    --tot.deliveries;
+}
+}  // namespace
+
+TEST(SubscriberPauseRegression, PauseStressRingRefusalAndHandlerRegression) {
+    const uint32_t seeds[] = {20261111u, 7u, 99991u, 31337u, 424242u};
+    StressTotals tot;
+    for (const uint32_t seed : seeds) {
+        for (int ep = 0; ep < 30; ++ep) {
+            runPauseStressEpisode(seed, ep, tot);
+            ASSERT_FALSE(::testing::Test::HasFailure()) << "seed " << seed << " episode " << ep;
+        }
+    }
+    std::printf("  deliveries=%ld pauses=%ld resumes=%ld handlerPR=%ld appOps=%ld applies=%ld moves=%ld lossPaused=%ld lossBound=%ld owedSent=%ld owedDropped=%ld\n",
+                tot.deliveries, tot.pauses, tot.resumes, tot.handlerPauseResume, tot.appOps, tot.applies, tot.moves,
+                tot.lossesPaused, tot.lossesBound, tot.owedSent, tot.owedDropped);
+    EXPECT_GT(tot.deliveries, 1000);
+    EXPECT_GT(tot.pauses, 300);
+    EXPECT_GT(tot.resumes, 100);
+    EXPECT_GT(tot.handlerPauseResume, 10);
+    EXPECT_GT(tot.appOps, 300);
+    EXPECT_GT(tot.applies, 100);
+    EXPECT_GT(tot.lossesPaused, 20);
+    EXPECT_GT(tot.lossesBound, 10);
+    EXPECT_GT(tot.owedSent, 10);
+    EXPECT_GT(tot.owedDropped, 0);
 }
