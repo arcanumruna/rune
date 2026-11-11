@@ -1519,15 +1519,17 @@ void runPauseStressEpisode(uint32_t seed, int episode, StressTotals& tot) {
         case 8: {   // pause from the application thread: queued on the command ring
             ++tot.appOps;
             r.viaRing = true;
-            (void)r.sub->pause(rnd(0, 1) ? -1 : rnd(0, static_cast<int>(modelNext)));
+            const bool sent = r.sub->pause(rnd(0, 1) ? -1 : rnd(0, static_cast<int>(modelNext)));
             r.viaRing = false;
+            if (sent) EXPECT_TRUE(r.sub->paused()) << "a handle sees its own pause at once, before the hub applied it";
             break;
         }
         case 9: {   // resume from the application thread
             ++tot.appOps;
             r.viaRing = true;
-            (void)r.sub->resume();
+            const bool sent = r.sub->resume();
             r.viaRing = false;
+            if (sent) EXPECT_FALSE(r.sub->paused()) << "a handle sees its own resume at once, before the hub applied it";
             break;
         }
         case 10: {  // the duty thread applies what is queued (a Records frame may have been dispatched before)
