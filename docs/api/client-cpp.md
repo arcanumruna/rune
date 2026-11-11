@@ -419,13 +419,23 @@ sub.unsubscribe();
 A consumer that cannot take a record now (its own queue is full) pauses the subscription instead of dropping the record.
 
 ```cpp
-Subscription sub = client.subscribe(events, Key(uint64_t{42}), {.from = From::earliest()},
+// Invoker mode: the owner thread assigns the handle first and only then drives the client.
+Subscription sub;
+sub = client.subscribe(events, Key(uint64_t{42}), {.from = From::earliest()},
     [&](const Record& rec) {
-        if (!ring.tryPush(rec)) sub.pause(rec.offset);   // keep this record for later: it is delivered again after resume()
+        // keep this record for later: it is delivered again after resume()
+        if (!ring.tryPush(rec) && !sub.pause(rec.offset)) dropped.increment();
     });
-// on the application thread, when the ring has room again:
-if (sub.paused()) sub.resume();
+for (;;) {
+    client.doWork(nowNs);
+    // when the ring has room again:
+    if (sub.paused()) sub.resume();
+}
 ```
+
+In Thread mode the duty thread can call the handler before `subscribe` has returned, so a handler must not use the handle
+until the application has assigned it. An application that needs to pause from the handler in Thread mode should hand the
+record to its own thread and call `pause` there.
 
 - `pause(resumeAt = -1)` releases the broker side of the subscription (an `Unsubscribe`) and parks it. With `resumeAt < 0`
   delivery continues after the last record the handler returned from. With `resumeAt >= 0` the next record delivered after
@@ -435,17 +445,23 @@ if (sub.paused()) sub.resume();
   subscription, reaches the handler. Pausing an already paused subscription only lowers (or keeps) its position.
 - `resume()` subscribes again at the stored position. Each record is delivered exactly once: a batch the broker pushes from
   below the position is trimmed. A `dataResets()` count and a leader move are handled as for any subscription.
-- `paused()` is true between a successful `pause()` and `resume()` or the end of the subscription.
+- `paused()` is true from the moment a pause has taken effect until `resume()` or the end of the subscription.
+  `active()` is false while the subscription is paused.
+- A `From::latest()` subscription paused before its first record resolves "latest" again at `resume()`, so the records
+  produced during the pause are skipped.
 - Both calls return `false` when the subscription is finished or unsubscribed, when `resumeAt` is above the position, for
   `resume()` when it is not paused, and always for the subscriptions of a `LeaseWatch` (they are not pausable).
-- **Visibility across threads.** The calls are safe on any thread. A pause made on the application thread is visible to that
-  handle at once. A pause made from inside a message handler (the duty thread) becomes visible to the application thread
+- **Visibility across threads.** The calls are safe on any thread. On an application thread, `pause()` returning `true`
+  means the request was sent to the client's duty thread; `paused()` shows when it took effect. `resumeAt` is checked
+  there against the last status the handle has seen, so `pause(x)` can be refused for an `x` the duty thread has already
+  delivered. A pause made from inside a message handler (the duty thread) becomes visible to the application thread
   eventually, not immediately: the duty thread publishes it on the status ring and the handle adopts it when the application
   thread next drains it, which `paused()`, `pause()`, `resume()`, `active()` and `position()` all do first. Until then
   `paused()` may still read `false` and `resume()` on the application thread may return `false`. Poll `paused()` (with a
   bounded loop) and call `resume()` once it reads `true`.
-- A paused subscription keeps its place; `unsubscribe()`, closing the client, a revoked grant or a lost session end it as for
-  any subscription.
+- A paused subscription keeps its place and has nothing open on the broker. A lost session or a leader move does not end
+  it: `resume()` subscribes again on the current session. `unsubscribe()`, closing the client, and a revoked session end
+  it. A `READ` grant revoked while it is paused is reported at `resume()`: the subscription finishes with `NotAuthorized`.
 
 ## Subscription filters
 
@@ -511,7 +527,7 @@ SubscriptionSet world = client.subscribe(events, AllPartitions{}, o,
 ## Lease watch
 
 `LeaseWatch` follows the live leases of a lease topic: it scans the topic's lease view and subscribes to the changes, and keeps
-the live set in memory. It is driven by `doWork(nowNs)` on the client's duty thread (Invoker pattern), like the other lease types
+the live set in memory. The owner calls `watch.doWork(nowNs)` on the thread that drives the client (the Invoker pattern), like the other lease types
 in `client-cpp/include/rune/client/lease/`. The full contract is in the header,
 [`LeaseWatch.h`](../../client-cpp/include/rune/client/lease/LeaseWatch.h).
 
@@ -522,7 +538,7 @@ in `client-cpp/include/rune/client/lease/`. The full contract is in the header,
 | Call | From | To |
 |---|---|---|
 | `startFromNow(prefixes)` | `Fresh` | `Running` |
-| failure of the watch (definitive error, full live set or name heap) | `Running` | `Failed` (one `Failed` event) |
+| failure of the watch (definitive error, full live set, name heap, a scan over `maxPagesPerScan`, or a row-length mismatch) | `Running` | `Failed` (one `Failed` event) |
 | `closeAsync()` | `Running` or `Failed` | `Closing`, then `Closed` when every subscription has finished |
 | `closeAsync()` | `Fresh` | `Closed` at once |
 | `closeAsync()` | `Closing`, `Closed` | no-op |
