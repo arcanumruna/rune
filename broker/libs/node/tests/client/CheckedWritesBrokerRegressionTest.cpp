@@ -818,20 +818,25 @@ TEST(CheckedWritesBrokerRegression, ViewOnAPartitionWithoutViewsAcksAtCommitShar
 #endif
 #ifndef RUNE_CW_SANITIZED
     // The latency ratio is a wall-clock bound: under a sanitizer the time is the sanitizer's (TSan box, -j8: All|View
-    // p50 2.07 x All p50), so only the deterministic open-transaction check above runs there.
-    const auto p50 = [&](rc::Acks acks, uint64_t firstId) {
-        Sender s(b.clientConfig(), "acct", f.topicId, 1, acks);
-        std::vector<std::chrono::nanoseconds> lat;
-        for (uint64_t i = 0; i < 100; ++i) {
-            const auto t0 = Clock::now();
-            EXPECT_TRUE(isOk(s.await(s.send(firstId + i), 10s)));
-            lat.push_back(Clock::now() - t0);
-        }
-        std::sort(lat.begin(), lat.end());
-        return lat[lat.size() / 2];
-    };
-    const auto plain = p50(rc::Acks::All, 1000);
-    const auto view  = p50(kAllView, 2000);
+    // p50 2.07 x All p50), so only the deterministic open-transaction check above runs there.  The two series are
+    // sampled alternately so a burst of host load falls on both alike.
+    Sender plainS(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::All);
+    Sender viewS(b.clientConfig(), "acct", f.topicId, 1, kAllView);
+    std::vector<std::chrono::nanoseconds> plainLat, viewLat;
+    plainLat.reserve(100);
+    viewLat.reserve(100);
+    for (uint64_t i = 0; i < 100; ++i) {
+        auto t0 = Clock::now();
+        EXPECT_TRUE(isOk(plainS.await(plainS.send(1000 + i), 10s)));
+        plainLat.push_back(Clock::now() - t0);
+        t0 = Clock::now();
+        EXPECT_TRUE(isOk(viewS.await(viewS.send(2000 + i), 10s)));
+        viewLat.push_back(Clock::now() - t0);
+    }
+    std::sort(plainLat.begin(), plainLat.end());
+    std::sort(viewLat.begin(), viewLat.end());
+    const auto plain = plainLat[plainLat.size() / 2];
+    const auto view  = viewLat[viewLat.size() / 2];
     EXPECT_LE(view, 2 * plain) << "no view folds this partition, so View adds no wait (All p50 " << plain.count() / 1000 << " us, All|View p50 "
                                << view.count() / 1000 << " us)";
 #endif
