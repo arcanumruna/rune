@@ -157,6 +157,7 @@ LeaseWatchBase::~LeaseWatchBase() {
     }
     for (Cb& o : observers_)   // the sessions observing this watch forget it first (owner thread; they never call a destroyed watch)
         if (o.fn != nullptr && o.gone != nullptr) { const Cb c = o; o = Cb{}; c.gone(c.ctx, this); }
+    if (!hasUnfinishedSub_()) { parts_.clear(); return; }   // closed (or never subscribed): nothing to wait for, the client is not touched
     for (Part& pt : parts_)
         if (pt.sub) pt.sub->unsubscribe();
     // A handler of the duty thread holds a pointer to the ring, which is freed after this body: wait until every subscription is finished,
@@ -190,8 +191,53 @@ bool LeaseWatchBase::removeObserver(void* ctx) noexcept {
     return false;
 }
 
+bool LeaseWatchBase::hasUnfinishedSub_() const noexcept {
+    for (const Part& pt : parts_)
+        if (pt.sub && !pt.sub->finished()) return true;
+    return false;
+}
+
+void LeaseWatchBase::closeAsync() noexcept {
+    switch (life_) {
+    case Life::Fresh:
+        life_ = Life::Closed;
+        return;
+    case Life::Running:
+        ready_ = false;
+        for (Part& pt : parts_) {
+            pt.curGen = 0;
+            ++pt.scanSeq;   // an outstanding scan answer is stale
+            pt.hn = pt.hbytes = 0;
+            if (pt.sub && !pt.sub->finished()) pt.sub->unsubscribe();
+            pt.st = Idle{};
+        }
+        life_ = Life::Closing;
+        return;
+    case Life::Failed:   // fail_() already unsubscribed every subscription
+        life_ = Life::Closing;
+        return;
+    case Life::Closing:
+    case Life::Closed:
+        return;
+    }
+}
+
+// Failed and Closing: whatever the duty thread and the broker still deliver is dropped; a finished subscription is released.  Closing ends
+// as Closed once no partition holds a subscription.
+void LeaseWatchBase::settleClosing_() noexcept {
+    (void)recs_.ring().read([](const Completion&, std::span<const uint8_t>) {}, INT_MAX);
+    (void)scanCq_.poll([](const Completion&, std::span<const uint8_t>) {});
+    bool any = false;
+    for (Part& pt : parts_) {
+        if (pt.sub && pt.sub->finished()) pt.sub.reset();
+        any = any || pt.sub.has_value();
+    }
+    if (life_ == Life::Closing && !any) life_ = Life::Closed;
+}
+
 void LeaseWatchBase::emit_(LeaseEventKind kind, int32_t partition, int64_t offset, std::span<const uint8_t> key, int64_t version,
                            std::span<const uint8_t> bytes, bool fromScan) {
+    if (life_ == Life::Closing || life_ == Life::Closed) return;
     const LeaseEvent ev{kind, core_.topicId(), partition, offset, key, version, bytes, fromScan};
     if (handler_.fn != nullptr) handler_.fn(handler_.ctx, ev);
     for (const Cb& o : observers_)
@@ -211,9 +257,9 @@ void LeaseWatchBase::emit_(LeaseEventKind kind, int32_t partition, int64_t offse
 }
 
 void LeaseWatchBase::fail_() {
-    if (failed_) return;
-    failed_ = true;
-    ready_  = false;
+    if (life_ != Life::Running) return;
+    life_  = Life::Failed;
+    ready_ = false;
     for (Part& pt : parts_) {
         pt.curGen = 0;
         if (pt.sub) pt.sub->unsubscribe();
@@ -226,7 +272,7 @@ void LeaseWatchBase::fail_() {
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 OpResult LeaseWatchBase::startFromNow(std::span<const std::span<const uint8_t>> prefixes) {
-    if (started_ || failed_ || core_.closed() || core_.viewRowLen() == 0) return OpResult::InvalidArgument;
+    if (life_ != Life::Fresh || core_.closed() || core_.viewRowLen() == 0) return OpResult::InvalidArgument;
     if (prefixes.empty() || prefixes.size() > kMaxPrefixes) return OpResult::InvalidArgument;
     // A record of the watched topic travels the ring as key + value: refuse a topic whose widest key and lease row cannot (it would fail
     // the watch as Fatal at the first record).
@@ -251,7 +297,7 @@ OpResult LeaseWatchBase::startFromNow(std::span<const std::span<const uint8_t>> 
         dst.len = static_cast<uint8_t>(prefixes[i].size());
         if (!prefixes[i].empty()) std::memcpy(dst.bytes, prefixes[i].data(), prefixes[i].size());
     }
-    started_ = true;
+    life_ = Life::Running;
     for (Part& pt : parts_) pt.st = Scanning{};
     return OpResult::Accepted;
 }
@@ -267,11 +313,12 @@ LeaseWatchBase::ScanProg* LeaseWatchBase::progOf_(Part& pt) noexcept {
 }
 
 int LeaseWatchBase::doWork(int64_t nowNs) {
-    if (!started_ || failed_) return 0;
+    if (life_ == Life::Failed || life_ == Life::Closing) { settleClosing_(); return 0; }
+    if (life_ != Life::Running) return 0;
     lastNowNs_ = nowNs;
     int w = drainRing_();
-    if (!failed_) w += pollScans_();
-    if (!failed_) w += step_(nowNs);
+    if (life_ == Life::Running) w += pollScans_();
+    if (life_ == Life::Running) w += step_(nowNs);
     return w;
 }
 
@@ -280,7 +327,7 @@ int LeaseWatchBase::drainRing_() {
 }
 
 void LeaseWatchBase::onRingItem_(const Completion& c, std::span<const uint8_t> payload) {
-    if (failed_) return;
+    if (life_ != Life::Running) return;
     const uint32_t p = c.reserved0 & 0xFFFFu;
     const auto gen = static_cast<uint32_t>(c.token >> 8);
     if (p >= static_cast<uint32_t>(nParts_)) return;
@@ -321,7 +368,7 @@ int LeaseWatchBase::pollScans_() {
 }
 
 void LeaseWatchBase::onScanCompletion_(const Completion& c, std::span<const uint8_t> payload) {
-    if (failed_ || c.op != OpKind::ScanLeases) return;
+    if (life_ != Life::Running || c.op != OpKind::ScanLeases) return;
     const uint32_t p = static_cast<uint32_t>(c.token & 0xFFFFu);
     if (p >= static_cast<uint32_t>(nParts_)) return;
     Part& pt = parts_[p];
@@ -383,7 +430,7 @@ bool LeaseWatchBase::issueScan_(int32_t p, ScanProg& sp) {
 
 int LeaseWatchBase::step_(int64_t nowNs) {
     int w = 0;
-    for (int32_t p = 0; p < nParts_ && !failed_; ++p) {
+    for (int32_t p = 0; p < nParts_ && life_ == Life::Running; ++p) {
         const std::size_t before = scansIssued_ + subsOpened_ + reruns_;
         stepPart_(p, nowNs);
         w += static_cast<int>(scansIssued_ + subsOpened_ + reruns_ - before);
@@ -456,10 +503,10 @@ void LeaseWatchBase::onPage_(int32_t p, ScanProg& sp, int64_t asOf, uint64_t las
     ++pt.pageCount[j];
     if (pt.pagesUsed == 1) {   // the first page of the epoch carries the minimum asOf: subscribe from it, now
         openSubscription_(p, asOf);
-        if (failed_) return;
+        if (life_ != Life::Running) return;
     }
     if (!onScanRows_(p, rowCount, rows)) { toBroken_(p, lastNowNs_); return; }
-    if (failed_) return;
+    if (life_ != Life::Running) return;
     if (done) {
         ++sp.prefixIdx;
         sp.first      = true;
@@ -492,7 +539,7 @@ bool LeaseWatchBase::onScanRows_(int32_t p, uint32_t rowCount, std::span<const u
         const uint32_t gs     = core_.viewGrantedSlot();
         const int64_t granted = (row[gs >> 3] & (1u << (gs & 7u))) == 0 ? load64(row.data() + core_.viewGrantedOffset()) : 0;
         grant_(p, granted, key, version, row, true);
-        if (failed_) return true;
+        if (life_ != Life::Running) return true;
     }
     return pos == rows.size();
 }
@@ -512,13 +559,13 @@ void LeaseWatchBase::scanDone_(int32_t p) {
         emit_(LeaseEventKind::Vanished, p, -1, std::span<const uint8_t>(kb, kl), ver, {}, false);
     }
     // The records that arrived during the scan, in order, through the same apply rule.
-    for (uint32_t i = 0; i < pt.hn && !failed_; ++i) {
+    for (uint32_t i = 0; i < pt.hn && life_ == Life::Running; ++i) {
         const HandoffRec& r = pt.hrec[i];
         applyRecord_(p, r.offset, r.op, r.version, std::span<const uint8_t>(pt.harena + r.at, r.keyLen),
                      std::span<const uint8_t>(pt.harena + r.at + r.keyLen, r.valLen));
     }
     pt.hn = pt.hbytes = 0;
-    if (failed_) return;
+    if (life_ != Life::Running) return;
     if (const auto* ov = std::get_if<Overflowed>(&pt.st)) {
         pt.st = Resubscribing{ov->cursor};
     } else {
@@ -551,7 +598,7 @@ void LeaseWatchBase::startRerun_(int32_t p) {
 }
 
 void LeaseWatchBase::checkReady_() {
-    if (ready_ || failed_) return;
+    if (ready_ || life_ != Life::Running) return;
     for (const Part& pt : parts_)
         if (!pt.everLive) return;
     ready_ = true;
@@ -734,7 +781,7 @@ void LeaseWatchBase::grant_(int32_t p, int64_t offset, std::span<const uint8_t> 
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 int32_t LeaseWatchBase::registerName(std::span<const uint8_t> name) {
-    if (started_ || name.empty() || name.size() > kMaxKey) return -1;
+    if (life_ != Life::Fresh || name.empty() || name.size() > kMaxKey) return -1;
     const auto h = static_cast<int64_t>(keyHash(name));
     if (const uint32_t at = nameMap_.find(h); at != detail::FlatIndexMap::kNone) {
         const Name& n = names_[at];

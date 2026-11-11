@@ -1688,6 +1688,7 @@ if(BUILD_TESTING)
             tests/client/CheckedWritesClientStatsTest.cpp    # checked writes Part 08: getStats over GetStats 91
             tests/client/LeaseTopicTest.cpp                  # lease topics Task 14a: LeaseTopic<T> writes and requests
             tests/lease/LeaseSessionTest.cpp                 # lease topics Task 15: LeaseSession and the produce guard
+            tests/lease/LeaseWatchLifeTest.cpp               # LeaseWatch life states (closeAsync / isClosed)
             tests/lease/LeaseWatchTest.cpp                   # lease topics Task 16: LeaseWatch (hash-range handoff)
             tests/lease/LeaseRecipeTest.cpp                  # lease topics Task 20: LeaseOwnership / LeaseElection
             tests/client/IngressEndpointRoutingTest.cpp

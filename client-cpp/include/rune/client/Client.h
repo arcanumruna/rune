@@ -693,6 +693,8 @@ public:
     /// T15b test hook: duty cycles run in failed mode (Invoker owner, or after
     /// close() in Thread mode — a plain duty-thread counter).
     [[nodiscard]] uint64_t testFailedDutyCycles() const noexcept { return failedDutyCycles_; }
+    /// Invoker doWork() calls that ran a duty cycle (the owner thread; tests: "this call did no client work").
+    [[nodiscard]] uint64_t dutyCyclesForTest() const noexcept { return invokerCycles_; }
 
     // ---- T15b: shard status (ClientConfig::shardStatus) -------------------------
     /// The ring's one consumer (the Invoker owner / an Agent control thread):
@@ -2215,6 +2217,7 @@ private:
     void publishShardStatus_() noexcept;
     bool failedForGood_ = false;  // the seed's terminal Rejected (duty thread only)
     uint64_t failedDutyCycles_ = 0;  // duty thread only (test hook)
+    uint64_t invokerCycles_ = 0;     // owner thread only: Invoker doWork() cycles (test hook)
     // T15b shard status (cfg_.shardStatus): ring created in the ctor before the
     // runner starts; duty-side state below is the duty thread's.
     std::unique_ptr<detail::StatusRing<shard::ShardStatus, 64 * 1024>> shardRing_;

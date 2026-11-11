@@ -22,13 +22,14 @@
 // with a transient non-retriable error) is re-run, after a per-partition exponential backoff (1 ms doubling to a 1 s cap, reset when the
 // partition reaches Live); a DEFINITIVE answer (NotAuthorized, UnknownTopic, InvalidRequest, or the duty thread refusing the request as
 // malformed), or a full live set or a full name heap, FAILS the watch TERMINALLY: every subscription is cancelled, failed() is true, one Failed
-// event is emitted, isReady() is false and doWork does nothing afterwards; the watch must be recreated.  (Transient breaks above re-run as written;
+// event is emitted, isReady() is false and doWork only drains and drops afterwards; the watch must be recreated (or closed: closeAsync()).  (Transient breaks above re-run as written;
 // Ready is emitted once.)  A lease recipe bound to a name ends whatever it holds on the Failed event (ClientErrorCode::LeaseWatchFailed).
 //
 // Memory.  Everything is allocated in the constructor (live set, name heaps, page bounds, handoff lists, record ring); doWork allocates
 // nothing.  Only (re)subscribing builds a std::function (cold, once per subscription).  No locks, no atomics, no virtual calls.
 // Moving or copying a watch is deleted (the subscription handlers hold pointers into it).  The destructor unsubscribes every subscription and
-// waits (capped) for each to finish before the ring is freed; in Invoker mode it pumps client.doWork().
+// waits (capped) for each to finish before the ring is freed; in Invoker mode it pumps client.doWork().  A watch that is isClosed() (or holds
+// no unfinished subscription) is destroyed at once, without touching the client.
 // Names (Task 20): a key belongs to the name N iff it starts with N + '/' and the rest has no further '/' (one level); lowest(id) is the live
 // lease of that name with the smallest version.  Register names BEFORE startFromNow.
 #pragma once
@@ -92,9 +93,20 @@ public:
     /// 48-byte ring record header) does not fit the 2048-byte record ring payload (kRecPayload): such a row could never be watched.
     [[nodiscard]] OpResult startFromNow(std::span<const std::span<const uint8_t>> prefixes);
 
+    /// The life of the watch: the one state (no scattered flags).  Fresh -> Running (startFromNow); Running -> Failed (fail_) or Closing
+    /// (closeAsync); Failed -> Closing (closeAsync); Closing -> Closed (every subscription finished); Fresh -> Closed (closeAsync).
+    enum class Life : uint8_t { Fresh, Running, Failed, Closing, Closed };
+
     int  doWork(int64_t nowNs);
-    [[nodiscard]] bool isReady() const noexcept { return ready_ && !failed_; }
-    [[nodiscard]] bool failed() const noexcept { return failed_; }
+    [[nodiscard]] bool isReady() const noexcept { return ready_ && life_ == Life::Running; }
+    [[nodiscard]] bool failed() const noexcept { return life_ == Life::Failed; }
+    [[nodiscard]] Life life() const noexcept { return life_; }
+    /// Fresh or Closed: the destructor then returns without waiting for the client.
+    [[nodiscard]] bool isClosed() const noexcept { return life_ == Life::Fresh || life_ == Life::Closed; }
+    /// Starts the close and returns at once: never blocks, never calls client.doWork().  Running: every subscription is cancelled and the
+    /// outstanding scans become stale; doWork then drains and drops what is left, emits no event and reaches Closed when every subscription
+    /// has finished.  Fresh: Closed at once.  Failed: Closing.  Closing / Closed: no-op.  Safe to call from inside a handler.
+    void closeAsync() noexcept;
     [[nodiscard]] uint64_t resubscribes() const noexcept { return resubscribes_; }
 
     void setHandler(LeaseEventFn fn, void* ctx) noexcept { handler_ = Cb{fn, ctx}; }
@@ -196,6 +208,8 @@ private:
 
     // ---- construction helpers / lifecycle ----
     void fail_();
+    void settleClosing_() noexcept;
+    [[nodiscard]] bool hasUnfinishedSub_() const noexcept;
     void emit_(LeaseEventKind kind, int32_t partition, int64_t offset, std::span<const uint8_t> key, int64_t version,
                std::span<const uint8_t> bytes, bool fromScan);
     // ---- the pass ----
@@ -255,7 +269,8 @@ private:
     std::vector<Part>        parts_;
     std::array<Cb, kMaxObservers> observers_{};
     Cb                       handler_{};
-    bool                     started_ = false, ready_ = false, failed_ = false;
+    Life                     life_ = Life::Fresh;
+    bool                     ready_ = false;
     uint64_t                 resubscribes_ = 0, scansIssued_ = 0, subsOpened_ = 0, reruns_ = 0, ringOverflows_ = 0, dataResetReruns_ = 0;
     int64_t                  lastNowNs_ = 0;
 };

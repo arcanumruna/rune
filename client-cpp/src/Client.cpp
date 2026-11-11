@@ -3865,6 +3865,7 @@ int Client::doWork() {
     // post-close call (e.g. from an app loop that has not yet noticed close()
     // happened).  F8c: "closed" is the command ring's closed bit.
     if (agent_.commandRingClosed()) return 0;
+    ++invokerCycles_;
     return dutyCycle(now());
 }
 
