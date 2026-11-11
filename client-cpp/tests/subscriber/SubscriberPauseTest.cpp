@@ -43,6 +43,7 @@ constexpr int64_t kHour    = 3'600'000'000'000LL;
 /// `store` is false (the allocation gate).
 struct Tx {
     bool                  store = true;
+    bool                  refuseUnsub = false;   // answer Retry to an Unsubscribe (the transport is back-pressured)
     int                   subscribes = 0;
     int                   unsubscribes = 0;
     int64_t               lastSubCorr = 0;
@@ -62,6 +63,7 @@ struct Tx {
             self->lastSubKnown   = s->partitionKnown;
             if (self->store) self->subFroms.push_back(s->fromOffset);
         } else if (auto u = rc::codec::decodeUnsubscribe(b, n)) {
+            if (self->refuseUnsub) return rcd::SendResult::Retry;
             ++self->unsubscribes;
             if (self->store) self->unsubIds.push_back(u->subscriptionId);
         }
@@ -110,14 +112,42 @@ struct Rig {
     std::unique_ptr<rc::SubscriptionImpl>  impl;
     std::optional<rc::Subscription>        sub;
     std::vector<uint8_t>                   st;
+    // The command ring's delay: with `deferApp`, a command issued off the duty thread (the AppThread) is queued and the
+    // test applies it later with applyQueued() (a Records frame can be processed in between, as in a real Client).
+    bool                                   deferApp = false;
+    bool                                   viaRing  = false;   // the test thread's handle calls go through the command ring (applied at once), not the direct path
+    std::thread::id                        dutyId   = std::this_thread::get_id();
+    std::vector<rcd::HubCommand>           queued;
+    void applyQueued() {
+        auto q = queued;
+        queued.clear();
+        for (auto& cmd : q) hub.applyCommand(cmd, ++nextCorr, sid, noSend, nowNs);
+    }
     SubscriberHub::SendFn                  noSend = [](int32_t, const uint8_t*, std::size_t) { return true; };
 
     Rig() { hub.setDirectSend(&Tx::fn, &tx); got.reserve(1 << 16); }
 
+    /// The Client's hubCommandTrampoline_, in miniature.  Pause / resume from the duty thread (this test thread, unless
+    /// `viaRing`) are decided and applied by the hub and answer with its verdict (Applied / Refused); "only if applied
+    /// directly" (cmd.c) elsewhere does nothing; any other call is the command ring: queued (`deferApp`, off the duty
+    /// thread) or applied at once, and answered Accepted.
     static rcd::HubSubmit sink(void* ctx, const rcd::HubCommand& c) {
+        using Op = rcd::HubCommand::Op;
         auto* r = static_cast<Rig*>(ctx);
         rcd::HubCommand cmd = c;
-        if (cmd.op == rcd::HubCommand::Op::HandleRelease) cmd.op = rcd::HubCommand::Op::Unsubscribe;
+        const bool onDuty = std::this_thread::get_id() == r->dutyId;
+        if (cmd.op == Op::SubscribePause || cmd.op == Op::SubscribeResume) {
+            auto* impl = reinterpret_cast<rc::SubscriptionImpl*>(cmd.handle);
+            if (onDuty && !r->viaRing) {
+                const bool ok = cmd.op == Op::SubscribePause
+                    ? r->hub.pauseDirect(*impl, cmd.a, static_cast<uint32_t>(cmd.b), ++r->nextCorr, r->sid, r->noSend)
+                    : r->hub.resumeDirect(*impl, static_cast<uint32_t>(cmd.b), ++r->nextCorr, r->sid, r->nowNs, r->noSend);
+                return ok ? rcd::HubSubmit::Applied : rcd::HubSubmit::Refused;
+            }
+            if (cmd.op == Op::SubscribePause && cmd.c == 1) return rcd::HubSubmit::Accepted;   // not decidable here
+        }
+        if (r->deferApp && !onDuty) { r->queued.push_back(cmd); return rcd::HubSubmit::Accepted; }
+        if (cmd.op == Op::HandleRelease) cmd.op = Op::Unsubscribe;
         r->hub.applyCommand(cmd, ++r->nextCorr, r->sid, r->noSend, r->nowNs);
         return rcd::HubSubmit::Accepted;
     }
@@ -1000,4 +1030,188 @@ TEST(SubscriberPauseRegression, HandlerPauseAppResumeNoAllocRegression) {
     EXPECT_EQ(allocs, 0) << "handler-pause / app-resume cycles after the first allocate nothing";
     EXPECT_EQ(r.sub->position(), 3 * kCycles);
     EXPECT_FALSE(r.sub->paused());
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Batch C review repros (red first): Invoker-mode handler pause, pause + resume in one handler call, the app handle's
+// view after a handler pause, a refused Unsubscribe at the pause, and the final-status reserve.
+// ---------------------------------------------------------------------------------------------------------
+
+// C-1: Invoker mode (the handle has no duty-thread id): pause(rec.offset) inside the handler, mid-batch.
+TEST(SubscriberPauseRegression, InvokerHandlerPauseAtRecordOffsetMidBatchRegression) {
+    Rig r;
+    r.open(11, /*dutyHandle=*/false);
+    r.bind(40);
+    bool ok = true; int calls = 0;
+    r.hook = [&](const rc::Record& rec) {
+        if (rec.offset == 4 && calls == 0) { ++calls; ok = r.sub->pause(rec.offset); }
+    };
+    r.push(40, 0, 10);
+    EXPECT_TRUE(ok) << "pause(rec.offset) refused inside the handler in Invoker mode";
+    EXPECT_EQ(r.got, (std::vector<int64_t>{0, 1, 2, 3, 4}));
+    EXPECT_TRUE(r.sub->paused());
+}
+
+// I-1: pause(rec.offset) then resume() inside the same handler call: the rest of the old batch is dropped, record 4 once more.
+TEST(SubscriberPauseRegression, PauseThenResumeInsideHandlerRegression) {
+    Rig r;
+    r.open(11);
+    r.bind(40);
+    int n = 0;
+    r.hook = [&](const rc::Record& rec) {
+        if (rec.offset == 4 && n == 0) { ++n; EXPECT_TRUE(r.sub->pause(rec.offset)); EXPECT_TRUE(r.sub->resume()); }
+    };
+    r.push(40, 0, 10);
+    EXPECT_EQ(r.got, (std::vector<int64_t>{0, 1, 2, 3, 4})) << "the old batch stops at the pause";
+    EXPECT_EQ(r.tx.lastSubFrom, 4);
+    r.bindLast(41);
+    r.push(41, 4, 6);
+    EXPECT_EQ(r.got, (std::vector<int64_t>{0, 1, 2, 3, 4, 4, 5, 6, 7, 8, 9})) << "4 handed over again, everything else once";
+}
+
+// I-1: pause() (no offset) then resume() inside the same handler call: the current record counts as delivered.
+TEST(SubscriberPauseRegression, DefaultPauseThenResumeInsideHandlerRegression) {
+    Rig r;
+    r.open(11);
+    r.bind(40);
+    int n = 0;
+    r.hook = [&](const rc::Record& rec) {
+        if (rec.offset == 4 && n == 0) { ++n; EXPECT_TRUE(r.sub->pause()); EXPECT_TRUE(r.sub->resume()); }
+    };
+    r.push(40, 0, 10);
+    EXPECT_EQ(r.got, (std::vector<int64_t>{0, 1, 2, 3, 4}));
+    EXPECT_EQ(r.tx.lastSubFrom, 5);
+    r.bindLast(41);
+    r.push(41, 5, 5);
+    EXPECT_EQ(r.got, (std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9})) << "each once";
+}
+
+// C-2: a handler pause earlier in life, then an app-thread pause whose command is applied after a Records frame.
+TEST(SubscriberPauseRegression, AppPauseRacingAFrameAfterAHandlerPauseRegression) {
+    Rig r;
+    AppThread app;
+    r.deferApp = true;
+    r.open(11);
+    r.bind(40);
+    bool hp = false;
+    r.hook = [&](const rc::Record& rec) {
+        if (rec.offset == 2 && !hp) { hp = true; EXPECT_TRUE(r.sub->pause(rec.offset)); }
+    };
+    r.push(40, 0, 5);
+    bool seen = false, res = false;
+    app.run([&] { seen = r.sub->paused(); res = r.sub->resume(); });
+    ASSERT_TRUE(seen); ASSERT_TRUE(res);
+    r.applyQueued();
+    r.bindLast(41);                              // the bind snapshot
+    app.run([&] { (void)r.sub->position(); });   // the app polls: drains the bind snapshot
+    bool p = false;
+    app.run([&] { p = r.sub->pause(); });        // app-thread pause: queued on the ring
+    ASSERT_TRUE(p);
+    r.push(41, 2, 3);                            // a Records frame is dispatched before the ring is drained
+    app.run([&] { (void)r.sub->paused(); });     // the app polls: drains the snapshot that frame published
+    r.applyQueued();                             // the duty thread applies the pause
+    ASSERT_TRUE(r.impl->paused) << "the hub paused it";
+    bool after = false, resumed = false;
+    app.run([&] { after = r.sub->paused(); resumed = r.sub->resume(); });
+    EXPECT_TRUE(after) << "the app thread must see its own pause";
+    EXPECT_TRUE(resumed) << "resume() must work: the subscription is paused in the hub";
+}
+
+// I-2: the transport refuses the Unsubscribe at the pause; then the session is lost: a paused subscription is untouched.
+TEST(SubscriberPauseRegression, RefusedUnsubscribeAtPauseThenSessionLossRegression) {
+    Rig r;
+    r.open(11);
+    r.bind(40);
+    r.push(40, 0, 5);
+    r.tx.refuseUnsub = true;
+    ASSERT_TRUE(r.sub->pause());
+    ASSERT_TRUE(r.sub->paused());
+    r.hub.setSessionConnected(false);
+    EXPECT_EQ(r.hub.endSeedBound(), 0) << "a paused subscription is bound to no session";
+    EXPECT_FALSE(r.sub->finished()) << "a session loss does nothing to a paused subscription";
+    EXPECT_TRUE(r.sub->paused());
+    r.tx.refuseUnsub = false;
+    r.sid += 1;
+    r.hub.setSessionConnected(true);
+    EXPECT_TRUE(r.sub->resume()) << "resume() subscribes again at the stored offset";
+    EXPECT_EQ(r.tx.lastSubFrom, 5);
+}
+
+// M-1: refused Unsubscribe at the pause; then unsubscribe(): nothing is left to scan once the owed release went out.
+TEST(SubscriberPauseRegression, RefusedUnsubscribeAtPauseThenUnsubscribeRegression) {
+    Rig r;
+    r.open(11);
+    r.bind(40);
+    r.push(40, 0, 5);
+    r.tx.refuseUnsub = true;
+    ASSERT_TRUE(r.sub->pause());
+    r.tx.refuseUnsub = false;
+    r.sub->unsubscribe();
+    EXPECT_TRUE(r.sub->finished());
+    EXPECT_EQ(r.hub.activeCount(), 0u);
+    for (int i = 0; i < 10; ++i) (void)r.hub.retryPendingUnsubscribes(r.sid);
+    EXPECT_EQ(r.hub.pendingUnsubscribes(), 0u) << "the owed release was sent and forgotten";
+    EXPECT_EQ(r.tx.unsubsFor(40), 1);
+}
+
+// I-3: refused Unsubscribe at the pause and again at the resume: the old broker subscription is still released.
+TEST(SubscriberPauseRegression, RefusedUnsubscribeAtPauseAndResumeRegression) {
+    Rig r;
+    r.open(11);
+    r.bind(40);
+    r.push(40, 0, 5);
+    r.tx.refuseUnsub = true;
+    ASSERT_TRUE(r.sub->pause());
+    ASSERT_TRUE(r.sub->resume());
+    r.tx.refuseUnsub = false;
+    for (int i = 0; i < 10; ++i) (void)r.hub.retryPendingUnsubscribes(r.sid);
+    EXPECT_EQ(r.tx.unsubsFor(40), 1) << "the broker-side subscription 40 is released once the transport accepts";
+}
+
+// I-4: pause / resume cycles made on the duty thread with no app-thread read: the re-bind snapshots must not eat the reserve.
+TEST(SubscriberPauseRegression, ManyResumesKeepTheFinalStatusRegression) {
+    Rig r;
+    AppThread app;
+    r.open(11);
+    r.bind(40);
+    int64_t id = 40;
+    for (int i = 0; i < 40; ++i) {
+        ASSERT_TRUE(r.sub->pause());
+        ASSERT_TRUE(r.sub->resume());
+        r.bindLast(++id);
+        r.push(id, i, 1);
+    }
+    EXPECT_EQ(r.hub.endAllLive(rc::SubscriptionFailReason::SessionRevoked, 46), 1);
+    rc::SubscriptionFailReason why = rc::SubscriptionFailReason::None; int64_t pos = -1; bool fin = false;
+    app.run([&] { fin = r.sub->finished(); why = r.sub->failReason(); pos = r.sub->position(); });
+    EXPECT_TRUE(fin);
+    EXPECT_EQ(why, rc::SubscriptionFailReason::SessionRevoked) << "the final snapshot was lost";
+    EXPECT_EQ(pos, 40);
+}
+
+// M-3: after a data reset the position is back at 0: a duty-path pause(oldOffset) names a record that no longer exists.
+TEST(SubscriberPauseRegression, DataResetLowersThePauseBoundRegression) {
+    Rig r;
+    r.open(11);
+    r.bind(40);
+    r.push(40, 0, 10);                                   // delivered up to 9
+    ASSERT_TRUE(r.hub.rearmMovedAway(11, 2000, 2001, r.sid, r.sid, 10 * kHour));
+    ASSERT_TRUE(r.hub.restartFromLogStart(2000, r.sid, 10 * kHour));
+    ASSERT_EQ(r.impl->nextOffset, 0);
+    EXPECT_FALSE(r.sub->pause(9)) << "the old delivered offset is above the new position";
+    EXPECT_FALSE(r.sub->paused());
+    EXPECT_TRUE(r.sub->pause(0));
+}
+
+// M-2: a handle whose subscription the hub has not adopted (its SubscribeAdd is still queued) cannot be paused or resumed
+// on the duty thread: the verdict is the hub's, so the handle says false instead of claiming a pause nothing applied.
+TEST(SubscriberPauseRegression, PauseOfAnUnadoptedSubscriptionRefusedRegression) {
+    Rig r;
+    auto impl2 = std::make_unique<rc::SubscriptionImpl>();
+    impl2->topicId = kTopic;
+    rc::Subscription s2(impl2.get(), &Rig::sink, &r, r.dutyId);
+    EXPECT_FALSE(s2.pause());
+    EXPECT_FALSE(s2.paused());
+    EXPECT_FALSE(s2.resume());
+    EXPECT_FALSE(impl2->paused);
 }

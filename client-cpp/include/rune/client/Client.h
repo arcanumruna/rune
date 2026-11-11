@@ -2258,6 +2258,8 @@ private:
     std::vector<uint8_t> batchFrame_;   // leaseKeepAliveBatch's encode buffer (owner thread; grown once)
     /// fix3 I3: the duty-thread DIRECT application (acts on the impl).
     void applyHubCommandDirect_(const detail::HubCommand& cmd);
+    /// SubscribePause / SubscribeResume on the duty / owner thread: the subscriber hub decides and applies; true = applied.
+    [[nodiscard]] bool applySubscriptionPauseDirect_(const detail::HubCommand& cmd);
     /// The thread whose handle calls take the duty path: the Thread-mode runner;
     /// none in Invoker mode (the owner is both app and duty thread).
     [[nodiscard]] std::thread::id handleDutyThread_() const noexcept {

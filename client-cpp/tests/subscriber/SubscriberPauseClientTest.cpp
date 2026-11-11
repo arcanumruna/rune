@@ -43,4 +43,36 @@ TEST(SubscriberPauseClientRegression, OtherSubscriptionKeepsFlowingLeaseSessionK
     EXPECT_TRUE(r.cb.lost.empty());
 }
 
+// C-1 on the real Invoker Client: the handler of record 4 of a 10-record frame pauses at its own offset.  The frame's records
+// are above the last status snapshot, so the pause is decided by the hub on the owner thread, not by the handle's cache.
+TEST(SubscriberPauseClientRegression, InvokerHandlerPauseAtRecordOffsetMidFrameRegression) {
+    WRig r(invokerCfg(7313, 7314, 1), 2);
+    const rc::TopicHandle th{r.topic->core().topicId(), r.topic->core().partitionCount(), rc::TopicKind::Typed, rune::protocol::Partitioner::Fnv1a};
+    std::unique_ptr<rc::Subscription> sub;
+    std::vector<int64_t> got;
+    bool paused = false;
+    int  pauseCalls = 0;
+    sub = std::make_unique<rc::Subscription>(r.client->subscribe(th, 1, {}, [&](const rc::Record& rec) {
+        got.push_back(rec.offset);
+        if (rec.offset == 4 && pauseCalls++ == 0) paused = sub->pause(rec.offset);
+    }));
+    rc::LeaseWatchBase w(*r.client, r.topic->core());
+    for (int i = 0; i < 400 && r.gw.latestSubscription(1, 1) == nullptr; ++i) r.round(w);
+    const auto* gs = r.gw.latestSubscription(1, 1);
+    ASSERT_NE(gs, nullptr);
+    const auto subscribed0 = r.gw.subscribed.size();
+    r.gw.pushRecords(*gs, 0, 10);
+    for (int i = 0; i < 60 && got.size() < 5; ++i) r.round(w);
+    r.rounds(w, 20);
+    EXPECT_TRUE(paused) << "pause(rec.offset) was refused in a handler of the Invoker owner";
+    EXPECT_EQ(got, (std::vector<int64_t>{0, 1, 2, 3, 4})) << "nothing after the refused record";
+    EXPECT_TRUE(sub->paused());
+    EXPECT_FALSE(sub->active());
+
+    ASSERT_TRUE(sub->resume());
+    for (int i = 0; i < 400 && r.gw.subscribed.size() == subscribed0; ++i) r.round(w);
+    ASSERT_GT(r.gw.subscribed.size(), subscribed0);
+    EXPECT_EQ(r.gw.subscribed.back().fromOffset, 4) << "resumes at the refused record";
+}
+
 }  // namespace

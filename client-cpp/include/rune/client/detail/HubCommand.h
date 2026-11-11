@@ -33,9 +33,12 @@ struct HubCommand {
         /// handle = the SubscriptionImpl* (identity; resolved against the hub's own list, never dereferenced unless found
         /// there); a = resumeAt (< 0: continue after the last record handed to the handler).  Releases the broker side and
         /// parks the subscription; the hub's `unsubCorrId` argument is the fresh Unsubscribe correlation id.
+        /// b = the handle's command number (non-zero for an application-side handle; echoed back in the status as
+        /// appSeqApplied; 0 = a duty-thread call, which has no number).  c = 1: "only if applied directly" - the sink
+        /// applies it when the caller is on the duty / owner thread and does nothing (returns Accepted) otherwise.
         SubscribePause  = 3,
         /// handle = the SubscriptionImpl* (identity).  Subscribes again at the stored position; the hub's `unsubCorrId`
-        /// argument is the fresh correlation id of that new Subscribe.
+        /// argument is the fresh correlation id of that new Subscribe.  b = the handle's command number (as for SubscribePause).
         SubscribeResume = 4,
 
         // ---- GroupConsumerHub -------------------------------------------------
@@ -163,6 +166,12 @@ enum class HubSubmit : uint8_t {
     /// go) and raised the ring's orphan hint; the duty side discovers it and
     /// applies the release in FIFO order.  The caller must not touch the impl.
     Orphaned,
+    /// SubscribePause / SubscribeResume only, caller on the duty / owner thread: applied on this thread; the hub accepted
+    /// it.  (Accepted still means "on the ring": the verdict is not known yet.)
+    Applied,
+    /// SubscribePause / SubscribeResume only, caller on the duty / owner thread: applied on this thread; the hub refused
+    /// it (not adopted, finished, not paused, a position above the bound, or no room for an owed release).
+    Refused,
 };
 
 /// F8a fix4 M1: verdict of a duty-thread DIRECT send (Subscribe /

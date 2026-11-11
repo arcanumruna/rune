@@ -27,6 +27,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -94,13 +95,25 @@ public:
     ///   - resume_: re-armed like rearmMovedAway: new correlationId, From::offset(position) (the original from while nothing
     ///     was delivered), resumeFloor = position, so a batch pushed from below is trimmed.
     ///   A paused subscription is `active` (not finished) but in no table: only unsubscribe, deactivateAll and endAllLive
-    ///   (via owned_) finish it; a session loss or a leader move does not touch it.
+    ///   (via owned_) finish it; a session loss or a leader move does not touch it.  The pause always parks it, whatever the
+    ///   transport answers to the Unsubscribe: a refused one goes into the hub's fixed list of owed releases (retried each duty
+    ///   cycle, dropped when its session is gone).  A full list refuses the pause.
+    ///   b = the handle's command number: recorded in impl.appSeqApplied and echoed in the next status snapshot.
     /// `nowNs` is the duty clock: a SubscribeAdd's deadline is stamped nowNs + its timeout.
     void applyCommand(const detail::HubCommand& cmd,
                       int64_t                   unsubCorrId,
                       int64_t                   sessionId,
                       const SendFn&             submitFn,
                       int64_t                   nowNs);
+
+    /// The duty / owner thread's own pause / resume (the sink of a handle called on that thread): decides AND applies, and
+    /// returns the verdict.  False (nothing changed): the impl is not adopted by this hub, finished, `resumeAt` is above
+    /// pauseBound(), no room for an owed release (pause); not paused (resume).  `appSeq` (0 = none) is the handle's command
+    /// number, recorded only when the command is applied.
+    [[nodiscard]] bool pauseDirect(SubscriptionImpl& impl, int64_t resumeAt, uint32_t appSeq, int64_t unsubCorrId,
+                                   int64_t sessionId, const SendFn& submitFn);
+    [[nodiscard]] bool resumeDirect(SubscriptionImpl& impl, uint32_t appSeq, int64_t newCorrId, int64_t sessionId,
+                                    int64_t nowNs, const SendFn& submitFn);
 
     /// Adopt a SubscribeRequest: register it as pending (keyed by its
     /// correlationId) and send its Subscribe frame.
@@ -393,7 +406,8 @@ public:
     /// cycle (gated: one branch when zero).  A retry for a session that is no
     /// longer the current one is dropped (logged + counted) — the broker ended
     /// the subscription with that session.
-    [[nodiscard]] std::size_t pendingUnsubscribes() const noexcept { return pendingUnsubCount_; }
+    /// Counts the entries of activeById_ whose Unsubscribe is pending plus the owed releases of paused subscriptions.
+    [[nodiscard]] std::size_t pendingUnsubscribes() const noexcept { return pendingUnsubCount_ + owedCount_; }
     int retryPendingUnsubscribes(int64_t currentSessionId);
     [[nodiscard]] uint64_t unsubscribesDropped() const noexcept { return unsubscribesDropped_; }
 
@@ -533,6 +547,18 @@ private:
     void*        directSendCtx_ = nullptr;
     std::size_t  pendingUnsubCount_  = 0;
     uint64_t     unsubscribesDropped_ = 0;
+    // Releases owed to the broker by paused subscriptions whose Unsubscribe the transport refused (a paused impl sits in no
+    // table).  Fixed capacity, no allocation; retried each duty cycle by retryPendingUnsubscribes.
+    struct OwedRelease { int64_t subscriptionId; int64_t sessionId; int64_t corrId; uint32_t homeSession; };
+    static constexpr std::size_t kMaxOwedReleases = 64;
+    std::array<OwedRelease, kMaxOwedReleases> owed_{};
+    std::size_t  owedCount_ = 0;
+    int retryOwedReleases_(int64_t currentSessionId);
+    detail::SendResult offerUnsubscribe_(int64_t subscriptionId, int64_t sessionId, int64_t corrId, uint32_t homeSession);
+    /// The one builder of every status snapshot (ordinary, bind, final).
+    [[nodiscard]] static SubscriptionStatus statusOf_(const SubscriptionImpl& impl, bool final) noexcept;
+    /// A bind snapshot: the first uses the final-status reserve, a re-bind (resume, move) does not.
+    void publishBind_(SubscriptionImpl& impl);
     detail::SendResult trySendUnsubscribe_(const SubscriptionImpl& impl, const SendFn& submitFn);
     detail::SendResult retrySendUnsubscribe_(const SubscriptionImpl& impl);
     // fix3 I4.
@@ -588,8 +614,10 @@ private:
     void eraseActive_(int64_t id, const SubscriptionImpl& impl);
     /// `impl` is one this hub adopted (owned_), by address - never dereferenced before.
     [[nodiscard]] bool owns_(const SubscriptionImpl* impl) const noexcept;
-    void pause_(SubscriptionImpl& impl, int64_t resumeAt, int64_t unsubCorrId, int64_t sessionId, const SendFn& submitFn, bool direct);
-    void resume_(SubscriptionImpl& impl, int64_t newCorrId, int64_t sessionId, int64_t nowNs, const SendFn& submitFn, bool direct);
+    /// False (nothing changed): finished, or an owed release has no room.
+    [[nodiscard]] bool pause_(SubscriptionImpl& impl, int64_t resumeAt, int64_t unsubCorrId, int64_t sessionId, const SendFn& submitFn);
+    /// False (nothing changed): finished, not paused.
+    [[nodiscard]] bool resume_(SubscriptionImpl& impl, int64_t newCorrId, int64_t sessionId, int64_t nowNs, const SendFn& submitFn);
     /// Unsubscribe of a PAUSED subscription: finished, nothing to send (the broker side was released at the pause).
     bool unsubscribePaused_(SubscriptionImpl* impl);
     void markUnsent_(SubscribeRequest& req) noexcept;
