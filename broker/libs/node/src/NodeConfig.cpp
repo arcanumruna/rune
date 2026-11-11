@@ -1233,6 +1233,10 @@ ConfigResult parseNodeConfig(
             return {{}, std::string("RUNE_PRODUCER_ID_EXPIRATION_MS must be an integer in [0, ") +
                             std::to_string(NodeConfig::kMaxDurationMs) + "] ms, got '" + raw + "'"};
         cfg.producerIdExpirationMs = static_cast<int64_t>(v);
+        if (v < NodeConfig::kProducerIdExpirationWarnBelowMs)
+            warnings.push_back(std::string("RUNE_PRODUCER_ID_EXPIRATION_MS=") + raw +
+                               " is below 300000 ms (5 minutes): it must exceed every client's delivery timeout, "
+                               "or a retried batch whose ack was lost can be stored twice after a failover");
     }
 
     // --- hotpath-A F2: RUNE_SEGMENT_PROVISION_DEPTH / RUNE_SEGMENT_PROVISIONER_MAX_PARK_US ---

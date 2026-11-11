@@ -2385,6 +2385,30 @@ TEST(NodeConfigTest, PsmLogConsistencyRegression_ProducerIdExpirationDefaultAndO
     EXPECT_NE(r3.error.find("RUNE_PRODUCER_ID_EXPIRATION_MS"), std::string::npos) << r3.error;
 }
 
+// #957: an expiry below the clients' delivery timeout lets a lost-ack retry be stored twice; the config warns below 5 minutes.
+TEST(NodeConfigTest, ProducerIdExpirationBelowFiveMinutesWarnsRegression) {
+    auto mentions = [](const auto& r) {
+        for (const std::string& w : r.warnings)
+            if (w.find("RUNE_PRODUCER_ID_EXPIRATION_MS") != std::string::npos) return true;
+        return false;
+    };
+    auto env = base1node();
+    for (const char* low : {"0", "60000", "299999"}) {
+        env["RUNE_PRODUCER_ID_EXPIRATION_MS"] = low;
+        auto r = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(r.error.empty()) << r.error;
+        EXPECT_TRUE(mentions(r)) << low << " ms did not warn";
+        EXPECT_EQ(r.config->producerIdExpirationMs, std::stoll(low)) << "the value is still applied";
+    }
+    for (const char* ok : {"300000", "604800000"}) {
+        env["RUNE_PRODUCER_ID_EXPIRATION_MS"] = ok;
+        auto r = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(r.error.empty()) << r.error;
+        EXPECT_FALSE(mentions(r)) << ok << " ms warned";
+    }
+    EXPECT_FALSE(mentions(parseNodeConfig(fakeEnv(base1node())))) << "the default warned";
+}
+
 TEST(ResponseControlConfigRegression, SegmentSevenOrEightZeroIsRefusedRegression) {
     auto env = shard3node();
     env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500:40400:0,"

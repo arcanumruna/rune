@@ -537,7 +537,7 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
   id. The cleaner removes every reservation record except the latest. It copies the last 32 idempotent data batches of each
   live producer whole, so a retry after a failover still finds its ids; a deleted id's tombstone is kept
   while such a batch holds that id. A producer that sent nothing for `RUNE_PRODUCER_ID_EXPIRATION_MS` (by the segment
-  append time on the broker, not the client's timestamps) is no longer protected. The memory budget for these batches is
+  append time on the broker, not the client's timestamps) is no longer protected. Keep that setting above the clients' delivery timeout, or a retry whose ack was lost can be stored a second time. The memory budget for these batches is
   the producer-tails capacity times about 1.3 KB; past it the cleaner logs once "the producer batch window ... is over its
   budget" and protects only each producer's last batch, so a late retry may complete `StoredIdUnknown`. Raise
   `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` to avoid it.
