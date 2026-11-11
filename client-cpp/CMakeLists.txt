@@ -1673,6 +1673,7 @@ if(BUILD_TESTING)
             tests/producer/CoordinatorLinkTest.cpp
             tests/producer/ProducerIdTest.cpp
             tests/producer/ProducerTxnTest.cpp
+            tests/producer/ProducerTxnGuardTest.cpp          # Herald prerequisites Task 4: the lease guard covers the commit
             tests/producer/ProducerTxnDataTest.cpp
             tests/producer/ProducerTxnOffsetsTest.cpp
             tests/detail/M2ORingBufferTest.cpp

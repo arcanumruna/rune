@@ -468,6 +468,12 @@ int ProducerImpl::endStep_(int64_t nowNs) noexcept {
         return 1;
     }
     if (std::holds_alternative<AwaitData>(phase)) {
+        if (cm != nullptr && guard_.bound && guardBlocks_()) [[unlikely]] {
+            // R7: the lease guard blocks (at risk, ended, or the bind was refused) and EndTxn(commit) has not left: it never does.
+            // The commit completes DeliveryFailed / LeaseAtRisk and the transaction can only abort.  Not for an abort, not for ResendEnd.
+            poison_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk), AbortKind::Plain);
+            return 1;
+        }
         if (ab != nullptr) {
             // Task 6 (Kafka abortUndrainedBatches): an abort never produces what is not sent yet - every record of
             // the transaction still unsent completes with the abort's outcome.  Completions may run user code: the
@@ -1434,6 +1440,11 @@ int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
         }
         const auto* id = std::get_if<IdAssigned>(&identity_);
         if (oa->slot != nullptr || !coord_ || id == nullptr) return 0;
+        if (guard_.bound && guardBlocks_()) [[unlikely]] {   // R7: nothing of a guarded transaction starts once the lease guard blocks
+            offsetsEnd_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk),
+                        "sendOffsetsToTransaction: the lease is at risk - abort the transaction", OffsetsEnd::Failed);
+            return 1;
+        }
         CoordinatorLink::Slot* s = coord_->acquire(ReqKind::AddOffsets, oa->op.deadlineNs);
         if (s == nullptr) return 0;   // no free slot: next pass
         rpc::AddOffsetsToTxn m;
@@ -1460,6 +1471,11 @@ int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
     }
     const auto* id = std::get_if<IdAssigned>(&identity_);
     if (!coord_ || id == nullptr) return 0;
+    if (oc->sent == 0 && oc->outstanding == 0 && guard_.bound && guardBlocks_()) [[unlikely]] {   // R7: before the first TxnOffsetCommit
+        offsetsEnd_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk),
+                    "sendOffsetsToTransaction: the lease is at risk - abort the transaction", OffsetsEnd::Failed);
+        return 1;
+    }
     int work = 0;
     // FD5: the entries that do not fit one kCoordFrameCap frame go in the next request (slot); a pass that finds no
     // free slot leaves the rest for the next one.

@@ -1233,7 +1233,12 @@ public:
     }
     /// Fails everything the producer accepted and not yet acknowledged (in flight, builder, Tier-2, deferred, ring) with `st` /
     /// `errorCode`; the producer stays open.  Idempotent.  Duty thread.
-    void failGuarded(OpStatus st, uint16_t errorCode) noexcept { failAllPending(st, errorCode); }
+    /// The guard tripped or ended: every accepted record fails, and a transactional producer's open transaction can no longer commit
+    /// (R7): InTransaction / Committing-before-EndTxn become AbortableError (a commit whose EndTxn left is decided by its answer).
+    void failGuarded(OpStatus st, uint16_t errorCode) noexcept {
+        failAllPending(st, errorCode);
+        if (transactional_()) poison_(st, errorCode, AbortKind::Plain);
+    }
     /// The guard's attach / kill (LeaseGuards, duty thread).
     void guardAttach(const detail::GuardEntry* e, uint32_t gen) noexcept { guard_ = GuardRef{e, gen, true, false}; }
     void guardKill() noexcept { guard_ = GuardRef{nullptr, 0, true, true}; }   // blocked for good
