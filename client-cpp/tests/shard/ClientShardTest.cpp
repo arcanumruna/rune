@@ -983,6 +983,7 @@ TEST(ClientShardRegression, ThreadRunnerCloseRightAfterTransportFaultJoinsPrompt
     client.close();
     EXPECT_LT(std::chrono::steady_clock::now() - t0, 400ms) << "close() does not wait for the next rebuild attempt";
     EXPECT_EQ(client.testTransportRebuilds(), 0u) << "no rebuild succeeded while the seed was unreachable";
+    EXPECT_GE(client.testRebuildAttempt(), 2u) << "close() ran while the transport was Down after failed rebuilds";
 }
 
 // A Thread-runner client (its own duty thread and driver thread, real clock) rebuilds after the transport fault too: it

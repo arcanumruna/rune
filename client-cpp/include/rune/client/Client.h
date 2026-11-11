@@ -688,6 +688,8 @@ public:
     bool testRetargetSeed(const std::string& channel) { return agent_.failoverSeedTo(channel, now(), true); }
     /// Transport rebuilds completed so far (duty thread, or after it stopped).
     [[nodiscard]] uint64_t testTransportRebuilds() const noexcept { return agent_.transportRebuilds(); }
+    /// Failed rebuild attempts of the current outage (duty thread, or after it stopped).
+    [[nodiscard]] uint32_t testRebuildAttempt() const noexcept { return agent_.rebuildAttempt(); }
     /// T15b test hook: duty cycles run in failed mode (Invoker owner, or after
     /// close() in Thread mode — a plain duty-thread counter).
     [[nodiscard]] uint64_t testFailedDutyCycles() const noexcept { return failedDutyCycles_; }
