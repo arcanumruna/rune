@@ -1393,7 +1393,9 @@ inline void writeReapResult(uint8_t* p, const ReapResultMsg& m) noexcept {
 //                     on its OWN thread (shared-nothing — installView is never
 //                     called cross-thread).
 // Wire layout: viewTopicId:i32, persistence:u8, recovery:u8,
-//   planLen:i32 + plan, outDescLen:i32 + outDesc, srcDescLen:i32 + srcDesc.
+//   planLen:i32 + plan, outDescLen:i32 + outDesc, srcDescLen:i32 + srcDesc, viewObjectId:u64.
+// #941: viewObjectId trails the blobs (a frame without it decodes 0): the plan blob stores the object id at its end, so a
+// plan that does not decode could not tell its worker whose logged member its refusal keeps.
 //
 // Task 19b: `recovery` distinguishes a RESTART-RECOVERY install (the startup-
 // load loop, BrokerNode::loadViewsForRecovery_) from the Task-19 CREATE-time
@@ -1415,22 +1417,23 @@ struct ViewPlanUpdateMsg {
     std::vector<uint8_t> planBlob;      // rune::view::serialize(CompiledViewPlan)
     std::vector<uint8_t> outDescBlob;   // rune::codec::serialize(outputDescriptor)
     std::vector<uint8_t> srcDescBlob;   // rune::codec::serialize(sourceDescriptor)
+    uint64_t viewObjectId = 0;   // #941: the catalog object the plan belongs to (0 = unknown / uninstall)
 };
 
 [[nodiscard]] inline std::size_t viewPlanUpdateWireLen(const ViewPlanUpdateMsg& m) noexcept {
-    return 4 + 1 + 1 + 4 + m.planBlob.size() + 4 + m.outDescBlob.size() + 4 + m.srcDescBlob.size();
+    return 4 + 1 + 1 + 4 + m.planBlob.size() + 4 + m.outDescBlob.size() + 4 + m.srcDescBlob.size() + 8;
 }
 
 [[nodiscard]] inline std::size_t viewPlanUpdateWireLen(std::span<const uint8_t> plan, std::span<const uint8_t> outDesc,
                                                       std::span<const uint8_t> srcDesc) noexcept {
-    return 4 + 1 + 1 + 4 + plan.size() + 4 + outDesc.size() + 4 + srcDesc.size();
+    return 4 + 1 + 1 + 4 + plan.size() + 4 + outDesc.size() + 4 + srcDesc.size() + 8;
 }
 
 /// Writes exactly viewPlanUpdateWireLen(plan, outDesc, srcDesc) bytes at `p`
-/// (catalog history Task 7: the catalog effect sink writes it from spans).
+/// (catalog history Task 7: the catalog effect sink writes it from spans); `viewObjectId` trails the blobs (#941).
 inline void writeViewPlanUpdate(uint8_t* p, int32_t viewTopicId, uint8_t persistence, uint8_t recovery,
                                 std::span<const uint8_t> plan, std::span<const uint8_t> outDesc,
-                                std::span<const uint8_t> srcDesc) noexcept {
+                                std::span<const uint8_t> srcDesc, uint64_t viewObjectId) noexcept {
     using namespace admin_wire;
     putI32(p, viewTopicId); p += 4;
     *p++ = persistence;
@@ -1443,6 +1446,8 @@ inline void writeViewPlanUpdate(uint8_t* p, int32_t viewTopicId, uint8_t persist
     p += outDesc.size();
     putI32(p, static_cast<int32_t>(srcDesc.size())); p += 4;
     if (!srcDesc.empty()) std::memcpy(p, srcDesc.data(), srcDesc.size());
+    p += srcDesc.size();
+    putI64(p, static_cast<int64_t>(viewObjectId));
 }
 
 inline bool encodeViewPlanUpdate(OneToOneByteRing& ring, int32_t msgType,
@@ -1451,7 +1456,7 @@ inline bool encodeViewPlanUpdate(OneToOneByteRing& ring, int32_t msgType,
     if (idx < 0) return false;
     const uint8_t op = m.uninstall ? kViewPlanUninstallByte : (m.recovery ? uint8_t{1} : uint8_t{0});
     writeViewPlanUpdate(ring.base() + idx, m.viewTopicId, m.persistence, op,
-                        m.planBlob, m.outDescBlob, m.srcDescBlob);
+                        m.planBlob, m.outDescBlob, m.srcDescBlob, m.viewObjectId);
     ring.commit(idx);
     return true;
 }
@@ -1476,7 +1481,8 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
     };
     if (!readBlob(m.planBlob))    return m;
     if (!readBlob(m.outDescBlob)) return m;
-    (void)readBlob(m.srcDescBlob);
+    if (!readBlob(m.srcDescBlob)) return m;
+    if (pos + 8 <= len) m.viewObjectId = static_cast<uint64_t>(getI64(buf + pos));   // #941: absent in an older frame
     return m;
 }
 

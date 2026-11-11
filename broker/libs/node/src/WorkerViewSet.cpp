@@ -365,7 +365,7 @@ int WorkerViewSet::drainInstalls() {
             if (!plan) {
                 spdlog::error("WorkerViewSet: install for viewTopicId={} dropped — "
                               "compiled plan failed to deserialize", m.viewTopicId);
-                noteRefused_(0, rune::view::verdictPlanFingerprint(m.planBlob));
+                noteRefused_(m.viewObjectId, rune::view::verdictPlanFingerprint(m.planBlob));   // #941: the frame carries the object id
                 return;
             }
             if (plan->unicodeVersion != 0 && !rune::codec::unicodeVersionSupported(plan->unicodeVersion)) {

@@ -1353,7 +1353,7 @@ private:
             const std::span<const uint8_t> plan(v.def.compiledPlanBlob), out(v.def.outputDescriptorBlob), sd(src);
             const uint8_t pers = v.def.persistence == rune::catalog::Persistence::Transient ? 1 : 0;
             postCatalog_(kA2cViewPlanUpdate, viewPlanUpdateWireLen(plan, out, sd), [&](uint8_t* p) {
-                writeViewPlanUpdate(p, v.def.viewTopicId, pers, viewInstallRecovery, plan, out, sd);
+                writeViewPlanUpdate(p, v.def.viewTopicId, pers, viewInstallRecovery, plan, out, sd, v.objectId);
             });
         };
         fx.viewUninstalled = [this](int32_t viewTopicId) {

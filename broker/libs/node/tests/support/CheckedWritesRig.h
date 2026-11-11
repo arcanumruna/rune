@@ -694,6 +694,7 @@ public:
     /// Another replica takes over: this node's tail above the HW is gone and no memory survives.
     /// From now on every install frame the rig sends carries a descriptor the worker refuses.
     bool refuseInstalls = false;
+    bool undecodablePlans = false;   // #941: the install's plan blob does not decode (the frame still names its object)
     void failover(bool reinstall = true) { restart(reinstall, replica->highWatermark()); }
     void reinstallAll() { for (auto& i : installs_) i.second(); }
     void demote() {
@@ -776,7 +777,9 @@ private:
         m.planBlob    = rune::view::serialize(c.plan);
         m.outDescBlob = rune::codec::serialize(c.outputDescriptor);
         m.srcDescBlob = rune::codec::serialize(src);
+        m.viewObjectId = c.plan.viewObjectId;
         if (refuseInstalls) m.outDescBlob = {1, 2, 3};   // the worker refuses a plan whose descriptor does not decode
+        if (undecodablePlans) m.planBlob = {1, 2, 3};     // the plan itself does not decode
         EXPECT_TRUE(encodeViewPlanUpdate(channel.install, ViewSnapshotChannel::kInstallMsgType, m));
         passes(3);
     }

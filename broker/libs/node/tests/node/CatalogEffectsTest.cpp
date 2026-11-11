@@ -613,7 +613,7 @@ TEST_P(CatalogEffectsRegression, InstalledViewUninstalledThroughTheCatalogAnswer
     const auto out  = rune::codec::serialize(comp->outputDescriptor);
     const auto sd   = rune::codec::serialize(src);
     std::vector<uint8_t> f(viewPlanUpdateWireLen(plan, out, sd));
-    writeViewPlanUpdate(f.data(), 1, /*persistence=*/1, /*recovery=*/0, plan, out, sd);
+    writeViewPlanUpdate(f.data(), 1, /*persistence=*/1, /*recovery=*/0, plan, out, sd, /*viewObjectId=*/0);
     n.postRaw(kA2cViewPlanUpdate, std::move(f));
     std::optional<uint16_t> st;
     ASSERT_TRUE(SingleNode::awaitTrue([&] {
@@ -667,7 +667,7 @@ TEST_P(CatalogEffectsRegression, AppliedPlacedSinkAwaitingItsPlanAnswersNotReady
     const auto out  = rune::codec::serialize(comp->outputDescriptor);
     const auto sd   = rune::codec::serialize(src);
     std::vector<uint8_t> f(viewPlanUpdateWireLen(plan, out, sd));
-    writeViewPlanUpdate(f.data(), 1, /*persistence=*/1, /*recovery=*/0, plan, out, sd);
+    writeViewPlanUpdate(f.data(), 1, /*persistence=*/1, /*recovery=*/0, plan, out, sd, /*viewObjectId=*/0);
     n.postRaw(kA2cViewPlanUpdate, std::move(f));
     std::optional<uint16_t> st;
     EXPECT_TRUE(SingleNode::awaitTrue([&] {

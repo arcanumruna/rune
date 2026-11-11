@@ -444,6 +444,20 @@ TEST(CheckedWritesConstraintChangeRegression, RefusedReplacementKeepsTheLoggedMe
     EXPECT_EQ(c.dropOf(kStatsObj), -1);
 }
 
+// #941: a replacement whose plan does not decode names its object only in the install frame: that still keeps the logged member.
+TEST(CheckedWritesConstraintChangeRegression, AnUndecodableReplacementKeepsTheLoggedMemberRegression) {
+    Cw c;
+    c.create(CV::AccountStats, 12);
+    c.append({ch(1, 6, "a")});
+    ASSERT_TRUE(c.r.driveUntilJudged());
+    const std::size_t changes = c.r.readLog().changes.size();
+    c.r.undecodablePlans = true;
+    c.r.replaceConstrainedView(CV::AccountStats, 2);
+    c.r.passes(200);
+    EXPECT_EQ(c.r.readLog().changes.size(), changes) << "no change may drop a constraint this node cannot replace";
+    EXPECT_EQ(c.dropOf(kStatsObj), -1);
+}
+
 // #940: a later good install of the object ends the keep its earlier refusal gave: fp2 refused, fp3 installs, the drop is logged.
 TEST(CheckedWritesConstraintChangeRegression, AGoodInstallClearsTheObjectsEarlierRefusalRegression) {
     Cw c;
