@@ -294,8 +294,8 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                         frameSid != m.sessionId()) {
                         if ((staleFramesDropped_++ & 1023u) == 0) {
                             std::fprintf(stderr,
-                                "rune-client: dropped control frame(s) of a session that no "
-                                "longer exists (frame sessionId %lld, current %lld, "
+                                "rune-client: dropped control frame(s) of a session that is not "
+                                "connected (resuming or gone; frame sessionId %lld, current %lld, "
                                 "connected=%d; %llu dropped so far)\n",
                                 static_cast<long long>(frameSid),
                                 static_cast<long long>(m.sessionId()),

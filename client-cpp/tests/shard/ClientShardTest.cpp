@@ -745,6 +745,7 @@ TEST(ClientShardRegression, ControlOpsAcrossRebuildRegression) {
     {
         auto              g = ownDriverGroup(3810, 3811);
         g.base.pingTimeoutMs = 600'000;   // the fake duty clock must not burn the ping's deadline while the real-time reconnect runs
+        g.base.connectTimeoutMs = 300;    // the first resume is offered before the new UDP link is warm: retried at this timeout
         const std::string goodChannel = g.base.gatewayChannel;
         OwnDriverRig r(g);
         r.connect();
@@ -770,14 +771,7 @@ TEST(ClientShardRegression, ControlOpsAcrossRebuildRegression) {
         for (int i = 0; i < 20; ++i) { r.step(1'000'000); collect(); }
         EXPECT_EQ(times[6], 0) << "held while Down: nothing is sent on a closed transport";
         r.shard->client().testSetSeedIngressChannel(goodChannel);
-        // The first resume after the rebuild may be lost to the UDP warm-up and retried a connectTimeoutMs later: keep the
-        // fake clock at least as fast as real time so that retry comes within the drive's real-time budget (sanitizers).
-        auto last = std::chrono::steady_clock::now();
-        ASSERT_TRUE(driveUntil([&] {
-            const auto now = std::chrono::steady_clock::now();
-            r.step(std::max<int64_t>(100'000, std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()));
-            last = now;
-        }, [&] { collect(); return times[6] > 0; }));
+        ASSERT_TRUE(r.drive([&] { collect(); return times[6] > 0; }, 100'000));
         EXPECT_EQ(status[6], rc::OpStatus::Ok);
         ASSERT_EQ(r.shard->client().ping(echo, cq, 7), rc::OpResult::Accepted);
         ASSERT_TRUE(r.drive([&] { collect(); return times[7] > 0; }, 100'000));
