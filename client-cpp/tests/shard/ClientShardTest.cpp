@@ -895,8 +895,8 @@ TEST(ClientShardRegression, RebuildFailureBacksOffWithoutSpinningRegression) {
 }
 
 // A failed attempt that itself takes longer than the gap (a slow DNS lookup) must not eat the gap: it runs from the first
-// duty pass after the attempt.  Every duty pass advances the fake clock by 1 s, so the pass that ran an attempt "took" 1 s, longer than any
-// gap below the 10 s cap; attempts must still be at most every second pass.
+// duty pass after the attempt.  Every duty pass advances the fake clock by 1 s, so the pass that ran an attempt "took"
+// 1 s, longer than any gap below the 10 s cap; attempts must still come exactly every second pass.
 TEST(ClientShardRegression, RebuildGapStartsAfterASlowFailedAttemptRegression) {
     auto g = ownDriverGroup(3818, 3819);
     OwnDriverRig r(g);
