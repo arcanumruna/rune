@@ -516,3 +516,33 @@ TEST(ClientAgentRegression, ABindChangedToPortZeroReleasesTheBindReferenceRegres
     EXPECT_TRUE(agent.workerBindFreeForTest(wIdx)) << "the bindChanged branch never dropped its reference";
     EXPECT_EQ(agent.activePublicationSlotsForTest(), base) << "the entry's publication pair was never released";
 }
+
+// #862: a route update that moves the worker's response port re-pairs the bind entry onto the new port, in place.
+TEST(ClientAgentRegression, AChangedWorkerResponsePortRePairsTheBindRegression) {
+    const std::string kNode = "aeron:udp?endpoint=nodeA:9001";
+    const std::string kW    = "aeron:udp?endpoint=hostW:9100";
+    constexpr int32_t kTopic = 7, kStream = 21;
+    rca::ClientAgent agent(makeAgentConfig("aeron:udp?endpoint=seed:1"));
+    ASSERT_TRUE(agent.setRoute(kTopic, 0, kNode, kW, 0, kStream, 7000));
+    ASSERT_TRUE(agent.setRoute(kTopic, 1, kNode, kW, 0, kStream, 7000));   // a second route on the same entry
+    const uint32_t wIdx = agent.routeBindIdxForTest(kTopic, 0);
+    ASSERT_NE(wIdx, 0xFFFFFFFFu);
+    const std::string before = agent.workerBindResponseChannelForTest(wIdx);
+    ASSERT_NE(before.find("7000"), std::string::npos) << before;
+    const std::size_t slots = agent.activePublicationSlotsForTest();
+
+    ASSERT_TRUE(agent.setRoute(kTopic, 0, kNode, kW, 0, kStream, 7555));   // the worker restarted on another port
+    EXPECT_EQ(agent.routeBindIdxForTest(kTopic, 0), wIdx) << "the entry is re-paired in place, not replaced";
+    const std::string after = agent.workerBindResponseChannelForTest(wIdx);
+    EXPECT_NE(after.find("7555"), std::string::npos) << "the response pair is still on the old port: " << after;
+    EXPECT_EQ(after.find("7000"), std::string::npos) << after;
+    EXPECT_EQ(agent.activePublicationSlotsForTest(), slots) << "no second publication slot";
+    EXPECT_FALSE(agent.workerBindFreeForTest(wIdx));
+
+    // The second route's update to the same new port changes nothing more.
+    ASSERT_TRUE(agent.setRoute(kTopic, 1, kNode, kW, 0, kStream, 7555));
+    EXPECT_EQ(agent.workerBindResponseChannelForTest(wIdx), after);
+    // A zero port never moves the pair back or away while another route still uses the entry.
+    (void)agent.setRoute(kTopic, 1, kNode, kW, 0, kStream, 0);
+    EXPECT_EQ(agent.workerBindResponseChannelForTest(wIdx), after);
+}

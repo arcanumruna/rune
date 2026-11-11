@@ -1988,7 +1988,18 @@ uint32_t ClientAgent::workerBindFor_(const std::string& sessionEndpoint, const s
         for (std::size_t i = 0; i < workerBinds_.size(); ++i) {
             WorkerBindEntry& b = workerBinds_[i];
             if (std::holds_alternative<WorkerBindEntry::Free>(b.state)) continue;
-            if (b.streamId == streamId && b.dataChannel == dataChannel) return static_cast<uint32_t>(i);
+            if (b.streamId != streamId || b.dataChannel != dataChannel) continue;
+            if (responsePort != 0 && b.responsePort != responsePort) {
+                // #862: the worker's response port moved (it restarted): rebuild this entry's pair on the new port, in
+                // place, and bind again.  A failed start leaves the entry as it was (the next route update retries).
+                const auto moved = transport::responseControlChannelFor(dataChannel, responsePort);
+                if (moved && transport_.rePairResponsePublication(b.pub, *moved)) {
+                    b.responsePort = responsePort;
+                    b.pair  = ResponsePair::Fresh;
+                    b.state = WorkerBindEntry::Unbound{};
+                }
+            }
+            return static_cast<uint32_t>(i);
         }
         const auto respCh = transport::responseControlChannelFor(dataChannel, responsePort);
         if (!respCh) return kNoBind;   // not a UDP worker endpoint: nothing to pair
@@ -1996,6 +2007,7 @@ uint32_t ClientAgent::workerBindFor_(const std::string& sessionEndpoint, const s
         e.sessionEndpoint = sessionEndpoint;
         e.dataChannel     = dataChannel;
         e.streamId        = streamId;
+        e.responsePort    = responsePort;
         // #751 review: the slot may already be Plain (a port-0 route created it, or a freed entry demoted it under
         // such a route): upgrade it to a pair, never keep it plain under a bind that needs NAT-safe egress.
         e.pub             = transport_.upgradeToResponsePublication(dataChannel, streamId, *respCh);

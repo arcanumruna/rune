@@ -1029,6 +1029,9 @@ public:
         const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
         return idx == detail::FlatIndexMap::kNone ? kNoBind : routes_[idx].bindIdx;
     }
+    [[nodiscard]] std::string workerBindResponseChannelForTest(std::size_t i) const {
+        return i < workerBinds_.size() ? transport_.responseSubChannelForTest(workerBinds_[i].pub) : std::string{};
+    }
     /// #751 review M1 seams: the publication handle route (topic, partition) names; make it offer on the plain
     /// publication for (its data channel, stream) exactly as the offer path does for a route without a bind entry;
     /// the slot of `h` is Released / response-paired.
@@ -1173,6 +1176,7 @@ private:
         std::string sessionEndpoint;     ///< the node session this worker's binds ride (its token / sid)
         std::string dataChannel;
         int32_t     streamId = 0;
+        int32_t     responsePort = 0;   ///< #862: the worker response port this entry's pair was built for
         transport::AeronTransport::PubHandle pub = transport::AeronTransport::kNoPub;
         uint32_t    sessionIndex = kNoSession;   ///< resolved (never opened) by the duty pass
         /// #750: the sessionTableGen_ at which `sessionIndex` was last looked up (UINT64_MAX = never): an unresolved
