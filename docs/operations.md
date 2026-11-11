@@ -277,7 +277,8 @@ sampling the file; the broker keeps no history.
 | 1000241 | `rune-txn-offset-stuck-age-ms` | gauge | control | Age of the oldest of those, in ms. A WARN names it every 30 s while any is stuck. |
 | 1000242 | `rune-ns-slot-mismatch` | counter | control | Namespace slot tags refused by the gateway or a worker (`rune.ns.slot_mismatch`): a message or request whose (slot, nsId) pair the receiver's slot table does not hold. Any rise is a bug. |
 | 1000243 | `rune-peer-hello-shed` | counter | control | Peer-link Hello / HelloV2 frames dropped because the sending peer had used its one crypto-costing Hello answer for this duty cycle (a flood, or a legitimate initiator retrying in the same cycle as a forged one). A sustained rise means an off-path Hello flood; the real initiator re-sends every 200 ms and still links. |
-| 1000270 | `rune-log-damaged-segments` | gauge | control | Sealed log segments found damaged at boot, summed over every log the node serves: bytes after the last whole batch of a segment below the recovery point. They stay on disk and reads that reach them fail (see Damaged log segments). Set once at start; damage found later is only logged. |
+| 1000270 | `rune-log-damaged-segments` | gauge | control | Sealed log segments found damaged at boot, summed over every log the node serves: bytes after the last whole batch of a segment below the recovery point. They stay on disk and reads that reach them fail (see Damaged log segments). Set once at start; damage that readers reach later is counted by `rune-log-damaged-reads`. |
+| 1000271 | `rune-log-damaged-reads` | counter | control | Subscription reads that reached a damaged or unreadable stored batch since the node started. Each one fails its subscription with `StorageError`. A value above 0 means clients are reading into damage found at boot or later. |
 
 Per-namespace metrics (one series per namespace on this node, allocated when the namespace is created and freed when it is
 erased; the key is the namespace id and the slot's owner tag is the namespace id too):
@@ -375,7 +376,8 @@ segment as it is. A sealed segment whose bytes after the last whole, CRC-valid b
 
 - **Kept.** The file is not touched (no truncation, no rename). The broker logs `Log <dir>: segment <base> is DAMAGED at byte <n>
   (offset <o>)` at error level when it finds it (at boot, or when the legacy compactor or the cleaner reloads the segment),
-  and the gauge `rune-log-damaged-segments` counts the damaged segments found at boot. A node with a damaged **partition**
+  and the gauge `rune-log-damaged-segments` counts the damaged segments found at boot; the counter `rune-log-damaged-reads`
+  counts the subscription reads that reach damage while the node runs. A node with a damaged **partition**
   segment still starts; a damaged **system log** refuses to start (below).
 - **Reads fail at the damage.** A read at or after the damaged offset, up to the next segment, is never skipped past. A consumer
   or subscription that reaches it gets `StorageError (26)` ("the stored batch is corrupt (damaged log segment)") and the client

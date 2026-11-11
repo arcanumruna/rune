@@ -6423,6 +6423,11 @@ void BrokerNode::publishNsSlotMetrics_() noexcept {
     if (!metricsReady_ || !gateway_) return;
     const auto total = static_cast<std::int64_t>(gateway_->nsSlotMismatchTotal());
     if (total != lastNsMismatchPublished_) { lastNsMismatchPublished_ = total; controlSet_(RuneMetric::NsSlotMismatch, total); }
+    const auto damaged = static_cast<std::int64_t>(gateway_->damagedReadsTotal());   // #882
+    if (damaged != lastDamagedReadsPublished_) {
+        lastDamagedReadsPublished_ = damaged;
+        controlSet_(RuneMetric::DamagedReads, damaged);
+    }
 }
 
 uint32_t BrokerNode::nsConnectionsForTest(uint32_t nsId) {

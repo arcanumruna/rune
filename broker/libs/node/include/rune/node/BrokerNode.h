@@ -3024,6 +3024,7 @@ private:
     std::vector<metrics::SlotWriter>                      nsMetricSlots_;       // by nsSlot; unbound (slot() < 0) = none
     uint64_t                                              nsSlotAssignFailures_ = 0;   // a bug if ever non-zero
     std::int64_t                                          lastNsMismatchPublished_ = 0;
+    std::int64_t                                          lastDamagedReadsPublished_ = 0;   // #882
     void bootAssignNsSlots_();                                                   // startup thread: from the booted catalog
     void onNsUpserted_(const rune::catalog::NamespaceRecord& rec);               // control thread: assign / refresh + broadcast
     void onNsErasedSlot_(uint32_t nsId);                                         // control thread: release + broadcast

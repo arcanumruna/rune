@@ -5,6 +5,7 @@
 // (StorageError on the wire, naming the subscription); a subscription from the next segment reads to the end; the log
 // still appends; and a second restart sees the same damage.  Every wait has a hard cap.
 #include "client/OneBroker.h"
+#include "MetricsTestReader.h"
 
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
@@ -22,6 +23,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -207,6 +209,15 @@ TEST(CorruptSegmentBrokerRegression, RealClientFailsCorruptBatchAndReadsPastTheD
         ASSERT_EQ(static_cast<int64_t>(got.size()), dmg.D) << "exactly the records below the damage";
         for (int64_t i = 0; i < dmg.D; ++i) EXPECT_EQ(got[static_cast<std::size_t>(i)], i) << "gap or reorder at " << i;
         EXPECT_TRUE(col.heardError("corrupt")) << "onError never heard the broker's message";
+        // #882: the runtime counter rises (worker -> gateway signal -> control-thread publish); bounded wait.
+        std::optional<std::int64_t> reads;
+        for (int i = 0; i < 2000; ++i) {
+            reads = rune::node::test::readRuneMetric(broker.node(), rune::node::RuneMetric::DamagedReads);
+            if (reads && *reads >= 1) break;
+            std::this_thread::sleep_for(5ms);
+        }
+        ASSERT_TRUE(reads.has_value());
+        EXPECT_GE(*reads, 1) << "rune-log-damaged-reads did not count the read that reached the damage";
     }
     {   // from the next segment: everything to the end
         Collected past;
