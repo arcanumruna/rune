@@ -2530,7 +2530,9 @@ public:
             // fire: this is the only place that knows.  Fail-stop like every
             // other storage invariant violation — never publish a shorter map
             // (a restart rebuilds from the surviving log: committedEnd_ = 0).
-            const rune::replication::Offset cut = replica_->lastTruncationOffset();
+            // The lowest cut since the last pass, not just the last one (#830).
+            const rune::replication::Offset cut =
+                replica_->takeTruncationFloor(rune::replication::CutConsumer::Metadata);
             if (cut < committedEnd_) [[unlikely]] {
                 spdlog::critical("MetadataService[{}]: __cluster_metadata truncated at {} — below the "
                                  "committed end {} (committed metadata lost: unclean consensus "

@@ -90,6 +90,9 @@ struct ReplicaPositionReport {
 // ---------------------------------------------------------------------------
 enum class Role { Leader, Follower };
 
+/// #830: who reads the truncation floor.  Each consumer has its own floor; a take resets only its own.
+enum class CutConsumer : uint8_t { VerdictTimeline = 0, Metadata = 1 };
+
 // ---------------------------------------------------------------------------
 // Error codes (returned in FetchResponseMsg::errorCode)
 // ---------------------------------------------------------------------------
@@ -802,10 +805,12 @@ public:
     [[nodiscard]] Offset      lastTruncationOffset() const noexcept { return lastTruncationOffset_; }
     /// #809: the LOWEST cut since the previous take (max = none), then reset.  lastTruncationOffset() is only the last cut; two
     /// cuts X < Y between two worker passes leave a consumer that folds a timeline (the verdict timeline) holding entries in [X, Y).
-    /// Exactly one consumer takes it (the worker's verdictOnLogCut_); nothing else resets it.
-    [[nodiscard]] Offset      takeTruncationFloor() noexcept {
-        const Offset f = cutFloor_;
-        cutFloor_ = std::numeric_limits<Offset>::max();
+    /// One floor per consumer (#830): each consumer's take resets only its own, so one consumer's pass never hides a cut
+    /// from another.  The default is the worker's verdict timeline (verdictOnLogCut_); MetadataService takes Metadata.
+    [[nodiscard]] Offset      takeTruncationFloor(CutConsumer who = CutConsumer::VerdictTimeline) noexcept {
+        Offset& slot = cutFloor_[static_cast<std::size_t>(who)];
+        const Offset f = slot;
+        slot = std::numeric_limits<Offset>::max();
         return f;
     }
     /// F15 S4: bumped on every Leader <-> Follower transition (becomeLeader from
@@ -1778,7 +1783,8 @@ private:
     uint64_t logGeneration_ = 0;           ///< F15: bumped on truncation
     uint64_t leaderAnswers_ = 0;           ///< issues #15 / #111: accepted current-leader answers (see leaderAnswers())
     Offset   lastTruncationOffset_ = 0;    ///< F15: cut point of the last generation bump
-    Offset   cutFloor_ = std::numeric_limits<Offset>::max();   ///< #809: lowest cut point since takeTruncationFloor()
+    /// #809/#830: lowest cut point since each consumer's takeTruncationFloor()
+    std::array<Offset, 2> cutFloor_{std::numeric_limits<Offset>::max(), std::numeric_limits<Offset>::max()};
     uint64_t leadershipGeneration_ = 0;    ///< F15 S4: bumped on every Leader <-> Follower transition
     uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_
     static constexpr Offset kChangedFromLatest = INT64_MIN;

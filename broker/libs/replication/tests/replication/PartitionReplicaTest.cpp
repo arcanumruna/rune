@@ -5837,3 +5837,13 @@ TEST_F(TwoReplicaTest, TruncationFloorIsTheLowestCutSinceTakeRegression) {
     EXPECT_EQ(leader_->takeTruncationFloor(), 6) << "the lower of the two cuts";
     EXPECT_EQ(leader_->takeTruncationFloor(), std::numeric_limits<Offset>::max()) << "a take resets the floor";
 }
+
+// #830: one floor per consumer; a take resets only its own.
+TEST_F(TwoReplicaTest, TruncationFloorsArePerConsumerRegression) {
+    for (int i = 0; i < 10; ++i) ASSERT_GE(leader_->append(makePayload(static_cast<uint8_t>(i))), 0);
+    leader_->truncateLogForTest(6);
+    EXPECT_EQ(leader_->takeTruncationFloor(CutConsumer::VerdictTimeline), 6);
+    EXPECT_EQ(leader_->takeTruncationFloor(CutConsumer::Metadata), 6) << "the first take must not reset the second floor";
+    EXPECT_EQ(leader_->takeTruncationFloor(CutConsumer::VerdictTimeline), std::numeric_limits<Offset>::max());
+    EXPECT_EQ(leader_->takeTruncationFloor(CutConsumer::Metadata), std::numeric_limits<Offset>::max());
+}
