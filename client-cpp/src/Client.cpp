@@ -2067,7 +2067,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     pinCqSlot_(p.target);  // I3: the slot stays out of reuse until this op completes
     // close()'s final drain, or T15b: failed for good (no session can answer) —
     // an accepted op completes exactly once, Closed.
-    if (closing_ || transportFailed_) {
+    if (closing_ || failedForGood_) {
         completeCtl_(p, OpStatus::Closed);
         return;
     }
@@ -3876,7 +3876,7 @@ int Client::dutyCycle(int64_t nowNs) {
         ~InCycle() { flag = prev; }
     } inCycle(inDutyCycle_);
     if (testDutyCycleHook_ != nullptr) [[unlikely]] testDutyCycleHook_();
-    if (transportFailed_) [[unlikely]] {
+    if (failedForGood_) [[unlikely]] {
         const int w = failedDutyCycle_(nowNs);
         if (cfg_.shardStatus) publishShardStatus_();
         return w;
@@ -3994,10 +3994,10 @@ int Client::dutyCycle(int64_t nowNs) {
     if (!orphans_.empty()) [[unlikely]] work += applyDueOrphans_();
     if (!releases_.empty()) [[unlikely]] work += reapReleases_();
 
-    // 6. T15b: the failure path — the Aeron client closed itself (or the seed
-    //    got a terminal Rejected answer): fail for good, once.
-    if (agent_.transportClosed() || agent_.seedMachine().state() == session::SessionState::Rejected)
-        [[unlikely]] {
+    // 6. T15b: the failure path — the seed got a terminal Rejected answer: fail
+    //    for good, once.  (A closed Aeron client is not terminal: the agent
+    //    rebuilds the transport and the sessions resume.)
+    if (agent_.seedMachine().state() == session::SessionState::Rejected) [[unlikely]] {
         enterFailed_();
         ++work;
     }
@@ -4007,16 +4007,14 @@ int Client::dutyCycle(int64_t nowNs) {
 }
 
 void Client::enterFailed_() {
-    if (transportFailed_) return;
-    transportFailed_ = true;
-    const bool rejected = !agent_.transportClosed();
+    if (failedForGood_) return;
+    failedForGood_ = true;
     std::fprintf(stderr,
-                 "rune-client: %s — failing for good: every accepted record completes Closed, "
-                 "no further I/O\n",
-                 rejected ? "the broker rejected the session (non-retriable)" : "the Aeron client closed");
+                 "rune-client: the broker rejected the session (non-retriable) — failing for good: every accepted "
+                 "record completes Closed, no further I/O\n");
     // Review B M3: a local refusal (nonce mismatch, a broker that skipped the login, no randomness) never produced an
     // AuthServerFinal for the Client to read — complete the pending connect / ops with the machine's code, here.
-    if (rejected) {
+    {
         const auto& sm = agent_.seedMachine();
         const int16_t rc = sm.rejectCode();
         using Ec = rune::protocol::client::ErrorCode;
@@ -4076,7 +4074,8 @@ void Client::publishShardStatus_() noexcept {
     v.seedBackoffAttempt = m.backoffAttempt();
     v.leaderSessions     = agent_.leaderSessionCount();
     v.leadersDownMask    = agent_.leaderSessionsDownMask();
-    v.transportFailed    = transportFailed_ && agent_.transportClosed();
+    v.transportDown          = agent_.transportDown();
+    v.transportRebuildAttempt = agent_.rebuildAttempt();
     v.producerClosing    = producerHub_.anyClosing();
     shardDuty_ = shard::deriveShardStatus(v, cfg_.shardIndex);
     if (!shardDirty_ && shard::sameStatus(shardDuty_, shardPublished_)) [[likely]] return;
@@ -4209,19 +4208,20 @@ void Client::runLoop() {
     if (cfg_.runnerCore >= 0 && !detail::pinCurrentThreadToCore(cfg_.runnerCore)) {
         std::fprintf(stderr, "rune-client: could not pin the runner to core %d\n", cfg_.runnerCore);
     }
-    // T15b: every loop also ends when the Client failed for good (M2): the
-    // runner then parks 1 ms per cycle below — it only drains the command ring
-    // (close, releases) and the producers' closed rings, with no I/O.
+    // T15b: every loop also ends when the Client failed for good (the seed's
+    // Rejected, M2): the runner then parks 1 ms per cycle below — it only drains
+    // the command ring (close, releases) and the producers' closed rings, with no
+    // I/O.  A closed Aeron client does not end them: the agent rebuilds in place.
     if (cfg_.idleMode == IdleMode::LowLatency) {
         // spin 5, yield 3, park 1 µs .. 100 µs: the runner drives the producer drain
         // AND the ack poll, so its park ceiling is the client floor on ack latency.
         aeron::concurrent::BackoffIdleStrategy idle(
             5, 3, std::chrono::duration<long, std::nano>(1'000),
             std::chrono::duration<long, std::nano>(100'000));
-        while (!agent_.commandRingClosed() && !transportFailed_) idle.idle(dutyCycle(now()));
+        while (!agent_.commandRingClosed() && !failedForGood_) idle.idle(dutyCycle(now()));
     } else if (cfg_.idleMode == IdleMode::BusySpin) {
         // Never park or yield: pin this runner to a dedicated core.
-        while (!agent_.commandRingClosed() && !transportFailed_) {
+        while (!agent_.commandRingClosed() && !failedForGood_) {
             if (dutyCycle(now()) == 0) {
 #if defined(__x86_64__) || defined(__i386__)
                 __asm__ volatile("pause" ::: "memory");
@@ -4236,7 +4236,7 @@ void Client::runLoop() {
         // Balanced: spins -> yields -> parks (max 1 ms).
         aeron::concurrent::BackoffIdleStrategy idle(
             10, 20, std::chrono::duration<long, std::nano>(1'000), std::chrono::milliseconds(1));
-        while (!agent_.commandRingClosed() && !transportFailed_) idle.idle(dutyCycle(now()));
+        while (!agent_.commandRingClosed() && !failedForGood_) idle.idle(dutyCycle(now()));
     }
     // T15b M2: failed for good — a parked loop until close() (no I/O, no spin).
     while (!agent_.commandRingClosed()) {

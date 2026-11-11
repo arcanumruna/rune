@@ -14,11 +14,13 @@
 //                 (downMask: which); those partitions wait, the rest flow
 //   Reconnecting  the seed was Live and is reconnecting (attempt = its Backoff
 //                 attempt); it never gives up (T15a R1).  Batches stay put.
+//                 Also the Aeron client closed and the transport is being
+//                 rebuilt (attempt = the failed rebuild attempts).
 //   Draining      the producer's intake is closed (begin-close): flushing and
 //                 awaiting the acks of what it accepted (then teardown)
-//   Failed        TransportClosed (the Aeron client closed) | Rejected (a non-
-//                 retriable broker answer to the seed, rejectCode).  Every
-//                 accepted record has completed Closed; no further I/O.
+//   Failed        Rejected (a non-retriable broker answer to the seed,
+//                 rejectCode).  Every accepted record has completed Closed; no
+//                 further I/O.
 //   Closed        torn down (close / closeImmediately / destructor)
 //
 // The state may go back (Live <-> Degraded <-> Reconnecting); only Failed and
@@ -32,7 +34,7 @@
 namespace rune::client::shard {
 
 enum class ShardState : uint8_t { Starting, Idle, Connecting, Live, Degraded, Reconnecting, Draining, Failed, Closed };
-enum class ShardFailure : uint8_t { None, TransportClosed, Rejected };
+enum class ShardFailure : uint8_t { None, Rejected };
 
 /// One published shard status (trivially copyable: it travels through a StatusRing).
 struct ShardStatus {
@@ -62,21 +64,22 @@ struct ShardStatus {
 }
 
 /// The shard's state from one duty cycle's view (pure).  Precedence: Failed
-/// (transport, then a Rejected seed) > Draining > session-derived.
+/// (a Rejected seed) > Reconnecting (transport rebuilding) > Draining >
+/// session-derived.
 [[nodiscard]] inline ShardStatus deriveShardStatus(const DutyView& v, uint32_t shard) noexcept {
     using SS = session::SessionState;
     ShardStatus s;
     s.shard     = shard;
     s.sessionId = v.seedSessionId;
-    if (v.transportFailed) {
-        s.state   = ShardState::Failed;
-        s.failure = ShardFailure::TransportClosed;
-        return s;
-    }
     if (v.seedState == SS::Rejected) {
         s.state      = ShardState::Failed;
         s.failure    = ShardFailure::Rejected;
         s.rejectCode = v.seedRejectCode;
+        return s;
+    }
+    if (v.transportDown) {
+        s.state   = ShardState::Reconnecting;
+        s.attempt = static_cast<int32_t>(v.transportRebuildAttempt);
         return s;
     }
     if (v.producerClosing) {

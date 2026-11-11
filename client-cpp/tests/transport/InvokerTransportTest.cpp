@@ -242,7 +242,7 @@ TEST(InvokerTransport, MinimumAcceptedLivenessStartsDriverRegression) {
 TEST(InvokerTransport, PerStreamPublicationResolvesWithoutBlockingRegression) {
     Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3200)};
     t.start();
-    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected(); }));
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
     const uint8_t b[] = {9};
     EXPECT_FALSE(t.offer(3201, b, 1)) << "unresolved per-worker stream back-pressures";
     const Transport::PubHandle h = t.publicationHandle("aeron:ipc", 3201);
@@ -1639,3 +1639,243 @@ TEST(SeedRePairRegression, RePairLeavesOtherPublicationsAloneRegression) {
     EXPECT_TRUE(t.publicationReady(h));
     t.stop();
 }
+
+// ---- rebuild(): the closed Aeron client is replaced in place (bugfix/client-aeron-recover) ----
+
+namespace {
+// The owner stalls past the Aeron client liveness (Aeron's clock cannot be injected; see the stall test above).
+void stallPastLiveness(const Config& c) {
+    const long long t0 = aeron::currentTimeMillis();
+    while (aeron::currentTimeMillis() <= t0 + c.clientLivenessTimeoutNs / 1'000'000) std::this_thread::yield();
+}
+}  // namespace
+
+// Mutation: rebuild() not restarting the driver/client -> the transport stays closed, offers stay refused (red).
+// Mutation: rebuild() dropping the slot tables or leaving the MDC sub unresolved -> the handle dies / the extra stream is silent.
+TEST(InvokerTransport, StalledOwnerRebuildRestoresIoRegression) {
+    Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3160);
+    c.clientLivenessTimeoutNs = rune::client::transport::kMinClientLivenessTimeoutNs;
+    Transport t{c};
+    t.start();
+    const Transport::PubHandle h = t.publicationHandle("aeron:ipc", 3161);   // an extra stream: a plain slot + a shared MDC sub slot
+    ASSERT_NE(h, Transport::kNoPub);
+    t.addEgressSubscription("aeron:ipc", 3161);
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
+    const int32_t mdc = t.mdcSubSlotForTest("aeron:ipc", 3161);
+    ASSERT_GE(mdc, 0);
+    const std::size_t pubSlots = t.pubSlotCountForTest(), subSlots = t.subSlotCountForTest();
+    stallPastLiveness(c);
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.closed(); }));
+    ASSERT_TRUE(t.rebuild(0));
+    EXPECT_FALSE(t.closed());
+    EXPECT_EQ(t.pubSlotCountForTest(), pubSlots) << "no publication slot is added or dropped";
+    EXPECT_EQ(t.subSlotCountForTest(), subSlots) << "no subscription slot is added or dropped";
+    EXPECT_EQ(t.findPublicationForTest("aeron:ipc", 3161), h) << "the handle keeps its slot";
+    EXPECT_EQ(t.mdcSubSlotForTest("aeron:ipc", 3161), mdc) << "the shared MDC slot keeps its index";
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
+    const uint8_t payload[] = {7, 8, 9};
+    std::vector<uint8_t> echo;
+    ASSERT_TRUE(pumpUntil(t, [&] {
+        t.offer(payload, sizeof payload);
+        t.poll([&](const uint8_t* b, std::size_t n) { echo.assign(b, b + n); }, 10);
+        return !echo.empty();
+    }));
+    EXPECT_EQ(echo, std::vector<uint8_t>(std::begin(payload), std::end(payload)));
+    const uint8_t extra[] = {4, 5};
+    std::vector<uint8_t> viaMdc;
+    ASSERT_TRUE(pumpUntil(t, [&] {
+        (void)t.offerOn(h, extra, sizeof extra);
+        t.poll([&](const uint8_t* b, std::size_t n) { if (n == sizeof extra) viaMdc.assign(b, b + n); }, 10);
+        return !viaMdc.empty();
+    })) << "the shared MDC subscription re-resolved on the new client";
+    EXPECT_EQ(t.pubSlotCountForTest(), pubSlots);
+    EXPECT_EQ(t.subSlotCountForTest(), subSlots);
+    t.stop();
+}
+
+// Mutation: rebuild() dropping the pub slots or the response pair -> the handle dies, or the pair stays on a dead
+// subscription and the server's reply never arrives (red).
+TEST(InvokerTransport, RebuildKeepsHandlesAndRePairsResponsePublicationsRegression) {
+    const uint16_t reqPort = rune::client::testing::allocFreeUdpPort();
+    const uint16_t rPort   = rune::client::testing::allocFreeUdpPort();
+    Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3162);
+    Transport t{c};
+    t.start();
+    const std::string worker = loopback(reqPort);
+    const auto respCtl = rune::client::transport::responseControlChannelFor(worker, rPort);
+    ASSERT_TRUE(respCtl.has_value());
+    const Transport::PubHandle h = t.responsePublicationHandle(worker, 3163, *respCtl);
+    ASSERT_NE(h, Transport::kNoPub);
+    auto srvp = std::make_unique<RawServer>(c.dataDir, worker, 3163, rPort, c.egressStreamId);
+    RawServer* srv = srvp.get();
+    const uint8_t bind[] = {0xB1};
+    bool sent = false;
+    ASSERT_TRUE(pumpBoth(t, *srv, [&] {
+        if (!sent) sent = t.offerOn(h, bind, sizeof bind);
+        return sent && t.publicationResponseCorrelated(h);
+    }));
+    const uint64_t subsBefore = t.responseSubsAddedForTest();
+    const std::string plainCh = loopback(rune::client::testing::allocFreeUdpPort());
+    const Transport::PubHandle plain = t.publicationHandle(plainCh, 3164);
+    ASSERT_NE(plain, Transport::kNoPub);
+    const Transport::PubHandle parked = t.publicationHandle(loopback(rune::client::testing::allocFreeUdpPort()), 3166);
+    const uint8_t probe[] = {1};
+    EXPECT_FALSE(t.offerOn(parked, probe, sizeof probe));   // sends the registration; the driver is not pumped yet
+    t.releasePublication(parked);   // still resolving: parked in the drain set
+    ASSERT_GE(t.drainingPubsForTest(), 1u);
+    const std::size_t pubSlots = t.pubSlotCountForTest(), subSlots = t.subSlotCountForTest();
+
+    srvp.reset();  // it lived on the driver the rebuild deletes
+    ASSERT_TRUE(t.rebuild(0));
+    EXPECT_EQ(t.drainingPubsForTest(), 0u) << "the drain set belongs to the closed client";
+    EXPECT_EQ(t.pubSlotCountForTest(), pubSlots);
+    EXPECT_EQ(t.subSlotCountForTest(), subSlots);
+    EXPECT_EQ(t.findPublicationForTest(plainCh, 3164), plain);
+    EXPECT_FALSE(t.publicationIsResponsePairedForTest(plain)) << "a plain handle stays plain";
+    srvp = std::make_unique<RawServer>(c.dataDir, worker, 3163, rPort, c.egressStreamId);
+    srv  = srvp.get();
+    EXPECT_EQ(t.findPublicationForTest(worker, 3163), h) << "the handle keeps its slot";
+    EXPECT_TRUE(t.publicationIsResponsePairedForTest(h));
+    sent = false;
+    ASSERT_TRUE(pumpBoth(t, *srv, [&] {
+        if (!sent) sent = t.offerOn(h, bind, sizeof bind);
+        return sent && t.publicationResponseCorrelated(h);
+    }));
+    EXPECT_EQ(t.responseSubsAddedForTest(), subsBefore) << "the pair reuses its sub slot with a fresh resolution";
+    ASSERT_TRUE(pumpBoth(t, *srv, [&] { return srv->received.size() == 1; }));
+    const std::vector<uint8_t> ack = {0xAC};
+    std::vector<uint8_t> got;
+    ASSERT_TRUE(pumpBoth(t, *srv, [&] {
+        if (got.empty()) (void)srv->respond(ack);
+        t.poll([&](const uint8_t* b, std::size_t n) { if (got.empty()) got.assign(b, b + n); }, 10);
+        return !got.empty();
+    }));
+    EXPECT_EQ(got, ack) << "the reply arrives on the re-paired response subscription";
+    t.stop();
+}
+
+// Mutation: a failed rebuild() leaving the transport "started" -> closed() stays false and nothing retries (red).
+TEST(InvokerTransport, RebuildFailureIsDownThenRetrySucceedsRegression) {
+    Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3164);
+    Transport t{c};
+    t.start();
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
+    t.setIngressChannelForTest("aeron:udp?endpoint=127.0.0.1:65536");
+    EXPECT_FALSE(t.rebuild(0));
+    EXPECT_TRUE(t.closed());
+    int fds[4];
+    EXPECT_EQ(t.wakeFds(fds, 4), 0) << "no driver, no wake fds while Down";
+    const uint8_t b[] = {1};
+    EXPECT_FALSE(t.offer(b, 1));
+    t.setIngressChannelForTest("aeron:ipc");
+    ASSERT_TRUE(t.rebuild(0));
+    EXPECT_FALSE(t.closed());
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
+    t.stop();
+}
+
+// A failed rebuild releases the driver and its dir lock before it reports Down (mutation: keep the driver on the
+// resolve-failure path -> the second transport is refused, red), and stop() from Down touches no deleted driver or
+// client (mutation -> crash or hang, red).
+TEST(InvokerTransport, StopFromDownIsCleanRegression) {
+    Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3171);
+    Transport t{c};
+    t.start();
+    t.setIngressChannelForTest("aeron:udp?endpoint=127.0.0.1:65536");
+    ASSERT_FALSE(t.rebuild(0));
+    {
+        Transport next{c};
+        EXPECT_NO_THROW(next.start()) << "Down still holds the dir";
+        next.stop();
+    }
+    t.stop();
+    const uint8_t b[] = {1};
+    EXPECT_FALSE(t.offer(b, 1));
+}
+
+// Mutation: rebuild() starting the embedded driver in invoker style -> usesDriverThread() flips, nobody pumps it (red).
+TEST(InvokerTransport, RebuildInThreadModeRelaunchesDriverThreadRegression) {
+    Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3165);
+    c.driverMode = DriverMode::Thread;
+    Transport t{c};
+    t.start();
+    ASSERT_TRUE(t.rebuild(0));
+    EXPECT_TRUE(t.usesDriverThread());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!(t.ingressConnected() && t.egressConnected()) && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    EXPECT_TRUE(t.ingressConnected() && t.egressConnected()) << "the new driver thread serves the new client";
+    t.stop();
+    EXPECT_EQ(t.callerPumpViolations(), 0) << "nobody pumped the driver thread's client";
+}
+
+// Mutation: rebuild() stopping the attached external driver -> the owner's round trip dies (red).
+TEST(InvokerTransport, RebuildAttachedLeavesTheExternalDriverRegression) {
+    Config a = invokerConfig("aeron:ipc", "aeron:ipc", 3166);
+    a.driverMode = DriverMode::Thread;
+    Transport owner{a};
+    owner.start();
+    Config b = invokerConfig("aeron:ipc", "aeron:ipc", 3167);
+    b.aeronDir = a.dataDir + "/aeron";
+    Transport attached{b};
+    attached.start();
+    ASSERT_TRUE(attached.rebuild(0));
+    EXPECT_TRUE(roundTrip(attached, 3168)) << "the rebuilt client re-attaches to the running driver";
+    EXPECT_FALSE(std::filesystem::exists(b.dataDir + "/aeron")) << "still no driver of its own";
+    attached.stop();
+    EXPECT_TRUE(roundTrip(owner, 3169)) << "the external driver survived the rebuild";
+    owner.stop();
+}
+
+namespace {
+int64_t g_tickNs = 0;
+bool g_ticking = false;
+int64_t tickingNow() noexcept { return g_ticking ? (g_tickNs += 1'000'000) : g_tickNs; }
+}  // namespace
+
+// Mutation: rebuild() stamping the response-sub deadline before startBody_ -> a slow restart eats the 5 s budget (red).
+TEST(InvokerTransport, RebuildResponseSubDeadlineStartsAfterTheClientIsUpRegression) {
+    Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3172);
+    Transport t{c};
+    t.start();
+    t.setResolveClock(&tickingNow);
+    g_tickNs = 1'000'000'000;
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const auto respCtl = rune::client::transport::responseControlChannelFor(worker, 40902);
+    ASSERT_TRUE(respCtl.has_value());
+    const Transport::PubHandle h = t.responsePublicationHandle(worker, 3173, *respCtl);
+    ASSERT_NE(h, Transport::kNoPub);
+    g_ticking = true;   // every clock read during the rebuild is 1 ms later than the previous
+    ASSERT_TRUE(t.rebuild(0));
+    g_ticking = false;
+    const int64_t up = g_tickNs;   // the last read of the rebuild
+    const uint8_t frame[] = {1};
+    g_tickNs = up + 5'000'000'000LL - 1;
+    EXPECT_FALSE(t.offerOn(h, frame, sizeof frame));
+    EXPECT_TRUE(t.publicationIsResponsePairedForTest(h)) << "the full resolve budget counts from the new client being up";
+    g_tickNs = up + 5'000'000'000LL;
+    EXPECT_FALSE(t.offerOn(h, frame, sizeof frame));
+    EXPECT_FALSE(t.publicationIsResponsePairedForTest(h)) << "a response subscription that never resolves is given up";
+    t.setResolveClock(nullptr);
+    t.stop();
+}
+
+#ifdef __linux__
+// Mutation: releaseGso_ overwriting instead of accumulating -> the closed driver's counters vanish on rebuild (red).
+TEST(InvokerTransport, RebuildAccumulatesGsoTotalsRegression) {
+    const std::string ch = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort());
+    Transport t{invokerConfig(ch, ch, 3170)};
+    t.start();
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
+    const uint8_t payload[] = {1};
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.offer(payload, sizeof payload); }));
+    if (!t.udpGsoActive()) GTEST_SKIP() << "UDP GSO is not active on this host";
+    ASSERT_TRUE(t.rebuild(0));
+    const auto mid = t.gsoTotals();   // only the closed driver's totals are in it now
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.offer(payload, sizeof payload); }));
+    t.stop();
+    const auto final = t.gsoTotals();
+    EXPECT_GT(final.transports, mid.transports) << "the second driver's transports are added to the first's";
+    EXPECT_GE(final.gso_sends, mid.gso_sends) << "overwriting instead of accumulating would drop the closed driver's sends";
+}
+#endif

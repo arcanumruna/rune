@@ -1171,6 +1171,75 @@ TEST(GroupRoutingRegression, OffsetCommitRejectionCompletesCommitSyncRegression)
     }
 }
 
+// C6: the media driver closes under a Stable member (own-driver broker, transport rebuild).  The commitSync whose
+// OffsetCommit the broker never answered completes SessionLost, the member joins the group again and resumes from
+// the committed offset: the records after it are re-delivered, none is skipped.
+TEST(GroupRoutingRegression, GroupMemberRejoinsAfterRebuildRegression) {
+    RigOptions o = routingClockOptions(100'000);
+    o.ownDriver  = true;
+    GroupRig r(4251, 4252, o);
+    r.gw.holdJoins       = false;
+    r.gw.newIdOnResume   = true;   // a resumed session gets a new broker id: the old one's subscriptions and membership ended
+    r.gw.groupAssignment = {{1, 0}};
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    reachStable(r, gc);
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr; }, 4'000'000));
+    const auto before = *r.subAt(0, 0);
+    r.gw.pushRecords(before, 0, 3);
+    ASSERT_TRUE(r.drive([&] { return led.records[0] == 3; }, 4'000'000));
+    const auto awaitCommit = [&](rc::Token t, rc::Completion& got) {
+        bool done = false;
+        return r.drive([&] {
+            r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+                if (cc.token == t) { done = true; got = cc; }
+            });
+            return done;
+        }, 4'000'000);
+    };
+    rc::Completion first{};
+    const rc::Token t1 = r.nextToken++;
+    ASSERT_EQ(gc.commitSync(r.cq, t1), rc::OpResult::Accepted);
+    ASSERT_TRUE(awaitCommit(t1, first));
+    EXPECT_EQ(first.status, rc::OpStatus::Ok);
+    r.gw.committedOffsets[{1, 0}] = 3;   // the fake does not persist commits: it now holds offset 3
+    r.gw.pushRecords(before, 3, 2);
+    ASSERT_TRUE(r.drive([&] { return led.records[0] == 5; }, 4'000'000));
+
+    r.gw.replyOffsetCommits = false;   // the next commit is sent and never answered
+    const std::size_t commitsBefore = r.gw.offsetCommits.size();
+    rc::Completion pending{};
+    const rc::Token t2 = r.nextToken++;
+    ASSERT_EQ(gc.commitSync(r.cq, t2), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return r.gw.offsetCommits.size() > commitsBefore; }, 4'000'000));
+    const int joinsBefore = r.gw.joinGroups;
+    const int64_t oldSid  = r.client.testSeedSessionId();
+    r.client.testInjectTransportFault();
+    ASSERT_TRUE(awaitCommit(t2, pending));
+    EXPECT_EQ(pending.status, rc::OpStatus::SessionLost);
+    ASSERT_TRUE(r.drive([&] {
+        return r.client.testTransportRebuilds() == 1 && r.client.state() == rc::session::SessionState::Connected &&
+               r.client.testSeedSessionId() != oldSid;
+    }, 4'000'000));
+    r.gw.startRebalance(2, r.client.testSeedSessionId());   // the broker ended the old session and its membership: revoke, then join again
+
+    const auto resumed = [&]() -> const test_support::InvokerGateway::Subscribed* {
+        for (const auto& sb : r.gw.subscribed)
+            if (sb.sessionId != before.sessionId && sb.fromOffset == 3) return &sb;
+        return nullptr;
+    };
+    ASSERT_TRUE(r.drive([&] { return r.gw.joinGroups > joinsBefore && resumed() != nullptr; }, 4'000'000))
+        << "the member did not join again and resume from the committed offset: joins=" << r.gw.joinGroups << "/" << joinsBefore
+        << " fetches=" << r.gw.offsetFetches << " rebuilds=" << r.client.testTransportRebuilds();
+    EXPECT_EQ(r.client.testTransportRebuilds(), 1u);
+    const auto after = *resumed();
+    r.gw.pushRecords(after, 3, 3);
+    ASSERT_TRUE(r.drive([&] { return led.records[0] == 8; }, 4'000'000)) << "records: " << led.records[0];
+    EXPECT_EQ(led.next[0], 6);
+    EXPECT_FALSE(gc.finished());
+}
+
 // Fix round 3 (C1): a coordinator that answers EVERY Heartbeat Internal no
 // longer cycles Stable → rejoin → Stable forever — only a Heartbeat OK resets
 // the backoff budget, so the consumer finishes RetryBudgetExhausted after a

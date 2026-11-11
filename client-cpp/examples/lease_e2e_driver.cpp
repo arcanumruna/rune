@@ -104,6 +104,7 @@ namespace {
 constexpr uint16_t kKeyExists = static_cast<uint16_t>(rune::protocol::client::ErrorCode::KeyExists);
 constexpr uint16_t kNotFound  = static_cast<uint16_t>(rune::protocol::client::ErrorCode::LeaseNotFound);
 constexpr uint16_t kThrottled = static_cast<uint16_t>(rune::protocol::client::ErrorCode::Throttled);
+constexpr uint16_t kNotLeader = static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader);
 
 // ---- plumbing ---------------------------------------------------------------------------------------------------------
 
@@ -638,8 +639,12 @@ int runTransient(const Args& a) {
     }
 
     // after the restart: serve first (an old key's keepalive is LeaseNotFound, never Ok), then grants are held until the fence opens
+    // One probe key, so every grant goes to one partition: its first Throttled proves the route to the fenced leader exists.  Before that the
+    // whole-cluster restart may still be settling (a NotLeader, or a Timeout while the client re-handshakes): the same rule as
+    // LeaseTransientTrioRegression.FullRestartFencesThenLeaderChangeMidFenceRegression.  NotLeader stays legal (a leader change mid-fence).
     int64_t servedMs = 0, grantedMs = 0, held = 0, heldAfterServed = 0;
-    for (int i = 0; grantedMs == 0; ++i) {
+    bool    sawThrottled = false, inDoubt = false;
+    while (grantedMs == 0) {
         if (over()) return failWith("TRANSIENT", "no grant succeeded after the restart within " + std::to_string(maxS) + " s (the fence must end)");
         if (!driveWatch()) return failWith("TRANSIENT", "the watch failed after the restart");
         if (servedMs == 0) {
@@ -649,16 +654,18 @@ int runTransient(const Args& a) {
             else std::this_thread::sleep_for(100ms);
             continue;
         }
-        char key[32];
-        std::snprintf(key, sizeof key, "tp-%04d", i);
-        const rc::LeaseResult g = lt.grantAndWait(claimRow(key), o, 1s);
-        if (g.ok()) {
+        const rc::LeaseResult g = lt.grantAndWait(claimRow("tp-probe"), o, 1s);
+        if (g.ok() || (inDoubt && g.errorCode == kKeyExists)) {   // KeyExists: an earlier in-doubt (Timeout) grant was appended
             grantedMs = realtimeMs();
         } else if (g.errorCode == kThrottled && g.status != rc::OpStatus::Timeout) {
             // The fence's retry-after lands at/past the grant's op timeout: the client fails the grant at once (Throttled, nothing appended);
             // inside the last op timeout of the fence it parks the grant and the fence's end lets it through.  A Timeout is never right.
             ++held;
             ++heldAfterServed;
+            sawThrottled = true;
+        } else if (g.errorCode == kNotLeader || (g.status == rc::OpStatus::Timeout && !sawThrottled)) {
+            inDoubt = inDoubt || g.status == rc::OpStatus::Timeout;
+            std::this_thread::sleep_for(100ms);
         } else if (g.status == rc::OpStatus::Timeout) {
             return failWith("TRANSIENT", "a grant after the restart timed out (held by the fence, in doubt): it must answer Throttled at once");
         } else {

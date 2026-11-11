@@ -8,6 +8,7 @@
 #include <filesystem>
 #include "FreePort.h"
 #include "InvokerGateway.h"
+#include "OwnDriverGateway.h"
 #include "TestCompletions.h"
 
 #include <rune/client/Client.h>
@@ -22,6 +23,7 @@
 #include <unistd.h>
 
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -38,6 +40,8 @@ struct RigOptions {
     // Image::sourceIdentity), like real broker nodes on distinct hosts; the
     // client's egress channel is UDP then.  Default: IPC egress (one source).
     bool    udpSources        = false;
+    // The fake nodes run on a media driver of their own (survives a client transport rebuild); implies udpSources.
+    bool    ownDriver         = false;
     int64_t keepaliveNs       = 0;  // 0 = agent defaults
     int64_t responseTimeoutNs = 0;
     int64_t connectTimeoutMs  = 0;  // 0 = the client default
@@ -56,7 +60,9 @@ struct GroupRig {
     std::string                  egress;
     rc::ClientConfig             c;
     rc::Client                   client;
-    test_support::InvokerGateway gw;
+    std::unique_ptr<test_support::BrokerHost>     host;     // ownDriver: the nodes' own driver + gateway
+    std::unique_ptr<test_support::InvokerGateway> plainGw;  // otherwise: the gateway on the client's driver
+    test_support::InvokerGateway&                 gw;
     rc::Completions              cq{client};
     rc::Token                    nextToken = 1;
 
@@ -64,10 +70,14 @@ struct GroupRig {
     // sessions need the SessionMachine's connect retry (duty clock).
     GroupRig(int32_t in, int32_t eg, RigOptions o = {})
         : opt(o),
-          egress(o.udpSources ? udp(rune::client::testing::allocFreeUdpPort()) : std::string("aeron:ipc")),
+          egress((o.udpSources || o.ownDriver) ? udp(rune::client::testing::allocFreeUdpPort()) : std::string("aeron:ipc")),
           c(makeCfg(in, eg, udp(rune::client::testing::allocFreeUdpPort()), egress, o)),
           client(c),
-          gw(c.dataDir + "/aeron", c.gatewayChannel, in, egress, eg, pubChannel()) {
+          host(o.ownDriver ? std::make_unique<test_support::BrokerHost>(test_support::BrokerHost::uniqueDir(), c.gatewayChannel, in, egress, eg)
+                           : nullptr),
+          plainGw(o.ownDriver ? nullptr
+                              : std::make_unique<test_support::InvokerGateway>(c.dataDir + "/aeron", c.gatewayChannel, in, egress, eg, pubChannel())),
+          gw(host ? host->gw : *plainGw) {
         const std::string& seed = c.gatewayChannel;
         gw.brokerHost       = "127.0.0.1";
         gw.brokerPort       = std::stoi(seed.substr(seed.rfind(':') + 1));
@@ -76,10 +86,11 @@ struct GroupRig {
         gw.holdJoins        = true;   // the test releases the join once routes are known
         gw.replyPongs       = true;   // keepalives answered (each node answers its own)
         gw.replyFromArrival = true;   // each node answers / pushes from its own publication
+        gw.replyOnAnnouncedEgress = false;
     }
     // The reply publication of the next fake node (a distinct source when udpSources).
     std::string pubChannel() const {
-        return opt.udpSources ? egress + "|interface=127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort()) : std::string();
+        return (opt.udpSources || opt.ownDriver) ? egress + "|interface=127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort()) : std::string();
     }
     /// Adds a fake broker node on a free port; returns (endpoint index, port).
     std::pair<int, int> addNode(int32_t stream) {

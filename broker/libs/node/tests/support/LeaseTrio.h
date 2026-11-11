@@ -24,12 +24,49 @@
 #include <thread>
 #include <vector>
 
+// Wall-clock budgets (L22 outage, lease time kept through a change) are meaningless under ASan / TSan (5-15x); the functional checks
+// still run (same convention as DutyPassLatencyGateTest).
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#define RUNE_LT3_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#define RUNE_LT3_SANITIZED 1
+#endif
+#ifndef RUNE_LT3_SANITIZED
+#define RUNE_LT3_SANITIZED 0
+#endif
+
 namespace rune::node::test {
 
 namespace lt3 {
 namespace rc = rune::client;
 using rune::gen::LeaseClaim;
 using Clock = std::chrono::steady_clock;
+inline constexpr bool kSanitized = RUNE_LT3_SANITIZED != 0;
+
+/// The client's route-hint counters as the owner thread sees them once the duty thread has published its latest values: the owner reads
+/// the newest snapshot on the status ring, which can trail the op that just completed by one duty cycle. Settled = three equal reads
+/// 10 ms apart (bounded: 2 s).
+struct RouteCounters {
+    uint64_t hits = 0, learned = 0, cleared = 0, redirects = 0;
+    bool operator==(const RouteCounters&) const = default;
+};
+inline RouteCounters routeCounters(const rc::Client& c) {
+    return {c.routeHintHits(), c.routeHintLearned(), c.routeHintCleared(), c.ctlRedirectsFollowed()};
+}
+inline RouteCounters settledRouteCounters(const rc::Client& c) {
+    RouteCounters prev = routeCounters(c);
+    int same = 0;
+    for (int i = 0; i < 200 && same < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const RouteCounters cur = routeCounters(c);
+        same = cur == prev ? same + 1 : 0;
+        prev = cur;
+    }
+    return prev;
+}
 
 inline LeaseClaim row(std::string_view key, uint64_t a = 0) {
     LeaseClaim r;

@@ -28,6 +28,8 @@
 // check (no record after unsubscribe) runs a fixed number of full client +
 // gateway cycles after the frame that would carry the record was sent.
 #include "../support/InvokerGateway.h"
+#include "../support/FreePort.h"
+#include "../support/OwnDriverGateway.h"
 #include "../support/TestCompletions.h"
 #include <rune/client/Client.h>
 #include <rune/client/TopicHandle.h>
@@ -40,6 +42,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -79,9 +82,11 @@ struct SubscriberHarness {
     std::string                  dir;
     ClientConfig                 cfg;
     Client                       client;
-    test_support::InvokerGateway gw;
+    std::unique_ptr<test_support::BrokerHost>     host;     // ownDriver: the broker's own driver + gateway
+    std::unique_ptr<test_support::InvokerGateway> plainGw;  // otherwise: the gateway on the client's driver
+    test_support::InvokerGateway&                 gw;
 
-    static ClientConfig makeCfg(const std::string& dir, int32_t in, int32_t eg) {
+    static ClientConfig makeCfg(const std::string& dir, int32_t in, int32_t eg, bool ownDriver) {
         ClientConfig c;
         c.gatewayChannel   = "aeron:ipc";
         c.gatewayStreamId  = in;
@@ -91,12 +96,24 @@ struct SubscriberHarness {
         c.connectTimeoutMs = 5000;
         c.pingTimeoutMs    = 5000;
         c.runnerMode       = RunnerMode::Invoker;
+        if (ownDriver) {   // the broker survives a transport rebuild: it runs on its own driver, reached over UDP
+            const auto port = rune::client::testing::allocFreeUdpPortRange(2);
+            c.gatewayChannel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port);
+            c.egressChannel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port + 1);
+            c.connectTimeoutMs = 150;   // the first resume is offered before the new UDP link is warm
+        }
         return c;
     }
 
-    SubscriberHarness(int32_t in, int32_t eg)
-        : dir(uniqueDir()), cfg(makeCfg(dir, in, eg)), client(cfg),
-          gw(dir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId, cfg.egressChannel, cfg.egressStreamId) {}
+    SubscriberHarness(int32_t in, int32_t eg, bool ownDriver = false)
+        : dir(uniqueDir()), cfg(makeCfg(dir, in, eg, ownDriver)), client(cfg),
+          host(ownDriver ? std::make_unique<test_support::BrokerHost>(test_support::BrokerHost::uniqueDir(), cfg.gatewayChannel,
+                                                                       cfg.gatewayStreamId, cfg.egressChannel, cfg.egressStreamId)
+                         : nullptr),
+          plainGw(ownDriver ? nullptr
+                            : std::make_unique<test_support::InvokerGateway>(dir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId,
+                                                                             cfg.egressChannel, cfg.egressStreamId)),
+          gw(host ? host->gw : *plainGw) {}
 
     ~SubscriberHarness() {
         client.close();
@@ -349,6 +366,40 @@ TEST(Subscriber, ReconnectResumeScaffold) {
 
     ASSERT_TRUE(h.drive([&] { return c.count() >= N; }));
     EXPECT_EQ(sub.position(), kBase + N) << "position() must be kBase + N";
+}
+
+// ===========================================================================
+// An Aeron client close while a plain subscription runs on the seed: the transport is rebuilt, the subscription ends
+// SessionLost (failover semantics: its broker-side state died with the session), and a re-subscribe from the last
+// offset + 1 delivers with no gap and no duplicate.
+// ===========================================================================
+TEST(Subscriber, SeedBoundSubscriptionEndsSessionLostAndResubscribeResumesRegression) {
+    SubscriberHarness h(3120, 3121, /*ownDriver=*/true);
+    h.connect();
+    constexpr int64_t kBase = 0;
+    constexpr int     N     = 5;
+    Collector c;
+    auto sub = h.client.subscribe(TopicHandle{12, 1}, 0, SubscribeOptions{From::earliest()}, c.handler());
+    h.gw.pushBatch(h.subscribed(0), kBase, buildBatch(kBase, 4'000'000LL, "k", "v", N));
+    ASSERT_TRUE(h.drive([&] { return c.count() >= N; }));
+    const int64_t lastOffset = c.got.back().offset;
+
+    h.client.testInjectTransportFault();
+    ASSERT_TRUE(h.drive([&] {
+        return h.client.testTransportRebuilds() == 1 && h.client.state() == rune::client::session::SessionState::Connected && !sub.active();
+    }));
+    EXPECT_EQ(sub.failReason(), SubscriptionFailReason::SessionLost);
+    EXPECT_EQ(c.count(), N);
+
+    Collector c2;
+    auto sub2 = h.client.subscribe(TopicHandle{12, 1}, 0, SubscribeOptions{From::offset(lastOffset + 1)}, c2.handler());
+    const auto& sd = h.subscribed(1);
+    EXPECT_EQ(sd.fromOffset, lastOffset + 1);
+    h.gw.pushBatch(sd, lastOffset + 1, buildBatch(lastOffset + 1, 5'000'000LL, "k", "w", N));
+    ASSERT_TRUE(h.drive([&] { return c2.count() >= N; }));
+    h.settle(200);
+    ASSERT_EQ(c2.count(), N);
+    for (int i = 0; i < N; ++i) EXPECT_EQ(c2.got[static_cast<std::size_t>(i)].offset, lastOffset + 1 + i) << "no gap, no duplicate";
 }
 
 // ===========================================================================

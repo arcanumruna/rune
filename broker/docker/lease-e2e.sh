@@ -205,12 +205,12 @@ leader_not() { local l; l=$(partition_leader "$1" 0) || return 1; [ "${l}" != "$
 
 KILLED_AT=0
 kill_node() { docker kill "$(cname $(( $1 + 1 )))" >/dev/null || fail "docker kill of rune-$(( $1 + 1 )) failed"; KILLED_AT="$(now_s)"; }
-SINCE=""
+SINCE=("" "" "" "")   # per container (1..3): its own start time, so a full restart (start 1, 2, 3, then await each) sees every node's early links
 links_since() {
     local n="$1" id c
     for id in 0 1 2; do
         [ "${id}" = "$(( n - 1 ))" ] && continue
-        c=$(docker logs --since "${SINCE}" "$(cname "${n}")" 2>&1 | grep -c "peer link with node ${id} established" || true)
+        c=$(docker logs --since "${SINCE[n]}" "$(cname "${n}")" 2>&1 | grep -c "peer link with node ${id} established" || true)
         [ "${c:-0}" -gt 0 ] || return 1
     done
 }
@@ -219,7 +219,7 @@ start_node() {
     local n=$(( $1 + 1 ))
     # a restart inside the driver dir lock's 1 s heartbeat window of the kill is refused (same pid 1): wait it out
     [ "$(( $(now_s) - KILLED_AT ))" -ge 3 ] || sleep 3
-    SINCE="$(date +%s)"   # epoch seconds: no timezone ambiguity
+    SINCE[n]="$(date +%s)"   # epoch seconds: no timezone ambiguity
     docker start "$(cname "${n}")" >/dev/null || fail "docker start of rune-${n} failed"
 }
 await_links() {

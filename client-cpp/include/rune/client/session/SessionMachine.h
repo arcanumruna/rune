@@ -1133,6 +1133,14 @@ public:
         resumeEntryNs_ = nowNs;
     }
 
+    /// The client's own transport was lost (the Aeron client closed and is being rebuilt): like an own stall, the
+    /// session's frames in flight are gone and the broker may still hold it.  Connected -> Resuming, counted as a stale
+    /// loss of the CLIENT's making (no evidence of a dead broker: no seed failover).  Any other state: its own timers
+    /// retry once ticks resume.
+    void onTransportLost(int64_t nowNs) noexcept {
+        if (state_ == SessionState::Connected) loseOwnSession_(nowNs);
+    }
+
     // ------------------------------------------------------------------------
     // Clock-driven — called every agent cycle.
     // ------------------------------------------------------------------------
@@ -1147,10 +1155,7 @@ public:
         const bool ownStall = lastTickNs_ != 0 && nowNs - lastTickNs_ >= cfg_.responseTimeoutNs;
         lastTickNs_ = nowNs;
         if (ownStall && state_ == SessionState::Connected) [[unlikely]] {
-            ++staleSessionLosses_;
-            ++ownStallLosses_;   // M1: the client stalled, not the broker
-            transitionTo(SessionState::Resuming);
-            resumeEntryNs_ = nowNs;
+            loseOwnSession_(nowNs);
             return;
         }
         switch (state_) {
@@ -1198,6 +1203,13 @@ public:
     }
 
 private:
+    void loseOwnSession_(int64_t nowNs) noexcept {
+        ++staleSessionLosses_;
+        ++ownStallLosses_;   // M1: the client stalled, not the broker
+        transitionTo(SessionState::Resuming);
+        resumeEntryNs_ = nowNs;
+    }
+
     // ------------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------------

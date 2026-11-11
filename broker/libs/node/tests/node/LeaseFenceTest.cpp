@@ -90,6 +90,7 @@ struct FRig {
     rune::codec::Descriptor       evolving = leaseDesc();
     TopicWriteSpec                spec;
     PartitionWriteState           st;
+    TxnOverlayPool                pool;
     VerdictSource                 vs{5, 0};
     std::unique_ptr<ViewInstance> index;
     ConstraintSet                 set;
@@ -127,6 +128,7 @@ struct FRig {
         (void)cr::buildVerdictMarker(c, cr::MarkerHeader{0, 0, 0, 0}, {});
         EXPECT_GE(mem.appendNoSync(c.data(), c.size(), 0), 0);
         st.constraintSets.onChange(0, set);
+        vs.bindTxn(&pool, {}, 0);   // replay folds against the pool's supersede keys; production always binds one
         vs.bindState(&st);
         vs.bindLeader(nullptr, 1, 0);
         judge();

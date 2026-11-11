@@ -142,7 +142,8 @@ AeronTransport::~AeronTransport() {
 void AeronTransport::start() {
     switch (state_) {
     case Lifecycle::Started:
-        return;  // already started (owner state)
+    case Lifecycle::Down:
+        return;  // already started (owner state); a Down transport is rebuilt, not restarted
     case Lifecycle::StartFailed:
         std::rethrow_exception(startError_);   // #510: the ORIGINAL error, every time
     case Lifecycle::Stopped:
@@ -217,8 +218,10 @@ void AeronTransport::startBody_() {
             ? std::optional<std::string>{seedResponseChannelForTest_}
             : responseControlChannelFor(cfg_.ingressChannel, cfg_.gatewayResponseControlPort);
     std::string correlatedChannel;   // the default publication's registered channel when response-correlated
+    int32_t     addedSlot = -1;      // the response subscription slot this call opened
     if (respChannel) {
         const int32_t slot = addSubSlot_(SubSlot::Kind::ResponsePair, *respChannel, cfg_.egressStreamId);
+        addedSlot          = slot;
         if (slot >= 0) {
             pumpUntil_([&] {
                 if (conductorFault_ != nullptr) return true;
@@ -261,7 +264,7 @@ void AeronTransport::startBody_() {
         // unwinding below it would outlive aeron_.reset() and abort the process.
         pubRes.reset();
         subRes.reset();
-        subSlots_.clear();
+        if (addedSlot >= 0) freeSubSlot_(subSlots_[static_cast<std::size_t>(addedSlot)]);   // only this call's slot: a rebuild keeps the others
         respSeedSlot_ = -1;
         aeron_.reset();
         stopEmbeddedDriver();
@@ -344,6 +347,64 @@ void AeronTransport::stop() noexcept {
 
     // Step 4: Stop the embedded driver (join thread → drain CnC → close driver).
     stopEmbeddedDriver();
+}
+
+// ---------------------------------------------------------------------------
+// rebuild (the Aeron client closed: a fresh driver + client under the same handles)
+// ---------------------------------------------------------------------------
+
+void AeronTransport::freeSubSlot_(SubSlot& s) noexcept {
+    s.assembler.reset();
+    s.res.reset();
+    s.mdcRefs = 0;
+    s.state   = SubSlot::State::Free;
+}
+
+bool AeronTransport::rebuild(int32_t seedResponsePort) noexcept {
+    // stop()'s order: every Aeron object goes before the client, the client before the driver.  Slot keys stay, so every
+    // PubHandle and sub slot index remains valid and re-resolves lazily on the new client.
+    assembler_.reset();
+    if (const auto* rp = std::get_if<SeedRePairing>(&seedPair_)) freeSubSlot_(subSlots_[static_cast<std::size_t>(rp->subSlot)]);
+    seedPair_ = SeedSteady{};
+    for (auto& d : drainingPubs_) d.reset();
+    drainingCount_ = 0;
+    if (respSeedSlot_ >= 0) freeSubSlot_(subSlots_[static_cast<std::size_t>(respSeedSlot_)]);   // startBody_ opens the new seed pair
+    respSeedSlot_ = -1;
+    retiredSubs_  = 0;
+    for (SubSlot& s : subSlots_) {
+        if (s.state == SubSlot::State::Retired) freeSubSlot_(s);
+        if (s.state == SubSlot::State::Free) continue;
+        s.assembler.reset();
+        s.res.reset();                              // a response pair's old subscription is pinned to a dead image
+        s.egress = SubSlot::Egress::AwaitImage;
+    }
+    for (PubSlot& ps : pubSlots_) {
+        ps.res.reset();
+        ps.addChannel.clear();                      // the response subscription has a new registration id
+        int32_t sub = -1;
+        if (const auto* c = std::get_if<PubSlot::Correlated>(&ps.mode)) sub = c->subSlot;
+        else if (const auto* a = std::get_if<PubSlot::AwaitResponseSub>(&ps.mode)) sub = a->subSlot;
+        if (sub >= 0) ps.mode = PubSlot::AwaitResponseSub{sub, 0};   // the deadline starts once the new client is up
+    }
+    ingressPub_.reset();
+    egressSub_.reset();
+    aeron_.reset();
+    stopEmbeddedDriver();
+    conductorFault_ = nullptr;
+    cfg_.gatewayResponseControlPort = seedResponsePort;   // the seed may have failed over to a gateway with another port
+    try {
+        startBody_();
+    } catch (const std::exception& e) {
+        if ((rebuildFailures_++ & 63u) == 0) std::fprintf(stderr, "rune-client: rebuilding the transport failed (%llu so far): %s\n", static_cast<unsigned long long>(rebuildFailures_), e.what());
+        state_ = Lifecycle::Down;
+        return false;
+    }
+    const int64_t awaitDeadlineNs = resolveNow_() + kResolveTimeoutNs;
+    for (PubSlot& ps : pubSlots_) {
+        if (auto* a = std::get_if<PubSlot::AwaitResponseSub>(&ps.mode); a != nullptr && a->deadlineNs == 0) a->deadlineNs = awaitDeadlineNs;
+    }
+    state_ = Lifecycle::Started;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,7 +1301,19 @@ void AeronTransport::releaseGso_() noexcept {
     rune_driver_epoll_poll_free(epollBindings_);   // after aeron_driver_context_close
     epollBindings_ = nullptr;
     if (gso_ == nullptr) return;
-    rune_gso_bindings_totals(gso_, &gsoTotals_);
+    rune_gso_totals_t t{};
+    rune_gso_bindings_totals(gso_, &t);
+    gsoTotals_.gso_sends += t.gso_sends;                         // a rebuild keeps the closed driver's sends
+    gsoTotals_.gso_datagrams += t.gso_datagrams;
+    gsoTotals_.gso_fallbacks += t.gso_fallbacks;
+    gsoTotals_.gro_buffers += t.gro_buffers;
+    gsoTotals_.gro_datagrams += t.gro_datagrams;
+    gsoTotals_.gro_ctrunc_drops += t.gro_ctrunc_drops;
+    gsoTotals_.gro_trunc_drops += t.gro_trunc_drops;
+    gsoTotals_.gro_disabled += t.gro_disabled;
+    gsoTotals_.transports += t.transports;
+    gsoTotals_.gro_transports += t.gro_transports;
+    gsoTotals_.gso_path_mtu_fallbacks += t.gso_path_mtu_fallbacks;
     rune_gso_bindings_delete(gso_);
     gso_ = nullptr;
 }

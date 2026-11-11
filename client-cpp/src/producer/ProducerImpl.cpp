@@ -3882,8 +3882,17 @@ int ProducerImpl::resendAllViaRoute(SendFn& sendFn)
     int resent = 0;
     for (auto& up : partitions_) {
         PartitionState& ps = *up;
+        bool refused = ps.routeResend;  // behind a queued / refused re-offer, in order
         ps.inflight.forEachLive([&](InFlightBatch& b) {
-            if (offerAttempt_(ps, b, lastNowNs_, sendFn, 2)) ++resent;
+            if (!refused && offerAttempt_(ps, b, lastNowNs_, sendFn, 2)) {
+                ++resent;
+                return;
+            }
+            // Refused (or behind a refused one): the per-pass route re-offer drives it, oldest first.
+            refused = true;
+            b.routeResendPending = true;
+            ps.routeResend = true;
+            markDirty_(ps);
         });
     }
     return resent;
