@@ -424,6 +424,9 @@ struct WatchCtx {
         case rc::LeaseEventKind::Vanished: return "Vanished";
         case rc::LeaseEventKind::Ready: return "Ready";
         case rc::LeaseEventKind::Failed: return "Failed";
+        case rc::LeaseEventKind::Confirmed: return "Confirmed";
+        case rc::LeaseEventKind::RerunBegin: return "RerunBegin";
+        case rc::LeaseEventKind::RerunEnd: return "RerunEnd";
         }
         return "?";
     }

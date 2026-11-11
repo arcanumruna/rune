@@ -3,6 +3,8 @@
 // loop is capped and nothing sleeps.
 #include "LeaseWatchRig.h"
 
+#include <map>
+
 namespace {
 
 using Life = rc::LeaseWatchBase::Life;
@@ -444,6 +446,492 @@ TEST(LeaseWatchRestartRegression, RestartKeepsNamesRegression) {
     EXPECT_GE(bound.events - before, 3) << "Vanished q/a, Granted q/c, Ready reach the bound recipe";
     EXPECT_EQ(w.registerName(key("q")), -1) << "names stay frozen after the first start";
     EXPECT_EQ(rec.bad, 0);
+}
+
+
+// ---- re-run events: Confirmed / RerunBegin / RerunEnd ----
+
+/// One event of the sequence a case expects: (kind, partition, key, version); Begin / End carry no key, Ready / Failed partition -1.
+struct Seq {
+    Kind    kind;
+    int32_t part;
+    Bytes   key;
+    int64_t ver;
+    bool operator==(const Seq&) const = default;
+};
+std::string describeSeq(const std::vector<Seq>& v) {
+    static const char* names[] = {"Granted", "Updated", "Revoked", "Expired", "Vanished", "Ready", "Failed", "Confirmed", "RerunBegin", "RerunEnd"};
+    std::string s;
+    for (const Seq& e : v) {
+        s += names[static_cast<int>(e.kind)];
+        if (!e.key.empty()) s += "(" + std::to_string(e.key[1]) + "@" + std::to_string(e.ver) + ")";
+        else if (e.part >= 0 && (e.kind == Kind::RerunBegin || e.kind == Kind::RerunEnd)) s += "(p" + std::to_string(e.part) + ")";
+        s += " ";
+    }
+    return s;
+}
+std::vector<Seq> seqFrom(const Recorder& rec, std::size_t mark) {
+    std::vector<Seq> v;
+    for (std::size_t i = mark; i < rec.evs.size(); ++i) {
+        const Recorder::Ev& e = rec.evs[i];
+        v.push_back({e.kind, e.part, e.key, e.ver});
+    }
+    return v;
+}
+const Bytes kNoKey;
+
+/// The fold of one partition's re-run, written down independently of the watch: what the scan rows (in scan-hash order) and the unconfirmed
+/// leftovers do to the live set.
+struct Sim {
+    std::map<Bytes, int64_t> live;
+    std::set<Bytes>          conf;
+    std::vector<Seq>         out;
+    void begin(bool emit) {
+        conf.clear();
+        if (emit) out.push_back({Kind::RerunBegin, 0, kNoKey, 0});
+    }
+    void row(const Bytes& k, int64_t v) {
+        const auto it = live.find(k);
+        if (it != live.end() && it->second == v) {
+            if (conf.insert(k).second) out.push_back({Kind::Confirmed, 0, k, v});
+            return;
+        }
+        if (it != live.end()) out.push_back({Kind::Vanished, 0, k, it->second});
+        live[k] = v;
+        conf.insert(k);
+        out.push_back({Kind::Granted, 0, k, v});
+    }
+    void done() {
+        for (auto it = live.begin(); it != live.end();) {
+            if (conf.count(it->first) != 0) { ++it; continue; }
+            out.push_back({Kind::Vanished, 0, it->first, it->second});
+            it = live.erase(it);
+        }
+        out.push_back({Kind::RerunEnd, 0, kNoKey, 0});
+    }
+};
+std::vector<std::pair<Bytes, int64_t>> rowsByHash(const LeaseModel& m) {
+    std::vector<std::pair<Bytes, int64_t>> rows;
+    for (const auto& [k, h] : m.table) rows.emplace_back(k, h.version);
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+        return rune::protocol::scanHash(a.first, 1) < rune::protocol::scanHash(b.first, 1);
+    });
+    return rows;
+}
+
+void breakPartition(WRig& r, int32_t p) {
+    const auto sub = *r.gw.latestSubscription(1, p);
+    r.gw.sendError(p, static_cast<int16_t>(rpc::ErrorCode::NotAuthorized), "denied", sub.sessionId, sub.corrId);
+}
+
+TEST(LeaseWatchRerunRegression, UpdateWhileBrokenIsConfirmedRegression) {
+    WRig r(invokerCfg(7001, 7002, 1), 1);
+    const Bytes A = kb(1);
+    const int64_t va = r.stub->parts[0].grant(A);
+    rc::LeaseWatchBase w(*r.client, r.topic->core());
+    Recorder rec;
+    w.setHandler(&Recorder::fn, &rec);
+    ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive(w, [&] { return w.isReady(); }));
+    r.rounds(w, 10);
+    const std::size_t mark = rec.evs.size();
+    breakPartition(r, 0);
+    r.stub->parts[0].update(A);   // while broken: new row bytes, same version, no record the resubscribed stream replays
+    r.rounds(w, 40);
+    g_now += 2 * kMs;
+    ASSERT_TRUE(r.drive(w, [&] { return rec.count(Kind::RerunEnd) == 1; }));
+    r.rounds(w, 30);
+    EXPECT_EQ(describeSeq(seqFrom(rec, mark)), describeSeq({{Kind::RerunBegin, 0, kNoKey, 0}, {Kind::Confirmed, 0, A, va}, {Kind::RerunEnd, 0, kNoKey, 0}}));
+    ASSERT_EQ(rec.evs.size() - mark, 3u);
+    const Recorder::Ev& c = rec.evs[mark + 1];
+    EXPECT_EQ(c.kind, Kind::Confirmed);
+    EXPECT_TRUE(c.fromScan);
+    EXPECT_EQ(c.bytes, LeaseModel::row(A, r.stub->parts[0].table.at(A))) << "the scanned view row, with the update";
+    EXPECT_EQ(c.off, va) << "the row's lease_granted_offset";
+    EXPECT_EQ(rec.count(Kind::Granted), 1);
+    EXPECT_EQ(rec.count(Kind::Updated), 0);
+    EXPECT_EQ(rec.bad, 0);
+}
+
+TEST(LeaseWatchRerunRegression, FirstScanHasNoRerunEventsRegression) {
+    LifeRig f(7003);
+    f.startReady();
+    f.r.rounds(f.w, 20);
+    EXPECT_EQ(f.rec.count(Kind::Confirmed), 0);
+    EXPECT_EQ(f.rec.count(Kind::RerunBegin), 0);
+    EXPECT_EQ(f.rec.count(Kind::RerunEnd), 0);
+    EXPECT_EQ(f.rec.bad, 0);
+}
+
+// Each timing x each change made while the partition was not watched: the exact event sequence of the partition's re-run.
+TEST(LeaseWatchRerunRegression, RerunFoldMatrixRegression) {
+    enum class Cause { Break, BreakAgain, Restart, Fail, Close };
+    enum class Chg { None, Update, End, Regrant, Grant };
+    const Cause causes[] = {Cause::Break, Cause::BreakAgain, Cause::Restart, Cause::Fail, Cause::Close};
+    const Chg   chgs[]   = {Chg::None, Chg::Update, Chg::End, Chg::Regrant, Chg::Grant};
+    const Bytes A = kb(1), B = kb(5), C = kb(9), G = kb(13);
+    int n = 0;
+    for (const Cause cause : causes)
+        for (const Chg chg : chgs) {
+            SCOPED_TRACE("cause " + std::to_string(static_cast<int>(cause)) + " change " + std::to_string(static_cast<int>(chg)));
+            ++n;
+            WRig r(invokerCfg(7100 + 2 * n, 7101 + 2 * n, 1), 1);
+            LeaseModel& m = r.stub->parts[0];
+            m.grant(A);
+            m.grant(B);
+            m.grant(C);
+            rc::LeaseWatchOptions o;
+            o.maxRows = 1;   // a page a lease
+            rc::LeaseWatchBase w(*r.client, r.topic->core(), o);
+            Recorder rec;
+            w.setHandler(&Recorder::fn, &rec);
+            ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+            ASSERT_TRUE(r.drive(w, [&] { return w.isReady(); }));
+            r.rounds(w, 10);
+            Sim sim;
+            for (const auto& [k, h] : m.table) sim.live[k] = h.version;
+            const std::size_t baseline = r.stub->seen.size();
+            const std::size_t mark     = rec.evs.size();
+            const auto change = [&] {
+                switch (chg) {
+                case Chg::None: break;
+                case Chg::Update: m.update(A); break;
+                case Chg::End: m.revoke(A); break;
+                case Chg::Regrant: m.revoke(A); m.grant(A); break;
+                case Chg::Grant: m.grant(G); break;
+                }
+            };
+            const auto fold = [&](bool again) {
+                sim.begin(true);
+                const auto rows = rowsByHash(m);
+                if (again) { sim.row(rows[0].first, rows[0].second); sim.begin(false); }
+                for (const auto& [k, v] : rows) sim.row(k, v);
+                sim.done();
+            };
+            const Bytes none;
+            const std::span<const uint8_t> sp[] = {std::span<const uint8_t>(none)};
+            switch (cause) {
+            case Cause::Restart:
+                closeToClosed(r, w);
+                change();
+                ASSERT_EQ(w.restart(sp), rc::OpResult::Accepted);
+                ASSERT_TRUE(r.drive(w, [&] { return rec.readies == 2; }));
+                fold(false);
+                sim.out.push_back({Kind::Ready, -1, kNoKey, 0});
+                break;
+            case Cause::Break:
+                breakPartition(r, 0);
+                change();
+                r.rounds(w, 40);
+                g_now += 2 * kMs;
+                ASSERT_TRUE(r.drive(w, [&] { return rec.count(Kind::RerunEnd) == 1; }));
+                fold(false);
+                break;
+            case Cause::BreakAgain: {
+                breakPartition(r, 0);
+                change();
+                r.rounds(w, 40);
+                const int64_t firstSub = r.gw.latestSubscription(1, 0)->subscriptionId;
+                r.stub->onRequest = [&](const LeaseStub::ScanSeen&) {
+                    if (r.stub->seen.size() == baseline + 2) r.stub->hold = true;   // the re-run's second page is computed, delivered late
+                };
+                g_now += 2 * kMs;
+                ASSERT_TRUE(r.drive(w, [&] { return r.stub->heldCount() == 1; }));
+                r.rounds(w, 5);
+                ASSERT_NE(r.gw.latestSubscription(1, 0)->subscriptionId, firstSub) << "the re-run's own subscription";
+                breakPartition(r, 0);   // the re-run is broken again, one page in
+                r.rounds(w, 10);
+                r.stub->release();   // the held page is stale now
+                g_now += 5 * kMs;
+                ASSERT_TRUE(r.drive(w, [&] { return rec.count(Kind::RerunEnd) == 1; }));
+                fold(true);
+                break;
+            }
+            case Cause::Fail:
+                breakPartition(r, 0);
+                change();
+                r.rounds(w, 40);
+                r.stub->errorCode = static_cast<int16_t>(rpc::ErrorCode::NotAuthorized);
+                r.stub->errorNext = 1'000'000;
+                g_now += 2 * kMs;
+                ASSERT_TRUE(r.drive(w, [&] { return w.failed(); }));
+                sim.begin(true);
+                sim.out.push_back({Kind::Failed, -1, kNoKey, 0});
+                break;
+            case Cause::Close:
+                breakPartition(r, 0);
+                change();
+                r.rounds(w, 40);
+                r.stub->hold = true;
+                g_now += 2 * kMs;
+                ASSERT_TRUE(r.drive(w, [&] { return !rec.open.empty(); }));
+                w.closeAsync();
+                for (int i = 0; i < kCap && !w.isClosed(); ++i) r.round(w);
+                ASSERT_TRUE(w.isClosed());
+                sim.begin(true);
+                break;
+            }
+            r.rounds(w, 30);
+            EXPECT_EQ(describeSeq(seqFrom(rec, mark)), describeSeq(sim.out));
+            EXPECT_EQ(rec.bad, 0);
+            for (std::size_t i = mark; i < rec.evs.size(); ++i) {
+                const Recorder::Ev& e = rec.evs[i];
+                if (e.kind != Kind::Confirmed) continue;
+                EXPECT_TRUE(e.fromScan);
+                EXPECT_EQ(e.bytes, LeaseModel::row(e.key, m.table.at(e.key)));
+                EXPECT_EQ(e.off, m.table.at(e.key).granted);
+            }
+            if (cause == Cause::Fail || cause == Cause::Close) {
+                EXPECT_FALSE(rec.open.empty()) << "no RerunEnd";
+                EXPECT_EQ(rec.count(Kind::RerunEnd), 0);
+            } else {
+                EXPECT_TRUE(rec.open.empty());
+                Held want;
+                for (const auto& [k, h] : m.table) want.insert({k, h.version});
+                EXPECT_EQ(rec.held, want);
+            }
+        }
+}
+
+TEST(LeaseWatchRerunRegression, RerunBreaksAgainOnePairRegression) {
+    WRig r(invokerCfg(7005, 7006, 1), 1);
+    for (int i : {1, 5, 9}) r.stub->parts[0].grant(kb(i));
+    rc::LeaseWatchOptions o;
+    o.maxRows = 1;
+    rc::LeaseWatchBase w(*r.client, r.topic->core(), o);
+    Recorder rec;
+    w.setHandler(&Recorder::fn, &rec);
+    ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive(w, [&] { return w.isReady(); }));
+    r.rounds(w, 10);
+    const std::size_t baseline = r.stub->seen.size();
+    breakPartition(r, 0);
+    r.rounds(w, 40);
+    r.stub->onRequest = [&](const LeaseStub::ScanSeen&) {
+        if (r.stub->seen.size() == baseline + 2) r.stub->hold = true;
+    };
+    g_now += 2 * kMs;
+    ASSERT_TRUE(r.drive(w, [&] { return r.stub->heldCount() == 1; }));
+    r.rounds(w, 5);
+    EXPECT_EQ(r.stub->seen.size(), baseline + 2) << "the re-run issued exactly one page and asked for the next";
+    breakPartition(r, 0);
+    r.rounds(w, 10);
+    r.stub->release();
+    g_now += 5 * kMs;
+    ASSERT_TRUE(r.drive(w, [&] { return rec.count(Kind::RerunEnd) == 1; }));
+    r.rounds(w, 30);
+    EXPECT_EQ(w.reruns(), 2u);
+    EXPECT_EQ(rec.count(Kind::RerunBegin), 1);
+    EXPECT_EQ(rec.count(Kind::RerunEnd), 1);
+    EXPECT_TRUE(rec.open.empty());
+    EXPECT_EQ(rec.bad, 0);
+}
+
+TEST(LeaseWatchRerunRegression, RerunEndAfterOverflowRegression) {
+    WRig r(invokerCfg(7007, 7008, 1), 1);
+    const Bytes B = kb(5);
+    for (int i : {1, 5, 9}) r.stub->parts[0].grant(kb(i));
+    rc::LeaseWatchOptions o;
+    o.handoffBuffer = 4;
+    o.maxRows       = 1;
+    rc::LeaseWatchBase w(*r.client, r.topic->core(), o);
+    struct Probe {
+        Recorder rec;
+        rc::LeaseWatchBase* w = nullptr;
+        uint64_t resubsAtEnd = 99;
+        static void fn(void* c, const rc::LeaseEvent& e) {
+            auto* p = static_cast<Probe*>(c);
+            if (e.kind == Kind::RerunEnd) p->resubsAtEnd = p->w->resubscribes();
+            p->rec.on(e);
+        }
+    } probe;
+    probe.w = &w;
+    Recorder& rec = probe.rec;
+    w.setHandler(&Probe::fn, &probe);
+    ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive(w, [&] { return w.isReady(); }));
+    r.rounds(w, 10);
+    const std::size_t baseline = r.stub->seen.size();
+    breakPartition(r, 0);
+    r.rounds(w, 40);
+    r.stub->onRequest = [&](const LeaseStub::ScanSeen&) {
+        if (r.stub->seen.size() == baseline + 2) r.stub->hold = true;
+    };
+    g_now += 2 * kMs;
+    ASSERT_TRUE(r.drive(w, [&] { return r.stub->heldCount() == 1; }));
+    r.rounds(w, 5);
+    for (int i = 0; i < 10; ++i) r.stub->parts[0].update(B);   // more than the handoff list holds, while the re-run's page 2 is outstanding
+    r.rounds(w, 30);
+    EXPECT_EQ(rec.count(Kind::RerunBegin), 1);
+    EXPECT_EQ(rec.count(Kind::RerunEnd), 0) << "the scan is not done";
+    r.stub->release();
+    ASSERT_TRUE(r.drive(w, [&] { return rec.count(Kind::RerunEnd) == 1; }));
+    r.rounds(w, 30);
+    EXPECT_EQ(probe.resubsAtEnd, 1u) << "RerunEnd came when the resubscribed partition was Live, not when the scan finished";
+    EXPECT_EQ(w.resubscribes(), 1u);
+    EXPECT_EQ(rec.count(Kind::RerunBegin), 1);
+    EXPECT_EQ(rec.count(Kind::RerunEnd), 1);
+    std::size_t firstUpdated = rec.evs.size(), end = rec.evs.size();
+    for (std::size_t i = 0; i < rec.evs.size(); ++i) {
+        if (rec.evs[i].kind == Kind::Updated && firstUpdated == rec.evs.size()) firstUpdated = i;
+        if (rec.evs[i].kind == Kind::RerunEnd) end = i;
+    }
+    EXPECT_LT(firstUpdated, end) << "the buffered records are applied before RerunEnd";
+    EXPECT_TRUE(rec.open.empty());
+    EXPECT_EQ(rec.bad, 0);
+}
+
+TEST(LeaseWatchRerunRegression, FailDuringRerunNoEndRegression) {
+    WRig r(invokerCfg(7009, 7010, 1), 1);
+    r.stub->parts[0].grant(kb(1));
+    rc::LeaseWatchBase w(*r.client, r.topic->core());
+    Recorder rec;
+    w.setHandler(&Recorder::fn, &rec);
+    ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive(w, [&] { return w.isReady(); }));
+    r.rounds(w, 10);
+    breakPartition(r, 0);
+    r.rounds(w, 40);
+    r.stub->errorCode = static_cast<int16_t>(rpc::ErrorCode::NotAuthorized);
+    r.stub->errorNext = 1'000'000;
+    g_now += 2 * kMs;
+    ASSERT_TRUE(r.drive(w, [&] { return w.failed(); }));
+    for (int i = 0; i < 20; ++i) { g_now += 2 * kMs; r.round(w); }
+    EXPECT_EQ(rec.count(Kind::RerunBegin), 1);
+    EXPECT_EQ(rec.count(Kind::RerunEnd), 0);
+    EXPECT_EQ(rec.failures, 1);
+    EXPECT_EQ(rec.evs.back().kind, Kind::Failed);
+}
+
+TEST(LeaseWatchRerunRegression, RestartBracketsEveryPartitionRegression) {
+    LifeRig f(7011);
+    f.startReady();
+    closeToClosed(f.r, f.w);
+    const std::size_t mark = f.rec.evs.size();
+    const Bytes none;
+    const std::span<const uint8_t> sp[] = {std::span<const uint8_t>(none)};
+    ASSERT_EQ(f.w.restart(sp), rc::OpResult::Accepted);
+    ASSERT_TRUE(f.r.drive(f.w, [&] { return f.rec.readies == 2; }));
+    f.r.rounds(f.w, 20);
+    std::size_t ready = 0;
+    int begin[2] = {0, 0}, end[2] = {0, 0};
+    for (std::size_t i = mark; i < f.rec.evs.size(); ++i) {
+        const Recorder::Ev& e = f.rec.evs[i];
+        if (e.kind == Kind::Ready) ready = i;
+        if (e.kind == Kind::RerunBegin) { ASSERT_TRUE(e.part == 0 || e.part == 1); ++begin[e.part]; EXPECT_EQ(ready, 0u) << "before the second Ready"; }
+        if (e.kind == Kind::RerunEnd) { ASSERT_TRUE(e.part == 0 || e.part == 1); ++end[e.part]; EXPECT_EQ(ready, 0u) << "before the second Ready"; }
+    }
+    EXPECT_NE(ready, 0u);
+    for (int p = 0; p < 2; ++p) {
+        EXPECT_EQ(begin[p], 1) << "partition " << p;
+        EXPECT_EQ(end[p], 1) << "partition " << p;
+    }
+    EXPECT_TRUE(f.rec.open.empty());
+    EXPECT_EQ(f.rec.bad, 0);
+}
+
+// A page answered with a transient error is asked again; the re-run confirms each lease once.
+TEST(LeaseWatchRerunRegression, RetriedPageConfirmsOnceRegression) {
+    WRig r(invokerCfg(7013, 7014, 1), 1);
+    for (int i : {1, 5, 9}) r.stub->parts[0].grant(kb(i));
+    rc::LeaseWatchOptions o;
+    o.maxRows = 1;
+    rc::LeaseWatchBase w(*r.client, r.topic->core(), o);
+    Recorder rec;
+    w.setHandler(&Recorder::fn, &rec);
+    ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive(w, [&] { return w.isReady(); }));
+    r.rounds(w, 10);
+    const std::size_t baseline = r.stub->seen.size();
+    breakPartition(r, 0);
+    r.rounds(w, 40);
+    r.stub->onRequest = [&](const LeaseStub::ScanSeen&) {
+        if (r.stub->seen.size() == baseline + 2) {   // the re-run's second page: answered Throttled once, then asked again
+            r.stub->errorCode = static_cast<int16_t>(rpc::ErrorCode::Throttled);
+            r.stub->errorNext = 1;
+        }
+    };
+    g_now += 2 * kMs;
+    for (int i = 0; i < 300 && rec.count(Kind::RerunEnd) == 0; ++i) { g_now += 2 * kMs; r.round(w); }
+    ASSERT_EQ(rec.count(Kind::RerunEnd), 1);
+    r.rounds(w, 20);
+    EXPECT_EQ(r.stub->seen.size(), baseline + 4) << "page 2 was asked twice";
+    for (int i : {1, 5, 9}) {
+        const Bytes k = kb(i);
+        EXPECT_EQ(rec.count(Kind::Confirmed, &k), 1) << "lease " << i;
+    }
+    EXPECT_EQ(rec.count(Kind::Confirmed), 3);
+    EXPECT_EQ(rec.count(Kind::RerunBegin), 1);
+    EXPECT_EQ(w.reruns(), 1u);
+    EXPECT_EQ(rec.bad, 0);
+}
+
+// A reborn partition (data reset) is a re-run: Begin, the old lineage's Vanished, the new lineage's Granted, End.
+TEST(LeaseWatchRerunRegression, DataResetRerunIsBracketedRegression) {
+    WRig r(invokerCfg(7015, 7016, 2), 2);
+    const Bytes A = kb(0), B = kb(4), C = kb(8), D = kb(12);   // all in partition 0 of the stub
+    r.stub->parts[0].grant(A);
+    r.stub->parts[0].grant(B);
+    rc::LeaseWatchBase w(*r.client, r.topic->core());
+    Recorder rec;
+    w.setHandler(&Recorder::fn, &rec);
+    ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive(w, [&] { return w.isReady() && r.stub->caughtUp(0); }));
+    r.rounds(w, 10);
+    const auto first = *r.gw.latestSubscription(1, 0);
+    r.gw.sendLineageNote(first, 1);
+    r.stub->parts[0].grant(D);
+    ASSERT_TRUE(r.drive(w, [&] { return rec.count(Kind::Granted, &D) == 1; }));
+    r.rounds(w, 10);
+    const std::size_t mark = rec.evs.size();
+    r.gw.partitionLineage[0] = 2;
+    { const std::size_t keyWidth = r.stub->parts[0].keyWidth; r.stub->parts[0] = LeaseModel{}; r.stub->parts[0].keyWidth = keyWidth; }
+    const int64_t vc = r.stub->parts[0].grant(C);
+    r.gw.sendError(0, static_cast<int16_t>(rpc::ErrorCode::NotLeader), "", first.sessionId, first.corrId);
+    ASSERT_TRUE(r.drive(w, [&] { g_now += kMs / 10; return r.gw.dataResetAnswers == 1 && w.dataResetRerunsForTest() >= 1; }));
+    g_now += 2 * kMs;
+    ASSERT_TRUE(r.drive(w, [&] { return rec.count(Kind::RerunEnd) == 1; }));
+    r.rounds(w, 30);
+    const std::vector<Seq> got = seqFrom(rec, mark);
+    ASSERT_GE(got.size(), 6u);
+    EXPECT_EQ(got.front().kind, Kind::RerunBegin);
+    EXPECT_EQ(got.back().kind, Kind::RerunEnd);
+    EXPECT_EQ(rec.count(Kind::RerunBegin), 1);
+    EXPECT_EQ(rec.count(Kind::Vanished), 3);
+    EXPECT_EQ(rec.count(Kind::Confirmed), 0) << "nothing of the old lineage survives";
+    EXPECT_EQ(describeSeq({got[got.size() - 2]}), describeSeq({{Kind::Vanished, 0, got[got.size() - 2].key, got[got.size() - 2].ver}}) ) << "Vanished closes the run, before RerunEnd";
+    EXPECT_EQ(rec.count(Kind::Granted, &C), 1);
+    (void)vc;
+    EXPECT_TRUE(rec.open.empty());
+    EXPECT_EQ(rec.bad, 0);
+}
+
+// The LeaseSession observes the watch: the three new kinds change nothing for the lease it holds.
+TEST(LeaseWatchRerunRegression, SessionObserverIgnoresRerunEventsRegression) {
+    WRig r(invokerCfg(7017, 7018, 1), 1);
+    r.makeSession();
+    Bytes key1(8, 0);
+    key1[0] = 1;
+    rc::OpResult err = rc::OpResult::Accepted;
+    (void)r.session->add(*r.topic, Row{1}, 5, 3000, g_now, &err);
+    ASSERT_EQ(err, rc::OpResult::Accepted);
+    r.stub->parts[0].setRow(key1, 5, 0);
+    rc::LeaseWatchBase w(*r.client, r.topic->core());
+    Recorder rec;
+    w.setHandler(&Recorder::fn, &rec);
+    ASSERT_TRUE(r.session->observe(w));
+    ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive(w, [&] { return w.isReady(); }));
+    r.rounds(w, 10);
+    breakPartition(r, 0);
+    r.rounds(w, 40);
+    g_now += 2 * kMs;
+    ASSERT_TRUE(r.drive(w, [&] { return rec.count(Kind::RerunEnd) == 1; }));
+    r.rounds(w, 30);
+    EXPECT_EQ(rec.count(Kind::Confirmed, &key1), 1);
+    EXPECT_TRUE(r.cb.lost.empty());
+    EXPECT_EQ(r.session->liveCount(), 1u);
+    EXPECT_TRUE(r.session->unobserve(w));
 }
 
 }  // namespace

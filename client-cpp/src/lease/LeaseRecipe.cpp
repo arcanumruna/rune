@@ -485,6 +485,8 @@ void LeaseRecipeCore::becomeOwner_(int64_t version, LeaseRef ref) {
 void LeaseRecipeCore::onWatchEvent(void* ctx, const LeaseEvent& ev) {
     auto* rc = static_cast<LeaseRecipeCore*>(ctx);
     if (ev.kind == LeaseEventKind::Failed) { rc->endForWatch_(); return; }
+    // A recipe decides on the set of live leases and their ends: a scan's confirmation and a re-run's bracket change neither.
+    if (ev.kind == LeaseEventKind::Confirmed || ev.kind == LeaseEventKind::RerunBegin || ev.kind == LeaseEventKind::RerunEnd) return;
     if (ev.kind == LeaseEventKind::Ready) {
         rc->observeCheck_(&ev);
         rc->settle_();

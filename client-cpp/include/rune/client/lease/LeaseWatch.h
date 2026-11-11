@@ -50,7 +50,12 @@
 
 namespace rune::client {
 
-enum class LeaseEventKind : uint8_t { Granted, Updated, Revoked, Expired, Vanished, Ready, Failed };
+/// Confirmed: a re-run's scan row names a held lease at the same version that the re-run had not confirmed yet (fromScan, bytes = the scanned
+/// view row, offset = its lease_granted_offset): the way to learn of an update made while the partition was not watched.  RerunBegin / RerunEnd
+/// bracket a partition's re-run (key empty, version 0, no bytes, offset -1; partition = the partition); RerunEnd comes after the re-run's
+/// Vanished events and its buffered records, when the partition is Live again.  A first scan has neither; Failed and closeAsync end a re-run
+/// with no RerunEnd.  The watch's names get Confirmed (by key) but never RerunBegin / RerunEnd.
+enum class LeaseEventKind : uint8_t { Granted, Updated, Revoked, Expired, Vanished, Ready, Failed, Confirmed, RerunBegin, RerunEnd };
 
 struct LeaseEvent {
     LeaseEventKind kind      = LeaseEventKind::Ready;
@@ -181,6 +186,7 @@ private:
         uint32_t                    nextGen = 1;
         uint32_t                    scanSeq = 0;
         bool                        everLive = false;
+        bool                        rerunOpen = false;   ///< a RerunBegin was emitted and its RerunEnd has not been (one open bracket a partition)
         uint32_t                    seenResets = 0;   ///< pt.sub->dataResets() when this subscription was opened; a bigger value = the partition was reborn
         int64_t                     backoffNs = 0;   ///< the next Broken delay (0 = the 1 ms floor); doubles to 1 s, reset when the partition is Live
         // page bounds of this epoch: prefix j's pages are pages[pageBegin[j] .. pageBegin[j] + pageCount[j])
@@ -232,6 +238,8 @@ private:
     void scanDone_(int32_t p);
     void toBroken_(int32_t p, int64_t nowNs);
     void startRerun_(int32_t p);
+    void openRerun_(int32_t p);    ///< emits RerunBegin unless the partition's bracket is open
+    void closeRerun_(int32_t p);   ///< emits RerunEnd when the partition's bracket is open
     void checkReady_();
     ScanProg* progOf_(Part& pt) noexcept;
     // ---- records ----

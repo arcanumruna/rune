@@ -244,7 +244,7 @@ void LeaseWatchBase::emit_(LeaseEventKind kind, int32_t partition, int64_t offse
         if (o.fn != nullptr) o.fn(o.ctx, ev);
     // The recipes bound to names: Ready / Failed go to every bound name once; a key event to the name the key belongs to (the name's heap and
     // the live set already reflect the event).
-    if (nNames_ == 0) return;
+    if (nNames_ == 0 || kind == LeaseEventKind::RerunBegin || kind == LeaseEventKind::RerunEnd) return;   // a re-run bracket names no key
     if (kind == LeaseEventKind::Ready || kind == LeaseEventKind::Failed) {
         for (uint32_t i = 0; i < nNames_; ++i)
             if (names_[i].bound.fn != nullptr) { const Cb c = names_[i].bound; c.fn(c.ctx, ev); }
@@ -295,9 +295,11 @@ OpResult LeaseWatchBase::restart(std::span<const std::span<const uint8_t>> prefi
         pt.pageBegin.fill(0);
         pt.pageCount.fill(0);
         pt.hn = pt.hbytes = 0;
+        pt.rerunOpen = false;
         pt.st = Scanning{};
     }
     life_ = Life::Running;
+    for (int32_t p = 0; p < nParts_ && life_ == Life::Running; ++p) openRerun_(p);   // every partition re-runs: one bracket each
     return OpResult::Accepted;
 }
 
@@ -494,6 +496,7 @@ void LeaseWatchBase::stepPart_(int32_t p, int64_t nowNs) {
             pt.backoffNs = 0;
             openSubscription_(p, cursor);
             pt.everLive = true;
+            if (life_ == Life::Running) closeRerun_(p);   // the end of a re-run that overflowed: the resubscribed partition is Live
         }
     } else if (auto* br = std::get_if<Broken>(&pt.st)) {
         if (nowNs >= br->retryAtNs && (!pt.sub || pt.sub->finished())) {
@@ -600,7 +603,22 @@ void LeaseWatchBase::scanDone_(int32_t p) {
         pt.st        = Live{};
         pt.everLive  = true;
         pt.backoffNs = 0;
+        closeRerun_(p);
     }
+}
+
+void LeaseWatchBase::openRerun_(int32_t p) {
+    Part& pt = parts_[static_cast<std::size_t>(p)];
+    if (pt.rerunOpen) return;   // a partition that breaks again during its re-run keeps the one bracket
+    pt.rerunOpen = true;
+    emit_(LeaseEventKind::RerunBegin, p, -1, {}, 0, {}, false);
+}
+
+void LeaseWatchBase::closeRerun_(int32_t p) {
+    Part& pt = parts_[static_cast<std::size_t>(p)];
+    if (!pt.rerunOpen) return;
+    pt.rerunOpen = false;
+    emit_(LeaseEventKind::RerunEnd, p, -1, {}, 0, {}, false);
 }
 
 void LeaseWatchBase::toBroken_(int32_t p, int64_t nowNs) {
@@ -623,6 +641,7 @@ void LeaseWatchBase::startRerun_(int32_t p) {
     pt.pageCount.fill(0);
     pt.hn = pt.hbytes = 0;
     pt.st = Scanning{};
+    openRerun_(p);   // after the state is set: a handler that closes the watch finds a consistent partition
 }
 
 void LeaseWatchBase::checkReady_() {
@@ -785,7 +804,17 @@ void LeaseWatchBase::grant_(int32_t p, int64_t offset, std::span<const uint8_t> 
     const uint64_t h = keyHash(key);
     if (const uint32_t old = findLive_(key, h); old != kNone) {
         LiveEntry& e = live_[old];
-        if (e.version == version) { e.confirmed = true; return; }   // the same lease: already held
+        if (e.version == version) {   // the same lease: already held
+            // A re-run's scan row confirms an entry the re-run had not confirmed yet (once: a retried page finds it confirmed).  Only while the
+            // partition's bracket is open: a first scan never emits Confirmed.
+            if (fromScan && !e.confirmed && parts_[static_cast<std::size_t>(p)].rerunOpen) {
+                e.confirmed = true;
+                emit_(LeaseEventKind::Confirmed, p, offset, key, version, bytes, true);
+            } else {
+                e.confirmed = true;
+            }
+            return;
+        }
         uint8_t kb[kMaxKey];   // the old incarnation leaves the live set and its name heap BEFORE the event (a bound recipe reads both)
         const std::size_t kl = e.keyLen;
         const int64_t ver = e.version;

@@ -126,17 +126,18 @@ struct OnRiskF {
 
 using Held = std::set<std::pair<Bytes, int64_t>>;
 
-/// Records the watch's events and folds them: a Granted for a held (key, version), or an Updated / Revoked / Expired / Vanished for an
-/// unheld one, is a protocol violation (`bad`).
+/// Records the watch's events and folds them: a Granted for a held (key, version), or an Updated / Revoked / Expired / Vanished / Confirmed for
+/// an unheld one, or a RerunBegin in an open bracket / a RerunEnd outside one, is a protocol violation (`bad`).
 struct Recorder {
-    struct Ev { Kind kind; int32_t part; int64_t off; Bytes key; int64_t ver; bool fromScan; };
+    struct Ev { Kind kind; int32_t part; int64_t off; Bytes key; int64_t ver; bool fromScan; Bytes bytes; };
     std::vector<Ev> evs;
     Held            held;
+    std::set<int32_t> open;   ///< the partitions with an open RerunBegin..RerunEnd bracket
     int             bad = 0, readies = 0, failures = 0;
     static void fn(void* c, const rc::LeaseEvent& e) { static_cast<Recorder*>(c)->on(e); }
     void on(const rc::LeaseEvent& e) {
         Bytes k(e.key.begin(), e.key.end());
-        evs.push_back({e.kind, e.partition, e.offset, k, e.version, e.fromScan});
+        evs.push_back({e.kind, e.partition, e.offset, k, e.version, e.fromScan, Bytes(e.bytes.begin(), e.bytes.end())});
         const auto id = std::make_pair(k, e.version);
         switch (e.kind) {
         case Kind::Granted:  if (!held.insert(id).second) ++bad; break;
@@ -146,6 +147,9 @@ struct Recorder {
         case Kind::Vanished: if (held.erase(id) == 0) ++bad; break;
         case Kind::Ready:    ++readies; break;
         case Kind::Failed:   ++failures; break;
+        case Kind::Confirmed:  if (held.count(id) == 0) ++bad; break;
+        case Kind::RerunBegin: if (!open.insert(e.partition).second) ++bad; break;
+        case Kind::RerunEnd:   if (open.erase(e.partition) == 0) ++bad; break;
         }
     }
     [[nodiscard]] int count(Kind kind, const Bytes* key = nullptr) const {
