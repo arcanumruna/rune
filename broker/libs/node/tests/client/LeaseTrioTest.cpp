@@ -197,9 +197,9 @@ TEST(LeaseTrioRegression, CheckpointInFlightRegression) {
     o.ttlMs = 60'000;
     const uint64_t ckpt0 = t.checkpointsOnLeader(topic, 0);
     std::map<int, int64_t> ver;
-    Clk::time_point sent[12];
+    std::map<int, lt3::Clock::time_point> sent;   // just before each grant is sent: the real time that lease has aged is at most msSince(sent)
     for (int i = 0; i < 12; ++i) {
-        sent[i] = Clk::now();
+        sent[i] = lt3::Clock::now();
         const rc::LeaseResult g = lt.grantAndWait(lt3::row("ck-" + std::to_string(i), uint64_t(i)), o);
         ASSERT_TRUE(g.ok());
         ver[i] = g.version;
@@ -214,8 +214,10 @@ TEST(LeaseTrioRegression, CheckpointInFlightRegression) {
         rc::LeaseTtlInfo info;
         ASSERT_TRUE(retried([&] { return lt.timeToLiveAndWait(lt3::row("ck-" + std::to_string(i)), &info); }).ok());
         EXPECT_LE(info.remainingMs, 60'000 + 1000) << "never more than the ttl";
-        // Relative to the grant: the reads may come a seed failover (~10 s) after the kill when the leader was the seed.
-        EXPECT_GT(info.remainingMs, 60'000 - msSince(sent[i]) - 300) << "a checkpointed lease keeps its time through the change";
+        // Never shortened: the new leader resumes from the last checkpoint (taken before the kill), so the lease keeps at least its ttl minus
+        // the real time since its grant, less one checkpoint interval (1 s). Time-independent: a slow failover ages it, never shortens it.
+        const int64_t aged = std::chrono::duration_cast<std::chrono::milliseconds>(lt3::Clock::now() - sent[i]).count();
+        EXPECT_GE(info.remainingMs, 60'000 - aged - 1000) << "a checkpointed lease keeps its time through the change (aged " << aged << " ms)";
     }
 }
 
@@ -325,6 +327,7 @@ Outage measureOutage(const char* tag) {
 // The leader change that follows the REJOIN of the killed node is a leader change too (L22 is a Herald budget for any forced change).
 TEST(LeaseTrioRegression, KeepAliveOutageUnderLeaderChangeRegression) {
     const Outage o = measureOutage("lease-trio-outage");
+    if (lt3::kSanitized) GTEST_SKIP() << "the L22 1.5 s outage budget is meaningless under a sanitizer (the lease survived both changes)";
     EXPECT_LT(o.killMaxMs, 1500) << "the longest keepalive outage after the kill of the leader, over 2 forced changes (L22)";
     EXPECT_LT(o.rejoinMaxMs, 1500) << "the longest keepalive outage when the restarted node takes the leadership back (L22)";
 }

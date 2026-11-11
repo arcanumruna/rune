@@ -37,7 +37,9 @@ void putLe(std::vector<uint8_t>& b, std::size_t at, uint64_t v, int bytes) {
 }
 
 // [u16 blockLength][u16 schema version][version, ttl, holder, remaining, id, addr(16)].
-std::vector<uint8_t> leaseValue(uint64_t id, int64_t ver, const std::string& addr, uint64_t remaining = 0, uint64_t holder = 1, uint64_t ttl = 5000) {
+// Lease expiry runs on the real lease clock: ttl and checkpoint remaining are minutes, so no lease expires mid-test even under
+// TSan (a 5 s ttl / 1.234 s remaining expired lease 1 across the restart rebuild of PersistedRebuildFoldsLikeLiveRegression).
+std::vector<uint8_t> leaseValue(uint64_t id, int64_t ver, const std::string& addr, uint64_t remaining = 0, uint64_t holder = 1, uint64_t ttl = 600'000) {
     std::vector<uint8_t> b(4u + 56u, 0);
     putLe(b, 0, 56, 2);
     putLe(b, 2, 1, 2);
@@ -53,7 +55,7 @@ RawRec grantRec(uint64_t id, const std::string& addr) { return {keyOf(id), lease
 RawRec updateRec(uint64_t id, int64_t ver, const std::string& addr) { return {keyOf(id), leaseValue(id, ver, addr, 0, 9), 2}; }
 RawRec revokeRec(uint64_t id, int64_t ver, const std::string& addr) { return {keyOf(id), leaseValue(id, ver, addr), kRevokeAttr}; }
 RawRec expireRec(uint64_t id, int64_t ver, const std::string& addr) { return {keyOf(id), leaseValue(id, ver, addr), kExpireAttr}; }
-RawRec checkpointRec(uint64_t id, int64_t ver, const std::string& addr, uint64_t remaining = 1234) {
+RawRec checkpointRec(uint64_t id, int64_t ver, const std::string& addr, uint64_t remaining = 543'210) {
     return {keyOf(id), leaseValue(id, ver, addr, remaining), kCheckpointAttr};
 }
 
@@ -171,6 +173,21 @@ struct Snapshot {
 };
 Snapshot snap(VerdictRig& r, uint64_t id, const std::string& addr) {
     return {rowOf(r, kProj, idKey(id)), rowOf(r, kByAddr, addrKey(addr, id)), rowOf(r, kCnt, idKey(id))};
+}
+/// Which views differ between two snapshots, with each side's row bytes (hex), for a failure message.
+std::string diffOf(const Snapshot& a, const Snapshot& b) {
+    const auto hex = [](const std::optional<std::vector<uint8_t>>& v) {
+        if (!v) return std::string("none");
+        std::string out;
+        char h[4];
+        for (const uint8_t c : *v) { std::snprintf(h, sizeof h, "%02x", c); out += h; }
+        return out;
+    };
+    std::string out;
+    if (a.proj != b.proj) out += " proj{" + hex(a.proj) + " vs " + hex(b.proj) + "}";
+    if (a.byAddr != b.byAddr) out += " byAddr{" + hex(a.byAddr) + " vs " + hex(b.byAddr) + "}";
+    if (a.cnt != b.cnt) out += " cnt{" + hex(a.cnt) + " vs " + hex(b.cnt) + "}";
+    return out;
 }
 
 const rune::storage::RejectedOffsetIndex::Entry* firstRejection(VerdictRig& r) {
@@ -384,18 +401,19 @@ TEST(LeasePredicateWorkerRegression, CheckpointInvisibleToUserViewsRegression) {
     VerdictRig& r = g.r;
     installAll(r);
     ASSERT_TRUE(g.send({grantRec(1, "a1")}));
+    ASSERT_TRUE(r.driveUntilJudged());   // the live fold has every record (a fixed pass count races the driver under TSan)
     r.passes(30);
     const Snapshot before = snap(r, 1, "a1");
     ASSERT_TRUE(before.proj && before.byAddr && before.cnt);
     const int64_t ver = liveVersion(r, 1);
     ASSERT_GE(ver, 0);
     // The checkpoint's addr differs from the row's: a user view that folded it would show "ck" (a pure copy of the row could not tell).
-    ASSERT_TRUE(g.send({checkpointRec(1, ver, "ck", 1234)}));
+    ASSERT_TRUE(g.send({checkpointRec(1, ver, "ck", 543'210)}));
     r.passes(30);
     EXPECT_EQ(firstRejection(r), nullptr) << "the checkpoint was judged and accepted";
     const Cols c = colsOf(r, 1, kV1Columns);
     ASSERT_TRUE(c.v[3].has_value());
-    EXPECT_EQ(*c.v[3], 1234u) << "the lease index took the checkpoint's remaining";
+    EXPECT_EQ(*c.v[3], 543'210u) << "the lease index took the checkpoint's remaining";
     EXPECT_TRUE(snap(r, 1, "a1") == before) << "all three user-view rows are byte-identical";
 }
 
@@ -427,6 +445,7 @@ TEST(LeasePredicateWorkerRegression, RebuildFoldsLikeLiveRegression) {
     ASSERT_TRUE(g.send({checkpointRec(1, liveVersion(r, 1), "ck")}));   // a differing addr: a fold of it would show
     ASSERT_TRUE(g.send({updateRec(2, liveVersion(r, 2), "b2")}));
     ASSERT_TRUE(g.send({revokeRec(3, liveVersion(r, 3), "a3")}));
+    ASSERT_TRUE(r.driveUntilJudged());   // the live fold has every record (a fixed pass count races the driver under TSan)
     r.passes(30);
     const std::pair<uint64_t, const char*> keys[] = {{1, "a1"}, {2, "a2"}, {2, "b2"}, {3, "a3"}};
     std::vector<Snapshot> before;
@@ -442,7 +461,7 @@ TEST(LeasePredicateWorkerRegression, RebuildFoldsLikeLiveRegression) {
     r.passes(60);
     for (std::size_t i = 0; i < before.size(); ++i) {
         const Snapshot after = snap(r, keys[i].first, keys[i].second);
-        EXPECT_TRUE(after == before[i]) << "id " << keys[i].first << " addr " << keys[i].second;
+        EXPECT_TRUE(after == before[i]) << "id " << keys[i].first << " addr " << keys[i].second << " after vs before:" << diffOf(after, before[i]);
     }
     const Snapshot b2 = snap(r, 2, "b2");
     ASSERT_TRUE(b2.proj.has_value());
@@ -467,6 +486,7 @@ TEST(LeasePredicateWorkerRegression, PersistedRebuildFoldsLikeLiveRegression) {
     ASSERT_TRUE(g.send({checkpointRec(1, liveVersion(r, 1), "ck")}));   // a differing addr: a fold of it would show
     ASSERT_TRUE(g.send({updateRec(2, liveVersion(r, 2), "b2")}));
     ASSERT_TRUE(g.send({revokeRec(3, liveVersion(r, 3), "a3")}));
+    ASSERT_TRUE(r.driveUntilJudged());   // the live fold has every record (a fixed pass count races the driver under TSan)
     r.passes(30);
     const std::pair<uint64_t, const char*> keys[] = {{1, "a1"}, {2, "a2"}, {2, "b2"}, {3, "a3"}};
     std::vector<Snapshot> before;
@@ -497,7 +517,7 @@ TEST(LeasePredicateWorkerRegression, PersistedRebuildFoldsLikeLiveRegression) {
     r.passes(60);
     for (std::size_t i = 0; i < before.size(); ++i) {
         const Snapshot after = snap(r, keys[i].first, keys[i].second);
-        EXPECT_TRUE(after == before[i]) << "id " << keys[i].first << " addr " << keys[i].second;
+        EXPECT_TRUE(after == before[i]) << "id " << keys[i].first << " addr " << keys[i].second << " after vs before:" << diffOf(after, before[i]);
     }
     const Snapshot b2 = snap(r, 2, "b2");
     ASSERT_TRUE(b2.proj.has_value());
