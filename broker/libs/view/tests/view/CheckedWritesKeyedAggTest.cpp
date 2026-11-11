@@ -102,7 +102,6 @@ ViewPlan aggregateOf(std::vector<KeyComponent> key, std::vector<AuthoredField> o
     for (const auto& k : key) {
         if (k.keyFunction) v.unicodeVersion = rune::codec::kUnicodeVersion;
     }
-    v.groupBy = key;
     v.keyComponents = std::move(key);
     v.output = std::move(output);
     return v;

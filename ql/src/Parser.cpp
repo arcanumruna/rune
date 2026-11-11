@@ -1031,18 +1031,6 @@ struct Parser {
         return key;
     }
 
-    // groupItem := IDENT | "lower" "(" IDENT ")"
-    std::expected<KeyItem, ParseError> parseGroupItem() noexcept {
-        auto id = expect(TK::Ident, "group by column");
-        if (!id) return std::unexpected(std::move(id.error()));
-        if (ieq(id->text, "lower") && cur.kind == TK::LParen) {
-            auto col = parseLowerArg();
-            if (!col) return std::unexpected(std::move(col.error()));
-            return KeyItem{std::move(*col), KeyFunction::Lower, {}};
-        }
-        return KeyItem{std::string(id->text), KeyFunction::None, std::string(id->text)};
-    }
-
     static bool aggregateKind(std::string_view w, ItemKind& k) noexcept {
         if (ieq(w, "count")) k = ItemKind::Count;
         else if (ieq(w, "sum")) k = ItemKind::Sum;
@@ -1261,15 +1249,7 @@ struct Parser {
         if (!src) return std::unexpected(std::move(src.error()));
         v.source = std::move(*src);
         if (isKw("group")) {
-            advance();
-            if (auto k = expectKeyword("by"); !k) return std::unexpected(std::move(k.error()));
-            for (;;) {
-                auto g = parseGroupItem();
-                if (!g) return std::unexpected(std::move(g.error()));
-                v.groupBy.push_back(std::move(*g));
-                if (cur.kind != TK::Comma) break;
-                advance();
-            }
+            return std::unexpected(err("'group by' is not part of create view: an aggregate view is grouped by its key; remove 'group by …'"));
         }
         while (isKw("constraint")) {
             advance();

@@ -13,6 +13,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 using namespace rune::node;
 using namespace rune::node::test;
 using rune::codec::PrimType;
@@ -210,23 +212,41 @@ TEST(CheckedWritesAdminViewDdl, CompileKindsMapToTheirCodes) {
     const auto missing = createView(rig, unknown);
     EXPECT_EQ(missing.code, codeOf(ErrorCode::ViewFieldUnresolved)) << missing.detail;
 
-    // A groupBy that differs from the key.
+    // A group block that differs from the key (an old client's `group by platform` on key userId): decode refuses it.
     rv::ViewPlan grouped;
     grouped.viewName = "device_history";
     grouped.sources = {{topicIdOf(rig, "device"), "userId"}};
     grouped.keyComponents = {{"userId", 0, "userId"}};
-    grouped.groupBy = {{"platform", 0, "platform"}};
     grouped.output = {{"uses", PrimType::Int64, 0, "", rv::MergeRule::CountAll}};
-    const auto group = createView(rig, grouped);
-    EXPECT_EQ(group.code, codeOf(ErrorCode::ViewKeyInvalid)) << group.detail;
-    EXPECT_NE(group.detail.find("group by"), std::string::npos) << group.detail;
+    auto bytes = rv::serializeAuthored(grouped);
+    ASSERT_EQ(bytes[0], 0x02);
+    auto putStr = [](std::vector<uint8_t>& b, const std::string& str) {
+        for (int i = 0; i < 4; ++i) b.push_back(static_cast<uint8_t>(str.size() >> (8 * i)));
+        b.insert(b.end(), str.begin(), str.end());
+    };
+    auto groupTail = [&](const std::string& col) {
+        std::vector<uint8_t> t = {1, 0, 0, 0};
+        putStr(t, col); t.push_back(0); putStr(t, col);
+        return t;
+    };
+    const auto from = groupTail("userId");
+    ASSERT_TRUE(std::equal(bytes.end() - static_cast<std::ptrdiff_t>(from.size()), bytes.end(), from.begin()));
+    bytes.resize(bytes.size() - from.size());
+    const auto to = groupTail("platform");
+    bytes.insert(bytes.end(), to.begin(), to.end());
+    CreateViewMsg mismatch;
+    mismatch.session = rig.sessionId(); mismatch.corr = rig.nextCorr(); mismatch.viewName = grouped.viewName; mismatch.keyField = "userId";
+    mismatch.planBlob = std::move(bytes);
+    mismatch.meta.requestId = rig.freshRequestId();
+    const auto group = rig.submitRaw(DdlRequest{std::move(mismatch)});
+    EXPECT_EQ(group.code, codeOf(ErrorCode::ViewFieldUnresolved)) << group.detail;
+    EXPECT_EQ(codeOf(ErrorCode::ViewFieldUnresolved), 34);
 
     // A keyed aggregate over a string(16)-keyed source.
     rv::ViewPlan keyedAggregate;
     keyedAggregate.viewName = "session_scores";
     keyedAggregate.sources = {{topicIdOf(rig, "session"), "name"}};
     keyedAggregate.keyComponents = {{"name", 0, "name"}};
-    keyedAggregate.groupBy = {{"name", 0, "name"}};
     keyedAggregate.output = {{"scores", PrimType::Int64, 0, "", rv::MergeRule::CountAll}};
     const auto agg = createView(rig, keyedAggregate);
     EXPECT_EQ(agg.code, codeOf(ErrorCode::ViewKeyExpressionInvalid)) << agg.detail;
@@ -355,7 +375,7 @@ TEST(CheckedWritesAdminViewDdlRegression, SourceKeyFieldMustBeTheTopicKeyRegress
     rv::ViewPlan grouped;
     grouped.viewName = "by_platform";
     grouped.sources = {{topicIdOf(rig, "device"), "platform"}};
-    grouped.keyComponents = grouped.groupBy = {{"platform", 0, "platform"}};
+    grouped.keyComponents = {{"platform", 0, "platform"}};   // a lone plain component on an aggregate is v2 (the group block is derived)
     grouped.output = {{"n", PrimType::Int64, 0, "", rv::MergeRule::CountAll}};
     const auto c = createView(rig, grouped, "platform");
     EXPECT_EQ(c.code, codeOf(ErrorCode::ViewKeyInvalid)) << c.detail;

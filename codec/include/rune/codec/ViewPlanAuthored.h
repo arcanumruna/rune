@@ -4,7 +4,7 @@
 // compilation) and its flat little-endian wire encoding - the exact bytes a `CreateView`
 // planBlob carries.  Shared by the broker and the client.  v1 is the original layout; v2
 // appends the wide-key components, the unique flag, the checked-write constraints, the Unicode
-// version and the GROUP BY columns.  A plan that needs none of them still serializes as v1.
+// version and the derived group block (an aggregate is grouped by its key).  A plan that needs none of them still serializes as v1.
 #pragma once
 #include <rune/codec/PrimType.h>
 
@@ -46,7 +46,7 @@ struct SourceSpec {
     std::string keyField;
 };
 
-// One component of a wide view key (or a GROUP BY column): a source column, an optional key
+// One component of a wide view key (an aggregate is grouped by its key): a source column, an optional key
 // function (rune::codec::kKeyFunction*; a raw byte, the compiler refuses unknown values) and the
 // name it carries in the view.
 struct KeyComponent {
@@ -88,7 +88,7 @@ struct ViewPlan {
     bool unique = false;
     std::vector<AuthoredConstraint> constraints;
     uint32_t unicodeVersion = 0;
-    std::vector<KeyComponent> groupBy;
+    // v2 tail: groupBy (derived, never authored): for an aggregate, the key components; else empty.
 };
 
 inline constexpr uint8_t kAuthoredVersionV1 = 1, kAuthoredVersion = 2;

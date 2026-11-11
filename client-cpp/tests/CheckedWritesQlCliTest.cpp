@@ -416,14 +416,14 @@ cat::ViewObject viewObjectOf(const std::string& viewText) {
 
 TEST(CheckedWritesQlCli, ShowViewFormatsConstraints) {
     const std::string stats = rune::cli::formatViewDefinition(viewObjectOf(
-        "create view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= 12);"));
-    const std::string tail = "  keyspec userId\n  unique no\n  group by (userId)\n  constraint max_characters check (characters <= 12)\n";
+        "create view account_stats key userId as select count(*) as characters from character constraint max_characters check (characters <= 12);"));
+    const std::string tail = "  keyspec userId\n  unique no\n  constraint max_characters check (characters <= 12)\n";
     ASSERT_GE(stats.size(), tail.size());
     EXPECT_EQ(stats.substr(stats.size() - tail.size()), tail) << stats;
 
     const std::string v1 = rune::cli::formatViewDefinition(viewObjectOf(
-        "create view by_user key userId as select count(*) as characters from character group by userId;"));
-    EXPECT_NE(v1.find("  keyspec userId\n  unique no\n  group by (userId)\n"), std::string::npos) << v1;
+        "create view by_user key userId as select count(*) as characters from character;"));
+    EXPECT_NE(v1.find("  keyspec userId\n  unique no\n"), std::string::npos) << v1;
 
     const std::string name = rune::cli::formatViewDefinition(viewObjectOf(kV4));
     EXPECT_NE(name.find("  keyspec lower(name) as nameKey\n  unique no\n  unicode 16.0.0\n"), std::string::npos) << name;
@@ -464,13 +464,13 @@ TEST(CheckedWritesQlCli, ShowViewPrintsTheKeyColumnForAV1ShapedAggregate) {
     plan.sources.push_back({-1, "userId"});
     plan.output.push_back({"userId", PrimType::UInt64, 0, "userId", rune::view::MergeRule::Replace});
     plan.output.push_back({"characters", PrimType::Int64, 0, "", rune::view::MergeRule::CountAll});
-    ASSERT_TRUE(plan.groupBy.empty());
     cat::ViewObject v;
     v.name                     = "by_user";
     v.def.normalizedPlanBlob   = rune::view::serializeAuthored(plan);
     v.def.outputDescriptorBlob = rune::codec::serialize(rune::codec::DescriptorBuilder("out").add("userId", PrimType::UInt64).add("characters", PrimType::Int64).build());
     const std::string text = rune::cli::formatViewDefinition(v);
-    EXPECT_NE(text.find("  keyspec userId\n  unique no\n  group by (userId)\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("  keyspec userId\n  unique no\n"), std::string::npos) << text;
+    EXPECT_EQ(text.find("group by"), std::string::npos) << text;   // #1009: the group is the key
 }
 
 TEST(CheckedWritesQlCli, UnauthorizedSourceNotesTheConstraintRows) {

@@ -79,7 +79,7 @@ std::string schema(bool replicas) {
     if (!replicas) character.replace(character.find(three), three.size(), "");
     return stmt(character) + stmt(goldenStatement("view character_name key")) + stmt(goldenStatement("view account_stats key")) +
            stmt("create view character_by_id key characterId as select * from character") + stmt(ledger) +
-           stmt("create view balances key account as select sum(amount) as balance from ledger group by account constraint non_negative check (balance >= 0)");
+           stmt("create view balances key account as select sum(amount) as balance from ledger constraint non_negative check (balance >= 0)");
 }
 
 int qlScript(const std::string& endpoint, const std::string& text, std::string* err) {

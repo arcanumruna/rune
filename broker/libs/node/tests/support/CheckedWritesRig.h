@@ -420,12 +420,12 @@ public:
         switch (v) {
         case ConstrainedView::CharacterName: return "create unique view character_name key lower(name) as nameKey as select characterId from character;";
         case ConstrainedView::AccountStats:
-            return "create view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= " + std::to_string(cap) + ");";
+            return "create view account_stats key userId as select count(*) as characters from character constraint max_characters check (characters <= " + std::to_string(cap) + ");";
         case ConstrainedView::AccountCharacters: return "create view account_characters key (userId, characterId) as select name, gender, lastPlayed from character;";
         case ConstrainedView::PerGender:
-            return "create view per_gender key (userId, gender) as select count(*) as n from character group by userId, gender constraint two_per_gender check (n <= 2);";
+            return "create view per_gender key (userId, gender) as select count(*) as n from character constraint two_per_gender check (n <= 2);";
         case ConstrainedView::Ledger:
-            return "create view balances key account as select sum(amount) as balance from entry group by account constraint non_negative check (balance >= 0);";
+            return "create view balances key account as select sum(amount) as balance from entry constraint non_negative check (balance >= 0);";
         case ConstrainedView::UserIdentity: return "create unique view user_identity key (provider, subject) as select userId from user;";
         case ConstrainedView::PcName: return "create unique view pc_name key lower(name) as nameKey as select id from pc;";
         }

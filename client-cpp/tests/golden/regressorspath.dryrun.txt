@@ -16,7 +16,7 @@ schema device_login fp=0xDF911DB78C3260E3 block=90 version=1 {
   platform  uint16  @80
   ts        int64   @82
 }
-create view device_history source device_login key (userId, deviceFp) group by (userId, deviceFp)
+create view device_history source device_login key (userId, deviceFp)
   output userId uint64 replace(userId), deviceFp string(64) replace(deviceFp), firstSeen int64 min(ts), lastSeen int64 max(ts), logins int64 count(*), platform uint16 last(platform)
   plan authored v2
 topic character partitions 1 replicas 3 persistence disk key characterId autoincrement
@@ -34,7 +34,7 @@ schema character fp=0xE9B55AB582EBB6DA block=56 version=1 {
 create unique view character_name source character key lower(name) as nameKey unicode 16.0.0
   output characterId uint64 replace(characterId)
   plan authored v2
-create view account_stats source character key userId group by (userId)
+create view account_stats source character key userId
   output userId uint64 replace(userId), characters int64 count(*)
   constraint max_characters check (characters <= 12)
   plan authored v2

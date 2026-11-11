@@ -457,7 +457,7 @@ constexpr const char* kR11Topic = "topic r11 { id uint64, g uint64, v int64 } pa
 constexpr int32_t kChk = 0x40000701, kOrd = 0x40000702, kChkCopy = 0x40000703, kOrdCopy = 0x40000704;
 
 rune::view::CompileResult r11View(int32_t viewTopicId, bool checked) {
-    const std::string stmt = std::string("create view r11v key g as select count(*) as n, last(v) as lv, last(v) as lnn from r11 group by g") +
+    const std::string stmt = std::string("create view r11v key g as select count(*) as n, last(v) as lv, last(v) as lnn from r11") +
                              (checked ? " constraint nonneg check (lv >= 0);" : ";");
     const rune::ql::TopicDef topic = VerdictRig::parseTopic(kR11Topic);
     auto parsed = rune::ql::parse(stmt);

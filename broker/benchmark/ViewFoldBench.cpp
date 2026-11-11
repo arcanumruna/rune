@@ -927,7 +927,7 @@ BENCHMARK(BM_ViewFoldVerdictKeyIndex)->Name("BM_ViewFoldVerdict/key_index")->Uni
 namespace {
 const char* const kConstraintTopic = "topic character { characterId uint64, userId uint64, name string(16), gender uint16, lastPlayed int64 } partitions 1 key characterId;";
 const char* const kUniqueName = "create unique view character_name key lower(name) as nameKey as select characterId from character;";
-const char* const kAccountStats = "create view account_stats key userId as select count(*) as characters from character group by userId "
+const char* const kAccountStats = "create view account_stats key userId as select count(*) as characters from character "
                                   "constraint max_characters check (characters <= 12);";
 constexpr uint64_t kUniqueObjectId = 7, kStatsObjectId = 8;
 constexpr uint64_t kSeededKeyBase = 10'000'000;   // above every churn key
@@ -1388,7 +1388,7 @@ BENCHMARK(BM_ViewFoldAggregate)
     ->Iterations(1)
     ->UseRealTime();
 
-// Wide view keys (Part 07 §14): the BM_ViewFoldAggregate event batches through device_history, `group by userId, deviceFp`
+// Wide view keys (Part 07 §14): the BM_ViewFoldAggregate event batches through device_history, key (userId, deviceFp)
 // (a 40-byte group key, so the keyed aggregate fold with its group-id table).  Case "count" is count(*); case "minmax" is
 // min(lastSeen) + max(lastSeen), which also keeps the Min/Max value blocks.  1,000,000 events from 50,000 users over 5
 // devices each, primed like BM_ViewFoldAggregate.  Gate: us_per_batch <= 10.
@@ -1437,7 +1437,7 @@ struct KeyedAggRig {
         rune::view::ViewPlan v;
         v.viewName = "device_history";
         v.sources  = {{5, "eventId"}};
-        v.keyComponents = v.groupBy = {{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}};
+        v.keyComponents = {{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}};
         if (minmax) {
             v.output = {{"firstSeen", PrimType::Int64, 0, "lastSeen", rune::view::MergeRule::Min},
                         {"lastSeen", PrimType::Int64, 0, "lastSeen", rune::view::MergeRule::Max}};

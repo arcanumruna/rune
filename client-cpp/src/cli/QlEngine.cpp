@@ -495,14 +495,11 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
                 out << "drop view " << s.name << "\n";
             } else if constexpr (std::is_same_v<T, PCreateView>) {
                 const auto& d = s.def;
-                const bool usesLower = std::any_of(d.key.begin(), d.key.end(), [](const ql::KeyItem& k) { return k.fn == ql::KeyFunction::Lower; }) ||
-                                       std::any_of(d.groupBy.begin(), d.groupBy.end(), [](const ql::KeyItem& k) { return k.fn == ql::KeyFunction::Lower; });
-                std::vector<std::string> key, groupBy;
+                const bool usesLower = std::any_of(d.key.begin(), d.key.end(), [](const ql::KeyItem& k) { return k.fn == ql::KeyFunction::Lower; });
+                std::vector<std::string> key;
                 for (const auto& k : d.key) key.push_back(keyItemText(k));
-                for (const auto& g : d.groupBy) groupBy.push_back(g.fn == ql::KeyFunction::Lower ? "lower(" + g.column + ")" : g.column);
                 out << "create " << (d.orReplace ? "or replace " : "") << (d.unique ? "unique " : "") << (d.transient ? "transient " : "")
                     << "view " << d.name << " source " << d.source << " key " << (key.size() == 1 ? key[0] : "(" + joined(key) + ")");
-                if (!groupBy.empty()) out << " group by (" << joined(groupBy) << ")";
                 if (usesLower) {
                     const uint32_t v = rune::codec::kUnicodeVersion;
                     out << " unicode " << (v >> 16) << "." << ((v >> 8) & 0xFF) << "." << (v & 0xFF);

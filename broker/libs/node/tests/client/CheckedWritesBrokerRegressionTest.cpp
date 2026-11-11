@@ -3526,7 +3526,7 @@ TEST(CheckedWritesBrokerRegression, DeviceHistoryGroupByPrefixReadShardRegressio
     rv::ViewPlan plan;
     plan.viewName = "device_history";
     plan.sources.push_back(rv::SourceSpec{t.topicId, "eventId"});
-    plan.keyComponents = plan.groupBy = {{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}};
+    plan.keyComponents = {{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}};
     plan.output.push_back(rv::AuthoredField{"uses", PrimType::Int64, 0, "", rv::MergeRule::CountAll});
     plan.output.push_back(rv::AuthoredField{"lastSeen", PrimType::Int64, 0, "lastSeen", rv::MergeRule::Max});
     const int32_t view = createView(*c, plan, "userId");
