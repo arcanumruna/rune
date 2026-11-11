@@ -36,19 +36,7 @@
 
 namespace rune::client::subscriber {
 
-/// App-thread -> duty-thread hand-off for one subscribe() call (heap-allocated
-/// by the app thread, ownership passed through the agent command ring).
-struct SubscribeRequest {
-    SubscriptionImpl*                     impl = nullptr;  // F8c C7: not owning (see owned_)
-    std::vector<uint8_t>                  subscribeFrame;  // encoded Subscribe (resend on redirect)
-    int64_t                               timeoutNs = 0;   // #701: the relative subscribe timeout (set on the app thread)
-    int64_t                               deadlineNs = 0;  // M2: subscribe-request deadline, duty-clock ns (stamped at adoption)
-    bool                                  unsent = false;  // fix3 I4: refused, retried per cycle
-    uint8_t                               nlRetries = 0;   // bare-NotLeader retries spent (bounded budget)
-    // E2 final fix wave (I2): a moved subscription held on its node session is
-    // not re-offered before this time (a bare NotLeader backoff); epoch = no wait.
-    int64_t                               notBeforeNs = 0;   // duty-clock ns (0 = no wait)
-};
+// SubscribeRequest lives in Subscription.h (a paused subscription parks its request in its SubscriptionImpl).
 
 class SubscriberHub {
 public:
@@ -94,10 +82,19 @@ public:
     // Duty thread: commands drained from the agent ring
     // -------------------------------------------------------------------------
 
-    /// Apply one subscriber HubCommand (SubscribeAdd / Unsubscribe).
-    /// `unsubCorrId` is a fresh correlationId for an Unsubscribe frame (used
-    /// only by Op::Unsubscribe on a bound subscription).  Ops that are not
+    /// Apply one subscriber HubCommand (SubscribeAdd / Unsubscribe / SubscribePause / SubscribeResume).
+    /// `unsubCorrId` is a fresh correlationId: for an Unsubscribe frame (Op::Unsubscribe, Op::SubscribePause on a bound
+    /// subscription), or - for Op::SubscribeResume - the correlationId of the new Subscribe.  Ops that are not
     /// subscriber ops are ignored.
+    ///
+    /// Pause / resume (a = resumeAt; handle = the impl, resolved against owned_ only):
+    ///   - pause_: the subscription leaves both routing tables (its request / routing entry are parked as map nodes in the
+    ///     impl), the broker side is released with an Unsubscribe, nextOffset = resumeAt when >= 0 (above the position it is
+    ///     treated as -1), and onRecords stops at once - mid-batch too - for the old broker id.
+    ///   - resume_: re-armed like rearmMovedAway: new correlationId, From::offset(position) (the original from while nothing
+    ///     was delivered), resumeFloor = position, so a batch pushed from below is trimmed.
+    ///   A paused subscription is `active` (not finished) but in no table: only unsubscribe, deactivateAll and endAllLive
+    ///   (via owned_) finish it; a session loss or a leader move does not touch it.
     /// `nowNs` is the duty clock: a SubscribeAdd's deadline is stamped nowNs + its timeout.
     void applyCommand(const detail::HubCommand& cmd,
                       int64_t                   unsubCorrId,
@@ -498,7 +495,8 @@ private:
 
     // Active subscriptions: SubscribeResponse received, subscriptionId bound.
     // Key: subscriptionId.
-    std::map<int64_t, SubscriptionImpl*> activeById_;
+    using ActiveMap = std::map<int64_t, SubscriptionImpl*>;
+    ActiveMap activeById_;
 
     // F8c C7: every impl whose SubscribeAdd this hub adopted (even one already
     // unsubscribed / finished), until release() forgets it or Client close
@@ -579,6 +577,21 @@ private:
     [[nodiscard]] int64_t correlationIdOf_(const SubscriptionImpl* key) const noexcept;
     /// fix4 M1: fail + erase a pending request whose Subscribe is never deliverable.
     PendingMap::iterator failRequest_(PendingMap::iterator it);
+    /// Offer the request at `it` (just made pending) on the seed: the tail of adoptSubscribe, shared with resume_.
+    void sendNewPending_(PendingMap::iterator it, const SendFn& submitFn);
+    /// A pending request that is answered / bound: erased - or, for a subscription that ever paused, parked in its impl
+    /// (so the next pause / resume cycle allocates nothing).
+    void retireRequest_(PendingMap::iterator it);
+    /// Route a bound subscription: activeById_[id] = impl, re-using the impl's parked node when it has one.
+    ActiveMap::iterator bindActive_(int64_t id, SubscriptionImpl* impl);
+    /// Erase activeById_[id] when it still maps to `impl` (the iterator an onRecords dispatch held may be gone after a pause).
+    void eraseActive_(int64_t id, const SubscriptionImpl& impl);
+    /// `impl` is one this hub adopted (owned_), by address - never dereferenced before.
+    [[nodiscard]] bool owns_(const SubscriptionImpl* impl) const noexcept;
+    void pause_(SubscriptionImpl& impl, int64_t resumeAt, int64_t unsubCorrId, int64_t sessionId, const SendFn& submitFn);
+    void resume_(SubscriptionImpl& impl, int64_t newCorrId, int64_t sessionId, int64_t nowNs, const SendFn& submitFn);
+    /// Unsubscribe of a PAUSED subscription: finished, nothing to send (the broker side was released at the pause).
+    bool unsubscribePaused_(SubscriptionImpl* impl);
     void markUnsent_(SubscribeRequest& req) noexcept;
     void clearUnsent_(SubscribeRequest& req) noexcept;
     void markUnsubPending_(SubscriptionImpl& impl) noexcept;

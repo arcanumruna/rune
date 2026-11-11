@@ -6980,13 +6980,15 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
             }
         }
     }
-    if (cmd.op == Op::SubscribeAdd || cmd.op == Op::Unsubscribe) {
+    if (cmd.op == Op::SubscribeAdd || cmd.op == Op::Unsubscribe || cmd.op == Op::SubscribePause ||
+        cmd.op == Op::SubscribeResume) {
         SubscriptionImpl* adopted = nullptr;  // F1: check the adopted impl for an orphaned release
         if (cmd.op == Op::SubscribeAdd && cmd.handle != 0) {
             adopted = reinterpret_cast<subscriber::SubscribeRequest*>(cmd.handle)->impl;
         }
         const auto snap = agent_.stateAndSessionId();
-        const int64_t unsubCorrId = (cmd.op == Op::Unsubscribe) ? nextCorrId_++ : 0;
+        // Unsubscribe / pause: the Unsubscribe's correlation id; resume: the new Subscribe's (hub applyCommand doc).
+        const int64_t unsubCorrId = (cmd.op != Op::SubscribeAdd) ? nextCorrId_++ : 0;
         subscriberHub_.applyCommand(
             cmd, unsubCorrId, snap.sessionId,
             [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
@@ -7040,7 +7042,8 @@ detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubComm
     // be applied to a subscription/consumer the hub does not hold yet.  Not
     // GroupSetCallback (it could replace a running callback): ring order.
     if (onDuty && (cmd.op == Op::SubscribeAdd || cmd.op == Op::GroupAdd ||
-                   cmd.op == Op::Unsubscribe || cmd.op == Op::GroupClose ||
+                   cmd.op == Op::Unsubscribe || cmd.op == Op::SubscribePause || cmd.op == Op::SubscribeResume ||
+                   cmd.op == Op::GroupClose ||
                    cmd.op == Op::GroupCommit)) {
         self->applyHubCommandDirect_(cmd);
         return detail::HubSubmit::Accepted;

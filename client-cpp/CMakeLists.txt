@@ -1543,6 +1543,7 @@ if(BUILD_TESTING)
             tests/subscriber/SubscriberHubCommandTest.cpp
             tests/subscriber/SubscriberHubRecordsRegressionTest.cpp   # catalog history Task 13 fix round 2
             tests/subscriber/CheckedWritesRecordOpTest.cpp
+            tests/subscriber/SubscriberPauseTest.cpp                   # Subscription::pause / resume
             tests/support/AllocCounter.cpp                             # zero-alloc onRecords gate
         )
         target_include_directories(rune_subscriber_tests PRIVATE
@@ -1654,6 +1655,7 @@ if(BUILD_TESTING)
         add_executable(rune_invoker_tests
             tests/transport/InvokerTransportTest.cpp
             tests/agent/InvokerAgentTest.cpp
+            tests/subscriber/SubscriberPauseClientTest.cpp
             tests/producer/ProducerSinkTest.cpp
             tests/producer/ProducerAllocRegressionTest.cpp
             tests/producer/ProducerAckPathTest.cpp

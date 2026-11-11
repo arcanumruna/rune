@@ -74,6 +74,8 @@ Subscription::Subscription(Subscription&& other) noexcept
     , sinkCtx_(other.sinkCtx_)
     , dutyThread_(other.dutyThread_)
     , unsubscribed_(other.unsubscribed_)
+    , pausable_(other.pausable_)
+    , paused_(other.paused_)
     , cache_(other.cache_)
 {}
 
@@ -85,6 +87,8 @@ Subscription& Subscription::operator=(Subscription&& other) noexcept {
         sinkCtx_      = other.sinkCtx_;
         dutyThread_   = other.dutyThread_;
         unsubscribed_ = other.unsubscribed_;
+        pausable_     = other.pausable_;
+        paused_       = other.paused_;
         cache_        = other.cache_;
     }
     return *this;
@@ -141,9 +145,56 @@ int64_t Subscription::position() const {
 
 bool Subscription::active() const {
     if (!impl_) return false;
-    if (onDutyThread_()) return impl_->active;
-    if (unsubscribed_) return false;
+    if (onDutyThread_()) return impl_->active && !impl_->paused;
+    if (unsubscribed_ || paused_) return false;
     return !impl_->status.closed();
+}
+
+bool Subscription::paused() const {
+    if (!impl_) return false;
+    if (onDutyThread_()) return impl_->paused;
+    return paused_ && !unsubscribed_ && !impl_->status.closed();
+}
+
+// ---------------------------------------------------------------------------
+// pause() / resume() - lifecycle commands (guaranteed delivery, like unsubscribe())
+// ---------------------------------------------------------------------------
+
+bool Subscription::pause(int64_t resumeAt) {
+    if (!impl_ || sink_ == nullptr || !pausable_) return false;
+    detail::HubCommand cmd;
+    cmd.op     = detail::HubCommand::Op::SubscribePause;
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);   // identity only, as for unsubscribe()
+    cmd.a      = resumeAt;
+    if (onDutyThread_()) {
+        // The duty thread owns the state: decide here, apply directly (the sink applies it on this thread).
+        if (!impl_->active) return false;
+        if (resumeAt >= 0 && resumeAt > impl_->pauseBound()) return false;
+        (void)sink_(sinkCtx_, cmd);
+        return true;
+    }
+    if (unsubscribed_ || impl_->status.closed()) return false;
+    drainStatus_();
+    if (resumeAt >= 0 && resumeAt > cache_.nextOffset) return false;
+    paused_ = true;
+    (void)sink_(sinkCtx_, cmd);
+    return true;
+}
+
+bool Subscription::resume() {
+    if (!impl_ || sink_ == nullptr || !pausable_) return false;
+    detail::HubCommand cmd;
+    cmd.op     = detail::HubCommand::Op::SubscribeResume;
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);
+    if (onDutyThread_()) {
+        if (!impl_->active || !impl_->paused) return false;
+        (void)sink_(sinkCtx_, cmd);
+        return true;
+    }
+    if (unsubscribed_ || !paused_ || impl_->status.closed()) return false;
+    paused_ = false;
+    (void)sink_(sinkCtx_, cmd);
+    return true;
 }
 
 bool Subscription::finished() const noexcept {

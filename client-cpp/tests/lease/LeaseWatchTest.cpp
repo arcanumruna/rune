@@ -208,6 +208,23 @@ TEST(LeaseWatchHandoffRegression, DisjointPrefixesOneSubscriptionRegression) {
     EXPECT_EQ(rec.bad, 0);
 }
 
+// A watch's subscriptions are not pausable: pause() on one is refused and the watch goes on.
+TEST(LeaseWatchHandoffRegression, WatchSubscriptionsAreNotPausableRegression) {
+    WRig r(invokerCfg(5191, 5192, 2), 2);
+    for (int i = 0; i < 8; ++i) r.stub->parts[static_cast<std::size_t>(i % 2)].grant(kb(i));
+    rc::LeaseWatchBase w(*r.client, r.topic->core());
+    Recorder rec;
+    w.setHandler(&Recorder::fn, &rec);
+    ASSERT_EQ(startWith(w, {Bytes{}}), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive(w, [&] { return w.isReady(); }));
+    ASSERT_EQ(w.subscriptionsOpened(), 2u);
+    for (int32_t p = 0; p < 2; ++p) EXPECT_FALSE(w.pauseSubscriptionForTest(p)) << "partition " << p;
+    r.stub->parts[0].grant(kb(100));
+    ASSERT_TRUE(r.drive(w, [&] { return rec.count(Kind::Granted) == 9; })) << "the watch kept delivering";
+    EXPECT_EQ(rec.bad, 0);
+    EXPECT_EQ(w.subscriptionsOpened(), 2u) << "nothing was re-opened";
+}
+
 // A full handoff list cancels the subscription at the record that did not fit; the partition re-subscribes from exactly that offset.
 TEST(LeaseWatchHandoffRegression, OverflowResubscribesFromCursorRegression) {
     WRig r(invokerCfg(5109, 5110, 1), 1);

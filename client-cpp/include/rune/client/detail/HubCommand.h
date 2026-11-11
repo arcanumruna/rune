@@ -30,6 +30,13 @@ struct HubCommand {
         SubscribeAdd    = 1,
         /// a = the subscription's Subscribe correlationId (its identity).
         Unsubscribe     = 2,
+        /// handle = the SubscriptionImpl* (identity; resolved against the hub's own list, never dereferenced unless found
+        /// there); a = resumeAt (< 0: continue after the last record handed to the handler).  Releases the broker side and
+        /// parks the subscription; the hub's `unsubCorrId` argument is the fresh Unsubscribe correlation id.
+        SubscribePause  = 3,
+        /// handle = the SubscriptionImpl* (identity).  Subscribes again at the stored position; the hub's `unsubCorrId`
+        /// argument is the fresh correlation id of that new Subscribe.
+        SubscribeResume = 4,
 
         // ---- GroupConsumerHub -------------------------------------------------
         /// handle = the GroupConsumerImpl* (F8c C7: no shared_ptr holder) —
@@ -172,7 +179,8 @@ enum class SendResult : uint8_t { Accepted, Retry, Fatal };
 /// otherwise a full ring is waited out on duty-thread progress) — never throw
 /// for a full ring.
 [[nodiscard]] constexpr bool isLifecycle(HubCommand::Op op) noexcept {
-    return op == HubCommand::Op::Unsubscribe || op == HubCommand::Op::GroupClose ||
+    return op == HubCommand::Op::Unsubscribe || op == HubCommand::Op::SubscribePause ||
+           op == HubCommand::Op::SubscribeResume || op == HubCommand::Op::GroupClose ||
            op == HubCommand::Op::CqRelease || op == HubCommand::Op::ProducerBeginClose ||
            op == HubCommand::Op::ProducerCloseNow ||
            op == HubCommand::Op::HandleRelease;

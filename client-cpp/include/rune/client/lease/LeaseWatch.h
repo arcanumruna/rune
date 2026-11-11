@@ -172,6 +172,9 @@ public:
     [[nodiscard]] uint64_t dataResetRerunsForTest() const noexcept { return dataResetReruns_; }   ///< reruns caused by a data-reset subscription
     [[nodiscard]] uint64_t ringOverflows() const noexcept { return ringOverflows_; }   ///< record-ring Overflow markers acted on
     [[nodiscard]] bool recordRingEmptyForTest() noexcept { return recs_.ring().empty(); }   ///< the record ring holds nothing (tests)
+    /// (tests) pause() on partition `p`'s subscription handle: always false - a watch's subscriptions are not pausable (it would lose
+    /// records the scan hand-off needs) - and false when the partition has none.
+    [[nodiscard]] bool pauseSubscriptionForTest(int32_t p) { Part& pt = parts_[static_cast<std::size_t>(p)]; return pt.sub.has_value() && pt.sub->pause(); }
 
 private:
     struct Cb { LeaseEventFn fn = nullptr; void* ctx = nullptr; WatchGoneFn gone = nullptr; };

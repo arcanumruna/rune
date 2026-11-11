@@ -519,6 +519,7 @@ void LeaseWatchBase::openSubscription_(int32_t p, int64_t fromOffset) {
         fail_();
         return;
     }
+    pt.sub->markNotPausable();   // a watch's own subscription: pausing it would lose records its scan hand-off needs
     pt.curGen = gen;
     pt.seenResets = pt.sub->dataResets();
     ++subsOpened_;
