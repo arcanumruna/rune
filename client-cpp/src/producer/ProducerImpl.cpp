@@ -1782,9 +1782,8 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
     //     produceTimeout tail).
     // Unlike Aeron's ManyToOneRingBuffer, this ring both supports ABORT and
     // dispatches the handler inline (no std::function).
-    bool controlApplied = false;
     const int n = ring_.controlledRead(
-        [this, nowNs, &controlApplied](
+        [this, nowNs](
             int32_t                              msgTypeId,
             aeron::concurrent::AtomicBuffer&     buf,
             aeron::util::index_t                 offset,
@@ -1879,9 +1878,19 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                                          static_cast<double>(static_cast<uint64_t>(n) * recLen));
                 if (guard_.bound && guardBlocks_()) [[unlikely]] {   // Task 15: see appendRecord_
                     const uint16_t code = static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk);
+                    // The handlers run in the duty scope; its end-of-scope work follows the read (readScopeDue_).
+                    const bool prevDuty = inDuty_;
+                    inDuty_ = true;
                     emitUnsentBatchAck_(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff), static_cast<int32_t>(n),
                                         OpStatus::DeliveryFailed, n, code);
                     completeHandle_(ackHandle, OpKind::Send, -1, 0, OpStatus::DeliveryFailed, code, 0, {}, batchCompletionBytes(n));
+                    inDuty_ = prevDuty;
+                    readScopeDue_ = true;
+                    if (transactional_()) {   // O-1: the refusal poisons the open transaction before any later ring message
+                        guardFailDue_ = true;
+                        lastDrainStop_ = DrainStop::FlushToken;
+                        return ControlledAction::BREAK;
+                    }
                     return ControlledAction::CONTINUE;
                 }
                 PartitionState& ps = getOrCreatePartition(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff));
@@ -1912,7 +1921,8 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                     std::memcpy(&armSeq, p + 12, 4);
                     std::memcpy(&atRiskNs, p + 16, 8);
                     hooks_.guardBind(hooks_.ctx, *this, sid, slot, gen, armSeq, atRiskNs);
-                    if (guardFailDue_) {   // I-7: the failure runs after this read (it must not nest a read of the ring)
+                    if (guardFailDue_) {
+                        readScopeDue_ = true;   // I-7: the failure runs after this read (it must not nest a read of the ring)
                         lastDrainStop_ = DrainStop::FlushToken;
                         return ControlledAction::BREAK;
                     }
@@ -1936,7 +1946,7 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                     // fails the limits check - the order Direct mode has.
                     applyTxnControl(tc, nowNs);
                     inDuty_ = prevDuty;
-                    controlApplied = true;
+                    readScopeDue_ = true;
                 } else {
                     ++ringForeign_;
                 }
@@ -1947,12 +1957,13 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
             return ControlledAction::BREAK;
         },
         messageLimit);
-    if (guardFailDue_) [[unlikely]] {   // I-7 / I-3: a bind onto a tripped / refused guard, applied in the read above
-        guardFailDue_ = false;
-        failGuarded(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk));
-    }
-    if (controlApplied) [[unlikely]] {
-        const DutyScope duty(*this);   // runs what the op's handlers deferred (a close, deferred records)
+    if (readScopeDue_ || guardFailDue_) [[unlikely]] {   // set in the read above: nothing below may run inside it
+        readScopeDue_ = false;
+        if (guardFailDue_) {   // I-7 / I-3 / O-1: a bind onto a tripped / refused guard, or a record the guard refused
+            guardFailDue_ = false;
+            failGuardedNow_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk));
+        }
+        const DutyScope duty(*this);   // runs what the handlers deferred (a close, deferred records, a deferred guard failure)
     }
     return n + refused;
 }
@@ -2099,8 +2110,18 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     if (guard_.bound && guardBlocks_()) [[unlikely]] {
         // Task 15: a guarded producer whose lease is at risk (or gone) appends nothing: the record fails at once.
         const uint16_t code = static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk);
+        // Inside the ring read (or a deferred pass) the handler must see the duty scope: a close it issues is deferred, not nested.
+        const bool prevDuty = inDuty_;
+        inDuty_ = true;
         emitUnsentBatchAck_(topicId, partition, 1, OpStatus::DeliveryFailed, 1, code);
         completeHandle_((flags & kFlagWantAck) ? ackHandle : 0u, OpKind::Send, -1, 0, OpStatus::DeliveryFailed, code);
+        inDuty_ = prevDuty;
+        readScopeDue_ = true;
+        if (transactional_() && mode_ == IngressMode::Ring) {   // O-1: poison the open transaction before any later message
+            guardFailDue_ = true;
+            lastDrainStop_ = DrainStop::FlushToken;
+            return ControlledAction::BREAK;
+        }
         return ControlledAction::CONTINUE;
     }
     PartitionState& ps = getOrCreatePartition(topicId, partition);

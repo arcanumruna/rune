@@ -1480,6 +1480,7 @@ int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
     }
     const auto* id = std::get_if<IdAssigned>(&identity_);
     if (!coord_ || id == nullptr) return 0;
+    assert(!(guard_.bound && guardBlocks_()) && "a blocked guard poisons the transaction in the same step: no TxnOffsetCommit starts");
     // (No guard check here: a guard that blocks poisons the transaction in the same step (failGuarded / the refused-bind failure), and an
     // AbortableError ends the call at the top of this function; the check before AddOffsetsToTxn covers a transaction begun after the block.)
     int work = 0;

@@ -1233,7 +1233,7 @@ public:
         return guard_.bound && (guard_.dead || guard_.entry->gen != guard_.gen ||
                                 guard_.entry->state != detail::GuardEntry::State::Armed);
     }
-    /// Fails everything the producer accepted and not yet acknowledged (in flight, builder, Tier-2, deferred, ring) with `st` /
+    /// Fails everything the producer accepted and not yet acknowledged (in flight, builder, Tier-2, deferred; NOT the app ring) with `st` /
     /// `errorCode`; the producer stays open.  Idempotent.  Duty thread.
     /// The guard tripped or ended: every accepted record fails, and a transactional producer's open transaction can no longer commit
     /// (R7): InTransaction / Committing-before-EndTxn become AbortableError (a commit whose EndTxn left is decided by its answer).
@@ -1241,7 +1241,14 @@ public:
     /// Never reads the app ring (I-4 / I-7): a control message already queued there (an abort) must still be applied in order, and a
     /// bind applied inside the drain's own controlledRead must not nest a second read.  Records still in the ring are refused by
     /// the normal drain while the guard blocks (appendRecord_ / refuseRingTxn_).
-    void failGuarded(OpStatus st, uint16_t errorCode) noexcept {
+    ///
+    /// Reached from a handler this producer's own walk fired (inDuty_), it is DEFERRED to the outermost DutyScope's end, like
+    /// applyCloseImmediately: the walk still holds live state.  Every call site passes DeliveryFailed / LeaseAtRisk.
+    void failGuarded(OpStatus, uint16_t) noexcept {
+        if (inDuty_) { guardFailDue_ = true; return; }
+        failGuardedNow_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk));
+    }
+    void failGuardedNow_(OpStatus st, uint16_t errorCode) noexcept {
         failAccepted_(st, errorCode);
         if (transactional_()) {
             guardRecallUnsentCommit_();
@@ -2330,6 +2337,9 @@ private:
     /// A bind (or its refusal) applied inside the drain's read owes a failGuarded: set by guardFailOnBind(), consumed right after the
     /// read (duty-owned).
     bool         guardFailDue_ = false;
+    /// The drain's read applied something whose end-of-scope work (DutyScope: a deferred close, deferred records, a deferred
+    /// failGuarded) must run after the read, not inside it: set in the read, consumed right after it (duty-owned).
+    bool         readScopeDue_ = false;
     /// Fails the partition's unsent work (builder, Tier-2) and in-flight batches with `st` / `errorCode`.
     void guardFailPartition_(PartitionState& ps, OpStatus st, uint16_t errorCode) noexcept;
     /// The per-record ack target of AckToken sends: none, the scalar form, or the full-Completion form (one enum, no flags).
@@ -2406,6 +2416,14 @@ private:
     };
     PendingFail pendingFail_{};
     void runPendingFail_() noexcept;
+    /// DutyScope end (inDuty_ still set): the deferred closes and the deferred guard failure, until neither is owed.
+    void runDeferredFails_() noexcept {
+        while (pendingFail_.armed || guardFailDue_) {
+            if (pendingFail_.armed) { runPendingFail_(); continue; }
+            guardFailDue_ = false;
+            failGuardedNow_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk));
+        }
+    }
     bool clientClosedDirect_ = false;  // Direct only: closeFinal ran (owner state)
 
     // ---- sendBlocking() support (app thread only) -----------------------------
@@ -2485,9 +2503,9 @@ private:
                 // fired the handler finished (no live batch / ring read / slot
                 // is ever failed twice) — and before the deferred records are
                 // applied (they are failed with everything else).
-                while (p.pendingFail_.armed) p.runPendingFail_();
+                p.runDeferredFails_();
                 if (!p.deferred_.empty()) p.applyDeferred_();
-                while (p.pendingFail_.armed) p.runPendingFail_();  // a lost-record handler closed
+                p.runDeferredFails_();  // a lost-record handler closed
                 p.inDuty_ = false;
             }
         }
