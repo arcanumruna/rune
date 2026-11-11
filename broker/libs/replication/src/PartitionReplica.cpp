@@ -3201,6 +3201,7 @@ void PartitionReplica::shrinkIsrToLive(std::span<const int32_t> live, int64_t no
             if (sl.id == cfg_.selfId || std::find(live.begin(), live.end(), sl.id) != live.end()) continue;
             mask |= (1u << i);
             sl.validated = false;   // must prove a validated position again to re-enter
+            sl.pushDamagedAt = -1;
         }
         if (mask != internalFencedMask_) {
             internalFencedMask_ = mask;
@@ -3216,6 +3217,7 @@ void PartitionReplica::shrinkIsrToLive(std::span<const int32_t> live, int64_t no
         FollowerSlot& sl = followerSlots_.at(i);
         if (sl.id != cfg_.selfId && std::find(live.begin(), live.end(), sl.id) == live.end())
             sl.validated = false;   // must prove a validated position again to re-enter
+            sl.pushDamagedAt = -1;
     }
     std::vector<NodeId> desired;   // cold: only when a member died
     desired.reserve(committedIsr_.size());
@@ -4112,6 +4114,7 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
     // One view + response per distinct cursor (followers in step share it).
     Offset                     builtFrom = -1;
     bool                       builtOk   = false;
+    bool                       builtDamaged = false;
     rune::storage::LogReadView v{};
     BatchPrefix                pre{};
     FetchResponseMsg           resp{};
@@ -4129,10 +4132,13 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
         if (!slot->validated) [[unlikely]] continue;
         const Offset from = slot->pushCursor();
         if (from >= currentLeo) continue;               // this follower has (been sent) it all
+        // #875: known damaged at this cursor; the follower's fetch gets the error
+        if (from == slot->pushDamagedAt) [[unlikely]] continue;
 
         if (from != builtFrom) {
             builtFrom = from;
             builtOk   = false;
+            builtDamaged = false;
             if (frame < 0) {
                 frame = std::numeric_limits<int64_t>::max();
                 onTransport([&](auto& t) { frame = t.maxFetchRecordsBytes(); });
@@ -4145,7 +4151,12 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
             // F18 m-3's pushCap; one ceiling: maxFetchRecordsBytes().)
             rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
             v = readLog_(from, static_cast<int32_t>(pushCap), &st);
-            if (v.empty() && rune::storage::unservable(st)) [[unlikely]] continue;   // #839: never push a damaged range
+            if (v.empty() && rune::storage::unservable(st)) [[unlikely]] {   // #839: never push a damaged range
+                ++corruptPushReads_;
+                builtDamaged = true;
+                slot->pushDamagedAt = from;
+                continue;
+            }
             // F18 / KIP-74: a first batch larger than maxFetchBytes is still pushed
             // whole (never stuck).  FLOW CONTROL: no batch that begins at or beyond
             // pushCeiling is pushed (in-flight <= kPushFlowWindow).
@@ -4185,6 +4196,10 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
             resp = makeFetchResponse(highWatermark(), kErrNone,
                                      std::span<const uint8_t>(v.data, pre.bytes), from);
             builtOk = true;
+        }
+        if (builtDamaged) {   // #875: a follower at the same cursor shares the read
+            slot->pushDamagedAt = from;
+            continue;
         }
         if (!builtOk) continue;
 

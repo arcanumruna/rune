@@ -654,3 +654,33 @@ TEST_F(CorruptBatchReplicationRegression, LeaderServesEverythingOutsideTheDamage
     EXPECT_EQ(served[0].base, bases[1]);
     EXPECT_EQ(leader->corruptReadsServed(), 0u);
 }
+
+// #875: the leader's push pass must not re-read a damaged range for a follower every pass.
+TEST_F(CorruptBatchReplicationRegression, LeaderReadsADamagedPushRangeOncePerFollowerCursorRegression) {
+    ASSERT_NO_FATAL_FAILURE(buildDamagedLeader());
+    // Run until the push pass first meets the damage (the follower's cursor is then at D and stays there).
+    for (int i = 0; i < 300 && leader->corruptPushReadsForTest() == 0; ++i) {
+        clock += 1'000'000LL;
+        leader->doWork(clock);
+        follower->doWork(clock);
+        transport.pump(clock);
+    }
+    ASSERT_EQ(leader->isr().size(), 2u) << "setup: the follower is still in the ISR, so the leader keeps pushing to it";
+    const uint64_t before = leader->corruptPushReadsForTest();
+    ASSERT_GE(before, 1u) << "setup: the push pass met the damage";
+    // 50 more push passes with the follower's cursor unchanged (the follower does no work; a tiny step keeps lag low).
+    for (int i = 0; i < 50; ++i) {
+        clock += 1'000LL;
+        leader->doWork(clock);
+    }
+    EXPECT_EQ(leader->corruptPushReadsForTest(), 1u) << "one read per (follower, cursor), not one per pass";
+    // The follower's own fetch still gets the damage error and wedges at the damage.
+    for (int i = 0; i < 50 && follower->wedgedAtOffset() < 0; ++i) {
+        clock += 1'000'000LL;
+        leader->doWork(clock);
+        follower->doWork(clock);
+        transport.pump(clock);
+    }
+    EXPECT_EQ(follower->wedgedAtOffset(), D);
+    EXPECT_GE(leader->corruptReadsServed(), 1u);
+}

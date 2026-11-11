@@ -1352,6 +1352,8 @@ public:
     [[nodiscard]] uint64_t recordTooLargeServed() const noexcept { return recordTooLargeServed_; }
     /// Leader: fetches answered kErrCorruptRecord (the batch at the fetch offset is stored damaged).
     [[nodiscard]] uint64_t corruptReadsServed() const noexcept { return corruptReadsServed_; }
+    /// #875: push-side reads that found the leader's copy damaged (one per follower cursor, not one per pass).
+    [[nodiscard]] uint64_t corruptPushReadsForTest() const noexcept { return corruptPushReads_; }
     /// Follower: times this replica wedged on an unreplicable batch.
     [[nodiscard]] uint64_t wedgedRefusals() const noexcept { return wedgedRefusals_; }
     /// Follower: the offset it is wedged at (stops fetching it), or -1.
@@ -1874,6 +1876,7 @@ private:
     // F18 unreplicable-batch state (see kErrRecordTooLarge).
     uint64_t recordTooLargeServed_ = 0;
     uint64_t corruptReadsServed_   = 0;   ///< #839: fetches answered kErrCorruptRecord
+    uint64_t corruptPushReads_     = 0;   ///< #875: push reads that hit a damaged range
     uint64_t wedgedRefusals_       = 0;
     Offset   wedgedAtOffset_       = -1;
     void wedgeAt_(Offset at, const char* why);   ///< F18: enter the wedged state (log + count)
