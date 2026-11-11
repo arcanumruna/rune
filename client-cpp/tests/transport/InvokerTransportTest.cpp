@@ -1742,19 +1742,23 @@ TEST(InvokerTransport, RebuildFailureIsDownThenRetrySucceedsRegression) {
     t.stop();
 }
 
-// Mutation: stop() from the Down state touching the deleted driver/client -> crash or hang (red).
+// A failed rebuild releases the driver and its dir lock before it reports Down (mutation: keep the driver on the
+// resolve-failure path -> the second transport is refused, red), and stop() from Down touches no deleted driver or
+// client (mutation -> crash or hang, red).
 TEST(InvokerTransport, StopFromDownIsCleanRegression) {
     Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3171);
     Transport t{c};
     t.start();
     t.setIngressChannelForTest("aeron:udp?endpoint=256.0.0.1:1");
     ASSERT_FALSE(t.rebuild(0));
+    {
+        Transport next{c};
+        EXPECT_NO_THROW(next.start()) << "Down still holds the dir";
+        next.stop();
+    }
     t.stop();
     const uint8_t b[] = {1};
     EXPECT_FALSE(t.offer(b, 1));
-    Transport next{c};   // the dir and its lock were released
-    EXPECT_NO_THROW(next.start());
-    next.stop();
 }
 
 // Mutation: rebuild() starting the embedded driver in invoker style -> usesDriverThread() flips, nobody pumps it (red).

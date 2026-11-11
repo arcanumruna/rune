@@ -27,7 +27,11 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <fstream>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <poll.h>
 #include <unistd.h>
 #include <vector>
@@ -1058,22 +1062,37 @@ TEST(ClientShardRegression, WakeFdsAreReplacedAfterRebuildRegression) {
     ASSERT_GT(na, 0);
     // The old fds were closed with the old driver; whatever the kernel reused, every fd now returned is open.
     for (int i = 0; i < na; ++i) EXPECT_NE(::fcntl(after[i], F_GETFD), -1) << after[i];
-    // An owner that parks on the re-queried fds between duty cycles gets its ack: every park is woken by traffic on
-    // the new sockets (a park on a stale or reused fd sleeps out its 1 s timeout).
+    // The rebuilt client's egress receive socket (the only one bound to the egress endpoint) is registered in one of
+    // the re-queried epoll fds, so an ack on it wakes the park: /proc/self/fdinfo/<epfd> lists each target as "tfd: <fd>".
+    const std::string egress = rs::shardClientConfig(g, 0).egressChannel;
+    const int egressPort = std::stoi(egress.substr(egress.rfind(':') + 1));
+    int egressFd = -1;
+    for (const auto& e : std::filesystem::directory_iterator("/proc/self/fd")) {
+        const int fd = std::stoi(e.path().filename().string());
+        sockaddr_in a{};
+        socklen_t   len = sizeof a;
+        if (::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len) == 0 && a.sin_family == AF_INET && ntohs(a.sin_port) == egressPort) egressFd = fd;
+    }
+    ASSERT_GE(egressFd, 0) << "no socket bound to the egress endpoint";
+    bool registered = false;
+    for (int i = 0; i < na; ++i) {
+        std::ifstream info("/proc/self/fdinfo/" + std::to_string(after[i]));
+        for (std::string line; std::getline(info, line);) registered = registered || (line.rfind("tfd:", 0) == 0 && std::stoi(line.substr(4)) == egressFd);
+    }
+    EXPECT_TRUE(registered) << "the egress socket " << egressFd << " is in none of the re-queried wake fds";
+    // An owner that parks on the re-queried fds between duty cycles gets its ack.
     r.accept(1, 1);
     r.step();   // the record goes out and the broker acks it after this duty cycle: the ack is not read yet
     ASSERT_EQ(r.ledger.ok, 0);
-    const auto t0 = std::chrono::steady_clock::now();
     for (int parks = 0; r.ledger.ok == 0 && parks < 20; ++parks) {
         r.gw().pump();
         pollfd fds[8];
         const int n = r.shard->wakeFds(after, 8);
         for (int i = 0; i < n; ++i) fds[i] = pollfd{after[i], POLLIN, 0};
-        ASSERT_GT(::poll(fds, static_cast<nfds_t>(n), 1000), 0) << "a park on the re-queried fds slept out its timeout";
+        ASSERT_GT(::poll(fds, static_cast<nfds_t>(n), 1000), 0) << "nothing woke a park on the re-queried fds";
         r.step();
     }
     EXPECT_EQ(r.ledger.ok, 1) << "the ack arrived through the parked owner loop";
-    EXPECT_LT(std::chrono::steady_clock::now() - t0, 1s);
 }
 #endif
 
