@@ -1728,7 +1728,7 @@ TEST(InvokerTransport, RebuildFailureIsDownThenRetrySucceedsRegression) {
     Transport t{c};
     t.start();
     ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
-    t.setIngressChannelForTest("aeron:udp?endpoint=256.0.0.1:1");
+    t.setIngressChannelForTest("aeron:udp?endpoint=127.0.0.1:65536");
     EXPECT_FALSE(t.rebuild(0));
     EXPECT_TRUE(t.closed());
     int fds[4];
@@ -1749,7 +1749,7 @@ TEST(InvokerTransport, StopFromDownIsCleanRegression) {
     Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3171);
     Transport t{c};
     t.start();
-    t.setIngressChannelForTest("aeron:udp?endpoint=256.0.0.1:1");
+    t.setIngressChannelForTest("aeron:udp?endpoint=127.0.0.1:65536");
     ASSERT_FALSE(t.rebuild(0));
     {
         Transport next{c};

@@ -695,9 +695,9 @@ bool faultAndRecover(OwnDriverRig& r, uint64_t n) {
     r.shard->client().testInjectTransportFault();
     return r.drive([&] { return r.shard->client().testTransportRebuilds() == n && r.state() == rs::ShardState::Live; }, 100'000);
 }
-// A seed channel Aeron cannot resolve: every rebuild attempt fails, so the transport stays Down across duty cycles.
+// A seed channel Aeron rejects while parsing the port (no DNS lookup): every rebuild attempt fails, so the transport stays Down across duty cycles.
 // The test restores the good channel to let it recover.
-const char* const kUnreachableSeed = "aeron:udp?endpoint=256.0.0.1:1";
+const char* const kUnreachableSeed = "aeron:udp?endpoint=127.0.0.1:65536";
 
 // Injects the fault and drives until the first rebuild attempt failed (the shard shows Reconnecting, still Down).
 bool faultIntoDown(OwnDriverRig& r) {
@@ -744,6 +744,7 @@ TEST(ClientShardRegression, RecordsAcceptedWhileTransportDownAreDeliveredInOrder
 TEST(ClientShardRegression, ControlOpsAcrossRebuildRegression) {
     {
         auto              g = ownDriverGroup(3810, 3811);
+        g.base.pingTimeoutMs = 600'000;   // the fake duty clock must not burn the ping's deadline while the real-time reconnect runs
         const std::string goodChannel = g.base.gatewayChannel;
         OwnDriverRig r(g);
         r.connect();
@@ -960,6 +961,7 @@ TEST(ClientShardRegression, ThreadRunnerCloseRightAfterTransportFaultJoinsPrompt
     g.base.gatewayChannel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port);
     g.base.egressChannel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port + 1);
     g.base.runnerMode     = rc::RunnerMode::Thread;
+    g.base.shardStatus    = true;
     test_support::BrokerHost broker(test_support::BrokerHost::uniqueDir(), g.base.gatewayChannel, g.base.gatewayStreamId,
                                     g.base.egressChannel, g.base.egressStreamId);
     rc::Client      client(g.base);
@@ -981,13 +983,18 @@ TEST(ClientShardRegression, ThreadRunnerCloseRightAfterTransportFaultJoinsPrompt
     }));
     client.testSetSeedIngressChannel(kUnreachableSeed);   // posted to the runner: every rebuild fails from here on
     client.testInjectTransportFault();
-    const auto downUntil = std::chrono::steady_clock::now() + 400ms;   // covers two failed attempts (gaps of 100 and 200 ms)
-    ASSERT_TRUE(pumpUntil([&] { return std::chrono::steady_clock::now() >= downUntil; }));
+    int32_t seen = 0;   // two failed attempts have run: the runner is now in a gap of at least 200 ms
+    ASSERT_TRUE(pumpUntil([&] {
+        client.pollShardStatus([&](const rs::ShardStatus& s) {
+            if (s.state == rs::ShardState::Reconnecting) seen = s.attempt;
+        });
+        return seen >= 2;
+    }));
     const auto t0 = std::chrono::steady_clock::now();
     client.close();
-    EXPECT_LT(std::chrono::steady_clock::now() - t0, 400ms) << "close() does not wait for the next rebuild attempt";
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 200ms) << "close() does not wait for the backoff gap";
+    EXPECT_EQ(client.testRebuildAttempt(), static_cast<uint32_t>(seen)) << "close() ran no further rebuild attempt";
     EXPECT_EQ(client.testTransportRebuilds(), 0u) << "no rebuild succeeded while the seed was unreachable";
-    EXPECT_GE(client.testRebuildAttempt(), 2u) << "close() ran while the transport was Down after failed rebuilds";
 }
 
 // A Thread-runner client (its own duty thread and driver thread, real clock) rebuilds after the transport fault too: it
