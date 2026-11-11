@@ -880,7 +880,8 @@ private:
     // CP-9: Retention scheduler — runRetention(nowMs)
     //
     // Called from doWork() when the retentionCheckMs cadence has elapsed.
-    // For each leader-owned replica with a Delete or CompactDelete policy:
+    // For each disk-backed replica with a Delete or CompactDelete policy (a follower trims only what its leader
+    // already trimmed, #990: it uses its leader's advertised log start as the one predicate):
     //   1. Load the immutable sealed-segment snapshot (no segments_ access).
     //   2. Compute the set of deletable segments via three predicates
     //      (time, size, log-start-offset).  Active segment EXCLUDED.
@@ -908,10 +909,13 @@ private:
 
         for (auto* replica : replicas_()) {
             if (!replica) continue;
-            // Retention is leader-only (failover-safe: a demoted leader stops
-            // retention because cleanerRole() != Leader).
+            // A leader applies the retention policy; a follower trims only what its leader already trimmed (#990):
+            // the leader's log start is its one predicate.  Any other role does nothing (failover-safe: a demoted
+            // leader stops applying the policy because cleanerRole() != Leader).
             // TSan race fix: read the cleaner-visible role snapshot (atomic acquire).
-            if (replica->cleanerRole() != rune::replication::Role::Leader) continue;
+            const auto role = replica->cleanerRole();
+            const bool leads = role == rune::replication::Role::Leader;
+            if (!leads && role != rune::replication::Role::Follower) continue;
 
             // Task M1 precondition #2: skip memory-backed replicas.
             // Retention only applies to on-disk logs.
@@ -929,7 +933,12 @@ private:
             int64_t retentionBytes  = ov && ov->retentionBytes ? *ov->retentionBytes
                                                                : replica->retentionBytes();
             clampRetention_(replica->topicId(), log->nsSlot(), log->nsId(), retentionMs, retentionBytes);   // Task 13 (D27)
-            const int64_t logStartOffset  = replica->logStartOffset();
+            int64_t logStartOffset        = replica->logStartOffset();
+            if (!leads) {
+                retentionMs = -1;
+                retentionBytes = -1;
+                logStartOffset = replica->cleanerLeaderLogStart();
+            }
             const int64_t fileDelayMs     = replica->fileDeleteDelayMs();
 
             // If no retention policy is active, skip.

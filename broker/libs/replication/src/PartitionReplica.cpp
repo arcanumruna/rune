@@ -1510,6 +1510,12 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // within a leadership epoch (an error frame may carry 0); BEFORE the apply floors.
     if (memoryBacked_ && leaseTransient_ && role_ == Role::Follower)
         leaderLogStart_ = std::max(leaderLogStart_, resp.logStartOffset);
+    // #990: a disk-backed follower remembers the leader's log start for its retention pass.  Monotone within a
+    // leadership (an error frame carries 0).
+    if (!memoryBacked_ && role_ == Role::Follower && resp.logStartOffset > leaderLogStart_) [[unlikely]] {
+        leaderLogStart_ = resp.logStartOffset;
+        publishedLeaderLogStartForCleaner_.store(leaderLogStart_, std::memory_order_release);
+    }
     // (FR: applyReplicated entry is measured by the ReplFetchRespApply SPAN; the
     //  control→worker handoff that delivers this op is ReplFragRecv→ReplWorkerOpRun.)
 
@@ -2940,6 +2946,7 @@ void PartitionReplica::publishCleanerState() noexcept
             if (configuredReplicas_[i] != cfg_.selfId) markerBound = std::min(markerBound, replicaFetchPos_[i]);
     }
     publishedMarkerBoundForCleaner_.store(markerBound, std::memory_order_release);
+    if (role_ == Role::Leader) publishedLeaderLogStartForCleaner_.store(0, std::memory_order_release);   // #990
 
     // Controller position snapshot: mirror this replica's view of replica-node LEOs
     // for the leadership-convergence path (see controllerReplicaLeo() in the header).

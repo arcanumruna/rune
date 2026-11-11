@@ -470,9 +470,10 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
   (`verdictCheckpointsDiscarded`). When the rejected-offset index is full the judge stalls and raises `verdictStalls`.
 - **Transactions.** A transaction that writes to a verdict source is judged at a `TxnJudge` record (control record 19) that
   the leader appends when the coordinator asks for its vote. The leader's cleaner removes a `TxnJudge` once the transaction's
-  COMMIT or ABORT lies below W and every persisted constraint view has checkpointed past it. As with all compaction and
-  retention, only the partition's leader cleans: a follower keeps every record it has replicated, these included, until it
-  leads and its own cleaner passes over them (follower cleaning: #990). A node restart does not change this.
+  COMMIT or ABORT lies below W and every persisted constraint view has checkpointed past it. Only the partition's leader
+  compacts: a follower keeps what it replicated, these included, until it leads (follower compaction: #990). A follower does
+  delete whole sealed segments that lie below its leader's log start, so retention on the leader bounds a follower's disk
+  too. A node restart does not change this.
   - **Votes.** The coordinator asks the leader of every partition the transaction wrote to whether it votes yes. The judge answers
     once it has judged the transaction whole, applying its records provisionally and locking the rows it wrote; the commit or
     abort marker then finalizes the result in one step. Counters are ids 11 to 20 of `rune stats topic <t>`: `txnVotesYes`,
