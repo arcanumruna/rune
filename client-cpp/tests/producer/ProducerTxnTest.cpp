@@ -38,6 +38,7 @@
 #include <rune/client/Completion.h>
 #include <rune/client/Key.h>
 #include <rune/client/codec/DataCodec.h>
+#include <rune/client/lease/detail/LeaseGuards.h>
 #include <rune/client/producer/ProducerHub.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/protocol/RecordBatch.h>
@@ -2084,4 +2085,156 @@ TEST(ProducerTxnGuardRegression, TripBeforeEndTxnOfferedFailsCommitRegression) {
     r.ticks(5);
     ASSERT_TRUE(ab.ready());
     EXPECT_EQ(ab.status(), OpStatus::Ok);
+}
+
+namespace {
+/// A guard bound to the rig's producer, Armed; tripping it is `entry.state = Tripped` + failGuarded (what LeaseGuards does).
+struct RigGuard {
+    rc::detail::GuardEntry entry;
+    explicit RigGuard(Rig& r) {
+        entry.gen   = 1;
+        entry.state = rc::detail::GuardEntry::State::Armed;
+        r.impl->guardAttach(&entry, 1);
+    }
+    void trip(Rig& r) {
+        entry.state = rc::detail::GuardEntry::State::Tripped;
+        r.impl->failGuarded(OpStatus::DeliveryFailed, static_cast<uint16_t>(rc::ClientErrorCode::LeaseAtRisk));
+    }
+};
+}  // namespace
+
+// N-1 (case 1): a commit whose first EndTxn timed out is InDoubt{AfterEnd}: it may have landed, so the guard never recalls the app's
+// retry - even while that re-send (EndSent{Resend}) has not been offered yet (the coordinator session is down).  It is offered, once,
+// when the session returns.  Mutation: dropping `es->attempt != EndTry::First` from guardRecallUnsentCommit_ turns this red.
+TEST(ProducerTxnGuardRegression, TripNeverRecallsResentCommitRegression) {
+    Rig r;
+    r.initOk();
+    r.startTxn();
+    RigGuard g(r);
+    Op first = r.commit();
+    r.tick();
+    ASSERT_EQ(r.endTxns(), 1u);   // the first EndTxn(commit) left, never answered
+    r.tick(r.cfg.transactionOpTimeoutMs * kMs);
+    ASSERT_EQ(first.status(), OpStatus::Timeout);
+    ASSERT_EQ(r.state(), TxnState::CommittingTransaction) << "in doubt";
+    r.fake.sid = 0;   // the coordinator session goes down before the app's retry
+    Op retry = r.commit();
+    for (int i = 0; i < 20 && r.impl->endTxnAttemptsForTest() < 2; ++i) r.tick();
+    ASSERT_EQ(r.impl->endTxnAttemptsForTest(), 2u) << "the re-send was submitted";
+    r.ticks(5);
+    ASSERT_EQ(r.endTxns(), 1u) << "but not offered: the session is down";
+    g.trip(r);
+    EXPECT_FALSE(retry.ready()) << "a commit that may have landed was failed by the trip";
+    EXPECT_EQ(r.state(), TxnState::CommittingTransaction);
+    r.fake.sid = 77;   // the session returns
+    r.ticks(100);
+    ASSERT_EQ(r.endTxns(), 2u) << "exactly one more EndTxn(commit) is offered";
+    EXPECT_EQ(r.lastEnd()->commit, uint8_t{1});
+    r.endAnswer();
+    ASSERT_TRUE(retry.ready());
+    EXPECT_EQ(retry.status(), OpStatus::Ok);
+}
+
+// N-1 (case 2): a first EndTxn(commit) that was offered once, then lost its session: the link re-offers the same request; the guard's
+// trip pins on `offers != 0` and never recalls it.
+TEST(ProducerTxnGuardRegression, TripNeverRecallsOfferedCommitAfterSessionChangeRegression) {
+    Rig r;
+    r.initOk();
+    r.startTxn();
+    RigGuard g(r);
+    Op commit = r.commit();
+    r.tick();
+    ASSERT_EQ(r.endTxns(), 1u);
+    r.fake.sid = 0;
+    r.hub.onCoordinatorSessionChanged();
+    r.ticks(5, kMs);
+    ASSERT_EQ(r.endTxns(), 1u) << "no session: nothing more is offered";
+    g.trip(r);
+    EXPECT_FALSE(commit.ready()) << "an offered commit was recalled by the trip";
+    EXPECT_EQ(r.state(), TxnState::CommittingTransaction);
+    r.fake.sid = 99;
+    r.ticks(100, kMs);
+    ASSERT_GE(r.endTxns(), 2u) << "the link re-offered the commit on the new session";
+    r.endAnswer();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    EXPECT_EQ(r.state(), TxnState::Ready);
+}
+
+// N-4: every way LeaseGuards fails a bound producer (trip, end, session released = the kill path) x every state a transaction can be in
+// when it lands.  A commit that has not left the client fails LeaseAtRisk (the unoffered EndTxn is recalled), the transaction is
+// AbortableError, no EndTxn(commit) is ever offered, and the abort completes.
+TEST(ProducerTxnGuardRegression, EveryRefusalPointByTransactionStateRegression) {
+    enum class Point { Trip, End, SessionReleased };
+    enum class At { InTransactionAcked, CommitAwaitData, UnofferedEndSent };
+    struct Sink {
+        static void fn(void*, const rc::detail::OpTarget&, const rc::Completion&, std::span<const uint8_t>) noexcept {}
+    };
+    constexpr uint32_t kSid = 7;
+    for (const Point pt : {Point::Trip, Point::End, Point::SessionReleased}) {
+        for (const At at : {At::InTransactionAcked, At::CommitAwaitData, At::UnofferedEndSent}) {
+            SCOPED_TRACE("point " + std::to_string(static_cast<int>(pt)) + " at " + std::to_string(static_cast<int>(at)));
+            Rig r;
+            r.initOk(42, 0);
+            r.startTxn();
+            rc::detail::LeaseGuards guards;
+            guards.configure(1, rc::detail::CompletionSink{&Sink::fn, nullptr});
+            guards.reserve(kSid, 2, 64, rc::detail::OpTarget{});
+            guards.arm(kSid, 0, 1, 1, 1000, 0);
+            guards.bind(kSid, 0, 1, 1, 1000, *r.impl, 0);
+            ASSERT_TRUE(r.impl->guardBound());
+            ASSERT_TRUE(r.sendRecord(0));
+            r.addOk();
+            r.ticks(2);
+            ASSERT_EQ(r.wire.size(), 1u);
+            Op pending;
+            if (at != At::CommitAwaitData) r.ackLastData();
+            if (at == At::CommitAwaitData) {
+                pending = r.commit();
+                r.ticks(2);
+                ASSERT_FALSE(pending.ready());
+            } else if (at == At::UnofferedEndSent) {
+                r.fake.sid = 0;   // the coordinator session is down: the link cannot offer
+                pending = r.commit();
+                for (int i = 0; i < 20 && r.impl->endTxnAttemptsForTest() == 0; ++i) r.tick();
+                ASSERT_EQ(r.impl->endTxnAttemptsForTest(), 1u);
+                r.ticks(3);
+                ASSERT_EQ(r.endTxns(), 0u);
+            }
+            switch (pt) {
+            case Point::Trip: EXPECT_EQ(guards.trip(2000), 1); break;
+            case Point::End: guards.end(kSid, 0, 1); break;
+            case Point::SessionReleased: (void)guards.release(kSid); break;
+            }
+            r.fake.sid = 77;   // a returning session must still offer no commit
+            ASSERT_TRUE(r.impl->guardBlocks_());
+            EXPECT_EQ(r.state(), TxnState::AbortableError);
+            if (at == At::InTransactionAcked) {
+                pending = r.commit();
+            }
+            ASSERT_TRUE(pending.ready());
+            EXPECT_EQ(pending.times(), 1);
+            EXPECT_EQ(pending.status(), OpStatus::DeliveryFailed);
+            EXPECT_EQ(pending.code(), static_cast<uint16_t>(rc::ClientErrorCode::LeaseAtRisk));
+            r.ticks(20, kMs);
+            for (const auto& f : r.fake.offered) {
+                if (f.templateId != rpc::EndTxn::TEMPLATE_ID) continue;
+                const auto m = rpc::EndTxn::decode(f.head.data(), std::min<std::size_t>(f.len, f.head.size()));
+                ASSERT_TRUE(m.has_value());
+                EXPECT_EQ(m->commit, uint8_t{0}) << "no EndTxn(commit) is offered";
+            }
+            Op ab = r.abort();
+            // answer what the abort asks of the coordinator (its EndTxn, and the epoch bump a lost in-flight batch requires)
+            std::size_t endsAnswered = 0, initsAnswered = 1;   // the rig's initOk answered the first InitProducerId
+            for (int i = 0; i < 40 && !ab.ready(); ++i) {
+                r.tick(kMs);
+                if (r.endTxns() > endsAnswered) { r.endAnswer(); endsAnswered = r.endTxns(); }
+                if (r.inits() > initsAnswered) { r.answer(initAnswer(r.lastInitCorr(), 42, 1)); initsAnswered = r.inits(); }
+            }
+            ASSERT_TRUE(ab.ready());
+            EXPECT_EQ(ab.status(), OpStatus::Ok);
+            EXPECT_EQ(r.state(), TxnState::Ready);
+            if (pt != Point::SessionReleased) guards.unbindProducer(*r.impl);
+        }
+    }
 }

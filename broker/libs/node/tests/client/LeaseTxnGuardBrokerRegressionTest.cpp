@@ -378,8 +378,9 @@ TEST_P(LeaseTxnGuardBrokerRegression, GuardedCommitHappyPath) {
 }
 
 // A begins and sends 5 (acked), then stalls for the whole ttl (not driven).  B is granted the lease after the broker expired A's, runs
-// initTransactions(tx-1), begins, sends 5 and commits.  A is driven again and commits: refused (LeaseAtRisk, or Fenced when the guard event
-// was not processed yet - never OK).  R reads exactly B's 5 (A's 5 never become visible); A's next send does not succeed.
+// initTransactions(tx-1), begins, sends 5 and commits.  A is driven again: its next send is accepted at the call and fails LeaseAtRisk, its
+// commit is refused LeaseAtRisk (never Ok, never Fenced: the guard answers first), and after that A is outside a transaction (its next send
+// is NotInTransaction).  R reads exactly B's 5 (A's 5 never become visible).
 TEST_P(LeaseTxnGuardBrokerRegression, StalledHolderCannotCommit) {
     Rig rig(GetParam(), "ltg_stall", kTtlMs);
     Actor  a(rig, 0, 0);
@@ -431,8 +432,8 @@ TEST_P(LeaseTxnGuardBrokerRegression, StalledHolderCannotCommit) {
     EXPECT_EQ(sorted(r.seen), sorted(expect)) << "R reads exactly B's records";
 }
 
-// No leases.  A begins, sends 3 (acked), does not commit.  B initTransactions(tx-1): R never sees A's 3; A's commit and A's send complete
-// Fenced; B commits 2 and R reads exactly those 2.
+// No leases.  A begins, sends 3 (acked), does not commit.  B initTransactions(tx-1): R never sees A's 3; A's commit completes Fenced, A is
+// FatalError (its next send is NotInTransaction); B commits 2 and R reads exactly those 2.
 TEST_P(LeaseTxnGuardBrokerRegression, InitTransactionsAbortsOldOpenTransaction) {
     Rig rig(GetParam(), "ltg_init", kTtlMs);
     Actor  a(rig, 0, 0);

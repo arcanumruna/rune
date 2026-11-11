@@ -126,6 +126,7 @@ struct GRig {
     std::unique_ptr<Session>           session;
     std::unique_ptr<rc::Completions>   pq;
     std::map<rc::Token, rc::Completion> got;
+    std::map<rc::Token, int>           completions;   ///< per token: how often it completed (a map keyed by token cannot see a double)
     rc::Token                          tok = 0;
     const rc::TopicHandle              data{1, 1};
 
@@ -164,7 +165,7 @@ struct GRig {
     }
     void poll() {
         if (!pq) return;
-        pq->poll([&](const rc::Completion& c, std::span<const uint8_t>) { got[c.token] = c; });
+        pq->poll([&](const rc::Completion& c, std::span<const uint8_t>) { got[c.token] = c; ++completions[c.token]; });
     }
     void connect() { test_support::connectGateway(*client, gw); }
     rc::LeaseTopic<Row> openTopic() { return test_support::openLeaseTopic(*client, gw); }
@@ -302,6 +303,44 @@ TEST(ProducerTxnGuardRegression, CommitWithAllRecordsAckedBlockedAtRiskRegressio
     EXPECT_EQ(p.state(), TxnState::AbortableError);
 }
 
+// O-1: a record the guard refuses inside the ring read poisons the open transaction in the same step.  The begin sits in the ring
+// behind the trip (applied after it), the send is accepted at the call; the drive refuses it LeaseAtRisk.  Re-arming the lease then
+// must not let the transaction commit without that record.
+TEST(ProducerTxnGuardRegression, RecordRefusedByGuardPoisonsTransactionRegression) {
+    GRig r;
+    r.g_now_base = g_now;
+    const auto ref = r.addLease(1);
+    rc::Producer p = r.producer("tx-a", ref);
+    ASSERT_NO_FATAL_FAILURE(r.trip());
+    p.beginTransaction();
+    const rc::Token s = ++r.tok;
+    const rc::SendResult sr = p.trySend(r.data, rc::Key(uint64_t{1}), kVal, *r.pq, s);
+    ASSERT_EQ(sr, rc::SendResult::Ok) << "accepted at the call";
+    ASSERT_TRUE(r.await(s));
+    r.expectFailedAtRisk(s, "the refused record");
+    EXPECT_EQ(p.state(), TxnState::AbortableError) << "the refusal poisons the open transaction";
+    ASSERT_NO_FATAL_FAILURE(r.rearm(1));
+    const rc::Token c = r.commit(p);
+    ASSERT_TRUE(r.await(c));
+    EXPECT_NE(r.got[c].status, OpStatus::Ok) << "a poisoned transaction never commits";
+    EXPECT_EQ(r.got[c].status, OpStatus::DeliveryFailed);
+    EXPECT_EQ(r.got[c].errorCode, kAtRisk);
+    EXPECT_EQ(r.endTxns(1), 0);
+    const rc::Token a = r.abort(p);
+    ASSERT_TRUE(r.await(a));
+    EXPECT_EQ(r.got[a].status, OpStatus::Ok);
+    EXPECT_EQ(p.state(), TxnState::Ready);
+    p.beginTransaction();
+    r.settle();
+    ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
+    const rc::Token c2 = r.commit(p);
+    ASSERT_TRUE(r.await(c2));
+    EXPECT_EQ(r.got[c2].status, OpStatus::Ok);
+    int produced = 0;
+    for (const auto& pr : r.gw.produced) produced += pr.records;
+    EXPECT_EQ(produced, 1) << "exactly the one record of the second transaction was produced (the refused one never was)";
+}
+
 // I-7: a bind applied onto an already tripped lease must not re-enter the producer ring read (the old path ran failGuarded ->
 // failAllPending -> discardRing_ inside the drain's own controlledRead and left the ring head pointing at zeroed memory).
 TEST(ProducerTxnGuardRegression, BindOnTrippedLeaseKeepsRingAliveRegression) {
@@ -319,13 +358,11 @@ TEST(ProducerTxnGuardRegression, BindOnTrippedLeaseKeepsRingAliveRegression) {
     p.beginTransaction();
     const rc::Token s = ++r.tok;
     const rc::SendResult sr = p.trySend(r.data, rc::Key(uint64_t{1}), kVal, *r.pq, s);
-    ASSERT_TRUE(sr == rc::SendResult::Ok || sr == rc::SendResult::NotInTransaction) << static_cast<int>(sr);
+    ASSERT_EQ(sr, rc::SendResult::Ok) << "accepted at the call (the begin is still in the ring)";
     r.settle();
-    if (sr == rc::SendResult::Ok) {
-        ASSERT_TRUE(r.await(s));
-        r.expectFailedAtRisk(s, "send onto the tripped lease");
-        EXPECT_EQ(r.got.size(), 2u) << "completed once";
-    }
+    ASSERT_TRUE(r.await(s));
+    r.expectFailedAtRisk(s, "send onto the tripped lease");
+    EXPECT_EQ(r.completions[s], 1) << "completed exactly once";
     const rc::Token a = r.abort(p);
     ASSERT_TRUE(r.await(a)) << "the ring is alive: the abort is drained";
     EXPECT_EQ(r.got[a].status, OpStatus::Ok);

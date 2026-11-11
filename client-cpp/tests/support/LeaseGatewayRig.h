@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <stdexcept>
 #include <poll.h>
 #include <string_view>
 #include <thread>
@@ -115,7 +116,8 @@ void whilePumping(InvokerGateway& gw, Fn&& fn) {
 inline rune::client::LeaseTopic<LeaseRow> openLeaseTopic(rune::client::Client& client, InvokerGateway& gw) {
     std::optional<rune::client::LeaseTopic<LeaseRow>> h;
     whilePumping(gw, [&] { h.emplace(client.openLeaseTopicAndWait<LeaseRow>("lease_t", {})); });
-    EXPECT_TRUE(h.has_value());
+    // whilePumping returns early (fatal ASSERT) when its pipe() fails: h is then empty - fail the test instead of dereferencing it.
+    if (!h.has_value()) throw std::runtime_error("openLeaseTopic: the pumping helper did not run (pipe() failed?)");
     return std::move(*h);
 }
 
