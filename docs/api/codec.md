@@ -121,10 +121,15 @@ From a shell, `rune schema generate <topic> --out gen/ --broker host:port` fetch
 `gen/<topic>.gen.h` ([admin-cli.md](admin-cli.md#rune-schema)). `rune_codec_gen <descriptor.blob> <out.h>` does the same
 from a serialized descriptor file.
 
-The generated struct is named after the schema in PascalCase and has typed members (`std::array<char, N>` for
+The generated struct is named after the schema in PascalCase and has typed members (`rune::FixedString<N>` for
 `string(N)`, `std::string_view` for `string` and `bytes`), `encodedSize()`, `encode(uint8_t*)`, `decode(span)`, and
 `kBlockLength`, `kVersion`, `kFingerprint`, `kSchemaName`, `descriptor()`. A schema with a key field also gets `key()`,
 which `TypedTopic::send` routes by.
+
+`rune::FixedString<N>` is exactly the N wire bytes, zero padded: `rec.name = "Ayla"` is checked at compile time (a
+literal longer than N does not compile), and a runtime string goes through `rune::FixedString<N>(sv)`, which throws
+`std::invalid_argument` when it is longer than N (`tryAssign(sv)` is the `noexcept` form returning `false`). The generated
+`string(N)` setters on the flyweight `Encoder` and `ClaimEncoder` take `const rune::FixedString<N>&`, so they never truncate.
 
 `generateHeader(evolving, version)` takes the topic's evolving descriptor (what `rune schema generate` fetches), so
 the type reads records of **every** version by the record's own version: a Drop moves the fields after it, and each
@@ -152,7 +157,7 @@ rune::codec::FilterBytes b = f.encode();                    // throws std::inval
 ```
 
 - One `rune::Match<T>` member per filterable field: `Int32`, `Int64`, `UInt16`, `UInt32`, `UInt64`, `Enum`, `Bool`, and
-  `std::array<char, N>` for `string(N)` up to 16 (a string literal of at most N characters is zero-padded like the
+  `rune::FixedString<N>` for `string(N)` up to 16 (a string literal of at most N characters is zero-padded like the
   stored field). No member exists for `string`, `bytes` or `float64`; the comment above `Filter` names them.
 - A `Match` holds one value or `rune::anyOf(...)` (up to 64). Integral literals are accepted for integral fields and
   range-checked at encode time (an out-of-range value fails, it is never truncated); floats, strings and `bool` against

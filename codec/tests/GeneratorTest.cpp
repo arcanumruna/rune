@@ -31,7 +31,7 @@ TEST(GeneratorRegression, EmitsKeyAccessorForFixedStrKey) {
     auto d = DescriptorBuilder("codes").addFixedStr("code", 8, 1, true)
                .add("n", PrimType::Int32).build();
     const std::string hdr = generateHeader(d);
-    EXPECT_NE(hdr.find("[[nodiscard]] const std::array<char, 8>& key() const noexcept { return code; }"),
+    EXPECT_NE(hdr.find("[[nodiscard]] const ::rune::FixedString<8>& key() const noexcept { return code; }"),
               std::string::npos) << hdr;
 }
 
@@ -89,7 +89,7 @@ TEST(Generator, EmitsZeroCopyFlyweightsForAnAllFixedSchema) {
     EXPECT_NE(hdr.find("[[gnu::always_inline]] PositionEncoder zone(int32_t v) noexcept {"), std::string::npos);
     EXPECT_NE(hdr.find("::rune::codec::fly::store<int32_t>(p + 4u + 8u, v);"), std::string::npos)
         << "zone sits at block offset 8";
-    EXPECT_NE(hdr.find("[[gnu::always_inline]] PositionEncoder tag(std::string_view v) noexcept {"), std::string::npos);
+    EXPECT_NE(hdr.find("[[gnu::always_inline]] PositionEncoder tag(const ::rune::FixedString<8>& v) noexcept {"), std::string::npos);
     EXPECT_NE(hdr.find("#include <rune/codec/Flyweight.h>"), std::string::npos);
 }
 
@@ -154,7 +154,7 @@ TEST(Generator, EmitsAFilterMemberPerEligibleFieldInFieldOrder) {
     ASSERT_NE(s, std::string::npos) << h;
     std::size_t pos = s;
     for (const char* m : {"::rune::Match<uint64_t> playerId{};", "::rune::Match<uint32_t> worldId{};",
-                          "::rune::Match<int32_t> channel{};", "::rune::Match<std::array<char, 8>> zone{};",
+                          "::rune::Match<int32_t> channel{};", "::rune::Match<::rune::FixedString<8>> zone{};",
                           "::rune::Match<int32_t> kind{};", "::rune::Match<bool> alive{};", "::rune::Match<int64_t> hp{};"}) {
         pos = at(h, m, pos);
         ASSERT_NE(pos, std::string::npos) << m << "\n" << h;
@@ -249,4 +249,14 @@ TEST(GeneratorLeaseRegression, LeaseGenerationRefusesAForeignSchemaRegression) {
     auto withVar = DescriptorBuilder("lease_v").add("id", PrimType::Int64, 1, true).add("s", PrimType::String).build();
     ASSERT_TRUE(prependLeaseColumns(withVar));
     EXPECT_THROW((void)generateHeader(withVar, withVar.version, "rune::gen", true), std::invalid_argument) << "a variable-length field";
+}
+
+TEST(GeneratorRegression, FixedStrIsFixedStringAndSettersNeverTruncateRegression) {
+    auto d = DescriptorBuilder("codes").addFixedStr("code", 8, 1, true)
+               .add("n", PrimType::Int32).build();
+    const std::string hdr = generateHeader(d);
+    EXPECT_NE(hdr.find("#include <rune/codec/FixedString.h>"), std::string::npos) << hdr;
+    EXPECT_EQ(hdr.find("std::array<char,"), std::string::npos) << hdr;
+    EXPECT_NE(hdr.find("(const ::rune::FixedString<8>& v) noexcept"), std::string::npos) << hdr;
+    EXPECT_EQ(hdr.find("storeFixedStr"), std::string::npos) << hdr;
 }

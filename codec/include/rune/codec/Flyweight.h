@@ -54,7 +54,7 @@ inline void storeFixedStr(uint8_t* p, std::string_view s, std::size_t n) noexcep
 }
 
 /// A string(N) field's N raw bytes, zero padding included — exactly the bytes
-/// the generated struct's decode() copies into its std::array<char, N>.
+/// the generated struct's decode() copies into its rune::FixedString<N>.
 [[nodiscard]] inline std::string_view loadFixedStr(const uint8_t* p, std::size_t n) noexcept {
     return {reinterpret_cast<const char*>(p), n};
 }

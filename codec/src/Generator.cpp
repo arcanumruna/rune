@@ -48,8 +48,8 @@ static std::string_view cppType(PrimType t) noexcept {
         case PrimType::String:  return "std::string_view";
         case PrimType::Bytes:   return "std::string_view";
         // string(N) has no width-free spelling: every emitter spells it
-        // std::array<char, fixedLen> itself and never asks cppType for it.
-        case PrimType::FixedStr: return "/* string(N): emitted as std::array<char, N> */";
+        // rune::FixedString<fixedLen> itself and never asks cppType for it.
+        case PrimType::FixedStr: return "/* string(N): emitted as rune::FixedString<N> */";
     }
     return "/* unknown */";
 }
@@ -94,9 +94,9 @@ static std::string_view flyType(PrimType t) noexcept {
     }
 }
 
-/// The generated struct's member type for a field (string(N): std::array<char, N>).
+/// The generated struct's member type for a field (string(N): rune::FixedString<N>).
 static std::string memberType(const FieldDescriptor& f) {
-    if (f.type == PrimType::FixedStr) return "std::array<char, " + std::to_string(f.fixedLen) + ">";
+    if (f.type == PrimType::FixedStr) return "::rune::FixedString<" + std::to_string(f.fixedLen) + ">";
     return std::string(cppType(f.type));
 }
 
@@ -138,10 +138,10 @@ static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::s
     for (const auto& f : d.fields) {
         if (noSetter(f, isLease)) continue;
         if (f.type == PrimType::FixedStr) {
-            o << "    [[gnu::always_inline]] " << cls << " " << f.name << "(std::string_view v) noexcept {\n"
+            o << "    [[gnu::always_inline]] " << cls << " " << f.name << "(const ::rune::FixedString<" << f.fixedLen
+              << ">& v) noexcept {\n"
               << "        uint8_t* const p = p_;\n"
-              << "        ::rune::codec::fly::storeFixedStr(p + 4u + " << f.offset << "u, v, "
-              << f.fixedLen << "u);\n"
+              << "        std::memcpy(p + 4u + " << f.offset << "u, v.data(), " << f.fixedLen << "u);\n"
               << "        return " << cls << "(p, Rebind_{});\n"
               << "    }\n";
         } else {
@@ -216,8 +216,9 @@ static void emitClaimEncoder(std::ostringstream& o, const Descriptor& d, const s
     for (const auto& f : d.fields) {
         if (k != nullptr && f.name == k->name) continue;
         if (noSetter(f, isLease)) continue;
-        const std::string arg = f.type == PrimType::FixedStr ? std::string("std::string_view")
-                                                             : std::string(cppType(f.type));
+        const std::string arg = f.type == PrimType::FixedStr
+            ? "const ::rune::FixedString<" + std::to_string(f.fixedLen) + ">&"
+            : std::string(cppType(f.type));
         o << "    [[gnu::always_inline]] " << cls << " " << f.name << "(" << arg << " v) noexcept {\n"
           << "        return " << cls << "(" << base << "::" << f.name << "(v));\n"
           << "    }\n";
@@ -355,7 +356,7 @@ static void emitFilter(std::ostringstream& o, const Descriptor& d) {
     o << "    struct Filter {\n";
     for (const auto* f : live) {
         if (f->type == PrimType::FixedStr)
-            o << "        ::rune::Match<std::array<char, " << f->fixedLen << ">> " << f->name << "{};\n";
+            o << "        ::rune::Match<::rune::FixedString<" << f->fixedLen << ">> " << f->name << "{};\n";
         else
             o << "        ::rune::Match<" << cppType(f->type) << "> " << f->name << "{};\n";
     }
@@ -665,6 +666,7 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
     o << "#include <vector>\n";
     o << "#include <rune/codec/Descriptor.h>\n";
     o << "#include <rune/codec/Filter.h>\n";
+    o << "#include <rune/codec/FixedString.h>\n";
     o << "#include <rune/codec/Fingerprint.h>\n";
     o << "#include <rune/codec/Flyweight.h>\n";
     o << "#include <rune/codec/Lineage.h>\n";
@@ -709,7 +711,7 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
     for (const auto& f : d.fields) {
         if (!isVarLen(f.type)) {
             if (f.type == PrimType::FixedStr)
-                o << "    std::array<char, " << f.fixedLen << "> " << f.name << " = {};\n";
+                o << "    ::rune::FixedString<" << f.fixedLen << "> " << f.name << " = {};\n";
             else
                 o << "    " << cppType(f.type) << " " << f.name << " = {};\n";
         }
@@ -729,7 +731,7 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
     // TypedTopic::send(rec) routes like Producer::send(h, Key(rec.key()), ...):
     //   scalar      -> by value  (Key(int64_t)/Key(uint64_t) = 8 LE bytes;
     //                             other scalars = their raw bytes)
-    //   string(N)   -> const std::array<char, N>&  (its N raw bytes)
+    //   string(N)   -> const ::rune::FixedString<N>&  (its N raw bytes)
     //   string/bytes-> std::span<const uint8_t> over the CONTENT — never a
     //                  std::string_view: that is trivially copyable, so Key
     //                  would hash the view object (pointer + length) instead.
@@ -760,7 +762,7 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
                   << kf->name << ".size()};\n";
                 o << "    }\n\n";
             } else if (kf->type == PrimType::FixedStr) {
-                o << "    [[nodiscard]] const std::array<char, " << kf->fixedLen
+                o << "    [[nodiscard]] const ::rune::FixedString<" << kf->fixedLen
                   << ">& key() const noexcept { return " << kf->name << "; }\n\n";
             } else {
                 o << "    [[nodiscard]] " << cppType(kf->type)

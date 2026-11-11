@@ -123,7 +123,7 @@ TEST(FilterPredicate, NegativeInt32EqualsItsStoredBytes) {
 }
 
 TEST(FilterPredicateRegression, ShortFixedStrLiteralMatchesTheZeroPaddedFieldRegression) {
-    FB a; a.w.term(3, PrimType::FixedStr, 8, Match<std::array<char, 8>>("eu"));
+    FB a; a.w.term(3, PrimType::FixedStr, 8, Match<rune::FixedString<8>>("eu"));
     const auto f = compileOk(a.done());
     EXPECT_EQ(ev(f, encodeRecord(pe(), 1, {.zone = "eu"})), FilterVerdict::Match);
     EXPECT_EQ(ev(f, encodeRecord(pe(), 3, {.zone = "eu"})), FilterVerdict::Match);

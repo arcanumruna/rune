@@ -306,7 +306,7 @@ TEST(TypedClaim, StringKeyClaimMatchesSendForShortKeys) {
                                      "ab",     std::string_view("ab\0\0", 4), "zzzzzzz", "k1"};
     for (const auto k : keys) {
         ShortKey rec;
-        rec.code.fill('\0');
+        rec.code = {};
         if (!k.empty()) std::memcpy(rec.code.data(), k.data(), k.size());
         rec.v = 77;
         topic.send(rec);
@@ -513,4 +513,23 @@ TEST(TypedClaimRegression, HeldInvokerClaimRefusesASecondTypedClaimWithClaimHeld
     ASSERT_EQ(cap.recs.size(), 2u) << "the refused claims left nothing";
     EXPECT_EQ(PositionDecoder(span(cap.recs[0].value)).zone(), 11);
     EXPECT_EQ(PositionDecoder(span(cap.recs[1].value)).zone(), 33);
+}
+
+// #1010 (D6): a generated string(N) setter takes const rune::FixedString<N>&: a literal is checked at compile time
+// (never truncated), a runtime string goes through the explicit, throwing FixedString constructor.
+template <class E, class A>
+concept CanSetTag = requires(E e, A a) { e.tag(a); };
+
+TEST(TypedClaimRegression, FixedStringSetterNeverTruncatesRegression) {
+    using Enc = rune::gen::PositionEncoder;         // string(8) `tag`
+    using Claim = rune::gen::PositionClaimEncoder;  // the claim-forwarding setter too
+    static_assert(CanSetTag<Enc, rune::FixedString<8>>);
+    static_assert(CanSetTag<Enc, const char (&)[9]>);
+    static_assert(!CanSetTag<Enc, const char (&)[10]>, "an over-long literal is a compile error");
+    static_assert(!CanSetTag<Enc, std::string_view>, "no silently truncating string_view setter");
+    static_assert(CanSetTag<Claim, rune::FixedString<8>>);
+    static_assert(!CanSetTag<Claim, const char (&)[10]>);
+    static_assert(!CanSetTag<Claim, std::string_view>);
+    EXPECT_THROW((void)rune::FixedString<8>(std::string(9, 'x')), std::invalid_argument);
+    EXPECT_NO_THROW((void)rune::FixedString<8>(std::string(8, 'x')));
 }
