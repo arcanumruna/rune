@@ -894,8 +894,8 @@ TEST(ClientShardRegression, RebuildFailureBacksOffWithoutSpinningRegression) {
     ASSERT_TRUE(r.drive([&] { return r.shard->client().testTransportRebuilds() == 1 && r.state() == rs::ShardState::Live; }, 10'000'000));
 }
 
-// A failed attempt that itself takes longer than the gap (a slow DNS lookup) must not eat the gap: it runs from the end of
-// the attempt.  Every duty pass advances the fake clock by 1 s, so the pass that ran an attempt "took" 1 s, longer than any
+// A failed attempt that itself takes longer than the gap (a slow DNS lookup) must not eat the gap: it runs from the first
+// duty pass after the attempt.  Every duty pass advances the fake clock by 1 s, so the pass that ran an attempt "took" 1 s, longer than any
 // gap below the 10 s cap; attempts must still be at most every second pass.
 TEST(ClientShardRegression, RebuildGapStartsAfterASlowFailedAttemptRegression) {
     auto g = ownDriverGroup(3818, 3819);
@@ -903,17 +903,11 @@ TEST(ClientShardRegression, RebuildGapStartsAfterASlowFailedAttemptRegression) {
     r.connect();
     r.shard->client().testSetSeedIngressChannel(kUnreachableSeed);
     r.shard->client().testInjectTransportFault();
-    const auto pass = [&] {
-        g_now += 1'000'000'000;
-        r.shard->doWork();
-        r.gw().pump();
-        r.shard->pollEvents([&](const rs::ShardStatus& st) { r.events.push_back(st); });
-    };
-    for (int i = 0; i < 100 && r.shard->client().testRebuildAttempt() == 0; ++i) pass();
+    for (int i = 0; i < 100 && r.shard->client().testRebuildAttempt() == 0; ++i) r.step(1'000'000'000);
     ASSERT_GE(r.shard->client().testRebuildAttempt(), 1u);
     const uint32_t first = r.shard->client().testRebuildAttempt();
-    for (int i = 0; i < 6; ++i) pass();
-    EXPECT_LE(r.shard->client().testRebuildAttempt() - first, 3u) << "a 1 s attempt does not consume the gap that follows it";
+    for (int i = 0; i < 6; ++i) r.step(1'000'000'000);
+    EXPECT_EQ(r.shard->client().testRebuildAttempt() - first, 3u) << "a 1 s attempt does not consume the gap that follows it";
 }
 
 // The seed moved to another broker channel (a completed failover): the rebuild keeps it there, and the resume goes to

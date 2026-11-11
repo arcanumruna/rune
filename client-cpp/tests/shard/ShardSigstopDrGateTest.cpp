@@ -32,6 +32,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <sys/select.h>
 #include <sys/wait.h>
 #include <thread>
@@ -45,11 +46,16 @@ using namespace std::chrono_literals;
 namespace {
 
 constexpr const char* kGateway = "aeron:udp?endpoint=127.0.0.1:24890";
-constexpr const char* kEgress  = "aeron:udp?endpoint=127.0.0.1:24900";
-constexpr int         kEgressPort = 24900;
-constexpr int         kShards     = 2;  // shard i binds kEgressPort + i
+constexpr const char* kEgress  = "aeron:udp?endpoint=127.0.0.1:24900";   // shard i binds this port + i
+constexpr int         kShards  = 2;
 constexpr int32_t     kCtl     = 3950;
 constexpr int32_t     kEg      = 3951;
+
+constexpr int portOf(std::string_view channel) {
+    int p = 0;
+    for (const char c : channel.substr(channel.rfind(':') + 1)) p = p * 10 + (c - '0');
+    return p;
+}
 
 void writeLine(int fd, const std::string& s) {
     const std::string l = s + "\n";
@@ -124,11 +130,10 @@ struct ChildLedger {
 
 constexpr const char* kPlainGateway = "aeron:udp?endpoint=127.0.0.1:24891";
 constexpr const char* kPlainEgress  = "aeron:udp?endpoint=127.0.0.1:24910";
-constexpr int         kPlainEgressPort = 24910;
-// ctest runs both gates at once: the plain egress must stay off the shard gate's egress ports.
-static_assert(kPlainEgressPort < kEgressPort || kPlainEgressPort >= kEgressPort + kShards);
 constexpr int32_t     kPlainCtl     = 3952;
 constexpr int32_t     kPlainEg      = 3953;
+// ctest runs both gates at once: the plain egress must stay off the shard gate's egress ports.
+static_assert(portOf(kPlainEgress) < portOf(kEgress) || portOf(kPlainEgress) >= portOf(kEgress) + kShards);
 
 // A plain Client with the default config (10 s Aeron liveness) under steady load; 'q' closes it and reports the ledger.
 [[noreturn]] void plainChildMain(int out, int in, const std::string& dir) {

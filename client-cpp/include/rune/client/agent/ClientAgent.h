@@ -1384,9 +1384,10 @@ private:
     /// Rejected, T15b: no I/O for good).  IoUp carries the rebuild pacing across outages (storm control): a rebuild sets
     /// `armed` and the seed's connectEpoch; until the seed's next Connected edge a new outage waits `gapNs` before its
     /// first rebuild and each further rebuild doubles it, so a client that keeps closing never restarts the driver back
-    /// to back.  The edge resets it.
+    /// to back.  The edge resets it.  IoTransportDown::waitNs is the gap a failed attempt left; the next pass turns it into
+    /// notBeforeNs, so a slow attempt does not eat its own gap.
     struct IoUp            { int64_t gapNs; uint64_t epoch; bool armed; };
-    struct IoTransportDown { uint32_t attempt; int64_t notBeforeNs; int64_t gapNs; int64_t waitNs; };   // waitNs: the gap a failed attempt left, turned into notBeforeNs on the next pass
+    struct IoTransportDown { uint32_t attempt; int64_t notBeforeNs; int64_t gapNs; int64_t waitNs; };
     struct IoFailed        {};
     static constexpr int64_t kRebuildMinGapNs = 100'000'000;     // the seed failover's pacing: 100 ms doubling to 10 s
     static constexpr int64_t kRebuildMaxGapNs = 10'000'000'000;

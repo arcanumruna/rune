@@ -463,7 +463,7 @@ void ClientAgent::enterTransportDown_(int64_t nowNs) noexcept {
 
 int ClientAgent::driveRebuild_(int64_t nowNs) noexcept {
     IoTransportDown& d = std::get<IoTransportDown>(io_);
-    if (d.waitNs != 0) {   // the gap runs from the end of the failed attempt, not from its start
+    if (d.waitNs != 0) {   // the gap runs from the first pass after the failed attempt, not from its start
         d.notBeforeNs = nowNs + d.waitNs;
         d.waitNs      = 0;
     }
