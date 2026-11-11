@@ -52,7 +52,7 @@ void SubscriberHub::clearDirty_(SubscriptionImpl& impl) noexcept
 void SubscriberHub::publishStatus_(SubscriptionImpl& impl)
 {
     if (impl.status.tryPublish(
-            SubscriptionStatus{impl.subscriptionId, impl.nextOffset, SubscriptionFailReason::None, 0, impl.dataResets, impl.batchBytes, impl.paused})) {
+            SubscriptionStatus{impl.subscriptionId, impl.nextOffset, SubscriptionFailReason::None, 0, impl.dataResets, impl.batchBytes, impl.paused, impl.dutyPauseSeq, impl.paused})) {
         clearDirty_(impl);
     } else if (!impl.status.closed()) {
         markDirty_(impl);
@@ -65,7 +65,7 @@ int SubscriberHub::republishDirty()
     for (SubscriptionImpl* p = dirtyHead_; p != nullptr; ) {
         SubscriptionImpl* next = p->nextDirty;
         if (p->status.tryPublish(
-                SubscriptionStatus{p->subscriptionId, p->nextOffset, SubscriptionFailReason::None, 0, p->dataResets, p->batchBytes, p->paused})) {
+                SubscriptionStatus{p->subscriptionId, p->nextOffset, SubscriptionFailReason::None, 0, p->dataResets, p->batchBytes, p->paused, p->dutyPauseSeq, p->paused})) {
             clearDirty_(*p);
             ++published;
         } else if (p->status.closed()) {
@@ -180,8 +180,10 @@ void SubscriberHub::applyCommand(const detail::HubCommand& cmd,
         // Identified by the impl address; dereferenced only when this hub owns it.
         SubscriptionImpl* impl = reinterpret_cast<SubscriptionImpl*>(cmd.handle);
         if (impl == nullptr || !owns_(impl)) break;
-        if (cmd.op == detail::HubCommand::Op::SubscribePause) pause_(*impl, cmd.a, unsubCorrId, sessionId, submitFn);
-        else                                                  resume_(*impl, unsubCorrId, sessionId, nowNs, submitFn);
+        // cmd.b != 0: the handle's own duty-thread (in-handler) call; the app thread's view must learn of the transition.
+        const bool direct = cmd.b != 0;
+        if (cmd.op == detail::HubCommand::Op::SubscribePause) pause_(*impl, cmd.a, unsubCorrId, sessionId, submitFn, direct);
+        else                                                  resume_(*impl, unsubCorrId, sessionId, nowNs, submitFn, direct);
         break;
     }
     default:
@@ -463,7 +465,7 @@ bool SubscriberHub::unsubscribePaused_(SubscriptionImpl* impl)
 }
 
 void SubscriberHub::pause_(SubscriptionImpl& impl, int64_t resumeAt, int64_t unsubCorrId, int64_t sessionId,
-                           const SendFn& submitFn)
+                           const SendFn& submitFn, bool direct)
 {
     if (!impl.active) return;
     // The handle refuses a position above the bound; a command that raced a rewind is treated as "no offset".
@@ -480,6 +482,7 @@ void SubscriberHub::pause_(SubscriptionImpl& impl, int64_t resumeAt, int64_t uns
         return;
     }
     impl.paused            = true;
+    if (direct) ++impl.dutyPauseSeq;   // once per transition: the app handle adopts it from the status snapshot published below
     impl.pausedOnce        = true;
     impl.pauseAfterCurrent = resumeAt < 0 && &impl == dispatching_;   // the record being handled counts as delivered
 
@@ -507,7 +510,7 @@ void SubscriberHub::pause_(SubscriptionImpl& impl, int64_t resumeAt, int64_t uns
 }
 
 void SubscriberHub::resume_(SubscriptionImpl& impl, int64_t newCorrId, int64_t sessionId, int64_t nowNs,
-                            const SendFn& submitFn)
+                            const SendFn& submitFn, bool direct)
 {
     if (!impl.active || !impl.paused || newCorrId == 0) return;
     // An Unsubscribe the transport refused at the pause: one last attempt (the session must still be the one it names).
@@ -574,6 +577,7 @@ void SubscriberHub::resume_(SubscriptionImpl& impl, int64_t newCorrId, int64_t s
     req.unsent      = false;
     req.nlRetries   = 0;
     req.notBeforeNs = 0;
+    if (direct) ++impl.dutyPauseSeq;
     publishStatus_(impl);
     if (impl.moved && routed_()) routeMovedPending_(it, sessionId);   // follows its partition's leader, as a moved one does
     else                         sendNewPending_(it, submitFn);

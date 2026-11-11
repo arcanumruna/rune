@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -24,6 +25,7 @@
 #include <optional>
 #include <random>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace rc  = rune::client;
@@ -147,6 +149,46 @@ struct Rig {
     ~Rig() {
         // The test owns the impl memory: a handle built on a bare hub never frees it.
         sub.reset();
+    }
+};
+
+/// A persistent "application thread": run(f) executes f on it and returns when f is done (a capped handshake; no
+/// allocation per call).  The hub is driven by the test thread (the duty thread of the Rig's handle); the calls f makes on
+/// the handle take the APP path.  The calls never overlap the test thread's own, so the hub is never used concurrently.
+struct AppThread {
+    std::atomic<int>   st{0};   // 0 idle, 1 work posted, 2 work done
+    void             (*fn)(void*) = nullptr;
+    void*              ctx = nullptr;
+    std::atomic<bool>  quit{false};
+    std::thread        th;
+    AppThread() {
+        th = std::thread([this] {
+            while (!quit.load(std::memory_order_acquire)) {
+                if (st.load(std::memory_order_acquire) == 1) {
+                    fn(ctx);
+                    st.store(2, std::memory_order_release);
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+        });
+    }
+    ~AppThread() {
+        quit.store(true, std::memory_order_release);
+        th.join();
+    }
+    template <class F>
+    void run(F&& f) {
+        fn  = [](void* c) { (*static_cast<std::remove_reference_t<F>*>(c))(); };
+        ctx = &f;
+        st.store(1, std::memory_order_release);
+        bool done = false;
+        for (long spin = 0; spin < 200'000'000L && !done; ++spin) {
+            done = st.load(std::memory_order_acquire) == 2;
+            if (!done) std::this_thread::yield();
+        }
+        EXPECT_TRUE(done) << "the application thread never finished";
+        st.store(0, std::memory_order_release);
     }
 };
 
@@ -779,4 +821,183 @@ TEST(SubscriberPauseRegression, PauseCommandAboveBoundIsClampedRegression) {
     r.hub.applyCommand(cmd, ++r.nextCorr, r.sid, r.noSend, r.nowNs);
     EXPECT_EQ(r.impl->nextOffset, 10) << "clamped: the position did not jump";
     EXPECT_TRUE(r.impl->paused);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// A pause made INSIDE the handler (duty thread) is visible to the application thread, which can resume it.
+// The test thread is the duty thread; the AppThread's calls on the same handle take the app path.
+// ---------------------------------------------------------------------------------------------------------
+
+TEST(SubscriberPauseRegression, HandlerPauseVisibleToAppThreadRegression) {
+    Rig r;
+    AppThread app;
+    r.open(11);
+    r.bind(40);
+    bool paused = false;
+    r.hook = [&](const rc::Record& rec) {
+        if (rec.offset == 4 && !paused) { paused = true; EXPECT_TRUE(r.sub->pause(rec.offset)); }
+    };
+    r.push(40, 0, 10);
+    ASSERT_EQ(r.got, (std::vector<int64_t>{0, 1, 2, 3, 4}));
+    bool pausedSeen = false, activeSeen = true, resumed = false, pausedAfter = true;
+    app.run([&] {
+        pausedSeen = r.sub->paused();
+        activeSeen = r.sub->active();
+        resumed    = r.sub->resume();
+        pausedAfter = r.sub->paused();
+    });
+    EXPECT_TRUE(pausedSeen) << "the app thread sees the pause the handler made";
+    EXPECT_FALSE(activeSeen);
+    EXPECT_TRUE(resumed);
+    EXPECT_FALSE(pausedAfter);
+    EXPECT_EQ(r.tx.lastSubFrom, 4) << "the client sent a Subscribe at 4";
+    r.got.clear();
+    r.bindLast(41);
+    r.push(41, 0, 10);
+    EXPECT_EQ(r.got, (std::vector<int64_t>{4, 5, 6, 7, 8, 9})) << "4..9 once each";
+    EXPECT_FALSE(r.sub->paused());
+}
+
+TEST(SubscriberPauseRegression, HandlerPauseAppResumeCyclesRegression) {
+    constexpr int kCycles = 50;
+    Rig r;
+    AppThread app;
+    r.open(11);
+    r.bind(40);
+    int64_t refuse = -1;
+    r.hook = [&](const rc::Record& rec) {
+        if (rec.offset == refuse) { refuse = -1; EXPECT_TRUE(r.sub->pause(rec.offset)); }
+    };
+    std::vector<int64_t> expect;
+    int64_t id = 40;
+    for (int k = 0; k < kCycles; ++k) {
+        const int64_t b = 3 * k;
+        refuse = b + 1;
+        r.push(id, b, 3);   // b, then b+1 refused
+        expect.insert(expect.end(), {b, b + 1});
+        bool first = false, second = true;
+        app.run([&] {
+            first  = r.sub->resume();
+            second = r.sub->resume();
+        });
+        ASSERT_TRUE(first) << "cycle " << k;
+        ASSERT_FALSE(second) << "cycle " << k << ": a second resume right after finds it not paused";
+        ASSERT_EQ(r.tx.lastSubFrom, b + 1) << "cycle " << k;
+        r.bindLast(++id);
+        r.push(id, b + 1, 2);   // b+1 (accepted now), b+2
+        expect.insert(expect.end(), {b + 1, b + 2});
+    }
+    EXPECT_EQ(r.got, expect) << "each offset delivered once, the refused one handed over again after the resume";
+    EXPECT_EQ(r.sub->position(), 3 * kCycles);
+    EXPECT_FALSE(r.sub->paused());
+}
+
+TEST(SubscriberPauseRegression, HandlerResumeClearsAppViewRegression) {
+    Rig r;
+    AppThread app;
+    r.open(11);
+    r.bind(40);
+    r.push(40, 0, 5);
+    bool paused = false;
+    app.run([&] { paused = r.sub->pause(); });   // the app pauses
+    ASSERT_TRUE(paused);
+    ASSERT_TRUE(r.sub->paused());
+    EXPECT_TRUE(r.sub->resume()) << "the duty thread resumes it (as a callback of another subscription would)";
+    bool pausedSeen = true, resumedAgain = true;
+    app.run([&] {
+        pausedSeen   = r.sub->paused();
+        resumedAgain = r.sub->resume();
+    });
+    EXPECT_FALSE(pausedSeen) << "the app thread learns of the duty-thread resume";
+    EXPECT_FALSE(resumedAgain);
+    r.got.clear();
+    r.bindLast(41);
+    r.push(41, 5, 3);
+    EXPECT_EQ(r.got, (std::vector<int64_t>{5, 6, 7}));
+}
+
+TEST(SubscriberPauseRegression, AppPauseThenAppResumeBackToBackRegression) {
+    Rig r;
+    AppThread app;
+    r.open(11);
+    r.bind(40);
+    bool hp = false;
+    r.hook = [&](const rc::Record& rec) {
+        if (rec.offset == 2 && !hp) { hp = true; EXPECT_TRUE(r.sub->pause(rec.offset)); }   // an earlier handler pause (seq 1)
+    };
+    r.push(40, 0, 5);
+    app.run([&] { EXPECT_TRUE(r.sub->resume()); });
+    r.bindLast(41);
+    r.push(41, 2, 3);   // 2 (accepted), 3, 4
+    ASSERT_EQ(r.sub->position(), 5);
+    bool p = false, rs = false, pausedAfter = true;
+    app.run([&] {   // before any duty cycle runs
+        p  = r.sub->pause();
+        rs = r.sub->resume();
+        pausedAfter = r.sub->paused();
+    });
+    EXPECT_TRUE(p);
+    EXPECT_TRUE(rs);
+    EXPECT_FALSE(pausedAfter) << "the app's own intent wins: no stale paused()";
+    EXPECT_EQ(r.tx.lastSubFrom, 5);
+    r.got.clear();
+    r.bindLast(42);
+    r.push(42, 5, 3);
+    EXPECT_EQ(r.got, (std::vector<int64_t>{5, 6, 7}));
+    bool pausedLater = true;
+    app.run([&] { pausedLater = r.sub->paused(); });
+    EXPECT_FALSE(pausedLater);
+}
+
+TEST(SubscriberPauseRegression, HandlerPauseAppResumeNoAllocRegression) {
+    constexpr int kCycles = 101;   // 1 warm-up + 100
+    Rig r;
+    AppThread app;
+    r.tx.store = false;
+    r.open(11);
+    r.bind(40);
+    r.got.reserve(1 << 12);
+    std::vector<std::vector<uint8_t>> whole(kCycles), rest(kCycles);   // built before the window
+    for (int k = 0; k < kCycles; ++k) {
+        rune::protocol::RecordBatchBuilder b(3 * k, 1'000'000);
+        for (int i = 0; i < 3; ++i) b.append("k", "v", 1'000'000 + i);
+        whole[k] = b.build();
+        rune::protocol::RecordBatchBuilder c(3 * k + 1, 1'000'000);
+        for (int i = 0; i < 2; ++i) c.append("k", "v", 1'000'000 + i);
+        rest[k] = c.build();
+    }
+    int64_t refuse = -1;
+    r.hook = [&](const rc::Record& rec) {
+        if (rec.offset == refuse) { refuse = -1; (void)r.sub->pause(rec.offset); }
+    };
+    int64_t id = 40;
+    bool resumed = false;
+    auto resumeOnApp = [&] { resumed = r.sub->resume(); };
+    auto feed = [&](const std::vector<uint8_t>& frame, int64_t base, int32_t count, int64_t subId) {
+        rc::codec::RecordsView rv;
+        rv.subscriptionId = subId;
+        rv.topicId        = kTopic;
+        rv.partition      = kPart;
+        rv.baseOffset     = base;
+        rv.recordBatch    = std::span<const uint8_t>(frame);
+        rv.recordCount    = count;
+        r.hub.onRecords(rv);
+    };
+    auto cycle = [&](int k) {
+        refuse = 3 * k + 1;
+        feed(whole[k], 3 * k, 3, id);
+        resumed = false;
+        app.run(resumeOnApp);
+        EXPECT_TRUE(resumed);
+        r.bindLast(++id);
+        feed(rest[k], 3 * k + 1, 2, id);
+    };
+    cycle(0);   // warm-up: the first cycle may allocate (parked nodes)
+    ASSERT_EQ(r.sub->position(), 3);
+    alloc_counter::start();
+    for (int k = 1; k < kCycles; ++k) cycle(k);
+    const long allocs = alloc_counter::stop();
+    EXPECT_EQ(allocs, 0) << "handler-pause / app-resume cycles after the first allocate nothing";
+    EXPECT_EQ(r.sub->position(), 3 * kCycles);
+    EXPECT_FALSE(r.sub->paused());
 }

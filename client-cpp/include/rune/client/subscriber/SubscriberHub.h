@@ -588,8 +588,8 @@ private:
     void eraseActive_(int64_t id, const SubscriptionImpl& impl);
     /// `impl` is one this hub adopted (owned_), by address - never dereferenced before.
     [[nodiscard]] bool owns_(const SubscriptionImpl* impl) const noexcept;
-    void pause_(SubscriptionImpl& impl, int64_t resumeAt, int64_t unsubCorrId, int64_t sessionId, const SendFn& submitFn);
-    void resume_(SubscriptionImpl& impl, int64_t newCorrId, int64_t sessionId, int64_t nowNs, const SendFn& submitFn);
+    void pause_(SubscriptionImpl& impl, int64_t resumeAt, int64_t unsubCorrId, int64_t sessionId, const SendFn& submitFn, bool direct);
+    void resume_(SubscriptionImpl& impl, int64_t newCorrId, int64_t sessionId, int64_t nowNs, const SendFn& submitFn, bool direct);
     /// Unsubscribe of a PAUSED subscription: finished, nothing to send (the broker side was released at the pause).
     bool unsubscribePaused_(SubscriptionImpl* impl);
     void markUnsent_(SubscribeRequest& req) noexcept;

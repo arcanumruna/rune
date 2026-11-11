@@ -251,6 +251,8 @@ struct SubscriptionStatus {
     uint32_t dataResets      = 0;  // E2 round 6: times the partition's data was reset under it (see dataResets())
     uint64_t batchBytes      = 0;  // Phase 2c (FD13) / #428: sum of the sizes of the batches DELIVERED to the handler (malformed, duplicate and control batches do not count)
     bool     paused          = false;  // pause(): the broker side is released and the subscription is parked
+    uint32_t dutyPauseSeq    = 0;      // bumped by the duty thread on each pause / resume made inside a handler (the direct path)
+    bool     dutyPaused      = false;  // the paused state as of that bump (the app handle adopts it when the seq moved)
 };
 
 struct SubscriptionImpl;
@@ -374,6 +376,7 @@ struct SubscriptionImpl {
     // (a map node) and its old routing entry (a map node) are parked here, so a later cycle allocates nothing.
     bool    paused       = false;
     bool    pausedOnce   = false;  // the hub keeps (parks) the nodes instead of freeing them once a pause happened
+    uint32_t dutyPauseSeq = 0;          // duty-owned: counts pause / resume transitions made by the handle on the duty thread
     bool    pauseAfterCurrent = false;  // paused with no offset inside its own handler: the record being handled counts
     int64_t deliveringOffset  = -1;     // the offset of the record handed to the handler last (a pause may name it)
     int64_t subscribeTimeoutNs = 0;     // the relative subscribe timeout (a resume re-stamps the deadline)
@@ -540,10 +543,12 @@ public:
     /// handle's last snapshot of the status (see position()); the hub checks it again.
     bool pause(int64_t resumeAt = -1);
     /// Subscribes again at the stored position (exactly once per record: a batch the broker pushes from below the position
-    /// is trimmed).  Returns false when not paused.
+    /// is trimmed).  Returns false when not paused.  After a pause made INSIDE the handler the app thread learns of it from
+    /// the drained status (eventually, not at the same instant): resume() returns false until paused() reads true.
     bool resume();
     /// True between a successful pause() and resume() / the end of the subscription.  Freshness: this handle's own calls are
-    /// visible at once; on the duty thread it reads the duty-owned state.
+    /// visible at once; on the duty thread it reads the duty-owned state.  A pause made inside the handler becomes visible to
+    /// the app thread once its status snapshot is drained (eventually).
     [[nodiscard]] bool paused() const;
 
     /// Internal (LeaseWatch): a handle whose pause() / resume() always return false.  Handle-local, set before the handle is
@@ -564,7 +569,8 @@ private:
     std::thread::id                   dutyThread_{};
     bool                              unsubscribed_ = false;  // handle-local (app-owned)
     bool                              pausable_     = true;   // handle-local: false for a LeaseWatch's subscriptions
-    bool                              paused_       = false;  // handle-local (app thread): set by pause(), cleared by resume()
+    mutable bool                      paused_       = false;  // handle-local (app thread): set by pause(), cleared by resume(); adopts a duty-thread transition (seenDutyPauseSeq_)
+    mutable uint32_t                  seenDutyPauseSeq_ = 0;
     // App-owned cache of the latest status snapshot drained from impl_->status.
     mutable SubscriptionStatus        cache_{};
 };

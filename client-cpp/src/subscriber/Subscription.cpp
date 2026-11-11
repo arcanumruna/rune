@@ -76,6 +76,7 @@ Subscription::Subscription(Subscription&& other) noexcept
     , unsubscribed_(other.unsubscribed_)
     , pausable_(other.pausable_)
     , paused_(other.paused_)
+    , seenDutyPauseSeq_(other.seenDutyPauseSeq_)
     , cache_(other.cache_)
 {}
 
@@ -89,6 +90,7 @@ Subscription& Subscription::operator=(Subscription&& other) noexcept {
         unsubscribed_ = other.unsubscribed_;
         pausable_     = other.pausable_;
         paused_       = other.paused_;
+        seenDutyPauseSeq_ = other.seenDutyPauseSeq_;
         cache_        = other.cache_;
     }
     return *this;
@@ -134,7 +136,12 @@ void Subscription::unsubscribe() {
 // ---------------------------------------------------------------------------
 
 void Subscription::drainStatus_() const {
-    if (impl_) (void)impl_->status.drainLatest(cache_);
+    if (!impl_) return;
+    (void)impl_->status.drainLatest(cache_);
+    if (cache_.dutyPauseSeq != seenDutyPauseSeq_) {   // a pause / resume the handle made on the duty thread (inside a handler)
+        seenDutyPauseSeq_ = cache_.dutyPauseSeq;
+        paused_           = cache_.dutyPaused;
+    }
 }
 
 int64_t Subscription::position() const {
@@ -146,6 +153,7 @@ int64_t Subscription::position() const {
 bool Subscription::active() const {
     if (!impl_) return false;
     if (onDutyThread_()) return impl_->active && !impl_->paused;
+    drainStatus_();
     if (unsubscribed_ || paused_) return false;
     return !impl_->status.closed();
 }
@@ -153,6 +161,7 @@ bool Subscription::active() const {
 bool Subscription::paused() const {
     if (!impl_) return false;
     if (onDutyThread_()) return impl_->paused;
+    drainStatus_();
     return paused_ && !unsubscribed_ && !impl_->status.closed();
 }
 
@@ -167,6 +176,7 @@ bool Subscription::pause(int64_t resumeAt) {
     cmd.handle = reinterpret_cast<uint64_t>(impl_);   // identity only, as for unsubscribe()
     cmd.a      = resumeAt;
     if (onDutyThread_()) {
+        cmd.b = 1;   // the direct path: the hub bumps dutyPauseSeq on a transition
         // The duty thread owns the state: decide here, apply directly (the sink applies it on this thread).
         if (!impl_->active) return false;
         if (resumeAt >= 0 && resumeAt > impl_->pauseBound()) return false;
@@ -187,10 +197,12 @@ bool Subscription::resume() {
     cmd.op     = detail::HubCommand::Op::SubscribeResume;
     cmd.handle = reinterpret_cast<uint64_t>(impl_);
     if (onDutyThread_()) {
+        cmd.b = 1;
         if (!impl_->active || !impl_->paused) return false;
         (void)sink_(sinkCtx_, cmd);
         return true;
     }
+    drainStatus_();
     if (unsubscribed_ || !paused_ || impl_->status.closed()) return false;
     paused_ = false;
     (void)sink_(sinkCtx_, cmd);
