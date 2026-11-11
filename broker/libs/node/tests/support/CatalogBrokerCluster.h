@@ -19,6 +19,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
@@ -226,6 +227,9 @@ struct ThreeNodes {
         // OpenSSL loads its config once, on the first thread that needs it; a starter thread that does so exits with
         // its per-thread RCU record unfreed (LeakSanitizer, auth clusters), so load it here on the long-lived caller.
         OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG, nullptr);
+        // Likewise the starters' first log lazily builds spdlog's registry; spdlog is not TSan-instrumented, so a starter
+        // reading it after another built it is reported as a race. Build it here.
+        spdlog::default_logger_raw();
         std::vector<std::exception_ptr> failed(ids.size());
         std::vector<std::thread> starters;
         for (std::size_t i = 0; i < ids.size(); ++i)
