@@ -23,7 +23,9 @@
 // partition reaches Live); a DEFINITIVE answer (NotAuthorized, UnknownTopic, InvalidRequest, or the duty thread refusing the request as
 // malformed), or a full live set or a full name heap, FAILS the watch: every subscription is cancelled, failed() is true, one Failed
 // event is emitted, isReady() is false and doWork only drains and drops afterwards.  Failed ends only by closeAsync(), after which restart() runs
-// the watch again over the same table.  (Transient breaks above re-run as written.)  Ready is emitted once per run: again after each restart().
+// the watch again over the same table.  A capacity Failed (name heap or live set full) can repeat on every restart(): the entries of the old run
+// still hold their slots while the re-run adds the current ones, so the consumer must recreate the watch, or size waitersPerName / maxLive for
+// old plus new.  (Transient breaks above re-run as written.)  Ready is emitted once per run: again after each restart().
 // A lease recipe bound to a name ends whatever it holds on the Failed event (ClientErrorCode::LeaseWatchFailed).
 //
 // Memory.  Everything is allocated in the constructor (live set, name heaps, page bounds, handoff lists, record ring); doWork allocates

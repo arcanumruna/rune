@@ -139,13 +139,15 @@ void closeUpdateRestart(rc::Client& c, bool invoker) {
     const rc::LeaseResult gd = lt.grantAndWait(claimRow("rs-d", 4), o);
     ASSERT_TRUE(gd.ok());
     const auto until = std::chrono::steady_clock::now() + 30s;
-    for (bool seen = false; !seen && std::chrono::steady_clock::now() < until;) {
+    bool seen = false;
+    for (; !seen && std::chrono::steady_clock::now() < until;) {
         const auto a = lt.getAndWait(claimRow("rs-a"));
         const auto b = lt.getAndWait(claimRow("rs-b"));
         const auto d = lt.getAndWait(claimRow("rs-d"));
         seen = a.has_value() && a->a == 99 && !b.has_value() && d.has_value();
         if (!seen) std::this_thread::sleep_for(2ms);
     }
+    ASSERT_TRUE(seen) << "the lease view never showed the changes made while the watch was closed";
 
     ASSERT_EQ(w.restart(sp), rc::OpResult::Accepted);
     ASSERT_TRUE(drive(w, c, invoker, [&] { return log.readies == 2 && log.open.empty(); }));

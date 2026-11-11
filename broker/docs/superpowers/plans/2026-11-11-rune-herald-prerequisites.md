@@ -91,7 +91,7 @@ test; "—" means the combination cannot be reached.
 | record / scan answer arrives | — | applied | dropped | dropped | dropped |
 | destructor | returns at once | waits (as today) | waits (as today) | waits (as today) | returns at once |
 
-**Re-run events × timing (Task 3)**: first scan (no `RerunBegin`), re-run after a break, re-run after a data reset,
+**Re-run events × timing (Task 3)**: first, unbroken scan (no `RerunBegin`), re-run after a break, re-run after a data reset,
 re-run after `restart`, a second break during a re-run, watch failure during a re-run (`Failed`, no `RerunEnd`),
 `closeAsync` during a re-run (no further event) — each × {lease unchanged, updated while broken, ended while broken,
 re-granted at a new version while broken, granted while broken}.
@@ -264,7 +264,7 @@ Every partition starts as a re-run, so `scanDone_` ends each lease the new scan 
 
 - Rules the implementer must hold:
   - `Confirmed` is emitted only on the change unconfirmed → confirmed, so a retried scan page never repeats it, and a
-    first scan (where a subscription record may already have granted the lease) never emits it.
+    first, unbroken scan (where a subscription record may already have granted the lease) never emits it.
   - One open bracket per partition: `Part` gets a field `rerunOpen`. `startRerun_` emits `RerunBegin` only when it is
     false, then sets it. `scanDone_` emits `RerunEnd` and clears it when the partition goes `Live` (not when it goes
     `Resubscribing`; then the end comes when the resubscribed partition is `Live`). A partition that breaks again

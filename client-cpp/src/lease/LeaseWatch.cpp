@@ -357,7 +357,7 @@ int LeaseWatchBase::drainRing_() {
 }
 
 void LeaseWatchBase::onRingItem_(const Completion& c, std::span<const uint8_t> payload) {
-    if (life_ != Life::Running) return;
+    if (life_ != Life::Running) return;   // redundant with curGen == 0 below once the watch stopped (every subscription is gone); kept as the stated rule
     const uint32_t p = c.reserved0 & 0xFFFFu;
     const auto gen = static_cast<uint32_t>(c.token >> 8);
     if (p >= static_cast<uint32_t>(nParts_)) return;
@@ -807,7 +807,7 @@ void LeaseWatchBase::grant_(int32_t p, int64_t offset, std::span<const uint8_t> 
         LiveEntry& e = live_[old];
         if (e.version == version) {   // the same lease: already held
             // A re-run's scan row confirms an entry the re-run had not confirmed yet (once: a retried page finds it confirmed).  Only while the
-            // partition's bracket is open: a first scan never emits Confirmed.
+            // partition's bracket is open: a first, unbroken scan never emits Confirmed.
             if (fromScan && !e.confirmed && parts_[static_cast<std::size_t>(p)].rerunOpen) {
                 e.confirmed = true;
                 emit_(LeaseEventKind::Confirmed, p, offset, key, version, bytes, true);
