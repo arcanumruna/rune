@@ -272,7 +272,37 @@ void LeaseWatchBase::fail_() {
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 OpResult LeaseWatchBase::startFromNow(std::span<const std::span<const uint8_t>> prefixes) {
-    if (life_ != Life::Fresh || core_.closed() || core_.viewRowLen() == 0) return OpResult::InvalidArgument;
+    if (life_ != Life::Fresh) return OpResult::InvalidArgument;
+    if (const OpResult r = setPrefixes_(prefixes); r != OpResult::Accepted) return r;
+    life_ = Life::Running;
+    for (Part& pt : parts_) pt.st = Scanning{};
+    return OpResult::Accepted;
+}
+
+OpResult LeaseWatchBase::restart(std::span<const std::span<const uint8_t>> prefixes) {
+    if (life_ != Life::Closed) return OpResult::InvalidArgument;   // what startFromNow answers on a second call
+    if (const OpResult r = setPrefixes_(prefixes); r != OpResult::Accepted) return r;
+    // Closed: no subscription is held and no scan is outstanding.  The live table, names, handlers and every buffer are kept; every partition
+    // starts as a re-run, so the scan ends each lease it does not confirm with Vanished.  nextGen / scanSeq keep growing: earlier answers stay stale.
+    ready_ = false;
+    for (LiveEntry& e : live_)
+        if (e.used) e.confirmed = false;
+    for (Part& pt : parts_) {
+        pt.curGen    = 0;
+        pt.everLive  = false;
+        pt.backoffNs = 0;
+        pt.pagesUsed = 0;
+        pt.pageBegin.fill(0);
+        pt.pageCount.fill(0);
+        pt.hn = pt.hbytes = 0;
+        pt.st = Scanning{};
+    }
+    life_ = Life::Running;
+    return OpResult::Accepted;
+}
+
+OpResult LeaseWatchBase::setPrefixes_(std::span<const std::span<const uint8_t>> prefixes) {
+    if (core_.closed() || core_.viewRowLen() == 0) return OpResult::InvalidArgument;
     if (prefixes.empty() || prefixes.size() > kMaxPrefixes) return OpResult::InvalidArgument;
     // A record of the watched topic travels the ring as key + value: refuse a topic whose widest key and lease row cannot (it would fail
     // the watch as Fatal at the first record).
@@ -297,8 +327,6 @@ OpResult LeaseWatchBase::startFromNow(std::span<const std::span<const uint8_t>> 
         dst.len = static_cast<uint8_t>(prefixes[i].size());
         if (!prefixes[i].empty()) std::memcpy(dst.bytes, prefixes[i].data(), prefixes[i].size());
     }
-    life_ = Life::Running;
-    for (Part& pt : parts_) pt.st = Scanning{};
     return OpResult::Accepted;
 }
 

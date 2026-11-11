@@ -93,6 +93,11 @@ public:
     /// 48-byte ring record header) does not fit the 2048-byte record ring payload (kRecPayload): such a row could never be watched.
     [[nodiscard]] OpResult startFromNow(std::span<const std::span<const uint8_t>> prefixes);
 
+    /// Starts the closed watch again, in place, over the same live table, names, handler, observers and buffers.  Accepted only in Life::Closed
+    /// (else InvalidArgument, nothing changes); the prefix rules are those of startFromNow.  Every partition re-runs: the leases the new scan does
+    /// not confirm (also those under a prefix no longer watched) end as Vanished, Ready is emitted again.  No allocation.
+    [[nodiscard]] OpResult restart(std::span<const std::span<const uint8_t>> prefixes);
+
     /// The life of the watch: the one state (no scattered flags).  Fresh -> Running (startFromNow); Running -> Failed (fail_) or Closing
     /// (closeAsync); Failed -> Closing (closeAsync); Closing -> Closed (every subscription finished); Fresh -> Closed (closeAsync).
     enum class Life : uint8_t { Fresh, Running, Failed, Closing, Closed };
@@ -208,6 +213,7 @@ private:
 
     // ---- construction helpers / lifecycle ----
     void fail_();
+    [[nodiscard]] OpResult setPrefixes_(std::span<const std::span<const uint8_t>> prefixes);   ///< validates and installs the prefixes
     void settleClosing_() noexcept;
     [[nodiscard]] bool hasUnfinishedSub_() const noexcept;
     void emit_(LeaseEventKind kind, int32_t partition, int64_t offset, std::span<const uint8_t> key, int64_t version,
