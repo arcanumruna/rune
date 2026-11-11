@@ -421,6 +421,34 @@ TEST(NsSlotRegression, AssignAlwaysPrecedesThrottleRegression) {
     EXPECT_EQ(pool.w[1].lastUntil[5], 999);
 }
 
+// #866: a throttle still owed to a worker when its slot is released is voided, never delivered as a tag mismatch.
+TEST(NsSlotRegression, AReleaseVoidsTheSlotsOwedThrottlesRegression) {
+    NsSlotFanout f;
+    f.configure(8, 2);
+    StubPool pool(2);
+    f.post(NsSlotAssign{3, 300u, rune::protocol::NamespaceLimits{}});
+    for (int i = 0; i < kPumpCap; ++i) (void)f.pump(pool);
+    for (auto& wk : pool.w) wk.full = true;
+    f.post(Throttle{3, 300u, ThrottleKind::FetchBytes, 888});    // owed to both workers
+    f.post(ViewMemOver{3, 300u, true});
+    for (int i = 0; i < kPumpCap; ++i) (void)f.pump(pool);
+    f.post(NsSlotRelease{3, 300u});
+    f.post(NsSlotAssign{3, 301u, rune::protocol::NamespaceLimits{}});
+    for (auto& wk : pool.w) wk.full = false;
+    for (int i = 0; i < kPumpCap; ++i) (void)f.pump(pool);
+    EXPECT_EQ(f.voidDropsForTest(), 4u) << "two cells, two workers";
+    for (int w = 0; w < 2; ++w) {
+        StubWorker& wk = pool.w[static_cast<std::size_t>(w)];
+        EXPECT_EQ(wk.slots.nsIdAt(3), 301u) << "worker " << w;
+        EXPECT_EQ(wk.mismatches, 0u) << "worker " << w << ": nothing of the old owner arrives";
+        EXPECT_EQ(f.dirtyForTest(w), 0u) << "worker " << w;
+    }
+    // The new owner's throttle is delivered as usual.
+    f.post(Throttle{3, 301u, ThrottleKind::FetchBytes, 999});
+    for (int i = 0; i < kPumpCap; ++i) (void)f.pump(pool);
+    for (int w = 0; w < 2; ++w) EXPECT_EQ(pool.w[static_cast<std::size_t>(w)].lastUntil[3], 999) << "worker " << w;
+}
+
 // #864: a Deleting namespace is upserted once per delete step; only the first NsDeleting of a slot owner is queued.
 TEST(NsSlotRegression, RepeatedDeletingUpsertsNeverOverflowTheOrderedFifoAdversarialRegression) {
     constexpr uint16_t kSlots = 4;                 // FIFO capacity 16: 18 posts without the dedup

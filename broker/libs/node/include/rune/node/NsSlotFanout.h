@@ -17,8 +17,9 @@
 //            so sustained throttling costs no memory.
 //
 // Ordering: a worker's dirty entries are offered only when it has no ordered message pending, so an assign is always
-// delivered before any throttle of that slot.  A stale throttle (its slot released and re-assigned since) is dropped
-// by the worker's slot tag check (`nsSlots_.matches`).
+// delivered before any throttle of that slot.  A release voids the slot's owed cells here, so a throttle of the old
+// owner is never delivered to the new one; the worker's slot tag check (`nsSlots_.matches`) stays as the second line
+// of defence.
 //
 // pump() is a template over the pool so a test can drive it with a stub whose rings refuse; the production type is
 // WorkerPool.  No virtual call, no std::function.
@@ -66,6 +67,8 @@ public:
     }
     void post(const NsSlotRelease& m) {
         if (m.slot < deletingPosted_.size()) deletingPosted_[m.slot] = 0;
+        if (m.slot < slotCapacity_)                              // #866: the old owner's owed throttles die with it
+            for (std::size_t k = 0; k < kKinds; ++k) latest_[static_cast<std::size_t>(m.slot) * kKinds + k].live = false;
         (void)postOrdered_(Msg{m});
     }
     void post(const Throttle& m) {   // Task 14
@@ -131,6 +134,7 @@ public:
                 const uint32_t cell = list[i];
                 if (ringFull) { list[kept++] = cell; continue; }   // keep the rest dirty, in order
                 const Latest& l = latest_[cell];
+                if (!l.live) { flag[cell] = 0; ++voidDrops_; continue; }   // released since it was posted: nothing to send
                 const uint16_t slot = static_cast<uint16_t>(cell / kKinds);
                 const std::size_t kind = cell % kKinds;
                 WorkerOp op = kind == kViewMemOverKind ? makeViewMemOverOp(ViewMemOver{slot, l.nsId, l.value != 0})
@@ -159,11 +163,12 @@ public:
     }
     [[nodiscard]] uint64_t    orderedOverflowsForTest() const noexcept { return orderedOverflows_; }
     [[nodiscard]] uint64_t    deletingDedupsForTest() const noexcept { return deletingDedups_; }
+    [[nodiscard]] uint64_t    voidDropsForTest() const noexcept { return voidDrops_; }
 
 private:
     using Msg = std::variant<NsSlotAssign, NsSlotRelease, Throttle>;
     struct Pending { Msg msg{NsSlotRelease{}}; int32_t nextWorker = 0; };
-    struct Latest  { uint32_t nsId = 0; int64_t value = 0; };
+    struct Latest  { uint32_t nsId = 0; int64_t value = 0; bool live = false; };
 
     bool postOrdered_(Msg m) {
         if (count_ == fifo_.size()) [[unlikely]] {
@@ -180,7 +185,7 @@ private:
         if (slot >= slotCapacity_) [[unlikely]] { ++badPosts_; return; }
         const std::size_t cells = static_cast<std::size_t>(slotCapacity_) * kKinds;
         const std::size_t cell  = static_cast<std::size_t>(slot) * kKinds + kind;
-        latest_[cell] = Latest{nsId, value};
+        latest_[cell] = Latest{nsId, value, true};
         for (uint32_t w = 0; w < workers_; ++w) {
             uint8_t& f = dirty_[w * cells + cell];
             if (f != 0) continue;   // already owed: it will carry the latest value
@@ -204,6 +209,7 @@ private:
     std::vector<uint32_t> deletingNs_;      ///< [slot]: the owner whose NsDeleting is already queued or delivered
     std::vector<uint8_t>  deletingPosted_;  ///< [slot]: 1 = deletingNs_[slot] is valid
     uint64_t deletingDedups_ = 0;
+    uint64_t voidDrops_ = 0;
 };
 
 }  // namespace rune::node
