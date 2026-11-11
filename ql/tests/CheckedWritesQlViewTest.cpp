@@ -116,7 +116,7 @@ TEST(CheckedWritesQlView, Modifiers) {
     EXPECT_TRUE(v.unique);
     EXPECT_EQ(errorOf("create unique transient view v key id as select x from s;"),
               "expected 'view' after 'create [or replace] [transient] [unique]', got 'transient'");
-    EXPECT_EQ(errorOf("create frob v;"), "expected 'user', 'role' or 'view' after 'create', got 'frob'");
+    EXPECT_EQ(errorOf("create frob v;"), "expected 'topic', 'lease', 'transient', 'view', 'user' or 'role' after 'create', got 'frob'");
 }
 
 TEST(CheckedWritesQlView, PredicateTree) {

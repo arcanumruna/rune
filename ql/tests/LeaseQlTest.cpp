@@ -156,6 +156,55 @@ TEST(LeaseQlRegression, LeaseTopicRefusalRegression) {
     EXPECT_EQ(tr.error().col, 1u);
 }
 
+TEST(LeaseQlRegression, CreateLeaseTopicRefusalsMatchBareRegression) {
+    // Every bare-form topic refusal is the same message (and the whole-statement ones the same position) behind `create `.
+    struct Row { std::string text, message; };
+    const std::vector<Row> rows = {
+        {"lease topic t;", "a lease topic needs a typed, keyed topic"},
+        {"lease topic t partitions 2;", "a lease topic needs a typed, keyed topic"},
+        {"lease topic t { id uint64 };", "a lease topic needs a typed, keyed topic"},
+        {"lease topic t { id uint64 } partitions 2;", "a lease topic needs a typed, keyed topic"},
+        {"transient lease topic t { id uint64 };", "a lease topic needs a typed, keyed topic"},
+        {"lease topic t { id uint64 autoincrement } key id;", "a lease topic cannot use autoincrement"},
+        {"lease topic t { id uint64, lease_x int32 } key id;", "lease_ field names are reserved"},
+        {"lease topic t { lease_owner uint64 } key lease_owner;", "lease_ field names are reserved"},
+        {"lease topic t { id uint64, name string } key id;", "a lease topic's fields are fixed-width: 'name' is string; use string(N)"},
+        {"lease topic t { id uint64, blob bytes } key id;", "a lease topic's fields are fixed-width: 'blob' is bytes; use string(N)"},
+        {"lease topic t { id uint64, a string(8), b string } key id;", "a lease topic's fields are fixed-width: 'b' is string; use string(N)"},
+        {withClause("key.index = on"), "a lease topic's key index is its lease view"},
+        {withClause("autoincrement.reserve = 10"), "autoincrement.max and autoincrement.reserve need autoincrement"},
+        {withClause("autoincrement.max = 10"), "autoincrement.max and autoincrement.reserve need autoincrement"},
+        {withClause("cleanup.policy = delete"), "a lease topic is compacted and keeps every live lease"},
+        {withClause("cleanup.policy = compact_delete"), "a lease topic is compacted and keeps every live lease"},
+        {withClause("retention.ms = 1000"), "a lease topic is compacted and keeps every live lease"},
+        {withClause("retention.bytes = 1000"), "a lease topic is compacted and keeps every live lease"},
+        {"topic t { id uint64 } key id with (lease.ttl = 5000);", "lease.* settings need a lease topic"},
+        {"topic t with (lease.checkpoint = off);", "lease.* settings need a lease topic"},
+        {"topic t { id uint64 } key id with (retention.ms = 5, lease.max_keys = 5);", "lease.* settings need a lease topic"},
+    };
+    for (const auto& row : rows) {
+        EXPECT_EQ(refusal("create " + row.text), row.message) << row.text;
+        auto bare = ql::parse(row.text);
+        auto created = ql::parse("create " + row.text);
+        ASSERT_FALSE(bare.has_value()) << row.text;
+        ASSERT_FALSE(created.has_value()) << row.text;
+        // A position inside the statement text shifts by the 7-character `create ` prefix.
+        if (row.message.find("needs a typed, keyed topic") != std::string::npos) {
+            EXPECT_EQ(created.error().col, 1u) << row.text;   // whole-statement refusals point at the `create` token
+            EXPECT_EQ(bare.error().col, 1u) << row.text;
+        } else {
+            EXPECT_EQ(created.error().col, bare.error().col + 7) << row.text;
+        }
+    }
+    auto f = ql::parse("create lease topic t { id uint64, lease_x int32 } key id;");
+    ASSERT_FALSE(f.has_value());
+    EXPECT_EQ(f.error().col, 35u);
+    // `topic` after `create` accepts what the bare form does, and the plain create form refuses lease settings the same way.
+    EXPECT_EQ(refusal("create topic t { id uint64, name string } key id;"), "<accepted>");
+    EXPECT_EQ(refusal("create lease topic t { id uint64, name string(32) } key id;"), "<accepted>");
+    EXPECT_EQ(refusal("create lease;"), "expected 'topic' after 'create lease', got ';'");
+}
+
 TEST(LeaseQlRegression, ExpectedListNamesLeaseRegression) {
     const std::string m = refusal("foo;");
     EXPECT_NE(m.find("'lease'"), std::string::npos) << m;

@@ -114,7 +114,7 @@ TEST(SecurityStatementsTest, ParsedFieldsAreExact) {
 
 TEST(SecurityStatementsTest, MoreBadStatements) {
     for (const char* s : {"ALTER USER u DROP PASSWORD 0;", "GRANT ROLE r TO ROLE x;", "ALTER USER u SET PASSWORD '';",
-                          "SHOW SECURITY;", "CREATE TOPIC x;", "SHOW GRANTS FOR USER u AS OF VERSION 1;",
+                          "SHOW SECURITY;", "CREATE TOPIC;", "SHOW GRANTS FOR USER u AS OF VERSION 1;",
                           "DROP USER;", "GRANT READ ON TOPIC t FROM USER u;", "REVOKE READ ON TOPIC t TO USER u;",
                           "ALTER USER u FROB;", "ALTER TOPIC;"})
         EXPECT_FALSE(ql::parse(s).has_value()) << s;

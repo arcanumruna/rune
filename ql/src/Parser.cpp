@@ -1,9 +1,10 @@
 // rune-ql parser — tokenizer + recursive-descent DDL parser
 // Grammar:
-//   statement   := topicStmt | leaseTopicStmt | transientStmt | alterStmt | dropStmt | showStmt | diffStmt
+//   statement   := createTopicStmt | topicStmt | leaseTopicStmt | transientStmt | alterStmt | dropStmt | showStmt | diffStmt
 //                | createStmt | grantStmt | revokeStmt                       (authentication: users / roles / grants)
-//   transientStmt := "transient" ["lease"] topicStmt       (Phase 2b E: persistence = Transient)
-//   leaseTopicStmt := "lease" topicStmt                    (a lease topic: needs a typed, keyed topic; lease.* settings)
+//   createTopicStmt := "create" ["transient"] ["lease"] topicStmt   (the same TopicDef as the bare forms below, which stay accepted)
+//   transientStmt := "transient" ["lease"] topicStmt       (Phase 2b E: persistence = Transient; also accepted as the bare form)
+//   leaseTopicStmt := "lease" topicStmt                    (a lease topic: needs a typed, keyed topic; lease.* settings; also accepted bare)
 //   showLeases  := "show" "leases" NAME [ "where" IDENT "like" STRING ] [ "limit" INT ] ";"
 //                  (the STRING is a key prefix: exactly one '%', the last character; '_' is a literal; prefix <= 127 bytes)
 //   showLease   := "show" "lease" NAME "key" KEYLIT ";"     revokeLease := "revoke" "lease" NAME "key" KEYLIT ";"
@@ -29,7 +30,7 @@
 //   SIGNED_INT  := ["-"] INT  ('-' directly before the digits); any int64 — ranges are the catalog library's (topicConfigError)
 //   CONFIGKEY   := "retention.ms" | "retention.bytes" | "delete.retention.ms" | "min.compaction.lag.ms" | "max.compaction.lag.ms"
 //   dropStmt    := "drop" ("topic" | "view") IDENT ";"  |  "drop" ( "user" | "role" ) NAME ";"
-//   createStmt  := "create" ( "user" NAME "with" "password" STRING | "role" NAME ) ";"
+//   createStmt  := "create" ( "user" NAME "with" "password" STRING | "role" NAME | createTopicStmt | createView )
 //   alterUser   := "alter" "user" NAME ( "add" "password" STRING | "drop" "password" INT         (1 oldest | 2)
 //                                      | "set" "password" STRING [ "terminate" "sessions" ] | "disable" | "enable" ) ";"
 //   grantStmt   := "grant" ( OPERATION "on" resource "to" ( "user" | "role" ) NAME | "role" NAME "to" "user" NAME ) ";"
@@ -1288,8 +1289,46 @@ struct Parser {
         return Statement(std::in_place_type<CreateViewDef>, std::move(v));
     }
 
+    // The bare topic forms `topic …`, `lease topic …`, `[transient] [lease] topic …`, shared with the `create …` forms.
+    // `start` is the statement's first token (the `create` token on the create path) for the statement-level errors;
+    // `ctx` is "create " on the create path so the errors name it ("expected 'topic' after 'create lease', got …").
+    std::expected<Statement, ParseError> parseTopicForm(Token start, const std::string& ctx) noexcept {
+        if (isKw("topic")) {
+            auto r = parseTopicStatement(false, start);
+            if (!r) return std::unexpected(std::move(r.error()));
+            return Statement(std::in_place_type<TopicDef>, std::move(*r));
+        }
+        if (isKw("lease")) {
+            advance();
+            if (!isKw("topic")) return std::unexpected(err("expected 'topic' after '" + ctx + "lease', got " + got()));
+            auto r = parseTopicStatement(true, start);
+            if (!r) return std::unexpected(std::move(r.error()));
+            return Statement(std::in_place_type<TopicDef>, std::move(*r));
+        }
+        // "transient"
+        advance();
+        const bool lease = isKw("lease");
+        if (lease) advance();
+        if (!isKw("topic")) {
+            return std::unexpected(err("expected 'topic' after '" + ctx + "transient" + (lease ? " lease" : "") + "', got " + got()));
+        }
+        auto r = parseTopicStatement(lease, start);
+        if (!r) return std::unexpected(std::move(r.error()));
+        r->persistence = Persistence::Transient;
+        return Statement(std::in_place_type<TopicDef>, std::move(*r));
+    }
+
     std::expected<Statement, ParseError> parseCreateStatement() noexcept {
+        const Token start = cur;
         advance();   // "create"
+        if (isKw("topic") || isKw("lease")) return parseTopicForm(start, "create ");
+        if (isKw("transient")) {
+            // `create transient [lease] topic …` is a topic; `create transient [unique] view …` is unchanged.
+            Parser look = *this;
+            look.advance();
+            if (look.isKw("topic") || look.isKw("lease")) return parseTopicForm(start, "create ");
+            return parseCreateView();
+        }
         if (isKw("role")) {
             advance();
             auto n = parseName("role name");
@@ -1298,8 +1337,8 @@ struct Parser {
             if (!semi) return std::unexpected(std::move(semi.error()));
             return Statement(std::in_place_type<CreateRoleDef>, CreateRoleDef{std::move(*n)});
         }
-        if (isKw("or") || isKw("transient") || isKw("unique") || isKw("view")) return parseCreateView();
-        if (!isKw("user")) return std::unexpected(err("expected 'user', 'role' or 'view' after 'create', got " + got()));
+        if (isKw("or") || isKw("unique") || isKw("view")) return parseCreateView();
+        if (!isKw("user")) return std::unexpected(err("expected 'topic', 'lease', 'transient', 'view', 'user' or 'role' after 'create', got " + got()));
         advance();
         auto n = parseName("user name");
         if (!n) return std::unexpected(std::move(n.error()));
@@ -1804,32 +1843,7 @@ struct Parser {
         if (cur.kind != TK::Ident) {
             return std::unexpected(err(std::string(kExpected) + ", got " + got()));
         }
-        if (isKw("topic")) {
-            auto r = parseTopicStatement();
-            if (!r) return std::unexpected(std::move(r.error()));
-            return Statement(std::in_place_type<TopicDef>, std::move(*r));
-        }
-        if (isKw("lease")) {
-            const Token start = cur;
-            advance();
-            if (!isKw("topic")) return std::unexpected(err("expected 'topic' after 'lease', got " + got()));
-            auto r = parseTopicStatement(true, start);
-            if (!r) return std::unexpected(std::move(r.error()));
-            return Statement(std::in_place_type<TopicDef>, std::move(*r));
-        }
-        if (isKw("transient")) {
-            const Token start = cur;
-            advance();
-            const bool lease = isKw("lease");
-            if (lease) advance();
-            if (!isKw("topic")) {
-                return std::unexpected(err(std::string("expected 'topic' after 'transient") + (lease ? " lease" : "") + "', got " + got()));
-            }
-            auto r = parseTopicStatement(lease, start);
-            if (!r) return std::unexpected(std::move(r.error()));
-            r->persistence = Persistence::Transient;
-            return Statement(std::in_place_type<TopicDef>, std::move(*r));
-        }
+        if (isKw("topic") || isKw("lease") || isKw("transient")) return parseTopicForm(cur, "");
         if (isKw("alter")) return parseAlterStatement();
         if (isKw("drop"))  return parseDropStatement();
         if (isKw("show"))  return parseShowStatement();
