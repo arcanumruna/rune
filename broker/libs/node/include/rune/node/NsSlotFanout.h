@@ -7,9 +7,10 @@
 //   ORDERED  (NsSlotAssign, NsSlotRelease, the NsDeleting throttle): a fixed-capacity FIFO.  Each message goes to the
 //            workers in index order; a full ring is retried next duty cycle and the FIFO stalls behind it, so per
 //            worker the messages stay in FIFO order (the same ring as TopicDropped and every produce op, so an assign
-//            always precedes the first op of a topic that carries its slot).  Capacity = 2 * slotCapacity * workerCount
-//            (one outstanding assign and one release per slot): a post on a full FIFO is impossible by construction and
-//            is counted and logged at CRITICAL (never a silent drop).
+//            always precedes the first op of a topic that carries its slot).  Capacity = 3 * slotCapacity (one assign,
+//            one NsDeleting and one release per slot owner; a repeated NsDeleting is dropped here, the worker's gate is
+//            sticky until the release).  A post on a full FIFO needs repeated limit changes or slot reuse during one
+//            long ring stall; it is counted and logged at CRITICAL, never silent.
 //   LATEST-WINS (the rate / disk Throttle kinds, ViewMemOver and LeasesOver, posted at the aggregator's tick rate): a fixed table
 //            latest_[slot * kKinds + kind] plus, per worker, a dirty list.  A post overwrites the slot's value and marks
 //            it dirty for every worker; an offer delivers the LAST value once.  With a full ring the table stays dirty,
@@ -46,7 +47,7 @@ public:
     void configure(uint32_t slotCapacity, int32_t workerCount) {
         slotCapacity_ = slotCapacity;
         workers_      = workerCount < 1 ? 1 : static_cast<uint32_t>(workerCount);
-        const std::size_t fifoCap = std::max<std::size_t>(16, std::size_t{2} * slotCapacity_ * workers_);
+        const std::size_t fifoCap = std::max<std::size_t>(16, std::size_t{3} * slotCapacity_);
         fifo_.assign(fifoCap, Pending{});
         head_ = count_ = 0;
         const std::size_t cells = static_cast<std::size_t>(slotCapacity_) * kKinds;
@@ -54,12 +55,26 @@ public:
         dirty_.assign(cells * workers_, 0);
         dirtyList_.assign(cells * workers_, 0);
         dirtyCount_.assign(workers_, 0);
+        deletingNs_.assign(slotCapacity_, 0);
+        deletingPosted_.assign(slotCapacity_, 0);
     }
 
-    void post(const NsSlotAssign& m) { postOrdered_(Msg{m}); }
-    void post(const NsSlotRelease& m) { postOrdered_(Msg{m}); }
+    void post(const NsSlotAssign& m) {
+        if (m.slot < deletingPosted_.size() && deletingPosted_[m.slot] != 0 && deletingNs_[m.slot] != m.nsId)
+            deletingPosted_[m.slot] = 0;                       // a new owner: its own NsDeleting must go out
+        (void)postOrdered_(Msg{m});
+    }
+    void post(const NsSlotRelease& m) {
+        if (m.slot < deletingPosted_.size()) deletingPosted_[m.slot] = 0;
+        (void)postOrdered_(Msg{m});
+    }
     void post(const Throttle& m) {   // Task 14
-        if (m.kind == ThrottleKind::NsDeleting) { postOrdered_(Msg{m}); return; }   // sticky, not a rate: ordered
+        if (m.kind == ThrottleKind::NsDeleting) {              // sticky, not a rate: ordered, once per slot owner (#864)
+            if (m.slot >= deletingPosted_.size()) [[unlikely]] { ++badPosts_; return; }
+            if (deletingPosted_[m.slot] != 0 && deletingNs_[m.slot] == m.nsId) { ++deletingDedups_; return; }
+            if (postOrdered_(Msg{m})) { deletingPosted_[m.slot] = 1; deletingNs_[m.slot] = m.nsId; }
+            return;
+        }
         const std::size_t k = static_cast<std::size_t>(m.kind);
         if (k >= kThrottleKinds) [[unlikely]] { ++badPosts_; return; }
         postLatest_(m.slot, k, m.nsId, m.untilNs);
@@ -143,21 +158,23 @@ public:
         return worker >= 0 && static_cast<std::size_t>(worker) < dirtyCount_.size() ? dirtyCount_[static_cast<std::size_t>(worker)] : 0;
     }
     [[nodiscard]] uint64_t    orderedOverflowsForTest() const noexcept { return orderedOverflows_; }
+    [[nodiscard]] uint64_t    deletingDedupsForTest() const noexcept { return deletingDedups_; }
 
 private:
     using Msg = std::variant<NsSlotAssign, NsSlotRelease, Throttle>;
     struct Pending { Msg msg{NsSlotRelease{}}; int32_t nextWorker = 0; };
     struct Latest  { uint32_t nsId = 0; int64_t value = 0; };
 
-    void postOrdered_(Msg m) {
+    bool postOrdered_(Msg m) {
         if (count_ == fifo_.size()) [[unlikely]] {
             ++orderedOverflows_;
             spdlog::critical("NsSlotFanout: the ordered namespace-slot FIFO is full ({} messages): a message is lost (bug; "
-                             "it holds one assign and one release per slot and worker)", fifo_.size());
-            return;
+                             "it holds one assign, one NsDeleting and one release per slot)", fifo_.size());
+            return false;
         }
         fifo_[(head_ + count_) % fifo_.size()] = Pending{std::move(m), 0};
         ++count_;
+        return true;
     }
     void postLatest_(uint16_t slot, std::size_t kind, uint32_t nsId, int64_t value) {
         if (slot >= slotCapacity_) [[unlikely]] { ++badPosts_; return; }
@@ -184,6 +201,9 @@ private:
     uint64_t tooLargeDrops_ = 0;
     uint64_t orderedOverflows_ = 0;
     uint64_t badPosts_ = 0;
+    std::vector<uint32_t> deletingNs_;      ///< [slot]: the owner whose NsDeleting is already queued or delivered
+    std::vector<uint8_t>  deletingPosted_;  ///< [slot]: 1 = deletingNs_[slot] is valid
+    uint64_t deletingDedups_ = 0;
 };
 
 }  // namespace rune::node

@@ -420,3 +420,43 @@ TEST(NsSlotRegression, AssignAlwaysPrecedesThrottleRegression) {
     EXPECT_EQ(pool.w[1].order[1], WorkerOp::Type::NsThrottle);
     EXPECT_EQ(pool.w[1].lastUntil[5], 999);
 }
+
+// #864: a Deleting namespace is upserted once per delete step; only the first NsDeleting of a slot owner is queued.
+TEST(NsSlotRegression, RepeatedDeletingUpsertsNeverOverflowTheOrderedFifoAdversarialRegression) {
+    constexpr uint16_t kSlots = 4;                 // FIFO capacity 16: 18 posts without the dedup
+    NsSlotFanout f;
+    f.configure(kSlots, 1);
+    StubPool pool(1);
+    pool.w[0].full = true;
+    for (uint16_t s = 1; s <= 3; ++s) {
+        const uint32_t ns = 100u + s;
+        f.post(NsSlotAssign{s, ns, rune::protocol::NamespaceLimits{}});
+        for (int up = 0; up < 4; ++up) f.post(Throttle{s, ns, ThrottleKind::NsDeleting, 0});
+        f.post(NsSlotRelease{s, ns});
+        for (int i = 0; i < 4; ++i) (void)f.pump(pool);
+    }
+    EXPECT_EQ(f.orderedOverflowsForTest(), 0u) << "an ordered slot message was lost";
+    EXPECT_EQ(f.deletingDedupsForTest(), 9u) << "three repeats per slot are dropped";
+    pool.w[0].full = false;
+    for (int i = 0; i < kPumpCap; ++i) (void)f.pump(pool);
+    for (uint16_t s = 1; s <= 3; ++s) EXPECT_EQ(pool.w[0].slots.nsIdAt(s), NsSlotTable::kFreeSlot) << "slot " << s;
+}
+
+// #864: the dedup is per slot OWNER: a slot released and given to another namespace gets its own NsDeleting.
+TEST(NsSlotRegression, ANewOwnerOfASlotGetsItsOwnDeletingRegression) {
+    NsSlotFanout f;
+    f.configure(4, 1);
+    StubPool pool(1);
+    f.post(NsSlotAssign{1, 101, rune::protocol::NamespaceLimits{}});
+    f.post(Throttle{1, 101, ThrottleKind::NsDeleting, 0});
+    f.post(NsSlotRelease{1, 101});
+    f.post(NsSlotAssign{1, 202, rune::protocol::NamespaceLimits{}});
+    f.post(Throttle{1, 202, ThrottleKind::NsDeleting, 0});
+    f.post(Throttle{1, 202, ThrottleKind::NsDeleting, 0});
+    EXPECT_EQ(f.pendingForTest(), 5u) << "assign, deleting, release, assign, deleting";
+    EXPECT_EQ(f.deletingDedupsForTest(), 1u);
+    for (int i = 0; i < kPumpCap && f.pendingForTest() != 0; ++i) (void)f.pump(pool);
+    EXPECT_EQ(f.pendingForTest(), 0u);
+    EXPECT_EQ(pool.w[0].slots.nsIdAt(1), 202u);
+    EXPECT_EQ(pool.w[0].throttles, 2u) << "one NsDeleting per slot owner reached the worker";
+}
