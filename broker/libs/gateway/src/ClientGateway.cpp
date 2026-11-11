@@ -6642,7 +6642,22 @@ void ClientGateway::pushSubscriptionsPass_()
             continue;
         }
 
-        if (view.empty()) continue; // nothing returned (nextOffset not yet visible)
+        if (view.empty()) {
+            // #877: at a damaged sealed segment nothing will ever be readable here - fail the subscription once with
+            // StorageError (parked, cursor not advanced), as the worker path does.  Cold: O(segments), only on an empty read
+            // below the bound.
+            if (sub.nextOffset < bound && log->damageAt(sub.nextOffset)) [[unlikely]] {
+                sub.failed         = true;
+                sub.errorOwed      = true;
+                sub.failedCause    = rune::node::PushTooLargeCause::CorruptBatch;
+                sub.failedFrameLen = 0;
+                spdlog::error("ClientGateway: subscription {} (topicId={} partition={} offset={}) failed: a stored batch is "
+                              "corrupt (damaged log segment) - StorageError, subscription parked (cursor not advanced)",
+                              subId, sub.topicId, sub.partition, sub.nextOffset);
+                if (session) trySendOwedPushError_(sub, *session);
+            }
+            continue;
+        }
 
         // Iterate whole record batches in the chunk (span into the read mmap).
         // Batch layout: kBaseOffsetOffset=0 (LE64), kLengthOffset=8 (LE32 = bytes after this field),
