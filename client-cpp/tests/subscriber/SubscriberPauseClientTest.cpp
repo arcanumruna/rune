@@ -14,10 +14,15 @@ TEST(SubscriberPauseClientRegression, OtherSubscriptionKeepsFlowingLeaseSessionK
     ASSERT_EQ(err, rc::OpResult::Accepted);
 
     const rc::TopicHandle th{r.topic->core().topicId(), r.topic->core().partitionCount(), rc::TopicKind::Typed, rune::protocol::Partitioner::Fnv1a};
-    rc::Subscription sub = r.client->subscribe(th, 1, {}, &noopRecords);
+    int got1 = 0, got2 = 0;
+    rc::Subscription sub  = r.client->subscribe(th, 1, {}, [&](const rc::Record&) { ++got1; });
     rc::LeaseWatchBase w(*r.client, r.topic->core());   // only to reuse the rig's round()
-    for (int i = 0; i < 400 && r.gw.latestSubscription(1, 1) == nullptr; ++i) r.round(w);
-    ASSERT_NE(r.gw.latestSubscription(1, 1), nullptr);
+    for (int i = 0; i < 400 && r.gw.subscribed.size() < 1; ++i) r.round(w);
+    rc::Subscription sub2 = r.client->subscribe(th, 2, {}, [&](const rc::Record&) { ++got2; });
+    for (int i = 0; i < 400 && r.gw.subscribed.size() < 2; ++i) r.round(w);
+    ASSERT_EQ(r.gw.subscribed.size(), 2u);
+    const auto first  = r.gw.subscribed[0];
+    const auto second = r.gw.subscribed[1];
     const std::size_t subs0 = r.gw.subscribed.size();
 
     ASSERT_TRUE(sub.pause());
@@ -33,6 +38,14 @@ TEST(SubscriberPauseClientRegression, OtherSubscriptionKeepsFlowingLeaseSessionK
     }
     EXPECT_GT(r.gw.kaSeen.size(), ka0);       // the session kept answering keepalives
     EXPECT_TRUE(r.cb.lost.empty());
+    EXPECT_TRUE(r.cb.atRisk.empty()) << "pausing a subscription never puts the lease at risk";
+    // The other subscription keeps flowing while the first one is paused.
+    r.gw.pushRecords(second, 0, 3);
+    for (int i = 0; i < 60 && got2 < 3; ++i) r.round(w);
+    EXPECT_EQ(got2, 3);
+    EXPECT_EQ(got1, 0);
+    EXPECT_TRUE(sub2.active());
+    (void)first;
     EXPECT_EQ(r.session->liveCount(), 1u);
     EXPECT_EQ(r.gw.subscribed.size(), subs0); // a pause sends no new Subscribe
 
@@ -41,6 +54,7 @@ TEST(SubscriberPauseClientRegression, OtherSubscriptionKeepsFlowingLeaseSessionK
     EXPECT_GT(r.gw.subscribed.size(), subs0); // the resume re-armed the subscription on the wire
     EXPECT_FALSE(sub.paused());
     EXPECT_TRUE(r.cb.lost.empty());
+    EXPECT_TRUE(r.cb.atRisk.empty());
 }
 
 // C-1 on the real Invoker Client: the handler of record 4 of a 10-record frame pauses at its own offset.  The frame's records

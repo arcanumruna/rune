@@ -115,13 +115,15 @@ inline const rune::protocol::LeaseSpec kSpec{.ttlMs = 6000, .minTtlMs = 1000, .m
 struct Cb {
     struct Lost { rc::LeaseRef ref; rc::LostReason why; };
     std::vector<Lost> lost;
+    std::vector<rc::AtRiskEdge> atRisk;
 };
 struct OnLostF {
     Cb* cb;
     void operator()(rc::LeaseRef r, rc::LostReason w) const { cb->lost.push_back({r, w}); }
 };
 struct OnRiskF {
-    void operator()(rc::LeaseRef, rc::AtRiskEdge) const {}
+    Cb* cb;
+    void operator()(rc::LeaseRef, rc::AtRiskEdge e) const { cb->atRisk.push_back(e); }
 };
 
 using Held = std::set<std::pair<Bytes, int64_t>>;
@@ -202,7 +204,7 @@ struct WRig {
         session.reset();
         topic.reset();
     }
-    void makeSession() { session = std::make_unique<Session>(*client, OnLostF{&cb}, OnRiskF{}, rc::LeaseSessionOptions{}); }
+    void makeSession() { session = std::make_unique<Session>(*client, OnLostF{&cb}, OnRiskF{&cb}, rc::LeaseSessionOptions{}); }
     void connect() {
         for (int i = 0; i < 4000 && !gw.ready(); ++i) { client->doWork(); gw.pump(); }
         ASSERT_TRUE(gw.ready());
