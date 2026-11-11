@@ -322,7 +322,7 @@ TEST(ShardDrGateRegression, SigstopPast15sThenSigcontRecoversLiveExactlyOnce) {
     int       closeSt  = -1;
     ASSERT_EQ(std::sscanf(summary.c_str(), "S %lld %lld %lld %lld %d %lld", &accepted, &records, &ok, &failed, &closeSt, &rebuilds),
               6);
-    EXPECT_GE(rebuilds, 1) << "the stall closed the Aeron clients and the transports were rebuilt";
+    EXPECT_EQ(rebuilds, 0) << "a shard client's 1 h Aeron liveness outlives the stall: nothing is rebuilt";
     EXPECT_EQ(records, accepted) << "every accepted record completed exactly once";
     EXPECT_EQ(ok, accepted) << "none failed: the stall stayed under the delivery timeout";
     EXPECT_EQ(failed, 0);

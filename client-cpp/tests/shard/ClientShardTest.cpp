@@ -1058,13 +1058,22 @@ TEST(ClientShardRegression, WakeFdsAreReplacedAfterRebuildRegression) {
     ASSERT_GT(na, 0);
     // The old fds were closed with the old driver; whatever the kernel reused, every fd now returned is open.
     for (int i = 0; i < na; ++i) EXPECT_NE(::fcntl(after[i], F_GETFD), -1) << after[i];
-    // Parking on the new fds wakes on an ack: the datagram is readable before the owner pumps the client again.
+    // An owner that parks on the re-queried fds between duty cycles gets its ack: every park is woken by traffic on
+    // the new sockets (a park on a stale or reused fd sleeps out its 1 s timeout).
     r.accept(1, 1);
-    r.step();
-    r.gw().pump();
-    pollfd fds[8];
-    for (int i = 0; i < na; ++i) fds[i] = pollfd{after[i], POLLIN, 0};
-    EXPECT_GT(::poll(fds, static_cast<nfds_t>(na), 1000), 0) << "the ack did not wake a park on the re-queried fds";
+    r.step();   // the record goes out and the broker acks it after this duty cycle: the ack is not read yet
+    ASSERT_EQ(r.ledger.ok, 0);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int parks = 0; r.ledger.ok == 0 && parks < 20; ++parks) {
+        r.gw().pump();
+        pollfd fds[8];
+        const int n = r.shard->wakeFds(after, 8);
+        for (int i = 0; i < n; ++i) fds[i] = pollfd{after[i], POLLIN, 0};
+        ASSERT_GT(::poll(fds, static_cast<nfds_t>(n), 1000), 0) << "a park on the re-queried fds slept out its timeout";
+        r.step();
+    }
+    EXPECT_EQ(r.ledger.ok, 1) << "the ack arrived through the parked owner loop";
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 1s);
 }
 #endif
 

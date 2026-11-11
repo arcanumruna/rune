@@ -504,9 +504,10 @@ TEST(ProducerRoutePark, RefusedConnectEdgeResendAllViaRouteGoesOutOnALaterPassRe
     const std::vector<Frame> first = w.frames;
 
     Wire refusing;
-    refusing.refuse = {0, 1, 2};
+    refusing.refuse = {0};   // the oldest is refused, the younger would be accepted
     auto refuseFn = refusing.fn();
     EXPECT_EQ(impl.resendAllViaRoute(refuseFn), 0);
+    EXPECT_TRUE(refusing.frames.empty()) << "a younger frame went out ahead of the refused oldest";
     EXPECT_TRUE(impl.hasInFlight());
 
     pump(impl, sink);

@@ -1752,6 +1752,9 @@ TEST(InvokerTransport, StopFromDownIsCleanRegression) {
     t.stop();
     const uint8_t b[] = {1};
     EXPECT_FALSE(t.offer(b, 1));
+    Transport next{c};   // the dir and its lock were released
+    EXPECT_NO_THROW(next.start());
+    next.stop();
 }
 
 // Mutation: rebuild() starting the embedded driver in invoker style -> usesDriverThread() flips, nobody pumps it (red).
