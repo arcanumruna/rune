@@ -357,6 +357,17 @@ TEST(CheckedWritesHookRegression, VersionAboveTheInstalledMaxIsRetriableNotLeade
     EXPECT_EQ(why, H::None);
 }
 
+// #868: text in the value is refused for good (SchemaValidationFailed), not answered with the retriable NotLeader.
+TEST(CheckedWritesHookRegression, ATextValueIsRefusedForGoodNotRetriedRegression) {
+    Hooked h;
+    HookRefusal why{};
+    TypedRecord text;
+    text.key = leBytes(7, 8);
+    text.value = "ws:12";
+    EXPECT_EQ(h.run(batchOf({text}), &why), ErrorCode::SchemaValidationFailed);
+    EXPECT_EQ(why, H::ValidationFailed);
+}
+
 TEST(CheckedWritesHook, WireKeyMismatchIsSchemaValidationFailed) {
     Hooked h;
     Parts p;
