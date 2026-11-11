@@ -16,10 +16,12 @@ in [`ql/src/Parser.cpp`](../../ql/src/Parser.cpp); every example on this page wa
 ## Topics
 
 ```sql
-topic <name> [ { <field> <type> [ autoincrement ], ... } ] [ partitions <n> ] [ replicas <r> ] [ key <field> ]
-      [ with ( <setting> = <value>, ... ) ] ;
-transient topic ... ;
+create [ transient ] [ lease ] topic <name> [ { <field> <type> [ autoincrement ], ... } ] [ partitions <n> ] [ replicas <r> ]
+      [ key <field> ] [ with ( <setting> = <value>, ... ) ] ;
 ```
+
+The bare forms `topic ...;`, `lease topic ...;` and `transient [lease] topic ...;` (without `create`) are still accepted and mean exactly
+the same; the examples below use the `create` form.
 
 - `partitions` defaults to 1.
 - An **untyped** (raw) topic has no field list and no `key`: records are opaque bytes. It has no database features
@@ -31,7 +33,7 @@ transient topic ... ;
   the record key equals the key field's bytes. A batch with any invalid record is refused with `SchemaValidationFailed` (24).
 - A key field is an integer type or `string(N)` with `N` at most 16; any other key field type is refused with
   `InvalidSchema` (23).
-- `transient topic` replicates in memory and never writes to disk. Persistence is fixed at creation.
+- `create transient topic` replicates in memory and never writes to disk. Persistence is fixed at creation.
 - A view may read a keyed transient topic, persisted or transient; a persisted one keeps its checkpointed rows across a restart (see SELF-HOSTING.md, Transient topics).
 - `replicas` is the replication factor, `0` to `32767`; `0` or omitted means every broker. It must be at most the
   broker count and at least `RUNE_MIN_ISR`.
@@ -42,12 +44,12 @@ Field types: `int32`, `int64`, `uint16`, `uint32`, `uint64`, `float64`, `bool`, 
 (a fixed-width string of `N` bytes).
 
 ```sql
-topic events;
-topic logs partitions 3 replicas 3;
-transient topic presence;
-topic player { userId uint64, name string(32), score int64 } partitions 4 key userId;
-topic orders partitions 4 replicas 3 with (tier = leader, durability = all-in-sync);
-topic audit partitions 1 with (cleanup.policy = compact, segment.bytes = 1048576);
+create topic events;
+create topic logs partitions 3 replicas 3;
+create transient topic presence;
+create topic player { userId uint64, name string(32), score int64 } partitions 4 key userId;
+create topic orders partitions 4 replicas 3 with (tier = leader, durability = all-in-sync);
+create topic audit partitions 1 with (cleanup.policy = compact, segment.bytes = 1048576);
 ```
 
 ### Creation settings (`with (...)`)
@@ -143,13 +145,12 @@ halted-apply runbook are in [CATALOG.md](../../broker/docs/CATALOG.md).
 
 ```text
 createView := "create" [ "or" "replace" ] [ "transient" ] [ "unique" ] "view" NAME "key" keyspec "as" "select" items
-              "from" NAME [ "group" "by" groupItem ( "," groupItem )* ]
+              "from" NAME
               ( "constraint" NAME "check" "(" predicate ")" )* ";"
 keyspec    := keyItem | "(" keyItem ( "," keyItem )* ")"
 keyItem    := column | "lower" "(" column ")" "as" NAME
 items      := "*" | item ( "," item )*
 item       := column [ "as" NAME ]  |  AGG "(" ( "*" | column ) ")" "as" NAME      AGG := count | sum | avg | min | max | last
-groupItem  := column | "lower" "(" column ")"
 predicate  := orExpr      orExpr := andExpr ( "or" andExpr )*      andExpr := notExpr ( "and" notExpr )*
 notExpr    := "not" notExpr | "(" orExpr ")" | column CMP literal
 CMP        := "=" | "<>" | "<" | "<=" | ">" | ">="      literal := [ "-" ] INT | STRING | "true" | "false"
@@ -164,8 +165,8 @@ A view is a materialized table that the broker keeps current from one typed, key
   [codec.md](codec.md#view-keys). `lower()` is Unicode simple lowercasing with no locale rules, and the plan pins the Unicode version.
 - **Select items.** `*` is every source column. `name as alias` renames a column. An aggregate always has an `as` name.
   `count(*)` counts the group's records.
-- **Aggregates and `group by`.** A view with any aggregate item is an aggregate view: its `group by` columns are its key
-  (`group by` must equal the `key` list, and `group by lower(name)` matches `lower(name) as ...`). A non-aggregate view takes no `group by`.
+- **Aggregates.** A view with any aggregate item is an aggregate view, grouped by its key; there is no `group by` clause (a
+  `group by` is refused at parse time: remove it).
   An aggregate view needs a source with one partition (`ViewNotCoPartitioned`, 36) and an integer source key of at most 8 bytes.
   A group folds the latest record per source key, so to count events per user the source needs a per-record key (see
   `device_login` in the example below).
@@ -184,7 +185,7 @@ A view is a materialized table that the broker keeps current from one typed, key
 ```sql
 create view character_by_id key characterId as select userId, name, gender from character;
 create view account_characters key (userId, characterId) as select name, gender from character;
-create view account_stats key userId as select count(*) as characters from character group by userId;
+create view account_stats key userId as select count(*) as characters from character;
 create unique view character_name key lower(name) as nameKey as select characterId from character;
 drop view account_stats;
 ```
@@ -198,7 +199,7 @@ removes it from the log. A writer learns the verdict by adding the `View` ack (`
 
 ```sql
 create unique view character_name key lower(name) as nameKey as select characterId from character;
-create view account_stats key userId as select count(*) as characters from character group by userId
+create view account_stats key userId as select count(*) as characters from character
   constraint max_characters check (characters <= 12);
 ```
 
@@ -298,7 +299,7 @@ show view account_stats;
 
 `show topic NAME` prints the topic's definition (partitions, replication, kind, `key.index`, `autoincrement`, partitioner, config, schema) and
 then, for each partition, the counters its leader reports (see [`rune stats`](admin-cli.md#rune-stats)). `show view NAME` prints the
-sources, key, sink partitions, persistence, output columns, the key spec, `unique`, `group by`, each `constraint ... check (...)`
+sources, key, sink partitions, persistence, output columns, the key spec, `unique`, each `constraint ... check (...)`
 and the pinned Unicode version, then the view's counters. Both need `DESCRIBE`; the counters are the [GetStats](wire-protocol.md#stats-client-version-17) ones. `show history`, `show ... as of` and `diff` are the catalog reads
 described below.
 
@@ -310,7 +311,7 @@ C++ constants are `ErrorCode` values; codes 59 to 61 reach only sessions at clie
 | Code | Name | Triggered by |
 |---|---|---|
 | 34 | `ViewFieldUnresolved` | The plan names a column the source does not have (or an ambiguous one), or an aggregate view's non-key column is not an aggregate. |
-| 35 | `ViewKeyInvalid` | The key does not appear in the output, `group by` does not equal the key, `group by` has no aggregate column, or the source has no key (a keyless topic cannot be a view source). |
+| 35 | `ViewKeyInvalid` | The key does not appear in the output, or the source has no key (a keyless topic cannot be a view source). |
 | 36 | `ViewNotCoPartitioned` | An aggregate view, or a view keyed by anything but the source key, over a source with more than one partition. |
 | 59 | `ViewKeyExpressionInvalid` | A key component that does not compile: a type that is not an integer, enum, `bool` or `string(N)`; `lower()` on a type other than `string(N)`; a duplicate key column; a key over 128 bytes; a `lower()` pinned to another Unicode version; the identity rule above; an aggregate over a source key wider than 8 bytes. |
 | 60 | `ViewConstraintInvalid` | A `check` constraint: no name, a duplicate name, a column that is not in the view, or a comparison of different types; more than 64 predicate nodes (`kMaxPredicateNodes`); or a limit of [Constraints](#constraints) (more than 32 verdict views, an object id of 65536 or above, an oversized plan). |
@@ -322,13 +323,13 @@ The whole backend schema of the RegressorsPath game, as one script
 ([`ql/tests/golden/regressorspath.rql`](../../ql/tests/golden/regressorspath.rql); the test suite parses, plans and runs it):
 
 ```sql
-topic user { userId uint64 autoincrement, provider uint16, subject string(64), createdAt int64 } partitions 1 replicas 3 key userId with (cleanup.policy = compact);
+create topic user { userId uint64 autoincrement, provider uint16, subject string(64), createdAt int64 } partitions 1 replicas 3 key userId with (cleanup.policy = compact);
 create unique view user_identity key (provider, subject) as select userId from user;
-topic device_login { loginId uint64 autoincrement, userId uint64, deviceFp string(64), platform uint16, ts int64 } partitions 1 replicas 3 key loginId with (cleanup.policy = compact);
-create view device_history key (userId, deviceFp) as select min(ts) as firstSeen, max(ts) as lastSeen, count(*) as logins, last(platform) as platform from device_login group by userId, deviceFp;
-topic character { characterId uint64 autoincrement, userId uint64, name string(16), gender uint16, hairSkin uint16, hairSheet uint16, headSkin uint16, createdAt int64, lastPlayed int64 } partitions 1 replicas 3 key characterId with (cleanup.policy = compact);
+create topic device_login { loginId uint64 autoincrement, userId uint64, deviceFp string(64), platform uint16, ts int64 } partitions 1 replicas 3 key loginId with (cleanup.policy = compact);
+create view device_history key (userId, deviceFp) as select min(ts) as firstSeen, max(ts) as lastSeen, count(*) as logins, last(platform) as platform from device_login;
+create topic character { characterId uint64 autoincrement, userId uint64, name string(16), gender uint16, hairSkin uint16, hairSheet uint16, headSkin uint16, createdAt int64, lastPlayed int64 } partitions 1 replicas 3 key characterId with (cleanup.policy = compact);
 create unique view character_name key lower(name) as nameKey as select characterId from character;
-create view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= 12);
+create view account_stats key userId as select count(*) as characters from character constraint max_characters check (characters <= 12);
 ```
 
 - `device_login` is keyed by a per-login `loginId`, not by `userId`: an aggregate keeps the latest record per source key, so a
@@ -394,10 +395,10 @@ not starting with `__`.
 ## The `rune ql` command
 
 ```bash
-rune ql -e "topic events partitions 3 replicas 3;" --broker rune-1:40200
+rune ql -e "create topic events partitions 3 replicas 3;" --broker rune-1:40200
 rune ql -f topics.rql --request-id 0123456789abcdef0123456789abcd00 --broker rune-1:40200
 rune ql -e "show history topic events;" --broker rune-1:40200
-rune ql -e "topic events partitions 3;" --dry-run            # parse and print the plan, no broker
+rune ql -e "create topic events partitions 3;" --dry-run            # parse and print the plan, no broker
 rune ql --user admin --password-file admin.pw -f users.rql --broker rune-1:40200
 ```
 
@@ -416,7 +417,7 @@ The full command list is in [admin-cli.md](admin-cli.md).
 #include <rune/ql/Parser.h>
 #include <rune/ql/Backends.h>
 
-auto stmt = rune::ql::parse("topic events partitions 3 replicas 3;");   // std::expected<Statement, ParseError>
+auto stmt = rune::ql::parse("create topic events partitions 3 replicas 3;");   // std::expected<Statement, ParseError>
 if (stmt) {
     if (auto* t = std::get_if<rune::ql::TopicDef>(&*stmt)) {
         rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(*t);       // name, partitions, descriptor blob, config

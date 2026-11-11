@@ -112,7 +112,7 @@ writes `results.jsonl`, then `results.json` and `specs.json`. It is a Linux harn
 
 | Tier | Rune | Kafka |
 |---|---|---|
-| D0 | `topic bench partitions P with (tier = leader)`, acks leader | `acks=1` |
+| D0 | `create topic bench partitions P with (tier = leader)`, acks leader | `acks=1` |
 | D1 | `tier = majority`, acks all | `acks=all`, RF 3, `min.insync.replicas=2` |
 | D2 | `tier = strict` (fdatasync), acks all | `acks=all`, `flush.messages=1` |
 

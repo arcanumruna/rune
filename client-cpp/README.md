@@ -142,11 +142,11 @@ another thread constructs its own `CatalogReader`. A client older than version 8
 ### CLI
 
 ```bash
-rune ql -e "topic events partitions 3 replicas 3;" --broker rune-1:40200
+rune ql -e "create topic events partitions 3 replicas 3;" --broker rune-1:40200
 rune ql -f topics.rql --request-id 0123456789abcdef0123456789abcd00 --broker rune-1:40200
 rune ql -e "show history topic events;" --broker rune-1:40200
 rune ql -e "diff catalog offset 3 to 9;" --broker rune-1:40200
-rune ql -e "topic events partitions 3;" --dry-run      # parse and print the plan, no broker
+rune ql -e "create topic events partitions 3;" --dry-run      # parse and print the plan, no broker
 
 rune catalog export --broker rune-1:40200 > prod.rcat
 rune catalog replay --from prod.rcat --into fresh-1:40200

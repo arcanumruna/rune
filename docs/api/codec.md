@@ -131,6 +131,16 @@ literal longer than N does not compile), and a runtime string goes through `rune
 `std::invalid_argument` when it is longer than N (`tryAssign(sv)` is the `noexcept` form returning `false`). The generated
 `string(N)` setters on the flyweight `Encoder` and `ClaimEncoder` take `const rune::FixedString<N>&`, so they never truncate.
 
+```cpp
+rune::gen::Character c{.userId = u, .name = "Ayla"};   // a literal longer than 16 does not compile
+c.name = std::string_view(input);                       // longer than 16: throws std::invalid_argument, c unchanged
+std::string_view n = c.name.view();                     // the content, up to the first NUL
+```
+
+Migrating a caller that passed a runtime `std::string` or `std::string_view` to a flyweight `Encoder` / `ClaimEncoder` setter:
+wrap it, `enc.name(rune::FixedString<16>(s))`. The old `std::string_view` overload silently truncated. Headers generated before
+this change must be regenerated (`Match<std::array<char, N>>` no longer exists; use `Match<rune::FixedString<N>>`).
+
 `generateHeader(evolving, version)` takes the topic's evolving descriptor (what `rune schema generate` fetches), so
 the type reads records of **every** version by the record's own version: a Drop moves the fields after it, and each
 field reads right or absent, never shifted. Versions up to `kVersion` need nothing; a record of a later version needs

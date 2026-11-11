@@ -56,6 +56,7 @@ finds nothing prints `(no row)`; a `NULL` aggregate prints `NULL`. Columns are p
 rune ql -e "select * from account_stats where userId = 42;" --broker rune-1:40200
 rune ql -e "show view account_stats;" --broker rune-1:40200
 rune ql -e "show topic character;" --broker rune-1:40200
+rune ql -e "create topic events partitions 3 replicas 3;" --broker rune-1:40200
 ```
 
 `show topic NAME` and `show view NAME` print the definition (the same text as `show ... as of` prints for the current version),

@@ -104,7 +104,7 @@ export RUNE_AUTH=disabled RUNE_NODE_ID=0 RUNE_PEERS=0@127.0.0.1:40111 \
 build/broker/rune_broker storage format --new --ignore-formatted     # once per data directory
 build/broker/rune_broker > /tmp/rune-dev.log 2>&1 &
 sleep 3 && build/broker/rune_role                                     # ROLE nodeId=0 role=LEADER term=1
-build/rune-client/rune ql -e "topic events partitions 1;" --broker 127.0.0.1:40200   # prints topicId=0
+build/rune-client/rune ql -e "create topic events partitions 1;" --broker 127.0.0.1:40200   # prints topicId=0
 RUNE_TARGET='aeron:udp?endpoint=127.0.0.1:40200' RUNE_EGRESS='aeron:udp?endpoint=127.0.0.1:40400' \
 RUNE_DATA_DIR=/tmp/rune-dev-client RUNE_CLIENT_TOPIC_TABLE=events:0:1 RUNE_PRODUCE_M=0 \
   build/rune-client/rune_produce_subscribe        # produces 20 records, reads them back, "phase1 OK"
