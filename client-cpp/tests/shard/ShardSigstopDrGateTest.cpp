@@ -46,6 +46,8 @@ namespace {
 
 constexpr const char* kGateway = "aeron:udp?endpoint=127.0.0.1:24890";
 constexpr const char* kEgress  = "aeron:udp?endpoint=127.0.0.1:24900";
+constexpr int         kEgressPort = 24900;
+constexpr int         kShards     = 2;  // shard i binds kEgressPort + i
 constexpr int32_t     kCtl     = 3950;
 constexpr int32_t     kEg      = 3951;
 
@@ -76,7 +78,7 @@ struct ChildLedger {
         t.topicId        = 1;
         t.partitionCount = 8;
         g.base.topics.push_back(t);
-        g.shardCount        = 2;
+        g.shardCount        = kShards;
         g.producer.acks     = rc::Acks::Leader;
         g.producer.lingerUs = 0;
         rs::ShardGroup grp(g);
@@ -121,7 +123,10 @@ struct ChildLedger {
 }
 
 constexpr const char* kPlainGateway = "aeron:udp?endpoint=127.0.0.1:24891";
-constexpr const char* kPlainEgress  = "aeron:udp?endpoint=127.0.0.1:24901";
+constexpr const char* kPlainEgress  = "aeron:udp?endpoint=127.0.0.1:24910";
+constexpr int         kPlainEgressPort = 24910;
+// ctest runs both gates at once: the plain egress must stay off the shard gate's egress ports.
+static_assert(kPlainEgressPort < kEgressPort || kPlainEgressPort >= kEgressPort + kShards);
 constexpr int32_t     kPlainCtl     = 3952;
 constexpr int32_t     kPlainEg      = 3953;
 
