@@ -541,7 +541,9 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
   append time on the broker, not the client's timestamps) is no longer protected. Keep that setting above the clients' delivery timeout, or a retry whose ack was lost can be stored a second time. The memory budget for these batches is
   the producer-tails capacity times about 1.3 KB; past it the cleaner logs once "the producer batch window ... is over its
   budget" and protects only each producer's last batch, so a late retry may complete `StoredIdUnknown`. Raise
-  `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` to avoid it.
+  `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` to avoid it. While a live producer keeps writing, the partition's cleaned-through
+  offset (`lastCleanOffset`) stays at the oldest batch the cleaner still protects for that producer; this is by design, and
+  compaction above it goes on. It moves forward once the producer's window moves past that batch or the producer expires.
 - **Stats** per partition: `idsBurned`, `reservationsAppended`, `keyZeroBatches`, `importsMovedCounter`,
   `windowFullRefusals`, `windowMisses` and `assignedKeyExists`; the checked-writes stats (C16) serve the counter, the
   reserved-through id and `idsBurned` as ids 8 to 10, the first two only on a leader whose scan has finished.
