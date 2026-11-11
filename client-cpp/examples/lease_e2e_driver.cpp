@@ -528,7 +528,11 @@ struct TransientLog {
             ++w.ended[k];
             break;
         case rc::LeaseEventKind::Failed: ++w.failed; break;
-        default: break;
+        case rc::LeaseEventKind::Updated:
+        case rc::LeaseEventKind::Ready:
+        case rc::LeaseEventKind::Confirmed:    // a re-run confirmed a lease the log already holds live
+        case rc::LeaseEventKind::RerunBegin:
+        case rc::LeaseEventKind::RerunEnd: break;
         }
     }
 };

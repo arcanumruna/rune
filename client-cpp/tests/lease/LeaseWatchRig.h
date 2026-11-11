@@ -152,6 +152,8 @@ struct Recorder {
         case Kind::RerunEnd:   if (open.erase(e.partition) == 0) ++bad; break;
         }
     }
+    /// Failed and closeAsync() end a partition's re-run with no RerunEnd: the consumer drops its bracket state (a later restart opens a new one).
+    void endBrackets() { open.clear(); }
     [[nodiscard]] int count(Kind kind, const Bytes* key = nullptr) const {
         int n = 0;
         for (const Ev& e : evs) n += e.kind == kind && (key == nullptr || e.key == *key);

@@ -21,9 +21,10 @@
 // Granted; Updated / Revoked / Expired for an unknown (k, v) are ignored.  A partition whose subscription breaks (or whose scan is answered
 // with a transient non-retriable error) is re-run, after a per-partition exponential backoff (1 ms doubling to a 1 s cap, reset when the
 // partition reaches Live); a DEFINITIVE answer (NotAuthorized, UnknownTopic, InvalidRequest, or the duty thread refusing the request as
-// malformed), or a full live set or a full name heap, FAILS the watch TERMINALLY: every subscription is cancelled, failed() is true, one Failed
-// event is emitted, isReady() is false and doWork only drains and drops afterwards; the watch must be recreated (or closed: closeAsync()).  (Transient breaks above re-run as written;
-// Ready is emitted once.)  A lease recipe bound to a name ends whatever it holds on the Failed event (ClientErrorCode::LeaseWatchFailed).
+// malformed), or a full live set or a full name heap, FAILS the watch: every subscription is cancelled, failed() is true, one Failed
+// event is emitted, isReady() is false and doWork only drains and drops afterwards.  Failed ends only by closeAsync(), after which restart() runs
+// the watch again over the same table.  (Transient breaks above re-run as written.)  Ready is emitted once per run: again after each restart().
+// A lease recipe bound to a name ends whatever it holds on the Failed event (ClientErrorCode::LeaseWatchFailed).
 //
 // Memory.  Everything is allocated in the constructor (live set, name heaps, page bounds, handoff lists, record ring); doWork allocates
 // nothing.  Only (re)subscribing builds a std::function (cold, once per subscription).  No locks, no atomics, no virtual calls.
@@ -53,8 +54,13 @@ namespace rune::client {
 /// Confirmed: a re-run's scan row names a held lease at the same version that the re-run had not confirmed yet (fromScan, bytes = the scanned
 /// view row, offset = its lease_granted_offset): the way to learn of an update made while the partition was not watched.  RerunBegin / RerunEnd
 /// bracket a partition's re-run (key empty, version 0, no bytes, offset -1; partition = the partition); RerunEnd comes after the re-run's
-/// Vanished events and its buffered records, when the partition is Live again.  A first scan has neither; Failed and closeAsync end a re-run
-/// with no RerunEnd.  The watch's names get Confirmed (by key) but never RerunBegin / RerunEnd.
+/// Vanished events and its buffered records, when the partition is Live again.  A re-run is a scan after the partition was Live once, after its
+/// subscription broke or was reborn (data reset), or after restart().  A scan that breaks before the partition was ever Live is bracketed too:
+/// the Granted events of the first attempt were delivered, so the retry reconciles them (Confirmed for those it finds again).  Only the very
+/// first, unbroken scan has none of the three events.  A re-run that breaks again keeps its one bracket, and may Confirm a lease again: a
+/// Confirmed can repeat inside one bracket, each time with the bytes of the newest scan.  Failed and closeAsync end a re-run with NO RerunEnd:
+/// a consumer drops its bracket state on Failed and on closeAsync (restart() opens new brackets).  The watch's names get Confirmed (by key) but
+/// never RerunBegin / RerunEnd.
 enum class LeaseEventKind : uint8_t { Granted, Updated, Revoked, Expired, Vanished, Ready, Failed, Confirmed, RerunBegin, RerunEnd };
 
 struct LeaseEvent {
@@ -100,11 +106,16 @@ public:
 
     /// Starts the closed watch again, in place, over the same live table, names, handler, observers and buffers.  Accepted only in Life::Closed
     /// (else InvalidArgument, nothing changes); the prefix rules are those of startFromNow.  Every partition re-runs: the leases the new scan does
-    /// not confirm (also those under a prefix no longer watched) end as Vanished, Ready is emitted again.  No allocation.
+    /// not confirm (also those under a prefix no longer watched) end as Vanished, Ready is emitted again.  restart() itself allocates nothing; the
+    /// handler runs synchronously inside it (every partition's RerunBegin is emitted before it returns Accepted), and a handler may close the
+    /// watch from there.  The re-subscribes that follow allocate as the first start's do (Client::subscribe, control plane).  Fresh -> closeAsync
+    /// -> restart is accepted and brackets what is really a first scan; registerName stays refused on that watch (names freeze at the first
+    /// start, whether or not it ever ran).
     [[nodiscard]] OpResult restart(std::span<const std::span<const uint8_t>> prefixes);
 
     /// The life of the watch: the one state (no scattered flags).  Fresh -> Running (startFromNow); Running -> Failed (fail_) or Closing
-    /// (closeAsync); Failed -> Closing (closeAsync); Closing -> Closed (every subscription finished); Fresh -> Closed (closeAsync).
+    /// (closeAsync); Failed -> Closing (closeAsync); Closing -> Closed (every subscription finished); Fresh -> Closed (closeAsync);
+    /// Closed -> Running (restart).
     enum class Life : uint8_t { Fresh, Running, Failed, Closing, Closed };
 
     int  doWork(int64_t nowNs);
@@ -113,9 +124,14 @@ public:
     [[nodiscard]] Life life() const noexcept { return life_; }
     /// Fresh or Closed: the destructor then returns without waiting for the client.
     [[nodiscard]] bool isClosed() const noexcept { return life_ == Life::Fresh || life_ == Life::Closed; }
-    /// Starts the close and returns at once: never blocks, never calls client.doWork().  Running: every subscription is cancelled and the
-    /// outstanding scans become stale; doWork then drains and drops what is left, emits no event and reaches Closed when every subscription
-    /// has finished.  Fresh: Closed at once.  Failed: Closing.  Closing / Closed: no-op.  Safe to call from inside a handler.
+    /// Starts the close and returns at once: never calls client.doWork().  Running: every subscription is cancelled and the outstanding scans
+    /// become stale; doWork then drains and drops what is left, emits no event and reaches Closed when every subscription has finished.
+    /// Fresh: Closed at once.  Failed: Closing.  Closing / Closed: no-op.  Safe to call from inside a handler: the event being delivered still
+    /// reaches the observers and the bound name (they see the same event as the handler), then the watch is silent and no later row or record
+    /// of the run changes the table.
+    /// Blocking: on the client's duty thread (a handler, Invoker mode) it never waits.  From an application thread in Thread mode each
+    /// Subscription::unsubscribe() hands a command to the duty thread and waits (progress-based, never a throw) while the command ring is full,
+    /// so under a saturated ring it can block until the duty thread drains it; it does not throw, hence the noexcept.
     void closeAsync() noexcept;
     [[nodiscard]] uint64_t resubscribes() const noexcept { return resubscribes_; }
 
@@ -135,7 +151,7 @@ public:
     /// linear pass over the name's entries: bounded by waitersPerName.
     [[nodiscard]] std::optional<std::pair<int64_t, std::span<const uint8_t>>> predecessor(int32_t id, int64_t version) const noexcept;
     /// Binds ONE callback to the name `id` (the recipes): it runs, on the owner thread inside doWork, for every Granted / Updated / Revoked /
-    /// Expired / Vanished event whose key belongs to the name, AFTER the live set and the name's heap reflect the event; Ready and Failed go to
+    /// Expired / Vanished / Confirmed event whose key belongs to the name, AFTER the live set and the name's heap reflect the event; Ready and Failed go to
     /// every bound name once.  false: an unknown id, a name that is already bound, no callback.  `gone` (optional) is called from the watch's
     /// destructor, so the binder can forget the watch.  unbindName removes the binding made with the same `ctx`.
     [[nodiscard]] bool bindName(int32_t id, LeaseEventFn fn, void* ctx, WatchGoneFn gone = nullptr) noexcept;
@@ -155,6 +171,7 @@ public:
     [[nodiscard]] uint64_t reruns() const noexcept { return reruns_; }
     [[nodiscard]] uint64_t dataResetRerunsForTest() const noexcept { return dataResetReruns_; }   ///< reruns caused by a data-reset subscription
     [[nodiscard]] uint64_t ringOverflows() const noexcept { return ringOverflows_; }   ///< record-ring Overflow markers acted on
+    [[nodiscard]] bool recordRingEmptyForTest() noexcept { return recs_.ring().empty(); }   ///< the record ring holds nothing (tests)
 
 private:
     struct Cb { LeaseEventFn fn = nullptr; void* ctx = nullptr; WatchGoneFn gone = nullptr; };

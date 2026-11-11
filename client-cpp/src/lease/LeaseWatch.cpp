@@ -578,7 +578,7 @@ bool LeaseWatchBase::onScanRows_(int32_t p, uint32_t rowCount, std::span<const u
 void LeaseWatchBase::scanDone_(int32_t p) {
     Part& pt = parts_[static_cast<std::size_t>(p)];
     // A re-run: whatever the scan did not confirm ended while the partition was not being watched.
-    for (uint32_t i = 0; i < o_.maxLive; ++i) {
+    for (uint32_t i = 0; i < o_.maxLive && life_ == Life::Running; ++i) {   // a handler that closes the watch stops the loop: the rest stays unconfirmed
         LiveEntry& e = live_[i];
         if (!e.used || e.partition != p || e.confirmed) continue;
         uint8_t kb[kMaxKey];   // the entry leaves the live set and its name heap BEFORE the event (a bound recipe reads both)
@@ -822,13 +822,18 @@ void LeaseWatchBase::grant_(int32_t p, int64_t offset, std::span<const uint8_t> 
         if (e.nameId >= 0) heapRemove_(e.nameId, e.heapPos);
         eraseLive_(old);
         emit_(LeaseEventKind::Vanished, p, offset, std::span<const uint8_t>(kb, kl), ver, {}, false);   // another incarnation replaces it
+        if (life_ != Life::Running) return;   // the handler closed the watch: the new incarnation is not inserted silently (the restart's scan finds it)
     }
     const uint32_t idx = insertLive_(p, key, h, version);
     if (idx == kNone) { fail_(); return; }   // the live set is full
     const int32_t nid = nameOf_(key);
     if (nid >= 0) {
         live_[idx].nameId = nid;
-        if (!heapPush_(nid, idx, version)) { fail_(); return; }
+        if (!heapPush_(nid, idx, version)) {   // the name's heap is full: the entry was never announced and is in no heap, so it must not stay live
+            eraseLive_(idx);
+            fail_();
+            return;
+        }
     }
     emit_(LeaseEventKind::Granted, p, offset, std::span<const uint8_t>(live_[idx].key, live_[idx].keyLen), version, bytes, fromScan);
 }
