@@ -48,10 +48,15 @@ inline constexpr int64_t kBenchMaxParkNs = 200'000;   // = the broker's default 
 class BenchParker {
 public:
     BenchParker(const int* fds, int n) noexcept {
-        for (int i = 0; i < n && n_ < kMax; ++i) pfds_[n_++] = pollfd{fds[i], POLLIN, 0};
+        setFds(fds, n);
 #if defined(__linux__)
         (void)::prctl(PR_SET_TIMERSLACK, 1'000UL, 0, 0, 0);   // 1 us: wake for the next send on time
 #endif
+    }
+    /// A transport rebuild replaces the driver's wake fds: re-set them before each park.
+    void setFds(const int* fds, int n) noexcept {
+        n_ = 0;
+        for (int i = 0; i < n && n_ < kMax; ++i) pfds_[n_++] = pollfd{fds[i], POLLIN, 0};
     }
     void park(int64_t ns) noexcept {
         if (ns <= 0) return;

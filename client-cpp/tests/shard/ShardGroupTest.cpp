@@ -108,6 +108,12 @@ struct Pipe {
     bool tryGet(char& b) const { return get(b, 0ms); }
 };
 
+// A terminal seed Rejected on shard 0: the gateway expires its session and answers every connect with a non-retriable code.
+void rejectShard0(std::vector<std::unique_ptr<test_support::InvokerGateway>>& gws) {
+    gws[0]->connectErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::ProtocolVersion);
+    gws[0]->expireSession(gws[0]->assignedSessionId);
+}
+
 // The fake brokers, one per shard driver, all on ONE helper thread.  setup /
 // onCommand / collect run on that thread; results are read after join().  The
 // helper stops on stop(), on its own 60 s deadline, or on destruction (RAII:
@@ -402,6 +408,7 @@ TEST(ShardGroupRegression, OneShardFailedSiblingsKeepProducing) {
     gt.setup     = [](test_support::InvokerGateway& gw, std::size_t i) {
         if (i == 0) gw.holdPartitions = {0, 1, 2, 3, 4, 5, 6, 7};  // shard 0's acks never come
     };
+    gt.onCommand = [](auto& gws, char) { rejectShard0(gws); };
     gt.start();
     ASSERT_TRUE(gt.ready);
     grp.connectAll(10s);
@@ -412,10 +419,10 @@ TEST(ShardGroupRegression, OneShardFailedSiblingsKeepProducing) {
             for (int i = 0; i < 5; ++i) accepted0 += grp.trySend(topic, keyFor(p), kVal) == rc::SendResult::Ok;
         }
     }
-    grp.shard(0).client().testInjectTransportFault();
+    gt.command('r');
     std::vector<rs::ShardStatus> log;
     ASSERT_TRUE(waitForState(grp, 0, rs::ShardState::Failed, &log));
-    EXPECT_EQ(grp.shard(0).status().failure, rs::ShardFailure::TransportClosed);
+    EXPECT_EQ(grp.shard(0).status().failure, rs::ShardFailure::Rejected);
     for (int32_t p = 0; p < 8; ++p) {
         const rc::SendResult r = grp.trySend(topic, keyFor(p), kVal);
         EXPECT_EQ(r, grp.shard(0).owns(1, p) ? rc::SendResult::Closed : rc::SendResult::Ok) << p;
@@ -443,6 +450,7 @@ TEST(ShardGroupRegression, RecordsClaimedBeforeFailureTailCloseCompletedClosedOn
         gt.dirs      = shardDirs(g, 1);
         gt.ctlStream = 3924;
         gt.egStream  = 3925;
+        gt.onCommand = [](auto& gws, char) { rejectShard0(gws); };
         gt.start();
         ASSERT_TRUE(gt.ready);
         grp.connectAll(10s);
@@ -460,7 +468,7 @@ TEST(ShardGroupRegression, RecordsClaimedBeforeFailureTailCloseCompletedClosedOn
         });
         char c = 0;
         ASSERT_TRUE(started.get(c, 10s));
-        grp.shard(0).client().testInjectTransportFault();
+        gt.command('r');
         sender.join();
         ASSERT_TRUE(waitForState(grp, 0, rs::ShardState::Failed));
         grp.closeImmediately();
@@ -752,6 +760,7 @@ TEST(ShardGroupRegression, FailedRunnerParksAndDoesNoIo) {
     gt.ctlStream = 3944;
     gt.egStream  = 3945;
     gt.onCommand = [&](auto& gws, char c) {
+        if (c == 'r') rejectShard0(gws);
         if (c == 'm') framesAtMark = gws[0]->framesReceived;
     };
     gt.collect = [&](auto& gws) {
@@ -762,7 +771,7 @@ TEST(ShardGroupRegression, FailedRunnerParksAndDoesNoIo) {
     ASSERT_TRUE(gt.ready);
     grp.connectAll(10s);
     const auto t0 = std::chrono::steady_clock::now();
-    grp.shard(0).client().testInjectTransportFault();
+    gt.command('r');
     ASSERT_TRUE(waitForState(grp, 0, rs::ShardState::Failed));
     gt.command('m');
     // 30 control round trips through the failed runner (each Completions

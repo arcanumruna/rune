@@ -667,19 +667,29 @@ public:
 
     /// A7 park-until-work (Invoker owner): the embedded invoker driver's socket-readiness fds — park in
     /// ppoll() on them when doWork() returned 0 instead of spinning; a datagram (an ack, a status message)
-    /// wakes the owner.  0 fds in Thread driver mode or off Linux.  Valid until close.
+    /// wakes the owner.  0 fds in Thread driver mode or off Linux.  Valid until the next doWork(): a transport
+    /// rebuild replaces them; re-query before each park.
     [[nodiscard]] int wakeFds(int* out, int max) const noexcept { return agent_.wakeFds(out, max); }
 
-    /// True once the Aeron client closed itself (invoker owner stalled past
-    /// aeronClientLivenessTimeoutNs, or the driver timed out).
+    /// True while the Aeron client is closed (invoker owner stalled past aeronClientLivenessTimeoutNs, or the driver
+    /// timed out): the transport is rebuilt by the duty cycle and the sessions resume, so this comes back to false by
+    /// itself.
     [[nodiscard]] bool transportClosed() const noexcept { return agent_.transportClosed(); }
 
     /// T15b test seam (any thread): the transport fault path, as if the Aeron
     /// client had closed itself — delivered through the command ring and
-    /// applied by the duty thread on its next cycle.  The Client then fails for
-    /// good (see dutyCycle: producers' intakes tail-closed, every accepted
-    /// record completed Closed exactly once, no further I/O).
+    /// applied by the duty thread on its next cycle.  The transport is then
+    /// really rebuilt (a healthy one is torn down and restarted) and the
+    /// sessions resume.
     void testInjectTransportFault() { (void)agent_.submitTestFault(); }
+    /// Moves the seed's physical ingress channel (the next rebuild() keeps it); applied on the duty thread at the next doWork().
+    void testSetSeedIngressChannel(const std::string& channel) { (void)agent_.submitTestSeedIngress(channel); }
+    /// Moves the seed to `channel` as a completed failover would (Invoker owner only).
+    bool testRetargetSeed(const std::string& channel) { return agent_.failoverSeedTo(channel, now(), true); }
+    /// Transport rebuilds completed so far (duty thread, or after it stopped).
+    [[nodiscard]] uint64_t testTransportRebuilds() const noexcept { return agent_.transportRebuilds(); }
+    /// Failed rebuild attempts of the current outage (duty thread, or after it stopped).
+    [[nodiscard]] uint32_t testRebuildAttempt() const noexcept { return agent_.rebuildAttempt(); }
     /// T15b test hook: duty cycles run in failed mode (Invoker owner, or after
     /// close() in Thread mode — a plain duty-thread counter).
     [[nodiscard]] uint64_t testFailedDutyCycles() const noexcept { return failedDutyCycles_; }
@@ -2192,8 +2202,8 @@ private:
     /// A Redirect / NotLeader answered a group fetch Subscribe (corrId tagged
     /// GroupConsumerHub::isFetchCorrId): re-route that partition, re-subscribe.
     void onGroupFetchRefused_(int64_t corrId, bool redirect, std::string_view endpoint) noexcept;
-    /// T15b: the failure path (duty thread).  Latched once, when the Aeron
-    /// client closed (or the seed session was Rejected, a terminal answer):
+    /// T15b: the failure path (duty thread).  Latched once, when the seed
+    /// session was Rejected (a terminal answer; a closed Aeron client is rebuilt, not failed):
     /// every producer's intake is tail-closed and every accepted record
     /// completes Closed exactly once; pending control ops complete Closed; the
     /// agent stops all I/O; a Thread-mode runner switches to a parked loop.
@@ -2203,7 +2213,7 @@ private:
     int  failedDutyCycle_(int64_t nowNs);
     /// T15b: derive this cycle's ShardStatus; publish it on change.
     void publishShardStatus_() noexcept;
-    bool transportFailed_ = false;  // duty thread only
+    bool failedForGood_ = false;  // the seed's terminal Rejected (duty thread only)
     uint64_t failedDutyCycles_ = 0;  // duty thread only (test hook)
     // T15b shard status (cfg_.shardStatus): ring created in the ctor before the
     // runner starts; duty-side state below is the duty thread's.

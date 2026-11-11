@@ -490,6 +490,34 @@ TEST(ProducerRoutePark, ResendAllRedirectedStopsAtTheFirstRefusalRegression) {
         EXPECT_EQ(batchcorr::base(w.frames[3 + i].corrId), batchcorr::base(first[i].corrId));
 }
 
+// A Connected-edge resend (resendAllViaRoute) refused because the route's publication is still connecting (every
+// publication is new after a transport rebuild) is re-offered on a later pass, oldest first - never left to the
+// 30 s attempt timer.
+TEST(ProducerRoutePark, RefusedConnectEdgeResendAllViaRouteGoesOutOnALaterPassRegression) {
+    ProducerConfig cfg = ackedCfg();
+    cfg.produceTimeoutMs  = 30'000;
+    cfg.deliveryTimeoutMs = 30'000;
+    ProducerImpl impl(cfg);
+    Wire w;
+    const auto sink = w.fn();
+    sendThree(impl, w, sink);
+    const std::vector<Frame> first = w.frames;
+
+    Wire refusing;
+    refusing.refuse = {0};   // the oldest is refused, the younger would be accepted
+    auto refuseFn = refusing.fn();
+    EXPECT_EQ(impl.resendAllViaRoute(refuseFn), 0);
+    EXPECT_TRUE(refusing.frames.empty()) << "a younger frame went out ahead of the refused oldest";
+    EXPECT_TRUE(impl.hasInFlight());
+
+    pump(impl, sink);
+    ASSERT_EQ(w.frames.size(), 6u) << "the refused Connected-edge resend was never re-driven";
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(batchcorr::base(w.frames[3 + i].corrId), batchcorr::base(first[i].corrId)) << i;
+        EXPECT_EQ(w.frames[3 + i].baseSequence, first[i].baseSequence) << i;
+    }
+}
+
 // Phase 2b E2 (ruling 2): TransientLogFull (42) is a definite non-append on the
 // RIGHT leader (its transient ring is full of not-yet-replicated records): the
 // batch is re-sent with the SAME identity after the retriable backoff — never

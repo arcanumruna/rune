@@ -2251,12 +2251,13 @@ private:
                 const std::size_t n = rcc::encodeErrorResponse(out.data(), out.size(), pingErrorCode,
                                                                "ping refused", pv->sessionId,
                                                                pv->correlationId);
-                send(0, out.data(), n);
+                sendToSession(pv->sessionId, out.data(), n);
             } else if (replyPongs && noPongEndpoints.count(endpoint) == 0) {
                 std::vector<uint8_t> out(64 + pv->echo.size());
                 const std::size_t n =
                     rcc::encodePong(out.data(), out.size(), pv->echo, pv->sessionId, pv->correlationId);
-                send(replyFromArrival ? endpoint : 0, out.data(), n);
+                if (replyFromArrival && !replyOnAnnouncedEgress) send(endpoint, out.data(), n);
+                else sendToSession(pv->sessionId, out.data(), n);   // the session's egress, like ClientGateway::sendAnswer_
             }
             return;
         }
