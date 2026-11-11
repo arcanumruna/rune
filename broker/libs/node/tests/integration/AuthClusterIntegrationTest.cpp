@@ -654,6 +654,8 @@ ConsumerResult runConsumer(std::stop_token stop, std::future<int64_t> target, st
         ++out.resubscribes;
         note("subscribed node " + std::to_string(n + 1) + " from offset " + std::to_string(next));
         const int64_t sub = c.subscriptionIdOf(corr).value_or(0);
+        note("subscription id " + std::to_string(sub) + " on node " + std::to_string(n + 1) + " session " + std::to_string(sid[n]) +
+             " (records so far " + std::to_string(firstRecord) + ")");
         std::size_t seenRecords = firstRecord;
         auto lastProgress = Clock3::now();
         bool broken = false;
@@ -662,7 +664,20 @@ ConsumerResult runConsumer(std::stop_token stop, std::future<int64_t> target, st
             for (; seenRecords < c.records().size(); ++seenRecords) {
                 const auto& r = c.records()[seenRecords];
                 if (r.subscriptionId != sub) continue;
+                // An EMPTY Records frame is the broker's POSITION NOTE (Protocol.h, client version 6), sent right before
+                // NotLeader when the subscription moves; in shard mode it carries the bind-time start, not the live cursor.
+                // It delivers nothing: counting it as a record double-counted offset 0 after a move (and could mask a
+                // gap).  The real client (SubscriberHub) uses it only as a resume hint while nothing was delivered.
+                if (r.bytes.empty()) {
+                    note("position note base " + std::to_string(r.baseOffset) + " sub " + std::to_string(r.subscriptionId) +
+                         " node " + std::to_string(n + 1) + " next " + std::to_string(next));
+                    continue;
+                }
                 const std::size_t k = batchBytes ? r.bytes.size() / batchBytes : 0;
+                if (out.deliveries.count(r.baseOffset))
+                    note("DUP base " + std::to_string(r.baseOffset) + " x" + std::to_string(std::max<std::size_t>(k, 1)) + " bytes " + std::to_string(r.bytes.size()) + " sub " +
+                         std::to_string(r.subscriptionId) + " node " + std::to_string(n + 1) + " seq " + std::to_string(r.seq) +
+                         " idx " + std::to_string(seenRecords) + " next " + std::to_string(next));
                 for (std::size_t i = 0; i < std::max<std::size_t>(k, 1); ++i) {
                     out.offsets.insert(r.baseOffset + static_cast<int64_t>(i));
                     ++out.deliveries[r.baseOffset + static_cast<int64_t>(i)];
@@ -676,6 +691,8 @@ ConsumerResult runConsumer(std::stop_token stop, std::future<int64_t> target, st
             if (want >= -1 && next > want) { out.complete = true; return out; }
             if (Clock3::now() - lastProgress > 4s && want != -2) { broken = true; note("starved 4 s after the target: leaving node " + std::to_string(n + 1)); }   // told the target but starved: another broker
         }
+        note("left node " + std::to_string(n + 1) + " sub " + std::to_string(sub) + " next " + std::to_string(next) +
+             (broken ? " (broken)" : ""));
         sid[n] = 0;
         ++node;
     }
