@@ -190,7 +190,7 @@ public:
         const std::string ep = "127.0.0.1:" + std::to_string(c_.ports.client[static_cast<std::size_t>(ctl - 1)]);
         std::string ddl;
         for (std::string st : rune::cli::engine::splitStatements(script.str())) {
-            if (st.starts_with("topic character "))
+            if (st.starts_with("create topic character ") || st.starts_with("topic character "))   // #1008: both forms
                 st.replace(st.find("with (cleanup.policy = compact)"), std::string_view("with (cleanup.policy = compact)").size(),
                            "with (cleanup.policy = compact, segment.bytes = " + std::to_string(segmentRollBytes_ > 0 ? segmentRollBytes_ : 65536) + ", min.compaction.lag.ms = 100, min.cleanable.dirty.ratio = 0.000001, file.delete.delay.ms = 50)");
             if (st.starts_with("create view account_stats "))
