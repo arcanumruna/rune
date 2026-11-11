@@ -7649,6 +7649,10 @@ bool Client::sendMetadataRequestAnywhere_() noexcept {
     // #514 (seed): a silent seed (Connected, nothing heard for 2 keepalives) is asked last - a crashed seed would
     // swallow the request until responseTimeoutNs.
     const bool seedFirst = !agent_.seedSilent(now());
+    // A silent session (Connected, nothing heard for two keepalives: its node may have crashed) would swallow the one request,
+    // and which session is the dead one is not known yet (the seed may sit on the crashed leader and not be flagged silent
+    // so far): ask every Connected session - a live one answers.  The pace is still the armed refresh's backoff.
+    if (!seedFirst || agent_.leaderSessionsSilentMask(now()) != 0) return sendMetadataRequestEverywhere_() > 0;
     // M2: a refused submit (command ring full) is not "asked".
     if (seedFirst && snap.state == session::SessionState::Connected && snap.sessionId != 0 &&
         sendMetadataRequest(snap.sessionId))

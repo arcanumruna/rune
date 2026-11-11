@@ -4163,6 +4163,45 @@ TEST(GroupRoutingRegression, ASilentLeaderStillNamedKeepsABoundedRefreshPaceThen
     EXPECT_FALSE(sub.finished());
 }
 
+// A refresh armed by a silent leader reaches a live session although silent Connected sessions precede it: the
+// seed and node 1 (the first node session) both crash, the election names node 2, and only a node that is asked
+// can tell.  One request per refresh would go to the silent seed or the silent node 1 round after round (the
+// backoff doubling), so the reader would move only when node 1's session is declared stale.
+// RED by mutation: remove the fan-out line in sendMetadataRequestAnywhere_ (`if (!seedFirst || ...SilentMask...)
+// return sendMetadataRequestEverywhere_() > 0;` - the request goes to the silent seed / node 1 only, never to node 2).
+TEST(GroupRoutingRegression, ARefreshArmedByASilentLeaderAsksEverySessionNotOnlyTheDeadOneAdversarialRegression) {
+    RigOptions o = routingClockOptions();   // #676: duty clock
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 60'000'000'000;   // a silent session is never declared stale in this test
+    GroupRig r(4569, 4570, o);
+    const auto [n1, p1port] = r.addNode(4569);   // the FIRST node session
+    const auto [n2, p2port] = r.addNode(4569);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 2, 1, 4569, ""}, {1, 1, 1, 1, 4569, ""}};   // p0 on node 2, p1 on node 1
+    r.gw.subscribeLeader = {{0, n2}, {1, n1}};
+    r.connect();
+    auto sub = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});   // opens node 1's session FIRST (lower index)
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && sub.active(); }));
+    auto other = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                    [](const rc::Record&) {});   // keeps a live session to node 2 open
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n2) != nullptr && other.active(); }));
+    ASSERT_TRUE(settleRefreshes(r));
+
+    r.gw.deadEndpoints.insert(0);                    // the seed and node 1 crash together ...
+    r.gw.deadEndpoints.insert(n1);
+    r.gw.partitions      = {{1, 0, 2, 1, 4569, ""}, {1, 1, 2, 2, 4569, ""}};   // ... and node 2 leads p1 now
+    r.gw.subscribeLeader = {{0, n2}, {1, n2}};
+    ASSERT_TRUE(r.drive([&] {
+        return subscribesAt(r.gw, 1, n2) >= 1 || sub.finished() ||
+               r.client.testSessionStateAt(1) != rc::session::SessionState::Connected;
+    }, 40'000'000)) << "the reader never followed the election";
+    EXPECT_GE(subscribesAt(r.gw, 1, n2), 1) << "no refresh reached the live node 2 (a silent session swallowed them)";
+    EXPECT_FALSE(sub.finished());
+    EXPECT_EQ(r.client.testSessionStateAt(1), rc::session::SessionState::Connected)
+        << "the move came from the stale timeout, not from the answered metadata";
+}
+
 // A leader that went silent (a long pause) and then comes back: once it answers again the refreshes stop, the
 // reader was never moved or re-sent, and its pushes still arrive on the original subscription.
 // RED by mutation: report every Connected session as silent in leaderSessionsSilentMask (refreshes never stop).
