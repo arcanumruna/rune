@@ -24,6 +24,7 @@ TEST(SubscriberPauseClientRegression, OtherSubscriptionKeepsFlowingLeaseSessionK
     const auto first  = r.gw.subscribed[0];
     const auto second = r.gw.subscribed[1];
     const std::size_t subs0 = r.gw.subscribed.size();
+    r.rounds(w, 20);                          // both are bound (the answers were processed)
 
     ASSERT_TRUE(sub.pause());
     EXPECT_TRUE(sub.paused());
