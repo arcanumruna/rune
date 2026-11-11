@@ -543,12 +543,15 @@ public:
     /// Safe on any thread and inside this subscription's handler (the hub applies it at once: no further record of the
     /// batch, nor of any later batch of the old broker subscription, is delivered).  Pausing a paused subscription only
     /// lowers (or keeps) its position.  Returns false when finished or unsubscribed, when resumeAt is above the position,
-    /// and for a LeaseWatch's subscription (not pausable).  From an app thread the position bound is checked against the
-    /// handle's last snapshot of the status (see position()); the hub checks it again.
+    /// and for a LeaseWatch's subscription (not pausable).  On the duty thread (a handler of this client's thread-mode runner,
+    /// or an Invoker caller) the hub decides at once and the return value is its verdict.  From another app thread the
+    /// command is queued: the position bound is checked against the handle's last snapshot (see position()) and the hub
+    /// checks it again; a command the hub later ignores shows only in paused() once its echo is drained.
     bool pause(int64_t resumeAt = -1);
     /// Subscribes again at the stored position (exactly once per record: a batch the broker pushes from below the position
     /// is trimmed).  Returns false when not paused.  After a pause made INSIDE the handler the app thread learns of it from
-    /// the drained status (eventually, not at the same instant): resume() returns false until paused() reads true.
+    /// the drained status (eventually, not at the same instant): resume() returns false until paused() reads true.  Called
+    /// from the handler itself, resume() takes effect for the position but never re-enters the batch being dispatched.
     bool resume();
     /// True between a successful pause() and resume() / the end of the subscription.  Freshness: this handle's own calls are
     /// visible at once; on the duty thread it reads the duty-owned state.  A pause made inside the handler becomes visible to
