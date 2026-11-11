@@ -6,7 +6,9 @@
 //   2. SecondSubscriptionUnaffected         (1 node)   a subscription paused for the whole test does not slow another one.
 //   3. LeaderChangeWhilePaused              (3 nodes)  pause at offset 500 of 1000, stop the partition leader, resume on the new one.
 //   4. ReadCommittedPauseInsideTransaction  (1 node)   a read_committed subscription pauses inside a committed transaction's batch.
-// Every drive loop has a hard iteration cap and FAILS rather than hangs; nothing waits on wall time.
+// Every drive loop has a hard iteration cap and FAILS rather than hangs; nothing waits on wall time.  Each test ends with a
+// SENTINEL record produced after the expected ones: a duplicate delivered after the last expected record arrives before the
+// sentinel, so the exact sequence (and position() == last + 1) is asserted only once the sentinel was seen.
 #include "client/ClusterClient.h"
 #include "client/OneBroker.h"
 
@@ -24,11 +26,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -114,31 +116,35 @@ std::unique_ptr<rc::Client> openClientOn(OneBroker& b, std::vector<rc::TopicSpec
     return client;
 }
 
-/// The consumer side of a handler: a bounded ring the duty thread fills and the test thread drains.  Guarded by one mutex (test
-/// scaffolding; the handler holds it for a push only).
+/// The consumer side of a handler: a fixed single-producer / single-consumer ring (the duty thread offers, the test thread
+/// drains), like a real application's.  A full ring REFUSES (tryPush returns false) and never blocks the duty thread.
 struct TestRing {
-    explicit TestRing(std::size_t cap) : capacity(cap) {}
-    std::mutex            mu;
-    std::deque<int64_t>   q;
-    std::size_t           capacity;
-    int                   pauses = 0;
+    static constexpr std::size_t kCap = 64;
+    std::array<int64_t, kCap> slots{};
+    alignas(64) std::atomic<uint64_t> head{0};   // written by the consumer
+    alignas(64) std::atomic<uint64_t> tail{0};   // written by the producer
+    std::atomic<int> pauses{0};
     /// The handler body: push, or - when full - pause naming the refused record.
     void offer(rc::Subscription& sub, const rc::Record& r) {
-        std::lock_guard<std::mutex> g(mu);
-        if (q.size() >= capacity) {
-            ++pauses;
+        const uint64_t t = tail.load(std::memory_order_relaxed);
+        if (t - head.load(std::memory_order_acquire) >= kCap) {
+            pauses.fetch_add(1, std::memory_order_relaxed);
             (void)sub.pause(r.offset);
             return;
         }
-        q.push_back(r.offset);
+        slots[t % kCap] = r.offset;
+        tail.store(t + 1, std::memory_order_release);
     }
-    /// Test thread: everything in the ring, in order; `emptied` is true when it was non-empty... and is empty now.
+    /// Test thread: up to `max` records, in order.
     std::size_t drainInto(std::vector<int64_t>& out, std::size_t max = static_cast<std::size_t>(-1)) {
-        std::lock_guard<std::mutex> g(mu);
-        const std::size_t n = std::min(q.size(), max);
-        out.insert(out.end(), q.begin(), q.begin() + static_cast<std::ptrdiff_t>(n));
-        q.erase(q.begin(), q.begin() + static_cast<std::ptrdiff_t>(n));
-        return n;
+        const uint64_t h = head.load(std::memory_order_relaxed);
+        const uint64_t n = std::min<uint64_t>(tail.load(std::memory_order_acquire) - h, max);
+        for (uint64_t i = 0; i < n; ++i) out.push_back(slots[(h + i) % kCap]);
+        head.store(h + n, std::memory_order_release);
+        return static_cast<std::size_t>(n);
+    }
+    [[nodiscard]] bool emptyForConsumer() const {
+        return head.load(std::memory_order_relaxed) == tail.load(std::memory_order_acquire);
     }
 };
 
@@ -170,6 +176,15 @@ struct CountRisk {
     int* n;
     void operator()(rc::LeaseRef, rc::AtRiskEdge) const { ++*n; }
 };
+
+/// The application thread's view of position() is eventual (a drained status snapshot): poll it, capped.
+bool awaitPosition(rc::Subscription& sub, int64_t want) {
+    for (uint64_t spin = 0; spin < kSpinCap; ++spin) {
+        if (sub.position() == want) return true;
+        std::this_thread::yield();
+    }
+    return false;
+}
 
 void expectSequence(const std::vector<int64_t>& got, int64_t first, int64_t count) {
     ASSERT_EQ(static_cast<int64_t>(got.size()), count);
@@ -209,7 +224,7 @@ TEST(SubscriptionPauseBrokerRegression, BackpressuredTailLosesNothingRegression)
     const rc::LeaseRef ref = session.add(lt, row, g.version, 2000, sentNs, &err);
     ASSERT_EQ(err, rc::OpResult::Accepted);
 
-    TestRing ring(64);
+    TestRing ring;
     std::optional<rc::Subscription> sub;
     rc::SubscribeOptions so;
     so.from = rc::From::earliest();
@@ -227,19 +242,24 @@ TEST(SubscriptionPauseBrokerRegression, BackpressuredTailLosesNothingRegression)
     for (; spin < kSpinCap && got.size() < static_cast<std::size_t>(kRecords); ++spin) {
         (void)ring.drainInto(got, 8);   // a consumer slower than the delivery: the 64-slot ring fills and the handler pauses
         // Resume only with the ring empty: pause() of the handler took effect on the duty thread; the consumer resumes it.
-        bool empty;
-        {
-            std::lock_guard<std::mutex> g2(ring.mu);
-            empty = ring.q.empty();
-        }
-        if (empty && sub->paused() && sub->resume()) ++resumes;
+        if (ring.emptyForConsumer() && sub->paused() && sub->resume()) ++resumes;
         (void)session.doWork(c.nowNs());
         std::this_thread::yield();
     }
     ASSERT_EQ(got.size(), static_cast<std::size_t>(kRecords)) << "stalled after " << spin << " iterations, " << resumes << " resumes, "
-                                                              << ring.pauses << " pauses";
-    ASSERT_NO_FATAL_FAILURE(expectSequence(got, 0, kRecords));
-    EXPECT_GE(ring.pauses, 10) << "a 64-slot ring under a 5000-record tail pauses at least 10 times";
+                                                              << ring.pauses.load() << " pauses";
+    // The sentinel: a duplicate delivered after the last expected record would arrive before it.
+    ASSERT_EQ(produceAll(c, th, 1, rc::Acks::Leader, kRecords), 1);
+    for (spin = 0; spin < kSpinCap && got.size() < static_cast<std::size_t>(kRecords) + 1; ++spin) {
+        (void)ring.drainInto(got, 8);
+        if (ring.emptyForConsumer() && sub->paused() && sub->resume()) ++resumes;
+        (void)session.doWork(c.nowNs());
+        std::this_thread::yield();
+    }
+    ASSERT_EQ(got.size(), static_cast<std::size_t>(kRecords) + 1) << "the sentinel never arrived (or a duplicate came before it)";
+    ASSERT_NO_FATAL_FAILURE(expectSequence(got, 0, kRecords + 1));
+    EXPECT_TRUE(awaitPosition(*sub, kRecords + 1)) << "position() " << sub->position();
+    EXPECT_GE(ring.pauses.load(), 10) << "a 64-slot ring under a 5000-record tail pauses at least 10 times";
     EXPECT_GE(resumes, 10);
     EXPECT_EQ(lost, 0) << "the LeaseSession never lost a lease";
     EXPECT_EQ(risk, 0) << "the LeaseSession never put a lease at risk";
@@ -395,8 +415,22 @@ TEST(SubscriptionPauseBrokerRegression, LeaderChangeWhilePausedRegression) {
     {
         std::lock_guard<std::mutex> g(mu);
         ASSERT_EQ(got.size(), static_cast<std::size_t>(kRecords)) << "stalled after the leader change";
-        ASSERT_NO_FATAL_FAILURE(expectSequence(got, 0, kRecords));   // 0..499 before the pause, 500..999 once each after it
     }
+    // Sentinel (offset 1000): a duplicate of the resumed range would arrive before it.
+    ASSERT_EQ(produceAll(*client, client->topic("moving"), 1, rc::Acks::All, kRecords), 1);
+    for (spin = 0; spin < kSpinCap; ++spin) {
+        {
+            std::lock_guard<std::mutex> g(mu);
+            if (got.size() >= static_cast<std::size_t>(kRecords) + 1) break;
+        }
+        std::this_thread::yield();
+    }
+    {
+        std::lock_guard<std::mutex> g(mu);
+        ASSERT_EQ(got.size(), static_cast<std::size_t>(kRecords) + 1) << "sentinel missing or duplicates before it";
+        ASSERT_NO_FATAL_FAILURE(expectSequence(got, 0, kRecords + 1));   // 0..499, then 500..999 once each, then the sentinel
+    }
+    EXPECT_TRUE(awaitPosition(*sub, kRecords + 1)) << "position() " << sub->position();
     sub->unsubscribe();
     client->close();
     admin->close();
@@ -472,11 +506,25 @@ TEST(SubscriptionPauseBrokerRegression, ReadCommittedPauseInsideTransactionRegre
         }
         std::this_thread::yield();
     }
-    std::lock_guard<std::mutex> g(mu);
-    // Each record once; the markers at offsets 10 and 14 are never delivered.
-    std::vector<int64_t> expect;
-    for (int i = 0; i < kBatch; ++i) expect.push_back(i);
-    for (int i = 0; i < kSecond; ++i) expect.push_back(kBatch + 1 + i);
-    EXPECT_EQ(got, expect);
+    // Sentinel: a plain (non-transactional) record at offset 15, after the second marker at 14.
+    constexpr int kSentinel = kBatch + 1 + kSecond + 1;
+    ASSERT_EQ(produceAll(c, th, 1, rc::Acks::All, 0), 1);
+    for (spin = 0; spin < kSpinCap; ++spin) {
+        {
+            std::lock_guard<std::mutex> g(mu);
+            if (got.size() >= want + 1) break;
+        }
+        std::this_thread::yield();
+    }
+    {
+        std::lock_guard<std::mutex> g(mu);
+        // Each record once; the markers at offsets 10 and 14 are never delivered; the sentinel closes the sequence.
+        std::vector<int64_t> expect;
+        for (int i = 0; i < kBatch; ++i) expect.push_back(i);
+        for (int i = 0; i < kSecond; ++i) expect.push_back(kBatch + 1 + i);
+        expect.push_back(kSentinel);
+        EXPECT_EQ(got, expect);
+    }
+    EXPECT_TRUE(awaitPosition(*sub, kSentinel + 1)) << "position() " << sub->position();
     sub->unsubscribe();
 }
