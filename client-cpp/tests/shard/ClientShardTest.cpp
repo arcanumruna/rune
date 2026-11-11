@@ -204,9 +204,11 @@ struct OwnDriverRig {
     std::unique_ptr<rs::ClientShard> shard;
     BatchLedger                      ledger;
     std::vector<rs::ShardStatus>     events;
-    explicit OwnDriverRig(const rs::ShardGroupConfig& g)
+    // gatewayEgress: the broker's constructor egress (default: the shard's own; replies follow the announced one).
+    explicit OwnDriverRig(const rs::ShardGroupConfig& g, const std::string& gatewayEgress = {})
         : broker(test_support::BrokerHost::uniqueDir(), g.base.gatewayChannel, g.base.gatewayStreamId,
-                 rs::shardClientConfig(g, 0).egressChannel, g.base.egressStreamId),
+                 gatewayEgress.empty() ? rs::shardClientConfig(g, 0).egressChannel : gatewayEgress,
+                 g.base.egressStreamId),
           shard(std::make_unique<rs::ClientShard>(g, 0)) {}
     ~OwnDriverRig() {
         if (shard) shard->closeImmediately();
@@ -771,7 +773,7 @@ TEST(ClientShardRegression, ControlOpsAcrossRebuildRegression) {
         for (int i = 0; i < 20; ++i) { r.step(1'000'000); collect(); }
         EXPECT_EQ(times[6], 0) << "held while Down: nothing is sent on a closed transport";
         r.shard->client().testSetSeedIngressChannel(goodChannel);
-        ASSERT_TRUE(r.drive([&] { collect(); return times[6] > 0; }, 100'000));
+        ASSERT_TRUE(r.drive([&] { collect(); return times[6] > 0; }, 1'000'000));
         EXPECT_EQ(status[6], rc::OpStatus::Ok);
         ASSERT_EQ(r.shard->client().ping(echo, cq, 7), rc::OpResult::Accepted);
         ASSERT_TRUE(r.drive([&] { collect(); return times[7] > 0; }, 100'000));
@@ -780,7 +782,9 @@ TEST(ClientShardRegression, ControlOpsAcrossRebuildRegression) {
         for (const rc::Token t : {5, 6, 7}) EXPECT_EQ(times[t], 1) << "token " << t << " completes exactly once";
     }
     {   // a connect pending when the Aeron client closes
-        OwnDriverRig r(ownDriverGroup(3830, 3831));
+        auto g = ownDriverGroup(3830, 3831);
+        g.base.connectTimeoutMs = 300;   // the connect sent before the close is answered nowhere: retried at this timeout
+        OwnDriverRig r(g);
         r.gw().replyConnects = false;
         ASSERT_TRUE(r.drive([&] { return r.gw().ready(); }));
         rc::Completions cq(r.shard->client());
@@ -794,7 +798,7 @@ TEST(ClientShardRegression, ControlOpsAcrossRebuildRegression) {
         ASSERT_TRUE(r.drive([&] {
             cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) { ++times; st = c.status; });
             return times > 0 && r.state() == rs::ShardState::Live;
-        }, 100'000)) << "a connect pending at the close never completed";
+        }, 1'000'000)) << "a connect pending at the close never completed";
         for (int i = 0; i < 20; ++i) {
             r.step(1'000'000);
             cq.poll([&](const rc::Completion&, std::span<const uint8_t>) { ++times; });
@@ -803,6 +807,28 @@ TEST(ClientShardRegression, ControlOpsAcrossRebuildRegression) {
         EXPECT_TRUE(st == rc::OpStatus::Ok || st == rc::OpStatus::Timeout || st == rc::OpStatus::SessionLost)
             << "status " << static_cast<int>(st);
     }
+}
+
+// The fake broker answers a Ping as ClientGateway::handlePing does (sendAnswer_): on the session's announced egress,
+// like its ConnectResponse.  On its constructor publication the first Pong after a transport rebuild was lost while the
+// client's new egress image joined (ControlOpsAcrossRebuild under TSan); here that publication leads to a port nobody
+// reads, so a Pong sent there never arrives.
+TEST(ClientShardRegression, GatewayPongRidesTheAnnouncedEgressRegression) {
+    auto g               = ownDriverGroup(3836, 3837);
+    g.base.pingTimeoutMs = 300;
+    OwnDriverRig r(g, "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPortRange(1)));
+    r.gw().replyPongs = true;
+    r.connect();
+    rc::Completions cq(r.shard->client());
+    const uint8_t   echo[] = {1};
+    ASSERT_EQ(r.shard->client().ping(echo, cq, 2), rc::OpResult::Accepted);
+    int          times = 0;
+    rc::OpStatus st    = rc::OpStatus::Closed;
+    ASSERT_TRUE(r.drive([&] {
+        cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) { ++times; st = c.status; });
+        return times > 0;
+    }, 1'000'000));
+    EXPECT_EQ(st, rc::OpStatus::Ok) << "status " << static_cast<int>(st);
 }
 
 // Storm control.  The first close rebuilds at once.  A second close before the seed reconnected (the Resuming window)
