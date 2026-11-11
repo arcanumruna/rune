@@ -647,6 +647,8 @@ struct InvokerGateway {
     /// EndTxn answers are queued instead of sent until releaseEndTxnReplies() (the request is decided and applied at once).
     bool holdEndTxnReply = false;
     std::vector<std::vector<uint8_t>> heldEndTxn_;
+    /// True while an EndTxn / AddOffsets answer is queued: a test that ends in this state forgot to release it (M-7).
+    [[nodiscard]] bool anyHeldTxnReplies() const noexcept { return !heldEndTxn_.empty() || !heldAddOffsets_.empty(); }
     void releaseEndTxnReplies() {
         holdEndTxnReply = false;
         for (auto& f : heldEndTxn_) send(0, f.data(), f.size());

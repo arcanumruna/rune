@@ -146,6 +146,7 @@ struct GRig {
         pq = std::make_unique<rc::Completions>(*client);
     }
     ~GRig() {
+        EXPECT_FALSE(gw.anyHeldTxnReplies()) << "a held coordinator answer was never released";
         session.reset();
         topic.reset();
         pq.reset();

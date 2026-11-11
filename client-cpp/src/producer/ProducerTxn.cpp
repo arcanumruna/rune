@@ -1480,11 +1480,8 @@ int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
     }
     const auto* id = std::get_if<IdAssigned>(&identity_);
     if (!coord_ || id == nullptr) return 0;
-    if (oc->sent == 0 && oc->outstanding == 0 && guard_.bound && guardBlocks_()) [[unlikely]] {   // R7: before the first TxnOffsetCommit
-        offsetsEnd_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk),
-                    "sendOffsetsToTransaction: the lease is at risk - abort the transaction", OffsetsEnd::Failed);
-        return 1;
-    }
+    // (No guard check here: a guard that blocks poisons the transaction in the same step (failGuarded / the refused-bind failure), and an
+    // AbortableError ends the call at the top of this function; the check before AddOffsetsToTxn covers a transaction begun after the block.)
     int work = 0;
     // FD5: the entries that do not fit one kCoordFrameCap frame go in the next request (slot); a pass that finds no
     // free slot leaves the rest for the next one.
