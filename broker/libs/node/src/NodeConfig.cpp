@@ -972,8 +972,8 @@ ConfigResult parseNodeConfig(
         const char* raw = getenv_fn("RUNE_MAX_NAMESPACES");
         if (raw && !std::string_view(raw).empty()) {
             int32_t v{};
-            if (!parseInt32(raw, v) || v < 1)
-                return {{}, std::string("RUNE_MAX_NAMESPACES must be a positive integer, got: ") + raw};
+            if (!parseInt32(raw, v) || v < 1 || v > NodeConfig::kMaxNamespacesCap)
+                return {{}, std::string("RUNE_MAX_NAMESPACES must be an integer in [1, 65535], got: ") + raw};
             cfg.maxNamespaces = v;
         }
         // One env var per NamespaceLimits field, in wire order (field i ↔ mask bit i).

@@ -564,6 +564,7 @@ struct NodeConfig {
     int32_t groupMaxGroups = 0;
     /// RUNE_MAX_NAMESPACES (namespaces Task 7): the cluster-wide namespace cap, `default` included.
     int32_t maxNamespaces = 1024;
+    static constexpr int32_t kMaxNamespacesCap = 65535;   ///< a slot index is a uint16_t and 0xFFFF means "no slot"
     /// RUNE_NS_DEFAULT_* (namespaces Task 7): the cluster default limits an omitted CreateNamespace field takes.
     rune::protocol::NamespaceLimits nsDefaultLimits = [] {
         rune::protocol::NamespaceLimits l{};

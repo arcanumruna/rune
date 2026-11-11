@@ -3343,6 +3343,21 @@ TEST(NodeConfigRegression, MaxNamespacesReadWithoutGroupSessionTimeoutRegression
     EXPECT_NE(r.error.find("RUNE_MAX_NAMESPACES"), std::string::npos) << r.error;
 }
 
+TEST(NodeConfigRegression, MaxNamespacesAboveTheSlotCapIsRefusedAdversarialRegression) {
+    auto env = base1node();
+    env["RUNE_AUTH"] = "disabled";
+    env["RUNE_MAX_NAMESPACES"] = "65535";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->maxNamespaces, 65535);
+    for (const char* v : {"65536", "100000", "2147483647"}) {
+        env["RUNE_MAX_NAMESPACES"] = v;
+        r = parseNodeConfig(fakeEnv(env));
+        EXPECT_FALSE(r.config.has_value()) << "RUNE_MAX_NAMESPACES=" << v << " accepted";
+        EXPECT_NE(r.error.find("65535"), std::string::npos) << r.error;
+    }
+}
+
 // Lease topics Task 21: RUNE_NS_DEFAULT_MAX_LEASES (limit field 29).  Unset -> 16 777 216 (spec 14.2); set -> carried, 0 = unlimited;
 // feature-bits (field 28) still parses as a u32 at its own offset; garbage refuses startup.
 TEST(NodeConfigRegression, NsDefaultMaxLeasesRegression) {
