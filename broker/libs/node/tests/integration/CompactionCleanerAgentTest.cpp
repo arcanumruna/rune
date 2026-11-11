@@ -1487,8 +1487,8 @@ TEST(CompactionCleanerAgentRegression, ALogHeldAtItsVerdictCoverageIsNotRescanne
 // same in-place path), so every remaining and every new segment is intact, yet the agent never selects the log again until
 // the broker restarts: a compacted topic stops compacting and grows without bound.  The mark is keyed by the log's dir and
 // only dropped when the dir leaves the view.
-// Non-urgent break (under-cleaning, no loss): #853, DISABLED until it is fixed.
-TEST(CompactionCleanerAgentRegression, DISABLED_AnUncleanableLogIsSelectedAgainOnceItsDamageIsTruncatedAwayAdversarialRegression) {
+// #853: the mark names the damaged file and goes when that file is gone or replaced.
+TEST(CompactionCleanerAgentRegression, AnUncleanableLogIsSelectedAgainOnceItsDamageIsTruncatedAwayAdversarialRegression) {
     auto dir = cp6TempDir("cp840_truncated_damage");
     Log log(dir.string(), /*rollBytes=*/128);
 
@@ -1539,6 +1539,74 @@ TEST(CompactionCleanerAgentRegression, DISABLED_AnUncleanableLogIsSelectedAgainO
         agent.doWork(now);
     }
     EXPECT_GT(agent.passesStartedForTest(), 1u) << "the log stayed uncleanable after its damage was truncated away";
+    EXPECT_EQ(agent.uncleanableLogCountForTest(), 0u);
+    fs::remove_all(dir);
+}
+
+// #853: the mark holds while the damaged segment file is unchanged and goes once the file is replaced (here: repaired in
+// place, which changes its write time), as a retention delete or a new log in the same dir would.
+TEST(CompactionCleanerAgentRegression, AnUncleanableLogIsSelectedAgainOnceItsDamagedSegmentFileIsReplacedRegression) {
+    auto dir = cp6TempDir("cp853_replaced_file");
+    Log log(dir.string(), /*rollBytes=*/128);
+
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(1841, 0.0);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->becomeLeader(1, {1});
+    for (int v = 0; v < 120; ++v) log.append(cp6Batch(v, "k" + std::to_string(v % 5), "v" + std::to_string(v)), v);
+    replica->onLeaderLogAppended();
+    const auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 4u);
+    std::vector<fs::path> logs;
+    for (const auto& e : fs::directory_iterator(dir))
+        if (e.path().extension() == ".log") logs.push_back(e.path());
+    std::sort(logs.begin(), logs.end());
+    {   // CRC-damage the last batch of the second (sealed) segment.
+        const auto sz = fs::file_size(logs[1]);
+        std::fstream f(logs[1], std::ios::in | std::ios::out | std::ios::binary);
+        char c = 0;
+        f.seekg(static_cast<std::streamoff>(sz) - 1);
+        f.read(&c, 1);
+        c = static_cast<char>(c ^ 0x5A);
+        f.seekp(static_cast<std::streamoff>(sz) - 1);
+        f.write(&c, 1);
+    }
+    rune::node::ReplicaRegistry registry;
+    PartitionReplica* raw = replica.get();
+    registry.add(1841, 0, std::move(replica));
+    rune::node::LogCleanerAgent agent(&registry, /*cycleBudgetBytes=*/0);
+    int64_t now = 1'000'000;
+    agent.doWork(now);
+    ASSERT_EQ(agent.uncleanableLogCountForTest(), 1u) << "precondition: the damage was met";
+    ASSERT_EQ(agent.passesStartedForTest(), 1u);
+
+    for (int i = 0; i < 20; ++i) {
+        now += 1'000'000;
+        agent.doWork(now);
+    }
+    EXPECT_EQ(agent.passesStartedForTest(), 1u) << "the mark was dropped while the damaged file was unchanged";
+    EXPECT_EQ(agent.uncleanableLogCountForTest(), 1u);
+    {   // repair: the same XOR restores the byte; the write changes the file's write time
+        const auto sz = fs::file_size(logs[1]);
+        {
+            std::fstream f(logs[1], std::ios::in | std::ios::out | std::ios::binary);
+            char c = 0;
+            f.seekg(static_cast<std::streamoff>(sz) - 1);
+            f.read(&c, 1);
+            c = static_cast<char>(c ^ 0x5A);
+            f.seekp(static_cast<std::streamoff>(sz) - 1);
+            f.write(&c, 1);
+        }
+        fs::last_write_time(logs[1], fs::last_write_time(logs[1]) + std::chrono::seconds(1));   // robust to a timestamp tick
+    }
+    for (int i = 0; i < 20; ++i) {
+        now += 1'000'000;
+        agent.doWork(now);
+    }
+    EXPECT_GT(agent.passesStartedForTest(), 1u) << "the log stayed uncleanable after its damaged file was replaced";
     EXPECT_EQ(agent.uncleanableLogCountForTest(), 0u);
     fs::remove_all(dir);
 }

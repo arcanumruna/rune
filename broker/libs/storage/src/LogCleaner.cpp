@@ -29,14 +29,14 @@
 
 namespace rune::storage {
 
-namespace {
-
 // Mirror LogSegment::fname — produce the on-disk path for a segment.
 std::string segmentLogPath(const std::string& dir, int64_t baseOffset) {
     std::ostringstream os;
     os << dir << "/" << std::setw(20) << std::setfill('0') << baseOffset << ".log";
     return os.str();
 }
+
+namespace {
 
 std::string segmentIndexPath(const std::string& dir, int64_t baseOffset) {
     std::ostringstream os;
@@ -666,7 +666,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
 void LogCleaner::noteDamage_(const std::string& dir, int64_t segBase, std::size_t pos) {
     if (damaged_.has_value()) return;
     damaged_ = Damaged{segBase, pos};
-    spdlog::warn("LogCleaner: damaged batch in {} segment {} at byte {}: the log is uncleanable until restart",
+    spdlog::warn("LogCleaner: damaged batch in {} segment {} at byte {}: the log is uncleanable until the damaged segment is gone or the broker restarts",
                  dir, segBase, pos);
 }
 

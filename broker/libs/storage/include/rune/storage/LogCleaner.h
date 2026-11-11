@@ -69,6 +69,9 @@ struct RangeCleanResult {
     std::vector<CleanedGroup> groups;
 };
 
+/// The on-disk path of the sealed segment `baseOffset` of the log in `dir` (LogSegment's file name).
+[[nodiscard]] std::string segmentLogPath(const std::string& dir, int64_t baseOffset);
+
 /// Kafka-style log compaction for a single Log.
 ///
 /// Mirrors Kafka's LogCleaner semantics:

@@ -107,7 +107,6 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace rune::node {
@@ -441,8 +440,13 @@ public:
 
             rune::storage::Log* log = replica->log();
             if (!log) continue;
-            // #840: a log whose cleaner met damage is never read again until restart.
-            if (!uncleanable_.empty() && uncleanable_.count(log->dir()) != 0) continue;
+            // #840: a log whose cleaner met damage is not read again while the damaged file is there (#853).
+            if (!uncleanable_.empty()) {
+                if (const auto it = uncleanable_.find(log->dir()); it != uncleanable_.end()) {
+                    if (damageStillThere_(it->first, it->second)) continue;
+                    uncleanable_.erase(it);   // #853: the damaged file is gone or replaced; a new pass decides again
+                }
+            }
 
             // Fix round 3: never start a pass while this log's previous outputs
             // are still queued for the owner (it installs one group per duty
@@ -759,9 +763,18 @@ public:
         // #840: the LogCleaner is per pass, so its sticky damage state ends with it; the agent keeps the log out of
         // selection and never advances (or persists) the watermark past damage.
         const bool damagedLog = cleaner.uncleanable();
-        if (damagedLog && uncleanable_.insert(best.dir).second) {
+        if (damagedLog && uncleanable_.find(best.dir) == uncleanable_.end()) {
             const auto dmg = cleaner.damage();
-            spdlog::warn("LogCleanerAgent: {} is uncleanable until restart (damaged batch in segment {} at byte {})",
+            DamageMark mark;
+            if (dmg) {
+                const std::string path = rune::storage::segmentLogPath(best.dir, dmg->segBase);
+                std::error_code ec;
+                const auto size  = std::filesystem::file_size(path, ec);
+                const auto mtime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
+                if (!ec) mark = DamageMark{dmg->segBase, size, mtime};   // unreadable now: segBase stays -1 (until restart)
+            }
+            uncleanable_.emplace(best.dir, mark);
+            spdlog::warn("LogCleanerAgent: {} is uncleanable until the damaged segment is gone or the broker restarts (damaged batch in segment {} at byte {})",
                          best.dir, dmg ? dmg->segBase : -1, dmg ? dmg->byteOffset : 0);
         }
 
@@ -1134,7 +1147,7 @@ private:
         // #840: forget an uncleanable log when it is deleted or unassigned (its dir leaves the view).
         for (auto it = uncleanable_.begin(); it != uncleanable_.end();) {
             bool live = false;
-            for (auto* r : view_) live = live || (r && r->isDiskBacked() && r->log() != nullptr && r->log()->dir() == *it);
+            for (auto* r : view_) live = live || (r && r->isDiskBacked() && r->log() != nullptr && r->log()->dir() == it->first);
             it = live ? std::next(it) : uncleanable_.erase(it);
         }
     }
@@ -1232,7 +1245,25 @@ private:
     /// A stalled log is looked at again at most this often: a delete retention of 0 would make every cycle the retry time and starve the others.
     static constexpr int64_t kStalledRetryFloorMs = 100;
     std::unordered_map<const rune::storage::Log*, Stalled> stalledPasses_;   ///< cleaner thread; one entry per stalled log
-    std::unordered_set<std::string> uncleanable_;   ///< #840: dirs of damaged logs (cleaner thread; cold)
+    /// #840 / #853: a damaged log and the segment file the damage was met in, as it was then.
+    struct DamageMark {
+        int64_t                         segBase = -1;   ///< -1: unknown segment, the mark holds until restart
+        std::uintmax_t                  size    = 0;
+        std::filesystem::file_time_type mtime{};
+    };
+    std::unordered_map<std::string, DamageMark> uncleanable_;   ///< by log dir (cleaner thread; cold)
+
+    /// #853: true while the file the damage was met in is still there, unchanged.  A truncation below it, a retention
+    /// delete or a new log in the same dir removes or replaces that file; the mark then goes and the log is tried again.
+    [[nodiscard]] static bool damageStillThere_(const std::string& dir, const DamageMark& m) {
+        if (m.segBase < 0) return true;
+        const std::string path = rune::storage::segmentLogPath(dir, m.segBase);
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(path, ec);
+        if (ec) return false;
+        const auto mtime = std::filesystem::last_write_time(path, ec);
+        return !ec && size == m.size && mtime == m.mtime;
+    }
     uint64_t passesStarted_ = 0;                    ///< test seam (cleaner thread)
     uint64_t cleanedSeq_ = 0;   ///< fix round 2: unique .cleaned output names (cleaner thread)
     std::array<rune::storage::Log::CleanedMember, rune::storage::LogCleaner::kMaxDeferredGroupMembers> scratchMembers_{};
