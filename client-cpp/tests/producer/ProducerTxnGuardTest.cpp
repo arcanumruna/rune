@@ -882,3 +882,149 @@ TEST(ProducerTxnGuardRegression, GuardTxnMatrixRegression) {
         EXPECT_EQ(r.endTxns(0), row.abortEnds);
     }
 }
+
+// F-12 (final review): the cells of the guard x transaction product the sampled table above does not name.
+
+// FatalError x {trip, end}: a fenced producer stays FatalError (the guard never turns it into a retryable AbortableError), the commit
+// completes with the fence (not Ok), and no EndTxn of any kind leaves.
+TEST(ProducerTxnGuardRegression, GuardEventOnFatalErrorProducerRegression) {
+    for (const Event ev : {Event::Trip, Event::Lost}) {
+        SCOPED_TRACE(name(ev));
+        GRig r;
+        r.g_now_base = g_now;
+        const auto ref = r.addLease(1);
+        rc::Producer p = r.producer("tx-f", ref);
+        p.beginTransaction();
+        r.settle();
+        r.gw.txnCoordCodes.push_back(18);   // ProducerFenced for the first coordinator request (AddPartitions)
+        r.gw.replyAcks = true;
+        const rc::Token s = r.send(p);
+        ASSERT_TRUE(r.drive([&] { return p.state() == TxnState::FatalError; })) << "the fence made the producer FatalError";
+        (void)s;
+        if (ev == Event::Trip) r.at(r.g_now_base + kAtRiskAfter);
+        else r.at(r.g_now_base + kMarginAfter);
+        ASSERT_GT(ev == Event::Trip ? r.cb.entered : r.cb.lost, 0);
+        r.settle();
+        EXPECT_EQ(p.state(), TxnState::FatalError) << "the guard event does not change a fatal state";
+        const rc::Token c = r.commit(p);
+        ASSERT_TRUE(r.await(c));
+        EXPECT_NE(r.got[c].status, OpStatus::Ok);
+        EXPECT_EQ(p.state(), TxnState::FatalError);
+        EXPECT_EQ(r.endTxnsAny(), 0);
+    }
+}
+
+// Aborting x bind refused: an abort waiting for its data is never blocked by a bind the guard refuses; it completes Ok with one
+// EndTxn(abort) and never an EndTxn(commit).
+TEST(ProducerTxnGuardRegression, RefusedBindWhileAbortingRegression) {
+    GRig r;
+    r.g_now_base = g_now;
+    const auto ref = r.addLease(1);
+    rc::Producer p = r.producerUnbound("tx-a");
+    p.beginTransaction();
+    r.settle();
+    (void)r.sendUnacked(p);
+    const rc::Token a = r.abort(p);
+    r.settle();
+    ASSERT_EQ(r.got.count(a), 0u) << "the abort waits for the unacked data";
+    ASSERT_EQ(r.session->bindProducer(ref, p), rc::OpResult::Accepted);
+    ASSERT_EQ(r.session->remove(ref), rc::OpResult::Accepted);
+    r.settle();
+    ASSERT_EQ(r.session->core().bindRefused(), 1u);
+    ASSERT_TRUE(r.await(a));
+    EXPECT_EQ(r.got[a].status, OpStatus::Ok) << "an abort is never blocked";
+    EXPECT_EQ(r.endTxns(1), 0);
+    EXPECT_EQ(r.endTxns(0), 1);
+    EXPECT_EQ(p.state(), TxnState::Ready);
+}
+
+// sendOffsetsToTransaction x {trip, end, bind refused} x {before the call, AddOffsetsToTxn answer held}: the call (or the leg in flight)
+// completes LeaseAtRisk, the transaction is AbortableError, and no TxnOffsetCommit ever leaves.
+TEST(ProducerTxnGuardRegression, SendOffsetsGuardMatrixRegression) {
+    enum class Cause { Trip, Lost, BindRefused };
+    for (const Cause cause : {Cause::Trip, Cause::Lost, Cause::BindRefused}) {
+        for (const bool held : {false, true}) {
+            SCOPED_TRACE(std::string(cause == Cause::Trip ? "trip" : cause == Cause::Lost ? "lost" : "bind refused") +
+                         (held ? " x AddOffsets held" : " x before the call"));
+            GRig r;
+            r.g_now_base = g_now;
+            const auto ref = r.addLease(1);
+            rc::Producer p = cause == Cause::BindRefused ? r.producerUnbound("tx-o") : r.producer("tx-o", ref);
+            p.beginTransaction();
+            r.settle();
+            const rc::OffsetEntry e{1, 0, 10};
+            const rc::Token o = ++r.tok;
+            auto fire = [&] {
+                if (cause == Cause::BindRefused) {
+                    ASSERT_EQ(r.session->bindProducer(ref, p), rc::OpResult::Accepted);
+                    ASSERT_EQ(r.session->remove(ref), rc::OpResult::Accepted);
+                    r.settle();
+                    ASSERT_EQ(r.session->core().bindRefused(), 1u);
+                } else if (cause == Cause::Trip) {
+                    r.at(r.g_now_base + kAtRiskAfter);
+                    ASSERT_GT(r.cb.entered, 0);
+                } else {
+                    r.at(r.g_now_base + kMarginAfter);
+                    ASSERT_GT(r.cb.lost, 0);
+                }
+            };
+            if (held) {
+                r.gw.holdAddOffsets = true;
+                ASSERT_EQ(p.sendOffsetsToTransaction(std::span<const rc::OffsetEntry>(&e, 1), "g", *r.pq, o), rc::OpResult::Accepted);
+                ASSERT_TRUE(r.drive([&] { return r.frames(TF::AddOffsets) == 1; }));
+                ASSERT_NO_FATAL_FAILURE(fire());
+                r.gw.holdAddOffsets = false;
+                r.gw.releaseAddOffsets();
+            } else {
+                ASSERT_NO_FATAL_FAILURE(fire());
+                ASSERT_EQ(p.sendOffsetsToTransaction(std::span<const rc::OffsetEntry>(&e, 1), "g", *r.pq, o), rc::OpResult::Accepted);
+            }
+            ASSERT_TRUE(r.await(o));
+            r.expectFailedAtRisk(o, "sendOffsets");
+            EXPECT_EQ(r.frames(TF::TxnOffsetCommit), 0);
+            EXPECT_EQ(p.state(), TxnState::AbortableError);
+            const rc::Token a = r.abort(p);
+            ASSERT_TRUE(r.await(a));
+            EXPECT_EQ(r.got[a].status, OpStatus::Ok);
+        }
+    }
+}
+
+// Re-arm x {poisoned transaction, aborted (Ready)}: the keepalive answer clears the guard, but a poisoned transaction still cannot
+// commit (the data after the trip is gone); a new transaction after the abort can.
+TEST(ProducerTxnGuardRegression, RearmMatrixRegression) {
+    for (const bool aborted : {false, true}) {
+        SCOPED_TRACE(aborted ? "aborted before the re-arm" : "poisoned at the re-arm");
+        GRig r;
+        r.g_now_base = g_now;
+        const auto ref = r.addLease(1);
+        rc::Producer p = r.producer("tx-r", ref);
+        p.beginTransaction();
+        r.settle();
+        ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
+        ASSERT_NO_FATAL_FAILURE(r.trip());
+        ASSERT_EQ(p.state(), TxnState::AbortableError);
+        if (aborted) {
+            const rc::Token a = r.abort(p);
+            ASSERT_TRUE(r.await(a));
+            ASSERT_EQ(r.got[a].status, OpStatus::Ok);
+        }
+        ASSERT_NO_FATAL_FAILURE(r.rearm(1));
+        if (!aborted) {
+            const rc::Token c = r.commit(p);
+            ASSERT_TRUE(r.await(c));
+            r.expectFailedAtRisk(c, "commit of the poisoned transaction after the re-arm");
+            EXPECT_EQ(r.endTxns(1), 0);
+            const rc::Token a = r.abort(p);
+            ASSERT_TRUE(r.await(a));
+            ASSERT_EQ(r.got[a].status, OpStatus::Ok);
+        }
+        p.beginTransaction();
+        r.settle();
+        ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
+        const rc::Token c2 = r.commit(p);
+        ASSERT_TRUE(r.await(c2));
+        EXPECT_EQ(r.got[c2].status, OpStatus::Ok) << "a new transaction commits once the guard is re-armed";
+        EXPECT_EQ(r.endTxns(1), 1);
+    }
+}
