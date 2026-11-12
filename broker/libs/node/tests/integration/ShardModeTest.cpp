@@ -2203,12 +2203,16 @@ void runHeldDirectClientRecoveringAfterTheLeaseIsNotReapedOnRelease(bool fast) {
     // can refresh the lease.  The fast default sends up to `burst` frames at a time, but only as many as A's ack
     // publication still has room for (a claim succeeds while its position is below the limit), so the last frames
     // still go one at a time: a burst crossing the hold would leave its later frames refused, never appended.
-    struct AckPub { std::size_t pending; int64_t position, limit; };
+    // `live` is false once the worker no longer holds a Ready ack publication for A (its session was closed: on a
+    // starved host A can miss the short lease before the test gets here) - the test then fails with that reason.
+    struct AckPub { std::size_t pending; int64_t position, limit; bool live; int state; };   // state: -1 = none
     auto ackPub = [&] {
         return node.onOwnerThreadForTest(0, 0, [&](rune::replication::PartitionReplica&) {
             const auto* w = node.workerForTest(0);
-            const auto& pub = std::get<SessionAckSink::PubReady>(*w->ackSinkForTest()->stateForTest(sidA)).pub;
-            return AckPub{w->sessionAcksPendingForTest(), pub->position(), pub->publicationLimit()};
+            const auto* st = w->ackSinkForTest()->stateForTest(sidA);
+            const auto* ready = st != nullptr ? std::get_if<SessionAckSink::PubReady>(st) : nullptr;
+            if (ready == nullptr) return AckPub{0, 0, 0, false, st != nullptr ? static_cast<int>(st->index()) : -1};
+            return AckPub{w->sessionAcksPendingForTest(), ready->pub->position(), ready->pub->publicationLimit(), true, 2};
         });
     };
     auto leo = [&] {
@@ -2220,6 +2224,10 @@ void runHeldDirectClientRecoveringAfterTheLeaseIsNotReapedOnRelease(bool fast) {
     int64_t sent = 0, ackBytes = 0;                                    // one ack's frame, measured on the first
     const int64_t leo0 = leo();
     for (AckPub p = ackPub(); sent < 200'000 && p.pending == 0;) {
+        ASSERT_TRUE(p.live) << "the worker holds no Ready ack publication for A after " << sent << " frames (sink state "
+                            << p.state << ", -1 = none; gateway lastSeenNs "
+                            << onGw([&](auto& g) { return g.sessionLastSeenNsForTest(sidA); }) << ", lost "
+                            << onGw([&](auto& g) { return g.sessionLostForTest(sidA); }) << ")";
         const int64_t n = ackBytes == 0 ? 1 : std::clamp<int64_t>((p.limit - p.position) / ackBytes, 1, burst);
         for (int64_t i = 0; i < n; ++i) {
             ASSERT_TRUE(a.produce(direct, kClientStream, sidA, c0 + sent, 0, 0, /*acks=*/0, batch));
