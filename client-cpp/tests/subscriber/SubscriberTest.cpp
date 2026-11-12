@@ -402,6 +402,49 @@ TEST(Subscriber, SeedBoundSubscriptionEndsSessionLostAndResubscribeResumesRegres
     for (int i = 0; i < N; ++i) EXPECT_EQ(c2.got[static_cast<std::size_t>(i)].offset, lastOffset + 1 + i) << "no gap, no duplicate";
 }
 
+// The same loss, with the broker silent while the first resume runs out its connect timeout (the rebuilt UDP link
+// was not warm yet).  That timeout follows the client's OWN loss: it is not a dead broker, so the seed does not fail
+// over; the machine's own retry reconnects and the re-subscribe resumes with no gap.
+// RED (mutation): SessionMachine::loseOwnSession_ does not set ownLossConnect_ -> one seed failover.
+TEST(Subscriber, SeedResumeTimeoutAfterATransportRebuildIsNotASeedFailoverRegression) {
+    SubscriberHarness h(3122, 3123, /*ownDriver=*/true);   // connect timeout 150 ms
+    h.connect();
+    constexpr int N = 5;
+    Collector c;
+    auto sub = h.client.subscribe(TopicHandle{12, 1}, 0, SubscribeOptions{From::earliest()}, c.handler());
+    h.gw.pushBatch(h.subscribed(0), 0, buildBatch(0, 4'000'000LL, "k", "v", N));
+    ASSERT_TRUE(h.drive([&] { return c.count() >= N; }));
+    const int64_t lastOffset = c.got.back().offset;
+
+    h.client.testInjectTransportFault();
+    // Only the client runs: the gateway answers nothing until one connect timeout has passed (two would still be
+    // inside the machine's budget of 3 retries).
+    bool rebuilt = false;
+    auto quietUntil = std::chrono::steady_clock::time_point::max();
+    for (int i = 0; i < 50'000'000 && std::chrono::steady_clock::now() < quietUntil; ++i) {
+        h.client.doWork();
+        if (!rebuilt && h.client.testTransportRebuilds() == 1) {
+            rebuilt    = true;
+            quietUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        }
+    }
+    ASSERT_TRUE(rebuilt);
+    ASSERT_NE(h.client.state(), rune::client::session::SessionState::Connected) << "precondition: nothing answered the resume";
+
+    ASSERT_TRUE(h.drive([&] { return h.client.state() == rune::client::session::SessionState::Connected && !sub.active(); }));
+    EXPECT_EQ(h.client.testSeedFailovers(), 0u) << "the client's own transport loss started a dead-broker failover";
+    EXPECT_EQ(sub.failReason(), SubscriptionFailReason::SessionLost);
+
+    Collector c2;
+    auto sub2 = h.client.subscribe(TopicHandle{12, 1}, 0, SubscribeOptions{From::offset(lastOffset + 1)}, c2.handler());
+    const auto& sd = h.subscribed(1);
+    h.gw.pushBatch(sd, lastOffset + 1, buildBatch(lastOffset + 1, 5'000'000LL, "k", "w", N));
+    ASSERT_TRUE(h.drive([&] { return c2.count() >= N; }));
+    h.settle(200);
+    ASSERT_EQ(c2.count(), N);
+    for (int i = 0; i < N; ++i) EXPECT_EQ(c2.got[static_cast<std::size_t>(i)].offset, lastOffset + 1 + i) << "no gap, no duplicate";
+}
+
 // ===========================================================================
 // 10. MultiRecordBatchInOrder — one batch of N records decodes in offset order.
 // ===========================================================================
