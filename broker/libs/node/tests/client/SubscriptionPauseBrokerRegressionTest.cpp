@@ -144,6 +144,9 @@ struct TestRing {
         head.store(h + n, std::memory_order_release);
         return static_cast<std::size_t>(n);
     }
+    [[nodiscard]] std::size_t sizeForConsumer() const {
+        return static_cast<std::size_t>(tail.load(std::memory_order_acquire) - head.load(std::memory_order_relaxed));
+    }
     [[nodiscard]] bool emptyForConsumer() const {
         return head.load(std::memory_order_relaxed) == tail.load(std::memory_order_acquire);
     }
@@ -241,7 +244,9 @@ TEST(SubscriptionPauseBrokerRegression, BackpressuredTailLosesNothingRegression)
     int resumes = 0;
     uint64_t spin = 0;
     for (; spin < kSpinCap && got.size() < static_cast<std::size_t>(kRecords); ++spin) {
-        (void)ring.drainInto(got, 8);   // a consumer slower than the delivery: the 64-slot ring fills and the handler pauses
+        // A consumer slower than the delivery, whatever the scheduling: it takes nothing until the 64-slot ring is full and
+        // the handler has paused (or until every record is in hand), so the pause count does not depend on thread timing.
+        if (sub->paused() || got.size() + ring.sizeForConsumer() >= static_cast<std::size_t>(kRecords)) (void)ring.drainInto(got);
         // Resume only with the ring empty: pause() of the handler took effect on the duty thread; the consumer resumes it.
         if (ring.emptyForConsumer() && sub->paused() && sub->resume()) ++resumes;
         (void)session.doWork(c.nowNs());
@@ -252,7 +257,7 @@ TEST(SubscriptionPauseBrokerRegression, BackpressuredTailLosesNothingRegression)
     // The sentinel: a duplicate delivered after the last expected record would arrive before it.
     ASSERT_EQ(produceAll(c, th, 1, rc::Acks::Leader, kRecords), 1);
     for (spin = 0; spin < kSpinCap && got.size() < static_cast<std::size_t>(kRecords) + 1; ++spin) {
-        (void)ring.drainInto(got, 8);
+        (void)ring.drainInto(got);
         if (ring.emptyForConsumer() && sub->paused() && sub->resume()) ++resumes;
         (void)session.doWork(c.nowNs());
         std::this_thread::yield();
