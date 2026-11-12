@@ -89,6 +89,31 @@ TEST(PermissionTableRegression, ClusterGrantsReachEveryTopicViewButNeverDataOrIn
     EXPECT_TRUE(t.allows(5, rs::opBit(Operation::Drop))) << "a cluster grant covers an object created after login";
 }
 
+TEST(PermissionTableRegression, OpsOnClusterAgreesWithClusterOpsRegression) {   // #224
+    rg::ObjectIndex idx;
+    const auto cl = [](Operation o) { return g(o, ResourceType::Cluster, PatternKind::Exact, ""); };
+    const std::vector<std::vector<rs::GrantSpec>> sets = {
+        {},
+        {cl(Operation::Admin)},
+        {cl(Operation::Create)},
+        {cl(Operation::Alter), cl(Operation::Drop)},
+        {cl(Operation::Describe)},
+        {cl(Operation::Create), g(Operation::Read, ResourceType::Topic, PatternKind::Exact, "t")},
+        {cl(Operation::Import)},
+    };
+    for (std::size_t i = 0; i < sets.size(); ++i) {
+        const auto t = rg::PermissionTable::compile(sets[i], idx);
+        for (uint8_t o = 0; o < 8; ++o) {
+            const uint8_t bit = rs::opBit(static_cast<Operation>(o));
+            EXPECT_EQ(t.allowsName(ResourceType::Cluster, "", bit), t.allowsCluster(bit)) << "set " << i << " op " << int(o);
+        }
+    }
+    const auto create = rg::PermissionTable::compile(sets[2], idx);
+    EXPECT_FALSE(create.allowsCluster(rs::opBit(Operation::Describe)));
+    EXPECT_FALSE(create.allowsName(ResourceType::Cluster, "", rs::opBit(Operation::Describe)))
+        << "CREATE ON CLUSTER does not imply DESCRIBE ON CLUSTER";
+}
+
 TEST(PermissionTableRegression, APrefixNeverMatchesAnInternalName) {   // I6
     rg::ObjectIndex idx; idx.onTopic(0, "__catalog_like");
     auto t = rg::PermissionTable::compile({{g(Operation::Read, ResourceType::Topic, PatternKind::Prefix, "")}}, idx);

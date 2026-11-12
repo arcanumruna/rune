@@ -27,6 +27,27 @@ TEST(SecurityPermissionsRegression, OpsOnCombinesExactPrefixClusterAndImpliedDes
     EXPECT_EQ(rs::clusterOps(grants), rs::opBit(Operation::Create));
 }
 
+// #224: the cluster resource has one definition of its effective operations (clusterOps); D15's implied DESCRIBE
+// belongs to objects, not to the cluster.
+TEST(SecurityPermissionsRegression, OpsOnClusterAgreesWithClusterOpsRegression) {
+    const auto cl = [](Operation o) { return g(o, ResourceType::Cluster, PatternKind::Exact, ""); };
+    const std::vector<std::vector<rs::GrantSpec>> sets = {
+        {},
+        {cl(Operation::Admin)},
+        {cl(Operation::Create)},
+        {cl(Operation::Alter), cl(Operation::Drop)},
+        {cl(Operation::Describe)},
+        {cl(Operation::Create), g(Operation::Read, ResourceType::Topic, PatternKind::Exact, "t")},
+        {cl(Operation::Import)},
+    };
+    for (std::size_t i = 0; i < sets.size(); ++i)
+        EXPECT_EQ(rs::opsOn(sets[i], ResourceType::Cluster, ""), rs::clusterOps(sets[i])) << "grant set " << i;
+    EXPECT_EQ(rs::opsOn(sets[2], ResourceType::Cluster, "") & rs::opBit(Operation::Describe), 0)
+        << "CREATE ON CLUSTER does not imply DESCRIBE ON CLUSTER";
+    EXPECT_EQ(rs::opsOn(sets[2], ResourceType::Topic, "x") & rs::opBit(Operation::Describe), rs::opBit(Operation::Describe))
+        << "objects keep D15";
+}
+
 // Namespaces spec §2 (owner ruling): ADMIN ON CLUSTER is root - every operation on every user object and on the
 // cluster, data included, with no other grant.  Internal (`__`) objects stay out of reach of any pattern (I6): root
 // gets on them only what an explicit CREATE/ALTER/DROP/DESCRIBE ON CLUSTER gets.  A NAMESPACE grant stays explicit
