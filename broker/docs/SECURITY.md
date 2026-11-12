@@ -56,7 +56,7 @@ Rules that keep the model small (D15 to D17):
 | `CreateView` / `AlterView` (D19) | also `READ` on every source topic |
 | `AlterSchema` / `AlterView` / `AlterTopicConfig` / `SetCompatibility` | `ALTER` on the object |
 | `DropTopic` / `DropView` | `DROP` on the object |
-| Catalog history, as-of, diff, export, replay (`__catalog` reads) (D21) | `DESCRIBE` on `CLUSTER` |
+| Catalog history, as-of, diff, export, replay (`__catalog` reads) (D21) | `DESCRIBE` on `CLUSTER`. All or nothing: a holder sees every catalog object (every tenant's names), a principal with only per-object `DESCRIBE` sees none (#220) |
 | User, role and grant DDL; every `SHOW USERS|ROLES|GRANTS|SECURITY HISTORY` (D20) | `ADMIN` on `CLUSTER` |
 | `ALTER USER <self> SET|ADD|DROP PASSWORD` (D20) | no grant, but a fresh proof of a current password (the client sends it; a session alone is not enough) |
 

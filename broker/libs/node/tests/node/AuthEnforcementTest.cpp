@@ -48,6 +48,36 @@ TEST(AuthEnforcementRegression, CatalogReadsNeedDescribeOnClusterRegression) {
     EXPECT_EQ(r.catalogSubscribe(readAll), kNotAuthorized) << "READ on every topic is not DESCRIBE ON CLUSTER (D21)";
 }
 
+// Issue #220: the catalog read is ONE check, DESCRIBE ON CLUSTER (D21), not a per-object filter.  A topic-level
+// DESCRIBE refuses the subscribe (45) yet GetTopicSchema on that topic still answers; a cluster-DESCRIBE holder with
+// no per-object grant is pushed events naming orders AND secret.  (The cluster-yes / READ-all-no half is pinned by
+// CatalogReadsNeedDescribeOnClusterRegression above.)
+TEST(AuthEnforcementRegression, CatalogReadNeedsDescribeOnClusterNotPerObjectRegression) {
+    AuthRig r;
+    const int64_t perObject = r.newUser({exact(SO::Describe, ST::Topic, "orders")});
+    const int64_t onCluster = r.newUser({cluster(SO::Describe)});
+    EXPECT_EQ(r.catalogSubscribe(perObject), kNotAuthorized) << "DESCRIBE on one topic is not a catalog read";
+    EXPECT_EQ(r.getTopicSchema(perObject, "orders"), kOk) << "the per-object request still answers";
+
+    const int64_t corr = r.c().sendCatalogSubscribe(r.ch(), r.stream(), onCluster, 0);
+    ASSERT_NE(corr, 0);
+    const auto code = r.c().awaitSubscribeCode(corr, AuthRig::dl(15));
+    ASSERT_TRUE(code.has_value());
+    ASSERT_EQ(*code, kOk);
+    const auto subId = r.c().subscriptionIdOf(corr);
+    ASSERT_TRUE(subId.has_value());
+    const auto sawName = [&](const std::string& name) {
+        for (const auto& rec : r.c().records()) {
+            if (rec.subscriptionId != *subId) continue;
+            const std::string bytes(rec.bytes.begin(), rec.bytes.end());
+            if (bytes.find(name) != std::string::npos) return true;
+        }
+        return false;
+    };
+    EXPECT_TRUE(r.c().pollUntil([&] { return sawName("orders") && sawName("secret"); }))
+        << "a cluster-DESCRIBE holder sees every catalog object, with no per-object grant on any";
+}
+
 TEST(AuthEnforcementRegression, SecurityReadsNeedAdminOnClusterRegression) {
     AuthRig r;
     const int64_t admin = r.newUser({cluster(SO::Admin)});
