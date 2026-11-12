@@ -222,10 +222,6 @@ int cmdSchemaGet(const std::vector<std::string>& args,
             return static_cast<int>(r.errorCode);
         }
         client.close();
-        if (r.errorCode == static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic)) {
-            err << "rune: unknown topic '" << topic << "'\n";
-            return static_cast<int>(r.errorCode);
-        }
         if (r.errorCode != 0) {
             err << "rune: broker error code " << r.errorCode
                 << " for topic '" << topic << "'\n";
