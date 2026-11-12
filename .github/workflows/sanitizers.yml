@@ -61,11 +61,15 @@ jobs:
             name: ASan+UBSan
             flags: -fsanitize=address,undefined -fno-omit-frame-pointer
             link: -fsanitize=address,undefined
+            # Line tables only.  With full debug info the ASan+UBSan broker tree left 7.5 GB of the runner's 106 GB,
+            # and shard 0, which also builds the client, ran out of disk at link.  -g1 keeps file:line in reports.
+            debug: -g1
             jobs: 2
           - id: tsan
             name: TSan
             flags: -fsanitize=thread -fno-omit-frame-pointer
             link: -fsanitize=thread
+            debug: -g
             jobs: 1
     env:
       UBSAN_OPTIONS: print_stacktrace=1
@@ -156,6 +160,7 @@ jobs:
             -DARCANUM_METRICS_DIR="$GITHUB_WORKSPACE/arcanum-metrics" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_FLAGS="${{ matrix.flags }}" \
+            -DCMAKE_C_FLAGS_DEBUG="${{ matrix.debug }}" -DCMAKE_CXX_FLAGS_DEBUG="${{ matrix.debug }}" \
             -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.link }}"
           # the client's conan layout puts its generators under a build/<type>/generators subfolder
           CLIENT_GEN=$(realpath "$(dirname "$(find "$GITHUB_WORKSPACE/build-client-${{ matrix.id }}" -name conan_toolchain.cmake | head -1)")")
@@ -165,6 +170,7 @@ jobs:
             -DFLIGHT_RECORDER_DIR="$GITHUB_WORKSPACE/flight-recorder" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_FLAGS="${{ matrix.flags }}" \
+            -DCMAKE_C_FLAGS_DEBUG="${{ matrix.debug }}" -DCMAKE_CXX_FLAGS_DEBUG="${{ matrix.debug }}" \
             -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.link }}"
 
       - name: Build broker
