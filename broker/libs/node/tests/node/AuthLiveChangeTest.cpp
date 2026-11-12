@@ -1192,3 +1192,138 @@ TEST(AuthLiveChangeAdversarialRegression, EverySessionEndingChangeUnderAHeldOpRi
                   0) << "the worker still owes an end";
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Issue #457 (repro): does a slow reader's ack backlog pause the worker's op ring, and so delay a REVOKE READ's OK to the
+// gate deadline?  Session(s) A produce acks=all and never read their acks (their own client: its subscription is never
+// polled); session B holds a live push subscription on another topic; an admin revokes B's READ.  One test per ingress
+// mode (worker-ingress "direct", gateway-routed) and per count of stalled sessions (1, 8), on the default and the
+// smallest ack pipe.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+struct AckState {
+    int64_t freeAckSlots = 0, reservedAckSlots = 0, ackRoom = 0, pending = 0, directInFlight = 0;
+    uint64_t ackRoomOpPauses = 0, intakePausedFrames = 0;
+};
+AckState ackStateOf(Live& t) {
+    AckState s;
+    t.b().node().onWorkerThreadForTest(0, [&](Worker& w) {
+        s.freeAckSlots = static_cast<int64_t>(w.ackSinkForTest()->freeAckSlots());
+        s.reservedAckSlots = w.reservedAckSlotsForTest();
+        s.ackRoom = s.freeAckSlots - s.reservedAckSlots;
+        s.pending = static_cast<int64_t>(w.sessionAcksPendingForTest());
+        s.directInFlight = static_cast<int64_t>(w.directAcksInFlightForTest());
+        s.ackRoomOpPauses = w.ackRoomOpPausesForTest();
+        s.intakePausedFrames = w.intakePausedFramesForTest();
+        return 0;
+    });
+    return s;
+}
+std::string show(const AckState& s) {
+    return "freeAckSlots=" + std::to_string(s.freeAckSlots) + " reservedAckSlots(O)=" + std::to_string(s.reservedAckSlots) +
+           " ackRoom=" + std::to_string(s.ackRoom) + " queuedAcks(A)=" + std::to_string(s.pending) +
+           " directInFlight=" + std::to_string(s.directInFlight) + " ackRoomOpPauses=" + std::to_string(s.ackRoomOpPauses) +
+           " intakePausedFrames=" + std::to_string(s.intakePausedFrames);
+}
+
+// Pins: non-reading producers never fill the worker's ack queue (SessionAckSink::kAckCapacity), so the op ring is never
+// paused for ack room and a revoke is answered in time.  It holds because direct sessions stop at their per-session
+// budget (SessionAckSink::kDefaultDirectSessionBudget, inside Worker::kDirectAckBudget) and gateway-routed ones at the
+// gateway's per-session credits and Worker::kRoutedAckBudget, both far below capacity minus Worker::kAckReserve.
+void revokeReadWhileAcksAreHeld(bool direct, int stalled, bool smallPipe = false) {
+    // smallPipe: the smallest ack pipe the transport allows (64 KiB control term, 1408 MTU, 1 ms client idle) so a client
+    // that reads nothing fills its window after a few hundred acks and the acks back up into the worker's ack queue.
+    AuthBroker::Options o = shardOptions();
+    if (smallPipe) {
+        o.wireIdleSleepMs = 1;
+        o.configure = [](NodeConfig& c) {
+            c.aeronControlTermBufferBytes = 1 << 16;
+            c.aeronMtuBytes = 1408;
+            c.testAeronClientIdleSleepMs = 1;
+        };
+    }
+    Live t(std::string(direct ? "r457d" : "r457g") + std::to_string(stalled) + (smallPipe ? "s" : "n"), o);
+    std::string reader;
+    const int64_t rs = t.r.newUser({exact(SO::Read, ST::Topic, "secret")}, &reader);
+    const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    ASSERT_EQ(shardProduceCode(t, ws, t.r.orders, 200), 0) << "the partition settled";
+    const auto sub = t.subscribe(rs, t.r.secret);
+    ASSERT_GT(sub.id, 0) << "B's live subscription";
+
+    // Session(s) A: their own client (own embedded driver), never polled again after the burst.
+    t.b().createUser("stalled", AuthRig::kPw, {exact(SO::Write, ST::Topic, "orders")});
+    AuthWireClient& wa = t.b().wire();
+    const std::string target = direct ? t.b().workerIngressChannel() : t.ch();
+    const auto batch = makeCharBatch(1);
+    const auto gatewayPauses = [&] {
+        return t.b().node().onControlThreadForTest([&] { return t.b().node().gatewayForTest()->heldProduceAbortsForTest(); });
+    };
+    const uint64_t abortsAtStart = gatewayPauses();
+    std::vector<int64_t> stalledSids;
+    for (int k = 0; k < stalled; ++k) {
+        const int64_t sid = wa.connect(t.ch(), rune::protocol::client::kClientVersionAuth);
+        ASSERT_GT(sid, 0);
+        stalledSids.push_back(sid);
+        ASSERT_TRUE(wa.login(t.ch(), sid, "stalled", {AuthRig::kPw, AuthRig::kPw}).ok());
+        t.b().noteLoginOk();
+        const auto make = [&](int64_t i, std::vector<uint8_t>& out) {
+            pc::Produce m;
+            m.sessionId = sid; m.correlationId = 90'000'000 + static_cast<int64_t>(k) * 1'000'000 + i;
+            m.topicId = t.r.orders; m.partition = 0; m.partitionKnown = 1;
+            m.acks = 1; m.producerId = -1; m.producerEpoch = 0; m.baseSequence = -1;
+            m.recordBatch = std::span<const uint8_t>(batch);
+            out.resize(m.encodedSize());
+            m.encode(out.data());
+        };
+        if (direct) {
+            const uint64_t before = ackStateOf(t).intakePausedFrames;
+            wa.raw().offerUntilPausedExclusive(k, target, AuthRig::stream(), make, /*maxFrames=*/60'000,
+                                                    [&] { return ackStateOf(t).intakePausedFrames > before; });
+        } else {
+            const uint64_t before = gatewayPauses();
+            wa.raw().offerUntilPaused(target, AuthRig::stream(), make, /*maxFrames=*/60'000,
+                                           [&] { return gatewayPauses() > before; });
+        }
+    }
+    // Let the worker settle what it already took (bounded), then snapshot: the stalled state.
+    t.r.c().pollFor(1500ms, [] { return false; });
+    const AckState before = ackStateOf(t);
+    // The stall is real and the gateway still holds every stalled session (a closed session would drop its acks).
+    const uint64_t abortsBefore = abortsAtStart;
+    for (const int64_t sid : stalledSids)
+        EXPECT_TRUE(t.b().node().onControlThreadForTest([&] { return t.b().node().gatewayForTest()->hasSessionForTest(sid); }))
+            << "the stalled session " << sid << " is still open on the gateway";
+    if (!direct)
+        EXPECT_GT(gatewayPauses(), abortsBefore) << "the gateway's produce budget stopped the non-reading producers";
+    const int64_t ackCapacity = static_cast<int64_t>(rune::node::SessionAckSink::kAckCapacity);
+    EXPECT_GT(before.ackRoom, ackCapacity / 2) << "the budgets leave most of the ack queue free: " << show(before);
+    EXPECT_EQ(before.ackRoomOpPauses, 0u) << "no op was ever paused for ack room before the revoke";
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto ans = t.b().admin().revoke(t.ch(), t.adminSid(), reader, false, SO::Read, ST::Topic, SP::Exact, "secret");
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    const AckState after = ackStateOf(t);
+    EXPECT_EQ(ans.errorCode, 0) << "the revoke is answered OK, not in doubt";
+    EXPECT_LT(ms, 2500) << "well inside the gate deadline (5 s)";
+    EXPECT_EQ(after.ackRoomOpPauses, 0u) << "the op ring was never paused by the ack backlog";
+    EXPECT_GT(after.ackRoom, ackCapacity / 2) << "still most of the ack queue free after the revoke: " << show(after);
+    EXPECT_EQ(t.errorOn(sub.corr, rs), 45) << "B's subscription ended explicitly";
+}
+}  // namespace
+
+TEST(AuthLiveChangeRegression, ARevokeReadIsAnsweredWhileAnotherSessionHoldsItsAcksRegression) {
+    revokeReadWhileAcksAreHeld(/*direct=*/true, 1);
+    revokeReadWhileAcksAreHeld(/*direct=*/true, 1, /*smallPipe=*/true);
+}
+TEST(AuthLiveChangeRegression, ARevokeReadIsAnsweredWhileEightSessionsHoldTheirAcksRegression) {
+    revokeReadWhileAcksAreHeld(/*direct=*/true, 8);
+    revokeReadWhileAcksAreHeld(/*direct=*/true, 8, /*smallPipe=*/true);
+}
+TEST(AuthLiveChangeRegression, ARevokeReadIsAnsweredWhileAGatewaySessionHoldsItsAcksRegression) {
+    revokeReadWhileAcksAreHeld(/*direct=*/false, 1);
+    revokeReadWhileAcksAreHeld(/*direct=*/false, 1, /*smallPipe=*/true);
+}
+TEST(AuthLiveChangeRegression, ARevokeReadIsAnsweredWhileEightGatewaySessionsHoldTheirAcksRegression) {
+    revokeReadWhileAcksAreHeld(/*direct=*/false, 8);
+    revokeReadWhileAcksAreHeld(/*direct=*/false, 8, /*smallPipe=*/true);
+}
