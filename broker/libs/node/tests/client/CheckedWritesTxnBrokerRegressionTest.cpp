@@ -79,7 +79,7 @@ std::string schema(bool replicas) {
     if (!replicas) character.replace(character.find(three), three.size(), "");
     return stmt(character) + stmt(goldenStatement("view character_name key")) + stmt(goldenStatement("view account_stats key")) +
            stmt("create view character_by_id key characterId as select * from character") + stmt(ledger) +
-           stmt("create view balances key account as select sum(amount) as balance from ledger group by account constraint non_negative check (balance >= 0)");
+           stmt("create view balances key account as select sum(amount) as balance from ledger constraint non_negative check (balance >= 0)");
 }
 
 int qlScript(const std::string& endpoint, const std::string& text, std::string* err) {
@@ -596,8 +596,9 @@ struct VoteGate {
 };
 
 /// T1 and T2 rewrite the same character and the same ledger entry and commit at once, with the votes held so that T1's reaches `character` first
-/// and T2's `ledger` first: each partition judges one and blocks the other.  With the transaction timeout `timeoutMs` one aborts by timeout
-/// within it and one pass, the other commits with its rows whole, and no commit hangs.
+/// and T2's `ledger` first: each partition judges one and blocks the other.  T1 has the transaction timeout `timeoutMs` and aborts by it within
+/// one pass; T2's timeout is kSurvivorExtra longer, so it outlives T1's locks on any host (#1006: with equal timeouts a slow runner let both
+/// expire) and commits with its rows whole.  No commit hangs.
 void expectOppositeOrderResolvesByTimeout(const char* tag, int32_t timeoutMs) {
     auto gate = std::make_shared<VoteGate>();
     Shard s(tag, fastBroker, [gate](BrokerNode& n) {
@@ -611,7 +612,9 @@ void expectOppositeOrderResolvesByTimeout(const char* tag, int32_t timeoutMs) {
     ASSERT_TRUE(c.ok());
     ASSERT_TRUE(plain.put(1, 5, 5).ok());
     std::array<std::unique_ptr<TxnClient>, 2> t;
-    for (std::size_t i = 0; i < t.size(); ++i) t[i] = std::make_unique<TxnClient>(s.b.clientConfig(), "tx-order-" + std::to_string(i), timeoutMs);   // producerId() is read on this thread
+    constexpr int32_t kSurvivorExtra = 10'000;
+    for (std::size_t i = 0; i < t.size(); ++i)   // producerId() is read on this thread
+        t[i] = std::make_unique<TxnClient>(s.b.clientConfig(), "tx-order-" + std::to_string(i), i == 0 ? timeoutMs : timeoutMs + kSurvivorExtra);
     const int64_t pid[2] = {t[0]->prod->producerId(), t[1]->prod->producerId()};
     ASSERT_GE(pid[0], 0);
     ASSERT_GE(pid[1], 0);
@@ -642,7 +645,8 @@ void expectOppositeOrderResolvesByTimeout(const char* tag, int32_t timeoutMs) {
     const auto limit = std::chrono::milliseconds(timeoutMs) + 1500ms;   // the timeout and one pass of the coordinator and the vote retry
     for (std::size_t i = 0; i < t.size(); ++i) EXPECT_LT(done[i] - t0, limit) << "commit " << i << " waited past the transaction timeout and a pass";
     const bool first = r[0] && r[0]->ok, second = r[1] && r[1]->ok;
-    EXPECT_NE(first, second) << "exactly one commits, the other aborts by timeout";
+    EXPECT_FALSE(first) << "T1 (the short timeout) aborts by its timeout";
+    EXPECT_TRUE(second) << "T2 outlives T1's locks and commits";
     const auto balance = readRow(*plain.client, balances, balances.keyOf(5));
     ASSERT_TRUE(balance.has_value());
     const bool one = readRow(*plain.client, names, names.keyOf("n1")).has_value(), two = readRow(*plain.client, names, names.keyOf("n2")).has_value();

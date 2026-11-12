@@ -252,7 +252,7 @@ TEST(FilterSchema, ParseAcceptsWriterOutput) {
     FilterBytes fb;
     FilterWriter w(std::span<uint8_t>(fb.bytes.data(), fb.bytes.size()));
     w.term(1, PrimType::UInt32, 4, Match<uint32_t>(anyOf(9u, 3u, 3u, 5u)));
-    w.term(3, PrimType::FixedStr, 8, Match<std::array<char, 8>>("eu"));
+    w.term(3, PrimType::FixedStr, 8, Match<rune::FixedString<8>>("eu"));
     w.term(6, PrimType::Int64, 8, Match<int64_t>(anyOf<int64_t>(-1, 1)));
     auto n = w.finish();
     ASSERT_TRUE(n);

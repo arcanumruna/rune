@@ -2889,9 +2889,11 @@ int ProducerImpl::flushBatches(
 //         branch: UNKNOWN_PRODUCER_ID always retries with an epoch bump).  Any
 //         attempt of b would sit above lastAckedOffset >= logStart, inside the
 //         rebuilt range, and would have created an entry — so the re-send is
-//         provably duplicate-free (no window at all, unlike U1).  The acked-
-//         data case is counted (unknownProducerIdStateLoss: the broker lost
-//         state it should have kept); it is never an app-visible failure.
+//         duplicate-free while the broker's producer id expiry
+//         (RUNE_PRODUCER_ID_EXPIRATION_MS) exceeds this client's delivery
+//         timeout (#957; no window otherwise, unlike U1).  The acked-data
+//         case is counted (unknownProducerIdStateLoss: the broker lost state
+//         it should have kept); it is never an app-visible failure.
 //         U3 (transactional, #694 / KIP-360).  A transactional epoch belongs to the coordinator, so U1 / U2's
 //         re-sequencing (a new identity) can only abort the transaction.  But UnknownProducerId means the broker
 //         holds NO producer state for us on this partition, i.e. none of our batches remain there.  If NONE of the

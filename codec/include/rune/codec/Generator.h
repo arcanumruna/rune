@@ -23,7 +23,7 @@ namespace rune::codec {
 ///   - static const Descriptor& descriptor()   (embeds the serialized blob).
 ///   - key() const (Phase 2b Part C) — ONLY when a field isKey: the key
 ///     field's value in the form rune::client::Key consumes (scalar by value,
-///     string(N) as const std::array<char,N>&, string/bytes as a
+///     string(N) as const rune::FixedString<N>&, string/bytes as a
 ///     std::span<const uint8_t> over the content).  TypedTopic::send routes by
 ///     Key(rec.key()); a schema with no key field gets no key() and its typed
 ///     records go to partition 0 with an empty record key.

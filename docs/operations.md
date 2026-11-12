@@ -277,7 +277,8 @@ sampling the file; the broker keeps no history.
 | 1000241 | `rune-txn-offset-stuck-age-ms` | gauge | control | Age of the oldest of those, in ms. A WARN names it every 30 s while any is stuck. |
 | 1000242 | `rune-ns-slot-mismatch` | counter | control | Namespace slot tags refused by the gateway or a worker (`rune.ns.slot_mismatch`): a message or request whose (slot, nsId) pair the receiver's slot table does not hold. Any rise is a bug. |
 | 1000243 | `rune-peer-hello-shed` | counter | control | Peer-link Hello / HelloV2 frames dropped because the sending peer had used its one crypto-costing Hello answer for this duty cycle (a flood, or a legitimate initiator retrying in the same cycle as a forged one). A sustained rise means an off-path Hello flood; the real initiator re-sends every 200 ms and still links. |
-| 1000270 | `rune-log-damaged-segments` | gauge | control | Sealed log segments found damaged at boot, summed over every log the node serves: bytes after the last whole batch of a segment below the recovery point. They stay on disk and reads that reach them fail (see Damaged log segments). Set once at start; damage found later is only logged. |
+| 1000270 | `rune-log-damaged-segments` | gauge | control | Sealed log segments found damaged at boot, summed over every log the node serves: bytes after the last whole batch of a segment below the recovery point. They stay on disk and reads that reach them fail (see Damaged log segments). Set once at start; damage that readers reach later is counted by `rune-log-damaged-reads`. |
+| 1000271 | `rune-log-damaged-reads` | counter | control | Subscription reads that reached a damaged or unreadable stored batch since the node started. Each one fails its subscription with `StorageError`. A value above 0 means clients are reading into damage found at boot or later. |
 
 Per-namespace metrics (one series per namespace on this node, allocated when the namespace is created and freed when it is
 erased; the key is the namespace id and the slot's owner tag is the namespace id too):
@@ -375,7 +376,8 @@ segment as it is. A sealed segment whose bytes after the last whole, CRC-valid b
 
 - **Kept.** The file is not touched (no truncation, no rename). The broker logs `Log <dir>: segment <base> is DAMAGED at byte <n>
   (offset <o>)` at error level when it finds it (at boot, or when the legacy compactor or the cleaner reloads the segment),
-  and the gauge `rune-log-damaged-segments` counts the damaged segments found at boot. A node with a damaged **partition**
+  and the gauge `rune-log-damaged-segments` counts the damaged segments found at boot; the counter `rune-log-damaged-reads`
+  counts the subscription reads that reach damage while the node runs. A node with a damaged **partition**
   segment still starts; a damaged **system log** refuses to start (below).
 - **Reads fail at the damage.** A read at or after the damaged offset, up to the next segment, is never skipped past. A consumer
   or subscription that reaches it gets `StorageError (26)` ("the stored batch is corrupt (damaged log segment)") and the client
@@ -470,9 +472,10 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
   (`verdictCheckpointsDiscarded`). When the rejected-offset index is full the judge stalls and raises `verdictStalls`.
 - **Transactions.** A transaction that writes to a verdict source is judged at a `TxnJudge` record (control record 19) that
   the leader appends when the coordinator asks for its vote. The leader's cleaner removes a `TxnJudge` once the transaction's
-  COMMIT or ABORT lies below W and every persisted constraint view has checkpointed past it. As with all compaction and
-  retention, only the partition's leader cleans: a follower keeps every record it has replicated, these included, until it
-  leads and its own cleaner passes over them (follower cleaning: #990). A node restart does not change this.
+  COMMIT or ABORT lies below W and every persisted constraint view has checkpointed past it. Only the partition's leader
+  compacts: a follower keeps what it replicated, these included, until it leads (follower compaction: #990). A follower does
+  delete whole sealed segments that lie below its leader's log start, so retention on the leader bounds a follower's disk
+  too. A node restart does not change this.
   - **Votes.** The coordinator asks the leader of every partition the transaction wrote to whether it votes yes. The judge answers
     once it has judged the transaction whole, applying its records provisionally and locking the rows it wrote; the commit or
     abort marker then finalizes the result in one step. Counters are ids 11 to 20 of `rune stats topic <t>`: `txnVotesYes`,
@@ -537,10 +540,12 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
   id. The cleaner removes every reservation record except the latest. It copies the last 32 idempotent data batches of each
   live producer whole, so a retry after a failover still finds its ids; a deleted id's tombstone is kept
   while such a batch holds that id. A producer that sent nothing for `RUNE_PRODUCER_ID_EXPIRATION_MS` (by the segment
-  append time on the broker, not the client's timestamps) is no longer protected. The memory budget for these batches is
+  append time on the broker, not the client's timestamps) is no longer protected. Keep that setting above the clients' delivery timeout, or a retry whose ack was lost can be stored a second time. The memory budget for these batches is
   the producer-tails capacity times about 1.3 KB; past it the cleaner logs once "the producer batch window ... is over its
   budget" and protects only each producer's last batch, so a late retry may complete `StoredIdUnknown`. Raise
-  `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` to avoid it.
+  `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` to avoid it. While a live producer keeps writing, the partition's cleaned-through
+  offset (`lastCleanOffset`) stays at the oldest batch the cleaner still protects for that producer; this is by design, and
+  compaction above it goes on. It moves forward once the producer's window moves past that batch or the producer expires.
 - **Stats** per partition: `idsBurned`, `reservationsAppended`, `keyZeroBatches`, `importsMovedCounter`,
   `windowFullRefusals`, `windowMisses` and `assignedKeyExists`; the checked-writes stats (C16) serve the counter, the
   reserved-through id and `idsBurned` as ids 8 to 10, the first two only on a leader whose scan has finished.

@@ -190,7 +190,7 @@ public:
         const std::string ep = "127.0.0.1:" + std::to_string(c_.ports.client[static_cast<std::size_t>(ctl - 1)]);
         std::string ddl;
         for (std::string st : rune::cli::engine::splitStatements(script.str())) {
-            if (st.starts_with("topic character "))
+            if (st.starts_with("create topic character ") || st.starts_with("topic character "))   // #1008: both forms
                 st.replace(st.find("with (cleanup.policy = compact)"), std::string_view("with (cleanup.policy = compact)").size(),
                            "with (cleanup.policy = compact, segment.bytes = " + std::to_string(segmentRollBytes_ > 0 ? segmentRollBytes_ : 65536) + ", min.compaction.lag.ms = 100, min.cleanable.dirty.ratio = 0.000001, file.delete.delay.ms = 50)");
             if (st.starts_with("create view account_stats "))
@@ -199,7 +199,7 @@ public:
         }
         if (txn_)
             for (const char* st : {"topic ledger { entryId uint64, account uint64, amount int64, memo string(16) } partitions 1 replicas 3 key entryId with (cleanup.policy = compact);",
-                                   "create view balances key account as select sum(amount) as balance from ledger group by account constraint non_negative check (balance >= 0);"})
+                                   "create view balances key account as select sum(amount) as balance from ledger constraint non_negative check (balance >= 0);"})
                 ddl += std::string(st) + "\n";
         const std::string ddlFile = (c_.clientsDir->path / "regressorspath.rql").string();
         std::ofstream(ddlFile) << ddl;
@@ -1046,7 +1046,7 @@ private:
     void replaceStats_() {
         const char* extra = ++statsReplaces_ % 2 == 1 ? ", max(lastPlayed) as lastPlayed" : "";
         const std::string text = std::string("create or replace view account_stats key userId as select count(*) as characters") + extra +
-                                 " from character group by userId constraint max_characters check (characters <= " + std::to_string(rpCap_) + ");";
+                                 " from character constraint max_characters check (characters <= " + std::to_string(rpCap_) + ");";
         for (int attempt = 0; attempt < 5; ++attempt) {
             std::string err;
             const int code = qlAny_(text, &err);

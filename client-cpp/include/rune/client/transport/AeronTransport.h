@@ -327,6 +327,10 @@ public:
         if (const auto* c = std::get_if<PubSlot::Correlated>(&m)) return c->subSlot;
         return -1;
     }
+    [[nodiscard]] std::string responseSubChannelForTest(PubHandle h) const {
+        const int32_t slot = responseSubSlotForTest(h);
+        return slot < 0 ? std::string{} : subSlots_[static_cast<std::size_t>(slot)].channel;
+    }
     void releaseSubSlotOwnerForTest(int32_t slot) noexcept { retireSubSlot_(slot); }
     /// TEST SEAMS (cold): publication Resolutions parked by drainPub_ (#763); the registration id of the response
     /// subscription a response-paired handle names (0 = none Ready); and the driver's publication-limit counters (one
@@ -574,6 +578,8 @@ public:
     /// the pair (see SeedRePairing).  True = a re-pair is in flight (or already was); false = nothing to pair.
     bool rePairSeedResponse(int32_t responsePort) noexcept;
     bool rePairResponsePublication(PubHandle h) noexcept;
+    /// #862: the same, onto another response control channel (the peer's response port moved).
+    bool rePairResponsePublication(PubHandle h, std::string_view responseControlChannel) noexcept;
     /// #989: the gateway's response publication of the seed's pair in force / of the pair of handle `h` connected and
     /// then closed (the gateway closed it or died: its image went unavailable).  True once per pair, at that edge.  A restarted gateway can never reach
     /// that subscription again (see above), so its session is gone: the caller reconnects, as Aeron Cluster's client

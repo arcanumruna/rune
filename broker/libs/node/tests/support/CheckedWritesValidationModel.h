@@ -61,7 +61,10 @@ inline TypedCheck record(const TopicWriteSpec& spec, const uint8_t* key, std::si
     if (valLen < 4) return TypedCheck::Reject;
     const uint16_t ver = static_cast<uint16_t>(le(val + 2, 2));
     const rune::codec::Descriptor* d = spec.descriptorFor(ver);
-    if (d == nullptr) return ver > spec.maxVersion() ? TypedCheck::VersionAhead : TypedCheck::Reject;
+    if (d == nullptr) {
+        if (ver <= spec.maxVersion()) return TypedCheck::Reject;
+        return valLen >= 4 + static_cast<std::size_t>(le(val, 2)) ? TypedCheck::VersionAhead : TypedCheck::Reject;   // #868
+    }
     if (le(val, 2) != d->blockLength) return TypedCheck::Reject;
     const std::size_t fixedEnd = 4 + d->blockLength;
     if (valLen < fixedEnd) return TypedCheck::Reject;

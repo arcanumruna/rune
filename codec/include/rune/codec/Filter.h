@@ -1,6 +1,7 @@
 #pragma once
 // Filter.h — Phase 2c: the filter-by-example member type (spec §4) and the canonical encoder (spec §5).
 #include <rune/codec/FilterWire.h>
+#include <rune/codec/FixedString.h>
 #include <rune/codec/PrimType.h>
 
 #include <array>
@@ -33,8 +34,6 @@ template <class T, class U>
 concept FilterValueFor = std::same_as<T, U> ||
     (std::integral<T> && std::integral<U> && !std::same_as<T, bool> && !std::same_as<U, bool>);
 
-template <class T> struct IsCharArray : std::false_type {};
-template <std::size_t N> struct IsCharArray<std::array<char, N>> : std::true_type {};
 
 /// One member of a generated E::Filter: unset (any value), Eq (one value) or In (up to 64 values, inline).
 /// Overflow / OutOfRange are terminal error states: once entered, no later assignment leaves them, so a
@@ -92,17 +91,17 @@ private:
     State   s_ = State::Unset;
 };
 
-/// FixedStr members: std::array<char, N> values; literals are zero-padded like fly::storeFixedStr.
+/// FixedStr members: rune::FixedString<N> values; literals are zero-padded like fly::storeFixedStr.
 template <std::size_t N>
-class Match<std::array<char, N>> {
+class Match<FixedString<N>> {
 public:
-    using V = std::array<char, N>;
+    using V = FixedString<N>;
     enum class State : uint8_t { Unset, Eq, In, Overflow, OutOfRange };
     static constexpr std::size_t kMaxValues = codec::kMaxFilterInValues;
     constexpr Match() noexcept = default;
     constexpr Match(const V& v) noexcept { setEq_(v); }
     template <std::size_t M> requires(M - 1 <= N)
-    constexpr Match(const char (&lit)[M]) noexcept { setEq_(pad_(lit, M - 1)); }
+    constexpr Match(const char (&lit)[M]) noexcept { setEq_(V(lit)); }
     template <std::size_t K>
     constexpr Match(const AnyOf<const char*, K>& a) noexcept { setInC_(a.v.data(), K); }
     template <std::size_t K>
@@ -110,7 +109,7 @@ public:
 
     constexpr Match& operator=(const V& v) noexcept { setEq_(v); return *this; }
     template <std::size_t M> requires(M - 1 <= N)
-    constexpr Match& operator=(const char (&lit)[M]) noexcept { setEq_(pad_(lit, M - 1)); return *this; }
+    constexpr Match& operator=(const char (&lit)[M]) noexcept { setEq_(V(lit)); return *this; }
     template <std::size_t K>
     constexpr Match& operator=(const AnyOf<const char*, K>& a) noexcept { setInC_(a.v.data(), K); return *this; }
     template <std::size_t K>
@@ -122,7 +121,6 @@ public:
     [[nodiscard]] constexpr bool        outOfRange() const noexcept { return s_ == State::OutOfRange; }
     [[nodiscard]] constexpr const V&    operator[](std::size_t i) const noexcept { return v_[i]; }
 private:
-    static constexpr V pad_(const char* p, std::size_t len) noexcept { V v{}; for (std::size_t i = 0; i < len && i < N; ++i) v[i] = p[i]; return v; }
     [[nodiscard]] constexpr bool terminal_() const noexcept { return s_ == State::Overflow || s_ == State::OutOfRange; }
     constexpr void setEq_(const V& v) noexcept {
         if (terminal_()) return;
@@ -143,7 +141,7 @@ private:
         for (std::size_t i = 0; i < count && s_ == State::In; ++i) {
             std::size_t len = 0; while (p[i][len] != '\0') ++len;
             if (len > N) { s_ = State::OutOfRange; return; }
-            v_[n_++] = pad_(p[i], len);
+            { V v{}; for (std::size_t k = 0; k < len; ++k) v[k] = p[i][k]; v_[n_++] = v; }
         }
     }
     std::array<V, kMaxValues> v_{};
@@ -237,11 +235,11 @@ private:
     // The caller's width must describe T exactly: no truncation of integers, no read past a char array.
     template <class T> static constexpr bool widthMatches_(PrimType type, uint8_t width) noexcept {
         if (width == 0 || filterValueWidth(type, width) != width) return false;
-        if constexpr (rune::IsCharArray<T>::value) return type == PrimType::FixedStr && width <= std::tuple_size_v<T>;
+        if constexpr (rune::IsFixedString<T>::value) return type == PrimType::FixedStr && width <= T::kCapacity;
         else return type != PrimType::FixedStr && width == sizeof(T);
     }
     template <class T> constexpr void storeValue_(const T& v, uint8_t width) noexcept {
-        if constexpr (rune::IsCharArray<T>::value) {
+        if constexpr (rune::IsFixedString<T>::value) {
             for (std::size_t i = 0; i < width; ++i) out_[pos_ + i] = static_cast<uint8_t>(v[i]);
         } else {
             using UT = std::make_unsigned_t<std::conditional_t<std::same_as<T, bool>, uint8_t, T>>;

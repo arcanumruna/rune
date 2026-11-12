@@ -250,14 +250,6 @@ std::expected<CompileResult, CompileError> compileView(
     const auto fail = [&](CompileErrorKind kind, const std::string& why) {
         return std::unexpected(CompileError{"view '" + authored.viewName + "': " + why, kind});
     };
-    const auto keyList = [](const std::vector<KeyComponent>& list) {
-        std::string out;
-        for (const KeyComponent& c : list) {
-            if (!out.empty()) out += ", ";
-            out += c.keyFunction == rune::codec::kKeyFunctionLower ? "lower(" + c.column + ")" : c.column;
-        }
-        return out;
-    };
 
     // --- 3. The key components: resolve each against the source, check its type and encoded width. ---
     const rune::codec::Descriptor& srcDesc = *sourceDescriptors[0];
@@ -360,13 +352,6 @@ std::expected<CompileResult, CompileError> compileView(
             if (&af != &*keyIt && af.rule == MergeRule::Replace) return nonAggregateColumn(af.name);
         }
     } else if (aggregate) {
-        const bool sameGroup = authored.groupBy.size() == components.size() &&
-            std::equal(components.begin(), components.end(), authored.groupBy.begin(), [](const KeyComponent& k, const KeyComponent& g) {
-                return k.column == g.column && k.keyFunction == g.keyFunction;
-            });
-        if (!sameGroup) {
-            return fail(CompileErrorKind::KeyInvalid, "group by (" + keyList(authored.groupBy) + ") must equal the key (" + keyList(components) + ")");
-        }
         const auto sourceKey = std::find_if(srcDesc.fields.begin(), srcDesc.fields.end(),
                                             [](const rune::codec::FieldDescriptor& f) { return f.isKey; });
         if (sourceKey == srcDesc.fields.end() || !isIntegerKeyType(sourceKey->type)) {
@@ -377,8 +362,6 @@ std::expected<CompileResult, CompileError> compileView(
         }
         if (authored.unique) return fail(CompileErrorKind::UniqueInvalid, "unique needs a projection view");
         keyFieldIds[0] = keys[0].fd->id;
-    } else if (!authored.groupBy.empty()) {
-        return fail(CompileErrorKind::KeyInvalid, "group by needs an aggregate column");
     }
 
     // --- 6. Output columns: the key columns in component order, then the remaining select items. ---

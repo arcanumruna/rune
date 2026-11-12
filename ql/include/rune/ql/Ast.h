@@ -91,12 +91,12 @@ struct ShowSecurityHistoryDef { std::optional<Grantee> who; std::string name; st
 
 // ── create view (Checked Writes Part 08) ─────────────────────────────────────
 // createView := "create" ["or" "replace"] ["transient"] ["unique"] "view" IDENT "key" keyspec "as" "select" items
-//               "from" IDENT ["group" "by" groupItem ("," groupItem)*] ("constraint" IDENT "check" "(" orExpr ")")* ";"
+//               "from" IDENT ("constraint" IDENT "check" "(" orExpr ")")* ";"
 // keyspec    := keyItem | "(" keyItem ("," keyItem)* ")"
 // keyItem    := IDENT | "lower" "(" IDENT ")" "as" IDENT
 // items      := "*" | item ("," item)*
 // item       := AGG "(" ("*" | IDENT) ")" "as" IDENT | IDENT ["as" IDENT]      AGG := count|sum|avg|min|max|last, only before "("
-// groupItem  := IDENT | "lower" "(" IDENT ")"
+// An aggregate view is grouped by its key: there is no "group by" (the parser refuses it).
 // orExpr := andExpr ("or" andExpr)*   andExpr := notExpr ("and" notExpr)*   notExpr := "not" notExpr | "(" orExpr ")" | IDENT CMP literal
 // CMP := "=" | "<>" | "<" | "<=" | ">" | ">="          literal := ["-"] INT | STRING | "true" | "false"
 // select := "select" ("*" | IDENT ("," IDENT)*) "from" IDENT "where" IDENT "=" selLit ("and" IDENT "=" selLit)* ["limit" INT] ";"
@@ -114,7 +114,7 @@ struct PredNode { PredOp op = PredOp::Column; uint16_t a = 0, b = 0; std::string
 struct ConstraintDef { std::string name; std::vector<PredNode> predicate; };
 struct CreateViewDef { std::string name; bool orReplace = false; bool transient = false; bool unique = false;
                        std::vector<KeyItem> key; std::vector<SelectItem> items; std::string source;
-                       std::vector<KeyItem> groupBy; std::vector<ConstraintDef> constraints; };
+                       std::vector<ConstraintDef> constraints; };
 
 struct WhereTerm { std::string column; Literal value; };
 struct SelectDef { std::vector<std::string> columns; /* empty = * */ std::string view; std::vector<WhereTerm> where;

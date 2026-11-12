@@ -710,7 +710,7 @@ echo "REGRESSORSPATH: OK"
 LEG="leg 9a TXN-SETUP"
 log "Leg 9a: TXN-SETUP: the ledger topic and the balances view through the CLI..."
 printf '%s\n' "topic ledger { entryId uint64, account uint64, amount int64, memo string(16) } partitions 1 replicas 3 key entryId with (cleanup.policy = compact);" \
-    "create view balances key account as select sum(amount) as balance from ledger group by account constraint non_negative check (balance >= 0);" \
+    "create view balances key account as select sum(amount) as balance from ledger constraint non_negative check (balance >= 0);" \
     > "${RUNE_AUTH_WORK_DIR}/ledger.rql"
 set +e
 out=$(rune_auth_cli_admin "${RUNE_AUTH_NETWORK}" ql -f /work/ledger.rql --broker "rune-${SEED_NODE}:${BROKER_PORT}" 2>&1); rc=$?

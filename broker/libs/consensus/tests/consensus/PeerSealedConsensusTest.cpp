@@ -28,7 +28,9 @@ extern "C" {
 #include <atomic>
 #include <deque>
 #include <functional>
+#include <iostream>
 #include <set>
+#include <vector>
 #include <string>
 #include <random>
 #include <chrono>
@@ -500,9 +502,12 @@ struct VClock {
     int64_t advance() { return t += 1'000'000; }
 };
 
-} // namespace
 
-TEST(PeerSealedConsensusRegression, NoFrameIsLostAcrossTwoRehandshakesUnderTrafficRegression) {
+/// Runs the two-rehandshake traffic scenario.  `transportDropSeqs`: the first send of each such seq, in both directions,
+/// is made while the sink is partitioned (a lost offer, exactly as a back-pressured or not-yet-connected publication
+/// loses it: UdpMessageSink::send is void and never retries); nothing sealed, so no crypto counter moves.
+void runTwoRehandshakeTraffic(const std::set<int64_t>& transportDropSeqs) {
+    const bool injected = !transportDropSeqs.empty();
     MediaDriver driver;
     aeron::Context ctx; ctx.aeronDir(driver.dir());
     auto aeron = aeron::Aeron::connect(ctx);
@@ -544,10 +549,12 @@ TEST(PeerSealedConsensusRegression, NoFrameIsLostAcrossTwoRehandshakesUnderTraff
         sh.step(now);
         std::this_thread::yield();
     };
-    auto send = [&](int from, int64_t seq) {
+    auto send = [&](int from, int64_t seq, bool injectLoss = false) {
         std::array<uint8_t, StandDownMsg::TOTAL_SIZE> f{};
         (void)StandDownMsg::encode(f.data(), 0, seq, from + 1);
+        if (injectLoss) end[from].sink->setPartitionedForTest(true);
         end[from].sink->send(2 - from, f.data(), f.size());
+        if (injectLoss) end[from].sink->setPartitionedForTest(false);
     };
     for (int i = 0; i < kPumpCap && !sh.established(); ++i) pumpOnce();
     ASSERT_TRUE(sh.established());
@@ -570,23 +577,60 @@ TEST(PeerSealedConsensusRegression, NoFrameIsLostAcrossTwoRehandshakesUnderTraff
             sh.absorb(0, std::move(o));
             ++rekeys;
         }
-        send(0, seq); send(1, seq);   // one frame each way per pump
+        const bool lose = transportDropSeqs.count(seq) != 0;
+        send(0, seq, lose); send(1, seq, lose);   // one frame each way per pump
         ++seq;
     }
     auto numbered = [](const End& e) { return static_cast<int64_t>(e.got.size() - e.got.count(0)); };
-    for (int i = 0; i < kPumpCap && (numbered(end[0]) < kN || numbered(end[1]) < kN || !sh.q.empty()); ++i)
+    // Drain until complete, or until the handshake queue is empty and nothing has arrived for kIdlePumps pumps (a
+    // transport-lost frame never arrives; the resend phase below recovers it).
+    constexpr int kIdlePumps = 3000;
+    for (int i = 0, idle = 0; i < kPumpCap && (numbered(end[0]) < kN || numbered(end[1]) < kN || !sh.q.empty()); ++i) {
+        const auto before = end[0].got.size() + end[1].got.size();
         pumpOnce();
-    std::multiset<int64_t> want;
-    for (int64_t s = 1; s <= kN; ++s) want.insert(s);
+        idle = (end[0].got.size() + end[1].got.size() != before || !sh.q.empty()) ? 0 : idle + 1;
+        if (idle >= kIdlePumps) break;
+    }
     for (auto& e : end) e.got.erase(0);
-    auto diff = [&](const std::multiset<int64_t>& got) {
-        std::string d;
-        for (int64_t s = 1; s <= kN; ++s)
-            if (const auto c = got.count(s); c != 1) d += " " + std::to_string(s) + "x" + std::to_string(c);
-        return d;
+    // Resend phase: UdpMessageSink::send is void and never retries, so an offer lost to transport (back-pressure, peer
+    // not connected under host load) is gone; the sender re-sends what the receiver lacks.  Rotation losses are still
+    // caught by the counters below, which stay unchanged.
+    constexpr int kResendRounds = 20;
+    std::set<int64_t> resent[2];   // indexed by sender
+    auto missing = [&](int from) {
+        std::vector<int64_t> m;
+        for (int64_t s = 1; s <= kN; ++s) if (end[1 - from].got.count(s) == 0) m.push_back(s);
+        return m;
     };
-    EXPECT_EQ(end[1].got, want) << "node 1 -> node 2, seq x count:" << diff(end[1].got);
-    EXPECT_EQ(end[0].got, want) << "node 2 -> node 1, seq x count:" << diff(end[0].got);
+    for (int round = 0; round < kResendRounds; ++round) {
+        const auto m0 = missing(0), m1 = missing(1);
+        if (m0.empty() && m1.empty()) break;
+        for (const int64_t s : m0) { send(0, s); resent[0].insert(s); }
+        for (const int64_t s : m1) { send(1, s); resent[1].insert(s); }
+        for (int i = 0; i < 2000 && (!missing(0).empty() || !missing(1).empty() || !sh.q.empty()); ++i) pumpOnce();
+    }
+    for (int i = 0; i < kPumpCap && !sh.q.empty(); ++i) pumpOnce();
+    for (auto& e : end) e.got.erase(0);
+    auto setStr = [](const std::set<int64_t>& v) { std::string d; for (const auto s : v) d += " " + std::to_string(s); return d; };
+    std::cerr << "resent by node 1:" << setStr(resent[0]) << "\nresent by node 2:" << setStr(resent[1]) << std::endl;
+    ::testing::Test::RecordProperty("resent_by_node1", static_cast<int>(resent[0].size()));
+    ::testing::Test::RecordProperty("resent_by_node2", static_cast<int>(resent[1].size()));
+    // sender index `from` -> receiver end[1 - from]
+    for (int from = 0; from < 2; ++from) {
+        const auto& got = end[1 - from].got;
+        std::string lost, wrong;
+        for (int64_t s = 1; s <= kN; ++s) {
+            const auto c = got.count(s);
+            if (c == 0) lost += " " + std::to_string(s);
+            else if (resent[from].count(s) == 0 ? c != 1 : c > 2) wrong += " " + std::to_string(s) + "x" + std::to_string(c);
+        }
+        EXPECT_TRUE(lost.empty()) << "node " << from + 1 << " -> node " << 2 - from << " never arrived:" << lost;
+        EXPECT_TRUE(wrong.empty()) << "node " << from + 1 << " -> node " << 2 - from
+                                   << " seq x count (1 required unless resent, then 1..2):" << wrong;
+    }
+    for (int from = 0; from < 2 && injected; ++from)
+        for (const int64_t s : transportDropSeqs)
+            EXPECT_EQ(resent[from].count(s), 1u) << "the resend path never ran for seq " << s << " from node " << from + 1;
     EXPECT_EQ(rekeys, 2);
     for (int i = 0; i < 2; ++i) {
         EXPECT_EQ(end[i].ingress->unknownEpochDrops(), 0u) << "node " << i + 1;
@@ -595,4 +639,14 @@ TEST(PeerSealedConsensusRegression, NoFrameIsLostAcrossTwoRehandshakesUnderTraff
     }
     EXPECT_EQ(end[0].sink->peerLinkEpoch(2), 3u);
     EXPECT_EQ(end[1].sink->peerLinkEpoch(1), 3u) << "the responder promoted the last epoch";
+}
+
+} // namespace
+
+TEST(PeerSealedConsensusRegression, NoFrameIsLostAcrossTwoRehandshakesUnderTrafficRegression) {
+    runTwoRehandshakeTraffic({});
+}
+
+TEST(PeerSealedConsensusRegression, ATransportLostOfferIsResentNotCountedAsARotationLossRegression) {
+    runTwoRehandshakeTraffic({37, 120, 260, 333});   // both sides of the rekeys at seq 100 and 250
 }

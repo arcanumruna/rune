@@ -45,7 +45,6 @@ ViewPlan aggregate(std::vector<KeyComponent> key, const char* sourceKey = "userI
     ViewPlan v;
     v.viewName = "device_history";
     v.sources = {{5, sourceKey}};
-    v.groupBy = key;
     v.keyComponents = std::move(key);
     v.output = {{"uses", PrimType::Int64, 0, "", MergeRule::CountAll}, {"lastSeen", PrimType::Int64, 0, "lastSeen", MergeRule::Max}};
     return v;
@@ -251,7 +250,7 @@ TEST(CheckedWritesPlanCompile, SingleEightByteGroupKeyStaysLegacy) {
     ViewPlan w;
     w.viewName = "device_count";
     w.sources = {{5, "userId"}};
-    w.keyComponents = w.groupBy = {{"userId", 0, "userId"}};
+    w.keyComponents = {{"userId", 0, "userId"}};
     w.output = {{"n", PrimType::Int64, 0, "", MergeRule::CountAll}};
     const auto v2 = compileView(w, std::array<const rune::codec::Descriptor*, 1>{&d}, 0x40000008);
     ASSERT_TRUE(v2.has_value()) << v2.error().message;
@@ -298,15 +297,17 @@ TEST(CheckedWritesPlanCompile, NarrowAndEnumGroupKeysAreKeyed) {
     EXPECT_EQ(u16->plan.keyWidth, 2u);
 }
 
-TEST(CheckedWritesPlanCompile, GroupByMustEqualTheKey) {
+TEST(CheckedWritesPlanCompileRegression, AggregateWithoutGroupByCompilesRegression) {
+    // #1009: there is no group by; an aggregate is grouped by its key, which the compiler reads from the plan.
     const auto d = deviceSource();
-    auto v = aggregate({{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}});
-    v.groupBy = {{"deviceFp", 0, "deviceFp"}, {"userId", 0, "userId"}};
-    expectRefused(compileOver(v, d), Kind::KeyInvalid, "group by (deviceFp, userId) must equal the key (userId, deviceFp)");
-    v.groupBy.clear();
-    expectRefused(compileOver(v, d), Kind::KeyInvalid, "group by () must equal the key (userId, deviceFp)");
-    v.groupBy = {{"userId", 0, "userId"}, {"deviceFp", 1, "deviceFp"}};
-    expectRefused(compileOver(v, d), Kind::KeyInvalid, "group by (userId, lower(deviceFp)) must equal the key (userId, deviceFp)");
+    const auto r = compileOver(aggregate({{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}}), d);
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    EXPECT_EQ(keyModeOf(r->plan), ViewKeyMode::Keyed);
+    ASSERT_EQ(r->outputDescriptor.fields.size(), 4u);
+    EXPECT_EQ(slotName(*r, 0), "userId");
+    EXPECT_EQ(slotName(*r, 1), "deviceFp");
+    EXPECT_EQ(slotName(*r, 2), "uses");
+    EXPECT_EQ(slotName(*r, 3), "lastSeen");
 }
 
 TEST(CheckedWritesPlanCompile, KeyedAggregateNeedsAnIntegerSourceKey) {
@@ -459,13 +460,6 @@ TEST(CheckedWritesPlanV2, CompiledDecodeRefusesAnUnknownKeyFunctionRegression) {
     auto wrongWidth = bytes;
     wrongWidth[firstComponent + 3] = 4;
     EXPECT_FALSE(deserializeCompiledViewPlan(wrongWidth).has_value());
-}
-
-TEST(CheckedWritesPlanCompile, GroupByWithoutAnAggregateColumnRegression) {
-    const auto d = deviceSource();
-    auto v = aggregate({{"userId", 0, "userId"}});
-    v.output = {replaceOf(d, "lastSeen")};
-    expectRefused(compileOver(v, d), Kind::KeyInvalid, "group by needs an aggregate column");
 }
 
 TEST(CheckedWritesPlanCompile, AliasedV1KeyColumnCompilesAsBeforeRegression) {

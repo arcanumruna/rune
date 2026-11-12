@@ -834,3 +834,23 @@ TEST(AuthEnforcementAdversarialRegression, ManyHeldSubscribesAreEachRefusedOnceA
     EXPECT_EQ(r.gw.subscriptionCount(), 0u);
     EXPECT_EQ(r.gw.pendingRecordEgressCountForTest(), 0u);
 }
+
+// #882: workers report their cumulative damaged-read counts as SessionSignal DamagedRead; the gateway sums the latest
+// count of each worker (a later report replaces the earlier one, it does not add to it).
+TEST(DamagedReadsGatewayRegression, WorkerCountsAreSummedAsLatestCumulativeRegression) {
+    Rig r(2, 2);
+    ASSERT_EQ(r.gw.damagedReadsTotal(), 0u);
+    const auto report = [&](int32_t worker, int64_t count) {
+        rune::node::WorkerReturn ret;
+        ret.type       = rune::node::WorkerReturn::Type::SessionSignal;
+        ret.lastOffset = static_cast<int64_t>(rune::node::SessionSignalKind::DamagedRead);
+        ret.partition  = worker;
+        ret.baseOffset = count;
+        r.gw.handleWorkerReturnForTest(ret);
+    };
+    report(0, 2);
+    report(1, 3);
+    EXPECT_EQ(r.gw.damagedReadsTotal(), 5u);
+    report(0, 4);
+    EXPECT_EQ(r.gw.damagedReadsTotal(), 7u);
+}

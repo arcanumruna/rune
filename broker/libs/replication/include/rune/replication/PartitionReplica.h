@@ -90,6 +90,9 @@ struct ReplicaPositionReport {
 // ---------------------------------------------------------------------------
 enum class Role { Leader, Follower };
 
+/// #830: who reads the truncation floor.  Each consumer has its own floor; a take resets only its own.
+enum class CutConsumer : uint8_t { VerdictTimeline = 0, Metadata = 1 };
+
 // ---------------------------------------------------------------------------
 // Error codes (returned in FetchResponseMsg::errorCode)
 // ---------------------------------------------------------------------------
@@ -802,10 +805,12 @@ public:
     [[nodiscard]] Offset      lastTruncationOffset() const noexcept { return lastTruncationOffset_; }
     /// #809: the LOWEST cut since the previous take (max = none), then reset.  lastTruncationOffset() is only the last cut; two
     /// cuts X < Y between two worker passes leave a consumer that folds a timeline (the verdict timeline) holding entries in [X, Y).
-    /// Exactly one consumer takes it (the worker's verdictOnLogCut_); nothing else resets it.
-    [[nodiscard]] Offset      takeTruncationFloor() noexcept {
-        const Offset f = cutFloor_;
-        cutFloor_ = std::numeric_limits<Offset>::max();
+    /// One floor per consumer (#830): each consumer's take resets only its own, so one consumer's pass never hides a cut
+    /// from another.  The default is the worker's verdict timeline (verdictOnLogCut_); MetadataService takes Metadata.
+    [[nodiscard]] Offset      takeTruncationFloor(CutConsumer who = CutConsumer::VerdictTimeline) noexcept {
+        Offset& slot = cutFloor_[static_cast<std::size_t>(who)];
+        const Offset f = slot;
+        slot = std::numeric_limits<Offset>::max();
         return f;
     }
     /// F15 S4: bumped on every Leader <-> Follower transition (becomeLeader from
@@ -885,6 +890,11 @@ public:
     }
     [[nodiscard]] Role cleanerRole() const noexcept {
         return static_cast<Role>(publishedRoleForCleaner_.load(std::memory_order_acquire));
+    }
+    /// Cleaner thread: the leader's log start a disk-backed follower last heard (0 = none).  A follower's retention
+    /// deletes only sealed segments wholly below it, so it never trims more than its leader (#990).
+    [[nodiscard]] Offset cleanerLeaderLogStart() const noexcept {
+        return publishedLeaderLogStartForCleaner_.load(std::memory_order_acquire);
     }
     // Task #13: gatewayHighWatermark() — acquire-load of the same published-HW
     // atomic used by the LogCleanerAgent.  The owning worker publishes with
@@ -983,7 +993,10 @@ public:
     /// cleaner; the owner validates (identity, not active, segment end <= HW)
     /// and only then renames the files away.  Disk-backed only.
     int drainRetentionDeletesOnOwner() {
-        return log()->drainRetentionDeletes(std::min(highWatermark(), retentionHold_));
+        // A follower only ever deletes below its leader's log start, and the leader applied the hold before it moved
+        // its start; a follower's own hold is not fed (its constraint-set scan runs on the leader) (#990).
+        const Offset bound = role_ == Role::Leader ? std::min(highWatermark(), retentionHold_) : highWatermark();
+        return log()->drainRetentionDeletes(bound);
     }
     /// Owner thread: retention keeps the segment holding `offset` and everything above it (the latest committed
     /// constraint-set change must outlive retention until a newer one is committed).  INT64_MAX = no hold.
@@ -1339,6 +1352,8 @@ public:
     [[nodiscard]] uint64_t recordTooLargeServed() const noexcept { return recordTooLargeServed_; }
     /// Leader: fetches answered kErrCorruptRecord (the batch at the fetch offset is stored damaged).
     [[nodiscard]] uint64_t corruptReadsServed() const noexcept { return corruptReadsServed_; }
+    /// #875: push-side reads that found the leader's copy damaged (one per follower cursor, not one per pass).
+    [[nodiscard]] uint64_t corruptPushReadsForTest() const noexcept { return corruptPushReads_; }
     /// Follower: times this replica wedged on an unreplicable batch.
     [[nodiscard]] uint64_t wedgedRefusals() const noexcept { return wedgedRefusals_; }
     /// Follower: the offset it is wedged at (stops fetching it), or -1.
@@ -1465,6 +1480,7 @@ private:
     }
     void resetLeaderLogStart_() noexcept {
         leaderLogStart_ = memoryBacked_ && memLog_ != nullptr ? memLog_->logStartOffset() : 0;
+        publishedLeaderLogStartForCleaner_.store(0, std::memory_order_release);
     }
     static constexpr Offset kNoLeaseFloor = std::numeric_limits<Offset>::max();
     bool        leaseTransient_    = false;
@@ -1553,7 +1569,7 @@ private:
     void rebuildEpochCacheFromLog_();
 
     /// Build a FetchResponseMsg stamped with this partition's identity
-    /// (epoch/partitionId/topicId, logStartOffset=0) plus the given HW,
+    /// (epoch/partitionId/topicId, the log start) plus the given HW,
     /// errorCode and records.  ZERO-COPY: `records` is a view (into the log's
     /// read mmap, or an empty span for an error/HW-only reply) that the caller
     /// MUST keep alive until transport_->sendFetchResponse()/sendReconcileResponse()
@@ -1569,9 +1585,10 @@ private:
         r.leaderEpoch    = epoch_;
         r.partition      = cfg_.partitionId;
         r.highWatermark  = highWatermark;
-        // Phase 2b E2: a TRANSIENT leader advertises its ring start — a follower
-        // below it restarts its ring there (applyReplicated).  Disk: 0, unchanged.
-        r.logStartOffset = memoryBacked_ ? memLog_->logStartOffset() : 0;
+        // A leader advertises its log start.  A transient follower below it restarts its ring there; a disk-backed
+        // follower trims the sealed segments wholly below it (#990).
+        r.logStartOffset = memoryBacked_ ? memLog_->logStartOffset()
+                                         : (diskLog_ != nullptr ? diskLog_->logStartOffset() : 0);
         r.errorCode      = errorCode;
         r.topicId        = cfg_.topicId;
         r.records        = records;
@@ -1768,7 +1785,8 @@ private:
     uint64_t logGeneration_ = 0;           ///< F15: bumped on truncation
     uint64_t leaderAnswers_ = 0;           ///< issues #15 / #111: accepted current-leader answers (see leaderAnswers())
     Offset   lastTruncationOffset_ = 0;    ///< F15: cut point of the last generation bump
-    Offset   cutFloor_ = std::numeric_limits<Offset>::max();   ///< #809: lowest cut point since takeTruncationFloor()
+    /// #809/#830: lowest cut point since each consumer's takeTruncationFloor()
+    std::array<Offset, 2> cutFloor_{std::numeric_limits<Offset>::max(), std::numeric_limits<Offset>::max()};
     uint64_t leadershipGeneration_ = 0;    ///< F15 S4: bumped on every Leader <-> Follower transition
     uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_
     static constexpr Offset kChangedFromLatest = INT64_MIN;
@@ -1858,6 +1876,7 @@ private:
     // F18 unreplicable-batch state (see kErrRecordTooLarge).
     uint64_t recordTooLargeServed_ = 0;
     uint64_t corruptReadsServed_   = 0;   ///< #839: fetches answered kErrCorruptRecord
+    uint64_t corruptPushReads_     = 0;   ///< #875: push reads that hit a damaged range
     uint64_t wedgedRefusals_       = 0;
     Offset   wedgedAtOffset_       = -1;
     void wedgeAt_(Offset at, const char* why);   ///< F18: enter the wedged state (log + count)
@@ -2235,6 +2254,8 @@ private:
     // D3b fix round 1: min fetch position over every assigned replica — see
     // cleanerMarkerRemovalBound().  0 until the first leader publication.
     std::atomic<Offset> publishedMarkerBoundForCleaner_{0};
+    // #990: the current leader's log start as this follower last heard it (0 = unknown, or this replica leads).
+    std::atomic<Offset> publishedLeaderLogStartForCleaner_{0};
 
     // Controller position snapshot (see controllerReplicaLeo()/controllerLeaderEpoch()).
     // Per-node published LEO (stored as leo+1; 0 = unknown), indexed by nodeId.

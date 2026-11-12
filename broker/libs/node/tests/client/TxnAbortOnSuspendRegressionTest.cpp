@@ -37,6 +37,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -243,22 +245,38 @@ void produceOne(rc::Client& c, rc::TopicHandle th, const std::string& v) {
     ASSERT_EQ(p.closeAndWait(30s), rc::OpStatus::Ok);
 }
 
+/// Handler calls that arrived after their CommittedReader was destroyed (#896, #778): each would have touched a dead
+/// reader's mutex and vector.  They are counted through a heap token the handler owns, never through the reader.
+std::atomic<int> gReaderCallsAfterDestruction{0};
+
 /// A live read_committed subscription of partition 0 from the earliest offset.
 struct CommittedReader {
     std::mutex mu;
     std::vector<std::string> values;
+    std::shared_ptr<std::atomic<bool>> alive = std::make_shared<std::atomic<bool>>(true);
     rc::Subscription sub;
     CommittedReader(rc::Client& c, rc::TopicHandle th) : sub(open(c, th)) {}
     rc::Subscription open(rc::Client& c, rc::TopicHandle th) {
         rc::SubscribeOptions o;
         o.from      = rc::From::earliest();
         o.isolation = rc::Isolation::ReadCommitted;
-        return c.subscribe(th, 0, o, [this](const rc::Record& r) {
+        return c.subscribe(th, 0, o, [this, alive = alive](const rc::Record& r) {
+            if (!alive->load()) { ++gReaderCallsAfterDestruction; return; }
             std::lock_guard<std::mutex> lk(mu);
             values.emplace_back(reinterpret_cast<const char*>(r.value.data()), r.value.size());
         });
     }
-    ~CommittedReader() { sub.unsubscribe(); }
+    ~CommittedReader() {
+        sub.unsubscribe();
+        // #896 / #778: unsubscribe() only submits the request; a handler call can still run afterwards.  finished()
+        // means none can (Subscription.h), so wait for it before mu and values die.
+        const bool finished = waitFor([this] { return sub.finished(); }, 30s);
+        alive->store(false);
+        if (!finished) {
+            std::fprintf(stderr, "CommittedReader: the subscription never finished after unsubscribe\n");
+            std::abort();   // freeing the reader under a live handler would be a use-after-free
+        }
+    }
     std::vector<std::string> snapshot() {
         std::lock_guard<std::mutex> lk(mu);
         return values;
@@ -413,4 +431,33 @@ TEST(TxnAbortOnSuspendRegression, SuspendThenRestartAbortsRegression) {
     ASSERT_TRUE(waitFor([&] { return reader.has("S"); }, 40s))
         << "the sentinel never became visible: the open transaction survived the suspend + restart";
     for (const std::string& v : reader.snapshot()) EXPECT_EQ(v, "S") << "an aborted record is visible to read_committed";
+}
+
+// #896 / #778: a CommittedReader destroyed while records are still being delivered.  unsubscribe() only submits the
+// request; a handler call can still run on the client's duty thread afterwards (Subscription.h: wait for finished()).
+// The reader's handler locks the reader's mutex and appends to its vector, so such a call used freed memory: the
+// SuspendThenRestart scenario resets its reader right after the suspend's abort releases the sentinel, and once hung
+// for 600 s (#896) and once segfaulted (#778).  The destructor must leave no handler call to run.
+TEST(TxnAbortOnSuspendRegression, CommittedReaderNoHandlerCallAfterDestructionRegression) {
+    Fix f("txnabort_reader");
+    const rc::TopicHandle th = Fix::handleOf(f.tA);
+    constexpr int kRecords = 20'000;
+    {
+        rc::ProducerConfig pcfg;
+        pcfg.acks = rc::Acks::Leader;
+        rc::Producer p = f.admin->producer(pcfg);
+        const std::string v(64, 'r');
+        for (int i = 0; i < kRecords; ++i) p.send(th, rc::Key(static_cast<int64_t>(i)), bytesOf(v));
+        ASSERT_EQ(p.closeAndWait(60s), rc::OpStatus::Ok);
+    }
+    gReaderCallsAfterDestruction = 0;
+    for (int round = 0; round < 5; ++round) {
+        auto reader = std::make_unique<CommittedReader>(*f.admin, th);
+        ASSERT_TRUE(waitFor([&] { return !reader->snapshot().empty(); }, 30s)) << "the reader never received a record";
+        ASSERT_LT(reader->snapshot().size(), static_cast<std::size_t>(kRecords)) << "premise: destroyed mid-delivery";
+        reader.reset();
+    }
+    std::this_thread::sleep_for(500ms);   // any late handler call has run by now
+    EXPECT_EQ(gReaderCallsAfterDestruction.load(), 0)
+        << "a handler call ran after its CommittedReader was destroyed (use-after-free in the uninstrumented reader)";
 }

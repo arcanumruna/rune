@@ -36,13 +36,20 @@ void scanBeforeFree(void* p) noexcept {
 }
 /// While the scan is armed a new block starts zeroed: a reused chunk can carry stale bytes from a block freed while the
 /// scan was off (the test's own unwiped copies), and only bytes written by the code under test may count as a hit.
-void* scrubIfScanning(void* p) noexcept {
+/// The slack past the requested size (malloc_usable_size) is cleared too, byte by byte, because a fortified memset
+/// over the usable size aborts (#997).
+void* scrubIfScanning(void* p, std::size_t requested) noexcept {
     if (t_needle == nullptr || p == nullptr) return p;
 #if defined(__APPLE__)
-    std::memset(p, 0, malloc_size(p));
+    const std::size_t usable = malloc_size(p);
 #else
-    std::memset(p, 0, malloc_usable_size(p));
+    const std::size_t usable = malloc_usable_size(p);
 #endif
+    std::memset(p, 0, requested);
+    // The slack past the requested size can hold stale bytes too.  It is cleared byte by byte through a volatile
+    // pointer: a fortified memset checks against the requested size and aborts (#997).
+    volatile unsigned char* tail = static_cast<unsigned char*>(p);
+    for (std::size_t i = requested; i < usable; ++i) tail[i] = 0;
     return p;
 }
 /// True when this allocation is the injected failure (counts down the armed n).
@@ -57,7 +64,7 @@ void* operator new(std::size_t n) {
     if (g_on.load(std::memory_order_relaxed)) g_count.fetch_add(1, std::memory_order_relaxed);
     if (t_on) ++t_count;
     if (injectFailure()) throw std::bad_alloc{};
-    if (void* p = std::malloc(n != 0 ? n : 1)) return scrubIfScanning(p);
+    if (void* p = std::malloc(n != 0 ? n : 1)) return scrubIfScanning(p, n != 0 ? n : 1);
     throw std::bad_alloc{};
 }
 void* operator new[](std::size_t n) { return ::operator new(n); }
@@ -71,7 +78,7 @@ void* operator new(std::size_t n, std::align_val_t al) {
     if (injectFailure()) throw std::bad_alloc{};
     const std::size_t a = static_cast<std::size_t>(al);
     const std::size_t sz = ((n != 0 ? n : 1) + a - 1) / a * a;  // aligned_alloc: size % align == 0
-    if (void* p = std::aligned_alloc(a, sz)) return scrubIfScanning(p);
+    if (void* p = std::aligned_alloc(a, sz)) return scrubIfScanning(p, sz);
     throw std::bad_alloc{};
 }
 void* operator new[](std::size_t n, std::align_val_t al) { return ::operator new(n, al); }

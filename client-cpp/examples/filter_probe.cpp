@@ -246,7 +246,7 @@ std::size_t encodeV1(const Ev& e, int64_t sendNs, uint8_t* buf) {
     ev.playerId = e.playerId;
     ev.worldId  = e.worldId;
     ev.channel  = e.channel;
-    ev.zone     = {'e', 'u'};
+    ev.zone     = "eu";
     ev.kind     = static_cast<int32_t>(1 + e.seq % 3);
     ev.alive    = (e.seq & 1) != 0;
     ev.hp       = sendNs;

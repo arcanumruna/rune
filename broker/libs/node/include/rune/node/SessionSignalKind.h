@@ -53,6 +53,10 @@ enum class SessionSignalKind : int64_t {
     /// The control thread holds the handshake frame that lets the peer seal under the epoch until every plane sent it.
     /// Never dropped (enqueueSignal_).
     PeerLinkKeysApplied = 13,
+    /// #882: NOT a session signal - a worker's read reached a damaged or unreadable stored batch and failed its
+    /// subscription (`rune-log-damaged-reads`): WorkerReturn::baseOffset = the worker's cumulative count, ::partition =
+    /// the worker.
+    DamagedRead = 14,
 };
 
 } // namespace rune::node

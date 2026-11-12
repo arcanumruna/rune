@@ -62,6 +62,7 @@ enum class RuneMetric : std::int32_t {
     NsSlotMismatch             = 1'000'242,   // monotonic: namespace slot tags refused (gateway + every worker)
     PeerHelloShed              = 1'000'243,   // monotonic: crypto-costing peer Hellos dropped over the per-peer budget
     DamagedSegments            = 1'000'270,   // gauge: damaged sealed log segments found at boot (every log the node serves)
+    DamagedReads               = 1'000'271,   // monotonic: subscription reads that reached damaged stored data
 };
 
 /// Per-namespace rows (namespaces Phase 2 Task 8): allocated per namespace on the control thread when it is created,
@@ -87,7 +88,7 @@ using M = RuneMetric;
 }  // namespace detail
 
 /// One row per live metric, in type-id order.  The row index is the slot index in BrokerNode::slots_.
-inline constexpr std::array<RuneMetricDef, 33> kRuneMetrics = {{
+inline constexpr std::array<RuneMetricDef, 34> kRuneMetrics = {{
     {detail::M::Role,                      detail::K::Gauge,   "rune-cluster-node-role",                       detail::O::Observer},
     {detail::M::Term,                      detail::K::Gauge,   "rune-cluster-leadership-term",                 detail::O::Observer},
     {detail::M::StuckMarkers,              detail::K::Gauge,   "rune-txn-stuck-markers",                       detail::O::Control},
@@ -121,6 +122,7 @@ inline constexpr std::array<RuneMetricDef, 33> kRuneMetrics = {{
     {detail::M::NsSlotMismatch,            detail::K::Counter, "rune-ns-slot-mismatch",                        detail::O::Control},
     {detail::M::PeerHelloShed,             detail::K::Counter, "rune-peer-hello-shed",                         detail::O::Control},
     {detail::M::DamagedSegments,           detail::K::Gauge,   "rune-log-damaged-segments",                    detail::O::Control},
+    {detail::M::DamagedReads,              detail::K::Counter, "rune-log-damaged-reads",                       detail::O::Control},
 }};
 
 /// The metric's type id in the metrics file (D61: the enumerator value, equal to the old Aeron counter type id).

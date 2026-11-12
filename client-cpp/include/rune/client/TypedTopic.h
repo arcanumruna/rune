@@ -57,6 +57,7 @@
 #include <rune/client/TopicHandle.h>
 #include <rune/client/WriteResult.h>
 #include <rune/codec/Fingerprint.h>
+#include <rune/codec/FixedString.h>
 #include <rune/codec/Serialize.h>
 
 #include <array>
@@ -153,9 +154,7 @@ struct ClaimScratch<T, std::void_t<typename T::ClaimEncoder>> {
 struct ClaimInPlace {};
 
 template <class K>
-struct IsCharArray : std::false_type {};
-template <std::size_t N>
-struct IsCharArray<std::array<char, N>> : std::true_type {};
+struct IsCharArray : ::rune::IsFixedString<K> {};  // a string(N) key field: rune::FixedString<N>
 }  // namespace detail
 
 template <class E>
@@ -369,7 +368,7 @@ public:
     [[nodiscard]] TypedClaim<typename U::ClaimEncoder> claim(std::string_view keyValue) {
         using E = typename U::ClaimEncoder;
         using K = typename E::KeyType;
-        constexpr std::size_t N = std::tuple_size_v<K>;
+        constexpr std::size_t N = K::kCapacity;
         constexpr std::size_t kLimit = N < Key::kMaxInline ? N : Key::kMaxInline;
         if (keyValue.size() > kLimit) [[unlikely]] {
             throw std::invalid_argument("TypedTopic::claim: key is " + std::to_string(keyValue.size()) +

@@ -655,7 +655,8 @@ namespace detail {
 /// The one per-record rule set.  `level` is the cluster metadata feature level: at kCheckedWrites every typed topic
 /// validates fully (UTF-8, wire key = key field); below it only a topic created with `validate` checks, as before.
 /// A tombstone (empty or null value) is never decoded: its key must be the key field's width.  A record of a version
-/// above the highest installed one is VersionAhead (retriable: the version's SchemaUpdate has not landed here yet).
+/// above the highest installed one is VersionAhead (retriable: the version's SchemaUpdate has not landed here yet)
+/// when the fixed block its header declares fits in the value; otherwise Reject.
 [[nodiscard]] inline TypedCheck checkTypedRecord(const TopicWriteSpec& spec, const rune::protocol::RecordSpan& r, int16_t level) noexcept {
     const bool checked = level >= rune::replication::MetadataFeature::kCheckedWrites;
     if (!checked && !spec.legacyValidate) return TypedCheck::Accept;
@@ -667,7 +668,13 @@ namespace detail {
     if (r.value.size() < 4) return TypedCheck::Reject;
     const uint16_t v = detail::le16(r.value.data() + 2);
     const SpecVersion* sv = spec.versionFor(v);
-    if (sv == nullptr) return v > spec.maxVersion() ? TypedCheck::VersionAhead : TypedCheck::Reject;
+    if (sv == nullptr) {
+        if (v <= spec.maxVersion()) return TypedCheck::Reject;
+        // #868: a version not installed here yet is retriable only when the header can be a record at all (the fixed
+        // block it declares fits in the value); text or other garbage is refused for good, not retried to the timeout.
+        const std::size_t declared = std::size_t{4} + detail::le16(r.value.data());
+        return r.value.size() >= declared ? TypedCheck::VersionAhead : TypedCheck::Reject;
+    }
     const auto check = checked ? rune::codec::StringCheck::Utf8 : rune::codec::StringCheck::None;
     if (!sv->validator.validate({reinterpret_cast<const uint8_t*>(r.value.data()), r.value.size()}, check).ok) return TypedCheck::Reject;
     if (keyRule && (sv->keyValueOffset == kNoKeyOffset || r.key.size() != spec.keyWidth ||

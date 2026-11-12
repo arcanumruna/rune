@@ -972,8 +972,8 @@ ConfigResult parseNodeConfig(
         const char* raw = getenv_fn("RUNE_MAX_NAMESPACES");
         if (raw && !std::string_view(raw).empty()) {
             int32_t v{};
-            if (!parseInt32(raw, v) || v < 1)
-                return {{}, std::string("RUNE_MAX_NAMESPACES must be a positive integer, got: ") + raw};
+            if (!parseInt32(raw, v) || v < 1 || v > NodeConfig::kMaxNamespacesCap)
+                return {{}, std::string("RUNE_MAX_NAMESPACES must be an integer in [1, 65535], got: ") + raw};
             cfg.maxNamespaces = v;
         }
         // One env var per NamespaceLimits field, in wire order (field i ↔ mask bit i).
@@ -1233,6 +1233,10 @@ ConfigResult parseNodeConfig(
             return {{}, std::string("RUNE_PRODUCER_ID_EXPIRATION_MS must be an integer in [0, ") +
                             std::to_string(NodeConfig::kMaxDurationMs) + "] ms, got '" + raw + "'"};
         cfg.producerIdExpirationMs = static_cast<int64_t>(v);
+        if (v < NodeConfig::kProducerIdExpirationWarnBelowMs)
+            warnings.push_back(std::string("RUNE_PRODUCER_ID_EXPIRATION_MS=") + raw +
+                               " is below 300000 ms (5 minutes): it must exceed every client's delivery timeout, "
+                               "or a retried batch whose ack was lost can be stored twice after a failover");
     }
 
     // --- hotpath-A F2: RUNE_SEGMENT_PROVISION_DEPTH / RUNE_SEGMENT_PROVISIONER_MAX_PARK_US ---

@@ -1165,3 +1165,154 @@ TEST(RetentionCleanerAgent, UndrainedRetentionProposalLosesNothingAcrossCrashReg
     }
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// #990 (retention half): only a leader ran retention, so a disk-backed follower
+// kept every record forever.  The leader advertises its log start in every fetch
+// response; a follower trims only the sealed segments wholly below it (and below
+// its own HW).  Follower compaction stays leader-only.
+// ===========================================================================
+namespace {
+
+class Cp9CaptureTransport : public PartitionTransport {
+public:
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg& m) override {
+        starts.push_back(m.logStartOffset);
+        return true;
+    }
+    std::vector<int64_t> starts;
+};
+
+// A record-less frame from the (epoch 2) leader: its HW and its log start.
+FetchResponseMsg cp9Frame(int32_t topicId, int64_t hw, int64_t leaderLogStart) {
+    FetchResponseMsg f{};
+    f.leaderEpoch    = 2;
+    f.partition      = 0;
+    f.topicId        = topicId;
+    f.highWatermark  = hw;
+    f.logStartOffset = leaderLogStart;
+    return f;
+}
+
+struct Cp9FollowerRig {
+    fs::path                          dir;
+    std::unique_ptr<Log>              log;
+    Cp9NullTransport                  transport;
+    rune::node::ReplicaRegistry       registry;
+    PartitionReplica*                 replica = nullptr;
+    std::unique_ptr<rune::node::LogCleanerAgent> cleaner;
+    Cp9MinimalConsensusAgent          dummy;
+    std::unique_ptr<rune::node::NodeRuntimeAgent> duty;
+    std::vector<int64_t>              bases;
+
+    Cp9FollowerRig(const char* name, int32_t topicId, int64_t ts, int64_t retMs, int64_t retBytes) {
+        dir = cp9TempDir(name);
+        log = std::make_unique<Log>(dir.string(), /*rollBytes=*/128);
+        int64_t off = 0;
+        for (int i = 0; i < 40; ++i) off = log->append(cp9Batch(off, "k" + std::to_string(i), "vv", ts), off);
+        bases = log->segmentBaseOffsets();
+        auto cfg = makeDeleteConfig(topicId, retMs, retBytes, 1, 1);
+        cfg.logStartOffset = 0;
+        auto r = std::make_unique<PartitionReplica>(cfg, Role::Follower, 1, std::vector<NodeId>{1, 2},
+                                                    std::vector<NodeId>{1, 2}, log.get(), &transport);
+        r->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+        replica = r.get();
+        registry.add(topicId, 0, std::move(r));
+        cleaner = std::make_unique<rune::node::LogCleanerAgent>(&registry);
+        duty = std::make_unique<rune::node::NodeRuntimeAgent>(dummy, nullptr, nullptr, nullptr, &registry, nullptr);
+    }
+    ~Cp9FollowerRig() { fs::remove_all(dir); }
+
+    void run() {
+        for (int i = 0; i < 20; ++i) {
+            cleaner->doWork(static_cast<int64_t>(i) * 1'000'000LL);
+            duty->doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        for (int i = 20; i < 25; ++i) {
+            cleaner->doWork(static_cast<int64_t>(i) * 1'000'000LL);
+            duty->doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        }
+    }
+};
+
+int64_t cp9NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+}  // namespace
+
+// T1: a disk-backed leader advertises its log start (it was 0 for disk logs).
+TEST(RetentionCleanerAgentRegression, LeaderAdvertisesItsDiskLogStartRegression) {
+    auto dir = cp9TempDir("990_leader_adv");
+    Log log(dir.string(), /*rollBytes=*/128);
+    Cp9CaptureTransport transport;
+    auto cfg = makeDeleteConfig(990, -1, -1, 1, 1);
+    PartitionReplica leader(cfg, Role::Leader, 1, std::vector<NodeId>{1, 2}, std::vector<NodeId>{1, 2}, &log,
+                            &transport);
+    leader.becomeLeader(1, {1, 2});
+    const std::vector<uint8_t> payload(64, 0x5A);
+    for (int i = 0; i < 40; ++i) ASSERT_GE(leader.append(std::span<const uint8_t>(payload), false), 0);
+    const auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 3u);
+    // Move the log start the way retention does: propose + drain the two oldest sealed segments.
+    const auto snap = log.ownerSealedSnapshot();
+    ASSERT_GE(snap->size(), 2u);
+    ASSERT_TRUE(log.enqueueDeletedSegment((*snap)[0].baseOffset, (*snap)[0].lineage));
+    ASSERT_TRUE(log.enqueueDeletedSegment((*snap)[1].baseOffset, (*snap)[1].lineage));
+    ASSERT_EQ(log.drainRetentionDeletes(INT64_MAX), 2);
+    ASSERT_EQ(log.logStartOffset(), bases[2]);
+
+    leader.onFetchRequest(FetchRequestMsg{1, 0, 2, log.logEndOffset(), 1 << 20, 0}, 1'000'000);
+    ASSERT_FALSE(transport.starts.empty()) << "the leader answered the fetch";
+    EXPECT_GT(transport.starts.back(), 0);
+    EXPECT_EQ(transport.starts.back(), log.logStartOffset());
+    fs::remove_all(dir);
+}
+
+// T2: a follower trims the sealed segments wholly below its leader's log start.
+TEST(RetentionCleanerAgentRegression, AFollowerTrimsBelowItsLeadersLogStartRegression) {
+    Cp9FollowerRig rig("990_follower_trims", 991, cp9NowMs(), -1, -1);
+    ASSERT_GE(rig.bases.size(), 4u);
+    const int64_t leaderStart = rig.bases[2] + 1;   // inside the third segment
+    rig.replica->applyReplicated(cp9Frame(991, rig.log->logEndOffset(), leaderStart));
+    ASSERT_EQ(rig.replica->cleanerLeaderLogStart(), leaderStart);
+    ASSERT_EQ(rig.replica->highWatermark(), rig.log->logEndOffset());   // the duty pass publishes it to the cleaner
+    rig.run();
+    const auto after = rig.log->segmentBaseOffsets();
+    ASSERT_FALSE(after.empty());
+    EXPECT_EQ(after.front(), rig.bases[2]) << "segments 0 and 1 gone; the one holding the leader's start is kept";
+    EXPECT_EQ(after, std::vector<int64_t>(rig.bases.begin() + 2, rig.bases.end()));
+    EXPECT_EQ(rig.log->logStartOffset(), rig.bases[2]);
+}
+
+// T3: a follower never trims more than its leader.  A leader with these settings (retMs=1, retBytes=1, ancient
+// timestamps) deletes every sealed segment (TimeRetentionDeletesOldSegments); the follower deletes nothing until
+// its leader's start says so.
+TEST(RetentionCleanerAgentRegression, AFollowerNeverTrimsMoreThanItsLeaderRegression) {
+    Cp9FollowerRig rig("990_follower_never_more", 992, /*ts=*/1'000, /*retMs=*/1, /*retBytes=*/1);
+    ASSERT_GE(rig.bases.size(), 4u);
+    rig.replica->applyReplicated(cp9Frame(992, rig.log->logEndOffset(), 0));   // HW only; no start advertised
+    ASSERT_EQ(rig.replica->cleanerLeaderLogStart(), 0);
+    rig.run();
+    EXPECT_EQ(rig.log->segmentBaseOffsets(), rig.bases) << "no advertised start: nothing is deleted";
+    rig.replica->applyReplicated(cp9Frame(992, rig.log->logEndOffset(), rig.bases[1]));
+    rig.run();
+    const auto after = rig.log->segmentBaseOffsets();
+    EXPECT_EQ(after, std::vector<int64_t>(rig.bases.begin() + 1, rig.bases.end()))
+        << "only the segment below the leader's start is gone";
+}
+
+// T4: the follower's own HW still bounds the deletion (existing bound, no mutation: it is MAJOR-3 in runRetention).
+TEST(RetentionCleanerAgentRegression, AFollowerKeepsSegmentsAboveItsOwnHighWatermarkRegression) {
+    Cp9FollowerRig rig("990_follower_hw", 993, cp9NowMs(), -1, -1);
+    ASSERT_GE(rig.bases.size(), 4u);
+    rig.replica->applyReplicated(cp9Frame(993, rig.bases[2], rig.log->logEndOffset()));
+    ASSERT_EQ(rig.replica->highWatermark(), rig.bases[2]);
+    rig.run();
+    const auto after = rig.log->segmentBaseOffsets();
+    EXPECT_EQ(after, std::vector<int64_t>(rig.bases.begin() + 2, rig.bases.end()))
+        << "only segments ending at or below the follower's HW go";
+}

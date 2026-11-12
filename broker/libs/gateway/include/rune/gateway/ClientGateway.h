@@ -598,6 +598,13 @@ public:
         for (const uint64_t w : workerNsSlotMismatches_) n += w;
         return n;
     }
+    /// #882: subscription reads that reached damaged or unreadable stored data: the inline path's own count plus the
+    /// cumulative counts the workers reported (SessionSignal DamagedRead).
+    [[nodiscard]] uint64_t damagedReadsTotal() const noexcept {
+        uint64_t n = inlineDamagedReads_;
+        for (const uint64_t w : workerDamagedReads_) n += w;
+        return n;
+    }
     /// Namespaces Phase 2 Task 14 (D28): the node's limit aggregator (control thread, the gateway's own thread).  Worker usage
     /// reports (SessionSignal NsUsage) are forwarded to it; the usage query (template 84) reads its totals.
     void setNsLimitAggregator(rune::node::NsLimitAggregator* a) noexcept { nsAggregator_ = a; }
@@ -2769,6 +2776,8 @@ private:
     uint64_t                nsSlotMismatches_ = 0;
     rune::node::NsLimitAggregator* nsAggregator_ = nullptr;   ///< Task 14: not owned; same thread
     std::vector<uint64_t>   workerNsSlotMismatches_;   ///< cumulative, per worker (SessionSignal NsSlotMismatch)
+    uint64_t                inlineDamagedReads_ = 0;   ///< #882: inline-path subscriptions failed at damaged data
+    std::vector<uint64_t>   workerDamagedReads_;       ///< #882: cumulative, per worker (SessionSignal DamagedRead)
     /// One array index and a compare; counts a mismatch.
     [[nodiscard]] bool nsTagMatches_(const Session& s) noexcept {
         if (nsSlots_.matches(s.nsSlot, s.nsId)) [[likely]] return true;

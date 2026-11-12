@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 #include "rune/ql/Parser.h"
+#include <string>
+#include <variant>
+#include <vector>
 using namespace rune::ql; using rune::codec::PrimType;
 
 TEST(Parser, ParsesCharacters) {
@@ -254,4 +257,91 @@ TEST(CheckedWritesQl, DocExamplesParse) {
         const auto r = parse(stmt);
         EXPECT_TRUE(r.has_value()) << stmt << ": " << (r ? "" : r.error().message);
     }
+}
+
+// ---- #1008: `create [transient] [lease] topic` ----
+namespace {
+TopicDef topicFrom(const std::string& text) {
+    auto r = parse(text);
+    EXPECT_TRUE(r.has_value()) << text << (r ? "" : " -> " + r.error().message);
+    const TopicDef* t = r ? std::get_if<TopicDef>(&*r) : nullptr;
+    EXPECT_NE(t, nullptr) << text;
+    return t ? *t : TopicDef{};
+}
+std::string parseError(const std::string& text) {
+    auto r = parse(text);
+    return r ? std::string("<accepted>") : r.error().message;
+}
+}  // namespace
+
+TEST(ParserRegression, CreateTopicFormsEqualBareFormsRegression) {
+    struct Pair { std::string bare, create; };
+    const std::vector<Pair> pairs = {
+        {"topic e;", "create topic e;"},
+        {"topic l partitions 3 replicas 3;", "create topic l partitions 3 replicas 3;"},
+        {"topic p { userId uint64, name string(32), score int64 } partitions 4 key userId;",
+         "create topic p { userId uint64, name string(32), score int64 } partitions 4 key userId;"},
+        {"topic o partitions 4 replicas 3 with (tier = leader, durability = all-in-sync);",
+         "create topic o partitions 4 replicas 3 with (tier = leader, durability = all-in-sync);"},
+        {"topic c { id uint64 autoincrement } partitions 2 key id with (cleanup.policy = compact);",
+         "create topic c { id uint64 autoincrement } partitions 2 key id with (cleanup.policy = compact);"},
+        {"transient topic t { id uint64 } key id;", "create transient topic t { id uint64 } key id;"},
+        {"lease topic s { path string(128), uri string(128) } partitions 1 replicas 3 key path with (lease.ttl = 15000);",
+         "create lease topic s { path string(128), uri string(128) } partitions 1 replicas 3 key path with (lease.ttl = 15000);"},
+        {"transient lease topic on { userId uint64, zone int32 } partitions 4 key userId with (lease.ttl = 10000, lease.max_ttl = 60000);",
+         "create transient lease topic on { userId uint64, zone int32 } partitions 4 key userId with (lease.ttl = 10000, lease.max_ttl = 60000);"},
+    };
+    for (const auto& p : pairs) {
+        const TopicDef a = topicFrom(p.bare), b = topicFrom(p.create);
+        EXPECT_EQ(a.name, b.name) << p.create;
+        ASSERT_EQ(a.fields.size(), b.fields.size()) << p.create;
+        for (std::size_t i = 0; i < a.fields.size(); ++i) {
+            EXPECT_EQ(a.fields[i].name, b.fields[i].name) << p.create;
+            EXPECT_EQ(a.fields[i].type, b.fields[i].type) << p.create;
+            EXPECT_EQ(a.fields[i].fixedLen, b.fields[i].fixedLen) << p.create;
+            EXPECT_EQ(a.fields[i].autoIncrement, b.fields[i].autoIncrement) << p.create;
+        }
+        EXPECT_EQ(a.partitions, b.partitions) << p.create;
+        EXPECT_EQ(a.keyField, b.keyField) << p.create;
+        EXPECT_EQ(a.persistence, b.persistence) << p.create;
+        EXPECT_EQ(a.replicas, b.replicas) << p.create;
+        ASSERT_EQ(a.with.size(), b.with.size()) << p.create;
+        for (std::size_t i = 0; i < a.with.size(); ++i) {
+            EXPECT_EQ(a.with[i].key, b.with[i].key) << p.create;
+            EXPECT_EQ(a.with[i].value, b.with[i].value) << p.create;
+            EXPECT_EQ(a.with[i].text, b.with[i].text) << p.create;
+        }
+        EXPECT_EQ(a.lease, b.lease) << p.create;
+    }
+    EXPECT_EQ(topicFrom("create transient topic t { id uint64 } key id;").persistence, Persistence::Transient);
+    EXPECT_FALSE(topicFrom("create transient topic t { id uint64 } key id;").lease);
+    const TopicDef tl = topicFrom("create transient lease topic t { id uint64 } key id;");
+    EXPECT_TRUE(tl.lease);
+    EXPECT_EQ(tl.persistence, Persistence::Transient);
+    EXPECT_TRUE(topicFrom("create lease topic t { id uint64 } key id;").lease);
+    EXPECT_EQ(topicFrom("create topic t;").persistence, Persistence::Disk);
+    EXPECT_EQ(topicFrom("CREATE TOPIC x;").name, "x");
+    const TopicDef named = topicFrom("create topic lease { id int32 } key id;");
+    EXPECT_EQ(named.name, "lease");
+    EXPECT_FALSE(named.lease);
+}
+
+TEST(ParserRegression, CreateTransientStillMeansViewRegression) {
+    for (const char* text : {"create transient view v key id as select id from t;",
+                             "create transient unique view v key id as select id from t;"}) {
+        auto r = parse(text);
+        ASSERT_TRUE(r.has_value()) << text << (r ? "" : " -> " + r.error().message);
+        const auto* v = std::get_if<CreateViewDef>(&*r);
+        ASSERT_NE(v, nullptr) << text;
+        EXPECT_TRUE(v->transient) << text;
+    }
+}
+
+TEST(ParserRegression, CreateTopicErrorsRegression) {
+    EXPECT_EQ(parseError("create lease view x;"), "expected 'topic' after 'create lease', got 'view'");
+    EXPECT_EQ(parseError("create transient lease view x;"), "expected 'topic' after 'create transient lease', got 'view'");
+    EXPECT_EQ(parseError("create or replace topic t;"),
+              "expected 'view' after 'create [or replace] [transient] [unique]', got 'topic'");
+    EXPECT_EQ(parseError("create frob v;"),
+              "expected 'topic', 'lease', 'transient', 'view', 'user' or 'role' after 'create', got 'frob'");
 }

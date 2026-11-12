@@ -420,12 +420,12 @@ public:
         switch (v) {
         case ConstrainedView::CharacterName: return "create unique view character_name key lower(name) as nameKey as select characterId from character;";
         case ConstrainedView::AccountStats:
-            return "create view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= " + std::to_string(cap) + ");";
+            return "create view account_stats key userId as select count(*) as characters from character constraint max_characters check (characters <= " + std::to_string(cap) + ");";
         case ConstrainedView::AccountCharacters: return "create view account_characters key (userId, characterId) as select name, gender, lastPlayed from character;";
         case ConstrainedView::PerGender:
-            return "create view per_gender key (userId, gender) as select count(*) as n from character group by userId, gender constraint two_per_gender check (n <= 2);";
+            return "create view per_gender key (userId, gender) as select count(*) as n from character constraint two_per_gender check (n <= 2);";
         case ConstrainedView::Ledger:
-            return "create view balances key account as select sum(amount) as balance from entry group by account constraint non_negative check (balance >= 0);";
+            return "create view balances key account as select sum(amount) as balance from entry constraint non_negative check (balance >= 0);";
         case ConstrainedView::UserIdentity: return "create unique view user_identity key (provider, subject) as select userId from user;";
         case ConstrainedView::PcName: return "create unique view pc_name key lower(name) as nameKey as select id from pc;";
         }
@@ -694,6 +694,7 @@ public:
     /// Another replica takes over: this node's tail above the HW is gone and no memory survives.
     /// From now on every install frame the rig sends carries a descriptor the worker refuses.
     bool refuseInstalls = false;
+    bool undecodablePlans = false;   // #941: the install's plan blob does not decode (the frame still names its object)
     void failover(bool reinstall = true) { restart(reinstall, replica->highWatermark()); }
     void reinstallAll() { for (auto& i : installs_) i.second(); }
     void demote() {
@@ -776,7 +777,9 @@ private:
         m.planBlob    = rune::view::serialize(c.plan);
         m.outDescBlob = rune::codec::serialize(c.outputDescriptor);
         m.srcDescBlob = rune::codec::serialize(src);
+        m.viewObjectId = c.plan.viewObjectId;
         if (refuseInstalls) m.outDescBlob = {1, 2, 3};   // the worker refuses a plan whose descriptor does not decode
+        if (undecodablePlans) m.planBlob = {1, 2, 3};     // the plan itself does not decode
         EXPECT_TRUE(encodeViewPlanUpdate(channel.install, ViewSnapshotChannel::kInstallMsgType, m));
         passes(3);
     }

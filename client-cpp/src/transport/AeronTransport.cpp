@@ -641,6 +641,10 @@ void AeronTransport::demoteResponsePublication(PubHandle h) noexcept {
 }
 
 bool AeronTransport::rePairResponsePublication(PubHandle h) noexcept {
+    return rePairResponsePublication(h, std::string_view{});
+}
+
+bool AeronTransport::rePairResponsePublication(PubHandle h, std::string_view responseControlChannel) noexcept {
     if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return false;
     PubSlot& ps = pubSlots_[static_cast<std::size_t>(h)];
     int32_t oldSub = -1;
@@ -648,7 +652,11 @@ bool AeronTransport::rePairResponsePublication(PubHandle h) noexcept {
     else if (const auto* a = std::get_if<PubSlot::AwaitResponseSub>(&ps.mode)) oldSub = a->subSlot;
     if (oldSub < 0) return false;   // a plain publication has no response pair
     try {
-        const std::string respChannel = subSlots_[static_cast<std::size_t>(oldSub)].channel;
+        // #862: an empty channel keeps the pair's channel; a given one moves the pair (the worker's response port
+        // changed).
+        const std::string respChannel = responseControlChannel.empty()
+                                            ? subSlots_[static_cast<std::size_t>(oldSub)].channel
+                                            : std::string(responseControlChannel);
         const int32_t sub = addSubSlot_(SubSlot::Kind::ResponsePair, respChannel, cfg_.egressStreamId);
         if (sub < 0) return false;
         drainPub_(std::move(ps.res));   // the old request publication deregisters (its image goes away at the broker)

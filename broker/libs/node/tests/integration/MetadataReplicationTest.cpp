@@ -769,5 +769,55 @@ TEST(MetadataReplicationDeathTest, MetadataTruncationBelowCommittedRegression_Ha
     }, "below the committed end");
 }
 
+// #830: two cuts between two passes — the first below the committed end, the second at or above it.  The check must see
+// the lower one (the floor), not the last (lastTruncationOffset()).
+TEST(MetadataReplicationDeathTest, TwoCutsBetweenPassesTheLowerOneHaltsRegression) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    MrtTempDir dir("two_cuts_between_passes");
+    rune::storage::Log log(dir.path);
+    log.recover();
+
+    const NodeId selfId = 1;
+    const std::vector<NodeId> nodes = {selfId};
+    InMemoryTransport transport;
+    auto replica = std::make_unique<PartitionReplica>(
+        makeMetaCfg(selfId, /*minIsr=*/1),
+        Role::Leader, /*epoch=*/1, nodes, nodes, &log, &transport);
+    transport.setLeader(replica.get());
+
+    const std::vector<int32_t> isr = {1}, replicas = {1};
+    Offset cut = -1;
+    for (int t = 0; t < 5; ++t) {
+        const Offset base = appendAssignment(replica.get(), t, 0, 1, isr, replicas, 1, t + 1);
+        ASSERT_GE(base, 0);
+        if (t == 2) cut = base;
+    }
+    int64_t clock = 0;
+    for (int i = 0; i < 50; ++i) { clock += 2'000'000LL; replica->doWork(clock); transport.pump(clock); }
+
+    MetadataService svc(replica.get(), selfId);
+    svc.doWork(clock);
+    for (int t = 0; t < 5; ++t) ASSERT_NE(svc.assignment(t, 0), nullptr);
+    const Offset end = replica->logEndOffset();
+    ASSERT_GT(end, cut);
+
+    // Cut 1 (below the committed end), no svc.doWork in between.
+    replica->becomeFollower(/*epoch=*/2, /*leaderId=*/2);
+    replica->truncateLogForTest(cut);
+    // Regrow the log past the committed end, then cut 2 at or above it.
+    replica->becomeLeader(/*epoch=*/3, {1});
+    for (int t = 5; t < 15; ++t) ASSERT_GE(appendAssignment(replica.get(), t, 0, 1, isr, replicas, 1, t + 1), 0);
+    ASSERT_GE(replica->logEndOffset(), end + 2);
+    replica->becomeFollower(/*epoch=*/4, /*leaderId=*/2);
+    replica->truncateLogForTest(end);
+    ASSERT_GE(replica->lastTruncationOffset(), end) << "setup: the last cut alone would not trip the check";
+
+    clock += 2'000'000LL;
+    EXPECT_DEATH({
+        spdlog::set_default_logger(spdlog::stderr_color_st("ltrunc2"));
+        svc.doWork(clock);
+    }, "below the committed end");
+}
+
 // A truncation exactly AT the committed end (the DR-10 zombie case) is legal
 // and must not halt — covered by MetadataTruncationRebuildRegression above.

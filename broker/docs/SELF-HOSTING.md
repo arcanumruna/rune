@@ -140,8 +140,8 @@ that points here. Every topic is created through the catalog, with Rune QL DDL, 
 is up and before anything produces or subscribes:
 
 ```bash
-rune ql -e "topic events partitions 3 replicas 3;" --broker rune-1:40200
-rune ql -e "transient topic presence partitions 1;" --broker rune-1:40200
+rune ql -e "create topic events partitions 3 replicas 3;" --broker rune-1:40200
+rune ql -e "create transient topic presence partitions 1;" --broker rune-1:40200
 rune ql -f topics.rql --request-id 0123456789abcdef0123456789abcd00 --broker rune-1:40200
 ```
 
@@ -153,8 +153,8 @@ id is assigned in creation order, from 0. The client's `defineTopic` does the sa
 docker e2e scripts create their topics with `docker/create-topics.sh`.
 
 **Typed and untyped topics.** `topic NAME partitions N ...;` makes an untyped topic: records are
-opaque bytes. `topic NAME { field type, ... } partitions N key FIELD;` makes a typed topic with a
-schema; a typed topic needs both the field list and `key`. `transient topic ...;` makes a transient
+opaque bytes. `create topic NAME { field type, ... } partitions N key FIELD;` makes a typed topic with a
+schema; a typed topic needs both the field list and `key`. `create transient topic ...;` makes a transient
 topic (see [Transient topics](#transient-topics)); persistence is fixed at creation.
 
 **Replication factor.** `replicas R` is the topic's replication factor.
@@ -172,7 +172,7 @@ creation settings. Each key may appear once. These replace the options of the re
 | Removed option | `with (...)` key | Values and default |
 |---|---|---|
 | `rf=N` | `replicas N` (not in `with`) | 0 = every broker (default) |
-| `persistence=transient` | `transient topic` (not in `with`) | `disk` (default) or `transient` |
+| `persistence=transient` | `create transient topic` (not in `with`) | `disk` (default) or `transient` |
 | `group=G` | `copartition.group = 'G'` | string, none by default |
 | `key=F` | `partition.key = 'F'` | string, none by default |
 | `durability=` | `durability` | `majority` (default), `all-in-sync` |
@@ -192,9 +192,9 @@ A value outside its range is answered `InvalidRequest` (39) with a detail such a
 `retention.ms -2 < -1`.
 
 ```bash
-rune ql -e "topic orders partitions 4 replicas 3 with (tier = leader, durability = all-in-sync);" --broker rune-1:40200
-rune ql -e "topic audit partitions 1 with (cleanup.policy = compact, segment.bytes = 1048576);" --broker rune-1:40200
-rune ql -e "topic player { userId uint64, name string(32), score int64 } partitions 4 key userId;" --broker rune-1:40200
+rune ql -e "create topic orders partitions 4 replicas 3 with (tier = leader, durability = all-in-sync);" --broker rune-1:40200
+rune ql -e "create topic audit partitions 1 with (cleanup.policy = compact, segment.bytes = 1048576);" --broker rune-1:40200
+rune ql -e "create topic player { userId uint64, name string(32), score int64 } partitions 4 key userId;" --broker rune-1:40200
 ```
 
 **Changing a topic.** `alter topic NAME set key = value, ...;` changes the six alterable
@@ -324,7 +324,7 @@ read and never changed (there is no migration); a warning names them if they hol
 
 ### Transient topics
 
-A **transient** topic (`transient topic …;` in Rune QL,
+A **transient** topic (`create transient topic …;` in Rune QL,
 or `Persistence::Transient` on the client's `defineTopic`) is replicated to the in-sync replicas
 before a produce is acknowledged but is **never written to disk**.
 
@@ -388,7 +388,7 @@ before a produce is acknowledged but is **never written to disk**.
     that rebalance is refused with `IllegalGeneration`, and the client re-joins. This holds even if
     a member fetched the old offset in the moment between a crash and its detection. A node that the
     failure detector finds dead no longer vouches for a lineage.
-  - Topics take an optional replication factor: `topic name partitions N replicas R;` (default: every
+  - Topics take an optional replication factor: `create topic name partitions N replicas R;` (default: every
     node). A transient topic with `rf=1` loses its data whenever its node stops. `replicas` must be at most
     the node count and at least `RUNE_MIN_ISR`; anything else is answered `InvalidRequest` with a
     detail that names the constraint.

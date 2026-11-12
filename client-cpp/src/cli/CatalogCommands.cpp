@@ -234,12 +234,9 @@ std::string formatViewDefinition(const cat::ViewObject& v) {
         o << "  (undecodable plan)\n";
         return o.str();
     }
-    std::vector<std::string> key, groupBy;
+    std::vector<std::string> key;
     for (const auto& k : plan->keyComponents) key.push_back(k.keyFunction == rune::codec::kKeyFunctionLower ? "lower(" + k.column + ") as " + k.outName : k.column);
     if (key.empty()) key.push_back(plan->key);
-    const bool aggregate = std::any_of(plan->output.begin(), plan->output.end(), [](const rune::view::AuthoredField& f) { return f.rule != rune::view::MergeRule::Replace; });
-    for (const auto& g : plan->groupBy) groupBy.push_back(g.outName);
-    if (aggregate && groupBy.empty()) groupBy.push_back(plan->key);   // a v1-shaped aggregate groups by its key column
     auto list = [](const std::vector<std::string>& v) {
         std::string out;
         for (std::size_t i = 0; i < v.size(); ++i) out += (i == 0 ? "" : ", ") + v[i];
@@ -247,7 +244,6 @@ std::string formatViewDefinition(const cat::ViewObject& v) {
     };
     o << "  keyspec " << (key.size() == 1 ? key[0] : "(" + list(key) + ")") << "\n"
       << "  unique " << (plan->unique ? "yes" : "no") << "\n";
-    if (aggregate) o << "  group by (" << list(groupBy) << ")\n";
     for (const auto& c : plan->constraints) o << "  constraint " << c.name << " check (" << rune::ql::predicateText(c.predicate) << ")\n";
     if (plan->unicodeVersion != 0) {
         const uint32_t u = plan->unicodeVersion;

@@ -81,7 +81,6 @@ struct Gen {
             }
         }
         v.source = name();
-        if (coin()) for (std::size_t i = 0, n = 1 + below(3); i < n; ++i) v.groupBy.push_back(keyItem(true));
         for (std::size_t i = 0, n = below(3); i < n; ++i) {
             ql::ConstraintDef c;
             c.name = name();
@@ -177,10 +176,6 @@ std::string render(const ql::Statement& st) {
         }
     }
     o += " from " + v.source;
-    if (!v.groupBy.empty()) {
-        o += " group by ";
-        for (std::size_t i = 0; i < v.groupBy.size(); ++i) o += (i ? ", " : "") + keyItem(v.groupBy[i], true);
-    }
     for (const auto& c : v.constraints) o += " constraint " + c.name + " check (" + pred(c.predicate, static_cast<uint16_t>(c.predicate.size() - 1)) + ")";
     return o + ";";
 }

@@ -564,6 +564,7 @@ struct NodeConfig {
     int32_t groupMaxGroups = 0;
     /// RUNE_MAX_NAMESPACES (namespaces Task 7): the cluster-wide namespace cap, `default` included.
     int32_t maxNamespaces = 1024;
+    static constexpr int32_t kMaxNamespacesCap = 65535;   ///< a slot index is a uint16_t and 0xFFFF means "no slot"
     /// RUNE_NS_DEFAULT_* (namespaces Task 7): the cluster default limits an omitted CreateNamespace field takes.
     rune::protocol::NamespaceLimits nsDefaultLimits = [] {
         rune::protocol::NamespaceLimits l{};
@@ -1149,7 +1150,11 @@ struct NodeConfig {
     // record-less batch when its last record is compacted away) so a
     // producer-state rebuild still knows it; older producers are expired.
     // Default 7 days.  Overridable via RUNE_PRODUCER_ID_EXPIRATION_MS (>= 0).
+    // Keep it above the clients' delivery timeout; below 5 minutes the broker warns at startup (#957).
     int64_t producerIdExpirationMs = 7LL * 24 * 3600 * 1000;
+    /// Below this the config warns at startup (#957): the expiry must stay well above every client's delivery timeout
+    /// (30 s by default), or a retried batch whose ack was lost can be stored twice after a failover.
+    static constexpr int64_t kProducerIdExpirationWarnBelowMs = 5 * 60 * 1000;
 
     // hotpath-A F2 + review M3: READY (pre-provisioned, fallocated) segments
     // the SegmentProvisionerAgent builds for a disk-backed user log — DEMAND-

@@ -8,9 +8,9 @@
 // hang).  Topics come from DDL only.  A cell produces a deterministic seeded stream of player_event records (the
 // record's hp field carries its sequence number, so a delivered record is identified by its own bytes) and
 // asserts, per subscription, the EXACT delivered set against the model (nothing missing, nothing extra, no
-// duplicate), every delivered record's fields (a `worldId == 7` filter delivers only worldId-7 records), and the
-// position reaching each partition's end.  The expected outcome of the timing comes from
-// FilterMatrixExpectations.h (Task 14's table).
+// duplicate; a group may be handed the same offset again after a re-read, which is not counted), every delivered
+// record's fields (a `worldId == 7` filter delivers only worldId-7 records), and the position reaching each
+// partition's end.  The expected outcome of the timing comes from FilterMatrixExpectations.h (Task 14's table).
 //
 // Single-broker cells run on OneBroker in the shipped shard runtime; the LeaderMove cells need a cluster
 // (ThreeNodes, the partition leader is crashed mid-stream).  Registered in rune_client_failover_broker_tests
@@ -37,11 +37,13 @@
 #include <rune/protocol/client/Protocol.h>
 #include <rune/replication/PartitionReplica.h>
 
+#include <gtest/gtest-spi.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <functional>
 #include <map>
@@ -251,9 +253,12 @@ struct Check {
     std::set<int32_t>     parts;
     const std::vector<Ev>* model = nullptr;
     std::map<int64_t, int> seen;
+    bool atLeastOnce = false;              // group delivery: the same offset may be delivered again
+    std::map<int64_t, int64_t> offsetOf;   // seq -> the offset it first arrived at (-1 = not given)
+    int  replays = 0;                      // records delivered again at their first offset (atLeastOnce only)
     std::vector<std::string> bad;   // immediate violations (a foreign record, a mangled field)
 
-    void onRecord(int32_t partition, std::span<const uint8_t> value) {
+    void onRecord(int32_t partition, std::span<const uint8_t> value, int64_t offset = -1) {
         const Decoded d = decodeRecord(value);
         if (!d.ok || d.seq < 0 || d.seq >= static_cast<int64_t>(model->size())) {
             bad.push_back(label + ": undecodable record");
@@ -269,6 +274,12 @@ struct Check {
         if (partition != e.part || parts.count(partition) == 0)
             bad.push_back(label + ": seq " + std::to_string(d.seq) + " arrived on partition " + std::to_string(partition));
         if (!e.visible) bad.push_back(label + ": seq " + std::to_string(d.seq) + " belongs to an aborted transaction");
+        // A group re-read hands over the same (partition, offset) again; the same seq at another offset is a duplicate.
+        if (const auto it = offsetOf.find(d.seq); atLeastOnce && offset >= 0 && it != offsetOf.end() && it->second == offset) {
+            ++replays;
+            return;
+        }
+        offsetOf.emplace(d.seq, offset);
         ++seen[d.seq];
     }
     [[nodiscard]] std::set<int64_t> expected(int upTo) const {
@@ -549,10 +560,11 @@ struct Reader {
         g.filter(filterFor(checks[0].pred));
         gc.emplace(client.subscribeGroup(group, {kTopic}, g));
         Check* chk = &checks[0];
+        chk->atLeastOnce = true;
         gc->onRecords([chk](const rc::RecordSet& rs) {
             const int32_t part = rs.partition;
-            rs.forEachRecord([&](std::string_view, std::string_view v, int64_t, int64_t) {
-                chk->onRecord(part, {reinterpret_cast<const uint8_t*>(v.data()), v.size()});
+            rs.forEachRecord([&](std::string_view, std::string_view v, int64_t offset, int64_t) {
+                chk->onRecord(part, {reinterpret_cast<const uint8_t*>(v.data()), v.size()}, offset);
             });
         });
     }
@@ -588,6 +600,10 @@ struct Reader {
     }
     void verifyExact(int upTo) const {
         for (const Check& c : checks) c.verifyExact(upTo);
+        for (const Check& c : checks)
+            if (c.replays > 0)
+                std::fprintf(stderr, "[ perturbed ] %s: %d record(s) were delivered again at the same offset (a group re-read)\n",
+                             c.label.c_str(), c.replays);
     }
 };
 
@@ -1114,6 +1130,51 @@ TEST(FilterBrokerRegression, GroupFilterMismatchRefusedRegression) {
     EXPECT_FALSE(first.anyFinished());
     pumpFor(cs, 300ms);
     first.verifyExact(kRecords);
+}
+
+// RED by mutation: dropping the offset comparison (any repeat of a group counts as a re-read) fails case B; dropping the atLeastOnce test fails case C.
+TEST(FilterBrokerRegression, AGroupReReadOfTheSameOffsetIsNotADuplicateButAMissIsRegression) {
+    std::vector<Ev> model;
+    for (int i = 0; i < 4; ++i) model.push_back(Ev{.seq = i, .playerId = 1, .worldId = kWorld, .channel = 1, .version = 1, .part = 0});
+    auto bytesOf = [&](int i) { return encodeEv(model[static_cast<std::size_t>(i)]); };
+    auto make = [&](bool atLeastOnce) {
+        Check c;
+        c.label       = "unit";
+        c.pred        = Pred{};
+        c.parts       = {0};
+        c.model       = &model;
+        c.atLeastOnce = atLeastOnce;
+        return c;
+    };
+    // Case A: group, the same offset twice.
+    {
+        Check c = make(true);
+        for (int i = 0; i < 4; ++i) c.onRecord(0, bytesOf(i), i);
+        c.onRecord(0, bytesOf(2), 2);
+        c.verifyExact(4);   // no failure
+        EXPECT_EQ(c.replays, 1);
+    }
+    // Case B: group, the same seq at a different offset.
+    {
+        Check c = make(true);
+        for (int i = 0; i < 4; ++i) c.onRecord(0, bytesOf(i), i);
+        c.onRecord(0, bytesOf(2), 9);
+        EXPECT_NONFATAL_FAILURE(c.verifyExact(4), "delivered 2 times");
+    }
+    // Case C: plain subscription, the same offset twice.
+    {
+        Check c = make(false);
+        for (int i = 0; i < 4; ++i) c.onRecord(0, bytesOf(i), i);
+        c.onRecord(0, bytesOf(2), 2);
+        EXPECT_NONFATAL_FAILURE(c.verifyExact(4), "delivered 2 times");
+    }
+    // Case D: group, one record missing, another replayed.
+    {
+        Check c = make(true);
+        for (const int i : {0, 2, 3}) c.onRecord(0, bytesOf(i), i);
+        c.onRecord(0, bytesOf(2), 2);
+        EXPECT_NONFATAL_FAILURE(c.verifyExact(4), "never delivered");
+    }
 }
 
 TEST(FilterBrokerRegression, LegacyModeRefusedRegression) {

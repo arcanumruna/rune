@@ -95,9 +95,16 @@ TEST(FlyweightGen, EncoderRejectsABufferShorterThanKEncodedLength) {
     for (const uint8_t b : buf) EXPECT_EQ(b, 0xEE) << "nothing written";
 }
 
-TEST(FlyweightGen, FixedStrSetterPadsAndTruncates) {
+template <class E, class A>
+concept CanSetCode = requires(E e, A a) { e.code(a); };
+
+TEST(FlyweightGen, FixedStrSetterPadsAndNeverTruncates) {
     std::vector<uint8_t> buf(Enc::kEncodedLength);
-    Enc(buf).code("TOO-LONG-VALUE");
+    static_assert(!CanSetCode<Enc, const char (&)[15]>, "an over-long literal is a compile error");
+    static_assert(CanSetCode<Enc, const char (&)[7]>);
+    static_assert(!CanSetCode<Enc, std::string_view>, "no truncating string_view setter");
+    EXPECT_THROW((void)rune::FixedString<6>(std::string_view("TOO-LONG-VALUE")), std::invalid_argument);
+    Enc(buf).code("TOO-LO");
     EXPECT_EQ(Dec(buf).code(), std::string_view("TOO-LO", 6));
     Enc(buf).code("Z");
     EXPECT_EQ(Dec(buf).code(), std::string_view("Z\0\0\0\0\0", 6));

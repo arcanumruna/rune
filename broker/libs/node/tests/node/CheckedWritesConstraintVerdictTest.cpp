@@ -43,7 +43,7 @@ const char* kCharacter = "topic character { characterId uint64, userId uint64, n
 const char* kEntry = "topic entry { entryId uint64, account uint64, amount int64, memo string(16) } partitions 1 key entryId;";
 
 const char* kUniqueName = "create unique view character_name key lower(name) as nameKey as select characterId, userId from character;";
-const char* kAccountStats = "create view account_stats key userId as select count(*) as characters from character group by userId "
+const char* kAccountStats = "create view account_stats key userId as select count(*) as characters from character "
                             "constraint max_characters check (characters <= 12);";
 
 struct Rec {
@@ -322,7 +322,7 @@ TEST(CheckedWritesConstraintVerdict, OverLimitGroupRenamePassesCreateFailsDelete
 
 TEST(CheckedWritesConstraintVerdict, DeleteAlwaysPassesBalanceLedger) {
     Rig r(kEntry);
-    Mem& ledger = r.view("create view ledger_balance key account as select sum(amount) as balance from entry group by account "
+    Mem& ledger = r.view("create view ledger_balance key account as select sum(amount) as balance from entry "
                          "constraint solvent check (balance >= 0);", 9);
     r.start();
     EXPECT_EQ(r.put1(r.entry(1, 1, 10)), (V{0, 0}));
@@ -451,7 +451,7 @@ TEST(CheckedWritesConstraintVerdict, TombstonesAreNeverRejected) {
 
 TEST(CheckedWritesConstraintVerdict, CheckOverACompositeGroupBy) {
     Rig r;
-    Mem& per = r.view("create view per_gender key (userId, gender) as select count(*) as n from character group by userId, gender "
+    Mem& per = r.view("create view per_gender key (userId, gender) as select count(*) as n from character "
                       "constraint at_most_two check (n <= 2);", 10);
     (void)per;
     r.start();
@@ -472,7 +472,7 @@ TEST(CheckedWritesConstraintVerdict, CheckOnAProjectionColumn) {
 
 TEST(CheckedWritesConstraintVerdictRegression, SumOverflowNullNeverRejectsRegression) {
     Rig r;
-    Mem& ov = r.view("create view ov key userId as select sum(lastPlayed) as total from character group by userId "
+    Mem& ov = r.view("create view ov key userId as select sum(lastPlayed) as total from character "
                      "constraint cap check (total <= 5);", 12);
     r.put({r.character(1, 1, "a", 0, std::numeric_limits<int64_t>::max())});   // unjudged: over the cap already
     r.start();

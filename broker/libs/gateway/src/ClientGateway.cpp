@@ -2025,6 +2025,14 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
         }
         return;
     }
+    if (kind == K::DamagedRead) [[unlikely]] {   // #882: a worker's cumulative count of reads that reached damage
+        if (ret.partition >= 0 && ret.partition < 4096) {
+            if (workerDamagedReads_.size() <= static_cast<std::size_t>(ret.partition))
+                workerDamagedReads_.resize(static_cast<std::size_t>(ret.partition) + 1, 0);
+            workerDamagedReads_[static_cast<std::size_t>(ret.partition)] = static_cast<uint64_t>(ret.baseOffset);
+        }
+        return;
+    }
     if (kind == K::NsUsage) [[unlikely]] {   // namespaces Phase 2 Task 14 (D28): sessionId = (slot << 8) | metric
         if (nsAggregator_ != nullptr && ret.partition >= 0 && ret.sessionId >= 0) {
             const auto metric = static_cast<std::size_t>(ret.sessionId & 0xFF);
@@ -6642,7 +6650,23 @@ void ClientGateway::pushSubscriptionsPass_()
             continue;
         }
 
-        if (view.empty()) continue; // nothing returned (nextOffset not yet visible)
+        if (view.empty()) {
+            // #877: at a damaged sealed segment nothing will ever be readable here - fail the subscription once with
+            // StorageError (parked, cursor not advanced), as the worker path does.  Cold: O(segments), only on an empty read
+            // below the bound.
+            if (sub.nextOffset < bound && log->damageAt(sub.nextOffset)) [[unlikely]] {
+                sub.failed         = true;
+                sub.errorOwed      = true;
+                sub.failedCause    = rune::node::PushTooLargeCause::CorruptBatch;
+                sub.failedFrameLen = 0;
+                ++inlineDamagedReads_;   // #882
+                spdlog::error("ClientGateway: subscription {} (topicId={} partition={} offset={}) failed: a stored batch is "
+                              "corrupt (damaged log segment) - StorageError, subscription parked (cursor not advanced)",
+                              subId, sub.topicId, sub.partition, sub.nextOffset);
+                if (session) trySendOwedPushError_(sub, *session);
+            }
+            continue;
+        }
 
         // Iterate whole record batches in the chunk (span into the read mmap).
         // Batch layout: kBaseOffsetOffset=0 (LE64), kLengthOffset=8 (LE32 = bytes after this field),

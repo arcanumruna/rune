@@ -27,7 +27,7 @@ Kinds:
 
 | Kind | Number | Issued by |
 |---|---|---|
-| `CreateTopic` | 1 | `topic ...;`, `transient topic ...;`, `defineTopic` |
+| `CreateTopic` | 1 | `create topic ...;`, `create transient topic ...;`, `defineTopic` |
 | `DropTopic` | 2 | `drop topic` |
 | `AlterTopicConfig` | 3 | `alter topic ... set` |
 | `CreateSchema` | 4 | `defineTopic` with a schema on an existing untyped topic |
@@ -50,8 +50,9 @@ before, but it only decides whether a topic validates below metadata feature lev
 every typed topic validates fully and the flag is ignored.
 
 **View plan v2.** `CreateView` and `AlterView` carry the authored plan in `normalizedPlanBlob`. A plan with a composite or derived
-key (`key (a, b)`, `lower(c) as n`), `unique`, `constraint ... check (...)` or a `group by` is written as **plan v2**: the v1 fields
-with version byte 2, then the key components, the `unique` byte, the constraints, the unicode version and the `group by` components. A
+key (`key (a, b)`, `lower(c) as n`), `unique`, `constraint ... check (...)` or an aggregate over key components is written as **plan v2**: the v1 fields
+with version byte 2, then the key components, the `unique` byte, the constraints, the unicode version and the group-by components
+(for an aggregate view a copy of the key components, which is its group; the block is kept so old and new blobs stay byte-identical). A
 plan with none of them stays v1 byte for byte, so every earlier digest replays as before.
 
 **`formatVer` 3** is `formatVer` 2 byte for byte plus a trailing 14-byte key-features block (`TopicKeyFeatures`) in every schema definition

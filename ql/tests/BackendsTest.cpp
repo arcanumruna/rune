@@ -27,7 +27,7 @@ TEST(Backends, CodegenCompilesFromDescriptor) {
     auto t = std::get<TopicDef>(parse("topic t { id int64, code string(8) } partitions 1 key id;").value());
     std::string hdr = rune::codec::generateHeader(toDescriptor(t));
     EXPECT_NE(hdr.find("struct T"), std::string::npos);
-    EXPECT_NE(hdr.find("std::array<char, 8>"), std::string::npos);
+    EXPECT_NE(hdr.find("::rune::FixedString<8>"), std::string::npos);
 }
 
 TEST(Backends, ApplyAlterPlanRoundTripsAddDropRename) {

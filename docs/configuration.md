@@ -90,7 +90,7 @@ them in `RUNE_PEERS` (7th and 8th segments, only after every node runs this vers
 | `RUNE_METRICS_SYSTEM_INTERVAL_MS` | `1000` | How often the admin agent samples `/proc/self` into the process metrics (positive ms). Max 2592000000 (30 days). |
 | `RUNE_IO_BACKEND` | `uring` when available, else `portable` | `uring` (Linux io_uring) or `portable`. An unset value falls back to `portable` when io_uring cannot start (old kernel, seccomp, Docker Desktop on Apple Silicon). An explicit `uring` fails loudly. |
 | `RUNE_TRANSIENT_LOG_RING_BYTES` | `8388608` (8 MiB) | Node-wide ring size of every transient partition (power of two). `RUNE_MEMORY_LOG_RING_BYTES` is a deprecated alias that logs one warning; the canonical name wins when both are set. |
-| `RUNE_PRODUCER_ID_EXPIRATION_MS` | `604800000` (7 days) | How long an idle producer id is remembered for idempotence. An integer in `[0, 2592000000]` ms (30 days); garbage, a negative or a larger value refuses startup. |
+| `RUNE_PRODUCER_ID_EXPIRATION_MS` | `604800000` (7 days) | How long an idle producer id is remembered for idempotence. An integer in `[0, 2592000000]` ms (30 days); garbage, a negative or a larger value refuses startup. Keep it above every client's delivery timeout (30 s by default): a shorter value lets a retried batch whose ack was lost be stored twice after a failover. Below 300000 (5 minutes) the broker logs a warning at startup. |
 | `RUNE_WORKER_SYNC_INTERVAL_MS` | `0` | Periodic fsync of the worker's logs; `0` = never (0 to 2 592 000 000). |
 | `RUNE_FOLLOWER_FLUSH_INTERVAL_MS` | `0` | Periodic flush of follower copies; `0` = never (0 to 2 592 000 000). |
 | `RUNE_ENABLE_COALESCING` | `true` | `0` or `false` (any case) turns compaction coalescing off. |

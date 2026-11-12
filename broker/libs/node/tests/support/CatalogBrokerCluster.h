@@ -20,6 +20,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
