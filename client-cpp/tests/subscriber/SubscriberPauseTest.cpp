@@ -711,7 +711,7 @@ TEST(SubscriberPauseRegression, PauseMatrixRegression) {
                 EXPECT_EQ(r.sub->finished(), finished);
                 EXPECT_EQ(r.sub->active(), !finished && !(wasPaused || ok));
                 const int64_t expectPos = (ok && at >= 0) ? at : bound;
-                if (s != St::Pending && s != St::TimedOut && s != St::BoundEmpty) EXPECT_EQ(r.sub->position(), expectPos);
+                EXPECT_EQ(r.sub->position(), expectPos);
                 EXPECT_EQ(r.tx.unsubscribes - unsubsBefore, (ok && wasBound) ? 1 : 0);
                 if (ok || wasPaused) {
                     EXPECT_EQ(r.hub.pendingCount(), 0u);
