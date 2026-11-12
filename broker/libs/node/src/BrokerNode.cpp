@@ -73,6 +73,17 @@ namespace rune::node {
 static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
 static_assert(static_cast<std::size_t>(kIngressCapacity) / 8 >= rune::consensus::kMaxConsensusFrameBytes,
               "#254: the consensus ingress ring must carry the largest consensus frame a peer sends");
+// The value of counter 1'000'228 (rune-auth-mode): 0 enabled, 1 dev-disabled, 2 in-process unauthenticated.  Not the
+// enum's own values: the counter's numbering is a published contract (docs/operations.md).
+static constexpr int64_t authModeMetricValue(AuthMode m) noexcept {
+    switch (m) {
+        case AuthMode::Enabled:                  return 0;
+        case AuthMode::DevDisabled:              return 1;
+        case AuthMode::InProcessUnauthenticated: return 2;
+    }
+    return 2;   // unreachable: every enumerator is handled above (the safe reading of an unknown value is "not enabled")
+}
+
 /// Combined fix program M13 (X102): permission bits of every `__security` segment / index / checkpoint file.
 static constexpr unsigned kSecurityFileMode = 0600;
 
@@ -2198,6 +2209,7 @@ void BrokerNode::buildGateway() {
         // Authentication Task 10 (D11/D13): how sessions authenticate + the bootstrap window's view (the control thread's
         // own SecurityView - the gateway runs on this same thread).
         gateway_->setAuthTimeoutNs(config_.authTimeoutMs * 1'000'000LL);   // D13: RUNE_AUTH_TIMEOUT_MS
+        gateway_->setLoginThrottleBaseDelayMsForTest(config_.loginThrottleBaseDelayMsForTest);   // #594: tests only
         gateway_->setAuthMode(config_.authMode == AuthMode::Enabled  ? rune::gateway::GatewayAuthMode::Required
                               : config_.authMode == AuthMode::DevDisabled ? rune::gateway::GatewayAuthMode::Dev
                                                                           : rune::gateway::GatewayAuthMode::InProcess,
@@ -3432,7 +3444,7 @@ void BrokerNode::createMetrics_() {
     // warning in the log).  Start thread, before any agent runs; the same clock_ as the control runner, so the
     // control-thread timer repeats it five minutes later, never twice at start.
     serviceAuthMode_(clock_.nowNs());
-    controlSet_(RuneMetric::AuthMode, config_.authMode == AuthMode::DevDisabled ? 1 : 0);
+    controlSet_(RuneMetric::AuthMode, authModeMetricValue(config_.authMode));
 
 #if defined(__linux__)   // process metrics read /proc/self; other hosts have none
     systemMetrics_.emplace();
@@ -3645,17 +3657,29 @@ void BrokerNode::publishSecurityMetrics_() noexcept {
     publishLoginTallies_();
     controlSet_(RuneMetric::SecurityApplyHalted, securityHaltedValue_);
     controlSet_(RuneMetric::SecurityAppliedOffset, securityAppliedValue_);
-    // 1'000'228: 0 = enabled (an in-process config publishes 0 too), 1 = dev-disabled.
-    controlSet_(RuneMetric::AuthMode, config_.authMode == AuthMode::DevDisabled ? 1 : 0);
+    // 1'000'228: 0 = enabled, 1 = dev-disabled, 2 = in-process unauthenticated (no auth mode in the NodeConfig).
+    controlSet_(RuneMetric::AuthMode, authModeMetricValue(config_.authMode));
 }
 
-// Authentication Task 9 (spec §9): dev mode (RUNE_AUTH=disabled) is shouted at start and every five minutes by this
-// control-thread timer; the auth-mode counter resolves once the driver acked it.
+// Authentication Task 9 (spec §9): dev mode (RUNE_AUTH=disabled) and the in-process unauthenticated mode are shouted at
+// start and every five minutes by this control-thread timer; the auth-mode counter resolves once the driver acked it.
 int BrokerNode::serviceAuthMode_(int64_t nowNs) {
     int work = 0;
-    if (config_.authMode == AuthMode::DevDisabled && devModeWarn_.due(nowNs)) {
-        spdlog::warn("BrokerNode[{}]: {}", config_.nodeId, kDevModeWarning);
-        ++work;
+    switch (config_.authMode) {
+        case AuthMode::Enabled:
+            break;
+        case AuthMode::DevDisabled:
+            if (devModeWarn_.due(nowNs)) {
+                spdlog::warn("BrokerNode[{}]: {}", config_.nodeId, kDevModeWarning);
+                ++work;
+            }
+            break;
+        case AuthMode::InProcessUnauthenticated:
+            if (devModeWarn_.due(nowNs)) {
+                spdlog::warn("BrokerNode[{}]: {}", config_.nodeId, kInProcessUnauthenticatedWarning);
+                ++work;
+            }
+            break;
     }
     return work;
 }
@@ -3927,7 +3951,7 @@ BrokerNode::SecurityMetricsSnap BrokerNode::securityMetricsForTest() {
     return onControlThreadForTest([this]() -> SecurityMetricsSnap {
         publishSecurityMetrics_();
         return SecurityMetricsSnap{securityHaltedValue_, securityAppliedValue_,
-                                   config_.authMode == AuthMode::DevDisabled ? 1 : 0};
+                                   authModeMetricValue(config_.authMode)};
     });
 }
 
@@ -4417,6 +4441,17 @@ void BrokerNode::bootFromSecurity_() {
         if (permEc)
             throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: cannot restrict " + dir.string() +
                                      " to its owner (0700): " + permEc.message() + " - refusing to start");
+        // #147: files an older run left 0644 (before M13, or restored by a copy) are tightened too, BEFORE the Log opens
+        // them.  Regular files only, never through a symlink; anything else is skipped.
+        for (const auto& entry : fs::directory_iterator(dir)) {
+            std::error_code ec;
+            if (!fs::is_regular_file(entry.symlink_status(ec)) || ec) continue;
+            fs::permissions(entry.path(), fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
+            if (ec)
+                throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: cannot restrict " +
+                                         entry.path().string() + " to its owner (0600): " + ec.message() +
+                                         " - refusing to start");
+        }
     }
     securityLog_ = std::make_unique<rune::storage::Log>(dir.string(), config_.offsetLogSegmentRollBytes, kSecurityFileMode);
     securityLog_->recover();
@@ -5451,14 +5486,17 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
         using Offer = CatalogReadFlow::Offer;
         using Room  = CatalogReadFlow::Room;
         using Admit = CatalogReadFlow::Admit;
-        Admit admit(int64_t session, int64_t subId, const uint8_t* f, std::size_t n) {   // issue #117
+        Admit admit(int64_t session, int64_t subId, const uint8_t* f, std::size_t n, int64_t& holdUntilEvent) {  // #117
             if (!node.gateway_) return Admit::Deliver;
-            switch (node.gateway_->admitAdminLogFrame(session, subId, f, n)) {
+            switch (node.gateway_->admitAdminLogFrame(session, subId, f, n, holdUntilEvent)) {
             case rune::gateway::ClientGateway::AdminLogAdmit::Deliver:  return Admit::Deliver;
             case rune::gateway::ClientGateway::AdminLogAdmit::Withhold: return Admit::Withhold;
             case rune::gateway::ClientGateway::AdminLogAdmit::Hold:     break;
             }
             return Admit::Hold;
+        }
+        bool holdReleased(int64_t holdUntilEvent) {   // #444
+            return !node.gateway_ || node.gateway_->adminLogHoldReleased(holdUntilEvent);
         }
         Offer tryOffer(int64_t session, const uint8_t* f, std::size_t n) {
             if (!node.gateway_) return Offer::NoSession;
@@ -5470,7 +5508,11 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             return Offer::NoSession;
         }
         void sendReliable(int64_t session, const uint8_t* f, std::size_t n) {
-            if (node.gateway_) (void)node.gateway_->sendControlFrame(session, f, n);
+            if (!node.gateway_) return;
+            // Issue #200: every SubscribeResponse and terminal answer of both read servers passes here first, so the
+            // session's list of admin-log reads drops a refused or ended read.
+            node.gateway_->noteAdminLogAnswer(session, f, n);
+            (void)node.gateway_->sendControlFrame(session, f, n);
         }
         Room room(int64_t session) {
             if (!node.gateway_) return Room::Gone;
@@ -5893,13 +5935,14 @@ int BrokerNode::resignIfHalted_(bool consensusLeader) {
     int work = 0;
     // Authentication review C: a halted `__security` applier is reported to every member (a latched node-control
     // mark): the controller steers the (-7, 0) leadership to a healthy broker.
-    if (securityHaltedValue_ != 0 && runtimeAgent_ && !holdHaltReportForTest_)
+    if (securityHaltedValue_ != 0 && runtimeAgent_ && !holdSecurityHaltReportForTest_)
         work += runtimeAgent_->controlledShutdown().reportSecurityHalted();
     if (catalogHaltedValue_ == 0) [[likely]] return work;
     // Fix round 0 (ruling 2): every member — the controller first — learns this
     // process is halted (a latched mark on the node-control register): it is
     // never a placement target again.
-    if (runtimeAgent_ && !holdHaltReportForTest_) work += runtimeAgent_->controlledShutdown().reportCatalogHalted();
+    if (runtimeAgent_ && !holdCatalogHaltReportForTest_)
+        work += runtimeAgent_->controlledShutdown().reportCatalogHalted();
     if (!consensusLeader || !election_ || !metadataService_ || config_.isSingleNode()) return work;
     // Fix round 0 (ruling 1): hand the controllership to a healthy peer ONLY while
     // one is live — never leave the cluster without a controller.  With every
@@ -6427,6 +6470,11 @@ void BrokerNode::publishNsSlotMetrics_() noexcept {
     if (damaged != lastDamagedReadsPublished_) {
         lastDamagedReadsPublished_ = damaged;
         controlSet_(RuneMetric::DamagedReads, damaged);
+    }
+    const auto unauth = static_cast<std::int64_t>(gateway_->unauthLogSuppressedTotal());   // #145
+    if (unauth != lastUnauthSuppressedPublished_) {
+        lastUnauthSuppressedPublished_ = unauth;
+        controlSet_(RuneMetric::UnauthLogSuppressed, unauth);
     }
 }
 

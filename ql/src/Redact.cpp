@@ -1,6 +1,7 @@
 // Redact.cpp — the canonical, password-free text of a security statement (D10).
 // Only this text is ever sent to the broker and recorded in __security.
 #include "rune/ql/Ast.h"
+#include <rune/catalog/TopicName.h>
 #include <type_traits>
 
 namespace rune::ql {
@@ -17,10 +18,11 @@ bool plainIdent(const std::string& n) noexcept {
     }
     return true;
 }
-// A quote inside a literal is doubled (SQL) - the same rule as the leader's rune::security::securityStatementText.
+// The same rule as the leader's rune::security::securityStatementText: a backslash, a control byte and a byte >= 0x80
+// are escaped (\\, \xhh), then a quote inside the literal is doubled (SQL).
 std::string quoted(const std::string& n) {
     std::string out = "'";
-    for (const char c : n) { out += c; if (c == '\'') out += '\''; }
+    for (const char c : rune::catalog::escapeNameForLog(n)) { out += c; if (c == '\'') out += '\''; }
     return out + "'";
 }
 std::string name(const std::string& n) { return plainIdent(n) ? n : quoted(n); }

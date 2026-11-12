@@ -7,6 +7,7 @@
 
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -61,6 +62,8 @@ static void runCell(AuthMatrixRig& rig, const Cell& c) {
     if (want.first == 45) EXPECT_EQ(first.appended, 0) << label << ": #278: a refused produce appended";
     if (c.op == Op::Metadata) EXPECT_EQ(first.present, want.presentFirst) << label;
     if (want.viewStatus != kNone) EXPECT_EQ(first.viewStatus, want.viewStatus) << label;
+    if (isViewRead(c.op))
+        EXPECT_EQ(first.viewStatus, viewStatusOf(want.first)) << label << ": the exact ViewRowResponse status";
 
     // Streams under RevokedMid / UserDisabledMid: the subscription is live and receiving before the change.
     std::string why;
@@ -80,6 +83,8 @@ static void runCell(AuthMatrixRig& rig, const Cell& c) {
                 const auto second = cell.issue(c.op, false);
                 EXPECT_EQ(second.code, want.second) << label;
                 if (want.second == 45) EXPECT_EQ(second.appended, 0) << label << ": #278: a refused produce appended";
+                if (isViewRead(c.op))
+                    EXPECT_EQ(second.viewStatus, viewStatusOf(want.second)) << label << ": exact status";
                 EXPECT_EQ(second.templ, second.wantTempl) << label << ": the second answer is not in the op's own response type";
                 if (c.op == Op::Metadata) EXPECT_EQ(second.present, want.presentSecond) << label;
             }
@@ -96,8 +101,8 @@ static void runCell(AuthMatrixRig& rig, const Cell& c) {
             }
             // The reconnect attempt of a disabled user is a failed login: the broker's per-host brute-force curve (spec
             // section 5, 10 free failures per source) would delay every later legitimate login of this broker process, so
-            // a fixed, order-independent 7 of the 79 R5 cells attempt it (the curve itself is LoginThrottleTest's).
-            if ((int(c.op) * 5 + int(c.grant)) % 11 == 0) EXPECT_EQ(cell.relogin(), want.reconnect) << label;
+            // relogin() resets the login throttle after each probe (issue #189's seam) and EVERY R5 cell probes it.
+            EXPECT_EQ(cell.relogin(), want.reconnect) << label;
             break;
         }
         case Outcome::DeniedThenOk: {
@@ -106,6 +111,7 @@ static void runCell(AuthMatrixRig& rig, const Cell& c) {
             const auto second = cell.issue(c.op, false);
             EXPECT_EQ(second.code, want.second) << label;
             EXPECT_EQ(second.templ, second.wantTempl) << label << ": the second answer is not in the op's own response type";
+            if (isViewRead(c.op)) EXPECT_EQ(second.viewStatus, viewStatusOf(want.second)) << label << ": exact status";
             if (c.op == Op::Metadata) EXPECT_EQ(second.present, want.presentSecond) << label;
             break;
         }
@@ -274,6 +280,26 @@ TEST(AuthMatrixRigRegression, AStrayFailedLoginBetweenCellsFailsTheNextCellAdver
     cell.close();
 }
 
+// #579: one stray login fails exactly ONE cell: the cell that sees the counter above the tally fails (and names it), the
+// rig then adopts the surplus into its tally, so the cells after it report only their own deltas.
+TEST(AuthMatrixRigRegression, AStrayLoginFailsExactlyOneCellRegression) {
+    AuthMatrixRig rig;
+    strayLogin(rig, /*ok=*/true);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    std::string problems[3];
+    for (std::string& problem : problems) {
+        auto cell = rig.newCell();
+        cell.grantFor(AMOp::Produce, AMGrant::None);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        cell.login();
+        problem = cell.countersProblem(false);
+        cell.close();
+    }
+    EXPECT_NE(problems[0].find("logins ok counter is"), std::string::npos) << "the cell after the stray must fail: '" << problems[0] << "'";
+    EXPECT_EQ(problems[1], "") << "the second cell reports only its own deltas";
+    EXPECT_EQ(problems[2], "") << "the third cell reports only its own deltas";
+}
+
 // The #4 wait is bounded and loud: a tally the broker never reaches (a login the rig believes happened) fails the cell's
 // setup within the wait's bound, exactly once, instead of hanging or passing.
 TEST(AuthMatrixRigRegression, AnOverTalliedLoginFailsTheBaselineWaitWithinItsBoundAdversarialRegression) {
@@ -375,4 +401,191 @@ TEST(AuthMatrixCountRegression, CellCountsArePinned) {
     EXPECT_EQ(outcome[int(Outcome::Missing)], 24);                 // UnknownTopic
     EXPECT_EQ(outcome[int(Outcome::FilteredOut)], 3 + 4);          // Metadata R1 (3 timings) + R3 (4 grants)
     EXPECT_EQ(outcome[int(Outcome::Denied)], 59 + 8 + 18);         // R1 non-Metadata + R2 + R3 id-addressed (incl. ViewOpen)
+}
+
+// ── #217: collision and refusal answers reveal nothing about an object the caller cannot DESCRIBE ────────────────────
+// D15: any operation on a name implies DESCRIBE on it (per kind: TOPIC grants describe topics, VIEW grants views),
+// so the principals differ by KIND.  `topicOnly` holds CREATE/ALTER/DROP on TOPIC 'secret.' / 'Secret.' (never a view),
+// `viewOnly` the same on VIEW, `seer` both, `reader` both plus DESCRIBE ON CLUSTER (reads the whole catalog, #220),
+// `catOnly` topicOnly plus DESCRIBE ON CLUSTER (no VIEW grant: only the catalog bit shows it a view).
+namespace {
+namespace pcl = rune::protocol::client;
+
+struct DdlAns {
+    int code = -1;
+    int64_t id = -2, version = -2;
+    std::string detail;
+    std::vector<uint8_t> body;   // the frame without its header (session / correlation id)
+};
+
+DdlAns ddlAnswerOf(rune::node::test::AuthRig& r, int64_t corr) {
+    DdlAns a;
+    const auto any = r.c().awaitAnyDdlAnswer(corr, rune::node::test::AuthRig::dl(15));
+    const auto raw = r.c().awaitRaw(corr, rune::node::test::AuthRig::dl(2));
+    if (!any || !raw) return a;
+    const auto h = pcl::MessageHeader::decode(raw->data(), raw->size());
+    if (!h) return a;
+    a.body.assign(raw->begin() + pcl::MessageHeader::ENCODED_SIZE, raw->end());
+    const uint8_t* p = raw->data();
+    const std::size_t n = raw->size();
+    using T = pcl::TemplateId;
+    switch (static_cast<T>(h->templateId)) {
+        case T::DefineTopicResponse:
+            if (const auto m = pcl::DefineTopicResponse::decode(p, n)) {
+                a.code = m->errorCode; a.id = m->topicId; a.version = m->version;
+            }
+            break;
+        case T::AlterTopicResponse:
+            if (const auto m = pcl::AlterTopicResponse::decode(p, n)) {
+                a.code = m->errorCode; a.id = m->topicId; a.version = m->newVersion;
+            }
+            break;
+        case T::CreateViewResponse:
+            if (const auto m = pcl::CreateViewResponse::decode(p, n)) {
+                a.code = m->errorCode; a.id = m->viewTopicId; a.version = 0;
+            }
+            break;
+        case T::DdlResponse:
+            if (const auto m = pcl::DdlResponse::decode(p, n)) {
+                a.code = m->errorCode; a.id = m->gateTopicId; a.version = m->newVersion;
+                a.detail = std::string(m->detail);
+            }
+            break;
+        default:
+            if (const auto m = pcl::ErrorResponse::decode(p, n)) {
+                a.code = m->code; a.id = -1; a.version = 0; a.detail = std::string(m->message);
+            }
+            break;
+    }
+    return a;
+}
+
+bool hasLe32(const std::vector<uint8_t>& b, int32_t v) {
+    const uint8_t le[4] = {uint8_t(v), uint8_t(v >> 8), uint8_t(v >> 16), uint8_t(v >> 24)};
+    for (std::size_t i = 0; i + 4 <= b.size(); ++i)
+        if (std::equal(le, le + 4, b.begin() + static_cast<std::ptrdiff_t>(i))) return true;
+    return false;
+}
+bool hasName(const std::vector<uint8_t>& b, std::string_view s) {
+    return std::search(b.begin(), b.end(), s.begin(), s.end()) != b.end();
+}
+}  // namespace
+
+TEST(AuthInteractionMatrixRegression, CollisionAnswersRevealNothingToAPrincipalWithoutDescribeRegression) {
+    using namespace rune::node::test;
+    using namespace rune::node::test::grants;
+    AuthRig r("coll217");
+    const int32_t src = r.defineTopic(r.builder, "secret.src");
+    const int32_t payroll = r.defineTopic(r.builder, "secret.payroll");
+    const int32_t openSrc = r.defineTopic(r.builder, "open.src");
+    const int32_t board = r.createView(r.builder, "secret.board", src);
+    ASSERT_GE(src, 0); ASSERT_GE(payroll, 0); ASSERT_GE(openSrc, 0); ASSERT_GE(board, 0);
+
+    std::vector<AuthGrant> topicG, viewG;
+    for (const char* p : {"secret.", "Secret."})
+        for (const auto op : {SO::Create, SO::Alter, SO::Drop}) {
+            topicG.push_back(prefix(op, ST::Topic, p));
+            viewG.push_back(prefix(op, ST::View, p));
+        }
+    topicG.push_back(prefix(SO::Read, ST::Topic, "open."));   // a view's source needs READ
+    // (topicG already holds the READ of the sources)
+    std::vector<AuthGrant> seerG = topicG, readerG, catOnlyG = topicG;
+    seerG.insert(seerG.end(), viewG.begin(), viewG.end());
+    readerG = seerG;
+    viewG.push_back(prefix(SO::Read, ST::Topic, "open."));
+    readerG.push_back(cluster(SO::Describe));
+    catOnlyG.push_back(cluster(SO::Describe));
+    const int64_t topicOnly = r.newUser(topicG), viewOnly = r.newUser(viewG), seer = r.newUser(seerG),
+                  reader = r.newUser(readerG), catOnly = r.newUser(catOnlyG);
+
+    auto define = [&](int64_t sid, const std::string& n) {
+        return ddlAnswerOf(r, r.c().sendDefineTopic(r.ch(), r.stream(), sid, n, 1, authRigCharBlob(), 0, {}, 0,
+                                                    authRigTopicConfig()));
+    };
+    auto createView = [&](int64_t sid, const std::string& n) {
+        return ddlAnswerOf(r, r.c().sendCreateView(r.ch(), r.stream(), sid, n, "id", 0, authRigViewPlan(n, {openSrc})));
+    };
+    auto alter = [&](int64_t sid, const std::string& n) {
+        rune::codec::AlterOp o{};
+        o.type = rune::codec::AlterOpType::Add; o.name = "extra";
+        o.primType = rune::codec::PrimType::Int64; o.fixedLen = 0;
+        return ddlAnswerOf(r, r.c().sendAlterTopic(r.ch(), r.stream(), sid, n, 0, rune::codec::encodeAlterOps({o})));
+    };
+    auto alterCfg = [&](int64_t sid, const std::string& n) {
+        const pcl::ConfigChangeWire cc{static_cast<uint8_t>(rune::protocol::ConfigKey::RetentionMs), 600'000};
+        return ddlAnswerOf(r, r.c().sendAlterTopicConfig(r.ch(), r.stream(), sid, n, 0, {cc}));
+    };
+    auto dropTopic = [&](int64_t sid, const std::string& n) {
+        return ddlAnswerOf(r, r.c().sendDropTopic(r.ch(), r.stream(), sid, n));
+    };
+    constexpr uint16_t kTopicExists = 25, kViewNotAlterable = 38, kUnknownTopic = 7;
+    auto blindShape = [&](const DdlAns& a, const char* what) {
+        EXPECT_EQ(a.code, kTopicExists) << what;
+        EXPECT_EQ(a.id, -1) << what;
+        EXPECT_EQ(a.version, 0) << what;
+        EXPECT_FALSE(hasLe32(a.body, payroll) || hasLe32(a.body, board) || hasLe32(a.body, src))
+            << what << ": a hidden id";
+    };
+
+    // CREATE TOPIC secret.payroll: the topic kind is describable to topicOnly, seer, reader (real id and version).
+    for (const int64_t who : {topicOnly, seer, reader}) {
+        const DdlAns a = define(who, "secret.payroll");
+        EXPECT_EQ(a.code, kTopicExists); EXPECT_EQ(a.id, payroll); EXPECT_EQ(a.version, 1);
+    }
+    // CREATE VIEW secret.payroll (a TOPIC name): viewOnly cannot describe topics.
+    blindShape(createView(viewOnly, "secret.payroll"), "CREATE VIEW over a topic name, viewOnly");
+    EXPECT_EQ(createView(seer, "secret.payroll").id, payroll);
+    EXPECT_EQ(createView(reader, "secret.payroll").id, payroll);
+    // CREATE TOPIC secret.board (a VIEW name): topicOnly cannot describe views.
+    blindShape(define(topicOnly, "secret.board"), "CREATE TOPIC over a view name, topicOnly");
+    EXPECT_EQ(define(seer, "secret.board").id, board);
+    EXPECT_EQ(define(reader, "secret.board").id, board);
+    EXPECT_EQ(define(catOnly, "secret.board").id, board);   // no VIEW grant at all: the catalog bit alone shows it
+    // CREATE TOPIC Secret.Payroll (letter case): only a catalog reader sees the other object.
+    for (const int64_t who : {topicOnly, seer}) {
+        const DdlAns a = define(who, "Secret.Payroll");
+        EXPECT_EQ(a.code, kTopicExists); EXPECT_EQ(a.id, -1); EXPECT_EQ(a.version, 0);
+        EXPECT_FALSE(hasName(a.body, "secret.payroll"));
+        EXPECT_FALSE(hasLe32(a.body, payroll));
+    }
+    for (const int64_t who : {reader, catOnly}) {
+        const DdlAns a = define(who, "Secret.Payroll");
+        EXPECT_EQ(a.code, kTopicExists); EXPECT_EQ(a.id, payroll);
+    }
+    // ALTER TOPIC on a view name: topicOnly gets exactly the answer of a name that is no object.
+    {
+        const DdlAns hidden = alter(topicOnly, "secret.board"), missing = alter(topicOnly, "secret.missing");
+        EXPECT_EQ(hidden.code, kUnknownTopic);
+        EXPECT_EQ(hidden.code, missing.code); EXPECT_EQ(hidden.id, missing.id);
+        EXPECT_EQ(hidden.version, missing.version);
+        EXPECT_EQ(hidden.body, missing.body);
+        EXPECT_EQ(alter(seer, "secret.board").code, kViewNotAlterable);
+        EXPECT_EQ(alter(reader, "secret.board").code, kViewNotAlterable);
+        EXPECT_EQ(alter(catOnly, "secret.board").code, kViewNotAlterable);
+    }
+    {
+        const DdlAns hidden = alterCfg(topicOnly, "secret.board"), missing = alterCfg(topicOnly, "secret.missing");
+        EXPECT_EQ(hidden.code, kUnknownTopic);
+        EXPECT_EQ(hidden.code, missing.code); EXPECT_EQ(hidden.id, missing.id);
+        EXPECT_EQ(hidden.version, missing.version);
+        EXPECT_FALSE(hasName(hidden.body, "secret.missing"));
+        std::string swapped = missing.detail;
+        swapped.replace(swapped.find("secret.missing"), 14, "secret.board");
+        EXPECT_EQ(hidden.detail, swapped);
+        EXPECT_EQ(alterCfg(seer, "secret.board").code, kViewNotAlterable);
+        EXPECT_EQ(alterCfg(reader, "secret.board").code, kViewNotAlterable);
+    }
+    // DROP TOPIC secret.src (read by the view secret.board): the view's name goes to catalog readers only.
+    for (const int64_t who : {topicOnly, seer}) {
+        const DdlAns a = dropTopic(who, "secret.src");
+        EXPECT_NE(a.code, 0);
+        EXPECT_NE(a.detail.find("is read by a view"), std::string::npos) << a.detail;
+        EXPECT_FALSE(hasName(a.body, "secret.board"));
+        EXPECT_FALSE(hasLe32(a.body, board));
+    }
+    {
+        const DdlAns a = dropTopic(catOnly, "secret.src");
+        EXPECT_NE(a.code, 0);
+        EXPECT_NE(a.detail.find("'secret.board'"), std::string::npos) << a.detail;
+    }
 }

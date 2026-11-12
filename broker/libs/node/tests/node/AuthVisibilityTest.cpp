@@ -87,6 +87,21 @@ TEST(AuthVisibilityRegression, MissingAndHiddenObjectsAnswerIdenticallyRegressio
     }
 }
 
+// #505: a live object of a kind the caller holds no DESCRIBE for answers GetTopicSchema exactly like a missing name
+// (the whole response, the correlation id aside).  RED: drop the kind check in AdminWorker::submitGetSchema.
+TEST(AuthVisibilityRegression, AHiddenOtherKindObjectAnswersLikeAMissingNameRegression) {
+    AuthRig r;
+    const int64_t u = r.newUser({prefix(SO::Describe, ST::Topic, "pay")});
+    ASSERT_GE(r.createView(r.builder, "payboard", r.orders), 0);
+    const auto hidden  = r.rawAnswer(r.c().sendGetTopicSchema(r.ch(), r.stream(), u, "payboard"));
+    const auto missing = r.rawAnswer(r.c().sendGetTopicSchema(r.ch(), r.stream(), u, "paymissing"));
+    ASSERT_FALSE(hidden.empty());
+    EXPECT_EQ(body(hidden), body(missing)) << "a view under a TOPIC-only grant answers like a missing name";
+    const auto d = pc::TopicSchemaResponse::decode(hidden.data(), hidden.size());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->errorCode, static_cast<uint16_t>(pc::ErrorCode::UnknownTopic));
+}
+
 TEST(AuthVisibilityRegression, MetadataListsOnlyDescribableTopics) {
     AuthRig r;
     ASSERT_TRUE(r.awaitListed(r.orders));

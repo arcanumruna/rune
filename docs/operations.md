@@ -265,7 +265,7 @@ sampling the file; the broker keeps no history.
 | 1000225 | `rune-lost-committed-reports` | counter | control | Reports of lost committed data. |
 | 1000226 | `rune-security-apply-halted` | gauge | control | `0` while applying; the halted offset plus 1 after a halt. Alert on it. |
 | 1000227 | `rune-security-applied-offset` | gauge | control | Last applied `__security` offset (`-1` none). |
-| 1000228 | `rune-auth-mode` | gauge | control | `0` authentication enabled, `1` dev mode. Alert on `1` in production. |
+| 1000228 | `rune-auth-mode` | gauge | control | `0` authentication enabled, `1` dev mode, `2` in-process unauthenticated (built without an auth mode). Alert on a non-zero value in production. |
 | 1000229 | `rune-logins-ok` | counter | control | Successful logins. |
 | 1000230 | `rune-logins-failed` | counter | control | Failed logins. Alert on a rising rate. |
 | 1000231 | `rune-logins-rate-limited` | counter | control | Login attempts refused by the login throttle (per user and source). |
@@ -273,6 +273,7 @@ sampling the file; the broker keeps no history.
 | 1000233 | `rune-peer-links-established` | gauge | control | Peers whose link is currently established. |
 | 1000234 | `rune-peer-link-refusals` | counter | control | Peer-link refusals logged by this broker. Alert on a rising rate. |
 | 1000235 | `rune-peer-frame-drops` | counter | control | Inter-broker frames dropped for want of a link or because they did not open. |
+| 1000239 | `rune-unauth-log-suppressed` | counter | control | Log lines not written because the rate limiter held them back: lines an unauthenticated sender can drive (failed decrypts, refused logins, require-TLS refusals, bad bootstrap proofs) are logged the first time and then every 1024th occurrence of their kind, and the rest are counted here, summed over the gateway and every worker. A worker reports its share with each line it logs, so this counter can trail the true count by up to 1023 per log kind per worker. A fast rise means someone is sending the broker bad traffic; the log shows only a sample. |
 | 1000240 | `rune-txn-offset-commits-stuck` | gauge | control | Transaction commits waiting because the group coordinator refuses their consumer-group offsets. Alert on a non-zero value that persists. |
 | 1000241 | `rune-txn-offset-stuck-age-ms` | gauge | control | Age of the oldest of those, in ms. A WARN names it every 30 s while any is stuck. |
 | 1000242 | `rune-ns-slot-mismatch` | counter | control | Namespace slot tags refused by the gateway or a worker (`rune.ns.slot_mismatch`): a message or request whose (slot, nsId) pair the receiver's slot table does not hold. Any rise is a bug. |
@@ -289,7 +290,7 @@ erased; the key is the namespace id and the slot's owner tag is the namespace id
 
 The owner is the one thread that writes the metric: `control` the broker's control agent, `observer` the role and ISR
 observer, `provisioner` the segment provisioner. Type id 1000204 (a metadata commit position that was never published) has no row, and
-1000236 to 1000239 are reserved. The table is `kRuneMetrics` in `broker/libs/node/include/rune/node/RuneMetrics.h`; a
+1000236 to 1000238 are reserved. The table is `kRuneMetrics` in `broker/libs/node/include/rune/node/RuneMetrics.h`; a
 regression test (`BrokerMetricsRegression.OperationsDocTableMatchesRegression`) keeps this table equal to it. Logins are
 metrics and structured logs, not `__security` events.
 

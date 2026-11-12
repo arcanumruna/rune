@@ -13,6 +13,13 @@
 // ---------------------------------------------------------------------------
 #include "DrHarness.h"
 
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
+
+#include <memory>
+#include <sstream>
+#include <string>
+
 using namespace rune::replication;
 using namespace rune::replication::dr;
 
@@ -29,6 +36,26 @@ void expectAllConvergedAndAcked(DrCluster& c, const char* where) {
         c.expectNoDuplicates(id);
     }
 }
+
+// Captures the default spdlog logger's output for the lifetime of the object.
+struct LogCapture {
+    std::ostringstream os;
+    std::shared_ptr<spdlog::logger> old, mine;
+    LogCapture() {
+        mine = std::make_shared<spdlog::logger>("cap", std::make_shared<spdlog::sinks::ostream_sink_mt>(os));
+        mine->set_level(spdlog::level::info);
+        mine->flush_on(spdlog::level::info);
+        old = spdlog::default_logger();
+        spdlog::set_default_logger(mine);
+    }
+    ~LogCapture() { spdlog::set_default_logger(old); }
+    std::size_t count(const std::string& needle) const {
+        std::size_t n = 0, at = 0;
+        const std::string s = os.str();
+        while ((at = s.find(needle, at)) != std::string::npos) { ++n; at += needle.size(); }
+        return n;
+    }
+};
 
 } // namespace
 
@@ -2087,6 +2114,27 @@ TEST(IsrProposalRegression, InvalidRequestClearsItsOwnProposalAndBacksOffRegress
                                                                                 << c.dump();
     c.healAll();
     expectAllConvergedAndAcked(c, "invalid request");
+}
+
+// A-M2 (#270): the first InvalidRequest of a leadership warns; the next ones in the same leadership stay quiet.  A
+// refactor guard (the "already warned" fact is "a back-off was set"): green before and after; RED when the warn
+// is unconditional.
+TEST(IsrProposalRegression, InvalidRequestWarnsOncePerLeadershipRegression) {
+    LogCapture log;
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.forceInvalidRequestNext(3);
+    c.cutBoth(1, 3);
+    ASSERT_EQ(c.produce(5), 5);
+    ASSERT_TRUE(c.driveUntil([&] { return c.forcedInvalidRequestsLeft() == 0; }, kCap)) << c.dump();
+    c.run(5);   // the last answer is delivered
+    EXPECT_EQ(log.count("answered INVALID_REQUEST"), 1u) << "three answers in one leadership warn exactly once";
+    ASSERT_TRUE(c.driveUntil([&] { return !c.controllerIsrContains(3); }, kCap)) << "the shrink must still commit\n"
+                                                                                << c.dump();
+    c.healAll();
+    expectAllConvergedAndAcked(c, "invalid request warn once");
 }
 
 // A-I2 (the part safe without a proposal id): a late InvalidRequest answered at an OLDER partitionEpoch than the

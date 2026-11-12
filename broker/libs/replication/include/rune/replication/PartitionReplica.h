@@ -2067,10 +2067,9 @@ private:
     }
     uint64_t isrAwaitingMetadata_   = 0;   ///< proposals that entered AwaitingMetadata (A-M1)
     uint64_t staleAssignments_      = 0;   ///< committed assignments older than the applied one, ignored (A-M5)
-    int64_t  invalidRequestBackoffUntilNs_ = 0;   ///< A-M2: no new proposal before this after an InvalidRequest
-    // CP1 M6: a one-shot WARN latch (one bit, no per-state data), reset with the leadership; kept as a bool on purpose -
-    // a std::variant<NotWarned, Warned> would hold the same single bit.
-    bool     invalidRequestWarned_  = false;      ///< A-M2: WARN once per leadership
+    /// 0 = no InvalidRequest answered in this leadership (the first one warns, A-M2); else no new proposal before
+    /// this time.
+    int64_t  invalidRequestBackoffUntilNs_ = 0;
     InternalProposal internalProposal_{};
     /// MEDIUM-1: partitionEpoch of the committed assignment (-1 = unknown /
     /// not controller-managed).  Set by every becomeLeader.

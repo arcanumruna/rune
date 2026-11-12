@@ -68,8 +68,17 @@ public:
         }
     }
 
-    /// Test seam: slots examined by the last find() (1 = direct hit).
-    [[nodiscard]] std::size_t lastProbesForTest() const noexcept { return lastProbes_; }
+    /// Test seam: slots a find(sid) examines (1 = direct hit, 0 = empty table).  Walks the same probe sequence as
+    /// findIndex_ and stores nothing, so the hot lookup carries no bookkeeping.
+    [[nodiscard]] std::size_t probesForTest(int64_t sid) const noexcept {
+        if (count_ == 0) return 0;
+        std::size_t i = hash_(sid);
+        std::size_t probes = 1;
+        for (std::size_t n = 0; n < Slots; ++n, i = (i + 1) & kMask, ++probes) {
+            if (keys_[i] == sid || keys_[i] == 0) return probes;
+        }
+        return probes;
+    }
 
 private:
     static constexpr std::size_t kNone = static_cast<std::size_t>(-1);
@@ -79,21 +88,18 @@ private:
         return static_cast<std::size_t>((static_cast<uint64_t>(sid) * 0x9E3779B97F4A7C15ULL) >> (64 - kBits));
     }
     [[nodiscard]] std::size_t findIndex_(int64_t sid) const noexcept {
-        if (count_ == 0) { lastProbes_ = 0; return kNone; }
+        if (count_ == 0) return kNone;
         std::size_t i = hash_(sid);
-        std::size_t probes = 1;
-        for (std::size_t n = 0; n < Slots; ++n, i = (i + 1) & kMask, ++probes) {
-            if (keys_[i] == sid) { lastProbes_ = probes; return i; }
-            if (keys_[i] == 0)   { lastProbes_ = probes; return kNone; }
+        for (std::size_t n = 0; n < Slots; ++n, i = (i + 1) & kMask) {
+            if (keys_[i] == sid) return i;
+            if (keys_[i] == 0)   return kNone;
         }
-        lastProbes_ = probes;
         return kNone;
     }
 
     std::unique_ptr<int64_t[]> keys_;      // 0 = empty
     std::unique_ptr<Entry[]>   vals_;
     std::size_t                count_ = 0;
-    mutable std::size_t        lastProbes_ = 0;
 };
 
 } // namespace rune::node

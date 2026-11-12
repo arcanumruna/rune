@@ -14,6 +14,7 @@
 #include <rune/protocol/ProducerIdBinding.h>
 #include <rune/crypto/Scram.h>
 #include <cassert>
+#include <charconv>
 #include <flight_recorder/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/gateway/GatewayReplicaView.h>
@@ -1114,10 +1115,16 @@ bool ClientGateway::inlineWaiterStillValid_(const rune::replication::PartitionRe
 // then erase them — avoids iterator invalidation.
 // ---------------------------------------------------------------------------
 void ClientGateway::reapExpired(int64_t nowNs) {
-    reapAuthDeadlines_(nowNs);   // Authentication Task 11 (D13): sessions that never logged in
+    // Issue #266: ONE walk of the table collects both the sessions that never logged in (Authentication Task 11, D13)
+    // and the expired ones.  failLogin_ writes none of the fields the expiry predicate reads and never erases a
+    // session other than the one it ends; the close loop below tolerates a session already closed by it.
+    const bool authScan = authMode_ == rune::gateway::GatewayAuthMode::Required;
+    authReapScratch_.clear();
     reapScratch_.clear();
+    ++sessionScansForTest_;
 
     sessions_.forEach([&](Session& s) {
+        if (authScan && authDeadlinePassed_(s, nowNs)) authReapScratch_.push_back(s.sessionId);
         // D8b: lost on any worker (ack publication NOT_CONNECTED) → the normal lease from the Lost edge (its
         // owed acks are freed in ~sessionTimeout); else held (paused by back-pressure) → maxHeldIdleNs_ since the
         // last activity / Progress signal; else the normal lease since the last activity.
@@ -1129,6 +1136,8 @@ void ClientGateway::reapExpired(int64_t nowNs) {
                                                   : nowNs - s.lastSeenNs > sessionTimeoutNs_;
         if (expired) reapScratch_.push_back(s.sessionId);
     });
+
+    failAuthDeadlines_();
 
     // Fix round 2 (finding 4): ONE close path (closeSession_) for reap,
     // Disconnect and SessionFailed — table, workers, record-egress resolves,
@@ -1679,12 +1688,11 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     // Each pub is retired: kept alive until its worker acknowledges the release.
     for (auto& [w, pub] : s->recordEgressByWorker)
         if (pub) retireRecordEgress_(sid, w, std::move(pub));
+    if (s->heldLoginOk.epoch != 0) unlinkHeldLoginOk_(*s);   // issue #202: before the session leaves the table
     sessions_.remove(sid);                    // releases its (gateway-written) egress publication
     // Task 13: the workers forget it too (its queued acks drop, its
     // publications are released) — retried until every worker has it.
     if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, sid);
-    for (std::size_t i = 0; i < heldLoginFinals_.size(); ++i)
-        if (heldLoginFinals_[i].sessionId == sid) { heldLoginFinals_.erase(heldLoginFinals_.begin() + static_cast<std::ptrdiff_t>(i)); break; }
     // Hybrid egress: drop any in-flight record-egress resolves for this session
     // (all workers — its buffered subscribes die with the session).
     for (auto pit = pendingRecordEgress_.begin(); pit != pendingRecordEgress_.end(); ) {
@@ -2030,6 +2038,14 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
             if (workerDamagedReads_.size() <= static_cast<std::size_t>(ret.partition))
                 workerDamagedReads_.resize(static_cast<std::size_t>(ret.partition) + 1, 0);
             workerDamagedReads_[static_cast<std::size_t>(ret.partition)] = static_cast<uint64_t>(ret.baseOffset);
+        }
+        return;
+    }
+    if (kind == K::UnauthLogSuppressed) [[unlikely]] {   // #145: a worker's cumulative suppressed log lines
+        if (ret.partition >= 0 && ret.partition < 4096) {
+            if (workerUnauthSuppressed_.size() <= static_cast<std::size_t>(ret.partition))
+                workerUnauthSuppressed_.resize(static_cast<std::size_t>(ret.partition) + 1, 0);
+            workerUnauthSuppressed_[static_cast<std::size_t>(ret.partition)] = static_cast<uint64_t>(ret.baseOffset);
         }
         return;
     }
@@ -5855,11 +5871,72 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 // the admin thread sends the SubscribeResponse, the backlog up to this broker's
 // HW, the caught-up marker and the live events.
 // ---------------------------------------------------------------------------
-void ClientGateway::noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr)
+// Issue #200: may this Subscribe become an admin-log read of the session?  A correlation id live on the OTHER log is
+// refused InvalidRequest (the read servers' answers carry no log kind, so a corr names one read of the session); a
+// full list the retriable NotLeader (at least 64 of its entries await a server answer, which is transient).  `isNew`:
+// the corr is not listed yet - the caller lists it once the admin ring took the request.
+bool ClientGateway::admitAdminRead_(Session& s, const pc::Subscribe& msg, bool security, bool& isNew)
 {
-    for (const int64_t c : corrs) if (c == corr) return;
-    if (corrs.size() >= Session::kMaxReadCorrs) corrs.erase(corrs.begin());
-    corrs.push_back(corr);
+    const auto& own   = security ? s.securityReadCorrs : s.catalogReadCorrs;
+    const auto& other = security ? s.catalogReadCorrs : s.securityReadCorrs;
+    const auto has = [&](const std::vector<Session::AdminRead>& v) {
+        return std::any_of(v.begin(), v.end(),
+                           [&](const Session::AdminRead& r) { return r.corr == msg.correlationId; });
+    };
+    isNew = false;
+    pc::ErrorResponse er;
+    er.sessionId     = msg.sessionId;
+    er.correlationId = msg.correlationId;
+    if (has(other)) {
+        ++adminReadsRefusedDuplicateCorr_;
+        er.code    = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+        er.message = "correlation id already used by a live read on this session";
+    } else if (has(own)) {
+        return true;   // a retransmitted Subscribe: no second entry
+    } else if (own.size() >= Session::kMaxAdminReads) {
+        ++adminReadsRefusedAtCap_;
+        er.code = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+    } else {
+        isNew = true;
+        return true;
+    }
+    sendAnswer_(s, scratch_.data(), er.encode(scratch_.data()));
+    return false;
+}
+
+void ClientGateway::noteAdminLogAnswer(int64_t sessionId, const uint8_t* frame, std::size_t len)
+{
+    const auto hdr = pc::MessageHeader::decode(frame, len);
+    if (!hdr) return;
+    const bool subscribeAnswer = hdr->templateId == static_cast<uint16_t>(pc::TemplateId::SubscribeResponse);
+    if (!subscribeAnswer && hdr->templateId != static_cast<uint16_t>(pc::TemplateId::ErrorResponse)) return;
+    Session* s = sessions_.find(sessionId);
+    if (s == nullptr) return;
+    bool accepted = false;
+    int64_t subId = 0;
+    if (subscribeAnswer) {
+        const auto r = pc::SubscribeResponse::decode(frame, len);
+        if (!r) return;
+        accepted = r->errorCode == 0;
+        subId    = r->subscriptionId;
+    }
+    for (auto* list : {&s->catalogReadCorrs, &s->securityReadCorrs}) {   // a corr is listed at most once across both
+        const auto it = std::find_if(list->begin(), list->end(),
+                                     [&](const Session::AdminRead& r) { return r.corr == hdr->correlationId; });
+        if (it == list->end()) continue;
+        if (accepted) it->subId = subId;
+        else list->erase(it);
+        return;
+    }
+}
+
+// Issue #200: the client ended the admin-log read `subscriptionId` (the log is named by the id's space).
+void ClientGateway::dropAdminRead_(int64_t sessionId, int64_t subscriptionId)
+{
+    Session* s = sessions_.find(sessionId);
+    if (s == nullptr || subscriptionId == 0) return;
+    auto& list = rune::gateway::isSecuritySubscriptionId(subscriptionId) ? s->securityReadCorrs : s->catalogReadCorrs;
+    std::erase_if(list, [&](const Session::AdminRead& r) { return r.subId == subscriptionId; });
 }
 
 void ClientGateway::handleCatalogSubscribe_(Session& session, const pc::Subscribe& msg)
@@ -5888,6 +5965,8 @@ void ClientGateway::handleCatalogSubscribe_(Session& session, const pc::Subscrib
         answer(pc::ErrorCode::Internal);
         return;
     }
+    bool isNewRead = false;
+    if (!admitAdminRead_(session, msg, /*security=*/false, isNewRead)) return;
     // Issue #117: an end of this kind still owed to the admin goes first (FIFO) - else it would end the new read.
     const bool endOwed = (session.pendingReadEnds & Session::kPendingEndCatalogReads) != 0 && !submitReadEnds_(session);
     if (endOwed || !adminSink_->submitCatalogSubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
@@ -5900,7 +5979,7 @@ void ClientGateway::handleCatalogSubscribe_(Session& session, const pc::Subscrib
         sendAnswer_(session, scratch_.data(), n);
         return;
     }
-    noteReadCorr_(session.catalogReadCorrs, msg.correlationId);
+    if (isNewRead) session.catalogReadCorrs.push_back({msg.correlationId, 0});
     ++catalogSubscribesForwarded_;
 }
 
@@ -5937,6 +6016,8 @@ void ClientGateway::handleSecuritySubscribe_(Session& session, const pc::Subscri
         answer(pc::ErrorCode::AuthUnavailable);
         return;
     }
+    bool isNewRead = false;
+    if (!admitAdminRead_(session, msg, /*security=*/true, isNewRead)) return;
     // Issue #117: an end of this kind still owed to the admin goes first (FIFO) - else it would end the new read.
     const bool endOwed = (session.pendingReadEnds & Session::kPendingEndSecurityReads) != 0 && !submitReadEnds_(session);
     if (endOwed || !adminSink_->submitSecuritySubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
@@ -5948,7 +6029,7 @@ void ClientGateway::handleSecuritySubscribe_(Session& session, const pc::Subscri
         sendAnswer_(session, scratch_.data(), n);
         return;
     }
-    noteReadCorr_(session.securityReadCorrs, msg.correlationId);
+    if (isNewRead) session.securityReadCorrs.push_back({msg.correlationId, 0});
     ++securitySubscribesForwarded_;
 }
 
@@ -6042,13 +6123,16 @@ int ClientGateway::flushPendingReadEnds_()
 }
 
 ClientGateway::AdminLogAdmit ClientGateway::admitAdminLogFrame(int64_t sessionId, int64_t subId, const uint8_t* frame,
-                                                              std::size_t len)
+                                                              std::size_t len, int64_t& holdUntilEvent)
 {
     using rune::security::Operation;
     if (authMode_ != rune::gateway::GatewayAuthMode::Required) return AdminLogAdmit::Deliver;
     const Session* s = sessions_.find(sessionId);
     if (s == nullptr) return AdminLogAdmit::Deliver;    // the offer answers NoSession
-    if (securityBehind_) [[unlikely]] return AdminLogAdmit::Hold;   // #603: the grant below may already be revoked
+    if (securityBehind_) [[unlikely]] {   // #603: the grant below may already be revoked
+        holdUntilEvent = -1;
+        return AdminLogAdmit::Hold;
+    }
     const bool security = rune::gateway::isSecuritySubscriptionId(subId);
     const PermissionTable& perms = permsOf_(*s);
     if (!perms.allowsCluster(rune::security::opBit(security ? Operation::Admin : Operation::Describe))) {
@@ -6081,7 +6165,9 @@ ClientGateway::AdminLogAdmit ClientGateway::admitAdminLogFrame(int64_t sessionId
         ++adminLogFramesWithheld_;
         return AdminLogAdmit::Withhold;
     }
-    return newestEvent <= securityView_->appliedOffset() ? AdminLogAdmit::Deliver : AdminLogAdmit::Hold;
+    if (newestEvent <= securityView_->appliedOffset()) return AdminLogAdmit::Deliver;
+    holdUntilEvent = newestEvent;
+    return AdminLogAdmit::Hold;
 }
 
 int ClientGateway::flushPendingCatalogUnsubs_()
@@ -6331,6 +6417,7 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
     // Catalog history Task 12: a catalog subscription lives on the admin thread
     // (its owner check is there too).
     if (rune::gateway::isCatalogSubscriptionId(msgOpt->subscriptionId)) [[unlikely]] {
+        dropAdminRead_(msgOpt->sessionId, msgOpt->subscriptionId);   // issue #200: ring or not
         forwardCatalogUnsubscribe_(msgOpt->sessionId, msgOpt->subscriptionId);
         return;
     }
@@ -8963,15 +9050,26 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
 // client fields and a {0, 0} request id.  Views into the ingress buffer / session.
 // ---------------------------------------------------------------------------
 rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext, int64_t sessionId,
-                                                     const Session& session, uint32_t targetNsId)
+                                                     const Session& session, uint32_t targetNsId,
+                                                     std::optional<std::string_view> describeLocalName)
 {
     rune::gateway::DdlMetaView m;
     m.targetNsId    = targetNsId;   // namespaces Task 10: the object's resolved namespace (kHiddenNsId = answered missing)
     m.sessionId     = sessionId;
     m.sourceAddress = session.sourceIdentity;   // the Connect image's source, never the declared channel (#227)
+    // Issues #218 / #67: the security state this request is authorized against.  The caller ran its authorization
+    // check on this same control-thread invocation, and the mirror only moves on this thread (kA2cSecurityApplied
+    // frames drain between handler invocations), so the offset read here is the one the check saw.
+    if (securityView_ != nullptr) {
+        m.securityStamped = true;
+        m.securityOffset  = securityView_->appliedOffset();
+    }
     // The authenticated user (Task 11; Task 12 makes the catalog principal carry it too): a view into the session's
     // auth state, copied by the admin ring submit before this frame's handler returns.
     m.callerNsId = sessionNsId_(session);   // namespaces Task 9: the login's namespace (0 = `default` / anonymous)
+    // Issue #217: what the session may DESCRIBE under the statement's own target name (a catalog DDL only; every other
+    // caller keeps the default, everything).
+    if (describeLocalName) m.describeMask = describeMaskFor_(session, *describeLocalName, targetNsId);
     const std::string* user = nullptr;
     if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) user = &a->user;
     else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session.auth)) user = &p->user;
@@ -8984,6 +9082,8 @@ rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext
             else { ddlPrincipalScratch_.push_back('#'); ddlPrincipalScratch_.append(std::to_string(m.callerNsId)); }
             ddlPrincipalScratch_.push_back('/');
         }
+        // The prefix just built (#218 / #67): where the local user name starts.
+        m.authenticatedLocalAt = static_cast<uint16_t>(ddlPrincipalScratch_.size());
         ddlPrincipalScratch_.append(*user);
         m.authenticated = ddlPrincipalScratch_;
     }
@@ -8996,6 +9096,18 @@ rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext
                                                              ext->replayedPrincipal};
     }
     return m;
+}
+
+/// Issue #217: the kinds under `localName` the session may DESCRIBE (kKindTopic / kKindView), plus kDescribeCatalog
+/// when it holds DESCRIBE ON CLUSTER (it may read the whole catalog anyway, #220).  Allow-all (dev / in-process) gets
+/// all three.
+uint8_t ClientGateway::describeMaskFor_(const Session& session, std::string_view localName, uint32_t nsId) const
+{
+    const rune::gateway::PermissionTable& perms = permsOf_(session);
+    uint8_t mask = rune::gateway::allowedKindsForName(perms, localName, rune::security::Operation::Describe, nsId);
+    if (!rune::gateway::authorizeCluster(perms, rune::security::Operation::Describe))
+        mask |= rune::gateway::kDescribeCatalog;
+    return mask;
 }
 
 // The admin sink's verdict → the answer when it did not take the request.
@@ -9143,8 +9255,9 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
                        adminSink_->submitDefineTopic(m.sessionId, m.correlationId, res.local, m.partitionCount,
                                                      m.keyField, m.validate, m.descriptorBlob, m.descriptorLen,
                                                      m.persistence, m.replicationFactor, m.config,
-                                                     ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session, res.nsId),
-                                                     adopt ? std::string_view(adopt->detail) : std::string_view{},
+                                                     ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session,
+                                                                res.nsId, res.local),
+                                                     adopt ? adopt->detail() : std::string_view{},
                                                      m.hasKeyFeatures ? m.keyFeatures : rune::protocol::TopicKeyFeatures{},
                                                      m.hasLease ? std::optional<rune::protocol::LeaseSpec>(m.lease) : std::nullopt),
                        "DefineTopic: admin ring full", "DefineTopic: request larger than the admin ring message");
@@ -9179,12 +9292,18 @@ void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
         return;
     }
     // Authentication Task 12 (D18): DESCRIBE on the name, whether it is a topic or a view (the text always says TOPIC).
-    if (deny_(*session, rune::gateway::authorizeTopicOrViewName(permsOf_(*session), res.local,
-                                                                 rune::security::Operation::Describe, objectIndex_,
-                                                                 res.nsId), buf, len))
+    // #504, #505: the gateway only decides WHICH KINDS the session may describe under this name; the admin thread,
+    // which holds the authoritative catalog, serves the object only if its real kind is among them.
+    const uint8_t kinds = rune::gateway::allowedKindsForName(permsOf_(*session), res.local,
+                                                              rune::security::Operation::Describe, res.nsId);
+    if (kinds == 0) {   // no DESCRIBE under either kind: NotAuthorized whether or not the object exists
+        (void)deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic,
+                                                           res.local, rune::security::Operation::Describe, res.nsId),
+                    buf, len);
         return;
+    }
     if (!adminSink_->submitGetSchema(m.sessionId, m.correlationId, res.local,
-                                     m.requestedFingerprint, res.nsId)) {
+                                     m.requestedFingerprint, res.nsId, kinds)) {
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "GetTopicSchema: admin ring full");
     }
 }
@@ -9233,7 +9352,8 @@ void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
     answerAdminSubmit_(buf, len,
                        adminSink_->submitAlterTopic(m.sessionId, m.correlationId, res.local, m.expectedVersion,
                                                     m.opsBlob, m.opsLen,
-                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session, res.nsId)),
+                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session,
+                                                               res.nsId, res.local)),
                        "AlterTopic: admin ring full", "AlterTopic: request larger than the admin ring message");
 }
 
@@ -9287,7 +9407,8 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
     answerAdminSubmit_(buf, len,
                        adminSink_->submitCreateView(m.sessionId, m.correlationId, res.local, m.keyField,
                                                     m.persistence, m.planBlob, m.planLen,
-                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session, res.nsId)),
+                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session,
+                                                               res.nsId, res.local)),
                        "CreateView: admin ring full", "CreateView: request larger than the admin ring message");
 }
 
@@ -9325,7 +9446,7 @@ void ClientGateway::handleCatalogDdl_(const uint8_t* buf, std::size_t len, const
         return;
     }
     if (deny_(*session, authorizeCatalogDdl_(*session, m, res.local, res.nsId), buf, len)) return;   // authentication Task 12
-    answerAdminSubmit_(buf, len, submit(m, res.local, ddlMetaOf_(&m.ext, m.sessionId, *session, res.nsId)),
+    answerAdminSubmit_(buf, len, submit(m, res.local, ddlMetaOf_(&m.ext, m.sessionId, *session, res.nsId, res.local)),
                        "catalog DDL: admin ring full", "catalog DDL: request larger than the admin ring message");
 }
 
@@ -9628,27 +9749,38 @@ void ClientGateway::answerSecurityBehind_(Session& session, const pc::MessageHea
     sendAnswer_(session, scratch_.data(), er.encode(scratch_.data()));
 }
 
+void ClientGateway::setSecurityKnownEnd(int64_t knownEnd)
+{
+    securityKnownEnd_ = knownEnd;
+    (void)syncWorkersLag_();   // #506: the view may now be behind events this broker holds
+}
+
 void ClientGateway::setSecurityBehind(bool behind)
 {
     behind = behind && authMode_ == rune::gateway::GatewayAuthMode::Required;
     if (behind == securityBehind_) return;
     securityBehind_ = behind;
+    if (!behind) behindClearNeedsOffset_ = pendingEnforce_.empty() ? -1 : pendingEnforce_.back().offset;   // #608
     spdlog::warn("ClientGateway: __security view {}", behind
         ? "BEHIND committed events this broker holds - grant-checked requests answer AuthUnavailable, nothing is pushed"
         : "applied every committed event this broker holds - grant-checked requests served again");
-    (void)syncWorkersBehind_();
+    (void)syncWorkersLag_();
 }
 
-int ClientGateway::syncWorkersBehind_()
+int ClientGateway::syncWorkersLag_()
 {
-    if (workersBehind_ == securityBehind_) [[likely]] return 0;
-    if (workerPool_ == nullptr) { workersBehind_ = securityBehind_; return 0; }
+    const bool deferDenials = authMode_ == rune::gateway::GatewayAuthMode::Required && securityViewBehind_();
+    const uint8_t wanted = securityBehind_ ? kLagRefuseAll : (deferDenials ? kLagDeferDenials : uint8_t{0});
+    if (workersLag_ == wanted) [[likely]] return 0;
+    if (workerPool_ == nullptr) { workersLag_ = wanted; return 0; }
     // The clear follows the view's effects: every applied event's ops (revoked bitmaps / binds on the lifecycle ring,
     // ending Unsubscribes on the op ring) were EXECUTED by every worker (its enforcement fences acknowledged) - until
-    // then a worker could still push to, or accept a produce of, a session the applied events cut off.
-    if (!securityBehind_ && !pendingEnforce_.empty()) return 0;
-    workersBehind_ = securityBehind_;
-    (void)permissionShipper_.securityBehind(*workerPool_, workersBehind_);   // FIFO behind every queued item
+    // then a worker could still push to, or accept a produce of, a session the applied events cut off.  #608: only the
+    // events pending when the gateway's own flag cleared count; later ones do not hold the clear back.
+    if (workersLag_ == kLagRefuseAll && wanted != kLagRefuseAll && securityEnforcedOffset_ < behindClearNeedsOffset_)
+        return 0;
+    workersLag_ = wanted;
+    (void)permissionShipper_.securityLag(*workerPool_, workersLag_);   // FIFO behind every queued item
     return 1;
 }
 
@@ -9872,8 +10004,13 @@ void ClientGateway::onCatalogObjectDropped(int32_t id)
 
 rune::gateway::Denial ClientGateway::refusedProducerIdDenial_(int64_t producerId)
 {
-    return rune::gateway::Denial{static_cast<uint16_t>(pc::ErrorCode::NotAuthorized),
-                                 "not authorized: WRITE on PRODUCER_ID " + std::to_string(producerId)};
+    rune::gateway::Denial d;
+    d.code = static_cast<uint16_t>(pc::ErrorCode::NotAuthorized);
+    std::array<char, 24> id{};
+    const auto end = std::to_chars(id.data(), id.data() + id.size(), producerId).ptr;
+    d.append("not authorized: WRITE on PRODUCER_ID ");
+    d.append(std::string_view(id.data(), static_cast<std::size_t>(end - id.data())));
+    return d;
 }
 
 void ClientGateway::noteDenied_(const Session& session, pc::TemplateId tid, const rune::gateway::Denial& denial)
@@ -9884,7 +10021,7 @@ void ClientGateway::noteDenied_(const Session& session, pc::TemplateId tid, cons
         if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) user = a->user.c_str();
         spdlog::warn("auth: request refused user={} session={} template={}: {} (refusals so far: {})",
                      LogSafeName{user}, session.sessionId,
-                     static_cast<uint16_t>(tid), denial.detail, notAuthorizedAnswers_);
+                     static_cast<uint16_t>(tid), denial.detail(), notAuthorizedAnswers_);
     }
 }
 
@@ -9912,6 +10049,15 @@ bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::D
         noteUnanswerable_(buf, len, "topic not applied here yet");
         return true;
     }
+    // #506: the view has not applied every `__security` event this broker holds (one of them may be the grant this
+    // request relies on), so the denial is not a verdict: retriable AuthUnavailable, exactly like #603's behind answer.
+    // Deny path only - nothing is ever allowed on unapplied events.
+    if (securityViewBehind_()) [[unlikely]] {
+        ++deniesDeferredViewBehind_;
+        if (hdr) answerSecurityBehind_(session, *hdr, buf, len);
+        else noteUnanswerable_(buf, len, "denied while the security view is behind");
+        return true;
+    }
     noteDenied_(session, static_cast<pc::TemplateId>(hdr ? hdr->templateId : 0), *denial);
     if (!hdr) return true;   // the caller decoded the body, so this cannot happen; nothing to answer on
     // The DDL family carries the D23 detail text; every other response type has no free-text field.
@@ -9925,7 +10071,7 @@ bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::D
         case pc::TemplateId::NamespaceDdl: {
             pc::DdlResponse r;
             r.sessionId = hdr->sessionId; r.correlationId = hdr->correlationId;
-            r.errorCode = denial->code; r.detail = denial->detail;
+            r.errorCode = denial->code; r.detail = denial->detail();   // views: the Denial outlives the encode
             if (r.fits() && r.encodedSize() <= scratch_.size()) {
                 sendAnswer_(session, scratch_.data(), r.encode(scratch_.data()));
                 return true;
@@ -9937,7 +10083,7 @@ bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::D
     if (!answerRejection_(session, *hdr, denial->code, "not authorized", buf, len)) {
         pc::ErrorResponse er;
         er.sessionId = hdr->sessionId; er.correlationId = hdr->correlationId;
-        er.code = static_cast<int16_t>(denial->code); er.message = denial->detail;
+        er.code = static_cast<int16_t>(denial->code); er.message = denial->detail();
         if (pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 + er.message.size() <= scratch_.size())
             sendAnswer_(session, scratch_.data(), er.encode(scratch_.data()));
     }
@@ -10405,8 +10551,7 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     const std::size_t finalLen = f.encode(scratch_.data());
     if (shipEpoch != 0 && permissionShipper_.shippedSeq() < shipEpoch) {
         // A worker's lifecycle ring is full: hold the OK (cold, login rate) until every worker accepted the bitmap.
-        heldLoginFinals_.push_back({session->sessionId, shipEpoch,
-                                    std::vector<uint8_t>(scratch_.data(), scratch_.data() + finalLen)});
+        holdLoginOk_(*session, shipEpoch, f.correlationId, f.flags, std::span<const uint8_t>(ok.serverSignature));
         return;
     }
     sendAnswer_(*session, scratch_.data(), finalLen);
@@ -10441,21 +10586,72 @@ int ClientGateway::servicePermissionShippingWork_()
     int work = 0;
     syncPermissionTables_();   // issue #259: a freed table's drop (after every rebind away from it)
     if (!workerPool_) return 0;
-    work += syncWorkersBehind_();   // #603: in every worker mode (worker-pushed subscriptions pause too)
+    work += syncWorkersLag_();   // #603: in every worker mode (worker-pushed subscriptions pause too)
     if (permissionShipper_.pendingUpdates() != 0) work += permissionShipper_.retry(*workerPool_);
     if (!shardMode_) return work;
     if (!objectShipSeqs_.empty()) {   // issue #197: bounded even when an OK is never offered
         const uint64_t shipped = permissionShipper_.shippedSeq();
         std::erase_if(objectShipSeqs_, [shipped](const auto& e) { return e.second <= shipped; });
     }
-    for (std::size_t i = 0; i < heldLoginFinals_.size(); ) {
-        HeldLoginFinal& h = heldLoginFinals_[i];
-        if (permissionShipper_.shippedSeq() < h.epoch) { ++i; continue; }
-        if (Session* s = sessions_.find(h.sessionId)) sendAnswer_(*s, h.frame.data(), h.frame.size());
-        heldLoginFinals_.erase(heldLoginFinals_.begin() + static_cast<std::ptrdiff_t>(i));
+    while (heldLoginHead_ != 0) {
+        Session* s = sessions_.find(heldLoginHead_);
+        if (s == nullptr) [[unlikely]] {   // closeSession_ unlinks a held session before it leaves the table
+            spdlog::error("gateway: held login list names session {} that is not in the table; list reset", heldLoginHead_);
+            heldLoginHead_ = heldLoginTail_ = 0;
+            heldLoginCount_ = 0;
+            break;
+        }
+        if (permissionShipper_.shippedSeq() < s->heldLoginOk.epoch) break;   // FIFO: epochs only grow
+        unlinkHeldLoginOk_(*s);
+        sendHeldLoginOk_(*s);
         ++work;
     }
     return work;
+}
+
+void ClientGateway::holdLoginOk_(Session& s, uint64_t epoch, int64_t corr, uint8_t flags, std::span<const uint8_t> signature)
+{
+    if (s.heldLoginOk.epoch != 0) unlinkHeldLoginOk_(s);
+    auto& h = s.heldLoginOk;
+    h.epoch = epoch;
+    h.correlationId = corr;
+    h.flags = flags;
+    h.serverSignature.fill(0);
+    std::memcpy(h.serverSignature.data(), signature.data(), std::min(signature.size(), h.serverSignature.size()));
+    h.prev = heldLoginTail_;
+    h.next = 0;
+    if (heldLoginTail_ != 0) {
+        if (Session* t = sessions_.find(heldLoginTail_)) t->heldLoginOk.next = s.sessionId;
+    } else {
+        heldLoginHead_ = s.sessionId;
+    }
+    heldLoginTail_ = s.sessionId;
+    ++heldLoginCount_;
+}
+
+void ClientGateway::unlinkHeldLoginOk_(Session& s)
+{
+    auto& h = s.heldLoginOk;
+    if (h.epoch == 0) return;
+    if (h.prev != 0) { if (Session* p = sessions_.find(h.prev)) p->heldLoginOk.next = h.next; }
+    else heldLoginHead_ = h.next;
+    if (h.next != 0) { if (Session* n = sessions_.find(h.next)) n->heldLoginOk.prev = h.prev; }
+    else heldLoginTail_ = h.prev;
+    h.epoch = 0;
+    h.prev = h.next = 0;
+    if (heldLoginCount_ > 0) --heldLoginCount_;
+}
+
+void ClientGateway::sendHeldLoginOk_(Session& s)
+{
+    pc::AuthServerFinal f;
+    f.sessionId       = s.sessionId;
+    f.correlationId   = s.heldLoginOk.correlationId;
+    f.errorCode       = 0;
+    f.flags           = s.heldLoginOk.flags;
+    f.serverSignature = std::string_view(reinterpret_cast<const char*>(s.heldLoginOk.serverSignature.data()),
+                                         s.heldLoginOk.serverSignature.size());
+    sendAnswer_(s, scratch_.data(), f.encode(scratch_.data()));
 }
 
 int ClientGateway::servicePermissionShipping_()
@@ -10466,19 +10662,20 @@ int ClientGateway::servicePermissionShipping_()
 }
 
 
-void ClientGateway::reapAuthDeadlines_(int64_t nowNs)
+bool ClientGateway::authDeadlinePassed_(const Session& s, int64_t nowNs)
 {
     using namespace rune::gateway;
-    if (authMode_ != GatewayAuthMode::Required) return;
-    authReapScratch_.clear();
-    sessions_.forEach([&](Session& s) {
-        // PR #525 review: a Closing session already failed its login (its 44 is owed): never failed - and counted - again.
-        if (s.spill.state == SpillState::Closing) [[unlikely]] return;
-        int64_t deadline = INT64_MAX;
-        if (const auto* a = std::get_if<AuthAwaitingFirst>(&s.auth)) deadline = a->deadlineNs;
-        else if (const auto* b = std::get_if<AuthAwaitingFinal>(&s.auth)) deadline = b->deadlineNs;
-        if (nowNs > deadline) authReapScratch_.push_back(s.sessionId);
-    });
+    // PR #525 review: a Closing session already failed its login (its 44 is owed): never failed - and counted - again.
+    if (s.spill.state == SpillState::Closing) [[unlikely]] return false;
+    int64_t deadline = INT64_MAX;
+    if (const auto* a = std::get_if<AuthAwaitingFirst>(&s.auth)) deadline = a->deadlineNs;
+    else if (const auto* b = std::get_if<AuthAwaitingFinal>(&s.auth)) deadline = b->deadlineNs;
+    return nowNs > deadline;
+}
+
+void ClientGateway::failAuthDeadlines_()
+{
+    using namespace rune::gateway;
     for (const int64_t sid : authReapScratch_) {
         Session* s = sessions_.find(sid);
         if (s == nullptr) continue;
@@ -10616,6 +10813,8 @@ void ClientGateway::onSecurityApplied(int64_t offset, const rune::security::Appl
     }
     applyTracking_ = false;
     noteEnforced_(offset, applyOpWorkers_, permissionShipper_.queuedSeq() != shippedBefore);
+    // #506: every permission item of this event is queued above, so a level change shipped now follows them (FIFO).
+    (void)syncWorkersLag_();
 }
 
 void ClientGateway::refreshSession_(int64_t sid)
@@ -10650,7 +10849,7 @@ void ClientGateway::executeLiveActions_(Session& s, const rune::gateway::LiveAct
     const PermissionTable& perms = permsOf_(s);
     for (const EndSubscription& e : act.ends) {
         const auto d = authorizeTopicId(perms, e.topicId, rune::security::Operation::Read, objectIndex_);
-        const std::string_view detail = d ? std::string_view(d->detail) : std::string_view("not authorized");
+        const std::string_view detail = d ? d->detail() : std::string_view("not authorized");
         // Issue #109: a WORKER-pushed subscription (per-worker egress) is ended by its push owner - the worker writes
         // its Records on its own publication, so only it can put the terminal NotAuthorized AFTER its last Records.
         // The ending Unsubscribe is queued behind the subscription's Subscribe (never dropped) and the event's
@@ -10667,15 +10866,17 @@ void ClientGateway::executeLiveActions_(Session& s, const rune::gateway::LiveAct
     if (act.endCatalogReads) {
         forwardCatalogUnsubscribe_(s.sessionId, rune::gateway::kEndCatalogReadsOnly);
         const auto d = authorizeCluster(perms, rune::security::Operation::Describe);
-        for (const int64_t corr : s.catalogReadCorrs)
-            sendErrorOn_(s, corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized), d ? std::string_view(d->detail) : std::string_view("not authorized"));
+        for (const auto& rd : s.catalogReadCorrs)
+            sendErrorOn_(s, rd.corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized),
+                         d ? d->detail() : std::string_view("not authorized"));
         s.catalogReadCorrs.clear();
     }
     if (act.endSecurityReads) {
         forwardCatalogUnsubscribe_(s.sessionId, rune::gateway::kEndSecurityReadsOnly);
         const auto d = authorizeCluster(perms, rune::security::Operation::Admin);
-        for (const int64_t corr : s.securityReadCorrs)
-            sendErrorOn_(s, corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized), d ? std::string_view(d->detail) : std::string_view("not authorized"));
+        for (const auto& rd : s.securityReadCorrs)
+            sendErrorOn_(s, rd.corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized),
+                         d ? d->detail() : std::string_view("not authorized"));
         s.securityReadCorrs.clear();
     }
     // Task 4: a lost WRITE grant aborts the session's open transactions (they could no longer be ended by it).
@@ -10727,8 +10928,8 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason, uint16_
         if (workerEnds) subscriptions_.erase(subId);
         else sendErrorOn_(*s, key.correlationId, code, reason);
     }
-    for (const int64_t corr : s->catalogReadCorrs) sendErrorOn_(*s, corr, code, reason);
-    for (const int64_t corr : s->securityReadCorrs) sendErrorOn_(*s, corr, code, reason);
+    for (const auto& rd : s->catalogReadCorrs) sendErrorOn_(*s, rd.corr, code, reason);
+    for (const auto& rd : s->securityReadCorrs) sendErrorOn_(*s, rd.corr, code, reason);
     // ... then the session-level frame (corr 0): every other in-flight request of the session completes with it.
     sendErrorOn_(*s, 0, code, reason);
     // Issue #212: a revoked session is terminal (never resumed): its group members leave now, so their groups
@@ -10848,7 +11049,9 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
         bool knownRetry = false;
         if (!m.ext.requestId.none() && securityView_ != nullptr)
             if (const auto rec = securityView_->state().request(m.ext.requestId))
-                knownRetry = rec->requestFingerprint == rune::gateway::securityDdlFingerprint(m);
+                knownRetry = rec->requestFingerprint ==   // #221: the principal the leader will see in meta.authenticated
+                             rune::gateway::securityDdlFingerprint(
+                                 m, ddlMetaOf_(&m.ext, m.sessionId, *session, 0).authenticated);
         if (!ownPassword) denial = std::move(admin);
         else if (admin) {
             proofChecked = true;
@@ -10866,7 +11069,7 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
     }
     answerAdminSubmit_(buf, len,
                        adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session, 0),
-                                                     denial ? std::string_view(denial->detail) : std::string_view{},
+                                                     denial ? denial->detail() : std::string_view{},
                                                      proofChecked),
                        "SecurityDdl: admin ring full", "SecurityDdl: request larger than the admin ring message");
 }
@@ -10907,7 +11110,7 @@ void ClientGateway::handleNamespaceDdl(const uint8_t* buf, std::size_t len)
     if (denial) noteDenied_(*session, pc::TemplateId::NamespaceDdl, *denial);
     answerAdminSubmit_(buf, len,
                        adminSink_->submitNamespaceDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session, 0),
-                                                      denial ? std::string_view(denial->detail) : std::string_view{},
+                                                      denial ? denial->detail() : std::string_view{},
                                                       static_cast<uint16_t>(session->clientVersion)),
                        "NamespaceDdl: admin ring full", "NamespaceDdl: request larger than the admin ring message");
 }
@@ -11057,7 +11260,7 @@ std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(S
     // Issue #114.  Every failure is the same text (it never says which part failed) and counts as a failed login on
     // the throttle: a proof is a password guess.  Cold path (security DDL rate).
     rune::gateway::Denial refused;
-    refused.detail = std::string(rune::gateway::kOwnCredentialProofRefusal);
+    refused.append(rune::gateway::kOwnCredentialProofRefusal);
     // A retry of a request the leader already applied (chargeThrottle false) is neither throttled nor charged: the
     // leader answers it from its dedupe table whatever this verdict says.
     if (chargeThrottle) {
@@ -11214,20 +11417,6 @@ uint16_t ClientGateway::viewRowGate_(int32_t viewTopicId, int32_t partition) con
 
 void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
 {
-    if (!workerPool_) {
-        // Task 8 fix round 1 (I5): a gated view answers its C1 code first.
-        if (const auto mo = pc::GetViewRow::decode(buf, len)) {
-            const uint16_t gate = viewRowGate_(mo->viewTopicId, 0);
-            if (gate != kViewRowNoGate) {
-                (void)rejectRequest_(buf, len, gate, "GetViewRow: view not served here (C1)");
-                return;
-            }
-        }
-        // No-hang (R2): no workers on this gateway — no view is servable here, a
-        // permanent condition: UnknownView (4), not the retriable NotReady.
-        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kUnknownView, "GetViewRow: no worker pool");
-        return;
-    }
     auto msgOpt = pc::GetViewRow::decode(buf, len);
     if (!msgOpt) {
         // No-hang (R2): answered ViewRowResponse{InvalidRequest (5)}.
@@ -11246,6 +11435,15 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
         if (deny_(*session, authorizeViewRead_(perms, m.viewTopicId), buf, len))
             return;
+
+    if (!workerPool_) {
+        // #219: authorized first, on every path; then the C1 gate (Task 8 fix round 1, I5), then "no view is servable
+        // here" (No-hang R2: a permanent condition, UnknownView (4), not the retriable NotReady).
+        const uint16_t gate = viewRowGate_(m.viewTopicId, 0);
+        (void)rejectRequest_(buf, len, gate != kViewRowNoGate ? gate : pc::ViewRowResponse::kUnknownView,
+                             gate != kViewRowNoGate ? "GetViewRow: view not served here (C1)" : "GetViewRow: no worker pool");
+        return;
+    }
 
     // #721: a view of a DELETING namespace is gone for readers, a root session included (one compare when none deletes).
     if (inDeletingNs_(m.viewTopicId)) [[unlikely]] {
@@ -11325,14 +11523,15 @@ Session* ClientGateway::checkedViewReadSession_(const uint8_t* buf, std::size_t 
         (void)rejectRequest_(buf, len, pc::ViewRowResponse::kInvalidRequest, "view read: client version below checked writes");
         return nullptr;
     }
+    if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
+        if (deny_(*session, authorizeViewRead_(perms, viewTopicId), buf, len))
+            return nullptr;
+    // #219: authorized first; only then the C1 gate / "no view is servable here" of a gateway without workers.
     if (!workerPool_) {
         const uint16_t gate = viewRowGate_(viewTopicId, 0);
         (void)rejectRequest_(buf, len, gate != kViewRowNoGate ? gate : pc::ViewRowResponse::kUnknownView, "view read: no worker pool");
         return nullptr;
     }
-    if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
-        if (deny_(*session, authorizeViewRead_(perms, viewTopicId), buf, len))
-            return nullptr;
     if (inDeletingNs_(viewTopicId)) [[unlikely]] {
         (void)rejectRequest_(buf, len, pc::ViewRowResponse::kUnknownView, "view read: namespace is being deleted");
         return nullptr;
@@ -11929,6 +12128,12 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
                                             int64_t producerId, bool commit,
                                             int32_t coordinatorEpoch)
 {
+    // #215: a control marker only ever targets a user topic; a negative (internal) id is refused and counted.
+    if (topicId < 0) {
+        ++controlRecordsRefusedInternalId_;
+        spdlog::warn("ClientGateway::appendControlRecord: internal topicId={} refused", topicId);
+        return -1;
+    }
     if (!topicRegistry_) {
         spdlog::warn("ClientGateway::appendControlRecord: no TopicRegistry — dropped");
         return -1;

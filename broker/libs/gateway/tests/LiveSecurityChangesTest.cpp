@@ -53,8 +53,8 @@ TEST(LiveSecurityChangesRegression, LostEveryReadEndsEverySubscriptionInIdOrder)
 
 TEST(LiveSecurityChangesRegression, LostDescribeClusterEndsCatalogReads) {
     Rig r;
-    r.session.catalogReadCorrs = {5};
-    r.session.securityReadCorrs = {6};
+    r.session.catalogReadCorrs = {{5, 0}};
+    r.session.securityReadCorrs = {{6, 0}};
     const auto before = r.table({g(Operation::Describe, ResourceType::Cluster, PatternKind::Exact, ""),
                                  g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")});
     const auto after  = r.table({g(Operation::Create, ResourceType::Cluster, PatternKind::Exact, "")});
@@ -70,8 +70,8 @@ TEST(LiveSecurityChangesRegression, LostDescribeClusterEndsCatalogReads) {
 
 TEST(LiveSecurityChangesRegression, LostAdminEndsSecurityReads) {
     Rig r;
-    r.session.catalogReadCorrs = {5};
-    r.session.securityReadCorrs = {6};
+    r.session.catalogReadCorrs = {{5, 0}};
+    r.session.securityReadCorrs = {{6, 0}};
     const auto before = r.table({g(Operation::Describe, ResourceType::Cluster, PatternKind::Exact, ""),
                                  g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")});
     const auto after  = r.table({g(Operation::Describe, ResourceType::Cluster, PatternKind::Exact, "")});
@@ -99,7 +99,7 @@ TEST(LiveSecurityChangesRegression, LostGroupReadEndsTheGroup) {
 
 TEST(LiveSecurityChangesRegression, GainedGrantsEndNothing) {
     Rig r;
-    r.session.catalogReadCorrs = {5};
+    r.session.catalogReadCorrs = {{5, 0}};
     const auto before = r.table({g(Operation::Read, ResourceType::Topic, PatternKind::Prefix, "w.")});
     const auto after  = r.table({g(Operation::Read, ResourceType::Topic, PatternKind::Prefix, "w."),
                                  g(Operation::Write, ResourceType::Topic, PatternKind::Prefix, "w."),

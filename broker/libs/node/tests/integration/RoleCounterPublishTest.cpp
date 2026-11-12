@@ -322,6 +322,22 @@ TEST(NodeConfigRegression, DevModeSingleNodeStartsAndWarns) {
     node.stop();
 }
 
+// #195: a NodeConfig built without an auth mode runs InProcessUnauthenticated (anonymous full access, plaintext links).
+// The counter must say so (2), never "enabled" (0), and the broker shouts it like dev mode.
+TEST(AuthModeCounterRegression, InProcessUnauthenticatedIsNotReportedAsEnabledRegression) {
+    TempDir tmp{"inproc_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    ASSERT_EQ(cfg.authMode, AuthMode::InProcessUnauthenticated) << "the default config has no auth mode";
+    WarnCapture log;   // installed BEFORE any broker thread exists, and outliving the node
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(5s));
+    const NodeMetrics nm{tmp.path, cfg.nodeId};
+    EXPECT_TRUE(awaitCounter(nm, typeIdOf(RuneMetric::AuthMode), 2, 10s)) << "counter 1'000'228 = 2 in-process";
+    EXPECT_GE(log.count("AUTHENTICATION IS OFF"), 1) << "the in-process warning at start";
+    node.stop();
+}
+
 // Combined fix program M13 (X102): the `__security` log holds every user's StoredKey / ServerKey.  Its directory is 0700
 // and its segment, index and checkpoint files 0600 (the default-umask 0644 they used to get).  RED: pass the default mode
 // to the security Log (or drop the permissions() call) - the files / directory are group- and world-readable again.
@@ -352,6 +368,83 @@ TEST(SecurityAtRestRegression, SecurityLogFilesAreOwnerOnlyRegression) {
     }
     EXPECT_GE(logs, 1);
     EXPECT_GE(indexes, 1);
+    node.stop();
+}
+
+// #147: `__security` files left by an older run (created 0644 before M13, or by a restore) are tightened to 0600 at
+// boot, not only the directory.  RED: remove the per-file permissions() loop in BrokerNode::bootFromSecurity_.
+TEST(SecurityAtRestRegression, FilesOfAnOlderRunAreOwnerOnlyAfterBootRegression) {
+    TempDir tmp{"atrest_old_"};
+    const fs::path key = tmp.path.string() + "_atrestold.key";
+    { std::ofstream(key) << std::string(40, 'k') << "\n"; }
+    fs::permissions(key, fs::perms::owner_read | fs::perms::owner_write);
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    cfg.authMode = AuthMode::Enabled;
+    cfg.clientTransport = ClientTransport::PlaintextForTest;   // issue #10: plaintext client sessions, test only
+    cfg.clusterKeyFile = key.string();
+    const fs::path dir = tmp.path / "__security";
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(5s));
+        node.stop();
+    }
+    // An "older run": every file group/world readable, and the directory too.
+    int widened = 0;
+    for (const auto& e : fs::directory_iterator(dir))
+        if (e.is_regular_file()) {
+            fs::permissions(e.path(), fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read |
+                                          fs::perms::others_read);
+            ++widened;
+        }
+    ASSERT_GE(widened, 2) << "the first run leaves at least a segment and an index";
+    fs::permissions(dir, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read |
+                             fs::perms::others_exec);
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(5s));
+        auto mode = [](const fs::path& p) {
+            struct stat st {};
+            return ::stat(p.c_str(), &st) == 0 ? (st.st_mode & 0777) : mode_t{0xFFFF};
+        };
+        EXPECT_EQ(mode(dir), mode_t{0700}) << "directory";
+        int seen = 0;
+        for (const auto& e : fs::directory_iterator(dir))
+            if (e.is_regular_file()) {
+                ++seen;
+                EXPECT_EQ(mode(e.path()), mode_t{0600}) << e.path();
+            }
+        EXPECT_GE(seen, widened);
+        node.stop();
+    }
+}
+
+// #147: EVERY regular file in `__security` of a fresh boot - recovery-point and log-start checkpoints, pre-provisioned
+// staging segment / index files included - is owner-only, not just the .log / .index / applied files.
+// RED: a storage file-creation site that ignores the Log's file mode (a literal 0644).
+TEST(SecurityAtRestRegression, EveryFileOfAFreshBootIsOwnerOnlyRegression) {
+    TempDir tmp{"atrest_all_"};
+    const fs::path key = tmp.path.string() + "_atrestall.key";
+    { std::ofstream(key) << std::string(40, 'k') << "\n"; }
+    fs::permissions(key, fs::perms::owner_read | fs::perms::owner_write);
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    cfg.authMode = AuthMode::Enabled;
+    cfg.clientTransport = ClientTransport::PlaintextForTest;   // issue #10: plaintext client sessions, test only
+    cfg.clusterKeyFile = key.string();
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(5s));
+    const fs::path dir = tmp.path / "__security";
+    int seen = 0;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        if (!e.is_regular_file()) continue;
+        ++seen;
+        struct stat st {};
+        ASSERT_EQ(::stat(e.path().c_str(), &st), 0) << e.path();
+        EXPECT_EQ(st.st_mode & 0777, mode_t{0600}) << e.path();
+    }
+    EXPECT_GE(seen, 2);
     node.stop();
 }
 

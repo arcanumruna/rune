@@ -130,7 +130,8 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
     std::optional<TransactionalId> txnId,
     int32_t                        txnTimeoutMs,
     int64_t                        nowNs,
-    std::optional<uint64_t>        owner)
+    std::optional<uint64_t>        owner,
+    std::optional<uint64_t>        caller)
 {
     // Resolve effective timeout.
     // txnTimeoutMs < 0 → explicitly invalid (mirror Kafka: INVALID_TXN_TIMEOUT_MS).
@@ -205,7 +206,11 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
     // Issue #122: the id must be the caller's.  Another principal's id (or a legacy id, issued to nobody) is never
     // handed over: the caller gets a fresh id of its own, through the same path as an epoch overflow (the previous
     // holder is fenced; an Ongoing transaction is aborted under the OLD id, the new one adopted once it resolves).
-    const bool foreign = owner.has_value() && !rune::protocol::producerIdOwnedBy(meta->producerId, *owner);
+    // #122 / #425: the held id must be usable by the caller.  With an owner (ids are being bound) it must be the
+    // caller's own bound id (a legacy raw id is re-issued bound).  Without one (below the feature level) a raw id is
+    // anyone's, but a BOUND id of another principal is still never handed over.
+    const bool foreign = owner.has_value() ? !rune::protocol::producerIdOwnedBy(meta->producerId, *owner)
+                       : caller.has_value() && !rune::protocol::producerIdUsableBy(meta->producerId, *caller);
     if (meta->producerEpoch == INT16_MAX || foreign) {
         // Epoch space exhausted (or the id is not the caller's) — allocate a fresh PID.
         newPid   = allocatePid_(owner);

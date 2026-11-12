@@ -72,12 +72,20 @@ inline constexpr uint8_t kPermFlagDrop     = 0x20;
 /// worker answers SessionSignal FenceAck{sessionId 1} - every permission item, bind and SessionClose queued before it
 /// on this ring is installed.  Carries no table.
 inline constexpr uint8_t kPermFlagFence    = 0x40;
-/// Issue #603: this broker's `__security` view is behind committed events it holds (nextOffset = 1) or no longer is
-/// (nextOffset = 0).  While behind, the worker answers every ingress produce AuthUnavailable (nothing appended) and
+/// Issue #603: this broker's `__security` view is behind committed events it holds (nextOffset = the lag level, see
+/// kSecurityLag*; 0 = no longer behind).  While behind, the worker answers every ingress produce AuthUnavailable
+/// (nothing appended) and
 /// pushes no subscription.  The control thread ships the clear only once every applied event's enforcement fence was
 /// acknowledged on both rings, so the revoked bitmaps and the ended subscriptions are installed first.  Carries no
 /// table.
 inline constexpr uint8_t kPermFlagSecurityBehind = 0x80;
+/// Issues #603 / #506: the level a kPermFlagSecurityBehind item carries in `nextOffset` (one lag LEVEL, not two flags).
+/// RefuseAll: every ingress produce is answered AuthUnavailable (#603).  DeferDenials: the view holds events it has not
+/// applied (#506) - a produce the worker would ALLOW is served, one it would DENY is answered AuthUnavailable.  A value
+/// above DeferDenials is treated as RefuseAll (fail closed).
+inline constexpr uint8_t kSecurityLagCurrent      = 0;
+inline constexpr uint8_t kSecurityLagRefuseAll    = 1;
+inline constexpr uint8_t kSecurityLagDeferDenials = 2;
 /// SESSION_PERMISSIONS `topicId` of a Table / Patch item: which bitmap of the table it carries.
 inline constexpr int32_t kPermBitmapWrite  = 0;
 inline constexpr int32_t kPermBitmapImport = 1;
@@ -93,7 +101,13 @@ struct Staging {
 };
 using PermissionUpdate = std::variant<NoUpdate, Staging>;
 
-enum class PermissionChunkResult : uint8_t { Staged, Installed, Dropped };
+/// What applying one SESSION_PERMISSIONS op did.  The lifecycle ring is in-process, FIFO and written only by the
+/// gateway's PermissionShipper, so only two failures exist:
+///   UnknownSession  a Bind for a session this worker no longer has (it closed while the bind was queued): benign;
+///   Violation       a structurally impossible op (bad length / bounds / table id / chunk order / variant flags): a
+///                   broker bug - the worker halts on it (Worker::executeSessionPermissionsWire_).
+/// Staged = a chunk of a table was stored, the table is not complete yet; Applied = the op took effect.
+enum class PermApply : uint8_t { Applied, Staged, UnknownSession, Violation };
 
 /// The worker's chunk assembler of a full TABLE: ONE per worker; the buffer circulates between it, the tables and
 /// `spare_` so nothing allocates once the buffers reached their peak size.  `Sink` provides
@@ -102,10 +116,12 @@ enum class PermissionChunkResult : uint8_t { Staged, Installed, Dropped };
 class PermissionStager {
 public:
     template <class Sink>
-    PermissionChunkResult apply(Sink& sink, int64_t sessionId, uint64_t firstWord, uint64_t totalWords, uint8_t flags,
-                                uint64_t epoch, const uint8_t* tail, std::size_t tailLen, uint64_t owner, int32_t bitmap) {
+    PermApply apply(Sink& sink, int64_t sessionId, uint64_t firstWord, uint64_t totalWords, uint8_t flags,
+                    uint64_t epoch, const uint8_t* tail, std::size_t tailLen, uint64_t owner, int32_t bitmap) {
         static_assert(sizeof(uint64_t) == 8);
-        if (tailLen % 8 != 0 || firstWord > totalWords || (tailLen / 8) > totalWords - firstWord) return drop_();
+        if (tailLen % 8 != 0) return drop_("table chunk tail is not whole words");
+        if (firstWord > totalWords || (tailLen / 8) > totalWords - firstWord)
+            return drop_("table chunk words lie outside the table");
         const std::size_t count = tailLen / 8;
         if (firstWord == 0) {                                  // a first chunk (re)starts the staging
             Staging st;
@@ -118,31 +134,36 @@ public:
         }
         Staging* st = std::get_if<Staging>(&state_);
         if (st == nullptr || st->sessionId != sessionId || st->totalWords != totalWords ||
-            firstWord != st->filled) return drop_();
+            firstWord != st->filled) return drop_("table chunk is not the next one of the staged table");
         if (count != 0) std::memcpy(st->words.data() + firstWord, tail, tailLen);   // little-endian hosts only
         st->filled = firstWord + count;
-        if ((flags & kPermFlagLast) == 0) return PermissionChunkResult::Staged;
-        if (st->filled != totalWords) return drop_();
+        if ((flags & kPermFlagLast) == 0) return PermApply::Staged;
+        if (st->filled != totalWords) return drop_("last table chunk does not complete the table");
         const bool ok = bitmap == kPermBitmapImport
             ? sink.installImportGrants(sessionId, st->words)
             : sink.installWriteGrants(sessionId, st->words, (flags & kPermFlagGrantAll) != 0, epoch, owner);
         spare_ = std::move(st->words);                         // the swapped-out slot buffer: the next staging buffer
         state_ = NoUpdate{};
-        return ok ? PermissionChunkResult::Installed : PermissionChunkResult::Dropped;   // unknown / closed session
+        if (!ok) { reason_ = "table id beyond the store"; ++dropped_; return PermApply::Violation; }
+        return PermApply::Applied;
     }
+    /// Why the last Violation was returned (a static string; meaningful only after a Violation).
+    [[nodiscard]] const char* violationReason() const noexcept { return reason_; }
     [[nodiscard]] bool staging() const noexcept { return std::holds_alternative<Staging>(state_); }
-    [[nodiscard]] uint64_t droppedChunks() const noexcept { return dropped_; }
+    [[nodiscard]] uint64_t droppedChunks() const noexcept { return dropped_; }   // Violations returned
 
 private:
-    PermissionChunkResult drop_() noexcept {
+    PermApply drop_(const char* reason) noexcept {
         if (auto* st = std::get_if<Staging>(&state_)) spare_ = std::move(st->words);
         state_ = NoUpdate{};
         ++dropped_;
-        return PermissionChunkResult::Dropped;
+        reason_ = reason;
+        return PermApply::Violation;
     }
     PermissionUpdate      state_;
     std::vector<uint64_t> spare_;
     uint64_t              dropped_ = 0;
+    const char*           reason_  = "";
 };
 
 } // namespace rune::node

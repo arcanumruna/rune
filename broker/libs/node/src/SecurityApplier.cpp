@@ -252,19 +252,18 @@ int SecurityApplier::applyRange_(rune::storage::Log* log, int64_t bound) {
             }
             const auto tl = static_cast<std::size_t>(reader.totalLength());
             if (reader.isControl()) {
-                // Not a security event (never written by the leader); its offsets are consumed — but only
-                // CONTIGUOUSLY: a control batch past nextOffset hides a gap, never skipped over.
-                Applying& cur = std::get<Applying>(st_);
-                if (reader.baseOffset() > cur.nextOffset) {
-                    halt_(localFailure(cur.nextOffset, sec::ApplyError::Code::Precondition,
-                                       "a gap in __security: the next batch (a control batch) starts at offset " +
-                                           std::to_string(reader.baseOffset())));
-                    break;
-                }
+                // Never written by the leader.  The control-thread mirror needs dense event offsets, so a control
+                // batch that covers any offset still to apply (below the bound) halts, never consumed.
+                const Applying& cur = std::get<Applying>(st_);
                 const int64_t end = reader.baseOffset() + reader.lastOffsetDelta() + 1;
-                if (end > cur.nextOffset) cur.nextOffset = std::min(end, bound);
-                pos += tl;
-                continue;
+                if (end <= cur.nextOffset || reader.baseOffset() >= bound) {   // applied before / past the bound
+                    pos += tl;
+                    continue;
+                }
+                halt_(localFailure(cur.nextOffset, sec::ApplyError::Code::Precondition,
+                                   "a control batch in __security at offset " + std::to_string(reader.baseOffset()) +
+                                       " (never written by the leader)"));
+                break;
             }
             reader.forEachRecord([&](std::string_view /*key*/, std::string_view val, int64_t off, int64_t /*ts*/) {
                 const Applying* cur = std::get_if<Applying>(&st_);
@@ -318,6 +317,7 @@ bool SecurityApplier::applyRecord_(int64_t offset, std::span<const uint8_t> byte
         halt_(std::move(a.error()));
         return false;
     }
+    authzChanges_.note(*ev, *a, state_, offset);   // issues #218 / #67: boot replay and live alike
     // From here on the library holds the event: a halt names it staged.
     if (live) {
         // Step 4: the checkpoint precedes the effect.

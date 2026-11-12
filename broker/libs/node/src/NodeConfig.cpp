@@ -1769,6 +1769,9 @@ ConfigResult parseNodeConfig(
         return {{}, "RUNE_CLUSTER_KEY_FILE is required when authentication is enabled (RUNE_AUTH unset or 'enabled'): "
                     "point it at the shared cluster key file (generate one with `rune security gen-cluster-key`), or set "
                     "RUNE_AUTH=disabled for single-node development"};
+    // #147: an unsupported authenticated topology is a parse error, so tools that only parse see it too
+    // (validateAuth repeats the check for programmatic configs that never went through here).
+    if (auto err = cfg.validateAuthTopology()) return {{}, *err};
 
     return {std::move(cfg), {}, std::move(warnings)};
 }

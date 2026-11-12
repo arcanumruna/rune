@@ -1,6 +1,8 @@
 // SecurityStatementText.cpp — see the header.  Mirrors rune::ql::redactedText (ql/src/Redact.cpp) rule for rule.
 #include <rune/security/SecurityStatementText.h>
 
+#include <rune/catalog/TopicName.h>
+
 namespace rune::security {
 namespace {
 
@@ -15,11 +17,13 @@ bool plainIdent(std::string_view n) noexcept {
     }
     return true;
 }
-// A string literal: a quote inside is doubled (SQL), so no name or pattern can close the literal and make the recorded
-// text read as another statement (PR #525 review: a raw wire client's pattern is not bound by the QL lexer).
+// A string literal.  A backslash, a control byte (< 0x20, 0x7f) and a byte >= 0x80 are escaped first (\\, \xhh:
+// rune::catalog::escapeNameForLog), then a quote is doubled (SQL).  So no name or pattern can close the literal and
+// make the recorded text read as another statement (PR #525 review), nor put a newline or an ANSI escape into the
+// audit text (#527): a raw wire client's pattern is not bound by the QL lexer.
 std::string quoted(std::string_view n) {
     std::string out = "'";
-    for (const char c : n) { out += c; if (c == '\'') out += '\''; }
+    for (const char c : rune::catalog::escapeNameForLog(n)) { out += c; if (c == '\'') out += '\''; }
     return out + "'";
 }
 std::string ident(std::string_view n) { return plainIdent(n) ? std::string(n) : quoted(n); }

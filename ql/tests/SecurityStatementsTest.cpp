@@ -404,6 +404,40 @@ TEST(SecurityStatementTextRegression, AQuoteInsideALiteralIsDoubledByBothRendere
               "GRANT READ ON GROUP PREFIX '" + std::string(498, '\'') + "' TO ROLE r;");
 }
 
+// #527: a literal's control bytes, backslashes and non-ASCII bytes are escaped as \xhh by BOTH renderers, byte for
+// byte the same, for every pattern the QL lexer accepts.
+TEST(SecurityStatementTextRegression, EscapedLiteralsMatchTheClientRedactionRegression) {
+    const char* cases[] = {
+        "GRANT READ ON GROUP PREFIX 'a\tb' TO ROLE r;",
+        "GRANT READ ON GROUP 'a\x1b[31m' TO ROLE r;",
+        "GRANT READ ON TOPIC PREFIX 'a\\b' TO ROLE r;",
+        "GRANT READ ON TOPIC 'caf\xC3\xA9' TO USER u;",
+        "REVOKE READ ON VIEW 'a\tb' FROM ROLE r FORCE;",
+        "CREATE ROLE 'a\tb';",
+    };
+    for (const char* text : cases) {
+        auto st = ql::parse(text);
+        ASSERT_TRUE(st.has_value()) << text;
+        auto plan = ql::applySecurityPlan(*st);
+        ASSERT_TRUE(plan.has_value()) << text;
+        const std::string want = ql::redactedText(*st);
+        for (const char ch : want) {
+            const auto c = static_cast<unsigned char>(ch);
+            EXPECT_FALSE(c < 0x20 || c == 0x7f || c >= 0x80) << text;
+        }
+        EXPECT_EQ(plan->statement, want) << text;
+        EXPECT_EQ(rune::security::securityStatementText(static_cast<uint8_t>(plan->kind), plan->name,
+                                                        static_cast<uint8_t>(plan->change), plan->passwordIndex,
+                                                        plan->terminateSessions, plan->force ? 1 : 0, plan->granteeKind,
+                                                        plan->op, plan->resourceType, plan->patternKind, plan->pattern,
+                                                        plan->roleName),
+                  want) << text;
+    }
+    auto st = ql::parse("GRANT READ ON GROUP PREFIX 'a\tb\\c' TO ROLE r;");
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(ql::redactedText(*st), "GRANT READ ON GROUP PREFIX 'a\\x09b\\\\c' TO ROLE r;");
+}
+
 TEST(CheckedWritesImportGrant, ParsesGrantAndRevokeImport) {
     auto g = std::get<ql::GrantDef>(ql::parse("grant import on topic 'user' to user backfill;").value());
     EXPECT_EQ(g.op, ql::SecOp::Import);

@@ -4,6 +4,7 @@
 #include <rune/node/SecurityAdmin.h>
 
 #include <rune/catalog/CatalogFingerprint.h>
+#include <rune/catalog/TopicName.h>
 #include <rune/catalog/CatalogState.h>
 #include <rune/catalog/NamespaceRegistry.h>
 #include <rune/catalog/NsName.h>
@@ -177,7 +178,8 @@ void SecurityAdmin::submit(SecurityRequest r) {
 }
 
 // ─── the request fingerprint (F14, for __security): FNV-1a-64 over every field that makes the statement what it is -
-//     never the requestId, clientName, session or the principal.
+//     and the authenticated principal (issue #221: a request id is never reusable across principals, so another
+//     principal learns nothing from a recorded one); never the requestId, clientName or session.
 namespace {
 struct Fnv {
     uint64_t h = 0xcbf29ce484222325ULL;
@@ -194,7 +196,7 @@ uint64_t fingerprintOf(const SecurityDdlMsg& m) {
     const rune::gateway::VerifierBytes v{m.verifier.salt, m.verifier.iterations, m.verifier.storedKey, m.verifier.serverKey};
     return rune::gateway::securityDdlFingerprint(m.meta.statement, m.kind, m.name, m.change, m.passwordIndex,
                                                  m.terminateSessions, v, m.granteeKind, m.op, m.resourceType,
-                                                 m.patternKind, m.pattern, m.roleName);
+                                                 m.patternKind, m.pattern, m.roleName, m.meta.authenticated);
 }
 uint64_t fingerprintOf(const SecurityBootstrapMsg& m) {
     Fnv f;
@@ -250,7 +252,7 @@ bool SecurityAdmin::advance_(int64_t nowNs) {
         const SecurityRequest req = std::move(a->req);
         const int64_t offset = a->offset;
         inFlight_ = Idle{};
-        answer_(req, kInternal, "security apply halted on this broker at offset " +
+        answer_(req, kInternal, "security apply halted on node " + std::to_string(selfId_) + " at offset " +
                                     std::to_string(applier_.haltError() ? applier_.haltError()->offset : -1) +
                                     "; the request's event (offset " + std::to_string(offset) +
                                     ") may have committed - retry with the same requestId on another broker");
@@ -285,7 +287,8 @@ void SecurityAdmin::startNext_(int64_t nowNs) {
     }
     if (applier_.halted() && !std::holds_alternative<SecurityHalted>(role_)) (void)updateRole_();
     if (const auto* h = std::get_if<SecurityHalted>(&role_)) {
-        answer_(req, kInternal, "security apply halted at offset " + std::to_string(h->offset));   // never a redirect
+        answer_(req, kInternal, "security apply halted on node " + std::to_string(selfId_) + " at offset " +
+                                    std::to_string(h->offset));   // never a redirect
         return;
     }
     if (!std::holds_alternative<SecurityLeaderServing>(role_)) {   // follower / catching up: retriable
@@ -301,6 +304,23 @@ void SecurityAdmin::startNext_(int64_t nowNs) {
 }
 
 namespace {
+/// #230: the names the broker records as principals ("bootstrap" for the bootstrap, "anonymous" for dev mode): no user
+/// may carry one, or the audit trail could not tell the user from the broker.  ASCII case-insensitive; no allocation.
+/// Only the leader enforces it: the frozen apply rules accept these names so an existing log still replays.
+bool reservedPrincipalName(std::string_view n) noexcept {
+    const auto eq = [&](std::string_view reserved) noexcept {
+        if (n.size() != reserved.size()) return false;
+        for (std::size_t i = 0; i < n.size(); ++i) {
+            const char c = (n[i] >= 'A' && n[i] <= 'Z') ? static_cast<char>(n[i] - 'A' + 'a') : n[i];
+            if (c != reserved[i]) return false;
+        }
+        return true;
+    };
+    return eq("bootstrap") || eq("anonymous");
+}
+} // namespace
+
+namespace {
 /// The Principal of an event from the request's meta.
 sec::Principal principalOf(const DdlMeta& meta, std::string authenticated, uint64_t fingerprint) {
     sec::Principal p;
@@ -313,30 +333,75 @@ sec::Principal principalOf(const DdlMeta& meta, std::string authenticated, uint6
     return p;
 }
 
-/// Review C I1 (D10): `__security` is never compacted and readable by every ADMIN forever, so the leader is the last line
-/// of defence for a password literal.  True when `statement` has a PASSWORD keyword (any case) followed by a quoted
-/// literal (' " or $$) that is not exactly '<redacted>'.  Cold path.
-bool statementHasUnredactedPassword(std::string_view statement) {
-    constexpr std::string_view kWord = "PASSWORD", kRedacted = "'<redacted>'";
-    for (std::size_t i = 0; i + kWord.size() <= statement.size(); ++i) {
-        bool match = true;
-        for (std::size_t k = 0; k < kWord.size() && match; ++k)
-            match = std::toupper(static_cast<unsigned char>(statement[i + k])) == kWord[k];
-        if (!match) continue;
-        std::size_t j = i + kWord.size();
-        while (j < statement.size() && std::isspace(static_cast<unsigned char>(statement[j]))) ++j;
-        if (j >= statement.size()) continue;
-        const char q = statement[j];
-        if (q != '\'' && q != '"' && q != '$') continue;
-        if (statement.substr(j, kRedacted.size()) != kRedacted) return true;
+/// Review C I1 (D10) / #229: `__security` is never compacted and readable by every ADMIN forever.  The recorded text is
+/// rendered from the op (#228), but the client's text still feeds the stored request fingerprint, so the leader stays
+/// the last line of defence - for the ops that carry a verifier only (CreateUser; AlterUser AddPassword / SetPassword,
+/// the same predicate the wire decode uses).  Every other op never has its text judged.  For those, true when the text
+/// holds a quoted literal ('..' or ".." with a doubled quote as escape, or $$..$$) that is not exactly '<redacted>'
+/// and is not the user's own name (full or local part, as the content or in the renderers' escaped, quoted form).
+/// An unterminated literal counts as one.  Cold path.
+std::string quotedForm(std::string_view n) {
+    std::string out = "'";
+    for (const char c : rune::catalog::escapeNameForLog(n)) { out += c; if (c == '\'') out += '\''; }
+    return out + "'";
+}
+
+bool statementMayCarryASecret(const SecurityDdlMsg& m) {
+    const bool hasVerifier = m.kind == 1 || (m.kind == 2 && (m.change == 0 || m.change == 2));
+    if (!hasVerifier) return false;
+    const std::string_view st = m.meta.statement;
+    const std::string_view full = m.name;
+    const auto slash = full.find('/');
+    const std::string_view local = slash == std::string_view::npos ? full : full.substr(slash + 1);
+    const std::string quotedFull = quotedForm(full), quotedLocal = quotedForm(local);
+    std::size_t i = 0;
+    while (i < st.size()) {
+        const char q = st[i];
+        if (q == '$' && i + 1 < st.size() && st[i + 1] == '$') {
+            const auto end = st.find("$$", i + 2);
+            if (end == std::string_view::npos) return true;
+            const std::string_view content = st.substr(i + 2, end - i - 2);
+            if (content != full && content != local) return true;
+            i = end + 2;
+        } else if (q == '\'' || q == '"') {
+            std::string content;
+            std::size_t j = i + 1;
+            bool closed = false;
+            while (j < st.size()) {
+                if (st[j] == q) {
+                    if (j + 1 < st.size() && st[j + 1] == q) { content += q; j += 2; continue; }
+                    closed = true;
+                    break;
+                }
+                content += st[j++];
+            }
+            if (!closed) return true;
+            const std::string_view raw = st.substr(i, j + 1 - i);
+            if (raw != "'<redacted>'" && raw != quotedFull && raw != quotedLocal && content != full && content != local)
+                return true;
+            i = j + 1;
+        } else {
+            ++i;
+        }
     }
     return false;
+}
+/// Issue #411: only these kinds can leave no enabled security admin; every other kind skips the dry run.
+bool canRemoveAnAdmin(const sec::SecurityEvent& e) {
+    switch (e.kind) {
+    case sec::EventKind::AlterUser:
+    case sec::EventKind::DropUser:
+    case sec::EventKind::DropRole:
+    case sec::EventKind::Revoke:
+    case sec::EventKind::RevokeRole: return true;
+    default: return false;
+    }
 }
 /// Issue #121: true when applying `e` to `state` leaves no enabled security admin.  A copy of the state takes the event
 /// (the library's own apply, so every op kind is judged by the rules that will really run); an event that does not
 /// apply is not judged here (appendEvent_'s dry run answers it).
 bool removesLastSecurityAdmin(const sec::SecurityState& state, const sec::SecurityEvent& e) {
-    sec::SecurityState after = state;
+    sec::SecurityState after = state.cloneWithoutRequests();   // no dedupe history: apply only writes it
     sec::SecurityEvent probe = e;
     auto fp = sec::previewFingerprint(state, probe);
     if (!fp) return false;
@@ -409,7 +474,7 @@ GuardVerdict nsGuard(const CallerPerms& caller, uint32_t targetNsId, const Secur
 
 void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRequest& req) {
     const sec::SecurityState& state = applier_.state();
-    if (statementHasUnredactedPassword(m.meta.statement)) {
+    if (statementMayCarryASecret(m)) {
         answer_(req, kInvalidRequest, "the statement carries a password literal; the client must send the redacted statement (D10)");
         return;
     }
@@ -432,6 +497,23 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
             }
             return;
         }
+    }
+    // Issues #218 / #67: the gateway authorized (or denied) this request against the `__security` state at the stamped
+    // offset.  This applier is fed by the same log the gateway's mirror follows (the mirror trails it), and a DDL
+    // starts only when no event of ours is in flight, so "applied" is the offset the new event follows.  A change the
+    // gateway did not see (a REVOKE ADMIN of this requester, a GRANT that would lift a denial): the retriable
+    // NotLeader, and the retry is authorized again.  Per principal: only an event applied after the stamp that could
+    // have changed what THIS user may do (SecurityAuthzChangeIndex) makes it stale, so an admin pipelining DDL about
+    // other users never retries.  After the dedupe: a recorded request keeps its result.
+    if (m.meta.securityStamped &&
+        applier_.authzChanges().staleAt(applier_.state(), applier_.state().appliedOffset(), m.meta.securityOffset,
+                                        m.meta.callerNsId, m.meta.authenticated, m.meta.authenticatedLocalAt)) {
+        if (++ddlStaleAuthorization_ % 1024 == 1)
+            spdlog::debug("SecurityAdmin: a DDL authorized at __security offset {} met applied offset {} - answered "
+                          "NotLeader (retriable; stale so far: {})", m.meta.securityOffset,
+                          applier_.state().appliedOffset(), ddlStaleAuthorization_);
+        answer_(req, kNotLeader, "the security state changed while this request was in flight; retry");
+        return;
     }
     // PR #410 review F2: a failed own-credential proof answers ONE refusal, whatever the request names.
     if (m.proofChecked != 0 && !m.denial.empty()) {
@@ -579,6 +661,10 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
                                           "valid for '" + m.name + "'");
         return;
     }
+    if (opKind == pc::SecurityOpKind::CreateUser && reservedPrincipalName(target->local)) {
+        answer_(req, kInvalidRequest, "the user name '" + std::string{target->local} + "' is reserved");
+        return;
+    }
     e.nsId = target->nsId;
     e.kind = sec::kindOf(ops);
     e.ops = std::move(ops);
@@ -622,10 +708,13 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
     e.timestampMs = wallClockMs();
     // Issue #121: the last-admin guard.  Removing the last ENABLED user that effectively holds ADMIN ON CLUSTER (a
     // DISABLE, a DROP USER, a REVOKE of ADMIN or of the role carrying it, a DROP ROLE ...) reopens the bootstrap window:
-    // only the cluster-key holder can then manage security.  Refused unless the statement says FORCE.  Decided on the
-    // event itself - the same frozen rules every broker applies, dry-run on a copy of the state (cold: DDL rate) - so
-    // every path that can remove the last admin is covered, not a list of statement kinds.
-    if (m.force == 0 && state.hasSecurityAdmin() && removesLastSecurityAdmin(state, e)) {
+    // only the cluster-key holder can then manage security.  Refused unless the statement says FORCE.  Only the event
+    // kinds that can remove an admin (canRemoveAnAdmin) pay for the check; those are decided on the event itself - the
+    // same frozen rules every broker applies - by a dry run on cloneWithoutRequests() (a copy of the state without
+    // its request dedupe table; cold: DDL rate), so every path that can remove the last admin is covered.
+    const bool dryRun = m.force == 0 && state.hasSecurityAdmin() && canRemoveAnAdmin(e);
+    if (dryRun) ++lastAdminDryRuns_;
+    if (dryRun && removesLastSecurityAdmin(state, e)) {
         answer_(req, kInvalidRequest, "this removes the last enabled security admin (no enabled user would hold ADMIN ON "
                                       "CLUSTER): create or enable another admin first, or say FORCE");
         return;
@@ -647,6 +736,10 @@ void SecurityAdmin::startBootstrap_(const SecurityBootstrapMsg& m, int64_t nowNs
     }
     if (state.hasSecurityAdmin()) {
         answer_(req, kInvalidRequest, "security is already bootstrapped (a security admin exists)");
+        return;
+    }
+    if (reservedPrincipalName(m.adminName)) {
+        answer_(req, kInvalidRequest, "the user name '" + m.adminName + "' is reserved");
         return;
     }
     sec::BootstrapOps ops{m.verifier, m.fakeSaltSeed};

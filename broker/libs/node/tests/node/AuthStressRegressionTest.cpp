@@ -735,7 +735,12 @@ private:
         }
         if (const std::string d = digestConvergence(rig_.broker().node()); !d.empty()) { failWith_("CONVERGENCE: " + d); return; }
         // broker side (review I5): every shard-produce frame the worker admitted was answered, and every enforcing session
-        // holds a shipped permission epoch on the worker
+        // holds a shipped permission epoch on the worker.  Limits, on record (issue #190): the in-flight counter also
+        // falls for spec-allowed drops (a closed session, an undecodable frame), so "0 in flight" is "nothing admitted
+        // is left", not "answered == received"; the gateway-routed path has no broker counter at all - it is covered by
+        // the client-side 5 s answer deadline of every probe below.  The epoch check shows the worker HOLDS a slot for
+        // the session (nonzero), not that it is the epoch the gateway last shipped: the gateway keeps no per-session
+        // shipped epoch to compare with.
         {
             const auto until = Clock::now() + 3s;
             std::size_t inFlight = rig_.broker().node().workerDirectAcksInFlightForTest(0);
@@ -746,8 +751,17 @@ private:
                 if (rig_.broker().node().workerPermissionEpochForTest(0, se.sid) == 0) { failWith_("BROKER: the worker holds no permission epoch for a live session"); return; }
                 ++tally_.epochsChecked;
             }
-            if (rig_.broker().node().securityAppliedOffsetOnControlForTest() != rig_.broker().node().securityViewForTest().appliedOffset) {
-                failWith_("BROKER: the control thread's applied offset probe disagrees with the view snapshot"); return;
+            // The control thread's applied offset (read ON the control thread) is the `__security` log end - 1 at
+            // quiescence (every change is answered and digestConvergence above saw the view reach the replay).
+            BrokerNode& node = rig_.broker().node();
+            const int64_t logEnd = node.onAdminThreadForTest([&node]() -> int64_t {
+                return node.securityLogForTest() != nullptr ? node.securityLogForTest()->logEndOffset() : int64_t{-1};
+            });
+            const int64_t applied = node.securityAppliedOffsetOnControlForTest();
+            if (logEnd < 1 || applied != logEnd - 1) {
+                failWith_("BROKER: the control thread's applied offset " + std::to_string(applied) +
+                          " is not the __security log end - 1 (log end " + std::to_string(logEnd) + ")");
+                return;
             }
         }
         // a disabled user cannot log in: a fresh login attempt is definitely refused AuthenticationFailed with no retry hint

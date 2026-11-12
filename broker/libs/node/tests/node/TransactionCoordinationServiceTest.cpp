@@ -1031,6 +1031,39 @@ TEST_F(TransactionCoordinationServiceTest, BoundProducerIdsWaitForTheClusterFeat
     EXPECT_TRUE(rune::protocol::producerIdOwnedBy(rebound.first, 8));
 }
 
+// #425: below the feature level (a coordinator serving before its metadata replay caught up) a bound id of another
+// principal is still never handed to a new holder; the caller gets a fresh raw id, its own bound id is kept.
+TEST_F(TransactionCoordinationServiceTest, ABoundIdIsNeverHandedToAnotherPrincipalBelowTheLevelAdversarialRegression) {
+    namespace rr = rune::replication;
+    svc_->setPrincipalResolverForTest(&txnPrincipalBySession, nullptr);   // session 2 = user 8, others = user 7
+    auto initFull = [&](int64_t sid, std::string_view txnId) {
+        const std::size_t n = svc_->handleInitProducerId(
+            reqBuf_.data(), encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), sid, 1, 30'000, txnId), 0,
+            outBuf_.data(), outBuf_.size());
+        const auto r = pc::InitProducerIdResponse::decode(outBuf_.data(), n);
+        return r && r->errorCode == 0 ? std::pair<int64_t, int16_t>{r->producerId, r->producerEpoch}
+                                      : std::pair<int64_t, int16_t>{-1, -1};
+    };
+    auto init = [&](int64_t sid, std::string_view txnId) { return initFull(sid, txnId).first; };
+    svc_->setMetadataFeatureLevel(rr::MetadataFeature::kBoundProducerIds);
+    const int64_t a = init(1, "tx-low");
+    ASSERT_TRUE(rune::protocol::producerIdOwnedBy(a, 7));
+    const auto own = initFull(1, "tx-own");
+    ASSERT_TRUE(rune::protocol::producerIdOwnedBy(own.first, 7));
+    svc_->setMetadataFeatureLevel(rr::MetadataFeature::kBase);
+    const int64_t b = init(2, "tx-low");
+    ASSERT_GE(b, 0);
+    EXPECT_TRUE(rune::protocol::producerIdUsableBy(b, 8)) << "principal 8 was handed principal 7's bound id " << b;
+    EXPECT_NE(b, a);
+    EXPECT_FALSE(rune::protocol::isBoundProducerId(b)) << "below the level the fresh id is raw";
+    const auto again = initFull(1, "tx-own");
+    EXPECT_EQ(again.first, own.first) << "the principal's own bound id is kept, not re-issued";
+    EXPECT_EQ(again.second, own.second + 1);
+    svc_->setMetadataFeatureLevel(rr::MetadataFeature::kBoundProducerIds);
+    const int64_t c = init(2, "tx-low");
+    EXPECT_TRUE(rune::protocol::producerIdOwnedBy(c, 8)) << "at the level the raw id is rebound to its caller";
+}
+
 // ===========================================================================
 // #358 class: nothing that depends on a __transaction_state record happens before the record is COMMITTED.  The
 // txn-state leader (node 1) has follower 2 in its ISR, so an acks-all append commits only once 2 fetched it.  An

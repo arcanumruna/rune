@@ -305,6 +305,21 @@ TEST(TransientGatewayRegression, GroupSubscriptionOnATransientPartitionIsPushedR
     EXPECT_EQ(r.records[0].baseOffset, 0);
 }
 
+// #215: a control marker for a negative (internal) topic id is refused and counted; nothing reaches the log.
+TEST(TransientGatewayRegression, AppendControlRecordRefusesInternalTopicIdsRegression) {
+    Rig r;
+    const auto marker = rune::transaction::ControlMarker::build(7, 0, rune::transaction::ControlType::Commit, 0);
+    for (const int32_t id : {-7, -1}) {
+        EXPECT_EQ(r.gw.appendControlRecord(id, 0, std::span<const uint8_t>(marker), 7, true, 0), -1) << "id " << id;
+    }
+    EXPECT_EQ(r.gw.controlRecordsRefusedInternalIdForTest(), 2u);
+    for (int i = 0; i < 8; ++i) r.pass();
+    EXPECT_EQ(r.mem.logEndOffset(), 0) << "a refused marker must not reach the log";
+    EXPECT_EQ(r.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 7, true, 0),
+              ClientGateway::kControlRecordAsync) << "a non-negative id behaves as before";
+    EXPECT_EQ(r.gw.controlRecordsRefusedInternalIdForTest(), 2u);
+}
+
 TEST(TransientGatewayRegression, TxnMarkerForATransientPartitionIsRoutedToTheWorkerRegression) {
     Rig r;
     const auto marker = rune::transaction::ControlMarker::build(7, 0, rune::transaction::ControlType::Commit, 0);

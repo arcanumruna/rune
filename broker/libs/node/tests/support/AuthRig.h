@@ -474,9 +474,18 @@ public:
         return r ? ProducerIds{r->errorCode, r->producerId, r->producerEpoch} : ProducerIds{};
     }
     struct ProduceAnswer { int code = kNoAnswer; int64_t baseOffset = -1; };
+    /// True while (topicId, 0) has a replica on this broker that accepts produces (the leader, not lead-pending): the
+    /// replica's own produce gate, read on its owner thread.
+    bool partitionAcceptsProduce(int32_t topicId) {
+        return b_.node().onOwnerThreadForTest(topicId, 0, [](rune::replication::PartitionReplica* r) {
+            return r != nullptr && r->acceptsProduce();
+        });
+    }
     /// An idempotent (or, `transactional`, transactional) produce of one record as (pid, epoch, seq) - the frame and
-    /// the batch header carry the same identity.  Retried while the partition's producer state is being built
-    /// (NotLeader); every other answer is final.  Bounded.
+    /// the batch header carry the same identity.  Waits (bounded, the client's own pump) until the partition accepts
+    /// produces, then produces ONCE.  A NotLeader / UnknownTopic can still follow the replica's readiness: the gateway
+    /// reads its own copy of the committed metadata and its topic registry, which the replica's gate does not cover; so
+    /// at most two more immediate re-sends (no sleep).  Every other answer is final.
     ProduceAnswer produceAs(int64_t sid, int32_t topicId, int64_t pid, int16_t epoch, int32_t seq,
                             bool transactional = false, const std::string& value = "v", const std::string* channel = nullptr) {
         rune::protocol::RecordBatchBuilder b(0, 1000);
@@ -484,7 +493,11 @@ public:
         b.append(charKey(), charValue(value), 1000);   // the rig's topics are typed: a valid record carrying `value` as its tail
         const std::vector<uint8_t> batch = b.build();
         ProduceAnswer out;
-        for (int attempt = 0; attempt < 200; ++attempt) {
+        if (!c().pollFor(std::chrono::seconds(10), [&] { return partitionAcceptsProduce(topicId); })) {
+            ADD_FAILURE() << "produceAs: topic " << topicId << " partition 0 does not accept produces after 10 s";
+            return out;
+        }
+        for (int attempt = 0; attempt < 3; ++attempt) {
             const int64_t corr = c().nextCorrelationId();
             if (!c().produceIdempotent(channel ? *channel : ch(), stream(), sid, corr, topicId, 0, 1, pid, epoch, seq, batch))
                 return out;
@@ -492,7 +505,6 @@ public:
             out = a ? ProduceAnswer{a->errorCode, a->baseOffset} : ProduceAnswer{};
             if (out.code != static_cast<int>(pc::ErrorCode::NotLeader) && out.code != static_cast<int>(pc::ErrorCode::UnknownTopic))
                 break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
         return out;
     }

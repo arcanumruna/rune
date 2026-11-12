@@ -66,6 +66,7 @@
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/replication/PartitionReplica.h>
 #include <flight_recorder/FlightRecorder.h>
+#include <rune/node/GrantHoldMarks.h>
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/detail/RingDoorbell.h>
 #include <rune/node/OwnerThreadTestTask.h>
@@ -923,7 +924,7 @@ public:
     [[nodiscard]] uint64_t intakeKeyHoldsForTest() const noexcept { return intakeKeyHolds_; }
     /// Test-only: per-session crypto entries (encrypted sessions announced here).
     /// Test-only: probe-chain length of the last session-crypto lookup (the slot-indexed regression).
-    [[nodiscard]] std::size_t sessionCryptoLastProbesForTest() const noexcept { return sessionCrypto_.lastProbesForTest(); }
+    [[nodiscard]] std::size_t sessionCryptoProbesForTest(int64_t sid) const noexcept { return sessionCrypto_.probesForTest(sid); }
     /// Test-only: look up one session's crypto entry exactly as the produce path does.
     [[nodiscard]] bool sessionCryptoLookupForTest(int64_t sid) noexcept { return sessionCrypto_.find(sid) != nullptr; }
     [[nodiscard]] std::size_t sessionCryptoCountForTest() const noexcept { return sessionCrypto_.size(); }
@@ -931,7 +932,10 @@ public:
     [[nodiscard]] uint64_t workerSuspendedRefusalsForTest() const noexcept { return workerSuspendedRefusals_; }
     [[nodiscard]] uint64_t sessionPermissionChunksSeenForTest() const noexcept { return sessionPermissionChunksSeen_; }
     /// Issue #603 probes: the worker's copy of the "security view behind" flag, the flag ops seen, the produces refused.
-    [[nodiscard]] bool securityBehindForTest() const noexcept { return securityBehind_; }
+    [[nodiscard]] bool securityBehindForTest() const noexcept { return securityLag_ == SecurityLag::RefuseAll; }
+    [[nodiscard]] uint8_t securityLagForTest() const noexcept { return static_cast<uint8_t>(securityLag_); }
+    [[nodiscard]] uint64_t securityLagUnknownForTest() const noexcept { return securityLagUnknown_; }
+    [[nodiscard]] uint64_t workerDeniesDeferredForTest() const noexcept { return workerDeniesDeferred_; }
     [[nodiscard]] uint64_t securityBehindOpsSeenForTest() const noexcept { return securityBehindOpsSeen_; }
     [[nodiscard]] uint64_t securityBehindRefusalsForTest() const noexcept { return securityBehindRefusals_; }
     /// Test-only (auth Task 18): the shipped permission epoch this worker holds for `sid` (0 = no slot / not enforcing).
@@ -941,6 +945,8 @@ public:
         return 0;
     }
     [[nodiscard]] uint64_t intakeGrantHoldsForTest() const noexcept { return intakeGrantHolds_; }
+    [[nodiscard]] uint64_t permBindsUnknownSessionForTest() const noexcept { return permBindsUnknownSession_; }
+    [[nodiscard]] const GrantHoldMarks& grantHoldMarksForTest() const noexcept { return grantHolds_; }
     [[nodiscard]] const SessionAckSink* ackSinkForTest() const noexcept { return ackSink_.get(); }
     /// NAT-safe egress (Task 6): the session's response publication is Ready (worker thread / quiescent only).
     [[nodiscard]] bool responsePubReadyForTest(int64_t sessionId) const noexcept { return ackSink_ && ackSink_->readyPub(sessionId) != nullptr; }
@@ -3122,7 +3128,13 @@ private:
             return;
         }
         if ((op.isolation() & kPermFlagSecurityBehind) != 0) [[unlikely]] {   // issue #603: in every worker mode
-            securityBehind_ = op.nextOffset() != 0;
+            const auto level = op.nextOffset();
+            if (level > static_cast<int64_t>(kSecurityLagDeferDenials) || level < 0) [[unlikely]] {
+                securityLag_ = SecurityLag::RefuseAll;   // an unknown level fails closed
+                ++securityLagUnknown_;
+            } else {
+                securityLag_ = static_cast<SecurityLag>(level);
+            }
             ++securityBehindOpsSeen_;
             return;
         }
@@ -3132,26 +3144,53 @@ private:
         const uint8_t flags = op.isolation();
         const std::uint32_t tailLen = op.tailLength();   // SBE var data: the length FIRST, then tail() advances past it
         const auto* tail = reinterpret_cast<const uint8_t*>(op.tail());
-        bool ok = true;
-        if ((flags & kPermFlagBind) != 0) {
-            ok = ackSink_->bindWriteGrants(op.sessionId(), op.nextOffset(), static_cast<uint64_t>(op.correlationId()),
-                                           static_cast<uint64_t>(op.producerId()));   // #122: the session's principal
+        // The ring is in-process and FIFO, written only by the PermissionShipper: a malformed op is a broker bug
+        // (Violation: halt), except a Bind for a session that closed while it was queued (UnknownSession: counted).
+        PermApply   r   = PermApply::Applied;
+        const char* why = "";
+        const unsigned variants = ((flags & kPermFlagBind) != 0) + ((flags & kPermFlagDrop) != 0) +
+                                  ((flags & kPermFlagPatch) != 0) + ((flags & kPermFlagTable) != 0);
+        if (variants != 1) [[unlikely]] {
+            r = PermApply::Violation;
+            why = variants == 0 ? "no variant flag" : "more than one variant flag";
+        } else if (tailLen % 8 != 0) [[unlikely]] {
+            r = PermApply::Violation;
+            why = "tail is not whole words";
+        } else if ((flags & kPermFlagBind) != 0) {
+            if (op.nextOffset() >= static_cast<int64_t>(kMaxWritePermTables)) [[unlikely]] {
+                r = PermApply::Violation;
+                why = "bind table id beyond the store";
+            } else if (!ackSink_->bindWriteGrants(op.sessionId(), op.nextOffset(),
+                                                  static_cast<uint64_t>(op.correlationId()),
+                                                  static_cast<uint64_t>(op.producerId()))) {   // #122: the principal
+                r = PermApply::UnknownSession;   // the only other failure of a bind: the session is gone
+            }
         } else if ((flags & kPermFlagDrop) != 0) {
-            ok = ackSink_->dropWriteTable(op.sessionId());
+            if (!ackSink_->dropWriteTable(op.sessionId())) [[unlikely]] {
+                r = PermApply::Violation;
+                why = "drop table id beyond the store";
+            }
         } else if ((flags & kPermFlagPatch) != 0) {
-            ok = tailLen % 8 == 0 && (op.topicId() == kPermBitmapImport
-                     ? ackSink_->patchImportTable(op.sessionId(), first, total, tail, tailLen / 8)
-                     : ackSink_->patchWriteTable(op.sessionId(), first, total, tail, tailLen / 8));
-        } else if ((flags & kPermFlagTable) != 0) {
-            ok = permStager_.apply(*ackSink_, op.sessionId(), first, total, flags,
-                                   static_cast<uint64_t>(op.correlationId()), tail, tailLen,
-                                   static_cast<uint64_t>(op.producerId()), op.topicId()) != PermissionChunkResult::Dropped;
+            const bool ok = op.topicId() == kPermBitmapImport
+                ? ackSink_->patchImportTable(op.sessionId(), first, total, tail, tailLen / 8)
+                : ackSink_->patchWriteTable(op.sessionId(), first, total, tail, tailLen / 8);
+            if (!ok) [[unlikely]] {
+                r = PermApply::Violation;
+                why = "patch table id beyond the store or words outside the table";
+            }
         } else {
-            ok = false;   // no variant flag: not sent by this runtime
+            r = permStager_.apply(*ackSink_, op.sessionId(), first, total, flags,
+                                  static_cast<uint64_t>(op.correlationId()), tail, tailLen,
+                                  static_cast<uint64_t>(op.producerId()), op.topicId());
+            if (r == PermApply::Violation) why = permStager_.violationReason();
         }
-        if (!ok) [[unlikely]]
-            spdlog::debug("Worker {}: permission op (flags {:#x}) for {} dropped (closed session, bad id or out-of-order "
-                          "chunk)", workerId_, flags, op.sessionId());
+        if (r == PermApply::Violation) [[unlikely]]
+            haltInvariant_("session-permissions", why, tailLen);   // a broker bug: never sent by the runtime
+        else if (r == PermApply::UnknownSession) [[unlikely]] {
+            ++permBindsUnknownSession_;
+            spdlog::debug("Worker {}: bind for closed session {} ignored (it closed while the bind was queued)",
+                          workerId_, op.sessionId());
+        }
     }
 
     [[gnu::cold]] void executeSessionAnnounceWire_(sbe::WorkerOp& op) {
@@ -4095,7 +4134,7 @@ private:
     int pushSubscriptions_(int64_t nowNs) {
         // Issue #603: nothing is pushed while this broker's `__security` view is behind committed events it holds (they
         // may revoke the READ a subscription was admitted with).  One predictable branch on a worker-owned bool.
-        if (securityBehind_) [[unlikely]] return 0;
+        if (securityLag_ == SecurityLag::RefuseAll) [[unlikely]] return 0;
         if (filterGroupByKey_.empty()) [[likely]] return pushOwnedSubscriptions_(nowNs);
         return pushSubscriptionsMixed_(nowNs);
     }
@@ -6691,9 +6730,11 @@ private:
     // Authentication Task 13: this worker's one chunked-permission assembler (shared-nothing; worker thread only).
     PermissionStager permStager_;
     uint64_t         sessionPermissionChunksSeen_ = 0;
+    uint64_t         permBindsUnknownSession_ = 0;   ///< binds for a session that closed while queued (benign)
     uint64_t         workerNotAuthorized_ = 0;   ///< shard produces refused NotAuthorized (counted)
     uint64_t         workerSuspendedRefusals_ = 0;   ///< shard produces refused NamespaceSuspended (ReadOnly; counted)
-    uint64_t         intakeGrantHolds_    = 0;   ///< denied frames held one pass for a lifecycle op in flight
+    uint64_t         intakeGrantHolds_    = 0;   ///< denied frames held until the lifecycle ops that preceded them apply
+    GrantHoldMarks   grantHolds_;                ///< first-sight lifecycle-ring position of each held denied frame
 
     // Task 19: this worker's per-session Records-egress crypto state — see
     // WorkerSessionCrypto's doc comment. Entries exist ONLY for encrypted
@@ -10675,11 +10716,23 @@ private:
                data[3] == static_cast<uint8_t>(rune::protocol::client::WorkerBind::TEMPLATE_ID >> 8);
     }
 
+    /// #145: true = log this occurrence.  When a line is due, the cumulative suppressed count is reported to the
+    /// gateway (SessionSignal UnauthLogSuppressed) if it changed: at most one signal per logged line, so a flood of
+    /// refused frames costs one return-ring slot per 1024 frames.  A full ring: retried at the next due line.
+    [[gnu::cold]] [[gnu::noinline]] bool unauthDue_(std::size_t kind) {
+        if (!unauthLog_.due(kind)) return false;
+        const uint64_t n = unauthLog_.suppressed();
+        if (n != unauthSuppressedReported_ &&
+            trySessionSignal_(0, SessionSignalKind::UnauthLogSuppressed, static_cast<int64_t>(n)))
+            unauthSuppressedReported_ = n;
+        return true;
+    }
+
     /// Cold: a frame of a response-mode session arrived on the wrong image (an attacker naming a sequential session
     /// id) or before the bind.  Consumed without append or reply; counted; logged first + every 1024th.
     [[gnu::cold]] [[gnu::noinline]] void noteSpoofedIngress_(int64_t sessionId, int32_t image) {
         ++spoofedIngressDropped_;
-        if (unauthLog_.due(18)) [[unlikely]]
+        if (unauthDue_(18)) [[unlikely]]
             spdlog::warn("Worker {}: produce for response-mode session {} from image {} dropped (not its bound image, or "
                          "not bound yet; total {})", workerId_, sessionId, image, spoofedIngressDropped_);
     }
@@ -10701,7 +10754,7 @@ private:
         const auto msg = pc::WorkerBind::decode(data, len);
         if (!msg || !ackSink_ || responseControlEndpoint_.empty()) {
             ++workerBindsRefused_;
-            if (unauthLog_.due(19)) spdlog::warn("Worker {}: WorkerBind refused ({}) from image {}", workerId_,
+            if (unauthDue_(19)) spdlog::warn("Worker {}: WorkerBind refused ({}) from image {}", workerId_,
                                                   !msg ? "undecodable" : "response mode off", image);
             return;
         }
@@ -10719,7 +10772,7 @@ private:
         }
         if (chk != SessionAckSink::BindResult::Bound) {
             ++workerBindsRefused_;
-            if (unauthLog_.due(19))
+            if (unauthDue_(19))
                 spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused (result {}; refused so far {})",
                              workerId_, msg->sessionId, image, static_cast<int>(chk), workerBindsRefused_);
             return;
@@ -10728,7 +10781,7 @@ private:
         const int64_t corr = workerIngress_ ? workerIngress_->imageCorrelationIdOf(image) : -1;
         if (corr < 0) {
             ++workerBindsRefused_;
-            if (unauthLog_.due(20)) spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused: no such image",
+            if (unauthDue_(20)) spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused: no such image",
                                                   workerId_, msg->sessionId, image);
             return;
         }
@@ -10742,7 +10795,7 @@ private:
             return;
         }
         ++workerBindsRefused_;
-        if (unauthLog_.due(19))
+        if (unauthDue_(19))
             spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused (result {}; refused so far {})",
                          workerId_, msg->sessionId, image, static_cast<int>(r), workerBindsRefused_);
     }
@@ -10818,7 +10871,11 @@ private:
         enqueueReturn_(ret);
         return 1;
     }
-    bool     securityBehind_         = false;   ///< #603: worker-owned copy of the control thread's flag
+    /// #603 / #506: worker-owned copy of the control thread's lag level (kSecurityLag*).
+    enum class SecurityLag : uint8_t { Current = 0, RefuseAll = 1, DeferDenials = 2 };
+    SecurityLag securityLag_             = SecurityLag::Current;
+    uint64_t securityLagUnknown_         = 0;   ///< lag levels above DeferDenials received (treated as RefuseAll)
+    uint64_t workerDeniesDeferred_       = 0;   ///< #506: denials answered AuthUnavailable (view behind)
     uint64_t securityBehindOpsSeen_  = 0;
     uint64_t securityBehindRefusals_ = 0;
 
@@ -10839,6 +10896,7 @@ private:
     uint64_t decryptFailures_ = 0;          ///< X103: produce frames dropped for failing to open (worker thread)
     uint64_t c2bWrongReceiverDrops_ = 0;    ///< issue #116: produce frames naming another receiver (worker thread)
     UnauthLogLimiter unauthLog_;            ///< X103: rate limit of the log lines an unauthenticated sender can drive
+    uint64_t         unauthSuppressedReported_ = 0;   ///< #145: the suppressed count last posted to the gateway
 
     /// Issue #116: does this encrypted c2b frame name THIS worker as its receiver (CryptoSubHeader.senderId ==
     /// workerId_ + 1)?  A frame too short for a subheader answers true: the open below rejects it as before.
@@ -10883,7 +10941,7 @@ private:
                 if (cr->receiverKeys && !c2bForThisWorker_(data, len)) [[unlikely]] {
                     if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
                     ++c2bWrongReceiverDrops_;
-                    if (unauthLog_.due(0)) [[unlikely]]
+                    if (unauthDue_(0)) [[unlikely]]
                         spdlog::warn("Worker {}: WorkerIngress: encrypted produce for another receiver (session={}, "
                                      "len={}); dropping (wrong-receiver drops so far {})",
                                      workerId_, produceSessionIdOf_(data), len, c2bWrongReceiverDrops_);
@@ -10916,7 +10974,7 @@ private:
                     if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
                     // X103: any UDP sender drives this on the produce thread - counted, logged first + every 1024th.
                     ++decryptFailures_;
-                    if (unauthLog_.due(0)) [[unlikely]]
+                    if (unauthDue_(0)) [[unlikely]]
                         spdlog::warn("Worker {}: WorkerIngress: produce decrypt failed (session={}, "
                                      "len={}); dropping (fail-closed; failures so far {})",
                                      workerId_, produceSessionIdOf_(data), len, decryptFailures_);
@@ -10971,22 +11029,30 @@ private:
             }
             // Issue #603: the grants below may already be revoked by committed events this broker holds but has not
             // applied - answered AuthUnavailable (retriable), nothing appended.  One predictable branch.
-            if (securityBehind_) [[unlikely]] {
+            if (securityLag_ == SecurityLag::RefuseAll) [[unlikely]] {
                 if (openSeq != 0) commitProduceSeq(openCtx, openSeq);   // consumed (answered)
                 return refuseSecurityBehind_(msg, directAck);
             }
             const WriteGrantSlot* grants = enf->sink->writeGrants(msg.sessionId);
             if (grants == nullptr || !allowsWrite(*grants, msg.topicId)) [[unlikely]] {
                 // The login's grants are enqueued on the lifecycle ring BEFORE the client learns it may produce, but
-                // this pass may have drained that ring before the enqueue: hold the frame one pass (the controlled
-                // poll re-delivers it after the next drain) rather than answer a stale NotAuthorized.
-                if (sessionRing_.producerPosition() > sessionRing_.consumerPosition()) [[unlikely]] {
+                // this worker may not have drained that ring yet: hold the frame (the controlled poll re-delivers it
+                // after the next drain) rather than answer a stale NotAuthorized.  The frame waits only for what was
+                // on the ring when it was first seen (GrantHoldMarks); ops that arrive later cannot be its grant.
+                if (grantHolds_.onDenied(msg.sessionId, msg.correlationId, sessionRing_.producerPosition(),
+                                         sessionRing_.consumerPosition()) == GrantHoldMarks::Verdict::Hold) [[unlikely]] {
                     if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
                     ++intakeGrantHolds_;
                     return kIngressHeld;                             // seq NOT committed: it re-opens
                 }
                 if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
                 if (grants != nullptr && grants->table == suspendedWriteTable()) return refuseSuspended_(msg, directAck);
+                // Issue #506: the view holds events it has not applied - one may be the grant this frame relies on, so
+                // the denial is not a verdict: retriable AuthUnavailable.  Allowed frames were served above.
+                if (securityLag_ == SecurityLag::DeferDenials) [[unlikely]] {
+                    ++workerDeniesDeferred_;
+                    return refuseSecurityBehind_(msg, directAck);
+                }
                 return refuseNotAuthorized_(msg, directAck);
             }
             // Issue #122: a producer id is honoured only for the principal it was issued to (its owner tag; the

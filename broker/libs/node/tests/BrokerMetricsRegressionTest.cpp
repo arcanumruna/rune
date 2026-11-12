@@ -328,7 +328,7 @@ TEST(BrokerMetricsRegression, EveryMetricMovedRegression) {
     }
 
     // The control thread's writers (values after start, then one deterministic action).
-    EXPECT_TRUE(awaitMetric(node, RuneMetric::AuthMode, 0)) << "auth enabled-or-in-process -> 0";
+    EXPECT_TRUE(awaitMetric(node, RuneMetric::AuthMode, 2)) << "a default NodeConfig is in-process unauthenticated -> 2";
     EXPECT_TRUE(awaitMetric(node, RuneMetric::StorageGateState, 0)) << "a single node is CONFIRMED";
     EXPECT_TRUE(awaitMetric(node, RuneMetric::CatalogApplyHalted, 0));
     EXPECT_TRUE(awaitMetric(node, RuneMetric::SecurityApplyHalted, 0));
@@ -592,7 +592,7 @@ TEST(BrokerMetricsRegression, RestartRecreatesFileRegression) {
     EXPECT_GT(headerStartEpochNs(fresh), oldEpoch);
     EXPECT_TRUE(awaitMetric(node, RuneMetric::StorageGateState, 0)) << "recovered: CONFIRMED again";
     EXPECT_TRUE(awaitMetric(node, RuneMetric::CatalogApplyHalted, 0));
-    EXPECT_TRUE(awaitMetric(node, RuneMetric::AuthMode, 0));
+    EXPECT_TRUE(awaitMetric(node, RuneMetric::AuthMode, 2));
     node.stop();
 }
 

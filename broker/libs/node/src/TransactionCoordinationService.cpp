@@ -1230,10 +1230,12 @@ size_t TransactionCoordinationService::handleInitProducerId_(
     }
 
     // Call coordinator.  Issue #122: the id is issued to (bound to) the session's principal - once every member
-    // supports bound ids (below the feature level: a raw id, nothing rebound).
+    // supports bound ids (below the feature level: a raw id, nothing rebound).  #425: the caller is passed either way,
+    // so a transactional id holding another principal's bound id never hands it over below the level either.
+    const uint64_t who = principalOf_(msg.sessionId);
     const auto result = coordinator_.initProducerId(
         txnIdOpt, msg.transactionTimeoutMs, nowNs,
-        bindsProducerIds() ? std::optional<uint64_t>(principalOf_(msg.sessionId)) : std::nullopt);
+        bindsProducerIds() ? std::optional<uint64_t>(who) : std::nullopt, who);
 
     // F15 I7: the allocation may have crossed half a block — prefetch the next.
     advancePidBlock_();

@@ -28,6 +28,7 @@
 // std::variant<AwaitingBoot, Booted, Live> — boot vs live selected by the PHASE, never a flag; an idle
 // applyCommitted allocates nothing.
 
+#include <rune/node/SecurityAuthzChangeIndex.h>
 #include <rune/storage/ZeroedBytes.h>
 #include <rune/security/SecurityState.h>
 
@@ -99,6 +100,8 @@ public:
     int applyCommitted(rune::replication::PartitionReplica& r);
 
     [[nodiscard]] const rune::security::SecurityState& state() const noexcept { return state_; }
+    /// Issues #218 / #67: which applied events could have changed what one user may do (every phase feeds it).
+    [[nodiscard]] const SecurityAuthzChangeIndex& authzChanges() const noexcept { return authzChanges_; }
     [[nodiscard]] bool halted() const noexcept { return std::holds_alternative<Halted>(st_); }
     [[nodiscard]] const rune::security::ApplyError* haltError() const noexcept;
     [[nodiscard]] int64_t stagedOffset() const noexcept;
@@ -121,6 +124,7 @@ private:
 
     std::string                                  dir_;
     rune::security::SecurityState                state_;
+    SecurityAuthzChangeIndex                     authzChanges_;
     std::variant<Applying, Halted>               st_;
     std::variant<AwaitingBoot, Booted, Live>     phase_;
     int64_t                                      lastAppliedOffset_ = -1;

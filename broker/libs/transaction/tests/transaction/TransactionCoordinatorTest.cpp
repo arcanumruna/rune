@@ -3329,3 +3329,56 @@ TEST(ProducerIdBindingRegression, ALegacyIdOfATransactionalIdIsReboundAtItsNextI
     EXPECT_EQ(own.producerId, bound.producerId) << "the owner of a recovered bound id keeps it";
     EXPECT_EQ(own.producerEpoch, 1);
 }
+
+// #425: below the feature level the coordinator is called with no owner but with the caller; a BOUND id of another
+// principal is still never handed over, a raw id and the caller's own bound id are kept.
+TEST(TransactionCoordinatorRegression, CallerWithoutOwnerNeverReceivesAnotherPrincipalsBoundIdRegression)
+{
+    using Who = std::optional<uint64_t>;
+    struct Held { const char* name; ProducerId pid; };
+    const Held helds[] = {{"raw", 42}, {"bound7", rp::bindProducerId(500, 7)}, {"bound8", rp::bindProducerId(500, 8)}};
+    struct Call { Who owner; Who caller; };
+    const Call calls[] = {{std::nullopt, std::nullopt}, {std::nullopt, 7}, {7, 7}};
+    for (const Held& h : helds) {
+        for (const Call& c : calls) {
+            SCOPED_TRACE(std::string(h.name) + " owner=" + (c.owner ? "7" : "-") + " caller=" + (c.caller ? "7" : "-"));
+            TransactionCoordinator coord;
+            coord.setBoundProducerIds(true);
+            std::map<std::string, TransactionMetadata> snapshot;
+            TransactionMetadata m;
+            m.txnId = "tx"; m.producerId = h.pid; m.producerEpoch = 3; m.state = TxnState::Empty;
+            snapshot.emplace("tx", m);
+            (void)coord.reload(snapshot, 1, 0);
+            const auto r = coord.initProducerId("tx", 60'000, 0, c.owner, c.caller);
+            ASSERT_TRUE(r.ok());
+            bool keep;
+            if (c.owner)       keep = rp::producerIdOwnedBy(h.pid, 7);
+            else if (c.caller) keep = rp::producerIdUsableBy(h.pid, 7);
+            else               keep = true;
+            if (keep) {
+                EXPECT_EQ(r.producerId, h.pid);
+                EXPECT_EQ(r.producerEpoch, 4);
+            } else {
+                EXPECT_NE(r.producerId, h.pid);
+                EXPECT_EQ(r.producerEpoch, 0);
+                if (c.owner) EXPECT_TRUE(rp::producerIdOwnedBy(r.producerId, 7));
+                else         EXPECT_FALSE(rp::isBoundProducerId(r.producerId)) << "no owner: a raw id";
+            }
+        }
+    }
+    // The held bound id of 8 with an Ongoing transaction: same outcome as an owner-bound takeover.
+    TransactionCoordinator coord;
+    const auto a = coord.initProducerId("tx", 60'000, 0, 8);
+    ASSERT_TRUE(a.ok());
+    ASSERT_TRUE(coord.addPartitions("tx", a.producerId, a.producerEpoch, {{"t", 0}}, 1).ok());
+    const auto b = coord.initProducerId("tx", 60'000, 2, std::nullopt, 7);
+    ASSERT_TRUE(b.ok());
+    EXPECT_NE(b.producerId, a.producerId);
+    EXPECT_FALSE(rp::isBoundProducerId(b.producerId));
+    EXPECT_EQ(b.producerEpoch, 0);
+    const TransactionMetadata* mm = coord.metadata("tx");
+    ASSERT_NE(mm, nullptr);
+    EXPECT_EQ(mm->state, TxnState::PrepareAbort);
+    EXPECT_EQ(mm->producerId, a.producerId);
+    EXPECT_EQ(mm->pendingNewProducerId, b.producerId);
+}

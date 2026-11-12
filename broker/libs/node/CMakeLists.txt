@@ -183,6 +183,8 @@ if(BUILD_TESTING)
     # Unit tests (NodeConfig + PortableFlushBackend + OneToOneByteRing + SchemaCodecSmoke + SchemaRegistry + AdminWorker)
     add_executable(rune_node_tests
         tests/node/NodeConfigTest.cpp
+        tests/node/NodeConfigAuthTopologyParseTest.cpp
+        tests/node/GrantHoldMarksTest.cpp
         tests/node/StorageIdentityTest.cpp
         tests/node/StorageGateTest.cpp
         tests/node/HostDefaultsTest.cpp
@@ -212,6 +214,7 @@ if(BUILD_TESTING)
         tests/node/SecurityApplierTest.cpp
         tests/node/SecurityReadServerTest.cpp
         tests/node/SecurityWritePathTest.cpp
+        tests/node/SecurityAuthzChangeIndexTest.cpp
         tests/node/SecurityAnswerGateTest.cpp
         tests/node/AdminEgressDrainTest.cpp
         tests/node/SecurityServingTest.cpp
@@ -2193,7 +2196,9 @@ if(BUILD_TESTING)
 
         # Authentication Task 11: the SCRAM login in the session handshake against ONE real authenticating broker
         # (raw frames: AuthWireClient + the rune-crypto SCRAM client).
-        add_executable(rune_auth_login_tests tests/node/AuthLoginTest.cpp)
+        add_executable(rune_auth_login_tests tests/node/AuthLoginTest.cpp
+                       tests/node/SecretsNeverReachTheLogsRegressionTest.cpp
+                       tests/node/NamesWithControlBytesNeverReachTheLogsRegressionTest.cpp)
         target_include_directories(rune_auth_login_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_auth_login_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
                               GTest::gtest_main)

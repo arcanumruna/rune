@@ -437,6 +437,13 @@ public:
     [[nodiscard]] uint64_t bootstrapsRefused() const noexcept { return bootstrapsRefused_; }
     /// X103: log lines the 1/1024 limiter swallowed (require-TLS refusals, bad bootstrap proofs, login failures).
     [[nodiscard]] uint64_t unauthLogSuppressed() const noexcept { return unauthLog_.suppressed(); }
+    /// #145: unauthenticated-sender log lines suppressed node-wide: this gateway's own plus the cumulative counts the
+    /// workers reported (SessionSignal UnauthLogSuppressed).  Published as `rune-unauth-log-suppressed`.
+    [[nodiscard]] uint64_t unauthLogSuppressedTotal() const noexcept {
+        uint64_t n = unauthLog_.suppressed();
+        for (const uint64_t w : workerUnauthSuppressed_) n += w;
+        return n;
+    }
     /// How this broker authenticates sessions (ConnectResponse.authMode) and the control thread's SecurityView the
     /// bootstrap window is read from (open while no ENABLED security admin exists - a fresh cluster or a locked-out one, D3).  Required: a session that has not
     /// authenticated is limited by its SessionAuth state (gateFor); default InProcess = no gating, byte-identical to before.
@@ -480,7 +487,7 @@ public:
     /// the leader's HW).  While the view has applied less, a failed login proof is not a verdict - the user may have
     /// been created or re-keyed by an event this broker holds but has not applied yet - so it answers the retriable
     /// AuthUnavailable (48) instead of the terminal AuthenticationFailed (44).
-    void setSecurityKnownEnd(int64_t knownEnd) noexcept { securityKnownEnd_ = knownEnd; }
+    void setSecurityKnownEnd(int64_t knownEnd);
     /// Issue #603, control thread (kA2cSecurityServing, behind every applied event it vouches for): the admin applier is
     /// below the committed `__security` HW this broker knows.  While set (Required mode only), every grant-checked
     /// request - routed Produce, Subscribe, view reads, group / txn / DDL requests, logins, `__security` reads - answers
@@ -491,9 +498,13 @@ public:
     void setSecurityBehind(bool behind);
     [[nodiscard]] bool securityBehind() const noexcept { return securityBehind_; }
     /// Test probe (#603): the value last shipped to the workers.
-    [[nodiscard]] bool workersSecurityBehindForTest() const noexcept { return workersBehind_; }
+    [[nodiscard]] bool workersSecurityBehindForTest() const noexcept { return workersLag_ == kLagRefuseAll; }
+    /// #506: the lag level last shipped to the workers (0 current, 1 refuse all, 2 defer denials).
+    [[nodiscard]] uint8_t workersSecurityLagForTest() const noexcept { return workersLag_; }
     [[nodiscard]] int64_t sessionTimeoutNsForTest() const noexcept { return sessionTimeoutNs_; }
     [[nodiscard]] uint64_t securityBehindRefusals() const noexcept { return securityBehindRefusals_; }
+    /// #506: denials answered AuthUnavailable (not NotAuthorized) because the view had not applied every held event.
+    [[nodiscard]] uint64_t deniesDeferredViewBehind() const noexcept { return deniesDeferredViewBehind_; }
     /// Issues #15 / #111: this broker stayed stale longer than R - every authenticated / must-change-password session
     /// is told AuthUnavailable at session level (corr 0) and closed; its client reconnects to a current broker.
     void endSessionsSecurityUnavailable();
@@ -531,8 +542,21 @@ public:
         permissionShipper_.setHoldForTest(on);
         if (!on) (void)servicePermissionShippingWork_();
     }
+    /// Issue #506 test seam: the lag levels queued in the (held) permission shipper, each with how many permission items
+    /// precede it in queue order.
+    [[nodiscard]] std::vector<std::pair<uint8_t, std::size_t>> permissionQueuedLagsForTest() const {
+        return permissionShipper_.queuedLagsForTest();
+    }
+    /// Issue #202 test seam: logins whose OK is held until every worker accepted the session's grants.
+    [[nodiscard]] std::size_t heldLoginOksForTest() const noexcept { return heldLoginCount_; }
     /// Issue #189 test seam (control thread): forget every login-throttle entry (no allocation).
     void resetLoginThrottleForTest() noexcept { loginThrottle_.clear(); }
+    /// Issue #594 test seam (control thread): the login throttle's base delay in ms (<= 0 keeps the default 250 ms).
+    void setLoginThrottleBaseDelayMsForTest(int64_t ms) noexcept {
+        if (ms > 0) loginThrottle_.setBaseDelayNsForTest(std::min<int64_t>(ms, 30'000) * 1'000'000LL);   // 30 s = the cap
+    }
+    /// Issue #266 test seam (control thread): how many times a reap pass walked the whole session table.
+    [[nodiscard]] uint64_t sessionScansForTest() const noexcept { return sessionScansForTest_; }
     void setAdvertisedBrokerVersionForTest(int32_t v) noexcept { advertisedBrokerVersion_ = v; }   ///< 0 = kBrokerVersion
     /// Issues #188 / #5 test seam (control thread): while held, pending record-egress resolves are not polled (a
     /// Subscribe stays AwaitingEgress).  Releasing restarts every pending resolve's timeout clock at now, so a held
@@ -644,7 +668,7 @@ public:
     /// Issue #197 (control thread): true once every shipper item queued when object `id` was applied (new permission
     /// tables, WRITE-bit patches) was accepted by EVERY worker's lifecycle ring - or when nothing was owed.  The DDL
     /// answer gate holds a DefineTopic / CreateView / AlterView OK on it, exactly as a login's final waits on its
-    /// epoch (`heldLoginFinals_`): the worker's grace hold covers an item on its ring, not one still queued here.
+    /// epoch (`holdLoginOk_`): the worker's grace hold covers an item on its ring, not one still queued here.
     [[nodiscard]] bool objectPermissionsShipped(int32_t id) const noexcept {
         for (const auto& e : objectShipSeqs_)
             if (e.first == id) return e.second <= permissionShipper_.shippedSeq();
@@ -1502,6 +1526,18 @@ public:
     /// Catalog history Task 12: catalog Subscribes forwarded to the admin thread /
     /// catalog Unsubscribes waiting for room on its request ring.
     [[nodiscard]] uint64_t catalogSubscribesForwarded() const noexcept { return catalogSubscribesForwarded_; }
+    /// Issue #200: Subscribes refused because the session's list of admin-log reads was full / because the correlation
+    /// id is live on the other log.
+    [[nodiscard]] uint64_t adminReadsRefusedAtCap() const noexcept { return adminReadsRefusedAtCap_; }
+    [[nodiscard]] uint64_t adminReadsRefusedDuplicateCorr() const noexcept { return adminReadsRefusedDuplicateCorr_; }
+    /// Issue #200 (control thread, cold): a reliable answer of a `__catalog` / `__security` read server on its way to
+    /// `sessionId`.  A refused or ended read is dropped from the session's list; an accepted one learns its
+    /// subscription id.  Only the header's type and correlation id are decoded; anything else is ignored.
+    void noteAdminLogAnswer(int64_t sessionId, const uint8_t* frame, std::size_t len);
+    /// Issue #200 test seam: run the live actions of a permission refresh on `sid`.
+    void executeLiveActionsForTest(int64_t sid, const rune::gateway::LiveActions& a) {
+        if (Session* s = sessions_.find(sid)) executeLiveActions_(*s, a);
+    }
     [[nodiscard]] std::size_t pendingCatalogUnsubscribes() const noexcept { return pendingCatalogUnsubs_.size(); }
     [[nodiscard]] uint64_t catalogUnsubscribesDropped() const noexcept { return catalogUnsubsDropped_; }
     [[nodiscard]] uint64_t catalogClosesLeftToTheSweep() const noexcept { return catalogClosesToSweep_; }
@@ -2176,7 +2212,9 @@ private:
     /// `ddlPrincipalScratch_` (control thread, cold DDL path), so a tenant's audit principal never equals a default user's.
     [[nodiscard]] rune::gateway::DdlMetaView
         ddlMetaOf_(const rune::protocol::client::DdlExtension* ext, int64_t sessionId, const Session& session,
-                   uint32_t targetNsId);
+                   uint32_t targetNsId, std::optional<std::string_view> describeLocalName = std::nullopt);
+    /// Issue #217: what `session` may DESCRIBE under `localName` (kKind* bits) and on the cluster (kDescribeCatalog).
+    [[nodiscard]] uint8_t describeMaskFor_(const Session& session, std::string_view localName, uint32_t nsId) const;
     std::string ddlPrincipalScratch_;
     void answerAdminSubmit_(const uint8_t* buf, std::size_t len, rune::gateway::AdminSubmit r,
                             const char* ringFull, const char* tooLarge);
@@ -2721,6 +2759,7 @@ private:
     uint64_t catalogUnsubsDropped_ = 0;
     uint64_t catalogClosesToSweep_ = 0;   // fix round 3: closes left to the admin's liveness sweep
     uint64_t catalogSubscribesForwarded_ = 0;
+    uint64_t adminReadsRefusedAtCap_ = 0, adminReadsRefusedDuplicateCorr_ = 0;
     void forwardCatalogUnsubscribe_(int64_t sid, int64_t subscriptionId);
     int  flushPendingCatalogUnsubs_();
     // Issue #117: an admin-log read end (-2 / -3) of a live session is the Session's own pending state (never the
@@ -2737,7 +2776,16 @@ public:
     /// whose events this broker's SecurityView has not applied yet waits (a revoke the admin applied first must not
     /// let its successors through).  Deliver / Withhold (dropped: the reader lost the grant) / Hold (offered later).
     enum class AdminLogAdmit : uint8_t { Deliver, Withhold, Hold };
-    [[nodiscard]] AdminLogAdmit admitAdminLogFrame(int64_t sessionId, int64_t subId, const uint8_t* frame, std::size_t len);
+    /// On Hold, `holdUntilEvent` is the `__security` event offset the held frame waits for (-1: the view is behind
+    /// committed events - released by adminLogHoldReleased once it is not).
+    [[nodiscard]] AdminLogAdmit admitAdminLogFrame(int64_t sessionId, int64_t subId, const uint8_t* frame,
+                                                   std::size_t len, int64_t& holdUntilEvent);
+    /// #444: would the gate no longer hold a frame that was held until `holdUntilEvent`?  A halted or absent view
+    /// releases too: the re-read frame is then Withheld by the gate, never delivered.
+    [[nodiscard]] bool adminLogHoldReleased(int64_t holdUntilEvent) const noexcept {
+        return !securityBehind_ && (securityView_ == nullptr || securityView_->halted() ||
+                                    securityView_->appliedOffset() >= holdUntilEvent);
+    }
     [[nodiscard]] uint64_t adminLogFramesWithheld() const noexcept { return adminLogFramesWithheld_; }
     [[nodiscard]] std::size_t sessionsWithPendingReadEndsForTest() const noexcept { return sessionsWithReadEnds_.size(); }
     int pumpReadEndsForTest() { return flushPendingReadEnds_(); }
@@ -2759,7 +2807,9 @@ private:
     [[nodiscard]] std::size_t unauthSessionsOf_(std::string_view host);   ///< issue #236 (cold: one Connect)
     uint64_t viewAcksRefusedLegacy_ = 0;   ///< Produce frames with the View bit refused by a gateway without shard mode
     uint64_t controlBatchRefusals_ = 0;   ///< X036: Produce frames refused for carrying a client control batch (rate-limited log)
-    static void noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr);
+    [[nodiscard]] bool admitAdminRead_(Session& s, const rune::protocol::client::Subscribe& msg, bool security,
+                                       bool& isNew);
+    void dropAdminRead_(int64_t sessionId, int64_t subscriptionId);
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
     rune::catalog::NamespaceMirror namespaces_;   ///< namespaces Task 9: control thread's copy (login lookup)
     rune::node::NsSlotTable nsSlots_;             ///< namespaces Phase 2 Task 8: this gateway's own slot table
@@ -2778,6 +2828,7 @@ private:
     std::vector<uint64_t>   workerNsSlotMismatches_;   ///< cumulative, per worker (SessionSignal NsSlotMismatch)
     uint64_t                inlineDamagedReads_ = 0;   ///< #882: inline-path subscriptions failed at damaged data
     std::vector<uint64_t>   workerDamagedReads_;       ///< #882: cumulative, per worker (SessionSignal DamagedRead)
+    std::vector<uint64_t>   workerUnauthSuppressed_;   ///< #145: cumulative, per worker (UnauthLogSuppressed)
     /// One array index and a compare; counts a mismatch.
     [[nodiscard]] bool nsTagMatches_(const Session& s) noexcept {
         if (nsSlots_.matches(s.nsSlot, s.nsId)) [[likely]] return true;
@@ -2823,10 +2874,15 @@ private:
     bool     securityServing_ = true;           ///< issues #15 / #111: see setSecurityServing
     int64_t  securityKnownEnd_ = -1;            ///< #205: see setSecurityKnownEnd
     bool     securityBehind_ = false;           ///< #603: see setSecurityBehind (Required mode only)
-    bool     workersBehind_  = false;           ///< #603: the value last shipped to the workers
+    int64_t  behindClearNeedsOffset_ = -1;   ///< #608: the newest event pending enforcement when the flag cleared
+    static constexpr uint8_t kLagRefuseAll = 1, kLagDeferDenials = 2;   ///< = rune::node::kSecurityLag*
+    uint8_t  workersLag_     = 0;               ///< #603 / #506: the lag level last shipped to the workers
     uint64_t securityBehindRefusals_ = 0;       ///< #603: requests answered 48 for it
-    /// #603: ship the behind flag to the workers when it changed - a clear only once pendingEnforce_ is empty.
-    int syncWorkersBehind_();
+    uint64_t deniesDeferredViewBehind_ = 0;     ///< #506: denials answered 48 while the view held unapplied events
+    /// #603 / #506: ship the lag level to the workers when it changed (1 = behind and refusing everything, 2 = the view
+    /// holds unapplied events: denials deferred, 0 = current) - leaving level 1 once every event pending at the clear
+    /// is enforced (#608).  Every other transition ships at once, FIFO behind every queued permission item.
+    int syncWorkersLag_();
     /// #603: answer one grant-checked request AuthUnavailable (its own response type, else an ErrorResponse on its
     /// correlation id).  Cold.
     void answerSecurityBehind_(Session& session, const rune::protocol::client::MessageHeader& hdr, const uint8_t* buf,
@@ -2889,8 +2945,10 @@ private:
     /// The ONE failure answer of a login (44, no retry-after unless rate-limited, the one detail text) then the end of
     /// the session.  Review Focus 1: nothing on the wire says why.
     void failLogin_(Session& session, int64_t correlationId, uint32_t retryAfterMs);
-    /// Sessions still awaiting their login past the deadline: AuthServerFinal{44} + end (D13).
-    void reapAuthDeadlines_(int64_t nowNs);
+    /// Issue #266: true when `s` still awaits its login past its deadline (D13); a Closing session never does.
+    [[nodiscard]] static bool authDeadlinePassed_(const Session& s, int64_t nowNs);
+    /// Sessions collected in authReapScratch_ (awaiting their login past the deadline): AuthServerFinal{44} + end (D13).
+    void failAuthDeadlines_();
     /// The throttle key host of a Connect: the Aeron image's source host, else the reply endpoint's host.
     [[nodiscard]] std::string sourceHostOf_(std::string_view egressChannel) const;
     // ── authentication Task 12 ──
@@ -2991,7 +3049,8 @@ private:
     /// after it. Never imageBySessionId mid-poll: it proposes the newest image list, which lets a threaded conductor
     /// free the list and images the poll is still iterating.
     aeron_image_t* currentImage_ = nullptr;
-    std::vector<int64_t> authReapScratch_; ///< reused by reapAuthDeadlines_ (capacity persists)
+    std::vector<int64_t> authReapScratch_; ///< reused by reapExpired / failAuthDeadlines_ (capacity persists)
+    uint64_t sessionScansForTest_ = 0;     ///< #266: whole-table walks made by reapExpired
     uint64_t authGateRefusals_ = 0;
     uint64_t bootstrapsRefused_ = 0;
     std::optional<rune::peerlink::ClusterKeys> clusterKeys_;
@@ -3042,10 +3101,15 @@ private:
     // Authentication Task 13 (D30): WRITE bitmaps to every worker; a login's AuthServerFinal{OK} waits for its epoch.
     rune::node::PermissionShipper permissionShipper_;
     uint64_t permEpoch_ = 0;
-    struct HeldLoginFinal { int64_t sessionId; uint64_t epoch; std::vector<uint8_t> frame; };
     /// Issue #197: (object id, the shipper seq that must be shipped before that object's DDL OK may leave).  Cold, DDL rate.
     std::vector<std::pair<int32_t, uint64_t>> objectShipSeqs_;
-    std::vector<HeldLoginFinal> heldLoginFinals_;     ///< cold: one per login whose grants are still being shipped
+    /// Issue #202: the sessions whose login OK is held (`Session::heldLoginOk`), oldest first; epochs only grow, so they are
+    /// released in this order.  Bounded by the session table; no allocation.  0 = none.
+    int64_t     heldLoginHead_ = 0, heldLoginTail_ = 0;
+    std::size_t heldLoginCount_ = 0;
+    void holdLoginOk_(Session& s, uint64_t epoch, int64_t corr, uint8_t flags, std::span<const uint8_t> signature);
+    void unlinkHeldLoginOk_(Session& s);
+    void sendHeldLoginOk_(Session& s);
     /// Bind `session` to its table on every worker (Required mode + shard mode only; the table itself is shipped once
     /// per grant set); returns the bind's shipper sequence (0 = nothing to ship).
     uint64_t shipPermissions_(const Session& session);
@@ -3227,6 +3291,7 @@ private:
     void onControlRecordRefused_(const rune::node::WorkerReturn& ret);
     void onControlRecordAppended_(const rune::node::WorkerReturn& ret);
     uint64_t controlRecordsRefused_ = 0;
+    uint64_t controlRecordsRefusedInternalId_ = 0;   // #215: appendControlRecord given a negative (internal) topic id
     uint64_t leaseReturnMalformed_  = 0;   // lease worker returns with a bad count / chunk (a broker bug), answered Internal
     uint64_t leaseEnqueueTooLarge_  = 0;   // lease requests that can never fit one worker-ingress frame, answered MessageTooLarge
     uint64_t produceBackPressured_  = 0;   // M5: produces answered NotLeader on back-pressure
@@ -3513,6 +3578,9 @@ private:
     int  pumpSubOps_();
 public:
     [[nodiscard]] uint64_t controlRecordsRefusedForTest() const noexcept { return controlRecordsRefused_; }
+    [[nodiscard]] uint64_t controlRecordsRefusedInternalIdForTest() const noexcept {
+        return controlRecordsRefusedInternalId_;
+    }
     [[nodiscard]] std::size_t markersInFlightForTest() const noexcept { return markersInFlight_.size(); }
     [[nodiscard]] std::size_t markersQueuedForTest() const noexcept { return markerSendQueue_.size(); }
     [[nodiscard]] std::size_t pendingSubOpsForTest() const noexcept {

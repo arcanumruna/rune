@@ -7,6 +7,7 @@
 #include "support/SecurityRig.h"
 
 #include <rune/node/CatalogCheckpoint.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/security/SecurityReplayer.h>
 
 #include <gtest/gtest.h>
@@ -32,6 +33,17 @@ uint64_t libraryDigest(const std::vector<sec::SecurityEvent>& events, std::size_
         EXPECT_TRUE(a.has_value());
     }
     return r.state().digest();
+}
+
+/// A one-record batch built by hand at `baseOffset` (control or not), appended straight to the Log.
+std::vector<uint8_t> handBuiltBatch(int64_t baseOffset, const std::vector<uint8_t>& value, bool control) {
+    rune::protocol::RecordBatchBuilder bb(baseOffset, 1'760'000'000'000);
+    bb.setControl(control);
+    bb.append(std::string_view{}, std::string_view(reinterpret_cast<const char*>(value.data()), value.size()),
+              1'760'000'000'000);
+    std::vector<uint8_t> out;
+    bb.buildInto(out);
+    return out;
 }
 
 } // namespace
@@ -245,4 +257,23 @@ TEST(SecurityApplierRegression, BootReplayOf10kEventsUnderOneSecond) {
 #else
     RecordProperty("boot_replay_ms", static_cast<int>(ms));   // Debug just runs it
 #endif
+}
+
+// #207: a control batch inside __security is never written by the leader.  The applier used to consume its offsets and
+// carry on, while the control-thread mirror (which needs dense event offsets) halted at the hole.
+TEST(SecurityApplierRegression, AControlBatchInTheSecurityLogHaltsTheApplierRegression) {
+    SecurityRig rig("ap_ctl");
+    rig.appendEvents(0, 1);                                                                   // offset 0
+    rig.log().append(handBuiltBatch(1, {0x00, 0x00, 0x00, 0x00}, /*control=*/true), /*lastOffset=*/1);
+    rig.log().append(handBuiltBatch(2, SecurityRig::encodeEvent(rig.golden()[1]), false), /*lastOffset=*/2);
+    rig.restart();
+    ASSERT_EQ(rig.applier.replayLocal(rig.log(), rig.rec.bootEffects()), 0);
+    ASSERT_TRUE(rig.applier.goLive(rig.rec.liveEffects()));
+    (void)rig.applier.applyCommitted(rig.replica());
+    ASSERT_TRUE(rig.applier.halted()) << "a control batch in __security halts, it is never consumed";
+    ASSERT_EQ(rig.rec.halts.size(), 1u);
+    EXPECT_EQ(rig.rec.halts[0].offset, 1) << "at the control batch's base offset";
+    EXPECT_EQ(rig.rec.halts[0].code, sec::ApplyError::Code::Precondition);
+    EXPECT_NE(rig.rec.halts[0].detail.find("control batch"), std::string::npos) << rig.rec.halts[0].detail;
+    EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{0})) << "the third offset is never applied";
 }

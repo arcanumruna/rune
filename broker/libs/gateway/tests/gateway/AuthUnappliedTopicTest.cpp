@@ -24,6 +24,8 @@
 #include <rune/protocol/client/Protocol.h>
 #include <rune/gateway/SecurityView.h>
 #include <rune/security/Permissions.h>
+#include <rune/security/SecurityEvent.h>
+#include "support/SecurityEventChain.h"
 
 #include <gtest/gtest.h>
 
@@ -78,11 +80,14 @@ struct CountingTxn final : ITxnRequestHandler {
 };
 struct CountingAdminSink final : IAdminRequestSink {
     std::size_t gets = 0;
+    uint8_t lastKinds = 0;
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool, const uint8_t*,
                                   uint32_t, uint8_t, int16_t, const rune::protocol::TopicConfigView&, const DdlMetaView&,
                                   std::string_view, const rune::protocol::TopicKeyFeatures&,
                                   const std::optional<rune::protocol::LeaseSpec>&) override { return AdminSubmit::Accepted; }
-    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t) override { ++gets; return true; }
+    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t, uint8_t kinds) override {
+        ++gets; lastKinds = kinds; return true;
+    }
     AdminSubmit submitAlterTopic(int64_t, int64_t, std::string_view, uint16_t, const uint8_t*, uint32_t,
                                  const DdlMetaView&) override { return AdminSubmit::Accepted; }
     AdminSubmit submitCreateView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, const uint8_t*, uint32_t,
@@ -118,6 +123,10 @@ std::vector<sec::GrantSpec> defaultGrants() {
             grant(sec::Operation::Write, sec::ResourceType::TransactionalId, "t")};
 }
 
+std::vector<rune::metadata::RoutingImage::BuildEntry> defaultImage() {
+    return {{rune::metadata::gpidOf(0, 0), 1, 1}, {rune::metadata::gpidOf(kPlaced, 0), 1, 1}};
+}
+
 struct Rig {
     TempDir                        dir;
     std::unique_ptr<TopicRegistry> registry;
@@ -129,18 +138,18 @@ struct Rig {
     int64_t                        sid = 0;
     int64_t                        corr = 100;
     std::vector<std::pair<int64_t, int16_t>> answers;   // (correlation, code)
+    std::string lastDdlDetail;
     bool dispatch = false;   // #603: send through the gateway's whole client-frame dispatch (the request gate included)
 
     explicit Rig(std::vector<sec::GrantSpec> grants = defaultGrants(),
-                 std::vector<rune::metadata::RoutingImage::BuildEntry> img = {{rune::metadata::gpidOf(0, 0), 1, 1},
-                                                                              {rune::metadata::gpidOf(kPlaced, 0), 1, 1}})
+                 std::vector<rune::metadata::RoutingImage::BuildEntry> img = defaultImage(), bool withPool = true)
           : pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16)
           , gw(ClientGateway::makeForTest([this](const uint8_t* b, std::size_t n) -> int64_t { onFrame(b, n); return 1; }, 1)) {
         rune::node::TopicSpec boot;
         boot.name = "w.boot"; boot.partitionCount = 1; boot.topicId = 0;
         registry = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{boot}, dir.path.string());
         gw.setTopicRegistry(registry.get());
-        gw.setWorkerPool(&pool);
+        if (withPool) gw.setWorkerPool(&pool);   // #219: false = a gateway without workers
         gw.setCommittedMetadataReady(true);
         gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build(img, rune::metadata::RoutingImage::Source::Committed));
         gw.setNodeIdForTest(1);
@@ -166,6 +175,9 @@ struct Rig {
             case pc::TemplateId::ViewRowResponse:
                 if (auto r = pc::ViewRowResponse::decode(b, n)) answers.emplace_back(r->correlationId, static_cast<int16_t>(r->status));
                 break;
+            case pc::TemplateId::ScanViewRowsResponse:
+                if (auto r = pc::ScanViewRowsResponse::decode(b, n)) answers.emplace_back(r->correlationId, static_cast<int16_t>(r->status));
+                break;
             case pc::TemplateId::JoinGroupResponse:
                 if (auto r = pc::JoinGroupResponse::decode(b, n)) answers.emplace_back(r->correlationId, r->errorCode);
                 break;
@@ -188,6 +200,12 @@ struct Rig {
             case pc::TemplateId::TopicSchemaResponse:
                 if (auto r = pc::TopicSchemaResponse::decode(b, n))
                     answers.emplace_back(r->correlationId, static_cast<int16_t>(r->errorCode));
+                break;
+            case pc::TemplateId::DdlResponse:   // #506: the DDL family carries its code and detail here
+                if (auto r = pc::DdlResponse::decode(b, n)) {
+                    answers.emplace_back(r->correlationId, static_cast<int16_t>(r->errorCode));
+                    lastDdlDetail = std::string(r->detail);
+                }
                 break;
             case pc::TemplateId::Pong:   // #603: a session-level answer (code 0)
                 answers.emplace_back(h->correlationId, 0);
@@ -233,6 +251,26 @@ struct Rig {
         buf.resize(m.encode(buf.data()));
         if (dispatch) (void)gw.applyClientFrameForTest(buf.data(), buf.size());
         else gw.applyGetViewRowForTest(buf.data(), buf.size());
+        return m.correlationId;
+    }
+    int64_t getViewRowK(int32_t viewId) {
+        pc::GetViewRowK m;
+        m.sessionId = sid; m.correlationId = ++corr; m.viewTopicId = viewId; m.partition = -1; m.minOffset = -1;
+        const std::vector<uint8_t> key{1, 0, 0, 0, 0, 0, 0, 0};
+        m.key = key;
+        std::vector<uint8_t> buf(m.encodedSize());
+        m.encode(buf.data());
+        gw.applyGetViewRowKForTest(buf.data(), buf.size());
+        return m.correlationId;
+    }
+    int64_t scanViewRows(int32_t viewId) {
+        pc::ScanViewRows m;
+        m.sessionId = sid; m.correlationId = ++corr; m.viewTopicId = viewId; m.limit = 0;
+        const std::vector<uint8_t> prefix{1};   // a prefix of length 0 does not decode
+        m.prefix = prefix;
+        std::vector<uint8_t> buf(m.encodedSize());
+        m.encode(buf.data());
+        gw.applyScanViewRowsForTest(buf.data(), buf.size());
         return m.correlationId;
     }
     static std::span<const uint8_t> bytes(std::string_view s) { return {reinterpret_cast<const uint8_t*>(s.data()), s.size()}; }
@@ -482,31 +520,56 @@ TEST(AuthUnappliedTopicRegression, DescribeOnClusterStillAnswersThePlacedIdRetri
     EXPECT_EQ(*missing, static_cast<int16_t>(pc::ErrorCode::UnknownTopic));
 }
 
-// #128 through the handler: a VIEW grant never describes a live topic (and the reverse); the refusal is the terminal 45
-// in TopicSchemaResponse, never forwarded to the admin thread; an unknown name still accepts either kind's grant.
+// #128, #504, #505 through the handler: the gateway no longer consults its (lagging) object index for GetTopicSchema.
+// It forwards with only the kind bits the grants allow under the name, and the admin thread serves the object only if
+// its real kind is among them (otherwise it answers like a missing name).  A session with no grant on the name under
+// either kind gets the terminal 45 here, whether or not the object exists, and the admin thread is never reached.
 TEST(AuthUnappliedTopicRegression, GetTopicSchemaChecksOnlyTheLiveObjectsOwnKindAdversarialRegression) {
     Rig viewOnly({grant(sec::Operation::Describe, sec::ResourceType::View, "pay")});
     viewOnly.gw.onCatalogObjectApplied(kPlaced, "payments", false);
     viewOnly.gw.onCatalogObjectApplied(kPlaced + 1, "payboard", true);
-    EXPECT_EQ(viewOnly.codeOf(viewOnly.getTopicSchema("payments")), kNotAuthorized);
-    EXPECT_EQ(viewOnly.admin.gets, 0u);
-    EXPECT_EQ(viewOnly.codeOf(viewOnly.getTopicSchema("payboard")), std::nullopt) << "its own kind: forwarded";
+    EXPECT_EQ(viewOnly.codeOf(viewOnly.getTopicSchema("payments")), std::nullopt) << "forwarded, only as a view";
+    EXPECT_EQ(viewOnly.admin.gets, 1u);
+    EXPECT_EQ(viewOnly.admin.lastKinds, rune::gateway::kKindView);
+    EXPECT_EQ(viewOnly.codeOf(viewOnly.getTopicSchema("payboard")), std::nullopt);
+    EXPECT_EQ(viewOnly.admin.lastKinds, rune::gateway::kKindView);
     EXPECT_EQ(viewOnly.codeOf(viewOnly.getTopicSchema("payroll")), std::nullopt) << "unknown: either kind (D22)";
-    EXPECT_EQ(viewOnly.admin.gets, 2u);
+    EXPECT_EQ(viewOnly.admin.gets, 3u);
+    EXPECT_EQ(viewOnly.codeOf(viewOnly.getTopicSchema("orders")), kNotAuthorized) << "no grant on the name, any kind";
+    EXPECT_EQ(viewOnly.admin.gets, 3u) << "never reached the admin thread";
 
     Rig topicOnly({grant(sec::Operation::Describe, sec::ResourceType::Topic, "pay")});
     topicOnly.gw.onCatalogObjectApplied(kPlaced, "payments", false);
     topicOnly.gw.onCatalogObjectApplied(kPlaced + 1, "payboard", true);
-    EXPECT_EQ(topicOnly.codeOf(topicOnly.getTopicSchema("payboard")), kNotAuthorized);
+    EXPECT_EQ(topicOnly.codeOf(topicOnly.getTopicSchema("payboard")), std::nullopt);
+    EXPECT_EQ(topicOnly.admin.lastKinds, rune::gateway::kKindTopic);
     EXPECT_EQ(topicOnly.codeOf(topicOnly.getTopicSchema("payments")), std::nullopt);
-    // Drop "payments" and re-create the NAME as a view at a new id: the kind follows the live object.
+    EXPECT_EQ(topicOnly.admin.lastKinds, rune::gateway::kKindTopic);
+    // Drop "payments" and re-create the NAME as a view at a new id: the gateway still sends the same kinds; the admin
+    // thread decides by the live object.
     topicOnly.gw.onCatalogObjectDropped(kPlaced);
     topicOnly.gw.onCatalogObjectApplied(kPlaced + 2, "payments", true);
-    EXPECT_EQ(topicOnly.codeOf(topicOnly.getTopicSchema("payments")), kNotAuthorized) << "now a view";
+    EXPECT_EQ(topicOnly.codeOf(topicOnly.getTopicSchema("payments")), std::nullopt) << "forwarded with kKindTopic";
+    EXPECT_EQ(topicOnly.admin.lastKinds, rune::gateway::kKindTopic);
+    EXPECT_EQ(topicOnly.admin.gets, 3u);
+    EXPECT_EQ(topicOnly.codeOf(topicOnly.getTopicSchema("orders")), kNotAuthorized) << "no grant on the name";
+    EXPECT_EQ(topicOnly.admin.gets, 3u);
 }
 
-// #128 input bounds: an empty name, a name that is a strict prefix / extension of a live one, and a 64 KiB-1 name
-// resolve by exact match only (byName never matches a prefix of a live name).
+// #504: a just-created topic is not in this gateway's object index yet (onCatalogObjectApplied has not run for it).
+// A VIEW-only session's GetTopicSchema must reach the admin thread carrying ONLY the view kind, so the admin thread
+// (whose catalog is authoritative; see GetSchemaKindRegression.TheAdminServesOnlyTheKindsTheGatewayAllowedRegression)
+// answers it like a missing name instead of serving the topic's schema.  The two tests together close the window.
+TEST(AuthUnappliedTopicRegression, AViewGrantNeverDescribesAJustCreatedTopicRegression) {
+    Rig r({grant(sec::Operation::Describe, sec::ResourceType::View, "pay")});
+    ASSERT_EQ(r.gw.objectIndex().at(kPlaced), nullptr) << "precondition: the topic is not applied here";
+    EXPECT_EQ(r.codeOf(r.getTopicSchema("payments")), std::nullopt) << "forwarded";
+    EXPECT_EQ(r.admin.gets, 1u);
+    EXPECT_EQ(r.admin.lastKinds, rune::gateway::kKindView) << "the admin thread must be told: a view, never a topic";
+}
+
+// #128 input bounds: an empty name, a name that is a strict prefix / extension of a live one, and a 64 KiB-1 name are
+// judged by the grants alone; the empty name is malformed.
 TEST(AuthUnappliedTopicRegression, GetTopicSchemaNameBoundsResolveByExactMatchAdversarialRegression) {
     Rig r({grant(sec::Operation::Describe, sec::ResourceType::View, "pay")});
     r.gw.onCatalogObjectApplied(kPlaced, "payments", false);
@@ -518,7 +581,8 @@ TEST(AuthUnappliedTopicRegression, GetTopicSchemaNameBoundsResolveByExactMatchAd
         << "the empty name is malformed (D7)";
     const std::string huge = "pay" + std::string(65535 - 3, 'x');
     EXPECT_EQ(r.codeOf(r.getTopicSchema(huge)), std::nullopt);
-    EXPECT_EQ(r.codeOf(r.getTopicSchema("payments")), kNotAuthorized);
+    EXPECT_EQ(r.codeOf(r.getTopicSchema("payments")), std::nullopt) << "forwarded with kKindView; the admin decides";
+    EXPECT_EQ(r.admin.lastKinds, rune::gateway::kKindView);
 }
 
 // #511 adversarial review (PR #516): every id-addressed template, on a view sink id, answers EXACTLY like a missing id
@@ -635,4 +699,128 @@ TEST(SecurityBehindGatewayRegression, AnInProcessGatewayIgnoresTheFlagRegression
     const auto code = r.codeOf(r.produce(0));
     EXPECT_TRUE(!code.has_value() || *code != kAuthUnavailable);
     EXPECT_EQ(r.gw.securityBehindRefusals(), 0u);
+}
+
+// #219: on a gateway WITHOUT a worker pool the three view reads answered the C1 gate (or "no view is servable here")
+// before the session's READ was checked, so a caller without READ told a hidden view (gate code) from a missing id.
+// Authorization comes first on every path; only then the gate.
+TEST(GetViewRowAuthRegression, NoPoolPathAuthorizesBeforeTheGateRegression) {
+    // The sink id is Dropped (the gate answers UnknownView); a never-defined id has no gate at all.  (A placed-but-not-
+    // applied id answers the retriable apply-window verdict on the pooled path too, by design: not tested here.)
+    Rig r(std::vector<sec::GrantSpec>{}, defaultImage(), /*withPool=*/false);
+    ASSERT_TRUE(r.registry->dropTopic(kPlaced));
+    const std::vector<std::pair<const char*, std::function<int64_t(int32_t)>>> reads = {
+        {"GetViewRow",   [&](int32_t id) { return r.getViewRow(id); }},
+        {"GetViewRowK",  [&](int32_t id) { return r.getViewRowK(id); }},
+        {"ScanViewRows", [&](int32_t id) { return r.scanViewRows(id); }}};
+    for (const auto& [what, read] : reads) {
+        const auto gated = r.codeOf(read(kPlaced));
+        const auto missing = r.codeOf(read(kMissing));
+        ASSERT_TRUE(gated.has_value()) << what << ": answered, never silent";
+        ASSERT_TRUE(missing.has_value()) << what;
+        EXPECT_EQ(*gated, kNotAuthorized) << what << ": no READ: the gated view answers NotAuthorized, not its gate code";
+        EXPECT_EQ(*gated, *missing) << what << ": a hidden view and a missing id answer alike";
+    }
+    // Control (non-vacuity): a principal WITH READ on the view gets the gate code, not NotAuthorized.
+    Rig granted(defaultGrants(), defaultImage(), /*withPool=*/false);
+    granted.gw.onCatalogObjectApplied(kPlaced, "w.z", false);
+    ASSERT_TRUE(granted.registry->dropTopic(kPlaced));
+    const auto unknownView = static_cast<int16_t>(pc::ViewRowResponse::kUnknownView);
+    EXPECT_EQ(granted.codeOf(granted.getViewRow(kPlaced)), unknownView);
+    EXPECT_EQ(granted.codeOf(granted.getViewRowK(kPlaced)), unknownView);
+    EXPECT_EQ(granted.codeOf(granted.scanViewRows(kPlaced)), unknownView);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Issue #506: a denial is not a verdict while this broker holds `__security` events its view has not applied (one of
+// them may be the grant the request relies on): retriable AuthUnavailable, never the terminal NotAuthorized.  Deny path
+// only - nothing is ever allowed on unapplied events.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+struct HeldEventsRig : Rig {
+    rune::node::test::SecurityEventChain chain;
+    SecurityView view;
+    static rune::node::test::SecurityEventChain boot() {
+        rune::node::test::SecurityEventChain c;
+        (void)c.createUser("u0");
+        return c;
+    }
+    HeldEventsRig() : Rig(std::vector<sec::GrantSpec>{}), chain(boot()), view(chain.state()) {
+        dispatch = true;
+        gw.setAuthMode(GatewayAuthMode::Required, &view);
+    }
+    int64_t newSession(std::vector<sec::GrantSpec> grants) {
+        const int64_t s = gw.injectTestSession();
+        gw.authenticateWithGrantsForTest(s, 43, std::move(grants));
+        return s;
+    }
+    void applyNextEvent(const char* user) {
+        const auto ev = chain.createUser(user);
+        const auto bytes = sec::encode(ev);
+        ASSERT_TRUE(bytes.has_value());
+        const int64_t off = static_cast<int64_t>(chain.count()) - 1;
+        auto applied = view.onApplied(off, *bytes);
+        ASSERT_TRUE(applied.has_value()) << applied.error().detail;
+        gw.onSecurityApplied(off, *applied);
+    }
+    int64_t dropTopic(std::string_view name) {
+        pc::DropTopic m;
+        m.sessionId = sid; m.correlationId = ++corr; m.topicName = name;
+        std::vector<uint8_t> buf(m.encodedSize());
+        buf.resize(m.encode(buf.data()));
+        (void)gw.applyClientFrameForTest(buf.data(), buf.size());
+        return m.correlationId;
+    }
+    int64_t leo() const { return registry->log(0, 0)->logEndOffset(); }
+};
+}  // namespace
+
+TEST(AuthUnappliedTopicRegression, ADenialWhileTheViewHoldsUnappliedEventsIsRetriableRegression) {
+    HeldEventsRig r;
+    const int64_t applied = r.view.appliedOffset();
+    ASSERT_EQ(r.gw.objectIndex().at(0) != nullptr, true) << "precondition: the topic is applied here";
+    const int64_t leo = r.leo();
+    const int64_t noGrant = r.sid;
+    r.gw.setSecurityKnownEnd(applied + 2);   // one event held by this broker, not applied: the grant may be in it
+    const uint64_t refusedBefore = r.gw.notAuthorizedAnswers();
+
+    // Step 2: the denied produce is retriable, reaches no sink, is not audited as a denial.
+    EXPECT_EQ(r.codeOf(r.produce(0)), kAuthUnavailable);
+    EXPECT_EQ(r.leo(), leo) << "nothing reaches the produce sink";
+    EXPECT_EQ(r.gw.deniesDeferredViewBehind(), 1u);
+    EXPECT_EQ(r.gw.notAuthorizedAnswers(), refusedBefore) << "a non-verdict is not audited as a denial";
+
+    // Step 5: a DDL-family template (own response type, no object name in the detail) and a Subscribe.
+    const auto drop = r.codeOf(r.dropTopic("w.boot"));
+    ASSERT_TRUE(drop.has_value());
+    EXPECT_EQ(*drop, kAuthUnavailable);
+    EXPECT_EQ(r.lastDdlDetail.find("w.boot"), std::string::npos) << "the detail does not name the object";
+    EXPECT_EQ(r.codeOf(r.subscribe(0)), kAuthUnavailable);
+    EXPECT_EQ(r.gw.deniesDeferredViewBehind(), 3u);
+    EXPECT_EQ(r.gw.notAuthorizedAnswers(), refusedBefore);
+
+    // Step 6: a session WITH the grant is not affected (deny path only): its produce is appended.
+    {
+        const int64_t granted = r.newSession(defaultGrants());
+        r.sid = granted;
+        EXPECT_FALSE(r.codeOf(r.produce(0)).has_value()) << "an allowed acks=0 produce is forwarded, never answered";
+        r.sid = noGrant;
+    }
+    EXPECT_EQ(r.gw.deniesDeferredViewBehind(), 3u);
+
+    // Step 3: the event reaches the view (knownEnd stays applied + 2 -> still one held) and the session picks the
+    // grant up: forwarded.
+    r.applyNextEvent("u1");
+    ASSERT_EQ(r.view.appliedOffset(), applied + 1);
+    r.gw.authenticateWithGrantsForTest(noGrant, 42, defaultGrants());
+    EXPECT_FALSE(r.codeOf(r.produce(0)).has_value()) << "forwarded once the grant is applied";
+
+    // Step 4 (control): fully applied view, a session with no grant -> the terminal 45 as today.
+    r.gw.setSecurityKnownEnd(r.view.appliedOffset() + 1);
+    const uint64_t deferred = r.gw.deniesDeferredViewBehind();
+    const uint64_t refusedControl = r.gw.notAuthorizedAnswers();
+    r.sid = r.newSession({});
+    EXPECT_EQ(r.codeOf(r.produce(0)), kNotAuthorized);
+    EXPECT_EQ(r.gw.deniesDeferredViewBehind(), deferred);
+    EXPECT_EQ(r.gw.notAuthorizedAnswers(), refusedControl + 1);
 }

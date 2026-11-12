@@ -126,9 +126,19 @@ public:
     /// Test seam (admin thread): while held, the leader issues no NamespacePurged (the window between a namespace turning
     /// DELETING and its grants being purged).
     void holdPurgeForTest(bool on) noexcept { purgeHeldForTest_ = on; }
+    /// Issue #411: how many DDLs reached the last-admin dry run (only kinds that can remove an admin do).
+    [[nodiscard]] uint64_t lastAdminDryRunsForTest() const noexcept { return lastAdminDryRuns_; }
     [[nodiscard]] std::size_t pendingCount() const noexcept { return pending_.size(); }
     [[nodiscard]] uint64_t pendingRefused() const noexcept { return pendingRefused_; }
+    /// Issues #218 / #67: DDLs answered NotLeader because the `__security` state moved after the gateway authorized
+    /// them.
+    [[nodiscard]] uint64_t ddlStaleAuthorization() const noexcept { return ddlStaleAuthorization_; }
     [[nodiscard]] bool hasInFlight() const noexcept { return !std::holds_alternative<Idle>(inFlight_); }
+    /// Issues #218 / #67: the event appended but not yet applied (nullptr when nothing is in flight).
+    [[nodiscard]] const rune::security::SecurityEvent* inFlightEvent() const noexcept {
+        const auto* a = std::get_if<AwaitingCommit>(&inFlight_);
+        return a != nullptr ? &a->event : nullptr;
+    }
     [[nodiscard]] std::string_view inFlightStateName() const noexcept {
         return hasInFlight() ? "AwaitingCommit" : "Idle";
     }
@@ -173,7 +183,9 @@ private:
     std::deque<SecurityRequest>          pending_;
     std::vector<uint8_t>                 eventBuf_;   // the encoded event (capacity reused)
     bool purgeHeldForTest_ = false;
+    uint64_t lastAdminDryRuns_ = 0;
     uint64_t started_ = 0, answered_ = 0, eventsAppended_ = 0, pendingRefused_ = 0, purgesIssued_ = 0;
+    uint64_t ddlStaleAuthorization_ = 0;   ///< issues #218 / #67
 };
 
 } // namespace rune::node

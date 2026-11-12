@@ -4,11 +4,13 @@
 // One SecurityAdmin + a real leader replica + the real SecurityApplier (support/SecurityDdlRig.h).
 #include "support/SecurityDdlRig.h"
 
+#include <rune/gateway/SecurityRequestFingerprint.h>
 #include <rune/security/Permissions.h>
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 
 using rune::node::test::SecurityDdlRig;
 namespace sec = rune::security;
@@ -17,7 +19,7 @@ using Op = pc::SecurityOpKind;
 using Ch = pc::UserChangeKind;
 
 namespace {
-constexpr uint16_t kNotLeader = 2, kInternal = 6, kInvalidRequest = 39;
+constexpr uint16_t kNotLeader = 2, kInternal = 6, kInvalidRequest = 39, kNotAuthorized = 45;
 
 bool contains(const std::vector<uint8_t>& hay, const std::string& needle) {
     return std::search(hay.begin(), hay.end(), needle.begin(), needle.end()) != hay.end();
@@ -169,6 +171,40 @@ TEST(SecurityWritePathRegression, RefusalsAnswerInvalidRequestNamingTheRuleAndAp
     EXPECT_EQ(rig.admin().startedCount(), rig.admin().answeredCount());
 }
 
+// #230: the names the broker records as principals ("bootstrap", "anonymous") cannot be given to a user: the audit
+// trail could not tell the user from the broker.  The leader refuses; the frozen apply rules (replay) do not.
+TEST(SecurityAdminRegression, ReservedPrincipalNamesAreRefusedRegression) {
+    SecurityDdlRig rig("reserved_names");
+    rig.becomeServingLeader();
+    const std::size_t logged = rig.recordedEvents().size();
+    for (const char* name : {"bootstrap", "Bootstrap", "BOOTSTRAP", "anonymous", "Anonymous"}) {
+        const auto a = rig.ddl(rig.createUser(name, "a-long-password-1"));
+        EXPECT_EQ(a.code, kInvalidRequest) << name << ": " << a.detail;
+        EXPECT_EQ(a.detail, std::string{"the user name '"} + name + "' is reserved") << name;
+        EXPECT_EQ(a.gateOffset, -1) << name << ": a refusal is not gated";
+        EXPECT_EQ(rig.recordedEvents().size(), logged) << name << ": nothing appended";
+        EXPECT_EQ(rig.state().userByName(rune::catalog::kDefaultNsId, name), nullptr) << name;
+    }
+    for (const char* name : {"bootstrap2", "my.bootstrap", "anonymous_reader"}) {
+        const auto a = rig.ddl(rig.createUser(name, "a-long-password-1"));
+        EXPECT_EQ(a.code, 0) << name << ": " << a.detail;
+        EXPECT_NE(rig.state().userByName(rune::catalog::kDefaultNsId, name), nullptr) << name;
+    }
+    EXPECT_EQ(rig.recordedEvents().size(), logged + 3);
+}
+
+TEST(SecurityAdminRegression, AReservedBootstrapAdminNameIsRefusedRegression) {
+    SecurityDdlRig rig("reserved_boot");
+    rig.becomeServingLeader();
+    for (const char* name : {"bootstrap", "ANONYMOUS"}) {
+        const auto a = rig.bootstrap(rig.bootstrapMsg(name, "initial-one-time-pw"));
+        EXPECT_EQ(a.code, kInvalidRequest) << name << ": " << a.detail;
+        EXPECT_EQ(a.detail, std::string{"the user name '"} + name + "' is reserved") << name;
+        EXPECT_TRUE(rig.recordedEvents().empty()) << name << ": nothing appended";
+    }
+    EXPECT_EQ(rig.bootstrap(rig.bootstrapMsg("admin", "initial-one-time-pw")).code, 0);
+}
+
 TEST(SecurityWritePathRegression, DuplicateRequestIdAnswersTheOriginalResultRegression) {
     SecurityDdlRig rig("dup");
     rig.becomeServingLeader();
@@ -278,6 +314,52 @@ TEST(SecurityWritePathRegression, HaltedBrokerAnswersInternal) {
     EXPECT_EQ(rig.admin().roleName(), "Halted");
 }
 
+// #208: a halted answer names the broker that halted (a client holding several brokers' answers cannot tell otherwise).
+TEST(SecurityAdminRegression, HaltedDetailNamesTheNodeRegression) {
+    SecurityDdlRig rig("halted_names_node");
+    rig.becomeServingLeader();
+    rig.applier().tamperNextFingerprintForTest();
+    const std::string want = "on node " + std::to_string(SecurityDdlRig::kSelf);
+    const auto inFlight = rig.ddl(rig.createUser("u1", "a-long-password-1"));   // in flight when the apply halts
+    ASSERT_EQ(inFlight.code, kInternal) << inFlight.detail;
+    EXPECT_NE(inFlight.detail.find(want), std::string::npos) << inFlight.detail;
+    const auto arriving = rig.ddl(rig.createUser("u2", "a-long-password-2"));   // arrives while halted
+    ASSERT_EQ(arriving.code, kInternal) << arriving.detail;
+    EXPECT_NE(arriving.detail.find(want), std::string::npos) << arriving.detail;
+}
+
+// #411: the last-admin dry run copies the state, so only the kinds that can remove an admin pay for it.
+TEST(SecurityAdminRegression, OnlyKindsThatCanRemoveAnAdminRunTheDryRunRegression) {
+    SecurityDdlRig rig("dry_run_kinds");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.bootstrap(rig.bootstrapMsg("admin", "a-long-password-0")).code, 0);
+    ASSERT_TRUE(rig.state().hasSecurityAdmin());
+    const auto dryRuns = [&] { return rig.admin().lastAdminDryRunsForTest(); };
+    const auto readTopic = [&](bool revoke) {
+        return rig.grant(revoke, sec::GranteeKind::Role, "r1", sec::Operation::Read, sec::ResourceType::Topic,
+                         sec::PatternKind::Prefix, "t.");
+    };
+    // Kinds that cannot remove an admin: no dry run.
+    const uint64_t base = dryRuns();
+    ASSERT_EQ(rig.ddl(rig.createUser("u1", "a-long-password-1")).code, 0);
+    ASSERT_EQ(rig.ddl(rig.createRole("r1")).code, 0);
+    ASSERT_EQ(rig.ddl(readTopic(false)).code, 0);
+    ASSERT_EQ(rig.ddl(rig.grantRole(false, "u1", "r1")).code, 0);
+    EXPECT_EQ(dryRuns(), base) << "CREATE USER, CREATE ROLE, GRANT, GRANT ROLE never run the dry run";
+    // Kinds that can: one dry run each.
+    uint64_t expect = base;
+    const auto one = [&](rune::node::SecurityDdlMsg m, const char* what) {
+        const auto a = rig.ddl(std::move(m));
+        ASSERT_EQ(a.code, 0) << what << ": " << a.detail;
+        EXPECT_EQ(dryRuns(), ++expect) << what;
+    };
+    one(readTopic(true), "REVOKE");
+    one(rig.grantRole(true, "u1", "r1"), "REVOKE ROLE");
+    one(rig.alterUser("u1", Ch::Disable), "ALTER USER");
+    one(rig.simple(Op::DropRole, "r1", "DROP ROLE r1;"), "DROP ROLE");
+    one(rig.simple(Op::DropUser, "u1", "DROP USER u1;"), "DROP USER");
+}
+
 TEST(SecurityWritePathRegression, NoEventEverCarriesAPasswordLiteralRegression) {
     SecurityDdlRig rig("nopw");
     rig.becomeServingLeader();
@@ -328,6 +410,50 @@ TEST(SecurityWritePathRegression, AnUnredactedPasswordLiteralIsRefusedAndAppends
     dp.meta = rig.meta("ALTER USER u1 DROP PASSWORD 1;");
     EXPECT_EQ(rig.ddl(std::move(dp)).code, 0);
     EXPECT_EQ(rig.recordedEvents().size(), 3u);
+}
+
+// #229: the guard judges the literals of password-carrying statements only, and is not fooled by a keyword spelling.
+TEST(SecurityWritePathRegression, PasswordGuardAcceptsQuotedNamesAndRefusesOtherSyntaxesRegression) {
+    SecurityDdlRig rig("guard_syntax");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.ddl(rig.createUser("u", "a-long-password-1")).code, 0);
+    // Statements that carry no verifier are never refused, whatever words their quoted names hold.
+    auto g1 = rig.grant(false, sec::GranteeKind::User, "u", sec::Operation::Read, sec::ResourceType::Topic,
+                        sec::PatternKind::Exact, "world.password");
+    g1.meta = rig.meta("GRANT READ ON TOPIC 'world.password' TO USER u;");
+    EXPECT_EQ(rig.ddl(std::move(g1)).code, 0);
+    auto g2 = rig.grant(false, sec::GranteeKind::User, "u", sec::Operation::Write, sec::ResourceType::Topic,
+                        sec::PatternKind::Prefix, "app.password");
+    g2.meta = rig.meta("GRANT WRITE ON TOPIC PREFIX 'app.password' TO USER u;");
+    EXPECT_EQ(rig.ddl(std::move(g2)).code, 0);
+    // A verifier-carrying statement may hold the redacted marker and the user's own (quoted) name.
+    auto c1 = rig.createUser("pass-word", "a-long-password-1");
+    c1.meta = rig.meta("CREATE USER 'pass-word' PASSWORD '<redacted>';");
+    EXPECT_EQ(rig.ddl(std::move(c1)).code, 0);
+    auto c2 = rig.createUser("x", "a-long-password-1");
+    c2.meta = rig.meta("CREATE USER x PASSWORD '<redacted>';");
+    EXPECT_EQ(rig.ddl(std::move(c2)).code, 0);
+    auto a1 = rig.alterUser("x", Ch::SetPassword);
+    a1.verifier = SecurityDdlRig::verifierFor("another-long-pw-1");
+    a1.meta = rig.meta("ALTER USER x SET PASSWORD '<redacted>';");
+    EXPECT_EQ(rig.ddl(std::move(a1)).code, 0);
+    const auto before = rig.recordedEvents().size();
+    EXPECT_EQ(before, 6u);
+    const std::vector<std::string> bad = {
+        "CREATE USER x IDENTIFIED BY 'secret'",
+        "CREATE USER x PASSWORD\xC2\xA0'secret'",
+        "CREATE USER x PASSWORD $$secret$$",
+        "CREATE USER x PASSWORD \"secret\"",
+        "CREATE USER x PASSWORD 'sec''ret'",
+        "CREATE USER x PASSWORD 'unterminated",
+    };
+    for (const auto& stmt : bad) {
+        auto m = rig.createUser("x2", "a-long-password-1");
+        m.meta = rig.meta(stmt);
+        const auto a = rig.ddl(std::move(m));
+        EXPECT_EQ(a.code, kInvalidRequest) << stmt;
+    }
+    EXPECT_EQ(rig.recordedEvents().size(), before) << "nothing was appended";
 }
 
 TEST(SecurityWritePathRegression, PrincipalIsTheSessionsAuthenticatedUser) {
@@ -568,6 +694,280 @@ TEST(SecurityWritePathRegression, AQuoteInAGrantPatternCannotForgeASecondStateme
     // Read with SQL quoting, each is ONE statement naming the grant that was applied - nothing outside a literal forges.
     EXPECT_EQ(outsideLiterals(events[1].event.statement), "GRANT READ ON GROUP PREFIX  TO ROLE r;");
     EXPECT_EQ(outsideLiterals(events[2].event.statement), "GRANT READ ON GROUP  TO ROLE r;");
+}
+
+// #527: a raw wire client's pattern may hold any byte.  The recorded statement is a log line every ADMIN reads, so a
+// control byte (newline, ESC, NUL) or a byte >= 0x80 never reaches it raw: it is escaped as \xhh inside the literal.
+namespace {
+bool hasRawControlOrHighByte(const std::string& s) {
+    for (const char ch : s) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (c < 0x20 || c == 0x7f || c >= 0x80) return true;
+    }
+    return false;
+}
+} // namespace
+
+TEST(SecurityWritePathRegression, AControlByteInAGrantPatternNeverReachesTheAuditTextRawAdversarialRegression) {
+    SecurityDdlRig rig("ctl_pattern");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.ddl(rig.createRole("r")).code, 0);
+    const auto a = rig.ddl(rig.grant(false, sec::GranteeKind::Role, "r", sec::Operation::Read, sec::ResourceType::Group,
+                                     sec::PatternKind::Prefix, "a\nGRANT ADMIN ON CLUSTER TO USER mallory; --"));
+    ASSERT_EQ(a.code, 0) << a.detail;
+    const auto events = rig.recordedEvents();
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_FALSE(hasRawControlOrHighByte(events[1].event.statement)) << "raw control byte in the audit text";
+    EXPECT_NE(events[1].event.statement.find("'a\\x0aGRANT ADMIN ON CLUSTER TO USER mallory; --'"), std::string::npos)
+        << events[1].event.statement;
+}
+
+TEST(SecurityWritePathRegression, ARecordedControlBytePatternStaysRevocableRegression) {
+    SecurityDdlRig rig("ctl_revocable");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.ddl(rig.createRole("r")).code, 0);
+    const std::string pattern = "a\tb";
+    auto a = rig.ddl(rig.grant(false, sec::GranteeKind::Role, "r", sec::Operation::Read, sec::ResourceType::Group,
+                               sec::PatternKind::Exact, pattern));
+    ASSERT_EQ(a.code, 0) << a.detail;
+    const auto* role = rig.state().roleByName(rune::catalog::kDefaultNsId, "r");
+    ASSERT_NE(role, nullptr);
+    EXPECT_EQ(role->grants.size(), 1u);
+    a = rig.ddl(rig.grant(true, sec::GranteeKind::Role, "r", sec::Operation::Read, sec::ResourceType::Group,
+                          sec::PatternKind::Exact, pattern));
+    ASSERT_EQ(a.code, 0) << a.detail;
+    role = rig.state().roleByName(rune::catalog::kDefaultNsId, "r");
+    ASSERT_NE(role, nullptr);
+    EXPECT_TRUE(role->grants.empty()) << "the grant is gone";
+    const auto events = rig.recordedEvents();
+    ASSERT_EQ(events.size(), 3u);
+    EXPECT_EQ(events[1].event.statement, "GRANT READ ON GROUP 'a\\x09b' TO ROLE r;");
+    EXPECT_EQ(events[2].event.statement, "REVOKE READ ON GROUP 'a\\x09b' FROM ROLE r;");
+}
+
+// #221: the dedupe fingerprint includes the authenticated principal - a request id is never reusable across principals,
+// and another principal learns nothing from a recorded id.
+namespace {
+rune::node::SecurityDdlMsg asPrincipal(rune::node::SecurityDdlMsg m, const std::string& who) {
+    m.meta.authenticated = who;
+    return m;
+}
+}
+
+TEST(SecurityWritePathRegression, DedupeIsPerPrincipalRegression) {
+    SecurityDdlRig rig("dedupe_principal");
+    rig.becomeServingLeader();
+    const auto mA = rig.createUser("x", "a long enough password", "alice");
+    const auto a = rig.ddl(mA);
+    ASSERT_EQ(a.code, 0) << a.detail;
+    const auto again = rig.ddl(mA);   // a retry by the same principal still works
+    EXPECT_EQ(again.code, 0) << again.detail;
+    EXPECT_EQ(again.objectId, a.objectId);
+    EXPECT_EQ(again.version, a.version);
+    EXPECT_EQ(again.gateOffset, a.gateOffset);
+    const auto b = rig.ddl(asPrincipal(mA, "bob"));
+    EXPECT_EQ(b.code, kInvalidRequest);
+    EXPECT_EQ(b.detail, "requestId reused for a different statement");
+    EXPECT_NE(b.objectId, a.objectId) << "never A's result";
+    auto mC = asPrincipal(mA, "carol");
+    mC.denial = "not authorized: ADMIN on CLUSTER";
+    const auto c = rig.ddl(mC);
+    EXPECT_EQ(c.code, kNotAuthorized);
+    EXPECT_EQ(c.detail, "not authorized: ADMIN on CLUSTER");
+    EXPECT_EQ(c.objectId, 0u);
+    const auto events = rig.recordedEvents();
+    ASSERT_EQ(events.size(), 1u) << "exactly one event for the request id";
+    EXPECT_EQ(events[0].event.principal.authenticated, "alice");
+}
+
+TEST(SecurityWritePathRegression, AnotherPrincipalLearnsNothingFromARecordedRequestIdRegression) {
+    SecurityDdlRig rig("dedupe_nothing");
+    rig.becomeServingLeader();
+    const auto mA = rig.createRole("s1");
+    const auto a = rig.ddl(mA);
+    ASSERT_EQ(a.code, 0) << a.detail;
+    ASSERT_NE(a.objectId, 0u);
+    // B guesses A's statement, then a different valid one on the same id: the two answers are identical.
+    const auto guess = rig.ddl(asPrincipal(mA, "bob"));
+    auto other = rig.createRole("s2");
+    other.meta.requestId = mA.meta.requestId;
+    const auto miss = rig.ddl(asPrincipal(other, "bob"));
+    EXPECT_EQ(guess.code, miss.code);
+    EXPECT_EQ(guess.detail, miss.detail);
+    EXPECT_EQ(guess.objectId, miss.objectId);
+    EXPECT_EQ(guess.version, miss.version);
+    EXPECT_EQ(guess.gateOffset, miss.gateOffset);
+    for (const auto* r : {&guess, &miss}) {
+        EXPECT_EQ(r->code, kInvalidRequest);
+        EXPECT_EQ(r->detail, "requestId reused for a different statement");
+        EXPECT_EQ(r->objectId, 0u);
+        EXPECT_EQ(r->version, 0u);
+        EXPECT_NE(r->gateOffset, a.gateOffset);
+    }
+    // B unauthorized for the statement: the same denial as for a FRESH request id - a recorded id is not observable.
+    const std::string denial = "not authorized: ADMIN on CLUSTER";
+    auto denied = asPrincipal(mA, "bob");
+    denied.denial = denial;
+    const auto onRecorded = rig.ddl(denied);
+    auto fresh = asPrincipal(rig.createRole("s1"), "bob");
+    fresh.denial = denial;
+    const auto onFresh = rig.ddl(fresh);
+    EXPECT_EQ(onRecorded.code, onFresh.code);
+    EXPECT_EQ(onRecorded.detail, onFresh.detail);
+    EXPECT_EQ(onRecorded.objectId, onFresh.objectId);
+    EXPECT_EQ(onRecorded.version, onFresh.version);
+    EXPECT_EQ(onRecorded.gateOffset, onFresh.gateOffset);
+    EXPECT_EQ(onRecorded.code, kNotAuthorized);
+    const auto events = rig.recordedEvents();
+    ASSERT_EQ(events.size(), 1u) << "exactly one event, for the first request id";
+    EXPECT_EQ(events[0].event.principal.authenticated, "admin");
+}
+
+TEST(SecurityWritePathRegression, TheDdlFingerprintCoversThePrincipalRegression) {
+    namespace gw = rune::gateway;
+    static constexpr std::array<uint8_t, 64> kKey{};
+    const gw::VerifierBytes v{{}, 0, kKey, kKey};
+    const auto fp = [&](std::string_view who) {
+        return gw::securityDdlFingerprint("CREATE ROLE r;", 4, "r", 0, 0, 0, v, 0, 0, 0, 0, "", "", who);
+    };
+    EXPECT_NE(fp("alice"), fp("bob"));
+    EXPECT_EQ(fp("alice"), fp("alice"));
+    EXPECT_EQ(fp(""), fp("")) << "in-process mode: an empty principal is stable";
+    EXPECT_NE(fp(""), fp("alice"));
+    EXPECT_NE(fp("ab"), fp("a")) << "the principal is part of the hash, not a prefix collision";
+}
+
+// Issues #218 / #67: the gateway stamps the `__security` offset it authorized against; the admin thread appends only
+// while its applied state is still that one.
+namespace {
+rune::node::SecurityDdlMsg stamped(rune::node::SecurityDdlMsg m, int64_t offset) {
+    m.meta.securityStamped = true;
+    m.meta.securityOffset  = offset;
+    return m;
+}
+}
+
+TEST(SecurityWritePathRegression, AStaleAuthorizationStampIsRetriedNotAppendedRegression) {
+    SecurityDdlRig rig("stale_stamp");
+    rig.becomeServingLeader();
+    for (const char* who : {"root", "bob"}) {   // another admin stays: bob's REVOKE ADMIN is no last-admin refusal
+        ASSERT_EQ(rig.ddl(rig.createUser(who, "a long enough password")).code, 0);
+        ASSERT_EQ(rig.ddl(rig.grant(false, sec::GranteeKind::User, who, sec::Operation::Admin,
+                                    sec::ResourceType::Cluster, sec::PatternKind::Exact, "")).code, 0);
+    }
+    const int64_t stampS = rig.state().appliedOffset();   // bob's DDL is authorized here: he holds ADMIN
+    // stamp == applied: proceeds.
+    const auto ok = rig.ddl(stamped(rig.createRole("r_ok"), stampS));
+    ASSERT_EQ(ok.code, 0) << ok.detail;
+    // REVOKE ADMIN from bob lands first (the gateway's mirror has not seen it yet).
+    const int64_t stampBeforeRevoke = rig.state().appliedOffset();
+    ASSERT_EQ(rig.ddl(rig.grant(true, sec::GranteeKind::User, "bob", sec::Operation::Admin,
+                                sec::ResourceType::Cluster, sec::PatternKind::Exact, "")).code, 0);
+    const std::size_t logged = rig.recordedEvents().size();
+    auto bobs = stamped(rig.createRole("r_stale"), stampBeforeRevoke);
+    bobs.meta.authenticated = "bob";
+    const auto stale = rig.ddl(bobs);
+    EXPECT_EQ(stale.code, kNotLeader) << stale.detail;
+    EXPECT_EQ(stale.detail, "the security state changed while this request was in flight; retry");
+    EXPECT_EQ(rig.recordedEvents().size(), logged) << "nothing was appended for the stale request";
+    EXPECT_EQ(rig.state().roleByName(0, "r_stale"), nullptr);
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 1u);
+    // The retry (same request id) carries the current stamp - the gateway authorized it afresh - and applies once.
+    bobs.meta.securityOffset = rig.state().appliedOffset();
+    bobs.corr = rig.nextCorr();
+    const auto retry = rig.ddl(bobs);
+    EXPECT_EQ(retry.code, 0) << retry.detail;
+    EXPECT_EQ(rig.recordedEvents().size(), logged + 1);
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 1u);
+    // A stamp beyond the applied offset cannot happen (the mirror trails the applier): treated as stale too.
+    const auto ahead = rig.ddl(stamped(rig.createRole("r_ahead"), rig.state().appliedOffset() + 1));
+    EXPECT_EQ(ahead.code, kNotLeader);
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 2u);
+    // An unstamped request (authorization off / in-process) proceeds whatever the applied offset.
+    EXPECT_EQ(rig.ddl(rig.createRole("r_unstamped")).code, 0);
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 2u);
+}
+
+TEST(SecurityWritePathRegression, ARecordedRequestIsAnsweredBeforeTheStampIsCheckedRegression) {
+    SecurityDdlRig rig("stale_dedupe");
+    rig.becomeServingLeader();
+    const auto m = rig.createRole("r1");
+    const auto first = rig.ddl(stamped(m, rig.state().appliedOffset()));
+    ASSERT_EQ(first.code, 0) << first.detail;
+    ASSERT_EQ(rig.ddl(rig.createRole("r2")).code, 0);   // the state moves on
+    const std::size_t logged = rig.recordedEvents().size();
+    auto retry = stamped(m, first.gateOffset - 1);       // a stale stamp on a recorded request id
+    retry.corr = rig.nextCorr();
+    const auto again = rig.ddl(retry);
+    EXPECT_EQ(again.code, 0) << "the ORIGINAL result, not a retry: " << again.detail;
+    EXPECT_EQ(again.objectId, first.objectId);
+    EXPECT_EQ(rig.recordedEvents().size(), logged);
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 0u);
+}
+
+// Per principal: only an event that could have changed what THIS user may do makes a stamped request stale.
+TEST(SecurityWritePathRegression, AnEventAboutAnotherUserDoesNotStaleAStampedRequestRegression) {
+    SecurityDdlRig rig("stale_other_user");
+    rig.becomeServingLeader();
+    for (const char* who : {"alice", "bob"}) ASSERT_EQ(rig.ddl(rig.createUser(who, "a long enough password")).code, 0);
+    const int64_t stamp = rig.state().appliedOffset();
+    ASSERT_EQ(rig.ddl(rig.grant(false, sec::GranteeKind::User, "alice", sec::Operation::Read, sec::ResourceType::Topic,
+                                sec::PatternKind::Exact, "t")).code, 0);   // about alice, after the stamp
+    auto bobs = stamped(rig.createRole("r1"), stamp);
+    bobs.meta.authenticated = "bob";
+    const auto a = rig.ddl(bobs);
+    EXPECT_EQ(a.code, 0) << a.detail;
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 0u);
+    // A role-side change makes stale only the role's MEMBERS: bob is no member of r1, so his request proceeds ...
+    const int64_t stamp2 = rig.state().appliedOffset();
+    ASSERT_EQ(rig.ddl(rig.grant(false, sec::GranteeKind::Role, "r1", sec::Operation::Read, sec::ResourceType::Topic,
+                                sec::PatternKind::Exact, "t")).code, 0);
+    auto bobAgain = stamped(rig.createRole("r2"), stamp2);
+    bobAgain.meta.authenticated = "bob";
+    const auto b = rig.ddl(bobAgain);
+    EXPECT_EQ(b.code, 0) << b.detail;
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 0u);
+    // ... and once he is a member, the next grant to r1 makes his older stamp stale.
+    ASSERT_EQ(rig.ddl(rig.grantRole(false, "bob", "r1")).code, 0);
+    const int64_t stamp3 = rig.state().appliedOffset();
+    ASSERT_EQ(rig.ddl(rig.grant(true, sec::GranteeKind::Role, "r1", sec::Operation::Read, sec::ResourceType::Topic,
+                                sec::PatternKind::Exact, "t")).code, 0);
+    auto bobMember = stamped(rig.createRole("r4"), stamp3);
+    bobMember.meta.authenticated = "bob";
+    EXPECT_EQ(rig.ddl(bobMember).code, kNotLeader);
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 1u);
+    // An unknown principal (anonymous) is stale on any change.
+    EXPECT_EQ(rig.ddl(stamped(rig.createRole("r3"), stamp3)).code, kNotLeader) << "\"admin\" was never created here";
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 2u);
+}
+
+TEST(SecurityWritePathRegression, AStaleDenialBecomesARetryNotA45Regression) {
+    SecurityDdlRig rig("stale_denial");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.ddl(rig.createUser("bob", "a long enough password")).code, 0);
+    const int64_t stamp = rig.state().appliedOffset();
+    auto denied = stamped(rig.createRole("r1"), stamp);
+    denied.meta.authenticated = "bob";
+    denied.denial = "not authorized: ADMIN on CLUSTER";
+    const auto fresh = rig.ddl(denied);   // stamp == applied: the denial stands
+    EXPECT_EQ(fresh.code, kNotAuthorized);
+    EXPECT_EQ(fresh.detail, "not authorized: ADMIN on CLUSTER");
+    // A GRANT to bob lands after the stamp: the denial may be obsolete, so the answer is the retry, not 45.
+    ASSERT_EQ(rig.ddl(rig.grant(false, sec::GranteeKind::User, "bob", sec::Operation::Admin, sec::ResourceType::Cluster,
+                                sec::PatternKind::Exact, "")).code, 0);
+    auto again = denied;
+    again.corr = rig.nextCorr();
+    again.meta.requestId = {0x5EC1, 9999};
+    const auto stale = rig.ddl(again);
+    EXPECT_EQ(stale.code, kNotLeader) << stale.detail;
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 1u);
+}
+
+// The owning meta and the security message agree on the caller's namespace (the fence reads the meta's).
+TEST(SecurityWritePathRegression, TheMetaAndTheSecurityMessageAgreeOnTheCallersNamespaceRegression) {
+    SecurityDdlRig rig("stale_ns_agree");
+    auto m = rig.createRole("r1");
+    EXPECT_EQ(m.meta.callerNsId, m.callerNsId);
 }
 
 TEST(CheckedWritesImportGrant, GrantImportBelowLevelFiveIsRefused) {

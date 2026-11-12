@@ -57,6 +57,7 @@ uint8_t clusterOps(std::span<const GrantSpec> grants) noexcept {
 }
 
 uint8_t opsOn(std::span<const GrantSpec> grants, ResourceType type, std::string_view name) noexcept {
+    if (type == ResourceType::Cluster) return clusterOps(grants);   // #224: one definition, no implied DESCRIBE
     const bool internal = type != ResourceType::Cluster && name.starts_with("__");   // I6
     // Root: every operation on the cluster and on every user topic / view / group / transactional id.  An internal
     // object stays at what an explicit cluster grant gives (below), and a NAMESPACE grant is never implied (it decides
@@ -73,7 +74,9 @@ uint8_t opsOn(std::span<const GrantSpec> grants, ResourceType type, std::string_
     if (type == ResourceType::Topic || type == ResourceType::View) bits = static_cast<uint8_t>(bits | (cluster & kObjectOps));
     else if (type == ResourceType::Group || type == ResourceType::TransactionalId)
         bits = static_cast<uint8_t>(bits | (cluster & opBit(Operation::Describe)));
-    if (bits != 0) bits = static_cast<uint8_t>(bits | opBit(Operation::Describe));   // D15
+    // D15: any operation on an object (topic, view, group, transactional id, namespace) implies DESCRIBE on it.  Not
+    // the cluster (returned above): its operations are exactly clusterOps (#224).
+    if (bits != 0) bits = static_cast<uint8_t>(bits | opBit(Operation::Describe));
     return bits;
 }
 

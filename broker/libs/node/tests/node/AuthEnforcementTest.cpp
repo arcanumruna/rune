@@ -1,7 +1,9 @@
 // AuthEnforcementTest.cpp - authentication Task 12 against ONE real authenticating BrokerNode (real Aeron UDP, raw
 // frames): every row of the §2.1 enforcement map, granted -> the request's normal answer, not granted -> code 45 in the
 // request's OWN response type.  A user per test, holding exactly the grants the row names.
+#include "support/AuthLogReader.h"
 #include "support/AuthRig.h"
+#include <rune/catalog/CatalogEvent.h>
 #include <rune/protocol/ProducerIdBinding.h>
 
 #include <algorithm>
@@ -46,6 +48,36 @@ TEST(AuthEnforcementRegression, CatalogReadsNeedDescribeOnClusterRegression) {
     const int64_t readAll = r.newUser({prefix(SO::Read, ST::Topic, "")});
     EXPECT_EQ(r.catalogSubscribe(may), kOk);
     EXPECT_EQ(r.catalogSubscribe(readAll), kNotAuthorized) << "READ on every topic is not DESCRIBE ON CLUSTER (D21)";
+}
+
+// Issue #220: the catalog read is ONE check, DESCRIBE ON CLUSTER (D21), not a per-object filter.  A topic-level
+// DESCRIBE refuses the subscribe (45) yet GetTopicSchema on that topic still answers; a cluster-DESCRIBE holder with
+// no per-object grant is pushed events naming orders AND secret.  (The cluster-yes / READ-all-no half is pinned by
+// CatalogReadsNeedDescribeOnClusterRegression above.)
+TEST(AuthEnforcementRegression, CatalogReadNeedsDescribeOnClusterNotPerObjectRegression) {
+    AuthRig r;
+    const int64_t perObject = r.newUser({exact(SO::Describe, ST::Topic, "orders")});
+    const int64_t onCluster = r.newUser({cluster(SO::Describe)});
+    EXPECT_EQ(r.catalogSubscribe(perObject), kNotAuthorized) << "DESCRIBE on one topic is not a catalog read";
+    EXPECT_EQ(r.getTopicSchema(perObject, "orders"), kOk) << "the per-object request still answers";
+
+    const int64_t corr = r.c().sendCatalogSubscribe(r.ch(), r.stream(), onCluster, 0);
+    ASSERT_NE(corr, 0);
+    const auto code = r.c().awaitSubscribeCode(corr, AuthRig::dl(15));
+    ASSERT_TRUE(code.has_value());
+    ASSERT_EQ(*code, kOk);
+    const auto subId = r.c().subscriptionIdOf(corr);
+    ASSERT_TRUE(subId.has_value());
+    const auto sawName = [&](const std::string& name) {
+        for (const auto& rec : r.c().records()) {
+            if (rec.subscriptionId != *subId) continue;
+            const std::string bytes(rec.bytes.begin(), rec.bytes.end());
+            if (bytes.find(name) != std::string::npos) return true;
+        }
+        return false;
+    };
+    EXPECT_TRUE(r.c().pollUntil([&] { return sawName("orders") && sawName("secret"); }))
+        << "a cluster-DESCRIBE holder sees every catalog object, with no per-object grant on any";
 }
 
 TEST(AuthEnforcementRegression, SecurityReadsNeedAdminOnClusterRegression) {
@@ -388,8 +420,10 @@ TEST(AuthEnforcementRegression, GetTopicSchemaAllowedAndDenied) {
 // object's OWN kind's grant answers it (#128): READ on a view named like the topic, or on a topic named like the view,
 // opens nothing; READ on a view's source topic does not open the view.  A system topic is never reachable through a
 // topic / view grant (even READ TOPIC prefix ''), and DESCRIBE ON CLUSTER sees it as missing (UnknownTopic), as any
-// name that is no catalog object.  RED: drop the own-kind branch (#128) of authorizeTopicOrViewName - the wrong-kind
-// grants are served.
+// name that is no catalog object.  #505: a wrong-kind grant holder gets exactly the answer of a missing name
+// (UnknownTopic), so the answer never tells a hidden object from an absent one; a holder of no grant on the name under
+// either kind still gets 45.  RED: drop the kind check in AdminWorker::submitGetSchema - the wrong-kind grants are
+// served.
 TEST(AuthEnforcementRegression, GetTopicSchemaAnswersPerTheObjectsOwnKindAcrossTopicKindsRegression) {
     AuthRig r;
     const int kUnknown = static_cast<int>(pc::ErrorCode::UnknownTopic);
@@ -405,14 +439,19 @@ TEST(AuthEnforcementRegression, GetTopicSchemaAnswersPerTheObjectsOwnKindAcrossT
     // A data topic.
     EXPECT_EQ(r.getTopicSchema(readOrders, "orders"), kOk);
     EXPECT_EQ(r.getTopicSchema(allTopics, "orders"), kOk);
-    EXPECT_EQ(r.getTopicSchema(viewNamedOrders, "orders"), kNotAuthorized) << "a VIEW grant on a topic's name";
-    EXPECT_EQ(r.getTopicSchema(allViews, "orders"), kNotAuthorized);
+    EXPECT_EQ(r.getTopicSchema(viewNamedOrders, "orders"), kUnknown) << "a VIEW grant on a topic's name";
+    EXPECT_EQ(r.getTopicSchema(allViews, "orders"), kUnknown);
     // A view (its sink topic is addressed by the view's name).
     EXPECT_EQ(r.getTopicSchema(readBoard, "board"), kOk);
     EXPECT_EQ(r.getTopicSchema(allViews, "board"), kOk);
-    EXPECT_EQ(r.getTopicSchema(topicNamedBoard, "board"), kNotAuthorized) << "a TOPIC grant on a view's name";
-    EXPECT_EQ(r.getTopicSchema(allTopics, "board"), kNotAuthorized);
-    EXPECT_EQ(r.getTopicSchema(readOrders, "board"), kNotAuthorized) << "READ on the source is not READ on the view";
+    EXPECT_EQ(r.getTopicSchema(topicNamedBoard, "board"), kUnknown) << "a TOPIC grant on a view's name";
+    EXPECT_EQ(r.getTopicSchema(allTopics, "board"), kUnknown);
+    EXPECT_EQ(r.getTopicSchema(readOrders, "board"), kNotAuthorized)
+        << "READ on the source is not READ on the view: no grant on the name";
+    const int64_t none = r.newUser({});
+    EXPECT_EQ(r.getTopicSchema(none, "orders"), kNotAuthorized) << "no grant under either kind: 45, object or not";
+    EXPECT_EQ(r.getTopicSchema(none, "board"), kNotAuthorized);
+    EXPECT_EQ(r.getTopicSchema(none, "absent"), kNotAuthorized);
     // The system topics.
     for (const char* sys : {"__security", "__catalog", "__consumer_offsets", "__transaction_state"}) {
         EXPECT_EQ(r.getTopicSchema(allTopics, sys), kNotAuthorized) << sys;
@@ -422,6 +461,19 @@ TEST(AuthEnforcementRegression, GetTopicSchemaAnswersPerTheObjectsOwnKindAcrossT
     }
     EXPECT_EQ(r.getTopicSchema(describeCluster, "orders"), kOk);
     EXPECT_EQ(r.getTopicSchema(describeCluster, "board"), kOk);
+}
+
+// #504: the gateway's object index lags the admin thread, so a just-created topic can still look "unknown" there and
+// a VIEW grant used to pass for it.  The gateway now only sends the kinds the grants allow (the gateway-level pin is
+// AuthUnappliedTopicRegression.AViewGrantNeverDescribesAJustCreatedTopicRegression, which holds the index behind) and
+// the admin thread serves a topic only to a caller allowed the topic kind; together they close the window.
+TEST(AuthEnforcementRegression, AViewGrantNeverDescribesAJustCreatedTopicRegression) {
+    AuthRig r;
+    const int64_t viewOnly = r.newUser({prefix(SO::Describe, ST::View, "pay")});
+    ASSERT_GE(r.defineTopic(r.builder, "payments", /*typed=*/true), 0);
+    for (int i = 0; i < 20; ++i)   // the window is short: probe it repeatedly, never a schema
+        EXPECT_NE(r.getTopicSchema(viewOnly, "payments"), kOk) << "attempt " << i;
+    EXPECT_EQ(r.getTopicSchema(viewOnly, "payments"), static_cast<int>(pc::ErrorCode::UnknownTopic));
 }
 
 TEST(AuthEnforcementRegression, DefineTopicAndCreateSchemaAllowedAndDenied) {
@@ -478,6 +530,42 @@ TEST(AuthEnforcementRegression, CreateViewOverAnUnreadableSourceIsNotAuthorizedR
     EXPECT_EQ(r.createViewCode(may, "leak", r.orders), kOk);
     const int64_t alterer = r.newUser({exact(SO::Alter, ST::View, "board"), exact(SO::Read, ST::Topic, "orders")});
     EXPECT_EQ(r.alterViewCode(alterer, "board", r.secret), kNotAuthorized) << "AlterView likewise";
+}
+
+// Issue #223 (D19): the creator's READ on every source is checked at CREATE VIEW / ALTER VIEW only.  Afterwards a view
+// is a cluster object: alice loses READ on `payments` and the view keeps folding it for a reader that holds READ on the
+// view; alice's own ALTER VIEW is refused 45 (checked again, against the alterer) and her own subscription to
+// `payments` is ended.
+TEST(AuthEnforcementRegression, AViewKeepsReadingAfterItsCreatorLostReadOnASourceRegression) {
+    AuthRig r;
+    const int32_t payments = r.defineTopic(r.builder, "payments");
+    ASSERT_GE(payments, 0);
+    std::string aliceName;
+    const int64_t alice = r.newUser({exact(SO::Create, ST::View, "v_pay"), exact(SO::Alter, ST::View, "v_pay"),
+                                     exact(SO::Read, ST::Topic, "payments")}, &aliceName);
+    const int64_t reader = r.newUser({exact(SO::Read, ST::View, "v_pay")});
+    const int64_t writer = r.newUser({exact(SO::Write, ST::Topic, "payments")});
+    const int32_t viewId = r.createView(alice, "v_pay", payments);
+    ASSERT_GE(viewId, 0);
+    const int64_t subCorr = r.c().sendSubscribe(r.ch(), r.stream(), alice, payments, 0);
+    ASSERT_EQ(r.c().awaitSubscribeCode(subCorr, AuthRig::dl()), std::optional<int16_t>(kOk));
+
+    ASSERT_EQ(r.broker().admin().revoke(r.ch(), r.broker().adminSession(), aliceName, false, SO::Read, ST::Topic,
+                                        rune::protocol::SecurityPatternKind::Exact, "payments").errorCode, 0);
+    ASSERT_EQ(r.produce(writer, payments, /*untilOk=*/true), kOk);
+
+    int status = kNoAnswer;
+    for (int i = 0; i < 400 && status != kOk; ++i) {   // bounded: the fold is asynchronous
+        status = r.getViewRow(reader, viewId);
+        if (status != kOk) (void)r.c().pollFor(std::chrono::milliseconds(25), [] { return false; });
+    }
+    EXPECT_EQ(status, kOk) << "the reader still receives the folded row through the view";
+    EXPECT_EQ(r.alterViewCode(alice, "v_pay", payments), kNotAuthorized) << "an ALTER VIEW is checked again";
+    EXPECT_TRUE(r.c().pollUntil([&] {
+        for (const auto& e : r.c().errors())
+            if (e.correlationId == subCorr) return true;   // the subscription completes with an error
+        return false;
+    })) << "alice's own subscription to payments is ended";
 }
 
 TEST(AuthEnforcementRegression, CreateAndAlterViewOverAnIdNotYetIndexedIsNotAuthorizedRegression) {
@@ -923,6 +1011,25 @@ TEST(AuthEnforcementRegression, RetriesOfAnAppliedOwnChangeAreNotChargedOnTheThr
                             << (login.fin ? login.fin->retryAfterMs : 0u);
 }
 
+// PR #410 re-check (#415): the gateway and the leader compute the SAME request fingerprint for a DDL kind that carries
+// no verifier (DROP PASSWORD).  That parity is what makes an applied DROP PASSWORD retry a true retry at the gateway,
+// so the retries are never charged on the login throttle.
+TEST(AuthEnforcementRegression, RetriesOfAnAppliedOwnDropPasswordAreTrueRetriesAdversarialRegression) {
+    AuthRig r;
+    std::string name;
+    const int64_t self = r.newUser({}, &name);   // logged in with AuthRig::kPw (slot 1)
+    r.broker().addPassword(name, "the-second-password-1");
+    pc::SecurityDdl m; m.sessionId = self; m.kind = pc::SecurityOpKind::AlterUser; m.name = name;
+    m.change = pc::UserChangeKind::DropPassword; m.passwordIndex = 1;
+    const std::string st = "ALTER USER " + name + " DROP PASSWORD 1;";
+    r.wire().pinRequestId(rune::protocol::RequestId{0x5157, 0xDDDD});
+    ASSERT_EQ(r.wire().securityDdl(r.ch(), m, st).errorCode, 0u);
+    for (int i = 0; i < 5; ++i) EXPECT_EQ(r.wire().securityDdl(r.ch(), m, st).errorCode, 0u) << "retry " << i;
+    r.wire().pinRequestId(std::nullopt);
+    const auto login = r.broker().wire().connectAndLogin(r.ch(), name, "the-second-password-1");
+    EXPECT_TRUE(login.ok()) << "the retries were not charged: code " << login.errorCode();
+}
+
 // PR #410 review F1, the whole bug class: any security DDL whose gateway check reads state its own first attempt
 // changed.  An admin revoking ITS OWN ADMIN (another admin remains) and retrying with the same request id: the gateway
 // now denies it ADMIN, but the retry gets its original result; a NEW request from it is refused 45.
@@ -1314,7 +1421,9 @@ TEST(AuthEnforcementAdversarialRegression, TheVerifierSlotsAcceptOnlyCurrentPass
 // failure - a bad own-change proof - starts the pair's delay, so the right password, sent at once, is refused with a
 // retry-after.  (Not charged, the pair would hold only the two free failures and the login would succeed.)
 TEST(AuthEnforcementAdversarialRegression, OwnChangeProofsAndLoginsShareOneThrottleAdversarialRegression) {
-    AuthRig r("adv136throttle");
+    AuthBroker::Options slowThrottle;   // #594: "throttled" must not depend on a 250 ms wall-clock gap
+    slowThrottle.configure = [](NodeConfig& c) { c.loginThrottleBaseDelayMsForTest = 10'000; };
+    AuthRig r("adv136throttle", slowThrottle);
     std::string name;
     const int64_t self = r.newUser({}, &name);
     for (int i = 0; i < 2; ++i) {
@@ -1357,4 +1466,45 @@ TEST(AuthEnforcementAdversarialRegression, TheRigsLogsStayWithinTheTestSegmentBo
     EXPECT_LE(largest, static_cast<uintmax_t>(kTestSegmentRollBytes) + (1u << 20))
         << "a file above the 1 MiB test roll (+ index slack): " << largestPath;
     EXPECT_LT(allocated, uintmax_t{24} << 20) << "the rig's logs: " << (allocated >> 20) << " MiB";
+}
+
+// Issue #524: a catalog event's `statement`, client name and `replayedFrom` are the issuing client's claims, recorded as
+// sent; `principal.authenticated` is the broker's, taken from the session.  A client that sends a misleading statement
+// and a replayedFrom naming another principal changes neither the applied ops nor the authenticated principal.
+TEST(AuthEnforcementRegression, ACatalogEventsAuthenticatedPrincipalIsTheSessionsNotTheClientsClaimRegression) {
+    AuthRig r;
+    std::string name;
+    const int64_t sid = r.newUser({prefix(SO::Create, ST::Topic, "p")}, &name);
+    pc::DefineTopic m;
+    m.sessionId = sid; m.correlationId = r.c().nextCorrelationId(); m.topicName = "p.t"; m.partitionCount = 1;
+    m.keyField = "id";
+    const auto blob = authRigCharBlob();
+    m.descriptorBlob = blob.data(); m.descriptorLen = static_cast<uint32_t>(blob.size());
+    m.config = authRigTopicConfig();
+    m.hasExt = true;
+    m.ext.statement = "DROP TOPIC everything;";
+    m.ext.clientName = "mallory-tool";
+    m.ext.hasReplayedFrom = 1;
+    m.ext.replayedClusterId = "x";
+    m.ext.replayedOffset = 7;
+    m.ext.replayedPrincipal = "mallory";
+    std::vector<uint8_t> buf(m.encodedSize());
+    const std::size_t len = m.encode(buf.data());
+    ASSERT_TRUE(r.c().send(r.ch(), r.stream(), buf.data(), len));
+    ASSERT_EQ(r.ddlCode(m.correlationId), kOk);
+
+    const auto events = readCatalogEvents(r.broker().node());
+    const rune::catalog::CatalogEvent* mine = nullptr;
+    for (const auto& e : events)
+        if (e.kind == rune::catalog::EventKind::CreateTopic && e.objectName == "p.t") mine = &e;
+    ASSERT_NE(mine, nullptr) << "the DefineTopic's catalog event";
+    EXPECT_TRUE(std::holds_alternative<rune::catalog::CreateTopicOps>(mine->ops)) << "ops: what was applied";
+    EXPECT_EQ(mine->principal.authenticated, name) << "the principal is the session's user, not the claim";
+    EXPECT_EQ(mine->statement, "DROP TOPIC everything;") << "recorded as sent: a claim";
+    EXPECT_EQ(mine->principal.clientName, "mallory-tool") << "recorded as sent: a claim";
+    ASSERT_TRUE(mine->replayedFrom.has_value());
+    EXPECT_EQ(mine->replayedFrom->clusterId, "x");
+    EXPECT_EQ(mine->replayedFrom->offset, 7);
+    EXPECT_EQ(mine->replayedFrom->principal, "mallory");
+    EXPECT_NE(mine->principal.authenticated, mine->replayedFrom->principal);
 }
