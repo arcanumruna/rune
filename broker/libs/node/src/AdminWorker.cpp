@@ -289,9 +289,11 @@ uint64_t requestFingerprint(const DdlRequest& req) noexcept {
         }
     }, req);
     // Issue #221: the authenticated principal, LAST - a request id is never reusable across principals, so another
-    // principal's (request id, statement) is no retry and learns nothing from the recorded one.  A kind that is never
-    // deduped (MalformedDdl, ListNamespaces) returned above its own fields; its hash is unused.
-    f.s(metaOf(req).authenticated);
+    // principal's (request id, statement) is no retry and learns nothing from the recorded one.  An empty principal
+    // (authentication off: one anonymous principal) hashes nothing, so such a request keeps the fingerprint it had
+    // before #221; a non-empty principal is hashed.  A kind that is never deduped (MalformedDdl, ListNamespaces)
+    // returned above its own fields; its hash is unused.
+    if (const auto& who = metaOf(req).authenticated; !who.empty()) f.s(who);
     return f.h;
 }
 
