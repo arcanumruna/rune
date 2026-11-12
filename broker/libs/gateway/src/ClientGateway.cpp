@@ -10015,6 +10015,15 @@ bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::D
         noteUnanswerable_(buf, len, "topic not applied here yet");
         return true;
     }
+    // #506: the view has not applied every `__security` event this broker holds (one of them may be the grant this
+    // request relies on), so the denial is not a verdict: retriable AuthUnavailable, exactly like #603's behind answer.
+    // Deny path only - nothing is ever allowed on unapplied events.
+    if (securityViewBehind_()) [[unlikely]] {
+        ++deniesDeferredViewBehind_;
+        if (hdr) answerSecurityBehind_(session, *hdr, buf, len);
+        else noteUnanswerable_(buf, len, "denied while the security view is behind");
+        return true;
+    }
     noteDenied_(session, static_cast<pc::TemplateId>(hdr ? hdr->templateId : 0), *denial);
     if (!hdr) return true;   // the caller decoded the body, so this cannot happen; nothing to answer on
     // The DDL family carries the D23 detail text; every other response type has no free-text field.

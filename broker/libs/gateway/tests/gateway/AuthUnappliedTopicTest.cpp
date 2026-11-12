@@ -24,6 +24,8 @@
 #include <rune/protocol/client/Protocol.h>
 #include <rune/gateway/SecurityView.h>
 #include <rune/security/Permissions.h>
+#include <rune/security/SecurityEvent.h>
+#include "support/SecurityEventChain.h"
 
 #include <gtest/gtest.h>
 
@@ -133,6 +135,7 @@ struct Rig {
     int64_t                        sid = 0;
     int64_t                        corr = 100;
     std::vector<std::pair<int64_t, int16_t>> answers;   // (correlation, code)
+    std::string lastDdlDetail;
     bool dispatch = false;   // #603: send through the gateway's whole client-frame dispatch (the request gate included)
 
     explicit Rig(std::vector<sec::GrantSpec> grants = defaultGrants(),
@@ -194,6 +197,12 @@ struct Rig {
             case pc::TemplateId::TopicSchemaResponse:
                 if (auto r = pc::TopicSchemaResponse::decode(b, n))
                     answers.emplace_back(r->correlationId, static_cast<int16_t>(r->errorCode));
+                break;
+            case pc::TemplateId::DdlResponse:   // #506: the DDL family carries its code and detail here
+                if (auto r = pc::DdlResponse::decode(b, n)) {
+                    answers.emplace_back(r->correlationId, static_cast<int16_t>(r->errorCode));
+                    lastDdlDetail = std::string(r->detail);
+                }
                 break;
             case pc::TemplateId::Pong:   // #603: a session-level answer (code 0)
                 answers.emplace_back(h->correlationId, 0);
@@ -691,4 +700,98 @@ TEST(GetViewRowAuthRegression, NoPoolPathAuthorizesBeforeTheGateRegression) {
     EXPECT_EQ(granted.codeOf(granted.getViewRow(kPlaced)), unknownView);
     EXPECT_EQ(granted.codeOf(granted.getViewRowK(kPlaced)), unknownView);
     EXPECT_EQ(granted.codeOf(granted.scanViewRows(kPlaced)), unknownView);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Issue #506: a denial is not a verdict while this broker holds `__security` events its view has not applied (one of
+// them may be the grant the request relies on): retriable AuthUnavailable, never the terminal NotAuthorized.  Deny path
+// only - nothing is ever allowed on unapplied events.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+struct HeldEventsRig : Rig {
+    rune::node::test::SecurityEventChain chain;
+    SecurityView view;
+    static rune::node::test::SecurityEventChain boot() {
+        rune::node::test::SecurityEventChain c;
+        (void)c.createUser("u0");
+        return c;
+    }
+    HeldEventsRig() : Rig(std::vector<sec::GrantSpec>{}), chain(boot()), view(chain.state()) {
+        dispatch = true;
+        gw.setAuthMode(GatewayAuthMode::Required, &view);
+    }
+    int64_t newSession(std::vector<sec::GrantSpec> grants) {
+        const int64_t s = gw.injectTestSession();
+        gw.authenticateWithGrantsForTest(s, 43, std::move(grants));
+        return s;
+    }
+    void applyNextEvent(const char* user) {
+        const auto ev = chain.createUser(user);
+        const auto bytes = sec::encode(ev);
+        ASSERT_TRUE(bytes.has_value());
+        const int64_t off = static_cast<int64_t>(chain.count()) - 1;
+        auto applied = view.onApplied(off, *bytes);
+        ASSERT_TRUE(applied.has_value()) << applied.error().detail;
+        gw.onSecurityApplied(off, *applied);
+    }
+    int64_t dropTopic(std::string_view name) {
+        pc::DropTopic m;
+        m.sessionId = sid; m.correlationId = ++corr; m.topicName = name;
+        std::vector<uint8_t> buf(m.encodedSize());
+        buf.resize(m.encode(buf.data()));
+        (void)gw.applyClientFrameForTest(buf.data(), buf.size());
+        return m.correlationId;
+    }
+    int64_t leo() const { return registry->log(0, 0)->logEndOffset(); }
+};
+}  // namespace
+
+TEST(AuthUnappliedTopicRegression, ADenialWhileTheViewHoldsUnappliedEventsIsRetriableRegression) {
+    HeldEventsRig r;
+    const int64_t applied = r.view.appliedOffset();
+    ASSERT_EQ(r.gw.objectIndex().at(0) != nullptr, true) << "precondition: the topic is applied here";
+    const int64_t leo = r.leo();
+    const int64_t noGrant = r.sid;
+    r.gw.setSecurityKnownEnd(applied + 2);   // one event held by this broker, not applied: the grant may be in it
+    const uint64_t refusedBefore = r.gw.notAuthorizedAnswers();
+
+    // Step 2: the denied produce is retriable, reaches no sink, is not audited as a denial.
+    EXPECT_EQ(r.codeOf(r.produce(0)), kAuthUnavailable);
+    EXPECT_EQ(r.leo(), leo) << "nothing reaches the produce sink";
+    EXPECT_EQ(r.gw.deniesDeferredViewBehind(), 1u);
+    EXPECT_EQ(r.gw.notAuthorizedAnswers(), refusedBefore) << "a non-verdict is not audited as a denial";
+
+    // Step 5: a DDL-family template (own response type, no object name in the detail) and a Subscribe.
+    const auto drop = r.codeOf(r.dropTopic("w.boot"));
+    ASSERT_TRUE(drop.has_value());
+    EXPECT_EQ(*drop, kAuthUnavailable);
+    EXPECT_EQ(r.lastDdlDetail.find("w.boot"), std::string::npos) << "the detail does not name the object";
+    EXPECT_EQ(r.codeOf(r.subscribe(0)), kAuthUnavailable);
+    EXPECT_EQ(r.gw.deniesDeferredViewBehind(), 3u);
+    EXPECT_EQ(r.gw.notAuthorizedAnswers(), refusedBefore);
+
+    // Step 6: a session WITH the grant is not affected (deny path only): its produce is appended.
+    {
+        const int64_t granted = r.newSession(defaultGrants());
+        r.sid = granted;
+        EXPECT_FALSE(r.codeOf(r.produce(0)).has_value()) << "an allowed acks=0 produce is forwarded, never answered";
+        r.sid = noGrant;
+    }
+    EXPECT_EQ(r.gw.deniesDeferredViewBehind(), 3u);
+
+    // Step 3: the event reaches the view (knownEnd stays applied + 2 -> still one held) and the session picks the
+    // grant up: forwarded.
+    r.applyNextEvent("u1");
+    ASSERT_EQ(r.view.appliedOffset(), applied + 1);
+    r.gw.authenticateWithGrantsForTest(noGrant, 42, defaultGrants());
+    EXPECT_FALSE(r.codeOf(r.produce(0)).has_value()) << "forwarded once the grant is applied";
+
+    // Step 4 (control): fully applied view, a session with no grant -> the terminal 45 as today.
+    r.gw.setSecurityKnownEnd(r.view.appliedOffset() + 1);
+    const uint64_t deferred = r.gw.deniesDeferredViewBehind();
+    const uint64_t refusedControl = r.gw.notAuthorizedAnswers();
+    r.sid = r.newSession({});
+    EXPECT_EQ(r.codeOf(r.produce(0)), kNotAuthorized);
+    EXPECT_EQ(r.gw.deniesDeferredViewBehind(), deferred);
+    EXPECT_EQ(r.gw.notAuthorizedAnswers(), refusedControl + 1);
 }

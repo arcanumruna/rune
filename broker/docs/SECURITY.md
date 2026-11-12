@@ -341,6 +341,11 @@ current; otherwise it answers the retriable `AuthUnavailable` (48) and the clien
   `AuthUnavailable`: produce (through the gateway and straight to a worker), subscribe, view reads, group
   and transaction requests, DDL, logins. Nothing is appended and no subscription is pushed until the events
   are applied; then the new grants decide. A revoke this broker has received is never served around.
+  A denial is answered `AuthUnavailable` instead of `NotAuthorized` while this broker holds `__security`
+  events it has not applied. A grant is therefore usable on every in-sync replica as soon as its statement
+  is answered. Two cases still see a short-lived `NotAuthorized` after a fresh grant: a broker outside the
+  `__security` in-sync set (bounded by the staleness limit F), and a produce checked on a shard worker's own
+  ingress (`RUNE_PER_WORKER_INGRESS=true`), which does not have this rule.
 - A broker stale for `RUNE_SECURITY_STALE_SESSION_END_MS` (R, default 10 000) ends its authenticated
   sessions with a session-level `AuthUnavailable`; their clients reconnect to a current broker. Only an
   event the broker has not heard of yet can still be missed by those sessions until then: what a broker

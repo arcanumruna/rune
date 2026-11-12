@@ -501,6 +501,8 @@ public:
     [[nodiscard]] bool workersSecurityBehindForTest() const noexcept { return workersBehind_; }
     [[nodiscard]] int64_t sessionTimeoutNsForTest() const noexcept { return sessionTimeoutNs_; }
     [[nodiscard]] uint64_t securityBehindRefusals() const noexcept { return securityBehindRefusals_; }
+    /// #506: denials answered AuthUnavailable (not NotAuthorized) because the view had not applied every held event.
+    [[nodiscard]] uint64_t deniesDeferredViewBehind() const noexcept { return deniesDeferredViewBehind_; }
     /// Issues #15 / #111: this broker stayed stale longer than R - every authenticated / must-change-password session
     /// is told AuthUnavailable at session level (corr 0) and closed; its client reconnects to a current broker.
     void endSessionsSecurityUnavailable();
@@ -2866,6 +2868,7 @@ private:
     int64_t  behindClearNeedsOffset_ = -1;   ///< #608: the newest event pending enforcement when the flag cleared
     bool     workersBehind_  = false;           ///< #603: the value last shipped to the workers
     uint64_t securityBehindRefusals_ = 0;       ///< #603: requests answered 48 for it
+    uint64_t deniesDeferredViewBehind_ = 0;     ///< #506: denials answered 48 while the view held unapplied events
     /// #603: ship the behind flag to the workers when it changed - a clear once every event pending at the clear is
     /// enforced (#608).
     int syncWorkersBehind_();
