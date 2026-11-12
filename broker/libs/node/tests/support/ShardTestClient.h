@@ -713,9 +713,9 @@ public:
         for (const ErrorSeen& e : errors_) n += e.correlationId == corr ? 1u : 0u;
         return n;
     }
-    int64_t sendGetTopicSchema(const std::string& ch, int32_t stream, int64_t sid, std::string_view name) {
+    int64_t sendGetTopicSchema(const std::string& ch, int32_t stream, int64_t sid, std::string_view name, uint64_t fingerprint = 0) {
         pc::GetTopicSchema m;
-        m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.requestedFingerprint = 0;
+        m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.requestedFingerprint = fingerprint;
         std::vector<uint8_t> buf(m.encodedSize());
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;

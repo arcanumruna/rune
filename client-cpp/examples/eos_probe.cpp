@@ -281,7 +281,7 @@ void fail(const char* tag, const std::string& msg) { std::fprintf(stderr, "%s: F
 // describe the topic (a non-zero error code, or a thrown error): a broken broker setup must fail the run (#688).
 bool topicMatchesBroker(Client& c, const char* tag, const char* name, const TopicHandle& t) {
     try {
-        const TopicSchemaResult r = c.getTopicSchemaAndWait(name);
+        const TopicSchemaResult r = c.getTopicSchemaAndWait(name, rune::protocol::client::kSchemaKindFingerprint);   // the form that also describes an untyped topic
         if (r.errorCode != 0) {
             fail(tag, std::string("the broker did not describe '") + name + "' (error " + std::to_string(r.errorCode) + ")");
             return false;
