@@ -3036,6 +3036,24 @@ Log::RepairCommitStatus Log::commitSegmentRepair() {
     return ok ? RepairCommitStatus::Ok : RepairCommitStatus::Rejected;
 }
 
+std::optional<Log::DamagedSegmentInfo> Log::firstDamagedSegment() const noexcept {
+    for (auto it = segments_.begin(); it != segments_.end(); ++it) {
+        auto nx = std::next(it);
+        if (nx == segments_.end()) break;   // the active segment is never damaged
+        if (it->second && it->second->damaged())
+            return DamagedSegmentInfo{it->first, it->second->damage()->offset, nx->first};
+    }
+    return std::nullopt;
+}
+
+bool Log::segmentRepairValid() const noexcept {
+    if (!repair_) return false;
+    const auto it = segments_.find(repair_->base);
+    if (it == segments_.end() || !it->second || !it->second->damaged()) return false;
+    if (std::next(it) == segments_.end()) return false;
+    return it->second->tsLineage() == repair_->lineage;
+}
+
 void Log::abortSegmentRepair() noexcept {
     if (!repair_) return;
     if (repair_->fd >= 0) ::close(repair_->fd);

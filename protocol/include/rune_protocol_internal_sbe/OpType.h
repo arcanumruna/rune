@@ -75,6 +75,8 @@ public:
         SCAN_LEASES = static_cast<std::uint8_t>(39),
         NS_LEASES_OVER = static_cast<std::uint8_t>(40),
         TRANSIENT_LINEAGE = static_cast<std::uint8_t>(41),
+        REPAIR_FETCH_REQ = static_cast<std::uint8_t>(42),
+        REPAIR_FETCH_RESP = static_cast<std::uint8_t>(43),
         TEST_TASK = static_cast<std::uint8_t>(200),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
@@ -125,6 +127,8 @@ public:
             case static_cast<std::uint8_t>(39): return SCAN_LEASES;
             case static_cast<std::uint8_t>(40): return NS_LEASES_OVER;
             case static_cast<std::uint8_t>(41): return TRANSIENT_LINEAGE;
+            case static_cast<std::uint8_t>(42): return REPAIR_FETCH_REQ;
+            case static_cast<std::uint8_t>(43): return REPAIR_FETCH_RESP;
             case static_cast<std::uint8_t>(200): return TEST_TASK;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
@@ -178,6 +182,8 @@ public:
             case SCAN_LEASES: return "SCAN_LEASES";
             case NS_LEASES_OVER: return "NS_LEASES_OVER";
             case TRANSIENT_LINEAGE: return "TRANSIENT_LINEAGE";
+            case REPAIR_FETCH_REQ: return "REPAIR_FETCH_REQ";
+            case REPAIR_FETCH_RESP: return "REPAIR_FETCH_RESP";
             case TEST_TASK: return "TEST_TASK";
             case NULL_VALUE: return "NULL_VALUE";
         }

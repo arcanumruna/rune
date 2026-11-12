@@ -872,6 +872,13 @@ public:
     }
     /// <base20>.log.repair — the side file of a repair.
     static std::string repairLogPath(const std::string& dir, int64_t base);
+    /// The lowest damaged, non-active segment: where it starts, where its valid prefix ends and where it ends (the next
+    /// segment's base).  nullopt when none.  Cold, O(segments); owner thread.
+    struct DamagedSegmentInfo { int64_t base = 0; int64_t damageOffset = 0; int64_t endOffset = 0; };
+    [[nodiscard]] std::optional<DamagedSegmentInfo> firstDamagedSegment() const noexcept;
+    /// True while the repair in flight can still be committed: its segment exists, is damaged, is not the active one
+    /// and is the incarnation the repair began on.  False when none is in flight.  Owner thread.
+    [[nodiscard]] bool segmentRepairValid() const noexcept;
 
     /// CP-9 SPSC consumer (owner thread): validate retention proposals; for each
     /// valid one rename its files to *.deleted, erase it from segments_ and

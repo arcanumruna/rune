@@ -200,6 +200,13 @@ struct WorkerOp {
         // partition, nextOffset = the leader epoch, correlationId = the lineage token (uint64 bit-cast to int64), hwBound = the
         // lineage generation.  No tail.  (41 = TRANSIENT_LINEAGE.)
         TransientLineage          = 41, ///< control → worker: the committed data lineage of a transient lease partition
+        // #880 (segment repair), Aeron-transport USER partitions: transport -> the owning worker.  RepairFetchReq
+        // reuses fetchRequestPayload (fetchOffset = the cursor, incarnation = the attempt id) + hwBound = the
+        // exclusive end offset; RepairFetchResp reuses replicatedPayload (errorCode = the status, logStartOffset =
+        // the attempt id echoed, records) + nextOffset = the cursor echoed.  Ownership-gated like
+        // ReconcileFetchReq / ReconcileFetchResp.
+        RepairFetchReq            = 42, ///< transport → worker: a peer serves a repair pull
+        RepairFetchResp           = 43, ///< transport → worker: the repairing replica applies a peer's answer
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the

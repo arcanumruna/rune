@@ -1974,6 +1974,273 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg&)
 }
 
 // ---------------------------------------------------------------------------
+// #880: segment repair.  Responder (onRepairRequest) + requester (serviceRepair_ / applyRepairResponse).
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int64_t kRepairCheckEveryNs = 1'000'000'000LL;   // idle: look for a damaged segment this often (cold)
+constexpr int64_t kRepairTimeoutNs    = 2'000'000'000LL;   // an unanswered request: next peer
+constexpr int64_t kRepairBackoffNs    = 1'000'000'000LL;   // every peer failed: wait before another round
+}  // namespace
+
+void PartitionReplica::onRepairRequest(const FetchRequestMsg& req)
+{
+    if (req.topicId != cfg_.topicId || req.partition != cfg_.partitionId) return;
+    if (req.followerId == cfg_.selfId) return;
+    // The asker must be a replica of this partition: a repair serves committed bytes to the replica set only.
+    const bool known = std::find(configuredReplicas_.begin(), configuredReplicas_.end(), req.followerId) !=
+                       configuredReplicas_.end();
+    const Offset hw = highWatermark();
+    auto answer = [&](int16_t status, std::span<const uint8_t> records) {
+        FetchResponseMsg r{};
+        r.leaderEpoch    = epoch_;
+        r.partition      = cfg_.partitionId;
+        r.highWatermark  = hw;
+        r.logStartOffset = req.incarnation;     // the asker's attempt id, echoed
+        r.errorCode      = status;
+        r.topicId        = cfg_.topicId;
+        r.records        = records;
+        r.fromOffset     = req.fetchOffset;     // the cursor, echoed
+        if (status == kRepairRefused) ++repairRefused_; else ++repairServed_;
+        // Not owed: the asker's timeout moves it on to the next peer.
+        (void)onTransport([&](auto& t) { return t.sendRepairResponse(req.followerId, r); });
+    };
+    if (!known || memoryBacked_ || diskLog_ == nullptr) return answer(kRepairRefused, {});
+    const Offset from = req.fetchOffset;
+    const Offset end  = req.lastEpochStartOffset;
+    if (from < 0 || end < 0) return answer(kRepairRefused, {});
+    if (from >= end) return answer(kRepairDone, {});
+    // Only committed bytes: never above THIS replica's high watermark.  hw < end means the range is not fully
+    // committed here: serve what is below it, then refuse (the asker tries another peer).
+    const Offset bound = std::min(end, hw);
+    if (from >= bound) return answer(kRepairRefused, {});
+    int64_t frame = std::numeric_limits<int64_t>::max();
+    onTransport([&](auto& t) { frame = t.maxFetchRecordsBytes(); });
+    const int64_t cap = std::min<int64_t>(req.maxBytes > 0 ? req.maxBytes : cfg_.maxFetchBytes, frame);
+    const std::size_t kOverhead = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+    Offset cur = from;
+    for (int hop = 0; hop < 64; ++hop) {   // one pass per segment the range crosses
+        if (diskLog_->damageAt(cur)) return answer(kRepairRefused, {});
+        rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
+        const rune::storage::LogReadView v =
+            readLog_(cur, static_cast<int32_t>(std::min<int64_t>(cap, INT32_MAX)), &st);
+        if (v.empty()) {
+            if (st != rune::storage::ReadIntoStatus::Absent) return answer(kRepairRefused, {});   // damaged / failed
+            // Nothing at or after `cur` in that segment: continue at the next segment's base.
+            Offset nextBase = -1;
+            for (int64_t b : diskLog_->segmentBaseOffsets()) if (b > cur) { nextBase = b; break; }
+            if (nextBase < 0 || nextBase >= bound) return answer(bound == end ? kRepairDone : kRepairRefused, {});
+            cur = nextBase;
+            continue;
+        }
+        std::size_t pos = 0, start = 0, served = 0;
+        bool stopped = false, crossesEnd = false;
+        Offset viewEnd = cur;
+        while (pos + kOverhead <= v.len) {
+            rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
+            const int32_t total = r.totalLength();
+            if (total <= 0 || pos + static_cast<std::size_t>(total) > v.len) break;
+            const Offset base = r.baseOffset();
+            const Offset last = base + r.lastOffsetDelta();
+            viewEnd = std::max(viewEnd, last + 1);
+            if (base < from) { pos += static_cast<std::size_t>(total); continue; }   // below the cursor: never served
+            if (base >= bound) { stopped = true; break; }
+            if (last >= end) { stopped = true; crossesEnd = true; break; }   // this copy's batching crosses the end
+            if (served > 0 && served + static_cast<std::size_t>(total) > static_cast<std::size_t>(cap)) break;
+            if (static_cast<int64_t>(total) > frame) return answer(kRepairRefused, {});   // cannot be framed
+            if (served == 0) start = pos;
+            pos += static_cast<std::size_t>(total);
+            served = pos - start;
+        }
+        if (served > 0) return answer(kErrNone, std::span<const uint8_t>(v.data + start, served));
+        if (crossesEnd) return answer(kRepairRefused, {});
+        // The next batch at or above the cursor is at or above the bound: nothing below the end remains here.
+        if (stopped) return answer(bound == end ? kRepairDone : kRepairRefused, {});
+        if (viewEnd <= cur) return answer(kRepairRefused, {});   // no progress: never loop
+        cur = viewEnd;   // every batch of this view lay below the cursor: read on
+    }
+    return answer(kRepairRefused, {});
+}
+
+std::vector<NodeId> PartitionReplica::repairPeers_() const
+{
+    std::vector<NodeId> out;
+    if (role_ == Role::Leader) {
+        if (isrManager_ != nullptr)
+            for (NodeId id : isrManager_->isr()) if (id != cfg_.selfId) out.push_back(id);
+        std::sort(out.begin(), out.end());
+    } else if (leaderId_ >= 0 && leaderId_ != cfg_.selfId) {
+        out.push_back(leaderId_);
+    }
+    return out;
+}
+
+void PartitionReplica::noteRepairNoPeer_(int64_t base, const char* why)
+{
+    if (repairNoPeerLoggedBase_ == base) return;
+    repairNoPeerLoggedBase_ = base;
+    ++repairNoPeer_;
+    spdlog::critical("PartitionReplica[node={} topic={} part={}]: damaged segment {} cannot be repaired from a peer "
+                     "({}); it stays damaged (reads at the damage fail) until an operator restores it",
+                     cfg_.selfId, cfg_.topicId, cfg_.partitionId, base, why);
+}
+
+bool PartitionReplica::sendRepairRequest_(RepairFetching& f)
+{
+    FetchRequestMsg req{};
+    req.leaderEpoch          = epoch_;
+    req.partition            = cfg_.partitionId;
+    req.followerId           = cfg_.selfId;
+    req.fetchOffset          = f.cursor;
+    req.maxBytes             = cfg_.maxFetchBytes;
+    req.topicId              = cfg_.topicId;
+    req.incarnation          = f.attempt;
+    req.lastEpochStartOffset = f.seg.endOffset;
+    const bool sent = onTransport([&](auto& t) { return t.sendRepairRequest(f.peer, req); });
+    f.sentAtNs = sent ? std::max<int64_t>(lastKnownNowNs_, 1) : 0;   // 0 = resend next pass
+    return sent;
+}
+
+void PartitionReplica::startRepairAttempt_(int64_t nowNs, const rune::storage::Log::DamagedSegmentInfo& d, NodeId peer,
+                                           std::vector<NodeId> tried)
+{
+    const auto rep = diskLog_->beginSegmentRepair(d.base);
+    if (!rep) {
+        ++repairAttemptsFailed_;
+        spdlog::warn("PartitionReplica[node={} topic={} part={}]: cannot begin the repair of segment {}",
+                     cfg_.selfId, cfg_.topicId, cfg_.partitionId, d.base);
+        repairState_ = RepairBackoff{nowNs + kRepairBackoffNs};
+        return;
+    }
+    RepairFetching f;
+    f.seg     = *rep;
+    f.cursor  = rep->damageOffset;
+    f.peer    = peer;
+    f.attempt = ++repairAttemptSeq_;
+    f.role    = role_;
+    f.epoch   = epoch_;
+    tried.push_back(peer);
+    f.tried   = std::move(tried);
+    repairState_ = std::move(f);
+    (void)sendRepairRequest_(std::get<RepairFetching>(repairState_));
+}
+
+void PartitionReplica::abortRepair_(const char* why)
+{
+    diskLog_->abortSegmentRepair();
+    ++repairsAborted_;
+    spdlog::info("PartitionReplica[node={} topic={} part={}]: segment repair dropped ({}); it starts over",
+                 cfg_.selfId, cfg_.topicId, cfg_.partitionId, why);
+    repairState_ = RepairIdle{};
+    repairNextCheckNs_ = 0;
+}
+
+void PartitionReplica::failRepairAttempt_(int64_t nowNs, const char* why, bool counted)
+{
+    RepairFetching f = std::move(std::get<RepairFetching>(repairState_));
+    diskLog_->abortSegmentRepair();
+    if (counted) ++repairAttemptsFailed_;
+    spdlog::warn("PartitionReplica[node={} topic={} part={}]: segment {} repair from peer {} failed: {}",
+                 cfg_.selfId, cfg_.topicId, cfg_.partitionId, f.seg.base, f.peer, why);
+    const auto d = diskLog_->firstDamagedSegment();
+    if (!d) { repairState_ = RepairIdle{}; repairNextCheckNs_ = 0; return; }
+    NodeId next = -1;
+    for (NodeId id : repairPeers_())
+        if (std::find(f.tried.begin(), f.tried.end(), id) == f.tried.end()) { next = id; break; }
+    if (next >= 0) { startRepairAttempt_(nowNs, *d, next, std::move(f.tried)); return; }
+    noteRepairNoPeer_(d->base, "every peer refused or failed");
+    repairState_ = RepairBackoff{nowNs + kRepairBackoffNs};
+}
+
+void PartitionReplica::commitRepair_(int64_t nowNs, RepairFetching& f)
+{
+    const int64_t base = f.seg.base;
+    switch (diskLog_->commitSegmentRepair()) {
+    case rune::storage::Log::RepairCommitStatus::Ok:
+        ++repairsCompleted_;
+        spdlog::warn("PartitionReplica[node={} topic={} part={}]: damaged segment {} repaired from peer {}",
+                     cfg_.selfId, cfg_.topicId, cfg_.partitionId, base, f.peer);
+        repairState_ = RepairIdle{};
+        repairNextCheckNs_ = 0;   // the next damaged segment, if any, now
+        break;
+    case rune::storage::Log::RepairCommitStatus::Busy:
+        f.commitPending = true;   // no room to post the file work: retried next pass
+        break;
+    case rune::storage::Log::RepairCommitStatus::IoError:
+        ++repairAttemptsFailed_;
+        repairState_ = RepairBackoff{nowNs + kRepairBackoffNs};
+        break;
+    case rune::storage::Log::RepairCommitStatus::Rejected:
+    case rune::storage::Log::RepairCommitStatus::NoRepair:
+    default:
+        ++repairsAborted_;   // the segment changed under the repair: the next pass starts over
+        repairState_ = RepairIdle{};
+        repairNextCheckNs_ = 0;
+        break;
+    }
+}
+
+int PartitionReplica::serviceRepair_(int64_t nowNs)
+{
+    if (memoryBacked_ || diskLog_ == nullptr) return 0;
+    if (std::holds_alternative<RepairIdle>(repairState_)) {
+        if (nowNs < repairNextCheckNs_) return 0;
+        repairNextCheckNs_ = nowNs + kRepairCheckEveryNs;
+        const auto d = diskLog_->firstDamagedSegment();
+        if (!d) return 0;
+        if (d->endOffset > highWatermark()) return 0;   // only committed bytes: waits until the HW passes the segment
+        const std::vector<NodeId> peers = repairPeers_();
+        if (peers.empty()) {
+            noteRepairNoPeer_(d->base, role_ == Role::Leader ? "no in-sync follower" : "no known leader");
+            return 0;
+        }
+        startRepairAttempt_(nowNs, *d, peers.front(), {});
+        return 1;
+    }
+    if (const auto* b = std::get_if<RepairBackoff>(&repairState_)) {
+        if (nowNs >= b->untilNs) { repairState_ = RepairIdle{}; repairNextCheckNs_ = 0; }
+        return 0;
+    }
+    RepairFetching& f = std::get<RepairFetching>(repairState_);
+    // Abort conditions: the segment's lineage changed (cleaner swap, truncation), it was deleted (retention) or is no
+    // longer sealed, the role or epoch changed, or the peer is no longer a source (a leader's follower left the ISR).
+    if (!diskLog_->segmentRepairValid()) { abortRepair_("the segment changed or is gone"); return 1; }
+    if (role_ != f.role || epoch_ != f.epoch) { abortRepair_("the role or the leader epoch changed"); return 1; }
+    const std::vector<NodeId> peers = repairPeers_();
+    if (std::find(peers.begin(), peers.end(), f.peer) == peers.end()) {
+        abortRepair_("the peer is no longer a source");
+        return 1;
+    }
+    if (f.commitPending) { commitRepair_(nowNs, f); return 1; }
+    if (f.sentAtNs == 0) { (void)sendRepairRequest_(f); return 1; }
+    if (nowNs - f.sentAtNs >= kRepairTimeoutNs) { failRepairAttempt_(nowNs, "timed out"); return 1; }
+    return 0;
+}
+
+void PartitionReplica::applyRepairResponse(const FetchResponseMsg& resp)
+{
+    auto* fp = std::get_if<RepairFetching>(&repairState_);
+    if (fp == nullptr || fp->commitPending) return;   // none outstanding: a late or duplicate answer
+    RepairFetching& f = *fp;
+    if (resp.topicId != cfg_.topicId || resp.partition != cfg_.partitionId) return;
+    if (resp.logStartOffset != f.attempt) return;   // an answer to an earlier attempt or request: stale
+    if (resp.fromOffset != f.cursor) return;        // not the request in flight (a duplicate, reordered)
+    const int64_t now = std::max<int64_t>(lastKnownNowNs_, 1);
+    if (resp.errorCode == kRepairRefused) { failRepairAttempt_(now, "the peer refused", /*counted=*/false); return; }
+    if (resp.errorCode == kRepairDone) { commitRepair_(now, f); return; }
+    if (resp.errorCode != kErrNone) { failRepairAttempt_(now, "an unexpected status"); return; }
+    if (resp.records.empty()) { failRepairAttempt_(now, "an empty answer"); return; }
+    const auto got = diskLog_->appendRepairBatches(
+        resp.records, [this](int64_t off) { return epochCache_.epochForOffset(off); });
+    if (got.status != rune::storage::Log::RepairAppendStatus::Ok) {
+        failRepairAttempt_(now, "the peer's batches failed validation");
+        return;
+    }
+    f.cursor  = got.cursor;
+    f.attempt = ++repairAttemptSeq_;
+    (void)sendRepairRequest_(f);
+}
+
+// ---------------------------------------------------------------------------
 // F27 F3: an epoch answer the transport refused is OWED and re-sent on the next
 // doWork pass.
 // ---------------------------------------------------------------------------
@@ -2658,6 +2925,9 @@ int PartitionReplica::doWork(int64_t nowNs)
 
     // F27 F3: owed DR frames (epoch answers, reconcile pull / answer) — any role.
     work += retryOwedDrSends_();
+
+    // #880: rebuild a damaged sealed segment from an in-sync peer (cold; idle when nothing is damaged).
+    work += serviceRepair_(nowNs);
 
     // Leader-epoch restart fence: a refused leadership asks for a new epoch.
     if (staleLead_.pending) [[unlikely]] work += requestLeaderEpochBump_(nowNs);

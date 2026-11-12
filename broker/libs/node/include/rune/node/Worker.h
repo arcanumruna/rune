@@ -1402,6 +1402,7 @@ public:
             break;
         case WorkerOp::Type::ApplyReplicated:
         case WorkerOp::Type::ReconcileFetchResp:
+        case WorkerOp::Type::RepairFetchResp:
             tailKind = sbe::TailKind::Value::REPLICATED_RECORDS;
             tailSrc  = op.replicatedPayload.records.data();
             tailLen  = op.replicatedPayload.records.size();
@@ -2915,6 +2916,12 @@ private:
             break;
         case WorkerOp::Type::ReconcileFetchReq:
             executeReconcileFetchReqWire_(op);
+            break;
+        case WorkerOp::Type::RepairFetchReq:
+            executeRepairFetchReqWire_(op);
+            break;
+        case WorkerOp::Type::RepairFetchResp:
+            executeRepairFetchRespWire_(op);
             break;
         // MEDIUM-2: the controller's AlterIsr answer (cold).
         case WorkerOp::Type::AlterIsrResponse:
@@ -5992,6 +5999,57 @@ private:
     }
 
     // -------------------------------------------------------------------
+    // #880: a peer serves a segment-repair pull / the repairing replica applies a peer's answer, on the OWNING worker
+    // (the replica's log is worker-owned).  Fire-and-forget; the asker's timeout covers a drop.
+    // -------------------------------------------------------------------
+    void executeRepairFetchReqWire_(sbe::WorkerOp& op) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        if (!replica) return;
+        ++followerSideOps_;
+        rune::replication::FetchRequestMsg req;
+        req.leaderEpoch          = static_cast<rune::replication::Epoch>(op.frLeaderEpoch());
+        req.partition            = static_cast<rune::replication::PartitionId>(op.partition());
+        req.followerId           = static_cast<rune::replication::NodeId>(op.frFollowerId());
+        req.fetchOffset          = static_cast<rune::replication::Offset>(op.frFetchOffset());
+        req.maxBytes             = op.frMaxBytes();
+        req.topicId              = op.topicId();
+        req.incarnation          = op.frIncarnation();
+        req.lastEpochStartOffset = op.hwBound();
+        try {
+            replica->onRepairRequest(req);
+        } catch (const std::exception& ex) {
+            spdlog::warn("Worker {}: onRepairRequest threw: {}", workerId_, ex.what());
+        } catch (...) {
+            spdlog::warn("Worker {}: onRepairRequest threw unknown exception", workerId_);
+        }
+    }
+
+    void executeRepairFetchRespWire_(sbe::WorkerOp& op) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        if (!replica) return;
+        ++followerSideOps_;
+        const uint32_t tailLen = op.tailLength();
+        const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
+        rune::replication::FetchResponseMsg msg;
+        msg.leaderEpoch    = op.replLeaderEpoch();
+        msg.partition      = op.replPartition();
+        msg.highWatermark  = op.replHighWatermark();
+        msg.logStartOffset = op.replLogStartOffset();
+        msg.errorCode      = op.replErrorCode();
+        msg.topicId        = op.replTopicId();
+        msg.fromOffset     = op.nextOffset();
+        msg.records = std::span<const uint8_t>(tail ? tail : static_cast<const uint8_t*>(nullptr),
+                                               static_cast<std::size_t>(tailLen));
+        try {
+            replica->applyRepairResponse(msg);
+        } catch (const std::exception& ex) {
+            spdlog::warn("Worker {}: applyRepairResponse threw: {}", workerId_, ex.what());
+        } catch (...) {
+            spdlog::warn("Worker {}: applyRepairResponse threw unknown exception", workerId_);
+        }
+    }
+
+    // -------------------------------------------------------------------
     // Task #13: executeAppendControlRecordWire_ — append a txn COMMIT/ABORT
     // control marker to the worker-owned user partition log (the worker is the
     // sole appender: no race).
@@ -6389,6 +6447,35 @@ private:
                              workerId_, ex.what());
             } catch (...) {
                 spdlog::warn("Worker {}: pollReplTransport ReconcileFetchResp applyReconcileResponse threw unknown",
+                             workerId_);
+            }
+            break;
+        }
+
+        // TemplateId 17 / 18 (#880): a segment-repair pull and its answer (FetchRequest / FetchResponse layouts).  The
+        // request reads the worker-owned log: scratch scope as for a fetch serve.
+        case rr::kRepairFetchReqTemplateId: {
+            const rr::FetchRequestMsg req = rr::FetchRequestMsg::decode(frame, 0, len);
+            const ReplReadScope rs(*replica, replScratch_);
+            try {
+                replica->onRepairRequest(req);
+            } catch (const std::exception& ex) {
+                spdlog::warn("Worker {}: pollReplTransport RepairFetchReq onRepairRequest threw: {}",
+                             workerId_, ex.what());
+            } catch (...) {
+                spdlog::warn("Worker {}: pollReplTransport RepairFetchReq onRepairRequest threw unknown", workerId_);
+            }
+            break;
+        }
+        case rr::kRepairFetchRespTemplateId: {
+            const rr::FetchResponseMsg msg = rr::FetchResponseMsg::decode(frame, 0, len);
+            try {
+                replica->applyRepairResponse(msg);
+            } catch (const std::exception& ex) {
+                spdlog::warn("Worker {}: pollReplTransport RepairFetchResp applyRepairResponse threw: {}",
+                             workerId_, ex.what());
+            } catch (...) {
+                spdlog::warn("Worker {}: pollReplTransport RepairFetchResp applyRepairResponse threw unknown",
                              workerId_);
             }
             break;
@@ -7587,6 +7674,8 @@ private:
         case WorkerOp::Type::ReconcileFetchResp:
         case WorkerOp::Type::OffsetsForLeaderEpochResp:
         case WorkerOp::Type::ReconcileFetchReq:
+        case WorkerOp::Type::RepairFetchReq:    // #880
+        case WorkerOp::Type::RepairFetchResp:   // #880
         case WorkerOp::Type::AlterIsrResponse:
         case WorkerOp::Type::AppendControlRecord:
         case WorkerOp::Type::TxnVerifyResult:   // #112: a stale answer is dropped (the client's retry re-verifies)

@@ -92,6 +92,12 @@ inline void dispatchAdminLogFrame(const AdminLogReplicas& replicas, int32_t topi
         case rr::kReconcileFetchRespTemplateId:
             replica->applyReconcileResponse(rr::FetchResponseMsg::decode(frame, 0, len));
             break;
+        case rr::kRepairFetchReqTemplateId:
+            replica->onRepairRequest(rr::FetchRequestMsg::decode(frame, 0, len));
+            break;
+        case rr::kRepairFetchRespTemplateId:
+            replica->applyRepairResponse(rr::FetchResponseMsg::decode(frame, 0, len));
+            break;
         default:
             // The transport already drops unknown template ids before dispatch.
             break;

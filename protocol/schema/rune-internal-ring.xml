@@ -160,6 +160,13 @@
            lease partition), no tail.  TRANSIENT_LINEAGE: topicId / partition, nextOffset = the leader epoch, correlationId = the
            lineage token (uint64 bit-cast), hwBound = the lineage generation. -->
       <validValue name="TRANSIENT_LINEAGE">41</validValue>
+      <!-- #880 (segment repair): transport -> the partition's owning worker, USER partitions replicated over the Aeron transport
+           (shard planes dispatch on the worker directly).  REPAIR_FETCH_REQ reuses the fr* scalars (frFetchOffset = the cursor,
+           frMaxBytes, frFollowerId, frIncarnation = the asker's attempt id) + hwBound = the exclusive end offset; REPAIR_FETCH_RESP
+           reuses the repl* scalars (replErrorCode = the status, replLogStartOffset = the attempt id echoed) + nextOffset = the cursor
+           echoed + the records tail (TailKind = REPLICATED_RECORDS). -->
+      <validValue name="REPAIR_FETCH_REQ">42</validValue>
+      <validValue name="REPAIR_FETCH_RESP">43</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica

@@ -270,6 +270,32 @@ bool AeronPartitionTransport::sendReconcileResponse(
     return enqueueFetchResponse(toPeer, resp, /*reconcile=*/true);
 }
 
+// ---------------------------------------------------------------------------
+// #880: segment-repair pull (a replica with a damaged sealed segment <-> a peer holding it intact).  FetchRequest /
+// FetchResponse layouts re-stamped with the repair templateIds; the extra facts ride in unused fields (see
+// kRepairFetchReqTemplateId).
+// ---------------------------------------------------------------------------
+bool AeronPartitionTransport::sendRepairRequest(NodeId toPeer, const FetchRequestMsg& req)
+{
+    // Same apply-frame cap as the reconcile pull: the answer lands on THIS node's worker ingress ring.
+    int32_t maxBytes = req.maxBytes;
+    if (applyRecordsCap_ > 0 && req.topicId >= 0 && maxBytes > applyRecordsCap_)
+        maxBytes = static_cast<int32_t>(applyRecordsCap_);
+    uint8_t wire[kMaxWireFrame];
+    const std::size_t len = FetchRequestMsg::encode(
+        wire, 0,
+        req.leaderEpoch, req.partition, req.followerId,
+        req.fetchOffset, maxBytes, req.topicId, req.lastFetchedEpoch, req.incarnation,
+        req.storageId, req.lastEpochStartOffset);
+    stampTemplateId(wire, 0, kRepairFetchReqTemplateId);
+    return enqueueOutbound(toPeer, wire, len);
+}
+
+bool AeronPartitionTransport::sendRepairResponse(NodeId toPeer, const FetchResponseMsg& resp)
+{
+    return enqueueFetchResponse(toPeer, resp, /*reconcile=*/false, kRepairFetchRespTemplateId);
+}
+
 // FR trace correlation (F9a: no file-static / atomic sequence counters).
 //   Outbound (worker → control, many-to-one ring): ReplOutEnqueue and
 //   ReplOutDrain are both marked with the record's RING SLOT OFFSET (the
@@ -295,7 +321,8 @@ bool AeronPartitionTransport::sendReconcileResponse(
 // ---------------------------------------------------------------------------
 bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targetNodeId,
                                                     const FetchResponseMsg& resp,
-                                                    bool                    reconcile)
+                                                    bool                    reconcile,
+                                                    uint16_t                restampTemplateId)
 {
     const std::size_t payloadLen = FetchResponseMsg::encodedSize(resp.records.size());
     const std::size_t frameLen =
@@ -336,6 +363,7 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
         // routes to the reconcile handlers (matches sendReconcileResponse's wire).
         stampTemplateId(payload, 0, kReconcileFetchRespTemplateId);
     }
+    if (restampTemplateId != 0) stampTemplateId(payload, 0, restampTemplateId);   // #880
     // Advance the flyweight position so the frame is well-formed (commit uses frameLen).
     enc.sbePosition(lenPos + isbe::OutboundFrame::payloadHeaderLength() + payloadLen);
     // FR mark BEFORE commit: once committed the consumer may drain + free the slot
@@ -1245,6 +1273,80 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             }
         } else {
             rep->applyReconcileResponse(resp);
+        }
+
+    } else if (tid == kRepairFetchReqTemplateId) {
+        // #880: a peer asks for the batches of a damaged segment's range (FetchRequest layout).  Capped like the
+        // reconcile pull so the answer never overflows the outbound ring.
+        if (len < FetchRequestMsg::MIN_SIZE) return Action::CONTINUE;
+        FetchRequestMsg req = FetchRequestMsg::decode(buf, 0, len);
+        PartitionReplica* const rep = resolveReplica_(req.topicId, req.partition);
+        if (rep == nullptr) return Action::CONTINUE;
+        const int32_t kOverhead = static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
+        int32_t ceiling = maxFetchResponseBytes();
+        auto* peer = findPeer(req.followerId);
+        if (peer && peer->pub) {
+            const int32_t pubCeiling =
+                static_cast<int32_t>(peer->pub->maxMessageLength()) - kOverhead
+                - static_cast<int32_t>(rune::peerlink::kPeerFrameOverhead);
+            if (pubCeiling < ceiling) ceiling = pubCeiling;
+        }
+        if (ceiling < 0) ceiling = 0;
+        if (req.maxBytes > ceiling) req.maxBytes = ceiling;
+        if (workerPool_ && req.topicId >= 0) {
+            rune::node::WorkerOp op;
+            op.type                                = rune::node::WorkerOp::Type::RepairFetchReq;
+            op.topicId                             = req.topicId;
+            op.partition                           = req.partition;
+            op.fetchRequestPayload.leaderEpoch     = req.leaderEpoch;
+            op.fetchRequestPayload.partition       = req.partition;
+            op.fetchRequestPayload.followerId      = req.followerId;
+            op.fetchRequestPayload.fetchOffset     = req.fetchOffset;
+            op.fetchRequestPayload.maxBytes        = req.maxBytes;
+            op.fetchRequestPayload.topicId         = req.topicId;
+            op.fetchRequestPayload.incarnation     = req.incarnation;   // the asker's attempt id
+            op.hwBound                             = req.lastEpochStartOffset;   // the exclusive end offset
+            if (!workerPool_->tryEnqueueOp(req.topicId, req.partition, std::move(op)))
+                return Action::ABORT;
+        } else {
+            rep->onRepairRequest(req);
+        }
+
+    } else if (tid == kRepairFetchRespTemplateId) {
+        // #880: a peer's answer (FetchResponse layout).
+        if (len < FetchResponseMsg::MIN_SIZE) return Action::CONTINUE;
+        const FetchResponseMsg resp = FetchResponseMsg::decode(buf, 0, len);
+        PartitionReplica* const rep = resolveReplica_(resp.topicId, resp.partition);
+        if (rep == nullptr) return Action::CONTINUE;
+        if (workerPool_ && resp.topicId >= 0 &&
+            !workerPool_->opTailFits(resp.topicId, resp.partition, resp.records.size())) [[unlikely]] {
+            ++oversizedApplyRefused_;
+            spdlog::error("AeronPartitionTransport: RepairFetchResponse for (topicId={}, partition={}) carries {} B of "
+                          "records — exceeds the worker ingress frame; refused",
+                          resp.topicId, resp.partition, resp.records.size());
+            return Action::CONTINUE;   // the asker times out and tries the next peer
+        }
+        if (workerPool_ && resp.topicId >= 0) {
+            rune::node::WorkerOp op;
+            op.type                              = rune::node::WorkerOp::Type::RepairFetchResp;
+            op.topicId                           = resp.topicId;
+            op.partition                         = resp.partition;
+            op.replica                           = rep;
+            op.logPtr                            = nullptr;
+            op.replicatedPayload.leaderEpoch     = resp.leaderEpoch;
+            op.replicatedPayload.partition       = resp.partition;
+            op.replicatedPayload.highWatermark   = resp.highWatermark;
+            op.replicatedPayload.logStartOffset  = resp.logStartOffset;   // the attempt id echoed
+            op.replicatedPayload.errorCode       = resp.errorCode;
+            op.replicatedPayload.topicId         = resp.topicId;
+            op.nextOffset                        = resp.fromOffset;       // the cursor echoed
+            if (!resp.records.empty())
+                op.replicatedPayload.records.assign(resp.records.data(), resp.records.data() + resp.records.size());
+            const auto er = workerPool_->enqueueOp(resp.topicId, resp.partition, std::move(op));
+            if (er == rune::node::EnqueueResult::TooLarge) [[unlikely]] return Action::CONTINUE;
+            if (er != rune::node::EnqueueResult::Enqueued) return Action::ABORT;   // ring full: retried next cycle
+        } else {
+            rep->applyRepairResponse(resp);
         }
 
     } else {

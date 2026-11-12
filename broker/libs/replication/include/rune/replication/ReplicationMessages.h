@@ -84,6 +84,8 @@ enum class ReplicationTemplateId : uint16_t {
     VerifyTxnPartitionResponse = 14,  // #112: txn coordinator → partition leader (hand-rolled)
     TxnVote                  = 15,  // C18: txn coordinator → partition leader (hand-rolled)
     TxnVoteResponse          = 16,  // C18: partition leader → txn coordinator (hand-rolled)
+    RepairFetchReq           = 17,  // #880: damaged-segment repair pull (req), FetchRequest layout
+    RepairFetchResp          = 18,  // #880: damaged-segment repair pull (resp), FetchResponse layout
 };
 
 // DR-BUG-6: reconcile-pull template ids.  The reconcile request/response reuse
@@ -92,6 +94,29 @@ enum class ReplicationTemplateId : uint16_t {
 // instead of the normal onFetchRequest()/applyReplicated() path.
 inline constexpr uint16_t kReconcileFetchReqTemplateId  = 5;
 inline constexpr uint16_t kReconcileFetchRespTemplateId = 6;
+
+// #880: segment-repair pull template ids.  They reuse the FetchRequest / FetchResponse WIRE LAYOUT unchanged (no block
+// length change, no schema bump) with a DISTINCT templateId, and carry their extra facts in fields the pair leaves
+// unused:
+//   RepairFetchReq  (FetchRequest layout):
+//     fetchOffset          = the cursor: the first offset wanted;
+//     maxBytes             = the most record bytes the asker takes (a first batch larger than it is still served);
+//     incarnation          = the asker's ATTEMPT id (a response whose echo differs is stale and ignored);
+//     lastEpochStartOffset = endOffset: the exclusive upper bound of the wanted range (the damaged segment's end);
+//     leaderEpoch / partition / followerId / topicId as in a fetch; lastFetchedEpoch -1, storageId 0.
+//   RepairFetchResp (FetchResponse layout):
+//     errorCode            = the status: kErrNone (batches follow), kRepairDone, kRepairRefused;
+//     records              = whole batches with base offset in [fromOffset, endOffset);
+//     fromOffset           = the request's cursor, echoed;
+//     logStartOffset       = the request's attempt id, echoed;
+//     highWatermark        = the answering peer's high watermark; leaderEpoch = its epoch.
+inline constexpr uint16_t kRepairFetchReqTemplateId  = 17;
+inline constexpr uint16_t kRepairFetchRespTemplateId = 18;
+/// RepairFetchResp status: no batch below the request's endOffset remains at or above the cursor.
+inline constexpr int16_t kRepairDone    = 1;
+/// RepairFetchResp status: this peer cannot serve the range (not below its high watermark, damaged there, not a
+/// replica of the partition, ...).
+inline constexpr int16_t kRepairRefused = 2;
 
 // ---------------------------------------------------------------------------
 // Internal little-endian helpers (UB-free via memcpy; optimises to mov)
