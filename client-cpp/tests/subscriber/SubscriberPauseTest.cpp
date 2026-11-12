@@ -465,6 +465,26 @@ TEST(SubscriberPauseRegression, SessionRevokedWhilePausedFinishesRegression) {
     EXPECT_FALSE(r.sub->resume());
 }
 
+// F-10 (final review): READ revoked while paused is reported at resume(), when the re-Subscribe is answered NotAuthorized (error 45).
+TEST(SubscriberPauseRegression, ReadRevokedWhilePausedFailsAtResumeRegression) {
+    Rig r;
+    r.open(11);
+    r.bind(40);
+    r.push(40, 0, 3);
+    ASSERT_TRUE(r.sub->pause());
+    EXPECT_FALSE(r.sub->finished()) << "nothing tells a paused subscription that its grant is gone";
+    ASSERT_TRUE(r.sub->resume());
+    ASSERT_EQ(r.tx.subscribes, 2) << "the re-Subscribe went out";
+    auto rsp = bindRsp(r.tx.lastSubCorr, 0, r.sid);
+    rsp.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotAuthorized);
+    r.hub.onSubscribeResponse(rsp, 0, r.sid, r.noSend);
+    EXPECT_TRUE(r.sub->finished());
+    EXPECT_EQ(r.sub->failReason(), rc::SubscriptionFailReason::NotAuthorized);
+    EXPECT_FALSE(r.sub->paused());
+    EXPECT_EQ(r.sub->position(), 3);
+    EXPECT_EQ(r.tx.unsubsFor(40), 1) << "released once (at the pause); a refused Subscribe binds nothing, so nothing more is owed";
+}
+
 TEST(SubscriberPauseRegression, PauseAboveDeliveredRefusedRegression) {
     Rig r;
     r.open(11);

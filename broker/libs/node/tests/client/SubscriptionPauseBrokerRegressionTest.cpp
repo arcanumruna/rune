@@ -259,6 +259,187 @@ TEST(SubscriptionPauseBrokerRegression, BackpressuredTailLosesNothingRegression)
     }
     ASSERT_EQ(got.size(), static_cast<std::size_t>(kRecords) + 1) << "the sentinel never arrived (or a duplicate came before it)";
     ASSERT_NO_FATAL_FAILURE(expectSequence(got, 0, kRecords + 1));
+    EXPECT_TRUE(awaitPosition(*sub, kRecords + 2)) << "position() " << sub->position();
+    EXPECT_GE(ring.pauses.load(), 10) << "a 64-slot ring under a 5000-record tail pauses at least 10 times";
+    EXPECT_GE(resumes, 10);
+    EXPECT_EQ(lost, 0) << "the LeaseSession never lost a lease";
+    EXPECT_EQ(risk, 0) << "the LeaseSession never put a lease at risk";
+    EXPECT_EQ(session.stateOf(ref), rc::LeaseEntryState::Held);
+    sub->unsubscribe();
+    session.close();
+    for (uint64_t i = 0; i < kSpinCap && !session.isClosed(); ++i) {
+        (void)session.doWork(c.nowNs());
+        std::this_thread::yield();
+    }
+    EXPECT_TRUE(session.isClosed());
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// 2. A subscription paused for the whole test does not touch another subscription of the same client.
+// ---------------------------------------------------------------------------------------------------------
+TEST(SubscriptionPauseBrokerRegression, SecondSubscriptionUnaffectedRegression) {
+    constexpr int kX = 200, kY = 1000;
+    OneBroker b("pause-second", OneBroker::Runtime::Shard);
+    rc::Client* admin = b.connectClient();
+    const rc::TopicSpec specX = defineOne(*admin, "x");
+    const rc::TopicSpec specY = defineOne(*admin, "y");
+    auto cp = openClientOn(b, {specX, specY});
+    rc::Client& c = *cp;
+    ASSERT_EQ(produceAll(c, c.topic("x"), kX, rc::Acks::Leader), kX);
+    ASSERT_EQ(produceAll(c, c.topic("y"), kY, rc::Acks::Leader), kY);
+
+    std::mutex mu;
+    std::vector<int64_t> xs, ys;
+    std::atomic<bool> xPaused{false};
+    std::optional<rc::Subscription> sx, sy;
+    rc::SubscribeOptions so;
+    so.from = rc::From::earliest();
+    std::atomic<bool> armed{false};
+    sx = c.subscribe(c.topic("x"), 0, so, [&](const rc::Record& r) {
+        awaitArmed(armed);
+        {
+            std::lock_guard<std::mutex> g(mu);
+            xs.push_back(r.offset);
+        }
+        if (r.offset == 0) {   // X takes no record at all: it pauses on the first and stays paused
+            (void)sx->pause(r.offset);
+            xPaused.store(true, std::memory_order_release);
+        }
+    });
+    sy = c.subscribe(c.topic("y"), 0, so, [&](const rc::Record& r) {
+        std::lock_guard<std::mutex> g(mu);
+        ys.push_back(r.offset);
+    });
+
+    armed.store(true, std::memory_order_release);
+    uint64_t spin = 0;
+    for (; spin < kSpinCap; ++spin) {
+        {
+            std::lock_guard<std::mutex> g(mu);
+            if (ys.size() >= static_cast<std::size_t>(kY)) break;
+        }
+        std::this_thread::yield();
+    }
+    ASSERT_LT(spin, kSpinCap) << "Y stalled";
+    ASSERT_TRUE(xPaused.load(std::memory_order_acquire));
+    {
+        std::lock_guard<std::mutex> g(mu);
+        ASSERT_NO_FATAL_FAILURE(expectSequence(ys, 0, kY));
+        // X: exactly the one record it refused, and nothing after it although 199 more are on the broker.
+        EXPECT_EQ(xs, std::vector<int64_t>{0});
+    }
+    // Y keeps flowing for a fresh batch while X stays paused.
+    ASSERT_EQ(produceAll(c, c.topic("y"), 50, rc::Acks::Leader, kY), 50);
+    for (spin = 0; spin < kSpinCap; ++spin) {
+        {
+            std::lock_guard<std::mutex> g(mu);
+            if (ys.size() >= static_cast<std::size_t>(kY + 50)) break;
+        }
+        std::this_thread::yield();
+    }
+    {
+        std::lock_guard<std::mutex> g(mu);
+        ASSERT_NO_FATAL_FAILURE(expectSequence(ys, 0, kY + 50));
+        EXPECT_EQ(xs, std::vector<int64_t>{0}) << "X was paused for the whole test";
+    }
+    sx->unsubscribe();
+    sy->unsubscribe();
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// 3. Three nodes, acks=all: the partition's leader changes while the subscription is paused.
+// ---------------------------------------------------------------------------------------------------------
+TEST(SubscriptionPauseBrokerRegression, LeaderChangeWhilePausedRegression) {
+    constexpr int kRecords = 1000, kPauseAt = 500;
+    ThreeNodes cluster = ThreeNodes::start("pause_leader");
+    ASSERT_TRUE(cluster.awaitCatalogLeader(30s));
+    auto admin = connectClient(cluster, cluster.runningNodes().front());
+    const rc::TopicSpec spec = defineOne(*admin, "moving", 3);
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(cluster, spec.topicId, 1, leaders, 30s));
+    const int32_t victim = leaders[0];
+    int survivor = -1;
+    for (int id : cluster.runningNodes())
+        if (id != victim) { survivor = id; break; }
+    ASSERT_GT(survivor, 0);
+
+    // The producer and the subscriber both live on survivors.
+    auto cfgOf = [&](int seed) {
+        auto cfg = clientConfigFor(cluster, seed);
+        cfg.topics = {spec};
+        cfg.connectTimeoutMs = 30'000;
+        cfg.pingTimeoutMs    = 30'000;
+        return cfg;
+    };
+    auto client = connectClient(cluster, cfgOf(survivor));
+    ASSERT_EQ(produceAll(*client, client->topic("moving"), kRecords, rc::Acks::All), kRecords);
+
+    std::mutex mu;
+    std::vector<int64_t> got;
+    std::atomic<bool> paused{false};
+    std::optional<rc::Subscription> sub;
+    rc::SubscribeOptions so;
+    so.from = rc::From::earliest();
+    std::atomic<bool> armed{false};
+    sub = client->subscribe(client->topic("moving"), 0, so, [&](const rc::Record& r) {
+        awaitArmed(armed);
+        if (r.offset == kPauseAt && !paused.load(std::memory_order_acquire)) {
+            (void)sub->pause(r.offset);   // refuse 500
+            paused.store(true, std::memory_order_release);
+            return;
+        }
+        std::lock_guard<std::mutex> g(mu);
+        got.push_back(r.offset);
+    });
+    armed.store(true, std::memory_order_release);
+    uint64_t spin = 0;
+    for (; spin < kSpinCap && !paused.load(std::memory_order_acquire); ++spin) std::this_thread::yield();
+    ASSERT_TRUE(paused.load()) << "never reached offset " << kPauseAt;
+    {
+        std::lock_guard<std::mutex> g(mu);
+        ASSERT_NO_FATAL_FAILURE(expectSequence(got, 0, kPauseAt));
+    }
+
+    cluster.stop(victim);
+    ASSERT_TRUE(awaitLeaders(cluster, spec.topicId, 1, leaders, 60s));
+    ASSERT_NE(leaders[0], victim);
+
+    for (spin = 0; spin < kSpinCap && !sub->paused(); ++spin) std::this_thread::yield();
+    // The move happened while paused, and this client followed it: a witness record (offset kRecords) is produced acks=all through
+    // the new leader BEFORE resume().  The paused subscription holds no route, so it must not see it yet.
+    ASSERT_EQ(produceAll(*client, client->topic("moving"), 1, rc::Acks::All, kRecords), 1) << "the client never reached the new leader";
+    ASSERT_TRUE(sub->paused());
+    EXPECT_EQ(client->testPendingUnsubscribes(), 0u) << "no release is owed: the pause's Unsubscribe was settled before the move";
+    {
+        std::lock_guard<std::mutex> g(mu);
+        EXPECT_EQ(got.size(), static_cast<std::size_t>(kPauseAt)) << "nothing is delivered while paused";
+    }
+    ASSERT_TRUE(sub->resume());
+    for (spin = 0; spin < kSpinCap; ++spin) {
+        {
+            std::lock_guard<std::mutex> g(mu);
+            if (got.size() >= static_cast<std::size_t>(kRecords) + 1) break;
+        }
+        std::this_thread::yield();
+    }
+    {
+        std::lock_guard<std::mutex> g(mu);
+        ASSERT_EQ(got.size(), static_cast<std::size_t>(kRecords) + 1) << "stalled after the leader change";
+    }
+    // Sentinel (offset kRecords + 1): a duplicate of the resumed range would arrive before it.
+    ASSERT_EQ(produceAll(*client, client->topic("moving"), 1, rc::Acks::All, kRecords + 1), 1);
+    for (spin = 0; spin < kSpinCap; ++spin) {
+        {
+            std::lock_guard<std::mutex> g(mu);
+            if (got.size() >= static_cast<std::size_t>(kRecords) + 2) break;
+        }
+        std::this_thread::yield();
+    }
+    {
+        std::lock_guard<std::mutex> g(mu);
+        ASSERT_EQ(got.size(), static_cast<std::size_t>(kRecords) + 2) << "sentinel missing or duplicates before it";
+        ASSERT_NO_FATAL_FAILURE(expectSequence(got, 0, kRecords + 2));   // 0..499, then 500..1000 once each, then the sentinel
+    }
     EXPECT_TRUE(awaitPosition(*sub, kRecords + 1)) << "position() " << sub->position();
     EXPECT_GE(ring.pauses.load(), 10) << "a 64-slot ring under a 5000-record tail pauses at least 10 times";
     EXPECT_GE(resumes, 10);
