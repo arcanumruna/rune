@@ -173,6 +173,7 @@ static std::vector<TopicSpec> parseTopics(const std::string& s) {
 static bool phaseProduceN(Client& c, const TopicHandle& th, int N,
                            int timeoutMs, int phase) {
     ProducerConfig pcfg;
+    // Leader acks can be lost if the leader fails before a follower replicates; use Acks::All for durability (#41).
     pcfg.acks             = Acks::Leader;
     pcfg.lingerUs         = 1;
     pcfg.batchBytes       = 1;

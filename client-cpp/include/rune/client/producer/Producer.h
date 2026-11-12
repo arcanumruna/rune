@@ -77,10 +77,14 @@ class Client;
 struct CompletionTarget;
 
 // ---------------------------------------------------------------------------
-// Acks — acknowledgement policy for produced batches, a flag set.
-// Leader (like Kafka acks=1): a leader restart or loss before the followers replicate can lose ACKED records.
-// All: with the broker's minIsr >= 2 (the multi-node default), acked records survive any single broker failure;
-// use it for durability (#41).
+// Acks — acknowledgement policy for produced batches, a flag set.  What each level guarantees (#41):
+//   None:   no response is awaited (the send completes locally with offset -1); loses what Leader loses, unreported.
+//   Leader: acked once the partition leader has appended the record (like Kafka acks=1).  If that leader fails or
+//           restarts before a follower replicated it, the record is lost although it was acked.
+//   All:    acked once the high watermark (the minimum log end over the in-sync replicas) has passed the record and the
+//           in-sync set still has at least the broker's minIsr members.  With minIsr >= 2 (the multi-node default) an
+//           acked record survives the loss of any single broker; with minIsr 1 it does not.
+// Recommendation: use All whenever an acknowledged record must survive a broker failure.
 // View (checked writes, broker >= 10): combined with Leader or All, the ack is also held until every view of the
 // partition has folded the batch, so a read right after the ack sees it.  `Leader | View` waits for commit like
 // `All | View` (the fold never passes the high watermark).  View alone is refused, and a transactional producer's

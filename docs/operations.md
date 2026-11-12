@@ -118,6 +118,11 @@ Two fixed costs set the resident floor of a node, before any topic or view:
 - **Failover.** Killing a leader triggers re-election among the survivors. An acked `acks=all` produce answered
   `NotLeader` or `Internal`, or not at all, is *in doubt*; the client retries it with the same producer id, epoch and
   sequence and the broker deduplicates.
+- **Durability of acked records.** What an acknowledged produce survives depends on the producer's ack level: with
+  `Acks::Leader` (the client default) a record acked by a leader that then fails or restarts before a follower
+  replicated it is lost; `Acks::All` with `RUNE_MIN_ISR` of at least 2 survives the loss of any single broker. The
+  per-level contract is in
+  [Acknowledgement levels and durability](api/client-cpp.md#acknowledgement-levels-and-durability).
 - **View reads after a failover.** A view row is served only by the leader of its source partition, and only while that
   broker holds a read lease from the controller (renewed every 20 ms, about 120 ms long). A leader cut off from the
   controller stops serving view rows once its lease runs out, before any other broker can take its partitions, and answers

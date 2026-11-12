@@ -198,7 +198,7 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
 
 - **`Acks`**: `None` (no response, always non-idempotent), `Leader`, `All` (the in-sync replicas hold it). Acked producers
   are **idempotent**: the broker deduplicates a retry by `(producerId, epoch, sequence)`. The durability contract of
-  each level:
+  each level (details and the table in [Acknowledgement levels and durability](#acknowledgement-levels-and-durability)):
   - `None`: no acknowledgement; a record can be lost without the producer knowing.
   - `Leader` (the default, like Kafka `acks=1`): acknowledged once the partition leader has the record. If the leader
     restarts or is lost before its followers replicate the record, an **acknowledged record can be lost**.
@@ -329,6 +329,43 @@ if (r.code() == 55) {
 // character-server, DELETE /character/{id}
 WriteResult d = characters.removeExistingAndWait(id);  // code() 57 (KeyNotFound) -> 404; a delete is never a 55
 ```
+
+### Acknowledgement levels and durability
+
+`ProducerConfig::acks` (default `Acks::Leader`) decides when the broker answers a produce and therefore which
+acknowledged records a broker failure can still take away.
+
+| Level | The ack is sent | An acked record can be lost when |
+|---|---|---|
+| `Acks::None` | Never waited for: the client completes the send locally with offset -1 ("sent, offset unknown"); on the wire it is the same request as `Leader`. | As with `Leader`, and a send that fails is not reported to the producer. |
+| `Acks::Leader` | When the partition leader has appended the record. | The leader fails or restarts before a follower has replicated it. |
+| `Acks::All` | When the partition high watermark has passed the record and the in-sync replica set still has at least `minIsr` members. | Only if more brokers fail than the in-sync set tolerates; see below. |
+
+`Acks::Leader` is like Kafka `acks=1`: the ack means only the partition leader has the record. If that leader fails
+or restarts before a follower has replicated it, the record is **lost although it was acknowledged**. Use `Acks::All`
+when an acknowledged record must survive the loss of one broker.
+
+What `Acks::All` waits for:
+
+- The partition high watermark is the minimum log end offset over the in-sync replicas, so the ack waits until every
+  member of the in-sync set holds the record.
+- `minIsr` (`RUNE_MIN_ISR`, default the cluster majority; see [configuration](../configuration.md)) is checked twice:
+  the leader refuses the produce up front while the in-sync set is smaller than `minIsr` (a retriable
+  `MinIsrViolation`, which the producer re-sends with the same identity), and the ack is only sent while the set is
+  still at least `minIsr` at the moment the high watermark passes the record. A leader left alone in the set never
+  acknowledges `Ok` for a `minIsr` of 2 or more.
+- With `minIsr` 1 (a single node, or `RUNE_MIN_ISR=1`) the in-sync set can shrink to the leader alone and still
+  acknowledge, so one broker failure can lose an acknowledged record exactly as with `Leader`.
+- If the high watermark has not passed the record after the broker's ack timeout (30 s by default), the produce is
+  answered `Internal` (6); the record may still be committed later, so the producer treats it as in doubt and retries
+  it with the same producer id and sequence, which the broker deduplicates.
+
+The topic's durability tier (`tier = leader | majority | strict`, see [QL](ql.md)) is separate from the ack level.
+`strict` adds a local `fsync` before the ack: with `Acks::Leader` the ack waits for the leader's `fsync`, with
+`Acks::All` it waits for the `fsync` and then for the high watermark. The other tiers do not delay the ack for an
+`fsync`, so a record acked under them is not necessarily on disk yet. A tier does not change which brokers must hold
+the record; that is the ack level's job. `Acks::View` (a flag) only adds a wait for the views and does not weaken the
+level it is combined with.
 
 ### Acknowledgements
 
