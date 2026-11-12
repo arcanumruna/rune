@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -328,13 +329,21 @@ void sendAcked(Actor& a, const std::vector<std::string>& vs, std::initializer_li
     }
 }
 /// A committed sentinel transaction, then R has seen it.  Returns after R delivered "sentinel".
-void sentinel(Actor& w, Reader& r, std::initializer_list<Actor*> pumped) {
+void sentinel(Actor& w, Reader& r, std::initializer_list<Actor*> pumped, const std::function<std::string()>& diag = {}) {
     w.producer->beginTransaction();
     ASSERT_NO_FATAL_FAILURE(sendAcked(w, {"sentinel"}, pumped));
     const rc::Token c = w.commit();
     ASSERT_TRUE(w.await(c, pumped));
     ASSERT_EQ(w.result(c).status, rc::OpStatus::Ok) << "sentinel commit, code " << w.result(c).errorCode;
-    ASSERT_TRUE(pumpUntil({&r}, [&] { return r.has("sentinel"); })) << "R never delivered the sentinel";
+    if (pumpUntil({&r}, [&] { return r.has("sentinel"); })) return;
+    // R stayed behind.  Say what it had seen, what `diag` reports of the cluster, and whether the sentinel still arrives
+    // when both clients are pumped for another minute (slow, or stuck).
+    const std::size_t seenAtCap = r.seen.size();
+    const std::string state    = diag ? diag() : std::string();
+    const bool        late     = pumpUntil({&w, &r}, [&] { return r.has("sentinel"); });
+    FAIL() << "R never delivered the sentinel: seen " << seenAtCap << " record(s) at the cap, "
+           << (late ? "arrived late with both clients pumped" : "still missing a minute later") << " (seen " << r.seen.size()
+           << "); " << state;
 }
 /// Holder A acquires the lease (first attempt) and keeps it; A's producer is initialised and bound.
 void takeLease(Actor& a, uint64_t holder, uint64_t ttlMs, const std::string& txnId, bool bindProducer = true) {
@@ -618,7 +627,17 @@ TEST_P(LeaseTxnGuardBrokerRegression, LeaderChangeMidCommitGuarded) {
 
     std::vector<int32_t> leaders;
     ASSERT_TRUE(awaitLeaders(*rig.three, rig.data.topicId, 1, leaders, 60s));
-    ASSERT_NO_FATAL_FAILURE(sentinel(a, r, {&a}));
+    ASSERT_NO_FATAL_FAILURE(sentinel(a, r, {&a}, [&] {
+        std::string s;
+        for (int id : rig.three->runningNodes()) {
+            rune::node::BrokerNode& n = rig.three->node(id);
+            s += "node " + std::to_string(id) + ": leader " + std::to_string(leaderOn(n, rig.data.topicId, 0));
+            s += n.onOwnerThreadForTest(rig.data.topicId, 0, [](rune::replication::PartitionReplica& p) {
+                return " leo " + std::to_string(p.log()->logEndOffset()) + " hw " + std::to_string(p.highWatermark()) + "; ";
+            });
+        }
+        return s;
+    }));
     auto expect = vs;
     expect.push_back("sentinel");
     EXPECT_EQ(sorted(r.seen), sorted(expect)) << "every record exactly once";
