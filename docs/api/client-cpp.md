@@ -769,9 +769,10 @@ for (int restarts = 0;;) {                                                      
   reads its own write) and `requestedFingerprint`. `scanView` / `scanViewAndWait(topic, prefix, limit, ViewScanOptions)` reads
   one page of at most `limit` rows (0 = 256; a page also stops at 61,440 row bytes).
 - `ViewScanResult`: `rows`, `nextToken` (empty on the last page; `complete()` is `status == kOk` and no token) and `status`.
-  **Pages are unordered** (table order). A row added or removed under the prefix between pages invalidates the token:
-  `status` is `ViewRowResult::kCursorInvalidated` (8, the same value as `kNotLeader`) and the scan restarts from the first page.
-  A scan sees each row of a quiet prefix once.
+  **Pages are in hash order**, and the token is a stable position, so writes under the prefix between pages never
+  invalidate it: a row that stays under the prefix is returned exactly once, a row added or removed meanwhile may or may not
+  appear, and none appears twice (not a snapshot). A page may hold no rows and still carry a token: loop until
+  `complete()`. `ViewRowResult::kCursorInvalidated` (8, the same value as `kNotLeader`) now only answers a malformed token.
 - With the token form (`scanView`), a `Completions` that polls the result needs `maxResultBytes` of at least 64 KiB, else the page is `ResultTooLarge`.
   The completion's `OpKind` is `GetViewRowK` or `ScanViewRows`; decode a scan's payload with `rune::client::view::decodeScanPayload`.
 - Both calls end `BrokerTooOld` without sending when the seed's `brokerVersion` is below `kBrokerVersionCheckedWrites` (10).

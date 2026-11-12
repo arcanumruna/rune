@@ -347,10 +347,18 @@ while the cluster is below the checked-writes feature level.
   row bytes. The answer is a `ScanViewRowsResponse` (90): `nextToken` is empty when the scan is complete, else 12 bytes to
   send back as `resumeToken`; `rows` is `rowCount` entries of `[length u32][view row]`, each row decoded like a `GetViewRow`
   row. A page is read in one worker step, so it is consistent.
-- **Pages are unordered**: rows come in table order, not key order, and a scan visits each row under the prefix once.
-  An insert or erase under the prefix between two pages invalidates the token: the answer is status 8
-  (`CursorInvalidated`) with no rows, and the client restarts the scan. The C++ `ViewRowResult::kCursorInvalidated` shares
-  the value 8 with the client-side `kNotLeader`; restart on both.
+- **Pages are in hash order, not key order.** The 12-byte token is `[r u32 LE][word u64 LE]`: the position of the last row
+  returned, where `word` is the row's slot word and `r` is the bit reversal of the low 32 bits of its hash. A page returns
+  the rows strictly above the token in `(r, word)` order, so a row's position depends on its key alone. A row that stays
+  under the prefix for the whole scan is returned exactly once whatever is inserted, erased or reorganized between pages; a
+  row inserted or erased during the scan may or may not be returned; no row is returned twice. A scan is not a snapshot
+  and always finishes, whatever the write rate. Rows whose hashes are equal (a 64-bit collision of two wide keys) are
+  returned together on one page; a group that does not fit an empty page is `RowTooLarge`.
+- **A page may hold no rows and still carry a token.** A worker step looks at a bounded number of index slots (4096); when
+  that runs out the page is `Ok` with `rowCount` 0 and a `nextToken` to continue from. Only an empty `nextToken` ends a
+  scan. A token of the wrong length is `InvalidRequest`; status 8 (`CursorInvalidated`) is kept for a malformed token and
+  is no longer answered for a write under the prefix. A token for a prefix with no rows left ends the scan. The C++
+  `ViewRowResult::kCursorInvalidated` shares the value 8 with the client-side `kNotLeader`.
 - **`minOffset`** (both frames, `-1` = none) is the read-your-writes barrier for a write acknowledged with the `ProduceResponse`
   `baseOffset`: the read waits until the view has folded that source offset. A waiting read is held for at most 100 ms and
   is then answered `NotReady`; a worker holds at most 256 reads, and one more is answered `NotReady` at once. Without it a

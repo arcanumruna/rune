@@ -3255,7 +3255,7 @@ TEST(CheckedWritesBrokerRegression, RenameMovesTheRowShardRegression) {
     EXPECT_EQ(readRow(c, view, keyOf("bravo")).status, rc::ViewRowResult::kOk);
 }
 
-TEST(CheckedWritesBrokerRegression, ScanAcrossPagesThenCursorInvalidatedShardRegression) {
+TEST(CheckedWritesBrokerRegression, ScanAcrossPagesThenAWriteKeepsTheCursorShardRegression) {
     Broker b("cw07-pages", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
@@ -3300,12 +3300,57 @@ TEST(CheckedWritesBrokerRegression, ScanAcrossPagesThenCursorInvalidatedShardReg
     ASSERT_TRUE(isOk(w.write(rc::Key(lastOnPage), {})));
     rc::ViewScanOptions resume;
     resume.resumeToken = first.nextToken;
-    const auto stale = c.scanViewAndWait(view, prefix, 100, resume, 10s);
-    EXPECT_EQ(stale.status, rc::ViewRowResult::kCursorInvalidated);
+    const auto rest = c.scanViewAndWait(view, prefix, 100, resume, 10s);
+    EXPECT_EQ(rest.status, rc::ViewRowResult::kOk) << "#573: a write under the prefix no longer invalidates the cursor";
+    for (const uint64_t id : idsOf(cols, rest.rows)) EXPECT_NE(id, lastOnPage) << "the erased row is not returned again";
 
     const auto again = scanRows(c, view, prefix, 100);
     ASSERT_TRUE(again.has_value());
     EXPECT_EQ(again->size(), kTotal - 1);
+}
+
+TEST(CheckedWritesBrokerRegression, AMultiPageScanCompletesWhileAProducerWritesUnderTheSamePrefixShardRegression) {
+    Broker b("cw07-hotscan", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = defineCharacters(c);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    const int32_t view = createView(c, accountCharactersPlan(t.topicId), "characterId");
+    ASSERT_GE(view, 0);
+    const ViewColumns cols(b.node(), "account_characters");
+    rcv::ViewKeyBuilder builder = keyBuilder(b.node(), "account_characters");
+    KeyedSender w(b.clientConfig(), "character", t.topicId, 1, kAllView);
+
+    constexpr uint64_t kTotal = 300;
+    std::vector<std::pair<rc::Key, std::string>> records;
+    for (uint64_t id = 1; id <= kTotal; ++id) records.emplace_back(rc::Key(id), characterValue(id, 42, "c" + std::to_string(id)));
+    ASSERT_TRUE(w.writeAll(records));
+    const std::vector<uint8_t> prefix = bytesOf(builder.setUInt("userId", 42).prefix());
+
+    std::set<uint64_t> erased;
+    std::vector<uint64_t> seenAll;
+    rc::ViewScanOptions opts;
+    bool complete = false;
+    uint64_t nextId = 1000;
+    for (int i = 0; i < 40 && !complete; ++i) {   // hard cap: the old scan restarted forever here
+        const auto page = c.scanViewAndWait(view, prefix, 50, opts, 10s);
+        ASSERT_EQ(page.status, rc::ViewRowResult::kOk) << "page " << i;
+        for (const uint64_t id : idsOf(cols, page.rows)) seenAll.push_back(id);
+        if (page.complete()) { complete = true; break; }
+        opts.resumeToken = page.nextToken;
+        // The producer writes under the same prefix between every two pages: one new row, and one old row erased.
+        ASSERT_TRUE(isOk(w.write(rc::Key(nextId), characterValue(nextId, 42, "n" + std::to_string(nextId)))));
+        ++nextId;
+        const uint64_t victim = 1 + static_cast<uint64_t>(i) * 7 % kTotal;
+        if (erased.insert(victim).second) ASSERT_TRUE(isOk(w.write(rc::Key(victim), {})));
+    }
+    ASSERT_TRUE(complete);
+    const std::set<uint64_t> seen(seenAll.begin(), seenAll.end());
+    EXPECT_EQ(seen.size(), seenAll.size()) << "no row is returned twice";
+    for (uint64_t id = 1; id <= kTotal; ++id) {
+        if (erased.count(id) == 0) EXPECT_TRUE(seen.count(id)) << "row " << id << " stayed under the prefix and was skipped";
+    }
 }
 
 TEST(CheckedWritesBrokerRegression, MinOffsetReadSeesTheWriteShardRegression) {

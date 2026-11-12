@@ -96,7 +96,7 @@ TEST(CheckedWritesViewRead, EmptyPrefixPageIsOkWithNoRowsAndNoToken) {
     EXPECT_TRUE(page.token.empty());
 }
 
-TEST(CheckedWritesViewReadRegression, ErasedTokenRowAnswersCursorInvalidatedRegression) {
+TEST(CheckedWritesViewReadRegression, ErasedTokenRowDoesNotInvalidateTheScanRegression) {
     CwViewReadWorkerRig r;
     const auto c = accountCharacters(r.src);
     r.install(c);
@@ -107,10 +107,16 @@ TEST(CheckedWritesViewReadRegression, ErasedTokenRowAnswersCursorInvalidatedRegr
     ASSERT_EQ(page1.rows.size(), 5u);
     ASSERT_EQ(page1.token.size(), 12u);
 
-    r.append({Rec{5, 42, "", 0, true}});   // the token's row (the fifth) is erased
+    const uint64_t tokenRow = rune::view::readSlot(page1.rows.back().data(), c.rowLayout, 1).u;
+    r.append({Rec{tokenRow, 42, "", 0, true}});   // the token's row (the last one returned) is erased
     const auto page2 = r.scan(beKey({42}), page1.token, 5);
-    EXPECT_EQ(page2.code, Status::kCursorInvalidated);
-    EXPECT_TRUE(page2.rows.empty());
+    // #573: the token is a hash-order position, so erasing the row it names changes nothing for the rest of the scan.
+    EXPECT_EQ(page2.code, kOk);
+    EXPECT_EQ(page2.rows.size(), 5u);
+    const auto page3 = r.scan(beKey({42}), page2.token, 5);
+    EXPECT_EQ(page3.code, kOk);
+    EXPECT_EQ(page3.rows.size(), 2u) << "the other 7 rows: 5 + 2";
+    EXPECT_TRUE(page3.token.empty());
 }
 
 TEST(CheckedWritesViewReadRegression, ScanNeverCrossesIntoAnotherPrefixRegression) {
@@ -121,10 +127,14 @@ TEST(CheckedWritesViewReadRegression, ScanNeverCrossesIntoAnotherPrefixRegressio
     r.append(userRows(42, 1, 12));
     r.append(userRows(43, 100, 12));
 
+    // Every row of a prefix has the same hash here, so the 12 rows are ONE equal-position group (#573): a page that
+    // cannot hold the whole group answers kRowTooLarge instead of splitting it.
+    EXPECT_EQ(r.scan(beKey({42}), {}, 5).code, Status::kRowTooLarge);
+
     std::vector<uint8_t> token;
     std::size_t total = 0;
     for (int pages = 0; pages < 10; ++pages) {
-        const auto page = r.scan(beKey({42}), token, 5);
+        const auto page = r.scan(beKey({42}), token, 12);
         ASSERT_EQ(page.code, kOk);
         for (const auto& row : page.rows) EXPECT_EQ(rune::view::readSlot(row.data(), c.rowLayout, 0).u, 42u);
         total += page.rows.size();

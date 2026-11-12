@@ -6,7 +6,6 @@
 #include <bit>
 #include <cassert>
 #include <chrono>
-#include <random>
 #include <utility>
 
 namespace rune::view {
@@ -117,8 +116,6 @@ ViewTable::ViewTable(RowLayout layout, size_t initialIndexSlots, size_t chunkByt
         outer_.init(initialIndexSlots, true, hashSeed_, hashMask_);
         chunkBytes_ = chunkBytes;
         blockFree_.resize(32);
-        std::random_device rd;
-        versionClock_ = (uint64_t{rd()} << 32) | rd();
     }
 
     appendChunk(); // start with one chunk so rid 0 is always addressable
@@ -622,7 +619,6 @@ void ViewTable::prefixInsert(const Probe& p, uint32_t rid) {
     b.words[i] = p.word;
     b.rids[i]  = rid;
     ++s.size;
-    s.version = ++versionClock_;
 }
 
 void ViewTable::prefixErase(const Probe& p, uint32_t rid) noexcept {
@@ -654,7 +650,6 @@ void ViewTable::prefixErase(const Probe& p, uint32_t rid) noexcept {
         backshiftDelete(ob.tags, ob.words, ob.rids, ob.cap - 1, slotOf(ob), home);
     }
     --s.size;
-    s.version = ++versionClock_;
 
     if (s.size == 0) {
         // Both blocks are empty here: a deleted entry leaves no tombstone.

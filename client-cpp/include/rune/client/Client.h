@@ -255,8 +255,8 @@ struct ViewRowResult {
     /// with the defaults (5 s each) a read that is never routed ends as kNotLeader or
     /// as a Timeout (the *AndWait form throws), whichever bound is hit first.
     static constexpr uint16_t kNotLeader       = 8;
-    /// A scan's resume token no longer matches its prefix: restart the scan (the broker's ViewRowResponse::kCursorInvalidated).
-    /// Shares the value 8 with kNotLeader: a routing failure of a scan reads the same, and restarting is right for both.
+    /// A scan's resume token is malformed (the broker's ViewRowResponse::kCursorInvalidated); a write under the prefix no longer
+    /// invalidates it.  Shares the value 8 with kNotLeader: a routing failure of a scan reads the same, and restarting is right for both.
     static constexpr uint16_t kCursorInvalidated = 8;
 
     uint16_t              status = kUnknownView;

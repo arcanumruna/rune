@@ -261,8 +261,13 @@ TEST(CheckedWritesViewSet, ScanStatuses) {
     EXPECT_EQ(r.scan(prefix, token, 4).status, Status::kOk);
     r.log.append({{99, 42, "z", 1}});   // an insert under the prefix
     r.fold();
-    EXPECT_EQ(r.scan(prefix, token, 4).status, Status::kCursorInvalidated);
-    EXPECT_EQ(r.scan(beKey({77}), token, 4).status, Status::kCursorInvalidated) << "a token for a prefix with no rows";
+    EXPECT_EQ(r.scan(prefix, token, 4).status, Status::kOk) << "a write under the prefix no longer invalidates the token (#573)";
+    const auto none = r.scan(beKey({77}), token, 4);
+    EXPECT_EQ(none.status, Status::kOk) << "a token for a prefix with no rows: nothing is left";
+    EXPECT_EQ(none.rows, 0u);
+    EXPECT_EQ(none.nextTokenLen, 0u);
+    const uint8_t badToken[5] = {};
+    EXPECT_EQ(r.scan(prefix, badToken, 4).status, Status::kInvalidRequest);
 
     ASSERT_TRUE(r.vs.beginDiscardForTest(kViewTopic, 0, rune::node::ViewDiscardReason::Unreadable));
     EXPECT_EQ(r.scan(prefix).status, Status::kNotReady);

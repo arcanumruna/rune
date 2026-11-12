@@ -576,10 +576,13 @@ ProducerConfig{.acks = Acks::All | Acks::View};
   - An oversized single row still gets `kRowTooLarge`.
 - **Consistency.**
   - A page is atomic: it is served in one worker step.
-  - Across pages: the resume token is the scan position in the prefix's set plus that set's version. Any insert or
-    erase under the prefix bumps the version (versions never repeat within an incarnation), and a token with a stale
-    version gets the new status `kCursorInvalidated`; the client restarts the scan. So a scan that completes saw the
-    prefix unchanged from its first page to its last.
+  - Across pages (#573): the resume token is `[r u32 LE][word u64 LE]`, the hash-order position of the last row
+    returned (`r` = bit reversal of the low 32 bits of the row's hash, `word` = the slot word). A page returns the rows
+    strictly above the token in `(r, word)` order. A row's position depends on its key alone, so a row that stays under
+    the prefix for the whole scan is returned exactly once whatever is inserted, erased, grown, shrunk or migrated
+    meanwhile; a row inserted or erased during the scan may or may not be returned; none is returned twice. It is not a
+    snapshot, and a scan always finishes. A worker step looks at 4096 slots at most, so a page may hold no rows and
+    still carry a token. `kCursorInvalidated` is kept only for a malformed token.
   - A user's ≤ 12 characters always fit in one page.
 - **Client.**
   - `getViewRowAndWait(view, key)` and `scanViewAndWait(view, prefix, limit)`.
@@ -926,8 +929,8 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 
 **Reads:**
 - a point read and a prefix read right after an acked write
-- a scan across pages with an insert or an erase under the prefix between them (`kCursorInvalidated`); a change under
-  another prefix, or an in-place update, does not invalidate it
+- a scan across pages with inserts and erases under the prefix between them (#573): it completes, returns every row that
+  stayed once and none twice
 - a scan of an empty prefix
 - a forced hash collision, using a fixed seed through a test hook
 - pre-existing duplicate names: the smallest source key owns the row, it is promoted correctly on delete and on rename, and a compaction followed by a refold gives the same owner
