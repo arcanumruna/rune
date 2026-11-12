@@ -302,6 +302,23 @@ void SecurityAdmin::startNext_(int64_t nowNs) {
 }
 
 namespace {
+/// #230: the names the broker records as principals ("bootstrap" for the bootstrap, "anonymous" for dev mode): no user
+/// may carry one, or the audit trail could not tell the user from the broker.  ASCII case-insensitive; no allocation.
+/// Only the leader enforces it: the frozen apply rules accept these names so an existing log still replays.
+bool reservedPrincipalName(std::string_view n) noexcept {
+    const auto eq = [&](std::string_view reserved) noexcept {
+        if (n.size() != reserved.size()) return false;
+        for (std::size_t i = 0; i < n.size(); ++i) {
+            const char c = (n[i] >= 'A' && n[i] <= 'Z') ? static_cast<char>(n[i] - 'A' + 'a') : n[i];
+            if (c != reserved[i]) return false;
+        }
+        return true;
+    };
+    return eq("bootstrap") || eq("anonymous");
+}
+} // namespace
+
+namespace {
 /// The Principal of an event from the request's meta.
 sec::Principal principalOf(const DdlMeta& meta, std::string authenticated, uint64_t fingerprint) {
     sec::Principal p;
@@ -591,6 +608,10 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
                                           "valid for '" + m.name + "'");
         return;
     }
+    if (opKind == pc::SecurityOpKind::CreateUser && reservedPrincipalName(target->local)) {
+        answer_(req, kInvalidRequest, "the user name '" + std::string{target->local} + "' is reserved");
+        return;
+    }
     e.nsId = target->nsId;
     e.kind = sec::kindOf(ops);
     e.ops = std::move(ops);
@@ -661,6 +682,10 @@ void SecurityAdmin::startBootstrap_(const SecurityBootstrapMsg& m, int64_t nowNs
     }
     if (state.hasSecurityAdmin()) {
         answer_(req, kInvalidRequest, "security is already bootstrapped (a security admin exists)");
+        return;
+    }
+    if (reservedPrincipalName(m.adminName)) {
+        answer_(req, kInvalidRequest, "the user name '" + m.adminName + "' is reserved");
         return;
     }
     sec::BootstrapOps ops{m.verifier, m.fakeSaltSeed};

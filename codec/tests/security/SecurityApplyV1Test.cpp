@@ -346,3 +346,13 @@ TEST(SecurityApplyV1Adversarial, DropRoleWithManyMembersRemovesEveryMembershipAn
     for (const auto& e : log) ASSERT_TRUE(rs::apply(replayed, e, off++).has_value());
     EXPECT_EQ(replayed.digest(), sc.s.digest()) << "the state equals a replay of its events";
 }
+
+// #230: the broker's leader refuses the names it uses as principals, but the frozen apply rules do not: an existing
+// log that holds such a user must still replay.
+TEST(SecurityApplyRegression, AnExistingUserNamedBootstrapStillAppliesRegression) {
+    Script sc;
+    ASSERT_TRUE(sc.run(rs::CreateUserOps{v(1)}, "bootstrap").has_value());
+    EXPECT_NE(sc.s.userByName(rune::catalog::kDefaultNsId, "bootstrap"), nullptr);
+    ASSERT_TRUE(sc.run(rs::CreateUserOps{v(2)}, "anonymous").has_value());
+    EXPECT_NE(sc.s.userByName(rune::catalog::kDefaultNsId, "anonymous"), nullptr);
+}

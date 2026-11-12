@@ -11,7 +11,8 @@ For what changed for existing deployments, see [the release notes](release-notes
 
 ## The model
 
-- **Principal:** a user. Services such as world servers are users too.
+- **Principal:** a user. Services such as world servers are users too. The names `bootstrap` and `anonymous`
+  (any letter case) are reserved for the broker's own audit principals: the leader refuses to create a user with one.
 - **Role:** a named set of grants.
 - **Grant:** an operation on a resource type, matched by an exact name or a prefix.
   - Operations: `READ`, `WRITE`, `CREATE`, `ALTER`, `DROP`, `DESCRIBE`, `ADMIN`, `IMPORT`.

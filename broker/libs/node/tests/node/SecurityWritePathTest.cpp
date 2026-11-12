@@ -169,6 +169,40 @@ TEST(SecurityWritePathRegression, RefusalsAnswerInvalidRequestNamingTheRuleAndAp
     EXPECT_EQ(rig.admin().startedCount(), rig.admin().answeredCount());
 }
 
+// #230: the names the broker records as principals ("bootstrap", "anonymous") cannot be given to a user: the audit
+// trail could not tell the user from the broker.  The leader refuses; the frozen apply rules (replay) do not.
+TEST(SecurityAdminRegression, ReservedPrincipalNamesAreRefusedRegression) {
+    SecurityDdlRig rig("reserved_names");
+    rig.becomeServingLeader();
+    const std::size_t logged = rig.recordedEvents().size();
+    for (const char* name : {"bootstrap", "Bootstrap", "BOOTSTRAP", "anonymous", "Anonymous"}) {
+        const auto a = rig.ddl(rig.createUser(name, "a-long-password-1"));
+        EXPECT_EQ(a.code, kInvalidRequest) << name << ": " << a.detail;
+        EXPECT_EQ(a.detail, std::string{"the user name '"} + name + "' is reserved") << name;
+        EXPECT_EQ(a.gateOffset, -1) << name << ": a refusal is not gated";
+        EXPECT_EQ(rig.recordedEvents().size(), logged) << name << ": nothing appended";
+        EXPECT_EQ(rig.state().userByName(rune::catalog::kDefaultNsId, name), nullptr) << name;
+    }
+    for (const char* name : {"bootstrap2", "my.bootstrap", "anonymous_reader"}) {
+        const auto a = rig.ddl(rig.createUser(name, "a-long-password-1"));
+        EXPECT_EQ(a.code, 0) << name << ": " << a.detail;
+        EXPECT_NE(rig.state().userByName(rune::catalog::kDefaultNsId, name), nullptr) << name;
+    }
+    EXPECT_EQ(rig.recordedEvents().size(), logged + 3);
+}
+
+TEST(SecurityAdminRegression, AReservedBootstrapAdminNameIsRefusedRegression) {
+    SecurityDdlRig rig("reserved_boot");
+    rig.becomeServingLeader();
+    for (const char* name : {"bootstrap", "ANONYMOUS"}) {
+        const auto a = rig.bootstrap(rig.bootstrapMsg(name, "initial-one-time-pw"));
+        EXPECT_EQ(a.code, kInvalidRequest) << name << ": " << a.detail;
+        EXPECT_EQ(a.detail, std::string{"the user name '"} + name + "' is reserved") << name;
+        EXPECT_TRUE(rig.recordedEvents().empty()) << name << ": nothing appended";
+    }
+    EXPECT_EQ(rig.bootstrap(rig.bootstrapMsg("admin", "initial-one-time-pw")).code, 0);
+}
+
 TEST(SecurityWritePathRegression, DuplicateRequestIdAnswersTheOriginalResultRegression) {
     SecurityDdlRig rig("dup");
     rig.becomeServingLeader();
