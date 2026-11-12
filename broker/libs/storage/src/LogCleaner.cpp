@@ -29,14 +29,14 @@
 
 namespace rune::storage {
 
-namespace {
-
 // Mirror LogSegment::fname — produce the on-disk path for a segment.
 std::string segmentLogPath(const std::string& dir, int64_t baseOffset) {
     std::ostringstream os;
     os << dir << "/" << std::setw(20) << std::setfill('0') << baseOffset << ".log";
     return os.str();
 }
+
+namespace {
 
 std::string segmentIndexPath(const std::string& dir, int64_t baseOffset) {
     std::ostringstream os;
@@ -666,7 +666,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
 void LogCleaner::noteDamage_(const std::string& dir, int64_t segBase, std::size_t pos) {
     if (damaged_.has_value()) return;
     damaged_ = Damaged{segBase, pos};
-    spdlog::warn("LogCleaner: damaged batch in {} segment {} at byte {}: the log is uncleanable until restart",
+    spdlog::warn("LogCleaner: damaged batch in {} segment {} at byte {}: the log is uncleanable until the damaged segment is gone or the broker restarts",
                  dir, segBase, pos);
 }
 
@@ -1442,6 +1442,26 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
     // Clean up stale .log.new temp files left by a previous crashed run.
     for (auto& e : std::filesystem::directory_iterator(dir)) {
         if (e.path().extension() == ".new") std::filesystem::remove(e.path());
+    }
+
+    // A segment adopted from the provisioner's ready pool can be sealed and in the snapshot while its file still has the
+    // staging name (the rename to <base>.log is queued on the provisioner thread).  The scan would read it as empty, so
+    // the pass ends below it: the watermark never moves over records that were not read.
+    for (const int64_t b : sealedBases) {
+        if (b >= activeBase) break;
+        std::error_code existsEc;
+        if (!std::filesystem::exists(segmentLogPath(dir, b), existsEc)) {
+            activeBase = b;
+            result.unreadable = true;
+            break;
+        }
+    }
+    if (result.unreadable) {
+        result.passEnd = activeBase;
+        if (activeBase <= globalDirtyStart) {
+            result.passEnd = globalDirtyStart;   // nothing readable in the dirty range: no advance, nothing written
+            return result;
+        }
     }
 
     // Fill the caller-owned dedupe map ONCE over the whole dirty section (clear()

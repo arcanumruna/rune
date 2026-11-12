@@ -60,28 +60,25 @@ TEST(CheckedWritesQlView, TargetBlockViewsParse) {
     expectKey(ui.key, {{"provider", KeyFunction::None, "provider"}, {"subject", KeyFunction::None, "subject"}});
     expectItems(ui.items, {{ItemKind::Column, "userId", ""}});
     EXPECT_EQ(ui.source, "user");
-    EXPECT_TRUE(ui.groupBy.empty());
     EXPECT_TRUE(ui.constraints.empty());
 
     auto dh = view("create view device_history key (userId, deviceFp) as select min(ts) as firstSeen, max(ts) as lastSeen, "
-                   "count(*) as logins, last(platform) as platform from device_login group by userId, deviceFp;");
+                   "count(*) as logins, last(platform) as platform from device_login;");
     EXPECT_FALSE(dh.unique);
     expectKey(dh.key, {{"userId", KeyFunction::None, "userId"}, {"deviceFp", KeyFunction::None, "deviceFp"}});
     expectItems(dh.items, {{ItemKind::Min, "ts", "firstSeen"}, {ItemKind::Max, "ts", "lastSeen"},
                            {ItemKind::CountAll, "", "logins"}, {ItemKind::Last, "platform", "platform"}});
     EXPECT_EQ(dh.source, "device_login");
-    expectKey(dh.groupBy, {{"userId", KeyFunction::None, "userId"}, {"deviceFp", KeyFunction::None, "deviceFp"}});
 
     auto cn = view("create unique view character_name key lower(name) as nameKey as select characterId from character;");
     EXPECT_TRUE(cn.unique);
     expectKey(cn.key, {{"name", KeyFunction::Lower, "nameKey"}});
     expectItems(cn.items, {{ItemKind::Column, "characterId", ""}});
 
-    auto as = view("create view account_stats key userId as select count(*) as characters from character group by userId "
+    auto as = view("create view account_stats key userId as select count(*) as characters from character "
                    "constraint max_characters check (characters <= 12);");
     expectKey(as.key, {{"userId", KeyFunction::None, "userId"}});
     expectItems(as.items, {{ItemKind::CountAll, "", "characters"}});
-    expectKey(as.groupBy, {{"userId", KeyFunction::None, "userId"}});
     ASSERT_EQ(as.constraints.size(), 1u);
     EXPECT_EQ(as.constraints[0].name, "max_characters");
     const auto& p = as.constraints[0].predicate;
@@ -116,7 +113,7 @@ TEST(CheckedWritesQlView, Modifiers) {
     EXPECT_TRUE(v.unique);
     EXPECT_EQ(errorOf("create unique transient view v key id as select x from s;"),
               "expected 'view' after 'create [or replace] [transient] [unique]', got 'transient'");
-    EXPECT_EQ(errorOf("create frob v;"), "expected 'user', 'role' or 'view' after 'create', got 'frob'");
+    EXPECT_EQ(errorOf("create frob v;"), "expected 'topic', 'lease', 'transient', 'view', 'user' or 'role' after 'create', got 'frob'");
 }
 
 TEST(CheckedWritesQlView, PredicateTree) {
@@ -158,15 +155,30 @@ TEST(CheckedWritesQlView, PredicateTree) {
 TEST(CheckedWritesQlView, ItemErrors) {
     const std::string h = "create view v key id as select ";
     EXPECT_EQ(errorOf(h + "*, a from s;"), "'*' cannot be combined with other select items");
-    EXPECT_EQ(errorOf(h + "sum(*) as t from s group by id;"), "'*' is only valid in count(*)");
-    EXPECT_EQ(errorOf(h + "count(*) from s group by id;"), "count(*) needs 'as <name>'");
-    EXPECT_EQ(errorOf(h + "min(ts) from s group by id;"), "min(…) needs 'as <name>'");
+    EXPECT_EQ(errorOf(h + "sum(*) as t from s;"), "'*' is only valid in count(*)");
+    EXPECT_EQ(errorOf(h + "count(*) from s;"), "count(*) needs 'as <name>'");
+    EXPECT_EQ(errorOf(h + "min(ts) from s;"), "min(…) needs 'as <name>'");
     auto star = view(h + "* from s;");
     expectItems(star.items, {{ItemKind::Star, "", ""}});
 }
 
+TEST(CheckedWritesQlViewRegression, GroupByIsRefusedRegression) {
+    const std::string msg = "'group by' is not part of create view: an aggregate view is grouped by its key; remove 'group by …'";
+    EXPECT_EQ(errorOf("create view v key id as select count(*) as n from s group by id;"), msg);
+    EXPECT_EQ(errorOf("create view v key (a, b) as select count(*) as n from s group by a, b;"), msg);
+    EXPECT_EQ(errorOf("create view v key id as select count(*) as n from s group by id constraint c check (n <= 1);"), msg);
+    EXPECT_EQ(errorOf("create view v key id as select a from s group by id;"), msg);
+    // The refusal sits at `group` (1-based column of the token after "from s ").
+    auto r = ql::parse("create view v key id as select count(*) as n from s group by id;");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().col, 53u);
+    // Without it the statement still parses, with or without a constraint.
+    view("create view x key a as select a from t;");
+    view("create view x key a as select count(*) as n from t constraint c check (n <= 1);");
+}
+
 TEST(CheckedWritesQlView, KeywordsStayUsableAsNames) {
-    auto v = view("create view v key key as select count, min as m, last from from group by group;");
+    auto v = view("create view v key key as select count, min as m, last from from;");
     expectItems(v.items, {{ItemKind::Column, "count", ""}, {ItemKind::Column, "min", "m"}, {ItemKind::Column, "last", ""}});
     EXPECT_EQ(v.source, "from");
 }

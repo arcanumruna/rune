@@ -2440,7 +2440,7 @@ Scenario aggScenarioOf(const Cell& c, AggRule07 rule) {
     s.plan.viewName = "device_history_07";
     s.plan.persistence = 1;
     s.plan.sources = {{VerdictRig::kSrc, "eventId"}};
-    s.plan.keyComponents = s.plan.groupBy = c.entity == Entity::KeyComposite
+    s.plan.keyComponents = c.entity == Entity::KeyComposite
         ? std::vector<rune::view::KeyComponent>{{"userId", 0, "userId"}, {"deviceId", 0, "deviceId"}}
         : std::vector<rune::view::KeyComponent>{{"deviceFp", rune::codec::kKeyFunctionLower, "fpKey"}, {"userId", 0, "userId"}};
     if (c.entity == Entity::KeyLower) s.plan.unicodeVersion = rune::codec::kUnicodeVersion;

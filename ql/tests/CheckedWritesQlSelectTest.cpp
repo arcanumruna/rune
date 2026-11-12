@@ -102,7 +102,7 @@ TEST(CheckedWritesQlSelect, Errors) {
 }
 
 TEST(CheckedWritesQlRegression, KeywordsAreNamesWhereTheGrammarAllowsRegression) {
-    auto r = ql::parse("create view v key key as select count as min, last(platform) as platform, count(*) as group from src group by key;");
+    auto r = ql::parse("create view v key key as select count as min, last(platform) as platform, count(*) as group from src;");
     ASSERT_TRUE(r.has_value()) << r.error().message;
     const auto& v = std::get<ql::CreateViewDef>(*r);
     ASSERT_EQ(v.key.size(), 1u);
@@ -117,8 +117,8 @@ TEST(CheckedWritesQlRegression, KeywordsAreNamesWhereTheGrammarAllowsRegression)
     EXPECT_EQ(v.items[1].alias, "platform");
     EXPECT_EQ(v.items[2].kind, ItemKind::CountAll);
     EXPECT_EQ(v.items[2].alias, "group");
-    ASSERT_EQ(v.groupBy.size(), 1u);
-    EXPECT_EQ(v.groupBy[0].column, "key");
+    // `group by key` is refused: the aggregate view is grouped by its key.
+    EXPECT_FALSE(ql::parse("create view v key key as select count(*) as group from src group by key;").has_value());
 
     auto s = select("select from, check from unique where key = 1;");
     EXPECT_EQ(s.columns, (std::vector<std::string>{"from", "check"}));

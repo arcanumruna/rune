@@ -48,6 +48,7 @@ extern "C" {
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -385,6 +386,8 @@ public:
     // gateway's worker-return push path (PushRead → handleWorkerReturn_) runs.
     rune::node::WorkerPool*        pool_ = nullptr;
     std::shared_ptr<aeron::Aeron>  aeron_;
+
+    [[nodiscard]] const fs::path& dataDirForTest() const { return dataDir_->path; }
 
 private:
     void startDriver()
@@ -2042,6 +2045,130 @@ INSTANTIATE_TEST_SUITE_P(Paths, GatewayLargeBatchPushRegression, ::testing::Bool
                          [](const ::testing::TestParamInfo<bool>& i) {
                              return i.param ? std::string("WorkerReturn") : std::string("Inline");
                          });
+
+// ---------------------------------------------------------------------------
+// #877: the INLINE push path (no WorkerPool) fails a subscription whose cursor sits at a damaged sealed segment: ONE
+// ErrorResponse{StorageError} naming the subscription, correlationId 0, the cursor parked.  Mutation: restore the
+// single-line `if (view.empty()) continue;` in the gateway's inline read path -> no error ever arrives (red).
+// ---------------------------------------------------------------------------
+class GatewayCorruptPushRegression : public GatewayLargeBatchPushRegression {
+public:
+    // The lowest-base .log file of the "smallseg" partition directory ("" = none).
+    std::string smallsegFirstSegment() const {
+        std::string best;
+        for (const auto& e : fs::recursive_directory_iterator(dataDirForTest())) {
+            if (e.path().extension() != ".log") continue;
+            if (e.path().parent_path().parent_path().filename() != "smallseg") continue;
+            if (best.empty() || e.path().string() < best) best = e.path().string();
+        }
+        return best;
+    }
+
+    // 40 one-record batches over several sealed segments of topic C, then the 2nd batch of segment 0 gets one flipped
+    // byte on the LIVE log (reloadSegments).  Returns D, the first offset of the damaged batch (-1 = setup failed).
+    int64_t makeDamagedSmallseg() {
+        rune::storage::Log* log = registry_->log(kTopicIdC, kPartitionC0);
+        if (!log) return -1;
+        log->setDeferSealSync(false);
+        for (int64_t i = 0; i < 40; ++i) {
+            rune::protocol::RecordBatchBuilder b(i, 1000 + i);
+            b.append("k", "v" + std::to_string(i), 1000 + i);
+            (void)log->append(b.build(), i);
+        }
+        log->sync();
+        const std::string seg0 = smallsegFirstSegment();
+        if (seg0.empty()) return -1;
+        std::vector<std::size_t> starts;
+        {
+            std::ifstream in(seg0, std::ios::binary);
+            std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)), {});
+            std::size_t pos = 0;
+            const auto ovh = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+            for (int guard = 0; guard < 1000 && pos + ovh <= buf.size(); ++guard) {
+                rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+                const int32_t total = r.totalLength();
+                if (total < rune::protocol::batch::kRecordBatchOverhead ||
+                    pos + static_cast<std::size_t>(total) > buf.size()) break;
+                starts.push_back(pos);
+                pos += static_cast<std::size_t>(total);
+            }
+        }
+        if (starts.size() < 3) return -1;
+        int64_t d = -1;
+        {
+            std::ifstream in(seg0, std::ios::binary);
+            in.seekg(static_cast<std::streamoff>(starts[1]));
+            std::vector<uint8_t> hdr(static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead));
+            in.read(reinterpret_cast<char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
+            d = rune::protocol::RecordBatchReader(hdr.data(), hdr.size()).baseOffset();
+        }
+        {
+            std::fstream f(seg0, std::ios::in | std::ios::out | std::ios::binary);
+            const auto ovh = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+            const auto pos = static_cast<std::streamoff>(starts[1] + ovh);
+            f.seekg(pos);
+            char c = 0;
+            f.read(&c, 1);
+            c = static_cast<char>(static_cast<uint8_t>(c) ^ 0x5A);
+            f.seekp(pos);
+            f.write(&c, 1);
+        }
+        if (!log->reloadSegments() || log->damagedSegmentCount() != 1u) return -1;
+        return d;
+    }
+};
+
+TEST_P(GatewayCorruptPushRegression, InlineSubscriptionFailsWithStorageErrorAtTheDamageRegression)
+{
+    ASSERT_FALSE(GetParam()) << "inline path only";
+    Egress eg;
+    Conn c = connect("aeron:ipc", kEgressBase + 80, eg);
+    const int64_t D = makeDamagedSmallseg();
+    ASSERT_GT(D, 0);
+
+    // The damaged subscription (topic C), then a healthy one (topic A partition 1).
+    const std::size_t before = eg.subResps.size();
+    sendSubscribe(*c.ingress, c.sid, 80, kTopicIdC, kPartitionC0, 1, /*from*/0, /*iso*/0);
+    pump([&]() { return eg.subResps.size() > before; }, c.egressSub.get(), &eg.fa, kPumpIter, "#877 SubResp");
+    ASSERT_EQ(eg.subResps.back().errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    const int64_t subBad = eg.subResps.back().subscriptionId;
+    const int64_t subOk  = subscribe(c, eg, kPartitionA1, 81);
+    appendSized(kPartitionA1, 16);
+    appendSized(kPartitionA1, 16);
+
+    bool done = false;
+    for (int i = 0; i < 2'000 && !done; ++i) {
+        gw_->doWork(nowNs());
+        c.egressSub->poll(eg.fa.handler(), 64);
+        done = !eg.errors.empty() && eg.recordsFor(subOk) >= 2;
+    }
+    ASSERT_TRUE(done) << "errors=" << eg.errors.size() << " healthy records=" << eg.recordsFor(subOk);
+    ASSERT_EQ(eg.errors.size(), 1u);
+    EXPECT_EQ(eg.errors[0].code, static_cast<int16_t>(pc::ErrorCode::StorageError));
+    EXPECT_EQ(eg.errors[0].correlationId, 0);
+    const std::string want = "subscription " + std::to_string(subBad) + " topic " + std::to_string(kTopicIdC) +
+                             " partition " + std::to_string(kPartitionC0) + " offset " + std::to_string(D);
+    EXPECT_NE(eg.errors[0].message.find(want), std::string::npos) << eg.errors[0].message;
+    EXPECT_NE(eg.errors[0].message.find("corrupt"), std::string::npos) << eg.errors[0].message;
+    EXPECT_EQ(eg.recordsFor(subOk), 2u) << "the healthy subscription keeps flowing";
+
+    // The bad subscription got exactly the records below the damage.
+    std::vector<int64_t> got;
+    for (const auto& r : eg.records) if (r.subId == subBad) got.push_back(r.baseOffset);
+    ASSERT_EQ(static_cast<int64_t>(got.size()), D);
+    for (int64_t i = 0; i < D; ++i) EXPECT_EQ(got[static_cast<std::size_t>(i)], i);
+
+    // Parked: no second error, nothing at or past the damage, the cursor stays at the damage.
+    for (int i = 0; i < 200; ++i) {
+        gw_->doWork(nowNs());
+        c.egressSub->poll(eg.fa.handler(), 64);
+    }
+    EXPECT_EQ(eg.errors.size(), 1u) << "exactly one error, no spin";
+    for (const auto& r : eg.records) if (r.subId == subBad) EXPECT_LT(r.baseOffset, D);
+    EXPECT_EQ(gw_->subscriptionNextOffsetForTest(subBad), D);
+}
+
+INSTANTIATE_TEST_SUITE_P(Inline, GatewayCorruptPushRegression, ::testing::Values(false));
 
 } // namespace
 } // namespace rune::gateway

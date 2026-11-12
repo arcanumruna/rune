@@ -5,10 +5,12 @@
 // (StorageError on the wire, naming the subscription); a subscription from the next segment reads to the end; the log
 // still appends; and a second restart sees the same damage.  Every wait has a hard cap.
 #include "client/OneBroker.h"
+#include "MetricsTestReader.h"
 
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
 #include <rune/client/Key.h>
+#include <rune/client/group/GroupConsumer.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/protocol/RecordBatch.h>
 
@@ -21,6 +23,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -206,6 +209,15 @@ TEST(CorruptSegmentBrokerRegression, RealClientFailsCorruptBatchAndReadsPastTheD
         ASSERT_EQ(static_cast<int64_t>(got.size()), dmg.D) << "exactly the records below the damage";
         for (int64_t i = 0; i < dmg.D; ++i) EXPECT_EQ(got[static_cast<std::size_t>(i)], i) << "gap or reorder at " << i;
         EXPECT_TRUE(col.heardError("corrupt")) << "onError never heard the broker's message";
+        // #882: the runtime counter rises (worker -> gateway signal -> control-thread publish); bounded wait.
+        std::optional<std::int64_t> reads;
+        for (int i = 0; i < 2000; ++i) {
+            reads = rune::node::test::readRuneMetric(broker.node(), rune::node::RuneMetric::DamagedReads);
+            if (reads && *reads >= 1) break;
+            std::this_thread::sleep_for(5ms);
+        }
+        ASSERT_TRUE(reads.has_value());
+        EXPECT_GE(*reads, 1) << "rune-log-damaged-reads did not count the read that reached the damage";
     }
     {   // from the next segment: everything to the end
         Collected past;
@@ -237,4 +249,87 @@ TEST(CorruptSegmentBrokerRegression, RealClientFailsCorruptBatchAndReadsPastTheD
 
     broker.restart();
     EXPECT_EQ(broker.node().bootDamagedSegmentsForTest(), 1) << "the damage is still kept after a second restart";
+}
+
+// #872: the same damage, reached by a GROUP member (the shipped group path against a real broker).
+TEST(CorruptSegmentBrokerRegression, RealGroupMemberFailsCorruptBatchAtTheDamageRegression) {
+    OneBroker broker("corrupt_seg_group", OneBroker::Runtime::Shard);
+    constexpr std::string_view kTopic = "dmg.g";
+    int32_t topicId = -1;
+    {
+        rc::Client* admin = broker.connectClient();
+        rc::TopicOptions opts;
+        opts.config.segmentRollBytes = 4096;
+        const auto r = admin->defineTopicAndWait(kTopic, 1, "", {}, rc::Persistence::Disk, opts, {}, 30s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+        topicId = r.topicId;
+    }
+    const rc::TopicSpec spec{std::string(kTopic), topicId, 1};
+    Collected none;
+    {
+        auto producerClient = openClient(broker, spec, none);
+        rc::ProducerConfig pc;
+        pc.acks     = rc::Acks::Leader;
+        pc.lingerUs = 0;
+        rc::Producer prod = producerClient->producer(pc);
+        rc::Completions cq(*producerClient);
+        const rc::TopicHandle topic = producerClient->topic(spec.name);
+        for (int k = 0; k < kRecords; ++k)
+            ASSERT_EQ(produceOne(*producerClient, prod, cq, topic, k), k) << "record " << k << " was not acked at its offset";
+        prod.close();
+        producerClient->close();
+    }
+
+    Damage dmg;
+    bool damaged = false;
+    broker.restartWhileStopped([&](const fs::path& dataDir) { damaged = damageFirstSegment(dataDir, kTopic, dmg); });
+    ASSERT_TRUE(damaged) << "no partition directory with >= 3 segments (or < 2 batches in the first)";
+    ASSERT_GT(dmg.D, 0);
+    ASSERT_GT(dmg.nextBase, dmg.D);
+    ASSERT_LT(dmg.nextBase, kRecords);
+    EXPECT_EQ(broker.node().bootDamagedSegmentsForTest(), 1) << "boot recovery must keep and count the damaged segment";
+
+    Collected col;
+    auto reader = openClient(broker, spec, col);
+    // A new group with no committed offset starts at the log start (GroupConfig's default): no setting is needed.
+    rc::GroupConfig gcfg;
+    gcfg.autoCommit       = false;
+    gcfg.sessionTimeoutMs = 10'000;
+    rc::GroupConsumer gc = reader->subscribeGroup("g-dmg", {std::string(kTopic)}, gcfg);
+    gc.onRecords([&](const rc::RecordSet& rs) {
+        rs.forEachRecord([&](std::string_view, std::string_view, int64_t offset, int64_t) {
+            std::lock_guard<std::mutex> g(col.mu);
+            col.offsets.push_back(offset);
+        });
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 40'000 && !gc.finished(); ++i) std::this_thread::sleep_for(1ms);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    ASSERT_TRUE(gc.finished()) << "the group consumer never ended at the damage (a hang)";
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::CorruptBatch);
+    const auto got = col.snapshot();
+    ASSERT_EQ(static_cast<int64_t>(got.size()), dmg.D) << "exactly the records below the damage";
+    for (int64_t i = 0; i < dmg.D; ++i) EXPECT_EQ(got[static_cast<std::size_t>(i)], i) << "gap or reorder at " << i;
+    EXPECT_TRUE(col.heardError("corrupt")) << "onError never heard the broker's message";
+    gc.close();
+
+    if (took < 5s) {   // a member of a NEW group fails the same way: not a one-off (one GroupConsumer per Client)
+        Collected col2;
+        auto reader2 = openClient(broker, spec, col2);
+        rc::GroupConsumer gc2 = reader2->subscribeGroup("g-dmg-2", {std::string(kTopic)}, gcfg);
+        gc2.onRecords([&](const rc::RecordSet& rs) {
+            rs.forEachRecord([&](std::string_view, std::string_view, int64_t offset, int64_t) {
+                std::lock_guard<std::mutex> g(col2.mu);
+                col2.offsets.push_back(offset);
+            });
+        });
+        for (int i = 0; i < 40'000 && !gc2.finished(); ++i) std::this_thread::sleep_for(1ms);
+        ASSERT_TRUE(gc2.finished()) << "the second group's consumer never ended at the damage (a hang)";
+        EXPECT_EQ(gc2.failReason(), rc::GroupFailReason::CorruptBatch);
+        EXPECT_EQ(static_cast<int64_t>(col2.snapshot().size()), dmg.D);
+        gc2.close();
+        reader2->close();
+    }
+    reader->close();
+    reader.reset();
 }

@@ -550,3 +550,19 @@ TEST(LeaseWriteSpecRegression, RefusedVersionAnswersRejectNotVersionAheadRegress
     r.value = std::string_view(ahead, sizeof ahead);
     EXPECT_EQ(checkTypedRecord(spec, r, 5), TypedCheck::VersionAhead) << "a later version is still ahead";
 }
+
+// #868: a value that cannot be a typed record is refused for good, never as the retriable VersionAhead.
+TEST(CheckedWritesWriteStateRegression, AVersionAheadWhoseBlockDoesNotFitIsRejectedRegression) {
+    const TopicWriteSpec spec = specOf(Entity::TypedLegacy);
+    ASSERT_LT(spec.maxVersion(), 9u);
+    rune::protocol::RecordSpan r;
+    const std::string_view text = "ws:12";                       // blockLength 0x7377, version 0x3A31
+    r.value = text;
+    EXPECT_EQ(checkTypedRecord(spec, r, 5), TypedCheck::Reject) << "text is not a record of a later version";
+    const char oneShort[7] = {4, 0, 9, 0, 0, 0, 0};             // version 9, declares 4 block bytes, holds 3
+    r.value = std::string_view(oneShort, sizeof oneShort);
+    EXPECT_EQ(checkTypedRecord(spec, r, 5), TypedCheck::Reject) << "one byte short of the declared block";
+    const char fits[8] = {4, 0, 9, 0, 0, 0, 0, 0};              // the same header with the whole block
+    r.value = std::string_view(fits, sizeof fits);
+    EXPECT_EQ(checkTypedRecord(spec, r, 5), TypedCheck::VersionAhead) << "a possible later version stays retriable";
+}

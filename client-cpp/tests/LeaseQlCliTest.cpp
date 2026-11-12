@@ -96,6 +96,34 @@ TEST(LeaseQlCliRegression, DefinePlanNamesTheLeaseRegression) {
     EXPECT_NE(err.find("a lease topic needs a typed, keyed topic"), std::string::npos) << err;
 }
 
+TEST(LeaseQlCliRegression, CreateLeaseTopicCliRegression) {
+    const std::string head =
+        "topic inst partitions 4 replicas 3 persistence disk key id lease lease.ttl 30000 lease.min_ttl 1000 "
+        "lease.max_ttl 9000000000000 lease.max_keys 1048576 lease.expiry_batch 256 lease.checkpoint on "
+        "lease.checkpoint_interval 300000 lease.checkpoint_rate 1000\n";
+    const std::string out = dryRun("create lease topic inst { id uint64, addr string(64) } partitions 4 replicas 3 key id;");
+    EXPECT_EQ(out.substr(0, head.size()), head) << out;
+
+    const std::string custom = dryRun(
+        "create transient lease topic inst { id uint64 } key id with (lease.ttl = 5000, lease.min_ttl = 2000, lease.max_ttl = 60000, "
+        "lease.max_keys = 10, lease.expiry_batch = 8, lease.checkpoint = off, lease.checkpoint_interval = 2000, lease.checkpoint_rate = 5);");
+    const std::string want =
+        "topic inst partitions 1 replicas 0 persistence transient key id lease lease.ttl 5000 lease.min_ttl 2000 "
+        "lease.max_ttl 60000 lease.max_keys 10 lease.expiry_batch 8 lease.checkpoint off lease.checkpoint_interval 2000 "
+        "lease.checkpoint_rate 5\n";
+    EXPECT_EQ(custom.substr(0, want.size()), want) << custom;
+
+    EXPECT_EQ(dryRun("create topic t { id uint64 } key id;").find("lease"), std::string::npos);
+
+    std::string out2, err;
+    EXPECT_EQ(runCli({"ql", "--dry-run", "-e", "create lease topic t;"}, &out2, &err), 1);
+    EXPECT_NE(err.find("a lease topic needs a typed, keyed topic"), std::string::npos) << err;
+
+    std::string out3, err3;
+    EXPECT_EQ(runCli({"ql", "--dry-run", "-f", writeScript("create_topic.rql",
+                      "create topic a { id uint64 } key id;\ncreate view v key id as select id from a;\n")}, &out3, &err3), 0) << err3;
+}
+
 TEST(LeaseQlCliRegression, LeaseStatementPlansRegression) {
     EXPECT_EQ(planOf("show leases inst;"), "show leases inst limit 100\n");
     EXPECT_EQ(planOf("show leases 'acme/claims' limit 5;"), "show leases acme/claims limit 5\n");

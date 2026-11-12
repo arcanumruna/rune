@@ -100,8 +100,8 @@ TEST(FilterMatchRegression, CompileTimeTypeRules) {   // spec §4: a wrong value
     static_assert(!std::is_constructible_v<Match<uint32_t>, const char*>, "a string is not an integer field value");
     static_assert(!std::is_constructible_v<Match<bool>, int>, "bool fields take bool");
     static_assert(!std::is_constructible_v<Match<int32_t>, bool>, "integer fields do not take bool");
-    static_assert(std::is_constructible_v<Match<std::array<char, 8>>, const char (&)[3]>, "a short FixedStr literal");
-    static_assert(!std::is_constructible_v<Match<std::array<char, 8>>, const char (&)[10]>, "a FixedStr literal longer than N");
+    static_assert(std::is_constructible_v<Match<rune::FixedString<8>>, const char (&)[3]>, "a short FixedStr literal");
+    static_assert(!std::is_constructible_v<Match<rune::FixedString<8>>, const char (&)[10]>, "a FixedStr literal longer than N");
     static_assert(std::is_trivially_copyable_v<Match<uint32_t>>, "E::Filter is a plain aggregate (spec §4)");
     SUCCEED();
 }
@@ -119,7 +119,7 @@ TEST(FilterWireRegression, ConstexprEncodingOfAConstantFilter) {   // spec §4 c
 }
 
 TEST(FilterWireRegression, FixedStrValueIsZeroPaddedToItsWidth) {
-    const auto b = encodeOne<std::array<char, 8>>(3, PrimType::FixedStr, 8, Match<std::array<char, 8>>("eu"));
+    const auto b = encodeOne<rune::FixedString<8>>(3, PrimType::FixedStr, 8, Match<rune::FixedString<8>>("eu"));
     ASSERT_EQ(b.len, 2 + 5 + 8);
     EXPECT_EQ(b.bytes[7], 'e'); EXPECT_EQ(b.bytes[8], 'u');
     for (int i = 9; i < 15; ++i) EXPECT_EQ(b.bytes[static_cast<std::size_t>(i)], 0);
@@ -144,7 +144,7 @@ TEST(MatchRegression, AnErrorStateIsTerminalRegression) {
     r = 5u;
     EXPECT_TRUE(r.outOfRange());
     EXPECT_FALSE(r.overflow());
-    Match<std::array<char, 4>> s(anyOf<const char*>("abcdefgh"));
+    Match<rune::FixedString<4>> s(anyOf<const char*>("abcdefgh"));
     ASSERT_TRUE(s.outOfRange());
     s = "ab";
     EXPECT_TRUE(s.outOfRange());
@@ -159,7 +159,7 @@ TEST(FilterWireRegression, MultiTermGoldenBytesRegression) {
     FilterBytes b;
     FilterWriter wr(std::span<uint8_t>(b.bytes.data(), b.bytes.size()));
     wr.term(0x0102, PrimType::Int32, 4, Match<int32_t>(anyOf(-1, 1, 1)));
-    wr.term(0x0203, PrimType::FixedStr, 4, Match<std::array<char, 4>>(anyOf<const char*>("ba", "ab", "ba")));
+    wr.term(0x0203, PrimType::FixedStr, 4, Match<rune::FixedString<4>>(anyOf<const char*>("ba", "ab", "ba")));
     wr.term(0x0304, PrimType::Bool, 1, Match<bool>(true));
     auto r = wr.finish();
     ASSERT_TRUE(r.has_value());
@@ -221,7 +221,7 @@ TEST(FilterWireRegression, WidthMustMatchTheValueTypeRegression) {
     };
     run(Match<int64_t>(int64_t{1}), PrimType::Int64, 4);                           // would truncate
     run(Match<int32_t>(1), PrimType::Int32, 8);                                    // wrong width for type
-    run(Match<std::array<char, 4>>("ab"), PrimType::FixedStr, 8);                  // reads past the array
-    run(Match<std::array<char, 20>>("ab"), PrimType::FixedStr, 20);                // wider than 16
-    run(Match<std::array<char, 4>>("ab"), PrimType::FixedStr, 0);
+    run(Match<rune::FixedString<4>>("ab"), PrimType::FixedStr, 8);                  // reads past the array
+    run(Match<rune::FixedString<20>>("ab"), PrimType::FixedStr, 20);                // wider than 16
+    run(Match<rune::FixedString<4>>("ab"), PrimType::FixedStr, 0);
 }

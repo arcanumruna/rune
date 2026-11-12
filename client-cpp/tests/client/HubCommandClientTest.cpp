@@ -1700,7 +1700,13 @@ TEST(HubCommandClientRegression, ThreadModeVoidSeekRetriesABackPressuredRingRegr
     });
     ASSERT_EQ(get(toTest[0], 60'000), 'S');
     // The runner is parked and the ring is full: the seek can only be retrying, it cannot have returned.
-    for (int i = 0; i < 20'000; ++i) { gw.pump(); std::this_thread::yield(); }
+    // Bounded by wall time, well inside the 5 s the seek retries a full ring: a fixed pass count outlasted it on a
+    // loaded host, and the seek then threw before the runner was released (#967).
+    const auto parkedUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    for (int i = 0; i < 20'000 && std::chrono::steady_clock::now() < parkedUntil; ++i) {
+        gw.pump();
+        std::this_thread::yield();
+    }
     EXPECT_EQ(get(toTest[0], 0), 0) << "the seek returned although the command ring was full (dropped?)";
     (void)put(toRunner[1], 'G');   // the runner leaves the handler and drains the ring
     t.join();

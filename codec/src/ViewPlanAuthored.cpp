@@ -232,10 +232,26 @@ bool isPlainSingleKey(const ViewPlan& p) {
     return c.keyFunction == 0 && c.outName == c.column && (p.key.empty() || p.key == c.column);
 }
 
+bool isAggregate(const ViewPlan& p) {
+    for (const AuthoredField& f : p.output) {
+        if (f.rule != MergeRule::Replace) return true;
+    }
+    return false;
+}
+
+// An aggregate view is grouped by its key. The v2 wire block carries that group explicitly: the key
+// components, or the single plain key when there are none. Not an aggregate: empty.
+std::vector<KeyComponent> derivedGroup(const ViewPlan& p) {
+    if (!isAggregate(p)) return {};
+    if (!p.keyComponents.empty()) return p.keyComponents;
+    return {KeyComponent{p.key, 0, p.key}};
+}
+
 } // anonymous namespace
 
 bool needsV2(const ViewPlan& p) noexcept {
-    if (p.unique || !p.constraints.empty() || p.unicodeVersion != 0 || !p.groupBy.empty()) return true;
+    if (p.unique || !p.constraints.empty() || p.unicodeVersion != 0) return true;
+    if (isAggregate(p) && !p.keyComponents.empty()) return true;
     return !p.keyComponents.empty() && !isPlainSingleKey(p);
 }
 
@@ -297,7 +313,7 @@ std::vector<uint8_t> serializeAuthored(const ViewPlan& plan) {
         writeU8(buf, plan.unique ? 1 : 0);
         writeConstraints(buf, plan.constraints);
         writeU32LE(buf, plan.unicodeVersion);
-        writeComponents(buf, plan.groupBy);
+        writeComponents(buf, derivedGroup(plan));
     }
     return buf;
 }
@@ -346,7 +362,17 @@ std::optional<ViewPlan> deserializeAuthored(std::span<const uint8_t> buf) {
         p.unique = unique == 1;
         if (!readConstraints(buf, pos, p.constraints))  return std::nullopt;
         if (!readU32LE(buf, pos, p.unicodeVersion))     return std::nullopt;
-        if (!readComponents(buf, pos, p.groupBy))       return std::nullopt;
+        std::vector<KeyComponent> group;
+        if (!readComponents(buf, pos, group))           return std::nullopt;
+        // The group block is derived from the key; a block that disagrees came from a plan the
+        // old compiler would have refused ("group by must equal the key"). Empty is accepted.
+        if (!group.empty()) {
+            const std::vector<KeyComponent> want = derivedGroup(p);
+            if (group.size() != want.size()) return std::nullopt;
+            for (size_t i = 0; i < want.size(); ++i) {
+                if (group[i].column != want[i].column || group[i].keyFunction != want[i].keyFunction) return std::nullopt;
+            }
+        }
     }
 
     if (pos != buf.size()) return std::nullopt;

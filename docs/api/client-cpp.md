@@ -686,11 +686,11 @@ if (row.status == ViewRowResult::kOk) {
 
 A view keyed by up to 128 bytes of typed columns (a plan v2) is authored with `plan.keyComponents`, each `{column, keyFunction, outName}`;
 `keyFunction` 1 is `lower()` (a `string(N)` column only) and then `plan.unicodeVersion` must be `rune::codec::kUnicodeVersion`.
-`group by` columns go in `plan.groupBy` and must equal the key. Send the view's first key component as the `keyField`
+Send the view's first key component as the `keyField`
 (`v::viewKeyField(plan, keyField)`).
 
-Aggregate views are authored two ways. A **v2** aggregate (key components or `group by`) names the topic's key as
-`sources[0].keyField` and always writes `groupBy`; the broker refuses it with `ViewKeyInvalid` if `sources[0].keyField` is not the
+Aggregate views are authored two ways. A **v2** aggregate (key components) names the topic's key as
+`sources[0].keyField`; its group is its key (there is no `plan.groupBy` member); the broker refuses it with `ViewKeyInvalid` if `sources[0].keyField` is not the
 topic's real key. A **v1-shaped** aggregate (a single `key` field, no key components) keeps its group column as before. The key encoding is in [View keys](codec.md#view-keys).
 
 ```cpp

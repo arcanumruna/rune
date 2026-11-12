@@ -823,7 +823,7 @@ TEST(CheckedWritesRegressorsPathRegression, CompositeGroupByCheckShardRegression
     std::string out, err;
     ASSERT_EQ(ql(b.endpoint(), goldenTopic("character"), &out, &err), 0) << err;
     ASSERT_EQ(ql(b.endpoint(),
-                 "create view per_gender key (userId, gender) as select count(*) as n from character group by userId, gender constraint two_per_gender check (n <= 2);",
+                 "create view per_gender key (userId, gender) as select count(*) as n from character constraint two_per_gender check (n <= 2);",
                  &out, &err), 0) << err;
     Writer w(b.clientConfig(), false);
     ASSERT_TRUE(w.insertAndAwait(character(7, "a", 0, 1)).ok());
@@ -841,7 +841,7 @@ TEST(CheckedWritesRegressorsPathRegression, ReplaceWhileWritingShardRegression) 
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
     ASSERT_EQ(ql(b.endpoint(), goldenTopic("character"), &out, &err), 0) << err;
-    ASSERT_EQ(ql(b.endpoint(), "create view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= 12);",
+    ASSERT_EQ(ql(b.endpoint(), "create view account_stats key userId as select count(*) as characters from character constraint max_characters check (characters <= 12);",
                  &out, &err), 0) << err;
     const int32_t characterTopic = topicIdOf(b.node(), "character");
 
@@ -875,7 +875,7 @@ TEST(CheckedWritesRegressorsPathRegression, ReplaceWhileWritingShardRegression) 
         return n.size() == kUsers && std::all_of(n.begin(), n.end(), [want](const auto& kv) { return kv.second >= want; });
     };
     const bool atCap = waitFor([&] { return everyUserHas(12); }, 10s);
-    const int replaced = atCap ? ql(b.endpoint(), "create or replace view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= 13);",
+    const int replaced = atCap ? ql(b.endpoint(), "create or replace view account_stats key userId as select count(*) as characters from character constraint max_characters check (characters <= 13);",
                                     &out, &err) : -1;
     const bool atNewCap = replaced == 0 && waitFor([&] { return everyUserHas(13); }, 10s);
     stop = true;

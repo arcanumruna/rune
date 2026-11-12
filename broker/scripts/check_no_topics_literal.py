@@ -4,7 +4,8 @@
 Every disk path to a topic is built by rune/node/NamespacePaths.h (<dataDir>/ns-<nsId>/topics/...), so a
 "topics" string literal in any C++ source under libs/ (tests included) is a path that bypasses the namespace
 root.  Scans every tracked and untracked-not-ignored libs/**.cpp except NamespacePaths itself.  Exit 1 listing
-every hit; exit 0 when clean.
+every hit; exit 2 when the root holds no libs/**.cpp (a wrong root would otherwise pass by checking nothing,
+#884); exit 0 when clean.  Usage: check_no_topics_literal.py <broker dir>
 """
 import subprocess, sys, pathlib
 
@@ -13,9 +14,13 @@ ls = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--cached", "--ot
                     capture_output=True, check=True).stdout
 files = sorted({p.decode("utf-8", "surrogateescape") for p in ls.split(b"\0") if p})
 needle = '"topics"'
+sources = [f for f in files if f.startswith("libs/") and f.endswith(".cpp")]
+if not sources:
+    print(f"error: {root} holds no libs/**.cpp; pass the broker directory as the root", file=sys.stderr)
+    sys.exit(2)
 hits = []
-for f in files:
-    if not f.startswith("libs/") or not f.endswith(".cpp") or "NamespacePaths" in f:
+for f in sources:
+    if "NamespacePaths" in f:
         continue
     try:
         text = (root / f).read_text(errors="ignore")

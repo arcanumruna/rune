@@ -225,6 +225,7 @@ add_executable(rune_codec_tests
     tests/PrimTypeTest.cpp
     tests/DescriptorTest.cpp
     tests/FingerprintTest.cpp
+    tests/FixedStringTest.cpp
     tests/SerializeTest.cpp
     tests/ToTextTest.cpp
     tests/RecordReaderTest.cpp

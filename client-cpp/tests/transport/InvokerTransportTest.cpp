@@ -1315,6 +1315,38 @@ TEST(AeronTransportRegression, RePairWhileThePublicationIsResolvingLeavesNoOrpha
     t.stop();
 }
 
+// #862: a re-pair onto another response control channel moves the pair; a channel-less re-pair keeps the new one.
+TEST(AeronTransportRegression, RePairOntoAnotherResponseChannelMovesThePairRegression) {
+    FastLingerEnv env;
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3615)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const auto respCtl = rune::client::transport::responseControlChannelFor(worker, 40901);
+    const auto movedCtl = rune::client::transport::responseControlChannelFor(worker, 40902);
+    ASSERT_TRUE(respCtl.has_value());
+    ASSERT_TRUE(movedCtl.has_value());
+    const Transport::PubHandle h = t.responsePublicationHandle(worker, 3616, *respCtl);
+    ASSERT_NE(h, Transport::kNoPub);
+    EXPECT_EQ(t.responseSubChannelForTest(h), *respCtl);
+
+    ASSERT_TRUE(t.rePairResponsePublication(h, *movedCtl));
+    EXPECT_EQ(t.responseSubChannelForTest(h), *movedCtl);
+    EXPECT_TRUE(t.publicationIsResponsePairedForTest(h));
+    ASSERT_TRUE(t.rePairResponsePublication(h));   // no channel: keeps the NEW one
+    EXPECT_EQ(t.responseSubChannelForTest(h), *movedCtl);
+    EXPECT_TRUE(t.publicationIsResponsePairedForTest(h));
+
+    const uint8_t frame[] = {1};
+    for (int i = 0; i < 2'000'000 && t.drainingPubsForTest() == 0; ++i) {   // hard cap: let the old pairs drain
+        t.dutyCycle();
+        (void)t.offerOn(h, frame, sizeof frame);
+    }
+    EXPECT_EQ(t.responseSubChannelForTest(h), *movedCtl);
+    t.stop();
+}
+
 // #763 sibling class: a retarget whose new default publication is still registering when its (wall-clock) resolve bound
 // runs out used to drop the local Resolution: the driver later completed a publication nobody owned.  The driver is
 // stalled (dutyCycle pumps nothing) so the registration stays Resolving; the injected clock never reaches a deadline.

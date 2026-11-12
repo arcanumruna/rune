@@ -4272,8 +4272,14 @@ private:
     /// #839 (cold): the stored batch at `atOffset` is damaged.  The subscription is parked AT it (cursor never advances
     /// past the damage) and ONE ErrorResponse{StorageError, correlationId 0} is owed - sent now, else retried every pass
     /// by the owed-error block until it is.
+    /// #882: count the failed read and report the cumulative count to the gateway (SessionSignal DamagedRead).
+    [[gnu::cold]] [[gnu::noinline]] void noteDamagedRead_() {
+        ++damagedReads_;
+        (void)trySessionSignal_(0, SessionSignalKind::DamagedRead, static_cast<int64_t>(damagedReads_));
+    }
     [[gnu::cold]] [[gnu::noinline]] int failCorrupt_(WorkerSubscription& s, aeron::ExclusivePublication* pub,
                                                       const RecordsSealCtx* seal, int64_t atOffset) {
+        noteDamagedRead_();   // #882
         spdlog::error("Worker {}: push sub={} (topicId={} partition={}) failed at offset={}: the stored batch is corrupt "
                       "(damaged log segment) - StorageError, subscription parked (cursor not advanced)",
                       workerId_, s.subscriptionId, s.topicId, s.partition, atOffset);
@@ -6781,6 +6787,7 @@ public:
     [[nodiscard]] uint64_t pushReadErrorsForTest() const noexcept { return pushReadErrors_; }
     /// #839: reads that reached a damaged segment (Corrupt / Unreadable) and were not served.
     [[nodiscard]] uint64_t corruptReadsForTest() const noexcept { return corruptReads_; }
+    [[nodiscard]] uint64_t damagedReadsForTest() const noexcept { return damagedReads_; }
     [[nodiscard]] std::size_t deferredPushReadsForTest() const noexcept { return deferredPushCount_; }
     /// Phase 2b E2 (TRANSIENT partitions): produces/markers the ring refused;
     /// reads whose cursor was below the ring start, and the records they skipped.
@@ -6813,6 +6820,7 @@ private:
     uint64_t                              pushReadMapFallbacks_ = 0;
     uint64_t                              pushReadErrors_ = 0;   ///< D26: push-read pread failures (answered empty)
     uint64_t                              corruptReads_ = 0;     ///< #839: reads that reached a damaged segment
+    uint64_t                              damagedReads_ = 0;     ///< #882: reads failed at damage (SessionSignal)
     /// D26: replication read scratch — a fetch serve / owed re-serve / push of
     /// an owned replica preads into it (PartitionReplica::setReadScratch), never
     /// faulting through the segment read map.  maxFetchBytes (1 MiB) + the

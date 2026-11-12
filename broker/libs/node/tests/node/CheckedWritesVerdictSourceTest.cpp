@@ -684,6 +684,55 @@ TEST(CheckedWritesVerdictSourceRegression, RetireIsPerPartitionRegression) {
     EXPECT_TRUE(vs.verdictSource(5, 1) == nullptr || vs.verdictSource(5, 1)->judgedThrough() >= log[1].next);
 }
 
+// A judge that activates past a drop (a new leadership above the covered offset) finds a leaving member no logged set names any
+// more: activation retires it, so neither the member nor its retiring template lingers.
+TEST(CheckedWritesVerdictSourceRegression, ActivationRetiresALeavingMemberNoSetNamesRegression) {
+    ViewSnapshotChannel channel;
+    const std::string dir = (std::filesystem::temp_directory_path() / ("rune-cw-actret-" + std::to_string(::getpid()))).string();
+    struct Cleanup { std::string d; ~Cleanup() { std::error_code ec; std::filesystem::remove_all(d, ec); } } cleanup{dir};
+    WorkerViewSet vs(channel, dir);
+    const rune::codec::Descriptor src = tagSource();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    const TestRejectRule rule = tagEquals(9);
+    constexpr int32_t kViewTopic = 0x40000001;
+    constexpr uint64_t kObject = 7;
+    auto comp = rune::view::compileView(tagView(), srcs, kViewTopic).value();
+    vs.installTestVerdictViewForTest(comp.plan, comp.rowLayout, src, false, kObject, rule);
+
+    Log log[2];
+    TopicWriteSpec spec;
+    PartitionWriteState st[2];
+    for (int p = 0; p < 2; ++p) {
+        st[p].spec = &spec;
+        log[p].control();                                                             // 0: the set
+        std::vector<Rec> a, b;
+        for (int i = 1; i <= 9; ++i) a.push_back({i, i == 3 ? 9 : 1});
+        log[p].data(a);                                                               // 1..9
+        log[p].control();                                                             // 10: the drop
+        for (int i = 11; i <= 15; ++i) b.push_back({i, 1});
+        log[p].data(b);                                                               // 11..15
+        st[p].constraintSets.onChange(0, setOf(1, {{kObject, rule.fingerprint()}}));
+        st[p].constraintSets.onChange(10, setOf(2, {}));
+    }
+    const auto drive = [&](int p) {
+        auto readRange = [&](int64_t from, int64_t) { return log[p].read(from); };
+        vs.driveFolds(5, p, readRange, log[p].next, rune::view::kNoSkip, 200'000'000, nullptr, 1, true, {}, &st[p], vs.ensureVerdictSource(5, p, st[p]));
+        verdictOnHw(st[p], 1'000'000);
+    };
+    for (int p = 0; p < 2; ++p) vs.ensureVerdictSource(5, p, st[p])->bindLeader(nullptr, 1, 0);
+    vs.verdictSource(5, 0)->holdJudgeForTest(true);   // partition 0 stays below the drop
+    ASSERT_TRUE(vs.uninstallView(kViewTopic));
+    for (int i = 0; i < 4; ++i) drive(1);              // partition 1 finishes its own drop
+    ASSERT_NE(vs.verdictSource(5, 0), nullptr);
+    EXPECT_EQ(vs.verdictSource(5, 0)->memberCountForTest(), 1u);
+    st[0].rejected.noteCovered(16);                    // a new leadership above the drop: activation lands past offset 10
+    vs.verdictSource(5, 0)->bindLeader(nullptr, /*gen=*/2, 0);
+    vs.verdictSource(5, 0)->holdJudgeForTest(false);
+    for (int i = 0; i < 6; ++i) drive(0);
+    EXPECT_EQ(vs.retiringVerdictTemplatesForTest(), 0u);
+    EXPECT_EQ(vs.verdictSource(5, 0) == nullptr ? 0u : vs.verdictSource(5, 0)->memberCountForTest(), 0u);
+}
+
 // A retiring view is attached only by a judge that is activated: partition 1's fresh judge is already past the drop and would never retire it.
 TEST(CheckedWritesVerdictSourceRegression, FreshJudgePastTheDropDoesNotAttachRetiringViewRegression) {
     ViewSnapshotChannel channel;

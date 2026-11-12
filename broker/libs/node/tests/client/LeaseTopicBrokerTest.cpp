@@ -79,8 +79,6 @@ LeaseClaim claimRow(std::string_view key, uint64_t a = 0, std::string_view b = {
     return r;
 }
 
-std::string text(const std::array<char, 8>& a) { return std::string(a.data(), strnlen(a.data(), a.size())); }
-
 struct Collected {
     int32_t           partition;
     int64_t           offset;
@@ -166,7 +164,7 @@ TEST(LeaseTopicBrokerRegression, GrantKeyExistsRevokeRegrantRegression) {
     EXPECT_EQ(got->lease_holder, 7u);
     EXPECT_EQ(got->lease_ttl_ms, 60'000u);
     EXPECT_EQ(got->a, 42u);
-    EXPECT_EQ(text(got->b), "hi");
+    EXPECT_EQ(got->b.view(), "hi");
     EXPECT_EQ(std::string(got->claim.data(), 7), "k-grant");
 
     EXPECT_FALSE(lt.getAndWait(claimRow("never-granted")).has_value()) << "no lease under that key";
@@ -193,7 +191,7 @@ TEST(LeaseTopicBrokerRegression, GetMinOffsetRegression) {
     const auto got = lt.getAndWait(row, updated->offset);
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got->a, 7u) << "read-your-writes: the read waited for the update's offset";
-    EXPECT_EQ(text(got->b), "seven");
+    EXPECT_EQ(got->b.view(), "seven");
     EXPECT_EQ(got->lease_updated_offset, updated->offset);
     EXPECT_EQ(got->lease_granted_offset, g.version);
     EXPECT_EQ(got->lease_version, g.version) << "an update keeps the lease version";

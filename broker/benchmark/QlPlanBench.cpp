@@ -39,7 +39,7 @@ constexpr Stmt kStmts[] = {
     {"projection", "create view character_by_id key characterId as select userId, name, gender from character;"},
     {"composite", "create view account_characters key (userId, characterId) as select name, gender from character;"},
     {"lower", "create unique view character_name key lower(name) as nameKey as select characterId from character;"},
-    {"aggregate_check", "create view account_stats key userId as select count(*) as characters from character group by userId "
+    {"aggregate_check", "create view account_stats key userId as select count(*) as characters from character "
                         "constraint max_characters check (characters <= 12);"},
 };
 

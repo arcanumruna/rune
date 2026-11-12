@@ -30,7 +30,7 @@ inline rune::view::CompileResult deviceHistory(const rune::codec::Descriptor& d)
     rune::view::ViewPlan v;
     v.viewName = "device_history";
     v.sources  = {{kSrcTopic, "userId"}};
-    v.keyComponents = v.groupBy = {{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}};
+    v.keyComponents = {{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}};
     v.output = {{"uses", PrimType::Int64, 0, "", rune::view::MergeRule::CountAll},
                 {"total", PrimType::UInt64, 0, "bytes", rune::view::MergeRule::Sum},
                 {"firstSeen", PrimType::Int64, 0, "lastSeen", rune::view::MergeRule::Min},

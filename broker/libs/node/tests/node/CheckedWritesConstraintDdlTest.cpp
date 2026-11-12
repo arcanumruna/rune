@@ -223,11 +223,11 @@ TEST(CheckedWritesConstraintDdl, AlterKeepsTheObjectIdAndCountsItselfOnce) {
     serving(rig);
     const ql::TopicDef topic = topicOf(kSource);
     ASSERT_EQ(defineTopic(rig, topic).code, kOk);
-    const auto created = submitView(rig, planOf(rig, topic, "create view stats key userId as select count(*) as n from src group by userId constraint a check (n <= 5);"));
+    const auto created = submitView(rig, planOf(rig, topic, "create view stats key userId as select count(*) as n from src constraint a check (n <= 5);"));
     ASSERT_EQ(created.code, kOk) << created.detail;
     uint64_t createdId = 0;
     (void)compiledOfLast(rig, &createdId);
-    const auto altered = submitAlter(rig, planOf(rig, topic, "create view stats key userId as select count(*) as n from src group by userId constraint a check (n <= 5) constraint b check (n >= 0);"));
+    const auto altered = submitAlter(rig, planOf(rig, topic, "create view stats key userId as select count(*) as n from src constraint a check (n <= 5) constraint b check (n >= 0);"));
     ASSERT_EQ(altered.code, kOk) << altered.detail;
     uint64_t alteredId = 0;
     const rv::CompiledViewPlan plan = compiledOfLast(rig, &alteredId);

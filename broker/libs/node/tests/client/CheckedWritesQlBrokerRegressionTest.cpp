@@ -280,7 +280,7 @@ TEST(CheckedWritesQlBrokerRegression, RegressorsPathOutcomesThreeNodesRegression
     EXPECT_NE(out.find("partitions 1"), std::string::npos) << out;
     ASSERT_EQ(ql(ep, "show view device_history;", &out, &err, driver->dir()), 0) << err;
     EXPECT_NE(out.find("keyspec (userId, deviceFp)"), std::string::npos) << out;
-    EXPECT_NE(out.find("group by (userId, deviceFp)"), std::string::npos) << out;
+    EXPECT_EQ(out.find("group by"), std::string::npos) << out;   // #1009: the group is the key
 }
 
 // The whole script with `-f` on a fresh cluster.
@@ -325,7 +325,7 @@ TEST(CheckedWritesQlBrokerRegression, DeviceHistoryCountsLoginsShardRegression) 
                  "partitions 1 key loginId with (cleanup.policy = compact);", &out, &err), 0) << err;
     ASSERT_EQ(ql(b.endpoint(),
                  "create view device_history key (userId, deviceFp) as select min(ts) as firstSeen, max(ts) as lastSeen, count(*) as logins, "
-                 "last(platform) as platform from device_login group by userId, deviceFp;", &out, &err), 0) << err;
+                 "last(platform) as platform from device_login;", &out, &err), 0) << err;
 
     rc::Client& c = *b.connectClient();
     Writer<DeviceLogin> w(c, "device_login");

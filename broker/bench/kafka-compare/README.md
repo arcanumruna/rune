@@ -19,13 +19,13 @@ Spec: `../../docs/superpowers/specs/2026-09-26-rune-vs-kafka-benchmark-design.md
 ## Durability tiers (matched on both tools)
 | Tier | Rune | Kafka |
 |------|------|-------|
-| D0 | `topic bench partitions P with (tier = leader)`, acks=leader | acks=1 |
+| D0 | `create topic bench partitions P with (tier = leader)`, acks=leader | acks=1 |
 | D1 | `tier=majority`, acks=all | acks=all, RF=3, min.insync=2 |
 | D2 | `tier=strict` (fdatasync), acks=all | acks=all, flush.messages=1 |
 
 `tier` is a `with (...)` setting of `topic` DDL. The harness creates the bench topic with the rune CLI
 (`$RUNE_CLI`, default `rune` next to `$RUNE_PROD_BIN`) right after the broker/cluster is up
-(`rune_create_topics` in `lib.sh`), e.g. `rune ql -e "topic bench partitions 8 with (tier = leader);" --broker 127.0.0.1:40200`.
+(`rune_create_topics` in `lib.sh`), e.g. `rune ql -e "create topic bench partitions 8 with (tier = leader);" --broker 127.0.0.1:40200`.
 
 ## Prototype (build-agent-01)
 ```bash

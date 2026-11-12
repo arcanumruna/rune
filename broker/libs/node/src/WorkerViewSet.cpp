@@ -365,7 +365,7 @@ int WorkerViewSet::drainInstalls() {
             if (!plan) {
                 spdlog::error("WorkerViewSet: install for viewTopicId={} dropped — "
                               "compiled plan failed to deserialize", m.viewTopicId);
-                noteRefused_(0, rune::view::verdictPlanFingerprint(m.planBlob));
+                noteRefused_(m.viewObjectId, rune::view::verdictPlanFingerprint(m.planBlob));   // #941: the frame carries the object id
                 return;
             }
             if (plan->unicodeVersion != 0 && !rune::codec::unicodeVersionSupported(plan->unicodeVersion)) {
@@ -406,6 +406,9 @@ int WorkerViewSet::drainInstalls() {
                         /*persisted=*/m.persistence == 0, /*underRecovery=*/m.recovery);
             if (kind) {   // a unique or check view: its source's judge drives it
                 installsSinceMark_ = true;
+                // #940: this object installs again - its earlier refusals no longer keep its logged member.  The fingerprints
+                // stay: the log never installs a plan this worker refused.
+                for (RefusedPlan& r : refusedPlans_) if (r.viewObjectId == objectId) r.viewObjectId = 0;
                 ViewTemplate& tpl = templates_.at(viewTopicId);
                 ++verdictEpoch_;
                 tpl.isVerdict = true;

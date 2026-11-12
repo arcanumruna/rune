@@ -309,7 +309,7 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
 A view can be keyed by up to 128 bytes of typed key components instead of one `uint64` (see [View keys](codec.md#view-keys)).
 Frames 88 to 90 read such a view. They are sent only to a session at client version 17 or above; the C++ client ends the
 call `BrokerTooOld` without sending when the seed's `brokerVersion` is below 10. A plan with key components, `lower()` or
-`group by` is a plan v2 and `CreateView` refuses it with `InvalidRequest` ("plan v2 needs the checked-writes feature level")
+an aggregate over key components is a plan v2 and `CreateView` refuses it with `InvalidRequest` ("plan v2 needs the checked-writes feature level")
 while the cluster is below the checked-writes feature level.
 
 - **`GetViewRowK`** (88) is a point read by the key's bytes (1 to 128, the encoding in [View keys](codec.md#view-keys)). It is

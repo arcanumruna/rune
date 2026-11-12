@@ -127,7 +127,7 @@ Fields expected(Lineage l, std::span<const uint16_t> tags, uint16_t w, const std
 Val sv(std::string_view s) { Val v; v.s = std::string(s); return v; }
 Val iv(int64_t i) { Val v; v.i = i; return v; }
 Val fv(double f) { Val v; v.f = f; return v; }
-template <std::size_t N> Val av(const std::array<char, N>& a) { return sv(std::string_view(a.data(), N)); }
+template <std::size_t N> Val av(const rune::FixedString<N>& a) { return sv(std::string_view(a.data(), N)); }
 
 /// Every reader field as a Val, defaults dropped (absent == default: the writers never write a default).
 Fields nonDefault(Fields all) {
@@ -275,7 +275,7 @@ TEST(LineageDecodeRegression, EachVersionsEncodeWritesItsVersionsLayout) {
         out.resize(s.encode(out.data()));
         EXPECT_EQ(out, recordAt(Lineage::Fix, 4));
         std::vector<uint8_t> claimed(EvoFixV4::Encoder::kEncodedLength, 0xEE);
-        EvoFixV4::Encoder(claimed).id(s.id).y(s.y).code(valueFor(Lineage::Fix, 4, 4).s).level(s.level).age(s.age);
+        EvoFixV4::Encoder(claimed).id(s.id).y(s.y).code(s.code).level(s.level).age(s.age);
         EXPECT_EQ(claimed, out);
     }
 }

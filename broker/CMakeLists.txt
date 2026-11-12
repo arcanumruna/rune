@@ -272,6 +272,15 @@ if(BUILD_TESTING)
     add_test(NAME NoRuneTopicsGateRegression.GateSelfTest
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_check_no_rune_topics.py)
+    # Namespaces D14 / #884: topic paths are built only by rune/node/NamespacePaths.h, so no libs/**.cpp outside it
+    # spells the "topics" directory.  The gate fails (exit 2) on a root with no libs/ sources instead of passing.
+    add_test(NAME NoTopicsLiteralGateRegression.LibsHaveNoTopicsLiteral
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_topics_literal.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME NoTopicsLiteralGateRegression.GateSelfTest
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_check_no_topics_literal.py)
 endif()
 
 # gtest_discover_tests() defaults to running each test binary with

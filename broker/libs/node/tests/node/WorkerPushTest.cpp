@@ -1284,6 +1284,46 @@ TEST_F(WorkerCorruptPushRegression, OwnedSubscriptionFailsWithStorageErrorAtTheD
     std::filesystem::remove_all(dirB);
 }
 
+// #882: the failed read is counted and reported to the gateway once, as a cumulative SessionSignal DamagedRead.
+TEST_F(WorkerCorruptPushRegression, ADamagedReadIsCountedAndSignalledRegression) {
+    auto dirA = tempLogDir();
+    rune::storage::Log logA(dirA.string(), 2048);
+    const int64_t D = makeDamagedLog(logA, dirA);
+    ASSERT_GT(D, 0);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3143);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3143);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &logA)));
+    F19Egress c;
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64); return !c.errors.empty(); }, 10s));
+    ASSERT_EQ(c.errors.size(), 1u);
+    EXPECT_EQ(w.damagedReadsForTest(), 1u);
+    for (int i = 0; i < 200; ++i) { w.doWork(1); sub->poll(c.fa.handler(), 64); }
+    EXPECT_EQ(w.damagedReadsForTest(), 1u) << "the parked subscription is never re-read";
+
+    int signals = 0;
+    int64_t reported = 0;
+    w.drainReturn([&](WorkerReturn r) {
+        if (r.type == WorkerReturn::Type::SessionSignal &&
+            r.lastOffset == static_cast<int64_t>(SessionSignalKind::DamagedRead)) {
+            ++signals;
+            reported = r.baseOffset;
+            EXPECT_EQ(r.partition, 0);
+        }
+    });
+    EXPECT_EQ(signals, 1) << "one DamagedRead signal on the return ring";
+    EXPECT_EQ(reported, 1);
+    std::filesystem::remove_all(dirA);
+}
+
 // The Unreadable sibling: a torn length field in the ACTIVE segment (no sealed-segment damage flag involved).
 TEST_F(WorkerCorruptPushRegression, TornLengthInTheActiveSegmentFailsTheSubscriptionRegression) {
     auto dir = tempLogDir();

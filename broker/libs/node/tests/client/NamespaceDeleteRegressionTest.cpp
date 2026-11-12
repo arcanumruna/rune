@@ -259,8 +259,8 @@ TEST(NamespaceDeleteRegression, DeletingDirRemovedAtBootRegression) {
     const fs::path deleting = fs::path(nsRoot(f.dataDir(), id).string() + ".deleting");
     const fs::path plain = nsRoot(f.dataDir(), id);
     for (const fs::path& p : {deleting, plain}) {
-        fs::create_directories(p / "topics" / "t" / "0");
-        std::ofstream(p / "topics" / "t" / "0" / "seg.log") << "data";
+        fs::create_directories(p / kTopicsDirName / "t" / "0");
+        std::ofstream(p / kTopicsDirName / "t" / "0" / "seg.log") << "data";
     }
     f.admin->close();
     f.b.restart(/*reloginAdmin=*/false);
@@ -272,7 +272,7 @@ TEST(NamespaceDeleteRegression, DeletingDirRemovedAtBootRegression) {
 TEST(NamespaceDeleteRegression, LiveNsDeletingDirIsFatalRegression) {
     Fix f("nsdel_fatal");
     const fs::path deleting = fs::path(nsRoot(f.dataDir(), f.aId).string() + ".deleting");
-    fs::create_directories(deleting / "topics");
+    fs::create_directories(deleting / kTopicsDirName);
     f.admin->close();
     EXPECT_THROW(f.b.restart(/*reloginAdmin=*/false), std::exception);
     EXPECT_TRUE(fs::exists(deleting)) << "nothing is removed beside a live namespace";
@@ -283,8 +283,8 @@ TEST(NamespaceDeleteRegression, ReconcileNsDirsByStateRegression) {
     const fs::path root = fs::temp_directory_path() / ("rune_nsdel_pure_" + std::to_string(::getpid()));
     fs::remove_all(root);
     const auto touch = [&](const std::string& dir) {
-        fs::create_directories(root / dir / "topics");
-        std::ofstream(root / dir / "topics" / "x") << "d";
+        fs::create_directories(root / dir / kTopicsDirName);
+        std::ofstream(root / dir / kTopicsDirName / "x") << "d";
     };
     // facts: 0 default (live), 1 live, 2 DELETING, 3 erased (id < nextNsId = 7), 5 never issued here (>= 7 is 9)
     touch("ns-0"); touch("ns-1"); touch("ns-2"); touch("ns-2.deleting"); touch("ns-1.deleting");

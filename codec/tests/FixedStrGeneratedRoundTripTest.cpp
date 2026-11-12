@@ -12,13 +12,15 @@
 #include <rune/codec/Record.h>
 #include <rune/codec/Validator.h>
 #include <cstring>
+#include <type_traits>
+#include <vector>
 
 using namespace rune::codec;
 
 TEST(FixedStrGen, EncodeRoundTripsThroughReadField) {
     rune::gen::FixedstrSample s;
     s.id = 42;
-    std::memcpy(s.code.data(), "ABCD", 4);   // std::array<char,8>, rest zero
+    s.code = "ABCD";   // rune::FixedString<8>, rest zero
     s.name = "hello";
 
     std::vector<uint8_t> buf(s.encodedSize());
@@ -45,4 +47,14 @@ TEST(FixedStrGen, EncodeRoundTripsThroughReadField) {
 TEST(FixedStrGen, FingerprintMatchesRuntimeDescriptor) {
     const Descriptor& d = rune::gen::FixedstrSample::descriptor();
     EXPECT_EQ(rune::gen::FixedstrSample::kFingerprint, fingerprint(d));
+}
+
+TEST(FixedStrGen, MemberIsFixedStringRegression) {
+    static_assert(std::is_same_v<decltype(rune::gen::FixedstrSample{}.code), rune::FixedString<8>>);
+    rune::gen::FixedstrSample s{.id = 1, .code = "ABCDEFGH"};
+    std::vector<uint8_t> buf(s.encodedSize());
+    buf.resize(s.encode(buf.data()));
+    rune::gen::FixedstrSample out;
+    ASSERT_TRUE(out.decode(buf));
+    EXPECT_EQ(out.code.view(), "ABCDEFGH");
 }

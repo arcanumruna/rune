@@ -1510,6 +1510,12 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // within a leadership epoch (an error frame may carry 0); BEFORE the apply floors.
     if (memoryBacked_ && leaseTransient_ && role_ == Role::Follower)
         leaderLogStart_ = std::max(leaderLogStart_, resp.logStartOffset);
+    // #990: a disk-backed follower remembers the leader's log start for its retention pass.  Monotone within a
+    // leadership (an error frame carries 0).
+    if (!memoryBacked_ && role_ == Role::Follower && resp.logStartOffset > leaderLogStart_) [[unlikely]] {
+        leaderLogStart_ = resp.logStartOffset;
+        publishedLeaderLogStartForCleaner_.store(leaderLogStart_, std::memory_order_release);
+    }
     // (FR: applyReplicated entry is measured by the ReplFetchRespApply SPAN; the
     //  control→worker handoff that delivers this op is ReplFragRecv→ReplWorkerOpRun.)
 
@@ -2940,6 +2946,7 @@ void PartitionReplica::publishCleanerState() noexcept
             if (configuredReplicas_[i] != cfg_.selfId) markerBound = std::min(markerBound, replicaFetchPos_[i]);
     }
     publishedMarkerBoundForCleaner_.store(markerBound, std::memory_order_release);
+    if (role_ == Role::Leader) publishedLeaderLogStartForCleaner_.store(0, std::memory_order_release);   // #990
 
     // Controller position snapshot: mirror this replica's view of replica-node LEOs
     // for the leadership-convergence path (see controllerReplicaLeo() in the header).
@@ -3194,6 +3201,7 @@ void PartitionReplica::shrinkIsrToLive(std::span<const int32_t> live, int64_t no
             if (sl.id == cfg_.selfId || std::find(live.begin(), live.end(), sl.id) != live.end()) continue;
             mask |= (1u << i);
             sl.validated = false;   // must prove a validated position again to re-enter
+            sl.pushDamagedAt = -1;
         }
         if (mask != internalFencedMask_) {
             internalFencedMask_ = mask;
@@ -3209,6 +3217,7 @@ void PartitionReplica::shrinkIsrToLive(std::span<const int32_t> live, int64_t no
         FollowerSlot& sl = followerSlots_.at(i);
         if (sl.id != cfg_.selfId && std::find(live.begin(), live.end(), sl.id) == live.end())
             sl.validated = false;   // must prove a validated position again to re-enter
+            sl.pushDamagedAt = -1;
     }
     std::vector<NodeId> desired;   // cold: only when a member died
     desired.reserve(committedIsr_.size());
@@ -3894,7 +3903,7 @@ void PartitionReplica::resetTransientLogTo_(Offset start)
     // over this source (Phase 2b E2 Task 9) re-validate instead of trusting a
     // cursor into the dropped ring.
     lastTruncationOffset_ = prevStart;
-    cutFloor_ = std::min(cutFloor_, prevStart);
+    for (Offset& f : cutFloor_) f = std::min(f, prevStart);
     ++logGeneration_;
     // Every epoch entry named offsets this ring no longer holds; the next
     // fetch carries lastFetchedEpoch -1 (an empty log: no lineage to validate)
@@ -3978,7 +3987,7 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
     // F15 §2.1 step 3: the log's existing content changed at and above
     // truncateOffset — every parked waiter / RC build re-validates against it.
     lastTruncationOffset_ = truncateOffset;
-    cutFloor_ = std::min(cutFloor_, truncateOffset);
+    for (Offset& f : cutFloor_) f = std::min(f, truncateOffset);
     ++logGeneration_;
 
     // Task 11: PSM re-rebuild on low truncation.
@@ -4105,6 +4114,7 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
     // One view + response per distinct cursor (followers in step share it).
     Offset                     builtFrom = -1;
     bool                       builtOk   = false;
+    bool                       builtDamaged = false;
     rune::storage::LogReadView v{};
     BatchPrefix                pre{};
     FetchResponseMsg           resp{};
@@ -4122,10 +4132,13 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
         if (!slot->validated) [[unlikely]] continue;
         const Offset from = slot->pushCursor();
         if (from >= currentLeo) continue;               // this follower has (been sent) it all
+        // #875: known damaged at this cursor; the follower's fetch gets the error
+        if (from == slot->pushDamagedAt) [[unlikely]] continue;
 
         if (from != builtFrom) {
             builtFrom = from;
             builtOk   = false;
+            builtDamaged = false;
             if (frame < 0) {
                 frame = std::numeric_limits<int64_t>::max();
                 onTransport([&](auto& t) { frame = t.maxFetchRecordsBytes(); });
@@ -4138,7 +4151,12 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
             // F18 m-3's pushCap; one ceiling: maxFetchRecordsBytes().)
             rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
             v = readLog_(from, static_cast<int32_t>(pushCap), &st);
-            if (v.empty() && rune::storage::unservable(st)) [[unlikely]] continue;   // #839: never push a damaged range
+            if (v.empty() && rune::storage::unservable(st)) [[unlikely]] {   // #839: never push a damaged range
+                ++corruptPushReads_;
+                builtDamaged = true;
+                slot->pushDamagedAt = from;
+                continue;
+            }
             // F18 / KIP-74: a first batch larger than maxFetchBytes is still pushed
             // whole (never stuck).  FLOW CONTROL: no batch that begins at or beyond
             // pushCeiling is pushed (in-flight <= kPushFlowWindow).
@@ -4178,6 +4196,10 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
             resp = makeFetchResponse(highWatermark(), kErrNone,
                                      std::span<const uint8_t>(v.data, pre.bytes), from);
             builtOk = true;
+        }
+        if (builtDamaged) {   // #875: a follower at the same cursor shares the read
+            slot->pushDamagedAt = from;
+            continue;
         }
         if (!builtOk) continue;
 

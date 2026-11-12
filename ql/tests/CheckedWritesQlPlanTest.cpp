@@ -82,7 +82,6 @@ void expectRoundTrip(const v::ViewPlan& p) {
     EXPECT_EQ(back->key, p.key);
     EXPECT_EQ(back->unique, p.unique);
     expectComponents(back->keyComponents, p.keyComponents);
-    expectComponents(back->groupBy, p.groupBy);
     EXPECT_EQ(back->constraints, p.constraints);
     EXPECT_EQ(back->unicodeVersion, p.unicodeVersion);
 }
@@ -131,7 +130,6 @@ TEST(CheckedWritesQlGolden, RegressorsPathAuthorsPlanV2) {
                          F("userId", PrimType::UInt64, "userId", MergeRule::Replace)});
         expectComponents(p.keyComponents, {{"provider", 0, "provider"}, {"subject", 0, "subject"}});
         EXPECT_TRUE(p.unique);
-        EXPECT_TRUE(p.groupBy.empty());
         EXPECT_EQ(p.unicodeVersion, 0u);
         EXPECT_EQ(p.persistence, 0);
         EXPECT_EQ(v::keyDisplayName(p), "provider,subject");
@@ -148,7 +146,6 @@ TEST(CheckedWritesQlGolden, RegressorsPathAuthorsPlanV2) {
                          F("platform", PrimType::UInt16, "platform", MergeRule::Last)});
         const std::vector<v::KeyComponent> both = {{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}};
         expectComponents(p.keyComponents, both);
-        expectComponents(p.groupBy, both);
         EXPECT_FALSE(p.unique);
     }
     {
@@ -168,7 +165,6 @@ TEST(CheckedWritesQlGolden, RegressorsPathAuthorsPlanV2) {
         expectOutput(p, {F("userId", PrimType::UInt64, "userId", MergeRule::Replace),
                          F("characters", PrimType::Int64, "", MergeRule::CountAll)});
         EXPECT_TRUE(p.keyComponents.empty());
-        expectComponents(p.groupBy, {{"userId", 0, "userId"}});
         ASSERT_EQ(p.constraints.size(), 1u);
         EXPECT_EQ(p.constraints[0].name, "max_characters");
         const std::vector<v::PredicateNode> want = {
@@ -227,7 +223,7 @@ TEST(CheckedWritesQlPlan, CompositeProjection) {
 
 TEST(CheckedWritesQlPlan, AggregateTyping) {
     const std::string t = "topic t { id uint64, i int32, u uint16, f float64, s string(8) } key id;";
-    auto p = planOne(t, "create view a key id as select sum(i) as si, sum(u) as su, avg(i) as ai, count(s) as cs, min(f) as mf, last(s) as ls from t group by id;");
+    auto p = planOne(t, "create view a key id as select sum(i) as si, sum(u) as su, avg(i) as ai, count(s) as cs, min(f) as mf, last(s) as ls from t;");
     ASSERT_TRUE(p.has_value()) << p.error().message;
     expectOutput(*p, {F("id", PrimType::UInt64, "id", MergeRule::Replace),
                       F("si", PrimType::Int64, "i", MergeRule::Sum),
@@ -236,8 +232,7 @@ TEST(CheckedWritesQlPlan, AggregateTyping) {
                       F("cs", PrimType::Int64, "s", MergeRule::Count),
                       F("mf", PrimType::Float64, "f", MergeRule::Min),
                       F("ls", PrimType::FixedStr, "s", MergeRule::Last)});
-    EXPECT_TRUE(p->groupBy.empty());
-    EXPECT_EQ(errorOf(t, "create view b key id as select sum(s) as x from t group by id;"),
+    EXPECT_EQ(errorOf(t, "create view b key id as select sum(s) as x from t;"),
               "sum() cannot aggregate 's' of type string(8)");
 }
 
@@ -245,24 +240,42 @@ TEST(CheckedWritesQlPlan, ShapeErrors) {
     const std::string t = "topic t { id uint64, a int32, s string(8) } key id;";
     EXPECT_EQ(errorOf(t, "create view v key id as select nope from t;"), "column 'nope' is not a field of 't'");
     EXPECT_EQ(errorOf(t, "create view v key nope as select a from t;"), "column 'nope' is not a field of 't'");
-    EXPECT_EQ(errorOf(t, "create view v key id as select * from t group by id;"), "'*' is not valid in an aggregate view");
-    EXPECT_EQ(errorOf(t, "create view v key id as select count(*) as n from t;"), "an aggregate view needs 'group by'");
-    EXPECT_EQ(errorOf(t, "create view v key id as select a from t group by id;"), "group by needs an aggregate item");
+    {   // The parser never mixes '*' with an aggregate; the planner still refuses a hand-built AST that does.
+        auto all = script(t + "create view v key id as select * from t;");
+        auto* cv = std::get_if<ql::CreateViewDef>(&all.back());
+        ASSERT_NE(cv, nullptr);
+        cv->items.push_back({ql::ItemKind::CountAll, "", "n"});
+        auto p = ql::applyViewPlan(*cv, ql::viewSourceOf(std::get<ql::TopicDef>(all[0])));
+        ASSERT_FALSE(p.has_value());
+        EXPECT_EQ(p.error().message, "'*' is not valid in an aggregate view");
+    }
     EXPECT_EQ(errorOf("topic u;", "create view v key id as select a from u;"), "view source must be a typed topic");
 }
 
-TEST(CheckedWritesQlPlan, GroupByIsWrittenAsTyped) {
+TEST(CheckedWritesQlPlanRegression, AggregateIsGroupedByItsKeyRegression) {
+    namespace v = rune::view;
     const std::string t = "topic d { id uint64, userId uint64, deviceFp string(64), ts int64 } key id;";
-    auto p = planOne(t, "create view v key (userId, deviceFp) as select count(*) as n from d group by deviceFp, userId;");
+    // A plain key: v1, the key column rides as the source key field, no group by anywhere.
+    auto s = planOne(t, "create view s key userId as select count(*) as n from d;");
+    ASSERT_TRUE(s.has_value()) << s.error().message;
+    EXPECT_EQ(s->key, "userId");
+    EXPECT_EQ(s->sources[0].keyField, "userId");
+    EXPECT_FALSE(v::needsV2(*s));
+    // A composite key: v2, the source key is the topic key.
+    auto p = planOne(t, "create view d2 key (userId, deviceFp) as select count(*) as c from d;");
     ASSERT_TRUE(p.has_value()) << p.error().message;
-    expectComponents(p->groupBy, {{"deviceFp", 0, "deviceFp"}, {"userId", 0, "userId"}});
-    auto q = planOne(t, "create view w key lower(deviceFp) as fp as select count(*) as n from d group by lower(deviceFp);");
+    EXPECT_TRUE(v::needsV2(*p));
+    EXPECT_EQ(p->sources[0].keyField, "id");
+    expectComponents(p->keyComponents, {{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}});
+    // A lower() key is the group, too.
+    auto q = planOne(t, "create view w key lower(deviceFp) as fp as select count(*) as n from d;");
     ASSERT_TRUE(q.has_value()) << q.error().message;
-    expectComponents(q->groupBy, {{"deviceFp", 1, "fp"}});
     expectComponents(q->keyComponents, {{"deviceFp", 1, "fp"}});
     EXPECT_EQ(q->unicodeVersion, 0x00100000u);
     expectOutput(*q, {F("n", PrimType::Int64, "", MergeRule::CountAll)});
     EXPECT_EQ(q->sources[0].keyField, "id");
+    // `group by` is refused at parse time (a script that parses nothing).
+    EXPECT_FALSE(ql::parseScript("topic t { id uint64 } key id; create view v key id as select count(*) as n from t group by id;").has_value());
 }
 
 TEST(CheckedWritesQlPlan, TransientAndReplace) {
@@ -274,26 +287,26 @@ TEST(CheckedWritesQlPlan, TransientAndReplace) {
 TEST(CheckedWritesQlPlanRegression, CheckConstantEdgesRegression) {
     const std::string t = "topic c { id uint64, u uint64, s string(16), w string(64), b bool, f float64 } key id;";
     auto check = [&](const char* col, const char* pred) {
-        return planOne(t, std::string("create view v key id as select count(*) as characters, ") + col + " from c group by id constraint max_characters check (" + pred + ");");
+        return planOne(t, std::string("create view v key id as select count(*) as characters, ") + col + " from c constraint max_characters check (" + pred + ");");
     };
-    auto neg = planOne(t, "create view v key id as select count(*) as characters from c group by id constraint max_characters check (characters <= -1);");
+    auto neg = planOne(t, "create view v key id as select count(*) as characters from c constraint max_characters check (characters <= -1);");
     ASSERT_TRUE(neg.has_value()) << neg.error().message;
     const auto& k = neg->constraints[0].predicate[1];
     EXPECT_EQ(k.constType, PrimType::Int64);
     EXPECT_EQ(k.constBytes, bytes16({0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}));
-    EXPECT_EQ(errorOf(t, "create view v key id as select count(*) as characters from c group by id constraint max_characters check (characters <= 9223372036854775808);"),
+    EXPECT_EQ(errorOf(t, "create view v key id as select count(*) as characters from c constraint max_characters check (characters <= 9223372036854775808);"),
               "constraint 'max_characters': 9223372036854775808 does not fit int64 column 'characters'");
-    EXPECT_EQ(errorOf(t, "create view v key id as select max(u) as m from c group by id constraint k check (m >= -1);"),
+    EXPECT_EQ(errorOf(t, "create view v key id as select max(u) as m from c constraint k check (m >= -1);"),
               "constraint 'k': -1 does not fit uint64 column 'm'");
     auto str = check("last(s) as ls", "ls = 'abc'");
     ASSERT_TRUE(str.has_value()) << str.error().message;
     EXPECT_EQ(str->constraints[0].predicate[1].constBytes, bytes16({0x61, 0x62, 0x63}));
     EXPECT_EQ(ql::predicateText(str->constraints[0].predicate), "ls = 'abc'");
-    EXPECT_EQ(errorOf(t, "create view v key id as select last(w) as lw from c group by id constraint k check (lw = 'abc');"),
+    EXPECT_EQ(errorOf(t, "create view v key id as select last(w) as lw from c constraint k check (lw = 'abc');"),
               "constraint 'k': check compares fixed-width columns of at most 16 bytes; 'lw' is string(64)");
-    EXPECT_EQ(errorOf(t, "create view v key id as select max(u) as m from c group by id constraint k check (m = true);"),
+    EXPECT_EQ(errorOf(t, "create view v key id as select max(u) as m from c constraint k check (m = true);"),
               "constraint 'k': true does not fit uint64 column 'm'");
-    EXPECT_EQ(errorOf(t, "create view v key id as select count(*) as n from c group by id constraint k check (nope = 1);"),
+    EXPECT_EQ(errorOf(t, "create view v key id as select count(*) as n from c constraint k check (nope = 1);"),
               "constraint 'k': column 'nope' is not a column of the view");
     auto b = check("last(b) as lb", "lb = true");
     ASSERT_TRUE(b.has_value()) << b.error().message;
@@ -303,7 +316,7 @@ TEST(CheckedWritesQlPlanRegression, CheckConstantEdgesRegression) {
 
 TEST(CheckedWritesQlPlanRegression, NegativeZeroFloatConstantIsPositiveZeroRegression) {
     const std::string t = "topic c { id uint64, f float64 } key id;";
-    auto p = planOne(t, "create view v key id as select last(f) as lf from c group by id constraint k check (lf > -0);");
+    auto p = planOne(t, "create view v key id as select last(f) as lf from c constraint k check (lf > -0);");
     ASSERT_TRUE(p.has_value()) << p.error().message;
     EXPECT_EQ(p->constraints[0].predicate[1].constBytes, bytes16({}));
     EXPECT_EQ(ql::predicateText(p->constraints[0].predicate), "lf > 0");
@@ -311,7 +324,7 @@ TEST(CheckedWritesQlPlanRegression, NegativeZeroFloatConstantIsPositiveZeroRegre
 
 TEST(CheckedWritesQlPlan, PredicateTextShapes) {
     const std::string t = "topic c { id uint64, u uint64 } key id;";
-    auto p = planOne(t, "create view v key id as select count(*) as n, max(u) as m from c group by id "
+    auto p = planOne(t, "create view v key id as select count(*) as n, max(u) as m from c "
                         "constraint k check (not (n < 3) and (m = 1 or m <> 2) or n >= 7);");
     ASSERT_TRUE(p.has_value()) << p.error().message;
     EXPECT_EQ(ql::predicateText(p->constraints[0].predicate), "(not (n < 3) and (m = 1 or m <> 2)) or n >= 7");
@@ -319,14 +332,12 @@ TEST(CheckedWritesQlPlan, PredicateTextShapes) {
 
 TEST(CheckedWritesQlPlanRegression, V2AggregateNamesTheSourceKeyRegression) {
     const std::string t = "topic d { id uint64, userId uint64, ts int64 } key id;";
-    auto v1 = planOne(t, "create view a key userId as select count(*) as n from d group by userId;");
+    auto v1 = planOne(t, "create view a key userId as select count(*) as n from d;");
     ASSERT_TRUE(v1.has_value()) << v1.error().message;
     EXPECT_EQ(v1->sources[0].keyField, "userId");
-    EXPECT_TRUE(v1->groupBy.empty());
-    auto v2 = planOne(t, "create view b key userId as select count(*) as n from d group by userId constraint c check (n <= 1);");
+    auto v2 = planOne(t, "create view b key userId as select count(*) as n from d constraint c check (n <= 1);");
     ASSERT_TRUE(v2.has_value()) << v2.error().message;
     EXPECT_EQ(v2->sources[0].keyField, "id");
-    expectComponents(v2->groupBy, {{"userId", 0, "userId"}});
 }
 
 TEST(CheckedWritesQlPlanRegression, PredicateTextOfASelfReferencingPlanIsInvalidRegression) {

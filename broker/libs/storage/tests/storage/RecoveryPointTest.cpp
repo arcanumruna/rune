@@ -952,6 +952,30 @@ TEST(DamagedSegmentRegression, ReloadSegmentsKeepsADamagedSealedSegmentRegressio
     EXPECT_EQ(f.log->logEndOffset(), f.leo);
 }
 
+// #878: the live reload recovers the ACTIVE (highest-base) segment with CutTornTail: a torn tail is cut, not flagged.
+TEST(DamagedSegmentRegression, ReloadCutsATornTailOfTheActiveSegmentRegression) {
+    DamagedFixture f("dmg_reload_active", 3, /*closeCleanly=*/false);
+    const int64_t leo = f.log->logEndOffset();
+    const std::string active = segPath(f.dir, f.bases.back());
+    const auto szActive = fs::file_size(active);
+    {
+        std::ofstream out(active, std::ios::app | std::ios::binary);
+        ASSERT_TRUE(out.is_open());
+        const std::string junk(37, static_cast<char>(0xAB));
+        out.write(junk.data(), static_cast<std::streamsize>(junk.size()));
+    }
+    ASSERT_EQ(fs::file_size(active), szActive + 37);
+    ASSERT_TRUE(f.log->reloadSegments());
+    EXPECT_EQ(fs::file_size(active), szActive) << "the torn tail of the active segment is cut by a live reload";
+    EXPECT_EQ(f.log->damagedSegmentCount(), 0u);
+    EXPECT_EQ(f.log->logEndOffset(), leo);
+    appendOne(*f.log);
+    EXPECT_EQ(f.log->logEndOffset(), leo + 1);
+    const auto got = readAt(*f.log, leo);
+    EXPECT_EQ(got.st, ReadIntoStatus::Ok);
+    EXPECT_EQ(got.base, leo);
+}
+
 TEST(DamagedSegmentRegression, CleanerSwapReloadKeepsDamageRegression) {
     DamagedFixture f("dmg_swap", 3, /*closeCleanly=*/false);
     f.xorSecondBatch();

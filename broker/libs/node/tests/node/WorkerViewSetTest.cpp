@@ -1379,14 +1379,26 @@ TEST(WorkerViewSetRegression, UninstallArrivesOnTheInstallRing) {
     EXPECT_EQ(vs.viewCount(), 0u);
     // Round trip of the op byte: uninstall / recovery / install never alias.
     std::vector<uint8_t> buf(rune::node::viewPlanUpdateWireLen(m));
-    rune::node::writeViewPlanUpdate(buf.data(), m.viewTopicId, 0, rune::node::kViewPlanUninstallByte, {}, {}, {});
+    rune::node::writeViewPlanUpdate(buf.data(), m.viewTopicId, 0, rune::node::kViewPlanUninstallByte, {}, {}, {}, 0);
     const auto d = rune::node::decodeViewPlanUpdate(buf.data(), buf.size());
     EXPECT_TRUE(d.uninstall);
     EXPECT_FALSE(d.recovery);
-    rune::node::writeViewPlanUpdate(buf.data(), m.viewTopicId, 0, 1, {}, {}, {});
+    rune::node::writeViewPlanUpdate(buf.data(), m.viewTopicId, 0, 1, {}, {}, {}, 0);
     const auto r = rune::node::decodeViewPlanUpdate(buf.data(), buf.size());
     EXPECT_TRUE(r.recovery);
     EXPECT_FALSE(r.uninstall);
+    // #941: the object id trails the blobs and survives; a frame without the trailing 8 bytes decodes with 0.
+    constexpr uint64_t kObj = 0x1122334455667788ull;
+    const std::vector<uint8_t> blob{1, 2, 3};
+    std::vector<uint8_t> withObj(rune::node::viewPlanUpdateWireLen(blob, blob, blob));
+    rune::node::writeViewPlanUpdate(withObj.data(), 5, 0, 0, blob, blob, blob, kObj);
+    const auto o = rune::node::decodeViewPlanUpdate(withObj.data(), withObj.size());
+    EXPECT_EQ(o.viewObjectId, kObj);
+    EXPECT_EQ(o.planBlob, blob);
+    EXPECT_EQ(o.srcDescBlob, blob);
+    const auto old = rune::node::decodeViewPlanUpdate(withObj.data(), withObj.size() - 8);
+    EXPECT_EQ(old.viewObjectId, 0u);
+    EXPECT_EQ(old.srcDescBlob, blob);
 }
 
 namespace {

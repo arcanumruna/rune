@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -71,7 +72,6 @@ const char* kSource = "{ id uint64, userId uint64, name string(16), tag string(8
 
 const char* kKeys[] = {"key id", "key userId", "key (userId, id)", "key lower(name) as nameKey", "key (lower(name) as nameKey, id)",
                        "key (lower(tag) as tagKey, id)", "key (lower(tag) as tagKey, id, gender)"};
-const char* kGroups[] = {"id", "userId", "userId, id", "lower(name)", "lower(name), id", "lower(tag), id", "lower(tag), id, gender"};
 
 enum class Kind : uint8_t { Projection, Aggregate, Unique };
 enum class Outcome : uint8_t { Legacy, Keyed, KeyedOwnerMapped, Refused };
@@ -114,7 +114,7 @@ std::vector<MatrixCell> cells() {
 
 std::string viewText(const MatrixCell& c) {
     const std::string head = std::string("create ") + (c.kind == Kind::Unique ? "unique " : "") + "view v " + kKeys[c.key] + " as select ";
-    if (c.kind == Kind::Aggregate) return head + "count(*) as c from src group by " + kGroups[c.key] + ";";
+    if (c.kind == Kind::Aggregate) return head + "count(*) as c from src;";
     return head + "n from src;";
 }
 
@@ -169,29 +169,48 @@ TEST(CheckedWritesQlCompile, UniqueViewIsAccepted) {
     EXPECT_EQ(a.code, 0) << a.detail;
 }
 
-TEST(CheckedWritesQlCompile, GroupByOrderIsTheCompilersRule) {
+namespace {
+void putStr(std::vector<uint8_t>& b, const std::string& s) {
+    const uint32_t n = static_cast<uint32_t>(s.size());
+    for (int i = 0; i < 4; ++i) b.push_back(static_cast<uint8_t>(n >> (8 * i)));
+    b.insert(b.end(), s.begin(), s.end());
+}
+// The v2 trailing group block of a plan grouped by `cols` (plain columns): u32 count, { column:str, keyFunction:u8, outName:str } each.
+std::vector<uint8_t> groupTail(const std::vector<std::string>& cols) {
+    std::vector<uint8_t> t;
+    for (int i = 0; i < 4; ++i) t.push_back(static_cast<uint8_t>(cols.size() >> (8 * i)));
+    for (const auto& c : cols) { putStr(t, c); t.push_back(0); putStr(t, c); }
+    return t;
+}
+}  // namespace
+
+// What an old CLI sent for `group by deviceFp, userId` on key (userId, deviceFp): the same blob with a different trailing group block.
+// Decode now refuses it (the group is derived from the key), so the broker answers ViewFieldUnresolved (34) without detail.
+TEST(CheckedWritesQlCompileRegression, OldClientMismatchedGroupByIsRefusedRegression) {
     const ql::TopicDef topic = topicOf("topic device { id uint64, userId uint64, deviceFp string(32), ts int64 } partitions 1 key id;");
-    const auto plan = ql::applyViewPlan(viewOf("create view v key (userId, deviceFp) as select count(*) as c from device group by deviceFp, userId;"),
-                                        ql::viewSourceOf(topic));
+    auto plan = ql::applyViewPlan(viewOf("create view v key (userId, deviceFp) as select count(*) as c from device;"), ql::viewSourceOf(topic));
     ASSERT_TRUE(plan.has_value()) << plan.error().message;
     CatalogDdlRig rig("cwqg");
     serving(rig);
     ASSERT_EQ(defineTopic(rig, topic).code, 0);
-    const auto a = submitView(rig, *plan, "device");
-    EXPECT_EQ(a.code, codeOf(ErrorCode::ViewKeyInvalid));
-    EXPECT_EQ(a.detail, "view 'v': group by (deviceFp, userId) must equal the key (userId, deviceFp)");
-}
+    plan->sources[0].topicId = rig.admin().applier().state().topicByName(0, "device")->topicId;
+    const auto good = rv::serializeAuthored(*plan);
+    ASSERT_EQ(good[0], 0x02);
 
-TEST(CheckedWritesQlCompileRegression, GroupColumnOtherThanTheKeyNamesTheCompilersDetailRegression) {
-    const ql::TopicDef topic = topicOf("topic src { id uint64, userId uint64, gender uint16 } partitions 1 key id;");
-    const auto plan = ql::applyViewPlan(viewOf("create view v key userId as select count(*) as n from src group by gender;"), ql::viewSourceOf(topic));
-    ASSERT_TRUE(plan.has_value()) << plan.error().message;
-    CatalogDdlRig rig("cwqk");
-    serving(rig);
-    ASSERT_EQ(defineTopic(rig, topic).code, 0);
-    const auto a = submitView(rig, *plan, "src");
-    EXPECT_EQ(a.code, codeOf(ErrorCode::ViewKeyInvalid));
-    EXPECT_EQ(a.detail, "view 'v': group by (gender) must equal the key (userId)");
+    auto swapped = good;
+    const auto from = groupTail({"userId", "deviceFp"});
+    const auto to = groupTail({"deviceFp", "userId"});
+    ASSERT_GE(swapped.size(), from.size());
+    ASSERT_TRUE(std::equal(swapped.end() - static_cast<std::ptrdiff_t>(from.size()), swapped.end(), from.begin()));
+    swapped.resize(swapped.size() - from.size());
+    swapped.insert(swapped.end(), to.begin(), to.end());
+    ASSERT_NE(swapped, good);
+
+    const auto refused = rig.createViewWithPlan("v", "userId", plan->persistence, swapped);
+    EXPECT_EQ(refused.code, codeOf(ErrorCode::ViewFieldUnresolved)) << refused.detail;
+    EXPECT_EQ(codeOf(ErrorCode::ViewFieldUnresolved), 34);
+    const auto ok = rig.createViewWithPlan("v", "userId", plan->persistence, good);
+    EXPECT_EQ(ok.code, 0) << ok.detail;
 }
 
 TEST(CheckedWritesQlCompile, RegressorsPathCompilesWithTheBrokerCompiler) {

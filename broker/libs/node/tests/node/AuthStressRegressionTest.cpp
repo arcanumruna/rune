@@ -128,6 +128,13 @@ struct Sess {
     Clock::time_point loginAt{};   ///< when the test observed this session's login OK
 };
 
+// The liveness bound of "a revoke ends the subscription": the test's uniform answer bound (every unanswered request,
+// subscribe and DDL fails at 5 s too).  It was 1 s and failed under ctest -j8 load while the end did arrive (#969): this
+// run measures the end through a loaded test thread, so it bounds liveness only.  The 100 ms promise (SECURITY.md) is
+// the latency gate AuthClusterRegression.RevokeEndsSubscriptionsOnEveryBrokerWithin100msRegression, on an idle host;
+// safety stays exact here: no Record at or above the log end seen at the subscription's end (finish_).
+constexpr auto kRevokeEndBound = std::chrono::seconds(5);
+
 struct Sub {
     enum class St { Pending, Live, MustEnd, Ended } st = St::Pending;
     int         sess = 0;
@@ -136,7 +143,7 @@ struct Sub {
     int64_t     corr = 0, subId = 0;
     int64_t     sid = 0;         // the session it was sent on (a reconnect gives the Sess a new one)
     std::size_t estSent = 0;     // changes sent when the SubscribeResponse OK was seen
-    Clock::time_point deadline;  // MustEnd: the error is due (1 s after the answer of the change that took READ)
+    Clock::time_point deadline;  // MustEnd: the error is due (kRevokeEndBound after the answer of the change that took READ)
     Clock::time_point liveAt;    // when its SubscribeResponse OK was seen
     bool        racing = false;  // MustEnd found by the revoke-raced-the-Subscribe rule
     bool        forced = false;  // the once-per-seed forced race (issue #5)
@@ -306,7 +313,7 @@ private:
             for (Sub& s : subs_) {
                 if (s.st != Sub::St::Live || s.estSent > c.idx) continue;
                 if (!states_[c.idx + 1].allowed(user_(sess_[static_cast<std::size_t>(s.sess)].user), pm::Op::Read, s.topic)) {
-                    s.st = Sub::St::MustEnd; s.deadline = now + 1s; s.racing = false;
+                    s.st = Sub::St::MustEnd; s.deadline = now + kRevokeEndBound; s.racing = false;
                 }
             }
         }
@@ -373,12 +380,12 @@ private:
             }
             // invariant 2, the revoke that RACED the Subscribe: it was authorised at some applied prefix <= estSent; once the
             // changes 0..estSent-1 are all answered the broker has applied at least states_[estSent], and if that denies READ
-            // some change after the authorisation took it from this live subscription - it must end within 1 s
+            // some change after the authorisation took it from this live subscription - it must end within kRevokeEndBound
             if (s.st == Sub::St::Live && s.estSent <= contig &&
                 !states_[s.estSent].allowed(user_(se.user), pm::Op::Read, s.topic)) {
                 Clock::time_point last = s.liveAt;
                 for (std::size_t k = 0; k < s.estSent; ++k) last = std::max(last, changes_[k].answeredAt);
-                s.st = Sub::St::MustEnd; s.deadline = last + 1s; s.racing = true;
+                s.st = Sub::St::MustEnd; s.deadline = last + kRevokeEndBound; s.racing = true;
             }
             if (s.st == Sub::St::Live || s.st == Sub::St::MustEnd) {
                 const auto& errs = se.c->errors();
@@ -399,7 +406,7 @@ private:
                     break;
                 }
                 if (s.st == Sub::St::MustEnd && now > s.deadline)
-                    failWith_("REVOKE DID NOT END the subscription on " + s.topic + " of " + user_(se.user) + " (1 s after the change's answer)");
+                    failWith_("REVOKE DID NOT END the subscription on " + s.topic + " of " + user_(se.user) + " (" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(kRevokeEndBound).count()) + " ms after the change's answer)");
             }
         }
     }
@@ -673,8 +680,8 @@ private:
         // sessions of a user disabled at the end are dead; the model decides
         const pm::Model& fin = states_.back();
         for (Sess& s : sess_) if (!fin.isEnabled(user_(s.user))) s.alive = false;
-        // subscriptions still live must still be allowed (nothing may survive a revoke) - give the broker its second
-        const auto settle = Clock::now() + 1500ms;
+        // subscriptions still live must still be allowed (nothing may survive a revoke) - within the same liveness bound
+        const auto settle = Clock::now() + kRevokeEndBound;
         for (;;) {
             pump_(5ms);
             bool bad = false;
@@ -759,6 +766,11 @@ private:
             }
             ++tally_.disabledLoginsRefused;
         }
+        // #1005: which sessions are alive here depended on timing (a reconnect step runs only while every change is
+        // answered), so the probe counts and their floors did too.  Every change is answered now: log every enabled
+        // user's dead session back in, so the probed set is the model's (every session of an enabled user).
+        reconnect_();
+        if (!fail_.empty()) return;
         // probes: EVERY alive session x existing topic x BOTH produce paths (worker ingress, gateway-routed) + Subscribe.
         // Plus the rig's `secret` topic, outside every grant this test can issue (all are under P()): every seed with a
         // live session probes a denial on both paths, whatever its final model grants.
