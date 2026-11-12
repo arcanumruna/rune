@@ -424,6 +424,9 @@ struct WatchCtx {
         case rc::LeaseEventKind::Vanished: return "Vanished";
         case rc::LeaseEventKind::Ready: return "Ready";
         case rc::LeaseEventKind::Failed: return "Failed";
+        case rc::LeaseEventKind::Confirmed: return "Confirmed";
+        case rc::LeaseEventKind::RerunBegin: return "RerunBegin";
+        case rc::LeaseEventKind::RerunEnd: return "RerunEnd";
         }
         return "?";
     }
@@ -525,7 +528,11 @@ struct TransientLog {
             ++w.ended[k];
             break;
         case rc::LeaseEventKind::Failed: ++w.failed; break;
-        default: break;
+        case rc::LeaseEventKind::Updated:
+        case rc::LeaseEventKind::Ready:
+        case rc::LeaseEventKind::Confirmed:    // a re-run confirmed a lease the log already holds live
+        case rc::LeaseEventKind::RerunBegin:
+        case rc::LeaseEventKind::RerunEnd: break;
         }
     }
 };

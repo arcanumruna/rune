@@ -31,6 +31,7 @@
 #include <cstring>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <span>
 #include <thread>
@@ -249,7 +250,31 @@ struct SubscriptionStatus {
     uint16_t brokerErrorCode = 0;  // RejectedByBroker: the SubscribeResponse errorCode (final snapshot only)
     uint32_t dataResets      = 0;  // E2 round 6: times the partition's data was reset under it (see dataResets())
     uint64_t batchBytes      = 0;  // Phase 2c (FD13) / #428: sum of the sizes of the batches DELIVERED to the handler (malformed, duplicate and control batches do not count)
+    bool     paused          = false;  // pause(): the broker side is released and the subscription is parked
+    /// The echo of the handle's own commands: the sequence number of the last pause() / resume() the handle sent that the
+    /// hub has applied.  The handle adopts `paused` only when this equals the number of commands it has sent (every one of
+    /// them is reflected); until then its own view stands.  A pause / resume made on the duty thread carries no number.
+    uint32_t appSeqApplied   = 0;
 };
+
+struct SubscriptionImpl;
+
+namespace subscriber {
+/// App-thread -> duty-thread hand-off for one subscribe() call (heap-allocated
+/// by the app thread, ownership passed through the agent command ring).  A paused
+/// subscription parks its request (inside a map node) in its SubscriptionImpl.
+struct SubscribeRequest {
+    SubscriptionImpl*                     impl = nullptr;  // F8c C7: not owning (see owned_)
+    std::vector<uint8_t>                  subscribeFrame;  // encoded Subscribe (resend on redirect)
+    int64_t                               timeoutNs = 0;   // #701: the relative subscribe timeout (set on the app thread)
+    int64_t                               deadlineNs = 0;  // M2: subscribe-request deadline, duty-clock ns (stamped at adoption)
+    bool                                  unsent = false;  // fix3 I4: refused, retried per cycle
+    uint8_t                               nlRetries = 0;   // bare-NotLeader retries spent (bounded budget)
+    // E2 final fix wave (I2): a moved subscription held on its node session is
+    // not re-offered before this time (a bare NotLeader backoff); epoch = no wait.
+    int64_t                               notBeforeNs = 0;   // duty-clock ns (0 = no wait)
+};
+}  // namespace subscriber
 
 // ---------------------------------------------------------------------------
 // SubscriptionImpl — internal state for one subscription (F8a: shared-nothing).
@@ -347,6 +372,27 @@ struct SubscriptionImpl {
     // Intrusive links of the hub's dirty list (no allocation on the dispatch path).
     SubscriptionImpl* prevDirty = nullptr;
     SubscriptionImpl* nextDirty = nullptr;
+
+    // ---- pause / resume (duty thread) ----------------------------------------------
+    // A paused subscription is `active` (not finished) but in neither of the hub's routing tables; its Subscribe request
+    // (a map node) and its old routing entry (a map node) are parked here, so a later cycle allocates nothing.
+    /// The slot of this impl in its hub's owned_ (set at adoption, kept by the swap-remove of release()): owns_() is O(1), validated
+    /// as `slot < owned_.size() && owned_[slot] == this`, so a stale value (handed back, never adopted) is simply refused.
+    uint32_t ownedSlot   = ~0u;
+    bool    paused       = false;
+    bool    pausedOnce   = false;  // the hub keeps (parks) the nodes instead of freeing them once a pause happened
+    uint32_t appSeqApplied = 0;         // duty-owned: the number of the last handle command (pause / resume) applied (echoed in the status)
+    bool    stopDispatch = false;       // set by pause_ for the impl being dispatched; only the dispatch loop resets it (a resume() inside the handler does not)
+    bool    everBound    = false;       // the first bind snapshot uses the final-status reserve; re-binds (resume, move) do not
+    bool    pauseAfterCurrent = false;  // paused with no offset inside its own handler: the record being handled counts
+    int64_t deliveringOffset  = -1;     // the offset of the record handed to the handler last (a pause may name it)
+    int64_t subscribeTimeoutNs = 0;     // the relative subscribe timeout (a resume re-stamps the deadline)
+    std::map<int64_t, std::unique_ptr<subscriber::SubscribeRequest>>::node_type parkedRequest;
+    std::map<int64_t, SubscriptionImpl*>::node_type                             parkedRoute;
+    /// The highest offset pause(resumeAt) may name: the position, or - while the handler of a record runs - that record.
+    [[nodiscard]] int64_t pauseBound() const noexcept {
+        return nextOffset > deliveringOffset + 1 ? nextOffset : deliveringOffset + 1;
+    }
 
     // ---- F8c C7 fix round 2 (F1): orphaned release -------------------------------
     int64_t orphanFence  = 0;      // written by the handle BEFORE its orphan RMW (published by it)
@@ -493,11 +539,43 @@ public:
     /// control batch (consumed, never delivered) do not add.  Freshness: see position().
     [[nodiscard]] uint64_t batchBytes() const;
 
+    /// Stops delivery.  The broker-side subscription is released; the handle stays valid.
+    /// resumeAt < 0: delivery continues after the last record handed to the handler.
+    /// resumeAt >= 0: the next record delivered after resume() is the one at resumeAt (a handler that could not take
+    /// `rec` calls pause(rec.offset)).  resumeAt may not be above (last delivered offset + 1).
+    /// Safe on any thread and inside this subscription's handler (the hub applies it at once: no further record of the
+    /// batch, nor of any later batch of the old broker subscription, is delivered).  Pausing a paused subscription only
+    /// lowers (or keeps) its position.  Returns false when finished or unsubscribed, when resumeAt is above the position,
+    /// and for a LeaseWatch's subscription (not pausable).  On the duty thread (a handler of this client's thread-mode runner,
+    /// or an Invoker caller) the hub decides at once and the return value is its verdict.  From another app thread the
+    /// command is queued: the position bound is checked against the handle's last snapshot (see position()) and the hub
+    /// checks it again; a command the hub later ignores shows only in paused() once its echo is drained.
+    bool pause(int64_t resumeAt = -1);
+    /// Subscribes again at the stored position (exactly once per record: a batch the broker pushes from below the position
+    /// is trimmed).  Returns false when not paused.  After a pause made INSIDE the handler the app thread learns of it from
+    /// the drained status (eventually, not at the same instant): resume() returns false until paused() reads true.  Called
+    /// from the handler itself, resume() takes effect for the position but never re-enters the batch being dispatched.
+    bool resume();
+    /// True between a successful pause() and resume() / the end of the subscription.  Freshness: this handle's own calls are
+    /// visible at once; on the duty thread it reads the duty-owned state.  A pause made inside the handler becomes visible to
+    /// the app thread once its status snapshot is drained (eventually).
+    [[nodiscard]] bool paused() const;
+
+    /// Internal (LeaseWatch): a handle whose pause() / resume() always return false.  Handle-local, set before the handle is
+    /// handed on.
+    void markNotPausable() noexcept { pausable_ = false; }
+
 private:
+    friend struct SubscriptionTestAccess;   // tests only: sets the command counter next to its wrap
     [[nodiscard]] bool onDutyThread_() const noexcept {
         return dutyThread_ != std::thread::id{} && std::this_thread::get_id() == dutyThread_;
     }
     void drainStatus_() const;
+    /// The number of the next pause() / resume() command: 0 means "no number" (a duty-thread call), so it is skipped on wrap.
+    [[nodiscard]] static uint32_t nextSeq_(uint32_t cur) noexcept {
+        const uint32_t n = cur + 1;
+        return n != 0 ? n : 1;
+    }
     /// F8c C7: the §3.3 release of the handle's share (see the destructor).
     void release_() noexcept;
 
@@ -506,6 +584,9 @@ private:
     void*                             sinkCtx_ = nullptr;
     std::thread::id                   dutyThread_{};
     bool                              unsubscribed_ = false;  // handle-local (app-owned)
+    bool                              pausable_     = true;   // handle-local: false for a LeaseWatch's subscriptions
+    mutable bool                      paused_       = false;  // handle-local (app thread): set by pause(), cleared by resume(); adopts the status' `paused` once appSeqApplied == appSeq_
+    uint32_t                          appSeq_       = 0;      // handle-local: pause() / resume() commands this handle has sent (echoed back as appSeqApplied)
     // App-owned cache of the latest status snapshot drained from impl_->status.
     mutable SubscriptionStatus        cache_{};
 };

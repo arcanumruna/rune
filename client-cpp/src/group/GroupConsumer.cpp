@@ -135,6 +135,8 @@ void GroupConsumer::setCallback_(int which, Fn cb) {
         break;
     case detail::HubSubmit::Closed:
     case detail::HubSubmit::Orphaned:  // HandleRelease only
+    case detail::HubSubmit::Applied:   // subscription pause / resume only
+    case detail::HubSubmit::Refused:
         break;  // never submitted: holder frees itself
     }
 }

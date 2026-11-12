@@ -3865,6 +3865,7 @@ int Client::doWork() {
     // post-close call (e.g. from an app loop that has not yet noticed close()
     // happened).  F8c: "closed" is the command ring's closed bit.
     if (agent_.commandRingClosed()) return 0;
+    ++invokerCycles_;
     return dutyCycle(now());
 }
 
@@ -6312,6 +6313,8 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
         break;
     case detail::HubSubmit::Closed:
     case detail::HubSubmit::Orphaned:  // HandleRelease only — never for a SubscribeAdd
+    case detail::HubSubmit::Applied:   // pause / resume only
+    case detail::HubSubmit::Refused:
         impl->status.abandon();         // never submitted (req freed): born finished
         (void)impl->status.detachProducer();  // C7: no duty side will ever hold it
         break;
@@ -6361,6 +6364,21 @@ void Client::applyHubCommandDirect_(const detail::HubCommand& cmd) {
         return;
     }
     applyHubCommand_(cmd);
+}
+
+bool Client::applySubscriptionPauseDirect_(const detail::HubCommand& cmd) {
+    using Op = detail::HubCommand::Op;
+    if (cmd.handle == 0) return false;
+    syncSeedSession_();
+    const auto snap = agent_.stateAndSessionId();
+    auto& impl      = *reinterpret_cast<SubscriptionImpl*>(cmd.handle);   // the caller's handle holds it for the whole call
+    const auto send = [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+        return agent_.submitSend(fb, fl);
+    };
+    const int64_t corr = nextCorrId_++;   // the Unsubscribe's (pause) / the new Subscribe's (resume) correlation id
+    return cmd.op == Op::SubscribePause
+               ? subscriberHub_.pauseDirect(impl, cmd.a, static_cast<uint32_t>(cmd.b), corr, snap.sessionId, send)
+               : subscriberHub_.resumeDirect(impl, static_cast<uint32_t>(cmd.b), corr, snap.sessionId, now(), send);
 }
 
 detail::SendResult Client::directSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len) {
@@ -6979,13 +6997,15 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
             }
         }
     }
-    if (cmd.op == Op::SubscribeAdd || cmd.op == Op::Unsubscribe) {
+    if (cmd.op == Op::SubscribeAdd || cmd.op == Op::Unsubscribe || cmd.op == Op::SubscribePause ||
+        cmd.op == Op::SubscribeResume) {
         SubscriptionImpl* adopted = nullptr;  // F1: check the adopted impl for an orphaned release
         if (cmd.op == Op::SubscribeAdd && cmd.handle != 0) {
             adopted = reinterpret_cast<subscriber::SubscribeRequest*>(cmd.handle)->impl;
         }
         const auto snap = agent_.stateAndSessionId();
-        const int64_t unsubCorrId = (cmd.op == Op::Unsubscribe) ? nextCorrId_++ : 0;
+        // Unsubscribe / pause: the Unsubscribe's correlation id; resume: the new Subscribe's (hub applyCommand doc).
+        const int64_t unsubCorrId = (cmd.op != Op::SubscribeAdd) ? nextCorrId_++ : 0;
         subscriberHub_.applyCommand(
             cmd, unsubCorrId, snap.sessionId,
             [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
@@ -7039,10 +7059,18 @@ detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubComm
     // be applied to a subscription/consumer the hub does not hold yet.  Not
     // GroupSetCallback (it could replace a running callback): ring order.
     if (onDuty && (cmd.op == Op::SubscribeAdd || cmd.op == Op::GroupAdd ||
-                   cmd.op == Op::Unsubscribe || cmd.op == Op::GroupClose ||
+                   cmd.op == Op::Unsubscribe ||
+                   cmd.op == Op::GroupClose ||
                    cmd.op == Op::GroupCommit)) {
         self->applyHubCommandDirect_(cmd);
         return detail::HubSubmit::Accepted;
+    }
+    // pause / resume: on the duty / owner thread (the Invoker owner included) the hub decides and applies at once and the
+    // verdict goes back to the handle; elsewhere the command is queued below - or, when it asked for "only if applied
+    // directly" (a position above the handle's last snapshot), dropped: that bound is not decidable off the owner thread.
+    if (cmd.op == Op::SubscribePause || cmd.op == Op::SubscribeResume) {
+        if (onDuty) return self->applySubscriptionPauseDirect_(cmd) ? detail::HubSubmit::Applied : detail::HubSubmit::Refused;
+        if (cmd.op == Op::SubscribePause && cmd.c == 1) return detail::HubSubmit::Accepted;
     }
 
     // F8c C2: every submit below is linearized against close() by the command
@@ -7129,6 +7157,8 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
         break;
     case detail::HubSubmit::Closed:
     case detail::HubSubmit::Orphaned:  // HandleRelease only — never for a GroupAdd
+    case detail::HubSubmit::Applied:   // pause / resume only
+    case detail::HubSubmit::Refused:
         impl->status.abandon();               // never submitted: born finished
         (void)impl->status.detachProducer();  // C7: no duty side will ever hold it
         break;

@@ -117,3 +117,9 @@ race:aeron_client_conductor_check_registering_resources
 # ONE process (in-process 3-node test clusters: CatalogBrokerCluster::startNodes) race on that flag; both writers store
 # true and seed the PRNG. A production broker runs one driver per process. Scope: this one Aeron C function only.
 race:aeron_feedback_delay_state_init
+
+# Aeron C client async commands (aeron_async_add_publication and friends): the calling thread allocates the command
+# (aeron_alloc zeroes it), hands it to the client conductor through Aeron's MPSC queue, and the conductor thread frees
+# it (aeron_free). The queue's fence-based happens-before edge is invisible to TSan, so the free is reported as racing
+# the allocating thread's memset. Entirely inside the vendored C client.
+race:aeron_free

@@ -6,7 +6,7 @@ Settings are listed in [configuration.md](../configuration.md#client-configurati
 [wire-protocol.md](wire-protocol.md#error-codes).
 
 Contents: [model](#threading-model) · [connect](#connect) · [authentication](#authentication-and-security) ·
-[topics](#topics-and-ddl) · [produce](#produce) · [subscribe](#subscribe) · [filters](#subscription-filters) · [groups](#consumer-groups) ·
+[topics](#topics-and-ddl) · [produce](#produce) · [subscribe](#subscribe) · [pause and resume](#pause-and-resume) · [filters](#subscription-filters) · [lease watch](#lease-watch) · [groups](#consumer-groups) ·
 [transactions](#transactions) · [typed topics](#typed-topics-and-routing) · [views](#materialized-views) ·
 [catalog reads](#catalog-and-security-reads) · [errors](#errors-and-failure-handling)
 
@@ -414,6 +414,59 @@ sub.unsubscribe();
   Only a redirect that would have to move the seed is refused while a group is active: `failReason()` is
   `LeaderElsewhereWhileGroupActive` (use a separate `Client` for it).
 
+### Pause and resume
+
+A consumer that cannot take a record now (its own queue is full) pauses the subscription instead of dropping the record.
+
+```cpp
+// Invoker mode: the owner thread assigns the handle first and only then drives the client.
+Subscription sub;
+sub = client.subscribe(events, Key(uint64_t{42}), {.from = From::earliest()},
+    [&](const Record& rec) {
+        // keep this record for later: it is delivered again after resume()
+        if (!ring.tryPush(rec) && !sub.pause(rec.offset)) dropped.increment();
+    });
+for (;;) {
+    client.doWork();
+    // when the ring has room again:
+    if (sub.paused()) sub.resume();
+}
+```
+
+In Thread mode the duty thread can call the handler before `subscribe` has returned, so the handler must not use the handle
+until the application has assigned it and published that to the handler. From then on `pause` inside the handler behaves
+as in Invoker mode.
+
+- `pause(resumeAt = -1)` releases the broker side of the subscription (an `Unsubscribe`) and parks it. With `resumeAt < 0`
+  delivery continues after the last record the handler returned from. With `resumeAt >= 0` the next record delivered after
+  `resume()` is the one at `resumeAt`; it may not be above the position (the last delivered offset + 1). Inside a handler,
+  `pause(rec.offset)` therefore re-delivers `rec`.
+- A pause made inside the handler takes effect at once: no further record of the batch, and none of the old broker
+  subscription, reaches the handler. Pausing an already paused subscription only lowers (or keeps) its position.
+- `resume()` subscribes again at the stored position. Each record is delivered exactly once: a batch the broker pushes from
+  below the position is trimmed. A `dataResets()` count and a leader move are handled as for any subscription.
+- `paused()` is true between a successful `pause()` and `resume()` or the end of the subscription.
+  `active()` is false while the subscription is paused.
+- A `From::latest()` subscription paused before its first record resolves "latest" again at `resume()`, so the records
+  produced during the pause are skipped.
+- Both calls return `false` when the subscription is finished or unsubscribed, when `resumeAt` is above the position, for
+  `resume()` when it is not paused, and always for the subscriptions of a `LeaseWatch` (they are not pausable).
+  `pause()` also returns `false` while the client holds 64 releases the transport has not yet accepted; the subscription
+  keeps delivering.
+- **Visibility across threads.** The calls are safe on any thread. On an application thread, `pause()` returning `true`
+  means the request was queued for the client's duty thread, not that it was applied; `paused()` reads `true` on that handle
+  at once and turns `false` again if the duty thread did not apply the pause (the subscription ended, or the client had no
+  room to hold the release for the broker). It converges through the status the duty thread publishes back. `resumeAt` is checked
+  there against the last status the handle has seen, so `pause(x)` can be refused for an `x` the duty thread has already
+  delivered. A pause made from inside a message handler (the duty thread) becomes visible to the application thread
+  eventually, not immediately: the duty thread publishes it on the status ring and the handle adopts it when the application
+  thread next drains it, which `paused()`, `pause()`, `resume()`, `active()` and `position()` all do first. Until then
+  `paused()` may still read `false` and `resume()` on the application thread may return `false`. Poll `paused()` (with a
+  bounded loop) and call `resume()` once it reads `true`.
+- A paused subscription keeps its place and has nothing open on the broker. A lost session or a leader move does not end
+  it: `resume()` subscribes again on the current session. `unsubscribe()`, closing the client, and a revoked session end
+  it. A `READ` grant revoked while it is paused is reported at `resume()`: the subscription finishes with `NotAuthorized`.
+
 ## Subscription filters
 
 The broker can send a subscription only the records whose fields match, so a consumer that wants one world, one player
@@ -474,6 +527,78 @@ SubscriptionSet world = client.subscribe(events, AllPartitions{}, o,
   (`filtered field absent`). A field added later matches only the records that carry it.
 - **Tombstones and short values.** A record with no value (or one too short to hold the filtered field) never matches
   and is counted.
+
+## Lease watch
+
+`LeaseWatch` follows the live leases of a lease topic: it scans the topic's lease view and subscribes to the changes, and keeps
+the live set in memory. The owner calls `watch.doWork(nowNs)` on the thread that drives the client (the Invoker pattern), like the other lease types
+in `client-cpp/include/rune/client/lease/`. The full contract is in the header,
+[`LeaseWatch.h`](../../client-cpp/include/rune/client/lease/LeaseWatch.h).
+
+### Life, close and restart
+
+`life()` is one state, never scattered flags: `Fresh`, `Running`, `Failed`, `Closing`, `Closed`.
+
+| Call | From | To |
+|---|---|---|
+| `startFromNow(prefixes)` | `Fresh` | `Running` |
+| failure of the watch (definitive error, full live set, name heap, a scan over `maxPagesPerScan`, or a row-length mismatch) | `Running` | `Failed` (one `Failed` event) |
+| `closeAsync()` | `Running` or `Failed` | `Closing`, then `Closed` when every subscription has finished |
+| `closeAsync()` | `Fresh` | `Closed` at once |
+| `closeAsync()` | `Closing`, `Closed` | no-op |
+| `restart(prefixes)` | `Closed` | `Running` |
+
+- `closeAsync()` returns at once and never calls `client.doWork()`. It cancels the subscriptions and makes outstanding scans
+  stale. `doWork` then drops what is left and emits no event. Safe to call from inside a handler: the event being delivered
+  still reaches the observers and the bound name. A closed watch emits nothing more, so whatever waits on one of its events (a recipe
+  with a pending acquire, say) is not told: the application must tell it, or `restart()` the watch. From an application thread in Thread mode each cancel hands a command to the
+  duty thread and waits (never throws) while the command ring is full.
+- `isClosed()` is true for `Fresh` and `Closed`. A watch that is closed is destroyed at once, without touching the client.
+- `restart(prefixes)` runs a closed watch again in place, over the same live table, names, handler, observers and buffers.
+  `InvalidArgument` unless the watch is `Closed`. It allocates nothing itself (the re-subscribes that follow allocate as the
+  first start does). The leases the new scan does not confirm end as `Vanished`, and `Ready` is emitted again. The handler runs
+  synchronously inside `restart()`: every partition's `RerunBegin` is emitted before it returns.
+- A `Failed` watch ends only by `closeAsync()`. A capacity failure (name heap or live set full) can repeat on every
+  `restart()`, because the old run's entries still hold their slots: recreate the watch or size it for old plus new.
+
+### Events
+
+Besides `Granted`, `Updated`, `Revoked`, `Expired`, `Vanished`, `Ready` and `Failed`, a watch emits three events about
+re-runs. A re-run is a scan after a partition was `Live` once, after its subscription broke or was reborn (a data reset), or
+after `restart()`. Only the very first, unbroken scan has none of them.
+
+| Event | Meaning | Fields |
+|---|---|---|
+| `Confirmed` | a re-run's scan found a held lease at the same version, not yet confirmed by this re-run. This is how a consumer learns of an update made while the partition was not watched. It can repeat inside one bracket, each time with the newest scan's bytes | the key, version and the scanned view row (`bytes`); `offset` = the row's `lease_granted_offset` |
+| `RerunBegin` | a partition's re-run starts | `partition`; key empty, version 0, no bytes, offset -1 |
+| `RerunEnd` | the partition is `Live` again, after the re-run's `Vanished` events and its buffered records | as `RerunBegin` |
+
+- A re-run that breaks again keeps its one bracket. `Failed` and `closeAsync()` end a re-run with no `RerunEnd`: drop your
+  bracket state on both. `restart()` opens a new bracket for every partition.
+- A scan that breaks before the partition was ever `Live` is bracketed too: the retry reconciles the `Granted` events of the
+  first attempt.
+- A name registered on the watch gets `Confirmed` (by key) but never `RerunBegin` or `RerunEnd`.
+
+### Producer guard and transactions
+
+A producer bound to a lease with `LeaseSession::bindProducer(ref, producer)` is blocked while the lease is at risk or lost. A
+record refused by the guard completes `DeliveryFailed` with `ClientErrorCode::LeaseAtRisk`. The guard also covers a
+transactional producer's commit. Inside an open transaction a refusal poisons the transaction: it becomes `AbortableError`
+and the commit cannot succeed.
+
+| Moment (the guard trips, ends, or the bind is refused) | Transaction state | Result |
+|---|---|---|
+| any of the three | `InTransaction`, records acked or not | `AbortableError` (`DeliveryFailed` / `LeaseAtRisk`); unacked records complete `DeliveryFailed` / `LeaseAtRisk` |
+| same | committing, `EndTxn` not sent yet | the commit completes `DeliveryFailed` / `LeaseAtRisk`; `AbortableError` |
+| same | committing, `EndTxn` sent (also a re-send) | unchanged: the commit was sent inside the lease and its answer decides. A re-send is never blocked |
+| same | aborting, `Ready`, `AbortableError`, `FatalError` | unchanged |
+| `commitTransaction` issued while blocked | open | no `EndTxn(commit)`; completes `DeliveryFailed` / `LeaseAtRisk`; `AbortableError` |
+| `sendOffsetsToTransaction` issued while blocked | `InTransaction` | no `AddOffsets` or `TxnOffsetCommit`; completes `DeliveryFailed` / `LeaseAtRisk`; `AbortableError` |
+| `abortTransaction` while blocked | any | allowed: `EndTxn(abort)` is sent |
+| `beginTransaction` while blocked | `Ready` | allowed; every send fails `LeaseAtRisk`, and the commit is refused as above |
+| after `Cleared` (re-armed) | `Ready` after the abort | `beginTransaction`, sends and commit work |
+
+A producer is bound to one lease for good. To produce under a new lease, bind a new producer.
 
 ## Consumer groups
 

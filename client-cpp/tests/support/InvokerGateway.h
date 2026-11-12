@@ -644,6 +644,24 @@ struct InvokerGateway {
     /// Coordinator requests are processed but never answered (a session that dies with the frame in flight).
     bool holdTxnReplies = false;
     int  txnRequestsUnanswered = 0;   ///< coordinator requests swallowed by holdTxnReplies
+    /// EndTxn answers are queued instead of sent until releaseEndTxnReplies() (the request is decided and applied at once).
+    bool holdEndTxnReply = false;
+    std::vector<std::vector<uint8_t>> heldEndTxn_;
+    /// True while an EndTxn / AddOffsets answer is queued: a test that ends in this state forgot to release it (M-7).
+    [[nodiscard]] bool anyHeldTxnReplies() const noexcept { return !heldEndTxn_.empty() || !heldAddOffsets_.empty(); }
+    void releaseEndTxnReplies() {
+        holdEndTxnReply = false;
+        for (auto& f : heldEndTxn_) send(0, f.data(), f.size());
+        heldEndTxn_.clear();
+    }
+    /// AddOffsetsToTxn answers are queued instead of sent until releaseAddOffsets() (the request is decided and applied at once).
+    bool holdAddOffsets = false;
+    std::vector<std::vector<uint8_t>> heldAddOffsets_;
+    void releaseAddOffsets() {
+        holdAddOffsets = false;
+        for (auto& f : heldAddOffsets_) send(0, f.data(), f.size());
+        heldAddOffsets_.clear();
+    }
     /// AddPartitionsToTxn answers are queued instead of sent until releaseAddPartitions().
     bool holdAddPartitions = false;
     struct HeldAddPartitions { std::vector<uint8_t> frame; std::vector<int32_t> partitions; };
@@ -2424,6 +2442,7 @@ private:
             rsp.errorCode     = code;
             std::vector<uint8_t> out(rp::AddOffsetsToTxnResponse::ENCODED_SIZE);
             const std::size_t n = rsp.encode(out.data());
+            if (holdAddOffsets) { out.resize(n); heldAddOffsets_.push_back(std::move(out)); return; }
             send(0, out.data(), n);
             return;
         }
@@ -2483,6 +2502,10 @@ private:
             rsp.errorCode     = code;
             std::vector<uint8_t> out(rp::EndTxnResponse::ENCODED_SIZE);
             const std::size_t n = rsp.encode(out.data());
+            if (holdEndTxnReply) {   // applied, answer queued until releaseEndTxnReplies()
+                heldEndTxn_.emplace_back(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(n));
+                return;
+            }
             send(0, out.data(), n);
             return;
         }

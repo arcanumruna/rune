@@ -124,6 +124,9 @@ struct WLog {
             break;
         case rc::LeaseEventKind::Ready: ++w.readies; break;
         case rc::LeaseEventKind::Failed: ++w.failed; break;
+        case rc::LeaseEventKind::Confirmed:    // a re-run's bookkeeping: the table is already what the event says
+        case rc::LeaseEventKind::RerunBegin:
+        case rc::LeaseEventKind::RerunEnd: break;
         }
     }
 };

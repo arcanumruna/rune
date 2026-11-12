@@ -1543,6 +1543,7 @@ if(BUILD_TESTING)
             tests/subscriber/SubscriberHubCommandTest.cpp
             tests/subscriber/SubscriberHubRecordsRegressionTest.cpp   # catalog history Task 13 fix round 2
             tests/subscriber/CheckedWritesRecordOpTest.cpp
+            tests/subscriber/SubscriberPauseTest.cpp                   # Subscription::pause / resume
             tests/support/AllocCounter.cpp                             # zero-alloc onRecords gate
         )
         target_include_directories(rune_subscriber_tests PRIVATE
@@ -1654,6 +1655,7 @@ if(BUILD_TESTING)
         add_executable(rune_invoker_tests
             tests/transport/InvokerTransportTest.cpp
             tests/agent/InvokerAgentTest.cpp
+            tests/subscriber/SubscriberPauseClientTest.cpp
             tests/producer/ProducerSinkTest.cpp
             tests/producer/ProducerAllocRegressionTest.cpp
             tests/producer/ProducerAckPathTest.cpp
@@ -1673,6 +1675,7 @@ if(BUILD_TESTING)
             tests/producer/CoordinatorLinkTest.cpp
             tests/producer/ProducerIdTest.cpp
             tests/producer/ProducerTxnTest.cpp
+            tests/producer/ProducerTxnGuardTest.cpp          # Herald prerequisites Task 4: the lease guard covers the commit
             tests/producer/ProducerTxnDataTest.cpp
             tests/producer/ProducerTxnOffsetsTest.cpp
             tests/detail/M2ORingBufferTest.cpp
@@ -1688,6 +1691,7 @@ if(BUILD_TESTING)
             tests/client/CheckedWritesClientStatsTest.cpp    # checked writes Part 08: getStats over GetStats 91
             tests/client/LeaseTopicTest.cpp                  # lease topics Task 14a: LeaseTopic<T> writes and requests
             tests/lease/LeaseSessionTest.cpp                 # lease topics Task 15: LeaseSession and the produce guard
+            tests/lease/LeaseWatchLifeTest.cpp               # LeaseWatch life states (closeAsync / isClosed)
             tests/lease/LeaseWatchTest.cpp                   # lease topics Task 16: LeaseWatch (hash-range handoff)
             tests/lease/LeaseRecipeTest.cpp                  # lease topics Task 20: LeaseOwnership / LeaseElection
             tests/client/IngressEndpointRoutingTest.cpp
