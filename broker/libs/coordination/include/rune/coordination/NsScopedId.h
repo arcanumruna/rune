@@ -58,12 +58,22 @@ struct ScopedIdView {
     return !id.empty() && id[0] == kScopedIdMark;
 }
 
+/// A per-request filter on topic ids (no allocation, no std::function): `fn == nullptr` means every topic is
+/// readable.  The gateway sets it for a fetch-all OffsetFetch so the coordinator lists only topics the caller may READ
+/// BEFORE it applies its capacity cap.
+struct TopicReadFilter {
+    bool (*fn)(void* ctx, int32_t topicId) = nullptr;   ///< true = the caller may READ `topicId`
+    void* ctx = nullptr;
+    [[nodiscard]] bool readable(int32_t topicId) const noexcept { return fn == nullptr || fn(ctx, topicId); }
+};
+
 /// The namespace context of one client request: the session's login namespace, whether the session is root, and the
 /// gateway's namespace registry mirror (null = no registry: every id is an opaque local id in the session namespace).
 struct NsRequestContext {
     uint32_t sessionNsId = 0;
     bool     root        = false;
     const rune::catalog::NamespaceRegistry* reg = nullptr;
+    TopicReadFilter readFilter{};   ///< fetch-all OffsetFetch only: the topics the caller may READ (null fn = all)
 };
 
 } // namespace rune::coordination

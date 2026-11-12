@@ -138,6 +138,9 @@ Notes:
   `1` read committed.
 - A key maps to a partition with FNV-1a 64 over the key bytes (`partitionForKey`, `PartitionHash.h`); an empty key maps
   to partition 0. Broker and client share the header, so they cannot diverge.
+- **`OffsetFetch` with no entries (fetch-all)**: lists every committed offset of the group the caller may READ, or
+  answers the single sentinel result `{topicId -1, partition -1, offset -1, errorCode MessageTooLarge (22)}` when those
+  results do not all fit one answer, never a truncated list. The caller then fetches with listed entries.
 
 ## Record batch (v2)
 

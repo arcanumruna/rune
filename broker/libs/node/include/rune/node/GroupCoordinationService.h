@@ -534,9 +534,11 @@ private:
         const uint64_t gen = (r->leadershipGeneration() << 32) ^ r->logGeneration();
         return offsetsRebuilt_ && wasLeader_ && gen == offsetsGen_ && r->acceptsProduce();
     }
+    uint64_t offsetFetchAllTooLarge_ = 0;    ///< fetch-all answers that were one MessageTooLarge sentinel (#592)
     uint64_t offsetsNotLoadedAnswers_ = 0;   ///< entries answered NotLeader while loading (round 4)
 public:
     [[nodiscard]] uint64_t offsetsNotLoadedAnswersForTest() const noexcept { return offsetsNotLoadedAnswers_; }
+    [[nodiscard]] uint64_t offsetFetchAllTooLargeForTest() const noexcept { return offsetFetchAllTooLarge_; }
 private:
     /// (leadershipGeneration << 32) ^ logGeneration of the offsets replica the
     /// index was rebuilt against (see doWork).

@@ -472,6 +472,8 @@ public:
     [[nodiscard]] uint64_t loginsAbandoned() const noexcept { return loginsAbandoned_; }
     [[nodiscard]] uint64_t bindTokenDeriveFailures() const noexcept { return bindTokenDeriveFailures_; }
     [[nodiscard]] uint64_t cryptoKeyAnnounces() const noexcept { return cryptoKeyAnnounces_; }
+    /// #592 test seam (control thread): cap a group answer below the scratch size (0 = the scratch size).
+    void groupAnswerCapForTest(std::size_t bytes) noexcept { groupAnswerCapForTest_ = bytes; }
     void forceZeroDerivedBindTokenForTest(bool on) noexcept { forceZeroDerivedBindTokenForTest_ = on; }   ///< #132: first legs never finished
     /// The SecurityView applied the event at `offset` (BrokerNode calls this right after the view did) - authentication
     /// Task 14, D25: Refresh -> every affected user's authenticated session recompiles its permission table, ends what
@@ -3022,6 +3024,7 @@ private:
     uint64_t bindTokenDeriveFailures_ = 0;
     uint64_t cryptoKeyAnnounces_      = 0;   ///< keyReady (second-wave) announces that landed on every worker
     bool     forceZeroDerivedBindTokenForTest_ = false;
+    std::size_t groupAnswerCapForTest_ = 0;   ///< #592 test seam
     // ── authentication Task 14: live security changes ──
     uint64_t sessionsRevoked_ = 0;
     int64_t  securityEnforcedOffset_ = -1;       ///< every event <= this is enforced here (see securityEnforcedOffset())

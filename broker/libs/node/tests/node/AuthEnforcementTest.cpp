@@ -1280,6 +1280,63 @@ TEST(AuthEnforcementRegression, OffsetFetchAllReturnsOnlyReadableTopicsRegressio
     EXPECT_EQ(seen->front().errorCode, 0);
 }
 
+// #592: the READ filter of a fetch-all runs BEFORE the coordinator's capacity cap.  The group holds more committed
+// partitions than one answer carries (the answer is capped small through a gateway seam); the unreadable topic sorts
+// FIRST, so the pre-fix cap was filled by partitions the caller may not read and the readable ones were never listed.
+TEST(AuthEnforcementRegression, OffsetFetchAllFiltersBeforeTheCapAndRefusesWhenItCannotFitRegression) {
+    AuthRig r;
+    const std::string g = "g592";
+    constexpr uint32_t kHidden = 24, kShown = 4;   // "a592" (unreadable, sorts first) x 24 partitions; "z592" x 4
+    const auto define = [&](const std::string& name, uint32_t parts) {
+        const auto d = r.c().awaitDefine(
+            r.c().sendDefineTopic(r.ch(), AuthRig::stream(), r.builder, name, parts, authRigCharBlob(), 0, {}, 0,
+                                  authRigTopicConfig()), AuthRig::dl(20));
+        return d && d->errorCode == 0 ? d->topicId : -1;
+    };
+    const int32_t hidden = define("a592", kHidden), shown = define("z592", kShown);
+    ASSERT_GE(hidden, 0);
+    ASSERT_GE(shown, 0);
+    const int64_t committer = r.newUser({exact(SO::Read, ST::Group, g), exact(SO::Read, ST::Topic, "a592"),
+                                         exact(SO::Read, ST::Topic, "z592")});
+    const int64_t reader = r.newUser({exact(SO::Read, ST::Group, g), exact(SO::Read, ST::Topic, "z592")});
+    const auto [member, gen] = r.joinStable(committer, g, {hidden, shown});
+    ASSERT_FALSE(member.empty());
+    const auto commit = [&](int32_t topic, uint32_t p, int64_t off) {
+        return r.c().offsetCommit(r.ch(), AuthRig::stream(), committer, g, member, gen, topic,
+                                  static_cast<int32_t>(p), off);
+    };
+    for (uint32_t p = 0; p < kHidden; ++p) ASSERT_EQ(commit(hidden, p, 100 + p), std::optional<int16_t>{0});
+    for (uint32_t p = 0; p < kShown; ++p) ASSERT_EQ(commit(shown, p, 200 + p), std::optional<int16_t>{0});
+    BrokerNode& node = r.broker().node();
+
+    // an answer that carries 6 results: the 4 readable ones fit, the 28 committed ones do not
+    node.gatewayGroupAnswerCapForTest(pc::OffsetFetchResponse::encodedSizeFor(6));
+    const auto seen = r.offsetFetchAll(reader, g);
+    ASSERT_TRUE(seen.has_value());
+    ASSERT_EQ(seen->size(), static_cast<std::size_t>(kShown)) << "every readable partition is listed, nothing else";
+    for (const auto& res : *seen) {
+        EXPECT_EQ(res.topicId, shown);
+        EXPECT_EQ(res.errorCode, 0);
+        EXPECT_EQ(res.offset, 200 + res.partition);
+    }
+
+    // the committer may read all 28: they cannot fit, so the answer is ONE explicit sentinel, never a partial list
+    const auto all = r.offsetFetchAll(committer, g);
+    ASSERT_TRUE(all.has_value());
+    ASSERT_EQ(all->size(), 1u) << "a truncated list instead of one sentinel";
+    EXPECT_EQ(all->front().topicId, -1);
+    EXPECT_EQ(all->front().partition, -1);
+    EXPECT_EQ(all->front().errorCode, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+
+    // the reader's readable results no longer fit either: the sentinel passes the READ filter untouched
+    node.gatewayGroupAnswerCapForTest(pc::OffsetFetchResponse::encodedSizeFor(3));
+    const auto tooSmall = r.offsetFetchAll(reader, g);
+    ASSERT_TRUE(tooSmall.has_value());
+    ASSERT_EQ(tooSmall->size(), 1u);
+    EXPECT_EQ(tooSmall->front().topicId, -1);
+    EXPECT_EQ(tooSmall->front().errorCode, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+}
+
 // #277: a user with two passwords (ADD PASSWORD: rotation) logs in through EITHER verifier slot on its own - the other
 // slot's proof is wrong - and a login whose two proofs are both wrong fails 44.
 TEST(AuthEnforcementRegression, EachVerifierSlotAuthenticatesOnItsOwnRegression) {

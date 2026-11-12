@@ -3969,6 +3969,9 @@ std::size_t BrokerNode::workerDirectAcksInFlightForTest(int32_t w) {
 bool BrokerNode::gatewayHasSessionForTest(int64_t sessionId) {
     return onControlThreadForTest([this, sessionId]() { return gateway_ != nullptr && gateway_->hasSessionForTest(sessionId); });
 }
+void BrokerNode::gatewayGroupAnswerCapForTest(std::size_t bytes) {
+    onControlThreadForTest([this, bytes]() { if (gateway_) gateway_->groupAnswerCapForTest(bytes); return 0; });
+}
 void BrokerNode::forceZeroDerivedBindTokenForTest(bool on) {
     onControlThreadForTest([this, on]() { if (gateway_) gateway_->forceZeroDerivedBindTokenForTest(on); return 0; });
 }

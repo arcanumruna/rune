@@ -1815,23 +1815,15 @@ size_t GroupCoordinationService::handleOffsetFetch(
             return answerRetriableSentinel();
         }
         // Fetch all committed offsets for the group.
-        // Bound-check BEFORE writing each result so a large fetch-all never
-        // overruns a fixed scratch buffer.  Results that would exceed outCap
-        // are silently dropped (the response is capped but never overruns).
+        // #592: the caller's READ filter (ctx.readFilter) runs BEFORE the capacity check, so a topic the caller may
+        // not read never uses up capacity.  The answer is all-or-explicit: when the readable results cannot all fit
+        // outCap it is ONE sentinel {-1, -1, -1, MessageTooLarge}, never a silently truncated list.
         // #498: an unstable key (#471: its record is above the high watermark) is listed with the retriable code and
         // no offset - exactly what a specific fetch answers - and every stable key with its offset; steady commits on
         // one key never starve the listing of the others.  An unstable value is never served.
+        bool tooLarge = false;
         const auto all = offsets_->fetchAll(groupIdStr);
         for (const auto& [tp, co] : all) {
-            // Bound-check before each push.
-            const std::size_t needed =
-                pc::OffsetFetchResponse::encodedSizeFor(fetchResultScratch_.size() + 1);
-            if (needed > outCap) {
-                spdlog::warn("GroupCoordinationService: OffsetFetch fetch-all capped at {} entries "
-                             "(outCap={} would be exceeded)", fetchResultScratch_.size(), outCap);
-                break;
-            }
-
             // Resolve topic name → topicId.
             int32_t topicId = -1;
             if (topics_) {
@@ -1839,8 +1831,15 @@ size_t GroupCoordinationService::handleOffsetFetch(
                 if (opt) topicId = *opt;
             }
             if (topicId < 0) continue; // unknown topic — skip
+            if (!ctx.readFilter.readable(topicId)) continue;   // #592: no READ: not listed, not counted
             const uint64_t lineage = lineageOf_(topicId, tp.partition);   // C1
             if (lineage != kLineagePending && staleLineage_(co, topicId, tp.partition)) continue;   // as if never committed
+
+            // Bound-check before each push.
+            if (pc::OffsetFetchResponse::encodedSizeFor(fetchResultScratch_.size() + 1) > outCap) {
+                tooLarge = true;
+                break;
+            }
 
             pc::OffsetFetchResult r;
             r.topicId   = topicId;
@@ -1856,6 +1855,21 @@ size_t GroupCoordinationService::handleOffsetFetch(
                 r.errorCode = unstableFor_(msg.sessionId);
             }
             fetchResultScratch_.push_back(r);
+        }
+        if (tooLarge) [[unlikely]] {
+            ++offsetFetchAllTooLarge_;
+            spdlog::warn("GroupCoordinationService: OffsetFetch fetch-all of group {} cannot fit outCap={} ({} "
+                         "readable results listed before the cap): answered one MessageTooLarge sentinel",
+                         groupIdStr, outCap, fetchResultScratch_.size());
+            fetchResultScratch_.clear();
+            if (pc::OffsetFetchResponse::encodedSizeFor(1) <= outCap) {
+                pc::OffsetFetchResult sentinel;
+                sentinel.topicId   = -1;
+                sentinel.partition = -1;
+                sentinel.offset    = -1;
+                sentinel.errorCode = static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
+                fetchResultScratch_.push_back(sentinel);
+            }
         }
     } else {
         // Fetch specific (topicId, partition) entries.

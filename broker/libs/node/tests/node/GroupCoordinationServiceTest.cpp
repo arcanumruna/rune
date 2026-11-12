@@ -47,6 +47,7 @@
 #include <rune/node/GroupErrorMapping.h>
 
 #include <array>
+#include <cstdio>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -5279,4 +5280,82 @@ TEST(OffsetCommitDurabilityRegression, HeldOffsetAnswerByVersionAtEveryBoundAndP
             EXPECT_EQ(f->results[0].offset, -1);
         }
     }
+}
+
+// ===========================================================================
+// Issue #592: a fetch-all OffsetFetch applies the READ filter BEFORE the capacity cap and, when the readable results
+// cannot all fit, answers ONE explicit MessageTooLarge sentinel - never a silently truncated list.
+// ===========================================================================
+namespace {
+constexpr int32_t kTopics592 = 30;   // topic ids 1..30, one partition each, one committed offset each
+struct Refuse592 {
+    int32_t refusedUpTo = 0;   // topic ids 1..refusedUpTo are refused
+    static bool fn(void* ctx, int32_t topicId) noexcept { return topicId > static_cast<Refuse592*>(ctx)->refusedUpTo; }
+};
+struct Fetch592 {
+    std::vector<std::array<int64_t, 3>> results;   // topicId, partition, errorCode
+    std::size_t n = 0;
+};
+void commitAll592(CommitRig& g, const std::string& group) {
+    for (int32_t t = 1; t <= kTopics592; ++t) {
+        char name[16];
+        std::snprintf(name, sizeof name, "t592-%03d", t);
+        ASSERT_EQ(g.registry.createTopicAt(t, makeTopicSpec(name, 1, t)), t);
+        ASSERT_EQ(commit498(g, group, t, 0, 1000 + t), 0u);
+    }
+    g.fetch();
+    g.svc.doWork(g.clock);
+}
+Fetch592 fetchAll592(CommitRig& g, const std::string& group, std::size_t cap, const Refuse592* refuse) {
+    rune::coordination::NsRequestContext ctx;
+    if (refuse != nullptr) ctx.readFilter = {&Refuse592::fn, const_cast<Refuse592*>(refuse)};
+    Fetch592 out;
+    out.n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, group), g.clock, g.out, cap, ctx);
+    EXPECT_LE(out.n, cap);
+    const auto f = pc::OffsetFetchResponse::decode(g.out, out.n);
+    EXPECT_TRUE(f.has_value());
+    if (f)
+        for (const auto r : f->results) out.results.push_back({r.topicId, r.partition, r.errorCode});
+    return out;
+}
+}  // namespace
+
+TEST(GroupCoordinationServiceRegression, FetchAllFiltersBeforeTheCapRegression) {
+    CommitRig g("g592a");
+    ASSERT_FALSE(g.member.empty());
+    commitAll592(g, "g592a");
+    Refuse592 refuse{27};   // the first 90 % (by name = by id) are refused; the last 3 are readable
+    const std::size_t cap = pc::OffsetFetchResponse::encodedSizeFor(3);   // 3 results fit, 4 do not
+    ASSERT_GT(pc::OffsetFetchResponse::encodedSizeFor(kTopics592), cap);
+    const auto all = fetchAll592(g, "g592a", cap, &refuse);
+    ASSERT_EQ(all.results.size(), 3u) << "every readable result is listed, none refused";
+    for (const auto& r : all.results) {
+        EXPECT_GT(r[0], 27) << "a refused topic was listed";
+        EXPECT_EQ(r[1], 0);
+        EXPECT_EQ(r[2], 0) << "a sentinel or an error instead of the list";
+    }
+    EXPECT_EQ(g.svc.offsetFetchAllTooLargeForTest(), 0u);
+}
+
+TEST(GroupCoordinationServiceRegression, FetchAllThatCannotFitAnswersOneExplicitSentinelRegression) {
+    CommitRig g("g592b");
+    ASSERT_FALSE(g.member.empty());
+    commitAll592(g, "g592b");
+    const auto fit = [&](const Refuse592* refuse, std::size_t readable) {
+        const std::size_t exact = pc::OffsetFetchResponse::encodedSizeFor(readable);
+        ASSERT_GT(exact, pc::OffsetFetchResponse::encodedSizeFor(readable - 1));
+        const uint64_t before = g.svc.offsetFetchAllTooLargeForTest();
+        const auto full = fetchAll592(g, "g592b", exact, refuse);   // exactly fits: the full list
+        EXPECT_EQ(full.results.size(), readable);
+        for (const auto& r : full.results) EXPECT_NE(r[0], -1) << "a sentinel in a list that fits";
+        EXPECT_EQ(g.svc.offsetFetchAllTooLargeForTest(), before);
+        const auto over = fetchAll592(g, "g592b", exact - 1, refuse);   // one byte short: ONE sentinel, nothing else
+        ASSERT_EQ(over.results.size(), 1u) << "a partial list instead of one sentinel";
+        const auto tooLarge = static_cast<int64_t>(pc::ErrorCode::MessageTooLarge);
+        EXPECT_EQ(over.results[0], (std::array<int64_t, 3>{-1, -1, tooLarge}));
+        EXPECT_EQ(g.svc.offsetFetchAllTooLargeForTest(), before + 1);
+    };
+    fit(nullptr, kTopics592);   // no predicate (auth off / allow-all)
+    Refuse592 refuse{25};       // five readable
+    fit(&refuse, 5);
 }

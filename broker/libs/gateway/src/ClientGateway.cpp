@@ -8848,9 +8848,23 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     // Dispatch to the service.  The service encodes the response into scratch_.
     // Capacity is passed so handlers bound-check BEFORE writing each element;
     // the post-write guard below is a final safety net only.
-    const rune::coordination::NsRequestContext nsCtx{sessionNsId_(*session), permsOf_(*session).isRoot(), &namespaces_.registry()};
+    rune::coordination::NsRequestContext nsCtx{sessionNsId_(*session), permsOf_(*session).isRoot(),
+                                               &namespaces_.registry()};
+    // #592: a fetch-all OffsetFetch is filtered by READ INSIDE the coordinator's loop, before its capacity cap (the
+    // filterFetchAllByRead_ pass below stays as the second line of defence).  Auth off / allow-all: no filter.
+    struct ReadCtx {
+        const PermissionTable* perms;
+        const rune::gateway::ObjectIndex* index;
+    } readCtx{&permsOf_(*session), &objectIndex_};
+    if (tid == static_cast<uint16_t>(pc::TemplateId::OffsetFetch) && !readCtx.perms->isAllowAll()) {
+        nsCtx.readFilter = {[](void* c, int32_t topicId) -> bool {
+            const auto* r = static_cast<const ReadCtx*>(c);
+            return !rune::gateway::authorizeTopicId(*r->perms, topicId, rune::security::Operation::Read, *r->index);
+        }, &readCtx};
+    }
     std::size_t encoded = 0;
-    const std::size_t cap = scratch_.size();
+    const std::size_t cap =
+        groupAnswerCapForTest_ != 0 ? std::min(groupAnswerCapForTest_, scratch_.size()) : scratch_.size();
     const auto templateId = static_cast<pc::TemplateId>(tid);
     switch (templateId) {
         case pc::TemplateId::JoinGroup:

@@ -1826,6 +1826,8 @@ public:
     /// I-C test seams (control thread): force the gateway's TLS-derived worker bind token to all-zero; the connects that
     /// failed on it; the keyReady announce waves that landed.
     void forceZeroDerivedBindTokenForTest(bool on);
+    /// #592: cap the gateway's group answers at `bytes` (0 = its scratch size), so a small fetch-all overflows.
+    void gatewayGroupAnswerCapForTest(std::size_t bytes);
     [[nodiscard]] uint64_t gatewayBindTokenDeriveFailuresForTest();
     [[nodiscard]] uint64_t gatewayCryptoKeyAnnouncesForTest();
     [[nodiscard]] uint64_t gatewayNotAuthorizedForTest();
