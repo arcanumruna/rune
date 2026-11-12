@@ -171,6 +171,42 @@ TEST(AuthorizerRegression, DescribeOnClusterTurnsAMissingIdIntoTheExistingUnknow
     EXPECT_TRUE(rg::authorizeTopicId(t, 0, Operation::Read, idx).has_value()) << "a live id it may not read is denied";
 }
 
+// #215: the D22 pass-through is for user object ids only; a negative (internal) id is never passed through.
+TEST(AuthorizerRegression, TheMissingIdPassThroughNeverAppliesToInternalIdsRegression) {
+    rg::ObjectIndex idx; idx.onTopic(0, "exists");
+    auto t = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::Cluster, PatternKind::Exact, "")}},
+                                          idx);
+    const Operation ops[] = {Operation::Read, Operation::Write, Operation::Describe, Operation::Create,
+                             Operation::Alter, Operation::Drop, Operation::Truncate, Operation::Admin,
+                             Operation::Import};
+    const int32_t internal[] = {-1, -2, -3, -6, -7, -100, -2147483647 - 1};
+    for (const int32_t id : internal) {
+        for (const Operation op : ops) {
+            const auto d = rg::authorizeTopicId(t, id, op, idx);
+            EXPECT_TRUE(d.has_value()) << "id " << id << " op " << static_cast<int>(op) << " must be denied";
+            if (d.has_value()) EXPECT_EQ(d->code, 45) << "id " << id;
+        }
+    }
+    for (const Operation op : ops) {
+        if (op == Operation::Import) continue;   // IMPORT is never passed through
+        EXPECT_FALSE(rg::authorizeTopicId(t, 12345, op, idx).has_value()) << "control: a missing user id passes (D22)";
+    }
+    // Root: the pass-through never applies to an internal id either; a missing non-negative id passes.
+    auto root = rg::PermissionTable::compile({{g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")}},
+                                             idx);
+    ASSERT_TRUE(root.isRoot());
+    for (const int32_t id : internal) {
+        for (const Operation op : ops) {
+            EXPECT_TRUE(rg::authorizeTopicId(root, id, op, idx).has_value())
+                << "root, id " << id << " op " << static_cast<int>(op) << " must be denied";
+        }
+    }
+    for (const Operation op : ops) {
+        if (op == Operation::Import) continue;
+        EXPECT_FALSE(rg::authorizeTopicId(root, 12345, op, idx).has_value()) << "root, missing user id passes";
+    }
+}
+
 TEST(AuthorizerRegression, ViewSourceUnknownIdIsDeniedEvenWithDescribeOnClusterRegression) {
     rg::ObjectIndex idx; idx.onTopic(0, "exists");
     const std::vector<rune::security::GrantSpec> grants{g(Operation::Describe, ResourceType::Cluster, PatternKind::Exact, ""),

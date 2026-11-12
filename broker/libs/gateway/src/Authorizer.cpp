@@ -67,7 +67,10 @@ std::optional<Denial> authorizeTopicId(const PermissionTable& t, int32_t topicId
 {
     if (op == rsec::Operation::Import) return deny(op, shownType, IdText(topicId).view());   // opBit(Import) is 0: IMPORT is allowsImport
     if (t.allows(topicId, rsec::opBit(op))) return std::nullopt;
-    if (index.at(topicId) == nullptr && t.allowsCluster(rsec::opBit(rsec::Operation::Describe))) return std::nullopt;   // D22
+    // D22: a missing USER object id (>= 0) falls through to the request's UnknownTopic; an internal (negative) id
+    // never does.
+    if (topicId >= 0 && index.at(topicId) == nullptr && t.allowsCluster(rsec::opBit(rsec::Operation::Describe)))
+        return std::nullopt;
     return deny(op, shownType, IdText(topicId).view());
 }
 

@@ -42,7 +42,8 @@ struct Denial {
 
 /// Id-addressed (Produce / Subscribe / group topics / txn partitions / views): `op` on the object `topicId`.  D22: a
 /// non-live id is NotAuthorized unless the session holds DESCRIBE ON CLUSTER (then no denial: the request's existing
-/// "unknown topic" answer follows).  `shownType` is the type named in the detail text (the request's, never the
+/// "unknown topic" answer follows).  The pass-through is for user object ids (>= 0) only: a negative (internal) id is
+/// never passed through.  `shownType` is the type named in the detail text (the request's, never the
 /// object's: the text must not reveal what the id is).
 [[nodiscard]] std::optional<Denial> authorizeTopicId(const PermissionTable&, int32_t topicId, rune::security::Operation,
                                                      const ObjectIndex&,
