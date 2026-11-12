@@ -342,3 +342,31 @@ TEST(TlsStartupPolicy, PerWorkerEgressOffNeverRefuses) {
     EXPECT_FALSE(rune::node::mustRefuseNonShardPerWorkerEgressTls(
         /*perWorkerEgress=*/false, /*shardMode=*/false, /*requireTls=*/true, /*brokerHasTls=*/true));
 }
+
+// Issue #532: the ingress twin.  Outside shard mode no SessionAnnouncer runs, so a worker polling its own ingress never
+// gets a session's c2b key and answers a sealed produce InvalidRequest; mustRefuseNonShardPerWorkerIngressTls refuses
+// that configuration at startup when the broker can serve TLS.
+TEST(TlsStartupPolicy, NonShardPerWorkerIngressWithRequireTlsRefusesStartRegression) {
+    EXPECT_TRUE(rune::node::mustRefuseNonShardPerWorkerIngressTls(
+        /*perWorkerIngress=*/true, /*shardMode=*/false, /*requireTls=*/true, /*brokerHasTls=*/false));
+}
+
+TEST(TlsStartupPolicy, NonShardPerWorkerIngressWithBrokerTlsRefusesStartRegression) {
+    EXPECT_TRUE(rune::node::mustRefuseNonShardPerWorkerIngressTls(
+        /*perWorkerIngress=*/true, /*shardMode=*/false, /*requireTls=*/false, /*brokerHasTls=*/true));
+}
+
+TEST(TlsStartupPolicy, ShardPerWorkerIngressWithTlsStillAllowedRegression) {
+    EXPECT_FALSE(rune::node::mustRefuseNonShardPerWorkerIngressTls(
+        /*perWorkerIngress=*/true, /*shardMode=*/true, /*requireTls=*/true, /*brokerHasTls=*/true));
+}
+
+TEST(TlsStartupPolicy, NonShardPerWorkerIngressWithoutTlsStillAllowedRegression) {
+    EXPECT_FALSE(rune::node::mustRefuseNonShardPerWorkerIngressTls(
+        /*perWorkerIngress=*/true, /*shardMode=*/false, /*requireTls=*/false, /*brokerHasTls=*/false));
+}
+
+TEST(TlsStartupPolicy, PerWorkerIngressOffNeverRefusesRegression) {
+    EXPECT_FALSE(rune::node::mustRefuseNonShardPerWorkerIngressTls(
+        /*perWorkerIngress=*/false, /*shardMode=*/false, /*requireTls=*/true, /*brokerHasTls=*/true));
+}

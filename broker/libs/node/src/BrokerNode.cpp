@@ -2179,6 +2179,17 @@ void BrokerNode::buildGateway() {
             "Records crypto handoff; it cannot serve TLS — use shard mode or disable "
             "per-worker egress");
     }
+    // Issue #532: the ingress twin — no session key handoff outside shard mode, so a sealed produce on a per-worker
+    // ingress stream would be answered InvalidRequest. Refuse to start rather than fail every encrypted produce.
+    if (rune::node::mustRefuseNonShardPerWorkerIngressTls(
+            config_.perWorkerIngressEnabled, config_.shardMode(), config_.requiresClientTls(),
+            brokerHasTlsAtStartup)) {
+        throw std::runtime_error(
+            "BrokerNode[" + std::to_string(nodeId) + "]: RUNE_PER_WORKER_INGRESS=true without "
+            "RUNE_WORKER_MODE=shard refuses to start on a broker with TLS (a certificate is loaded or "
+            "RUNE_REQUIRE_TLS is set): a worker polling its own ingress outside shard mode has no session keys and "
+            "cannot open an encrypted produce; use RUNE_WORKER_MODE=shard or unset RUNE_PER_WORKER_INGRESS");
+    }
 
     // Build the gateway (subscribes on clientChannel).
     try {

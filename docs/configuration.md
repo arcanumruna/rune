@@ -173,7 +173,7 @@ authentication enabled, and with any of these variables set, instead of starting
 | `RUNE_IDLE_DOORBELL_MIN_PARK_US` | `1000` | Doorbell minimum park, `1` to `1000000` us; must not exceed the next row. |
 | `RUNE_IDLE_DOORBELL_PARK_US` | `1000` | Doorbell park, `1` to `1000000` us. |
 | `RUNE_FETCH_INTERVAL_US` | `5000` | Follower periodic-fetch backstop cadence. An integer in `[1, 2592000000000]` us; anything else refuses startup. |
-| `RUNE_PER_WORKER_INGRESS` | `false` | `1`/`true`/`TRUE`. Forced on by shard mode. |
+| `RUNE_PER_WORKER_INGRESS` | `false` | `1`/`true`/`TRUE`. Forced on by shard mode. Outside shard mode a broker that can serve TLS (a certificate is loaded or `RUNE_REQUIRE_TLS` is set) refuses to start with it on, because those workers hold no session keys and cannot open an encrypted produce. |
 | `RUNE_PER_WORKER_EGRESS` | `false` | Same. Forced on by shard mode. |
 | `RUNE_PER_WORKER_REPLICATION` | `false` | Same. Forced on by shard mode. |
 
