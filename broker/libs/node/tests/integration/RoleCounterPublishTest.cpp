@@ -322,6 +322,22 @@ TEST(NodeConfigRegression, DevModeSingleNodeStartsAndWarns) {
     node.stop();
 }
 
+// #195: a NodeConfig built without an auth mode runs InProcessUnauthenticated (anonymous full access, plaintext links).
+// The counter must say so (2), never "enabled" (0), and the broker shouts it like dev mode.
+TEST(AuthModeCounterRegression, InProcessUnauthenticatedIsNotReportedAsEnabledRegression) {
+    TempDir tmp{"inproc_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    ASSERT_EQ(cfg.authMode, AuthMode::InProcessUnauthenticated) << "the default config has no auth mode";
+    WarnCapture log;   // installed BEFORE any broker thread exists, and outliving the node
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(5s));
+    const NodeMetrics nm{tmp.path, cfg.nodeId};
+    EXPECT_TRUE(awaitCounter(nm, typeIdOf(RuneMetric::AuthMode), 2, 10s)) << "counter 1'000'228 = 2 in-process";
+    EXPECT_GE(log.count("AUTHENTICATION IS OFF"), 1) << "the in-process warning at start";
+    node.stop();
+}
+
 // Combined fix program M13 (X102): the `__security` log holds every user's StoredKey / ServerKey.  Its directory is 0700
 // and its segment, index and checkpoint files 0600 (the default-umask 0644 they used to get).  RED: pass the default mode
 // to the security Log (or drop the permissions() call) - the files / directory are group- and world-readable again.

@@ -322,7 +322,7 @@ zero allocation); tables are owned by the thread that owns the session and updat
 
 - It is never the default: without the setting, authentication is on and the broker needs a cluster key.
 - The broker logs a loud warning at startup and every 5 minutes, and publishes the mode as the
-  metric `rune-auth-mode` (1 000 228: 0 enabled, 1 dev mode).
+  metric `rune-auth-mode` (1 000 228: 0 enabled, 1 dev mode, 2 in-process unauthenticated).
 - A broker in dev mode **refuses to start as part of a multi-broker cluster**
   (`RUNE_PEERS` lists more than one broker): an unauthenticated node would be an open door into the
   cluster's data and into `__security`.
@@ -377,7 +377,7 @@ is in [operations](../../docs/operations.md#metrics)):
 |---|---|---|
 | `rune-security-apply-halted node=<id>` | 1 000 226 | 0 while applying; after a halt, the halted offset plus 1 |
 | `rune-security-applied-offset node=<id>` | 1 000 227 | the last applied `__security` offset |
-| `rune-auth-mode node=<id>` | 1 000 228 | 0 authentication enabled, 1 dev mode |
+| `rune-auth-mode node=<id>` | 1 000 228 | 0 authentication enabled, 1 dev mode, 2 in-process unauthenticated |
 | `rune-logins-ok node=<id>` | 1 000 229 | successful logins |
 | `rune-logins-failed node=<id>` | 1 000 230 | failed logins |
 | `rune-logins-rate-limited node=<id>` | 1 000 231 | logins answered inside a throttle delay |
@@ -386,7 +386,7 @@ is in [operations](../../docs/operations.md#metrics)):
 | `rune-peer-link-refusals node=<id>` | 1 000 234 | peer-link refusals logged by this broker, both directions |
 | `rune-peer-frame-drops node=<id>` | 1 000 235 | inter-broker frames dropped for want of a link or because they did not open |
 
-Alert on a non-zero `rune-security-apply-halted`, on `rune-auth-mode` = 1 anywhere in production, on a
+Alert on a non-zero `rune-security-apply-halted`, on a non-zero `rune-auth-mode` anywhere in production, on a
 rising `rune-logins-failed` or `rune-logins-rate-limited`, and on a rising `rune-peer-link-refusals`.
 Successful and failed logins are metrics and structured logs, not `__security` events (they are
 high-volume).

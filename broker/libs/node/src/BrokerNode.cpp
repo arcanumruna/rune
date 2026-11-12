@@ -73,6 +73,17 @@ namespace rune::node {
 static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
 static_assert(static_cast<std::size_t>(kIngressCapacity) / 8 >= rune::consensus::kMaxConsensusFrameBytes,
               "#254: the consensus ingress ring must carry the largest consensus frame a peer sends");
+// The value of counter 1'000'228 (rune-auth-mode): 0 enabled, 1 dev-disabled, 2 in-process unauthenticated.  Not the
+// enum's own values: the counter's numbering is a published contract (docs/operations.md).
+static constexpr int64_t authModeMetricValue(AuthMode m) noexcept {
+    switch (m) {
+        case AuthMode::Enabled:                  return 0;
+        case AuthMode::DevDisabled:              return 1;
+        case AuthMode::InProcessUnauthenticated: return 2;
+    }
+    return 2;   // unreachable: every enumerator is handled above (the safe reading of an unknown value is "not enabled")
+}
+
 /// Combined fix program M13 (X102): permission bits of every `__security` segment / index / checkpoint file.
 static constexpr unsigned kSecurityFileMode = 0600;
 
@@ -3432,7 +3443,7 @@ void BrokerNode::createMetrics_() {
     // warning in the log).  Start thread, before any agent runs; the same clock_ as the control runner, so the
     // control-thread timer repeats it five minutes later, never twice at start.
     serviceAuthMode_(clock_.nowNs());
-    controlSet_(RuneMetric::AuthMode, config_.authMode == AuthMode::DevDisabled ? 1 : 0);
+    controlSet_(RuneMetric::AuthMode, authModeMetricValue(config_.authMode));
 
 #if defined(__linux__)   // process metrics read /proc/self; other hosts have none
     systemMetrics_.emplace();
@@ -3645,17 +3656,29 @@ void BrokerNode::publishSecurityMetrics_() noexcept {
     publishLoginTallies_();
     controlSet_(RuneMetric::SecurityApplyHalted, securityHaltedValue_);
     controlSet_(RuneMetric::SecurityAppliedOffset, securityAppliedValue_);
-    // 1'000'228: 0 = enabled (an in-process config publishes 0 too), 1 = dev-disabled.
-    controlSet_(RuneMetric::AuthMode, config_.authMode == AuthMode::DevDisabled ? 1 : 0);
+    // 1'000'228: 0 = enabled, 1 = dev-disabled, 2 = in-process unauthenticated (no auth mode in the NodeConfig).
+    controlSet_(RuneMetric::AuthMode, authModeMetricValue(config_.authMode));
 }
 
-// Authentication Task 9 (spec §9): dev mode (RUNE_AUTH=disabled) is shouted at start and every five minutes by this
-// control-thread timer; the auth-mode counter resolves once the driver acked it.
+// Authentication Task 9 (spec §9): dev mode (RUNE_AUTH=disabled) and the in-process unauthenticated mode are shouted at
+// start and every five minutes by this control-thread timer; the auth-mode counter resolves once the driver acked it.
 int BrokerNode::serviceAuthMode_(int64_t nowNs) {
     int work = 0;
-    if (config_.authMode == AuthMode::DevDisabled && devModeWarn_.due(nowNs)) {
-        spdlog::warn("BrokerNode[{}]: {}", config_.nodeId, kDevModeWarning);
-        ++work;
+    switch (config_.authMode) {
+        case AuthMode::Enabled:
+            break;
+        case AuthMode::DevDisabled:
+            if (devModeWarn_.due(nowNs)) {
+                spdlog::warn("BrokerNode[{}]: {}", config_.nodeId, kDevModeWarning);
+                ++work;
+            }
+            break;
+        case AuthMode::InProcessUnauthenticated:
+            if (devModeWarn_.due(nowNs)) {
+                spdlog::warn("BrokerNode[{}]: {}", config_.nodeId, kInProcessUnauthenticatedWarning);
+                ++work;
+            }
+            break;
     }
     return work;
 }
@@ -3927,7 +3950,7 @@ BrokerNode::SecurityMetricsSnap BrokerNode::securityMetricsForTest() {
     return onControlThreadForTest([this]() -> SecurityMetricsSnap {
         publishSecurityMetrics_();
         return SecurityMetricsSnap{securityHaltedValue_, securityAppliedValue_,
-                                   config_.authMode == AuthMode::DevDisabled ? 1 : 0};
+                                   authModeMetricValue(config_.authMode)};
     });
 }
 

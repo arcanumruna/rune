@@ -48,7 +48,7 @@ enum class RuneMetric : std::int32_t {
     LostCommittedReports       = 1'000'225,   // monotonic
     SecurityApplyHalted        = 1'000'226,   // 0 applying, else halted offset + 1
     SecurityAppliedOffset      = 1'000'227,   // -1 none
-    AuthMode                   = 1'000'228,   // 0 enabled, 1 dev-disabled
+    AuthMode                   = 1'000'228,   // 0 enabled, 1 dev-disabled, 2 in-process unauthenticated
     LoginsOk                   = 1'000'229,   // monotonic
     LoginsFailed               = 1'000'230,
     LoginsRateLimited          = 1'000'231,

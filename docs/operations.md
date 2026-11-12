@@ -265,7 +265,7 @@ sampling the file; the broker keeps no history.
 | 1000225 | `rune-lost-committed-reports` | counter | control | Reports of lost committed data. |
 | 1000226 | `rune-security-apply-halted` | gauge | control | `0` while applying; the halted offset plus 1 after a halt. Alert on it. |
 | 1000227 | `rune-security-applied-offset` | gauge | control | Last applied `__security` offset (`-1` none). |
-| 1000228 | `rune-auth-mode` | gauge | control | `0` authentication enabled, `1` dev mode. Alert on `1` in production. |
+| 1000228 | `rune-auth-mode` | gauge | control | `0` authentication enabled, `1` dev mode, `2` in-process unauthenticated (built without an auth mode). Alert on a non-zero value in production. |
 | 1000229 | `rune-logins-ok` | counter | control | Successful logins. |
 | 1000230 | `rune-logins-failed` | counter | control | Failed logins. Alert on a rising rate. |
 | 1000231 | `rune-logins-rate-limited` | counter | control | Login attempts refused by the login throttle (per user and source). |
