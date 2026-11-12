@@ -594,8 +594,9 @@ TEST(CliLive, SchemaGetUntypedTopic) {
 
 // `rune ql` keeps "connect to <ep> timed out" (the e2e retry scripts grep it) and adds the configured response port.
 namespace {
-std::atomic<int64_t> g_qlClockNs{1'000'000'000};
-int64_t qlStepClock() noexcept { return g_qlClockNs.fetch_add(100'000'000); }   // every read is 100 ms later: the connect deadline passes at once
+// `rune ql` runs its Client in Invoker mode: the CLI (test) thread is the only duty thread, so the only reader of this clock.
+int64_t g_qlClockNs = 1'000'000'000;
+int64_t qlStepClock() noexcept { const int64_t t = g_qlClockNs; g_qlClockNs += 100'000'000; return t; }   // every read is 100 ms later: the connect deadline passes at once
 }
 
 TEST(CliLive, QlConnectTimeoutNamesTheResponsePort) {

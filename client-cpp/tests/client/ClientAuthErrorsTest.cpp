@@ -18,7 +18,7 @@
 #include <rune/client/detail/PasswordFile.h>
 
 #include <algorithm>
-#include <atomic>
+#include <poll.h>
 #include <functional>
 #include <cstring>
 #include <chrono>
@@ -960,16 +960,25 @@ std::string connectWaitText(rc::ClientConfig c, const std::function<void(Rig&)>&
     c.gatewayResponseControlPort = 8263;
     Rig r(c);
     setup(r);
-    std::atomic<bool> stop{false};
-    std::thread pumper([&] { while (!stop.load()) r.gw.pump(); });
+    // The pumper stops when the pipe becomes readable (written once connectAndWait returned); its wall deadline is only a safety net.
+    int stop[2];
+    if (::pipe(stop) != 0) throw std::runtime_error("connectWaitText: pipe() failed");
+    std::thread pumper([&] {
+        pollfd pfd{stop[0], POLLIN, 0};
+        const auto deadline = std::chrono::steady_clock::now() + wait + std::chrono::seconds(10);
+        while (::poll(&pfd, 1, 0) == 0 && std::chrono::steady_clock::now() < deadline) r.gw.pump();
+    });
     std::string why;
     try {
         r.client.connectAndWait(wait);
     } catch (const std::runtime_error& e) {
         why = e.what();
     }
-    stop = true;
+    const char b = 0;
+    (void)!::write(stop[1], &b, 1);
     pumper.join();
+    ::close(stop[0]);
+    ::close(stop[1]);
     r.client.close();
     return why;
 }

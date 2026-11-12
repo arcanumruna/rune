@@ -1239,15 +1239,15 @@ static void seedFailoverLeg(bool nat, const char* tag) {
     client->onConnected([snap](int64_t) { snap(); });
     Collector col;
     std::vector<rc::Subscription> subs;
-    {
+    const auto subscribeTo = [&](int32_t p) {
         rc::SubscribeOptions o;
         o.from = rc::From::earliest();
-        for (int32_t p = 0; p < spec.partitionCount; ++p)
-            subs.push_back(client->subscribe(handleOf(spec), p, o, [&col, snap](const rc::Record& rec) {
-                col.add(rec);
-                snap();
-            }));
-    }
+        return client->subscribe(handleOf(spec), p, o, [&col, snap](const rc::Record& rec) {
+            col.add(rec);
+            snap();
+        });
+    };
+    for (int32_t p = 0; p < spec.partitionCount; ++p) subs.push_back(subscribeTo(p));
     // Every partition leader now has a session (and a bind) from this client.
     const Sent before = produceN(*client, handleOf(spec), "seedA", 0, 150, rc::Acks::All);
     EXPECT_EQ(before.ok, 150) << before.firstBad << " undone " << before.undone;
@@ -1274,7 +1274,20 @@ static void seedFailoverLeg(bool nat, const char* tag) {
     EXPECT_EQ(after.ok, 150) << after.firstBad << " undone " << after.undone;
     std::set<std::string> both = asSet(before.okValues);
     for (const auto& v : after.okValues) both.insert(v);
-    EXPECT_TRUE(waitUntil([&] { return col.count(both) == both.size(); }, 90s)) << col.count(both) << "/" << both.size();
+    // The subscription bound on the seed's own session has two documented outcomes when the seed's node dies, by which
+    // the client sees first: fresh metadata naming the new leader (it moves there and goes on), or the loss of the seed
+    // session (it ends SessionLost and the application subscribes again).  Either way every record is delivered (the
+    // Collector counts distinct values, so a re-read from the start adds nothing).
+    const auto resubscribeEnded = [&] {
+        for (int32_t p = 0; p < spec.partitionCount; ++p) {
+            auto& sub = subs[static_cast<std::size_t>(p)];
+            if (!sub.finished()) continue;
+            EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::SessionLost) << "partition " << p;
+            sub = subscribeTo(p);
+        }
+    };
+    EXPECT_TRUE(waitUntil([&] { resubscribeEnded(); return col.count(both) == both.size(); }, 90s))
+        << col.count(both) << "/" << both.size();
     for (auto& sub : subs) sub.unsubscribe();
     // (the control client has no seed response port, but the cluster's Metadata teaches it the survivors' ports, so
     // after the failover its seed pair is response-correlated too: only the NAT leg asserts the mode)

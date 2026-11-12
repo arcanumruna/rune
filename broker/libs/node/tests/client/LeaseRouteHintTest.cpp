@@ -14,12 +14,16 @@ using Clk = std::chrono::steady_clock;
 namespace {
 int64_t msSince(Clk::time_point t0) { return std::chrono::duration_cast<std::chrono::milliseconds>(Clk::now() - t0).count(); }
 
-/// Defines one-partition lease topics until one is led by a node that is not the client's seed (bounded: 6 topics).
+/// A one-partition lease topic led by a node that is not the client's seed.  A new topic's leader does not depend on the seed (in a fresh
+/// trio every new topic may land on the same node, the seed included), so the seed is moved off the leader instead (bounded: 6 topics
+/// until one has a leader).
 std::optional<LeaseTrio::Topic> nonSeedLedLease(LeaseTrio& t) {
     for (int i = 0; i < 6; ++i) {
         const auto topic = t.defineLease("claims" + std::to_string(i), 1, 30'000, 1000, 600'000);
         const int32_t l = t.leaderOf(topic, 0);
-        if (l > 0 && l != t.seedNode()) return topic;
+        if (l < 1) continue;
+        t.reseedAwayFrom(l);
+        return topic;
     }
     return std::nullopt;
 }
@@ -84,22 +88,24 @@ TEST(LeaseRouteHintRegression, HintClearedOnLeaderChangeRegression) {
 
 TEST(LeaseRouteHintRegression, ViewReadGoesStraightToLeaderRegression) {
     LeaseTrio t("lease-hint-view");
-    auto& c = t.client();
     rc::TopicOptions to;
     to.replicationFactor = 3;
     int32_t viewTopicId = -1;
     LeaseTrio::Topic st{};
     for (int i = 0; i < 6 && viewTopicId < 0; ++i) {
         const std::string name = "src" + std::to_string(i);
-        const auto src = c.defineTopicAndWait(name, 1, "id", rune::node::test::charBlob(), rc::Persistence::Disk, to, {}, 90s);
+        const auto src = t.client().defineTopicAndWait(name, 1, "id", rune::node::test::charBlob(), rc::Persistence::Disk, to, {}, 90s);
         ASSERT_EQ(src.errorCode, 0) << src.detail;
-        const auto view = c.createViewAndWait("v" + std::to_string(i), "id", 0, rune::node::test::viewPlanBlob("v" + std::to_string(i), src.topicId, 0), {}, 60s);
+        const auto view = t.client().createViewAndWait("v" + std::to_string(i), "id", 0, rune::node::test::viewPlanBlob("v" + std::to_string(i), src.topicId, 0), {}, 60s);
         ASSERT_EQ(view.errorCode, 0) << view.detail;
         st = LeaseTrio::Topic{src.topicId, 1, name};
         const int32_t l = t.leaderOf(st, 0);
-        if (l > 0 && l != t.seedNode()) viewTopicId = view.viewTopicId;
+        if (l < 1) continue;
+        t.reseedAwayFrom(l);   // the source's leader does not follow the seed: move the seed off it
+        viewTopicId = view.viewTopicId;
     }
     ASSERT_GE(viewTopicId, 0) << "a view whose source partition is led by a node other than the seed";
+    auto& c = t.client();
     auto read = [&] { return c.getViewRowAndWait(viewTopicId, 101, 0, 10s); };
     // Warm-up: reads until one is served through the remembered leader (a hit, no Redirect).  The first ones may meet a view that is
     // still being created, and a hint learnt then may be dropped again while the young cluster still moves leaders (bounded).

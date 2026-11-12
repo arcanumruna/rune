@@ -198,8 +198,7 @@ Log::~Log() {
         }
     }
     {
-        const std::size_t head = swapHead_.load(std::memory_order_relaxed);
-        const std::size_t tail = swapTail_.load(std::memory_order_acquire);
+        const auto [head, tail] = ownerSwapSpan_();
         for (std::size_t i = head; i != tail; ++i) delete swapRing_[i & kSwapRingMask].prebuilt;
     }
     // E1d: clean shutdown persists the exact recovery point (a stale, lower one
@@ -2833,9 +2832,14 @@ void Log::recoverCleanerSwapFiles() {
     }
 }
 
-bool Log::ownerSwapsPending() const noexcept {
+Log::SwapSpan Log::ownerSwapSpan_() const noexcept {
     const std::size_t head = swapHead_.load(std::memory_order_relaxed);   // owner = consumer
     const std::size_t tail = swapTail_.load(std::memory_order_acquire);
+    return {head, tail};
+}
+
+bool Log::ownerSwapsPending() const noexcept {
+    const auto [head, tail] = ownerSwapSpan_();
     return tail != head;
 }
 
@@ -2914,8 +2918,7 @@ int Log::drainCleanerSwaps(int64_t maxBaseBound) {
     // tail_ acquire-load pairs with the producer's release-store — the acquire
     // half of the happens-before between the cleaner's file rename and the
     // reloadSegment() calls below.
-    const std::size_t head = swapHead_.load(std::memory_order_relaxed);
-    const std::size_t tail = swapTail_.load(std::memory_order_acquire);
+    const auto [head, tail] = ownerSwapSpan_();
     if (!ownerDrainAllowed_(pauseSwapPost_) || head == tail) return 0;   // fix round 5: cold path waiting / log failed
     // In-memory only: confirm staging→base renames so the canonical-name check
     // in applyCleanedGroup_ is exact.

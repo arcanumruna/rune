@@ -2939,8 +2939,9 @@ void Client::sweepControl_(int64_t nowNs) {
                              rateLimited ? static_cast<int64_t>(retryAfter) : 0);
             if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(kRefused)); });
         } else {
-            connectTimeoutUnanswered_.store(agent_.seedMachine().state() == session::SessionState::Connecting, std::memory_order_relaxed);
-            completeConnect_(OpStatus::Timeout, 0, 0, {});
+            // aux = 1: the gateway never answered the ConnectRequest (the seed is still Connecting).  It travels in the completion,
+            // so the waiting app thread reads it from the ring, never from a duty-owned field.
+            completeConnect_(OpStatus::Timeout, 0, 0, {}, agent_.seedMachine().state() == session::SessionState::Connecting ? 1 : 0);
             if (cbError_) {
                 invokeUserCallback_("onError", [&] { cbError_("connect() timed out"); });
             }
@@ -3216,7 +3217,7 @@ void Client::connectAndWait(std::chrono::nanoseconds timeout) {
     andWait_("connect()", timeout, 0,
              [&](Completions& q, Token t) { return connect(q, t); },
              [&](const Completion& c, std::span<const uint8_t> payload) {
-                 if (c.status == OpStatus::Timeout && !hint.empty() && connectTimeoutUnanswered_.load(std::memory_order_relaxed)) throw std::runtime_error("connect(): timed out" + hint);
+                 if (c.status == OpStatus::Timeout && !hint.empty() && c.aux != 0) throw std::runtime_error("connect(): timed out" + hint);
                  throwForStatus_("connect()", c, payload);
              },
              [&]() -> std::string {
@@ -7736,7 +7737,10 @@ int Client::sendMetadataRequestEverywhere_() noexcept {
 //
 // SeedSteady -> SeedFailingOver when the seed, after having been Live, lost its
 // session to silence (a stale loss NOT caused by the client's own stall — M1:
-// its broker is presumed dead) or gave up reconnecting (Disconnected / Backoff).
+// its broker is presumed dead), left Connected on an answer (SessionExpired /
+// UnknownSession) and then had ONE connect there go unanswered (the broker
+// ended the session and died: no stale loss is counted on that path), or gave
+// up reconnecting (Disconnected / Backoff).
 // Each attempt moves the seed to ONE candidate and connects fresh there; it ends
 // Connected (-> SeedSteady, every in-flight batch re-offered — I1), or fails
 // (Disconnected / Backoff) or runs out its deadline (min(connect timeout,
@@ -7752,6 +7756,11 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
     const uint64_t losses  = m.staleSessionLosses() - m.ownStallLosses();
     const bool     newLoss = losses != seedFailoverLossesSeen_;
     seedFailoverLossesSeen_ = losses;
+    // An unanswered connect of a once-Live seed is the same evidence as a stale loss (only an episode START reads it:
+    // a running episode has its own attempt deadline).
+    const uint64_t unanswered    = m.unansweredConnects();
+    const bool     newUnanswered = unanswered != seedUnansweredSeen_;
+    seedUnansweredSeen_ = unanswered;
     if (auto* f = std::get_if<SeedFailingOver>(&seedFailover_)) [[unlikely]] {
         // PR #476 review: a TLS session is Connected optimistically once the client sent its Finished; only a sealed
         // frame proves the broker holds the keys (its final leg may still fail).  Until then the failover neither ends
@@ -7811,7 +7820,7 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
     // may the seed fail over.
     if (redirectPending()) return 0;
     const bool gaveUp = st == session::SessionState::Disconnected || st == session::SessionState::Backoff;
-    if (!newLoss && !gaveUp) return 0;
+    if (!newLoss && !newUnanswered && !gaveUp) return 0;
     seedFailover_ = SeedFailingOver{};
     if (cfg_.reconnectForeverAfterLive) {
         // I-4: the stale-loss edge re-points at once — the machine's resume (next
@@ -7819,7 +7828,8 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
         // / UnknownSession and the machine connects fresh there: the first move
         // ~responseTimeoutNs after the broker died, not after the whole resume +
         // connect budget.  A gave-up (Backoff) start waits for the odd-entry rule.
-        if (newLoss) (void)startSeedFailoverAttempt_(std::get<SeedFailingOver>(seedFailover_), nowNs, false);
+        if (newLoss || newUnanswered)
+            (void)startSeedFailoverAttempt_(std::get<SeedFailingOver>(seedFailover_), nowNs, false);
         return 1;
     }
     return startSeedFailoverAttempt_(std::get<SeedFailingOver>(seedFailover_), nowNs) ? 1 : 0;

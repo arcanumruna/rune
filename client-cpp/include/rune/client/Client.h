@@ -2132,6 +2132,7 @@ private:
     struct SeedFailoverStopped {};
     std::variant<SeedSteady, SeedFailingOver, SeedFailoverStopped> seedFailover_;
     uint64_t seedFailoverLossesSeen_ = 0;  ///< the seed machine's staleSessionLosses() last seen
+    uint64_t seedUnansweredSeen_     = 0;  ///< the seed machine's unansweredConnects() last seen
     uint64_t seedFailovers_          = 0;  ///< moves started (test hook)
     uint64_t seedFailoverConnects_   = 0;  ///< fix round 1 (I2): moves that connected by themselves
     uint64_t metadataViaOtherSession_ = 0; ///< MetadataRequests sent on a non-seed session
@@ -2460,7 +2461,6 @@ private:
     // ---- F8c C3: seed-session status for app threads (duty -> owner ring) ---
     mutable detail::StatusRing<SeedStatus> seedStatus_;  // consumer side drained by const state()
     bool       seedStatusDirty_ = false;  // duty: a newer status than the ring holds
-    std::atomic<bool> connectTimeoutUnanswered_{false};   // duty writes at a connect deadline: the gateway never answered the ConnectRequest
     SeedStatus seedStatusLast_{};         // duty: last status computed
     mutable SeedStatus seedStatusCache_{};  // owner: latest drained
 
