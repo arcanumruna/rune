@@ -1396,6 +1396,7 @@ TEST(LeaseSessionRegression, DirectRefusedRecordHandlerClosesProducerRegression)
     EXPECT_TRUE(h.fired) << "the refused record's completion ran";
     EXPECT_EQ(h.ledger.times(1), 1);
     EXPECT_FALSE(p.lifeOpen()) << "the handler's close was applied before trySubmit returned";
+    EXPECT_TRUE(p.releasable()) << "its deferred fail-all ran before trySubmit returned (no duty work is left owed)";
     g.guards.unbindProducer(p);
 }
 
