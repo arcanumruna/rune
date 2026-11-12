@@ -110,6 +110,29 @@ TEST(SecurityAuthzChangeIndexRegression, ANameInAnotherNamespaceIsAnotherUserReg
     EXPECT_FALSE(SecurityAuthzChangeIndex::affects(event(sec::AlterUserOps{sec::DisableUser{}}, 7, "bob"), 0, "bob"));
 }
 
+TEST(SecurityAuthzChangeIndexRegression, APurgedNamespacesUsersLeaveTheIndexRegression) {
+    SecurityAuthzChangeIndex idx;
+    for (const char* n : {"a", "b", "c"}) idx.note(event(sec::CreateUserOps{}, 7, n), 1);
+    for (const char* n : {"x", "y"}) idx.note(event(sec::CreateUserOps{}, 0, n), 2);
+    idx.note(event(sec::CreateUserOps{}, 8, "z"), 3);
+    ASSERT_EQ(idx.usersForTest(), 6u);
+    idx.note(event(sec::NamespacePurgedOps{}, 7, "arena"), 10);
+    EXPECT_EQ(idx.usersForTest(), 3u) << "only the purged namespace's users are forgotten";
+    // Stamp after the purge: the neighbours keep their own offsets (known, not stale); the purged users are unknown.
+    EXPECT_FALSE(idx.changedSince(0, "x", 10));
+    EXPECT_FALSE(idx.changedSince(0, "y", 10));
+    EXPECT_FALSE(idx.changedSince(8, "z", 10));
+    EXPECT_TRUE(idx.changedSince(7, "a", 10));
+    EXPECT_TRUE(idx.changedSince(0, "x", 9)) << "the purge is wide for older stamps";
+    idx.note(event(sec::CreateUserOps{}, 7, "a"), 11);
+    EXPECT_EQ(idx.usersForTest(), 4u);
+    EXPECT_FALSE(idx.changedSince(7, "a", 11)) << "a re-created user is known again";
+    SecurityAuthzChangeIndex top;
+    top.note(event(sec::CreateUserOps{}, UINT32_MAX, "q"), 1);
+    top.note(event(sec::NamespacePurgedOps{}, UINT32_MAX, "n"), 2);
+    EXPECT_EQ(top.usersForTest(), 0u);
+}
+
 TEST(SecurityAuthzChangeIndexRegression, TheFencePredicateNeverStalesAtTheStampAndAlwaysAheadOfItRegression) {
     SecurityAuthzChangeIndex idx = primed();
     idx.note(event(sec::CreateRoleOps{}, 0, "r"), 5);   // wide

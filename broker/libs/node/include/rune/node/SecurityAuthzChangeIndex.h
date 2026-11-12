@@ -10,6 +10,7 @@
 // change.  Admin-thread only, owned by SecurityApplier: no locks, no atomics, not on a hot path.
 #include <rune/security/SecurityEvent.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -63,6 +64,13 @@ public:
     void note(const rune::security::SecurityEvent& ev, int64_t offset) {
         const Scope s = scopeOf(ev);
         if (s.global) global_ = offset;
+        // A purged namespace's users are gone for good: forget them (the wide mark above already stales every
+        // older stamp), so the map does not grow under namespace create/purge churn.
+        if (ev.kind == rune::security::EventKind::NamespacePurged) {
+            const auto first = user_.lower_bound({ev.nsId, std::string{}});
+            const auto last  = ev.nsId == UINT32_MAX ? user_.end() : user_.lower_bound({ev.nsId + 1, std::string{}});
+            user_.erase(first, last);
+        }
         // The bootstrap is wide AND names the first admin: that user is known from here on.
         if (s.global && ev.kind != rune::security::EventKind::Bootstrap) return;
         const auto key = std::make_pair(ev.nsId, std::string(ev.objectName));
@@ -77,6 +85,9 @@ public:
         const auto it = user_.find(std::make_pair(nsId, std::string(local)));
         return it == user_.end() || it->second > stamp;
     }
+
+    /// Number of users tracked (tests).
+    [[nodiscard]] std::size_t usersForTest() const noexcept { return user_.size(); }
 
     /// The fence predicate: is a request stamped at `stamp` (authorized by the user `authenticated`, whose LOCAL name
     /// starts at `localAt`, in namespace `nsId`) stale against the applier's `applied` offset?  Equal: never.
