@@ -8,6 +8,7 @@
 // `existed` / persistence bytes, kA2cTopicCommitted) is its catalog-state
 // equivalent, named the same with `Catalog` prefixed.
 #include "support/CatalogDdlRig.h"
+#include "support/SecurityRig.h"
 
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminWorker.h>
@@ -22,6 +23,7 @@
 #include <rune/codec/Evolve.h>
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/client/SchemaMessages.h>
+#include <rune/protocol/client/SecurityMessages.h>
 
 #include <gtest/gtest.h>
 #include <spdlog/sinks/stdout_sinks.h>
@@ -570,6 +572,193 @@ TEST(AdminWorkerRegression, MalformedRingRequestIsAnsweredNeverDroppedRegression
     EXPECT_EQ(rig.submitRaw(DdlRequest{MalformedDdl{kTidDefineTopic, rig.sessionId(), rig.nextCorr(), "x"}}).code, 23);
     EXPECT_EQ(rig.submitRaw(DdlRequest{MalformedDdl{kTidDropTopic, rig.sessionId(), rig.nextCorr(), "x"}}).code, 39);
     EXPECT_TRUE(rig.recordedLog().empty());
+}
+
+// Issues #218 / #67: the DDL meta's security stamp crosses the admin ring bit-exact, and a stamp flag other than
+// 0 / 1 is malformed (never cast).
+TEST(AdminWorkerRegression, TheSecurityStampCrossesTheAdminRingAndARefusedFlagIsMalformedRegression) {
+    OneToOneByteRing ring{kAdminRequestRingBytes};
+    for (const bool stamped : {false, true}) {
+        DropTopicMsg dt; dt.session = 7; dt.corr = 11; dt.name = "p";
+        dt.meta.statement = "DROP TOPIC p;"; dt.meta.requestId = {5, 6};
+        dt.meta.authenticated = "ns/bob"; dt.meta.callerNsId = 7; dt.meta.authenticatedLocalAt = 3;
+        dt.meta.securityStamped = stamped; dt.meta.securityOffset = stamped ? 41 : -1;
+        ASSERT_TRUE(encodeDdl(ring, dt));
+        int seen = 0;
+        ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                       aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            const auto n = static_cast<std::size_t>(len);
+            const DdlRequest r = decodeDropTopic(p, n);
+            ASSERT_TRUE(std::holds_alternative<DropTopicMsg>(r));
+            const auto& got = std::get<DropTopicMsg>(r);
+            EXPECT_EQ(got.meta.securityStamped, stamped);
+            EXPECT_EQ(got.meta.securityOffset, stamped ? 41 : -1);
+            EXPECT_EQ(got.meta, dt.meta);
+            EXPECT_EQ(got.meta.callerNsId, 7u);
+            EXPECT_EQ(got.meta.authenticatedLocalAt, 3u);
+            // The stamp (flag 1 + offset 8) then callerNsId 4 + authenticatedLocalAt 2 end the meta, followed by the
+            // 4-byte nsId.
+            std::vector<uint8_t> bad(p, p + n);
+            bad[n - 4 - 15] = 2;
+            const DdlRequest badR = decodeDropTopic(bad.data(), bad.size());
+            const auto* badM = std::get_if<MalformedDdl>(&badR);
+            ASSERT_NE(badM, nullptr);
+            EXPECT_EQ(badM->reason, "a securityStamped flag other than 0/1");
+            // An authenticatedLocalAt beyond the name is malformed too (the u16 sits just before the nsId).
+            std::vector<uint8_t> badAt(p, p + n);
+            badAt[n - 4 - 2] = 0; badAt[n - 4 - 1] = 0x7f;
+            const DdlRequest badAtR = decodeDropTopic(badAt.data(), badAt.size());
+            const auto* badAtM = std::get_if<MalformedDdl>(&badAtR);
+            ASSERT_NE(badAtM, nullptr);
+            EXPECT_EQ(badAtM->reason, "an authenticatedLocalAt beyond the authenticated name");
+            ++seen;
+        }, 8);
+        EXPECT_EQ(seen, 1);
+    }
+}
+
+namespace {
+// A catalog leader with `events` golden __security events applied by its own admin thread (the stamp's reference).
+struct StampRig {
+    CatalogDdlRig               cat;
+    rune::node::test::SecurityRig sec;
+    explicit StampRig(const char* tag, std::size_t events)
+        : cat(tag, 1), sec(tag, /*goLive=*/false) {
+        cat.becomeServingLeader();
+        sec.appendEvents(0, events);
+        (void)sec.applier.replayLocal(sec.log(), sec.rec.bootEffects());
+        cat.admin().attachSecurity(std::move(sec.applier), &sec.replica(), sec.rec.liveEffects());
+        for (int i = 0; i < 64; ++i) cat.pump();
+    }
+    [[nodiscard]] int64_t applied() { return cat.admin().securityApplier()->state().appliedOffset(); }
+    /// One more security event reaches the admin thread's applier (the gateway's mirror has not seen it yet).
+    void applyOneMoreEvent(std::size_t index) {
+        sec.appendEvents(index, index + 1);
+        for (int i = 0; i < 64; ++i) cat.pump();
+    }
+};
+}
+
+TEST(AdminWorkerRegression, AStaleAuthorizationStampIsRetriedNotAppendedRegression) {
+    StampRig rig("aw_stale_stamp", 4);
+    ASSERT_EQ(rig.applied(), 3);
+    auto& cat = rig.cat;
+    // stamp == applied: proceeds.
+    cat.stampSecurity(rig.applied());
+    ASSERT_EQ(cat.define({.name = "orders"}).code, 0);
+    EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 0u);
+    // One security event (a REVOKE of the requester's right) applies after the stamp.
+    const int64_t stampS = rig.applied();
+    rig.applyOneMoreEvent(4);
+    ASSERT_EQ(rig.applied(), stampS + 1);
+    const std::size_t logged = cat.recordedLog().size();
+    const auto rid = cat.freshRequestId();
+    const auto stale = cat.define({.name = "late", .requestId = rid});
+    EXPECT_EQ(stale.code, 2) << stale.detail;   // NotLeader
+    EXPECT_EQ(cat.recordedLog().size(), logged) << "nothing was appended for the stale request";
+    EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 1u);
+    // The retry with the same request id and the current stamp (authorized afresh) applies once.
+    cat.stampSecurity(rig.applied());
+    EXPECT_EQ(cat.define({.name = "late", .requestId = rid}).code, 0);
+    EXPECT_EQ(cat.recordedLog().size(), logged + 1);
+    // A stamp beyond the applied offset (impossible: the mirror trails the applier) is stale too.
+    cat.stampSecurity(rig.applied() + 1);
+    EXPECT_EQ(cat.define({.name = "ahead"}).code, 2);
+    EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 2u);
+    const auto drop = cat.dropTopic("orders");   // a DDL answer that carries a detail
+    EXPECT_EQ(drop.code, 2);
+    EXPECT_EQ(drop.detail, "the security state changed while this request was in flight; retry");
+    EXPECT_EQ(cat.recordedLog().size(), logged + 1) << "the stale drop appended nothing";
+    EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 3u);
+    // Unstamped (authorization off / in-process): proceeds whatever the applied offset.
+    cat.unstampSecurity();
+    EXPECT_EQ(cat.define({.name = "unstamped"}).code, 0);
+    EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 3u);
+}
+
+TEST(AdminWorkerRegression, ARecordedRequestIsAnsweredBeforeTheStampIsCheckedRegression) {
+    StampRig rig("aw_stale_dedupe", 4);
+    auto& cat = rig.cat;
+    cat.stampSecurity(rig.applied());
+    const auto rid = cat.freshRequestId();
+    const auto first = cat.define({.name = "orders", .requestId = rid});
+    ASSERT_EQ(first.code, 0) << first.detail;
+    rig.applyOneMoreEvent(4);   // the stamp is now stale
+    const std::size_t logged = cat.recordedLog().size();
+    const auto again = cat.define({.name = "orders", .requestId = rid});
+    EXPECT_EQ(again.code, 0) << "the ORIGINAL result, not a retry: " << again.detail;
+    EXPECT_EQ(again.topicId, first.topicId);
+    EXPECT_EQ(cat.recordedLog().size(), logged);
+    EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 0u);
+}
+
+// #67: a CREATE VIEW authorized (READ on its source) before a REVOKE READ applied is not created.
+TEST(AdminWorkerRegression, ACreateViewAuthorizedBeforeARevokeIsRetriedNotCreatedRegression) {
+    StampRig rig("aw_stale_view", 4);
+    auto& cat = rig.cat;
+    ASSERT_EQ(cat.define({.name = "orders", .typed = true}).code, 0);   // unstamped set-up
+    cat.stampSecurity(rig.applied());
+    rig.applyOneMoreEvent(4);   // REVOKE READ ON TOPIC orders lands before the admin thread starts the view
+    const std::size_t logged = cat.recordedLog().size();
+    const auto stale = cat.createView("orders_v", "orders");
+    EXPECT_EQ(stale.code, 2) << stale.detail;
+    EXPECT_EQ(cat.recordedLog().size(), logged) << "the view was not created";
+    EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 1u);
+}
+
+// Per principal: an event about ANOTHER user does not stale a catalog DDL; a role-side change or one about the
+// requester does.  The requester "admin" is the bootstrap user; golden events 0..7 are applied, 8 is about ws1, 9
+// revokes a role's grant, 10 is about admin.
+TEST(AdminWorkerRegression, AnEventAboutAnotherUserDoesNotStaleACatalogDdlRegression) {
+    StampRig rig("aw_stale_principal", 8);
+    auto& cat = rig.cat;
+    ASSERT_EQ(rig.applied(), 7);
+    cat.stampSecurity(rig.applied());
+    rig.applyOneMoreEvent(8);   // ALTER USER ws1: another user
+    ASSERT_EQ(rig.applied(), 8);
+    EXPECT_EQ(cat.define({.name = "orders", .authenticated = "admin"}).code, 0) << "no retry for a pipelined DDL";
+    EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 0u);
+    cat.stampSecurity(rig.applied());
+    rig.applyOneMoreEvent(9);   // REVOKE from a ROLE: wide, stale for everyone (admin is no member)
+    EXPECT_EQ(cat.define({.name = "late", .authenticated = "admin"}).code, 2);
+    EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 1u);
+    cat.stampSecurity(rig.applied());
+    rig.applyOneMoreEvent(10);   // ALTER USER admin: the requester itself
+    EXPECT_EQ(cat.define({.name = "later", .authenticated = "admin"}).code, 2);
+    EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 2u);
+}
+
+// A security event appended but not yet applied is classified with the same rule: it cannot slip between the stamp and
+// the catalog append.
+TEST(AdminWorkerRegression, ASecurityEventInFlightAboutTheRequesterStalesACatalogDdlRegression) {
+    StampRig rig("aw_inflight", 8);
+    auto& cat = rig.cat;
+    AdminRoleMsg role;
+    role.leader = true; role.epoch = 1; role.leaderId = 1; role.partitionEpoch = 0; role.isrCount = 2;
+    role.isr[0] = 1; role.isr[1] = 2;
+    cat.admin().onSecurityRole(role);   // follower 2 never fetches: an appended event stays uncommitted
+    for (int i = 0; i < 64 && cat.admin().securityAdmin()->roleName() != "LeaderServing"; ++i) cat.pump();
+    ASSERT_EQ(cat.admin().securityAdmin()->roleName(), "LeaderServing");
+    SecurityDdlMsg m;
+    m.session = cat.sessionId(); m.corr = cat.nextCorr();
+    m.kind = static_cast<uint8_t>(rune::protocol::client::SecurityOpKind::AlterUser);
+    m.name = "ws1"; m.change = static_cast<uint8_t>(rune::protocol::client::UserChangeKind::Disable);
+    m.meta.clientName = "t"; m.meta.statement = "ALTER USER ws1 DISABLE;"; m.meta.authenticated = "admin";
+    m.meta.requestId = cat.freshRequestId(); m.meta.sessionId = cat.sessionId();
+    cat.admin().submitSecurity(SecurityRequest{std::move(m)});
+    for (int i = 0; i < 16 && !cat.admin().securityAdmin()->hasInFlight(); ++i) cat.pump();
+    ASSERT_TRUE(cat.admin().securityAdmin()->hasInFlight());
+    const int64_t stamp = rig.applied();   // the in-flight event is not applied yet
+    cat.stampSecurity(stamp);
+    const std::size_t logged = cat.recordedLog().size();
+    // A DDL from ws1 while an event about ws1 is in flight: retry, nothing appended.
+    EXPECT_EQ(cat.define({.name = "by_ws1", .authenticated = "ws1"}).code, 2);
+    EXPECT_EQ(cat.recordedLog().size(), logged);
+    EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 1u);
+    // The same while the event is about another user: proceeds.
+    EXPECT_EQ(cat.define({.name = "by_admin", .authenticated = "admin"}).code, 0);
+    EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 1u);
 }
 
 // No-hang wave (R1): an unknown persistence byte is never defaulted to Disk.

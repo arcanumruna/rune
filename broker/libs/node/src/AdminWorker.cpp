@@ -1011,6 +1011,41 @@ void AdminWorker::startNext_(int64_t nowNs) {
         }
     }
 
+    // 3a. Issues #218 / #67: the gateway authorized (or denied) this request against the `__security` state at the
+    //     stamped offset; the admin thread appends only if nothing applied since could have changed what THIS user may
+    //     do (per principal, SecurityAuthzChangeIndex).  The mirror
+    //     trails this applier (it is fed by it), so a request that raced a security change is answered the retriable
+    //     NotLeader and the retry is authorized afresh.  After the dedupe: a recorded request keeps its result.
+    if (meta.securityStamped) {
+        if (!securityApplier_) {   // a stamped request on a broker without __security: a wiring bug, not a retry
+            if (!staleStampWiringLogged_) {
+                staleStampWiringLogged_ = true;
+                spdlog::critical("AdminWorker: a DDL stamped with a __security offset reached a broker with no "
+                                 "__security attached - refused");
+            }
+            answer_(req, kInternal, "this broker has no __security to check the request's authorization against");
+            return;
+        }
+        // Per principal (SecurityAuthzChangeIndex): only an event applied after the stamp that could have changed what
+        // THIS user may do makes the request stale.  An event of the security leader that is appended but not yet
+        // applied is classified with the same rule, so it cannot slip between the stamp and the append either.
+        const SecurityAuthzChangeIndex& changes = securityApplier_->authzChanges();
+        const std::string_view who = std::string_view{meta.authenticated};
+        const std::string_view local = meta.authenticatedLocalAt <= who.size() ? who.substr(meta.authenticatedLocalAt)
+                                                                               : std::string_view{};
+        const rune::security::SecurityEvent* pending = securityAdmin_ ? securityAdmin_->inFlightEvent() : nullptr;
+        if (changes.staleAt(securityApplier_->state().appliedOffset(), meta.securityOffset, meta.callerNsId, who,
+                            meta.authenticatedLocalAt) ||
+            (pending != nullptr && SecurityAuthzChangeIndex::affects(*pending, meta.callerNsId, local))) {
+            if (++ddlStaleAuthorization_ % 1024 == 1)
+                spdlog::debug("AdminWorker: a DDL authorized at __security offset {} met applied offset {} - answered "
+                              "NotLeader (retriable; stale so far: {})", meta.securityOffset,
+                              securityApplier_->state().appliedOffset(), ddlStaleAuthorization_);
+            answer_(req, kNotLeader, "the security state changed while this request was in flight; retry");
+            return;
+        }
+    }
+
     // 3b. Namespaces Task 7 (D15): the gateway's authorization verdict rides the message — answered after the dedupe,
     //     so a retry of a committed namespace DDL still gets its original result.  A denied one whose id is recorded
     //     for a different statement or principal was already answered its denial inside step 3 (#221).

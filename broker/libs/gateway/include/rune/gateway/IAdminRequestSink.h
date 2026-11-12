@@ -49,6 +49,10 @@ struct DdlMetaView {
     uint32_t                        callerNsId = 0;  // namespaces Task 9: the session's namespace (0 = `default`)
     uint32_t                        targetNsId = 0;  // namespaces Task 10: the object's resolved namespace
                                                      // (NsResolve.h; kHiddenNsId = hidden or unknown, answered as missing)
+    bool                            securityStamped = false;   // issues #218 / #67: authorization is enforced...
+    int64_t                         securityOffset  = -1;      // ...and this SecurityView offset was checked against
+    uint16_t                        authenticatedLocalAt = 0;  // where the LOCAL user name starts in `authenticated`
+                                                               // (0 = the bare default-namespace form)
 };
 
 /// The outcome of handing a request to the admin thread.

@@ -308,6 +308,17 @@ Other brokers
 apply the event asynchronously (typically within 100 ms on healthy brokers).
 A revoke ends the affected subscriptions within 100 ms on a 3-node cluster.
 
+**A DDL and a concurrent security change.** The gateway authorizes a catalog or security DDL against its mirror of
+`__security` and stamps the request with the `__security` offset it checked. The admin thread appends the request only
+if no event applied after that offset could have changed what the requesting user may do (issues #218, #67); otherwise
+it answers the ordinary retriable `NotLeader`, and the client's retry (same request id) is authorized again against
+the newer state. The rule is per user: an event about another user does not make an admin's pipelined DDL retry. A
+change on the role side (a role's grants, `CREATE ROLE`, `DROP ROLE`), a namespace purge, the bootstrap, and any event
+kind not listed as user-specific count as a change for every user, and so does a principal the admin thread has no
+record of since boot (anonymous, dropped, or not touched since the broker started from a checkpoint). The same rule
+covers a security event that is appended but not yet applied. A request whose id is already recorded still gets its
+original result first.
+
 ### A broker serves only a current security state (`#serving`)
 
 A broker serves logins, `__security` reads and security DDL only while its `__security` state is provably

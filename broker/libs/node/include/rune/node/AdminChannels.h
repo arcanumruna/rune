@@ -255,6 +255,16 @@ struct DdlMeta {
     int64_t                                    sessionId = 0;
     rune::protocol::RequestId                  requestId{};
     std::optional<rune::catalog::ReplayedFrom> replayedFrom;   // set only by `rune catalog replay` (spec §7)
+    /// Issues #218 / #67: the SecurityView applied offset the gateway authorized this request against; stamped only
+    /// when the gateway enforces authorization.  The admin thread appends only while its own applied `__security`
+    /// offset is still exactly this one (else it answers the retriable NotLeader and the retry is authorized afresh).
+    bool                                       securityStamped = false;
+    int64_t                                    securityOffset  = -1;
+    /// The authenticated user's namespace id, and where the LOCAL user name starts in `authenticated` (0 for the bare
+    /// default-namespace form, else the length of the `<ns NAME>/` or `#<nsId>/` prefix): the key the admin thread's
+    /// per-principal fence looks the user up by.  Gateway-set; never parsed back out of the string.
+    uint32_t                                   callerNsId           = 0;
+    uint16_t                                   authenticatedLocalAt = 0;
     bool operator==(const DdlMeta&) const = default;
 };
 
@@ -636,6 +646,10 @@ void layoutMeta(W& w, const DdlMeta& m) {
         w.i64(m.replayedFrom->offset);
         w.str16(m.replayedFrom->principal);
     }
+    w.u8(m.securityStamped ? 1 : 0);   // issues #218 / #67
+    w.i64(m.securityOffset);
+    w.u32(m.callerNsId);
+    w.u16(m.authenticatedLocalAt);
 }
 inline void readMeta(Reader& r, DdlMeta& m) {
     r.str32(m.statement);
@@ -653,6 +667,16 @@ inline void readMeta(Reader& r, DdlMeta& m) {
         from.offset = r.i64();
         r.str16(from.principal);
         m.replayedFrom = std::move(from);
+    }
+    const uint8_t stamped = r.u8();
+    if (stamped > 1) { r.fail("a securityStamped flag other than 0/1"); return; }   // never cast
+    m.securityStamped = stamped == 1;
+    m.securityOffset  = r.i64();
+    m.callerNsId           = r.u32();
+    m.authenticatedLocalAt = r.u16();
+    if (m.authenticatedLocalAt > m.authenticated.size()) {
+        r.fail("an authenticatedLocalAt beyond the authenticated name");   // never trusted
+        return;
     }
 }
 
@@ -1965,8 +1989,9 @@ template <typename Write>
 // the request's (it gains the four lease system columns, and an RCD1 blob is re-serialized); that growth is not bounded
 // here but by the append-time catalogEventEffectsRefusal.  The static_assert below keeps >= 128 bytes of margin for the
 // four columns (4 x ~30 B) under the SchemaUpdate bound.
-// statement(4) + clientName(2) + sourceAddress(2) + authenticated(2, auth Task 10) + sessionId + requestId hi/lo + flag.
-inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 1;
+// statement(4) + clientName(2) + sourceAddress(2) + authenticated(2, auth Task 10) + sessionId + requestId hi/lo + flag
+// + the security stamp (flag + offset, issues #218 / #67) + callerNsId(4) + authenticatedLocalAt(2).
+inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 1 + 1 + 8 + 4 + 2;
 // The trailing adoptDenial length prefix (2, issue #129), the nsId (4, namespaces), then the
 // key features (checked writes Part 05).
 inline constexpr std::size_t kDefineTopicFixedBytes =

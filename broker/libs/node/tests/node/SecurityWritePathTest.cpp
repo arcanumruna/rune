@@ -793,6 +793,129 @@ TEST(SecurityWritePathRegression, TheDdlFingerprintCoversThePrincipalRegression)
     EXPECT_NE(fp("ab"), fp("a")) << "the principal is part of the hash, not a prefix collision";
 }
 
+// Issues #218 / #67: the gateway stamps the `__security` offset it authorized against; the admin thread appends only
+// while its applied state is still that one.
+namespace {
+rune::node::SecurityDdlMsg stamped(rune::node::SecurityDdlMsg m, int64_t offset) {
+    m.meta.securityStamped = true;
+    m.meta.securityOffset  = offset;
+    return m;
+}
+}
+
+TEST(SecurityWritePathRegression, AStaleAuthorizationStampIsRetriedNotAppendedRegression) {
+    SecurityDdlRig rig("stale_stamp");
+    rig.becomeServingLeader();
+    for (const char* who : {"root", "bob"}) {   // another admin stays: bob's REVOKE ADMIN is no last-admin refusal
+        ASSERT_EQ(rig.ddl(rig.createUser(who, "a long enough password")).code, 0);
+        ASSERT_EQ(rig.ddl(rig.grant(false, sec::GranteeKind::User, who, sec::Operation::Admin,
+                                    sec::ResourceType::Cluster, sec::PatternKind::Exact, "")).code, 0);
+    }
+    const int64_t stampS = rig.state().appliedOffset();   // bob's DDL is authorized here: he holds ADMIN
+    // stamp == applied: proceeds.
+    const auto ok = rig.ddl(stamped(rig.createRole("r_ok"), stampS));
+    ASSERT_EQ(ok.code, 0) << ok.detail;
+    // REVOKE ADMIN from bob lands first (the gateway's mirror has not seen it yet).
+    const int64_t stampBeforeRevoke = rig.state().appliedOffset();
+    ASSERT_EQ(rig.ddl(rig.grant(true, sec::GranteeKind::User, "bob", sec::Operation::Admin,
+                                sec::ResourceType::Cluster, sec::PatternKind::Exact, "")).code, 0);
+    const std::size_t logged = rig.recordedEvents().size();
+    auto bobs = stamped(rig.createRole("r_stale"), stampBeforeRevoke);
+    bobs.meta.authenticated = "bob";
+    const auto stale = rig.ddl(bobs);
+    EXPECT_EQ(stale.code, kNotLeader) << stale.detail;
+    EXPECT_EQ(stale.detail, "the security state changed while this request was in flight; retry");
+    EXPECT_EQ(rig.recordedEvents().size(), logged) << "nothing was appended for the stale request";
+    EXPECT_EQ(rig.state().roleByName(0, "r_stale"), nullptr);
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 1u);
+    // The retry (same request id) carries the current stamp - the gateway authorized it afresh - and applies once.
+    bobs.meta.securityOffset = rig.state().appliedOffset();
+    bobs.corr = rig.nextCorr();
+    const auto retry = rig.ddl(bobs);
+    EXPECT_EQ(retry.code, 0) << retry.detail;
+    EXPECT_EQ(rig.recordedEvents().size(), logged + 1);
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 1u);
+    // A stamp beyond the applied offset cannot happen (the mirror trails the applier): treated as stale too.
+    const auto ahead = rig.ddl(stamped(rig.createRole("r_ahead"), rig.state().appliedOffset() + 1));
+    EXPECT_EQ(ahead.code, kNotLeader);
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 2u);
+    // An unstamped request (authorization off / in-process) proceeds whatever the applied offset.
+    EXPECT_EQ(rig.ddl(rig.createRole("r_unstamped")).code, 0);
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 2u);
+}
+
+TEST(SecurityWritePathRegression, ARecordedRequestIsAnsweredBeforeTheStampIsCheckedRegression) {
+    SecurityDdlRig rig("stale_dedupe");
+    rig.becomeServingLeader();
+    const auto m = rig.createRole("r1");
+    const auto first = rig.ddl(stamped(m, rig.state().appliedOffset()));
+    ASSERT_EQ(first.code, 0) << first.detail;
+    ASSERT_EQ(rig.ddl(rig.createRole("r2")).code, 0);   // the state moves on
+    const std::size_t logged = rig.recordedEvents().size();
+    auto retry = stamped(m, first.gateOffset - 1);       // a stale stamp on a recorded request id
+    retry.corr = rig.nextCorr();
+    const auto again = rig.ddl(retry);
+    EXPECT_EQ(again.code, 0) << "the ORIGINAL result, not a retry: " << again.detail;
+    EXPECT_EQ(again.objectId, first.objectId);
+    EXPECT_EQ(rig.recordedEvents().size(), logged);
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 0u);
+}
+
+// Per principal: only an event that could have changed what THIS user may do makes a stamped request stale.
+TEST(SecurityWritePathRegression, AnEventAboutAnotherUserDoesNotStaleAStampedRequestRegression) {
+    SecurityDdlRig rig("stale_other_user");
+    rig.becomeServingLeader();
+    for (const char* who : {"alice", "bob"}) ASSERT_EQ(rig.ddl(rig.createUser(who, "a long enough password")).code, 0);
+    const int64_t stamp = rig.state().appliedOffset();
+    ASSERT_EQ(rig.ddl(rig.grant(false, sec::GranteeKind::User, "alice", sec::Operation::Read, sec::ResourceType::Topic,
+                                sec::PatternKind::Exact, "t")).code, 0);   // about alice, after the stamp
+    auto bobs = stamped(rig.createRole("r1"), stamp);
+    bobs.meta.authenticated = "bob";
+    const auto a = rig.ddl(bobs);
+    EXPECT_EQ(a.code, 0) << a.detail;
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 0u);
+    // A role-side change is wide: stale for everyone, even a user that is no member.
+    const int64_t stamp2 = rig.state().appliedOffset();
+    ASSERT_EQ(rig.ddl(rig.grant(false, sec::GranteeKind::Role, "r1", sec::Operation::Read, sec::ResourceType::Topic,
+                                sec::PatternKind::Exact, "t")).code, 0);
+    auto bobAgain = stamped(rig.createRole("r2"), stamp2);
+    bobAgain.meta.authenticated = "bob";
+    EXPECT_EQ(rig.ddl(bobAgain).code, kNotLeader);
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 1u);
+    // An unknown principal (anonymous) is stale on any change.
+    EXPECT_EQ(rig.ddl(stamped(rig.createRole("r3"), stamp2)).code, kNotLeader) << "\"admin\" was never created here";
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 2u);
+}
+
+TEST(SecurityWritePathRegression, AStaleDenialBecomesARetryNotA45Regression) {
+    SecurityDdlRig rig("stale_denial");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.ddl(rig.createUser("bob", "a long enough password")).code, 0);
+    const int64_t stamp = rig.state().appliedOffset();
+    auto denied = stamped(rig.createRole("r1"), stamp);
+    denied.meta.authenticated = "bob";
+    denied.denial = "not authorized: ADMIN on CLUSTER";
+    const auto fresh = rig.ddl(denied);   // stamp == applied: the denial stands
+    EXPECT_EQ(fresh.code, kNotAuthorized);
+    EXPECT_EQ(fresh.detail, "not authorized: ADMIN on CLUSTER");
+    // A GRANT to bob lands after the stamp: the denial may be obsolete, so the answer is the retry, not 45.
+    ASSERT_EQ(rig.ddl(rig.grant(false, sec::GranteeKind::User, "bob", sec::Operation::Admin, sec::ResourceType::Cluster,
+                                sec::PatternKind::Exact, "")).code, 0);
+    auto again = denied;
+    again.corr = rig.nextCorr();
+    again.meta.requestId = {0x5EC1, 9999};
+    const auto stale = rig.ddl(again);
+    EXPECT_EQ(stale.code, kNotLeader) << stale.detail;
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 1u);
+}
+
+// The owning meta and the security message agree on the caller's namespace (the fence reads the meta's).
+TEST(SecurityWritePathRegression, TheMetaAndTheSecurityMessageAgreeOnTheCallersNamespaceRegression) {
+    SecurityDdlRig rig("stale_ns_agree");
+    auto m = rig.createRole("r1");
+    EXPECT_EQ(m.meta.callerNsId, m.callerNsId);
+}
+
 TEST(CheckedWritesImportGrant, GrantImportBelowLevelFiveIsRefused) {
     SecurityDdlRig rig("import_level");
     rig.becomeServingLeader();

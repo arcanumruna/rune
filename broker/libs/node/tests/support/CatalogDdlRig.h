@@ -417,6 +417,10 @@ public:
     [[nodiscard]] const std::vector<std::string>& bootEffects() const noexcept { return bootEffects_; }
     [[nodiscard]] const std::filesystem::path& root() const noexcept { return root_; }
     [[nodiscard]] int64_t now() const noexcept { return now_; }
+    /// Issues #218 / #67: every DDL the rig builds from now on carries this `__security` authorization stamp
+    /// (as the gateway's ddlMetaOf_ does when authorization is enforced); unstampSecurity() returns to unstamped.
+    void stampSecurity(int64_t offset) noexcept { stampSecurity_ = true; stampOffset_ = offset; }
+    void unstampSecurity() noexcept { stampSecurity_ = false; stampOffset_ = -1; }
     /// The clock moves WITHOUT a pump (Task 10: the caller's next pump sees it).
     void advanceClock(int64_t ns) noexcept { now_ += ns; }
     /// The live effects the applier posted: "<effect>:<topicId>".
@@ -489,6 +493,8 @@ private:
         m.statement     = statement;
         m.sessionId     = kSession;
         m.sourceAddress = "aeron:udp?endpoint=rig-client:40123";
+        m.securityStamped = stampSecurity_;
+        m.securityOffset  = stampOffset_;
         if (preV8) return m;   // no extension: no client name, no request id
         m.clientName = client;
         m.requestId  = rid.none() ? freshRequestId() : rid;
@@ -632,6 +638,8 @@ private:
     int64_t                                              now_   = 1'000'000'000;
     int64_t                                              corr_  = 0;
     uint64_t                                             ridCounter_ = 0;
+    bool                                                 stampSecurity_ = false;   ///< issues #218 / #67
+    int64_t                                              stampOffset_   = -1;
     uint64_t catalogFrames_ = 0;  uint64_t catalogProbes_ = 0;  int64_t catalogSubId_ = 0;
 };
 

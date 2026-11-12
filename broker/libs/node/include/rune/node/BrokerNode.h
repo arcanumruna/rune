@@ -1018,6 +1018,10 @@ private:
         m.authenticated.assign(v.authenticated);
         m.sessionId       = v.sessionId;
         m.requestId       = v.requestId;
+        m.securityStamped = v.securityStamped;
+        m.securityOffset  = v.securityOffset;
+        m.callerNsId           = v.callerNsId;
+        m.authenticatedLocalAt = v.authenticatedLocalAt;
         if (v.replayedFrom)
             m.replayedFrom = rune::catalog::ReplayedFrom{std::string(v.replayedFrom->clusterId),
                                                          v.replayedFrom->offset,

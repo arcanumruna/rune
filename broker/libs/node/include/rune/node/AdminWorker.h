@@ -449,6 +449,9 @@ public:
     [[nodiscard]] uint64_t ddlRefusedUntrustedLeader() const noexcept { return ddlRefusedUntrustedLeader_; }
     /// Issue #296: DDLs refused because they would raise the estimated open-file need above fdLimit.
     [[nodiscard]] uint64_t ddlRefusedFdBudget() const noexcept { return ddlRefusedFdBudget_; }
+    /// Issues #218 / #67: catalog DDLs answered NotLeader because the `__security` state moved after the gateway
+    /// authorized them.
+    [[nodiscard]] uint64_t ddlStaleAuthorization() const noexcept { return ddlStaleAuthorization_; }
     [[nodiscard]] static constexpr int64_t ddlTimeoutNs() noexcept { return kDdlTimeoutNs; }
 
     // ── The in-flight DDL (rule 3) ──────────────────────────────────────────
@@ -594,6 +597,8 @@ private:
     uint64_t preV8Refused_      = 0;
     uint64_t ddlRefusedUntrustedLeader_ = 0;
     uint64_t ddlRefusedFdBudget_ = 0;   ///< issue #296
+    uint64_t ddlStaleAuthorization_ = 0;   ///< issues #218 / #67
+    bool     staleStampWiringLogged_ = false;
     bool     applyHeldForTest_  = false;   // holdApplyForTest (test seam only)
     bool     answersHeldForTest_ = false;  // holdAnswersForTest (test seam only)
     bool     catalogReplicationHeldForTest_ = false;  // holdCatalogReplicationForTest (test seam only)

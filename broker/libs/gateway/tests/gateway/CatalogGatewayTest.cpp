@@ -80,9 +80,11 @@ struct CountingAdminSink final : IAdminRequestSink {
                                  uint32_t, const DdlMetaView&) override { ++submits; return AdminSubmit::Accepted; }
     std::string lastAuthenticated;   // #652: the audit principal of the last DropTopic (copied: the view is transient)
     uint32_t    lastCallerNsId = 0;
+    uint16_t    lastLocalAt = 0;   // #218 / #67: where the local user name starts in `authenticated`
     AdminSubmit submitDropTopic(int64_t, int64_t, std::string_view, const DdlMetaView& meta) override {
         lastAuthenticated = std::string(meta.authenticated);
         lastCallerNsId    = meta.callerNsId;
+        lastLocalAt       = meta.authenticatedLocalAt;
         ++submits; return AdminSubmit::Accepted;
     }
     AdminSubmit submitAlterTopicConfig(int64_t, int64_t, std::string_view, uint32_t, std::span<const uint8_t>,
@@ -1219,9 +1221,16 @@ TEST(CatalogPrincipalRegression, UnknownNsFallsBackToNumericPrefixRegression) {
     ASSERT_EQ(g.adminSubmits(), 1u);
     EXPECT_EQ(g.admin.lastCallerNsId, kGone);
     EXPECT_EQ(g.admin.lastAuthenticated, "#7/ops") << "an unknown namespace id is spelled #<nsId>";
+    // #218 / #67: the admin thread's per-principal fence reads the user by (callerNsId, the part of `authenticated`
+    // from authenticatedLocalAt).
+    EXPECT_EQ(g.admin.lastLocalAt, 3u);
+    EXPECT_EQ(g.admin.lastAuthenticated.substr(g.admin.lastLocalAt), "ops");
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", PermissionTable::allowAll(), {}, 0});
     EXPECT_FALSE(g.sendDdl(pc::TemplateId::DropTopic).answered);
     EXPECT_EQ(g.admin.lastAuthenticated, "ops") << "default stays bare";
+    EXPECT_EQ(g.admin.lastCallerNsId, 0u);
+    EXPECT_EQ(g.admin.lastLocalAt, 0u) << "the bare form: the local name starts at 0";
+    EXPECT_EQ(g.admin.lastAuthenticated.substr(g.admin.lastLocalAt), "ops");
 }
 
 // ── Issue #200: the session's list of admin-log reads holds exactly the reads that are pending or live ──────────

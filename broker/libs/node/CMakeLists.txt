@@ -214,6 +214,7 @@ if(BUILD_TESTING)
         tests/node/SecurityApplierTest.cpp
         tests/node/SecurityReadServerTest.cpp
         tests/node/SecurityWritePathTest.cpp
+        tests/node/SecurityAuthzChangeIndexTest.cpp
         tests/node/SecurityAnswerGateTest.cpp
         tests/node/AdminEgressDrainTest.cpp
         tests/node/SecurityServingTest.cpp

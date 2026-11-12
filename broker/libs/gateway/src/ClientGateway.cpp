@@ -9056,6 +9056,13 @@ rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext
     m.targetNsId    = targetNsId;   // namespaces Task 10: the object's resolved namespace (kHiddenNsId = answered missing)
     m.sessionId     = sessionId;
     m.sourceAddress = session.sourceIdentity;   // the Connect image's source, never the declared channel (#227)
+    // Issues #218 / #67: the security state this request is authorized against.  The caller ran its authorization
+    // check on this same control-thread invocation, and the mirror only moves on this thread (kA2cSecurityApplied
+    // frames drain between handler invocations), so the offset read here is the one the check saw.
+    if (securityView_ != nullptr) {
+        m.securityStamped = true;
+        m.securityOffset  = securityView_->appliedOffset();
+    }
     // The authenticated user (Task 11; Task 12 makes the catalog principal carry it too): a view into the session's
     // auth state, copied by the admin ring submit before this frame's handler returns.
     m.callerNsId = sessionNsId_(session);   // namespaces Task 9: the login's namespace (0 = `default` / anonymous)
@@ -9071,6 +9078,8 @@ rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext
             else { ddlPrincipalScratch_.push_back('#'); ddlPrincipalScratch_.append(std::to_string(m.callerNsId)); }
             ddlPrincipalScratch_.push_back('/');
         }
+        // The prefix just built (#218 / #67): where the local user name starts.
+        m.authenticatedLocalAt = static_cast<uint16_t>(ddlPrincipalScratch_.size());
         ddlPrincipalScratch_.append(*user);
         m.authenticated = ddlPrincipalScratch_;
     }

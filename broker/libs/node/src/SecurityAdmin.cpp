@@ -463,6 +463,23 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
             return;
         }
     }
+    // Issues #218 / #67: the gateway authorized (or denied) this request against the `__security` state at the stamped
+    // offset.  This applier is fed by the same log the gateway's mirror follows (the mirror trails it), and a DDL
+    // starts only when no event of ours is in flight, so "applied" is the offset the new event follows.  A change the
+    // gateway did not see (a REVOKE ADMIN of this requester, a GRANT that would lift a denial): the retriable
+    // NotLeader, and the retry is authorized again.  Per principal: only an event applied after the stamp that could
+    // have changed what THIS user may do (SecurityAuthzChangeIndex) makes it stale, so an admin pipelining DDL about
+    // other users never retries.  After the dedupe: a recorded request keeps its result.
+    if (m.meta.securityStamped &&
+        applier_.authzChanges().staleAt(applier_.state().appliedOffset(), m.meta.securityOffset, m.meta.callerNsId,
+                                        m.meta.authenticated, m.meta.authenticatedLocalAt)) {
+        if (++ddlStaleAuthorization_ % 1024 == 1)
+            spdlog::debug("SecurityAdmin: a DDL authorized at __security offset {} met applied offset {} - answered "
+                          "NotLeader (retriable; stale so far: {})", m.meta.securityOffset,
+                          applier_.state().appliedOffset(), ddlStaleAuthorization_);
+        answer_(req, kNotLeader, "the security state changed while this request was in flight; retry");
+        return;
+    }
     // PR #410 review F2: a failed own-credential proof answers ONE refusal, whatever the request names.
     if (m.proofChecked != 0 && !m.denial.empty()) {
         answer_(req, kNotAuthorized, m.denial);

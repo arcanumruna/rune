@@ -39,6 +39,8 @@ namespace {
 struct RecordingSink final : IAdminRequestSink {
     int securityDdls = 0, otherSubmits = 0;
     std::string lastAuthenticated;
+    bool    lastStamped = false;       // issues #218 / #67: the authorization stamp of the last authorized security DDL
+    int64_t lastStampOffset = -2;
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool, const uint8_t*, uint32_t,
                                   uint8_t, int16_t, const rune::protocol::TopicConfigView&, const DdlMetaView&, std::string_view, const rune::protocol::TopicKeyFeatures&,
                                   const std::optional<rune::protocol::LeaseSpec>&) override { ++otherSubmits; return AdminSubmit::Accepted; }
@@ -56,7 +58,9 @@ struct RecordingSink final : IAdminRequestSink {
     std::map<int64_t, std::string> denied;
     AdminSubmit submitSecurityDdl(const pc::SecurityDdl& w, const DdlMetaView& m, std::string_view denial, bool) override {
         if (!denial.empty()) { denied[w.correlationId] = std::string(denial); return AdminSubmit::Accepted; }
-        ++securityDdls; lastAuthenticated = std::string(m.authenticated); return AdminSubmit::Accepted;
+        ++securityDdls; lastAuthenticated = std::string(m.authenticated);
+        lastStamped = m.securityStamped; lastStampOffset = m.securityOffset;
+        return AdminSubmit::Accepted;
     }
     AdminSubmit submitNamespaceDdl(const pc::NamespaceDdlRequest&, const DdlMetaView&, std::string_view, uint16_t) override { return AdminSubmit::Accepted; }
     AdminSubmit submitListNamespaces(int64_t, int64_t, uint32_t, uint16_t, uint32_t, bool) override { return AdminSubmit::Accepted; }
@@ -2848,4 +2852,24 @@ TEST(AuthLogRegression, PerReasonLoginFailureLogLinesAreRateLimitedRegression) {
     for (const char* reason : {"reason=bad-proof", "reason=unknown-user", "reason=disabled", "reason=timeout"})
         EXPECT_EQ(logLinesWith(rig, reason), 1) << reason << ": one line per reason (its own kind), first only";
     EXPECT_EQ(rig.gw.unauthLogSuppressed(), static_cast<uint64_t>(4 * (kPerReason - 1)));
+}
+
+// Issues #218 / #67: the DDL meta states which `__security` state the gateway authorized against, so the admin thread
+// can refuse a request that raced a security change.  Read in the same handler that ran the check.
+TEST(AuthLoginRegression, DdlMetaCarriesTheSecurityOffsetItWasAuthorizedAtRegression) {
+    Rig rig;
+    const auto a = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_EQ(a.fin->errorCode, 0);
+    const int64_t first = rig.view.appliedOffset();
+    rig.send(alterUserFrame(a.sid, 200, "ws1", pc::UserChangeKind::AddPassword, &a));
+    ASSERT_EQ(rig.admin.securityDdls, 1);
+    EXPECT_TRUE(rig.admin.lastStamped);
+    EXPECT_EQ(rig.admin.lastStampOffset, first);
+    // One more event reaches the mirror: the next DDL carries the next offset.
+    applyCreateUser(rig, "fresh", kTestPasswordA, 11);
+    ASSERT_EQ(rig.view.appliedOffset(), first + 1);
+    rig.send(alterUserFrame(a.sid, 201, "ws1", pc::UserChangeKind::AddPassword, &a));
+    ASSERT_EQ(rig.admin.securityDdls, 2);
+    EXPECT_TRUE(rig.admin.lastStamped);
+    EXPECT_EQ(rig.admin.lastStampOffset, first + 1);
 }
