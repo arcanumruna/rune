@@ -577,6 +577,8 @@ bool SubscriberHub::pause_(SubscriptionImpl& impl, int64_t resumeAt, int64_t uns
             ait = activeById_.find(impl.subscriptionId);
             if (ait != activeById_.end() && ait->second == &impl) {
                 bound = true;
+                // Overwrites unsubCorrId / unsubSessionId of an earlier release of this impl: harmless, that one is either answered or
+                // owed (the owed list carries its own ids).
                 const int64_t prevCorr = impl.unsubCorrId, prevSid = impl.unsubSessionId;
                 impl.unsubCorrId    = unsubCorrId;   // trySendUnsubscribe_ reads the two from the impl
                 impl.unsubSessionId = homeSidOf_(impl, sessionId);   // a moved one's own node session

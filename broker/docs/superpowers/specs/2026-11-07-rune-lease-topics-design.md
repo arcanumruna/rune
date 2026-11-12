@@ -1154,7 +1154,7 @@ hold one session per client, for example one per tenant client for case claims (
     (`NotLeader`, `Throttled`, `NamespaceSuspended`), a timeout or missing reply, a disconnect, or a long park.
   - **Not terminal.** The session keeps sending keepalives. An `Ok` before `M` fires `Cleared`, and the lease was held
     throughout. If no `Ok` comes by `M`, `onLost` follows. `Entered` fires at most once per episode.
-  - **Produce deadline (R5).** A producer can be bound to a lease (`ProducerOptions.guard = ref`, up to 8 producers
+  - **Produce deadline (R5).** A producer can be bound to a lease (`LeaseSession::bindProducer(ref, producer)`, up to 8 producers
     per lease, on the session's client).
     - At `Entered`, before the callback runs, the client fails every **pending** produce of the bound producers with
       `OpStatus::DeliveryFailed` and `errorCode = LeaseAtRisk`. A pending produce was sent and is not acked, so its

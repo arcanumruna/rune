@@ -550,7 +550,8 @@ in `client-cpp/include/rune/client/lease/`. The full contract is in the header,
 
 - `closeAsync()` returns at once and never calls `client.doWork()`. It cancels the subscriptions and makes outstanding scans
   stale. `doWork` then drops what is left and emits no event. Safe to call from inside a handler: the event being delivered
-  still reaches the observers and the bound name. From an application thread in Thread mode each cancel hands a command to the
+  still reaches the observers and the bound name. A closed watch emits nothing more, so whatever waits on one of its events (a recipe
+  with a pending acquire, say) is not told: the application must tell it, or `restart()` the watch. From an application thread in Thread mode each cancel hands a command to the
   duty thread and waits (never throws) while the command ring is full.
 - `isClosed()` is true for `Fresh` and `Closed`. A watch that is closed is destroyed at once, without touching the client.
 - `restart(prefixes)` runs a closed watch again in place, over the same live table, names, handler, observers and buffers.
