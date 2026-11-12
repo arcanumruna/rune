@@ -133,10 +133,10 @@ TEST(AuthorizerRegression, DetailTextIsBuiltOnlyFromTheRequest) {
     ASSERT_TRUE(hidden.has_value());
     ASSERT_TRUE(missing.has_value());
     EXPECT_EQ(hidden->code, 45);
-    EXPECT_EQ(hidden->detail, "not authorized: READ on TOPIC 0");
-    EXPECT_EQ(missing->detail, "not authorized: READ on TOPIC 77");
-    EXPECT_EQ(rg::authorizeName(t, ResourceType::Topic, "t1", Operation::Drop, 0)->detail, "not authorized: DROP on TOPIC t1");
-    EXPECT_EQ(rg::authorizeCluster(t, Operation::Admin)->detail, "not authorized: ADMIN on CLUSTER");
+    EXPECT_EQ(hidden->detail(), "not authorized: READ on TOPIC 0");
+    EXPECT_EQ(missing->detail(), "not authorized: READ on TOPIC 77");
+    EXPECT_EQ(rg::authorizeName(t, ResourceType::Topic, "t1", Operation::Drop, 0)->detail(), "not authorized: DROP on TOPIC t1");
+    EXPECT_EQ(rg::authorizeCluster(t, Operation::Admin)->detail(), "not authorized: ADMIN on CLUSTER");
 }
 
 TEST(AuthorizerRegression, DescribeOnClusterTurnsAMissingIdIntoTheExistingUnknownTopic) {   // D22
@@ -168,7 +168,31 @@ TEST(AuthorizerRegression, AnOverlongNameIsCutInTheDetailIdenticallyForHiddenAnd
     auto t = rg::PermissionTable::denyAll();
     const auto d = rg::authorizeName(t, ResourceType::Topic, std::string(5000, 'x'), Operation::Drop, 0);
     ASSERT_TRUE(d.has_value());
-    EXPECT_LE(d->detail.size(), 300u);
+    EXPECT_LE(d->detail().size(), 300u);
+}
+
+// #263: the detail text lives in a fixed buffer; it must be byte for byte what the std::string build produced.
+TEST(AuthorizerRegression, TheDetailTextsAreUnchangedByTheFixedBufferRegression) {
+    auto t = rg::PermissionTable::denyAll();
+    EXPECT_EQ(rg::authorizeName(t, ResourceType::Topic, "orders", Operation::Write, 0)->detail(),
+              "not authorized: WRITE on TOPIC orders");
+    const std::string exact(rg::kMaxNameInDetail, 'x'), longer(rg::kMaxNameInDetail + 1, 'y');
+    EXPECT_EQ(rg::authorizeName(t, ResourceType::Topic, exact, Operation::Read, 0)->detail(),
+              "not authorized: READ on TOPIC " + exact);
+    EXPECT_EQ(rg::authorizeName(t, ResourceType::Topic, longer, Operation::Read, 0)->detail(),
+              "not authorized: READ on TOPIC " + std::string(rg::kMaxNameInDetail, 'y') + "...");
+    EXPECT_EQ(rg::authorizeCluster(t, Operation::Admin)->detail(), "not authorized: ADMIN on CLUSTER");
+    EXPECT_EQ(rg::authorizeAnyGrant(t, ResourceType::Topic, Operation::Write)->detail(),
+              "not authorized: WRITE on any TOPIC");
+    rg::ObjectIndex idx;
+    EXPECT_EQ(rg::authorizeTopicId(t, -2147483647 - 1, Operation::Read, idx)->detail(),
+              "not authorized: READ on TOPIC -2147483648") << "the widest id fits the 12-byte buffer";
+    EXPECT_EQ(rg::authorizeViewSource(t, 41)->detail(), "not authorized: READ on TOPIC 41");
+    // The longest text the Authorizer can build (TRUNCATE on TRANSACTIONAL_ID with an over-long name) fits whole.
+    const auto widest = rg::authorizeName(t, ResourceType::TransactionalId, longer, Operation::Truncate, 0);
+    ASSERT_TRUE(widest.has_value());
+    EXPECT_EQ(widest->detail(), "not authorized: TRUNCATE on TRANSACTIONAL_ID " + std::string(rg::kMaxNameInDetail, 'y') + "...");
+    EXPECT_LE(widest->detail().size(), rg::kDenialDetailBytes);
 }
 
 // #640: a name of another namespace is never authorized by a non-root table, even if a grant pattern matches the
@@ -379,7 +403,7 @@ TEST(AuthorizerRegression, AViewGrantNeverDescribesATopicRegression) {
     const auto denied = rg::authorizeTopicOrViewName(viewOnly, "payments", Operation::Describe, idx, 0);
     ASSERT_TRUE(denied.has_value()) << "a VIEW grant must not describe the topic 'payments'";
     EXPECT_EQ(denied->code, 45);
-    EXPECT_EQ(denied->detail, "not authorized: DESCRIBE on TOPIC payments") << "the text always says TOPIC (D23)";
+    EXPECT_EQ(denied->detail(), "not authorized: DESCRIBE on TOPIC payments") << "the text always says TOPIC (D23)";
     EXPECT_TRUE(rg::authorizeTopicOrViewName(topicOnly, "payboard", Operation::Describe, idx, 0).has_value())
         << "a TOPIC grant must not describe the view 'payboard'";
     EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payboard", Operation::Describe, idx, 0).has_value());
@@ -422,7 +446,7 @@ TEST(PermissionTableRegression, HasAnyGrantCountsEveryPatternOfThatTypeAndOpRegr
     const auto d = rg::authorizeAnyGrant(none, ResourceType::Topic, Operation::Write);
     ASSERT_TRUE(d.has_value());
     EXPECT_EQ(d->code, 45);
-    EXPECT_EQ(d->detail, "not authorized: WRITE on any TOPIC");
+    EXPECT_EQ(d->detail(), "not authorized: WRITE on any TOPIC");
     const auto w = rg::PermissionTable::compile(std::vector<rs::GrantSpec>{g(Operation::Write, ResourceType::Topic, PatternKind::Prefix, "x")}, idx);
     EXPECT_FALSE(rg::authorizeAnyGrant(w, ResourceType::Topic, Operation::Write).has_value());
 }

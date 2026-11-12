@@ -14,6 +14,7 @@
 #include <rune/protocol/ProducerIdBinding.h>
 #include <rune/crypto/Scram.h>
 #include <cassert>
+#include <charconv>
 #include <flight_recorder/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/gateway/GatewayReplicaView.h>
@@ -9144,7 +9145,7 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
                                                      m.keyField, m.validate, m.descriptorBlob, m.descriptorLen,
                                                      m.persistence, m.replicationFactor, m.config,
                                                      ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session, res.nsId),
-                                                     adopt ? std::string_view(adopt->detail) : std::string_view{},
+                                                     adopt ? adopt->detail() : std::string_view{},
                                                      m.hasKeyFeatures ? m.keyFeatures : rune::protocol::TopicKeyFeatures{},
                                                      m.hasLease ? std::optional<rune::protocol::LeaseSpec>(m.lease) : std::nullopt),
                        "DefineTopic: admin ring full", "DefineTopic: request larger than the admin ring message");
@@ -9872,8 +9873,13 @@ void ClientGateway::onCatalogObjectDropped(int32_t id)
 
 rune::gateway::Denial ClientGateway::refusedProducerIdDenial_(int64_t producerId)
 {
-    return rune::gateway::Denial{static_cast<uint16_t>(pc::ErrorCode::NotAuthorized),
-                                 "not authorized: WRITE on PRODUCER_ID " + std::to_string(producerId)};
+    rune::gateway::Denial d;
+    d.code = static_cast<uint16_t>(pc::ErrorCode::NotAuthorized);
+    std::array<char, 24> id{};
+    const auto end = std::to_chars(id.data(), id.data() + id.size(), producerId).ptr;
+    d.append("not authorized: WRITE on PRODUCER_ID ");
+    d.append(std::string_view(id.data(), static_cast<std::size_t>(end - id.data())));
+    return d;
 }
 
 void ClientGateway::noteDenied_(const Session& session, pc::TemplateId tid, const rune::gateway::Denial& denial)
@@ -9884,7 +9890,7 @@ void ClientGateway::noteDenied_(const Session& session, pc::TemplateId tid, cons
         if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) user = a->user.c_str();
         spdlog::warn("auth: request refused user={} session={} template={}: {} (refusals so far: {})",
                      LogSafeName{user}, session.sessionId,
-                     static_cast<uint16_t>(tid), denial.detail, notAuthorizedAnswers_);
+                     static_cast<uint16_t>(tid), denial.detail(), notAuthorizedAnswers_);
     }
 }
 
@@ -9925,7 +9931,7 @@ bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::D
         case pc::TemplateId::NamespaceDdl: {
             pc::DdlResponse r;
             r.sessionId = hdr->sessionId; r.correlationId = hdr->correlationId;
-            r.errorCode = denial->code; r.detail = denial->detail;
+            r.errorCode = denial->code; r.detail = std::string(denial->detail());
             if (r.fits() && r.encodedSize() <= scratch_.size()) {
                 sendAnswer_(session, scratch_.data(), r.encode(scratch_.data()));
                 return true;
@@ -9937,7 +9943,7 @@ bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::D
     if (!answerRejection_(session, *hdr, denial->code, "not authorized", buf, len)) {
         pc::ErrorResponse er;
         er.sessionId = hdr->sessionId; er.correlationId = hdr->correlationId;
-        er.code = static_cast<int16_t>(denial->code); er.message = denial->detail;
+        er.code = static_cast<int16_t>(denial->code); er.message = std::string(denial->detail());
         if (pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 + er.message.size() <= scratch_.size())
             sendAnswer_(session, scratch_.data(), er.encode(scratch_.data()));
     }
@@ -10650,7 +10656,7 @@ void ClientGateway::executeLiveActions_(Session& s, const rune::gateway::LiveAct
     const PermissionTable& perms = permsOf_(s);
     for (const EndSubscription& e : act.ends) {
         const auto d = authorizeTopicId(perms, e.topicId, rune::security::Operation::Read, objectIndex_);
-        const std::string_view detail = d ? std::string_view(d->detail) : std::string_view("not authorized");
+        const std::string_view detail = d ? d->detail() : std::string_view("not authorized");
         // Issue #109: a WORKER-pushed subscription (per-worker egress) is ended by its push owner - the worker writes
         // its Records on its own publication, so only it can put the terminal NotAuthorized AFTER its last Records.
         // The ending Unsubscribe is queued behind the subscription's Subscribe (never dropped) and the event's
@@ -10668,14 +10674,14 @@ void ClientGateway::executeLiveActions_(Session& s, const rune::gateway::LiveAct
         forwardCatalogUnsubscribe_(s.sessionId, rune::gateway::kEndCatalogReadsOnly);
         const auto d = authorizeCluster(perms, rune::security::Operation::Describe);
         for (const int64_t corr : s.catalogReadCorrs)
-            sendErrorOn_(s, corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized), d ? std::string_view(d->detail) : std::string_view("not authorized"));
+            sendErrorOn_(s, corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized), d ? d->detail() : std::string_view("not authorized"));
         s.catalogReadCorrs.clear();
     }
     if (act.endSecurityReads) {
         forwardCatalogUnsubscribe_(s.sessionId, rune::gateway::kEndSecurityReadsOnly);
         const auto d = authorizeCluster(perms, rune::security::Operation::Admin);
         for (const int64_t corr : s.securityReadCorrs)
-            sendErrorOn_(s, corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized), d ? std::string_view(d->detail) : std::string_view("not authorized"));
+            sendErrorOn_(s, corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized), d ? d->detail() : std::string_view("not authorized"));
         s.securityReadCorrs.clear();
     }
     // Task 4: a lost WRITE grant aborts the session's open transactions (they could no longer be ended by it).
@@ -10866,7 +10872,7 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
     }
     answerAdminSubmit_(buf, len,
                        adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session, 0),
-                                                     denial ? std::string_view(denial->detail) : std::string_view{},
+                                                     denial ? denial->detail() : std::string_view{},
                                                      proofChecked),
                        "SecurityDdl: admin ring full", "SecurityDdl: request larger than the admin ring message");
 }
@@ -10907,7 +10913,7 @@ void ClientGateway::handleNamespaceDdl(const uint8_t* buf, std::size_t len)
     if (denial) noteDenied_(*session, pc::TemplateId::NamespaceDdl, *denial);
     answerAdminSubmit_(buf, len,
                        adminSink_->submitNamespaceDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session, 0),
-                                                      denial ? std::string_view(denial->detail) : std::string_view{},
+                                                      denial ? denial->detail() : std::string_view{},
                                                       static_cast<uint16_t>(session->clientVersion)),
                        "NamespaceDdl: admin ring full", "NamespaceDdl: request larger than the admin ring message");
 }
@@ -11057,7 +11063,7 @@ std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(S
     // Issue #114.  Every failure is the same text (it never says which part failed) and counts as a failed login on
     // the throttle: a proof is a password guess.  Cold path (security DDL rate).
     rune::gateway::Denial refused;
-    refused.detail = std::string(rune::gateway::kOwnCredentialProofRefusal);
+    refused.append(rune::gateway::kOwnCredentialProofRefusal);
     // A retry of a request the leader already applied (chargeThrottle false) is neither throttled nor charged: the
     // leader answers it from its dedupe table whatever this verdict says.
     if (chargeThrottle) {

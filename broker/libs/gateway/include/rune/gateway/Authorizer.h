@@ -3,10 +3,13 @@
 // the only place a NotAuthorized code or detail text is chosen (D23): `not authorized: <OP> on <TYPE> <requested name
 // or id>`, built ONLY from the request, so a hidden object and a missing one answer identically.
 //
-// Pure functions of (table, request): no allocation on the granted path (the Denial is built only on a refusal).
+// Pure functions of (table, request): no allocation on the granted path, nor on a refusal (the Denial text is a fixed
+// buffer, #263).
 #include <rune/gateway/ObjectIndex.h>
 #include <rune/gateway/PermissionTable.h>
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -14,9 +17,27 @@
 
 namespace rune::gateway {
 
+/// The longest part of a requested name the detail text carries (cut identically for hidden and missing objects).
+inline constexpr std::size_t kMaxNameInDetail = 256;
+/// "not authorized: " (16) + the longest operation name (TRUNCATE / DESCRIBE, 8) + " on " (4) + the longest type name
+/// (TRANSACTIONAL_ID, 16) + ' ' (1) + kMaxNameInDetail + "..." (3), rounded up to a multiple of 16.  The text built by
+/// the Authorizer always fits (a unit test pins the longest case); `append` truncates silently should it ever not.
+inline constexpr std::size_t kDenialDetailBytes = ((16 + 8 + 4 + 16 + 1 + kMaxNameInDetail + 3) + 15) / 16 * 16;
+
+/// A refusal: the code and the D23 detail text, in a fixed buffer so a denied request allocates nothing (#263).
 struct Denial {
     uint16_t code = 45;   // ErrorCode::NotAuthorized
-    std::string detail;   // D23
+    std::array<char, kDenialDetailBytes> text{};
+    uint16_t len = 0;     // kDenialDetailBytes does not fit a byte: the name part alone may be kMaxNameInDetail (256)
+
+    [[nodiscard]] std::string_view detail() const noexcept { return {text.data(), len}; }   // D23
+    /// Appends as much of `s` as fits; truncates silently, never overflows.
+    void append(std::string_view s) noexcept {
+        const std::size_t room = text.size() - len;
+        const std::size_t n = s.size() < room ? s.size() : room;
+        for (std::size_t i = 0; i < n; ++i) text[len + i] = s[i];
+        len = static_cast<uint16_t>(len + n);
+    }
 };
 
 /// Id-addressed (Produce / Subscribe / group topics / txn partitions / views): `op` on the object `topicId`.  D22: a
