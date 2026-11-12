@@ -3277,6 +3277,7 @@ private:
     void onControlRecordRefused_(const rune::node::WorkerReturn& ret);
     void onControlRecordAppended_(const rune::node::WorkerReturn& ret);
     uint64_t controlRecordsRefused_ = 0;
+    uint64_t controlRecordsRefusedInternalId_ = 0;   // #215: appendControlRecord given a negative (internal) topic id
     uint64_t leaseReturnMalformed_  = 0;   // lease worker returns with a bad count / chunk (a broker bug), answered Internal
     uint64_t leaseEnqueueTooLarge_  = 0;   // lease requests that can never fit one worker-ingress frame, answered MessageTooLarge
     uint64_t produceBackPressured_  = 0;   // M5: produces answered NotLeader on back-pressure
@@ -3563,6 +3564,9 @@ private:
     int  pumpSubOps_();
 public:
     [[nodiscard]] uint64_t controlRecordsRefusedForTest() const noexcept { return controlRecordsRefused_; }
+    [[nodiscard]] uint64_t controlRecordsRefusedInternalIdForTest() const noexcept {
+        return controlRecordsRefusedInternalId_;
+    }
     [[nodiscard]] std::size_t markersInFlightForTest() const noexcept { return markersInFlight_.size(); }
     [[nodiscard]] std::size_t markersQueuedForTest() const noexcept { return markerSendQueue_.size(); }
     [[nodiscard]] std::size_t pendingSubOpsForTest() const noexcept {

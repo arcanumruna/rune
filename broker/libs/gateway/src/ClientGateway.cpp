@@ -12074,6 +12074,12 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
                                             int64_t producerId, bool commit,
                                             int32_t coordinatorEpoch)
 {
+    // #215: a control marker only ever targets a user topic; a negative (internal) id is refused and counted.
+    if (topicId < 0) {
+        ++controlRecordsRefusedInternalId_;
+        spdlog::warn("ClientGateway::appendControlRecord: internal topicId={} refused", topicId);
+        return -1;
+    }
     if (!topicRegistry_) {
         spdlog::warn("ClientGateway::appendControlRecord: no TopicRegistry — dropped");
         return -1;
