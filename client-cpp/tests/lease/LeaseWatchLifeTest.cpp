@@ -80,9 +80,11 @@ TEST(LeaseWatchLifeRegression, DestructorOfClosedWatchDoesNoWorkRegression) {
     w->closeAsync();
     for (int i = 0; i < kCap && !w->isClosed(); ++i) r.round(*w);
     ASSERT_TRUE(w->isClosed());
-    const uint64_t before = r.client->dutyCyclesForTest();
+    const uint64_t before   = r.client->dutyCyclesForTest();
+    const std::size_t unsub = r.gw.unsubscribed.size();
     w.reset();
     EXPECT_EQ(r.client->dutyCyclesForTest(), before) << "the destructor of a closed watch pumps nothing";
+    EXPECT_EQ(r.gw.unsubscribed.size(), unsub) << "and sends nothing";
 }
 
 TEST(LeaseWatchLifeRegression, CloseAsyncInsideHandlerRegression) {
@@ -1650,9 +1652,10 @@ TEST(LeaseWatchThreadRegression, ThreadModeClosedWatchOutlivesClientRegression) 
     t->stopPump();
     t->topic.reset();
     t->gw.reset();
+    const bool closedBefore = w->isClosed();
     t->client.reset();   // the client is gone
-    w.reset();           // and the closed watch is destroyed without touching it
-    SUCCEED();
+    w.reset();           // and the closed watch is destroyed without touching it (a use of the dead client is the sanitizer legs' finding)
+    EXPECT_TRUE(closedBefore) << "the watch was Closed when the client went away";
 }
 
 }  // namespace

@@ -171,7 +171,7 @@ struct Rig {
 // ---- one client: lease topic handle, session, completions, transactional producer ----
 class Actor {
 public:
-    Actor(Rig& rig, int k, int clockIdx, int avoid = -1) : rig_(rig), idx_(clockIdx) {
+    Actor(Rig& rig, int k, int clockIdx, int avoid = -1) : idx_(clockIdx) {
         client = std::make_unique<rc::Client>(rig.config(k, clockIdx, avoid));
         client->connectAndWait(30s);
         cq = std::make_unique<rc::Completions>(*client);
@@ -213,7 +213,6 @@ public:
         rc::OpResult err = rc::OpResult::Accepted;
         ref = session->add(*lt, claimRow("role/1"), g.version, static_cast<int64_t>(ttlMs), sentNs_, &err);
         ASSERT_EQ(err, rc::OpResult::Accepted);
-        ttlMs_ = ttlMs;
     }
 
     rc::Producer& makeProducer(const std::string& txnId) {
@@ -269,10 +268,8 @@ public:
     std::map<rc::Token, rc::Completion> got;
 
 private:
-    Rig&     rig_;
     int      idx_;
     int64_t  sentNs_ = 0;
-    uint64_t ttlMs_  = 0;
     rc::Token tok_   = 0;
 };
 
