@@ -2716,3 +2716,136 @@ TEST(HeldLoginFinalRegression, AClosedHeldSessionLeavesTheListRegression) {
     EXPECT_EQ(h.finalsOf(f.sid), 1u);
     EXPECT_EQ(h.finalsOf(g.sid), 1u);
 }
+
+// ===========================================================================
+// Issue #146 (M4): every unauthenticated log line is rate limited per KIND - the first occurrence logs, the rest only
+// bump the suppression count (counter rune-unauth-log-suppressed is the gateway's own count plus the workers').
+// Deleting the due() at any one site must turn exactly its test red.
+//
+// | kind            | site                | flood                            | test (AuthLogRegression.)
+// | 0 require-TLS   | handleConnect       | plaintext Connects, require_tls  | RequireTlsRefusalLogLines...
+// | 1 rate limited  | first leg           | first legs inside the delay      | RateLimitedFirstLegLogLines...
+// | 1 rate limited  | final leg           | parked finals inside the delay   | RateLimitedFinalLegLogLines...
+// | 2 and 7 halted  | first leg           | first legs on a halted view      | HaltedFirstLegLogLines...
+// | 8+halted and 7  | final leg           | halt between the legs            | HaltedFinalLegLogLines...
+// | 8+reason        | final leg           | wrong, unknown, disabled, late   | PerReasonLoginFailureLogLines...
+// Not covered here: kinds 3-6, 15-21 are other sites (bootstrap, malformed, worker bind); 8+reason "no-credentials"
+// is reached only with a user that has no password, and the "no-randomness" line is not rate limited at all.
+// ===========================================================================
+namespace {
+int logLinesWith(const Rig& rig, const std::string& needle) {
+    int n = 0;
+    for (const std::string& l : rig.logSink->last_formatted()) if (l.find(needle) != std::string::npos) ++n;
+    return n;
+}
+std::string floodHost(int i) { return "10.9." + std::to_string(i / 200) + "." + std::to_string(i % 200 + 1); }
+}  // namespace
+
+TEST(AuthLogRegression, RequireTlsRefusalLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    rig.gw.setRequireTls(true);
+    constexpr int kFlood = 30;
+    for (int i = 0; i < kFlood; ++i) (void)connectFrom(rig, floodHost(i));
+    EXPECT_EQ(logLinesWith(rig, "require_tls rejecting a plaintext Connect"), 1) << "first only";
+    EXPECT_EQ(rig.gw.unauthLogSuppressed(), static_cast<uint64_t>(kFlood - 1));
+}
+
+TEST(AuthLogRegression, RateLimitedFirstLegLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    for (int i = 0; i < 3; ++i) (void)rig.login("ws2", {"wrong password", ""});   // the 3rd failure starts the delay
+    ASSERT_EQ(rig.gw.loginsFailed(), 3u);
+    const uint64_t suppressedBefore = rig.gw.unauthLogSuppressed();
+    constexpr int kFlood = 25;
+    for (int i = 0; i < kFlood; ++i) {
+        const auto o = rig.login("ws2", {kTestPasswordA, ""});
+        ASSERT_TRUE(o.fin.has_value()) << i;
+        EXPECT_GT(o.fin->retryAfterMs, 0u) << i << ": inside the delay";
+    }
+    EXPECT_EQ(rig.gw.loginsRateLimited(), static_cast<uint64_t>(kFlood));
+    EXPECT_EQ(logLinesWith(rig, "auth: rate limited user=ws2"), 1) << "first only";
+    EXPECT_EQ(rig.gw.unauthLogSuppressed() - suppressedBefore, static_cast<uint64_t>(kFlood - 1));
+}
+
+TEST(AuthLogRegression, RateLimitedFinalLegLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    constexpr int kSessions = 25;
+    std::vector<FirstLeg> legs;
+    for (int i = 0; i < kSessions; ++i) {   // every first leg is allowed: no failure has been recorded yet
+        legs.push_back(sendFirst(rig, "ws1"));
+        ASSERT_TRUE(legs.back().first.has_value()) << i;
+    }
+    for (int i = 0; i < 3; ++i) rig.send(finalFor(legs[static_cast<std::size_t>(i)], "ws1", {"wrong", "wrong too"}));
+    ASSERT_EQ(rig.gw.loginsFailed(), 3u);
+    ASSERT_EQ(logLinesWith(rig, "auth: rate limited"), 0);
+    const uint64_t suppressedBefore = rig.gw.unauthLogSuppressed();
+    for (int i = 3; i < kSessions; ++i)
+        rig.send(finalFor(legs[static_cast<std::size_t>(i)], "ws1", {kTestPasswordA, ""}));
+    constexpr int kLimited = kSessions - 3;
+    EXPECT_EQ(rig.gw.loginsRateLimited(), static_cast<uint64_t>(kLimited));
+    EXPECT_EQ(logLinesWith(rig, "auth: rate limited user=ws1"), 1) << "first only";
+    EXPECT_EQ(rig.gw.unauthLogSuppressed() - suppressedBefore, static_cast<uint64_t>(kLimited - 1));
+}
+
+TEST(AuthLogRegression, HaltedFirstLegLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    rune::security::ApplyError err; err.offset = 3; err.detail = "test halt";
+    rig.view.onHalted(err);
+    constexpr int kFlood = 25;
+    for (int i = 0; i < kFlood; ++i) {
+        const auto o = rig.login("ws1", {kTestPasswordA, ""}, floodHost(i));
+        ASSERT_TRUE(o.fin.has_value()) << i;
+        EXPECT_EQ(o.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable)) << i;
+    }
+    EXPECT_EQ(rig.gw.loginsUnavailable(), static_cast<uint64_t>(kFlood));
+    EXPECT_EQ(logLinesWith(rig, "reason=security-halted"), 1) << "kind 2: first only";
+    EXPECT_EQ(logLinesWith(rig, "reason=security-not-current"), 1) << "kind 7 (unavailableLogin_): first only";
+    EXPECT_EQ(rig.gw.unauthLogSuppressed(), static_cast<uint64_t>(2 * (kFlood - 1)));
+}
+
+TEST(AuthLogRegression, HaltedFinalLegLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    std::vector<std::unique_ptr<SecurityView>> views;
+    constexpr int kFlood = 25;
+    for (int i = 0; i < kFlood; ++i) {
+        views.push_back(std::make_unique<SecurityView>(rig.chain.state()));
+        SecurityView* v = views.back().get();
+        rig.gw.setAuthMode(GatewayAuthMode::Required, v);
+        const int64_t sid = rig.newSession(floodHost(i));
+        const auto fin = loginWithBetweenLegs(rig, sid, "ws1", kTestPasswordA, [v] {
+            rune::security::ApplyError err; err.offset = 3; err.detail = "test halt between the legs";
+            v->onHalted(err);
+        });
+        ASSERT_TRUE(fin.has_value()) << i;
+        EXPECT_EQ(fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable)) << i;
+    }
+    EXPECT_EQ(rig.gw.loginsUnavailable(), static_cast<uint64_t>(kFlood));
+    EXPECT_EQ(logLinesWith(rig, "reason=security-halted"), 1) << "kind 8+SecurityHalted: first only";
+    EXPECT_EQ(logLinesWith(rig, "reason=security-not-current"), 1) << "kind 7 (unavailableLogin_): first only";
+    EXPECT_EQ(rig.gw.unauthLogSuppressed(), static_cast<uint64_t>(2 * (kFlood - 1)));
+}
+
+TEST(AuthLogRegression, PerReasonLoginFailureLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    constexpr int kPerReason = 8;
+    int host = 0;
+    for (int i = 0; i < kPerReason; ++i) {
+        rig.gw_now += 600'000'000'000;   // far past any throttle delay: no attempt is refused as rate limited
+        rig.gw.setNowNsForTest(rig.gw_now);
+        (void)rig.login("ws2", {"not the password", ""}, floodHost(host++));         // bad-proof
+        (void)rig.login("nobody", {kTestPasswordA, kTestPasswordA}, floodHost(host++));   // unknown-user
+        (void)rig.login("off", {kTestPasswordA, ""}, floodHost(host++));              // disabled
+        const std::string h = floodHost(host++);   // timeout: the final arrives after the session's deadline
+        rig.gw_now += 10'000'000'000;
+        rig.gw.setNowNsForTest(rig.gw_now);
+        const FirstLeg late = sendFirst(rig, "ws2", h, rig.gw_now);
+        ASSERT_TRUE(late.first.has_value()) << i;
+        rig.gw_now += 2'000'000'000;
+        rig.gw.setNowNsForTest(rig.gw_now);
+        rig.send(finalFor(late, "ws2", {kTestPasswordA, ""}));
+    }
+    ASSERT_EQ(rig.gw.loginsFailed(), static_cast<uint64_t>(4 * kPerReason)) << "no attempt was rate limited";
+    EXPECT_EQ(rig.gw.loginsRateLimited(), 0u);
+    for (const char* reason : {"reason=bad-proof", "reason=unknown-user", "reason=disabled", "reason=timeout"})
+        EXPECT_EQ(logLinesWith(rig, reason), 1) << reason << ": one line per reason (its own kind), first only";
+    EXPECT_EQ(rig.gw.unauthLogSuppressed(), static_cast<uint64_t>(4 * (kPerReason - 1)));
+}

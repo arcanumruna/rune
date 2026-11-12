@@ -7,6 +7,7 @@
 
 #include <rune/node/RuneMetricSlot.h>
 #include <rune/node/RuneMetrics.h>
+#include <rune/node/Worker.h>
 
 #include <gtest/gtest.h>
 
@@ -590,4 +591,23 @@ TEST(BrokerMetricsRegression, ThreeWritersUnderTsanRegression) {
     EXPECT_EQ(bad.load(), 0) << "a row was missing or out of range mid-write";
     EXPECT_EQ(b.counter(typeIdOf(RuneMetric::Role)), static_cast<std::int64_t>(RoleCode::Leader));
     EXPECT_TRUE(b.awaitCounter(typeIdOf(RuneMetric::LoginsFailed), 2));
+}
+
+// Issue #146 (M5): with authentication Enabled EVERY worker of the node enforces WRITE on its direct ingress
+// (requireEnforcement in BrokerNode::start); with authentication off none does.  RED: skip any one worker in the loop.
+TEST(BrokerNodeRegression, EveryWorkerIsEnforcingWhenAuthIsEnabledRegression) {
+    constexpr int32_t kWorkers = 3;
+    for (const AuthMode mode : {AuthMode::Enabled, AuthMode::InProcessUnauthenticated}) {
+        AuthBroker::Options o;
+        o.mode = mode;
+        o.configure = [](NodeConfig& c) { c.workerCount = kWorkers; };
+        AuthBroker b(mode == AuthMode::Enabled ? "enforceon" : "enforceoff", o);
+        ASSERT_EQ(b.node().workerCountForTest(), kWorkers);
+        // Set once at start, before any runner starts; a legacy-mode worker never reassigns it.
+        for (int32_t w = 0; w < kWorkers; ++w) {
+            Worker* wk = b.node().workerForTest(w);
+            ASSERT_NE(wk, nullptr) << w;
+            EXPECT_EQ(wk->enforcingForTest(), mode == AuthMode::Enabled) << "worker " << w;
+        }
+    }
 }

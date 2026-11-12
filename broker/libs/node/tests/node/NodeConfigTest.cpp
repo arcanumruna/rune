@@ -335,6 +335,20 @@ TEST(NodeConfigRegression, TooManyWorkersPeersOrNodeIdRefusedWhenAuthEnabledRegr
         EXPECT_NE(err->find("RUNE_PEERS"), std::string::npos) << *err;
     }
     {
+        // A PEER id out of range while this node's own id is fine: only the peer check can refuse it.
+        auto e = shard1();
+        e["RUNE_PEERS"] = "0@rune-1:40111,70000@rune-2:40111";
+        auto r = parseNodeConfig(fakeEnv(e));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        const auto err = r.config->validateAuthTopology();
+        ASSERT_TRUE(err.has_value()) << "a peer id above 65535 must refuse even though this node's id is in range";
+        EXPECT_NE(err->find("RUNE_PEERS node id 70000"), std::string::npos) << *err;
+        EXPECT_NE(err->find("65535"), std::string::npos) << *err;
+    }
+    {
+        // This node's own id out of range.  The own id must be listed in RUNE_PEERS (parse refuses otherwise), so the
+        // peers loop sees it first and names it: the separate RUNE_NODE_ID check in validateAuthTopology is a
+        // second line of defence no config can reach on its own.  Pinned: the refusal exists and names the id.
         auto e = shard1();
         e["RUNE_NODE_ID"] = "70000";
         e["RUNE_PEERS"] = "70000@rune-1:40111";
@@ -342,6 +356,7 @@ TEST(NodeConfigRegression, TooManyWorkersPeersOrNodeIdRefusedWhenAuthEnabledRegr
         ASSERT_TRUE(r.config.has_value()) << r.error;
         const auto err = r.config->validateAuthTopology();
         ASSERT_TRUE(err.has_value());
+        EXPECT_NE(err->find("70000"), std::string::npos) << *err;
         EXPECT_NE(err->find("65535"), std::string::npos) << *err;
     }
 }
