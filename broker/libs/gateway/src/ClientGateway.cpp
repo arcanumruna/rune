@@ -9947,7 +9947,7 @@ bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::D
         case pc::TemplateId::NamespaceDdl: {
             pc::DdlResponse r;
             r.sessionId = hdr->sessionId; r.correlationId = hdr->correlationId;
-            r.errorCode = denial->code; r.detail = std::string(denial->detail());
+            r.errorCode = denial->code; r.detail = denial->detail();   // views: the Denial outlives the encode
             if (r.fits() && r.encodedSize() <= scratch_.size()) {
                 sendAnswer_(session, scratch_.data(), r.encode(scratch_.data()));
                 return true;
@@ -9959,7 +9959,7 @@ bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::D
     if (!answerRejection_(session, *hdr, denial->code, "not authorized", buf, len)) {
         pc::ErrorResponse er;
         er.sessionId = hdr->sessionId; er.correlationId = hdr->correlationId;
-        er.code = static_cast<int16_t>(denial->code); er.message = std::string(denial->detail());
+        er.code = static_cast<int16_t>(denial->code); er.message = denial->detail();
         if (pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 + er.message.size() <= scratch_.size())
             sendAnswer_(session, scratch_.data(), er.encode(scratch_.data()));
     }
