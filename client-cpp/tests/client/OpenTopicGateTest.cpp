@@ -34,7 +34,6 @@
 #include <filesystem>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -76,12 +75,12 @@ struct GateGateway {
     int32_t ingressStream = 0;
     int32_t egressStream  = 0;
 
-    // onFrame runs on the pump thread: a test that changes the reply fields after the pump started holds `mu`.
-    std::mutex mu;
+    // onFrame runs on the pump thread: a test reads or changes these fields only while no pump runs (before it starts, or inside
+    // GateGatewayPump::paused, whose join/restart orders the accesses) - no shared sync.
 
     bool replyConnectOK      = true;
     bool replyGetTopicSchema = true;
-    std::atomic<int> getTopicSchemaSeen{0};   // GetTopicSchema requests that reached the gateway (a skipped probe sends none)
+    int  getTopicSchemaSeen = 0;         // GetTopicSchema requests that reached the gateway (a skipped probe sends none)
     int  getTopicSchemaAnswers = -1;   // answer only this many GetTopicSchema requests (-1 = all)
     std::vector<bool> defineValidate;   // the validate byte of every DefineTopic that reached the gateway
 
@@ -192,7 +191,6 @@ struct GateGateway {
         case rcc::TemplateId::GetTopicSchema: {
             auto opt = rpc::GetTopicSchema::decode(buf, len);
             if (opt) ++getTopicSchemaSeen;
-            std::unique_lock lk(mu);
             if (!opt || !replyGetTopicSchema) break;
             if (getTopicSchemaAnswers >= 0 && getTopicSchemaSeen > getTopicSchemaAnswers) break;
 
@@ -239,7 +237,6 @@ struct GateGateway {
             std::vector<uint8_t> scratch(resp.encodedSize() + 32u);
             const std::size_t n = resp.encode(scratch.data());
             const bool omitCount = omitPartitionCount;
-            lk.unlock();
             // A pre-2b broker's frame stops after the descriptor blob.
             if (n > 0) sendFrame(scratch.data(), omitCount ? n - 4u : n);
             break;
@@ -412,17 +409,27 @@ struct GateGatewayPump {
     GateGateway&       gw;
     std::atomic<bool>  stopFlag{false};
     std::thread        t;
-    explicit GateGatewayPump(GateGateway& g)
-        : gw(g), t([this] {
-              while (!stopFlag.load(std::memory_order_acquire)) {
-                  if (gw.poll(16) == 0) std::this_thread::sleep_for(kPollSleep);
-              }
-          }) {}
+    explicit GateGatewayPump(GateGateway& g) : gw(g) { start(); }
+    void start() {
+        stopFlag.store(false, std::memory_order_relaxed);
+        t = std::thread([this] {
+            while (!stopFlag.load(std::memory_order_acquire)) {
+                if (gw.poll(16) == 0) std::this_thread::sleep_for(kPollSleep);
+            }
+        });
+    }
     void stop() {
         if (t.joinable()) {
             stopFlag.store(true, std::memory_order_release);
             t.join();
         }
+    }
+    /// Runs `f` with the pump stopped: the join orders the pump's earlier writes before `f`, and the restart orders `f`'s writes
+    /// before the pump's later reads.  The way a test reads or changes the gateway's fields while a pump runs.
+    template <class F> auto paused(F&& f) {
+        stop();
+        struct Restart { GateGatewayPump& p; ~Restart() { p.start(); } } restart{*this};
+        return f();
     }
     ~GateGatewayPump() { stop(); }
 };
@@ -670,11 +677,10 @@ TEST(OpenTopicGateRegression, AnUnknownFingerprintOfAnExistingTopicIsStillStaleR
     rune::client::Producer shared = h.client->producer();
     const std::string borrowed = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("characters", shared); });
     EXPECT_NE(borrowed.find("stale"), std::string::npos) << borrowed;
-    {
-        std::lock_guard lk(h.gw->mu);
+    pump.paused([&] {
         h.gw->getErrorCode = 7;
         h.gw->getBlob      = {};
-    }
+    });
     const std::string missing = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("nope", shared); });
     EXPECT_NE(missing.find("does not exist"), std::string::npos) << missing;
     EXPECT_EQ(missing.find("stale"), std::string::npos) << missing;
@@ -715,7 +721,7 @@ TEST(OpenTopicGateRegression, OpenFailureWithNoBudgetLeftSkipsTheProbeAdversaria
     h.gw->getBlob      = serialize(makeCharsV2Descriptor());
     h.gw->getErrorCode = 0;
     GateGatewayPump pump(*h.gw);
-    const int before = h.gw->getTopicSchemaSeen;
+    const int before = pump.paused([&] { return h.gw->getTopicSchemaSeen; });
     for (const std::chrono::nanoseconds left :
          {std::chrono::nanoseconds{0}, std::chrono::nanoseconds{-1}, std::chrono::nanoseconds{-10s}}) {
         const std::string msg = openFailureText(*h.client, "characters", 7, left);
@@ -723,13 +729,12 @@ TEST(OpenTopicGateRegression, OpenFailureWithNoBudgetLeftSkipsTheProbeAdversaria
         EXPECT_EQ(msg.find("stale"), std::string::npos) << msg;
         EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
     }
-    EXPECT_EQ(h.gw->getTopicSchemaSeen, before) << "no probe without budget";
-    {
-        std::lock_guard lk(h.gw->mu);
+    EXPECT_EQ(pump.paused([&] { return h.gw->getTopicSchemaSeen; }), before) << "no probe without budget";
+    pump.paused([&] {
         h.gw->unknownFingerprintErrorCode = 7;
-    }
+    });
     EXPECT_NE(openFailureText(*h.client, "characters", 7, 5s).find("stale"), std::string::npos);
-    EXPECT_EQ(h.gw->getTopicSchemaSeen, before + 2) << "the kind probe, then the caller's fingerprint again";
+    EXPECT_EQ(pump.paused([&] { return h.gw->getTopicSchemaSeen; }), before + 2) << "the kind probe, then the caller's fingerprint again";
 }
 
 // #22: a probe that is never answered proves nothing - the original code is named (never "does not exist" or
@@ -771,30 +776,27 @@ TEST(OpenTopicGateRegression, OpenFailureProbeRefusalAndOtherCodesAreNamedAdvers
     h.build();
     h.connectAndWait();
     GateGatewayPump pump(*h.gw);
-    {
-        std::lock_guard lk(h.gw->mu);
+    pump.paused([&] {
         h.gw->getErrorCode = 45;
-    }
+    });
     std::string msg = openFailureText(*h.client, "characters", 7, 5s);
     EXPECT_NE(msg.find("(error 45 NotAuthorized)"), std::string::npos) << msg;
     EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
-    {
-        std::lock_guard lk(h.gw->mu);
+    pump.paused([&] {
         h.gw->getErrorCode = 0x7FFF;
-    }
+    });
     msg = openFailureText(*h.client, "characters", 7, 5s);
     EXPECT_NE(msg.find("(error 32767)"), std::string::npos) << msg;
-    {
-        std::lock_guard lk(h.gw->mu);
+    pump.paused([&] {
         h.gw->getErrorCode = 0;   // a probe WOULD be served: only skipping it gives the plain code
-    }
-    const int before = h.gw->getTopicSchemaSeen;
+    });
+    const int before = pump.paused([&] { return h.gw->getTopicSchemaSeen; });
     for (const uint16_t code : {uint16_t{1}, uint16_t{6}, uint16_t{8}, uint16_t{46}, uint16_t{0xFFFF}}) {
         msg = openFailureText(*h.client, "characters", code, 5s);
         EXPECT_NE(msg.find("(error " + std::to_string(code)), std::string::npos) << code << ": " << msg;
         EXPECT_EQ(msg.find("stale"), std::string::npos) << code << ": " << msg;
     }
-    EXPECT_EQ(h.gw->getTopicSchemaSeen, before) << "only UnknownTopic is probed";
+    EXPECT_EQ(pump.paused([&] { return h.gw->getTopicSchemaSeen; }), before) << "only UnknownTopic is probed";
 }
 
 // ===========================================================================
@@ -1150,10 +1152,9 @@ TEST(OpenTopicGateRegression, LineageProbeRefusedNamesTheProbeCodeAdversarialReg
     GateGatewayPump pump(*h.gw);
     const std::map<uint16_t, std::string> names{{45, "NotAuthorized"}, {1, "ProtocolVersion"}, {0x7FFF, "UnknownErrorCode"}};
     for (const uint16_t probeCode : {uint16_t{45}, uint16_t{1}, uint16_t{0x7FFF}}) {
-        {
-            std::lock_guard lk(h.gw->mu);
+        pump.paused([&] {
             h.gw->getErrorCode = probeCode;
-        }
+        });
         const std::string msg = h.client->lineageFailure("t", 7, 5s);
         EXPECT_NE(msg.find("(" + names.at(probeCode) + " " + std::to_string(probeCode) + ")"), std::string::npos) << probeCode << ": " << msg;
         EXPECT_EQ(msg.find("does not exist"), std::string::npos) << probeCode << ": " << msg;
@@ -1184,17 +1185,17 @@ TEST(OpenTopicGateRegression, LineageProbeIsSkippedWhenTheBudgetIsSpentRegressio
     h.gw->getErrorCode                = 0;   // a sent probe WOULD be served: skipping it is the only way to get the plain text
     h.gw->unknownFingerprintErrorCode = 7;
     GateGatewayPump pump(*h.gw);
-    const int before = h.gw->getTopicSchemaSeen;
+    const int before = pump.paused([&] { return h.gw->getTopicSchemaSeen; });
     for (const std::chrono::nanoseconds left : {std::chrono::nanoseconds{0}, std::chrono::nanoseconds{-1}, std::chrono::nanoseconds{-10s}}) {
         const std::string msg = h.client->lineageFailure("t", 7, left);
         EXPECT_NE(msg.find("did not serve the schema lineage of 't' (UnknownTopic 7)"), std::string::npos)
             << left.count() << ": " << msg;
         EXPECT_EQ(msg.find("upgrade"), std::string::npos) << left.count() << ": " << msg;
     }
-    EXPECT_EQ(h.gw->getTopicSchemaSeen, before) << "no probe was sent with no budget left";
+    EXPECT_EQ(pump.paused([&] { return h.gw->getTopicSchemaSeen; }), before) << "no probe was sent with no budget left";
     // With budget left the very same call probes.
     EXPECT_NE(h.client->lineageFailure("t", 7, 5s).find("upgrade"), std::string::npos);
-    EXPECT_GT(h.gw->getTopicSchemaSeen, before);
+    EXPECT_GT(pump.paused([&] { return h.gw->getTopicSchemaSeen; }), before);
 }
 
 TEST(OpenTopicGateRegression, LineageProbeWaitsAtMostTheRemainingBudgetRegression) {
