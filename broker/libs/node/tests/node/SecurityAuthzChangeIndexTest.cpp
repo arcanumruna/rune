@@ -1,178 +1,243 @@
 // SecurityAuthzChangeIndexTest.cpp - issues #218 / #67: the per-principal staleness rule of the admin thread's fence.
-// A request stamped at offset S is stale only if an event applied after S could have changed what ITS user may do:
-// events about that user, and every role-side / wide event; an unknown or anonymous principal is stale on any change.
-#include "support/SecurityRig.h"
-
+// A request stamped at offset S is stale only if an event applied after S could have changed what ITS user may do, and
+// "could have changed" is the state machine's own affected-users set (sec::Applied), driven here through a REAL
+// SecurityState: a role-side event stales the role's MEMBERS only; the bootstrap stales everyone; an unknown or
+// anonymous principal is stale on any change.
 #include <rune/node/SecurityAuthzChangeIndex.h>
+#include <rune/security/SecurityState.h>
 
 #include <gtest/gtest.h>
 
+#include <stdexcept>
 #include <string>
-#include <vector>
 
 using rune::node::SecurityAuthzChangeIndex;
 namespace sec = rune::security;
 
 namespace {
 
-sec::SecurityEvent event(sec::Ops ops, uint32_t nsId, const std::string& name) {
-    sec::SecurityEvent e;
-    e.kind     = sec::kindOf(ops);
-    e.ops      = std::move(ops);
-    e.nsId     = nsId;
-    e.objectName = name;
-    return e;
+sec::ScramVerifier verifier() {
+    sec::ScramVerifier v;
+    v.salt.assign(16, 0x11);
+    v.iterations = 4096;
+    v.storedKey.fill(0x31);
+    v.serverKey.fill(0x51);
+    return v;
 }
 sec::GrantSpec topicRead() {
     return sec::GrantSpec{sec::Operation::Read, {sec::ResourceType::Topic, sec::PatternKind::Exact, "t"}};
 }
-
-struct Row {
-    const char*        what;
-    sec::SecurityEvent ev;
-    bool               selfStale;    // the requester is the event's user ("bob" in namespace 0)
-    bool               otherStale;   // another known user ("alice") - also stands for a role member / non-member
-};
-
-std::vector<Row> rows() {
-    const std::string who = "bob";
-    return {
-        {"CreateUser self", event(sec::CreateUserOps{}, 0, who), true, false},
-        {"AlterUser self", event(sec::AlterUserOps{sec::DisableUser{}}, 0, who), true, false},
-        {"DropUser self", event(sec::DropUserOps{}, 0, who), true, false},
-        {"GrantRole self", event(sec::GrantRoleOps{1, "r"}, 0, who), true, false},
-        {"RevokeRole self", event(sec::RevokeRoleOps{1, "r"}, 0, who), true, false},
-        {"Grant to the user", event(sec::GrantOps{sec::GranteeKind::User, topicRead()}, 0, who), true, false},
-        {"Revoke from the user", event(sec::RevokeOps{sec::GranteeKind::User, topicRead()}, 0, who), true, false},
-        {"Grant to a role", event(sec::GrantOps{sec::GranteeKind::Role, topicRead()}, 0, "r"), true, true},
-        {"Revoke from a role", event(sec::RevokeOps{sec::GranteeKind::Role, topicRead()}, 0, "r"), true, true},
-        {"CreateRole", event(sec::CreateRoleOps{}, 0, "r"), true, true},
-        {"DropRole", event(sec::DropRoleOps{}, 0, "r"), true, true},
-        {"Bootstrap", event(sec::BootstrapOps{}, 0, "admin"), true, true},
-        {"NamespacePurged", event(sec::NamespacePurgedOps{}, 7, "arena"), true, true},
-    };
+sec::GrantSpec arenaTopic() {
+    return sec::GrantSpec{sec::Operation::Read, {sec::ResourceType::Topic, sec::PatternKind::Exact, "arena/t"}};
 }
 
-constexpr int64_t kAt = 10;
+/// A real security state plus the index fed exactly like SecurityApplier feeds it: note(ev, applied, state, offset).
+struct World {
+    sec::SecurityState        s;
+    SecurityAuthzChangeIndex  idx;
+    int64_t                   offset = -1;
 
-SecurityAuthzChangeIndex primed() {
-    SecurityAuthzChangeIndex idx;
-    idx.note(event(sec::CreateUserOps{}, 0, "bob"), 1);
-    idx.note(event(sec::CreateUserOps{}, 0, "alice"), 2);
-    return idx;
+    /// The event for `ops` about `name` in namespace `ns`; ids and versions come from the current state.
+    [[nodiscard]] sec::SecurityEvent make(sec::Ops ops, const std::string& name, uint32_t ns = 0) const {
+        sec::SecurityEvent e;
+        e.kind       = sec::kindOf(ops);
+        e.ops        = std::move(ops);
+        e.nsId       = ns;
+        e.objectName = name;
+        e.principal.authenticated = "admin";
+        const bool roleTarget = e.kind == sec::EventKind::CreateRole || e.kind == sec::EventKind::DropRole ||
+            (e.kind == sec::EventKind::Grant && std::get<sec::GrantOps>(e.ops).grantee == sec::GranteeKind::Role) ||
+            (e.kind == sec::EventKind::Revoke && std::get<sec::RevokeOps>(e.ops).grantee == sec::GranteeKind::Role);
+        const bool create = e.kind == sec::EventKind::CreateUser || e.kind == sec::EventKind::CreateRole ||
+                            e.kind == sec::EventKind::Bootstrap;
+        if (e.kind == sec::EventKind::NamespacePurged) {
+            e.objectId = 0; e.prevVersion = 0; e.newVersion = 0;
+        } else if (create) {
+            e.objectId = s.nextObjectId(); e.prevVersion = 0; e.newVersion = 1;
+        } else if (roleTarget) {
+            const sec::RoleObject* r = s.roleByName(ns, name);
+            if (r == nullptr) throw std::logic_error("no role " + name);
+            e.objectId = r->objectId; e.prevVersion = r->version; e.newVersion = r->version + 1;
+        } else {
+            const sec::UserObject* u = s.userByName(ns, name);
+            if (u == nullptr) throw std::logic_error("no user " + name);
+            e.objectId = u->objectId; e.prevVersion = u->version; e.newVersion = u->version + 1;
+        }
+        auto fp = sec::previewFingerprint(s, e);
+        if (!fp) throw std::logic_error("preview: " + fp.error().detail);
+        e.fingerprint = *fp;
+        return e;
+    }
+    /// Applies `e` at the next offset and notes it; returns that offset.
+    int64_t apply(const sec::SecurityEvent& e) {
+        auto a = sec::apply(s, e, offset + 1);
+        if (!a) throw std::logic_error("apply: " + a.error().detail);
+        ++offset;
+        idx.note(e, *a, s, offset);
+        return offset;
+    }
+    int64_t emit(sec::Ops ops, const std::string& name, uint32_t ns = 0) {
+        return apply(make(std::move(ops), name, ns));
+    }
+    [[nodiscard]] uint64_t roleId(const std::string& n, uint32_t ns = 0) const { return s.roleByName(ns, n)->objectId; }
+    [[nodiscard]] bool stale(uint32_t ns, const std::string& who, int64_t stamp) const {
+        return idx.changedSince(s, ns, who, stamp);
+    }
+};
+
+/// admin (bootstrap), role r with a grant, alice = member of r, bob = no member, and "alice" in namespace 7 (a role
+/// "r" exists there too, with no members).
+World base() {
+    World w;
+    w.emit(sec::BootstrapOps{verifier(), {}}, "admin");
+    w.emit(sec::CreateRoleOps{}, "r");
+    w.emit(sec::CreateUserOps{verifier()}, "alice");
+    w.emit(sec::CreateUserOps{verifier()}, "bob");
+    w.emit(sec::GrantRoleOps{w.roleId("r"), "r"}, "alice");
+    w.emit(sec::CreateRoleOps{}, "r", 7);
+    w.emit(sec::CreateUserOps{verifier()}, "alice", 7);
+    return w;
+}
+
+struct Who { uint32_t ns; const char* name; };
+constexpr Who kAlice{0, "alice"}, kBob{0, "bob"}, kAliceNs7{7, "alice"};
+
+/// Applies `ev` and checks, for alice / bob / ns7-alice, both the post-apply answer (stale for the stamp offset-1) and
+/// the pending-event answer (`affects`, asked before the apply) against the expectation.
+void expectEvent(World& w, const char* what, const sec::SecurityEvent& ev, bool aliceStale, bool bobStale,
+                 bool aliceNs7Stale) {
+    SCOPED_TRACE(what);
+    const bool pre[] = {SecurityAuthzChangeIndex::affects(w.s, ev, kAlice.ns, kAlice.name),
+                        SecurityAuthzChangeIndex::affects(w.s, ev, kBob.ns, kBob.name),
+                        SecurityAuthzChangeIndex::affects(w.s, ev, kAliceNs7.ns, kAliceNs7.name)};
+    EXPECT_TRUE(SecurityAuthzChangeIndex::affects(w.s, ev, 0, "")) << "anonymous";
+    EXPECT_TRUE(SecurityAuthzChangeIndex::affects(w.s, ev, 0, "zed")) << "an unknown principal";
+    const int64_t at = w.apply(ev);
+    EXPECT_EQ(w.stale(kAlice.ns, kAlice.name, at - 1), aliceStale) << "alice (member of r)";
+    EXPECT_EQ(w.stale(kBob.ns, kBob.name, at - 1), bobStale) << "bob (no member)";
+    EXPECT_EQ(w.stale(kAliceNs7.ns, kAliceNs7.name, at - 1), aliceNs7Stale) << "alice of another namespace";
+    EXPECT_EQ(pre[0], aliceStale) << "affects: alice";
+    EXPECT_EQ(pre[1], bobStale) << "affects: bob";
+    EXPECT_EQ(pre[2], aliceNs7Stale) << "affects: alice of another namespace";
+    // stamp == offset: nothing newer than the stamp, so only unknown / anonymous principals stay stale.
+    EXPECT_FALSE(w.stale(kBob.ns, kBob.name, at));
+    EXPECT_TRUE(w.stale(0, "zed", at));
+    EXPECT_TRUE(w.stale(0, "", at));
 }
 
 }  // namespace
 
-TEST(SecurityAuthzChangeIndexRegression, EveryEventKindStalesExactlyTheRequestsItCouldChangeRegression) {
-    for (const Row& r : rows()) {
-        SCOPED_TRACE(r.what);
-        SecurityAuthzChangeIndex idx = primed();
-        idx.note(r.ev, kAt);
-        const bool dropsSelf = r.ev.kind == sec::EventKind::DropUser;
-        // stamp = offset - 1: the event applied after the stamp.
-        EXPECT_EQ(idx.changedSince(0, "bob", kAt - 1), r.selfStale) << "the requester itself";
-        EXPECT_EQ(idx.changedSince(0, "alice", kAt - 1), r.otherStale) << "another user";
-        EXPECT_TRUE(idx.changedSince(0, "zed", kAt - 1)) << "an unknown principal fails safe to the strict rule";
-        EXPECT_TRUE(idx.changedSince(0, "", kAt - 1)) << "anonymous";
-        // stamp = offset: nothing newer than the stamp, so only unknown / anonymous principals stay stale.
-        EXPECT_EQ(idx.changedSince(0, "bob", kAt), dropsSelf) << "a dropped user is unknown";
-        EXPECT_FALSE(idx.changedSince(0, "alice", kAt));
-        EXPECT_TRUE(idx.changedSince(0, "zed", kAt));
-        EXPECT_TRUE(idx.changedSince(0, "", kAt));
-        // The in-flight classification gives the same answer for one event, without an index.
-        EXPECT_EQ(SecurityAuthzChangeIndex::affects(r.ev, 0, "bob"), r.selfStale);
-        EXPECT_EQ(SecurityAuthzChangeIndex::affects(r.ev, 0, "alice"), r.otherStale);
-        EXPECT_TRUE(SecurityAuthzChangeIndex::affects(r.ev, 0, "")) << "anonymous";
-    }
+TEST(SecurityAuthzChangeIndexRegression, ARoleSideEventStalesOnlyTheRolesMembersRegression) {
+    World w = base();
+    expectEvent(w, "Grant to the role", w.make(sec::GrantOps{sec::GranteeKind::Role, topicRead()}, "r"),
+                true, false, false);
+    expectEvent(w, "Revoke from the role", w.make(sec::RevokeOps{sec::GranteeKind::Role, topicRead()}, "r"),
+                true, false, false);
+    expectEvent(w, "CreateRole", w.make(sec::CreateRoleOps{}, "r2"), false, false, false);
+    expectEvent(w, "DropRole (alice a member)", w.make(sec::DropRoleOps{}, "r"), true, false, false);
+}
+
+TEST(SecurityAuthzChangeIndexRegression, AUserSideEventStalesThatUserOnlyRegression) {
+    World w = base();
+    expectEvent(w, "Grant to the user", w.make(sec::GrantOps{sec::GranteeKind::User, topicRead()}, "alice"),
+                true, false, false);
+    expectEvent(w, "Revoke from the user", w.make(sec::RevokeOps{sec::GranteeKind::User, topicRead()}, "alice"),
+                true, false, false);
+    expectEvent(w, "GrantRole", w.make(sec::GrantRoleOps{w.roleId("r"), "r"}, "bob"), false, true, false);
+    expectEvent(w, "RevokeRole", w.make(sec::RevokeRoleOps{w.roleId("r"), "r"}, "bob"), false, true, false);
+    expectEvent(w, "AlterUser", w.make(sec::AlterUserOps{sec::DisableUser{}}, "bob"), false, true, false);
+    expectEvent(w, "CreateUser", w.make(sec::CreateUserOps{verifier()}, "carol"), false, false, false);
+    EXPECT_FALSE(w.stale(0, "carol", w.offset)) << "the new user is known";
+}
+
+TEST(SecurityAuthzChangeIndexRegression, AUserThatJoinsARoleAfterItsGrantIsStaleBecauseOfTheMembershipRegression) {
+    World w = base();
+    w.emit(sec::GrantOps{sec::GranteeKind::Role, topicRead()}, "r");
+    const int64_t before = w.offset;
+    EXPECT_FALSE(w.stale(0, "bob", before));
+    w.emit(sec::GrantRoleOps{w.roleId("r"), "r"}, "bob");
+    EXPECT_TRUE(w.stale(0, "bob", before)) << "the GrantRole is an event about bob";
+    // From now on bob IS a member: the next role grant stales him too.
+    w.emit(sec::RevokeOps{sec::GranteeKind::Role, topicRead()}, "r");
+    EXPECT_TRUE(w.stale(0, "bob", w.offset - 1));
 }
 
 TEST(SecurityAuthzChangeIndexRegression, ADroppedUserThatIsCreatedAgainIsKnownAgainRegression) {
-    SecurityAuthzChangeIndex idx = primed();
-    idx.note(event(sec::DropUserOps{}, 0, "bob"), 10);
-    EXPECT_TRUE(idx.changedSince(0, "bob", 10)) << "dropped: unknown, stale on any change";
-    idx.note(event(sec::CreateUserOps{}, 0, "bob"), 11);
-    EXPECT_TRUE(idx.changedSince(0, "bob", 10)) << "the re-creation applied after the stamp";
-    EXPECT_FALSE(idx.changedSince(0, "bob", 11));
+    World w = base();
+    const int64_t stamp = w.offset;
+    w.emit(sec::DropUserOps{}, "bob");
+    EXPECT_TRUE(w.stale(0, "bob", w.offset)) << "dropped: unknown, stale on any stamp";
+    EXPECT_TRUE(w.stale(0, "bob", stamp));
+    w.emit(sec::CreateUserOps{verifier()}, "bob");
+    EXPECT_TRUE(w.stale(0, "bob", stamp)) << "a re-created name does not inherit \"unchanged\"";
+    EXPECT_TRUE(w.stale(0, "bob", w.offset - 1));
+    EXPECT_FALSE(w.stale(0, "bob", w.offset)) << "known again";
 }
 
-TEST(SecurityAuthzChangeIndexRegression, ANameInAnotherNamespaceIsAnotherUserRegression) {
-    SecurityAuthzChangeIndex idx = primed();
-    idx.note(event(sec::CreateUserOps{}, 7, "bob"), 5);
-    idx.note(event(sec::AlterUserOps{sec::DisableUser{}}, 7, "bob"), kAt);
-    EXPECT_TRUE(idx.changedSince(7, "bob", kAt - 1));
-    EXPECT_FALSE(idx.changedSince(0, "bob", kAt - 1)) << "no cross-talk: (0, bob) was not touched";
-    SecurityAuthzChangeIndex other = primed();
-    other.note(event(sec::CreateUserOps{}, 7, "bob"), 5);
-    other.note(event(sec::AlterUserOps{sec::DisableUser{}}, 0, "bob"), kAt);
-    EXPECT_TRUE(other.changedSince(0, "bob", kAt - 1));
-    EXPECT_FALSE(other.changedSince(7, "bob", kAt - 1));
-    EXPECT_FALSE(SecurityAuthzChangeIndex::affects(event(sec::AlterUserOps{sec::DisableUser{}}, 7, "bob"), 0, "bob"));
+TEST(SecurityAuthzChangeIndexRegression, ANamespacePurgeStalesTheErasedAndTheRefreshedOnlyRegression) {
+    World w = base();
+    w.emit(sec::CreateUserOps{verifier()}, "carol");   // refreshed: holds a grant that names the purged namespace
+    w.emit(sec::GrantOps{sec::GranteeKind::User, arenaTopic()}, "carol");
+    w.emit(sec::CreateUserOps{verifier()}, "dave");    // untouched survivor
+    w.emit(sec::CreateUserOps{verifier()}, "gone", 7);
+    const int64_t stamp = w.offset;
+    ASSERT_NE(w.s.userByName(7, "gone"), nullptr);
+    const auto purge = w.make(sec::NamespacePurgedOps{}, "arena", 7);
+    EXPECT_TRUE(SecurityAuthzChangeIndex::affects(w.s, purge, 0, "dave")) << "a pending purge: every principal";
+    w.apply(purge);
+    ASSERT_EQ(w.s.userByName(7, "gone"), nullptr);
+    EXPECT_TRUE(w.stale(7, "gone", stamp)) << "an erased user is unknown";
+    EXPECT_TRUE(w.stale(7, "gone", w.offset));
+    EXPECT_TRUE(w.stale(0, "carol", stamp)) << "a refreshed survivor";
+    EXPECT_FALSE(w.stale(0, "dave", stamp)) << "an untouched survivor";
+    EXPECT_FALSE(w.stale(0, "bob", stamp));
+    EXPECT_FALSE(w.stale(0, "carol", w.offset));
+    // The index forgot the erased users: nothing leaks as the namespace churns.
+    EXPECT_EQ(w.idx.usersForTest(), w.s.users().size() - 1) << "one entry per live user but the bootstrap admin";
 }
 
-TEST(SecurityAuthzChangeIndexRegression, APurgedNamespacesUsersLeaveTheIndexRegression) {
-    SecurityAuthzChangeIndex idx;
-    for (const char* n : {"a", "b", "c"}) idx.note(event(sec::CreateUserOps{}, 7, n), 1);
-    for (const char* n : {"x", "y"}) idx.note(event(sec::CreateUserOps{}, 0, n), 2);
-    idx.note(event(sec::CreateUserOps{}, 8, "z"), 3);
-    ASSERT_EQ(idx.usersForTest(), 6u);
-    idx.note(event(sec::NamespacePurgedOps{}, 7, "arena"), 10);
-    EXPECT_EQ(idx.usersForTest(), 3u) << "only the purged namespace's users are forgotten";
-    // Stamp after the purge: the neighbours keep their own offsets (known, not stale); the purged users are unknown.
-    EXPECT_FALSE(idx.changedSince(0, "x", 10));
-    EXPECT_FALSE(idx.changedSince(0, "y", 10));
-    EXPECT_FALSE(idx.changedSince(8, "z", 10));
-    EXPECT_TRUE(idx.changedSince(7, "a", 10));
-    EXPECT_TRUE(idx.changedSince(0, "x", 9)) << "the purge is wide for older stamps";
-    idx.note(event(sec::CreateUserOps{}, 7, "a"), 11);
-    EXPECT_EQ(idx.usersForTest(), 4u);
-    EXPECT_FALSE(idx.changedSince(7, "a", 11)) << "a re-created user is known again";
-    SecurityAuthzChangeIndex top;
-    top.note(event(sec::CreateUserOps{}, UINT32_MAX, "q"), 1);
-    top.note(event(sec::NamespacePurgedOps{}, UINT32_MAX, "n"), 2);
-    EXPECT_EQ(top.usersForTest(), 0u);
+TEST(SecurityAuthzChangeIndexRegression, TheBootstrapStalesEveryoneRegression) {
+    World w;
+    w.emit(sec::BootstrapOps{verifier(), {}}, "admin");
+    const int64_t first = w.offset;
+    w.emit(sec::CreateUserOps{verifier()}, "bob");
+    // A user created after the bootstrap is not stale for a stamp at or after the bootstrap ...
+    EXPECT_FALSE(w.stale(0, "admin", first));
+    // ... and every known user is stale for a stamp before it.
+    EXPECT_TRUE(w.stale(0, "admin", first - 1));
+    EXPECT_TRUE(w.stale(0, "bob", first - 1));
+    sec::SecurityEvent boot;
+    boot.kind = sec::EventKind::Bootstrap;
+    boot.ops  = sec::BootstrapOps{};
+    EXPECT_TRUE(SecurityAuthzChangeIndex::affects(w.s, boot, 0, "bob")) << "a pending bootstrap: every principal";
 }
 
 TEST(SecurityAuthzChangeIndexRegression, TheFencePredicateNeverStalesAtTheStampAndAlwaysAheadOfItRegression) {
-    SecurityAuthzChangeIndex idx = primed();
-    idx.note(event(sec::CreateRoleOps{}, 0, "r"), 5);   // wide
+    World w = base();
+    w.emit(sec::GrantOps{sec::GranteeKind::Role, topicRead()}, "r");   // about alice (member), not bob
+    const int64_t at = w.offset;
     // stamp == applied: never stale, not even for an unknown principal (no lookup).
-    EXPECT_FALSE(idx.staleAt(5, 5, 0, "zed", 0));
-    EXPECT_FALSE(idx.staleAt(5, 5, 0, "", 0));
+    EXPECT_FALSE(w.idx.staleAt(w.s, at, at, 0, "zed", 0));
+    EXPECT_FALSE(w.idx.staleAt(w.s, at, at, 0, "", 0));
     // stamp > applied cannot happen: stale.
-    EXPECT_TRUE(idx.staleAt(5, 6, 0, "bob", 0));
+    EXPECT_TRUE(w.idx.staleAt(w.s, at, at + 1, 0, "bob", 0));
     // stamp < applied: the index decides; the local name starts at `localAt` (a prefixed principal).
-    EXPECT_TRUE(idx.staleAt(5, 4, 0, "bob", 0)) << "the wide event at 5";
-    idx.note(event(sec::AlterUserOps{sec::DisableUser{}}, 0, "alice"), 8);
-    EXPECT_FALSE(idx.staleAt(8, 5, 0, "bob", 0)) << "an event about another user";
-    EXPECT_TRUE(idx.staleAt(8, 5, 0, "alice", 0));
-    EXPECT_TRUE(idx.staleAt(8, 5, 0, "ns/alice", 3)) << "the prefix is skipped";
-    EXPECT_TRUE(idx.staleAt(8, 5, 0, "ns/", 3)) << "an empty local name is unknown";
-    EXPECT_TRUE(idx.staleAt(8, 5, 0, "", 0)) << "anonymous";
+    EXPECT_FALSE(w.idx.staleAt(w.s, at, at - 1, 0, "bob", 0)) << "a non-member";
+    EXPECT_TRUE(w.idx.staleAt(w.s, at, at - 1, 0, "alice", 0)) << "a member";
+    EXPECT_FALSE(w.idx.staleAt(w.s, at, at - 1, 0, "ns/bob", 3));
+    EXPECT_TRUE(w.idx.staleAt(w.s, at, at - 1, 0, "ns/alice", 3));
+    EXPECT_TRUE(w.idx.staleAt(w.s, at, at - 1, 0, "zed", 0)) << "unknown";
+    EXPECT_TRUE(w.idx.staleAt(w.s, at, at - 1, 0, "", 0)) << "anonymous";
+    EXPECT_TRUE(w.idx.staleAt(w.s, at, at - 1, 0, "bob", 9)) << "localAt past the end: empty local name";
 }
 
-// Every boot replays [0, checkpoint] through applyRecord_ (SecurityApplier::replay_), so the index sees every event
-// of the log: a user that exists always has an entry (CreateUser / Bootstrap), and a restart does not make an admin
-// "unknown".  An admin with no event of its own since the boot pipelines across events about others.
-TEST(SecurityAuthzChangeIndexRegression, AnAdminWithNoEventSinceTheBootIsKnownAfterARestartRegression) {
-    rune::node::test::SecurityRig rig("authz_index_restart", /*goLive=*/true);
-    rig.appendEvents(0, 8);
-    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 8);
-    rig.restart();   // same log and checkpoint, a fresh applier
-    ASSERT_GE(rig.applier.replayLocal(rig.log(), rig.rec.bootEffects()), 0);
-    ASSERT_EQ(rig.applier.phaseName(), "Booted");
-    ASSERT_TRUE(rig.applier.goLive(rig.rec.liveEffects()));
-    const auto& idx = [&]() -> const SecurityAuthzChangeIndex& { return rig.applier.authzChanges(); }();
-    ASSERT_EQ(rig.applier.state().appliedOffset(), 7);
-    // "admin" (bootstrap, event 0) has had no event of its own since: known, not stale after the last wide event (4).
-    EXPECT_FALSE(idx.changedSince(0, "admin", 7));
-    EXPECT_TRUE(idx.changedSince(0, "admin", 3)) << "the role grants at 4 are wide";
-    EXPECT_TRUE(idx.changedSince(0, "nobody", 7)) << "a user that does not exist stays strict";
-    rig.appendEvents(8, 9);   // ALTER USER ws1: another user
-    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 1);
-    EXPECT_FALSE(idx.changedSince(0, "admin", 7)) << "across an event about another user";
-    rig.appendEvents(9, 11);   // 9: REVOKE from a role (wide), 10: ALTER USER admin
-    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 2);
-    EXPECT_TRUE(idx.changedSince(0, "admin", 9)) << "across an event about itself";
-    EXPECT_FALSE(idx.changedSince(0, "admin", 10));
+TEST(SecurityAuthzChangeIndexRegression, ANameInAnotherNamespaceIsAnotherUserRegression) {
+    World w = base();
+    w.emit(sec::AlterUserOps{sec::DisableUser{}}, "alice", 7);
+    EXPECT_TRUE(w.stale(7, "alice", w.offset - 1));
+    EXPECT_FALSE(w.stale(0, "bob", w.offset - 1));
+    const auto enable7  = w.make(sec::AlterUserOps{sec::EnableUser{}}, "alice", 7);
+    const auto disable0 = w.make(sec::AlterUserOps{sec::DisableUser{}}, "bob");
+    EXPECT_FALSE(SecurityAuthzChangeIndex::affects(w.s, enable7, 0, "bob"));
+    EXPECT_FALSE(SecurityAuthzChangeIndex::affects(w.s, disable0, 7, "alice"));
 }

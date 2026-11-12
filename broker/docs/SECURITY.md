@@ -323,11 +323,13 @@ A revoke ends the affected subscriptions within 100 ms on a 3-node cluster.
 `__security` and stamps the request with the `__security` offset it checked. The admin thread appends the request only
 if no event applied after that offset could have changed what the requesting user may do (issues #218, #67); otherwise
 it answers the ordinary retriable `NotLeader`, and the client's retry (same request id) is authorized again against
-the newer state. The rule is per user: an event about another user does not make an admin's pipelined DDL retry. A
-change on the role side (a role's grants, `CREATE ROLE`, `DROP ROLE`), a namespace purge, the bootstrap, and any event
-kind not listed as user-specific count as a change for every user, and so does a principal the admin thread has no
-record of (anonymous, or a user that no longer exists). A broker restart replays the whole log through the same
-index, so a user that exists is known after it. The same rule
+the newer state. The rule is per user, and "could have changed" is the security state machine's own affected-users set
+(the users whose sessions the event refreshes or revokes): an event about another user, or a change to a role the
+requester is not a member of, does not make an admin's pipelined DDL retry. A change to a role's grants or a `DROP ROLE`
+makes stale only that role's members; a namespace purge only the erased users and the survivors whose grants it
+stripped; `CREATE ROLE` nobody. Only the bootstrap and any event kind not listed in the index count as a change for
+every user, and so does a principal the admin thread has no record of (anonymous, or a user that no longer exists).
+A broker restart replays the whole log through the same index, so a user that exists is known after it. The same rule
 covers a security event that is appended but not yet applied. A request whose id is already recorded still gets its
 original result first.
 

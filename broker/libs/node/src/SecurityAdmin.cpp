@@ -506,8 +506,8 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
     // have changed what THIS user may do (SecurityAuthzChangeIndex) makes it stale, so an admin pipelining DDL about
     // other users never retries.  After the dedupe: a recorded request keeps its result.
     if (m.meta.securityStamped &&
-        applier_.authzChanges().staleAt(applier_.state().appliedOffset(), m.meta.securityOffset, m.meta.callerNsId,
-                                        m.meta.authenticated, m.meta.authenticatedLocalAt)) {
+        applier_.authzChanges().staleAt(applier_.state(), applier_.state().appliedOffset(), m.meta.securityOffset,
+                                        m.meta.callerNsId, m.meta.authenticated, m.meta.authenticatedLocalAt)) {
         if (++ddlStaleAuthorization_ % 1024 == 1)
             spdlog::debug("SecurityAdmin: a DDL authorized at __security offset {} met applied offset {} - answered "
                           "NotLeader (retriable; stale so far: {})", m.meta.securityOffset,

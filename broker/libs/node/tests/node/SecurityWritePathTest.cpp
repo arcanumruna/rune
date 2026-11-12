@@ -918,16 +918,26 @@ TEST(SecurityWritePathRegression, AnEventAboutAnotherUserDoesNotStaleAStampedReq
     const auto a = rig.ddl(bobs);
     EXPECT_EQ(a.code, 0) << a.detail;
     EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 0u);
-    // A role-side change is wide: stale for everyone, even a user that is no member.
+    // A role-side change makes stale only the role's MEMBERS: bob is no member of r1, so his request proceeds ...
     const int64_t stamp2 = rig.state().appliedOffset();
     ASSERT_EQ(rig.ddl(rig.grant(false, sec::GranteeKind::Role, "r1", sec::Operation::Read, sec::ResourceType::Topic,
                                 sec::PatternKind::Exact, "t")).code, 0);
     auto bobAgain = stamped(rig.createRole("r2"), stamp2);
     bobAgain.meta.authenticated = "bob";
-    EXPECT_EQ(rig.ddl(bobAgain).code, kNotLeader);
+    const auto b = rig.ddl(bobAgain);
+    EXPECT_EQ(b.code, 0) << b.detail;
+    EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 0u);
+    // ... and once he is a member, the next grant to r1 makes his older stamp stale.
+    ASSERT_EQ(rig.ddl(rig.grantRole(false, "bob", "r1")).code, 0);
+    const int64_t stamp3 = rig.state().appliedOffset();
+    ASSERT_EQ(rig.ddl(rig.grant(true, sec::GranteeKind::Role, "r1", sec::Operation::Read, sec::ResourceType::Topic,
+                                sec::PatternKind::Exact, "t")).code, 0);
+    auto bobMember = stamped(rig.createRole("r4"), stamp3);
+    bobMember.meta.authenticated = "bob";
+    EXPECT_EQ(rig.ddl(bobMember).code, kNotLeader);
     EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 1u);
     // An unknown principal (anonymous) is stale on any change.
-    EXPECT_EQ(rig.ddl(stamped(rig.createRole("r3"), stamp2)).code, kNotLeader) << "\"admin\" was never created here";
+    EXPECT_EQ(rig.ddl(stamped(rig.createRole("r3"), stamp3)).code, kNotLeader) << "\"admin\" was never created here";
     EXPECT_EQ(rig.admin().ddlStaleAuthorization(), 2u);
 }
 

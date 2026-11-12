@@ -317,7 +317,7 @@ bool SecurityApplier::applyRecord_(int64_t offset, std::span<const uint8_t> byte
         halt_(std::move(a.error()));
         return false;
     }
-    authzChanges_.note(*ev, offset);   // issues #218 / #67: boot replay and live alike
+    authzChanges_.note(*ev, *a, state_, offset);   // issues #218 / #67: boot replay and live alike
     // From here on the library holds the event: a halt names it staged.
     if (live) {
         // Step 4: the checkpoint precedes the effect.

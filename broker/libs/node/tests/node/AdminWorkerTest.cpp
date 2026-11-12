@@ -740,9 +740,9 @@ TEST(AdminWorkerRegression, ACreateViewAuthorizedBeforeARevokeIsRetriedNotCreate
     EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 1u);
 }
 
-// Per principal: an event about ANOTHER user does not stale a catalog DDL; a role-side change or one about the
-// requester does.  The requester "admin" is the bootstrap user; golden events 0..7 are applied, 8 is about ws1, 9
-// revokes a role's grant, 10 is about admin.
+// Per principal: an event about ANOTHER user does not stale a catalog DDL; a role-side change stales its members
+// and an event about the requester stales it.  The requester "admin" is the bootstrap user; golden events 0..7 are
+// applied, 8 is about ws1, 9 revokes a role's grant, 10 is about admin.
 TEST(AdminWorkerRegression, AnEventAboutAnotherUserDoesNotStaleACatalogDdlRegression) {
     StampRig rig("aw_stale_principal", 8);
     auto& cat = rig.cat;
@@ -753,8 +753,10 @@ TEST(AdminWorkerRegression, AnEventAboutAnotherUserDoesNotStaleACatalogDdlRegres
     EXPECT_EQ(cat.define({.name = "orders", .authenticated = "admin"}).code, 0) << "no retry for a pipelined DDL";
     EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 0u);
     cat.stampSecurity(rig.applied());
-    rig.applyOneMoreEvent(9);   // REVOKE from a ROLE: wide, stale for everyone (admin is no member)
-    EXPECT_EQ(cat.define({.name = "late", .authenticated = "admin"}).code, 2);
+    rig.applyOneMoreEvent(9);   // REVOKE from a ROLE: stale only for its members (ws1 is one, admin is not)
+    EXPECT_EQ(cat.define({.name = "late", .authenticated = "admin"}).code, 0) << "a non-member proceeds";
+    EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 0u);
+    EXPECT_EQ(cat.define({.name = "by_member", .authenticated = "ws1"}).code, 2) << "a member is stale";
     EXPECT_EQ(cat.admin().ddlStaleAuthorization(), 1u);
     cat.stampSecurity(rig.applied());
     rig.applyOneMoreEvent(10);   // ALTER USER admin: the requester itself

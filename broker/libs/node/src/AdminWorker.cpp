@@ -1066,9 +1066,10 @@ void AdminWorker::startNext_(int64_t nowNs) {
         const std::string_view local = meta.authenticatedLocalAt <= who.size() ? who.substr(meta.authenticatedLocalAt)
                                                                                : std::string_view{};
         const rune::security::SecurityEvent* pending = securityAdmin_ ? securityAdmin_->inFlightEvent() : nullptr;
-        if (changes.staleAt(securityApplier_->state().appliedOffset(), meta.securityOffset, meta.callerNsId, who,
+        const rune::security::SecurityState& secState = securityApplier_->state();
+        if (changes.staleAt(secState, secState.appliedOffset(), meta.securityOffset, meta.callerNsId, who,
                             meta.authenticatedLocalAt) ||
-            (pending != nullptr && SecurityAuthzChangeIndex::affects(*pending, meta.callerNsId, local))) {
+            (pending != nullptr && SecurityAuthzChangeIndex::affects(secState, *pending, meta.callerNsId, local))) {
             if (++ddlStaleAuthorization_ % 1024 == 1)
                 spdlog::debug("AdminWorker: a DDL authorized at __security offset {} met applied offset {} - answered "
                               "NotLeader (retriable; stale so far: {})", meta.securityOffset,

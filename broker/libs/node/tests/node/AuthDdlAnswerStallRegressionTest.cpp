@@ -45,6 +45,21 @@ struct Async {
         m.patternKind = static_cast<uint8_t>(SP::Exact); m.pattern = topic;
         return send(m, "GRANT ...;");
     }
+    int64_t createRole(const std::string& name) {
+        pc::SecurityDdl m; m.kind = pc::SecurityOpKind::CreateRole; m.name = name;
+        return send(m, "CREATE ROLE ...;");
+    }
+    int64_t grantReadToRole(const std::string& role, const std::string& topic) {
+        pc::SecurityDdl m; m.kind = pc::SecurityOpKind::Grant; m.name = role; m.granteeKind = 1;
+        m.op = static_cast<uint8_t>(SO::Read); m.resourceType = static_cast<uint8_t>(ST::Topic);
+        m.patternKind = static_cast<uint8_t>(SP::Exact); m.pattern = topic;
+        return send(m, "GRANT ...;");
+    }
+    int64_t defineTopic(const std::string& name) {
+        auto& adm = r.broker();
+        return adm.admin().raw().sendDefineTopic(r.ch(), AuthWireClient::kClientStream, adm.adminSession(), name, 1,
+                                                 authRigCharBlob(), 0, {}, 0, authRigTopicConfig());
+    }
     int64_t alter(const std::string& who, pc::UserChangeKind k) {
         pc::SecurityDdl m; m.kind = pc::SecurityOpKind::AlterUser; m.name = who; m.change = k;
         return send(m, "ALTER USER ...;");
@@ -92,6 +107,33 @@ TEST(AuthDdlAnswerStallRegression, DisableThenEnableThenGrantAllAnswer) {
         const int64_t c4 = a.grantWrite(name, "orders");
         EXPECT_EQ(a.answer(c1), 0); EXPECT_EQ(a.answer(c2), 0); EXPECT_EQ(a.answer(c3), 0); EXPECT_EQ(a.answer(c4), 0);
         rig.login(name);   // a fresh session for the next round
+    }
+}
+
+// Issues #218 / #67: the staleness fence stales only the principals a change could affect.  An admin that pipelines a
+// grant to a ROLE (the admin is no member) followed by more DDL about other users and roles and a catalog CREATE sees
+// every answer OK, never the retriable NotLeader.
+TEST(AuthDdlAnswerStallRegression, PipelinedRoleDdlNeverRetriesANonMemberAdminRegression) {
+    AuthBroker::Options o; o.shard = true;
+    AuthRig rig("stallrole", o);
+    Async a{rig};
+    std::string other;
+    rig.newUser({exact(SO::Write, ST::Topic, "orders")}, &other);
+    for (int round = 0; round < 10; ++round) {
+        const std::string role = "pipe_role_" + std::to_string(round);
+        ASSERT_EQ(a.answer(a.createRole(role)), 0);
+        const int64_t c1 = a.grantReadToRole(role, "orders");
+        const int64_t c2 = a.alter(other, pc::UserChangeKind::Disable);
+        const int64_t c3 = a.createRole(role + "_b");
+        const int64_t c4 = a.alter(other, pc::UserChangeKind::Enable);
+        ASSERT_NE(c1, 0); ASSERT_NE(c2, 0); ASSERT_NE(c3, 0); ASSERT_NE(c4, 0);
+        const int64_t c5 = a.defineTopic("pipe_topic_" + std::to_string(round));
+        ASSERT_NE(c5, 0);
+        EXPECT_EQ(a.answer(c5), 0) << "a catalog CREATE pipelined behind role DDL (round " << round << ")";
+        EXPECT_EQ(a.answer(c1), 0) << "GRANT TO ROLE (round " << round << ")";
+        EXPECT_EQ(a.answer(c2), 0) << "DISABLE (round " << round << ")";
+        EXPECT_EQ(a.answer(c3), 0) << "CREATE ROLE (round " << round << ")";
+        EXPECT_EQ(a.answer(c4), 0) << "ENABLE (round " << round << ")";
     }
 }
 
