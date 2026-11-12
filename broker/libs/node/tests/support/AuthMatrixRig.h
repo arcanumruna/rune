@@ -489,13 +489,21 @@ public:
                 return std::string(c.name) + " counter is " + std::to_string(counterNow(c.id)) + ", expected " + std::to_string(c.start + c.delta);
         }
         r_.c().pollFor(std::chrono::milliseconds(30), [] { return false; });   // a stray extra tick would land here
-        for (const C& c : {C{typeIdOf(RuneMetric::LoginsOk), okAtStart_, loginsOk_, "logins ok"},
-                           C{typeIdOf(RuneMetric::LoginsFailed), failedAtStart_, loginsFailed_, "logins failed"},
-                           C{typeIdOf(RuneMetric::SessionsRevoked), revokedAtStart_, disabled ? 1 : 0, "sessions revoked"}}) {
+        struct Tally { std::int32_t id; int64_t start; int64_t delta; const char* name; int64_t* issued; };
+        std::string problem;
+        for (const Tally& c : {Tally{typeIdOf(RuneMetric::LoginsOk), okAtStart_, loginsOk_, "logins ok", &m_.issuedOk_},
+                               Tally{typeIdOf(RuneMetric::LoginsFailed), failedAtStart_, loginsFailed_, "logins failed", &m_.issuedFailed_},
+                               Tally{typeIdOf(RuneMetric::SessionsRevoked), revokedAtStart_, disabled ? 1 : 0, "sessions revoked",
+                                     &m_.issuedRevoked_}}) {
             const int64_t now = counterNow(c.id);
-            if (now != c.start + c.delta)
-                return std::string(c.name) + " counter is " + std::to_string(now) + ", expected " + std::to_string(c.start + c.delta);
+            if (now == c.start + c.delta) continue;
+            if (problem.empty())
+                problem = std::string(c.name) + " counter is " + std::to_string(now) + ", expected " + std::to_string(c.start + c.delta);
+            // #579: this cell reports the stray (it fails); the rig then adopts the surplus into its tally so the NEXT
+            // cell starts clean and reports only its own deltas.  A counter BELOW the tally is not adopted.
+            if (now > c.start + c.delta) *c.issued = std::max(*c.issued, now);   // idempotent
         }
+        if (!problem.empty()) return problem;
         return {};
     }
     /// Assertion 6: every DDL this cell's user got an OK for is recorded with principal.authenticated == the user.

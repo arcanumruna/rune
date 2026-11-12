@@ -274,6 +274,26 @@ TEST(AuthMatrixRigRegression, AStrayFailedLoginBetweenCellsFailsTheNextCellAdver
     cell.close();
 }
 
+// #579: one stray login fails exactly ONE cell: the cell that sees the counter above the tally fails (and names it), the
+// rig then adopts the surplus into its tally, so the cells after it report only their own deltas.
+TEST(AuthMatrixRigRegression, AStrayLoginFailsExactlyOneCellRegression) {
+    AuthMatrixRig rig;
+    strayLogin(rig, /*ok=*/true);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    std::string problems[3];
+    for (std::string& problem : problems) {
+        auto cell = rig.newCell();
+        cell.grantFor(AMOp::Produce, AMGrant::None);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        cell.login();
+        problem = cell.countersProblem(false);
+        cell.close();
+    }
+    EXPECT_NE(problems[0].find("logins ok counter is"), std::string::npos) << "the cell after the stray must fail: '" << problems[0] << "'";
+    EXPECT_EQ(problems[1], "") << "the second cell reports only its own deltas";
+    EXPECT_EQ(problems[2], "") << "the third cell reports only its own deltas";
+}
+
 // The #4 wait is bounded and loud: a tally the broker never reaches (a login the rig believes happened) fails the cell's
 // setup within the wait's bound, exactly once, instead of hanging or passing.
 TEST(AuthMatrixRigRegression, AnOverTalliedLoginFailsTheBaselineWaitWithinItsBoundAdversarialRegression) {
