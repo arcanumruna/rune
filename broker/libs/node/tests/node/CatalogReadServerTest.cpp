@@ -307,7 +307,7 @@ struct FlowHarness {
     // `appliedUpTo` is Held (the control thread's #117 gate), as ClientGateway::admitAdminLogFrame does.
     int64_t  appliedUpTo = INT64_MAX;
     uint64_t holds = 0;
-    rune::node::CatalogReadFlow::Admit admit(int64_t, int64_t, const uint8_t* f, std::size_t n) {
+    rune::node::CatalogReadFlow::Admit admit(int64_t, int64_t, const uint8_t* f, std::size_t n, int64_t& holdUntil) {
         if (appliedUpTo == INT64_MAX) return rune::node::CatalogReadFlow::Admit::Deliver;
         const auto r = pc::Records::decode(f, n);
         int64_t newest = -1;
@@ -320,9 +320,11 @@ struct FlowHarness {
                 pos += static_cast<std::size_t>(rd.totalLength());
             }
         }
-        if (newest > appliedUpTo) { ++holds; return rune::node::CatalogReadFlow::Admit::Hold; }
+        if (newest > appliedUpTo) { ++holds; holdUntil = newest; return rune::node::CatalogReadFlow::Admit::Hold; }
         return rune::node::CatalogReadFlow::Admit::Deliver;
     }
+    // as ClientGateway::adminLogHoldReleased
+    bool holdReleased(int64_t holdUntil) { return appliedUpTo >= holdUntil; }
     Offer tryOffer(int64_t s, const uint8_t* f, std::size_t n) {
         Session& ss = sessions.at(s);
         if (ss.inFlight + n > ss.window && ss.inFlight != 0) return Offer::BackPressured;
@@ -1149,7 +1151,7 @@ TEST(CatalogReadServerRegression, HeldFramesAreReReadFromTheLogExactlyOnceAsTheM
     const auto [offs, marks] = h.seen(1);
     EXPECT_EQ(offs, range(0, 600)) << "every record exactly once, in order, across the holds";
     EXPECT_EQ(marks, (std::vector<int64_t>{600}));
-    EXPECT_GT(h.holds, 5u) << "non-vacuous: frames were held";
+    EXPECT_GE(h.holds, 2u) << "non-vacuous: frames were held (#444: each hold now costs one pause and one resume)";
     EXPECT_EQ(h.flow.resumes(), h.flow.pauses());
     EXPECT_EQ(h.flow.paused(), 0u);
     EXPECT_EQ(h.sessions[1].reliableFrames, 1u) << "a held frame never takes the reliable path around the gate";
@@ -1169,4 +1171,47 @@ TEST(CatalogReadServerRegression, AMirrorThatNeverAdvancesDeliversNothingAboveIt
     for (int64_t o : offs) EXPECT_LE(o, 9) << "nothing above the mirror";
     EXPECT_TRUE(marks.empty());
     EXPECT_LE(h.flow.paused(), 1u) << "one entry per held subscription";
+    // #444: the hold costs nothing while it waits - one pause, no resume, no re-read.
+    EXPECT_EQ(h.flow.pauses(), 1u);
+    EXPECT_EQ(h.flow.resumes(), 0u);
+}
+
+// Issue #444: a subscription paused by a Hold is resumed once - when the mirror has applied the held frame's newest
+// event - not on every pass.  Then the frame is re-read and delivered.
+TEST(CatalogReadFlowRegression, AHeldSubscriptionResumesOnceWhenTheMirrorCatchesUpRegression) {
+    ReadRig r("rd_flow_hold_once");
+    r.commitEvents(50);
+    FlowHarness h(r);
+    h.sessions[1] = {/*window=*/1 << 22, 0, /*drainPerPass=*/1 << 22};
+    h.appliedUpTo = 9;
+    r.server.subscribe(1, 1, -2);
+    for (int p = 0; p < 50; ++p) h.pass();
+    ASSERT_EQ(h.flow.pauses(), 1u);
+    EXPECT_EQ(h.flow.resumes(), 0u) << "50 passes with the mirror at 9: no resume";
+    EXPECT_EQ(h.flow.paused(), 1u);
+    h.appliedUpTo = 49;   // the mirror catches up to every event
+    for (int p = 0; p < 50; ++p) h.pass();
+    EXPECT_EQ(h.flow.resumes(), 1u) << "exactly one resume once the mirror caught up";
+    EXPECT_EQ(h.flow.pauses(), 1u);
+    EXPECT_EQ(h.flow.paused(), 0u);
+    const auto [offs, marks] = h.seen(1);
+    EXPECT_EQ(offs, range(0, 50)) << "the held frame was re-read and delivered";
+    EXPECT_EQ(marks, (std::vector<int64_t>{50}));
+}
+
+// Issue #444: the session of a held subscription closes while the mirror never advances: the entry is erased on the
+// next service pass (no leaked slot).
+TEST(CatalogReadFlowRegression, AHeldSubscriptionOfAGoneSessionIsClearedRegression) {
+    ReadRig r("rd_flow_hold_gone");
+    r.commitEvents(50);
+    FlowHarness h(r);
+    h.sessions[1] = {/*window=*/1 << 22, 0, /*drainPerPass=*/1 << 22};
+    h.appliedUpTo = 9;
+    r.server.subscribe(1, 1, -2);
+    for (int p = 0; p < 10; ++p) h.pass();
+    ASSERT_EQ(h.flow.paused(), 1u);
+    h.sessions.erase(1);   // the session closes; the mirror stays at 9
+    h.flow.service(h);
+    EXPECT_EQ(h.flow.paused(), 0u) << "the held entry of a gone session is erased";
+    EXPECT_EQ(h.flow.resumes(), 0u);
 }

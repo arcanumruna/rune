@@ -5475,14 +5475,17 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
         using Offer = CatalogReadFlow::Offer;
         using Room  = CatalogReadFlow::Room;
         using Admit = CatalogReadFlow::Admit;
-        Admit admit(int64_t session, int64_t subId, const uint8_t* f, std::size_t n) {   // issue #117
+        Admit admit(int64_t session, int64_t subId, const uint8_t* f, std::size_t n, int64_t& holdUntilEvent) {  // #117
             if (!node.gateway_) return Admit::Deliver;
-            switch (node.gateway_->admitAdminLogFrame(session, subId, f, n)) {
+            switch (node.gateway_->admitAdminLogFrame(session, subId, f, n, holdUntilEvent)) {
             case rune::gateway::ClientGateway::AdminLogAdmit::Deliver:  return Admit::Deliver;
             case rune::gateway::ClientGateway::AdminLogAdmit::Withhold: return Admit::Withhold;
             case rune::gateway::ClientGateway::AdminLogAdmit::Hold:     break;
             }
             return Admit::Hold;
+        }
+        bool holdReleased(int64_t holdUntilEvent) {   // #444
+            return !node.gateway_ || node.gateway_->adminLogHoldReleased(holdUntilEvent);
         }
         Offer tryOffer(int64_t session, const uint8_t* f, std::size_t n) {
             if (!node.gateway_) return Offer::NoSession;

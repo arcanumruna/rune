@@ -959,6 +959,7 @@ TEST(AuthLiveChangeRegression, SecurityReadEndNeverDroppedUnderAdminRingPressure
 // admin can apply and stream a REVOKE and the CREATE USER after it before this thread applies the REVOKE).  RED before
 // the fix: every frame was offered (the admin processing the end was the only stop).
 namespace {
+int64_t gHoldUntil = 0;   // #444: the out-parameter of admitAdminLogFrame, where a test does not look at it
 std::vector<uint8_t> securityRecordsFrame(int64_t sid, int64_t subId, int64_t eventOffset, bool control = false) {
     rune::protocol::RecordBatchBuilder b(eventOffset, 0);
     b.setControl(control);
@@ -993,24 +994,25 @@ TEST(AuthLiveChangeRegression, AdminLogFramesNeedTheReadersGrantAtSendTimeRegres
     const auto ctrl0  = securityRecordsFrame(g.sid, secSub, 0, /*control=*/true);
 
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", clusterTable({rune::security::Operation::Admin}), {}});
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, event0.data(), event0.size()), A::Hold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, event0.data(), event0.size(), gHoldUntil), A::Hold)
         << "an event this broker has not applied yet waits (it may follow a revoke of this very reader)";
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size()), A::Deliver)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size(), gHoldUntil), A::Deliver)
         << "a control batch is no event (the applier never mirrors it): never held";
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size()), A::Deliver)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size(), gHoldUntil), A::Deliver)
         << "ADMIN ON CLUSTER is root: it holds DESCRIBE ON CLUSTER, so the catalog streams";
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", clusterTable({rune::security::Operation::Create}), {}});
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size()), A::Withhold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size(), gHoldUntil), A::Withhold)
         << "CREATE ON CLUSTER does not give DESCRIBE ON CLUSTER";
 
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", clusterTable({rune::security::Operation::Describe}), {}});
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size()), A::Withhold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size(), gHoldUntil), A::Withhold)
         << "lost ADMIN: no __security frame, whatever the admin thread still streams";
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size()), A::Deliver);
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size(), gHoldUntil), A::Deliver);
     EXPECT_GE(g.gw.adminLogFramesWithheld(), 1u);
 
     g.gw.setAuthMode(GatewayAuthMode::InProcess, nullptr);
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, event0.data(), event0.size()), A::Deliver) << "dev / in-process";
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, event0.data(), event0.size(), gHoldUntil), A::Deliver)
+        << "dev / in-process";
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1071,13 +1073,36 @@ TEST(AuthLiveChangeAdversarialRegression, ACoalescedSecurityFrameWaitsForItsNewe
     const auto tailAhead = securityFrameOf(g.sid, kSecSub, {{1, 1}, {2, 2}});          // events 1, 2..3: 3 not applied
     const auto inBatch   = securityFrameOf(g.sid, kSecSub, {{2, 3}});                  // one batch 2..4
     const auto ctrlTail  = securityFrameOf(g.sid, kSecSub, {{2, 1}, {3, 1}}, {false, true});   // event 2 + control 3
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, applied.data(), applied.size()), A::Deliver);
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, tailAhead.data(), tailAhead.size()), A::Hold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, applied.data(), applied.size(), gHoldUntil), A::Deliver);
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, tailAhead.data(), tailAhead.size(), gHoldUntil), A::Hold)
         << "a later batch of the same frame is ahead of this broker's mirror";
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, inBatch.data(), inBatch.size()), A::Hold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, inBatch.data(), inBatch.size(), gHoldUntil), A::Hold)
         << "the LAST record of a multi-record batch counts, not its base offset";
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ctrlTail.data(), ctrlTail.size()), A::Deliver)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ctrlTail.data(), ctrlTail.size(), gHoldUntil), A::Deliver)
         << "a control batch is no event";
+}
+
+// Issue #444: a Hold names what it waits for - the frame's newest event - and adminLogHoldReleased turns true exactly
+// when the mirror has applied it (or the view halted: the re-read frame is then Withheld, never delivered).
+TEST(AuthLiveChangeAdversarialRegression, AHoldNamesTheEventItWaitsForAndIsReleasedByTheMirrorRegression) {
+    using A = ClientGateway::AdminLogAdmit;
+    GatewayRig g;
+    auto view = viewApplied(3);   // applied: 0..2
+    g.gw.setAuthMode(GatewayAuthMode::Required, &view);
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", adminTable(), {}});
+    const auto inBatch = securityFrameOf(g.sid, kSecSub, {{2, 3}});   // one batch 2..4
+    int64_t until = -2;
+    ASSERT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, inBatch.data(), inBatch.size(), until), A::Hold);
+    EXPECT_EQ(until, 4) << "the frame's newest event";
+    EXPECT_FALSE(g.gw.adminLogHoldReleased(until)) << "the mirror is at 2";
+    EXPECT_TRUE(g.gw.adminLogHoldReleased(2));
+    g.gw.setSecurityBehind(true);
+    until = -2;
+    ASSERT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, inBatch.data(), inBatch.size(), until), A::Hold);
+    EXPECT_EQ(until, -1) << "behind: no event to wait for";
+    EXPECT_FALSE(g.gw.adminLogHoldReleased(-1)) << "released only once the view is not behind";
+    g.gw.setSecurityBehind(false);
+    EXPECT_TRUE(g.gw.adminLogHoldReleased(-1));
 }
 
 // Precedence and fail-closed states: a reader that lost the grant is Withheld (never merely Held, which would re-offer
@@ -1089,19 +1114,19 @@ TEST(AuthLiveChangeAdversarialRegression, LostGrantHaltedMirrorAndUnauthenticate
     g.gw.setAuthMode(GatewayAuthMode::Required, &view);
     const auto ahead = securityFrameOf(g.sid, kSecSub, {{5, 1}});
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", rune::gateway::PermissionTable::denyAll(), {}});
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size()), A::Withhold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size(), gHoldUntil), A::Withhold)
         << "no grant: withheld even while the event is ahead of the mirror";
     for (const rune::gateway::SessionAuth st : {rune::gateway::SessionAuth{AuthAnonymous{}},
                                                rune::gateway::SessionAuth{AuthPasswordChangeRequired{1, "ops", {}}},
                                                rune::gateway::SessionAuth{AuthAwaitingFirst{INT64_MAX}}}) {
         g.gw.setSessionAuthForTest(g.sid, st);
-        EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size()), A::Withhold);
-        EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kCatSub, ahead.data(), ahead.size()), A::Withhold);
+        EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size(), gHoldUntil), A::Withhold);
+        EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kCatSub, ahead.data(), ahead.size(), gHoldUntil), A::Withhold);
     }
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", adminTable(), {}});
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size()), A::Hold);
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size(), gHoldUntil), A::Hold);
     view.onHalted(rune::security::ApplyError{});
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size()), A::Withhold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size(), gHoldUntil), A::Withhold)
         << "a halted mirror never applies the event: withheld, never held forever";
 }
 
@@ -1116,13 +1141,13 @@ TEST(AuthLiveChangeAdversarialRegression, ASecurityFrameTruncatedAtEveryOffsetIs
     const auto full = securityFrameOf(g.sid, kSecSub, {{0, 2}, {2, 1}});
     for (std::size_t len = 0; len <= full.size(); ++len) {
         std::vector<uint8_t> cut(full.begin(), full.begin() + static_cast<std::ptrdiff_t>(len));   // exact-size buffer
-        (void)g.gw.admitAdminLogFrame(g.sid, kSecSub, cut.data(), cut.size());
+        (void)g.gw.admitAdminLogFrame(g.sid, kSecSub, cut.data(), cut.size(), gHoldUntil);
     }
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, full.data(), full.size()), A::Hold);
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, full.data(), full.size(), gHoldUntil), A::Hold);
     auto lying = full;
     const uint32_t huge = 0xFFFFFFFFu;
     std::memcpy(lying.data() + 48, &huge, 4);
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, lying.data(), lying.size()), A::Hold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, lying.data(), lying.size(), gHoldUntil), A::Hold)
         << "the batch length is clamped to the frame";
 }
 

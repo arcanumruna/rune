@@ -2750,7 +2750,16 @@ public:
     /// whose events this broker's SecurityView has not applied yet waits (a revoke the admin applied first must not
     /// let its successors through).  Deliver / Withhold (dropped: the reader lost the grant) / Hold (offered later).
     enum class AdminLogAdmit : uint8_t { Deliver, Withhold, Hold };
-    [[nodiscard]] AdminLogAdmit admitAdminLogFrame(int64_t sessionId, int64_t subId, const uint8_t* frame, std::size_t len);
+    /// On Hold, `holdUntilEvent` is the `__security` event offset the held frame waits for (-1: the view is behind
+    /// committed events - released by adminLogHoldReleased once it is not).
+    [[nodiscard]] AdminLogAdmit admitAdminLogFrame(int64_t sessionId, int64_t subId, const uint8_t* frame,
+                                                   std::size_t len, int64_t& holdUntilEvent);
+    /// #444: would the gate no longer hold a frame that was held until `holdUntilEvent`?  A halted or absent view
+    /// releases too: the re-read frame is then Withheld by the gate, never delivered.
+    [[nodiscard]] bool adminLogHoldReleased(int64_t holdUntilEvent) const noexcept {
+        return !securityBehind_ && (securityView_ == nullptr || securityView_->halted() ||
+                                    securityView_->appliedOffset() >= holdUntilEvent);
+    }
     [[nodiscard]] uint64_t adminLogFramesWithheld() const noexcept { return adminLogFramesWithheld_; }
     [[nodiscard]] std::size_t sessionsWithPendingReadEndsForTest() const noexcept { return sessionsWithReadEnds_.size(); }
     int pumpReadEndsForTest() { return flushPendingReadEnds_(); }

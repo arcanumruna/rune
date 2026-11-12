@@ -6059,13 +6059,16 @@ int ClientGateway::flushPendingReadEnds_()
 }
 
 ClientGateway::AdminLogAdmit ClientGateway::admitAdminLogFrame(int64_t sessionId, int64_t subId, const uint8_t* frame,
-                                                              std::size_t len)
+                                                              std::size_t len, int64_t& holdUntilEvent)
 {
     using rune::security::Operation;
     if (authMode_ != rune::gateway::GatewayAuthMode::Required) return AdminLogAdmit::Deliver;
     const Session* s = sessions_.find(sessionId);
     if (s == nullptr) return AdminLogAdmit::Deliver;    // the offer answers NoSession
-    if (securityBehind_) [[unlikely]] return AdminLogAdmit::Hold;   // #603: the grant below may already be revoked
+    if (securityBehind_) [[unlikely]] {   // #603: the grant below may already be revoked
+        holdUntilEvent = -1;
+        return AdminLogAdmit::Hold;
+    }
     const bool security = rune::gateway::isSecuritySubscriptionId(subId);
     const PermissionTable& perms = permsOf_(*s);
     if (!perms.allowsCluster(rune::security::opBit(security ? Operation::Admin : Operation::Describe))) {
@@ -6098,7 +6101,9 @@ ClientGateway::AdminLogAdmit ClientGateway::admitAdminLogFrame(int64_t sessionId
         ++adminLogFramesWithheld_;
         return AdminLogAdmit::Withhold;
     }
-    return newestEvent <= securityView_->appliedOffset() ? AdminLogAdmit::Deliver : AdminLogAdmit::Hold;
+    if (newestEvent <= securityView_->appliedOffset()) return AdminLogAdmit::Deliver;
+    holdUntilEvent = newestEvent;
+    return AdminLogAdmit::Hold;
 }
 
 int ClientGateway::flushPendingCatalogUnsubs_()

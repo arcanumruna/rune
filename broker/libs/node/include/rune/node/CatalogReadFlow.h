@@ -34,7 +34,9 @@
 //   bool    postPaused(int64_t session, int64_t subscriptionId, int64_t baseOffset, bool droppedMarker);
 //   bool    postResume(int64_t session, int64_t subscriptionId);
 //   bool    postSessionGone(int64_t session);      // fix round 3: a probe found it gone
-//   Admit   admit(int64_t session, int64_t subscriptionId, const uint8_t* frame, std::size_t n);   // issue #117
+//   Admit   admit(int64_t session, int64_t subscriptionId, const uint8_t* frame, std::size_t n,
+//                 int64_t& holdUntilEvent);   // issue #117; on Hold: the event the frame waits for (-1: any)
+//   bool    holdReleased(int64_t holdUntilEvent);   // #444: would the gate no longer hold that frame?
 
 #include <rune/node/CatalogReadServer.h>
 
@@ -43,6 +45,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <variant>
 #include <vector>
 
@@ -66,6 +69,7 @@ public:
         int64_t session        = 0;
         int64_t subscriptionId = 0;
         State   state;
+        std::optional<int64_t> heldUntil;   ///< #444: set for a Hold (not for a back-pressured frame)
     };
 
     explicit CatalogReadFlow(std::size_t capacity) : capacity_(capacity) { entries_.reserve(capacity); }
@@ -106,7 +110,8 @@ public:
             return;
         }
         if (len == 0) return;   // an ack for a subscription not paused here (already cleared)
-        const Admit admitted = sink.admit(h.session, h.subscriptionId, frame, len);
+        int64_t holdUntil = -1;
+        const Admit admitted = sink.admit(h.session, h.subscriptionId, frame, len, holdUntil);
         if (admitted == Admit::Withhold) [[unlikely]] { ++withheld_; return; }
         if (admitted == Admit::Deliver) {
             switch (sink.tryOffer(h.session, frame, len)) {
@@ -140,7 +145,8 @@ public:
         // history epoch at a baseOffset >= 0 (Task 13 fix round 2: the stream's
         // epoch NOTE has the same size at baseOffset -1 — never a marker).
         const bool marker = isCaughtUpMarker(frame, len);
-        Entry e{h.session, h.subscriptionId, PauseOwed{h.baseOffset, marker}};
+        Entry e{h.session, h.subscriptionId, PauseOwed{h.baseOffset, marker}, std::nullopt};
+        if (admitted == Admit::Hold) e.heldUntil = holdUntil;
         if (sink.postPaused(h.session, h.subscriptionId, h.baseOffset, marker)) e.state = AwaitingAck{};
         entries_.push_back(e);   // reserved: never allocates
     }
@@ -170,6 +176,8 @@ public:
             if (std::holds_alternative<AwaitingRoom>(e.state)) {
                 const Room r = sink.room(e.session);
                 if (r == Room::Gone) { erase_(i); continue; }
+                // #444: a frame held by the gate is re-read only once the gate would let it through.
+                if (e.heldUntil && !sink.holdReleased(*e.heldUntil)) { ++i; continue; }
                 if (r == Room::NotYet) { ++i; continue; }
                 e.state = ResumeOwed{};
             }
