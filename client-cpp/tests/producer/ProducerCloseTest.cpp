@@ -158,10 +158,10 @@ TEST(ProducerClose, BeginCloseRejectsLaterSendsSynchronouslyRegression) {
         SCOPED_TRACE(direct ? "Direct" : "Ring");
         auto* impl = new ProducerImpl(ackCfg());
         if (direct) impl->enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr, kNow});
-        rc::Producer p(impl);
         AckLedger L;
         L.attach(*impl);
         CloseLedger CL;
+        rc::Producer p(impl);  // after the ledgers: its release completes pending sends into them
         const rc::TopicHandle topic{1, 1};
         ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal, AckToken{1}), SendResult::Ok);
         ASSERT_EQ(p.close(rc::CompletionTarget(CL.handler()), 77), OpResult::Accepted);
