@@ -1558,6 +1558,11 @@ public:
     void setAppliedTopicFrontier(int32_t nextTopicId);
     [[nodiscard]] int32_t appliedTopicFrontierForTest() const noexcept { return appliedTopicFrontier_; }
     [[nodiscard]] uint64_t topicFrontierRegressionsIgnored() const noexcept { return topicFrontierRegressionsIgnored_; }
+    /// #500 test seam: the frontiers still queued in the permission shipper (held), each with the number of other
+    /// permission items queued before it.
+    [[nodiscard]] std::vector<std::pair<int32_t, std::size_t>> queuedTopicFrontiersForTest() const {
+        return permissionShipper_.queuedFrontiersForTest();
+    }
     /// Task 22 fix round 1 (C1) — control thread (cold): a view's sink topic id →
     /// its source topic (plan.sourceTopicId[0]).  GetViewRow is answered only on
     /// the broker that leads (source, partition); the view partition IS the source

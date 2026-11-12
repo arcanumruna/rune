@@ -116,3 +116,72 @@ TEST(CheckedWritesImportGrant, AnImportTableAndPatchShipAsOneChunkEachBehindThei
     EXPECT_EQ(p->worker(0).sessionPermissionChunksSeenForTest(), 3u);
     EXPECT_EQ(s.chunksSentForTest(), 3u);
 }
+
+// #500: the applied topic frontier ships to every worker on the same FIFO as the permission items, as the
+// kPermFlagSecurityBehind wire flag with its own `topicId` (kPermLagTopicFrontier), so a worker never reads it as a lag
+// level - and a lag level shipped later does not disturb it.
+TEST(TopicFrontierShipperRegression, TheFrontierReachesEveryWorkerAndIsNeverALagLevelRegression) {
+    auto p = pool(2);
+    PermissionShipper s;
+    EXPECT_EQ(p->worker(0).appliedTopicFrontierForTest(), INT32_MAX) << "none shipped yet";
+    const uint64_t seq = s.topicFrontier(*p, 7);
+    drain(p->worker(0));
+    drain(p->worker(1));
+    EXPECT_EQ(s.shippedSeq(), seq);
+    for (int w = 0; w < 2; ++w) {
+        EXPECT_EQ(p->worker(w).appliedTopicFrontierForTest(), 7) << "worker " << w;
+        EXPECT_EQ(p->worker(w).securityLagForTest(), 0u) << "worker " << w << ": the frontier is not a lag level";
+        EXPECT_EQ(p->worker(w).topicFrontierRejectedForTest(), 0u);
+    }
+    (void)s.securityLag(*p, 2);
+    drain(p->worker(0));
+    drain(p->worker(1));
+    for (int w = 0; w < 2; ++w) {
+        EXPECT_EQ(p->worker(w).securityLagForTest(), 2u) << "worker " << w;
+        EXPECT_EQ(p->worker(w).appliedTopicFrontierForTest(), 7) << "worker " << w << ": a lag level leaves it alone";
+    }
+}
+
+// #500: the worker's copy of the frontier only grows; a lower value, a negative one and one past int32 are ignored and
+// counted.  Mutation: accept a lower value -> the frontier moves back (red).
+TEST(TopicFrontierShipperRegression, TheWorkersFrontierNeverMovesBackRegression) {
+    auto p = pool(1);
+    PermissionShipper s;
+    (void)s.topicFrontier(*p, 10);
+    (void)s.topicFrontier(*p, 4);
+    drain(p->worker(0));
+    EXPECT_EQ(p->worker(0).appliedTopicFrontierForTest(), 10);
+    EXPECT_EQ(p->worker(0).topicFrontierRejectedForTest(), 1u);
+    (void)s.topicFrontier(*p, 10);
+    (void)s.topicFrontier(*p, 12);
+    drain(p->worker(0));
+    EXPECT_EQ(p->worker(0).appliedTopicFrontierForTest(), 12);
+    EXPECT_EQ(p->worker(0).topicFrontierRejectedForTest(), 1u);
+    (void)s.topicFrontier(*p, -1);   // 0xFFFFFFFF on the wire: past int32, out of range
+    drain(p->worker(0));
+    EXPECT_EQ(p->worker(0).appliedTopicFrontierForTest(), 12);
+    EXPECT_EQ(p->worker(0).topicFrontierRejectedForTest(), 2u);
+}
+
+// #500: ORDER - the frontier of an event is queued behind the permission patches of that same event, so a worker that
+// sees the new frontier has already installed the bitmap bit of the topic the event created (otherwise a produce could
+// be refused NotLeader after the apply, or 45 before it).  Held queue: the patch precedes the frontier.
+// Mutation: queue the frontier at the front -> the patch no longer precedes it (red).
+TEST(TopicFrontierShipperRegression, TheFrontierIsQueuedBehindThePatchesOfItsEventRegression) {
+    auto p = pool(1);
+    PermissionShipper s;
+    s.setHoldForTest(true);
+    const std::vector<uint64_t> w1{1};
+    (void)s.patchTable(*p, 0, 0, w1, 1);
+    (void)s.patchTable(*p, 1, 0, w1, 1);
+    (void)s.topicFrontier(*p, 9);
+    const auto q = s.queuedFrontiersForTest();
+    ASSERT_EQ(q.size(), 1u);
+    EXPECT_EQ(q[0].first, 9);
+    EXPECT_EQ(q[0].second, 2u) << "both patches are queued before the frontier";
+    s.setHoldForTest(false);
+    (void)s.retry(*p);
+    drain(p->worker(0));
+    EXPECT_EQ(p->worker(0).sessionPermissionChunksSeenForTest(), 3u);
+    EXPECT_EQ(p->worker(0).appliedTopicFrontierForTest(), 9);
+}

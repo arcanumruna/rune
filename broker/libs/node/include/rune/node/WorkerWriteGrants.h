@@ -89,6 +89,11 @@ inline constexpr uint8_t kSecurityLagDeferDenials = 2;
 /// SESSION_PERMISSIONS `topicId` of a Table / Patch item: which bitmap of the table it carries.
 inline constexpr int32_t kPermBitmapWrite  = 0;
 inline constexpr int32_t kPermBitmapImport = 1;
+/// #500: `topicId` of a kPermFlagSecurityBehind item that carries the broker's applied topic FRONTIER (the catalog's
+/// nextTopicId, in `nextOffset`) instead of a lag level.  The lag-level item carries kPermBitmapWrite (0) here, so the
+/// two never alias.  A worker answers a produce it would deny for a topic id at or above the frontier NotLeader (not
+/// applied here yet), never the terminal NotAuthorized.
+inline constexpr int32_t kPermLagTopicFrontier = 2;
 /// The worker's table store bound (== gateway PermissionPool::kMaxTables).
 inline constexpr std::size_t kMaxWritePermTables = 4096;
 

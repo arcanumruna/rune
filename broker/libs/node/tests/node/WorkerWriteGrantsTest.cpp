@@ -172,6 +172,13 @@ struct Fixture {
         o.nextOffset = level; o.isolation = kPermFlagSecurityBehind | kPermFlagLast;
         ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
     }
+    /// #500: the applied topic frontier as the PermissionShipper ships it (the kPermFlagSecurityBehind flag, topicId =
+    /// kPermLagTopicFrontier, the frontier in nextOffset).
+    void topicFrontier(int64_t frontier) {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = 0; o.topicId = kPermLagTopicFrontier;
+        o.nextOffset = frontier; o.isolation = kPermFlagSecurityBehind | kPermFlagLast;
+        ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
+    }
     void produce(int64_t sid, int64_t corr, int32_t topicId = 1) {
         rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
         const auto batch = b.build();
@@ -757,4 +764,62 @@ TEST(CheckedWritesImportGrant, ImportPatchFlipsOneBit) {
     f.importPatch(3, 130, 131, bitsFor({}, 1));
     f.steps(8);
     EXPECT_FALSE(allowsImport(*f.slot(5), kNew));
+}
+
+// Issue #500: a produce the worker would DENY for a topic id at or above the applied topic frontier is not applied on
+// this broker yet (no bitmap can cover it): the retriable NotLeader, nothing appended, never the terminal 45.  Below
+// the frontier the denial is a verdict; an allowed produce is served; with no frontier shipped (INT32_MAX) every
+// denial is 45.
+// Mutation: remove the worker's frontier branch -> the id at the frontier answers 45 (red).
+TEST(WorkerWriteGrantRegression, ADenialForAnIdNotAppliedHereIsRetriableOnTheWorkerRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.chunk(5, 1, 0, 1, bitsFor({1}, 1), /*last=*/true);   // session 5: WRITE on topic 1
+    f.announce(6, false);
+    f.chunk(6, 1, 0, 1, bitsFor({}, 1), /*last=*/true);    // session 6: nothing yet (topic 1 is "being created")
+
+    f.produce(6, 1, /*topicId=*/1);   // no frontier shipped yet: unknown, so a denial is a verdict
+    ASSERT_TRUE(f.awaitAck(1));
+    EXPECT_EQ(f.acks[1].errorCode, static_cast<int16_t>(pc::ErrorCode::NotAuthorized)) << "frontier unknown: 45";
+    EXPECT_EQ(f.worker->workerDeniesUnappliedForTest(), 0u);
+
+    f.topicFrontier(1);               // id 0 is decided on this broker; 1 and up are not applied yet
+    f.produce(6, 2, /*topicId=*/1);   // at the frontier
+    f.produce(6, 3, /*topicId=*/500); // above it
+    f.produce(6, 4, /*topicId=*/0);   // below it: a verdict
+    f.produce(5, 5, /*topicId=*/1);   // allowed: served whatever the frontier
+    for (int64_t c = 2; c <= 5; ++c) ASSERT_TRUE(f.awaitAck(c)) << c;
+    EXPECT_EQ(f.acks[2].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "at the frontier";
+    EXPECT_EQ(f.acks[3].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "above the frontier";
+    EXPECT_EQ(f.acks[4].errorCode, static_cast<int16_t>(pc::ErrorCode::NotAuthorized)) << "below the frontier";
+    EXPECT_EQ(f.acks[5].errorCode, 0) << "an allowed produce is served";
+    EXPECT_EQ(f.worker->workerDeniesUnappliedForTest(), 2u);
+    EXPECT_EQ(f.worker->workerNotAuthorizedForTest(), 2u) << "only the two real verdicts";
+    EXPECT_EQ(f.log->logEndOffset(), 1) << "nothing appended by a refusal";
+
+    // RefuseAll (#603) still wins; DeferDenials (#506) does not outrank the unapplied answer (not a deferred denial).
+    f.securityLag(1);
+    f.produce(6, 6, /*topicId=*/1);
+    ASSERT_TRUE(f.awaitAck(6));
+    EXPECT_EQ(f.acks[6].errorCode, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable)) << "refuse-all wins";
+    f.securityLag(2);
+    f.produce(6, 7, /*topicId=*/1);
+    f.produce(6, 8, /*topicId=*/0);
+    ASSERT_TRUE(f.awaitAck(7));
+    ASSERT_TRUE(f.awaitAck(8));
+    EXPECT_EQ(f.acks[7].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_EQ(f.acks[8].errorCode, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable)) << "below: deferred as before";
+    EXPECT_EQ(f.worker->workerDeniesUnappliedForTest(), 3u);
+    EXPECT_EQ(f.worker->workerDeniesDeferredForTest(), 1u);
+    EXPECT_EQ(f.log->logEndOffset(), 1);
+
+    // The apply lands: the bitmap word gains the new topic's bit, then the frontier moves past it; the retry is served.
+    f.securityLag(0);
+    f.patch(f.tableOf(6), 0, 1, bitsFor({1}, 1));
+    f.topicFrontier(2);
+    f.produce(6, 9, /*topicId=*/1);
+    ASSERT_TRUE(f.awaitAck(9));
+    EXPECT_EQ(f.acks[9].errorCode, 0) << "after the apply the same produce is appended";
+    EXPECT_EQ(f.log->logEndOffset(), 2);
+    EXPECT_EQ(f.worker->workerDeniesUnappliedForTest(), 3u);
 }

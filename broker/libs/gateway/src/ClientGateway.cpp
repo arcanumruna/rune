@@ -3748,7 +3748,14 @@ void ClientGateway::setAppliedTopicFrontier(int32_t nextTopicId)
         ++topicFrontierRegressionsIgnored_;
         return;
     }
+    if (nextTopicId == appliedTopicFrontier_) return;   // every applied event reports it: ship only a change
     appliedTopicFrontier_ = nextTopicId;
+    // #500: the workers answer a produce they would deny NotLeader for an id at or above it.  Shipped after the value
+    // is stored, FIFO behind every permission patch queued by the effects of the event that moved it (the control
+    // thread processes those effect frames before this one).
+    // Same condition as the permission patches: only shard workers enforce, and only on an authenticating broker.
+    if (workerPool_ != nullptr && shardMode_ && authMode_ == rune::gateway::GatewayAuthMode::Required)
+        (void)permissionShipper_.topicFrontier(*workerPool_, nextTopicId);
 }
 
 std::size_t ClientGateway::endTopicSubscriptions(int32_t topicId)

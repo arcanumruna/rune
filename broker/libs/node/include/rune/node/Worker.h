@@ -936,6 +936,11 @@ public:
     [[nodiscard]] uint8_t securityLagForTest() const noexcept { return static_cast<uint8_t>(securityLag_); }
     [[nodiscard]] uint64_t securityLagUnknownForTest() const noexcept { return securityLagUnknown_; }
     [[nodiscard]] uint64_t workerDeniesDeferredForTest() const noexcept { return workerDeniesDeferred_; }
+    /// #500: denials answered NotLeader (an id at or above the applied topic frontier), the worker's copy of the
+    /// frontier, and the frontier ops it ignored.
+    [[nodiscard]] uint64_t workerDeniesUnappliedForTest() const noexcept { return workerDeniesUnapplied_; }
+    [[nodiscard]] int32_t appliedTopicFrontierForTest() const noexcept { return appliedTopicFrontier_; }
+    [[nodiscard]] uint64_t topicFrontierRejectedForTest() const noexcept { return topicFrontierRejected_; }
     [[nodiscard]] uint64_t securityBehindOpsSeenForTest() const noexcept { return securityBehindOpsSeen_; }
     [[nodiscard]] uint64_t securityBehindRefusalsForTest() const noexcept { return securityBehindRefusals_; }
     /// Test-only (auth Task 18): the shipped permission epoch this worker holds for `sid` (0 = no slot / not enforcing).
@@ -3130,6 +3135,18 @@ private:
             return;
         }
         if ((op.isolation() & kPermFlagSecurityBehind) != 0) [[unlikely]] {   // issue #603: in every worker mode
+            if (op.topicId() == kPermLagTopicFrontier) [[unlikely]] {   // #500: the applied topic frontier
+                const auto frontier = op.nextOffset();
+                if (frontier < 0 || frontier > static_cast<int64_t>(INT32_MAX)) {
+                    ++topicFrontierRejected_;   // out of range: ignored (the frontier only ever grows)
+                } else if (appliedTopicFrontier_ != INT32_MAX &&
+                           frontier < static_cast<int64_t>(appliedTopicFrontier_)) {
+                    ++topicFrontierRejected_;   // monotonic: a lower value never moves it back
+                } else {
+                    appliedTopicFrontier_ = static_cast<int32_t>(frontier);
+                }
+                return;
+            }
             const auto level = op.nextOffset();
             if (level > static_cast<int64_t>(kSecurityLagDeferDenials) || level < 0) [[unlikely]] {
                 securityLag_ = SecurityLag::RefuseAll;   // an unknown level fails closed
@@ -10874,6 +10891,26 @@ private:
         enqueueReturn_(ret);
         return 1;
     }
+    /// #500: answer a direct-ingress produce the session may not WRITE, for a topic id at or above the applied topic
+    /// frontier: the id is not applied on this broker yet (its bitmap bit cannot exist), so the answer is the retriable
+    /// ProduceResponse{NotLeader} (consumed, never appended), counted, logged rate-limited.
+    [[gnu::cold]] [[gnu::noinline]] int refuseUnapplied_(const rune::protocol::client::Produce& msg,
+                                                         uint8_t directAck) {
+        if (workerDeniesUnapplied_++ % 1024 == 0)
+            spdlog::warn("Worker {}: WorkerIngress: produce refused NotLeader - the topic is not applied here yet "
+                         "(session={}, topic={}, frontier={}); total {}", workerId_, msg.sessionId, msg.topicId,
+                         appliedTopicFrontier_, workerDeniesUnapplied_);
+        WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, msg.sessionId, msg.correlationId,
+                                          msg.topicId, msg.partition);
+        ret.directAck = directAck;
+        ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+        enqueueReturn_(ret);
+        return 1;
+    }
+    /// #500: worker-owned copy of the gateway's applied topic frontier (kPermLagTopicFrontier); INT32_MAX = none.
+    int32_t  appliedTopicFrontier_   = INT32_MAX;
+    uint64_t workerDeniesUnapplied_  = 0;   ///< #500: denials answered NotLeader (id at or above the frontier)
+    uint64_t topicFrontierRejected_  = 0;   ///< #500: frontier ops ignored (out of range, or below the current value)
     /// #603 / #506: worker-owned copy of the control thread's lag level (kSecurityLag*).
     enum class SecurityLag : uint8_t { Current = 0, RefuseAll = 1, DeferDenials = 2 };
     SecurityLag securityLag_             = SecurityLag::Current;
@@ -11051,6 +11088,9 @@ private:
                 }
                 if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
                 if (grants != nullptr && grants->table == suspendedWriteTable()) return refuseSuspended_(msg, directAck);
+                // #500: an id at or above the applied topic frontier is not applied here yet, so no bitmap can cover
+                // it: retriable NotLeader (the gateway answers the same for every session), never the terminal 45.
+                if (msg.topicId >= appliedTopicFrontier_) [[unlikely]] return refuseUnapplied_(msg, directAck);
                 // Issue #506: the view holds events it has not applied - one may be the grant this frame relies on, so
                 // the denial is not a verdict: retriable AuthUnavailable.  Allowed frames were served above.
                 if (securityLag_ == SecurityLag::DeferDenials) [[unlikely]] {

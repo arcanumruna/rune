@@ -227,3 +227,56 @@ TEST(ShardAuthProduceRegression, ADropWhileTheOkIsHeldReleasesItAdversarialRegre
     EXPECT_EQ(d->code, 0) << d->message;
     rig.broker().node().holdPermissionShippingForTest(false);
 }
+
+// Issue #500: a produce straight to the owning worker for a topic this broker has not applied yet.  The session holds
+// WRITE ON TOPIC PREFIX 'w.'; the next catalog topic id is not created yet, so the worker's bitmap cannot cover it.
+// The worker answers the retriable NotLeader (never the terminal 45) and appends nothing; once the topic is created
+// and applied the re-sent produce - the same producer sequence - is appended, and the next sequence follows it.
+// Real broker: the catalog apply cannot be held here, so the window is the id of a topic that does not exist yet; the
+// frontier the gateway ships behind the apply's permission patches is what the worker compares against.
+// RED before the fix: the worker answered 45.
+TEST(ShardAuthProduceRegression, AProduceToATopicNotAppliedHereIsRetriableOnTheWorkerStreamRegression) {
+    using namespace grants;
+    using SO = rune::protocol::SecurityOperation;
+    using ST = rune::protocol::SecurityResourceType;
+    AuthRig rig("shard500", shardOptions());
+    const int32_t warm = rig.defineTopic(rig.builder, "w.warm");
+    ASSERT_GE(warm, 0);
+    const int64_t user = rig.newUser({prefix(SO::Write, ST::Topic, "w."), prefix(SO::Create, ST::Topic, "w.")});
+    ASSERT_EQ(shardProduce(rig, user, warm), 0) << "warm-up: login shipped, leadership settled";
+    const int32_t next = warm + 1;   // the catalog's next topic id: not created, so not applied on this broker
+    const auto ids = rig.initProducer(user);
+    ASSERT_EQ(ids.code, 0);
+
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    b.setProducerId(ids.pid); b.setProducerEpoch(ids.epoch); b.setBaseSequence(0);
+    b.append(charKey(), charValue("v"), 1000);
+    const std::vector<uint8_t> batch0 = b.build();
+    auto direct = [&](int32_t topicId, int32_t seq, const std::vector<uint8_t>& batch) -> int {
+        const int64_t corr = rig.c().nextCorrelationId();
+        if (!rig.c().produceIdempotent(rig.broker().workerIngressChannel(), AuthRig::stream(), user, corr, topicId, 0,
+                                       1, ids.pid, ids.epoch, seq, batch))
+            return kNoAnswer;
+        const auto ack = rig.c().awaitProduceResponseUntil(corr, AuthRig::dl(10));
+        return ack ? ack->errorCode : kNoAnswer;
+    };
+    // The frontier follows the warm topic's apply on the same FIFO as its permission patch: a bounded number of
+    // immediate re-sends until the worker has it (45 is only the not-yet-shipped state; it must turn into NotLeader).
+    int code = kNoAnswer;
+    for (int i = 0; i < 200 && (code == kNoAnswer || code == kNotAuthorized); ++i) code = direct(next, 0, batch0);
+    EXPECT_EQ(code, static_cast<int>(pc::ErrorCode::NotLeader)) << "not applied here: retriable";
+
+    const int32_t created = rig.defineTopic(user, "w.z");
+    ASSERT_EQ(created, next) << "the topic got the id the produce addressed";
+    ASSERT_TRUE(awaitServes(rig, created));
+    int after = kNoAnswer;
+    // transient: the worker's registry can lag the gate
+    for (int i = 0; i < 20 && after != 0; ++i) after = direct(created, 0, batch0);
+    EXPECT_EQ(after, 0) << "after the apply the re-sent produce, same sequence, is appended";
+    EXPECT_EQ(rig.logEnd(created), 1) << "appended exactly once";
+    rune::protocol::RecordBatchBuilder b1(0, 1000);
+    b1.setProducerId(ids.pid); b1.setProducerEpoch(ids.epoch); b1.setBaseSequence(1);
+    b1.append(charKey(), charValue("v"), 1000);
+    EXPECT_EQ(direct(created, 1, b1.build()), 0) << "the next sequence follows: the refused produce never advanced it";
+    EXPECT_EQ(rig.logEnd(created), 2);
+}

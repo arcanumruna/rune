@@ -496,6 +496,48 @@ TEST(AuthUnappliedTopicRegression, TheFrontierNeverMovesBackRegression) {
 }
 
 // #988: a gateway without a frontier feed keeps the terminal answer for an unknown id (nothing is "above").
+// #500: the frontier is shipped to the workers (FIFO behind the permission patches) only when the gateway has a worker
+// pool and authenticates (the workers enforce nothing otherwise), and only when it changed.
+// Mutation: ship the frontier at the front of the permission queue -> the patch no longer precedes it (red).
+TEST(AuthUnappliedTopicRegression, TheFrontierIsShippedToTheWorkersBehindThePatchesOfItsEventRegression) {
+    SecurityView view{sec::SecurityState{}};
+    {
+        Rig noAuth;   // a pool, but auth is not Required: nothing to enforce, nothing shipped
+        noAuth.gw.setShardMode(true);
+        noAuth.gw.holdPermissionShippingForTest(true);
+        noAuth.gw.setAppliedTopicFrontier(kPlaced + 3);
+        EXPECT_TRUE(noAuth.gw.queuedTopicFrontiersForTest().empty());
+        Rig noPool(defaultGrants(), defaultImage(), /*withPool=*/false);
+        noPool.gw.setShardMode(true);
+        noPool.gw.setAuthMode(GatewayAuthMode::Required, &view);
+        noPool.gw.holdPermissionShippingForTest(true);
+        noPool.gw.setAppliedTopicFrontier(kPlaced + 3);
+        EXPECT_TRUE(noPool.gw.queuedTopicFrontiersForTest().empty());
+        Rig notShard;   // workers that do not enforce (not shard mode) are sent nothing
+        notShard.gw.setAuthMode(GatewayAuthMode::Required, &view);
+        notShard.gw.holdPermissionShippingForTest(true);
+        notShard.gw.setAppliedTopicFrontier(kPlaced + 3);
+        EXPECT_TRUE(notShard.gw.queuedTopicFrontiersForTest().empty());
+    }
+    Rig r;
+    r.gw.setShardMode(true);
+    r.gw.setAuthMode(GatewayAuthMode::Required, &view);
+    r.gw.holdPermissionShippingForTest(true);
+    const std::size_t before = r.gw.permissionPendingUpdatesForTest();
+    // the event that creates topic kPlaced: its effects first (the patch of the session's table), then the frontier
+    r.gw.onCatalogObjectApplied(kPlaced, "w.z", false);
+    const std::size_t patches = r.gw.permissionPendingUpdatesForTest() - before;
+    ASSERT_GE(patches, 1u) << "the new topic's bit is patched into the session's table";
+    r.gw.setAppliedTopicFrontier(kPlaced + 1);
+    r.gw.setAppliedTopicFrontier(kPlaced + 1);   // every event reports it: an unchanged value ships nothing
+    const auto q = r.gw.queuedTopicFrontiersForTest();
+    ASSERT_EQ(q.size(), 1u);
+    EXPECT_EQ(q[0].first, kPlaced + 1);
+    EXPECT_EQ(q[0].second, before + patches) << "every item queued before it (the patches) precedes the frontier";
+    r.gw.setAppliedTopicFrontier(kPlaced);   // a lower value: ignored, not shipped
+    EXPECT_EQ(r.gw.queuedTopicFrontiersForTest().size(), 1u);
+}
+
 TEST(AuthUnappliedTopicRegression, WithoutAFrontierFeedAnUnknownIdKeepsTheTerminalAnswerRegression) {
     Rig r(defaultGrants(), defaultImage(), /*withPool=*/true, /*feedFrontier=*/false);
     ASSERT_EQ(r.gw.appliedTopicFrontierForTest(), INT32_MAX);

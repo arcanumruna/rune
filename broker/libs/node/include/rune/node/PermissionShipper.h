@@ -94,6 +94,14 @@ public:
         return push_(pool, std::move(it));
     }
 
+    /// #500: this broker's applied topic frontier (the catalog's nextTopicId) - FIFO behind every item queued so far,
+    /// so a worker installs the permission patches of the event that moved it before it sees the new frontier.
+    uint64_t topicFrontier(WorkerPool& pool, int32_t frontier) {
+        Item it{Kind::TopicFrontier};
+        it.first = static_cast<uint64_t>(static_cast<uint32_t>(frontier));
+        return push_(pool, std::move(it));
+    }
+
     /// Resume every worker; returns how many ops were accepted this call.
     int retry(WorkerPool& pool) {
         int sent = 0;
@@ -127,9 +135,21 @@ public:
         }
         return out;
     }
+    /// Test seam (#500): the topic frontiers still queued, in queue order, each with the number of non-frontier,
+    /// non-lag items queued before it (a permission patch must precede the frontier of its own event).  Meaningful
+    /// while held.
+    [[nodiscard]] std::vector<std::pair<int32_t, std::size_t>> queuedFrontiersForTest() const {
+        std::vector<std::pair<int32_t, std::size_t>> out;
+        std::size_t others = 0;
+        for (const Item& it : queue_) {
+            if (it.kind == Kind::TopicFrontier) out.emplace_back(static_cast<int32_t>(it.first), others);
+            else if (it.kind != Kind::SecurityBehind) ++others;
+        }
+        return out;
+    }
 
 private:
-    enum class Kind : uint8_t { Table, Patch, Bind, Drop, Fence, SecurityBehind };
+    enum class Kind : uint8_t { Table, Patch, Bind, Drop, Fence, SecurityBehind, TopicFrontier };
     struct Item {
         Kind                  kind;
         int64_t               key   = 0;   ///< table id (Table / Patch / Drop) or session id (Bind)
@@ -189,6 +209,11 @@ private:
             op.correlationId = static_cast<int64_t>(it.epoch);   // the fence sequence number
             break;
         case Kind::SecurityBehind:   // issue #603
+            op.isolation     = kPermFlagSecurityBehind | kPermFlagLast;
+            op.nextOffset    = static_cast<int64_t>(it.first);
+            break;
+        case Kind::TopicFrontier:    // #500: the same wire flag, told apart by `topicId`
+            op.topicId       = kPermLagTopicFrontier;
             op.isolation     = kPermFlagSecurityBehind | kPermFlagLast;
             op.nextOffset    = static_cast<int64_t>(it.first);
             break;

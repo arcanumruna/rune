@@ -102,7 +102,10 @@ broker knows how far it has applied it (its frontier, the catalog's `nextTopicId
 "not applied here yet" for every session, whatever its namespace or grants and whether or not the id was placed: the
 request answers the retriable `NotLeader` (`NotReady` for GetViewRow), so a topic just created in another namespace
 cannot be told from an id nobody created. An id below the frontier is decided here and keeps the answers above. The
-frontier is not a secret: a tenant sees the counter in the ids of its own topics.
+frontier is not a secret: a tenant sees the counter in the ids of its own topics. With per-worker ingress the gateway
+ships the frontier to every shard worker behind the permission patches of the event that moved it, and a worker answers
+a produce it would deny for an id at or above it `NotLeader` (nothing appended, the producer's sequence unchanged)
+instead of `NotAuthorized`.
 GetTopicSchema on a name whose live object is of a kind the caller holds no DESCRIBE for answers exactly like a
 missing name; a caller with no DESCRIBE on the name under either kind gets NotAuthorized whether or not the object
 exists.
