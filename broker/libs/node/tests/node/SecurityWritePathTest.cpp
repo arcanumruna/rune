@@ -650,6 +650,55 @@ TEST(SecurityWritePathRegression, AQuoteInAGrantPatternCannotForgeASecondStateme
     EXPECT_EQ(outsideLiterals(events[2].event.statement), "GRANT READ ON GROUP  TO ROLE r;");
 }
 
+// #527: a raw wire client's pattern may hold any byte.  The recorded statement is a log line every ADMIN reads, so a
+// control byte (newline, ESC, NUL) or a byte >= 0x80 never reaches it raw: it is escaped as \xhh inside the literal.
+namespace {
+bool hasRawControlOrHighByte(const std::string& s) {
+    for (const char ch : s) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (c < 0x20 || c == 0x7f || c >= 0x80) return true;
+    }
+    return false;
+}
+} // namespace
+
+TEST(SecurityWritePathRegression, AControlByteInAGrantPatternNeverReachesTheAuditTextRawAdversarialRegression) {
+    SecurityDdlRig rig("ctl_pattern");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.ddl(rig.createRole("r")).code, 0);
+    const auto a = rig.ddl(rig.grant(false, sec::GranteeKind::Role, "r", sec::Operation::Read, sec::ResourceType::Group,
+                                     sec::PatternKind::Prefix, "a\nGRANT ADMIN ON CLUSTER TO USER mallory; --"));
+    ASSERT_EQ(a.code, 0) << a.detail;
+    const auto events = rig.recordedEvents();
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_FALSE(hasRawControlOrHighByte(events[1].event.statement)) << "raw control byte in the audit text";
+    EXPECT_NE(events[1].event.statement.find("'a\\x0aGRANT ADMIN ON CLUSTER TO USER mallory; --'"), std::string::npos)
+        << events[1].event.statement;
+}
+
+TEST(SecurityWritePathRegression, ARecordedControlBytePatternStaysRevocableRegression) {
+    SecurityDdlRig rig("ctl_revocable");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.ddl(rig.createRole("r")).code, 0);
+    const std::string pattern = "a\tb";
+    auto a = rig.ddl(rig.grant(false, sec::GranteeKind::Role, "r", sec::Operation::Read, sec::ResourceType::Group,
+                               sec::PatternKind::Exact, pattern));
+    ASSERT_EQ(a.code, 0) << a.detail;
+    const auto* role = rig.state().roleByName(rune::catalog::kDefaultNsId, "r");
+    ASSERT_NE(role, nullptr);
+    EXPECT_EQ(role->grants.size(), 1u);
+    a = rig.ddl(rig.grant(true, sec::GranteeKind::Role, "r", sec::Operation::Read, sec::ResourceType::Group,
+                          sec::PatternKind::Exact, pattern));
+    ASSERT_EQ(a.code, 0) << a.detail;
+    role = rig.state().roleByName(rune::catalog::kDefaultNsId, "r");
+    ASSERT_NE(role, nullptr);
+    EXPECT_TRUE(role->grants.empty()) << "the grant is gone";
+    const auto events = rig.recordedEvents();
+    ASSERT_EQ(events.size(), 3u);
+    EXPECT_EQ(events[1].event.statement, "GRANT READ ON GROUP 'a\\x09b' TO ROLE r;");
+    EXPECT_EQ(events[2].event.statement, "REVOKE READ ON GROUP 'a\\x09b' FROM ROLE r;");
+}
+
 TEST(CheckedWritesImportGrant, GrantImportBelowLevelFiveIsRefused) {
     SecurityDdlRig rig("import_level");
     rig.becomeServingLeader();
