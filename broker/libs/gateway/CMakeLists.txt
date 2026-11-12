@@ -319,7 +319,7 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_gateway_security_fence_tests)
 
     # Authentication Task 10: the bootstrap proof (D4), the __security route, Subscribe -7 and the pre-auth gate - no Aeron.
-    add_executable(rune_gateway_security_tests tests/gateway/SecurityGatewayTest.cpp)
+    add_executable(rune_gateway_security_tests tests/gateway/SecurityGatewayTest.cpp tests/gateway/BootstrapProofTest.cpp)
     target_include_directories(rune_gateway_security_tests PRIVATE ${RUNE_BROKER_DIR}/libs/node/tests)
     target_link_libraries(rune_gateway_security_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_security_tests)

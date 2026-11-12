@@ -1435,6 +1435,27 @@ TEST(ConformanceGolden, SecurityBootstrap) {
     EXPECT_EQ(d->fakeSaltSeed, av::bootstrap().fakeSaltSeed);
 }
 
+TEST(ConformanceGolden, SecurityBootstrapChallengeRequest) {
+    const auto golden = readVector("security_bootstrap_challenge_request.bin");
+    ASSERT_EQ(golden.size(), 24u);   // header only
+    expectHeader(golden, 102, 0);
+    EXPECT_EQ(encodeVec(av::bootstrapChallengeRequest()), golden);
+    auto d = rpc::SecurityBootstrapChallengeRequest::decode(golden.data(), golden.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->sessionId, av::bootstrapChallengeRequest().sessionId);
+    EXPECT_EQ(d->correlationId, av::bootstrapChallengeRequest().correlationId);
+}
+
+TEST(ConformanceGolden, SecurityBootstrapChallenge) {
+    const auto golden = readVector("security_bootstrap_challenge.bin");
+    ASSERT_EQ(golden.size(), 56u);   // header + 32-byte challenge
+    expectHeader(golden, 103, 0);
+    EXPECT_EQ(encodeVec(av::bootstrapChallenge()), golden);
+    auto d = rpc::SecurityBootstrapChallenge::decode(golden.data(), golden.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->challenge, av::bootstrapChallenge().challenge);
+}
+
 TEST(ConformanceGolden, ConnectResponseV9) {
     const auto golden = readVector("connect_response_v9.bin");
     ASSERT_EQ(golden.size(), 49u);   // 24 + 21 + var32 length (empty handshake)

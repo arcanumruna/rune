@@ -124,6 +124,11 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     LeaseTimeToLiveResponse = 99,
     ScanLeases              = 100,
     ScanLeasesResponse      = 101,
+    // bootstrap challenge (client version 19): the bootstrap proof is bound to a one-use challenge (#234); sent only to
+    // a
+    // session >= kClientVersionBootstrapChallenge.  The answer to 102 is 103 (an unusable session gets a DdlResponse).
+    SecurityBootstrapChallengeRequest = 102,   // client -> broker
+    SecurityBootstrapChallenge        = 103,   // broker -> client
 };
 
 enum class ErrorCode : uint16_t {
@@ -427,7 +432,13 @@ inline constexpr int32_t kClientVersionCheckedWrites              = 17;
 //   block on DefineTopic.  A broker >= 11 serves them.  A session below 18 is never sent 64-66 (produceErrorForClient
 //   answers InvalidRequest), a lease trailer or templates 96-101, and keeps byte-identical frames.
 inline constexpr int32_t kClientVersionLeases                     = 18;
-inline constexpr int32_t kClientVersion                           = kClientVersionLeases;  // what this protocol's client announces
+// 19 — bootstrap challenge (#234): templates 102-103 (SecurityBootstrapChallengeRequest / SecurityBootstrapChallenge).
+// The
+//   SecurityBootstrap (80) MAC is keyed by a subkey of the cluster master and covers a one-use challenge the gateway
+//   issued on the session; a broker >= 12 serves it, a client < 19 cannot bootstrap.
+inline constexpr int32_t kClientVersionBootstrapChallenge         = 19;
+// what this protocol's client announces
+inline constexpr int32_t kClientVersion                           = kClientVersionBootstrapChallenge;
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
@@ -473,7 +484,10 @@ inline constexpr int32_t kBrokerVersionResponseEgress             = 9;   // NAT-
 inline constexpr int32_t kBrokerVersionCheckedWrites              = 10;  // checked writes (client version 17)
 // 11 — lease topics (see client version 18)
 inline constexpr int32_t kBrokerVersionLeases                     = 11;
-inline constexpr int32_t kBrokerVersion                           = kBrokerVersionLeases;   // what this protocol's broker announces
+// 12 — bootstrap challenge (see client version 19)
+inline constexpr int32_t kBrokerVersionBootstrapChallenge         = 12;
+// what this protocol's broker announces
+inline constexpr int32_t kBrokerVersion                           = kBrokerVersionBootstrapChallenge;
 
 /// Issue #116: true when a session whose client announced `clientVersion` and whose broker announced
 /// `brokerVersion` binds each encrypted client->broker frame to one receiver (see client version 12).

@@ -1322,6 +1322,7 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::AlterView:
         case pc::TemplateId::SecurityDdl:
         case pc::TemplateId::SecurityBootstrap:
+        case pc::TemplateId::SecurityBootstrapChallengeRequest:
         case pc::TemplateId::NamespaceDdl:
         case pc::TemplateId::ListNamespaces:
         case pc::TemplateId::NamespaceUsage:
@@ -1442,6 +1443,9 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             break;
         case pc::TemplateId::SecurityBootstrap:
             handleSecurityBootstrap(buf, len);
+            break;
+        case pc::TemplateId::SecurityBootstrapChallengeRequest:
+            handleSecurityBootstrapChallengeRequest(buf, len);
             break;
         // Namespaces Task 7: namespace DDL (81, catalog-routed) and ListNamespaces (82, any broker).
         case pc::TemplateId::NamespaceDdl:
@@ -9684,7 +9688,9 @@ bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std
                                   m->change == pc::UserChangeKind::SetPassword && ownUserName_(*session, m->name, pcr->user);
 
     // bootstrapOpen_() walks the account list: evaluated only for the one request that can use it (never per frame).
-    const AuthGate gate = gateFor(session->auth, tid, tid == pc::TemplateId::SecurityBootstrap && bootstrapOpen_(), selfSetPassword);
+    const bool bootstrapTid =
+        tid == pc::TemplateId::SecurityBootstrap || tid == pc::TemplateId::SecurityBootstrapChallengeRequest;
+    const AuthGate gate = gateFor(session->auth, tid, bootstrapTid && bootstrapOpen_(), selfSetPassword);
     if (gate == AuthGate::Allow) {
         // Issue #603: every grant-checked request waits for the view to apply the committed events this broker holds.
         // The login legs answer it themselves (securityUnavailable_: AuthServerFinal 48 + the session's end).
@@ -9812,6 +9818,7 @@ bool ClientGateway::becomeAnonymousIfAllowed_(Session& session, pc::TemplateId t
     const auto* d = namespaces_.registry().byId(rune::catalog::kDefaultNsId);
     if (anonymousRead_ && authMode_ == GatewayAuthMode::Required && tid != pc::TemplateId::AuthClientFirst &&
         tid != pc::TemplateId::AuthClientFinal && tid != pc::TemplateId::SecurityBootstrap &&
+        tid != pc::TemplateId::SecurityBootstrapChallengeRequest &&
         std::holds_alternative<rune::gateway::AuthAwaitingFirst>(session.auth) &&
         (d == nullptr || rune::node::nsFeatureAllowed(d->limits, rune::protocol::kNsFeatureAnonymousRead))) {
         // Namespaces Phase 2 Task 10 (#236, D24): the anonymous cap applies before any namespace limit.
@@ -10069,6 +10076,7 @@ bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::D
         case pc::TemplateId::AlterView:
         case pc::TemplateId::SecurityDdl:
         case pc::TemplateId::SecurityBootstrap:
+        case pc::TemplateId::SecurityBootstrapChallengeRequest:
         case pc::TemplateId::NamespaceDdl: {
             pc::DdlResponse r;
             r.sessionId = hdr->sessionId; r.correlationId = hdr->correlationId;
@@ -11318,9 +11326,9 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
         noteUnanswerable_(buf, len, "SecurityBootstrap for unknown session");
         return;
     }
-    if (!pc::clientUnderstandsAuth(session->clientVersion)) {
+    if (session->clientVersion < pc::kClientVersionBootstrapChallenge) {
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
-                             "SecurityBootstrap needs client version 9");
+                             "SecurityBootstrap needs client version 19");
         return;
     }
     if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111
@@ -11328,21 +11336,31 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
                              "this broker's security state is not current - retry on another broker");
         return;
     }
+    // #234: the challenge issued on THIS session is used up by this attempt, whatever its outcome (single use).
+    const uint64_t challengeId = std::exchange(session->bootstrapChallengeId, uint64_t{0});
+    std::array<uint8_t, pc::kBootstrapChallengeBytes> challenge{};
+    const bool haveChallenge = challengeId != 0 && bootstrapChallengeOf_(challengeId, challenge);
     // D4: a fresh cluster cannot be hijacked by whoever reaches it first - the request must prove possession of the
-    // cluster key (current or next).  Verified HERE with this thread's own copy of the keys, before the admin thread
-    // is involved; the refusal is explicit, and logged with where it came from.
-    const BootstrapProof proof = verifyBootstrapProof(m, clusterKeys_ ? &*clusterKeys_ : nullptr, bootstrapMacScratch_);
-    if (proof != BootstrapProof::Ok) {
+    // cluster key (current or next) over the challenge this gateway issued on this session (#234).  Verified HERE with
+    // this thread's own copy of the keys, before the admin thread is involved; the refusal is explicit, and logged
+    // with where it came from.
+    const BootstrapProof proof = haveChallenge
+        ? verifyBootstrapProof(m, challenge, clusterKeys_ ? &*clusterKeys_ : nullptr, bootstrapMacScratch_)
+        : BootstrapProof::Mismatch;
+    if (!haveChallenge || proof != BootstrapProof::Ok) {
         ++bootstrapsRefused_;
         if (unauthLog_.due(3)) [[unlikely]]   // X103: an unauthenticated session drives this
-            spdlog::warn("security: bootstrap refused from {}: bad cluster-key proof{}", LogSafeName{session->sourceIdentity},
+            spdlog::warn("security: bootstrap refused from {}: {}{}", LogSafeName{session->sourceIdentity},
+                         !haveChallenge ? "no challenge" : "bad cluster-key proof",
                          proof == BootstrapProof::NoKey ? " (this broker holds no cluster key: authentication is not enabled)" : "");
         pc::DdlResponse r;
         r.sessionId     = m.sessionId;
         r.correlationId = m.correlationId;
         r.errorCode     = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
-        r.detail        = proof == BootstrapProof::NoKey ? "this broker has no cluster key: authentication is not enabled"
-                                                         : "bootstrap proof does not match this cluster's key";
+        r.detail        = !haveChallenge
+            ? "no bootstrap challenge on this session: request one first (client version 19)"
+            : proof == BootstrapProof::NoKey ? "this broker has no cluster key: authentication is not enabled"
+                                             : "bootstrap proof does not match this cluster's key";
         const std::size_t n = r.encode(scratch_.data());
         sendAnswer_(*session, scratch_.data(), n);
         return;
@@ -11361,6 +11379,64 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
         }
     answerAdminSubmit_(buf, len, submitted, "SecurityBootstrap: admin ring full",
                        "SecurityBootstrap: request larger than the admin ring message");
+}
+
+bool ClientGateway::bootstrapChallengeOf_(uint64_t id, std::array<uint8_t, 32>& out)
+{
+    if (!bootstrapChallengeSecretReady_) {
+        if (!rune::crypto::randomBytes(bootstrapChallengeSecret_)) return false;
+        bootstrapChallengeSecretReady_ = true;
+    }
+    uint8_t idBytes[8];
+    for (int i = 0; i < 8; ++i) idBytes[i] = static_cast<uint8_t>(id >> (8 * i));
+    rune::crypto::DigestBytes mac;
+    const std::span<const uint8_t> idSpan(idBytes, 8);
+    if (!rune::crypto::hmac(rune::crypto::Digest::Sha512, bootstrapChallengeSecret_, idSpan, mac) ||
+        mac.size < out.size())
+        return false;
+    std::memcpy(out.data(), mac.bytes.data(), out.size());
+    return true;
+}
+
+// #234: SecurityBootstrapChallengeRequest (102): the gateway answers 32 bytes unique per request, valid for ONE
+// bootstrap
+// attempt on THIS session; a newer request replaces an older unused challenge.  Gated exactly like the bootstrap.
+void ClientGateway::handleSecurityBootstrapChallengeRequest(const uint8_t* buf, std::size_t len)
+{
+    const auto msgOpt = pc::SecurityBootstrapChallengeRequest::decode(buf, len);
+    if (!msgOpt) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                             "SecurityBootstrapChallengeRequest body undecodable");
+        return;
+    }
+    Session* session = sessions_.find(msgOpt->sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "SecurityBootstrapChallengeRequest for unknown session");
+        return;
+    }
+    if (session->clientVersion < pc::kClientVersionBootstrapChallenge) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                             "SecurityBootstrapChallengeRequest needs client version 19");
+        return;
+    }
+    if (securityUnavailable_()) [[unlikely]] {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable),
+                             "this broker's security state is not current - retry on another broker");
+        return;
+    }
+    const uint64_t id = ++bootstrapChallengeCounter_;
+    pc::SecurityBootstrapChallenge ans;
+    ans.sessionId = msgOpt->sessionId;
+    ans.correlationId = msgOpt->correlationId;
+    if (!bootstrapChallengeOf_(id, ans.challenge)) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                             "no randomness for a bootstrap challenge");
+        return;
+    }
+    session->bootstrapChallengeId = id;   // a newer request replaces an older unused challenge
+    ++bootstrapChallengesIssued_;
+    const std::size_t n = ans.encode(scratch_.data());
+    sendAnswer_(*session, scratch_.data(), n);
 }
 
 // ---------------------------------------------------------------------------

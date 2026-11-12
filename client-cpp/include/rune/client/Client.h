@@ -1672,6 +1672,8 @@ private:
         int32_t              routeTopic = -1;
         int32_t              routePartition = -1;
         bool                 hinted = false;   // `endpoint` came from the route-hint table and no Redirect was followed yet
+        // #234: non-empty = every offer sends THIS first (a bootstrap's challenge request)
+        std::vector<uint8_t> challengeFrame;
     };
     static constexpr int32_t kRouteAnyPartition = -2;
     /// L22 fix 2: the node that last answered a partition-routed op for (topic, partition) - the next op starts there
@@ -1718,7 +1720,9 @@ private:
         /// own deadline; it never reached a broker.
         struct CtlAwaitingSeed { std::vector<uint8_t> frame; };
         std::variant<std::monostate, RoutedCtlPending, CtlAwaitingSeed> ddl;   // catalog history: a DDL's own state
-        detail::SecretString newPassword;   // review B I4: a self SET PASSWORD's plaintext until its answer (wiped always)
+        /// review B I4: a self SET PASSWORD's plaintext, or a bootstrap's MAC key (#234), until its answer
+        /// (wiped always)
+        detail::SecretString newPassword;
         /// Task 15: a multi-entry LeaseKeepAlive (leaseKeepAliveBatch).  multiCount > 0: each answered entry delivers its own completion
         /// (reserved0 = the entry index, 48 reserved bytes); the op's terminal completion (reserved0 == kLeaseKeepAliveTerminal) carries
         /// 48 x (1 + unanswered entries).  multiBits marks the entries answered so far (a duplicate or out-of-range index is dropped).
@@ -1940,6 +1944,9 @@ private:
     /// Offer d.frame to d.endpoint's node (the seed when ""); on Accepted, `on`
     /// names the session it went out on.
     transport::AeronTransport::OfferResult offerDdl_(RoutedCtlPending& d, int64_t nowNs, DdlOfferedOn& on);
+    /// The ONE site that offers a routed op's bytes to its node: `frame` to `d.endpoint`, naming the session it rode.
+    transport::AeronTransport::OfferResult offerRoutedFrame_(RoutedCtlPending& d, std::vector<uint8_t>& frame,
+                                                             int64_t nowNs, DdlOfferedOn& on);
     /// Move d to `next`, keeping routedCtlAwaitingResend_ exact.
     void setDdlRetry_(RoutedCtlPending& d, DdlRetry next) noexcept;
     /// routedCtlPending_ / routedCtlAwaitingResend_ for an entry entering (+1) / leaving (-1) the table.

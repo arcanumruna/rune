@@ -107,15 +107,15 @@ auto users = client.securityUsers(10s);                     // ADMIN on CLUSTER 
 | Call | Purpose |
 |---|---|
 | `securityDdl(plan, ddl, target, token)` / `securityDdlAndWait(plan, ddl, timeout)` | Every security DDL: users, roles, grants, passwords. |
-| `bootstrapSecurity(...)` / `bootstrapSecurityAndWait(adminName, oneTimePassword, clusterKeyFileContents, timeout)` | The one-time first-admin bootstrap of a fresh cluster. The MAC under the cluster key proves possession. |
+| `bootstrapSecurity(...)` / `bootstrapSecurityAndWait(adminName, oneTimePassword, clusterKeyFileContents, timeout)` | The one-time first-admin bootstrap of a fresh cluster. Challenge-response (#234): each attempt asks the gateway for a one-use challenge and signs the frame with a subkey of the cluster key; `BrokerTooOld` against a broker below version 12. |
 | `securityHistory(filter, timeout)` | The replayed `__security` events. |
 | `securityGrantsFor(kind, name, asOf, timeout)` | Effective grants of a user or role, direct and through roles. |
 | `securityUsers(timeout)`, `securityRoles(timeout)` | Current users and roles. |
 | `securityReader()` | The cached reader behind the four calls above. |
 
 Reads of `__security` need `ADMIN` on `CLUSTER`; any other principal gets `Kind::Rejected` with broker code 45.
-`rune::client::security::buildVerifier`, `fillSecurityDdl` and `buildBootstrap` (`security/SecurityDdl.h`) are the low-level
-verifier builders.
+`rune::client::security::buildVerifier`, `fillSecurityDdl`, `buildBootstrap` and `signBootstrap` (`security/SecurityDdl.h`) are the
+low-level builders (a bootstrap frame is built without its MAC and signed once the challenge is known).
 
 ## Topics and DDL
 

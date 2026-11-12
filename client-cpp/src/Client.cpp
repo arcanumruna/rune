@@ -1676,6 +1676,12 @@ bool leaseOpTooOld(rune::client::OpKind op, int32_t brokerVersion) noexcept {
             op == OpKind::ScanLeases) &&
            brokerVersion >= 1 && brokerVersion < rune::protocol::client::kBrokerVersionLeases;
 }
+
+// #234: the bootstrap's challenge-response needs broker >= 12.  `brokerVersion` 0 = unknown: sent.
+bool bootstrapTooOld(rune::client::OpKind op, int32_t brokerVersion) noexcept {
+    return op == rune::client::OpKind::SecurityBootstrap && brokerVersion >= 1 &&
+           brokerVersion < rune::protocol::client::kBrokerVersionBootstrapChallenge;
+}
 }  // namespace
 
 namespace {
@@ -1871,13 +1877,22 @@ OpResult Client::bootstrapSecurity(std::string_view adminName, std::string_view 
     namespace rpc = rune::protocol::client;
     rpc::SecurityBootstrap msg;
     security::VerifierStorage vs;
+    // #234: the MAC covers the gateway's one-use challenge, so it is made on the duty thread when the challenge
+    // arrives; the MAC key (a subkey of the cluster master) rides to it as the op's secret, like a self password.
+    std::array<uint8_t, 64> macKey{};
+    struct WipeKey {
+        std::array<uint8_t, 64>& k;
+        ~WipeKey() { detail::secureZero(k.data(), k.size()); }
+    } wipeKey{macKey};
     security::buildBootstrap(adminName, oneTimePassword, clusterKeyFileContents, cfg_.scramIterations,
-                             cfg_.minPasswordLength, vs, msg);
+                             cfg_.minPasswordLength, vs, msg, macKey);
     std::vector<uint8_t> frame(msg.encodedSize());
     const std::size_t n = msg.encode(frame.data());
     if (n == 0) return OpResult::InvalidArgument;
-    // No DDL extension: the bootstrap's nonce is its identity; a resend carries the same bytes.
-    return issueControl_(OpKind::SecurityBootstrap, target, token, std::span<const uint8_t>(frame.data(), n), 0, 0);
+    // No DDL extension: the bootstrap's nonce is its identity; a resend carries the same bytes (re-signed per
+    // challenge).
+    return issueControl_(OpKind::SecurityBootstrap, target, token, std::span<const uint8_t>(frame.data(), n), 0, 0,
+                         std::span<const uint8_t>(macKey.data(), macKey.size()));
 }
 
 OpResult Client::getViewRow(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint,
@@ -2136,7 +2151,8 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             }
         }
     }
-    if (checkedWritesReadTooOld(h.op, agent_.sessionBrokerVersion(0)) || leaseOpTooOld(h.op, agent_.sessionBrokerVersion(0))) {
+    if (checkedWritesReadTooOld(h.op, agent_.sessionBrokerVersion(0)) ||
+        leaseOpTooOld(h.op, agent_.sessionBrokerVersion(0)) || bootstrapTooOld(h.op, agent_.sessionBrokerVersion(0))) {
         completeCtl_(p, OpStatus::BrokerTooOld, ddlNoValue(p.op));
         return;
     }
@@ -2178,6 +2194,14 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             framePool_.pop_back();
         }
         d.frame.assign(ctlScratch_.begin(), ctlScratch_.end());
+        // #234: every offer asks for a fresh challenge first (same stamps as the frame)
+        if (h.op == OpKind::SecurityBootstrap) {
+            rpc::SecurityBootstrapChallengeRequest rq;
+            rq.sessionId     = machine.sessionId();
+            rq.correlationId = p.corrId;
+            d.challengeFrame.resize(rq.encodedSize());
+            rq.encode(d.challengeFrame.data());
+        }
         if (!endpointPool_.empty()) {   // L22 fix 2: a recycled endpoint string (capacity kept)
             d.endpoint = std::move(endpointPool_.back());
             endpointPool_.pop_back();
@@ -2385,8 +2409,15 @@ void Client::failControlOnSeedLoss_(uint16_t errorCode, std::span<const uint8_t>
 }
 
 transport::AeronTransport::OfferResult Client::offerDdl_(RoutedCtlPending& d, int64_t nowNs, DdlOfferedOn& on) {
+    // #234: a bootstrap starts every attempt, on any node, with a challenge request; its answer triggers the signed
+    // frame.
+    return offerRoutedFrame_(d, d.challengeFrame.empty() ? d.frame : d.challengeFrame, nowNs, on);
+}
+
+transport::AeronTransport::OfferResult Client::offerRoutedFrame_(RoutedCtlPending& d, std::vector<uint8_t>& frame,
+                                                                 int64_t nowNs, DdlOfferedOn& on) {
     uint32_t idx = 0;
-    const auto r = agent_.offerToEndpoint(d.endpoint, d.frame.data(), d.frame.size(), nowNs, idx);
+    const auto r = agent_.offerToEndpoint(d.endpoint, frame.data(), frame.size(), nowNs, idx);
     // #290: the node session is named on a refusal too (its epoch is 0 then) — a Rejected one ends the DDL.
     on = DdlOfferedOn{idx, r == transport::AeronTransport::OfferResult::Accepted ? agent_.connectedEpoch(idx) : 0};
     return r;
@@ -2682,7 +2713,8 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
         if ((p.op == OpKind::DefineTopic && (defineKeyFeaturesTooOld(d->frame, agent_.sessionBrokerVersion(0)) ||
                                          defineLeaseTooOld(d->frame, agent_.sessionBrokerVersion(0)))) ||
             checkedWritesReadTooOld(p.op, agent_.sessionBrokerVersion(0)) ||
-            leaseOpTooOld(p.op, agent_.sessionBrokerVersion(0))) {
+            leaseOpTooOld(p.op, agent_.sessionBrokerVersion(0)) ||
+            bootstrapTooOld(p.op, agent_.sessionBrokerVersion(0))) {
             PendingCtl dead = takeCtl_(i);   // queued before the seed connected: the version is known now
             completeCtl_(dead, OpStatus::BrokerTooOld, ddlNoValue(dead.op));
             ++work;
@@ -5444,6 +5476,56 @@ void Client::onEgressFrame(codec::TemplateId tid,
                          opt->errorCode,
                          std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(opt->detail.data()),
                                                   opt->detail.size()));
+        }
+        break;
+    }
+
+    // ---- #234: SecurityBootstrapChallenge (103) - the gateway's one-use challenge for an in-flight bootstrap.  The
+    // MAC
+    //      (made under the op's key, held in PendingCtl::newPassword) is written into the frame, which is then sent.
+    case codec::TemplateId::SecurityBootstrapChallenge: {
+        namespace rpc = rune::protocol::client;
+        using Offer = transport::AeronTransport::OfferResult;
+        const auto opt = rpc::SecurityBootstrapChallenge::decode(buf, len);
+        if (!opt) break;
+        const std::size_t i = findCtl_(opt->correlationId);
+        if (i >= pendingCtl_.size() || pendingCtl_[i].op != OpKind::SecurityBootstrap) break;
+        PendingCtl& p = pendingCtl_[i];
+        auto* d = std::get_if<RoutedCtlPending>(&p.ddl);
+        // Only an in-flight attempt (its challenge request is out) takes a challenge; the key must be the 64-byte one.
+        if (d == nullptr || p.newPassword.view().size() != 64) break;
+        const auto* sent = std::get_if<DdlSent>(&d->retry);
+        const auto* seen = std::get_if<DdlNotLeaderSeen>(&d->retry);
+        if (sent == nullptr && seen == nullptr) break;
+        std::array<uint8_t, 64> key{};
+        std::memcpy(key.data(), p.newPassword.view().data(), key.size());
+        const bool signedOk = security::signBootstrap(key, opt->challenge, d->frame);
+        detail::secureZero(key.data(), key.size());
+        const int64_t nowNs = now();
+        if (!signedOk) {
+            constexpr std::string_view kWhy = "cannot compute the bootstrap MAC";
+            PendingCtl dead = takeCtl_(i);
+            dead.newPassword.wipe();
+            completeCtl_(dead, OpStatus::InvalidArgument, ddlNoValue(dead.op), 0, 0,
+                         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()), kWhy.size()));
+            break;
+        }
+        DdlOfferedOn on;
+        switch (offerRoutedFrame_(*d, d->frame, nowNs, on)) {
+        case Offer::Accepted:
+            if (sent != nullptr) setDdlRetry_(*d, DdlSent{sent->redirects, on});
+            else                 setDdlRetry_(*d, DdlNotLeaderSeen{seen->redirects, seen->budgetEndNs,
+                                                                   seen->backoffNs, on});
+            break;
+        case Offer::Retry:   // re-sent within the budget; the resend asks for a new challenge
+            onDdlNotLeader_(i, "bootstrap challenge received but the request could not be sent", nowNs);
+            break;
+        case Offer::Fatal: {
+            PendingCtl dead = takeCtl_(i);
+            dead.newPassword.wipe();
+            completeCtl_(dead, OpStatus::NotConnected);
+            break;
+        }
         }
         break;
     }

@@ -227,9 +227,9 @@ TEST(NamespaceMessagesRegression, TemplateDispatchRegression) {
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::ListNamespaces), 82);
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::ListNamespacesResponse), 83);
     EXPECT_EQ(pc::kProtocolVersion, 3);
-    EXPECT_EQ(pc::kClientVersion, 18);   // v18: lease topics; v17: checked writes; v16: NAT-safe response egress; v15: RecordEgressUnavailable (#450)
+    EXPECT_EQ(pc::kClientVersion, 19);   // v19: bootstrap challenge (#234); v18: lease topics; v17: checked writes; v16: NAT-safe response egress; v15: RecordEgressUnavailable (#450)
     EXPECT_EQ(pc::kClientVersionNamespaces, 14);
-    EXPECT_EQ(pc::kBrokerVersion, 11);   // v11: lease topics; v10: checked writes
+    EXPECT_EQ(pc::kBrokerVersion, 12);   // v12: bootstrap challenge; v11: lease topics; v10: checked writes
 }
 
 TEST(NamespaceMessagesRegression, ErrorCodeValuesRegression) {

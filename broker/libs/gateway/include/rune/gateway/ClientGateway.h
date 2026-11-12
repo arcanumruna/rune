@@ -435,6 +435,8 @@ public:
     /// proof (D4) is verified with it.  Unset (InProcessUnauthenticated / dev): every bootstrap is refused.
     void setClusterKeys(rune::peerlink::ClusterKeys keys) { clusterKeys_ = std::move(keys); }
     [[nodiscard]] uint64_t bootstrapsRefused() const noexcept { return bootstrapsRefused_; }
+    /// #234: bootstrap challenges issued (answers to SecurityBootstrapChallengeRequest).
+    [[nodiscard]] uint64_t bootstrapChallengesIssued() const noexcept { return bootstrapChallengesIssued_; }
     /// X103: log lines the 1/1024 limiter swallowed (require-TLS refusals, bad bootstrap proofs, login failures).
     [[nodiscard]] uint64_t unauthLogSuppressed() const noexcept { return unauthLog_.suppressed(); }
     /// #145: unauthenticated-sender log lines suppressed node-wide: this gateway's own plus the cumulative counts the
@@ -1735,6 +1737,9 @@ public:
         case pc::TemplateId::AlterView:        handleAlterView(buf, len); break;
         case pc::TemplateId::SecurityDdl:      handleSecurityDdl(buf, len); break;
         case pc::TemplateId::SecurityBootstrap: handleSecurityBootstrap(buf, len); break;
+        case pc::TemplateId::SecurityBootstrapChallengeRequest:
+            handleSecurityBootstrapChallengeRequest(buf, len);
+            break;
         case pc::TemplateId::NamespaceDdl:     handleNamespaceDdl(buf, len); break;
         case pc::TemplateId::ListNamespaces:   handleListNamespaces(buf, len); break;
         case pc::TemplateId::NamespaceUsage:   handleNamespaceUsage(buf, len); break;
@@ -2229,6 +2234,11 @@ private:
     // Authentication Task 10: SecurityDdl (79) and SecurityBootstrap (80).
     void handleSecurityDdl      (const uint8_t* buf, std::size_t len);
     void handleSecurityBootstrap(const uint8_t* buf, std::size_t len);
+    /// #234: SecurityBootstrapChallengeRequest (102) -> SecurityBootstrapChallenge (103).
+    void handleSecurityBootstrapChallengeRequest(const uint8_t* buf, std::size_t len);
+    /// #234: the challenge for `id`: the first 32 bytes of HMAC-SHA-512(per-process secret, id as 8 LE bytes).  The
+    /// secret is drawn on first use; false (and not ready) when no randomness is available.
+    [[nodiscard]] bool bootstrapChallengeOf_(uint64_t id, std::array<uint8_t, 32>& out);
     // Namespaces Task 7: NamespaceDdl (81) and ListNamespaces (82).
     void handleNamespaceDdl     (const uint8_t* buf, std::size_t len);
     void handleListNamespaces   (const uint8_t* buf, std::size_t len);
@@ -3057,6 +3067,12 @@ private:
     uint64_t sessionScansForTest_ = 0;     ///< #266: whole-table walks made by reapExpired
     uint64_t authGateRefusals_ = 0;
     uint64_t bootstrapsRefused_ = 0;
+    // #234: the bootstrap challenges (control thread only).  A challenge never repeats within a process (the counter)
+    // and cannot be predicted (the secret); a restarted broker has a new secret.
+    std::array<uint8_t, 32> bootstrapChallengeSecret_{};
+    bool bootstrapChallengeSecretReady_ = false;
+    uint64_t bootstrapChallengeCounter_ = 0;
+    uint64_t bootstrapChallengesIssued_ = 0;
     std::optional<rune::peerlink::ClusterKeys> clusterKeys_;
     std::vector<uint8_t> bootstrapMacScratch_;   // reused MAC input (capacity persists)
 

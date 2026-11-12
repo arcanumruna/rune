@@ -1,6 +1,7 @@
 // rune-crypto: the primitives authentication is built on, pinned to their RFC vectors.
 #include "rune/crypto/Kdf.h"
 #include <gtest/gtest.h>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -156,4 +157,24 @@ TEST(WorkerBindTokenRegression, DerivationIsStableKeyedAndPerSession) {
     const std::string_view info = "rune-worker-bind-v1";
     ASSERT_TRUE(rc::hkdf(rc::Digest::Sha256, key, salt, {reinterpret_cast<const uint8_t*>(info.data()), info.size()}, ref));
     EXPECT_EQ(a, ref);
+}
+
+TEST(BootstrapMacKeyRegression, DerivationIsTheHkdfSubkeyAndNeverTheMasterRegression) {
+    std::array<uint8_t, 64> master{};
+    for (std::size_t i = 0; i < master.size(); ++i) master[i] = static_cast<uint8_t>(i);
+    std::array<uint8_t, 64> a{}, b{}, ref{};
+    ASSERT_TRUE(rc::deriveBootstrapMacKey(master, a));
+    ASSERT_TRUE(rc::deriveBootstrapMacKey(master, b));
+    EXPECT_EQ(a, b) << "deterministic";
+    EXPECT_NE(a, master) << "a subkey, never the master";
+    const std::string_view info = "rune-bootstrap-mac-v2";
+    const std::span<const uint8_t> infoBytes(reinterpret_cast<const uint8_t*>(info.data()), info.size());
+    ASSERT_TRUE(rc::hkdf(rc::Digest::Sha512, master, {}, infoBytes, ref));
+    EXPECT_EQ(a, ref) << "HKDF(SHA-512, ikm = master, salt = empty, info = rune-bootstrap-mac-v2)";
+    auto other = master; other[63] ^= 1;
+    ASSERT_TRUE(rc::deriveBootstrapMacKey(other, b));
+    EXPECT_NE(a, b) << "another master, another subkey";
+    a.fill(0x55);
+    EXPECT_FALSE(rc::deriveBootstrapMacKey({}, a));
+    EXPECT_EQ(a, (std::array<uint8_t, 64>{})) << "a failure leaves no partial key";
 }

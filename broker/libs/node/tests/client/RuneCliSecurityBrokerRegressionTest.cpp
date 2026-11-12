@@ -252,14 +252,17 @@ TEST(AuthEnforcementRegression, ARealClientChangesItsOwnPasswordWithAProofRegres
 }
 
 // ── Adversarial: the bootstrap window (the area of #121) ────────────────────────────────────────────────────────────
-// Replays and races at the window: a captured bootstrap frame replayed after the window REOPENS is MAC-valid but
-// dedupes on its nonce - it creates no admin; two new bootstraps racing in the reopened window create exactly one.
+// Replays and races at the window: a captured bootstrap frame replayed after the window REOPENS is refused (#234: its
+// MAC
+// covered another session's one-use challenge) - it creates no admin; two new bootstraps racing in the reopened window
+// create exactly one.
 TEST(AuthBootstrapWindowRegression, AReplayedBootstrapCreatesNoAdminAndRacingBootstrapsCreateOneAdversarialRegression) {
     AuthBroker b("clireplay");
     AuthWireClient& w = b.wire();
     const int64_t s0 = w.connect(b.channel());
     ASSERT_GT(s0, 0);
-    const std::vector<uint8_t> captured = w.bootstrapBytes(s0, b.keyContents(), "admin", AuthBroker::kBootstrapPassword);
+    const std::vector<uint8_t> captured =
+        w.bootstrapBytes(b.channel(), s0, b.keyContents(), "admin", AuthBroker::kBootstrapPassword);
     ASSERT_EQ(w.sendBootstrapBytes(b.channel(), s0, captured).errorCode, 0);
     // The admin changes its one-time password and leaves for good (FORCE): the window reopens.
     const int64_t s1 = w.connect(b.channel());
@@ -273,12 +276,15 @@ TEST(AuthBootstrapWindowRegression, AReplayedBootstrapCreatesNoAdminAndRacingBoo
     ASSERT_TRUE(awaitNoSecurityAdmin(b));
     const int64_t applied = b.node().securityViewForTest().appliedOffset;
 
-    // The replay: answered with its ORIGINAL result, nothing appended, no admin.
+    // The replay (#234): even after asking for a challenge on its own session, the captured MAC covers the OLD
+    // challenge -
+    // refused, nothing appended, no admin.
     const int64_t s2 = w.connect(b.channel());
     ASSERT_GT(s2, 0);
     EXPECT_EQ(w.lastConnect()->authState, pc::AuthState::MustAuthenticate);
+    ASSERT_TRUE(w.bootstrapChallenge(b.channel(), s2).has_value());
     const auto replay = w.sendBootstrapBytes(b.channel(), s2, captured);
-    EXPECT_EQ(replay.errorCode, 0) << replay.detail;
+    EXPECT_EQ(replay.errorCode, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest)) << replay.detail;
     EXPECT_EQ(b.node().securityViewForTest().appliedOffset, applied) << "the replay appended nothing";
     EXPECT_FALSE(b.node().securityViewForTest().hasSecurityAdmin) << "and created no admin";
 
@@ -287,8 +293,8 @@ TEST(AuthBootstrapWindowRegression, AReplayedBootstrapCreatesNoAdminAndRacingBoo
     const int64_t sa = w.connect(b.channel()), sb = w2.connect(b.channel());
     ASSERT_GT(sa, 0);
     ASSERT_GT(sb, 0);
-    const auto fa = w.bootstrapBytes(sa, b.keyContents(), "rescueA", "rescue-otp-123456", 0x50);
-    const auto fb = w2.bootstrapBytes(sb, b.keyContents(), "rescueB", "rescue-otp-123456", 0x60);
+    const auto fa = w.bootstrapBytes(b.channel(), sa, b.keyContents(), "rescueA", "rescue-otp-123456", 0x50);
+    const auto fb = w2.bootstrapBytes(b.channel(), sb, b.keyContents(), "rescueB", "rescue-otp-123456", 0x60);
     std::thread other([&] { (void)w2.sendBootstrapBytes(b.channel(), sb, fb); });
     (void)w.sendBootstrapBytes(b.channel(), sa, fa);
     other.join();

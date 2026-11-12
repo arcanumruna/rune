@@ -767,11 +767,11 @@ TEST(LeaseProtocolRegression, LeaseSpecValidateRegression) {
 // ---------------------------------------------------------------------------
 TEST(LeaseProtocolRegression, TemplateDispatchRegression) {
     for (uint16_t t = 96; t <= 101; ++t) EXPECT_TRUE(rc::isKnownTemplate(t)) << t;
-    for (const uint16_t t : {uint16_t{93}, uint16_t{94}, uint16_t{95}, uint16_t{102}, uint16_t{111}, uint16_t{112}})
+    for (const uint16_t t : {uint16_t{93}, uint16_t{94}, uint16_t{95}, uint16_t{104}, uint16_t{111}, uint16_t{112}})
         EXPECT_FALSE(rc::isKnownTemplate(t)) << t;
     std::array<uint8_t, 24> hdr{};
     rc::MessageHeader h;
-    h.templateId = 102;
+    h.templateId = 104;
     h.encode(hdr.data());
     EXPECT_EQ(rc::checkFrame(hdr.data(), hdr.size()).status, rc::FrameStatus::UnknownTemplate);
     h.templateId = 96;
@@ -792,9 +792,9 @@ TEST(LeaseProtocolRegression, NumbersPinnedRegression) {
     EXPECT_EQ(static_cast<int>(rc::ErrorCode::LeaseLimitExceeded), 65);
     EXPECT_EQ(static_cast<int>(rc::ErrorCode::LeaseTtlTooLarge), 66);
     EXPECT_EQ(rc::kClientVersionLeases, 18);
-    EXPECT_EQ(rc::kClientVersion, 18);
+    EXPECT_EQ(rc::kClientVersion, 19);   // #234: the bootstrap challenge
     EXPECT_EQ(rc::kBrokerVersionLeases, 11);
-    EXPECT_EQ(rc::kBrokerVersion, 11);
+    EXPECT_EQ(rc::kBrokerVersion, 12);
     EXPECT_FALSE(rc::clientUnderstandsLeases(17));
     EXPECT_TRUE(rc::clientUnderstandsLeases(18));
     for (const auto ec : {rc::ErrorCode::LeaseNotFound, rc::ErrorCode::LeaseLimitExceeded, rc::ErrorCode::LeaseTtlTooLarge}) {

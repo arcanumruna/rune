@@ -1910,7 +1910,7 @@ static_assert(rpc::kBrokerVersionNamespaces == rpc::kBrokerVersionReceiverKeys +
 // Issue #450: client 15 (SubscribeResponse RecordEgressUnavailable) follows.
 static_assert(rpc::kClientVersionRecordEgressUnavailable == rpc::kClientVersionNamespaces + 1);
 static_assert(rpc::kClientVersionResponseEgress == rpc::kClientVersionRecordEgressUnavailable + 1);   // NAT-safe egress: client 16
-static_assert(rpc::kClientVersion == rpc::kClientVersionLeases && rpc::kBrokerVersion == rpc::kBrokerVersionLeases);   // v18 / v11: lease topics (v17 / v10: checked writes)
+static_assert(rpc::kClientVersion == rpc::kClientVersionBootstrapChallenge && rpc::kBrokerVersion == rpc::kBrokerVersionBootstrapChallenge);   // v19 / v12: bootstrap challenge (v18 / v11: lease topics) (v17 / v10: checked writes)
 static_assert(rpc::sessionUsesReceiverKeys(12, 7) && !rpc::sessionUsesReceiverKeys(11, 7) && !rpc::sessionUsesReceiverKeys(12, 6));
 static_assert(rpc::clientUnderstandsFilters(11) && !rpc::clientUnderstandsFilters(10));
 
@@ -2202,8 +2202,8 @@ TEST(CheckedWritesProtocol, ErrorCodesAreAppendedAfterViewPaused) {
 
 TEST(CheckedWritesProtocol, VersionsAreSeventeenAndTen) {
     static_assert(rpc::kClientVersionCheckedWrites == rpc::kClientVersionResponseEgress + 1 && rpc::kClientVersionCheckedWrites == 17 &&
-                  rpc::kClientVersion == 18);   // v18: lease topics
-    static_assert(rpc::kBrokerVersionCheckedWrites == rpc::kBrokerVersionResponseEgress + 1 && rpc::kBrokerVersion == 11);   // v11: lease topics
+                  rpc::kClientVersion == 19);   // v19: bootstrap challenge (v18: lease topics)
+    static_assert(rpc::kBrokerVersionCheckedWrites == rpc::kBrokerVersionResponseEgress + 1 && rpc::kBrokerVersion == 12);   // v12: bootstrap challenge (v11: lease topics)
     EXPECT_FALSE(rpc::clientUnderstandsCheckedWrites(16));
     EXPECT_TRUE(rpc::clientUnderstandsCheckedWrites(17));
 }

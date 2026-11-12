@@ -5,7 +5,9 @@
 #include <rune/crypto/Kdf.h>
 #include <rune/crypto/Scram.h>
 
+#include <array>
 #include <cstring>
+#include <vector>
 #include <stdexcept>
 
 namespace rune::client::security {
@@ -69,26 +71,40 @@ void fillSecurityDdl(const rune::ql::SecurityPlan& plan, uint32_t iterations, ui
 
 void buildBootstrap(std::string_view adminName, std::string_view oneTimePassword,
                     std::span<const uint8_t> clusterKeyFileContents, uint32_t iterations,
-                    uint32_t minPasswordLength, VerifierStorage& vs, rpc::SecurityBootstrap& msg) {
+                    uint32_t minPasswordLength, VerifierStorage& vs, rpc::SecurityBootstrap& msg,
+                    std::array<uint8_t, 64>& macKey) {
     auto key = rune::crypto::deriveClusterKey(clusterKeyFileContents);
     if (!key) throw std::invalid_argument("the cluster key file must hold at least 32 bytes");
     buildVerifier(oneTimePassword, iterations, minPasswordLength, vs);
     msg.adminName = adminName;
     msg.verifier  = vs.view();
     if (!rune::crypto::randomBytes(msg.fakeSaltSeed) || !rune::crypto::randomBytes(msg.nonce)) {
+        detail::secureZero(key->master.data(), key->master.size());
         throw std::runtime_error("no randomness available for the bootstrap seed / nonce");
     }
-    std::vector<uint8_t> input;
-    rpc::bootstrapMacInput(msg, input);
-    if (input.empty()) throw std::invalid_argument("the bootstrap admin name or verifier is not encodable");
-    rune::crypto::DigestBytes mac;
-    if (!rune::crypto::hmac(rune::crypto::Digest::Sha512, key->master, input, mac) || mac.size != msg.mac.size()) {
-        throw std::runtime_error("cannot compute the bootstrap MAC");
-    }
-    std::memcpy(msg.mac.data(), mac.bytes.data(), msg.mac.size());
-    detail::secureZero(input.data(), input.size());
+    msg.mac.fill(0);   // the MAC covers the gateway's challenge: signBootstrap() fills it
+    const bool derived = rune::crypto::deriveBootstrapMacKey(key->master, macKey);
     detail::secureZero(key->master.data(), key->master.size());   // the derived master key
+    if (!derived) throw std::runtime_error("cannot compute the bootstrap MAC");
+}
+
+bool signBootstrap(std::span<const uint8_t, 64> macKey,
+                   std::span<const uint8_t, rpc::kBootstrapChallengeBytes> challenge, std::span<uint8_t> frame) {
+    if (frame.size() < rpc::kBootstrapMacBytes) return false;
+    const auto msg = rpc::SecurityBootstrap::decode(frame.data(), frame.size());
+    if (!msg || msg->encodedSize() != frame.size()) return false;   // the MAC is the frame's last field
+    std::vector<uint8_t> input;
+    rpc::bootstrapMacInput(*msg, challenge, input);
+    if (input.empty()) return false;
+    rune::crypto::DigestBytes mac;
+    const bool ok = rune::crypto::hmac(rune::crypto::Digest::Sha512, macKey, input, mac) &&
+                    mac.size == rpc::kBootstrapMacBytes;
+    if (ok) {
+        std::memcpy(frame.data() + frame.size() - rpc::kBootstrapMacBytes, mac.bytes.data(), rpc::kBootstrapMacBytes);
+    }
+    detail::secureZero(input.data(), input.size());
     detail::secureZero(mac.bytes.data(), mac.bytes.size());
+    return ok;
 }
 
 } // namespace rune::client::security

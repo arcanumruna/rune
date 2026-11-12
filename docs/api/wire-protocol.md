@@ -108,12 +108,14 @@ security 64 to 95.
 | 77 | `AlterView` | C→B | `viewName`, `keyField`, `persistence`, `expectedVersion`, `planBlob`, `planLen` |
 | 78 | `DdlResponse` | B→C | `errorCode`, `objectId`, `newVersion`, `gateTopicId`, `detail` |
 | 79 | `SecurityDdl` | C→B | `ext`, `kind`, `name`, `change`, `passwordIndex`, `terminateSessions`, `verifier`, `granteeKind`, `op`, `resourceType`, `patternKind`, `pattern`, `roleName` |
-| 80 | `SecurityBootstrap` | C→B | `adminName`, `verifier` |
+| 80 | `SecurityBootstrap` | C→B | `adminName`, `verifier`, `fakeSaltSeed`, `nonce`, `mac` (see Bootstrap proof) |
 | 88 | `GetViewRowK` | C→B | `viewTopicId`, `partition`, `requestedFingerprint`, `minOffset`, `key` (1 to 128 bytes) |
 | 89 | `ScanViewRows` | C→B | `viewTopicId`, `limit`, `requestedFingerprint`, `minOffset`, `prefix` (1 to 127 bytes), `resumeToken` (0 or 12 bytes) |
 | 90 | `ScanViewRowsResponse` | B→C | `status`, `rowCount`, `nextToken`, `rows` |
 | 91 | `GetStats` | C→B | `scope` u8 (1 topic partition, 2 view partition), `objectId` i32, `partition` i32 |
 | 92 | `StatsResponse` | B→C | `status` u16, `count` u16, `count` x `(statId u16, value i64)`, `nConstraints` u16, `nConstraints` x `(constraintId u32, rejections u64)` |
+| 102 | `SecurityBootstrapChallengeRequest` | C→B | header only |
+| 103 | `SecurityBootstrapChallenge` | B→C | `challenge` (32 bytes) |
 
 Notes:
 
@@ -192,6 +194,30 @@ handshake when one was negotiated) a session whose `authMode` is `Required` runs
 
 Until a session is authenticated, every other request is answered `AuthenticationFailed` (44) and the session ends. See
 [SECURITY.md](../../broker/docs/SECURITY.md) for the throttle, the one-time bootstrap password and revocation.
+
+## Bootstrap proof (client version 19)
+
+`SecurityBootstrap` (80) proves possession of the cluster key with a challenge-response, so a captured frame replays
+nowhere:
+
+1. The client sends `SecurityBootstrapChallengeRequest` (102, a header with the session id and a correlation id) on the
+   session it will bootstrap on. The gateway answers `SecurityBootstrapChallenge` (103): 32 bytes, unique per request
+   (a per-process counter run through a keyed MAC under a random per-process secret) and valid for **one** bootstrap
+   attempt on **that** session. A newer request replaces an older unused challenge; an attempt (accepted or refused)
+   uses the challenge up. 102 is allowed and refused exactly where 80 is (the bootstrap window; the refusal is the
+   same). A client below version 19 is refused both.
+2. The MAC key is a subkey: `HKDF(SHA-512, ikm = cluster master, salt = empty, info = "rune-bootstrap-mac-v2")`, 64
+   bytes. The master is never a MAC key.
+3. The `mac` field of 80 is HMAC-SHA-512 under that subkey over
+   `"rune-bootstrap-v2" | challenge 32 | adminName var16 | verifier | fakeSaltSeed 32 | nonce 16`. The challenge is not
+   on the wire in 80; the gateway knows it. The layout of 80 is unchanged.
+4. The proof binds no clock: the one-use challenge is the freshness. A frame signed for another challenge, another
+   session, another gateway or another process lifetime does not verify; v1 proofs (raw master, `rune-bootstrap-v1`
+   input) are refused.
+
+Every resend of a bootstrap (NotLeader, Redirect, a lost session) sends a new 102 first and signs the frame again for
+the new challenge; the nonce stays the same, so the broker still dedupes the bootstrap on it. The client ends the call
+`BrokerTooOld` against a broker below version 12.
 
 ## Filters (client version 11)
 

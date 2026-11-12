@@ -84,8 +84,12 @@ struct Rig {
     std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> logSink;
     std::shared_ptr<spdlog::logger> previous;
     int64_t sid = 0, corr = 100;
+    // #234: the newest SecurityBootstrapChallenge answered
+    std::array<uint8_t, pc::kBootstrapChallengeBytes> lastChallenge{};
+    int challengesSeen = 0;
+    int64_t challengeCorr = 5'000'000;
 
-    explicit Rig(int32_t clientVersion = pc::kClientVersionAuth)
+    explicit Rig(int32_t clientVersion = pc::kClientVersion)
         : gw(ClientGateway::makeForTest([this](const uint8_t* b, std::size_t n) -> int64_t { onFrame(b, n); return 1; }, 1)) {
         registry = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{}, dir.path.string());
         gw.setTopicRegistry(registry.get());
@@ -109,6 +113,10 @@ struct Rig {
         if (!h) return;
         Seen s;
         s.tid = h->templateId; s.corr = h->correlationId;
+        if (const auto c = pc::SecurityBootstrapChallenge::decode(b, n)) {
+            lastChallenge = c->challenge;
+            ++challengesSeen;
+        }
         if (auto e = pc::ErrorResponse::decode(b, n)) { s.code = e->code; s.text = std::string(e->message); }
         else if (auto d = pc::DdlResponse::decode(b, n)) { s.code = static_cast<int16_t>(d->errorCode); s.text = std::string(d->detail); }
         else if (auto r = pc::SubscribeResponse::decode(b, n)) { s.code = r->errorCode; }
@@ -118,6 +126,16 @@ struct Rig {
     [[nodiscard]] const Seen* answerFor(int64_t c) const {
         for (const auto& s : seen) if (s.corr == c) return &s;
         return nullptr;
+    }
+    /// #234: asks the gateway (through the DDL dispatch, which skips the pre-auth gate) for a bootstrap challenge on
+    /// `forSid` and returns it; all zero when the gateway answered something else.
+    std::array<uint8_t, pc::kBootstrapChallengeBytes> challengeFor(int64_t forSid) {
+        pc::SecurityBootstrapChallengeRequest rq;
+        rq.sessionId = forSid; rq.correlationId = ++challengeCorr;
+        std::vector<uint8_t> b(rq.encodedSize()); b.resize(rq.encode(b.data()));
+        const int before = challengesSeen;
+        gw.applyDdlFrameForTest(b.data(), b.size());
+        return challengesSeen > before ? lastChallenge : std::array<uint8_t, pc::kBootstrapChallengeBytes>{};
     }
     std::vector<uint8_t> createRole(int64_t c) {
         pc::SecurityDdl m;
@@ -142,7 +160,11 @@ struct BootFrame {
     std::vector<uint8_t> salt = std::vector<uint8_t>(16, 7);
     std::array<uint8_t, 64> stored{}, server{};
     std::vector<uint8_t> bytes;
-    BootFrame(int64_t sid, int64_t corr, const std::string& keyContents) {
+    /// The challenge is requested from `rig`'s gateway on `sid` first (a refused request leaves it all zero).
+    BootFrame(Rig& rig, int64_t sid, int64_t corr, const std::string& keyContents)
+        : BootFrame(rig.challengeFor(sid), sid, corr, keyContents) {}
+    BootFrame(const std::array<uint8_t, pc::kBootstrapChallengeBytes>& challenge, int64_t sid, int64_t corr,
+              const std::string& keyContents) {
         stored.fill(1); server.fill(2);
         pc::SecurityBootstrap m;
         m.sessionId = sid; m.correlationId = corr; m.adminName = "admin";
@@ -155,10 +177,13 @@ struct BootFrame {
         } else {
             const auto k = rune::crypto::deriveClusterKey(std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(keyContents.data()), keyContents.size()));
+            std::array<uint8_t, 64> subkey{};
+            if (!rune::crypto::deriveBootstrapMacKey(k->master, subkey))
+                throw std::runtime_error("SecurityGatewayTest: bootstrap subkey derivation failed");
             std::vector<uint8_t> in;
-            pc::bootstrapMacInput(m, in);
+            pc::bootstrapMacInput(m, challenge, in);
             rune::crypto::DigestBytes mac;
-            if (!rune::crypto::hmac(rune::crypto::Digest::Sha512, k->master, in, mac))
+            if (!rune::crypto::hmac(rune::crypto::Digest::Sha512, subkey, in, mac))
                 throw std::runtime_error("SecurityGatewayTest: bootstrap proof HMAC failed");
             std::memcpy(m.mac.data(), mac.bytes.data(), 64);
         }
@@ -174,7 +199,7 @@ const std::string kA(40, 'a'), kB(40, 'b'), kC(40, 'c');
 TEST(SecurityBootstrapRegression, BootstrapWithoutAValidProofIsRefusedAndLogged) {
     Rig rig;
     rig.gw.setClusterKeys(keysFor(kA));
-    const BootFrame f(rig.sid, 7, kC);   // a MAC under ANOTHER cluster's key
+    const BootFrame f(rig, rig.sid, 7, kC);   // a MAC under ANOTHER cluster's key
     rig.gw.applyDdlFrameForTest(f.bytes.data(), f.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 0) << "never forwarded";
     const Seen* a = rig.answerFor(7);
@@ -186,7 +211,7 @@ TEST(SecurityBootstrapRegression, BootstrapWithoutAValidProofIsRefusedAndLogged)
     EXPECT_TRUE(rig.logContains("bad cluster-key proof"));
     EXPECT_EQ(rig.gw.bootstrapsRefused(), 1u);
     // A garbage MAC too.
-    const BootFrame g(rig.sid, 8, "");
+    const BootFrame g(rig, rig.sid, 8, "");
     rig.gw.applyDdlFrameForTest(g.bytes.data(), g.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 0);
     EXPECT_EQ(rig.gw.bootstrapsRefused(), 2u);
@@ -195,20 +220,20 @@ TEST(SecurityBootstrapRegression, BootstrapWithoutAValidProofIsRefusedAndLogged)
 TEST(SecurityBootstrapRegression, BootstrapUnderTheNextKeyIsAccepted) {
     Rig rig;
     rig.gw.setClusterKeys(keysFor(kA, kB));   // a rolling restart: current A, next B
-    const BootFrame underNext(rig.sid, 1, kB);
+    const BootFrame underNext(rig, rig.sid, 1, kB);
     rig.gw.applyDdlFrameForTest(underNext.bytes.data(), underNext.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 1) << "a proof under the NEXT key is accepted";
-    const BootFrame underCurrent(rig.sid, 2, kA);
+    const BootFrame underCurrent(rig, rig.sid, 2, kA);
     rig.gw.applyDdlFrameForTest(underCurrent.bytes.data(), underCurrent.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 2) << "and under the current one";
-    const BootFrame underOther(rig.sid, 3, kC);
+    const BootFrame underOther(rig, rig.sid, 3, kC);
     rig.gw.applyDdlFrameForTest(underOther.bytes.data(), underOther.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 2) << "a third key is neither";
 }
 
 TEST(SecurityBootstrapRegression, ABrokerWithoutAClusterKeyRefusesEveryBootstrap) {
     Rig rig;   // InProcess / dev: no key
-    const BootFrame f(rig.sid, 5, kA);
+    const BootFrame f(rig, rig.sid, 5, kA);
     rig.gw.applyDdlFrameForTest(f.bytes.data(), f.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 0);
     const Seen* a = rig.answerFor(5);
@@ -331,13 +356,13 @@ TEST(AuthGateRegression, TheBootstrapWindowAdmitsExactlyBootstrapWithAValidMac) 
     rig.gw.setAuthMode(GatewayAuthMode::Required, &view);
     rig.gw.setClusterKeys(keysFor(kA));
     rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{INT64_MAX});
-    const BootFrame bad(rig.sid, 20, kC);
+    const BootFrame bad(rig, rig.sid, 20, kC);
     rig.gw.applyClientFrameForTest(bad.bytes.data(), bad.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 0);
     ASSERT_NE(rig.answerFor(20), nullptr);
     EXPECT_EQ(rig.answerFor(20)->code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << "bad MAC: refused by the proof";
     EXPECT_TRUE(rig.gw.hasSessionForTest(rig.sid)) << "a bad proof does not end the window session";
-    const BootFrame good(rig.sid, 21, kA);
+    const BootFrame good(rig, rig.sid, 21, kA);
     rig.gw.applyClientFrameForTest(good.bytes.data(), good.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 1);
 }
@@ -355,7 +380,7 @@ TEST(SecurityBootstrapRegression, AnAcceptedBootstrapRestartsTheLoginDeadlineReg
         rig.gw.setAuthTimeoutNs(kTimeout);
         rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{kTimeout, 50});
         rig.gw.setNowForTest(900'000'000);
-        const BootFrame good(rig.sid, 30, kA);
+        const BootFrame good(rig, rig.sid, 30, kA);
         rig.gw.applyClientFrameForTest(good.bytes.data(), good.bytes.size());
         ASSERT_EQ(rig.admin.bootstraps, 1);
         rig.gw.reapExpiredForTest(1'500'000'000);   // past the first deadline, inside the restarted one
@@ -372,10 +397,10 @@ TEST(SecurityBootstrapRegression, AnAcceptedBootstrapRestartsTheLoginDeadlineReg
         rig.gw.setAuthTimeoutNs(kTimeout);
         rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{kTimeout, 50});
         rig.gw.setNowForTest(900'000'000);
-        const BootFrame first(rig.sid, 32, kA);
+        const BootFrame first(rig, rig.sid, 32, kA);
         rig.gw.applyClientFrameForTest(first.bytes.data(), first.bytes.size());
         rig.gw.setNowForTest(1'800'000'000);
-        const BootFrame second(rig.sid, 33, kA);
+        const BootFrame second(rig, rig.sid, 33, kA);
         rig.gw.applyClientFrameForTest(second.bytes.data(), second.bytes.size());
         ASSERT_EQ(rig.admin.bootstraps, 2) << "both forwarded (the admin thread refuses the second)";
         rig.gw.reapExpiredForTest(900'000'000 + kTimeout + 1);
@@ -389,7 +414,7 @@ TEST(SecurityBootstrapRegression, AnAcceptedBootstrapRestartsTheLoginDeadlineReg
         rig.gw.setAuthTimeoutNs(kTimeout);
         rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{kTimeout, 50});
         rig.gw.setNowForTest(900'000'000);
-        const BootFrame bad(rig.sid, 31, kC);
+        const BootFrame bad(rig, rig.sid, 31, kC);
         rig.gw.applyClientFrameForTest(bad.bytes.data(), bad.bytes.size());
         ASSERT_EQ(rig.admin.bootstraps, 0);
         rig.gw.reapExpiredForTest(1'500'000'000);
@@ -404,7 +429,7 @@ TEST(AuthGateRegression, AfterBootstrapAnonymousSessionsAreRefusedEvenForBootstr
     rig.gw.setAuthMode(GatewayAuthMode::Required, &view);
     rig.gw.setClusterKeys(keysFor(kA));
     rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{INT64_MAX});   // offered the window BEFORE it closed
-    const BootFrame good(rig.sid, 30, kA);
+    const BootFrame good(rig, rig.sid, 30, kA);
     rig.gw.applyClientFrameForTest(good.bytes.data(), good.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 0) << "the window is closed";
     ASSERT_NE(rig.answerFor(30), nullptr);
@@ -453,7 +478,7 @@ TEST(AuthGateRegression, BootstrapWindowFollowsTheRulingRegression) {
     rig.gw.setAuthMode(GatewayAuthMode::Required, &open);
     rig.gw.setClusterKeys(keysFor(kA));
     rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{INT64_MAX});
-    const BootFrame good(rig.sid, 40, kA);
+    const BootFrame good(rig, rig.sid, 40, kA);
     rig.gw.applyClientFrameForTest(good.bytes.data(), good.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 1);
 }
@@ -536,7 +561,7 @@ TEST(AuthLoginRegression, UnauthenticatedLogLinesAreRateLimitedRegression) {
     rig.gw.setClusterKeys(keysFor(kA));
     constexpr int kFlood = 2500;
     for (int i = 0; i < kFlood; ++i) {
-        const BootFrame f(rig.sid, 1000 + i, kC);   // a MAC under ANOTHER cluster's key
+        const BootFrame f(rig, rig.sid, 1000 + i, kC);   // a MAC under ANOTHER cluster's key
         rig.gw.applyDdlFrameForTest(f.bytes.data(), f.bytes.size());
     }
     EXPECT_EQ(rig.gw.bootstrapsRefused(), static_cast<uint64_t>(kFlood));
@@ -580,7 +605,7 @@ TEST(SecurityBootstrapRegression, AValidBootstrapOnACatchingUpBrokerIsNeverForwa
     rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{INT64_MAX});
     EXPECT_EQ(rig.gw.connectAuthStateForTest(), pc::AuthState::MustAuthenticate);
     for (int64_t corr : {50, 51}) {   // via the pre-auth gate and via the DDL route
-        const BootFrame good(rig.sid, corr, kA);
+        const BootFrame good(rig, rig.sid, corr, kA);
         if (corr == 50) rig.gw.applyClientFrameForTest(good.bytes.data(), good.bytes.size());
         else rig.gw.applyDdlFrameForTest(good.bytes.data(), good.bytes.size());
         EXPECT_EQ(rig.admin.bootstraps, 0) << corr << ": never forwarded while not current";
@@ -589,7 +614,7 @@ TEST(SecurityBootstrapRegression, AValidBootstrapOnACatchingUpBrokerIsNeverForwa
         EXPECT_EQ(a->code, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable)) << corr;
     }
     rig.gw.setSecurityServing(true);
-    const BootFrame good(rig.sid, 52, kA);
+    const BootFrame good(rig, rig.sid, 52, kA);
     rig.gw.applyClientFrameForTest(good.bytes.data(), good.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 1) << "current again: forwarded";
 }
@@ -601,7 +626,7 @@ TEST(SecurityBootstrapRegression, ABootstrapFromAChannelWithControlBytesIsLogged
     Rig rig;
     rig.gw.setClusterKeys(keysFor(kA));
     const int64_t sid = rig.gw.injectTestSessionOnChannel("aeron:udp?endpoint=h:1", 0, "h:1\nauth: login ok user=admin");
-    const BootFrame f(sid, 7, kC);
+    const BootFrame f(rig, sid, 7, kC);
     rig.gw.applyDdlFrameForTest(f.bytes.data(), f.bytes.size());
     ASSERT_EQ(rig.gw.bootstrapsRefused(), 1u);
     bool sawLine = false;
@@ -611,4 +636,150 @@ TEST(SecurityBootstrapRegression, ABootstrapFromAChannelWithControlBytesIsLogged
         if (l.find("bootstrap refused from h:1\\x0aauth:\\x20login") != std::string::npos) sawLine = true;
     }
     EXPECT_TRUE(sawLine) << "the channel is logged escaped";
+}
+
+// ---------------------------------------------------------------------------
+// Issue #234: the bootstrap proof is challenge-response.  The gateway issues a one-use challenge per request on the
+// session; the MAC (under a subkey of the cluster master) covers it, so a captured frame replays nowhere.
+// ---------------------------------------------------------------------------
+TEST(BootstrapChallengeRegression, BootstrapWithoutAChallengeIsRefusedRegression) {
+    Rig rig;
+    rig.gw.setClusterKeys(keysFor(kA));
+    // a MAC over an all-zero "challenge"
+    const BootFrame f(std::array<uint8_t, pc::kBootstrapChallengeBytes>{}, rig.sid, 7, kA);
+    rig.gw.applyDdlFrameForTest(f.bytes.data(), f.bytes.size());
+    EXPECT_EQ(rig.admin.bootstraps, 0) << "nothing submitted to the admin sink";
+    const Seen* a = rig.answerFor(7);
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(a->tid, static_cast<uint16_t>(pc::TemplateId::DdlResponse));
+    EXPECT_EQ(a->code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(a->text, "no bootstrap challenge on this session: request one first (client version 19)");
+    EXPECT_EQ(rig.gw.bootstrapsRefused(), 1u);
+    EXPECT_TRUE(rig.logContains("no challenge"));
+}
+
+TEST(BootstrapChallengeRegression, AChallengeIsSingleUseRegression) {
+    Rig rig;
+    rig.gw.setClusterKeys(keysFor(kA));
+    const BootFrame f(rig, rig.sid, 7, kA);
+    rig.gw.applyDdlFrameForTest(f.bytes.data(), f.bytes.size());
+    ASSERT_EQ(rig.admin.bootstraps, 1) << "accepted and submitted";
+    EXPECT_EQ(rig.gw.bootstrapsRefused(), 0u);
+    rig.gw.applyDdlFrameForTest(f.bytes.data(), f.bytes.size());   // the same bytes again
+    EXPECT_EQ(rig.admin.bootstraps, 1) << "the challenge is used up";
+    EXPECT_EQ(rig.gw.bootstrapsRefused(), 1u);
+    // a refused attempt uses the challenge up too: the next attempt needs a new one
+    const BootFrame bad(rig, rig.sid, 8, kC);
+    rig.gw.applyDdlFrameForTest(bad.bytes.data(), bad.bytes.size());
+    EXPECT_EQ(rig.gw.bootstrapsRefused(), 2u);
+    rig.gw.applyDdlFrameForTest(bad.bytes.data(), bad.bytes.size());
+    const Seen* a = rig.answerFor(8);
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(rig.gw.bootstrapsRefused(), 3u);
+}
+
+TEST(BootstrapChallengeRegression, AChallengeBelongsToItsSessionRegression) {
+    Rig rig;
+    rig.gw.setClusterKeys(keysFor(kA));
+    const int64_t sidB = rig.gw.injectTestSession(0, pc::kClientVersion);
+    ASSERT_NE(sidB, rig.sid);
+    const auto chA = rig.challengeFor(rig.sid);
+    const auto chB = rig.challengeFor(sidB);
+    EXPECT_NE(chA, chB) << "per request";
+    EXPECT_EQ(rig.gw.bootstrapChallengesIssued(), 2u);
+    // a MAC for A's challenge, sent on session B (which holds B's own challenge): refused
+    BootFrame forA(chA, sidB, 11, kA);
+    rig.gw.applyDdlFrameForTest(forA.bytes.data(), forA.bytes.size());
+    EXPECT_EQ(rig.admin.bootstraps, 0);
+    EXPECT_EQ(rig.gw.bootstrapsRefused(), 1u);
+    // A's own challenge is still A's: a MAC for it on A is accepted
+    const BootFrame onA(chA, rig.sid, 12, kA);
+    rig.gw.applyDdlFrameForTest(onA.bytes.data(), onA.bytes.size());
+    EXPECT_EQ(rig.admin.bootstraps, 1);
+    // two requests on one session: the answers differ, and only the newest challenge is valid
+    const auto first = rig.challengeFor(rig.sid);
+    const auto second = rig.challengeFor(rig.sid);
+    EXPECT_NE(first, second);
+    EXPECT_EQ(rig.gw.bootstrapChallengesIssued(), 4u);
+    const BootFrame stale(first, rig.sid, 13, kA);
+    rig.gw.applyDdlFrameForTest(stale.bytes.data(), stale.bytes.size());
+    EXPECT_EQ(rig.admin.bootstraps, 1) << "a newer request replaced the older challenge";
+}
+
+TEST(BootstrapChallengeRegression, ACapturedBootstrapIsRefusedByAnotherGatewayRegression) {
+    Rig one;
+    one.gw.setClusterKeys(keysFor(kA));
+    const BootFrame recorded(one, one.sid, 7, kA);
+    one.gw.applyDdlFrameForTest(recorded.bytes.data(), recorded.bytes.size());
+    ASSERT_EQ(one.admin.bootstraps, 1) << "the recorded frame was accepted by its own gateway";
+    // The same cluster keys on another gateway (a wiped or recreated cluster): 102, then the recorded bytes.
+    Rig two;
+    two.gw.setClusterKeys(keysFor(kA));
+    (void)two.challengeFor(two.sid);
+    std::vector<uint8_t> replay = recorded.bytes;
+    const uint64_t sid2 = static_cast<uint64_t>(two.sid);
+    // addressed to the replayer's session
+    for (int i = 0; i < 8; ++i) replay[8 + i] = static_cast<uint8_t>(sid2 >> (8 * i));
+    two.gw.applyDdlFrameForTest(replay.data(), replay.size());
+    EXPECT_EQ(two.admin.bootstraps, 0);
+    EXPECT_EQ(two.gw.bootstrapsRefused(), 1u);
+    ASSERT_NE(two.answerFor(7), nullptr);
+    EXPECT_EQ(two.answerFor(7)->text, "bootstrap proof does not match this cluster's key");
+}
+
+TEST(BootstrapChallengeRegression, AChallengeRequestIsGatedLikeTheBootstrapRegression) {
+    pc::SecurityBootstrapChallengeRequest rq;
+    const auto frame = [&](int64_t sid, int64_t corr) {
+        rq.sessionId = sid; rq.correlationId = corr;
+        std::vector<uint8_t> b(rq.encodedSize()); b.resize(rq.encode(b.data())); return b;
+    };
+    // window closed (an enabled admin exists): the bootstrap and its challenge request get the same refusal
+    Rig closedBoot, closedChallenge;
+    auto view1 = adminView(), view2 = adminView();
+    closedBoot.gw.setAuthMode(GatewayAuthMode::Required, &view1);
+    closedChallenge.gw.setAuthMode(GatewayAuthMode::Required, &view2);
+    for (Rig* r : {&closedBoot, &closedChallenge}) {
+        r->gw.setClusterKeys(keysFor(kA));
+        r->gw.setSessionAuthForTest(r->sid, AuthAwaitingFirst{INT64_MAX});
+    }
+    const BootFrame b(std::array<uint8_t, pc::kBootstrapChallengeBytes>{}, closedBoot.sid, 30, kA);
+    closedBoot.gw.applyClientFrameForTest(b.bytes.data(), b.bytes.size());
+    const auto c = frame(closedChallenge.sid, 30);
+    closedChallenge.gw.applyClientFrameForTest(c.data(), c.size());
+    const Seen* sb = closedBoot.answerFor(30);
+    const Seen* sc = closedChallenge.answerFor(30);
+    ASSERT_NE(sb, nullptr);
+    ASSERT_NE(sc, nullptr);
+    EXPECT_EQ(sc->tid, sb->tid);
+    EXPECT_EQ(sc->code, sb->code);
+    EXPECT_EQ(sc->code, static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed));
+    EXPECT_EQ(closedChallenge.challengesSeen, 0) << "no challenge for a closed window";
+    EXPECT_EQ(closedChallenge.gw.bootstrapChallengesIssued(), 0u);
+    EXPECT_FALSE(closedChallenge.gw.hasSessionForTest(closedChallenge.sid));
+    // window open: the request through the pre-auth gate is answered with a challenge
+    Rig open;
+    auto view = emptyView();
+    open.gw.setAuthMode(GatewayAuthMode::Required, &view);
+    open.gw.setClusterKeys(keysFor(kA));
+    open.gw.setSessionAuthForTest(open.sid, AuthAwaitingFirst{INT64_MAX});
+    const auto o = frame(open.sid, 31);
+    open.gw.applyClientFrameForTest(o.data(), o.size());
+    EXPECT_EQ(open.challengesSeen, 1);
+    ASSERT_NE(open.answerFor(31), nullptr);
+    EXPECT_EQ(open.answerFor(31)->tid, static_cast<uint16_t>(pc::TemplateId::SecurityBootstrapChallenge));
+    EXPECT_TRUE(open.gw.hasSessionForTest(open.sid));
+    // a client below version 19 is refused a challenge and a bootstrap
+    Rig old(pc::kClientVersionLeases);
+    old.gw.setClusterKeys(keysFor(kA));
+    const auto oc = frame(old.sid, 32);
+    old.gw.applyDdlFrameForTest(oc.data(), oc.size());
+    EXPECT_EQ(old.challengesSeen, 0);
+    ASSERT_NE(old.answerFor(32), nullptr);
+    EXPECT_EQ(old.answerFor(32)->code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    const BootFrame ob(std::array<uint8_t, pc::kBootstrapChallengeBytes>{}, old.sid, 33, kA);
+    old.gw.applyDdlFrameForTest(ob.bytes.data(), ob.bytes.size());
+    ASSERT_NE(old.answerFor(33), nullptr);
+    EXPECT_EQ(old.answerFor(33)->code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest))
+        << "needs client version 19";
+    EXPECT_EQ(old.admin.bootstraps, 0);
 }

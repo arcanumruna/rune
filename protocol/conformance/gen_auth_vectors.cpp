@@ -35,6 +35,8 @@ int main(int argc, char** argv) {
     emit(d, "security_ddl_set_password.bin", av::setPassword());
     emit(d, "security_ddl_grant.bin", av::grant());
     emit(d, "security_bootstrap.bin", av::bootstrap());
+    emit(d, "security_bootstrap_challenge_request.bin", av::bootstrapChallengeRequest());
+    emit(d, "security_bootstrap_challenge.bin", av::bootstrapChallenge());
     // ConnectResponse has no encodedSize(): wrap it
     struct W { rune::protocol::client::ConnectResponse m; std::size_t encodedSize() const { return 96; }
                std::size_t encode(uint8_t* b) const { return m.encode(b); } };

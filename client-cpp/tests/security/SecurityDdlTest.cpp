@@ -253,27 +253,22 @@ TEST(SecurityDdlRegression, BootstrapMacVerifiesUnderTheKeyFile) {
     const std::string keyFile = std::string(64, 'a') + "\n";   // D32: >= 32 bytes after trimming
     const std::vector<uint8_t> keyBytes(keyFile.begin(), keyFile.end());
     std::vector<std::array<uint8_t, 16>> nonces;
+    r.gw.clusterKey = keyBytes;
     r.gw.templateHandlers[pc::SecurityBootstrap::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
         auto m = pc::SecurityBootstrap::decode(f, len);
         ASSERT_TRUE(m.has_value());
         EXPECT_EQ(m->adminName, "admin");
-        std::vector<uint8_t> input;
-        pc::bootstrapMacInput(*m, input);
-        ASSERT_FALSE(input.empty());
-        const auto key = rcr::deriveClusterKey(keyBytes);
-        ASSERT_TRUE(key.has_value());
-        rcr::DigestBytes mac;
-        ASSERT_TRUE(rcr::hmac(rcr::Digest::Sha512, key->master, input, mac));
-        EXPECT_EQ(std::memcmp(mac.bytes.data(), m->mac.data(), 64), 0) << "the MAC under the cluster key verifies";
+        // #234: the MAC covers the challenge the gateway issued on this session (the fake answered the 102 itself).
+        ASSERT_FALSE(r.gw.challengesIssued.empty());
+        EXPECT_TRUE(r.gw.bootstrapMacVerifies(std::vector<uint8_t>(f, f + len), r.gw.challengesIssued.back()))
+            << "the MAC under the cluster key verifies over the issued challenge";
+        auto stale = r.gw.challengesIssued.back();
+        stale[0] ^= 1;
+        EXPECT_FALSE(r.gw.bootstrapMacVerifies(std::vector<uint8_t>(f, f + len), stale))
+            << "and over no other challenge";
         const std::array<uint8_t, 32> zero{};
         EXPECT_NE(m->fakeSaltSeed, zero) << "D8: a random fake-salt seed";
         nonces.push_back(m->nonce);
-        // A different key must not verify.
-        const std::vector<uint8_t> other(64, 'b');
-        const auto k2 = rcr::deriveClusterKey(other);
-        rcr::DigestBytes mac2;
-        ASSERT_TRUE(rcr::hmac(rcr::Digest::Sha512, k2->master, input, mac2));
-        EXPECT_NE(std::memcmp(mac2.bytes.data(), m->mac.data(), 64), 0);
         pc::DdlResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId; resp.objectId = 1;
         r.gw.sendDdlResponse(0, resp);
     };
@@ -293,6 +288,97 @@ TEST(SecurityDdlRegression, BootstrapMacVerifiesUnderTheKeyFile) {
     EXPECT_THROW((void)cq.issue([&](rc::Completions& q, rc::Token t) {
         return r.client.bootstrapSecurity("admin", "a one-time password 24", shortKey, q, t);
     }), std::invalid_argument);
+}
+
+// #234: the bootstrap proof is challenge-response: every attempt asks the gateway for a challenge (102 -> 103) and
+// signs the frame with it; a resend asks again.
+TEST(BootstrapChallengeClientRegression, BootstrapAsksForAChallengeFirstRegression) {
+    Rig r(invokerCfg(3830, 3831));
+    r.connect();
+    const std::string keyFile = std::string(64, 'a') + "\n";
+    const std::vector<uint8_t> keyBytes(keyFile.begin(), keyFile.end());
+    r.gw.clusterKey = keyBytes;
+    r.gw.templateHandlers[pc::SecurityBootstrap::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::SecurityBootstrap::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        answerOk(r, m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return r.client.bootstrapSecurity("admin", "a one-time password 24", keyBytes, q, t);
+    });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(r.gw.bootstrapOrder, (std::vector<uint16_t>{pc::SecurityBootstrapChallengeRequest::TEMPLATE_ID,
+                                                          pc::SecurityBootstrap::TEMPLATE_ID}))
+        << "the challenge request first, then the bootstrap";
+    ASSERT_EQ(r.gw.challengesIssued.size(), 1u);
+    ASSERT_EQ(r.gw.bootstrapFrames.size(), 1u);
+    EXPECT_TRUE(r.gw.bootstrapMacVerifies(r.gw.bootstrapFrames[0], r.gw.challengesIssued[0]))
+        << "the MAC covers the challenge";
+    const auto m = pc::SecurityBootstrap::decode(r.gw.bootstrapFrames[0].data(), r.gw.bootstrapFrames[0].size());
+    ASSERT_TRUE(m.has_value());
+    EXPECT_NE(m->mac, (std::array<uint8_t, 64>{})) << "the MAC (the frame's last field) was written";
+}
+
+TEST(BootstrapChallengeClientRegression, ANotLeaderResendUsesANewChallengeRegression) {
+    Rig r(invokerCfg(3832, 3833));
+    r.connect();
+    const std::string keyFile = std::string(64, 'a') + "\n";
+    const std::vector<uint8_t> keyBytes(keyFile.begin(), keyFile.end());
+    r.gw.clusterKey = keyBytes;
+    int seen = 0;
+    r.gw.templateHandlers[pc::SecurityBootstrap::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        const auto m = pc::SecurityBootstrap::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        if (++seen == 1) {
+            pc::DdlResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId;
+            resp.errorCode = static_cast<uint16_t>(pc::ErrorCode::NotLeader);
+            r.gw.sendDdlResponse(ep, resp);
+            return;
+        }
+        answerOk(r, m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return r.client.bootstrapSecurity("admin", "a one-time password 24", keyBytes, q, t);
+    });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 50'000'000));   // walks the NotLeader backoff
+    ASSERT_TRUE(f.ok()) << f.describe();
+    ASSERT_EQ(r.gw.bootstrapFrames.size(), 2u);
+    ASSERT_EQ(r.gw.challengesIssued.size(), 2u);
+    EXPECT_EQ(r.gw.bootstrapOrder, (std::vector<uint16_t>{102, 80, 102, 80}))
+        << "every attempt starts with a challenge request";
+    EXPECT_NE(r.gw.challengesIssued[0], r.gw.challengesIssued[1]);
+    EXPECT_TRUE(r.gw.bootstrapMacVerifies(r.gw.bootstrapFrames[0], r.gw.challengesIssued[0]));
+    EXPECT_TRUE(r.gw.bootstrapMacVerifies(r.gw.bootstrapFrames[1], r.gw.challengesIssued[1]))
+        << "the second MAC covers the SECOND challenge";
+    EXPECT_FALSE(r.gw.bootstrapMacVerifies(r.gw.bootstrapFrames[1], r.gw.challengesIssued[0]));
+    const auto a = pc::SecurityBootstrap::decode(r.gw.bootstrapFrames[0].data(), r.gw.bootstrapFrames[0].size());
+    const auto b = pc::SecurityBootstrap::decode(r.gw.bootstrapFrames[1].data(), r.gw.bootstrapFrames[1].size());
+    ASSERT_TRUE(a.has_value() && b.has_value());
+    EXPECT_NE(a->mac, b->mac);
+    EXPECT_EQ(a->nonce, b->nonce) << "the same nonce (the bootstrap's identity) on the resend";
+}
+
+TEST(BootstrapChallengeClientRegression, BootstrapOnAnOldBrokerIsBrokerTooOldRegression) {
+    Rig r(invokerCfg(3834, 3835));
+    r.gw.advertisedBrokerVersion = pc::kBrokerVersionBootstrapChallenge - 1;
+    r.connect();
+    const std::string keyFile = std::string(64, 'a') + "\n";
+    const std::vector<uint8_t> keyBytes(keyFile.begin(), keyFile.end());
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return r.client.bootstrapSecurity("admin", "a one-time password 24", keyBytes, q, t);
+    });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    EXPECT_EQ(f.outcome().c.op, rc::OpKind::SecurityBootstrap);
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerTooOld);
+    EXPECT_EQ(r.gw.challengeRequests, 0) << "nothing was sent";
+    EXPECT_TRUE(r.gw.bootstrapFrames.empty());
 }
 
 TEST(SecurityDdlRegression, NotLeaderIsRetriedWithTheSameRequestId) {

@@ -1254,6 +1254,8 @@ Verifier fixtures: salt `"0123456789abcdef"` (16), iterations 4096, storedKey 64
 | `security_ddl_set_password.bin` | 267 | SecurityDdl (79) | 0 | ext, kind 2 (AlterUser), name `ws1`, change 2 (SetPassword), terminateSessions 1, verifier |
 | `security_ddl_grant.bin` | 116 | SecurityDdl (79) | 0 | ext, kind 6 (Grant), name `ws1`, granteeKind 0, op 1 (WRITE), resourceType 1 (TOPIC), patternKind 1 (PREFIX), pattern `world.` |
 | `security_bootstrap.bin` | 293 | SecurityBootstrap (80) | 0 | adminName `admin`, verifier, fakeSaltSeed 0x40..0x5F (32), nonce 0x10..0x1F, mac 0x80..0xBF |
+| `security_bootstrap_challenge_request.bin` | 24 | SecurityBootstrapChallengeRequest (102) | 0 | header only |
+| `security_bootstrap_challenge.bin` | 56 | SecurityBootstrapChallenge (103) | 0 | challenge 0xC0..0xDF (32) |
 | `connect_response_v9.bin` | 49 | ConnectResponse (2) v9 | 21 | code 0, leader 2, assignedSessionId 0xDEADBEEF, brokerVersion 5, chosenCipher 0, authMode 0 (Required), authState 0 (MustAuthenticate), handshakeBytes `""` |
 | `connect_response_v9_crypto.bin` | 60 | ConnectResponse (2) v9 | 21 | as above with chosenCipher 2, authState 1 (ResumedAuthenticated), handshakeBytes `"serverhello"` |
 

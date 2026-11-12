@@ -247,6 +247,30 @@ struct InvokerGateway {
     bool                 bootstrapped = false;
     std::vector<uint8_t> clusterKey;
     int                  bootstraps = 0;                 // accepted bootstraps
+    /// #234: the bootstrap proof is challenge-response.  SecurityBootstrapChallengeRequest (102) is answered (unless a
+    /// test installed a handler for it) with a challenge that DIFFERS on every request and is valid for ONE bootstrap
+    /// on that session; the built-in bootstrap verifies the MAC against the challenge last issued on the session.
+    int                                           challengeRequests = 0;   // 102 frames received
+    std::vector<std::array<uint8_t, 32>>          challengesIssued;        // in order
+    // every SecurityBootstrap (80) received, verbatim
+    std::vector<std::vector<uint8_t>>             bootstrapFrames;
+    std::map<int64_t, std::array<uint8_t, 32>>    bootstrapChallengeOf;    // session -> its unused challenge
+    std::vector<uint16_t>                         bootstrapOrder;          // template ids (80 / 102) in arrival order
+    /// True when `frame` (a SecurityBootstrap) carries the MAC the cluster key makes over `challenge`.
+    [[nodiscard]] bool bootstrapMacVerifies(const std::vector<uint8_t>& frame,
+                                            const std::array<uint8_t, 32>& challenge) const {
+        namespace rp = rune::protocol::client;
+        const auto m = rp::SecurityBootstrap::decode(frame.data(), frame.size());
+        const auto key = rune::crypto::deriveClusterKey(clusterKey);
+        std::array<uint8_t, 64> sub{};
+        std::vector<uint8_t> input;
+        if (!m || !key || !rune::crypto::deriveBootstrapMacKey(key->master, sub)) return false;
+        rp::bootstrapMacInput(*m, challenge, input);
+        rune::crypto::DigestBytes mac;
+        return !input.empty() && rune::crypto::hmac(rune::crypto::Digest::Sha512, sub, input, mac) &&
+               rune::crypto::constantTimeEqual(std::span<const uint8_t>(mac.bytes.data(), 64),
+                                               std::span<const uint8_t>(m->mac));
+    }
     std::set<std::string> mustChange;                    // users that must change their password first (their requests: 47)
     int unprovenCredentialChanges = 0;                   // issue #114: own-credential changes without a valid proof
     /// Review B M6: the login's first leg is held (AuthClientFirst captured, not answered) until releaseHeldAuth().
@@ -1338,13 +1362,14 @@ private:
             sendDdlResponse(replyFromArrival ? endpoint : 0, r);
         };
         if (bootstrapped) { refuse("already bootstrapped: this cluster has a security admin"); return; }
-        const auto key = rune::crypto::deriveClusterKey(clusterKey);
-        std::vector<uint8_t> input;
-        rp::bootstrapMacInput(*m, input);
-        rune::crypto::DigestBytes mac;
-        if (!key || input.empty() ||
-            !rune::crypto::hmac(rune::crypto::Digest::Sha512, key->master, input, mac) ||
-            !rune::crypto::constantTimeEqual(std::span<const uint8_t>(mac.bytes.data(), 64), std::span<const uint8_t>(m->mac))) {
+        const auto ch = bootstrapChallengeOf.find(m->sessionId);
+        if (ch == bootstrapChallengeOf.end()) {
+            refuse("no bootstrap challenge on this session: request one first (client version 19)");
+            return;
+        }
+        const std::array<uint8_t, 32> challenge = ch->second;
+        bootstrapChallengeOf.erase(ch);   // single use, whatever the outcome
+        if (!bootstrapMacVerifies(std::vector<uint8_t>(buf, buf + len), challenge)) {
             refuse("bootstrap proof invalid: the cluster key does not match");
             return;
         }
@@ -1841,7 +1866,8 @@ private:
                 const auto as = hh ? authState_.find(hh->sessionId) : authState_.end();
                 const bool anonymousBootstrap =
                     as != authState_.end() && std::holds_alternative<AuthAnonymous>(as->second) &&
-                    t == rcc::TemplateId::SecurityBootstrap;
+                    (t == rcc::TemplateId::SecurityBootstrap ||
+                     t == rcc::TemplateId::SecurityBootstrapChallengeRequest);
                 if (as != authState_.end() && !std::holds_alternative<AuthAuthenticated>(as->second) && !anonymousBootstrap) {
                     ++unauthenticatedRequests;
                     sendError(replyFromArrival ? endpoint : 0,
@@ -1906,8 +1932,31 @@ private:
                 }
             }
         }
+        // #234: recorded for the tests
+        if (*tid == rp::SecurityBootstrap::TEMPLATE_ID) bootstrapFrames.emplace_back(buf, buf + len);
+        if (*tid == rp::SecurityBootstrap::TEMPLATE_ID || *tid == rp::SecurityBootstrapChallengeRequest::TEMPLATE_ID)
+            bootstrapOrder.push_back(*tid);
+        // #234: the challenge request (102) is answered unless a test installed a handler for it.
+        if (*tid == rp::SecurityBootstrapChallengeRequest::TEMPLATE_ID &&
+            templateHandlers.find(*tid) == templateHandlers.end()) {
+            if (const auto rq = rp::SecurityBootstrapChallengeRequest::decode(buf, len)) {
+                ++challengeRequests;
+                rp::SecurityBootstrapChallenge c;
+                c.sessionId = rq->sessionId; c.correlationId = rq->correlationId;
+                const uint64_t n = static_cast<uint64_t>(challengeRequests);
+                for (std::size_t i = 0; i < c.challenge.size(); ++i)
+                    // the counter makes each one differ
+                    c.challenge[i] = static_cast<uint8_t>(0xA0 + i + (i < 8 ? (n >> (8 * i)) : 0));
+                challengesIssued.push_back(c.challenge);
+                bootstrapChallengeOf[rq->sessionId] = c.challenge;
+                std::vector<uint8_t> out(c.encodedSize());
+                const std::size_t on = c.encode(out.data());
+                send(replyFromArrival ? endpoint : 0, out.data(), on);
+            }
+            return;
+        }
         // Review B I5: the built-in bootstrap (Required mode, no test handler installed): an ANONYMOUS session only,
-        // the MAC verified under the cluster key, accepted once.
+        // the MAC verified under the cluster key (over the challenge issued on the session), accepted once.
         if (authMode == rp::AuthMode::Required && *tid == rp::SecurityBootstrap::TEMPLATE_ID &&
             templateHandlers.find(*tid) == templateHandlers.end()) {
             onBootstrap_(endpoint, buf, len);

@@ -207,9 +207,14 @@ rune security bootstrap --admin admin \
 # one-time password for admin: Hz3...            (printed once)
 ```
 
-- The bootstrap proves possession of the **cluster key** (an HMAC over its fields and a nonce), so
-  whoever reaches a fresh cluster first cannot take it over. `--cluster-key-file` defaults to
-  `RUNE_CLUSTER_KEY_FILE`.
+- The bootstrap proves possession of the **cluster key** by challenge-response (#234), so whoever reaches a fresh
+  cluster first cannot take it over and a captured frame cannot be replayed. The client first asks the gateway for a
+  one-use challenge on its session (`SecurityBootstrapChallengeRequest` -> `SecurityBootstrapChallenge`, 32 bytes); the
+  bootstrap carries an HMAC-SHA-512 over the challenge and its fields (admin name, verifier, fake-salt seed, nonce)
+  under a bootstrap subkey, `HKDF(SHA-512, master, info = "rune-bootstrap-mac-v2")`, never the raw master. The challenge
+  is valid for one attempt on that session only (an attempt, accepted or refused, uses it up), a restarted broker has a
+  new secret, and no clock is involved. Without a challenge a bootstrap is refused (`no bootstrap challenge on this
+  session: request one first`). `--cluster-key-file` defaults to `RUNE_CLUSTER_KEY_FILE`.
 - It records one `Bootstrap` event with the principal `bootstrap`: the admin user with
   `ADMIN ON CLUSTER` and a generated 24-character one-time password, printed once.
 - The admin **must change the password on first login.** Until then every request except

@@ -166,6 +166,7 @@ static_assert(rune::protocol::client::MessageHeader::ENCODED_SIZE + rune::protoc
     case T::AlterView:
     case T::SecurityDdl:          // authentication (client version 9): answered by DdlResponse too
     case T::SecurityBootstrap:
+    case T::SecurityBootstrapChallengeRequest:   // #234: refused like the bootstrap it prepares
     case T::NamespaceDdl: {       // namespaces (client version 14): answered by DdlResponse too
         pc::DdlResponse r;
         r.sessionId = sessionId; r.correlationId = correlationId; r.errorCode = code;
