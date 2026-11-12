@@ -12,7 +12,7 @@
 //
 // Regression tests (engineering rule 6):
 //   CliLiveRegression.GetLive_DescriptorInOutput, ListLive_TopicPresent,
-//   QlDefinesATopicAndVerbosePrintsEveryNotLeaderRetry
+//   QlDefinesATopicAndVerbosePrintsEveryNotLeaderRetry, QlDefinesATopicAndWithoutVerbosePrintsNothingExtra
 //
 // `rune schema apply|alter` were removed (Phase 2b D): their live assertions are carried by
 // RuneConsoleBrokerRegression in the broker's RuneConsoleBrokerRegressionTest.cpp (real broker).
@@ -906,9 +906,8 @@ TEST(CliLiveRegression, ListLive_TopicPresent) {
 // ===========================================================================
 // Catalog history Task 15: `rune ql` live against the loopback gateway.
 // ===========================================================================
-TEST(CliLiveRegression, QlDefinesATopicAndVerbosePrintsEveryNotLeaderRetry) {
-    for (const bool verbose : {true, false}) {
-        SCOPED_TRACE(verbose ? "--verbose" : "no --verbose");
+static void qlDefinesATopicRetryingNotLeader(const bool verbose) {
+    {
         const int32_t kIn = verbose ? 1260 : 1262, kOut = verbose ? 1261 : 1263;
         const std::string baseDir = cliUniqueDir();
         const std::string aeronDir = baseDir + "/aeron";
@@ -940,3 +939,6 @@ TEST(CliLiveRegression, QlDefinesATopicAndVerbosePrintsEveryNotLeaderRetry) {
         try { std::filesystem::remove_all(baseDir); } catch (...) {}
     }
 }
+
+TEST(CliLiveRegression, QlDefinesATopicAndVerbosePrintsEveryNotLeaderRetry) { qlDefinesATopicRetryingNotLeader(true); }
+TEST(CliLiveRegression, QlDefinesATopicAndWithoutVerbosePrintsNothingExtra) { qlDefinesATopicRetryingNotLeader(false); }

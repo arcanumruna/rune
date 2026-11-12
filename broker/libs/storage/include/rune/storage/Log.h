@@ -748,6 +748,9 @@ public:
     [[nodiscard]] uint64_t cleanerGroupsRejected() const noexcept { return cleanerGroupsRejected_; }
     /// Cleaner thread: outputs it enqueued are not yet consumed by the owner.
     [[nodiscard]] bool cleanerSwapsPending() const noexcept;
+    /// Owner thread (the swap ring's consumer): the acquire on the tail sees every output the cleaner enqueued before
+    /// publishing anything it stored after it (its clean watermark).
+    [[nodiscard]] bool ownerSwapsPending() const noexcept;
     /// The lowest front base of a deferred group rejected since the last call
     /// (INT64_MAX = none), then reset.  The owner rewinds the replica's clean
     /// watermark to it: the rejected range was NOT compacted although the

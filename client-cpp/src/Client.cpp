@@ -2939,6 +2939,7 @@ void Client::sweepControl_(int64_t nowNs) {
                              rateLimited ? static_cast<int64_t>(retryAfter) : 0);
             if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(kRefused)); });
         } else {
+            connectTimeoutUnanswered_.store(agent_.seedMachine().state() == session::SessionState::Connecting, std::memory_order_relaxed);
             completeConnect_(OpStatus::Timeout, 0, 0, {});
             if (cbError_) {
                 invokeUserCallback_("onError", [&] { cbError_("connect() timed out"); });
@@ -3029,12 +3030,12 @@ void Client::checkBlockingCaller_(const char* what) const {
 
 template <class Issue, class OnDone>
 void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
-                      Issue&& issue, OnDone&& onDone, std::string_view waitTimeoutHint) {
+                      Issue&& issue, OnDone&& onDone, const std::function<std::string()>& waitTimeoutHint) {
     OpResult rejected = OpResult::Accepted;
     switch (andWaitCore_(what, timeout, maxResultBytes, issue, onDone, rejected)) {
     case AndWaitEnd::Done:         return;
     case AndWaitEnd::RingTimedOut: throw std::runtime_error(std::string(what) + ": timed out (command ring full)");
-    case AndWaitEnd::WaitTimedOut: throw std::runtime_error(std::string(what) + ": timed out waiting" + std::string(waitTimeoutHint));
+    case AndWaitEnd::WaitTimedOut: throw std::runtime_error(std::string(what) + ": timed out waiting" + (waitTimeoutHint ? waitTimeoutHint() : std::string()));
     case AndWaitEnd::Closed:       throw std::runtime_error(std::string(what) + ": client closed");
     case AndWaitEnd::Rejected:
         throw std::runtime_error(std::string(what) + ": rejected (OpResult " +
@@ -3215,10 +3216,17 @@ void Client::connectAndWait(std::chrono::nanoseconds timeout) {
     andWait_("connect()", timeout, 0,
              [&](Completions& q, Token t) { return connect(q, t); },
              [&](const Completion& c, std::span<const uint8_t> payload) {
-                 if (c.status == OpStatus::Timeout && !hint.empty()) throw std::runtime_error("connect(): timed out" + hint);
+                 if (c.status == OpStatus::Timeout && !hint.empty() && connectTimeoutUnanswered_.load(std::memory_order_relaxed)) throw std::runtime_error("connect(): timed out" + hint);
                  throwForStatus_("connect()", c, payload);
              },
-             hint);
+             [&]() -> std::string {
+                 if (hint.empty()) return {};
+                 try {
+                     if (state() != session::SessionState::Connecting) return {};   // the gateway answered: its port works
+                 } catch (const std::logic_error&) {   // a thread that cannot read the state: say nothing is known, keep the hint
+                 }
+                 return hint;
+             });
 }
 
 Bytes Client::pingAndWait(std::span<const uint8_t> payload, std::chrono::nanoseconds timeout) {

@@ -953,6 +953,7 @@ TEST(ClientConnectTimeoutRegression, TheTimeoutNamesTheConfiguredGatewayResponse
 }
 
 // A thread-mode client on the real clock, its fake gateway pumped by a helper thread; connectAndWait's text is returned.
+namespace {
 std::string connectWaitText(rc::ClientConfig c, const std::function<void(Rig&)>& setup, std::chrono::milliseconds wait) {
     c.runnerMode = rc::RunnerMode::Thread;
     c.nanoClock = nullptr;
@@ -972,6 +973,8 @@ std::string connectWaitText(rc::ClientConfig c, const std::function<void(Rig&)>&
     r.client.close();
     return why;
 }
+
+}   // namespace
 
 TEST(ClientConnectTimeoutRegression, ARefusalTheBrokerAnsweredGetsNoResponsePortHint) {
     // The broker answered (over the response channel, so the port works): the connect ends at its deadline while retrying
