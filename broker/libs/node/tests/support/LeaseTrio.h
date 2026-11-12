@@ -117,6 +117,21 @@ public:
     catalog_cluster::ThreeNodes& nodes() noexcept { return c_; }
     /// The node the client is seeded on.
     [[nodiscard]] int32_t seedNode() const noexcept { return seed_; }
+    /// Moves the client's seed off `node` when the client is seeded there: the next client() connects to another running node (a
+    /// follower of the catalog first) and the connected client, if any, is closed.  A new topic's leader does not follow the seed, so a
+    /// test that needs a partition led by a node other than the seed moves the seed rather than hoping for a placement.
+    void reseedAwayFrom(int32_t node) {
+        if (seed_ != node) return;
+        const int32_t catalogLeader = c_.settledLeader();
+        int32_t pick = -1;
+        for (int32_t id : c_.runningNodes())
+            if (id != node && id != catalogLeader) { pick = id; break; }
+        for (int32_t id : c_.runningNodes())
+            if (pick < 0 && id != node) pick = id;
+        if (pick < 0) throw std::runtime_error("reseedAwayFrom: no other running node");
+        if (client_) { client_->close(); client_.reset(); }
+        seed_ = pick;
+    }
     /// The real client (seeded on a follower of the catalog, so it survives the catalog leader's death), connected lazily.
     Client& client() {
         if (!client_) {
