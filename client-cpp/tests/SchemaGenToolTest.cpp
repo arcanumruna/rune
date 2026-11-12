@@ -8,8 +8,11 @@
 #include <gtest/gtest.h>
 #include <filesystem>
 #include <fstream>
+#include <string>
+#include <unistd.h>
 #include "rune/tools/SchemaGen.h"
 #include <rune/codec/Descriptor.h>
+#include <rune/codec/LeaseColumns.h>
 #include <rune/codec/Serialize.h>
 
 namespace fs = std::filesystem;
@@ -99,4 +102,72 @@ TEST(SchemaGenToolRegression, MalformedBlobThrows) {
     EXPECT_THROW(
         (void)rune::tools::generateFromFile(blobPath.string(), dir.string()),
         std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// Lease form offline (--lease): the blob carries no lease block, so the caller says it.
+// ---------------------------------------------------------------------------
+namespace {
+
+fs::path leaseTestDir(const char* tag) {
+    fs::path dir = fs::temp_directory_path() /
+                   ("rune_gen_tool_lease_" + std::string(tag) + "_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    return dir;
+}
+
+fs::path writeBlob(const fs::path& dir, rune::codec::Descriptor d) {
+    auto blob = rune::codec::serialize(d);
+    fs::path p = dir / "in.blob";
+    std::ofstream o(p, std::ios::binary);
+    o.write((const char*)blob.data(), (std::streamsize)blob.size());
+    return p;
+}
+
+rune::codec::Descriptor leaseShaped() {
+    using namespace rune::codec;
+    auto d = DescriptorBuilder("lease_claim")
+                 .addFixedStr("claim", 32, 1, true)
+                 .add("a", PrimType::UInt64)
+                 .build();
+    EXPECT_TRUE(prependLeaseColumns(d));
+    return d;
+}
+
+std::string slurp(const std::string& path) {
+    std::ifstream in(path);
+    return std::string((std::istreambuf_iterator<char>(in)), {});
+}
+
+} // namespace
+
+TEST(SchemaGenToolRegression, FromFileWithLeaseEmitsLeasesRow) {
+    fs::path dir = leaseTestDir("on");
+    auto gen = rune::tools::generateFromFile(writeBlob(dir, leaseShaped()).string(), dir.string(), true);
+    const std::string s = slurp(gen);
+    EXPECT_NE(s.find("LeasesRow"), std::string::npos);
+    EXPECT_NE(s.find("withLease"), std::string::npos);
+    fs::remove_all(dir);
+}
+
+TEST(SchemaGenToolRegression, FromFileWithoutLeaseHasNoLeasesRow) {
+    fs::path dir = leaseTestDir("off");
+    const std::string blob = writeBlob(dir, leaseShaped()).string();
+    const std::string a = slurp(rune::tools::generateFromFile(blob, dir.string(), false));
+    EXPECT_EQ(a.find("LeasesRow"), std::string::npos);
+    EXPECT_EQ(a.find("withLease"), std::string::npos);
+    const std::string b = slurp(rune::tools::generateFromFile(blob, dir.string()));
+    EXPECT_EQ(b.find("LeasesRow"), std::string::npos);
+    EXPECT_EQ(a, b);
+    fs::remove_all(dir);
+}
+
+TEST(SchemaGenToolRegression, FromFileLeaseOnNonLeaseSchemaThrows) {
+    using namespace rune::codec;
+    fs::path dir = leaseTestDir("bad");
+    fs::path blob = writeBlob(dir, DescriptorBuilder("plain", 1).add("id", PrimType::Int64).build());
+    EXPECT_THROW((void)rune::tools::generateFromFile(blob.string(), dir.string(), true), std::invalid_argument);
+    EXPECT_FALSE(fs::exists(dir / "plain.gen.h"));
+    fs::remove_all(dir);
 }

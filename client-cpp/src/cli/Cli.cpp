@@ -99,8 +99,9 @@ void printUsage(std::ostream& err) {
         << "      Fetch topic schema from broker and print descriptor.\n"
         << "  rune schema list [--verbose] --broker <ep>\n"
         << "      List known topics on broker.\n"
-        << "  rune schema generate --from-file <blob> --out <dir>\n"
-        << "      Generate C++ header from a serialized descriptor blob.\n"
+        << "  rune schema generate --from-file <blob> --out <dir> [--lease]\n"
+        << "      Generate C++ header from a serialized descriptor blob (--lease: the blob is a lease topic's\n"
+        << "      stored schema; adds withLease() and LeasesRow).\n"
         << "  rune schema generate <topic> --out <dir> [--broker <ep>]\n"
         << "      Fetch topic schema from broker and generate C++ header (live).\n";
     rune::cli::printCatalogUsage(err);
@@ -317,11 +318,16 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
         err << "rune schema generate: --out <dir> is required\n";
         return 1;
     }
+    const bool lease = hasFlag(args, "--lease");
+    if (lease && fromFile.empty()) {
+        err << "rune schema generate: --lease applies to --from-file only; live mode reads it from the topic\n";
+        return 1;
+    }
 
     // ── Offline: --from-file ──────────────────────────────────────────────────
     if (!fromFile.empty()) {
         try {
-            auto written = rune::tools::generateFromFile(fromFile, outDir);
+            auto written = rune::tools::generateFromFile(fromFile, outDir, lease);
             out << "rune: wrote " << written << "\n";
             return 0;
         } catch (const std::exception& e) {
@@ -367,7 +373,7 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
 
         rune::codec::Descriptor d = rune::codec::deserialize(
             std::span<const uint8_t>(r.descriptorBlob.data(), r.descriptorBlob.size()));
-        std::string hdr = rune::codec::generateHeader(d);
+        std::string hdr = rune::codec::generateHeader(d, d.version, "rune::gen", r.lease.has_value());
 
         std::filesystem::path dir(outDir);
         std::filesystem::create_directories(dir);
