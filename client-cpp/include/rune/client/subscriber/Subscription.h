@@ -376,6 +376,9 @@ struct SubscriptionImpl {
     // ---- pause / resume (duty thread) ----------------------------------------------
     // A paused subscription is `active` (not finished) but in neither of the hub's routing tables; its Subscribe request
     // (a map node) and its old routing entry (a map node) are parked here, so a later cycle allocates nothing.
+    /// The slot of this impl in its hub's owned_ (set at adoption, kept by the swap-remove of release()): owns_() is O(1), validated
+    /// as `slot < owned_.size() && owned_[slot] == this`, so a stale value (handed back, never adopted) is simply refused.
+    uint32_t ownedSlot   = ~0u;
     bool    paused       = false;
     bool    pausedOnce   = false;  // the hub keeps (parks) the nodes instead of freeing them once a pause happened
     uint32_t appSeqApplied = 0;         // duty-owned: the number of the last handle command (pause / resume) applied (echoed in the status)

@@ -164,7 +164,10 @@ void SubscriberHub::applyCommand(const detail::HubCommand& cmd,
         std::unique_ptr<SubscribeRequest> req(reinterpret_cast<SubscribeRequest*>(cmd.handle));
         // F8c C7: from here the duty side holds its share of the impl (even
         // if it was unsubscribed before this adoption) until release().
-        if (req && req->impl) owned_.push_back(req->impl);
+        if (req && req->impl) {
+            req->impl->ownedSlot = static_cast<uint32_t>(owned_.size());
+            owned_.push_back(req->impl);
+        }
         // F8a fix2: stamp the frame with the CURRENT session (the app thread's
         // snapshot may be stale); a frame of a dead session is dropped by the
         // ring drain, and pending subscribes are re-sent on every connect.
@@ -317,13 +320,17 @@ int SubscriberHub::retryUnsentSubscribes()
 
 int64_t SubscriberHub::correlationIdOf_(const SubscriptionImpl* key) const noexcept
 {
-    for (const auto& [corr, req] : pendingByCorrelation_) {
-        if (req->impl == key) return corr;
+    // O(1): the impl's own correlation id and subscription id are the keys of the two routing tables (a paused or finished one is in
+    // neither).  Only an impl this hub owns is dereferenced; the command ring orders every command before the impl's release.
+    if (!owns_(key)) return 0;   // not held: nothing to unsubscribe
+    if (const auto it = pendingByCorrelation_.find(key->correlationId);
+        it != pendingByCorrelation_.end() && it->second->impl == key)
+        return it->first;
+    if (key->subscriptionId != 0) {
+        if (const auto it = activeById_.find(key->subscriptionId); it != activeById_.end() && it->second == key)
+            return key->correlationId;
     }
-    for (const auto& [id, impl] : activeById_) {
-        if (impl == key) return impl->correlationId;
-    }
-    return 0;  // not (or no longer) held: nothing to unsubscribe
+    return 0;  // not (or no longer) in a table
 }
 
 bool SubscriberHub::unsubscribe(int64_t       subscribeCorrId,
@@ -485,10 +492,10 @@ int SubscriberHub::retryPendingUnsubscribes(int64_t currentSessionId)
 
 bool SubscriberHub::owns_(const SubscriptionImpl* impl) const noexcept
 {
-    for (const SubscriptionImpl* p : owned_) {
-        if (p == impl) return true;
-    }
-    return false;
+    // O(1), validated on use.  `impl` is a live impl whenever this is reached (a handle command is applied before the release the
+    // handle's destruction queues behind it, reapReleases_ fence); a value from before adoption or after hand-back fails the check.
+    const uint32_t slot = impl->ownedSlot;
+    return slot < owned_.size() && owned_[slot] == impl;
 }
 
 void SubscriberHub::eraseActive_(int64_t id, const SubscriptionImpl& impl)
@@ -1761,12 +1768,12 @@ bool SubscriberHub::release(SubscriptionImpl* impl) noexcept
     for (const auto& [id, p] : activeById_) {
         if (p == impl) return false;
     }
-    for (std::size_t i = 0; i < owned_.size(); ++i) {
-        if (owned_[i] == impl) {
-            owned_[i] = owned_.back();
-            owned_.pop_back();
-            break;
-        }
+    if (owns_(impl)) {
+        SubscriptionImpl* moved = owned_.back();
+        owned_[impl->ownedSlot] = moved;
+        moved->ownedSlot        = impl->ownedSlot;
+        owned_.pop_back();
+        impl->ownedSlot = ~0u;
     }
     return true;
 }

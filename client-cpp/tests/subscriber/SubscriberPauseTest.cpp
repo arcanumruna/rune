@@ -1231,6 +1231,51 @@ TEST(SubscriberPauseRegression, PauseOfAnUnadoptedSubscriptionRefusedRegression)
     EXPECT_FALSE(impl2->paused);
 }
 
+// F-4 (final review): owns_() is an O(1) slot check.  The swap-remove of release() must move the last impl's slot with it, or the
+// moved impl would be refused (or, worse, another one resolved) by pause / resume.
+TEST(SubscriberPauseRegression, OwnedSlotSurvivesReleaseSwapRemoveRegression) {
+    Rig r;
+    constexpr int kN = 5;
+    std::vector<std::unique_ptr<rc::SubscriptionImpl>> impls;
+    std::vector<std::unique_ptr<rc::Subscription>>     subs;
+    for (int i = 0; i < kN; ++i) {
+        auto impl           = std::make_unique<rc::SubscriptionImpl>();
+        impl->correlationId = 500 + i;
+        impl->topicId       = kTopic;
+        impl->partition     = i;
+        impl->fromWire      = -2;
+        impl->handler       = [](const rc::Record&) {};
+        subs.push_back(std::make_unique<rc::Subscription>(impl.get(), &Rig::sink, &r, r.dutyId));
+        auto req = SubscriberHub::makeSubscribeRequest(impl.get(), r.sid, 1, -2, 0, {}, kHour);
+        rcd::HubCommand add;
+        add.op     = rcd::HubCommand::Op::SubscribeAdd;
+        add.handle = reinterpret_cast<uint64_t>(req.release());
+        r.hub.applyCommand(add, 0, r.sid, r.noSend, r.nowNs);
+        r.hub.onSubscribeResponse(bindRsp(500 + i, 900 + i, r.sid), 0, r.sid, r.noSend);
+        impls.push_back(std::move(impl));
+    }
+    ASSERT_EQ(r.hub.ownedCount(), static_cast<std::size_t>(kN));
+    // Release the first: its hub-side references go (unsubscribe), then the swap-remove moves the last impl into slot 0.
+    subs[0]->unsubscribe();
+    ASSERT_TRUE(r.hub.release(impls[0].get())) << "nothing references the unsubscribed impl any more";
+    ASSERT_EQ(r.hub.ownedCount(), static_cast<std::size_t>(kN - 1));
+    // The released impl is no longer owned; every other one still resolves.
+    EXPECT_FALSE(r.hub.pauseDirect(*impls[0], -1, 1, ++r.nextCorr, r.sid, r.noSend)) << "a released impl is not owned";
+    for (int i = 1; i < kN; ++i) {
+        EXPECT_TRUE(subs[i]->pause()) << "impl " << i;
+        EXPECT_TRUE(impls[i]->paused) << "impl " << i;
+        if (i != kN - 1) EXPECT_TRUE(subs[i]->resume()) << "impl " << i;   // the last stays paused: it ends in no table
+    }
+    // Release the (former) last, now in slot 0 or a middle slot: the rest still resolve.
+    subs[kN - 1]->unsubscribe();
+    ASSERT_TRUE(r.hub.release(impls[kN - 1].get()));
+    ASSERT_EQ(r.hub.ownedCount(), static_cast<std::size_t>(kN - 2));
+    for (int i = 1; i < kN - 1; ++i) {
+        ASSERT_TRUE(impls[i]->active);
+        EXPECT_TRUE(r.hub.pauseDirect(*impls[i], -1, 99, ++r.nextCorr, r.sid, r.noSend)) << "impl " << i;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------
 // I-6: the in-handler timings x handle kind x record position x refused Unsubscribe.
 // ---------------------------------------------------------------------------------------------------------------------------
