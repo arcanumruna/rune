@@ -565,7 +565,7 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     followerHw_ = 0;
     hwLearnedEpoch_ = -1;     // catalog Task 12 re-review F2: a new leader (even same epoch) must answer first
     followerSync_.reset();    // new leadership epoch → bootstrap fetch state afresh
-    wedgedAtOffset_ = -1;     // F18: a new leadership may serve it (re-evaluated)
+    clearWedge_();            // F18: a new leadership may serve it (re-evaluated)
     stampEpochOnLog_(-1);
     // Drop a phantom epoch entry (assigned at becomeLeader at our LEO, never
     // appended in): our lastFetchedEpoch must name the epoch of our last record.
@@ -881,7 +881,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         followerHw_ = committedHw;
         hwLearnedEpoch_ = epoch_;   // our own committed HW as the demoted leader
         followerSync_.reset();    // self-demotion → bootstrap fetch state afresh
-        wedgedAtOffset_ = -1;     // F18
+        clearWedge_();            // F18
         followerSlots_.resetLeadership();
         clearPublishedFollowerPositions_();
         if (fsLogEnabled()) {
@@ -1375,6 +1375,8 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // Review C1: no apply between a divergence truncation and its durable history.
     if (awaitEsFetch_) [[unlikely]] { ++appliesDroppedAwaitEs_; return; }
     ++rtApplies_;
+    const bool probeAnswer = wedgeProbeSent_;   // #880: any answer consumes the outstanding probe
+    wedgeProbeSent_ = false;
     rtApplyBytes_ += static_cast<int64_t>(resp.records.size());
     FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplFetchRespApply,
                              static_cast<uint32_t>(cfg_.partitionId));
@@ -1392,14 +1394,16 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         if (resp.errorCode == kErrRecordTooLarge) {
             followerSync_.forceBehind();
             if (role_ == Role::Follower && resp.leaderEpoch >= epoch_)
-                wedgeAt_(logEndOffset_(), "the leader cannot fit it in one replication frame");
+                wedgeAt_(logEndOffset_(), WedgeReason::TooLarge,
+                         "the leader cannot fit it in one replication frame");
         }
         // #839: the leader's stored copy of the batch at our LEO is damaged — never retriable here: Behind, then wedge
         // (same rules as above: a stale-epoch answer never wedges).
         if (resp.errorCode == kErrCorruptRecord) {
             followerSync_.forceBehind();
             if (role_ == Role::Follower && resp.leaderEpoch >= epoch_)
-                wedgeAt_(logEndOffset_(), "the leader's stored copy of this batch is corrupt");
+                wedgeAt_(logEndOffset_(), WedgeReason::CorruptAtLeader,
+                         "the leader's stored copy of this batch is corrupt");
         }
         // KIP-320/595: our (fetchOffset, lastFetchedEpoch) is off the leader's
         // lineage — KIP-279 truncation, then re-fetch.
@@ -1459,6 +1463,14 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // epoch adoption here — once we follow that epoch, our fetch (validated by
     // its leader) brings the data.
     if (resp.leaderEpoch > epoch_) return;
+    // #880: an OK answer without data to a follower wedged on the leader's damaged batch: the leader's log ends at our
+    // LEO now (it was truncated), so the offset is no longer unservable.  (A data answer moves our LEO: doWork clears.)
+    if (probeAnswer && wedgeReason_ == WedgeReason::CorruptAtLeader && role_ == Role::Follower &&
+        resp.records.empty()) {
+        spdlog::info("PartitionReplica[node={} topic={} part={}]: the leader answered offset {} without data (its log "
+                     "ends there): the wedge is cleared", cfg_.selfId, cfg_.topicId, cfg_.partitionId, wedgedAtOffset_);
+        clearWedge_();
+    }
     // E2 final fix wave (C1 multi-node): this ring now follows the current
     // leadership's data lineage (reported if it is ever promoted).
     if (memoryBacked_ && role_ == Role::Follower) lineageSrcEpoch_ = epoch_;
@@ -1720,10 +1732,13 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
 
 // F18: enter the wedged state at `at` (idempotent per offset): no further fetch
 // or epoch probe (doWork), so the leader's existing lag check evicts us.
-void PartitionReplica::wedgeAt_(Offset at, const char* why)
+void PartitionReplica::wedgeAt_(Offset at, WedgeReason reason, const char* why)
 {
     if (wedgedAtOffset_ == at) return;
     wedgedAtOffset_ = at;
+    wedgeReason_    = reason;
+    wedgeProbeAtNs_ = lastKnownNowNs_;
+    wedgeProbeSent_ = false;
     ++wedgedRefusals_;
     spdlog::error("PartitionReplica[node={} topic={} part={}]: follower WEDGED at offset {} — "
                   "the batch there is unreplicable ({}); stopped fetching it, leaving the ISR "
@@ -1735,7 +1750,7 @@ void PartitionReplica::onUnapplicableBatch(Offset batchBase, Epoch leaderEpoch)
 {
     if (role_ != Role::Follower || leaderEpoch < epoch_) return;   // stale / not a follower
     if (batchBase != logEndOffset_()) return;   // not the batch we need: never wedge (B-1)
-    wedgeAt_(batchBase, "it cannot fit one frame of this node's worker ingress ring");
+    wedgeAt_(batchBase, WedgeReason::Other, "it cannot fit one frame of this node's worker ingress ring");
 }
 
 // Spec §3.5.2: the follower knows its leader — unicast.  Before the leader is
@@ -3031,7 +3046,7 @@ int PartitionReplica::doWork(int64_t nowNs)
         // F18 (I-1): a wedge is bound to the offset — a truncation that moved our
         // LEO clears it (time-independent: no timer).  While wedged the follower
         // sends NOTHING (no fetch, no keepalive), so the leader's lag check evicts it.
-        if (wedgedAtOffset_ >= 0 && wedgedAtOffset_ != logEndOffset_()) wedgedAtOffset_ = -1;
+        if (wedgedAtOffset_ >= 0 && wedgedAtOffset_ != logEndOffset_()) clearWedge_();
         // Fix round 5: a deferred divergence truncation completes as soon as the
         // log cleaner has performed its posted renames (event-driven, no wait).
         if (followerSync_.truncatePending() && !memoryBacked_ && diskLog_ != nullptr &&
@@ -3055,7 +3070,16 @@ int PartitionReplica::doWork(int64_t nowNs)
                                 std::holds_alternative<Refused>(divergenceGuard_);   // (wedge cleared above if LEO moved)
             const FollowerSync::State fsPrev = followerSync_.state();
             const bool fsWasArmed = followerSync_.fetchArmed();
-            const FollowerSync::Action act = wedged
+            // #880: a follower wedged on the LEADER's damaged copy asks again once a period: the leader may have
+            // repaired the segment since.  One ordinary data fetch at the LEO (the answer is not liveness while the
+            // copy is damaged, so this never keeps the follower in the ISR); every other pass stays silent.
+            const bool probe = wedgeReason_ == WedgeReason::CorruptAtLeader && wedgedAtOffset_ >= 0 &&
+                               !std::holds_alternative<Refused>(divergenceGuard_) &&
+                               nowNs - wedgeProbeAtNs_ >= kCorruptWedgeProbeNs;
+            if (probe) { wedgeProbeAtNs_ = nowNs; wedgeProbeSent_ = true; ++corruptWedgeProbes_; }
+            const FollowerSync::Action act = probe
+                ? FollowerSync::Action{true, true}
+                : wedged
                 ? FollowerSync::Action{false, false}       // wedged: no fetch, no liveness
                 : followerSync_.decide(nowNs, cfg_.fetchIntervalNs, keepaliveNs, kFetchResendNs);
             if (act.emit) {
@@ -4200,7 +4224,7 @@ void PartitionReplica::onTransientApplyRefused_(int64_t rc, std::size_t frameByt
                           "RUNE_TRANSIENT_LOG_RING_BYTES) — it cannot be replicated here (refusals={})",
                           cfg_.selfId, cfg_.topicId, cfg_.partitionId, at, frameBytes,
                           memLog_->capacityBytes(), transientApplyTooLargeRefusals_);
-        wedgeAt_(at, "larger than this node's transient ring");
+        wedgeAt_(at, WedgeReason::Other, "larger than this node's transient ring");
         return;
     }
     ++transientApplyFullRefusals_;

@@ -1409,6 +1409,8 @@ public:
     [[nodiscard]] uint64_t wedgedRefusals() const noexcept { return wedgedRefusals_; }
     /// Follower: the offset it is wedged at (stops fetching it), or -1.
     [[nodiscard]] Offset wedgedAtOffset() const noexcept { return wedgedAtOffset_; }
+    /// #880: probe fetches a follower wedged on the leader's damaged batch sent (one per kCorruptWedgeProbeNs).
+    [[nodiscard]] uint64_t corruptWedgeProbes() const noexcept { return corruptWedgeProbes_; }
     /// F18 (B-1): this node's transport could not hand the follower the batch
     /// whose baseOffset is `batchBase` (it cannot fit one worker-ingress frame on
     /// its own).  Wedges ONLY if that batch is the one at our LEO and the answer
@@ -1965,7 +1967,16 @@ private:
     uint64_t corruptPushReads_     = 0;   ///< #875: push reads that hit a damaged range
     uint64_t wedgedRefusals_       = 0;
     Offset   wedgedAtOffset_       = -1;
-    void wedgeAt_(Offset at, const char* why);   ///< F18: enter the wedged state (log + count)
+    /// #880: why the follower is wedged.  Only a wedge on the LEADER's damaged copy probes again (the leader may
+    /// repair it); an unreplicable (too large) batch never becomes servable by waiting.
+    enum class WedgeReason : uint8_t { None, TooLarge, CorruptAtLeader, Other };
+    WedgeReason wedgeReason_       = WedgeReason::None;
+    int64_t  wedgeProbeAtNs_       = 0;     ///< when the wedge was entered / last probed (duty clock)
+    bool     wedgeProbeSent_       = false; ///< a probe is out: its answer is the next one that can clear the wedge
+    uint64_t corruptWedgeProbes_   = 0;
+    static constexpr int64_t kCorruptWedgeProbeNs = 1'000'000'000;
+    void wedgeAt_(Offset at, WedgeReason reason, const char* why);   ///< F18: enter the wedged state (log + count)
+    void clearWedge_() noexcept { wedgedAtOffset_ = -1; wedgeReason_ = WedgeReason::None; wedgeProbeSent_ = false; }
     Offset  rtLastHw_ = 0, rtLastLeo_ = 0;
 
     // F3 fix-round-2, item A: count of "batch exceeds even this transport's

@@ -401,8 +401,10 @@ segment as it is. A sealed segment whose bytes after the last whole, CRC-valid b
   or subscription that reaches it gets `StorageError (26)` ("the stored batch is corrupt (damaged log segment)") and the client
   fails that subscription with `CorruptBatch`; records before the damage and in later segments are served.
 - **Replication.** A leader asked to fetch the damaged range answers `kErrCorruptRecord` (-12). The follower stops at its log end
-  and leaves the in-sync set. It stays stopped until its leadership changes or the node restarts: repairing the leader's copy
-  does not wake it.
+  and leaves the in-sync set. While stopped it sends nothing except one fetch at its log end per second: once the leader has
+  repaired its copy (below) that fetch is answered with data, and the follower catches up and rejoins the in-sync set within a
+  second of the repair, with no restart. A batch that is too large for one replication frame is a different stop and is not
+  retried.
 - **Automatic repair.** A replica whose partition has a damaged sealed segment rebuilds it from a peer that holds the range
   intact, while it keeps its log length, its place in the in-sync set and its leadership. A follower asks the leader; a
   leader asks its in-sync followers in id order. The replica copies the valid prefix of the segment into a side file, fetches

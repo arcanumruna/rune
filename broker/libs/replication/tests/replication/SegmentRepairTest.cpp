@@ -18,6 +18,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include <unistd.h>
@@ -44,16 +45,16 @@ struct TempDir {
     ~TempDir() { std::error_code ec; fs::remove_all(path, ec); }
 };
 
-PartitionConfig cfgFor(NodeId self) {
+PartitionConfig cfgFor(NodeId self, int64_t lagMaxMs = 600'000, int32_t maxFetch = 4096) {
     PartitionConfig c;
     c.partitionId         = 0;
     c.selfId              = self;
-    c.replicaLagMaxMs     = 600'000;   // no lag eviction: the injected clock runs fast
+    c.replicaLagMaxMs     = lagMaxMs;   // default: no lag eviction (the injected clock runs fast)
     c.replicaLagMaxOffset = 1'000'000;
     c.minIsr              = 1;
     c.fetchIntervalNs     = 1'000'000LL;
     c.isrCheckIntervalNs  = 1'000'000LL;
-    c.maxFetchBytes       = 4096;
+    c.maxFetchBytes       = maxFetch;
     c.pushOnAppend        = false;
     return c;
 }
@@ -101,11 +102,18 @@ public:
     std::vector<FetchRequestMsg>  repairReqs;
     std::vector<NodeId>           repairReqTo;
     int  responses = 0;
+    std::map<NodeId, int> dataFetchesFrom;     // ... of which asked for records (maxBytes > 0)
     bool dropRequests = false;
     bool dropFetches = false;   // follower fetches never reach the leader: its HW cannot move
+    std::set<NodeId> dropFetchesFrom;          // ... only those of these followers
+    std::map<NodeId, int> fetchesFrom;         // every fetch frame a follower handed to the transport
+    int64_t frameLimit = std::numeric_limits<int64_t>::max();   // maxFetchRecordsBytes()
     std::vector<int16_t> statuses;
+    [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override { return frameLimit; }
     bool sendFetchRequest(const FetchRequestMsg& req) override {
-        if (dropFetches) return true;
+        ++fetchesFrom[req.followerId];
+        if (req.maxBytes > 0) ++dataFetchesFrom[req.followerId];
+        if (dropFetches || dropFetchesFrom.count(req.followerId) != 0) return true;
         return InMemoryTransport::sendFetchRequest(req);
     }
     bool sendRepairRequest(NodeId to, const FetchRequestMsg& req) override {
@@ -129,6 +137,8 @@ struct Rig {
     std::unique_ptr<PartitionReplica> rep[3];
     std::vector<uint8_t> scratch = std::vector<uint8_t>(64 * 1024);
     int64_t clock = 0;
+    int64_t lagMaxMs = 600'000;       // the replica lag window of every node
+    int32_t maxFetch = 4096;
     int64_t leo = 0;
     int64_t D = -1;                 // the damage offset (2nd batch of segment 0)
     std::vector<int64_t> bases;
@@ -164,8 +174,9 @@ struct Rig {
             logs[n]->recover();
             logs[n]->setDeferSealSync(false);
             logs[n]->setEpochHistoryCap(std::numeric_limits<int64_t>::max());
-            rep[n] = std::make_unique<PartitionReplica>(cfgFor(n + 1), n == 0 ? Role::Leader : Role::Follower, 1,
-                                                        replicas, replicas, logs[n].get(), &transport);
+            rep[n] = std::make_unique<PartitionReplica>(
+                cfgFor(n + 1, lagMaxMs, maxFetch), n == 0 ? Role::Leader : Role::Follower, 1, replicas, replicas,
+                logs[n].get(), &transport);
             rep[n]->setReadScratch(scratch.data(), scratch.size());
             if (n > 0) rep[n]->becomeFollower(1, 1);
         }
@@ -504,4 +515,116 @@ TEST(SegmentRepairRegression, ATruncationBelowTheSegmentEndMidRepairAbortsItRegr
     EXPECT_GE(r.rep[1]->segmentRepairsAborted(), 1u);
     EXPECT_FALSE(r.logs[1]->segmentRepairBase().has_value());
     EXPECT_FALSE(fs::exists(rune::storage::Log::repairLogPath(r.dirs[1].path, r.bases[0])));
+}
+
+// ---- #880 follow-up: a follower wedged on the leader's damaged batch probes again --------------------------------
+
+namespace {
+// Node 3 holds the log up to (not including) the damage offset: it is "behind the damage".
+void truncateNode3To(Rig& r, int64_t at) {
+    rune::storage::Log l(r.dirs[2].path, kRoll);
+    l.recover();
+    ASSERT_TRUE(l.truncateTo(at));
+}
+constexpr int64_t kProbeNs = 1'000'000'000;   // PartitionReplica::kCorruptWedgeProbeNs
+}  // namespace
+
+TEST(SegmentRepairRegression, AFollowerWedgedOnTheLeadersDamageResumesAfterTheRepairRegression) {
+    Rig r;
+    ASSERT_NO_FATAL_FAILURE(r.seed());
+    r.D = damageFirstSegment(r.dirs[0].path);
+    ASSERT_NO_FATAL_FAILURE(truncateNode3To(r, r.D));
+    r.lagMaxMs = 3000;                             // node 3 is evicted by the lag check, then the HW follows node 2
+    r.open(3);
+    r.transport.dropFetchesFrom = {2};             // node 2 has not reported: the HW is 0, no repair yet
+    ASSERT_TRUE(r.driveUntil([&] { return r.rep[2]->wedgedAtOffset() == r.D; }));
+    EXPECT_EQ(r.rep[2]->wedgedRefusals(), 1u);
+    const int sentAtWedge = r.transport.fetchesFrom[3];
+    // Less than the probe period: C is silent.
+    r.drive(5);
+    EXPECT_EQ(r.transport.fetchesFrom[3], sentAtWedge) << "a wedged follower sends nothing between probes";
+    EXPECT_EQ(r.rep[2]->corruptWedgeProbes(), 0u);
+    // The leader repairs from node 2.  (Its repair pass runs once a second, so a probe or two that is still answered
+    // "corrupt" may land before it completes: the wedge just stands.)
+    r.transport.dropFetchesFrom.clear();
+    (void)r.rep[0]->onFetchRequest(ackOf(2, r.leo), r.clock);
+    ASSERT_TRUE(r.driveUntil([&] { return r.rep[0]->segmentRepairsCompleted() == 1; }));
+    ASSERT_EQ(r.logs[0]->damagedSegmentCount(), 0u);
+    EXPECT_EQ(r.rep[2]->wedgedAtOffset(), r.D);
+    // From now on the next probe (within one period) is answered with data: exactly one fetch, not a burst.
+    const int sentAtRepair = r.transport.dataFetchesFrom[3];
+    const uint64_t probesAtRepair = r.rep[2]->corruptWedgeProbes();
+    ASSERT_TRUE(r.driveUntil([&] { return r.rep[2]->corruptWedgeProbes() > probesAtRepair; }, 12));
+    EXPECT_EQ(r.rep[2]->corruptWedgeProbes(), probesAtRepair + 1);
+    EXPECT_EQ(r.transport.dataFetchesFrom[3], sentAtRepair + 1) << "one probe, not a burst";
+    ASSERT_TRUE(r.driveUntil([&] { return r.rep[2]->wedgedAtOffset() == -1; }, 5));
+    ASSERT_TRUE(r.driveUntil([&] { return r.logs[2]->logEndOffset() == r.leo; }, 100));
+    EXPECT_EQ(r.rep[2]->wedgedRefusals(), 1u);
+    ASSERT_TRUE(r.driveUntil([&] {
+        const auto& isr = r.rep[0]->isr();
+        return std::find(isr.begin(), isr.end(), 3) != isr.end();
+    }, 100)) << "caught up: it re-enters the ISR";
+}
+
+TEST(SegmentRepairRegression, AWedgedFollowerProbesOncePerPeriodAndIsNotIsrLivenessRegression) {
+    Rig r;
+    ASSERT_NO_FATAL_FAILURE(r.seed());
+    r.D = damageFirstSegment(r.dirs[0].path);
+    damageFirstSegment(r.dirs[1].path);            // no peer can serve the repair
+    ASSERT_NO_FATAL_FAILURE(truncateNode3To(r, r.D));
+    r.lagMaxMs = 3000;
+    r.open(3);
+    r.settle();   // (node 3's report is answered "empty ok" after it wedged, too: that must not clear the wedge)
+    ASSERT_TRUE(r.driveUntil([&] { return r.rep[2]->wedgedAtOffset() == r.D; }));
+    const int sentAtWedge = r.transport.fetchesFrom[3];
+    const uint64_t servedAtWedge = r.rep[0]->corruptReadsServed();
+    const int64_t t0 = r.clock;
+    r.drive(100);   // 10 probe periods of 1 s
+    ASSERT_EQ(r.clock - t0, 10 * kProbeNs);
+    EXPECT_EQ(r.transport.fetchesFrom[3], sentAtWedge + 10);
+    EXPECT_EQ(r.rep[2]->corruptWedgeProbes(), 10u);
+    EXPECT_EQ(r.rep[0]->corruptReadsServed(), servedAtWedge + 10) << "every probe was answered, none served";
+    EXPECT_EQ(r.rep[2]->wedgedAtOffset(), r.D);
+    EXPECT_EQ(r.rep[2]->wedgedRefusals(), 1u) << "the repeated answer neither re-wedges nor counts";
+    const auto& isr = r.rep[0]->isr();
+    EXPECT_EQ(std::find(isr.begin(), isr.end(), 3), isr.end()) << "never live: evicted by the lag check";
+    EXPECT_EQ(r.rep[0]->segmentRepairsCompleted(), 0u);
+}
+
+TEST(SegmentRepairRegression, ATooLargeWedgeNeverProbesRegression) {
+    Rig r;
+    ASSERT_NO_FATAL_FAILURE(r.seed());
+    for (const auto& e : fs::directory_iterator(r.dirs[1].path)) fs::remove_all(e.path());   // node 2 starts empty
+    r.maxFetch = 64;                  // smaller than the first batch
+    r.transport.frameLimit = 100;     // and the frame cannot hold it either
+    r.open(2);
+    ASSERT_TRUE(r.driveUntil([&] { return r.rep[1]->wedgedAtOffset() == 0; }));
+    EXPECT_EQ(r.rep[0]->recordTooLargeServed() >= 1, true);
+    const int sentAtWedge = r.transport.fetchesFrom[2];
+    r.drive(50);
+    EXPECT_EQ(r.transport.fetchesFrom[2], sentAtWedge) << "an unreplicable batch never becomes servable by waiting";
+    EXPECT_EQ(r.rep[1]->corruptWedgeProbes(), 0u);
+    EXPECT_EQ(r.rep[1]->wedgedAtOffset(), 0);
+}
+
+TEST(SegmentRepairRegression, AWedgeClearsWhenTheLeadersLogNowEndsAtTheWedgedOffsetRegression) {
+    Rig r;
+    ASSERT_NO_FATAL_FAILURE(r.seed());
+    r.D = damageFirstSegment(r.dirs[0].path);
+    ASSERT_NO_FATAL_FAILURE(truncateNode3To(r, r.D));
+    r.lagMaxMs = 3000;
+    r.open(3);
+    r.settle();
+    ASSERT_TRUE(r.driveUntil([&] { return r.rep[2]->wedgedAtOffset() == r.D; }));
+    // The leader's log now ends exactly where the follower's does (the damaged tail was cut away).
+    bool cut = false;
+    for (int i = 0; i < 20 && !cut; ++i) {   // the cleaner's posted file ops may defer it
+        r.logs[0]->runCleanerFileOps(0);
+        cut = r.logs[0]->truncateTo(r.D);
+    }
+    ASSERT_TRUE(cut);
+    ASSERT_EQ(r.logs[0]->logEndOffset(), r.D);
+    ASSERT_TRUE(r.driveUntil([&] { return r.rep[2]->wedgedAtOffset() == -1; }, 30));
+    EXPECT_EQ(r.rep[2]->wedgedRefusals(), 1u);
+    EXPECT_GE(r.rep[2]->corruptWedgeProbes(), 1u);
 }
