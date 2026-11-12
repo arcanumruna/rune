@@ -234,6 +234,24 @@ TEST(SchemaGenLeaseCliRegression, FromFileWithoutLeaseFlagHasNoLeasesRowRegressi
     EXPECT_EQ(h.find("LeasesRow"), std::string::npos);
 }
 
+// F-6: the --lease form carries the same kFingerprint literal as the plain form.
+TEST(SchemaGenLeaseCliRegression, LeaseFlagDoesNotChangeTheFingerprintRegression) {
+    SchemaGenLeaseFixture f;
+    std::string out, err;
+    auto literalOf = [](const std::string& h) {
+        const std::string key = "kFingerprint = ";
+        const auto at = h.find(key);
+        EXPECT_NE(at, std::string::npos);
+        return at == std::string::npos ? std::string{} : h.substr(at + key.size(), h.find("ull;", at) - at - key.size());
+    };
+    ASSERT_EQ(runCli({"schema", "generate", "--from-file", f.blob, "--out", f.dir.string()}, &out, &err), 0) << err;
+    const std::string off = literalOf(f.header());
+    ASSERT_EQ(runCli({"schema", "generate", "--from-file", f.blob, "--out", f.dir.string(), "--lease"}, &out, &err), 0) << err;
+    const std::string on = literalOf(f.header());
+    EXPECT_FALSE(on.empty());
+    EXPECT_EQ(on, off);
+}
+
 TEST(SchemaGenLeaseCliRegression, LeaseFlagWithoutFromFileIsRefusedRegression) {
     SchemaGenLeaseFixture f;
     std::string out, err;

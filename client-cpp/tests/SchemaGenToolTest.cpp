@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include "rune/tools/SchemaGen.h"
 #include <rune/codec/Descriptor.h>
+#include <rune/codec/Fingerprint.h>
 #include <rune/codec/LeaseColumns.h>
 #include <rune/codec/Serialize.h>
 
@@ -160,6 +161,26 @@ TEST(SchemaGenToolRegression, FromFileWithoutLeaseHasNoLeasesRow) {
     const std::string b = slurp(rune::tools::generateFromFile(blob, dir.string()));
     EXPECT_EQ(b.find("LeasesRow"), std::string::npos);
     EXPECT_EQ(a, b);
+    fs::remove_all(dir);
+}
+
+// F-6: the lease form must not change the schema fingerprint (a generated lease header that disagreed with the stored schema would be
+// refused at runtime).  Both headers carry the same kFingerprint literal, and it is the descriptor's fingerprint.
+TEST(SchemaGenToolRegression, LeaseFlagDoesNotChangeTheFingerprint) {
+    fs::path dir = leaseTestDir("fp");
+    const auto d = leaseShaped();
+    const std::string blob = writeBlob(dir, d).string();
+    auto literalOf = [](const std::string& h) {
+        const std::string key = "kFingerprint = ";
+        const auto at = h.find(key);
+        EXPECT_NE(at, std::string::npos);
+        return at == std::string::npos ? std::string{} : h.substr(at + key.size(), h.find("ull;", at) - at - key.size());
+    };
+    const std::string off = literalOf(slurp(rune::tools::generateFromFile(blob, dir.string(), false)));
+    const std::string on  = literalOf(slurp(rune::tools::generateFromFile(blob, dir.string(), true)));
+    EXPECT_FALSE(on.empty());
+    EXPECT_EQ(on, off) << "--lease must not fold into the fingerprint";
+    EXPECT_EQ(on, std::to_string(rune::codec::fingerprint(d)));
     fs::remove_all(dir);
 }
 
