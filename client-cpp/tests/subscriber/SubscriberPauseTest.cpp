@@ -1845,3 +1845,26 @@ TEST(SubscriberPauseRegression, RouteMoveReleaseSurvivesRetryRegression) {
     EXPECT_EQ(r.hub.retryPendingUnsubscribes(r.sid), 0);
     EXPECT_EQ(mr.unsubs.size(), 1u) << "exactly once";
 }
+
+// M-9: a moved-from handle keeps nothing of the subscription it gave away.
+TEST(SubscriberPauseRegression, MovedFromHandleKeepsNoStatusRegression) {
+    Rig r;
+    r.open(11, /*dutyHandle=*/false);
+    r.bind(40);
+    r.push(40, 0, 3);
+    ASSERT_EQ(r.sub->position(), 3);
+    ASSERT_TRUE(r.sub->pause());
+    ASSERT_TRUE(r.sub->paused());
+    rc::Subscription to = std::move(*r.sub);
+    EXPECT_EQ(r.sub->position(), 0);
+    EXPECT_EQ(r.sub->failReason(), rc::SubscriptionFailReason::None);
+    EXPECT_FALSE(r.sub->paused());
+    EXPECT_FALSE(r.sub->resume());
+    EXPECT_EQ(to.position(), 3);
+    EXPECT_TRUE(to.paused());
+    Rig other;                  // move-assignment resets its source the same way
+    other.open(12, /*dutyHandle=*/false);
+    *other.sub = std::move(to);
+    EXPECT_EQ(to.position(), 0);
+    EXPECT_EQ(other.sub->position(), 3);
+}
