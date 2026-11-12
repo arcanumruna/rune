@@ -34,7 +34,6 @@ public:
     using SP = rune::protocol::SecurityPatternKind;
     using TID = rune::protocol::client::TemplateId;
     static constexpr int32_t kMissingId = 98'765;
-    static constexpr int kInvalidTxnState = 19;
     static constexpr std::chrono::milliseconds kInFlightWindow{60};   ///< records already on the wire behind the end frame
     static constexpr std::chrono::milliseconds kQuietWindow{300};   ///< how long "nothing after the end" is watched
 
@@ -136,6 +135,9 @@ public:
             case Op::GroupJoin: case Op::OffsetCommit: case Op::OffsetFetch: case Op::CreateView:
                 topic();
                 break;
+            case Op::TxnEnd:   // the transaction EndTxn ends is opened on this topic (see issueAs)
+                if (!supportingOnly) topic();
+                break;
             case Op::ViewRead: case Op::ViewOpen: case Op::AlterView: case Op::DropView:
                 if (supportingOnly) { if (op == Op::AlterView) topic(); }
                 else { topic(); view(); }
@@ -208,6 +210,11 @@ public:
             ASSERT_EQ(c.errorCode, 0) << c.detail;
             who = role_; isRole = true;
         }
+        // EndTxn answers 0 only for an Ongoing transaction, which takes AddPartitionsToTxn and a produce: the setup
+        // needs WRITE on the topic too.  Not a requirement of EndTxn itself (requires_), so a revoke never touches it.
+        if (op == Op::TxnEnd)
+            grantTo(who, isRole, SO::Write, ST::Topic, gr == Grant::Prefix ? SP::Prefix : SP::Exact,
+                    gr == Grant::Prefix ? prefix_ : t());
         for (std::size_t i = 0; i < reqs.size(); ++i) {
             const Req& q = reqs[i];
             if (gr == Grant::Prefix) grantTo(who, isRole, q.op, q.type, SP::Prefix, prefix_);
@@ -254,6 +261,7 @@ public:
         const int code = r_.wire().login(r_.ch(), s, user_, {AuthRig::kPw, AuthRig::kPw}).errorCode();
         if (code == 0) ++loginsOk_; else ++loginsFailed_;
         m_.noteLogin(code == 0);
+        r_.broker().node().resetLoginThrottleForTest();   // a failed login arms the per-host throttle: not carried over
         return code;
     }
     /// The session-level frame (corr 0) code after a disable, bounded.
@@ -334,11 +342,13 @@ public:
                 Answer scratch;
                 auto init = txnInit(sid, x(), scratch);
                 if (init.code != 0) init = {init.code, 1, 0};
+                else if (tid_ >= 0) {   // authorized: open a transaction (AddPartitionsToTxn + a produce), then end it
+                    TxnState open; open.inited = true; open.pid = init.pid; open.epoch = init.epoch;
+                    Answer setup;
+                    (void)txnProduce(sid, tid_, open, setup);   // a refusal here leaves EndTxn's own answer to show it
+                }
                 a.wantTempl = tmpl(TID::EndTxnResponse);
-                a.code = txnEnd(sid, init, a);
-                // An authorized EndTxn with no transaction open answers InvalidTxnState (19): authorization passed, which
-                // is all the matrix asserts (WRITE on the transactional id is the whole requirement).
-                if (a.code == kInvalidTxnState) a.code = 0;
+                a.code = txnEnd(sid, init, a);   // exactly 0 for an Ongoing transaction; 19 is a failure
                 break;
             }
             case Op::Subscribe: a.wantTempl = tmpl(TID::SubscribeResponse); a.corr = r_.c().sendSubscribe(r_.ch(), r_.stream(), sid, tid, 0); a.code = subscribeCode(a); break;

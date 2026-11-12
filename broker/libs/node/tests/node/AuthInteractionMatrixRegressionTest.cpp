@@ -61,6 +61,8 @@ static void runCell(AuthMatrixRig& rig, const Cell& c) {
     if (want.first == 45) EXPECT_EQ(first.appended, 0) << label << ": #278: a refused produce appended";
     if (c.op == Op::Metadata) EXPECT_EQ(first.present, want.presentFirst) << label;
     if (want.viewStatus != kNone) EXPECT_EQ(first.viewStatus, want.viewStatus) << label;
+    if (isViewRead(c.op))
+        EXPECT_EQ(first.viewStatus, viewStatusOf(want.first)) << label << ": the exact ViewRowResponse status";
 
     // Streams under RevokedMid / UserDisabledMid: the subscription is live and receiving before the change.
     std::string why;
@@ -80,6 +82,8 @@ static void runCell(AuthMatrixRig& rig, const Cell& c) {
                 const auto second = cell.issue(c.op, false);
                 EXPECT_EQ(second.code, want.second) << label;
                 if (want.second == 45) EXPECT_EQ(second.appended, 0) << label << ": #278: a refused produce appended";
+                if (isViewRead(c.op))
+                    EXPECT_EQ(second.viewStatus, viewStatusOf(want.second)) << label << ": exact status";
                 EXPECT_EQ(second.templ, second.wantTempl) << label << ": the second answer is not in the op's own response type";
                 if (c.op == Op::Metadata) EXPECT_EQ(second.present, want.presentSecond) << label;
             }
@@ -96,8 +100,8 @@ static void runCell(AuthMatrixRig& rig, const Cell& c) {
             }
             // The reconnect attempt of a disabled user is a failed login: the broker's per-host brute-force curve (spec
             // section 5, 10 free failures per source) would delay every later legitimate login of this broker process, so
-            // a fixed, order-independent 7 of the 79 R5 cells attempt it (the curve itself is LoginThrottleTest's).
-            if ((int(c.op) * 5 + int(c.grant)) % 11 == 0) EXPECT_EQ(cell.relogin(), want.reconnect) << label;
+            // relogin() resets the login throttle after each probe (issue #189's seam) and EVERY R5 cell probes it.
+            EXPECT_EQ(cell.relogin(), want.reconnect) << label;
             break;
         }
         case Outcome::DeniedThenOk: {
@@ -106,6 +110,7 @@ static void runCell(AuthMatrixRig& rig, const Cell& c) {
             const auto second = cell.issue(c.op, false);
             EXPECT_EQ(second.code, want.second) << label;
             EXPECT_EQ(second.templ, second.wantTempl) << label << ": the second answer is not in the op's own response type";
+            if (isViewRead(c.op)) EXPECT_EQ(second.viewStatus, viewStatusOf(want.second)) << label << ": exact status";
             if (c.op == Op::Metadata) EXPECT_EQ(second.present, want.presentSecond) << label;
             break;
         }
