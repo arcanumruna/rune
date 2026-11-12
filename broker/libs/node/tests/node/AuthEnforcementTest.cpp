@@ -510,6 +510,42 @@ TEST(AuthEnforcementRegression, CreateViewOverAnUnreadableSourceIsNotAuthorizedR
     EXPECT_EQ(r.alterViewCode(alterer, "board", r.secret), kNotAuthorized) << "AlterView likewise";
 }
 
+// Issue #223 (D19): the creator's READ on every source is checked at CREATE VIEW / ALTER VIEW only.  Afterwards a view
+// is a cluster object: alice loses READ on `payments` and the view keeps folding it for a reader that holds READ on the
+// view; alice's own ALTER VIEW is refused 45 (checked again, against the alterer) and her own subscription to
+// `payments` is ended.
+TEST(AuthEnforcementRegression, AViewKeepsReadingAfterItsCreatorLostReadOnASourceRegression) {
+    AuthRig r;
+    const int32_t payments = r.defineTopic(r.builder, "payments");
+    ASSERT_GE(payments, 0);
+    std::string aliceName;
+    const int64_t alice = r.newUser({exact(SO::Create, ST::View, "v_pay"), exact(SO::Alter, ST::View, "v_pay"),
+                                     exact(SO::Read, ST::Topic, "payments")}, &aliceName);
+    const int64_t reader = r.newUser({exact(SO::Read, ST::View, "v_pay")});
+    const int64_t writer = r.newUser({exact(SO::Write, ST::Topic, "payments")});
+    const int32_t viewId = r.createView(alice, "v_pay", payments);
+    ASSERT_GE(viewId, 0);
+    const int64_t subCorr = r.c().sendSubscribe(r.ch(), r.stream(), alice, payments, 0);
+    ASSERT_EQ(r.c().awaitSubscribeCode(subCorr, AuthRig::dl()), std::optional<int16_t>(kOk));
+
+    ASSERT_EQ(r.broker().admin().revoke(r.ch(), r.broker().adminSession(), aliceName, false, SO::Read, ST::Topic,
+                                        rune::protocol::SecurityPatternKind::Exact, "payments").errorCode, 0);
+    ASSERT_EQ(r.produce(writer, payments, /*untilOk=*/true), kOk);
+
+    int status = kNoAnswer;
+    for (int i = 0; i < 400 && status != kOk; ++i) {   // bounded: the fold is asynchronous
+        status = r.getViewRow(reader, viewId);
+        if (status != kOk) (void)r.c().pollFor(std::chrono::milliseconds(25), [] { return false; });
+    }
+    EXPECT_EQ(status, kOk) << "the reader still receives the folded row through the view";
+    EXPECT_EQ(r.alterViewCode(alice, "v_pay", payments), kNotAuthorized) << "an ALTER VIEW is checked again";
+    EXPECT_TRUE(r.c().pollUntil([&] {
+        for (const auto& e : r.c().errors())
+            if (e.correlationId == subCorr) return true;   // the subscription completes with an error
+        return false;
+    })) << "alice's own subscription to payments is ended";
+}
+
 TEST(AuthEnforcementRegression, CreateAndAlterViewOverAnIdNotYetIndexedIsNotAuthorizedRegression) {
     AuthRig r;
     // The in-flight CREATE TOPIC window: the id is unknown to the gateway's index but may be live on the admin thread.

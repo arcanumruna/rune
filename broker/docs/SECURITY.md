@@ -60,6 +60,21 @@ Rules that keep the model small (D15 to D17):
 | User, role and grant DDL; every `SHOW USERS|ROLES|GRANTS|SECURITY HISTORY` (D20) | `ADMIN` on `CLUSTER` |
 | `ALTER USER <self> SET|ADD|DROP PASSWORD` (D20) | no grant, but a fresh proof of a current password (the client sends it; a session alone is not enough) |
 
+### What a view may read after it is created
+
+`CreateView` and `AlterView` check `READ` on every source topic against the principal that issues the request, at that
+moment (D19). That is the only check of the sources.
+
+- After the request is applied the view reads its sources as a cluster object, not as its creator. `READ` on the
+  VIEW governs who sees its content.
+- Revoking a principal's `READ` on a source (or dropping the principal) does not stop an existing view: it keeps folding
+  the source and its readers keep reading it. Later enforcement was rejected on purpose: the creator may have been
+  dropped, may hold `READ` through a role, or the view may have been altered by another principal, so "who must still
+  hold `READ`" has no stable answer.
+- To stop the flow, revoke `READ` on the view from its readers, or drop the view.
+- An `ALTER VIEW` is checked again, against the principal that alters it, so a principal that lost `READ` on a source
+  is refused (`NotAuthorized`, 45) when it alters the view.
+
 **Ownership.** A consumer-group member id and a producer id belong to whoever obtained them.
 - A member id is bound to the session and user that joined. SyncGroup, Heartbeat, LeaveGroup and
   OffsetCommit naming it are honoured only on that session, and are otherwise answered `UnknownMember`,

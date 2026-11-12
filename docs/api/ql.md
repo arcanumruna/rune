@@ -181,6 +181,9 @@ A view is a materialized table that the broker keeps current from one typed, key
   (an integer, `bool`, `float64` or `string(N)` with `N` up to 16); QL refuses a wider or variable column locally.
 - **`transient`** makes the view in-memory only (no checkpoint). **`or replace`** alters a view that exists (`AlterView`, at its
   current version) and creates it when it does not; without it an existing name is `ViewExists` (32). A view cannot read another view.
+- **What a view may read after it is created.** The creating (or altering) principal needs `READ` on every source at that
+  moment only; afterwards the view reads its sources as a cluster object, and `READ` on the view decides who sees its
+  content. See [Authorization](../../broker/docs/SECURITY.md#what-a-view-may-read-after-it-is-created).
 
 ```sql
 create view character_by_id key characterId as select userId, name, gender from character;
