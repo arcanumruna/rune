@@ -320,10 +320,11 @@ public:
         std::optional<rune::protocol::LeaseSpec> lease;
         int32_t leaseViewTopicId = -1;
     };
-    SchemaAnswer getSchema(const std::string& name, uint64_t fingerprint = 0, uint32_t nsId = 0) {
+    SchemaAnswer getSchema(const std::string& name, uint64_t fingerprint = 0, uint32_t nsId = 0, uint8_t kinds = 3) {
         const int64_t corr = ++corr_;
         GetSchemaMsg msg{kSession, corr, name, fingerprint};
         msg.nsId = nsId;
+        msg.allowedKinds = kinds;
         admin_->submitGetSchema(msg);
         const auto it = gets_.find(corr);
         if (it == gets_.end()) throw std::logic_error("CatalogDdlRig: GetSchema was not answered at once");

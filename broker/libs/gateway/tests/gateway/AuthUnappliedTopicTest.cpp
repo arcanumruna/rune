@@ -80,11 +80,14 @@ struct CountingTxn final : ITxnRequestHandler {
 };
 struct CountingAdminSink final : IAdminRequestSink {
     std::size_t gets = 0;
+    uint8_t lastKinds = 0;
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool, const uint8_t*,
                                   uint32_t, uint8_t, int16_t, const rune::protocol::TopicConfigView&, const DdlMetaView&,
                                   std::string_view, const rune::protocol::TopicKeyFeatures&,
                                   const std::optional<rune::protocol::LeaseSpec>&) override { return AdminSubmit::Accepted; }
-    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t) override { ++gets; return true; }
+    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t, uint8_t kinds) override {
+        ++gets; lastKinds = kinds; return true;
+    }
     AdminSubmit submitAlterTopic(int64_t, int64_t, std::string_view, uint16_t, const uint8_t*, uint32_t,
                                  const DdlMetaView&) override { return AdminSubmit::Accepted; }
     AdminSubmit submitCreateView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, const uint8_t*, uint32_t,
@@ -517,31 +520,56 @@ TEST(AuthUnappliedTopicRegression, DescribeOnClusterStillAnswersThePlacedIdRetri
     EXPECT_EQ(*missing, static_cast<int16_t>(pc::ErrorCode::UnknownTopic));
 }
 
-// #128 through the handler: a VIEW grant never describes a live topic (and the reverse); the refusal is the terminal 45
-// in TopicSchemaResponse, never forwarded to the admin thread; an unknown name still accepts either kind's grant.
+// #128, #504, #505 through the handler: the gateway no longer consults its (lagging) object index for GetTopicSchema.
+// It forwards with only the kind bits the grants allow under the name, and the admin thread serves the object only if
+// its real kind is among them (otherwise it answers like a missing name).  A session with no grant on the name under
+// either kind gets the terminal 45 here, whether or not the object exists, and the admin thread is never reached.
 TEST(AuthUnappliedTopicRegression, GetTopicSchemaChecksOnlyTheLiveObjectsOwnKindAdversarialRegression) {
     Rig viewOnly({grant(sec::Operation::Describe, sec::ResourceType::View, "pay")});
     viewOnly.gw.onCatalogObjectApplied(kPlaced, "payments", false);
     viewOnly.gw.onCatalogObjectApplied(kPlaced + 1, "payboard", true);
-    EXPECT_EQ(viewOnly.codeOf(viewOnly.getTopicSchema("payments")), kNotAuthorized);
-    EXPECT_EQ(viewOnly.admin.gets, 0u);
-    EXPECT_EQ(viewOnly.codeOf(viewOnly.getTopicSchema("payboard")), std::nullopt) << "its own kind: forwarded";
+    EXPECT_EQ(viewOnly.codeOf(viewOnly.getTopicSchema("payments")), std::nullopt) << "forwarded, only as a view";
+    EXPECT_EQ(viewOnly.admin.gets, 1u);
+    EXPECT_EQ(viewOnly.admin.lastKinds, rune::gateway::kKindView);
+    EXPECT_EQ(viewOnly.codeOf(viewOnly.getTopicSchema("payboard")), std::nullopt);
+    EXPECT_EQ(viewOnly.admin.lastKinds, rune::gateway::kKindView);
     EXPECT_EQ(viewOnly.codeOf(viewOnly.getTopicSchema("payroll")), std::nullopt) << "unknown: either kind (D22)";
-    EXPECT_EQ(viewOnly.admin.gets, 2u);
+    EXPECT_EQ(viewOnly.admin.gets, 3u);
+    EXPECT_EQ(viewOnly.codeOf(viewOnly.getTopicSchema("orders")), kNotAuthorized) << "no grant on the name, any kind";
+    EXPECT_EQ(viewOnly.admin.gets, 3u) << "never reached the admin thread";
 
     Rig topicOnly({grant(sec::Operation::Describe, sec::ResourceType::Topic, "pay")});
     topicOnly.gw.onCatalogObjectApplied(kPlaced, "payments", false);
     topicOnly.gw.onCatalogObjectApplied(kPlaced + 1, "payboard", true);
-    EXPECT_EQ(topicOnly.codeOf(topicOnly.getTopicSchema("payboard")), kNotAuthorized);
+    EXPECT_EQ(topicOnly.codeOf(topicOnly.getTopicSchema("payboard")), std::nullopt);
+    EXPECT_EQ(topicOnly.admin.lastKinds, rune::gateway::kKindTopic);
     EXPECT_EQ(topicOnly.codeOf(topicOnly.getTopicSchema("payments")), std::nullopt);
-    // Drop "payments" and re-create the NAME as a view at a new id: the kind follows the live object.
+    EXPECT_EQ(topicOnly.admin.lastKinds, rune::gateway::kKindTopic);
+    // Drop "payments" and re-create the NAME as a view at a new id: the gateway still sends the same kinds; the admin
+    // thread decides by the live object.
     topicOnly.gw.onCatalogObjectDropped(kPlaced);
     topicOnly.gw.onCatalogObjectApplied(kPlaced + 2, "payments", true);
-    EXPECT_EQ(topicOnly.codeOf(topicOnly.getTopicSchema("payments")), kNotAuthorized) << "now a view";
+    EXPECT_EQ(topicOnly.codeOf(topicOnly.getTopicSchema("payments")), std::nullopt) << "forwarded with kKindTopic";
+    EXPECT_EQ(topicOnly.admin.lastKinds, rune::gateway::kKindTopic);
+    EXPECT_EQ(topicOnly.admin.gets, 3u);
+    EXPECT_EQ(topicOnly.codeOf(topicOnly.getTopicSchema("orders")), kNotAuthorized) << "no grant on the name";
+    EXPECT_EQ(topicOnly.admin.gets, 3u);
 }
 
-// #128 input bounds: an empty name, a name that is a strict prefix / extension of a live one, and a 64 KiB-1 name
-// resolve by exact match only (byName never matches a prefix of a live name).
+// #504: a just-created topic is not in this gateway's object index yet (onCatalogObjectApplied has not run for it).
+// A VIEW-only session's GetTopicSchema must reach the admin thread carrying ONLY the view kind, so the admin thread
+// (whose catalog is authoritative; see GetSchemaKindRegression.TheAdminServesOnlyTheKindsTheGatewayAllowedRegression)
+// answers it like a missing name instead of serving the topic's schema.  The two tests together close the window.
+TEST(AuthUnappliedTopicRegression, AViewGrantNeverDescribesAJustCreatedTopicRegression) {
+    Rig r({grant(sec::Operation::Describe, sec::ResourceType::View, "pay")});
+    ASSERT_EQ(r.gw.objectIndex().at(kPlaced), nullptr) << "precondition: the topic is not applied here";
+    EXPECT_EQ(r.codeOf(r.getTopicSchema("payments")), std::nullopt) << "forwarded";
+    EXPECT_EQ(r.admin.gets, 1u);
+    EXPECT_EQ(r.admin.lastKinds, rune::gateway::kKindView) << "the admin thread must be told: a view, never a topic";
+}
+
+// #128 input bounds: an empty name, a name that is a strict prefix / extension of a live one, and a 64 KiB-1 name are
+// judged by the grants alone; the empty name is malformed.
 TEST(AuthUnappliedTopicRegression, GetTopicSchemaNameBoundsResolveByExactMatchAdversarialRegression) {
     Rig r({grant(sec::Operation::Describe, sec::ResourceType::View, "pay")});
     r.gw.onCatalogObjectApplied(kPlaced, "payments", false);
@@ -553,7 +581,8 @@ TEST(AuthUnappliedTopicRegression, GetTopicSchemaNameBoundsResolveByExactMatchAd
         << "the empty name is malformed (D7)";
     const std::string huge = "pay" + std::string(65535 - 3, 'x');
     EXPECT_EQ(r.codeOf(r.getTopicSchema(huge)), std::nullopt);
-    EXPECT_EQ(r.codeOf(r.getTopicSchema("payments")), kNotAuthorized);
+    EXPECT_EQ(r.codeOf(r.getTopicSchema("payments")), std::nullopt) << "forwarded with kKindView; the admin decides";
+    EXPECT_EQ(r.admin.lastKinds, rune::gateway::kKindView);
 }
 
 // #511 adversarial review (PR #516): every id-addressed template, on a view sink id, answers EXACTLY like a missing id

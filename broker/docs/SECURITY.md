@@ -97,6 +97,9 @@ is checked against the grants on that object. Only when the id is not live (miss
 answer `NotAuthorized`, unless the session holds `DESCRIBE ON CLUSTER`; then it gets the request's normal
 `UnknownTopic` answer (D22). A view plan's source ids never get this relaxation: they need `READ`. The detail text is
 always `not authorized: <OP> on <TYPE> <requested name or id>` (D23).
+GetTopicSchema on a name whose live object is of a kind the caller holds no DESCRIBE for answers exactly like a
+missing name; a caller with no DESCRIBE on the name under either kind gets NotAuthorized whether or not the object
+exists.
 
 ## Rune QL statements
 

@@ -294,13 +294,14 @@ public:
 
     bool submitGetSchema(int64_t sessionId, int64_t correlationId,
                          std::string_view name,
-                         uint64_t requestedFingerprint, uint32_t nsId) override {
+                         uint64_t requestedFingerprint, uint32_t nsId, uint8_t allowedKinds) override {
         GetSchemaMsg m;
         m.session = sessionId;
         m.corr    = correlationId;
         m.nsId    = nsId;   // namespaces Task 10: the gateway-resolved namespace
         m.name.assign(name);
         m.requestedFingerprint = requestedFingerprint;
+        m.allowedKinds = allowedKinds;
         return encodeGetSchema(requestRing_, m);
     }
 

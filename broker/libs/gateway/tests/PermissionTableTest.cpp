@@ -266,9 +266,9 @@ TEST(AuthorizerRegression, ForeignNsNameDeniedRegression) {
     EXPECT_EQ(foreign->code, 45);
     EXPECT_FALSE(rg::authorizeName(t, ResourceType::Topic, "x", Operation::Write, 1).has_value());
     EXPECT_FALSE(rg::authorizeName(t, ResourceType::Topic, "x", Operation::Write, rg::kHiddenNsId).has_value());
-    EXPECT_TRUE(rg::authorizeTopicOrViewName(t, "x", Operation::Write, idx, 2).has_value());
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(t, "x", Operation::Write, idx, 1).has_value());
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(t, "x", Operation::Write, idx, rg::kHiddenNsId).has_value());
+    EXPECT_EQ(rg::allowedKindsForName(t, "x", Operation::Write, 2), 0);
+    EXPECT_EQ(rg::allowedKindsForName(t, "x", Operation::Write, 1), rg::kKindTopic);
+    EXPECT_EQ(rg::allowedKindsForName(t, "x", Operation::Write, rg::kHiddenNsId), rg::kKindTopic);
 
     auto root = rg::PermissionTable::compile({{g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, ""),
                                                g(Operation::Write, ResourceType::Topic, PatternKind::Prefix, "")}}, 1, idx);
@@ -461,24 +461,21 @@ TEST(AuthorizerRegression, AViewGrantNeverDescribesATopicRegression) {
     rg::ObjectIndex idx; idx.onTopic(0, "payments"); idx.onView(1, "payboard");
     const auto viewOnly  = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::View, PatternKind::Prefix, "pay")}}, idx);
     const auto topicOnly = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::Topic, PatternKind::Prefix, "pay")}}, idx);
-    const auto denied = rg::authorizeTopicOrViewName(viewOnly, "payments", Operation::Describe, idx, 0);
-    ASSERT_TRUE(denied.has_value()) << "a VIEW grant must not describe the topic 'payments'";
-    EXPECT_EQ(denied->code, 45);
-    EXPECT_EQ(denied->detail(), "not authorized: DESCRIBE on TOPIC payments") << "the text always says TOPIC (D23)";
-    EXPECT_TRUE(rg::authorizeTopicOrViewName(topicOnly, "payboard", Operation::Describe, idx, 0).has_value())
-        << "a TOPIC grant must not describe the view 'payboard'";
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payboard", Operation::Describe, idx, 0).has_value());
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(topicOnly, "payments", Operation::Describe, idx, 0).has_value());
-}
-
-TEST(AuthorizerRegression, AnUnknownSchemaNameAcceptsEitherKindsGrantRegression) {   // D22 parity: "unknown" follows
-    rg::ObjectIndex idx; idx.onTopic(0, "payments");
-    const auto viewOnly = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::View, PatternKind::Prefix, "pay")}}, idx);
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payroll", Operation::Describe, idx, 0).has_value());
-    idx.onDropped(0);
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payments", Operation::Describe, idx, 0).has_value())
-        << "a dropped name is unknown again";
-    EXPECT_TRUE(rg::authorizeTopicOrViewName(viewOnly, "orders", Operation::Describe, idx, 0).has_value());
+    const auto none      = rg::PermissionTable::compile(
+        {{g(Operation::Describe, ResourceType::Topic, PatternKind::Prefix, "x")}}, idx);
+    // #504, #505: the gateway names the kinds the grants allow under the name; it never looks at what exists.  The
+    // admin thread serves the object only if its real kind is among them.
+    for (const char* name : {"payments", "payboard", "payroll", "paymissing"}) {
+        EXPECT_EQ(rg::allowedKindsForName(viewOnly, name, Operation::Describe, 0), rg::kKindView) << name;
+        EXPECT_EQ(rg::allowedKindsForName(topicOnly, name, Operation::Describe, 0), rg::kKindTopic) << name;
+        EXPECT_EQ(rg::allowedKindsForName(none, name, Operation::Describe, 0), 0) << name;
+    }
+    const auto both = rg::PermissionTable::compile(
+        {{g(Operation::Describe, ResourceType::Topic, PatternKind::Prefix, "pay"),
+          g(Operation::Describe, ResourceType::View, PatternKind::Prefix, "pay")}}, idx);
+    EXPECT_EQ(rg::allowedKindsForName(both, "payments", Operation::Describe, 0), rg::kKindAll);
+    EXPECT_EQ(rg::allowedKindsForName(viewOnly, "orders", Operation::Describe, 0), 0);
+    EXPECT_EQ(rg::allowedKindsForName(viewOnly, "payments", Operation::Import, 0), 0);
 }
 
 // #211: hasAnyGrant(type, op) - any literal, prefixed or wildcard grant of `op` ON that type, kept at compile time
@@ -628,7 +625,7 @@ TEST(CheckedWritesImportGrantRegression, TheOpMaskEntryPointsNeverAuthorizeImpor
         const auto t = rg::PermissionTable::compile(grants, idx);
         EXPECT_TRUE(rg::authorizeTopicId(t, 3, Operation::Import, idx).has_value());
         EXPECT_TRUE(rg::authorizeName(t, ResourceType::Topic, "user", Operation::Import, 0).has_value());
-        EXPECT_TRUE(rg::authorizeTopicOrViewName(t, "user", Operation::Import, idx, 0).has_value());
+        EXPECT_EQ(rg::allowedKindsForName(t, "user", Operation::Import, 0), 0);
         EXPECT_TRUE(rg::authorizeCluster(t, Operation::Import).has_value());
         EXPECT_TRUE(rg::authorizeAnyGrant(t, ResourceType::Topic, Operation::Import).has_value());
     }

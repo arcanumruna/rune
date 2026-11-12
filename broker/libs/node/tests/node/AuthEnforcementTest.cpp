@@ -420,8 +420,10 @@ TEST(AuthEnforcementRegression, GetTopicSchemaAllowedAndDenied) {
 // object's OWN kind's grant answers it (#128): READ on a view named like the topic, or on a topic named like the view,
 // opens nothing; READ on a view's source topic does not open the view.  A system topic is never reachable through a
 // topic / view grant (even READ TOPIC prefix ''), and DESCRIBE ON CLUSTER sees it as missing (UnknownTopic), as any
-// name that is no catalog object.  RED: drop the own-kind branch (#128) of authorizeTopicOrViewName - the wrong-kind
-// grants are served.
+// name that is no catalog object.  #505: a wrong-kind grant holder gets exactly the answer of a missing name
+// (UnknownTopic), so the answer never tells a hidden object from an absent one; a holder of no grant on the name under
+// either kind still gets 45.  RED: drop the kind check in AdminWorker::submitGetSchema - the wrong-kind grants are
+// served.
 TEST(AuthEnforcementRegression, GetTopicSchemaAnswersPerTheObjectsOwnKindAcrossTopicKindsRegression) {
     AuthRig r;
     const int kUnknown = static_cast<int>(pc::ErrorCode::UnknownTopic);
@@ -437,14 +439,19 @@ TEST(AuthEnforcementRegression, GetTopicSchemaAnswersPerTheObjectsOwnKindAcrossT
     // A data topic.
     EXPECT_EQ(r.getTopicSchema(readOrders, "orders"), kOk);
     EXPECT_EQ(r.getTopicSchema(allTopics, "orders"), kOk);
-    EXPECT_EQ(r.getTopicSchema(viewNamedOrders, "orders"), kNotAuthorized) << "a VIEW grant on a topic's name";
-    EXPECT_EQ(r.getTopicSchema(allViews, "orders"), kNotAuthorized);
+    EXPECT_EQ(r.getTopicSchema(viewNamedOrders, "orders"), kUnknown) << "a VIEW grant on a topic's name";
+    EXPECT_EQ(r.getTopicSchema(allViews, "orders"), kUnknown);
     // A view (its sink topic is addressed by the view's name).
     EXPECT_EQ(r.getTopicSchema(readBoard, "board"), kOk);
     EXPECT_EQ(r.getTopicSchema(allViews, "board"), kOk);
-    EXPECT_EQ(r.getTopicSchema(topicNamedBoard, "board"), kNotAuthorized) << "a TOPIC grant on a view's name";
-    EXPECT_EQ(r.getTopicSchema(allTopics, "board"), kNotAuthorized);
-    EXPECT_EQ(r.getTopicSchema(readOrders, "board"), kNotAuthorized) << "READ on the source is not READ on the view";
+    EXPECT_EQ(r.getTopicSchema(topicNamedBoard, "board"), kUnknown) << "a TOPIC grant on a view's name";
+    EXPECT_EQ(r.getTopicSchema(allTopics, "board"), kUnknown);
+    EXPECT_EQ(r.getTopicSchema(readOrders, "board"), kNotAuthorized)
+        << "READ on the source is not READ on the view: no grant on the name";
+    const int64_t none = r.newUser({});
+    EXPECT_EQ(r.getTopicSchema(none, "orders"), kNotAuthorized) << "no grant under either kind: 45, object or not";
+    EXPECT_EQ(r.getTopicSchema(none, "board"), kNotAuthorized);
+    EXPECT_EQ(r.getTopicSchema(none, "absent"), kNotAuthorized);
     // The system topics.
     for (const char* sys : {"__security", "__catalog", "__consumer_offsets", "__transaction_state"}) {
         EXPECT_EQ(r.getTopicSchema(allTopics, sys), kNotAuthorized) << sys;
@@ -454,6 +461,19 @@ TEST(AuthEnforcementRegression, GetTopicSchemaAnswersPerTheObjectsOwnKindAcrossT
     }
     EXPECT_EQ(r.getTopicSchema(describeCluster, "orders"), kOk);
     EXPECT_EQ(r.getTopicSchema(describeCluster, "board"), kOk);
+}
+
+// #504: the gateway's object index lags the admin thread, so a just-created topic can still look "unknown" there and
+// a VIEW grant used to pass for it.  The gateway now only sends the kinds the grants allow (the gateway-level pin is
+// AuthUnappliedTopicRegression.AViewGrantNeverDescribesAJustCreatedTopicRegression, which holds the index behind) and
+// the admin thread serves a topic only to a caller allowed the topic kind; together they close the window.
+TEST(AuthEnforcementRegression, AViewGrantNeverDescribesAJustCreatedTopicRegression) {
+    AuthRig r;
+    const int64_t viewOnly = r.newUser({prefix(SO::Describe, ST::View, "pay")});
+    ASSERT_GE(r.defineTopic(r.builder, "payments", /*typed=*/true), 0);
+    for (int i = 0; i < 20; ++i)   // the window is short: probe it repeatedly, never a schema
+        EXPECT_NE(r.getTopicSchema(viewOnly, "payments"), kOk) << "attempt " << i;
+    EXPECT_EQ(r.getTopicSchema(viewOnly, "payments"), static_cast<int>(pc::ErrorCode::UnknownTopic));
 }
 
 TEST(AuthEnforcementRegression, DefineTopicAndCreateSchemaAllowedAndDenied) {

@@ -9275,12 +9275,18 @@ void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
         return;
     }
     // Authentication Task 12 (D18): DESCRIBE on the name, whether it is a topic or a view (the text always says TOPIC).
-    if (deny_(*session, rune::gateway::authorizeTopicOrViewName(permsOf_(*session), res.local,
-                                                                 rune::security::Operation::Describe, objectIndex_,
-                                                                 res.nsId), buf, len))
+    // #504, #505: the gateway only decides WHICH KINDS the session may describe under this name; the admin thread,
+    // which holds the authoritative catalog, serves the object only if its real kind is among them.
+    const uint8_t kinds = rune::gateway::allowedKindsForName(permsOf_(*session), res.local,
+                                                              rune::security::Operation::Describe, res.nsId);
+    if (kinds == 0) {   // no DESCRIBE under either kind: NotAuthorized whether or not the object exists
+        (void)deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic,
+                                                           res.local, rune::security::Operation::Describe, res.nsId),
+                    buf, len);
         return;
+    }
     if (!adminSink_->submitGetSchema(m.sessionId, m.correlationId, res.local,
-                                     m.requestedFingerprint, res.nsId)) {
+                                     m.requestedFingerprint, res.nsId, kinds)) {
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "GetTopicSchema: admin ring full");
     }
 }

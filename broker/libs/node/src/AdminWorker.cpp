@@ -2,6 +2,7 @@
 // See AdminWorker.h.
 #include "rune/node/AdminWorker.h"
 
+#include <rune/gateway/IAdminRequestSink.h>
 #include <rune/node/NamespaceLimitCheck.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/TopicFeatureRules.h>
@@ -671,15 +672,24 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     // A pure read of the projected registry.  `requestedFingerprint` 0 = latest;
     // non-zero = the exact historical version with that per-version fingerprint.
     const auto* named = reg_.byName(msg.nsId, msg.name);   // namespaces Task 7: scoped to the request's namespace
+    // #504, #505: the gateway only says which kinds the caller may describe under this name; the live object's real
+    // kind (this thread's catalog is authoritative) must be one of them, else the answer is a missing name's - one
+    // spelling, so a hidden object and an absent one cannot be told apart.
+    const bool isView = applier_.state().viewByName(msg.nsId, msg.name) != nullptr;
+    const uint8_t kind = isView ? rune::gateway::kKindView : rune::gateway::kKindTopic;
+    const auto unknown = [&] {
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {}, std::nullopt, -1);
+    };
     if (!named && msg.requestedFingerprint == rune::protocol::client::kSchemaKindFingerprint) {
         // Checked writes kind probe: an untyped topic is OK with no blob (a raw handle binds to it).
         if (const cat::TopicObject* t = applier_.state().topicByName(msg.nsId, msg.name)) {
+            if ((msg.allowedKinds & kind) == 0) { unknown(); return; }
             deps_.respondGet(msg.session, msg.corr, t->topicId, 0, t->partitions, {}, kOK, {}, std::nullopt, -1);
             return;
         }
     }
-    if (!named) {
-        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {}, std::nullopt, -1);
+    if (!named || (msg.allowedKinds & kind) == 0) {
+        unknown();
         return;
     }
     const cat::TopicObject* topic = applier_.state().topicByName(msg.nsId, msg.name);
@@ -700,7 +710,7 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
                                  ? named
                                  : reg_.byFingerprint(named->topicId, msg.requestedFingerprint);
     if (!e) {
-        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {}, std::nullopt, -1);
+        unknown();
         return;
     }
     // The wire blob is the MATERIALIZED-as-of-version descriptor (its fingerprint

@@ -1,5 +1,6 @@
 // Authorizer.cpp - see rune/gateway/Authorizer.h.
 #include <rune/gateway/Authorizer.h>
+#include <rune/gateway/IAdminRequestSink.h>
 #include <rune/gateway/NsResolve.h>
 
 #include <charconv>
@@ -88,19 +89,11 @@ std::optional<Denial> authorizeName(const PermissionTable& t, rsec::ResourceType
     return deny(op, type, name);
 }
 
-std::optional<Denial> authorizeTopicOrViewName(const PermissionTable& t, std::string_view name, rsec::Operation op,
-                                               const ObjectIndex& index, uint32_t nsId)
+uint8_t allowedKindsForName(const PermissionTable& t, std::string_view name, rsec::Operation op, uint32_t nsId) noexcept
 {
-    if (op == rsec::Operation::Import || foreignNs(t, nsId)) return deny(op, rsec::ResourceType::Topic, name);   // #640; IMPORT: see authorizeTopicId
-    if (const auto id = index.byName(nsId, name)) {   // #128: only the object's own kind's grants count
-        const ObjectEntry* e = index.at(*id);
-        if (t.allowsName(e->type, name, rsec::opBit(op))) return std::nullopt;
-        return deny(op, rsec::ResourceType::Topic, name);
-    }
-    if (t.allowsName(rsec::ResourceType::Topic, name, rsec::opBit(op)) ||
-        t.allowsName(rsec::ResourceType::View, name, rsec::opBit(op)))
-        return std::nullopt;
-    return deny(op, rsec::ResourceType::Topic, name);
+    if (op == rsec::Operation::Import || foreignNs(t, nsId)) return 0;   // #640; IMPORT: see authorizeTopicId
+    return static_cast<uint8_t>((t.allowsName(rsec::ResourceType::Topic, name, rsec::opBit(op)) ? kKindTopic : 0) |
+                                (t.allowsName(rsec::ResourceType::View, name, rsec::opBit(op)) ? kKindView : 0));
 }
 
 std::optional<Denial> authorizeCluster(const PermissionTable& t, rsec::Operation op)

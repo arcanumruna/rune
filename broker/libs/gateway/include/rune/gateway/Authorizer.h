@@ -5,6 +5,7 @@
 //
 // Pure functions of (table, request): no allocation on the granted path, nor on a refusal (the Denial text is a fixed
 // buffer, #263).
+#include <rune/gateway/IAdminRequestSink.h>   // kKindTopic / kKindView / kKindAll
 #include <rune/gateway/ObjectIndex.h>
 #include <rune/gateway/PermissionTable.h>
 
@@ -58,13 +59,11 @@ struct Denial {
 /// (already answered as missing) and a root table pass through.  Required: no caller may forget it.
 [[nodiscard]] std::optional<Denial> authorizeName(const PermissionTable&, rune::security::ResourceType, std::string_view,
                                                   rune::security::Operation, uint32_t nsId);
-/// GetTopicSchema: a name may be a topic or a view.  Issue #128: a live name is checked against its own kind's grants
-/// only (the ObjectIndex knows which); a name not live here is allowed when either type allows it (D22 parity: the
-/// request's own "unknown" answer follows).  The text always says TOPIC.  `nsId` (namespaces Task 10): the name's
-/// resolved namespace (NsResolve.h; kHiddenNsId never holds an object, so a hidden name is judged as a missing one).
-[[nodiscard]] std::optional<Denial> authorizeTopicOrViewName(const PermissionTable&, std::string_view,
-                                                             rune::security::Operation, const ObjectIndex&,
-                                                             uint32_t nsId);
+/// GetTopicSchema (#504, #505): the object kinds under `name` that `t` may `op`, as a bit set of kKindTopic |
+/// kKindView (IAdminRequestSink.h); 0 = none (the caller answers NotAuthorized).  The gateway never consults its
+/// ObjectIndex here: it lags the admin thread, which serves the object only if its real kind is in the set.
+[[nodiscard]] uint8_t allowedKindsForName(const PermissionTable&, std::string_view, rune::security::Operation,
+                                          uint32_t nsId) noexcept;
 [[nodiscard]] std::optional<Denial> authorizeCluster(const PermissionTable&, rune::security::Operation);
 /// #211: `op` on at least one resource of `type` (no resource is named: a non-transactional InitProducerId needs
 /// WRITE on some topic, Kafka's rule).  Detail: `not authorized: <OP> on any <TYPE>`.

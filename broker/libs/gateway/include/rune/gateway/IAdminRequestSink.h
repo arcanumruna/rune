@@ -30,6 +30,10 @@
 
 namespace rune::gateway {
 
+/// GetTopicSchema (#504, #505): the object kinds under a name a session may DESCRIBE, as a bit set.  The gateway
+/// computes it from the grants alone; the admin thread serves the object only when its real kind is in the set.
+inline constexpr uint8_t kKindTopic = 1, kKindView = 2, kKindAll = 3;
+
 /// Where a replayed DDL came from (`rune catalog replay`, spec §7).
 struct ReplayedFromView {
     std::string_view clusterId;
@@ -108,10 +112,11 @@ struct IAdminRequestSink {
     // GetTopicSchema (66) — a read, no DDL extension.  requestedFingerprint
     // (Task 13): 0 = latest; non-zero = the SPECIFIC version whose per-version
     // fingerprint matches.  true = enqueued, false = ring full.  nsId (namespaces Task 10): the resolved namespace of
-    // `name` (its local part).
+    // `name` (its local part).  allowedKinds (#504, #505): the kKindTopic / kKindView bits the session may describe
+    // under `name`; the admin thread answers like a missing name when the live object's kind is not in the set.
     virtual bool submitGetSchema(int64_t sessionId, int64_t correlationId,
                                  std::string_view name,
-                                 uint64_t requestedFingerprint, uint32_t nsId) = 0;
+                                 uint64_t requestedFingerprint, uint32_t nsId, uint8_t allowedKinds) = 0;
 
     // AlterTopic (68).  expectedVersion: 0 = unconditional; non-zero = the
     // topic's schema version (SchemaConflict on a mismatch).  opsBlob:

@@ -490,6 +490,8 @@ struct GetSchemaMsg {
     std::string name;
     uint64_t    requestedFingerprint = 0;
     uint32_t    nsId = 0;   // namespaces Task 7: the namespace the name resolves in (0 = default)
+    // #504, #505: the kKindTopic (1) / kKindView (2) bits the session may describe; 3 = both (in-process callers).
+    uint8_t     allowedKinds = 3;
 };
 
 
@@ -1171,10 +1173,10 @@ struct CatalogReadResumeMsg { int64_t session = 0; int64_t subscriptionId = 0; }
 
 // ---- GetSchema ----
 // Wire layout: session:i64, corr:i64, requestedFingerprint:u64 (0=latest),
-// nameLen:u16 + name bytes.
+// nameLen:u16 + name bytes, nsId:u32, allowedKinds:u8 (absent = 3, both kinds).
 inline bool encodeGetSchema(OneToOneByteRing& ring, const GetSchemaMsg& m) {
     using namespace admin_wire;
-    const std::size_t len = 8 + 8 + 8 + 2 + m.name.size() + 4;
+    const std::size_t len = 8 + 8 + 8 + 2 + m.name.size() + 4 + 1;
     const auto idx = ring.tryClaim(kMsgGetSchema, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
@@ -1183,7 +1185,8 @@ inline bool encodeGetSchema(OneToOneByteRing& ring, const GetSchemaMsg& m) {
     putI64(p, static_cast<int64_t>(m.requestedFingerprint)); p += 8;
     putU16(p, static_cast<uint16_t>(m.name.size())); p += 2;
     std::memcpy(p, m.name.data(), m.name.size()); p += m.name.size();
-    putU32(p, m.nsId);
+    putU32(p, m.nsId); p += 4;
+    *p = m.allowedKinds;
     ring.commit(idx);
     return true;
 }
@@ -1199,6 +1202,7 @@ inline GetSchemaMsg decodeGetSchema(const uint8_t* buf, std::size_t len) {
     if (26 + static_cast<std::size_t>(nl) <= len)
         m.name.assign(reinterpret_cast<const char*>(buf + 26), nl);
     if (26 + static_cast<std::size_t>(nl) + 4 <= len) m.nsId = getU32(buf + 26 + nl);
+    if (26 + static_cast<std::size_t>(nl) + 4 + 1 <= len) m.allowedKinds = buf[26 + nl + 4];
     return m;
 }
 
