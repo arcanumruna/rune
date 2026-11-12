@@ -772,6 +772,10 @@ public:
     /// Fix round 5 (N4-I1) test hook: final-leg HandshakeFailed verdicts the agent applied.
     [[nodiscard]] uint64_t testHandshakeFinalLegFailures() const noexcept { return agent_.handshakeFinalLegFailures(); }
     [[nodiscard]] uint64_t testStaleSessionNotices() const noexcept { return agent_.staleSessionNotices(); }
+    /// #12: session notices / auth answers a sealed session ignored because its own key did not open them.
+    [[nodiscard]] uint64_t testForgedSessionFramesIgnored() const noexcept {
+        return agent_.forgedSessionFramesIgnored();
+    }
     /// #989: sessions resumed because their response pair's gateway publication closed.
     [[nodiscard]] uint64_t testResponseEgressLosses() const noexcept { return agent_.responseEgressLosses(); }
     /// Test hook (duty-cycle thread only): the seed session's current broker session id (0 = none).

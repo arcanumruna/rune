@@ -927,6 +927,9 @@ public:
         namespace rpc = rune::protocol::client;
         namespace rs  = rune::crypto::scram;
         if (state_ != SessionState::Authenticating || !scram_) return;
+        // #12: an auth answer acts only when it names this login's connect correlation id AND this session's id
+        // (any UDP sender could otherwise end a login with a bare AuthServerFinal{44}); a foreign one changes nothing.
+        if (sf.correlationId != correlationId_ || sf.sessionId != sessionId_ || sessionId_ == 0) [[unlikely]] return;
         auto* first = std::get_if<ScramSentFirst>(&*scram_);
         if (first == nullptr) return;   // a duplicate AuthServerFirst: the proof already went out
         const std::string_view cn = first->clientNonce;
@@ -988,6 +991,9 @@ public:
     void onAuthServerFinal(const rune::protocol::client::AuthServerFinal& f, int64_t nowNs) noexcept {
         namespace rpc = rune::protocol::client;
         if (state_ != SessionState::Authenticating || !scram_) return;
+        // #12: an auth answer acts only when it names this login's connect correlation id AND this session's id
+        // (any UDP sender could otherwise end a login with a bare AuthServerFinal{44}); a foreign one changes nothing.
+        if (f.correlationId != correlationId_ || f.sessionId != sessionId_ || sessionId_ == 0) [[unlikely]] return;
         if (f.errorCode != 0) {
             const auto ec = static_cast<rpc::ErrorCode>(f.errorCode);
             if (ec == rpc::ErrorCode::AuthenticationFailed) failAuth_(ec, f.retryAfterMs, nowNs);
@@ -1048,18 +1054,22 @@ public:
 
         if (state_ == SessionState::Connected) {
             // F-A C1 (defence in depth): a session-fatal notice naming ANOTHER session (one this machine already
-            // left) never moves this one.  0 = the notice names no session (kept: the old behaviour).
+            // left) never moves this one.  0 = the notice names no session (kept for the non-terminal SessionExpired /
+            // UnknownSession, which only lead to Resuming).
             if (noticeSessionId != 0 && sessionId_ != 0 && noticeSessionId != sessionId_) return;
+            // #12: a TERMINAL session-level notice (46 / 51 / AuthUnavailable, corr 0) is honoured only when it names
+            // THIS session: id 0 ("names no session") is no longer enough to end it.
+            const bool namesMe = noticeSessionId == sessionId_ && sessionId_ != 0;
             if (ec == rpc::ErrorCode::SessionExpired || ec == rpc::ErrorCode::UnknownSession) {
                 transitionTo(SessionState::Resuming);
                 // doResume fires on the next tick (FIX D: Resuming is a real waiting state).
                 resumeEntryNs_ = nowNs;
-            } else if (ec == rpc::ErrorCode::AuthUnavailable && incomingCorrelationId == 0) {
+            } else if (ec == rpc::ErrorCode::AuthUnavailable && incomingCorrelationId == 0 && namesMe) {
                 // Issues #15 / #111: the broker's security state stayed stale and it ended this session - retriable:
                 // reconnect FRESH elsewhere (the seed failover rotates the candidates), never resume here.
                 onAuthUnavailable_(nowNs);
             } else if ((ec == rpc::ErrorCode::SessionRevoked || ec == rpc::ErrorCode::NamespaceSuspended) &&
-                       incomingCorrelationId == 0) {
+                       incomingCorrelationId == 0 && namesMe) {
                 // Authentication (D26): the session-level ErrorResponse{SessionRevoked, corr 0} — the user was
                 // dropped / disabled — or {NamespaceSuspended 51, corr 0}: a RejectAll suspend of the user's namespace
                 // (client version 14; an older client gets 46).  The broker closes the session:
@@ -1074,7 +1084,7 @@ public:
             // instead of an AuthServerFinal.  Only the answer to THIS episode counts.
             // Review B M2: a SESSION-level refusal (the auth deadline, D13) carries correlation id 0 and names the session.
             const bool sessionLevel = incomingCorrelationId == 0 && ec == rpc::ErrorCode::AuthenticationFailed &&
-                                      (noticeSessionId == 0 || noticeSessionId == sessionId_);
+                                      noticeSessionId == sessionId_ && sessionId_ != 0;   // #12: id 0 names no session
             if (incomingCorrelationId != correlationId_ && !sessionLevel) return;
             if (ec == rpc::ErrorCode::AuthenticationFailed) {
                 failAuth_(ec, /*retryAfterMs=*/0, nowNs);

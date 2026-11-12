@@ -54,6 +54,13 @@ AuthStatus a = client.authStatus();                       // Authenticated, Pass
   sessions, and a client with credentials sends them only over TLS: without `offerCrypto` it throws at construction, and
   `requireCrypto` is forced on. Each session checks the certificate against its own endpoint's host unless
   `cfg.tlsExpectHost` names one.
+- Session notices and login answers are checked against the session. A session-level end notice (`SessionRevoked`,
+  `NamespaceSuspended`, `AuthUnavailable`, an auth-deadline `AuthenticationFailed`) ends a session only when its header
+  names that session's id (id 0 names none); an `AuthServerFirst` / `AuthServerFinal` acts only when it carries the
+  login's correlation id and the session id. On a TLS session, a frame its own keys did not open (a clear frame, or one
+  sealed for another session) never reaches the session machine; the one clear exception is the probe notice that
+  echoes a fresh probe nonce. A plaintext session has no such protection: whoever can read its session id and
+  correlation id can forge anything on it, so credentials travel only over TLS.
 - From a game loop, set `cfg.runnerMode = RunnerMode::Invoker` and call `client.doWork()` once per tick:
 
 ```cpp

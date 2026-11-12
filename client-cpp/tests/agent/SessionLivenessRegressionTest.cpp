@@ -11,7 +11,9 @@
 // an explicit clock, no sleeps.
 #include <rune/client/agent/ClientAgent.h>
 #include <rune/client/codec/Codec.h>
+#include <rune/client/codec/CryptoFrame.h>
 #include <rune/client/codec/DataCodec.h>
+#include <rune/protocol/client/AuthMessages.h>
 
 #include <gtest/gtest.h>
 
@@ -165,4 +167,127 @@ TEST(ClientAgentRegression, ClearUnknownSessionNeedsProbeNonceRegression) {
     notice(sid, nonce);                                      // the right session and an old but kept nonce
     EXPECT_EQ(a.probeNoticesAccepted(), 1u);
     EXPECT_EQ(m.state(), sm::SessionState::Resuming) << "handled exactly like an UnknownSession on that session";
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// #12: a forged session notice or auth answer must not end an encrypted session.  Crypto is OFFERED (not required): a
+// clear frame whose header names session 0 or an id nobody holds passes the sealed-session filter, and the session
+// machine used to honour a corr-0 SessionRevoked / AuthServerFinal{44} for session id 0.
+// ---------------------------------------------------------------------------------------------------------------------
+namespace {
+
+constexpr uint8_t kPrefix[4] = {1, 2, 3, 4};
+
+rune::crypto::AeadKey testKey() {
+    rune::crypto::AeadKey k{};
+    for (std::size_t i = 0; i < sizeof k.bytes; ++i) k.bytes[i] = static_cast<uint8_t>(0x30 + i);
+    return k;
+}
+
+// The session's keys, installed by hand (no handshake): `m` opens what `brokerSide` seals.
+void sealSession(sm::SessionMachine& m, sm::CryptoState& brokerSide) {
+    const auto key = testKey();
+    m.cryptoState().cipher = rune::crypto::Cipher::Aes256Gcm;
+    m.cryptoState().recv.emplace(rune::crypto::Cipher::Aes256Gcm, key, kPrefix);
+    m.cryptoState().send.emplace(rune::crypto::Cipher::Aes256Gcm, key, kPrefix);
+    m.cryptoState().encrypted = true;
+    brokerSide.cipher = rune::crypto::Cipher::Aes256Gcm;
+    brokerSide.send.emplace(rune::crypto::Cipher::Aes256Gcm, key, kPrefix);
+    brokerSide.encrypted = true;
+}
+
+rca::AgentConfig cryptoCfg() {
+    rca::AgentConfig c = cfg();
+    c.session.offerCrypto = true;
+    return c;
+}
+
+void injectError(rca::ClientAgent& a, int16_t code, int64_t headerSid, int64_t corr, int64_t now) {
+    std::array<uint8_t, 128> buf{};
+    const std::size_t n = rcc::encodeErrorResponse(buf.data(), buf.size(), code, "forged", headerSid, corr);
+    ASSERT_GT(n, 0u);
+    a.dispatchEgressFrameForTest(now, buf.data(), n);
+}
+
+void injectAuthFinal(rca::ClientAgent& a, int64_t sid, int64_t corr, uint16_t code, int64_t now) {
+    std::array<uint8_t, 128> buf{};
+    rpc::AuthServerFinal f;
+    f.sessionId = sid; f.correlationId = corr; f.errorCode = code;
+    const std::size_t n = f.encode(buf.data());
+    ASSERT_GT(n, 0u);
+    a.dispatchEgressFrameForTest(now, buf.data(), n);
+}
+
+}  // namespace
+
+TEST(ClientAgentRegression, AnUnsealedSessionNoticeIsIgnoredRegression) {
+    rca::ClientAgent a(cryptoCfg());
+    sm::SessionMachine& m = a.sessionMachineForTest(0);
+    connect(a, m, /*sid=*/0x5500000007LL, T0);
+    sm::CryptoState broker;
+    sealSession(m, broker);
+    const int64_t sid = m.sessionId();
+    constexpr auto k46 = static_cast<int16_t>(rpc::ErrorCode::SessionRevoked);
+    EXPECT_EQ(a.forgedSessionFramesIgnored(), 0u);
+    injectError(a, k46, /*headerSid=*/0, /*corr=*/0, T0 + kMs);                 // names no session
+    EXPECT_EQ(m.state(), sm::SessionState::Connected);
+    EXPECT_EQ(a.forgedSessionFramesIgnored(), 1u);
+    injectError(a, k46, /*headerSid=*/0x5500000063LL, /*corr=*/0, T0 + 2 * kMs);   // an id nobody holds
+    EXPECT_EQ(m.state(), sm::SessionState::Connected);
+    EXPECT_EQ(a.forgedSessionFramesIgnored(), 2u);
+    injectError(a, k46, sid, /*corr=*/0, T0 + 3 * kMs);   // its own id, but in clear: the filter drops it
+    EXPECT_EQ(m.state(), sm::SessionState::Connected);
+    // The same notice SEALED under the session's keys is honoured.
+    {
+        std::array<uint8_t, 128> plain{};
+        const std::size_t pn = rcc::encodeErrorResponse(plain.data(), plain.size(), k46, "revoked", sid, 0);
+        ASSERT_GT(pn, 0u);
+        std::array<uint8_t, 256> sealed{};
+        const std::size_t sn = rcc::sealFrame(broker, plain.data(), pn, sealed.data(), sealed.size());
+        ASSERT_GT(sn, 0u);
+        a.dispatchEgressFrameForTest(T0 + 4 * kMs, sealed.data(), sn);
+    }
+    EXPECT_EQ(m.state(), sm::SessionState::Rejected);
+    EXPECT_EQ(m.rejectCode(), 46);
+}
+
+TEST(ClientAgentRegression, AnUnsealedAuthAnswerNeverMovesASealedLoginRegression) {
+    rca::ClientAgent a(cryptoCfg());
+    sm::SessionMachine& m = a.sessionMachineForTest(0);
+    m.connect(T0);
+    m.onConnectResponse(0, -1, 0x5500000007LL, m.correlationId(), T0 + 1, 0, {}, rpc::AuthMode::Required,
+                        rpc::AuthState::MustAuthenticate);
+    ASSERT_EQ(m.state(), sm::SessionState::Authenticating);
+    sm::CryptoState broker;
+    sealSession(m, broker);
+    const int64_t sid = m.sessionId(), corr = m.correlationId();
+    injectAuthFinal(a, /*sid=*/0, corr, 44, T0 + 2 * kMs);       // right correlation, no session
+    EXPECT_EQ(m.state(), sm::SessionState::Authenticating);
+    EXPECT_EQ(a.forgedSessionFramesIgnored(), 1u);
+    injectAuthFinal(a, sid, corr, 44, T0 + 3 * kMs);             // everything right, but clear
+    EXPECT_EQ(m.state(), sm::SessionState::Authenticating);
+    injectAuthFinal(a, sid + 1, corr + 1, 44, T0 + 4 * kMs);
+    EXPECT_EQ(m.state(), sm::SessionState::Authenticating);
+    EXPECT_EQ(a.forgedSessionFramesIgnored(), 2u);
+}
+
+// The connect leg is not sealed yet: a clear Redirect / NotLeader / refusal carrying the in-flight ConnectRequest's
+// correlation id still reaches the machine (and one carrying another id does not).
+TEST(ClientAgentRegression, AClearRefusalStillAnswersAnInFlightConnectRegression) {
+    rca::ClientAgent a(cryptoCfg());
+    sm::SessionMachine& m = a.sessionMachineForTest(0);
+    m.connect(T0);
+    ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+    ASSERT_FALSE(m.cryptoState().encrypted) << "no keys while Connecting";
+    const int64_t corr = m.correlationId();
+    constexpr auto kNotLeader = static_cast<int16_t>(rpc::ErrorCode::NotLeader);
+    EXPECT_EQ(m.redirectCount(), 0);
+    injectError(a, kNotLeader, /*headerSid=*/0, corr + 1, T0 + kMs);   // another correlation: not this connect's
+    EXPECT_EQ(m.redirectCount(), 0);
+    injectError(a, kNotLeader, /*headerSid=*/0, corr, T0 + 2 * kMs);
+    EXPECT_EQ(m.redirectCount(), 1) << "the clear NotLeader answering the in-flight connect is delivered";
+    EXPECT_EQ(a.forgedSessionFramesIgnored(), 0u);
+    injectError(a, static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable), 0, m.correlationId(), T0 + 3 * kMs);
+    EXPECT_EQ(m.lastConnectError(), static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable));
+    EXPECT_EQ(a.forgedSessionFramesIgnored(), 0u);
 }

@@ -872,6 +872,9 @@ public:
     [[nodiscard]] uint64_t staleFramesDropped() const noexcept { return staleFramesDropped_; }
     /// F-A C1: session-fatal notices for a session this client already left (dropped, never applied).
     [[nodiscard]] uint64_t staleSessionNotices() const noexcept { return staleSessionNotices_; }
+    /// #12: AuthServerFirst / AuthServerFinal / ErrorResponse frames aimed at a sealed session that its own key did not
+    /// open (a clear or foreign-keyed frame), dropped before any machine call.
+    [[nodiscard]] uint64_t forgedSessionFramesIgnored() const noexcept { return forgedSessionFramesIgnored_; }
     /// #989: sessions resumed because their response pair's gateway publication closed (duty thread only).
     [[nodiscard]] uint64_t responseEgressLosses() const noexcept { return responseEgressLosses_; }
     /// U2: clear UnknownSession notices accepted for an encrypted session (probe nonce echoed) / refused (wrong nonce or session).
@@ -1422,6 +1425,7 @@ private:
     // only on the duty thread / after the runner is joined).
     uint64_t staleFramesDropped_  = 0;
     uint64_t staleSessionNotices_ = 0;   ///< F-A C1 (duty thread only)
+    uint64_t forgedSessionFramesIgnored_ = 0;   ///< #12 (duty thread only)
     uint64_t responseEgressLosses_ = 0;  ///< #989 (duty thread only)
     uint64_t ingressOfferRefused_ = 0;
     uint64_t ingressFatalDropped_ = 0;

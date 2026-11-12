@@ -15,6 +15,13 @@ namespace sm = rune::client::session;
 
 namespace {
 
+// An AuthServerFinal as the broker stamps it: this machine's session id and its connect correlation id.
+pc::AuthServerFinal ownFinal(const sm::SessionMachine& m, pc::AuthServerFinal f) {
+    f.sessionId = m.sessionId();
+    f.correlationId = m.correlationId();
+    return f;
+}
+
 struct CapturingIo : sm::SessionIo {
     std::vector<std::vector<uint8_t>> frames;
     bool sendFrame(const uint8_t* b, std::size_t n) override { frames.emplace_back(b, b + n); return true; }
@@ -71,7 +78,7 @@ TEST(SessionTransientRetryRegression, AReconnectAfterLiveRetriesATransientRefusa
         if (rateLimited) {
             t.answerAuthRequired(++now);
             ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating);
-            t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 300}, now);
+            t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 300}), now);
         } else {
             t.m->onConnectResponse(kUnavailable, -1, 0, t.io.lastCorrelation(), ++now);
         }

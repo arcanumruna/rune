@@ -911,6 +911,9 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     // the bind's correlation id, no secret) and is not an ingress template (checkFrame refuses it): handled here, before
     // the sealed-session filter, and only an exact (sid, corr) match of a Sent bind changes anything.
     // #765: the template id is read ONCE and reused by the ack branch and the sealed-session peek below.
+    // #12: which session's key opened this frame (nullptr: clear / none), and whether it is the U2 clear probe notice.
+    Session* openedBy = nullptr;
+    bool probeNotice = false;
     if (len >= rune::protocol::client::MessageHeader::ENCODED_SIZE) {
         const uint16_t tid = rune::protocol::client::detail::getLE16(buf, 2);
         if (tid == rune::protocol::client::WorkerBindAck::TEMPLATE_ID) {
@@ -949,6 +952,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
                         buf = egressDecryptScratch_.data();
                         len = plainLen;
                         decrypted = true;
+                        openedBy = &cand;
                         cand.machine.onSealedFrameOpened();   // PR #476 review: the broker proved the keys
                         break;
                     }
@@ -960,7 +964,6 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             // one of its latest probe nonces (a restarted gateway holds no keys; its notice is clear text).  Everything else clear
             // is dropped.  Security: an off-path forger needs the 40-bit random session id AND the latest 62-bit nonce; an on-path
             // attacker can already drop traffic.
-            bool probeNotice = false;
             if (!decrypted && sawEncryptedCandidate) {
                 if (peekedTid == codec::TemplateId::ErrorResponse)
                     probeNotice = acceptsProbeNotice_(buf, len, sid);
@@ -1150,6 +1153,14 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         auto opt = ::rune::protocol::client::AuthServerFirst::decode(buf, len);
         if (!opt) break;   // outside the wire bounds: the login then times out (never a proof to a malformed frame)
         Session& s = sessionForConnectCorrId(opt->correlationId);
+        // #12: a session whose keys are established is never moved by a frame its own key did not open (a clear frame
+        // naming session 0 or an id nobody holds, or one sealed under another session's key and routed here by the
+        // connect-correlation fallback).  Not encrypted yet (Connecting / Handshaking: the clear Redirect / NotLeader /
+        // refusal answering the in-flight ConnectRequest) is unaffected; the U2 clear probe notice is exempt.
+        if (s.machine.cryptoState().encrypted && openedBy != &s && !probeNotice) [[unlikely]] {
+            ++forgedSessionFramesIgnored_;
+            break;
+        }
         s.machine.onAuthServerFirst(*opt, nowNs);
         break;
     }
@@ -1158,6 +1169,14 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         auto opt = ::rune::protocol::client::AuthServerFinal::decode(buf, len);
         if (!opt) break;
         Session& s = sessionForConnectCorrId(opt->correlationId);
+        // #12: a session whose keys are established is never moved by a frame its own key did not open (a clear frame
+        // naming session 0 or an id nobody holds, or one sealed under another session's key and routed here by the
+        // connect-correlation fallback).  Not encrypted yet (Connecting / Handshaking: the clear Redirect / NotLeader /
+        // refusal answering the in-flight ConnectRequest) is unaffected; the U2 clear probe notice is exempt.
+        if (s.machine.cryptoState().encrypted && openedBy != &s && !probeNotice) [[unlikely]] {
+            ++forgedSessionFramesIgnored_;
+            break;
+        }
         const bool awaited = s.machine.state() == session::SessionState::Authenticating &&
                              s.machine.correlationId() == opt->correlationId;
         s.machine.onAuthServerFinal(*opt, nowNs);
@@ -1202,6 +1221,15 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             }
         }
         Session& s = *sp;
+        // #12: a session whose keys are established is never moved by a frame its own key did not open (a clear frame
+        // naming session 0 or an id nobody holds, or one sealed under another session's key and routed here by the
+        // connect-correlation fallback).  Not encrypted yet (Connecting / Handshaking: the clear Redirect / NotLeader /
+        // refusal answering the in-flight ConnectRequest) is unaffected; the U2 clear probe notice is exempt.
+        if (s.machine.cryptoState().encrypted && openedBy != &s && !probeNotice) [[unlikely]] {
+            ++forgedSessionFramesIgnored_;
+            if (egressObserver_) egressObserver_(tid, buf, len);
+            break;
+        }
         // F-A C1: a session-fatal notice for a session this client already LEFT (a forceReconnect / seed failover /
         // resume that got a new id abandoned it; the broker's lease reap now tells it SessionExpired ~10 s later)
         // names an id no machine holds.  It must never tear down the session it was routed to.  Ids are cluster-unique
