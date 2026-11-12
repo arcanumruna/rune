@@ -6453,6 +6453,11 @@ void BrokerNode::publishNsSlotMetrics_() noexcept {
         lastDamagedReadsPublished_ = damaged;
         controlSet_(RuneMetric::DamagedReads, damaged);
     }
+    const auto unauth = static_cast<std::int64_t>(gateway_->unauthLogSuppressedTotal());   // #145
+    if (unauth != lastUnauthSuppressedPublished_) {
+        lastUnauthSuppressedPublished_ = unauth;
+        controlSet_(RuneMetric::UnauthLogSuppressed, unauth);
+    }
 }
 
 uint32_t BrokerNode::nsConnectionsForTest(uint32_t nsId) {

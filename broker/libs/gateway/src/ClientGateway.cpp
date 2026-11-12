@@ -2042,6 +2042,14 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
         }
         return;
     }
+    if (kind == K::UnauthLogSuppressed) [[unlikely]] {   // #145: a worker's cumulative suppressed log lines
+        if (ret.partition >= 0 && ret.partition < 4096) {
+            if (workerUnauthSuppressed_.size() <= static_cast<std::size_t>(ret.partition))
+                workerUnauthSuppressed_.resize(static_cast<std::size_t>(ret.partition) + 1, 0);
+            workerUnauthSuppressed_[static_cast<std::size_t>(ret.partition)] = static_cast<uint64_t>(ret.baseOffset);
+        }
+        return;
+    }
     if (kind == K::NsUsage) [[unlikely]] {   // namespaces Phase 2 Task 14 (D28): sessionId = (slot << 8) | metric
         if (nsAggregator_ != nullptr && ret.partition >= 0 && ret.sessionId >= 0) {
             const auto metric = static_cast<std::size_t>(ret.sessionId & 0xFF);

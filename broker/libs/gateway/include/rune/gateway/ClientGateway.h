@@ -437,6 +437,13 @@ public:
     [[nodiscard]] uint64_t bootstrapsRefused() const noexcept { return bootstrapsRefused_; }
     /// X103: log lines the 1/1024 limiter swallowed (require-TLS refusals, bad bootstrap proofs, login failures).
     [[nodiscard]] uint64_t unauthLogSuppressed() const noexcept { return unauthLog_.suppressed(); }
+    /// #145: unauthenticated-sender log lines suppressed node-wide: this gateway's own plus the cumulative counts the
+    /// workers reported (SessionSignal UnauthLogSuppressed).  Published as `rune-unauth-log-suppressed`.
+    [[nodiscard]] uint64_t unauthLogSuppressedTotal() const noexcept {
+        uint64_t n = unauthLog_.suppressed();
+        for (const uint64_t w : workerUnauthSuppressed_) n += w;
+        return n;
+    }
     /// How this broker authenticates sessions (ConnectResponse.authMode) and the control thread's SecurityView the
     /// bootstrap window is read from (open while no ENABLED security admin exists - a fresh cluster or a locked-out one, D3).  Required: a session that has not
     /// authenticated is limited by its SessionAuth state (gateFor); default InProcess = no gating, byte-identical to before.
@@ -2784,6 +2791,7 @@ private:
     std::vector<uint64_t>   workerNsSlotMismatches_;   ///< cumulative, per worker (SessionSignal NsSlotMismatch)
     uint64_t                inlineDamagedReads_ = 0;   ///< #882: inline-path subscriptions failed at damaged data
     std::vector<uint64_t>   workerDamagedReads_;       ///< #882: cumulative, per worker (SessionSignal DamagedRead)
+    std::vector<uint64_t>   workerUnauthSuppressed_;   ///< #145: cumulative, per worker (UnauthLogSuppressed)
     /// One array index and a compare; counts a mismatch.
     [[nodiscard]] bool nsTagMatches_(const Session& s) noexcept {
         if (nsSlots_.matches(s.nsSlot, s.nsId)) [[likely]] return true;

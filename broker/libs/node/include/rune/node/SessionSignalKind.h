@@ -57,6 +57,10 @@ enum class SessionSignalKind : int64_t {
     /// subscription (`rune-log-damaged-reads`): WorkerReturn::baseOffset = the worker's cumulative count, ::partition =
     /// the worker.
     DamagedRead = 14,
+    /// #145: NOT a session signal - the cumulative count of unauthenticated-sender log lines a worker's rate limiter
+    /// suppressed (`rune-unauth-log-suppressed`): WorkerReturn::baseOffset = the worker's cumulative count, ::partition =
+    /// the worker.  Sent with a logged line, only when the count changed.
+    UnauthLogSuppressed = 15,
 };
 
 } // namespace rune::node

@@ -10675,11 +10675,23 @@ private:
                data[3] == static_cast<uint8_t>(rune::protocol::client::WorkerBind::TEMPLATE_ID >> 8);
     }
 
+    /// #145: true = log this occurrence.  When a line is due, the cumulative suppressed count is reported to the
+    /// gateway (SessionSignal UnauthLogSuppressed) if it changed: at most one signal per logged line, so a flood of
+    /// refused frames costs one return-ring slot per 1024 frames.  A full ring: retried at the next due line.
+    [[gnu::cold]] [[gnu::noinline]] bool unauthDue_(std::size_t kind) {
+        if (!unauthLog_.due(kind)) return false;
+        const uint64_t n = unauthLog_.suppressed();
+        if (n != unauthSuppressedReported_ &&
+            trySessionSignal_(0, SessionSignalKind::UnauthLogSuppressed, static_cast<int64_t>(n)))
+            unauthSuppressedReported_ = n;
+        return true;
+    }
+
     /// Cold: a frame of a response-mode session arrived on the wrong image (an attacker naming a sequential session
     /// id) or before the bind.  Consumed without append or reply; counted; logged first + every 1024th.
     [[gnu::cold]] [[gnu::noinline]] void noteSpoofedIngress_(int64_t sessionId, int32_t image) {
         ++spoofedIngressDropped_;
-        if (unauthLog_.due(18)) [[unlikely]]
+        if (unauthDue_(18)) [[unlikely]]
             spdlog::warn("Worker {}: produce for response-mode session {} from image {} dropped (not its bound image, or "
                          "not bound yet; total {})", workerId_, sessionId, image, spoofedIngressDropped_);
     }
@@ -10701,7 +10713,7 @@ private:
         const auto msg = pc::WorkerBind::decode(data, len);
         if (!msg || !ackSink_ || responseControlEndpoint_.empty()) {
             ++workerBindsRefused_;
-            if (unauthLog_.due(19)) spdlog::warn("Worker {}: WorkerBind refused ({}) from image {}", workerId_,
+            if (unauthDue_(19)) spdlog::warn("Worker {}: WorkerBind refused ({}) from image {}", workerId_,
                                                   !msg ? "undecodable" : "response mode off", image);
             return;
         }
@@ -10719,7 +10731,7 @@ private:
         }
         if (chk != SessionAckSink::BindResult::Bound) {
             ++workerBindsRefused_;
-            if (unauthLog_.due(19))
+            if (unauthDue_(19))
                 spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused (result {}; refused so far {})",
                              workerId_, msg->sessionId, image, static_cast<int>(chk), workerBindsRefused_);
             return;
@@ -10728,7 +10740,7 @@ private:
         const int64_t corr = workerIngress_ ? workerIngress_->imageCorrelationIdOf(image) : -1;
         if (corr < 0) {
             ++workerBindsRefused_;
-            if (unauthLog_.due(20)) spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused: no such image",
+            if (unauthDue_(20)) spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused: no such image",
                                                   workerId_, msg->sessionId, image);
             return;
         }
@@ -10742,7 +10754,7 @@ private:
             return;
         }
         ++workerBindsRefused_;
-        if (unauthLog_.due(19))
+        if (unauthDue_(19))
             spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused (result {}; refused so far {})",
                          workerId_, msg->sessionId, image, static_cast<int>(r), workerBindsRefused_);
     }
@@ -10839,6 +10851,7 @@ private:
     uint64_t decryptFailures_ = 0;          ///< X103: produce frames dropped for failing to open (worker thread)
     uint64_t c2bWrongReceiverDrops_ = 0;    ///< issue #116: produce frames naming another receiver (worker thread)
     UnauthLogLimiter unauthLog_;            ///< X103: rate limit of the log lines an unauthenticated sender can drive
+    uint64_t         unauthSuppressedReported_ = 0;   ///< #145: the suppressed count last posted to the gateway
 
     /// Issue #116: does this encrypted c2b frame name THIS worker as its receiver (CryptoSubHeader.senderId ==
     /// workerId_ + 1)?  A frame too short for a subheader answers true: the open below rejects it as before.
@@ -10883,7 +10896,7 @@ private:
                 if (cr->receiverKeys && !c2bForThisWorker_(data, len)) [[unlikely]] {
                     if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
                     ++c2bWrongReceiverDrops_;
-                    if (unauthLog_.due(0)) [[unlikely]]
+                    if (unauthDue_(0)) [[unlikely]]
                         spdlog::warn("Worker {}: WorkerIngress: encrypted produce for another receiver (session={}, "
                                      "len={}); dropping (wrong-receiver drops so far {})",
                                      workerId_, produceSessionIdOf_(data), len, c2bWrongReceiverDrops_);
@@ -10916,7 +10929,7 @@ private:
                     if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
                     // X103: any UDP sender drives this on the produce thread - counted, logged first + every 1024th.
                     ++decryptFailures_;
-                    if (unauthLog_.due(0)) [[unlikely]]
+                    if (unauthDue_(0)) [[unlikely]]
                         spdlog::warn("Worker {}: WorkerIngress: produce decrypt failed (session={}, "
                                      "len={}); dropping (fail-closed; failures so far {})",
                                      workerId_, produceSessionIdOf_(data), len, decryptFailures_);

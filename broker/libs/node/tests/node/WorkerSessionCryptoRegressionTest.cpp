@@ -104,6 +104,37 @@ TEST(WorkerSessionCryptoRegression, DecryptFailuresAreCountedAndRateLimitedRegre
     EXPECT_EQ(worker.unauthLogSuppressed(), static_cast<uint64_t>(kFlood - 3)) << "logged at 0, 1024 and 2048 only";
 }
 
+// #145: the suppressed count is published, not only kept: a worker posts its cumulative count to the gateway
+// (SessionSignal UnauthLogSuppressed) with each logged line, only when it changed - at most one signal per logged line.
+// RED: no signal is ever posted.
+TEST(WorkerSessionCryptoRegression, SuppressedCountIsSignalledRegression) {
+    Worker worker(0);
+    ASSERT_TRUE(worker.tryEnqueueOp(encryptedAnnounce(1)));
+    worker.doWork(1);
+    ASSERT_EQ(worker.sessionCryptoEntriesForTest(), 1u);
+    const auto frame = produceFrameFor(1);   // unsealed: every open fails closed
+    constexpr int kFlood = 2500;             // logged at 0, 1024 and 2048
+    for (int i = 0; i < kFlood; ++i) EXPECT_EQ(worker.handleIngressFrameForTest(frame.data(), frame.size(), 1 + i), 0);
+    int signals = 0;
+    std::vector<int64_t> reported;
+    worker.drainReturn([&](WorkerReturn r) {
+        if (r.type == WorkerReturn::Type::SessionSignal &&
+            r.lastOffset == static_cast<int64_t>(SessionSignalKind::UnauthLogSuppressed)) {
+            ++signals;
+            reported.push_back(r.baseOffset);
+            EXPECT_EQ(r.partition, 0);
+        }
+    });
+    constexpr int kLogged = 3;
+    EXPECT_LE(signals, kLogged) << "at most one signal per logged line";
+    // The line at 0 has nothing suppressed yet (no signal); the line at 1024 follows 1023 suppressed, the one at 2048
+    // follows 2046; the last 451 suppressed after it are reported with the next logged line.
+    ASSERT_EQ(reported.size(), 2u);
+    EXPECT_EQ(reported[0], static_cast<int64_t>(UnauthLogLimiter::kEvery - 1));
+    EXPECT_EQ(reported[1], static_cast<int64_t>(2 * (UnauthLogLimiter::kEvery - 1)));
+    EXPECT_EQ(worker.unauthLogSuppressed(), static_cast<uint64_t>(kFlood - kLogged));
+}
+
 // #268: the hot lookup stored the probe count in a mutable member on EVERY find().  The counter is now computed on demand
 // by a test seam, so the table holds nothing but its two arrays and its count.
 TEST(SessionCryptoTableRegression, LookupStoresNothingRegression) {
