@@ -62,7 +62,7 @@ public:
             return;
         }
         len_ = static_cast<uint8_t>(bytes.size());
-        std::memcpy(buf_.data(), bytes.data(), len_);
+        if (len_ != 0) std::memcpy(buf_.data(), bytes.data(), len_);  // an empty span may have a null data()
     }
 
     /// The record key of a string(`fieldWidth`) key field holding `value` (at most `fieldWidth` bytes): for a field up to

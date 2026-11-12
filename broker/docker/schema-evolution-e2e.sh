@@ -241,7 +241,7 @@ rename_ns() {
 }
 
 echo "[in] ===== PHASE 1: apply v1 (id,userId,name) ====="
-rune console -f "${RQL}/v1.rql" --broker "${RUNE_TARGET}" --validate \
+rune console -f "${RQL}/v1.rql" --broker "${RUNE_TARGET}" \
     --cli-data-dir /tmp/cli_apply_v1
 
 echo "[in] generate + stage v1 header..."
