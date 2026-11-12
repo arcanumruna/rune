@@ -166,6 +166,11 @@ attacker at one address never delays the same user at another. A session that ha
 the login within `RUNE_AUTH_TIMEOUT_MS` (default 10 000) is answered `AuthenticationFailed` and ended
 (D13). A client that is rate-limited waits `max(retryAfterMs, its backoff)` and retries.
 
+The source address in the throttle key is the real UDP source of the Connect image. An IPC image
+has no source address, so the host of the reply endpoint the client declared is used instead. Only
+processes on the broker's own machine can connect over IPC, so the key cannot be chosen remotely,
+but local processes can choose it.
+
 ## Bootstrap: the first admin (D3, D4)
 
 A fresh cluster has no users. `rune security bootstrap` creates the first security admin, once:
