@@ -580,16 +580,21 @@ TEST_P(LeaseTxnGuardBrokerRegression, AtRiskThenClearedContinues) {
     EXPECT_EQ(sorted(r.seen), sorted(expect));
 }
 
-// 3 nodes: A commits while the data partition's leader is stopped; the lease stays held (ttl 30 s here, so a slow failover is not a
-// lease loss); the commit completes OK after the failover and R reads each record once.
+// 3 nodes: A commits while the data partition's leader is stopped; the lease stays held; the commit completes OK after the failover and
+// R reads each record once.  The lease cannot go at risk inside the wait: its at-risk instant (ttl/2 after the last answered keepalive)
+// lies past the wait's own cap, however slow the failover is (a 30 s ttl tripped under TSan: no keepalive was answered for 15 s and the
+// guard refused the commit, rightly).  So a red run here is a commit that did not complete, never a slow host.
+constexpr std::chrono::seconds kFailoverCap = 150s;
+constexpr uint64_t             kLeaderTtlMs = 400'000;
+static_assert(kLeaderTtlMs / 2 > static_cast<uint64_t>(std::chrono::milliseconds(kFailoverCap).count()));
 TEST_P(LeaseTxnGuardBrokerRegression, LeaderChangeMidCommitGuarded) {
     if (GetParam() != 3) GTEST_SKIP() << "needs three nodes";
-    Rig rig(3, "ltg_leader", 30'000, /*fastDetect=*/true);
+    Rig rig(3, "ltg_leader", kLeaderTtlMs, /*fastDetect=*/true);
     const int32_t victim = rig.dataLeader();
     ASSERT_GT(victim, 0);
     Actor  a(rig, 0, 0, victim);
     Reader r(rig, 1, 1, victim);
-    ASSERT_NO_FATAL_FAILURE(takeLease(a, 1, 30'000, "tx-1"));
+    ASSERT_NO_FATAL_FAILURE(takeLease(a, 1, kLeaderTtlMs, "tx-1"));
     a.producer->beginTransaction();
     std::vector<std::string> vs = values("L", 20);
     std::vector<rc::Token>   toks;
@@ -601,7 +606,7 @@ TEST_P(LeaseTxnGuardBrokerRegression, LeaderChangeMidCommitGuarded) {
     (void)a.client->doWork();   // frames to the victim are on the wire
     const rc::Token c = a.commit();
     rig.three->stop(victim);
-    ASSERT_TRUE(a.await(c, {&a}, 150s)) << "the commit never completed after the failover";
+    ASSERT_TRUE(a.await(c, {&a}, kFailoverCap)) << "the commit never completed after the failover";
     EXPECT_EQ(a.result(c).status, rc::OpStatus::Ok) << "code " << a.result(c).errorCode;
     for (rc::Token t : toks) {
         ASSERT_EQ(a.got.count(t), 1u);
