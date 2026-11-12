@@ -283,6 +283,31 @@ TEST(SubscriberPauseRegression, ResumeRedeliversFromOffsetRegression) {
     EXPECT_FALSE(r.sub->resume()) << "not paused any more";
 }
 
+// Final review (c): resume() arms the floor at the position.  A batch wholly below it is a duplicate and is dropped (and counted
+// once); the first batch at the position is delivered and clears the floor.  Nothing is delivered twice.
+TEST(SubscriberPauseRegression, ResumeDropsWhollyBelowBatchThenDeliversRegression) {
+    Rig r;
+    r.open(11);
+    r.bind(40);
+    r.push(40, 0, 10);
+    ASSERT_EQ(r.sub->position(), 10);
+    ASSERT_TRUE(r.sub->pause());
+    ASSERT_TRUE(r.sub->resume());
+    EXPECT_EQ(r.impl->resumeFloor, 10) << "the resume armed the floor at the position";
+    EXPECT_EQ(r.hub.movedDuplicateBatchesDropped(), 0u);
+    r.got.clear();
+    r.bindLast(41);
+    r.push(41, 0, 5);    // wholly below the position
+    EXPECT_TRUE(r.got.empty()) << "a batch wholly below the position is never delivered twice";
+    EXPECT_EQ(r.hub.movedDuplicateBatchesDropped(), 1u);
+    EXPECT_EQ(r.impl->resumeFloor, 10) << "still armed: no batch at the position has arrived";
+    r.push(41, 10, 3);   // at the position
+    EXPECT_EQ(r.got, (std::vector<int64_t>{10, 11, 12}));
+    EXPECT_EQ(r.hub.movedDuplicateBatchesDropped(), 1u) << "only the one below batch was counted";
+    EXPECT_EQ(r.impl->resumeFloor, -1) << "the first batch at the position cleared the floor";
+    EXPECT_EQ(r.sub->position(), 13);
+}
+
 // pause() with no offset: delivery continues after the last record handed to the handler, from the app thread.
 TEST(SubscriberPauseRegression, PauseDefaultContinuesAfterLastRegression) {
     Rig r;
