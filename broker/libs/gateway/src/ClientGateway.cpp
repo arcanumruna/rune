@@ -2088,6 +2088,30 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
         onEnforceFenceAck_(ret.partition, static_cast<int>(ret.sessionId), static_cast<uint64_t>(ret.baseOffset));
         return;
     }
+    if (kind == K::Unauthenticated) [[unlikely]] {   // #216: a worker answered 44 to a session it holds no bind for
+        // The gateway's own state decides, exactly as for the same request on its path (answerGate_, D13): a session
+        // that is still unauthenticated (AwaitingFirst / AwaitingFinal) is ended after its 44 (already sent by the
+        // worker); one that authenticated since, or is gone, is left alone.
+        Session* s = sessions_.find(ret.sessionId);
+        if (s == nullptr || s->auth.index() >= 2 || s->spill.state == SpillState::Closing) return;
+        // A session that never authenticated, with anonymous read on, is turned into the anonymous reader by its first
+        // produce on the gateway path (becomeAnonymousIfAllowed_ at handleProduce, answered 45, the session stays);
+        // do the same here, so the worker path ends the same sessions.  The worker already sent its one 44 (it held no
+        // bind): the one accepted difference.  Its deny bind is shipped by the conversion, so later worker produces
+        // answer 45.  When the anonymous cap is reached the gateway path answers the namespace-limit error and leaves the
+        // session as it is (it does not end it): mirrored, nothing more is sent here.  AwaitingFinal is ended as before.
+        if (std::holds_alternative<rune::gateway::AuthAwaitingFirst>(s->auth)) {
+            if (becomeAnonymousIfAllowed_(*s, pc::TemplateId::Produce)) return;   // cap reached
+            if (std::holds_alternative<rune::gateway::AuthAnonymousRead>(s->auth)) return;
+        }
+        ++authGateRefusals_;
+        if (authGateRefusals_ % 1024 == 1)
+            spdlog::warn("ClientGateway: session {} sent a produce to worker {} before authenticating - answered "
+                         "AuthenticationFailed and ended (D13; refusals so far: {})", ret.sessionId, ret.partition,
+                         authGateRefusals_);
+        closeAfterAnswers_(ret.sessionId);   // its 44 is delivered first, as on the gateway path (#119)
+        return;
+    }
     if (kind != K::Failed && kind != K::Expire) {
         Session* s = sessions_.find(ret.sessionId);
         if (!s) return;                                               // closed meanwhile
@@ -9924,6 +9948,9 @@ bool ClientGateway::becomeAnonymousIfAllowed_(Session& session, pc::TemplateId t
         session.auth = rune::gateway::AuthAnonymousRead{anonPerms_()};
         session.anonCounted = true;
         ++anonSessions_;
+        // #216: the anonymous reader is not unauthenticated - its produce is answered NotAuthorized (45) on the gateway
+        // path, so the worker must hold a deny bind for it (an Unbound slot would answer 44 and end the session).
+        bindDenyTable_(session);
         if (d != nullptr)
             session.nsGate = rune::catalog::tagOf(d->state);   // namespaces Phase 2 Task 3: the anonymous reader is `default`'s
     }
@@ -10699,8 +10726,15 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
 uint64_t ClientGateway::shipPermissions_(const Session& session)
 {
     if (authMode_ != rune::gateway::GatewayAuthMode::Required || !shardMode_ || !workerPool_) return 0;
+    if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session.auth)) {
+        // #216: a one-time-password session produces nothing but is NOT unauthenticated: bound to nothing, so the
+        // worker answers PasswordChangeRequired (47) like the gateway's gate and keeps the session.  The login OK
+        // waits for it.
+        return permissionShipper_.bind(*workerPool_, session.sessionId,
+                                       rune::node::PermissionShipper::kPasswordChangeTable, ++permEpoch_, p->userId);
+    }
     const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth);
-    if (a == nullptr) return 0;   // must-change-password / anonymous: the worker slot stays empty (deny)
+    if (a == nullptr) return 0;   // anonymous / unauthenticated: the worker slot stays Unbound (#216: answered 44)
     const uint64_t epoch = ++permEpoch_;
     // Namespaces Phase 2 (D21): EVERY ship of a session whose namespace is not Active - a login while suspended, a
     // grant change, the must-change-password transition, the suspend itself - binds no WRITE: a ReadOnly namespace's

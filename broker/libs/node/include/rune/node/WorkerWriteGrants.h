@@ -14,12 +14,13 @@
 //   (a Table / Patch item whose op `topicId` is kPermBitmapImport carries the IMPORT bitmap of the table instead of the
 //   WRITE one; a table without such an item denies IMPORT everywhere)
 //   kPermFlagBind   session `sessionId` now uses table `nextOffset` (-1 = deny everything, -2 = its namespace is
-//                   suspended ReadOnly: deny everything, answered NamespaceSuspended); correlationId = epoch,
+//                   suspended ReadOnly: deny everything, answered NamespaceSuspended, -3 = it must change its password
+//                   first: deny everything, answered PasswordChangeRequired); correlationId = epoch,
 //                   producerId = the principal (#122);
 //   kPermFlagDrop   table `sessionId` is freed: every slot still pointing at it is reset to deny, its bits cleared.
 //   kPermFlagFence / kPermFlagSecurityBehind: no table (see below).
-// A session announced without grantAll starts denied: every produce from it is answered NotAuthorized until its bind
-// arrives (default deny).
+// A session announced without grantAll starts UNBOUND (#216): it never authenticated, so a produce from it is answered
+// AuthenticationFailed (and the session ended) until its bind arrives (default deny).
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -42,10 +43,23 @@ struct WritePermTable {
 /// suspended ReadOnly - so the worker's cold refusal answers NamespaceSuspended instead of NotAuthorized.
 [[nodiscard]] inline const WritePermTable* suspendedWriteTable() noexcept { static const WritePermTable t{}; return &t; }
 
+/// #216: the state of a session that was announced and never bound (AwaitingFirst / AwaitingFinal at the gateway - they
+/// ship no bind): denies like denyWriteTable(), but its address says WHY, so the worker answers AuthenticationFailed
+/// (44) and asks for the session's end, as the gateway does (D13), instead of the terminal NotAuthorized.  The
+/// default of a slot.
+[[nodiscard]] inline const WritePermTable* unboundWriteTable() noexcept { static const WritePermTable t{}; return &t; }
+/// #216: the session authenticated with a one-time password and must change it first (bind -3): denies, answered
+/// PasswordChangeRequired (47) like the gateway's gate, the session kept.
+[[nodiscard]] inline const WritePermTable* passwordChangeWriteTable() noexcept {
+    static const WritePermTable t{};
+    return &t;
+}
+
 struct WriteGrantSlot {
-    const WritePermTable* table    = denyWriteTable();   ///< never null
+    const WritePermTable* table    = unboundWriteTable();   ///< never null
     uint32_t              ownerTag = 0;   ///< issue #122: pidOwnerTag(the session's principal)
     uint64_t              epoch    = 0;   ///< the bind epoch this slot holds
+    bool                  unauthSignalled = false;   ///< #216: the one Unauthenticated signal of this state was sent
 };
 
 /// The hot-path check.

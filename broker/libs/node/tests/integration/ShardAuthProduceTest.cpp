@@ -63,8 +63,8 @@ TEST(ShardAuthProduceRegression, ASessionThatNeverLoggedInIsDeniedAtTheWorker) {
     const int64_t sid = rig.wire().connect(rig.ch());                     // connected, SCRAM not even started
     ASSERT_GT(sid, 0);
     const int64_t before = rig.logEnd(rig.orders);
-    EXPECT_EQ(shardProduce(rig, sid, rig.orders, /*attempts=*/3), kNotAuthorized)
-        << "default deny: an announced, unauthenticated session has an empty slot";
+    EXPECT_EQ(shardProduce(rig, sid, rig.orders, /*attempts=*/3), static_cast<int>(pc::ErrorCode::AuthenticationFailed))
+        << "default deny: an announced, unauthenticated session has an empty slot (#216: answered 44, as the gateway)";
     EXPECT_EQ(rig.logEnd(rig.orders), before) << "#278: the refused produce appended nothing";
 }
 
@@ -279,4 +279,174 @@ TEST(ShardAuthProduceRegression, AProduceToATopicNotAppliedHereIsRetriableOnTheW
     b1.append(charKey(), charValue("v"), 1000);
     EXPECT_EQ(direct(created, 1, b1.build()), 0) << "the next sequence follows: the refused produce never advanced it";
     EXPECT_EQ(rig.logEnd(created), 2);
+}
+
+// ── #216: the worker path answers what the gateway path answers ──
+namespace {
+// One produce on `channel` as `sid` over `w`'s own client (its answers come back on the session's own publication).
+int produceOn(AuthWireClient& w, const std::string& channel, int64_t sid, int32_t topic, int attempts = 3) {
+    int code = kNoAnswer;
+    for (int a = 0; a < attempts; ++a) {
+        const int64_t corr = w.raw().nextCorrelationId();
+        if (!w.raw().produce(channel, AuthRig::stream(), sid, corr, topic, 0, 1, makeCharBatch(1))) return kNoAnswer;
+        const auto ack = w.raw().awaitProduceResponseUntil(corr, AuthRig::dl(10));
+        code = ack ? ack->errorCode : kNoAnswer;
+        if (code != static_cast<int>(pc::ErrorCode::NotLeader) &&
+            code != static_cast<int>(pc::ErrorCode::UnknownTopic) && code != kNoAnswer)
+            return code;
+    }
+    return code;
+}
+}  // namespace
+
+// Issue #216 (RED before: the worker answered 45 for all three states).  Sessions in AwaitingFirst, AwaitingFinal and
+// PasswordChangeRequired produce through the worker ingress and through the gateway: the same codes (44, 44, 47), the
+// unauthenticated sessions are ended on both paths, the password-change session stays - and once its password is
+// changed it produces on the worker path.
+TEST(ShardAuthProduceRegression, WorkerPathAnswersTheSameCodesAsTheGatewayRegression) {
+    using namespace grants;
+    using SO = rune::protocol::SecurityOperation;
+    AuthRig rig("shard216", shardOptions());
+    AuthBroker& b = rig.broker();
+    AuthWireClient& w = b.wire();
+    const std::string& gw = b.channel();
+    const std::string& wk = b.workerIngressChannel();
+    // A password-change session needs a bootstrap-created user: reopen the bootstrap window (both administrators
+    // disabled), then bootstrap a one-time-password administrator.
+    b.createUser("adm2", AuthBroker::kAdminPassword, {cluster(SO::Admin)});
+    const int64_t a2 = w.connect(gw);
+    ASSERT_GT(a2, 0);
+    ASSERT_TRUE(w.login(gw, a2, "adm2", {AuthBroker::kAdminPassword, AuthBroker::kAdminPassword}).ok());
+    ASSERT_EQ(w.alterPassword(gw, a2, "admin", pc::UserChangeKind::Disable).errorCode, 0);
+    {   // adm2 disables itself: its own session is revoked with the change, so the answer may never arrive
+        pc::SecurityDdl self; self.sessionId = a2; self.kind = pc::SecurityOpKind::AlterUser; self.name = "adm2";
+        self.change = pc::UserChangeKind::Disable;
+        self.flags = pc::kSecurityDdlFlagForce;   // the last enabled administrator: FORCE reopens the bootstrap window
+        (void)w.securityDdl(gw, self, "ALTER USER adm2 DISABLE FORCE;", std::chrono::seconds(3));
+    }
+    int64_t s0 = 0;
+    bool reopened = false;
+    std::string lastDetail;
+    for (int attempt = 0; attempt < 20 && !reopened; ++attempt) {   // bounded: reopens once the view applied both
+        s0 = w.connect(gw);
+        ASSERT_GT(s0, 0);
+        const auto boot = w.bootstrap(gw, s0, b.keyContents(), "root2", AuthBroker::kBootstrapPassword);
+        reopened = boot.errorCode == 0;
+        if (!reopened) lastDetail = std::to_string(boot.errorCode) + ": " + boot.detail;
+        if (!reopened) (void)w.raw().disconnect(gw, AuthWireClient::kClientStream, s0);
+    }
+    ASSERT_TRUE(reopened) << "the bootstrap window reopened: " << lastDetail;
+    (void)w.raw().disconnect(gw, AuthWireClient::kClientStream, s0);
+    const int64_t pcr = w.connect(gw);
+    ASSERT_GT(pcr, 0);
+    const auto pl = w.login(gw, pcr, "root2", {AuthBroker::kBootstrapPassword, AuthBroker::kBootstrapPassword});
+    ASSERT_TRUE(pl.ok() && pl.mustChangePassword());
+    ASSERT_TRUE(awaitServes(rig, rig.orders));
+    // The unauthenticated sessions: one pair per path (a 44 ends the session it answers).  Created last: the end must
+    // come from the 44, not from an idle or authentication deadline.
+    const int64_t firstW = w.connect(gw), firstG = w.connect(gw), finalW = w.connect(gw), finalG = w.connect(gw);
+    ASSERT_GT(std::min({firstW, firstG, finalW, finalG}), 0);
+    for (const int64_t sid : {finalW, finalG}) {   // AwaitingFinal: the first SCRAM leg answered, the final never sent
+        const auto l = w.login(gw, sid, "root2", {AuthBroker::kBootstrapPassword, AuthBroker::kBootstrapPassword}, 0,
+                               /*sendFinal=*/false);
+        ASSERT_TRUE(l.first.has_value());
+    }
+    const int kFailed = static_cast<int>(pc::ErrorCode::AuthenticationFailed);
+    const int kPwChange = static_cast<int>(pc::ErrorCode::PasswordChangeRequired);
+    const int64_t before = rig.logEnd(rig.orders);
+
+    EXPECT_EQ(produceOn(w, wk, firstW, rig.orders), kFailed) << "AwaitingFirst, worker path";
+    EXPECT_EQ(produceOn(w, gw, firstG, rig.orders), kFailed) << "AwaitingFirst, gateway path";
+    EXPECT_EQ(produceOn(w, wk, finalW, rig.orders), kFailed) << "AwaitingFinal, worker path";
+    EXPECT_EQ(produceOn(w, gw, finalG, rig.orders), kFailed) << "AwaitingFinal, gateway path";
+    EXPECT_EQ(produceOn(w, wk, pcr, rig.orders), kPwChange) << "PasswordChangeRequired, worker path";
+    EXPECT_EQ(produceOn(w, gw, pcr, rig.orders), kPwChange) << "PasswordChangeRequired, gateway path";
+    EXPECT_EQ(rig.logEnd(rig.orders), before) << "nothing was appended";
+
+    // The same client-visible end: the unauthenticated sessions are gone on both paths, the password-change one stays.
+    for (const int64_t sid : {firstW, firstG, finalW, finalG})
+        EXPECT_TRUE(rig.awaitSessionGone(sid, std::chrono::seconds(3))) << "session " << sid << " is ended by the 44";
+    EXPECT_TRUE(b.node().gatewayHasSessionForTest(pcr)) << "the password-change session stays";
+    EXPECT_EQ(produceOn(w, wk, pcr, rig.orders), kPwChange) << "and is answered again";
+
+    // The password change lifts it: the ordinary bind replaces the password-change state on the worker.
+    ASSERT_EQ(w.alterPassword(gw, pcr, "root2", pc::UserChangeKind::SetPassword, AuthBroker::kAdminPassword).errorCode,
+              0);
+    EXPECT_EQ(produceOn(w, wk, pcr, rig.orders), 0) << "the same session, once its password is changed";
+    const int64_t again = w.connect(gw);
+    ASSERT_GT(again, 0);
+    ASSERT_TRUE(w.login(gw, again, "root2", {AuthBroker::kAdminPassword, AuthBroker::kAdminPassword}).ok());
+    EXPECT_EQ(produceOn(w, wk, again, rig.orders), 0) << "and after a re-login";
+}
+
+// Issue #216, the race to rule out: a login's OK waits until its bind reached every worker, so the first direct produce
+// after the OK is never answered 44 (the slot is still Unbound only before the bind).  The shipper is held: the OK is
+// not sent; released: OK, and the first produce is served.  Then 200 plain logins, each producing at once.
+TEST(ShardAuthProduceRegression, ALoginNeverSeesAnUnauthenticatedAnswerAfterItsOkRegression) {
+    using namespace grants;
+    using SO = rune::protocol::SecurityOperation;
+    using ST = rune::protocol::SecurityResourceType;
+    AuthRig rig("shard216race", shardOptions());
+    AuthBroker& b = rig.broker();
+    AuthWireClient& w = b.wire();
+    std::string user;
+    (void)rig.newUser({exact(SO::Write, ST::Topic, "orders")}, &user);
+    ASSERT_TRUE(awaitServes(rig, rig.orders));
+    const std::string& gw = b.channel();
+    const std::string& wk = b.workerIngressChannel();
+    for (int round = 0; round < 3; ++round) {
+        const int64_t sid = w.connect(gw);
+        ASSERT_GT(sid, 0);
+        auto l = w.login(gw, sid, user, {AuthRig::kPw, AuthRig::kPw}, 0, /*sendFinal=*/false);
+        ASSERT_TRUE(l.first.has_value()) << round;
+        b.node().holdPermissionShippingForTest(true);
+        w.finish(gw, l, user, {AuthRig::kPw, AuthRig::kPw}, std::chrono::milliseconds(300));
+        EXPECT_FALSE(l.fin.has_value()) << "round " << round << ": the OK is not sent while its bind is queued";
+        b.node().holdPermissionShippingForTest(false);
+        const auto fin = w.raw().awaitAuthFinal(l.correlationId, AuthRig::dl(10));
+        ASSERT_TRUE(fin.has_value()) << round;
+        l.fin = pc::AuthServerFinal::decode(fin->bytes.data(), fin->bytes.size());
+        ASSERT_TRUE(l.ok()) << round;
+        EXPECT_EQ(produceOn(w, wk, sid, rig.orders, 1), 0) << "round " << round << ": first direct produce served";
+    }
+    w.cacheSaltedPasswords(true);
+    for (int i = 0; i < 200; ++i) {
+        const int64_t sid = w.connect(gw);
+        ASSERT_GT(sid, 0) << i;
+        ASSERT_TRUE(w.login(gw, sid, user, {AuthRig::kPw, AuthRig::kPw}).ok()) << i;
+        const int code = produceOn(w, wk, sid, rig.orders, 1);
+        ASSERT_NE(code, static_cast<int>(pc::ErrorCode::AuthenticationFailed)) << "iteration " << i;
+        ASSERT_EQ(code, 0) << "iteration " << i;
+    }
+}
+
+// Issue #216 follow-up: a session that never authenticated, on a broker with anonymous read on, is the anonymous reader
+// as soon as its first produce reaches the gateway - on the worker path too.  The worker answers that first produce 44
+// (it held no bind: the one accepted difference), and the gateway, handling the worker's signal, turns the session
+// into the anonymous reader exactly as its own produce path does instead of ending it.  Later worker produces answer 45.
+TEST(ShardAuthProduceRegression, AnAnonymousReadersFirstWorkerProduceDoesNotEndItRegression) {
+    AuthBroker::Options o = shardOptions();
+    o.configure = [](NodeConfig& c) { c.anonymousRead = true; };
+    AuthRig rig("shard216anon", std::move(o));
+    AuthBroker& b = rig.broker();
+    AuthWireClient& w = b.wire();
+    const std::string& gw = b.channel();
+    const std::string& wk = b.workerIngressChannel();
+    ASSERT_TRUE(awaitServes(rig, rig.orders));
+    const int64_t sid = w.connect(gw);
+    ASSERT_GT(sid, 0);
+    const int64_t before = rig.logEnd(rig.orders);
+    EXPECT_EQ(produceOn(w, wk, sid, rig.orders, /*attempts=*/1), static_cast<int>(pc::ErrorCode::AuthenticationFailed))
+        << "the worker held no bind: the first produce is answered 44 (accepted difference)";
+    // The signal is handled on the gateway's control thread: drive the client until the session is the anonymous reader.
+    EXPECT_TRUE(rig.c().pollFor(std::chrono::seconds(10), [&] { return b.node().anonymousSessionsForTest() == 1; }))
+        << "the worker's signal made the session the anonymous reader";
+    EXPECT_TRUE(b.node().gatewayHasSessionForTest(sid)) << "an anonymous reader is not ended";
+    const auto md = w.raw().metadata(gw, AuthWireClient::kClientStream, sid);
+    EXPECT_FALSE(md.empty()) << "the session still reads (Describe on `default`)";
+    EXPECT_EQ(produceOn(w, wk, sid, rig.orders, /*attempts=*/1), kNotAuthorized)
+        << "its next worker produce is NotAuthorized, as on the gateway path";
+    EXPECT_TRUE(b.node().gatewayHasSessionForTest(sid)) << "and the session stays";
+    EXPECT_EQ(b.node().anonymousSessionsForTest(), 1u);
+    EXPECT_EQ(rig.logEnd(rig.orders), before) << "nothing was appended";
 }

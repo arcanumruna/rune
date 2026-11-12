@@ -437,6 +437,18 @@ zero allocation); tables are owned by the thread that owns the session and updat
 | This broker's `__security` state is not current (catching up, stale) | logins, `__security` reads and security DDL `AuthUnavailable`; retriable, try another broker. Stale longer than R: a session-level `AuthUnavailable` ends the authenticated sessions | 48, see `#serving` |
 | This broker holds committed `__security` events it has not applied yet (behind) | every grant-checked request `AuthUnavailable`, nothing appended or pushed; retriable, served again once applied | 48, see `#serving` |
 
+A produce sent straight to a shard worker's ingress gets the same answer as one sent through the gateway (#216): a
+session that has not authenticated (it never started or never finished its login) is answered `AuthenticationFailed`
+and its session ends, and a session that must change its one-time password is answered `PasswordChangeRequired` and
+stays. The worker holds the session's state as a bind it received from the gateway (never bound, bound to nothing,
+bound to the password-change state, or bound to a table), so a client sees the same code and the same session end
+whether the broker runs shard workers or not. The retriable `AuthUnavailable` and `NotLeader` answers of the lag
+levels keep their precedence. Anonymous readers (when enabled) are bound to nothing and answered `NotAuthorized` on
+both paths. One difference remains: a session that never authenticated and whose first request is a produce straight to
+a worker (anonymous read on) is answered `AuthenticationFailed` once, because the worker holds no bind for it yet; the
+gateway, handling the worker's signal, makes it the anonymous reader as its own produce path does and does not end it,
+and its later worker produces are answered `NotAuthorized`.
+
 ### `#halted`: the `__security` apply halted (D28)
 
 Each broker applies `__security` in offset order and checks every event's fingerprint, like the

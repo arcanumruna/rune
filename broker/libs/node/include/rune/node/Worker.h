@@ -944,6 +944,12 @@ public:
     [[nodiscard]] uint64_t workerDeniesUnappliedForTest() const noexcept { return workerDeniesUnapplied_; }
     [[nodiscard]] int32_t appliedTopicFrontierForTest() const noexcept { return appliedTopicFrontier_; }
     [[nodiscard]] bool permissionStagingForTest() const noexcept { return permStager_.staging(); }
+    /// #216 probes: produces answered AuthenticationFailed / PasswordChangeRequired; Unauthenticated signals sent.
+    [[nodiscard]] uint64_t workerUnauthenticatedForTest() const noexcept { return workerUnauthenticated_; }
+    [[nodiscard]] uint64_t unauthSignalsForTest() const noexcept { return unauthSignals_; }
+    [[nodiscard]] uint64_t workerPasswordChangeRefusalsForTest() const noexcept {
+        return workerPasswordChangeRefusals_;
+    }
     [[nodiscard]] uint64_t permissionResetsForTest() const noexcept { return permissionResets_; }
     [[nodiscard]] uint64_t topicFrontierRejectedForTest() const noexcept { return topicFrontierRejected_; }
     [[nodiscard]] uint64_t securityBehindOpsSeenForTest() const noexcept { return securityBehindOpsSeen_; }
@@ -11026,6 +11032,47 @@ private:
         return 1;
     }
 
+    /// #216: a direct-ingress produce of a session that never authenticated: ProduceResponse{AuthenticationFailed}
+    /// (consumed, never appended) and, once per state, the Unauthenticated signal - the gateway ends the session as it
+    /// does for the same request on its own path (D13).
+    [[gnu::cold]] [[gnu::noinline]] int refuseUnauthenticated_(const rune::protocol::client::Produce& msg,
+                                                               uint8_t directAck) {
+        if (workerUnauthenticated_++ % 1024 == 0)
+            spdlog::warn("Worker {}: WorkerIngress: produce refused AuthenticationFailed - the session never "
+                         "authenticated (session={}, topic={}); total {}", workerId_, msg.sessionId, msg.topicId,
+                         workerUnauthenticated_);
+        WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, msg.sessionId, msg.correlationId,
+                                          msg.topicId, msg.partition);
+        ret.directAck = directAck;
+        ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed);
+        enqueueReturn_(ret);
+        if (ackSink_ && ackSink_->markUnauthSignalled(msg.sessionId)) {
+            WorkerReturn sig;
+            sig.type       = WorkerReturn::Type::SessionSignal;
+            sig.sessionId  = msg.sessionId;
+            sig.partition  = workerId_;
+            sig.lastOffset = static_cast<int64_t>(SessionSignalKind::Unauthenticated);
+            ++unauthSignals_;
+            enqueueSignal_(sig);
+        }
+        return 1;
+    }
+    /// #216: a direct-ingress produce of a session that must change its password:
+    /// ProduceResponse{PasswordChangeRequired} (consumed, never appended); the session stays.
+    [[gnu::cold]] [[gnu::noinline]] int refusePasswordChange_(const rune::protocol::client::Produce& msg,
+                                                              uint8_t directAck) {
+        ++workerPasswordChangeRefusals_;
+        WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, msg.sessionId, msg.correlationId,
+                                          msg.topicId, msg.partition);
+        ret.directAck = directAck;
+        ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::PasswordChangeRequired);
+        enqueueReturn_(ret);
+        return 1;
+    }
+    uint64_t workerUnauthenticated_        = 0;   ///< #216: produces answered AuthenticationFailed
+    uint64_t unauthSignals_                = 0;   ///< #216: Unauthenticated signals sent (one per session state)
+    uint64_t workerPasswordChangeRefusals_ = 0;   ///< #216: produces answered PasswordChangeRequired
+
     /// Namespaces Phase 2 (D21): the session's namespace is suspended ReadOnly (the gateway bound it to
     /// suspendedWriteTable()): ProduceResponse{NamespaceSuspended} - InvalidRequest for a client older than 14, as the
     /// gateway path answers - consumed, never appended.
@@ -11262,6 +11309,13 @@ private:
                     ++workerDeniesDeferred_;
                     return refuseSecurityBehind_(msg, directAck);
                 }
+                // #216: the same answers as the gateway's auth gate (D13): a session that never authenticated (no bind:
+                // the slot is Unbound) hears AuthenticationFailed and its end is requested; one that must change its
+                // password hears PasswordChangeRequired and stays.  A session this worker has no slot for keeps 45.
+                if (grants != nullptr && grants->table == unboundWriteTable()) [[unlikely]]
+                    return refuseUnauthenticated_(msg, directAck);
+                if (grants != nullptr && grants->table == passwordChangeWriteTable()) [[unlikely]]
+                    return refusePasswordChange_(msg, directAck);
                 return refuseNotAuthorized_(msg, directAck);
             }
             // Issue #122: a producer id is honoured only for the principal it was issued to (its owner tag; the

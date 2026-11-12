@@ -364,7 +364,7 @@ public:
         if (idx == kNone) return false;                                   // table full
         // Issue #198: only a NEW session seeds its grants.  A session is accepted (and so bound) only after its first
         // announce wave reached every worker, and a re-announce (the key wave) of a known one never resets them.
-        if (fresh) grants_[idx].table = grantAll ? allowAllWriteTable() : denyWriteTable();
+        if (fresh) grants_[idx].table = grantAll ? allowAllWriteTable() : unboundWriteTable();   // #216: not yet bound
         clientVersion_[idx] = clientVersion;
         boundImage_[idx] = 0;                                              // Task 6: a plain announce is never response-mode
         PubState& st = states_[idx];
@@ -405,7 +405,7 @@ public:
         const bool fresh = (idx == kNone);
         if (fresh) idx = insert_(sessionId);
         if (idx == kNone) return false;                                   // table full
-        if (fresh) grants_[idx].table = grantAll ? allowAllWriteTable() : denyWriteTable();
+        if (fresh) grants_[idx].table = grantAll ? allowAllWriteTable() : unboundWriteTable();   // #216: not yet bound
         clientVersion_[idx] = clientVersion;
         PubState& st = states_[idx];
         if (!fresh) {
@@ -1012,8 +1012,10 @@ public:
         if (idx == kNone || tableId >= static_cast<int64_t>(kMaxWritePermTables)) return false;
         WriteGrantSlot& g = grants_[idx];
         g.table    = tableId == -2 ? suspendedWriteTable()
+                   : tableId == -3 ? passwordChangeWriteTable()   // #216
                    : tableId < 0   ? denyWriteTable()
                                    : &permTables_[static_cast<std::size_t>(tableId)];
+        g.unauthSignalled = false;   // #216: a new state: its own (one) signal
         g.epoch    = epoch;
         g.ownerTag = rune::protocol::pidOwnerTag(owner);
         return true;
@@ -1040,7 +1042,18 @@ public:
             t.importBits.clear();
             t.grantAll = false;
         }
-        for (std::size_t i = 0; i < kMaxSessions; ++i) resetGrants_(grants_[i]);
+        for (std::size_t i = 0; i < kMaxSessions; ++i) {   // denied, not unbound: the snapshot rebinds the live ones
+            grants_[i].table = denyWriteTable(); grants_[i].epoch = 0; grants_[i].ownerTag = 0;
+            grants_[i].unauthSignalled = false;
+        }
+    }
+    /// #216: the first call after a state change returns true (the caller sends the one Unauthenticated signal); later
+    /// calls for the same state return false.  False also for an unknown session.
+    bool markUnauthSignalled(int64_t sessionId) noexcept {
+        const std::size_t idx = find_(sessionId);
+        if (idx == kNone || grants_[idx].unauthSignalled) return false;
+        grants_[idx].unauthSignalled = true;
+        return true;
     }
     /// Test seam: slots examined by the last find_ of `sessionId` (probe chain length).
     [[nodiscard]] std::size_t probeChainForTest(int64_t sessionId) const noexcept {
@@ -1087,7 +1100,9 @@ private:
         if (n != 0) std::memcpy(bits.data() + first, words, n * 8);   // little-endian hosts only
         return true;
     }
-    static void resetGrants_(WriteGrantSlot& g) noexcept { g.table = denyWriteTable(); g.epoch = 0; g.ownerTag = 0; }
+    static void resetGrants_(WriteGrantSlot& g) noexcept {
+        g.table = unboundWriteTable(); g.epoch = 0; g.ownerTag = 0; g.unauthSignalled = false;
+    }
     std::size_t insert_(int64_t sid) noexcept {
         if (count_ == kMaxSessions - 1) return kNone;               // one empty slot ends every probe
         std::size_t i = hash_(sid);

@@ -66,6 +66,13 @@ enum class SessionSignalKind : int64_t {
     /// `rune-log-segment-repair-failures`, 2 no peer could serve `rune-log-segment-repair-no-peer`), ::baseOffset = the
     /// worker's cumulative count, ::partition = the worker.  Sent when a count changed; a refused one is retried.
     SegmentRepair = 16,
+    /// #216: the worker answered a direct-ingress produce of a session that never authenticated (it holds no binding:
+    /// AwaitingFirst / AwaitingFinal at the gateway) AuthenticationFailed, and asks the runtime to end the session as
+    /// the gateway does for the same request (D13): WorkerReturn::sessionId = the session, ::partition = the worker.
+    /// At most one per session until a bind changes its state.  The gateway decides from ITS state: a session that is
+    /// no longer unauthenticated is left alone, and one that becomes the anonymous reader (anonymous read on, first
+    /// request) is not ended.
+    Unauthenticated = 17,
 };
 
 } // namespace rune::node
