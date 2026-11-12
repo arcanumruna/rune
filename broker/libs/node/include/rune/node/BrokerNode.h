@@ -2920,10 +2920,15 @@ private:
     /// TEST-ONLY seam (control thread): hold this broker's catalog-halt broadcast
     /// (forces the placement race of fix round 2: a create placed on a broker that
     /// halts on it before any member knows).
-    bool holdHaltReportForTest_ = false;
+    bool holdCatalogHaltReportForTest_ = false;
+    /// TEST-ONLY seam (control thread): hold this broker's `__security`-halt broadcast (kNodeSecurityHalted).
+    bool holdSecurityHaltReportForTest_ = false;
 public:
     void holdCatalogHaltReportForTest(bool on) {
-        onControlThreadForTest([this, on] { holdHaltReportForTest_ = on; return 0; });
+        onControlThreadForTest([this, on] { holdCatalogHaltReportForTest_ = on; return 0; });
+    }
+    void holdSecurityHaltReportForTest(bool on) {
+        onControlThreadForTest([this, on] { holdSecurityHaltReportForTest_ = on; return 0; });
     }
 private:
     /// When resignIfHalted_ first saw this broker leading while halted (-1 = not yet; control thread).

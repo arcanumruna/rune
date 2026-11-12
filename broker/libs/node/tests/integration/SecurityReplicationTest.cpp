@@ -475,3 +475,31 @@ TEST(SecurityReplicationRegression, AHaltedSecurityLeaderIsSteeredOffRegression)
     ASSERT_TRUE(internal.has_value());
     EXPECT_EQ(internal->code, static_cast<int16_t>(pc::ErrorCode::Internal)) << internal->message;
 }
+
+// #286: one test seam used to hold both the catalog and the security halt report.  Holding the CATALOG report
+// must leave the security report alone: the halted `__security` leader is still steered off.
+TEST(BrokerNodeRegression, HoldingTheCatalogHaltReportDoesNotHoldTheSecurityReportRegression) {
+    ThreeNodes c = ThreeNodes::start("sec_halt_hold");
+    ASSERT_TRUE(awaitSecurityLeader(c, 30s));
+    const int32_t halted = settledSecurityLeader(c);
+    ASSERT_GT(halted, 0);
+    BrokerNode& hn = c.node(halted);
+    hn.holdCatalogHaltReportForTest(true);   // before the halt: only the catalog report is held
+    hn.onAdminThreadForTest([&hn]() {
+        hn.adminWorkerAgentForTest()->worker().securityApplierForTest()->tamperNextFingerprintForTest();
+        return 0;
+    });
+    GoldenAppender g;
+    ASSERT_GE(g.appendNext(c), 0) << "one valid event, committed by the healthy majority";
+    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    while (!hn.securityViewForTest().halted && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(20ms);
+    ASSERT_TRUE(hn.securityViewForTest().halted) << "the damaged leader's mirror halted";
+    int32_t now = halted;
+    for (int i = 0; i < 1200 && now == halted; ++i) {   // hard cap: 60 s
+        now = settledSecurityLeader(c);
+        if (now <= 0 || now == halted) { now = halted; std::this_thread::sleep_for(50ms); }
+    }
+    EXPECT_NE(now, halted) << "the security halt report was held by the catalog seam: the leader was never steered off";
+    hn.holdCatalogHaltReportForTest(false);
+}

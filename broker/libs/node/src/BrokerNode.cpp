@@ -5917,13 +5917,14 @@ int BrokerNode::resignIfHalted_(bool consensusLeader) {
     int work = 0;
     // Authentication review C: a halted `__security` applier is reported to every member (a latched node-control
     // mark): the controller steers the (-7, 0) leadership to a healthy broker.
-    if (securityHaltedValue_ != 0 && runtimeAgent_ && !holdHaltReportForTest_)
+    if (securityHaltedValue_ != 0 && runtimeAgent_ && !holdSecurityHaltReportForTest_)
         work += runtimeAgent_->controlledShutdown().reportSecurityHalted();
     if (catalogHaltedValue_ == 0) [[likely]] return work;
     // Fix round 0 (ruling 2): every member — the controller first — learns this
     // process is halted (a latched mark on the node-control register): it is
     // never a placement target again.
-    if (runtimeAgent_ && !holdHaltReportForTest_) work += runtimeAgent_->controlledShutdown().reportCatalogHalted();
+    if (runtimeAgent_ && !holdCatalogHaltReportForTest_)
+        work += runtimeAgent_->controlledShutdown().reportCatalogHalted();
     if (!consensusLeader || !election_ || !metadataService_ || config_.isSingleNode()) return work;
     // Fix round 0 (ruling 1): hand the controllership to a healthy peer ONLY while
     // one is live — never leave the cluster without a controller.  With every
