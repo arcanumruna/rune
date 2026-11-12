@@ -815,6 +815,11 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
                 target_link_libraries(filter_probe PRIVATE ${UUID_LIB_FILTER_PROBE})
             endif()
         endif()
+        if(BUILD_TESTING)
+            # The probe's own records against the broker's validator (a v2 record without the variable-length section failed the e2e's ALTER leg).
+            add_test(NAME FilterProbeSelfCheckRegression COMMAND ${CMAKE_COMMAND} -E env RUNE_MODE=selfcheck $<TARGET_FILE:filter_probe>)
+            set_tests_properties(FilterProbeSelfCheckRegression PROPERTIES PASS_REGULAR_EXPRESSION "FILTER-SELFCHECK: OK" TIMEOUT 20)
+        endif()
     endif()
 
     # ── Checked writes Part 05 — key index probe (broker/docker/checked-writes-e2e.sh) ──
@@ -867,7 +872,7 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
     # the 0b schema-probe above (build-time codegen from a checked-in blob), this
     # probe's header comes from `rune schema generate` at RUNTIME.  The e2e script
     # (docker/rune-ql-e2e.sh) runs, inside the client container:
-    #     rune console -f   tests/e2e/characters.rql --broker <node> --validate
+    #     rune console -f   tests/e2e/characters.rql --broker <node>
     #     rune schema generate characters --out ${RUNE_GEN_DIR} --broker <node>
     #     cmake --build . --target rune_ql_probe    (compiles THIS against the header)
     #     ./rune_ql_probe

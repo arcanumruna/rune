@@ -34,6 +34,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -75,9 +76,12 @@ struct GateGateway {
     int32_t ingressStream = 0;
     int32_t egressStream  = 0;
 
+    // onFrame runs on the pump thread: a test that changes the reply fields after the pump started holds `mu`.
+    std::mutex mu;
+
     bool replyConnectOK      = true;
     bool replyGetTopicSchema = true;
-    int  getTopicSchemaSeen  = 0;   // GetTopicSchema requests that reached the gateway (a skipped probe sends none)
+    std::atomic<int> getTopicSchemaSeen{0};   // GetTopicSchema requests that reached the gateway (a skipped probe sends none)
     int  getTopicSchemaAnswers = -1;   // answer only this many GetTopicSchema requests (-1 = all)
     std::vector<bool> defineValidate;   // the validate byte of every DefineTopic that reached the gateway
 
@@ -188,6 +192,7 @@ struct GateGateway {
         case rcc::TemplateId::GetTopicSchema: {
             auto opt = rpc::GetTopicSchema::decode(buf, len);
             if (opt) ++getTopicSchemaSeen;
+            std::unique_lock lk(mu);
             if (!opt || !replyGetTopicSchema) break;
             if (getTopicSchemaAnswers >= 0 && getTopicSchemaSeen > getTopicSchemaAnswers) break;
 
@@ -233,8 +238,10 @@ struct GateGateway {
 
             std::vector<uint8_t> scratch(resp.encodedSize() + 32u);
             const std::size_t n = resp.encode(scratch.data());
+            const bool omitCount = omitPartitionCount;
+            lk.unlock();
             // A pre-2b broker's frame stops after the descriptor blob.
-            if (n > 0) sendFrame(scratch.data(), omitPartitionCount ? n - 4u : n);
+            if (n > 0) sendFrame(scratch.data(), omitCount ? n - 4u : n);
             break;
         }
 
@@ -663,8 +670,11 @@ TEST(OpenTopicGateRegression, AnUnknownFingerprintOfAnExistingTopicIsStillStaleR
     rune::client::Producer shared = h.client->producer();
     const std::string borrowed = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("characters", shared); });
     EXPECT_NE(borrowed.find("stale"), std::string::npos) << borrowed;
-    h.gw->getErrorCode = 7;
-    h.gw->getBlob      = {};
+    {
+        std::lock_guard lk(h.gw->mu);
+        h.gw->getErrorCode = 7;
+        h.gw->getBlob      = {};
+    }
     const std::string missing = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("nope", shared); });
     EXPECT_NE(missing.find("does not exist"), std::string::npos) << missing;
     EXPECT_EQ(missing.find("stale"), std::string::npos) << missing;
@@ -714,7 +724,10 @@ TEST(OpenTopicGateRegression, OpenFailureWithNoBudgetLeftSkipsTheProbeAdversaria
         EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
     }
     EXPECT_EQ(h.gw->getTopicSchemaSeen, before) << "no probe without budget";
-    h.gw->unknownFingerprintErrorCode = 7;
+    {
+        std::lock_guard lk(h.gw->mu);
+        h.gw->unknownFingerprintErrorCode = 7;
+    }
     EXPECT_NE(openFailureText(*h.client, "characters", 7, 5s).find("stale"), std::string::npos);
     EXPECT_EQ(h.gw->getTopicSchemaSeen, before + 2) << "the kind probe, then the caller's fingerprint again";
 }
@@ -758,14 +771,23 @@ TEST(OpenTopicGateRegression, OpenFailureProbeRefusalAndOtherCodesAreNamedAdvers
     h.build();
     h.connectAndWait();
     GateGatewayPump pump(*h.gw);
-    h.gw->getErrorCode = 45;
+    {
+        std::lock_guard lk(h.gw->mu);
+        h.gw->getErrorCode = 45;
+    }
     std::string msg = openFailureText(*h.client, "characters", 7, 5s);
     EXPECT_NE(msg.find("(error 45 NotAuthorized)"), std::string::npos) << msg;
     EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
-    h.gw->getErrorCode = 0x7FFF;
+    {
+        std::lock_guard lk(h.gw->mu);
+        h.gw->getErrorCode = 0x7FFF;
+    }
     msg = openFailureText(*h.client, "characters", 7, 5s);
     EXPECT_NE(msg.find("(error 32767)"), std::string::npos) << msg;
-    h.gw->getErrorCode = 0;   // a probe WOULD be served: only skipping it gives the plain code
+    {
+        std::lock_guard lk(h.gw->mu);
+        h.gw->getErrorCode = 0;   // a probe WOULD be served: only skipping it gives the plain code
+    }
     const int before = h.gw->getTopicSchemaSeen;
     for (const uint16_t code : {uint16_t{1}, uint16_t{6}, uint16_t{8}, uint16_t{46}, uint16_t{0xFFFF}}) {
         msg = openFailureText(*h.client, "characters", code, 5s);
@@ -1128,7 +1150,10 @@ TEST(OpenTopicGateRegression, LineageProbeRefusedNamesTheProbeCodeAdversarialReg
     GateGatewayPump pump(*h.gw);
     const std::map<uint16_t, std::string> names{{45, "NotAuthorized"}, {1, "ProtocolVersion"}, {0x7FFF, "UnknownErrorCode"}};
     for (const uint16_t probeCode : {uint16_t{45}, uint16_t{1}, uint16_t{0x7FFF}}) {
-        h.gw->getErrorCode = probeCode;
+        {
+            std::lock_guard lk(h.gw->mu);
+            h.gw->getErrorCode = probeCode;
+        }
         const std::string msg = h.client->lineageFailure("t", 7, 5s);
         EXPECT_NE(msg.find("(" + names.at(probeCode) + " " + std::to_string(probeCode) + ")"), std::string::npos) << probeCode << ": " << msg;
         EXPECT_EQ(msg.find("does not exist"), std::string::npos) << probeCode << ": " << msg;

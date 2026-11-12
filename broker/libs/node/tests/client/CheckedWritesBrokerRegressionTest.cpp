@@ -32,7 +32,7 @@ namespace {
 
 /// Starts the media driver of a broker's clients while the broker itself starts.
 struct ClientDriverStart {
-    std::future<std::unique_ptr<SharedClientDriver>> started = std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
+    std::future<std::unique_ptr<SharedClientDriver>> started = SharedClientDriver::startAsync();
 };
 
 /// A OneBroker whose clients share one media driver (a client otherwise starts one of its own, 100-180 ms) and whose runtime client's
@@ -72,7 +72,7 @@ struct Cluster : rune::node::test::catalog_cluster::ThreeNodes {
 };
 
 Cluster startCluster(const std::string& tag) {
-    auto driver = std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
+    auto driver = SharedClientDriver::startAsync();
     auto nodes  = rune::node::test::catalog_cluster::ThreeNodes::startWith(tag, cwb::fastFailover);
     return Cluster(std::move(nodes), driver.get());
 }
@@ -2645,7 +2645,7 @@ TEST(CheckedWritesBrokerRegression, ModuloRoutingIsTheSameOnEveryPathShardRegres
 }
 
 TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
-    auto driverStart = std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
+    auto driverStart = SharedClientDriver::startAsync();
     AuthBroker b("ai-import", {.shard = true, .configure = [](NodeConfig& cfg) { cfg.testAeronClientIdleSleepMs = 1; }, .wireIdleSleepMs = 1});
     const auto driver = driverStart.get();
     b.bootstrapAdmin();

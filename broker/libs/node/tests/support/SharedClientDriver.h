@@ -3,9 +3,12 @@
 // embedded driver of its own (100-180 ms, three 128 MiB command queues zeroed).  Never a broker's node driver: crash() would kill it.
 #include <rune/client/Client.h>
 #include <rune/node/EmbeddedDriver.h>
+#include <spdlog/spdlog.h>
 #include <unistd.h>
 #include <atomic>
 #include <filesystem>
+#include <future>
+#include <memory>
 #include <string>
 
 namespace rune::node::test {
@@ -17,6 +20,14 @@ public:
           driver_(config_(scratch_.dir / "aeron"), DriverMode::Threaded) {}
     SharedClientDriver(const SharedClientDriver&)            = delete;
     SharedClientDriver& operator=(const SharedClientDriver&) = delete;
+
+    /// Starts a driver on another thread, so a test's broker starts meanwhile.  The spdlog registry and its default logger are
+    /// created here first: the driver thread would otherwise be the first to log, and the test thread would use that logger
+    /// with no ordering TSan can see (spdlog is a compiled library, its static-init guard is invisible to TSan).
+    [[nodiscard]] static std::future<std::unique_ptr<SharedClientDriver>> startAsync() {
+        spdlog::default_logger_raw();
+        return std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
+    }
 
     /// The aeron dir to hand `--cli-aeron-dir`, so a `rune::cli::run` attaches to this driver as well.
     [[nodiscard]] const std::string& dir() const { return driver_.dir(); }

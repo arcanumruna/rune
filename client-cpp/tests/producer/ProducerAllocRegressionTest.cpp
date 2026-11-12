@@ -352,8 +352,6 @@ struct TxnAllocRig {
     std::unique_ptr<rc::Client>  client = std::make_unique<rc::Client>(txnAllocClientCfg());
     rc::Completions              cq{*client, txnAllocCqCfg()};
     ProducerImpl*                impl;
-    rc::Producer                 p;
-    rc::TypedTopic<rune::gen::Position, rc::ProducerRef> typed;
     rp::ProducerHub              hub;
     ProducerImpl::SendFn         sink;
     std::array<Req, 64>          reqs{};
@@ -365,6 +363,11 @@ struct TxnAllocRig {
     int64_t                      cqRecords = 0, offsetsOk = 0, commitsOk = 0, opFailures = 0, recordFailures = 0;
     int64_t                      handlerAcks = 0;
     rc::Token                    token = 0;
+    // Destroyed after p: p's release can still deliver pending completions through g_txnCq.
+    struct ClearTxnCq { ~ClearTxnCq() { g_txnCq = nullptr; } } clearTxnCq;
+    // Last: its release completes pending records into the counters above.
+    rc::Producer                 p;
+    rc::TypedTopic<rune::gen::Position, rc::ProducerRef> typed;
 
     static constexpr rc::TopicHandle kTopic{3, 4};
 
@@ -393,7 +396,6 @@ struct TxnAllocRig {
     }
     ~TxnAllocRig() {
         hub.remove(impl);
-        g_txnCq = nullptr;
     }
     static void wire(ProducerImpl* i, rc::Client* c) {
         ProducerImpl::Hooks h;

@@ -254,7 +254,7 @@ TEST(CheckedWritesQlBrokerRegression, RegressorsPathOutcomesThreeNodesRegression
     ASSERT_EQ(statements.size(), 7u);
 
     // The runs of `rune ql` share one media driver (an embedded one per run costs 40-75 ms of it here), started while the cluster does.
-    auto driverStart = std::async(std::launch::async, [] { return std::make_unique<SharedClientDriver>(); });
+    auto driverStart = SharedClientDriver::startAsync();
     ThreeNodes c = startCluster("cw09_ql");
     const auto driver = driverStart.get();
     ASSERT_TRUE(c.awaitCatalogLeader(30s));

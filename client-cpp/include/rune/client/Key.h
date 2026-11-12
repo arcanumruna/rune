@@ -62,7 +62,7 @@ public:
             return;
         }
         len_ = static_cast<uint8_t>(bytes.size());
-        std::memcpy(buf_.data(), bytes.data(), len_);
+        if (len_ != 0) std::memcpy(buf_.data(), bytes.data(), len_);  // an empty span may have a null data()
     }
 
     /// The record key of a string(`fieldWidth`) key field holding `value` (at most `fieldWidth` bytes): for a field up to
@@ -75,7 +75,8 @@ public:
             return Key(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), len));
         }
         std::array<uint8_t, kMaxInline> field{};
-        std::memcpy(field.data(), value.data(), value.size() < fieldWidth ? value.size() : fieldWidth);
+        const std::size_t n = value.size() < fieldWidth ? value.size() : fieldWidth;
+        if (n != 0) std::memcpy(field.data(), value.data(), n);  // an empty view may have a null data()
         return Key(std::span<const uint8_t>(field.data(), fieldWidth));
     }
 

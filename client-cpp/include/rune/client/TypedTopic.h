@@ -377,7 +377,7 @@ public:
         }
         K field{};  // zero padded; the field keeps at most N bytes
         const std::size_t fieldBytes = keyValue.size() < N ? keyValue.size() : N;
-        std::memcpy(field.data(), keyValue.data(), fieldBytes);
+        if (fieldBytes != 0) std::memcpy(field.data(), keyValue.data(), fieldBytes);  // an empty view may have a null data()
         const Key recordKey = Key::forStringField(keyValue, N);
         return TypedClaim<E>(
             detail::ClaimInPlace{},
