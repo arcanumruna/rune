@@ -708,9 +708,10 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
     e.timestampMs = wallClockMs();
     // Issue #121: the last-admin guard.  Removing the last ENABLED user that effectively holds ADMIN ON CLUSTER (a
     // DISABLE, a DROP USER, a REVOKE of ADMIN or of the role carrying it, a DROP ROLE ...) reopens the bootstrap window:
-    // only the cluster-key holder can then manage security.  Refused unless the statement says FORCE.  Decided on the
-    // event itself - the same frozen rules every broker applies, dry-run on a copy of the state (cold: DDL rate) - so
-    // every path that can remove the last admin is covered, not a list of statement kinds.
+    // only the cluster-key holder can then manage security.  Refused unless the statement says FORCE.  Only the event
+    // kinds that can remove an admin (canRemoveAnAdmin) pay for the check; those are decided on the event itself - the
+    // same frozen rules every broker applies - by a dry run on cloneWithoutRequests() (a copy of the state without
+    // its request dedupe table; cold: DDL rate), so every path that can remove the last admin is covered.
     const bool dryRun = m.force == 0 && state.hasSecurityAdmin() && canRemoveAnAdmin(e);
     if (dryRun) ++lastAdminDryRuns_;
     if (dryRun && removesLastSecurityAdmin(state, e)) {

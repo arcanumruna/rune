@@ -19,7 +19,8 @@
 // eviction of the OLDEST entry of the probe window when it is full; the known-pair table is 512 buckets of kProbe
 // slots chosen by the USER alone, so one user's successes (from any number of hosts) can only evict entries in that
 // user's own bucket - residual, accepted: two users whose secret-keyed hashes share a bucket still compete) - check /
-// onFailure / onSuccess never allocate and never refuse.  An entry is occupied iff it holds at least one failure (a known-pair entry: a success).  Keys are
+// onFailure / onSuccess never allocate and never refuse.  An entry is occupied iff it holds at least one failure (a
+// known-pair entry: a success).  Keys are
 // stored as a 128-bit hash: two SipHash-2-4 of the key under two halves of a random per-process 256-bit key (issue
 // #131), so an attacker can neither predict a name's slot (grind names into one probe window to evict its own
 // entries) nor find a collision.

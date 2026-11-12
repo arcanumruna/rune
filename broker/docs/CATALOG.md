@@ -188,8 +188,11 @@ Every DDL is answered. No request is silently dropped.
 A DDL carries a 128-bit request id that stays the same across every resend. The leader answers a
 retry of a DDL that already applied with the original result, and answers `InvalidRequest` if the
 same id arrives with a different statement.
-A request id is never reusable across principals: the leader's request fingerprint includes the authenticated
-principal (issue #221), so another principal that sends a recorded id learns nothing of the recorded result.
+A request id recorded by one principal is not a retry for another: a different principal that sends it is
+answered `requestId reused for a different statement` (or its own denial, if it may not run the statement) and
+never the recorded result. Whether an id is recorded is therefore visible to a principal that guesses it; ids are
+a random 64-bit client instance id plus a counter. The leader's request fingerprint includes the authenticated
+principal (issue #221).
 Requests of an authenticated principal recorded before the upgrade no longer dedupe: a retry that spans the
 upgrade is answered `requestId reused for a different statement` although the statement applied. Requests made
 with authentication off (an empty principal) are unaffected.
