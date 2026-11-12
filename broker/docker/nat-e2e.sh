@@ -346,10 +346,10 @@ rune_auth_prepare "${PRIV_NET}" "rune-1:${BROKER_PORT}" || fail "bootstrap / e2e
 step "5 DDL"
 ddl_ok=0
 for attempt in 1 2 3 4 5; do
-    if docker exec "${CLIENT_A}" timeout "${OP_TIMEOUT_S}" rune ql -f /topics/nat-e2e.rql --broker "rune-2:${BROKER_PORT}"; then ddl_ok=1; break; fi
+    if docker exec "${CLIENT_A}" timeout "${OP_TIMEOUT_S}" rune ql -f /topics/nat-e2e.rql --broker "rune-1:${BROKER_PORT}"; then ddl_ok=1; break; fi
     log "nat-e2e.rql attempt ${attempt} failed; retrying"; sleep 3
 done
-[ "${ddl_ok}" = "1" ] || fail "nat-e2e.rql through rune-2 from ${CLIENT_A} failed"
+[ "${ddl_ok}" = "1" ] || fail "nat-e2e.rql through rune-1 from ${CLIENT_A} failed"
 
 # ---------------------------------------------------------------------------
 # Step 6: produce + consume, two clients behind ONE NAT, concurrently.
