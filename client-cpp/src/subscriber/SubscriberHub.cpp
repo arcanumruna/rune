@@ -563,10 +563,15 @@ bool SubscriberHub::pause_(SubscriptionImpl& impl, int64_t resumeAt, int64_t uns
             ait = activeById_.find(impl.subscriptionId);
             if (ait != activeById_.end() && ait->second == &impl) {
                 bound = true;
-                impl.unsubCorrId    = unsubCorrId;
+                const int64_t prevCorr = impl.unsubCorrId, prevSid = impl.unsubSessionId;
+                impl.unsubCorrId    = unsubCorrId;   // trySendUnsubscribe_ reads the two from the impl
                 impl.unsubSessionId = homeSidOf_(impl, sessionId);   // a moved one's own node session
                 if (trySendUnsubscribe_(impl, submitFn) == detail::SendResult::Retry) {
-                    if (owedCount_ == owed_.size()) return false;    // no room to owe it: refuse, change nothing
+                    if (owedCount_ == owed_.size()) {   // no room to owe it: refuse, change nothing
+                        impl.unsubCorrId    = prevCorr;
+                        impl.unsubSessionId = prevSid;
+                        return false;
+                    }
                     owed_[owedCount_++] = OwedRelease{impl.subscriptionId, impl.unsubSessionId, impl.unsubCorrId, impl.homeSession};
                 }
             }
@@ -586,7 +591,9 @@ bool SubscriberHub::pause_(SubscriptionImpl& impl, int64_t resumeAt, int64_t uns
     }
     impl.paused            = true;
     impl.pausedOnce        = true;
-    impl.pauseAfterCurrent = resumeAt < 0 && &impl == dispatchingNow;   // the record being handled counts as delivered
+    // Only inside a record handler (deliveringOffset >= nextOffset: the record being handled is not yet counted) - not in the
+    // catalog epoch / caught-up callback, where no record is in hand.
+    impl.pauseAfterCurrent = resumeAt < 0 && &impl == dispatchingNow && impl.deliveringOffset >= impl.nextOffset;
     if (&impl == dispatchingNow) impl.stopDispatch = true;               // the dispatch loop stops, even if resume() follows
 
     if (bound) {
@@ -833,6 +840,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
                                      "(caught; the duty cycle continues)\n");
             }
             dispatching_ = nullptr;
+            impl.stopDispatch = false;   // a pause() in the callback has no record loop to stop
             if (!impl.active) {   // finished from inside the callback (as for a record handler)
                 closeStatus_(impl);
                 if (!impl.unsubPending) eraseActive_(rv.subscriptionId, impl);

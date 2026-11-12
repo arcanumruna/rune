@@ -6,9 +6,10 @@
 //   2. SecondSubscriptionUnaffected         (1 node)   a subscription paused for the whole test does not slow another one.
 //   3. LeaderChangeWhilePaused              (3 nodes)  pause at offset 500 of 1000, stop the partition leader, resume on the new one.
 //   4. ReadCommittedPauseInsideTransaction  (1 node)   a read_committed subscription pauses inside a committed transaction's batch.
-// Every drive loop has a hard iteration cap and FAILS rather than hangs; nothing waits on wall time.  Each test ends with a
+// Every drive loop has a hard iteration cap and FAILS rather than hangs; nothing waits on wall time.  Tests 1, 3 and 4 end with a
 // SENTINEL record produced after the expected ones: a duplicate delivered after the last expected record arrives before the
-// sentinel, so the exact sequence (and position() == last + 1) is asserted only once the sentinel was seen.
+// sentinel, so the exact sequence (and position() == last + 1) is asserted only once the sentinel was seen.  Test 2 needs none
+// (its paused subscription never resumes; it settles on 50 more records of the other topic).
 #include "client/ClusterClient.h"
 #include "client/OneBroker.h"
 

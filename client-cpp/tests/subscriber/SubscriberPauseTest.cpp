@@ -12,10 +12,12 @@
 #include <rune/client/codec/DataCodec.h>
 #include <rune/client/detail/HubCommand.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/Protocol.h>
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -1676,4 +1678,75 @@ TEST(SubscriberPauseRegression, EchoNumberSkipsZeroOnWrapRegression) {
     EXPECT_TRUE(seen) << "the handler's pause is adopted after the counter wrapped";
     EXPECT_TRUE(back);
     EXPECT_NE(r.impl->appSeqApplied, 0u);
+}
+
+// N-4: a pause() inside the catalog caught-up callback is not "inside a record handler": no record is being handled, so
+// resume() must not settle the position to deliveringOffset + 1.  (Today the two agree on a catalog stream; the test makes
+// them differ - an offset consumed without delivery - to pin the rule.)
+TEST(SubscriberPauseRegression, PauseInsideCaughtUpCallbackDoesNotRewindRegression) {
+    Rig r;
+    r.open(11);
+    r.impl->topicId = rune::protocol::client::kCatalogTopicId;
+    int64_t hw = -1;
+    bool    resumedOk = false;
+    r.impl->onCaughtUp = [&](int64_t h, uint64_t) {
+        hw = h;
+        EXPECT_TRUE(r.sub->pause());
+        resumedOk = r.sub->resume();
+    };
+    r.bind(40);
+    {
+        auto first = records(r.st, 40, 0, 3);   // delivered 0..2: deliveringOffset 2, nextOffset 3
+        first.topicId = rune::protocol::client::kCatalogTopicId;
+        r.hub.onRecords(first);
+    }
+    ASSERT_EQ(r.got, (std::vector<int64_t>{0, 1, 2}));
+    r.impl->nextOffset = 7;                 // offsets 3..6 were consumed without being delivered
+    std::array<uint8_t, 8> epoch{};         // the caught-up marker: an 8-byte epoch body, baseOffset = the high watermark
+    rc::codec::RecordsView rv;
+    rv.subscriptionId = 40;
+    rv.topicId        = rune::protocol::client::kCatalogTopicId;
+    rv.partition      = kPart;
+    rv.baseOffset     = 7;
+    rv.recordBatch    = std::span<const uint8_t>(epoch);
+    r.hub.onRecords(rv);
+    ASSERT_EQ(hw, 7);
+    ASSERT_TRUE(resumedOk);
+    EXPECT_EQ(r.impl->nextOffset, 7) << "the position must not go back to the last delivered record + 1";
+    EXPECT_EQ(r.tx.lastSubFrom, 7) << "the re-subscribe starts at the position";
+    r.bindLast(41);
+    auto second = records(r.st, 41, 7, 2);
+    second.topicId = rune::protocol::client::kCatalogTopicId;
+    r.hub.onRecords(second);
+    EXPECT_EQ(r.got, (std::vector<int64_t>{0, 1, 2, 7, 8})) << "no duplicate, no skip";
+}
+
+// N-5: a refused pause changes nothing - not the paused state, the dispatch markers, nor the release bookkeeping.
+TEST(SubscriberPauseRegression, RefusedPauseChangesNothingRegression) {
+    Rig r;
+    r.open(11);
+    r.bind(40);
+    r.push(40, 0, 1);
+    r.tx.refuseUnsub = true;
+    int64_t id = 40;
+    for (int i = 0; i < 64; ++i) {   // fill the owed list
+        ASSERT_TRUE(r.sub->pause());
+        ASSERT_TRUE(r.sub->resume());
+        r.bindLast(++id);
+        r.push(id, i + 1, 1);
+    }
+    const int64_t corrBefore = r.impl->unsubCorrId, sidBefore = r.impl->unsubSessionId;
+    bool refused = false;
+    r.hook = [&](const rc::Record& rec) {
+        if (rec.offset == 65) refused = !r.sub->pause();   // inside the handler: the markers would be set
+    };
+    r.push(id, 65, 3);
+    ASSERT_TRUE(refused) << "the owed list is full";
+    EXPECT_FALSE(r.impl->paused);
+    EXPECT_FALSE(r.impl->pausedOnce && r.impl->paused);
+    EXPECT_FALSE(r.impl->pauseAfterCurrent);
+    EXPECT_FALSE(r.impl->stopDispatch);
+    EXPECT_EQ(r.impl->unsubCorrId, corrBefore);
+    EXPECT_EQ(r.impl->unsubSessionId, sidBefore);
+    EXPECT_EQ(r.got.back(), 67) << "the batch ran to its end: the refused pause stopped nothing";
 }
