@@ -340,9 +340,9 @@ TEST(NodeConfigRegression, TooManyWorkersPeersOrNodeIdRefusedWhenAuthEnabledRegr
         EXPECT_NE(r.error.find("65535"), std::string::npos) << r.error;
     }
     {
-        // This node's own id out of range.  The own id must be listed in RUNE_PEERS (parse refuses otherwise), so the
-        // peers loop sees it first and names it: the separate RUNE_NODE_ID check in validateAuthTopology is a
-        // second line of defence no config can reach on its own.  Pinned: the refusal exists and names the id.
+        // This node's own id out of range.  Through parse the own id must be listed in RUNE_PEERS, so the peers loop
+        // refuses it first and names it.  (Retained: the separate RUNE_NODE_ID check below it is still reached by a
+        // programmatic config whose nodeId is not among its peers, pinned right after this case.)
         auto e = shard1();
         e["RUNE_NODE_ID"] = "70000";
         e["RUNE_PEERS"] = "70000@rune-1:40111";
@@ -350,6 +350,17 @@ TEST(NodeConfigRegression, TooManyWorkersPeersOrNodeIdRefusedWhenAuthEnabledRegr
         EXPECT_FALSE(r.config.has_value()) << "#147: refused at parse";
         EXPECT_NE(r.error.find("70000"), std::string::npos) << r.error;
         EXPECT_NE(r.error.find("65535"), std::string::npos) << r.error;
+    }
+    {
+        // A programmatic config (never through parse) whose own id is not among its peers: only the RUNE_NODE_ID
+        // check can refuse it, so that branch is reachable (validateAuth repeats the topology check for such configs).
+        auto r = parseNodeConfig(fakeEnv(shard1()));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        r.config->nodeId = 70000;
+        const auto err = r.config->validateAuthTopology();
+        ASSERT_TRUE(err.has_value());
+        EXPECT_NE(err->find("RUNE_NODE_ID=70000"), std::string::npos) << *err;
+        EXPECT_NE(err->find("65535"), std::string::npos) << *err;
     }
 }
 
