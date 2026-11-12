@@ -33,6 +33,9 @@ namespace rune::gateway {
 /// GetTopicSchema (#504, #505): the object kinds under a name a session may DESCRIBE, as a bit set.  The gateway
 /// computes it from the grants alone; the admin thread serves the object only when its real kind is in the set.
 inline constexpr uint8_t kKindTopic = 1, kKindView = 2, kKindAll = 3;
+/// DdlMeta::describeMask (#217): `kKindTopic` / `kKindView` = the session may DESCRIBE the request's own target name as
+/// that kind; this bit = it holds DESCRIBE ON CLUSTER, i.e. it may read the whole catalog anyway (#220).
+inline constexpr uint8_t kDescribeCatalog = 4;
 
 /// Where a replayed DDL came from (`rune catalog replay`, spec §7).
 struct ReplayedFromView {
@@ -57,6 +60,9 @@ struct DdlMetaView {
     int64_t                         securityOffset  = -1;      // ...and this SecurityView offset was checked against
     uint16_t                        authenticatedLocalAt = 0;  // where the LOCAL user name starts in `authenticated`
                                                                // (0 = the bare default-namespace form)
+    uint8_t                         describeMask = 0xFF;       // issue #217: what the session may DESCRIBE
+                                                               // (kKind* bits + kDescribeCatalog); 0xFF = everything
+                                                               // (no-auth, in-process)
 };
 
 /// The outcome of handing a request to the admin thread.

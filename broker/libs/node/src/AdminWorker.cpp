@@ -175,11 +175,31 @@ int64_t wallClockMs() {
                std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+/// Issue #217: whether the caller may DESCRIBE the object a request collides with.  `kindBit` is the colliding object's
+/// kind (kKindTopic / kKindView), judged on the REQUEST'S OWN target name by the gateway; 0 = an object under another
+/// name (a derived one): only a catalog reader (DESCRIBE ON CLUSTER) sees it.
+constexpr uint8_t kSeesTopic = rune::gateway::kKindTopic, kSeesView = rune::gateway::kKindView;
+bool sees(const DdlMeta& meta, uint8_t kindBit) {
+    return (meta.describeMask & (kindBit | rune::gateway::kDescribeCatalog)) != 0;
+}
+/// DESCRIBE ON CLUSTER: the whole catalog is readable by this caller anyway (#220).
+bool seesAll(const DdlMeta& meta) { return (meta.describeMask & rune::gateway::kDescribeCatalog) != 0; }
+
+/// The answer to "the name is taken by an existing object" (id and version of that object): the full answer when the
+/// caller may describe it, else TopicExists with no id and no version - what it would answer if the identity were
+/// unknown.
+DdlRejection existsAnswer(const DdlMeta& meta, uint8_t kindBit, int32_t id, uint16_t version) {
+    return sees(meta, kindBit) ? reject(kTopicExists, {}, id, version) : reject(kTopicExists);
+}
+
 /// The fold-equal live name `n` lands on, and its answer (TopicExists with the
-/// object's topic id).
-std::optional<DdlRejection> foldCollision(const cat::CatalogState& s, uint32_t nsId, std::string_view n) {
+/// object's topic id).  The other object's name is not the request's name: only a catalog reader sees it (#217).
+std::optional<DdlRejection> foldCollision(const DdlMeta& meta, const cat::CatalogState& s, uint32_t nsId,
+                                          std::string_view n) {
     const std::string* other = s.liveNameFoldingOnto(nsId, n);
     if (other == nullptr) return std::nullopt;
+    if (!seesAll(meta))
+        return reject(kTopicExists, "name " + quotedName(n) + " differs only in letter case from an existing name");
     int32_t id = -1;
     if (const cat::TopicObject* t = s.topicByName(nsId, *other)) id = t->topicId;
     else if (const cat::ViewObject* v = s.viewByName(nsId, *other)) id = v->def.viewTopicId;
@@ -1462,7 +1482,10 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
     // anticipate is refused here with the library's own reason.
     auto preview = cat::previewFingerprint(s, *b);
     if (!preview) {
-        const std::string& why = preview.error().detail;
+        // #217: a refusal that names another existing object is answered without the name unless the caller reads
+        // the catalog.
+        const bool redact = !seesAll(meta) && !preview.error().redactedDetail.empty();
+        const std::string& why = redact ? preview.error().redactedDetail : preview.error().detail;
         switch (b->kind) {
         case cat::EventKind::CreateSchema:
         case cat::EventKind::AlterSchema:
@@ -1623,8 +1646,9 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     e.nsId       = m.nsId;
     e.objectName = m.name;
     if (const cat::TopicObject* t = s.topicByName(m.nsId, m.name)) {
-        if (t->schema) return Rejected(reject(kTopicExists, {}, t->topicId, t->schema->schemaVersion));
-        if (m.blob.empty()) return Rejected(reject(kTopicExists, {}, t->topicId, 0));   // untyped, nothing to adopt
+        if (t->schema) return Rejected(existsAnswer(m.meta, kSeesTopic, t->topicId, t->schema->schemaVersion));
+        if (m.blob.empty())   // untyped, nothing to adopt
+            return Rejected(existsAnswer(m.meta, kSeesTopic, t->topicId, 0));
         if (m.lease) return Rejected(reject(kInvalidRequest, "a lease topic needs a new topic"));
         if (keyRefusal) return Rejected(std::move(*keyRefusal));
         if (auto why = keyFeaturesRefusal(features, TopicShape{true, !m.keyField.empty(), t->persistence == cat::Persistence::Transient},
@@ -1637,7 +1661,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         // cannot be honoured (the topic keeps its log backend).
         if (m.persistence == static_cast<uint8_t>(PersistenceMode::Transient) &&
             t->persistence == cat::Persistence::Disk)
-            return Rejected(reject(kTopicExists, {}, t->topicId, 0));
+            return Rejected(existsAnswer(m.meta, kSeesTopic, t->topicId, 0));
         // Schema-less adoption (ruling 3): the untyped topic gains its schema.
         e.objectId    = t->objectId;
         e.prevVersion = t->version;
@@ -1647,9 +1671,9 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     }
     if (const cat::ViewObject* v = s.viewByName(m.nsId, m.name)) {
         const RegistryEntry* out = reg_.byId(v->def.viewTopicId);
-        return Rejected(reject(kTopicExists, {}, v->def.viewTopicId, out ? out->version : uint16_t{0}));
+        return Rejected(existsAnswer(m.meta, kSeesView, v->def.viewTopicId, out ? out->version : uint16_t{0}));
     }
-    if (auto fold = foldCollision(s, m.nsId, m.name)) return Rejected(std::move(*fold));
+    if (auto fold = foldCollision(m.meta, s, m.nsId, m.name)) return Rejected(std::move(*fold));
     if (m.lease) {
         // L15: the lease view '<name>.leases' is created with the topic, so its name is judged here (the apply rule is the
         // replay half).  The codec keeps the suffix private: ".leases" is 7 bytes.
@@ -1657,13 +1681,14 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         const std::string viewName = m.name + std::string(kLeaseViewSuffix);
         if (viewName.size() > cat::kMaxTopicNameBytes)
             return Rejected(reject(kInvalidTopicName, "the lease view name '" + viewName + "' is too long"));
+        // #217: the derived name is not the request's own name: only a catalog reader sees what holds it (kind bit 0).
         if (const cat::TopicObject* t = s.topicByName(m.nsId, viewName))
-            return Rejected(reject(kTopicExists, {}, t->topicId, t->schema ? t->schema->schemaVersion : uint16_t{0}));
+            return Rejected(existsAnswer(m.meta, 0, t->topicId, t->schema ? t->schema->schemaVersion : uint16_t{0}));
         if (const cat::ViewObject* v = s.viewByName(m.nsId, viewName)) {
             const RegistryEntry* out = reg_.byId(v->def.viewTopicId);
-            return Rejected(reject(kTopicExists, {}, v->def.viewTopicId, out ? out->version : uint16_t{0}));
+            return Rejected(existsAnswer(m.meta, 0, v->def.viewTopicId, out ? out->version : uint16_t{0}));
         }
-        if (auto fold = foldCollision(s, m.nsId, viewName)) return Rejected(std::move(*fold));
+        if (auto fold = foldCollision(m.meta, s, m.nsId, viewName)) return Rejected(std::move(*fold));
     }
     if (keyRefusal) return Rejected(std::move(*keyRefusal));
     std::optional<rune::codec::Descriptor> userDesc;   // set for a typed define (already known to deserialize)
@@ -1730,7 +1755,8 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
 
 AdminWorker::Built AdminWorker::buildAlter_(const AlterTopicMsg& m, const cat::CatalogState& s) const {
     // U1: a view's output is derived from its plan — never altered directly.
-    if (s.viewByName(m.nsId, m.topicName)) return Rejected(reject(kViewNotAlterable));
+    // #217: a caller who may not describe a VIEW of this name is answered as for a name that is no object at all.
+    if (s.viewByName(m.nsId, m.topicName) && sees(m.meta, kSeesView)) return Rejected(reject(kViewNotAlterable));
     const cat::TopicObject* t = s.topicByName(m.nsId, m.topicName);
     // F3: an untyped topic has no schema to alter — UnknownTopic, as today.
     if (t == nullptr || !t->schema) return Rejected(reject(kUnknownTopic));
@@ -1895,8 +1921,9 @@ AdminWorker::Built AdminWorker::buildCreateView_(const CreateViewMsg& m, const c
     if (!cat::isValidTopicName(m.viewName)) return Rejected(reject(kInvalidTopicName));
     if (const cat::ViewObject* v = s.viewByName(m.nsId, m.viewName))
         return Rejected(reject(kViewExists, {}, v->def.viewTopicId));
-    if (const cat::TopicObject* t = s.topicByName(m.nsId, m.viewName)) return Rejected(reject(kTopicExists, {}, t->topicId));
-    if (auto fold = foldCollision(s, m.nsId, m.viewName)) return Rejected(std::move(*fold));
+    if (const cat::TopicObject* t = s.topicByName(m.nsId, m.viewName))
+        return Rejected(existsAnswer(m.meta, kSeesTopic, t->topicId, 0));
+    if (auto fold = foldCollision(m.meta, s, m.nsId, m.viewName)) return Rejected(std::move(*fold));
     auto def = viewDef_(m.viewName, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), s.nextObjectId(), m.nsId, s);
     if (!def) return Rejected(std::move(def.error()));
     cat::CatalogEvent e;
@@ -1946,14 +1973,16 @@ AdminWorker::Built AdminWorker::buildDropView_(const DropViewMsg& m, const cat::
 }
 
 AdminWorker::Built AdminWorker::buildDropTopic_(const DropTopicMsg& m, const cat::CatalogState& s) const {
-    if (const cat::ViewObject* v = s.viewByName(m.nsId, m.name))
+    if (const cat::ViewObject* v = s.viewByName(m.nsId, m.name); v != nullptr && sees(m.meta, kSeesView))
         return Rejected(reject(kInvalidRequest, v->kind == cat::ViewKind::LeaseIndex
                                                     ? quotedName(m.name) + " is a lease view; drop its lease topic"
                                                     : quotedName(m.name) + " is a view; use DROP VIEW"));
     const cat::TopicObject* t = s.topicByName(m.nsId, m.name);
     if (t == nullptr) return Rejected(reject(kUnknownTopic, "no topic named " + quotedName(m.name)));
-    if (const cat::ViewObject* v = s.viewReading(m.nsId, m.name))
-        return Rejected(reject(kInvalidRequest, "topic " + quotedName(m.name) + " is the source of view " + quotedName(v->name)));
+    if (const cat::ViewObject* v = s.viewReading(m.nsId, m.name))   // #217: the view's name only for a catalog reader
+        return Rejected(reject(kInvalidRequest, "topic " + quotedName(m.name) + " is " +
+                                                    (seesAll(m.meta) ? "the source of view " + quotedName(v->name)
+                                                                     : std::string{"read by a view"})));
     cat::CatalogEvent e;
     e.nsId        = m.nsId;
     e.objectName  = t->name;
@@ -1965,7 +1994,8 @@ AdminWorker::Built AdminWorker::buildDropTopic_(const DropTopicMsg& m, const cat
 }
 
 AdminWorker::Built AdminWorker::buildAlterConfig_(const AlterTopicConfigMsg& m, const cat::CatalogState& s) const {
-    if (s.viewByName(m.nsId, m.name)) return Rejected(reject(kViewNotAlterable));
+    if (s.viewByName(m.nsId, m.name) && sees(m.meta, kSeesView))   // #217: else as for a missing name
+        return Rejected(reject(kViewNotAlterable));
     const cat::TopicObject* t = s.topicByName(m.nsId, m.name);
     if (t == nullptr) return Rejected(reject(kUnknownTopic, "no topic named " + quotedName(m.name)));
     // Lease topics: the lease.* keys (above kLastConfigKeyV3) are formatVer 4 events; below the lease feature level

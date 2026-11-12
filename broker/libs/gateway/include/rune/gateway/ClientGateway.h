@@ -2205,7 +2205,9 @@ private:
     /// `ddlPrincipalScratch_` (control thread, cold DDL path), so a tenant's audit principal never equals a default user's.
     [[nodiscard]] rune::gateway::DdlMetaView
         ddlMetaOf_(const rune::protocol::client::DdlExtension* ext, int64_t sessionId, const Session& session,
-                   uint32_t targetNsId);
+                   uint32_t targetNsId, std::optional<std::string_view> describeLocalName = std::nullopt);
+    /// Issue #217: what `session` may DESCRIBE under `localName` (kKind* bits) and on the cluster (kDescribeCatalog).
+    [[nodiscard]] uint8_t describeMaskFor_(const Session& session, std::string_view localName, uint32_t nsId) const;
     std::string ddlPrincipalScratch_;
     void answerAdminSubmit_(const uint8_t* buf, std::size_t len, rune::gateway::AdminSubmit r,
                             const char* ringFull, const char* tooLarge);

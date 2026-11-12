@@ -69,18 +69,23 @@ struct CountingAdminSink final : IAdminRequestSink {
     uint8_t lastKinds   = 0;
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool,
                                   const uint8_t*, uint32_t, uint8_t, int16_t, const rune::protocol::TopicConfigView&,
-                                  const DdlMetaView&, std::string_view, const rune::protocol::TopicKeyFeatures&,
+                                  const DdlMetaView& meta, std::string_view, const rune::protocol::TopicKeyFeatures&,
                                   const std::optional<rune::protocol::LeaseSpec>& lease) override {
-        ++submits; lastLease = lease; return AdminSubmit::Accepted;
+        ++submits; lastLease = lease; masks.push_back(meta.describeMask); return AdminSubmit::Accepted;
     }
+    std::vector<uint8_t> masks;   // #217: the describeMask of every catalog DDL that reached the sink, in order
     std::optional<rune::protocol::LeaseSpec> lastLease;   // the lease argument of the last DefineTopic
     bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t, uint8_t kinds) override {
         ++gets; lastKinds = kinds; return true;
     }
     AdminSubmit submitAlterTopic(int64_t, int64_t, std::string_view, uint16_t, const uint8_t*, uint32_t,
-                                 const DdlMetaView&) override { ++submits; return AdminSubmit::Accepted; }
+                                 const DdlMetaView& meta) override {
+        ++submits; masks.push_back(meta.describeMask); return AdminSubmit::Accepted;
+    }
     AdminSubmit submitCreateView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, const uint8_t*,
-                                 uint32_t, const DdlMetaView&) override { ++submits; return AdminSubmit::Accepted; }
+                                 uint32_t, const DdlMetaView& meta) override {
+        ++submits; masks.push_back(meta.describeMask); return AdminSubmit::Accepted;
+    }
     std::string lastAuthenticated;   // #652: the audit principal of the last DropTopic (copied: the view is transient)
     uint32_t    lastCallerNsId = 0;
     uint16_t    lastLocalAt = 0;   // #218 / #67: where the local user name starts in `authenticated`
@@ -88,16 +93,19 @@ struct CountingAdminSink final : IAdminRequestSink {
         lastAuthenticated = std::string(meta.authenticated);
         lastCallerNsId    = meta.callerNsId;
         lastLocalAt       = meta.authenticatedLocalAt;
+        masks.push_back(meta.describeMask);
         ++submits; return AdminSubmit::Accepted;
     }
     AdminSubmit submitAlterTopicConfig(int64_t, int64_t, std::string_view, uint32_t, std::span<const uint8_t>,
-                                       const DdlMetaView&) override { ++submits; return AdminSubmit::Accepted; }
-    AdminSubmit submitDropView(int64_t, int64_t, std::string_view, const DdlMetaView&) override {
-        ++submits; return AdminSubmit::Accepted;
+                                       const DdlMetaView& meta) override {
+        ++submits; masks.push_back(meta.describeMask); return AdminSubmit::Accepted;
+    }
+    AdminSubmit submitDropView(int64_t, int64_t, std::string_view, const DdlMetaView& meta) override {
+        ++submits; masks.push_back(meta.describeMask); return AdminSubmit::Accepted;
     }
     AdminSubmit submitAlterView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, uint32_t,
-                                const uint8_t*, uint32_t, const DdlMetaView&) override {
-        ++submits; return AdminSubmit::Accepted;
+                                const uint8_t*, uint32_t, const DdlMetaView& meta) override {
+        ++submits; masks.push_back(meta.describeMask); return AdminSubmit::Accepted;
     }
     // Task 12: catalog reads.  `ringFull` makes every catalog submit refuse (back-pressure).
     struct CatalogSub { int64_t session, corr, from; };
@@ -1371,4 +1379,56 @@ TEST(LiveSecurityChangesRegression, ARevokedSessionAnswersEveryLiveAdminReadRegr
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "u", PermissionTable::allowAll()});
     g.gw.revokeAllSessionsForTest("test");
     for (const int64_t c : {21, 22, 23}) EXPECT_EQ(answersOn(g, c), 1u) << c;
+}
+
+// ── Issue #217: the gateway tells the admin thread what the session may DESCRIBE under the request's own name ──────
+namespace {
+rune::gateway::PermissionTable tableOf(std::vector<rune::security::GrantSpec> g) {
+    std::sort(g.begin(), g.end());
+    return rune::gateway::PermissionTable::compile(g, rune::gateway::ObjectIndex{});
+}
+rune::security::GrantSpec grantOn(rune::security::Operation op, rune::security::ResourceType t, const char* name) {
+    return {op, rune::security::ResourcePattern{t, rune::security::PatternKind::Exact, name}};
+}
+}  // namespace
+
+TEST(CatalogDescribeMaskRegression, TheGatewayStampsTheDescribeMaskOfTheRequestsOwnNameRegression) {
+    using rune::security::Operation;
+    using rune::security::ResourceType;
+    namespace rg = rune::gateway;
+    GatewayRig g;
+    g.gateway().setCatalogRoute(rune::gateway::RouteLocalLeader{});
+    const auto send = [&](pc::TemplateId t, rune::gateway::PermissionTable table) -> std::optional<uint8_t> {
+        g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", std::move(table), {}});
+        const std::size_t before = g.admin.masks.size();
+        (void)g.sendDdl(t);
+        return g.admin.masks.size() == before + 1 ? std::optional<uint8_t>(g.admin.masks.back()) : std::nullopt;
+    };
+    const auto topicOnly = [] {
+        return tableOf({grantOn(Operation::Create, ResourceType::Topic, "t"),
+                        grantOn(Operation::Alter, ResourceType::Topic, "t"),
+                        grantOn(Operation::Drop, ResourceType::Topic, "t")});
+    };
+    const auto viewOnly = [] {
+        return tableOf({grantOn(Operation::Drop, ResourceType::View, "v")});
+    };
+    // The grants' own kind: TOPIC grants on "t" describe the topic kind only.
+    EXPECT_EQ(send(pc::TemplateId::DefineTopic, topicOnly()), rg::kKindTopic);
+    EXPECT_EQ(send(pc::TemplateId::AlterTopic, topicOnly()), rg::kKindTopic);
+    EXPECT_EQ(send(pc::TemplateId::DropTopic, topicOnly()), rg::kKindTopic);
+    EXPECT_EQ(send(pc::TemplateId::AlterTopicConfig, topicOnly()), rg::kKindTopic);
+    EXPECT_EQ(send(pc::TemplateId::DropView, viewOnly()), rg::kKindView);
+    // A cluster DESCRIBE adds the catalog bit; CREATE ON CLUSTER alone reaches every name as both kinds, no catalog
+    // bit.
+    const rune::security::GrantSpec clusterDescribe{
+        Operation::Describe,
+        rune::security::ResourcePattern{ResourceType::Cluster, rune::security::PatternKind::Exact, ""}};
+    EXPECT_EQ(send(pc::TemplateId::DefineTopic,
+                   tableOf({grantOn(Operation::Create, ResourceType::Topic, "t"), clusterDescribe})),
+              rg::kKindAll | rg::kDescribeCatalog);
+    EXPECT_EQ(send(pc::TemplateId::AlterTopic, clusterTable({Operation::Alter})), rg::kKindAll);
+    // A name outside the grants' reach (the DDL is refused before it reaches the sink: nothing is stamped).
+    EXPECT_EQ(send(pc::TemplateId::DropTopic, viewOnly()), std::nullopt);
+    // Dev / in-process: allow-all describes everything, catalog included.
+    EXPECT_EQ(send(pc::TemplateId::DefineTopic, PermissionTable::allowAll()), 7);
 }

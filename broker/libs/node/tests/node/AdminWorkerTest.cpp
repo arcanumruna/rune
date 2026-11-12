@@ -597,21 +597,54 @@ TEST(AdminWorkerRegression, TheSecurityStampCrossesTheAdminRingAndARefusedFlagIs
             EXPECT_EQ(got.meta, dt.meta);
             EXPECT_EQ(got.meta.callerNsId, 7u);
             EXPECT_EQ(got.meta.authenticatedLocalAt, 3u);
-            // The stamp (flag 1 + offset 8) then callerNsId 4 + authenticatedLocalAt 2 end the meta, followed by the
-            // 4-byte nsId.
+            // The stamp (flag 1 + offset 8) then callerNsId 4 + authenticatedLocalAt 2 + describeMask 1 end the meta,
+            // followed by the 4-byte nsId.
             std::vector<uint8_t> bad(p, p + n);
-            bad[n - 4 - 15] = 2;
+            bad[n - 4 - 16] = 2;
             const DdlRequest badR = decodeDropTopic(bad.data(), bad.size());
             const auto* badM = std::get_if<MalformedDdl>(&badR);
             ASSERT_NE(badM, nullptr);
             EXPECT_EQ(badM->reason, "a securityStamped flag other than 0/1");
-            // An authenticatedLocalAt beyond the name is malformed too (the u16 sits just before the nsId).
+            // An authenticatedLocalAt beyond the name is malformed too (the u16 sits before the describeMask byte
+            // and the nsId).
             std::vector<uint8_t> badAt(p, p + n);
-            badAt[n - 4 - 2] = 0; badAt[n - 4 - 1] = 0x7f;
+            badAt[n - 4 - 3] = 0; badAt[n - 4 - 2] = 0x7f;
             const DdlRequest badAtR = decodeDropTopic(badAt.data(), badAt.size());
             const auto* badAtM = std::get_if<MalformedDdl>(&badAtR);
             ASSERT_NE(badAtM, nullptr);
             EXPECT_EQ(badAtM->reason, "an authenticatedLocalAt beyond the authenticated name");
+            ++seen;
+        }, 8);
+        EXPECT_EQ(seen, 1);
+    }
+}
+
+// Issue #217: the describe mask crosses the admin ring bit-exact for every mask, a message built without it carries
+// 0xFF (everything), and a meta that gains the byte keeps the fixed-bytes constant honest.
+TEST(AdminWorkerRegression, TheDescribeMaskCrossesTheAdminRingAndDefaultsToEverythingRegression) {
+    {
+        DropTopicMsg dt;   // aggregate default: the full answers
+        EXPECT_EQ(dt.meta.describeMask, 0xFF);
+        EXPECT_EQ(DdlMeta{}.describeMask, 0xFF);
+    }
+    OneToOneByteRing ring{kAdminRequestRingBytes};
+    for (const uint8_t mask : {uint8_t{0}, uint8_t{1}, uint8_t{2}, uint8_t{4}, uint8_t{7}, uint8_t{0xFF}}) {
+        DropTopicMsg dt; dt.session = 7; dt.corr = 11; dt.name = "p";
+        dt.meta.statement = "DROP TOPIC p;"; dt.meta.requestId = {5, 6};
+        dt.meta.describeMask = mask;
+        ASSERT_TRUE(encodeDdl(ring, dt));
+        int seen = 0;
+        ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                       aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            const DdlRequest r = decodeDropTopic(p, static_cast<std::size_t>(len));
+            ASSERT_TRUE(std::holds_alternative<DropTopicMsg>(r));
+            EXPECT_EQ(std::get<DropTopicMsg>(r).meta.describeMask, mask);
+            EXPECT_EQ(std::get<DropTopicMsg>(r).meta, dt.meta);
+            // A frame one byte short (the mask missing) is malformed, never read as 0xFF: the meta is not the frame's
+            // last field, so there is no "old-length frame" - the ring never leaves the process.
+            const DdlRequest shortR = decodeDropTopic(p, static_cast<std::size_t>(len) - 1);
+            EXPECT_TRUE(std::holds_alternative<MalformedDdl>(shortR));
             ++seen;
         }, 8);
         EXPECT_EQ(seen, 1);

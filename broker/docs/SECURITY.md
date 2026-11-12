@@ -100,6 +100,11 @@ always `not authorized: <OP> on <TYPE> <requested name or id>` (D23).
 GetTopicSchema on a name whose live object is of a kind the caller holds no DESCRIBE for answers exactly like a
 missing name; a caller with no DESCRIBE on the name under either kind gets NotAuthorized whether or not the object
 exists.
+A catalog DDL answers about a colliding object (an existing name of the other kind, a name that differs only in letter
+case, a topic a view reads) in full only when the gateway says the caller may DESCRIBE that kind under the request's own
+name; otherwise the answer is the one for an unknown object (`TopicExists` with no id and version, `UnknownTopic` for an
+ALTER or DROP TOPIC naming a view). The other object's name in a letter-case or read-by-view refusal is shown only to
+principals with DESCRIBE ON CLUSTER (D22).
 
 ## Rune QL statements
 

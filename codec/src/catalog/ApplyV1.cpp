@@ -69,8 +69,8 @@ using Code = ApplyError::Code;
 constexpr uint16_t kLiveForever      = 0xFFFF;   // FieldDescriptor::untilVersion sentinel
 constexpr uint16_t kMaxSchemaVersion = 0xFFFE;   // the next one must stay below the sentinel
 
-std::unexpected<ApplyError> fail(int64_t offset, Code code, std::string detail) {
-    return std::unexpected(ApplyError{offset, code, 0, 0, std::move(detail)});
+std::unexpected<ApplyError> fail(int64_t offset, Code code, std::string detail, std::string redactedDetail = {}) {
+    return std::unexpected(ApplyError{offset, code, 0, 0, std::move(detail), std::move(redactedDetail)});
 }
 /// Names in a detail are client-supplied: escaped so a rejected one cannot forge log lines.
 std::string quoted(std::string_view s) { return "'" + escapeNameForLog(s) + "'"; }
@@ -87,13 +87,17 @@ std::optional<std::string> chainError(const CatalogEvent& e, uint32_t current) {
 }
 
 /// A new object: a free non-empty name, the next objectId, the next topic id, versions 0 -> 1.
+/// `redacted` (issue #217): set when the text names another live object (the case-fold collision).
 std::optional<std::string> createError(const CatalogState& s, const CatalogEvent& e, int32_t topicId,
-                                       std::string_view topicIdName) {
+                                       std::string_view topicIdName, std::string* redacted = nullptr) {
     if (const TopicNameError ne = checkTopicName(e.objectName); ne != TopicNameError::None)
         return prefix(e) + "name " + quoted(e.objectName) + " is invalid (" + std::string(topicNameErrorText(ne)) + ")";
     if (s.nameTaken(e.nsId, e.objectName)) return prefix(e) + "name " + quoted(e.objectName) + " is taken";
-    if (const std::string* other = s.liveNameFoldingOnto(e.nsId, e.objectName))
+    if (const std::string* other = s.liveNameFoldingOnto(e.nsId, e.objectName)) {
+        if (redacted != nullptr)
+            *redacted = prefix(e) + "name " + quoted(e.objectName) + " case-folds onto a live name";
         return prefix(e) + "name " + quoted(e.objectName) + " case-folds onto the live name " + quoted(*other);
+    }
     if (s.nextObjectId() == std::numeric_limits<uint64_t>::max()) return prefix(e) + "object ids are exhausted";
     if (e.objectId != s.nextObjectId())
         return prefix(e) + "objectId " + std::to_string(e.objectId) + ", next is " + std::to_string(s.nextObjectId());
@@ -147,8 +151,11 @@ std::expected<const TopicObject*, ApplyError> liveTopic(const CatalogState& s, c
     if (t == nullptr || t->nsId != e.nsId)   // an object of another namespace is not live here
         return fail(offset, Code::Precondition, prefix(e) + "no live topic with objectId " + std::to_string(e.objectId));
     if (t->name != e.objectName)
-        return fail(offset, Code::Precondition, prefix(e) + "objectId " + std::to_string(e.objectId) + " is topic " +
-                                                    quoted(t->name) + ", not " + quoted(e.objectName));
+        return fail(offset, Code::Precondition,
+                    prefix(e) + "objectId " + std::to_string(e.objectId) + " is topic " + quoted(t->name) + ", not " +
+                        quoted(e.objectName),
+                    prefix(e) + "objectId " + std::to_string(e.objectId) + " is another topic than " +
+                        quoted(e.objectName));
     if (auto c = chainError(e, t->version)) return fail(offset, Code::Precondition, std::move(*c));
     return t;
 }
@@ -157,8 +164,11 @@ std::expected<const ViewObject*, ApplyError> liveView(const CatalogState& s, con
     if (v == nullptr || v->nsId != e.nsId)
         return fail(offset, Code::Precondition, prefix(e) + "no live view with objectId " + std::to_string(e.objectId));
     if (v->name != e.objectName)
-        return fail(offset, Code::Precondition, prefix(e) + "objectId " + std::to_string(e.objectId) + " is view " +
-                                                    quoted(v->name) + ", not " + quoted(e.objectName));
+        return fail(offset, Code::Precondition,
+                    prefix(e) + "objectId " + std::to_string(e.objectId) + " is view " + quoted(v->name) + ", not " +
+                        quoted(e.objectName),
+                    prefix(e) + "objectId " + std::to_string(e.objectId) + " is another view than " +
+                        quoted(e.objectName));
     if (auto c = chainError(e, v->version)) return fail(offset, Code::Precondition, std::move(*c));
     return v;
 }
@@ -257,7 +267,9 @@ namespace {
 using Result = std::expected<Staged, ApplyError>;
 
 Result createTopic(const CatalogState& s, const CatalogEvent& e, int64_t off, const CreateTopicOps& o) {
-    if (auto c = createError(s, e, o.topicId, "topicId")) return fail(off, Code::Precondition, std::move(*c));
+    std::string redacted;
+    if (auto c = createError(s, e, o.topicId, "topicId", &redacted))
+        return fail(off, Code::Precondition, std::move(*c), std::move(redacted));
     if (o.partitions < 1) return fail(off, Code::Precondition, prefix(e) + "partitions " + std::to_string(o.partitions) + " < 1");
     if (o.replicationFactor < 0)
         return fail(off, Code::Precondition, prefix(e) + "replicationFactor " + std::to_string(o.replicationFactor) + " < 0");
@@ -280,7 +292,9 @@ Result dropTopic(const CatalogState& s, const CatalogEvent& e, int64_t off, cons
         return fail(off, Code::Precondition, prefix(e) + "topicId " + std::to_string(o.topicId) + ", topic " +
                                                  quoted(e.objectName) + " is " + std::to_string((*t)->topicId));
     if (const ViewObject* v = s.viewReading(e.nsId, e.objectName))
-        return fail(off, Code::Precondition, prefix(e) + "topic " + quoted(e.objectName) + " is read by view " + quoted(v->name));
+        return fail(off, Code::Precondition,
+                    prefix(e) + "topic " + quoted(e.objectName) + " is read by view " + quoted(v->name),
+                    prefix(e) + "topic " + quoted(e.objectName) + " is read by a view");   // #217: no foreign name
     return StagedRemove{e.objectId, Tombstone{e.objectId, e.objectName, e.newVersion, /*wasView=*/false, e.nsId}, (*t)->topicId};
 }
 
@@ -368,7 +382,9 @@ Result setCompatibility(const CatalogState& s, const CatalogEvent& e, int64_t of
 }
 
 Result createView(const CatalogState& s, const CatalogEvent& e, int64_t off, const CreateViewOps& o) {
-    if (auto c = createError(s, e, o.view.viewTopicId, "viewTopicId")) return fail(off, Code::Precondition, std::move(*c));
+    std::string redacted;
+    if (auto c = createError(s, e, o.view.viewTopicId, "viewTopicId", &redacted))
+        return fail(off, Code::Precondition, std::move(*c), std::move(redacted));
     if (auto err = checkViewDef(s, e, off, o.view)) return std::unexpected(std::move(*err));
     return StagedCreate{ViewObject{.objectId = e.objectId, .name = e.objectName, .version = 1, .def = o.view,
                                    .nsId = e.nsId}};

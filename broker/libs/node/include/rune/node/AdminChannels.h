@@ -265,6 +265,11 @@ struct DdlMeta {
     /// per-principal fence looks the user up by.  Gateway-set; never parsed back out of the string.
     uint32_t                                   callerNsId           = 0;
     uint16_t                                   authenticatedLocalAt = 0;
+    /// Issue #217: what the session may DESCRIBE (rune::gateway::kKindTopic / kKindView of the request's own target
+    /// name, kDescribeCatalog = DESCRIBE ON CLUSTER).  The admin thread gives the full answer about a colliding object
+    /// only when the gateway said the caller may describe it.  0xFF = everything (in-process callers, the reaper,
+    /// no-auth).
+    uint8_t                                    describeMask         = 0xFF;
     bool operator==(const DdlMeta&) const = default;
 };
 
@@ -652,6 +657,7 @@ void layoutMeta(W& w, const DdlMeta& m) {
     w.i64(m.securityOffset);
     w.u32(m.callerNsId);
     w.u16(m.authenticatedLocalAt);
+    w.u8(m.describeMask);   // issue #217
 }
 inline void readMeta(Reader& r, DdlMeta& m) {
     r.str32(m.statement);
@@ -680,6 +686,7 @@ inline void readMeta(Reader& r, DdlMeta& m) {
         r.fail("an authenticatedLocalAt beyond the authenticated name");   // never trusted
         return;
     }
+    m.describeMask = r.u8();   // issue #217: any byte is a mask (unknown bits grant nothing: only bits 0-2 are read)
 }
 
 template <class W>
@@ -1994,8 +2001,9 @@ template <typename Write>
 // here but by the append-time catalogEventEffectsRefusal.  The static_assert below keeps >= 128 bytes of margin for the
 // four columns (4 x ~30 B) under the SchemaUpdate bound.
 // statement(4) + clientName(2) + sourceAddress(2) + authenticated(2, auth Task 10) + sessionId + requestId hi/lo + flag
-// + the security stamp (flag + offset, issues #218 / #67) + callerNsId(4) + authenticatedLocalAt(2).
-inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 1 + 1 + 8 + 4 + 2;
+// + the security stamp (flag + offset, issues #218 / #67) + callerNsId(4) + authenticatedLocalAt(2)
+// + describeMask(1, issue #217).
+inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 1 + 1 + 8 + 4 + 2 + 1;
 // The trailing adoptDenial length prefix (2, issue #129), the nsId (4, namespaces), then the
 // key features (checked writes Part 05).
 inline constexpr std::size_t kDefineTopicFixedBytes =

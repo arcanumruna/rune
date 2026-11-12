@@ -1023,6 +1023,7 @@ private:
         m.securityOffset  = v.securityOffset;
         m.callerNsId           = v.callerNsId;
         m.authenticatedLocalAt = v.authenticatedLocalAt;
+        m.describeMask         = v.describeMask;   // issue #217
         if (v.replayedFrom)
             m.replayedFrom = rune::catalog::ReplayedFrom{std::string(v.replayedFrom->clusterId),
                                                          v.replayedFrom->offset,

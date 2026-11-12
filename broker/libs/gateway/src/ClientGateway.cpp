@@ -9050,7 +9050,8 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
 // client fields and a {0, 0} request id.  Views into the ingress buffer / session.
 // ---------------------------------------------------------------------------
 rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext, int64_t sessionId,
-                                                     const Session& session, uint32_t targetNsId)
+                                                     const Session& session, uint32_t targetNsId,
+                                                     std::optional<std::string_view> describeLocalName)
 {
     rune::gateway::DdlMetaView m;
     m.targetNsId    = targetNsId;   // namespaces Task 10: the object's resolved namespace (kHiddenNsId = answered missing)
@@ -9066,6 +9067,9 @@ rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext
     // The authenticated user (Task 11; Task 12 makes the catalog principal carry it too): a view into the session's
     // auth state, copied by the admin ring submit before this frame's handler returns.
     m.callerNsId = sessionNsId_(session);   // namespaces Task 9: the login's namespace (0 = `default` / anonymous)
+    // Issue #217: what the session may DESCRIBE under the statement's own target name (a catalog DDL only; every other
+    // caller keeps the default, everything).
+    if (describeLocalName) m.describeMask = describeMaskFor_(session, *describeLocalName, targetNsId);
     const std::string* user = nullptr;
     if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) user = &a->user;
     else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session.auth)) user = &p->user;
@@ -9092,6 +9096,18 @@ rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext
                                                              ext->replayedPrincipal};
     }
     return m;
+}
+
+/// Issue #217: the kinds under `localName` the session may DESCRIBE (kKindTopic / kKindView), plus kDescribeCatalog
+/// when it holds DESCRIBE ON CLUSTER (it may read the whole catalog anyway, #220).  Allow-all (dev / in-process) gets
+/// all three.
+uint8_t ClientGateway::describeMaskFor_(const Session& session, std::string_view localName, uint32_t nsId) const
+{
+    const rune::gateway::PermissionTable& perms = permsOf_(session);
+    uint8_t mask = rune::gateway::allowedKindsForName(perms, localName, rune::security::Operation::Describe, nsId);
+    if (!rune::gateway::authorizeCluster(perms, rune::security::Operation::Describe))
+        mask |= rune::gateway::kDescribeCatalog;
+    return mask;
 }
 
 // The admin sink's verdict → the answer when it did not take the request.
@@ -9239,7 +9255,8 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
                        adminSink_->submitDefineTopic(m.sessionId, m.correlationId, res.local, m.partitionCount,
                                                      m.keyField, m.validate, m.descriptorBlob, m.descriptorLen,
                                                      m.persistence, m.replicationFactor, m.config,
-                                                     ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session, res.nsId),
+                                                     ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session,
+                                                                res.nsId, res.local),
                                                      adopt ? adopt->detail() : std::string_view{},
                                                      m.hasKeyFeatures ? m.keyFeatures : rune::protocol::TopicKeyFeatures{},
                                                      m.hasLease ? std::optional<rune::protocol::LeaseSpec>(m.lease) : std::nullopt),
@@ -9335,7 +9352,8 @@ void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
     answerAdminSubmit_(buf, len,
                        adminSink_->submitAlterTopic(m.sessionId, m.correlationId, res.local, m.expectedVersion,
                                                     m.opsBlob, m.opsLen,
-                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session, res.nsId)),
+                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session,
+                                                               res.nsId, res.local)),
                        "AlterTopic: admin ring full", "AlterTopic: request larger than the admin ring message");
 }
 
@@ -9389,7 +9407,8 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
     answerAdminSubmit_(buf, len,
                        adminSink_->submitCreateView(m.sessionId, m.correlationId, res.local, m.keyField,
                                                     m.persistence, m.planBlob, m.planLen,
-                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session, res.nsId)),
+                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session,
+                                                               res.nsId, res.local)),
                        "CreateView: admin ring full", "CreateView: request larger than the admin ring message");
 }
 
@@ -9427,7 +9446,7 @@ void ClientGateway::handleCatalogDdl_(const uint8_t* buf, std::size_t len, const
         return;
     }
     if (deny_(*session, authorizeCatalogDdl_(*session, m, res.local, res.nsId), buf, len)) return;   // authentication Task 12
-    answerAdminSubmit_(buf, len, submit(m, res.local, ddlMetaOf_(&m.ext, m.sessionId, *session, res.nsId)),
+    answerAdminSubmit_(buf, len, submit(m, res.local, ddlMetaOf_(&m.ext, m.sessionId, *session, res.nsId, res.local)),
                        "catalog DDL: admin ring full", "catalog DDL: request larger than the admin ring message");
 }
 
