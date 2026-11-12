@@ -315,7 +315,8 @@ it answers the ordinary retriable `NotLeader`, and the client's retry (same requ
 the newer state. The rule is per user: an event about another user does not make an admin's pipelined DDL retry. A
 change on the role side (a role's grants, `CREATE ROLE`, `DROP ROLE`), a namespace purge, the bootstrap, and any event
 kind not listed as user-specific count as a change for every user, and so does a principal the admin thread has no
-record of since boot (anonymous, dropped, or not touched since the broker started from a checkpoint). The same rule
+record of (anonymous, or a user that no longer exists). A broker restart replays the whole log through the same
+index, so a user that exists is known after it. The same rule
 covers a security event that is appended but not yet applied. A request whose id is already recorded still gets its
 original result first.
 

@@ -1,6 +1,8 @@
 // SecurityAuthzChangeIndexTest.cpp - issues #218 / #67: the per-principal staleness rule of the admin thread's fence.
 // A request stamped at offset S is stale only if an event applied after S could have changed what ITS user may do:
 // events about that user, and every role-side / wide event; an unknown or anonymous principal is stale on any change.
+#include "support/SecurityRig.h"
+
 #include <rune/node/SecurityAuthzChangeIndex.h>
 
 #include <gtest/gtest.h>
@@ -124,4 +126,30 @@ TEST(SecurityAuthzChangeIndexRegression, TheFencePredicateNeverStalesAtTheStampA
     EXPECT_TRUE(idx.staleAt(8, 5, 0, "ns/alice", 3)) << "the prefix is skipped";
     EXPECT_TRUE(idx.staleAt(8, 5, 0, "ns/", 3)) << "an empty local name is unknown";
     EXPECT_TRUE(idx.staleAt(8, 5, 0, "", 0)) << "anonymous";
+}
+
+// Every boot replays [0, checkpoint] through applyRecord_ (SecurityApplier::replay_), so the index sees every event
+// of the log: a user that exists always has an entry (CreateUser / Bootstrap), and a restart does not make an admin
+// "unknown".  An admin with no event of its own since the boot pipelines across events about others.
+TEST(SecurityAuthzChangeIndexRegression, AnAdminWithNoEventSinceTheBootIsKnownAfterARestartRegression) {
+    rune::node::test::SecurityRig rig("authz_index_restart", /*goLive=*/true);
+    rig.appendEvents(0, 8);
+    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 8);
+    rig.restart();   // same log and checkpoint, a fresh applier
+    ASSERT_GE(rig.applier.replayLocal(rig.log(), rig.rec.bootEffects()), 0);
+    ASSERT_EQ(rig.applier.phaseName(), "Booted");
+    ASSERT_TRUE(rig.applier.goLive(rig.rec.liveEffects()));
+    const auto& idx = [&]() -> const SecurityAuthzChangeIndex& { return rig.applier.authzChanges(); }();
+    ASSERT_EQ(rig.applier.state().appliedOffset(), 7);
+    // "admin" (bootstrap, event 0) has had no event of its own since: known, not stale after the last wide event (4).
+    EXPECT_FALSE(idx.changedSince(0, "admin", 7));
+    EXPECT_TRUE(idx.changedSince(0, "admin", 3)) << "the role grants at 4 are wide";
+    EXPECT_TRUE(idx.changedSince(0, "nobody", 7)) << "a user that does not exist stays strict";
+    rig.appendEvents(8, 9);   // ALTER USER ws1: another user
+    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 1);
+    EXPECT_FALSE(idx.changedSince(0, "admin", 7)) << "across an event about another user";
+    rig.appendEvents(9, 11);   // 9: REVOKE from a role (wide), 10: ALTER USER admin
+    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 2);
+    EXPECT_TRUE(idx.changedSince(0, "admin", 9)) << "across an event about itself";
+    EXPECT_FALSE(idx.changedSince(0, "admin", 10));
 }
