@@ -161,7 +161,9 @@ TEST(AuthSessionBindingRegression, AFrameNamingAnotherSessionsIdNeverOpensRegres
     EXPECT_EQ(attacker.lastConnect()->code, static_cast<int16_t>(pc::ErrorCode::HandshakeFailed));
     EXPECT_NE(attacker.lastConnect()->assignedSessionId, sid);
 
-    std::this_thread::sleep_for(200ms);   // let the gateway poll everything the attacker sent
+    // No wait is needed: the DefineTopic, the Disconnect and the Connect all went out through the attacker's one
+    // Aeron publication (same channel and stream), which the gateway polls in order and handles inline.  The
+    // Connect's answer (awaited above) is therefore the event proving the Disconnect before it was already handled.
     EXPECT_TRUE(b.node().gatewayHasSessionForTest(sid)) << "a plaintext Disconnect never ends an encrypted session";
     // The admin's own session still works, and the topic the attacker named was never created by its request.
     const auto made = admin->defineTopicAndWait("hijacked", 1, "", {}, 20s);
