@@ -249,12 +249,14 @@ public:
                      AdminDeps deps,
                      ViewRegistry* viewRegistry = nullptr,
                      rune::replication::PartitionReplica* catalogReplica = nullptr,
-                     rune::replication::WorkerReplicationTransport* catalogPlane = nullptr)
+                     rune::replication::WorkerReplicationTransport* catalogPlane = nullptr,
+                     int egressRingBytes = kAdminEgressRingBytes)   // tests shrink it (not the staging buffer)
         : worker_(reg, selfId, std::move(deps), viewRegistry, catalogReplica, catalogPlane)
         , catalogSchemas_(&reg)
         , requestRing_(kAdminRequestRingBytes)
         , controlToAdminRing_(kControlToAdminRingBytes)
-        , roleRing_(kAdminRoleRingBytes) {}
+        , roleRing_(kAdminRoleRingBytes)
+        , egressRing_(egressRingBytes) {}
 
     const char* name() const noexcept override { return "rune-admin"; }
 
@@ -762,7 +764,8 @@ public:
     /// Authentication Task 10 (D24) - ADMIN thread only (deps.respondSecurity).  A DdlResponse for a security DDL /
     /// bootstrap.  `gateOffset` >= 0 (an OK): posted as kMsgEgressFrameGated [session][eventOffset][frame] - the control
     /// thread releases it only once ITS SecurityView applied that event and its refresh reached the workers; otherwise
-    /// an ordinary egress frame.  The detail is cut to what one frame holds (never a refused answer).
+    /// an ordinary egress frame.  The detail is cut to what one frame holds (never a refused answer).  An answer that
+    /// cannot be posted (it does not fit one egress message) halts the broker in every build type: it is never dropped.
     void postSecurityResponse(int64_t session, int64_t corr, uint16_t code, uint64_t objectId, uint32_t newVersion,
                               int64_t gateOffset, std::string_view detail) {
         namespace pc = rune::protocol::client;
@@ -774,18 +777,20 @@ public:
         r.newVersion    = newVersion;
         r.gateTopicId   = -1;
         const std::size_t fixed = pc::MessageHeader::ENCODED_SIZE + pc::DdlResponse::BODY_FIXED + 2u;
-        r.detail = detail.substr(0, std::min<std::size_t>({detail.size(), 0xFFFFu, 1024u, maxEgressFrameBytes() - fixed - 8u}));
+        const std::size_t room = maxEgressFrameBytes() > fixed + 8u ? maxEgressFrameBytes() - fixed - 8u : 0;
+        r.detail = detail.substr(0, std::min<std::size_t>({detail.size(), 0xFFFFu, 1024u, room}));
         if (gateOffset < 0) {
             const std::size_t n = r.encode(egressStage_.data());
-            [[maybe_unused]] const bool posted = n > 0 && postEgressFrame(session, egressStage_.data(), n);
-            assert(posted && "a clamped DdlResponse always fits one admin egress message");
+            if (n == 0 || !postEgressFrame(session, egressStage_.data(), n)) [[unlikely]]
+                haltAnswerUnpostable_(session, corr);
             return;
         }
         // [eventOffset:i64][frame], keyed with the gated bit; the ring/backlog prepend the session.
         admin_wire::putI64(egressStage_.data(), gateOffset);
         const std::size_t n = r.encode(egressStage_.data() + 8);
         const std::size_t total = 8 + n;
-        if (n == 0 || 8 + total > static_cast<std::size_t>(egressRing_.maxMsgLength())) [[unlikely]] return;
+        if (n == 0 || 8 + total > static_cast<std::size_t>(egressRing_.maxMsgLength())) [[unlikely]]
+            haltAnswerUnpostable_(session, corr);
         const int64_t key = session | kGatedKeyBit;
         if (egressBacklog_.empty() && tryPostEgress_(key, egressStage_.data(), total)) return;
         if (!egressBacklog_.push(key, egressStage_.data(), total)) [[unlikely]] haltEgressBacklogFull_();
@@ -1092,7 +1097,7 @@ private:
                      static_cast<uint64_t>(removed));
     }
     OneToOneByteRing roleRing_;        // control → admin (role events)
-    OneToOneByteRing egressRing_{kAdminEgressRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
+    OneToOneByteRing egressRing_;   // admin → control (response frames: [sessionId:i64][frame])
     // Catalog history Task 12: the catalog read server's own egress — never behind
     // the DDL answer gate, never filling the DDL answers' ring.  One frame (a
     // Records of whole catalog batches) always fits the gateway's spill staging.
@@ -1417,6 +1422,14 @@ private:
         spdlog::critical("AdminWorkerAgent: DDL egress backlog full ({} answers, {} B) beyond its "
                          "static bound — halting rather than dropping a DDL answer",
                          egressBacklog_.count(), egressBacklog_.usedBytes());
+        std::abort();
+    }
+
+    // A security DDL answer that cannot be posted (it does not fit one egress message): halt, never drop it.
+    [[noreturn]] [[gnu::cold]] [[gnu::noinline]] void haltAnswerUnpostable_(int64_t session,
+                                                                           int64_t corr) const noexcept {
+        spdlog::critical("AdminWorkerAgent: a security DDL answer (session {}, correlation {}) does not fit one egress "
+                         "message — halting rather than dropping the answer", session, corr);
         std::abort();
     }
 

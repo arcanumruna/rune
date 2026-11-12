@@ -24,6 +24,8 @@
 #include <rune/protocol/client/SchemaMessages.h>
 
 #include <gtest/gtest.h>
+#include <spdlog/sinks/stdout_sinks.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <string>
@@ -781,4 +783,21 @@ TEST(AdminWorkerRegression, OverBudgetANeutralAlterIsAdmittedAndARaiseOnAnyTopic
     EXPECT_EQ(rig.alterConfig("small", {{rc::ConfigKey::RetentionBytes, 100LL << 20}}).code, 39)
         << "small alone fits, but the broker's total is above the limit and grows";
     EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 1u);
+}
+
+// #204: a security DDL answer that cannot be posted (it does not fit one egress message) halts the broker in every
+// build type; it used to be dropped silently (gated) or caught by an assert only in debug builds (ungated).
+TEST(PostSecurityResponseDeathRegression, AnAnswerThatCannotBePostedHaltsRegression) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    for (const int64_t gateOffset : {int64_t{-1}, int64_t{5}}) {   // ungated, gated
+        EXPECT_DEATH({
+            // spdlog's default sink is stdout: send the critical line to stderr, where a death test reads it.
+            spdlog::set_default_logger(spdlog::create<spdlog::sinks::stderr_sink_mt>("death"));
+            rune::node::SchemaRegistry schemas;
+            // The smallest ring (256 B, 32 B per message) is below one bare DdlResponse.
+            AdminWorkerAgent agent(schemas, /*selfId=*/1, AdminDeps{}, nullptr, nullptr, nullptr,
+                                   /*egressRingBytes=*/256);
+            agent.postSecurityResponse(/*session=*/7, /*corr=*/9, /*code=*/0, 0, 0, gateOffset, "ok");
+        }, "halting rather than dropping the answer") << "gateOffset " << gateOffset;
+    }
 }
