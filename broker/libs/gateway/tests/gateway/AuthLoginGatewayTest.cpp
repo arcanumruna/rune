@@ -2596,3 +2596,123 @@ TEST(AuthReapRegression, OneSessionScanPerReapPassRegression) {
     EXPECT_FALSE(rig.gw.hasSessionForTest(idle));
     EXPECT_TRUE(rig.gw.hasSessionForTest(live));
 }
+
+// ── Issue #202: a held login OK lives in its session ───────────────────────────────────────────────────────────────────
+namespace {
+struct HeldLoginRig {
+    Rig rig;
+    rune::node::WorkerPool pool{1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16};
+    HeldLoginRig() {
+        rig.gw.setWorkerPool(&pool);
+        rig.gw.setShardMode(true);
+        rig.gw.setMaxUnauthenticatedSessionsPerHost(1000);
+        rig.gw.holdPermissionShippingForTest(true);   // the lifecycle rings take nothing: every login OK is held
+    }
+    struct Pending { int64_t sid = 0, finalCorr = 0; std::array<uint8_t, 64> signature{}; };
+    /// Both legs of a login of `ws1` on a new session; the final's correlation id and the signature the client verifies.
+    Pending login() {
+        Pending p;
+        p.sid = rig.newSession();
+        const std::string nonce = "held-" + std::to_string(++rig.corr);
+        pc::AuthClientFirst cf;
+        cf.sessionId = p.sid; cf.correlationId = ++rig.corr; cf.username = "ws1"; cf.clientNonce = nonce;
+        std::vector<uint8_t> b(cf.encodedSize()); b.resize(cf.encode(b.data()));
+        rig.send(b);
+        const Frame* sf = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFirst), p.sid);
+        EXPECT_NE(sf, nullptr);
+        if (sf == nullptr) return p;
+        const auto first = pc::AuthServerFirst::decode(sf->bytes.data(), sf->bytes.size());
+        auto ans = scramAnswer("ws1", nonce, *first, {kTestPasswordA, ""}, p.sid, ++rig.corr);
+        p.finalCorr = ans->final.correlationId;
+        p.signature = ans->expectedSignature[0];
+        std::vector<uint8_t> fb(ans->final.encodedSize()); fb.resize(ans->final.encode(fb.data()));
+        rig.send(fb);
+        return p;
+    }
+    [[nodiscard]] std::size_t finalsOf(int64_t sid) const {
+        std::size_t n = 0;
+        for (const Frame& f : rig.seen) if (f.tid == static_cast<uint16_t>(pc::TemplateId::AuthServerFinal) && f.sid == sid) ++n;
+        return n;
+    }
+    /// Let the workers accept everything (bounded passes) and release the held OKs.
+    void release() {
+        rig.gw.holdPermissionShippingForTest(false);
+        for (int64_t pass = 1; pass <= 2000 && rig.gw.heldLoginOksForTest() != 0; ++pass) {
+            (void)rig.gw.servicePermissionShippingForTest();
+            pool.worker(0).doWork(pass);
+            rig.gw.drainWorkerReturnsForTest(pass);
+        }
+    }
+};
+}  // namespace
+
+TEST(HeldLoginFinalRegression, HeldOksAreReleasedInOrderWithTheSameBytesRegression) {
+    HeldLoginRig h;
+    std::vector<HeldLoginRig::Pending> logins;
+    const std::size_t seenBefore = h.rig.seen.size();
+    for (int i = 0; i < 200; ++i) logins.push_back(h.login());
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 200u);
+    for (const auto& p : logins) EXPECT_EQ(h.finalsOf(p.sid), 0u) << "no OK before the grants are accepted";
+    EXPECT_GT(h.rig.seen.size(), seenBefore);
+    (void)h.rig.gw.servicePermissionShippingForTest();   // a service pass while the shipper is held releases nothing
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 200u);
+    for (const auto& p : logins) EXPECT_EQ(h.finalsOf(p.sid), 0u);
+    const std::size_t releasedFrom = h.rig.seen.size();
+    h.release();
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 0u);
+    std::vector<int64_t> order;
+    for (std::size_t i = releasedFrom; i < h.rig.seen.size(); ++i)
+        if (h.rig.seen[i].tid == static_cast<uint16_t>(pc::TemplateId::AuthServerFinal)) order.push_back(h.rig.seen[i].sid);
+    ASSERT_EQ(order.size(), logins.size());
+    for (std::size_t i = 0; i < logins.size(); ++i) {
+        EXPECT_EQ(order[i], logins[i].sid) << "released in login order (" << i << ")";
+        EXPECT_EQ(h.finalsOf(logins[i].sid), 1u);
+        const Frame* f = h.rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), logins[i].sid);
+        ASSERT_NE(f, nullptr);
+        const auto fin = pc::AuthServerFinal::decode(f->bytes.data(), f->bytes.size());
+        ASSERT_TRUE(fin.has_value());
+        EXPECT_EQ(fin->errorCode, 0);
+        EXPECT_EQ(fin->flags, 0);
+        EXPECT_EQ(fin->sessionId, logins[i].sid);
+        EXPECT_EQ(fin->correlationId, logins[i].finalCorr);
+        ASSERT_EQ(fin->serverSignature.size(), 64u);
+        EXPECT_EQ(std::memcmp(fin->serverSignature.data(), logins[i].signature.data(), 64), 0)
+            << "the signature the client verifies";
+    }
+    // A login that is not held (the rings take the bind at once) answers with the same frame shape.
+    const auto direct = h.login();
+    EXPECT_EQ(h.finalsOf(direct.sid), 1u);
+    const Frame* df = h.rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), direct.sid);
+    const Frame* hf = h.rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), logins[0].sid);
+    ASSERT_TRUE(df != nullptr && hf != nullptr);
+    EXPECT_EQ(df->bytes.size(), hf->bytes.size());
+}
+
+TEST(HeldLoginFinalRegression, AClosedHeldSessionLeavesTheListRegression) {
+    HeldLoginRig h;
+    std::vector<HeldLoginRig::Pending> p;
+    for (int i = 0; i < 5; ++i) p.push_back(h.login());   // A..E
+    ASSERT_EQ(h.rig.gw.heldLoginOksForTest(), 5u);
+    const auto close = [&](std::size_t i) { h.rig.send(disconnectFrame(p[i].sid, ++h.rig.corr)); };
+    close(2);   // C: the middle
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 4u);
+    close(0);   // A: the head
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 3u);
+    close(4);   // E: the tail
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 2u);
+    for (const std::size_t i : {0u, 2u, 4u}) EXPECT_FALSE(h.rig.gw.hasSessionForTest(p[i].sid));
+    h.release();
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 0u);
+    EXPECT_EQ(h.finalsOf(p[1].sid), 1u);
+    EXPECT_EQ(h.finalsOf(p[3].sid), 1u);
+    for (const std::size_t i : {0u, 2u, 4u}) EXPECT_EQ(h.finalsOf(p[i].sid), 0u) << "nothing for a closed session";
+    // The list is consistent after emptying.
+    h.rig.gw.holdPermissionShippingForTest(true);
+    const auto f = h.login();
+    const auto g = h.login();
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 2u);
+    h.release();
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 0u);
+    EXPECT_EQ(h.finalsOf(f.sid), 1u);
+    EXPECT_EQ(h.finalsOf(g.sid), 1u);
+}

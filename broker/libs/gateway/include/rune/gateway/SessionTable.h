@@ -202,6 +202,15 @@ struct Session {
         }
     };
     std::unordered_map<SubKey, int64_t, SubKeyHash> subIdByKey;
+    /// Issue #202: a login OK held until every worker accepted this session's grants (shard mode); epoch 0 = none.  The
+    /// gateway links the held sessions into a FIFO through prev / next (session ids are never 0).
+    struct HeldLoginOk {
+        uint64_t epoch = 0;                          ///< the shipper epoch the OK waits for
+        int64_t  correlationId = 0;
+        uint8_t  flags = 0;                          ///< AuthServerFinal.flags
+        std::array<uint8_t, 64> serverSignature{};
+        int64_t  prev = 0, next = 0;                 ///< 0 = none
+    } heldLoginOk;
     // Authentication Task 14: the correlation ids of this session's `__catalog` / `__security` Subscribes (the admin
     // thread owns the subscriptions; a live permission loss answers ErrorResponse{NotAuthorized} on each of these).
     // Cold, bounded (kMaxReadCorrs, oldest dropped); a stale entry (already unsubscribed) only costs one ignored frame.

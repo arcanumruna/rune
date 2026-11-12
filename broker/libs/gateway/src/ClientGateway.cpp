@@ -1688,12 +1688,11 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     // Each pub is retired: kept alive until its worker acknowledges the release.
     for (auto& [w, pub] : s->recordEgressByWorker)
         if (pub) retireRecordEgress_(sid, w, std::move(pub));
+    if (s->heldLoginOk.epoch != 0) unlinkHeldLoginOk_(*s);   // issue #202: before the session leaves the table
     sessions_.remove(sid);                    // releases its (gateway-written) egress publication
     // Task 13: the workers forget it too (its queued acks drop, its
     // publications are released) — retried until every worker has it.
     if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, sid);
-    for (std::size_t i = 0; i < heldLoginFinals_.size(); ++i)
-        if (heldLoginFinals_[i].sessionId == sid) { heldLoginFinals_.erase(heldLoginFinals_.begin() + static_cast<std::ptrdiff_t>(i)); break; }
     // Hybrid egress: drop any in-flight record-egress resolves for this session
     // (all workers — its buffered subscribes die with the session).
     for (auto pit = pendingRecordEgress_.begin(); pit != pendingRecordEgress_.end(); ) {
@@ -10434,8 +10433,7 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     const std::size_t finalLen = f.encode(scratch_.data());
     if (shipEpoch != 0 && permissionShipper_.shippedSeq() < shipEpoch) {
         // A worker's lifecycle ring is full: hold the OK (cold, login rate) until every worker accepted the bitmap.
-        heldLoginFinals_.push_back({session->sessionId, shipEpoch,
-                                    std::vector<uint8_t>(scratch_.data(), scratch_.data() + finalLen)});
+        holdLoginOk_(*session, shipEpoch, f.correlationId, f.flags, std::span<const uint8_t>(ok.serverSignature));
         return;
     }
     sendAnswer_(*session, scratch_.data(), finalLen);
@@ -10477,14 +10475,65 @@ int ClientGateway::servicePermissionShippingWork_()
         const uint64_t shipped = permissionShipper_.shippedSeq();
         std::erase_if(objectShipSeqs_, [shipped](const auto& e) { return e.second <= shipped; });
     }
-    for (std::size_t i = 0; i < heldLoginFinals_.size(); ) {
-        HeldLoginFinal& h = heldLoginFinals_[i];
-        if (permissionShipper_.shippedSeq() < h.epoch) { ++i; continue; }
-        if (Session* s = sessions_.find(h.sessionId)) sendAnswer_(*s, h.frame.data(), h.frame.size());
-        heldLoginFinals_.erase(heldLoginFinals_.begin() + static_cast<std::ptrdiff_t>(i));
+    while (heldLoginHead_ != 0) {
+        Session* s = sessions_.find(heldLoginHead_);
+        if (s == nullptr) [[unlikely]] {   // closeSession_ unlinks a held session before it leaves the table
+            spdlog::error("gateway: held login list names session {} that is not in the table; list reset", heldLoginHead_);
+            heldLoginHead_ = heldLoginTail_ = 0;
+            heldLoginCount_ = 0;
+            break;
+        }
+        if (permissionShipper_.shippedSeq() < s->heldLoginOk.epoch) break;   // FIFO: epochs only grow
+        unlinkHeldLoginOk_(*s);
+        sendHeldLoginOk_(*s);
         ++work;
     }
     return work;
+}
+
+void ClientGateway::holdLoginOk_(Session& s, uint64_t epoch, int64_t corr, uint8_t flags, std::span<const uint8_t> signature)
+{
+    if (s.heldLoginOk.epoch != 0) unlinkHeldLoginOk_(s);
+    auto& h = s.heldLoginOk;
+    h.epoch = epoch;
+    h.correlationId = corr;
+    h.flags = flags;
+    h.serverSignature.fill(0);
+    std::memcpy(h.serverSignature.data(), signature.data(), std::min(signature.size(), h.serverSignature.size()));
+    h.prev = heldLoginTail_;
+    h.next = 0;
+    if (heldLoginTail_ != 0) {
+        if (Session* t = sessions_.find(heldLoginTail_)) t->heldLoginOk.next = s.sessionId;
+    } else {
+        heldLoginHead_ = s.sessionId;
+    }
+    heldLoginTail_ = s.sessionId;
+    ++heldLoginCount_;
+}
+
+void ClientGateway::unlinkHeldLoginOk_(Session& s)
+{
+    auto& h = s.heldLoginOk;
+    if (h.epoch == 0) return;
+    if (h.prev != 0) { if (Session* p = sessions_.find(h.prev)) p->heldLoginOk.next = h.next; }
+    else heldLoginHead_ = h.next;
+    if (h.next != 0) { if (Session* n = sessions_.find(h.next)) n->heldLoginOk.prev = h.prev; }
+    else heldLoginTail_ = h.prev;
+    h.epoch = 0;
+    h.prev = h.next = 0;
+    if (heldLoginCount_ > 0) --heldLoginCount_;
+}
+
+void ClientGateway::sendHeldLoginOk_(Session& s)
+{
+    pc::AuthServerFinal f;
+    f.sessionId       = s.sessionId;
+    f.correlationId   = s.heldLoginOk.correlationId;
+    f.errorCode       = 0;
+    f.flags           = s.heldLoginOk.flags;
+    f.serverSignature = std::string_view(reinterpret_cast<const char*>(s.heldLoginOk.serverSignature.data()),
+                                         s.heldLoginOk.serverSignature.size());
+    sendAnswer_(s, scratch_.data(), f.encode(scratch_.data()));
 }
 
 int ClientGateway::servicePermissionShipping_()

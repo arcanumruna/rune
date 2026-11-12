@@ -538,6 +538,8 @@ public:
         permissionShipper_.setHoldForTest(on);
         if (!on) (void)servicePermissionShippingWork_();
     }
+    /// Issue #202 test seam: logins whose OK is held until every worker accepted the session's grants.
+    [[nodiscard]] std::size_t heldLoginOksForTest() const noexcept { return heldLoginCount_; }
     /// Issue #189 test seam (control thread): forget every login-throttle entry (no allocation).
     void resetLoginThrottleForTest() noexcept { loginThrottle_.clear(); }
     /// Issue #594 test seam (control thread): the login throttle's base delay in ms (<= 0 keeps the default 250 ms).
@@ -657,7 +659,7 @@ public:
     /// Issue #197 (control thread): true once every shipper item queued when object `id` was applied (new permission
     /// tables, WRITE-bit patches) was accepted by EVERY worker's lifecycle ring - or when nothing was owed.  The DDL
     /// answer gate holds a DefineTopic / CreateView / AlterView OK on it, exactly as a login's final waits on its
-    /// epoch (`heldLoginFinals_`): the worker's grace hold covers an item on its ring, not one still queued here.
+    /// epoch (`holdLoginOk_`): the worker's grace hold covers an item on its ring, not one still queued here.
     [[nodiscard]] bool objectPermissionsShipped(int32_t id) const noexcept {
         for (const auto& e : objectShipSeqs_)
             if (e.first == id) return e.second <= permissionShipper_.shippedSeq();
@@ -3070,10 +3072,15 @@ private:
     // Authentication Task 13 (D30): WRITE bitmaps to every worker; a login's AuthServerFinal{OK} waits for its epoch.
     rune::node::PermissionShipper permissionShipper_;
     uint64_t permEpoch_ = 0;
-    struct HeldLoginFinal { int64_t sessionId; uint64_t epoch; std::vector<uint8_t> frame; };
     /// Issue #197: (object id, the shipper seq that must be shipped before that object's DDL OK may leave).  Cold, DDL rate.
     std::vector<std::pair<int32_t, uint64_t>> objectShipSeqs_;
-    std::vector<HeldLoginFinal> heldLoginFinals_;     ///< cold: one per login whose grants are still being shipped
+    /// Issue #202: the sessions whose login OK is held (`Session::heldLoginOk`), oldest first; epochs only grow, so they are
+    /// released in this order.  Bounded by the session table; no allocation.  0 = none.
+    int64_t     heldLoginHead_ = 0, heldLoginTail_ = 0;
+    std::size_t heldLoginCount_ = 0;
+    void holdLoginOk_(Session& s, uint64_t epoch, int64_t corr, uint8_t flags, std::span<const uint8_t> signature);
+    void unlinkHeldLoginOk_(Session& s);
+    void sendHeldLoginOk_(Session& s);
     /// Bind `session` to its table on every worker (Required mode + shard mode only; the table itself is shipped once
     /// per grant set); returns the bind's shipper sequence (0 = nothing to ship).
     uint64_t shipPermissions_(const Session& session);
