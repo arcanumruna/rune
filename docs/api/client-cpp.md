@@ -427,15 +427,15 @@ sub = client.subscribe(events, Key(uint64_t{42}), {.from = From::earliest()},
         if (!ring.tryPush(rec) && !sub.pause(rec.offset)) dropped.increment();
     });
 for (;;) {
-    client.doWork(nowNs);
+    client.doWork();
     // when the ring has room again:
     if (sub.paused()) sub.resume();
 }
 ```
 
-In Thread mode the duty thread can call the handler before `subscribe` has returned, so a handler must not use the handle
-until the application has assigned it. An application that needs to pause from the handler in Thread mode should hand the
-record to its own thread and call `pause` there.
+In Thread mode the duty thread can call the handler before `subscribe` has returned, so the handler must not use the handle
+until the application has assigned it and published that to the handler. From then on `pause` inside the handler behaves
+as in Invoker mode.
 
 - `pause(resumeAt = -1)` releases the broker side of the subscription (an `Unsubscribe`) and parks it. With `resumeAt < 0`
   delivery continues after the last record the handler returned from. With `resumeAt >= 0` the next record delivered after
@@ -445,14 +445,18 @@ record to its own thread and call `pause` there.
   subscription, reaches the handler. Pausing an already paused subscription only lowers (or keeps) its position.
 - `resume()` subscribes again at the stored position. Each record is delivered exactly once: a batch the broker pushes from
   below the position is trimmed. A `dataResets()` count and a leader move are handled as for any subscription.
-- `paused()` is true from the moment a pause has taken effect until `resume()` or the end of the subscription.
+- `paused()` is true between a successful `pause()` and `resume()` or the end of the subscription.
   `active()` is false while the subscription is paused.
 - A `From::latest()` subscription paused before its first record resolves "latest" again at `resume()`, so the records
   produced during the pause are skipped.
 - Both calls return `false` when the subscription is finished or unsubscribed, when `resumeAt` is above the position, for
   `resume()` when it is not paused, and always for the subscriptions of a `LeaseWatch` (they are not pausable).
+  `pause()` also returns `false` while the client holds 64 releases the transport has not yet accepted; the subscription
+  keeps delivering.
 - **Visibility across threads.** The calls are safe on any thread. On an application thread, `pause()` returning `true`
-  means the request was sent to the client's duty thread; `paused()` shows when it took effect. `resumeAt` is checked
+  means the request was queued for the client's duty thread, not that it was applied; `paused()` reads `true` on that handle
+  at once and turns `false` again if the duty thread did not apply the pause (the subscription ended, or the client had no
+  room to hold the release for the broker). It converges through the status the duty thread publishes back. `resumeAt` is checked
   there against the last status the handle has seen, so `pause(x)` can be refused for an `x` the duty thread has already
   delivered. A pause made from inside a message handler (the duty thread) becomes visible to the application thread
   eventually, not immediately: the duty thread publishes it on the status ring and the handle adopts it when the application
