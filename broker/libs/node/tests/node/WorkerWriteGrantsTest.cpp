@@ -283,6 +283,31 @@ TEST(WorkerWriteGrantRegression, ASecondAnnounceOfAKnownSessionKeepsItsGrants) {
     EXPECT_TRUE(allowsWrite(*f.slot(5), 1)) << "a re-announce must not wipe an authenticated session's grants";
 }
 
+// Issue #198: a later announce wave (the crypto-key second wave) of a session that already holds a bound table never
+// resets its grants.  A session is accepted only after its FIRST wave reached every worker and binds exist only for
+// accepted sessions, so "first announce before bind" is the only cross-queue order that matters.
+TEST(WorkerWriteGrantRegression, ALaterAnnounceWaveKeepsTheBoundGrantsRegression) {
+    Fixture f;
+    f.announce(5, false);                                    // first wave
+    f.tableChunk(f.tableOf(5), 0, 1, bitsFor({1}, 1), true);
+    f.bind(5, f.tableOf(5), /*epoch=*/4, /*owner=*/9);
+    f.steps(8);
+    ASSERT_NE(f.slot(5), nullptr);
+    const WriteGrantSlot before = *f.slot(5);
+    ASSERT_EQ(before.epoch, 4u);
+    ASSERT_TRUE(allowsWrite(before, 1));
+    f.announce(5, false);                                    // second wave (the key wave) of the same session
+    f.steps(8);
+    ASSERT_NE(f.slot(5), nullptr);
+    EXPECT_EQ(f.slot(5)->table, before.table) << "still bound to the same table";
+    EXPECT_EQ(f.slot(5)->epoch, 4u);
+    EXPECT_EQ(f.slot(5)->ownerTag, before.ownerTag) << "the owner tag is unchanged";
+    EXPECT_EQ(f.worker->permBindsUnknownSessionForTest(), 0u);
+    f.produce(5, 1, /*topicId=*/1);
+    ASSERT_TRUE(f.awaitAck(1));
+    EXPECT_EQ(f.acks[1].errorCode, 0) << "a produce to the granted topic is accepted";
+}
+
 TEST(WorkerWriteGrantRegression, SlotsMoveWithBackwardShiftDeletion) {
     Fixture f;
     // Two sessions with the same home slot: the second sits one past it; erasing the first shifts it back.

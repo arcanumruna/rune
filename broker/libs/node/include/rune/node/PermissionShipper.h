@@ -61,6 +61,9 @@ public:
         return push_(pool, std::move(it));
     }
     /// Session `sessionId` uses table `tableId` (kDenyTable: nothing); `owner` (issue #122) its principal.
+    /// Issue #198: only called for an accepted session, whose first announce wave already reached every worker (the
+    /// accept waits for it), so the bind never precedes the announce on a worker's ring; a later announce wave of the
+    /// same session keeps the bound table (SessionAckSink::announce seeds grants only for a new session).
     uint64_t bind(WorkerPool& pool, int64_t sessionId, int64_t tableId, uint64_t epoch, uint64_t owner) {
         Item it{Kind::Bind};
         it.key = sessionId; it.first = static_cast<uint64_t>(tableId); it.epoch = epoch; it.owner = owner;

@@ -362,6 +362,8 @@ public:
         const bool fresh = (idx == kNone);
         if (fresh) idx = insert_(sessionId);
         if (idx == kNone) return false;                                   // table full
+        // Issue #198: only a NEW session seeds its grants.  A session is accepted (and so bound) only after its first
+        // announce wave reached every worker, and a re-announce (the key wave) of a known one never resets them.
         if (fresh) grants_[idx].table = grantAll ? allowAllWriteTable() : denyWriteTable();
         clientVersion_[idx] = clientVersion;
         boundImage_[idx] = 0;                                              // Task 6: a plain announce is never response-mode
