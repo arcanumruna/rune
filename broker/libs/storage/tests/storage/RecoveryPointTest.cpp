@@ -1203,3 +1203,356 @@ TEST(BatchHeaderCursorRegression, UpperBoundRegression) {
     EXPECT_EQ(BatchHeaderCursor::upperFor(10, int64_t{1} << 40), int64_t{10} + INT32_MAX + 1);
     EXPECT_EQ(BatchHeaderCursor::upperFor(std::numeric_limits<int64_t>::max() - 5), std::numeric_limits<int64_t>::max());
 }
+
+// ===========================================================================
+// #880: a damaged sealed segment is rebuilt in a side file from the batches a peer holds, then swapped in.
+// ===========================================================================
+namespace {
+
+std::vector<uint8_t> slurp(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)), {});
+}
+
+// Bytes of the whole batches [fromBatch, toBatch) of `bytes` (batch starts from batchStarts of the same file).
+std::vector<uint8_t> sliceBatches(const std::vector<uint8_t>& bytes, const std::vector<std::size_t>& starts,
+                                  std::size_t fromBatch, std::size_t toBatch) {
+    const std::size_t a = starts.at(fromBatch);
+    const std::size_t b = toBatch >= starts.size() ? bytes.size() : starts.at(toBatch);
+    return std::vector<uint8_t>(bytes.begin() + static_cast<std::ptrdiff_t>(a),
+                                bytes.begin() + static_cast<std::ptrdiff_t>(b));
+}
+
+// One damaged sealed segment `k` of a DamagedFixture: the original bytes (what an intact peer holds), the damage point.
+struct RepairCase {
+    DamagedFixture f;
+    std::size_t k;
+    std::string path;
+    std::vector<uint8_t> orig;
+    std::vector<std::size_t> starts;
+    int64_t base = 0, end = 0;
+    int64_t damageOffset = 0;   // first offset of batch `j`
+    std::size_t j;
+    std::vector<uint8_t> damaged;   // the file after the damage
+
+    RepairCase(const char* stem, std::size_t segIndex, std::size_t batchIndex)
+        : f(stem, 4, true), k(segIndex), j(batchIndex) {
+        base = f.bases.at(k);
+        end = f.bases.at(k + 1);
+        path = segPath(f.dir, base);
+        orig = slurp(path);
+        starts = batchStarts(path);
+        damageOffset = batchBaseAt(path, starts.at(j));
+        xorByteAt(path, starts.at(j) + static_cast<std::size_t>(batch::kRecordBatchOverhead));
+        damaged = slurp(path);
+    }
+    std::vector<uint8_t> missing() const { return sliceBatches(orig, starts, j, starts.size()); }
+};
+
+bool hasFileWith(const fs::path& dir, const std::string& needle, const std::string& suffix) {
+    for (const auto& e : fs::directory_iterator(dir)) {
+        const std::string n = e.path().filename().string();
+        if (n.find(needle) != std::string::npos && n.size() >= suffix.size() &&
+            n.compare(n.size() - suffix.size(), suffix.size(), suffix) == 0) return true;
+    }
+    return false;
+}
+
+std::string onlyFileWith(const fs::path& dir, const std::string& needle, const std::string& suffix) {
+    std::string found;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        const std::string n = e.path().filename().string();
+        if (n.find(needle) != std::string::npos && n.size() >= suffix.size() &&
+            n.compare(n.size() - suffix.size(), suffix.size(), suffix) == 0) found = e.path().string();
+    }
+    return found;
+}
+
+void expectNoDamage(Log& log) {
+    EXPECT_EQ(log.damagedSegmentCount(), 0u);
+    EXPECT_FALSE(log.firstDamageOffset().has_value());
+}
+
+}  // namespace
+
+TEST(LogSegmentRepairRegression, ExactMissingBatchesRepairTheSegmentRegression) {
+    RepairCase c("rep_exact", 0, 1);
+    auto log = openRecovered(c.f.dir, kDmgRoll, false);
+    ASSERT_EQ(log->damagedSegmentCount(), 1u);
+    ASSERT_EQ(readAt(*log, c.damageOffset).st, ReadIntoStatus::Corrupt);
+    const auto rep = log->beginSegmentRepair(c.base);
+    ASSERT_TRUE(rep.has_value());
+    EXPECT_EQ(rep->base, c.base);
+    EXPECT_EQ(rep->damageOffset, c.damageOffset);
+    EXPECT_EQ(rep->endOffset, c.end);
+    EXPECT_EQ(log->segmentRepairBase(), std::optional<int64_t>(c.base));
+    EXPECT_TRUE(fs::exists(Log::repairLogPath(c.f.dir.string(), c.base)));
+    EXPECT_EQ(fs::file_size(c.path), c.damaged.size()) << "the damaged file is untouched until the commit";
+    const auto got = log->appendRepairBatches(c.missing());
+    ASSERT_EQ(got.status, Log::RepairAppendStatus::Ok);
+    EXPECT_EQ(got.cursor, c.end) << "the peer's batches run up to the segment's end";
+    ASSERT_EQ(log->commitSegmentRepair(), Log::RepairCommitStatus::Ok);
+    EXPECT_FALSE(log->segmentRepairBase().has_value());
+    expectNoDamage(*log);
+    EXPECT_EQ(log->cleanerGroupsRejected(), 0u);
+    EXPECT_EQ(readAt(*log, c.damageOffset).st, ReadIntoStatus::Ok) << "served from the new handle at once";
+    expectGapFree(*log);
+    log->runCleanerFileOps(0);
+    EXPECT_EQ(slurp(c.path), c.orig) << "the repaired file is byte-identical to the intact original";
+    EXPECT_FALSE(hasFileWith(c.f.dir, ".log.", ".cleaned"));
+    EXPECT_FALSE(hasFileWith(c.f.dir, ".index.", ".cleaned"));
+    EXPECT_FALSE(fs::exists(Log::repairLogPath(c.f.dir.string(), c.base)));
+    expectGapFree(*log);
+    EXPECT_NE(log->ownerSealedSnapshot(), nullptr);
+}
+
+TEST(LogSegmentRepairRegression, CommitThenReopenHasNoDamageAndTheSameBytesRegression) {
+    RepairCase c("rep_reopen", 0, 1);
+    {
+        auto log = openRecovered(c.f.dir, kDmgRoll, false);
+        ASSERT_TRUE(log->beginSegmentRepair(c.base).has_value());
+        ASSERT_EQ(log->appendRepairBatches(c.missing()).status, Log::RepairAppendStatus::Ok);
+        ASSERT_EQ(log->commitSegmentRepair(), Log::RepairCommitStatus::Ok);
+    }   // a clean close completes the posted renames
+    EXPECT_EQ(slurp(c.path), c.orig);
+    auto rec = openRecovered(c.f.dir, kDmgRoll, false);
+    expectNoDamage(*rec);
+    EXPECT_EQ(rec->damageDetections(), 0u);
+    EXPECT_EQ(rec->logEndOffset(), c.f.leo);
+    expectGapFree(*rec);
+    EXPECT_EQ(readAt(*rec, c.damageOffset).st, ReadIntoStatus::Ok);
+}
+
+TEST(LogSegmentRepairRegression, ASparserCompactedRangeIsRepairedWithGapsRegression) {
+    RepairCase c("rep_sparse", 0, 1);
+    ASSERT_GE(c.starts.size(), 6u);
+    // The peer compacted away batches 2 and 4 of this segment: an offset gap in the range it serves.
+    auto part = [&](std::size_t a, std::size_t b) { return sliceBatches(c.orig, c.starts, a, b); };
+    std::vector<uint8_t> sparse = part(1, 2);
+    for (const auto& p : {part(3, 4), part(5, c.starts.size())}) sparse.insert(sparse.end(), p.begin(), p.end());
+    const int64_t gap2 = batchBaseAt(c.path, c.starts[2]);
+    auto log = openRecovered(c.f.dir, kDmgRoll, false);
+    ASSERT_TRUE(log->beginSegmentRepair(c.base).has_value());
+    // Fed in two spans: the cursor moves past a gap, never back.
+    const std::size_t cut = part(1, 2).size() + part(3, 4).size();
+    ASSERT_EQ(log->appendRepairBatches({sparse.data(), cut}).status, Log::RepairAppendStatus::Ok);
+    ASSERT_EQ(log->appendRepairBatches({sparse.data() + cut, sparse.size() - cut}).status, Log::RepairAppendStatus::Ok);
+    ASSERT_EQ(log->commitSegmentRepair(), Log::RepairCommitStatus::Ok);
+    expectNoDamage(*log);
+    EXPECT_EQ(readAt(*log, c.damageOffset).st, ReadIntoStatus::Ok);
+    const auto atGap = readAt(*log, gap2);
+    EXPECT_EQ(atGap.st, ReadIntoStatus::Ok);
+    EXPECT_EQ(atGap.base, gap2 + 1) << "a compaction gap reads as the next surviving batch";
+    log->runCleanerFileOps(0);
+    auto expect = c.orig;
+    expect.assign(c.orig.begin(), c.orig.begin() + static_cast<std::ptrdiff_t>(c.starts[1]));
+    expect.insert(expect.end(), sparse.begin(), sparse.end());
+    EXPECT_EQ(slurp(c.path), expect);
+    log.reset();
+    auto rec = openRecovered(c.f.dir, kDmgRoll, false);
+    expectNoDamage(*rec);
+    EXPECT_EQ(readAt(*rec, c.base + 0).st, ReadIntoStatus::Ok);
+}
+
+TEST(LogSegmentRepairRegression, BatchesOutsideTheRangeOrWithABadCrcOrEpochAreRefusedRegression) {
+    RepairCase c("rep_refuse", 0, 2);
+    auto log = openRecovered(c.f.dir, kDmgRoll, false);
+    ASSERT_TRUE(log->beginSegmentRepair(c.base).has_value());
+    const auto good = c.missing();
+    auto status = [&](const std::vector<uint8_t>& b, const Log::RepairEpochOf& ep = {}) {
+        const auto r = log->appendRepairBatches(b, ep);
+        EXPECT_EQ(r.cursor, c.damageOffset) << "a refused span never moves the cursor";
+        return r.status;
+    };
+    // Below the cursor: batch 0 of the segment (an offset before the damage) and batch 1 (also valid prefix).
+    EXPECT_EQ(status(sliceBatches(c.orig, c.starts, 0, 1)), Log::RepairAppendStatus::BelowCursor);
+    EXPECT_EQ(status(sliceBatches(c.orig, c.starts, 1, 2)), Log::RepairAppendStatus::BelowCursor);
+    // Reaching the end offset: a two-record batch starting at end - 1.
+    {
+        RecordBatchBuilder b(c.end - 1, 1000);
+        b.append("k", "v1", 1000);
+        b.append("k", "v2", 1000);
+        EXPECT_EQ(status(b.build()), Log::RepairAppendStatus::ReachesEnd);
+        EXPECT_EQ(status(batchAt(c.end)), Log::RepairAppendStatus::ReachesEnd) << "a batch at the end offset itself";
+    }
+    // A flipped body byte: CRC.
+    {
+        auto bad = good;
+        bad[static_cast<std::size_t>(batch::kRecordBatchOverhead)] ^= 0x5A;
+        EXPECT_EQ(status(bad), Log::RepairAppendStatus::BadCrc);
+    }
+    // A truncated span.
+    {
+        auto cut = good;
+        cut.resize(cut.size() - 3);
+        EXPECT_EQ(status(cut), Log::RepairAppendStatus::Malformed);
+    }
+    // A leader epoch the receiver's cache does not hold for that offset.
+    EXPECT_EQ(status(good, [](int64_t) { return 5; }), Log::RepairAppendStatus::WrongEpoch);
+    // One bad batch at the END of an otherwise good span: nothing of the span is written.
+    {
+        auto mixed = good;
+        mixed.insert(mixed.end(), good.begin(), good.begin() + static_cast<std::ptrdiff_t>(c.starts[1] - c.starts[0]));
+        EXPECT_EQ(status(mixed), Log::RepairAppendStatus::BelowCursor);
+    }
+    // After every refusal the exact span still goes in, and the result is the intact original.
+    const auto ok = log->appendRepairBatches(good, [](int64_t) { return -1; });
+    ASSERT_EQ(ok.status, Log::RepairAppendStatus::Ok);
+    EXPECT_EQ(ok.cursor, c.end);
+    ASSERT_EQ(log->commitSegmentRepair(), Log::RepairCommitStatus::Ok);
+    log->runCleanerFileOps(0);
+    EXPECT_EQ(slurp(c.path), c.orig) << "no refused span left a byte in the side file";
+}
+
+TEST(LogSegmentRepairRegression, BeginIsRefusedForANonDamagedActiveOrBusySegmentAndAbortCleansUpRegression) {
+    RepairCase c("rep_begin", 0, 1);
+    auto log = openRecovered(c.f.dir, kDmgRoll, false);
+    EXPECT_FALSE(log->beginSegmentRepair(c.f.bases[1]).has_value()) << "not damaged";
+    EXPECT_FALSE(log->beginSegmentRepair(c.f.bases.back()).has_value()) << "the active segment";
+    EXPECT_FALSE(log->beginSegmentRepair(c.base + 12345).has_value()) << "no such segment";
+    EXPECT_EQ(log->commitSegmentRepair(), Log::RepairCommitStatus::NoRepair);
+    EXPECT_EQ(log->appendRepairBatches(c.missing()).status, Log::RepairAppendStatus::NoRepair);
+    ASSERT_TRUE(log->beginSegmentRepair(c.base).has_value());
+    EXPECT_FALSE(log->beginSegmentRepair(c.base).has_value()) << "one repair per log";
+    log->abortSegmentRepair();
+    EXPECT_FALSE(log->segmentRepairBase().has_value());
+    EXPECT_FALSE(fs::exists(Log::repairLogPath(c.f.dir.string(), c.base)));
+    EXPECT_EQ(log->damagedSegmentCount(), 1u);
+    EXPECT_EQ(slurp(c.path), c.damaged);
+}
+
+TEST(LogSegmentRepairRegression, CrashBeforeCommitDeletesTheSideFileAndTheSegmentStaysDamagedRegression) {
+    RepairCase c("rep_crash_pre", 0, 1);
+    {
+        auto log = openRecovered(c.f.dir, kDmgRoll, false);
+        ASSERT_TRUE(log->beginSegmentRepair(c.base).has_value());
+        ASSERT_EQ(log->appendRepairBatches(c.missing()).status, Log::RepairAppendStatus::Ok);
+        ASSERT_TRUE(fs::exists(Log::repairLogPath(c.f.dir.string(), c.base)));
+        crashKeepPageCache(log);
+    }
+    ASSERT_TRUE(fs::exists(Log::repairLogPath(c.f.dir.string(), c.base))) << "the crash left the side file";
+    auto rec = openRecovered(c.f.dir, kDmgRoll, false);
+    EXPECT_FALSE(fs::exists(Log::repairLogPath(c.f.dir.string(), c.base))) << "a stray side file is deleted at boot";
+    EXPECT_EQ(rec->damagedSegmentCount(), 1u);
+    EXPECT_EQ(slurp(c.path), c.damaged);
+    EXPECT_EQ(readAt(*rec, c.damageOffset).st, ReadIntoStatus::Corrupt);
+}
+
+// Crash windows of the committed swap, as the cleaner's crash test enumerates them: nothing renamed yet (the output is
+// an uncommitted .cleaned), the commit rename done (.swap), the original retired, the index renamed in, finished.
+TEST(LogSegmentRepairRegression, CrashAtEveryStepOfTheSwapRecoversRegression) {
+    for (int step = 0; step <= 4; ++step) {
+        SCOPED_TRACE("step " + std::to_string(step));
+        RepairCase c(("rep_crash_swap" + std::to_string(step)).c_str(), 0, 1);
+        {
+            auto log = openRecovered(c.f.dir, kDmgRoll, false);
+            ASSERT_TRUE(log->beginSegmentRepair(c.base).has_value());
+            ASSERT_EQ(log->appendRepairBatches(c.missing()).status, Log::RepairAppendStatus::Ok);
+            ASSERT_EQ(log->commitSegmentRepair(), Log::RepairCommitStatus::Ok);
+            crashKeepPageCache(log);   // the cleaner never ran: the owner's committed output is only a .cleaned file
+        }
+        const std::string cleaned = onlyFileWith(c.f.dir, ".log.", ".cleaned");
+        const std::string cleanedIdx = onlyFileWith(c.f.dir, ".index.", ".cleaned");
+        ASSERT_FALSE(cleaned.empty());
+        ASSERT_FALSE(cleanedIdx.empty());
+        const std::string swap = Log::swapLogPath(c.f.dir.string(), c.base, c.end);
+        const std::string idx = segPath(c.f.dir, c.base).substr(0, segPath(c.f.dir, c.base).size() - 4) + ".index";
+        if (step >= 1) fs::rename(cleaned, swap);                                  // the COMMIT point
+        if (step >= 2) fs::rename(c.path, c.path + ".7.deleted");                  // the original is retired
+        if (step >= 3) fs::rename(cleanedIdx, idx);                                // the cleaner-built index in place
+        if (step >= 4) fs::rename(swap, c.path);                                   // finished
+        auto rec = openRecovered(c.f.dir, kDmgRoll, false);
+        if (step == 0) {
+            EXPECT_EQ(rec->damagedSegmentCount(), 1u) << "uncommitted: the damaged segment stays";
+            EXPECT_EQ(slurp(c.path), c.damaged);
+            EXPECT_FALSE(hasFileWith(c.f.dir, ".log.", ".cleaned"));
+            EXPECT_FALSE(hasFileWith(c.f.dir, ".index.", ".cleaned"));
+        } else {
+            expectNoDamage(*rec);
+            EXPECT_EQ(slurp(c.path), c.orig) << "a committed repair ends as the repaired segment";
+            EXPECT_FALSE(hasFileWith(c.f.dir, "", ".swap"));
+            expectGapFree(*rec);
+            EXPECT_EQ(readAt(*rec, c.damageOffset).st, ReadIntoStatus::Ok);
+        }
+    }
+}
+
+TEST(LogSegmentRepairRegression, AChangedLineageBeforeCommitIsRejectedAndTheOriginalsStayRegression) {
+    RepairCase c("rep_lineage", 0, 1);
+    auto log = openRecovered(c.f.dir, kDmgRoll, false);
+    ASSERT_TRUE(log->beginSegmentRepair(c.base).has_value());
+    ASSERT_EQ(log->appendRepairBatches(c.missing()).status, Log::RepairAppendStatus::Ok);
+    log->reloadSegment(c.base);   // a new incarnation of the segment (as a cleaner swap or a rebuild gives)
+    ASSERT_EQ(log->damagedSegmentCount(), 1u);
+    EXPECT_EQ(log->commitSegmentRepair(), Log::RepairCommitStatus::Rejected);
+    EXPECT_FALSE(log->segmentRepairBase().has_value()) << "a rejected commit ends the repair";
+    EXPECT_EQ(log->cleanerGroupsRejected(), 1u);
+    EXPECT_EQ(log->damagedSegmentCount(), 1u);
+    EXPECT_EQ(slurp(c.path), c.damaged) << "the original is untouched";
+    EXPECT_EQ(readAt(*log, c.damageOffset).st, ReadIntoStatus::Corrupt);
+    log->runCleanerFileOps(0);   // the cleaner deletes the rejected output
+    EXPECT_FALSE(hasFileWith(c.f.dir, ".log.", ".cleaned"));
+    EXPECT_FALSE(hasFileWith(c.f.dir, ".index.", ".cleaned"));
+    EXPECT_EQ(slurp(c.path), c.damaged);
+}
+
+TEST(LogSegmentRepairRegression, DamageAtByteZeroOfTheSegmentIsRepairedFromAnEmptyPrefixRegression) {
+    RepairCase c("rep_byte0", 0, 0);
+    ASSERT_EQ(c.damageOffset, c.base);
+    auto log = openRecovered(c.f.dir, kDmgRoll, false);
+    ASSERT_EQ(log->damagedSegmentCount(), 1u);
+    const auto rep = log->beginSegmentRepair(c.base);
+    ASSERT_TRUE(rep.has_value());
+    EXPECT_EQ(rep->damageOffset, c.base);
+    ASSERT_EQ(log->appendRepairBatches(c.orig).status, Log::RepairAppendStatus::Ok);
+    ASSERT_EQ(log->commitSegmentRepair(), Log::RepairCommitStatus::Ok);
+    log->runCleanerFileOps(0);
+    expectNoDamage(*log);
+    EXPECT_EQ(slurp(c.path), c.orig);
+    expectGapFree(*log);
+}
+
+TEST(LogSegmentRepairRegression, DamageInTheLastSealedSegmentIsRepairedRegression) {
+    RepairCase c("rep_last_sealed", 2, 1);   // fixture: bases 0..3, the active segment is bases[3]
+    ASSERT_EQ(c.end, c.f.bases.back());
+    auto log = openRecovered(c.f.dir, kDmgRoll, false);
+    ASSERT_EQ(log->damagedSegmentCount(), 1u);
+    ASSERT_TRUE(log->beginSegmentRepair(c.base).has_value());
+    ASSERT_EQ(log->appendRepairBatches(c.missing()).status, Log::RepairAppendStatus::Ok);
+    ASSERT_EQ(log->commitSegmentRepair(), Log::RepairCommitStatus::Ok);
+    log->runCleanerFileOps(0);
+    expectNoDamage(*log);
+    EXPECT_EQ(slurp(c.path), c.orig);
+    EXPECT_EQ(log->logEndOffset(), c.f.leo);
+    appendOne(*log);   // the active segment is unaffected
+    expectGapFree(*log);
+}
+
+TEST(LogSegmentRepairRegression, TwoDamagedSegmentsAreRepairedOneAfterTheOtherRegression) {
+    RepairCase c("rep_two", 0, 1);
+    const std::string p1 = segPath(c.f.dir, c.f.bases[1]);
+    const auto orig1 = slurp(p1);
+    const auto starts1 = batchStarts(p1);
+    const int64_t d1 = batchBaseAt(p1, starts1.at(1));
+    xorByteAt(p1, starts1.at(1) + static_cast<std::size_t>(batch::kRecordBatchOverhead));
+    auto log = openRecovered(c.f.dir, kDmgRoll, false);
+    ASSERT_EQ(log->damagedSegmentCount(), 2u);
+    EXPECT_EQ(log->firstDamageOffset(), std::optional<int64_t>(c.damageOffset));
+    ASSERT_TRUE(log->beginSegmentRepair(c.base).has_value());
+    ASSERT_EQ(log->appendRepairBatches(c.missing()).status, Log::RepairAppendStatus::Ok);
+    ASSERT_EQ(log->commitSegmentRepair(), Log::RepairCommitStatus::Ok);
+    log->runCleanerFileOps(0);
+    EXPECT_EQ(log->damagedSegmentCount(), 1u);
+    EXPECT_EQ(log->firstDamageOffset(), std::optional<int64_t>(d1));
+    EXPECT_EQ(readAt(*log, d1).st, ReadIntoStatus::Corrupt);
+    const auto rep = log->beginSegmentRepair(c.f.bases[1]);
+    ASSERT_TRUE(rep.has_value());
+    ASSERT_EQ(log->appendRepairBatches(sliceBatches(orig1, starts1, 1, starts1.size())).status,
+              Log::RepairAppendStatus::Ok);
+    ASSERT_EQ(log->commitSegmentRepair(), Log::RepairCommitStatus::Ok);
+    log->runCleanerFileOps(0);
+    expectNoDamage(*log);
+    EXPECT_EQ(slurp(c.path), c.orig);
+    EXPECT_EQ(slurp(p1), orig1);
+    expectGapFree(*log);
+}
