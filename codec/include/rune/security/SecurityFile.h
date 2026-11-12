@@ -1,7 +1,9 @@
 #pragma once
-// rune/security/SecurityFile.h — the .rsec file: a recorded __security log, as written by
-// `rune security export` and read by the golden-log tests.  The RecordFile.h container (plan D38)
+// rune/security/SecurityFile.h — the .rsec file: a recorded __security log, written by the golden-log tool
+// (make_security_golden) and read by the golden-log tests.  The RecordFile.h container (plan D38)
 // with magic "RSEC": file version 2, per-record CRC32C, strictly increasing offsets.
+// No `rune` command writes this file yet.  A future writer must create it with mode 0600 and O_EXCL: the file holds
+// every user's verifier (StoredKey / ServerKey).
 #include <rune/catalog/RecordFile.h>
 
 #include <cstdint>
