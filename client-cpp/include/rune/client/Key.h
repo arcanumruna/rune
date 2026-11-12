@@ -75,7 +75,8 @@ public:
             return Key(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), len));
         }
         std::array<uint8_t, kMaxInline> field{};
-        std::memcpy(field.data(), value.data(), value.size() < fieldWidth ? value.size() : fieldWidth);
+        const std::size_t n = value.size() < fieldWidth ? value.size() : fieldWidth;
+        if (n != 0) std::memcpy(field.data(), value.data(), n);  // an empty view may have a null data()
         return Key(std::span<const uint8_t>(field.data(), fieldWidth));
     }
 
