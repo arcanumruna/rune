@@ -2116,7 +2116,13 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
         emitUnsentBatchAck_(topicId, partition, 1, OpStatus::DeliveryFailed, 1, code);
         completeHandle_((flags & kFlagWantAck) ? ackHandle : 0u, OpKind::Send, -1, 0, OpStatus::DeliveryFailed, code);
         inDuty_ = prevDuty;
-        readScopeDue_ = true;
+        if (mode_ == IngressMode::Direct) {
+            // Direct mode has no drain after the call: the deferred work a handler owed (a close, deferred records, a deferred guard
+            // failure) runs at the end of a real duty scope before the call returns.  Inside an outer scope (prevDuty) that scope's end does it.
+            if (!prevDuty) { const DutyScope duty(*this); }
+        } else {
+            readScopeDue_ = true;
+        }
         if (transactional_() && mode_ == IngressMode::Ring) {   // O-1: poison the open transaction before any later message
             guardFailDue_ = true;
             lastDrainStop_ = DrainStop::FlushToken;

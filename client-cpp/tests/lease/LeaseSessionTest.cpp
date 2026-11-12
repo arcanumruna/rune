@@ -1377,6 +1377,28 @@ TEST(LeaseSessionRegression, RefusedRecordHandlerClosesProducerRegression) {
     g.guards.unbindProducer(p);
 }
 
+// F-2 (final review): the Direct-mode twin of the above.  A Direct producer appends in place, so there is no drain after the call: the
+// close the refusal's handler issued must be applied before trySubmit returns, not at the next duty cycle.
+TEST(LeaseSessionRegression, DirectRefusedRecordHandlerClosesProducerRegression) {
+    BareGuards g;
+    rune::client::producer::ProducerImpl p(bareAckedCfg());
+    p.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr, kBareNow});
+    HookLedger h;
+    p.setOnAck(&HookLedger::onAck, &h);
+    h.onFirstFail = [&] { (void)p.closeImmediately(); };
+    constexpr uint32_t S = BareGuards::kSid;
+    g.guards.arm(S, 0, 1, 1, 1000, 0);
+    g.guards.bind(S, 0, 1, 1, 1000, p, 0);
+    ASSERT_TRUE(p.guardBound());
+    ASSERT_EQ(g.guards.trip(2000), 1);
+    ASSERT_TRUE(p.guardBlocks_());
+    (void)p.trySubmit(1, 0, rc::Key(uint64_t{1}), kVal, test_support::AckLedger::hi(1));
+    EXPECT_TRUE(h.fired) << "the refused record's completion ran";
+    EXPECT_EQ(h.ledger.times(1), 1);
+    EXPECT_FALSE(p.lifeOpen()) << "the handler's close was applied before trySubmit returned";
+    g.guards.unbindProducer(p);
+}
+
 // O-3: failGuarded reached from a handler the producer's own walk fired (a failure completion whose handler ends the lease again) is
 // deferred to the end of that walk: each of the two in-flight batches' records completes exactly once.
 TEST(LeaseSessionRegression, FailGuardedFromOwnWalkHandlerRegression) {

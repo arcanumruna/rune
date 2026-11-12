@@ -580,6 +580,32 @@ TEST(ProducerTxnGuardRegression, SendOffsetsBlockedAtRiskRegression) {
     EXPECT_EQ(p.state(), TxnState::AbortableError);
 }
 
+// F-1 (final review): the guard check in offsetsStep_ is a runtime branch, not a debug assert.  Through the public API the branch is
+// not reachable (the trip poisons the transaction in the same drain, so the AbortableError ends the call first); this test pins that
+// outcome for the late AddOffsetsToTxn answer: the trip lands while the answer is held, and when it arrives no TxnOffsetCommit leaves.
+TEST(ProducerTxnGuardRegression, TripWhileAddOffsetsAnswerHeldSendsNoTxnOffsetCommitRegression) {
+    GRig r;
+    r.g_now_base = g_now;
+    const auto ref = r.addLease(1);
+    rc::Producer p = r.producer("tx-a", ref);
+    p.beginTransaction();
+    r.settle();
+    r.gw.holdAddOffsets = true;
+    const rc::OffsetEntry e{1, 0, 10};
+    const rc::Token t = ++r.tok;
+    ASSERT_EQ(p.sendOffsetsToTransaction(std::span<const rc::OffsetEntry>(&e, 1), "g", *r.pq, t), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return r.frames(TF::AddOffsets) == 1; })) << "AddOffsetsToTxn left, its answer is held";
+    ASSERT_NO_FATAL_FAILURE(r.trip());
+    r.gw.holdAddOffsets = false;
+    r.gw.releaseAddOffsets();
+    ASSERT_TRUE(r.await(t));
+    EXPECT_NE(r.got[t].status, OpStatus::Ok);
+    EXPECT_EQ(r.frames(TF::TxnOffsetCommit), 0) << "no TxnOffsetCommit of a doomed transaction";
+    EXPECT_EQ(p.state(), TxnState::AbortableError);
+    const rc::Token a = r.abort(p);
+    ASSERT_TRUE(r.await(a));
+}
+
 TEST(ProducerTxnGuardRegression, GuardEndedIsFinalRegression) {
     GRig r;
     r.g_now_base = g_now;
