@@ -28,6 +28,9 @@ struct SchemaState {
     uint16_t                nextTag       = 0;
     rune::codec::CompatMode compat        = rune::codec::CompatMode::Backward;
     rune::protocol::TopicKeyFeatures keyFeatures{};
+    /// formatVer 5 (#419): schema versions below this are retired (refused at produce and typed open; history stays
+    /// readable).  1 = nothing retired; it only moves forward and never passes `schemaVersion`.
+    uint16_t                retiredBelow  = 1;
     bool operator==(const SchemaState&) const = default;
 };
 struct TopicObject {

@@ -356,7 +356,7 @@ Result alterSchema(const CatalogState& s, const CatalogEvent& e, int64_t off, co
     TopicObject next = **t;
     next.schema = SchemaState{.keyField = std::move(keyField), .validate = cur.validate, .evolvingBlob = std::move(*blob),
                               .schemaVersion = static_cast<uint16_t>(cur.schemaVersion + 1), .nextTag = nextTag,
-                              .compat = mode};
+                              .compat = mode, .retiredBelow = cur.retiredBelow};   // the retire floor (v5) survives an ALTER
     next.version = e.newVersion;
     return StagedUpdate{std::move(next)};
 }
@@ -451,6 +451,13 @@ std::optional<std::string> topicConfigError(const TopicConfig& c) {
     if (auto r = byte("durability", c.durability, wire::kMaxDurability)) return r;
     if (auto r = byte("durability.tier", c.durabilityTier, wire::kMaxDurabilityTier)) return r;
     return std::nullopt;   // coPartitionGroup, partitionKey: free-form (bounded by the wire's str16)
+}
+
+std::expected<const TopicObject*, ApplyError> liveTopicOf(const CatalogState& s, const CatalogEvent& e, int64_t offset) {
+    return liveTopic(s, e, offset);
+}
+std::optional<ApplyError> schemaVersionErrorOf(const CatalogEvent& e, int64_t offset, const TopicObject& t) {
+    return schemaVersionError(e, offset, t);
 }
 
 std::expected<Staged, ApplyError> ApplyV1::run(const CatalogState& s, const CatalogEvent& e, int64_t offset) {

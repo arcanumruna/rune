@@ -31,6 +31,7 @@ add_library(rune_catalog STATIC
     src/catalog/ApplyV2.cpp
     src/catalog/ApplyV3.cpp
     src/catalog/ApplyV4.cpp
+    src/catalog/ApplyV5.cpp
     src/catalog/NamespaceRegistry.cpp
     src/catalog/CatalogReplayer.cpp
     src/catalog/CatalogQueries.cpp
@@ -280,6 +281,7 @@ add_executable(rune_catalog_tests
     tests/catalog/NamespaceCatalogV2Test.cpp
     tests/catalog/CheckedWritesCatalogV3Test.cpp
     tests/catalog/LeaseCatalogTest.cpp
+    tests/catalog/CatalogApplyV5Test.cpp
     tests/catalog/NamespaceLifecycleApplyRegressionTest.cpp)
 target_link_libraries(rune_catalog_tests PRIVATE rune_catalog GTest::gtest_main)
 target_compile_definitions(rune_catalog_tests PRIVATE
