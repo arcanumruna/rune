@@ -60,6 +60,7 @@ struct WriteFacts {
     bool    transactional      = false;
     bool    atomicBatch        = false;
     bool    importGranted      = false;
+    bool    importDenialDeferred = false;   // #506: the security view is behind: a missing IMPORT is not a verdict
     int64_t producerId         = -1;
     bool    legacyMode         = false;
     bool    levelCheckedWrites = false;
@@ -165,7 +166,8 @@ struct RequirementVerdict {
     }
     if (t.autoIncrement) {
         if (b.plainUpsert) return refuse(HookRefusal::UpsertOnAutoIncrement);
-        if (b.explicitInsert && !f.importGranted) return {ErrorCode::NotAuthorized, HookRefusal::ImportNotGranted};
+        if (b.explicitInsert && !f.importGranted)
+            return {f.importDenialDeferred ? ErrorCode::AuthUnavailable : ErrorCode::NotAuthorized, HookRefusal::ImportNotGranted};
         if (b.importBadKey) return refuse(HookRefusal::ImportOutOfRange);
         if (b.keyZeroCreate && b.autoIncExhausted) return {ErrorCode::AutoIncrementExhausted, HookRefusal::AutoIncExhausted};
     }

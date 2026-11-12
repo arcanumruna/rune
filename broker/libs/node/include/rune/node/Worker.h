@@ -1582,6 +1582,8 @@ public:
            .deferAck(static_cast<std::uint8_t>((op.deferAck ? kOpFlagDeferAck : 0u) |
                                                (op.crcValidated ? kOpFlagCrcValidated : 0u) |
                                                (op.importGranted ? kOpFlagImportGranted : 0u) |
+                                               (op.type == WorkerOp::Type::Produce && op.importDeferred
+                                                    ? kOpFlagImportDeferred : 0u) |
                                                (op.freshCursor ? kOpFlagFreshCursor : 0u) |
                                                (op.type == WorkerOp::Type::PushRead && op.fromEarliest
                                                     ? kOpFlagPushReadFromEarliest : 0u) |
@@ -4663,6 +4665,7 @@ private:
                                                 (((op.deferAck() & kOpFlagDeferAck) != 0 && rep != nullptr) ? rune::protocol::client::kAcksWireAll : 0));
         f.crcValidated   = (op.deferAck() & kOpFlagCrcValidated) != 0;
         f.importGranted  = (op.deferAck() & kOpFlagImportGranted) != 0;
+        f.importDeferred = (op.deferAck() & kOpFlagImportDeferred) != 0;   // Produce op: bit 0x10 is not keyPending here
         f.durabilityTier = op.durabilityTier();
         f.enqueuedAtNs   = op.enqueuedAtNs();
         f.fromOp         = true;
@@ -11022,6 +11025,7 @@ private:
         // nothing.  A session this worker has no slot for is denied (fail closed), and an Enforcing worker with no
         // sink attached (M4, X012) refuses every frame: it has no grants to consult.
         bool importGranted = true;   // NotEnforcing: nothing is checked
+        bool importDeferred = false; // #506: no IMPORT while the view is behind: not a verdict
         if (const auto* enf = std::get_if<Enforcing>(&enforcement_)) {
             if (enf->sink == nullptr) [[unlikely]] {
                 if (openSeq != 0) commitProduceSeq(openCtx, openSeq);   // consumed (answered)
@@ -11063,6 +11067,7 @@ private:
                 return refuseNotAuthorized_(msg, directAck);
             }
             importGranted = allowsImport(*grants, msg.topicId);
+            importDeferred = !importGranted && securityLag_ == SecurityLag::DeferDenials;
         }
 
         // X036: a client never writes a control batch (after the WRITE check, so an unauthorized sender hears 45).
@@ -11101,6 +11106,7 @@ private:
         f.baseSequence  = msg.baseSequence;
         f.producerEpoch = msg.producerEpoch;
         f.importGranted = importGranted;
+        f.importDeferred = importDeferred;
         f.durabilityTier = replica ? replica->durabilityTier() : uint8_t{1};
         f.acks          = msg.acks;
         f.fromOp        = false;   // the poll budget (ingressPollBudget_) reserved its answer
@@ -11275,6 +11281,7 @@ private:
         bool    fromOp        = false;  ///< op-ring produce: reserve a parked answer here
         bool    crcValidated  = false;  ///< the op producer validated this batch's CRC (M-3)
         bool    importGranted = false;  ///< the session holds IMPORT on the topic (or the worker does not enforce)
+        bool    importDeferred = false; ///< #506: no IMPORT while the security view is behind: a missing IMPORT is not a verdict
         uint8_t directAck     = 0;      ///< D8d: direct-budget admission (worker ingress only)
         int64_t enqueuedAtNs  = 0;      ///< gateway enqueue time (op path; latency attribution)
         [[nodiscard]] bool acksAll() const noexcept { return rune::protocol::client::acksAll(acks); }
@@ -11635,7 +11642,7 @@ private:
         LeaseDupAnswer leaseDup;   // a known-old duplicate of a lease batch, answered with its trailers (spec 6.3)
         if (ws != nullptr) [[unlikely]] {
             const WriteFacts factsBase{.acks = acks, .idempotent = f.producerId >= 0, .transactional = txn, .atomicBatch = !txn && (batchAttrs & rune::protocol::batch::kAttrAtomic) != 0,
-                                   .importGranted = f.importGranted, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_(), .txnJudgedRecordsMax = txnJudgedRecordsMax_,
+                                   .importGranted = f.importGranted, .importDenialDeferred = f.importDeferred, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_(), .txnJudgedRecordsMax = txnJudgedRecordsMax_,
                                    .txnRecords = txn && rc != nullptr ? rc->tracker().recordsOf(f.producerId) : 0,
                                    .txnJudged = txn && rc != nullptr && txnJudged_(*ws, rc->tracker().hasIntent(f.producerId), rc->tracker().firstOffsetOf(f.producerId))};
             WriteFacts facts = factsBase;
@@ -11677,7 +11684,10 @@ private:
             }
             if (hook.checked()) ++hookChecks_;
             batchIntent = hook.anyIntent();
-            if (hook.refusal() != HookRefusal::None) [[unlikely]] noteHookRefusal_(hook.refusal(), f);
+            if (hook.refusal() != HookRefusal::None) [[unlikely]] {
+                noteHookRefusal_(hook.refusal(), f);
+                if (hook.refusal() == HookRefusal::ImportNotGranted && facts.importDenialDeferred) ++workerDeniesDeferred_;   // #506
+            }
             if (!outcome.isOK()) [[unlikely]] hook.onProduceFailed();
             if (outcome.error == pc::ErrorCode::Throttled) [[unlikely]] outcome.retryAfterNs = hook.retryAfterNs();
             if (hook.assignedBase() != 0 && ws->assignedBases.wantsGrowth()) [[unlikely]] autoIncGrowDue_ = true;   // P6-8: grown next pass

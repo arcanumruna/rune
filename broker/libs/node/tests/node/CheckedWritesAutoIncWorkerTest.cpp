@@ -26,6 +26,7 @@ constexpr int16_t kNotLeader = static_cast<int16_t>(ErrorCode::NotLeader);
 constexpr int16_t kInvalidRequest = static_cast<int16_t>(ErrorCode::InvalidRequest);
 constexpr int16_t kSchemaValidationFailed = static_cast<int16_t>(ErrorCode::SchemaValidationFailed);
 constexpr int16_t kNotAuthorized = static_cast<int16_t>(ErrorCode::NotAuthorized);
+constexpr int16_t kAuthUnavailable = static_cast<int16_t>(ErrorCode::AuthUnavailable);   // #506
 constexpr int16_t kDuplicateSequence = static_cast<int16_t>(ErrorCode::DuplicateSequence);
 constexpr uint16_t kConstraintViolation = 55, kKeyExists = 56;
 constexpr int32_t kRej = 0x40000601, kProj = 0x40000602;
@@ -615,6 +616,72 @@ TEST(CheckedWritesAutoIncWorker, ShardIngressFactsCarryTheGrant) {
     ASSERT_TRUE(a);
     EXPECT_EQ(a->code, kNotAuthorized);
     EXPECT_FALSE(r.worker->lastWriteFactsForTest().importGranted);
+}
+
+namespace {
+/// Issues #603 / #506: the lag LEVEL as the PermissionShipper ships it (0 current, 1 refuse all, 2 defer denials).
+void shipSecurityLag(VerdictRig& r, int64_t level) {
+    WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = 0;
+    o.nextOffset = level; o.isolation = kPermFlagSecurityBehind | kPermFlagLast;
+    ASSERT_TRUE(r.worker->tryEnqueueOp(std::move(o)));
+    r.passes(3);
+}
+}  // namespace
+
+// Issue #506 (gateway-routed): the op says the gateway's view is behind and the session holds no IMPORT: the explicit insert is
+// answered AuthUnavailable (retriable), nothing appended, no producer sequence consumed - the same batch at the same base
+// sequence is accepted once the op says IMPORT is held.  View current, no IMPORT: the terminal 45.
+TEST(CheckedWritesAutoIncRegression, RoutedImportDenialIsRetriableWhileTheViewIsBehindRegression) {
+    AutoInc g;
+    VerdictRig& r = g.r;
+    const auto routed = [&](int32_t seq, bool importGranted, bool importDeferred) {
+        return r.ack(r.routedFrame({import(100)}, kAllView, 42, seq, importGranted, importDeferred));
+    };
+    const auto a = r.ack(r.routedFrame(creates(3), kAllView, 42, 0, false, true));
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, 0) << "creates need no grant, deferred or not";
+    const int64_t leo = r.log->logEndOffset();
+    const auto deferred = routed(3, false, true);
+    ASSERT_TRUE(deferred);
+    EXPECT_EQ(deferred->code, kAuthUnavailable);
+    EXPECT_EQ(r.log->logEndOffset(), leo) << "nothing appended";
+    const auto verdict = routed(3, false, false);
+    ASSERT_TRUE(verdict);
+    EXPECT_EQ(verdict->code, kNotAuthorized) << "the view is current: a verdict";
+    const auto retried = routed(3, true, false);
+    ASSERT_TRUE(retried);
+    EXPECT_EQ(retried->code, 0) << "the same batch at the same base sequence";
+    EXPECT_GT(r.log->logEndOffset(), leo);
+}
+
+// Issue #506 (shard ingress): the same three answers with the lag level shipped as DeferDenials (2), and the deferred-denial
+// counter counts it.
+TEST(CheckedWritesAutoIncRegression, IngressImportDenialIsRetriableWhileTheViewIsBehindRegression) {
+    AutoInc g;
+    VerdictRig& r = g.r;
+    ASSERT_TRUE(r.worker->enforcingForTest());
+    r.bindGrants(/*import=*/false);
+    Producer p{r, 42};
+    shipSecurityLag(r, 2);
+    ASSERT_EQ(r.worker->securityLagForTest(), 2u);
+    const int64_t leo = r.log->logEndOffset();
+    const auto deferred = p.ackOf(p.resend({import(600)}, 0));
+    ASSERT_TRUE(deferred);
+    EXPECT_EQ(deferred->code, kAuthUnavailable);
+    EXPECT_EQ(r.log->logEndOffset(), leo) << "nothing appended";
+    EXPECT_EQ(r.worker->workerDeniesDeferredForTest(), 1u);
+
+    shipSecurityLag(r, 0);   // current: the denial is a verdict
+    const auto verdict = p.ackOf(p.resend({import(600)}, 0));
+    ASSERT_TRUE(verdict);
+    EXPECT_EQ(verdict->code, kNotAuthorized);
+    EXPECT_EQ(r.worker->workerDeniesDeferredForTest(), 1u) << "a verdict is not a deferred denial";
+
+    r.bindGrants(/*import=*/true);   // the grant lands: the SAME batch, the same base sequence
+    const auto retried = p.ackOf(p.resend({import(600)}, 0));
+    ASSERT_TRUE(retried);
+    EXPECT_EQ(retried->code, 0);
+    EXPECT_GT(r.log->logEndOffset(), leo);
 }
 
 // Task 8 review carry-over: an append that fails after stage() took the ids burns them.

@@ -2887,6 +2887,10 @@ private:
     /// correlation id).  Cold.
     void answerSecurityBehind_(Session& session, const rune::protocol::client::MessageHeader& hdr, const uint8_t* buf,
                                std::size_t len);
+    /// #506: a denial is not a verdict yet: Required mode and the view is behind events this broker already holds.
+    [[nodiscard]] bool denialsDeferred_() const noexcept {
+        return authMode_ == rune::gateway::GatewayAuthMode::Required && securityViewBehind_();
+    }
     /// #205: the view has not applied every event this broker knows exists.
     [[nodiscard]] bool securityViewBehind_() const noexcept {
         return securityView_ != nullptr && securityKnownEnd_ > securityView_->appliedOffset() + 1;

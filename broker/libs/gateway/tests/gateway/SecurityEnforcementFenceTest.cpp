@@ -635,3 +635,60 @@ TEST(CheckedWritesImportGrant, GatewaySetsTheOpFlagOnlyWithTheGrant) {
     EXPECT_NE(routedProduceFlags(r, withGrant) & rune::node::kOpFlagImportGranted, 0);
     EXPECT_EQ(routedProduceFlags(r, writeOnly) & rune::node::kOpFlagImportGranted, 0);
 }
+
+// Issue #506: the gateway marks a produce's missing IMPORT as "not a verdict yet" exactly when the session has no IMPORT AND the
+// security view is behind events this broker holds.  RED before: the flag did not exist (never set).
+TEST(CheckedWritesImportGrant, GatewaySetsImportDeferredOnlyWithoutTheGrantWhileTheViewIsBehindRegression) {
+    FenceRig r(1);
+    (void)r.apply(sec::CreateUserOps{testVerifier(3)}, "i", "CREATE USER i WITH PASSWORD '<redacted>';");
+    for (const auto op : {sec::Operation::Write, sec::Operation::Import})
+        (void)r.apply(sec::GrantOps{sec::GranteeKind::User, topicGrant(op, "events")}, "i", "GRANT ... ON TOPIC events TO USER i;");
+    const int64_t withGrant = r.login("i");
+    const int64_t writeOnly = r.login("w");
+    const auto deferred = [&](int64_t sid) { return (routedProduceFlags(r, sid) & rune::node::kOpFlagImportDeferred) != 0; };
+
+    EXPECT_FALSE(deferred(writeOnly)) << "the view is current: the missing IMPORT is a verdict";
+    r.gw.setSecurityKnownEnd(r.view->appliedOffset() + 2);   // one event held by this broker, not applied
+    ASSERT_EQ(r.gw.workersSecurityLagForTest(), 2u);
+    EXPECT_TRUE(deferred(writeOnly)) << "the view is behind: the missing IMPORT may be a held grant";
+    EXPECT_FALSE(deferred(withGrant)) << "an IMPORT the session holds is never deferred";
+    r.gw.setSecurityKnownEnd(r.view->appliedOffset() + 1);   // caught up
+    EXPECT_FALSE(deferred(writeOnly));
+}
+
+namespace {
+/// Enqueues `op` on worker 0's op ring and returns the `deferAck` flag byte the ring carries.
+uint8_t enqueuedFlags(FenceRig& r, rune::node::WorkerOp op) {
+    const bool lifecycle = op.type == rune::node::WorkerOp::Type::SessionAnnounce;   // the session-lifecycle ring
+    EXPECT_TRUE(r.pool.worker(0).tryEnqueueOp(std::move(op)));
+    int seen = 0;
+    uint8_t flags = 0;
+    (lifecycle ? r.pool.worker(0).sessionRingForDoorbell() : r.pool.worker(0).opRingForDoorbell()).drain([&](int32_t, aeron::concurrent::AtomicBuffer& ab, aeron::util::index_t off, aeron::util::index_t len) {
+        char* c = reinterpret_cast<char*>(ab.buffer()) + off;
+        sbe::MessageHeader mh;
+        mh.wrap(c, 0, 0, static_cast<std::size_t>(len));
+        sbe::WorkerOp d;
+        d.wrapForDecode(c, sbe::MessageHeader::encodedLength(), mh.blockLength(), mh.version(), static_cast<std::size_t>(len));
+        flags = d.deferAck();
+        ++seen;
+    }, 16);
+    EXPECT_EQ(seen, 1);
+    return flags;
+}
+}  // namespace
+
+// Issue #506: the op-ring flag byte.  importDeferred shares bit 0x10 with the SessionAnnounce-only keyPending; each is encoded
+// only for its own op type, so neither reads back as the other.
+TEST(CheckedWritesImportGrant, ImportDeferredSurvivesTheRingAndSharesItsBitWithKeyPendingOnlyAcrossTypesRegression) {
+    FenceRig r(1);
+    using rune::node::WorkerOp;
+    EXPECT_EQ(rune::node::kOpFlagImportDeferred, rune::node::kOpFlagKeyPending);
+    WorkerOp produce; produce.type = WorkerOp::Type::Produce; produce.importDeferred = true;
+    EXPECT_NE(enqueuedFlags(r, produce) & rune::node::kOpFlagImportDeferred, 0) << "a Produce carries it";
+    WorkerOp produceKey; produceKey.type = WorkerOp::Type::Produce; produceKey.keyPending = true;
+    EXPECT_EQ(enqueuedFlags(r, produceKey) & rune::node::kOpFlagImportDeferred, 0) << "keyPending is not a Produce flag";
+    WorkerOp announce; announce.type = WorkerOp::Type::SessionAnnounce; announce.keyPending = true;
+    EXPECT_NE(enqueuedFlags(r, announce) & rune::node::kOpFlagKeyPending, 0) << "a SessionAnnounce keeps keyPending";
+    WorkerOp announceDef; announceDef.type = WorkerOp::Type::SessionAnnounce; announceDef.importDeferred = true;
+    EXPECT_EQ(enqueuedFlags(r, announceDef) & rune::node::kOpFlagKeyPending, 0) << "importDeferred is not an announce flag";
+}

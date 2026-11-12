@@ -4538,6 +4538,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         op.baseSequence  = msg.baseSequence;
         op.lastOffsetDelta = lastOffsetDelta;
         op.recordCount   = recordCount;
+        op.importDeferred = !op.importGranted && denialsDeferred_();   // #506: a missing IMPORT is not a verdict while behind
         op.deferAck      = acksAll && static_cast<bool>(replica) && committedMetadataReady_;
         op.minIsr        = cachedMinIsr_;   // the admission policy; the worker gates on its own ISR
         op.enqueuedAtNs  = nowNs_;
@@ -9769,7 +9770,7 @@ void ClientGateway::setSecurityBehind(bool behind)
 
 int ClientGateway::syncWorkersLag_()
 {
-    const bool deferDenials = authMode_ == rune::gateway::GatewayAuthMode::Required && securityViewBehind_();
+    const bool deferDenials = denialsDeferred_();
     const uint8_t wanted = securityBehind_ ? kLagRefuseAll : (deferDenials ? kLagDeferDenials : uint8_t{0});
     if (workersLag_ == wanted) [[likely]] return 0;
     if (workerPool_ == nullptr) { workersLag_ = wanted; return 0; }

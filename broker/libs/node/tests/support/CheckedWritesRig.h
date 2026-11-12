@@ -1270,8 +1270,10 @@ public:
         return c;
     }
     /// The same batch the way a gateway routes it: a Produce op on the op ring, answered through the ack sink.
-    /// `importGranted`: the gateway found IMPORT on the topic (kOpFlagImportGranted).
-    int64_t routedFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool importGranted = true) {
+    /// `importGranted`: the gateway found IMPORT on the topic (kOpFlagImportGranted); `importDeferred`: ... and its security view
+    /// is behind, so a missing IMPORT is not a verdict (kOpFlagImportDeferred, #506).
+    int64_t routedFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool importGranted = true,
+                        bool importDeferred = false) {
         const auto bytes = batch(recs, pid, seq, keyShape_);
         WorkerOp op;
         op.type = WorkerOp::Type::Produce; op.topicId = kSrc; op.partition = tuning_.partition;
@@ -1282,6 +1284,7 @@ public:
         op.durabilityTier = replica->durabilityTier();
         op.deferAck = (acks & rune::protocol::client::kAcksWireAll) != 0;
         op.importGranted = importGranted;
+        op.importDeferred = importDeferred;
         op.recordBatchView = std::span<const uint8_t>(bytes);
         EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
         return corr;

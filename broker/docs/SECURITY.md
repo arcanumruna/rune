@@ -42,7 +42,7 @@ Rules that keep the model small (D15 to D17):
 | Request | Needs |
 |---|---|
 | Produce, transactional produce | `WRITE` on the topic |
-| Produce a record with an explicit key to an autoincrement topic (an import) | `IMPORT` on the topic, as well as `WRITE`; without it `NotAuthorized` |
+| Produce a record with an explicit key to an autoincrement topic (an import) | `IMPORT` on the topic, as well as `WRITE`; without it `NotAuthorized` (`AuthUnavailable` while behind) |
 | Transaction init / markers | `WRITE` on the transactional id |
 | `AddOffsetsToTxn` / `TxnOffsetCommit` (D18) | `WRITE` on the transactional id and `READ` on the group |
 | Subscribe (any form) | `READ` on the topic |
@@ -357,7 +357,10 @@ current; otherwise it answers the retriable `AuthUnavailable` (48) and the clien
   A denial is answered `AuthUnavailable` instead of `NotAuthorized` while this broker holds `__security`
   events it has not applied, on both paths: the gateway, and a shard worker's own ingress
   (`RUNE_PER_WORKER_INGRESS=true`), which is told the lag level with the permission items. A request the grants
-  allow is served meanwhile. A grant is therefore usable on every in-sync replica as soon as its statement
+  allow is served meanwhile. The missing-`IMPORT` denial of an explicit-key produce follows the same rule (the gateway
+  and the worker ingress both ship "the view is behind" with the produce): `AuthUnavailable`, nothing appended, and the
+  same batch at the same base sequence is accepted once the grant is applied. A grant is therefore usable on every
+  in-sync replica as soon as its statement
   is answered. One case still sees a short-lived `NotAuthorized` after a fresh grant: a broker outside the
   `__security` in-sync set (bounded by the staleness limit F).
 - A broker stale for `RUNE_SECURITY_STALE_SESSION_END_MS` (R, default 10 000) ends its authenticated
