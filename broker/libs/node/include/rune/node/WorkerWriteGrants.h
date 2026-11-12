@@ -94,6 +94,12 @@ inline constexpr int32_t kPermBitmapImport = 1;
 /// two never alias.  A worker answers a produce it would deny for a topic id at or above the frontier NotLeader (not
 /// applied here yet), never the terminal NotAuthorized.
 inline constexpr int32_t kPermLagTopicFrontier = 2;
+/// A kPermFlagSecurityBehind item whose `topicId` is kPermLagReset is a RESET: the control thread's shipper queue
+/// overflowed for this worker (it was a whole queue behind and skipped items), so everything it knows about tables and
+/// bindings may be stale.  The worker drops every table, denies every session, discards a half-staged table and refuses
+/// every produce (retriable AuthUnavailable) until the snapshot that follows ends with a lag level.  Distinct from the
+/// lag-level item (kPermBitmapWrite) and the frontier item (kPermLagTopicFrontier).
+inline constexpr int32_t kPermLagReset = 3;
 /// The worker's table store bound (== gateway PermissionPool::kMaxTables).
 inline constexpr std::size_t kMaxWritePermTables = 4096;
 
@@ -151,6 +157,11 @@ public:
         state_ = NoUpdate{};
         if (!ok) { reason_ = "table id beyond the store"; ++dropped_; return PermApply::Violation; }
         return PermApply::Applied;
+    }
+    /// #442: forget a half-staged table (a reset: the chunks that follow belong to a snapshot, never to it).
+    void discard() noexcept {
+        if (auto* st = std::get_if<Staging>(&state_)) spare_ = std::move(st->words);
+        state_ = NoUpdate{};
     }
     /// Why the last Violation was returned (a static string; meaningful only after a Violation).
     [[nodiscard]] const char* violationReason() const noexcept { return reason_; }

@@ -1922,6 +1922,36 @@ public:
     void holdCatalogReplicationForTest(bool on) {
         onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdCatalogReplicationForTest(on); return 0; });
     }
+    /// #442 seams (control thread): the permission shipper's queue cap, the workers it declared lost, and a
+    /// worker's lifecycle ring filled to the brim (nothing drains it while the worker's hold lasts).
+    template <class = void>
+    void setPermissionQueueCapForTest(std::size_t n) {
+        onControlThreadForTest([this, n]() { if (gateway_) gateway_->setPermissionQueueCapForTest(n); return 0; });
+    }
+    template <class = void>
+    [[nodiscard]] uint64_t permissionWorkersLostForTest() {
+        return static_cast<uint64_t>(onControlThreadForTest([this]() {
+            return gateway_ ? static_cast<int64_t>(gateway_->permissionWorkersLostForTest()) : int64_t{0}; }));
+    }
+    template <class = void>
+    [[nodiscard]] uint64_t permissionResyncsForTest() {
+        return static_cast<uint64_t>(onControlThreadForTest([this]() {
+            return gateway_ ? static_cast<int64_t>(gateway_->permissionResyncsForTest()) : int64_t{0}; }));
+    }
+    template <class = void>
+    [[nodiscard]] int64_t permissionLostNowForTest() {
+        return onControlThreadForTest([this]() {
+            return gateway_ ? static_cast<int64_t>(gateway_->permissionLostNowForTest()) : int64_t{0}; });
+    }
+    template <class = void>
+    void fillWorkerLifecycleRingForTest(int32_t w) {
+        onControlThreadForTest([this, w]() {
+            if (!workerPool_ || w < 0 || w >= workerPool_->workerCount()) return 0;
+            WorkerOp filler; filler.type = WorkerOp::Type::SessionClose; filler.sessionId = INT64_MAX;
+            while (workerPool_->worker(w).tryEnqueueOp(filler)) {}
+            return 0;
+        });
+    }
     /// Issue #197 seam (CONTROL thread): hold / release the gateway's permission shipper (queued, never sent while held;
     /// releasing ships the backlog at once).
     template <class = void>   // instantiated after onControlThreadForTest is defined

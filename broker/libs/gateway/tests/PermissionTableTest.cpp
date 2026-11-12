@@ -410,6 +410,28 @@ TEST(PermissionPoolAdversarialRegression, AFullPoolFailsClosedAndRecoversWhenASe
     EXPECT_FALSE(again->allows(5, rs::opBit(Operation::Write))) << "the reused entry is the new set's";
 }
 
+// #442: the pool says when it answered the full-pool deny-all (so the gateway can re-acquire later), and iterates its
+// live entries (a worker resync ships every one again).
+TEST(PermissionPoolAdversarialRegression, TheFullPoolSaysSoAndLiveEntriesAreIterableAdversarialRegression) {
+    rg::ObjectIndex idx;
+    for (int i = 0; i < 8; ++i) idx.onTopic(i, "t" + std::to_string(i));
+    rg::PermissionPool pool;
+    std::vector<rg::PermissionRef> held;
+    held.reserve(rg::PermissionPool::kMaxTables);
+    for (uint32_t i = 0; i < rg::PermissionPool::kMaxTables; ++i)
+        held.push_back(pool.acquire(writeOne(static_cast<int>(i)), idx));
+    EXPECT_FALSE(pool.lastAcquireWasFull());
+    const auto over = pool.acquire(writeOne(999'999), idx);
+    EXPECT_TRUE(pool.lastAcquireWasFull());
+    const auto shared = pool.acquire(writeOne(3), idx);
+    EXPECT_FALSE(pool.lastAcquireWasFull()) << "an existing set still shares";
+    held[5] = rg::PermissionRef{};
+    std::size_t live = 0;
+    pool.forEachLive([&](uint32_t id, const rg::PermissionTable&) { EXPECT_NE(id, 5u); ++live; });
+    EXPECT_EQ(live, rg::PermissionPool::kMaxTables - 1);
+    EXPECT_EQ(live, pool.liveTables());
+}
+
 // Lifetime: copies, moves, self-assignment and swaps keep the count exact - one Freed when (and only when) the last
 // holder goes, never a double release.
 TEST(PermissionPoolAdversarialRegression, RefCopiesMovesAndSelfAssignmentKeepTheCountExactAdversarialRegression) {

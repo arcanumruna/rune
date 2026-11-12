@@ -1030,6 +1030,18 @@ public:
         t->grantAll = false;
         return true;
     }
+    /// #442: the control thread's shipper declared this worker lost and resyncs it: forget every table (bits cleared,
+    /// capacity persists) and deny every session until the snapshot's tables and binds arrive.  O(kMaxWritePermTables +
+    /// kMaxSessions), cold (a resync, essentially never).
+    void resetPermissions() noexcept {
+        for (std::size_t i = 0; i < kMaxWritePermTables; ++i) {
+            WritePermTable& t = permTables_[i];
+            t.bits.clear();
+            t.importBits.clear();
+            t.grantAll = false;
+        }
+        for (std::size_t i = 0; i < kMaxSessions; ++i) resetGrants_(grants_[i]);
+    }
     /// Test seam: slots examined by the last find_ of `sessionId` (probe chain length).
     [[nodiscard]] std::size_t probeChainForTest(int64_t sessionId) const noexcept {
         std::size_t i = hash_(sessionId);

@@ -1327,3 +1327,68 @@ TEST(AuthLiveChangeRegression, ARevokeReadIsAnsweredWhileEightGatewaySessionsHol
     revokeReadWhileAcksAreHeld(/*direct=*/false, 8);
     revokeReadWhileAcksAreHeld(/*direct=*/false, 8, /*smallPipe=*/true);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #442: the permission shipper's queue is bounded.  A worker whose lifecycle ring stays full while grant sets churn is
+// declared LOST (it skips items), then reset and resynced from the gateway's full snapshot once its ring drains.  Over
+// the whole episode no session that holds the WRITE grant is ever answered the terminal 45, and afterwards every
+// session's effective WRITE permission on that worker equals the gateway's.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+TEST(AuthLiveChangeAdversarialRegression,
+     AWorkerThatFellAQueueBehindIsResyncedToTheGatewaysPermissionsAdversarialRegression) {
+    AuthBroker::Options o = shardOptions();
+    o.configure = [](NodeConfig& c) { c.securityGateDeadlineMs = 300; };   // OKs held on the stalled worker: in doubt
+    Live t("adv442lost", o);
+    ASSERT_EQ(t.createRole("writers"), 0);
+    ASSERT_EQ(t.grantRoleOp("writers", SO::Write, ST::Topic, SP::Exact, "orders"), 0);
+    std::vector<int64_t> members;
+    for (int i = 0; i < 6; ++i) {
+        std::string name;
+        members.push_back(t.r.newUser({}, &name));
+        ASSERT_EQ(t.grantRole(name, "writers"), 0);
+    }
+    const int64_t bystander = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    for (const int64_t s : members) ASSERT_EQ(shardProduceCode(t, s, t.r.orders, 200), 0);
+    ASSERT_EQ(shardProduceCode(t, bystander, t.r.orders, 200), 0);
+
+    // One produce, retried through the retriable answers; every terminal 45 seen is counted.
+    int terminal45 = 0;
+    const auto settled = [&](int64_t sid) {
+        int code = kNoAnswer;
+        for (int a = 0; a < 200; ++a) {
+            code = shardProduceOnce(t, sid, t.r.orders, 10);
+            if (code == 45) ++terminal45;
+            if (code != static_cast<int>(pc::ErrorCode::NotLeader) &&
+                code != static_cast<int>(pc::ErrorCode::UnknownTopic) &&
+                code != static_cast<int>(pc::ErrorCode::AuthUnavailable) && code != kNoAnswer)
+                return code;
+            std::this_thread::sleep_for(25ms);
+        }
+        return code;
+    };
+
+    t.b().node().setPermissionQueueCapForTest(24);
+    (void)t.b().node().onWorkerThreadForTest(0, [](Worker& w) { w.holdSessionOpsForTest(3'000'000'000); return 0; });
+    t.b().node().fillWorkerLifecycleRingForTest(0);
+    // Churn between grant sets that ALL keep WRITE on orders: every member keeps the grant throughout.
+    for (int flip = 0; flip < 8 && t.b().node().permissionLostNowForTest() == 0; ++flip) {
+        (void)t.grantRoleOp("writers", SO::Read, ST::Topic, SP::Exact, "secret");   // in-doubt at the gate deadline
+        (void)t.revoke("writers", true, SO::Read, ST::Topic, SP::Exact, "secret");
+    }
+    ASSERT_GE(t.b().node().permissionWorkersLostForTest(), 1u) << "the worker was declared lost";
+    for (const int64_t s : members) {
+        const int code = shardProduceOnce(t, s, t.r.orders, 3);
+        EXPECT_NE(code, 45) << "a session holding the grant is never answered the terminal 45 while its worker is lost";
+    }
+
+    // The hold ends, the worker drains its ring, the gateway resets it and ships the snapshot.
+    ASSERT_TRUE(t.r.c().pollUntil([&] { return t.b().node().permissionResyncsForTest() >= 1; })) << "resynced";
+    for (const int64_t s : members) EXPECT_EQ(settled(s), 0) << "every member's WRITE is back on the worker";
+    EXPECT_EQ(settled(bystander), 0);
+    EXPECT_EQ(terminal45, 0) << "no terminal 45 was answered to a session that holds the grant at any time";
+
+    // And a REVOKE after the resync is enforced on that worker: the worker's permissions equal the gateway's.
+    ASSERT_EQ(t.revoke("writers", true, SO::Write, ST::Topic, SP::Exact, "orders"), 0);
+    for (const int64_t s : members) EXPECT_EQ(settled(s), 45) << "the revoked role's members are refused";
+    EXPECT_EQ(settled(bystander), 0) << "the bystander's own grant is untouched";
+}

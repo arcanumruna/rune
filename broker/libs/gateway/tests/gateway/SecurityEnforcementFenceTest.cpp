@@ -692,3 +692,103 @@ TEST(CheckedWritesImportGrant, ImportDeferredSurvivesTheRingAndSharesItsBitWithK
     WorkerOp announceDef; announceDef.type = WorkerOp::Type::SessionAnnounce; announceDef.importDeferred = true;
     EXPECT_EQ(enqueuedFlags(r, announceDef) & rune::node::kOpFlagKeyPending, 0) << "importDeferred is not an announce flag";
 }
+
+// ── #442: a worker that fell a whole shipper queue behind is LOST; nothing that waits for "every worker has it" is
+// satisfied on its behalf, and the resync (reset + snapshot + the outstanding fence) lets it acknowledge.
+// Mutation m3 (shippedSeq() not frozen while a worker is lost): the object's permissions count as shipped (the other
+// worker alone moves the trim point) -> red.
+TEST(SecurityEnforcementFenceRegression, AFenceIsNeverAcknowledgedOnBehalfOfALostWorkerRegression) {
+    FenceRig r(2);
+    r.gw.setPermissionQueueCapForTest(16);
+    const int64_t ws = r.login("w");
+    const int64_t pre = r.gw.injectTestSession(0);
+    r.gw.authenticateWithGrantsForTest(pre, 77, {sec::GrantSpec{sec::Operation::Write, sec::ResourcePattern{
+        sec::ResourceType::Topic, sec::PatternKind::Prefix, "w."}}});
+    for (int i = 0; i < 3; ++i) r.runAll(1 + i);
+    ASSERT_EQ(r.gw.permissionLostNowForTest(), 0u);
+
+    // Worker 1 stops draining its lifecycle ring (full); logins pile items up behind it until it is lost.
+    rune::node::WorkerOp filler;
+    filler.type = rune::node::WorkerOp::Type::SessionClose;
+    filler.sessionId = INT64_MAX;
+    while (r.pool.worker(1).tryEnqueueOp(filler)) {}
+    int64_t now = 10;
+    for (int i = 0; i < 40; ++i) {
+        (void)r.login("r");
+        (void)r.gw.servicePermissionShippingForTest();
+        r.runWorker(0, ++now);
+    }
+    ASSERT_EQ(r.gw.permissionLostNowForTest(), 1u) << "worker 1 is a whole queue behind";
+    EXPECT_LE(r.gw.permissionPendingUpdatesForTest(), 17u);
+
+    // An object whose permissions must reach every worker first, and a REVOKE whose fence worker 1 cannot see.
+    r.gw.onCatalogObjectApplied(10, "w.t10", false);
+    const int64_t off = r.revoke(sec::Operation::Write, "w");
+    for (int i = 0; i < 20; ++i) {
+        (void)r.gw.servicePermissionShippingForTest();
+        r.runWorker(0, ++now);
+    }
+    EXPECT_GE(r.gw.enforceFenceAckedForTest(0, 1), 1u) << "worker 0 acknowledged the fence";
+    EXPECT_EQ(r.gw.enforceFenceAckedForTest(1, 1), 0u) << "worker 1 never saw it";
+    EXPECT_LT(r.gw.securityEnforcedOffset(), off) << "the revoke is not enforced on behalf of a lost worker";
+    EXPECT_FALSE(r.gw.objectPermissionsShipped(10)) << "shippedSeq() does not move for a worker that skipped items";
+
+    // Worker 1 drains its ring: the gateway resets it, ships the snapshot and re-issues the outstanding fence.
+    bool enforced = false;
+    for (int cycle = 0; cycle < 60 && !enforced; ++cycle) {
+        r.runAll(++now);
+        enforced = r.gw.securityEnforcedOffset() >= off;
+    }
+    EXPECT_TRUE(enforced) << "the resynced worker acknowledged the fence";
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), off);
+    EXPECT_EQ(r.gw.permissionLostNowForTest(), 0u);
+    EXPECT_EQ(r.gw.permissionResyncsForTest(), 1u);
+    EXPECT_EQ(r.pool.worker(1).permissionResetsForTest(), 1u);
+    EXPECT_EQ(r.pool.worker(0).permissionResetsForTest(), 0u);
+    EXPECT_TRUE(r.gw.objectPermissionsShipped(10));
+    (void)ws;
+}
+
+// ── #442 part 2: a session that got the full-pool deny-all ref is re-acquired once the pool has room.
+// Mutation m6 (starved sessions are never re-acquired): the session keeps its deny-all table -> red.
+TEST(PermissionPoolStarvedRegression, AStarvedSessionIsReacquiredWhenASetLeavesRegression) {
+    SecurityEventChain chain;
+    sec::BootstrapOps b; b.verifier = testVerifier(9); b.fakeSaltSeed.fill(7);
+    (void)chain.emit(b, "admin", "BOOTSTRAP", "bootstrap");
+    (void)chain.createUser("r");
+    (void)chain.emit(sec::GrantOps{sec::GranteeKind::User, topicGrant(sec::Operation::Read, "events")}, "r",
+                     "GRANT READ ON TOPIC events TO USER r;");
+    SecurityView view(chain.state());
+    auto gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    gw.setAuthMode(GatewayAuthMode::Required, &view);
+    gw.onCatalogObjectApplied(0, "events", false);
+
+    constexpr uint32_t kMax = PermissionPool::kMaxTables;
+    std::vector<int64_t> fillers;
+    fillers.reserve(kMax);
+    for (uint32_t i = 0; i < kMax; ++i) {   // kMax distinct live sets: the pool is full
+        const int64_t sid = gw.injectTestSession(0);
+        gw.authenticateWithGrantsForTest(sid, 1000 + i, {sec::GrantSpec{sec::Operation::Write, sec::ResourcePattern{
+            sec::ResourceType::Topic, sec::PatternKind::Prefix, "p" + std::to_string(i)}}});
+        fillers.push_back(sid);
+    }
+    ASSERT_EQ(gw.permissionTablesForTest(), kMax);
+    const uint64_t rid = chain.state().userByName(rune::catalog::kDefaultNsId, "r")->objectId;
+    const int64_t sr = gw.injectTestSession(0);
+    gw.authenticateWithGrantsForTest(sr, rid, sec::effectiveGrants(chain.state(), rid));
+    constexpr uint8_t kRead = sec::opBit(sec::Operation::Read);
+    ASSERT_NE(gw.sessionPermissionsForTest(sr), nullptr);
+    EXPECT_FALSE(gw.sessionPermissionsForTest(sr)->allows(0, kRead)) << "the full pool answered deny-all";
+    EXPECT_EQ(gw.poolStarvedForTest(), 1u);
+
+    (void)gw.servicePermissionShippingForTest();
+    EXPECT_FALSE(gw.sessionPermissionsForTest(sr)->allows(0, kRead)) << "still full: nothing to re-acquire into";
+    EXPECT_EQ(gw.poolStarvedReacquiredForTest(), 0u);
+
+    gw.closeSessionForTest(fillers[7]);   // its set's last holder leaves
+    ASSERT_LT(gw.permissionTablesForTest(), kMax);
+    (void)gw.servicePermissionShippingForTest();
+    EXPECT_TRUE(gw.sessionPermissionsForTest(sr)->allows(0, kRead)) << "the starved session holds its real table";
+    EXPECT_EQ(gw.poolStarvedReacquiredForTest(), 1u);
+    EXPECT_EQ(gw.poolStarvedForTest(), 0u);
+}

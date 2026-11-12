@@ -179,6 +179,13 @@ struct Fixture {
         o.nextOffset = frontier; o.isolation = kPermFlagSecurityBehind | kPermFlagLast;
         ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
     }
+    /// #442: the shipper's RESET (kPermFlagSecurityBehind with topicId kPermLagReset): the control thread's queue for
+    /// this worker overflowed, so every table / binding it holds may be stale.
+    void permReset() {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = 0; o.topicId = kPermLagReset;
+        o.nextOffset = 0; o.isolation = kPermFlagSecurityBehind | kPermFlagLast;
+        ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
+    }
     void produce(int64_t sid, int64_t corr, int32_t topicId = 1) {
         rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
         const auto batch = b.build();
@@ -822,4 +829,69 @@ TEST(WorkerWriteGrantRegression, ADenialForAnIdNotAppliedHereIsRetriableOnTheWor
     EXPECT_EQ(f.acks[9].errorCode, 0) << "after the apply the same produce is appended";
     EXPECT_EQ(f.log->logEndOffset(), 2);
     EXPECT_EQ(f.worker->workerDeniesUnappliedForTest(), 3u);
+}
+
+// ── #442: the RESET op ──
+// Mutation m4 (the reset keeps the tables / bindings): the session the snapshot did not rebind is served from its
+// pre-reset binding once the level is Current -> red.  m5 (the reset leaves the level Current): the first produce after
+// the reset is answered 45 instead of the retriable 48 -> red.
+TEST(WorkerPermissionResetRegression, AResetDeniesEverySessionRetriablyUntilTheSnapshotsLevelArrivesRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.chunk(5, 1, 0, 1, bitsFor({1}, 1), /*last=*/true);   // WRITE on topic 1
+    f.announce(6, false);
+    f.chunk(6, 1, 0, 1, bitsFor({2}, 1), /*last=*/true);   // WRITE on topic 2
+    f.produce(5, 1);
+    ASSERT_TRUE(f.awaitAck(1));
+    ASSERT_EQ(f.acks[1].errorCode, 0);
+    ASSERT_EQ(f.log->logEndOffset(), 1);
+
+    f.permReset();
+    int64_t corr = 10;
+    const auto code = [&](int64_t sid, int32_t topic) {
+        f.produce(sid, ++corr, topic);
+        EXPECT_TRUE(f.awaitAck(corr));
+        return f.acks[corr].errorCode;
+    };
+    const auto unavailable = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+    const auto notAuth     = static_cast<int16_t>(pc::ErrorCode::NotAuthorized);
+    EXPECT_EQ(code(5, 1), unavailable) << "retriable, never the terminal 45";
+    EXPECT_EQ(code(6, 2), unavailable);
+    EXPECT_EQ(code(5, 2), unavailable) << "a produce the old table would have denied is retriable too";
+    EXPECT_EQ(f.log->logEndOffset(), 1) << "nothing appended";
+    EXPECT_EQ(f.worker->permissionResetsForTest(), 1u);
+    EXPECT_EQ(f.worker->securityLagForTest(), 1u) << "RefuseAll until the snapshot's level arrives";
+    EXPECT_EQ(f.slot(5)->table, denyWriteTable()) << "every binding is denied";
+    EXPECT_EQ(f.slot(6)->table, denyWriteTable());
+
+    // No snapshot rebind, level Current: the sessions are denied (45) - never served from the pre-reset tables.
+    f.securityLag(0);
+    EXPECT_EQ(code(5, 1), notAuth) << "the pre-reset table is gone";
+    EXPECT_EQ(code(6, 2), notAuth);
+    EXPECT_EQ(f.log->logEndOffset(), 1);
+
+    // A second reset, then the snapshot: tables, binds, the level last.  Until the level, still retriable.
+    f.permReset();
+    f.chunk(5, 2, 0, 1, bitsFor({1}, 1), /*last=*/true);
+    f.chunk(6, 2, 0, 1, bitsFor({1}, 1), /*last=*/true);   // the gateway's view: session 6 now holds topic 1 too
+    EXPECT_EQ(code(5, 1), unavailable) << "the snapshot's level has not arrived";
+    f.securityLag(0);
+    EXPECT_EQ(code(5, 1), 0) << "allowed sessions are served again";
+    EXPECT_EQ(code(6, 1), 0) << "the snapshot's table replaced the stale one";
+    EXPECT_EQ(code(5, 2), notAuth) << "a revoked one answers 45";
+    EXPECT_EQ(code(6, 2), notAuth) << "the pre-reset grant on topic 2 did not survive";
+    EXPECT_EQ(f.log->logEndOffset(), 3);
+    EXPECT_EQ(f.worker->permissionResetsForTest(), 2u);
+}
+
+TEST(WorkerPermissionResetRegression, AHalfStagedTableDoesNotSurviveAResetRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.chunk(5, 1, /*first=*/0, /*total=*/2, std::vector<uint64_t>{1}, /*last=*/false);   // word 0 of 2
+    f.steps(3);
+    ASSERT_TRUE(f.worker->permissionStagingForTest()) << "a table is half staged";
+    f.permReset();
+    f.steps(3);
+    EXPECT_FALSE(f.worker->permissionStagingForTest()) << "the reset discarded the staged chunks";
+    EXPECT_EQ(f.worker->permissionResetsForTest(), 1u);
 }

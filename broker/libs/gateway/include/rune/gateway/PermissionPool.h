@@ -127,6 +127,15 @@ public:
         }
     }
 
+    /// #442: the last acquire() found the pool full and answered the deny-all ref (never pooled).  A caller that keeps
+    /// that ref for a session can record it as starved and re-acquire once liveTables() < kMaxTables.
+    [[nodiscard]] bool lastAcquireWasFull() const noexcept { return lastFull_; }
+    /// #442: `f(id, table)` for every live entry, in id order (cold: a worker resync ships them all again).
+    template <class F> void forEachLive(F&& f) const {
+        for (uint32_t i = 0; i < entries_.size(); ++i)
+            if (entries_[i]->refs != 0) f(i, entries_[i]->table);
+    }
+
     [[nodiscard]] std::size_t liveTables() const noexcept { return live_; }
     [[nodiscard]] uint64_t compiles() const noexcept { return compiles_; }   ///< tables compiled so far (tests, bench)
     [[nodiscard]] uint32_t refsOf(uint32_t id) const noexcept { return id < entries_.size() ? entries_[id]->refs : 0; }
@@ -149,6 +158,7 @@ private:
     std::vector<uint32_t>                       free_;      // ids of freed entries (reused first)
     std::unordered_multimap<uint64_t, uint32_t> byHash_;    // live entries only
     std::size_t                                 live_ = 0;
+    bool                                        lastFull_ = false;   // #442: the last acquire() hit kMaxTables
     uint64_t                                    compiles_ = 0;
     std::vector<PendingEvent>                   events_;
     PermissionTable                             denyAll_ = PermissionTable::denyAll();

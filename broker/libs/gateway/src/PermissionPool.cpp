@@ -32,6 +32,7 @@ uint64_t PermissionPool::hashOf_(std::span<const rsec::GrantSpec> grants, uint32
 
 PermissionRef PermissionPool::acquire(std::vector<rsec::GrantSpec> grants, uint32_t nsId, const ObjectIndex& index,
                                      std::string_view nsName) {
+    lastFull_ = false;
     const uint64_t h = hashOf_(grants, nsId);
     for (auto [it, end] = byHash_.equal_range(h); it != end; ++it) {
         Entry& e = *entries_[it->second];
@@ -50,6 +51,7 @@ PermissionRef PermissionPool::acquire(std::vector<rsec::GrantSpec> grants, uint3
     } else {
         spdlog::error("auth: {} distinct live grant sets (the limit) - a session with a new one is denied everything",
                       live_);
+        lastFull_ = true;   // #442: the caller may re-acquire once a set leaves
         return PermissionRef{};   // deny-all, never pooled (fail closed)
     }
     Entry& e = *entries_[id];

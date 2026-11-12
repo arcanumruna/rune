@@ -539,6 +539,13 @@ public:
         return (ring == 0 ? opFenceAcked_ : lifeFenceAcked_)[static_cast<std::size_t>(worker)];
     }
     [[nodiscard]] std::size_t permissionPendingUpdatesForTest() const noexcept { return permissionShipper_.pendingUpdates(); }
+    /// #442 seams: the shipper's queue cap, lost / resynced workers, the pool-starved sessions re-acquired.
+    void setPermissionQueueCapForTest(std::size_t n) noexcept { permissionShipper_.setMaxQueuedForTest(n); }
+    [[nodiscard]] std::size_t permissionLostNowForTest() const noexcept { return permissionShipper_.lostNow(); }
+    [[nodiscard]] uint64_t permissionWorkersLostForTest() const noexcept { return permissionShipper_.workersLost(); }
+    [[nodiscard]] uint64_t permissionResyncsForTest() const noexcept { return permissionShipper_.resyncs(); }
+    [[nodiscard]] uint64_t poolStarvedReacquiredForTest() const noexcept { return poolStarvedReacquired_; }
+    [[nodiscard]] std::size_t poolStarvedForTest() const noexcept { return poolStarved_.size(); }
     /// PR #528 review (issue #197): how many objects still owe a permission ship before their DDL OK (bounded).
     [[nodiscard]] std::size_t objectShipSeqsForTest() const noexcept { return objectShipSeqs_.size(); }
     /// Issue #197 test seam: hold the permission shipper (queue, send nothing); releasing ships the backlog at once.
@@ -577,6 +584,7 @@ public:
         if (s == nullptr) return;
         s->auth = rune::gateway::AuthAuthenticated{userId, "u" + std::to_string(userId),
                                                     permPool_.acquire(std::move(grants), nsId, objectIndex_), {}, nsId};
+        noteStarved_(sid, permPool_.lastAcquireWasFull());
         (void)shipPermissions_(*s);
     }
     int servicePermissionShippingForTest() { return servicePermissionShipping_(); }
@@ -3158,6 +3166,18 @@ private:
     // Authentication Task 13 (D30): WRITE bitmaps to every worker; a login's AuthServerFinal{OK} waits for its epoch.
     rune::node::PermissionShipper permissionShipper_;
     uint64_t permEpoch_ = 0;
+    /// #442 part 2: the sessions whose last permission acquire hit the full pool (they hold the deny-all ref), deduped,
+    /// removed at session close.  Bounded by the session table.  The service step re-acquires up to kStarvedPerCycle of
+    /// them per duty cycle while the pool has room.
+    static constexpr std::size_t kStarvedPerCycle = 16;
+    std::vector<int64_t> poolStarved_;
+    uint64_t poolStarvedReacquired_ = 0;
+    bool     compileStarved_ = false;   ///< the last compilePerms_ got the full-pool deny-all ref
+    void noteStarved_(int64_t sid, bool starved);
+    void reacquireStarved_();
+    /// #442 part 1: a worker was lost and reset: re-ship everything it needs (tables, binds, lag, frontier, fence).
+    void shipPermissionSnapshot_();
+    uint64_t lostWorkersLogged_ = 0;
     /// Issue #197: (object id, the shipper seq that must be shipped before that object's DDL OK may leave).  Cold, DDL rate.
     std::vector<std::pair<int32_t, uint64_t>> objectShipSeqs_;
     /// Issue #202: the sessions whose login OK is held (`Session::heldLoginOk`), oldest first; epochs only grow, so they are

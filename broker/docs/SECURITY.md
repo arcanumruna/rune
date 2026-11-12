@@ -336,6 +336,25 @@ Other brokers
 apply the event asynchronously (typically within 100 ms on healthy brokers).
 A revoke ends the affected subscriptions within 100 ms on a 3-node cluster.
 
+**Worker permission shipping is bounded.** On a shard broker the gateway ships the WRITE tables, the sessions' bindings
+and the lag level to every worker, in order, as one queue. The queue holds at most 65 536 items and nothing in it is
+merged or dropped. A worker whose lifecycle ring stays full while the queue grows past that bound is declared **lost**
+(`CRITICAL` in the log): it skips every item queued so far. While any worker is lost, "shipped to every worker" stops
+advancing, so no login answer, no object DDL answer and no security DDL answer is released on behalf of a worker that
+skipped items. Once the worker's ring drains, the gateway sends it a reset (it drops every table, denies every session
+and refuses produces) followed by a full snapshot of the tables, bindings, lag level, topic frontier and any fence the
+admin gate still waits for (`INFO` in the log). What clients see meanwhile: a produce through that worker is answered
+the retriable `AuthUnavailable`, never the terminal `NotAuthorized`, until the snapshot's lag level arrives; a security
+DDL whose enforcement that worker cannot confirm is answered `Internal` ("enforcement not confirmed") at
+`RUNE_SECURITY_GATE_DEADLINE_MS`, as for any stalled worker. After the resync the worker enforces exactly the gateway's
+permissions.
+
+**A full table pool recovers.** A broker holds at most 4 096 distinct effective grant sets at once (the workers' table
+store has the same bound; one more than the 4 095 shard sessions, because a refresh briefly holds a session's old and
+new table). A session whose set does not fit gets deny-all (fail closed, and an error in the log). Such a session is
+remembered, and each duty cycle, while the pool has room, up to 16 of them re-run their ordinary permission refresh and
+get their real table. On a non-shard broker with more than 4 096 distinct sets this matters; shard mode cannot reach it.
+
 **A DDL and a concurrent security change.** The gateway authorizes a catalog or security DDL against its mirror of
 `__security` and stamps the request with the `__security` offset it checked. The admin thread appends the request only
 if no event applied after that offset could have changed what the requesting user may do (issues #218, #67); otherwise

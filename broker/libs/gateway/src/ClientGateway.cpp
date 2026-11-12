@@ -57,6 +57,13 @@
 static_assert(rune::gateway::ClientGateway::kShardMaxSessions ==
                   rune::node::SessionAckSink::kMaxSessions - 1,
               "Task 13: the runtime's shard session cap is a worker ack table's capacity");
+// #442: a permission refresh briefly holds the old ref and the new one, so a full shard session table needs one table
+// of headroom; the worker's table store is the pool's bound (the pool numbers a table, the worker stores it by that
+// id).
+static_assert(rune::gateway::PermissionPool::kMaxTables >= rune::gateway::ClientGateway::kShardMaxSessions + 1,
+              "#442: a refresh briefly holds the old and the new table of a session");
+static_assert(rune::node::kMaxWritePermTables == rune::gateway::PermissionPool::kMaxTables,
+              "#442: the workers' table store is exactly the gateway pool's bound");
 static_assert(rune::gateway::ClientGateway::kWorkerRoutedCap == rune::node::Worker::kRoutedAckBudget,
               "D8c fix round 1: the gateway's per-worker routed cap is the worker's routed ack share");
 static_assert(rune::gateway::ClientGateway::kMaxSessionProduceCredits * 4 <=
@@ -1693,6 +1700,7 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     for (auto& [w, pub] : s->recordEgressByWorker)
         if (pub) retireRecordEgress_(sid, w, std::move(pub));
     if (s->heldLoginOk.epoch != 0) unlinkHeldLoginOk_(*s);   // issue #202: before the session leaves the table
+    noteStarved_(sid, false);   // #442: a closed session is never re-acquired
     sessions_.remove(sid);                    // releases its (gateway-written) egress publication
     // Task 13: the workers forget it too (its queued acks drop, its
     // publications are released) — retried until every worker has it.
@@ -9964,8 +9972,36 @@ rune::gateway::PermissionRef ClientGateway::compilePerms_(uint64_t userId, uint3
     // foreign object gets no bits, except for root (ADMIN ON CLUSTER keeps every op in every namespace, #626).
     // Plan D11: the session's namespace name decides whether ADMIN ON NAMESPACE makes it that namespace's admin.
     const rune::catalog::NamespaceRecord* ns = namespaces_.registry().byId(nsId);
-    return permPool_.acquire(rune::security::effectiveGrants(securityView_->state(), userId), nsId, objectIndex_,
-                             ns != nullptr ? std::string_view(ns->name) : std::string_view{});
+    rune::gateway::PermissionRef ref = permPool_.acquire(
+        rune::security::effectiveGrants(securityView_->state(), userId), nsId, objectIndex_,
+        ns != nullptr ? std::string_view(ns->name) : std::string_view{});
+    compileStarved_ = permPool_.lastAcquireWasFull();   // #442: noteStarved_ reads it right after the caller installs
+    return ref;
+}
+
+void ClientGateway::noteStarved_(int64_t sid, bool starved)
+{
+    const auto it = std::ranges::find(poolStarved_, sid);
+    if (!starved) {
+        if (it != poolStarved_.end()) { *it = poolStarved_.back(); poolStarved_.pop_back(); }
+        return;
+    }
+    if (it == poolStarved_.end()) poolStarved_.push_back(sid);
+}
+
+void ClientGateway::reacquireStarved_()
+{
+    // A starved session holds the deny-all ref until its next refresh; once the pool has room, run the ordinary refresh
+    // for a few of them per duty cycle (cold; bounded).  A session that gets a real table leaves the list
+    // (refreshSession_ -> noteStarved_); one that is starved again stays.
+    std::array<int64_t, kStarvedPerCycle> batch{};
+    const std::size_t n = std::min(poolStarved_.size(), batch.size());
+    std::copy_n(poolStarved_.begin(), n, batch.begin());
+    for (std::size_t i = 0; i < n; ++i) {
+        refreshSession_(batch[i]);
+        if (sessions_.find(batch[i]) == nullptr) { noteStarved_(batch[i], false); continue; }
+        if (!std::ranges::contains(poolStarved_, batch[i])) ++poolStarvedReacquired_;
+    }
 }
 
 void ClientGateway::syncPermissionTables_()
@@ -10601,7 +10637,11 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         spdlog::warn("auth: session {} authenticated over plaintext (no TLS): frames are not integrity-protected",
                      session->sessionId);
     if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user, std::move(loginNonce), ok.nsId};
-    else session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId, ok.nsId), std::move(loginNonce), ok.nsId};
+    else {
+        session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId, ok.nsId), std::move(loginNonce),
+                                          ok.nsId};
+        noteStarved_(session->sessionId, compileStarved_);   // #442
+    }
     session->nsGate = nsTag;
     session->nsId   = ok.nsId;
     session->nsSlot = nsSlots_.slotOf(ok.nsId);   // namespaces Phase 2 Task 8: cached for the hot path
@@ -10652,8 +10692,31 @@ int ClientGateway::servicePermissionShippingWork_()
 {
     int work = 0;
     syncPermissionTables_();   // issue #259: a freed table's drop (after every rebind away from it)
-    if (!workerPool_) return 0;
+    // #442 part 2: sessions that got the full-pool deny-all ref get their real table once the pool has room.
+    if (!poolStarved_.empty() && permPool_.liveTables() < rune::gateway::PermissionPool::kMaxTables) {
+        reacquireStarved_();
+        ++work;
+    }
+    if (!workerPool_) return work;
     work += syncWorkersLag_();   // #603: in every worker mode (worker-pushed subscriptions pause too)
+    // #442 part 1: a worker that fell a whole queue behind was declared lost by the shipper; reset it (its ring must
+    // take the reset op) and ship the full snapshot at once, before any other item, so it converges on the gateway's
+    // state.
+    if (permissionShipper_.workersLost() != lostWorkersLogged_) [[unlikely]] {
+        spdlog::critical("ClientGateway: {} permission shipper worker(s) fell more than {} items behind and skipped "
+                         "them ({} lost so far); each is reset and resynced from a full snapshot when its ring "
+                         "drains - until then its produces are answered AuthUnavailable and held admin answers go "
+                         "in doubt",
+                         permissionShipper_.lostNow(), rune::node::PermissionShipper::kMaxQueued,
+                         permissionShipper_.workersLost());
+        lostWorkersLogged_ = permissionShipper_.workersLost();
+    }
+    if (permissionShipper_.lostNow() != 0 && permissionShipper_.tryReset(*workerPool_)) {
+        spdlog::info("ClientGateway: a lost permission shipper worker was reset; shipping the permission snapshot "
+                     "({} resync(s) so far)", permissionShipper_.resyncs());
+        shipPermissionSnapshot_();
+        ++work;
+    }
     if (permissionShipper_.pendingUpdates() != 0) work += permissionShipper_.retry(*workerPool_);
     if (!shardMode_) return work;
     if (!objectShipSeqs_.empty()) {   // issue #197: bounded even when an OK is never offered
@@ -10674,6 +10737,30 @@ int ClientGateway::servicePermissionShippingWork_()
         ++work;
     }
     return work;
+}
+
+// #442: a worker was reset - it holds no table and no binding.  Everything it needs, in the order it needs it: every
+// live pool table (WRITE, then IMPORT when it has bits), every session's current bind (a NEW epoch, the same table /
+// deny / suspended choice as a refresh), the lag level, the topic frontier, and - when the D24 gate waits for one - the
+// newest outstanding lifecycle fence again (acks are cumulative per ring, so a worker that already acknowledged it, or
+// a later one, is unaffected).  Every worker receives it; it is idempotent for the healthy ones: a Table for an
+// existing id swaps the same content in (SessionAckSink::installWriteGrants), a Bind rebinds the session to the same
+// table with a newer epoch (SessionAckSink::bindWriteGrants), a level / frontier is monotonic or equal.
+void ClientGateway::shipPermissionSnapshot_()
+{
+    if (!workerPool_ || !shardMode_ || authMode_ != rune::gateway::GatewayAuthMode::Required) return;
+    syncPermissionTables_();   // drain the pool's events first: a Freed after the snapshot would drop a re-created id
+    permPool_.forEachLive([&](uint32_t id, const PermissionTable& t) {
+        (void)permissionShipper_.shipTable(*workerPool_, id, t.writeBits(), t.isAllowAll());
+        if (std::ranges::any_of(t.importBits(), [](uint64_t w) { return w != 0; }))
+            (void)permissionShipper_.shipImportTable(*workerPool_, id, t.importBits());
+    });
+    sessions_.forEach([&](Session& s) { (void)shipPermissions_(s); });   // AuthAuthenticated only; a new epoch each
+    (void)permissionShipper_.securityLag(*workerPool_, workersLag_);
+    if (appliedTopicFrontier_ != std::numeric_limits<int32_t>::max())
+        (void)permissionShipper_.topicFrontier(*workerPool_, appliedTopicFrontier_);
+    for (auto it = pendingEnforce_.rbegin(); it != pendingEnforce_.rend(); ++it)
+        if (it->lifecycle && it->seq != 0) { (void)permissionShipper_.fence(*workerPool_, it->seq); break; }
 }
 
 void ClientGateway::holdLoginOk_(Session& s, uint64_t epoch, int64_t corr, uint8_t flags, std::span<const uint8_t> signature)
@@ -10894,6 +10981,7 @@ void ClientGateway::refreshSession_(int64_t sid)
         const rune::security::UserObject* user = securityView_->state().userById(pcr->userId);
         if (user == nullptr || user->mustChangePassword) return;
         s->auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId, pcr->nsId), pcr->loginNonce, pcr->nsId};
+        noteStarved_(s->sessionId, compileStarved_);   // #442
         (void)shipPermissions_(*s);
         return;
     }
@@ -10901,11 +10989,13 @@ void ClientGateway::refreshSession_(int64_t sid)
     if (a == nullptr) return;
     // Issue #259: a pooled table - compiled only if no session holds the new set yet; the same set = the same table.
     PermissionRef fresh = compilePerms_(a->userId, a->nsId);
+    const bool freshStarved = compileStarved_;   // #442: before anything else can acquire
     if (fresh.id() == a->perms.id() && fresh.id() != PermissionRef::kNoId) return;   // nothing changed for it
     const LiveActions actions = refreshActions(a->perms.table(), fresh.table(), *s, objectIndex_);
     // The old table is held until the rebind is queued: its drop (if this was its last holder) must FOLLOW the bind,
     // or the worker would deny this session between the two.
     const PermissionRef old = std::exchange(a->perms, std::move(fresh));
+    noteStarved_(sid, freshStarved);
     (void)shipPermissions_(*s);   // a revoked WRITE fails the next produce on both paths
     if (!actions.empty()) executeLiveActions_(*s, actions);
 }

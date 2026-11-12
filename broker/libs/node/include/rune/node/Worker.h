@@ -940,6 +940,8 @@ public:
     /// frontier, and the frontier ops it ignored.
     [[nodiscard]] uint64_t workerDeniesUnappliedForTest() const noexcept { return workerDeniesUnapplied_; }
     [[nodiscard]] int32_t appliedTopicFrontierForTest() const noexcept { return appliedTopicFrontier_; }
+    [[nodiscard]] bool permissionStagingForTest() const noexcept { return permStager_.staging(); }
+    [[nodiscard]] uint64_t permissionResetsForTest() const noexcept { return permissionResets_; }
     [[nodiscard]] uint64_t topicFrontierRejectedForTest() const noexcept { return topicFrontierRejected_; }
     [[nodiscard]] uint64_t securityBehindOpsSeenForTest() const noexcept { return securityBehindOpsSeen_; }
     [[nodiscard]] uint64_t securityBehindRefusalsForTest() const noexcept { return securityBehindRefusals_; }
@@ -3146,6 +3148,13 @@ private:
             return;
         }
         if ((op.isolation() & kPermFlagSecurityBehind) != 0) [[unlikely]] {   // issue #603: in every worker mode
+            if (op.topicId() == kPermLagReset) [[unlikely]] {   // #442: this worker skipped items; resync follows
+                if (ackSink_) ackSink_->resetPermissions();   // every table dropped, every session denied
+                permStager_.discard();                        // a half-staged table never survives
+                securityLag_ = SecurityLag::RefuseAll;        // retriable AuthUnavailable until the snapshot's level
+                ++permissionResets_;                          // (the applied topic frontier is kept: it only grows)
+                return;
+            }
             if (op.topicId() == kPermLagTopicFrontier) [[unlikely]] {   // #500: the applied topic frontier
                 const auto frontier = op.nextOffset();
                 if (frontier < 0 || frontier > static_cast<int64_t>(INT32_MAX)) {
@@ -11031,6 +11040,7 @@ private:
     /// #500: worker-owned copy of the gateway's applied topic frontier (kPermLagTopicFrontier); INT32_MAX = none.
     int32_t  appliedTopicFrontier_   = INT32_MAX;
     uint64_t workerDeniesUnapplied_  = 0;   ///< #500: denials answered NotLeader (id at or above the frontier)
+    uint64_t permissionResets_       = 0;   ///< #442: kPermLagReset ops executed
     uint64_t topicFrontierRejected_  = 0;   ///< #500: frontier ops ignored (out of range, or below the current value)
     /// #603 / #506: worker-owned copy of the control thread's lag level (kSecurityLag*).
     enum class SecurityLag : uint8_t { Current = 0, RefuseAll = 1, DeferDenials = 2 };

@@ -185,3 +185,75 @@ TEST(TopicFrontierShipperRegression, TheFrontierIsQueuedBehindThePatchesOfItsEve
     EXPECT_EQ(p->worker(0).sessionPermissionChunksSeenForTest(), 3u);
     EXPECT_EQ(p->worker(0).appliedTopicFrontierForTest(), 9);
 }
+
+// ── #442: the queue is bounded; a worker that falls a whole queue behind is LOST and resynced ──
+namespace {
+constexpr std::size_t kTestCap = 64;
+// 100 000 binds with worker 1's ring full and worker 0 draining: returns the iteration the loss happened (or -1).
+// Every iteration asserts the queue bound; once lost, shippedSeq() is frozen at its value at the loss.
+void bindStormWithWorkerOneFull(PermissionShipper& s, WorkerPool& p, uint64_t& frozen, int& lostAt) {
+    s.setMaxQueuedForTest(kTestCap);
+    fillLifecycleRing(p.worker(1));
+    frozen = 0;
+    lostAt = -1;
+    for (int i = 0; i < 100'000; ++i) {
+        (void)s.bind(p, 1000 + i, PermissionShipper::kDenyTable, static_cast<uint64_t>(i) + 1, /*owner=*/7);
+        if ((i & 31) == 31) drain(p.worker(0));
+        ASSERT_LE(s.pendingUpdates(), kTestCap + 1) << "iteration " << i;
+        if (lostAt < 0 && s.lostNow() != 0) { lostAt = i; frozen = s.shippedSeq(); }
+        if (lostAt >= 0) ASSERT_EQ(s.shippedSeq(), frozen) << "shippedSeq moved after the loss, iteration " << i;
+    }
+    drain(p.worker(0));
+}
+}  // namespace
+
+// Mutation m1 (no cap): pendingUpdates() reaches 100 000 -> red.  m2 (`low` includes lost workers): the lost worker's
+// stuck cursor keeps the queue untrimmed -> red.  m3 (shippedSeq not frozen) -> red.
+TEST(PermissionShipperRegression, TheQueueIsBoundedWhileAWorkersRingStaysFullRegression) {
+    auto p = pool(2);
+    PermissionShipper s;
+    uint64_t frozen = 0;
+    int lostAt = -1;
+    bindStormWithWorkerOneFull(s, *p, frozen, lostAt);
+    EXPECT_GE(lostAt, 0) << "worker 1 was declared lost";
+    EXPECT_EQ(s.lostNow(), 1u);
+    EXPECT_EQ(s.workersLost(), 1u);
+    EXPECT_EQ(frozen, 0u) << "worker 1 never accepted anything: nothing was ever shipped to every worker";
+    EXPECT_EQ(p->worker(0).sessionPermissionChunksSeenForTest(), 100'000u) << "worker 0 received every bind";
+    EXPECT_EQ(p->worker(1).sessionPermissionChunksSeenForTest(), 0u) << "worker 1's ring was never touched";
+}
+
+// A lost worker is reset once its ring takes the reset op; shippedSeq() moves again only when it passed the items.
+TEST(PermissionShipperRegression, ALostWorkerIsResetAndResyncedRegression) {
+    auto p = pool(2);
+    PermissionShipper s;
+    uint64_t frozen = 0;
+    int lostAt = -1;
+    bindStormWithWorkerOneFull(s, *p, frozen, lostAt);
+    ASSERT_EQ(s.lostNow(), 1u);
+    EXPECT_FALSE(s.tryReset(*p)) << "the ring is still full: the worker stays lost";
+    EXPECT_EQ(s.lostNow(), 1u);
+    drain(p->worker(1));
+    ASSERT_TRUE(s.tryReset(*p));
+    EXPECT_EQ(s.lostNow(), 0u);
+    EXPECT_EQ(s.resyncs(), 1u);
+    EXPECT_FALSE(s.tryReset(*p)) << "nothing is lost any more";
+    drain(p->worker(1));
+    EXPECT_EQ(p->worker(1).permissionResetsForTest(), 1u);
+    EXPECT_EQ(p->worker(1).sessionPermissionChunksSeenForTest(), 1u) << "the reset is the first (only) op it got";
+    EXPECT_EQ(p->worker(0).permissionResetsForTest(), 0u) << "a healthy worker is never reset";
+    EXPECT_EQ(s.shippedSeq(), s.queuedSeq()) << "the reset worker is at the end of the queue";
+
+    // Items queued after the reset reach worker 1 in order, and shippedSeq() waits for it again.
+    fillLifecycleRing(p->worker(1));
+    const uint64_t before = s.shippedSeq();
+    (void)s.bind(*p, 5, PermissionShipper::kDenyTable, 1, 7);
+    (void)s.bind(*p, 6, PermissionShipper::kDenyTable, 2, 7);
+    const uint64_t last = s.bind(*p, 7, PermissionShipper::kDenyTable, 3, 7);
+    EXPECT_EQ(s.shippedSeq(), before) << "worker 1 has not accepted them";
+    drain(p->worker(1));
+    (void)s.retry(*p);
+    drain(p->worker(1));
+    EXPECT_EQ(s.shippedSeq(), last);
+    EXPECT_EQ(p->worker(1).sessionPermissionChunksSeenForTest(), 4u) << "reset + three binds, in order";
+}
