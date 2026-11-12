@@ -1550,6 +1550,14 @@ public:
     /// plan reached every worker's install ring (or the view was dropped).
     void noteViewSinkAwaitingPlan(int32_t viewTopicId);
     void noteViewPlanDelivered(int32_t viewTopicId);
+    /// #988 - control thread: the catalog's nextTopicId on this broker (topics and view sinks share one dense id
+    /// counter), fed after every applied event once that event's own effects are processed.  An id at or above it is
+    /// "not applied here yet" (retriable for every session); an id below it is decided here.  Monotonic: a lower value
+    /// is ignored and counted.  The default (INT32_MAX) means "nothing is above": a rig without a feed keeps the
+    /// terminal answers.
+    void setAppliedTopicFrontier(int32_t nextTopicId);
+    [[nodiscard]] int32_t appliedTopicFrontierForTest() const noexcept { return appliedTopicFrontier_; }
+    [[nodiscard]] uint64_t topicFrontierRegressionsIgnored() const noexcept { return topicFrontierRegressionsIgnored_; }
     /// Task 22 fix round 1 (C1) — control thread (cold): a view's sink topic id →
     /// its source topic (plan.sourceTopicId[0]).  GetViewRow is answered only on
     /// the broker that leads (source, partition); the view partition IS the source
@@ -2891,6 +2899,13 @@ private:
     uint8_t  workersLag_     = 0;               ///< #603 / #506: the lag level last shipped to the workers
     uint64_t securityBehindRefusals_ = 0;       ///< #603: requests answered 48 for it
     uint64_t deniesDeferredViewBehind_ = 0;     ///< #506: denials answered 48 while the view held unapplied events
+    int32_t  appliedTopicFrontier_ = std::numeric_limits<int32_t>::max();   ///< #988: see setAppliedTopicFrontier
+    uint64_t topicFrontierRegressionsIgnored_ = 0;
+    /// #988: the id is at or above the catalog frontier this broker has applied - created on a broker that is ahead, or
+    /// never created.  The one test for "not applied here yet"; placement no longer decides it.
+    [[nodiscard]] bool aboveAppliedFrontier_(int32_t topicId) const noexcept {
+        return topicId >= appliedTopicFrontier_;
+    }
     /// #603 / #506: ship the lag level to the workers when it changed (1 = behind and refusing everything, 2 = the view
     /// holds unapplied events: denials deferred, 0 = current) - leaving level 1 once every event pending at the clear
     /// is enforced (#608).  Every other transition ships at once, FIFO behind every queued permission item.
@@ -3397,9 +3412,9 @@ private:
     [[nodiscard]] bool placementCommitted_(int32_t topicId, int32_t partition,
                                            const RoutedEntry* routed = nullptr) const noexcept;
     /// C1 generalized: the code for a topic id this broker has not applied —
-    /// NotLeader (retriable) when its placement is already committed (a producer
-    /// learned it from another broker, this one applies it next), UnknownTopic
-    /// otherwise and always for a Dropped id.
+    /// NotLeader (retriable) for an id at or above the applied catalog frontier
+    /// (#988: created on a broker that is ahead, or never created - the two answer
+    /// alike), UnknownTopic below it and always for a Dropped id.
     /// Fix round 1 (I5): the C1 gate on a view read — a ViewRowResponse status
     /// to answer, or kViewRowNoGate (forward to the worker).
     static constexpr uint16_t kViewRowNoGate = 0xFFFF;

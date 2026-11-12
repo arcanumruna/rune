@@ -302,7 +302,10 @@ struct GatewayRig {
         s.name = name; s.partitionCount = partitions;
         return registry->createTopicAt(topicId, s);
     }
-    void placeWithoutApply(int32_t topicId, int32_t partitions) { place(topicId, partitions); }
+    void placeWithoutApply(int32_t topicId, int32_t partitions) {
+        place(topicId, partitions);
+        gw.setAppliedTopicFrontier(topicId);   // #988: the catalog applied everything below this id; it is the one in flight
+    }
     void applyWithoutPlacement(int32_t topicId, int32_t partitions) {
         ASSERT_EQ(apply(topicId, partitions, "t" + std::to_string(topicId)), topicId);
     }

@@ -442,7 +442,7 @@ rejection counts of a topic's verdict source, `constraintId = viewObjectId << 16
 |---|---|---|---|
 | 0 | `OK` |  |  |
 | 1 | `ProtocolVersion` | Client version not supported (also: an authenticated broker refusing a client below 9, or a JoinGroup from a client below 3 or 5). | not retried |
-| 2 | `NotLeader` | This node does not lead the partition, or the catalog leader changed or is catching up. | retried after a metadata refresh |
+| 2 | `NotLeader` | This node does not lead the partition, or the catalog leader changed or is catching up, or the topic id is at or above the catalog position this node has applied (not applied here yet; any session, any id, created or not). | retried after a metadata refresh |
 | 3 | `Redirect` | Carries the leader's client endpoint; re-send there. | followed (DDL: at most 3 hops) |
 | 4 | `SessionExpired` | The session timed out. |  |
 | 5 | `UnknownSession` | The broker has no such session. |  |

@@ -709,11 +709,20 @@ TEST(AuthEnforcementRegression, DescribeOnClusterTurnsAMissingIdIntoUnknownTopic
     AuthRig r;
     const int64_t describe = r.newUser({cluster(SO::Describe)});
     const int64_t none = r.newUser({});
+    // A never-created id at or above the applied topic frontier is "not applied here yet" for every session (#988).
     constexpr int32_t kMissing = 99'999;
-    EXPECT_EQ(r.subscribe(describe, kMissing), kUnknownTopic);
-    EXPECT_EQ(r.produce(describe, kMissing), kUnknownTopic);
-    EXPECT_EQ(r.subscribeDenied(none, kMissing), kNotAuthorized);
-    EXPECT_EQ(r.produceDenied(none, kMissing), kNotAuthorized);
+    EXPECT_EQ(r.subscribe(describe, kMissing), 2 /*NotLeader*/);
+    EXPECT_EQ(r.produce(describe, kMissing), 2 /*NotLeader*/);
+    EXPECT_EQ(r.subscribeDenied(none, kMissing), 2 /*NotLeader*/);
+    EXPECT_EQ(r.produceDenied(none, kMissing), 2 /*NotLeader*/);
+    // An id decided here (dropped) keeps the terminal answers: UnknownTopic with DESCRIBE ON CLUSTER, 45 without.
+    const int32_t kGone = r.defineTopic(r.builder, "gone");
+    ASSERT_GE(kGone, 0);
+    ASSERT_EQ(r.dropTopicCode(r.builder, "gone"), kOk);
+    EXPECT_EQ(r.subscribe(describe, kGone), kUnknownTopic);
+    EXPECT_EQ(r.produce(describe, kGone), kUnknownTopic);
+    EXPECT_EQ(r.subscribeDenied(none, kGone), kNotAuthorized);
+    EXPECT_EQ(r.produceDenied(none, kGone), kNotAuthorized);
     EXPECT_EQ(r.subscribeDenied(describe, r.secret), kNotAuthorized) << "an existing topic it may not READ is still refused";
 }
 

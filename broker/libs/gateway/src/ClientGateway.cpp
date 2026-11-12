@@ -3731,14 +3731,24 @@ bool ClientGateway::topicAssignable(int32_t topicId) const noexcept
     return true;
 }
 
-pc::ErrorCode ClientGateway::unappliedTopicCode_(int32_t topicId, int32_t partition) const noexcept
+pc::ErrorCode ClientGateway::unappliedTopicCode_(int32_t topicId, [[maybe_unused]] int32_t partition) const noexcept
 {
     using St = rune::gateway::TopicRegistry::TopicState;
     const St st = topicRegistry_ != nullptr ? topicRegistry_->state(topicId) : St::Unknown;
     if (st == St::Dropped) return pc::ErrorCode::UnknownTopic;
     if (st == St::Pending) return pc::ErrorCode::NotLeader;   // applied, waits behind a drop (fix round 1, C1)
-    return placementCommitted_(topicId, partition < 0 ? 0 : partition) ? pc::ErrorCode::NotLeader
-                                                                       : pc::ErrorCode::UnknownTopic;
+    // #988: "not applied here yet" is a fact of the catalog frontier, not of placement: a just-placed foreign id and a
+    // never-created id above the frontier answer alike.
+    return aboveAppliedFrontier_(topicId) ? pc::ErrorCode::NotLeader : pc::ErrorCode::UnknownTopic;
+}
+
+void ClientGateway::setAppliedTopicFrontier(int32_t nextTopicId)
+{
+    if (nextTopicId < appliedTopicFrontier_ && appliedTopicFrontier_ != std::numeric_limits<int32_t>::max()) {
+        ++topicFrontierRegressionsIgnored_;
+        return;
+    }
+    appliedTopicFrontier_ = nextTopicId;
 }
 
 std::size_t ClientGateway::endTopicSubscriptions(int32_t topicId)

@@ -129,7 +129,9 @@ struct CatalogEffects {
     std::function<void(const rune::catalog::TopicObject&, uint16_t fromVersion)> schemaChanged;
     std::function<void(const rune::catalog::ViewObject&)>                viewInstalled;    // recovery-ness = the phase (F4)
     std::function<void(int32_t viewTopicId)>                             viewUninstalled;
-    std::function<void(int64_t offset, uint64_t digest)>                 applied;          // metric + tests
+    // After EVERY applied event (and once at boot): the offset, the digest and the applier's nextTopicId -- the topic
+    // frontier the gateway answers "not applied here yet" against (#988).  Posted after the event's own effects.
+    std::function<void(int64_t offset, uint64_t digest, int32_t nextTopicId)> applied;   // metric + frontier + tests
     std::function<void(const rune::catalog::ApplyError&)>               halted;
     /// The checkpoint could not be made durable (errno, catalog dir) — the broker's
     /// storage-failure halt path (kA2cStorageFailure).

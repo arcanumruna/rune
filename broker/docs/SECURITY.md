@@ -97,6 +97,12 @@ is checked against the grants on that object. Only when the id is not live (miss
 answer `NotAuthorized`, unless the session holds `DESCRIBE ON CLUSTER`; then it gets the request's normal
 `UnknownTopic` answer (D22). A view plan's source ids never get this relaxation: they need `READ`. The detail text is
 always `not authorized: <OP> on <TYPE> <requested name or id>` (D23).
+**Ids this broker has not applied yet.** Topic and view-sink ids come from one dense counter in the catalog, and each
+broker knows how far it has applied it (its frontier, the catalog's `nextTopicId`). An id at or above the frontier is
+"not applied here yet" for every session, whatever its namespace or grants and whether or not the id was placed: the
+request answers the retriable `NotLeader` (`NotReady` for GetViewRow), so a topic just created in another namespace
+cannot be told from an id nobody created. An id below the frontier is decided here and keeps the answers above. The
+frontier is not a secret: a tenant sees the counter in the ids of its own topics.
 GetTopicSchema on a name whose live object is of a kind the caller holds no DESCRIBE for answers exactly like a
 missing name; a caller with no DESCRIBE on the name under either kind gets NotAuthorized whether or not the object
 exists.

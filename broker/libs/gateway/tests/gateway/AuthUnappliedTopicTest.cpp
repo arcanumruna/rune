@@ -56,7 +56,8 @@ struct TempDir {
 };
 
 constexpr int32_t kPlaced  = 7;    // placed here, catalog event not applied here yet
-constexpr int32_t kMissing = 99;   // neither
+// neither: below the applied frontier (kPlaced), so decided here - a gap that was never created
+constexpr int32_t kMissing = 5;
 constexpr int16_t kNotLeader     = static_cast<int16_t>(pc::ErrorCode::NotLeader);
 constexpr int16_t kNotAuthorized = static_cast<int16_t>(pc::ErrorCode::NotAuthorized);
 
@@ -142,7 +143,8 @@ struct Rig {
     bool dispatch = false;   // #603: send through the gateway's whole client-frame dispatch (the request gate included)
 
     explicit Rig(std::vector<sec::GrantSpec> grants = defaultGrants(),
-                 std::vector<rune::metadata::RoutingImage::BuildEntry> img = defaultImage(), bool withPool = true)
+                 std::vector<rune::metadata::RoutingImage::BuildEntry> img = defaultImage(), bool withPool = true,
+                 bool feedFrontier = true)
           : pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16)
           , gw(ClientGateway::makeForTest([this](const uint8_t* b, std::size_t n) -> int64_t { onFrame(b, n); return 1; }, 1)) {
         rune::node::TopicSpec boot;
@@ -158,11 +160,16 @@ struct Rig {
         gw.setTxnService(&txn);
         gw.setAdminSink(&admin);
         gw.onCatalogObjectApplied(0, "w.boot", false);
+        // #988: the catalog applied every id below kPlaced; kPlaced is the one in flight
+        if (feedFrontier) gw.setAppliedTopicFrontier(kPlaced);
         sid = gw.injectTestSession();
         gw.authenticateWithGrantsForTest(sid, 42, std::move(grants));
     }
 
+    std::vector<std::vector<uint8_t>> frames;   // every frame the gateway emitted, raw (#988: byte comparisons)
+
     void onFrame(const uint8_t* b, std::size_t n) {
+        frames.emplace_back(b, b + n);
         const auto h = pc::MessageHeader::decode(b, n);
         if (!h) return;
         switch (static_cast<pc::TemplateId>(h->templateId)) {
@@ -206,6 +213,10 @@ struct Rig {
                     answers.emplace_back(r->correlationId, static_cast<int16_t>(r->errorCode));
                     lastDdlDetail = std::string(r->detail);
                 }
+                break;
+            case pc::TemplateId::StatsResponse:   // #988: GetStats refusals are status-only StatsResponses
+                if (auto r = pc::StatsResponse::decode(b, n))
+                    answers.emplace_back(r->correlationId, static_cast<int16_t>(r->status));
                 break;
             case pc::TemplateId::Pong:   // #603: a session-level answer (code 0)
                 answers.emplace_back(h->correlationId, 0);
@@ -251,6 +262,15 @@ struct Rig {
         buf.resize(m.encode(buf.data()));
         if (dispatch) (void)gw.applyClientFrameForTest(buf.data(), buf.size());
         else gw.applyGetViewRowForTest(buf.data(), buf.size());
+        return m.correlationId;
+    }
+    int64_t getStats(int32_t topicId, int32_t partition = 0) {
+        pc::GetStats m;
+        m.sessionId = sid; m.correlationId = ++corr; m.scope = pc::StatsScope::TopicPartition;
+        m.objectId = topicId; m.partition = partition;
+        std::vector<uint8_t> buf(m.encodedSize());
+        m.encode(buf.data());
+        gw.applyGetStatsForTest(buf.data(), buf.size());
         return m.correlationId;
     }
     int64_t getViewRowK(int32_t viewId) {
@@ -376,6 +396,114 @@ TEST(AuthUnappliedTopicRegression, AnIdNeitherAppliedNorPlacedKeepsTheD22DenialR
         ASSERT_TRUE(code.has_value()) << what;
         EXPECT_EQ(*code, kNotAuthorized) << what << ": a missing id answers like a hidden one (D22)";
     }
+}
+
+// #988: an id this broker has not applied answers the same whether the catalog placed it (a foreign namespace's new
+// topic, committed here before the apply) or never created it.  The session is another namespace's, with no grant.
+// Below the frontier the answer is decided here: a foreign applied id and a dropped id are both NotAuthorized, byte
+// for byte.  After the apply a foreign session is refused, the owner served.
+namespace {
+using Frame = std::vector<uint8_t>;
+// Send one request kind for `id` with the fixed correlation `corr`; the single frame the gateway answered with.
+template <class Send>
+Frame ask(Rig& r, Send send, int32_t id, int64_t corr) {
+    r.frames.clear();
+    r.answers.clear();
+    r.corr = corr - 1;
+    (void)send(id);
+    EXPECT_EQ(r.frames.size(), 1u) << "id " << id << ": exactly one answer";
+    return r.frames.empty() ? Frame{} : r.frames.front();
+}
+} // namespace
+
+TEST(AuthUnappliedTopicRegression, AJustPlacedForeignIdAnswersLikeANeverCreatedIdRegression) {
+    Rig r(std::vector<sec::GrantSpec>{});   // a namespace-A session with no grant on anything of namespace B
+    const int32_t F = kPlaced;              // namespace B's new topic: placement committed here, not applied here
+    const int32_t G = kPlaced + 1;          // never created, not placed
+    ASSERT_EQ(r.gw.appliedTopicFrontierForTest(), F);
+    ASSERT_EQ(r.gw.objectIndex().at(F), nullptr);
+
+    struct Req { const char* name; std::function<int64_t(int32_t)> send; };
+    const Req reqs[] = {
+        {"GetStats",  [&](int32_t id) { return r.getStats(id); }},
+        {"Subscribe", [&](int32_t id) { return r.subscribe(id); }},
+        {"Produce",   [&](int32_t id) { return r.produce(id); }},
+    };
+    for (const Req& q : reqs) {
+        const Frame fa = ask(r, q.send, F, 900);
+        const auto codeF = r.codeOf(900);
+        const Frame ga = ask(r, q.send, G, 900);
+        const auto codeG = r.codeOf(900);
+        ASSERT_FALSE(fa.empty()) << q.name;
+        EXPECT_EQ(fa, ga) << q.name << ": a just-placed foreign id and a never-created id answer byte for byte alike";
+        ASSERT_TRUE(codeF.has_value()) << q.name;
+        EXPECT_EQ(*codeF, kNotLeader) << q.name << ": at or above the frontier: retriable for every session";
+        EXPECT_EQ(codeF, codeG) << q.name;
+    }
+
+    // Below the frontier: a foreign applied id and a dropped id both answer the terminal NotAuthorized, alike.
+    constexpr int32_t kForeign = 3, kDropped = 4;
+    r.gw.onCatalogObjectApplied(2, kForeign, "b.applied", false);
+    rune::node::TopicSpec dropped;
+    dropped.name = "b.dropped"; dropped.partitionCount = 1;
+    ASSERT_EQ(r.registry->createTopicAt(kDropped, dropped), kDropped);
+    r.gw.onCatalogObjectApplied(2, kDropped, "b.dropped", false);
+    r.gw.onCatalogObjectDropped(kDropped);
+    ASSERT_TRUE(r.registry->dropTopic(kDropped));
+    for (const Req& q : reqs) {
+        const Frame fa = ask(r, q.send, kForeign, 901);
+        const auto codeA = r.codeOf(901);
+        const Frame da = ask(r, q.send, kDropped, 901);
+        const auto codeD = r.codeOf(901);
+        ASSERT_FALSE(fa.empty()) << q.name;
+        EXPECT_EQ(fa, da) << q.name << ": a foreign applied id and a dropped id answer alike";
+        ASSERT_TRUE(codeA.has_value()) << q.name;
+        EXPECT_EQ(*codeA, kNotAuthorized) << q.name;
+        EXPECT_EQ(codeA, codeD) << q.name;
+    }
+
+    // After the apply (registry + frontier F+1): the foreign session is refused, the owner is served.
+    rune::node::TopicSpec applied;
+    applied.name = "b.new"; applied.partitionCount = 1;
+    ASSERT_EQ(r.registry->createTopicAt(F, applied), F);
+    r.gw.onCatalogObjectApplied(2, F, "b.new", false);
+    r.gw.setAppliedTopicFrontier(F + 1);
+    EXPECT_EQ(r.codeOf(r.produce(F)), kNotAuthorized) << "applied: a foreign session is refused";
+    r.answers.clear();
+    const int64_t owner = r.gw.injectTestSession();
+    r.gw.authenticateWithGrantsForTest(owner, 43, {grant(sec::Operation::Write, sec::ResourceType::Topic, "b.")}, 2);
+    r.sid = owner;
+    const auto served = r.codeOf(r.produce(F));
+    EXPECT_NE(served, std::optional<int16_t>{kNotAuthorized}) << "the owner is not refused";
+    EXPECT_NE(served, std::optional<int16_t>{kNotLeader});
+}
+
+// #988: the frontier never moves back; a lower value is ignored and counted.
+TEST(AuthUnappliedTopicRegression, TheFrontierNeverMovesBackRegression) {
+    Rig r;
+    r.gw.setAppliedTopicFrontier(20);
+    EXPECT_EQ(r.gw.appliedTopicFrontierForTest(), 20);
+    r.gw.setAppliedTopicFrontier(12);
+    EXPECT_EQ(r.gw.appliedTopicFrontierForTest(), 20) << "a lower value is ignored";
+    EXPECT_EQ(r.gw.topicFrontierRegressionsIgnored(), 1u);
+    r.gw.setAppliedTopicFrontier(20);
+    r.gw.setAppliedTopicFrontier(21);
+    EXPECT_EQ(r.gw.appliedTopicFrontierForTest(), 21);
+    EXPECT_EQ(r.gw.topicFrontierRegressionsIgnored(), 1u);
+    // an id at or above the frontier answers retriable, one below it terminal
+    EXPECT_EQ(r.codeOf(r.produce(21)), kNotLeader);
+    EXPECT_EQ(r.codeOf(r.produce(kMissing)), kNotAuthorized);
+}
+
+// #988: a gateway without a frontier feed keeps the terminal answer for an unknown id (nothing is "above").
+TEST(AuthUnappliedTopicRegression, WithoutAFrontierFeedAnUnknownIdKeepsTheTerminalAnswerRegression) {
+    Rig r(defaultGrants(), defaultImage(), /*withPool=*/true, /*feedFrontier=*/false);
+    ASSERT_EQ(r.gw.appliedTopicFrontierForTest(), INT32_MAX);
+    EXPECT_EQ(r.codeOf(r.produce(kPlaced)), kNotAuthorized) << "placed but no feed: nothing is above the frontier";
+    EXPECT_EQ(r.codeOf(r.produce(kMissing)), kNotAuthorized);
+    r.gw.setAppliedTopicFrontier(kPlaced);
+    EXPECT_EQ(r.gw.appliedTopicFrontierForTest(), kPlaced) << "the first feed is accepted whatever the default";
+    EXPECT_EQ(r.codeOf(r.produce(kPlaced)), kNotLeader);
 }
 
 TEST(AuthUnappliedTopicRegression, OnceAppliedAnUngrantedPlacedTopicIsDeniedTerminallyRegression) {

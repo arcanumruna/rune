@@ -217,6 +217,7 @@ TEST(CheckedWritesStatsGatewayRegression, UnappliedTopicIsBareNotLeaderRegressio
     g.rig.gw.setSessionAuthForTest(g.rig.sid, rune::gateway::AuthAuthenticated{1, "nobody", rune::gateway::PermissionTable::compile({}, idx)});
     std::vector<rune::metadata::RoutingImage::BuildEntry> img{{rune::metadata::gpidOf(kSrc, 0), CwViewReadGatewayRig::kSelf, 1}};
     g.rig.gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build(img, rune::metadata::RoutingImage::Source::Committed));
+    g.rig.gw.setAppliedTopicFrontier(kSrc);   // #988: "not applied here yet" = at or above the applied frontier
 
     g.send(g.frame(1, pc::StatsScope::TopicPartition, kSrc, 0));
     EXPECT_FALSE(g.lastStats().has_value()) << "a retriable denial is never a StatsResponse status";

@@ -33,7 +33,8 @@ public:
     using ST = rune::protocol::SecurityResourceType;
     using SP = rune::protocol::SecurityPatternKind;
     using TID = rune::protocol::client::TemplateId;
-    static constexpr int32_t kMissingId = 98'765;
+    /// An id far above any id the rig's broker allocates: "not applied here yet" (NotLeader, #988), never "missing".
+    static constexpr int32_t kAboveFrontierId = 98'765;
     static constexpr std::chrono::milliseconds kInFlightWindow{60};   ///< records already on the wire behind the end frame
     static constexpr std::chrono::milliseconds kQuietWindow{300};   ///< how long "nothing after the end" is watched
 
@@ -127,6 +128,7 @@ public:
     void createObjects(Op op, bool supportingOnly = false) {
         auto topic = [&] { if (tid_ >= 0) return; tid_ = r_.defineTopic(r_.builder, t()); ASSERT_GE(tid_, 0); ASSERT_TRUE(r_.awaitListed(tid_)); };
         auto view  = [&] { if (vid_ >= 0) return; vid_ = r_.createView(r_.builder, v(), tid_); ASSERT_GE(vid_, 0); };
+        if (supportingOnly) { createDroppedIds(op); if (::testing::Test::HasFatalFailure()) return; }
         switch (op) {
             case Op::Produce: case Op::ProduceRouted: case Op::TxnProduce: case Op::Subscribe: case Op::Metadata:
             case Op::AlterSchema: case Op::SetCompatibility: case Op::AlterTopicConfig: case Op::DropTopic:
@@ -148,6 +150,42 @@ public:
             default: break;
         }
     }
+    /// The "missing" id of an id-addressed op (R3): the id of an object created and then dropped, the drop fully applied
+    /// here (an id at or above the gateway's applied frontier answers NotLeader, so a never-created id is not "missing",
+    /// #988).  A topic's id for the topic ops, a view's id for the view ops.  Bounded waits.
+    void createDroppedIds(Op op) {
+        const bool topicOp = op == Op::Produce || op == Op::ProduceRouted || op == Op::TxnProduce ||
+                             op == Op::Subscribe;
+        const bool viewOp = op == Op::ViewRead || op == Op::ViewOpen;
+        if (!topicOp && !viewOp) return;
+        const int32_t topic = r_.defineTopic(r_.builder, t());
+        ASSERT_GE(topic, 0);
+        ASSERT_TRUE(r_.awaitListed(topic));
+        if (topicOp) {
+            ASSERT_EQ(r_.dropTopicCode(r_.builder, t()), 0);
+            ASSERT_TRUE(awaitTopicGone(topic)) << "the topic drop was not applied";
+            missingTid_ = missingVid_ = topic;
+            return;
+        }
+        const int32_t view = r_.createView(r_.builder, v(), topic);
+        ASSERT_GE(view, 0);
+        ASSERT_EQ(r_.dropViewCode(r_.builder, v()), 0);
+        ASSERT_EQ(r_.dropTopicCode(r_.builder, t()), 0);
+        ASSERT_TRUE(awaitTopicGone(topic)) << "the topic drop was not applied";
+        // The view's drop is applied before the topic's (one ordered catalog): once the topic is gone, so is the view.
+        missingTid_ = missingVid_ = view;
+    }
+    /// Metadata for the builder until `id` is no longer listed, bounded.
+    bool awaitTopicGone(int32_t id) {
+        for (int i = 0; i < 400; ++i) {
+            const auto ids = r_.metadataTopics(r_.builder);
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        return false;
+    }
+    /// Make the next `missing` request name this id (the regression for an id above the applied frontier).
+    void useMissingId(int32_t id) { missingTid_ = missingVid_ = id; }
     /// A schema-less topic (the catalog's untyped topic: empty key field and descriptor).
     int32_t defineUntyped(const std::string& name) {
         pc::DefineTopic m;
@@ -323,9 +361,14 @@ public:
         // id) are missing by never having been created, and the name-addressed requests use the (uncreated) name.
         const bool idAddressed = op == Op::Produce || op == Op::ProduceRouted || op == Op::TxnProduce ||
                                  op == Op::Subscribe || op == Op::ViewRead || op == Op::ViewOpen;
-        const int32_t tid = missing && idAddressed ? kMissingId : tid_;
-        const int32_t vid = missing && idAddressed ? kMissingId : vid_;
+        const int32_t tid = missing && idAddressed ? missingTid_ : tid_;
+        const int32_t vid = missing && idAddressed ? missingVid_ : vid_;
         // Issue #278: a refused produce appends nothing (the log end of an existing topic, before and after).
+        struct OneShot {
+            bool& f;
+            OneShot(bool& x, bool v) : f(x) { f = v; }
+            ~OneShot() { f = false; }
+        } const oneShot(oneShotRequest_, missing && idAddressed);
         const bool writes = op == Op::Produce || op == Op::ProduceRouted || op == Op::TxnProduce;
         const int64_t leoBefore = writes && tid >= 0 ? r_.logEnd(tid) : -1;
         switch (op) {
@@ -546,7 +589,7 @@ private:
     }
     /// Blank the topic / view ids an answer may echo (a real id and the never-existing one must not tell apart).
     std::vector<uint8_t> blank(std::vector<uint8_t> f) const {
-        for (const int32_t id : {tid_, vid_, kMissingId}) {
+        for (const int32_t id : {tid_, vid_, missingTid_, missingVid_, kAboveFrontierId}) {
             if (id < 0 || f.size() < 4) continue;
             uint8_t le[4];
             std::memcpy(le, &id, 4);
@@ -615,7 +658,8 @@ private:
     int produceVia(const std::string& channel, int64_t sid, int32_t topicId, const std::vector<uint8_t>& batch, Answer& a,
                    const TxnState* txn = nullptr) {
         int code = kNoAnswer;
-        for (int attempt = 0; attempt < 200; ++attempt) {
+        // A request naming a missing id is answered once, finally: a retry only waits out a placement race.
+        for (int attempt = 0; attempt < (oneShotRequest_ ? 1 : 200); ++attempt) {
             a.corr = r_.c().nextCorrelationId();
             note(a.corr);
             const bool sent = txn ? r_.c().produceIdempotent(channel, r_.stream(), sid, a.corr, topicId, 0, 1, txn->pid, txn->epoch, txn->seq, batch)
@@ -730,6 +774,8 @@ private:
     std::string prefix_, user_, role_;
     int64_t sid_ = 0, twinSid_ = 0;
     int32_t tid_ = -1, vid_ = -1, uid_ = -1;
+    bool oneShotRequest_ = false;   ///< produceVia: no retry of NotLeader / UnknownTopic (a missing id)
+    int32_t missingTid_ = kAboveFrontierId, missingVid_ = kAboveFrontierId;
     bool userCreated_ = false, twinCreated_ = false;
     int triggers_ = 0;
     uint64_t endSeq_ = 0;   ///< arrival sequence of the last end frame errorOn() matched

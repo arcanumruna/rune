@@ -53,6 +53,9 @@ inline int gRigSeq = 0;   // single-threaded test binaries
 struct Recorder {
     std::vector<int64_t>                    appliedOffsets;
     std::vector<uint64_t>                   appliedDigests;
+    std::vector<int32_t>                    appliedFrontiers;   // the applier's nextTopicId after each `applied`
+    std::vector<int32_t>                    appliedMaxIdSeen;   // highest topic/sink id an effect named, per `applied`
+    int32_t                                 maxIdSeen = -1;
     std::vector<rune::catalog::ApplyError>  halts;
     std::vector<std::string>                sequence;          // "<effect>:<topicId>"
     std::vector<int32_t>                    bootViewInstalls;  // viewTopicIds installed through the BOOT sink
@@ -71,7 +74,8 @@ struct Recorder {
     std::vector<rune::catalog::NamespaceRecord>     nsUpserts;
 
     void clear() {
-        appliedOffsets.clear(); appliedDigests.clear(); halts.clear(); sequence.clear();
+        appliedOffsets.clear(); appliedDigests.clear(); appliedFrontiers.clear(); appliedMaxIdSeen.clear();
+        maxIdSeen = -1; halts.clear(); sequence.clear();
         bootViewInstalls.clear(); liveViewInstalls.clear(); storageFailures.clear();
         sinkSpecs.clear(); topicLeases.clear(); droppedNames.clear(); configChanges.clear(); writeSpecTopics.clear();
         onTopicApplied = nullptr;
@@ -86,11 +90,13 @@ struct Recorder {
             if (onTopicApplied) onTopicApplied();
             if (onTopicAppliedId) onTopicAppliedId(t.topicId);
             objects.onTopic(t.nsId, t.topicId, t.name);
+            maxIdSeen = std::max(maxIdSeen, t.topicId);
             topicLeases.push_back(t.lease);
             sequence.push_back("topicApplied:" + std::to_string(t.topicId));
         };
         e.sinkApplied = [this](const SinkSpec& s) {
             objects.onView(s.nsId, s.topicId, s.name);
+            maxIdSeen = std::max(maxIdSeen, s.topicId);
             sinkSpecs.push_back(s);
             sequence.push_back("sinkApplied:" + std::to_string(s.topicId));
         };
@@ -116,9 +122,11 @@ struct Recorder {
             sequence.push_back("viewInstalled:" + std::to_string(v.def.viewTopicId));
         };
         e.viewUninstalled = [this](int32_t id) { sequence.push_back("viewUninstalled:" + std::to_string(id)); };
-        e.applied = [this](int64_t off, uint64_t digest) {
+        e.applied = [this](int64_t off, uint64_t digest, int32_t nextTopicId) {
             appliedOffsets.push_back(off);
             appliedDigests.push_back(digest);
+            appliedFrontiers.push_back(nextTopicId);
+            appliedMaxIdSeen.push_back(maxIdSeen);
         };
         e.halted = [this](const rune::catalog::ApplyError& err) { halts.push_back(err); };
         e.storageFailed = [this](int err, const std::string& dir) { storageFailures.emplace_back(err, dir); };

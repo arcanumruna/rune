@@ -183,6 +183,28 @@ TEST_P(NamespaceMatrixRegression, SequentialCell) {
     }
 }
 
+// #988: an id at or above the applied topic frontier may be a topic this broker has not applied yet, so it answers the
+// retriable NotLeader (a view read: status 2) for every caller alike - the cluster admin, a user of the object's own
+// namespace and a user of a foreign namespace - the two users with the same bytes.
+TEST(NamespaceMatrixRegression, AnIdAboveTheFrontierIsNotLeaderForOwnForeignAndAdminRegression) {
+    NamespaceRig rig;
+    const int notLeader = static_cast<int>(rune::protocol::client::ErrorCode::NotLeader);
+    for (const Op op : {Op::Produce, Op::Fetch, Op::GetViewRow}) {
+        const NamespaceRig::Answer admin = rig.runAboveFrontier(op, Caller::ClusterAdmin);
+        const NamespaceRig::Answer own = rig.runAboveFrontier(op, Caller::UserGranted);
+        const NamespaceRig::Answer foreign = rig.runAboveFrontier(op, Caller::UserForeign);
+        const int want = op == Op::GetViewRow ? 2 : notLeader;   // a view read answers status 2 (not ready here)
+        EXPECT_EQ(admin.code, want) << "op " << static_cast<int>(op) << " as the cluster admin";
+        EXPECT_EQ(own.code, want) << "op " << static_cast<int>(op) << " as an own-namespace user";
+        EXPECT_EQ(foreign.code, want) << "op " << static_cast<int>(op) << " as a foreign-namespace user";
+        EXPECT_FALSE(admin.body.empty());
+        // Own and foreign callers get byte-equal answers.  The admin's frame is not compared: its Produce / Subscribe
+        // answers differ from a user's in their trailing fields (reported, not pinned here).
+        EXPECT_EQ(own.normalized(foreign), foreign.normalized(own))
+            << "op " << static_cast<int>(op) << ": own vs foreign";
+    }
+}
+
 INSTANTIATE_TEST_SUITE_P(All, NamespaceMatrixRegression, ::testing::ValuesIn(allCells()),
                          [](const auto& info) { return cellName(info.param); });
 

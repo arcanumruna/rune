@@ -814,6 +814,17 @@ TEST(NamespaceDeletingProduceRegression, RootReadsOfDeletingNamespaceAreUnknownT
     ASSERT_FALSE(row->isError) << "baseline: GetViewRow code " << row->errorCode;
     ASSERT_LE(row->status, 2u) << "baseline: GetViewRow status";
 
+    // The baseline id: a topic created and dropped, the drop applied.  A never-allocated id is at or above the applied
+    // frontier and is answered NotLeader (#988); the id of a dropped object is a topic that never exists here.
+    const int32_t gone = a.defineTopic(sid, "zgone");
+    ASSERT_GE(gone, 0);
+    ASSERT_TRUE(a.awaitListed(gone));
+    ASSERT_EQ(a.dropTopicCode(sid, "zgone"), 0);
+    ASSERT_TRUE(c.pollFor(std::chrono::seconds(10), [&] {
+        const auto listed = a.metadataTopics(sid);
+        return std::find(listed.begin(), listed.end(), gone) == listed.end();
+    })) << "the scratch topic's drop was not applied";
+
     const uint32_t nsId = rig.observe("dr").nsId;
     ASSERT_NE(nsId, 0u);
     ASSERT_EQ(rig.ns(sid, pc::NamespaceDdlKind::Delete, "dr").code, 0);
@@ -827,11 +838,10 @@ TEST(NamespaceDeletingProduceRegression, RootReadsOfDeletingNamespaceAreUnknownT
     ASSERT_FALSE(rig.erased(nsId)) << "the reaper is held: the namespace is still DELETING";
 
     // (2) a new root Subscribe by the topic's id answers like a topic that never existed.
-    constexpr int32_t kNeverExisted = 987654;
-    const int64_t nCorr = c.sendSubscribe(a.ch(), a.stream(), sid, kNeverExisted, 0);
+    const int64_t nCorr = c.sendSubscribe(a.ch(), a.stream(), sid, gone, 0);
     const auto nCode = c.awaitSubscribeCode(nCorr, AuthRig::dl());
     ASSERT_TRUE(nCode.has_value());
-    ASSERT_EQ(*nCode, kUnknownTopic) << "baseline: a never-existing id";
+    ASSERT_EQ(*nCode, kUnknownTopic) << "baseline: the id of a dropped topic";
     for (const int32_t id : ids) {
         const int64_t corr = c.sendSubscribe(a.ch(), a.stream(), sid, id, 0);
         const auto code = c.awaitSubscribeCode(corr, AuthRig::dl());

@@ -1379,9 +1379,9 @@ private:
             postCatalog_(kA2cViewUninstall, kViewUninstallWireLen,
                          [&](uint8_t* p) { writeViewUninstall(p, viewTopicId); });
         };
-        fx.applied = [this](int64_t offset, uint64_t digest) {
+        fx.applied = [this](int64_t offset, uint64_t digest, int32_t nextTopicId) {
             postCatalog_(kA2cCatalogApplied, kCatalogAppliedWireLen,
-                         [&](uint8_t* p) { writeCatalogApplied(p, offset, digest); });
+                         [&](uint8_t* p) { writeCatalogApplied(p, offset, digest, nextTopicId); });
         };
         fx.halted = [this](const rune::catalog::ApplyError& err) {
             std::string detail = std::string{rune::catalog::applyErrorName(err.code)} + ": " + err.detail;

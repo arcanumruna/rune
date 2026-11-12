@@ -5293,10 +5293,16 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             if (tid == kA2cCatalogApplied) {
                 int64_t offset = -1;
                 uint64_t digest = 0;
-                if (decodeCatalogApplied(p, n, offset, digest)) {
-                    catalogAppliedValue_ = offset;
-                    publishCatalogMetrics_();
-                    fanoutCatalogMark_(offset);
+                int32_t nextTopicId = 0;
+                if (decodeCatalogApplied(p, n, offset, digest, nextTopicId)) {
+                    // The frame follows the event's own effect frames on this FIFO, so every id below `nextTopicId`
+                    // is already known to the gateway (#988).
+                    if (gateway_) gateway_->setAppliedTopicFrontier(nextTopicId);
+                    if (offset >= 0) {   // -1: an empty catalog booted -- the frontier only
+                        catalogAppliedValue_ = offset;
+                        publishCatalogMetrics_();
+                        fanoutCatalogMark_(offset);
+                    }
                 } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]] {
                     spdlog::error("BrokerNode[{}]: malformed kA2cCatalogApplied (len={}) skipped", config_.nodeId, n);
                 }

@@ -243,7 +243,10 @@ void CatalogApplier::postBootStash(const CatalogEffects& sink) const {
             if (sink.sinkApplied) sink.sinkApplied(sinkSpecOf(*v, state_));
             if (sink.viewInstalled) sink.viewInstalled(*v);
         }
-        if (sink.applied) sink.applied(lastApplied_.offset, state_.digest());
+        if (sink.applied) sink.applied(lastApplied_.offset, state_.digest(), state_.nextTopicId());
+    } else if (sink.applied) {
+        // An empty catalog still has a frontier (0): every topic id is "not applied here yet" (#988).
+        sink.applied(-1, state_.digest(), state_.nextTopicId());
     }
     if (const Halted* h = std::get_if<Halted>(&st_); h != nullptr && sink.halted) sink.halted(h->error);
 }
@@ -285,7 +288,7 @@ void CatalogApplier::emitFinalState_() {
         if (sink->sinkApplied) sink->sinkApplied(sinkSpecOf(*v, state_));
         if (sink->viewInstalled) sink->viewInstalled(*v);
     }
-    if (sink->applied) sink->applied(lastApplied_.offset, state_.digest());
+    if (sink->applied) sink->applied(lastApplied_.offset, state_.digest(), state_.nextTopicId());
 }
 
 bool CatalogApplier::goLive(LiveEffects live) {
@@ -503,7 +506,7 @@ bool CatalogApplier::applyRecord_(int64_t offset, std::span<const uint8_t> bytes
     if (live && sink != nullptr) {
         effects_(*sink, *ev, *a);
         if (a->nsErased && sink->namespaceErased) sink->namespaceErased(a->nsId);   // last: after the drops' own effects
-        if (sink->applied) sink->applied(offset, state_.digest());
+        if (sink->applied) sink->applied(offset, state_.digest(), state_.nextTopicId());
     }
     return true;
 }

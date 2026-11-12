@@ -126,6 +126,40 @@ static void runCell(AuthMatrixRig& rig, const Cell& c) {
 
 TEST_P(AuthMatrixRegression, Cell) { runCell(*rig_, GetParam()); }
 
+// #988: an id at or above the applied frontier is "not applied here yet" (NotLeader) for every grant, never "missing";
+// the matrix's ObjectMissing cells use the id of a dropped object (below the frontier) for the D22 answer.
+TEST(AuthMatrixFrontierRegression, AnIdAboveTheFrontierAnswersNotLeaderForEveryGrantRegression) {
+    AuthMatrixRig rig;
+    for (const Op op : {Op::Produce, Op::ProduceRouted, Op::TxnProduce, Op::Subscribe, Op::ViewRead, Op::ViewOpen}) {
+        for (const Grant gr : {Grant::None, Grant::Exact, Grant::Prefix, Grant::ViaRole}) {
+            const std::string label = std::string(name(op)) + "/" + std::string(name(gr));
+            auto cell = rig.newCell();
+            struct Closer { decltype(cell)& c; ~Closer() { c.close(); } } closer{cell};
+            cell.createObjects(op);   // the cell's own live objects exist; the request names an id above the frontier
+            ASSERT_FALSE(::testing::Test::HasFatalFailure()) << label;
+            cell.grantFor(op, gr);
+            ASSERT_FALSE(::testing::Test::HasFatalFailure()) << label;
+            cell.login();
+            cell.useMissingId(AuthMatrixRig::kAboveFrontierId);
+            for (int round = 0; round < 2; ++round) {   // the second request proves the session stayed
+                const auto a = cell.issue(op, /*missing=*/true);
+                if (isViewRead(op)) {
+                    // A view read answers in a ViewRowResponse: status 2 is the retriable NotReady.
+                    EXPECT_EQ(a.viewStatus, 2) << label << " round " << round << ": NotReady (2) expected";
+                } else if (op == Op::TxnProduce && gr == Grant::None) {
+                    // No WRITE on the transactional id: InitProducerId is denied before any topic is looked at.
+                    EXPECT_EQ(a.code, 45) << label << " round " << round;
+                    EXPECT_EQ(a.stage, 0) << label << " round " << round;
+                } else {
+                    EXPECT_EQ(a.code, 2) << label << " round " << round << ": NotLeader expected";
+                }
+                EXPECT_EQ(a.templ, a.wantTempl) << label << ": the answer is not in the op's own response type";
+                EXPECT_EQ(a.appended, 0) << label << ": a produce above the frontier appended";
+            }
+        }
+    }
+}
+
 INSTANTIATE_TEST_SUITE_P(All, AuthMatrixRegression, ::testing::ValuesIn(allCells()), [](const auto& info) {
     return std::string(name(info.param.op)) + "_" + std::string(name(info.param.grant)) + "_" + std::string(name(info.param.timing));
 });

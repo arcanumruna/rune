@@ -2,6 +2,7 @@
 // recorder (ARCANUM_METRICS_DIR or FetchContent at the pinned commit).  This test pins the
 // layout version Rune is built against: a library bump that changes the file layout must
 // fail here at compile time, and a created file must read back that version at run time.
+#include <limits>
 #include <metrics/MetricsFile.h>
 #include <metrics/MetricsLayout.h>
 #include <rune/node/RuneMetrics.h>
@@ -341,7 +342,7 @@ TEST(BrokerMetricsRegression, EveryMetricMovedRegression) {
     ASSERT_NE(agent, nullptr);
     node.onAdminThreadForTest([agent] {
         const auto live = agent->catalogLiveEffects();
-        live.sink.applied(41, 0xABCD);
+        live.sink.applied(41, 0xABCD, std::numeric_limits<int32_t>::max());
         return 0;
     });
     EXPECT_TRUE(awaitMetric(node, RuneMetric::CatalogAppliedOffset, 41)) << "the applier's report reaches the file";
@@ -400,7 +401,7 @@ TEST(BrokerMetricsRegression, PublishedFromFirstCycleRegression) {
     rune::node::AdminWorkerAgent* agent = node.adminWorkerAgentForTest();
     ASSERT_NE(agent, nullptr);
     node.onAdminThreadForTest([agent] {
-        agent->catalogLiveEffects().sink.applied(7, 0x77);
+        agent->catalogLiveEffects().sink.applied(7, 0x77, std::numeric_limits<int32_t>::max());
         return 0;
     });
     ASSERT_TRUE(awaitMetric(node, RuneMetric::CatalogAppliedOffset, 7)) << "the one report reached the file";
