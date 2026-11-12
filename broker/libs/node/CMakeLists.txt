@@ -2193,7 +2193,8 @@ if(BUILD_TESTING)
         # Authentication Task 11: the SCRAM login in the session handshake against ONE real authenticating broker
         # (raw frames: AuthWireClient + the rune-crypto SCRAM client).
         add_executable(rune_auth_login_tests tests/node/AuthLoginTest.cpp
-                       tests/node/SecretsNeverReachTheLogsRegressionTest.cpp)
+                       tests/node/SecretsNeverReachTheLogsRegressionTest.cpp
+                       tests/node/NamesWithControlBytesNeverReachTheLogsRegressionTest.cpp)
         target_include_directories(rune_auth_login_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_auth_login_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
                               GTest::gtest_main)
