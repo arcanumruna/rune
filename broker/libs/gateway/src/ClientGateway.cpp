@@ -1701,7 +1701,8 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     // (all workers — its buffered subscribes die with the session).
     for (auto pit = pendingRecordEgress_.begin(); pit != pendingRecordEgress_.end(); ) {
         if (pit->first.first != sid) { ++pit; continue; }
-        abandonRegistration_(pit->second.regId);   // a registration still in flight is released, not leaked
+        if (!pit->second.resolved)   // #745: a found publication is released by the erase below (found only once)
+            abandonRegistration_(pit->second.regId);   // a registration still in flight is released, not leaked
         pit = pendingRecordEgress_.erase(pit);
     }
 
@@ -5117,37 +5118,55 @@ void ClientGateway::pollPendingRecordEgress_(int64_t nowNs)
         const int32_t workerId  = it->first.second;
         PendingRecordEgress& pend = it->second;
 
-        std::shared_ptr<aeron::ExclusivePublication> pub;
+        // A registration is found ONCE (Aeron: a second find with the same id throws): the found publication is kept
+        // in the entry and only its connection is polled from then on.
         try {
-            if (pend.regId >= 0) pub = aeron_->findExclusivePublication(pend.regId);
+            if (!pend.resolved && pend.regId >= 0) pend.resolved = aeron_->findExclusivePublication(pend.regId);
         } catch (...) {
-            pub = nullptr;  // ERRORED — treat as failed resolve below
+            pend.resolved = nullptr;  // ERRORED — treat as failed resolve below
             pend.regId = -1;
         }
 
         const bool timedOut =
             (nowNs - pend.requestedAtNs) > connectResolveTimeoutNs_;
 
-        if (pub) {
-            // Resolved: cache on the Session under its worker id and drain waiters.
+        // #745 (legacy mode): a publication to an unreachable declared address (a client behind NAT) resolves at once
+        // but never connects - Records offered into it reach nobody.  It is usable only once the client's
+        // subscription answered it; until then the Subscribe stays parked (the clock runs from the request).
+        if (pend.resolved && pend.resolved->isConnected()) {
+            // Connected: cache on the Session under its worker id and drain waiters.
             // Record-egress lifetime (2026-10-05): a worker gets ONLY the pointer
             // of the pub the Session owns — never one this scope destroys (the
             // old session-gone branch handed the local pub's raw pointer out and
             // then freed it), and a cached pub is never REPLACED (a worker may
             // hold it; it lives until its retire-on-ack release at close).
-            onRecordEgressResolved_(sessionId, workerId, pend, std::move(pub));
+            onRecordEgressResolved_(sessionId, workerId, pend, std::move(pend.resolved));
             it = pendingRecordEgress_.erase(it);
             continue;
         }
-        if (timedOut || pend.regId < 0) {
-            spdlog::warn("ClientGateway: record-egress pub for session {} worker {} did not "
-                         "resolve ({} waiters) — {}",
-                         sessionId, workerId, pend.waiters.size(),
-                         authMode_ == rune::gateway::GatewayAuthMode::Required
-                             ? "retired NotLeader (no shared-egress fallback under authentication)"
-                             : "falling back to MDC");
+        if (timedOut || (pend.regId < 0 && !pend.resolved)) {
+            if (pend.resolved) {
+                ++recordEgressNeverConnected_;
+                spdlog::warn("ClientGateway: record-egress pub for session {} worker {} resolved but never connected "
+                             "(the declared egress channel is unreachable, e.g. a client behind NAT; legacy mode) "
+                             "({} waiters) — {}",
+                             sessionId, workerId, pend.waiters.size(),
+                             authMode_ == rune::gateway::GatewayAuthMode::Required
+                                 ? "retired NotLeader (no shared-egress fallback under authentication)"
+                                 : "falling back to MDC");
+            } else {
+                spdlog::warn("ClientGateway: record-egress pub for session {} worker {} did not "
+                             "resolve ({} waiters) — {}",
+                             sessionId, workerId, pend.waiters.size(),
+                             authMode_ == rune::gateway::GatewayAuthMode::Required
+                                 ? "retired NotLeader (no shared-egress fallback under authentication)"
+                                 : "falling back to MDC");
+            }
             for (const auto& w : pend.waiters) releaseAwaiting_(w, nullptr);
-            abandonRegistration_(pend.regId);   // timed out while still in flight: release it (regId < 0 = nothing)
+            // A found publication is released by dropping it (never handed to a worker, never cached); one still in
+            // flight is abandoned (regId < 0 = nothing registered).
+            if (pend.resolved) pend.resolved.reset();
+            else abandonRegistration_(pend.regId);
             it = pendingRecordEgress_.erase(it);
             continue;
         }

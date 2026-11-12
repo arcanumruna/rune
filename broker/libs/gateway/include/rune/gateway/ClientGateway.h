@@ -2123,6 +2123,7 @@ private:
     /// F1: the held SubscribeResponse{OK} of `subId` (its egress resolved) - and the lineage note it owes.
     void sendOwedSubscribeOk_(int64_t subId);
     uint64_t subscribesWithoutRecordEgress_ = 0;   ///< issue #118: subscriptions retired for want of their own egress
+    uint64_t recordEgressNeverConnected_ = 0;      ///< #745: record-egress pubs that resolved but never connected
 
     // Hybrid egress: a Subscribe deferred until its session's per-consumer UNICAST
     // Records publication resolves (NON-BLOCKING — never sleeps on the control
@@ -2143,6 +2144,10 @@ private:
     struct PendingRecordEgress {
         int64_t regId         = -1;  // addExclusivePublication registration (in flight)
         int64_t requestedAtNs = 0;   // for the resolve timeout
+        /// #745: the publication once the registration resolved, held here (never on the Session, never handed to a
+        /// worker) until the client's subscription answers it (isConnected); a declared channel nothing answers (a
+        /// client behind NAT) takes the failed-resolve path at the resolve timeout.
+        std::shared_ptr<aeron::ExclusivePublication> resolved;
         std::vector<BufferedSubscribe> waiters;
     };
     // (sessionId, ownerWorkerId) → in-flight record-egress pub resolve + its
@@ -3896,6 +3901,28 @@ public:
     }
     /// Issue #118: subscriptions retired because they had no record egress of their own under authentication.
     [[nodiscard]] uint64_t subscribesWithoutRecordEgressForTest() const noexcept { return subscribesWithoutRecordEgress_; }
+    [[nodiscard]] uint64_t recordEgressNeverConnected() const noexcept { return recordEgressNeverConnected_; }
+    /// Test-only (#745): the pending record-egress entry of (sid, worker) holds a resolved publication.
+    [[nodiscard]] bool pendingRecordEgressResolvedForTest(int64_t sid, int32_t worker) const {
+        const auto it = pendingRecordEgress_.find({sid, worker});
+        return it != pendingRecordEgress_.end() && it->second.resolved != nullptr;
+    }
+    /// Test-only (#745): the session caches a record-egress publication for `worker`.
+    [[nodiscard]] bool recordEgressCachedForTest(int64_t sid, int32_t worker) {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr) return false;
+        const auto it = s->recordEgressByWorker.find(worker);
+        return it != s->recordEgressByWorker.end() && it->second != nullptr;
+    }
+    /// Test-only (#745): the record of a plain subscription whose Subscribe the test then forwards (the Subscribe
+    /// handler creates it in production); `okOwed` as under authentication.
+    void addSubscriptionRecordForTest(int64_t subId, int64_t sessionId, int32_t topicId, int32_t partition,
+                                      int64_t subscribeCorrId, bool okOwed) {
+        Subscription sub;
+        sub.subscriptionId = subId; sub.sessionId = sessionId; sub.topicId = topicId; sub.partition = partition;
+        sub.subscribeCorrId = subscribeCorrId; sub.okOwed = okOwed;
+        subscriptions_.emplace(subId, std::move(sub));
+    }
 private:
     int64_t                                 lastFlushNs_ = 0;
 

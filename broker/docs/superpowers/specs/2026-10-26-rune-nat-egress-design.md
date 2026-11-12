@@ -66,6 +66,14 @@ Decisions:
     channel. This fixes #227 for both paths.
 - **D5.** **The per-worker dynamic-MDC record broadcast** stays for authentication-off (dev) only, exactly as #118
   left it. Under authentication Records always ride the session's own response publication.
+- **D5a.** **Legacy (non-shard) mode** (`RUNE_WORKER_MODE=legacy`, single node under authentication) is not NAT-safe:
+  Aeron allows one response publication per request image, and a per-worker flow needs a per-worker client request
+  publication, which is what shard mode is. Records go to the channel the client declared. A record-egress
+  publication counts as usable only once it is connected (the client's subscription answered it): the Subscribe
+  waits for that, and when the declared channel is unreachable (a client behind NAT) the publication never connects.
+  At the resolve timeout, counted from the request, the Subscribe takes the failed-resolve path: under
+  authentication it is refused explicitly (`RecordEgressUnavailable`, never silent); without authentication it is
+  served over the shared dynamic-MDC egress. NAT with authentication needs shard mode (the default).
 - **D6.** **Shard-mode `SessionAnnouncer`** ships the worker the client's ingress image key (the client's
   `sessionId` on that worker's ingress) instead of a channel string. The worker creates the response publication
   itself on its own thread, so it stays single-writer, and resolves it with the same bounded resolve as

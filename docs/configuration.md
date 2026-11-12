@@ -156,7 +156,7 @@ authentication enabled, and with any of these variables set, instead of starting
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RUNE_WORKER_MODE` | `shard` | `shard` or `legacy`. Shard mode (self-contained workers, each with its own ingress, egress and replication) is the default. `legacy` is refused when authentication is on and `RUNE_PEERS` lists more than one broker. |
+| `RUNE_WORKER_MODE` | `shard` | `shard` or `legacy`. Shard mode (self-contained workers, each with its own ingress, egress and replication) is the default. `legacy` is refused when authentication is on and `RUNE_PEERS` lists more than one broker. In `legacy` mode Records are delivered to the egress channel the client declares: a client that cannot be reached there (for example behind NAT) is refused explicitly under authentication (`RecordEgressUnavailable`) and served over the shared dynamic-MDC egress without it. NAT with authentication needs shard mode. |
 | `RUNE_RUNTIME_PLACEMENT` | `fused` | `fused` or `thread`: whether the runtime agent shares the worker thread or has its own. |
 | `RUNE_WORKERS` | `1` | In-process workers per node (at least 1; a bad value reads as 1). With authentication on, at most 252. |
 | `RUNE_WORKER_CORE_BASE` | derived | First CPU of the worker pinning (`-1` = no pinning, `>= 0` = worker `i` on core `base + i`). Unset: Linux shard mode pins to cores `1 + i * W` when the box has them. Unparseable reads as `-1`. |
