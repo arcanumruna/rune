@@ -66,6 +66,7 @@
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/replication/PartitionReplica.h>
 #include <flight_recorder/FlightRecorder.h>
+#include <rune/node/GrantHoldMarks.h>
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/detail/RingDoorbell.h>
 #include <rune/node/OwnerThreadTestTask.h>
@@ -941,6 +942,7 @@ public:
         return 0;
     }
     [[nodiscard]] uint64_t intakeGrantHoldsForTest() const noexcept { return intakeGrantHolds_; }
+    [[nodiscard]] const GrantHoldMarks& grantHoldMarksForTest() const noexcept { return grantHolds_; }
     [[nodiscard]] const SessionAckSink* ackSinkForTest() const noexcept { return ackSink_.get(); }
     /// NAT-safe egress (Task 6): the session's response publication is Ready (worker thread / quiescent only).
     [[nodiscard]] bool responsePubReadyForTest(int64_t sessionId) const noexcept { return ackSink_ && ackSink_->readyPub(sessionId) != nullptr; }
@@ -6693,7 +6695,8 @@ private:
     uint64_t         sessionPermissionChunksSeen_ = 0;
     uint64_t         workerNotAuthorized_ = 0;   ///< shard produces refused NotAuthorized (counted)
     uint64_t         workerSuspendedRefusals_ = 0;   ///< shard produces refused NamespaceSuspended (ReadOnly; counted)
-    uint64_t         intakeGrantHolds_    = 0;   ///< denied frames held one pass for a lifecycle op in flight
+    uint64_t         intakeGrantHolds_    = 0;   ///< denied frames held until the lifecycle ops that preceded them apply
+    GrantHoldMarks   grantHolds_;                ///< first-sight lifecycle-ring position of each held denied frame
 
     // Task 19: this worker's per-session Records-egress crypto state — see
     // WorkerSessionCrypto's doc comment. Entries exist ONLY for encrypted
@@ -10991,9 +10994,11 @@ private:
             const WriteGrantSlot* grants = enf->sink->writeGrants(msg.sessionId);
             if (grants == nullptr || !allowsWrite(*grants, msg.topicId)) [[unlikely]] {
                 // The login's grants are enqueued on the lifecycle ring BEFORE the client learns it may produce, but
-                // this pass may have drained that ring before the enqueue: hold the frame one pass (the controlled
-                // poll re-delivers it after the next drain) rather than answer a stale NotAuthorized.
-                if (sessionRing_.producerPosition() > sessionRing_.consumerPosition()) [[unlikely]] {
+                // this worker may not have drained that ring yet: hold the frame (the controlled poll re-delivers it
+                // after the next drain) rather than answer a stale NotAuthorized.  The frame waits only for what was
+                // on the ring when it was first seen (GrantHoldMarks); ops that arrive later cannot be its grant.
+                if (grantHolds_.onDenied(msg.sessionId, msg.correlationId, sessionRing_.producerPosition(),
+                                         sessionRing_.consumerPosition()) == GrantHoldMarks::Verdict::Hold) [[unlikely]] {
                     if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
                     ++intakeGrantHolds_;
                     return kIngressHeld;                             // seq NOT committed: it re-opens
