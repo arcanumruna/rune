@@ -9650,6 +9650,7 @@ void ClientGateway::setSecurityBehind(bool behind)
     behind = behind && authMode_ == rune::gateway::GatewayAuthMode::Required;
     if (behind == securityBehind_) return;
     securityBehind_ = behind;
+    if (!behind) behindClearNeedsOffset_ = pendingEnforce_.empty() ? -1 : pendingEnforce_.back().offset;   // #608
     spdlog::warn("ClientGateway: __security view {}", behind
         ? "BEHIND committed events this broker holds - grant-checked requests answer AuthUnavailable, nothing is pushed"
         : "applied every committed event this broker holds - grant-checked requests served again");
@@ -9662,8 +9663,9 @@ int ClientGateway::syncWorkersBehind_()
     if (workerPool_ == nullptr) { workersBehind_ = securityBehind_; return 0; }
     // The clear follows the view's effects: every applied event's ops (revoked bitmaps / binds on the lifecycle ring,
     // ending Unsubscribes on the op ring) were EXECUTED by every worker (its enforcement fences acknowledged) - until
-    // then a worker could still push to, or accept a produce of, a session the applied events cut off.
-    if (!securityBehind_ && !pendingEnforce_.empty()) return 0;
+    // then a worker could still push to, or accept a produce of, a session the applied events cut off.  #608: only the
+    // events pending when the gateway's own flag cleared count; later ones do not hold the clear back.
+    if (!securityBehind_ && securityEnforcedOffset_ < behindClearNeedsOffset_) return 0;
     workersBehind_ = securityBehind_;
     (void)permissionShipper_.securityBehind(*workerPool_, workersBehind_);   // FIFO behind every queued item
     return 1;

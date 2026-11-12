@@ -2837,9 +2837,11 @@ private:
     bool     securityServing_ = true;           ///< issues #15 / #111: see setSecurityServing
     int64_t  securityKnownEnd_ = -1;            ///< #205: see setSecurityKnownEnd
     bool     securityBehind_ = false;           ///< #603: see setSecurityBehind (Required mode only)
+    int64_t  behindClearNeedsOffset_ = -1;   ///< #608: the newest event pending enforcement when the flag cleared
     bool     workersBehind_  = false;           ///< #603: the value last shipped to the workers
     uint64_t securityBehindRefusals_ = 0;       ///< #603: requests answered 48 for it
-    /// #603: ship the behind flag to the workers when it changed - a clear only once pendingEnforce_ is empty.
+    /// #603: ship the behind flag to the workers when it changed - a clear once every event pending at the clear is
+    /// enforced (#608).
     int syncWorkersBehind_();
     /// #603: answer one grant-checked request AuthUnavailable (its own response type, else an ErrorResponse on its
     /// correlation id).  Cold.

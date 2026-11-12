@@ -485,6 +485,47 @@ TEST(SecurityEnforcementFenceRegression, TheWorkersBehindClearWaitsForTheApplied
     EXPECT_TRUE(r.pool.worker(0).securityBehindForTest()) << "(on its ring, not yet installed)";
 }
 
+// Issue #608: the workers' clear needs only the events that were pending when the gateway's own flag cleared (here event
+// A).  Event B, applied after the clear, stays pending without holding the clear back.  Control: before A's fences are
+// acknowledged the clear is not shipped.  RED before the fix: the clear waited for the whole queue, B included.
+// Mutation: compare against pendingEnforce_.back() at ship time instead of the recorded offset -> red.
+TEST(SecurityEnforcementFenceRegression, TheClearShipsOnceTheEventsPendingAtTheClearAreEnforcedRegression) {
+    FenceRig r(1);
+    FakePub pub;
+    const int64_t rs = r.login("r");
+    (void)r.login("w");
+    r.gw.injectRecordEgressForTest(rs, 0, pub.make());
+    pc::Subscribe s;
+    s.sessionId = rs; s.correlationId = 92; s.topicId = 0; s.partition = 0; s.partitionKnown = 1; s.fromOffset = 0;
+    std::vector<uint8_t> buf(s.encodedSize());
+    buf.resize(s.encode(buf.data()));
+    r.gw.applySubscribeForTest(buf.data(), buf.size());
+    r.runAll(1);
+    ASSERT_EQ(r.pool.worker(0).subscriptionsForTest().size(), 1u);
+    const int64_t before = r.gw.securityEnforcedOffset();
+    const uint64_t f0 = r.gw.enforceFencesIssuedForTest();
+
+    r.gw.setSecurityBehind(true);
+    ASSERT_TRUE(r.gw.workersSecurityBehindForTest());
+    const int64_t a = r.revoke(sec::Operation::Read, "r");    // pending: op ring + lifecycle fences (seq f0 + 1)
+    r.gw.setSecurityBehind(false);
+    const int64_t b = r.revoke(sec::Operation::Write, "w");   // applied after the clear, pending (seq f0 + 2)
+    ASSERT_EQ(r.gw.enforceFencesIssuedForTest(), f0 + 2);
+    (void)r.gw.servicePermissionShippingForTest();
+    EXPECT_TRUE(r.gw.workersSecurityBehindForTest()) << "control: nothing acknowledged yet";
+
+    r.gw.handleWorkerReturnForTest(fenceAck(0, 1, f0 + 1));   // A's lifecycle fence only
+    (void)r.gw.servicePermissionShippingForTest();
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), before);
+    EXPECT_TRUE(r.gw.workersSecurityBehindForTest()) << "control: A's op ring has not acknowledged";
+
+    r.gw.handleWorkerReturnForTest(fenceAck(0, 0, f0 + 1));   // A's op ring fence: A is enforced, B still pending
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), a);
+    ASSERT_LT(r.gw.securityEnforcedOffset(), b);
+    (void)r.gw.servicePermissionShippingForTest();
+    EXPECT_FALSE(r.gw.workersSecurityBehindForTest()) << "the clear ships while B is still pending";
+}
+
 // Issue #603: edges only - repeated identical verdicts ship nothing; an InProcess / dev gateway never sets it.
 TEST(SecurityEnforcementFenceRegression, TheBehindFlagShipsEdgesOnlyRegression) {
     FenceRig r(2);
