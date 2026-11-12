@@ -17,7 +17,11 @@
 #include <FragmentAssembler.h>
 #include <gtest/gtest.h>
 
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
+
 #include <atomic>
+#include <functional>
 #include <filesystem>
 #include <map>
 #include <unistd.h>
@@ -254,17 +258,6 @@ TEST(WorkerWriteGrantRegression, ChunkedUpdateIsInstalledAtomicallyOnTheLastChun
     EXPECT_EQ(f.slot(5)->epoch, 2u);
 }
 
-TEST(WorkerWriteGrantRegression, AnOutOfOrderChunkIsDroppedAndNeverInstallsAPartialTable) {
-    Fixture f;
-    f.announce(5, false);
-    f.bind(5, f.tableOf(5), 1);                              // bound to its (still empty) table
-    f.tableChunk(f.tableOf(5), 0, 1024, bitsFor({1}, 512), false);
-    f.tableChunk(f.tableOf(5), 768, 1024, bitsFor({}, 256), true);   // skips words 512..767: must not install
-    f.steps(8);
-    EXPECT_FALSE(allowsWrite(*f.slot(5), 1)) << "a partial table is never visible";
-    EXPECT_EQ(f.slot(5)->epoch, 1u);
-}
-
 TEST(WorkerWriteGrantRegression, GrantAllAllowsEveryTopic) {
     Fixture f;
     f.announce(5, /*grantAll=*/true);                       // dev / in-process mode
@@ -339,9 +332,9 @@ TEST(WorkerWriteGrantRegression, PermissionStagerReusesItsBuffersAfterTheFirstUp
     PermissionStager st;
     std::vector<uint64_t> chunkWords(512, 7);
     auto update = [&] {
-        EXPECT_EQ(st.apply(sink, 1, 0, 1024, 0, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096, /*owner=*/7, kPermBitmapWrite), PermissionChunkResult::Staged);
+        EXPECT_EQ(st.apply(sink, 1, 0, 1024, 0, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096, /*owner=*/7, kPermBitmapWrite), PermApply::Staged);
         EXPECT_EQ(st.apply(sink, 1, 512, 1024, kPermFlagLast, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096, /*owner=*/7, kPermBitmapWrite),
-                  PermissionChunkResult::Installed);
+                  PermApply::Applied);
     };
     update();
     update();                                                // both buffers now hold their peak capacity
@@ -443,37 +436,105 @@ TEST(WorkerWriteGrantRegression, AStaleSlotNeverInheritsATableIdReusedByAnotherS
     EXPECT_TRUE(allowsWrite(*f.slot(6), 2));
 }
 
-// Input bounds: hostile SESSION_PERMISSIONS ops (ids at / beyond the store, negative ids, a patch past its total, a tail
-// that is not whole words, no variant flag, an unknown session) change nothing and never crash.
-TEST(WorkerWriteGrantRegression, MalformedPermissionOpsChangeNothingAdversarialRegression) {
+// Issue #199: the lifecycle ring is in-process and FIFO, written only by the PermissionShipper, so a structurally
+// malformed SESSION_PERMISSIONS op is a broker bug: the worker halts (fail-stop, like every other "cannot happen"
+// lifecycle-ring frame) instead of silently dropping it.  One row per Violation class; each row is a death test (the
+// halt is std::_Exit) whose child logs to stderr.  A tail that is not whole words is not constructible through
+// tryEnqueueOp (the op carries a word count); the worker's check for it is defensive.
+TEST(WorkerPermissionOpsRegression, AMalformedPermissionOpHaltsTheWorkerRegression) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    const int64_t kMax = static_cast<int64_t>(kMaxWritePermTables);
+    struct Row {
+        const char* name;
+        const char* reason;
+        std::function<void(Fixture&)> feed;
+    };
+    const auto rawOp = [](Fixture& f, uint8_t flags, int64_t sid, int64_t first, int64_t total, int32_t bitmap,
+                          const std::vector<uint64_t>& words, int64_t corr = 0) {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = sid;
+        o.nextOffset = first; o.hwBound = total; o.topicId = bitmap; o.isolation = flags; o.correlationId = corr;
+        o.permWords = words.data(); o.permWordCount = words.size();
+        ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(o)));
+    };
+    const std::vector<Row> rows = {
+        {"no variant flag", "no variant flag",
+         [&](Fixture& f) { rawOp(f, kPermFlagLast, 3, 0, 1, 0, bitsFor({9}, 1)); }},
+        {"two variant flags", "more than one variant flag",
+         [&](Fixture& f) { rawOp(f, kPermFlagBind | kPermFlagDrop | kPermFlagLast, 5, 3, 0, 0, {}); }},
+        {"first word beyond the total", "table chunk words lie outside the table",
+         [&](Fixture& f) { f.tableChunk(3, 5, 2, bitsFor({1}, 1), true); }},
+        {"more words than the table has left", "table chunk words lie outside the table",
+         [&](Fixture& f) { f.tableChunk(3, 1, 1, bitsFor({1}, 1), true); }},
+        {"a chunk that skips words", "table chunk is not the next one of the staged table",
+         [&](Fixture& f) {
+             f.tableChunk(3, 0, 1024, bitsFor({1}, 512), false);
+             f.tableChunk(3, 768, 1024, bitsFor({}, 256), true);
+         }},
+        {"a chunk of another table", "table chunk is not the next one of the staged table",
+         [&](Fixture& f) {
+             f.tableChunk(3, 0, 1024, bitsFor({1}, 512), false);
+             f.tableChunk(4, 512, 1024, bitsFor({}, 512), true);
+         }},
+        {"a continuation without a first chunk", "table chunk is not the next one of the staged table",
+         [&](Fixture& f) { f.tableChunk(3, 512, 1024, bitsFor({}, 512), true); }},
+        {"a last chunk that does not complete the table", "last table chunk does not complete the table",
+         [&](Fixture& f) { f.tableChunk(3, 0, 1024, bitsFor({1}, 512), true); }},
+        {"table id beyond the store", "table id beyond the store",
+         [&](Fixture& f) { f.tableChunk(kMax, 0, 1, bitsFor({1}, 1), true); }},
+        {"negative table id", "table id beyond the store",
+         [&](Fixture& f) { f.tableChunk(-7, 0, 1, bitsFor({1}, 1), true); }},
+        {"import table id beyond the store", "table id beyond the store",
+         [&](Fixture& f) { f.importChunk(kMax, 0, 1, bitsFor({1}, 1), true); }},
+        {"patch table id beyond the store", "patch table id beyond the store",
+         [&](Fixture& f) { f.patch(kMax, 0, 1, bitsFor({4}, 1)); }},
+        {"patch negative table id", "patch table id beyond the store",
+         [&](Fixture& f) { f.patch(-1, 0, 1, bitsFor({4}, 1)); }},
+        {"patch first beyond the total", "patch table id beyond the store or words outside the table",
+         [&](Fixture& f) { f.patch(3, 5, 2, bitsFor({4}, 1)); }},
+        {"patch words beyond the total", "patch table id beyond the store or words outside the table",
+         [&](Fixture& f) { f.patch(3, 1, 1, bitsFor({4}, 1)); }},
+        {"drop table id beyond the store", "drop table id beyond the store",
+         [&](Fixture& f) { f.dropTable(kMax); }},
+        {"drop negative table id", "drop table id beyond the store",
+         [&](Fixture& f) { f.dropTable(-3); }},
+        {"bind table id beyond the store", "bind table id beyond the store",
+         [&](Fixture& f) { f.bind(5, kMax, 2); }},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EXIT(
+            {
+                spdlog::set_default_logger(spdlog::stderr_color_mt("permdeath"));
+                Fixture f;
+                f.announce(5, false);
+                f.tableChunk(3, 0, 1, bitsFor({1}, 1), true);
+                f.bind(5, 3, 1);
+                f.steps(8);
+                row.feed(f);
+                f.steps(16);
+                std::_Exit(0);   // reached only if the worker did NOT halt
+            },
+            ::testing::ExitedWithCode(Worker::kExitInvariantViolation),
+            std::string("session-permissions.*") + row.reason);
+    }
+}
+
+// Issue #199: the one benign failure - a Bind for a session that closed while the bind was queued - is counted and
+// never halts; the worker goes on applying valid ops.
+TEST(WorkerPermissionOpsRegression, ABindForAClosedSessionIsCountedNotHaltedRegression) {
     Fixture f;
     f.announce(5, false);
-    f.tableChunk(3, 0, 1, bitsFor({1}, 1), true);
+    f.close(5);
     f.bind(5, 3, 1);
     f.steps(8);
-    ASSERT_TRUE(allowsWrite(*f.slot(5), 1));
-    const int64_t kMax = static_cast<int64_t>(kMaxWritePermTables);
-    f.bind(5, kMax, 2);                                    // beyond the store: refused, the slot keeps table 3
-    f.tableChunk(kMax, 0, 1, bitsFor({1}, 1), true);
-    f.tableChunk(-7, 0, 1, bitsFor({1}, 1), true);
-    f.patch(kMax, 0, 1, bitsFor({4}, 1));
-    f.patch(-1, 0, 1, bitsFor({4}, 1));
-    f.patch(3, 5, 2, bitsFor({4}, 1));                     // first > total
-    f.patch(3, 1, 1, bitsFor({4}, 1));                     // n > total - first
-    f.dropTable(kMax);
-    f.dropTable(-3);
-    f.bind(424242, 3, 3);                                  // unknown session
-    {
-        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = 3;
-        o.isolation = kPermFlagLast;                       // no variant flag
-        const auto w = bitsFor({9}, 1); o.permWords = w.data(); o.permWordCount = w.size();
-        ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(o)));
-    }
-    f.steps(16);
-    EXPECT_TRUE(allowsWrite(*f.slot(5), 1)) << "nothing of it touched table 3 or the slot";
-    EXPECT_FALSE(allowsWrite(*f.slot(5), 4));
-    EXPECT_FALSE(allowsWrite(*f.slot(5), 9));
-    EXPECT_EQ(f.slot(5)->epoch, 1u);
+    EXPECT_EQ(f.worker->permBindsUnknownSessionForTest(), 1u);
+    EXPECT_EQ(f.slot(5), nullptr);
+    f.announce(6, false);
+    f.chunk(6, 1, 0, 1, bitsFor({1}, 1), true);
+    f.steps(8);
+    ASSERT_NE(f.slot(6), nullptr);
+    EXPECT_TRUE(allowsWrite(*f.slot(6), 1)) << "a later valid op is applied normally";
+    EXPECT_EQ(f.worker->permBindsUnknownSessionForTest(), 1u);
 }
 
 // Issue #603: while the control thread says its `__security` view is behind committed events this broker holds, the

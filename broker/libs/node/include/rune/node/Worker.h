@@ -942,6 +942,7 @@ public:
         return 0;
     }
     [[nodiscard]] uint64_t intakeGrantHoldsForTest() const noexcept { return intakeGrantHolds_; }
+    [[nodiscard]] uint64_t permBindsUnknownSessionForTest() const noexcept { return permBindsUnknownSession_; }
     [[nodiscard]] const GrantHoldMarks& grantHoldMarksForTest() const noexcept { return grantHolds_; }
     [[nodiscard]] const SessionAckSink* ackSinkForTest() const noexcept { return ackSink_.get(); }
     /// NAT-safe egress (Task 6): the session's response publication is Ready (worker thread / quiescent only).
@@ -3134,26 +3135,53 @@ private:
         const uint8_t flags = op.isolation();
         const std::uint32_t tailLen = op.tailLength();   // SBE var data: the length FIRST, then tail() advances past it
         const auto* tail = reinterpret_cast<const uint8_t*>(op.tail());
-        bool ok = true;
-        if ((flags & kPermFlagBind) != 0) {
-            ok = ackSink_->bindWriteGrants(op.sessionId(), op.nextOffset(), static_cast<uint64_t>(op.correlationId()),
-                                           static_cast<uint64_t>(op.producerId()));   // #122: the session's principal
+        // The ring is in-process and FIFO, written only by the PermissionShipper: a malformed op is a broker bug
+        // (Violation: halt), except a Bind for a session that closed while it was queued (UnknownSession: counted).
+        PermApply   r   = PermApply::Applied;
+        const char* why = "";
+        const unsigned variants = ((flags & kPermFlagBind) != 0) + ((flags & kPermFlagDrop) != 0) +
+                                  ((flags & kPermFlagPatch) != 0) + ((flags & kPermFlagTable) != 0);
+        if (variants != 1) [[unlikely]] {
+            r = PermApply::Violation;
+            why = variants == 0 ? "no variant flag" : "more than one variant flag";
+        } else if (tailLen % 8 != 0) [[unlikely]] {
+            r = PermApply::Violation;
+            why = "tail is not whole words";
+        } else if ((flags & kPermFlagBind) != 0) {
+            if (op.nextOffset() >= static_cast<int64_t>(kMaxWritePermTables)) [[unlikely]] {
+                r = PermApply::Violation;
+                why = "bind table id beyond the store";
+            } else if (!ackSink_->bindWriteGrants(op.sessionId(), op.nextOffset(),
+                                                  static_cast<uint64_t>(op.correlationId()),
+                                                  static_cast<uint64_t>(op.producerId()))) {   // #122: the principal
+                r = PermApply::UnknownSession;   // the only other failure of a bind: the session is gone
+            }
         } else if ((flags & kPermFlagDrop) != 0) {
-            ok = ackSink_->dropWriteTable(op.sessionId());
+            if (!ackSink_->dropWriteTable(op.sessionId())) [[unlikely]] {
+                r = PermApply::Violation;
+                why = "drop table id beyond the store";
+            }
         } else if ((flags & kPermFlagPatch) != 0) {
-            ok = tailLen % 8 == 0 && (op.topicId() == kPermBitmapImport
-                     ? ackSink_->patchImportTable(op.sessionId(), first, total, tail, tailLen / 8)
-                     : ackSink_->patchWriteTable(op.sessionId(), first, total, tail, tailLen / 8));
-        } else if ((flags & kPermFlagTable) != 0) {
-            ok = permStager_.apply(*ackSink_, op.sessionId(), first, total, flags,
-                                   static_cast<uint64_t>(op.correlationId()), tail, tailLen,
-                                   static_cast<uint64_t>(op.producerId()), op.topicId()) != PermissionChunkResult::Dropped;
+            const bool ok = op.topicId() == kPermBitmapImport
+                ? ackSink_->patchImportTable(op.sessionId(), first, total, tail, tailLen / 8)
+                : ackSink_->patchWriteTable(op.sessionId(), first, total, tail, tailLen / 8);
+            if (!ok) [[unlikely]] {
+                r = PermApply::Violation;
+                why = "patch table id beyond the store or words outside the table";
+            }
         } else {
-            ok = false;   // no variant flag: not sent by this runtime
+            r = permStager_.apply(*ackSink_, op.sessionId(), first, total, flags,
+                                  static_cast<uint64_t>(op.correlationId()), tail, tailLen,
+                                  static_cast<uint64_t>(op.producerId()), op.topicId());
+            if (r == PermApply::Violation) why = permStager_.violationReason();
         }
-        if (!ok) [[unlikely]]
-            spdlog::debug("Worker {}: permission op (flags {:#x}) for {} dropped (closed session, bad id or out-of-order "
-                          "chunk)", workerId_, flags, op.sessionId());
+        if (r == PermApply::Violation) [[unlikely]]
+            haltInvariant_("session-permissions", why, tailLen);   // a broker bug: never sent by the runtime
+        else if (r == PermApply::UnknownSession) [[unlikely]] {
+            ++permBindsUnknownSession_;
+            spdlog::debug("Worker {}: bind for closed session {} ignored (it closed while the bind was queued)",
+                          workerId_, op.sessionId());
+        }
     }
 
     [[gnu::cold]] void executeSessionAnnounceWire_(sbe::WorkerOp& op) {
@@ -6693,6 +6721,7 @@ private:
     // Authentication Task 13: this worker's one chunked-permission assembler (shared-nothing; worker thread only).
     PermissionStager permStager_;
     uint64_t         sessionPermissionChunksSeen_ = 0;
+    uint64_t         permBindsUnknownSession_ = 0;   ///< binds for a session that closed while queued (benign)
     uint64_t         workerNotAuthorized_ = 0;   ///< shard produces refused NotAuthorized (counted)
     uint64_t         workerSuspendedRefusals_ = 0;   ///< shard produces refused NamespaceSuspended (ReadOnly; counted)
     uint64_t         intakeGrantHolds_    = 0;   ///< denied frames held until the lifecycle ops that preceded them apply
