@@ -60,6 +60,14 @@ struct MissingAnswer { Outcome outcome; int16_t code; int16_t viewStatus; };
     return Outcome::Ok;                                                                                     // R7
 }
 
+/// The exact ViewRowResponse status of a view read (GetViewRow) that answered `code`.  An authorized read (code 0) of
+/// the matrix's views answers 1 (AbsentKey): the view is Ready (its builder created it before the read) and no source
+/// row exists, so the key is absent - never 0 (OK: needs a row), 2 (NotReady: the view still rebuilding) or any other
+/// status.  A refusal is an ErrorResponse and carries its own code as the status (45).
+[[nodiscard]] constexpr bool isViewRead(Op o) noexcept { return o == Op::ViewRead || o == Op::ViewOpen; }
+inline constexpr int16_t kViewStatusAbsentKey = 1;
+[[nodiscard]] constexpr int16_t viewStatusOf(int16_t code) noexcept { return code == 0 ? kViewStatusAbsentKey : code; }
+
 /// Every code a cell asserts.  first = the first answer; second = the answer after the change (RevokedMid,
 /// GrantedAfterLogin, UserDisabledMid) or kNone; reconnect = the code of a reconnect attempt (UserDisabledMid) or kNone.
 struct ExpectedCodes { int16_t first = kNone; int16_t second = kNone; int16_t reconnect = kNone; int16_t viewStatus = kNone;

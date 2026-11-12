@@ -11,7 +11,8 @@ For what changed for existing deployments, see [the release notes](release-notes
 
 ## The model
 
-- **Principal:** a user. Services such as world servers are users too.
+- **Principal:** a user. Services such as world servers are users too. The names `bootstrap` and `anonymous`
+  (any letter case) are reserved for the broker's own audit principals: the leader refuses to create a user with one.
 - **Role:** a named set of grants.
 - **Grant:** an operation on a resource type, matched by an exact name or a prefix.
   - Operations: `READ`, `WRITE`, `CREATE`, `ALTER`, `DROP`, `DESCRIBE`, `ADMIN`, `IMPORT`.
@@ -55,9 +56,24 @@ Rules that keep the model small (D15 to D17):
 | `CreateView` / `AlterView` (D19) | also `READ` on every source topic |
 | `AlterSchema` / `AlterView` / `AlterTopicConfig` / `SetCompatibility` | `ALTER` on the object |
 | `DropTopic` / `DropView` | `DROP` on the object |
-| Catalog history, as-of, diff, export, replay (`__catalog` reads) (D21) | `DESCRIBE` on `CLUSTER` |
+| Catalog history, as-of, diff, export, replay (`__catalog` reads) (D21) | `DESCRIBE` on `CLUSTER`. All or nothing: a holder sees every catalog object (every tenant's names), a principal with only per-object `DESCRIBE` sees none (#220) |
 | User, role and grant DDL; every `SHOW USERS|ROLES|GRANTS|SECURITY HISTORY` (D20) | `ADMIN` on `CLUSTER` |
 | `ALTER USER <self> SET|ADD|DROP PASSWORD` (D20) | no grant, but a fresh proof of a current password (the client sends it; a session alone is not enough) |
+
+### What a view may read after it is created
+
+`CreateView` and `AlterView` check `READ` on every source topic against the principal that issues the request, at that
+moment (D19). That is the only check of the sources.
+
+- After the request is applied the view reads its sources as a cluster object, not as its creator. `READ` on the
+  VIEW governs who sees its content.
+- Revoking a principal's `READ` on a source (or dropping the principal) does not stop an existing view: it keeps folding
+  the source and its readers keep reading it. Later enforcement was rejected on purpose: the creator may have been
+  dropped, may hold `READ` through a role, or the view may have been altered by another principal, so "who must still
+  hold `READ`" has no stable answer.
+- To stop the flow, revoke `READ` on the view from its readers, or drop the view.
+- An `ALTER VIEW` is checked again, against the principal that alters it, so a principal that lost `READ` on a source
+  is refused (`NotAuthorized`, 45) when it alters the view.
 
 **Ownership.** A consumer-group member id and a producer id belong to whoever obtained them.
 - A member id is bound to the session and user that joined. SyncGroup, Heartbeat, LeaveGroup and
@@ -81,6 +97,14 @@ is checked against the grants on that object. Only when the id is not live (miss
 answer `NotAuthorized`, unless the session holds `DESCRIBE ON CLUSTER`; then it gets the request's normal
 `UnknownTopic` answer (D22). A view plan's source ids never get this relaxation: they need `READ`. The detail text is
 always `not authorized: <OP> on <TYPE> <requested name or id>` (D23).
+GetTopicSchema on a name whose live object is of a kind the caller holds no DESCRIBE for answers exactly like a
+missing name; a caller with no DESCRIBE on the name under either kind gets NotAuthorized whether or not the object
+exists.
+A catalog DDL answers about a colliding object (an existing name of the other kind, a name that differs only in letter
+case, a topic a view reads) in full only when the gateway says the caller may DESCRIBE that kind under the request's own
+name; otherwise the answer is the one for an unknown object (`TopicExists` with no id and version, `UnknownTopic` for an
+ALTER or DROP TOPIC naming a view). The other object's name in a letter-case or read-by-view refusal is shown only to
+principals with DESCRIBE ON CLUSTER (D22).
 
 ## Rune QL statements
 
@@ -165,6 +189,11 @@ There is **no hard lockout**: a lockout would let an attacker lock out the world
 attacker at one address never delays the same user at another. A session that has not finished
 the login within `RUNE_AUTH_TIMEOUT_MS` (default 10 000) is answered `AuthenticationFailed` and ended
 (D13). A client that is rate-limited waits `max(retryAfterMs, its backoff)` and retries.
+
+The source address in the throttle key is the real UDP source of the Connect image. An IPC image
+has no source address, so the host of the reply endpoint the client declared is used instead. Only
+processes on the broker's own machine can connect over IPC, so the key cannot be chosen remotely,
+but local processes can choose it.
 
 ## Bootstrap: the first admin (D3, D4)
 
@@ -280,9 +309,29 @@ bound to nothing, and an ended subscription's cursor is gone. A subscription a w
 that worker: its `NotAuthorized` follows its last `Records` frame, and nothing follows it. An OK whose
 enforcement is not confirmed within `RUNE_SECURITY_GATE_DEADLINE_MS` (default 5 000) is answered `Internal`
 "committed at offset N; enforcement on this broker not confirmed" (the change is committed; a retry with
-the same request id returns its result). The OK does not mean every broker enforces it. Other brokers
+the same request id by the same principal returns its result; a different principal that sends that id is
+answered `requestId reused for a different statement` (or its own denial, if it may not run the statement) and
+never the recorded result, so whether an id is recorded is visible to a principal that guesses it; ids are a
+random 64-bit client instance id plus a counter. A retry that spans a rolling upgrade is answered the same way,
+since the request fingerprint now includes the authenticated principal, issue #221). The OK does not mean every
+broker enforces it.
+Other brokers
 apply the event asynchronously (typically within 100 ms on healthy brokers).
 A revoke ends the affected subscriptions within 100 ms on a 3-node cluster.
+
+**A DDL and a concurrent security change.** The gateway authorizes a catalog or security DDL against its mirror of
+`__security` and stamps the request with the `__security` offset it checked. The admin thread appends the request only
+if no event applied after that offset could have changed what the requesting user may do (issues #218, #67); otherwise
+it answers the ordinary retriable `NotLeader`, and the client's retry (same request id) is authorized again against
+the newer state. The rule is per user, and "could have changed" is the security state machine's own affected-users set
+(the users whose sessions the event refreshes or revokes): an event about another user, or a change to a role the
+requester is not a member of, does not make an admin's pipelined DDL retry. A change to a role's grants or a `DROP ROLE`
+makes stale only that role's members; a namespace purge only the erased users and the survivors whose grants it
+stripped; `CREATE ROLE` nobody. Only the bootstrap and any event kind not listed in the index count as a change for
+every user, and so does a principal the admin thread has no record of (anonymous, or a user that no longer exists).
+A broker restart replays the whole log through the same index, so a user that exists is known after it. The same rule
+covers a security event that is appended but not yet applied. A request whose id is already recorded still gets its
+original result first.
 
 ### A broker serves only a current security state (`#serving`)
 
@@ -306,6 +355,12 @@ current; otherwise it answers the retriable `AuthUnavailable` (48) and the clien
   `AuthUnavailable`: produce (through the gateway and straight to a worker), subscribe, view reads, group
   and transaction requests, DDL, logins. Nothing is appended and no subscription is pushed until the events
   are applied; then the new grants decide. A revoke this broker has received is never served around.
+  A denial is answered `AuthUnavailable` instead of `NotAuthorized` while this broker holds `__security`
+  events it has not applied, on both paths: the gateway, and a shard worker's own ingress
+  (`RUNE_PER_WORKER_INGRESS=true`), which is told the lag level with the permission items. A request the grants
+  allow is served meanwhile. A grant is therefore usable on every in-sync replica as soon as its statement
+  is answered. One case still sees a short-lived `NotAuthorized` after a fresh grant: a broker outside the
+  `__security` in-sync set (bounded by the staleness limit F).
 - A broker stale for `RUNE_SECURITY_STALE_SESSION_END_MS` (R, default 10 000) ends its authenticated
   sessions with a session-level `AuthUnavailable`; their clients reconnect to a current broker. Only an
   event the broker has not heard of yet can still be missed by those sessions until then: what a broker
@@ -322,7 +377,7 @@ zero allocation); tables are owned by the thread that owns the session and updat
 
 - It is never the default: without the setting, authentication is on and the broker needs a cluster key.
 - The broker logs a loud warning at startup and every 5 minutes, and publishes the mode as the
-  metric `rune-auth-mode` (1 000 228: 0 enabled, 1 dev mode).
+  metric `rune-auth-mode` (1 000 228: 0 enabled, 1 dev mode, 2 in-process unauthenticated).
 - A broker in dev mode **refuses to start as part of a multi-broker cluster**
   (`RUNE_PEERS` lists more than one broker): an unauthenticated node would be an open door into the
   cluster's data and into `__security`.
@@ -377,7 +432,7 @@ is in [operations](../../docs/operations.md#metrics)):
 |---|---|---|
 | `rune-security-apply-halted node=<id>` | 1 000 226 | 0 while applying; after a halt, the halted offset plus 1 |
 | `rune-security-applied-offset node=<id>` | 1 000 227 | the last applied `__security` offset |
-| `rune-auth-mode node=<id>` | 1 000 228 | 0 authentication enabled, 1 dev mode |
+| `rune-auth-mode node=<id>` | 1 000 228 | 0 authentication enabled, 1 dev mode, 2 in-process unauthenticated |
 | `rune-logins-ok node=<id>` | 1 000 229 | successful logins |
 | `rune-logins-failed node=<id>` | 1 000 230 | failed logins |
 | `rune-logins-rate-limited node=<id>` | 1 000 231 | logins answered inside a throttle delay |
@@ -386,7 +441,7 @@ is in [operations](../../docs/operations.md#metrics)):
 | `rune-peer-link-refusals node=<id>` | 1 000 234 | peer-link refusals logged by this broker, both directions |
 | `rune-peer-frame-drops node=<id>` | 1 000 235 | inter-broker frames dropped for want of a link or because they did not open |
 
-Alert on a non-zero `rune-security-apply-halted`, on `rune-auth-mode` = 1 anywhere in production, on a
+Alert on a non-zero `rune-security-apply-halted`, on a non-zero `rune-auth-mode` anywhere in production, on a
 rising `rune-logins-failed` or `rune-logins-rate-limited`, and on a rising `rune-peer-link-refusals`.
 Successful and failed logins are metrics and structured logs, not `__security` events (they are
 high-volume).

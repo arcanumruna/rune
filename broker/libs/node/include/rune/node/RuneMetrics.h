@@ -48,7 +48,7 @@ enum class RuneMetric : std::int32_t {
     LostCommittedReports       = 1'000'225,   // monotonic
     SecurityApplyHalted        = 1'000'226,   // 0 applying, else halted offset + 1
     SecurityAppliedOffset      = 1'000'227,   // -1 none
-    AuthMode                   = 1'000'228,   // 0 enabled, 1 dev-disabled
+    AuthMode                   = 1'000'228,   // 0 enabled, 1 dev-disabled, 2 in-process unauthenticated
     LoginsOk                   = 1'000'229,   // monotonic
     LoginsFailed               = 1'000'230,
     LoginsRateLimited          = 1'000'231,
@@ -56,7 +56,8 @@ enum class RuneMetric : std::int32_t {
     PeerLinksEstablished       = 1'000'233,
     PeerLinkRefusals           = 1'000'234,   // monotonic
     PeerFrameDrops             = 1'000'235,   // monotonic, summed over every transport owner
-    // 1'000'236 - 1'000'239 reserved
+    // 1'000'236 - 1'000'238 reserved
+    UnauthLogSuppressed        = 1'000'239,   // monotonic: rate-limited unauthenticated log lines (gateway + every worker)
     StuckTxnOffsetCommits      = 1'000'240,
     StuckTxnOffsetAgeMs        = 1'000'241,
     NsSlotMismatch             = 1'000'242,   // monotonic: namespace slot tags refused (gateway + every worker)
@@ -88,7 +89,7 @@ using M = RuneMetric;
 }  // namespace detail
 
 /// One row per live metric, in type-id order.  The row index is the slot index in BrokerNode::slots_.
-inline constexpr std::array<RuneMetricDef, 34> kRuneMetrics = {{
+inline constexpr std::array<RuneMetricDef, 35> kRuneMetrics = {{
     {detail::M::Role,                      detail::K::Gauge,   "rune-cluster-node-role",                       detail::O::Observer},
     {detail::M::Term,                      detail::K::Gauge,   "rune-cluster-leadership-term",                 detail::O::Observer},
     {detail::M::StuckMarkers,              detail::K::Gauge,   "rune-txn-stuck-markers",                       detail::O::Control},
@@ -117,6 +118,7 @@ inline constexpr std::array<RuneMetricDef, 34> kRuneMetrics = {{
     {detail::M::PeerLinksEstablished,      detail::K::Gauge,   "rune-peer-links-established",                  detail::O::Control},
     {detail::M::PeerLinkRefusals,          detail::K::Counter, "rune-peer-link-refusals",                      detail::O::Control},
     {detail::M::PeerFrameDrops,            detail::K::Counter, "rune-peer-frame-drops",                        detail::O::Control},
+    {detail::M::UnauthLogSuppressed,       detail::K::Counter, "rune-unauth-log-suppressed",                   detail::O::Control},
     {detail::M::StuckTxnOffsetCommits,     detail::K::Gauge,   "rune-txn-offset-commits-stuck",                detail::O::Control},
     {detail::M::StuckTxnOffsetAgeMs,       detail::K::Gauge,   "rune-txn-offset-stuck-age-ms",                 detail::O::Control},
     {detail::M::NsSlotMismatch,            detail::K::Counter, "rune-ns-slot-mismatch",                        detail::O::Control},

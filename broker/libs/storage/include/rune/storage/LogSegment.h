@@ -351,13 +351,13 @@ public:
                                                     const std::string& logFile,
                                                     const std::string& indexFile,
                                                     int64_t nextOffset, int32_t indexIntervalBytes,
-                                                    int32_t indexMaxBytes);
+                                                    int32_t indexMaxBytes, unsigned fileMode = 0644);
     /// `readMapBytes` 0 (the default, D26): no read mapping — a later
     /// readView maps lazily (push / fetch reads pread and never map).
     static std::unique_ptr<LogSegment> prepareStaging(
         const std::string& stagingLogPath, const std::string& stagingIndexPath,
         int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes,
-        std::size_t readMapBytes = 0);
+        std::size_t readMapBytes = 0, unsigned fileMode = 0644);
     /// Hot-path B F5 + review Md5: the read mapping a segment that grows to
     /// `rollBytes` ends with — page-rounded rollBytes + one maximal batch (never
     /// a power of two).  A mapping starts at kReadMapMinBytes and a provisioned

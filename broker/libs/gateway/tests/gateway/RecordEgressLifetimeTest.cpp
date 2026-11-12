@@ -835,6 +835,27 @@ TEST(AuthEnforcementAdversarialRegression, ManyHeldSubscribesAreEachRefusedOnceA
     EXPECT_EQ(r.gw.pendingRecordEgressCountForTest(), 0u);
 }
 
+// #145: workers report their cumulative suppressed unauthenticated-log counts as SessionSignal UnauthLogSuppressed; the
+// gateway adds the latest count of each worker to its own limiter's count.
+TEST(UnauthLogSuppressedGatewayRegression, WorkerCountsAreSummedWithTheGatewaysOwnRegression) {
+    Rig r(2, 2);
+    ASSERT_EQ(r.gw.unauthLogSuppressedTotal(), 0u);
+    const auto report = [&](int32_t worker, int64_t count) {
+        rune::node::WorkerReturn ret;
+        ret.type       = rune::node::WorkerReturn::Type::SessionSignal;
+        ret.lastOffset = static_cast<int64_t>(rune::node::SessionSignalKind::UnauthLogSuppressed);
+        ret.partition  = worker;
+        ret.baseOffset = count;
+        r.gw.handleWorkerReturnForTest(ret);
+    };
+    report(0, 2);
+    report(1, 3);
+    EXPECT_EQ(r.gw.unauthLogSuppressedTotal(), 5u);
+    report(0, 4);
+    EXPECT_EQ(r.gw.unauthLogSuppressedTotal(), 7u) << "a later report replaces the earlier one";
+    EXPECT_EQ(r.gw.unauthLogSuppressed(), 0u) << "the gateway's own count is separate";
+}
+
 // #882: workers report their cumulative damaged-read counts as SessionSignal DamagedRead; the gateway sums the latest
 // count of each worker (a later report replaces the earlier one, it does not add to it).
 TEST(DamagedReadsGatewayRegression, WorkerCountsAreSummedAsLatestCumulativeRegression) {

@@ -207,6 +207,46 @@ TEST(CheckedWritesDdl, KindProbe) {
     EXPECT_EQ(rig.getSchema("nope", rp::client::kSchemaKindFingerprint).code, kUnknownTopic);
 }
 
+// #504, #505: the admin thread, which holds the authoritative catalog, serves an object only if its real kind is one
+// the gateway allowed for the caller; otherwise it answers byte-for-byte like a missing name.  RED: drop the kind
+// check in AdminWorker::submitGetSchema.
+TEST(GetSchemaKindRegression, TheAdminServesOnlyTheKindsTheGatewayAllowedRegression) {
+    CatalogDdlRig rig("gskind");
+    rig.becomeServingLeader();
+    CatalogDdlRig::DefineArgs pay; pay.name = "payments"; pay.typed = true;
+    CatalogDdlRig::DefineArgs raw; raw.name = "payraw";
+    ASSERT_EQ(rig.define(pay).code, kOk);
+    ASSERT_EQ(rig.define(raw).code, kOk);
+    ASSERT_EQ(rig.createView("payboard", "payments").code, kOk);
+    constexpr uint8_t kTopic = 1, kView = 2, kAll = 3;
+    const auto same = [](const CatalogDdlRig::SchemaAnswer& a, const CatalogDdlRig::SchemaAnswer& b) {
+        return a.code == b.code && a.topicId == b.topicId && a.version == b.version &&
+               a.partitionCount == b.partitionCount && a.blob == b.blob;
+    };
+    for (const uint64_t fp : {uint64_t{0}, rp::client::kSchemaKindFingerprint, rp::client::kSchemaLineageFingerprint}) {
+        const auto missing = rig.getSchema("paymissing", fp, 0, kView);
+        EXPECT_EQ(missing.code, kUnknownTopic);
+        EXPECT_EQ(missing.topicId, -1);
+        EXPECT_EQ(missing.version, 0);
+        EXPECT_EQ(missing.partitionCount, 0);
+        EXPECT_TRUE(missing.blob.empty());
+        EXPECT_TRUE(same(rig.getSchema("payments", fp, 0, kView), missing)) << "a VIEW-only caller, a topic; fp " << fp;
+        EXPECT_TRUE(same(rig.getSchema("payboard", fp, 0, kTopic), missing))
+            << "a TOPIC-only caller, a view; fp " << fp;
+        EXPECT_TRUE(same(rig.getSchema("payroll", fp, 0, kTopic), missing));
+    }
+    const auto probe = rig.getSchema("payraw", rp::client::kSchemaKindFingerprint, 0, kView);
+    EXPECT_TRUE(same(probe, rig.getSchema("paymissing", rp::client::kSchemaKindFingerprint, 0, kView)))
+        << "the kind probe on an untyped topic, VIEW-only";
+    EXPECT_EQ(rig.getSchema("payraw", rp::client::kSchemaKindFingerprint, 0, kTopic).code, kOk);
+    EXPECT_EQ(rig.getSchema("payments", 0, 0, kTopic).code, kOk) << "its own kind: served";
+    EXPECT_FALSE(rig.getSchema("payments", 0, 0, kTopic).blob.empty());
+    EXPECT_EQ(rig.getSchema("payments", 0, 0, kAll).code, kOk);
+    const uint16_t viewAll = rig.getSchema("payboard", 0, 0, kAll).code;
+    EXPECT_EQ(rig.getSchema("payboard", 0, 0, kView).code, viewAll) << "a view's own kind answers as kAll does";
+    EXPECT_EQ(rig.getSchema("payraw", rp::client::kSchemaKindFingerprint, 0, kAll).code, kOk);
+}
+
 TEST(CheckedWritesDdl, KindProbeIsScopedToTheNamespace) {
     CatalogDdlRig rig("cwprobens");
     rig.becomeServingLeader();

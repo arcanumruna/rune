@@ -430,6 +430,23 @@ TEST(LeaseDdlRegression, DedupeFingerprintRegression) {
     EXPECT_EQ(fBase, 3452249952166456580ull);   // computed with the parent commit's requestFingerprint
 }
 
+TEST(LeaseDdlRegression, AnEmptyPrincipalKeepsItsFingerprintAndANamedOneDoesNotRegression) {
+    DefineTopicMsg base;
+    rune::codec::DescriptorBuilder legacy("t", 1);
+    legacy.add("id", PrimType::UInt64, 1, true);
+    legacy.add("note", PrimType::String);
+    base.session = 1; base.corr = 2; base.name = "t"; base.keyField = "id"; base.blob = rune::codec::serialize(legacy.build());
+    base.meta.statement = "s";
+    DefineTopicMsg anon = base, alice = base, bob = base;
+    anon.meta.authenticated = "";
+    alice.meta.authenticated = "alice";
+    bob.meta.authenticated = "bob";
+    const uint64_t fAnon = requestFingerprint(DdlRequest{anon});
+    EXPECT_EQ(fAnon, 3452249952166456580ull);   // authentication off: the fingerprint it had before #221
+    EXPECT_NE(requestFingerprint(DdlRequest{alice}), 3452249952166456580ull);
+    EXPECT_NE(requestFingerprint(DdlRequest{alice}), requestFingerprint(DdlRequest{bob}));
+}
+
 // ── admin wire ───────────────────────────────────────────────────────────────
 namespace {
 std::vector<uint8_t> frameOf(const DefineTopicMsg& m) {

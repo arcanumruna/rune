@@ -89,6 +89,31 @@ TEST(PermissionTableRegression, ClusterGrantsReachEveryTopicViewButNeverDataOrIn
     EXPECT_TRUE(t.allows(5, rs::opBit(Operation::Drop))) << "a cluster grant covers an object created after login";
 }
 
+TEST(PermissionTableRegression, OpsOnClusterAgreesWithClusterOpsRegression) {   // #224
+    rg::ObjectIndex idx;
+    const auto cl = [](Operation o) { return g(o, ResourceType::Cluster, PatternKind::Exact, ""); };
+    const std::vector<std::vector<rs::GrantSpec>> sets = {
+        {},
+        {cl(Operation::Admin)},
+        {cl(Operation::Create)},
+        {cl(Operation::Alter), cl(Operation::Drop)},
+        {cl(Operation::Describe)},
+        {cl(Operation::Create), g(Operation::Read, ResourceType::Topic, PatternKind::Exact, "t")},
+        {cl(Operation::Import)},
+    };
+    for (std::size_t i = 0; i < sets.size(); ++i) {
+        const auto t = rg::PermissionTable::compile(sets[i], idx);
+        for (uint8_t o = 0; o < 8; ++o) {
+            const uint8_t bit = rs::opBit(static_cast<Operation>(o));
+            EXPECT_EQ(t.allowsName(ResourceType::Cluster, "", bit), t.allowsCluster(bit)) << "set " << i << " op " << int(o);
+        }
+    }
+    const auto create = rg::PermissionTable::compile(sets[2], idx);
+    EXPECT_FALSE(create.allowsCluster(rs::opBit(Operation::Describe)));
+    EXPECT_FALSE(create.allowsName(ResourceType::Cluster, "", rs::opBit(Operation::Describe)))
+        << "CREATE ON CLUSTER does not imply DESCRIBE ON CLUSTER";
+}
+
 TEST(PermissionTableRegression, APrefixNeverMatchesAnInternalName) {   // I6
     rg::ObjectIndex idx; idx.onTopic(0, "__catalog_like");
     auto t = rg::PermissionTable::compile({{g(Operation::Read, ResourceType::Topic, PatternKind::Prefix, "")}}, idx);
@@ -133,10 +158,10 @@ TEST(AuthorizerRegression, DetailTextIsBuiltOnlyFromTheRequest) {
     ASSERT_TRUE(hidden.has_value());
     ASSERT_TRUE(missing.has_value());
     EXPECT_EQ(hidden->code, 45);
-    EXPECT_EQ(hidden->detail, "not authorized: READ on TOPIC 0");
-    EXPECT_EQ(missing->detail, "not authorized: READ on TOPIC 77");
-    EXPECT_EQ(rg::authorizeName(t, ResourceType::Topic, "t1", Operation::Drop, 0)->detail, "not authorized: DROP on TOPIC t1");
-    EXPECT_EQ(rg::authorizeCluster(t, Operation::Admin)->detail, "not authorized: ADMIN on CLUSTER");
+    EXPECT_EQ(hidden->detail(), "not authorized: READ on TOPIC 0");
+    EXPECT_EQ(missing->detail(), "not authorized: READ on TOPIC 77");
+    EXPECT_EQ(rg::authorizeName(t, ResourceType::Topic, "t1", Operation::Drop, 0)->detail(), "not authorized: DROP on TOPIC t1");
+    EXPECT_EQ(rg::authorizeCluster(t, Operation::Admin)->detail(), "not authorized: ADMIN on CLUSTER");
 }
 
 TEST(AuthorizerRegression, DescribeOnClusterTurnsAMissingIdIntoTheExistingUnknownTopic) {   // D22
@@ -144,6 +169,42 @@ TEST(AuthorizerRegression, DescribeOnClusterTurnsAMissingIdIntoTheExistingUnknow
     auto t = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::Cluster, PatternKind::Exact, "")}}, idx);
     EXPECT_FALSE(rg::authorizeTopicId(t, 77, Operation::Read, idx).has_value()) << "missing id: no denial, UnknownTopic follows";
     EXPECT_TRUE(rg::authorizeTopicId(t, 0, Operation::Read, idx).has_value()) << "a live id it may not read is denied";
+}
+
+// #215: the D22 pass-through is for user object ids only; a negative (internal) id is never passed through.
+TEST(AuthorizerRegression, TheMissingIdPassThroughNeverAppliesToInternalIdsRegression) {
+    rg::ObjectIndex idx; idx.onTopic(0, "exists");
+    auto t = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::Cluster, PatternKind::Exact, "")}},
+                                          idx);
+    const Operation ops[] = {Operation::Read, Operation::Write, Operation::Describe, Operation::Create,
+                             Operation::Alter, Operation::Drop, Operation::Truncate, Operation::Admin,
+                             Operation::Import};
+    const int32_t internal[] = {-1, -2, -3, -6, -7, -100, -2147483647 - 1};
+    for (const int32_t id : internal) {
+        for (const Operation op : ops) {
+            const auto d = rg::authorizeTopicId(t, id, op, idx);
+            EXPECT_TRUE(d.has_value()) << "id " << id << " op " << static_cast<int>(op) << " must be denied";
+            if (d.has_value()) EXPECT_EQ(d->code, 45) << "id " << id;
+        }
+    }
+    for (const Operation op : ops) {
+        if (op == Operation::Import) continue;   // IMPORT is never passed through
+        EXPECT_FALSE(rg::authorizeTopicId(t, 12345, op, idx).has_value()) << "control: a missing user id passes (D22)";
+    }
+    // Root: the pass-through never applies to an internal id either; a missing non-negative id passes.
+    auto root = rg::PermissionTable::compile({{g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")}},
+                                             idx);
+    ASSERT_TRUE(root.isRoot());
+    for (const int32_t id : internal) {
+        for (const Operation op : ops) {
+            EXPECT_TRUE(rg::authorizeTopicId(root, id, op, idx).has_value())
+                << "root, id " << id << " op " << static_cast<int>(op) << " must be denied";
+        }
+    }
+    for (const Operation op : ops) {
+        if (op == Operation::Import) continue;
+        EXPECT_FALSE(rg::authorizeTopicId(root, 12345, op, idx).has_value()) << "root, missing user id passes";
+    }
 }
 
 TEST(AuthorizerRegression, ViewSourceUnknownIdIsDeniedEvenWithDescribeOnClusterRegression) {
@@ -168,7 +229,31 @@ TEST(AuthorizerRegression, AnOverlongNameIsCutInTheDetailIdenticallyForHiddenAnd
     auto t = rg::PermissionTable::denyAll();
     const auto d = rg::authorizeName(t, ResourceType::Topic, std::string(5000, 'x'), Operation::Drop, 0);
     ASSERT_TRUE(d.has_value());
-    EXPECT_LE(d->detail.size(), 300u);
+    EXPECT_LE(d->detail().size(), 300u);
+}
+
+// #263: the detail text lives in a fixed buffer; it must be byte for byte what the std::string build produced.
+TEST(AuthorizerRegression, TheDetailTextsAreUnchangedByTheFixedBufferRegression) {
+    auto t = rg::PermissionTable::denyAll();
+    EXPECT_EQ(rg::authorizeName(t, ResourceType::Topic, "orders", Operation::Write, 0)->detail(),
+              "not authorized: WRITE on TOPIC orders");
+    const std::string exact(rg::kMaxNameInDetail, 'x'), longer(rg::kMaxNameInDetail + 1, 'y');
+    EXPECT_EQ(rg::authorizeName(t, ResourceType::Topic, exact, Operation::Read, 0)->detail(),
+              "not authorized: READ on TOPIC " + exact);
+    EXPECT_EQ(rg::authorizeName(t, ResourceType::Topic, longer, Operation::Read, 0)->detail(),
+              "not authorized: READ on TOPIC " + std::string(rg::kMaxNameInDetail, 'y') + "...");
+    EXPECT_EQ(rg::authorizeCluster(t, Operation::Admin)->detail(), "not authorized: ADMIN on CLUSTER");
+    EXPECT_EQ(rg::authorizeAnyGrant(t, ResourceType::Topic, Operation::Write)->detail(),
+              "not authorized: WRITE on any TOPIC");
+    rg::ObjectIndex idx;
+    EXPECT_EQ(rg::authorizeTopicId(t, -2147483647 - 1, Operation::Read, idx)->detail(),
+              "not authorized: READ on TOPIC -2147483648") << "the widest id fits the 12-byte buffer";
+    EXPECT_EQ(rg::authorizeViewSource(t, 41)->detail(), "not authorized: READ on TOPIC 41");
+    // The longest text the Authorizer can build (TRUNCATE on TRANSACTIONAL_ID with an over-long name) fits whole.
+    const auto widest = rg::authorizeName(t, ResourceType::TransactionalId, longer, Operation::Truncate, 0);
+    ASSERT_TRUE(widest.has_value());
+    EXPECT_EQ(widest->detail(), "not authorized: TRUNCATE on TRANSACTIONAL_ID " + std::string(rg::kMaxNameInDetail, 'y') + "...");
+    EXPECT_LE(widest->detail().size(), rg::kDenialDetailBytes);
 }
 
 // #640: a name of another namespace is never authorized by a non-root table, even if a grant pattern matches the
@@ -181,9 +266,9 @@ TEST(AuthorizerRegression, ForeignNsNameDeniedRegression) {
     EXPECT_EQ(foreign->code, 45);
     EXPECT_FALSE(rg::authorizeName(t, ResourceType::Topic, "x", Operation::Write, 1).has_value());
     EXPECT_FALSE(rg::authorizeName(t, ResourceType::Topic, "x", Operation::Write, rg::kHiddenNsId).has_value());
-    EXPECT_TRUE(rg::authorizeTopicOrViewName(t, "x", Operation::Write, idx, 2).has_value());
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(t, "x", Operation::Write, idx, 1).has_value());
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(t, "x", Operation::Write, idx, rg::kHiddenNsId).has_value());
+    EXPECT_EQ(rg::allowedKindsForName(t, "x", Operation::Write, 2), 0);
+    EXPECT_EQ(rg::allowedKindsForName(t, "x", Operation::Write, 1), rg::kKindTopic);
+    EXPECT_EQ(rg::allowedKindsForName(t, "x", Operation::Write, rg::kHiddenNsId), rg::kKindTopic);
 
     auto root = rg::PermissionTable::compile({{g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, ""),
                                                g(Operation::Write, ResourceType::Topic, PatternKind::Prefix, "")}}, 1, idx);
@@ -376,24 +461,21 @@ TEST(AuthorizerRegression, AViewGrantNeverDescribesATopicRegression) {
     rg::ObjectIndex idx; idx.onTopic(0, "payments"); idx.onView(1, "payboard");
     const auto viewOnly  = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::View, PatternKind::Prefix, "pay")}}, idx);
     const auto topicOnly = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::Topic, PatternKind::Prefix, "pay")}}, idx);
-    const auto denied = rg::authorizeTopicOrViewName(viewOnly, "payments", Operation::Describe, idx, 0);
-    ASSERT_TRUE(denied.has_value()) << "a VIEW grant must not describe the topic 'payments'";
-    EXPECT_EQ(denied->code, 45);
-    EXPECT_EQ(denied->detail, "not authorized: DESCRIBE on TOPIC payments") << "the text always says TOPIC (D23)";
-    EXPECT_TRUE(rg::authorizeTopicOrViewName(topicOnly, "payboard", Operation::Describe, idx, 0).has_value())
-        << "a TOPIC grant must not describe the view 'payboard'";
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payboard", Operation::Describe, idx, 0).has_value());
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(topicOnly, "payments", Operation::Describe, idx, 0).has_value());
-}
-
-TEST(AuthorizerRegression, AnUnknownSchemaNameAcceptsEitherKindsGrantRegression) {   // D22 parity: "unknown" follows
-    rg::ObjectIndex idx; idx.onTopic(0, "payments");
-    const auto viewOnly = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::View, PatternKind::Prefix, "pay")}}, idx);
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payroll", Operation::Describe, idx, 0).has_value());
-    idx.onDropped(0);
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payments", Operation::Describe, idx, 0).has_value())
-        << "a dropped name is unknown again";
-    EXPECT_TRUE(rg::authorizeTopicOrViewName(viewOnly, "orders", Operation::Describe, idx, 0).has_value());
+    const auto none      = rg::PermissionTable::compile(
+        {{g(Operation::Describe, ResourceType::Topic, PatternKind::Prefix, "x")}}, idx);
+    // #504, #505: the gateway names the kinds the grants allow under the name; it never looks at what exists.  The
+    // admin thread serves the object only if its real kind is among them.
+    for (const char* name : {"payments", "payboard", "payroll", "paymissing"}) {
+        EXPECT_EQ(rg::allowedKindsForName(viewOnly, name, Operation::Describe, 0), rg::kKindView) << name;
+        EXPECT_EQ(rg::allowedKindsForName(topicOnly, name, Operation::Describe, 0), rg::kKindTopic) << name;
+        EXPECT_EQ(rg::allowedKindsForName(none, name, Operation::Describe, 0), 0) << name;
+    }
+    const auto both = rg::PermissionTable::compile(
+        {{g(Operation::Describe, ResourceType::Topic, PatternKind::Prefix, "pay"),
+          g(Operation::Describe, ResourceType::View, PatternKind::Prefix, "pay")}}, idx);
+    EXPECT_EQ(rg::allowedKindsForName(both, "payments", Operation::Describe, 0), rg::kKindAll);
+    EXPECT_EQ(rg::allowedKindsForName(viewOnly, "orders", Operation::Describe, 0), 0);
+    EXPECT_EQ(rg::allowedKindsForName(viewOnly, "payments", Operation::Import, 0), 0);
 }
 
 // #211: hasAnyGrant(type, op) - any literal, prefixed or wildcard grant of `op` ON that type, kept at compile time
@@ -422,7 +504,7 @@ TEST(PermissionTableRegression, HasAnyGrantCountsEveryPatternOfThatTypeAndOpRegr
     const auto d = rg::authorizeAnyGrant(none, ResourceType::Topic, Operation::Write);
     ASSERT_TRUE(d.has_value());
     EXPECT_EQ(d->code, 45);
-    EXPECT_EQ(d->detail, "not authorized: WRITE on any TOPIC");
+    EXPECT_EQ(d->detail(), "not authorized: WRITE on any TOPIC");
     const auto w = rg::PermissionTable::compile(std::vector<rs::GrantSpec>{g(Operation::Write, ResourceType::Topic, PatternKind::Prefix, "x")}, idx);
     EXPECT_FALSE(rg::authorizeAnyGrant(w, ResourceType::Topic, Operation::Write).has_value());
 }
@@ -543,7 +625,7 @@ TEST(CheckedWritesImportGrantRegression, TheOpMaskEntryPointsNeverAuthorizeImpor
         const auto t = rg::PermissionTable::compile(grants, idx);
         EXPECT_TRUE(rg::authorizeTopicId(t, 3, Operation::Import, idx).has_value());
         EXPECT_TRUE(rg::authorizeName(t, ResourceType::Topic, "user", Operation::Import, 0).has_value());
-        EXPECT_TRUE(rg::authorizeTopicOrViewName(t, "user", Operation::Import, idx, 0).has_value());
+        EXPECT_EQ(rg::allowedKindsForName(t, "user", Operation::Import, 0), 0);
         EXPECT_TRUE(rg::authorizeCluster(t, Operation::Import).has_value());
         EXPECT_TRUE(rg::authorizeAnyGrant(t, ResourceType::Topic, Operation::Import).has_value());
     }

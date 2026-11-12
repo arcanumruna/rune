@@ -255,6 +255,21 @@ struct DdlMeta {
     int64_t                                    sessionId = 0;
     rune::protocol::RequestId                  requestId{};
     std::optional<rune::catalog::ReplayedFrom> replayedFrom;   // set only by `rune catalog replay` (spec §7)
+    /// Issues #218 / #67: the SecurityView applied offset the gateway authorized this request against; stamped only
+    /// when the gateway enforces authorization.  The admin thread appends only while its own applied `__security`
+    /// offset is still exactly this one (else it answers the retriable NotLeader and the retry is authorized afresh).
+    bool                                       securityStamped = false;
+    int64_t                                    securityOffset  = -1;
+    /// The authenticated user's namespace id, and where the LOCAL user name starts in `authenticated` (0 for the bare
+    /// default-namespace form, else the length of the `<ns NAME>/` or `#<nsId>/` prefix): the key the admin thread's
+    /// per-principal fence looks the user up by.  Gateway-set; never parsed back out of the string.
+    uint32_t                                   callerNsId           = 0;
+    uint16_t                                   authenticatedLocalAt = 0;
+    /// Issue #217: what the session may DESCRIBE (rune::gateway::kKindTopic / kKindView of the request's own target
+    /// name, kDescribeCatalog = DESCRIBE ON CLUSTER).  The admin thread gives the full answer about a colliding object
+    /// only when the gateway said the caller may describe it.  0xFF = everything (in-process callers, the reaper,
+    /// no-auth).
+    uint8_t                                    describeMask         = 0xFF;
     bool operator==(const DdlMeta&) const = default;
 };
 
@@ -480,6 +495,8 @@ struct GetSchemaMsg {
     std::string name;
     uint64_t    requestedFingerprint = 0;
     uint32_t    nsId = 0;   // namespaces Task 7: the namespace the name resolves in (0 = default)
+    // #504, #505: the kKindTopic (1) / kKindView (2) bits the session may describe; 3 = both (in-process callers).
+    uint8_t     allowedKinds = 3;
 };
 
 
@@ -636,6 +653,11 @@ void layoutMeta(W& w, const DdlMeta& m) {
         w.i64(m.replayedFrom->offset);
         w.str16(m.replayedFrom->principal);
     }
+    w.u8(m.securityStamped ? 1 : 0);   // issues #218 / #67
+    w.i64(m.securityOffset);
+    w.u32(m.callerNsId);
+    w.u16(m.authenticatedLocalAt);
+    w.u8(m.describeMask);   // issue #217
 }
 inline void readMeta(Reader& r, DdlMeta& m) {
     r.str32(m.statement);
@@ -654,6 +676,17 @@ inline void readMeta(Reader& r, DdlMeta& m) {
         r.str16(from.principal);
         m.replayedFrom = std::move(from);
     }
+    const uint8_t stamped = r.u8();
+    if (stamped > 1) { r.fail("a securityStamped flag other than 0/1"); return; }   // never cast
+    m.securityStamped = stamped == 1;
+    m.securityOffset  = r.i64();
+    m.callerNsId           = r.u32();
+    m.authenticatedLocalAt = r.u16();
+    if (m.authenticatedLocalAt > m.authenticated.size()) {
+        r.fail("an authenticatedLocalAt beyond the authenticated name");   // never trusted
+        return;
+    }
+    m.describeMask = r.u8();   // issue #217: any byte is a mask (unknown bits grant nothing: only bits 0-2 are read)
 }
 
 template <class W>
@@ -1147,10 +1180,10 @@ struct CatalogReadResumeMsg { int64_t session = 0; int64_t subscriptionId = 0; }
 
 // ---- GetSchema ----
 // Wire layout: session:i64, corr:i64, requestedFingerprint:u64 (0=latest),
-// nameLen:u16 + name bytes.
+// nameLen:u16 + name bytes, nsId:u32, allowedKinds:u8 (absent = 3, both kinds).
 inline bool encodeGetSchema(OneToOneByteRing& ring, const GetSchemaMsg& m) {
     using namespace admin_wire;
-    const std::size_t len = 8 + 8 + 8 + 2 + m.name.size() + 4;
+    const std::size_t len = 8 + 8 + 8 + 2 + m.name.size() + 4 + 1;
     const auto idx = ring.tryClaim(kMsgGetSchema, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
@@ -1159,7 +1192,8 @@ inline bool encodeGetSchema(OneToOneByteRing& ring, const GetSchemaMsg& m) {
     putI64(p, static_cast<int64_t>(m.requestedFingerprint)); p += 8;
     putU16(p, static_cast<uint16_t>(m.name.size())); p += 2;
     std::memcpy(p, m.name.data(), m.name.size()); p += m.name.size();
-    putU32(p, m.nsId);
+    putU32(p, m.nsId); p += 4;
+    *p = m.allowedKinds;
     ring.commit(idx);
     return true;
 }
@@ -1175,6 +1209,7 @@ inline GetSchemaMsg decodeGetSchema(const uint8_t* buf, std::size_t len) {
     if (26 + static_cast<std::size_t>(nl) <= len)
         m.name.assign(reinterpret_cast<const char*>(buf + 26), nl);
     if (26 + static_cast<std::size_t>(nl) + 4 <= len) m.nsId = getU32(buf + 26 + nl);
+    if (26 + static_cast<std::size_t>(nl) + 4 + 1 <= len) m.allowedKinds = buf[26 + nl + 4];
     return m;
 }
 
@@ -1965,8 +2000,10 @@ template <typename Write>
 // the request's (it gains the four lease system columns, and an RCD1 blob is re-serialized); that growth is not bounded
 // here but by the append-time catalogEventEffectsRefusal.  The static_assert below keeps >= 128 bytes of margin for the
 // four columns (4 x ~30 B) under the SchemaUpdate bound.
-// statement(4) + clientName(2) + sourceAddress(2) + authenticated(2, auth Task 10) + sessionId + requestId hi/lo + flag.
-inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 1;
+// statement(4) + clientName(2) + sourceAddress(2) + authenticated(2, auth Task 10) + sessionId + requestId hi/lo + flag
+// + the security stamp (flag + offset, issues #218 / #67) + callerNsId(4) + authenticatedLocalAt(2)
+// + describeMask(1, issue #217).
+inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 1 + 1 + 8 + 4 + 2 + 1;
 // The trailing adoptDenial length prefix (2, issue #129), the nsId (4, namespaces), then the
 // key features (checked writes Part 05).
 inline constexpr std::size_t kDefineTopicFixedBytes =

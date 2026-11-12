@@ -66,33 +66,46 @@ constexpr int32_t kSelf = 1;
 struct CountingAdminSink final : IAdminRequestSink {
     std::size_t submits = 0;
     std::size_t gets    = 0;
+    uint8_t lastKinds   = 0;
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool,
                                   const uint8_t*, uint32_t, uint8_t, int16_t, const rune::protocol::TopicConfigView&,
-                                  const DdlMetaView&, std::string_view, const rune::protocol::TopicKeyFeatures&,
+                                  const DdlMetaView& meta, std::string_view, const rune::protocol::TopicKeyFeatures&,
                                   const std::optional<rune::protocol::LeaseSpec>& lease) override {
-        ++submits; lastLease = lease; return AdminSubmit::Accepted;
+        ++submits; lastLease = lease; masks.push_back(meta.describeMask); return AdminSubmit::Accepted;
     }
+    std::vector<uint8_t> masks;   // #217: the describeMask of every catalog DDL that reached the sink, in order
     std::optional<rune::protocol::LeaseSpec> lastLease;   // the lease argument of the last DefineTopic
-    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t) override { ++gets; return true; }
+    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t, uint8_t kinds) override {
+        ++gets; lastKinds = kinds; return true;
+    }
     AdminSubmit submitAlterTopic(int64_t, int64_t, std::string_view, uint16_t, const uint8_t*, uint32_t,
-                                 const DdlMetaView&) override { ++submits; return AdminSubmit::Accepted; }
+                                 const DdlMetaView& meta) override {
+        ++submits; masks.push_back(meta.describeMask); return AdminSubmit::Accepted;
+    }
     AdminSubmit submitCreateView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, const uint8_t*,
-                                 uint32_t, const DdlMetaView&) override { ++submits; return AdminSubmit::Accepted; }
+                                 uint32_t, const DdlMetaView& meta) override {
+        ++submits; masks.push_back(meta.describeMask); return AdminSubmit::Accepted;
+    }
     std::string lastAuthenticated;   // #652: the audit principal of the last DropTopic (copied: the view is transient)
     uint32_t    lastCallerNsId = 0;
+    uint16_t    lastLocalAt = 0;   // #218 / #67: where the local user name starts in `authenticated`
     AdminSubmit submitDropTopic(int64_t, int64_t, std::string_view, const DdlMetaView& meta) override {
         lastAuthenticated = std::string(meta.authenticated);
         lastCallerNsId    = meta.callerNsId;
+        lastLocalAt       = meta.authenticatedLocalAt;
+        masks.push_back(meta.describeMask);
         ++submits; return AdminSubmit::Accepted;
     }
     AdminSubmit submitAlterTopicConfig(int64_t, int64_t, std::string_view, uint32_t, std::span<const uint8_t>,
-                                       const DdlMetaView&) override { ++submits; return AdminSubmit::Accepted; }
-    AdminSubmit submitDropView(int64_t, int64_t, std::string_view, const DdlMetaView&) override {
-        ++submits; return AdminSubmit::Accepted;
+                                       const DdlMetaView& meta) override {
+        ++submits; masks.push_back(meta.describeMask); return AdminSubmit::Accepted;
+    }
+    AdminSubmit submitDropView(int64_t, int64_t, std::string_view, const DdlMetaView& meta) override {
+        ++submits; masks.push_back(meta.describeMask); return AdminSubmit::Accepted;
     }
     AdminSubmit submitAlterView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, uint32_t,
-                                const uint8_t*, uint32_t, const DdlMetaView&) override {
-        ++submits; return AdminSubmit::Accepted;
+                                const uint8_t*, uint32_t, const DdlMetaView& meta) override {
+        ++submits; masks.push_back(meta.describeMask); return AdminSubmit::Accepted;
     }
     // Task 12: catalog reads.  `ringFull` makes every catalog submit refuse (back-pressure).
     struct CatalogSub { int64_t session, corr, from; };
@@ -117,7 +130,12 @@ struct CountingAdminSink final : IAdminRequestSink {
     AdminSubmit submitNamespaceDdl(const pc::NamespaceDdlRequest&, const DdlMetaView&, std::string_view, uint16_t) override { return AdminSubmit::Accepted; }
     AdminSubmit submitListNamespaces(int64_t, int64_t, uint32_t, uint16_t, uint32_t, bool) override { return AdminSubmit::Accepted; }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { return AdminSubmit::Accepted; }
-    bool submitSecuritySubscribe(int64_t, int64_t, int64_t) override { return true; }
+    std::vector<CatalogSub> securitySubs;   // issue #200
+    bool submitSecuritySubscribe(int64_t s, int64_t c, int64_t from) override {
+        if (ringFull) return false;
+        securitySubs.push_back({s, c, from});
+        return true;
+    }
     std::vector<CatalogUnsub> securityUnsubs;
     bool submitSecurityUnsubscribe(int64_t s, int64_t id) override {
         if (ringFull) return false;
@@ -959,6 +977,7 @@ TEST(AuthLiveChangeRegression, SecurityReadEndNeverDroppedUnderAdminRingPressure
 // admin can apply and stream a REVOKE and the CREATE USER after it before this thread applies the REVOKE).  RED before
 // the fix: every frame was offered (the admin processing the end was the only stop).
 namespace {
+int64_t gHoldUntil = 0;   // #444: the out-parameter of admitAdminLogFrame, where a test does not look at it
 std::vector<uint8_t> securityRecordsFrame(int64_t sid, int64_t subId, int64_t eventOffset, bool control = false) {
     rune::protocol::RecordBatchBuilder b(eventOffset, 0);
     b.setControl(control);
@@ -993,24 +1012,25 @@ TEST(AuthLiveChangeRegression, AdminLogFramesNeedTheReadersGrantAtSendTimeRegres
     const auto ctrl0  = securityRecordsFrame(g.sid, secSub, 0, /*control=*/true);
 
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", clusterTable({rune::security::Operation::Admin}), {}});
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, event0.data(), event0.size()), A::Hold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, event0.data(), event0.size(), gHoldUntil), A::Hold)
         << "an event this broker has not applied yet waits (it may follow a revoke of this very reader)";
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size()), A::Deliver)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size(), gHoldUntil), A::Deliver)
         << "a control batch is no event (the applier never mirrors it): never held";
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size()), A::Deliver)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size(), gHoldUntil), A::Deliver)
         << "ADMIN ON CLUSTER is root: it holds DESCRIBE ON CLUSTER, so the catalog streams";
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", clusterTable({rune::security::Operation::Create}), {}});
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size()), A::Withhold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size(), gHoldUntil), A::Withhold)
         << "CREATE ON CLUSTER does not give DESCRIBE ON CLUSTER";
 
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", clusterTable({rune::security::Operation::Describe}), {}});
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size()), A::Withhold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size(), gHoldUntil), A::Withhold)
         << "lost ADMIN: no __security frame, whatever the admin thread still streams";
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size()), A::Deliver);
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size(), gHoldUntil), A::Deliver);
     EXPECT_GE(g.gw.adminLogFramesWithheld(), 1u);
 
     g.gw.setAuthMode(GatewayAuthMode::InProcess, nullptr);
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, event0.data(), event0.size()), A::Deliver) << "dev / in-process";
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, event0.data(), event0.size(), gHoldUntil), A::Deliver)
+        << "dev / in-process";
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1071,13 +1091,36 @@ TEST(AuthLiveChangeAdversarialRegression, ACoalescedSecurityFrameWaitsForItsNewe
     const auto tailAhead = securityFrameOf(g.sid, kSecSub, {{1, 1}, {2, 2}});          // events 1, 2..3: 3 not applied
     const auto inBatch   = securityFrameOf(g.sid, kSecSub, {{2, 3}});                  // one batch 2..4
     const auto ctrlTail  = securityFrameOf(g.sid, kSecSub, {{2, 1}, {3, 1}}, {false, true});   // event 2 + control 3
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, applied.data(), applied.size()), A::Deliver);
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, tailAhead.data(), tailAhead.size()), A::Hold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, applied.data(), applied.size(), gHoldUntil), A::Deliver);
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, tailAhead.data(), tailAhead.size(), gHoldUntil), A::Hold)
         << "a later batch of the same frame is ahead of this broker's mirror";
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, inBatch.data(), inBatch.size()), A::Hold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, inBatch.data(), inBatch.size(), gHoldUntil), A::Hold)
         << "the LAST record of a multi-record batch counts, not its base offset";
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ctrlTail.data(), ctrlTail.size()), A::Deliver)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ctrlTail.data(), ctrlTail.size(), gHoldUntil), A::Deliver)
         << "a control batch is no event";
+}
+
+// Issue #444: a Hold names what it waits for - the frame's newest event - and adminLogHoldReleased turns true exactly
+// when the mirror has applied it (or the view halted: the re-read frame is then Withheld, never delivered).
+TEST(AuthLiveChangeAdversarialRegression, AHoldNamesTheEventItWaitsForAndIsReleasedByTheMirrorRegression) {
+    using A = ClientGateway::AdminLogAdmit;
+    GatewayRig g;
+    auto view = viewApplied(3);   // applied: 0..2
+    g.gw.setAuthMode(GatewayAuthMode::Required, &view);
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", adminTable(), {}});
+    const auto inBatch = securityFrameOf(g.sid, kSecSub, {{2, 3}});   // one batch 2..4
+    int64_t until = -2;
+    ASSERT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, inBatch.data(), inBatch.size(), until), A::Hold);
+    EXPECT_EQ(until, 4) << "the frame's newest event";
+    EXPECT_FALSE(g.gw.adminLogHoldReleased(until)) << "the mirror is at 2";
+    EXPECT_TRUE(g.gw.adminLogHoldReleased(2));
+    g.gw.setSecurityBehind(true);
+    until = -2;
+    ASSERT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, inBatch.data(), inBatch.size(), until), A::Hold);
+    EXPECT_EQ(until, -1) << "behind: no event to wait for";
+    EXPECT_FALSE(g.gw.adminLogHoldReleased(-1)) << "released only once the view is not behind";
+    g.gw.setSecurityBehind(false);
+    EXPECT_TRUE(g.gw.adminLogHoldReleased(-1));
 }
 
 // Precedence and fail-closed states: a reader that lost the grant is Withheld (never merely Held, which would re-offer
@@ -1089,19 +1132,19 @@ TEST(AuthLiveChangeAdversarialRegression, LostGrantHaltedMirrorAndUnauthenticate
     g.gw.setAuthMode(GatewayAuthMode::Required, &view);
     const auto ahead = securityFrameOf(g.sid, kSecSub, {{5, 1}});
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", rune::gateway::PermissionTable::denyAll(), {}});
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size()), A::Withhold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size(), gHoldUntil), A::Withhold)
         << "no grant: withheld even while the event is ahead of the mirror";
     for (const rune::gateway::SessionAuth st : {rune::gateway::SessionAuth{AuthAnonymous{}},
                                                rune::gateway::SessionAuth{AuthPasswordChangeRequired{1, "ops", {}}},
                                                rune::gateway::SessionAuth{AuthAwaitingFirst{INT64_MAX}}}) {
         g.gw.setSessionAuthForTest(g.sid, st);
-        EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size()), A::Withhold);
-        EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kCatSub, ahead.data(), ahead.size()), A::Withhold);
+        EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size(), gHoldUntil), A::Withhold);
+        EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kCatSub, ahead.data(), ahead.size(), gHoldUntil), A::Withhold);
     }
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", adminTable(), {}});
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size()), A::Hold);
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size(), gHoldUntil), A::Hold);
     view.onHalted(rune::security::ApplyError{});
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size()), A::Withhold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, ahead.data(), ahead.size(), gHoldUntil), A::Withhold)
         << "a halted mirror never applies the event: withheld, never held forever";
 }
 
@@ -1116,13 +1159,13 @@ TEST(AuthLiveChangeAdversarialRegression, ASecurityFrameTruncatedAtEveryOffsetIs
     const auto full = securityFrameOf(g.sid, kSecSub, {{0, 2}, {2, 1}});
     for (std::size_t len = 0; len <= full.size(); ++len) {
         std::vector<uint8_t> cut(full.begin(), full.begin() + static_cast<std::ptrdiff_t>(len));   // exact-size buffer
-        (void)g.gw.admitAdminLogFrame(g.sid, kSecSub, cut.data(), cut.size());
+        (void)g.gw.admitAdminLogFrame(g.sid, kSecSub, cut.data(), cut.size(), gHoldUntil);
     }
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, full.data(), full.size()), A::Hold);
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, full.data(), full.size(), gHoldUntil), A::Hold);
     auto lying = full;
     const uint32_t huge = 0xFFFFFFFFu;
     std::memcpy(lying.data() + 48, &huge, 4);
-    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, lying.data(), lying.size()), A::Hold)
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, kSecSub, lying.data(), lying.size(), gHoldUntil), A::Hold)
         << "the batch length is clamped to the frame";
 }
 
@@ -1189,7 +1232,203 @@ TEST(CatalogPrincipalRegression, UnknownNsFallsBackToNumericPrefixRegression) {
     ASSERT_EQ(g.adminSubmits(), 1u);
     EXPECT_EQ(g.admin.lastCallerNsId, kGone);
     EXPECT_EQ(g.admin.lastAuthenticated, "#7/ops") << "an unknown namespace id is spelled #<nsId>";
+    // #218 / #67: the admin thread's per-principal fence reads the user by (callerNsId, the part of `authenticated`
+    // from authenticatedLocalAt).
+    EXPECT_EQ(g.admin.lastLocalAt, 3u);
+    EXPECT_EQ(g.admin.lastAuthenticated.substr(g.admin.lastLocalAt), "ops");
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", PermissionTable::allowAll(), {}, 0});
     EXPECT_FALSE(g.sendDdl(pc::TemplateId::DropTopic).answered);
     EXPECT_EQ(g.admin.lastAuthenticated, "ops") << "default stays bare";
+    EXPECT_EQ(g.admin.lastCallerNsId, 0u);
+    EXPECT_EQ(g.admin.lastLocalAt, 0u) << "the bare form: the local name starts at 0";
+    EXPECT_EQ(g.admin.lastAuthenticated.substr(g.admin.lastLocalAt), "ops");
+}
+
+// ── Issue #200: the session's list of admin-log reads holds exactly the reads that are pending or live ──────────
+namespace {
+constexpr int64_t kCatBase = rune::gateway::kCatalogSubscriptionIdBase | (int64_t{2} << 40);
+constexpr int64_t kSecBase = rune::gateway::kCatalogSubscriptionIdBase | rune::gateway::kSecuritySubscriptionIdBit |
+                             (int64_t{2} << 40);
+constexpr auto kNotAuthorized = static_cast<int16_t>(pc::ErrorCode::NotAuthorized);
+constexpr auto kInvalidRequest = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+
+void adminSubscribe(GatewayRig& g, bool security, int64_t corr) {
+    pc::Subscribe s;
+    s.sessionId = g.sid; s.correlationId = corr; s.topicId = security ? pc::kSecurityTopicId : pc::kCatalogTopicId;
+    s.partition = 0; s.partitionKnown = 1; s.fromOffset = -2; s.isolation = 0;
+    std::vector<uint8_t> buf(s.encodedSize());
+    buf.resize(s.encode(buf.data()));
+    g.gw.applySubscribeForTest(buf.data(), buf.size());
+}
+/// The read server's SubscribeResponse (code 0 = accepted, carrying `subId`) as the control thread's sink sees it.
+void serverAnswersSubscribe(GatewayRig& g, int64_t corr, int16_t code, int64_t subId) {
+    pc::SubscribeResponse r;
+    r.sessionId = g.sid; r.correlationId = corr; r.errorCode = code; r.partition = 0; r.subscriptionId = subId;
+    std::array<uint8_t, 256> buf{};
+    g.gw.noteAdminLogAnswer(g.sid, buf.data(), r.encode(buf.data()));
+}
+/// The read server ending the subscription of `corr` (ErrorResponse on its Subscribe's correlation id).
+void serverEndsRead(GatewayRig& g, int64_t corr) {
+    pc::ErrorResponse e;
+    e.sessionId = g.sid; e.correlationId = corr; e.code = kNotAuthorized;
+    std::array<uint8_t, 256> buf{};
+    g.gw.noteAdminLogAnswer(g.sid, buf.data(), e.encode(buf.data()));
+}
+void revokeReads(GatewayRig& g, bool security) {
+    rune::gateway::LiveActions a;
+    (security ? a.endSecurityReads : a.endCatalogReads) = true;
+    g.gw.executeLiveActionsForTest(g.sid, a);
+}
+std::size_t answersOn(const GatewayRig& g, int64_t corr, int16_t code = -1) {
+    std::size_t n = 0;
+    for (const auto& e : g.errors) n += e.correlationId == corr && (code < 0 || e.code == code) ? 1 : 0;
+    return n;
+}
+
+void aLiveReadKeepsItsAnswer(bool security) {
+    GatewayRig g;
+    const int64_t base = security ? kSecBase : kCatBase;
+    adminSubscribe(g, security, 1);
+    serverAnswersSubscribe(g, 1, 0, base | 1);
+    for (int64_t i = 0; i < 300; ++i) {
+        adminSubscribe(g, security, 1000 + i);
+        serverAnswersSubscribe(g, 1000 + i, 0, base | (2 + i));
+        unsubscribe(g, base | (2 + i));
+    }
+    revokeReads(g, security);
+    EXPECT_EQ(answersOn(g, 1, kNotAuthorized), 1u) << "the first, still live read is answered on its own corr";
+    EXPECT_EQ(std::count_if(g.errors.begin(), g.errors.end(),
+                            [](const pc::ErrorResponse& e) { return e.code == kNotAuthorized; }), 1)
+        << "the 300 ended reads are forgotten: exactly one answer";
+}
+}  // namespace
+
+TEST(LiveSecurityChangesRegression, ALiveReadKeepsItsAnswerAfterManyEndedReadsRegression) {
+    aLiveReadKeepsItsAnswer(/*security=*/false);
+}
+
+TEST(LiveSecurityChangesRegression, ALiveSecurityReadKeepsItsAnswerAfterManyEndedReadsRegression) {
+    aLiveReadKeepsItsAnswer(/*security=*/true);
+}
+
+TEST(LiveSecurityChangesRegression, ARefusedSubscribeIsForgottenRegression) {
+    GatewayRig g;
+    adminSubscribe(g, false, 5);
+    serverAnswersSubscribe(g, 5, static_cast<int16_t>(pc::ErrorCode::Internal), 0);
+    revokeReads(g, false);
+    EXPECT_EQ(answersOn(g, 5), 0u);
+}
+
+TEST(LiveSecurityChangesRegression, AReadEndedByTheServerIsForgottenRegression) {
+    GatewayRig g;
+    adminSubscribe(g, false, 6);
+    serverAnswersSubscribe(g, 6, 0, kCatBase | 1);
+    serverEndsRead(g, 6);
+    revokeReads(g, false);
+    EXPECT_EQ(answersOn(g, 6), 0u) << "the server's own end already answered it";
+}
+
+TEST(LiveSecurityChangesRegression, ACorrLiveOnOneLogIsRefusedOnTheOtherRegression) {
+    GatewayRig g;
+    adminSubscribe(g, false, 7);
+    serverAnswersSubscribe(g, 7, 0, kCatBase | 1);
+    adminSubscribe(g, true, 7);
+    EXPECT_EQ(answersOn(g, 7, kInvalidRequest), 1u);
+    EXPECT_TRUE(g.admin.securitySubs.empty()) << "not forwarded";
+    EXPECT_EQ(g.gw.adminReadsRefusedDuplicateCorr(), 1u);
+    g.ddlAnswers.clear();   // the rig allows one answer per corr; the refusal and the revoke share corr 7
+    revokeReads(g, false);
+    EXPECT_EQ(answersOn(g, 7, kNotAuthorized), 1u) << "the catalog read is still listed";
+    // Once the catalog read is unsubscribed its corr is free for the other log.
+    adminSubscribe(g, false, 8);
+    serverAnswersSubscribe(g, 8, 0, kCatBase | 2);
+    adminSubscribe(g, true, 8);
+    EXPECT_TRUE(g.admin.securitySubs.empty());
+    unsubscribe(g, kCatBase | 2);
+    adminSubscribe(g, true, 8);
+    ASSERT_EQ(g.admin.securitySubs.size(), 1u);
+    EXPECT_EQ(g.admin.securitySubs[0].corr, 8);
+    EXPECT_EQ(g.gw.adminReadsRefusedDuplicateCorr(), 2u);
+}
+
+TEST(LiveSecurityChangesRegression, SubscribesBeyondTheCapAreAnsweredRetriableRegression) {
+    GatewayRig g;
+    for (int64_t c = 1; c <= 128; ++c) adminSubscribe(g, false, c);
+    EXPECT_EQ(g.admin.catalogSubs.size(), 128u);
+    adminSubscribe(g, false, 129);
+    EXPECT_EQ(answersOn(g, 129, kNotLeader), 1u);
+    EXPECT_EQ(g.admin.catalogSubs.size(), 128u) << "not forwarded";
+    EXPECT_EQ(g.gw.catalogSubscribesForwarded(), 128u);
+    EXPECT_EQ(g.gw.adminReadsRefusedAtCap(), 1u);
+    adminSubscribe(g, false, 5);   // a retransmitted Subscribe of a listed corr is not a new read
+    EXPECT_EQ(g.admin.catalogSubs.size(), 129u);
+    serverAnswersSubscribe(g, 1, static_cast<int16_t>(pc::ErrorCode::Internal), 0);
+    adminSubscribe(g, false, 130);
+    EXPECT_EQ(g.admin.catalogSubs.size(), 130u) << "room again after one server answer";
+    EXPECT_EQ(g.admin.catalogSubs.back().corr, 130);
+}
+
+TEST(LiveSecurityChangesRegression, ARevokedSessionAnswersEveryLiveAdminReadRegression) {
+    GatewayRig g;
+    adminSubscribe(g, false, 21);
+    serverAnswersSubscribe(g, 21, 0, kCatBase | 1);
+    adminSubscribe(g, false, 22);
+    serverAnswersSubscribe(g, 22, 0, kCatBase | 2);
+    adminSubscribe(g, true, 23);
+    serverAnswersSubscribe(g, 23, 0, kSecBase | 1);
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "u", PermissionTable::allowAll()});
+    g.gw.revokeAllSessionsForTest("test");
+    for (const int64_t c : {21, 22, 23}) EXPECT_EQ(answersOn(g, c), 1u) << c;
+}
+
+// ── Issue #217: the gateway tells the admin thread what the session may DESCRIBE under the request's own name ──────
+namespace {
+rune::gateway::PermissionTable tableOf(std::vector<rune::security::GrantSpec> g) {
+    std::sort(g.begin(), g.end());
+    return rune::gateway::PermissionTable::compile(g, rune::gateway::ObjectIndex{});
+}
+rune::security::GrantSpec grantOn(rune::security::Operation op, rune::security::ResourceType t, const char* name) {
+    return {op, rune::security::ResourcePattern{t, rune::security::PatternKind::Exact, name}};
+}
+}  // namespace
+
+TEST(CatalogDescribeMaskRegression, TheGatewayStampsTheDescribeMaskOfTheRequestsOwnNameRegression) {
+    using rune::security::Operation;
+    using rune::security::ResourceType;
+    namespace rg = rune::gateway;
+    GatewayRig g;
+    g.gateway().setCatalogRoute(rune::gateway::RouteLocalLeader{});
+    const auto send = [&](pc::TemplateId t, rune::gateway::PermissionTable table) -> std::optional<uint8_t> {
+        g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", std::move(table), {}});
+        const std::size_t before = g.admin.masks.size();
+        (void)g.sendDdl(t);
+        return g.admin.masks.size() == before + 1 ? std::optional<uint8_t>(g.admin.masks.back()) : std::nullopt;
+    };
+    const auto topicOnly = [] {
+        return tableOf({grantOn(Operation::Create, ResourceType::Topic, "t"),
+                        grantOn(Operation::Alter, ResourceType::Topic, "t"),
+                        grantOn(Operation::Drop, ResourceType::Topic, "t")});
+    };
+    const auto viewOnly = [] {
+        return tableOf({grantOn(Operation::Drop, ResourceType::View, "v")});
+    };
+    // The grants' own kind: TOPIC grants on "t" describe the topic kind only.
+    EXPECT_EQ(send(pc::TemplateId::DefineTopic, topicOnly()), rg::kKindTopic);
+    EXPECT_EQ(send(pc::TemplateId::AlterTopic, topicOnly()), rg::kKindTopic);
+    EXPECT_EQ(send(pc::TemplateId::DropTopic, topicOnly()), rg::kKindTopic);
+    EXPECT_EQ(send(pc::TemplateId::AlterTopicConfig, topicOnly()), rg::kKindTopic);
+    EXPECT_EQ(send(pc::TemplateId::DropView, viewOnly()), rg::kKindView);
+    // A cluster DESCRIBE adds the catalog bit; CREATE ON CLUSTER alone reaches every name as both kinds, no catalog
+    // bit.
+    const rune::security::GrantSpec clusterDescribe{
+        Operation::Describe,
+        rune::security::ResourcePattern{ResourceType::Cluster, rune::security::PatternKind::Exact, ""}};
+    EXPECT_EQ(send(pc::TemplateId::DefineTopic,
+                   tableOf({grantOn(Operation::Create, ResourceType::Topic, "t"), clusterDescribe})),
+              rg::kKindAll | rg::kDescribeCatalog);
+    EXPECT_EQ(send(pc::TemplateId::AlterTopic, clusterTable({Operation::Alter})), rg::kKindAll);
+    // A name outside the grants' reach (the DDL is refused before it reaches the sink: nothing is stamped).
+    EXPECT_EQ(send(pc::TemplateId::DropTopic, viewOnly()), std::nullopt);
+    // Dev / in-process: allow-all describes everything, catalog included.
+    EXPECT_EQ(send(pc::TemplateId::DefineTopic, PermissionTable::allowAll()), 7);
 }

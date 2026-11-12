@@ -101,6 +101,11 @@ struct ApplyError {
     uint64_t    expected = 0;    // FingerprintMismatch: the event's fingerprint
     uint64_t    actual   = 0;    // FingerprintMismatch: the recomputed one
     std::string detail;
+    /// Issue #217: non-empty when `detail` names an existing object OTHER than the event's own (a view that reads the
+    /// dropped topic, the live name a new one case-folds onto): the same text without that name, for a caller who may
+    /// not read the whole catalog.  Empty = `detail` names no other object.  Never serialized, never hashed (an
+    /// ApplyError is only ever an in-memory answer).
+    std::string redactedDetail;
 };
 
 /// The largest segment roll size a topic may set: segment positions are 32-bit, less one

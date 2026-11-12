@@ -42,8 +42,9 @@ std::string LogSegment::fname(std::string dir, int64_t base, const char* ext) {
 // ---------------------------------------------------------------------------
 std::unique_ptr<LogSegment> LogSegment::openPrebuilt(
     const std::string& dir, int64_t base, const std::string& logFile, const std::string& indexFile,
-    int64_t nextOffset, int32_t indexIntervalBytes, int32_t indexMaxBytes) {
+    int64_t nextOffset, int32_t indexIntervalBytes, int32_t indexMaxBytes, unsigned fileMode) {
     auto seg = std::unique_ptr<LogSegment>(new LogSegment());
+    seg->fileMode_           = fileMode;
     seg->baseOffset_         = base;
     seg->indexIntervalBytes_ = indexIntervalBytes;
     seg->indexMaxBytes_      = indexMaxBytes;
@@ -51,10 +52,10 @@ std::unique_ptr<LogSegment> LogSegment::openPrebuilt(
     seg->durableNext_        = base;
     // D20: the raw fd is the segment's ONLY handle on its .log (no FILE*/fstream —
     // glibc's fclose walks the process-wide FILE list: O(open segments)).
-    seg->fd_ = ::open(logFile.c_str(), O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    seg->fd_ = ::open(logFile.c_str(), O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, fileMode);
     if (seg->fd_ < 0)
         throw std::system_error(errno, std::system_category(), "LogSegment::openPrebuilt: open " + logFile);
-    seg->index_ = std::make_unique<OffsetIndex>(indexFile, base, indexMaxBytes);
+    seg->index_ = std::make_unique<OffsetIndex>(indexFile, base, indexMaxBytes, false, fileMode);
     if (const int e = seg->openTrusted(nextOffset); e != 0)
         throw std::system_error(e, std::system_category(), "LogSegment::openPrebuilt: fstat " + logFile);
     seg->logPath_ = fname(dir, base, ".log");   // the name it will have once installed
@@ -63,13 +64,15 @@ std::unique_ptr<LogSegment> LogSegment::openPrebuilt(
 
 std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     const std::string& stagingLogPath, const std::string& stagingIndexPath,
-    int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes, std::size_t readMapBytes) {
+    int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes, std::size_t readMapBytes,
+    unsigned fileMode) {
     // Construct at provisional base 0.  All the expensive syscalls (1 open() for
     // the .log fd, 1 open() + ftruncate + mmap + prefault for the .index)
     // happen HERE, on the background thread.  The staging files use non-.log/.index
     // extensions (invisible to segment/retention scans); the adopt-time rename
     // gives them their final <base>.log/.index names.
     auto seg = std::unique_ptr<LogSegment>(new LogSegment());
+    seg->fileMode_          = fileMode;
     seg->baseOffset_        = 0;
     seg->indexIntervalBytes_= indexIntervalBytes;
     seg->indexMaxBytes_     = indexMaxBytes;
@@ -81,7 +84,7 @@ std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     seg->logPath_.reserve(stagingLogPath.size() + 32);
     seg->logPath_           = stagingLogPath;
     const std::string& idxPath = stagingIndexPath;
-    seg->fd_ = ::open(seg->logPath_.c_str(), O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    seg->fd_ = ::open(seg->logPath_.c_str(), O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, fileMode);
     // F3 fix-round-1, item 2: an unchecked open() failure used to leave fd_ at
     // -1 and silently continue — sync() would then silently skip the
     // fdatasync forever (fd_ < 0 is a no-op in sync()), a silent durability
@@ -95,7 +98,7 @@ std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     }
     // Right-sized index, PREFAULTED so the append/roll hot path never faults it.
     seg->index_ = std::make_unique<OffsetIndex>(idxPath, /*base*/0, indexMaxBytes,
-                                                /*prefault*/true);
+                                                /*prefault*/true, fileMode);
     // D26 (fix65 review LOW-1): no read mapping by default.  Push / fetch
     // reads pread (#65 / D26); only the cold mapped readers (RC rebuild, PSM
     // rebuild, truncation prep, the rare too-large fallback) map — so a

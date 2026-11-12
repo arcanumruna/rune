@@ -10,9 +10,17 @@ using namespace rune::node::test;
 namespace pc = rune::protocol::client;
 
 namespace {
-// One produce straight to the worker, retried while leadership / assignment settles (NotLeader, UnknownTopic).
+// Waits (bounded, the client's own pump; no sleep here) until the partition accepts produces: the replica's own gate.
+bool awaitServes(AuthRig& rig, int32_t topicId) {
+    const bool ok = rig.c().pollFor(std::chrono::seconds(10), [&] { return rig.partitionAcceptsProduce(topicId); });
+    EXPECT_TRUE(ok) << "topic " << topicId << " partition 0 does not accept produces after 10 s";
+    return ok;
+}
+// One produce straight to the worker once the partition serves.  The worker's own registry can still lag the replica's
+// gate (UnknownTopic / NotLeader), so at most `attempts` immediate re-sends, no sleep.
 // NotAuthorized (45) is final: it is the answer under test, never a transient.
-int shardProduce(AuthRig& rig, int64_t sid, int32_t topicId, int attempts = 200) {
+int shardProduce(AuthRig& rig, int64_t sid, int32_t topicId, int attempts = 3) {
+    if (!awaitServes(rig, topicId)) return kNoAnswer;
     int code = kNoAnswer;
     for (int a = 0; a < attempts; ++a) {
         const int64_t corr = rig.c().nextCorrelationId();
@@ -23,7 +31,6 @@ int shardProduce(AuthRig& rig, int64_t sid, int32_t topicId, int attempts = 200)
         if (code != static_cast<int>(pc::ErrorCode::NotLeader) && code != static_cast<int>(pc::ErrorCode::UnknownTopic) &&
             code != kNoAnswer)
             return code;
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     return code;
 }
@@ -104,7 +111,8 @@ DefineThenProduce defineThenProduce(AuthRig& rig, int64_t sid, const std::string
     // The new topic's id: the DefineTopicResponse carries it.
     out.produce = kNoAnswer;
     const int32_t id = a->topicId;
-    for (int attempt = 0; attempt < 200; ++attempt) {
+    if (!awaitServes(rig, id)) return out;
+    for (int attempt = 0; attempt < 3; ++attempt) {   // immediate re-sends only (the worker's registry can lag the gate)
         const int64_t pc2 = rig.c().nextCorrelationId();
         if (!rig.c().produce(rig.broker().workerIngressChannel(), AuthRig::stream(), sid, pc2, id, 0, 1, makeCharBatch(1))) break;
         const auto ack = rig.c().awaitProduceResponseUntil(pc2, AuthRig::dl(10));
@@ -113,7 +121,6 @@ DefineThenProduce defineThenProduce(AuthRig& rig, int64_t sid, const std::string
         if (out.produce != static_cast<int>(pc::ErrorCode::NotLeader) && out.produce != static_cast<int>(pc::ErrorCode::UnknownTopic) &&
             out.produce != kNoAnswer)
             break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     return out;
 }

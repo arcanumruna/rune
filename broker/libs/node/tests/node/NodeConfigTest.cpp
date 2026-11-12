@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <optional>
@@ -257,18 +258,20 @@ TEST(NodeConfigRegression, PerWorkerIngressWithoutShardRefusedWhenAuthEnabledReg
     auto env = legacyEnv(base1node());
     env["RUNE_PER_WORKER_INGRESS"] = "true";
     auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.config.has_value()) << "#147: the topology refusal is a parse error";
+    EXPECT_NE(r.error.find("RUNE_PER_WORKER_INGRESS"), std::string::npos) << r.error;
+
+    env["RUNE_AUTH"] = "disabled";                       // dev mode: nothing to enforce
+    r = parseNodeConfig(fakeEnv(env));
     ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_FALSE(r.config->validateAuthTopology().has_value());
+    r.config->authMode = AuthMode::Enabled;              // a programmatic config that never went through parse
     const auto err = r.config->validateAuthTopology();
     ASSERT_TRUE(err.has_value());
     EXPECT_NE(err->find("RUNE_PER_WORKER_INGRESS"), std::string::npos) << *err;
     const auto viaAuth = r.config->validateAuth();
     ASSERT_TRUE(viaAuth.has_value()) << "validateAuth (BrokerNode::start and main) carries it";
     EXPECT_NE(viaAuth->find("RUNE_PER_WORKER_INGRESS"), std::string::npos) << *viaAuth;
-
-    env["RUNE_AUTH"] = "disabled";                       // dev mode: nothing to enforce
-    r = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(r.config.has_value()) << r.error;
-    EXPECT_FALSE(r.config->validateAuthTopology().has_value());
 
     auto shard = base1node();                            // shard mode forces per-worker ingress ON and is allowed
     shard["RUNE_WORKER_MODE"] = "shard";
@@ -282,10 +285,8 @@ TEST(NodeConfigRegression, PerWorkerIngressWithoutShardRefusedWhenAuthEnabledReg
 // open every byte on the control thread).  RED: delete the peers.size() > 1 && !shardMode() refusal.
 TEST(NodeConfigRegression, NonShardMultiNodeRefusedWhenAuthEnabledRegression) {
     auto r = parseNodeConfig(fakeEnv(legacyEnv(base3node())));
-    ASSERT_TRUE(r.config.has_value()) << r.error;
-    const auto err = r.config->validateAuthTopology();
-    ASSERT_TRUE(err.has_value());
-    EXPECT_NE(err->find("RUNE_WORKER_MODE"), std::string::npos) << *err;
+    EXPECT_FALSE(r.config.has_value()) << "#147: the topology refusal is a parse error";
+    EXPECT_NE(r.error.find("RUNE_WORKER_MODE"), std::string::npos) << r.error;
 
     auto shard = base3node();
     shard["RUNE_WORKER_MODE"] = "shard";
@@ -294,7 +295,7 @@ TEST(NodeConfigRegression, NonShardMultiNodeRefusedWhenAuthEnabledRegression) {
     EXPECT_FALSE(r.config->validateAuthTopology().has_value());
 }
 
-// M4 (X082): workers <= 252 (sender id 3+w in a u8), peers <= 16, node ids <= 65535 - refused at start, not at runtime.
+// M4 (X082): workers <= 252 (sender id 3+w in a u8), peers <= 16, node ids <= 65535 - refused at parse, not at runtime.
 // RED: delete any one of the three bounds and its case below passes validation.
 TEST(NodeConfigRegression, TooManyWorkersPeersOrNodeIdRefusedWhenAuthEnabledRegression) {
     auto shard1 = []() {
@@ -310,10 +311,8 @@ TEST(NodeConfigRegression, TooManyWorkersPeersOrNodeIdRefusedWhenAuthEnabledRegr
         EXPECT_FALSE(r.config->validateAuthTopology().has_value()) << "252 workers is the supported maximum";
         e["RUNE_WORKERS"] = "253";
         r = parseNodeConfig(fakeEnv(e));
-        ASSERT_TRUE(r.config.has_value()) << r.error;
-        const auto err = r.config->validateAuthTopology();
-        ASSERT_TRUE(err.has_value());
-        EXPECT_NE(err->find("RUNE_WORKERS"), std::string::npos) << *err;
+        EXPECT_FALSE(r.config.has_value()) << "#147: refused at parse";
+        EXPECT_NE(r.error.find("RUNE_WORKERS"), std::string::npos) << r.error;
     }
     {
         auto peersOf = [](int n) {
@@ -328,19 +327,39 @@ TEST(NodeConfigRegression, TooManyWorkersPeersOrNodeIdRefusedWhenAuthEnabledRegr
         EXPECT_FALSE(r.config->validateAuthTopology().has_value()) << "16 peers is the supported maximum";
         e["RUNE_PEERS"] = peersOf(17);
         r = parseNodeConfig(fakeEnv(e));
-        ASSERT_TRUE(r.config.has_value()) << r.error;
-        const auto err = r.config->validateAuthTopology();
-        ASSERT_TRUE(err.has_value());
-        EXPECT_NE(err->find("RUNE_PEERS"), std::string::npos) << *err;
+        EXPECT_FALSE(r.config.has_value()) << "#147: refused at parse";
+        EXPECT_NE(r.error.find("RUNE_PEERS"), std::string::npos) << r.error;
     }
     {
+        // A PEER id out of range while this node's own id is fine: only the peer check can refuse it.
+        auto e = shard1();
+        e["RUNE_PEERS"] = "0@rune-1:40111,70000@rune-2:40111";
+        auto r = parseNodeConfig(fakeEnv(e));
+        EXPECT_FALSE(r.config.has_value()) << "a peer id above 65535 must refuse even though this node's id is in range";
+        EXPECT_NE(r.error.find("RUNE_PEERS node id 70000"), std::string::npos) << r.error;
+        EXPECT_NE(r.error.find("65535"), std::string::npos) << r.error;
+    }
+    {
+        // This node's own id out of range.  Through parse the own id must be listed in RUNE_PEERS, so the peers loop
+        // refuses it first and names it.  (Retained: the separate RUNE_NODE_ID check below it is still reached by a
+        // programmatic config whose nodeId is not among its peers, pinned right after this case.)
         auto e = shard1();
         e["RUNE_NODE_ID"] = "70000";
         e["RUNE_PEERS"] = "70000@rune-1:40111";
         auto r = parseNodeConfig(fakeEnv(e));
+        EXPECT_FALSE(r.config.has_value()) << "#147: refused at parse";
+        EXPECT_NE(r.error.find("70000"), std::string::npos) << r.error;
+        EXPECT_NE(r.error.find("65535"), std::string::npos) << r.error;
+    }
+    {
+        // A programmatic config (never through parse) whose own id is not among its peers: only the RUNE_NODE_ID
+        // check can refuse it, so that branch is reachable (validateAuth repeats the topology check for such configs).
+        auto r = parseNodeConfig(fakeEnv(shard1()));
         ASSERT_TRUE(r.config.has_value()) << r.error;
+        r.config->nodeId = 70000;
         const auto err = r.config->validateAuthTopology();
         ASSERT_TRUE(err.has_value());
+        EXPECT_NE(err->find("RUNE_NODE_ID=70000"), std::string::npos) << *err;
         EXPECT_NE(err->find("65535"), std::string::npos) << *err;
     }
 }
@@ -397,13 +416,13 @@ TEST(NodeConfigTest, NonIntWorkerEgressBaseStreamIsError) {
 TEST(NodeConfigTest, PerWorkerEgressFlagDefaultsFalseAndParses) {
     // Default (unset) → false.
     {
-        auto r = parseNodeConfig(fakeEnv(legacyEnv(base3node())));
+        auto r = parseNodeConfig(fakeEnv(legacyEnv(base1node())));
         ASSERT_TRUE(r.error.empty()) << r.error;
         EXPECT_FALSE(r.config->perWorkerEgressEnabled);
     }
     // "1"/"true"/"TRUE" → true.
     for (const char* v : {"1", "true", "TRUE"}) {
-        auto env = legacyEnv(base3node());
+        auto env = legacyEnv(base1node());
         env["RUNE_PER_WORKER_EGRESS"] = v;
         auto r = parseNodeConfig(fakeEnv(env));
         ASSERT_TRUE(r.error.empty()) << r.error;
@@ -411,7 +430,7 @@ TEST(NodeConfigTest, PerWorkerEgressFlagDefaultsFalseAndParses) {
     }
     // Other non-empty → false.
     {
-        auto env = legacyEnv(base3node());
+        auto env = legacyEnv(base1node());
         env["RUNE_PER_WORKER_EGRESS"] = "no";
         auto r = parseNodeConfig(fakeEnv(env));
         ASSERT_TRUE(r.error.empty()) << r.error;
@@ -1858,7 +1877,8 @@ TEST(NodeConfigRegression, ValidateAeronDirCatchesProgrammaticConfig) {
 
 TEST(NodeConfig, PeerWorkerCountDefaultsToZero) {
     // PeerConfig::workerCount defaults to 0 (unknown) for peers parsed from RUNE_PEERS.
-    auto res = rune::node::parseNodeConfig(fakeEnv(legacyEnv(base3node())));
+    // (single node: an authenticating multi-broker cluster must run shard mode and would be refused at parse, #147)
+    auto res = rune::node::parseNodeConfig(fakeEnv(legacyEnv(base1node())));
     ASSERT_TRUE(res.config.has_value()) << res.error;
     for (const auto& p : res.config->peers) {
         EXPECT_EQ(p.workerCount, 0)
@@ -2427,8 +2447,9 @@ TEST(ResponseControlConfigRegression, SegmentSevenOrEightZeroIsRefusedRegression
 
 TEST(ResponseControlConfigRegression, LegacyGatewayResponsePortValidatedRegression) {
     auto mk = [](const char* port, bool egress = false, int workers = 1) {
-        auto env = legacyEnv(base3node());
-        env["RUNE_PEERS"] = "0@rune-1:40110:40200:40220,1@rune-2:40111:40201:40221,2@rune-3:40112:40202:40222";
+        // Single node: an authenticating multi-broker legacy cluster is refused at parse (#147).
+        auto env = legacyEnv(base1node());
+        env["RUNE_PEERS"] = "0@rune-1:40110:40200:40220";
         env["RUNE_GATEWAY_RESPONSE_CONTROL_PORT"] = port;
         if (egress) env["RUNE_PER_WORKER_EGRESS"] = "true";
         env["RUNE_WORKERS"] = std::to_string(workers);
@@ -3590,6 +3611,29 @@ TEST(NodeConfigRegression, MsKnobsAboveThirtyDaysAreRefusedRegression) {
             EXPECT_NE(r.error.find(row.var), std::string::npos) << r.error;
         }
     }
+}
+
+// #237: RUNE_AUTH_TIMEOUT_MS is multiplied by 1'000'000 (ms -> ns) by the auth handshake; a value above the 30-day cap
+// would overflow int64.  The parser refuses it, so the product below can never wrap.
+TEST(NodeConfigRegression, AuthTimeoutAboveTheBoundIsRefusedRegression) {
+    static_assert(NodeConfig::kMaxDurationMs <= INT64_MAX / 1'000'000, "ms -> ns of the cap must fit an int64");
+    for (const char* bad : {"9300000000000", "2592000001"}) {
+        auto env = base3node();
+        env["RUNE_AUTH_TIMEOUT_MS"] = bad;
+        const auto r = parseNodeConfig(fakeEnv(env));
+        EXPECT_FALSE(r.config.has_value()) << bad << " was accepted";
+        EXPECT_NE(r.error.find("RUNE_AUTH_TIMEOUT_MS"), std::string::npos) << r.error;
+    }
+    auto env = base3node();
+    env["RUNE_AUTH_TIMEOUT_MS"] = std::to_string(NodeConfig::kMaxDurationMs + 1);
+    const auto over = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(over.config.has_value());
+    EXPECT_NE(over.error.find("RUNE_AUTH_TIMEOUT_MS"), std::string::npos) << over.error;
+
+    env["RUNE_AUTH_TIMEOUT_MS"] = std::to_string(NodeConfig::kMaxDurationMs);
+    const auto atCap = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(atCap.config.has_value()) << atCap.error;
+    EXPECT_EQ(atCap.config->authTimeoutMs, NodeConfig::kMaxDurationMs);
 }
 
 // Batch 1 adversarial pass, #803 sibling class: the ms knobs #803 did not route through the 30-day cap.  RUNE_CONTROLLED_SHUTDOWN_MS

@@ -1,6 +1,7 @@
 // SecurityAllocRegressionTest.cpp — authentication Task 9: the admin thread's __security steady state never
 // allocates (hard rule 4).  Replaces the global operator new (binary-wide), so it lives in its own binary
 // (rune_security_alloc_regression_tests) — the CatalogAllocRegressionTest (F12) pattern.
+#include "support/CatalogDdlRig.h"
 #include "support/SecurityRig.h"
 
 #include <gtest/gtest.h>
@@ -79,4 +80,31 @@ TEST(SecurityAllocRegression, HaltedApplierAllocatesNothing) {
     for (int i = 0; i < 1000; ++i) (void)rig.applier.applyCommitted(rig.replica());
     gArmed = false;
     EXPECT_EQ(gArmedAllocs, 0u);
+}
+
+// The whole idle admin duty pass with `__security` attached: the catalog replica + applier + read server, and the
+// security replica + applier + SecurityAdmin::doWork + the second CatalogReadServer pump. Nothing is in flight, so
+// nothing may allocate (hard rule 4).
+TEST(SecurityAllocRegression, IdleAdminPassWithSecurityAttachedAllocatesNothingRegression) {
+    rune::node::test::CatalogDdlRig cat("alloc_admin_cat", 3);
+    cat.becomeServingLeader();
+    SecurityRig sec("alloc_admin_sec", /*goLive=*/false);
+    sec.appendEvents(0, 16);
+    // The startup phase's boot replay: AwaitingBoot -> Booted (the checkpoint, if any, bounds what it replays).
+    (void)sec.applier.replayLocal(sec.log(), sec.rec.bootEffects());
+    ASSERT_EQ(sec.applier.phaseName(), "Booted");
+    auto& admin = cat.admin();
+    admin.attachSecurity(std::move(sec.applier), &sec.replica(), sec.rec.liveEffects());
+    ASSERT_NE(admin.securityApplier(), nullptr);
+    ASSERT_NE(admin.securityReadServer(), nullptr);
+    int64_t t = cat.now();
+    for (int i = 0; i < 64; ++i) (void)admin.doWork(t += 1'000'000);   // warm-up, disarmed: goes live, applies the log
+    ASSERT_EQ(admin.securityApplier()->phaseName(), "Live");
+    ASSERT_EQ(admin.securityApplier()->nextOffset(), 16) << "the warm-up applied every committed event";
+    gArmedAllocs = 0;
+    gArmed = true;
+    for (int i = 0; i < 1000; ++i) (void)admin.doWork(t += 1'000'000);
+    gArmed = false;
+    EXPECT_EQ(gArmedAllocs, 0u) << "the idle admin pass with __security attached allocated (backtraces above)";
+    EXPECT_EQ(admin.securityApplier()->nextOffset(), 16) << "idle: nothing applied";
 }

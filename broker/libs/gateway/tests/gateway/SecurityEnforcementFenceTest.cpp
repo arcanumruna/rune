@@ -485,6 +485,47 @@ TEST(SecurityEnforcementFenceRegression, TheWorkersBehindClearWaitsForTheApplied
     EXPECT_TRUE(r.pool.worker(0).securityBehindForTest()) << "(on its ring, not yet installed)";
 }
 
+// Issue #608: the workers' clear needs only the events that were pending when the gateway's own flag cleared (here event
+// A).  Event B, applied after the clear, stays pending without holding the clear back.  Control: before A's fences are
+// acknowledged the clear is not shipped.  RED before the fix: the clear waited for the whole queue, B included.
+// Mutation: compare against pendingEnforce_.back() at ship time instead of the recorded offset -> red.
+TEST(SecurityEnforcementFenceRegression, TheClearShipsOnceTheEventsPendingAtTheClearAreEnforcedRegression) {
+    FenceRig r(1);
+    FakePub pub;
+    const int64_t rs = r.login("r");
+    (void)r.login("w");
+    r.gw.injectRecordEgressForTest(rs, 0, pub.make());
+    pc::Subscribe s;
+    s.sessionId = rs; s.correlationId = 92; s.topicId = 0; s.partition = 0; s.partitionKnown = 1; s.fromOffset = 0;
+    std::vector<uint8_t> buf(s.encodedSize());
+    buf.resize(s.encode(buf.data()));
+    r.gw.applySubscribeForTest(buf.data(), buf.size());
+    r.runAll(1);
+    ASSERT_EQ(r.pool.worker(0).subscriptionsForTest().size(), 1u);
+    const int64_t before = r.gw.securityEnforcedOffset();
+    const uint64_t f0 = r.gw.enforceFencesIssuedForTest();
+
+    r.gw.setSecurityBehind(true);
+    ASSERT_TRUE(r.gw.workersSecurityBehindForTest());
+    const int64_t a = r.revoke(sec::Operation::Read, "r");    // pending: op ring + lifecycle fences (seq f0 + 1)
+    r.gw.setSecurityBehind(false);
+    const int64_t b = r.revoke(sec::Operation::Write, "w");   // applied after the clear, pending (seq f0 + 2)
+    ASSERT_EQ(r.gw.enforceFencesIssuedForTest(), f0 + 2);
+    (void)r.gw.servicePermissionShippingForTest();
+    EXPECT_TRUE(r.gw.workersSecurityBehindForTest()) << "control: nothing acknowledged yet";
+
+    r.gw.handleWorkerReturnForTest(fenceAck(0, 1, f0 + 1));   // A's lifecycle fence only
+    (void)r.gw.servicePermissionShippingForTest();
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), before);
+    EXPECT_TRUE(r.gw.workersSecurityBehindForTest()) << "control: A's op ring has not acknowledged";
+
+    r.gw.handleWorkerReturnForTest(fenceAck(0, 0, f0 + 1));   // A's op ring fence: A is enforced, B still pending
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), a);
+    ASSERT_LT(r.gw.securityEnforcedOffset(), b);
+    (void)r.gw.servicePermissionShippingForTest();
+    EXPECT_FALSE(r.gw.workersSecurityBehindForTest()) << "the clear ships while B is still pending";
+}
+
 // Issue #603: edges only - repeated identical verdicts ship nothing; an InProcess / dev gateway never sets it.
 TEST(SecurityEnforcementFenceRegression, TheBehindFlagShipsEdgesOnlyRegression) {
     FenceRig r(2);
@@ -496,6 +537,62 @@ TEST(SecurityEnforcementFenceRegression, TheBehindFlagShipsEdgesOnlyRegression) 
     for (int i = 0; i < 3; ++i) r.runAll(10 + i);
     EXPECT_EQ(r.gw.permissionOpsShippedForTest() - before, 4u);
     for (int32_t w = 0; w < 2; ++w) EXPECT_FALSE(r.pool.worker(w).securityBehindForTest()) << w;
+}
+
+// Issue #506: the workers' lag LEVEL.  The view falling behind events this broker holds (knownEnd ahead of the applied
+// offset) ships level 2 at once; the view applying the event queues the event's permission items BEFORE the level-0
+// item (a worker installs the grant before it leaves level 2).  RED before: nothing was shipped for it (the worker
+// answered the terminal 45).  Mutation: never ship level 2 -> red.
+TEST(SecurityEnforcementFenceRegression, TheWorkersGetLevelTwoWhileTheViewHoldsUnappliedEventsRegression) {
+    FenceRig r(1);
+    (void)r.login("w");
+    for (int i = 0; i < 3; ++i) r.runAll(1 + i);
+    ASSERT_EQ(r.gw.workersSecurityLagForTest(), 0u);
+    const int64_t applied = r.view->appliedOffset();
+
+    r.gw.setSecurityKnownEnd(applied + 2);   // one event this broker holds, not applied by the view
+    EXPECT_EQ(r.gw.workersSecurityLagForTest(), 2u) << "shipped at once";
+    EXPECT_FALSE(r.gw.workersSecurityBehindForTest()) << "level 2 is not refuse-all";
+    r.runAll(10);
+    EXPECT_EQ(r.pool.worker(0).securityLagForTest(), 2u) << "the worker installed it";
+    const uint64_t shipped = r.gw.permissionOpsShippedForTest();
+    for (int i = 0; i < 5; ++i) r.gw.setSecurityKnownEnd(applied + 2);
+    (void)r.gw.servicePermissionShippingForTest();
+    EXPECT_EQ(r.gw.permissionOpsShippedForTest(), shipped) << "edges only";
+
+    r.gw.holdPermissionShippingForTest(true);   // inspect the queue order
+    (void)r.revoke(sec::Operation::Write, "w");   // the view applies the held event
+    EXPECT_EQ(r.gw.workersSecurityLagForTest(), 0u);
+    const auto lags = r.gw.permissionQueuedLagsForTest();
+    ASSERT_EQ(lags.size(), 1u);
+    EXPECT_EQ(lags[0].first, 0u);
+    EXPECT_GE(lags[0].second, 2u) << "the event's bind and fence are queued before the level drops";
+    r.gw.holdPermissionShippingForTest(false);
+    r.runAll(20);
+    EXPECT_EQ(r.pool.worker(0).securityLagForTest(), 0u);
+}
+
+// Issue #506 / #608: the level never goes from refuse-all (1) straight to 0 while the view is still behind - it drops
+// to 2 once the #608 enforcement condition holds, and to 0 only when the view catches up.
+TEST(SecurityEnforcementFenceRegression, RefuseAllClearsToLevelTwoNotZeroWhileTheViewIsStillBehindRegression) {
+    FenceRig r(1);
+    const int64_t applied = r.view->appliedOffset();
+    r.gw.setSecurityKnownEnd(applied + 3);   // two events held, not applied
+    ASSERT_EQ(r.gw.workersSecurityLagForTest(), 2u);
+    r.gw.setSecurityBehind(true);
+    EXPECT_EQ(r.gw.workersSecurityLagForTest(), 1u);
+    r.runAll(1);
+    EXPECT_EQ(r.pool.worker(0).securityLagForTest(), 1u);
+
+    r.gw.setSecurityBehind(false);   // nothing pending enforcement: the clear needs no wait
+    EXPECT_EQ(r.gw.workersSecurityLagForTest(), 2u) << "the view is still behind: defer denials, never current";
+    r.runAll(2);
+    EXPECT_EQ(r.pool.worker(0).securityLagForTest(), 2u);
+
+    r.gw.setSecurityKnownEnd(applied + 1);   // the view caught up
+    EXPECT_EQ(r.gw.workersSecurityLagForTest(), 0u);
+    r.runAll(3);
+    EXPECT_EQ(r.pool.worker(0).securityLagForTest(), 0u);
 }
 
 namespace {

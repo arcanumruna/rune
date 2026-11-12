@@ -92,7 +92,8 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_gateway_scram_server_tests)
 
     # Authentication Task 11: the gateway's login state machine (gate, SCRAM legs, throttle, deadline, counters) - no Aeron.
-    add_executable(rune_gateway_auth_login_tests tests/gateway/AuthLoginGatewayTest.cpp)
+    add_executable(rune_gateway_auth_login_tests tests/gateway/AuthLoginGatewayTest.cpp
+                   tests/gateway/AuthLogNamesGatewayTest.cpp)
     target_include_directories(rune_gateway_auth_login_tests PRIVATE ${RUNE_BROKER_DIR}/libs/node/tests)
     target_link_libraries(rune_gateway_auth_login_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_auth_login_tests)
@@ -135,6 +136,7 @@ if(BUILD_TESTING)
     # Authentication Task 9: the control thread's SecurityView (D29).
     add_executable(rune_gateway_security_view_tests
         tests/gateway/SecurityViewTest.cpp)
+    target_include_directories(rune_gateway_security_view_tests PRIVATE ${RUNE_BROKER_DIR}/libs/node/tests)
     target_link_libraries(rune_gateway_security_view_tests PRIVATE
         rune_gateway
         GTest::gtest_main)
@@ -301,6 +303,7 @@ if(BUILD_TESTING)
 
     # Issue #127: a placed-but-unapplied id answers NotLeader, never the terminal NotAuthorized - no Aeron.
     add_executable(rune_gateway_auth_unapplied_tests tests/gateway/AuthUnappliedTopicTest.cpp)
+    target_include_directories(rune_gateway_auth_unapplied_tests PRIVATE ${RUNE_BROKER_DIR}/libs/node/tests)
     target_link_libraries(rune_gateway_auth_unapplied_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_auth_unapplied_tests)
 

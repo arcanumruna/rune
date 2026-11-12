@@ -68,6 +68,19 @@ std::optional<RequestRecord> SecurityState::request(const RequestId& id) const {
     return it->second;
 }
 
+SecurityState SecurityState::cloneWithoutRequests() const {
+    SecurityState c;
+    c.users_ = users_;
+    c.roles_ = roles_;
+    c.userNames_ = userNames_;
+    c.roleNames_ = roleNames_;
+    c.tombstones_ = tombstones_;
+    c.fakeSaltSeed_ = fakeSaltSeed_;
+    c.nextObjectId_ = nextObjectId_;
+    c.appliedOffset_ = appliedOffset_;
+    return c;   // requests_ stays empty
+}
+
 uint64_t SecurityState::digest() const {
     namespace det = rune::catalog::detail;
     // objects outside `default` hash with their namespace mixed in; `default` objects hash as before namespaces

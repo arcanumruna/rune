@@ -5,6 +5,7 @@
 #include "support/GatewayProduceRig.h"
 #include "support/ViewReadRig.h"
 
+#include <rune/gateway/Authorizer.h>
 #include <rune/gateway/PermissionTable.h>
 #include <rune/gateway/SecurityView.h>
 #include <rune/node/EmbeddedDriver.h>
@@ -341,4 +342,34 @@ TEST(AuthAllocRegression, SteadyStateAuthorizedViewRowNeverAllocatesRegression) 
     rig.read(rig.getViewRowFrame(900'000, 7));
     for (int i = 0; i < 8; ++i) rig.pass();
     EXPECT_EQ(rig.viewOk, okBefore) << "a session without READ is not served";
+}
+
+// Issue #263: a denied request builds its D23 detail text on the control thread for every refused frame; the Denial
+// holds it in a fixed buffer, so a refusal allocates nothing (the three builders: by id, by name, "on any").
+TEST(AuthAllocRegression, ADeniedRequestAllocatesNothingRegression) {
+    using namespace rune::gateway;
+    using rune::security::Operation; using rune::security::ResourceType;
+    ObjectIndex idx;
+    idx.onTopic(5, "some_topic");
+    const PermissionTable none = PermissionTable::compile({}, idx);
+    const std::string longName(kMaxNameInDetail * 2, 'n');
+    constexpr int kDenials = 1000;
+    // warm-up: first use of everything the loop touches
+    ASSERT_TRUE(authorizeTopicId(none, 5, Operation::Write, idx).has_value());
+    ASSERT_TRUE(authorizeName(none, ResourceType::Topic, longName, Operation::Read, 0).has_value());
+    ASSERT_TRUE(authorizeAnyGrant(none, ResourceType::Topic, Operation::Write).has_value());
+    uint64_t denied = 0, codes = 0;
+    {
+        Arm arm;
+        for (int i = 0; i < kDenials; ++i) {
+            const auto a = authorizeTopicId(none, 5, Operation::Write, idx);
+            const auto b = authorizeName(none, ResourceType::Topic, longName, Operation::Read, 0);
+            const auto c = authorizeAnyGrant(none, ResourceType::Topic, Operation::Write);
+            denied += a.has_value() + b.has_value() + c.has_value();
+            codes += a->code + b->code + c->code;
+        }
+    }
+    EXPECT_EQ(gArmedAllocs, 0u) << gArmedBytes << " bytes allocated by " << 3 * kDenials << " denials";
+    EXPECT_EQ(denied, 3u * kDenials) << "non-vacuity: every call was a denial";
+    EXPECT_EQ(codes, 3u * kDenials * 45u) << "NotAuthorized every time";
 }

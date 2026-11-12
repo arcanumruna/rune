@@ -11,6 +11,10 @@ namespace rune::node {
 /// The dev-mode warning, verbatim (spec §9).
 inline constexpr const char* kDevModeWarning =
     "AUTHENTICATION DISABLED (RUNE_AUTH=disabled): every request runs as 'anonymous' with full access — dev mode only";
+/// The in-process mode's warning (a NodeConfig built without an auth mode; same cadence as the dev-mode one).
+inline constexpr const char* kInProcessUnauthenticatedWarning =
+    "AUTHENTICATION IS OFF: this broker was built from a NodeConfig without an auth mode (in-process, "
+    "unauthenticated): anonymous sessions have full access and inter-broker links are plaintext";
 inline constexpr int64_t kDevModeWarnIntervalNs = 5LL * 60 * 1'000'000'000LL;
 
 struct DevModeWarnTimer {

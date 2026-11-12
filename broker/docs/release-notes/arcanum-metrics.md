@@ -25,5 +25,5 @@ in the arcanum-metrics format, and the driver's `cnc.dat` now holds only the dri
   1000201 to 1000241 finds nothing.
 - In Docker, the file sits in the data volume by default; set `RUNE_METRICS_FILE` to move it (for example to a tmpfs
   shared with a sidecar). The image is built with the `arcanum-metrics` named build context (`broker/docker/README.md`).
-- Type id 1000204 (a metadata commit position that was never published) has no metric; 1000236 to 1000239 are
+- Type id 1000204 (a metadata commit position that was never published) has no metric; 1000236 to 1000238 are
   reserved.

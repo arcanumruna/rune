@@ -39,10 +39,12 @@ namespace {
 struct RecordingSink final : IAdminRequestSink {
     int securityDdls = 0, otherSubmits = 0;
     std::string lastAuthenticated;
+    bool    lastStamped = false;       // issues #218 / #67: the authorization stamp of the last authorized security DDL
+    int64_t lastStampOffset = -2;
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool, const uint8_t*, uint32_t,
                                   uint8_t, int16_t, const rune::protocol::TopicConfigView&, const DdlMetaView&, std::string_view, const rune::protocol::TopicKeyFeatures&,
                                   const std::optional<rune::protocol::LeaseSpec>&) override { ++otherSubmits; return AdminSubmit::Accepted; }
-    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t) override { return true; }
+    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t, uint8_t) override { return true; }
     AdminSubmit submitAlterTopic(int64_t, int64_t, std::string_view, uint16_t, const uint8_t*, uint32_t, const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
     AdminSubmit submitCreateView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, const uint8_t*, uint32_t, const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
     AdminSubmit submitDropTopic(int64_t, int64_t, std::string_view, const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
@@ -56,7 +58,9 @@ struct RecordingSink final : IAdminRequestSink {
     std::map<int64_t, std::string> denied;
     AdminSubmit submitSecurityDdl(const pc::SecurityDdl& w, const DdlMetaView& m, std::string_view denial, bool) override {
         if (!denial.empty()) { denied[w.correlationId] = std::string(denial); return AdminSubmit::Accepted; }
-        ++securityDdls; lastAuthenticated = std::string(m.authenticated); return AdminSubmit::Accepted;
+        ++securityDdls; lastAuthenticated = std::string(m.authenticated);
+        lastStamped = m.securityStamped; lastStampOffset = m.securityOffset;
+        return AdminSubmit::Accepted;
     }
     AdminSubmit submitNamespaceDdl(const pc::NamespaceDdlRequest&, const DdlMetaView&, std::string_view, uint16_t) override { return AdminSubmit::Accepted; }
     AdminSubmit submitListNamespaces(int64_t, int64_t, uint32_t, uint16_t, uint32_t, bool) override { return AdminSubmit::Accepted; }
@@ -2567,4 +2571,305 @@ TEST(AuthLoginGatewayRegression, UnauthCapRefusalIsReadableByEveryAcceptedClient
         EXPECT_EQ(retry.resp->code, accepted ? int16_t{0} : expectCode);
         if (accepted) EXPECT_TRUE(rig.gw.hasSessionForTest(retry.resp->sessionId));
     }
+}
+
+// Issue #266: one reap pass walks the session table once (the auth-deadline check is fused into the expiry scan).
+TEST(AuthReapRegression, OneSessionScanPerReapPassRegression) {
+    Rig rig;
+    const int64_t now = rig.gw.sessionTimeoutNsForTest() + 5'000'000'000;
+    const auto authed = [&](int64_t sid) {
+        rig.gw.setSessionAuthForTest(sid, AuthAuthenticated{7, "u", PermissionTable::allowAll()});
+    };
+    const int64_t late = rig.newSession("10.0.0.9", now - 1'000'000'000);   // lastSeen is recent
+    rig.gw.setSessionAuthForTest(late, AuthAwaitingFirst{now - 1, 50});      // ... but its login deadline has passed
+    const int64_t idle = rig.newSession("10.0.0.9", 0);                      // idle past the lease
+    authed(idle);
+    const int64_t live = rig.newSession("10.0.0.9", now - 1'000'000'000);
+    authed(live);
+    const uint64_t failedBefore = rig.gw.loginsFailed();
+    const uint64_t scansBefore  = rig.gw.sessionScansForTest();
+    rig.gw.reapExpiredForTest(now);
+    EXPECT_EQ(rig.gw.sessionScansForTest(), scansBefore + 1) << "the reap pass walked the session table more than once";
+    EXPECT_EQ(rig.gw.loginsFailed(), failedBefore + 1);
+    const Frame* f = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), late);
+    ASSERT_NE(f, nullptr);
+    const auto fin = pc::AuthServerFinal::decode(f->bytes.data(), f->bytes.size());
+    ASSERT_TRUE(fin.has_value());
+    EXPECT_EQ(fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+    EXPECT_FALSE(rig.gw.hasSessionForTest(late));
+    EXPECT_FALSE(rig.gw.hasSessionForTest(idle));
+    EXPECT_TRUE(rig.gw.hasSessionForTest(live));
+}
+
+// ── Issue #202: a held login OK lives in its session ───────────────────────────────────────────────────────────────────
+namespace {
+struct HeldLoginRig {
+    Rig rig;
+    rune::node::WorkerPool pool{1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16};
+    HeldLoginRig() {
+        rig.gw.setWorkerPool(&pool);
+        rig.gw.setShardMode(true);
+        rig.gw.setMaxUnauthenticatedSessionsPerHost(1000);
+        rig.gw.holdPermissionShippingForTest(true);   // the lifecycle rings take nothing: every login OK is held
+    }
+    struct Pending { int64_t sid = 0, finalCorr = 0; std::array<uint8_t, 64> signature{}; };
+    /// Both legs of a login of `ws1` on a new session; the final's correlation id and the signature the client verifies.
+    Pending login() {
+        Pending p;
+        p.sid = rig.newSession();
+        const std::string nonce = "held-" + std::to_string(++rig.corr);
+        pc::AuthClientFirst cf;
+        cf.sessionId = p.sid; cf.correlationId = ++rig.corr; cf.username = "ws1"; cf.clientNonce = nonce;
+        std::vector<uint8_t> b(cf.encodedSize()); b.resize(cf.encode(b.data()));
+        rig.send(b);
+        const Frame* sf = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFirst), p.sid);
+        EXPECT_NE(sf, nullptr);
+        if (sf == nullptr) return p;
+        const auto first = pc::AuthServerFirst::decode(sf->bytes.data(), sf->bytes.size());
+        auto ans = scramAnswer("ws1", nonce, *first, {kTestPasswordA, ""}, p.sid, ++rig.corr);
+        p.finalCorr = ans->final.correlationId;
+        p.signature = ans->expectedSignature[0];
+        std::vector<uint8_t> fb(ans->final.encodedSize()); fb.resize(ans->final.encode(fb.data()));
+        rig.send(fb);
+        return p;
+    }
+    [[nodiscard]] std::size_t finalsOf(int64_t sid) const {
+        std::size_t n = 0;
+        for (const Frame& f : rig.seen) if (f.tid == static_cast<uint16_t>(pc::TemplateId::AuthServerFinal) && f.sid == sid) ++n;
+        return n;
+    }
+    /// Let the workers accept everything (bounded passes) and release the held OKs.
+    void release() {
+        rig.gw.holdPermissionShippingForTest(false);
+        for (int64_t pass = 1; pass <= 2000 && rig.gw.heldLoginOksForTest() != 0; ++pass) {
+            (void)rig.gw.servicePermissionShippingForTest();
+            pool.worker(0).doWork(pass);
+            rig.gw.drainWorkerReturnsForTest(pass);
+        }
+    }
+};
+}  // namespace
+
+TEST(HeldLoginFinalRegression, HeldOksAreReleasedInOrderWithTheSameBytesRegression) {
+    HeldLoginRig h;
+    std::vector<HeldLoginRig::Pending> logins;
+    const std::size_t seenBefore = h.rig.seen.size();
+    for (int i = 0; i < 200; ++i) logins.push_back(h.login());
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 200u);
+    for (const auto& p : logins) EXPECT_EQ(h.finalsOf(p.sid), 0u) << "no OK before the grants are accepted";
+    EXPECT_GT(h.rig.seen.size(), seenBefore);
+    (void)h.rig.gw.servicePermissionShippingForTest();   // a service pass while the shipper is held releases nothing
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 200u);
+    for (const auto& p : logins) EXPECT_EQ(h.finalsOf(p.sid), 0u);
+    const std::size_t releasedFrom = h.rig.seen.size();
+    h.release();
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 0u);
+    std::vector<int64_t> order;
+    for (std::size_t i = releasedFrom; i < h.rig.seen.size(); ++i)
+        if (h.rig.seen[i].tid == static_cast<uint16_t>(pc::TemplateId::AuthServerFinal)) order.push_back(h.rig.seen[i].sid);
+    ASSERT_EQ(order.size(), logins.size());
+    for (std::size_t i = 0; i < logins.size(); ++i) {
+        EXPECT_EQ(order[i], logins[i].sid) << "released in login order (" << i << ")";
+        EXPECT_EQ(h.finalsOf(logins[i].sid), 1u);
+        const Frame* f = h.rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), logins[i].sid);
+        ASSERT_NE(f, nullptr);
+        const auto fin = pc::AuthServerFinal::decode(f->bytes.data(), f->bytes.size());
+        ASSERT_TRUE(fin.has_value());
+        EXPECT_EQ(fin->errorCode, 0);
+        EXPECT_EQ(fin->flags, 0);
+        EXPECT_EQ(fin->sessionId, logins[i].sid);
+        EXPECT_EQ(fin->correlationId, logins[i].finalCorr);
+        ASSERT_EQ(fin->serverSignature.size(), 64u);
+        EXPECT_EQ(std::memcmp(fin->serverSignature.data(), logins[i].signature.data(), 64), 0)
+            << "the signature the client verifies";
+    }
+    // A login that is not held (the rings take the bind at once) answers with the same frame shape.
+    const auto direct = h.login();
+    EXPECT_EQ(h.finalsOf(direct.sid), 1u);
+    const Frame* df = h.rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), direct.sid);
+    const Frame* hf = h.rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), logins[0].sid);
+    ASSERT_TRUE(df != nullptr && hf != nullptr);
+    EXPECT_EQ(df->bytes.size(), hf->bytes.size());
+}
+
+TEST(HeldLoginFinalRegression, AClosedHeldSessionLeavesTheListRegression) {
+    HeldLoginRig h;
+    std::vector<HeldLoginRig::Pending> p;
+    for (int i = 0; i < 5; ++i) p.push_back(h.login());   // A..E
+    ASSERT_EQ(h.rig.gw.heldLoginOksForTest(), 5u);
+    const auto close = [&](std::size_t i) { h.rig.send(disconnectFrame(p[i].sid, ++h.rig.corr)); };
+    close(2);   // C: the middle
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 4u);
+    close(0);   // A: the head
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 3u);
+    close(4);   // E: the tail
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 2u);
+    for (const std::size_t i : {0u, 2u, 4u}) EXPECT_FALSE(h.rig.gw.hasSessionForTest(p[i].sid));
+    h.release();
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 0u);
+    EXPECT_EQ(h.finalsOf(p[1].sid), 1u);
+    EXPECT_EQ(h.finalsOf(p[3].sid), 1u);
+    for (const std::size_t i : {0u, 2u, 4u}) EXPECT_EQ(h.finalsOf(p[i].sid), 0u) << "nothing for a closed session";
+    // The list is consistent after emptying.
+    h.rig.gw.holdPermissionShippingForTest(true);
+    const auto f = h.login();
+    const auto g = h.login();
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 2u);
+    h.release();
+    EXPECT_EQ(h.rig.gw.heldLoginOksForTest(), 0u);
+    EXPECT_EQ(h.finalsOf(f.sid), 1u);
+    EXPECT_EQ(h.finalsOf(g.sid), 1u);
+}
+
+// ===========================================================================
+// Issue #146 (M4): every unauthenticated log line is rate limited per KIND - the first occurrence logs, the rest only
+// bump the suppression count (counter rune-unauth-log-suppressed is the gateway's own count plus the workers').
+// Deleting the due() at any one site must turn exactly its test red.
+//
+// | kind            | site                | flood                            | test (AuthLogRegression.)
+// | 0 require-TLS   | handleConnect       | plaintext Connects, require_tls  | RequireTlsRefusalLogLines...
+// | 1 rate limited  | first leg           | first legs inside the delay      | RateLimitedFirstLegLogLines...
+// | 1 rate limited  | final leg           | parked finals inside the delay   | RateLimitedFinalLegLogLines...
+// | 2 and 7 halted  | first leg           | first legs on a halted view      | HaltedFirstLegLogLines...
+// | 8+halted and 7  | final leg           | halt between the legs            | HaltedFinalLegLogLines...
+// | 8+reason        | final leg           | wrong, unknown, disabled, late   | PerReasonLoginFailureLogLines...
+// Not covered here: kinds 3-6, 15-21 are other sites (bootstrap, malformed, worker bind); 8+reason "no-credentials"
+// is reached only with a user that has no password, and the "no-randomness" line is not rate limited at all.
+// ===========================================================================
+namespace {
+int logLinesWith(const Rig& rig, const std::string& needle) {
+    int n = 0;
+    for (const std::string& l : rig.logSink->last_formatted()) if (l.find(needle) != std::string::npos) ++n;
+    return n;
+}
+std::string floodHost(int i) { return "10.9." + std::to_string(i / 200) + "." + std::to_string(i % 200 + 1); }
+}  // namespace
+
+TEST(AuthLogRegression, RequireTlsRefusalLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    rig.gw.setRequireTls(true);
+    constexpr int kFlood = 30;
+    for (int i = 0; i < kFlood; ++i) (void)connectFrom(rig, floodHost(i));
+    EXPECT_EQ(logLinesWith(rig, "require_tls rejecting a plaintext Connect"), 1) << "first only";
+    EXPECT_EQ(rig.gw.unauthLogSuppressed(), static_cast<uint64_t>(kFlood - 1));
+}
+
+TEST(AuthLogRegression, RateLimitedFirstLegLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    for (int i = 0; i < 3; ++i) (void)rig.login("ws2", {"wrong password", ""});   // the 3rd failure starts the delay
+    ASSERT_EQ(rig.gw.loginsFailed(), 3u);
+    const uint64_t suppressedBefore = rig.gw.unauthLogSuppressed();
+    constexpr int kFlood = 25;
+    for (int i = 0; i < kFlood; ++i) {
+        const auto o = rig.login("ws2", {kTestPasswordA, ""});
+        ASSERT_TRUE(o.fin.has_value()) << i;
+        EXPECT_GT(o.fin->retryAfterMs, 0u) << i << ": inside the delay";
+    }
+    EXPECT_EQ(rig.gw.loginsRateLimited(), static_cast<uint64_t>(kFlood));
+    EXPECT_EQ(logLinesWith(rig, "auth: rate limited user=ws2"), 1) << "first only";
+    EXPECT_EQ(rig.gw.unauthLogSuppressed() - suppressedBefore, static_cast<uint64_t>(kFlood - 1));
+}
+
+TEST(AuthLogRegression, RateLimitedFinalLegLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    constexpr int kSessions = 25;
+    std::vector<FirstLeg> legs;
+    for (int i = 0; i < kSessions; ++i) {   // every first leg is allowed: no failure has been recorded yet
+        legs.push_back(sendFirst(rig, "ws1"));
+        ASSERT_TRUE(legs.back().first.has_value()) << i;
+    }
+    for (int i = 0; i < 3; ++i) rig.send(finalFor(legs[static_cast<std::size_t>(i)], "ws1", {"wrong", "wrong too"}));
+    ASSERT_EQ(rig.gw.loginsFailed(), 3u);
+    ASSERT_EQ(logLinesWith(rig, "auth: rate limited"), 0);
+    const uint64_t suppressedBefore = rig.gw.unauthLogSuppressed();
+    for (int i = 3; i < kSessions; ++i)
+        rig.send(finalFor(legs[static_cast<std::size_t>(i)], "ws1", {kTestPasswordA, ""}));
+    constexpr int kLimited = kSessions - 3;
+    EXPECT_EQ(rig.gw.loginsRateLimited(), static_cast<uint64_t>(kLimited));
+    EXPECT_EQ(logLinesWith(rig, "auth: rate limited user=ws1"), 1) << "first only";
+    EXPECT_EQ(rig.gw.unauthLogSuppressed() - suppressedBefore, static_cast<uint64_t>(kLimited - 1));
+}
+
+TEST(AuthLogRegression, HaltedFirstLegLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    rune::security::ApplyError err; err.offset = 3; err.detail = "test halt";
+    rig.view.onHalted(err);
+    constexpr int kFlood = 25;
+    for (int i = 0; i < kFlood; ++i) {
+        const auto o = rig.login("ws1", {kTestPasswordA, ""}, floodHost(i));
+        ASSERT_TRUE(o.fin.has_value()) << i;
+        EXPECT_EQ(o.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable)) << i;
+    }
+    EXPECT_EQ(rig.gw.loginsUnavailable(), static_cast<uint64_t>(kFlood));
+    EXPECT_EQ(logLinesWith(rig, "reason=security-halted"), 1) << "kind 2: first only";
+    EXPECT_EQ(logLinesWith(rig, "reason=security-not-current"), 1) << "kind 7 (unavailableLogin_): first only";
+    EXPECT_EQ(rig.gw.unauthLogSuppressed(), static_cast<uint64_t>(2 * (kFlood - 1)));
+}
+
+TEST(AuthLogRegression, HaltedFinalLegLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    std::vector<std::unique_ptr<SecurityView>> views;
+    constexpr int kFlood = 25;
+    for (int i = 0; i < kFlood; ++i) {
+        views.push_back(std::make_unique<SecurityView>(rig.chain.state()));
+        SecurityView* v = views.back().get();
+        rig.gw.setAuthMode(GatewayAuthMode::Required, v);
+        const int64_t sid = rig.newSession(floodHost(i));
+        const auto fin = loginWithBetweenLegs(rig, sid, "ws1", kTestPasswordA, [v] {
+            rune::security::ApplyError err; err.offset = 3; err.detail = "test halt between the legs";
+            v->onHalted(err);
+        });
+        ASSERT_TRUE(fin.has_value()) << i;
+        EXPECT_EQ(fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable)) << i;
+    }
+    EXPECT_EQ(rig.gw.loginsUnavailable(), static_cast<uint64_t>(kFlood));
+    EXPECT_EQ(logLinesWith(rig, "reason=security-halted"), 1) << "kind 8+SecurityHalted: first only";
+    EXPECT_EQ(logLinesWith(rig, "reason=security-not-current"), 1) << "kind 7 (unavailableLogin_): first only";
+    EXPECT_EQ(rig.gw.unauthLogSuppressed(), static_cast<uint64_t>(2 * (kFlood - 1)));
+}
+
+TEST(AuthLogRegression, PerReasonLoginFailureLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    constexpr int kPerReason = 8;
+    int host = 0;
+    for (int i = 0; i < kPerReason; ++i) {
+        rig.gw_now += 600'000'000'000;   // far past any throttle delay: no attempt is refused as rate limited
+        rig.gw.setNowNsForTest(rig.gw_now);
+        (void)rig.login("ws2", {"not the password", ""}, floodHost(host++));         // bad-proof
+        (void)rig.login("nobody", {kTestPasswordA, kTestPasswordA}, floodHost(host++));   // unknown-user
+        (void)rig.login("off", {kTestPasswordA, ""}, floodHost(host++));              // disabled
+        const std::string h = floodHost(host++);   // timeout: the final arrives after the session's deadline
+        rig.gw_now += 10'000'000'000;
+        rig.gw.setNowNsForTest(rig.gw_now);
+        const FirstLeg late = sendFirst(rig, "ws2", h, rig.gw_now);
+        ASSERT_TRUE(late.first.has_value()) << i;
+        rig.gw_now += 2'000'000'000;
+        rig.gw.setNowNsForTest(rig.gw_now);
+        rig.send(finalFor(late, "ws2", {kTestPasswordA, ""}));
+    }
+    ASSERT_EQ(rig.gw.loginsFailed(), static_cast<uint64_t>(4 * kPerReason)) << "no attempt was rate limited";
+    EXPECT_EQ(rig.gw.loginsRateLimited(), 0u);
+    for (const char* reason : {"reason=bad-proof", "reason=unknown-user", "reason=disabled", "reason=timeout"})
+        EXPECT_EQ(logLinesWith(rig, reason), 1) << reason << ": one line per reason (its own kind), first only";
+    EXPECT_EQ(rig.gw.unauthLogSuppressed(), static_cast<uint64_t>(4 * (kPerReason - 1)));
+}
+
+// Issues #218 / #67: the DDL meta states which `__security` state the gateway authorized against, so the admin thread
+// can refuse a request that raced a security change.  Read in the same handler that ran the check.
+TEST(AuthLoginRegression, DdlMetaCarriesTheSecurityOffsetItWasAuthorizedAtRegression) {
+    Rig rig;
+    const auto a = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_EQ(a.fin->errorCode, 0);
+    const int64_t first = rig.view.appliedOffset();
+    rig.send(alterUserFrame(a.sid, 200, "ws1", pc::UserChangeKind::AddPassword, &a));
+    ASSERT_EQ(rig.admin.securityDdls, 1);
+    EXPECT_TRUE(rig.admin.lastStamped);
+    EXPECT_EQ(rig.admin.lastStampOffset, first);
+    // One more event reaches the mirror: the next DDL carries the next offset.
+    applyCreateUser(rig, "fresh", kTestPasswordA, 11);
+    ASSERT_EQ(rig.view.appliedOffset(), first + 1);
+    rig.send(alterUserFrame(a.sid, 201, "ws1", pc::UserChangeKind::AddPassword, &a));
+    ASSERT_EQ(rig.admin.securityDdls, 2);
+    EXPECT_TRUE(rig.admin.lastStamped);
+    EXPECT_EQ(rig.admin.lastStampOffset, first + 1);
 }
