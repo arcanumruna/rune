@@ -3208,9 +3208,15 @@ Client::SecurityResult<std::vector<rune::security::RoleRow>> Client::securityRol
 }
 
 void Client::connectAndWait(std::chrono::nanoseconds timeout) {
-    andWait_("connect()", timeout, 0,
-             [&](Completions& q, Token t) { return connect(q, t); },
-             [&](const Completion& c, std::span<const uint8_t> payload) { throwForStatus_("connect()", c, payload); });
+    try {
+        andWait_("connect()", timeout, 0,
+                 [&](Completions& q, Token t) { return connect(q, t); },
+                 [&](const Completion& c, std::span<const uint8_t> payload) { throwForStatus_("connect()", c, payload); });
+    } catch (const std::runtime_error& e) {
+        if (cfg_.gatewayResponseControlPort == 0 || std::string_view(e.what()).find("timed out") == std::string_view::npos) throw;
+        throw std::runtime_error(std::string(e.what()) + " (gateway response port " + std::to_string(cfg_.gatewayResponseControlPort) +
+                                 "; the broker must reach it)");
+    }
 }
 
 Bytes Client::pingAndWait(std::span<const uint8_t> payload, std::chrono::nanoseconds timeout) {

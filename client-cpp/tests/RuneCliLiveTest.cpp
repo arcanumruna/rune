@@ -124,6 +124,7 @@ struct CliTestGateway {
     uint16_t             getVersion   = 1;
     uint16_t             getErrorCode = 0;
     std::vector<uint8_t> getBlob;   // set by test before call
+    bool                 getUntyped = false;   // an untyped topic: UnknownTopic for the registry lookup, OK with no blob for the kind probe
 
     // Canned AlterTopic response (Task 20).
     bool     replyAlterTopic  = true;
@@ -299,7 +300,8 @@ struct CliTestGateway {
             resp.correlationId  = opt->correlationId;
             resp.topicId        = getTopicId;
             resp.version        = getVersion;
-            resp.errorCode      = getErrorCode;
+            resp.errorCode      = getUntyped && opt->requestedFingerprint == rpc::kSchemaKindFingerprint
+                                      ? uint16_t{0} : getErrorCode;
             resp.descriptorBlob = getBlob.data();
             resp.descriptorLen  = static_cast<uint32_t>(getBlob.size());
 
@@ -557,6 +559,33 @@ TEST(CliLive, SchemaGetUnknownTopic) {
         << "CLI must return 7 (UnknownTopic); err=" << r.err;
     EXPECT_NE(r.err.find("unknown topic"), std::string::npos)
         << "err must mention 'unknown topic'; got: " << r.err;
+
+    gw.stop();
+    try { std::filesystem::remove_all(baseDir); } catch (...) {}
+}
+
+// An existing untyped topic is not "unknown": the registry lookup says UnknownTopic, the kind probe says it exists.
+TEST(CliLive, SchemaGetUntypedTopic) {
+    static constexpr int32_t kIn = 1216, kOut = 1217;
+    const std::string baseDir = cliUniqueDir();
+    const std::string aeronDir = baseDir + "/aeron";
+
+    CliTestGateway gw(aeronDir, kIn, kOut);
+    gw.getErrorCode = static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic);
+    gw.getUntyped   = true;
+
+    std::vector<std::string> args = {
+        "schema", "get", "raw_topic",
+        "--cli-data-dir", baseDir,
+        "--cli-stream-in",  std::to_string(kIn),
+        "--cli-stream-out", std::to_string(kOut),
+    };
+
+    auto r = runCli(gw, aeronDir, args);
+
+    EXPECT_EQ(r.rc, 0) << "err=" << r.err;
+    EXPECT_NE(r.out.find("untyped"), std::string::npos) << "out=" << r.out;
+    EXPECT_EQ(r.err.find("unknown topic"), std::string::npos) << "err=" << r.err;
 
     gw.stop();
     try { std::filesystem::remove_all(baseDir); } catch (...) {}

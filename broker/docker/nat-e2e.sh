@@ -92,6 +92,9 @@ DERIVED_SHARD_PORT_STRIDE=$(( 3 * 64 ))
 EGRESS_CONTROL_OFFSET=128
 GATEWAY_RESPONSE_OFFSET=63
 GW_RESP=$(( DERIVED_SHARD_PORT_BASE + DERIVED_SHARD_PORT_STRIDE * SEED_NODE_ID + EGRESS_CONTROL_OFFSET + GATEWAY_RESPONSE_OFFSET ))
+# rune-2 is node id 1: the DDL connects there, so the client needs that node's port.
+DDL_NODE_ID=1
+DDL_GW_RESP=$(( DERIVED_SHARD_PORT_BASE + DERIVED_SHARD_PORT_STRIDE * DDL_NODE_ID + EGRESS_CONTROL_OFFSET + GATEWAY_RESPONSE_OFFSET ))
 
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
 export RUNE_AUTH_WORK_DIR="${WORK_DIR}"      # the client containers' /work is also where the passwords live
@@ -346,10 +349,10 @@ rune_auth_prepare "${PRIV_NET}" "rune-1:${BROKER_PORT}" || fail "bootstrap / e2e
 step "5 DDL"
 ddl_ok=0
 for attempt in 1 2 3 4 5; do
-    if docker exec "${CLIENT_A}" timeout "${OP_TIMEOUT_S}" rune ql -f /topics/nat-e2e.rql --broker "rune-1:${BROKER_PORT}"; then ddl_ok=1; break; fi
+    if docker exec "${CLIENT_A}" timeout "${OP_TIMEOUT_S}" rune ql -f /topics/nat-e2e.rql --broker "rune-2:${BROKER_PORT}" --gateway-response-port "${DDL_GW_RESP}"; then ddl_ok=1; break; fi
     log "nat-e2e.rql attempt ${attempt} failed; retrying"; sleep 3
 done
-[ "${ddl_ok}" = "1" ] || fail "nat-e2e.rql through rune-1 from ${CLIENT_A} failed"
+[ "${ddl_ok}" = "1" ] || fail "nat-e2e.rql through rune-2 from ${CLIENT_A} failed"
 
 # ---------------------------------------------------------------------------
 # Step 6: produce + consume, two clients behind ONE NAT, concurrently.

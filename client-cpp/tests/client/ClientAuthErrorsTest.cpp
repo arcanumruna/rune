@@ -932,6 +932,24 @@ TEST(ClientSecretAdversarialRegression, ASelfSetPasswordLifecycleLeavesNoFreedCo
     EXPECT_EQ(newHits, 0) << "a freed block still held the new password (ring record, pending op, plan copy, secret)";
 }
 
+TEST(ClientConnectTimeoutRegression, TheTimeoutNamesTheConfiguredGatewayResponsePort) {
+    // No gateway answers: a NAT-safe client's connect times out, and the text names the port the broker has to reach.
+    rc::ClientConfig c = authCfg(4160, "ws1", kPw);
+    c.runnerMode = rc::RunnerMode::Thread;
+    c.nanoClock = nullptr;
+    c.gatewayResponseControlPort = 8263;
+    rc::Client client(c);
+    std::string why;
+    try {
+        client.connectAndWait(std::chrono::milliseconds(200));
+    } catch (const std::runtime_error& e) {
+        why = e.what();
+    }
+    EXPECT_NE(why.find("timed out"), std::string::npos) << why;
+    EXPECT_NE(why.find("gateway response port 8263"), std::string::npos) << why;
+    client.close();
+}
+
 TEST(ClientSecretAdversarialRegression, ASecurityDdlAndWaitRetriedOnAFullCommandRingSendsTheWholePlanAdversarialRegression) {
     // Resources x auth: the blocking form re-issues a BackPressured op.  The re-issue must carry the same plan - not
     // a moved-from one (an empty grantee and an empty PREFIX pattern: a grant on every topic).

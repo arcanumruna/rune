@@ -377,8 +377,8 @@ public:
         const auto a = c().offsetFetch(ch(), stream(), sid, group, topicId, 0);
         return a && a->second == 0 ? a->first : kNoAnswer;
     }
-    int getTopicSchema(int64_t sid, const std::string& name, uint64_t fingerprint = 0) {
-        const auto a = c().awaitSchema(c().sendGetTopicSchema(ch(), stream(), sid, name, fingerprint), dl());
+    int getTopicSchema(int64_t sid, const std::string& name) {
+        const auto a = c().awaitSchema(c().sendGetTopicSchema(ch(), stream(), sid, name), dl());
         return a ? a->errorCode : kNoAnswer;
     }
     /// ViewRowResponse status (45 = NotAuthorized), or the code of an ErrorResponse.

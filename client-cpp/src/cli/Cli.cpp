@@ -59,7 +59,7 @@ bool connectOrReport(rune::client::Client& client, std::ostream& err) {
         return true;
     } catch (const std::exception& e) {
         if (isWaitTimeout(e)) {
-            err << "rune: connect timed out\n";
+            err << "rune: " << e.what() << "\n";
         } else {
             err << "rune error: " << e.what() << "\n";
         }
@@ -208,9 +208,20 @@ int cmdSchemaGet(const std::vector<std::string>& args,
             }
             throw;
         }
-        client.close();
 
         namespace rpc = rune::protocol::client;
+        if (r.errorCode == static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic)) {
+            // The registry holds typed topics only: ask whether the topic exists untyped.
+            const TopicSchemaResult kind = client.getTopicSchemaAndWait(topic, rpc::kSchemaKindFingerprint, kCliWait);
+            client.close();
+            if (kind.errorCode == 0 && kind.descriptorBlob.empty()) {
+                out << "topic '" << topic << "' is untyped: it has no schema\n";
+                return 0;
+            }
+            err << "rune: unknown topic '" << topic << "'\n";
+            return static_cast<int>(r.errorCode);
+        }
+        client.close();
         if (r.errorCode == static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic)) {
             err << "rune: unknown topic '" << topic << "'\n";
             return static_cast<int>(r.errorCode);

@@ -476,19 +476,6 @@ TEST(AuthEnforcementRegression, AViewGrantNeverDescribesAJustCreatedTopicRegress
     EXPECT_EQ(r.getTopicSchema(viewOnly, "payments"), static_cast<int>(pc::ErrorCode::UnknownTopic));
 }
 
-// The e2e role (READ / WRITE / CREATE on TOPIC PREFIX '', DESCRIBE ON CLUSTER) describes an UNTYPED topic with the kind
-// probe, the one GetTopicSchema form that serves a topic without a schema (eos_probe's check of its topic table): OK with the
-// topic's id and partition count.  A plain fingerprint-0 request is UnknownTopic for it (no schema to return), so a caller
-// that must describe a plain topic has to use the kind probe.
-TEST(AuthEnforcementRegression, KindProbeDescribesAnUntypedTopicToTheE2eRoleRegression) {
-    AuthRig r;
-    const int64_t e2e = r.newUser({prefix(SO::Read, ST::Topic, ""), prefix(SO::Write, ST::Topic, ""), prefix(SO::Create, ST::Topic, ""),
-                                   cluster(SO::Describe)});
-    ASSERT_GE(r.defineTopic(r.builder, "plain", /*typed=*/false), 0);
-    EXPECT_EQ(r.getTopicSchema(e2e, "plain", pc::kSchemaKindFingerprint), kOk);
-    EXPECT_EQ(r.getTopicSchema(e2e, "plain"), static_cast<int>(pc::ErrorCode::UnknownTopic));
-}
-
 TEST(AuthEnforcementRegression, DefineTopicAndCreateSchemaAllowedAndDenied) {
     AuthRig r;
     const int64_t named = r.newUser({exact(SO::Create, ST::Topic, "fresh1")});

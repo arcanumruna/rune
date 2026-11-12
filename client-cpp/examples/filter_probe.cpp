@@ -530,14 +530,15 @@ struct AckState {
     int64_t acked = 0, failed = 0;
     std::array<int64_t, kParts> end{};
     int32_t firstFailure = 0;
+    uint16_t firstCode = 0;   // the broker's error code of the first failed ack
 };
 constexpr Token kTokenBase = 8;
 Token tokenOf(int64_t seq, int32_t part) { return static_cast<Token>(((seq << 3) | part) + kTokenBase); }
 int32_t partOfToken(Token t) { return static_cast<int32_t>((t - kTokenBase) & 7); }
-void onAck(void* ctx, Token token, int64_t offset, OpStatus status, uint16_t) noexcept {
+void onAck(void* ctx, Token token, int64_t offset, OpStatus status, uint16_t code) noexcept {
     auto* a = static_cast<AckState*>(ctx);
     ++a->acked;
-    if (status != OpStatus::Ok) { ++a->failed; a->firstFailure = static_cast<int32_t>(status); return; }
+    if (status != OpStatus::Ok) { if (a->failed++ == 0) { a->firstFailure = static_cast<int32_t>(status); a->firstCode = code; } return; }
     const int32_t p = partOfToken(token);
     if (offset >= 0) a->end[static_cast<std::size_t>(p)] = std::max(a->end[static_cast<std::size_t>(p)], offset + 1);
 }
@@ -619,7 +620,7 @@ int runProduce(const Env& env) {
             ++burst;
         }
         if (c.doWork() == 0 && g_idleUs > 0) std::this_thread::sleep_for(std::chrono::microseconds(g_idleUs));
-        if (acks.failed != 0) { fail("FILTER-PRODUCE", "a record failed, status " + std::to_string(acks.firstFailure)); return 1; }
+        if (acks.failed != 0) { fail("FILTER-PRODUCE", "a record failed, status " + std::to_string(acks.firstFailure) + ", broker code " + std::to_string(acks.firstCode)); return 1; }
         if (!progressFile.empty() && Clock::now() - lastProgress > std::chrono::milliseconds(250)) {
             writeFileAtomic(progressFile, std::to_string(acks.acked) + "\n");
             lastProgress = Clock::now();
@@ -1010,7 +1011,9 @@ int runAlter(const Env& env) {
             p.send(th, Key(e.playerId), bytes, AckToken{tokenOf(e.seq, e.part)});
         }
         p.flush();
-        return wait([&] { return acks.acked >= static_cast<int64_t>(evs.size()) + 0 && acks.failed == 0; }, 120, "the produce acks");
+        if (!wait([&] { return acks.acked >= static_cast<int64_t>(evs.size()) || acks.failed != 0; }, 120, "the produce acks")) return false;
+        if (acks.failed != 0) { fail(tag, "a record failed, status " + std::to_string(acks.firstFailure) + ", broker code " + std::to_string(acks.firstCode)); return false; }
+        return true;
     };
     auto alter = [&](const std::vector<uint8_t>& ops, const char* what) {
         const auto r = c.alterTopicAndWait(kTopicName, 0, ops, {}, std::chrono::seconds(60));
@@ -1020,10 +1023,10 @@ int runAlter(const Env& env) {
     };
     if (!alter(addGuildOps(), "ADD guild")) return 1;
     acks = AckState{};
-    if (!produce(v2) || acks.failed != 0) return 1;
+    if (!produce(v2)) return 1;
     if (!alter(dropChannelOps(), "DROP channel")) return 1;
     acks = AckState{};
-    if (!produce(v3) || acks.failed != 0) return 1;
+    if (!produce(v3)) return 1;
     std::vector<int64_t> ends(acks.end.begin(), acks.end.end());   // v3 is the last record of every partition it reached
     // Partitions that got no v3 record keep their v2 end: re-derive from the v2 acks is not needed, position follows notes.
     if (!wait([&] {
