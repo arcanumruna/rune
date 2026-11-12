@@ -3,7 +3,7 @@
 
 #include <spdlog/spdlog.h>
 
-#include <map>
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -29,9 +29,33 @@ std::expected<sec::Applied, sec::ApplyError> SecurityView::onApplied(int64_t off
     if (!ev) return fail(ev.error() == sec::DecodeError::UnknownFormatVer ? sec::ApplyError::Code::UnsupportedFormat
                                                                           : sec::ApplyError::Code::BadOps,
                          "the mirrored record does not decode: " + std::string{sec::decodeErrorName(ev.error())});
+    // #269: the fake-iteration mode is maintained incrementally for the events that change a user's verifiers.
+    const bool userKind = ev->kind == sec::EventKind::CreateUser || ev->kind == sec::EventKind::AlterUser ||
+                          ev->kind == sec::EventKind::DropUser;
+    if (userKind) {
+        if (const sec::UserObject* u = state_.userByName(ev->nsId, ev->objectName)) countVerifiers_(*u, -1);
+    }
     auto a = sec::apply(state_, *ev, offset);
-    if (!a) return std::unexpected(halt_(std::move(a.error())));
-    refreshDerived_();   // once per applied event: the O(users x grants) walk stays off every Connect
+    if (!a) return std::unexpected(halt_(std::move(a.error())));   // halted: the counts no longer matter
+    window_ = state_.hasSecurityAdmin() ? Window::Closed : Window::Open;   // once per applied event
+    switch (ev->kind) {
+        case sec::EventKind::CreateUser:
+        case sec::EventKind::AlterUser:
+        case sec::EventKind::DropUser:
+            if (const sec::UserObject* u = state_.userByName(ev->nsId, ev->objectName)) countVerifiers_(*u, +1);
+            pickFakeIterations_();
+            break;
+        case sec::EventKind::CreateRole:
+        case sec::EventKind::DropRole:
+        case sec::EventKind::Grant:
+        case sec::EventKind::Revoke:
+        case sec::EventKind::GrantRole:
+        case sec::EventKind::RevokeRole:
+            break;   // no verifier changes
+        default:     // Bootstrap, NamespacePurged, anything new: the full rebuild
+            rebuildDerived_();
+            break;
+    }
     return a;
 }
 
@@ -40,14 +64,31 @@ void SecurityView::onHalted(const sec::ApplyError& error) {
     (void)halt_(error);
 }
 
-void SecurityView::refreshDerived_() {
+void SecurityView::rebuildDerived_() {
+    ++derivedFullRebuilds_;
     window_ = state_.hasSecurityAdmin() ? Window::Closed : Window::Open;
-    std::map<uint32_t, std::size_t> counts;
-    for (const auto& [id, u] : state_.users())
-        for (const auto& v : u.verifiers) ++counts[v.iterations];
+    iterationCounts_.clear();
+    for (const auto& [id, u] : state_.users()) countVerifiers_(u, +1);
+    pickFakeIterations_();
+}
+
+void SecurityView::countVerifiers_(const sec::UserObject& user, int delta) {
+    for (const auto& v : user.verifiers) {
+        const auto it = std::lower_bound(iterationCounts_.begin(), iterationCounts_.end(), v.iterations,
+                                         [](const auto& e, uint32_t k) { return e.first < k; });
+        if (it != iterationCounts_.end() && it->first == v.iterations) {
+            if (delta > 0) ++it->second;
+            else if (--it->second == 0) iterationCounts_.erase(it);
+        } else if (delta > 0) {
+            iterationCounts_.insert(it, {v.iterations, 1});
+        }
+    }
+}
+
+void SecurityView::pickFakeIterations_() {
     uint32_t best = 4096;
     std::size_t bestN = 0;
-    for (const auto& [it, n] : counts)
+    for (const auto& [it, n] : iterationCounts_)   // ascending: on a tie the smallest count wins
         if (n > bestN) { best = it; bestN = n; }
     fakeIterations_ = best;
 }

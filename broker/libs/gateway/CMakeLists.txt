@@ -135,6 +135,7 @@ if(BUILD_TESTING)
     # Authentication Task 9: the control thread's SecurityView (D29).
     add_executable(rune_gateway_security_view_tests
         tests/gateway/SecurityViewTest.cpp)
+    target_include_directories(rune_gateway_security_view_tests PRIVATE ${RUNE_BROKER_DIR}/libs/node/tests)
     target_link_libraries(rune_gateway_security_view_tests PRIVATE
         rune_gateway
         GTest::gtest_main)
