@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <optional>
@@ -3590,6 +3591,29 @@ TEST(NodeConfigRegression, MsKnobsAboveThirtyDaysAreRefusedRegression) {
             EXPECT_NE(r.error.find(row.var), std::string::npos) << r.error;
         }
     }
+}
+
+// #237: RUNE_AUTH_TIMEOUT_MS is multiplied by 1'000'000 (ms -> ns) by the auth handshake; a value above the 30-day cap
+// would overflow int64.  The parser refuses it, so the product below can never wrap.
+TEST(NodeConfigRegression, AuthTimeoutAboveTheBoundIsRefusedRegression) {
+    static_assert(NodeConfig::kMaxDurationMs <= INT64_MAX / 1'000'000, "ms -> ns of the cap must fit an int64");
+    for (const char* bad : {"9300000000000", "2592000001"}) {
+        auto env = base3node();
+        env["RUNE_AUTH_TIMEOUT_MS"] = bad;
+        const auto r = parseNodeConfig(fakeEnv(env));
+        EXPECT_FALSE(r.config.has_value()) << bad << " was accepted";
+        EXPECT_NE(r.error.find("RUNE_AUTH_TIMEOUT_MS"), std::string::npos) << r.error;
+    }
+    auto env = base3node();
+    env["RUNE_AUTH_TIMEOUT_MS"] = std::to_string(NodeConfig::kMaxDurationMs + 1);
+    const auto over = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(over.config.has_value());
+    EXPECT_NE(over.error.find("RUNE_AUTH_TIMEOUT_MS"), std::string::npos) << over.error;
+
+    env["RUNE_AUTH_TIMEOUT_MS"] = std::to_string(NodeConfig::kMaxDurationMs);
+    const auto atCap = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(atCap.config.has_value()) << atCap.error;
+    EXPECT_EQ(atCap.config->authTimeoutMs, NodeConfig::kMaxDurationMs);
 }
 
 // Batch 1 adversarial pass, #803 sibling class: the ms knobs #803 did not route through the 30-day cap.  RUNE_CONTROLLED_SHUTDOWN_MS
