@@ -62,6 +62,20 @@ bool pumpUntil(Transport& t, Pred&& pred) {
 }
 
 // Injected Resolution clock (single-threaded: the test thread is the owner).
+// #767: a retarget is a state advanced by the duty cycle.  Start one and drive it (bounded by a 10 s failure deadline,
+// no sleep) to its outcome: true when it completed and swapped.
+bool retargetSettled(Transport& t, const std::string& channel, int32_t responsePort = 0) {
+    uint64_t token = 0;
+    if (t.beginRetarget(channel, responsePort, token) != Transport::RetargetStart::Pending) return false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (t.seedRetargetPending() && std::chrono::steady_clock::now() < deadline) {
+        t.dutyCycle();
+        t.serviceRetarget();
+    }
+    const auto o = t.takeRetargetOutcome();
+    return o.has_value() && o->token == token && o->ok;
+}
+
 int64_t g_nowNs = 0;
 int64_t fakeNow() noexcept { return g_nowNs; }
 // >= AeronTransport's 100 ms Resolution retry backoff.
@@ -1112,7 +1126,7 @@ TEST(AeronTransportRegression, SeedAndLeaderPairsOwnTheirOwnResponseSubscription
     EXPECT_NE(t.responseSubSlotForTest(h), slot) << "the seed's response subscription is never shared (one-shot per pair)";
 
     // The seed fails over to B: only the seed's share is released.
-    ASSERT_TRUE(t.retarget(loopback(reqB), rB));
+    ASSERT_TRUE(retargetSettled(t, loopback(reqB), rB));
     for (int i = 0; i < 5; ++i) { t.dutyCycle(); t.poll([](const uint8_t*, std::size_t) {}, 10); }   // reap pass
     EXPECT_FALSE(t.subSlotLiveForTest(slot)) << "the seed's own subscription is released with its pair";
 
@@ -1360,8 +1374,18 @@ TEST(AeronTransportRegression, RetargetThatTimesOutWhileResolvingLeavesNoOrphanR
     g_nowNs = 1'000'000'000;
     ASSERT_EQ(t.drainingPubsForTest(), 0u);
 
-    t.setDriverStalledForTest(true, 20'000'000LL);   // 20 ms wall bound
-    EXPECT_FALSE(t.retarget(newGw)) << "the driver was stalled: the new publication cannot have resolved";
+    t.setDriverStalledForTest(true, 20'000'000LL);   // 20 ms bound on the injected resolve clock
+    uint64_t token = 0;
+    ASSERT_EQ(t.beginRetarget(newGw, 0, token), Transport::RetargetStart::Pending);
+    t.serviceRetarget();                                  // the registration is sent; the stalled driver never answers
+    EXPECT_TRUE(t.seedRetargetPending());
+    g_nowNs += 21'000'000LL;
+    t.serviceRetarget();
+    EXPECT_FALSE(t.seedRetargetPending()) << "the driver was stalled: the new publication cannot have resolved";
+    const auto outcome = t.takeRetargetOutcome();
+    ASSERT_TRUE(outcome.has_value());
+    EXPECT_EQ(outcome->token, token);
+    EXPECT_FALSE(outcome->ok);
     t.setDriverStalledForTest(false);
     EXPECT_EQ(t.ingressChannel(), oldGw) << "a failed retarget keeps the old channel";
     EXPECT_EQ(t.drainingPubsForTest(), 1u) << "the Resolving registration was dropped, not drained";
@@ -1387,7 +1411,7 @@ TEST(AeronTransportRegression, RetargetWithAStreamPublicationStillResolvingLeave
     EXPECT_FALSE(t.offerOn(h, frame, sizeof frame)) << "Resolving: the registration is sent, the driver is not pumped yet";
     ASSERT_EQ(t.drainingPubsForTest(), 0u);
 
-    ASSERT_TRUE(t.retarget(newGw));
+    ASSERT_TRUE(retargetSettled(t, newGw));
     EXPECT_EQ(t.drainingPubsForTest(), 1u) << "the Resolving stream registration was kept in the slot, not drained";
     bool created = false;
     EXPECT_TRUE(createdThenReleased(t, oldGw, created)) << "the old-channel stream publication was never released";
@@ -1546,7 +1570,7 @@ TEST(InvokerTransportResponseRegression, RetargetPairsTheNewResponseSubscription
     ASSERT_TRUE(t.seedResponseCorrelated());
     const int64_t regA = t.seedResponseSubscriptionIdForTest();
 
-    ASSERT_TRUE(t.retarget(loopback(reqB), rB));
+    ASSERT_TRUE(retargetSettled(t, loopback(reqB), rB));
     EXPECT_TRUE(t.seedResponseCorrelated());
     const int64_t regB = t.seedResponseSubscriptionIdForTest();
     EXPECT_NE(regB, 0);
@@ -1555,7 +1579,7 @@ TEST(InvokerTransportResponseRegression, RetargetPairsTheNewResponseSubscription
     EXPECT_EQ(t.ingressChannel(), loopback(reqB));
 
     // Port 0 / a redirect without a port: back on the plain (declared) path.
-    ASSERT_TRUE(t.retarget(loopback(reqA)));
+    ASSERT_TRUE(retargetSettled(t, loopback(reqA)));
     EXPECT_FALSE(t.seedResponseCorrelated());
     EXPECT_EQ(t.seedPublicationChannelForTest(), loopback(reqA));
     // The retired response subscription is released at the next poll (never inside a callback).
@@ -1856,6 +1880,283 @@ TEST(InvokerTransport, RebuildResponseSubDeadlineStartsAfterTheClientIsUpRegress
     EXPECT_FALSE(t.offerOn(h, frame, sizeof frame));
     EXPECT_FALSE(t.publicationIsResponsePairedForTest(h)) << "a response subscription that never resolves is given up";
     t.setResolveClock(nullptr);
+    t.stop();
+}
+
+// ---- #767: the seed retarget is a state on the duty thread, never a blocking call
+// -------------------------------------
+
+namespace {
+// Count the frames the transport's own egress subscription delivers (an ipc ingress loops back onto it).
+int drainEgress(Transport& t) {
+    int n = 0;
+    for (int i = 0; i < 8; ++i) {
+        t.dutyCycle();
+        t.poll([&](const uint8_t*, std::size_t) { ++n; }, 10);
+    }
+    return n;
+}
+// A live count of the sub slots in use (the leak check: a superseded / failed move must leave none behind).
+int liveSubSlots(const Transport& t) {
+    int n = 0;
+    for (std::size_t i = 0; i < t.subSlotCountForTest(); ++i)
+        n += t.subSlotLiveForTest(static_cast<int32_t>(i)) ? 1 : 0;
+    return n;
+}
+}  // namespace
+
+// An unresolvable target (the driver is stalled): beginRetarget returns Pending without pumping the conductor, every
+// duty cycle returns, a leader session's publication (offerTo) keeps working, and at the resolve bound on the injected
+// clock the outcome is {token, false} with the old pair still in force.
+TEST(AeronTransportRegression, RetargetNeverBlocksTheDutyThreadRegression) {
+    FastLingerEnv env;
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3700)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const std::string leaderCh = "aeron:ipc?alias=leader";   // another channel: a leader session's publication
+    const uint8_t frame[] = {1, 2, 3, 4};
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.offerTo(leaderCh, 3700, frame, sizeof frame); }))
+        << "the leader pub never connected";
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.offer(frame, sizeof frame); })) << "the default pub never connected";
+
+    t.setDriverStalledForTest(true, 50'000'000LL);   // 50 ms bound on the injected resolve clock
+    const uint64_t pumpsBefore = t.dutyCyclePumpsForTest();
+    uint64_t token = 0;
+    ASSERT_EQ(t.beginRetarget("aeron:udp?endpoint=192.0.2.1:59998", 0, token), Transport::RetargetStart::Pending);
+    EXPECT_EQ(t.dutyCyclePumpsForTest(), pumpsBefore) << "beginRetarget must not pump the driver / conductor";
+    EXPECT_TRUE(t.seedRetargetPending());
+
+    for (int i = 0; i < 1000; ++i) {   // hard cap: every duty cycle returns, the move stays pending inside its bound
+        t.dutyCycle();
+        t.serviceRetarget();
+        ASSERT_TRUE(t.seedRetargetPending());
+    }
+    EXPECT_FALSE(t.takeRetargetOutcome().has_value()) << "no outcome inside the bound";
+    for (int i = 0; i < 3; ++i)
+        EXPECT_TRUE(t.offerTo(leaderCh, 3700, frame, sizeof frame)) << "a leader session is unaffected";
+
+    g_nowNs += 51'000'000LL;   // past the bound
+    t.serviceRetarget();
+    EXPECT_FALSE(t.seedRetargetPending());
+    const auto o = t.takeRetargetOutcome();
+    ASSERT_TRUE(o.has_value());
+    EXPECT_EQ(o->token, token);
+    EXPECT_FALSE(o->ok);
+    EXPECT_FALSE(t.takeRetargetOutcome().has_value()) << "exactly one outcome";
+    EXPECT_EQ(t.ingressChannel(), "aeron:ipc") << "a failed move keeps the old channel";
+    t.setDriverStalledForTest(false);
+    EXPECT_TRUE(pumpUntil(t, [&] { return t.offer(frame, sizeof frame); })) << "the old pair still works";
+    t.stop();
+}
+
+TEST(AeronTransportRegression, ARetargetCompletesAndSwapsRegression) {
+    const uint16_t reqA = rune::client::testing::allocFreeUdpPort(), rA = rune::client::testing::allocFreeUdpPort();
+    const uint16_t reqB = rune::client::testing::allocFreeUdpPort(), rB = rune::client::testing::allocFreeUdpPort();
+    Transport t{responseConfig(loopback(reqA), rA, 3710)};
+    t.start();
+    ASSERT_TRUE(t.seedResponseCorrelated());
+    const int32_t oldSlot = t.seedResponseSlotForTest();
+    const int64_t oldReg  = t.seedResponseSubscriptionIdForTest();
+    // A per-stream publication on the OLD default channel, Ready.
+    const Transport::PubHandle h = t.publicationHandle(loopback(reqA), 3711);
+    const uint8_t frame[] = {1};
+    ASSERT_TRUE(pumpUntil(t, [&] {
+        (void)t.offerOn(h, frame, sizeof frame);
+        return t.publicationIdentityForTest(h) != nullptr;
+    }));
+
+    uint64_t token = 0;
+    ASSERT_EQ(t.beginRetarget(loopback(reqB), rB, token), Transport::RetargetStart::Pending);
+    EXPECT_EQ(t.ingressChannel(), loopback(reqA)) << "the old channel is kept until the swap";
+    bool done = false;
+    for (int i = 0; i < 200000 && !done; ++i) {   // hard cap
+        t.dutyCycle();
+        t.serviceRetarget();
+        done = !t.seedRetargetPending();
+    }
+    ASSERT_TRUE(done) << "the retarget never completed";
+    const auto o = t.takeRetargetOutcome();
+    ASSERT_TRUE(o.has_value());
+    EXPECT_EQ(o->token, token);
+    EXPECT_TRUE(o->ok);
+    EXPECT_EQ(t.ingressChannel(), loopback(reqB));
+    const int64_t newReg = t.seedResponseSubscriptionIdForTest();
+    EXPECT_NE(newReg, 0);
+    EXPECT_NE(newReg, oldReg);
+    EXPECT_EQ(t.seedPublicationChannelForTest(), loopback(reqB) + "|response-correlation-id=" + std::to_string(newReg))
+        << "the default publication is the new one";
+    EXPECT_EQ(t.publicationIdentityForTest(h), nullptr) << "a per-stream publication on the old channel re-resolves";
+    for (int i = 0; i < 5; ++i) { t.dutyCycle(); t.poll([](const uint8_t*, std::size_t) {}, 10); }   // reap pass
+    EXPECT_FALSE(t.subSlotLiveForTest(oldSlot) && t.seedResponseSlotForTest() == oldSlot);
+    EXPECT_FALSE(t.subSlotLiveForTest(oldSlot)) << "the old response slot is retired";
+    t.stop();
+}
+
+TEST(AeronTransportRegression, ANewRetargetSupersedesAPendingOneRegression) {
+    FastLingerEnv env;
+    const uint16_t reqA = rune::client::testing::allocFreeUdpPort(), rA = rune::client::testing::allocFreeUdpPort();
+    const uint16_t reqB = rune::client::testing::allocFreeUdpPort(), rB = rune::client::testing::allocFreeUdpPort();
+    const uint16_t reqC = rune::client::testing::allocFreeUdpPort(), rC = rune::client::testing::allocFreeUdpPort();
+    Transport t{responseConfig(loopback(reqA), rA, 3720)};
+    t.start();
+    const int liveBefore = liveSubSlots(t);
+    uint64_t t1 = 0, t2 = 0;
+    ASSERT_EQ(t.beginRetarget(loopback(reqB), rB, t1), Transport::RetargetStart::Pending);
+    ASSERT_EQ(t.beginRetarget(loopback(reqC), rC, t2), Transport::RetargetStart::Pending);
+    EXPECT_NE(t1, t2);
+    for (int i = 0; i < 200000 && t.seedRetargetPending(); ++i) { t.dutyCycle(); t.serviceRetarget(); }   // hard cap
+    ASSERT_FALSE(t.seedRetargetPending());
+    const auto o1 = t.takeRetargetOutcome();
+    const auto o2 = t.takeRetargetOutcome();
+    ASSERT_TRUE(o1.has_value());
+    ASSERT_TRUE(o2.has_value());
+    EXPECT_EQ(o1->token, t1);
+    EXPECT_FALSE(o1->ok);
+    EXPECT_EQ(o2->token, t2);
+    EXPECT_TRUE(o2->ok);
+    EXPECT_FALSE(t.takeRetargetOutcome().has_value());
+    EXPECT_EQ(t.retargetOutcomesDroppedForTest(), 0u);
+    EXPECT_EQ(t.ingressChannel(), loopback(reqC));
+    // No leaked slot, no leaked registration: the abandoned move's subscription is released, nothing is left draining.
+    for (int i = 0; i < 200000 && (t.drainingPubsForTest() != 0 || liveSubSlots(t) != liveBefore); ++i) {   // hard cap
+        t.dutyCycle();
+        t.poll([](const uint8_t*, std::size_t) {}, 10);
+    }
+    EXPECT_EQ(liveSubSlots(t), liveBefore) << "the seed's pair was replaced one for one";
+    EXPECT_EQ(t.drainingPubsForTest(), 0u);
+    t.stop();
+}
+
+// #767 follow-up: a second move to the SAME target (channel + response port) joins the pending one: same token, no new
+// registration, no outcome.  Response-subscription stage (a real response port) first, then the publication stage
+// (the driver stalled past the subscription stage so the move sits in its publication stage).
+TEST(AeronTransportRegression, ASecondRetargetToTheSameTargetJoinsThePendingOneRegression) {
+    FastLingerEnv env;
+    const uint16_t reqA = rune::client::testing::allocFreeUdpPort(), rA = rune::client::testing::allocFreeUdpPort();
+    const uint16_t reqB = rune::client::testing::allocFreeUdpPort(), rB = rune::client::testing::allocFreeUdpPort();
+    Transport t{responseConfig(loopback(reqA), rA, 3740)};
+    t.start();
+    uint64_t a = 0;
+    ASSERT_EQ(t.beginRetarget(loopback(reqB), rB, a), Transport::RetargetStart::Pending);
+    const std::size_t slotsAfterFirst = t.subSlotCountForTest();
+    const int liveAfterFirst          = liveSubSlots(t);
+    const std::size_t drainAfterFirst = t.drainingPubsForTest();
+    for (int i = 0; i < 40; ++i) {
+        uint64_t again = 0;
+        ASSERT_EQ(t.beginRetarget(loopback(reqB), rB, again), Transport::RetargetStart::Pending);
+        ASSERT_EQ(again, a) << "call " << i << " must join the pending move";
+    }
+    EXPECT_EQ(t.subSlotCountForTest(), slotsAfterFirst);
+    EXPECT_EQ(liveSubSlots(t), liveAfterFirst);
+    EXPECT_EQ(t.drainingPubsForTest(), drainAfterFirst);
+    EXPECT_EQ(t.retargetsJoinedForTest(), 40u);
+    EXPECT_FALSE(t.retargetOutcomePending()) << "a join queues no outcome";
+    for (int i = 0; i < 200000 && t.seedRetargetPending(); ++i) { t.dutyCycle(); t.serviceRetarget(); }   // hard cap
+    ASSERT_FALSE(t.seedRetargetPending());
+    const auto o = t.takeRetargetOutcome();
+    ASSERT_TRUE(o.has_value());
+    EXPECT_EQ(o->token, a);
+    EXPECT_TRUE(o->ok);
+    EXPECT_FALSE(t.takeRetargetOutcome().has_value()) << "exactly one outcome";
+    EXPECT_EQ(t.ingressChannel(), loopback(reqB));
+    t.stop();
+}
+
+TEST(AeronTransportRegression, ASecondRetargetToTheSameTargetJoinsInThePublicationStageRegression) {
+    FastLingerEnv env;
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3741)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    t.setDriverStalledForTest(true, 50'000'000LL);
+    const std::string target = "aeron:udp?endpoint=192.0.2.1:59997";   // no response port: straight to the publication
+    uint64_t a = 0;
+    ASSERT_EQ(t.beginRetarget(target, 0, a), Transport::RetargetStart::Pending);
+    for (int i = 0; i < 5; ++i) { t.dutyCycle(); t.serviceRetarget(); }   // the publication registration is in flight
+    ASSERT_TRUE(t.seedRetargetPending());
+    const std::size_t drainBefore = t.drainingPubsForTest();
+    const std::size_t slotsBefore = t.subSlotCountForTest();
+    for (int i = 0; i < 40; ++i) {
+        uint64_t again = 0;
+        ASSERT_EQ(t.beginRetarget(target, 0, again), Transport::RetargetStart::Pending);
+        ASSERT_EQ(again, a);
+    }
+    EXPECT_EQ(t.drainingPubsForTest(), drainBefore) << "no registration parked by a join";
+    EXPECT_EQ(t.subSlotCountForTest(), slotsBefore);
+    EXPECT_EQ(t.retargetsJoinedForTest(), 40u);
+    EXPECT_FALSE(t.retargetOutcomePending());
+    g_nowNs += 51'000'000LL;   // past the bound
+    t.serviceRetarget();
+    ASSERT_FALSE(t.seedRetargetPending());
+    const auto o = t.takeRetargetOutcome();
+    ASSERT_TRUE(o.has_value());
+    EXPECT_EQ(o->token, a);
+    EXPECT_FALSE(o->ok);
+    EXPECT_FALSE(t.takeRetargetOutcome().has_value()) << "exactly one outcome";
+    t.setDriverStalledForTest(false);
+    t.stop();
+}
+
+// #767 follow-up: cancelling a pending move (a request to stay where we are) queues {token, false}, keeps the old pair
+// and the old channel, and nothing happens afterwards.
+TEST(AeronTransportRegression, AlreadyThereCancelsAMoveElsewhereRegression) {
+    FastLingerEnv env;
+    const uint16_t reqB = rune::client::testing::allocFreeUdpPort();
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3742)};
+    t.start();
+    const uint8_t frame[] = {1};
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.offer(frame, sizeof frame); })) << "the default pub never connected";
+    t.cancelRetarget();   // nothing pending: a no-op
+    EXPECT_FALSE(t.retargetOutcomePending());
+    const std::string pubBefore = t.seedPublicationChannelForTest();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    t.setDriverStalledForTest(true, 50'000'000LL);   // the move stays pending
+    uint64_t a = 0;
+    ASSERT_EQ(t.beginRetarget(loopback(reqB), 0, a), Transport::RetargetStart::Pending);
+    for (int i = 0; i < 3; ++i) { t.dutyCycle(); t.serviceRetarget(); }   // the publication registration is in flight
+    t.cancelRetarget();
+    EXPECT_FALSE(t.seedRetargetPending());
+    const auto o = t.takeRetargetOutcome();
+    ASSERT_TRUE(o.has_value());
+    EXPECT_EQ(o->token, a);
+    EXPECT_FALSE(o->ok);
+    EXPECT_FALSE(t.takeRetargetOutcome().has_value());
+    EXPECT_EQ(t.ingressChannel(), "aeron:ipc");
+    EXPECT_EQ(t.seedPublicationChannelForTest(), pubBefore);
+    for (int i = 0; i < 50; ++i) { t.dutyCycle(); t.serviceRetarget(); }
+    g_nowNs += 51'000'000LL;   // past the bound the cancelled move would have had
+    for (int i = 0; i < 50; ++i) { t.dutyCycle(); t.serviceRetarget(); }
+    EXPECT_FALSE(t.retargetOutcomePending()) << "later service steps do nothing";
+    EXPECT_EQ(t.ingressChannel(), "aeron:ipc");
+    t.setDriverStalledForTest(false);
+    EXPECT_TRUE(pumpUntil(t, [&] { return t.offer(frame, sizeof frame); })) << "the old pair still offers";
+    for (int i = 0; i < 200000 && t.drainingPubsForTest() != 0; ++i) {   // hard cap
+        t.dutyCycle();
+        t.poll([](const uint8_t*, std::size_t) {}, 10);
+    }
+    EXPECT_EQ(t.drainingPubsForTest(), 0u) << "the cancelled registration is released";
+    t.stop();
+}
+
+// While a retarget is pending the default publication reports "not sent" (as for a not-connected one): nothing
+// reaches the old gateway meanwhile.  An ipc ingress loops back onto the transport's own egress subscription, so a
+// frame that went out shows up there.
+TEST(AeronTransportRegression, DefaultOffersWaitWhileARetargetIsPendingRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3730)};
+    t.start();
+    const uint8_t frame[] = {9, 9, 9, 9};
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.offer(frame, sizeof frame); })) << "the default pub never connected";
+    EXPECT_GE(drainEgress(t), 1) << "an accepted frame loops back";
+
+    uint64_t token = 0;
+    const std::string newGw = loopback(rune::client::testing::allocFreeUdpPort());
+    ASSERT_EQ(t.beginRetarget(newGw, 0, token), Transport::RetargetStart::Pending);
+    EXPECT_FALSE(t.offer(frame, sizeof frame)) << "the default publication reports not-sent while the move is pending";
+    EXPECT_EQ(t.offerResult(frame, sizeof frame), Transport::OfferResult::Retry);
+    EXPECT_EQ(drainEgress(t), 0) << "nothing reached the old gateway";
+    EXPECT_TRUE(t.seedRetargetPending()) << "no duty cycle serviced it: the move is still in flight";
     t.stop();
 }
 

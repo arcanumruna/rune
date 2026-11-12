@@ -706,14 +706,20 @@ TEST(ShardConfigRegression, LastKnownLeaderFallbackNeverReplacesANewerLeader) {
     const std::string l1 = "aeron:udp?endpoint=127.0.0.1:24801";
     const std::string l2 = "aeron:udp?endpoint=127.0.0.1:24802";
     ASSERT_TRUE(agent.testRetargetSeed(l1));             // stuck to leader L
+    ASSERT_TRUE(agent.testSettleSeedMove());   // #767: the move is a state of the duty cycle
     ASSERT_TRUE(agent.testRetargetSeedToBootstrap());     // attempt 2: bootstrap; lastKnown = L
+    ASSERT_TRUE(agent.testSettleSeedMove());   // #767: the move is a state of the duty cycle
     EXPECT_EQ(agent.testSeedIngressChannel(), "aeron:ipc");
     ASSERT_TRUE(agent.testRetargetSeed(l2));             // now on a NEWER leader L2
+    ASSERT_TRUE(agent.testSettleSeedMove());   // #767: the move is a state of the duty cycle
     ASSERT_TRUE(agent.testRetargetSeedToLastKnownLeader());  // odd attempt
+    ASSERT_TRUE(agent.testSettleSeedMove());   // #767: the move is a state of the duty cycle
     EXPECT_EQ(agent.testSeedIngressChannel(), l2) << "a stale last-known leader never replaces a newer one";
     // From the bootstrap the fallback still returns to the last-known leader.
     ASSERT_TRUE(agent.testRetargetSeedToBootstrap());     // lastKnown = L2
+    ASSERT_TRUE(agent.testSettleSeedMove());   // #767: the move is a state of the duty cycle
     ASSERT_TRUE(agent.testRetargetSeedToLastKnownLeader());
+    ASSERT_TRUE(agent.testSettleSeedMove());   // #767: the move is a state of the duty cycle
     EXPECT_EQ(agent.testSeedIngressChannel(), l2);
     agent.stop();
     std::error_code ec;
@@ -760,6 +766,7 @@ TEST(ShardConfigRegression, SeedBackoffFallsBackToBootstrapGateway) {
     // Stick-to-leader onto a node that then dies: nothing listens on this port.
     const std::string deadLeader = "aeron:udp?endpoint=127.0.0.1:24799";
     ASSERT_TRUE(agent.testRetargetSeed(deadLeader));
+    ASSERT_TRUE(agent.testSettleSeedMove());   // #767: the move is a state of the duty cycle
     ASSERT_EQ(agent.testTransport().ingressChannel(), deadLeader);
     const int connectsBefore = gw->connects;
 
@@ -888,6 +895,7 @@ TEST(ShardConfigRegression, SeedBackoffReturnsToLiveLeaderWhenBootstrapDead) {
 
     // Stick-to-leader, then the bootstrap node dies for good.
     ASSERT_TRUE(agent.testRetargetSeed(leaderCh));
+    ASSERT_TRUE(agent.testSettleSeedMove());   // #767: the move is a state of the duty cycle
     bootstrap.reset();
     const int leaderConnectsBefore = leader->connects;
 

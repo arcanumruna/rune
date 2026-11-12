@@ -189,6 +189,9 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     if (transportDown()) [[unlikely]] totalWork += driveRebuild_(nowNs);
     // Down / failed: no driver / conductor pumping, no I/O of any kind.
     if (ioUp()) totalWork += transport_.dutyCycle();  // invoker: driver + conductor; thread mode: 0
+    // #767: a seed move is a state of the transport, advanced here once per cycle; its post-actions run at completion.
+    if (ioUp() && (transport_.seedRetargetPending() || transport_.retargetOutcomePending())) [[unlikely]]
+        serviceSeedMove_(nowNs);
 
     // ---- Step 1: Drain the command ring (bounded) ---------------------------
     // fix5 Important-2(d): deliberately NO unblock-on-no-progress here (nor in
@@ -816,38 +819,149 @@ ClientAgent::StateSnapshot ClientAgent::stateAndSessionId() const noexcept {
 // Seed-transport helpers (agent thread only)
 // ---------------------------------------------------------------------------
 
-bool ClientAgent::retarget(const std::string& newIngressChannel, int32_t responsePort) noexcept {
-    // FIX F8: forward to the transport's noexcept, non-throwing retarget.
-    if (responsePort == 0) responsePort = knownResponsePort_(newIngressChannel);
-    const bool moved = transport_.retarget(newIngressChannel, responsePort);
-    if (moved) {
-        seedSession().responsePort = responsePort;
-        seedSession().pair         = ResponsePair::Fresh;   // the retarget built a fresh pair
-        invalidateRouteSessions_();  // DR client bug 1: the seed moved
+ClientAgent::SeedMove ClientAgent::beginSeedMove_(PendingSeedMove&& m, uint64_t& token) noexcept {
+    uint64_t t = 0;
+    if (transport_.beginRetarget(m.channel, m.responsePort, t) == transport::AeronTransport::RetargetStart::Failed)
+        return SeedMove::Failed;   // old pair intact; a move it superseded is answered by its (failed) outcome
+    if (pendingMove_ && pendingMove_->token == t) {
+        // Joined: the transport took this request for the move already pending (the same target).  That move serves
+        // both: no superseded result, the FIRST request's post-actions stand (every kind sets the same seed fields,
+        // see applySeedMove_), except that a fresh connect asked by either request is kept.
+        pendingMove_->connectNow = pendingMove_->connectNow || m.connectNow;
+        token                    = t;
+        return SeedMove::Pending;
     }
-    return moved;
+    if (pendingMove_) {   // superseded: its failed result is published first
+        publishSeedMoveResult_(SeedMoveResult{pendingMove_->token, pendingMove_->kind, false});
+    }
+    m.token      = t;
+    pendingMove_ = std::move(m);
+    token        = t;
+    return SeedMove::Pending;
 }
 
-bool ClientAgent::failoverSeedTo(const std::string& channel, int64_t nowNs, bool connectNow) noexcept {
-    if (!ioUp() || channel.empty()) return false;
+void ClientAgent::cancelPendingSeedMove_() noexcept {
+    // Only a move still in flight: one the transport already finished keeps its queued outcome (and post-actions).
+    if (!pendingMove_ || !transport_.seedRetargetPending()) return;
+    transport_.cancelRetarget();   // its outcome {token, false} is ignored by serviceSeedMove_ (no such pending move)
+    publishSeedMoveResult_(SeedMoveResult{pendingMove_->token, pendingMove_->kind, false});
+    pendingMove_.reset();
+}
+
+void ClientAgent::publishSeedMoveResult_(const SeedMoveResult& r) noexcept {
+    if (seedMoveResultCount_ == kMaxSeedMoveResults) {   // the owner only reads the newest; drop the oldest
+        seedMoveResultHead_ = (seedMoveResultHead_ + 1) % kMaxSeedMoveResults;
+        --seedMoveResultCount_;
+    }
+    seedMoveResults_[(seedMoveResultHead_ + seedMoveResultCount_) % kMaxSeedMoveResults] = r;
+    ++seedMoveResultCount_;
+}
+
+std::optional<ClientAgent::SeedMoveResult> ClientAgent::takeSeedMoveResult() noexcept {
+    if (seedMoveResultCount_ == 0) return std::nullopt;
+    const SeedMoveResult r = seedMoveResults_[seedMoveResultHead_];
+    seedMoveResultHead_ = (seedMoveResultHead_ + 1) % kMaxSeedMoveResults;
+    --seedMoveResultCount_;
+    return r;
+}
+
+void ClientAgent::serviceSeedMove_(int64_t nowNs) noexcept {
+    transport_.serviceRetarget();
+    while (const auto o = transport_.takeRetargetOutcome()) {
+        // superseded: its result was published already
+        if (!pendingMove_ || pendingMove_->token != o->token) continue;
+        const PendingSeedMove m = std::move(*pendingMove_);
+        pendingMove_.reset();
+        if (o->ok) applySeedMove_(m, nowNs);
+        publishSeedMoveResult_(SeedMoveResult{m.token, m.kind, o->ok});
+    }
+}
+
+void ClientAgent::applySeedMove_(const PendingSeedMove& m, int64_t nowNs) noexcept {
+    // The post-actions of each kind, exactly as they ran after the (formerly blocking) transport retarget succeeded.
+    Session& seed = seedSession();
     try {
-        if (transport_.ingressChannel() != channel) {
-            const int32_t port = knownResponsePort_(channel);
-            if (!transport_.retarget(channel, port)) return false;  // old pub intact: the owner tries the next one
-            Session& seed             = seedSession();
-            seed.currentLeaderChannel = channel;
-            seed.currentLeaderNode    = -1;   // learnt from the next metadata answer
-            seed.responsePort         = port;
-            seed.pair                 = ResponsePair::Fresh;   // fresh pair
-            invalidateRouteSessions_();
+        switch (m.kind) {
+            case SeedMoveKind::ClientRetarget:
+                seed.responsePort = m.responsePort;
+                seed.pair         = ResponsePair::Fresh;   // the retarget built a fresh pair
+                invalidateRouteSessions_();                // DR client bug 1: the seed moved
+                break;
+            case SeedMoveKind::Failover:
+                seed.currentLeaderChannel = m.channel;
+                seed.currentLeaderNode    = -1;   // learnt from the next metadata answer
+                seed.responsePort         = m.responsePort;
+                seed.pair                 = ResponsePair::Fresh;   // fresh pair
+                invalidateRouteSessions_();
+                // A fresh session there (resetting the old broker session id: that broker is gone, a resume hint would
+                // only cost the new one a SessionExpired).
+                if (m.connectNow) seed.machine.forceReconnect(nowNs);
+                break;
+            case SeedMoveKind::ConnectRedirect:
+                seed.currentLeaderChannel = m.channel;
+                seed.currentLeaderNode    = -1;   // the node id is learnt from the metadata answer
+                seed.responsePort         = m.responsePort;
+                seed.pair                 = ResponsePair::Fresh;   // the retarget built a fresh pair
+                invalidateRouteSessions_();       // DR client bug 1: the seed moved
+                break;
+            case SeedMoveKind::Bootstrap:
+                seed.lastKnownLeaderChannel      = m.leaving;
+                seed.lastKnownLeaderNode         = m.leavingNode;
+                seed.lastKnownLeaderResponsePort = m.leavingPort;
+                seed.responsePort                = m.responsePort;
+                seed.pair                        = ResponsePair::Fresh;   // fresh pair
+                seed.currentLeaderChannel        = m.channel;
+                seed.currentLeaderNode           = -1;  // unknown until the gateway redirects us again
+                invalidateRouteSessions_();             // DR client bug 1: the seed moved
+                break;
+            case SeedMoveKind::LastKnownLeader:
+                seed.currentLeaderChannel = m.channel;
+                seed.currentLeaderNode    = m.leavingNode;
+                seed.responsePort         = m.responsePort;
+                seed.pair                 = ResponsePair::Fresh;   // fresh pair
+                invalidateRouteSessions_();  // DR client bug 1: the seed moved
+                break;
         }
     } catch (...) {
-        return false;  // allocation failure (cold path): the next candidate / pass retries
+        // allocation failure (cold path): the seed's channel strings keep their old value
     }
-    // A fresh session there (resetting the old broker session id: that broker
-    // is gone, a resume hint would only cost the new one a SessionExpired).
+}
+
+ClientAgent::SeedMove ClientAgent::retarget(const std::string& newIngressChannel, int32_t responsePort,
+                                            uint64_t& token) noexcept {
+    // FIX F8: forward to the transport's noexcept, non-throwing retarget.
+    try {
+        if (responsePort == 0) responsePort = knownResponsePort_(newIngressChannel);
+        PendingSeedMove m;
+        m.kind         = SeedMoveKind::ClientRetarget;
+        m.channel      = newIngressChannel;
+        m.responsePort = responsePort;
+        return beginSeedMove_(std::move(m), token);
+    } catch (...) {
+        return SeedMove::Failed;
+    }
+}
+
+ClientAgent::SeedMove ClientAgent::failoverSeedTo(const std::string& channel, int64_t nowNs, bool connectNow,
+                                                  uint64_t& token) noexcept {
+    if (!ioUp() || channel.empty()) return SeedMove::Failed;
+    try {
+        if (transport_.ingressChannel() != channel) {
+            PendingSeedMove m;
+            m.kind         = SeedMoveKind::Failover;
+            m.channel      = channel;
+            m.responsePort = knownResponsePort_(channel);
+            m.connectNow   = connectNow;
+            return beginSeedMove_(std::move(m), token);   // Failed: old pub intact, the owner tries the next one
+        }
+    } catch (...) {
+        return SeedMove::Failed;  // allocation failure (cold path): the next candidate / pass retries
+    }
+    // Already there: a move elsewhere still pending is cancelled (the request is to stay), then a fresh session there
+    // (resetting the old broker session id).
+    cancelPendingSeedMove_();
     if (connectNow) seedSession().machine.forceReconnect(nowNs);
-    return true;
+    return SeedMove::Done;
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,16 +1519,19 @@ bool ClientAgent::retargetSeedOnConnectRedirect_(const std::string& endpoint, in
     try {
         // "host:port" or a full Aeron channel (the broker sends the channel).
         const std::string channel = endpoint.rfind("aeron:", 0) == 0 ? endpoint : "aeron:udp?endpoint=" + endpoint;
-        if (transport_.ingressChannel() == channel) return true;
+        if (transport_.ingressChannel() == channel) {
+            cancelPendingSeedMove_();   // already there: a move elsewhere still pending is cancelled
+            return true;
+        }
         if (responsePort == 0) responsePort = knownResponsePort_(channel);   // Metadata may know it
-        if (!transport_.retarget(channel, responsePort)) return false;   // old pub intact; the resend is budget-bounded
-        Session& seed            = seedSession();
-        seed.currentLeaderChannel = channel;
-        seed.currentLeaderNode    = -1;   // the node id is learnt from the metadata answer
-        seed.responsePort         = responsePort;
-        seed.pair                 = ResponsePair::Fresh;   // the retarget built a fresh pair
-        invalidateRouteSessions_();       // DR client bug 1: the seed moved
-        return true;
+        PendingSeedMove m;
+        m.kind         = SeedMoveKind::ConnectRedirect;
+        m.channel      = channel;
+        m.responsePort = responsePort;
+        // Pending: the machine's resend finds the default publication "not sent" and re-offers the same request
+        // until the swap (#767); Failed: old pub intact, the resend is budget-bounded.
+        uint64_t token = 0;
+        return beginSeedMove_(std::move(m), token) != SeedMove::Failed;
     } catch (...) {
         return false;   // allocation failure (cold path): keep the old pub
     }
@@ -1442,24 +1559,30 @@ bool SessionEndpointIo::retargetToLastKnownLeader() noexcept {
 
 bool ClientAgent::retargetSeedToBootstrap_() noexcept {
     const std::string& bootstrap = cfg_.transport.ingressChannel;  // never retargeted
-    if (transport_.ingressChannel() == bootstrap) return true;
+    if (transport_.ingressChannel() == bootstrap) {
+        cancelPendingSeedMove_();   // already there: a move elsewhere still pending is cancelled
+        return true;
+    }
     // fix2 A-B1: remember where we were stuck BEFORE leaving — the bootstrap may
     // be the dead node, and the next odd Backoff attempt returns here.  Captured
     // from the transport (the real current channel) and copied, since retarget()
     // replaces the transport's channel string.
     const std::string leaving = transport_.ingressChannel();
     const int32_t bootstrapPort = cfg_.transport.gatewayResponseControlPort;
-    if (!transport_.retarget(bootstrap, bootstrapPort)) return false;  // old pub intact; next attempt retries
-    Session& seed               = seedSession();
-    seed.lastKnownLeaderChannel = leaving;
-    seed.lastKnownLeaderNode    = seed.currentLeaderNode;
-    seed.lastKnownLeaderResponsePort = seed.responsePort;
-    seed.responsePort           = bootstrapPort;
-    seed.pair                   = ResponsePair::Fresh;   // fresh pair
-    seed.currentLeaderChannel   = bootstrap;
-    seed.currentLeaderNode      = -1;  // unknown until the gateway redirects us again
-    invalidateRouteSessions_();        // DR client bug 1: the seed moved
-    return true;
+    try {
+        PendingSeedMove m;
+        m.kind         = SeedMoveKind::Bootstrap;
+        m.channel      = bootstrap;
+        m.responsePort = bootstrapPort;
+        m.leaving      = leaving;
+        m.leavingNode  = seedSession().currentLeaderNode;
+        m.leavingPort  = seedSession().responsePort;
+        uint64_t token = 0;
+        // Failed: old pub intact; next attempt retries
+        return beginSeedMove_(std::move(m), token) != SeedMove::Failed;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
@@ -1469,14 +1592,21 @@ bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
     // NEWER than lastKnownLeader (attempt 2's retarget failed, or a redirect
     // moved it) — never trade it for the stale one.
     if (transport_.ingressChannel() != cfg_.transport.ingressChannel) return true;
-    if (transport_.ingressChannel() == seed.lastKnownLeaderChannel) return true;
-    if (!transport_.retarget(seed.lastKnownLeaderChannel, seed.lastKnownLeaderResponsePort)) return false;  // next odd attempt retries
-    seed.currentLeaderChannel = seed.lastKnownLeaderChannel;
-    seed.currentLeaderNode    = seed.lastKnownLeaderNode;
-    seed.responsePort         = seed.lastKnownLeaderResponsePort;
-    seed.pair                 = ResponsePair::Fresh;   // fresh pair
-    invalidateRouteSessions_();  // DR client bug 1: the seed moved
-    return true;
+    if (transport_.ingressChannel() == seed.lastKnownLeaderChannel) {
+        cancelPendingSeedMove_();   // already there: a move elsewhere still pending is cancelled
+        return true;
+    }
+    try {
+        PendingSeedMove m;
+        m.kind         = SeedMoveKind::LastKnownLeader;
+        m.channel      = seed.lastKnownLeaderChannel;
+        m.responsePort = seed.lastKnownLeaderResponsePort;
+        m.leavingNode  = seed.lastKnownLeaderNode;
+        uint64_t token = 0;
+        return beginSeedMove_(std::move(m), token) != SeedMove::Failed;   // Failed: the next odd attempt retries
+    } catch (...) {
+        return false;
+    }
 }
 
 bool ClientAgent::offerControlTo(Session& owner, const uint8_t* buf, std::size_t len, bool clear) noexcept {

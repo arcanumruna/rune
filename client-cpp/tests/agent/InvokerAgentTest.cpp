@@ -1,12 +1,14 @@
 // tests/agent/InvokerAgentTest.cpp — ClientAgent in invoker mode against the
 // single-threaded InvokerGateway: no sleeps, iteration-capped drive loops.
 #include <filesystem>
+#include "../support/FreePort.h"
 #include "../support/InvokerGateway.h"
 
 #include <rune/client/agent/ClientAgent.h>
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <string>
@@ -310,4 +312,251 @@ TEST(InvokerAgent, CloseDrainTerminatesWhenTheRingCannotBeUnblockedRegression) {
 
     EXPECT_EQ(total, 0);
     EXPECT_EQ(agent.testCloseDrainUnblockCalls(), rca::ClientAgent::kCloseDrainMaxFailedUnblocks);
+}
+
+// ---- #767: a seed move is a state of the duty cycle, never a block
+// ---------------------------------------------------
+
+namespace {
+int64_t g_fakeNowNs = 0;
+int64_t fakeNow() noexcept { return g_fakeNowNs; }
+std::string loopbackUdp(uint16_t port) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port); }
+rca::AgentConfig invokerAgentConfig(const std::string& ingress, int32_t in, int32_t eg) {
+    rca::AgentConfig cfg;
+    cfg.transport.ingressChannel  = ingress;
+    cfg.transport.ingressStreamId = in;
+    cfg.transport.egressChannel   = "aeron:ipc";
+    cfg.transport.egressStreamId  = eg;
+    cfg.transport.dataDir = std::filesystem::temp_directory_path().string() + "/inv_agent_" +
+                            std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
+    cfg.transport.driverMode   = rune::client::transport::DriverMode::Invoker;
+    cfg.session.egressChannel  = "aeron:ipc";
+    cfg.session.egressStreamId = eg;
+    return cfg;
+}
+}  // namespace
+
+// The issue's symptom: the seed's move to an unresolvable target used to block the duty thread for the resolve bound,
+// so every other session's keepalive stalled.  Now the move is pending for the full bound while each duty cycle takes
+// exactly one conductor pass and a leader session's keepalives keep their cadence (injected clock).  The stalled
+// driver (test seam) stands for "the target never resolves"; the leader's Pings, offered during the window, reach the
+// gateway once it runs again.
+TEST(ClientAgentRegression, OtherSessionsKeepAliveWhileTheSeedRetargetsRegression) {
+    const uint16_t leaderPort = rune::client::testing::allocFreeUdpPort();
+    rca::AgentConfig cfg = invokerAgentConfig("aeron:ipc", 3540, 3541);
+    cfg.transport.egressChannel = "aeron:ipc";
+    rca::ClientAgent agent(cfg);
+    agent.start();
+    test_support::InvokerGateway gw(cfg.transport.dataDir + "/aeron", "aeron:ipc", 3540, "aeron:ipc", 3541);
+    const std::string leaderCh = loopbackUdp(leaderPort);
+    const int leaderEp = gw.addNode(leaderCh, 3540);
+    (void)leaderEp;
+    g_fakeNowNs = 1'000'000'000'000LL;
+    constexpr int64_t kStep = 10'000'000LL;   // 10 ms per duty cycle
+    auto cycle = [&] { g_fakeNowNs += kStep; agent.doWork(g_fakeNowNs); gw.pump(); };
+    auto drive = [&](auto&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            cycle();
+            if (pred()) return true;
+        }
+        return false;
+    };
+    ASSERT_TRUE(drive([&] { return gw.ready(); }));
+    ASSERT_TRUE(agent.submitConnect());
+    ASSERT_TRUE(drive([&] { return agent.sessionState() == rcs::SessionState::Connected; }));
+    rcs::SessionMachine& leader = agent.sessionForEndpointForTest(leaderCh);
+    ASSERT_TRUE(drive([&] { return leader.state() == rcs::SessionState::Connected; }))
+        << "the leader session never connected";
+    const int64_t leaderKeepalive = leader.keepaliveCorrelationId();
+    auto leaderPings = [&] {
+        int n = 0;
+        for (const int64_t c : gw.pingCorrIds) n += c == leaderKeepalive ? 1 : 0;
+        return n;
+    };
+
+    // The move: the driver is stalled (nothing resolves), the resolve bound is 3 s on the injected clock.
+    agent.testTransportMut().setResolveClock(&fakeNow);
+    agent.testTransportMut().setDriverStalledForTest(true, 3'000'000'000LL);
+    const int pingsBefore = leaderPings();
+    uint64_t token = 0;
+    const uint64_t pumpsAtBegin = agent.testTransportMut().dutyCyclePumpsForTest();
+    ASSERT_TRUE(agent.testRetargetSeed(loopbackUdp(rune::client::testing::allocFreeUdpPort()), 0, &token));
+    EXPECT_EQ(agent.testTransportMut().dutyCyclePumpsForTest(), pumpsAtBegin) << "starting the move pumped (it blocks)";
+    ASSERT_TRUE(agent.testSeedMovePending());
+    const int64_t t0 = g_fakeNowNs;
+    int cycles = 0;
+    uint64_t maxPumpsPerCycle = 0;
+    while (agent.testSeedMovePending() && cycles < 2000) {   // hard cap
+        const uint64_t pumps = agent.testTransportMut().dutyCyclePumpsForTest();
+        g_fakeNowNs += kStep;
+        agent.doWork(g_fakeNowNs);
+        maxPumpsPerCycle = std::max(maxPumpsPerCycle, agent.testTransportMut().dutyCyclePumpsForTest() - pumps);
+        ++cycles;
+    }
+    const int64_t pendingNs = g_fakeNowNs - t0;
+    EXPECT_FALSE(agent.testSeedMovePending()) << "the move never ended";
+    EXPECT_GE(pendingNs, 3'000'000'000LL) << "the move was pending for the full resolve bound";
+    EXPECT_LE(maxPumpsPerCycle, 1u) << "a duty cycle took more than one pump: something blocked inside it";
+    const auto res = agent.takeSeedMoveResult();
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->token, token);
+    EXPECT_FALSE(res->ok) << "the target never resolved";
+    EXPECT_EQ(agent.seedMoves(), 0u) << "a failed move changed nothing on the seed";
+
+    // The leader's keepalives (1 s interval) were offered through the window; the gateway runs again and sees them.
+    agent.testTransportMut().setDriverStalledForTest(false);
+    ASSERT_TRUE(drive([&] { return leaderPings() >= pingsBefore + 2; }));
+    EXPECT_GE(leaderPings() - pingsBefore, 2)
+        << "the leader's keepalives kept their cadence while the seed's move was pending";
+    EXPECT_EQ(leader.state(), rcs::SessionState::Connected);
+}
+
+// A new seed move supersedes a pending one: the first is answered {token, failed} at once, the second completes.
+TEST(ClientAgentRegression, ASupersededSeedMoveIsAnsweredFailedRegression) {
+    rca::AgentConfig cfg = invokerAgentConfig("aeron:ipc", 3550, 3551);
+    rca::ClientAgent agent(cfg);
+    agent.start();
+    const std::string c1 = loopbackUdp(rune::client::testing::allocFreeUdpPort());
+    const std::string c2 = loopbackUdp(rune::client::testing::allocFreeUdpPort());
+    uint64_t t1 = 0, t2 = 0;
+    ASSERT_TRUE(agent.testRetargetSeed(c1, 0, &t1));
+    ASSERT_TRUE(agent.testRetargetSeed(c2, 0, &t2));
+    EXPECT_NE(t1, t2);
+    const auto r1 = agent.takeSeedMoveResult();
+    ASSERT_TRUE(r1.has_value()) << "the superseded move's failure is published at once";
+    EXPECT_EQ(r1->token, t1);
+    EXPECT_FALSE(r1->ok);
+    ASSERT_TRUE(agent.testSettleSeedMove());
+    const auto r2 = agent.takeSeedMoveResult();
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r2->token, t2);
+    EXPECT_TRUE(r2->ok);
+    EXPECT_FALSE(agent.takeSeedMoveResult().has_value());
+    EXPECT_EQ(agent.testSeedIngressChannel(), c2);
+    EXPECT_EQ(agent.seedMoves(), 1u) << "only the move that completed ran its post-actions";
+}
+
+// The machine path: a connect-time Redirect to a resolvable endpoint.  The ConnectRequest is NOT sent to the old
+// gateway again, waits (re-offered under the SAME correlation id) until the swap, reaches the new gateway, and the
+// session connects.  The redirect / connect-retry budgets are what the blocking retarget spent: one redirect, no
+// connect timeout.
+TEST(ClientAgentRegression, AConnectRedirectWaitsForTheSwapAndSpendsTheSameBudgetsRegression) {
+    const uint16_t aPort = rune::client::testing::allocFreeUdpPort();
+    const uint16_t bPort = rune::client::testing::allocFreeUdpPort();
+    rca::AgentConfig cfg = invokerAgentConfig(loopbackUdp(aPort), 3560, 3561);
+    rca::ClientAgent agent(cfg);
+    agent.start();
+    test_support::InvokerGateway gw(cfg.transport.dataDir + "/aeron", loopbackUdp(aPort), 3560, "aeron:ipc", 3561);
+    const int b = gw.addNode(loopbackUdp(bPort), 3560);
+    gw.connectRedirect[0] = "127.0.0.1:" + std::to_string(bPort);
+    auto drive = [&](auto&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            agent.doWork(monoNs());
+            gw.pump();
+            if (pred()) return true;
+        }
+        return false;
+    };
+    ASSERT_TRUE(drive([&] { return gw.ready(); }));
+    ASSERT_TRUE(agent.submitConnect());
+    int maxRedirects = 0;
+    uint64_t maxConnectFailures = 0;
+    bool sawPendingWithConnecting = false;
+    ASSERT_TRUE(drive([&] {
+        const auto& m = agent.seedMachine();
+        maxRedirects = std::max(maxRedirects, m.redirectCount());
+        maxConnectFailures = std::max(maxConnectFailures, m.connectFailures());
+        sawPendingWithConnecting |= agent.testSeedMovePending() && m.state() == rcs::SessionState::Connecting;
+        return agent.sessionState() == rcs::SessionState::Connected;
+    })) << "the seed never connected on the redirected gateway";
+    EXPECT_TRUE(sawPendingWithConnecting) << "the connect waited inside the pending move (it was not blocking)";
+    EXPECT_EQ(gw.connectsAt[0], 1) << "the ConnectRequest never went back to the redirecting gateway";
+    ASSERT_GE(gw.connectsAt[b], 1);
+    ASSERT_EQ(static_cast<int>(gw.connectCorrIds.size()), gw.connectsAt[0] + gw.connectsAt[b]);
+    for (std::size_t i = 2; i < gw.connectCorrIds.size(); ++i)
+        EXPECT_EQ(gw.connectCorrIds[i], gw.connectCorrIds[1]) << "re-offers during the move keep the correlation id";
+    EXPECT_NE(gw.connectCorrIds[1], gw.connectCorrIds[0]);
+    EXPECT_EQ(maxRedirects, 1) << "one redirect spent";
+    EXPECT_EQ(maxConnectFailures, 0u) << "no connect timeout was spent while the move was pending";
+    EXPECT_EQ(agent.testSeedIngressChannel(), loopbackUdp(bPort));
+}
+
+// ---- #767 follow-up: a request to stay cancels a pending move elsewhere; a second move to the same target joins
+// -----------------------------------------------------------------------------------------------------------
+
+// A request to stay where the seed is ("already there") while a move elsewhere is pending cancels that move: its
+// {token, false} result is published once, the seed never swaps to the other target (driven well past the resolve
+// bound with the driver running), and the old pair keeps offering.  Through failoverSeedTo's and the bootstrap
+// fallback's "already there" returns.
+TEST(ClientAgentRegression, ARequestToStayCancelsAPendingSeedMoveRegression) {
+    rca::AgentConfig cfg = invokerAgentConfig("aeron:ipc", 3570, 3571);
+    rca::ClientAgent agent(cfg);
+    agent.start();
+    test_support::InvokerGateway gw(cfg.transport.dataDir + "/aeron", "aeron:ipc", 3570, "aeron:ipc", 3571);
+    g_fakeNowNs = 1'000'000'000'000LL;
+    agent.testTransportMut().setResolveClock(&fakeNow);
+    for (int i = 0; i < 20000 && !gw.ready(); ++i) { g_fakeNowNs += 1'000'000LL; agent.doWork(g_fakeNowNs); gw.pump(); }
+    ASSERT_TRUE(gw.ready());
+    const std::string current = agent.testSeedIngressChannel();
+    for (int variant = 0; variant < 2; ++variant) {
+        agent.testTransportMut().setDriverStalledForTest(true, 3'000'000'000LL);   // the move stays pending
+        const std::string other = loopbackUdp(rune::client::testing::allocFreeUdpPort());
+        uint64_t token = 0;
+        ASSERT_TRUE(agent.testRetargetSeed(other, 0, &token));
+        ASSERT_TRUE(agent.testSeedMovePending());
+        EXPECT_FALSE(agent.takeSeedMoveResult().has_value());
+        if (variant == 0) {
+            uint64_t t2 = 0;
+            EXPECT_EQ(agent.failoverSeedTo(current, g_fakeNowNs, /*connectNow=*/false, t2),
+                      rca::ClientAgent::SeedMove::Done);
+        } else {
+            EXPECT_TRUE(agent.testRetargetSeedToBootstrap());   // the bootstrap is where the seed is
+        }
+        EXPECT_FALSE(agent.testSeedMovePending()) << "variant " << variant << ": the move is cancelled";
+        const auto r = agent.takeSeedMoveResult();
+        ASSERT_TRUE(r.has_value()) << "variant " << variant;
+        EXPECT_EQ(r->token, token);
+        EXPECT_FALSE(r->ok);
+        EXPECT_FALSE(agent.takeSeedMoveResult().has_value()) << "published once";
+        agent.testTransportMut().setDriverStalledForTest(false);
+        for (int i = 0; i < 2000; ++i) {   // hard cap, well past the resolve bound (10 ms steps = 20 s)
+            g_fakeNowNs += 10'000'000LL;
+            agent.doWork(g_fakeNowNs);
+            gw.pump();
+        }
+        EXPECT_EQ(agent.testSeedIngressChannel(), current) << "the seed never swapped to the cancelled target";
+        EXPECT_FALSE(agent.takeSeedMoveResult().has_value()) << "no later result for the cancelled token";
+        EXPECT_EQ(agent.seedMoves(), 0u);
+        const uint8_t frame[] = {1, 2, 3, 4};
+        bool offered = false;
+        for (int i = 0; i < 4000 && !offered; ++i) {   // hard cap
+            agent.doWork(g_fakeNowNs);
+            gw.pump();
+            offered = agent.testTransportMut().offer(frame, sizeof frame);
+        }
+        EXPECT_TRUE(offered) << "offers flow on the old channel again";
+    }
+}
+
+// Two moves to the same target join: one transport move, ONE result {token, ok}, the post-actions applied once.
+TEST(ClientAgentRegression, JoinedSeedMovesPublishOneResultRegression) {
+    rca::AgentConfig cfg = invokerAgentConfig("aeron:ipc", 3580, 3581);
+    rca::ClientAgent agent(cfg);
+    agent.start();
+    const std::string target = loopbackUdp(rune::client::testing::allocFreeUdpPort());
+    uint64_t a = 0, b = 0;
+    ASSERT_TRUE(agent.testRetargetSeed(target, 0, &a));
+    ASSERT_TRUE(agent.testRetargetSeed(target, 0, &b));
+    EXPECT_EQ(a, b) << "the second move joined the first";
+    EXPECT_FALSE(agent.takeSeedMoveResult().has_value()) << "a join publishes no superseded result";
+    ASSERT_TRUE(agent.testSettleSeedMove());
+    const auto r = agent.takeSeedMoveResult();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->token, a);
+    EXPECT_TRUE(r->ok);
+    EXPECT_FALSE(agent.takeSeedMoveResult().has_value()) << "exactly one result";
+    EXPECT_EQ(agent.seedMoves(), 1u) << "the post-actions ran once";
+    EXPECT_EQ(agent.testSeedIngressChannel(), target);
 }

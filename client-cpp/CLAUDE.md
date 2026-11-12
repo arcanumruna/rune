@@ -65,6 +65,24 @@ Bottom to top — each layer is a separate CMake target (see §3):
 | Group | `group/{GroupConsumer,GroupConsumerHub}` | Consumer-group membership, assignment, auto/sync offset commit. |
 | Support | `Key`, `TopicHandle`, `codec/{Codec,DataCodec}`, `Version` | Keys, topic ids, codec adapters over `protocol/`. |
 
+#### Moving the seed (redirect, failover, bootstrap fallback)
+The seed session's control path is the transport's one default publication. Moving it (a data-op or connect-time
+`Redirect`, a seed failover, the Backoff fallback to the bootstrap / last-known leader) is **asynchronous**: it is a
+state of the transport (`AeronTransport::beginRetarget` / `serviceRetarget`), never a blocking call on the duty
+thread. `beginRetarget` only registers the new response subscription and returns `Pending`; each duty cycle
+(`ClientAgent::doWork`) then resolves the subscription, then the response-correlated publication, bounded by the
+resolve clock (5 s each), and swaps when both are Ready. Meanwhile the OLD pair stays in force but quiet: offers on the
+default publication report "not sent" (as for a not-connected one), so nothing reaches the old gateway and the session
+machine re-offers the same ConnectRequest (same correlation id) until the swap; leader sessions (`offerTo`) are
+unaffected, so other sessions' keepalives keep their cadence. A move that does not resolve in its bound fails and keeps
+the old pair. The agent keeps one `PendingSeedMove`; its post-actions (the seed's channel / port / pair state, route
+invalidation, the failover's fresh connect) run at completion, and `takeSeedMoveResult()` tells the `Client` the
+outcome (success, failure, or superseded by a newer move) so its redirect / failover bookkeeping runs at the same point.
+A second move to the SAME target (channel and response port) joins the pending one (same token, nothing new
+registered; a burst of redirects to one leader is one move, each op keeping its own failure bookkeeping), while a move to
+ANOTHER target supersedes it. A request to stay on the current channel ("already there") cancels a pending move elsewhere
+(`AeronTransport::cancelRetarget`, published as a failed result).
+
 ### 2.1 Producer (`producer/`)
 Tier-1 producer with a **zero per-send heap allocation** fast path. App threads
 call `send()`/`flush()` → write a compact `SEND_RECORD` into the ring (the

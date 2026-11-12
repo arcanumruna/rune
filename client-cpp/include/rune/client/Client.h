@@ -685,7 +685,10 @@ public:
     /// Moves the seed's physical ingress channel (the next rebuild() keeps it); applied on the duty thread at the next doWork().
     void testSetSeedIngressChannel(const std::string& channel) { (void)agent_.submitTestSeedIngress(channel); }
     /// Moves the seed to `channel` as a completed failover would (Invoker owner only).
-    bool testRetargetSeed(const std::string& channel) { return agent_.failoverSeedTo(channel, now(), true); }
+    bool testRetargetSeed(const std::string& channel) {
+        uint64_t token = 0;
+        return agent_.failoverSeedTo(channel, now(), true, token) != agent::ClientAgent::SeedMove::Failed;
+    }
     /// Transport rebuilds completed so far (duty thread, or after it stopped).
     [[nodiscard]] uint64_t testTransportRebuilds() const noexcept { return agent_.transportRebuilds(); }
     /// Failed rebuild attempts of the current outage (duty thread, or after it stopped).
@@ -877,6 +880,10 @@ public:
     [[nodiscard]] uint64_t testCloseDeadlineHits() const noexcept { return closeDeadlineHits_; }
     [[nodiscard]] uint64_t testMetadataViaOtherSession() const noexcept { return metadataViaOtherSession_; }
     [[nodiscard]] const std::string& testSeedChannel() const noexcept { return agent_.seedChannel(); }
+    /// #767: how often the seed's default publication moved (a completed retarget / failover).
+    [[nodiscard]] uint64_t testSeedMoves() const noexcept { return agent_.seedMoves(); }
+    /// #767 follow-up: redirects whose target could not be reached (the failure body ran).
+    [[nodiscard]] uint64_t testUnreachableRedirects() const noexcept { return unreachableRedirects_; }
     /// Fix round 1 test seam (duty thread / Invoker owner): an urgent metadata ask.
     void testRequestMetadataNow() noexcept { lastUrgentMetadataNs_ = INT64_MIN; requestMetadataNow_(); }
     /// True while a MetadataRequest is unanswered (its answer timer is armed).  Test seam (duty thread).
@@ -2178,6 +2185,25 @@ private:
     enum class RedirectFollow : uint8_t { PerPartition, Hold, BySeed };
     [[nodiscard]] RedirectFollow redirectFollowFor_(const std::string& endpoint) const;
     void redirectBySeed_(int64_t corrId, const std::string& newEndpoint, int32_t responsePort = 0);
+    /// #767: the seed move is asynchronous.  The two outcomes of a redirect's move, each exactly once (the code exists
+    /// once, whether the move completed at once or later); `superseded`: a newer redirect replaced it, so only this
+    /// op's own bookkeeping runs.
+    void onSeedRedirectMoved_(const std::string& newChannel);
+    void onSeedRedirectFailed_(int64_t corrId, const std::string& newEndpoint, bool superseded);
+    void onSeedFailoverMoved_(const std::string& target, bool connectNow, uint32_t attempt) noexcept;
+    void onSeedFailoverFailed_() noexcept;
+    /// Finish the seed moves the agent completed (their results carry the token of the move that was started).
+    int  serviceSeedMoves_();
+    /// One redirect waiting on the seed move `token`; further redirects to the SAME target join it (`joined`: their
+    /// own op and endpoint, cold path) - the move's moved / failed body runs once, the per-op part once per op.
+    struct JoinedRedirect { int64_t corrId; std::string endpoint; };
+    struct PendingRedirect {
+        uint64_t token; int64_t corrId; std::string endpoint; std::string channel;
+        std::vector<JoinedRedirect> joined;
+    };
+    std::optional<PendingRedirect> pendingRedirect_;
+    struct PendingFailover { uint64_t token; std::string target; bool connectNow; uint32_t attempt; };
+    std::optional<PendingFailover> pendingFailover_;
     int  releaseHeldRedirectFollows_();
     struct HeldRedirect { int64_t corrId; std::string endpoint; int metaSeen; int32_t responsePort; };
     /// The Redirect message a held entry came from ("endpoint[#responsePort]").

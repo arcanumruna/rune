@@ -68,6 +68,19 @@ std::string uniqueDir() {
 static constexpr int  kPumpMax   = 3'000;
 static constexpr auto kPumpSleep = 2ms;
 
+// #767: retarget is a state the duty cycle advances; Thread-mode driver, so the background threads resolve while this
+// loop services it (hard-capped).  Returns true when the move completed and swapped.
+static bool retargetSettled(rct::AeronTransport& t, const std::string& channel) {
+    uint64_t token = 0;
+    if (t.beginRetarget(channel, 0, token) != rct::AeronTransport::RetargetStart::Pending) return false;
+    for (int i = 0; i < kPumpMax && t.seedRetargetPending(); ++i) {
+        t.serviceRetarget();
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+    const auto o = t.takeRetargetOutcome();
+    return o.has_value() && o->token == token && o->ok;
+}
+
 /// Build a basic AgentConfig with a loopback-style ipc setup.
 /// ingressStreamId: agent → gateway
 /// egressStreamId:  gateway → agent
@@ -670,7 +683,7 @@ TEST(ClientAgent, RetargetChangesIngressChannel) {
     // loopback for the new ingress.  That's fine for this unit test: we just
     // need to verify that offer() now targets the new channel without
     // crashing (and the old pub is released).
-    ASSERT_NO_THROW(t.retarget("aeron:ipc"));
+    ASSERT_TRUE(retargetSettled(t, "aeron:ipc"));
     // After retarget the pub is on the new channel (still ipc, stream 300 but fresh pub).
     // Offer should still work (whether it echoes back depends on sub being there).
     const uint8_t msg2[] = {0xAA, 0xBB};
@@ -1046,7 +1059,9 @@ TEST(ClientAgent, RetargetPostNullIngressOfferReturnsFalse) {
     // retarget offer() returns false (no connected subscriber → back-pressure).
     // The important invariant: retarget() does NOT throw and transport stays
     // alive (stop() completes cleanly).
-    ASSERT_NO_THROW(t.retarget("aeron:udp?endpoint=192.0.2.1:59999"))
+    uint64_t bogusToken = 0;
+    ASSERT_EQ(t.beginRetarget("aeron:udp?endpoint=192.0.2.1:59999", 0, bogusToken),
+              rct::AeronTransport::RetargetStart::Pending)
         << "retarget to bogus channel must not throw";
 
     // offer() on the new (unresolved) publication must return false (or true if

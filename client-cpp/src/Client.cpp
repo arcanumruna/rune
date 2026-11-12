@@ -3920,6 +3920,8 @@ int Client::dutyCycle(int64_t nowNs) {
     int work = agent_.doWork(nowNs);
     // I3': owner releases fenced on the command ring apply once the drain passed them.
     if (!deferredReleases_.empty()) [[unlikely]] work += applyDeferredReleases_(false);
+    // #767: the seed moves the agent finished (a redirect / a failover): what follows a success / a failure.
+    work += serviceSeedMoves_();
     // DR client bug 1: a seed whose broker died moves to a live broker.
     work += driveSeedFailover_(nowNs);
     // Fix round 2 (C-1): every Connected edge of the seed (failover, a resume
@@ -6689,77 +6691,138 @@ void Client::redirectBySeed_(int64_t corrId, const std::string& newEndpoint, int
     // production UDP redirects and in-process ipc test redirects.
     const std::string newChannel = toChannel(newEndpoint);  // N2
 
-    // Retarget is noexcept; if it fails the old publication is kept.
-    const bool retargeted = agent_.retarget(newChannel, responsePort);
-
-    if (retargeted) {
-        // MD1 IMPORTANT-2: record the connection's new leader channel so
-        // proactive produce routing compares against the right target.
-        currentLeaderChannel() = newChannel;
-        // CB-5 B FIX (bugs 1-4): a data op (Produce OR Subscribe) was
-        // rejected by a FOLLOWER.  We must:
-        //   (1) reconnect to the leader with a FRESH session (the leader
-        //       has no session for us — submitReconnect forces a new
-        //       ConnectRequest even though we are still logically
-        //       Connected to the follower), and
-        //   (2) resend the affected op(s) — Produce AND Subscribe — but
-        //       only AFTER the new session is Connected (round 4: its handshake done), so they
-        //       carry the leader's freshly assigned sessionId (re-stamped
-        //       into the frame header).  We defer the resend by setting
-        //       redirectPending_; the seed's Connected edge (onSeedConnected_) flushes
-        //       it (see above).  This fixes: subscribe never resent (1),
-        //       stale sessionId (2), resend racing the reconnect (3).
-        //
-        // Stick-to-leader (4): the transport retarget persists and the
-        // new session is the leader's, so every subsequent op reads the
-        // leader session via stateAndSessionId() and lands directly on
-        // the leader without re-redirecting.
-        //
-        // Only initiate ONE reconnect per redirect episode: if a
-        // reconnect is already pending (multiple in-flight ops each
-        // redirected), coalesce — the single deferred resend on the next
-        // Connected edge flushes ALL pending ops.  This prevents
-        // session churn from a burst of redirects.
-        // Coalesce: only initiate ONE reconnect per redirect episode.
-        // Single-owner agent thread → a plain check-and-set (no CAS).
-        if (!redirectPending()) {
-            redirectPending() = true;
-            agent_.submitReconnect();
-        }
-        redirectedResendBackoffNs_ = kRedirectedResendInitNs;  // DR-15: a reachable target
-    } else {
-        // DR-15 (SIGTERM parity, Docker 2026-10-05): the redirect named a node
-        // that is unreachable right now (it just stopped — its host is gone).
-        // Never terminal: stay on the current node, ask for metadata, and
-        // re-send the pending Subscribes on the answer (the cluster moves on;
-        // the next answer redirects to the live leader or serves it).  The
-        // redirected Produce stays in flight — its attempt timer re-offers it
-        // (no redirect budget spent: nothing was re-sent).
-        if ((unreachableRedirects_++ & 1023u) == 0)
-            std::fprintf(stderr, "rune-client: redirect target %s unreachable — staying, asking for metadata "
-                         "(%llu so far)\n", newEndpoint.c_str(),
-                         static_cast<unsigned long long>(unreachableRedirects_));
-        // Review M1: still an answer for the produce's in-flight accounting.
-        producerHub_.noteRedirectAnswer(corrId);
-        // Review MAJOR-1: only THIS Subscribe is re-sent (never the others,
-        // which still await their own answer — a duplicate would register a
-        // second subscription broker-side).
-        if (subscriberHub_.isPending(corrId) &&
-            std::find(redirectedSubscribes_.begin(), redirectedSubscribes_.end(), corrId) ==
-                redirectedSubscribes_.end()) {  // re-review NEW-M1: once per pending resend
+    // Retarget is noexcept; if it fails the old publication is kept.  #767: the move is asynchronous: Done / Failed
+    // act now, Pending records the redirect and takeSeedMoveResult() (serviceSeedMoves_) finishes it, the same two
+    // bodies.
+    uint64_t token = 0;
+    const agent::ClientAgent::SeedMove mv = agent_.retarget(newChannel, responsePort, token);
+    if (mv == agent::ClientAgent::SeedMove::Pending) {
+        // The same target as the move a redirect is already waiting on (a burst of redirects to one leader): the move
+        // is shared.  This op is not failed by it; it only joins the record, so the moved / failed body runs once for
+        // the move and the per-op part (the failure path's own bookkeeping) once per op.
+        if (pendingRedirect_ && pendingRedirect_->token == token) {
             try {
-                redirectedSubscribes_.push_back(corrId);
+                pendingRedirect_->joined.push_back(JoinedRedirect{corrId, newEndpoint});
             } catch (...) {
-                // allocation failure (cold path): it times out as before
+                // allocation failure (cold path): this op takes its own bookkeeping now, as a superseded one would
+                onSeedRedirectFailed_(corrId, newEndpoint, /*superseded=*/true);
+            }
+            return;
+        }
+        // A redirect pending on ANOTHER move is superseded by this one (the agent abandons its move): its failure body
+        // runs now, for its own ops only; the newer move is untouched.
+        if (pendingRedirect_) {
+            PendingRedirect old = std::move(*pendingRedirect_);
+            pendingRedirect_.reset();
+            for (const JoinedRedirect& j : old.joined) onSeedRedirectFailed_(j.corrId, j.endpoint, /*superseded=*/true);
+            onSeedRedirectFailed_(old.corrId, old.endpoint, /*superseded=*/true);
+        }
+        pendingRedirect_ = PendingRedirect{token, corrId, newEndpoint, newChannel, {}};
+        return;
+    }
+    if (mv == agent::ClientAgent::SeedMove::Failed) onSeedRedirectFailed_(corrId, newEndpoint, /*superseded=*/false);
+    else onSeedRedirectMoved_(newChannel);
+}
+
+void Client::onSeedRedirectMoved_(const std::string& newChannel) {
+    // MD1 IMPORTANT-2: record the connection's new leader channel so
+    // proactive produce routing compares against the right target.
+    currentLeaderChannel() = newChannel;
+    // CB-5 B FIX (bugs 1-4): a data op (Produce OR Subscribe) was
+    // rejected by a FOLLOWER.  We must:
+    //   (1) reconnect to the leader with a FRESH session (the leader
+    //       has no session for us — submitReconnect forces a new
+    //       ConnectRequest even though we are still logically
+    //       Connected to the follower), and
+    //   (2) resend the affected op(s) — Produce AND Subscribe — but
+    //       only AFTER the new session is Connected (round 4: its handshake done), so they
+    //       carry the leader's freshly assigned sessionId (re-stamped
+    //       into the frame header).  We defer the resend by setting
+    //       redirectPending_; the seed's Connected edge (onSeedConnected_) flushes
+    //       it (see above).  This fixes: subscribe never resent (1),
+    //       stale sessionId (2), resend racing the reconnect (3).
+    //
+    // Stick-to-leader (4): the transport retarget persists and the
+    // new session is the leader's, so every subsequent op reads the
+    // leader session via stateAndSessionId() and lands directly on
+    // the leader without re-redirecting.
+    //
+    // Only initiate ONE reconnect per redirect episode: if a
+    // reconnect is already pending (multiple in-flight ops each
+    // redirected), coalesce — the single deferred resend on the next
+    // Connected edge flushes ALL pending ops.  This prevents
+    // session churn from a burst of redirects.
+    // Coalesce: only initiate ONE reconnect per redirect episode.
+    // Single-owner agent thread → a plain check-and-set (no CAS).
+    if (!redirectPending()) {
+        redirectPending() = true;
+        agent_.submitReconnect();
+    }
+    redirectedResendBackoffNs_ = kRedirectedResendInitNs;  // DR-15: a reachable target
+}
+
+void Client::onSeedRedirectFailed_(int64_t corrId, const std::string& newEndpoint, bool superseded) {
+    // DR-15 (SIGTERM parity, Docker 2026-10-05): the redirect named a node
+    // that is unreachable right now (it just stopped — its host is gone).
+    // Never terminal: stay on the current node, ask for metadata, and
+    // re-send the pending Subscribes on the answer (the cluster moves on;
+    // the next answer redirects to the live leader or serves it).  The
+    // redirected Produce stays in flight — its attempt timer re-offers it
+    // (no redirect budget spent: nothing was re-sent).
+    if ((unreachableRedirects_++ & 1023u) == 0)
+        std::fprintf(stderr, "rune-client: redirect target %s unreachable — staying, asking for metadata "
+                     "(%llu so far)\n", newEndpoint.c_str(),
+                     static_cast<unsigned long long>(unreachableRedirects_));
+    // Review M1: still an answer for the produce's in-flight accounting.
+    producerHub_.noteRedirectAnswer(corrId);
+    // Review MAJOR-1: only THIS Subscribe is re-sent (never the others,
+    // which still await their own answer — a duplicate would register a
+    // second subscription broker-side).
+    if (subscriberHub_.isPending(corrId) &&
+        std::find(redirectedSubscribes_.begin(), redirectedSubscribes_.end(), corrId) ==
+            redirectedSubscribes_.end()) {  // re-review NEW-M1: once per pending resend
+        try {
+            redirectedSubscribes_.push_back(corrId);
+        } catch (...) {
+            // allocation failure (cold path): it times out as before
+        }
+    }
+    // #767: a superseded redirect only answers for its own op; the episode's pacing belongs to the newer move
+    // (its success reconnects and re-sends every pending Subscribe; its failure paces here).
+    if (superseded) return;
+    // Review M3: paced — the re-send waits for a fresh metadata answer
+    // AND a doubling backoff (100 ms .. 2 s); never a tight redirect loop.
+    redirectMetaSeen_       = metadataResponses_;
+    nextRedirectedResendNs_ = now() + redirectedResendBackoffNs_;
+    redirectedResendBackoffNs_ = std::min<int64_t>(redirectedResendBackoffNs_ * 2, kRedirectedResendMaxNs);
+    requestMetadataNow_();
+}
+
+int Client::serviceSeedMoves_() {
+    int work = 0;
+    while (const auto r = agent_.takeSeedMoveResult()) {
+        ++work;
+        if (pendingRedirect_ && pendingRedirect_->token == r->token) {
+            PendingRedirect p = std::move(*pendingRedirect_);
+            pendingRedirect_.reset();
+            if (r->ok) {
+                onSeedRedirectMoved_(p.channel);   // once for the move: the joined ops need nothing of their own
+            } else {
+                for (const JoinedRedirect& j : p.joined)
+                    onSeedRedirectFailed_(j.corrId, j.endpoint, /*superseded=*/true);
+                onSeedRedirectFailed_(p.corrId, p.endpoint, /*superseded=*/false);   // the episode's pacing, once
             }
         }
-        // Review M3: paced — the re-send waits for a fresh metadata answer
-        // AND a doubling backoff (100 ms .. 2 s); never a tight redirect loop.
-        redirectMetaSeen_       = metadataResponses_;
-        nextRedirectedResendNs_ = now() + redirectedResendBackoffNs_;
-        redirectedResendBackoffNs_ = std::min<int64_t>(redirectedResendBackoffNs_ * 2, kRedirectedResendMaxNs);
-        requestMetadataNow_();
+        // A failover attempt may share the move with a redirect (both to the same channel): each record whose token
+        // matches finishes.
+        if (pendingFailover_ && pendingFailover_->token == r->token) {
+            PendingFailover p = std::move(*pendingFailover_);
+            pendingFailover_.reset();
+            if (r->ok) onSeedFailoverMoved_(p.target, p.connectNow, p.attempt);
+            else onSeedFailoverFailed_();
+        }
     }
+    return work;
 }
 
 int Client::retryRedirectedSubscribes_(int64_t nowNs) {
@@ -7812,6 +7875,8 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
             seedFailover_ = SeedFailoverStopped{};
             return 1;
         }
+        // #767: a move still resolving decides the attempt (its result paces the next one): never start another.
+        if (pendingFailover_) return 0;
         // I2: a reconnectForeverAfterLive machine owns its attempt schedule (its
         // capped-exponential Backoff): the failover never connects by itself — it
         // only re-points the seed's publication at the next candidate while the
@@ -7933,19 +7998,43 @@ bool Client::startSeedFailoverAttempt_(SeedFailingOver& f, int64_t nowNs, bool c
     f.gapNs       = std::min(f.gapNs * 2, kSeedFailoverMaxGapNs);
     const int64_t connectNs = cfg_.connectTimeoutMs > 0 ? nsAfter(0, cfg_.connectTimeoutMs) : kSeedFailoverAttemptMaxNs;
     f.attemptDeadlineNs = nowNs + std::min(connectNs, kSeedFailoverAttemptMaxNs);
-    if (target.empty() || !agent_.failoverSeedTo(target, nowNs, connectNow)) {
+    uint64_t token = 0;
+    const agent::ClientAgent::SeedMove mv =
+        target.empty() ? agent::ClientAgent::SeedMove::Failed : agent_.failoverSeedTo(target, nowNs, connectNow, token);
+    if (mv == agent::ClientAgent::SeedMove::Failed) {
         f.attemptDeadlineNs = f.notBeforeNs;  // did not resolve: the next candidate after the gap
         return false;
     }
+    if (mv == agent::ClientAgent::SeedMove::Pending) {
+        // #767: the move is in flight; its result (serviceSeedMoves_) runs what follows a success / a failure.  A
+        // pending attempt this one supersedes is simply replaced: its (failed) result carries a stale token.
+        try {
+            pendingFailover_ = PendingFailover{token, target, connectNow, f.attempt};
+        } catch (...) {
+            // allocation failure (cold path): the move completes unobserved; the attempt deadline paces the next one
+            pendingFailover_.reset();
+        }
+        return true;
+    }
+    onSeedFailoverMoved_(target, connectNow, f.attempt);
+    return true;
+}
+
+void Client::onSeedFailoverMoved_(const std::string& target, bool connectNow, uint32_t attempt) noexcept {
     if (connectNow) ++seedFailoverConnects_;
     if ((seedFailovers_++ & 63u) == 0)
         std::fprintf(stderr, "rune-client: seed broker presumed dead (no answer / gave up) — seed moved to %s "
-                     "(attempt %u, %llu so far)\n", target.c_str(), f.attempt,
+                     "(attempt %u, %llu so far)\n", target.c_str(), attempt,
                      static_cast<unsigned long long>(seedFailovers_));
     // The leader of what the seed's broker led must be learnt from a live broker
     // now (C1: the seed moved — fan out).
     requestMetadataNow_();
-    return true;
+}
+
+void Client::onSeedFailoverFailed_() noexcept {
+    // The new publication did not resolve: the next candidate after the gap (only the CURRENT attempt's record reaches
+    // here, so a newer attempt's deadline is never reset by a superseded one).
+    if (auto* f = std::get_if<SeedFailingOver>(&seedFailover_)) f->attemptDeadlineNs = f->notBeforeNs;
 }
 
 void Client::resendAllInFlightViaRoute_() noexcept {

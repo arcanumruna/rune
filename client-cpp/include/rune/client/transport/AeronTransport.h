@@ -115,9 +115,10 @@ public:
     int dutyCycle() noexcept;
 
     /// TEST SEAM (cold; owner thread): while stalled, dutyCycle() pumps nothing, so a registration sent meanwhile stays
-    /// Resolving; `retarget`'s publication resolve bound is shortened to `boundNs` (wall clock) so a stalled retarget
-    /// returns promptly.  Stall off / bound 0 restores the defaults.  The driver is parked aside rather than flagged,
-    /// so dutyCycle()'s existing `driver_ == nullptr` check stalls it and the hot path carries no test-only branch.
+    /// Resolving; a retarget's publication resolve bound is shortened to `boundNs` (resolve clock) so a stalled
+    /// retarget fails promptly.  Stall off / bound 0 restores the defaults.  The driver is parked aside rather than
+    /// flagged, so dutyCycle()'s existing `driver_ == nullptr` check stalls it and the hot path carries no test-only
+    /// branch.
     void setDriverStalledForTest(bool stalled, int64_t retargetBoundNs = 0) noexcept {
         if (stalled && driver_ != nullptr) { stalledDriver_ = driver_; driver_ = nullptr; }
         if (!stalled && stalledDriver_ != nullptr) { driver_ = stalledDriver_; stalledDriver_ = nullptr; }
@@ -140,7 +141,7 @@ public:
     /// retries after its backoff.  Blocking and bounded like start(); owner thread only, never from a poll() callback.
     bool rebuild(int32_t seedResponsePort) noexcept;
 
-    /// The default ingress publication's current channel (changes on retarget()).
+    /// The default ingress publication's current channel (changes when a retarget completes).
     /// Owner thread only.
     [[nodiscard]] const std::string& ingressChannel() const noexcept { return cfg_.ingressChannel; }
 
@@ -395,7 +396,7 @@ public:
 
     /// Test/simulation seam: the clock that drives every Resolution deadline and
     /// retry backoff (default: steady_clock).  pumpUntil_'s own wall-time bound
-    /// in start()/retarget() stays on the real clock.  nullptr restores default.
+    /// in start() stays on the real clock.  nullptr restores default.
     void setResolveClock(int64_t (*nowNs)() noexcept) noexcept {
         resolveNow_ = nowNs != nullptr ? nowNs : &monoNs_;
     }
@@ -545,27 +546,55 @@ public:
     // retarget — single-writer, agent-thread only
     // -------------------------------------------------------------------------
 
-    /// Create a new ingress ExclusivePublication on newIngressChannel (same
-    /// stream id as the original config) and swap it in for the current one.
-    /// Per-stream publications of offer(streamId) are lazily re-resolved on the
-    /// new channel; the stream ids are PRESERVED (E5.1: REDIRECT changes channel,
-    /// keeps per-partition worker stream ids).
-    /// Bounded resolution (kResolveMaxMs hard cap); pumps this transport's own
-    /// driver + conductor in invoker mode (never waits on another thread).
-    /// Called only from the agent thread (single-writer contract).
+    /// Move the seed's default ingress publication to newIngressChannel (same stream id as the original config).  The
+    /// move is a STATE on the duty thread, never a blocking call (#767): beginRetarget only registers the new response
+    /// subscription (when the channel has a response control) and returns Pending; serviceRetarget(), once per duty
+    /// cycle from the owner, resolves the response subscription, then the response-correlated publication (each bounded
+    /// by the resolve clock: kResolveTimeoutNs for the subscription, retargetPubBoundNs_ for the publication), and
+    /// swaps when both are Ready.  Per-stream publications of offer(streamId) are lazily re-resolved on the new channel
+    /// (E5.1: REDIRECT changes channel, keeps per-partition worker stream ids).  Nothing here pumps the driver or the
+    /// conductor and nothing sleeps.
     ///
-    /// FIX F8: noexcept + non-throwing.  Resolves the NEW publication BEFORE
-    /// releasing the old one, so a failed retarget (resolve timeout / not
-    /// started) leaves the OLD publication intact and usable — offer() keeps
-    /// working on the previous endpoint.  Returns true on success, false on
-    /// failure (transport left consistent, no exception, no std::terminate even
-    /// when reached from the agent's noexcept dispatchEgressFrame path).
+    /// Meanwhile the OLD pair stays in force but quiet: offer()/offerResult() on the default publication report "not
+    /// sent" (Retry), exactly as for a not-connected publication, so nothing reaches the old gateway; offerTo(channel,
+    /// ...) (leader sessions) is unaffected and ingressChannel() keeps the old value until the swap.  A failed resolve
+    /// (rejected / past its bound) leaves the old pair intact and usable.  Either way one outcome {token, ok} is
+    /// queued for takeRetargetOutcome().  A newer beginRetarget to ANOTHER target supersedes a pending one (its outcome
+    /// is {token, false} and its resources are released first); one to the SAME target (channel and response port)
+    /// joins it: no new registration, the pending move's token is returned.  It also abandons a pending seed re-pair.
     ///
     /// NAT-safe egress: `responsePort` (the new gateway's response-control port, 0 / a non-UDP channel = none) selects
     /// the response pairing — a new response subscription FIRST, then the publication correlated with it; the old
     /// pair (publication, and the old response subscription, retired and released at the next poll) is released only
-    /// after both new ones are Ready.  A failure keeps the old pair.
-    bool retarget(const std::string& newIngressChannel, int32_t responsePort = 0) noexcept;
+    /// after both new ones are Ready.
+    ///
+    /// Failed = not started / no slot / an exception (old pair intact, no outcome queued).  Called only from the agent
+    /// thread (single-writer contract); noexcept (reached from the agent's noexcept dispatch path).
+    enum class RetargetStart : uint8_t { Pending, Failed };
+    struct RetargetOutcome {
+        uint64_t token = 0;
+        bool     ok    = false;
+    };
+    RetargetStart beginRetarget(const std::string& newIngressChannel, int32_t responsePort, uint64_t& token) noexcept;
+    /// Advance a pending retarget by one step; a no-op (one predictable branch) when none is pending.  Once per duty
+    /// cycle, from the owner, outside any poll callback.
+    void serviceRetarget() noexcept {
+        if (seedPair_.index() == kSeedRetargetingIndex) [[unlikely]] serviceRetarget_();
+    }
+    /// The oldest undelivered retarget outcome, if any.
+    [[nodiscard]] std::optional<RetargetOutcome> takeRetargetOutcome() noexcept;
+    /// Abandon the pending retarget, if any (a request to stay where the seed is): its outcome is {token, false},
+    /// what it registered is released, the old pair stays.
+    void cancelRetarget() noexcept;
+    [[nodiscard]] bool retargetOutcomePending() const noexcept { return retargetOutcomeCount_ != 0; }
+    [[nodiscard]] bool seedRetargetPending() const noexcept { return seedPair_.index() == kSeedRetargetingIndex; }
+    /// TEST SEAM: outcomes dropped because 4 were undrained (cannot happen with one pending move at a time).
+    [[nodiscard]] uint64_t retargetOutcomesDroppedForTest() const noexcept { return retargetOutcomesDropped_; }
+    /// TEST SEAM: beginRetarget calls that joined the move already pending to the same target.
+    [[nodiscard]] uint64_t retargetsJoinedForTest() const noexcept { return retargetsJoined_; }
+    /// TEST SEAM: conductor / driver pump steps taken so far (dutyCycle() calls that pumped); a call that must not
+    /// block shows no change across it.
+    [[nodiscard]] uint64_t dutyCyclePumpsForTest() const noexcept { return dutyCyclePumps_; }
     /// A response subscription is ONE-SHOT: Aeron pins it to the first response publication session that reaches it, so
     /// a second response publication to the same request image (a reconnect, a rebind of a new session) or to ANOTHER
     /// request publication correlated with the same subscription can never connect.  Every response pair therefore owns
@@ -630,7 +659,8 @@ private:
     int pumpDriverFromCaller_() noexcept;
     int callerPumpViolations_ = 0;  // written/read by the owning (caller) thread only
     aeron_driver_t*  stalledDriver_       = nullptr;  // test seam: the driver parked by setDriverStalledForTest
-    int64_t          retargetPubBoundNs_   = kResolveTimeoutNs;   // test seam: retarget's publication resolve bound
+    // the retarget's publication resolve bound (resolve clock); test-shortened
+    int64_t          retargetPubBoundNs_   = kResolveTimeoutNs;
     PumpStepObserver pumpObserver_    = nullptr;  // test seam (owner thread only)
     void*            pumpObserverCtx_ = nullptr;
 
@@ -655,6 +685,7 @@ private:
     ///   SeedSteady     the pair in force (ingressPub_ + respSeedSlot_) is the only one;
     ///   SeedRePairing  a fresh response subscription (subSlots_[subSlot]) is resolving, then the request publication
     ///                  correlated with it on `addChannel`; offer() advances it and swaps when both are Ready.
+    ///   SeedRetargeting the seed moves to ANOTHER channel (#767): see beginRetarget().
     struct SeedSteady {};
     struct SeedRePairing {
         int32_t     subSlot;
@@ -662,7 +693,31 @@ private:
         Resolution<aeron::ExclusivePublication> res;
         int64_t     deadlineNs;   // #755: the re-pair is abandoned (old pair kept) at this resolve-clock time
     };
-    std::variant<SeedSteady, SeedRePairing> seedPair_{SeedSteady{}};
+    struct SeedRetargeting {
+        std::string channel;           // the new plain ingress channel (becomes cfg_.ingressChannel)
+        int32_t     responsePort;
+        int32_t     newRespSlot;       // -1 = no response pairing
+        std::string pubChannel;        // the channel the publication registers with (correlated once the sub is Ready)
+        Resolution<aeron::ExclusivePublication> pubRes;
+        bool        awaitingSub;       // true: the response subscription resolves first; false: the publication
+        int64_t     stageStartNs;      // resolve-clock time the current stage began
+        uint64_t    token;
+    };
+    static constexpr std::size_t kSeedRetargetingIndex = 2;
+    std::variant<SeedSteady, SeedRePairing, SeedRetargeting> seedPair_{SeedSteady{}};
+    uint64_t retargetsJoined_ = 0;
+    void serviceRetarget_() noexcept;
+    void completeRetarget_(SeedRetargeting& rt) noexcept;
+    /// Leave SeedRetargeting: queue {token, ok}; on failure release what the move registered (the old pair stays).
+    void finishRetarget_(bool ok) noexcept;
+    void queueRetargetOutcome_(uint64_t token, bool ok) noexcept;
+    static constexpr std::size_t kMaxRetargetOutcomes = 4;
+    RetargetOutcome retargetOutcomes_[kMaxRetargetOutcomes]{};
+    std::size_t     retargetOutcomeHead_  = 0;
+    std::size_t     retargetOutcomeCount_ = 0;
+    uint64_t        retargetOutcomesDropped_ = 0;
+    uint64_t        retargetTokens_ = 0;
+    uint64_t        dutyCyclePumps_ = 0;
     /// Advance a pending seed re-pair; true = swapped (the new pair is in force), false = still pending or abandoned.
     bool advanceSeedRePair_(SeedRePairing& rp) noexcept;
     /// Drop a pending seed re-pair: its subscription slot is retired, the old pair stays in force.
