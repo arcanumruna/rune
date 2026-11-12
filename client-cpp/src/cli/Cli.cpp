@@ -59,7 +59,7 @@ bool connectOrReport(rune::client::Client& client, std::ostream& err) {
         return true;
     } catch (const std::exception& e) {
         if (isWaitTimeout(e)) {
-            err << "rune: connect timed out\n";
+            err << "rune: " << e.what() << "\n";
         } else {
             err << "rune error: " << e.what() << "\n";
         }
@@ -197,24 +197,34 @@ int cmdSchemaGet(const std::vector<std::string>& args,
     try {
         if (!connectOrReport(client, err)) return 1;
 
-        TopicSchemaResult r;
-        try {
-            r = client.getTopicSchemaAndWait(topic, kCliWait);
-        } catch (const std::exception& e) {
-            if (isWaitTimeout(e)) {
+        const auto lookup = [&](uint64_t fingerprint, TopicSchemaResult& res) {
+            try {
+                res = client.getTopicSchemaAndWait(topic, fingerprint, kCliWait);
+                return true;
+            } catch (const std::exception& e) {
+                if (!isWaitTimeout(e)) throw;
                 err << "rune: getTopicSchema timed out for topic: " << topic << "\n";
                 client.close();
-                return 1;
+                return false;
             }
-            throw;
-        }
-        client.close();
+        };
 
         namespace rpc = rune::protocol::client;
+        TopicSchemaResult r;
+        if (!lookup(0, r)) return 1;
         if (r.errorCode == static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic)) {
+            // The registry holds typed topics only: ask whether the topic exists untyped.
+            TopicSchemaResult kind;
+            if (!lookup(rpc::kSchemaKindFingerprint, kind)) return 1;
+            client.close();
+            if (kind.errorCode == 0 && kind.descriptorBlob.empty()) {
+                out << "topic '" << topic << "' is untyped: it has no schema\n";
+                return 0;
+            }
             err << "rune: unknown topic '" << topic << "'\n";
             return static_cast<int>(r.errorCode);
         }
+        client.close();
         if (r.errorCode != 0) {
             err << "rune: broker error code " << r.errorCode
                 << " for topic '" << topic << "'\n";

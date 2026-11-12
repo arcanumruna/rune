@@ -50,6 +50,7 @@
 #include <rune/codec/FilterBuilder.h>
 #include <rune/codec/Flyweight.h>
 #include <rune/codec/Serialize.h>
+#include <rune/codec/Validator.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <algorithm>
@@ -216,11 +217,12 @@ std::vector<Ev> makeAlterModel(uint64_t seed, int64_t firstSeq, int count, uint1
 
 // ---- the record codec (any of the three versions) --------------------------------------------------------------------
 
-/// [blockLength u16][version u16][fixed block at the materialized offsets of `version`]; fields absent in that
-/// version are skipped.  hp = sendNs, pos = seq.  No variable-length section.
+/// [blockLength u16][version u16][fixed block at the materialized offsets of `version`][name: u32 length 0]; fields
+/// absent in that version are skipped.  hp = sendNs, pos = seq.  The broker validates every typed write, so the one
+/// variable-length field (name, empty) carries its length prefix.
 std::vector<uint8_t> encodeVersioned(const Ev& e, int64_t sendNs) {
     const rune::codec::Descriptor& m = schema().materialized[e.version];
-    std::vector<uint8_t> out(4 + m.blockLength, 0);
+    std::vector<uint8_t> out(4 + m.blockLength + 4, 0);
     fly::store<uint16_t>(out.data(), static_cast<uint16_t>(m.blockLength));
     fly::store<uint16_t>(out.data() + 2, e.version);
     uint8_t* blk = out.data() + 4;
@@ -528,14 +530,15 @@ struct AckState {
     int64_t acked = 0, failed = 0;
     std::array<int64_t, kParts> end{};
     int32_t firstFailure = 0;
+    uint16_t firstCode = 0;   // the broker's error code of the first failed ack
 };
 constexpr Token kTokenBase = 8;
 Token tokenOf(int64_t seq, int32_t part) { return static_cast<Token>(((seq << 3) | part) + kTokenBase); }
 int32_t partOfToken(Token t) { return static_cast<int32_t>((t - kTokenBase) & 7); }
-void onAck(void* ctx, Token token, int64_t offset, OpStatus status, uint16_t) noexcept {
+void onAck(void* ctx, Token token, int64_t offset, OpStatus status, uint16_t code) noexcept {
     auto* a = static_cast<AckState*>(ctx);
     ++a->acked;
-    if (status != OpStatus::Ok) { ++a->failed; a->firstFailure = static_cast<int32_t>(status); return; }
+    if (status != OpStatus::Ok) { if (a->failed++ == 0) { a->firstFailure = static_cast<int32_t>(status); a->firstCode = code; } return; }
     const int32_t p = partOfToken(token);
     if (offset >= 0) a->end[static_cast<std::size_t>(p)] = std::max(a->end[static_cast<std::size_t>(p)], offset + 1);
 }
@@ -617,7 +620,7 @@ int runProduce(const Env& env) {
             ++burst;
         }
         if (c.doWork() == 0 && g_idleUs > 0) std::this_thread::sleep_for(std::chrono::microseconds(g_idleUs));
-        if (acks.failed != 0) { fail("FILTER-PRODUCE", "a record failed, status " + std::to_string(acks.firstFailure)); return 1; }
+        if (acks.failed != 0) { fail("FILTER-PRODUCE", "a record failed, status " + std::to_string(acks.firstFailure) + ", broker code " + std::to_string(acks.firstCode)); return 1; }
         if (!progressFile.empty() && Clock::now() - lastProgress > std::chrono::milliseconds(250)) {
             writeFileAtomic(progressFile, std::to_string(acks.acked) + "\n");
             lastProgress = Clock::now();
@@ -1008,7 +1011,9 @@ int runAlter(const Env& env) {
             p.send(th, Key(e.playerId), bytes, AckToken{tokenOf(e.seq, e.part)});
         }
         p.flush();
-        return wait([&] { return acks.acked >= static_cast<int64_t>(evs.size()) + 0 && acks.failed == 0; }, 120, "the produce acks");
+        if (!wait([&] { return acks.acked >= static_cast<int64_t>(evs.size()) || acks.failed != 0; }, 120, "the produce acks")) return false;
+        if (acks.failed != 0) { fail(tag, "a record failed, status " + std::to_string(acks.firstFailure) + ", broker code " + std::to_string(acks.firstCode)); return false; }
+        return true;
     };
     auto alter = [&](const std::vector<uint8_t>& ops, const char* what) {
         const auto r = c.alterTopicAndWait(kTopicName, 0, ops, {}, std::chrono::seconds(60));
@@ -1018,10 +1023,10 @@ int runAlter(const Env& env) {
     };
     if (!alter(addGuildOps(), "ADD guild")) return 1;
     acks = AckState{};
-    if (!produce(v2) || acks.failed != 0) return 1;
+    if (!produce(v2)) return 1;
     if (!alter(dropChannelOps(), "DROP channel")) return 1;
     acks = AckState{};
-    if (!produce(v3) || acks.failed != 0) return 1;
+    if (!produce(v3)) return 1;
     std::vector<int64_t> ends(acks.end.begin(), acks.end.end());   // v3 is the last record of every partition it reached
     // Partitions that got no v3 record keep their v2 end: re-derive from the v2 acks is not needed, position follows notes.
     if (!wait([&] {
@@ -1187,6 +1192,9 @@ int selfcheck() {
     const std::vector<Ev> a2 = makeAlterModel(7, 100000, 40, 2), a3 = makeAlterModel(7, 100040, 40, 3);
     for (const Ev& ev : a2) { const Decoded x = decodeAny(encodeVersioned(ev, 5)); expect(x.ok && x.version == 2 && x.hasChannel && x.seq == ev.seq, "v2 round trip"); }
     for (const Ev& ev : a3) { const Decoded x = decodeAny(encodeVersioned(ev, 5)); expect(x.ok && x.version == 3 && !x.hasChannel && x.seq == ev.seq, "v3 round trip"); }
+    // the broker validates every typed write against its version's descriptor (checked writes): so must each record
+    for (const Ev& ev : a2) expect(rune::codec::Validator(schema().materialized[2]).validate(encodeVersioned(ev, 5), rune::codec::StringCheck::Utf8).ok, "v2 record passes the broker's validator");
+    for (const Ev& ev : a3) expect(rune::codec::Validator(schema().materialized[3]).validate(encodeVersioned(ev, 5), rune::codec::StringCheck::Utf8).ok, "v3 record passes the broker's validator");
     // the generated filter and the runtime builder encode the same bytes
     {
         auto rb = rune::codec::FilterBuilder::on(rune::examples::playerEventDescriptor()).field("worldId").eq(8u).field("channel").in({1, 2}).build();

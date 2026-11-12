@@ -2833,6 +2833,12 @@ void Log::recoverCleanerSwapFiles() {
     }
 }
 
+bool Log::ownerSwapsPending() const noexcept {
+    const std::size_t head = swapHead_.load(std::memory_order_relaxed);   // owner = consumer
+    const std::size_t tail = swapTail_.load(std::memory_order_acquire);
+    return tail != head;
+}
+
 bool Log::cleanerSwapsPending() const noexcept {
     // Cleaner thread (the swap ring's producer): own tail vs the consumer head.
     const std::size_t tail = swapTail_.load(std::memory_order_relaxed);

@@ -307,10 +307,19 @@ static bool waitFor(Pred&& pred,
     return pred();
 }
 
-// Wait (bounded) for the node's cleaner to complete `cycles` more cycles.
-static bool awaitCleanerCycles(rune::node::BrokerNode& node, uint64_t cycles) {
-    const uint64_t c0 = node.cleanerCyclesForTest();
-    return waitFor([&] { return node.cleanerCyclesForTest() >= c0 + cycles; }, 10s);
+// Wait (bounded) until the cleaner has compacted partition 0 of topic 0 through `through` (-1: its last sealed segment) AND
+// that output is durable: the watermark moves when the output is queued for the owner, which installs one group per duty
+// pass and then posts the renames (.cleaned -> .swap, the commit point) back to the cleaner.  A node stopped before that
+// loses the output.  A cleaner cycle count is no such condition: cycles tick while the user partition is not yet leader.
+static bool awaitCleanedDurably(rune::node::BrokerNode& node, int64_t through = -1) {
+    return waitFor([&] {
+        return node.onOwnerThreadForTest(0, 0, [through](rune::replication::PartitionReplica* r) {
+            if (!r) return false;
+            const auto bases = r->log()->segmentBaseOffsets();
+            return bases.size() > 1 && r->lastCleanOffset() >= (through < 0 ? bases.back() : through)
+                   && !r->log()->ownerSwapsPending() && r->log()->fileOpsQuiescent();
+        });
+    }, 10s);
 }
 
 // ===========================================================================
@@ -563,9 +572,7 @@ TEST(CompactionRetentionSmoke, TombstoneLifecycle_KIP534) {
             ASSERT_TRUE(node.awaitLeader(3s)) << "Smoke2: must self-elect";
             ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
                 << "Smoke2: replication bridge must propagate within 2 s";
-            const uint64_t c0 = node.cleanerCyclesForTest();
-            ASSERT_TRUE(waitFor([&] { return node.cleanerCyclesForTest() >= c0 + 3; }, 10s))
-                << "Smoke2 Phase A: the cleaner never completed a cycle";
+            ASSERT_TRUE(awaitCleanedDurably(node)) << "Smoke2 Phase A: the cleaner never compacted the log";
             node.stop();
         }
         Log phaseALog(logDir, kRoll);
@@ -614,7 +621,7 @@ TEST(CompactionRetentionSmoke, TombstoneLifecycle_KIP534) {
     // it is a condition of the feature — the STAMPED horizon has passed.)
     auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::system_clock::now().time_since_epoch()).count(); };
-    while (nowMs() <= stampedHorizonMs + 100) std::this_thread::sleep_for(10ms);
+    while (nowMs() <= stampedHorizonMs) std::this_thread::sleep_for(5ms);
 
     // Phase C: drop the tombstone (horizon expired).  Fresh checkpoint so the
     // cleaner re-scans the whole log and reaches the tombstone's segment.
@@ -635,12 +642,8 @@ TEST(CompactionRetentionSmoke, TombstoneLifecycle_KIP534) {
             << "Smoke2 Phase C: replication bridge must propagate within 2 s";
         // HW advanced by becomeLeader() on duty-cycle thread.
 
-        // D25: event-driven — the stamped horizon has already expired, so the
-        // first full pass (fresh checkpoint) drops the tombstone; wait for three
-        // completed cleaner cycles.
-        const uint64_t c3 = node3.cleanerCyclesForTest();
-        ASSERT_TRUE(waitFor([&] { return node3.cleanerCyclesForTest() >= c3 + 3; }, 10s))
-            << "Smoke2 Phase C: the cleaner never completed a cycle";
+        // The stamped horizon has already expired, so the first full pass (fresh checkpoint) drops the tombstone.
+        ASSERT_TRUE(awaitCleanedDurably(node3)) << "Smoke2 Phase C: the cleaner never compacted the log";
         node3.stop();
     }
 
@@ -740,8 +743,8 @@ TEST(CompactionRetentionSmoke, DeleteRetention_TimeAndSize) {
     // HW advanced by becomeLeader() on duty-cycle thread.
     // No test-thread replica calls (duty-thread-only invariant).
 
-    // Wait for retention to run.
-    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
+    // Wait for retention to delete a segment.
+    ASSERT_TRUE(waitFor([&] { return countLogFiles(logDir) < segsBefore; }, 10s)) << "Smoke3: retention deleted no segment";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -1019,6 +1022,7 @@ TEST(CompactionRetentionSmoke, IdempotentDedup_SurvivesRetention) {
     }
 
     auto cfg = makeSmokeConfig(tmp.path);
+    const int segsBefore = countLogFiles(logDir);
 
     rune::node::BrokerNode node{cfg};
     node.start();
@@ -1028,7 +1032,7 @@ TEST(CompactionRetentionSmoke, IdempotentDedup_SurvivesRetention) {
     // HW advanced by becomeLeader() on duty-cycle thread.
     // No test-thread replica calls (duty-thread-only invariant).
 
-    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
+    ASSERT_TRUE(waitFor([&] { return countLogFiles(logDir) < segsBefore; }, 10s)) << "Smoke6: retention never deleted a segment";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -1120,9 +1124,7 @@ TEST(CompactionRetentionSmoke, RestartResume_Checkpoint) {
         };
         ASSERT_TRUE(rune::node::test::hasReplica(node));
 
-        ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
-
-        waitFor([&] { return lastClean() > 0; }, 2s);
+        ASSERT_TRUE(awaitCleanedDurably(node)) << "the cleaner never compacted the log";
         watermarkAfterFirst = lastClean();
         node.stop();
     }
@@ -1151,9 +1153,7 @@ TEST(CompactionRetentionSmoke, RestartResume_Checkpoint) {
         };
         ASSERT_TRUE(rune::node::test::hasReplica(node2));
 
-        ASSERT_TRUE(awaitCleanerCycles(node2, 3)) << "the cleaner never completed 3 cycles";
-
-        waitFor([&] { return lastClean2() >= watermarkAfterFirst; }, 2s);
+        ASSERT_TRUE(waitFor([&] { return lastClean2() >= watermarkAfterFirst; }, 10s)) << "Smoke7 Phase 2: the watermark was not restored";
 
         const int64_t watermarkAfterSecond = lastClean2();
         EXPECT_GE(watermarkAfterSecond, watermarkAfterFirst)
@@ -1228,7 +1228,7 @@ TEST(CompactionRetentionSmoke, HwLeo_NonPerturbation) {
     // HW advanced to LEO by becomeLeader() on the duty-cycle thread.
     // No test-thread replica calls (duty-thread-only invariant).
 
-    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
+    ASSERT_TRUE(awaitCleanedDurably(node)) << "the cleaner never compacted the log";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -1323,7 +1323,7 @@ TEST(CompactionRetentionSmoke, AppendDuringCompaction_Correctness) {
         // No test-thread replica calls (duty-thread-only invariant).
 
         // Give cleaner 1.5 s to work.
-        ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
+        ASSERT_TRUE(awaitCleanedDurably(node)) << "the cleaner never compacted the log";
         node.stop();
     }
 
@@ -1357,7 +1357,7 @@ TEST(CompactionRetentionSmoke, AppendDuringCompaction_Correctness) {
         // HW advanced by becomeLeader() on duty-cycle thread.
         // No test-thread replica calls (duty-thread-only invariant).
 
-        ASSERT_TRUE(awaitCleanerCycles(node2, 3)) << "the cleaner never completed 3 cycles";
+        ASSERT_TRUE(awaitCleanedDurably(node2)) << "the cleaner never compacted the log";
 
         using sclock = std::chrono::steady_clock;
         const auto t0 = sclock::now();
@@ -1445,7 +1445,7 @@ TEST(CompactionRetentionSmoke, Failover_HwBounded_NoResurrection) {
     // No test-thread replica calls (duty-thread-only invariant).
 
     // Let the cleaner compact some records (as leader).
-    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
+    ASSERT_TRUE(awaitCleanedDurably(node)) << "the cleaner never compacted the log";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -1848,9 +1848,7 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
         ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
             << "Smoke12 P2: replication bridge must propagate within 2 s";
         // The sealed prefix is compacted once the cleaner has passed the data keys' last records (offsets below the sentinel anchors).
-        ASSERT_TRUE(waitFor([&] {
-            return node.onOwnerThreadForTest(0, 0, [](rune::replication::PartitionReplica& r) { return r.lastCleanOffset(); }) >= K * R;
-        }, 10s)) << "Smoke12 P2: the cleaner never compacted the sealed prefix";
+        ASSERT_TRUE(awaitCleanedDurably(node, K * R)) << "Smoke12 P2: the cleaner never compacted the sealed prefix";
         node.stop();
     }
 
@@ -1867,9 +1865,7 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
         ASSERT_TRUE(waitFor([&] { return node2.replicationIsLeaderForTest(); }, 2s))
             << "Smoke12 P3: replication bridge must propagate within 2 s";
         // The new leader re-runs its incremental cleaner passes (the observed e2e failure is that it does not converge).
-        const uint64_t c0 = node2.cleanerCyclesForTest();
-        ASSERT_TRUE(waitFor([&] { return node2.cleanerCyclesForTest() >= c0 + 3; }, 10s))
-            << "Smoke12 P3: the new leader's cleaner never completed a pass";
+        ASSERT_TRUE(awaitCleanedDurably(node2)) << "Smoke12 P3: the new leader's cleaner never completed a pass";
         node2.stop();  // duty + cleaner threads joined → on-disk state is final.
     }
 
