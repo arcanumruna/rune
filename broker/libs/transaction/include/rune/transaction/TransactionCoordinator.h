@@ -348,13 +348,17 @@ public:
     ///                       whose id is not the caller's (another principal's, or a legacy id) gets a FRESH id
     ///                       (epoch 0), exactly like the epoch-overflow path - the previous holder is fenced and its
     ///                       Ongoing transaction aborted under the old id.  Unset (unit rigs): raw counter ids.
+    /// \param caller         Issue #425: who is asking, used only for the hand-over check.  Set while `owner` is
+    ///                       unset (ids are not being bound, e.g. below the feature level): a raw id is anyone's, but a
+    ///                       BOUND id of another principal is still never handed over (a fresh raw id is issued).
     ///
     /// \returns {producerId, producerEpoch, errorCode}
     ///   errorCode = kInvalidTxnTimeout if txnTimeoutMs is out of range [1, max].
     InitProducerIdResult initProducerId(std::optional<TransactionalId> txnId,
                                         int32_t                        txnTimeoutMs,
                                         int64_t                        nowNs,
-                                        std::optional<uint64_t>        owner = std::nullopt);
+                                        std::optional<uint64_t>        owner = std::nullopt,
+                                        std::optional<uint64_t>        caller = std::nullopt);
 
     // -----------------------------------------------------------------------
     // addPartitions
