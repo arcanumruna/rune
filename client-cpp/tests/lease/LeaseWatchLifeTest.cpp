@@ -125,6 +125,31 @@ TEST(LeaseWatchLifeRegression, CloseAsyncInsideHandlerRegression) {
     EXPECT_EQ(h.rec.bad, 0);
 }
 
+// F-11 (iii): closeAsync while the client's broker session is lost.  The broker expired the session; the close is issued before the
+// client reconnected.  The watch still ends Closed (no hang, no event after the close, every subscription finished), and a restart over
+// the re-established session runs again to Ready.
+TEST(LeaseWatchLifeRegression, CloseAsyncWhileSessionLostThenRestartRegression) {
+    LifeRig f(6107);
+    f.startReady();
+    const std::size_t events = f.rec.evs.size();
+    const std::size_t connectsBefore = f.r.gw.connectAuthTokens.size();
+    f.r.gw.expireSession(f.r.client->testSeedSessionId());
+    f.w.closeAsync();
+    EXPECT_EQ(f.w.life(), Life::Closing);
+    ASSERT_TRUE(f.driveClosed()) << "the close completes although the session is gone";
+    EXPECT_EQ(f.w.life(), Life::Closed);
+    EXPECT_EQ(f.rec.evs.size(), events) << "no event after closeAsync, whatever the session did";
+    f.r.rounds(f.w, 30);
+    EXPECT_EQ(f.rec.evs.size(), events);
+    const Bytes none;
+    const std::span<const uint8_t> sp[] = {std::span<const uint8_t>(none)};
+    ASSERT_EQ(f.w.restart(sp), rc::OpResult::Accepted);
+    ASSERT_TRUE(f.r.drive(f.w, [&] { return f.rec.readies == 2; })) << "the restarted watch reached Ready on the new session";
+    EXPECT_EQ(f.rec.bad, 0);
+    EXPECT_EQ(f.w.liveCount(), 3u);
+    EXPECT_GT(f.r.gw.connectAuthTokens.size(), connectsBefore) << "the session really was lost and re-established (a new Connect)";
+}
+
 TEST(LeaseWatchLifeRegression, CloseAsyncOnFreshIsClosedRegression) {
     WRig r(invokerCfg(6107, 6108, 2), 2);
     const uint64_t before = r.client->dutyCyclesForTest();
@@ -441,6 +466,41 @@ TEST(LeaseWatchRestartRegression, RestartAfterCloseFoldsToLiveSetRegression) {
     f.r.stub->parts[1].grant(kb(7));
     ASSERT_TRUE(f.r.drive(f.w, [&] { return f.rec.held.size() == 6; }));
     EXPECT_EQ(f.rec.bad, 0);
+}
+
+// F-11 (ii): restart across a leader change.  The first Subscribes of the restarted watch are answered NotLeader (the partitions' leaders
+// moved while the watch was closed): the client retries them, and the re-run still brackets every partition once and folds to the live set.
+TEST(LeaseWatchRestartRegression, RestartAcrossLeaderChangeRegression) {
+    LifeRig f(6311);
+    f.startReady();
+    closeToClosed(f.r, f.w);
+    f.r.stub->parts[1].revoke(kb(1));
+    f.r.stub->parts[0].grant(kb(6));
+    const std::size_t mark = f.rec.evs.size();
+    f.r.gw.subscribeErrorFirstN    = 2;   // one per partition: the old leader no longer leads
+    f.r.gw.subscribeErrorFirstCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+    const Bytes none;
+    const std::span<const uint8_t> sp[] = {std::span<const uint8_t>(none)};
+    ASSERT_EQ(f.w.restart(sp), rc::OpResult::Accepted);
+    ASSERT_TRUE(f.r.drive(f.w, [&] { return f.rec.readies == 2; })) << "the restarted watch became ready again after the retries";
+    f.r.rounds(f.w, 20);
+    EXPECT_EQ(f.w.life(), Life::Running);
+    int begin[2] = {0, 0}, end[2] = {0, 0};
+    for (std::size_t i = mark; i < f.rec.evs.size(); ++i) {
+        const Recorder::Ev& e = f.rec.evs[i];
+        if (e.kind == Kind::RerunBegin) { ASSERT_LT(e.part, 2u); ++begin[e.part]; }
+        if (e.kind == Kind::RerunEnd) { ASSERT_LT(e.part, 2u); ++end[e.part]; }
+    }
+    for (int p = 0; p < 2; ++p) {
+        EXPECT_EQ(begin[p], 1) << "partition " << p;
+        EXPECT_EQ(end[p], 1) << "partition " << p;
+    }
+    EXPECT_TRUE(f.rec.open.empty());
+    EXPECT_EQ(f.rec.bad, 0);
+    EXPECT_EQ(heldKeys(f.rec), (Ids{kb(0), kb(2), kb(6)}));
+    const Bytes k1 = kb(1);
+    EXPECT_EQ(f.rec.count(Kind::Vanished, &k1), 1);
+    EXPECT_EQ(f.r.gw.subscribeErrorFirstN, 0) << "both NotLeader answers were consumed (the retries happened)";
 }
 
 TEST(LeaseWatchRestartRegression, RestartAfterFailedRegression) {

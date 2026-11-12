@@ -1028,3 +1028,56 @@ TEST(ProducerTxnGuardRegression, RearmMatrixRegression) {
         EXPECT_EQ(r.endTxns(1), 1);
     }
 }
+
+// F-11 (i): a guarded transactional producer and a PAUSED subscription on the same client.  The pause lives in the hub, the guard in the
+// producer: a trip, a poisoned commit and an abort never touch the paused subscription, and its resume afterwards delivers once.
+TEST(ProducerTxnGuardRegression, GuardedTransactionAndPausedSubscriptionOnOneClientRegression) {
+    GRig r;
+    r.g_now_base = g_now;
+    const auto ref = r.addLease(1);
+    rc::Producer p = r.producer("tx-s", ref);
+    std::vector<int64_t> got;
+    rc::Subscription sub = r.client->subscribe(r.data, 0, {}, [&](const rc::Record& rec) { got.push_back(rec.offset); });
+    ASSERT_TRUE(r.drive([&] { return r.gw.latestSubscription(1, 0) != nullptr; })) << "the Subscribe reached the gateway";
+    const auto first = *r.gw.latestSubscription(1, 0);
+    r.gw.pushRecords(first, 0, 3);
+    ASSERT_TRUE(r.drive([&] { return got.size() == 3; }));
+    ASSERT_TRUE(sub.pause());
+    r.settle();
+    ASSERT_TRUE(sub.paused());
+
+    // A whole guarded transaction while paused: commit ok.
+    p.beginTransaction();
+    r.settle();
+    ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
+    rc::Token c = r.commit(p);
+    ASSERT_TRUE(r.await(c));
+    EXPECT_EQ(r.got[c].status, OpStatus::Ok);
+    EXPECT_TRUE(sub.paused());
+
+    // Then a trip fails the next transaction; the subscription stays paused and untouched.
+    p.beginTransaction();
+    r.settle();
+    ASSERT_NO_FATAL_FAILURE(r.sendAcked(p));
+    ASSERT_NO_FATAL_FAILURE(r.trip());
+    EXPECT_EQ(p.state(), TxnState::AbortableError);
+    EXPECT_TRUE(sub.paused()) << "the guard trip does not touch a paused subscription";
+    EXPECT_FALSE(sub.finished());
+    c = r.commit(p);
+    ASSERT_TRUE(r.await(c));
+    r.expectFailedAtRisk(c, "commit");
+    const rc::Token a = r.abort(p);
+    ASSERT_TRUE(r.await(a));
+    EXPECT_EQ(r.got[a].status, OpStatus::Ok);
+    EXPECT_EQ(got.size(), 3u) << "nothing was delivered while paused";
+
+    // Resume: delivered once from the position, however the guard fared.
+    const std::size_t subs = r.gw.subscribed.size();
+    ASSERT_TRUE(sub.resume());
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribed.size() > subs; })) << "the resume re-armed the subscription";
+    r.gw.pushRecords(r.gw.subscribed.back(), 0, 6);   // the broker pushes a whole batch from below the position
+    ASSERT_TRUE(r.drive([&] { return got.size() >= 6; }));
+    r.settle(20);
+    EXPECT_EQ(got, (std::vector<int64_t>{0, 1, 2, 3, 4, 5})) << "each record once";
+}
+
