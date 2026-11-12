@@ -16,8 +16,10 @@
 //
 // Cold control-thread object (hard rules 1, 4): owned by the gateway on the control thread, four fixed tables
 // allocated once at construction (4096 entries each: pair, host, user, known pair; bounded-probe open addressing with
-// eviction of the OLDEST entry of the probe window when it is full) - check / onFailure / onSuccess never allocate and
-// never refuse.  An entry is occupied iff it holds at least one failure (a known-pair entry: a success).  Keys are
+// eviction of the OLDEST entry of the probe window when it is full; the known-pair table is 512 buckets of kProbe
+// slots chosen by the USER alone, so one user's successes (from any number of hosts) can only evict entries in that
+// user's own bucket - residual, accepted: two users whose secret-keyed hashes share a bucket still compete) - check /
+// onFailure / onSuccess never allocate and never refuse.  An entry is occupied iff it holds at least one failure (a known-pair entry: a success).  Keys are
 // stored as a 128-bit hash: two SipHash-2-4 of the key under two halves of a random per-process 256-bit key (issue
 // #131), so an attacker can neither predict a name's slot (grind names into one probe window to evict its own
 // entries) nor find a collision.
@@ -46,6 +48,8 @@ public:
     static constexpr int64_t  kMaxUserDelayNs = 2'000'000'000;   ///< the user component's low ceiling (never a lockout)
     static constexpr std::size_t kCapacity = 4096;   ///< entries per table (pair, host, user, known); a power of two
     static constexpr std::size_t kProbe    = 8;      ///< slots examined per key
+    static_assert(kCapacity % kProbe == 0 && ((kCapacity / kProbe) & (kCapacity / kProbe - 1)) == 0,
+                  "known_ is kCapacity / kProbe buckets, a power of two");
     using HashKey = std::array<uint8_t, 32>;         ///< two SipHash keys (h1, h2)
 
     /// A random per-process hash key (RAND_bytes; std::random_device if that refuses - unpredictable either way).
@@ -78,8 +82,14 @@ private:
     [[nodiscard]] Key hostKey(std::string_view host) const noexcept;
     [[nodiscard]] Key userKey(std::string_view user) const noexcept;
     [[nodiscard]] Key hash_(char tag, std::string_view a, std::string_view b) const noexcept;
-    [[nodiscard]] static const Entry* find_(const std::vector<Entry>&, Key, int64_t nowNs) noexcept;
-    [[nodiscard]] static Entry& claim_(std::vector<Entry>&, Key, int64_t nowNs) noexcept;
+    /// Home slot of a key in the pair / host / user tables: where its probe window starts.
+    [[nodiscard]] static std::size_t slotOf_(Key k) noexcept;
+    /// First slot of a user's bucket of kProbe slots in `known_` (#523): chosen by the USER alone.
+    [[nodiscard]] static std::size_t bucketStart_(Key userKey) noexcept;
+    [[nodiscard]] std::size_t knownStart_(std::string_view user) const noexcept;
+    /// Bounded-probe lookup / claim of the kProbe slots from `start` (wrapping); `start` is the table's own choice.
+    [[nodiscard]] static const Entry* find_(const std::vector<Entry>&, Key, std::size_t start, int64_t nowNs) noexcept;
+    [[nodiscard]] static Entry& claim_(std::vector<Entry>&, Key, std::size_t start, int64_t nowNs) noexcept;
     static void fail_(Entry&, uint32_t freeFailures, int64_t maxDelayNs, int64_t nowNs) noexcept;
 
     HashKey key_;

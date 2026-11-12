@@ -89,8 +89,8 @@ LoginThrottle::Key LoginThrottle::pairKey(std::string_view user, std::string_vie
 LoginThrottle::Key LoginThrottle::hostKey(std::string_view host) const noexcept { return hash_('H', {}, host); }
 LoginThrottle::Key LoginThrottle::userKey(std::string_view user) const noexcept { return hash_('U', user, {}); }
 
-const LoginThrottle::Entry* LoginThrottle::find_(const std::vector<Entry>& t, Key k, int64_t nowNs) noexcept {
-    const std::size_t start = static_cast<std::size_t>(k.h1) & (kCapacity - 1);
+const LoginThrottle::Entry* LoginThrottle::find_(const std::vector<Entry>& t, Key k, std::size_t start,
+                                                 int64_t nowNs) noexcept {
     for (std::size_t i = 0; i < kProbe; ++i) {
         const Entry& e = t[(start + i) & (kCapacity - 1)];
         if (e.failures != 0 && e.h1 == k.h1 && e.h2 == k.h2)
@@ -99,8 +99,7 @@ const LoginThrottle::Entry* LoginThrottle::find_(const std::vector<Entry>& t, Ke
     return nullptr;
 }
 
-LoginThrottle::Entry& LoginThrottle::claim_(std::vector<Entry>& t, Key k, int64_t nowNs) noexcept {
-    const std::size_t start = static_cast<std::size_t>(k.h1) & (kCapacity - 1);
+LoginThrottle::Entry& LoginThrottle::claim_(std::vector<Entry>& t, Key k, std::size_t start, int64_t nowNs) noexcept {
     Entry* victim = nullptr;
     bool victimReusable = false;   // an empty / idle slot beats any live one
     for (std::size_t i = 0; i < kProbe; ++i) {
@@ -129,33 +128,44 @@ void LoginThrottle::fail_(Entry& e, uint32_t freeFailures, int64_t maxDelayNs, i
     e.nextAllowedNs = nowNs + std::min<int64_t>(kBaseDelayNs << shift, maxDelayNs);
 }
 
+std::size_t LoginThrottle::slotOf_(Key k) noexcept { return static_cast<std::size_t>(k.h1) & (kCapacity - 1); }
+
+std::size_t LoginThrottle::bucketStart_(Key userKey) noexcept {
+    return (static_cast<std::size_t>(userKey.h1) & (kCapacity / kProbe - 1)) * kProbe;
+}
+
+std::size_t LoginThrottle::knownStart_(std::string_view user) const noexcept { return bucketStart_(userKey(user)); }
+
 LoginThrottle::Verdict LoginThrottle::check(std::string_view user, std::string_view host, int64_t nowNs) const noexcept {
     int64_t next = 0;
-    if (const Entry* e = find_(pairs_, pairKey(user, host), nowNs)) next = std::max(next, e->nextAllowedNs);
-    if (const Entry* e = find_(hosts_, hostKey(host), nowNs)) next = std::max(next, e->nextAllowedNs);
+    const Key pk = pairKey(user, host), hk = hostKey(host), uk = userKey(user);
+    if (const Entry* e = find_(pairs_, pk, slotOf_(pk), nowNs)) next = std::max(next, e->nextAllowedNs);
+    if (const Entry* e = find_(hosts_, hk, slotOf_(hk), nowNs)) next = std::max(next, e->nextAllowedNs);
     // The user component (#131) is skipped for a pair the user has logged in from: a campaign against the user from
     // elsewhere never delays the user at home.  Its pair and host components still apply.
-    if (find_(known_, pairKey(user, host), nowNs) == nullptr)
-        if (const Entry* e = find_(users_, userKey(user), nowNs)) next = std::max(next, e->nextAllowedNs);
+    if (find_(known_, pk, bucketStart_(uk), nowNs) == nullptr)
+        if (const Entry* e = find_(users_, uk, slotOf_(uk), nowNs)) next = std::max(next, e->nextAllowedNs);
     if (nowNs >= next) return {};
     constexpr int64_t ms = 1'000'000;
     return {false, static_cast<uint32_t>((next - nowNs + ms - 1) / ms)};
 }
 
 void LoginThrottle::onFailure(std::string_view user, std::string_view host, int64_t nowNs) noexcept {
-    fail_(claim_(pairs_, pairKey(user, host), nowNs), kFreePairFailures, kMaxDelayNs, nowNs);
-    fail_(claim_(hosts_, hostKey(host), nowNs), kFreeHostFailures, kMaxDelayNs, nowNs);
-    fail_(claim_(users_, userKey(user), nowNs), kFreeUserFailures, kMaxUserDelayNs, nowNs);
+    const Key pk = pairKey(user, host), hk = hostKey(host), uk = userKey(user);
+    fail_(claim_(pairs_, pk, slotOf_(pk), nowNs), kFreePairFailures, kMaxDelayNs, nowNs);
+    fail_(claim_(hosts_, hk, slotOf_(hk), nowNs), kFreeHostFailures, kMaxDelayNs, nowNs);
+    fail_(claim_(users_, uk, slotOf_(uk), nowNs), kFreeUserFailures, kMaxUserDelayNs, nowNs);
 }
 
 void LoginThrottle::onSuccess(std::string_view user, std::string_view host, int64_t nowNs) noexcept {
     const Key k = pairKey(user, host);
-    const std::size_t start = static_cast<std::size_t>(k.h1) & (kCapacity - 1);
+    const std::size_t start = slotOf_(k);
     for (std::size_t i = 0; i < kProbe; ++i) {
         Entry& e = pairs_[(start + i) & (kCapacity - 1)];
         if (e.failures != 0 && e.h1 == k.h1 && e.h2 == k.h2) e = Entry{};
     }
-    Entry& known = claim_(known_, k, nowNs);   // refreshed on every success: known for kForgetAfterNs after the last
+    // Refreshed on every success: known for kForgetAfterNs after the last; in the USER's own bucket (#523).
+    Entry& known = claim_(known_, k, knownStart_(user), nowNs);
     known.failures = 1;
     known.lastFailNs = nowNs;
 }

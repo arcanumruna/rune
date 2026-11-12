@@ -175,9 +175,9 @@ TEST(LoginThrottleRegression, TheUserComponentNeverExceedsItsCapAndAKnownPairIsF
 }
 
 // Table pressure (the known-pair table is 4096 entries, oldest-of-window eviction): an attacker with its OWN account
-// logging in from 20 000 hosts can push the victim's known pair out.  The damage is bounded by the user cap: the victim
-// at home is delayed 2 s at most, never locked out, and its own next success restores the exemption.  (The eviction
-// itself is filed as a hardening issue; this test pins the bound.)
+// logging in from 20 000 hosts.  Since #523 it cannot push the victim's known pair out (per-user buckets); this test
+// keeps pinning the bound that holds even if a bucket is shared: at most the user cap, never a lockout, and the
+// victim's own next success restores the exemption.
 TEST(LoginThrottleRegression, KnownPairTablePressureBoundsTheVictimByTheUserCapAdversarialRegression) {
     LoginThrottle t;
     int64_t now = 1;
@@ -190,6 +190,32 @@ TEST(LoginThrottleRegression, KnownPairTablePressureBoundsTheVictimByTheUserCapA
     t.onSuccess("victim", "10.0.0.9", now + LoginThrottle::kMaxUserDelayNs);
     t.onFailure("victim", "198.51.100.200", now + LoginThrottle::kMaxUserDelayNs);
     EXPECT_TRUE(t.check("victim", "10.0.0.9", now + LoginThrottle::kMaxUserDelayNs).allowed) << "known again";
+}
+
+// Issue #523: a user's known pairs live in a bucket chosen by the USER alone, so another principal's successes from
+// any number of hosts can never evict them (fixed hash key: the two names below land in different buckets).
+TEST(LoginThrottleRegression, OtherUsersSuccessesNeverEvictAKnownPairRegression) {
+    LoginThrottle::HashKey k{};
+    k[0] = 7;
+    LoginThrottle t(k);
+    int64_t now = 1;
+    t.onSuccess("victim", "10.0.0.9", now);
+    for (int i = 0; i < 20'000; ++i) t.onSuccess("attacker", "2001:db8::" + std::to_string(i), ++now);
+    for (int i = 0; i < 50; ++i) t.onFailure("victim", "198.51.100." + std::to_string(i), now);
+    EXPECT_TRUE(t.check("victim", "10.0.0.9", now).allowed) << "the known pair survives the flood";
+    EXPECT_FALSE(t.check("victim", "203.0.113.7", now).allowed) << "the user component still applies elsewhere";
+}
+
+// One user's own ninth known host evicts that user's OLDEST known pair (its bucket holds kProbe entries) and no other.
+TEST(LoginThrottleRegression, AUsersNinthKnownHostEvictsItsOwnOldestRegression) {
+    LoginThrottle::HashKey k{};
+    k[0] = 7;
+    LoginThrottle t(k);
+    int64_t now = 1;
+    for (int h = 1; h <= 9; ++h) t.onSuccess("u", "10.0.0." + std::to_string(h), ++now);
+    for (int i = 0; i < 12; ++i) t.onFailure("u", "198.51.100." + std::to_string(i), now);
+    EXPECT_FALSE(t.check("u", "10.0.0.1", now).allowed) << "the oldest known pair was evicted";
+    for (int h = 2; h <= 9; ++h) EXPECT_TRUE(t.check("u", "10.0.0." + std::to_string(h), now).allowed) << h;
 }
 
 // Input bounds of the keys: an empty user, an empty host (IPC), a 1 MiB name and a name with an embedded NUL are all
