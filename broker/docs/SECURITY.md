@@ -182,7 +182,11 @@ examples are `world_*`; a grant pattern is a string and may contain any allowed 
   verifier, and the broker accepts the one that verifies (D5, D8).
 - Logging in with an unknown user, a wrong password, a disabled user or no credentials all give the
   same `AuthenticationFailed`; the answer never reveals which. An unknown user gets a deterministic
-  fake salt, the same on every broker and across restarts.
+  fake salt, the same on every broker and across restarts, and advertises the iteration count of the
+  first bootstrap's verifier, fixed for the life of the cluster (it does not follow the real accounts).
+  Known limit: an account whose password was created with a different iteration count than that is
+  distinguishable from an unknown name, so create every password with the bootstrap count (the CLI
+  default).
 - A client with credentials **refuses a broker that skips the login** (a dev-mode broker, an old
   broker, a cluster with no security admin yet) with `AuthenticationFailed`, so a rogue endpoint
   never receives a credentialed client's data. Set `ClientConfig::allowUnauthenticatedBroker = true`

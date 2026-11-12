@@ -294,6 +294,23 @@ TEST(SecurityApplyV1Regression, FakeSaltSeedIsSetOnceByTheFirstBootstrapRegressi
     EXPECT_NE(a.s.digest(), emptyDigest);
 }
 
+// #238: the iteration count of the fake salts is the one of the FIRST Bootstrap's verifier; a later Bootstrap keeps it,
+// and the digest is unchanged (the golden tests pin it).
+TEST(SecurityApplyV1Regression, FakeIterationsArePinnedByTheFirstBootstrapRegression) {
+    Script sc;
+    EXPECT_FALSE(sc.s.fakeIterations().has_value());
+    auto vi = [](uint8_t n, uint32_t iterations) { auto x = v(n); x.iterations = iterations; return x; };
+    rs::BootstrapOps first{vi(1, 8192)}; first.fakeSaltSeed.fill(0xA1);
+    ASSERT_TRUE(sc.run(first, "admin").has_value());
+    ASSERT_TRUE(sc.s.fakeIterations().has_value());
+    EXPECT_EQ(*sc.s.fakeIterations(), 8192u);
+    sc.run(rs::AlterUserOps{rs::DisableUser{}}, "admin");
+    rs::BootstrapOps second{vi(2, 20000)}; second.fakeSaltSeed.fill(0xB2);
+    ASSERT_TRUE(sc.run(second, "admin2").has_value());
+    EXPECT_EQ(*sc.s.fakeIterations(), 8192u) << "a later Bootstrap does not move it";
+    EXPECT_EQ(*sc.s.cloneWithoutRequests().fakeIterations(), 8192u) << "the clone keeps it";
+}
+
 TEST(SecurityApplyV1Regression, GrantsOnInternalNamesAreRefusedRegression) {
     Script sc; sc.run(rs::CreateUserOps{v(1)}, "u");
     const rs::GrantSpec bad[] = {

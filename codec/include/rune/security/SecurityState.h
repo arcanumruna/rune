@@ -107,6 +107,11 @@ public:
     /// D8: the cluster-wide key of the fake salts, set by the FIRST Bootstrap event and never changed
     /// (a later Bootstrap keeps it).  nullopt before any bootstrap.  Covered by digest(), not by fingerprints.
     [[nodiscard]] const std::optional<std::array<uint8_t, kFakeSaltSeedBytes>>& fakeSaltSeed() const noexcept { return fakeSaltSeed_; }
+    /// #238: the iteration count the fake salts of unknown users advertise: the iteration count of the FIRST Bootstrap's
+    /// verifier, set once together with the seed and never changed (a later Bootstrap keeps it).  nullopt before any
+    /// bootstrap.  NOT covered by digest(): it is a pure function of the same first Bootstrap event the seed comes from
+    /// (which the digest already covers), so the digest and the golden files are unchanged.
+    [[nodiscard]] const std::optional<uint32_t>& fakeIterations() const noexcept { return fakeIterations_; }
 private:
     friend struct ApplyV1;
     friend struct ApplyV2;
@@ -117,6 +122,7 @@ private:
     struct RequestEntry { std::string principal; RequestRecord rec; };   // one per principal that recorded the id
     std::unordered_map<RequestId, std::vector<RequestEntry>, rune::catalog::RequestIdHash> requests_;
     std::optional<std::array<uint8_t, kFakeSaltSeedBytes>> fakeSaltSeed_;
+    std::optional<uint32_t> fakeIterations_;
     uint64_t nextObjectId_ = 1; int64_t appliedOffset_ = -1;
 };
 

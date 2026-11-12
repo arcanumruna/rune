@@ -246,7 +246,10 @@ Applied ApplyV1::commit(SecurityState& s, const SecurityEvent& e, int64_t offset
             s.tombstones_.push_back(std::move(ch.tomb));
         }
     }, st.change);
-    if (const auto* b = std::get_if<BootstrapOps>(&e.ops); b && !s.fakeSaltSeed_) s.fakeSaltSeed_ = b->fakeSaltSeed;   // D8: the first one wins
+    if (const auto* b = std::get_if<BootstrapOps>(&e.ops); b && !s.fakeSaltSeed_) {   // D8: the first one wins
+        s.fakeSaltSeed_ = b->fakeSaltSeed;
+        s.fakeIterations_ = b->verifier.iterations;   // #238: the fake salts advertise the first bootstrap's count
+    }
     s.appliedOffset_ = offset;
     if (!e.principal.requestId.none()) {   // first one wins, per (principal, id)
         auto& entries = s.requests_[e.principal.requestId];

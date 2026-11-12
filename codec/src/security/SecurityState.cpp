@@ -87,6 +87,7 @@ SecurityState SecurityState::cloneWithoutRequests() const {
     c.roleNames_ = roleNames_;
     c.tombstones_ = tombstones_;
     c.fakeSaltSeed_ = fakeSaltSeed_;
+    c.fakeIterations_ = fakeIterations_;
     c.nextObjectId_ = nextObjectId_;
     c.appliedOffset_ = appliedOffset_;
     return c;   // requests_ stays empty
