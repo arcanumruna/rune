@@ -486,7 +486,6 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
     committedIsr_    = isr;
     resetIsrProposal_();       // in place (A-M4)
     invalidRequestBackoffUntilNs_ = 0;
-    invalidRequestWarned_ = false;
     committedPartitionEpoch_ = partitionEpoch;
     expandBackoffUntilNs_    = 0;
     // MAJOR-2/3 (internal quorum mode): the ISR handed in (every replica) is
@@ -3135,16 +3134,16 @@ void PartitionReplica::onAlterIsrResponse(const AlterIsrResponseMsg& r)
             if (!atBase) return;
             expandBackoffUntilNs_ = lastKnownNowNs_ + kAlterIsrResendNs;
             break;
-        case kAlterIsrInvalidRequest:
+        case kAlterIsrInvalidRequest: {
             // Answered only for a proposal derived from the CURRENT committed state (leader epoch and partitionEpoch
             // checked first, MetadataService::onAlterIsr): nothing newer is committed, so this replica's committed
             // view is the controller's - collapsing to it is safe.  A GENUINE InvalidRequest always carries pe ==
             // our base; any other pe is a late answer for an earlier proposal and must never clear this one.
             if (!atBase) return;
             // A-M2: never re-derive and re-send the same invalid set at RTT rate.
+            const bool firstThisLeadership = invalidRequestBackoffUntilNs_ == 0;
             invalidRequestBackoffUntilNs_ = lastKnownNowNs_ + kAlterIsrResendNs;
-            if (!invalidRequestWarned_) {
-                invalidRequestWarned_ = true;
+            if (firstThisLeadership) {
                 std::string set;
                 for (int i = 0; i < P.count; ++i) { if (!set.empty()) set += ','; set += std::to_string(P.members[static_cast<std::size_t>(i)]); }
                 spdlog::warn("PartitionReplica[node={} topic={} part={}]: AlterIsr {{{}}} at partitionEpoch {} "
@@ -3154,6 +3153,7 @@ void PartitionReplica::onAlterIsrResponse(const AlterIsrResponseMsg& r)
                              kAlterIsrResendNs / 1'000'000);
             }
             break;
+        }
         case kAlterIsrInvalidUpdateVersion:
         case kAlterIsrFencedLeaderEpoch:
             // DR-BUG-6 residual (2026-10-15): NEVER resolved by the answer.  A newer partitionEpoch / leader epoch is
