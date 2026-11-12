@@ -153,6 +153,7 @@ struct Completion {
                                  ///< own length is ground truth)
     int64_t  aux   = 0;          ///< Connect refused AuthenticationFailed: the broker's retryAfterMs (rate-limited login; 0 = none): read it
                                  ///< with retryAfterMs(c)
+                                 ///< Connect Timeout: 1 when the gateway never answered the ConnectRequest, else 0
                                  ///< GetTopicSchema/DefineTopic: version; AlterTopic: newVersion; Tier2: recordCount
                                  ///< CreateView: outputFingerprint (bit-cast uint64_t)
     OpKind   op{};

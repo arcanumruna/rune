@@ -2939,8 +2939,9 @@ void Client::sweepControl_(int64_t nowNs) {
                              rateLimited ? static_cast<int64_t>(retryAfter) : 0);
             if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(kRefused)); });
         } else {
-            connectTimeoutUnanswered_.store(agent_.seedMachine().state() == session::SessionState::Connecting, std::memory_order_relaxed);
-            completeConnect_(OpStatus::Timeout, 0, 0, {});
+            // aux = 1: the gateway never answered the ConnectRequest (the seed is still Connecting).  It travels in the completion,
+            // so the waiting app thread reads it from the ring, never from a duty-owned field.
+            completeConnect_(OpStatus::Timeout, 0, 0, {}, agent_.seedMachine().state() == session::SessionState::Connecting ? 1 : 0);
             if (cbError_) {
                 invokeUserCallback_("onError", [&] { cbError_("connect() timed out"); });
             }
@@ -3216,7 +3217,7 @@ void Client::connectAndWait(std::chrono::nanoseconds timeout) {
     andWait_("connect()", timeout, 0,
              [&](Completions& q, Token t) { return connect(q, t); },
              [&](const Completion& c, std::span<const uint8_t> payload) {
-                 if (c.status == OpStatus::Timeout && !hint.empty() && connectTimeoutUnanswered_.load(std::memory_order_relaxed)) throw std::runtime_error("connect(): timed out" + hint);
+                 if (c.status == OpStatus::Timeout && !hint.empty() && c.aux != 0) throw std::runtime_error("connect(): timed out" + hint);
                  throwForStatus_("connect()", c, payload);
              },
              [&]() -> std::string {

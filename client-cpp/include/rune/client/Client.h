@@ -2461,7 +2461,6 @@ private:
     // ---- F8c C3: seed-session status for app threads (duty -> owner ring) ---
     mutable detail::StatusRing<SeedStatus> seedStatus_;  // consumer side drained by const state()
     bool       seedStatusDirty_ = false;  // duty: a newer status than the ring holds
-    std::atomic<bool> connectTimeoutUnanswered_{false};   // duty writes at a connect deadline: the gateway never answered the ConnectRequest
     SeedStatus seedStatusLast_{};         // duty: last status computed
     mutable SeedStatus seedStatusCache_{};  // owner: latest drained
 
