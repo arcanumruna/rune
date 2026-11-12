@@ -192,7 +192,7 @@ bool Subscription::pause(int64_t resumeAt) {
     // number.  An Invoker owner's sink applies it at once and answers with the hub's verdict; elsewhere it is queued.
     if (unsubscribed_ || impl_->status.closed()) return false;
     drainStatus_();
-    const uint32_t seq = appSeq_ + 1;
+    const uint32_t seq = nextSeq_(appSeq_);
     cmd.b = seq;
     // A position above the last snapshot is only decidable by the thread that owns the hub: ask the sink to apply it
     // directly (it does nothing when the caller is not that thread).
@@ -220,7 +220,7 @@ bool Subscription::resume() {
     if (onDutyThread_()) return sink_(sinkCtx_, cmd) == detail::HubSubmit::Applied;
     drainStatus_();
     if (unsubscribed_ || !paused_ || impl_->status.closed()) return false;
-    const uint32_t seq = appSeq_ + 1;
+    const uint32_t seq = nextSeq_(appSeq_);
     cmd.b = seq;
     const detail::HubSubmit r = sink_(sinkCtx_, cmd);
     if (r != detail::HubSubmit::Applied && r != detail::HubSubmit::Accepted) return false;

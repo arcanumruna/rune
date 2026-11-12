@@ -563,10 +563,16 @@ public:
     void markNotPausable() noexcept { pausable_ = false; }
 
 private:
+    friend struct SubscriptionTestAccess;   // tests only: sets the command counter next to its wrap
     [[nodiscard]] bool onDutyThread_() const noexcept {
         return dutyThread_ != std::thread::id{} && std::this_thread::get_id() == dutyThread_;
     }
     void drainStatus_() const;
+    /// The number of the next pause() / resume() command: 0 means "no number" (a duty-thread call), so it is skipped on wrap.
+    [[nodiscard]] static uint32_t nextSeq_(uint32_t cur) noexcept {
+        const uint32_t n = cur + 1;
+        return n != 0 ? n : 1;
+    }
     /// F8c C7: the §3.3 release of the handle's share (see the destructor).
     void release_() noexcept;
 

@@ -33,6 +33,13 @@ namespace rc  = rune::client;
 namespace rcd = rune::client::detail;
 using rune::client::subscriber::SubscriberHub;
 
+namespace rune::client {
+/// The friend the handle declares: puts the command counter next to its wrap.
+struct SubscriptionTestAccess {
+    static void setSeq(Subscription& s, uint32_t n) { s.appSeq_ = n; }
+};
+}  // namespace rune::client
+
 namespace {
 
 constexpr int64_t kSession = 7;
@@ -1641,4 +1648,32 @@ TEST(SubscriberPauseRegression, PauseStressRingRefusalAndHandlerRegression) {
     EXPECT_GT(tot.lossesBound, 10);
     EXPECT_GT(tot.owedSent, 10);
     EXPECT_GT(tot.owedDropped, 0);
+}
+
+// N-1: the command number 0 means "no number" (a duty-thread call).  Across the wrap of the 32-bit counter the handle skips
+// 0, so the echo keeps matching and a handler pause is still adopted by the handle.
+TEST(SubscriberPauseRegression, EchoNumberSkipsZeroOnWrapRegression) {
+    Rig r;
+    AppThread app;
+    r.open(11);
+    r.bind(40);
+    rc::SubscriptionTestAccess::setSeq(*r.sub, 0xFFFFFFFEu);
+    r.impl->appSeqApplied = 0xFFFFFFFEu;   // the hub echoed everything so far
+    bool p = false, rs = false;
+    app.run([&] { p = r.sub->pause(); });      // number 0xFFFFFFFF
+    app.run([&] { rs = r.sub->resume(); });    // the next number: must not be 0
+    ASSERT_TRUE(p);
+    ASSERT_TRUE(rs);
+    r.bindLast(41);
+    bool hp = false;
+    r.hook = [&](const rc::Record& rec) {
+        if (rec.offset == 1 && !hp) { hp = true; EXPECT_TRUE(r.sub->pause(rec.offset)); }   // a duty-thread call: no number
+    };
+    r.push(41, 0, 4);
+    ASSERT_TRUE(r.impl->paused);
+    bool seen = false, back = false;
+    app.run([&] { seen = r.sub->paused(); back = r.sub->resume(); });
+    EXPECT_TRUE(seen) << "the handler's pause is adopted after the counter wrapped";
+    EXPECT_TRUE(back);
+    EXPECT_NE(r.impl->appSeqApplied, 0u);
 }
