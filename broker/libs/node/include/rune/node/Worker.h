@@ -923,7 +923,7 @@ public:
     [[nodiscard]] uint64_t intakeKeyHoldsForTest() const noexcept { return intakeKeyHolds_; }
     /// Test-only: per-session crypto entries (encrypted sessions announced here).
     /// Test-only: probe-chain length of the last session-crypto lookup (the slot-indexed regression).
-    [[nodiscard]] std::size_t sessionCryptoLastProbesForTest() const noexcept { return sessionCrypto_.lastProbesForTest(); }
+    [[nodiscard]] std::size_t sessionCryptoProbesForTest(int64_t sid) const noexcept { return sessionCrypto_.probesForTest(sid); }
     /// Test-only: look up one session's crypto entry exactly as the produce path does.
     [[nodiscard]] bool sessionCryptoLookupForTest(int64_t sid) noexcept { return sessionCrypto_.find(sid) != nullptr; }
     [[nodiscard]] std::size_t sessionCryptoCountForTest() const noexcept { return sessionCrypto_.size(); }

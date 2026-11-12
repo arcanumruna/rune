@@ -2,6 +2,7 @@
 // scan over every encrypted session on EVERY produce frame (O(sessions) on the hot path).  The lookup is now one hash
 // and a short probe chain in a slot-indexed table.
 #include <rune/crypto/Aead.h>
+#include <rune/node/SessionCryptoTable.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/protocol/RecordBatch.h>
@@ -9,6 +10,8 @@
 
 #include <gtest/gtest.h>
 
+#include <bit>
+#include <cstddef>
 #include <cstring>
 #include <vector>
 
@@ -57,12 +60,12 @@ TEST(WorkerSessionCryptoRegression, LookupIsSlotIndexedNotAScanRegression) {
     // The frame is not sealed, so the open fails closed (dropped) - but the lookup it did is what is measured.
     const auto frame = produceFrameFor(kSessions);
     EXPECT_EQ(worker.handleIngressFrameForTest(frame.data(), frame.size(), 1), 0) << "an unsealed frame of an encrypted session is dropped";
-    EXPECT_GE(worker.sessionCryptoLastProbesForTest(), 1u);
-    EXPECT_LE(worker.sessionCryptoLastProbesForTest(), 8u) << "O(1) average, not O(sessions)";
+    EXPECT_GE(worker.sessionCryptoProbesForTest(kSessions), 1u);
+    EXPECT_LE(worker.sessionCryptoProbesForTest(kSessions), 8u) << "O(1) average, not O(sessions)";
 
     for (const int64_t sid : {int64_t{1}, int64_t{2000}, int64_t{3999}}) {
         ASSERT_TRUE(worker.sessionCryptoLookupForTest(sid));
-        EXPECT_LE(worker.sessionCryptoLastProbesForTest(), 8u);
+        EXPECT_LE(worker.sessionCryptoProbesForTest(sid), 8u);
     }
     EXPECT_FALSE(worker.sessionCryptoLookupForTest(kSessions + 1)) << "an unknown (plaintext) session has no entry";
 }
@@ -99,4 +102,31 @@ TEST(WorkerSessionCryptoRegression, DecryptFailuresAreCountedAndRateLimitedRegre
     for (int i = 0; i < kFlood; ++i) EXPECT_EQ(worker.handleIngressFrameForTest(frame.data(), frame.size(), 1 + i), 0);
     EXPECT_EQ(worker.decryptFailuresForTest(), static_cast<uint64_t>(kFlood));
     EXPECT_EQ(worker.unauthLogSuppressed(), static_cast<uint64_t>(kFlood - 3)) << "logged at 0, 1024 and 2048 only";
+}
+
+// #268: the hot lookup stored the probe count in a mutable member on EVERY find().  The counter is now computed on demand
+// by a test seam, so the table holds nothing but its two arrays and its count.
+TEST(SessionCryptoTableRegression, LookupStoresNothingRegression) {
+    using Table = SessionCryptoTable<int, 16>;
+    static_assert(sizeof(Table) == 2 * sizeof(void*) + sizeof(std::size_t),
+                  "a lookup must not keep per-lookup state in the table");
+    EXPECT_EQ(sizeof(Table), 2 * sizeof(void*) + sizeof(std::size_t));
+}
+
+TEST(SessionCryptoTableRegression, ProbesForTestCountsTheExaminedSlotsRegression) {
+    using Table = SessionCryptoTable<int, 16>;
+    const auto home = [](int64_t sid) {
+        return static_cast<std::size_t>((static_cast<uint64_t>(sid) * 0x9E3779B97F4A7C15ULL) >> (64 - 4));
+    };
+    Table t;
+    EXPECT_EQ(t.probesForTest(1), 0u) << "an empty table examines nothing";
+    ASSERT_NE(t.findOrInsert(1), nullptr);
+    EXPECT_EQ(t.probesForTest(1), 1u) << "a direct hit is one slot";
+    int64_t colliding = 0;
+    for (int64_t s = 2; s < 4096 && colliding == 0; ++s)
+        if (home(s) == home(1)) colliding = s;
+    ASSERT_NE(colliding, 0) << "no key with the same home slot found in the capped search";
+    ASSERT_NE(t.findOrInsert(colliding), nullptr);
+    EXPECT_EQ(t.probesForTest(1), 1u);
+    EXPECT_GE(t.probesForTest(colliding), 2u) << "inserted after a colliding key: it sits further along the chain";
 }
