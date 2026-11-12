@@ -1,7 +1,9 @@
 // AuthEnforcementTest.cpp - authentication Task 12 against ONE real authenticating BrokerNode (real Aeron UDP, raw
 // frames): every row of the §2.1 enforcement map, granted -> the request's normal answer, not granted -> code 45 in the
 // request's OWN response type.  A user per test, holding exactly the grants the row names.
+#include "support/AuthLogReader.h"
 #include "support/AuthRig.h"
+#include <rune/catalog/CatalogEvent.h>
 #include <rune/protocol/ProducerIdBinding.h>
 
 #include <algorithm>
@@ -1444,4 +1446,45 @@ TEST(AuthEnforcementAdversarialRegression, TheRigsLogsStayWithinTheTestSegmentBo
     EXPECT_LE(largest, static_cast<uintmax_t>(kTestSegmentRollBytes) + (1u << 20))
         << "a file above the 1 MiB test roll (+ index slack): " << largestPath;
     EXPECT_LT(allocated, uintmax_t{24} << 20) << "the rig's logs: " << (allocated >> 20) << " MiB";
+}
+
+// Issue #524: a catalog event's `statement`, client name and `replayedFrom` are the issuing client's claims, recorded as
+// sent; `principal.authenticated` is the broker's, taken from the session.  A client that sends a misleading statement
+// and a replayedFrom naming another principal changes neither the applied ops nor the authenticated principal.
+TEST(AuthEnforcementRegression, ACatalogEventsAuthenticatedPrincipalIsTheSessionsNotTheClientsClaimRegression) {
+    AuthRig r;
+    std::string name;
+    const int64_t sid = r.newUser({prefix(SO::Create, ST::Topic, "p")}, &name);
+    pc::DefineTopic m;
+    m.sessionId = sid; m.correlationId = r.c().nextCorrelationId(); m.topicName = "p.t"; m.partitionCount = 1;
+    m.keyField = "id";
+    const auto blob = authRigCharBlob();
+    m.descriptorBlob = blob.data(); m.descriptorLen = static_cast<uint32_t>(blob.size());
+    m.config = authRigTopicConfig();
+    m.hasExt = true;
+    m.ext.statement = "DROP TOPIC everything;";
+    m.ext.clientName = "mallory-tool";
+    m.ext.hasReplayedFrom = 1;
+    m.ext.replayedClusterId = "x";
+    m.ext.replayedOffset = 7;
+    m.ext.replayedPrincipal = "mallory";
+    std::vector<uint8_t> buf(m.encodedSize());
+    const std::size_t len = m.encode(buf.data());
+    ASSERT_TRUE(r.c().send(r.ch(), r.stream(), buf.data(), len));
+    ASSERT_EQ(r.ddlCode(m.correlationId), kOk);
+
+    const auto events = readCatalogEvents(r.broker().node());
+    const rune::catalog::CatalogEvent* mine = nullptr;
+    for (const auto& e : events)
+        if (e.kind == rune::catalog::EventKind::CreateTopic && e.objectName == "p.t") mine = &e;
+    ASSERT_NE(mine, nullptr) << "the DefineTopic's catalog event";
+    EXPECT_TRUE(std::holds_alternative<rune::catalog::CreateTopicOps>(mine->ops)) << "ops: what was applied";
+    EXPECT_EQ(mine->principal.authenticated, name) << "the principal is the session's user, not the claim";
+    EXPECT_EQ(mine->statement, "DROP TOPIC everything;") << "recorded as sent: a claim";
+    EXPECT_EQ(mine->principal.clientName, "mallory-tool") << "recorded as sent: a claim";
+    ASSERT_TRUE(mine->replayedFrom.has_value());
+    EXPECT_EQ(mine->replayedFrom->clusterId, "x");
+    EXPECT_EQ(mine->replayedFrom->offset, 7);
+    EXPECT_EQ(mine->replayedFrom->principal, "mallory");
+    EXPECT_NE(mine->principal.authenticated, mine->replayedFrom->principal);
 }

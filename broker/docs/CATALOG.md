@@ -16,10 +16,10 @@ Each event is one record. Its layout is fixed per `formatVer`.
 | `objectId` | The object's permanent id. Assigned at creation, never reused. |
 | `objectName` | The object's name at the time of the event. |
 | `prevVersion` / `newVersion` | The object's version before and after. A create has `prevVersion` 0. |
-| `statement` | The original DDL text. Empty for DDL issued from the API without text. |
+| `statement` | The DDL text as the client sent it. Empty for DDL issued from the API without text. The broker does not check it against `ops`: `ops` is what was applied. |
 | `ops` | The parsed, resolved operations. Schema changes name fields by their durable tag, not by name. |
-| `principal` | Who issued it: session id, client name, source address, the authenticated principal (empty until authentication exists), and the DDL's request id. |
-| `replayedFrom` | Set only on events written by `rune catalog replay`: the source cluster id, offset and original principal. |
+| `principal` | Who issued it: session id, client name, source address, the authenticated principal (empty until authentication exists), and the DDL's request id. The authenticated principal is set by the broker from the session; the client name is the client's claim. |
+| `replayedFrom` | The client's claim that this DDL re-issues an event of another cluster (`rune catalog replay` sets it): source cluster id, offset and original principal. The broker records it as given; who actually issued the event is `principal`. |
 | `timestampMs` | The leader's wall clock when it appended the event. Informational: the **offset** is the order. |
 | `fingerprint` | A hash of the object's resulting state. The state itself is not stored. |
 
@@ -130,7 +130,8 @@ rune ql -e "diff catalog offset 3 to 9;" --broker rune-1:40200
 ```
 
 A history row is one line: offset, time (UTC), kind, object and object id, version change,
-principal, `replayedFrom` (`<cluster>@<offset>` or `-`) and the statement. A diff line is
+principal, `replayedFrom` (`<cluster>@<offset>` or `-`) and the statement. The statement and replayedFrom columns are the issuing client's claims; the principal column is
+broker-set. A diff line is
 `+ topic NAME` (only in the second point), `- view NAME` (only in the first) or
 `~ topic NAME: field, field` (changed, with the differing fields).
 
