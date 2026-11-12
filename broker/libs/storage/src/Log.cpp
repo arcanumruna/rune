@@ -590,7 +590,7 @@ int Log::provisionReady(std::size_t depth, bool preallocate) {
                 throw std::system_error(provisionFaultErr_, std::generic_category(), "provision fault (test)");
             }
             seg = LogSegment::prepareStaging(stagingLogPathFor(seq), stagingIndexPathFor(seq), seq,
-                                             kDefaultIndexIntervalBytes, indexMaxBytes_);
+                                             kDefaultIndexIntervalBytes, indexMaxBytes_, 0, fileMode_);
         } catch (const std::system_error& e) {
             err = e.code().value() != 0 ? e.code().value() : EIO;
         } catch (...) {
@@ -1563,7 +1563,7 @@ int Log::createRecoveryPointFile_(int64_t r) noexcept {
     encodeRpSlot(slot, seq, r);
     std::memcpy(file.data(), slot, sizeof slot);   // slot 0 valid, slot 1 empty (invalid)
     int err = 0;
-    const int fd = ::open(rpTmpPath_.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    const int fd = ::open(rpTmpPath_.c_str(), O_RDWR | O_CREAT | O_TRUNC, fileMode_);
     if (fd < 0) err = errno != 0 ? errno : EIO;
     if (err == 0 && storage_.writeFaultForTest > 0) err = storage_.writeFaultForTest;
     if (err == 0 && ::pwrite(fd, file.data(), file.size(), 0) != static_cast<ssize_t>(file.size()))
@@ -2757,7 +2757,7 @@ bool Log::writeLogStartCheckpoint_(int64_t v) {
     putLe32(buf + 8, rune::protocol::crc32c(buf, 8));
     const std::string tmp = dir_ + "/" + kLogStartTmpFile;
     const std::string fin = dir_ + "/" + kLogStartFile;
-    const int fd = ::open(tmp.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    const int fd = ::open(tmp.c_str(), O_CREAT | O_TRUNC | O_WRONLY, fileMode_);
     if (fd < 0) { spdlog::error("Log {}: cannot write {} (errno={})", dir_, kLogStartTmpFile, errno); return false; }
     const bool ok = ::write(fd, buf, sizeof(buf)) == static_cast<ssize_t>(sizeof(buf)) && ::fsync(fd) == 0;
     ::close(fd);
@@ -2785,7 +2785,7 @@ int64_t Log::readLogStartCheckpoint(const std::string& dir) {
 
 std::unique_ptr<LogSegment> Log::openCleanedOutput(int64_t base, uint64_t seq, int64_t nextOffset) const {
     return LogSegment::openPrebuilt(dir_, base, cleanedLogPath(dir_, base, seq), cleanedIndexPath(dir_, base, seq),
-                                    nextOffset, kDefaultIndexIntervalBytes, indexMaxBytes_);
+                                    nextOffset, kDefaultIndexIntervalBytes, indexMaxBytes_, fileMode_);
 }
 
 void Log::recoverCleanerSwapFiles() {

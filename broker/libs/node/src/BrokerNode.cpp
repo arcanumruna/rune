@@ -4441,6 +4441,17 @@ void BrokerNode::bootFromSecurity_() {
         if (permEc)
             throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: cannot restrict " + dir.string() +
                                      " to its owner (0700): " + permEc.message() + " - refusing to start");
+        // #147: files an older run left 0644 (before M13, or restored by a copy) are tightened too, BEFORE the Log opens
+        // them.  Regular files only, never through a symlink; anything else is skipped.
+        for (const auto& entry : fs::directory_iterator(dir)) {
+            std::error_code ec;
+            if (!fs::is_regular_file(entry.symlink_status(ec)) || ec) continue;
+            fs::permissions(entry.path(), fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
+            if (ec)
+                throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: cannot restrict " +
+                                         entry.path().string() + " to its owner (0600): " + ec.message() +
+                                         " - refusing to start");
+        }
     }
     securityLog_ = std::make_unique<rune::storage::Log>(dir.string(), config_.offsetLogSegmentRollBytes, kSecurityFileMode);
     securityLog_->recover();
