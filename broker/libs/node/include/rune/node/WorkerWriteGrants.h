@@ -72,12 +72,20 @@ inline constexpr uint8_t kPermFlagDrop     = 0x20;
 /// worker answers SessionSignal FenceAck{sessionId 1} - every permission item, bind and SessionClose queued before it
 /// on this ring is installed.  Carries no table.
 inline constexpr uint8_t kPermFlagFence    = 0x40;
-/// Issue #603: this broker's `__security` view is behind committed events it holds (nextOffset = 1) or no longer is
-/// (nextOffset = 0).  While behind, the worker answers every ingress produce AuthUnavailable (nothing appended) and
+/// Issue #603: this broker's `__security` view is behind committed events it holds (nextOffset = the lag level, see
+/// kSecurityLag*; 0 = no longer behind).  While behind, the worker answers every ingress produce AuthUnavailable
+/// (nothing appended) and
 /// pushes no subscription.  The control thread ships the clear only once every applied event's enforcement fence was
 /// acknowledged on both rings, so the revoked bitmaps and the ended subscriptions are installed first.  Carries no
 /// table.
 inline constexpr uint8_t kPermFlagSecurityBehind = 0x80;
+/// Issues #603 / #506: the level a kPermFlagSecurityBehind item carries in `nextOffset` (one lag LEVEL, not two flags).
+/// RefuseAll: every ingress produce is answered AuthUnavailable (#603).  DeferDenials: the view holds events it has not
+/// applied (#506) - a produce the worker would ALLOW is served, one it would DENY is answered AuthUnavailable.  A value
+/// above DeferDenials is treated as RefuseAll (fail closed).
+inline constexpr uint8_t kSecurityLagCurrent      = 0;
+inline constexpr uint8_t kSecurityLagRefuseAll    = 1;
+inline constexpr uint8_t kSecurityLagDeferDenials = 2;
 /// SESSION_PERMISSIONS `topicId` of a Table / Patch item: which bitmap of the table it carries.
 inline constexpr int32_t kPermBitmapWrite  = 0;
 inline constexpr int32_t kPermBitmapImport = 1;

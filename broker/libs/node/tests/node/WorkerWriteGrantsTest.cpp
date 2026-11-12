@@ -166,6 +166,12 @@ struct Fixture {
         o.nextOffset = on ? 1 : 0; o.isolation = kPermFlagSecurityBehind | kPermFlagLast;
         ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
     }
+    /// Issues #603 / #506: the lag LEVEL as the PermissionShipper ships it (0 current, 1 refuse all, 2 defer denials).
+    void securityLag(int64_t level) {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = 0;
+        o.nextOffset = level; o.isolation = kPermFlagSecurityBehind | kPermFlagLast;
+        ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
+    }
     void produce(int64_t sid, int64_t corr, int32_t topicId = 1) {
         rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
         const auto batch = b.build();
@@ -626,6 +632,86 @@ TEST(WorkerWriteGrantRegression, ABehindFlagLandingMidStreamStopsTheStreamAtOnce
     }
     EXPECT_EQ(leoAtFirstRefusal, 19);
     EXPECT_EQ(f.log->logEndOffset(), 19) << "never appended after the first refusal";
+}
+
+// Issue #506: while the view holds events it has not applied (level 2) a produce the worker would ALLOW is served, one it
+// would DENY is answered AuthUnavailable (the grant may be in a held event) - nothing appended, not counted as a denial.
+// RED before: the denied produce answered NotAuthorized (45).  Mutation: treat level 2 as current -> the 48 turns 45;
+// treat level 2 as refuse-all -> the allowed produce is refused.
+TEST(WorkerWriteGrantRegression, ADenialWhileTheViewHoldsUnappliedEventsIsRetriableOnTheWorkerRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.chunk(5, 1, 0, 1, bitsFor({1}, 1), /*last=*/true);   // WRITE on topic 1
+    f.announce(6, false);
+    f.chunk(6, 1, 0, 1, bitsFor({2}, 1), /*last=*/true);   // no WRITE on topic 1
+
+    f.securityLag(2);
+    f.produce(6, 1);
+    ASSERT_TRUE(f.awaitAck(1));
+    EXPECT_EQ(f.acks[1].errorCode, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable));
+    EXPECT_EQ(f.log->logEndOffset(), 0) << "nothing appended";
+    EXPECT_EQ(f.worker->workerDeniesDeferredForTest(), 1u);
+    EXPECT_EQ(f.worker->workerNotAuthorizedForTest(), 0u) << "not a verdict";
+    EXPECT_EQ(f.worker->securityLagForTest(), 2u);
+    EXPECT_FALSE(f.worker->securityBehindForTest()) << "level 2 is not refuse-all";
+
+    f.produce(5, 2);   // allowed requests are not refused
+    ASSERT_TRUE(f.awaitAck(2));
+    EXPECT_EQ(f.acks[2].errorCode, 0);
+    EXPECT_EQ(f.log->logEndOffset(), 1);
+    EXPECT_EQ(f.worker->workerDeniesDeferredForTest(), 1u);
+
+    f.securityLag(0);   // current: the denial is a verdict again
+    f.produce(6, 3);
+    ASSERT_TRUE(f.awaitAck(3));
+    EXPECT_EQ(f.acks[3].errorCode, static_cast<int16_t>(pc::ErrorCode::NotAuthorized));
+    EXPECT_EQ(f.worker->workerNotAuthorizedForTest(), 1u);
+    EXPECT_EQ(f.worker->workerDeniesDeferredForTest(), 1u);
+    EXPECT_EQ(f.log->logEndOffset(), 1);
+
+    f.securityLag(1);   // refuse-all (#603): both sessions, unchanged behaviour
+    f.produce(5, 4);
+    f.produce(6, 5);
+    ASSERT_TRUE(f.awaitAck(4));
+    ASSERT_TRUE(f.awaitAck(5));
+    EXPECT_EQ(f.acks[4].errorCode, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable));
+    EXPECT_EQ(f.acks[5].errorCode, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable));
+    EXPECT_EQ(f.worker->workerDeniesDeferredForTest(), 1u) << "refuse-all does not count as a deferred denial";
+    EXPECT_EQ(f.log->logEndOffset(), 1);
+}
+
+// Issue #506: the grant patch lands while the level is 2, then the level drops to 0 (the shipper's order): the retried
+// produce is appended.
+TEST(WorkerWriteGrantRegression, ADeferredDenialRetriedAfterTheGrantAndTheClearIsAppendedRegression) {
+    Fixture f;
+    f.announce(6, false);
+    f.chunk(6, 1, 0, 1, bitsFor({2}, 1), /*last=*/true);
+    f.securityLag(2);
+    f.produce(6, 1);
+    ASSERT_TRUE(f.awaitAck(1));
+    ASSERT_EQ(f.acks[1].errorCode, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable));
+    f.patch(f.tableOf(6), 0, 1, bitsFor({1, 2}, 1));   // the GRANT, then the level drops
+    f.securityLag(0);
+    f.produce(6, 2);
+    ASSERT_TRUE(f.awaitAck(2));
+    EXPECT_EQ(f.acks[2].errorCode, 0) << "the same produce, retried";
+    EXPECT_EQ(f.log->logEndOffset(), 1);
+    EXPECT_EQ(f.worker->securityLagForTest(), 0u);
+}
+
+// Issue #506: a level this worker does not know fails closed as refuse-all, and is counted.
+TEST(WorkerWriteGrantRegression, AnUnknownSecurityLagLevelIsTreatedAsRefuseAllRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.chunk(5, 1, 0, 1, bitsFor({1}, 1), /*last=*/true);
+    f.securityLag(7);
+    f.produce(5, 1);
+    ASSERT_TRUE(f.awaitAck(1));
+    EXPECT_EQ(f.acks[1].errorCode, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable)) << "even an allowed produce";
+    EXPECT_EQ(f.log->logEndOffset(), 0);
+    EXPECT_TRUE(f.worker->securityBehindForTest());
+    EXPECT_EQ(f.worker->securityLagForTest(), 1u);
+    EXPECT_EQ(f.worker->securityLagUnknownForTest(), 1u);
 }
 
 TEST(CheckedWritesImportGrant, StagerInstallsTheImportBitmapSeparately) {

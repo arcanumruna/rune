@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <deque>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace rune::node {
@@ -85,11 +86,11 @@ public:
         return push_(pool, std::move(it));
     }
 
-    /// Issue #603: this broker's `__security` view is (behind = true) / is no longer behind committed events it holds -
-    /// FIFO behind every item queued so far.
-    uint64_t securityBehind(WorkerPool& pool, bool behind) {
+    /// Issues #603 / #506: this broker's `__security` view lag LEVEL (kSecurityLag*; 0 = not behind) - FIFO behind
+    /// every item queued so far, so a worker installs every grant shipped before a level change before it sees it.
+    uint64_t securityLag(WorkerPool& pool, uint8_t level) {
         Item it{Kind::SecurityBehind};
-        it.first = behind ? 1 : 0;
+        it.first = level;
         return push_(pool, std::move(it));
     }
 
@@ -115,6 +116,17 @@ public:
     /// Test seam (issue #197): while held, push_ / retry() queue items but send nothing, so shippedSeq() cannot
     /// advance; the next retry() after the release ships everything.
     void setHoldForTest(bool on) noexcept { hold_ = on; }
+    /// Test seam (#506): the lag levels still queued, in queue order, each with the number of non-lag items queued
+    /// before it (so a test can tell whether a permission item precedes a level change).  Meaningful while held.
+    [[nodiscard]] std::vector<std::pair<uint8_t, std::size_t>> queuedLagsForTest() const {
+        std::vector<std::pair<uint8_t, std::size_t>> out;
+        std::size_t others = 0;
+        for (const Item& it : queue_) {
+            if (it.kind == Kind::SecurityBehind) out.emplace_back(static_cast<uint8_t>(it.first), others);
+            else ++others;
+        }
+        return out;
+    }
 
 private:
     enum class Kind : uint8_t { Table, Patch, Bind, Drop, Fence, SecurityBehind };

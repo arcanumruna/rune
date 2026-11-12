@@ -932,7 +932,10 @@ public:
     [[nodiscard]] uint64_t workerSuspendedRefusalsForTest() const noexcept { return workerSuspendedRefusals_; }
     [[nodiscard]] uint64_t sessionPermissionChunksSeenForTest() const noexcept { return sessionPermissionChunksSeen_; }
     /// Issue #603 probes: the worker's copy of the "security view behind" flag, the flag ops seen, the produces refused.
-    [[nodiscard]] bool securityBehindForTest() const noexcept { return securityBehind_; }
+    [[nodiscard]] bool securityBehindForTest() const noexcept { return securityLag_ == SecurityLag::RefuseAll; }
+    [[nodiscard]] uint8_t securityLagForTest() const noexcept { return static_cast<uint8_t>(securityLag_); }
+    [[nodiscard]] uint64_t securityLagUnknownForTest() const noexcept { return securityLagUnknown_; }
+    [[nodiscard]] uint64_t workerDeniesDeferredForTest() const noexcept { return workerDeniesDeferred_; }
     [[nodiscard]] uint64_t securityBehindOpsSeenForTest() const noexcept { return securityBehindOpsSeen_; }
     [[nodiscard]] uint64_t securityBehindRefusalsForTest() const noexcept { return securityBehindRefusals_; }
     /// Test-only (auth Task 18): the shipped permission epoch this worker holds for `sid` (0 = no slot / not enforcing).
@@ -3125,7 +3128,13 @@ private:
             return;
         }
         if ((op.isolation() & kPermFlagSecurityBehind) != 0) [[unlikely]] {   // issue #603: in every worker mode
-            securityBehind_ = op.nextOffset() != 0;
+            const auto level = op.nextOffset();
+            if (level > static_cast<int64_t>(kSecurityLagDeferDenials) || level < 0) [[unlikely]] {
+                securityLag_ = SecurityLag::RefuseAll;   // an unknown level fails closed
+                ++securityLagUnknown_;
+            } else {
+                securityLag_ = static_cast<SecurityLag>(level);
+            }
             ++securityBehindOpsSeen_;
             return;
         }
@@ -4125,7 +4134,7 @@ private:
     int pushSubscriptions_(int64_t nowNs) {
         // Issue #603: nothing is pushed while this broker's `__security` view is behind committed events it holds (they
         // may revoke the READ a subscription was admitted with).  One predictable branch on a worker-owned bool.
-        if (securityBehind_) [[unlikely]] return 0;
+        if (securityLag_ == SecurityLag::RefuseAll) [[unlikely]] return 0;
         if (filterGroupByKey_.empty()) [[likely]] return pushOwnedSubscriptions_(nowNs);
         return pushSubscriptionsMixed_(nowNs);
     }
@@ -10862,7 +10871,11 @@ private:
         enqueueReturn_(ret);
         return 1;
     }
-    bool     securityBehind_         = false;   ///< #603: worker-owned copy of the control thread's flag
+    /// #603 / #506: worker-owned copy of the control thread's lag level (kSecurityLag*).
+    enum class SecurityLag : uint8_t { Current = 0, RefuseAll = 1, DeferDenials = 2 };
+    SecurityLag securityLag_             = SecurityLag::Current;
+    uint64_t securityLagUnknown_         = 0;   ///< lag levels above DeferDenials received (treated as RefuseAll)
+    uint64_t workerDeniesDeferred_       = 0;   ///< #506: denials answered AuthUnavailable (view behind)
     uint64_t securityBehindOpsSeen_  = 0;
     uint64_t securityBehindRefusals_ = 0;
 
@@ -11016,7 +11029,7 @@ private:
             }
             // Issue #603: the grants below may already be revoked by committed events this broker holds but has not
             // applied - answered AuthUnavailable (retriable), nothing appended.  One predictable branch.
-            if (securityBehind_) [[unlikely]] {
+            if (securityLag_ == SecurityLag::RefuseAll) [[unlikely]] {
                 if (openSeq != 0) commitProduceSeq(openCtx, openSeq);   // consumed (answered)
                 return refuseSecurityBehind_(msg, directAck);
             }
@@ -11034,6 +11047,12 @@ private:
                 }
                 if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
                 if (grants != nullptr && grants->table == suspendedWriteTable()) return refuseSuspended_(msg, directAck);
+                // Issue #506: the view holds events it has not applied - one may be the grant this frame relies on, so
+                // the denial is not a verdict: retriable AuthUnavailable.  Allowed frames were served above.
+                if (securityLag_ == SecurityLag::DeferDenials) [[unlikely]] {
+                    ++workerDeniesDeferred_;
+                    return refuseSecurityBehind_(msg, directAck);
+                }
                 return refuseNotAuthorized_(msg, directAck);
             }
             // Issue #122: a producer id is honoured only for the principal it was issued to (its owner tag; the

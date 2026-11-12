@@ -487,7 +487,7 @@ public:
     /// the leader's HW).  While the view has applied less, a failed login proof is not a verdict - the user may have
     /// been created or re-keyed by an event this broker holds but has not applied yet - so it answers the retriable
     /// AuthUnavailable (48) instead of the terminal AuthenticationFailed (44).
-    void setSecurityKnownEnd(int64_t knownEnd) noexcept { securityKnownEnd_ = knownEnd; }
+    void setSecurityKnownEnd(int64_t knownEnd);
     /// Issue #603, control thread (kA2cSecurityServing, behind every applied event it vouches for): the admin applier is
     /// below the committed `__security` HW this broker knows.  While set (Required mode only), every grant-checked
     /// request - routed Produce, Subscribe, view reads, group / txn / DDL requests, logins, `__security` reads - answers
@@ -498,7 +498,9 @@ public:
     void setSecurityBehind(bool behind);
     [[nodiscard]] bool securityBehind() const noexcept { return securityBehind_; }
     /// Test probe (#603): the value last shipped to the workers.
-    [[nodiscard]] bool workersSecurityBehindForTest() const noexcept { return workersBehind_; }
+    [[nodiscard]] bool workersSecurityBehindForTest() const noexcept { return workersLag_ == kLagRefuseAll; }
+    /// #506: the lag level last shipped to the workers (0 current, 1 refuse all, 2 defer denials).
+    [[nodiscard]] uint8_t workersSecurityLagForTest() const noexcept { return workersLag_; }
     [[nodiscard]] int64_t sessionTimeoutNsForTest() const noexcept { return sessionTimeoutNs_; }
     [[nodiscard]] uint64_t securityBehindRefusals() const noexcept { return securityBehindRefusals_; }
     /// #506: denials answered AuthUnavailable (not NotAuthorized) because the view had not applied every held event.
@@ -539,6 +541,11 @@ public:
     void holdPermissionShippingForTest(bool on) {
         permissionShipper_.setHoldForTest(on);
         if (!on) (void)servicePermissionShippingWork_();
+    }
+    /// Issue #506 test seam: the lag levels queued in the (held) permission shipper, each with how many permission items
+    /// precede it in queue order.
+    [[nodiscard]] std::vector<std::pair<uint8_t, std::size_t>> permissionQueuedLagsForTest() const {
+        return permissionShipper_.queuedLagsForTest();
     }
     /// Issue #202 test seam: logins whose OK is held until every worker accepted the session's grants.
     [[nodiscard]] std::size_t heldLoginOksForTest() const noexcept { return heldLoginCount_; }
@@ -2868,12 +2875,14 @@ private:
     int64_t  securityKnownEnd_ = -1;            ///< #205: see setSecurityKnownEnd
     bool     securityBehind_ = false;           ///< #603: see setSecurityBehind (Required mode only)
     int64_t  behindClearNeedsOffset_ = -1;   ///< #608: the newest event pending enforcement when the flag cleared
-    bool     workersBehind_  = false;           ///< #603: the value last shipped to the workers
+    static constexpr uint8_t kLagRefuseAll = 1, kLagDeferDenials = 2;   ///< = rune::node::kSecurityLag*
+    uint8_t  workersLag_     = 0;               ///< #603 / #506: the lag level last shipped to the workers
     uint64_t securityBehindRefusals_ = 0;       ///< #603: requests answered 48 for it
     uint64_t deniesDeferredViewBehind_ = 0;     ///< #506: denials answered 48 while the view held unapplied events
-    /// #603: ship the behind flag to the workers when it changed - a clear once every event pending at the clear is
-    /// enforced (#608).
-    int syncWorkersBehind_();
+    /// #603 / #506: ship the lag level to the workers when it changed (1 = behind and refusing everything, 2 = the view
+    /// holds unapplied events: denials deferred, 0 = current) - leaving level 1 once every event pending at the clear
+    /// is enforced (#608).  Every other transition ships at once, FIFO behind every queued permission item.
+    int syncWorkersLag_();
     /// #603: answer one grant-checked request AuthUnavailable (its own response type, else an ErrorResponse on its
     /// correlation id).  Cold.
     void answerSecurityBehind_(Session& session, const rune::protocol::client::MessageHeader& hdr, const uint8_t* buf,

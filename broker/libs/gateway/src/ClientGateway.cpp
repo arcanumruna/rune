@@ -9749,6 +9749,12 @@ void ClientGateway::answerSecurityBehind_(Session& session, const pc::MessageHea
     sendAnswer_(session, scratch_.data(), er.encode(scratch_.data()));
 }
 
+void ClientGateway::setSecurityKnownEnd(int64_t knownEnd)
+{
+    securityKnownEnd_ = knownEnd;
+    (void)syncWorkersLag_();   // #506: the view may now be behind events this broker holds
+}
+
 void ClientGateway::setSecurityBehind(bool behind)
 {
     behind = behind && authMode_ == rune::gateway::GatewayAuthMode::Required;
@@ -9758,20 +9764,23 @@ void ClientGateway::setSecurityBehind(bool behind)
     spdlog::warn("ClientGateway: __security view {}", behind
         ? "BEHIND committed events this broker holds - grant-checked requests answer AuthUnavailable, nothing is pushed"
         : "applied every committed event this broker holds - grant-checked requests served again");
-    (void)syncWorkersBehind_();
+    (void)syncWorkersLag_();
 }
 
-int ClientGateway::syncWorkersBehind_()
+int ClientGateway::syncWorkersLag_()
 {
-    if (workersBehind_ == securityBehind_) [[likely]] return 0;
-    if (workerPool_ == nullptr) { workersBehind_ = securityBehind_; return 0; }
+    const bool deferDenials = authMode_ == rune::gateway::GatewayAuthMode::Required && securityViewBehind_();
+    const uint8_t wanted = securityBehind_ ? kLagRefuseAll : (deferDenials ? kLagDeferDenials : uint8_t{0});
+    if (workersLag_ == wanted) [[likely]] return 0;
+    if (workerPool_ == nullptr) { workersLag_ = wanted; return 0; }
     // The clear follows the view's effects: every applied event's ops (revoked bitmaps / binds on the lifecycle ring,
     // ending Unsubscribes on the op ring) were EXECUTED by every worker (its enforcement fences acknowledged) - until
     // then a worker could still push to, or accept a produce of, a session the applied events cut off.  #608: only the
     // events pending when the gateway's own flag cleared count; later ones do not hold the clear back.
-    if (!securityBehind_ && securityEnforcedOffset_ < behindClearNeedsOffset_) return 0;
-    workersBehind_ = securityBehind_;
-    (void)permissionShipper_.securityBehind(*workerPool_, workersBehind_);   // FIFO behind every queued item
+    if (workersLag_ == kLagRefuseAll && wanted != kLagRefuseAll && securityEnforcedOffset_ < behindClearNeedsOffset_)
+        return 0;
+    workersLag_ = wanted;
+    (void)permissionShipper_.securityLag(*workerPool_, workersLag_);   // FIFO behind every queued item
     return 1;
 }
 
@@ -10577,7 +10586,7 @@ int ClientGateway::servicePermissionShippingWork_()
     int work = 0;
     syncPermissionTables_();   // issue #259: a freed table's drop (after every rebind away from it)
     if (!workerPool_) return 0;
-    work += syncWorkersBehind_();   // #603: in every worker mode (worker-pushed subscriptions pause too)
+    work += syncWorkersLag_();   // #603: in every worker mode (worker-pushed subscriptions pause too)
     if (permissionShipper_.pendingUpdates() != 0) work += permissionShipper_.retry(*workerPool_);
     if (!shardMode_) return work;
     if (!objectShipSeqs_.empty()) {   // issue #197: bounded even when an OK is never offered
@@ -10804,6 +10813,8 @@ void ClientGateway::onSecurityApplied(int64_t offset, const rune::security::Appl
     }
     applyTracking_ = false;
     noteEnforced_(offset, applyOpWorkers_, permissionShipper_.queuedSeq() != shippedBefore);
+    // #506: every permission item of this event is queued above, so a level change shipped now follows them (FIFO).
+    (void)syncWorkersLag_();
 }
 
 void ClientGateway::refreshSession_(int64_t sid)
