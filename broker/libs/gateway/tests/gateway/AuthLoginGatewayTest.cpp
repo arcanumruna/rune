@@ -2568,3 +2568,31 @@ TEST(AuthLoginGatewayRegression, UnauthCapRefusalIsReadableByEveryAcceptedClient
         if (accepted) EXPECT_TRUE(rig.gw.hasSessionForTest(retry.resp->sessionId));
     }
 }
+
+// Issue #266: one reap pass walks the session table once (the auth-deadline check is fused into the expiry scan).
+TEST(AuthReapRegression, OneSessionScanPerReapPassRegression) {
+    Rig rig;
+    const int64_t now = rig.gw.sessionTimeoutNsForTest() + 5'000'000'000;
+    const auto authed = [&](int64_t sid) {
+        rig.gw.setSessionAuthForTest(sid, AuthAuthenticated{7, "u", PermissionTable::allowAll()});
+    };
+    const int64_t late = rig.newSession("10.0.0.9", now - 1'000'000'000);   // lastSeen is recent
+    rig.gw.setSessionAuthForTest(late, AuthAwaitingFirst{now - 1, 50});      // ... but its login deadline has passed
+    const int64_t idle = rig.newSession("10.0.0.9", 0);                      // idle past the lease
+    authed(idle);
+    const int64_t live = rig.newSession("10.0.0.9", now - 1'000'000'000);
+    authed(live);
+    const uint64_t failedBefore = rig.gw.loginsFailed();
+    const uint64_t scansBefore  = rig.gw.sessionScansForTest();
+    rig.gw.reapExpiredForTest(now);
+    EXPECT_EQ(rig.gw.sessionScansForTest(), scansBefore + 1) << "the reap pass walked the session table more than once";
+    EXPECT_EQ(rig.gw.loginsFailed(), failedBefore + 1);
+    const Frame* f = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), late);
+    ASSERT_NE(f, nullptr);
+    const auto fin = pc::AuthServerFinal::decode(f->bytes.data(), f->bytes.size());
+    ASSERT_TRUE(fin.has_value());
+    EXPECT_EQ(fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+    EXPECT_FALSE(rig.gw.hasSessionForTest(late));
+    EXPECT_FALSE(rig.gw.hasSessionForTest(idle));
+    EXPECT_TRUE(rig.gw.hasSessionForTest(live));
+}

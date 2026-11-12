@@ -1115,10 +1115,16 @@ bool ClientGateway::inlineWaiterStillValid_(const rune::replication::PartitionRe
 // then erase them — avoids iterator invalidation.
 // ---------------------------------------------------------------------------
 void ClientGateway::reapExpired(int64_t nowNs) {
-    reapAuthDeadlines_(nowNs);   // Authentication Task 11 (D13): sessions that never logged in
+    // Issue #266: ONE walk of the table collects both the sessions that never logged in (Authentication Task 11, D13)
+    // and the expired ones.  failLogin_ writes none of the fields the expiry predicate reads and never erases a
+    // session other than the one it ends; the close loop below tolerates a session already closed by it.
+    const bool authScan = authMode_ == rune::gateway::GatewayAuthMode::Required;
+    authReapScratch_.clear();
     reapScratch_.clear();
+    ++sessionScansForTest_;
 
     sessions_.forEach([&](Session& s) {
+        if (authScan && authDeadlinePassed_(s, nowNs)) authReapScratch_.push_back(s.sessionId);
         // D8b: lost on any worker (ack publication NOT_CONNECTED) → the normal lease from the Lost edge (its
         // owed acks are freed in ~sessionTimeout); else held (paused by back-pressure) → maxHeldIdleNs_ since the
         // last activity / Progress signal; else the normal lease since the last activity.
@@ -1130,6 +1136,8 @@ void ClientGateway::reapExpired(int64_t nowNs) {
                                                   : nowNs - s.lastSeenNs > sessionTimeoutNs_;
         if (expired) reapScratch_.push_back(s.sessionId);
     });
+
+    failAuthDeadlines_();
 
     // Fix round 2 (finding 4): ONE close path (closeSession_) for reap,
     // Disconnect and SessionFailed — table, workers, record-egress resolves,
@@ -10472,19 +10480,20 @@ int ClientGateway::servicePermissionShipping_()
 }
 
 
-void ClientGateway::reapAuthDeadlines_(int64_t nowNs)
+bool ClientGateway::authDeadlinePassed_(const Session& s, int64_t nowNs)
 {
     using namespace rune::gateway;
-    if (authMode_ != GatewayAuthMode::Required) return;
-    authReapScratch_.clear();
-    sessions_.forEach([&](Session& s) {
-        // PR #525 review: a Closing session already failed its login (its 44 is owed): never failed - and counted - again.
-        if (s.spill.state == SpillState::Closing) [[unlikely]] return;
-        int64_t deadline = INT64_MAX;
-        if (const auto* a = std::get_if<AuthAwaitingFirst>(&s.auth)) deadline = a->deadlineNs;
-        else if (const auto* b = std::get_if<AuthAwaitingFinal>(&s.auth)) deadline = b->deadlineNs;
-        if (nowNs > deadline) authReapScratch_.push_back(s.sessionId);
-    });
+    // PR #525 review: a Closing session already failed its login (its 44 is owed): never failed - and counted - again.
+    if (s.spill.state == SpillState::Closing) [[unlikely]] return false;
+    int64_t deadline = INT64_MAX;
+    if (const auto* a = std::get_if<AuthAwaitingFirst>(&s.auth)) deadline = a->deadlineNs;
+    else if (const auto* b = std::get_if<AuthAwaitingFinal>(&s.auth)) deadline = b->deadlineNs;
+    return nowNs > deadline;
+}
+
+void ClientGateway::failAuthDeadlines_()
+{
+    using namespace rune::gateway;
     for (const int64_t sid : authReapScratch_) {
         Session* s = sessions_.find(sid);
         if (s == nullptr) continue;

@@ -533,6 +533,8 @@ public:
     }
     /// Issue #189 test seam (control thread): forget every login-throttle entry (no allocation).
     void resetLoginThrottleForTest() noexcept { loginThrottle_.clear(); }
+    /// Issue #266 test seam (control thread): how many times a reap pass walked the whole session table.
+    [[nodiscard]] uint64_t sessionScansForTest() const noexcept { return sessionScansForTest_; }
     void setAdvertisedBrokerVersionForTest(int32_t v) noexcept { advertisedBrokerVersion_ = v; }   ///< 0 = kBrokerVersion
     /// Issues #188 / #5 test seam (control thread): while held, pending record-egress resolves are not polled (a
     /// Subscribe stays AwaitingEgress).  Releasing restarts every pending resolve's timeout clock at now, so a held
@@ -2889,8 +2891,10 @@ private:
     /// The ONE failure answer of a login (44, no retry-after unless rate-limited, the one detail text) then the end of
     /// the session.  Review Focus 1: nothing on the wire says why.
     void failLogin_(Session& session, int64_t correlationId, uint32_t retryAfterMs);
-    /// Sessions still awaiting their login past the deadline: AuthServerFinal{44} + end (D13).
-    void reapAuthDeadlines_(int64_t nowNs);
+    /// Issue #266: true when `s` still awaits its login past its deadline (D13); a Closing session never does.
+    [[nodiscard]] static bool authDeadlinePassed_(const Session& s, int64_t nowNs);
+    /// Sessions collected in authReapScratch_ (awaiting their login past the deadline): AuthServerFinal{44} + end (D13).
+    void failAuthDeadlines_();
     /// The throttle key host of a Connect: the Aeron image's source host, else the reply endpoint's host.
     [[nodiscard]] std::string sourceHostOf_(std::string_view egressChannel) const;
     // ── authentication Task 12 ──
@@ -2991,7 +2995,8 @@ private:
     /// after it. Never imageBySessionId mid-poll: it proposes the newest image list, which lets a threaded conductor
     /// free the list and images the poll is still iterating.
     aeron_image_t* currentImage_ = nullptr;
-    std::vector<int64_t> authReapScratch_; ///< reused by reapAuthDeadlines_ (capacity persists)
+    std::vector<int64_t> authReapScratch_; ///< reused by reapExpired / failAuthDeadlines_ (capacity persists)
+    uint64_t sessionScansForTest_ = 0;     ///< #266: whole-table walks made by reapExpired
     uint64_t authGateRefusals_ = 0;
     uint64_t bootstrapsRefused_ = 0;
     std::optional<rune::peerlink::ClusterKeys> clusterKeys_;
