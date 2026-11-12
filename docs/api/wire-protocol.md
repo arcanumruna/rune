@@ -129,7 +129,8 @@ Notes:
 - **`ViewRowResponse.status`**: 0 OK, 1 AbsentKey, 2 NotReady, 3 SchemaMismatch, 4 UnknownView, 5 InvalidRequest,
   6 Busy, 7 RowTooLarge, 8 CursorInvalidated (scans, see below), 45 NotAuthorized. A `GetViewRow` on a broker that does not lead the view's source partition, or
   leads it without the controller's read lease, is answered `ErrorResponse` `Redirect` (3, the leader's endpoint) or
-  `NotLeader` (2); both are retriable.
+  `NotLeader` (2); both are retriable. A view id at or above the catalog position the broker has applied (the view was
+  just created through another broker) is answered `NotReady` for every session, with or without authentication.
 - **Internal logs** are read by subscribing to a negative topic id: `__catalog` is `-6` (`kCatalogTopicId`), `__security`
   is `-7` (`kSecurityTopicId`, security admins and brokers only). A stream ends with an 8-byte caught-up marker batch.
 - `Produce.acks`: bit 0 set = all (deferred until the in-sync replicas hold it), clear = leader or none (immediate ack); bit 1 = `View` (client version 17, see Checked writes).

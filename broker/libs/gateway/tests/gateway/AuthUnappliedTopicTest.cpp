@@ -903,6 +903,61 @@ struct HeldEventsRig : Rig {
 };
 }  // namespace
 
+// #507: GetViewRow for a view this broker has not applied yet is retriable (NotReady), with auth on or off, whether
+// or not the id is placed: it is at or above the applied frontier.  An id decided here keeps the terminal answers.
+// Mutation: viewRowGate_ decides by placement again -> the never-placed id above the frontier is not NotReady (red).
+TEST(GetViewRowAuthRegression, AViewNotAppliedHereIsRetriableNotTerminalRegression) {
+    constexpr int32_t kAbove = 20, kDropped = 3;   // kPlaced (7) is the frontier: placed here, not applied
+    const auto notReady    = static_cast<int16_t>(pc::ViewRowResponse::kNotReady);
+    const auto unknownView = static_cast<int16_t>(pc::ViewRowResponse::kUnknownView);
+    for (const bool authOn : {true, false}) {
+        for (const bool pooled : {false, true}) {
+            // Every view read path asks the same question: GetViewRow (id 0), GetViewRowK (1), ScanViewRows (2).
+            auto answerBy = [&](int kind, int32_t id) -> std::optional<int16_t> {
+                Rig r(authOn ? std::vector<sec::GrantSpec>{} : defaultGrants(), defaultImage(), pooled);
+                // auth off: an anonymous session of a gateway that authenticates nobody is allow-all
+                if (!authOn) r.sid = r.gw.injectTestSession();
+                rune::node::TopicSpec dropped;
+                dropped.name = "w.dropped"; dropped.partitionCount = 1;
+                EXPECT_EQ(r.registry->createTopicAt(kDropped, dropped), kDropped);
+                EXPECT_TRUE(r.registry->dropTopic(kDropped));
+                return r.codeOf(kind == 0 ? r.getViewRow(id) : kind == 1 ? r.getViewRowK(id) : r.scanViewRows(id));
+            };
+            auto answer = [&](int32_t id) { return answerBy(0, id); };
+            const std::string cell = std::string{authOn ? "auth on" : "auth off"} + (pooled ? ", pooled" : ", no pool");
+            EXPECT_EQ(answer(kPlaced), notReady) << cell << ": at the frontier (placed, not applied)";
+            EXPECT_EQ(answer(kAbove), notReady) << cell << ": above the frontier (never created)";
+            for (int kind = 1; kind <= 2; ++kind) {
+                EXPECT_EQ(answerBy(kind, kPlaced), notReady) << cell << ": read kind " << kind << " at the frontier";
+                EXPECT_EQ(answerBy(kind, kAbove), notReady) << cell << ": read kind " << kind << " above the frontier";
+            }
+            const auto below = answer(kMissing), gone = answer(kDropped);
+            if (authOn) {
+                EXPECT_EQ(below, std::optional<int16_t>{kNotAuthorized}) << cell << ": below the frontier, unknown";
+                EXPECT_EQ(gone, std::optional<int16_t>{kNotAuthorized}) << cell << ": below the frontier, dropped";
+            } else if (!pooled) {
+                EXPECT_EQ(below, std::optional<int16_t>{unknownView}) << cell << ": below the frontier, unknown";
+                EXPECT_EQ(gone, std::optional<int16_t>{unknownView}) << cell << ": below the frontier, dropped";
+            } else {
+                EXPECT_FALSE(below.has_value()) << cell << ": no gate below the frontier: forwarded to the worker";
+                EXPECT_EQ(gone, std::optional<int16_t>{unknownView}) << cell << ": dropped";
+            }
+        }
+    }
+    // After the apply (the sink is registered, the frontier moves past it) the view is served: not refused, forwarded.
+    for (const bool authOn : {true, false}) {
+        Rig r(authOn ? defaultGrants() : std::vector<sec::GrantSpec>{}, defaultImage(), /*withPool=*/true);
+        if (!authOn) r.sid = r.gw.injectTestSession();
+        rune::node::TopicSpec sink;
+        sink.name = "w.v"; sink.partitionCount = 1; sink.viewSink = true;
+        ASSERT_EQ(r.registry->createTopicAt(kPlaced, sink), kPlaced);
+        r.gw.onCatalogObjectApplied(kPlaced, "w.v", true);
+        r.gw.setAppliedTopicFrontier(kPlaced + 1);
+        EXPECT_FALSE(r.codeOf(r.getViewRow(kPlaced)).has_value())
+            << (authOn ? "auth on" : "auth off") << ": applied: no gateway refusal, forwarded to the worker";
+    }
+}
+
 TEST(AuthUnappliedTopicRegression, ADenialWhileTheViewHoldsUnappliedEventsIsRetriableRegression) {
     HeldEventsRig r;
     const int64_t applied = r.view.appliedOffset();

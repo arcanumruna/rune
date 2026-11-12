@@ -11483,10 +11483,10 @@ uint16_t ClientGateway::viewRowGate_(int32_t viewTopicId, int32_t partition) con
 {
     // Catalog history Task 8 fix round 1 (I5): the C1 gate on view reads (the
     // view's sink topic, spec §5.4).  Dropped → UnknownView (permanent); applied
-    // but waiting behind a drop, placed but not applied here yet, or applied but
-    // not placed → NotReady (retriable: a client that learned the view from
-    // another broker retries).  Never applied here and never placed: no gate —
-    // the worker answers (UnknownView: no plan).
+    // but waiting behind a drop, not applied here yet (an id at or above the applied
+    // catalog frontier, #507), or applied but not placed → NotReady (retriable: a
+    // client that learned the view from another broker retries).  An unknown id
+    // below the frontier: no gate — the worker answers (UnknownView: no plan).
     if (topicRegistry_ == nullptr) return kViewRowNoGate;
     using St = TopicRegistry::TopicState;
     const St st = topicRegistry_->state(viewTopicId);
@@ -11511,7 +11511,8 @@ uint16_t ClientGateway::viewRowGate_(int32_t viewTopicId, int32_t partition) con
         }
         return (src >= 0 && !placementCommitted_(src, partition)) ? pc::ViewRowResponse::kNotReady : kViewRowNoGate;
     }
-    if (st == St::Pending || (st == St::Unknown && placementCommitted_(viewTopicId, 0)) ||
+    // #507: an unknown id at or above the applied catalog frontier is a view this broker has not applied yet.
+    if (st == St::Pending || (st == St::Unknown && aboveAppliedFrontier_(viewTopicId)) ||
         (st == St::Serving && topicRegistry_->placementGated(viewTopicId) &&
          !placementCommitted_(viewTopicId, partition)))
         return pc::ViewRowResponse::kNotReady;

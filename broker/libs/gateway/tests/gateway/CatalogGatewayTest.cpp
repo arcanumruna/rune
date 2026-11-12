@@ -591,7 +591,9 @@ TEST(CatalogGatewayRegression, ViewReadOfAnUnappliedViewIsNotReadyAndOfADroppedV
     EXPECT_EQ(g.viewRowStatus(6), pc::ViewRowResponse::kNotReady) << "applied, not placed: retriable";
     ASSERT_TRUE(g.registry->dropTopic(6));
     EXPECT_EQ(g.viewRowStatus(6), pc::ViewRowResponse::kUnknownView) << "dropped: permanent";
-    EXPECT_EQ(g.viewRowStatus(9), pc::ViewRowResponse::kUnknownView) << "never placed, never applied";
+    EXPECT_EQ(g.viewRowStatus(9), pc::ViewRowResponse::kNotReady)
+        << "never placed, never applied, at or above the applied frontier: not applied here yet (#507)";
+    EXPECT_EQ(g.viewRowStatus(2), pc::ViewRowResponse::kUnknownView) << "below the frontier, never seen: decided here";
 }
 
 // Fix round 1 (I3): a dropped topic's GROUP-created subscriptions go with it —
