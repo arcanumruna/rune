@@ -927,6 +927,69 @@ TEST(AdminWorkerRegression, AnUnknownFdLimitNeverRefusesRegression) {
     EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 0u);
 }
 
+// #612: the budget is the smallest open-file limit in the cluster, not only this broker's own.  The control thread
+// tells the admin thread the smallest limit any broker advertised and whose it is (setClusterFdLimit).
+TEST(AdminWorkerRegression, ADdlAboveAPeersFdBudgetIsRefusedBeforeItIsAppendedRegression) {
+    const uint64_t small = fdNeedBase() + 100;
+    const uint64_t large = 10'000'000;
+    {   // own limit large, a peer's small: refused, naming the peer
+        CatalogDdlRig rig("aw_fd_peer_create", 1, 1, 0, /*fdLimit=*/large);
+        rig.becomeServingLeader();
+        rig.admin().setClusterFdLimit(small, 3);
+        EXPECT_EQ(rig.admin().clusterFdLimit(), small);
+        EXPECT_EQ(rig.admin().clusterFdLimitNode(), 3);
+        const std::size_t events = rig.recordedLog().size();
+        const auto big = defineWith(rig, "big", 1000, 1LL << 20, 10LL << 20);
+        EXPECT_EQ(big.code, 39) << "InvalidRequest: " << big.detail;
+        const std::string want = "above the open-file limit " + std::to_string(small) +
+                                 " of broker 3 (the smallest in the cluster)";
+        EXPECT_NE(big.detail.find(want), std::string::npos) << big.detail;
+        EXPECT_EQ(rig.recordedLog().size(), events) << "nothing appended";
+        EXPECT_EQ(rig.admin().applier().state().topicByName(rune::catalog::kDefaultNsId, "big"), nullptr);
+        EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 1u);
+        EXPECT_EQ(defineWith(rig, "small", 1).code, 0) << "a topic within the smallest budget is admitted";
+    }
+    {   // the cluster limit above the own one: the own limit rules, with the unchanged wording
+        CatalogDdlRig rig("aw_fd_peer_above", 1, 1, 0, /*fdLimit=*/small);
+        rig.becomeServingLeader();
+        rig.admin().setClusterFdLimit(large, 3);
+        const auto big = defineWith(rig, "big", 1000);
+        EXPECT_EQ(big.code, 39) << big.detail;
+        EXPECT_NE(big.detail.find("above its open-file limit " + std::to_string(small)), std::string::npos)
+            << big.detail;
+        EXPECT_EQ(big.detail.find("of broker"), std::string::npos) << big.detail;
+        EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 1u);
+    }
+    {   // an unknown own limit does not hide a known peer limit
+        CatalogDdlRig rig("aw_fd_peer_ownzero", 1, 1, 0, /*fdLimit=*/0);
+        rig.becomeServingLeader();
+        rig.admin().setClusterFdLimit(small, 2);
+        const auto big = defineWith(rig, "big", 1000);
+        EXPECT_EQ(big.code, 39) << big.detail;
+        EXPECT_NE(big.detail.find("of broker 2"), std::string::npos) << big.detail;
+    }
+    {   // both unknown: admitted
+        CatalogDdlRig rig("aw_fd_peer_bothzero", 1, 1, 0, /*fdLimit=*/0);
+        rig.becomeServingLeader();
+        EXPECT_EQ(defineWith(rig, "big", 1000).code, 0);
+        EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 0u);
+    }
+    {   // an ALTER that grows the need: the same table
+        CatalogDdlRig rig("aw_fd_peer_alter", 1, 1, 0, /*fdLimit=*/large);
+        rig.becomeServingLeader();
+        ASSERT_EQ(defineWith(rig, "t", 1, 1LL << 20).code, 0);
+        rig.admin().setClusterFdLimit(small, 3);
+        const std::size_t events = rig.recordedLog().size();
+        const auto a = rig.alterConfig("t", {{rc::ConfigKey::RetentionBytes, 1LL << 30}});
+        EXPECT_EQ(a.code, 39) << a.detail;
+        EXPECT_NE(a.detail.find("of broker 3 (the smallest in the cluster)"), std::string::npos) << a.detail;
+        EXPECT_EQ(rig.recordedLog().size(), events);
+        EXPECT_EQ(rig.alterConfig("t", {{rc::ConfigKey::RetentionBytes, 10LL << 20}}).code, 0) << "within the budget";
+        rig.admin().setClusterFdLimit(0, -1);   // the peer is not known any more
+        EXPECT_EQ(rig.alterConfig("t", {{rc::ConfigKey::RetentionBytes, 1LL << 30}}).code, 0) << "own limit only";
+    }
+}
+
 // ── PR #611 review, adversarial pass (issue #296: DDL admission against the open-file budget) ──────────────────────
 namespace {
 uint64_t needOfOne(int32_t partitions, int64_t segmentBytes, int64_t retentionBytes) {

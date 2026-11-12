@@ -582,6 +582,9 @@ struct AlterIsrMsg {
     static constexpr int kNodeStorageLoSlot     = 7;
     static constexpr int kNodeStorageHiSlot     = 8;
     static constexpr int kNodeStorageOriginSlot = 9;
+    /// #612: the sender's soft RLIMIT_NOFILE clamped to INT32_MAX; 0 = unknown / an older binary.  Slot 10 is written
+    /// by no other node-control frame (register, shutdown, confirm, halted marks and lineage reports use slots 0-9).
+    static constexpr int kNodeFdLimitSlot = 10;
     static constexpr int32_t kStorageOriginNone      = 0;
     static constexpr int32_t kStorageOriginFounder   = 1;
     static constexpr int32_t kStorageOriginLegacy    = 2;

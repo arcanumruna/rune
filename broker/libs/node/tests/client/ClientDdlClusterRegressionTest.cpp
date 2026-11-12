@@ -389,3 +389,71 @@ TEST(ClientDdlClusterRegression, CatalogHistoryTruncatedMidReadIsReReadNotServed
     EXPECT_EQ(sOffsets.back(), 0) << "then a full re-read from offset 0 (on " << served << ")";
     EXPECT_EQ(reader->catalogReader().historyEpoch(), readServerEpoch(served)) << "the cache is S's epoch, never a stale one";
 }
+
+// #612: DDL admission against the open-file budget uses the smallest limit among the brokers, not only the catalog
+// leader's own.  Node 3 runs under a soft limit of 4096 (test seam), the others under the process default.  Every
+// broker's admin thread learns {4096, 3}; a CREATE TOPIC needing ~25k fds is refused wherever the catalog leader is;
+// a broker that RESTARTS re-learns the limits of the peers that kept running (they greet its new process); and a new
+// process of node 3 under another limit replaces the old value.
+namespace {
+/// Poll (bounded, no sleep: every probe is a round trip to the admin thread) until broker `id` reports `want`.
+bool awaitFdLimit(ThreeNodes& c, int id, std::pair<uint64_t, int32_t> want, std::chrono::seconds within) {
+    const auto deadline = std::chrono::steady_clock::now() + within;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (c.running(id) && c.node(id).clusterFdLimitForTest() == want) return true;
+        std::this_thread::yield();
+    }
+    return false;
+}
+/// The issue's statement: CREATE TOPIC big PARTITIONS 1000 WITH (segment.bytes = 1048576, retention.bytes = 10485760).
+rune::client::DefineTopicResult defineBig(ThreeNodes& c, int32_t viaBroker) {
+    auto client = connectClient(c, viaBroker);
+    rune::client::TopicOptions opts;
+    opts.config.segmentRollBytes = 1048576;
+    opts.config.retentionBytes   = 10485760;
+    return client->defineTopicAndWait("big", 1000, "", {}, kDisk, opts, {}, 60s);
+}
+void expectRefusedByTheSmallestBroker(ThreeNodes& c, const char* when) {
+    ASSERT_TRUE(c.awaitCatalogLeader(60s)) << when;
+    const int32_t leader = c.settledLeader();
+    ASSERT_GT(leader, 0) << when;
+    const auto r = defineBig(c, leader);
+    EXPECT_EQ(r.errorCode, 39) << when << ": InvalidRequest expected, got " << r.errorCode << " " << r.detail;
+    EXPECT_NE(r.detail.find("4096"), std::string::npos) << when << ": " << r.detail;
+    if (leader != 3)
+        EXPECT_NE(r.detail.find("of broker 3 (the smallest in the cluster)"), std::string::npos)
+            << when << ": " << r.detail;
+}
+}  // namespace
+
+TEST(ClientDdlClusterRegression, FdBudgetAdmissionUsesTheSmallestBrokerRegression) {
+    uint64_t node3Limit = 4096;
+    ThreeNodes c = ThreeNodes::startWith("cc_fdbudget", [&node3Limit](rune::node::NodeConfig& cfg) {
+        if (cfg.nodeId == 3) cfg.testFdSoftLimitOverride = node3Limit;
+    });
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    for (const int id : {1, 2, 3})
+        ASSERT_TRUE(awaitFdLimit(c, id, {4096, 3}, 60s)) << "broker " << id << " never learned the smallest limit";
+    expectRefusedByTheSmallestBroker(c, "before any restart");
+    {
+        const int32_t leader = c.settledLeader();
+        auto client = connectClient(c, leader);
+        EXPECT_EQ(client->defineTopicAndWait("small", 1, "", {}, kDisk, {}, {}, 60s).errorCode, 0)
+            << "a topic within the smallest budget is created";
+    }
+
+    // A broker that restarts re-learns the peers' limits.  Restart the catalog leader unless it is node 3.
+    const int32_t restarted = c.settledLeader() != 3 ? c.settledLeader() : (c.running(1) ? 1 : 2);
+    c.crash(restarted);
+    c.startNode(restarted);
+    ASSERT_TRUE(awaitFdLimit(c, restarted, {4096, 3}, 90s)) << "the restarted broker " << restarted
+        << " never re-learned the smallest limit";
+    expectRefusedByTheSmallestBroker(c, "after a broker restart");
+
+    // A new process of node 3 under another limit replaces the old value on every broker.
+    c.crash(3);
+    node3Limit = 8192;
+    c.startNode(3);
+    for (const int id : {1, 2, 3})
+        ASSERT_TRUE(awaitFdLimit(c, id, {8192, 3}, 90s)) << "broker " << id << " kept the old limit of node 3";
+}

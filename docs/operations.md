@@ -36,7 +36,10 @@ Container requirements: `--shm-size=256m` (the default 64 MB is too small), the 
 low-latency mode: the Docker bridge adds about 35 µs at p50, and published ports make p99 about 10x worse; Linux only in
 practice; on a bridge, publish the client port and the node's shard block `8200 + 192n` to `8200 + 192n + 191`; the derived response-control ports sit inside that block), and a
 file-descriptor hard limit that covers the partitions (the broker raises its soft limit to the hard limit and refuses to start when the hard
-limit is below the estimated need; see SELF-HOSTING, "Open-file limit").
+limit is below the estimated need; see SELF-HOSTING, "Open-file limit"). DDL admission uses the smallest soft limit
+advertised by any broker this broker has heard from since it started; a broker that is down keeps its last value, and a
+broker never heard from is not counted and refuses at its own start when its limit is too low. Set the same
+`LimitNOFILE` on every broker.
 
 Firewall: allow inbound UDP on the client port, each worker's ingress port and the response-control ports (gateway and
 workers) from clients. The per-worker egress control ports are needed only when authentication is off.

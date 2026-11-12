@@ -438,6 +438,7 @@ void BrokerNode::start() {
         uint64_t need = 0;
         const bool fdOk = applyFdLimitAtStartup(config_, bootTopics_, fdErr, &need, &fdSoftLimit_);
         fdNeedAtBoot_ = need;                       // the budget actually applied (no second estimate)
+        if (config_.testFdSoftLimitOverride != 0) fdSoftLimit_ = config_.testFdSoftLimitOverride;   // TEST-ONLY (#612)
         if (!fdOk) {
             spdlog::error("BrokerNode[{}]: {}", config_.nodeId, fdErr);
             throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: " + fdErr);
@@ -3075,6 +3076,7 @@ void BrokerNode::buildGateway() {
                                : storage_.origin == StorageIdentity::Origin::Legacy  ? 2
                                : storage_.origin == StorageIdentity::Origin::Joiner  ? 3 : 4;
             runtimeAgent_->controlledShutdown().setStorage(storage_.id, wire);
+            runtimeAgent_->controlledShutdown().setFdSoftLimit(fdSoftLimit_);   // #612: advertised in every register
             if (storageGate_)
                 runtimeAgent_->controlledShutdown().setStorageOpenFn(
                     [](void* g) noexcept { return static_cast<StorageGate*>(g)->open(); }, storageGate_.get());
@@ -3795,6 +3797,25 @@ int BrokerNode::servicePeerLinks_(int64_t nowNs) {
     }
     publishPeerLinkMetrics_();
     return work;
+}
+
+int BrokerNode::serviceClusterFdLimit_() {
+    if (!metadataService_) return 0;
+    if (metadataService_->fdLimitsEpoch() != postedFdLimitsEpoch_) {
+        postedFdLimitsEpoch_ = metadataService_->fdLimitsEpoch();
+        const auto v = metadataService_->clusterFdLimit();
+        // A newer value supersedes an undelivered one; one equal to what the admin thread already holds needs no frame.
+        fdLimitPending_ = v.limit != deliveredFdLimit_.limit || v.node != deliveredFdLimit_.node;
+        pendingFdLimit_ = v;
+    }
+    if (!fdLimitPending_ || !adminWorkerAgent_) return 0;
+    uint8_t buf[kClusterFdLimitWireLen];
+    writeClusterFdLimit(buf, pendingFdLimit_.limit, pendingFdLimit_.node);
+    // Ring full: retried next cycle.
+    if (!adminWorkerAgent_->controlToAdminRing().write(buf, sizeof buf, kMsgClusterFdLimit)) return 0;
+    deliveredFdLimit_ = pendingFdLimit_;
+    fdLimitPending_ = false;
+    return 1;
 }
 
 int BrokerNode::serviceClusterFeatureLevel_() {
@@ -5181,6 +5202,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     work += serviceAuthMode_(nowNs);   // Authentication Task 9: the dev-mode warning timer + the auth-mode counter
     work += stepSecurityServing_(nowNs);   // issues #15 / #111: serving only while provably current
     work += servicePeerLinks_(nowNs);  // Authentication Task 15: the peer link handshakes + key distribution
+    work += serviceClusterFdLimit_();   // #612: the smallest open-file limit -> the admin thread (DDL admission)
     work += serviceClusterFeatureLevel_();   // checked writes: the committed metadata feature level -> every worker + the admin thread
 
     auto* agent = adminWorkerAgent_.get();

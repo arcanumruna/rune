@@ -402,6 +402,11 @@ struct NodeConfig {
     // 10 s default.  0 (default): ClientGateway::kDefaultSessionTimeoutNs; never set in production.
     int64_t testSessionTimeoutMs = 0;
 
+    // TEST-ONLY (#612): when non-zero it replaces the soft RLIMIT_NOFILE this broker reports after its fd step, for
+    // BOTH its own DDL fd-budget admission and the limit it advertises to the cluster.  Lets one node of an
+    // in-process cluster run under a lower limit.  Not read from the environment; never set in production.
+    uint64_t testFdSoftLimitOverride = 0;
+
     // TEST-ONLY (ISR v3 Step 9, R-I1): hold the consensus candidacy from boot even for a Founder/Legacy storage,
     // until the test releases it (BrokerNode::setTestCandidacyHold).  Makes a fresh-cluster formation
     // deterministic: every node decides its storage before anyone stands.  Never set in production.

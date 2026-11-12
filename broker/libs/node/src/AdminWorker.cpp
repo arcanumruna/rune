@@ -1124,7 +1124,15 @@ TopicSpec fdSpecOf(int32_t partitions, const rune::protocol::TopicConfig& c) {
 }  // namespace
 
 std::optional<std::string> AdminWorker::fdBudgetRefusal_(const cat::CatalogEvent& e, const cat::CatalogState& s) const {
-    if (deps_.fdLimit == 0) return std::nullopt;   // unknown limit: never refuse
+    // #612: the budget is the smallest open-file limit known in the cluster: this broker's own, or the smallest a
+    // peer advertised (every broker hosts the topic).  0 = unknown = never refuse.
+    uint64_t limit = deps_.fdLimit;
+    int32_t  who   = -1;   // -1 = this broker
+    if (clusterFdLimit_ != 0 && (limit == 0 || clusterFdLimit_ < limit)) {
+        limit = clusterFdLimit_;
+        who   = clusterFdLimitNode_;
+    }
+    if (limit == 0) return std::nullopt;   // unknown limit: never refuse
     const bool create = std::holds_alternative<cat::CreateTopicOps>(e.ops);
     const auto* alter = std::get_if<cat::AlterTopicConfigOps>(&e.ops);
     if (!create && alter == nullptr) return std::nullopt;   // views own no log; drops only lower the need
@@ -1152,9 +1160,12 @@ std::optional<std::string> AdminWorker::fdBudgetRefusal_(const cat::CatalogEvent
         after = fdNeedAdd(after, t == altered ? newTerm : term);
     }
     if (create) after = fdNeedAdd(after, newTerm);
-    if (after <= deps_.fdLimit) return std::nullopt;
+    if (after <= limit) return std::nullopt;
+    const std::string limitText = who >= 0 ? "the open-file limit " + std::to_string(limit) + " of broker " +
+                                                 std::to_string(who) + " (the smallest in the cluster)"
+                                           : "its open-file limit " + std::to_string(limit);
     return std::string(create ? "CREATE TOPIC" : "ALTER TOPIC") + " would raise this broker's estimated open-file need to " +
-           std::to_string(after) + ", above its open-file limit " + std::to_string(deps_.fdLimit) + " (now " +
+           std::to_string(after) + ", above " + limitText + " (now " +
            std::to_string(before) + "); raise LimitNOFILE / --ulimit nofile, or use fewer partitions, a larger "
            "segment.bytes or a smaller retention.bytes";
 }

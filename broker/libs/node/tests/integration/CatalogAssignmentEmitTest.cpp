@@ -5624,3 +5624,271 @@ TEST(LeaderMoveFenceRegression, AFencedMoveNeverDelaysAnotherPartitionsRecordsRe
     c.drive(20);
     EXPECT_NE(c.paOf(0).leaderNode, L0);
 }
+
+// #612: every broker advertises its soft open-file limit in its node-control register (slot kNodeFdLimitSlot, 0 =
+// unknown / an older binary) and every member keeps the last value each live PROCESS advertised.
+// clusterFdLimit() = the smallest non-zero one and whose it is (ties: the lowest node id).
+TEST(MetadataServiceRegression, TheSmallestAdvertisedFdLimitIsKnownToEveryMemberRegression) {
+    using rune::replication::AlterIsrMsg;
+    CtlRig c;
+    auto registerWithLimit = [&](int32_t node, int64_t nonce, int32_t limit) {
+        AlterIsrMsg m = nodeControl(node, nonce, false);
+        m.isr[AlterIsrMsg::kNodeFdLimitSlot] = limit;
+        (void)c.svc->onAlterIsr(m);
+    };
+    EXPECT_EQ(c.svc->clusterFdLimit().limit, 0u) << "nothing advertised yet: unknown";
+    EXPECT_EQ(c.svc->clusterFdLimit().node, -1);
+    const uint64_t e0 = c.svc->fdLimitsEpoch();
+    registerWithLimit(1, 101, 1048576);
+    registerWithLimit(2, 102, 1048576);
+    EXPECT_EQ(c.svc->clusterFdLimit().limit, 1048576u);
+    EXPECT_EQ(c.svc->clusterFdLimit().node, 1) << "a tie goes to the lowest node id";
+    registerWithLimit(3, 103, 4096);
+    EXPECT_EQ(c.svc->clusterFdLimit().limit, 4096u);
+    EXPECT_EQ(c.svc->clusterFdLimit().node, 3);
+    const uint64_t e1 = c.svc->fdLimitsEpoch();
+    EXPECT_GT(e1, e0) << "the epoch never moved although limits were learned";
+
+    registerWithLimit(3, 103, 4096);   // the same process again (a re-send): nothing changed
+    EXPECT_EQ(c.svc->fdLimitsEpoch(), e1) << "a re-send of the same value moved the epoch";
+
+    // A shutdown-confirm frame ABOUT node 3 (from member 2) is about another node: it changes nothing, even with
+    // a value in the slot.
+    {
+        AlterIsrMsg conf = nodeControl(3, 103, false);
+        conf.isr[1] = AlterIsrMsg::kNodeShutdownConfirm;
+        conf.isr[2] = 2;
+        conf.isr[5] = AlterIsrMsg::kConfirmAllClear;
+        conf.isr[AlterIsrMsg::kNodeFdLimitSlot] = 1;
+        (void)c.svc->onAlterIsr(conf);
+    }
+    EXPECT_EQ(c.svc->clusterFdLimit().limit, 4096u) << "a confirm frame changed a node's limit";
+    EXPECT_EQ(c.svc->clusterFdLimit().node, 3);
+    EXPECT_EQ(c.svc->fdLimitsEpoch(), e1) << "a confirm frame moved the epoch";
+
+    // Node 3 restarts as an older binary (advertises 0 = unknown): it is not counted.
+    registerWithLimit(3, 203, 0);
+    EXPECT_EQ(c.svc->clusterFdLimit().limit, 1048576u);
+    EXPECT_EQ(c.svc->clusterFdLimit().node, 1);
+    const uint64_t e2 = c.svc->fdLimitsEpoch();
+    EXPECT_GT(e2, e1);
+
+    // A frame of the dead process (superseded nonce 103) is ignored, whatever it advertises.
+    registerWithLimit(3, 103, 2048);
+    EXPECT_EQ(c.svc->clusterFdLimit().limit, 1048576u);
+    EXPECT_EQ(c.svc->fdLimitsEpoch(), e2);
+
+    // A new process of node 3 with 8192.
+    registerWithLimit(3, 303, 8192);
+    EXPECT_EQ(c.svc->clusterFdLimit().limit, 8192u);
+    EXPECT_EQ(c.svc->clusterFdLimit().node, 3);
+    const uint64_t e3 = c.svc->fdLimitsEpoch();
+    EXPECT_GT(e3, e2);
+
+    // A new process that advertises nothing at all (slot left 0) clears what the old one said.
+    {
+        AlterIsrMsg m = nodeControl(3, 403, false);
+        (void)c.svc->onAlterIsr(m);
+    }
+    EXPECT_EQ(c.svc->clusterFdLimit().limit, 1048576u) << "a new process kept its predecessor's limit";
+    EXPECT_GT(c.svc->fdLimitsEpoch(), e3);
+}
+
+// #612: the register frame a broker sends carries its soft open-file limit (clamped to INT32_MAX; 0 by default).
+TEST(ControlledShutdownRegression, RegisterCarriesTheOpenFileLimitRegression) {
+    using rune::replication::AlterIsrMsg;
+    const auto firstRegister = [](const std::function<void(rune::node::ControlledShutdown&)>& configure) {
+        RecordingRig r;
+        configure(r.cs);
+        int64_t now = 1'000'000;
+        r.followLeader1(now);
+        (void)r.cs.doWork(now);
+        return r.sent;
+    };
+    {
+        const auto sent = firstRegister([](rune::node::ControlledShutdown&) {});
+        ASSERT_FALSE(sent.empty());
+        for (const auto& m : sent) EXPECT_EQ(m.isr[AlterIsrMsg::kNodeFdLimitSlot], 0) << "default: unknown";
+    }
+    {
+        const auto sent = firstRegister([](rune::node::ControlledShutdown& cs) { cs.setFdSoftLimit(4096); });
+        ASSERT_FALSE(sent.empty());
+        for (const auto& m : sent) EXPECT_EQ(m.isr[AlterIsrMsg::kNodeFdLimitSlot], 4096);
+    }
+    {
+        const auto sent = firstRegister([](rune::node::ControlledShutdown& cs) {
+            cs.setFdSoftLimit(uint64_t{1} << 40);
+        });
+        ASSERT_FALSE(sent.empty());
+        for (const auto& m : sent)
+            EXPECT_EQ(m.isr[AlterIsrMsg::kNodeFdLimitSlot], std::numeric_limits<int32_t>::max()) << "not clamped";
+    }
+}
+
+// #612 (greet): a member that sees a NEW PROCESS of a peer register owes that peer one register of its own, so a
+// restarted broker learns the limits of the peers that kept running.  The same process again never marks.
+TEST(MetadataServiceRegression, ANewPeerProcessIsOwedAGreetOnceRegression) {
+    using rune::replication::AlterIsrMsg;
+    CtlRig c;   // this service is node 1
+    const auto owed = [&] {
+        const auto s = c.svc->greetsOwed();
+        return std::vector<int32_t>(s.begin(), s.end());
+    };
+    EXPECT_TRUE(owed().empty());
+    (void)c.svc->onAlterIsr(nodeControl(2, 102, false));
+    EXPECT_EQ(owed(), (std::vector<int32_t>{2})) << "a new peer process is owed a greet";
+    (void)c.svc->onAlterIsr(nodeControl(2, 102, false));
+    EXPECT_EQ(owed(), (std::vector<int32_t>{2})) << "the same process again must not add a second entry";
+    c.svc->greetDone(2);
+    EXPECT_TRUE(owed().empty());
+    (void)c.svc->onAlterIsr(nodeControl(2, 102, false));
+    EXPECT_TRUE(owed().empty()) << "the SAME nonce after the greet was done marked again (the exchange never ends)";
+    (void)c.svc->onAlterIsr(nodeControl(2, 202, false));
+    EXPECT_EQ(owed(), (std::vector<int32_t>{2})) << "a new process of the peer is owed a greet again";
+    c.svc->greetDone(2);
+
+    (void)c.svc->onAlterIsr(nodeControl(1, 501, false));   // this node's own register
+    EXPECT_TRUE(owed().empty()) << "the node's own register is never owed a greet";
+    (void)c.svc->onAlterIsr(nodeControl(3, 303, /*shutdown=*/true));   // a stopping process
+    EXPECT_TRUE(owed().empty()) << "a shutdown frame is not owed a greet";
+    (void)c.svc->onAlterIsr(nodeControl(2, 102, false));   // the dead process of node 2 (superseded)
+    EXPECT_TRUE(owed().empty()) << "a superseded process is not owed a greet";
+    EXPECT_EQ(c.svc->greetsDropped(), 0u);
+}
+
+namespace {
+/// One broker's node side for the greet tests: its own election (follower of member 1), metadata service and
+/// ControlledShutdown; every frame it sends is recorded with its destination.
+struct GreetNode {
+    SaeTempDir d{"csgreet"};
+    rune::consensus::NodeStateFile nsf{d.path + "/nsf"};
+    rune::consensus::TermLog       tl{d.path + "/tl"};
+    NullPublisher pub;
+    static std::vector<rune::consensus::ClusterMember> members() {
+        std::vector<rune::consensus::ClusterMember> ms(3);
+        for (int i = 0; i < 3; ++i) { ms[i].id = i; ms[i].logPosition = 0; }
+        return ms;
+    }
+    rune::consensus::Election e;
+    MetadataService md;
+    rune::node::ControlledShutdown cs;
+    std::vector<std::pair<int32_t, rune::replication::AlterIsrMsg>> out;
+    bool failSends = false;
+    int32_t self;
+    static bool send(void* p, int32_t to, const rune::replication::AlterIsrMsg& m) noexcept {
+        auto* n = static_cast<GreetNode*>(p);
+        if (n->failSends) return false;
+        n->out.emplace_back(to, m);
+        return true;
+    }
+    explicit GreetNode(int32_t selfId)
+        : e(true, -1, 0, 0, 0, 0, members(), selfId, pub, nsf, tl, 150'000'000LL, 50'000'000LL, 300'000'000LL, 42),
+          md(nullptr, selfId), self(selfId) {
+        cs.bind(selfId, 0x1000 + selfId, &GreetNode::send, this, &md, &e, {0, 1, 2});
+    }
+    void followLeader1(int64_t& now) {
+        e.doWork(now);
+        e.onRequestVote(0, 0, 1, 1, now);
+        e.onNewLeadershipTerm(now, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, true, 0);
+        for (int i = 0; i < 20 && !e.isClosed(); ++i) e.doWork(++now);
+        ASSERT_TRUE(e.isClosed());
+        ASSERT_EQ(e.leaderMemberId(), 1);
+    }
+    void ackFromController() {
+        rune::replication::AlterIsrResponseMsg r{};
+        r.topicId = rune::replication::AlterIsrMsg::kNodeControlTopicId;
+        r.partition = 1; r.leaderId = self;
+        const int64_t n = cs.nonceOnControl();
+        r.leaderEpoch = static_cast<int32_t>(static_cast<uint32_t>(n));
+        r.partitionEpoch = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(n) >> 32));
+        r.errorCode = rune::replication::kAlterIsrOk;
+        cs.onResponse(r);
+    }
+    /// Register, get acked, reach Running; the recorded frames are cleared.
+    void reachRunning(int64_t& now) {
+        followLeader1(now);
+        (void)cs.doWork(now);
+        ackFromController();
+        (void)cs.doWork(++now);
+        ASSERT_EQ(cs.phaseOnControl(), rune::node::ControlledShutdown::Phase::Running);
+        out.clear();
+    }
+};
+} // namespace
+
+// #612 (greet): a Running node whose peer registers as a NEW process sends exactly one register to that peer (with
+// its fd limit and its own nonce), retries a failed send no faster than kResendNs, gives up after 64 attempts, and
+// two nodes that greet each other exchange one frame each way and go quiet.
+TEST(ControlledShutdownRegression, ARunningNodeGreetsANewPeerProcessRegression) {
+    using rune::replication::AlterIsrMsg;
+    constexpr int64_t kStep = rune::node::ControlledShutdown::kResendNs;
+    {
+        GreetNode a(0);
+        a.cs.setFdSoftLimit(4096);
+        int64_t now = 1'000'000;
+        a.reachRunning(now);
+        (void)a.md.onAlterIsr(nodeControl(2, 202, false));
+        for (int i = 0; i < 5; ++i) (void)a.cs.doWork(now += kStep);
+        ASSERT_EQ(a.out.size(), 1u) << "exactly one frame to the new peer process";
+        EXPECT_EQ(a.out[0].first, 2);
+        EXPECT_EQ(a.out[0].second.isr[1] & AlterIsrMsg::kNodeRegister, AlterIsrMsg::kNodeRegister);
+        EXPECT_EQ(a.out[0].second.isr[AlterIsrMsg::kNodeFdLimitSlot], 4096);
+        EXPECT_EQ(RecordingRig::nonceOf(a.out[0].second), a.cs.nonceOnControl());
+        EXPECT_EQ(a.out[0].second.leaderId, 0);
+        EXPECT_EQ(a.cs.greetsSent(), 1u);
+        EXPECT_TRUE(a.md.greetsOwed().empty());
+        for (int i = 0; i < 20; ++i) (void)a.cs.doWork(now += kStep);
+        EXPECT_EQ(a.out.size(), 1u) << "nothing more on later steps";
+    }
+    {   // a failing send: retried no faster than kResendNs, abandoned after 64 attempts
+        GreetNode a(0);
+        int64_t now = 1'000'000;
+        a.reachRunning(now);
+        a.failSends = true;
+        (void)a.md.onAlterIsr(nodeControl(2, 202, false));
+        int attempts = 0;
+        for (int i = 0; i < 200 && a.cs.greetsAbandoned() == 0; ++i) {
+            (void)a.cs.doWork(now += kStep / 2);   // two steps per window: half of them must be skipped
+            attempts = i + 1;
+        }
+        EXPECT_EQ(a.cs.greetsAbandoned(), 1u);
+        EXPECT_EQ(attempts, 64 * 2 - 1) << "retried faster (or slower) than one attempt per kResendNs";
+        EXPECT_TRUE(a.md.greetsOwed().empty()) << "an abandoned greet is dropped from the owed set";
+        EXPECT_EQ(a.cs.greetsSent(), 0u);
+        a.failSends = false;
+        for (int i = 0; i < 20; ++i) (void)a.cs.doWork(now += kStep);
+        EXPECT_TRUE(a.out.empty());
+    }
+    {   // two nodes greet each other once, then are quiet
+        GreetNode a(0), b(2);
+        int64_t now = 1'000'000;
+        a.followLeader1(now);
+        b.followLeader1(now);
+        auto deliver = [&] {
+            for (GreetNode* from : {&a, &b}) {
+                auto frames = std::move(from->out);
+                from->out.clear();
+                for (const auto& [to, m] : frames) {
+                    if (to == 0) (void)a.md.onAlterIsr(m);
+                    if (to == 2) (void)b.md.onAlterIsr(m);
+                }
+            }
+        };
+        (void)a.cs.doWork(now);
+        (void)b.cs.doWork(now);
+        deliver();   // each learns the other's process: each owes a greet
+        a.ackFromController();
+        b.ackFromController();
+        size_t frames = 0;
+        for (int i = 0; i < 1000; ++i) {
+            (void)a.cs.doWork(now += kStep);
+            (void)b.cs.doWork(now);
+            frames += a.out.size() + b.out.size();
+            deliver();
+        }
+        ASSERT_EQ(a.cs.phaseOnControl(), rune::node::ControlledShutdown::Phase::Running);
+        EXPECT_EQ(a.cs.greetsSent(), 1u);
+        EXPECT_EQ(b.cs.greetsSent(), 1u);
+        EXPECT_EQ(frames, 2u) << "the greets did not end: one frame each way, then quiet";
+    }
+}

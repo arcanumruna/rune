@@ -642,6 +642,12 @@ Set the hard limit high:
 - **Shell:** `ulimit -Hn` shows the hard limit; Linux's default soft limit (1024) is
   exhausted by ~300 partitions.
 
+**Several brokers.** Every broker hosts every topic, so a `CREATE TOPIC` / `ALTER TOPIC` is admitted against the
+**smallest** open-file limit advertised by any broker the catalog leader has heard from since it started, not only its
+own.  Each broker sends its soft limit in its node-control register; a refusal names the broker whose limit is the
+smallest.  A broker that is down keeps its last value; a broker never heard from is not counted and refuses at its own
+start when its limit is too low.  Set the same `LimitNOFILE` on every broker.
+
 ### Verify the cluster (optional)
 
 The repo ships an end-to-end script that builds + starts the cluster, confirms a single

@@ -561,6 +561,14 @@ public:
                     spdlog::error("AdminWorkerAgent: malformed kMsgClusterFeatureLevel (len={}) refused", n);
                 return;
             }
+            if (tid == kMsgClusterFdLimit) {   // #612
+                uint64_t limit = 0;
+                int32_t node = -1;
+                if (decodeClusterFdLimit(p, n, limit, node)) worker_.setClusterFdLimit(limit, node);
+                else if (badControlFrames_++ % 1024 == 0)
+                    spdlog::error("AdminWorkerAgent: malformed kMsgClusterFdLimit (len={}) refused", n);
+                return;
+            }
             if (tid == kMsgCatalogReadPaused) {   // Task 12 fix round 0
                 CatalogReadPausedMsg m;
                 if (decodeCatalogReadPaused(p, n, m)) worker_.catalogReadPaused(m);
@@ -2016,6 +2024,14 @@ public:
     }
     /// The DdlAnswerGate's hold cap (a DDL OK for a not-yet-serving topic is answered Internal "in doubt" after it).
     static constexpr int64_t kDdlAnswerMaxHoldNs = 5'000'000'000LL;
+    /// #612: the smallest advertised open-file limit and whose it is, as this broker's admin thread holds it (read ON
+    /// the admin thread); {0, -1} = none known.
+    [[nodiscard]] std::pair<uint64_t, int32_t> clusterFdLimitForTest() {
+        return onAdminThreadForTest([this]() -> std::pair<uint64_t, int32_t> {
+            const auto& w = adminWorkerAgent_->worker();
+            return {w.clusterFdLimit(), w.clusterFdLimitNode()};
+        });
+    }
     /// Task 22: DDL events this broker's admin thread appended (read ON the admin thread).
     [[nodiscard]] uint64_t catalogEventsAppendedForTest() {
         return onAdminThreadForTest([this]() -> uint64_t { return adminWorkerAgent_->worker().eventsAppended(); });
@@ -2559,6 +2575,7 @@ private:
     // duty cycle) drives it, distributes newly established keys and publishes counters 233 / 234.
     void buildPeerLinks_();
     int  servicePeerLinks_(int64_t nowNs);
+    int  serviceClusterFdLimit_();   // control thread, every duty cycle: post a changed smallest open-file limit (#612)
     int  serviceClusterFeatureLevel_();   // control thread, every duty cycle: post a changed metadata feature level, pump the fanout
     void publishPeerLinkMetrics_() noexcept;
     static uint64_t onPeerLinkEstablishedThunk_(void* self, int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs);
@@ -2857,6 +2874,10 @@ private:
     std::unique_ptr<PeerLinkAgent>   peerLinkAgent_;               // control thread (null: no peer links)
     PeerLinkFanout                   peerLinkFanout_;              // control thread: keys -> workers + admin, over rings
     ClusterFeatureLevelFanout        clusterLevelFanout_;          // control thread: the metadata feature level -> workers + admin
+    uint64_t                         postedFdLimitsEpoch_ = 0;     // control thread (#612): last epoch seen
+    MetadataService::ClusterFdLimit  deliveredFdLimit_{};          // control thread (#612): last value delivered
+    MetadataService::ClusterFdLimit  pendingFdLimit_{};            // control thread (#612): changed, not delivered yet
+    bool                             fdLimitPending_ = false;
     int16_t                          postedClusterLevel_ = -1;     // control thread: the last level handed to clusterLevelFanout_
     // Task 16 (D34): the inter-broker frame crypto of a transport this broker builds - PeerSealed for Enabled with more
     // than one peer (sender id: consensus 0, legacy replication 1, admin plane 2, worker w -> 3 + w), else PeerPlain.

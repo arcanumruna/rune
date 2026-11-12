@@ -53,6 +53,8 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
+#include <limits>
 #include <cstdint>
 #include <chrono>
 #include <random>
@@ -137,6 +139,12 @@ public:
     /// ISR v3 (Step 9): this node's storage id and origin wire code (AlterIsrMsg::kStorageOrigin*), carried in slots
     /// 7/8/9 of every node-control frame.  Startup thread / control thread.  `bind()` is unchanged.
     void setStorage(int64_t id, uint8_t origin) noexcept { storageId_ = id; storageOrigin_ = origin; }
+    /// #612: this process's soft open-file limit (RLIMIT_NOFILE), carried in kNodeFdLimitSlot of every node-control
+    /// frame, clamped to INT32_MAX.  0 = unknown.  Set before the threads start.
+    void setFdSoftLimit(uint64_t limit) noexcept {
+        fdSoftLimit_ = static_cast<int32_t>(
+            std::min<uint64_t>(limit, static_cast<uint64_t>(std::numeric_limits<int32_t>::max())));
+    }
     /// ISR v3: is this node's storage CONFIRMED (the gate is open)?  While not, and while the controller has no
     /// committed storage for this node, a Running node re-registers every kStorageReRegisterNs (the controller
     /// ignores a register until it is a ready level >= 2 controller; an event or a lost frame must not stall it).
@@ -157,6 +165,10 @@ public:
         }
         return 0;
     }
+    /// #612 (greet): registers sent to a new peer process / given up on after kMaxGreetAttempts.  Control thread.
+    static constexpr int32_t kMaxGreetAttempts = 64;
+    [[nodiscard]] uint64_t greetsSent() const noexcept { return greetsSent_; }
+    [[nodiscard]] uint64_t greetsAbandoned() const noexcept { return greetsAbandoned_; }
     /// Control thread / tests: this process's current identity (nonce).
     [[nodiscard]] int64_t nonceOnControl() const noexcept { return incarnation_; }
 
@@ -325,9 +337,8 @@ private:
         ++q.unanswered;
         return sendTo_(q, flags, nowNs);
     }
-    /// Broadcast one NODE-level request to every member (incl. self).
-    int sendTo_(Request& q, int32_t flags, int64_t nowNs) {
-        rune::replication::AlterIsrMsg m{};
+    /// The node-control frame every request carries (shared by the broadcast and the #612 greet).
+    void fillNodeFrame_(rune::replication::AlterIsrMsg& m, int32_t flags) const noexcept {
         m.topicId   = rune::replication::AlterIsrMsg::kNodeControlTopicId;
         m.partition = 0;
         m.leaderId  = self_;
@@ -346,6 +357,12 @@ private:
         m.isr[rune::replication::AlterIsrMsg::kNodeStorageHiSlot] =
             static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(storageId_) >> 32));
         m.isr[rune::replication::AlterIsrMsg::kNodeStorageOriginSlot] = storageOrigin_;
+        m.isr[rune::replication::AlterIsrMsg::kNodeFdLimitSlot] = fdSoftLimit_;   // #612
+    }
+    /// Broadcast one NODE-level request to every member (incl. self).
+    int sendTo_(Request& q, int32_t flags, int64_t nowNs) {
+        rune::replication::AlterIsrMsg m{};
+        fillNodeFrame_(m, flags);
         q.lastSendNs = nowNs;   // before the sends: a local answer arrives synchronously
         for (int32_t n : members_) (void)send_fn_(sendCtx_, n, m);   // ring full: re-sent later
         return 1;
@@ -362,13 +379,60 @@ private:
                      nowNs, force);
     }
 
+    /// #612 (greet), Running only: a NEW process of a peer registered here (MetadataService::greetsOwed) - send it
+    /// this node's register once, so a restarted broker learns the limits (and the rest) of the peers that kept
+    /// running.  The peer's own greet back carries a nonce this node already knows: nothing is owed then and the
+    /// exchange ends.  At most one pass per kResendNs; a failed send (ring full) stays owed and is retried, up to
+    /// kMaxGreetAttempts per peer, then abandoned (the peer learns this node at the next register).  Cold, no
+    /// allocation.
+    int serviceGreets_(int64_t nowNs) {
+        const auto owed = metadata_->greetsOwed();
+        if (owed.empty() || nowNs - lastGreetNs_ < kResendNs) return 0;
+        lastGreetNs_ = nowNs;
+        std::array<int32_t, MetadataService::kMaxGreetsOwed> todo{};
+        const std::size_t cnt = std::min(owed.size(), todo.size());
+        std::copy_n(owed.begin(), cnt, todo.begin());   // greetDone() edits the set under the loop
+        int work = 0;
+        for (std::size_t i = 0; i < cnt; ++i) {
+            const int32_t n = todo[i];
+            rune::replication::AlterIsrMsg m{};
+            fillNodeFrame_(m, rune::replication::AlterIsrMsg::kNodeRegister);
+            if (send_fn_(sendCtx_, n, m)) {
+                greetDone_(n);
+                ++greetsSent_;
+                ++work;
+            } else if (++greetFails_(n) >= kMaxGreetAttempts) {
+                greetDone_(n);
+                ++greetsAbandoned_;
+                spdlog::warn("ControlledShutdown[{}]: could not greet node {} after {} attempts - given up", self_, n,
+                             kMaxGreetAttempts);
+            }
+        }
+        return work;
+    }
+    void greetDone_(int32_t node) noexcept {
+        metadata_->greetDone(node);
+        for (std::size_t i = 0; i < greetFailCount_; ++i)
+            if (greetFail_[i][0] == node) { greetFail_[i] = greetFail_[--greetFailCount_]; return; }
+    }
+    int32_t& greetFails_(int32_t node) noexcept {
+        for (std::size_t i = 0; i < greetFailCount_; ++i)
+            if (greetFail_[i][0] == node) return greetFail_[i][1];
+        const std::size_t at = greetFailCount_ < greetFail_.size() ? greetFailCount_++ : greetFail_.size() - 1;
+        greetFail_[at] = {node, 0};
+        return greetFail_[at][1];
+    }
+
     int step_(Running& st, int64_t nowNs) {
         // A new controller may hold a mark an earlier process of this node
         // left (it was a member then): register again on every controller change.
         // ISR v3: and on a new TERM of the same controller (its soft registration state died with the old term).
         if (!active_()) return 0;
+        const int work = serviceGreets_(nowNs);   // #612
         const int32_t ctl = controller_();
         if (ctl >= 0 && (ctl != st.registeredWith || election_->leadershipTermId() > st.registeredTerm)) {
+            // The Registering broadcast reaches every member: it covers the peers still owed a greet.
+            while (!metadata_->greetsOwed().empty()) greetDone_(metadata_->greetsOwed().front());
             state_ = Registering{};
             return 1;
         }
@@ -386,9 +450,9 @@ private:
         if ((!open || !committed) && nowNs - st.lastRegisterNs >= kStorageReRegisterNs) {
             st.lastRegisterNs = nowNs;
             Request q;
-            return sendTo_(q, rune::replication::AlterIsrMsg::kNodeRegister, nowNs);
+            return work + sendTo_(q, rune::replication::AlterIsrMsg::kNodeRegister, nowNs);
         }
-        return 0;
+        return work;
     }
     int step_(Done&, int64_t) { return 0; }
     int step_(Halted&, int64_t) { return 0; }
@@ -534,6 +598,11 @@ private:
     bool                                        securityHalted_ = false;   ///< review C: same, for `__security`
     int64_t                                     storageId_     = 0;     ///< ISR v3: slots 7/8 of every frame
     uint8_t                                     storageOrigin_ = 0;     ///< ISR v3: slot 9 (0 = none)
+    int32_t                                     fdSoftLimit_   = 0;     ///< #612: slot 10 (0 = unknown)
+    int64_t                                     lastGreetNs_   = std::numeric_limits<int64_t>::min() / 2;   ///< #612
+    uint64_t                                    greetsSent_ = 0, greetsAbandoned_ = 0;                      ///< #612
+    std::array<std::array<int32_t, 2>, MetadataService::kMaxGreetsOwed> greetFail_{};   ///< #612: {node, failures}
+    std::size_t                                 greetFailCount_ = 0;
     StorageOpenFn                               storageOpenFn_  = nullptr;
     void*                                       storageOpenCtx_ = nullptr;
     std::vector<int32_t>                        members_;               ///< every cluster member (incl. self)
