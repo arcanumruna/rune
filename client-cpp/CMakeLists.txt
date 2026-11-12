@@ -90,6 +90,12 @@ if(BUILD_TESTING)
     # C-F32: the test tree (tests/** minus the shipped tests/e2e probes) adds no
     # atomics / mutexes / futures / sleeps — the existing sites are an exact
     # baseline (scripts/test_tree_sync_baseline.json) that only shrinks.
+    # client-cpp-v0.1.3: the package missed rune_client_view, so a consumer could not link.  Every static library is
+    # installed and listed in conanfile.py in the same order.
+    add_test(NAME PackageShipsEveryStaticLibrarySelfTestRegression
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_package_libs.py --selftest)
+    add_test(NAME PackageShipsEveryStaticLibraryRegression
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_package_libs.py ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME NoNewSyncOrSleepsInTestTreeRegression
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics_or_mutexes.py --tests
@@ -2041,7 +2047,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     include(GNUInstallDirs)
     set(RUNE_INSTALL_TARGETS
         rune_client_api rune_client_producer rune_client_subscriber rune_client_group rune_client_agent
-        rune_client_transport rune_gso rune_client_driver_wake rune_ql rune_security rune_catalog
+        rune_client_transport rune_gso rune_client_driver_wake rune_ql rune_security rune_client_view rune_catalog
         rune_codec rune_client_scram rune_crypto flight_recorder)
     foreach(_t IN LISTS RUNE_INSTALL_TARGETS)
         # rune_client_api and the aeron-only libraries do not exist without aeron (the macOS/armv8 IDE stub).
