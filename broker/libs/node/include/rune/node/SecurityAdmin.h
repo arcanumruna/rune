@@ -126,6 +126,8 @@ public:
     /// Test seam (admin thread): while held, the leader issues no NamespacePurged (the window between a namespace turning
     /// DELETING and its grants being purged).
     void holdPurgeForTest(bool on) noexcept { purgeHeldForTest_ = on; }
+    /// Issue #411: how many DDLs reached the last-admin dry run (only kinds that can remove an admin do).
+    [[nodiscard]] uint64_t lastAdminDryRunsForTest() const noexcept { return lastAdminDryRuns_; }
     [[nodiscard]] std::size_t pendingCount() const noexcept { return pending_.size(); }
     [[nodiscard]] uint64_t pendingRefused() const noexcept { return pendingRefused_; }
     [[nodiscard]] bool hasInFlight() const noexcept { return !std::holds_alternative<Idle>(inFlight_); }
@@ -173,6 +175,7 @@ private:
     std::deque<SecurityRequest>          pending_;
     std::vector<uint8_t>                 eventBuf_;   // the encoded event (capacity reused)
     bool purgeHeldForTest_ = false;
+    uint64_t lastAdminDryRuns_ = 0;
     uint64_t started_ = 0, answered_ = 0, eventsAppended_ = 0, pendingRefused_ = 0, purgesIssued_ = 0;
 };
 

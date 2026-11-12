@@ -91,6 +91,10 @@ public:
     [[nodiscard]] int64_t appliedOffset() const noexcept { return appliedOffset_; }   // -1 = nothing applied
     [[nodiscard]] uint64_t nextObjectId() const noexcept { return nextObjectId_; }    // users and roles share one counter
     [[nodiscard]] std::optional<RequestRecord> request(const RequestId&) const;
+    /// A copy of every member EXCEPT the request dedupe table (left empty), built member by member: the table only
+    /// grows, so copying it is the cost this avoids.  For dry runs only (the leader's last-admin guard); the result has
+    /// no dedupe history and must never be used as a replica's state.
+    [[nodiscard]] SecurityState cloneWithoutRequests() const;
     /// FNV-1a-64 over appliedOffset, nextObjectId, each live user then role fingerprint in objectId order,
     /// each tombstone in apply order; an object or tombstone of a namespace other than 0 hashes
     /// objectFingerprintV2(fingerprint, nsId) (a default-only state keeps the digest it had before namespaces).
@@ -102,6 +106,7 @@ public:
 private:
     friend struct ApplyV1;
     friend struct ApplyV2;
+    // A new member must be added to cloneWithoutRequests().
     std::map<uint64_t, UserObject> users_; std::map<uint64_t, RoleObject> roles_;
     std::map<SecKey, uint64_t, SecKeyLess> userNames_, roleNames_;
     std::vector<Tombstone> tombstones_;

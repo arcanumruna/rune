@@ -190,6 +190,45 @@ TEST(SecurityApplyV1Regression, RequestIdsAreRecordedWithTheirFingerprint) {
     EXPECT_FALSE(sc.s.request({1, 1}).has_value());
 }
 
+TEST(SecurityStateRegression, CloneWithoutRequestsDropsOnlyTheDedupeTableRegression) {
+    Script sc;
+    constexpr uint64_t kApplied = 12;
+    auto applyWithRid = [&](rs::Ops ops, std::string name, uint64_t rid) {
+        auto e = sc.make(std::move(ops), std::move(name));
+        e.principal.requestId = {.hi = rid, .lo = rid + 1}; e.principal.requestFingerprint = rid;
+        ASSERT_TRUE(rs::apply(sc.s, e, sc.offset++).has_value());
+    };
+    applyWithRid(rs::BootstrapOps{v(1)}, "admin", 1);
+    applyWithRid(rs::CreateRoleOps{}, "world", 2);
+    applyWithRid(rs::GrantOps{rs::GranteeKind::Role, g(rs::Operation::Read, rs::ResourceType::Topic,
+                                                        rs::PatternKind::Prefix, "world.")}, "world", 3);
+    for (uint64_t i = 4; i <= kApplied; ++i)
+        applyWithRid(rs::CreateUserOps{v(static_cast<uint8_t>(i))}, "u" + std::to_string(i), i);
+    applyWithRid(rs::DropUserOps{}, "u4", kApplied + 1);   // a tombstone too
+    ASSERT_TRUE(sc.s.request({3, 4}).has_value());
+    const rs::SecurityState c = sc.s.cloneWithoutRequests();
+    EXPECT_FALSE(c.request({3, 4}).has_value()) << "an applied requestId is not in the clone";
+    EXPECT_FALSE(c.request({1, 2}).has_value());
+    EXPECT_EQ(c.appliedOffset(), sc.s.appliedOffset());
+    EXPECT_EQ(c.hasSecurityAdmin(), sc.s.hasSecurityAdmin());
+    EXPECT_TRUE(c.hasSecurityAdmin());
+    EXPECT_EQ(c.nextObjectId(), sc.s.nextObjectId());
+    EXPECT_EQ(c.digest(), sc.s.digest()) << "the digest covers every member but the dedupe table";
+    EXPECT_EQ(c.users().size(), sc.s.users().size());
+    EXPECT_EQ(c.roles().size(), sc.s.roles().size());
+    EXPECT_EQ(c.tombstones().size(), sc.s.tombstones().size());
+    EXPECT_NE(c.userByName(rune::catalog::kDefaultNsId, "u5"), nullptr) << "the name index is copied";
+    EXPECT_EQ(c.userByName(rune::catalog::kDefaultNsId, "u4"), nullptr);
+    // The same next event on the original and on the clone: same outcome.
+    auto e = sc.make(rs::AlterUserOps{rs::DisableUser{}}, "admin");
+    rs::SecurityState orig = sc.s, clone = c;
+    ASSERT_TRUE(rs::apply(orig, e, orig.appliedOffset() + 1).has_value());
+    ASSERT_TRUE(rs::apply(clone, e, clone.appliedOffset() + 1).has_value());
+    EXPECT_EQ(orig.hasSecurityAdmin(), clone.hasSecurityAdmin());
+    EXPECT_FALSE(clone.hasSecurityAdmin());
+    EXPECT_EQ(orig.digest(), clone.digest());
+}
+
 TEST(SecurityApplyV1Regression, PreviewAppliedMatchesApplyAndMutatesNothing) {
     Script sc; sc.run(rs::CreateUserOps{v(1)}, "ws1");
     const uint64_t before = sc.s.digest();

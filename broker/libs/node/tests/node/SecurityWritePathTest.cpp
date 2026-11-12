@@ -292,6 +292,38 @@ TEST(SecurityAdminRegression, HaltedDetailNamesTheNodeRegression) {
     EXPECT_NE(arriving.detail.find(want), std::string::npos) << arriving.detail;
 }
 
+// #411: the last-admin dry run copies the state, so only the kinds that can remove an admin pay for it.
+TEST(SecurityAdminRegression, OnlyKindsThatCanRemoveAnAdminRunTheDryRunRegression) {
+    SecurityDdlRig rig("dry_run_kinds");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.bootstrap(rig.bootstrapMsg("admin", "a-long-password-0")).code, 0);
+    ASSERT_TRUE(rig.state().hasSecurityAdmin());
+    const auto dryRuns = [&] { return rig.admin().lastAdminDryRunsForTest(); };
+    const auto readTopic = [&](bool revoke) {
+        return rig.grant(revoke, sec::GranteeKind::Role, "r1", sec::Operation::Read, sec::ResourceType::Topic,
+                         sec::PatternKind::Prefix, "t.");
+    };
+    // Kinds that cannot remove an admin: no dry run.
+    const uint64_t base = dryRuns();
+    ASSERT_EQ(rig.ddl(rig.createUser("u1", "a-long-password-1")).code, 0);
+    ASSERT_EQ(rig.ddl(rig.createRole("r1")).code, 0);
+    ASSERT_EQ(rig.ddl(readTopic(false)).code, 0);
+    ASSERT_EQ(rig.ddl(rig.grantRole(false, "u1", "r1")).code, 0);
+    EXPECT_EQ(dryRuns(), base) << "CREATE USER, CREATE ROLE, GRANT, GRANT ROLE never run the dry run";
+    // Kinds that can: one dry run each.
+    uint64_t expect = base;
+    const auto one = [&](rune::node::SecurityDdlMsg m, const char* what) {
+        const auto a = rig.ddl(std::move(m));
+        ASSERT_EQ(a.code, 0) << what << ": " << a.detail;
+        EXPECT_EQ(dryRuns(), ++expect) << what;
+    };
+    one(readTopic(true), "REVOKE");
+    one(rig.grantRole(true, "u1", "r1"), "REVOKE ROLE");
+    one(rig.alterUser("u1", Ch::Disable), "ALTER USER");
+    one(rig.simple(Op::DropRole, "r1", "DROP ROLE r1;"), "DROP ROLE");
+    one(rig.simple(Op::DropUser, "u1", "DROP USER u1;"), "DROP USER");
+}
+
 TEST(SecurityWritePathRegression, NoEventEverCarriesAPasswordLiteralRegression) {
     SecurityDdlRig rig("nopw");
     rig.becomeServingLeader();

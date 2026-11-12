@@ -333,11 +333,22 @@ bool statementHasUnredactedPassword(std::string_view statement) {
     }
     return false;
 }
+/// Issue #411: only these kinds can leave no enabled security admin; every other kind skips the dry run.
+bool canRemoveAnAdmin(const sec::SecurityEvent& e) {
+    switch (e.kind) {
+    case sec::EventKind::AlterUser:
+    case sec::EventKind::DropUser:
+    case sec::EventKind::DropRole:
+    case sec::EventKind::Revoke:
+    case sec::EventKind::RevokeRole: return true;
+    default: return false;
+    }
+}
 /// Issue #121: true when applying `e` to `state` leaves no enabled security admin.  A copy of the state takes the event
 /// (the library's own apply, so every op kind is judged by the rules that will really run); an event that does not
 /// apply is not judged here (appendEvent_'s dry run answers it).
 bool removesLastSecurityAdmin(const sec::SecurityState& state, const sec::SecurityEvent& e) {
-    sec::SecurityState after = state;
+    sec::SecurityState after = state.cloneWithoutRequests();   // no dedupe history: apply only writes it
     sec::SecurityEvent probe = e;
     auto fp = sec::previewFingerprint(state, probe);
     if (!fp) return false;
@@ -626,7 +637,9 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
     // only the cluster-key holder can then manage security.  Refused unless the statement says FORCE.  Decided on the
     // event itself - the same frozen rules every broker applies, dry-run on a copy of the state (cold: DDL rate) - so
     // every path that can remove the last admin is covered, not a list of statement kinds.
-    if (m.force == 0 && state.hasSecurityAdmin() && removesLastSecurityAdmin(state, e)) {
+    const bool dryRun = m.force == 0 && state.hasSecurityAdmin() && canRemoveAnAdmin(e);
+    if (dryRun) ++lastAdminDryRuns_;
+    if (dryRun && removesLastSecurityAdmin(state, e)) {
         answer_(req, kInvalidRequest, "this removes the last enabled security admin (no enabled user would hold ADMIN ON "
                                       "CLUSTER): create or enable another admin first, or say FORCE");
         return;
