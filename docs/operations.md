@@ -153,6 +153,12 @@ rune namespace delete a --broker rune-1:40200 --user admin --password-file admin
 - **Foreign objects answer exactly like missing ones**: same error code and message, so a name in another namespace is
   never revealed. A namespace admin sees only its own namespace in `rune namespace list`.
 - **Anonymous read is off by default.** Only a cluster admin turns it on, and only for `default`.
+- A broker coordinates at most `RUNE_GROUP_MAX_GROUPS` groups, and one authenticated principal may have created at most
+  `RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL` of them (default half the cap; [configuration](configuration.md#consumer-groups)).
+  A join that would create a group past either is answered `Throttled (53)`: the C++ client (version 14 and newer)
+  re-joins with a paced, bounded backoff, an older client gets the old refusal code and fails. The share is charged to
+  the creating principal until the group empties, and a broker with authentication off has no share. Watch for repeated
+  refusals in the log (`refused - this broker coordinates its maximum` / `already created its share`).
 - Consumer groups and transactions work in every namespace: the same group id or transactional id in two namespaces
   is two groups or two producers, with independent offsets, membership and fencing.
 - The data lives under `<data>/ns-<nsId>/topics/<name>/`. A cluster with namespaces is a new cluster; there is no

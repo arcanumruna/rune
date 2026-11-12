@@ -3648,6 +3648,56 @@ TEST_F(GroupAuthUnavailableRegression, ACommitSyncAnswered48UntilItsDeadlineRepo
     EXPECT_EQ(op2.c().errorCode, 0u) << "an unanswered commitSync reports no broker code";
 }
 
+// #617: a JoinGroup refused by the broker's group cap (or a principal's share) is answered Throttled (53): the consumer
+// does not fail, re-sends the JoinGroup after the paced backoff, and an OK answer then completes the join.  RED
+// (Throttled classified Refuse): the first answer ends the consumer (RefusedByBroker), no second JoinGroup is sent.
+TEST_F(GroupConsumerHubRegression, AThrottledJoinIsRetriedWithBackoffRegression) {
+    hub_->onConnected(kSessionId, sink_.fn());
+    const int64_t c1 = lastCorr(sink_, rpc::TemplateId::JoinGroup);
+    ASSERT_NE(c1, 0);
+    auto th = makeJoinGroupResponseError(static_cast<int16_t>(rpc::ErrorCode::Throttled), c1);
+    hub_->onJoinGroupResponse(th.data(), th.size(), kSessionId, sink_.fn());
+    ASSERT_TRUE(impl_->active) << "a Throttled join ended the consumer: " << static_cast<int>(impl_->failReason);
+    ASSERT_EQ(impl_->state, GroupConsumerState::Rejoining);
+    ASSERT_GT(impl_->rejoinNotBeforeNs, 0) << "the re-join is paced";
+    sink_.clear();
+    hub_->doWork(impl_->rejoinNotBeforeNs - 1, kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Rejoining) << "re-sent before the backoff elapsed";
+    EXPECT_EQ(lastCorr(sink_, rpc::TemplateId::JoinGroup), 0);
+    hub_->doWork(impl_->rejoinNotBeforeNs, kSessionId, sink_.fn());
+    ASSERT_EQ(impl_->state, GroupConsumerState::Joining);
+    const int64_t c2 = lastCorr(sink_, rpc::TemplateId::JoinGroup);
+    ASSERT_NE(c2, 0) << "no second JoinGroup after the backoff";
+    ASSERT_NE(c1, c2);
+    sink_.clear();
+    auto ok = makeJoinGroupResponseOK(1, "m1", c2);
+    hub_->onJoinGroupResponse(ok.data(), ok.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Syncing);
+    EXPECT_TRUE(impl_->active);
+    EXPECT_EQ(impl_->memberId, "m1");
+}
+
+// #617, observed (unchanged behaviour): a broker that keeps answering Throttled spends the bounded backoff budget
+// (kMaxBackoffRejoins re-joins) and the consumer then ends with RetryBudgetExhausted.
+TEST_F(GroupConsumerHubRegression, ThrottledJoinsEndWithRetryBudgetExhaustedOnceTheBudgetIsSpentRegression) {
+    hub_->onConnected(kSessionId, sink_.fn());
+    int64_t now = 0;
+    int answers = 0;
+    for (; answers < 32 && impl_->active; ++answers) {   // hard cap
+        const int64_t c = lastCorr(sink_, rpc::TemplateId::JoinGroup);
+        ASSERT_NE(c, 0) << "answer " << answers;
+        auto th = makeJoinGroupResponseError(static_cast<int16_t>(rpc::ErrorCode::Throttled), c);
+        hub_->onJoinGroupResponse(th.data(), th.size(), kSessionId, sink_.fn());
+        if (!impl_->active) break;
+        sink_.clear();
+        now = std::max(now, impl_->rejoinNotBeforeNs);
+        hub_->doWork(now, kSessionId, sink_.fn());
+    }
+    EXPECT_FALSE(impl_->active);
+    EXPECT_EQ(impl_->failReason, GroupFailReason::RetryBudgetExhausted);
+    EXPECT_EQ(answers + 1, 9) << "the budget is the first answer plus kMaxBackoffRejoins (8) re-joins";
+}
+
 TEST_F(GroupConsumerHubRegression, AStaleJoinAnswerIsDroppedRegression) {
     hub_->onConnected(kSessionId, sink_.fn());
     const int64_t c1 = lastCorr(sink_, rpc::TemplateId::JoinGroup);

@@ -4149,7 +4149,7 @@ TEST(GroupCoordinationServiceRegression, CoordinatorCountIsCappedAndEmptyOnesAre
     ASSERT_EQ(g.svc.groupCountForTest(), 3u);
 
     const auto refused = joinGroup214(g.svc, req, out, sizeof out, 1, corr++, "g4", "", g.clock, m, detail);
-    EXPECT_EQ(refused.errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(refused.errorCode, static_cast<int16_t>(pc::ErrorCode::Throttled));
     EXPECT_TRUE(m.empty()) << "a refused join was admitted";
     EXPECT_NE(detail.find("maximum of 3"), std::string::npos) << detail;
     EXPECT_EQ(g.svc.joinsRefusedGroupCap(), 1u);
@@ -4568,7 +4568,7 @@ TEST(GroupCoordinationServiceRegression, TheGroupCapBoundsAndNonJoinRequestsNeve
     std::string m;
     int16_t code = -1;
     (void)joinTopics616(g.svc, g.req, g.out, sizeof g.out, 2, g.corr++, "g616-b", "", g.clock, m, code);
-    EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::Throttled));
     EXPECT_TRUE(m.empty());
     (void)joinTopics616(g.svc, g.req, g.out, sizeof g.out, 2, g.corr++, "g616-a", "", g.clock, m, code);
     EXPECT_EQ(code, 0) << "a join to an existing group was refused by the cap";
@@ -4590,7 +4590,7 @@ TEST(GroupCoordinationServiceRegression, TheGroupCapBoundsAndNonJoinRequestsNeve
     for (int i = 0; i < 1000; ++i) {
         (void)joinTopics616(g.svc, g.req, g.out, sizeof g.out, 3, g.corr++, "g616-flood-" + std::to_string(i), "",
                             g.clock, m, code);
-        ASSERT_EQ(code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << i;
+        ASSERT_EQ(code, static_cast<int16_t>(pc::ErrorCode::Throttled)) << i;
     }
     EXPECT_EQ(g.svc.joinsRefusedGroupCap(), refusedBefore + 1000);
     EXPECT_EQ(g.svc.groupCountForTest(), 1u);
@@ -5001,6 +5001,178 @@ TEST_F(CG3ServiceTest, MaxGroupsPerNamespaceRegression) {
     rec(1, "a", 1);
     mirror.upsert([&] { cat::NamespaceRecord r; r.nsId = 1; r.name = "a"; r.version = 2; r.limits.maxGroups = 1; return r; }());
     EXPECT_EQ(join(ctxA, "g5", pc::kClientVersion), kLimitCode);
+}
+
+// ===========================================================================
+// #617: the group cap has a per-principal share (charged to the creating principal) and its refusal is retriable
+// ===========================================================================
+namespace {
+struct Join617 { int16_t code = -1; std::string member; std::string detail; };
+/// The test principal of a session: session 1 is unauthenticated (principal 0), the others are their own principal.
+uint64_t principal617(void*, int64_t sid) noexcept { return sid == 1 ? 0u : static_cast<uint64_t>(sid); }
+struct Rig617 : OffRig {
+    uint8_t req[4096]{}, out[4096]{};
+    int64_t corr = 1;
+    Rig617() { svc.setPrincipalResolverForTest(&principal617, nullptr); }
+    Join617 join(int64_t sid, std::string_view group, int32_t ver = pc::kClientVersion, std::string_view member = {},
+                 const rune::coordination::NsRequestContext& ctx = {}) {
+        pc::JoinGroup msg;
+        msg.sessionId = sid; msg.correlationId = corr++; msg.sessionTimeoutMs = 5000;
+        msg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+        msg.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(member.data()), member.size());
+        const std::array<int32_t, 1> topics{kTestTopicId};
+        const std::size_t n = msg.encode(req, std::span<const int32_t>(topics));
+        const std::size_t o = svc.handleJoinGroup(req, n, ver, clock, out, sizeof out, ctx);
+        const auto r = pc::JoinGroupResponse::decode(out, o);
+        EXPECT_TRUE(r.has_value());
+        if (!r) return {};
+        return {r->errorCode, std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size()),
+                std::string(r->detail)};
+    }
+    int16_t leave(int64_t sid, std::string_view group, const std::string& member) {
+        const std::size_t n = svc.handleLeaveGroup(
+            req, encodeLeaveGroup(req, sid, corr++, std::string(group), member), clock, out, sizeof out);
+        return decodeLeaveErrorCode(out, n);
+    }
+    /// Duty cycles on the injected clock until `done()` (hard cap of 50).
+    template <class F> bool drive(F done) {
+        for (int i = 0; i < 50 && !done(); ++i) { clock += 1'000'000; svc.doWork(clock); }
+        return done();
+    }
+};
+constexpr int16_t kOk617 = 0;
+const int16_t kThrottled617 = static_cast<int16_t>(pc::ErrorCode::Throttled);
+}  // namespace
+
+// One principal cannot fill the broker's group slots: cap 4, share unset (= 2).  Principal 7 gets two groups, the third
+// is refused 53 naming the variable; principal 9 still gets its two, its third hits the global cap; the share never
+// blocks a join to an EXISTING group.  RED (no share): 7's third group is admitted.
+TEST(GroupCoordinationServiceRegression, OnePrincipalCannotTakeEveryGroupSlotRegression) {
+    Rig617 g;
+    g.svc.setMaxGroups(4);
+    EXPECT_EQ(g.svc.maxGroupsPerPrincipal(), 2);
+    EXPECT_EQ(g.join(7, "a").code, kOk617);
+    EXPECT_EQ(g.join(7, "b").code, kOk617);
+    const auto c = g.join(7, "c");
+    EXPECT_EQ(c.code, kThrottled617);
+    EXPECT_NE(c.detail.find("RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL"), std::string::npos) << c.detail;
+    EXPECT_TRUE(c.member.empty());
+    EXPECT_EQ(g.svc.joinsRefusedPrincipalShare(), 1u);
+    EXPECT_EQ(g.svc.joinsRefusedGroupCap(), 0u);
+    EXPECT_EQ(g.svc.groupCountForTest(), 2u);
+    EXPECT_EQ(g.join(9, "c").code, kOk617);
+    EXPECT_EQ(g.join(9, "d").code, kOk617);
+    const auto e = g.join(9, "e");
+    EXPECT_EQ(e.code, kThrottled617);
+    EXPECT_NE(e.detail.find("RUNE_GROUP_MAX_GROUPS"), std::string::npos) << e.detail;
+    EXPECT_EQ(g.svc.joinsRefusedGroupCap(), 1u);
+    EXPECT_EQ(g.svc.joinsRefusedPrincipalShare(), 1u) << "the cap refusal must not count as a share refusal";
+    EXPECT_EQ(g.join(7, "c").code, kOk617) << "the share never blocks joining an existing group";
+    EXPECT_EQ(g.svc.groupCountForTest(), 4u);
+    EXPECT_EQ(g.svc.groupsCreatedByForTest(7), 2);
+    EXPECT_EQ(g.svc.groupsCreatedByForTest(9), 2);
+    EXPECT_LE(g.svc.groupsCreatedByForTest(7) + g.svc.groupsCreatedByForTest(9) + g.svc.groupsCreatedByForTest(0),
+              static_cast<int32_t>(g.svc.groupCountForTest()));
+}
+
+// The share comes back when the creator's group empties (the charge ends with the group), and a group kept alive by
+// another principal's member still counts against its creator.  RED (no release on drop): 7 stays at its share.
+TEST(GroupCoordinationServiceRegression, ThePrincipalShareComesBackWhenItsGroupEmptiesRegression) {
+    Rig617 g;
+    g.svc.setMaxGroups(4);
+    const auto a = g.join(7, "a");
+    ASSERT_EQ(a.code, kOk617);
+    ASSERT_EQ(g.join(7, "b").code, kOk617);
+    ASSERT_EQ(g.svc.groupsCreatedByForTest(7), 2);
+    EXPECT_EQ(g.join(7, "c").code, kThrottled617);
+
+    ASSERT_EQ(g.leave(7, "a", a.member), kOk617);
+    ASSERT_TRUE(g.drive([&] { return g.svc.groupCountForTest() == 1u; })) << "the empty group was kept";
+    EXPECT_EQ(g.svc.groupsCreatedByForTest(7), 1) << "the charge outlived the group";
+    const auto c = g.join(7, "c");
+    EXPECT_EQ(c.code, kOk617);
+    EXPECT_EQ(g.svc.groupsCreatedByForTest(7), 2);
+
+    // A group created by 7 and kept alive by 9's member after 7's member left still counts against 7.
+    const auto c9 = g.join(9, "c");
+    ASSERT_EQ(c9.code, kOk617);
+    ASSERT_EQ(g.leave(7, "c", c.member), kOk617);
+    for (int i = 0; i < 5; ++i) { g.clock += 1'000'000; g.svc.doWork(g.clock); }
+    EXPECT_EQ(g.svc.groupCountForTest(), 2u) << "9's member keeps group c alive";
+    EXPECT_EQ(g.svc.groupsCreatedByForTest(7), 2) << "the charge follows the creator";
+    EXPECT_EQ(g.svc.groupsCreatedByForTest(9), 0);
+    EXPECT_EQ(g.join(7, "d").code, kThrottled617);
+    EXPECT_EQ(g.svc.joinsRefusedPrincipalShare(), 2u);
+}
+
+// A cap refusal (the broker cap and the principal share) is 53 for a current client and the old rule's code below
+// version 14; the namespace maxGroups refusal is unchanged (52 from 14).  RED (Capacity answers the old code for every
+// version): the version 14 and current rows answer InvalidRequest.
+TEST(GroupCoordinationServiceRegression, ACapRefusalIsRetriableForCurrentClientsAndFinalForOldOnesRegression) {
+    namespace cat = rune::catalog;
+    const int32_t versions[] = {4, 5, 13, 14, pc::kClientVersion};
+    for (const int32_t v : versions) {
+        SCOPED_TRACE(::testing::Message() << "client version " << v);
+        const int16_t old = static_cast<int16_t>(v >= pc::kClientVersionInvalidRequest
+                                                     ? pc::ErrorCode::InvalidRequest : pc::ErrorCode::ProtocolVersion);
+        const int16_t want = v >= pc::kClientVersionNamespaces ? kThrottled617 : old;
+        {
+            Rig617 g;
+            g.svc.setMaxGroups(2);
+            g.svc.setMaxGroupsPerPrincipal(1);
+            ASSERT_EQ(g.join(7, "g1", v).code, kOk617);
+            EXPECT_EQ(g.join(7, "g2", v).code, want) << "the principal share";
+            EXPECT_EQ(g.svc.joinsRefusedPrincipalShare(), 1u);
+            ASSERT_EQ(g.join(9, "g3", v).code, kOk617);
+            EXPECT_EQ(g.join(9, "g4", v).code, want) << "the broker cap";
+            EXPECT_EQ(g.svc.joinsRefusedGroupCap(), 1u);
+            EXPECT_EQ(g.svc.groupCountForTest(), 2u);
+        }
+        {   // the namespace limit is an admin's act: final, NamespaceLimitExceeded from 14, as before
+            Rig617 g;
+            cat::NamespaceMirror mirror;
+            cat::NamespaceRecord r;
+            r.nsId = 1; r.name = "a"; r.version = 1; r.limits.maxGroups = 1;
+            ASSERT_TRUE(mirror.upsert(r));
+            const rune::coordination::NsRequestContext ctx{1, false, &mirror.registry()};
+            ASSERT_EQ(g.join(7, "x", v, {}, ctx).code, kOk617);
+            const int16_t nsLimit = static_cast<int16_t>(pc::ErrorCode::NamespaceLimitExceeded);
+            const int16_t nsWant = v >= pc::kClientVersionNamespaces ? nsLimit : old;
+            EXPECT_EQ(g.join(7, "y", v, {}, ctx).code, nsWant) << "the namespace maxGroups limit";
+        }
+    }
+}
+
+// With auth off (or an anonymous session) every session is principal 0: never charged, never limited - a share would
+// be a second global cap.  RED (principal 0 charged): the third group of a cap-4 broker is refused by the share.
+TEST(GroupCoordinationServiceRegression, AnUnauthenticatedPrincipalIsNeverChargedRegression) {
+    Rig617 g;
+    g.svc.setMaxGroups(4);
+    for (const char* name : {"a", "b", "c", "d"}) EXPECT_EQ(g.join(1, name).code, kOk617) << name;
+    EXPECT_EQ(g.svc.groupCountForTest(), 4u);
+    EXPECT_EQ(g.svc.joinsRefusedPrincipalShare(), 0u);
+    EXPECT_EQ(g.svc.groupsCreatedByForTest(0), 0);
+    EXPECT_EQ(g.join(1, "e").code, kThrottled617) << "only the broker cap applies";
+    EXPECT_EQ(g.svc.joinsRefusedGroupCap(), 1u);
+    EXPECT_EQ(g.svc.joinsRefusedPrincipalShare(), 0u);
+}
+
+// The effective share: unset = half the cap (at least 1), a value above the cap is the cap, and it follows a later cap.
+TEST(GroupCoordinationServiceRegression, ThePrincipalShareDerivesFromTheCapAndClampsToItRegression) {
+    OffRig g;
+    g.svc.setMaxGroups(5);
+    EXPECT_EQ(g.svc.maxGroupsPerPrincipal(), 2);
+    g.svc.setMaxGroups(1);
+    EXPECT_EQ(g.svc.maxGroupsPerPrincipal(), 1);
+    g.svc.setMaxGroups(5);
+    g.svc.setMaxGroupsPerPrincipal(3);
+    EXPECT_EQ(g.svc.maxGroupsPerPrincipal(), 3);
+    g.svc.setMaxGroupsPerPrincipal(100);
+    EXPECT_EQ(g.svc.maxGroupsPerPrincipal(), 5) << "above the cap: clamped to it";
+    for (const int32_t bad : {0, -1, std::numeric_limits<int32_t>::min()}) {
+        g.svc.setMaxGroupsPerPrincipal(bad);
+        EXPECT_EQ(g.svc.maxGroupsPerPrincipal(), 2) << bad << ": unset";
+    }
 }
 
 // ===========================================================================

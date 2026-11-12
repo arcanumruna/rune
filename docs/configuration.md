@@ -97,6 +97,16 @@ them in `RUNE_PEERS` (7th and 8th segments, only after every node runs this vers
 | `RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND` | unlimited | Cleaner I/O throttle (positive bytes per second). |
 | `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` | `134217728` (128 MiB) | Memory for the cleaner's dedupe map, in bytes, 1048576 to 4294967296. The offset table is the largest power of two entries that fits, so the table itself stays within this budget. The cleaner's producer tails add up to 25% of the budget (minimum 1024 x 64 B) on top, so the total is at most about 1.25 times this value. |
 
+## Consumer groups
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RUNE_GROUP_MAX_GROUPS` | `10000` | Positive int32. The most consumer groups this broker coordinates at once. A JoinGroup that would create one more is refused; a join to an existing group never is. The refusal is `Throttled (53)` for a client of version 14 or newer (the C++ consumer retries it with a paced, bounded backoff) and the old rule's code below that (final). Room comes back when a group empties. |
+| `RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL` | half of `RUNE_GROUP_MAX_GROUPS` (at least 1) | Positive int32. The most live groups one authenticated principal may have created, so one principal cannot take every slot. A value above `RUNE_GROUP_MAX_GROUPS` is the cap itself (no share). The charge goes to the principal whose join created the group and ends when the group empties and is dropped, even if other principals' members keep the group alive meanwhile. A broker with `RUNE_AUTH=disabled` (or an anonymous session) has no principal: no share applies. The refusal is `Throttled (53)` as above. |
+
+The two refusals are counted per broker (`joinsRefusedGroupCap`, `joinsRefusedPrincipalShare`) and logged at the 1st,
+2nd, 4th, 8th, ... refusal. The per-namespace `max-groups` limit is separate and final (`NamespaceLimitExceeded (52)`).
+
 ## Authentication and TLS
 
 | Variable | Default | Meaning |

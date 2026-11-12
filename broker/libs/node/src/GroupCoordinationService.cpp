@@ -489,6 +489,8 @@ int GroupCoordinationService::unloadGroups_(const char* why) {
     for (const auto& [groupId, coord] : coordinators_) pruneGroupLineageState_(groupId);
     const auto n = coordinators_.size();
     coordinators_.clear();
+    groupCreator_.clear();      // #617
+    groupsCreatedBy_.clear();
     spdlog::info("GroupCoordinationService: {} — unloaded {} group(s) (#565 / #570)", why, n);
     return static_cast<int>(n);
 }
@@ -518,6 +520,12 @@ GroupCoordinationService::dropGroup_(
         std::erase_if(filterMismatchRefusals_, [&](const auto& e) {
             return e.first.size() > g.size() && e.first.compare(0, g.size(), g) == 0 && e.first[g.size()] == '\x1f';
         });
+    }
+    // #617: the creator's charge ends with the group
+    if (const auto c = groupCreator_.find(g); c != groupCreator_.end()) {
+        if (const auto n = groupsCreatedBy_.find(c->second); n != groupsCreatedBy_.end() && --n->second <= 0)
+            groupsCreatedBy_.erase(n);
+        groupCreator_.erase(c);
     }
     return coordinators_.erase(it);
 }
@@ -711,13 +719,20 @@ size_t GroupCoordinationService::handleJoinGroup(
     const std::span<const uint8_t> filter = pc::clientUnderstandsFilters(ver) ? msg.filter : std::span<const uint8_t>{};
     // A refused join: never admitted, no state change.  Old clients get the rule's ProtocolVersion; the detail
     // (cold; reserved member string) goes to a session >= 11 only.
-    auto refuseJoin = [&](std::string detail, bool nsLimit = false) {
+    enum class JoinRefusal { Invalid, NamespaceLimit, Capacity };
+    auto refuseJoin = [&](std::string detail, JoinRefusal why = JoinRefusal::Invalid) {
         pc::JoinGroupResponse resp;
         resp.sessionId     = msg.sessionId;
         resp.correlationId = msg.correlationId;
         // Namespaces Phase 2 Task 9: a namespace limit is NamespaceLimitExceeded (52) for a v14+ member, else the old rule.
-        resp.errorCode     = static_cast<int16_t>(nsLimit && ver >= pc::kClientVersionNamespaces ? pc::ErrorCode::NamespaceLimitExceeded
-                                                                                                  : rejectionCodeFor(ver));
+        // #617: a capacity refusal (the group cap, a principal's share) is retriable - Throttled (53) for a v14+ member
+        // (the C++ consumer re-joins with a paced, bounded backoff); an older client gets the old rule's code (final).
+        pc::ErrorCode code = rejectionCodeFor(ver);
+        if (ver >= pc::kClientVersionNamespaces) {
+            if (why == JoinRefusal::NamespaceLimit) code = pc::ErrorCode::NamespaceLimitExceeded;
+            else if (why == JoinRefusal::Capacity)  code = pc::ErrorCode::Throttled;
+        }
+        resp.errorCode     = static_cast<int16_t>(code);
         resp.generationId  = 0;
         resp.isLeader      = 0;
         resp.memberId      = std::span<const uint8_t>();
@@ -760,27 +775,50 @@ size_t GroupCoordinationService::handleJoinGroup(
     // Namespaces Phase 2 Task 9 (D23): maxGroups of the group's namespace, at the join that would CREATE a group (count of
     // distinct group ids of that nsId in coordinators_; count >= limit refuses; 0 = unlimited).  The limit is read from the
     // gateway's namespace mirror the request carries (ctx.reg).  Cold: only a new group's first join scans.
-    if (ctx.reg != nullptr && coordinators_.find(groupIdStr) == coordinators_.end()) {
+    // #617: the principal of the join (a cold lookup, no side effect), computed once; and whether this join CREATES.
+    const uint64_t principal = principalOf_(msg.sessionId);
+    const bool creates = coordinators_.find(groupIdStr) == coordinators_.end();
+    if (ctx.reg != nullptr && creates) {
         const uint32_t gns = rune::coordination::parseScopedId(groupIdStr).nsId;
         if (const auto* nsr = ctx.reg->byId(gns); nsr != nullptr && nsr->limits.maxGroups != 0) {
             const uint64_t have = groupsOfNamespace(gns);
             if (have >= nsr->limits.maxGroups)
                 return refuseJoin("namespace limit exceeded: groups (" + std::to_string(have) + " of " +
-                                  std::to_string(nsr->limits.maxGroups) + ")", true);
+                                  std::to_string(nsr->limits.maxGroups) + ")", JoinRefusal::NamespaceLimit);
         }
     }
     // #214: the number of coordinated groups is bounded.  Only a join that would CREATE a group is refused (never one
     // to an existing group); empty groups are dropped by doWork, so the room comes back as groups empty.
-    if (coordinators_.size() >= static_cast<std::size_t>(maxGroups_) &&
-        coordinators_.find(groupIdStr) == coordinators_.end()) [[unlikely]] {
+    if (creates && coordinators_.size() >= static_cast<std::size_t>(maxGroups_)) [[unlikely]] {
         const uint64_t n = ++joinsRefusedGroupCap_;
         if ((n & (n - 1)) == 0)
             spdlog::warn("GroupCoordinationService: JoinGroup for new group '{}' refused - this broker coordinates its "
                          "maximum of {} consumer groups (RUNE_GROUP_MAX_GROUPS) (refusal #{})", groupIdStr, maxGroups_, n);
         return refuseJoin("this broker coordinates its maximum of " + std::to_string(maxGroups_) +
-                          " consumer groups; retry after a group empties or raise RUNE_GROUP_MAX_GROUPS");
+                          " consumer groups; retry after a group empties or raise RUNE_GROUP_MAX_GROUPS",
+                          JoinRefusal::Capacity);
+    }
+    // #617: one principal cannot take every slot: at most maxGroupsPerPrincipal() live groups CREATED by it (O(1): the
+    // per-principal count, no scan).  Principal 0 (nobody authenticated: every session is the same principal) is never
+    // limited - a share would be a second global cap.  A join to an existing group never reaches this check.
+    if (creates && principal != 0) {
+        const auto it = groupsCreatedBy_.find(principal);
+        if (it != groupsCreatedBy_.end() && it->second >= maxGroupsPerPrincipal()) [[unlikely]] {
+            const uint64_t n = ++joinsRefusedPrincipalShare_;
+            if ((n & (n - 1)) == 0)
+                spdlog::warn("GroupCoordinationService: JoinGroup for new group '{}' refused - principal {} already "
+                             "created its share of {} consumer groups (RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL) "
+                             "(refusal #{})", groupIdStr, principal, maxGroupsPerPrincipal(), n);
+            return refuseJoin("this principal already holds its share of " + std::to_string(maxGroupsPerPrincipal()) +
+                              " consumer groups on this broker; retry after one of its groups empties or raise "
+                              "RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL", JoinRefusal::Capacity);
+        }
     }
     coord::GroupCoordinator& gc = coordinator(groupIdStr);   // only creates the group
+    if (creates && principal != 0) {   // #617: the creator is charged until the group is dropped
+        groupCreator_.emplace(groupIdStr, principal);
+        ++groupsCreatedBy_[principal];
+    }
     if (!gc.admitFilter(filter)) {
         noteFilterMismatch_(groupIdStr, msg.sessionId);
         return refuseJoin(groupFilterMismatchDetail(gc.filterBytes()));
@@ -791,7 +829,6 @@ size_t GroupCoordinationService::handleJoinGroup(
     // no longer exists, an id the client made up - joins as a NEW member with a fresh id: the answer looks the same
     // whether or not the id names someone (nothing to enumerate), and an id is never adopted from the client.
     // PR #423 review F2: and only for a CURRENT member of THIS group (a binding never stands in for membership).
-    const uint64_t principal = principalOf_(msg.sessionId);
     if (!memberIdScratch_.empty()) {
         const MemberBinding* b = bindingOf_(groupIdStr, memberIdStr);
         if (b == nullptr || b->principal != principal || !gc.hasMember(memberIdStr)) memberIdScratch_.clear();

@@ -2483,6 +2483,8 @@ void BrokerNode::buildGateway() {
             groupCoordService_->setCoordinatorTermFn(
                 [this]() -> int64_t { return static_cast<int64_t>(leaderObserver_.computeOnControl().term); });
             groupCoordService_->setMaxGroups(config_.groupMaxGroups);   // #214 (0 = the default)
+            // #617 (0 = half the cap)
+            groupCoordService_->setMaxGroupsPerPrincipal(config_.groupMaxGroupsPerPrincipal);
             groupCoordService_->setMinSessionTimeoutMs(config_.groupMinSessionTimeoutMs);   // #499 (0 = the default)
             groupCoordService_->setMaxSessionTimeoutMs(config_.groupMaxSessionTimeoutMs);   // #499 (0 = the default)
             // E2 final fix wave (C1): committed offsets of transient partitions

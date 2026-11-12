@@ -967,6 +967,17 @@ ConfigResult parseNodeConfig(
         }
     }
 
+    // --- RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL (optional, default 0 = half of the group cap) — #617 ---
+    {
+        const char* raw = getenv_fn("RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL");
+        if (raw && !std::string_view(raw).empty()) {
+            int32_t v{};
+            if (!parseInt32(raw, v) || v < 1)
+                return {{}, std::string("RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL must be a positive integer, got: ") + raw};
+            cfg.groupMaxGroupsPerPrincipal = v;
+        }
+    }
+
     // --- RUNE_MAX_NAMESPACES (optional, default 1024) and RUNE_NS_DEFAULT_* (optional, default 0) — namespaces Task 7 ---
     {
         const char* raw = getenv_fn("RUNE_MAX_NAMESPACES");

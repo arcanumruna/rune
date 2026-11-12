@@ -3264,6 +3264,23 @@ TEST(NodeConfigRegression, GroupMaxGroupsEnvIsParsedRegression) {
         EXPECT_FALSE(r.config.has_value()) << bad;
         EXPECT_NE(r.error.find("RUNE_GROUP_MAX_GROUPS"), std::string::npos) << bad << ": " << r.error;
     }
+    // #617: RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL — unset -> 0 (half the cap); positive int32 carried; 0 / negative /
+    // garbage / overflow refuse startup.  RED: ignore the variable.
+    env = base1node();
+    env["RUNE_AUTH"] = "disabled";
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->groupMaxGroupsPerPrincipal, 0);
+    env["RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL"] = "3";
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->groupMaxGroupsPerPrincipal, 3);
+    for (const char* bad : {"0", "-1", "x", "99999999999"}) {
+        env["RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL"] = bad;
+        r = parseNodeConfig(fakeEnv(env));
+        EXPECT_FALSE(r.config.has_value()) << bad;
+        EXPECT_NE(r.error.find("RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL"), std::string::npos) << bad << ": " << r.error;
+    }
 }
 
 // #499: RUNE_GROUP_MIN_SESSION_TIMEOUT_MS / RUNE_GROUP_MAX_SESSION_TIMEOUT_MS — unset → 0 (the service defaults); a
@@ -3315,6 +3332,8 @@ TEST(NodeConfigRegression, GroupKnobBoundsAndEffectiveSessionBoundsAdversarialRe
     const Row rows[] = {
         {"RUNE_GROUP_MAX_GROUPS", "1", true}, {"RUNE_GROUP_MAX_GROUPS", "2147483647", true},
         {"RUNE_GROUP_MAX_GROUPS", "2147483648", false}, {"RUNE_GROUP_MAX_GROUPS", "", true},
+        {"RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL", "1", true}, {"RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL", "2147483647", true},
+        {"RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL", "2147483648", false}, {"RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL", "", true},
         {"RUNE_GROUP_MIN_SESSION_TIMEOUT_MS", "1", true}, {"RUNE_GROUP_MIN_SESSION_TIMEOUT_MS", "1800000", true},
         {"RUNE_GROUP_MIN_SESSION_TIMEOUT_MS", "1800001", false}, {"RUNE_GROUP_MIN_SESSION_TIMEOUT_MS", "2147483647", false},
         {"RUNE_GROUP_MIN_SESSION_TIMEOUT_MS", "2147483648", false},
