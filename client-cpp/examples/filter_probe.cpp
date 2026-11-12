@@ -50,6 +50,7 @@
 #include <rune/codec/FilterBuilder.h>
 #include <rune/codec/Flyweight.h>
 #include <rune/codec/Serialize.h>
+#include <rune/codec/Validator.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <algorithm>
@@ -216,11 +217,12 @@ std::vector<Ev> makeAlterModel(uint64_t seed, int64_t firstSeq, int count, uint1
 
 // ---- the record codec (any of the three versions) --------------------------------------------------------------------
 
-/// [blockLength u16][version u16][fixed block at the materialized offsets of `version`]; fields absent in that
-/// version are skipped.  hp = sendNs, pos = seq.  No variable-length section.
+/// [blockLength u16][version u16][fixed block at the materialized offsets of `version`][name: u32 length 0]; fields
+/// absent in that version are skipped.  hp = sendNs, pos = seq.  The broker validates every typed write, so the one
+/// variable-length field (name, empty) carries its length prefix.
 std::vector<uint8_t> encodeVersioned(const Ev& e, int64_t sendNs) {
     const rune::codec::Descriptor& m = schema().materialized[e.version];
-    std::vector<uint8_t> out(4 + m.blockLength, 0);
+    std::vector<uint8_t> out(4 + m.blockLength + 4, 0);
     fly::store<uint16_t>(out.data(), static_cast<uint16_t>(m.blockLength));
     fly::store<uint16_t>(out.data() + 2, e.version);
     uint8_t* blk = out.data() + 4;
@@ -1187,6 +1189,9 @@ int selfcheck() {
     const std::vector<Ev> a2 = makeAlterModel(7, 100000, 40, 2), a3 = makeAlterModel(7, 100040, 40, 3);
     for (const Ev& ev : a2) { const Decoded x = decodeAny(encodeVersioned(ev, 5)); expect(x.ok && x.version == 2 && x.hasChannel && x.seq == ev.seq, "v2 round trip"); }
     for (const Ev& ev : a3) { const Decoded x = decodeAny(encodeVersioned(ev, 5)); expect(x.ok && x.version == 3 && !x.hasChannel && x.seq == ev.seq, "v3 round trip"); }
+    // the broker validates every typed write against its version's descriptor (checked writes): so must each record
+    for (const Ev& ev : a2) expect(rune::codec::Validator(schema().materialized[2]).validate(encodeVersioned(ev, 5), rune::codec::StringCheck::Utf8).ok, "v2 record passes the broker's validator");
+    for (const Ev& ev : a3) expect(rune::codec::Validator(schema().materialized[3]).validate(encodeVersioned(ev, 5), rune::codec::StringCheck::Utf8).ok, "v3 record passes the broker's validator");
     // the generated filter and the runtime builder encode the same bytes
     {
         auto rb = rune::codec::FilterBuilder::on(rune::examples::playerEventDescriptor()).field("worldId").eq(8u).field("channel").in({1, 2}).build();
