@@ -197,22 +197,25 @@ int cmdSchemaGet(const std::vector<std::string>& args,
     try {
         if (!connectOrReport(client, err)) return 1;
 
-        TopicSchemaResult r;
-        try {
-            r = client.getTopicSchemaAndWait(topic, kCliWait);
-        } catch (const std::exception& e) {
-            if (isWaitTimeout(e)) {
+        const auto lookup = [&](uint64_t fingerprint, TopicSchemaResult& res) {
+            try {
+                res = client.getTopicSchemaAndWait(topic, fingerprint, kCliWait);
+                return true;
+            } catch (const std::exception& e) {
+                if (!isWaitTimeout(e)) throw;
                 err << "rune: getTopicSchema timed out for topic: " << topic << "\n";
                 client.close();
-                return 1;
+                return false;
             }
-            throw;
-        }
+        };
 
         namespace rpc = rune::protocol::client;
+        TopicSchemaResult r;
+        if (!lookup(0, r)) return 1;
         if (r.errorCode == static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic)) {
             // The registry holds typed topics only: ask whether the topic exists untyped.
-            const TopicSchemaResult kind = client.getTopicSchemaAndWait(topic, rpc::kSchemaKindFingerprint, kCliWait);
+            TopicSchemaResult kind;
+            if (!lookup(rpc::kSchemaKindFingerprint, kind)) return 1;
             client.close();
             if (kind.errorCode == 0 && kind.descriptorBlob.empty()) {
                 out << "topic '" << topic << "' is untyped: it has no schema\n";

@@ -23,6 +23,7 @@
 
 #include "support/AeronTestErrors.h"
 #include "rune/cli/Cli.h"
+#include "../src/cli/QlEngine.h"
 
 #include "support/TestCompletions.h"
 #include <rune/client/Client.h>
@@ -522,7 +523,7 @@ TEST(CliLive, AeronDirFlagAttachesToARunningDriver) {
                                      "--cli-stream-in", std::to_string(kIn), "--cli-stream-out", std::to_string(kOut)},
                                     0ms);   // the driver is already running
 
-    EXPECT_EQ(gw.getsSeen.load(), 1) << "the CLI reached the gateway through the running driver; err=" << res.err;
+    EXPECT_EQ(gw.getsSeen.load(), 2) << "the CLI reached the gateway through the running driver (the lookup, then the kind probe); err=" << res.err;
     EXPECT_EQ(res.rc, static_cast<int>(rpc::ErrorCode::UnknownTopic)) << res.err;
     EXPECT_FALSE(std::filesystem::exists(cliDir + "/aeron")) << "the CLI started no driver of its own";
     EXPECT_FALSE(std::filesystem::exists(cliDir + "/aeron.lock"));
@@ -588,6 +589,29 @@ TEST(CliLive, SchemaGetUntypedTopic) {
     EXPECT_EQ(r.err.find("unknown topic"), std::string::npos) << "err=" << r.err;
 
     gw.stop();
+    try { std::filesystem::remove_all(baseDir); } catch (...) {}
+}
+
+// `rune ql` keeps "connect to <ep> timed out" (the e2e retry scripts grep it) and adds the configured response port.
+namespace {
+std::atomic<int64_t> g_qlClockNs{1'000'000'000};
+int64_t qlStepClock() noexcept { return g_qlClockNs.fetch_add(100'000'000); }   // every read is 100 ms later: the connect deadline passes at once
+}
+
+TEST(CliLive, QlConnectTimeoutNamesTheResponsePort) {
+    namespace engine = rune::cli::engine;
+    const std::string baseDir = cliUniqueDir();
+    engine::LiveOptions o;
+    o.endpoint            = "aeron:ipc";
+    o.gatewayResponsePort = "8263";
+    o.dataDir             = baseDir;
+    o.insecurePlaintext   = true;
+    o.nanoClock           = &qlStepClock;
+    engine::LiveBroker broker;
+    std::ostringstream err;
+    EXPECT_FALSE(broker.open(o, err));
+    EXPECT_NE(err.str().find("connect to aeron:ipc timed out"), std::string::npos) << err.str();
+    EXPECT_NE(err.str().find("gateway response port 8263"), std::string::npos) << err.str();
     try { std::filesystem::remove_all(baseDir); } catch (...) {}
 }
 

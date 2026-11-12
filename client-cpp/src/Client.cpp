@@ -3029,12 +3029,12 @@ void Client::checkBlockingCaller_(const char* what) const {
 
 template <class Issue, class OnDone>
 void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
-                      Issue&& issue, OnDone&& onDone) {
+                      Issue&& issue, OnDone&& onDone, std::string_view waitTimeoutHint) {
     OpResult rejected = OpResult::Accepted;
     switch (andWaitCore_(what, timeout, maxResultBytes, issue, onDone, rejected)) {
     case AndWaitEnd::Done:         return;
     case AndWaitEnd::RingTimedOut: throw std::runtime_error(std::string(what) + ": timed out (command ring full)");
-    case AndWaitEnd::WaitTimedOut: throw std::runtime_error(std::string(what) + ": timed out waiting");
+    case AndWaitEnd::WaitTimedOut: throw std::runtime_error(std::string(what) + ": timed out waiting" + std::string(waitTimeoutHint));
     case AndWaitEnd::Closed:       throw std::runtime_error(std::string(what) + ": client closed");
     case AndWaitEnd::Rejected:
         throw std::runtime_error(std::string(what) + ": rejected (OpResult " +
@@ -3208,15 +3208,17 @@ Client::SecurityResult<std::vector<rune::security::RoleRow>> Client::securityRol
 }
 
 void Client::connectAndWait(std::chrono::nanoseconds timeout) {
-    try {
-        andWait_("connect()", timeout, 0,
-                 [&](Completions& q, Token t) { return connect(q, t); },
-                 [&](const Completion& c, std::span<const uint8_t> payload) { throwForStatus_("connect()", c, payload); });
-    } catch (const std::runtime_error& e) {
-        if (cfg_.gatewayResponseControlPort == 0 || std::string_view(e.what()).find("timed out") == std::string_view::npos) throw;
-        throw std::runtime_error(std::string(e.what()) + " (gateway response port " + std::to_string(cfg_.gatewayResponseControlPort) +
-                                 "; the broker must reach it)");
-    }
+    // No answer from the gateway: with a configured response port, name it (the broker must reach it).  A full command ring
+    // sent nothing, and a refusal the broker answered proves the port works: neither gets the hint.
+    const std::string hint = cfg_.gatewayResponseControlPort == 0 ? std::string()
+        : " (gateway response port " + std::to_string(cfg_.gatewayResponseControlPort) + "; the broker must reach it)";
+    andWait_("connect()", timeout, 0,
+             [&](Completions& q, Token t) { return connect(q, t); },
+             [&](const Completion& c, std::span<const uint8_t> payload) {
+                 if (c.status == OpStatus::Timeout && !hint.empty()) throw std::runtime_error("connect(): timed out" + hint);
+                 throwForStatus_("connect()", c, payload);
+             },
+             hint);
 }
 
 Bytes Client::pingAndWait(std::span<const uint8_t> payload, std::chrono::nanoseconds timeout) {

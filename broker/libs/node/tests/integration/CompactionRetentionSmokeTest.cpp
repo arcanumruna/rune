@@ -307,20 +307,17 @@ static bool waitFor(Pred&& pred,
     return pred();
 }
 
-// Wait (bounded) for the node's cleaner to complete `cycles` more cycles.
-static bool awaitCleanerCycles(rune::node::BrokerNode& node, uint64_t cycles) {
-    const uint64_t c0 = node.cleanerCyclesForTest();
-    return waitFor([&] { return node.cleanerCyclesForTest() >= c0 + cycles; }, 10s);
-}
-
-// Wait (bounded) until the cleaner has compacted partition 0 of topic 0 through its last sealed segment (the clean
-// watermark reached the active segment's base).  A cleaner cycle count is no such condition: cycles tick while the user
-// partition is not yet leader, so they can pass before any pass is possible.
+// Wait (bounded) until the cleaner has compacted partition 0 of topic 0 through its last sealed segment AND that output is
+// durable: the watermark moves when the output is queued for the owner, which installs one group per duty pass and then
+// posts the renames (.cleaned -> .swap, the commit point) back to the cleaner.  A node stopped before that loses the output.
+// A cleaner cycle count is no such condition: cycles tick while the user partition is not yet leader.
 static bool awaitCleanedThroughSealed(rune::node::BrokerNode& node) {
     return waitFor([&] {
-        return node.onOwnerThreadForTest(0, 0, [](rune::replication::PartitionReplica& r) {
-            const auto bases = r.log()->segmentBaseOffsets();
-            return bases.size() > 1 && r.lastCleanOffset() >= bases.back();
+        return node.onOwnerThreadForTest(0, 0, [](rune::replication::PartitionReplica* r) {
+            if (!r) return false;
+            const auto bases = r->log()->segmentBaseOffsets();
+            return bases.size() > 1 && r->lastCleanOffset() >= bases.back()
+                   && !r->log()->cleanerSwapsPending() && r->log()->fileOpsQuiescent();
         });
     }, 10s);
 }
@@ -746,8 +743,8 @@ TEST(CompactionRetentionSmoke, DeleteRetention_TimeAndSize) {
     // HW advanced by becomeLeader() on duty-cycle thread.
     // No test-thread replica calls (duty-thread-only invariant).
 
-    // Wait for retention to run.
-    ASSERT_TRUE(awaitCleanerCycles(node, 3)) << "the cleaner never completed 3 cycles";
+    // Wait for retention to delete a segment.
+    ASSERT_TRUE(waitFor([&] { return countLogFiles(logDir) < segsBefore; }, 10s)) << "Smoke3: retention deleted no segment";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();

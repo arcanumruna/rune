@@ -1989,7 +1989,7 @@ private:
     /// Issue-and-wait shared by the *AndWait wrappers (see their doc).
     template <class Issue, class OnDone>
     void andWait_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
-                  Issue&& issue, OnDone&& onDone);
+                  Issue&& issue, OnDone&& onDone, std::string_view waitTimeoutHint = {});
     /// How andWaitCore_ ended (andWait_ throws for each; the group's sink maps them to a Completion status).
     enum class AndWaitEnd : uint8_t { Done, RingTimedOut, WaitTimedOut, Closed, Rejected };
     /// andWait_ without the throw: `rejected` holds the issue's OpResult when it returns Rejected.

@@ -18,6 +18,8 @@
 #include <rune/client/detail/PasswordFile.h>
 
 #include <algorithm>
+#include <atomic>
+#include <functional>
 #include <cstring>
 #include <chrono>
 #include <optional>
@@ -948,6 +950,38 @@ TEST(ClientConnectTimeoutRegression, TheTimeoutNamesTheConfiguredGatewayResponse
     EXPECT_NE(why.find("timed out"), std::string::npos) << why;
     EXPECT_NE(why.find("gateway response port 8263"), std::string::npos) << why;
     client.close();
+}
+
+// A thread-mode client on the real clock, its fake gateway pumped by a helper thread; connectAndWait's text is returned.
+std::string connectWaitText(rc::ClientConfig c, const std::function<void(Rig&)>& setup, std::chrono::milliseconds wait) {
+    c.runnerMode = rc::RunnerMode::Thread;
+    c.nanoClock = nullptr;
+    c.gatewayResponseControlPort = 8263;
+    Rig r(c);
+    setup(r);
+    std::atomic<bool> stop{false};
+    std::thread pumper([&] { while (!stop.load()) r.gw.pump(); });
+    std::string why;
+    try {
+        r.client.connectAndWait(wait);
+    } catch (const std::runtime_error& e) {
+        why = e.what();
+    }
+    stop = true;
+    pumper.join();
+    r.client.close();
+    return why;
+}
+
+TEST(ClientConnectTimeoutRegression, ARefusalTheBrokerAnsweredGetsNoResponsePortHint) {
+    // The broker answered (over the response channel, so the port works): the connect ends at its deadline while retrying
+    // a transient refusal, and naming the response port would blame the wrong cause.
+    rc::ClientConfig c = authCfg(4162, "ws1", kPw);
+    c.connectTimeoutMs = 300;
+    const std::string why = connectWaitText(c, [](Rig& r) { r.gw.connectErrorCode = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable); },
+                                            std::chrono::seconds(5));
+    EXPECT_NE(why.find("transient refusal"), std::string::npos) << why;
+    EXPECT_EQ(why.find("gateway response port"), std::string::npos) << why;
 }
 
 TEST(ClientSecretAdversarialRegression, ASecurityDdlAndWaitRetriedOnAFullCommandRingSendsTheWholePlanAdversarialRegression) {
