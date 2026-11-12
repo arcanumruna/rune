@@ -2132,6 +2132,7 @@ private:
     struct SeedFailoverStopped {};
     std::variant<SeedSteady, SeedFailingOver, SeedFailoverStopped> seedFailover_;
     uint64_t seedFailoverLossesSeen_ = 0;  ///< the seed machine's staleSessionLosses() last seen
+    uint64_t seedUnansweredSeen_     = 0;  ///< the seed machine's unansweredConnects() last seen
     uint64_t seedFailovers_          = 0;  ///< moves started (test hook)
     uint64_t seedFailoverConnects_   = 0;  ///< fix round 1 (I2): moves that connected by themselves
     uint64_t metadataViaOtherSession_ = 0; ///< MetadataRequests sent on a non-seed session

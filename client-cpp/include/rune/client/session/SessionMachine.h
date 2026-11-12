@@ -444,6 +444,10 @@ public:
     /// by the CLIENT's own stall (a tick gap > responseTimeoutNs) — the broker
     /// was not shown dead.
     [[nodiscard]] uint64_t ownStallLosses() const noexcept { return ownStallLosses_; }
+    /// Connect attempts of a once-Live machine that ran out connectTimeoutNs with no answer at all, not counting a
+    /// timeout the CLIENT's own stall produced (M1).  Monotonic; each increment is evidence that the broker is dead,
+    /// the same as a stale loss (the seed failover starts on it instead of waiting for the whole retry budget).
+    [[nodiscard]] uint64_t unansweredConnects() const noexcept { return unansweredConnects_; }
     /// DR client bugs fix round 1 (I2): the error code of the latest connect
     /// attempt refused by the broker (0 = none since the last ConnectResponse{OK}),
     /// or kHandshakeTimedOut (fix round 3, M-2: client-local, never on the wire,
@@ -1160,7 +1164,7 @@ public:
         }
         switch (state_) {
         case SessionState::Connecting:
-            tickConnecting(nowNs);
+            tickConnecting(nowNs, ownStall);
             break;
         case SessionState::Handshaking:
             tickHandshaking_(nowNs);
@@ -1705,7 +1709,7 @@ private:
         }
     }
 
-    void tickConnecting(int64_t nowNs) noexcept {
+    void tickConnecting(int64_t nowNs, bool ownStall) noexcept {
         if (cfg_.offerCrypto && cfg_.requireCrypto && !hs_) [[unlikely]] {
             rejectHandshake_();   // fix round 4: required crypto, no local TLS — a local verdict, terminal
             return;
@@ -1741,6 +1745,7 @@ private:
 
         // Connect timed out.
         ++connectFailures_;  // DR-7: an event the owner reacts to (metadata refresh)
+        if (everLive_ && !ownStall) ++unansweredConnects_;   // the broker was silent for the whole window
         if (connectRetryCount_ >= cfg_.maxConnectRetries) {
             onRetryBudgetExhausted_(nowNs);
             return;
@@ -2044,6 +2049,7 @@ private:
     uint64_t authUnavailable_ = 0;   // issues #15 / #111: see authUnavailableCount()
     uint64_t staleSessionLosses_ = 0;   // fix round 4: see staleSessionLosses()
     uint64_t ownStallLosses_     = 0;   // M1: see ownStallLosses()
+    uint64_t unansweredConnects_ = 0;   // see unansweredConnects()
     int16_t  lastConnectError_   = 0;   // I2: see lastConnectError()
     int64_t lastConnectSentNs_   = 0;  // when the last ConnectRequest was offered
     bool    connectSentOk_       = false; // true if the last offer() succeeded
