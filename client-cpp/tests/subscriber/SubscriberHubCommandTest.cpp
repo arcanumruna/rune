@@ -962,21 +962,26 @@ TEST(SubscriberHubRegression, ALateOkMatchingTwoSessionsIsNotUnsubscribedRegress
     }
 }
 
-// A refused offer is one attempt only: counted unreleased, never retried.
-TEST(SubscriberHubRegression, ARefusedLateOkUnsubscribeIsCountedAndNotRetriedRegression) {
+// A refused offer (Retry) is owed, not dropped: the next duty cycle sends it, exactly once.
+TEST(SubscriberHubRegression, ARefusedLateOkUnsubscribeIsOwedAndRetriedRegression) {
     SubscriberHub hub;
     CaptureSend   send;
     RefusingTransport tx;
     hub.setDirectSend(&RefusingTransport::fn, &tx);
     auto impl = makeImpl(87);
     subscribeAndTimeOut(hub, send, impl.get());
-    tx.refuseNext = 1;                               // the late OK's one Unsubscribe attempt
+    tx.refuseNext = 1;                               // the late OK's first Unsubscribe attempt
     hub.onSubscribeResponse(bindRsp(87, 4718), 784, kSession, send.fn());
-    EXPECT_EQ(hub.lateOksUnreleased(), 1u);
+    EXPECT_EQ(hub.lateOksUnreleased(), 0u) << "owed, not given up";
     EXPECT_EQ(hub.lateOksReleased(), 0u);
+    EXPECT_EQ(hub.pendingUnsubscribes(), 1u);
+    EXPECT_TRUE(unsubscribesOf(tx).empty());
+    EXPECT_EQ(hub.retryPendingUnsubscribes(kSession), 1);
+    ASSERT_EQ(unsubscribesOf(tx).size(), 1u);
+    EXPECT_EQ(unsubscribesOf(tx)[0].subscriptionId, 4718);
     EXPECT_EQ(hub.pendingUnsubscribes(), 0u);
     EXPECT_EQ(hub.retryPendingUnsubscribes(kSession), 0);
-    EXPECT_TRUE(unsubscribesOf(tx).empty());
+    EXPECT_EQ(unsubscribesOf(tx).size(), 1u) << "exactly once";
 }
 
 // An error answer binds nothing broker-side, so there is nothing to release.

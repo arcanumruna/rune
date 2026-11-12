@@ -553,6 +553,8 @@ private:
     static constexpr std::size_t kMaxOwedReleases = 64;
     std::array<OwedRelease, kMaxOwedReleases> owed_{};
     std::size_t  owedCount_ = 0;
+    /// Owe a release the transport refused (Retry): false when the fixed list is full.
+    bool oweRelease_(int64_t subscriptionId, int64_t sessionId, int64_t corrId, uint32_t homeSession);
     int retryOwedReleases_(int64_t currentSessionId);
     detail::SendResult offerUnsubscribe_(int64_t subscriptionId, int64_t sessionId, int64_t corrId, uint32_t homeSession);
     static void noteAppSeq_(SubscriptionImpl& impl, uint32_t seq) noexcept;

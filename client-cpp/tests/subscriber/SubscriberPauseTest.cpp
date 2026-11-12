@@ -1465,9 +1465,12 @@ void runPauseStressEpisode(uint32_t seed, int episode, StressTotals& tot) {
             if (!staleOks.empty() && rnd(0, 1) == 0) {
                 const auto [c, id] = staleOks.back();
                 staleOks.pop_back();
+                ensureRoom();
                 const int unsubs = r.tx.unsubscribes;
                 r.hub.onSubscribeResponse(bindRsp(c, id, r.sid), 0, r.sid, r.noSend);
                 EXPECT_EQ(r.tx.unsubscribes, unsubs + (r.tx.refuseUnsub ? 0 : 1)) << "a late OK of a paused-away Subscribe is released once";
+                if (r.tx.refuseUnsub) owed.push_back({id, r.sid});   // refused: owed, retried by the duty cycle
+                else                  expectUnsub[id] += 1;
             }
             break;
         }
@@ -1584,6 +1587,7 @@ void runPauseStressEpisode(uint32_t seed, int episode, StressTotals& tot) {
             break;
         }
         case 12: {  // a leader move
+            ensureRoom();
             const int64_t newCorr = ++r.nextCorr;
             ++r.nextCorr;
             const int64_t oldId = instSubId;
@@ -1592,6 +1596,7 @@ void runPauseStressEpisode(uint32_t seed, int episode, StressTotals& tot) {
             EXPECT_EQ(ok, inst == Inst::Bound);
             if (ok) {
                 if (!r.tx.refuseUnsub) { expectUnsub[oldId] += 1; EXPECT_EQ(r.tx.unsubscribes, unsubs + 1); }
+                else                   owed.push_back({oldId, r.sid});   // refused: owed
                 r.corr = newCorr;
                 inst = Inst::Pending;
                 pendingFrom = modelNext;
@@ -1749,4 +1754,94 @@ TEST(SubscriberPauseRegression, RefusedPauseChangesNothingRegression) {
     EXPECT_EQ(r.impl->unsubCorrId, corrBefore);
     EXPECT_EQ(r.impl->unsubSessionId, sidBefore);
     EXPECT_EQ(r.got.back(), 67) << "the batch ran to its end: the refused pause stopped nothing";
+}
+
+// O-1: the late OK of a Subscribe that was paused away, offered while the transport refuses (Retry): the release is owed and
+// retried each duty cycle, exactly once.
+TEST(SubscriberPauseRegression, LateOkReleaseSurvivesRetryRegression) {
+    Rig r;
+    r.open(11, /*dutyHandle=*/false);
+    ASSERT_TRUE(r.sub->pause());                       // pending: parked
+    r.tx.refuseUnsub = true;
+    r.hub.onSubscribeResponse(bindRsp(11, 40, r.sid), 777, r.sid, r.noSend);   // the late OK: its one Unsubscribe is refused
+    EXPECT_EQ(r.tx.unsubsFor(40), 0);
+    EXPECT_EQ(r.hub.pendingUnsubscribes(), 1u) << "the release is owed";
+    EXPECT_EQ(r.hub.retryPendingUnsubscribes(r.sid), 0) << "still refused";
+    r.tx.refuseUnsub = false;
+    EXPECT_EQ(r.hub.retryPendingUnsubscribes(r.sid), 1);
+    EXPECT_EQ(r.tx.unsubsFor(40), 1);
+    EXPECT_EQ(r.hub.pendingUnsubscribes(), 0u);
+    EXPECT_EQ(r.hub.retryPendingUnsubscribes(r.sid), 0);
+    EXPECT_EQ(r.tx.unsubsFor(40), 1) << "sent exactly once";
+    ASSERT_TRUE(r.sub->resume());                      // and the subscription itself is unharmed
+}
+
+// The same bug class: the best-effort release of the old instance when a NotLeader answer moves a subscription.
+TEST(SubscriberPauseRegression, MoveReleaseSurvivesRetryRegression) {
+    Rig r;
+    r.open(11);
+    r.bind(40);
+    r.tx.refuseUnsub = true;
+    const int64_t newCorr = ++r.nextCorr;
+    ASSERT_TRUE(r.hub.rearmMovedAway(r.corr, newCorr, newCorr + 1, r.sid, r.sid, 100 * kHour));
+    EXPECT_EQ(r.tx.unsubsFor(40), 0);
+    EXPECT_EQ(r.hub.pendingUnsubscribes(), 1u) << "the release of the old instance is owed";
+    r.tx.refuseUnsub = false;
+    EXPECT_EQ(r.hub.retryPendingUnsubscribes(r.sid), 1);
+    EXPECT_EQ(r.tx.unsubsFor(40), 1);
+    EXPECT_EQ(r.hub.retryPendingUnsubscribes(r.sid), 0);
+    EXPECT_EQ(r.tx.unsubsFor(40), 1);
+}
+
+namespace {
+/// A node router for one moved partition: node session 2 is the old home (epoch 5, broker session 800), session 1 leads the
+/// partition now (broker session 900).  Frames offered are recorded; Unsubscribes are refused while `refuseUnsub`.
+struct MovedRouter {
+    bool refuseUnsub = true;
+    int64_t corr = 5000;
+    std::vector<std::pair<uint32_t, int64_t>> unsubs;   // (session, subscriptionId) accepted
+    int subscribes = 0;
+    static uint32_t leader(void*, int32_t, int32_t) { return 1; }
+    static int64_t sid(void*, uint32_t s) { return s == 1 ? 900 : s == 2 ? 800 : 0; }
+    static uint64_t epoch(void*, uint32_t s) { return s == 1 ? 3 : s == 2 ? 5 : 0; }
+    static int64_t next(void* c) { return ++static_cast<MovedRouter*>(c)->corr; }
+    static rcd::SendResult offer(void* c, uint32_t s, const uint8_t* b, std::size_t n) {
+        auto* self = static_cast<MovedRouter*>(c);
+        if (auto u = rc::codec::decodeUnsubscribe(b, n)) {
+            if (self->refuseUnsub) return rcd::SendResult::Retry;
+            self->unsubs.emplace_back(s, u->subscriptionId);
+        } else if (rc::codec::decodeSubscribe(b, n)) {
+            ++self->subscribes;
+        }
+        return rcd::SendResult::Accepted;
+    }
+    SubscriberHub::NodeRouter router() {
+        SubscriberHub::NodeRouter r;
+        r.ctx = this; r.leaderSession = &leader; r.sessionId = &sid; r.epoch = &epoch; r.offer = &offer; r.nextCorrId = &next;
+        return r;
+    }
+};
+}  // namespace
+
+// The same bug class: the release of the old instance when fresh metadata moves a bound subscription off its node session
+// (#365) - refused once, it is owed and goes out on that node session exactly once.
+TEST(SubscriberPauseRegression, RouteMoveReleaseSurvivesRetryRegression) {
+    Rig r;
+    MovedRouter mr;
+    r.hub.setNodeRouter(mr.router());
+    r.open(11);
+    r.bind(40);
+    r.impl->homeSession = 2;   // bound on node session 2 (epoch 5, broker session 800)
+    r.impl->homeSid     = 800;
+    r.impl->homeEpoch   = 5;
+    EXPECT_GT(r.hub.driveHomed(r.sid, 100 * kHour, 0), 0) << "the route moved: re-armed";
+    EXPECT_TRUE(mr.unsubs.empty()) << "the release was refused";
+    EXPECT_EQ(mr.subscribes, 1);
+    EXPECT_EQ(r.hub.pendingUnsubscribes(), 1u) << "owed";
+    mr.refuseUnsub = false;
+    EXPECT_EQ(r.hub.retryPendingUnsubscribes(r.sid), 1);
+    ASSERT_EQ(mr.unsubs.size(), 1u);
+    EXPECT_EQ(mr.unsubs[0], (std::pair<uint32_t, int64_t>{2u, 40}));
+    EXPECT_EQ(r.hub.retryPendingUnsubscribes(r.sid), 0);
+    EXPECT_EQ(mr.unsubs.size(), 1u) << "exactly once";
 }

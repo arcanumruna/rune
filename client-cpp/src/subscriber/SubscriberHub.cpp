@@ -411,6 +411,13 @@ detail::SendResult SubscriberHub::offerUnsubscribe_(int64_t subscriptionId, int6
     return directSend_(directSendCtx_, frameBuf, frameLen);
 }
 
+bool SubscriberHub::oweRelease_(int64_t subscriptionId, int64_t sessionId, int64_t corrId, uint32_t homeSession)
+{
+    if (owedCount_ == owed_.size()) return false;
+    owed_[owedCount_++] = OwedRelease{subscriptionId, sessionId, corrId, homeSession};
+    return true;
+}
+
 int SubscriberHub::retryOwedReleases_(int64_t currentSessionId)
 {
     int sent = 0;
@@ -567,12 +574,11 @@ bool SubscriberHub::pause_(SubscriptionImpl& impl, int64_t resumeAt, int64_t uns
                 impl.unsubCorrId    = unsubCorrId;   // trySendUnsubscribe_ reads the two from the impl
                 impl.unsubSessionId = homeSidOf_(impl, sessionId);   // a moved one's own node session
                 if (trySendUnsubscribe_(impl, submitFn) == detail::SendResult::Retry) {
-                    if (owedCount_ == owed_.size()) {   // no room to owe it: refuse, change nothing
-                        impl.unsubCorrId    = prevCorr;
+                    if (!oweRelease_(impl.subscriptionId, impl.unsubSessionId, impl.unsubCorrId, impl.homeSession)) {
+                        impl.unsubCorrId    = prevCorr;   // no room to owe it: refuse, change nothing
                         impl.unsubSessionId = prevSid;
                         return false;
                     }
-                    owed_[owedCount_++] = OwedRelease{impl.subscriptionId, impl.unsubSessionId, impl.unsubCorrId, impl.homeSession};
                 }
             }
         }
@@ -770,9 +776,11 @@ void SubscriberHub::releaseUnboundOk_(const codec::SubscribeResponseView& rsp, i
         if (seedMatch)           { if (directSend_ != nullptr) r = directSend_(directSendCtx_, buf, len); }
         else if (routed_())      { r = router_.offer(router_.ctx, node, buf, len); }
     }
-    // One attempt only (best-effort, as the #365 old-instance release): a refusal is not retried.
+    // A refusal (Retry) is owed: retried each duty cycle until accepted, or dropped with its session (retryOwedReleases_).
+    // Only a Fatal send, or a full owed list, leaves it unreleased.
     if (r == detail::SendResult::Accepted) ++lateOksReleased_;
-    else                                   ++lateOksUnreleased_;
+    else if (r == detail::SendResult::Retry && oweRelease_(rsp.subscriptionId, rsp.sessionId, unsubCorrId, seedMatch ? 0u : node)) {}
+    else ++lateOksUnreleased_;
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,10 +1171,14 @@ bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int
             const std::size_t unsubLen =
                 codec::encodeUnsubscribe(unsubBuf, sizeof(unsubBuf), impl.subscriptionId, homeSid, unsubCorrId);
             if (unsubLen > 0) {
+                detail::SendResult rel = detail::SendResult::Fatal;
                 if (impl.homeSession != 0 && routed_())   // I2: its old node session
-                    (void)router_.offer(router_.ctx, impl.homeSession, unsubBuf, unsubLen);
+                    rel = router_.offer(router_.ctx, impl.homeSession, unsubBuf, unsubLen);
                 else if (directSend_ != nullptr)
-                    (void)directSend_(directSendCtx_, unsubBuf, unsubLen);
+                    rel = directSend_(directSendCtx_, unsubBuf, unsubLen);
+                // A refusal is owed (retried each duty cycle), never dropped; a full list is the hard limit.
+                if (rel == detail::SendResult::Retry)
+                    (void)oweRelease_(impl.subscriptionId, homeSid, unsubCorrId, impl.homeSession != 0 && routed_() ? impl.homeSession : 0u);
             }
         }
         activeById_.erase(it);
@@ -1500,9 +1512,12 @@ int SubscriberHub::driveHomed(int64_t seedSid, int64_t deadlineNs, int64_t now)
             // old instance there, best-effort as on a NotLeader move.
             const int64_t relSid = wasSeed ? homeSidOf_(impl, seedSid) : impl.homeSid;
             uint8_t unsubBuf[64]{};
+            const int64_t unsubCorr = router_.nextCorrId(router_.ctx);
             const std::size_t unsubLen = codec::encodeUnsubscribe(unsubBuf, sizeof(unsubBuf), impl.subscriptionId,
-                                                                  relSid, router_.nextCorrId(router_.ctx));
-            if (unsubLen > 0) (void)router_.offer(router_.ctx, impl.homeSession, unsubBuf, unsubLen);
+                                                                  relSid, unsubCorr);
+            if (unsubLen > 0 &&
+                router_.offer(router_.ctx, impl.homeSession, unsubBuf, unsubLen) == detail::SendResult::Retry)
+                (void)oweRelease_(impl.subscriptionId, relSid, unsubCorr, impl.homeSession);   // owed, not dropped
         }
         ++homedSessionsLost_;
         activeById_.erase(ait);
