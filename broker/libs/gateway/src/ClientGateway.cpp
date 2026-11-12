@@ -2046,6 +2046,14 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
         }
         return;
     }
+    if (kind == K::SegmentRepair) [[unlikely]] {   // #880: a worker's cumulative repair count; sessionId = the counter
+        if (ret.partition >= 0 && ret.partition < 4096 && ret.sessionId >= 0 && ret.sessionId < 3) {
+            auto& per = workerSegmentRepairs_[static_cast<std::size_t>(ret.sessionId)];
+            if (per.size() <= static_cast<std::size_t>(ret.partition)) per.resize(static_cast<std::size_t>(ret.partition) + 1, 0);
+            per[static_cast<std::size_t>(ret.partition)] = static_cast<uint64_t>(ret.baseOffset);
+        }
+        return;
+    }
     if (kind == K::UnauthLogSuppressed) [[unlikely]] {   // #145: a worker's cumulative suppressed log lines
         if (ret.partition >= 0 && ret.partition < 4096) {
             if (workerUnauthSuppressed_.size() <= static_cast<std::size_t>(ret.partition))

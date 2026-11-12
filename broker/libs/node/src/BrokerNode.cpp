@@ -6519,6 +6519,12 @@ void BrokerNode::publishNsSlotMetrics_() noexcept {
         lastDamagedReadsPublished_ = damaged;
         controlSet_(RuneMetric::DamagedReads, damaged);
     }
+    static constexpr RuneMetric kRepairMetrics[3] = {RuneMetric::SegmentRepairs, RuneMetric::SegmentRepairFailures,
+                                                     RuneMetric::SegmentRepairNoPeer};   // #880
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto v = static_cast<std::int64_t>(gateway_->segmentRepairsTotal(i));
+        if (v != lastSegmentRepairPublished_[i]) { lastSegmentRepairPublished_[i] = v; controlSet_(kRepairMetrics[i], v); }
+    }
     const auto unauth = static_cast<std::int64_t>(gateway_->unauthLogSuppressedTotal());   // #145
     if (unauth != lastUnauthSuppressedPublished_) {
         lastUnauthSuppressedPublished_ = unauth;

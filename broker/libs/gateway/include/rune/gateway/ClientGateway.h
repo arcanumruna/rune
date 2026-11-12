@@ -633,6 +633,14 @@ public:
         for (const uint64_t w : workerDamagedReads_) n += w;
         return n;
     }
+    /// #880: segment repairs, summed over every worker's cumulative count (SessionSignal SegmentRepair): counter 0 =
+    /// repairs completed, 1 = attempts failed, 2 = damaged segments no peer could serve.
+    [[nodiscard]] uint64_t segmentRepairsTotal(std::size_t counter) const noexcept {
+        uint64_t n = 0;
+        if (counter < 3)
+            for (const uint64_t w : workerSegmentRepairs_[counter]) n += w;
+        return n;
+    }
     /// Namespaces Phase 2 Task 14 (D28): the node's limit aggregator (control thread, the gateway's own thread).  Worker usage
     /// reports (SessionSignal NsUsage) are forwarded to it; the usage query (template 84) reads its totals.
     void setNsLimitAggregator(rune::node::NsLimitAggregator* a) noexcept { nsAggregator_ = a; }
@@ -2858,6 +2866,7 @@ private:
     std::vector<uint64_t>   workerNsSlotMismatches_;   ///< cumulative, per worker (SessionSignal NsSlotMismatch)
     uint64_t                inlineDamagedReads_ = 0;   ///< #882: inline-path subscriptions failed at damaged data
     std::vector<uint64_t>   workerDamagedReads_;       ///< #882: cumulative, per worker (SessionSignal DamagedRead)
+    std::vector<uint64_t>   workerSegmentRepairs_[3];   ///< #880: cumulative, per counter, per worker
     std::vector<uint64_t>   workerUnauthSuppressed_;   ///< #145: cumulative, per worker (UnauthLogSuppressed)
     /// One array index and a compare; counts a mismatch.
     [[nodiscard]] bool nsTagMatches_(const Session& s) noexcept {

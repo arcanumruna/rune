@@ -516,6 +516,14 @@ are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRe
   `InternalIsr`, `InternalIsrAck`, `OffsetsForLeaderEpochRequest`/`Response`, `ReconcileFetchRequest`/`Response`. Broker to
   broker only; inter-broker frames are sealed with the cluster key
   ([operations](../operations.md#the-cluster-key)).
+- **Segment repair** (`schemaId 112`, templates 17 `RepairFetchRequest` and 18 `RepairFetchResponse`): a replica with a damaged
+  sealed log segment asks a peer for the batches it lacks. Both reuse the `FetchRequest` / `FetchResponse` layouts unchanged (no
+  block-length or schema-version change) and carry their extra facts in fields the layouts do not otherwise use. In the request,
+  `fetchOffset` is the cursor (the first offset wanted), `incarnation` is the asker's attempt id and `lastEpochStartOffset` is
+  the exclusive end of the wanted range. In the response, `errorCode` is the status (0 batches follow, 1 done: no batch below
+  the end remains, 2 refused), `fromOffset` and `logStartOffset` echo the cursor and the attempt id, `highWatermark` is the
+  peer's, and `records` are whole batches whose base offsets lie in the range and below the peer's high watermark. Broker to
+  broker only.
 - **Transaction vote** (cluster plane, `schemaId 112`, hand-rolled little-endian blocks after the 8-byte header): template 15
   `TxnVote`, coordinator to partition leader (40-byte block: `coordinatorNodeId`, `coordinatorEpoch`, `token`, `topicId`,
   `partition`, `producerId`, `producerEpoch`, `leaderEpoch`), and template 16 `TxnVoteResponse`, leader to coordinator (48-byte

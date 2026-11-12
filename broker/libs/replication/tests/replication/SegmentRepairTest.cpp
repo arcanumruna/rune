@@ -210,6 +210,14 @@ TEST(SegmentRepairRegression, AFollowerRepairsItsDamagedSegmentFromTheLeaderRegr
     EXPECT_EQ(r.rep[1]->segmentRepairNoPeer(), 0u);
     EXPECT_GE(r.rep[0]->repairRequestsServed(), 1u);
     EXPECT_EQ(r.rep[1]->segmentRepairActive(), false);
+    // The counter movement is handed to the worker once (it folds it into the node's metrics).
+    ASSERT_TRUE(r.rep[1]->repairEventsPending());
+    const auto ev = r.rep[1]->takeRepairEvents();
+    EXPECT_EQ(ev.completed, 1u);
+    EXPECT_EQ(ev.failed, 0u);
+    EXPECT_EQ(ev.noPeer, 0u);
+    EXPECT_FALSE(r.rep[1]->repairEventsPending());
+    EXPECT_EQ(r.rep[1]->takeRepairEvents().completed, 0u);
     // The leader was never damaged: nothing of its own to repair.
     EXPECT_EQ(r.rep[0]->segmentRepairsCompleted(), 0u);
     // The repaired copy reads over the whole range.

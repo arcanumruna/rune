@@ -294,6 +294,9 @@ sampling the file; the broker keeps no history.
 | 1000243 | `rune-peer-hello-shed` | counter | control | Peer-link Hello / HelloV2 frames dropped because the sending peer had used its one crypto-costing Hello answer for this duty cycle (a flood, or a legitimate initiator retrying in the same cycle as a forged one). A sustained rise means an off-path Hello flood; the real initiator re-sends every 200 ms and still links. |
 | 1000270 | `rune-log-damaged-segments` | gauge | control | Sealed log segments found damaged at boot, summed over every log the node serves: bytes after the last whole batch of a segment below the recovery point. They stay on disk and reads that reach them fail (see Damaged log segments). Set once at start; damage that readers reach later is counted by `rune-log-damaged-reads`. |
 | 1000271 | `rune-log-damaged-reads` | counter | control | Subscription reads that reached a damaged or unreadable stored batch since the node started. Each one fails its subscription with `StorageError`. A value above 0 means clients are reading into damage found at boot or later. |
+| 1000272 | `rune-log-segment-repairs` | counter | control | Damaged sealed segments rebuilt from an in-sync peer since the node started, summed over the node's workers (see Damaged log segments). |
+| 1000273 | `rune-log-segment-repair-failures` | counter | control | Segment repair attempts that failed: the peer's batches failed validation, a request timed out, or the repair could not begin or commit. The replica tries the next peer or backs off, so a nonzero value is not by itself a problem; a value that keeps rising with `rune-log-segment-repairs` flat is. |
+| 1000274 | `rune-log-segment-repair-no-peer` | counter | control | Damaged sealed segments no peer could repair: replication factor 1, no known leader or in-sync follower, or every copy refused or failed. Counted once per segment; the segment stays damaged and needs an operator. |
 
 Per-namespace metrics (one series per namespace on this node, allocated when the namespace is created and freed when it is
 erased; the key is the namespace id and the slot's owner tag is the namespace id too):
@@ -398,8 +401,25 @@ segment as it is. A sealed segment whose bytes after the last whole, CRC-valid b
   or subscription that reaches it gets `StorageError (26)` ("the stored batch is corrupt (damaged log segment)") and the client
   fails that subscription with `CorruptBatch`; records before the damage and in later segments are served.
 - **Replication.** A leader asked to fetch the damaged range answers `kErrCorruptRecord` (-12). The follower stops at its log end
-  and leaves the in-sync set; nothing is repaired automatically.
-- **Cleaner.** The log cleaner refuses a log that has a damaged segment until an operator acts.
+  and leaves the in-sync set. It stays stopped until its leadership changes or the node restarts: repairing the leader's copy
+  does not wake it.
+- **Automatic repair.** A replica whose partition has a damaged sealed segment rebuilds it from a peer that holds the range
+  intact, while it keeps its log length, its place in the in-sync set and its leadership. A follower asks the leader; a
+  leader asks its in-sync followers in id order. The replica copies the valid prefix of the segment into a side file, fetches
+  the batches it lacks, checks every one (CRC, offset range, leader epoch) and swaps the file in with the same crash-safe
+  swap the cleaner uses (a crash leaves either the damaged segment or the repaired one). A peer serves only committed bytes
+  from segments that are not damaged in the range, so a segment is repaired only once its end is at or below the replica's
+  high watermark. The counters `rune-log-segment-repairs` (completed), `rune-log-segment-repair-failures` (attempts that
+  failed validation, timed out or could not commit) and `rune-log-segment-repair-no-peer` (a damaged segment no peer could
+  serve) show it; the log lines `damaged segment <base> repaired from peer <n>` and, at critical level, `cannot be repaired
+  from a peer` name the segment. Reads over the repaired range succeed at once; a subscription that already failed with
+  `CorruptBatch` stays failed and its client re-subscribes. The cleaner's `uncleanable` flag is sticky: a repair does not
+  clear it, so a compacted topic is compacted again only after the broker restarts.
+- **What still needs an operator.** A topic of replication factor 1; a segment every copy of which is damaged; a system log
+  (below), which stops the node at boot and is restored by wiping that node and letting it resync; and a range above the high
+  watermark. For these the segment stays damaged exactly as before: `rune-log-segment-repair-no-peer` rises once per segment
+  and the critical line is logged once.
+- **Cleaner.** The log cleaner refuses a log that has a damaged segment until the broker restarts, repaired or not.
 - **Retention.** Retention deletes the damaged segment whole, once it ages out. The size accounting counts only its valid prefix.
 - **System logs refuse to start.** Damage in `__catalog`, `__security`, `__consumer_offsets`, `__transaction_state` or
   `__cluster_metadata` stops the node at boot: it logs `system log <dir> has a damaged segment at offset <o> - refusing to

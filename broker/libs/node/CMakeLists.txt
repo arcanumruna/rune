@@ -2268,7 +2268,8 @@ if(BUILD_TESTING)
         add_executable(rune_client_failover_broker_tests tests/client/ClientFailoverBrokerRegressionTest.cpp
                        tests/client/EosBrokerRegressionTest.cpp
                        tests/client/FilterBrokerRegressionTest.cpp
-                       tests/client/CheckedWritesTransientViewFailoverBrokerRegressionTest.cpp)
+                       tests/client/CheckedWritesTransientViewFailoverBrokerRegressionTest.cpp
+                       tests/client/SegmentRepairClusterRegressionTest.cpp)
         add_dependencies(rune_client_failover_broker_tests generate_claim_schema_headers)
         target_include_directories(rune_client_failover_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
                                    ${RUNE_CLIENT_ROOT}/tests ${CMAKE_BINARY_DIR}/rune-client/claim-gen

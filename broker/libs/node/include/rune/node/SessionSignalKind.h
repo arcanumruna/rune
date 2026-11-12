@@ -61,6 +61,11 @@ enum class SessionSignalKind : int64_t {
     /// suppressed (`rune-unauth-log-suppressed`): WorkerReturn::baseOffset = the worker's cumulative count, ::partition =
     /// the worker.  Sent with a logged line, only when the count changed.
     UnauthLogSuppressed = 15,
+    /// #880: NOT a session signal - a worker's cumulative segment-repair counts, one signal per counter: WorkerReturn::
+    /// sessionId = the counter (0 repairs completed `rune-log-segment-repairs`, 1 attempts failed
+    /// `rune-log-segment-repair-failures`, 2 no peer could serve `rune-log-segment-repair-no-peer`), ::baseOffset = the
+    /// worker's cumulative count, ::partition = the worker.  Sent when a count changed; a refused one is retried.
+    SegmentRepair = 16,
 };
 
 } // namespace rune::node

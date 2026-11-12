@@ -2093,7 +2093,9 @@ public:
                 if (!replica) continue;
                 const ReplReadScope rs(*replica, replScratch_);
                 work += replica->doWork(nowNs);
+                if (replica->repairEventsPending()) [[unlikely]] noteRepairEvents_(*replica);   // #880
             }
+            if (repairDirty_) [[unlikely]] work += flushRepairSignals_();
             work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
             if (viewSet_ != nullptr) [[unlikely]] {
                 work += viewSet_->drainInstalls();   // Task 19: install runtime-created view plans (own thread)
@@ -2229,7 +2231,9 @@ private:
                 if (!replica) continue;
                 const ReplReadScope rs(*replica, replScratch_);
                 work += replica->doWork(nowNs);
+                if (replica->repairEventsPending()) [[unlikely]] noteRepairEvents_(*replica);   // #880
             }
+            if (repairDirty_) [[unlikely]] work += flushRepairSignals_();
             work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
         }
         if (viewSet_ != nullptr) [[unlikely]] {
@@ -4338,6 +4342,31 @@ private:
     /// past the damage) and ONE ErrorResponse{StorageError, correlationId 0} is owed - sent now, else retried every pass
     /// by the owed-error block until it is.
     /// #882: count the failed read and report the cumulative count to the gateway (SessionSignal DamagedRead).
+    /// #880 (cold): fold an owned replica's segment-repair counter movement into this worker's counts.
+    [[gnu::cold]] [[gnu::noinline]] void noteRepairEvents_(rune::replication::PartitionReplica& r) {
+        const auto d = r.takeRepairEvents();
+        repairCounts_[0] += d.completed;
+        repairCounts_[1] += d.failed;
+        repairCounts_[2] += d.noPeer;
+        repairDirty_ = true;
+    }
+    /// #880 (cold): report each changed count to the gateway (SessionSignal SegmentRepair); a full return ring keeps the
+    /// worker dirty and the next pass retries.
+    [[gnu::cold]] [[gnu::noinline]] int flushRepairSignals_() {
+        int sent = 0;
+        bool pending = false;
+        for (int i = 0; i < 3; ++i) {
+            if (repairCounts_[i] == repairSignaled_[i]) continue;
+            if (trySessionSignal_(i, SessionSignalKind::SegmentRepair, static_cast<int64_t>(repairCounts_[i]))) {
+                repairSignaled_[i] = repairCounts_[i];
+                ++sent;
+            } else {
+                pending = true;
+            }
+        }
+        repairDirty_ = pending;
+        return sent;
+    }
     [[gnu::cold]] [[gnu::noinline]] void noteDamagedRead_() {
         ++damagedReads_;
         (void)trySessionSignal_(0, SessionSignalKind::DamagedRead, static_cast<int64_t>(damagedReads_));
@@ -6969,6 +6998,9 @@ private:
     uint64_t                              pushReadErrors_ = 0;   ///< D26: push-read pread failures (answered empty)
     uint64_t                              corruptReads_ = 0;     ///< #839: reads that reached a damaged segment
     uint64_t                              damagedReads_ = 0;     ///< #882: reads failed at damage (SessionSignal)
+    uint64_t                              repairCounts_[3] = {};     ///< #880: cumulative completed / failed / no-peer
+    uint64_t                              repairSignaled_[3] = {};   ///< #880: the values the gateway last accepted
+    bool                                  repairDirty_ = false;      ///< #880: a count is not yet reported
     /// D26: replication read scratch — a fetch serve / owed re-serve / push of
     /// an owned replica preads into it (PartitionReplica::setReadScratch), never
     /// faulting through the segment read map.  maxFetchBytes (1 MiB) + the

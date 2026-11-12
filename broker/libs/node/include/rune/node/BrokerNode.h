@@ -3074,6 +3074,7 @@ private:
     uint64_t                                              nsSlotAssignFailures_ = 0;   // a bug if ever non-zero
     std::int64_t                                          lastNsMismatchPublished_ = 0;
     std::int64_t                                          lastDamagedReadsPublished_ = 0;   // #882
+    std::int64_t                                          lastSegmentRepairPublished_[3] = {};   // #880
     std::int64_t                                          lastUnauthSuppressedPublished_ = 0;   // #145
     void bootAssignNsSlots_();                                                   // startup thread: from the booted catalog
     void onNsUpserted_(const rune::catalog::NamespaceRecord& rec);               // control thread: assign / refresh + broadcast

@@ -799,6 +799,19 @@ public:
     /// Repair requests this replica answered Ok / Done / Refused.
     [[nodiscard]] uint64_t repairRequestsServed() const noexcept { return repairServed_; }
     [[nodiscard]] uint64_t repairRequestsRefused() const noexcept { return repairRefused_; }
+    /// #880: the counter movement since the last take (owner thread).  A worker folds it into its cumulative counts and
+    /// reports them to the gateway (`rune-log-segment-repairs`, `-repair-failures`, `-repair-no-peer`).
+    struct RepairEvents { uint64_t completed = 0, failed = 0, noPeer = 0; };
+    [[nodiscard]] bool repairEventsPending() const noexcept {
+        return repairsCompleted_ != repairReported_.completed || repairAttemptsFailed_ != repairReported_.failed ||
+               repairNoPeer_ != repairReported_.noPeer;
+    }
+    RepairEvents takeRepairEvents() noexcept {
+        const RepairEvents d{repairsCompleted_ - repairReported_.completed, repairAttemptsFailed_ - repairReported_.failed,
+                             repairNoPeer_ - repairReported_.noPeer};
+        repairReported_ = {repairsCompleted_, repairAttemptsFailed_, repairNoPeer_};
+        return d;
+    }
     /// A repair is in flight (fetching or waiting to retry).
     [[nodiscard]] bool segmentRepairActive() const noexcept {
         return !std::holds_alternative<RepairIdle>(repairState_);
@@ -1934,6 +1947,7 @@ private:
     int64_t  repairNoPeerLoggedBase_ = -1;   ///< the segment base the no-peer critical line was last logged for
     uint64_t repairsCompleted_ = 0, repairAttemptsFailed_ = 0, repairNoPeer_ = 0, repairsAborted_ = 0;
     uint64_t repairServed_ = 0, repairRefused_ = 0;
+    RepairEvents repairReported_{};   ///< the counters as last taken by takeRepairEvents()
     /// The duty-pass step: start / time out / abort / retry the repair.  Returns work done.
     int serviceRepair_(int64_t nowNs);
     /// Candidate peers for a repair now: a follower -> the leader; a leader -> its in-sync followers in id order.
