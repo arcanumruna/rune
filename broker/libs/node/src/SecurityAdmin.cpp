@@ -250,7 +250,7 @@ bool SecurityAdmin::advance_(int64_t nowNs) {
         const SecurityRequest req = std::move(a->req);
         const int64_t offset = a->offset;
         inFlight_ = Idle{};
-        answer_(req, kInternal, "security apply halted on this broker at offset " +
+        answer_(req, kInternal, "security apply halted on node " + std::to_string(selfId_) + " at offset " +
                                     std::to_string(applier_.haltError() ? applier_.haltError()->offset : -1) +
                                     "; the request's event (offset " + std::to_string(offset) +
                                     ") may have committed - retry with the same requestId on another broker");
@@ -285,7 +285,8 @@ void SecurityAdmin::startNext_(int64_t nowNs) {
     }
     if (applier_.halted() && !std::holds_alternative<SecurityHalted>(role_)) (void)updateRole_();
     if (const auto* h = std::get_if<SecurityHalted>(&role_)) {
-        answer_(req, kInternal, "security apply halted at offset " + std::to_string(h->offset));   // never a redirect
+        answer_(req, kInternal, "security apply halted on node " + std::to_string(selfId_) + " at offset " +
+                                    std::to_string(h->offset));   // never a redirect
         return;
     }
     if (!std::holds_alternative<SecurityLeaderServing>(role_)) {   // follower / catching up: retriable

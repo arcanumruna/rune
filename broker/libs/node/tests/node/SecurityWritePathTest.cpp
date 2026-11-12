@@ -278,6 +278,20 @@ TEST(SecurityWritePathRegression, HaltedBrokerAnswersInternal) {
     EXPECT_EQ(rig.admin().roleName(), "Halted");
 }
 
+// #208: a halted answer names the broker that halted (a client holding several brokers' answers cannot tell otherwise).
+TEST(SecurityAdminRegression, HaltedDetailNamesTheNodeRegression) {
+    SecurityDdlRig rig("halted_names_node");
+    rig.becomeServingLeader();
+    rig.applier().tamperNextFingerprintForTest();
+    const std::string want = "on node " + std::to_string(SecurityDdlRig::kSelf);
+    const auto inFlight = rig.ddl(rig.createUser("u1", "a-long-password-1"));   // in flight when the apply halts
+    ASSERT_EQ(inFlight.code, kInternal) << inFlight.detail;
+    EXPECT_NE(inFlight.detail.find(want), std::string::npos) << inFlight.detail;
+    const auto arriving = rig.ddl(rig.createUser("u2", "a-long-password-2"));   // arrives while halted
+    ASSERT_EQ(arriving.code, kInternal) << arriving.detail;
+    EXPECT_NE(arriving.detail.find(want), std::string::npos) << arriving.detail;
+}
+
 TEST(SecurityWritePathRegression, NoEventEverCarriesAPasswordLiteralRegression) {
     SecurityDdlRig rig("nopw");
     rig.becomeServingLeader();
