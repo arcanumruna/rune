@@ -186,7 +186,7 @@ public:
         client->close();
     }
 
-    void step() {
+    virtual void step() {
         (void)client->doWork();
         if (session) session->doWork(client->nowNs());
         poll();
@@ -294,18 +294,40 @@ bool Actor::await(rc::Token t, std::initializer_list<Actor*> pumped, std::chrono
 class Reader : public Actor {
 public:
     Reader(Rig& rig, int k, int clockIdx, int avoid = -1) : Actor(rig, k, clockIdx, avoid) {
-        rc::SubscribeOptions o;
-        o.from      = rc::From::earliest();
-        o.isolation = rc::Isolation::ReadCommitted;
-        sub_.emplace(client->subscribe(client->topic("data"), 0, o, [this](const rc::Record& r) {
-            seen.emplace_back(reinterpret_cast<const char*>(r.value.data()), r.value.size());
-        }));
+        subscribe();
+    }
+    /// A subscription the client ended on its own (a subscribe that timed out because this reader was not pumped for
+    /// longer than subscribeTimeoutMs, a lost session, a leader that moved) is taken again from the next offset, as the
+    /// client's contract asks of an application: an ended subscription is never resumed by the client itself.
+    void step() override {
+        Actor::step();
+        if (sub_ && !sub_->active()) {
+            ended.push_back(int(sub_->failReason()));
+            subscribe();
+        }
     }
     ~Reader() override { if (sub_) sub_->unsubscribe(); }
     [[nodiscard]] bool has(const std::string& v) const { return std::find(seen.begin(), seen.end(), v) != seen.end(); }
+    [[nodiscard]] std::string subState() const {
+        std::string s = std::string("sub active ") + (sub_->active() ? "1" : "0") + " failReason " + std::to_string(int(sub_->failReason())) +
+                        " next " + std::to_string(next_) + " session " + std::to_string(int(client->state())) + " ended";
+        for (int e : ended) s += " " + std::to_string(e);
+        return s;
+    }
     std::vector<std::string> seen;
+    std::vector<int>         ended;   // the fail reason of every subscription the client ended
 
 private:
+    void subscribe() {
+        rc::SubscribeOptions o;
+        o.from      = next_ < 0 ? rc::From::earliest() : rc::From::offset(next_);
+        o.isolation = rc::Isolation::ReadCommitted;
+        sub_.emplace(client->subscribe(client->topic("data"), 0, o, [this](const rc::Record& r) {
+            next_ = r.offset + 1;
+            seen.emplace_back(reinterpret_cast<const char*>(r.value.data()), r.value.size());
+        }));
+    }
+    int64_t next_ = -1;   // the offset after the last delivered record; -1: nothing delivered yet
     std::optional<rc::Subscription> sub_;
 };
 
@@ -343,7 +365,7 @@ void sentinel(Actor& w, Reader& r, std::initializer_list<Actor*> pumped, const s
     const bool        late     = pumpUntil({&w, &r}, [&] { return r.has("sentinel"); });
     FAIL() << "R never delivered the sentinel: seen " << seenAtCap << " record(s) at the cap, "
            << (late ? "arrived late with both clients pumped" : "still missing a minute later") << " (seen " << r.seen.size()
-           << "); " << state;
+           << "); " << r.subState() << "; " << state;
 }
 /// Holder A acquires the lease (first attempt) and keeps it; A's producer is initialised and bound.
 void takeLease(Actor& a, uint64_t holder, uint64_t ttlMs, const std::string& txnId, bool bindProducer = true) {
@@ -495,6 +517,16 @@ TEST_P(LeaseTxnGuardBrokerRegression, InitTransactionsFencesOldProducersSend) {
     ASSERT_TRUE(b.await(bi, {&a, &b}));
     ASSERT_EQ(b.result(bi).status, rc::OpStatus::Ok);
 
+    // B's init is answered when the coordinator has bumped the epoch and decided the abort of A's open transaction; the
+    // abort marker reaches the data partition afterwards.  B's own transaction cannot start before that abort is done,
+    // so once it has committed the partition knows the new epoch and A's send is refused for certain.  (A send of A that
+    // lands before the marker joins the transaction being aborted: never visible either way, which the end checks.)
+    b.producer->beginTransaction();
+    ASSERT_NO_FATAL_FAILURE(sendAcked(b, values("B", 2), {&a, &b}));
+    const rc::Token bc = b.commit();
+    ASSERT_TRUE(b.await(bc, {&a, &b}));
+    ASSERT_EQ(b.result(bc).status, rc::OpStatus::Ok) << "code " << b.result(bc).errorCode;
+
     rc::Token st = 0;
     ASSERT_EQ(a.send("A-after", st), rc::SendResult::Ok);
     ASSERT_TRUE(a.await(st, {&a, &b}));
@@ -504,12 +536,6 @@ TEST_P(LeaseTxnGuardBrokerRegression, InitTransactionsFencesOldProducersSend) {
     const rc::Token ac = a.commit();
     ASSERT_TRUE(a.await(ac, {&a, &b}));
     EXPECT_EQ(a.result(ac).status, rc::OpStatus::Fenced) << "A's commit: code " << a.result(ac).errorCode;
-
-    b.producer->beginTransaction();
-    ASSERT_NO_FATAL_FAILURE(sendAcked(b, values("B", 2), {&a, &b}));
-    const rc::Token bc = b.commit();
-    ASSERT_TRUE(b.await(bc, {&a, &b}));
-    ASSERT_EQ(b.result(bc).status, rc::OpStatus::Ok) << "code " << b.result(bc).errorCode;
     ASSERT_NO_FATAL_FAILURE(sentinel(b, r, {&a, &b}));
     auto expect = values("B", 2);
     expect.push_back("sentinel");
