@@ -4,11 +4,13 @@
 // One SecurityAdmin + a real leader replica + the real SecurityApplier (support/SecurityDdlRig.h).
 #include "support/SecurityDdlRig.h"
 
+#include <rune/gateway/SecurityRequestFingerprint.h>
 #include <rune/security/Permissions.h>
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 
 using rune::node::test::SecurityDdlRig;
 namespace sec = rune::security;
@@ -17,7 +19,7 @@ using Op = pc::SecurityOpKind;
 using Ch = pc::UserChangeKind;
 
 namespace {
-constexpr uint16_t kNotLeader = 2, kInternal = 6, kInvalidRequest = 39;
+constexpr uint16_t kNotLeader = 2, kInternal = 6, kInvalidRequest = 39, kNotAuthorized = 45;
 
 bool contains(const std::vector<uint8_t>& hay, const std::string& needle) {
     return std::search(hay.begin(), hay.end(), needle.begin(), needle.end()) != hay.end();
@@ -697,6 +699,98 @@ TEST(SecurityWritePathRegression, ARecordedControlBytePatternStaysRevocableRegre
     ASSERT_EQ(events.size(), 3u);
     EXPECT_EQ(events[1].event.statement, "GRANT READ ON GROUP 'a\\x09b' TO ROLE r;");
     EXPECT_EQ(events[2].event.statement, "REVOKE READ ON GROUP 'a\\x09b' FROM ROLE r;");
+}
+
+// #221: the dedupe fingerprint includes the authenticated principal - a request id is never reusable across principals,
+// and another principal learns nothing from a recorded id.
+namespace {
+rune::node::SecurityDdlMsg asPrincipal(rune::node::SecurityDdlMsg m, const std::string& who) {
+    m.meta.authenticated = who;
+    return m;
+}
+}
+
+TEST(SecurityWritePathRegression, DedupeIsPerPrincipalRegression) {
+    SecurityDdlRig rig("dedupe_principal");
+    rig.becomeServingLeader();
+    const auto mA = rig.createUser("x", "a long enough password", "alice");
+    const auto a = rig.ddl(mA);
+    ASSERT_EQ(a.code, 0) << a.detail;
+    const auto again = rig.ddl(mA);   // a retry by the same principal still works
+    EXPECT_EQ(again.code, 0) << again.detail;
+    EXPECT_EQ(again.objectId, a.objectId);
+    EXPECT_EQ(again.version, a.version);
+    EXPECT_EQ(again.gateOffset, a.gateOffset);
+    const auto b = rig.ddl(asPrincipal(mA, "bob"));
+    EXPECT_EQ(b.code, kInvalidRequest);
+    EXPECT_EQ(b.detail, "requestId reused for a different statement");
+    EXPECT_NE(b.objectId, a.objectId) << "never A's result";
+    auto mC = asPrincipal(mA, "carol");
+    mC.denial = "not authorized: ADMIN on CLUSTER";
+    const auto c = rig.ddl(mC);
+    EXPECT_EQ(c.code, kNotAuthorized);
+    EXPECT_EQ(c.detail, "not authorized: ADMIN on CLUSTER");
+    EXPECT_EQ(c.objectId, 0u);
+    const auto events = rig.recordedEvents();
+    ASSERT_EQ(events.size(), 1u) << "exactly one event for the request id";
+    EXPECT_EQ(events[0].event.principal.authenticated, "alice");
+}
+
+TEST(SecurityWritePathRegression, AnotherPrincipalLearnsNothingFromARecordedRequestIdRegression) {
+    SecurityDdlRig rig("dedupe_nothing");
+    rig.becomeServingLeader();
+    const auto mA = rig.createRole("s1");
+    const auto a = rig.ddl(mA);
+    ASSERT_EQ(a.code, 0) << a.detail;
+    ASSERT_NE(a.objectId, 0u);
+    // B guesses A's statement, then a different valid one on the same id: the two answers are identical.
+    const auto guess = rig.ddl(asPrincipal(mA, "bob"));
+    auto other = rig.createRole("s2");
+    other.meta.requestId = mA.meta.requestId;
+    const auto miss = rig.ddl(asPrincipal(other, "bob"));
+    EXPECT_EQ(guess.code, miss.code);
+    EXPECT_EQ(guess.detail, miss.detail);
+    EXPECT_EQ(guess.objectId, miss.objectId);
+    EXPECT_EQ(guess.version, miss.version);
+    EXPECT_EQ(guess.gateOffset, miss.gateOffset);
+    for (const auto* r : {&guess, &miss}) {
+        EXPECT_EQ(r->code, kInvalidRequest);
+        EXPECT_EQ(r->detail, "requestId reused for a different statement");
+        EXPECT_EQ(r->objectId, 0u);
+        EXPECT_EQ(r->version, 0u);
+        EXPECT_NE(r->gateOffset, a.gateOffset);
+    }
+    // B unauthorized for the statement: the same denial as for a FRESH request id - a recorded id is not observable.
+    const std::string denial = "not authorized: ADMIN on CLUSTER";
+    auto denied = asPrincipal(mA, "bob");
+    denied.denial = denial;
+    const auto onRecorded = rig.ddl(denied);
+    auto fresh = asPrincipal(rig.createRole("s1"), "bob");
+    fresh.denial = denial;
+    const auto onFresh = rig.ddl(fresh);
+    EXPECT_EQ(onRecorded.code, onFresh.code);
+    EXPECT_EQ(onRecorded.detail, onFresh.detail);
+    EXPECT_EQ(onRecorded.objectId, onFresh.objectId);
+    EXPECT_EQ(onRecorded.version, onFresh.version);
+    EXPECT_EQ(onRecorded.gateOffset, onFresh.gateOffset);
+    EXPECT_EQ(onRecorded.code, kNotAuthorized);
+    const auto events = rig.recordedEvents();
+    ASSERT_EQ(events.size(), 1u) << "exactly one event, for the first request id";
+    EXPECT_EQ(events[0].event.principal.authenticated, "admin");
+}
+
+TEST(SecurityWritePathRegression, TheDdlFingerprintCoversThePrincipalRegression) {
+    namespace gw = rune::gateway;
+    static constexpr std::array<uint8_t, 64> kKey{};
+    const gw::VerifierBytes v{{}, 0, kKey, kKey};
+    const auto fp = [&](std::string_view who) {
+        return gw::securityDdlFingerprint("CREATE ROLE r;", 4, "r", 0, 0, 0, v, 0, 0, 0, 0, "", "", who);
+    };
+    EXPECT_NE(fp("alice"), fp("bob"));
+    EXPECT_EQ(fp("alice"), fp("alice"));
+    EXPECT_EQ(fp(""), fp("")) << "in-process mode: an empty principal is stable";
+    EXPECT_NE(fp(""), fp("alice"));
+    EXPECT_NE(fp("ab"), fp("a")) << "the principal is part of the hash, not a prefix collision";
 }
 
 TEST(CheckedWritesImportGrant, GrantImportBelowLevelFiveIsRefused) {

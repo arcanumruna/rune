@@ -301,7 +301,10 @@ bound to nothing, and an ended subscription's cursor is gone. A subscription a w
 that worker: its `NotAuthorized` follows its last `Records` frame, and nothing follows it. An OK whose
 enforcement is not confirmed within `RUNE_SECURITY_GATE_DEADLINE_MS` (default 5 000) is answered `Internal`
 "committed at offset N; enforcement on this broker not confirmed" (the change is committed; a retry with
-the same request id returns its result). The OK does not mean every broker enforces it. Other brokers
+the same request id by the same principal returns its result; another principal's retry of that id is answered
+`requestId reused for a different statement`, and so is a retry that spans a rolling upgrade, since the request
+fingerprint now includes the authenticated principal, issue #221). The OK does not mean every broker enforces it.
+Other brokers
 apply the event asynchronously (typically within 100 ms on healthy brokers).
 A revoke ends the affected subscriptions within 100 ms on a 3-node cluster.
 

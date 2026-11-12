@@ -177,7 +177,8 @@ void SecurityAdmin::submit(SecurityRequest r) {
 }
 
 // ─── the request fingerprint (F14, for __security): FNV-1a-64 over every field that makes the statement what it is -
-//     never the requestId, clientName, session or the principal.
+//     and the authenticated principal (issue #221: a request id is never reusable across principals, so another
+//     principal learns nothing from a recorded one); never the requestId, clientName or session.
 namespace {
 struct Fnv {
     uint64_t h = 0xcbf29ce484222325ULL;
@@ -194,7 +195,7 @@ uint64_t fingerprintOf(const SecurityDdlMsg& m) {
     const rune::gateway::VerifierBytes v{m.verifier.salt, m.verifier.iterations, m.verifier.storedKey, m.verifier.serverKey};
     return rune::gateway::securityDdlFingerprint(m.meta.statement, m.kind, m.name, m.change, m.passwordIndex,
                                                  m.terminateSessions, v, m.granteeKind, m.op, m.resourceType,
-                                                 m.patternKind, m.pattern, m.roleName);
+                                                 m.patternKind, m.pattern, m.roleName, m.meta.authenticated);
 }
 uint64_t fingerprintOf(const SecurityBootstrapMsg& m) {
     Fnv f;

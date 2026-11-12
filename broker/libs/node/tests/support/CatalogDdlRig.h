@@ -96,6 +96,7 @@ public:
         uint32_t                    nsId        = 0;       // namespaces Task 7: the topic's namespace
         rune::protocol::TopicKeyFeatures keyFeatures{};
         std::optional<rune::protocol::LeaseSpec> lease;
+        std::string                 authenticated;         // the session's principal ("" = anonymous)
     };
 
     /// `fdLimit` / `fdReadySegments` (issue #296): AdminDeps::fdLimit / readySegmentsPerPartition (0 = unknown limit).
@@ -203,6 +204,7 @@ public:
         m.nsId = a.nsId;
         m.keyFeatures = a.keyFeatures;
         m.lease = a.lease;
+        m.meta.authenticated = a.authenticated;
         return submit_(DdlRequest{std::move(m)});
     }
 

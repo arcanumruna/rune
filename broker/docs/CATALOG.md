@@ -188,6 +188,11 @@ Every DDL is answered. No request is silently dropped.
 A DDL carries a 128-bit request id that stays the same across every resend. The leader answers a
 retry of a DDL that already applied with the original result, and answers `InvalidRequest` if the
 same id arrives with a different statement.
+A request id is never reusable across principals: the leader's request fingerprint includes the authenticated
+principal (issue #221), so another principal that sends a recorded id learns nothing of the recorded result. A
+request recorded by a broker without this change does not match a retry seen by a broker with it (and the
+reverse), so a retry that spans a rolling upgrade is answered `requestId reused for a different statement`
+although the statement applied.
 
 ## halted
 

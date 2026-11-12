@@ -98,6 +98,59 @@ TEST(CatalogWritePathRegression, RequestIdReusedForADifferentStatementIsInvalidR
     EXPECT_EQ(rig.admin().startedCount(), rig.admin().answeredCount());
 }
 
+// #221: the dedupe fingerprint includes the authenticated principal - a request id is never reusable across principals.
+TEST(CatalogWritePathRegression, CatalogDedupeIsPerPrincipalRegression) {
+    CatalogDdlRig rig("wp_dedupe_principal", 3);
+    rig.becomeServingLeader();
+    const rune::protocol::RequestId rid{.hi = 0xC11E, .lo = 221};
+    const auto defineAs = [&](const char* name, int32_t parts, const char* who) {
+        return rig.define({.name = name, .partitions = parts, .typed = true, .requestId = rid, .authenticated = who});
+    };
+    const auto a = defineAs("t", 1, "alice");
+    ASSERT_EQ(a.code, 0) << a.detail;
+    const auto again = defineAs("t", 1, "alice");
+    EXPECT_EQ(again.code, 0) << "a retry by the same principal still works";
+    EXPECT_EQ(again.topicId, a.topicId);
+    EXPECT_EQ(again.version, a.version);
+    const auto b = defineAs("t", 1, "bob");
+    EXPECT_EQ(b.code, 39);
+    EXPECT_EQ(b.detail, "requestId reused for a different statement");
+    EXPECT_NE(b.topicId, a.topicId) << "never A's result";
+    const auto log = rig.recordedLog();
+    ASSERT_EQ(log.size(), 1u) << "exactly one event for the request id";
+    EXPECT_EQ(log[0].event.principal.authenticated, "alice");
+}
+
+TEST(CatalogWritePathRegression, AnotherPrincipalLearnsNothingFromARecordedRequestIdRegression) {
+    CatalogDdlRig rig("wp_dedupe_nothing", 3);
+    rig.becomeServingLeader();
+    const rune::protocol::RequestId rid{.hi = 0xC11E, .lo = 222};
+    const auto defineAs = [&](const char* name, int32_t parts, const char* who) {
+        return rig.define({.name = name, .partitions = parts, .typed = true, .requestId = rid, .authenticated = who});
+    };
+    const auto a = defineAs("t", 1, "alice");
+    ASSERT_EQ(a.code, 0) << a.detail;
+    // B guesses A's statement, then a different valid one on the same id: the two answers are identical.
+    const auto guess = defineAs("t", 1, "bob");
+    const auto miss = defineAs("u", 2, "bob");
+    EXPECT_EQ(guess.code, miss.code);
+    EXPECT_EQ(guess.detail, miss.detail);
+    EXPECT_EQ(guess.topicId, miss.topicId);
+    EXPECT_EQ(guess.version, miss.version);
+    EXPECT_EQ(guess.objectId, miss.objectId);
+    EXPECT_EQ(guess.gateTopicId, miss.gateTopicId);
+    EXPECT_EQ(guess.fingerprint, miss.fingerprint);
+    for (const auto* r : {&guess, &miss}) {
+        EXPECT_EQ(r->code, 39);
+        EXPECT_EQ(r->detail, "requestId reused for a different statement");
+        EXPECT_NE(r->topicId, a.topicId);
+        EXPECT_EQ(r->version, 0u);
+        EXPECT_EQ(r->objectId, 0u);
+    }
+    EXPECT_EQ(rig.recordedLog().size(), 1u);
+    EXPECT_EQ(rig.recordedLog()[0].event.principal.authenticated, "alice");
+}
+
 TEST(CatalogWritePathRegression, CommitTimeoutAnswersRetriableNotLeaderAndTheRetryIsExactRegression) {
     // F13: past kDdlTimeoutNs the appended event may still commit — the answer must be retriable,
     // and the retry (same requestId) must get the original result once it committed.

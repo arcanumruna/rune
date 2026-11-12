@@ -10995,7 +10995,9 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
         bool knownRetry = false;
         if (!m.ext.requestId.none() && securityView_ != nullptr)
             if (const auto rec = securityView_->state().request(m.ext.requestId))
-                knownRetry = rec->requestFingerprint == rune::gateway::securityDdlFingerprint(m);
+                knownRetry = rec->requestFingerprint ==   // #221: the principal the leader will see in meta.authenticated
+                             rune::gateway::securityDdlFingerprint(
+                                 m, ddlMetaOf_(&m.ext, m.sessionId, *session, 0).authenticated);
         if (!ownPassword) denial = std::move(admin);
         else if (admin) {
             proofChecked = true;
