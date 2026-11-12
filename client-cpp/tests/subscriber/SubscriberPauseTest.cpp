@@ -18,7 +18,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -28,6 +27,9 @@
 #include <optional>
 #include <random>
 #include <thread>
+
+#include <poll.h>
+#include <unistd.h>
 #include <type_traits>
 #include <vector>
 
@@ -192,43 +194,43 @@ struct Rig {
     }
 };
 
-/// A persistent "application thread": run(f) executes f on it and returns when f is done (a capped handshake; no
-/// allocation per call).  The hub is driven by the test thread (the duty thread of the Rig's handle); the calls f makes on
-/// the handle take the APP path.  The calls never overlap the test thread's own, so the hub is never used concurrently.
+/// A persistent "application thread": run(f) executes f on it and returns when f is done (a handshake over two pipes; no
+/// allocation per call, no shared word).  The hub is driven by the test thread (the duty thread of the Rig's handle); the
+/// calls f makes on the handle take the APP path.  The calls never overlap the test thread's own, so the hub is never used
+/// concurrently: `fn` / `ctx` are handed over by the pipe write, and handed back by the reply.
 struct AppThread {
-    std::atomic<int>   st{0};   // 0 idle, 1 work posted, 2 work done
-    void             (*fn)(void*) = nullptr;
-    void*              ctx = nullptr;
-    std::atomic<bool>  quit{false};
-    std::thread        th;
+    void      (*fn)(void*) = nullptr;
+    void*       ctx = nullptr;
+    int         go[2] = {-1, -1};     // test thread -> application thread: one byte per call; closed = quit
+    int         done[2] = {-1, -1};   // application thread -> test thread: one byte per finished call
+    std::thread th;
     AppThread() {
+        if (::pipe(go) != 0 || ::pipe(done) != 0) std::abort();
         th = std::thread([this] {
-            while (!quit.load(std::memory_order_acquire)) {
-                if (st.load(std::memory_order_acquire) == 1) {
-                    fn(ctx);
-                    st.store(2, std::memory_order_release);
-                } else {
-                    std::this_thread::yield();
-                }
+            char b = 0;
+            while (::read(go[0], &b, 1) == 1) {
+                fn(ctx);
+                if (::write(done[1], &b, 1) != 1) return;
             }
         });
     }
     ~AppThread() {
-        quit.store(true, std::memory_order_release);
+        ::close(go[1]);   // read() returns 0: the thread leaves its loop
         th.join();
+        ::close(go[0]);
+        ::close(done[0]);
+        ::close(done[1]);
     }
     template <class F>
     void run(F&& f) {
         fn  = [](void* c) { (*static_cast<std::remove_reference_t<F>*>(c))(); };
         ctx = &f;
-        st.store(1, std::memory_order_release);
-        bool done = false;
-        for (long spin = 0; spin < 200'000'000L && !done; ++spin) {
-            done = st.load(std::memory_order_acquire) == 2;
-            if (!done) std::this_thread::yield();
-        }
-        EXPECT_TRUE(done) << "the application thread never finished";
-        st.store(0, std::memory_order_release);
+        char b = 1;
+        ASSERT_EQ(::write(go[1], &b, 1), 1);
+        pollfd pfd{done[0], POLLIN, 0};
+        const int ready = ::poll(&pfd, 1, 60'000);   // a failure-only deadline: the reply is the progress signal
+        ASSERT_EQ(ready, 1) << "the application thread never finished";
+        ASSERT_EQ(::read(done[0], &b, 1), 1);
     }
 };
 
