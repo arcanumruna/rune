@@ -923,6 +923,25 @@ TEST(AuthEnforcementRegression, RetriesOfAnAppliedOwnChangeAreNotChargedOnTheThr
                             << (login.fin ? login.fin->retryAfterMs : 0u);
 }
 
+// PR #410 re-check (#415): the gateway and the leader compute the SAME request fingerprint for a DDL kind that carries
+// no verifier (DROP PASSWORD).  That parity is what makes an applied DROP PASSWORD retry a true retry at the gateway,
+// so the retries are never charged on the login throttle.
+TEST(AuthEnforcementRegression, RetriesOfAnAppliedOwnDropPasswordAreTrueRetriesAdversarialRegression) {
+    AuthRig r;
+    std::string name;
+    const int64_t self = r.newUser({}, &name);   // logged in with AuthRig::kPw (slot 1)
+    r.broker().addPassword(name, "the-second-password-1");
+    pc::SecurityDdl m; m.sessionId = self; m.kind = pc::SecurityOpKind::AlterUser; m.name = name;
+    m.change = pc::UserChangeKind::DropPassword; m.passwordIndex = 1;
+    const std::string st = "ALTER USER " + name + " DROP PASSWORD 1;";
+    r.wire().pinRequestId(rune::protocol::RequestId{0x5157, 0xDDDD});
+    ASSERT_EQ(r.wire().securityDdl(r.ch(), m, st).errorCode, 0u);
+    for (int i = 0; i < 5; ++i) EXPECT_EQ(r.wire().securityDdl(r.ch(), m, st).errorCode, 0u) << "retry " << i;
+    r.wire().pinRequestId(std::nullopt);
+    const auto login = r.broker().wire().connectAndLogin(r.ch(), name, "the-second-password-1");
+    EXPECT_TRUE(login.ok()) << "the retries were not charged: code " << login.errorCode();
+}
+
 // PR #410 review F1, the whole bug class: any security DDL whose gateway check reads state its own first attempt
 // changed.  An admin revoking ITS OWN ADMIN (another admin remains) and retrying with the same request id: the gateway
 // now denies it ADMIN, but the retry gets its original result; a NEW request from it is refused 45.
