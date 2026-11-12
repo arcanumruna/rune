@@ -76,17 +76,18 @@ struct Log {
     }
 };
 
-/// Drives the watch on this thread (real time, hard cap) until `done`; an Invoker client is pumped too.
+/// Drives the watch on this thread until `done`; an Invoker client is pumped too.  Yields between passes and stops at a hard pass cap
+/// (the failure, never a hang): no sleep, no wall deadline.
 template <class P>
 bool drive(rc::LeaseWatchBase& w, rc::Client& c, bool invoker, P&& done) {
-    const auto end = std::chrono::steady_clock::now() + 30s;
-    while (std::chrono::steady_clock::now() < end) {
+    constexpr uint64_t kPassCap = 50'000'000;
+    for (uint64_t i = 0; i < kPassCap; ++i) {
         if (invoker) (void)c.doWork();
         (void)w.doWork(c.nowNs());
         if (done()) return true;
-        std::this_thread::sleep_for(2ms);
+        std::this_thread::yield();
     }
-    return false;
+    return done();
 }
 
 void defineClaims(rc::Client& c, const std::string& name, uint32_t partitions) {
@@ -138,14 +139,13 @@ void closeUpdateRestart(rc::Client& c, bool invoker) {
     ASSERT_TRUE(lt.revokeAndWait(claimRow("rs-b"), gb.version).ok());
     const rc::LeaseResult gd = lt.grantAndWait(claimRow("rs-d", 4), o);
     ASSERT_TRUE(gd.ok());
-    const auto until = std::chrono::steady_clock::now() + 30s;
     bool seen = false;
-    for (; !seen && std::chrono::steady_clock::now() < until;) {
+    for (int attempt = 0; !seen && attempt < 100'000; ++attempt) {   // hard cap; each attempt is three blocking reads
         const auto a = lt.getAndWait(claimRow("rs-a"));
         const auto b = lt.getAndWait(claimRow("rs-b"));
         const auto d = lt.getAndWait(claimRow("rs-d"));
         seen = a.has_value() && a->a == 99 && !b.has_value() && d.has_value();
-        if (!seen) std::this_thread::sleep_for(2ms);
+        if (!seen) std::this_thread::yield();
     }
     ASSERT_TRUE(seen) << "the lease view never showed the changes made while the watch was closed";
 
