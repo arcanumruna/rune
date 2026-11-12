@@ -310,9 +310,8 @@ that worker: its `NotAuthorized` follows its last `Records` frame, and nothing f
 enforcement is not confirmed within `RUNE_SECURITY_GATE_DEADLINE_MS` (default 5 000) is answered `Internal`
 "committed at offset N; enforcement on this broker not confirmed" (the change is committed; a retry with
 the same request id by the same principal returns its result; a different principal that sends that id is
-answered `requestId reused for a different statement` (or its own denial, if it may not run the statement) and
-never the recorded result, so whether an id is recorded is visible to a principal that guesses it; ids are a
-random 64-bit client instance id plus a counter. A retry that spans a rolling upgrade is answered the same way,
+processed as a new request of its own, so whether an id is recorded is not visible to another principal; ids are a
+random 64-bit client instance id plus a counter. A retry that spans a rolling upgrade is answered `requestId reused for a different statement`,
 since the request fingerprint now includes the authenticated principal, issue #221). The OK does not mean every
 broker enforces it.
 Other brokers

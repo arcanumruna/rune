@@ -823,7 +823,7 @@ TEST(NamespaceCatalogV2Regression, RequestIdDedupeSpansNamespaceKindsRegression)
     e.principal.requestId = rc::RequestId{7, 8};
     e.principal.requestFingerprint = 99;
     ASSERT_TRUE(r.go(e).has_value());
-    const auto rec = r.s.request(rc::RequestId{7, 8});
+    const auto rec = r.s.requestOfAnyPrincipal(rc::RequestId{7, 8});
     ASSERT_TRUE(rec.has_value());
     EXPECT_EQ(rec->kind, rc::EventKind::NamespaceCreated);
     EXPECT_EQ(rec->requestFingerprint, 99u);

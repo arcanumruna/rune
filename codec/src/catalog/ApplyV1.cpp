@@ -456,7 +456,7 @@ std::optional<std::string> topicConfigError(const TopicConfig& c) {
 std::expected<Staged, ApplyError> ApplyV1::run(const CatalogState& s, const CatalogEvent& e, int64_t offset) {
     if (auto v = wire::validateEvent(e))
         return fail(offset, Code::BadOps, prefix(e) + "invalid event: " + std::string(encodeErrorName(*v)));
-    if (!e.principal.requestId.none() && s.request(e.principal.requestId))
+    if (!e.principal.requestId.none() && s.request(e.principal.authenticated, e.principal.requestId))
         return fail(offset, Code::Precondition, prefix(e) + "requestId " + std::to_string(e.principal.requestId.hi) + ":" +
                                                     std::to_string(e.principal.requestId.lo) + " is already applied");
     return std::visit([&](const auto& o) -> Result {
@@ -540,7 +540,8 @@ Applied ApplyV1::commit(CatalogState& s, const CatalogEvent& e, int64_t offset, 
     }, std::move(st));
 
     s.appliedOffset_ = offset;
-    if (!e.principal.requestId.none()) s.requests_.emplace(e.principal.requestId, r);
+    if (!e.principal.requestId.none())
+        s.requests_[e.principal.requestId].push_back(CatalogState::RequestEntry{e.principal.authenticated, r});
     return a;
 }
 

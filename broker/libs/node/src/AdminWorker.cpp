@@ -1028,7 +1028,7 @@ void AdminWorker::startNext_(int64_t nowNs) {
     // 3. Dedupe (F14) on (requestId, statement fingerprint).
     const uint64_t fp = requestFingerprint(req);
     if (!meta.requestId.none()) {
-        if (const auto rec = state.request(meta.requestId)) {
+        if (const auto rec = state.request(meta.authenticated, meta.requestId)) {
             if (rec->requestFingerprint == fp) {
                 answerOk_(req, *rec);   // a retry of a committed DDL: its ORIGINAL result
             } else if (const auto* denied = std::get_if<NamespaceDdlMsg>(&req);
@@ -1216,7 +1216,8 @@ bool AdminWorker::advance_(int64_t nowNs) {
         // The answer is what the applied event recorded.
         const DdlMeta& meta = metaOf(a->req);
         std::optional<cat::RequestRecord> rec =
-            meta.requestId.none() ? recordOfLastApplied_(a->offset) : applier_.state().request(meta.requestId);
+            meta.requestId.none() ? recordOfLastApplied_(a->offset)
+                                  : applier_.state().request(meta.authenticated, meta.requestId);
         DdlRequest req = std::move(a->req);
         const int64_t offset = a->offset;
         inFlight_ = Idle{};

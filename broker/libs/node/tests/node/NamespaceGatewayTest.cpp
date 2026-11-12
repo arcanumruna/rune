@@ -418,9 +418,10 @@ TEST(NamespaceGatewayRegression, OwnPasswordQualifiedNameAdversarialRegression) 
     EXPECT_NE(foreign.errorCode, kOk) << foreign.detail;
 }
 
-// #639 (won't-fix, lead D2): the requestId dedupe is global across namespaces, but the request fingerprint includes
-// the namespace, so a colliding id from another tenant is refused as "requestId reused" and never answered with the
-// first tenant's result.  Pins the no-leak property.
+// #639 / #221: the DDL requestId dedupe is keyed by (principal, requestId), so a colliding id from ANOTHER tenant is a
+// new request of its own, never answered with the first tenant's result.  Pins the no-leak property: bravo's request
+// runs as bravo's (its own topic, its own id), alpha's is untouched, and alpha re-sending its id still gets its first
+// result back.
 TEST(NamespaceGatewayRegression, CrossNamespaceRequestIdReuseNeverLeaksResultRegression) {
     NsGw g;
     AuthRig& r = g.r;
@@ -431,19 +432,23 @@ TEST(NamespaceGatewayRegression, CrossNamespaceRequestIdReuseNeverLeaksResultReg
     const int64_t sb = r.login("bravo/tb");
     const rune::protocol::RequestId rid{0x639, 0x639};
     const auto send = [&](int64_t sid) {
-        return r.c().awaitAnyDdlAnswer(
+        return r.c().awaitDefine(
             r.c().sendDefineTopic(r.ch(), r.stream(), sid, "t", 1, authRigCharBlob(), 0, rid, 0, authRigTopicConfig()),
             AuthRig::dl(20));
     };
     const auto a = send(sa);
     ASSERT_TRUE(a.has_value());
-    ASSERT_EQ(a->code, kOk) << a->message;
+    ASSERT_EQ(a->errorCode, kOk);
     const auto b = send(sb);
     ASSERT_TRUE(b.has_value());
-    EXPECT_EQ(b->code, 39) << "bravo's colliding requestId must be refused, never answered with alpha's result";
-    EXPECT_NE(b->message.find("requestId reused"), std::string::npos) << b->message;
+    EXPECT_EQ(b->errorCode, kOk) << "bravo's request with the colliding id is its own request";
+    EXPECT_NE(b->topicId, a->topicId) << "bravo's answer is bravo's own topic, never alpha's result";
     EXPECT_EQ(r.defineTopic(g.root, "alpha/t"), -1) << "alpha's topic exists";
-    EXPECT_GE(r.defineTopic(g.root, "bravo/t"), 0) << "bravo has no topic t (the refused request created nothing)";
+    EXPECT_EQ(r.defineTopic(g.root, "bravo/t"), -1) << "bravo's topic exists";
+    const auto again = send(sa);
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(again->errorCode, kOk);
+    EXPECT_EQ(again->topicId, a->topicId) << "alpha re-sending its id gets its own first result again";
 }
 
 // #637 (lead D5): group names that look qualified.  Groups are scoped into the session's namespace by

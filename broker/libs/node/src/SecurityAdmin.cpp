@@ -321,6 +321,9 @@ bool reservedPrincipalName(std::string_view n) noexcept {
 } // namespace
 
 namespace {
+/// The authenticated principal a Bootstrap event carries (D3); its nonce dedupe looks the record up under it.
+constexpr std::string_view kBootstrapPrincipal = "bootstrap";
+
 /// The Principal of an event from the request's meta.
 sec::Principal principalOf(const DdlMeta& meta, std::string authenticated, uint64_t fingerprint) {
     sec::Principal p;
@@ -483,7 +486,7 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
     // of an applied request gets its original result even when the gateway now denies it (the first attempt changed
     // what the check reads: the password the retry is proven with, the ADMIN it needed).
     if (!m.meta.requestId.none()) {
-        if (const auto rec = state.request(m.meta.requestId)) {
+        if (const auto rec = state.request(m.meta.authenticated, m.meta.requestId)) {
             if (rec->requestFingerprint == fp) {
                 answer_(req, kOK, {}, rec->objectId, rec->newVersion, rec->offset);   // a retry: its ORIGINAL result
             } else if (m.proofChecked != 0) {
@@ -729,7 +732,7 @@ void SecurityAdmin::startBootstrap_(const SecurityBootstrapMsg& m, int64_t nowNs
     sec::RequestId rid;
     std::memcpy(&rid.hi, m.nonce.data(), 8);
     std::memcpy(&rid.lo, m.nonce.data() + 8, 8);
-    if (const auto rec = state.request(rid)) {
+    if (const auto rec = state.request(kBootstrapPrincipal, rid)) {
         if (rec->requestFingerprint == fp) answer_(req, kOK, {}, rec->objectId, rec->newVersion, rec->offset);
         else answer_(req, kInvalidRequest, "requestId reused for a different statement");
         return;
@@ -751,7 +754,7 @@ void SecurityAdmin::startBootstrap_(const SecurityBootstrapMsg& m, int64_t nowNs
     e.objectId = state.nextObjectId();
     e.prevVersion = 0;
     e.newVersion = 1;
-    e.principal = principalOf(m.meta, "bootstrap", fp);   // D3
+    e.principal = principalOf(m.meta, std::string{kBootstrapPrincipal}, fp);   // D3
     e.principal.requestId = rid;
     e.timestampMs = wallClockMs();
     (void)appendEvent_(req, std::move(e), nowNs);

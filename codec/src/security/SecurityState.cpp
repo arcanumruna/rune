@@ -62,10 +62,21 @@ std::vector<uint64_t> SecurityState::nsAdminOf(uint32_t nsId, std::string_view n
     return out;
 }
 
-std::optional<RequestRecord> SecurityState::request(const RequestId& id) const {
+std::optional<RequestRecord> SecurityState::request(std::string_view principal, const RequestId& id) const {
     auto it = requests_.find(id);
     if (it == requests_.end()) return std::nullopt;
-    return it->second;
+    for (const RequestEntry& en : it->second)
+        if (en.principal == principal) return en.rec;
+    return std::nullopt;
+}
+
+std::optional<RequestRecord> SecurityState::requestOfAnyPrincipal(const RequestId& id) const {
+    auto it = requests_.find(id);
+    if (it == requests_.end()) return std::nullopt;
+    const RequestEntry* best = nullptr;
+    for (const RequestEntry& en : it->second)
+        if (!best || en.rec.offset < best->rec.offset) best = &en;
+    return best ? std::optional<RequestRecord>(best->rec) : std::nullopt;
 }
 
 SecurityState SecurityState::cloneWithoutRequests() const {

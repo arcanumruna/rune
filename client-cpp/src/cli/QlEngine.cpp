@@ -701,7 +701,7 @@ std::optional<cat::RequestRecord> awaitOwnWrite(rc::Client& c, const cat::Reques
             }
             return std::nullopt;
         },
-        [&] { return reader.state().request(rid); }, steadyNowMs,
+        [&] { return reader.state().requestOfAnyPrincipal(rid); }, steadyNowMs,
         [] { std::this_thread::sleep_for(std::chrono::milliseconds(20)); }, deadline, why);
 }
 
@@ -937,7 +937,7 @@ bool QlRun::awaitLastSecurityDdl() {
             lastErrorCode = r.error().brokerErrorCode;
             break;
         }
-        if (reader.state().request(*lastSecurityDdl)) return true;
+        if (reader.state().requestOfAnyPrincipal(*lastSecurityDdl)) return true;
         if (steadyNowMs() >= deadline) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }

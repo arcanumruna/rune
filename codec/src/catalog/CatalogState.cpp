@@ -80,11 +80,23 @@ std::vector<const ViewObject*> CatalogState::views() const {
     for (const auto& [id, v] : views_) out.push_back(&v);
     return out;
 }
-std::optional<RequestRecord> CatalogState::request(const RequestId& requestId) const {
+std::optional<RequestRecord> CatalogState::request(std::string_view principal, const RequestId& requestId) const {
     if (requestId.none()) return std::nullopt;
     auto it = requests_.find(requestId);
     if (it == requests_.end()) return std::nullopt;
-    return it->second;
+    for (const RequestEntry& en : it->second)
+        if (en.principal == principal) return en.rec;
+    return std::nullopt;
+}
+
+std::optional<RequestRecord> CatalogState::requestOfAnyPrincipal(const RequestId& requestId) const {
+    if (requestId.none()) return std::nullopt;
+    auto it = requests_.find(requestId);
+    if (it == requests_.end()) return std::nullopt;
+    const RequestEntry* best = nullptr;
+    for (const RequestEntry& en : it->second)
+        if (!best || en.rec.offset < best->rec.offset) best = &en;
+    return best ? std::optional<RequestRecord>(best->rec) : std::nullopt;
 }
 
 uint64_t layeredFingerprint(const TopicObject& t) noexcept {

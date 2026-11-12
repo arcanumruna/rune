@@ -903,7 +903,7 @@ int cmdReplay(const std::vector<std::string>& args, std::ostream& out, std::ostr
                 return 1;
             }
             // A rerun after a crash: this step already applied (same request id) — its original result stands.
-            auto done = reader.state().request(rid);
+            auto done = reader.state().requestOfAnyPrincipal(rid);
             if (done) {
                 ++deduplicated;
             } else {

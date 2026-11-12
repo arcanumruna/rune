@@ -184,10 +184,35 @@ TEST(SecurityApplyV1Regression, RequestIdsAreRecordedWithTheirFingerprint) {
     auto e = sc.make(rs::CreateUserOps{v(1)}, "ws1");
     e.principal.requestId = {.hi = 7, .lo = 9}; e.principal.requestFingerprint = 0xABCD;
     ASSERT_TRUE(rs::apply(sc.s, e, 0).has_value());
-    auto rec = sc.s.request({7, 9});
+    auto rec = sc.s.requestOfAnyPrincipal({7, 9});
     ASSERT_TRUE(rec.has_value());
     EXPECT_EQ(rec->offset, 0); EXPECT_EQ(rec->requestFingerprint, 0xABCDu); EXPECT_EQ(rec->kind, rs::EventKind::CreateUser);
-    EXPECT_FALSE(sc.s.request({1, 1}).has_value());
+    EXPECT_FALSE(sc.s.requestOfAnyPrincipal({1, 1}).has_value());
+}
+
+TEST(SecurityApplyV1Regression, TwoPrincipalsMayRecordTheSameRequestIdRegression) {
+    Script sc;
+    const rs::RequestId rid{7, 9};
+    auto e1 = sc.make(rs::CreateUserOps{v(1)}, "x");
+    e1.principal.authenticated = "a"; e1.principal.requestId = rid; e1.principal.requestFingerprint = 0xA1;
+    ASSERT_TRUE(rs::apply(sc.s, e1, sc.offset++).has_value());
+    auto e2 = sc.make(rs::CreateUserOps{v(2)}, "y");
+    e2.principal.authenticated = "b"; e2.principal.requestId = rid; e2.principal.requestFingerprint = 0xB2;
+    ASSERT_TRUE(rs::apply(sc.s, e2, sc.offset++).has_value());
+    const auto ra = sc.s.request("a", rid);
+    const auto rb = sc.s.request("b", rid);
+    ASSERT_TRUE(ra.has_value()); ASSERT_TRUE(rb.has_value());
+    EXPECT_EQ(ra->offset, 0); EXPECT_EQ(ra->requestFingerprint, 0xA1u);
+    EXPECT_EQ(rb->offset, 1); EXPECT_EQ(rb->requestFingerprint, 0xB2u);
+    EXPECT_FALSE(sc.s.request("c", rid).has_value());
+    ASSERT_TRUE(sc.s.requestOfAnyPrincipal(rid).has_value());
+    EXPECT_EQ(sc.s.requestOfAnyPrincipal(rid)->offset, 0) << "the lowest offset";
+    // __security has no 'already applied' refusal: a repeat by the same principal applies, the first record wins.
+    auto e3 = sc.make(rs::CreateUserOps{v(3)}, "z");
+    e3.principal.authenticated = "a"; e3.principal.requestId = rid; e3.principal.requestFingerprint = 0xC3;
+    ASSERT_TRUE(rs::apply(sc.s, e3, sc.offset++).has_value());
+    EXPECT_EQ(sc.s.request("a", rid)->offset, 0);
+    EXPECT_EQ(sc.s.request("a", rid)->requestFingerprint, 0xA1u);
 }
 
 TEST(SecurityStateRegression, CloneWithoutRequestsDropsOnlyTheDedupeTableRegression) {
@@ -205,10 +230,10 @@ TEST(SecurityStateRegression, CloneWithoutRequestsDropsOnlyTheDedupeTableRegress
     for (uint64_t i = 4; i <= kApplied; ++i)
         applyWithRid(rs::CreateUserOps{v(static_cast<uint8_t>(i))}, "u" + std::to_string(i), i);
     applyWithRid(rs::DropUserOps{}, "u4", kApplied + 1);   // a tombstone too
-    ASSERT_TRUE(sc.s.request({3, 4}).has_value());
+    ASSERT_TRUE(sc.s.requestOfAnyPrincipal({3, 4}).has_value());
     const rs::SecurityState c = sc.s.cloneWithoutRequests();
-    EXPECT_FALSE(c.request({3, 4}).has_value()) << "an applied requestId is not in the clone";
-    EXPECT_FALSE(c.request({1, 2}).has_value());
+    EXPECT_FALSE(c.requestOfAnyPrincipal({3, 4}).has_value()) << "an applied requestId is not in the clone";
+    EXPECT_FALSE(c.requestOfAnyPrincipal({1, 2}).has_value());
     EXPECT_EQ(c.appliedOffset(), sc.s.appliedOffset());
     EXPECT_EQ(c.hasSecurityAdmin(), sc.s.hasSecurityAdmin());
     EXPECT_TRUE(c.hasSecurityAdmin());

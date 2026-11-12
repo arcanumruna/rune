@@ -248,9 +248,15 @@ Applied ApplyV1::commit(SecurityState& s, const SecurityEvent& e, int64_t offset
     }, st.change);
     if (const auto* b = std::get_if<BootstrapOps>(&e.ops); b && !s.fakeSaltSeed_) s.fakeSaltSeed_ = b->fakeSaltSeed;   // D8: the first one wins
     s.appliedOffset_ = offset;
-    if (!e.principal.requestId.none())
-        s.requests_.try_emplace(e.principal.requestId,
-                                RequestRecord{offset, e.kind, e.objectId, e.newVersion, e.principal.requestFingerprint});
+    if (!e.principal.requestId.none()) {   // first one wins, per (principal, id)
+        auto& entries = s.requests_[e.principal.requestId];
+        const bool have = std::any_of(entries.begin(), entries.end(),
+                                      [&](const SecurityState::RequestEntry& en) { return en.principal == e.principal.authenticated; });
+        if (!have)
+            entries.push_back(SecurityState::RequestEntry{
+                e.principal.authenticated,
+                RequestRecord{offset, e.kind, e.objectId, e.newVersion, e.principal.requestFingerprint}});
+    }
     return std::move(st.applied);
 }
 

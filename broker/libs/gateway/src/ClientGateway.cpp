@@ -11047,11 +11047,13 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
         // may lag the leader by an apply, so a retry can also look new: then it is still answered right, only charged
         // once on the throttle.
         bool knownRetry = false;
-        if (!m.ext.requestId.none() && securityView_ != nullptr)
-            if (const auto rec = securityView_->state().request(m.ext.requestId))
-                knownRetry = rec->requestFingerprint ==   // #221: the principal the leader will see in meta.authenticated
-                             rune::gateway::securityDdlFingerprint(
-                                 m, ddlMetaOf_(&m.ext, m.sessionId, *session, 0).authenticated);
+        if (!m.ext.requestId.none() && securityView_ != nullptr) {
+            // #221: the record is per principal - the one the leader will see in meta.authenticated.
+            const auto retryMeta = ddlMetaOf_(&m.ext, m.sessionId, *session, 0);
+            if (const auto rec = securityView_->state().request(retryMeta.authenticated, m.ext.requestId))
+                knownRetry = rec->requestFingerprint ==
+                             rune::gateway::securityDdlFingerprint(m, retryMeta.authenticated);
+        }
         if (!ownPassword) denial = std::move(admin);
         else if (admin) {
             proofChecked = true;

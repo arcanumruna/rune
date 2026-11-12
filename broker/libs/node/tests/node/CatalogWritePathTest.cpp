@@ -98,13 +98,15 @@ TEST(CatalogWritePathRegression, RequestIdReusedForADifferentStatementIsInvalidR
     EXPECT_EQ(rig.admin().startedCount(), rig.admin().answeredCount());
 }
 
-// #221: the dedupe fingerprint includes the authenticated principal - a request id is never reusable across principals.
+// #221: the recorded request ids are per principal - a principal that sends an id another principal recorded is
+// answered as for a fresh id (here: the topic exists), never "requestId reused", and never the other's result.
 TEST(CatalogWritePathRegression, CatalogDedupeIsPerPrincipalRegression) {
     CatalogDdlRig rig("wp_dedupe_principal", 3);
     rig.becomeServingLeader();
     const rune::protocol::RequestId rid{.hi = 0xC11E, .lo = 221};
-    const auto defineAs = [&](const char* name, int32_t parts, const char* who) {
-        return rig.define({.name = name, .partitions = parts, .typed = true, .requestId = rid, .authenticated = who});
+    const auto defineAs = [&](const char* name, int32_t parts, const char* who,
+                              rune::protocol::RequestId id = {.hi = 0xC11E, .lo = 221}) {
+        return rig.define({.name = name, .partitions = parts, .typed = true, .requestId = id, .authenticated = who});
     };
     const auto a = defineAs("t", 1, "alice");
     ASSERT_EQ(a.code, 0) << a.detail;
@@ -113,42 +115,60 @@ TEST(CatalogWritePathRegression, CatalogDedupeIsPerPrincipalRegression) {
     EXPECT_EQ(again.topicId, a.topicId);
     EXPECT_EQ(again.version, a.version);
     const auto b = defineAs("t", 1, "bob");
-    EXPECT_EQ(b.code, 39);
-    EXPECT_EQ(b.detail, "requestId reused for a different statement");
-    EXPECT_NE(b.topicId, a.topicId) << "never A's result";
+    const auto bFresh = defineAs("t", 1, "bob", {.hi = 0xC11E, .lo = 2210});
+    EXPECT_EQ(b.code, 25) << b.detail;
+    EXPECT_EQ(b.code, bFresh.code);
+    EXPECT_EQ(b.detail, bFresh.detail);
+    EXPECT_NE(b.detail, "requestId reused for a different statement");
+    EXPECT_EQ(rig.recordedLog().size(), 1u) << "the refused request appended nothing";
+    const auto b2 = defineAs("u", 1, "bob");
+    EXPECT_EQ(b2.code, 0) << b2.detail << " (bob's request with alice's id is a new request of his own)";
+    const auto aRetry = defineAs("t", 1, "alice");
+    EXPECT_EQ(aRetry.code, 0) << aRetry.detail;
+    EXPECT_EQ(aRetry.topicId, a.topicId) << "alice still gets her original result";
     const auto log = rig.recordedLog();
-    ASSERT_EQ(log.size(), 1u) << "exactly one event for the request id";
+    ASSERT_EQ(log.size(), 2u);
     EXPECT_EQ(log[0].event.principal.authenticated, "alice");
+    EXPECT_EQ(log[1].event.principal.authenticated, "bob");
 }
 
-TEST(CatalogWritePathRegression, AnotherPrincipalLearnsNothingFromARecordedRequestIdRegression) {
+// A statement by B with an id A recorded is answered exactly like the same statement with a fresh id, for an allowed
+// and for a denied B: whether an id is recorded is not visible to another principal.
+TEST(CatalogWritePathRegression, ARecordedIdOfAnotherPrincipalAnswersLikeAFreshIdRegression) {
     CatalogDdlRig rig("wp_dedupe_nothing", 3);
     rig.becomeServingLeader();
     const rune::protocol::RequestId rid{.hi = 0xC11E, .lo = 222};
-    const auto defineAs = [&](const char* name, int32_t parts, const char* who) {
-        return rig.define({.name = name, .partitions = parts, .typed = true, .requestId = rid, .authenticated = who});
-    };
-    const auto a = defineAs("t", 1, "alice");
+    const auto a = rig.define({.name = "t", .partitions = 1, .typed = true, .requestId = rid, .authenticated = "alice"});
     ASSERT_EQ(a.code, 0) << a.detail;
-    // B guesses A's statement, then a different valid one on the same id: the two answers are identical.
-    const auto guess = defineAs("t", 1, "bob");
-    const auto miss = defineAs("u", 2, "bob");
-    EXPECT_EQ(guess.code, miss.code);
-    EXPECT_EQ(guess.detail, miss.detail);
-    EXPECT_EQ(guess.topicId, miss.topicId);
-    EXPECT_EQ(guess.version, miss.version);
-    EXPECT_EQ(guess.objectId, miss.objectId);
-    EXPECT_EQ(guess.gateTopicId, miss.gateTopicId);
-    EXPECT_EQ(guess.fingerprint, miss.fingerprint);
-    for (const auto* r : {&guess, &miss}) {
-        EXPECT_EQ(r->code, 39);
-        EXPECT_EQ(r->detail, "requestId reused for a different statement");
-        EXPECT_NE(r->topicId, a.topicId);
-        EXPECT_EQ(r->version, 0u);
-        EXPECT_EQ(r->objectId, 0u);
-    }
-    EXPECT_EQ(rig.recordedLog().size(), 1u);
-    EXPECT_EQ(rig.recordedLog()[0].event.principal.authenticated, "alice");
+    const auto onRecorded =
+        rig.define({.name = "t", .partitions = 1, .typed = true, .requestId = rid, .authenticated = "bob"});
+    const auto onFresh = rig.define({.name = "t", .partitions = 1, .typed = true,
+                                     .requestId = {.hi = 0xC11E, .lo = 2220}, .authenticated = "bob"});
+    EXPECT_EQ(onRecorded.code, onFresh.code);
+    EXPECT_EQ(onRecorded.detail, onFresh.detail);
+    EXPECT_EQ(onRecorded.topicId, onFresh.topicId);
+    EXPECT_EQ(onRecorded.version, onFresh.version);
+    EXPECT_EQ(onRecorded.objectId, onFresh.objectId);
+    EXPECT_EQ(onRecorded.code, 25) << "TopicExists, not 'requestId reused'";
+    EXPECT_NE(onRecorded.detail, "requestId reused for a different statement");
+    // The denied case (a namespace DDL carries its denial to the leader).
+    auto mA = rig.namespaceMsg(1, "nsa", {}, {}, rid);
+    mA.meta.authenticated = "carol";
+    const auto ca = rig.submitRaw(rune::node::DdlRequest{mA});
+    ASSERT_EQ(ca.code, 0) << ca.detail;
+    auto mB = rig.namespaceMsg(1, "nsa", {}, {}, rid);
+    mB.meta.authenticated = "dave";
+    mB.denial = "not authorized: ADMIN on CLUSTER";
+    auto mFresh = rig.namespaceMsg(1, "nsa", {}, {});
+    mFresh.meta.authenticated = "dave";
+    mFresh.denial = mB.denial;
+    const auto deniedRecorded = rig.submitRaw(rune::node::DdlRequest{mB});
+    const auto deniedFresh = rig.submitRaw(rune::node::DdlRequest{mFresh});
+    EXPECT_EQ(deniedRecorded.code, deniedFresh.code);
+    EXPECT_EQ(deniedRecorded.detail, deniedFresh.detail);
+    EXPECT_EQ(deniedRecorded.code, 45);
+    EXPECT_EQ(deniedRecorded.detail, mB.denial);
+    EXPECT_EQ(rig.recordedLog().size(), 2u) << "alice's topic and carol's namespace only";
 }
 
 // B, whose verdict is a denial (only a namespace DDL carries one to the leader), asks with A's recorded id: the same
