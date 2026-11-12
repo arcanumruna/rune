@@ -4,6 +4,7 @@
 #include <rune/node/SecurityAdmin.h>
 
 #include <rune/catalog/CatalogFingerprint.h>
+#include <rune/catalog/TopicName.h>
 #include <rune/catalog/CatalogState.h>
 #include <rune/catalog/NamespaceRegistry.h>
 #include <rune/catalog/NsName.h>
@@ -332,22 +333,56 @@ sec::Principal principalOf(const DdlMeta& meta, std::string authenticated, uint6
     return p;
 }
 
-/// Review C I1 (D10): `__security` is never compacted and readable by every ADMIN forever, so the leader is the last line
-/// of defence for a password literal.  True when `statement` has a PASSWORD keyword (any case) followed by a quoted
-/// literal (' " or $$) that is not exactly '<redacted>'.  Cold path.
-bool statementHasUnredactedPassword(std::string_view statement) {
-    constexpr std::string_view kWord = "PASSWORD", kRedacted = "'<redacted>'";
-    for (std::size_t i = 0; i + kWord.size() <= statement.size(); ++i) {
-        bool match = true;
-        for (std::size_t k = 0; k < kWord.size() && match; ++k)
-            match = std::toupper(static_cast<unsigned char>(statement[i + k])) == kWord[k];
-        if (!match) continue;
-        std::size_t j = i + kWord.size();
-        while (j < statement.size() && std::isspace(static_cast<unsigned char>(statement[j]))) ++j;
-        if (j >= statement.size()) continue;
-        const char q = statement[j];
-        if (q != '\'' && q != '"' && q != '$') continue;
-        if (statement.substr(j, kRedacted.size()) != kRedacted) return true;
+/// Review C I1 (D10) / #229: `__security` is never compacted and readable by every ADMIN forever.  The recorded text is
+/// rendered from the op (#228), but the client's text still feeds the stored request fingerprint, so the leader stays
+/// the last line of defence - for the ops that carry a verifier only (CreateUser; AlterUser AddPassword / SetPassword,
+/// the same predicate the wire decode uses).  Every other op never has its text judged.  For those, true when the text
+/// holds a quoted literal ('..' or ".." with a doubled quote as escape, or $$..$$) that is not exactly '<redacted>'
+/// and is not the user's own name (full or local part, as the content or in the renderers' escaped, quoted form).
+/// An unterminated literal counts as one.  Cold path.
+std::string quotedForm(std::string_view n) {
+    std::string out = "'";
+    for (const char c : rune::catalog::escapeNameForLog(n)) { out += c; if (c == '\'') out += '\''; }
+    return out + "'";
+}
+
+bool statementMayCarryASecret(const SecurityDdlMsg& m) {
+    const bool hasVerifier = m.kind == 1 || (m.kind == 2 && (m.change == 0 || m.change == 2));
+    if (!hasVerifier) return false;
+    const std::string_view st = m.meta.statement;
+    const std::string_view full = m.name;
+    const auto slash = full.find('/');
+    const std::string_view local = slash == std::string_view::npos ? full : full.substr(slash + 1);
+    const std::string quotedFull = quotedForm(full), quotedLocal = quotedForm(local);
+    std::size_t i = 0;
+    while (i < st.size()) {
+        const char q = st[i];
+        if (q == '$' && i + 1 < st.size() && st[i + 1] == '$') {
+            const auto end = st.find("$$", i + 2);
+            if (end == std::string_view::npos) return true;
+            const std::string_view content = st.substr(i + 2, end - i - 2);
+            if (content != full && content != local) return true;
+            i = end + 2;
+        } else if (q == '\'' || q == '"') {
+            std::string content;
+            std::size_t j = i + 1;
+            bool closed = false;
+            while (j < st.size()) {
+                if (st[j] == q) {
+                    if (j + 1 < st.size() && st[j + 1] == q) { content += q; j += 2; continue; }
+                    closed = true;
+                    break;
+                }
+                content += st[j++];
+            }
+            if (!closed) return true;
+            const std::string_view raw = st.substr(i, j + 1 - i);
+            if (raw != "'<redacted>'" && raw != quotedFull && raw != quotedLocal && content != full && content != local)
+                return true;
+            i = j + 1;
+        } else {
+            ++i;
+        }
     }
     return false;
 }
@@ -439,7 +474,7 @@ GuardVerdict nsGuard(const CallerPerms& caller, uint32_t targetNsId, const Secur
 
 void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRequest& req) {
     const sec::SecurityState& state = applier_.state();
-    if (statementHasUnredactedPassword(m.meta.statement)) {
+    if (statementMayCarryASecret(m)) {
         answer_(req, kInvalidRequest, "the statement carries a password literal; the client must send the redacted statement (D10)");
         return;
     }

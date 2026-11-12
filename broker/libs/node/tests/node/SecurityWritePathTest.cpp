@@ -412,6 +412,50 @@ TEST(SecurityWritePathRegression, AnUnredactedPasswordLiteralIsRefusedAndAppends
     EXPECT_EQ(rig.recordedEvents().size(), 3u);
 }
 
+// #229: the guard judges the literals of password-carrying statements only, and is not fooled by a keyword spelling.
+TEST(SecurityWritePathRegression, PasswordGuardAcceptsQuotedNamesAndRefusesOtherSyntaxesRegression) {
+    SecurityDdlRig rig("guard_syntax");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.ddl(rig.createUser("u", "a-long-password-1")).code, 0);
+    // Statements that carry no verifier are never refused, whatever words their quoted names hold.
+    auto g1 = rig.grant(false, sec::GranteeKind::User, "u", sec::Operation::Read, sec::ResourceType::Topic,
+                        sec::PatternKind::Exact, "world.password");
+    g1.meta = rig.meta("GRANT READ ON TOPIC 'world.password' TO USER u;");
+    EXPECT_EQ(rig.ddl(std::move(g1)).code, 0);
+    auto g2 = rig.grant(false, sec::GranteeKind::User, "u", sec::Operation::Write, sec::ResourceType::Topic,
+                        sec::PatternKind::Prefix, "app.password");
+    g2.meta = rig.meta("GRANT WRITE ON TOPIC PREFIX 'app.password' TO USER u;");
+    EXPECT_EQ(rig.ddl(std::move(g2)).code, 0);
+    // A verifier-carrying statement may hold the redacted marker and the user's own (quoted) name.
+    auto c1 = rig.createUser("pass-word", "a-long-password-1");
+    c1.meta = rig.meta("CREATE USER 'pass-word' PASSWORD '<redacted>';");
+    EXPECT_EQ(rig.ddl(std::move(c1)).code, 0);
+    auto c2 = rig.createUser("x", "a-long-password-1");
+    c2.meta = rig.meta("CREATE USER x PASSWORD '<redacted>';");
+    EXPECT_EQ(rig.ddl(std::move(c2)).code, 0);
+    auto a1 = rig.alterUser("x", Ch::SetPassword);
+    a1.verifier = SecurityDdlRig::verifierFor("another-long-pw-1");
+    a1.meta = rig.meta("ALTER USER x SET PASSWORD '<redacted>';");
+    EXPECT_EQ(rig.ddl(std::move(a1)).code, 0);
+    const auto before = rig.recordedEvents().size();
+    EXPECT_EQ(before, 6u);
+    const std::vector<std::string> bad = {
+        "CREATE USER x IDENTIFIED BY 'secret'",
+        "CREATE USER x PASSWORD\xC2\xA0'secret'",
+        "CREATE USER x PASSWORD $$secret$$",
+        "CREATE USER x PASSWORD \"secret\"",
+        "CREATE USER x PASSWORD 'sec''ret'",
+        "CREATE USER x PASSWORD 'unterminated",
+    };
+    for (const auto& stmt : bad) {
+        auto m = rig.createUser("x2", "a-long-password-1");
+        m.meta = rig.meta(stmt);
+        const auto a = rig.ddl(std::move(m));
+        EXPECT_EQ(a.code, kInvalidRequest) << stmt;
+    }
+    EXPECT_EQ(rig.recordedEvents().size(), before) << "nothing was appended";
+}
+
 TEST(SecurityWritePathRegression, PrincipalIsTheSessionsAuthenticatedUser) {
     SecurityDdlRig rig("principal");
     rig.becomeServingLeader();
