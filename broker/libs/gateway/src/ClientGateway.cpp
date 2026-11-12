@@ -11220,20 +11220,6 @@ uint16_t ClientGateway::viewRowGate_(int32_t viewTopicId, int32_t partition) con
 
 void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
 {
-    if (!workerPool_) {
-        // Task 8 fix round 1 (I5): a gated view answers its C1 code first.
-        if (const auto mo = pc::GetViewRow::decode(buf, len)) {
-            const uint16_t gate = viewRowGate_(mo->viewTopicId, 0);
-            if (gate != kViewRowNoGate) {
-                (void)rejectRequest_(buf, len, gate, "GetViewRow: view not served here (C1)");
-                return;
-            }
-        }
-        // No-hang (R2): no workers on this gateway — no view is servable here, a
-        // permanent condition: UnknownView (4), not the retriable NotReady.
-        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kUnknownView, "GetViewRow: no worker pool");
-        return;
-    }
     auto msgOpt = pc::GetViewRow::decode(buf, len);
     if (!msgOpt) {
         // No-hang (R2): answered ViewRowResponse{InvalidRequest (5)}.
@@ -11252,6 +11238,15 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
         if (deny_(*session, authorizeViewRead_(perms, m.viewTopicId), buf, len))
             return;
+
+    if (!workerPool_) {
+        // #219: authorized first, on every path; then the C1 gate (Task 8 fix round 1, I5), then "no view is servable
+        // here" (No-hang R2: a permanent condition, UnknownView (4), not the retriable NotReady).
+        const uint16_t gate = viewRowGate_(m.viewTopicId, 0);
+        (void)rejectRequest_(buf, len, gate != kViewRowNoGate ? gate : pc::ViewRowResponse::kUnknownView,
+                             gate != kViewRowNoGate ? "GetViewRow: view not served here (C1)" : "GetViewRow: no worker pool");
+        return;
+    }
 
     // #721: a view of a DELETING namespace is gone for readers, a root session included (one compare when none deletes).
     if (inDeletingNs_(m.viewTopicId)) [[unlikely]] {
@@ -11331,14 +11326,15 @@ Session* ClientGateway::checkedViewReadSession_(const uint8_t* buf, std::size_t 
         (void)rejectRequest_(buf, len, pc::ViewRowResponse::kInvalidRequest, "view read: client version below checked writes");
         return nullptr;
     }
+    if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
+        if (deny_(*session, authorizeViewRead_(perms, viewTopicId), buf, len))
+            return nullptr;
+    // #219: authorized first; only then the C1 gate / "no view is servable here" of a gateway without workers.
     if (!workerPool_) {
         const uint16_t gate = viewRowGate_(viewTopicId, 0);
         (void)rejectRequest_(buf, len, gate != kViewRowNoGate ? gate : pc::ViewRowResponse::kUnknownView, "view read: no worker pool");
         return nullptr;
     }
-    if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
-        if (deny_(*session, authorizeViewRead_(perms, viewTopicId), buf, len))
-            return nullptr;
     if (inDeletingNs_(viewTopicId)) [[unlikely]] {
         (void)rejectRequest_(buf, len, pc::ViewRowResponse::kUnknownView, "view read: namespace is being deleted");
         return nullptr;

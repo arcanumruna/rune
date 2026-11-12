@@ -118,6 +118,10 @@ std::vector<sec::GrantSpec> defaultGrants() {
             grant(sec::Operation::Write, sec::ResourceType::TransactionalId, "t")};
 }
 
+std::vector<rune::metadata::RoutingImage::BuildEntry> defaultImage() {
+    return {{rune::metadata::gpidOf(0, 0), 1, 1}, {rune::metadata::gpidOf(kPlaced, 0), 1, 1}};
+}
+
 struct Rig {
     TempDir                        dir;
     std::unique_ptr<TopicRegistry> registry;
@@ -132,15 +136,14 @@ struct Rig {
     bool dispatch = false;   // #603: send through the gateway's whole client-frame dispatch (the request gate included)
 
     explicit Rig(std::vector<sec::GrantSpec> grants = defaultGrants(),
-                 std::vector<rune::metadata::RoutingImage::BuildEntry> img = {{rune::metadata::gpidOf(0, 0), 1, 1},
-                                                                              {rune::metadata::gpidOf(kPlaced, 0), 1, 1}})
+                 std::vector<rune::metadata::RoutingImage::BuildEntry> img = defaultImage(), bool withPool = true)
           : pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16)
           , gw(ClientGateway::makeForTest([this](const uint8_t* b, std::size_t n) -> int64_t { onFrame(b, n); return 1; }, 1)) {
         rune::node::TopicSpec boot;
         boot.name = "w.boot"; boot.partitionCount = 1; boot.topicId = 0;
         registry = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{boot}, dir.path.string());
         gw.setTopicRegistry(registry.get());
-        gw.setWorkerPool(&pool);
+        if (withPool) gw.setWorkerPool(&pool);   // #219: false = a gateway without workers
         gw.setCommittedMetadataReady(true);
         gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build(img, rune::metadata::RoutingImage::Source::Committed));
         gw.setNodeIdForTest(1);
@@ -165,6 +168,9 @@ struct Rig {
                 break;
             case pc::TemplateId::ViewRowResponse:
                 if (auto r = pc::ViewRowResponse::decode(b, n)) answers.emplace_back(r->correlationId, static_cast<int16_t>(r->status));
+                break;
+            case pc::TemplateId::ScanViewRowsResponse:
+                if (auto r = pc::ScanViewRowsResponse::decode(b, n)) answers.emplace_back(r->correlationId, static_cast<int16_t>(r->status));
                 break;
             case pc::TemplateId::JoinGroupResponse:
                 if (auto r = pc::JoinGroupResponse::decode(b, n)) answers.emplace_back(r->correlationId, r->errorCode);
@@ -233,6 +239,26 @@ struct Rig {
         buf.resize(m.encode(buf.data()));
         if (dispatch) (void)gw.applyClientFrameForTest(buf.data(), buf.size());
         else gw.applyGetViewRowForTest(buf.data(), buf.size());
+        return m.correlationId;
+    }
+    int64_t getViewRowK(int32_t viewId) {
+        pc::GetViewRowK m;
+        m.sessionId = sid; m.correlationId = ++corr; m.viewTopicId = viewId; m.partition = -1; m.minOffset = -1;
+        const std::vector<uint8_t> key{1, 0, 0, 0, 0, 0, 0, 0};
+        m.key = key;
+        std::vector<uint8_t> buf(m.encodedSize());
+        m.encode(buf.data());
+        gw.applyGetViewRowKForTest(buf.data(), buf.size());
+        return m.correlationId;
+    }
+    int64_t scanViewRows(int32_t viewId) {
+        pc::ScanViewRows m;
+        m.sessionId = sid; m.correlationId = ++corr; m.viewTopicId = viewId; m.limit = 0;
+        const std::vector<uint8_t> prefix{1};   // a prefix of length 0 does not decode
+        m.prefix = prefix;
+        std::vector<uint8_t> buf(m.encodedSize());
+        m.encode(buf.data());
+        gw.applyScanViewRowsForTest(buf.data(), buf.size());
         return m.correlationId;
     }
     static std::span<const uint8_t> bytes(std::string_view s) { return {reinterpret_cast<const uint8_t*>(s.data()), s.size()}; }
@@ -635,4 +661,34 @@ TEST(SecurityBehindGatewayRegression, AnInProcessGatewayIgnoresTheFlagRegression
     const auto code = r.codeOf(r.produce(0));
     EXPECT_TRUE(!code.has_value() || *code != kAuthUnavailable);
     EXPECT_EQ(r.gw.securityBehindRefusals(), 0u);
+}
+
+// #219: on a gateway WITHOUT a worker pool the three view reads answered the C1 gate (or "no view is servable here")
+// before the session's READ was checked, so a caller without READ told a hidden view (gate code) from a missing id.
+// Authorization comes first on every path; only then the gate.
+TEST(GetViewRowAuthRegression, NoPoolPathAuthorizesBeforeTheGateRegression) {
+    // The sink id is Dropped (the gate answers UnknownView); a never-defined id has no gate at all.  (A placed-but-not-
+    // applied id answers the retriable apply-window verdict on the pooled path too, by design: not tested here.)
+    Rig r(std::vector<sec::GrantSpec>{}, defaultImage(), /*withPool=*/false);
+    ASSERT_TRUE(r.registry->dropTopic(kPlaced));
+    const std::vector<std::pair<const char*, std::function<int64_t(int32_t)>>> reads = {
+        {"GetViewRow",   [&](int32_t id) { return r.getViewRow(id); }},
+        {"GetViewRowK",  [&](int32_t id) { return r.getViewRowK(id); }},
+        {"ScanViewRows", [&](int32_t id) { return r.scanViewRows(id); }}};
+    for (const auto& [what, read] : reads) {
+        const auto gated = r.codeOf(read(kPlaced));
+        const auto missing = r.codeOf(read(kMissing));
+        ASSERT_TRUE(gated.has_value()) << what << ": answered, never silent";
+        ASSERT_TRUE(missing.has_value()) << what;
+        EXPECT_EQ(*gated, kNotAuthorized) << what << ": no READ: the gated view answers NotAuthorized, not its gate code";
+        EXPECT_EQ(*gated, *missing) << what << ": a hidden view and a missing id answer alike";
+    }
+    // Control (non-vacuity): a principal WITH READ on the view gets the gate code, not NotAuthorized.
+    Rig granted(defaultGrants(), defaultImage(), /*withPool=*/false);
+    granted.gw.onCatalogObjectApplied(kPlaced, "w.z", false);
+    ASSERT_TRUE(granted.registry->dropTopic(kPlaced));
+    const auto unknownView = static_cast<int16_t>(pc::ViewRowResponse::kUnknownView);
+    EXPECT_EQ(granted.codeOf(granted.getViewRow(kPlaced)), unknownView);
+    EXPECT_EQ(granted.codeOf(granted.getViewRowK(kPlaced)), unknownView);
+    EXPECT_EQ(granted.codeOf(granted.scanViewRows(kPlaced)), unknownView);
 }
