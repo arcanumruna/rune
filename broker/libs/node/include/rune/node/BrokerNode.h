@@ -1831,6 +1831,8 @@ public:
     [[nodiscard]] int64_t securityAppliedOffsetOnControlForTest();
     /// The shipped permission epoch worker `w` holds for `sessionId` (0: none), read ON that worker's thread.
     [[nodiscard]] uint64_t workerPermissionEpochForTest(int32_t w, int64_t sessionId);
+    /// Permission binds worker `w` dropped because the session was unknown to it (read ON that worker's thread).
+    [[nodiscard]] uint64_t workerPermBindsUnknownSessionForTest(int32_t w);
     /// Shard-produce frames worker `w` admitted and has not yet answered (read ON that worker's thread): 0 once every
     /// received frame was answered (the broker-side answered == received).
     [[nodiscard]] std::size_t workerDirectAcksInFlightForTest(int32_t w);

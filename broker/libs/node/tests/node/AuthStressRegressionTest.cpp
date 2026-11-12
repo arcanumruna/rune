@@ -198,6 +198,15 @@ public:
         return o.str();
     }
 
+    /// Test seams (the keep-alive regression): register already-logged-in sessions, one per wire client, and run the
+    /// keep-alive helper alone.
+    void adoptSessionsForTest(const std::vector<int64_t>& sids) {
+        for (std::size_t i = 0; i < sids.size() && i < uw_.size(); ++i)
+            sess_.push_back({static_cast<int>(i / 3), &uw_[i]->raw(), uw_[i], sids[i], true});
+    }
+    void keepAllAliveForTest() { keepAllAlive_(); }
+    [[nodiscard]] const std::string& failureForTest() const noexcept { return fail_; }
+
 private:
     // ── names ──
     std::string user_(int u) const { return "s" + std::to_string(seed_) + "u" + std::to_string(u); }
@@ -218,9 +227,9 @@ private:
         auto& adm = rig_.broker().admin();
         const std::string ch = rig_.ch();
         const int64_t as = rig_.broker().adminSession();
-        keepRigAlive_();
-        for (int r = 0; r < 2; ++r) { model_.addRole(role_(r)); if (adm.createRole(ch, as, role_(r)).errorCode) failWith_("create role"); keepRigAlive_(); }
-        for (int u = 0; u < 2; ++u) { model_.addUser(user_(u)); if (adm.createUser(ch, as, user_(u), AuthRig::kPw).errorCode) failWith_("create user"); keepRigAlive_(); }
+        keepAllAlive_();
+        for (int r = 0; r < 2; ++r) { model_.addRole(role_(r)); if (adm.createRole(ch, as, role_(r)).errorCode) failWith_("create role"); keepAllAlive_(); }
+        for (int u = 0; u < 2; ++u) { model_.addUser(user_(u)); if (adm.createUser(ch, as, user_(u), AuthRig::kPw).errorCode) failWith_("create user"); keepAllAlive_(); }
         states_.push_back(model_);
         for (const std::string& t : topicNames_()) exists_[t] = -1;
         for (const std::string& t : {topicNames_()[0], topicNames_()[1], topicNames_()[3], topicNames_()[5]}) builderCreate_(t);
@@ -232,14 +241,31 @@ private:
         for (AuthWireClient* w : uw_) v.push_back(&w->raw());
         return v;
     }
-    /// The rig's admin and builder sessions are reaped after 10 s without a keepalive, and a wait on one wire client
-    /// (a login, a probe) pumps only that client: such waits pump these two as well.
-    void keepRigAlive_() {
-        for (const auto& [c, sid, who] : {std::tuple{&rig_.broker().admin().raw(), rig_.broker().adminSession(), "admin"},
-                                          std::tuple{&rig_.c(), rig_.builder, "builder"}}) {
+    /// Every session the model keeps alive is reaped by the gateway after 10 s without a keepalive, and a wait on ONE
+    /// wire client (a login, a probe) pumps only that client: such waits call this between slices of at most 500 ms, so
+    /// the rig's admin and builder sessions AND every live user session get their Keepalive (pollFor offers a due one).
+    void keepAllAlive_() {
+        const auto guard = [this](ShardTestClient* c, int64_t sid, const std::string& who) {
             if (const auto quiet = std::chrono::duration_cast<std::chrono::milliseconds>(c->silentFor(sid)); quiet > 8s)
-                failWith_(std::string("the rig's ") + who + " session went " + std::to_string(quiet.count()) + " ms without a keepalive (the gateway reaps it at 10 s)");
-            (void)c->pollFor(0ms, [] { return false; });
+                failWith_("TEST STARVED: " + who + " went " + std::to_string(quiet.count()) +
+                          " ms without a keepalive (the gateway reaps it at 10 s)");
+        };
+        guard(&rig_.broker().admin().raw(), rig_.broker().adminSession(), "the rig's admin session");
+        guard(&rig_.c(), rig_.builder, "the rig's builder session");
+        for (std::size_t i = 0; i < sess_.size(); ++i)
+            if (sess_[i].alive)
+                guard(sess_[i].c, sess_[i].sid,
+                      "user session " + std::to_string(i) + " (sid " + std::to_string(sess_[i].sid) + ")");
+        for (ShardTestClient* c : {&rig_.broker().admin().raw(), &rig_.c()}) (void)c->pollFor(0ms, [] { return false; });
+        for (AuthWireClient* w : uw_) (void)w->raw().pollFor(0ms, [] { return false; });
+    }
+    /// A sleep of `d` that keeps every session alive: slices of at most 500 ms with keepAllAlive_() between.
+    void sleepAlive_(std::chrono::milliseconds d) {
+        const auto end = Clock::now() + d;
+        for (int i = 0; i < 100000 && Clock::now() < end; ++i) {
+            keepAllAlive_();
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(end - Clock::now());
+            std::this_thread::sleep_for(std::min<std::chrono::milliseconds>(left, 100ms));
         }
     }
     void login_(std::size_t i) {
@@ -248,7 +274,7 @@ private:
         // retried, after that hint, like the real client - bounded.  Any other refusal of an enabled user (a wrongful
         // AuthenticationFailed after an answered ENABLE, a missing answer) fails the run at once.
         for (int attempt = 0; attempt < 30; ++attempt) {
-            keepRigAlive_();
+            keepAllAlive_();
             s.sid = s.w->connect(rig_.ch());
             if (s.sid <= 0) { failWith_("connect"); return; }
             const auto l = s.w->login(rig_.ch(), s.sid, user_(s.user), {AuthRig::kPw, AuthRig::kPw});
@@ -261,7 +287,7 @@ private:
                           " code=" + std::to_string(l.errorCode()) + " first=" + (l.first ? "yes" : "no") + ")");
                 return;
             }
-            std::this_thread::sleep_for(unavailable ? std::chrono::milliseconds(20) : std::chrono::milliseconds(l.fin->retryAfterMs));
+            sleepAlive_(unavailable ? std::chrono::milliseconds(20) : std::chrono::milliseconds(l.fin->retryAfterMs));
         }
         failWith_("login " + user_(s.user) + " stayed throttled / unavailable for 30 attempts");
     }
@@ -748,7 +774,23 @@ private:
             if (inFlight != 0) { failWith_("BROKER: " + std::to_string(inFlight) + " shard produce frame(s) admitted by the worker were never answered"); return; }
             for (const Sess& se : sess_) {
                 if (!se.alive) continue;
-                if (rig_.broker().node().workerPermissionEpochForTest(0, se.sid) == 0) { failWith_("BROKER: the worker holds no permission epoch for a live session"); return; }
+                BrokerNode& nd = rig_.broker().node();
+                if (nd.workerPermissionEpochForTest(0, se.sid) == 0) {
+                    const std::string sid = std::to_string(se.sid);
+                    const auto silent = std::chrono::duration_cast<std::chrono::milliseconds>(se.c->silentFor(se.sid));
+                    if (!nd.gatewayHasSessionForTest(se.sid))
+                        failWith_(silent > 8s
+                            ? "TEST STARVED: user session sid " + sid + " of " + user_(se.user) + " went " +
+                                  std::to_string(silent.count()) + " ms without a keepalive (the gateway reaps it at 10 s)"
+                            : "BROKER: the gateway ended live session sid " + sid + " of " + user_(se.user) +
+                                  " (silent " + std::to_string(silent.count()) + " ms) that the model keeps alive");
+                    else
+                        failWith_("BROKER: the worker holds no permission epoch for live session sid " + sid + " of " +
+                                  user_(se.user) + "; gateway has it; permission ships " +
+                                  std::to_string(nd.permissionShipsForTest()) + ", worker unknown-session binds " +
+                                  std::to_string(nd.workerPermBindsUnknownSessionForTest(0)));
+                    return;
+                }
                 ++tally_.epochsChecked;
             }
             // The control thread's applied offset (read ON the control thread) is the `__security` log end - 1 at
@@ -770,7 +812,7 @@ private:
             if (fin.isEnabled(user_(u))) continue;
             ++tally_.disabledUsersAtEnd;
             const auto l = uw_[static_cast<std::size_t>(u) * 3]->connectAndLogin(rig_.ch(), user_(u), AuthRig::kPw);
-            keepRigAlive_();
+            keepAllAlive_();
             rig_.broker().node().resetLoginThrottleForTest();
             if (!(!l.ok() && l.answered() && l.errorCode() == static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed) && l.fin->retryAfterMs == 0)) {
                 failWith_("CONVERGENCE: the login of disabled user " + user_(u) + " was not definitely refused (answered=" +
@@ -804,11 +846,15 @@ private:
                         const int64_t corr = s.c->nextCorrelationId();
                         const std::string& chan = routed ? rig_.ch() : rig_.broker().workerIngressChannel();
                         if (!s.c->produce(chan, AuthRig::stream(), s.sid, corr, topicId, 0, 1, makeCharBatch(1))) break;
-                        const auto ack = s.c->awaitProduceResponseUntil(corr, Clock::now() + 5s);
-                        keepRigAlive_();
+                        std::optional<pc::ProduceResponse> ack;
+                        const auto ackBy = Clock::now() + 5s;
+                        for (int sl = 0; sl < 100 && !ack && Clock::now() < ackBy && fail_.empty(); ++sl) {
+                            keepAllAlive_();
+                            ack = s.c->awaitProduceResponseUntil(corr, std::min(ackBy, Clock::now() + 500ms));
+                        }
                         code = ack ? ack->errorCode : kNoAnswer;
                         if (code == 0 || code == 45 || code == kNoAnswer) break;
-                        std::this_thread::sleep_for(25ms);
+                        sleepAlive_(25ms);
                     }
                     ++tally_.probes;
                     if (wantW != (code == 0) || (!wantW && code != 45))
@@ -819,10 +865,16 @@ private:
                 }
                 int sc = kNoAnswer;
                 for (int a = 0; a < 80; ++a) {
-                    sc = s.c->awaitSubscribeCode(s.c->sendSubscribe(rig_.ch(), AuthRig::stream(), s.sid, topicId, 0), Clock::now() + 5s).value_or(kNoAnswer);
-                    keepRigAlive_();
+                    const int64_t subCorr = s.c->sendSubscribe(rig_.ch(), AuthRig::stream(), s.sid, topicId, 0);
+                    std::optional<int16_t> subCode;
+                    const auto subBy = Clock::now() + 5s;
+                    for (int sl = 0; sl < 100 && !subCode && Clock::now() < subBy && fail_.empty(); ++sl) {
+                        keepAllAlive_();
+                        subCode = s.c->awaitSubscribeCode(subCorr, std::min(subBy, Clock::now() + 500ms));
+                    }
+                    sc = subCode.value_or(kNoAnswer);
                     if (sc != static_cast<int>(pc::ErrorCode::NotLeader)) break;
-                    std::this_thread::sleep_for(25ms);
+                    sleepAlive_(25ms);
                 }
                 ++tally_.probes;
                 if (wantR != (sc == 0) || (!wantR && sc != 45))
@@ -982,4 +1034,41 @@ TEST(AuthStressRegression, DisableThenEnableLeavesTheOldSessionClosedRegression)
     const auto reshipped = Clock::now() + 5s;
     while (node.workerPermissionEpochForTest(0, after.sessionId) == 0 && Clock::now() < reshipped) w.raw().pollFor(2ms, [] { return false; });
     EXPECT_NE(node.workerPermissionEpochForTest(0, after.sessionId), 0u) << "a fresh login after the ENABLE holds a shipped epoch";
+}
+
+// #582: a user session of the stress model is kept alive by every wait of the test, not only by `pump_`.  A long wait
+// that pumps one client (a throttled reconnect, a probe) must not let the gateway reap the others (10 s without a
+// Keepalive) and report the worker's missing epoch as a broker bug.  This is the keep-alive helper's contract, driven
+// the way a long reconnect drives it: no `pump_`, only the helper, for longer than the gateway's lease.
+TEST(AuthStressRegression, AUserSessionIsKeptAliveAcrossSingleClientWaitsRegression) {
+    AuthBroker::Options o;
+    o.shard = true;
+    AuthRig rig("keepalive582", o);
+    rig.c().keepSessionsAlive(true);
+    rig.broker().admin().raw().keepSessionsAlive(true);
+    std::vector<AuthWireClient*> wires;
+    std::vector<int64_t> sids;
+    for (int i = 0; i < 3; ++i) {
+        std::string user;
+        (void)rig.newUser({}, &user);
+        wires.push_back(&rig.broker().wire());
+        const auto l = wires.back()->connectAndLogin(rig.ch(), user, AuthRig::kPw);
+        ASSERT_TRUE(l.ok());
+        sids.push_back(l.sessionId);
+    }
+    Tally tally;
+    Seed seed(rig, wires, 0, 0, tally);
+    seed.adoptSessionsForTest(sids);
+    const auto end = Clock::now() + 11s;
+    for (int i = 0; i < 100000 && Clock::now() < end; ++i) {
+        seed.keepAllAliveForTest();
+        std::this_thread::sleep_for(2ms);
+    }
+    EXPECT_EQ(seed.failureForTest(), "") << "the helper's own starvation guard fired";
+    auto& node = rig.broker().node();
+    for (std::size_t i = 0; i < sids.size(); ++i) {
+        EXPECT_TRUE(node.gatewayHasSessionForTest(sids[i])) << "user session " << i << " was reaped";
+        EXPECT_NE(node.workerPermissionEpochForTest(0, sids[i]), 0u)
+            << "user session " << i << " lost its worker epoch";
+    }
 }

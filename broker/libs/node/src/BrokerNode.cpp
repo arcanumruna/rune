@@ -3926,6 +3926,10 @@ uint64_t BrokerNode::workerPermissionEpochForTest(int32_t w, int64_t sessionId) 
     return onWorkerThreadForTest(w, [sessionId](auto& worker) -> uint64_t { return worker.permissionEpochForTest(sessionId); });
 }
 
+uint64_t BrokerNode::workerPermBindsUnknownSessionForTest(int32_t w) {
+    return onWorkerThreadForTest(w, [](auto& worker) -> uint64_t { return worker.permBindsUnknownSessionForTest(); });
+}
+
 std::size_t BrokerNode::workerDirectAcksInFlightForTest(int32_t w) {
     return onWorkerThreadForTest(w, [](auto& worker) -> std::size_t { return worker.directAcksInFlightForTest(); });
 }
