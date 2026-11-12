@@ -999,6 +999,11 @@ void AdminWorker::startNext_(int64_t nowNs) {
         if (const auto rec = state.request(meta.requestId)) {
             if (rec->requestFingerprint == fp) {
                 answerOk_(req, *rec);   // a retry of a committed DDL: its ORIGINAL result
+            } else if (const auto* denied = std::get_if<NamespaceDdlMsg>(&req);
+                       denied != nullptr && !denied->denial.empty()) {
+                // #221: a denied namespace DDL gets its denial, as for a fresh id - a principal that may not run the
+                // statement cannot tell whether a request id is recorded.
+                answer_(req, kNotAuthorized, denied->denial);
             } else {
                 answer_(req, kInvalidRequest, "requestId reused for a different statement");
             }
@@ -1007,7 +1012,8 @@ void AdminWorker::startNext_(int64_t nowNs) {
     }
 
     // 3b. Namespaces Task 7 (D15): the gateway's authorization verdict rides the message — answered after the dedupe,
-    //     so a retry of a committed namespace DDL still gets its original result.
+    //     so a retry of a committed namespace DDL still gets its original result.  A denied one whose id is recorded
+    //     for a different statement or principal was already answered its denial inside step 3 (#221).
     if (const auto* ns = std::get_if<NamespaceDdlMsg>(&req); ns != nullptr && !ns->denial.empty()) {
         answer_(req, kNotAuthorized, ns->denial);
         return;

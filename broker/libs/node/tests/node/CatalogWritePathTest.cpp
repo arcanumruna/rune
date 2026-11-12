@@ -151,6 +151,47 @@ TEST(CatalogWritePathRegression, AnotherPrincipalLearnsNothingFromARecordedReque
     EXPECT_EQ(rig.recordedLog()[0].event.principal.authenticated, "alice");
 }
 
+// B, whose verdict is a denial (only a namespace DDL carries one to the leader), asks with A's recorded id: the same
+// denial as for a fresh id - a recorded id is not observable by a principal that may not run the statement.
+TEST(CatalogWritePathRegression, ADeniedPrincipalCannotObserveARecordedRequestIdRegression) {
+    CatalogDdlRig rig("wp_dedupe_denied", 3);
+    rig.becomeServingLeader();
+    const rune::protocol::RequestId rid{.hi = 0xC11E, .lo = 223};
+    auto mA = rig.namespaceMsg(1, "nsa", {}, {}, rid);
+    mA.meta.authenticated = "alice";
+    const auto a = rig.submitRaw(rune::node::DdlRequest{mA});
+    ASSERT_EQ(a.code, 0) << a.detail;
+    auto mB = rig.namespaceMsg(1, "nsa", {}, {}, rid);
+    mB.meta.authenticated = "bob";
+    mB.denial = "not authorized: ADMIN on CLUSTER";
+    auto mFresh = rig.namespaceMsg(1, "nsa", {}, {});
+    mFresh.meta.authenticated = "bob";
+    mFresh.denial = mB.denial;
+    const auto onRecorded = rig.submitRaw(rune::node::DdlRequest{mB});
+    const auto onFresh = rig.submitRaw(rune::node::DdlRequest{mFresh});
+    EXPECT_EQ(onRecorded.code, onFresh.code);
+    EXPECT_EQ(onRecorded.detail, onFresh.detail);
+    EXPECT_EQ(onRecorded.code, 45);
+    EXPECT_EQ(rig.recordedLog().size(), 1u);
+}
+
+// A's own retry of its committed namespace DDL keeps the ORIGINAL ok result even with a denial set (A lost the right).
+TEST(CatalogWritePathRegression, TheSamePrincipalsRetryKeepsItsOriginalResultDespiteALaterDenialRegression) {
+    CatalogDdlRig rig("wp_dedupe_denied_own", 3);
+    rig.becomeServingLeader();
+    const rune::protocol::RequestId rid{.hi = 0xC11E, .lo = 224};
+    auto mA = rig.namespaceMsg(1, "nsa", {}, {}, rid);
+    mA.meta.authenticated = "alice";
+    const auto a = rig.submitRaw(rune::node::DdlRequest{mA});
+    ASSERT_EQ(a.code, 0) << a.detail;
+    auto retry = mA;
+    retry.denial = "not authorized: ADMIN on CLUSTER";
+    const auto again = rig.submitRaw(rune::node::DdlRequest{retry});
+    EXPECT_EQ(again.code, 0) << again.detail;
+    EXPECT_EQ(again.detail, a.detail);
+    EXPECT_EQ(rig.recordedLog().size(), 1u);
+}
+
 TEST(CatalogWritePathRegression, CommitTimeoutAnswersRetriableNotLeaderAndTheRetryIsExactRegression) {
     // F13: past kDdlTimeoutNs the appended event may still commit — the answer must be retriable,
     // and the retry (same requestId) must get the original result once it committed.
