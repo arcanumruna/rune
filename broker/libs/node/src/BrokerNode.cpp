@@ -2209,6 +2209,7 @@ void BrokerNode::buildGateway() {
         // Authentication Task 10 (D11/D13): how sessions authenticate + the bootstrap window's view (the control thread's
         // own SecurityView - the gateway runs on this same thread).
         gateway_->setAuthTimeoutNs(config_.authTimeoutMs * 1'000'000LL);   // D13: RUNE_AUTH_TIMEOUT_MS
+        gateway_->setLoginThrottleBaseDelayMsForTest(config_.loginThrottleBaseDelayMsForTest);   // #594: tests only
         gateway_->setAuthMode(config_.authMode == AuthMode::Enabled  ? rune::gateway::GatewayAuthMode::Required
                               : config_.authMode == AuthMode::DevDisabled ? rune::gateway::GatewayAuthMode::Dev
                                                                           : rune::gateway::GatewayAuthMode::InProcess,

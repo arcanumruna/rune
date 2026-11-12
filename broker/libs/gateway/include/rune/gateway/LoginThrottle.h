@@ -24,6 +24,7 @@
 // #131), so an attacker can neither predict a name's slot (grind names into one probe window to evict its own
 // entries) nor find a collision.
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -65,6 +66,12 @@ public:
     /// Test seam (#189): forget every entry (zero-fills the fixed tables in place; never allocates).
     void clear() noexcept;
 
+    /// Test seam (#594): this instance's base delay (the first delayed failure's delay; it doubles from there).  Values
+    /// <= 0 are ignored; larger than kMaxDelayNs is clamped to it (so `baseDelayNs_ << 20` cannot overflow).
+    void setBaseDelayNsForTest(int64_t ns) noexcept {
+        if (ns > 0) baseDelayNs_ = std::min(ns, kMaxDelayNs);
+    }
+
     /// Test seam (#131): the home slot of a (user, host) pair key - where its probe window starts.
     [[nodiscard]] std::size_t pairSlotForTest(std::string_view user, std::string_view host) const noexcept {
         return static_cast<std::size_t>(pairKey(user, host).h1) & (kCapacity - 1);
@@ -90,9 +97,10 @@ private:
     /// Bounded-probe lookup / claim of the kProbe slots from `start` (wrapping); `start` is the table's own choice.
     [[nodiscard]] static const Entry* find_(const std::vector<Entry>&, Key, std::size_t start, int64_t nowNs) noexcept;
     [[nodiscard]] static Entry& claim_(std::vector<Entry>&, Key, std::size_t start, int64_t nowNs) noexcept;
-    static void fail_(Entry&, uint32_t freeFailures, int64_t maxDelayNs, int64_t nowNs) noexcept;
+    void fail_(Entry&, uint32_t freeFailures, int64_t maxDelayNs, int64_t nowNs) const noexcept;
 
     HashKey key_;
+    int64_t baseDelayNs_ = kBaseDelayNs;
     std::vector<Entry> pairs_, hosts_, users_;
     std::vector<Entry> known_;   ///< (user, host) pairs with a success: `lastFailNs` holds the last success time
 };

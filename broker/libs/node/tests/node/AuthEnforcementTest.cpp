@@ -1314,7 +1314,9 @@ TEST(AuthEnforcementAdversarialRegression, TheVerifierSlotsAcceptOnlyCurrentPass
 // failure - a bad own-change proof - starts the pair's delay, so the right password, sent at once, is refused with a
 // retry-after.  (Not charged, the pair would hold only the two free failures and the login would succeed.)
 TEST(AuthEnforcementAdversarialRegression, OwnChangeProofsAndLoginsShareOneThrottleAdversarialRegression) {
-    AuthRig r("adv136throttle");
+    AuthBroker::Options slowThrottle;   // #594: "throttled" must not depend on a 250 ms wall-clock gap
+    slowThrottle.configure = [](NodeConfig& c) { c.loginThrottleBaseDelayMsForTest = 10'000; };
+    AuthRig r("adv136throttle", slowThrottle);
     std::string name;
     const int64_t self = r.newUser({}, &name);
     for (int i = 0; i < 2; ++i) {

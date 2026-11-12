@@ -259,3 +259,22 @@ TEST(LoginThrottleRegression, ClearForgetsEveryTableAndTheCurveRestartsAdversari
     t.onFailure("p", "q", now);
     EXPECT_EQ(t.check("p", "q", now).retryAfterMs, 250u);
 }
+
+// Issue #594: the base delay is per instance, settable by tests only, so a real-broker test can make "the next attempt is
+// throttled" independent of a 250 ms wall-clock gap.
+TEST(LoginThrottleRegression, BaseDelayIsSettableForTestsRegression) {
+    LoginThrottle d;   // the default 250 ms base
+    LoginThrottle l;
+    l.setBaseDelayNsForTest(10'000 * ms);
+    for (int i = 0; i < 3; ++i) { d.onFailure("ws1", "10.0.0.9", 0); l.onFailure("ws1", "10.0.0.9", 0); }
+    EXPECT_TRUE(d.check("ws1", "10.0.0.9", 1'000 * ms).allowed) << "default: 1 s after the third failure is past 250 ms";
+    const auto v = l.check("ws1", "10.0.0.9", 1'000 * ms);
+    EXPECT_FALSE(v.allowed) << "a 10 s base: the attempt 1 s after the third failure is refused";
+    EXPECT_EQ(v.retryAfterMs, 9'000u);
+    EXPECT_TRUE(l.check("ws1", "10.0.0.9", 10'000 * ms).allowed);
+    l.setBaseDelayNsForTest(0);    // ignored
+    l.setBaseDelayNsForTest(-5);   // ignored
+    l.clear();
+    for (int i = 0; i < 3; ++i) l.onFailure("ws1", "10.0.0.9", 0);
+    EXPECT_FALSE(l.check("ws1", "10.0.0.9", 1'000 * ms).allowed) << "non-positive values keep the previous base";
+}

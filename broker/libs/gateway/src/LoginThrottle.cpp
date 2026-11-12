@@ -119,13 +119,13 @@ LoginThrottle::Entry& LoginThrottle::claim_(std::vector<Entry>& t, Key k, std::s
     return *victim;
 }
 
-void LoginThrottle::fail_(Entry& e, uint32_t freeFailures, int64_t maxDelayNs, int64_t nowNs) noexcept {
+void LoginThrottle::fail_(Entry& e, uint32_t freeFailures, int64_t maxDelayNs, int64_t nowNs) const noexcept {
     if (e.failures < 0xFFFF'FFF0u) ++e.failures;
     e.lastFailNs = nowNs;
     if (e.failures <= freeFailures) { e.nextAllowedNs = 0; return; }
     const uint32_t over = e.failures - freeFailures;                    // 1 = the first delayed failure
     const uint32_t shift = std::min<uint32_t>(over - 1, 20);
-    e.nextAllowedNs = nowNs + std::min<int64_t>(kBaseDelayNs << shift, maxDelayNs);
+    e.nextAllowedNs = nowNs + std::min<int64_t>(baseDelayNs_ << shift, maxDelayNs);
 }
 
 std::size_t LoginThrottle::slotOf_(Key k) noexcept { return static_cast<std::size_t>(k.h1) & (kCapacity - 1); }

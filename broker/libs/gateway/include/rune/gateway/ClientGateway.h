@@ -533,6 +533,10 @@ public:
     }
     /// Issue #189 test seam (control thread): forget every login-throttle entry (no allocation).
     void resetLoginThrottleForTest() noexcept { loginThrottle_.clear(); }
+    /// Issue #594 test seam (control thread): the login throttle's base delay in ms (<= 0 keeps the default 250 ms).
+    void setLoginThrottleBaseDelayMsForTest(int64_t ms) noexcept {
+        if (ms > 0) loginThrottle_.setBaseDelayNsForTest(std::min<int64_t>(ms, 30'000) * 1'000'000LL);   // 30 s = the cap
+    }
     /// Issue #266 test seam (control thread): how many times a reap pass walked the whole session table.
     [[nodiscard]] uint64_t sessionScansForTest() const noexcept { return sessionScansForTest_; }
     void setAdvertisedBrokerVersionForTest(int32_t v) noexcept { advertisedBrokerVersion_ = v; }   ///< 0 = kBrokerVersion

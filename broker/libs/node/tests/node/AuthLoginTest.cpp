@@ -116,7 +116,9 @@ TEST(AuthLoginRegression, FailureAnswersAreIndistinguishableForATwoPasswordUserR
 // client connections - each make ONE wrong-password attempt for the same user, and together they meet the throttle
 // exactly as six consecutive attempts would: three verified failures, then refusals with a retry-after and no salt.
 TEST(AuthLoginRegression, ParallelSessionsShareTheLoginThrottleRegression) {
-    AuthBroker b("parthrottle");
+    AuthBroker::Options slowThrottle;   // #594: "throttled" must not depend on a 250 ms wall-clock gap
+    slowThrottle.configure = [](NodeConfig& c) { c.loginThrottleBaseDelayMsForTest = 10'000; };
+    AuthBroker b("parthrottle", slowThrottle);
     b.bootstrapAdmin();
     b.createUser("ws1", kPwA);
     AuthWireClient& w1 = b.wire();
