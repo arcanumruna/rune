@@ -117,7 +117,12 @@ struct CountingAdminSink final : IAdminRequestSink {
     AdminSubmit submitNamespaceDdl(const pc::NamespaceDdlRequest&, const DdlMetaView&, std::string_view, uint16_t) override { return AdminSubmit::Accepted; }
     AdminSubmit submitListNamespaces(int64_t, int64_t, uint32_t, uint16_t, uint32_t, bool) override { return AdminSubmit::Accepted; }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { return AdminSubmit::Accepted; }
-    bool submitSecuritySubscribe(int64_t, int64_t, int64_t) override { return true; }
+    std::vector<CatalogSub> securitySubs;   // issue #200
+    bool submitSecuritySubscribe(int64_t s, int64_t c, int64_t from) override {
+        if (ringFull) return false;
+        securitySubs.push_back({s, c, from});
+        return true;
+    }
     std::vector<CatalogUnsub> securityUnsubs;
     bool submitSecurityUnsubscribe(int64_t s, int64_t id) override {
         if (ringFull) return false;
@@ -1217,4 +1222,141 @@ TEST(CatalogPrincipalRegression, UnknownNsFallsBackToNumericPrefixRegression) {
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", PermissionTable::allowAll(), {}, 0});
     EXPECT_FALSE(g.sendDdl(pc::TemplateId::DropTopic).answered);
     EXPECT_EQ(g.admin.lastAuthenticated, "ops") << "default stays bare";
+}
+
+// ── Issue #200: the session's list of admin-log reads holds exactly the reads that are pending or live ──────────
+namespace {
+constexpr int64_t kCatBase = rune::gateway::kCatalogSubscriptionIdBase | (int64_t{2} << 40);
+constexpr int64_t kSecBase = rune::gateway::kCatalogSubscriptionIdBase | rune::gateway::kSecuritySubscriptionIdBit |
+                             (int64_t{2} << 40);
+constexpr auto kNotAuthorized = static_cast<int16_t>(pc::ErrorCode::NotAuthorized);
+constexpr auto kInvalidRequest = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+
+void adminSubscribe(GatewayRig& g, bool security, int64_t corr) {
+    pc::Subscribe s;
+    s.sessionId = g.sid; s.correlationId = corr; s.topicId = security ? pc::kSecurityTopicId : pc::kCatalogTopicId;
+    s.partition = 0; s.partitionKnown = 1; s.fromOffset = -2; s.isolation = 0;
+    std::vector<uint8_t> buf(s.encodedSize());
+    buf.resize(s.encode(buf.data()));
+    g.gw.applySubscribeForTest(buf.data(), buf.size());
+}
+/// The read server's SubscribeResponse (code 0 = accepted, carrying `subId`) as the control thread's sink sees it.
+void serverAnswersSubscribe(GatewayRig& g, int64_t corr, int16_t code, int64_t subId) {
+    pc::SubscribeResponse r;
+    r.sessionId = g.sid; r.correlationId = corr; r.errorCode = code; r.partition = 0; r.subscriptionId = subId;
+    std::array<uint8_t, 256> buf{};
+    g.gw.noteAdminLogAnswer(g.sid, buf.data(), r.encode(buf.data()));
+}
+/// The read server ending the subscription of `corr` (ErrorResponse on its Subscribe's correlation id).
+void serverEndsRead(GatewayRig& g, int64_t corr) {
+    pc::ErrorResponse e;
+    e.sessionId = g.sid; e.correlationId = corr; e.code = kNotAuthorized;
+    std::array<uint8_t, 256> buf{};
+    g.gw.noteAdminLogAnswer(g.sid, buf.data(), e.encode(buf.data()));
+}
+void revokeReads(GatewayRig& g, bool security) {
+    rune::gateway::LiveActions a;
+    (security ? a.endSecurityReads : a.endCatalogReads) = true;
+    g.gw.executeLiveActionsForTest(g.sid, a);
+}
+std::size_t answersOn(const GatewayRig& g, int64_t corr, int16_t code = -1) {
+    std::size_t n = 0;
+    for (const auto& e : g.errors) n += e.correlationId == corr && (code < 0 || e.code == code) ? 1 : 0;
+    return n;
+}
+
+void aLiveReadKeepsItsAnswer(bool security) {
+    GatewayRig g;
+    const int64_t base = security ? kSecBase : kCatBase;
+    adminSubscribe(g, security, 1);
+    serverAnswersSubscribe(g, 1, 0, base | 1);
+    for (int64_t i = 0; i < 300; ++i) {
+        adminSubscribe(g, security, 1000 + i);
+        serverAnswersSubscribe(g, 1000 + i, 0, base | (2 + i));
+        unsubscribe(g, base | (2 + i));
+    }
+    revokeReads(g, security);
+    EXPECT_EQ(answersOn(g, 1, kNotAuthorized), 1u) << "the first, still live read is answered on its own corr";
+    EXPECT_EQ(std::count_if(g.errors.begin(), g.errors.end(),
+                            [](const pc::ErrorResponse& e) { return e.code == kNotAuthorized; }), 1)
+        << "the 300 ended reads are forgotten: exactly one answer";
+}
+}  // namespace
+
+TEST(LiveSecurityChangesRegression, ALiveReadKeepsItsAnswerAfterManyEndedReadsRegression) {
+    aLiveReadKeepsItsAnswer(/*security=*/false);
+}
+
+TEST(LiveSecurityChangesRegression, ALiveSecurityReadKeepsItsAnswerAfterManyEndedReadsRegression) {
+    aLiveReadKeepsItsAnswer(/*security=*/true);
+}
+
+TEST(LiveSecurityChangesRegression, ARefusedSubscribeIsForgottenRegression) {
+    GatewayRig g;
+    adminSubscribe(g, false, 5);
+    serverAnswersSubscribe(g, 5, static_cast<int16_t>(pc::ErrorCode::Internal), 0);
+    revokeReads(g, false);
+    EXPECT_EQ(answersOn(g, 5), 0u);
+}
+
+TEST(LiveSecurityChangesRegression, AReadEndedByTheServerIsForgottenRegression) {
+    GatewayRig g;
+    adminSubscribe(g, false, 6);
+    serverAnswersSubscribe(g, 6, 0, kCatBase | 1);
+    serverEndsRead(g, 6);
+    revokeReads(g, false);
+    EXPECT_EQ(answersOn(g, 6), 0u) << "the server's own end already answered it";
+}
+
+TEST(LiveSecurityChangesRegression, ACorrLiveOnOneLogIsRefusedOnTheOtherRegression) {
+    GatewayRig g;
+    adminSubscribe(g, false, 7);
+    serverAnswersSubscribe(g, 7, 0, kCatBase | 1);
+    adminSubscribe(g, true, 7);
+    EXPECT_EQ(answersOn(g, 7, kInvalidRequest), 1u);
+    EXPECT_TRUE(g.admin.securitySubs.empty()) << "not forwarded";
+    EXPECT_EQ(g.gw.adminReadsRefusedDuplicateCorr(), 1u);
+    g.ddlAnswers.clear();   // the rig allows one answer per corr; the refusal and the revoke share corr 7
+    revokeReads(g, false);
+    EXPECT_EQ(answersOn(g, 7, kNotAuthorized), 1u) << "the catalog read is still listed";
+    // Once the catalog read is unsubscribed its corr is free for the other log.
+    adminSubscribe(g, false, 8);
+    serverAnswersSubscribe(g, 8, 0, kCatBase | 2);
+    adminSubscribe(g, true, 8);
+    EXPECT_TRUE(g.admin.securitySubs.empty());
+    unsubscribe(g, kCatBase | 2);
+    adminSubscribe(g, true, 8);
+    ASSERT_EQ(g.admin.securitySubs.size(), 1u);
+    EXPECT_EQ(g.admin.securitySubs[0].corr, 8);
+    EXPECT_EQ(g.gw.adminReadsRefusedDuplicateCorr(), 2u);
+}
+
+TEST(LiveSecurityChangesRegression, SubscribesBeyondTheCapAreAnsweredRetriableRegression) {
+    GatewayRig g;
+    for (int64_t c = 1; c <= 128; ++c) adminSubscribe(g, false, c);
+    EXPECT_EQ(g.admin.catalogSubs.size(), 128u);
+    adminSubscribe(g, false, 129);
+    EXPECT_EQ(answersOn(g, 129, kNotLeader), 1u);
+    EXPECT_EQ(g.admin.catalogSubs.size(), 128u) << "not forwarded";
+    EXPECT_EQ(g.gw.catalogSubscribesForwarded(), 128u);
+    EXPECT_EQ(g.gw.adminReadsRefusedAtCap(), 1u);
+    adminSubscribe(g, false, 5);   // a retransmitted Subscribe of a listed corr is not a new read
+    EXPECT_EQ(g.admin.catalogSubs.size(), 129u);
+    serverAnswersSubscribe(g, 1, static_cast<int16_t>(pc::ErrorCode::Internal), 0);
+    adminSubscribe(g, false, 130);
+    EXPECT_EQ(g.admin.catalogSubs.size(), 130u) << "room again after one server answer";
+    EXPECT_EQ(g.admin.catalogSubs.back().corr, 130);
+}
+
+TEST(LiveSecurityChangesRegression, ARevokedSessionAnswersEveryLiveAdminReadRegression) {
+    GatewayRig g;
+    adminSubscribe(g, false, 21);
+    serverAnswersSubscribe(g, 21, 0, kCatBase | 1);
+    adminSubscribe(g, false, 22);
+    serverAnswersSubscribe(g, 22, 0, kCatBase | 2);
+    adminSubscribe(g, true, 23);
+    serverAnswersSubscribe(g, 23, 0, kSecBase | 1);
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "u", PermissionTable::allowAll()});
+    g.gw.revokeAllSessionsForTest("test");
+    for (const int64_t c : {21, 22, 23}) EXPECT_EQ(answersOn(g, c), 1u) << c;
 }

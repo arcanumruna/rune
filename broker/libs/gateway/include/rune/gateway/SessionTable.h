@@ -211,11 +211,18 @@ struct Session {
         std::array<uint8_t, 64> serverSignature{};
         int64_t  prev = 0, next = 0;                 ///< 0 = none
     } heldLoginOk;
-    // Authentication Task 14: the correlation ids of this session's `__catalog` / `__security` Subscribes (the admin
-    // thread owns the subscriptions; a live permission loss answers ErrorResponse{NotAuthorized} on each of these).
-    // Cold, bounded (kMaxReadCorrs, oldest dropped); a stale entry (already unsubscribed) only costs one ignored frame.
-    static constexpr std::size_t kMaxReadCorrs = 64;
-    std::vector<int64_t> catalogReadCorrs, securityReadCorrs;
+    // Authentication Task 14 / issue #200: this session's `__catalog` / `__security` reads that are pending or live,
+    // one entry per Subscribe correlation id (the admin thread owns the subscriptions; a live permission loss answers
+    // ErrorResponse{NotAuthorized} on each of these).  An entry is dropped when its read ends (client Unsubscribe, a
+    // refused Subscribe, an end sent by the read server) and never evicted: the list is capped at kMaxAdminReads (64
+    // live reads, which each read server allows, plus 64 awaiting the server's answer) and a Subscribe beyond it is
+    // refused retriably.  A correlation id is unique across both lists.
+    struct AdminRead {
+        int64_t corr  = 0;
+        int64_t subId = 0;   ///< 0 until the read server answered
+    };
+    static constexpr std::size_t kMaxAdminReads = 128;
+    std::vector<AdminRead> catalogReadCorrs, securityReadCorrs;
     // Issue #117 (X017 part, M10): the admin-log read ends (kEndCatalogReadsOnly / kEndSecurityReadsOnly) the admin
     // request ring could not take yet - per-session pending state, coalesced, retried every duty cycle, NEVER dropped.
     static constexpr uint8_t kPendingEndCatalogReads  = 0x01;

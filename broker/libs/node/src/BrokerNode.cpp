@@ -5497,7 +5497,11 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             return Offer::NoSession;
         }
         void sendReliable(int64_t session, const uint8_t* f, std::size_t n) {
-            if (node.gateway_) (void)node.gateway_->sendControlFrame(session, f, n);
+            if (!node.gateway_) return;
+            // Issue #200: every SubscribeResponse and terminal answer of both read servers passes here first, so the
+            // session's list of admin-log reads drops a refused or ended read.
+            node.gateway_->noteAdminLogAnswer(session, f, n);
+            (void)node.gateway_->sendControlFrame(session, f, n);
         }
         Room room(int64_t session) {
             if (!node.gateway_) return Room::Gone;

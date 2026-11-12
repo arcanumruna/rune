@@ -5871,11 +5871,72 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 // the admin thread sends the SubscribeResponse, the backlog up to this broker's
 // HW, the caught-up marker and the live events.
 // ---------------------------------------------------------------------------
-void ClientGateway::noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr)
+// Issue #200: may this Subscribe become an admin-log read of the session?  A correlation id live on the OTHER log is
+// refused InvalidRequest (the read servers' answers carry no log kind, so a corr names one read of the session); a
+// full list the retriable NotLeader (at least 64 of its entries await a server answer, which is transient).  `isNew`:
+// the corr is not listed yet - the caller lists it once the admin ring took the request.
+bool ClientGateway::admitAdminRead_(Session& s, const pc::Subscribe& msg, bool security, bool& isNew)
 {
-    for (const int64_t c : corrs) if (c == corr) return;
-    if (corrs.size() >= Session::kMaxReadCorrs) corrs.erase(corrs.begin());
-    corrs.push_back(corr);
+    const auto& own   = security ? s.securityReadCorrs : s.catalogReadCorrs;
+    const auto& other = security ? s.catalogReadCorrs : s.securityReadCorrs;
+    const auto has = [&](const std::vector<Session::AdminRead>& v) {
+        return std::any_of(v.begin(), v.end(),
+                           [&](const Session::AdminRead& r) { return r.corr == msg.correlationId; });
+    };
+    isNew = false;
+    pc::ErrorResponse er;
+    er.sessionId     = msg.sessionId;
+    er.correlationId = msg.correlationId;
+    if (has(other)) {
+        ++adminReadsRefusedDuplicateCorr_;
+        er.code    = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+        er.message = "correlation id already used by a live read on this session";
+    } else if (has(own)) {
+        return true;   // a retransmitted Subscribe: no second entry
+    } else if (own.size() >= Session::kMaxAdminReads) {
+        ++adminReadsRefusedAtCap_;
+        er.code = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+    } else {
+        isNew = true;
+        return true;
+    }
+    sendAnswer_(s, scratch_.data(), er.encode(scratch_.data()));
+    return false;
+}
+
+void ClientGateway::noteAdminLogAnswer(int64_t sessionId, const uint8_t* frame, std::size_t len)
+{
+    const auto hdr = pc::MessageHeader::decode(frame, len);
+    if (!hdr) return;
+    const bool subscribeAnswer = hdr->templateId == static_cast<uint16_t>(pc::TemplateId::SubscribeResponse);
+    if (!subscribeAnswer && hdr->templateId != static_cast<uint16_t>(pc::TemplateId::ErrorResponse)) return;
+    Session* s = sessions_.find(sessionId);
+    if (s == nullptr) return;
+    bool accepted = false;
+    int64_t subId = 0;
+    if (subscribeAnswer) {
+        const auto r = pc::SubscribeResponse::decode(frame, len);
+        if (!r) return;
+        accepted = r->errorCode == 0;
+        subId    = r->subscriptionId;
+    }
+    for (auto* list : {&s->catalogReadCorrs, &s->securityReadCorrs}) {   // a corr is listed at most once across both
+        const auto it = std::find_if(list->begin(), list->end(),
+                                     [&](const Session::AdminRead& r) { return r.corr == hdr->correlationId; });
+        if (it == list->end()) continue;
+        if (accepted) it->subId = subId;
+        else list->erase(it);
+        return;
+    }
+}
+
+// Issue #200: the client ended the admin-log read `subscriptionId` (the log is named by the id's space).
+void ClientGateway::dropAdminRead_(int64_t sessionId, int64_t subscriptionId)
+{
+    Session* s = sessions_.find(sessionId);
+    if (s == nullptr || subscriptionId == 0) return;
+    auto& list = rune::gateway::isSecuritySubscriptionId(subscriptionId) ? s->securityReadCorrs : s->catalogReadCorrs;
+    std::erase_if(list, [&](const Session::AdminRead& r) { return r.subId == subscriptionId; });
 }
 
 void ClientGateway::handleCatalogSubscribe_(Session& session, const pc::Subscribe& msg)
@@ -5904,6 +5965,8 @@ void ClientGateway::handleCatalogSubscribe_(Session& session, const pc::Subscrib
         answer(pc::ErrorCode::Internal);
         return;
     }
+    bool isNewRead = false;
+    if (!admitAdminRead_(session, msg, /*security=*/false, isNewRead)) return;
     // Issue #117: an end of this kind still owed to the admin goes first (FIFO) - else it would end the new read.
     const bool endOwed = (session.pendingReadEnds & Session::kPendingEndCatalogReads) != 0 && !submitReadEnds_(session);
     if (endOwed || !adminSink_->submitCatalogSubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
@@ -5916,7 +5979,7 @@ void ClientGateway::handleCatalogSubscribe_(Session& session, const pc::Subscrib
         sendAnswer_(session, scratch_.data(), n);
         return;
     }
-    noteReadCorr_(session.catalogReadCorrs, msg.correlationId);
+    if (isNewRead) session.catalogReadCorrs.push_back({msg.correlationId, 0});
     ++catalogSubscribesForwarded_;
 }
 
@@ -5953,6 +6016,8 @@ void ClientGateway::handleSecuritySubscribe_(Session& session, const pc::Subscri
         answer(pc::ErrorCode::AuthUnavailable);
         return;
     }
+    bool isNewRead = false;
+    if (!admitAdminRead_(session, msg, /*security=*/true, isNewRead)) return;
     // Issue #117: an end of this kind still owed to the admin goes first (FIFO) - else it would end the new read.
     const bool endOwed = (session.pendingReadEnds & Session::kPendingEndSecurityReads) != 0 && !submitReadEnds_(session);
     if (endOwed || !adminSink_->submitSecuritySubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
@@ -5964,7 +6029,7 @@ void ClientGateway::handleSecuritySubscribe_(Session& session, const pc::Subscri
         sendAnswer_(session, scratch_.data(), n);
         return;
     }
-    noteReadCorr_(session.securityReadCorrs, msg.correlationId);
+    if (isNewRead) session.securityReadCorrs.push_back({msg.correlationId, 0});
     ++securitySubscribesForwarded_;
 }
 
@@ -6352,6 +6417,7 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
     // Catalog history Task 12: a catalog subscription lives on the admin thread
     // (its owner check is there too).
     if (rune::gateway::isCatalogSubscriptionId(msgOpt->subscriptionId)) [[unlikely]] {
+        dropAdminRead_(msgOpt->sessionId, msgOpt->subscriptionId);   // issue #200: ring or not
         forwardCatalogUnsubscribe_(msgOpt->sessionId, msgOpt->subscriptionId);
         return;
     }
@@ -10746,15 +10812,17 @@ void ClientGateway::executeLiveActions_(Session& s, const rune::gateway::LiveAct
     if (act.endCatalogReads) {
         forwardCatalogUnsubscribe_(s.sessionId, rune::gateway::kEndCatalogReadsOnly);
         const auto d = authorizeCluster(perms, rune::security::Operation::Describe);
-        for (const int64_t corr : s.catalogReadCorrs)
-            sendErrorOn_(s, corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized), d ? d->detail() : std::string_view("not authorized"));
+        for (const auto& rd : s.catalogReadCorrs)
+            sendErrorOn_(s, rd.corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized),
+                         d ? d->detail() : std::string_view("not authorized"));
         s.catalogReadCorrs.clear();
     }
     if (act.endSecurityReads) {
         forwardCatalogUnsubscribe_(s.sessionId, rune::gateway::kEndSecurityReadsOnly);
         const auto d = authorizeCluster(perms, rune::security::Operation::Admin);
-        for (const int64_t corr : s.securityReadCorrs)
-            sendErrorOn_(s, corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized), d ? d->detail() : std::string_view("not authorized"));
+        for (const auto& rd : s.securityReadCorrs)
+            sendErrorOn_(s, rd.corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized),
+                         d ? d->detail() : std::string_view("not authorized"));
         s.securityReadCorrs.clear();
     }
     // Task 4: a lost WRITE grant aborts the session's open transactions (they could no longer be ended by it).
@@ -10806,8 +10874,8 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason, uint16_
         if (workerEnds) subscriptions_.erase(subId);
         else sendErrorOn_(*s, key.correlationId, code, reason);
     }
-    for (const int64_t corr : s->catalogReadCorrs) sendErrorOn_(*s, corr, code, reason);
-    for (const int64_t corr : s->securityReadCorrs) sendErrorOn_(*s, corr, code, reason);
+    for (const auto& rd : s->catalogReadCorrs) sendErrorOn_(*s, rd.corr, code, reason);
+    for (const auto& rd : s->securityReadCorrs) sendErrorOn_(*s, rd.corr, code, reason);
     // ... then the session-level frame (corr 0): every other in-flight request of the session completes with it.
     sendErrorOn_(*s, 0, code, reason);
     // Issue #212: a revoked session is terminal (never resumed): its group members leave now, so their groups

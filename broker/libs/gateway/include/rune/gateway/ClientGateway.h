@@ -1517,6 +1517,18 @@ public:
     /// Catalog history Task 12: catalog Subscribes forwarded to the admin thread /
     /// catalog Unsubscribes waiting for room on its request ring.
     [[nodiscard]] uint64_t catalogSubscribesForwarded() const noexcept { return catalogSubscribesForwarded_; }
+    /// Issue #200: Subscribes refused because the session's list of admin-log reads was full / because the correlation
+    /// id is live on the other log.
+    [[nodiscard]] uint64_t adminReadsRefusedAtCap() const noexcept { return adminReadsRefusedAtCap_; }
+    [[nodiscard]] uint64_t adminReadsRefusedDuplicateCorr() const noexcept { return adminReadsRefusedDuplicateCorr_; }
+    /// Issue #200 (control thread, cold): a reliable answer of a `__catalog` / `__security` read server on its way to
+    /// `sessionId`.  A refused or ended read is dropped from the session's list; an accepted one learns its
+    /// subscription id.  Only the header's type and correlation id are decoded; anything else is ignored.
+    void noteAdminLogAnswer(int64_t sessionId, const uint8_t* frame, std::size_t len);
+    /// Issue #200 test seam: run the live actions of a permission refresh on `sid`.
+    void executeLiveActionsForTest(int64_t sid, const rune::gateway::LiveActions& a) {
+        if (Session* s = sessions_.find(sid)) executeLiveActions_(*s, a);
+    }
     [[nodiscard]] std::size_t pendingCatalogUnsubscribes() const noexcept { return pendingCatalogUnsubs_.size(); }
     [[nodiscard]] uint64_t catalogUnsubscribesDropped() const noexcept { return catalogUnsubsDropped_; }
     [[nodiscard]] uint64_t catalogClosesLeftToTheSweep() const noexcept { return catalogClosesToSweep_; }
@@ -2736,6 +2748,7 @@ private:
     uint64_t catalogUnsubsDropped_ = 0;
     uint64_t catalogClosesToSweep_ = 0;   // fix round 3: closes left to the admin's liveness sweep
     uint64_t catalogSubscribesForwarded_ = 0;
+    uint64_t adminReadsRefusedAtCap_ = 0, adminReadsRefusedDuplicateCorr_ = 0;
     void forwardCatalogUnsubscribe_(int64_t sid, int64_t subscriptionId);
     int  flushPendingCatalogUnsubs_();
     // Issue #117: an admin-log read end (-2 / -3) of a live session is the Session's own pending state (never the
@@ -2783,7 +2796,9 @@ private:
     [[nodiscard]] std::size_t unauthSessionsOf_(std::string_view host);   ///< issue #236 (cold: one Connect)
     uint64_t viewAcksRefusedLegacy_ = 0;   ///< Produce frames with the View bit refused by a gateway without shard mode
     uint64_t controlBatchRefusals_ = 0;   ///< X036: Produce frames refused for carrying a client control batch (rate-limited log)
-    static void noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr);
+    [[nodiscard]] bool admitAdminRead_(Session& s, const rune::protocol::client::Subscribe& msg, bool security,
+                                       bool& isNew);
+    void dropAdminRead_(int64_t sessionId, int64_t subscriptionId);
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
     rune::catalog::NamespaceMirror namespaces_;   ///< namespaces Task 9: control thread's copy (login lookup)
     rune::node::NsSlotTable nsSlots_;             ///< namespaces Phase 2 Task 8: this gateway's own slot table
