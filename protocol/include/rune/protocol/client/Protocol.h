@@ -263,6 +263,9 @@ enum class ErrorCode : uint16_t {
     LeaseNotFound            = 64,  // no live lease for the key, or a different version.  Definite
     LeaseLimitExceeded       = 65,  // lease.max_keys or the namespace max-leases is reached.  Definite
     LeaseTtlTooLarge         = 66,  // the requested TTL is above lease.max_ttl.  Definite
+    // Schema retire (#419).  Sent to every client version as is (no version gate: a client that does not know it treats
+    // an unknown produce / schema error as terminal).
+    SchemaVersionRetired     = 67,  // a produced record, or a typed open, names a schema version below the topic's retire floor.  Definite, never retriable
 };
 
 /// True for the codes a transaction vote can answer EndTxn(commit) with: 55, 56, 57, 62 and 63.

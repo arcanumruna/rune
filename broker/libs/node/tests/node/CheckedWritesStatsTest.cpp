@@ -54,6 +54,12 @@ Entries expectedTopic(VerdictRig& r, std::vector<std::pair<uint32_t, uint64_t>>*
                                     {19, t.foldPausedOnTxnLockNs}, {20, t.markerWithoutVote}})
             e.emplace_back(id, static_cast<int64_t>(v));
     }
+    if (w->spec != nullptr) {   // schema retire (#419): the topic's floor, then the versions with a count, lowest first
+        e.emplace_back(pc::kStatSchemaRetiredBelow, w->spec->retiredBelow());
+        for (std::size_t v = 1; v < w->spec->versionSlots(); ++v)
+            if (const SpecVersion* sv = w->spec->versionFor(static_cast<uint16_t>(v)); sv != nullptr && sv->producedRecords != 0)
+                e.emplace_back(static_cast<uint16_t>(pc::kStatProducedAtVersionBase + v), static_cast<int64_t>(sv->producedRecords));
+    }
     return e;
 }
 
@@ -146,10 +152,13 @@ TEST_P(StatsCell, ServesExactlyTheCountersThatExist) {
     EXPECT_EQ(reply.constraints, wantConstraints);
     for (std::size_t i = 1; i < reply.stats.size(); ++i) EXPECT_LT(reply.stats[i - 1].first, reply.stats[i].first) << "ids ascend";
     switch (cell.object) {
-    case StatsObject::KeyIndex:   EXPECT_EQ(reply.stats.size(), 17u); break;
-    case StatsObject::AutoInc:    EXPECT_EQ(reply.stats.size(), 20u); break;
+    case StatsObject::KeyIndex:   EXPECT_EQ(reply.stats.size(), 19u) << "17 + the retire floor + the version-1 produce count (#419)"; break;
+    case StatsObject::AutoInc:    EXPECT_EQ(reply.stats.size(), 22u) << "20 + the retire floor + the version-1 produce count (#419)"; break;
     case StatsObject::Projection: EXPECT_EQ(reply.stats.size(), 4u); break;
-    default:                      EXPECT_TRUE(reply.stats.empty()) << "a plain or untyped topic keeps no counter"; break;
+    case StatsObject::PlainTyped:
+        EXPECT_EQ(reply.stats, (Entries{{pc::kStatSchemaRetiredBelow, 1}})) << "a typed topic always reports its floor, and a count only once it produced";
+        break;
+    default:                      EXPECT_TRUE(reply.stats.empty()) << "an untyped topic keeps no counter"; break;
     }
 }
 
@@ -171,7 +180,7 @@ TEST(CheckedWritesStats, KeyIndexCountersAfterRejections) {
     ASSERT_TRUE(r.driveUntilJudged());
 
     const auto reply = r.getStats(pc::StatsScope::TopicPartition, VerdictRig::kSrc, 0);
-    ASSERT_EQ(reply.stats.size(), 17u);
+    ASSERT_EQ(reply.stats.size(), 19u);
     const VerdictSourceStats* st = r.worker->verdictStatsForTest(VerdictRig::kSrc, 0);
     ASSERT_NE(st, nullptr);
     EXPECT_EQ(reply.stats[0], (std::pair<uint16_t, int64_t>{1, 1}));
@@ -260,7 +269,7 @@ TEST(CheckedWritesStatsRegression, FollowerNeverAnswersStaleCountersRegression) 
     ASSERT_TRUE(r.driveUntilJudged());
     const auto before = r.getStats(pc::StatsScope::TopicPartition, VerdictRig::kSrc, 0);
     ASSERT_FALSE(before.notLeader);
-    ASSERT_EQ(before.stats.size(), 17u);
+    ASSERT_EQ(before.stats.size(), 19u);
 
     r.demote();
     const auto after = r.getStats(pc::StatsScope::TopicPartition, VerdictRig::kSrc, 0);
@@ -312,4 +321,19 @@ TEST(CheckedWritesStatsRegression, ExpiredReadLeaseAnswersTheSentinelRegression)
         EXPECT_TRUE(reply.notLeader) << "no lease, no counters, scope " << static_cast<int>(scope);
         EXPECT_TRUE(reply.stats.empty());
     }
+}
+
+// Schema retire (#419): the floor and the per-version produce counts, in ascending ids, capped at kMaxStats.
+TEST(CheckedWritesStatsRegression, TheRetireFloorAndTheProducedCountsOfEachInstalledVersionAreReportedRegression) {
+    VerdictRig r;
+    r.typed();
+    const auto first = r.getStats(pc::StatsScope::TopicPartition, VerdictRig::kSrc, 0);
+    EXPECT_EQ(first.stats, (Entries{{pc::kStatSchemaRetiredBelow, 1}})) << "nothing produced: no count, the floor is 1";
+    EXPECT_EQ(pc::kStatSchemaRetiredBelow, 21);
+    EXPECT_EQ(pc::kStatProducedAtVersionBase, 0x8000);
+    ASSERT_EQ(r.produce({Rec{1, 10}, Rec{2, 20}}), 0);
+    ASSERT_EQ(r.produce({Rec{3, 30}}), 0);
+    const auto after = r.getStats(pc::StatsScope::TopicPartition, VerdictRig::kSrc, 0);
+    EXPECT_EQ(after.stats, (Entries{{pc::kStatSchemaRetiredBelow, 1}, {0x8001, 3}})) << "three records at version 1";
+    EXPECT_STREQ(std::string(pc::statName(pc::StatId::schemaRetiredBelow)).c_str(), "schemaRetiredBelow");
 }

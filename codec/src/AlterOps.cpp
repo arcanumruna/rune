@@ -79,6 +79,9 @@ std::vector<uint8_t> encodeAlterOps(const std::vector<AlterOp>& ops) {
             case AlterOpType::SetCompatibility:
                 push_u8(buf, static_cast<uint8_t>(op.mode));
                 break;
+            case AlterOpType::RetireBelow:
+                push_u16le(buf, op.version);
+                break;
         }
     }
 
@@ -100,7 +103,7 @@ std::optional<std::vector<AlterOp>> decodeAlterOps(std::span<const uint8_t> blob
         uint8_t opTypeByte;
         if (!read_u8(blob, pos, opTypeByte)) return std::nullopt;
         if (opTypeByte < static_cast<uint8_t>(AlterOpType::Add)
-            || opTypeByte > static_cast<uint8_t>(AlterOpType::SetCompatibility)) {
+            || opTypeByte > static_cast<uint8_t>(AlterOpType::RetireBelow)) {
             return std::nullopt;
         }
         AlterOpType opType = static_cast<AlterOpType>(opTypeByte);
@@ -135,6 +138,10 @@ std::optional<std::vector<AlterOp>> decodeAlterOps(std::span<const uint8_t> blob
                     return std::nullopt;
                 }
                 op.mode = static_cast<CompatMode>(modeByte);
+                break;
+            }
+            case AlterOpType::RetireBelow: {
+                if (!read_u16le(blob, pos, op.version)) return std::nullopt;
                 break;
             }
         }

@@ -328,6 +328,8 @@ resolveAlterOps(const SchemaState& schema, std::span<const cd::AlterOp> ops) {
         case cd::AlterOpType::SetCompatibility:
             r.mode = op.mode;
             break;
+        case cd::AlterOpType::RetireBelow:   // a RetireSchemaVersions event, never part of a schema evolution
+            return std::unexpected(std::string("RETIRE VERSION cannot be part of a schema evolution"));
         default:
             return std::unexpected("unknown ALTER op type " + std::to_string(static_cast<int>(op.type)));
         }
@@ -392,6 +394,8 @@ unresolveAlterOps(const SchemaState& schema, std::span<const ResolvedAlterOp> op
                 return std::unexpected(std::string("SET COMPATIBILITY: carries fields it does not use"));
             op.mode = r.mode;
             break;
+        case cd::AlterOpType::RetireBelow:
+            return std::unexpected(std::string("RETIRE VERSION cannot be part of a schema evolution"));
         default:
             return std::unexpected("unknown ALTER op type " + std::to_string(static_cast<int>(r.type)));
         }

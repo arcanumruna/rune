@@ -508,8 +508,11 @@ inline constexpr int16_t kTxnPartitionVerify = 4;
 inline constexpr int16_t kCheckedWrites = 5;
 /// Lease topics: every broker serves lease DDL, the lease write hook and expiry. Lease DDL is refused below it.
 inline constexpr int16_t kLeases = 6;
+/// Schema retire (#419): every broker decodes catalog formatVer 5 (the RetireSchemaVersions event) and its workers refuse a
+/// produce whose record version is below the topic's retire floor.  `alter topic .. retire version < N` is refused below it.
+inline constexpr int16_t kSchemaRetire = 7;
 /// The level this binary supports.
-inline constexpr int16_t kLatest = kLeases;
+inline constexpr int16_t kLatest = kSchemaRetire;
 } // namespace MetadataFeature
 
 struct AlterIsrMsg {

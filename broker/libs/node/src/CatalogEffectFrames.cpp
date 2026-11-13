@@ -63,7 +63,7 @@ std::optional<std::string> topicEffectFramesError(const cat::TopicObject& t, std
             return "the schema of '" + t.name + "' does not materialize: " + ex.what();
         }
         if (auto e = tooLarge("the WriteSpec effect", t.name,
-                              std::max(kTopicWriteSpecAutoIncWireLen, kTopicWriteSpecLeaseWireLen), maxFrame)) return e;
+                              kTopicWriteSpecMaxWireLen, maxFrame)) return e;
     }
     // Phase 2c: every typed topic also posts its FilterSchema (the EVOLVING descriptor: retired fields stay, so it can
     // outgrow the materialized one) - validate or not.  Unsized, a frame the ring cannot take is refused on every broker
@@ -118,6 +118,7 @@ std::optional<std::string> eventEffectFramesError(const cat::CatalogState& after
     case cat::EventKind::CreateSchema:
     case cat::EventKind::AlterSchema:
     case cat::EventKind::SetCompatibility:
+    case cat::EventKind::RetireSchemaVersions:   // its one frame is the fixed-size write spec; the topic's frames are checked
     case cat::EventKind::AlterTopicConfig:   // its frame is fixed-size (keys 1..6, plus the lease keys 7..12; the agent's topicConfig filters to 1..6); the topic's frames are checked
         if (const cat::TopicObject* t = after.topicByObjectId(e.objectId)) return topicEffectFramesError(*t, maxFrame, t->schema ? t->schema->schemaVersion : uint16_t{1});
         return std::nullopt;

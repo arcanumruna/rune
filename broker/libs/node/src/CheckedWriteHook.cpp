@@ -57,6 +57,10 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
     leaseUpdates_ = 0;
     leaseRevokes_ = 0;
     retryAfterNs_ = 0;
+    runCount_ = 0;
+    mixed_ = false;
+    batch_ = batch;
+    batchLen_ = len;
 
     // Lease topic (spec 6.4, in the spec's order; each refusal is definite and nothing is stored).  Namespace suspension
     // is refused before the produce core (refuseSuspended_), so there is no row for it here.
@@ -117,6 +121,16 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
             stopped = pc::ErrorCode::NotLeader;
             refusal_ = HookRefusal::VersionAhead;
             return;
+        case TypedCheck::VersionRetired:
+            stopped = pc::ErrorCode::SchemaVersionRetired;
+            refusal_ = HookRefusal::VersionRetired;
+            return;
+        }
+        if (r.value.size() >= 4) {   // an accepted versioned record: one run of equal versions, else mixed
+            const uint16_t v = detail::le16(r.value.data() + 2);
+            if (runCount_ == 0) { runVersion_ = v; runCount_ = 1; }
+            else if (v == runVersion_) ++runCount_;
+            else mixed_ = true;
         }
         if (intent == static_cast<uint8_t>(rec::Intent::Upsert)) {
             if (autoInc && !r.value.empty()) [[unlikely]] intents.plainUpsert = true;
@@ -301,7 +315,21 @@ rune::storage::HookStaged CheckedWriteHook::patchKeyZeroIds_(const uint8_t* batc
     return {pc::ErrorCode::OK, out, len};
 }
 
+void CheckedWriteHook::countProduced_() noexcept {
+    const TopicWriteSpec& spec = *state_.spec;
+    if (!mixed_) {
+        if (runCount_ == 0) return;
+        if (const SpecVersion* sv = spec.versionFor(runVersion_)) sv->producedRecords += runCount_;
+        return;
+    }
+    (void)rune::protocol::forEachRecordSpan(batch_, batchLen_, [&](const rune::protocol::RecordSpan& r) {
+        if (r.value.size() < 4) return;
+        if (const SpecVersion* sv = spec.versionFor(detail::le16(r.value.data() + 2))) ++sv->producedRecords;
+    });
+}
+
 void CheckedWriteHook::onAppended(int64_t base, int64_t last) noexcept {
+    countProduced_();
     if (leaseUntracked_) [[unlikely]] {   // the index could not record this batch's updates: readiness waits for the judge to pass them
         state_.leaseUntrackedThrough = std::max(state_.leaseUntrackedThrough, last);
         leaseUntracked_ = false;

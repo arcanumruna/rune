@@ -1,6 +1,7 @@
 // CheckedWritesWriteStateTest.cpp — checked writes Part 02 Task 3: TopicWriteSpec, the wire form of its facts, and
 // checkTypedRecord / checkTypedBatch outside the matrices (bounded framing, version rules, the model-checked fuzz).
 #include <rune/node/WriteState.h>
+#include <rune/node/lease/LeaseIndex.h>
 #include <rune/catalog/CatalogState.h>
 #include <rune/codec/Serialize.h>
 
@@ -565,4 +566,165 @@ TEST(CheckedWritesWriteStateRegression, AVersionAheadWhoseBlockDoesNotFitIsRejec
     const char fits[8] = {4, 0, 9, 0, 0, 0, 0, 0};              // the same header with the whole block
     r.value = std::string_view(fits, sizeof fits);
     EXPECT_EQ(checkTypedRecord(spec, r, 5), TypedCheck::VersionAhead) << "a possible later version stays retriable";
+}
+
+// ── schema retire (#419) ──────────────────────────────────────────────────────
+namespace {
+/// Versions 1..`versions` installed (the matrix descriptor at each), the floor `retiredBelow` set through setFacts.
+TopicWriteSpec retireSpec(uint16_t versions, uint16_t retiredBelow) {
+    TopicWriteSpec s;
+    for (uint16_t v = 1; v <= versions; ++v) s.installVersion(v, matrixDescriptor(v));
+    TopicWriteSpecWire w;
+    w.topicId = 9; w.keyFieldId = kIdTag; w.keyType = PrimType::UInt64; w.keyWidth = 8; w.legacyValidate = true;
+    w.retiredBelow = retiredBelow;
+    s.setFacts(w);
+    return s;
+}
+rune::protocol::RecordSpan recordAt(std::string& store, uint16_t version) {
+    store = validRecord(1, version).value;
+    rune::protocol::RecordSpan r;
+    r.key = std::string_view("\x01\0\0\0\0\0\0\0", 8);
+    r.value = store;
+    return r;
+}
+}  // namespace
+
+TEST(CheckedWritesWriteStateRegression, ProduceLookupHonoursTheRetireFloorAndEveryOtherLookupDoesNotRegression) {
+    const TopicWriteSpec s = retireSpec(4, 3);
+    EXPECT_EQ(s.retiredBelow(), 3);
+    for (uint16_t v : {1, 2}) {
+        EXPECT_EQ(s.produceVersionFor(v), nullptr) << v;
+        EXPECT_NE(s.versionFor(v), nullptr) << "stored records of a retired version stay readable: " << v;
+        EXPECT_NE(s.validatorFor(v), nullptr) << v;
+        EXPECT_NE(s.descriptorFor(v), nullptr) << v;
+    }
+    for (uint16_t v : {3, 4}) {
+        EXPECT_EQ(s.produceVersionFor(v), s.versionFor(v)) << v;
+        EXPECT_NE(s.produceVersionFor(v), nullptr) << v;
+    }
+    EXPECT_EQ(s.produceVersionFor(0), nullptr);
+    EXPECT_EQ(s.produceVersionFor(5), nullptr) << "above the highest installed";
+    EXPECT_EQ(s.produceVersionFor(0xFFFF), nullptr);
+    // no floor: the produce lookup is versionFor
+    const TopicWriteSpec open = retireSpec(4, 1);
+    for (uint16_t v = 0; v < 7; ++v) EXPECT_EQ(open.produceVersionFor(v), open.versionFor(v)) << v;
+}
+
+TEST(CheckedWritesWriteStateRegression, TheProduceSpanFollowsInstallsAndTheFloorInEitherOrderRegression) {
+    TopicWriteSpec s;
+    TopicWriteSpecWire w;
+    w.topicId = 9; w.legacyValidate = true; w.retiredBelow = 3;
+    s.setFacts(w);   // the floor first: no version is installed, the span is empty
+    s.installVersion(1, matrixDescriptor(1));
+    s.installVersion(2, matrixDescriptor(2));
+    EXPECT_EQ(s.produceVersionFor(1), nullptr);
+    EXPECT_EQ(s.produceVersionFor(2), nullptr);
+    s.installVersion(3, matrixDescriptor(3));
+    EXPECT_NE(s.produceVersionFor(3), nullptr) << "a version installed at the floor joins the span";
+    s.installVersion(5, matrixDescriptor(5));   // a gap: version 4 has no slot content
+    EXPECT_EQ(s.produceVersionFor(4), nullptr);
+    EXPECT_NE(s.produceVersionFor(5), nullptr);
+    w.retiredBelow = 5;   // the floor moves up: 3 leaves the span
+    s.setFacts(w);
+    EXPECT_EQ(s.produceVersionFor(3), nullptr);
+    EXPECT_NE(s.produceVersionFor(5), nullptr);
+    w.retiredBelow = 9;   // past every installed version
+    s.setFacts(w);
+    EXPECT_EQ(s.produceVersionFor(5), nullptr);
+    EXPECT_NE(s.versionFor(5), nullptr);
+}
+
+TEST(CheckedWritesWriteStateRegression, TheFloorNeverLowersAndALowerOneIsCountedRegression) {
+    TopicWriteSpec s = retireSpec(4, 3);
+    TopicWriteSpecWire w;
+    w.topicId = 9; w.legacyValidate = true;
+    w.retiredBelow = 2;
+    s.setFacts(w);
+    EXPECT_EQ(s.retiredBelow(), 3);
+    EXPECT_EQ(s.lowerFloorsIgnored(), 1u);
+    w.retiredBelow = 1;
+    s.setFacts(w);
+    EXPECT_EQ(s.retiredBelow(), 3);
+    EXPECT_EQ(s.lowerFloorsIgnored(), 2u);
+    w.retiredBelow = 3;   // the same floor again (a re-post) is not a lowering
+    s.setFacts(w);
+    EXPECT_EQ(s.lowerFloorsIgnored(), 2u);
+    EXPECT_EQ(s.produceVersionFor(2), nullptr);
+}
+
+TEST(CheckedWritesWriteStateRegression, ARecordBelowTheFloorIsVersionRetiredBeforeAnyOtherClassificationRegression) {
+    const TopicWriteSpec s = retireSpec(4, 3);
+    std::string store;
+    EXPECT_EQ(checkTypedRecord(s, recordAt(store, 1), 5), TypedCheck::VersionRetired);
+    EXPECT_EQ(checkTypedRecord(s, recordAt(store, 2), 5), TypedCheck::VersionRetired);
+    EXPECT_EQ(checkTypedRecord(s, recordAt(store, 3), 5), TypedCheck::Accept);
+    EXPECT_EQ(checkTypedRecord(s, recordAt(store, 4), 5), TypedCheck::Accept);
+    EXPECT_EQ(checkTypedRecord(s, recordAt(store, 5), 5), TypedCheck::VersionAhead) << "ahead stays retriable";
+    EXPECT_EQ(checkTypedRecord(s, recordAt(store, 0), 5), TypedCheck::Reject) << "version 0 never existed: not a retired version";
+    // a tombstone carries no version: never refused for one
+    rune::protocol::RecordSpan tomb;
+    tomb.key = std::string_view("\x01\0\0\0\0\0\0\0", 8);
+    EXPECT_EQ(checkTypedRecord(s, tomb, 5), TypedCheck::Accept);
+    // a batch decides by its first not-accepted record
+    EXPECT_EQ(checkTypedBatch(s, batchOf({validRecord(1, 3), validRecord(2, 1)}), 5), TypedCheck::VersionRetired);
+    EXPECT_EQ(checkTypedBatch(s, batchOf({validRecord(1, 3), validRecord(2, 4)}), 5), TypedCheck::Accept);
+}
+
+TEST(CheckedWritesWriteStateRegression, TheRetireFloorRidesTheWriteSpecWireInEveryFormRegression) {
+    for (const bool autoInc : {false, true}) {
+        for (const bool lease : {false, true}) {
+            if (autoInc && lease) continue;
+            TopicWriteSpecWire w;
+            w.topicId = 4; w.keyFieldId = 1; w.keyType = PrimType::UInt64; w.keyWidth = 8; w.keyIndex = true;
+            if (autoInc) { w.autoIncrement = true; w.partitioner = rune::protocol::Partitioner::Modulo; w.partitionCount = 2; }
+            if (lease) { w.keyIndex = false; w.lease = rune::protocol::LeaseSpec{}; w.leaseViewTopicId = 11; }
+            const std::size_t base = topicWriteSpecWireLen(w);
+            std::vector<uint8_t> noFloor(base);
+            ASSERT_EQ(encodeTopicWriteSpec(w, noFloor), base);
+            EXPECT_EQ(noFloor[8] & 0x20, 0) << "a floor of 1 writes today's bytes";
+            w.retiredBelow = 0x0305;
+            ASSERT_EQ(topicWriteSpecWireLen(w), base + 2);
+            std::vector<uint8_t> buf(base + 2);
+            ASSERT_EQ(encodeTopicWriteSpec(w, buf), base + 2);
+            EXPECT_EQ(buf[8] & 0x20, 0x20);
+            EXPECT_EQ(buf[base], 0x05);
+            EXPECT_EQ(buf[base + 1], 0x03);
+            const auto back = decodeTopicWriteSpec(buf);
+            ASSERT_TRUE(back) << autoInc << lease;
+            EXPECT_EQ(*back, w);
+            EXPECT_FALSE(decodeTopicWriteSpec(std::span<const uint8_t>(buf.data(), buf.size() - 1))) << "one byte short";
+            auto flagless = buf;
+            flagless[8] &= static_cast<uint8_t>(~0x20);
+            EXPECT_FALSE(decodeTopicWriteSpec(flagless)) << "the floor bytes without bit 5";
+            auto floorOne = buf;
+            floorOne[base] = 1; floorOne[base + 1] = 0;
+            EXPECT_FALSE(decodeTopicWriteSpec(floorOne)) << "bit 5 means a floor above 1";
+            auto bit6 = buf;
+            bit6[8] |= 0x40;
+            EXPECT_FALSE(decodeTopicWriteSpec(bit6)) << "bits 6 and 7 stay refused";
+        }
+    }
+    EXPECT_EQ(kTopicWriteSpecMaxWireLen, kTopicWriteSpecLeaseWireLen + 2);
+}
+
+TEST(CheckedWritesWriteStateRegression, TheCatalogTopicCarriesItsFloorIntoTheWriteSpecRegression) {
+    auto t = topicOf(matrixDescriptor(), "id", true);
+    EXPECT_EQ(writeSpecWireOf(t)->retiredBelow, 1);
+    t.schema->retiredBelow = 4;
+    const auto w = writeSpecWireOf(t);
+    ASSERT_TRUE(w);
+    EXPECT_EQ(w->retiredBelow, 4);
+    EXPECT_EQ(topicWriteSpecWireLen(*w), kTopicWriteSpecWireLen + 2);
+}
+
+TEST(CheckedWritesWriteStateRegression, StoredRecordsOfARetiredVersionStillResolveForTheLeaseWriterRegression) {
+    const TopicWriteSpec s = retireSpec(4, 3);
+    const std::string v1 = validRecord(1, 1).value;
+    const std::string v4 = validRecord(1, 4).value;
+    EXPECT_EQ(leaseWriterOf(s, v1), s.descriptorFor(1)) << "the lease replay / judge still finds the writer of a stored v1 record";
+    EXPECT_NE(leaseWriterOf(s, v1), nullptr);
+    EXPECT_NE(leaseInstallSeqOf(s, v1), 0u);
+    EXPECT_NE(leaseWriterOf(s, v4), nullptr);
+    const LeaseWriter latest = latestLeaseWriter(s);
+    EXPECT_EQ(latest.version, 4);
 }

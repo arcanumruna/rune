@@ -101,7 +101,8 @@ TEST(CheckedWritesCliRegression, ErrorCodeNamesCoverEveryCodeThroughTxnConflictR
     EXPECT_EQ(errorCodeName(64), "LeaseNotFound");
     EXPECT_EQ(errorCodeName(65), "LeaseLimitExceeded");
     EXPECT_EQ(errorCodeName(66), "LeaseTtlTooLarge");
-    EXPECT_EQ(errorCodeName(67), "UnknownErrorCode");
+    EXPECT_EQ(errorCodeName(67), "SchemaVersionRetired");
+    EXPECT_EQ(errorCodeName(68), "UnknownErrorCode");
 }
 
 // Checked writes Part 08: `rune stats (topic | view) <name> [--partition N] [--json] --broker host:port`.

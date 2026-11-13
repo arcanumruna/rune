@@ -424,6 +424,11 @@ public:
     void unstampSecurity() noexcept { stampSecurity_ = false; stampOffset_ = -1; }
     /// The clock moves WITHOUT a pump (Task 10: the caller's next pump sees it).
     void advanceClock(int64_t ns) noexcept { now_ += ns; }
+    /// #419: the (topic id, retire floor) of every write-spec effect, live (writeSpecChanged) and at boot (the final state's
+    /// schemaChanged, which BrokerNode answers with the write spec too); each cleared by restart().
+    using FloorPost = std::pair<int32_t, uint16_t>;
+    [[nodiscard]] const std::vector<FloorPost>& writeSpecEffects() const noexcept { return writeSpecs_; }
+    [[nodiscard]] const std::vector<FloorPost>& bootWriteSpecEffects() const noexcept { return bootWriteSpecs_; }
     /// The live effects the applier posted: "<effect>:<topicId>".
     [[nodiscard]] const std::vector<std::string>& effects() const noexcept { return effects_; }
 
@@ -438,6 +443,8 @@ public:
         effects_.clear();
         catalogSubId_ = 0;
         bootEffects_.clear();
+        writeSpecs_.clear();
+        bootWriteSpecs_.clear();
         isr_.clear();
         silent_.clear();
         open_();
@@ -599,6 +606,10 @@ private:
         fx.schemaChanged = [this](const rune::catalog::TopicObject& t, uint16_t) {
             effects_.push_back("schemaChanged:" + std::to_string(t.topicId) + "@v" +
                                std::to_string(t.schema ? t.schema->schemaVersion : 0));
+            writeSpecs_.push_back({t.topicId, t.schema ? t.schema->retiredBelow : uint16_t{1}});   // BrokerNode posts the write spec with it
+        };
+        fx.writeSpecChanged = [this](const rune::catalog::TopicObject& t) {   // #419: the retire floor the workers are told
+            writeSpecs_.push_back({t.topicId, t.schema ? t.schema->retiredBelow : uint16_t{1}});
         };
         fx.halted = [this](const rune::catalog::ApplyError&) { effects_.push_back("halted"); };
         fx.maxFrameBytes = effectMaxFrame_;   // the applier sizes against the same frame as the leader gate
@@ -606,11 +617,15 @@ private:
         boot.topicApplied  = [this](const rune::catalog::TopicObject& t) { bootEffects_.push_back("topicApplied:" + std::to_string(t.topicId)); };
         boot.sinkApplied   = [this](const SinkSpec& s) { bootEffects_.push_back("sinkApplied:" + std::to_string(s.topicId)); };
         boot.viewInstalled = [this](const rune::catalog::ViewObject& v) { bootEffects_.push_back("viewInstalled:" + std::to_string(v.def.viewTopicId)); };
+        boot.schemaChanged = [this](const rune::catalog::TopicObject& t, uint16_t) {   // #419: the boot's write spec follows each typed topic
+            bootWriteSpecs_.push_back({t.topicId, t.schema ? t.schema->retiredBelow : uint16_t{1}});
+        };
         boot.halted        = [this](const rune::catalog::ApplyError&) { bootEffects_.push_back("halted"); };
         boot.maxFrameBytes = effectMaxFrame_;
         (void)admin_->bootCatalog(BootEffects{std::move(boot)}, LiveEffects{std::move(fx)});
     }
 
+    std::vector<FloorPost>                               writeSpecs_, bootWriteSpecs_;
     std::size_t                                          effectMaxFrame_ = 0;
     uint64_t                                             fdLimit_ = 0;
     uint64_t                                             fdReadySegments_ = 0;

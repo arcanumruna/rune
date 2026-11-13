@@ -75,6 +75,7 @@ constexpr uint16_t kNotAuthorized        = 45;
 constexpr uint16_t kViewKeyExpressionInvalid = 59;   // only to clients >= kClientVersionCheckedWrites; the gateway answers older ones 39
 constexpr uint16_t kViewConstraintInvalid    = 60;
 constexpr uint16_t kViewUniqueInvalid        = 61;
+constexpr uint16_t kSchemaVersionRetired = 67;   // #419: a typed open of a version below the retire floor (no client version gate)
 constexpr uint16_t kNamespaceLimitExceeded = 52;   // only to clients >= kClientVersionNamespaces; older get 39
 
 /// A malformed request carries no meta: it is treated as id-less (pre-v8) — it is
@@ -733,6 +734,14 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
                                  : reg_.byFingerprint(named->topicId, msg.requestedFingerprint);
     if (!e) {
         unknown();
+        return;
+    }
+    // #419: a typed open that resolves to a version below the retire floor is refused (the CURRENT version never is: the floor
+    // never passes it).  TopicSchemaResponse has no text field, so the refusal is logged with its text and answered by its code.
+    if (e->version < named->retiredBelow) {
+        spdlog::info("GetTopicSchema: schema version {} of {} is retired (versions below {})", e->version,
+                     quotedName(msg.name), named->retiredBelow);
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kSchemaVersionRetired, {}, std::nullopt, -1);
         return;
     }
     // The wire blob is the MATERIALIZED-as-of-version descriptor (its fingerprint
@@ -1477,7 +1486,8 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
     // leader's wall clock when the event is built for its append).
     const DdlMeta& meta = metaOf(req);
     const int64_t session = std::visit([](const auto& m) { return m.session; }, req);
-    b->formatVer                 = clusterFeatureLevel_ >= rune::replication::MetadataFeature::kLeases          ? cat::kFormatV4
+    b->formatVer                 = clusterFeatureLevel_ >= rune::replication::MetadataFeature::kSchemaRetire    ? cat::kFormatV5
+                                 : clusterFeatureLevel_ >= rune::replication::MetadataFeature::kLeases          ? cat::kFormatV4
                                  : clusterFeatureLevel_ >= rune::replication::MetadataFeature::kCheckedWrites ? cat::kFormatV3
                                                                                                               : cat::kCurrentFormatVer;
     b->statement                 = meta.statement;
@@ -1503,6 +1513,7 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
         case cat::EventKind::CreateSchema:
         case cat::EventKind::AlterSchema:
         case cat::EventKind::SetCompatibility:
+        case cat::EventKind::RetireSchemaVersions:
             return Rejected(reject(kInvalidSchema, why));
         case cat::EventKind::CreateTopic:
             if (std::get<cat::CreateTopicOps>(b->ops).schema) return Rejected(reject(kInvalidSchema, why));
@@ -1786,6 +1797,16 @@ AdminWorker::Built AdminWorker::buildAlter_(const AlterTopicMsg& m, const cat::C
     e.objectId    = t->objectId;
     e.prevVersion = t->version;
     e.newVersion  = t->version + 1;
+    // #419: `RETIRE VERSION < N` is the one operation of its request, a RetireSchemaVersions event (formatVer 5).  The apply
+    // rule's dry run (buildEvent_'s preview) answers the floor and upper-bound refusals with the rule's own text.
+    for (const auto& op : *ops) {
+        if (op.type != rune::codec::AlterOpType::RetireBelow) continue;
+        if (ops->size() != 1) return Rejected(reject(kInvalidSchema, "RETIRE VERSION cannot be combined with other operations", topicId, cur));
+        if (clusterFeatureLevel_ < rune::replication::MetadataFeature::kSchemaRetire)
+            return Rejected(reject(kInvalidRequest, "RETIRE VERSION needs every broker upgraded (cluster feature level 7)", topicId, cur));
+        e.ops = cat::RetireSchemaVersionsOps{op.version};
+        return e;
+    }
     bool onlySetCompat = true;
     rune::codec::CompatMode mode = t->schema->compat;
     for (const auto& op : *ops) {

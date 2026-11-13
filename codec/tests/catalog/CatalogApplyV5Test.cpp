@@ -356,3 +356,23 @@ TEST(CatalogApplyRegression, RetireOnALeaseTopicIsAllowedRegression) {
     EXPECT_EQ(s.topicByName(rc::kDefaultNsId, "inst")->schema->retiredBelow, 2);
     EXPECT_TRUE(s.topicByName(rc::kDefaultNsId, "inst")->lease.has_value());
 }
+
+TEST(CatalogApplyRegression, RetireBelowIsNeverResolvedIntoASchemaAlterRegression) {
+    rc::CatalogState s;
+    typedState(s, 2);
+    cd::AlterOp op{};
+    op.type = cd::AlterOpType::RetireBelow;
+    op.version = 2;
+    const std::vector<cd::AlterOp> ops{op};
+    const auto r = rc::resolveAlterOps(*topic(s).schema, std::span<const cd::AlterOp>(ops));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(has(r.error(), "RETIRE VERSION")) << r.error();
+    rc::ResolvedAlterOp ro;
+    ro.type = cd::AlterOpType::RetireBelow;
+    const std::vector<rc::ResolvedAlterOp> resolved{ro};
+    const auto u = rc::unresolveAlterOps(*topic(s).schema, std::span<const rc::ResolvedAlterOp>(resolved));
+    ASSERT_FALSE(u.has_value());
+    // and an AlterSchema event carrying the type does not encode: the kind's wire enum stops at SET COMPATIBILITY
+    auto e = event(rc::kFormatV5, rc::AlterSchemaOps{.ops = {ro}}, "t", 1, catalogVersion(s));
+    EXPECT_FALSE(rc::encode(e).has_value());
+}

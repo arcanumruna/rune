@@ -153,3 +153,16 @@ TEST(Evolve, ApplyOpsIsAtomicOnFirstError) {
     EXPECT_FALSE(r.has_value());
     EXPECT_EQ(nt, 2); // tag allocation is rolled back on failure, not leaked
 }
+
+TEST(EvolveRetireRegression, RetireBelowIsNeverPartOfASchemaEvolutionRegression) {
+    using namespace rune::codec;
+    const Descriptor cur = DescriptorBuilder("t", 1).add("id", PrimType::Int64, 1, true).add("age", PrimType::Int32).build();
+    AlterOp op{};
+    op.type = AlterOpType::RetireBelow;
+    op.version = 2;
+    uint16_t nextTag = 2;
+    const auto r = applyOps(cur, {op}, nextTag, 2);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("RETIRE VERSION"), std::string::npos);
+    EXPECT_EQ(nextTag, 2) << "a refused call burns no tag";
+}

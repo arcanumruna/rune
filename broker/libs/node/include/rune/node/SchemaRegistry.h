@@ -35,6 +35,8 @@ struct TopicSchema {
     PersistenceMode       persistence    = PersistenceMode::Disk;
     // Namespaces Task 5: the namespace that owns the topic (names are per namespace).
     uint32_t              nsId           = 0;
+    // Schema retire (#419): versions below this are retired (1 = none).  A topic-level fact, carried by every version entry.
+    uint16_t              retiredBelow   = 1;
 };
 
 /// In-memory registry entry built from a TopicSchema.
@@ -57,6 +59,7 @@ struct RegistryEntry {
     PersistenceMode                  persistence    = PersistenceMode::Disk;   // Phase 2b E
     std::string                      topicName;        // durable topic name (may be empty: legacy record)
     uint32_t                         nsId           = 0;
+    uint16_t                         retiredBelow   = 1;   // #419: the topic's retire floor as of this entry (read from the LATEST entry)
 };
 
 /// Single-threaded, AdminWorker-owned schema registry.

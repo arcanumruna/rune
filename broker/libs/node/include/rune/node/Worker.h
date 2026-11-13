@@ -1958,6 +1958,18 @@ public:
     }
     [[nodiscard]] uint64_t typedRejectsForTest() const noexcept { return typedRejects_; }
     [[nodiscard]] uint64_t typedVersionAheadForTest() const noexcept { return typedVersionAhead_; }
+    /// #419: batches refused SchemaVersionRetired (a record's version below the topic's retire floor).
+    [[nodiscard]] uint64_t typedVersionRetiredForTest() const noexcept { return typedVersionRetired_; }
+    /// #419: write specs that named a retire floor below the one a topic holds (ignored: the floor only moves forward).
+    [[nodiscard]] uint32_t lowerFloorsIgnoredForTest(int32_t topicId) const noexcept {
+        const auto it = writeSpecs_.find(topicId);
+        return it == writeSpecs_.end() ? 0u : it->second->lowerFloorsIgnored();
+    }
+    /// #419: the topic's write spec as this worker holds it (nullptr: none).
+    [[nodiscard]] const TopicWriteSpec* writeSpecForTest(int32_t topicId) const noexcept {
+        const auto it = writeSpecs_.find(topicId);
+        return it == writeSpecs_.end() ? nullptr : it->second.get();
+    }
     [[nodiscard]] uint64_t hookChecksForTest() const noexcept { return hookChecks_; }
     [[nodiscard]] uint64_t hookRefusalsForTest(HookRefusal why) const noexcept { return hookRefusals_[std::to_underlying(why)]; }
     /// The facts of the last write that reached the write hook.
@@ -7260,6 +7272,7 @@ private:
     std::unordered_map<int32_t, std::unique_ptr<TopicWriteSpec>> writeSpecs_;
     uint64_t typedRejects_      = 0;   // batches refused SchemaValidationFailed by checkTypedBatch
     uint64_t typedVersionAhead_ = 0;   // batches answered NotLeader: a record's version has not been installed here yet
+    uint64_t typedVersionRetired_ = 0; // batches answered SchemaVersionRetired: a record's version is below the topic's retire floor (#419)
     uint64_t hookChecks_        = 0;   // CheckedWriteHook::check ran
     WriteFacts lastWriteFacts_{};
     std::unique_ptr<LeaseHookWork> leaseHookWork_;   // lease topics: the produce hook's work area (allocated once, cold)
@@ -11699,6 +11712,7 @@ private:
     [[gnu::cold]] [[gnu::noinline]] void noteHookRefusal_(HookRefusal why, const ProduceFields& f) {
         if (why == HookRefusal::ValidationFailed) ++typedRejects_;
         else if (why == HookRefusal::VersionAhead) ++typedVersionAhead_;
+        else if (why == HookRefusal::VersionRetired) ++typedVersionRetired_;
         if (hookRefusals_[std::to_underlying(why)]++ % 1024 == 0)
             spdlog::warn("Worker {}: produce refused (reason {}) topicId={} partition={}, total {}", workerId_, std::to_underlying(why),
                          f.topicId, f.partition, hookRefusals_[std::to_underlying(why)]);

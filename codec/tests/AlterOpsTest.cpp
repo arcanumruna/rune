@@ -64,3 +64,23 @@ TEST(AlterOps, UnknownOpTypeReturnsNullopt) {
     blob[2] = 0xFF; // corrupt the opType byte (opsCount=2 bytes, then opType)
     EXPECT_FALSE(decodeAlterOps(blob).has_value());
 }
+
+TEST(AlterOpsRetireRegression, RetireBelowRoundTripsAsAU16AndTruncationIsRefusedRegression) {
+    using namespace rune::codec;
+    AlterOp op{};
+    op.type = AlterOpType::RetireBelow;
+    op.version = 0x0A0B;
+    const auto blob = encodeAlterOps({op});
+    // u16 count, u8 type 5, u16 version little-endian
+    EXPECT_EQ(blob, (std::vector<uint8_t>{1, 0, 5, 0x0B, 0x0A}));
+    const auto got = decodeAlterOps(blob);
+    ASSERT_TRUE(got.has_value());
+    ASSERT_EQ(got->size(), 1u);
+    EXPECT_EQ((*got)[0].type, AlterOpType::RetireBelow);
+    EXPECT_EQ((*got)[0].version, 0x0A0B);
+    for (std::size_t n = 0; n < blob.size(); ++n)
+        EXPECT_FALSE(decodeAlterOps(std::span<const uint8_t>(blob.data(), n)).has_value()) << "prefix " << n;
+    auto six = blob;
+    six[2] = 6;   // the next op type does not exist
+    EXPECT_FALSE(decodeAlterOps(six).has_value());
+}

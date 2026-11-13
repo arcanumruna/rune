@@ -16,6 +16,7 @@
 // Deterministic: no Aeron, no sleeps — makeForTest + the apply*ForTest seams
 // (the TopicServabilityTest rig); "committed placement" = the steady-state
 // routing image (committed metadata ready).
+#include <rune/codec/AlterOps.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/node/NamespacePaths.h>
 #include <rune/gateway/SecurityView.h>
@@ -216,8 +217,9 @@ struct GatewayRig {
     }
     /// One well-formed DDL frame of `t` (v8 extension unless the session is pre-v8).
     std::optional<rune::protocol::LeaseSpec> defineLease;   // set: the DefineTopic frame carries this lease (v18)
+    std::vector<uint8_t> alterOps{1, 2, 3};   // the ops blob of an AlterTopic frame (#419: a test may carry a retire statement)
     std::vector<uint8_t> ddlFrame(pc::TemplateId t, int64_t c, bool withExt) {
-        static const std::vector<uint8_t> blob{1, 2, 3};
+        const std::vector<uint8_t>& blob = alterOps;
         pc::DdlExtension ext;
         ext.clientName = "gw-test";
         ext.requestId  = {0x7E57, static_cast<uint64_t>(c)};
@@ -1436,4 +1438,32 @@ TEST(CatalogDescribeMaskRegression, TheGatewayStampsTheDescribeMaskOfTheRequests
     EXPECT_EQ(send(pc::TemplateId::DropTopic, viewOnly()), std::nullopt);
     // Dev / in-process: allow-all describes everything, catalog included.
     EXPECT_EQ(send(pc::TemplateId::DefineTopic, PermissionTable::allowAll()), 7);
+}
+
+// #419: `alter topic t retire version < N` is an AlterTopic whose ops are one RetireBelow; the gateway authorizes it as the
+// ALTER of the topic's schema, exactly - no grant weaker than ALTER lets it through, and ALTER alone is enough.
+TEST(CatalogRetireAuthRegression, ARetireStatementNeedsExactlyTheAlterGrantOnTheTopicRegression) {
+    using rune::security::Operation;
+    using rune::security::ResourceType;
+    GatewayRig g;
+    g.gateway().setCatalogRoute(rune::gateway::RouteLocalLeader{});
+    rune::codec::AlterOp op{};
+    op.type = rune::codec::AlterOpType::RetireBelow;
+    op.version = 3;
+    g.alterOps = rune::codec::encodeAlterOps({op});
+
+    for (const Operation weaker : {Operation::Read, Operation::Write, Operation::Create, Operation::Drop, Operation::Describe}) {
+        g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", tableOf({grantOn(weaker, ResourceType::Topic, "t")}), {}});
+        const std::size_t before = g.adminSubmits();
+        const DdlAnswer a = g.sendDdl(pc::TemplateId::AlterTopic);
+        EXPECT_TRUE(a.answered) << static_cast<int>(weaker);
+        EXPECT_EQ(a.code, pc::ErrorCode::NotAuthorized) << static_cast<int>(weaker);
+        EXPECT_EQ(g.adminSubmits(), before) << "a refused retire never reaches the admin thread: " << static_cast<int>(weaker);
+    }
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", tableOf({grantOn(Operation::Alter, ResourceType::Topic, "other")}), {}});
+    EXPECT_EQ(g.sendDdl(pc::TemplateId::AlterTopic).code, pc::ErrorCode::NotAuthorized) << "ALTER on another topic";
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", tableOf({grantOn(Operation::Alter, ResourceType::Topic, "t")}), {}});
+    const std::size_t before = g.adminSubmits();
+    (void)g.sendDdl(pc::TemplateId::AlterTopic);
+    EXPECT_EQ(g.adminSubmits(), before + 1) << "ALTER on the topic is enough: the retire reaches the admin thread";
 }

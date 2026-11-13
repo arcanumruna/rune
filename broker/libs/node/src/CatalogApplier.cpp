@@ -53,6 +53,7 @@ TopicSchema topicSchemaOf(const cat::TopicObject& t) {
     ts.topicName      = t.name;
     ts.persistence    = persistenceOf(t.persistence);
     ts.nsId           = t.nsId;
+    ts.retiredBelow   = s.retiredBelow;
     return ts;
 }
 
@@ -516,7 +517,8 @@ void CatalogApplier::project_(const cat::CatalogEvent& e, const cat::Applied& a)
     case cat::EventKind::CreateTopic:
     case cat::EventKind::CreateSchema:
     case cat::EventKind::AlterSchema:
-    case cat::EventKind::SetCompatibility: {
+    case cat::EventKind::SetCompatibility:
+    case cat::EventKind::RetireSchemaVersions: {   // #419: the registry entry of the (unchanged) current version takes the new floor
         const cat::TopicObject* t = state_.topicByObjectId(e.objectId);
         if (t != nullptr && t->schema) schemas_->applyRecord(topicSchemaOf(*t));
         return;
@@ -605,6 +607,12 @@ void CatalogApplier::effects_(const CatalogEffects& sink, const cat::CatalogEven
     case cat::EventKind::SetCompatibility:
         if (const cat::TopicObject* t = state_.topicByObjectId(e.objectId); t && t->schema && sink.schemaChanged)
             sink.schemaChanged(*t, t->schema->schemaVersion);   // only the version this event created or changed
+        return;
+    case cat::EventKind::RetireSchemaVersions:
+        // Only the workers' produce admission follows (the write spec carries the floor): no validator re-post, no filter
+        // schema - the descriptors are unchanged and stored old-version records stay readable.
+        if (const cat::TopicObject* t = state_.topicByObjectId(e.objectId); t && t->schema && sink.writeSpecChanged)
+            sink.writeSpecChanged(*t);
         return;
     case cat::EventKind::CreateView:
     case cat::EventKind::AlterView: {

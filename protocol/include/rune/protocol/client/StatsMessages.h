@@ -48,12 +48,21 @@ enum class StatId : uint16_t {
     txnVoteLatencyNsTotal        = 18,
     foldPausedOnTxnLockNs        = 19,
     txnMarkerWithoutVote         = 20,
+    schemaRetiredBelow           = 21,   // the topic's schema retire floor (1 = nothing retired); see kStatSchemaRetiredBelow
     uniqueConflicts              = 32,
     scanRows                     = 33,
     scanPages                    = 34,
     transientRecordsEvicted      = 35,
     transientSourceResets        = 36,
 };
+
+/// Schema retire (#419), topic-partition scope.  kStatSchemaRetiredBelow is the topic's retire floor (StatId 21).  For each installed
+/// schema version with a non-zero count, lowest version first until kMaxStats is reached, the response also carries
+/// statId = kStatProducedAtVersionBase + version (a version >= 0x8000 is not reported), whose value is the number of records the
+/// answering worker accepted at that version for the TOPIC (all its partitions of that topic) since it started.  A version is unused
+/// when every partition leader reports no count for it.  statId stays strictly ascending: 21 < 0x8000 + version.
+inline constexpr uint16_t kStatSchemaRetiredBelow     = static_cast<uint16_t>(StatId::schemaRetiredBelow);
+inline constexpr uint16_t kStatProducedAtVersionBase  = 0x8000;
 
 [[nodiscard]] constexpr std::string_view statName(StatId id) noexcept {
     switch (id) {
@@ -77,6 +86,7 @@ enum class StatId : uint16_t {
         case StatId::txnVoteLatencyNsTotal:         return "txnVoteLatencyNsTotal";
         case StatId::foldPausedOnTxnLockNs:         return "foldPausedOnTxnLockNs";
         case StatId::txnMarkerWithoutVote:          return "txnMarkerWithoutVote";
+        case StatId::schemaRetiredBelow:            return "schemaRetiredBelow";
         case StatId::uniqueConflicts:               return "uniqueConflicts";
         case StatId::scanRows:                      return "scanRows";
         case StatId::scanPages:                     return "scanPages";

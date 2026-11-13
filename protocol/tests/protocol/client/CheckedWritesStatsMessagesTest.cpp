@@ -178,7 +178,8 @@ TEST(CheckedWritesStatsMessages, IdsAndNamesArePinned) {
     EXPECT_EQ(pc::statName(pc::StatId::rejectionsKeyExists), "rejectionsKeyExists");
     EXPECT_EQ(pc::statName(pc::StatId::txnVoteLatencyNsTotal), "txnVoteLatencyNsTotal");
     EXPECT_EQ(pc::statName(static_cast<pc::StatId>(99)), "unknown");
-    EXPECT_EQ(pc::statName(static_cast<pc::StatId>(21)), "unknown");
+    EXPECT_EQ(pc::statName(pc::StatId::schemaRetiredBelow), "schemaRetiredBelow");   // #419: id 21
+    EXPECT_EQ(pc::statName(static_cast<pc::StatId>(22)), "unknown");
 }
 
 TEST(CheckedWritesStatsMessages, KnownTemplates) {

@@ -208,9 +208,9 @@ std::string_view errorCodeName(uint16_t code) noexcept {
         "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused",
         "ConstraintViolation", "KeyExists", "KeyNotFound", "AutoIncrementExhausted", "ViewKeyExpressionInvalid",
         "ViewConstraintInvalid", "ViewUniqueInvalid", "TxnTooLarge", "TxnConflict",
-        "LeaseNotFound", "LeaseLimitExceeded", "LeaseTtlTooLarge"};
+        "LeaseNotFound", "LeaseLimitExceeded", "LeaseTtlTooLarge", "SchemaVersionRetired"};
 #ifdef RUNE_CLI_LIVE_ENABLED
-    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::LeaseTtlTooLarge) + 1,
+    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::SchemaVersionRetired) + 1,
                   "errorCodeName: one name per rune::protocol::client::ErrorCode");
     static_assert(static_cast<uint16_t>(rune::protocol::client::ErrorCode::TopicExists) == 25,
                   "errorCodeName: the table is indexed by the enum's values");
@@ -477,6 +477,9 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
                                 case rune::codec::AlterOpType::Rename: out << "RENAME " << op.name << " -> " << op.newName; break;
                                 case rune::codec::AlterOpType::SetCompatibility:
                                     out << "SET_COMPATIBILITY " << compatName(op.mode);
+                                    break;
+                                case rune::codec::AlterOpType::RetireBelow:
+                                    out << "RETIRE VERSION < " << op.version;
                                     break;
                             }
                             out << "\n";

@@ -817,6 +817,13 @@ std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st
                 const auto blob = rune::codec::encodeAlterOps({op});
                 const auto r = c.alterTopicAndWait(e.objectName, 0, blob, ddl, t);
                 return failureOf(r.errorCode, r.detail);
+            } else if constexpr (std::is_same_v<T, cat::RetireSchemaVersionsOps>) {   // #419
+                rune::codec::AlterOp op{};
+                op.type = rune::codec::AlterOpType::RetireBelow;
+                op.version = o.below;
+                const auto blob = rune::codec::encodeAlterOps({op});
+                const auto r = c.alterTopicAndWait(e.objectName, 0, blob, ddl, t);
+                return failureOf(r.errorCode, r.detail);
             } else if constexpr (std::is_same_v<T, cat::AlterTopicConfigOps>) {
                 std::vector<rpc::ConfigChangeWire> changes;
                 for (const cat::ConfigChange& ch : o.changes)

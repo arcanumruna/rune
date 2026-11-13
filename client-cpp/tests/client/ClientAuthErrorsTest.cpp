@@ -2721,7 +2721,8 @@ TEST(ClientAuthErrorsRegression, AuthErrorNamesCoverNamespaceCodesRegression) {
     EXPECT_STREQ(rc::authErrorName(64), "LeaseNotFound");
     EXPECT_STREQ(rc::authErrorName(65), "LeaseLimitExceeded");
     EXPECT_STREQ(rc::authErrorName(66), "LeaseTtlTooLarge");
-    EXPECT_EQ(rc::authErrorName(67), nullptr);
+    EXPECT_STREQ(rc::authErrorName(67), "SchemaVersionRetired");
+    EXPECT_EQ(rc::authErrorName(68), nullptr);
 }
 
 // ---------------------------------------------------------------------------

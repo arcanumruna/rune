@@ -124,6 +124,8 @@ std::expected<Descriptor, EvolveError> applyOps(const Descriptor& currentEvolvin
                 // No descriptor change: the compatibility mode is tracked
                 // by the caller (broker), not stored on the Descriptor.
                 break;
+            case AlterOpType::RetireBelow:
+                return std::unexpected(EvolveError{"RETIRE VERSION is not a schema evolution"});
         }
     }
 

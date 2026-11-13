@@ -139,6 +139,7 @@ enum class OpStatus : uint8_t {
     case 64: return "LeaseNotFound";
     case 65: return "LeaseLimitExceeded";
     case 66: return "LeaseTtlTooLarge";
+    case 67: return "SchemaVersionRetired";
     default: return nullptr;
     }
 }

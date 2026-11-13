@@ -3348,8 +3348,8 @@ std::string_view lineageErrorName(uint16_t code) noexcept {
         "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused",
         "ConstraintViolation", "KeyExists", "KeyNotFound", "AutoIncrementExhausted", "ViewKeyExpressionInvalid",
         "ViewConstraintInvalid", "ViewUniqueInvalid", "TxnTooLarge", "TxnConflict",
-        "LeaseNotFound", "LeaseLimitExceeded", "LeaseTtlTooLarge"};
-    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::LeaseTtlTooLarge) + 1,
+        "LeaseNotFound", "LeaseLimitExceeded", "LeaseTtlTooLarge", "SchemaVersionRetired"};
+    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::SchemaVersionRetired) + 1,
                   "lineageErrorName: one name per rune::protocol::client::ErrorCode");
     if (const char* auth = authErrorName(code)) return auth;   // #225: the one source of the 44..48 names
     return code < std::size(kNames) ? kNames[code] : std::string_view("UnknownErrorCode");
