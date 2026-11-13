@@ -5833,10 +5833,8 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool 
         impl->setHooks(hk);
     }
 
-    // fix1 I4: clock coherence — when an injected clock is configured, the ring's
-    // heartbeat writer (the duty cycle, via dutyCycle(now())) and its reader
-    // (sendBlocking's liveness check) must agree on "now", or an injected-clock
-    // test can see a stale heartbeat race a real steady_clock read.
+    // The injected clock reaches the producer for its DUTY-thread work (transaction control).  App threads never
+    // read it: a blocked send/flush times its wait on the real clock against the duty-pass heartbeat (#734).
     if (cfg_.nanoClock != nullptr) {
         impl->setClockForTesting(cfg_.nanoClock);
     }

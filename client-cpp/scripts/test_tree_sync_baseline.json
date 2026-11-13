@@ -70,7 +70,7 @@
   "sync|barrier": 2
  },
  "tests/client/InvokerClientTest.cpp": {
-  "atomic|std::atomic": 4,
+  "atomic|std::atomic": 3,
   "future|#include <future>": 1,
   "future|std::future": 1,
   "future|std::future_status": 1,

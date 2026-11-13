@@ -1309,7 +1309,7 @@ ProducerImpl::BlockingWait ProducerImpl::beginBlockingWait() const {
     return BlockingWait{aeron::concurrent::BackoffIdleStrategy(
                             100, 10, std::chrono::duration<long, std::nano>(1'000),
                             std::chrono::duration<long, std::nano>(100'000)),
-                        clock_()};
+                        ring_.consumerHeartbeatTime(), steadyNowNs_()};
 }
 
 void ProducerImpl::blockingWaitStep(BlockingWait& w) {
@@ -1349,11 +1349,17 @@ void ProducerImpl::blockingWaitStep(BlockingWait& w) {
     // NotOwner (no hook wired, or a genuinely separate thread): the
     // heartbeat-bounded wait.
     w.idle.idle(0);
-    const int64_t nowNs = clock_();
+    // The heartbeat word is a duty-pass sequence, not a time: "the runner is alive" is the word CHANGING, and
+    // "how long since" is measured here on the real monotonic clock (never the injected duty clock, #734).
+    const int64_t beat  = ring_.consumerHeartbeatTime();
+    const int64_t nowNs = steadyNowNs_();
     if (closed_()) {
         throw std::logic_error("Producer::send: client closed (or this producer was closed)");
     }
-    if (nowNs - std::max(ring_.consumerHeartbeatTime(), w.startNs) > livenessNs) {
+    if (beat != w.lastBeat) {
+        w.lastBeat     = beat;
+        w.lastChangeNs = nowNs;
+    } else if (nowNs - w.lastChangeNs > livenessNs) {
         throw std::runtime_error(
             "Producer::send: back-pressured and the runner stopped draining for "
             "> agentLivenessTimeoutMs (client closed?)");
@@ -1415,12 +1421,18 @@ void ProducerImpl::submitFlush() noexcept {
     aeron::concurrent::BackoffIdleStrategy idle(
         100, 10, std::chrono::duration<long, std::nano>(1'000),
         std::chrono::duration<long, std::nano>(100'000));
-    const int64_t startNs    = clock_();
+    int64_t       lastBeat     = ring_.consumerHeartbeatTime();
+    int64_t       lastChangeNs = steadyNowNs_();
     const int64_t livenessNs = cfg_.agentLivenessTimeoutMs * 1'000'000LL;
     while (!writeToRing(kMsgFlush, nullptr, 0)) {
         if (closed_()) return;
         idle.idle(0);
-        if (clock_() - std::max(ring_.consumerHeartbeatTime(), startNs) > livenessNs) {
+        const int64_t beat  = ring_.consumerHeartbeatTime();
+        const int64_t nowNs = steadyNowNs_();
+        if (beat != lastBeat) {
+            lastBeat     = beat;
+            lastChangeNs = nowNs;
+        } else if (nowNs - lastChangeNs > livenessNs) {
             std::fprintf(stderr,
                 "rune-client: Producer::flush: ring full and the runner stopped draining for "
                 "> agentLivenessTimeoutMs; flush request dropped (records still flush on "

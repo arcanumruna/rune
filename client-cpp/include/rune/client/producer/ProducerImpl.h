@@ -837,7 +837,8 @@ public:
     /// for a non-retryable SendResult (Ok / BackPressured: no-op).
     struct BlockingWait {
         aeron::concurrent::BackoffIdleStrategy idle;
-        int64_t                                startNs = 0;
+        int64_t                                lastBeat     = 0;  // the heartbeat word last seen
+        int64_t                                lastChangeNs = 0;  // steadyNowNs_() when it last changed
     };
     [[nodiscard]] BlockingWait beginBlockingWait() const;
     void blockingWaitStep(BlockingWait& w);
@@ -845,7 +846,7 @@ public:
 
     using ClockFn = int64_t (*)() noexcept;
     void setClockForTesting(ClockFn fn) noexcept { clock_ = fn; }
-    /// The DEFAULT liveness clock (steady nanoseconds — the unit of the ring heartbeat and livenessNs).
+    /// The default clock (steady nanoseconds): the blocking waits and flush time themselves on it.
     [[nodiscard]] static int64_t defaultClockNowForTest() noexcept { return steadyNowNs_(); }
 
     /// Pump hook, wired by Client::producer() in BOTH runner modes (fix1 C1):
@@ -912,8 +913,11 @@ public:
     /// per producer) — a relaxed store either way (see M2ORingBuffer), just
     /// cheaper to do it once.
     /// Task 14: no-op for a Direct producer (nobody waits on its ring).
-    void publishHeartbeat(int64_t nowNs) noexcept {
-        if (mode_ != IngressMode::Direct) ring_.consumerHeartbeatTime(nowNs);
+    /// The heartbeat word carries a duty-pass SEQUENCE (not a time): a waiting app thread sees the runner alive
+    /// by the word changing and times the gap on its own real clock, so the injected duty clock is never read
+    /// off the duty thread (#734).
+    void publishHeartbeat(int64_t /*nowNs*/) noexcept {
+        if (mode_ != IngressMode::Direct) ring_.consumerHeartbeatTime(++heartbeatSeq_);
     }
 
     /// fix1 C2/I3: mark this producer's ring closed. Called by Client::closeImpl_
@@ -2433,6 +2437,7 @@ private:
 
     // ---- sendBlocking() support (app thread only) -----------------------------
     static int64_t steadyNowNs_() noexcept;
+    int64_t heartbeatSeq_ = 0;          // duty-owned: the value publishHeartbeat() stores
     ClockFn clock_   = &steadyNowNs_;   // overridable by setClockForTesting()
     uint64_t throttledFailFast_ = 0;    // Throttled (53) answers failed at once (retry-after >= delivery deadline)
     uint64_t throttledBackoffs_ = 0;    // Task 14: Throttled (53) answers backed off

@@ -439,6 +439,7 @@ struct ClientConfig {
     // Thread mode: pin the runner thread to this CPU (Linux; -1 = do not pin).
     int32_t    runnerCore = -1;
     // Duty-cycle clock (tests inject; nullptr = std::chrono::steady_clock).
+    // App threads never read it: they pass relative timeouts and time their own waits on the real monotonic clock.
     NanoClock  nanoClock  = nullptr;
     // Aeron client liveness: in Invoker mode doWork() must run at least this often.
     int64_t    aeronClientLivenessTimeoutNs = 10'000'000'000LL;

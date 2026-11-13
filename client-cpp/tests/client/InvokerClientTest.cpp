@@ -8,6 +8,7 @@
 
 #include <rune/client/Client.h>
 #include <rune/client/producer/InFlightRing.h>
+#include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/detail/CpuAffinity.h>
 
 #include <gtest/gtest.h>
@@ -45,6 +46,17 @@ int64_t realNow() {
 // threads.
 std::atomic<int64_t> g_fakeNowMt{1};
 int64_t fakeNowMt() noexcept { return g_fakeNowMt.load(std::memory_order_relaxed); }
+
+// #734: an injected clock that remembers the first thread other than its owner (the duty thread) to read it:
+// g_clockOwnerHash holds the owner's thread hash and flips to kClockViolated on a foreign read.
+constexpr size_t     kClockViolated = 1;
+std::atomic<size_t>  g_clockOwnerHash{0};
+int64_t recordingClock() noexcept {
+    if (g_clockOwnerHash.load(std::memory_order_relaxed) != std::hash<std::thread::id>{}(std::this_thread::get_id())) {
+        g_clockOwnerHash.store(kClockViolated, std::memory_order_relaxed);
+    }
+    return g_fakeNowMt.load(std::memory_order_relaxed);
+}
 
 /// A transactional producer's config (Phase 2b F: a Producer with a transactionalId; acks=all as before).
 rc::ProducerConfig txnPcfg(std::string id) {
@@ -640,155 +652,91 @@ TEST(InvokerClient, RingSeamProducerOutlivesClientNoUseAfterFreeRegression) {
 }
 
 // ---------------------------------------------------------------------------
-// fix2 I4: clock coherence — the heartbeat's writer (the duty cycle, via
-// cfg_.nanoClock) and its reader (sendBlocking's liveness check, via
-// ProducerImpl::clock_, wired by Client::producer()/testProducerWithRingCap()
-// calling setClockForTesting(cfg_.nanoClock)) must agree on "now". Without
-// that wiring, sendBlocking would fall back to a real steady_clock read
-// against a heartbeat published on an unrelated injected timeline, producing
-// a spurious immediate throw even while the runner is actively draining.
-// Both tests use a thread-safe injected clock (fakeNowMt/g_fakeNowMt) deliberately
-// far from real steady_clock's epoch, so a wiring regression (falling back to
-// steady_clock on either side) would misbehave immediately and obviously.
+// #734: the injected duty clock is read by the duty thread only.  An app thread
+// blocked in send() waits on the ring consumer's heartbeat word (a duty-pass
+// SEQUENCE, never a time) and measures "how long since it last changed" on the
+// real monotonic clock.  The tests below pin that: the app thread never calls
+// the injected clock, a clock jump on the duty side cannot fake a dead runner,
+// a runner that makes no duty pass is detected although the injected clock is
+// frozen, and a runner whose passes keep arriving is never declared dead.
 // ---------------------------------------------------------------------------
 
-// fix4: no sleep_for anywhere (tests never sleep/spin to pass time). The
-// fix3 version held off draining for 150ms of REAL wall-clock time to force
-// a real reader/writer gap — effective, but a forbidden sleep.
-//
-// Redesigned to need NO real-time gap at all: agentLivenessTimeoutMs is set
-// to 1 — the smallest POSITIVE unit the ms-granularity config allows. (0 was
-// tried first: it works for the "stays frozen, never throws" phase below, but
-// then makes the later "finish draining" phase itself flaky — the instant the
-// clock resumes advancing, there is an inherent, unavoidable microseconds-
-// scale window between advancing it and this test's own doWork() call
-// republishing the heartbeat at the new value, and a ZERO-tolerance
-// threshold has no slack for that window even in CORRECTLY wired code. 1 ms
-// is ample slack for that real-world microseconds-scale window while still
-// being far smaller than any realistic real-steady_clock fallback delay.)
-// With the injected clock FROZEN and a FRESH heartbeat just published at that
-// same frozen value, a correctly-wired reader's gap is EXACTLY 0 forever
-// (`0 > 1ms-in-ns` is false, so it never throws, no matter how many times or
-// how long it is checked). A reader that wrongly fell back to real
-// steady_clock reads real elapsed time directly: real time reliably exceeds
-// 1 ms within a handful of this producer's BackoffIdleStrategy retries (spin
-// -> yield -> park, capped at 100 us/park), so it throws quickly. The test's
-// own wait is bounded by a plain iteration cap (yields, no sleep) — ample
-// either way.
-TEST(InvokerClient, RingSeamHeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingRegression) {
+namespace {
+/// One app thread running a blocking call; the outcome is 1 = returned, 2 = std::runtime_error (the liveness
+/// timeout), 3 = any other exception.  The owner polls running() and calls finish() to join.
+struct AppCall {
+    std::promise<int> promise;
+    std::future<int>  future{promise.get_future()};
+    std::string       what;   // written only by the app thread, read after finish()
+    std::thread       thread;
+
+    template <class F>
+    void start(F fn) {
+        thread = std::thread([this, fn] {
+            int o = 1;
+            try {
+                fn();
+            } catch (const std::runtime_error& e) {
+                what = e.what();
+                o    = 2;
+            } catch (const std::exception& e) {
+                what = e.what();
+                o    = 3;
+            } catch (...) {
+                what = "non-std exception";
+                o    = 3;
+            }
+            promise.set_value(o);
+        });
+    }
+    [[nodiscard]] bool running() { return future.wait_for(0us) != std::future_status::ready; }
+    int finish() {
+        thread.join();
+        return future.get();
+    }
+};
+} // namespace
+
+TEST(InvokerClient, ABlockedSendNeverReadsTheInjectedClockOffTheDutyThreadRegression) {
     rc::ClientConfig c = invokerCfg(3790, 3791);
     g_fakeNowMt.store(1, std::memory_order_relaxed);
-    c.nanoClock = &fakeNowMt;
+    g_clockOwnerHash.store(std::hash<std::thread::id>{}(std::this_thread::get_id()), std::memory_order_relaxed);
+    c.nanoClock = &recordingClock;
     Rig r(c);
 
     rc::ProducerConfig pcfg;
     pcfg.acks                   = rc::Acks::None;
     pcfg.lingerUs               = 0;
-    pcfg.agentLivenessTimeoutMs = 1; // smallest positive unit: see the comment above
-                                     // (phase 2 below steps the clock 500 us: a 2x margin)
+    pcfg.agentLivenessTimeoutMs = 60'000;
     auto p = r.client.testProducerWithRingCap(pcfg, 4 * 1024);
     auto topic = r.client.topic("t");
-
-    // Adopt the registration and publish a FRESH heartbeat at the current
-    // (frozen) fake-clock value — ProducerHub::drainAndFlush publishes a
-    // heartbeat for every registered producer every cycle, even with nothing
-    // to drain yet.
     ASSERT_TRUE(r.drive([&] { return r.client.testProducerCount() >= 1; }));
 
-    // Fill to back-pressure.
     uint64_t ok = 0;
     for (; ok < 10'000; ++ok) {
         if (p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)) != rc::SendResult::Ok) break;
     }
     ASSERT_GT(ok, 0u);
 
-    std::atomic<bool> threw{false};
-    std::atomic<bool> succeeded{false};
-    // C-F22: catch EVERYTHING and keep the message — an exception escaping this
-    // thread used to std::terminate the whole binary ("Subprocess aborted", no
-    // output) instead of failing this test with a diagnosis.
-    std::string what;   // written only by appThread, read after join()
-    std::thread appThread([&] {
-        try {
-            p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal));
-            succeeded.store(true, std::memory_order_release);
-        } catch (const std::exception& e) {
-            what = e.what();
-            threw.store(true, std::memory_order_release);
-        } catch (...) {
-            what = "non-std exception";
-            threw.store(true, std::memory_order_release);
-        }
-    });
+    AppCall app;
+    app.start([&] { p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal)); });
 
-    // The injected clock is NEVER touched here (stays frozen) and nothing
-    // drains the ring — bounded purely by an iteration cap (yields, not a
-    // sleep): a wrongly-wired reader throws within the first couple of its
-    // own retry iterations, so this cap only needs to be "long enough to let
-    // appThread actually run a few times", not "long enough to pass a real
-    // time threshold".
-    for (int i = 0; i < 100'000 &&
-                    !threw.load(std::memory_order_acquire) &&
-                    !succeeded.load(std::memory_order_acquire);
-         ++i) {
-        std::this_thread::yield();
-    }
-    EXPECT_FALSE(threw.load(std::memory_order_acquire))
-        << "spurious timeout: the heartbeat reader is not using the injected (frozen) clock "
-           "(fell back to real steady_clock)";
-    EXPECT_FALSE(succeeded.load(std::memory_order_acquire))
-        << "nothing drains the ring above — a success here is unexpected regardless of wiring";
-
-    // Now actually let it succeed (drain for real), so appThread can be
-    // joined cleanly. fix5 minor 4: step the injected clock by 500 us, HALF
-    // the 1 ms liveness window. Each doWork() republishes the heartbeat at
-    // the just-advanced value, so the largest gap the reader can ever observe
-    // (it reads the clock between this fetch_add and the doWork() that
-    // follows) is one step = 500 us < 1 ms — a real 2x margin. (A 1 ms step
-    // made that worst-case gap EQUAL to the window, passing only because the
-    // check is a strict `>`.)
-    // C-F22: drain until the app thread finishes — bounded by progress, with a
-    // real-time hang guard only for a FAILING run (a fixed 2000-iteration cap
-    // could end before a starved app thread ran, leaving it blocked on a frozen
-    // clock).  On a hang, close() first so the blocked sender exits (Closed →
-    // logic_error, caught above) and join() can never wait forever.
     const auto hangGuard = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (!succeeded.load(std::memory_order_acquire) &&
-           !threw.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < hangGuard) {
-        g_fakeNowMt.fetch_add(500'000, std::memory_order_relaxed); // +500us injected
+    while (app.running() && std::chrono::steady_clock::now() < hangGuard) {
         r.client.doWork();
         r.gw.pump();
     }
-    const bool hung = !succeeded.load(std::memory_order_acquire) &&
-                      !threw.load(std::memory_order_acquire);
-    if (hung) r.client.close();
-    appThread.join();
+    const bool hung = app.running();
+    if (hung) r.client.closeImmediately();
+    const int outcome = app.finish();
 
-    EXPECT_FALSE(hung) << "app thread never completed while the duty cycle drained (hang guard)";
-    EXPECT_TRUE(succeeded.load()) << "send failed: " << what;
-    EXPECT_FALSE(threw.load()) << "spurious failure in send(): " << what;
+    EXPECT_FALSE(hung) << "the blocked send never completed while the duty cycle drained (hang guard)";
+    EXPECT_EQ(outcome, 1) << "send failed: " << app.what;
+    EXPECT_NE(g_clockOwnerHash.load(std::memory_order_relaxed), kClockViolated)
+        << "the injected duty clock was read off the duty thread (by the blocked app thread)";
 }
 
-// fix3 I2: a deliberately large (60 s) liveness window that the injected
-// clock crosses in a fraction of a real second (pure atomic increments, no
-// sleep) but a real steady_clock fallback could only cross by actually
-// waiting 60 REAL seconds — so a wiring regression is detected.
-//
-// fix5 Important 1: the fix3/fix4 version stopped advancing the injected
-// clock at a 120 s injected "safety stop" — under load the app thread could
-// be descheduled long enough for the advancing loop to hit that stop before
-// sendBlocking ever re-read the clock, after which nothing advanced the clock
-// again and the test HUNG in join(). Now the clock keeps advancing until the
-// app thread's future is ready; the ONLY bound is a real-time hang guard
-// (wait_for(100 us) per iteration, 5 s total) — the one real-time bound this
-// suite permits, never needed in a passing run (a correctly-wired reader
-// throws as soon as it next reads an injected time 60 s past its start). On
-// failure, close() runs BEFORE join() so the blocked sender exits promptly
-// through the ring's closed word (SendResult::Closed -> std::logic_error)
-// instead of waiting out 60 real seconds; the thread catches everything so a
-// logic_error can never terminate the process.
-TEST(InvokerClient, RingSeamHeartbeatTimeoutFiresWhenRunnerIsWedgedWithInjectedClockRegression) {
+TEST(InvokerClient, ABlockedSendSurvivesAnInjectedClockJumpWhileTheRunnerIsLiveRegression) {
     rc::ClientConfig c = invokerCfg(3792, 3793);
     g_fakeNowMt.store(1, std::memory_order_relaxed);
     c.nanoClock = &fakeNowMt;
@@ -797,55 +745,114 @@ TEST(InvokerClient, RingSeamHeartbeatTimeoutFiresWhenRunnerIsWedgedWithInjectedC
     rc::ProducerConfig pcfg;
     pcfg.acks                   = rc::Acks::None;
     pcfg.lingerUs               = 0;
-    pcfg.agentLivenessTimeoutMs = 60'000; // only the injected clock can cross this quickly
+    pcfg.agentLivenessTimeoutMs = 60'000;
     auto p = r.client.testProducerWithRingCap(pcfg, 4 * 1024);
     auto topic = r.client.topic("t");
+    ASSERT_TRUE(r.drive([&] { return r.client.testProducerCount() >= 1; }));
+
     uint64_t ok = 0;
     for (; ok < 10'000; ++ok) {
         if (p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)) != rc::SendResult::Ok) break;
     }
     ASSERT_GT(ok, 0u);
 
-    enum class Outcome { Timeout, Succeeded, OtherException };
-    std::promise<Outcome> outcomePromise;
-    std::future<Outcome>  outcomeFuture = outcomePromise.get_future();
-    std::thread appThread([&] {
-        Outcome o = Outcome::Succeeded;
-        try {
-            p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal));
-        } catch (const std::runtime_error&) {
-            o = Outcome::Timeout;          // the liveness timeout: expected
-        } catch (...) {
-            o = Outcome::OtherException;   // e.g. logic_error("client closed") after close()
-        }
-        outcomePromise.set_value(o);
-    });
+    AppCall app;
+    app.start([&] { p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal)); });
 
-    // The runner NEVER runs here (no doWork() calls — simulating "wedged"):
-    // advance the SAME injected clock until the app thread finishes. Real time
-    // only bounds the loop as a hang guard (see above).
-    const auto hangGuard = std::chrono::steady_clock::now() + 5s;
-    bool ready = false;
-    while (!(ready = outcomeFuture.wait_for(100us) == std::future_status::ready) &&
-           std::chrono::steady_clock::now() < hangGuard) {
-        // +100 ms injected per iteration: each iteration also waits (up to)
-        // 100 us of real time in wait_for above, so a 1 ms step would need
-        // >= 60'000 iterations (>= 6 REAL seconds) to cross the 60 s window —
-        // longer than the hang guard itself. 100 ms crosses it in ~600.
-        g_fakeNowMt.fetch_add(100'000'000, std::memory_order_relaxed);
+    // First, with no duty pass yet, jump the clock repeatedly (bounded, yielding) so that the app thread's
+    // waiting reads are certain to see a clock far past anything the heartbeat could be stamped with.
+    for (int i = 0; i < 20'000 && app.running(); ++i) {
+        g_fakeNowMt.fetch_add(120'000'000'000LL, std::memory_order_relaxed);
+        std::this_thread::yield();
     }
+    // Then the injected clock jumps 120 s (twice the 60 s window) right after EVERY duty pass: a reader that
+    // compared the injected clock with the heartbeat would see a gap of 120 s and call the runner dead.
+    const auto hangGuard = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (app.running() && std::chrono::steady_clock::now() < hangGuard) {
+        r.client.doWork();
+        r.gw.pump();
+        g_fakeNowMt.fetch_add(120'000'000'000LL, std::memory_order_relaxed);
+    }
+    const bool hung = app.running();
+    if (hung) r.client.closeImmediately();
+    const int outcome = app.finish();
 
-    EXPECT_TRUE(ready)
-        << "appThread did not finish within the 5 s real-time hang guard — sendBlocking's "
-           "reader is likely not using the injected clock (a steady_clock fallback needs 60 "
-           "REAL seconds to cross this test's liveness window)";
-    if (!ready) r.client.close(); // closed word -> the blocked sender exits now, not in 60 s
-    appThread.join();
-    if (ready) {
-        EXPECT_EQ(outcomeFuture.get(), Outcome::Timeout)
-            << "must time out (std::runtime_error) once the injected clock exceeds "
-               "agentLivenessTimeoutMs";
+    EXPECT_FALSE(hung) << "the blocked send never completed while the duty cycle drained (hang guard)";
+    EXPECT_EQ(outcome, 1) << "a live runner was declared dead after a duty-clock jump: " << app.what;
+}
+
+TEST(InvokerClient, ABlockedSendThrowsWhenNoDutyPassRunsRegression) {
+    rc::ClientConfig c = invokerCfg(3796, 3797);
+    g_fakeNowMt.store(1, std::memory_order_relaxed);
+    c.nanoClock = &fakeNowMt;   // frozen for the whole test
+    Rig r(c);
+
+    rc::ProducerConfig pcfg;
+    pcfg.acks                   = rc::Acks::None;
+    pcfg.lingerUs               = 0;
+    pcfg.agentLivenessTimeoutMs = 5;
+    auto p = r.client.testProducerWithRingCap(pcfg, 4 * 1024);
+    auto topic = r.client.topic("t");
+    ASSERT_TRUE(r.drive([&] { return r.client.testProducerCount() >= 1; }));
+
+    uint64_t ok = 0;
+    for (; ok < 10'000; ++ok) {
+        if (p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)) != rc::SendResult::Ok) break;
     }
+    ASSERT_GT(ok, 0u);
+
+    AppCall app;
+    app.start([&] { p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal)); });
+
+    // NO doWork() here: the runner makes no duty pass and the injected clock never moves.
+    const auto hangGuard = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (app.running() && std::chrono::steady_clock::now() < hangGuard) std::this_thread::yield();
+    const bool hung = app.running();
+    if (hung) r.client.closeImmediately();   // the closed word releases the blocked sender before join
+    const int outcome = app.finish();
+    EXPECT_FALSE(hung) << "the blocked send never timed out although no duty pass ran (5 s hang guard)";
+    EXPECT_EQ(outcome, 2) << "must throw std::runtime_error once the heartbeat has not changed for "
+                             "agentLivenessTimeoutMs; got " << app.what;
+}
+
+// The heartbeat word is a duty-pass sequence.  A blocked send must NOT time out while duty passes keep
+// arriving (the word keeps changing), even when the ring stays full for longer than agentLivenessTimeoutMs of
+// real time, and MUST time out once they stop.  Nothing drains the ring here: only publishHeartbeat() runs.
+TEST(InvokerClient, ABlockedSendStaysAliveWhileDutyPassesArriveThenThrowsWhenTheyStopRegression) {
+    rc::ProducerConfig cfg;
+    cfg.acks                   = rc::Acks::None;
+    cfg.lingerUs               = 0;
+    cfg.agentLivenessTimeoutMs = 100;
+    auto* impl = new rc::producer::ProducerImpl(cfg, 4 * 1024);
+    rc::Producer p(impl);
+    const rc::TopicHandle topic{1, 4};
+    uint64_t ok = 0;
+    for (; ok < 1'000'000; ++ok) {
+        if (p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)) != rc::SendResult::Ok) break;
+    }
+    ASSERT_GT(ok, 0u);
+    ASSERT_LT(ok, 1'000'000u) << "ring never filled";
+
+    AppCall app;
+    app.start([&] { p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal)); });
+
+    // 1. Duty passes keep arriving for 3x the liveness window of real time: the blocked send stays blocked.
+    const auto aliveUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    while (std::chrono::steady_clock::now() < aliveUntil && app.running()) {
+        impl->publishHeartbeat(0);   // the argument is not used: the word is a sequence
+        std::this_thread::yield();
+    }
+    EXPECT_TRUE(app.running()) << "a live runner (duty passes arriving) was declared dead";
+
+    // 2. The passes stop: the send must time out (bounded by a real-time hang guard, then closed to release it).
+    const auto hangGuard = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (app.running() && std::chrono::steady_clock::now() < hangGuard) std::this_thread::yield();
+    const bool hung = app.running();
+    if (hung) impl->markRingClosed();
+    const int outcome = app.finish();
+    EXPECT_FALSE(hung) << "the send never timed out after the duty passes stopped";
+    EXPECT_EQ(outcome, 2) << "must throw std::runtime_error once no duty pass ran for agentLivenessTimeoutMs; got "
+                          << app.what;
 }
 
 // ---------------------------------------------------------------------------

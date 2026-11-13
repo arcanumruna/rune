@@ -237,8 +237,8 @@ struct ProducerConfig {
     /// record that would take the batch past it.
     int32_t tier2SlotBytes = 0;
     int64_t deliveryTimeoutMs = 30000;  // total time to keep retransmitting before failing.
-    int64_t agentLivenessTimeoutMs = 1000; // void send(): back-pressured with no ring-consumer
-                                           // heartbeat for this long => throw (runner gone)
+    int64_t agentLivenessTimeoutMs = 1000; // void send(): back-pressured and no duty pass for this
+                                           // long of real time => throw (runner gone)
     int32_t directDeferredBytes = 256 * 1024; // Invoker (Direct ingress) only: room for sends made
                                               // from callbacks the producer fires mid-duty-work
                                               // (deferred, applied after the walk). Clamped up
@@ -709,7 +709,8 @@ public:
     /// Invoker mode, called on the owner thread outside a callback, pumps the
     /// Client's duty cycle itself (no idle); any OTHER genuinely separate thread
     /// (Thread mode's app thread; a foreign thread) backs off and waits, bounded
-    /// by the ring's consumer-liveness heartbeat — a BACKSTOP for a wedged
+    /// by "no duty pass for agentLivenessTimeoutMs of real time" (the ring's consumer heartbeat is a duty-pass
+    /// sequence; the wait is timed on the real monotonic clock, never the injected one) — a BACKSTOP for a wedged
     /// runner ONLY (fix1 I5): a cleanly closed Client is reported immediately
     /// (see Closed below), never decided by this timer.
     ///
@@ -735,8 +736,8 @@ public:
     ///                          callback — the common case — or, in Thread
     ///                          mode, the runner thread itself outside its own
     ///                          cycle; use trySend there), OR back-pressured
-    ///                          and the runner stopped draining for longer
-    ///                          than agentLivenessTimeoutMs (a wedged runner,
+    ///                          and no duty pass ran for longer than
+    ///                          agentLivenessTimeoutMs of real time (a wedged runner,
     ///                          NOT a closed Client).
     /// Zero allocation when accepted.
     ///
@@ -968,7 +969,7 @@ public:
     /// producer's ring; the duty thread flushes every record accepted before it
     /// on its next cycle.  Ring full: an app thread backs off until the token
     /// fits (the duty cycle drains the ring) or the producer closes — bounded by
-    /// the ring consumer's heartbeat: stale for > agentLivenessTimeoutMs (a
+    /// no duty pass for > agentLivenessTimeoutMs of real time (a
     /// wedged runner) logs and drops the flush request (records still flush on
     /// linger / batch size).  Called from a duty-cycle callback it never waits
     /// (the next flush pass flushes all).

@@ -267,6 +267,7 @@ public:
         return static_cast<std::int32_t>(size);
     }
 
+    /// The consumer's liveness word (a duty-pass sequence for the producer ring, not a time).
     void consumerHeartbeatTime(std::int64_t timeNs) noexcept {
         __atomic_store_n(word64_(m_consumerHeartbeatIndex), timeNs, __ATOMIC_RELAXED);
     }

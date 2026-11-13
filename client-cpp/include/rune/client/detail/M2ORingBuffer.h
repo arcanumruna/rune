@@ -102,7 +102,8 @@ public:
     static constexpr aeron::util::index_t trailerLength() { return TRAILER_LENGTH; }
 
     /// Aeron ManyToOneRingBuffer::consumerHeartbeatTime: the single consumer
-    /// publishes its liveness so producers can tell a slow consumer from a dead
+    /// publishes its liveness (here a duty-pass sequence, not a time: waiters
+    /// watch it change) so producers can tell a slow consumer from a dead
     /// one — a backstop ONLY for a wedged runner (fix1 I5: a cleanly closed
     /// Client is decided by closed(), below, never by this timer).  It publishes
     /// nothing else (no other memory is ordered against it), so both sides use a
