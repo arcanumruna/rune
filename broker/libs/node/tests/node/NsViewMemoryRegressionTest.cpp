@@ -124,8 +124,14 @@ struct SimLog {
         batches.push_back({b.build(), end, 2 * n * rounds});
         end += 2 * n * rounds;
     }
+    int64_t damagedFrom = -1;   ///< #874: a read at or past this offset reaches a damaged segment (empty, `damaged`)
     rune::storage::LogReadView read(int64_t from, int64_t /*to*/) const {
         if (from < start) return {};
+        if (damagedFrom >= 0 && from >= damagedFrom) {
+            rune::storage::LogReadView v;
+            v.damaged = true;
+            return v;
+        }
         for (const B& b : batches)
             if (from >= b.base && from < b.base + b.count)
                 return rune::storage::LogReadView{b.bytes.data(), b.bytes.size(), b.base, b.base + b.count};
@@ -626,4 +632,59 @@ TEST(WorkerViewSetRegression, PausedViewWithAHeldDeltaGivesBackItsWindowRegressi
     EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotB), inst->table.memoryBytes());
     rig.drive(kSrcB, kSlotB, kNsB, log, 0, 4);
     EXPECT_TRUE(std::holds_alternative<ViewRunning>(inst->pause)) << "the pause it caused is lifted";
+}
+
+// #874: a damaged source pause is the probe's to lift, never the namespace limit's: in a namespace that is NOT over its
+// limit the limit gate sees a Damaged-paused view every pass and must leave it paused.
+TEST(NsViewMemoryRegression, OverLimitPauseStillResumesAndADamagedPauseIsNotResumedByTheLimitGateRegression) {
+    Rig rig(/*limit chunks*/ 100);
+    SimLog log;
+    log.append(1, 4);
+    log.append(5, 4);
+    for (int i = 0; i < 4; ++i) rig.driveA(log);   // one batch a pass
+    ASSERT_EQ(rig.vs.instanceServeState(kViewA, 0).foldCursor, log.end);
+    ASSERT_FALSE(rig.vs.nsViewMemOver(kSlotA));
+    const int64_t damagedAt = log.end;
+    log.append(100, 4);
+    log.damagedFrom = damagedAt;
+    rig.driveA(log);
+    ASSERT_EQ(rig.vs.viewDamagedPausesForTest(), 1u);
+    auto st = rig.vs.instanceServeState(kViewA, 0);
+    EXPECT_TRUE(st.paused);
+    EXPECT_TRUE(st.damaged);
+    EXPECT_EQ(st.pausedOffset, damagedAt);
+    for (int i = 0; i < 50; ++i) rig.driveA(log);   // the clock stands still: no probe is due
+    st = rig.vs.instanceServeState(kViewA, 0);
+    EXPECT_TRUE(st.paused) << "the limit gate resumed a Damaged pause";
+    EXPECT_EQ(rig.vs.viewResumesForTest(), 0u);
+    EXPECT_EQ(rig.vs.viewDamagedPausesForTest(), 1u);
+    WorkerViewSet::RowStatus rs{};
+    EXPECT_EQ(rig.row(kViewA, 1, rs), nullptr);
+    EXPECT_EQ(rs, WorkerViewSet::RowStatus::Damaged);
+}
+
+// #874: the paused view probes its offset once a second of the clock and resumes, folding on from the same cursor,
+// when it reads again.
+TEST(NsViewMemoryRegression, DamagedViewResumesWhenTheRangeReadsAgainRegression) {
+    Rig rig(/*limit chunks*/ 100);
+    SimLog log;
+    log.append(1, 4);
+    rig.driveA(log);
+    const int64_t damagedAt = log.end;
+    log.append(100, 4);
+    log.damagedFrom = damagedAt;
+    rig.driveA(log, 0, 1'000'000'000);
+    ASSERT_TRUE(rig.vs.instanceServeState(kViewA, 0).damaged);
+    log.damagedFrom = -1;   // the range reads again
+    rig.driveA(log, 0, 1'500'000'000);   // half a second after the pause: no probe yet
+    EXPECT_TRUE(rig.vs.instanceServeState(kViewA, 0).damaged);
+    EXPECT_EQ(rig.vs.viewResumesForTest(), 0u);
+    rig.driveA(log, 0, 2'000'000'000);   // a second after the pause: the probe reads and the view resumes
+    EXPECT_FALSE(rig.vs.instanceServeState(kViewA, 0).paused);
+    EXPECT_EQ(rig.vs.viewResumesForTest(), 1u);
+    for (int i = 0; i < 5; ++i) rig.driveA(log, 0, 2'000'000'000);
+    EXPECT_EQ(rig.vs.instanceServeState(kViewA, 0).foldCursor, log.end) << "the fold continued from the paused offset";
+    WorkerViewSet::RowStatus rs{};
+    EXPECT_NE(rig.row(kViewA, 100, rs), nullptr);
+    EXPECT_EQ(rs, WorkerViewSet::RowStatus::Ok);
 }

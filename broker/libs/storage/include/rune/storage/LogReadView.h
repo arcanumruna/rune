@@ -13,6 +13,8 @@ struct LogReadView {
     std::size_t    len        = 0;
     int64_t        baseOffset = 0;
     int64_t        nextOffset = 0;
+    /// #874: the read reached unservable bytes at its start offset (empty; the consumer fails, it must not wait).
+    bool           damaged    = false;
     bool empty() const noexcept { return data == nullptr || len == 0; }
 };
 

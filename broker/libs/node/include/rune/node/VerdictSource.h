@@ -345,6 +345,8 @@ public:
     }
     [[nodiscard]] int32_t partition() const noexcept { return partition_; }
     [[nodiscard]] bool stalled() const noexcept { return stalled_; }
+    /// #874: the judge stalled because its source log is damaged at a cursor it must read (a new leadership clears it).
+    [[nodiscard]] bool damaged() const noexcept { return stalled_ && stallReason_ == StallReason::Damaged; }
     /// Cold, the owner after growing the index: resumes a judge that stalled on a full index.  The other stalls stay.
     void unstall() noexcept {
         if (stallReason_ == StallReason::Full && state_ != nullptr && state_->rejected.size() + stallRoom_ <= state_->rejected.capacity()) stalled_ = false;
@@ -568,7 +570,7 @@ private:
     bool   reindex_();
     void   recomputeCap_() noexcept;
     void   discardAhead_(Member& m);
-    enum class StallReason : uint8_t { None, Full, OutOfOrder, Capacity };
+    enum class StallReason : uint8_t { None, Full, OutOfOrder, Capacity, Damaged };
     void   stall_(StallReason reason) noexcept;
     void   waitForInstall_(const ConstraintSet& set) noexcept;
     void   noteLayoutWait_(int64_t offset, uint16_t version) noexcept;
@@ -786,6 +788,7 @@ bool VerdictSource::switchSet_(int64_t A, ReadRangeFn& readRange, const rune::vi
         if (m.inst->foldCursor < A + 1) {
             const rune::storage::LogReadView v = readRange(m.inst->foldCursor, A + 1);
             if (!v.empty()) work += replay_(m, v, A + 1, aborted, rune::view::spanReaderOf(readRange));
+            else if (v.damaged) [[unlikely]] stall_(StallReason::Damaged);   // #874
         }
         if (m.inst->foldCursor != A + 1) return false;
     }
@@ -830,7 +833,10 @@ int VerdictSource::replayMember_(ReadRangeFn& readRange, Member& m, int64_t boun
     // A read stops at the next segment base at or above its end: a compacted gap whose next segment starts at judgeCursor_ reads
     // empty to judgeCursor_, and still to the bound when judgeCursor_ == bound.  So read to the bound and at least one past it.
     const rune::storage::LogReadView v = readRange(inst.foldCursor, std::max(bound, judgeCursor_ + 1));
-    if (v.empty()) return 0;
+    if (v.empty()) {
+        if (v.damaged) [[unlikely]] stall_(StallReason::Damaged);   // #874
+        return 0;
+    }
     const int work = replay_(m, v, judgeCursor_, aborted, rune::view::spanReaderOf(readRange));
     if (inst.foldCursor >= judgeCursor_) m.replayFrom = -1;
     return work;
@@ -841,7 +847,10 @@ template <class ReadRangeFn, class Fn>
 bool VerdictSource::walkBatches_(ReadRangeFn& readRange, int64_t from, int64_t to, Fn&& fn) noexcept {
     for (int64_t at = from; at < to;) {
         const rune::storage::LogReadView v = readRange(at, to);
-        if (v.empty()) return false;
+        if (v.empty()) {
+            if (v.damaged) [[unlikely]] stall_(StallReason::Damaged);   // #874
+            return false;
+        }
         const int64_t start = at;
         for (std::size_t pos = 0; pos < v.len;) {
             const rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
@@ -1316,7 +1325,10 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
             // the cap would wait at it forever.  A delta holds at most the cap plus one unit.
             const int64_t hardLimit = A == INT64_MAX ? bound : std::min(bound, A + 1);
             const rune::storage::LogReadView v = readRange(judgeCursor_, limit);
-            if (v.empty()) break;
+            if (v.empty()) {
+                if (v.damaged) [[unlikely]] stall_(StallReason::Damaged);   // #874
+                break;
+            }
             const int64_t before = judgeCursor_;
             work += judgeBatches_(v, limit, hardLimit, aborted);
             if (txnStop_ == TxnStop::Probe) {

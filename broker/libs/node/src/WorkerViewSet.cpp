@@ -870,8 +870,9 @@ const ViewInstance* WorkerViewSet::serveInstance_(int32_t viewTopicId, int32_t p
     }
     outLayout = &it->second.layout;
     // Task 12 (D26): a view paused over its namespace's memory limit answers Paused (never a stale row).
-    if (std::holds_alternative<ViewPaused>(it->second.pause)) {
-        if (outStatus != nullptr) *outStatus = RowStatus::Paused;
+    if (const ViewPaused* const pz = std::get_if<ViewPaused>(&it->second.pause)) {
+        if (outStatus != nullptr)   // #874: a damaged source log is told apart from the namespace limit
+            *outStatus = pz->reason == ViewPauseReason::Damaged ? RowStatus::Damaged : RowStatus::Paused;
         return nullptr;
     }
     // SERVE-GUARD: a view still rebuilding after a restart must NEVER serve a
@@ -944,7 +945,8 @@ WorkerViewSet::ScanPage WorkerViewSet::scanPage(int32_t viewTopicId, int32_t par
     RowStatus st{};
     if (serveInstance_(viewTopicId, partition, layout, &st) == nullptr) {
         // As GetViewRowK: an instance this broker does not host is not an empty page.
-        page.status = st != RowStatus::NotFound ? Status::kNotReady : Status::kAbsentKey;
+        page.status = st == RowStatus::Damaged ? Status::kStorageError
+                    : st != RowStatus::NotFound ? Status::kNotReady : Status::kAbsentKey;
         return page;
     }
     ViewInstance& inst = views_.find(instKey(viewTopicId, partition))->second;
@@ -1211,7 +1213,10 @@ void WorkerViewSet::dropSourceTopic(int32_t srcTopicId) {
     std::erase_if(verdictSources_, [&](const auto& kv) {
         if (!ofTopic(kv)) return false;
         releaseJudge_(*kv.second);
-        if (PartitionWriteState* s = kv.second->boundState()) s->verdicts = nullptr;   // the state may outlive its judge
+        if (PartitionWriteState* s = kv.second->boundState()) {   // the state may outlive its judge
+            s->verdicts = nullptr;
+            s->judgeDamaged = false;
+        }
         return true;
     });
     for (auto it = keyIndexes_.begin(); it != keyIndexes_.end();) {
@@ -1327,6 +1332,7 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
         }
         releaseJudge_(*vit->second);
         write.verdicts = nullptr;
+        write.judgeDamaged = false;
         verdictSources_.erase(vit);
         eraseKeyIndex_(key);
         return nullptr;

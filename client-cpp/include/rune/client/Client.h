@@ -242,6 +242,8 @@ struct ViewRowResult {
     static constexpr uint16_t kInvalidRequest  = 5;
     static constexpr uint16_t kBusy            = 6;
     static constexpr uint16_t kRowTooLarge     = 7;   ///< the row exceeds the broker's egress frame (no bytes)
+    /// The view's source log is damaged on this broker (no row bytes); not retriable on this leader, never retried.
+    static constexpr uint16_t kStorageError    = 26;
     static constexpr uint16_t kNotAuthorized   = 45;  ///< the session may not READ the view (no bytes; never retried)
     /// The view is paused over its namespace's memory limit (client version 14); rowBytes = the paused fold offset as one
     /// little-endian i64 (8 bytes).  Retriable once the limit is raised or memory falls.

@@ -200,7 +200,7 @@ public:
     // absent key (terminal NotFound) from a view still rebuilding (RETRIABLE
     // NotReady) from a served row (Ok).  getRow returns the row pointer; this is
     // the out-of-band reason when it returns nullptr.
-    enum class RowStatus : uint8_t { Ok, NotFound, NotReady, Paused, BadKey };
+    enum class RowStatus : uint8_t { Ok, NotFound, NotReady, Paused, BadKey, Damaged };
 
     // Readiness of the (view, partition) instance.  Returns Ready when no such
     // instance is hosted here (nothing to gate — consistent with allViewsReady
@@ -632,14 +632,17 @@ public:
     /// The serve path's view of one hosted instance (one lookup): the leadership it is caught up under and how far it
     /// folded (issue #82, the read-your-writes barrier).  nullptr leadership = not hosted.
     struct InstanceServeState { uint64_t leadership = 0; int64_t foldCursor = 0; bool hosted = false; bool ready = false;
-                                bool paused = false; int64_t pausedOffset = 0; bool fenced = false; };
+                                bool paused = false; int64_t pausedOffset = 0; bool fenced = false;
+                                bool damaged = false;   ///< #874: Damaged pause (source log damaged at pausedOffset)
+                              };
     [[nodiscard]] InstanceServeState instanceServeState(int32_t viewTopicId, int32_t partition) const noexcept {
         const auto it = views_.find(instKey(viewTopicId, partition));
         if (it == views_.end()) return {};
         const ViewPaused* pz = std::get_if<ViewPaused>(&it->second.pause);
         return InstanceServeState{it->second.foldLeadership, it->second.foldCursor, true,
                                   it->second.readiness == ViewReadiness::Ready, pz != nullptr, pz ? pz->offset : 0,
-                                  it->second.spanFence.fenced()};
+                                  it->second.spanFence.fenced(),
+                                  pz != nullptr && pz->reason == ViewPauseReason::Damaged};
     }
     /// P11-9 (contract addition 13): a transaction's or an atomic batch's application spans passes; its reads are held meanwhile.
     [[nodiscard]] bool readFenced(int32_t viewTopicId, int32_t partition) const noexcept {
@@ -700,6 +703,7 @@ public:
     [[nodiscard]] bool     nsViewMemOver(uint16_t slot) const noexcept { return slot < nsViewMemOver_.size() && nsViewMemOver_[slot] != 0; }
     [[nodiscard]] uint64_t viewResumesForTest() const noexcept { return viewResumes_; }
     [[nodiscard]] uint64_t viewPausesForTest() const noexcept { return viewPauses_; }
+    [[nodiscard]] uint64_t viewDamagedPausesForTest() const noexcept { return viewDamagedPauses_; }
     [[nodiscard]] bool nsTagMatches(uint16_t slot, uint32_t nsId) noexcept {
         if (nsSlots_.matches(slot, nsId)) return true;
         ++nsSlotMismatches_;
@@ -726,7 +730,9 @@ private:
     // aggregator's LeasesOver message).  Sized and reset exactly where nsViewMem_ is.
     std::vector<uint64_t> nsLeases_     = std::vector<uint64_t>(NsSlotTable::kDefaultCapacity, 0);
     std::vector<uint8_t>  nsLeasesOver_ = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
-    uint64_t viewPauses_ = 0, viewResumes_ = 0;
+    uint64_t viewPauses_ = 0, viewResumes_ = 0, viewDamagedPauses_ = 0;
+    /// #874: a Damaged-paused view probes its offset this often.
+    static constexpr int64_t kDamagedProbeIntervalNs = 1'000'000'000;
 
     // The tables, their dirty sets' growth and a held delta: a long window between checkpoints (P11-9) is view memory too.  A
     // pushed window gives a long span's growth back (releaseWindow_; ViewTable::trimDirty).  Churn past the reserve keeps its
@@ -818,6 +824,14 @@ private:
             nsLeases_[inst.nsSlot] -= std::min<uint64_t>(nsLeases_[inst.nsSlot], inst.leasesCharged);
         inst.leasesCharged = 0;
     }
+    /// #874: the source log is damaged at `inst.foldCursor`: stop folding (reads answer StorageError); probe 1/s.
+    [[gnu::cold]] [[gnu::noinline]] void pauseDamaged_(ViewInstance& inst, int64_t nowNs) noexcept {
+        inst.pause = ViewPaused{ViewPauseReason::Damaged, inst.foldCursor};
+        inst.damagedProbeNs = nowNs;
+        ++viewDamagedPauses_;
+        spdlog::error("view {} partition {}: the source log is damaged at offset {}; the view is paused (reads answer "
+                      "StorageError)", inst.plan.viewTopicId, inst.partition, inst.foldCursor);
+    }
     /// The first drive that carries the source's namespace tag adopts it (cold, once per instance).
     void adoptNs_(ViewInstance& inst, NsTag ns) noexcept {
         if (ns.slot == kNoNsSlot || inst.nsSlot != kNoNsSlot) return;
@@ -829,7 +843,9 @@ private:
     /// The fold gate: false = the instance is (still) paused.  An array index, an nsId compare and one byte.
     [[nodiscard]] bool nsViewGate_(ViewInstance& inst) noexcept {
         const bool over = nsViewMemOver_[inst.nsSlot] != 0 && nsSlots_.matches(inst.nsSlot, inst.nsId);
-        if (std::holds_alternative<ViewPaused>(inst.pause)) {
+        if (const ViewPaused* const pz = std::get_if<ViewPaused>(&inst.pause)) {
+            // #874: a Damaged pause is the probe's to lift, never the limit's
+            if (pz->reason != ViewPauseReason::OverLimit) return false;
             if (over) return false;
             inst.pause = ViewRunning{};   // resume: the fold continues from foldCursor (== the paused offset)
             ++viewResumes_;
@@ -1088,6 +1104,18 @@ private:
         //     ViewPaused); back under it -> resume from that same foldCursor.  Untagged instances skip this.  A paused view folds
         //     nothing.  A held delta was folded already: it still leaves, and its push trims the window it drained.  A kept dirty
         //     window is given back at once: both are reclaimable charge that would hold the pause.
+        //     #874: a Damaged pause (the source log is unreadable at foldCursor) probes that offset at most once per
+        //     second and resumes when it reads; until then it holds nothing back that the limit pause would not.
+        const ViewPaused* const dz = std::get_if<ViewPaused>(&inst.pause);
+        if (dz != nullptr && dz->reason == ViewPauseReason::Damaged) [[unlikely]] {
+            if (inst.pendingValid && !tryPushDelta_(inst)) return 1;
+            if (inst.windowKept) releaseQuiet_(inst);
+            if (nowNs - inst.damagedProbeNs < kDamagedProbeIntervalNs) return work;
+            inst.damagedProbeNs = nowNs;
+            if (readRange(inst.foldCursor, inst.foldCursor + 1).damaged) return work;
+            inst.pause = ViewRunning{};   // it reads again: the fold continues from foldCursor
+            ++viewResumes_;
+        }
         if (inst.nsSlot != kNoNsSlot && !nsViewGate_(inst)) {
             if (inst.pendingValid && !tryPushDelta_(inst)) return 1;   // the ring is full: keep the worker hot to retry it (step 1)
             if (inst.windowKept) releaseQuiet_(inst);
@@ -1158,7 +1186,14 @@ private:
         // passBound reads empty below it.  Nothing is there, so read on to `bound`; the fold still stops at passBound.
         // (A transient source's read ignores the end, so the second read just repeats the first.)
         if (view.empty() && passBound < bound) [[unlikely]] view = readRange(inst.foldCursor, bound);
-        if (view.empty()) return work;
+        if (view.empty()) {
+            if (view.damaged) [[unlikely]] {   // #874: nothing at this offset will ever read: pause, never wait
+                pauseDamaged_(inst, nowNs);
+                if (inst.pendingValid && !tryPushDelta_(inst)) return 1;
+                if (inst.windowKept) releaseQuiet_(inst);
+            }
+            return work;
+        }
 
         int64_t cursor = inst.foldCursor;
         // P11-0: a transaction applies at its commit marker, read back through readRange, within the pass cap.  A transient

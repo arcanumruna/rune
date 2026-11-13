@@ -672,6 +672,7 @@ struct PartitionWriteState {
     uint64_t                           mismatchesLogged = 0; ///< rejected-index determinism alarms already reported
     uint64_t                           seenLogGeneration = UINT64_MAX;   ///< the replica's log generation the timeline and ledger are in step with
     int64_t                            scanHw = 0;           ///< the replica HW at the start of this pass: the scan feed commits ledger slots below it
+    bool                               judgeDamaged = false;   ///< #874: judge stalled at a damaged segment
     bool                               growOwed = false;     ///< the judge saw the rejected index cross 75 %, or stalled for room: the worker's cold maintenance grows it
     std::size_t                        rejectedMax = kIndexMax;   ///< the rejected index's ceiling (a rig lowers it)
     std::size_t                        growNeed = 0;        ///< the size a stalled whole-batch rejection needs (size + its records); 0 when none

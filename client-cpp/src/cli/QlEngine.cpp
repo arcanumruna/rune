@@ -1214,6 +1214,7 @@ std::string viewReadRefusal(uint16_t status) {
         case rc::ViewRowResult::kInvalidRequest: return "invalid request";
         case rc::ViewRowResult::kBusy:           return "the partition is busy, try again";
         case rc::ViewRowResult::kRowTooLarge:    return "the row is too large to send";
+        case rc::ViewRowResult::kStorageError:   return "the view's source log is damaged on this broker";
         case rc::ViewRowResult::kNotAuthorized:  return "not authorized";
         case rc::ViewRowResult::kNotLeader:      return "the partition's leader was not reached";
         case rc::ViewRowResult::kViewPaused:     return "the view is paused over its namespace's memory limit";

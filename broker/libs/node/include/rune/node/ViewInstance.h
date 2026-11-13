@@ -69,7 +69,10 @@ enum class ViewReadiness : uint8_t { Recovering, RebuildingViews, CatchingUp, Re
 //   ViewPaused{OverLimit, offset}    - the namespace is over maxViewMemoryBytes: the view stopped folding at `offset`
 //                                      (== its foldCursor) and reads answer ViewPaused (54) with that offset; on resume it
 //                                      folds on from `offset`, so the table equals a recompute from the log.
-enum class ViewPauseReason : uint8_t { OverLimit = 1 };
+//   ViewPaused{Damaged, offset}      - #874: the source log is damaged at `offset` (== foldCursor): the view stops
+//                                      folding, reads answer StorageError (26); the fold probes the offset again at
+//                                      most once per second and resumes if it reads.
+enum class ViewPauseReason : uint8_t { OverLimit = 1, Damaged = 2 };
 struct ViewRunning {};
 struct ViewPaused { ViewPauseReason reason = ViewPauseReason::OverLimit; int64_t offset = 0; };
 using ViewPauseState = std::variant<ViewRunning, ViewPaused>;
@@ -254,6 +257,7 @@ struct ViewInstance {
 
     // Task 12 (D26): the view-memory pause, the namespace this instance is charged to, and the bytes charged so far.
     ViewPauseState                     pause{ViewRunning{}};
+    int64_t                            damagedProbeNs  = 0;   // #874: the last time a Damaged pause probed its offset
     uint16_t                           nsSlot          = kNoNsSlot;
     uint32_t                           nsId            = 0;
     std::size_t                        memCharged      = 0;

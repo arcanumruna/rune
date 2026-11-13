@@ -446,6 +446,8 @@ void VerdictSource::bindLeader(rune::replication::PartitionReplica* replica, uin
     needsActivation_ = true;
     stalled_         = false;
     stallReason_     = StallReason::None;
+    // #874: a new leadership reads the log afresh (it stalls again if still damaged)
+    if (state_ != nullptr) state_->judgeDamaged = false;
 }
 
 int64_t VerdictSource::extendOverEmptySets_(int64_t offset) const noexcept {
@@ -524,8 +526,11 @@ void VerdictSource::stall_(StallReason reason) noexcept {
     stalled_     = true;
     releaseOneStep();   // a stalled judge is not driven: the other sources must not wait for it
     stallReason_ = reason;
+    if (reason == StallReason::Damaged && state_ != nullptr) state_->judgeDamaged = true;   // #874: refuse produces
     spdlog::error("verdict judge stalled: topic {} partition {}: {}", srcTopicId_, partition_,
-                  reason == StallReason::Full ? "rejected index full" : reason == StallReason::OutOfOrder ? "rejection out of order" : "view capacity exhausted");
+                  reason == StallReason::Full ? "rejected index full"
+                  : reason == StallReason::OutOfOrder ? "rejection out of order"
+                  : reason == StallReason::Damaged ? "source log damaged" : "view capacity exhausted");
 }
 
 // Cold (once per wait): the judge or a replay holds at a lease record whose writer layout is not installed on this worker yet.

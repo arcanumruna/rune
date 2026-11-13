@@ -5014,7 +5014,8 @@ private:
             }
             const WorkerViewSet::InstanceServeState st = viewSet_->instanceServeState(viewTopicId, partition);
             if (st.paused) [[unlikely]] {   // Task 12 (D26): over the namespace's view memory; lastOffset = the paused offset
-                ret.errorCode  = static_cast<int16_t>(RS::kViewPaused);
+                // #874: a damaged source log answers StorageError
+                ret.errorCode  = static_cast<int16_t>(st.damaged ? RS::kStorageError : RS::kViewPaused);
                 ret.lastOffset = st.pausedOffset;
                 enqueueReturn_(std::move(ret));
                 return ViewServe::Answered;
@@ -5082,6 +5083,8 @@ private:
             ret.errorCode = static_cast<int16_t>(RS::kNotReady);
         } else if (rs == WorkerViewSet::RowStatus::Paused) {
             ret.errorCode = static_cast<int16_t>(RS::kViewPaused);
+        } else if (rs == WorkerViewSet::RowStatus::Damaged) {   // #874
+            ret.errorCode = static_cast<int16_t>(RS::kStorageError);
         } else if (rs == WorkerViewSet::RowStatus::BadKey) {   // a key the view cannot hold: its width, or a u64 on a wide-key view
             ret.errorCode = static_cast<int16_t>(RS::kInvalidRequest);
         } else {
@@ -7073,6 +7076,7 @@ public:
     [[nodiscard]] uint64_t pushReadErrorsForTest() const noexcept { return pushReadErrors_; }
     /// #839: reads that reached a damaged segment (Corrupt / Unreadable) and were not served.
     [[nodiscard]] uint64_t corruptReadsForTest() const noexcept { return corruptReads_; }
+    [[nodiscard]] uint64_t checkedDamagedRefusalsForTest() const noexcept { return checkedDamagedRefusals_; }
     [[nodiscard]] uint64_t damagedReadsForTest() const noexcept { return damagedReads_; }
     [[nodiscard]] uint64_t filterCorruptScansForTest() const noexcept { return filterCorruptScans_; }
     [[nodiscard]] std::size_t deferredPushReadsForTest() const noexcept { return deferredPushCount_; }
@@ -7107,6 +7111,7 @@ private:
     uint64_t                              pushReadMapFallbacks_ = 0;
     uint64_t                              pushReadErrors_ = 0;   ///< D26: push-read pread failures (answered empty)
     uint64_t                              corruptReads_ = 0;     ///< #839: reads that reached a damaged segment
+    uint64_t                              checkedDamagedRefusals_ = 0;   ///< #874: produces refused at a damaged judge
     uint64_t                              filterCorruptScans_ = 0;   ///< #876: failFilteredCorrupt_ walks
     uint64_t                              damagedReads_ = 0;     ///< #882: reads failed at damage (SessionSignal)
     uint64_t                              repairCounts_[3] = {};     ///< #880: cumulative completed / failed / no-peer
@@ -8195,7 +8200,11 @@ private:
                 rune::storage::Log* log = replica->log();
                 if (log == nullptr) continue;
                 auto readRange = [this, log](int64_t from, int64_t to) -> rune::storage::LogReadView {
-                    return readNoFault_(log, from, kPushMaxChunkBytes, to);
+                    rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
+                    rune::storage::LogReadView v = readNoFault_(log, from, kPushMaxChunkBytes, to, st);
+                    // #874: a damaged segment is reported, not waited out
+                    v.damaged = v.len == 0 && rune::storage::unservable(st);
+                    return v;
                 };
                 work += driveViewsOf_(topicId, partition, readRange, bound, skip, nowNs, nullptr,
                                       replica->leadershipGeneration(), hwConfirmed, NsTag{log->nsSlot(), log->nsId()}, replica,
@@ -11934,6 +11943,17 @@ private:
         // Ready it would pass the hook on a partial timeline.
         if (ws != nullptr && rc == nullptr && pc::acksView(acks) && rcGate_(replica) == nullptr) [[unlikely]] {
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            enqueueReturn_(ret);
+            return 1;
+        }
+
+        // #874: the partition's judge stalled at a damaged log segment: it will judge nothing more under this
+        // leadership, so a new write is refused whole (nothing appended) instead of waiting for a verdict that never
+        // comes.  Records already appended and waiting for a verdict keep waiting, as with every other stall reason.
+        // One bool read; false for any other topic.
+        if (ws != nullptr && ws->judgeDamaged) [[unlikely]] {
+            ++checkedDamagedRefusals_;
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::StorageError);
             enqueueReturn_(ret);
             return 1;
         }
