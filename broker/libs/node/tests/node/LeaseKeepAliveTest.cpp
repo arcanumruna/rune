@@ -96,7 +96,8 @@ struct Ka {
     int64_t corr = 1000;
     std::vector<Frame> frames;   // every keepalive return seen so far, in order
 
-    explicit Ka(uint32_t maxKeys = 1000, bool follower = false, bool leaseTopic = true) : r(follower, 64LL * 1024 * 1024, RigTuning{}) {
+    explicit Ka(uint32_t maxKeys = 1000, bool follower = false, bool leaseTopic = true, RigTuning tuning = RigTuning{})
+        : r(follower, 64LL * 1024 * 1024, tuning) {
         r.worker->setLeaseClockForTest(&leaseNow);
         if (leaseTopic) r.createLeaseTopic(maxKeys);
         else r.typed();   // a plain topic: its write spec has no lease block
@@ -1308,4 +1309,194 @@ TEST(LeaseKeepAliveTableRegression, ReplayThrottledWhenRingFullRegression) {
     EXPECT_EQ(k.frames[0].es[0].ttl, 1u);
     EXPECT_TRUE(k.frames[0].final);
     EXPECT_EQ(k.r.worker->leaseParksForTest().inUse(), 8u) << "only the replayed chain was answered";
+}
+
+// ── #987: an answer queued under return-ring back-pressure keeps its bytes in a preallocated chunk ring ──
+namespace {
+/// A lease rig over a worker whose return ring is small (64 KiB), so a run of answers that nobody drains fills it and
+/// the rest queue in the return FIFO.
+struct Pressured {
+    Worker w;
+    Ka     k;
+    Pressured() : w(0, Worker::kIngressByteCapacity, 1 << 16), k(1000, false, true, tuning(&w)) {}
+    static RigTuning tuning(Worker* p) { RigTuning t; t.hostWorker = p; return t; }
+    std::vector<uint8_t> kaTail, readTail;
+    int64_t kaCorr = 5000, readCorr = 9000;
+    int64_t now() { return k.r.now += 1'000'000; }
+    /// One keepalive op (answer: one entry, Ok) - no drain, one worker pass.
+    void keepAliveOp() {
+        WorkerOp op;
+        op.type = WorkerOp::Type::LeaseKeepAlive; op.topicId = VerdictRig::kSrc; op.partition = 0;
+        op.sessionId = 77; op.correlationId = ++kaCorr; op.recordCount = 1;
+        op.leaseTail = std::span<const uint8_t>(kaTail.data(), kaTail.size());
+        EXPECT_TRUE(w.tryEnqueueOp(std::move(op)));
+    }
+    void readOp() {
+        WorkerOp op;
+        op.type = WorkerOp::Type::GetViewRowK; op.topicId = VerdictRig::kLeaseView; op.partition = 0;
+        op.sessionId = 1; op.correlationId = ++readCorr; op.nextOffset = -1; op.hwBound = 0;
+        op.viewReadTail = std::span<const uint8_t>(readTail.data(), readTail.size());
+        EXPECT_TRUE(w.tryEnqueueOp(std::move(op)));
+    }
+    bool prepare() {
+        if (!k.setup({1})) return false;
+        const int64_t v = k.versionOf(1);
+        const std::string key = keyOf(1);
+        kaTail.push_back(uint8_t(key.size()));
+        kaTail.insert(kaTail.end(), key.begin(), key.end());
+        for (int j = 0; j < 8; ++j) kaTail.push_back(uint8_t(uint64_t(v) >> (8 * j)));
+        readTail.push_back(uint8_t(key.size()));
+        readTail.insert(readTail.end(), key.begin(), key.end());
+        readTail.push_back(0);
+        return true;
+    }
+    struct Seen { std::vector<WorkerReturn> ka, rows; std::vector<char> order; };
+    /// Drains until the FIFO is empty (bounded), collecting the answers in the order they left the ring.
+    Seen drain() {
+        Seen s;
+        const auto take = [&] {
+            w.drainReturn([&](WorkerReturn r) {
+                if (r.type == WorkerReturn::Type::LeaseKeepAliveResult) {
+                    s.ka.push_back(std::move(r));
+                    s.order.push_back('k');
+                } else if (r.type == WorkerReturn::Type::ViewRowResult) {
+                    s.rows.push_back(std::move(r));
+                    s.order.push_back('v');
+                }
+                else if (r.type == WorkerReturn::Type::ProduceResult) s.order.push_back('p');
+            }, [&](const TxnReturn&) { s.order.push_back('t'); });
+        };
+        for (int i = 0; i < 20'000; ++i) {
+            take();
+            if (w.retFifoSizeForTest() == 0) { take(); return s; }
+            (void)w.doWork(now());
+        }
+        ADD_FAILURE() << "the return FIFO never drained";
+        return s;
+    }
+};
+}  // namespace
+
+// Mutation m1 (the fallback copies into ret.chunk again): every queued answer allocates -> red.  m3 (ChunkFull
+// treated as Ok without the bytes): a queued answer arrives empty -> the byte-identity check red.
+TEST(WorkerReturnRegression, AnAnswerQueuedUnderReturnBackPressureDoesNotAllocateRegression) {
+    Pressured p;
+    ASSERT_TRUE(p.prepare());
+    // The un-pressured references.
+    p.keepAliveOp();
+    p.k.r.pass();
+    p.readOp();
+    p.k.r.pass();
+    const auto refKa = p.k.r.leaseKaAnswers;
+    const auto refRows = p.k.r.takeViewAnswers();
+    ASSERT_EQ(refKa.size(), 1u);
+    ASSERT_EQ(refRows.size(), 1u);
+    ASSERT_EQ(refRows[0].errorCode, 0);
+    p.k.r.leaseKaAnswers.clear();
+
+    constexpr int kOps = 300;
+    uint64_t allocs = 0;
+    std::size_t queuedMax = 0;
+    for (int i = 0; i < kOps; ++i) {
+        uint64_t used = 0;
+        {
+            rune::testing::AllocWindow win;
+            p.keepAliveOp();
+            p.readOp();
+            (void)p.w.doWork(p.now());
+            used = win.count();
+        }
+        queuedMax = std::max(queuedMax, p.w.retFifoSizeForTest());
+        if (i >= 100) allocs += used;   // the first ops warm the cold paths; by 100 the 64 KiB ring is long full
+    }
+    ASSERT_GT(queuedMax, 100u) << "the return ring is full: answers queue in the FIFO";
+    EXPECT_EQ(allocs, 0u) << "serving while back-pressured allocates nothing";
+    EXPECT_GT(p.w.retChunkArenaUsedForTest(), 0u) << "the queued bytes live in the chunk ring";
+
+    const auto seen = p.drain();
+    EXPECT_EQ(p.w.retChunkArenaUsedForTest(), 0u) << "freed on the flush";
+    ASSERT_EQ(seen.ka.size(), std::size_t(kOps));
+    ASSERT_EQ(seen.rows.size(), std::size_t(kOps));
+    for (std::size_t i = 0; i < seen.ka.size(); ++i) {
+        EXPECT_EQ(seen.ka[i].correlationId, p.kaCorr - kOps + 1 + int64_t(i)) << "in order";
+        EXPECT_EQ(seen.ka[i].chunk, refKa[0].chunk) << "byte-identical to the un-pressured answer, #" << i;
+        EXPECT_EQ(seen.rows[i].correlationId, p.readCorr - kOps + 1 + int64_t(i));
+        EXPECT_EQ(seen.rows[i].errorCode, 0);
+        EXPECT_EQ(seen.rows[i].chunk, refRows[0].chunk) << "row byte-identical, #" << i;
+    }
+}
+
+// A chunk ring too small for the queue answers the overflow chunk-less Throttled (a view row can say it), in order,
+// counted, without a halt; afterwards new requests are served normally.
+TEST(WorkerReturnRegression, AFullChunkArenaAnswersThrottledNotAHaltRegression) {
+    Pressured p;
+    ASSERT_TRUE(p.prepare());
+    p.readOp();
+    p.k.r.pass();
+    const auto ref = p.k.r.takeViewAnswers();
+    ASSERT_EQ(ref.size(), 1u);
+    ASSERT_EQ(ref[0].errorCode, 0);
+    p.w.setRetChunkArenaBytesForTest(2048);
+    constexpr int kOps = 400;
+    for (int i = 0; i < kOps; ++i) {
+        p.readOp();
+        (void)p.w.doWork(p.now());
+    }
+    EXPECT_GT(p.w.retChunkArenaRefusalsForTest(), 0u) << "the 2 KiB ring is exhausted";
+    const auto seen = p.drain();
+    ASSERT_EQ(seen.rows.size(), std::size_t(kOps)) << "every request is answered, none dropped";
+    std::size_t throttled = 0;
+    bool sawThrottled = false;
+    for (std::size_t i = 0; i < seen.rows.size(); ++i) {
+        const WorkerReturn& r = seen.rows[i];
+        EXPECT_EQ(r.correlationId, p.readCorr - kOps + 1 + int64_t(i)) << "in order";
+        if (r.errorCode == static_cast<int16_t>(pc::ErrorCode::Throttled)) {
+            ++throttled;
+            sawThrottled = true;
+            EXPECT_TRUE(r.chunk.empty());
+        } else {
+            EXPECT_FALSE(sawThrottled) << "an Ok answer after a refused one: the queue is in order";
+            EXPECT_EQ(r.errorCode, 0);
+            EXPECT_EQ(r.chunk, ref[0].chunk);
+        }
+    }
+    EXPECT_EQ(throttled, p.w.retChunkArenaRefusalsForTest()) << "every refusal is counted";
+    EXPECT_GT(throttled, 0u);
+    // after the drain: normal service
+    p.readOp();
+    for (int i = 0; i < 4; ++i) p.k.r.pass();
+    const auto after = p.k.r.takeViewAnswers();
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after[0].errorCode, 0);
+    EXPECT_EQ(after[0].chunk, ref[0].chunk);
+}
+
+// A chunk answer, a produce result and a txn return queued in that order leave in that order.
+TEST(WorkerReturnRegression, AChunkAnswerAProduceResultAndATxnReturnLeaveInOrderRegression) {
+    Pressured p;
+    ASSERT_TRUE(p.prepare());
+    for (int i = 0; i < 3000 && p.w.retFifoSizeForTest() == 0; ++i) { p.keepAliveOp(); (void)p.w.doWork(p.now()); }
+    ASSERT_GT(p.w.retFifoSizeForTest(), 0u) << "the ring is full";
+    const auto before = p.drain();   // empty the queue first, then refill it in the order under test
+    for (int i = 0; i < 3000 && p.w.retFifoSizeForTest() == 0; ++i) { p.keepAliveOp(); (void)p.w.doWork(p.now()); }
+    ASSERT_GT(p.w.retFifoSizeForTest(), 0u);
+    p.readOp();
+    (void)p.w.doWork(p.now());                      // the chunk answer queues
+    WorkerReturn pr;
+    pr.type = WorkerReturn::Type::ProduceResult;
+    pr.deferAck = true;
+    pr.correlationId = 777;
+    p.w.enqueueReturnForTest(pr);                   // then a produce result
+    TxnReturn tr;
+    tr.token = 4242;
+    p.w.enqueueTxnReturnForTest(tr);                // then a txn return
+    const auto seen = p.drain();
+    std::string tail(seen.order.begin(), seen.order.end());
+    const auto v = tail.find('v');
+    ASSERT_NE(v, std::string::npos);
+    const auto pp = tail.find('p', v);
+    ASSERT_NE(pp, std::string::npos);
+    const auto t = tail.find('t', pp);
+    EXPECT_NE(t, std::string::npos) << "view row, then the produce result, then the txn return: " << tail.substr(v);
+    (void)before;
 }

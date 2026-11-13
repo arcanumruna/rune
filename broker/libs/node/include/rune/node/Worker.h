@@ -250,6 +250,10 @@ public:
              ? kOverflowHighWater : static_cast<std::size_t>(kMaxIngressDrainLimit)) * kMaxReturnsPerOp +
         static_cast<std::size_t>(kMaxFragmentLimit) * kMaxReturnsPerOp + kMaxOwedReturnsCeiling;
     static constexpr std::size_t kRetFifoCapacity   = 16384;
+    /// #987: the chunk byte ring behind the return FIFO (power of two): a chunk-carrying answer queued under return-
+    /// ring back-pressure is copied there instead of into an allocated vector.  Full: a chunk-less Throttled refusal.
+    static constexpr std::size_t kRetChunkArenaBytes = std::size_t{8} * 1024 * 1024;
+    static_assert((kRetChunkArenaBytes & (kRetChunkArenaBytes - 1)) == 0, "power of two (O(1) index mask)");
     // D8c fix round 1 (MAJOR-1): the session ack queue (SessionAckSink::
     // kAckCapacity) is split in two STATIC shares.
     //   kAckReserve       — what this worker's own intake may need beyond the
@@ -1862,6 +1866,14 @@ public:
     // (retFifoHighWaterPauses, watched by the DR matrix), TxnReturn emission
     // (S6 emits them; tests drive it directly) and the ingress poll budget.
     [[nodiscard]] std::size_t retFifoSizeForTest() const noexcept { return retFifo_.size(); }
+    /// #987 seams: the chunk byte ring's fill, a smaller ring (only while no return is queued), and the answers refused
+    /// Throttled / queued in an owned vector because the ring was full.
+    [[nodiscard]] std::size_t retChunkArenaUsedForTest() const noexcept { return retFifo_.chunkArenaUsed(); }
+    void setRetChunkArenaBytesForTest(std::size_t bytes) { retFifo_.resetChunkArenaForTest(bytes); }
+    [[nodiscard]] uint64_t retChunkArenaRefusalsForTest() const noexcept { return retChunkArenaRefusals_; }
+    [[nodiscard]] uint64_t retChunkArenaVectorFallbacksForTest() const noexcept {
+        return retChunkArenaVectorFallbacks_;
+    }
     [[nodiscard]] uint64_t    retFifoHighWaterPausesForTest() const noexcept { return retFifoHighWaterPauses_; }
     void enqueueTxnReturnForTest(const TxnReturn& r) { enqueueTxnReturn_(r); }
     [[nodiscard]] int64_t ingressPollBudgetForTest() const noexcept { return ingressPollBudget_(); }
@@ -2374,6 +2386,11 @@ private:
     // or a full FIFO (beyond its static bound) is an invariant-violation halt
     // (exit 70) — never a drop, never a retry loop.
     //
+    // #987: a chunk-carrying answer (view row / scan page, stats, lease keepalive / time-to-live / scan) queued under
+    // back-pressure keeps its bytes in the FIFO's preallocated chunk ring (kRetChunkArenaBytes) - enqueueReturnRuns_
+    // - so it allocates nothing.  A full chunk ring answers a chunk-less Throttled (view row, view scan, lease scan)
+    // or, for a type that cannot say it (stats, lease keepalive, lease time-to-live), falls back to an owned vector.
+    //
     // Bypass (L2): enqueueSignal_ for StorageFailure / OwnershipAck / EgressReleased only.
     // Worker-thread only (the producer side of ret_).
     // -----------------------------------------------------------------------
@@ -2479,6 +2496,23 @@ private:
             ret_.abort(idx);
             haltInvariant_("WorkerReturn encode threw", "non-std exception", ret.chunk.size());
         }
+        ret_.commit(idx);
+        return true;
+    }
+    /// #987: tryWriteReturn_ for a return whose chunk is one run of bytes held elsewhere (the return FIFO's chunk
+    /// ring).
+    [[nodiscard]] bool tryWriteReturnGather_(const WorkerReturn& ret, const ChunkRun& run) {
+        aeron::util::index_t idx = -1;
+        const std::size_t n = workerReturnEncodedLength(static_cast<std::size_t>(run.len));
+        try {
+            idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n);
+        } catch (const std::exception& ex) {
+            haltInvariant_("return-ring tryClaim threw (queued chunk)", ex.what(), run.len);
+        } catch (...) {
+            haltInvariant_("return-ring tryClaim threw (queued chunk)", "non-std exception", run.len);
+        }
+        if (idx < 0) return false;
+        encodeWorkerReturnGather(reinterpret_cast<char*>(ret_.base() + idx), n, ret, &run, 1, run.len);
         ret_.commit(idx);
         return true;
     }
@@ -5013,7 +5047,7 @@ private:
             std::memcpy(head.data() + 4 + tokenLen, &page.bytes, 4);
             const uint32_t headLen = 8 + tokenLen;
             const ChunkRun runs[2] = {{head.data(), headLen}, {scanScratch_.data(), page.bytes}};
-            enqueueViewResult_(ret, runs, 2, headLen + page.bytes);
+            enqueueReturnRuns_(ret, runs, 2, headLen + page.bytes);
             return ViewServe::Answered;
         }
         const rune::view::RowLayout*  layout = nullptr;
@@ -5025,7 +5059,7 @@ private:
             ret.errorCode   = static_cast<int16_t>(RS::kOk);
             ret.recordCount = static_cast<int32_t>(layout->rowLen);
             const ChunkRun run{row, layout->rowLen};
-            enqueueViewResult_(ret, &run, 1, layout->rowLen);   // zero-copy gather (hot path)
+            enqueueReturnRuns_(ret, &run, 1, layout->rowLen);   // zero-copy gather (hot path)
             return ViewServe::Answered;
         } else if (rs == WorkerViewSet::RowStatus::NotReady) {
             ret.errorCode = static_cast<int16_t>(RS::kNotReady);
@@ -5111,7 +5145,7 @@ private:
         ret.errorCode   = static_cast<int16_t>(RS::kOk);
         ret.recordCount = static_cast<int32_t>(lk.ref.layout->rowLen);
         const ChunkRun run{row, lk.ref.layout->rowLen};
-        enqueueViewResult_(ret, &run, 1, lk.ref.layout->rowLen);
+        enqueueReturnRuns_(ret, &run, 1, lk.ref.layout->rowLen);
         return ViewServe::Answered;
     }
 
@@ -5162,7 +5196,7 @@ private:
         const auto constraints = sink.constraintBytes();
         const ChunkRun runs[3] = {{stats.data(), static_cast<uint32_t>(stats.size())}, {constraintCount.data(), 2},
                                   {constraints.data(), static_cast<uint32_t>(constraints.size())}};
-        enqueueViewResult_(ret, runs, 3, static_cast<uint32_t>(stats.size() + 2 + constraints.size()));
+        enqueueReturnRuns_(ret, runs, 3, static_cast<uint32_t>(stats.size() + 2 + constraints.size()));
     }
 
     // Issue #82 (VLS A.5.5): per pass, after the view folds: serve the held reads whose fold reached their target;
@@ -5194,7 +5228,7 @@ private:
     // back-pressure fallback (a return already queued, or the ring momentarily
     // full) copies into the owned chunk and queues it — never dropped, never
     // reordered; the common case never allocates.
-    void enqueueViewResult_(WorkerReturn& ret, const ChunkRun* runs, std::size_t nRuns, uint32_t total) {
+    void enqueueReturnRuns_(WorkerReturn& ret, const ChunkRun* runs, std::size_t nRuns, uint32_t total) {
         if (retFifo_.empty()) [[likely]] {
             const std::size_t n = workerReturnEncodedLength(static_cast<std::size_t>(total));
             aeron::util::index_t idx = -1;
@@ -5211,10 +5245,50 @@ private:
                 return;
             }
         }
-        ret.chunk.clear();   // back-pressure fallback (rare): copy + queue
-        for (std::size_t i = 0; i < nRuns; ++i) ret.chunk.insert(ret.chunk.end(), runs[i].data, runs[i].data + runs[i].len);
-        enqueueReturn_(std::move(ret));
+        // Back-pressure (a return already queued, or the ring momentarily full): queue the answer with its bytes in the
+        // preallocated chunk ring - no allocation (#987).  A chunk the return ring could never hold is the same
+        // invariant halt as a claim of it would be.
+        if (workerReturnEncodedLength(static_cast<std::size_t>(total)) > static_cast<std::size_t>(ret_.maxMsgLength()))
+            [[unlikely]] haltInvariant_("queued answer larger than the return ring's max message", "chunk too large",
+                                        total);
+        ret.chunk.clear();
+        switch (retFifo_.pushWithChunk(std::move(ret), runs, nRuns, total)) {
+        case ChunkPush::Ok: return;
+        case ChunkPush::SlotsFull: haltRetFifoFull_();
+        case ChunkPush::ChunkFull: break;
+        }
+        queueChunkFullAnswer_(ret, runs, nRuns, total);   // `ret` is intact: pushWithChunk moves only on Ok
     }
+
+    // #987: the chunk ring is full.  A return type that can say "refused, retry" answers a chunk-less Throttled (the
+    // gateway forwards the status; the client retries a Throttled view read / lease scan with backoff); a type that
+    // cannot (the gateway turns an empty StatsResult into InvalidRequest and an empty LeaseKeepAlive /
+    // LeaseTimeToLive result into Internal) keeps an owned vector chunk - an allocation, only once the 8 MiB ring is
+    // exhausted.
+    [[gnu::cold]] [[gnu::noinline]] void queueChunkFullAnswer_(WorkerReturn& ret, const ChunkRun* runs,
+                                                               std::size_t nRuns, uint32_t /*total*/) {
+        using WT = WorkerReturn::Type;
+        if (ret.type == WT::ViewRowResult || ret.type == WT::ViewScanResult || ret.type == WT::ScanLeasesResult) {
+            ++retChunkArenaRefusals_;
+            if (retChunkArenaRefusals_ % 1024 == 1)
+                spdlog::warn("Worker {}: return chunk ring full ({} B): answer type {} refused Throttled (total {})",
+                             workerId_, retFifo_.chunkArenaCapacity(), static_cast<int>(ret.type),
+                             retChunkArenaRefusals_);
+            ret.chunk.clear();
+            ret.errorCode   = static_cast<int16_t>(rune::protocol::client::ErrorCode::Throttled);
+            ret.recordCount = 0;
+            ret.lastOffset  = 0;   // retry-after 0: the client's own backoff applies
+            ret.isolation   = 0;
+            if (!retFifo_.push(std::move(ret))) [[unlikely]] haltRetFifoFull_();
+            return;
+        }
+        ++retChunkArenaVectorFallbacks_;
+        ret.chunk.clear();
+        for (std::size_t i = 0; i < nRuns; ++i) ret.chunk.insert(ret.chunk.end(), runs[i].data, runs[i].data + runs[i].len);
+        if (!retFifo_.push(std::move(ret))) [[unlikely]] haltRetFifoFull_();
+    }
+    uint64_t retChunkArenaRefusals_        = 0;   ///< #987: answers refused Throttled because the chunk ring was full
+    uint64_t retChunkArenaVectorFallbacks_ = 0;   ///< #987: answers of types that cannot say Throttled, in a vector
 
     // executePushReadWire_ — read a chunk from the log for a push subscription.
     //
@@ -7111,7 +7185,7 @@ private:
     // TxnReturn), O(1) push / pop-front.  While it is non-empty: new ingress
     // polling is gated (G-A6) and the op drain pauses at kOverflowHighWater.
     // Worker-thread only.
-    ReturnFifo<kRetFifoCapacity> retFifo_;
+    ReturnFifo<kRetFifoCapacity> retFifo_{kRetChunkArenaBytes};
     // Passes whose op drain was paused at the high-water mark (DR matrix
     // watches it for ISR-lag interaction in Legacy mode).
     uint64_t retFifoHighWaterPauses_ = 0;
@@ -8309,7 +8383,7 @@ private:
         ret.recordCount   = count;
         ret.lastOffset    = final ? 1 : 0;
         const ChunkRun run{entries, static_cast<uint32_t>(count) * 12u};
-        enqueueViewResult_(ret, &run, 1, run.len);
+        enqueueReturnRuns_(ret, &run, 1, run.len);
     }
     static void putKaEntry_(uint8_t* p, uint16_t index, uint16_t code, uint64_t ttlMs) noexcept {
         p[0] = static_cast<uint8_t>(index);        p[1] = static_cast<uint8_t>(index >> 8);
@@ -8506,7 +8580,7 @@ private:
             }
         }
         const ChunkRun run{body, 16};
-        enqueueViewResult_(ret, &run, 1, 16);
+        enqueueReturnRuns_(ret, &run, 1, 16);
     }
     // Lease topics Task 13b (spec 8.3): a ScanLeases op - one page of the lease rows in ascending order of the scan hash (lease/LeaseHash.h).
     // topicId = the SOURCE topic; nextOffset = resumeHash, recordCount = maxRows, isolation = first, leaseTail = the key prefix.
@@ -8646,7 +8720,7 @@ private:
         ret.recordCount = static_cast<int32_t>(rows);
         ret.isolation   = (!cut && candidates == hn) ? 1 : 0;   // done: no candidate beyond the page
         const ChunkRun run{sc.page.data(), static_cast<uint32_t>(pos)};
-        enqueueViewResult_(ret, &run, 1, static_cast<uint32_t>(pos));
+        enqueueReturnRuns_(ret, &run, 1, static_cast<uint32_t>(pos));
     }
     static constexpr std::size_t kLeaseEmitReserveBytes = 1u << 20;
 
@@ -9010,6 +9084,8 @@ private:
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             const uint32_t n = op.tailLength();
             const auto* t = reinterpret_cast<const uint8_t*>(op.tail());
+            // #987: not a per-client-request answer (a transaction marker bounced back to the coordinator, only after a
+            // leadership change): it keeps the owned vector chunk.
             if (t && n) ret.chunk.assign(t, t + n);
             enqueueReturn_(ret);
             return;
@@ -10087,7 +10163,7 @@ private:
         sig.errorCode = static_cast<int16_t>(err);
         sig.topicId   = topicId;
         sig.partition = partition;
-        sig.chunk.assign(dir.begin(), dir.end());
+        sig.chunk.assign(dir.begin(), dir.end());   // #987: a once-per-process fail-stop signal, not an answer
         ++storageFailureSignals_;
         enqueueSignal_(sig);
     }
@@ -10160,8 +10236,15 @@ private:
         int flushed = 0;
         while (!retFifo_.empty()) {
             ReturnFifoEntry& e = retFifo_.front();
-            const bool ok = e.tag == ReturnFifoEntry::Tag::Txn ? tryWriteTxnReturn_(e.txn)
-                                                               : tryWriteReturn_(e.worker);
+            bool ok;
+            if (e.tag == ReturnFifoEntry::Tag::Txn) {
+                ok = tryWriteTxnReturn_(e.txn);
+            } else if (e.arenaChunk) [[unlikely]] {   // #987: the chunk is in the byte ring: gather it from there
+                const std::span<const uint8_t> bytes = retFifo_.chunkOf(e);
+                ok = tryWriteReturnGather_(e.worker, ChunkRun{bytes.data(), static_cast<uint32_t>(bytes.size())});
+            } else {
+                ok = tryWriteReturn_(e.worker);
+            }
             if (!ok) break;   // ring still full — stop; retry next cycle
             retFifo_.popFront();
             ++flushed;

@@ -518,6 +518,15 @@ The on-disk layout is unchanged.
   - `R` is the maximum number of returns per op (1);
   - `P = |pendingAcksAll_| + |durablePending_| + |commit waiters| + |parkedMarkers_|`, each bounded by the G-A6 reservation, which now counts commit waiters and parked markers.
 - The capacity is `static_assert`ed. Exceeding it halts.
+- **Chunk ring (#987).** A chunk-carrying answer (a view row or scan page, stats, a lease keepalive, time-to-live or
+  scan answer) queued behind a refused claim keeps its bytes in a second pre-allocated store, a byte ring of
+  `kRetChunkArenaBytes` (8 MiB) next to the slot ring, instead of an allocated `std::vector`. Entries leave front to
+  back, so the bytes are filled and freed in the same order; a chunk is stored contiguously (the tail skips to the
+  next wrap). When the byte ring is full the answer is a chunk-less `Throttled` refusal for the return types that can
+  say it (view row, view scan, lease scan; counted by `retChunkArenaRefusals_`). Stats, keepalive and time-to-live
+  answers cannot (the gateway turns an empty one into `InvalidRequest` or `Internal`), so they keep an owned vector
+  once the ring is exhausted (`retChunkArenaVectorFallbacks_`). The slot ring's bound is unchanged: a full slot ring
+  still halts.
 - Because a `tryClaim` exception now halts, `workerReturnRingBytes` is a correctness setting: at startup W checks that `ret_.maxMsgLength()` covers one 512 KiB `PushReadResult` chunk plus its header, and refuses to start otherwise (the default, 4 MiB, does).
 - In Legacy mode the op-drain pause also delays `ApplyReplicated` and `FetchRequest` ops. It is transient and bounded, but the DR matrix watches for ISR-lag interaction (`retFifoHighWaterPauses` counter).
 - No deadlock: control drains returns every cycle and never waits on an op ring. In `fused` placement, both sides run sequentially.

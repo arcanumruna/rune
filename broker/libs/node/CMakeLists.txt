@@ -171,6 +171,10 @@ if(BUILD_TESTING)
                    tests/node/WorkerSessionCryptoRegressionTest.cpp)
     target_link_libraries(rune_permission_shipper_tests PRIVATE rune_node rune_metadata GTest::gtest_main)
     gtest_discover_tests(rune_permission_shipper_tests)
+    # #987: the worker return FIFO's chunk byte ring (no driver).
+    add_executable(rune_return_fifo_tests tests/node/ReturnFifoTest.cpp)
+    target_link_libraries(rune_return_fifo_tests PRIVATE rune_node rune_metadata GTest::gtest_main)
+    gtest_discover_tests(rune_return_fifo_tests)
     if(UNIX AND NOT APPLE)
         # Real-driver UDP GSO/GRO bindings tests (Linux kernels only: UDP_SEGMENT/UDP_GRO).
         add_executable(rune_udp_gso_tests tests/node/UdpGsoBindingsTest.cpp)
