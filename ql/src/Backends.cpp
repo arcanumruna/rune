@@ -211,6 +211,15 @@ ViewSource viewSourceOf(const TopicDef& td) {
     return src;
 }
 
+std::string literalText(const Literal& l) {
+    switch (l.kind) {
+        case Literal::Kind::Integer: return (l.negative && l.magnitude != 0 ? "-" : "") + std::to_string(l.magnitude);
+        case Literal::Kind::String:  return l.lowered ? "lower('" + l.text + "')" : "'" + l.text + "'";
+        case Literal::Kind::Bool:    return l.boolean ? "true" : "false";
+    }
+    return {};
+}
+
 std::string typeWord(rune::codec::PrimType t, uint16_t width) {
     using rune::codec::PrimType;
     switch (t) {
@@ -272,15 +281,6 @@ MergeRule ruleOf(ItemKind k) {
         case ItemKind::Last:     return MergeRule::Last;
         default:                 return MergeRule::Replace;
     }
-}
-
-std::string literalText(const Literal& l) {
-    switch (l.kind) {
-        case Literal::Kind::Integer: return (l.negative && l.magnitude != 0 ? "-" : "") + std::to_string(l.magnitude);
-        case Literal::Kind::String:  return "'" + l.text + "'";
-        case Literal::Kind::Bool:    return l.boolean ? "true" : "false";
-    }
-    return {};
 }
 
 // The literal in the column's row-slot encoding (P8-5); nullopt = it does not fit.

@@ -116,15 +116,6 @@ std::string joined(const std::vector<std::string>& parts) {
     return out;
 }
 
-std::string literalText(const ql::Literal& l) {
-    switch (l.kind) {
-        case ql::Literal::Kind::Integer: return (l.negative && l.magnitude != 0 ? "-" : "") + std::to_string(l.magnitude);
-        case ql::Literal::Kind::Bool:    return l.boolean ? "true" : "false";
-        case ql::Literal::Kind::String:  return l.lowered ? "lower('" + l.text + "')" : "'" + l.text + "'";
-    }
-    return {};
-}
-
 std::string keyItemText(const ql::KeyItem& k) {
     return k.fn == ql::KeyFunction::Lower ? "lower(" + k.column + ") as " + k.outName : k.column;
 }
@@ -507,7 +498,7 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
             } else if constexpr (std::is_same_v<T, PSelect>) {
                 const auto& d = s.def;
                 std::vector<std::string> where;
-                for (const auto& w : d.where) where.push_back(w.column + " = " + literalText(w.value));
+                for (const auto& w : d.where) where.push_back(w.column + " = " + ql::literalText(w.value));
                 out << "select " << (d.columns.empty() ? "*" : joined(d.columns)) << " from " << d.view << " where ";
                 for (std::size_t i = 0; i < where.size(); ++i) out << (i == 0 ? "" : " and ") << where[i];
                 if (d.limit) out << " limit " << *d.limit;
@@ -522,9 +513,9 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
                 if (d.prefix) out << " where " << d.keyColumn << " like '" << *d.prefix << "%'";
                 out << " limit " << d.limit << "\n";
             } else if constexpr (std::is_same_v<T, PShowLease>) {
-                out << "show lease " << s.def.topic << " key " << literalText(s.def.key) << "\n";
+                out << "show lease " << s.def.topic << " key " << ql::literalText(s.def.key) << "\n";
             } else if constexpr (std::is_same_v<T, PRevokeLease>) {
-                out << "revoke lease " << s.def.topic << " key " << literalText(s.def.key) << "\n";
+                out << "revoke lease " << s.def.topic << " key " << ql::literalText(s.def.key) << "\n";
             } else if constexpr (std::is_same_v<T, PSecurity>) {
                 out << s.plan.statement << "\n";   // the REDACTED statement (D10): a password literal never prints
             } else {
@@ -1085,7 +1076,7 @@ std::expected<SelectRead, std::string> planSelect(const ql::SelectDef& def, cons
         if (named[i] == nullptr) continue;
         const auto& c   = key[i];
         const auto& lit = named[i]->value;
-        const std::string doesNotFit = literalText(lit) + " does not fit " + ql::typeWord(c.type, c.srcWidth) + " column '" + c.outName + "'";
+        const std::string doesNotFit = ql::literalText(lit) + " does not fit " + ql::typeWord(c.type, c.srcWidth) + " column '" + c.outName + "'";
         switch (c.type) {
             case PrimType::Int32:
             case PrimType::Int64: {
@@ -1113,11 +1104,11 @@ std::expected<SelectRead, std::string> planSelect(const ql::SelectDef& def, cons
                 if (lit.lowered && c.keyFunction == rune::codec::kKeyFunctionNone) {   // a lower() key component lowers it in the builder
                     std::vector<uint8_t> lowered(rune::codec::maxLoweredWidth(static_cast<uint32_t>(text.size())));
                     const auto r = rune::codec::lowerUtf8(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size()), lowered);
-                    if (!r.ok) return std::unexpected(literalText(lit) + " is not valid UTF-8");
+                    if (!r.ok) return std::unexpected(ql::literalText(lit) + " is not valid UTF-8");
                     text.assign(reinterpret_cast<const char*>(lowered.data()), r.len);
                 }
                 if (text.size() > c.srcWidth)
-                    return std::unexpected(literalText(lit) + " is " + std::to_string(text.size()) + " bytes; column '" + c.outName + "' is " + ql::typeWord(c.type, c.srcWidth));
+                    return std::unexpected(ql::literalText(lit) + " is " + std::to_string(text.size()) + " bytes; column '" + c.outName + "' is " + ql::typeWord(c.type, c.srcWidth));
                 builder->setString(c.outName, text);
                 break;
             }

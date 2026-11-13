@@ -367,3 +367,26 @@ TEST(CheckedWritesQlPlanRegression, PredicateTextOfALongAndChainRendersRegressio
     }
     EXPECT_EQ(ql::predicateText(nodes), want);
 }
+
+// A lowered literal (select-list `lower('x')`; the grammar allows it nowhere on the check path, so the planner's
+// "does not fit" error cannot carry one) must read back as the user wrote it.
+TEST(CheckedWritesQlPlanRegression, LoweredLiteralIsPrintedAsWrittenRegression) {
+    ql::Literal i;
+    i.kind = ql::Literal::Kind::Integer;
+    i.magnitude = 7;
+    EXPECT_EQ(ql::literalText(i), "7");
+    i.negative = true;
+    EXPECT_EQ(ql::literalText(i), "-7");
+    i.magnitude = 0;
+    EXPECT_EQ(ql::literalText(i), "0");
+    ql::Literal b;
+    b.kind = ql::Literal::Kind::Bool;
+    b.boolean = true;
+    EXPECT_EQ(ql::literalText(b), "true");
+    ql::Literal s;
+    s.kind = ql::Literal::Kind::String;
+    s.text = "ABC";
+    EXPECT_EQ(ql::literalText(s), "'ABC'");
+    s.lowered = true;
+    EXPECT_EQ(ql::literalText(s), "lower('ABC')");
+}

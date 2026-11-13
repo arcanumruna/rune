@@ -93,4 +93,7 @@ struct ViewSource {
 /// How QL writes a column type: `uint16`, `string(16)` (a FixedStr's width in brackets).
 [[nodiscard]] std::string typeWord(rune::codec::PrimType t, uint16_t width);
 
+/// A literal as the user wrote it: `7`, `-7`, `true`, `'text'`, and `lower('text')` for a lowered one.
+[[nodiscard]] std::string literalText(const Literal& l);
+
 } // namespace rune::ql
