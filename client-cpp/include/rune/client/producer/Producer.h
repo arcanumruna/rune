@@ -275,8 +275,10 @@ struct ProducerConfig {
 ///                  answered a retransmit as a known-old duplicate — the record
 ///                  IS in the log, its offset is no longer known: Kafka
 ///                  DUPLICATE_SEQUENCE parity)
-///   BrokerError    errorCode = the broker's ErrorCode, baseOffset = -1 (a
-///                  View rejection: the rejected record's offset)
+///   BrokerError    errorCode = the broker's ErrorCode.  baseOffset = -1 for a
+///                  refused produce; for a checked-writes (View) rejection the
+///                  batch was stored and baseOffset is the rejected record's
+///                  own offset (-1 only when the broker gave no real base)
 ///   DeliveryFailed delivery timeout / redirect budget exhausted / a deferred
 ///                  record that could not be applied, baseOffset = -1
 ///   SessionLost    the redirect reconnect failed (no answer possible)
@@ -330,7 +332,9 @@ struct BatchAck {
     static constexpr int16_t kClientFailure = -1;  ///< delivery timeout / redirect exhausted / closed
     int32_t topicId      = 0;
     int32_t partition    = 0;
-    int64_t baseOffset   = -1;  ///< -1 unless errorCode == 0 or the batch's records were judged
+    int64_t baseOffset   = -1;  ///< the batch's real base offset when it was stored (errorCode == 0, or a checked-writes batch
+                                ///< whose records were judged: errorCode is then the first rejection's code); -1 when the
+                                ///< batch was refused or failed, acks=None, or a known-old duplicate (offset unknown)
     int32_t baseSequence = 0;
     int32_t recordCount  = 0;
     int16_t errorCode    = 0;   ///< 0 OK; >0 broker ErrorCode; kClientFailure
