@@ -270,7 +270,9 @@ TEST(ClaimClientRegression, GracefulCloseWithAnInvokerClaimHeldAbandonsItPromptl
 
 // #323 (test only): Thread-mode close() on the thread that holds a ring claim.  The held claim blocks the duty side's
 // drain, so the close recovers through the delivery timeout (200 ms here, not the 30 s default), commit() is
-// false afterwards and the queue's credit is back.
+// false afterwards and the queue's credit is back.  The close is bounded by that timeout plus the closed-ring
+// drain's yield cap (an iteration cap, so its wall time is the host's load, #835); the cap is lowered here so the
+// 10 s bound measures the delivery timeout.
 TEST(ClaimClientRegression, ThreadModeCloseWithAHeldRingClaimRecoversWithinTheDeliveryTimeoutRegression) {
     Rig r(cfgFor(rc::RunnerMode::Thread, 5862, 5863));
     r.connect();
@@ -286,6 +288,8 @@ TEST(ClaimClientRegression, ThreadModeCloseWithAHeldRingClaimRecoversWithinTheDe
     ASSERT_TRUE(c);
     fill(c.buffer(), "HELD");
 
+    // production default: 1M yields, an iteration cap whose wall time is the host's load (#835); same path
+    r.client->testSetCloseDrainUnblockAfterYields(64);
     const auto t0 = std::chrono::steady_clock::now();
     r.client->close();
     const auto elapsed = std::chrono::steady_clock::now() - t0;
