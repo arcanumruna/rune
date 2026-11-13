@@ -113,7 +113,9 @@ AeronTransport::AeronTransport(TransportConfig cfg)
     , maxMessageLength_(computeMaxMessageLength(cfg_))
     , sealSupplier_([this](aeron::concurrent::AtomicBuffer& term, aeron::util::index_t termOffset,
                            aeron::util::index_t) -> std::int64_t { return sealInTerm_(term, termOffset); })
-{}
+{
+    drainingPubs_.reserve(kMaxDraining);
+}
 
 std::size_t AeronTransport::computeMaxMessageLength(const TransportConfig& c) noexcept {
     std::size_t term = c.termBufferLength;
@@ -321,8 +323,7 @@ void AeronTransport::stop() noexcept {
     // BEFORE closing the aeron client (same recursive_mutex teardown reason as
     // the publication slots below — Subscription dtors deregister via the conductor).
     seedPair_ = SeedSteady{};           // a pending re-pair's publication resolution, before its Aeron client
-    for (auto& d : drainingPubs_) d.reset();   // abandoned registrations, before the Aeron client closes
-    drainingCount_ = 0;
+    drainingPubs_.clear();              // abandoned registrations, before the Aeron client closes
     subSlots_.clear();                  // assemblers + subscriptions (conductor dereg), the response pairs' too
     respSeedSlot_ = -1;
     retiredSubs_  = 0;
@@ -373,8 +374,7 @@ bool AeronTransport::rebuild(int32_t seedResponsePort) noexcept {
         queueRetargetOutcome_(rt->token, false);
     }
     seedPair_ = SeedSteady{};
-    for (auto& d : drainingPubs_) d.reset();
-    drainingCount_ = 0;
+    drainingPubs_.clear();
     if (respSeedSlot_ >= 0) freeSubSlot_(subSlots_[static_cast<std::size_t>(respSeedSlot_)]);   // startBody_ opens the new seed pair
     respSeedSlot_ = -1;
     retiredSubs_  = 0;
@@ -963,34 +963,34 @@ void AeronTransport::drainPub_(Resolution<aeron::ExclusivePublication>&& r) noex
     if (r.ready() != nullptr) { r.reset(); return; }   // Ready: release it now
     const bool pending = std::holds_alternative<Res::Resolving>(r.state()) || std::holds_alternative<Res::TimedOut>(r.state());
     if (!pending) { r.reset(); return; }               // Unstarted / Rejected: nothing registered
-    if (drainingCount_ == kMaxDraining) {
+    try {
+        drainingPubs_.push_back(std::move(r));   // cold path: grows past the reserved capacity when it must
+    } catch (...) {
         if (!warnedDrainOverflow_) {
             warnedDrainOverflow_ = true;
-            std::fprintf(stderr, "rune-client: %zu abandoned publication registrations are still pending; "
-                                 "the newest is not tracked\n", kMaxDraining);
+            std::fprintf(stderr, "rune-client: could not track an abandoned publication registration "
+                                 "(out of memory)\n");
         }
-        return;
     }
-    drainingPubs_[drainingCount_++].emplace(std::move(r));
 }
 
 void AeronTransport::serviceDraining_() noexcept {
     static const std::string kNoChannel;   // add() is never called here: only a pending registration resumes
     std::size_t i = 0;
-    while (i < drainingCount_) {
+    while (i < drainingPubs_.size()) {
         auto& slot = drainingPubs_[i];
         bool done = false;
         if (!aeron_) {
             done = true;
         } else {
             PubRegistry reg{*aeron_, kNoChannel, 0};
-            (void)slot->poll(reg, resolveNow_());
-            done = slot->ready() != nullptr || slot->rejected();
+            (void)slot.poll(reg, resolveNow_());
+            done = slot.ready() != nullptr || slot.rejected();
         }
         if (!done) { ++i; continue; }
         slot.reset();   // Ready: the publication is released here; Rejected: nothing to release
-        --drainingCount_;
-        if (i != drainingCount_) { drainingPubs_[i] = std::move(drainingPubs_[drainingCount_]); drainingPubs_[drainingCount_].reset(); }
+        if (i + 1 != drainingPubs_.size()) drainingPubs_[i] = std::move(drainingPubs_.back());
+        drainingPubs_.pop_back();
     }
 }
 

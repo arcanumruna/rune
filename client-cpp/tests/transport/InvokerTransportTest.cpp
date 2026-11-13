@@ -1419,6 +1419,35 @@ TEST(AeronTransportRegression, RetargetWithAStreamPublicationStillResolvingLeave
     t.stop();
 }
 
+// More abandoned registrations than the old fixed drain capacity (16): every one is tracked and later released.
+TEST(AeronTransportRegression, MoreThanSixteenAbandonedRegistrationsAreAllTrackedRegression) {
+    FastLingerEnv env;
+    const std::string oldGw = loopback(rune::client::testing::allocFreeUdpPort());
+    const std::string newGw = loopback(rune::client::testing::allocFreeUdpPort());
+    Transport t{invokerConfig(oldGw, "aeron:ipc", 3660)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    constexpr int kStreams = 20;
+    const uint8_t frame[] = {1};
+    for (int i = 0; i < kStreams; ++i) {
+        const Transport::PubHandle h = t.publicationHandle(t.ingressChannel(), 3661 + i);
+        EXPECT_FALSE(t.offerOn(h, frame, sizeof frame)) << "Resolving: registration sent, driver not pumped";
+    }
+    ASSERT_EQ(t.drainingPubsForTest(), 0u);
+
+    ASSERT_TRUE(retargetSettled(t, newGw));
+    EXPECT_EQ(t.drainingPubsForTest(), static_cast<std::size_t>(kStreams)) << "an abandoned registration was lost";
+    bool drained = false;
+    for (int i = 0; i < 200000 && !drained; ++i) {   // hard cap: the driver answers, each registration is released
+        t.dutyCycle();
+        t.poll([](const uint8_t*, std::size_t) {}, 10);
+        drained = t.drainingPubsForTest() == 0;
+    }
+    EXPECT_TRUE(drained);
+    t.stop();
+}
+
 // releasePublication on a slot that is still registering parks the registration (it used to leave it alone).
 TEST(AeronTransportRegression, ReleasingAResolvingPublicationLeavesNoOrphanRegression) {
     FastLingerEnv env;

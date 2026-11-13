@@ -336,7 +336,7 @@ public:
     /// TEST SEAMS (cold): publication Resolutions parked by drainPub_ (#763); the registration id of the response
     /// subscription a response-paired handle names (0 = none Ready); and the driver's publication-limit counters (one
     /// per live publication) whose label ends with `channelSuffix` (the registered channel, e.g. a plain endpoint).
-    [[nodiscard]] std::size_t drainingPubsForTest() const noexcept { return drainingCount_; }
+    [[nodiscard]] std::size_t drainingPubsForTest() const noexcept { return drainingPubs_.size(); }
     [[nodiscard]] bool subSlotFreeForTest(int32_t slot) const noexcept {
         return slot >= 0 && static_cast<std::size_t>(slot) < subSlots_.size() &&
                subSlots_[static_cast<std::size_t>(slot)].state == SubSlot::State::Free;
@@ -460,7 +460,8 @@ public:
         // room).  The starting source rotates each poll so no subscription starves.
         int frags = 0;
         if (retiredSubs_ != 0) [[unlikely]] reapRetiredSubs_();   // never inside a poll callback: here is safe
-        if (drainingCount_ != 0) [[unlikely]] serviceDraining_();   // #763: registrations whose owner left them pending
+        // #763: registrations whose owner left them pending
+        if (!drainingPubs_.empty()) [[unlikely]] serviceDraining_();
         const std::size_t sources = 1 + subSlots_.size();
         const std::size_t start   = pollStart_ < sources ? pollStart_ : 0;
         pollStart_ = (start + 1 == sources) ? 0 : start + 1;
@@ -830,14 +831,14 @@ private:
     /// #763: a publication Resolution that leaves its owner goes through here, never `reset()`.  Ready: released now.
     /// Resolving / TimedOut: its driver registration is still pending and would later complete with nobody to release
     /// it, so it is parked in drainingPubs_ and polled (serviceDraining_, from poll()) until it is Ready (released) or
-    /// Rejected (dropped).  Unstarted / Rejected: nothing registered.  Cold, never blocks.  Overflow (kMaxDraining
-    /// pending at once): logged once, the OLDEST entries are kept and `r` is dropped.
+    /// Rejected (dropped).  Unstarted / Rejected: nothing registered.  Cold, never blocks.  Every pending
+    /// registration is tracked (the set grows by allocation on this cold path; only an allocation failure drops one,
+    /// logged once).
     void drainPub_(Resolution<aeron::ExclusivePublication>&& r) noexcept;
     void serviceDraining_() noexcept;
-    static constexpr std::size_t kMaxDraining = 16;
-    std::array<std::optional<Resolution<aeron::ExclusivePublication>>, kMaxDraining> drainingPubs_{};
-    std::size_t drainingCount_ = 0;           // entries in drainingPubs_[0, drainingCount_)
-    bool        warnedDrainOverflow_ = false;   // drainPub_ overflow: logged once
+    static constexpr std::size_t kMaxDraining = 16;   // capacity reserved up front, not a cap
+    std::vector<Resolution<aeron::ExclusivePublication>> drainingPubs_;
+    bool        warnedDrainOverflow_ = false;   // drainPub_ could not allocate: logged once
     uint32_t retiredSubs_ = 0;   // Retired slots awaiting reapRetiredSubs_()
     uint64_t rebuildFailures_ = 0;   // failed rebuild() attempts; logged on the first and every 64th
     uint64_t freshSubsAdded_ = 0;   // fresh (response-pair) subscription slots added; test seam
