@@ -459,6 +459,36 @@ TEST(ClientAgentRegression, ABindPublicationAPlainRouteStillUsesIsDemotedNotRele
     EXPECT_FALSE(agent.publicationResponsePairedForTest(h)) << "the pair is gone: the slot is a plain publication";
 }
 
+// A session's control publication shares the (channel, stream) slot with a worker bind entry whose data channel is that
+// session's endpoint: freeing the entry must leave the slot to the session, never Release it.
+TEST(ClientAgentRegression, ABindEntryThatSharesASessionsPublicationSlotNeverReleasesItRegression) {
+    const std::string kNode = "aeron:udp?endpoint=nodeA:9001";
+    const std::string kB    = "aeron:udp?endpoint=hostB:9001";
+    const std::string kW2   = "aeron:udp?endpoint=hostX:9200";
+    constexpr int32_t kTopic = 7, kStream = 1;   // the transport's ingressStreamId: the session's slot key
+    rca::ClientAgent agent(makeAgentConfig("aeron:udp?endpoint=seed:1"));
+
+    const uint32_t bIdx = agent.sessionIndexForTest(kB);
+    ASSERT_EQ(bIdx, 1u);
+    agent.setSessionResponsePort(kB, 41001);
+    ASSERT_EQ(agent.serviceResponseUpgradesForTest(1'000'000), 1);
+    const auto ctl = agent.sessionObjForTest(bIdx).ctlPub;
+    ASSERT_NE(ctl, rune::client::transport::AeronTransport::kNoPub);
+    ASSERT_TRUE(agent.publicationResponsePairedForTest(ctl));
+
+    // A worker whose data channel is the session's endpoint: its bind entry lands on the session's slot.
+    ASSERT_TRUE(agent.setRoute(kTopic, 0, kNode, kB, 0, kStream, 7000));
+    const uint32_t wIdx = agent.routeBindIdxForTest(kTopic, 0);
+    ASSERT_NE(wIdx, 0xFFFFFFFFu);
+    ASSERT_EQ(agent.routePubForTest(kTopic, 0), ctl) << "the bind shares the session's slot: the collision exists";
+
+    ASSERT_TRUE(agent.setRoute(kTopic, 0, kNode, kW2, 0, kStream, 7100));   // the last route leaves the entry
+    EXPECT_TRUE(agent.workerBindFreeForTest(wIdx));
+    EXPECT_FALSE(agent.publicationReleasedForTest(ctl)) << "the session's control publication was released";
+    EXPECT_TRUE(agent.publicationResponsePairedForTest(ctl)) << "the session's pair was torn down";
+    EXPECT_EQ(agent.sessionObjForTest(bIdx).ctlPub, ctl);
+}
+
 // #751 re-review: a bind entry created on a slot that is already Plain (a port-0 route made it, or a freed entry was
 // demoted under such a route) upgrades the slot to a response pair; it never inherits the plain publication.
 TEST(ClientAgentRegression, ABindOnAPlainSlotUpgradesItToAResponsePairRegression) {

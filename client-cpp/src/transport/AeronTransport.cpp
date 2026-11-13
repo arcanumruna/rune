@@ -540,10 +540,26 @@ AeronTransport::PubHandle AeronTransport::publicationHandle(const std::string& c
             return static_cast<PubHandle>(i);
         }
     }
+    if (const PubHandle r = firstReleasedPubSlot_(); r != kNoPub) {   // #832: a Released slot serves any key
+        PubSlot& ps = pubSlots_[static_cast<std::size_t>(r)];
+        ps.channel  = channel;
+        ps.streamId = streamId;
+        ps.res      = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
+        ps.addChannel.clear();
+        ps.mode = PubSlot::Plain{};
+        return r;
+    }
     pubSlots_.push_back(PubSlot{channel, streamId,
                                 Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs,
                                                                         kResolveRetryNs}});
     return static_cast<PubHandle>(pubSlots_.size() - 1);
+}
+
+AeronTransport::PubHandle AeronTransport::firstReleasedPubSlot_() const noexcept {
+    for (std::size_t i = 0; i < pubSlots_.size(); ++i) {
+        if (std::holds_alternative<PubSlot::Released>(pubSlots_[i].mode)) return static_cast<PubHandle>(i);
+    }
+    return kNoPub;
 }
 
 bool AeronTransport::offerOn(PubHandle h, const uint8_t* buf, std::size_t len, FrameCrc crc) noexcept {
@@ -611,6 +627,15 @@ AeronTransport::PubHandle AeronTransport::responsePublicationHandle(const std::s
     }
     const int32_t sub = addSubSlot_(SubSlot::Kind::ResponsePair, std::string(responseControlChannel), cfg_.egressStreamId);
     if (sub < 0) return kNoPub;
+    if (const PubHandle r = firstReleasedPubSlot_(); r != kNoPub) {   // #832: a Released slot serves any key
+        PubSlot& rs = pubSlots_[static_cast<std::size_t>(r)];
+        rs.channel  = channel;
+        rs.streamId = streamId;
+        rs.res      = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
+        rs.addChannel.clear();
+        rs.mode = PubSlot::AwaitResponseSub{sub, resolveNow_() + kResolveTimeoutNs};
+        return r;
+    }
     PubSlot ps{channel, streamId, Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs}};
     ps.mode = PubSlot::AwaitResponseSub{sub, resolveNow_() + kResolveTimeoutNs};
     pubSlots_.push_back(std::move(ps));

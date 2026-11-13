@@ -1821,8 +1821,15 @@ void ClientAgent::unrefBind_(uint32_t idx) noexcept {
     for (const PartitionRoute& r : routes_) {
         if (r.pub == b.pub) { plainUser = true; break; }
     }
-    if (plainUser) transport_.demoteResponsePublication(b.pub);
-    else transport_.releaseResponsePublication(b.pub);
+    // A session's control publication can share this (channel, stream) slot; the slot is then the session's.
+    bool sessionUser = false;
+    for (const auto& s : sessions_) {
+        if (s->ctlPub == b.pub) { sessionUser = true; break; }
+    }
+    if (!sessionUser) {
+        if (plainUser) transport_.demoteResponsePublication(b.pub);
+        else transport_.releaseResponsePublication(b.pub);
+    }
     b.pub          = transport::AeronTransport::kNoPub;
     b.sessionIndex = kNoSession;
     b.resolvedGen  = UINT64_MAX;

@@ -835,6 +835,8 @@ private:
     /// registration is tracked (the set grows by allocation on this cold path; only an allocation failure drops one,
     /// logged once).
     void drainPub_(Resolution<aeron::ExclusivePublication>&& r) noexcept;
+    /// #832: the first Released publication slot (reusable for any (channel, stream)), or kNoPub.
+    [[nodiscard]] PubHandle firstReleasedPubSlot_() const noexcept;
     void serviceDraining_() noexcept;
     static constexpr std::size_t kMaxDraining = 16;   // capacity reserved up front, not a cap
     std::vector<Resolution<aeron::ExclusivePublication>> drainingPubs_;

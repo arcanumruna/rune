@@ -1448,6 +1448,32 @@ TEST(AeronTransportRegression, MoreThanSixteenAbandonedRegistrationsAreAllTracke
     t.stop();
 }
 
+// A Released publication slot is reused for the next endpoint, whatever its key: the table does not grow per rotation.
+TEST(AeronTransportRegression, AReleasedPublicationSlotIsReusedForAnotherEndpointRegression) {
+    FastLingerEnv env;
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3680)};
+    t.start();
+    constexpr int kRounds = 50;
+    std::size_t slotsAfterFirst = 0;
+    Transport::PubHandle first = Transport::kNoPub;
+    for (int i = 0; i < kRounds; ++i) {
+        const std::string worker = loopback(static_cast<uint16_t>(21000 + i));   // never resolved: no driver traffic
+        const auto respCtl = rune::client::transport::responseControlChannelFor(worker, 41000 + i);
+        ASSERT_TRUE(respCtl.has_value());
+        const Transport::PubHandle h = t.responsePublicationHandle(worker, 3681 + i, *respCtl);
+        ASSERT_NE(h, Transport::kNoPub);
+        if (i == 0) { slotsAfterFirst = t.pubSlotCountForTest(); first = h; }
+        EXPECT_EQ(h, first) << "the Released slot is the one reused";
+        ASSERT_NE(t.publicationChannel(h), nullptr);
+        EXPECT_EQ(*t.publicationChannel(h), worker) << "the reused slot targets the NEW endpoint";
+        t.releaseResponsePublication(h);
+        EXPECT_TRUE(t.publicationReleasedForTest(h));
+        for (int k = 0; k < 3; ++k) t.poll([](const uint8_t*, std::size_t) {}, 10);   // retired subscriptions are freed
+    }
+    EXPECT_EQ(t.pubSlotCountForTest(), slotsAfterFirst) << "a Released slot was not reused: the table grew";
+    t.stop();
+}
+
 // releasePublication on a slot that is still registering parks the registration (it used to leave it alone).
 TEST(AeronTransportRegression, ReleasingAResolvingPublicationLeavesNoOrphanRegression) {
     FastLingerEnv env;
