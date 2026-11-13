@@ -83,6 +83,16 @@ registered; a burst of redirects to one leader is one move, each op keeping its 
 ANOTHER target supersedes it. A request to stay on the current channel ("already there") cancels a pending move elsewhere
 (`AeronTransport::cancelRetarget`, published as a failed result).
 
+#### The coordinator route (group / transaction coordinator)
+The group and transaction coordinator is the consensus leader. A `NotCoordinator{leader}` answer moves the route to that
+node's own session (`Client::moveCoordinatorTo_`); a remote coordinator session that stays down is given up at its stale
+edge (`responseTimeoutNs`) or after the down grace. Since client version 20 the `MetadataResponse` also names the
+coordinator node (a trailer, `-1` = unknown). A remote coordinator session that is silent (two keepalives) or not
+Connected, while a group member, a transactional producer or a coordinator request uses it, arms the metadata refresh
+(`watchSilentLeaders_`); an answer that names another node moves the route there at once (`testCoordinatorMetadataMoves()`
+counts these). A healthy coordinator is never moved by metadata: its own `NotCoordinator` answer stays the authority, and
+a wrong hint corrects itself that way.
+
 ### 2.1 Producer (`producer/`)
 Tier-1 producer with a **zero per-send heap allocation** fast path. App threads
 call `send()`/`flush()` → write a compact `SEND_RECORD` into the ring (the

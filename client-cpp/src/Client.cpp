@@ -3993,7 +3993,9 @@ int Client::dutyCycle(int64_t nowNs) {
     }
     // #514: a BOUND reader / group fetch on a leader node that went silent (crashed) arms nothing above; the
     // check is one compare per cycle, the scan once per quarter keepalive.
-    if (nowNs >= nextSilentCheckNs_ && (subscriberHub_.homedCount() != 0 || !groupConsumerHub_.empty())) [[unlikely]]
+    // #361: ... and a remote coordinator session (coordinatorInUse_ is asked inside, once per period).
+    if (nowNs >= nextSilentCheckNs_ &&
+        (subscriberHub_.homedCount() != 0 || !groupConsumerHub_.empty() || coordIdx() != 0)) [[unlikely]]
         work += watchSilentLeaders_(nowNs);
 
     // 3b'. F8c C3: control frames the transport refused (Retry), in order.
@@ -6892,6 +6894,14 @@ int Client::watchSilentLeaders_(int64_t nowNs) {
         scheduleMetadataRefresh();   // #514 (seed): idempotent while armed
         return 1;
     }
+    // #361: a remote coordinator session that went silent while something uses the coordinator: ask for metadata, whose
+    // answer names the new coordinator (onMetadataResponse).  Idempotent while armed, level-triggered.  A session that
+    // is not Connected asks nothing here: syncCoordinatorSession_ paces its give-up and its metadata refresh (a growing
+    // grace); an answer that arrives anyway may still move the route (coordinatorSuspect_).
+    if (coordinatorSilent_(nowNs) && coordinatorInUse_()) {
+        scheduleMetadataRefresh();
+        return 1;
+    }
     if (silent == 0) [[likely]] return 0;
     for (uint32_t i = 1; i <= 64 && silent != 0; ++i, silent >>= 1) {
         if ((silent & 1u) == 0) continue;
@@ -7541,6 +7551,26 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         if (groupConsumerHub_.fetchWaitsForSession()) scheduleMetadataRefresh();
     }
 
+    // #361: the answer names the cluster's coordinator.  A coordinator session that is silent or down (and something
+    // uses it) is left for the named node at once, not after the stale-session detection; a healthy coordinator is
+    // never moved by metadata (a lagging follower's answer must not cause a rejoin: its own NotCoordinator answer is
+    // the authority), and a wrong hint corrects itself (the named node answers NotCoordinator{real one}; an
+    // unreachable one is given up by syncCoordinatorSession_).  An answer from the coordinator's own session proves it
+    // alive.  An answer naming the same node (the election has not finished) moves nothing: the refresh stays armed by
+    // watchSilentLeaders_ (level-triggered, backoff-paced).
+    if (resp.coordinatorNodeId >= 0 && coordinatorInUse_() && coordinatorSuspect_(now()) &&
+        resp.sessionId != coordSessionId_()) {
+        const std::string& hostPort = metadataCache_.endpointFor(resp.coordinatorNodeId);
+        if (!hostPort.empty()) {
+            // The response port of that node was learnt from this same answer (the per-broker loop above).
+            try {
+                if (moveCoordinatorTo_(toChannel(hostPort))) ++coordinatorMetadataMoves_;
+            } catch (...) {
+                // allocation failure (cold path): the refresh stays armed, the next answer retries
+            }
+        }
+    }
+
     // F14: a fresh cluster view - txn requests waiting for the coordinator to be re-discovered
     // (NotCoordinator) back off and re-send.
     producerHub_.onCoordinatorMoved();
@@ -7556,9 +7586,15 @@ void Client::onCoordinatorRedirect_(const std::string& message) {
     // MAJOR-1: "the seed" means where the seed PHYSICALLY is (its default
     // publication), not its bootstrap identity — a seed a data-op redirect moved
     // to L that hears NotCoordinator{bootstrap} must route to the bootstrap.
+    (void)moveCoordinatorTo_(channel);
+}
+
+// The route move of onCoordinatorRedirect_ (a NotCoordinator answer) and of a metadata answer naming the coordinator
+// (#361): false = nothing moved.  Agent / duty thread.
+bool Client::moveCoordinatorTo_(const std::string& channel) {
     const auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_);
     const std::string& current = rm == nullptr ? agent_.seedChannel() : rm->channel;
-    if (agent::ClientAgent::sameEndpoint(channel, current)) return;
+    if (agent::ClientAgent::sameEndpoint(channel, current)) return false;
     // r2 LOW-3: a coordinator whose session was Rejected / Closed is not
     // re-followed until fresh metadata arrives (the member waits its join
     // deadline, the txn op its retry) — never a 100 ms move/fallback loop.
@@ -7566,7 +7602,7 @@ void Client::onCoordinatorRedirect_(const std::string& message) {
         if (metadataResponses_ == coordRejected_->meta &&
             agent::ClientAgent::sameEndpoint(channel, coordRejected_->channel)) {
             scheduleMetadataRefresh();
-            return;
+            return false;
         }
         coordRejected_.reset();
     }
@@ -7578,6 +7614,29 @@ void Client::onCoordinatorRedirect_(const std::string& message) {
     groupConsumerHub_.onCoordinatorMoved();   // members -> Rejoining (there)
     producerHub_.onCoordinatorMoved();        // Phase 2b F: AwaitCoordinator requests re-send
     syncCoordinatorSession_();                // already connected: they join at once
+    return true;
+}
+
+// #361: the remote coordinator's session is silent (Connected, nothing heard for two keepalives: a live node answers
+// every Ping) or not Connected.  The seed route is never suspect here: the seed has its own failover (#514 / DR).
+bool Client::coordinatorSuspect_(int64_t nowNs) const noexcept {
+    const auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_);
+    if (rm == nullptr) return false;
+    return agent_.sessionMachineAt(rm->idx).state() != session::SessionState::Connected || coordinatorSilent_(nowNs);
+}
+
+// #361: the remote coordinator's session is Connected but silent for two keepalives (a live node answers every Ping).
+bool Client::coordinatorSilent_(int64_t nowNs) const noexcept {
+    const auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_);
+    if (rm == nullptr) return false;
+    const session::SessionMachine& m = agent_.sessionMachineAt(rm->idx);
+    return m.state() == session::SessionState::Connected && m.silentLongerThan(nowNs, 2 * m.keepaliveIntervalNs());
+}
+
+// #361: something depends on the coordinator session: a group member, a transactional producer, or a pending
+// coordinator request.
+bool Client::coordinatorInUse_() const noexcept {
+    return !groupConsumerHub_.empty() || producerHub_.coordinatorInUse();
 }
 
 uint64_t Client::staleLossesAt_(uint32_t idx) const noexcept {

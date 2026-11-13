@@ -792,7 +792,7 @@ TEST(LeaseProtocolRegression, NumbersPinnedRegression) {
     EXPECT_EQ(static_cast<int>(rc::ErrorCode::LeaseLimitExceeded), 65);
     EXPECT_EQ(static_cast<int>(rc::ErrorCode::LeaseTtlTooLarge), 66);
     EXPECT_EQ(rc::kClientVersionLeases, 18);
-    EXPECT_EQ(rc::kClientVersion, 19);   // #234: the bootstrap challenge
+    EXPECT_EQ(rc::kClientVersion, 20);   // #361: the coordinator hint (v19: the bootstrap challenge, #234)
     EXPECT_EQ(rc::kBrokerVersionLeases, 11);
     EXPECT_EQ(rc::kBrokerVersion, 12);
     EXPECT_FALSE(rc::clientUnderstandsLeases(17));

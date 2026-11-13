@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -1584,4 +1585,166 @@ TEST(ProducerTxnClientRegression, OpenTopicAndWaitWithAnotherClientsProducerIsRe
     EXPECT_THROW((void)b.client->openTopicAndWait<rune::gen::Position>("t", pb, shortWait), std::invalid_argument)
         << "a moved-from producer belongs to no Client";
     EXPECT_TRUE(moved.ownedBy(*b.client));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// #361: a silent coordinator is left as soon as a metadata answer names another node (before the stale-session edge).
+// ---------------------------------------------------------------------------------------------------------------
+namespace {
+
+/// The FallbackRig with a third node (node id 2) and a transaction whose EndTxn is in flight at the coordinator
+/// (node id 1, `r.node`); the stale edge is kStaleRespNs (1 s), a silent session shows after 2 keepalives (0.4 s).
+struct SilentCoord {
+    FallbackRig  r;
+    int          third;   // the third node's endpoint index
+    int          thirdPort;
+    std::optional<rc::Producer> p;
+    int64_t      endCorr = 0;
+    uint32_t     oldIdx = 0;
+    uint64_t     staleBefore = 0;
+    int64_t      t0 = 0;
+
+    SilentCoord(int32_t in, int32_t eg, bool endTxn = true)
+        // The previous test left g_fbNow ahead: the Client reads the clock in its constructor (its first sweep is due
+        // 100 ms after it), so the clock is reset before the rig is built.
+        : r((g_fbNow = 1'000'000'000'000LL, in), eg, kStaleRespNs, kStaleKeepaliveNs),
+          third(r.gw.addEndpoint(fbUdp(thirdPort = fbFreePort()), in)),
+          p(r.client.producer(fbStaleProducerCfg())) {
+        r.gw.nodeOfEndpoint[third] = third;
+        r.gw.moreBrokers.push_back({2, "127.0.0.1", thirdPort});
+        endCorr     = fbCoordinatorUp(r, *p, endTxn);
+        oldIdx      = r.coordIdx();
+        staleBefore = r.client.testStaleLossesAt(oldIdx);
+    }
+    /// The coordinator node dies (no pong, no connect answer); the next election's coordinator is `newCoordinator`
+    /// (an endpoint index) and every metadata answer names `hint` as the coordinator node id.
+    void killCoordinator(int newCoordinator, int32_t hint) {
+        t0 = g_fbNow;
+        r.gw.noPongEndpoints.insert(r.node);
+        r.gw.silentEndpoints.insert(r.node);
+        r.gw.coordinatorEndpoint   = newCoordinator;
+        r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(newCoordinator == third ? thirdPort : r.seedPort);
+        r.gw.coordinatorHint       = hint;
+        r.gw.holdTxnReplies        = false;   // the dead node's EndTxn stays swallowed; the new coordinator answers
+    }
+    /// Time moves in 25 ms legs (each with enough real passes for a loopback datagram to cross) until `pred` holds or
+    /// `windowNs` passed since the kill.
+    template <class P>
+    bool runUntil(int64_t windowNs, P&& pred) {
+        while (g_fbNow - t0 < windowNs) {
+            g_fbNow += 25'000'000LL;
+            r.passes(60);
+            if (pred()) return true;
+        }
+        return pred();
+    }
+};
+
+}  // namespace
+
+TEST(ClientCoordinatorRegression, ASilentCoordinatorIsLeftWhenMetadataNamesAnotherRegression) {
+    SilentCoord s(5121, 5122);
+    ASSERT_NE(s.endCorr, 0);
+    ASSERT_NE(s.oldIdx, 0u);
+    ASSERT_EQ(s.r.client.testCoordinatorMetadataMoves(), 0u);
+    const int metaBefore = s.r.gw.metadataRequests;
+    s.killCoordinator(s.third, /*hint=*/2);
+    ASSERT_TRUE(s.runUntil(900'000'000LL, [&] { return s.r.client.testCoordinatorMetadataMoves() != 0; }))
+        << "the silent coordinator was not left before the stale edge (" << (g_fbNow - s.t0) / 1'000'000 << " ms in)";
+    EXPECT_LT(g_fbNow - s.t0, kStaleRespNs) << "all before responseTimeoutNs";
+    EXPECT_GT(s.r.gw.metadataRequests, metaBefore) << "a MetadataRequest went out";
+    EXPECT_EQ(s.r.client.testCoordinatorMetadataMoves(), 1u);
+    EXPECT_EQ(s.r.client.testCoordinatorChannel(), fbUdp(s.thirdPort)) << "the route is the named node";
+    EXPECT_NE(s.r.coordIdx(), 0u);
+    EXPECT_NE(s.r.coordIdx(), s.oldIdx);
+    EXPECT_EQ(s.r.client.testStaleLossesAt(s.oldIdx), s.staleBefore) << "the old session had not counted a stale loss";
+    EXPECT_EQ(s.r.client.testCoordinatorFallbacks(), 0u) << "left by the hint, not given up";
+    // The in-flight EndTxn is re-sent on the new coordinator's session once it is connected, and completes.
+    ASSERT_TRUE(s.r.drive([&] { return s.r.got.count(201) != 0; }, 200'000, 0)) << "the commit never completed";
+    EXPECT_EQ(s.r.got[201].status, rc::OpStatus::Ok) << "errorCode " << s.r.got[201].errorCode;
+    EXPECT_LT(g_fbNow - s.t0, kStaleRespNs) << "completed before the stale edge would have fired";
+    s.r.passes(2000);
+    EXPECT_EQ(s.r.gw.endTxns, 2) << "the EndTxn reached the new coordinator exactly once";
+    ASSERT_GE(s.r.gw.coordinatorEndpoints.size(), 2u);
+    EXPECT_EQ(s.r.gw.coordinatorEndpoints.back(), s.third);
+    EXPECT_EQ(s.r.client.testStaleLossesAt(s.oldIdx), s.staleBefore);
+}
+
+namespace {
+/// A silent coordinator while every answer names `hint` (the same node, or none): nothing moves, inside the stale edge.
+/// Returns the metadata requests seen from the first one to the end of the window (0 = none went out).
+int silentCoordinatorWithHint(int32_t in, int32_t eg, int32_t hint) {
+    SilentCoord s(in, eg);
+    EXPECT_NE(s.endCorr, 0);
+    s.killCoordinator(s.third, hint);
+    const int metaAtKill = s.r.gw.metadataRequests;
+    (void)s.runUntil(900'000'000LL, [] { return false; });
+    EXPECT_EQ(s.r.client.testCoordinatorMetadataMoves(), 0u) << "hint " << hint;
+    EXPECT_EQ(s.r.coordIdx(), s.oldIdx) << "hint " << hint << ": the route did not move";
+    EXPECT_EQ(s.r.client.testStaleLossesAt(s.oldIdx), s.staleBefore) << "hint " << hint << ": inside the stale edge";
+    return s.r.gw.metadataRequests - metaAtKill;
+}
+}  // namespace
+
+// The election has not finished: the answer still names the silent node.  Nothing moves; the refresh stays armed
+// (level-triggered), so more requests follow at the backoff pace.
+TEST(ClientCoordinatorRegression, AnAnswerNamingTheSameNodeMovesNothingAndTheRefreshStaysArmedRegression) {
+    EXPECT_GE(silentCoordinatorWithHint(5123, 5124, /*hint=*/1), 2) << "another request follows the first";
+}
+
+TEST(ClientCoordinatorRegression, AnAnswerNamingNoNodeMovesNothingRegression) {
+    EXPECT_GE(silentCoordinatorWithHint(5125, 5126, /*hint=*/-1), 1) << "the silent coordinator asked";
+}
+
+TEST(ClientCoordinatorRegression, AnAnswerNamingTheSeedMovesTheRouteThereRegression) {
+    SilentCoord s(5127, 5128);
+    ASSERT_NE(s.endCorr, 0);
+    s.killCoordinator(/*the seed node*/ 0, /*hint=*/0);
+    ASSERT_TRUE(s.runUntil(900'000'000LL, [&] { return s.r.client.testCoordinatorMetadataMoves() != 0; }));
+    EXPECT_EQ(s.r.client.testCoordinatorMetadataMoves(), 1u);
+    EXPECT_EQ(s.r.coordIdx(), 0u) << "the route is the seed";
+    EXPECT_EQ(s.r.client.testCoordinatorChannel(), "") << "the seed route";
+    ASSERT_TRUE(s.r.drive([&] { return s.r.got.count(201) != 0; }, 200'000, 0)) << "the commit never completed";
+    EXPECT_EQ(s.r.got[201].status, rc::OpStatus::Ok);
+    EXPECT_EQ(s.r.gw.coordinatorEndpoints.back(), 0) << "the EndTxn reached the seed node";
+}
+
+// A healthy coordinator (answering its Pings) is never moved by metadata: a lagging follower's answer must not cause a
+// rejoin; the coordinator's own NotCoordinator stays the authority.
+TEST(ClientCoordinatorRegression, AHealthyCoordinatorIsNotMovedByMetadataRegression) {
+    SilentCoord s(5129, 5130);
+    ASSERT_NE(s.endCorr, 0);
+    s.r.gw.coordinatorHint = 2;   // an answer that names another node
+    const uint64_t redirects = s.r.client.testCoordinatorRedirects();
+    const int      endTxns   = s.r.gw.endTxns;
+    const int      before    = s.r.gw.metadataRequests;
+    s.t0 = g_fbNow;
+    for (int i = 0; i < 12; ++i) {   // 12 asks over 1.2 s, each answered by every Connected node
+        s.r.client.testRequestMetadataNow();
+        s.r.passes(4);
+        g_fbNow += 100'000'000LL;
+        s.r.passes(4);
+    }
+    EXPECT_GT(s.r.gw.metadataRequests, before + 5) << "precondition: answers naming node 2 were delivered";
+    EXPECT_EQ(s.r.client.testCoordinatorMetadataMoves(), 0u);
+    EXPECT_EQ(s.r.coordIdx(), s.oldIdx) << "a healthy coordinator stays";
+    EXPECT_EQ(s.r.client.testCoordinatorRedirects(), redirects);
+    EXPECT_EQ(s.r.gw.endTxns, endTxns) << "nothing re-sent: no rejoin";
+    EXPECT_EQ(s.r.client.testStaleLossesAt(s.oldIdx), s.staleBefore);
+}
+
+// No group and no transactional producer: nothing depends on the coordinator, so its silence asks for nothing.
+TEST(ClientCoordinatorRegression, AnIdleClientAsksNothingRegression) {
+    SilentCoord s(5131, 5132, /*endTxn=*/false);
+    ASSERT_NE(s.oldIdx, 0u) << "precondition: the coordinator route is remote";
+    s.p.reset();   // the transactional producer is released
+    s.r.passes(200);
+    s.r.gw.holdTxnReplies = false;
+    s.killCoordinator(s.third, /*hint=*/2);
+    s.r.passes(200);   // let in-flight traffic settle
+    const int metaBefore = s.r.gw.metadataRequests;
+    s.t0 = g_fbNow;
+    (void)s.runUntil(900'000'000LL, [] { return false; });
+    EXPECT_EQ(s.r.gw.metadataRequests, metaBefore) << "an idle client asked for metadata because a coordinator it does not use went silent";
+    EXPECT_EQ(s.r.client.testCoordinatorMetadataMoves(), 0u);
 }

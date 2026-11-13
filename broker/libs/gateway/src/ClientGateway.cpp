@@ -12848,6 +12848,14 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     resp.brokers       = std::span<const pc::BrokerEntry>(brokers.data(), brokers.size());
     resp.partitions    = std::span<const pc::PartitionEntry>(parts.data(), parts.size());
     resp.clientVersion = session->clientVersion;   // issue #116: the receiver trailer only for sessions >= 12
+    // #361: the coordinator (the consensus leader the group / transaction coordinator is) as this node sees it: this
+    // node's own id when it leads (LeaderView::leaderNodeId is the leader's id as the observer knows it), the leader's
+    // id when a follower knows it AND has an endpoint a client could be redirected to (the same condition under which
+    // redirectToCoordinator_ answers NotCoordinator), else -1.  No leader view (no replication): nothing to name.
+    if (leaderView_) {
+        const LeaderView lv = leaderView_();
+        resp.coordinatorNodeId = lv.isLeader ? thisNodeId_ : (lv.leaderClientEndpoint.empty() ? -1 : lv.leaderNodeId);
+    }
     if (preReceiverKeyMetadataForTest_) [[unlikely]]   // test seam: an old broker's answer (no receiver trailer)
         resp.clientVersion = std::min(resp.clientVersion, pc::kClientVersionReceiverKeys - 1);
 

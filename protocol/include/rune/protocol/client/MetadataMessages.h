@@ -56,6 +56,11 @@
 //               kClientVersionResponseEgress and only when some port is non-zero; whenever it is sent the endpoint and
 //               receiver trailers are sent too (empty strings / zero ids allowed), so older decoders stop before it.
 //               Absent = every responseControlPort 0.
+//   [after the response-port trailer] optional coordinator trailer (v20, #361): int32 LE coordinatorNodeId, the node id
+//               of the cluster's coordinator (the consensus leader the group / transaction coordinator is) as the
+//               answering node sees it, -1 = not known now.  Sent only to sessions >= kClientVersionCoordinatorHint,
+//               always for them; whenever it is sent the endpoint, receiver and response-port trailers are sent too
+//               (empty strings / zero ids / zero ports allowed), so older decoders stop before it.  Absent = -1.
 // ---------------------------------------------------------------------------
 
 #include <cstddef>
@@ -226,9 +231,15 @@ struct MetadataResponse {
     /// Encode side (issue #116): the ConnectRequest.clientVersion of the session this response answers - the
     /// receiver trailer is written only for sessions >= kClientVersionReceiverKeys.  Not on the wire.
     int32_t clientVersion = 0;
+    /// Encode side (#361): the node id of the cluster's coordinator as this node sees it (-1 = not known now).  Written
+    /// in the coordinator trailer for sessions >= kClientVersionCoordinatorHint.
+    int32_t coordinatorNodeId = -1;
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::MetadataResponse); // 9
     static constexpr uint16_t BODY_FIXED  = 0;
+
+    /// #361: true when the coordinator trailer is written (every session >= kClientVersionCoordinatorHint).
+    [[nodiscard]] bool emitsCoordinator() const noexcept { return clientVersion >= kClientVersionCoordinatorHint; }
 
     /// True when at least one partition carries a non-empty ingressEndpoint.
     /// Gates whether encode()/encodedSize() emit the additive trailer, so
@@ -312,8 +323,9 @@ struct MetadataResponse {
 
         // Additive trailer: uint16 count (== partitions.size()) + var-str per entry.
         // Written only when some endpoint is non-empty → default frames unchanged.
-        const bool responsePorts = emitsResponsePorts();
-        const bool receiverIds = emitsReceiverIds() || responsePorts;   // trailers are positional
+        const bool coord = emitsCoordinator();
+        const bool responsePorts = emitsResponsePorts() || coord;   // trailers are positional
+        const bool receiverIds = emitsReceiverIds() || responsePorts;
         if (receiverIds || hasIngressEndpoints()) {
             detail::putLE16(buf, static_cast<int>(pos), static_cast<uint16_t>(partitions.size()));
             pos += 2;
@@ -334,6 +346,11 @@ struct MetadataResponse {
             pos += 2;
             for (const auto& p : partitions) { detail::putLE32(buf, static_cast<int>(pos), p.responseControlPort); pos += 4; }
         }
+        // v20 (#361): the coordinator trailer, after the response-port trailer.
+        if (coord) {
+            detail::putLE32(buf, static_cast<int>(pos), coordinatorNodeId);
+            pos += 4;
+        }
         return pos;
     }
 
@@ -346,7 +363,8 @@ struct MetadataResponse {
         }
         sz += 2u;              // partitionCount
         sz += partitions.size() * 28u;  // read-rework: 28 bytes/entry (E5.1 was 20)
-        const bool responsePorts = emitsResponsePorts();
+        const bool coord = emitsCoordinator();
+        const bool responsePorts = emitsResponsePorts() || coord;
         const bool receiverIds = emitsReceiverIds() || responsePorts;
         if (receiverIds || hasIngressEndpoints()) {
             sz += 2u;
@@ -354,6 +372,7 @@ struct MetadataResponse {
         }
         if (receiverIds) sz += 2u + partitions.size();   // issue #116: count + one byte per partition
         if (responsePorts) sz += 2u + brokers.size() * 4u + 2u + partitions.size() * 4u;   // v16
+        if (coord) sz += 4u;                                                               // v20
         return sz;
     }
 
@@ -367,6 +386,8 @@ struct MetadataResponse {
         int64_t                   correlationId = 0;
         std::vector<BrokerEntry>    brokers;
         std::vector<PartitionEntry> partitions;
+        /// #361: the coordinator trailer (-1 = absent / not known).
+        int32_t                   coordinatorNodeId = -1;
     };
 
     static std::optional<Decoded> decode(const uint8_t* buf,
@@ -462,6 +483,11 @@ struct MetadataResponse {
             result.partitions[i].responseControlPort = port;
             pos += 4;
         }
+        // v20 (#361): optional coordinator trailer (absent = not known, -1).
+        if (pos == avail) return result;
+        if (pos + 4u > avail) return std::nullopt;       // torn trailer
+        result.coordinatorNodeId = detail::getLE32(buf, static_cast<int>(pos));
+        pos += 4;
         return result;   // later additive trailers (none today) are ignored
     }
 };

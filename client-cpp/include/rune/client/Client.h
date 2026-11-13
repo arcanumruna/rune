@@ -868,6 +868,10 @@ public:
     [[nodiscard]] uint32_t testCoordinatorSessionIndex() const noexcept { return coordIdx(); }
     [[nodiscard]] uint64_t testCoordinatorRedirects() const noexcept { return coordinatorRedirects_; }
     [[nodiscard]] uint64_t testCoordinatorFallbacks() const noexcept { return coordinatorFallbacks_; }
+    /// #361: coordinator moves a metadata answer caused (a silent / down coordinator session left for the node the
+    /// answer names), and the stale-session losses (not the client's own stalls) of session `idx`.
+    [[nodiscard]] uint64_t testCoordinatorMetadataMoves() const noexcept { return coordinatorMetadataMoves_; }
+    [[nodiscard]] uint64_t testStaleLossesAt(uint32_t idx) const noexcept { return staleLossesAt_(idx); }
     /// DR client bug 1 (duty thread / after close): seed failovers started (each a
     /// move of the seed to another broker), and the MetadataRequests sent on a
     /// non-seed session because the seed was not Connected.
@@ -1884,6 +1888,15 @@ private:
     /// NotCoordinator, endpoint}) — the coordinator route follows it (the seed
     /// session never moves).  No-op when it names the current coordinator.
     void onCoordinatorRedirect_(const std::string& message);   // "endpoint[#responsePort]"
+    /// The route move behind onCoordinatorRedirect_ and a metadata answer naming the coordinator (#361): false = nothing
+    /// moved (already there, or a Rejected node not re-followed before fresh metadata).
+    bool moveCoordinatorTo_(const std::string& channel);
+    /// #361: the remote coordinator session is silent (two keepalives) or not Connected (the seed route: false).
+    [[nodiscard]] bool coordinatorSuspect_(int64_t nowNs) const noexcept;
+    /// #361: the remote coordinator session is Connected but silent (two keepalives).
+    [[nodiscard]] bool coordinatorSilent_(int64_t nowNs) const noexcept;
+    /// #361: a group member, a transactional producer or a pending coordinator request depends on the coordinator.
+    [[nodiscard]] bool coordinatorInUse_() const noexcept;
     /// D4: tell the group hub the COORDINATOR session's (connected, sessionId,
     /// episode) if it changed; a coordinator session that (re)connected joins the
     /// members there; one that gave up falls back to the seed.  Called from
@@ -1905,6 +1918,7 @@ private:
     static constexpr int64_t kCoordDownFallbackNs = 5'000'000'000LL;
     int64_t     coordNeverUpGraceNs_ = kMetadataBackoffInitNs;   // grace of a coordinator session never Connected; doubles per give-up
     uint64_t    coordinatorRedirects_ = 0;   // coordinator moves followed
+    uint64_t    coordinatorMetadataMoves_ = 0;   // #361: of those, moves a metadata answer named (the old one was suspect)
     uint64_t    coordinatorFallbacks_ = 0;   // coordinator sessions given up (back to the seed)
     // r2 LOW-3: a coordinator channel whose session was Rejected / Closed, and
     // the metadataResponses_ count then (re-followed only after fresh metadata).

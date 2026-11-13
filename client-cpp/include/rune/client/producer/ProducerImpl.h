@@ -1450,6 +1450,11 @@ public:
     void onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noexcept;
     /// One duty pass of the link: offers, retries, deadline expiry (expired slots are released).
     int pumpCoordinator(int64_t nowNs) noexcept;
+    /// #361: this producer depends on the coordinator session: it is transactional (its next transaction request goes
+    /// there) or it has a coordinator request pending (an InitProducerId on its way).  Duty thread; cold.
+    [[nodiscard]] bool coordinatorInUse() const noexcept {
+        return coord_.has_value() && (transactional_() || coord_->inUse() != 0);
+    }
     /// FD4: one duty pass of the identity machine (ProducerHub::drainAndFlush, before the flush).  An
     /// IdAssigned producer pays one variant-index compare; the rest is cold.
     int identityStep(int64_t nowNs) noexcept {

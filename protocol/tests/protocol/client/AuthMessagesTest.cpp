@@ -18,7 +18,7 @@ TEST(AuthMessagesRegression, ErrorCodesAndTemplatesArePinned) {
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), 15);
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::SecurityDdl), 79);
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::SecurityBootstrap), 80);
-    EXPECT_EQ(pc::kClientVersion, pc::kClientVersionBootstrapChallenge); EXPECT_EQ(pc::kBrokerVersion, 12); EXPECT_EQ(pc::kSecurityTopicId, -7);   // v19 / v12: bootstrap challenge (#234)
+    EXPECT_EQ(pc::kClientVersion, pc::kClientVersionCoordinatorHint); EXPECT_EQ(pc::kBrokerVersion, 12); EXPECT_EQ(pc::kSecurityTopicId, -7);   // v19 / v12: bootstrap challenge (#234)
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::SecurityBootstrapChallengeRequest), 102);
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::SecurityBootstrapChallenge), 103);
     EXPECT_EQ(pc::kClientVersionAuth, 9); EXPECT_EQ(pc::kBrokerVersionAuth, 5);

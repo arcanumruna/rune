@@ -1026,6 +1026,8 @@ struct InvokerGateway {
     }
 
     /// Unsolicited or solicited MetadataResponse from the node endpoint.
+    /// #361: the coordinator node id every MetadataResponse names to a session >= v20 (-1 = not known).
+    int32_t coordinatorHint = -1;
     void sendMetadata(int64_t sessionId, int64_t correlationId, int endpoint = -1) {
         namespace rp = rune::protocol::client;
         std::vector<rp::BrokerEntry> brokers;
@@ -1063,6 +1065,7 @@ struct InvokerGateway {
         msg.correlationId = correlationId;
         msg.brokers       = std::span<const rp::BrokerEntry>(brokers);
         msg.partitions    = std::span<const rp::PartitionEntry>(parts);
+        msg.coordinatorNodeId = coordinatorHint;
         if (const auto cv = clientVersions.find(sessionId); cv != clientVersions.end())
             msg.clientVersion = cv->second;   // the v16 response-port trailer is for sessions >= 16 only
         std::vector<uint8_t> buf(msg.encodedSize());

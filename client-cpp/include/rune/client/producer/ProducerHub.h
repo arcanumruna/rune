@@ -172,6 +172,13 @@ public:
     /// only that producer sees the answer - never broadcast.  Ids that are not coordinator ids, or name
     /// no live producer, are ignored.  Returns true when a producer received it.
     bool onCoordinatorResponse(uint16_t templateId, const uint8_t* buf, std::size_t len, int64_t nowNs);
+    /// #361: some producer depends on the coordinator session (a transactional one, or a coordinator request pending).
+    /// Duty thread; a scan of the producers, called once per silent-check period only.
+    [[nodiscard]] bool coordinatorInUse() const noexcept {
+        for (const ProducerImpl* impl : active_)
+            if (impl != nullptr && impl->coordinatorInUse()) return true;
+        return false;
+    }
     /// The Client re-pointed the coordinator session: waiting requests re-send.
     void onCoordinatorMoved() noexcept;
     /// The coordinator session changed (reconnect / new id): in-flight requests re-send on it.

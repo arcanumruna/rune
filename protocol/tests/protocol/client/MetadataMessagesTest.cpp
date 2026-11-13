@@ -27,6 +27,7 @@
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/Protocol.h>
 
+#include <algorithm>
 #include <array>
 #include <climits>
 #include <cstdint>
@@ -616,11 +617,14 @@ TEST(MetadataMessagesReceiverIdRegression, AReceiverTrailerCountThatDoesNotParal
         EXPECT_FALSE(rpc::MetadataResponse::decode(b.data(), b.size()).has_value()) << "count " << bad;
     }
     // v16 adds the response-port trailer after the receiver trailer, so bytes after a well-formed receiver trailer are
-    // parsed as that trailer; the "later additive trailer is ignored" rule now applies after the port trailer.
+    // parsed as that trailer; v20 (#361) adds the 4-byte coordinator trailer after the port trailer, so the "later
+    // additive trailer is ignored" rule now applies after the coordinator trailer (3 bytes there are a torn one).
     auto q0 = p0; q0.responseControlPort = 9;
     auto q1 = p1; q1.responseControlPort = 8;
     auto longer = encodeRespFor(rpc::kClientVersionResponseEgress, {q0, q1});
     for (uint8_t x : {uint8_t{0xAA}, uint8_t{0xBB}, uint8_t{0xCC}}) longer.push_back(x);
+    EXPECT_FALSE(rpc::MetadataResponse::decode(longer.data(), longer.size()).has_value()) << "a torn coordinator trailer";
+    for (uint8_t x : {uint8_t{0x00}, uint8_t{0xDD}, uint8_t{0xEE}, uint8_t{0xFF}}) longer.push_back(x);   // 4 + 3 bytes
     const auto dec = rpc::MetadataResponse::decode(longer.data(), longer.size());
     ASSERT_TRUE(dec.has_value()) << "a later additive trailer must be ignored";
     EXPECT_EQ(dec->partitions[0].ingressReceiverId, 1);
@@ -788,4 +792,101 @@ TEST(MetadataMessagesReceiverIdRegression, JunkAfterReceiverTrailerRejectedRegre
         for (std::size_t i = 0; i < junk; ++i) b.push_back(static_cast<uint8_t>(0xA0 + i));
         EXPECT_FALSE(rpc::MetadataResponse::decode(b.data(), b.size()).has_value()) << "junk " << junk;
     }
+}
+
+// ---------------------------------------------------------------------------
+// #361: the coordinator trailer (client version 20)
+// ---------------------------------------------------------------------------
+
+TEST(MetadataResponseCoordinatorRegression, RoundTripsTheCoordinatorNodeIdRegression) {
+    for (const int32_t node : {3, 0, -1}) {
+        PortsFixture f;
+        auto r = f.response(rpc::kClientVersionCoordinatorHint);
+        r.coordinatorNodeId = node;
+        const auto buf = encodeMd(r);
+        const auto out = rpc::MetadataResponse::decode(buf.data(), buf.size());
+        ASSERT_TRUE(out.has_value()) << node;
+        EXPECT_EQ(out->coordinatorNodeId, node);
+        ASSERT_EQ(out->brokers.size(), 2u);
+        EXPECT_EQ(out->brokers[1].responseControlPort, 9002);
+        EXPECT_EQ(out->partitions[1].responseControlPort, 9102);
+    }
+}
+
+TEST(MetadataResponseCoordinatorRegression, ForcesThePositionalTrailersEvenWhenEmptyRegression) {
+    // No endpoints, no receiver ids, all ports zero: the earlier trailers are still written (empty / zero) so the
+    // coordinator trailer sits where a decoder expects it.
+    PortsFixture f;
+    for (auto& b : f.brokers) b.responseControlPort = 0;
+    for (auto& p : f.parts) p.responseControlPort = 0;
+    auto r = f.response(rpc::kClientVersionCoordinatorHint);
+    r.coordinatorNodeId = 2;
+    const auto buf = encodeMd(r);
+    const auto legacy = encodeMd(f.response(rpc::kClientVersionBootstrapChallenge));
+    EXPECT_GT(buf.size(), legacy.size() + 4u);
+    const auto out = rpc::MetadataResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->coordinatorNodeId, 2);
+    for (const auto& p : out->partitions) {
+        EXPECT_TRUE(p.ingressEndpoint.empty());
+        EXPECT_EQ(p.ingressReceiverId, 0);
+        EXPECT_EQ(p.responseControlPort, 0);
+    }
+    // With endpoints and receiver ids too.
+    f.parts[0].ingressEndpoint = "w0.example:7100";
+    f.parts[2].ingressReceiverId = 3;
+    r = f.response(rpc::kClientVersionCoordinatorHint);
+    r.coordinatorNodeId = 1;
+    const auto buf2 = encodeMd(r);
+    const auto out2 = rpc::MetadataResponse::decode(buf2.data(), buf2.size());
+    ASSERT_TRUE(out2.has_value());
+    EXPECT_EQ(out2->coordinatorNodeId, 1);
+    EXPECT_EQ(out2->partitions[0].ingressEndpoint, "w0.example:7100");
+    EXPECT_EQ(out2->partitions[2].ingressReceiverId, 3);
+}
+
+TEST(MetadataResponseCoordinatorRegression, BelowV20FramesAreByteIdenticalRegression) {
+    PortsFixture f;
+    for (const int32_t v : {16, 17, 18, 19}) {
+        auto with = f.response(v);
+        with.coordinatorNodeId = 7;   // never written below 20
+        auto without = f.response(v);
+        EXPECT_EQ(encodeMd(with), encodeMd(without)) << "v" << v;
+        EXPECT_EQ(encodeMd(with), encodeMd(f.response(16))) << "v" << v << " has the v16 layout";
+        const auto out = rpc::MetadataResponse::decode(encodeMd(with).data(), encodeMd(with).size());
+        ASSERT_TRUE(out.has_value());
+        EXPECT_EQ(out->coordinatorNodeId, -1) << "absent = not known";
+    }
+}
+
+TEST(MetadataResponseCoordinatorRegression, AnOldDecoderStopsBeforeTheCoordinatorTrailerRegression) {
+    PortsFixture f;
+    f.parts[1].ingressEndpoint = "w.example:7100";
+    f.parts[1].ingressReceiverId = 2;
+    auto r = f.response(rpc::kClientVersionCoordinatorHint);
+    r.coordinatorNodeId = 3;
+    const auto buf = encodeMd(r);
+    const auto legacy = encodeMd(f.response(16));
+    ASSERT_EQ(buf.size(), legacy.size() + 4u);
+    // A decoder with the v19 rules stops after the response-port trailer: the same bytes without the last four.
+    EXPECT_TRUE(std::equal(legacy.begin(), legacy.end(), buf.begin()));
+    const auto out = rpc::MetadataResponse::decode(buf.data(), buf.size() - 4u);
+    ASSERT_TRUE(out.has_value());
+    ASSERT_EQ(out->brokers.size(), 2u);
+    ASSERT_EQ(out->partitions.size(), 3u);
+    EXPECT_EQ(out->brokers[0].responseControlPort, 9001);
+    EXPECT_EQ(out->partitions[1].ingressEndpoint, "w.example:7100");
+    EXPECT_EQ(out->partitions[1].ingressReceiverId, 2);
+    EXPECT_EQ(out->coordinatorNodeId, -1);
+}
+
+TEST(MetadataResponseCoordinatorRegression, ATornCoordinatorTrailerIsRejectedRegression) {
+    PortsFixture f;
+    auto r = f.response(rpc::kClientVersionCoordinatorHint);
+    r.coordinatorNodeId = 3;
+    const auto buf = encodeMd(r);
+    for (std::size_t torn = 1; torn <= 3; ++torn)
+        EXPECT_FALSE(rpc::MetadataResponse::decode(buf.data(), buf.size() - 4u + torn).has_value()) << "torn " << torn;
+    EXPECT_TRUE(rpc::MetadataResponse::decode(buf.data(), buf.size() - 4u).has_value());
+    EXPECT_TRUE(rpc::MetadataResponse::decode(buf.data(), buf.size()).has_value());
 }

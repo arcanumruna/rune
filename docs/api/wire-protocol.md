@@ -19,7 +19,7 @@ body; all integers are little-endian. The source of truth is the headers:
 Variable-length fields (strings, byte blobs) follow the fixed part, each with a length prefix.
 
 Capability is negotiated with two numbers in `Connect`/`ConnectResponse`: `clientVersion` (this protocol's client
-announces `17`, `kClientVersion`) and `brokerVersion` (`10`, `kBrokerVersion`). A broker answers a client below a
+announces `20`, `kClientVersion`) and `brokerVersion` (`10`, `kBrokerVersion`). A broker answers a client below a
 feature's version in the older way; an authentication-enabled broker answers a `Connect` below 9
 `ConnectResponse{ProtocolVersion}`.
 
@@ -36,6 +36,7 @@ feature's version in the older way; an authentication-enabled broker answers a `
 | 10 | `TxnOffsetCommit` member block (`generationId`, `memberId` after the entries; KIP-447); `UnstableOffsetCommit` (50). An older broker ignores the block; a broker answers a session below 10 `NotCoordinator` instead of 50. |
 | 11 | Subscription filters: the optional filter trailer on `Subscribe` and `JoinGroup`, the refusal `detail` trailer on their responses (broker version 6). |
 | 17 | Checked writes (broker version 10): the `Produce` `acks` byte carries bit 1 (`View`), `ProduceResponse` carries `assignedBase` and an optional verdict trailer, the `EndTxnResponse` vote trailer, and error codes 55 to 63 exist. A session below 17 is never sent 55 to 63 (it is answered `InvalidRequest`) and keeps the 46-byte `ProduceResponse` and the 26-byte `EndTxnResponse`. |
+| 20 | Coordinator hint (#361): the `MetadataResponse` coordinator trailer (see Metadata coordinator hint). No broker version change. |
 
 ## Frame catalogue
 
@@ -56,7 +57,7 @@ security 64 to 95.
 | 6 | `Ping` | C→B | `echo` |
 | 7 | `Pong` | B→C | `echo` |
 | 8 | `MetadataRequest` | C→B | `topicIds` |
-| 9 | `MetadataResponse` | B→C | `brokers`, `partitions` |
+| 9 | `MetadataResponse` | B→C | `brokers`, `partitions`, `coordinatorNodeId` (v20, optional trailer) |
 | 10 | `HandshakeContinue` | C→B | `handshakeBytes` |
 | 11 | `HandshakeContinueResponse` | B→C | `code`, `handshakeBytes` |
 | 12 | `AuthClientFirst` | C→B | `mechanism`, `username`, `clientNonce` |
@@ -222,6 +223,18 @@ nowhere:
 Every resend of a bootstrap (NotLeader, Redirect, a lost session) sends a new 102 first and signs the frame again for
 the new challenge; the nonce stays the same, so the broker still dedupes the bootstrap on it. The client ends the call
 `BrokerTooOld` against a broker below version 12.
+
+## Metadata coordinator hint (client version 20)
+
+`MetadataResponse` (9) ends with additive trailers after `partitions[]`, each read only when bytes remain, in this
+order: the per-partition worker endpoints (`u16 count`, then a length-prefixed `host:port` per partition), the receiver
+ids (v12), the response-control ports (v16), and, from version 20, the **coordinator trailer**: one `int32` LE, the node
+id of the cluster's coordinator (the consensus leader that the group and transaction coordinator is) as the answering
+node sees it, `-1` when it does not know one. It is written for every session at version 20 or above; whenever it is
+written the three trailers before it are written too (empty strings, zero ids and zero ports when there is nothing to
+say), so a decoder that stops after an earlier trailer is unaffected. A session below 20 keeps the byte-identical older
+frame. The C++ client moves its coordinator route to the named node only while its current coordinator session is silent or
+down; a trailer of 1 to 3 bytes is a torn frame.
 
 ## Filters (client version 11)
 

@@ -437,8 +437,14 @@ inline constexpr int32_t kClientVersionLeases                     = 18;
 //   SecurityBootstrap (80) MAC is keyed by a subkey of the cluster master and covers a one-use challenge the gateway
 //   issued on the session; a broker >= 12 serves it, a client < 19 cannot bootstrap.
 inline constexpr int32_t kClientVersionBootstrapChallenge         = 19;
+// 20 — coordinator hint (#361): the MetadataResponse carries a fourth additive trailer, the node id of the cluster's
+//   coordinator (the consensus leader the group / transaction coordinator is), -1 when this node does not know one.
+//   Sent only to a session >= 20; whenever it is sent the endpoint, receiver and response-port trailers are sent too
+//   (empty / zero), so every older decoder stops before it.  No broker version change: a client reads the trailer when
+//   it is there.  A session below 20 keeps byte-identical frames.
+inline constexpr int32_t kClientVersionCoordinatorHint            = 20;
 // what this protocol's client announces
-inline constexpr int32_t kClientVersion                           = kClientVersionBootstrapChallenge;
+inline constexpr int32_t kClientVersion                           = kClientVersionCoordinatorHint;
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h

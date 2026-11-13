@@ -1174,6 +1174,59 @@ TEST(EosBrokerRegression, CoordinatorCrashedUnderANonSeedClientCommitsAfterTheMo
 }
 
 // =========================================================================================================
+// 10b. #361: the same crash with the DEFAULT detection settings (a silent session is stale only after responseTimeoutNs
+// = 10 s).  The client sees the coordinator's session go silent after two keepalives, asks for metadata, and the answer
+// of a live node names the new coordinator: the route moves long before the stale-session edge.  The time-independent
+// proof is the old coordinator session's stale-loss count: it is unchanged when the commit completes (the old path
+// gives the route up only AFTER counting that loss).  The wall time is printed for information only.
+// RED (before the fix): the route moved at the stale edge: testCoordinatorMetadataMoves() == 0 and the old session's
+// stale-loss count is 1.
+// =========================================================================================================
+TEST(EosBrokerRegression, SilentCoordinatorUnderANonSeedClientIsLeftByMetadataBeforeStaleDetectionRegression) {
+    Env e("eos_coord_md");
+    const rc::TopicSpec plain = e.define("eos.plain", kParts);
+    const int seed = e.otherThan(e.ctl);
+    auto kcfg = e.cfg(seed, {plain});
+    kcfg.responseTimeoutNs   = 10'000'000'000LL;   // the defaults: stale after 10 s, silent after two 1 s keepalives
+    kcfg.keepaliveIntervalNs = 1'000'000'000LL;
+    auto cl = connectClient(e.c, kcfg);
+    rc::Producer p = cl->producer(txnConfig("eos-coord-md"));
+    Writer w(*cl, p, cl->topic("eos.plain"), kParts);
+    ASSERT_TRUE(w.init().ok());
+
+    Expected recs;
+    w.begin();
+    int64_t cur = 100;
+    for (int rep = 0; rep < 3; ++rep)
+        for (int32_t part = 0; part < kParts; ++part) (void)w.issue(mx::Op::Send, idForPartition(kParts, part, cur), recs);
+    ASSERT_TRUE(w.flush().ok());   // the data is in the log, the partitions are in the transaction
+
+    const uint32_t oldIdx = cl->testCoordinatorSessionIndex();
+    ASSERT_NE(oldIdx, 0u) << "precondition: the coordinator session is the controller's, not the seed's";
+    const uint64_t staleBefore = cl->testStaleLossesAt(oldIdx);
+    e.c.crash(e.ctl);              // the coordinator dies; the client's seed is a follower
+    const auto t0 = Clock::now();
+    const TxnResult c = w.commit(120s);
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0);
+    std::fprintf(stderr, "[eos_coord_md] commit after the coordinator crash took %lld ms (metadata moves %llu)\n",
+                 static_cast<long long>(took.count()),
+                 static_cast<unsigned long long>(cl->testCoordinatorMetadataMoves()));
+    ASSERT_TRUE(c.ok()) << "the commit after a coordinator crash: " << c.str();
+    EXPECT_GE(cl->testCoordinatorMetadataMoves(), 1u) << "the route moved at the stale edge, not by metadata";
+    EXPECT_EQ(cl->testStaleLossesAt(oldIdx), staleBefore)
+        << "the old coordinator session counted a stale loss: the route was not moved before the stale detection";
+    int64_t cursor = 500'000;
+    ASSERT_TRUE(w.sentinel(recs, cursor).ok()) << "the producer keeps working with the new coordinator";
+
+    awaitSettled(e, {plain});
+    Reader rcRead(e, seed, {plain}, -1, rc::Isolation::ReadCommitted);
+    ASSERT_TRUE(rcRead.await(recs));
+    expectExactlyOnce(rcRead.seen, recs, "read_committed after the coordinator crash");
+    p.close();
+    cl->close();
+}
+
+// =========================================================================================================
 // 11. The offsets of a committed transaction reach the group; those of an aborted one never do.
 // RED (before the fix): the broker's transaction coordinator had no offset sink - TxnOffsetCommit was accepted and
 // the committed offsets were silently dropped, so seekToCommitted (and every restart) went back to the log start
