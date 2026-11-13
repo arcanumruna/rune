@@ -5,7 +5,8 @@ How to try to break the area of a fix before its PR merges. It applies to every 
 **It runs once per batch, at the very end.** After every fix in the batch is in, the PR reviewer makes one adversarial
 pass over the union of the areas the batch touches. An area shared by several fixes is attacked once. The implementer
 does not run a separate pass; it fixes each issue with its regression tests. After a fix round, only the areas the
-new diff touches are attacked again.
+new diff touches are attacked again. Before the end of the batch, each wave (one code path) gets only a focused review of its own
+diff and area, with no adversarial pass.
 
 ## Mindset
 

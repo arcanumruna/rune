@@ -85,12 +85,14 @@ keyed topic; a topic without them takes one branch and nothing else. Details and
   state is shared. Every plan has an "Interaction matrix" section; reviewers check the matrix, not only the diff.
 - **Per task / fix round:** build, then run the test executables covering the touched code plus every new or changed
   test.
-- **Per batch:** only the affected-area tests (the executables covering the touched code plus every new or changed
-  test). No full suite per batch.
-- **Big checkpoints only** (every 3–4 batches, and before a final whole-branch review): the full
-  `*Regression*` suite (`-R Regression -LE latency`), plus the same suite under ASan+UBSan and under TSan (broker and
-  client; a client TSan build needs `-DBUILD_TESTING=ON`). A checkpoint failure is bisected over the commits since
-  the last green checkpoint. After fixing checkpoint failures, re-run only the failed and affected tests.
+- **Per wave** (one code path inside a batch, see [docs/issue-fix-program.md](docs/issue-fix-program.md)): only the
+  affected-area tests (the executables covering the touched code plus every new or changed test) and a focused review
+  of the wave's diff and its area. No full suite and no adversarial pass per wave.
+- **End of batch only (the checkpoint):** batches are made as big as one code-path-coherent PR allows, so that the
+  expensive steps run once. Merge `main` in, then run the full `*Regression*` suite (`-R Regression -LE latency`), the
+  same suite under ASan+UBSan and under TSan (broker and client; a client TSan build needs `-DBUILD_TESTING=ON`), and
+  the whole-branch review with its adversarial pass (§6). A checkpoint failure is bisected over the batch's commits.
+  After fixing checkpoint failures, re-run only the failed and affected tests.
 - **Sanitizer reports are findings:** fix them like a failing test, with a regression test. On macOS x86_64
   (Rosetta) run ASan with `detect_leaks=0` and check leaks with `leaks(1)`.
 - **No silently weakened tests.** A deviation that drops or weakens an assertion the plan requires is unfinished
@@ -168,7 +170,8 @@ the repo, issues or commits.
   invariant, and their tests. **Once per batch, at the very end** (after every fix is in), the reviewer writes tests
   meant to break the union of the areas the batch touches, driven through the public API (client API, wire frames,
   admin/CLI). An area shared by several fixes is attacked once; the implementer does not run a separate pass; after a
-  fix round only the areas the new diff touches are attacked again.
+  fix round only the areas the new diff touches are attacked again. Before that, each wave of the batch gets only a
+  focused review of its own diff and area.
   - **Mindset:** assume the fix is wrong and prove it with a failing test. Find every sibling entry point to the same
     state first (gateway, admin channel, replication catch-up, boot recovery, CLI). Re-run the issue's repro at every
     layer.
