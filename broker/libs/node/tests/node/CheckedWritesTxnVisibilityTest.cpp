@@ -676,3 +676,12 @@ TEST_P(CheckedWritesTxnDeterminismOrdinaryRegression, KeyIndexOnlySourceAppliesA
 }
 
 INSTANTIATE_TEST_SUITE_P(Seeds, CheckedWritesTxnDeterminismOrdinaryRegression, ::testing::Range(1u, 21u));
+
+// REGRESSION (#954): the rig's recovery flag covers the restart's re-installs only.  An install the control thread sends after the
+// restart's boot mark is a live install (recovery=0), as production's live DDL after boot is.
+TEST(CheckedWritesTxnVisibilityRegression, InstallAfterARestartIsALiveInstallRegression) {
+    R11 w(1, /*checked=*/false);
+    w.r.restart();
+    w.r.installCompiledView(r11View(kOrdCopy, false), 0x5704, /*persisted=*/true);
+    EXPECT_FALSE(w.r.lastInstallRecoveryForTest()) << "an install after the boot mark carries recovery=0";
+}

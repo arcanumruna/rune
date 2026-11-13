@@ -684,7 +684,8 @@ public:
         typedWith_(5, keyShape_, keyIndexOn_ && specDelayPasses == 0);
         recovering_ = true;
         if (reinstall) reinstallAll();
-        if (catalogPos_ >= 0) catalogMark(catalogPos_);
+        if (catalogPos_ >= 0) catalogMark(catalogPos_);   // the boot mark: what follows is live DDL
+        recovering_ = false;
         passes(3);
         delayedSpecIn_ = keyIndexOn_ ? specDelayPasses : 0;
     }
@@ -702,6 +703,8 @@ public:
     bool refuseInstalls = false;
     bool undecodablePlans = false;   // #941: the install's plan blob does not decode (the frame still names its object)
     void failover(bool reinstall = true) { restart(reinstall, replica->highWatermark()); }
+    /// The recovery flag of the last install frame the rig sent through installCompiledView / replaceCompiledView.
+    [[nodiscard]] bool lastInstallRecoveryForTest() const { return lastInstallRecovery_; }
     void reinstallAll() { for (auto& i : installs_) i.second(); }
     void demote() {
         replica->becomeFollower(++epoch_, 2);
@@ -780,6 +783,7 @@ private:
         m.viewTopicId = c.plan.viewTopicId;
         m.persistence = persisted ? 0 : 1;
         m.recovery    = recovering_;
+        lastInstallRecovery_ = m.recovery;
         m.planBlob    = rune::view::serialize(c.plan);
         m.outDescBlob = rune::codec::serialize(c.outputDescriptor);
         m.srcDescBlob = rune::codec::serialize(src);
@@ -1700,7 +1704,8 @@ private:
     uint64_t cleanedSeq_ = 0;
     std::vector<std::pair<int32_t, std::function<void()>>> installs_;   ///< (view topic, install): replayed by a restart
     int64_t epoch_ = 1;
-    bool recovering_ = false;   ///< the views of a restarted node load their checkpoints
+    bool recovering_ = false;   ///< the views of a restarted node load their checkpoints; cleared once restart() delivered the boot mark
+    bool lastInstallRecovery_ = false;   ///< the recovery flag of the last install frame sendInstall_ encoded
     KeyShape keyShape_;
     std::optional<rune::codec::Descriptor> customSrc_;   ///< useSource(): the source's schema
     std::vector<WorkerReturn> viewAnswers_;
