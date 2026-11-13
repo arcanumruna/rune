@@ -152,6 +152,9 @@ struct SelectRead {
                                                                 rune::protocol::Partitioner partitioner);
 /// Rows asked of the broker per scan page.
 inline constexpr uint32_t kScanPageRows = 256;
+/// Appends one scan page to `rows`, never past `limit` (0 = no limit), whatever the broker returned; true once the
+/// limit is reached, so the caller stops paging.
+[[nodiscard]] bool appendScanPage(std::vector<std::vector<uint8_t>>& rows, std::vector<std::vector<uint8_t>>&& page, uint32_t limit);
 /// A header of the selected columns, a line per row, `(<n> rows)`.
 [[nodiscard]] std::string formatRows(const rune::codec::Descriptor& output, std::span<const uint16_t> slots,
                                      std::span<const std::vector<uint8_t>> rows);

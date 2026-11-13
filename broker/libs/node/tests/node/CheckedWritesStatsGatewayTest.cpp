@@ -99,6 +99,11 @@ TEST(CheckedWritesStatsGateway, RefusalsInOrder) {
     expectStatus(g.frame(3, pc::StatsScope::TopicPartition, kSrc, 4), SR::kInvalidRequest, "partition 4 of 4");
     expectStatus(g.frame(4, pc::StatsScope::TopicPartition, kSrc, -1), SR::kInvalidRequest, "partition -1");
     expectStatus(g.frame(5, pc::StatsScope::TopicPartition, 99, 9), SR::kUnknownObject, "an unknown topic and a partition out of range");
+    // Two different refusals in one request: the session's version is judged before the object, the object before the range.
+    expectStatus(g.frame(9, pc::StatsScope::TopicPartition, 99, 9, old), SR::kInvalidRequest,
+                 "a v11 session naming an unknown topic and a partition out of range: the version refusal wins");
+    expectStatus(g.frame(10, pc::StatsScope::TopicPartition, 99, 9), SR::kUnknownObject,
+                 "an unknown topic and a partition out of range: the object refusal wins");
     EXPECT_EQ(g.servedTotal(), 0u) << "a refused request never reaches a worker";
 
     g.leaderElsewhere(1, kOther, 4);

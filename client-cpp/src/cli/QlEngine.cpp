@@ -110,25 +110,6 @@ std::optional<int64_t> parseIsoMs(std::string_view s) noexcept {
            1000;
 }
 
-/// `uint16`, `string(16)`: how QL writes a column type.
-std::string typeWord(rune::codec::PrimType t, uint16_t width) {
-    using rune::codec::PrimType;
-    switch (t) {
-        case PrimType::Int32:    return "int32";
-        case PrimType::Int64:    return "int64";
-        case PrimType::UInt16:   return "uint16";
-        case PrimType::UInt32:   return "uint32";
-        case PrimType::UInt64:   return "uint64";
-        case PrimType::Float64:  return "float64";
-        case PrimType::Bool:     return "bool";
-        case PrimType::Enum:     return "enum";
-        case PrimType::String:   return "string";
-        case PrimType::Bytes:    return "bytes";
-        case PrimType::FixedStr: return "string(" + std::to_string(width) + ")";
-    }
-    return "unknown";
-}
-
 std::string joined(const std::vector<std::string>& parts) {
     std::string out;
     for (std::size_t i = 0; i < parts.size(); ++i) out += (i == 0 ? "" : ", ") + parts[i];
@@ -343,7 +324,7 @@ std::optional<Prepared> prepare(const ql::Statement& st, const PrepareOptions& o
                         }
                         for (const auto& f : plan->output) {
                             const auto* column = src.descriptor.find(f.srcField);
-                            p.outputTypes.push_back(typeWord(f.type, column != nullptr ? column->fixedLen : uint16_t{0}));
+                            p.outputTypes.push_back(ql::typeWord(f.type, column != nullptr ? column->fixedLen : uint16_t{0}));
                         }
                         p.scriptPlan = std::move(*plan);
                     }
@@ -1104,7 +1085,7 @@ std::expected<SelectRead, std::string> planSelect(const ql::SelectDef& def, cons
         if (named[i] == nullptr) continue;
         const auto& c   = key[i];
         const auto& lit = named[i]->value;
-        const std::string doesNotFit = literalText(lit) + " does not fit " + typeWord(c.type, c.srcWidth) + " column '" + c.outName + "'";
+        const std::string doesNotFit = literalText(lit) + " does not fit " + ql::typeWord(c.type, c.srcWidth) + " column '" + c.outName + "'";
         switch (c.type) {
             case PrimType::Int32:
             case PrimType::Int64: {
@@ -1136,7 +1117,7 @@ std::expected<SelectRead, std::string> planSelect(const ql::SelectDef& def, cons
                     text.assign(reinterpret_cast<const char*>(lowered.data()), r.len);
                 }
                 if (text.size() > c.srcWidth)
-                    return std::unexpected(literalText(lit) + " is " + std::to_string(text.size()) + " bytes; column '" + c.outName + "' is " + typeWord(c.type, c.srcWidth));
+                    return std::unexpected(literalText(lit) + " is " + std::to_string(text.size()) + " bytes; column '" + c.outName + "' is " + ql::typeWord(c.type, c.srcWidth));
                 builder->setString(c.outName, text);
                 break;
             }
@@ -1160,6 +1141,14 @@ std::expected<SelectRead, std::string> planSelect(const ql::SelectDef& def, cons
         }
     }
     return read;
+}
+
+bool appendScanPage(std::vector<std::vector<uint8_t>>& rows, std::vector<std::vector<uint8_t>>&& page, uint32_t limit) {
+    for (auto& row : page) {
+        if (limit != 0 && rows.size() >= limit) break;
+        rows.push_back(std::move(row));
+    }
+    return limit != 0 && rows.size() >= limit;
 }
 
 std::string formatRows(const rune::codec::Descriptor& output, std::span<const uint16_t> slots, std::span<const std::vector<uint8_t>> rows) {
@@ -1399,8 +1388,8 @@ bool QlRun::run(const PSelect& s, const rc::DdlOptions&) {
             if (r.status != rc::ViewRowResult::kOk) return fail(r.status == rc::ViewRowResult::kCursorInvalidated
                                                                     ? "the scan was invalidated by a concurrent change; run it again"
                                                                     : viewReadRefusal(r.status));
-            for (auto& row : r.rows) rows.push_back(std::move(row));
-            if (r.complete() || (read->limit != 0 && rows.size() >= read->limit)) break;
+            const bool atLimit = appendScanPage(rows, std::move(r.rows), read->limit);
+            if (r.complete() || atLimit) break;
             page.resumeToken = std::move(r.nextToken);
         }
     }

@@ -320,6 +320,28 @@ TEST(CheckedWritesQlSelect, LimitIsForScansAndColumnsComeFromTheOutput) {
     EXPECT_EQ(bad.error(), "column 'nope' is not a column of view 'v2'");
 }
 
+TEST(CheckedWritesQlSelectRegression, AScanPageThatOverReturnsIsTrimmedToTheLimitRegression) {
+    const auto page = [](uint8_t from, uint8_t n) {
+        std::vector<std::vector<uint8_t>> p;
+        for (uint8_t i = 0; i < n; ++i) p.push_back({static_cast<uint8_t>(from + i)});
+        return p;
+    };
+    std::vector<std::vector<uint8_t>> rows;
+    EXPECT_TRUE(eng::appendScanPage(rows, page(0, 10), 3)) << "a broker that returns 10 rows for a limit of 3";
+    EXPECT_EQ(rows, page(0, 3));
+    EXPECT_TRUE(eng::appendScanPage(rows, page(10, 2), 3)) << "already at the limit: nothing is added";
+    EXPECT_EQ(rows.size(), 3u);
+
+    std::vector<std::vector<uint8_t>> two;
+    EXPECT_FALSE(eng::appendScanPage(two, page(0, 2), 3)) << "under the limit: keep paging";
+    EXPECT_TRUE(eng::appendScanPage(two, page(2, 5), 3));
+    EXPECT_EQ(two, page(0, 3));
+
+    std::vector<std::vector<uint8_t>> all;
+    EXPECT_FALSE(eng::appendScanPage(all, page(0, 200), 0)) << "limit 0 = every row";
+    EXPECT_EQ(all.size(), 200u);
+}
+
 // ---- row and stats formatting -------------------------------------------------------------------------------------
 
 TEST(CheckedWritesQlCli, FormatRows) {

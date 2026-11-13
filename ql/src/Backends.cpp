@@ -211,17 +211,9 @@ ViewSource viewSourceOf(const TopicDef& td) {
     return src;
 }
 
-namespace {
-
-using rune::codec::PrimType;
-using rune::view::MergeRule;
-using rune::view::PredicateNode;
-using rune::view::PredicateOp;
-
-struct ColType { PrimType type = PrimType::Int32; uint16_t width = 0; };
-
-std::string typeWord(const ColType& c) {
-    switch (c.type) {
+std::string typeWord(rune::codec::PrimType t, uint16_t width) {
+    using rune::codec::PrimType;
+    switch (t) {
         case PrimType::Int32:    return "int32";
         case PrimType::Int64:    return "int64";
         case PrimType::UInt16:   return "uint16";
@@ -232,10 +224,21 @@ std::string typeWord(const ColType& c) {
         case PrimType::Enum:     return "enum";
         case PrimType::String:   return "string";
         case PrimType::Bytes:    return "bytes";
-        case PrimType::FixedStr: return "string(" + std::to_string(c.width) + ")";
+        case PrimType::FixedStr: return "string(" + std::to_string(width) + ")";
     }
     return "unknown";
 }
+
+namespace {
+
+using rune::codec::PrimType;
+using rune::view::MergeRule;
+using rune::view::PredicateNode;
+using rune::view::PredicateOp;
+
+struct ColType { PrimType type = PrimType::Int32; uint16_t width = 0; };
+
+std::string typeWord(const ColType& c) { return rune::ql::typeWord(c.type, c.width); }
 
 const rune::codec::FieldDescriptor* sourceField(const rune::codec::Descriptor& d, const std::string& name) {
     for (const auto& f : d.fields) {

@@ -90,4 +90,7 @@ struct ViewSource {
 /// "characters <= 12": the text of a plan predicate.
 [[nodiscard]] std::string predicateText(std::span<const rune::view::PredicateNode> nodes);
 
+/// How QL writes a column type: `uint16`, `string(16)` (a FixedStr's width in brackets).
+[[nodiscard]] std::string typeWord(rune::codec::PrimType t, uint16_t width);
+
 } // namespace rune::ql
