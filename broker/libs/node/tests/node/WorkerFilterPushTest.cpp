@@ -9,6 +9,7 @@
 // waits and position notes are wall-clock driven.
 #include "support/FilterFakes.h"
 
+#include <algorithm>
 #include <rune/aeronutil/testing/FreePort.h>
 #include <rune/codec/Serialize.h>
 #include <rune/crypto/Aead.h>
@@ -1390,6 +1391,97 @@ TEST_F(WorkerFilterPushRegression, FilteredMemberAtTheDamageFailsWithStorageErro
     EXPECT_EQ(c.offsets(3).size(), 2u) << "the neighbour keeps flowing";
     std::filesystem::remove_all(dirA);
     std::filesystem::remove_all(dirB);
+}
+
+// ---- #876: a failed filtered member that was InSync stops costing a read and a scan per pass ----
+namespace corruptutil {
+/// Flip the first record byte of the 2nd batch of the first SEALED segment whose first batch is at or past `minBase`;
+/// returns that batch's first offset (-1 = could not).  The newest segment is the active one and is never damaged.
+inline int64_t damageSealedSegmentFrom(const std::filesystem::path& dir, int64_t minBase) {
+    std::vector<std::string> segs;
+    for (const auto& e : std::filesystem::directory_iterator(dir))
+        if (e.path().extension() == ".log") segs.push_back(e.path().string());
+    std::sort(segs.begin(), segs.end());
+    for (std::size_t i = 0; i + 1 < segs.size(); ++i) {
+        const auto starts = batchStarts(segs[i]);
+        if (starts.size() < 2 || batchBaseAt(segs[i], starts[0]) < minBase) continue;
+        const int64_t d = batchBaseAt(segs[i], starts[1]);
+        xorByteAt(segs[i], starts[1] + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead));
+        return d;
+    }
+    return -1;
+}
+}  // namespace corruptutil
+
+TEST_F(WorkerFilterPushRegression, FailedFilteredMemberCostsNoScanPerPassRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 2048);
+    log.recover();
+    log.setDeferSealSync(false);
+    for (int i = 0; i < 20; ++i) appendRows(log, worlds({7}));
+    openEgress(3418);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    const Fb f = worldEq(7);
+    ASSERT_TRUE(w.tryEnqueueOp(schemaOp(kTopic, 2)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(1, kTopic, 0, 0, &log, f)));
+    FilterCollector c;
+    ASSERT_TRUE(pump(w, c, [&] { return c.offsets(1).size() == 20; }));
+    ASSERT_NE(w.filterGroupForTest(kTopic, 0, 0), nullptr);
+    ASSERT_EQ(w.filterGroupForTest(kTopic, 0, 0)->inSyncCount(), 1u) << "the member must be InSync when the damage is reached";
+    for (int i = 0; i < 40; ++i) appendRows(log, worlds({7}));
+    log.sync();
+    const int64_t D = corruptutil::damageSealedSegmentFrom(dir, 20);
+    ASSERT_GT(D, 20);
+    ASSERT_TRUE(log.reloadSegments());
+    ASSERT_EQ(log.damagedSegmentCount(), 1u);
+    ASSERT_TRUE(pump(w, c, [&] { return c.errors.size() >= 1; }));
+    settle(w, c, 20ms);
+    ASSERT_EQ(c.errors.size(), 1u);
+    EXPECT_NE(c.errors[0].message.find("offset " + std::to_string(D)), std::string::npos) << c.errors[0].message;
+    const uint64_t scans = w.filterCorruptScansForTest();
+    const uint64_t reads = w.damagedReadsForTest();
+    EXPECT_GE(scans, 1u);
+    for (int i = 0; i < 200; ++i) step(w, c);
+    EXPECT_EQ(w.filterCorruptScansForTest(), scans) << "a failed member still costs a scan per pass";
+    EXPECT_EQ(w.damagedReadsForTest(), reads) << "a failed member still costs a damaged read per pass";
+    EXPECT_EQ(c.errors.size(), 1u) << "no second error";
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(WorkerFilterPushRegression, ALateFilteredMemberAtTheDamageStillFailsRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 2048);
+    log.recover();
+    log.setDeferSealSync(false);
+    for (int i = 0; i < 20; ++i) appendRows(log, worlds({7}));
+    openEgress(3419);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    const Fb f = worldEq(7);
+    ASSERT_TRUE(w.tryEnqueueOp(schemaOp(kTopic, 2)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(1, kTopic, 0, 0, &log, f)));
+    FilterCollector c;
+    ASSERT_TRUE(pump(w, c, [&] { return c.offsets(1).size() == 20; }));
+    ASSERT_EQ(w.filterGroupForTest(kTopic, 0, 0)->inSyncCount(), 1u);
+    for (int i = 0; i < 40; ++i) appendRows(log, worlds({7}));
+    log.sync();
+    const int64_t D = corruptutil::damageSealedSegmentFrom(dir, 20);
+    ASSERT_GT(D, 20);
+    ASSERT_TRUE(log.reloadSegments());
+    ASSERT_TRUE(pump(w, c, [&] { return c.errors.size() >= 1; }));
+    for (int i = 0; i < 50; ++i) step(w, c);   // the first member is failed and parked
+    ASSERT_EQ(c.errors.size(), 1u);
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(2, kTopic, 0, 20, &log, f)));
+    ASSERT_TRUE(pump(w, c, [&] { return c.errors.size() >= 2; })) << "the late member never saw the damage";
+    settle(w, c, 20ms);
+    ASSERT_EQ(c.errors.size(), 2u);
+    EXPECT_NE(c.errors[1].message.find("subscription 2 "), std::string::npos) << c.errors[1].message;
+    EXPECT_NE(c.errors[1].message.find("offset " + std::to_string(D)), std::string::npos) << c.errors[1].message;
+    const auto got = c.offsets(2);
+    EXPECT_EQ(got.size(), static_cast<std::size_t>(D - 20)) << "the records before the damage must all arrive";
+    for (const int64_t o : got) EXPECT_LT(o, D);
+    std::filesystem::remove_all(dir);
 }
 
 }  // namespace

@@ -4252,6 +4252,7 @@ private:
     /// leaveFilter_: the member stops being deliverable and its owed error is retried by the unfiltered pass.  A member
     /// at another damaged offset fails on its own next read.
     [[gnu::cold]] [[gnu::noinline]] int failFilteredCorrupt_(std::size_t gi, int64_t at) {
+        ++filterCorruptScans_;
         int work = 0;
         for (WorkerSubscription& s : subs_) {
             if (!s.active || s.pushState != WorkerSubscription::PushState::Live) continue;
@@ -4302,7 +4303,11 @@ private:
             // Only the group that finds the budget still untouched may take the first-batch allowance.
             work += g.pass(src, snk, *filterGroupSchemas_[gi], filterScratch_, nowNs, pushBudgetLeft_,
                            freshBudget && pushBudgetLeft_ == entry);
-            if (src.corruptAt() >= 0) [[unlikely]] work += failFilteredCorrupt_(gi, src.corruptAt());
+            if (src.corruptAt() >= 0) [[unlikely]] {
+                work += failFilteredCorrupt_(gi, src.corruptAt());
+                // #876: the failed InSync members fall behind at the damage, so the scan stops reading it every pass.
+                (void)g.parkUndeliverableInSync(src, snk, *filterGroupSchemas_[gi], filterScratch_, nowNs);
+            }
             if (src.evictedAt() >= 0) [[unlikely]] {
                 const rune::storage::InMemoryLog* const ring = subReplica_(any) != nullptr ? subReplica_(any)->memoryLog() : nullptr;
                 work += failFilteredEvicted_(gi, src.evictedAt(), ring != nullptr ? ring->logStartOffset() : 0);
@@ -7069,6 +7074,7 @@ public:
     /// #839: reads that reached a damaged segment (Corrupt / Unreadable) and were not served.
     [[nodiscard]] uint64_t corruptReadsForTest() const noexcept { return corruptReads_; }
     [[nodiscard]] uint64_t damagedReadsForTest() const noexcept { return damagedReads_; }
+    [[nodiscard]] uint64_t filterCorruptScansForTest() const noexcept { return filterCorruptScans_; }
     [[nodiscard]] std::size_t deferredPushReadsForTest() const noexcept { return deferredPushCount_; }
     /// Phase 2b E2 (TRANSIENT partitions): produces/markers the ring refused;
     /// reads whose cursor was below the ring start, and the records they skipped.
@@ -7101,6 +7107,7 @@ private:
     uint64_t                              pushReadMapFallbacks_ = 0;
     uint64_t                              pushReadErrors_ = 0;   ///< D26: push-read pread failures (answered empty)
     uint64_t                              corruptReads_ = 0;     ///< #839: reads that reached a damaged segment
+    uint64_t                              filterCorruptScans_ = 0;   ///< #876: failFilteredCorrupt_ walks
     uint64_t                              damagedReads_ = 0;     ///< #882: reads failed at damage (SessionSignal)
     uint64_t                              repairCounts_[3] = {};     ///< #880: cumulative completed / failed / no-peer
     uint64_t                              repairSignaled_[3] = {};   ///< #880: the values the gateway last accepted

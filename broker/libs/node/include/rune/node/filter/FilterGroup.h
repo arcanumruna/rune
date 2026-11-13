@@ -314,6 +314,25 @@ public:
         return work;
     }
 
+    /// Cold (#876): the source cannot be read at the scan cursor.  Every InSync member that is no longer deliverable
+    /// falls behind at the scan cursor, so the scan stops reading there (a Behind member that is not deliverable
+    /// is never read for).  Returns how many members fell behind.
+    template <FilterSource Src, FilterSink Snk>
+    uint32_t parkUndeliverableInSync(Src& src, Snk& sink, const rune::codec::FilterSchema& schema,
+                                     FilterScratch& scratch, int64_t nowNs) {
+        const int64_t at = scanCursor_();
+        std::size_t budget = 0;
+        Cx<Src, Snk> cx{src, sink, schema, scratch, nowNs, at, budget, false};   // fallBehind_ never reads cx.bound
+        uint32_t fell = 0;
+        for (uint32_t n = nodes_[kSynced].stateLink.next; n != kSynced;) {
+            const uint32_t nxt = nodes_[n].stateLink.next;   // fallBehind_ relinks the node
+            if (!sink.deliverable(nodes_[n].sub)) { fallBehind_(cx, n - kSentinels, at); ++fell; }
+            n = nxt;
+        }
+        if (inSync_ == 0) scan_ = ScanIdle{};
+        return fell;
+    }
+
     /// An InSync member's cursor is the scan cursor (its own cursor field is written back on every transition out).
     [[nodiscard]] int64_t cursorOf(uint32_t member, int64_t ownCursor) const noexcept {
         if (!std::holds_alternative<InSync>(at_(member).state)) return ownCursor;
