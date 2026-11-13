@@ -68,15 +68,23 @@ std::string uniqueDir() {
 static constexpr int  kPumpMax   = 3'000;
 static constexpr auto kPumpSleep = 2ms;
 
+/// Runs `work` then tests `pred`, up to `limit` times with a short sleep between; true iff `pred` became true.
+template<typename Work, typename Pred>
+bool pumpWorkUntil(Work work, Pred pred, int limit = kPumpMax) {
+    for (int i = 0; i < limit; ++i) {
+        work();
+        if (pred()) return true;
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+    return false;
+}
+
 // #767: retarget is a state the duty cycle advances; Thread-mode driver, so the background threads resolve while this
 // loop services it (hard-capped).  Returns true when the move completed and swapped.
 static bool retargetSettled(rct::AeronTransport& t, const std::string& channel) {
     uint64_t token = 0;
     if (t.beginRetarget(channel, 0, token) != rct::AeronTransport::RetargetStart::Pending) return false;
-    for (int i = 0; i < kPumpMax && t.seedRetargetPending(); ++i) {
-        t.serviceRetarget();
-        std::this_thread::sleep_for(kPumpSleep);
-    }
+    (void)pumpWorkUntil([&] { t.serviceRetarget(); }, [&] { return !t.seedRetargetPending(); });
     const auto o = t.takeRetargetOutcome();
     return o.has_value() && o->token == token && o->ok;
 }
@@ -115,12 +123,7 @@ int64_t nowNs() {
 /// Returns true iff the predicate became true within the limit.
 template<typename Pred>
 bool pumpUntil(rca::ClientAgent& agent, Pred pred, int limit = kPumpMax) {
-    for (int i = 0; i < limit; ++i) {
-        agent.doWork(nowNs());
-        if (pred()) return true;
-        std::this_thread::sleep_for(kPumpSleep);
-    }
-    return false;
+    return pumpWorkUntil([&] { agent.doWork(nowNs()); }, pred, limit);
 }
 
 // ---------------------------------------------------------------------------
