@@ -311,10 +311,10 @@ TEST(NsProduceSizeLimitRegression, TransientPartitionFetchPacedAndCountedRegress
     tAssign(rig, 0, 0);
     ASSERT_EQ(rig.produce(transient_rig::batchOf(2, 200), 1), 0);
     const uint64_t opsBefore = rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::RequestOps);
-    const auto served = rig.readOnce(/*subId=*/5, /*from=*/0);
+    const auto served = rig.readOnce(/*subId=*/5, /*from=*/0, /*isolation=*/0, /*fresh=*/true);
     ASSERT_TRUE(served.has_value());
     EXPECT_GT(rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::FetchBytes), 0u) << "the delivered bytes are charged to the slot";
-    EXPECT_GT(rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::RequestOps), opsBefore) << "a read is a request op";
+    EXPECT_GT(rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::RequestOps), opsBefore) << "the bind-time read of a Subscribe is a request op (#869)";
     // Over its fetch-bytes rate: the read is UNANSWERED (push bound -1) and counted as throttled; nothing is delivered.
     const uint64_t fetchBytes = rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::FetchBytes);
     rig.worker().applyNsThrottleDirect(kTSlot, kTNs, rune::node::ThrottleKind::FetchBytes, rig.now + 1'000'000'000);

@@ -5424,7 +5424,7 @@ private:
         const NsTag nsTag = nsTagOfLog_(log, mem);   // #712: a transient source is paced too
         if (NsHot* const meter = nsReadMeter_(topicId, nsTag)) {
             NsHot& nh = *meter;
-            ++nh.requestOps;
+            if (a.freshCursor) ++nh.requestOps;   // #869: once per Subscribe (the bind-time read), not per re-issued PushRead
             if (passNowNs_ < nh.fetchUntil) [[unlikely]] {
                 ++throttledRefusals_;
                 ret.setPushEffectiveBound(-1);

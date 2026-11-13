@@ -127,3 +127,31 @@ TEST(NsFetchGateAdversarial, OpenSubscriptionAcrossSlotReuseAdversarialRegressio
         EXPECT_EQ(rig.worker->nsSlotMismatchesForTest(), mismatches) << "a read counted a slot mismatch";
     }
 }
+
+// #869: the legacy push-read path counts ONE request op per Subscribe (the bind-time read, flagged fresh), not one per re-issued
+// PushRead: the gateway re-issues a subscription's read again and again, which used to inflate the namespace's request-ops count.
+// Mutation: restore the unconditional `++nh.requestOps` in Worker::servePushRead_ -> the 50 re-issued reads each add one: red.
+TEST(NsFetchGateAdversarial, LegacyPushReadCountsOneRequestOpPerSubscribeRegression) {
+    VerdictRig rig;
+    tagAndAssign(rig);
+    ASSERT_EQ(rig.produce({{1, 10}, {2, 20}, {3, 30}}), 0);
+    const auto read = [&](bool fresh) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::PushRead;
+        op.subscriptionId = 1; op.sessionId = 4201; op.topicId = VerdictRig::kSrc; op.partition = 0;
+        op.nextOffset = 0; op.hwBound = rig.leo();
+        op.freshCursor = fresh;
+        op.replica = rig.replica.get(); op.logPtr = rig.log.get();
+        ASSERT_TRUE(rig.worker->tryEnqueueOp(std::move(op)));
+        rig.now += 1'000'000;
+        rig.worker->doWork(rig.now);
+        rig.worker->drainReturn([](WorkerReturn) {}, [](const TxnReturn&) {});
+    };
+    const uint64_t before = rig.worker->nsRequestOpsForTest(kSlot);
+    read(true);
+    for (int i = 0; i < 50; ++i) read(false);
+    EXPECT_EQ(rig.worker->nsRequestOpsForTest(kSlot) - before, 1u) << "once per Subscribe, never per re-issued PushRead";
+    read(true);   // a re-Subscribe binds a fresh cursor again
+    for (int i = 0; i < 50; ++i) read(false);
+    EXPECT_EQ(rig.worker->nsRequestOpsForTest(kSlot) - before, 2u);
+}
