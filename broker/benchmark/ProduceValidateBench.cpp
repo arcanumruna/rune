@@ -396,6 +396,7 @@ static void BM_CheckedWriteHook_HookCheck64(benchmark::State& state) {
 // ---------------------------------------------------------------------------
 struct NullLog {
     int64_t next = 0;
+    int64_t logEndOffset() const { return next; }   // the hook's lease staging reads it (never called for an autoincrement topic)
     int64_t appendNoSyncRestamp(const uint8_t*, std::size_t, int32_t lastOffsetDelta, int64_t& base) {
         base = next;
         next += lastOffsetDelta + 1;
@@ -426,7 +427,8 @@ static void autoIncHookBench(benchmark::State& state, int records) {
     set.count = 1;
     set.members[0] = rune::node::ConstraintSetMember{0, rune::view::VerdictViewKind::KeyIndex, rune::node::kKeyIndexPlanFingerprint};
     ws.constraintSets.onChange(7, set);
-    ws.assignedBases.reserve(64);
+    constexpr int kProducers = 64;
+    ws.assignedBases.reserve(2 * kProducers);   // 64 producers at half load
     ws.autoInc.configure(0, 1, spec.autoIncrementMax, wire.autoIncrementReserve);
     ws.autoInc.beginScan();
     (void)ws.autoInc.finishScan();
@@ -436,7 +438,7 @@ static void autoIncHookBench(benchmark::State& state, int records) {
     facts.idempotent = true;
     facts.levelCheckedWrites = true;
     facts.importGranted = true;
-    facts.producerId = 42;
+    facts.producerId = 100;
 
     // {id u64, v int64, tag u16}: [blockLength u16][version u16][id][v][tag], one key-0 create per record
     const auto le = [](uint64_t v, std::size_t n) { std::string r(n, '\0'); for (std::size_t i = 0; i < n; ++i) r[i] = static_cast<char>(v >> (8 * i)); return r; };
@@ -447,7 +449,11 @@ static void autoIncHookBench(benchmark::State& state, int records) {
     std::vector<uint8_t> scratch(64 * 1024);
     NullLog log;
 
+    // The side window is keyed by (producer, batch base offset): the producer rotates over 64 ids and the base advances with every
+    // batch (the log's next offset), so each producer's window slides and the producer table is read at 64 keys.
+    int call = 0;
     const auto once = [&] {
+        facts.producerId = 100 + call++ % kProducers;
         rune::node::CheckedWriteHook hook(ws, facts, scratch);
         const auto verdict = hook.check(batch.data(), batch.size(), records);
         const auto staged = hook.stage(log, batch.data(), batch.size());
@@ -458,6 +464,18 @@ static void autoIncHookBench(benchmark::State& state, int records) {
         benchmark::DoNotOptimize(staged);
     };
 
+    // One steady_clock read costs about as much as the hook's cheapest calls: its median over back-to-back reads is subtracted.
+    double clockReadNs = 0;
+    {
+        std::vector<double> reads(10000);
+        for (double& r : reads) {
+            const auto a = std::chrono::steady_clock::now();
+            const auto c = std::chrono::steady_clock::now();
+            r = std::chrono::duration<double, std::nano>(c - a).count();
+        }
+        std::nth_element(reads.begin(), reads.begin() + reads.size() / 2, reads.end());
+        clockReadNs = reads[reads.size() / 2];
+    }
     constexpr int kWarmup = 4096, kCalls = 65536;
     std::vector<double> ns(kCalls);
     int64_t steadyAlloc = 0;
@@ -469,13 +487,14 @@ static void autoIncHookBench(benchmark::State& state, int records) {
             const auto t0 = std::chrono::steady_clock::now();
             once();
             const auto t1 = std::chrono::steady_clock::now();
-            ns[static_cast<std::size_t>(i)] = std::chrono::duration<double, std::nano>(t1 - t0).count();
+            ns[static_cast<std::size_t>(i)] = std::max(0.0, std::chrono::duration<double, std::nano>(t1 - t0).count() - clockReadNs);
         }
         g_allocEnabled.store(false, std::memory_order_relaxed);
         steadyAlloc = g_allocCount.load(std::memory_order_relaxed);
     }
     std::sort(ns.begin(), ns.end());
     const double p50 = ns[kCalls / 2], p99 = ns[kCalls * 99 / 100];
+    state.counters["clock_read_ns"] = clockReadNs;
     state.counters["hook_p50_ns"] = p50;
     state.counters["hook_p99_ns"] = p99;
     state.counters["steady_alloc"] = static_cast<double>(steadyAlloc);
