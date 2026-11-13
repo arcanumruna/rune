@@ -18,6 +18,8 @@
 #  12. `rune namespace suspend a --reject-all`: a live session of a is closed, a login with the right password gets
 #      NamespaceSuspended and with a wrong one AuthenticationFailed; resume; the login works again;
 #  13. `produce-bytes-per-sec` over the limit: alice's client is told Throttled, backs off and every record still lands;
+#  13b. `fetch-bytes-per-sec` low: alice's plain consume of the first 1000 records of t on the default config gets every
+#      record, takes at least 0.8 x the least volume / rate and no more than 4 x the greatest volume / rate (a stall fails);
 #  14. the whole cluster is restarted (volumes kept): the max-topics limit and a ReadOnly suspend still hold;
 #  15. `rune namespace delete a --yes` with data of every kind that this script writes (topic records, a consumer group's
 #      committed offsets, users); the erase is awaited through `rune namespace list`; `a` is created again and is EMPTY
@@ -456,6 +458,39 @@ took=$(( SECONDS - t0 ))
 echo "${WS_OUT}" | grep -q "failed=0" || fail "step 13: the throttled run reports failed records"
 ns_as admin /work/admin.pw limits a --set produce-bytes-per-sec=0 --broker "rune-1:${BROKER_PORT}" || fail "step 13: clearing the rate failed"
 log "step 13 OK (${took}s throttled, ${base}s unthrottled)"
+
+# ---------------------------------------------------------------------------
+# Step 13b: a fetch rate over the limit paces the default consume path: nothing is lost and it takes about volume / rate.
+# ---------------------------------------------------------------------------
+# The broker meters the record frames it pushes; the exact frame size is not read from here, so the volume is bracketed: a record
+# is at least FETCH_REC_MIN bytes (its "ws:<seq>" value alone) and at most FETCH_REC_MAX (value plus the varint framing and a
+# share of the batch header).  The lower time bound uses the least volume, the stall bound the greatest.  An unthrottled
+# control consume of the same records gives the contrast (client start-up and login are in both).
+FETCH_RATE=1500        # bytes per second: RECORDS records are about 6000-40000 B, i.e. roughly 4-27 s
+FETCH_REC_MIN=6
+FETCH_REC_MAX=40
+log "step 13b: fetch-bytes-per-sec=${FETCH_RATE}: alice's consume of ${RECORDS} records is paced, complete and not stalled..."
+ns_as admin /work/admin.pw limits a --set fetch-bytes-per-sec=0 --broker "rune-1:${BROKER_PORT}" || fail "step 13b: clearing the fetch rate failed"
+t0=${SECONDS}
+ws_run_ex "fetch-control" 1 a/alice /work/alice.pw consume 0 "RUNE_CONSUME_EXPECT=${RECORDS}"
+fbase=$(( SECONDS - t0 ))
+[ "${WS_RC}" -eq 0 ] || { echo "${WS_OUT}" | tail -20 >&2; fail "step 13b: the unthrottled control consume failed (exit ${WS_RC})"; }
+ns_as admin /work/admin.pw limits a --set "fetch-bytes-per-sec=${FETCH_RATE}" --broker "rune-1:${BROKER_PORT}" || fail "step 13b: limits --set failed"
+lim=$(ns_as admin /work/admin.pw limits a --broker "rune-1:${BROKER_PORT}") || fail "step 13b: limits read-back failed"
+echo "${lim}" | grep -qE "^fetch-bytes-per-sec +${FETCH_RATE}$" || { echo "${lim}" >&2; fail "step 13b: the read-back does not show fetch-bytes-per-sec ${FETCH_RATE}"; }
+t0=${SECONDS}
+ws_run_ex "fetch-paced" 1 a/alice /work/alice.pw consume 0 "RUNE_CONSUME_EXPECT=${RECORDS}"
+ftook=$(( SECONDS - t0 ))
+[ "${WS_RC}" -eq 0 ] || { echo "${WS_OUT}" | tail -20 >&2; fail "step 13b: the paced consume failed (exit ${WS_RC}) after ${ftook}s: a record was lost or the consume stalled"; }
+fn=$(echo "${WS_OUT}" | grep -oE 'WS-CONSUMER: distinct=[0-9]+' | tail -1 | grep -oE '[0-9]+$') || true
+[ -n "${fn}" ] && [ "${fn}" -ge "${RECORDS}" ] || { echo "${WS_OUT}" | tail -20 >&2; fail "step 13b: the paced consume got distinct=${fn:-none} (want >= ${RECORDS})"; }
+[ $(( ftook * 5 * FETCH_RATE )) -ge $(( 4 * RECORDS * FETCH_REC_MIN )) ] \
+    || fail "step 13b: ${RECORDS} records at ${FETCH_RATE} B/s took ${ftook}s, under 0.8 x ${RECORDS} x ${FETCH_REC_MIN} / ${FETCH_RATE}: the fetch limit never paced the consume"
+[ "${ftook}" -gt "${fbase}" ] || fail "step 13b: the paced consume (${ftook}s) was not slower than the unthrottled one (${fbase}s)"
+[ $(( ftook * FETCH_RATE )) -le $(( 4 * RECORDS * FETCH_REC_MAX )) ] \
+    || fail "step 13b: ${RECORDS} records at ${FETCH_RATE} B/s took ${ftook}s, over 4 x ${RECORDS} x ${FETCH_REC_MAX} / ${FETCH_RATE}: the consume stalled"
+ns_as admin /work/admin.pw limits a --set fetch-bytes-per-sec=0 --broker "rune-1:${BROKER_PORT}" || fail "step 13b: clearing the fetch rate failed"
+log "step 13b OK (${ftook}s paced, ${fbase}s unthrottled)"
 
 # ---------------------------------------------------------------------------
 # Step 14: restart the cluster: the max-topics limit and a ReadOnly suspend survive.
