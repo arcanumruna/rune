@@ -201,6 +201,7 @@ void LeaseGuards::ack(uint32_t sid, uint64_t consumedTotal) {
 }
 
 void LeaseGuards::refuseBind_(Block& b, uint32_t slot, uint32_t gen, producer::ProducerImpl& p) noexcept {
+    p.guardFailOnBind();   // a transactional producer's open transaction can no longer commit (deferred out of the drain's read)
     p.guardKill();
     if (b.posted - b.acked < b.pool) deliver_(b, GuardEvent::BindRefused, slot, gen, 0);
     else ++droppedBindRefused_;
@@ -209,7 +210,7 @@ void LeaseGuards::refuseBind_(Block& b, uint32_t slot, uint32_t gen, producer::P
 void LeaseGuards::bind(uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSeq, int64_t atRiskNs, producer::ProducerImpl& p,
                        int64_t nowNs) {
     Block* b = find_(sid);
-    if (b == nullptr || slot >= b->capacity) { p.guardKill(); return; }   // fail closed (the session gates binds on its block)
+    if (b == nullptr || slot >= b->capacity) { p.guardFailOnBind(); p.guardKill(); return; }   // fail closed (the session gates binds on its block)
     if (p.guardBound()) { refuseBind_(*b, slot, gen, p); return; }        // a producer is bound to at most one guard: blocked for good
     GuardEntry& e = b->entries[slot];
     if (e.state != GuardEntry::State::Free && (newer(e.gen, gen) || (e.gen == gen && e.state == GuardEntry::State::Ended))) {
@@ -220,7 +221,7 @@ void LeaseGuards::bind(uint32_t sid, uint32_t slot, uint32_t gen, uint32_t armSe
     if (e.nProducers >= kMaxGuardProducers) { refuseBind_(*b, slot, gen, p); return; }
     e.producers[e.nProducers++] = &p;
     p.guardAttach(&e, gen);
-    if (e.state == GuardEntry::State::Tripped) p.failGuarded(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk));
+    if (e.state == GuardEntry::State::Tripped) p.guardFailOnBind();   // the failure runs after the drain's read (I-7)
 }
 
 void LeaseGuards::unbindProducer(producer::ProducerImpl& p) noexcept {

@@ -18,6 +18,8 @@
 #include <rune/client/detail/PasswordFile.h>
 
 #include <algorithm>
+#include <poll.h>
+#include <functional>
 #include <cstring>
 #include <chrono>
 #include <optional>
@@ -930,6 +932,68 @@ TEST(ClientSecretAdversarialRegression, ASelfSetPasswordLifecycleLeavesNoFreedCo
         newHits = scanNew.hits();
     }
     EXPECT_EQ(newHits, 0) << "a freed block still held the new password (ring record, pending op, plan copy, secret)";
+}
+
+TEST(ClientConnectTimeoutRegression, TheTimeoutNamesTheConfiguredGatewayResponsePort) {
+    // No gateway answers: a NAT-safe client's connect times out, and the text names the port the broker has to reach.
+    rc::ClientConfig c = authCfg(4160, "ws1", kPw);
+    c.runnerMode = rc::RunnerMode::Thread;
+    c.nanoClock = nullptr;
+    c.gatewayResponseControlPort = 8263;
+    rc::Client client(c);
+    std::string why;
+    try {
+        client.connectAndWait(std::chrono::milliseconds(200));
+    } catch (const std::runtime_error& e) {
+        why = e.what();
+    }
+    EXPECT_NE(why.find("timed out"), std::string::npos) << why;
+    EXPECT_NE(why.find("gateway response port 8263"), std::string::npos) << why;
+    client.close();
+}
+
+// A thread-mode client on the real clock, its fake gateway pumped by a helper thread; connectAndWait's text is returned.
+namespace {
+std::string connectWaitText(rc::ClientConfig c, const std::function<void(Rig&)>& setup, std::chrono::milliseconds wait) {
+    c.runnerMode = rc::RunnerMode::Thread;
+    c.nanoClock = nullptr;
+    c.gatewayResponseControlPort = 8263;
+    Rig r(c);
+    setup(r);
+    // The pumper stops when the pipe becomes readable (written once connectAndWait returned); its wall deadline is only a safety net.
+    int stop[2];
+    if (::pipe(stop) != 0) throw std::runtime_error("connectWaitText: pipe() failed");
+    std::thread pumper([&] {
+        pollfd pfd{stop[0], POLLIN, 0};
+        const auto deadline = std::chrono::steady_clock::now() + wait + std::chrono::seconds(10);
+        while (::poll(&pfd, 1, 0) == 0 && std::chrono::steady_clock::now() < deadline) r.gw.pump();
+    });
+    std::string why;
+    try {
+        r.client.connectAndWait(wait);
+    } catch (const std::runtime_error& e) {
+        why = e.what();
+    }
+    const char b = 0;
+    (void)!::write(stop[1], &b, 1);
+    pumper.join();
+    ::close(stop[0]);
+    ::close(stop[1]);
+    r.client.close();
+    return why;
+}
+
+}   // namespace
+
+TEST(ClientConnectTimeoutRegression, ARefusalTheBrokerAnsweredGetsNoResponsePortHint) {
+    // The broker answered (over the response channel, so the port works): the connect ends at its deadline while retrying
+    // a transient refusal, and naming the response port would blame the wrong cause.
+    rc::ClientConfig c = authCfg(4162, "ws1", kPw);
+    c.connectTimeoutMs = 300;
+    const std::string why = connectWaitText(c, [](Rig& r) { r.gw.connectErrorCode = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable); },
+                                            std::chrono::seconds(5));
+    EXPECT_NE(why.find("transient refusal"), std::string::npos) << why;
+    EXPECT_EQ(why.find("gateway response port"), std::string::npos) << why;
 }
 
 TEST(ClientSecretAdversarialRegression, ASecurityDdlAndWaitRetriedOnAFullCommandRingSendsTheWholePlanAdversarialRegression) {

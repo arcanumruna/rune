@@ -302,8 +302,9 @@ TEST(TypedClaimRegression, ShortStringKeyKeepsItsZeroPaddingAdversarialRegressio
 TEST(TypedClaim, StringKeyClaimMatchesSendForShortKeys) {
     auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
     TypedTopic<ShortKey> topic{Producer{impl}, TopicHandle{1, 8}, uint16_t{1}};
+    // std::string_view{} has a null data(): UBSan flags a memcpy from it even for 0 bytes.
     const std::string_view keys[] = {"",       "a",        "abcdefgh", "abc",
-                                     "ab",     std::string_view("ab\0\0", 4), "zzzzzzz", "k1"};
+                                     "ab",     std::string_view("ab\0\0", 4), "zzzzzzz", "k1", std::string_view{}};
     for (const auto k : keys) {
         ShortKey rec;
         rec.code = {};
@@ -317,11 +318,11 @@ TEST(TypedClaim, StringKeyClaimMatchesSendForShortKeys) {
     }
     FrameCapture cap;
     pump(*impl, cap.fn());
-    ASSERT_EQ(cap.recs.size(), 16u);
+    ASSERT_EQ(cap.recs.size(), 18u);
     // Per partition, send/claim pairs stay in order, but partitions interleave: match by key.
     std::map<std::string, std::vector<test_support::CapturedRecord>> byKey;
     for (const auto& r : cap.recs) byKey[r.value.substr(4, 8)].push_back(r);
-    EXPECT_EQ(byKey.size(), 7u) << "\"ab\" and \"ab\\0\\0\" are the same padded key";
+    EXPECT_EQ(byKey.size(), 7u) << "\"ab\" and \"ab\\0\\0\" are the same padded key, so are \"\" and string_view{}";
     for (const auto& [field, rs] : byKey) {
         ASSERT_EQ(rs.size() % 2, 0u);
         for (std::size_t i = 0; i + 1 < rs.size(); i += 2) {

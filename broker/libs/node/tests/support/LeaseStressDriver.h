@@ -246,7 +246,10 @@ struct WLog {
         const std::string k = keyOf(e);
         switch (e.kind) {
         case rc::LeaseEventKind::Granted: w.live[k] = e.version; ++w.granted[k]; break;
-        case rc::LeaseEventKind::Updated: break;
+        case rc::LeaseEventKind::Updated:
+        case rc::LeaseEventKind::Confirmed:    // a re-run confirms a held lease: no change to the live set
+        case rc::LeaseEventKind::RerunBegin:
+        case rc::LeaseEventKind::RerunEnd: break;
         case rc::LeaseEventKind::Revoked:
         case rc::LeaseEventKind::Expired:
         case rc::LeaseEventKind::Vanished:

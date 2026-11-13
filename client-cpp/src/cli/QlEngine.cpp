@@ -803,8 +803,11 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
         return true;
     } catch (const std::exception& e) {
         lastFailure_ = e.what();
-        if (std::string_view(e.what()).find("timed out") != std::string_view::npos)
-            err << "rune: connect to " << o.endpoint << " timed out\n";
+        if (const std::string_view what = e.what(); what.find("timed out") != std::string_view::npos) {
+            // "connect to <ep> timed out" is what the e2e retry scripts grep; the response-port hint follows it.
+            const auto hint = what.find(" (gateway response port");
+            err << "rune: connect to " << o.endpoint << " timed out" << (hint == std::string_view::npos ? "" : what.substr(hint)) << "\n";
+        }
         else if (!quietFailure)
             err << "rune error: " << e.what() << "\n";
         close();

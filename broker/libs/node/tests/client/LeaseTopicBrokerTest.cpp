@@ -400,6 +400,9 @@ struct WatchLog {
         case rc::LeaseEventKind::Vanished: ++w.bad; break;   // no break happens: a lease never vanishes
         case rc::LeaseEventKind::Ready: ++w.readies; break;
         case rc::LeaseEventKind::Failed: ++w.bad; break;
+        case rc::LeaseEventKind::Confirmed:    // no break happens: no partition is ever re-run
+        case rc::LeaseEventKind::RerunBegin:
+        case rc::LeaseEventKind::RerunEnd: ++w.bad; break;
         }
     }
 };

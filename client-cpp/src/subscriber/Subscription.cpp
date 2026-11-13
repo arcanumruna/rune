@@ -74,8 +74,15 @@ Subscription::Subscription(Subscription&& other) noexcept
     , sinkCtx_(other.sinkCtx_)
     , dutyThread_(other.dutyThread_)
     , unsubscribed_(other.unsubscribed_)
+    , pausable_(other.pausable_)
+    , paused_(other.paused_)
+    , appSeq_(other.appSeq_)
     , cache_(other.cache_)
-{}
+{
+    other.paused_ = false;   // moved-from: impl_ is null, but leave no stale view behind
+    other.appSeq_ = 0;
+    other.cache_  = SubscriptionStatus{};
+}
 
 Subscription& Subscription::operator=(Subscription&& other) noexcept {
     if (this != &other) {
@@ -85,7 +92,13 @@ Subscription& Subscription::operator=(Subscription&& other) noexcept {
         sinkCtx_      = other.sinkCtx_;
         dutyThread_   = other.dutyThread_;
         unsubscribed_ = other.unsubscribed_;
+        pausable_     = other.pausable_;
+        paused_       = other.paused_;
+        appSeq_       = other.appSeq_;
         cache_        = other.cache_;
+        other.paused_ = false;
+        other.appSeq_ = 0;
+        other.cache_  = SubscriptionStatus{};
     }
     return *this;
 }
@@ -130,7 +143,13 @@ void Subscription::unsubscribe() {
 // ---------------------------------------------------------------------------
 
 void Subscription::drainStatus_() const {
-    if (impl_) (void)impl_->status.drainLatest(cache_);
+    if (!impl_) return;
+    (void)impl_->status.drainLatest(cache_);
+    // The hub echoes the number of the last command of this handle it applied.  Once it equals the number of commands sent,
+    // every one of them is reflected and the snapshot's `paused` is the truth (it includes a pause or resume made on the
+    // duty thread, e.g. inside a handler); before that, a snapshot may pre-date a command still in flight: this handle's
+    // own view stands.
+    if (cache_.appSeqApplied == appSeq_) paused_ = cache_.paused;
 }
 
 int64_t Subscription::position() const {
@@ -141,9 +160,73 @@ int64_t Subscription::position() const {
 
 bool Subscription::active() const {
     if (!impl_) return false;
-    if (onDutyThread_()) return impl_->active;
-    if (unsubscribed_) return false;
+    if (onDutyThread_()) return impl_->active && !impl_->paused;
+    drainStatus_();
+    if (unsubscribed_ || paused_) return false;
     return !impl_->status.closed();
+}
+
+bool Subscription::paused() const {
+    if (!impl_) return false;
+    if (onDutyThread_()) return impl_->paused;
+    drainStatus_();
+    return paused_ && !unsubscribed_ && !impl_->status.closed();
+}
+
+// ---------------------------------------------------------------------------
+// pause() / resume() - lifecycle commands (guaranteed delivery, like unsubscribe())
+// ---------------------------------------------------------------------------
+
+bool Subscription::pause(int64_t resumeAt) {
+    if (!impl_ || sink_ == nullptr || !pausable_) return false;
+    detail::HubCommand cmd;
+    cmd.op     = detail::HubCommand::Op::SubscribePause;
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);   // identity only, as for unsubscribe()
+    cmd.a      = resumeAt;
+    if (onDutyThread_()) {
+        // A callback on the duty thread (Thread mode): the sink applies it on this thread and returns the hub's verdict.
+        // No field of this handle is touched (the application thread owns them); it learns the result from the status.
+        return sink_(sinkCtx_, cmd) == detail::HubSubmit::Applied;
+    }
+    // The application thread - or the Invoker owner, which is also the duty thread: send the command with this handle's
+    // number.  An Invoker owner's sink applies it at once and answers with the hub's verdict; elsewhere it is queued.
+    if (unsubscribed_ || impl_->status.closed()) return false;
+    drainStatus_();
+    const uint32_t seq = nextSeq_(appSeq_);
+    cmd.b = seq;
+    // A position above the last snapshot is only decidable by the thread that owns the hub: ask the sink to apply it
+    // directly (it does nothing when the caller is not that thread).
+    const bool onlyIfDirect = resumeAt >= 0 && resumeAt > cache_.nextOffset;
+    cmd.c = onlyIfDirect ? 1 : 0;
+    switch (sink_(sinkCtx_, cmd)) {
+    case detail::HubSubmit::Applied:
+        break;
+    case detail::HubSubmit::Accepted:
+        if (onlyIfDirect) return false;   // not decided here: the stale-snapshot bound refuses it, as before
+        break;
+    default:   // Refused, Closed, Orphaned
+        return false;
+    }
+    appSeq_ = seq;
+    paused_ = true;
+    return true;
+}
+
+bool Subscription::resume() {
+    if (!impl_ || sink_ == nullptr || !pausable_) return false;
+    detail::HubCommand cmd;
+    cmd.op     = detail::HubCommand::Op::SubscribeResume;
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);
+    if (onDutyThread_()) return sink_(sinkCtx_, cmd) == detail::HubSubmit::Applied;
+    drainStatus_();
+    if (unsubscribed_ || !paused_ || impl_->status.closed()) return false;
+    const uint32_t seq = nextSeq_(appSeq_);
+    cmd.b = seq;
+    const detail::HubSubmit r = sink_(sinkCtx_, cmd);
+    if (r != detail::HubSubmit::Applied && r != detail::HubSubmit::Accepted) return false;
+    appSeq_ = seq;
+    paused_ = false;
+    return true;
 }
 
 bool Subscription::finished() const noexcept {

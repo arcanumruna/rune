@@ -9,7 +9,7 @@
 #   2. Start ONE broker node (self-elects).
 #   3. Wait (bounded) for the node to become LEADER.
 #   4. Run the client container which, INSIDE itself, against the live broker:
-#        a. rune console -f    tests/e2e/characters.rql --broker rune-1:40200 --validate
+#        a. rune console -f    tests/e2e/characters.rql --broker rune-1:40200
 #        b. rune schema generate characters --out <gen> --broker rune-1:40200
 #        c. cmake --build ... --target rune_ql_probe   (compile probe vs the header)
 #        d. ./rune_ql_probe   → openTopic<Characters> → produce/consume typed →
@@ -156,10 +156,9 @@ set -euo pipefail
 GEN_DIR="${RUNE_GEN_DIR:-/build/build/e2e-gen}"
 mkdir -p "${GEN_DIR}"
 
-echo "[in] rune console -f (validate=on) ..." >&2
+echo "[in] rune console -f ..." >&2
 rune console -f tests/e2e/characters.rql \
     --broker "${RUNE_TARGET}" \
-    --validate \
     --cli-data-dir /tmp/rune_cli_apply
 
 echo "[in] rune schema generate characters -> ${GEN_DIR} ..." >&2
@@ -220,7 +219,7 @@ log "========================================"
 log "  TASK 10 (0c #11 GATE) CLI-DRIVEN E2E PASSED"
 log "  Single node self-elected: ${leader}"
 log "  Broker compiled against rune-codec (FixedStr)"
-log "  rune console -f --validate -> generate -> compile probe -> run"
+log "  rune console -f -> generate -> compile probe -> run"
 log "  Probe: openTopic<Characters> -> send×${PROBE_RECORDS} -> consume -> decode"
 log "         round-trip incl. code[8] FixedStr + var name"
 log "         + malformed record REJECTED (SchemaValidationFailed)"

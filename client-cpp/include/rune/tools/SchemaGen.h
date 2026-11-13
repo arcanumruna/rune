@@ -30,9 +30,13 @@ namespace rune::tools {
 ///                  the file cannot be opened or is malformed.
 /// @param outDir    Directory to write the generated header into.  Must exist
 ///                  or be createable.  Throws std::runtime_error on I/O error.
+/// @param isLease   true: the blob is a lease topic's stored schema, so the header gains withLease() and
+///                  <T>::LeasesRow (the blob carries no lease block, the caller says it).  Throws
+///                  std::invalid_argument if the schema is not lease-shaped; nothing is written then.
 /// @returns         The absolute path of the written header file.
 [[nodiscard]] inline std::string generateFromFile(const std::string& blobPath,
-                                                   const std::string& outDir)
+                                                   const std::string& outDir,
+                                                   bool isLease = false)
 {
     // ── 1. Read blob bytes ──────────────────────────────────────────────────
     std::ifstream in(blobPath, std::ios::binary);
@@ -51,7 +55,7 @@ namespace rune::tools {
         rune::codec::deserialize(std::span<const uint8_t>(bytes.data(), bytes.size()));
 
     // ── 3. Generate C++ header ──────────────────────────────────────────────
-    std::string hdr = rune::codec::generateHeader(d);
+    std::string hdr = rune::codec::generateHeader(d, d.version, "rune::gen", isLease);
 
     // ── 4. Write <outDir>/<name>.gen.h ─────────────────────────────────────
     std::filesystem::path dir(outDir);

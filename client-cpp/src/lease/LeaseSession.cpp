@@ -368,7 +368,13 @@ void watchThunk(void* ctx, const LeaseEvent& ev) {
     case LeaseEventKind::Revoked:  why = LostReason::WatchedRevoked; break;
     case LeaseEventKind::Expired:  why = LostReason::WatchedExpired; break;
     case LeaseEventKind::Vanished: why = LostReason::WatchedVanished; break;
-    default: return;
+    case LeaseEventKind::Granted:
+    case LeaseEventKind::Updated:
+    case LeaseEventKind::Ready:
+    case LeaseEventKind::Failed:
+    case LeaseEventKind::Confirmed:    // a lease the session holds that a re-run confirmed is still held
+    case LeaseEventKind::RerunBegin:
+    case LeaseEventKind::RerunEnd: return;
     }
     static_cast<LeaseSessionCore*>(ctx)->onWatchedEnd(ev.topicId, ev.partition, ev.key, ev.version, why);   // filters by topic id, key and version
 }

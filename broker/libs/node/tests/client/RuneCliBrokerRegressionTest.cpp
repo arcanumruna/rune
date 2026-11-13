@@ -882,6 +882,49 @@ TEST(RuneCliBrokerRegression, SchemaGenerateEmbedsTheLineageOfEveryVersionRegres
     EXPECT_NE(hdr.find("{0u, 8u},  // v2"), std::string::npos) << "a v2 record's score is at 8";
 }
 
+// F-7 (final review): live `schema generate` of a lease topic emits the lease form (LeasesRow / withLease); a plain topic does not.
+TEST(RuneCliBrokerRegression, SchemaGenerateOfALeaseTopicEmitsTheLeaseFormRegression) {
+    namespace cd = rune::codec;
+    OneBroker b("cli_gen_lease");
+    rune::client::Client& c = *b.connectClient();
+    const rune::protocol::LeaseSpec spec{.ttlMs = 10000, .minTtlMs = 1000, .maxTtlMs = 60000, .maxKeys = 10,
+                                         .expiryBatch = 64, .checkpoint = 0, .checkpointIntervalMs = 1000,
+                                         .checkpointRate = 1};
+    {
+        cd::DescriptorBuilder d("inst");
+        d.addFixedStr("id", 64, 1, /*isKey=*/true).add("note", cd::PrimType::Int32);
+        rune::client::TopicOptions o;
+        o.config.cleanupPolicy  = 1;
+        o.config.retentionMs    = -1;
+        o.config.retentionBytes = -1;
+        o.lease                 = spec;
+        const auto r = c.defineTopicAndWait("inst", 1, "id", cd::serialize(d.build()), rune::client::Persistence::Disk, o, {}, 10s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+    }
+    {
+        cd::DescriptorBuilder d("plain");
+        d.add("id", cd::PrimType::Int64, 1, /*isKey=*/true).add("v", cd::PrimType::Int32);
+        const auto r = c.defineTopicAndWait("plain", 1, "id", cd::serialize(d.build()), rune::client::Persistence::Disk, {}, {}, 10s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+    }
+    const std::string egress = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+    auto header = [&](const std::string& topic) {
+        const fs::path out = tmpDir() / ("gen_lease_" + topic);
+        std::string o, e;
+        EXPECT_EQ(runCli({"schema", "generate", topic, "--out", out.string(), "--broker", "aeron:udp?endpoint=" + b.endpoint(),
+                          "--cli-egress", egress, "--cli-data-dir", (tmpDir() / ("gen_lease_cli_" + topic)).string()}, &o, &e), 0) << e;
+        std::ifstream in(out / (topic + ".gen.h"));
+        EXPECT_TRUE(static_cast<bool>(in));
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string lease = header("inst");
+    EXPECT_NE(lease.find("LeasesRow"), std::string::npos) << lease;
+    EXPECT_NE(lease.find("withLease"), std::string::npos);
+    const std::string plain = header("plain");
+    EXPECT_FALSE(plain.empty());
+    EXPECT_EQ(plain.find("LeasesRow"), std::string::npos);
+}
+
 // Issue #397: `rune schema list` without --cli-data-dir runs in a scratch data dir of its own (it used to fail with an
 // empty data dir).
 TEST(RuneCliBrokerRegression, SchemaListWorksWithoutTheCliDataDirFlagRegression) {

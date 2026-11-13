@@ -9,6 +9,9 @@
 
 #include <rune/catalog/CatalogState.h>
 #include <rune/ql/Parser.h>
+#include <rune/codec/Descriptor.h>
+#include <rune/codec/LeaseColumns.h>
+#include <rune/codec/Serialize.h>
 
 #include <gtest/gtest.h>
 
@@ -17,6 +20,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 namespace ql  = rune::ql;
 namespace eng = rune::cli::engine;
@@ -187,4 +191,70 @@ TEST(LeaseQlCliRegression, LeaseViewPrintsItsTopicRegression) {
     cat::ViewObject plan;
     plan.name = "v";
     EXPECT_NE(rune::cli::formatViewDefinition(plan).find("(undecodable plan)"), std::string::npos);
+}
+
+// `rune schema generate --from-file ... [--lease]`: the offline lease form (the blob carries no lease block).
+namespace {
+struct SchemaGenLeaseFixture {
+    std::filesystem::path dir;
+    std::string blob;
+    SchemaGenLeaseFixture() {
+        using namespace rune::codec;
+        dir = std::filesystem::temp_directory_path() / ("rune_cli_schema_gen_lease_" + std::to_string(::getpid()));
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        auto d = DescriptorBuilder("lease_claim").addFixedStr("claim", 32, 1, true).add("a", PrimType::UInt64).build();
+        EXPECT_TRUE(prependLeaseColumns(d));
+        auto bytes = serialize(d);
+        blob = (dir / "in.blob").string();
+        std::ofstream o(blob, std::ios::binary);
+        o.write((const char*)bytes.data(), (std::streamsize)bytes.size());
+    }
+    ~SchemaGenLeaseFixture() { std::filesystem::remove_all(dir); }
+    std::string header() const {
+        std::ifstream in(dir / "lease_claim.gen.h");
+        return std::string((std::istreambuf_iterator<char>(in)), {});
+    }
+};
+} // namespace
+
+TEST(SchemaGenLeaseCliRegression, FromFileWithLeaseFlagEmitsLeasesRowRegression) {
+    SchemaGenLeaseFixture f;
+    std::string out, err;
+    ASSERT_EQ(runCli({"schema", "generate", "--from-file", f.blob, "--out", f.dir.string(), "--lease"}, &out, &err), 0) << err;
+    EXPECT_NE(f.header().find("LeasesRow"), std::string::npos);
+}
+
+TEST(SchemaGenLeaseCliRegression, FromFileWithoutLeaseFlagHasNoLeasesRowRegression) {
+    SchemaGenLeaseFixture f;
+    std::string out, err;
+    ASSERT_EQ(runCli({"schema", "generate", "--from-file", f.blob, "--out", f.dir.string()}, &out, &err), 0) << err;
+    const std::string h = f.header();
+    EXPECT_FALSE(h.empty());
+    EXPECT_EQ(h.find("LeasesRow"), std::string::npos);
+}
+
+// F-6: the --lease form carries the same kFingerprint literal as the plain form.
+TEST(SchemaGenLeaseCliRegression, LeaseFlagDoesNotChangeTheFingerprintRegression) {
+    SchemaGenLeaseFixture f;
+    std::string out, err;
+    auto literalOf = [](const std::string& h) {
+        const std::string key = "kFingerprint = ";
+        const auto at = h.find(key);
+        EXPECT_NE(at, std::string::npos);
+        return at == std::string::npos ? std::string{} : h.substr(at + key.size(), h.find("ull;", at) - at - key.size());
+    };
+    ASSERT_EQ(runCli({"schema", "generate", "--from-file", f.blob, "--out", f.dir.string()}, &out, &err), 0) << err;
+    const std::string off = literalOf(f.header());
+    ASSERT_EQ(runCli({"schema", "generate", "--from-file", f.blob, "--out", f.dir.string(), "--lease"}, &out, &err), 0) << err;
+    const std::string on = literalOf(f.header());
+    EXPECT_FALSE(on.empty());
+    EXPECT_EQ(on, off);
+}
+
+TEST(SchemaGenLeaseCliRegression, LeaseFlagWithoutFromFileIsRefusedRegression) {
+    SchemaGenLeaseFixture f;
+    std::string out, err;
+    EXPECT_EQ(runCli({"schema", "generate", "lease_claim", "--out", f.dir.string(), "--lease"}, &out, &err), 1);
+    EXPECT_NE(err.find("--lease applies to --from-file only; live mode reads it from the topic"), std::string::npos) << err;
 }

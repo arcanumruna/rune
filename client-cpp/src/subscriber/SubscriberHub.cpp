@@ -49,10 +49,31 @@ void SubscriberHub::clearDirty_(SubscriptionImpl& impl) noexcept
     --dirtyCount_;
 }
 
+/*static*/
+SubscriptionStatus SubscriberHub::statusOf_(const SubscriptionImpl& impl, bool final) noexcept
+{
+    return SubscriptionStatus{impl.subscriptionId, impl.nextOffset,
+                              final ? impl.failReason : SubscriptionFailReason::None,
+                              final ? impl.brokerErrorCode : uint16_t{0},
+                              impl.dataResets, impl.batchBytes,
+                              !final && impl.paused, impl.appSeqApplied};
+}
+
+void SubscriberHub::publishBind_(SubscriptionImpl& impl)
+{
+    // The first bind uses the final-status reserve (one bind and one final record per subscription); a re-bind after a
+    // resume or a move is an ordinary latest-wins snapshot, so many pause / resume cycles never eat the reserve.
+    if (!impl.everBound) {
+        impl.everBound = true;
+        (void)impl.status.publishFinal(statusOf_(impl, false));
+        return;
+    }
+    publishStatus_(impl);
+}
+
 void SubscriberHub::publishStatus_(SubscriptionImpl& impl)
 {
-    if (impl.status.tryPublish(
-            SubscriptionStatus{impl.subscriptionId, impl.nextOffset, SubscriptionFailReason::None, 0, impl.dataResets, impl.batchBytes})) {
+    if (impl.status.tryPublish(statusOf_(impl, false))) {
         clearDirty_(impl);
     } else if (!impl.status.closed()) {
         markDirty_(impl);
@@ -64,8 +85,7 @@ int SubscriberHub::republishDirty()
     int published = 0;
     for (SubscriptionImpl* p = dirtyHead_; p != nullptr; ) {
         SubscriptionImpl* next = p->nextDirty;
-        if (p->status.tryPublish(
-                SubscriptionStatus{p->subscriptionId, p->nextOffset, SubscriptionFailReason::None, 0, p->dataResets, p->batchBytes})) {
+        if (p->status.tryPublish(statusOf_(*p, false))) {
             clearDirty_(*p);
             ++published;
         } else if (p->status.closed()) {
@@ -82,15 +102,14 @@ void SubscriberHub::closeStatus_(SubscriptionImpl& impl)
     if (impl.status.producerClosed()) return;
     // Final snapshot (uses the ring's reserve — always fits), THEN close: an
     // app thread that observes finished() and drains afterwards sees it.
-    (void)impl.status.publishFinal(
-        SubscriptionStatus{impl.subscriptionId, impl.nextOffset, impl.failReason, impl.brokerErrorCode,
-                           impl.dataResets, impl.batchBytes});
+    (void)impl.status.publishFinal(statusOf_(impl, true));
     impl.status.close();
 }
 
 void SubscriberHub::finish_(SubscriptionImpl& impl)
 {
     impl.active = false;
+    impl.paused = false;   // finished, not paused (a paused subscription that ends is simply finished)
     clearDirty_(impl);
     if (&impl == dispatching_) return;  // closed by onRecords once the handler returns
     closeStatus_(impl);
@@ -145,7 +164,10 @@ void SubscriberHub::applyCommand(const detail::HubCommand& cmd,
         std::unique_ptr<SubscribeRequest> req(reinterpret_cast<SubscribeRequest*>(cmd.handle));
         // F8c C7: from here the duty side holds its share of the impl (even
         // if it was unsubscribed before this adoption) until release().
-        if (req && req->impl) owned_.push_back(req->impl);
+        if (req && req->impl) {
+            req->impl->ownedSlot = static_cast<uint32_t>(owned_.size());
+            owned_.push_back(req->impl);
+        }
         // F8a fix2: stamp the frame with the CURRENT session (the app thread's
         // snapshot may be stale); a frame of a dead session is dropped by the
         // ring drain, and pending subscribes are re-sent on every connect.
@@ -154,6 +176,7 @@ void SubscriberHub::applyCommand(const detail::HubCommand& cmd,
             for (int i = 0; i < 8; ++i)
                 req->subscribeFrame[8 + i] = static_cast<uint8_t>(u >> (i * 8));
         }
+        if (req && req->impl) req->impl->subscribeTimeoutNs = req->timeoutNs;   // a resume() re-stamps the deadline from it
         if (req) {   // #701: the duty clock stamps the deadline (saturating: a huge timeout is "never")
             req->deadlineNs = req->timeoutNs > std::numeric_limits<int64_t>::max() - std::max<int64_t>(nowNs, 0)
                                   ? std::numeric_limits<int64_t>::max()
@@ -170,6 +193,21 @@ void SubscriberHub::applyCommand(const detail::HubCommand& cmd,
             ? correlationIdOf_(reinterpret_cast<const SubscriptionImpl*>(cmd.handle))
             : cmd.a;
         if (corr != 0) unsubscribe(corr, unsubCorrId, sessionId, submitFn);
+        else if (cmd.handle != 0) (void)unsubscribePaused_(reinterpret_cast<SubscriptionImpl*>(cmd.handle));   // a paused one is in no table
+        break;
+    }
+    case detail::HubCommand::Op::SubscribePause:
+    case detail::HubCommand::Op::SubscribeResume: {
+        // Identified by the impl address; dereferenced only when this hub owns it.
+        SubscriptionImpl* impl = reinterpret_cast<SubscriptionImpl*>(cmd.handle);
+        if (impl == nullptr || !owns_(impl)) break;
+        // The ring path: the handle has already answered its caller, so the command is applied whatever the verdict; its
+        // number is echoed in the next snapshot (cmd.b), which is how the handle learns a refusal (no room, finished).
+        noteAppSeq_(*impl, static_cast<uint32_t>(cmd.b));
+        const bool applied = cmd.op == detail::HubCommand::Op::SubscribePause
+                                 ? pause_(*impl, cmd.a, unsubCorrId, sessionId, submitFn)
+                                 : resume_(*impl, unsubCorrId, sessionId, nowNs, submitFn);
+        if (!applied && impl->active) publishStatus_(*impl);   // nothing changed, but the echo moved
         break;
     }
     default:
@@ -192,6 +230,11 @@ void SubscriberHub::adoptSubscribe(std::unique_ptr<SubscribeRequest> req,
     auto [it, inserted] = pendingByCorrelation_.emplace(corrId, std::move(req));
     if (!inserted) return;  // duplicate correlationId: impossible (unique counter)
 
+    sendNewPending_(it, submitFn);
+}
+
+void SubscriberHub::sendNewPending_(PendingMap::iterator it, const SendFn& submitFn)
+{
     SubscribeRequest& pr = *it->second;
     if (directSend_ == nullptr) {
         // Hub-level tests without a transport: the given SendFn.
@@ -277,13 +320,17 @@ int SubscriberHub::retryUnsentSubscribes()
 
 int64_t SubscriberHub::correlationIdOf_(const SubscriptionImpl* key) const noexcept
 {
-    for (const auto& [corr, req] : pendingByCorrelation_) {
-        if (req->impl == key) return corr;
+    // O(1): the impl's own correlation id and subscription id are the keys of the two routing tables (a paused or finished one is in
+    // neither).  Only an impl this hub owns is dereferenced; the command ring orders every command before the impl's release.
+    if (!owns_(key)) return 0;   // not held: nothing to unsubscribe
+    if (const auto it = pendingByCorrelation_.find(key->correlationId);
+        it != pendingByCorrelation_.end() && it->second->impl == key)
+        return it->first;
+    if (key->subscriptionId != 0) {
+        if (const auto it = activeById_.find(key->subscriptionId); it != activeById_.end() && it->second == key)
+            return key->correlationId;
     }
-    for (const auto& [id, impl] : activeById_) {
-        if (impl == key) return impl->correlationId;
-    }
-    return 0;  // not (or no longer) held: nothing to unsubscribe
+    return 0;  // not (or no longer) in a table
 }
 
 bool SubscriberHub::unsubscribe(int64_t       subscribeCorrId,
@@ -356,13 +403,50 @@ detail::SendResult SubscriberHub::retrySendUnsubscribe_(const SubscriptionImpl& 
 {
     assert(directSend_ != nullptr && "SubscriberHub: direct send not wired");
     if (directSend_ == nullptr) return detail::SendResult::Retry;  // never claim "sent"
+    return offerUnsubscribe_(impl.subscriptionId, impl.unsubSessionId, impl.unsubCorrId, impl.homeSession);
+}
+
+detail::SendResult SubscriberHub::offerUnsubscribe_(int64_t subscriptionId, int64_t sessionId, int64_t corrId,
+                                                    uint32_t homeSession)
+{
+    if (directSend_ == nullptr) return detail::SendResult::Retry;
     uint8_t frameBuf[64]{};
-    const std::size_t frameLen = codec::encodeUnsubscribe(
-        frameBuf, sizeof(frameBuf), impl.subscriptionId, impl.unsubSessionId, impl.unsubCorrId);
+    const std::size_t frameLen = codec::encodeUnsubscribe(frameBuf, sizeof(frameBuf), subscriptionId, sessionId, corrId);
     if (frameLen == 0) return detail::SendResult::Accepted;
-    if (impl.homeSession != 0 && routed_())   // I2: on its own node session
-        return router_.offer(router_.ctx, impl.homeSession, frameBuf, frameLen);
+    if (homeSession != 0 && routed_())   // I2: on its own node session
+        return router_.offer(router_.ctx, homeSession, frameBuf, frameLen);
     return directSend_(directSendCtx_, frameBuf, frameLen);
+}
+
+bool SubscriberHub::oweRelease_(int64_t subscriptionId, int64_t sessionId, int64_t corrId, uint32_t homeSession)
+{
+    if (owedCount_ == owed_.size()) return false;
+    owed_[owedCount_++] = OwedRelease{subscriptionId, sessionId, corrId, homeSession};
+    return true;
+}
+
+int SubscriberHub::retryOwedReleases_(int64_t currentSessionId)
+{
+    int sent = 0;
+    for (std::size_t i = 0; i < owedCount_; ) {
+        const OwedRelease o = owed_[i];
+        const int64_t homeNow = (o.homeSession != 0 && routed_()) ? router_.sessionId(router_.ctx, o.homeSession)
+                                                                  : currentSessionId;
+        if (o.sessionId != homeNow) {
+            // Its session is gone: the broker dropped the subscription with it.
+            ++unsubscribesDropped_;
+            std::fprintf(stderr,
+                "rune-client: owed Unsubscribe for subscription %lld dropped: session %lld no longer exists\n",
+                static_cast<long long>(o.subscriptionId), static_cast<long long>(o.sessionId));
+        } else {
+            const detail::SendResult r = offerUnsubscribe_(o.subscriptionId, o.sessionId, o.corrId, o.homeSession);
+            if (r == detail::SendResult::Retry) { ++i; continue; }
+            if (r == detail::SendResult::Accepted) ++sent;
+            // Fatal: never deliverable, dropped.
+        }
+        owed_[i] = owed_[--owedCount_];   // order does not matter
+    }
+    return sent;
 }
 
 void SubscriberHub::markUnsubPending_(SubscriptionImpl& impl) noexcept
@@ -374,7 +458,7 @@ void SubscriberHub::markUnsubPending_(SubscriptionImpl& impl) noexcept
 
 int SubscriberHub::retryPendingUnsubscribes(int64_t currentSessionId)
 {
-    int sent = 0;
+    int sent = owedCount_ != 0 ? retryOwedReleases_(currentSessionId) : 0;
     for (auto it = activeById_.begin(); it != activeById_.end() && pendingUnsubCount_ != 0; ) {
         SubscriptionImpl& impl = *it->second;
         if (!impl.unsubPending || &impl == dispatching_) { ++it; continue; }
@@ -400,6 +484,213 @@ int SubscriberHub::retryPendingUnsubscribes(int64_t currentSessionId)
         it = activeById_.erase(it);
     }
     return sent;
+}
+
+// ---------------------------------------------------------------------------
+// pause / resume — duty thread (cold)
+// ---------------------------------------------------------------------------
+
+bool SubscriberHub::owns_(const SubscriptionImpl* impl) const noexcept
+{
+    // O(1), validated on use.  `impl` is a live impl whenever this is reached (a handle command is applied before the release the
+    // handle's destruction queues behind it, reapReleases_ fence); a value from before adoption or after hand-back fails the check.
+    const uint32_t slot = impl->ownedSlot;
+    return slot < owned_.size() && owned_[slot] == impl;
+}
+
+void SubscriberHub::eraseActive_(int64_t id, const SubscriptionImpl& impl)
+{
+    if (const auto it = activeById_.find(id); it != activeById_.end() && it->second == &impl) activeById_.erase(it);
+}
+
+void SubscriberHub::retireRequest_(PendingMap::iterator it)
+{
+    SubscriptionImpl* impl = it->second ? it->second->impl : nullptr;
+    if (impl != nullptr && impl->pausedOnce) impl->parkedRequest = pendingByCorrelation_.extract(it);
+    else                                      pendingByCorrelation_.erase(it);
+}
+
+SubscriberHub::ActiveMap::iterator SubscriberHub::bindActive_(int64_t id, SubscriptionImpl* impl)
+{
+    if (!impl->parkedRoute.empty()) {   // a resumed subscription: its old node, re-keyed (no allocation)
+        impl->parkedRoute.key()    = id;
+        impl->parkedRoute.mapped() = impl;
+        return activeById_.insert(std::move(impl->parkedRoute)).position;
+    }
+    return activeById_.emplace(id, impl).first;
+}
+
+bool SubscriberHub::unsubscribePaused_(SubscriptionImpl* impl)
+{
+    if (!owns_(impl) || !impl->active || !impl->paused) return false;
+    finish_(*impl);   // clears `paused`; the broker side was released at the pause
+    impl->parkedRequest = {};
+    impl->parkedRoute   = {};
+    return true;
+}
+
+void SubscriberHub::noteAppSeq_(SubscriptionImpl& impl, uint32_t seq) noexcept
+{
+    // Only forward (wrap-safe): a command that was queued before a later direct one of the same handle never moves the echo back.
+    if (seq != 0 && static_cast<int32_t>(seq - impl.appSeqApplied) > 0) impl.appSeqApplied = seq;
+}
+
+bool SubscriberHub::pauseDirect(SubscriptionImpl& impl, int64_t resumeAt, uint32_t appSeq, int64_t unsubCorrId,
+                                int64_t sessionId, const SendFn& submitFn)
+{
+    if (!owns_(&impl) || !impl.active) return false;
+    if (resumeAt >= 0 && resumeAt > impl.pauseBound()) return false;
+    const uint32_t prev = impl.appSeqApplied;
+    noteAppSeq_(impl, appSeq);   // before the call: pause_ publishes the snapshot that carries the echo
+    if (pause_(impl, resumeAt, unsubCorrId, sessionId, submitFn)) return true;
+    impl.appSeqApplied = prev;
+    return false;
+}
+
+bool SubscriberHub::resumeDirect(SubscriptionImpl& impl, uint32_t appSeq, int64_t newCorrId, int64_t sessionId,
+                                 int64_t nowNs, const SendFn& submitFn)
+{
+    if (!owns_(&impl) || !impl.active || !impl.paused) return false;
+    const uint32_t prev = impl.appSeqApplied;
+    noteAppSeq_(impl, appSeq);
+    if (resume_(impl, newCorrId, sessionId, nowNs, submitFn)) return true;
+    impl.appSeqApplied = prev;
+    return false;
+}
+
+bool SubscriberHub::pause_(SubscriptionImpl& impl, int64_t resumeAt, int64_t unsubCorrId, int64_t sessionId,
+                           const SendFn& submitFn)
+{
+    if (!impl.active) return false;
+    // The handle refuses a position above the bound; a command that raced a rewind is treated as "no offset".
+    if (resumeAt > impl.pauseBound()) resumeAt = -1;
+
+    // The broker side is released first: a transport that refuses the Unsubscribe puts it on the owed list, and a full list
+    // refuses the whole pause before anything changed.
+    SubscriptionImpl* const dispatchingNow = dispatching_;
+    bool                     bound         = false;
+    ActiveMap::iterator      ait           = activeById_.end();
+    if (!impl.paused && impl.subscriptionId != 0) {
+        const auto pit = pendingByCorrelation_.find(impl.correlationId);
+        const bool pending = pit != pendingByCorrelation_.end() && pit->second && pit->second->impl == &impl;
+        if (!pending) {
+            ait = activeById_.find(impl.subscriptionId);
+            if (ait != activeById_.end() && ait->second == &impl) {
+                bound = true;
+                // Overwrites unsubCorrId / unsubSessionId of an earlier release of this impl: harmless, that one is either answered or
+                // owed (the owed list carries its own ids).
+                const int64_t prevCorr = impl.unsubCorrId, prevSid = impl.unsubSessionId;
+                impl.unsubCorrId    = unsubCorrId;   // trySendUnsubscribe_ reads the two from the impl
+                impl.unsubSessionId = homeSidOf_(impl, sessionId);   // a moved one's own node session
+                if (trySendUnsubscribe_(impl, submitFn) == detail::SendResult::Retry) {
+                    if (!oweRelease_(impl.subscriptionId, impl.unsubSessionId, impl.unsubCorrId, impl.homeSession)) {
+                        impl.unsubCorrId    = prevCorr;   // no room to owe it: refuse, change nothing
+                        impl.unsubSessionId = prevSid;
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    if (resumeAt >= 0) {
+        impl.nextOffset        = resumeAt;
+        impl.deliveringOffset  = resumeAt - 1;
+        impl.resumeHint        = -1;
+        impl.pauseAfterCurrent = false;
+        if (resumeAt == 0) impl.fromWire = 0;   // nothing delivered, explicitly from the start
+    }
+    if (impl.paused) {   // only the position changed
+        publishStatus_(impl);
+        return true;
+    }
+    impl.paused            = true;
+    impl.pausedOnce        = true;
+    // Only inside a record handler (deliveringOffset >= nextOffset: the record being handled is not yet counted) - not in the
+    // catalog epoch / caught-up callback, where no record is in hand.
+    impl.pauseAfterCurrent = resumeAt < 0 && &impl == dispatchingNow && impl.deliveringOffset >= impl.nextOffset;
+    if (&impl == dispatchingNow) impl.stopDispatch = true;               // the dispatch loop stops, even if resume() follows
+
+    if (bound) {
+        impl.parkedRoute = activeById_.extract(ait);
+    } else if (const auto pit = pendingByCorrelation_.find(impl.correlationId);
+               pit != pendingByCorrelation_.end() && pit->second && pit->second->impl == &impl) {
+        // Not answered yet: the request is parked; a late OK for its correlation id is released by releaseUnboundOk_.
+        clearUnsent_(*pit->second);
+        impl.homeSession = 0;
+        impl.homeSid     = 0;
+        impl.homeEpoch   = 0;
+        impl.parkedRequest = pendingByCorrelation_.extract(pit);
+    }
+    publishStatus_(impl);
+    return true;
+}
+
+bool SubscriberHub::resume_(SubscriptionImpl& impl, int64_t newCorrId, int64_t sessionId, int64_t nowNs,
+                            const SendFn& submitFn)
+{
+    if (!impl.active || !impl.paused || newCorrId == 0) return false;
+    // A resume() inside the handler of the very record whose pause() had no offset: settle the position first - the record
+    // being handled counts as delivered - because the post-handler assignment is skipped once the dispatch was stopped.
+    if (impl.pauseAfterCurrent) {
+        impl.nextOffset        = impl.deliveringOffset + 1;
+        impl.pauseAfterCurrent = false;
+    }
+    const int64_t from = impl.nextOffset > 0  ? impl.nextOffset
+                       : impl.resumeHint >= 0 ? impl.resumeHint
+                                              : impl.fromWire;
+    uint8_t frameBuf[codec::kMaxSubscribeFrameBytes];
+    uint8_t claim[8];
+    std::size_t frameLen = 0;
+    if (impl.boundPartition >= 0) {
+        frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), impl.topicId, impl.boundPartition,
+                                          /*partitionKnown=*/1, from, impl.isolation, lineageClaim_(impl, claim),
+                                          sessionId, newCorrId, impl.filterSpan());
+    } else if (!impl.parkedRequest.empty()) {
+        // Never answered: the parked request still carries the partition / key the app asked for.
+        const SubscribeRequest& old = *impl.parkedRequest.mapped();
+        if (const auto v = codec::decodeSubscribe(old.subscribeFrame.data(), old.subscribeFrame.size())) {
+            frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), v->topicId, v->partition, v->partitionKnown,
+                                              from, impl.isolation, v->key, sessionId, newCorrId, impl.filterSpan());
+        }
+    }
+    if (frameLen == 0) {   // unreachable (a paused subscription always has one of the two): never a silent stall
+        assert(false && "SubscriberHub::resume_: no Subscribe to rebuild");
+        impl.failReason = SubscriptionFailReason::RejectedByBroker;
+        finish_(impl);
+        return false;
+    }
+    impl.homeSession    = 0;   // routed below like any new / moved Subscribe
+    impl.homeSid        = 0;
+    impl.homeEpoch      = 0;
+    impl.subscriptionId = 0;
+    impl.correlationId  = newCorrId;
+    impl.resumeFloor    = impl.nextOffset > 0 ? impl.nextOffset : -1;   // a batch pushed from below the position is trimmed
+    impl.resumeHint     = -1;
+    impl.paused            = false;
+    impl.pauseAfterCurrent = false;
+
+    PendingMap::iterator it;
+    if (!impl.parkedRequest.empty()) {   // after the first cycle: the parked node, re-keyed (no allocation)
+        impl.parkedRequest.key() = newCorrId;
+        it = pendingByCorrelation_.insert(std::move(impl.parkedRequest)).position;
+    } else {
+        it = pendingByCorrelation_.emplace(newCorrId, std::make_unique<SubscribeRequest>()).first;   // first cycle only
+    }
+    SubscribeRequest& req = *it->second;
+    req.impl = &impl;
+    req.subscribeFrame.assign(frameBuf, frameBuf + frameLen);
+    req.timeoutNs   = impl.subscribeTimeoutNs;
+    req.deadlineNs  = req.timeoutNs > std::numeric_limits<int64_t>::max() - std::max<int64_t>(nowNs, 0)
+                          ? std::numeric_limits<int64_t>::max()
+                          : nowNs + req.timeoutNs;
+    req.unsent      = false;
+    req.nlRetries   = 0;
+    req.notBeforeNs = 0;
+    publishStatus_(impl);
+    if (impl.moved && routed_()) routeMovedPending_(it, sessionId);   // follows its partition's leader, as a moved one does
+    else                         sendNewPending_(it, submitFn);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -432,7 +723,7 @@ void SubscriberHub::onSubscribeResponse(
     }
     clearUnsent_(*it->second);
     SubscriptionImpl* impl = it->second->impl;
-    pendingByCorrelation_.erase(it);
+    retireRequest_(it);
     if (!impl) return;
 
     // No-hang wave: an error answer binds NOTHING broker-side.  It used to be
@@ -469,9 +760,8 @@ void SubscriberHub::onSubscribeResponse(
     }
 
     // Bind: lifecycle snapshot (uses the reserve — always fits).
-    (void)impl->status.publishFinal(
-        SubscriptionStatus{impl->subscriptionId, impl->nextOffset, impl->failReason, 0, impl->dataResets, impl->batchBytes});
-    activeById_.emplace(rsp.subscriptionId, impl);
+    publishBind_(*impl);
+    (void)bindActive_(rsp.subscriptionId, impl);
 }
 
 // ---------------------------------------------------------------------------
@@ -495,9 +785,11 @@ void SubscriberHub::releaseUnboundOk_(const codec::SubscribeResponseView& rsp, i
         if (seedMatch)           { if (directSend_ != nullptr) r = directSend_(directSendCtx_, buf, len); }
         else if (routed_())      { r = router_.offer(router_.ctx, node, buf, len); }
     }
-    // One attempt only (best-effort, as the #365 old-instance release): a refusal is not retried.
+    // A refusal (Retry) is owed: retried each duty cycle until accepted, or dropped with its session (retryOwedReleases_).
+    // Only a Fatal send, or a full owed list, leaves it unreleased.
     if (r == detail::SendResult::Accepted) ++lateOksReleased_;
-    else                                   ++lateOksUnreleased_;
+    else if (r == detail::SendResult::Retry && oweRelease_(rsp.subscriptionId, rsp.sessionId, unsubCorrId, seedMatch ? 0u : node)) {}
+    else ++lateOksUnreleased_;
 }
 
 // ---------------------------------------------------------------------------
@@ -525,15 +817,14 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         if (expectSid == 0 || rv.sessionId != expectSid) return;
         if (!pi->active || rv.topicId != pi->topicId) return;
         clearUnsent_(*p->second);
-        pendingByCorrelation_.erase(p);
+        retireRequest_(p);
         pi->subscriptionId = rv.subscriptionId;
         pi->boundPartition = rv.partition;
-        (void)pi->status.publishFinal(
-            SubscriptionStatus{pi->subscriptionId, pi->nextOffset, pi->failReason, 0, pi->dataResets, pi->batchBytes});
-        it = activeById_.emplace(rv.subscriptionId, pi).first;
+        publishBind_(*pi);
+        it = bindActive_(rv.subscriptionId, pi);
     }
     SubscriptionImpl& impl = *it->second;
-    if (!impl.active) return;
+    if (!impl.active) return;   // (a paused subscription is in no table: its old id never reaches here)
     // Exact instance: the push names the Subscribe that created it.
     if (rv.correlationId != 0 && rv.correlationId != impl.correlationId) return;
     // Only its own topic / partition (a belt-and-braces compare on a branch
@@ -566,9 +857,10 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
                                      "(caught; the duty cycle continues)\n");
             }
             dispatching_ = nullptr;
+            impl.stopDispatch = false;   // a pause() in the callback has no record loop to stop
             if (!impl.active) {   // finished from inside the callback (as for a record handler)
                 closeStatus_(impl);
-                if (!impl.unsubPending) activeById_.erase(it);
+                if (!impl.unsubPending) eraseActive_(rv.subscriptionId, impl);
             }
             return;
         }
@@ -600,9 +892,10 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
     // a template (RecordBatchReader::forEachRecord), never a std::function.
     const int32_t partitionOfRecords = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
     dispatching_ = &impl;
+    impl.stopDispatch = false;   // only this loop resets it: a pause() in a handler stops the frame even if resume() follows
     std::span<const uint8_t> rest(rb.data(), rb.size());
     bool first = true;
-    while (!rest.empty() && impl.active) {
+    while (!rest.empty() && impl.active && !impl.stopDispatch) {
         rune::protocol::RecordBatchReader reader(rest.data(), rest.size());
         if (!reader.ensureValid()) {   // also: shorter than a batch header
             noteMalformed_();          // counted + logged (rate-limited), never silent
@@ -648,7 +941,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
             {
                 // The handler may have unsubscribed this subscription (directly, on
                 // this thread): deliver nothing more of the batch.
-                if (!impl.active) return;
+                if (!impl.active || impl.stopDispatch) return;
                 if (absOffset < dropBelow) [[unlikely]] return;   // delivered before the move
                 // Task 14a: a lease Checkpoint record is the broker's own bookkeeping - never delivered, but its offset is
                 // consumed so the resume position moves past it (bits 2-3 are reserved, and refused on produce, elsewhere).
@@ -667,6 +960,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
                 rec.value = std::span<const uint8_t>(
                     reinterpret_cast<const uint8_t*>(valView.data()), valView.size());
 
+                impl.deliveringOffset = absOffset;   // pause(absOffset) from inside the handler names this record
                 // Invoke the handler (duty thread; must not block). fix1 C1: this runs
                 // inside the noexcept ClientAgent::doWork chain — a throwing handler
                 // must never escape it.
@@ -684,13 +978,18 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
                         "(caught; the duty cycle continues)\n");
                 }
 
+                if (impl.stopDispatch) [[unlikely]] {   // paused by its handler (and maybe resumed): pause_ / resume_ set the position
+                    if (impl.pauseAfterCurrent) { impl.nextOffset = absOffset + 1; impl.pauseAfterCurrent = false; }
+                    return;
+                }
                 impl.nextOffset = absOffset + 1;
             });
-            if (impl.active && impl.filtered() && last + 1 > impl.nextOffset) [[unlikely]] impl.nextOffset = last + 1;   // the rebuilt batch spans its source; not past records an unsubscribing handler never got
+            if (impl.active && !impl.stopDispatch && impl.filtered() && last + 1 > impl.nextOffset) [[unlikely]] impl.nextOffset = last + 1;   // the rebuilt batch spans its source; not past records an unsubscribing handler never got
         }
         if (batchLen >= rest.size()) break;
         rest = rest.subspan(batchLen);
     }
+    impl.stopDispatch = false;
     dispatching_ = nullptr;
 
     if (!impl.active) {
@@ -698,7 +997,11 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         // publish the final snapshot, close the ring, and drop the entry (this
         // may free impl — nothing below touches it).
         closeStatus_(impl);
-        if (!impl.unsubPending) activeById_.erase(it);  // pending: the retry erases it
+        if (!impl.unsubPending) eraseActive_(rv.subscriptionId, impl);  // pending: the retry erases it
+        return;
+    }
+    if (impl.paused) [[unlikely]] {   // paused by its handler: it left the tables at the pause
+        publishStatus_(impl);
         return;
     }
     // One status snapshot per Records frame (not per record).
@@ -726,9 +1029,13 @@ void SubscriberHub::deactivateAll()
     for (auto& [subId, impl] : activeById_) {
         finish_(*impl);
     }
+    for (SubscriptionImpl* impl : owned_) {   // paused ones are in no table
+        if (impl->paused && impl->active) finish_(*impl);
+    }
     pendingByCorrelation_.clear();
     activeById_.clear();
     pendingUnsubCount_ = 0;
+    owedCount_         = 0;
     unsentSubscribes_  = 0;  // their sessions end with the Client
 }
 
@@ -873,10 +1180,14 @@ bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int
             const std::size_t unsubLen =
                 codec::encodeUnsubscribe(unsubBuf, sizeof(unsubBuf), impl.subscriptionId, homeSid, unsubCorrId);
             if (unsubLen > 0) {
+                detail::SendResult rel = detail::SendResult::Fatal;
                 if (impl.homeSession != 0 && routed_())   // I2: its old node session
-                    (void)router_.offer(router_.ctx, impl.homeSession, unsubBuf, unsubLen);
+                    rel = router_.offer(router_.ctx, impl.homeSession, unsubBuf, unsubLen);
                 else if (directSend_ != nullptr)
-                    (void)directSend_(directSendCtx_, unsubBuf, unsubLen);
+                    rel = directSend_(directSendCtx_, unsubBuf, unsubLen);
+                // A refusal is owed (retried each duty cycle), never dropped; a full list is the hard limit.
+                if (rel == detail::SendResult::Retry)
+                    (void)oweRelease_(impl.subscriptionId, homeSid, unsubCorrId, impl.homeSession != 0 && routed_() ? impl.homeSession : 0u);
             }
         }
         activeById_.erase(it);
@@ -954,6 +1265,7 @@ bool SubscriberHub::restartFromLogStart(int64_t correlationId, int64_t seedSid,
     ++partitionDataResets_;
     impl.lineage     = 0;
     impl.nextOffset  = 0;
+    impl.deliveringOffset = -1;   // pauseBound() follows the new position, not the old (higher) one
     impl.resumeFloor = -1;
     impl.resumeHint  = -1;
     impl.fromWire    = kFromEarliest;
@@ -1209,9 +1521,12 @@ int SubscriberHub::driveHomed(int64_t seedSid, int64_t deadlineNs, int64_t now)
             // old instance there, best-effort as on a NotLeader move.
             const int64_t relSid = wasSeed ? homeSidOf_(impl, seedSid) : impl.homeSid;
             uint8_t unsubBuf[64]{};
+            const int64_t unsubCorr = router_.nextCorrId(router_.ctx);
             const std::size_t unsubLen = codec::encodeUnsubscribe(unsubBuf, sizeof(unsubBuf), impl.subscriptionId,
-                                                                  relSid, router_.nextCorrId(router_.ctx));
-            if (unsubLen > 0) (void)router_.offer(router_.ctx, impl.homeSession, unsubBuf, unsubLen);
+                                                                  relSid, unsubCorr);
+            if (unsubLen > 0 &&
+                router_.offer(router_.ctx, impl.homeSession, unsubBuf, unsubLen) == detail::SendResult::Retry)
+                (void)oweRelease_(impl.subscriptionId, relSid, unsubCorr, impl.homeSession);   // owed, not dropped
         }
         ++homedSessionsLost_;
         activeById_.erase(ait);
@@ -1383,6 +1698,13 @@ int SubscriberHub::endAllLive(SubscriptionFailReason why, uint16_t code)
         if (impl == dispatching_) { ++it; continue; }   // onRecords erases it once its handler returns
         it = activeById_.erase(it);
     }
+    for (SubscriptionImpl* impl : owned_) {   // a paused subscription is in no table: it ends with the session's user too
+        if (!impl->paused || !impl->active) continue;
+        impl->failReason      = why;
+        impl->brokerErrorCode = code;
+        finish_(*impl);
+        ++ended;
+    }
     return ended;
 }
 
@@ -1448,12 +1770,12 @@ bool SubscriberHub::release(SubscriptionImpl* impl) noexcept
     for (const auto& [id, p] : activeById_) {
         if (p == impl) return false;
     }
-    for (std::size_t i = 0; i < owned_.size(); ++i) {
-        if (owned_[i] == impl) {
-            owned_[i] = owned_.back();
-            owned_.pop_back();
-            break;
-        }
+    if (owns_(impl)) {
+        SubscriptionImpl* moved = owned_.back();
+        owned_[impl->ownedSlot] = moved;
+        moved->ownedSlot        = impl->ownedSlot;
+        owned_.pop_back();
+        impl->ownedSlot = ~0u;
     }
     return true;
 }

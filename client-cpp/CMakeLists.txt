@@ -90,6 +90,12 @@ if(BUILD_TESTING)
     # C-F32: the test tree (tests/** minus the shipped tests/e2e probes) adds no
     # atomics / mutexes / futures / sleeps — the existing sites are an exact
     # baseline (scripts/test_tree_sync_baseline.json) that only shrinks.
+    # client-cpp-v0.1.3: the package missed rune_client_view, so a consumer could not link.  Every static library is
+    # installed and listed in conanfile.py in the same order.
+    add_test(NAME PackageShipsEveryStaticLibrarySelfTestRegression
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_package_libs.py --selftest)
+    add_test(NAME PackageShipsEveryStaticLibraryRegression
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_package_libs.py ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME NoNewSyncOrSleepsInTestTreeRegression
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics_or_mutexes.py --tests
@@ -815,6 +821,11 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
                 target_link_libraries(filter_probe PRIVATE ${UUID_LIB_FILTER_PROBE})
             endif()
         endif()
+        if(BUILD_TESTING)
+            # The probe's own records against the broker's validator (a v2 record without the variable-length section failed the e2e's ALTER leg).
+            add_test(NAME FilterProbeSelfCheckRegression COMMAND ${CMAKE_COMMAND} -E env RUNE_MODE=selfcheck $<TARGET_FILE:filter_probe>)
+            set_tests_properties(FilterProbeSelfCheckRegression PROPERTIES PASS_REGULAR_EXPRESSION "FILTER-SELFCHECK: OK" TIMEOUT 20)
+        endif()
     endif()
 
     # ── Checked writes Part 05 — key index probe (broker/docker/checked-writes-e2e.sh) ──
@@ -867,7 +878,7 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
     # the 0b schema-probe above (build-time codegen from a checked-in blob), this
     # probe's header comes from `rune schema generate` at RUNTIME.  The e2e script
     # (docker/rune-ql-e2e.sh) runs, inside the client container:
-    #     rune console -f   tests/e2e/characters.rql --broker <node> --validate
+    #     rune console -f   tests/e2e/characters.rql --broker <node>
     #     rune schema generate characters --out ${RUNE_GEN_DIR} --broker <node>
     #     cmake --build . --target rune_ql_probe    (compiles THIS against the header)
     #     ./rune_ql_probe
@@ -1543,6 +1554,7 @@ if(BUILD_TESTING)
             tests/subscriber/SubscriberHubCommandTest.cpp
             tests/subscriber/SubscriberHubRecordsRegressionTest.cpp   # catalog history Task 13 fix round 2
             tests/subscriber/CheckedWritesRecordOpTest.cpp
+            tests/subscriber/SubscriberPauseTest.cpp                   # Subscription::pause / resume
             tests/support/AllocCounter.cpp                             # zero-alloc onRecords gate
         )
         target_include_directories(rune_subscriber_tests PRIVATE
@@ -1654,6 +1666,7 @@ if(BUILD_TESTING)
         add_executable(rune_invoker_tests
             tests/transport/InvokerTransportTest.cpp
             tests/agent/InvokerAgentTest.cpp
+            tests/subscriber/SubscriberPauseClientTest.cpp
             tests/producer/ProducerSinkTest.cpp
             tests/producer/ProducerAllocRegressionTest.cpp
             tests/producer/ProducerAckPathTest.cpp
@@ -1673,6 +1686,7 @@ if(BUILD_TESTING)
             tests/producer/CoordinatorLinkTest.cpp
             tests/producer/ProducerIdTest.cpp
             tests/producer/ProducerTxnTest.cpp
+            tests/producer/ProducerTxnGuardTest.cpp          # Herald prerequisites Task 4: the lease guard covers the commit
             tests/producer/ProducerTxnDataTest.cpp
             tests/producer/ProducerTxnOffsetsTest.cpp
             tests/detail/M2ORingBufferTest.cpp
@@ -1688,6 +1702,7 @@ if(BUILD_TESTING)
             tests/client/CheckedWritesClientStatsTest.cpp    # checked writes Part 08: getStats over GetStats 91
             tests/client/LeaseTopicTest.cpp                  # lease topics Task 14a: LeaseTopic<T> writes and requests
             tests/lease/LeaseSessionTest.cpp                 # lease topics Task 15: LeaseSession and the produce guard
+            tests/lease/LeaseWatchLifeTest.cpp               # LeaseWatch life states (closeAsync / isClosed)
             tests/lease/LeaseWatchTest.cpp                   # lease topics Task 16: LeaseWatch (hash-range handoff)
             tests/lease/LeaseRecipeTest.cpp                  # lease topics Task 20: LeaseOwnership / LeaseElection
             tests/client/IngressEndpointRoutingTest.cpp
@@ -2032,7 +2047,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     include(GNUInstallDirs)
     set(RUNE_INSTALL_TARGETS
         rune_client_api rune_client_producer rune_client_subscriber rune_client_group rune_client_agent
-        rune_client_transport rune_gso rune_client_driver_wake rune_ql rune_security rune_catalog
+        rune_client_transport rune_gso rune_client_driver_wake rune_ql rune_security rune_client_view rune_catalog
         rune_codec rune_client_scram rune_crypto flight_recorder)
     foreach(_t IN LISTS RUNE_INSTALL_TARGETS)
         # rune_client_api and the aeron-only libraries do not exist without aeron (the macOS/armv8 IDE stub).

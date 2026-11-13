@@ -696,6 +696,8 @@ public:
     /// T15b test hook: duty cycles run in failed mode (Invoker owner, or after
     /// close() in Thread mode — a plain duty-thread counter).
     [[nodiscard]] uint64_t testFailedDutyCycles() const noexcept { return failedDutyCycles_; }
+    /// Invoker doWork() calls that ran a duty cycle (the owner thread; tests: "this call did no client work").
+    [[nodiscard]] uint64_t dutyCyclesForTest() const noexcept { return invokerCycles_; }
 
     // ---- T15b: shard status (ClientConfig::shardStatus) -------------------------
     /// The ring's one consumer (the Invoker owner / an Agent control thread):
@@ -2019,7 +2021,7 @@ private:
     /// Issue-and-wait shared by the *AndWait wrappers (see their doc).
     template <class Issue, class OnDone>
     void andWait_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
-                  Issue&& issue, OnDone&& onDone);
+                  Issue&& issue, OnDone&& onDone, const std::function<std::string()>& waitTimeoutHint = {});
     /// How andWaitCore_ ended (andWait_ throws for each; the group's sink maps them to a Completion status).
     enum class AndWaitEnd : uint8_t { Done, RingTimedOut, WaitTimedOut, Closed, Rejected };
     /// andWait_ without the throw: `rejected` holds the issue's OpResult when it returns Rejected.
@@ -2162,6 +2164,7 @@ private:
     struct SeedFailoverStopped {};
     std::variant<SeedSteady, SeedFailingOver, SeedFailoverStopped> seedFailover_;
     uint64_t seedFailoverLossesSeen_ = 0;  ///< the seed machine's staleSessionLosses() last seen
+    uint64_t seedUnansweredSeen_     = 0;  ///< the seed machine's unansweredConnects() last seen
     uint64_t seedFailovers_          = 0;  ///< moves started (test hook)
     uint64_t seedFailoverConnects_   = 0;  ///< fix round 1 (I2): moves that connected by themselves
     uint64_t metadataViaOtherSession_ = 0; ///< MetadataRequests sent on a non-seed session
@@ -2266,6 +2269,7 @@ private:
     void publishShardStatus_() noexcept;
     bool failedForGood_ = false;  // the seed's terminal Rejected (duty thread only)
     uint64_t failedDutyCycles_ = 0;  // duty thread only (test hook)
+    uint64_t invokerCycles_ = 0;     // owner thread only: Invoker doWork() cycles (test hook)
     // T15b shard status (cfg_.shardStatus): ring created in the ctor before the
     // runner starts; duty-side state below is the duty thread's.
     std::unique_ptr<detail::StatusRing<shard::ShardStatus, 64 * 1024>> shardRing_;
@@ -2306,6 +2310,8 @@ private:
     std::vector<uint8_t> batchFrame_;   // leaseKeepAliveBatch's encode buffer (owner thread; grown once)
     /// fix3 I3: the duty-thread DIRECT application (acts on the impl).
     void applyHubCommandDirect_(const detail::HubCommand& cmd);
+    /// SubscribePause / SubscribeResume on the duty / owner thread: the subscriber hub decides and applies; true = applied.
+    [[nodiscard]] bool applySubscriptionPauseDirect_(const detail::HubCommand& cmd);
     /// The thread whose handle calls take the duty path: the Thread-mode runner;
     /// none in Invoker mode (the owner is both app and duty thread).
     [[nodiscard]] std::thread::id handleDutyThread_() const noexcept {

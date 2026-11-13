@@ -167,6 +167,9 @@ struct WLog {
             break;
         case rc::LeaseEventKind::Ready: ++w.readies; break;
         case rc::LeaseEventKind::Failed: ++w.failed; break;
+        case rc::LeaseEventKind::Confirmed:    // a re-run's bookkeeping: the table is already what the event says
+        case rc::LeaseEventKind::RerunBegin:
+        case rc::LeaseEventKind::RerunEnd: break;
         }
     }
 };
@@ -333,12 +336,16 @@ TEST(LeaseTransientBrokerRegression, RingFullOfLiveLeasesExpireStillAppendsRegre
     ASSERT_TRUE(driveWatch(watch, c, 30s, [&] { return watch.isReady(); }));
 
     // The grants go through their own handle: a refused grant is retried by the client's producer (TransientLogFull is a retriable answer) until the
-    // call's deadline, so the caller sees a Timeout, not code 42; closing the handle drops what it was still retrying.  The worker's counter
+    // HANDLE's op timeout (the producer's delivery timeout; a write does not take LeaseOptions::opTimeoutMs), so the caller sees
+    // DeliveryFailed / Timeout, not code 42.  The handle's op timeout (5 s) is shorter than grantAndWait's wait (10 s): the producer has given
+    // the refused grant up before the call returns, so nothing is still retrying it when the expiries free the ring.  With the default
+    // (lease.ttl / 3 = 20 s) the abandoned grant landed after the expiries and stayed live for good (seen under ASan).  The worker's counter
     // proves the ring (not max_keys, not a bug) is what refused.
-    auto grantLt = c.openLeaseTopicAndWait<LeaseClaim>("tr", {}, 30s);
+    rc::LeaseTopicConfig grantCfg;
+    grantCfg.opTimeoutMs = 5000;
+    auto grantLt = c.openLeaseTopicAndWait<LeaseClaim>("tr", grantCfg, 30s);
     rc::LeaseOptions o;
-    o.ttlMs        = 1000;   // min ttl
-    o.opTimeoutMs  = 1500;
+    o.ttlMs = 1000;   // min ttl
     int granted = 0;
     bool full   = false;
     const auto t0 = Clk::now();
@@ -369,7 +376,18 @@ TEST(LeaseTransientBrokerRegression, RingFullOfLiveLeasesExpireStillAppendsRegre
 
     rig.advance(std::chrono::milliseconds(10'000));   // past ttl + slack on the injected clock
     ASSERT_TRUE(driveWatch(watch, c, 90s, [&] { return log.live.empty() && int(log.ended.size()) == granted; }))
-        << "live " << log.live.size() << " ended " << log.ended.size() << " of " << granted;
+        << "live " << log.live.size() << " ended " << log.ended.size() << " of " << granted << "; " << [&] {
+               // Which keys stayed live, how often each was granted and ended, and whether the watch re-ran: tells a late grant of the
+               // refused key (a 961st key) from a key granted again after its end.
+               std::string s2 = "re-runs " + std::to_string(watch.reruns()) + ", still live:";
+               for (const auto& [k, v] : log.live) {
+                   const auto g = log.granted.find(k);
+                   const auto e = log.ended.find(k);
+                   s2 += " " + k + "(v" + std::to_string(v) + " granted " + std::to_string(g == log.granted.end() ? 0 : g->second) + " ended " +
+                         std::to_string(e == log.ended.end() ? 0 : e->second) + ")";
+               }
+               return s2;
+           }();
     for (const auto& [k, n] : log.ended) EXPECT_EQ(n, 1) << k << " ends exactly once";
     EXPECT_EQ(log.bad, 0);
     EXPECT_FALSE(watch.failed());

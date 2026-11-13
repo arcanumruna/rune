@@ -750,6 +750,9 @@ public:
     [[nodiscard]] uint64_t cleanerGroupsRejected() const noexcept { return cleanerGroupsRejected_; }
     /// Cleaner thread: outputs it enqueued are not yet consumed by the owner.
     [[nodiscard]] bool cleanerSwapsPending() const noexcept;
+    /// Owner thread (the swap ring's consumer): the acquire on the tail sees every output the cleaner enqueued before
+    /// publishing anything it stored after it (its clean watermark).
+    [[nodiscard]] bool ownerSwapsPending() const noexcept;
     /// The lowest front base of a deferred group rejected since the last call
     /// (INT64_MAX = none), then reset.  The owner rewinds the replica's clean
     /// watermark to it: the rejected range was NOT compacted although the
@@ -1380,6 +1383,10 @@ private:
     void recoverCleanerSwapFiles();
     /// The single SPSC producer path of the swap ring (n slots, one release-store).
     bool enqueueSwapSlots_(const SegRef* refs, std::size_t n) noexcept;
+    /// The swap ring as its consumer (the owner thread) sees it: its own head (relaxed) and the cleaner's published
+    /// tail (acquire, pairing with the cleaner's release-store).  The one place the owner reads the two indices.
+    struct SwapSpan { std::size_t head; std::size_t tail; };
+    [[nodiscard]] SwapSpan ownerSwapSpan_() const noexcept;
     /// Consumer body of drainCleanerSwaps over the published slots [head, tail).
     int drainSwapSlots_(std::size_t head, std::size_t tail, int64_t maxBaseBound);
     std::array<SegRef, kSwapRingCapacity> swapRing_{};

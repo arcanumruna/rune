@@ -468,6 +468,12 @@ int ProducerImpl::endStep_(int64_t nowNs) noexcept {
         return 1;
     }
     if (std::holds_alternative<AwaitData>(phase)) {
+        if (cm != nullptr && guard_.bound && guardBlocks_()) [[unlikely]] {
+            // R7: the lease guard blocks (at risk, ended, or the bind was refused) and EndTxn(commit) has not left: it never does.
+            // The commit completes DeliveryFailed / LeaseAtRisk and the transaction can only abort.  Not for an abort, not for ResendEnd.
+            poison_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk), AbortKind::Plain);
+            return 1;
+        }
         if (ab != nullptr) {
             // Task 6 (Kafka abortUndrainedBatches): an abort never produces what is not sent yet - every record of
             // the transaction still unsent completes with the abort's outcome.  Completions may run user code: the
@@ -584,6 +590,15 @@ void ProducerImpl::poison_(OpStatus st, uint16_t errorCode, AbortKind kind) noex
     // The first error is kept; a sequence gap still requires the epoch bump.
     if (auto* ae = std::get_if<AbortableError>(&txn_); ae != nullptr && kind == AbortKind::BumpEpoch) ae->kind = kind;
     if (auto* ab = std::get_if<Aborting>(&txn_); ab != nullptr && kind == AbortKind::BumpEpoch) ab->kind = kind;
+}
+
+void ProducerImpl::guardRecallUnsentCommit_() noexcept {
+    auto* cm = std::get_if<Committing>(&txn_);
+    if (cm == nullptr || !coord_) return;
+    const auto* es = std::get_if<EndSent>(&cm->phase);
+    if (es == nullptr || es->attempt != EndTry::First || es->slot == nullptr || es->slot->offers != 0) return;
+    coord_->release(*es->slot);
+    cm->phase = AwaitData{};
 }
 
 void ProducerImpl::onTxnLegAnswer_(ReqKind kind, int16_t errorCode) noexcept {
@@ -1434,6 +1449,11 @@ int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
         }
         const auto* id = std::get_if<IdAssigned>(&identity_);
         if (oa->slot != nullptr || !coord_ || id == nullptr) return 0;
+        if (guard_.bound && guardBlocks_()) [[unlikely]] {   // R7: nothing of a guarded transaction starts once the lease guard blocks
+            offsetsEnd_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk),
+                        "sendOffsetsToTransaction: the lease is at risk - abort the transaction", OffsetsEnd::Failed);
+            return 1;
+        }
         CoordinatorLink::Slot* s = coord_->acquire(ReqKind::AddOffsets, oa->op.deadlineNs);
         if (s == nullptr) return 0;   // no free slot: next pass
         rpc::AddOffsetsToTxn m;
@@ -1460,6 +1480,13 @@ int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
     }
     const auto* id = std::get_if<IdAssigned>(&identity_);
     if (!coord_ || id == nullptr) return 0;
+    if (guard_.bound && guardBlocks_()) [[unlikely]] {   // R7: no TxnOffsetCommit of a guarded transaction starts once the lease guard blocks
+        // Normally unreachable (a blocking guard poisons the transaction in the same step and the AbortableError ends the call at the top);
+        // kept as a runtime branch so a bind applied between the poison check and here never sends one commit of a doomed transaction.
+        offsetsEnd_(OpStatus::DeliveryFailed, static_cast<uint16_t>(ClientErrorCode::LeaseAtRisk),
+                    "sendOffsetsToTransaction: the lease is at risk - abort the transaction", OffsetsEnd::Failed);
+        return 1;
+    }
     int work = 0;
     // FD5: the entries that do not fit one kCoordFrameCap frame go in the next request (slot); a pass that finds no
     // free slot leaves the rest for the next one.

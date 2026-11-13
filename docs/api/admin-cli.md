@@ -178,7 +178,7 @@ Read-only access to topic schemas. Define or change a topic with `rune console -
 ```text
 rune schema get <topic> --broker <ep>
 rune schema list [--verbose] --broker <ep>
-rune schema generate --from-file <blob> --out <dir>
+rune schema generate --from-file <blob> --out <dir> [--lease]
 rune schema generate <topic> --out <dir> [--broker <ep>]
 ```
 
@@ -186,7 +186,7 @@ rune schema generate <topic> --out <dir> [--broker <ep>]
 |---|---|
 | `get` | Fetch a topic's schema and print it. |
 | `list` | List the topics the broker knows; `--verbose` prints more detail per topic. |
-| `generate --from-file` | Generate a C++ header from a serialized descriptor blob, offline. |
+| `generate --from-file` | Generate a C++ header from a serialized descriptor blob, offline. `--lease` marks the blob as a lease topic's stored schema (adds `withLease()` and `LeasesRow`; the blob carries no lease block). Live mode reads it from the topic. |
 | `generate <topic>` | Fetch the topic's schema lineage from the broker and write `<out>/<topic>.gen.h`, a type that reads records of every version up to the current one. |
 
 `generate` refuses a schema with a field whose name ends in `_`: a trailing `_` is reserved for the generated code's own names.
@@ -240,7 +240,7 @@ RUNE_TLS_CA_FILE=ca.pem rune ql --user admin --password-file admin.pw -e "show u
 
 | Binary | Source | Purpose |
 |---|---|---|
-| `rune_schema_gen` | `client-cpp/tools/rune_schema_gen.cpp` | The standalone form of `rune schema generate`: `generate <topic> --out <dir> [--broker <endpoint>]` or `generate --from-file <blob> --out <dir>`. |
+| `rune_schema_gen` | `client-cpp/tools/rune_schema_gen.cpp` | The standalone form of `rune schema generate`: `generate <topic> --out <dir> [--broker <endpoint>]` or `generate --from-file <blob> --out <dir> [--lease]`. |
 | `rune_codec_gen` | `codec/tools/rune_codec_gen_main.cpp` | `rune_codec_gen <descriptor.blob> <out.h>`. |
 | `rune_role` | `broker/src/rune_role.cpp` | `rune_role [<metricsFile>]` prints one `ROLE nodeId=... role=LEADER\|FOLLOWER\|CANDIDATE\|NONE term=...` line and one `STORAGE ...` line from the broker's metrics file (default `$RUNE_METRICS_FILE`, else `$RUNE_DATA_DIR/metrics/rune-metrics.dat`, `RUNE_DATA_DIR` defaulting to `/var/lib/rune`). Exit 0 found, 1 file missing, unreadable or not ready (the status is printed on stderr), 2 role metric not present yet. The DR harness uses it. |
 | `rune_broker storage format` | `broker/src/main.cpp` | Format a data directory: `--new`, `--join` or `--reassign-join`, `[--data-dir D] [--ignore-formatted]`. See [operations](../operations.md#formatting-a-data-directory). |

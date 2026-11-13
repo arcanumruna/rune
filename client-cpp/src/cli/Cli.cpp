@@ -59,7 +59,7 @@ bool connectOrReport(rune::client::Client& client, std::ostream& err) {
         return true;
     } catch (const std::exception& e) {
         if (isWaitTimeout(e)) {
-            err << "rune: connect timed out\n";
+            err << "rune: " << e.what() << "\n";
         } else {
             err << "rune error: " << e.what() << "\n";
         }
@@ -99,8 +99,9 @@ void printUsage(std::ostream& err) {
         << "      Fetch topic schema from broker and print descriptor.\n"
         << "  rune schema list [--verbose] --broker <ep>\n"
         << "      List known topics on broker.\n"
-        << "  rune schema generate --from-file <blob> --out <dir>\n"
-        << "      Generate C++ header from a serialized descriptor blob.\n"
+        << "  rune schema generate --from-file <blob> --out <dir> [--lease]\n"
+        << "      Generate C++ header from a serialized descriptor blob (--lease: the blob is a lease topic's\n"
+        << "      stored schema; adds withLease() and LeasesRow).\n"
         << "  rune schema generate <topic> --out <dir> [--broker <ep>]\n"
         << "      Fetch topic schema from broker and generate C++ header (live).\n";
     rune::cli::printCatalogUsage(err);
@@ -196,24 +197,34 @@ int cmdSchemaGet(const std::vector<std::string>& args,
     try {
         if (!connectOrReport(client, err)) return 1;
 
-        TopicSchemaResult r;
-        try {
-            r = client.getTopicSchemaAndWait(topic, kCliWait);
-        } catch (const std::exception& e) {
-            if (isWaitTimeout(e)) {
+        const auto lookup = [&](uint64_t fingerprint, TopicSchemaResult& res) {
+            try {
+                res = client.getTopicSchemaAndWait(topic, fingerprint, kCliWait);
+                return true;
+            } catch (const std::exception& e) {
+                if (!isWaitTimeout(e)) throw;
                 err << "rune: getTopicSchema timed out for topic: " << topic << "\n";
                 client.close();
-                return 1;
+                return false;
             }
-            throw;
-        }
-        client.close();
+        };
 
         namespace rpc = rune::protocol::client;
+        TopicSchemaResult r;
+        if (!lookup(0, r)) return 1;
         if (r.errorCode == static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic)) {
+            // The registry holds typed topics only: ask whether the topic exists untyped.
+            TopicSchemaResult kind;
+            if (!lookup(rpc::kSchemaKindFingerprint, kind)) return 1;
+            client.close();
+            if (kind.errorCode == 0 && kind.descriptorBlob.empty()) {
+                out << "topic '" << topic << "' is untyped: it has no schema\n";
+                return 0;
+            }
             err << "rune: unknown topic '" << topic << "'\n";
             return static_cast<int>(r.errorCode);
         }
+        client.close();
         if (r.errorCode != 0) {
             err << "rune: broker error code " << r.errorCode
                 << " for topic '" << topic << "'\n";
@@ -317,11 +328,16 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
         err << "rune schema generate: --out <dir> is required\n";
         return 1;
     }
+    const bool lease = hasFlag(args, "--lease");
+    if (lease && fromFile.empty()) {
+        err << "rune schema generate: --lease applies to --from-file only; live mode reads it from the topic\n";
+        return 1;
+    }
 
     // ── Offline: --from-file ──────────────────────────────────────────────────
     if (!fromFile.empty()) {
         try {
-            auto written = rune::tools::generateFromFile(fromFile, outDir);
+            auto written = rune::tools::generateFromFile(fromFile, outDir, lease);
             out << "rune: wrote " << written << "\n";
             return 0;
         } catch (const std::exception& e) {
@@ -367,7 +383,7 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
 
         rune::codec::Descriptor d = rune::codec::deserialize(
             std::span<const uint8_t>(r.descriptorBlob.data(), r.descriptorBlob.size()));
-        std::string hdr = rune::codec::generateHeader(d);
+        std::string hdr = rune::codec::generateHeader(d, d.version, "rune::gen", r.lease.has_value());
 
         std::filesystem::path dir(outDir);
         std::filesystem::create_directories(dir);

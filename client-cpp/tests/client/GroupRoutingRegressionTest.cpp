@@ -3215,6 +3215,34 @@ RigOptions failoverRealClockOpts() {   // tests that measure wall time, sleep, o
 }
 }  // namespace
 
+// The seed's broker ended the session (SessionExpired) and then died: the seed left Connected through an ANSWER, so
+// no stale loss was counted, and its fresh connect there is never answered.  One unanswered connect of a once-Live
+// seed is the same evidence as a stale loss: the failover starts after ONE connect timeout.
+// RED (the failover waits for the machine to give up): 4 connect timeouts (1.2 s here; 120 s with a 30 s timeout).
+TEST(GroupRoutingRegression, SeedExpiredThenBrokerDiesFailsOverAfterOneUnansweredConnectRegression) {
+    GroupRig r(4311, 4312, failoverOpts());   // connect timeout 300 ms on the duty clock
+    const auto [n1, p1port] = r.addNode(4311);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions  = {{2, 0, 1, 1, 4311, ""}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; })) << "precondition: node 1 is known";
+    ASSERT_EQ(r.client.testSeedFailovers(), 0u);
+
+    r.gw.deadEndpoints.insert(0);   // node 0 hears nothing from here on
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "", r.seedSid, 0);
+    ASSERT_TRUE(r.drive([&] { return r.client.testSessionStateAt(0) != rc::session::SessionState::Connected; }))
+        << "precondition: the seed left Connected on the answer";
+    ASSERT_EQ(r.client.testSeedFailovers(), 0u) << "an answer alone is not a dead broker";
+
+    EXPECT_TRUE(driveFor(r, 700ms, [&] { return r.client.testSeedFailovers() >= 1; }))
+        << "the seed waited for the whole connect budget before it failed over";
+    ASSERT_TRUE(driveFor(r, 5s, [&] {
+        return r.client.testSeedFailovers() >= 1 && r.client.testSessionStateAt(0) == rc::session::SessionState::Connected;
+    })) << "the seed never reconnected";
+    EXPECT_TRUE(rc::agent::ClientAgent::sameEndpoint(r.client.testSeedChannel(), udp(p1port)));
+}
+
 // C1: after the seed moved off its bootstrap node, "no route entry = the seed's
 // broker" must mean where the seed PHYSICALLY is.  The bootstrap node regains the
 // partition's leadership; its records must reach it.

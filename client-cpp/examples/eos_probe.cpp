@@ -276,18 +276,16 @@ void pumpFor(Client& c, int ms) {
 
 void fail(const char* tag, const std::string& msg) { std::fprintf(stderr, "%s: FAIL %s\n", tag, msg.c_str()); }
 
-// #377: a topic's id and partition count are resolved from the broker (GetTopicSchema), not trusted from the
-// RUNE_CLIENT_TOPIC_TABLE: a mismatch fails loudly before any record is written.  So does a broker that cannot
-// describe the topic (a non-zero error code, or a thrown error): a broken broker setup must fail the run (#688).
-bool topicMatchesBroker(Client& c, const char* tag, const char* name, const TopicHandle& t) {
+// #377: a topic's id and partition count are resolved from the broker (the client library's topic lookup), not trusted from
+// the RUNE_CLIENT_TOPIC_TABLE: a mismatch fails loudly before any record is written.  So does a broker that cannot describe
+// the topic (the lookup throws): a broken broker setup must fail the run (#688).  `lookup` returns the broker's handle; rawTopicAndWait reports every broker error
+// code (NotAuthorized too) as a missing topic and counts a 0-partition answer as 1, which still mismatches a table of more.
+template <class Lookup>
+bool topicMatchesBroker(const char* tag, const char* name, const TopicHandle& t, Lookup&& lookup) {
     try {
-        const TopicSchemaResult r = c.getTopicSchemaAndWait(name);
-        if (r.errorCode != 0) {
-            fail(tag, std::string("the broker did not describe '") + name + "' (error " + std::to_string(r.errorCode) + ")");
-            return false;
-        }
-        if (r.topicId != t.topicId || r.partitionCount != t.partitionCount) {   // #688: a broker reporting 0 partitions is a mismatch too
-            fail(tag, std::string(name) + " is topic " + std::to_string(r.topicId) + " with " + std::to_string(r.partitionCount) +
+        const TopicHandle live = lookup();
+        if (live.topicId != t.topicId || live.partitionCount != t.partitionCount) {
+            fail(tag, std::string(name) + " is topic " + std::to_string(live.topicId) + " with " + std::to_string(live.partitionCount) +
                           " partitions on the broker, RUNE_CLIENT_TOPIC_TABLE says topic " + std::to_string(t.topicId) + " with " +
                           std::to_string(t.partitionCount));
             return false;
@@ -771,12 +769,12 @@ int main() {
         }
         if (mode == "fill") {
             c.connectAndWait();
-            if (!topicMatchesBroker(c, "EOS-FILL", "eos_in", in)) return 1;
+            if (!topicMatchesBroker("EOS-FILL", "eos_in", in, [&] { return c.rawTopicAndWait("eos_in"); })) return 1;
             return runFill(c, in, n, timeoutMs);
         }
         if (mode == "verify") {
             c.connectAndWait();
-            if (!topicMatchesBroker(c, "EOS-VERIFY", "eos_out", out)) return 1;
+            if (!topicMatchesBroker("EOS-VERIFY", "eos_out", out, [&] { return c.openTopicAndWait<rune::gen::EosOut>("eos_out").handle(); })) return 1;
             return runVerify(c, out, n);
         }
         if (mode == "pipeline") {

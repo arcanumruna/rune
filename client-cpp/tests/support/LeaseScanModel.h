@@ -134,6 +134,7 @@ public:
     int16_t                 errorCode = 0;                ///< non-zero: answer this many requests with this code (done = 1, no rows)
     int                     errorNext = 0;
     std::set<int32_t>       holdPartitions;               ///< hold the answers of these partitions only
+    int                     rewindNext = 0;               ///< answer this many requests as if they were the FIRST page (a row is delivered twice)
 
     void install() {
         gw_.templateHandlers[static_cast<uint16_t>(rune::protocol::client::TemplateId::ScanLeases)] =
@@ -147,6 +148,7 @@ public:
         holdPartitions.clear();
         onRequest = nullptr;
         errorNext = 0;
+        rewindNext = 0;
     }
     void release() {
         hold = false;
@@ -207,6 +209,11 @@ private:
         ScanSeen s{m->partition, Bytes(m->prefix.begin(), m->prefix.end()), m->resumeHash, m->first == 1, m->maxRows};
         seen.push_back(s);
         if (onRequest) onRequest(s);
+        if (rewindNext > 0) {
+            --rewindNext;
+            s.first      = true;
+            s.resumeHash = 0;
+        }
         rp::ScanLeasesResponse r;
         r.sessionId     = m->sessionId;
         r.correlationId = m->correlationId;

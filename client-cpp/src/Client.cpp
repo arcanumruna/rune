@@ -2971,7 +2971,9 @@ void Client::sweepControl_(int64_t nowNs) {
                              rateLimited ? static_cast<int64_t>(retryAfter) : 0);
             if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(kRefused)); });
         } else {
-            completeConnect_(OpStatus::Timeout, 0, 0, {});
+            // aux = 1: the gateway never answered the ConnectRequest (the seed is still Connecting).  It travels in the completion,
+            // so the waiting app thread reads it from the ring, never from a duty-owned field.
+            completeConnect_(OpStatus::Timeout, 0, 0, {}, agent_.seedMachine().state() == session::SessionState::Connecting ? 1 : 0);
             if (cbError_) {
                 invokeUserCallback_("onError", [&] { cbError_("connect() timed out"); });
             }
@@ -3061,12 +3063,12 @@ void Client::checkBlockingCaller_(const char* what) const {
 
 template <class Issue, class OnDone>
 void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
-                      Issue&& issue, OnDone&& onDone) {
+                      Issue&& issue, OnDone&& onDone, const std::function<std::string()>& waitTimeoutHint) {
     OpResult rejected = OpResult::Accepted;
     switch (andWaitCore_(what, timeout, maxResultBytes, issue, onDone, rejected)) {
     case AndWaitEnd::Done:         return;
     case AndWaitEnd::RingTimedOut: throw std::runtime_error(std::string(what) + ": timed out (command ring full)");
-    case AndWaitEnd::WaitTimedOut: throw std::runtime_error(std::string(what) + ": timed out waiting");
+    case AndWaitEnd::WaitTimedOut: throw std::runtime_error(std::string(what) + ": timed out waiting" + (waitTimeoutHint ? waitTimeoutHint() : std::string()));
     case AndWaitEnd::Closed:       throw std::runtime_error(std::string(what) + ": client closed");
     case AndWaitEnd::Rejected:
         throw std::runtime_error(std::string(what) + ": rejected (OpResult " +
@@ -3240,9 +3242,24 @@ Client::SecurityResult<std::vector<rune::security::RoleRow>> Client::securityRol
 }
 
 void Client::connectAndWait(std::chrono::nanoseconds timeout) {
+    // No answer from the gateway: with a configured response port, name it (the broker must reach it).  A full command ring
+    // sent nothing, and a refusal the broker answered proves the port works: neither gets the hint.
+    const std::string hint = cfg_.gatewayResponseControlPort == 0 ? std::string()
+        : " (gateway response port " + std::to_string(cfg_.gatewayResponseControlPort) + "; the broker must reach it)";
     andWait_("connect()", timeout, 0,
              [&](Completions& q, Token t) { return connect(q, t); },
-             [&](const Completion& c, std::span<const uint8_t> payload) { throwForStatus_("connect()", c, payload); });
+             [&](const Completion& c, std::span<const uint8_t> payload) {
+                 if (c.status == OpStatus::Timeout && !hint.empty() && c.aux != 0) throw std::runtime_error("connect(): timed out" + hint);
+                 throwForStatus_("connect()", c, payload);
+             },
+             [&]() -> std::string {
+                 if (hint.empty()) return {};
+                 try {
+                     if (state() != session::SessionState::Connecting) return {};   // the gateway answered: its port works
+                 } catch (const std::logic_error&) {   // a thread that cannot read the state: say nothing is known, keep the hint
+                 }
+                 return hint;
+             });
 }
 
 Bytes Client::pingAndWait(std::span<const uint8_t> payload, std::chrono::nanoseconds timeout) {
@@ -3901,6 +3918,7 @@ int Client::doWork() {
     // post-close call (e.g. from an app loop that has not yet noticed close()
     // happened).  F8c: "closed" is the command ring's closed bit.
     if (agent_.commandRingClosed()) return 0;
+    ++invokerCycles_;
     return dutyCycle(now());
 }
 
@@ -6402,6 +6420,8 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
         break;
     case detail::HubSubmit::Closed:
     case detail::HubSubmit::Orphaned:  // HandleRelease only — never for a SubscribeAdd
+    case detail::HubSubmit::Applied:   // pause / resume only
+    case detail::HubSubmit::Refused:
         impl->status.abandon();         // never submitted (req freed): born finished
         (void)impl->status.detachProducer();  // C7: no duty side will ever hold it
         break;
@@ -6451,6 +6471,21 @@ void Client::applyHubCommandDirect_(const detail::HubCommand& cmd) {
         return;
     }
     applyHubCommand_(cmd);
+}
+
+bool Client::applySubscriptionPauseDirect_(const detail::HubCommand& cmd) {
+    using Op = detail::HubCommand::Op;
+    if (cmd.handle == 0) return false;
+    syncSeedSession_();
+    const auto snap = agent_.stateAndSessionId();
+    auto& impl      = *reinterpret_cast<SubscriptionImpl*>(cmd.handle);   // the caller's handle holds it for the whole call
+    const auto send = [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+        return agent_.submitSend(fb, fl);
+    };
+    const int64_t corr = nextCorrId_++;   // the Unsubscribe's (pause) / the new Subscribe's (resume) correlation id
+    return cmd.op == Op::SubscribePause
+               ? subscriberHub_.pauseDirect(impl, cmd.a, static_cast<uint32_t>(cmd.b), corr, snap.sessionId, send)
+               : subscriberHub_.resumeDirect(impl, static_cast<uint32_t>(cmd.b), corr, snap.sessionId, now(), send);
 }
 
 detail::SendResult Client::directSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len) {
@@ -7138,13 +7173,15 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
             }
         }
     }
-    if (cmd.op == Op::SubscribeAdd || cmd.op == Op::Unsubscribe) {
+    if (cmd.op == Op::SubscribeAdd || cmd.op == Op::Unsubscribe || cmd.op == Op::SubscribePause ||
+        cmd.op == Op::SubscribeResume) {
         SubscriptionImpl* adopted = nullptr;  // F1: check the adopted impl for an orphaned release
         if (cmd.op == Op::SubscribeAdd && cmd.handle != 0) {
             adopted = reinterpret_cast<subscriber::SubscribeRequest*>(cmd.handle)->impl;
         }
         const auto snap = agent_.stateAndSessionId();
-        const int64_t unsubCorrId = (cmd.op == Op::Unsubscribe) ? nextCorrId_++ : 0;
+        // Unsubscribe / pause: the Unsubscribe's correlation id; resume: the new Subscribe's (hub applyCommand doc).
+        const int64_t unsubCorrId = (cmd.op != Op::SubscribeAdd) ? nextCorrId_++ : 0;
         subscriberHub_.applyCommand(
             cmd, unsubCorrId, snap.sessionId,
             [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
@@ -7198,10 +7235,18 @@ detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubComm
     // be applied to a subscription/consumer the hub does not hold yet.  Not
     // GroupSetCallback (it could replace a running callback): ring order.
     if (onDuty && (cmd.op == Op::SubscribeAdd || cmd.op == Op::GroupAdd ||
-                   cmd.op == Op::Unsubscribe || cmd.op == Op::GroupClose ||
+                   cmd.op == Op::Unsubscribe ||
+                   cmd.op == Op::GroupClose ||
                    cmd.op == Op::GroupCommit)) {
         self->applyHubCommandDirect_(cmd);
         return detail::HubSubmit::Accepted;
+    }
+    // pause / resume: on the duty / owner thread (the Invoker owner included) the hub decides and applies at once and the
+    // verdict goes back to the handle; elsewhere the command is queued below - or, when it asked for "only if applied
+    // directly" (a position above the handle's last snapshot), dropped: that bound is not decidable off the owner thread.
+    if (cmd.op == Op::SubscribePause || cmd.op == Op::SubscribeResume) {
+        if (onDuty) return self->applySubscriptionPauseDirect_(cmd) ? detail::HubSubmit::Applied : detail::HubSubmit::Refused;
+        if (cmd.op == Op::SubscribePause && cmd.c == 1) return detail::HubSubmit::Accepted;
     }
 
     // F8c C2: every submit below is linearized against close() by the command
@@ -7288,6 +7333,8 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
         break;
     case detail::HubSubmit::Closed:
     case detail::HubSubmit::Orphaned:  // HandleRelease only — never for a GroupAdd
+    case detail::HubSubmit::Applied:   // pause / resume only
+    case detail::HubSubmit::Refused:
         impl->status.abandon();               // never submitted: born finished
         (void)impl->status.detachProducer();  // C7: no duty side will ever hold it
         break;
@@ -7898,7 +7945,10 @@ int Client::sendMetadataRequestEverywhere_() noexcept {
 //
 // SeedSteady -> SeedFailingOver when the seed, after having been Live, lost its
 // session to silence (a stale loss NOT caused by the client's own stall — M1:
-// its broker is presumed dead) or gave up reconnecting (Disconnected / Backoff).
+// its broker is presumed dead), left Connected on an answer (SessionExpired /
+// UnknownSession) and then had ONE connect there go unanswered (the broker
+// ended the session and died: no stale loss is counted on that path), or gave
+// up reconnecting (Disconnected / Backoff).
 // Each attempt moves the seed to ONE candidate and connects fresh there; it ends
 // Connected (-> SeedSteady, every in-flight batch re-offered — I1), or fails
 // (Disconnected / Backoff) or runs out its deadline (min(connect timeout,
@@ -7914,6 +7964,11 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
     const uint64_t losses  = m.staleSessionLosses() - m.ownStallLosses();
     const bool     newLoss = losses != seedFailoverLossesSeen_;
     seedFailoverLossesSeen_ = losses;
+    // An unanswered connect of a once-Live seed is the same evidence as a stale loss (only an episode START reads it:
+    // a running episode has its own attempt deadline).
+    const uint64_t unanswered    = m.unansweredConnects();
+    const bool     newUnanswered = unanswered != seedUnansweredSeen_;
+    seedUnansweredSeen_ = unanswered;
     if (auto* f = std::get_if<SeedFailingOver>(&seedFailover_)) [[unlikely]] {
         // PR #476 review: a TLS session is Connected optimistically once the client sent its Finished; only a sealed
         // frame proves the broker holds the keys (its final leg may still fail).  Until then the failover neither ends
@@ -7975,7 +8030,7 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
     // may the seed fail over.
     if (redirectPending()) return 0;
     const bool gaveUp = st == session::SessionState::Disconnected || st == session::SessionState::Backoff;
-    if (!newLoss && !gaveUp) return 0;
+    if (!newLoss && !newUnanswered && !gaveUp) return 0;
     seedFailover_ = SeedFailingOver{};
     if (cfg_.reconnectForeverAfterLive) {
         // I-4: the stale-loss edge re-points at once — the machine's resume (next
@@ -7983,7 +8038,8 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
         // / UnknownSession and the machine connects fresh there: the first move
         // ~responseTimeoutNs after the broker died, not after the whole resume +
         // connect budget.  A gave-up (Backoff) start waits for the odd-entry rule.
-        if (newLoss) (void)startSeedFailoverAttempt_(std::get<SeedFailingOver>(seedFailover_), nowNs, false);
+        if (newLoss || newUnanswered)
+            (void)startSeedFailoverAttempt_(std::get<SeedFailingOver>(seedFailover_), nowNs, false);
         return 1;
     }
     return startSeedFailoverAttempt_(std::get<SeedFailingOver>(seedFailover_), nowNs) ? 1 : 0;

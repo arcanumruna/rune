@@ -5,6 +5,18 @@ semantics exactly", "no lease simply expires … take over a lease? out of spec"
 is to replace what the `discovery` library plus etcd do today, with exact parity". Revision 4 applies the builder
 check (below). Branch read: `origin/main` @ 33de61d9; the key-width facts in §5.1 were re-read at 6f79348.
 
+**Revision 5 follow-ups (Herald prerequisites, 2026-11-11).**
+- **R6** The discovery library is no longer specified here. The discovery repository's `2026-11-11-discovery-on-rune-design.md` is the spec: topic `platform-sys/discovery`, one
+  runtime per process, no watchdog, domain and region as columns. §3, §13, §19.1 and Phase 3 point to it, and the
+  `RuneEndpoint`-per-object description is gone.
+- **R10** A lease TTL is a duration. Rune has no calendar deadline for a lease and will not add one (§5.2).
+- **RQ1** Owner question Q1 is open, not settled (§17). §19 follows the tenant's own `herald.leases.<tag>` topics.
+- **R5** The produce guard also covers a transactional producer's commit (§12.2).
+- **R11 superseded.** R11's producer grants ("a discovery `Producer` needs `READ` and `WRITE`") are superseded (§14.1): the
+  discovery design's producer needs no `READ`.
+- **§19** Herald uses the tenant's own `herald.leases.<tag>` topics for role elections and `herald-sys/herald.elections` only for
+  singletons. There is no `herald.workers` and no `herald.idslots`; epochs come from `herald.epochs`. F3 below is superseded.
+
 **Revision 4 change log (builder-check settlements, Coordinator's call, Herald consistency pass K15 R1–R11, F3,
 B28).** Lease semantics (grant, keepalive, revoke, expiry, the etcd rows of §4) are unchanged; these fix places where
 rev 3 could not be built or could expire early.
@@ -215,49 +227,44 @@ read-your-writes.
 
 ## 3. Discovery parity (primary)
 
-This section maps every public API and behaviour of the `discovery` library onto lease topics. §13 specifies the
-Rune-backed library. Gaps are numbered **DG1–DG9**, and each one has a resolution.
+This section maps every public API and behaviour of the `discovery` library onto lease topics. The Rune-backed library
+itself is specified by the discovery repository's `2026-11-11-discovery-on-rune-design.md` (topic `platform-sys/discovery`, one runtime per process, no watchdog, domain and
+region as columns); §13 only points to it. Where a row below names `RuneEndpoint`, the watchdog or the topic's old name, the
+discovery design wins. Gaps are numbered **DG1–DG9**, and each one has a resolution.
 
 ### 3.1 The discovery topic
 
-One lease topic per deployment namespace, with one partition, so every consumer sees one total order, as etcd gives
-(call):
+One lease topic, `platform-sys/discovery`, with one partition, so every consumer sees one total order, as etcd gives. The
+column layout, the partition and replica settings and the TTL are the discovery design's §6.1; this spec does not copy
+them, so there is one owner.
 
-```sql
-lease topic 'herald-sys/discovery' {
-    path      string(128),   -- <servicePrefix>/<region>/<cluster|_shared>/<serviceName>/<replicaId>/<incarnation>
-    uri       string(128),
-    load      uint32,        -- 0 = not reported
-    mapId     uint64, clusterId uint64, regionId uint64,   -- 0 = absent (ServiceInfo's optionals)
-    holderInfo string(64)
-} partitions 1 replicas 3 key path with (lease.ttl = 15000);
-```
-
-The key is the etcd key path, extended with an `incarnation` segment (DG2). That keeps etcd's prefix layout, so
-`ScanLeases` with a prefix is etcd's prefix `Get` (in hash order, not key order: §8.3). The path is at most 128 bytes,
-the lease-topic key limit (§5.1, Coordinator's call, R1); the incarnation takes 17 of them (`/` plus 16 hex digits),
-and the `Producer` refuses a longer path at construction.
+The key is the etcd key path without the domain and region, extended with an `incarnation` segment (DG2). The domain and the
+region are columns, not key segments: the consumer filters on them (the discovery design, §7.5). `ScanLeases` with a prefix is a
+prefix `Get` over the cluster, service and replica (in hash order, not key order: §8.3). The path is at most 128 bytes,
+the lease-topic key limit (§5.1, Coordinator's call, R1); the incarnation takes 9 of them (`/` plus 8 hex digits, the
+discovery design's §6.2, which leaves 117 for the rest),
+and the `Producer` refuses a longer path (logged, state `Refused`).
 
 ### 3.2 Producer
 
 | `discovery` today (etcd) | Rune-backed library | Gap |
 |---|---|---|
-| `Producer(etcdUrl, servicePrefix, region, ServiceKey identity, leaseTtlSeconds)` | `Producer(RuneEndpoint, servicePrefix, region, identity, leaseTtlSeconds)`. `RuneEndpoint` = bootstrap addresses, namespace, SCRAM credentials. All other arguments are unchanged. | **DG1** |
-| ctor: `leasekeepalive(ttl)` = LeaseGrant plus a KeepAlive thread, retrying 30× with backoff | the ctor connects. The lease is granted with the key at `registerEndpoint`, because the key is the lease; the same 30× retry and backoff apply to connect and grant. In the caller-supplied-client form nothing blocks: connect is the caller's, and the grant with its retries is an async state machine (§13). | **DG4** |
+| `Producer(etcdUrl, servicePrefix, region, ServiceKey identity, leaseTtlSeconds)` | `Producer(Runtime&, servicePrefix, region, identity, leaseTtlSeconds)`. A `Runtime` is one Rune connection and one owner thread per process (the discovery design, §4.1). All other arguments are unchanged. | **DG1** |
+| ctor: `leasekeepalive(ttl)` = LeaseGrant plus a KeepAlive thread, retrying 30× with backoff | the ctor connects. The lease is granted with the key at `registerEndpoint`, because the key is the lease; the same 30× retry and backoff apply to connect and grant. In the caller-driven form nothing blocks: connect is the caller's, and the grant with its retries is an async state machine (the discovery design, §4.2 and §5.6). | **DG4** |
 | keepalive every `max(ttl−1, 1)` s (etcd-cpp `KeepAlive`), errors in `eptr` with no handler | `LeaseSession` keepalive every `ttl/3` (etcd's Go client cadence). Errors reach `onLost` / `onAtRisk`, which the Producer wires to re-registration. | **DG5** (fixes a latent loss: one late keepalive lost the lease) |
 | `registerEndpoint(uri)`: `put(key, uri, leaseId)` | first call: grant (`Put`+`insert`) of row `{path, uri}`. A later call with a new uri is a fenced `Put`+`update` of `uri`, which does not refresh the lease, exactly like etcd's put. | — |
-| key `<servicePrefix>/<region>/<cluster\|_shared>/<serviceName>/<replicaId>` | the same path plus `/<incarnation>`: a 64-bit random id drawn at each grant | **DG2** |
+| key `<servicePrefix>/<region>/<cluster\|_shared>/<serviceName>/<replicaId>` | the same path plus `/<incarnation>`: a random 8-hex-digit id drawn at each grant (the discovery design, §6.2) | **DG2** |
 | restart of the same replicaId within the TTL: the new process's `put` overwrites the key and re-attaches it to the new lease | that would be a takeover, which is out of spec. The new incarnation is a new key, so the grant succeeds at once. Consumers keep the newest live incarnation per `ServiceKey` (§3.3). | **DG2** |
 | `startLoadReporting(uri, loadFn, intervalSec = 5)`: re-put `{"uri","load"}` with the lease every interval; requires `ttl ≥ 2 × interval`; a failed put sets `leaseNeedsReinit` | the same timer issues a fenced `Put`+`update` of `load`. It does not keep the lease alive (etcd: a put does not renew). The `ttl ≥ 2 × interval` check is kept. `kErrLeaseNotFound` sets `leaseNeedsReinit`. | **DG3** (typed columns, not JSON) |
-| watchdog every `ttl/2`: `get(key)`; if missing, `tryReinitializeLease` (a new lease) and `reRegister` | kept: a point read of the lease view (`getViewRowK`) every `ttl/2`; if absent, or on `onLost`, it grants a new incarnation and re-registers | — (superset: `onLost` reacts before the watchdog) |
-| `stop()`: cancel the keepalive, then a blocking `leaserevoke` | cancel the keepalive, then a blocking fenced `Revoke` (the same blocking behaviour as BUG-005). The caller-supplied-client form has `stopAsync()` / `isStopped()` instead (§13). | — |
+| watchdog every `ttl/2`: `get(key)`; if missing, `tryReinitializeLease` (a new lease) and `reRegister` | no watchdog: `onLost` (and the watch's `Revoked` / `Expired` for the held key) grants a new incarnation and re-registers | — (the lease session reacts at once; no poll) |
+| `stop()`: cancel the keepalive, then a blocking `leaserevoke` | cancel the keepalive, then a blocking fenced `Revoke` (the same blocking behaviour as BUG-005). The caller-driven form has `stopAsync()` / `isStopped()` instead (the discovery design, §4.2). | — |
 | `~Producer()` calls `stop()` | the same | — |
 
 ### 3.3 Consumer
 
 | `discovery` today | Rune-backed library | Gap |
 |---|---|---|
-| `Consumer::create(etcdUrl, servicePrefix, region, filters, ServiceCache&)` → `shared_ptr` | `Consumer::create(RuneEndpoint, servicePrefix, region, filters, ServiceCache&)` | **DG1** |
+| `Consumer::create(etcdUrl, servicePrefix, region, filters, ServiceCache&)` → `shared_ptr` | `Consumer::create(Runtime&, servicePrefix, region, filters, ServiceCache&)` | **DG1** |
 | `run()`: for each filter, `ls(prefix)` (`prefix = regionPrefix + filter.toWatchPath()`; empty = the whole region), `handlePut` per entry, then `watchPrefix(prefix, index + 1)` | `run()`: one `LeaseWatch::startFromNow` over the topic with every filter's prefix: a `ScanLeases(prefix)` per distinct prefix (paged, with `asOfOffset`), then one subscription to the topic's partition from the minimum `asOf`, merged by the exact handoff rule (§12.4, including the multi-prefix merge). Events whose path does not match a filter are dropped client-side. | **DG7** |
 | watch re-armed from `modified_index + 1`; empty event batches throttled by 250 ms; on error, re-initialise after 1 s | the subscription is push, so there are no empty batches and no throttle. On any break (disconnect, `NotLeader`, a resume failure), the consumer re-initialises after 1 s with the same scan + subscribe, as today. | — |
 | PUT → `handlePut`: parse the key into a `ServiceKey`, apply the filter, parse the value (a plain uri or JSON `{uri, load, mapId, clusterId, regionId}`), update the cache | `Granted` / `Updated` → the same `handlePut` path. The `ServiceInfo` fields come from typed columns. `parseRegistrationValue` stays public for compatibility and tests. | **DG3** |
@@ -285,7 +292,7 @@ uses the library differently; §19.1 describes that use (Coordinator's call, R10
 
 | Legacy Herald today | After the switch |
 |---|---|
-| `Producer{DISCO_URL, …, ServiceKey{serviceDomain, "CHAT_SERVICE", serviceName}, DISCO_LEASE_TTL_SECONDS}` and `registerEndpoint("ws://host:s2sPort/server")` | the same calls with a `RuneEndpoint` from `RUNE_BOOTSTRAP`, `RUNE_NAMESPACE` and credentials from the environment |
+| `Producer{DISCO_URL, …, ServiceKey{serviceDomain, "CHAT_SERVICE", serviceName}, DISCO_LEASE_TTL_SECONDS}` and `registerEndpoint("ws://host:s2sPort/server")` | the same calls on a `Runtime` built from the discovery design's environment variables (bootstrap, principal and password come from the environment) |
 | `Consumer::create(…, {sharedService("COORDINATOR_SERVICE")}, cache)`, `setAuthToken(serviceJwt)`, `run()` | the same |
 | `ChatAsyncServerChannel`: `sendToSharedExact`, falling back to `sendSharedLeastLoaded` | unchanged |
 | environment `DISCO_URL`, `SERVICE_DOMAIN`, `LOCATION` | `DISCO_URL` is replaced (DG1); the other two are unchanged |
@@ -296,7 +303,7 @@ Herald uses no etcd transactions, TimeToLive, Mutex or Election today.
 
 | # | Gap | Resolution |
 |---|---|---|
-| DG1 | etcd URL → a Rune connection | `RuneEndpoint{bootstrap, namespace, credentials}`. Credentials come from the environment, never the repo. This is the one API change. |
+| DG1 | etcd URL → a Rune connection | a `Runtime` (one per process) built from a `RuntimeConfig`; credentials come from the environment, never the repo. The discovery design (§4.1) owns the exact API. |
 | DG2 | no takeover, so a restart within the TTL cannot overwrite its own old key | an incarnation segment in the key; the consumer keeps the newest live incarnation per `ServiceKey`. Observable behaviour matches etcd: the restarted replica is visible at once, and only one entry per `ServiceKey` is in the cache. A zombie old process that still keeps alive is shadowed by the newer one, as etcd's overwrite shadowed it. |
 | DG3 | a JSON value → typed columns | the Producer writes columns. `parseRegistrationValue` stays for tests and for mixed-transport migration. |
 | DG4 | etcd grants a lease before any key; here the key is the lease | not observable: a Producer's lease exists only to carry its one key |
@@ -398,7 +405,7 @@ lease topic <name> { <field> <type>, ... } [ partitions <n> ] [ replicas <r> ] k
   | `VerdictSource.cpp:155` (`addVerdictView`, key index) | throws above 16 bytes | accept up to 128 for `LeaseIndex` (member 0); `Member::keyWidth` is a `uint8_t`, fine |
   | client `Key::kMaxInline = 16` (`Key.h:39`), the producer ring's `SEND_RECORD` layout (`ProducerImpl.h:132-138`: a 16-byte inline key slot, value at byte 38), `TypedTopic`'s static asserts, `Client.cpp:58` | a record key is at most 16 bytes on the client | `LeaseTopic` writes need a second, lease-only `SEND_RECORD` form whose key slot is 128 bytes (selected per topic at open; fixed-size, no heap). Non-lease sends keep today's layout and cost. |
   | `ViewTable` (`ViewTable.cpp:86`, `keyWidth ≤ kMaxViewKeyBytes`), `kMaxViewKeyBytes = 128` (`ViewKeyEncoding.h:16`), `ViewKeyBuilder.cpp:60` | already 128 | none |
-  | `getViewRowK` `kMaxKeyBytes = 128` (`DataMessages.h:969`), the gateway's tail buffer (`ClientGateway.cpp:10836`) | already 128 | none: the watchdog's point read fits |
+  | `getViewRowK` `kMaxKeyBytes = 128` (`DataMessages.h:969`), the gateway's tail buffer (`ClientGateway.cpp:10836`) | already 128 | none: a point read fits |
   | the stored record format (varint key length, `RecordBatch`), the cleaner's `OffsetMap` (`string_view` keys), `partitionForKey(bytes)` | width-free | none |
   | `ScanLeases` prefix | 0–127 bytes | none |
 
@@ -418,6 +425,7 @@ lease topic <name> { <field> <type>, ... } [ partitions <n> ] [ replicas <r> ] k
 | `lease.expiry_batch` | 1–4096 `Expire` records per partition per duty cycle | 256 | no |
 
 - **The TTL is fixed at grant.** This is etcd's rule: a lease's TTL never changes after grant.
+  - A lease TTL is a duration. Rune has no calendar deadline for a lease and will not add one.
   - Every record carries `lease_ttl_ms`. The write hook writes the raised value into the grant (§6.4), so arming
     always uses the TTL in the log, never a catalog value.
   - An alter of `min_ttl` or `max_ttl` changes only the checks on new grants. A live lease keeps its TTL until it
@@ -1016,8 +1024,8 @@ None of these can stop expiry:
 ## 11. Rune QL and CLI
 
 ```sql
-show leases 'herald-sys/discovery';                                   -- ScanLeases, every partition, limit 100
-show leases 'herald-sys/discovery' where path like 'herald/eu/_shared/COORDINATOR_SERVICE/%';   -- prefix scan
+show leases 'platform-sys/discovery';                                 -- ScanLeases, every partition, limit 100
+show leases 'platform-sys/discovery' where path like '_shared/COORDINATOR_SERVICE/%';   -- prefix scan
 show lease 'acme/herald.safety.case-claims' key 7;                    -- LeaseTimeToLive: granted, remaining, version
 revoke lease 'acme/herald.safety.case-claims' key 7;                  -- reads the version, then a fenced Revoke
 show topic 'acme/herald.safety.case-claims';                          -- lease settings and the live count
@@ -1117,8 +1125,8 @@ graces.grant(gen::DeleteGrace{.nsId = ns}, LeaseOptions{.ttl = 7 * 24h, .holder 
 ### 12.2 `LeaseSession<Capacity, OnLost, OnAtRisk>` (etcd `concurrency.Session`)
 
 **Untyped and multi-topic (Coordinator's call, R7).** A preallocated, fixed-capacity set of leases on **one** client
-that one thread keeps alive, driven by `doWork(nowNs)` (the Invoker pattern). Herald keeps election keys
-(`herald.elections`, 1 partition) and worker slots (`herald.workers`, 8 partitions) in one session. A process may
+that one thread keeps alive, driven by `doWork(nowNs)` (the Invoker pattern). Herald keeps its election keys
+(a role's `herald.leases.<tag>`, or `herald.elections` for singletons, 1 partition each) in one session. A process may
 hold one session per client, for example one per tenant client for case claims (Herald F19).
 - **`add(topic, partition, keyBytes, version, ttlMs) → LeaseRef`** takes over keepalives for a lease this client
   granted. `keyBytes` is at most 128 bytes (§5.1). `remove(ref)` stops keeping it alive without a revoke.
@@ -1146,7 +1154,7 @@ hold one session per client, for example one per tenant client for case claims (
     (`NotLeader`, `Throttled`, `NamespaceSuspended`), a timeout or missing reply, a disconnect, or a long park.
   - **Not terminal.** The session keeps sending keepalives. An `Ok` before `M` fires `Cleared`, and the lease was held
     throughout. If no `Ok` comes by `M`, `onLost` follows. `Entered` fires at most once per episode.
-  - **Produce deadline (R5).** A producer can be bound to a lease (`ProducerOptions.guard = ref`, up to 8 producers
+  - **Produce deadline (R5).** A producer can be bound to a lease (`LeaseSession::bindProducer(ref, producer)`, up to 8 producers
     per lease, on the session's client).
     - At `Entered`, before the callback runs, the client fails every **pending** produce of the bound producers with
       `OpStatus::DeliveryFailed` and `errorCode = LeaseAtRisk`. A pending produce was sent and is not acked, so its
@@ -1154,6 +1162,19 @@ hold one session per client, for example one per tenant client for case claims (
       produce the same way; those were never sent.
     - From then on the client never sends or re-sends anything for those producers (no reconnect retry) until
       `Cleared`.
+    - **A transactional producer's commit is guarded too (Herald prerequisites, Task 4).** While the guard blocks, a record is
+      refused and completes `DeliveryFailed` / `LeaseAtRisk`. Inside an open transaction the refusal also poisons the
+      transaction: it becomes `AbortableError` and the commit cannot succeed.
+
+      | Moment | Transaction state | Result |
+      |---|---|---|
+      | guard trips, ends, or the bind is refused | open, records acked or not | `AbortableError`; unacked records complete `DeliveryFailed` / `LeaseAtRisk` |
+      | same | committing, `EndTxn` not sent yet | the commit completes `DeliveryFailed` / `LeaseAtRisk`; `AbortableError` |
+      | same | committing, `EndTxn` sent (also a re-send) | unchanged: the commit was sent inside the lease and its answer decides; a re-send is never blocked |
+      | same | aborting, ready, `AbortableError`, `FatalError` | unchanged |
+      | `commitTransaction` or `sendOffsetsToTransaction` issued while blocked | open | no `EndTxn(commit)` and no offsets frame; completes `DeliveryFailed` / `LeaseAtRisk`; `AbortableError` |
+      | `abortTransaction` while blocked | any | allowed: `EndTxn(abort)` is sent |
+      | after `Cleared` (re-armed) | ready after the abort | a new transaction works |
     - So every write of a guarded producer that can reach the log was sent before `Entered`, and is appended by
       `Entered + d < M`, which is before the key can expire. Herald 02 §4.3 relies on this.
     - `onLost` does the same if it comes first.
@@ -1265,7 +1286,7 @@ lock, and takes no lock in the client or the broker. Every operation is async
   - **`observe()`** reports each change of the lowest, from the watch.
   - At-risk behaviour is in §12.2.
 - **A single-slot lock.** A key that is the lock itself, with no waiters (`acquire slot` → `KeyExists`), is etcd's
-  `TryLock` with no queue. Herald's fenced workers use that form (§19.4).
+  `TryLock` with no queue. Herald no longer uses it (§19.4).
 
 **As built (Task 20).** `LeaseOwnership` and `LeaseElection` are thin front ends over `detail::LeaseRecipeCore` (`client-cpp/src/lease/LeaseRecipe.cpp`), driven by a `LeaseRecipeHost<Capacity>` that owns the slot table and is fed `doWork`, `onLost` and `onAtRisk` by the caller. Key bytes: `name/<holderId 16 hex>-<campaignNo 8 hex>` zero-padded to the key column `string(N)`, so a name is at most N-26 bytes; the holder id is per `LeaseSession`, so competing participants (two processes in production) use separate sessions and watches. A completion target may be a handler in either client mode, but a `Completions` queue only in Invoker mode (the queue is single-producer; in Thread mode the duty thread would be a second producer), otherwise `InvalidArgument`. An unknown grant outcome (`VerdictUnknown`) reads the key from the lease view: it adopts the key when the holder matches, otherwise re-grants with `campaignNo+1`, at most 8 times. A waiter re-evaluates only when exactly its predecessor ends (etcd `waitDeletes`). Release completes when `stateOf(ref)==Free` or on `onLost`. Batch F fix round: the campaign number is drawn from the HOST's counter (key = `name/<holderId>-<campaign number, unique per host>`), so a stale answer never reaches a recipe attached later at the same index. When the shared watch fails (terminally) or is destroyed, every recipe bound to it ends: a pending claim completes `DeliveryFailed` + `ClientErrorCode::LeaseWatchFailed` (0xFF05), a held lease is revoked and `lost` runs once with `LostReason::WatchFailed`, and the recipe is `invalid()` (recreate the watch and the recipes). A host destroyed before its recipes revokes the leases they hold (`hostGone`). Destroying a recipe while its grant is in flight keeps crash semantics (the lease ends at its TTL); `release()` on a campaign in flight abandons it and an unknown grant outcome is read and revoked when it landed. A refused `claim` / `proclaim` never overwrites the stored row. A grant or read that cannot be sent (BackPressured / QueueFull) moves the recipe to a `Retrying` state that `host.doWork` re-sends; it does not count against the 8 re-grants. Verified by `LeaseRecipeRegression.*` (stub), `LeaseRecipeBrokerRegression` (one node, Thread mode), `LeaseRecipeTrioRegression` (leader kill) and the ELECTION leg of `lease-e2e.sh` (not yet run on the Linux box).
 
@@ -1339,59 +1360,18 @@ lock, and takes no lock in the client or the broker. Every operation is async
 
 ## 13. The Rune-backed discovery library (deliverable)
 
-- **Where it lives.** In the `discovery` repository, as a second transport beside etcd (call). Herald switches by
-  build option and configuration, and the etcd transport stays until Herald's cutover is green.
-  - The public types and method names are those of §3: `Producer`, `Consumer`, `ServiceCache` and the rest.
-  - Only the first constructor / `create` argument changes, `etcdUrl` → `RuneEndpoint` (DG1), plus the
-    caller-supplied client overload below.
-- **How it works.** It uses the Rune C++ client (`client-cpp`), which supplies `LeaseTopic`, `LeaseSession`,
-  `LeaseWatch` and `ScanLeases`.
-  - Given a `RuneEndpoint`, the library creates its own client and runs it on its own thread under the client's
-    poll model.
-  - Events go to the existing `ServiceCache` through its existing `update` / `remove` calls, so the cache's
-    concurrency is unchanged.
-- **Caller-supplied client (proposed change, from Herald spec 02 §12.4; Coordinator's call, for owner review;
-  made buildable in rev 4, R6).** `create` also accepts an existing Rune `Client` that the caller already drives.
-  - **No thread, no blocking.** The library creates no client and runs no thread of its own. It exposes a
-    `doWork(nowNs)` agent that the caller polls from the loop that drives the client. Today's blocking steps become
-    async state machines inside `doWork`, built on §12.1's completions:
-    - the constructor's 30× retry with backoff (now a retry state with a deadline on `nowNs`);
-    - the grant and re-registration;
-    - the load-report update;
-    - the watchdog's point read (an async `get`);
-    - the Consumer's scan and subscribe (`LeaseWatch::startFromNow`);
-    - `stop()`'s revoke.
-  - **Its own session.** The library owns its **own** `LeaseSession` and `LeaseWatch` on the supplied client, and
-    keeps no reference to any session of the caller's. The caller's other sessions on the same client are unaffected
-    (§12.2).
-  - **Stop.** `stopAsync()` starts the stop: it cancels keepalives, revokes the registration fenced, and closes the
-    subscription. `isStopped()` turns true when every step has completed or timed out. Destroying the library before
-    `isStopped()` is a precondition violation, and debug builds assert on it. The `RuneEndpoint` form keeps today's
-    blocking `stop()` and `~Producer()`.
-  - **Lifetime.** The client must outlive the library. The caller stops the library (`stopAsync()`, then poll until
-    `isStopped()`) before it closes the client.
-  - **Login and grants.** The client must already be logged in to the discovery topic's namespace with that topic's
-    grants (§14.1). The library never logs in or out on it.
-  - Events still reach `ServiceCache` through `update` / `remove`, so the cache's concurrency is unchanged.
-  - **Why.** A Herald process already runs a Rune client on its RuneAgent thread, so it needs no second client,
-    thread or session for discovery. The `RuneEndpoint` form stays for processes with no Rune client (the legacy game
-    services).
-  - **Tests.** The `DiscoveryIntegrationTest` suite runs in both forms. In the caller-supplied form, a test asserts
-    that no call blocks: a stub transport that never answers, with a hard `doWork` iteration cap.
-- **Behaviour.** It implements exactly the §3 tables: the incarnation key and newest-incarnation selection (DG2),
-  typed values (DG3), the `ttl/3` keepalive (DG5), `onLost` re-registration (DG6), the watchdog point read, fenced
-  load-report updates, a blocking revoke in `stop()`, and re-scan on every subscription break.
-- **Provisioning.** It needs one lease topic per deployment namespace (§3.1). The library does not create the topic:
-  the operator's DDL does, as an etcd cluster is provisioned today.
-- **Tests.** The library's `DiscoveryIntegrationTest` suite runs unchanged against a real Rune broker in place of the
-  docker etcd. That covers `ProducerKeepsLeaseAlive`, `LeaseRecovery_*`, `PassiveMode_*`, `Stress`, round-robin and
-  least-loaded.
-  - New cases cover: restart within the TTL (DG2), a lost lease mid-load-report, a partition-leader failover during
-    registration, and a consumer that started from a compacted log.
-- **Herald cutover.** It is a Herald task.
-  - **The legacy chat server** (§3.5): `main.cpp` builds a `RuneEndpoint` from the environment, and nothing else
-    changes.
-  - **The Herald 02 runtime** (§19.1): it uses the caller-supplied-client form on its RuneAgent thread.
+The library is specified by the discovery repository's `2026-11-11-discovery-on-rune-design.md`. This spec no longer describes it. In short:
+- **Where it lives.** In the `discovery` repository, behind the existing public API (`Producer`, `Consumer`, `ServiceCache`
+  and the rest). The etcd transport goes away.
+- **Topic.** One lease topic, `platform-sys/discovery` (§3.1). The library does not create it: the operator's DDL does.
+- **One runtime per process.** A `Runtime` owns the connection, the one owner thread (or, in the caller-driven form, a
+  `doWork(nowNs)` agent on a client the caller drives) and one `LeaseSession` and `LeaseWatch`. The old per-object
+  `RuneEndpoint` form is gone.
+- **No watchdog.** Re-registration is driven by `onLost` and by the watch (§3.2).
+- **Domain and region** are columns of the row, not key segments (§3.1).
+- **What Rune provides.** `LeaseTopic`, `LeaseSession`, `LeaseWatch` (with `closeAsync`, `restart` and the `Confirmed` / `RerunBegin` /
+  `RerunEnd` events, §12.4), the produce guard (§12.2) and `ScanLeases`.
+- **Cutover.** It is a Herald task (§19.1).
 
 ## 14. Security, namespaces and limits
 
@@ -1402,11 +1382,7 @@ lock, and takes no lock in the client or the broker. Every operation is async
 | grant, update, revoke, `LeaseKeepAlive` | `WRITE` on the topic |
 | `getViewRow`, `ScanLeases`, `LeaseTimeToLive`, `show lease(s)`, subscribe | `READ` on the topic |
 | `Expire`, `Checkpoint` | nobody: broker only |
-| a discovery `Producer` | `WRITE` **and** `READ` on the discovery topic: its watchdog reads the lease view with `getViewRowK` (R11) |
-| a discovery `Consumer` | `READ` |
-
-Herald 02 gives `herald-pool`, the Wardstone sidecar's principal, `READ` as well as `WRITE` on `herald-sys/discovery`
-(R11).
+| a discovery runtime | on `platform-sys/discovery`: `WRITE` for a principal that only registers, `READ` for one that only watches, both for one that does both (discovery design §8). Herald: `platform-sys/herald-<role>` has `READ`, `WRITE`; the Wardstone sidecar `platform-sys/wardstone` has `WRITE` |
 
 Lease view reads need `READ` on the topic; a `VIEW` grant on `<t>.leases` is not consulted (one rule: the gateway
 authorises a read of a lease view as `READ` on its source topic, and a foreign namespace answers exactly like a missing id).
@@ -1704,23 +1680,24 @@ worker's own fail-closed rule, a write state, not a logged constraint set). See 
 - `ProduceBench` and the replication bench on a non-lease topic, ABAB against tip, unchanged.
 - Benchmarks are tracked as issues while there is no bench box, and the PR says so.
 
-## 17. Owner question (settled)
+## 17. Owner question (open)
 
-**Q1. A Rune principal that works in many namespaces (Herald D12). Settled: option A (Herald 00 D12, owner
-delegated; Coordinator's call).** Herald opens one Rune session per tenant namespace per Herald role
-(`<ns>/herald-gateway`, `<ns>/herald-moderation`, `<ns>/herald-audit`, `<ns>/herald-safety`), each holding only that
+**Q1. A Rune principal that works in many namespaces (Herald D12). Open (RQ1).** Herald builds so that either option
+works (Herald 02 §3.2); Herald 00 D12 proposed option A, and the owner has not settled it. Under option A, Herald opens one
+Rune session per tenant namespace per Herald role
+(`<ns>/herald-core`, `<ns>/herald-moderation`, `<ns>/herald-safety`, `<ns>/herald-audit`, `<ns>/herald-worker`; Herald 02 §3.2, §4.2), each holding only that
 role's grants, and `herald-sys` has the same per-role users. A process opens a tenant session only while it works
-for that tenant: a gateway for the tenants it is active for, a fenced worker for the slots it holds. Only the
+for that tenant: a gateway for the tenants it is active for, a role's active instance for its election. Only the
 provisioning singleton holds cluster-admin credentials, for namespace DDL and users, never for data. Option B is not
-built: Rune has no account level above namespaces (namespaces spec §1, §2). Nothing in this spec changes: lease
-topics are reached through ordinary sessions, and §19.4 stands. The analysis is kept below.
+built today: Rune has no account level above namespaces (namespaces spec §1, §2). Nothing in this spec depends on the answer:
+lease topics are reached through ordinary sessions, and §19 holds under either option. The analysis is kept below.
 
-| | A: a per-tenant principal (chosen; per role, as above) | B: a Rune "namespace service" role (not built) |
+| | A: a per-tenant principal (per role, as above) | B: a Rune "namespace service" role (not built) |
 |---|---|---|
 | Rune change | none | a security-model change: a cluster admin grants the role named operations on a list of namespaces, each grant audited in `__security`, with adversarial tests for escalation through the role |
 | Herald cost | about 1 000 Rune sessions per Herald process (connections, SCRAM logins, per-session memory), and credential provisioning per tenant | one session per process |
 | Isolation | unchanged: a session only ever sees its own namespace | one credential can reach every listed namespace, so its compromise reaches them all |
-| Lease topics | §19.4 as written | the same topics, reached through one session |
+| Lease topics | §19 as written | the same topics, reached through one session |
 
 (Also tracked in Herald spec 02.)
 
@@ -1739,10 +1716,10 @@ topics are reached through ordinary sessions, and §19.4 stands. The analysis is
 
 | Herald use | Lease topic | Section |
 |---|---|---|
-| service registration, cache and watch, replica selection | `herald-sys/discovery` via the Rune-backed `discovery` library | §3, §19.1 |
-| leadership (the tenant lease, singletons) | `LeaseElection` on `herald-sys/herald.elections` | §19.2 |
+| service registration, cache and watch, replica selection | `platform-sys/discovery` via the Rune-backed `discovery` library | §3, §19.1 |
+| leadership (a role's active instance per tenant; singletons) | `LeaseElection` on the tenant's `herald.leases.<tag>`; singletons on `herald-sys/herald.elections` | §19.2 |
 | presence | none: `<tenant>/herald.presence` is a plain compacted topic fenced by the tenant epoch | §19.3 |
-| worker fencing | `herald-sys/herald.workers` single-slot locks | §19.4 |
+| worker fencing | none: the role's election token and `herald.epochs` | §19.4 |
 | auto-dissolve | none: the tenant's active instance, in memory, from `emptySinceNs` | §19.5 |
 | deadlines with an expiry event (sanction and strike expiry, appeal tokens, the tenant delete grace) | one-shot long leases with checkpoints | §19.6 |
 | short holds (invites, case claims, rate limits) | short leases, no checkpoints | §19.6 |
@@ -1753,35 +1730,40 @@ worker; friend requests are one (§19.6). Herald spec 02 chooses per object.
 
 ### 19.1 Discovery
 
-Two users, both on `herald-sys/discovery` (Coordinator's call, R10):
-- **The legacy chat server** is §3.5: chat servers are `Producer`s, and the coordinator lookup is a `Consumer` with
-  `sharedService("COORDINATOR_SERVICE")`. This is the parity target.
-- **The Herald 02 runtime** (Herald 02 §8.1, §8.4):
-  - **Producers.** Every Herald process is a `Producer` at
-    `herald/<region>/_shared/<SERVICE>/<podName>/<incarnation>`. The services are `HERALD_GATEWAY` (its uri is the
-    pod's route), `HERALD_WORKER`, `HERALD_MODERATION`, `HERALD_AUDIT`, `HERALD_SAFETY` and `HERALD_PROVISIONER`.
-    Gateways report their session count as `load` every 5 s.
-  - **Consumers, all passive** (the library opens no connections):
-    - gateways watch `HERALD_GATEWAY` and the Wardstone pools of their tenants (`sharedService("wardstone-<poolId>")`);
-    - each worker-type process watches its own deployment, for rendezvous assignment.
-  - **One client.** Each process uses the caller-supplied-client form (§13) on its RuneAgent thread. It runs no
-    library thread and no second client. The library owns its own `LeaseSession` and `LeaseWatch` on that client.
-  - **The `herald-pool` sidecar.** Each Wardstone instance runs a small registration sidecar, a `Producer` as the
-    `herald-sys/herald-pool` principal, at `herald/<region>/_shared/wardstone-<poolId>/<instanceNo>/<incarnation>`. It
-    uses the `RuneEndpoint` form and holds `READ` + `WRITE` on discovery (§14.1).
-  - **Load.** A few hundred registrations, with keepalives every 5 s, which is trivial. Every path fits in 128 bytes.
+Two users, both on `platform-sys/discovery`. The library is specified by the discovery repository's
+`2026-11-11-discovery-on-rune-design.md`; its §10 and Herald 02 §4.5 own what follows, and this section only repeats it.
+- **The legacy chat server** is §3.5 (the parity target).
+- **The Herald 02 runtime** (Herald 02 §4.5; discovery design §10):
+  - **Keys** (`cluster/service/replica`, plus the library's incarnation): every process registers
+    `herald-<group>/<role>/<podName>`; the active instance of a tenant's role also registers
+    `herald-<group>/<role>-t-<nsId>/<podName>` while it holds that tenant's election. `<role>` is `core`,
+    `moderation`, `safety`, `audit`, `worker` or `provisioner` (`herald-sys/provisioner/<podName>`; here
+    `herald-sys` is a discovery cluster name). Domain `herald` and the pod's region are columns, not key parts.
+  - **Readers** use `ServiceView`s polled in each agent's duty cycle; the library opens no connections for them.
+    Discovery is for finding, never for fencing: the election of §19.2 decides who is active.
+  - **Runtime.** The caller-driven form on the Rune agent thread, on a second client logged in as
+    `platform-sys/herald-<role>` (a session's namespace is fixed at login). The runtime owns its own `LeaseSession` and
+    `LeaseWatch` on that client.
+  - **Wardstone pools.** `_shared/wardstone-<poolId>/<instanceNo>`, registered by the pool's sidecar on the managed
+    runtime as `platform-sys/wardstone` (discovery design §10).
+  - **Size.** The longest key is 95 bytes of the 117 the library allows.
 
 ### 19.2 Leadership
 
 ```sql
+lease topic '<tenant>/herald.leases.<tag>' { path string(64), value string(64) }
+      partitions 1 replicas 3 key path with (lease.ttl = 10000);   -- one per role: core, mod, saf, aud, wrk
 lease topic 'herald-sys/herald.elections' { path string(96), value string(64) }
-      partitions 1 replicas 3 key path with (lease.ttl = 10000);
+      partitions 1 replicas 3 key path with (lease.ttl = 10000);   -- singletons only
 ```
 
-- **Names.** Herald 02 uses `tenant/<nsId>` (the tenant lease: one active instance per tenant) and
-  `singleton/<role>`. Every gateway watches the whole topic with **one** `LeaseWatch` shared by all its elections
-  (§12.3), about 2 000 per gateway.
-- **Electing a leader.** `LeaseElection(session, watch, "singleton/transparency-schedule").campaign(podName)` runs on
+- **Role elections use the tenant's own topics.** A role's active instance per tenant is elected on that tenant's
+  `herald.leases.<tag>`, so a role's credential can neither campaign on nor revoke another role's leader (grants are per
+  topic). Herald 02 §4.2 owns the layout.
+- **`herald-sys/herald.elections` is only for singletons** (`singleton/<name>`; Herald 02 §8.4 lists `provisioner`, `ingress-gen`, `jwks-refresh` and `metering-rollup`).
+- **Epochs.** The epoch of a role comes from `herald.epochs` (a compacted topic, Herald 02 §5.1), not from a lease topic of
+  its own. There is no `herald.workers` and no `herald.idslots`.
+- **Electing a leader.** `LeaseElection(session, watch, "singleton/metering-rollup").campaign(podName)` (or the role's path on its tenant topic) runs on
   each candidate. The leader works with `token()` as its fencing token, stamped into every row it writes.
 - **Stepping down.** On `onAtRisk(Entered)` it stops at once. The client fails the pending produces of its guarded
   producers (§12.2, R5). Herald then revokes and campaigns with a new key (Herald F1).
@@ -1797,47 +1779,21 @@ Herald presence uses no lease (Coordinator's call, from Herald spec 02 §12.4 an
   a row on every change. Viewers get updates from that map, never from Rune.
 - **The topic.** `<tenant>/herald.presence` is a plain compacted topic keyed `actorId`, row
   `{status, epoch, sinceNs, activity, attrs}`. Herald spec 02 owns the layout.
-- **Epoch fencing.** `epoch` is the tenant epoch: the `lease_version` of the tenant's election key (§19.2). A row is
-  live only if its `epoch` equals the current one, and a row from an older epoch reads as `offline`. When the active
-  instance dies, every actor it served reads as offline as soon as the standby wins.
+- **Epoch fencing.** `epoch` is the core role's `epochNo` from `<tenant>/herald.epochs` (Herald 02 §5.1), bumped when a
+  new instance becomes active. A row is live only if its `epoch` equals the current `herald.epochs[core]` (Herald 02
+  §7.4); a row from an older epoch reads as `offline`.
 - **What goes away.** Per-session presence leases, their keepalives, the home cell and `herald.presence.changes`
   (revision 3's earlier draft). Presence needs only the election from this spec.
 
 ### 19.4 Worker fencing
 
-```sql
-lease topic 'herald-sys/herald.workers' { slot uint64, tenant string(64), role uint16, holderInfo string(64) }
-      partitions 8 replicas 3 key slot with (lease.ttl = 10000);
-create topic 'herald-sys/herald.idslots' { id string(16), slot uint64, epoch int64, highWater uint64, fencingToken int64 }
-      partitions 1 replicas 3 key id with (key.index = on);   -- id = slot (u64 big-endian) ‖ epoch (i64 big-endian)
-create view 'herald-sys/herald.idslots_by_slot' key (slot, epoch) as select highWater, fencingToken
-      from 'herald-sys/herald.idslots';                         -- scan by slot (Herald 02 owns the name)
-```
-
-- **The slot and the lock (Herald's formula, B28; Coordinator's call, R10).** `slot = nsId << 16 | roleId`, with
-  `roleId = role << 8 | partition` (up to 256 partitions per role). The `role → u8` table lives in Herald 02. Rune
-  never reuses an `nsId`. Each Herald process `grant`s the
-  slots rendezvous hashing assigns it. This is a single-slot claim (etcd `TryLock`, §12.3), where `KeyExists` means
-  someone holds it.
-- **Fencing writes.** The worker writes with `version` as its fencing token.
-- **Handing a slot back.** On a membership change it hands the slot back with a fenced revoke, so the next owner
-  grants at once.
-- **Minted ids stay unique (doc 00 §13 "Minted ids"; Coordinator's call, F3).**
-  - **One row per minter and epoch.** `herald.idslots` is keyed `(slot, epoch)`.
-    - The tenant's active instance uses `slot = nsId << 16` (roleId 0, which no worker uses). Its `epoch` is the
-      tenant epoch (§19.2).
-    - A fenced worker that mints uses its own `herald.workers` slot (`nsId << 16 | roleId`). Its `epoch` is the
-      worker's `lease_version`. Worker-minted ids set the top bit, so they never meet the active instance's ids.
-    - The value column `fencingToken` is the epoch the row was written under, so a reader checks a row without
-      decoding the key.
-  - **Starting.** A new minter scans `idslots_by_slot` for its slot, starting above the largest `highWater` over
-    every row of that slot. It then inserts its own row `(slot, epoch)`, which is always new.
-  - **Reserving.** It advances its own row's `highWater` with checked `update`s, and never mints past it.
-  - **A stale minter** can only touch its own `(slot, oldEpoch)` row, so it can never lower or overwrite the new
-    minter's. Herald 02 §5.2 gives the argument that every id the old minter used is below the new floor.
-  - **Where it lives.** A plain keyed topic, not the lease row, because a lease row is deleted when the lease ends.
-    Old epochs' rows are swept by Herald.
-- **Scale.** 4 000 slots kept alive at 3.3 s is about 1 200 keepalive entries/s.
+Herald has no worker-slot lease topic and no `herald.idslots` (Herald 02 §5.1, §6.3, §8.4).
+- **Who holds what.** The active instance of each role per tenant holds that role's election lease (§19.2). It fences its
+  writes with the lease `version` (the election token, §7.3).
+- **Minted ids.** A minter's epoch is the role's row in `herald.epochs` (Herald 02 §5.1), bumped in a transaction with the
+  role's claim row. The old `(slot, epoch)` rows of `herald.idslots` are gone.
+- **Why no slot locks.** Rendezvous assignment of worker slots is not used; one active instance per tenant and role is the unit
+  of ownership (Herald D16).
 
 ### 19.5 Auto-dissolve
 
@@ -1889,8 +1845,8 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 |---|---|---|
 | 1 | a payload of at least 64 bytes for holder identity | rows up to max message bytes; `holderInfo` columns |
 | 2 | a max TTL of at least 400 days | `lease.max_ttl` up to 9 × 10⁹ s with checkpoints (§9.5, §10) |
-| 3 | tenant workers observe node-gone across namespaces | a `herald-sys` session plus tenant sessions (§17) |
-| 4 | one fenced worker per (tenant, role) at about 1 k × a few | §19.4 |
+| 3 | tenant roles observe node-gone across namespaces | a `herald-sys` session plus tenant sessions (§17, open) |
+| 4 | one active instance per (tenant, role) at about 1 k × a few | §19.2 |
 | 5 | 1–30 s TTLs with a tight bound | 1 ms tick, the fixed 1 s `min_ttl` floor (R11), ≥ 100 k expiries/s |
 
 ## 20. Phases
@@ -1938,13 +1894,16 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 
 ### Phase 3: the Rune-backed discovery library (deliverable)
 
-1. A `RuneEndpoint` and the Rune transport for `Producer`, in both forms (`RuneEndpoint`, and the caller-supplied client
-   with `doWork`, `stopAsync()` and `isStopped()`): incarnation keys, its own `LeaseSession`, the watchdog, load
-   updates, `stop()`.
+The discovery library is specified by the discovery repository's `2026-11-11-discovery-on-rune-design.md` (topic
+`platform-sys/discovery`, one runtime per process, no watchdog, domain and region as columns). Its tasks are in that repo's
+plan; they depend on this spec's client features (`LeaseWatch::closeAsync` / `restart`, the rerun events, the guarded commit).
+
+1. A `Runtime` and the Rune transport for `Producer`, in both forms (managed and caller-driven): incarnation keys, its own
+   `LeaseSession`, load updates, `stop()`.
 2. The Rune transport for `Consumer` (scan + subscribe, newest-incarnation selection, re-scan on break). The
    `ServiceCache` path is unchanged.
 3. `DiscoveryIntegrationTest` against a real Rune broker, plus the DG2 and failover cases.
-4. Herald cutover task: `main.cpp` builds the `RuneEndpoint`, and the discovery e2e runs on the default config.
+4. Herald cutover task: `main.cpp` builds the `Runtime`, and the discovery e2e runs on the default config.
 
 ## 21. Interaction matrix
 

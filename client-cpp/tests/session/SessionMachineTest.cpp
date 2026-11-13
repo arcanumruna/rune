@@ -2523,3 +2523,46 @@ TEST(SessionMachineRegression, ARefusedConnectIsReofferedOnTheNextTickRegression
                         T0 + 1'000'000'001LL);
     EXPECT_EQ(m.state(), sm::SessionState::Connected);
 }
+
+// A connect that times out after the client's OWN loss (its transport closed and was rebuilt, or it stalled) says
+// nothing about the broker: the new link may still be warming up.  It is a connect failure, never an unanswered
+// connect (the seed failover starts on those).  Once the session is Connected again, a later loss to broker silence
+// followed by a silent connect counts.
+// RED (mutation): loseOwnSession_ does not mark the episode -> unansweredConnects() == 1 after the first timeout.
+TEST(SessionMachineRegression, ConnectTimeoutAfterAnOwnLossIsNotAnUnansweredConnectRegression) {
+    FakeIo io;
+    auto cfg = testConfig();
+    sm::SessionMachine m(io, cfg);
+    m.connect(T0);
+    m.onConnectResponse(static_cast<int16_t>(rpc::ErrorCode::OK), 2, 42LL, m.correlationId(), T0);
+    m.tick(T0);
+    ASSERT_EQ(m.state(), sm::SessionState::Connected);
+
+    int64_t now = T0 + 1'000;
+    m.onTransportLost(now);
+    ASSERT_EQ(m.state(), sm::SessionState::Resuming);
+    m.tick(now);   // the resume goes out on the rebuilt transport
+    ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+    now += cfg.connectTimeoutNs + 1;   // far below responseTimeoutNs: not a stall of the client
+    m.tick(now);
+    ASSERT_EQ(m.connectFailures(), 1u) << "precondition: the resume timed out";
+    ASSERT_EQ(m.state(), sm::SessionState::Connecting) << "precondition: the machine retries by itself";
+    EXPECT_EQ(m.unansweredConnects(), 0u) << "a timeout after the client's own loss was booked as a silent broker";
+
+    // The retry is answered; from here on the broker goes silent for real.
+    m.onConnectResponse(static_cast<int16_t>(rpc::ErrorCode::OK), 2, 43LL, m.correlationId(), now);
+    m.tick(now);
+    ASSERT_EQ(m.state(), sm::SessionState::Connected);
+    const uint64_t staleBefore = m.staleSessionLosses();
+    for (int i = 0; i < 100 && m.state() == sm::SessionState::Connected; ++i) {
+        now += cfg.keepaliveIntervalNs;
+        m.tick(now);
+    }
+    ASSERT_EQ(m.staleSessionLosses(), staleBefore + 1) << "precondition: the session was lost to broker silence";
+    ASSERT_EQ(m.ownStallLosses(), 1u) << "precondition: only the transport loss was the client's own";
+    for (int i = 0; i < 10 && m.unansweredConnects() == 0; ++i) {
+        now += cfg.connectTimeoutNs + 1;
+        m.tick(now);
+    }
+    EXPECT_EQ(m.unansweredConnects(), 1u) << "a silent connect after a loss to broker silence was not counted";
+}

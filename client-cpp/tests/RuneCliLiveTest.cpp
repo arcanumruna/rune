@@ -12,7 +12,7 @@
 //
 // Regression tests (engineering rule 6):
 //   CliLiveRegression.GetLive_DescriptorInOutput, ListLive_TopicPresent,
-//   QlDefinesATopicAndVerbosePrintsEveryNotLeaderRetry
+//   QlDefinesATopicAndVerbosePrintsEveryNotLeaderRetry, QlDefinesATopicAndWithoutVerbosePrintsNothingExtra
 //
 // `rune schema apply|alter` were removed (Phase 2b D): their live assertions are carried by
 // RuneConsoleBrokerRegression in the broker's RuneConsoleBrokerRegressionTest.cpp (real broker).
@@ -23,6 +23,7 @@
 
 #include "support/AeronTestErrors.h"
 #include "rune/cli/Cli.h"
+#include "../src/cli/QlEngine.h"
 
 #include "support/TestCompletions.h"
 #include <rune/client/Client.h>
@@ -124,6 +125,7 @@ struct CliTestGateway {
     uint16_t             getVersion   = 1;
     uint16_t             getErrorCode = 0;
     std::vector<uint8_t> getBlob;   // set by test before call
+    bool                 getUntyped = false;   // an untyped topic: UnknownTopic for the registry lookup, OK with no blob for the kind probe
 
     // Canned AlterTopic response (Task 20).
     bool     replyAlterTopic  = true;
@@ -299,7 +301,8 @@ struct CliTestGateway {
             resp.correlationId  = opt->correlationId;
             resp.topicId        = getTopicId;
             resp.version        = getVersion;
-            resp.errorCode      = getErrorCode;
+            resp.errorCode      = getUntyped && opt->requestedFingerprint == rpc::kSchemaKindFingerprint
+                                      ? uint16_t{0} : getErrorCode;
             resp.descriptorBlob = getBlob.data();
             resp.descriptorLen  = static_cast<uint32_t>(getBlob.size());
 
@@ -520,7 +523,7 @@ TEST(CliLive, AeronDirFlagAttachesToARunningDriver) {
                                      "--cli-stream-in", std::to_string(kIn), "--cli-stream-out", std::to_string(kOut)},
                                     0ms);   // the driver is already running
 
-    EXPECT_EQ(gw.getsSeen.load(), 1) << "the CLI reached the gateway through the running driver; err=" << res.err;
+    EXPECT_EQ(gw.getsSeen.load(), 2) << "the CLI reached the gateway through the running driver (the lookup, then the kind probe); err=" << res.err;
     EXPECT_EQ(res.rc, static_cast<int>(rpc::ErrorCode::UnknownTopic)) << res.err;
     EXPECT_FALSE(std::filesystem::exists(cliDir + "/aeron")) << "the CLI started no driver of its own";
     EXPECT_FALSE(std::filesystem::exists(cliDir + "/aeron.lock"));
@@ -559,6 +562,57 @@ TEST(CliLive, SchemaGetUnknownTopic) {
         << "err must mention 'unknown topic'; got: " << r.err;
 
     gw.stop();
+    try { std::filesystem::remove_all(baseDir); } catch (...) {}
+}
+
+// An existing untyped topic is not "unknown": the registry lookup says UnknownTopic, the kind probe says it exists.
+TEST(CliLive, SchemaGetUntypedTopic) {
+    static constexpr int32_t kIn = 1216, kOut = 1217;
+    const std::string baseDir = cliUniqueDir();
+    const std::string aeronDir = baseDir + "/aeron";
+
+    CliTestGateway gw(aeronDir, kIn, kOut);
+    gw.getErrorCode = static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic);
+    gw.getUntyped   = true;
+
+    std::vector<std::string> args = {
+        "schema", "get", "raw_topic",
+        "--cli-data-dir", baseDir,
+        "--cli-stream-in",  std::to_string(kIn),
+        "--cli-stream-out", std::to_string(kOut),
+    };
+
+    auto r = runCli(gw, aeronDir, args);
+
+    EXPECT_EQ(r.rc, 0) << "err=" << r.err;
+    EXPECT_NE(r.out.find("untyped"), std::string::npos) << "out=" << r.out;
+    EXPECT_EQ(r.err.find("unknown topic"), std::string::npos) << "err=" << r.err;
+
+    gw.stop();
+    try { std::filesystem::remove_all(baseDir); } catch (...) {}
+}
+
+// `rune ql` keeps "connect to <ep> timed out" (the e2e retry scripts grep it) and adds the configured response port.
+namespace {
+// `rune ql` runs its Client in Invoker mode: the CLI (test) thread is the only duty thread, so the only reader of this clock.
+int64_t g_qlClockNs = 1'000'000'000;
+int64_t qlStepClock() noexcept { const int64_t t = g_qlClockNs; g_qlClockNs += 100'000'000; return t; }   // every read is 100 ms later: the connect deadline passes at once
+}
+
+TEST(CliLive, QlConnectTimeoutNamesTheResponsePort) {
+    namespace engine = rune::cli::engine;
+    const std::string baseDir = cliUniqueDir();
+    engine::LiveOptions o;
+    o.endpoint            = "aeron:ipc";
+    o.gatewayResponsePort = "8263";
+    o.dataDir             = baseDir;
+    o.insecurePlaintext   = true;
+    o.nanoClock           = &qlStepClock;
+    engine::LiveBroker broker;
+    std::ostringstream err;
+    EXPECT_FALSE(broker.open(o, err));
+    EXPECT_NE(err.str().find("connect to aeron:ipc timed out"), std::string::npos) << err.str();
+    EXPECT_NE(err.str().find("gateway response port 8263"), std::string::npos) << err.str();
     try { std::filesystem::remove_all(baseDir); } catch (...) {}
 }
 
@@ -853,9 +907,8 @@ TEST(CliLiveRegression, ListLive_TopicPresent) {
 // ===========================================================================
 // Catalog history Task 15: `rune ql` live against the loopback gateway.
 // ===========================================================================
-TEST(CliLiveRegression, QlDefinesATopicAndVerbosePrintsEveryNotLeaderRetry) {
-    for (const bool verbose : {true, false}) {
-        SCOPED_TRACE(verbose ? "--verbose" : "no --verbose");
+static void qlDefinesATopicRetryingNotLeader(const bool verbose) {
+    {
         const int32_t kIn = verbose ? 1260 : 1262, kOut = verbose ? 1261 : 1263;
         const std::string baseDir = cliUniqueDir();
         const std::string aeronDir = baseDir + "/aeron";
@@ -887,3 +940,6 @@ TEST(CliLiveRegression, QlDefinesATopicAndVerbosePrintsEveryNotLeaderRetry) {
         try { std::filesystem::remove_all(baseDir); } catch (...) {}
     }
 }
+
+TEST(CliLiveRegression, QlDefinesATopicAndVerbosePrintsEveryNotLeaderRetry) { qlDefinesATopicRetryingNotLeader(true); }
+TEST(CliLiveRegression, QlDefinesATopicAndWithoutVerbosePrintsNothingExtra) { qlDefinesATopicRetryingNotLeader(false); }

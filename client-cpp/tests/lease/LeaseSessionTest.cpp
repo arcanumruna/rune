@@ -1,7 +1,9 @@
 // tests/lease/LeaseSessionTest.cpp - lease topics Task 15: LeaseSession (keepalive cadence, batching, callbacks) and the produce guard,
 // against the InvokerGateway stub broker, on a fake clock.  Every drive loop is capped; nothing sleeps.
+#include "../support/AckLedger.h"
 #include "../support/AllocCounter.h"
 #include "../support/InvokerGateway.h"
+#include "../support/LeaseGatewayRig.h"
 #include "../support/TestCompletions.h"
 
 #include <rune/client/Client.h>
@@ -44,26 +46,8 @@ int64_t realNow() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-rune::codec::Descriptor leaseDescriptor() {
-    return rune::codec::DescriptorBuilder("lease_t", 1).add("id", rune::codec::PrimType::Int64, 1, /*isKey=*/true).build();
-}
-const uint64_t kFp = rune::codec::fingerprint(leaseDescriptor());
-
-struct Row {
-    static const uint64_t             kFingerprint;
-    static constexpr std::string_view kSchemaName = "lease_t";
-    uint64_t id = 0;
-    [[nodiscard]] uint64_t    key() const noexcept { return id; }
-    [[nodiscard]] std::size_t encodedSize() const noexcept { return 4 + 32 + 8; }
-    std::size_t encode(uint8_t* b) const noexcept {
-        std::memset(b, 0, 44);
-        b[0] = 40;
-        b[2] = 1;
-        std::memcpy(b + 36, &id, 8);
-        return 44;
-    }
-};
-const uint64_t Row::kFingerprint = kFp;
+using test_support::leaseDescriptor;
+using Row = test_support::LeaseRow;
 
 struct DataDirs {
     std::vector<std::string> dirs;
@@ -96,8 +80,7 @@ rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
     return c;
 }
 
-const rune::protocol::LeaseSpec kSpec{.ttlMs = 6000, .minTtlMs = 1000, .maxTtlMs = 60000, .maxKeys = 100000,
-                                      .expiryBatch = 64, .checkpoint = 0, .checkpointIntervalMs = 1000, .checkpointRate = 1};
+const rune::protocol::LeaseSpec& kSpec = test_support::leaseSpec();
 
 std::vector<uint8_t> verdicts(const std::vector<uint16_t>& codes) {
     std::vector<uint8_t> v(codes.size() * 8, 0);
@@ -170,24 +153,7 @@ struct SRig {
     explicit SRig(const rc::ClientConfig& c, uint32_t partitions = 1, uint32_t maxDelayMs = 100, bool makeSession = true)
         : client(std::make_unique<rc::Client>(c)),
           gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId, c.egressChannel, c.egressStreamId) {
-        gw.idempotence            = true;
-        gw.replySchemas           = true;
-        gw.schemaBlob             = rune::codec::serialize(leaseDescriptor());
-        gw.schemaTopicId          = 1;
-        gw.schemaPartitionCount   = static_cast<int32_t>(partitions);
-        gw.schemaLeaseViewTopicId = 9;
-        rune::protocol::TopicKeyFeatures f;
-        f.keyIndex = true;
-        gw.schemaKeyFeatures = f;
-        gw.schemaLease       = kSpec;
-        gw.produceLeaseTrailer = [] {
-            std::vector<uint8_t> t(16);
-            const int64_t v = 77;
-            const uint64_t ttl = 5000;
-            std::memcpy(t.data(), &v, 8);
-            std::memcpy(t.data() + 8, &ttl, 8);
-            return t;
-        }();
+        test_support::configureLeaseGateway(gw, partitions);
         connect();
         topic.emplace(openTopic());
         awaitProducer();
@@ -214,40 +180,8 @@ struct SRig {
         }
         return false;
     }
-    void connect() {
-        for (int i = 0; i < 4000 && !gw.ready(); ++i) { client->doWork(); gw.pump(); }
-        ASSERT_TRUE(gw.ready());
-        test_support::TestCq cq(*client);
-        auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client->connect(q, t); });
-        for (int i = 0; i < 4000 && !f.ready(); ++i) { client->doWork(); gw.pump(); }
-        ASSERT_TRUE(f.ok()) << f.describe();
-        for (int i = 0; i < 4000 && gw.metadataRequests == 0; ++i) { client->doWork(); gw.pump(); }
-    }
-    template <class Fn>
-    void whilePumping(Fn&& fn) {
-        int stop[2];
-        ASSERT_EQ(::pipe(stop), 0);
-        std::thread t([&] {
-            pollfd pfd{stop[0], POLLIN, 0};
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            while (::poll(&pfd, 1, 0) == 0 && std::chrono::steady_clock::now() < deadline) gw.pump();
-        });
-        const auto release = [&] {
-            const char b = 0;
-            (void)!::write(stop[1], &b, 1);
-            t.join();
-            ::close(stop[0]);
-            ::close(stop[1]);
-        };
-        try { fn(); } catch (...) { release(); throw; }
-        release();
-    }
-    rc::LeaseTopic<Row> openTopic() {
-        std::optional<rc::LeaseTopic<Row>> h;
-        whilePumping([&] { h.emplace(client->openLeaseTopicAndWait<Row>("lease_t", {})); });
-        EXPECT_TRUE(h.has_value());
-        return std::move(*h);
-    }
+    void connect() { test_support::connectGateway(*client, gw); }
+    rc::LeaseTopic<Row> openTopic() { return test_support::openLeaseTopic(*client, gw); }
     void awaitProducer() {
         for (int i = 0; i < 4000 && topic->producer().producerId() < 0; ++i) { client->doWork(); gw.pump(); }
         ASSERT_GE(topic->producer().producerId(), 0);
@@ -768,6 +702,35 @@ TEST(LeaseSessionRegression, GuardFailsPendingAndUnsentRegression) {
     d.run(pq);
     EXPECT_EQ(d.failed, 6) << "a late ack of a failed batch produces no second completion";
     EXPECT_EQ(d.ok + d.other, 0);
+}
+
+// N-3: a record the producer accepted at the call and that the drive has not read yet when the guard trips is refused by the ring read:
+// one DeliveryFailed / LeaseAtRisk completion, and no produce frame ever leaves.
+TEST(LeaseSessionRegression, RingRecordRefusedByTrippedGuardRegression) {
+    SRig<4> r(invokerCfg(5961, 5962));
+    r.gw.idempotence = false;
+    r.gw.replyAcks = false;
+    rc::Producer p = r.client->testProducerWithRingCap(guardedCfg(), 64 * 1024);
+    awaitProducerId(r, p);
+    rc::Completions pq(*r.client);
+    const rc::TopicHandle topic{1, 1};
+    const int64_t t = g_now;
+    const auto ref = r.add(1, 5, 3000, t);
+    ASSERT_EQ(r.session->bindProducer(ref, p), rc::OpResult::Accepted);
+    r.settle();
+    const std::size_t framesBefore = r.gw.produceFrameBytes.size();
+    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal, pq, 1), rc::SendResult::Ok);   // in the ring, no drive
+    g_now = t + 1500 * kMs;
+    r.settle();
+    ASSERT_EQ(r.cb.entered(), 1);
+    int n = 0, failed = 0;
+    (void)pq.poll([&](const rc::Completion& c, std::span<const uint8_t>) {
+        ++n;
+        if (c.token == 1 && c.status == OpStatus::DeliveryFailed && c.errorCode == static_cast<uint16_t>(rc::ClientErrorCode::LeaseAtRisk)) ++failed;
+    });
+    EXPECT_EQ(n, 1) << "exactly one completion";
+    EXPECT_EQ(failed, 1);
+    EXPECT_EQ(r.gw.produceFrameBytes.size(), framesBefore) << "no produce frame";
 }
 
 TEST(LeaseSessionRegression, GuardBlocksReconnectResendRegression) {
@@ -1338,6 +1301,135 @@ TEST(LeaseSessionRegression, DutySideDoubleBindKillsRegression) {
     g.guards.bind(BareGuards::kSid, 1, 1, 1, kFar, p, 0);   // the same producer again
     EXPECT_TRUE(p.guardBlocks_()) << "a second bind kills the producer: blocked for good";
     EXPECT_EQ(g.count(rc::detail::GuardEvent::BindRefused), 1);
+    g.guards.unbindProducer(p);
+}
+
+namespace {
+rc::ProducerConfig bareAckedCfg() {
+    rc::ProducerConfig c;
+    c.acks = rc::Acks::Leader;
+    c.lingerUs = 60'000'000;
+    c.batchBytes = 64 * 1024;
+    c.maxInFlight = 8;
+    c.produceTimeoutMs = 60'000;
+    c.deliveryTimeoutMs = 120'000;
+    return c;
+}
+/// Counts the produce frames a bare producer hands to its send function.
+struct FrameCount {
+    int frames = 0;
+    std::vector<int64_t> corr;
+    rune::client::producer::ProducerImpl::SendFn fn() {
+        return [this](int32_t, int32_t, int32_t, const uint8_t* b, std::size_t n) {
+            ++frames;
+            const auto v = rc::codec::decodeProduce(b, n);
+            if (v) corr.push_back(v->correlationId);
+            return true;
+        };
+    }
+};
+/// An ack ledger whose handler runs `onFail` on the first LeaseAtRisk failure it sees (inline, on the duty thread).
+struct HookLedger {
+    test_support::AckLedger ledger;
+    std::function<void()> onFirstFail;
+    bool fired = false;
+    static void onAck(void* ctx, rc::Token t, int64_t v, rc::OpStatus st, uint16_t ec) noexcept {
+        auto* self = static_cast<HookLedger*>(ctx);
+        test_support::AckLedger::onAck(&self->ledger, t, v, st, ec);
+        if (st == rc::OpStatus::DeliveryFailed && !self->fired && self->onFirstFail) {
+            self->fired = true;
+            self->onFirstFail();
+        }
+    }
+};
+constexpr int64_t kBareNow = 1'000'000'000;
+}  // namespace
+
+// O-2: a handler that closes the producer from a completion the guard-refusal of the ring read fired must not nest a read of the same
+// ring (closeImmediately -> failAllPending -> discardRing_).  Three acked records sit in the ring, the guard trips, the first failure
+// closes the producer: every token completes exactly once, the producer is closed, nothing is produced.
+TEST(LeaseSessionRegression, RefusedRecordHandlerClosesProducerRegression) {
+    BareGuards g;
+    rune::client::producer::ProducerImpl p(bareAckedCfg());
+    HookLedger h;
+    p.setOnAck(&HookLedger::onAck, &h);
+    h.onFirstFail = [&] { (void)p.closeImmediately(); };
+    constexpr uint32_t S = BareGuards::kSid;
+    g.guards.arm(S, 0, 1, 1, 1000, 0);
+    g.guards.bind(S, 0, 1, 1, 1000, p, 0);
+    ASSERT_TRUE(p.guardBound());
+    for (rc::Token t = 1; t <= 3; ++t) ASSERT_EQ(p.trySubmit(1, 0, rc::Key(uint64_t{1}), kVal, test_support::AckLedger::hi(t)), rc::SendResult::Ok);
+    ASSERT_EQ(g.guards.trip(2000), 1);
+    FrameCount fc;
+    const auto sink = fc.fn();
+    for (int i = 0; i < 8; ++i) {
+        (void)p.drainRing(kBareNow, 256);
+        (void)p.flushBatches(kBareNow, 42, sink);
+    }
+    for (rc::Token t = 1; t <= 3; ++t) EXPECT_EQ(h.ledger.times(t), 1) << "token " << t;
+    for (const auto& r : h.ledger.recs) {
+        EXPECT_EQ(r.status, rc::OpStatus::DeliveryFailed);
+        EXPECT_EQ(r.ec, static_cast<uint16_t>(rc::ClientErrorCode::LeaseAtRisk));
+    }
+    EXPECT_TRUE(h.fired);
+    EXPECT_FALSE(p.lifeOpen()) << "the handler's close was applied";
+    EXPECT_EQ(fc.frames, 0) << "nothing was produced";
+    g.guards.unbindProducer(p);
+}
+
+// F-2 (final review): the Direct-mode twin of the above.  A Direct producer appends in place, so there is no drain after the call: the
+// close the refusal's handler issued must be applied before trySubmit returns, not at the next duty cycle.
+TEST(LeaseSessionRegression, DirectRefusedRecordHandlerClosesProducerRegression) {
+    BareGuards g;
+    rune::client::producer::ProducerImpl p(bareAckedCfg());
+    p.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr, kBareNow});
+    HookLedger h;
+    p.setOnAck(&HookLedger::onAck, &h);
+    h.onFirstFail = [&] { (void)p.closeImmediately(); };
+    constexpr uint32_t S = BareGuards::kSid;
+    g.guards.arm(S, 0, 1, 1, 1000, 0);
+    g.guards.bind(S, 0, 1, 1, 1000, p, 0);
+    ASSERT_TRUE(p.guardBound());
+    ASSERT_EQ(g.guards.trip(2000), 1);
+    ASSERT_TRUE(p.guardBlocks_());
+    (void)p.trySubmit(1, 0, rc::Key(uint64_t{1}), kVal, test_support::AckLedger::hi(1));
+    EXPECT_TRUE(h.fired) << "the refused record's completion ran";
+    EXPECT_EQ(h.ledger.times(1), 1);
+    EXPECT_FALSE(p.lifeOpen()) << "the handler's close was applied before trySubmit returned";
+    EXPECT_TRUE(p.releasable()) << "its deferred fail-all ran before trySubmit returned (no duty work is left owed)";
+    g.guards.unbindProducer(p);
+}
+
+// O-3: failGuarded reached from a handler the producer's own walk fired (a failure completion whose handler ends the lease again) is
+// deferred to the end of that walk: each of the two in-flight batches' records completes exactly once.
+TEST(LeaseSessionRegression, FailGuardedFromOwnWalkHandlerRegression) {
+    BareGuards g;
+    rune::client::producer::ProducerImpl p(bareAckedCfg());
+    HookLedger h;
+    p.setOnAck(&HookLedger::onAck, &h);
+    constexpr uint32_t S = BareGuards::kSid;
+    g.guards.arm(S, 0, 1, 1, 1000, 0);
+    g.guards.bind(S, 0, 1, 1, 1000, p, 0);
+    for (int32_t part = 0; part < 2; ++part) {
+        ASSERT_EQ(p.trySubmit(1, part, rc::Key(uint64_t{1}), kVal, test_support::AckLedger::hi(static_cast<rc::Token>(part + 1))), rc::SendResult::Ok);
+    }
+    p.submitFlush();
+    (void)p.drainRing(kBareNow, 256);
+    FrameCount fc;
+    const auto sink = fc.fn();
+    (void)p.flushBatches(kBareNow, 42, sink);
+    ASSERT_EQ(fc.frames, 2) << "an acked batch in flight on each partition";
+    h.onFirstFail = [&] { g.guards.end(S, 0, 1); };   // the lease ends from inside the walk that fails the first batch
+    ASSERT_EQ(g.guards.trip(2000), 1);
+    for (int i = 0; i < 4; ++i) (void)p.drainRing(kBareNow, 256);
+    EXPECT_TRUE(h.fired);
+    EXPECT_EQ(h.ledger.times(1), 1);
+    EXPECT_EQ(h.ledger.times(2), 1);
+    EXPECT_TRUE(h.ledger.noneDuplicated());
+    for (const auto& r : h.ledger.recs) EXPECT_EQ(r.status, rc::OpStatus::DeliveryFailed);
+    for (const int64_t c : fc.corr) p.onProduceResponse(c, 100, 0);   // the late acks: nothing more
+    EXPECT_TRUE(h.ledger.noneDuplicated());
+    EXPECT_EQ(h.ledger.recs.size(), 2u);
     g.guards.unbindProducer(p);
 }
 

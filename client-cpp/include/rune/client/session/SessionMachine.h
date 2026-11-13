@@ -444,6 +444,12 @@ public:
     /// by the CLIENT's own stall (a tick gap > responseTimeoutNs) — the broker
     /// was not shown dead.
     [[nodiscard]] uint64_t ownStallLosses() const noexcept { return ownStallLosses_; }
+    /// Connect attempts of a once-Live machine that ran out connectTimeoutNs with no answer at all, not counting a
+    /// timeout the CLIENT itself produced: its own stall (M1), or a connect that follows its own loss (a stall or a
+    /// rebuilt transport, whose new link may still be warming up) until the broker has answered once.  Monotonic;
+    /// each increment is evidence that the broker is dead, the same as a stale loss (the seed failover starts on it
+    /// instead of waiting for the whole retry budget).
+    [[nodiscard]] uint64_t unansweredConnects() const noexcept { return unansweredConnects_; }
     /// DR client bugs fix round 1 (I2): the error code of the latest connect
     /// attempt refused by the broker (0 = none since the last ConnectResponse{OK}),
     /// or kHandshakeTimedOut (fix round 3, M-2: client-local, never on the wire,
@@ -718,6 +724,7 @@ public:
 
         // Stale / mismatched correlationId — ignore.
         if (incomingCorrelationId != correlationId_) return;
+        ownLossConnect_ = false;   // any answer proves the link to the broker: a later silent connect is its silence
 
         namespace rpc = rune::protocol::client;
         const auto ec = static_cast<rpc::ErrorCode>(static_cast<uint16_t>(code));
@@ -796,6 +803,7 @@ public:
                                    int64_t          nowNs) noexcept {
         if (state_ != SessionState::Connecting) return;
         if (incomingCorrelationId != correlationId_) return;
+        ownLossConnect_ = false;   // an answer: see onConnectResponse
 
         if (redirectCount_ >= cfg_.maxRedirects) {
             onRetryBudgetExhausted_(nowNs);
@@ -1170,7 +1178,7 @@ public:
         }
         switch (state_) {
         case SessionState::Connecting:
-            tickConnecting(nowNs);
+            tickConnecting(nowNs, ownStall);
             break;
         case SessionState::Handshaking:
             tickHandshaking_(nowNs);
@@ -1216,6 +1224,7 @@ private:
     void loseOwnSession_(int64_t nowNs) noexcept {
         ++staleSessionLosses_;
         ++ownStallLosses_;   // M1: the client stalled, not the broker
+        ownLossConnect_ = true;
         transitionTo(SessionState::Resuming);
         resumeEntryNs_ = nowNs;
     }
@@ -1715,7 +1724,7 @@ private:
         }
     }
 
-    void tickConnecting(int64_t nowNs) noexcept {
+    void tickConnecting(int64_t nowNs, bool ownStall) noexcept {
         if (cfg_.offerCrypto && cfg_.requireCrypto && !hs_) [[unlikely]] {
             rejectHandshake_();   // fix round 4: required crypto, no local TLS — a local verdict, terminal
             return;
@@ -1751,6 +1760,8 @@ private:
 
         // Connect timed out.
         ++connectFailures_;  // DR-7: an event the owner reacts to (metadata refresh)
+        // The broker was silent for the whole window, and the client gave it no excuse.
+        if (everLive_ && !ownStall && !ownLossConnect_) ++unansweredConnects_;
         if (connectRetryCount_ >= cfg_.maxConnectRetries) {
             onRetryBudgetExhausted_(nowNs);
             return;
@@ -2054,6 +2065,8 @@ private:
     uint64_t authUnavailable_ = 0;   // issues #15 / #111: see authUnavailableCount()
     uint64_t staleSessionLosses_ = 0;   // fix round 4: see staleSessionLosses()
     uint64_t ownStallLosses_     = 0;   // M1: see ownStallLosses()
+    uint64_t unansweredConnects_ = 0;   // see unansweredConnects()
+    bool     ownLossConnect_     = false;   // the connect episode began with the client's own loss, no answer yet
     int16_t  lastConnectError_   = 0;   // I2: see lastConnectError()
     int64_t lastConnectSentNs_   = 0;  // when the last ConnectRequest was offered
     bool    connectSentOk_       = false; // true if the last offer() succeeded

@@ -7,7 +7,7 @@
 //       Connect to the broker, fetch the topic descriptor, generate a C++
 //       header and write it to <dir>/<topic>.gen.h.
 //
-//   rune_schema_gen generate --from-file <blob> --out <dir>
+//   rune_schema_gen generate --from-file <blob> --out <dir> [--lease]
 //       Offline mode: read the serialized descriptor blob from <blob>, generate
 //       a C++ header derived from the embedded schema name, write it to
 //       <dir>/<name>.gen.h.  No broker connection required.
@@ -42,11 +42,12 @@ void printUsage(const char* argv0) {
     std::cerr
         << "Usage:\n"
         << "  " << argv0 << " generate <topic> --out <dir> [--broker <endpoint>]\n"
-        << "  " << argv0 << " generate --from-file <blob> --out <dir>\n"
+        << "  " << argv0 << " generate --from-file <blob> --out <dir> [--lease]\n"
         << "\n"
         << "Options:\n"
         << "  <topic>           Topic name to fetch schema for (live mode).\n"
         << "  --from-file <f>   Path to a serialized descriptor blob (offline mode).\n"
+        << "  --lease           Offline only: the blob is a lease topic's stored schema (adds withLease, LeasesRow).\n"
         << "  --out <dir>       Output directory for the generated header.\n"
         << "  --broker <ep>     Broker endpoint (default: aeron:ipc, live mode only).\n";
 }
@@ -65,13 +66,21 @@ std::string flagValue(int argc, char** argv, std::string_view flag) {
     return {};
 }
 
+/// True if --<flag> is present in argv.
+bool hasFlag(int argc, char** argv, std::string_view flag) {
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] == flag) return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Offline (--from-file) entry point
 // ---------------------------------------------------------------------------
 
-int runFromFile(const std::string& blobPath, const std::string& outDir) {
+int runFromFile(const std::string& blobPath, const std::string& outDir, bool lease) {
     try {
-        auto written = rune::tools::generateFromFile(blobPath, outDir);
+        auto written = rune::tools::generateFromFile(blobPath, outDir, lease);
         std::cout << "rune_schema_gen: wrote " << written << "\n";
         return 0;
     } catch (const std::exception& e) {
@@ -188,9 +197,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    const bool lease = hasFlag(argc, argv, "--lease");
+    if (lease && fromFile.empty()) {
+        std::cerr << "rune_schema_gen: --lease applies to --from-file only; live mode reads it from the topic\n";
+        return 1;
+    }
+
     // ── Offline mode: --from-file ─────────────────────────────────────────
     if (!fromFile.empty()) {
-        return runFromFile(fromFile, outDir);
+        return runFromFile(fromFile, outDir, lease);
     }
 
     // ── Live mode: generate <topic> --broker <ep> ─────────────────────────

@@ -104,7 +104,6 @@ struct Rig {
     FakeCoordinator        fake;
     rp::ProducerHub        hub;
     ProducerImpl*          impl;
-    rc::Producer           p;
     OpLedger               ops;
     AckCapture             acks;
     std::vector<WireBatch> wire;
@@ -113,8 +112,9 @@ struct Rig {
     int64_t                now  = kT0;
     Token                  next = 0;
     rc::ProducerConfig     cfg;
+    rc::Producer           p;   // last: its release completes pending writes into ops/acks, which must still be alive
 
-    explicit Rig(rc::ProducerConfig c) : impl(new ProducerImpl(c, 1 << 16)), p(impl), cfg(std::move(c)) {
+    explicit Rig(rc::ProducerConfig c) : impl(new ProducerImpl(c, 1 << 16)), cfg(std::move(c)), p(impl) {
         hub.setCoordinatorSink(fake.sink());
         impl->setOnAck(&AckCapture::on, &acks);
         ProducerImpl::Hooks h;

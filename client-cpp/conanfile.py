@@ -113,7 +113,7 @@ class RuneClientCppConan(ConanFile):
         client.libs = [
             "rune_client_api", "rune_client_producer", "rune_client_subscriber", "rune_client_group",
             "rune_client_agent", "rune_client_transport", "rune_gso", "rune_client_driver_wake",
-            "rune_ql", "rune_security", "rune_catalog", "rune_codec",
+            "rune_ql", "rune_security", "rune_client_view", "rune_catalog", "rune_codec",
             "rune_client_scram", "rune_crypto", "flight_recorder",
         ]
         client.defines = ["FLIGHT_RECORDER=1"]
