@@ -486,6 +486,116 @@ TEST(SessionMachineAuthRegression, TheMustChangePasswordFlagIsLatchedOnTheConnec
     EXPECT_TRUE(t.m->passwordChangeRequired());
 }
 
+namespace {
+
+// Review B I3 / I5 and the one-time-password flag are one login state: at most one of {anonymousBootstrap,
+// authenticated}, and a pending password change only on an authenticated session.
+void expectOneLoginState(const sm::SessionMachine& m) {
+    EXPECT_FALSE(m.anonymousBootstrap() && m.authenticated());
+    if (m.passwordChangeRequired()) EXPECT_TRUE(m.authenticated());
+}
+
+// Logs a Rig in on session id 42 with the must-change flag; leaves it Connected.
+void loginMustChange(Rig& t) {
+    t.connectAuthRequired();
+    Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
+    std::string combined; auto cf = t.clientFirst();
+    (void)t.serverFirst(srv, cf, combined);
+    t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 0, .flags = pc::kAuthFlagMustChangePassword,
+                                                              .serverSignature = srv.signature(cf, combined, 0)}), 3);
+}
+
+}  // namespace
+
+TEST(SessionMachineAuthRegression, AuthInfoHasOneStateAtATimeRegression) {
+    Rig t;
+    loginMustChange(t);
+    ASSERT_EQ(t.m->state(), sm::SessionState::Connected);
+    EXPECT_TRUE(t.m->authenticated());
+    EXPECT_TRUE(t.m->passwordChangeRequired());
+    EXPECT_FALSE(t.m->anonymousBootstrap());
+    expectOneLoginState(*t.m);
+    // The link drops and the broker asks for a fresh login: nothing of the old login may survive.
+    t.m->onTransportDisconnected(10);
+    t.m->tick(11);
+    ASSERT_EQ(t.m->state(), sm::SessionState::Connecting);
+    auto r = authRequired(t.io.lastCorrelation());
+    t.m->onConnectResponse(r.code, -1, 42, t.io.lastCorrelation(), 12, 0, {}, r.authMode, r.authState);
+    ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating);
+    EXPECT_FALSE(t.m->authenticated());
+    EXPECT_FALSE(t.m->passwordChangeRequired()) << "a stale one-time-password flag outlived its login";
+    EXPECT_FALSE(t.m->anonymousBootstrap());
+    expectOneLoginState(*t.m);
+    // The same on a machine that accepts an unauthenticated broker: the reconnect lands on Connected without a login
+    // (beginAuth_ is never reached), so nothing of the earlier login may survive there either.
+    {
+        Rig u("ws1", "correct horse battery", /*forever=*/false, /*allowUnauthenticated=*/true);
+        loginMustChange(u);
+        ASSERT_TRUE(u.m->passwordChangeRequired());
+        u.m->onTransportDisconnected(10);
+        u.m->tick(11);
+        ASSERT_EQ(u.m->state(), sm::SessionState::Connecting);
+        u.m->onConnectResponse(0, -1, 42, u.io.lastCorrelation(), 12, 0, {}, pc::AuthMode::DevDisabled,
+                               pc::AuthState::Anonymous);
+        ASSERT_EQ(u.m->state(), sm::SessionState::Connected);
+        EXPECT_FALSE(u.m->authenticated());
+        EXPECT_FALSE(u.m->passwordChangeRequired()) << "a stale one-time-password flag outlived its login";
+        EXPECT_FALSE(u.m->anonymousBootstrap());
+        expectOneLoginState(*u.m);
+    }
+    // A bootstrap-only machine on a Required + Anonymous broker.
+    {
+        CapturingIo io; sm::SessionConfig cfg; cfg.bootstrapOnly = true;
+        sm::SessionMachine m(io, cfg);
+        m.connect(0);
+        m.onConnectResponse(0, -1, 42, io.lastCorrelation(), 1, 0, {}, pc::AuthMode::Required,
+                            pc::AuthState::Anonymous);
+        ASSERT_EQ(m.state(), sm::SessionState::Connected);
+        EXPECT_TRUE(m.anonymousBootstrap());
+        EXPECT_FALSE(m.authenticated());
+        EXPECT_FALSE(m.passwordChangeRequired());
+        expectOneLoginState(m);
+    }
+    // ... and on a Required + MustAuthenticate broker (the reopened bootstrap window).
+    {
+        CapturingIo io; sm::SessionConfig cfg; cfg.bootstrapOnly = true;
+        sm::SessionMachine m(io, cfg);
+        m.connect(0);
+        m.onConnectResponse(0, -1, 42, io.lastCorrelation(), 1, 0, {}, pc::AuthMode::Required,
+                            pc::AuthState::MustAuthenticate);
+        ASSERT_EQ(m.state(), sm::SessionState::Connected);
+        EXPECT_TRUE(m.anonymousBootstrap());
+        EXPECT_FALSE(m.authenticated());
+        EXPECT_FALSE(m.passwordChangeRequired());
+        expectOneLoginState(m);
+    }
+}
+
+TEST(SessionMachineAuthRegression, AnOwnResumeKeepsTheMustChangeFlagRegression) {
+    Rig t;
+    loginMustChange(t);
+    ASSERT_EQ(t.m->state(), sm::SessionState::Connected);
+    t.m->onTransportDisconnected(10);
+    t.m->tick(11);
+    ASSERT_EQ(t.m->state(), sm::SessionState::Connecting);
+    t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 12, 0, {}, pc::AuthMode::Required,
+                           pc::AuthState::ResumedAuthenticated);
+    EXPECT_EQ(t.m->state(), sm::SessionState::Connected);
+    EXPECT_TRUE(t.m->authenticated());
+    EXPECT_TRUE(t.m->passwordChangeRequired()) << "the resumed session is the one that logged in";
+    expectOneLoginState(*t.m);
+}
+
+TEST(SessionMachineAuthRegression, PasswordChangedClearsOnlyTheMustChangeFlagRegression) {
+    Rig t;
+    loginMustChange(t);
+    ASSERT_TRUE(t.m->passwordChangeRequired());
+    t.m->passwordChanged();
+    EXPECT_TRUE(t.m->authenticated());
+    EXPECT_FALSE(t.m->passwordChangeRequired());
+    expectOneLoginState(*t.m);
+}
+
 TEST(SessionMachineAuthRegression, ALoginThatNeverAnswersTimesOutLikeAStuckHandshake) {
     Rig t; t.connectAuthRequired(/*now=*/1);
     ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating);
