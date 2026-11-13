@@ -398,6 +398,38 @@ TEST(ClientResponseEgressRegression, OldBrokerUsesTheDeclaredPath) {
     EXPECT_GE(r.producesAt(w.endpoint), 1) << "produce unchanged: straight to the worker";
 }
 
+// #834: the learnt response port is sticky (Metadata saying port 0 does not clear it), and that costs no delay: a node
+// that restarted without a response port answers the Connect on the declared channel, and the client's reconnect
+// completes at once instead of waiting for the transport's resolve timeout (kResolveTimeoutNs, 5 s) on a dead pair.
+TEST(ClientResponseEgressRegression, ALearntPortTheNodeDroppedReconnectsOnTheDeclaredPathRegression) {
+    Options o;
+    o.declaredReachable = true;
+    Rig r(4143, 4144, o);
+    const auto w = r.addWorker(0, 4145, /*responseMode=*/false);
+    ASSERT_TRUE(r.connect());
+    ASSERT_GE(r.gw.responseConnects, 1) << "the first session rides a response publication";
+    auto p = r.client.producer(noLinger());
+    ASSERT_EQ(r.sendAcked(p, 0, 1), 1);
+    const int connectsBefore = r.gw.connectsArrived;
+
+    // The node restarts without a response port: it drops the session, names port 0 for itself in its Metadata and
+    // from now on answers every Connect on the declared channel (the pre-response behaviour).
+    r.gw.advertisedBrokerVersion = 8;
+    r.gw.brokerResponsePort      = 0;
+    const auto dropped           = std::chrono::steady_clock::now();
+    r.gw.expireSession(r.gw.lastUniqueSessionId());
+    r.gw.forgetResponseState();   // a restarted node has no response publication and no route to one
+    ASSERT_EQ(r.sendAcked(p, 0, 1), 1) << "no produce acked after the node dropped the session";
+    const auto tookMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - dropped).count();
+
+    EXPECT_GT(r.gw.connectsArrived, connectsBefore) << "the client reconnected";
+    ASSERT_GE(r.gw.connectFlags.size(), 2u);
+    EXPECT_TRUE(r.gw.connectFlags.back()) << "the learnt port stayed: the reconnect still asks for response egress";
+    EXPECT_EQ(r.gw.responseConnects, 1) << "the reconnect was answered on the declared channel";
+    EXPECT_LT(tookMs, 2000) << "the reconnect waited for the resolve timeout (5 s) instead of using the declared path";
+    (void)w;
+}
+
 // A worker that only owns a SUBSCRIBED partition still gets its WorkerBind (eager, from Metadata) and its Records
 // reach the subscriber on the worker's response publication.
 TEST(ClientResponseEgressRegression, ConsumeOnlyWorkerIsBound) {

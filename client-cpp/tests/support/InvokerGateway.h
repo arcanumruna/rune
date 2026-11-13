@@ -967,6 +967,16 @@ struct InvokerGateway {
         sendToSession(sessionId, out.data(), n);
     }
 
+    /// A node restart as the response paths see it: every response publication closes and no session or Connect keeps
+    /// a route to one.  What it answers afterwards follows the current version / response-control settings.
+    void forgetResponseState() {
+        respRoute_.clear();
+        respConnectRoute_.clear();
+        respConnectGen_.clear();
+        respGen_.clear();
+        respPubs_.clear();
+    }
+
     /// One gateway duty cycle: conductor, registrations, outbox, polls.
     int pump() {
         ++pumps_;
