@@ -736,3 +736,98 @@ TEST_F(CheckedWritesTxnVoteRoutingWiredRegression, ReleaseDetachesTheGatewayFrom
     R.runWorker(2);   // the late answer of an in-flight vote reaches no one
     EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u);
 }
+
+// #995: an interim return (the judge waits on another transaction) reaches the sink as `waiting` and leaves the vote in flight; the
+// real answer that follows is the one sink call that completes it.
+TEST(CheckedWritesTxnVoteRoutingRegression, AnInterimIsPassedOnAndTheVoteStaysInFlightRegression) {
+    VoteRig R;
+    ASSERT_GE(R.gw.sendTxnVote(0, 0, 78, 1, 9), 0);
+    WorkerReturn ret;
+    ret.type = WorkerReturn::Type::TxnVoteResult;
+    ret.correlationId = R.gw.lastVoteTokenForTest();
+    ret.sessionId = -1;
+    ret.errorCode = rune::replication::kTxnVoteWaiting;
+    ret.baseOffset = 900;      // the holder's producer id
+    ret.newNextOffset = 2;     // its epoch
+    R.gw.handleWorkerReturnForTest(ret);
+    ASSERT_EQ(R.got.size(), 1u);
+    EXPECT_TRUE(R.got[0].r.waiting);
+    EXPECT_EQ(R.got[0].r.waitPid, 900);
+    EXPECT_EQ(R.got[0].r.waitEpoch, 2);
+    EXPECT_EQ(R.got[0].producerId, 78);
+    EXPECT_EQ(R.got[0].coordinatorEpoch, 9);
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 1u) << "an interim is not the answer";
+    R.gw.handleWorkerReturnForTest(ret);   // a second one (the holder changed) is passed on too
+    EXPECT_EQ(R.got.size(), 2u);
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
+
+    ret.errorCode = 0;                     // the real vote
+    ret.recordCount = 0;
+    ret.newNextOffset = 0;
+    ret.baseOffset = -1;
+    R.gw.handleWorkerReturnForTest(ret);
+    ASSERT_EQ(R.got.size(), 3u);
+    EXPECT_FALSE(R.got[2].r.waiting);
+    EXPECT_EQ(R.got[2].r.errorCode, 0);
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u);
+    ret.errorCode = rune::replication::kTxnVoteWaiting;   // a late interim after the answer matches nothing
+    R.gw.handleWorkerReturnForTest(ret);
+    EXPECT_EQ(R.got.size(), 3u);
+}
+
+// The same across the plane: the leader's interim goes to the coordinator's node as a TxnVoteResponse with errorCode kTxnVoteWaiting,
+// keeps the remote vote owed on the leader and the vote in flight on the coordinator.
+TEST(CheckedWritesTxnVoteRoutingRegression, AnInterimCrossesThePlaneAndKeepsTheVoteOwedRegression) {
+    VoteTmpDir ad;
+    rune::node::EmbeddedDriverConfig dc; dc.dir = ad.path.string(); dc.termBufferBytes = 64 * 1024;
+    rune::node::EmbeddedDriver drv(dc, rune::node::DriverMode::Threaded);
+    aeron::Context ctx; ctx.aeronDir(ad.path.string());
+    auto client = aeron::Aeron::connect(ctx);
+    rune::replication::AeronPartitionTransport tr0(client, "aeron:ipc", 7411, 0, 1 << 20);
+    rune::replication::AeronPartitionTransport tr1(client, "aeron:ipc", 7412, 1, 1 << 20);
+    VoteRig C(0), L(1);
+    tr0.setTxnVoteHandlers(&rune::gateway::ClientGateway::onTxnVoteThunk,
+                           &rune::gateway::ClientGateway::onTxnVoteResponseThunk, &C.gw);
+    tr1.setTxnVoteHandlers(&rune::gateway::ClientGateway::onTxnVoteThunk,
+                           &rune::gateway::ClientGateway::onTxnVoteResponseThunk, &L.gw);
+    C.gw.setRoutingImageSnapshot(voteImage(1, 1));
+    auto ferry = [](auto& out, rune::replication::AeronPartitionTransport& to) {
+        ASSERT_FALSE(out.empty());
+        to.deliverFrameForTest(out.back().second.data(), out.back().second.size(), 1);
+        out.clear();
+    };
+    ASSERT_GE(C.gw.sendTxnVote(0, 0, 78, 1, 9), 0);
+    ferry(C.votesSent, tr1);
+    ASSERT_EQ(L.gw.remoteTxnVotesForTest(), 1u);
+    WorkerReturn ret;
+    ret.type = WorkerReturn::Type::TxnVoteResult;
+    ret.correlationId = C.gw.lastVoteTokenForTest();
+    ret.sessionId = 0;
+    ret.errorCode = rune::replication::kTxnVoteWaiting;
+    ret.baseOffset = 900;
+    ret.newNextOffset = 2;
+    L.gw.handleWorkerReturnForTest(ret);
+    EXPECT_EQ(L.gw.remoteTxnVotesForTest(), 1u) << "the answer is still owed";
+    ASSERT_EQ(L.responsesSent.size(), 1u);
+    rune::replication::TxnVoteResponseMsg wire{};
+    ASSERT_TRUE(rune::replication::TxnVoteResponseMsg::decode(L.responsesSent[0].second.data(), L.responsesSent[0].second.size(), wire));
+    EXPECT_EQ(wire.errorCode, rune::replication::kTxnVoteWaiting);
+    EXPECT_EQ(wire.failingOffset, 900);
+    EXPECT_EQ(wire.constraintId, 2u);
+    ferry(L.responsesSent, tr0);
+    ASSERT_EQ(C.got.size(), 1u);
+    EXPECT_TRUE(C.got[0].r.waiting);
+    EXPECT_EQ(C.got[0].r.waitPid, 900);
+    EXPECT_EQ(C.got[0].r.waitEpoch, 2);
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 1u);
+
+    ret.errorCode = 0;   // the real vote
+    ret.baseOffset = -1;
+    ret.newNextOffset = 0;
+    L.gw.handleWorkerReturnForTest(ret);
+    EXPECT_EQ(L.gw.remoteTxnVotesForTest(), 0u);
+    ferry(L.responsesSent, tr0);
+    ASSERT_EQ(C.got.size(), 2u);
+    EXPECT_FALSE(C.got[1].r.waiting);
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 0u);
+}

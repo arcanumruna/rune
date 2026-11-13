@@ -162,6 +162,10 @@ struct TxnVoteResult {
     uint16_t code          = 0;    ///< 0 = yes
     uint32_t constraintId  = 0;
     int64_t  failingOffset = -1;
+    /// #995: an interim, not an answer: the partition's judge waits on the transaction (waitPid, waitEpoch); the vote stays out.
+    bool     waiting       = false;
+    int64_t  waitPid       = -1;
+    int16_t  waitEpoch     = 0;
 };
 using TxnVoteSink = void (*)(void* ctx, int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch,
                              int32_t coordinatorEpoch, const TxnVoteResult&) noexcept;

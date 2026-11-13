@@ -257,7 +257,8 @@ against its rules. What a transaction guarantees, by level:
 - **`TxnTooLarge`** (62). A transaction with more records on one partition than `RUNE_TXN_JUDGED_RECORDS_MAX` (default 4096, see
   [configuration](../configuration.md)) is voted no, and a send that would take it past the limit is refused with the same code.
 - **`TxnConflict`** (63). Another writer wrote the same key after this transaction's write and before its commit; the transaction
-  aborts.
+  aborts. It is also the answer for the younger of two transactions that wait on each other's locked rows on two partitions: the
+  broker aborts it at once instead of at the transaction timeout, and the commit can be retried.
 - **Locked rows.** From a yes vote until the commit or abort marker, the rows the transaction wrote are locked: the verdict of another
   writer's record that touches one of them waits for the marker.
 - **Atomic batch.** `p.batch(...)` on a verdict source is all or nothing: one rejected record rejects the batch, and the ack carries one

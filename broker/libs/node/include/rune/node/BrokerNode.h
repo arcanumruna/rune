@@ -1963,6 +1963,12 @@ public:
     uint64_t permissionShipsForTest() {
         return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->permissionShipsForTest() : 0; });
     }
+    /// Issue #995 probe (CONTROL thread): the cycles of lock waits this broker's transaction coordinator has resolved (it counts
+    /// only while it is the coordinator).
+    template <class = void>   // instantiated after onControlThreadForTest is defined
+    uint64_t txnDeadlocksResolvedForTest() {
+        return onControlThreadForTest([this]() -> uint64_t { return txnCoordService_ ? txnCoordService_->txnDeadlocksResolvedForTest() : 0; });
+    }
     /// Issue #189 seam (CONTROL thread): forget every login-throttle entry of this broker's gateway.
     template <class = void>   // instantiated after onControlThreadForTest is defined
     void resetLoginThrottleForTest() {

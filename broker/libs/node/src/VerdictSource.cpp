@@ -728,6 +728,7 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
         if (s == rune::view::PrepareStatus::Pending) return Verdict::held();   // the record's layout is not installed yet: no verdict, the caller holds
         if (s == rune::view::PrepareStatus::Locked) {   // P11-4: the judge pauses here, records nothing
             txnStop_ = TxnStop::Locked;
+            pauseOnLockHit_();
             notePause_(rec.offset);
             return {};
         }
@@ -948,6 +949,7 @@ bool VerdictSource::judgeAtomic_(const rune::protocol::RecordBatchReader& r, con
     if (!walked || step == ChainStep::Stalled) return false;
     if (step == ChainStep::Locked) {
         txnStop_ = TxnStop::Locked;
+        pauseOnLockHit_();
         notePause_(r.baseOffset());
         return false;
     }
@@ -1050,6 +1052,7 @@ bool VerdictSource::readTxnBatch_(const rune::protocol::RecordBatchReader& r, co
             if (jx_.answer.code == 0) jx_.answer = {failed.code, failed.constraintId, span.offset};
             step = ChainStep::Ok;
         } else if (step == ChainStep::Locked) {
+            pauseOnLockHit_();
             notePause_(span.offset);
             chain.clear();
             keys.clear();
@@ -1518,6 +1521,7 @@ bool VerdictSource::applyTxnBatch_(const uint8_t* batch, std::size_t len, TxnKey
                 const rune::view::PrepareStatus s = prepare_(members_[i], rec, nullptr, lockSet_());
                 if (s == rune::view::PrepareStatus::CapacityExhausted) stall_(StallReason::Capacity);
                 if (s == rune::view::PrepareStatus::Locked) {
+                    pauseOnLockHit_();
                     notePause_(span.offset);
                     parkOneStep_(true, /*onLock=*/true);   // the lock clears at the holder's marker, which may wait for a vote the waiter judges
                 }

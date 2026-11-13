@@ -519,8 +519,14 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
     abort marker then finalizes the result in one step. Counters are ids 11 to 20 of `rune stats topic <t>`: `txnVotesYes`,
     `txnVotesNo`, one counter each for 55, 56, 57 and 62 (`TxnConflict` no votes count only in `txnVotesNo`), `txnVoteLatencyNsMax` and `txnVoteLatencyNsTotal`.
   - **Lock pause.** While a transaction holds a row locked, the verdicts of other writers' records that touch the row wait for its
-    marker; the time is `foldPausedOnTxnLockNs`. A distributed lock wait ends at the transaction timeout at the latest, when the
-    coordinator aborts the transaction. A judgement never waits for another transaction's marker to free an overlay: the worker adds
+    marker; the time is `foldPausedOnTxnLockNs`. A distributed lock wait is a cycle when two transactions hold rows on two
+    partitions in opposite order. A partition whose judge is paused on a transaction's rows tells the coordinator which transaction
+    (once per pending vote and holder); the coordinator keeps that as a wait-for edge, and when the edges of its committing
+    transactions form a cycle it aborts the one with the latest start (the larger producer id on a tie) at once. That transaction's
+    commit fails with `TxnConflict` (63), a retriable abort, and the others go on; each one is an info log line on the coordinator
+    ("a cycle of lock waits is resolved"). Waiting behind a lock that is not part of a cycle is a delay, and nobody is aborted. What stays bounded by the
+    transaction timeout: a pause with no single holder (a full overlay pool, a capacity stall), and a wait of a transaction behind
+    its own producer's previous one. A judgement never waits for another transaction's marker to free an overlay: the worker adds
     one when every overlay holds a lock, and drops it again once it is free and the pool has not grown for 10 s.
   - **`txnMarkerWithoutVote`** counts markers that arrived for a transaction nobody asked a vote for. It stays 0; a non-zero
     value is a coordinator bug.

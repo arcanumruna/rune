@@ -1097,11 +1097,20 @@ struct VerifyTxnPartitionResponseMsg : VerifyTxnPartitionMsg {
 //   producerId        : int64 @ +16
 //   coordinatorEpoch  : int32 @ +24
 //   producerEpoch     : int16 @ +28
-//   errorCode         : int16 @ +30   transport: 0, NotLeader or InvalidTxnState
+//   errorCode         : int16 @ +30   transport: 0, NotLeader or InvalidTxnState; kTxnVoteWaiting = an interim (below)
 //   code              : uint16 @ +32  the vote: 0 = yes, else the rejection code   (+34..35 pad)
 //   constraintId      : uint32 @ +36
 //   failingOffset     : int64 @ +40
+//
+// The interim (#995): while the partition's judge is paused on a row a judged, undecided transaction U holds, the leader
+// answers each pending vote once with errorCode = kTxnVoteWaiting, failingOffset = U's producer id and constraintId = U's
+// producer epoch (as uint32); code is 0.  It does not complete the vote: the real answer follows.  The block length is
+// unchanged.  An older coordinator sees a non-zero errorCode (a transport error) and asks again with its backoff.
 // ===========================================================================
+/// errorCode of an interim TxnVoteResponse.  Not a client ErrorCode (those are positive) and not one of the replication
+/// plane's kErr* codes (-1 .. -12): a transport status that no other path produces.
+inline constexpr int16_t kTxnVoteWaiting = -100;
+
 struct TxnVoteMsg {
     static constexpr uint16_t    TEMPLATE_ID  = 15;
     static constexpr uint16_t    BLOCK_LENGTH = 40;

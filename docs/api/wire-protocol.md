@@ -541,7 +541,9 @@ are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRe
   `TxnVote`, coordinator to partition leader (40-byte block: `coordinatorNodeId`, `coordinatorEpoch`, `token`, `topicId`,
   `partition`, `producerId`, `producerEpoch`, `leaderEpoch`), and template 16 `TxnVoteResponse`, leader to coordinator (48-byte
   block: `token`, `topicId`, `partition`, `producerId`, `coordinatorEpoch`, `producerEpoch`, `errorCode` for the transport,
-  `code` for the vote, `constraintId`, `failingOffset`).
+  `code` for the vote, `constraintId`, `failingOffset`). While the partition's judge waits on another transaction's rows, the
+  leader answers each pending vote once with an interim: `errorCode` -100, `failingOffset` the holder's producer id, `constraintId`
+  its producer epoch. It is not the answer; the vote follows. A coordinator that predates it sees a transport error and asks again.
 - **Internal ring** (`schemaId 7`, SBE, `schema/rune-internal-ring.xml`): messages between threads of one process
   (`WorkerOp`, `WorkerReturn`, `FlushRequest`, `FlushCompletion`). They never cross a wire.
 - **Conformance vectors**: `protocol/conformance/` holds generated golden vectors for the client frames; see its

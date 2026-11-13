@@ -793,6 +793,9 @@ public:
         return ws != nullptr ? &ws->txn.stats : nullptr;
     }
     [[nodiscard]] int64_t parkedVotesForTest() const noexcept { return parkedVotes_; }
+    /// #995: interim answers sent to pending votes (the judge waits on another transaction), and those held back for want of return room.
+    [[nodiscard]] uint64_t txnVoteInterimsForTest() const noexcept { return txnVoteInterims_; }
+    [[nodiscard]] uint64_t txnVoteInterimsDeferredForTest() const noexcept { return txnVoteInterimsDeferred_; }
     [[nodiscard]] std::size_t voteScansForTest() const noexcept { return voteScans_.size(); }
     void setVerdictAckArenaEntriesForTest(uint32_t entries) { ackSink_->resizeVerdictArenaForTest(entries); }
     [[nodiscard]] const VerdictSourceStats* verdictStatsForTest(int32_t topicId, int32_t partition) const noexcept {
@@ -7091,6 +7094,7 @@ private:
     static constexpr std::size_t kMaxVoteScans = 256;
     std::vector<VoteScan> voteScans_;
     int64_t parkedVotes_ = 0;
+    uint64_t txnVoteInterims_ = 0, txnVoteInterimsDeferred_ = 0;   // #995
     std::array<uint8_t, rune::storage::control_record::kTxnJudgeBatchBytes> txnJudgeScratch_{};
     int32_t txnJudgedRecordsMax_ = 4096;
     int64_t  verdictIntervalNs_ = 100'000'000;
@@ -9252,8 +9256,38 @@ private:
                 if (t == nullptr) answerVote_(ws, v, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), {}, -1, nowNs, true);
                 else answerVote_(ws, v, 0, t->answer, t->judgeOffset, nowNs, true);
             });
+            if (ws.txn.parkedCount() != 0) work += sendVoteInterims_(ws);
         }
         return work;
+    }
+    /// #995: the votes still parked wait behind a judge paused on another transaction: each is told once per holder (an interim,
+    /// errorCode kTxnVoteWaiting, baseOffset = the holder's producer id, newNextOffset = its epoch), so the coordinator can see a
+    /// cycle of such waits.  The interim is no answer: the vote stays parked.  Never when the return FIFO is past its high water:
+    /// it is asked again on the next pass (the holder is not recorded), counted.  No holder (the pool is full, a capacity stall):
+    /// nothing is sent, and the wait is bounded by the transaction timeout.
+    int sendVoteInterims_(PartitionWriteState& ws) {
+        if (ws.verdicts == nullptr) return 0;
+        return ws.txn.noteJudgeWait(ws.verdicts->pauseHolderPid(), ws.verdicts->pauseHolderEpoch(), [&](const ParkedVote& v) {
+            if (retFifo_.size() >= kOverflowHighWater) {
+                ++txnVoteInterimsDeferred_;
+                return false;
+            }
+            WorkerReturn ret;
+            ret.type          = WorkerReturn::Type::TxnVoteResult;
+            ret.correlationId = v.token;
+            ret.sessionId     = v.originNode;
+            ret.topicId       = ws.spec->topicId;
+            ret.partition     = ws.partition;
+            ret.producerId    = v.producerId;
+            ret.producerEpoch = v.epoch;
+            ret.errorCode     = rune::replication::kTxnVoteWaiting;
+            ret.baseOffset    = ws.verdicts->pauseHolderPid();
+            ret.newNextOffset = static_cast<int64_t>(static_cast<uint16_t>(ws.verdicts->pauseHolderEpoch()));
+            ret.lastOffset    = -1;
+            enqueueReturn_(std::move(ret));
+            ++txnVoteInterims_;
+            return true;
+        });
     }
     /// Demotion, or the state is about to go: every parked vote is answered NotLeader (retriable) and its scan dropped.
     void dropVotes_(PartitionWriteState& ws) {

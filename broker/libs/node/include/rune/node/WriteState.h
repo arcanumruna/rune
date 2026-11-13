@@ -366,7 +366,10 @@ struct DeferredTxn {
     int64_t     holdFrom = INT64_MAX;   ///< below firstOffset: an applied ordinary span holds it (the coverage never splits that span)
 };
 /// `judgeOffset`: the J the vote waits for; -1 while the worker's vote-time scan runs (only the worker answers those).
-struct ParkedVote { int64_t token = 0; int32_t originNode = -1; int64_t producerId = -1; int16_t epoch = -1; int64_t judgeOffset = -1; int64_t receivedNs = 0; int64_t first = -1; };
+/// `waitPid` / `waitEpoch` (#995): the holder of the last interim sent for this vote (waitPid -1 = none sent, or the judge is no
+/// longer paused on a known holder): a pause sends one interim per vote and holder, never one per pass.
+struct ParkedVote { int64_t token = 0; int32_t originNode = -1; int64_t producerId = -1; int16_t epoch = -1; int64_t judgeOffset = -1; int64_t receivedNs = 0; int64_t first = -1;
+                    int64_t waitPid = -1; int16_t waitEpoch = 0; };
 
 /// The transactions of one source between their TxnJudge record and their marker, in judge-offset order.  Everything is reserved
 /// by reserve(); no call allocates after it.  A full table refuses the record (nullptr): the judge waits there, never a verdict.
@@ -532,6 +535,25 @@ public:
             }
         }
         parked_.resize(kept);
+        return n;
+    }
+    /// #995: the judge is paused on (holderPid, holderEpoch) (holderPid -1: on no known holder).  fn(const ParkedVote&) is asked, once per
+    /// vote and holder, to send the interim; it returns whether it did (a refused one is asked again).  A vote of the holder's own
+    /// producer is never told (its own previous transaction's rows).  Returns the interims sent.
+    template <class Fn>
+    int noteJudgeWait(int64_t holderPid, int16_t holderEpoch, Fn&& fn) noexcept {
+        int n = 0;
+        for (ParkedVote& v : parked_) {
+            if (holderPid < 0 || v.producerId == holderPid) {
+                v.waitPid = -1;
+                continue;
+            }
+            if (v.waitPid == holderPid && v.waitEpoch == holderEpoch) continue;
+            if (!fn(static_cast<const ParkedVote&>(v))) continue;
+            v.waitPid   = holderPid;
+            v.waitEpoch = holderEpoch;
+            ++n;
+        }
         return n;
     }
     /// fn(const ParkedVote&) for the scanning votes (J -1) of the producer's transaction from `first`, which leave the park; `bindTo` >= 0 binds them to that J instead.

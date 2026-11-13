@@ -7611,6 +7611,28 @@ std::size_t ClientGateway::purgeTxnVotes(int32_t olderThan)
 
 void ClientGateway::onTxnVoteResult_(const rune::node::WorkerReturn& ret)
 {
+    if (ret.errorCode == rune::replication::kTxnVoteWaiting) {   // #995: an interim, no answer: the vote stays in flight
+        if (ret.sessionId >= 0) {   // for another node's coordinator: passed over the plane, the remote vote stays owed
+            const auto it = remoteVotes_.find(RemoteVoteKey{static_cast<int32_t>(ret.sessionId), ret.correlationId});
+            if (it == remoteVotes_.end()) return;
+            rune::replication::TxnVoteResponseMsg r = it->second;
+            r.errorCode     = rune::replication::kTxnVoteWaiting;
+            r.code          = 0;
+            r.constraintId  = static_cast<uint32_t>(ret.newNextOffset);
+            r.failingOffset = ret.baseOffset;
+            answerRemoteVote_(static_cast<int32_t>(ret.sessionId), r);
+            return;
+        }
+        const auto it = votesInFlight_.find(ret.correlationId);
+        if (it == votesInFlight_.end() || voteSink_ == nullptr) return;
+        const VoteInFlight v = it->second;   // copied: the sink may send again
+        TxnVoteResult r;
+        r.waiting   = true;
+        r.waitPid   = ret.baseOffset;
+        r.waitEpoch = static_cast<int16_t>(ret.newNextOffset);
+        voteSink_(voteSinkCtx_, v.topicId, v.partition, v.producerId, v.producerEpoch, v.coordinatorEpoch, r);
+        return;
+    }
     if (ret.sessionId >= 0) {   // a vote taken for another node's coordinator: answer it over the plane
         auto it = remoteVotes_.find(RemoteVoteKey{static_cast<int32_t>(ret.sessionId), ret.correlationId});
         if (it == remoteVotes_.end()) {
@@ -7689,6 +7711,16 @@ void ClientGateway::onRemoteTxnVoteResponse(const rune::replication::TxnVoteResp
         it->second.producerEpoch != r.producerEpoch || it->second.coordinatorEpoch != r.coordinatorEpoch) {
         spdlog::debug("ClientGateway: TxnVoteResponse for unknown token={} topic={} partition={}", r.token, r.topicId,
                       r.partition);
+        return;
+    }
+    if (r.errorCode == rune::replication::kTxnVoteWaiting) {   // #995: an interim, no answer: the vote stays in flight
+        if (voteSink_ == nullptr) return;
+        const VoteInFlight w = it->second;   // copied: the sink may send again
+        TxnVoteResult res;
+        res.waiting   = true;
+        res.waitPid   = r.failingOffset;
+        res.waitEpoch = static_cast<int16_t>(r.constraintId);
+        voteSink_(voteSinkCtx_, w.topicId, w.partition, w.producerId, w.producerEpoch, w.coordinatorEpoch, res);
         return;
     }
     const VoteInFlight v = it->second;

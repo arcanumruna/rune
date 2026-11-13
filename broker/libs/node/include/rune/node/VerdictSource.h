@@ -315,6 +315,12 @@ public:
     }
     /// Where the judge stands; it runs ahead of deferred transactions.
     [[nodiscard]] int64_t judgeCursor() const noexcept { return judgeCursor_; }
+    /// #995: the transaction (producer id, epoch) the judge is paused on in the last driveJudge pass: the owner of a row it met locked
+    /// (a judged, undecided transaction's overlay).  -1 = not paused on one known holder: no pause, a full overlay pool, a capacity
+    /// stall, a probe wait at an open transaction's first record (it ends by itself once the coordinator's vote or marker reaches the
+    /// partition, and every concurrent commit would otherwise look like a cycle) and a wait for a marker past the end.
+    [[nodiscard]] int64_t pauseHolderPid() const noexcept { return pauseHolderPid_; }
+    [[nodiscard]] int16_t pauseHolderEpoch() const noexcept { return pauseHolderEpoch_; }
     /// Gives the pool every overlay `txn` holds, and drops the judgement in progress.  The leadership scan's begin and activate_ call
     /// it before the table is reset.
     void releaseTxnOverlays(TxnJudgeState& txn) noexcept;
@@ -536,9 +542,18 @@ private:
     void   refreshLocks_() noexcept {
         if (txnPool_ != nullptr) txnPool_->lockSetFor(sourceKey_, txnLockPtrs_);
         txnLocks_.locked = txnLockPtrs_;
+        txnLocks_.hit = nullptr;
     }
     [[nodiscard]] const rune::view::TxnLockSet* lockSet_() const noexcept { return txnLocks_.locked.empty() ? nullptr : &txnLocks_; }
     void   notePause_(int64_t offset) noexcept;
+    /// #995: the judge pauses on `producerId`'s transaction.
+    void   pauseOn_(int64_t producerId, int16_t epoch) noexcept { pauseHolderPid_ = producerId; pauseHolderEpoch_ = epoch; }
+    /// #995: a Locked prepare names the overlay it met (TxnLockSet::hit): its owner is the holder.  Cold: a pause only.
+    void   pauseOnLockHit_() noexcept {
+        const rune::view::TxnOverlay* const h = txnLocks_.hit;
+        txnLocks_.hit = nullptr;
+        if (h != nullptr && h->ownerPid() >= 0) pauseOn_(h->ownerPid(), h->ownerEpoch());
+    }
     void   noteMarkerWithoutVote_(const OrdinaryTxn& o, bool applied) noexcept;          // cold
     void   countVote_(const TxnVoteAnswer& a) noexcept;
     [[nodiscard]] bool recordRejection_(int64_t offset, const rune::view::Verdict& v) noexcept;
@@ -643,6 +658,8 @@ private:
     std::vector<const rune::view::TxnOverlay*> txnLockPtrs_;   // reserved to the pool's size in bindTxn: refreshLocks_ never allocates
     TxnJudgement                jx_;
     int64_t                     judgePid_ = -1;           // TxnStop::Judge: the producer whose TxnJudge the judge stands at
+    int64_t                     pauseHolderPid_ = -1;     // #995: see pauseHolderPid()
+    int16_t                     pauseHolderEpoch_ = 0;
     int64_t                     overlayWaitAt_ = -1, lockPausedAt_ = -1;   // each wait counted once
     int64_t                     nowNs_ = 0, lockPausedNs_ = 0;
     int64_t                     finalizePid_ = -1, finalizeApplied_ = -1;   // a commit finalized part-way (a read failed)
@@ -1088,6 +1105,7 @@ bool VerdictSource::judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedT
     DeferredTxn& t = *state_->txn.find(judgePid_);
     if (jx_.atMarker || jx_.producerId != t.producerId || jx_.end != t.judgeOffset) {
         if (!beginJudgement_(t.producerId, t.firstOffset, t.judgeOffset, false)) return false;
+        txnPool_->at(jx_.overlay).setOwner(t.producerId, t.epoch);   // #995: the holder a pause on its rows names
         t.overlay = jx_.overlay;
         t.phase = TxnPhase::Judging;
     }
@@ -1244,6 +1262,8 @@ bool VerdictSource::finalizeLocked_(ReadRangeFn& readRange, const rune::view::Ab
 template <class ReadRangeFn>
 int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t nowNs, PartitionWriteState& state,
                               const rune::view::AbortedTxnFilter& aborted, int64_t lso) {
+    pauseHolderPid_ = -1;   // #995: set again by a pause of this pass
+    pauseHolderEpoch_ = 0;
     if (stalled_ || held_) return 0;
     state_ = &state;
     int work = 0;
