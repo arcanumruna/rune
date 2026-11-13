@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -19,6 +20,11 @@ namespace rune::node::test {
 namespace aidetail {
 inline void putLe(uint8_t* b, std::size_t off, uint64_t v, int bytes) {
     for (int i = 0; i < bytes; ++i) b[off + static_cast<std::size_t>(i)] = static_cast<uint8_t>(v >> (8 * i));
+}
+inline uint64_t getLe(const uint8_t* b, std::size_t off, int bytes) {
+    uint64_t v = 0;
+    for (int i = 0; i < bytes; ++i) v |= static_cast<uint64_t>(b[off + static_cast<std::size_t>(i)]) << (8 * i);
+    return v;
 }
 inline void putStr(uint8_t* b, std::size_t off, const std::string& s, std::size_t width) {
     std::memset(b + off, 0, width);
@@ -119,6 +125,13 @@ struct Ai {
         return encodedSize();
     }
     [[nodiscard]] uint64_t key() const noexcept { return id; }
+    /// The record a stored value holds; nullopt when the value is not an Ai block of this version.
+    [[nodiscard]] static std::optional<Ai> decode(std::string_view v) noexcept {
+        if (v.size() != 4 + kBlockLength) return std::nullopt;
+        const auto* b = reinterpret_cast<const uint8_t*>(v.data());
+        if (aidetail::getLe(b, 0, 2) != kBlockLength || aidetail::getLe(b, 2, 2) != kVersion) return std::nullopt;
+        return Ai{.id = aidetail::getLe(b, 4, 8), .n = static_cast<int64_t>(aidetail::getLe(b, 12, 8))};
+    }
 };
 inline const uint64_t Ai::kFingerprint = rune::codec::fingerprint(aiDescriptor());
 

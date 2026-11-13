@@ -2603,6 +2603,18 @@ std::vector<uint8_t> aiViewPlan(int32_t srcTopicId) {
     return rv::serializeAuthored(p);
 }
 
+/// A view over the user topic keyed by userId, carrying createdAt: row = [bitmap][userId][createdAt].
+std::vector<uint8_t> aiUserViewPlan(int32_t srcTopicId) {
+    namespace rv = rune::view;
+    rv::ViewPlan p;
+    p.viewName = "user_by_id";
+    p.key      = "userId";
+    p.sources.push_back(rv::SourceSpec{srcTopicId, "userId"});
+    p.output.push_back(rv::AuthoredField{"userId", rune::codec::PrimType::UInt64, 0, "userId", rv::MergeRule::Replace});
+    p.output.push_back(rv::AuthoredField{"createdAt", rune::codec::PrimType::Int64, 0, "createdAt", rv::MergeRule::Replace});
+    return rv::serializeAuthored(p);
+}
+
 /// The n of a row [bitmap][id][n].
 int64_t aiRowValue(const std::vector<uint8_t>& row) {
     int64_t n = 0;
@@ -2613,10 +2625,10 @@ int64_t aiRowValue(const std::vector<uint8_t>& row) {
 /// The `n` of view row `id` ([bitmap][id][n]); nullopt = absent.  Retries only what a moving leader or a building view answers.
 std::optional<int64_t> aiRowN(rc::Client& reader, int32_t viewTopicId, uint64_t id) {
     rc::ViewRowResult row;
-    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(100ms)) {
-        try { row = reader.getViewRowAndWait(viewTopicId, id, 0, 10s); } catch (const std::exception&) { continue; }
-        if (row.status == rc::ViewRowResult::kOk || row.status == rc::ViewRowResult::kAbsentKey) break;
-    }
+    (void)waitFor([&] {
+        try { row = reader.getViewRowAndWait(viewTopicId, id, 0, 10s); } catch (const std::exception&) { return false; }
+        return row.status == rc::ViewRowResult::kOk || row.status == rc::ViewRowResult::kAbsentKey;
+    }, 60s);
     if (row.status != rc::ViewRowResult::kOk) {
         EXPECT_EQ(row.status, rc::ViewRowResult::kAbsentKey) << "row " << id;
         return std::nullopt;
@@ -2904,12 +2916,15 @@ TEST(CheckedWritesBrokerRegression, RegressorsPathBackFillThenInsertsNeverCollid
     using namespace rune::node::test::catalog_cluster;
     constexpr int kUsers = 3000, kCharacters = 6000;
     Cluster c = startCluster("cw06");
-    int32_t userTopic = -1, characterTopic = -1;
+    int32_t userTopic = -1, characterTopic = -1, userViewTopic = -1;
     {
         auto admin = clusterAdmin(c);
         ASSERT_TRUE(admin != nullptr);
         const auto u = defineAi(*admin, "user", aiUserDescriptor(), "userId", 1, 3);
         ASSERT_EQ(u.errorCode, 0) << u.detail;
+        const auto uv = admin->createViewAndWait("user_by_id", "userId", 0, aiUserViewPlan(u.topicId), {}, 60s);
+        ASSERT_EQ(uv.errorCode, 0) << uv.detail;
+        userViewTopic = uv.viewTopicId;
         const auto ch = defineAi(*admin, "character", aiCharacterDescriptor(), "characterId", 1, 3);
         ASSERT_EQ(ch.errorCode, 0) << ch.detail;
         userTopic      = u.topicId;
@@ -2931,7 +2946,7 @@ TEST(CheckedWritesBrokerRegression, RegressorsPathBackFillThenInsertsNeverCollid
         auto client = connectClient(c, patientConfig(c, 1));
         AiWriter<AiUser> users(*client, "user");
         ASSERT_TRUE(writePipelined(*client, users.prod, kUsers,
-            [&](uint64_t i, rc::Completions& cq, rc::Token t) { users.topic.insert(AiUser{.userId = backfillId(i + 1), .provider = 1, .subject = "user" + std::to_string(i + 1)}, cq, t); },
+            [&](uint64_t i, rc::Completions& cq, rc::Token t) { users.topic.insert(AiUser{.userId = backfillId(i + 1), .provider = 1, .subject = "user" + std::to_string(i + 1), .createdAt = static_cast<int64_t>(backfillId(i + 1))}, cq, t); },
             [&](uint64_t i, const rc::WriteResult& r) {
                 EXPECT_TRUE(r.ok()) << "user " << i + 1 << " code " << r.code();
                 userIds.insert(backfillId(i + 1));
@@ -2947,6 +2962,16 @@ TEST(CheckedWritesBrokerRegression, RegressorsPathBackFillThenInsertsNeverCollid
             }));
     }
     const uint64_t userMax = *userIds.rbegin(), characterMax = *characterIds.rbegin();
+    {   // the imported ids are what the view holds, not only what the counter moved past
+        auto reader = connectClient(c, patientConfig(c, 1));
+        for (const uint64_t i : {uint64_t{kUsers}, uint64_t{kUsers / 2}, uint64_t{1}}) {
+            const uint64_t id = backfillId(i);
+            const std::optional<int64_t> row = aiRowN(*reader, userViewTopic, id);
+            ASSERT_TRUE(row.has_value()) << "imported id " << id;
+            EXPECT_EQ(*row, static_cast<int64_t>(id)) << "the imported id is the stored id";
+        }
+        reader->close();
+    }
 
     const auto insertLive = [&](int seed, int users, int characters, uint64_t userAbove, uint64_t characterAbove) {
         auto client = connectClient(c, patientConfig(c, seed));
@@ -3059,7 +3084,7 @@ TEST(CheckedWritesBrokerRegression, KeyZeroCreatesToAnOlderClusterShardRegressio
         const rc::Completion r = prod.sendAndWait(handle, rc::Key(uint64_t{0}), bytes, rc::WriteIntent::Insert, 10s);
         EXPECT_EQ(r.status, rc::OpStatus::BrokerError);
         EXPECT_EQ(r.errorCode, kInvalidRequest);
-        EXPECT_EQ(leoOf(b.node(), t.topicId, 0), 0);
+        EXPECT_TRUE(storedValues(b.node(), t.topicId, 0).empty()) << "nothing was stored";
         prod.closeImmediately();
     }
     int32_t advertised = 0;
@@ -3116,14 +3141,14 @@ TEST(CheckedWritesBrokerRegression, LostAckRetryAcrossFailoverReturnsTheSameIdsT
     client->dropProduceAcksForTest(1);
     constexpr int64_t kMarker = 4242;
     std::optional<rc::WriteResult> retried;
-    std::thread inserter([&] { retried.emplace(w.topic.insertAndWait(Ai{.n = kMarker}, 90s)); });
+    std::jthread inserter([&] { retried.emplace(w.topic.insertAndWait(Ai{.n = kMarker}, 90s)); });
 
     // The follower holds the record, so it is committed: the ack that was dropped had been sent.
     uint64_t assigned = 0;
     ASSERT_TRUE(waitFor([&] {
         for (const std::string& v : storedValues(c.node(follower), topicId, 0)) {
-            int64_t n = 0;
-            if (v.size() == 20 && (std::memcpy(&n, v.data() + 12, 8), n == kMarker)) { std::memcpy(&assigned, v.data() + 4, 8); return true; }
+            const std::optional<Ai> rec = Ai::decode(v);
+            if (rec && rec->n == kMarker) { assigned = rec->id; return true; }
         }
         return false;
     }, 10s));
@@ -3131,7 +3156,6 @@ TEST(CheckedWritesBrokerRegression, LostAckRetryAcrossFailoverReturnsTheSameIdsT
     inserter.join();
     ASSERT_TRUE(retried.has_value());
     EXPECT_TRUE(retried->ok()) << "status " << static_cast<int>(retried->status()) << " code " << retried->code();
-    EXPECT_NE(retried->status(), rc::OpStatus::StoredIdUnknown);
     EXPECT_EQ(retried->key(), assigned) << "the retry on the new leader answers the id the old leader assigned";
     EXPECT_EQ(assigned, 4u);
 
