@@ -415,13 +415,14 @@ segment as it is. A sealed segment whose bytes after the last whole, CRC-valid b
   failed validation, timed out or could not commit) and `rune-log-segment-repair-no-peer` (a damaged segment no peer could
   serve) show it; the log lines `damaged segment <base> repaired from peer <n>` and, at critical level, `cannot be repaired
   from a peer` name the segment. Reads over the repaired range succeed at once; a subscription that already failed with
-  `CorruptBatch` stays failed and its client re-subscribes. The cleaner's `uncleanable` flag is sticky: a repair does not
-  clear it, so a compacted topic is compacted again only after the broker restarts.
+  `CorruptBatch` stays failed and its client re-subscribes. A compacted topic is compacted again after the repair,
+  without a restart: the repair swaps in a new segment file and the cleaner agent notices that the damaged file is gone.
 - **What still needs an operator.** A topic of replication factor 1; a segment every copy of which is damaged; a system log
   (below), which stops the node at boot and is restored by wiping that node and letting it resync; and a range above the high
   watermark. For these the segment stays damaged exactly as before: `rune-log-segment-repair-no-peer` rises once per segment
   and the critical line is logged once.
-- **Cleaner.** The log cleaner refuses a log that has a damaged segment until the broker restarts, repaired or not.
+- **Cleaner.** The log cleaner skips a log that has a damaged segment until that segment file is replaced (a repair, or
+  the cleaner or retention removing it) or the broker restarts.
 - **Retention.** Retention deletes the damaged segment whole, once it ages out. The size accounting counts only its valid prefix.
 - **System logs refuse to start.** Damage in `__catalog`, `__security`, `__consumer_offsets`, `__transaction_state` or
   `__cluster_metadata` stops the node at boot: it logs `system log <dir> has a damaged segment at offset <o> - refusing to
