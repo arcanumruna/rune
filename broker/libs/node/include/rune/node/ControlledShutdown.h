@@ -541,9 +541,14 @@ private:
             }
             return work;
         }
+        // #970: ctl == self_ here means this node WON the consensus but its election is not closed yet (withdrawCandidacy
+        // only blocks the canvass and nominate stages).  Asking itself would end Draining without a resign and leave the
+        // stopped node leading.  Send nothing and conclude nothing: the leader branch above decides once the election
+        // closed, and a lost leadership changes ctl - both are events, no timer.
+        if (ctl == self_) return 0;
         st.remaining = blocking(map, self_, /*userOnly=*/false);
         const int work = askCompletion_(st.req, st.remaining, nowNs);
-        if (st.remaining == 0 && ctl >= 0 && st.req.completeBy == ctl) {
+        if (st.remaining == 0 && ctl >= 0 && ctl != self_ && st.req.completeBy == ctl) {
             spdlog::info("ControlledShutdown[{}]: every movable partition is led elsewhere, this node left "
                          "every ISR and the controller confirmed every live member routes around it — "
                          "ready to stop ({} ms)", self_, (nowNs - st.startedNs) / 1'000'000);

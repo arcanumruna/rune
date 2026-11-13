@@ -569,7 +569,9 @@ TEST(ControlledShutdownRegression, ControllerCrashMidHandOffRegression) {
     ns[static_cast<std::size_t>(controller)]->stop();
     const bool done = ns[static_cast<std::size_t>(victim)]->controlledShutdown(30'000ms);
     EXPECT_TRUE(done) << "the hand-off never completed with the successor controller";
-    EXPECT_EQ(consensusLeaderOnControl(*ns[static_cast<std::size_t>(third)]), third);
+    EXPECT_TRUE(eventually([&] { return consensusLeaderOnControl(*ns[static_cast<std::size_t>(third)]) == third; }, 20'000ms))
+        << "the third node never became the consensus leader (it reads node "
+        << consensusLeaderOnControl(*ns[static_cast<std::size_t>(third)]) << ")";
     for (const auto& [p, e] : oldEpoch) {
         const auto cl = committedLeader(*ns[static_cast<std::size_t>(third)], 0, p);
         EXPECT_EQ(cl.first, third) << "partition " << p << " not handed to the surviving node";
