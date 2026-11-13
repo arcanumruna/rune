@@ -586,6 +586,54 @@ TEST(ClientAgentRegression, StaleWorkerBindAckIgnoredRegression) {
     ASSERT_TRUE(r.drive([&] { return r.client.testWorkerBindAcksIgnored() == 3u; }));
 }
 
+// #833: a bind in Sent, then the partition's leader moves to another worker: the old entry goes Sent -> Free (its pair
+// is released).  The old bind's late ack - from the old worker and from the new one - matches nothing: no entry binds,
+// nothing is released, the held produce stays held.  The new worker's own bind then proceeds normally.
+TEST(ClientAgentRegression, ALateBindAckAfterALeaderChangeMatchesNothingRegression) {
+    Options o; o.fakeClock = true;
+    Rig r(4225, 4226, o);
+    const auto wA = r.addWorker(0, 4227);
+    const auto wB = r.addWorker(0, 4228);   // exists from the start (its endpoint must be up), advertised only later
+    const auto adB = r.gw.partitions.back();
+    r.gw.partitions.pop_back();
+    r.gw.noBindAcks = true;
+    r.gw.replyPongs = true;
+    connectThenFreeze(r);
+    if (::testing::Test::HasFatalFailure()) return;
+    auto p = r.client.producer(noLinger());
+    const rc::Token t = sendOne(r, p);
+    ASSERT_TRUE(r.drive([&] { return r.gw.binds.size() == 1; })) << "the bind to the first worker never went out";
+    ASSERT_EQ(r.gw.binds[0].endpoint, wA.endpoint);
+    const auto oldBind = rp::WorkerBind::decode(r.gw.workerBindFrames[0].data(), r.gw.workerBindFrames[0].size());
+    ASSERT_TRUE(oldBind.has_value());
+
+    // The leader moves to a second worker (epoch 2): the first entry is freed while its bind is unacknowledged.
+    r.gw.partitions                = {adB};
+    r.gw.partitions[0].leaderEpoch = 2;
+    r.gw.sendMetadata(oldBind->sessionId, /*correlationId=*/0);
+    const bool gotB = r.drive([&] { return r.gw.binds.size() == 2; });
+    ASSERT_TRUE(gotB) << "no bind for the new leader";
+    ASSERT_EQ(r.gw.binds[1].endpoint, wB.endpoint);
+    const auto newBind = rp::WorkerBind::decode(r.gw.workerBindFrames[1].data(), r.gw.workerBindFrames[1].size());
+    ASSERT_TRUE(newBind.has_value());
+    ASSERT_NE(newBind->correlationId, oldBind->correlationId);
+
+    // The old bind's ack arrives late, from the new worker's pair (deliverable) and from the old worker's.
+    r.gw.sendBindAck(wB.endpoint, oldBind->sessionId, oldBind->correlationId);
+    r.gw.sendBindAck(wA.endpoint, oldBind->sessionId, oldBind->correlationId);
+    ASSERT_TRUE(r.drive([&] { return r.client.testWorkerBindAcksIgnored() >= 1u; })) << "the late ack was never seen";
+    (void)r.drive([] { return false; }, 500);
+    EXPECT_EQ(r.client.testWorkerBindAcksAccepted(), 0u) << "a late ack of a freed entry bound something";
+    EXPECT_TRUE(r.gw.produced.empty()) << "the produce was released by a stale ack";
+
+    // The new leader's bind proceeds normally.
+    r.gw.sendBindAck(wB.endpoint, newBind->sessionId, newBind->correlationId);
+    EXPECT_TRUE(completedOk(r, t));
+    EXPECT_EQ(r.client.testWorkerBindAcksAccepted(), 1u);
+    EXPECT_EQ(r.producesAt(wB.endpoint), 1);
+    EXPECT_EQ(r.producesAt(wA.endpoint), 0);
+}
+
 // #765: a WorkerBindAck is plaintext BY CONTRACT even on an ENCRYPTED session, and is handled before the sealed-session
 // filter.  An encrypted session with the bind in Sent, then a plaintext ack with the exact (sid, corr): Bound, and the
 // held produce is released.

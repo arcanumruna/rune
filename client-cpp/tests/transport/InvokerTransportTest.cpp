@@ -1474,6 +1474,79 @@ TEST(AeronTransportRegression, AReleasedPublicationSlotIsReusedForAnotherEndpoin
     t.stop();
 }
 
+namespace {
+// A response pair to a worker whose response publication connects: one request reaches `srv`, its reply reaches the
+// client.  Leaves the pair's response image connected.
+bool pairRoundTrip(Transport& t, RawServer& srv, Transport::PubHandle h) {
+    const uint8_t request[] = {0xB1, 0x07};
+    const std::size_t seen = srv.received.size();
+    bool sent = false;
+    if (!pumpBoth(t, srv, [&] {
+            if (!sent) sent = t.offerOn(h, request, sizeof request);
+            return sent && srv.received.size() == seen + 1;
+        }))
+        return false;
+    const std::vector<uint8_t> reply = {0xB2, 0x08};
+    std::vector<uint8_t> got;
+    return pumpBoth(t, srv, [&] {
+        if (got.empty()) (void)srv.respond(reply);
+        t.poll([&](const uint8_t* b, std::size_t n) { if (got.empty()) got.assign(b, b + n); }, 10);
+        return got == reply;
+    });
+}
+}  // namespace
+
+// #833: releaseResponsePublication against a real media driver: the pair's response subscription retires and is
+// freed, its request publication is released in the driver, nothing is left draining, and the
+// slot is reusable for another worker (#832) with the pair's subscription slot recycled.
+TEST(AeronTransportRegression, ReleasingAResponsePublicationRetiresAndDrainsAgainstTheDriverRegression) {
+    FastLingerEnv env;
+    const uint16_t gwPort = rune::client::testing::allocFreeUdpPort(), gwResp = rune::client::testing::allocFreeUdpPort();
+    Config c = responseConfig(loopback(gwPort), gwResp, 3700);
+    Transport t{c};
+    t.start();
+    const uint16_t wPort = rune::client::testing::allocFreeUdpPort(), wResp = rune::client::testing::allocFreeUdpPort();
+    const std::string worker = loopback(wPort);
+    const auto respCtl = rune::client::transport::responseControlChannelFor(worker, wResp);
+    ASSERT_TRUE(respCtl.has_value());
+    const Transport::PubHandle h = t.responsePublicationHandle(worker, 3701, *respCtl);
+    ASSERT_NE(h, Transport::kNoPub);
+    RawServer srv(c.dataDir, worker, 3701, wResp, c.egressStreamId);
+    ASSERT_TRUE(pairRoundTrip(t, srv, h)) << "the pair never carried a request and its reply";
+    const int32_t sub = t.responseSubSlotForTest(h);
+    ASSERT_GE(sub, 0);
+    ASSERT_TRUE(t.subSlotLiveForTest(sub));
+    // The request publication as the driver registered it: the worker channel correlated with the response subscription.
+    const std::string requestPub = worker + "|response-correlation-id=" + std::to_string(t.responseSubscriptionIdForTest(h));
+    ASSERT_EQ(t.publisherLimitCountersForTest(requestPub), 1) << "the pair's request publication is not live in the driver";
+    const std::size_t activeBefore = t.activePublicationSlotsForTest();
+    const std::size_t slotsBefore  = t.pubSlotCountForTest();
+
+    t.releaseResponsePublication(h);
+    EXPECT_TRUE(t.publicationReleasedForTest(h));
+    EXPECT_EQ(t.activePublicationSlotsForTest(), activeBefore - 1);
+    // The driver side: the response subscription is freed, the request publication is gone from the driver, and
+    // nothing parked is left draining.
+    ASSERT_TRUE(pumpBoth(t, srv, [&] {
+        t.poll([](const uint8_t*, std::size_t) {}, 10);
+        return t.subSlotFreeForTest(sub) && t.drainingPubsForTest() == 0 && t.publisherLimitCountersForTest(requestPub) == 0;
+    })) << "free=" << t.subSlotFreeForTest(sub) << " draining=" << t.drainingPubsForTest()
+        << " requestPubCounters=" << t.publisherLimitCountersForTest(requestPub);
+
+    // The slot is reusable for ANOTHER endpoint, on the recycled subscription slot, and the new pair works.
+    const uint16_t w2Port = rune::client::testing::allocFreeUdpPort(), w2Resp = rune::client::testing::allocFreeUdpPort();
+    const std::string worker2 = loopback(w2Port);
+    const auto respCtl2 = rune::client::transport::responseControlChannelFor(worker2, w2Resp);
+    ASSERT_TRUE(respCtl2.has_value());
+    const Transport::PubHandle h2 = t.responsePublicationHandle(worker2, 3702, *respCtl2);
+    EXPECT_EQ(h2, h) << "the Released slot is reused";
+    EXPECT_EQ(t.pubSlotCountForTest(), slotsBefore) << "the table grew instead of reusing the Released slot";
+    EXPECT_EQ(t.responseSubSlotForTest(h2), sub) << "the freed subscription slot was not recycled";
+    RawServer srv2(c.dataDir, worker2, 3702, w2Resp, c.egressStreamId);
+    EXPECT_TRUE(pairRoundTrip(t, srv2, h2)) << "the reused slot does not carry a request and its reply";
+    t.stop();
+}
+
 // releasePublication on a slot that is still registering parks the registration (it used to leave it alone).
 TEST(AeronTransportRegression, ReleasingAResolvingPublicationLeavesNoOrphanRegression) {
     FastLingerEnv env;
