@@ -98,6 +98,7 @@ rune::codec::AlterOpType toCodecOpType(AlterOpKind kind) {
         case AlterOpKind::Drop:             return rune::codec::AlterOpType::Drop;
         case AlterOpKind::Rename:           return rune::codec::AlterOpType::Rename;
         case AlterOpKind::SetCompatibility: return rune::codec::AlterOpType::SetCompatibility;
+        case AlterOpKind::RetireBelow:      return rune::codec::AlterOpType::RetireBelow;
     }
     throw std::logic_error("unhandled AlterOpKind");
 }
@@ -128,6 +129,9 @@ rune::codec::AlterOp toCodecOp(const AlterOp& op) {
             break;
         case AlterOpKind::SetCompatibility:
             out.mode = toCodecCompatMode(op.mode);
+            break;
+        case AlterOpKind::RetireBelow:
+            out.version = op.retireBelow;
             break;
     }
     return out;

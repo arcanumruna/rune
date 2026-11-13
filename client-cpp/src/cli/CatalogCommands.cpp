@@ -146,6 +146,7 @@ std::string formatSchemaDefinition(const cat::TopicObject& t) {
     const cat::SchemaState& s = *t.schema;
     o << "schema " << t.name << " version " << s.schemaVersion << "\n"
       << "  compatibility " << compatName(s.compat) << "\n"
+      << (s.retiredBelow > 1 ? "  retired below: " + std::to_string(s.retiredBelow) + "\n" : std::string{})
       << "  keyField " << (s.keyField.empty() ? "-" : s.keyField) << "\n"
       << descriptorText(s.evolvingBlob);
     return o.str();
@@ -441,6 +442,8 @@ int cmdQl(const std::vector<std::string>& args, std::istream& in, std::ostream& 
 namespace {
 
 std::string statLabel(uint16_t id) {
+    if (id >= rune::protocol::client::kStatProducedAtVersionBase)   // #419: records accepted at one schema version
+        return "producedAtVersion" + std::to_string(id - rune::protocol::client::kStatProducedAtVersionBase);
     const std::string_view name = rune::protocol::client::statName(static_cast<rune::protocol::client::StatId>(id));
     return name == "unknown" ? "stat" + std::to_string(id) : std::string(name);
 }

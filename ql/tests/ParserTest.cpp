@@ -345,3 +345,51 @@ TEST(ParserRegression, CreateTopicErrorsRegression) {
     EXPECT_EQ(parseError("create frob v;"),
               "expected 'topic', 'lease', 'transient', 'view', 'user' or 'role' after 'create', got 'frob'");
 }
+
+// ── alter topic <name> retire version < N (#419) ─────────────────────────────
+TEST(ParserRetireRegression, RetireVersionParsesTheFloorAsTheOnlyOperationRegression) {
+    for (const char* text : {"alter topic users retire version < 3;", "ALTER TOPIC users RETIRE VERSION < 3;",
+                             "alter topic users retire version<3;", "alter topic users retire version  <  3 ;"}) {
+        auto r = rune::ql::parse(text);
+        ASSERT_TRUE(r.has_value()) << text << ": " << r.error().message;
+        auto* a = std::get_if<rune::ql::AlterTopicDef>(&*r);
+        ASSERT_NE(a, nullptr) << text;
+        EXPECT_EQ(a->name, "users");
+        ASSERT_EQ(a->ops.size(), 1u);
+        EXPECT_EQ(a->ops[0].kind, rune::ql::AlterOpKind::RetireBelow);
+        EXPECT_EQ(a->ops[0].retireBelow, 3);
+    }
+    for (const char* text : {"alter topic t retire version < 2;", "alter topic t retire version < 65535;"}) {
+        auto r = rune::ql::parse(text);
+        ASSERT_TRUE(r.has_value()) << text;
+        const uint16_t want = std::string_view(text).find("65535") != std::string_view::npos ? 65535 : 2;
+        EXPECT_EQ(std::get<rune::ql::AlterTopicDef>(*r).ops[0].retireBelow, want);
+    }
+}
+
+TEST(ParserRetireRegression, EveryMalformedRetireIsRefusedWithAMessageRegression) {
+    struct Case { const char* text; const char* contains; };
+    const Case cases[] = {
+        {"alter topic t retire version 3;", "expected '<'"},
+        {"alter topic t retire version;", "expected '<'"},
+        {"alter topic t retire version <= 3;", "takes '<'"},
+        {"alter topic t retire version = 3;", "takes '<'"},
+        {"alter topic t retire version < 0;", "retires nothing"},
+        {"alter topic t retire version < 1;", "retires nothing"},
+        {"alter topic t retire version < -3;", "negative"},
+        {"alter topic t retire version < 65536;", "largest schema version"},
+        {"alter topic t retire version < 99999999999999999999;", "overflow"},
+        {"alter topic t retire version < ;", "expected integer"},
+        {"alter topic t retire version < abc;", "expected integer"},
+        {"alter topic t retire < 3;", "expected 'version'"},
+        {"alter topic t retire version < 3, add column x int32;", "only operation"},
+        {"alter topic t add column x int32, retire version < 3;", "only operation"},
+        {"alter topic t retire version < 3, retire version < 4;", "only operation"},
+        {"alter topic t retire version < 3 extra;", "got 'extra'"},
+    };
+    for (const Case& c : cases) {
+        auto r = rune::ql::parse(c.text);
+        ASSERT_FALSE(r.has_value()) << c.text;
+        EXPECT_NE(r.error().message.find(c.contains), std::string::npos) << c.text << ": " << r.error().message;
+    }
+}

@@ -110,6 +110,7 @@ alter topic events set retention.ms = 604800000, retention.bytes = 1073741824;
 alter topic player add column guildId int64, set compatibility backward;
 alter topic player rename column score to points;
 alter topic player drop column guildId;
+alter topic player retire version < 3;
 drop topic events;
 drop view user_stats;
 ```
@@ -119,6 +120,14 @@ drop view user_stats;
   `set compatibility (backward | forward)`. Under `forward` compatibility, `drop column` is refused
   (`SchemaIncompatible`, 30). A stale `expectedVersion` is `SchemaConflict` (31). A schema change never
   invalidates old data: a record is decoded by the schema version it was written with.
+- `alter topic NAME retire version < N` closes the window that lets old producers keep writing: from then on a produced
+  record stamped with a schema version below `N`, and a typed open that resolves to such a version, are refused with
+  `SchemaVersionRetired` (67), never silently and never retried. `N` is an integer from 2 to 65535, it must be the only
+  operation of the statement, and it must be above the topic's current floor (a repeated statement is refused: "versions
+  below N are already retired") and no higher than the current schema version (the current version is never retired).
+  The topic must be typed, and every broker must be at feature level 7 (else `InvalidRequest`, "needs every broker
+  upgraded"). Stored old-version records stay readable by consumers, views, filters and replay. See
+  [schema evolution](codec.md#retiring-old-versions).
 - `alter transient` and `set persistence` are rejected.
 - `drop topic` on a view is `InvalidRequest` ("is a view; use DROP VIEW"); on the source of a live view it names the
   view. Dropping an unknown name is `UnknownTopic` (7). A dropped name may be created again with a new id.

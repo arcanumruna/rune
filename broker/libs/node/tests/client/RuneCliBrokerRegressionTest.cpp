@@ -3,6 +3,7 @@
 // BrokerNodes (OneBroker over Aeron UDP).  `rune ql` (DDL + reads, -f scripts, --request-id)
 // and `rune catalog export | replay | diff`.  Every wait is bounded by the CLI's own client
 // timeouts; every expected value is read back from the broker's own __catalog.
+#include "client/CheckedWritesBrokerSupport.h"
 #include "client/OneBroker.h"
 #include "support/CatalogBrokerCluster.h"
 
@@ -656,6 +657,61 @@ TEST(RuneCliBrokerRegression, QlDdlOverEveryStatementKind) {
     EXPECT_EQ(std::get<rcat::CreateTopicOps>(log[4].event.ops).persistence, rcat::Persistence::Transient);
     EXPECT_EQ(log[5].event.kind, rcat::EventKind::DropTopic);
     for (const auto& r : log) EXPECT_FALSE(r.event.statement.empty()) << r.offset;
+}
+
+// ── schema retire (#419): the issue's flow through the CLI and a real C++ client producer, on the default config ─────────
+
+TEST(RuneCliBrokerRegression, RetireVersionCutsOffAnOldProducerAndShowsTheFloorRegression) {
+    namespace cwb = rune::node::test::cw_broker;
+    OneBroker b("cli_retire");
+    std::string out, err;
+    const auto f = writeTemp("retire.rql",
+                             "topic t { id int64, hp int64 } partitions 1 key id;\n"
+                             "alter topic t add column mana int64;\n");
+    ASSERT_EQ(runCli({"ql", "-f", f, "--broker", b.endpoint()}, &out, &err), 0) << err;
+    const auto idOf = [&] { return cwb::catalogTopicId(b.node(), "t"); };
+    const int32_t topicId = idOf();
+    ASSERT_GE(topicId, 0);
+    // a producer still on schema version 1 {id, hp}: 4-byte header (block length 16, version 1) + the two int64 columns
+    const auto v1 = [](uint64_t id) {
+        std::string v(20, '\0');
+        v[0] = 16; v[2] = 1;
+        for (int i = 0; i < 8; ++i) v[4 + i] = static_cast<char>((id >> (8 * i)) & 0xFF);
+        return v;
+    };
+    const auto key = [](uint64_t id) { return rune::client::Key(id); };
+    uint16_t code = 2;   // NotLeader until the spec is installed
+    for (int i = 0; i < 200 && (code == 2 || code == cwb::kNotOk); ++i) {
+        code = cwb::produceRaw(b, "t", topicId, 1, v1(1), key(1));
+        if (code == 2 || code == cwb::kNotOk) std::this_thread::sleep_for(50ms);
+    }
+    EXPECT_EQ(code, 0) << "before the retire an old-version producer is accepted";
+
+    // the statement: accepted once, then refused as already retired / above the current version
+    ASSERT_EQ(runCli({"ql", "-e", "alter topic t retire version < 2;", "--broker", b.endpoint()}, &out, &err), 0) << err;
+    const auto log = b.catalogEvents();
+    EXPECT_EQ(log.back().event.kind, rcat::EventKind::RetireSchemaVersions);
+    EXPECT_EQ(log.back().event.formatVer, rcat::kFormatV5);
+    EXPECT_EQ(runCli({"ql", "-e", "alter topic t retire version < 2;", "--broker", b.endpoint()}, &out, &err), 1);
+    EXPECT_NE(err.find("already retired"), std::string::npos) << err;
+    EXPECT_EQ(runCli({"ql", "-e", "alter topic t retire version < 9;", "--broker", b.endpoint()}, &out, &err), 1);
+    EXPECT_NE(err.find("above the current version"), std::string::npos) << err;
+
+    // describe shows the floor
+    ASSERT_EQ(runCli({"ql", "-e", "show schema t as of offset " + std::to_string(log.back().offset) + ";", "--broker", b.endpoint()}, &out, &err), 0) << err;
+    EXPECT_NE(out.find("retired below: 2"), std::string::npos) << out;
+
+    // the old producer now fails with the explicit, terminal code; nothing more is stored
+    for (int i = 0; i < 200; ++i) {
+        code = cwb::produceRaw(b, "t", topicId, 1, v1(2), key(2));
+        if (code == 67) break;
+        std::this_thread::sleep_for(50ms);
+    }
+    EXPECT_EQ(code, 67) << "SchemaVersionRetired";
+    // the stats command names the floor and the produce count of version 1
+    ASSERT_EQ(runCli({"stats", "topic", "t", "--partition", "0", "--broker", b.endpoint()}, &out, &err), 0) << err;
+    EXPECT_NE(out.find("schemaRetiredBelow"), std::string::npos) << out;
+    EXPECT_NE(out.find("producedAtVersion1"), std::string::npos) << out;
 }
 
 // ── diff ────────────────────────────────────────────────────────────────────

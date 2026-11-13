@@ -97,7 +97,7 @@ security 64 to 95.
 | 65 | `DefineTopicResponse` | B→C | `topicId`, `version`, `errorCode` |
 | 66 | `GetTopicSchema` | C→B | `topicName`, `requestedFingerprint` (0 = latest; `~0` = the evolving lineage) |
 | 67 | `TopicSchemaResponse` | B→C | `topicId`, `version`, `errorCode`, `descriptorBlob`, `partitionCount`, key features (optional) |
-| 68 | `AlterTopic` | C→B | `topicName`, `expectedVersion`, `opsBlob`, DDL extension |
+| 68 | `AlterTopic` | C→B | `topicName`, `expectedVersion`, `opsBlob` (op types 1 Add, 2 Drop, 3 Rename, 4 SetCompatibility, 5 RetireBelow: `u16 version`, the only op of its request; needs feature level 7), DDL extension |
 | 69 | `AlterTopicResponse` | B→C | `topicId`, `newVersion`, `errorCode` |
 | 70 | `CreateView` | C→B | `viewName`, `keyField`, `persistence`, `planBlob`, DDL extension |
 | 71 | `CreateViewResponse` | B→C | `viewTopicId`, `outputFingerprint`, `errorCode` |
@@ -443,6 +443,8 @@ topic or view. The leader's owning worker answers, so a read costs about as much
 | 34 | `scanPages` | view | `ScanViewRows` pages served. |
 | 35 | `transientRecordsEvicted` | view | Records a transient source dropped before the view folded them. |
 | 36 | `transientSourceResets` | view | Times the source ring was recreated or cut under the view's cursor. |
+| 21 | `schemaRetiredBelow` | topic | The topic's schema retire floor: records stamped with a version below it are refused (`SchemaVersionRetired`, 67). 1 = nothing retired. Reported for every typed topic. |
+| 0x8000 + V | (`producedAtVersion<V>`) | topic | Records the answering worker accepted at schema version V for the topic (all its partitions of that topic) since it started. Sent for each installed version with a non-zero count, lowest version first until the 64-entry limit; versions of 0x8000 and above are not reported. A version is unused when every partition leader reports no count for it. Ids stay strictly ascending. |
 
 Ids 1 to 31 are topic scope and 32 and up are view scope; new ids are appended. The constraint entries are the per-constraint
 rejection counts of a topic's verdict source, `constraintId = viewObjectId << 16 | ordinal`.
@@ -517,6 +519,7 @@ rejection counts of a topic's verdict source, `constraintId = viewObjectId << 16
 | 64 | `LeaseNotFound` | Client 18: no live lease for the key, or a lease at a different version. A session below 18 is answered `InvalidRequest` (39). | per-record verdict of a `View` ack on a lease topic, or a `LeaseKeepAlive` entry |
 | 65 | `LeaseLimitExceeded` | Client 18: the topic's `lease.max_keys` or the namespace's max leases is reached. | per-record verdict of a grant |
 | 66 | `LeaseTtlTooLarge` | Client 18: the requested TTL is above the topic's `lease.max_ttl`. | `Produce` / `LeaseKeepAlive` error |
+| 67 | `SchemaVersionRetired` | A produced record, or a typed open (`GetTopicSchema`), names a schema version below the topic's retire floor (`alter topic .. retire version < N`). Nothing is stored. Sent to every client version: a client that does not know it treats an unknown produce or schema error as terminal. | `Produce` error / `TopicSchemaResponse.errorCode`; terminal |
 
 The broker-internal storage errors (`rune::protocol::ErrorCode`, [`Errors.h`](../../protocol/include/rune/protocol/Errors.h))
 are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRecord`=2, `InvalidRecordBatch`=3,

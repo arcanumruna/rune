@@ -3392,6 +3392,10 @@ TopicHandle Client::rawTopicAndWait(std::string_view name, std::chrono::nanoseco
 TopicSchemaResult Client::resolveOpenTopicFailure(std::string_view name, uint64_t fingerprint, uint16_t code, std::chrono::nanoseconds remaining) {
     constexpr auto kUnknownTopic = static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownTopic);
     const auto refused = [&](uint16_t c) {
+        if (c == static_cast<uint16_t>(rune::protocol::client::ErrorCode::SchemaVersionRetired))   // #419
+            return "openTopic: the schema version this type was generated from is retired on '" + std::string(name) +
+                   "' (error 67 SchemaVersionRetired: versions below the topic's retire floor are refused); regenerate the type "
+                   "from the current schema";
         std::string msg = "openTopic: the broker refused '" + std::string(name) + "' (error " + std::to_string(c);
         if (const char* an = authErrorName(c)) msg += std::string(" ") + an;
         else if (c == kUnknownTopic) msg += " UnknownTopic";

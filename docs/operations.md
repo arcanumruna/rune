@@ -600,6 +600,9 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
 
 ## Upgrades
 
+- **Metadata feature level 7 (`kSchemaRetire`)** gates `alter topic .. retire version < N`: the statement is refused
+  (`InvalidRequest`, "needs every broker upgraded") until every broker runs this build, and the catalog then writes
+  `formatVer` 5 events. See [schema evolution](api/codec.md#retiring-old-versions) for when to retire and the stats to check first.
 - Upgrade **brokers before clients**: a new client defining a transient topic against an older broker silently gets a
   disk topic.
 - A client older than version 9 is refused at the connect on an authenticated cluster; a client older than version 8 cannot

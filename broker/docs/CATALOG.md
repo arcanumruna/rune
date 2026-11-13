@@ -36,8 +36,9 @@ Kinds:
 | `CreateView` | 7 | `createView` |
 | `AlterView` | 8 | `alterView` (a fresh output topic under the same object id) |
 | `DropView` | 9 | `drop view` |
+| `RetireSchemaVersions` | 10 | `alter topic ... retire version < N` (`formatVer` 5 only) |
 
-Kinds 32 to 36 are the namespace kinds of `formatVer` 2 and 3 (`NamespaceCreated` 32, `NamespaceLimitsSet` 33,
+Kind 10 exists only in `formatVer` 5; a `formatVer` 1 to 4 event of kind 10 is an unknown kind (`UnknownKind`). Kinds 32 to 36 are the namespace kinds of `formatVer` 2 to 5 (`NamespaceCreated` 32, `NamespaceLimitsSet` 33,
 `NamespaceStateChanged` 34, `NamespaceDeleted` 35, `NamespaceDeleteStep` 36). Kinds 37 to 63 are reserved for later
 features; `formatVer` 1 refuses all of 32 to 63.
 
@@ -98,6 +99,13 @@ created, and there is no way to alter the partition count, so the key field, its
 `Modulo` needs `autoIncrement`, and an `AlterTopicConfig` on an autoincrement topic keeps retention at -1. The golden
 `codec/tests/catalog/golden/v3/autoinc.rcat` pins five events (two creates, an `AlterSchema`, an `AlterTopicConfig`, and a
 three-partition `uint32` create).
+
+**`formatVer` 5** (schema retire, #419) is `formatVer` 4 byte for byte plus one kind, `RetireSchemaVersions` (10), whose body is
+`u16 below`. The apply rule: the topic is live and typed, `below` is above the topic's current retire floor (`retiredBelow`,
+default 1) and no higher than its current schema version, else `Precondition` ("versions below N are already retired" / "version N is
+above the current version V"). It changes only `retiredBelow` and the topic's catalog version. The floor is hashed into the object
+fingerprint and the state digest only when it is not 1, so every log without a retire keeps its digests; an `AlterSchema` or
+`SetCompatibility` carries the floor over. The leader writes `formatVer` 5 once the cluster feature level is 7 (`kSchemaRetire`).
 
 **`formatVer` rules.** The apply rules of a `formatVer` are frozen and never edited. A rule change
 ships under a new `formatVer`, and old events keep replaying under their own rules. A reader that

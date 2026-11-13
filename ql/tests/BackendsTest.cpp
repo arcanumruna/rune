@@ -145,3 +145,15 @@ TEST(BackendsRegression, ApplyPlanCarriesPersistence) {
     auto d = std::get<TopicDef>(parse("topic q { id int64 } partitions 2 key id;").value());
     EXPECT_EQ(applyPlan(d).persistence, Persistence::Disk);
 }
+
+TEST(BackendsRetireRegression, RetireVersionEncodesAsOneRetireBelowOpRegression) {
+    auto ad = std::get<AlterTopicDef>(parse("alter topic users retire version < 7;").value());
+    const auto plan = applyAlterPlan(ad, /*expectedVersion=*/0);
+    EXPECT_EQ(plan.name, "users");
+    const auto decoded = rune::codec::decodeAlterOps(plan.opsBlob);
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_EQ(decoded->size(), 1u);
+    EXPECT_EQ((*decoded)[0].type, rune::codec::AlterOpType::RetireBelow);
+    EXPECT_EQ((*decoded)[0].version, 7);
+    EXPECT_EQ(plan.opsBlob, (std::vector<uint8_t>{1, 0, 5, 7, 0})) << "u16 count, type 5, u16 floor";
+}
