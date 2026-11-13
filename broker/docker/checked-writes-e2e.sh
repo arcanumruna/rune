@@ -203,6 +203,13 @@ partition_leader() {
 
 KILLED_AT=0
 kill_node() { docker kill "$(cname $(( $1 + 1 )))" >/dev/null || fail "docker kill of rune-$(( $1 + 1 )) failed"; KILLED_AT="$(now_s)"; }
+# race_left <start_s> : the seconds left of the RACE_S budget that began at <start_s> (at least 1); one deadline for the whole race.
+race_left() { local l=$(( RACE_S - ($(now_s) - $1) )); [ "${l}" -gt 0 ] || l=1; echo "${l}"; }
+# resume_left <start_s> : the resume wait, capped by what is left of the race budget.
+resume_left() { local l; l=$(race_left "$1"); [ "${l}" -lt "${RESUME_WAIT_S}" ] && echo "${l}" || echo "${RESUME_WAIT_S}"; }
+# not_seed <leader node 0-2> <what> : the probes outlive neither their seed nor a kill of it, so a leader that moved onto the
+# seed node since the probes started is a failure naming the step, never a kill of the seed.
+not_seed() { [ "$(( $1 + 1 ))" != "${SEED_NODE}" ] || fail "$2 moved to node $1, the probes' seed (rune-${SEED_NODE}), since they started: refusing to kill it; rerun"; }
 SINCE=""
 links_since() {
     local n="$1" id c
@@ -362,21 +369,21 @@ TOTAL_WRITES=$(( WORKERS * IDS ))
 log "Leg 2: RACE: ${WORKERS} containers insert ids 1-${IDS} (${TOTAL_WRITES} writes, ${THREADS} threads each); the partition-0 leader is killed at ~30 %..."
 RACE_START=$(now_s)
 for i in $(seq 0 $(( WORKERS - 1 ))); do probe_start "race-${i}" "${RACE_S}" race --worker "${i}" --ids "1-${IDS}"; done
-wait_until $(( RACE_S )) "30 % of the race" progress_at_least $(( TOTAL_WRITES * 30 / 100 )) \
+wait_until "$(race_left "${RACE_START}")" "30 % of the race" progress_at_least $(( TOTAL_WRITES * 30 / 100 )) \
     || { out_of race-0 | tail -20 >&2; fail "the race never reached 30 % within ${RACE_S}s (at $(race_progress) of ${TOTAL_WRITES})"; }
 LEADER0=$(partition_leader "${TOPIC_ID}" 0) || fail "no leader of partition 0 at the kill"
+not_seed "${LEADER0}" "the partition-0 leader"
 BASE=$(race_progress)
 log "Leg 2: killing node ${LEADER0}, the partition-0 leader, at ${BASE} of ${TOTAL_WRITES} writes"
 kill_node "${LEADER0}"
 RESUME_AT=$(( BASE + RESUME_WRITES ))
 [ "${RESUME_AT}" -le "${TOTAL_WRITES}" ] || RESUME_AT="${TOTAL_WRITES}"
-wait_until "${RESUME_WAIT_S}" "the race resuming" progress_at_least "${RESUME_AT}" \
-    || { out_of race-0 | tail -20 >&2; fail "no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the kill (at $(race_progress))"; }
+wait_until "$(resume_left "${RACE_START}")" "the race resuming" progress_at_least "${RESUME_AT}" \
+    || { out_of race-0 | tail -20 >&2; fail "no progress past ${RESUME_AT} within $(resume_left "${RACE_START}")s of the kill (at $(race_progress))"; }
 restart_node "${LEADER0}"
 log "Leg 2: node ${LEADER0} restarted; waiting for the racers..."
 for i in $(seq 0 $(( WORKERS - 1 ))); do
-    left=$(( RACE_S - ($(now_s) - RACE_START) ))
-    [ "${left}" -gt 0 ] || left=1
+    left=$(race_left "${RACE_START}")
     wait_until "${left}" "racer ${i}" bg_done "race-${i}" || fail "racer ${i} did not finish within ${RACE_S}s of the race start"
     [ "$(bg_rc "race-${i}")" = "0" ] || { out_of "race-${i}" | tail -20 >&2; fail "racer ${i} exited $(bg_rc "race-${i}")"; }
 done
@@ -482,21 +489,21 @@ AI_START=$(now_s)
 for i in $(seq 0 $(( WORKERS - 1 ))); do
     PROBE_USER=app PROBE_PW=app.pw probe_start "ai-create-${i}" "${RACE_S}" ai-create --worker "${i}" --count "${AI_CREATES}"
 done
-wait_until "${RACE_S}" "30 % of the creates" progress_at_least $(( AI_TOTAL * 30 / 100 )) ai-create \
+wait_until "$(race_left "${AI_START}")" "30 % of the creates" progress_at_least $(( AI_TOTAL * 30 / 100 )) ai-create \
     || { out_of ai-create-0 | tail -20 >&2; fail "the creates never reached 30 % within ${RACE_S}s (at $(race_progress ai-create) of ${AI_TOTAL})"; }
 AI_LEADER=$(partition_leader "${AI_TOPIC_ID}" 0) || fail "no leader of ai_user partition 0 at the kill"
+not_seed "${AI_LEADER}" "the ai_user leader"
 BASE=$(race_progress ai-create)
 log "Leg 7: killing node ${AI_LEADER}, the ai_user leader, at ${BASE} of ${AI_TOTAL} creates"
 kill_node "${AI_LEADER}"
 RESUME_AT=$(( BASE + RESUME_WRITES ))
 [ "${RESUME_AT}" -le "${AI_TOTAL}" ] || RESUME_AT="${AI_TOTAL}"
-wait_until "${RESUME_WAIT_S}" "the creates resuming" progress_at_least "${RESUME_AT}" ai-create \
-    || { out_of ai-create-0 | tail -20 >&2; fail "no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the kill (at $(race_progress ai-create))"; }
+wait_until "$(resume_left "${AI_START}")" "the creates resuming" progress_at_least "${RESUME_AT}" ai-create \
+    || { out_of ai-create-0 | tail -20 >&2; fail "no progress past ${RESUME_AT} within $(resume_left "${AI_START}")s of the kill (at $(race_progress ai-create))"; }
 restart_node "${AI_LEADER}"
 log "Leg 7: node ${AI_LEADER} restarted; waiting for the creators..."
 for i in $(seq 0 $(( WORKERS - 1 ))); do
-    left=$(( RACE_S - ($(now_s) - AI_START) ))
-    [ "${left}" -gt 0 ] || left=1
+    left=$(race_left "${AI_START}")
     wait_until "${left}" "creator ${i}" bg_done "ai-create-${i}" || fail "creator ${i} did not finish within ${RACE_S}s of the start"
     [ "$(bg_rc "ai-create-${i}")" = "0" ] || { out_of "ai-create-${i}" | tail -20 >&2; fail "creator ${i} exited $(bg_rc "ai-create-${i}")"; }
 done
@@ -513,7 +520,8 @@ awk -v total="${AI_TOTAL}" -v top=$(( AI_IMPORT_MAX - 1 )) '
         exit bad
     }' "${ai_files[@]}" > "${WORK_DIR}/ai-create-check.txt" \
     || { cat "${WORK_DIR}/ai-create-check.txt" >&2; fail "the creators broke 'unique ids above ${AI_IMPORT_MAX}, all ok' (codes 10013 = StoredIdUnknown, 10014 = VerdictUnknown, 10002 = Timeout)"; }
-AI_TOP=$(awk '$1 > max { max = $1 } END { print max }' "${ai_files[@]}")
+AI_TOP=$(awk '$1 > max { max = $1 } END { print max }' "${ai_files[@]}") || fail "Leg 7: no highest id from the create result files"
+[ -n "${AI_TOP}" ] || fail "Leg 7: the create result files held no id"
 log "Leg 7: ${AI_TOTAL} unique ids above $(( AI_IMPORT_MAX - 1 )), highest ${AI_TOP}; $(( $(now_s) - AI_START )) s"
 leg ai-verify "${LEG_S}" "CHECKED-WRITES-AI-VERIFY: OK" ai-verify
 
@@ -521,7 +529,8 @@ log "Leg 7d: AI-DELETE-TOP: removing id ${AI_TOP}, restarting all three nodes, o
 PROBE_USER=app PROBE_PW=app.pw leg ai-remove "${LEG_S}" "CHECKED-WRITES-AI-REMOVE: OK" ai-remove --ids "${AI_TOP}-${AI_TOP}"
 restart_all
 PROBE_USER=app PROBE_PW=app.pw leg ai-after "${LEG_S}" "CHECKED-WRITES-AI-CREATE: DONE" ai-create --worker 0 --count 1 --tag ai-after
-AI_AFTER=$(awk 'NR == 1 && $3 == 0 { print $1 }' "${SHARED}/ai-after-w0.txt")
+[ -f "${SHARED}/ai-after-w0.txt" ] || fail "Leg 7d: the create after the restart wrote no result file (ai-after-w0.txt)"
+AI_AFTER=$(awk 'NR == 1 && $3 == 0 { print $1 }' "${SHARED}/ai-after-w0.txt") || fail "Leg 7d: ai-after-w0.txt could not be read"
 [ -n "${AI_AFTER}" ] || { cat "${SHARED}/ai-after-w0.txt" >&2; fail "the create after the restart was not ok"; }
 [ "${AI_AFTER}" -gt "${AI_TOP}" ] || fail "the create after the restart gave id ${AI_AFTER}, not above the removed ${AI_TOP}"
 log "Leg 7: the create after the restart gave ${AI_AFTER}, above the removed ${AI_TOP}"
@@ -581,20 +590,20 @@ rp_race() {
     if [ "${leader}" = "0" ]; then SEED_NODE=2; else SEED_NODE=1; fi   # the probes never connect through the node the race kills
     start=$(now_s)
     for i in $(seq 0 $(( WORKERS - 1 ))); do probe_start "${tag}-${i}" "${RACE_S}" "${mode}" --worker "${i}" "${flag}" "${range}"; done
-    wait_until "${RACE_S}" "30 % of ${tag}" progress_at_least $(( total * 30 / 100 )) "${tag}" \
+    wait_until "$(race_left "${start}")" "30 % of ${tag}" progress_at_least $(( total * 30 / 100 )) "${tag}" \
         || { out_of "${tag}-0" | tail -20 >&2; fail "${tag} never reached 30 % within ${RACE_S}s (at $(race_progress "${tag}") of ${total})"; }
     leader=$(partition_leader "${topic}" 0) || fail "no leader of the ${tag} topic at the kill"
+    not_seed "${leader}" "the ${tag} leader"
     BASE=$(race_progress "${tag}")
     log "Leg 8: ${tag}: killing node ${leader}, the leader, at ${BASE} of ${total} writes"
     kill_node "${leader}"
     RESUME_AT=$(( BASE + RESUME_WRITES ))
     [ "${RESUME_AT}" -le "${total}" ] || RESUME_AT="${total}"
-    wait_until "${RESUME_WAIT_S}" "${tag} resuming" progress_at_least "${RESUME_AT}" "${tag}" \
-        || { out_of "${tag}-0" | tail -20 >&2; fail "${tag}: no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the kill (at $(race_progress "${tag}"))"; }
+    wait_until "$(resume_left "${start}")" "${tag} resuming" progress_at_least "${RESUME_AT}" "${tag}" \
+        || { out_of "${tag}-0" | tail -20 >&2; fail "${tag}: no progress past ${RESUME_AT} within $(resume_left "${start}")s of the kill (at $(race_progress "${tag}"))"; }
     restart_node "${leader}"
     for i in $(seq 0 $(( WORKERS - 1 ))); do
-        left=$(( RACE_S - ($(now_s) - start) ))
-        [ "${left}" -gt 0 ] || left=1
+        left=$(race_left "${start}")
         wait_until "${left}" "${tag} probe ${i}" bg_done "${tag}-${i}" || fail "${tag} probe ${i} did not finish within ${RACE_S}s of the race start"
         [ "$(bg_rc "${tag}-${i}")" = "0" ] || { out_of "${tag}-${i}" | tail -20 >&2; fail "${tag} probe ${i} exited $(bg_rc "${tag}-${i}")"; }
     done
