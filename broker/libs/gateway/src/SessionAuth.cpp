@@ -17,7 +17,9 @@ AuthGate gateFor(const SessionAuth& a, pc::TemplateId tid, bool bootstrapOpen, b
             break;
     }
     if (std::holds_alternative<AuthAwaitingFirst>(a))
-        return tid == pc::TemplateId::AuthClientFirst || (tid == pc::TemplateId::SecurityBootstrap && bootstrapOpen)
+        return tid == pc::TemplateId::AuthClientFirst ||
+                       ((tid == pc::TemplateId::SecurityBootstrap ||
+                         tid == pc::TemplateId::SecurityBootstrapChallengeRequest) && bootstrapOpen)
                    ? AuthGate::Allow : AuthGate::AnswerAuthFailedAndEnd;
     if (std::holds_alternative<AuthAwaitingFinal>(a))
         return tid == pc::TemplateId::AuthClientFinal ? AuthGate::Allow : AuthGate::AnswerAuthFailedAndEnd;

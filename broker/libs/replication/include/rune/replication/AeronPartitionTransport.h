@@ -286,6 +286,9 @@ public:
             NodeId toPeer, const FetchRequestMsg& req) override;
     bool sendReconcileResponse(
             NodeId toPeer, const FetchResponseMsg& resp) override;
+    // #880: segment-repair pull (FetchRequest / FetchResponse layouts, templates 17 / 18).
+    bool sendRepairRequest(NodeId toPeer, const FetchRequestMsg& req) override;
+    bool sendRepairResponse(NodeId toPeer, const FetchResponseMsg& resp) override;
 
     /// Kafka AlterPartition (any thread: MPSC outbound ring).  Routed on the
     /// control thread to the CURRENT controller (setControllerId); delivered
@@ -655,8 +658,9 @@ private:
     /// \param reconcile  when true, re-stamp the FetchResponse templateId to the
     ///        reconcile id (DR reverse-catch-up) after encoding, matching
     ///        sendReconcileResponse's wire.  Returns false on full ring.
+    /// `restampTemplateId` (#880, non-zero): re-stamp to that id instead (the segment-repair answer).
     bool enqueueFetchResponse(int32_t targetNodeId, const FetchResponseMsg& resp,
-                              bool reconcile = false);
+                              bool reconcile = false, uint16_t restampTemplateId = 0);
 
     /// CONTROL-thread side: drain the outbound ring and do the real peer offers.
     /// Called from poll().  Only this path touches peers_/pubs on send.

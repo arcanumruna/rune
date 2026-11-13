@@ -61,6 +61,8 @@
 #include <filesystem>
 #include <functional>
 #include <fstream>
+#include <iterator>
+#include <span>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -1343,7 +1345,8 @@ TEST(CompactionCleanerAgent, SwapRingFullDoesNotLoseCompaction) {
 }
 
 // ===========================================================================
-// #840: a log whose cleaner met a damaged batch is uncleanable until restart.
+// #840: a log whose cleaner met a damaged batch is out of selection until its damaged segment file is replaced or the
+// broker restarts.
 // The LogCleaner is per pass, so its sticky state ends with the pass: the agent must keep the log out of selection,
 // never advance (or persist) the clean watermark past the damage, and try it once more after a restart (a fresh agent).
 // ===========================================================================
@@ -1608,6 +1611,97 @@ TEST(CompactionCleanerAgentRegression, AnUncleanableLogIsSelectedAgainOnceItsDam
     }
     EXPECT_GT(agent.passesStartedForTest(), 1u) << "the log stayed uncleanable after its damaged file was replaced";
     EXPECT_EQ(agent.uncleanableLogCountForTest(), 0u);
+    fs::remove_all(dir);
+}
+
+// #880: a damaged sealed segment repaired from a peer (the real repair API, then the posted file ops) drops the mark by
+// itself: the repair swap installs a new file, nothing here touches a time stamp.
+TEST(CompactionCleanerAgentRegression, AnUncleanableLogIsCleanedAgainAfterARealSegmentRepairRegression) {
+    auto dir = cp6TempDir("cp880_real_repair");
+    constexpr int64_t kRoll = 128;
+    std::vector<int64_t> bases;
+    {
+        Log seed(dir.string(), kRoll);
+        seed.recover();
+        Cp6NullTransport t0;
+        PartitionReplica r0(makeCompactConfig(1842, 0.0), Role::Leader, 1, std::vector<NodeId>{1},
+                            std::vector<NodeId>{1}, &seed, &t0);
+        r0.becomeLeader(1, {1});
+        for (int v = 0; v < 120; ++v) seed.append(cp6Batch(v, "k" + std::to_string(v % 5), "v" + std::to_string(v)), v);
+        seed.sync();
+        bases = seed.segmentBaseOffsets();
+    }   // clean shutdown
+    ASSERT_GE(bases.size(), 4u);
+    std::vector<fs::path> logs;
+    for (const auto& e : fs::directory_iterator(dir))
+        if (e.path().extension() == ".log") logs.push_back(e.path());
+    std::sort(logs.begin(), logs.end());
+    std::vector<uint8_t> intact;   // what a peer holds
+    {
+        std::ifstream in(logs[1], std::ios::binary);
+        intact.assign(std::istreambuf_iterator<char>(in), {});
+    }
+    {   // CRC-damage the last batch of the second (sealed) segment.
+        const auto sz = fs::file_size(logs[1]);
+        std::fstream f(logs[1], std::ios::in | std::ios::out | std::ios::binary);
+        char c = 0;
+        f.seekg(static_cast<std::streamoff>(sz) - 1);
+        f.read(&c, 1);
+        c = static_cast<char>(c ^ 0x5A);
+        f.seekp(static_cast<std::streamoff>(sz) - 1);
+        f.write(&c, 1);
+    }
+    // The broker restarts over the damaged directory: recovery marks the segment damaged.
+    Log log(dir.string(), kRoll);
+    log.recover();
+    ASSERT_EQ(log.damagedSegmentCount(), 1u);
+    Cp6NullTransport transport;
+    auto replica = std::make_unique<PartitionReplica>(
+        makeCompactConfig(1842, 0.0), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log,
+        &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->becomeLeader(1, {1});
+    replica->onLeaderLogAppended();
+    Log& lg = log;
+    rune::node::ReplicaRegistry registry;
+    registry.add(1842, 0, std::move(replica));
+    rune::node::LogCleanerAgent agent(&registry, /*cycleBudgetBytes=*/0);
+    int64_t now = 1'000'000;
+    agent.doWork(now);
+    ASSERT_EQ(agent.uncleanableLogCountForTest(), 1u) << "precondition: the damage was met";
+    ASSERT_EQ(agent.passesStartedForTest(), 1u);
+    for (int i = 0; i < 20; ++i) { now += 1'000'000; agent.doWork(now); }
+    ASSERT_EQ(agent.passesStartedForTest(), 1u) << "the damaged log was selected again";
+    const int before = cp6CountLiveRecords(lg);
+
+    // The real repair: the valid prefix is copied, the peer's batches from the damage on are appended, then the swap.
+    const auto rep = lg.beginSegmentRepair(bases[1]);
+    ASSERT_TRUE(rep.has_value());
+    std::vector<uint8_t> tail;
+    for (std::size_t pos = 0; pos < intact.size();) {
+        RecordBatchReader b(intact.data() + pos, intact.size() - pos);
+        const std::size_t total = static_cast<std::size_t>(b.totalLength());
+        if (b.baseOffset() >= rep->damageOffset)
+            tail.insert(tail.end(), intact.begin() + static_cast<std::ptrdiff_t>(pos),
+                        intact.begin() + static_cast<std::ptrdiff_t>(pos + total));
+        pos += total;
+    }
+    ASSERT_FALSE(tail.empty());
+    ASSERT_EQ(lg.appendRepairBatches(std::span<const uint8_t>(tail.data(), tail.size())).status,
+              Log::RepairAppendStatus::Ok);
+    ASSERT_EQ(lg.commitSegmentRepair(), Log::RepairCommitStatus::Ok);
+    (void)lg.runCleanerFileOps(now);   // the posted renames, as production does
+    EXPECT_EQ(lg.damagedSegmentCount(), 0u);
+
+    for (int i = 0; i < 50; ++i) {
+        now += 1'000'000;
+        agent.doWork(now);
+        lg.drainCleanerSwaps();
+    }
+    EXPECT_GT(agent.passesStartedForTest(), 1u) << "the log stayed uncleanable after its segment was repaired";
+    EXPECT_EQ(agent.uncleanableLogCountForTest(), 0u);
+    EXPECT_LT(cp6CountLiveRecords(lg), before) << "the superseded records were not compacted away";
     fs::remove_all(dir);
 }
 

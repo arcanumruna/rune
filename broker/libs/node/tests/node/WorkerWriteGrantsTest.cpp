@@ -3,6 +3,7 @@
 // A REAL invoker driver over aeron:ipc (the ShardWorkerAckTest fixture): a client produces straight to the worker's
 // ingress; the answer comes back on the session's own publication.
 #include <rune/node/EmbeddedDriver.h>
+#include <rune/node/PermissionShipper.h>
 #include <rune/node/SessionAnnouncer.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerIngress.h>
@@ -172,6 +173,20 @@ struct Fixture {
         o.nextOffset = level; o.isolation = kPermFlagSecurityBehind | kPermFlagLast;
         ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
     }
+    /// #500: the applied topic frontier as the PermissionShipper ships it (the kPermFlagSecurityBehind flag, topicId =
+    /// kPermLagTopicFrontier, the frontier in nextOffset).
+    void topicFrontier(int64_t frontier) {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = 0; o.topicId = kPermLagTopicFrontier;
+        o.nextOffset = frontier; o.isolation = kPermFlagSecurityBehind | kPermFlagLast;
+        ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
+    }
+    /// #442: the shipper's RESET (kPermFlagSecurityBehind with topicId kPermLagReset): the control thread's queue for
+    /// this worker overflowed, so every table / binding it holds may be stale.
+    void permReset() {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = 0; o.topicId = kPermLagReset;
+        o.nextOffset = 0; o.isolation = kPermFlagSecurityBehind | kPermFlagLast;
+        ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
+    }
     void produce(int64_t sid, int64_t corr, int32_t topicId = 1) {
         rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
         const auto batch = b.build();
@@ -203,9 +218,11 @@ TEST(WorkerWriteGrantRegression, UnauthenticatedSessionProduceToWorkerIsDeniedRe
     f.announce(5, /*grantAll=*/false);                     // Enabled mode: announced, not yet authenticated
     f.produce(5, 41);
     ASSERT_TRUE(f.awaitAck(41));
-    EXPECT_EQ(f.acks[41].errorCode, static_cast<int16_t>(pc::ErrorCode::NotAuthorized));
+    // #216: the same answer as the gateway's auth gate (D13): AuthenticationFailed, and the session's end is requested.
+    EXPECT_EQ(f.acks[41].errorCode, static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed));
     EXPECT_EQ(f.log->logEndOffset(), 0) << "nothing is appended for a denied session";
-    EXPECT_EQ(f.worker->workerNotAuthorizedForTest(), 1u);
+    EXPECT_EQ(f.worker->workerUnauthenticatedForTest(), 1u);
+    EXPECT_EQ(f.worker->workerNotAuthorizedForTest(), 0u);
 }
 
 // Task 14 ruling (Task 13 R2 reversed): the default is DENY.  An announcer that forgot to say anything - no grantAll, no
@@ -221,7 +238,7 @@ TEST(WorkerWriteGrantRegression, ASessionAnnouncedWithDefaultFlagsAndNoShippedBi
     }
     f.produce(9, 51);
     ASSERT_TRUE(f.awaitAck(51));
-    EXPECT_EQ(f.acks[51].errorCode, static_cast<int16_t>(pc::ErrorCode::NotAuthorized));
+    EXPECT_EQ(f.acks[51].errorCode, static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed)) << "#216: never bound";
     EXPECT_EQ(f.log->logEndOffset(), 0);
 }
 
@@ -757,4 +774,187 @@ TEST(CheckedWritesImportGrant, ImportPatchFlipsOneBit) {
     f.importPatch(3, 130, 131, bitsFor({}, 1));
     f.steps(8);
     EXPECT_FALSE(allowsImport(*f.slot(5), kNew));
+}
+
+// Issue #500: a produce the worker would DENY for a topic id at or above the applied topic frontier is not applied on
+// this broker yet (no bitmap can cover it): the retriable NotLeader, nothing appended, never the terminal 45.  Below
+// the frontier the denial is a verdict; an allowed produce is served; with no frontier shipped (INT32_MAX) every
+// denial is 45.
+// Mutation: remove the worker's frontier branch -> the id at the frontier answers 45 (red).
+TEST(WorkerWriteGrantRegression, ADenialForAnIdNotAppliedHereIsRetriableOnTheWorkerRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.chunk(5, 1, 0, 1, bitsFor({1}, 1), /*last=*/true);   // session 5: WRITE on topic 1
+    f.announce(6, false);
+    f.chunk(6, 1, 0, 1, bitsFor({}, 1), /*last=*/true);    // session 6: nothing yet (topic 1 is "being created")
+
+    f.produce(6, 1, /*topicId=*/1);   // no frontier shipped yet: unknown, so a denial is a verdict
+    ASSERT_TRUE(f.awaitAck(1));
+    EXPECT_EQ(f.acks[1].errorCode, static_cast<int16_t>(pc::ErrorCode::NotAuthorized)) << "frontier unknown: 45";
+    EXPECT_EQ(f.worker->workerDeniesUnappliedForTest(), 0u);
+
+    f.topicFrontier(1);               // id 0 is decided on this broker; 1 and up are not applied yet
+    f.produce(6, 2, /*topicId=*/1);   // at the frontier
+    f.produce(6, 3, /*topicId=*/500); // above it
+    f.produce(6, 4, /*topicId=*/0);   // below it: a verdict
+    f.produce(5, 5, /*topicId=*/1);   // allowed: served whatever the frontier
+    for (int64_t c = 2; c <= 5; ++c) ASSERT_TRUE(f.awaitAck(c)) << c;
+    EXPECT_EQ(f.acks[2].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "at the frontier";
+    EXPECT_EQ(f.acks[3].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "above the frontier";
+    EXPECT_EQ(f.acks[4].errorCode, static_cast<int16_t>(pc::ErrorCode::NotAuthorized)) << "below the frontier";
+    EXPECT_EQ(f.acks[5].errorCode, 0) << "an allowed produce is served";
+    EXPECT_EQ(f.worker->workerDeniesUnappliedForTest(), 2u);
+    EXPECT_EQ(f.worker->workerNotAuthorizedForTest(), 2u) << "only the two real verdicts";
+    EXPECT_EQ(f.log->logEndOffset(), 1) << "nothing appended by a refusal";
+
+    // RefuseAll (#603) still wins; DeferDenials (#506) does not outrank the unapplied answer (not a deferred denial).
+    f.securityLag(1);
+    f.produce(6, 6, /*topicId=*/1);
+    ASSERT_TRUE(f.awaitAck(6));
+    EXPECT_EQ(f.acks[6].errorCode, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable)) << "refuse-all wins";
+    f.securityLag(2);
+    f.produce(6, 7, /*topicId=*/1);
+    f.produce(6, 8, /*topicId=*/0);
+    ASSERT_TRUE(f.awaitAck(7));
+    ASSERT_TRUE(f.awaitAck(8));
+    EXPECT_EQ(f.acks[7].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_EQ(f.acks[8].errorCode, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable)) << "below: deferred as before";
+    EXPECT_EQ(f.worker->workerDeniesUnappliedForTest(), 3u);
+    EXPECT_EQ(f.worker->workerDeniesDeferredForTest(), 1u);
+    EXPECT_EQ(f.log->logEndOffset(), 1);
+
+    // The apply lands: the bitmap word gains the new topic's bit, then the frontier moves past it; the retry is served.
+    f.securityLag(0);
+    f.patch(f.tableOf(6), 0, 1, bitsFor({1}, 1));
+    f.topicFrontier(2);
+    f.produce(6, 9, /*topicId=*/1);
+    ASSERT_TRUE(f.awaitAck(9));
+    EXPECT_EQ(f.acks[9].errorCode, 0) << "after the apply the same produce is appended";
+    EXPECT_EQ(f.log->logEndOffset(), 2);
+    EXPECT_EQ(f.worker->workerDeniesUnappliedForTest(), 3u);
+}
+
+// ── #442: the RESET op ──
+// Mutation m4 (the reset keeps the tables / bindings): the session the snapshot did not rebind is served from its
+// pre-reset binding once the level is Current -> red.  m5 (the reset leaves the level Current): the first produce after
+// the reset is answered 45 instead of the retriable 48 -> red.
+TEST(WorkerPermissionResetRegression, AResetDeniesEverySessionRetriablyUntilTheSnapshotsLevelArrivesRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.chunk(5, 1, 0, 1, bitsFor({1}, 1), /*last=*/true);   // WRITE on topic 1
+    f.announce(6, false);
+    f.chunk(6, 1, 0, 1, bitsFor({2}, 1), /*last=*/true);   // WRITE on topic 2
+    f.produce(5, 1);
+    ASSERT_TRUE(f.awaitAck(1));
+    ASSERT_EQ(f.acks[1].errorCode, 0);
+    ASSERT_EQ(f.log->logEndOffset(), 1);
+
+    f.permReset();
+    int64_t corr = 10;
+    const auto code = [&](int64_t sid, int32_t topic) {
+        f.produce(sid, ++corr, topic);
+        EXPECT_TRUE(f.awaitAck(corr));
+        return f.acks[corr].errorCode;
+    };
+    const auto unavailable = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+    const auto notAuth     = static_cast<int16_t>(pc::ErrorCode::NotAuthorized);
+    EXPECT_EQ(code(5, 1), unavailable) << "retriable, never the terminal 45";
+    EXPECT_EQ(code(6, 2), unavailable);
+    EXPECT_EQ(code(5, 2), unavailable) << "a produce the old table would have denied is retriable too";
+    EXPECT_EQ(f.log->logEndOffset(), 1) << "nothing appended";
+    EXPECT_EQ(f.worker->permissionResetsForTest(), 1u);
+    EXPECT_EQ(f.worker->securityLagForTest(), 1u) << "RefuseAll until the snapshot's level arrives";
+    EXPECT_EQ(f.slot(5)->table, denyWriteTable()) << "every binding is denied";
+    EXPECT_EQ(f.slot(6)->table, denyWriteTable());
+
+    // No snapshot rebind, level Current: the sessions are denied (45) - never served from the pre-reset tables.
+    f.securityLag(0);
+    EXPECT_EQ(code(5, 1), notAuth) << "the pre-reset table is gone";
+    EXPECT_EQ(code(6, 2), notAuth);
+    EXPECT_EQ(f.log->logEndOffset(), 1);
+
+    // A second reset, then the snapshot: tables, binds, the level last.  Until the level, still retriable.
+    f.permReset();
+    f.chunk(5, 2, 0, 1, bitsFor({1}, 1), /*last=*/true);
+    f.chunk(6, 2, 0, 1, bitsFor({1}, 1), /*last=*/true);   // the gateway's view: session 6 now holds topic 1 too
+    EXPECT_EQ(code(5, 1), unavailable) << "the snapshot's level has not arrived";
+    f.securityLag(0);
+    EXPECT_EQ(code(5, 1), 0) << "allowed sessions are served again";
+    EXPECT_EQ(code(6, 1), 0) << "the snapshot's table replaced the stale one";
+    EXPECT_EQ(code(5, 2), notAuth) << "a revoked one answers 45";
+    EXPECT_EQ(code(6, 2), notAuth) << "the pre-reset grant on topic 2 did not survive";
+    EXPECT_EQ(f.log->logEndOffset(), 3);
+    EXPECT_EQ(f.worker->permissionResetsForTest(), 2u);
+}
+
+TEST(WorkerPermissionResetRegression, AHalfStagedTableDoesNotSurviveAResetRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.chunk(5, 1, /*first=*/0, /*total=*/2, std::vector<uint64_t>{1}, /*last=*/false);   // word 0 of 2
+    f.steps(3);
+    ASSERT_TRUE(f.worker->permissionStagingForTest()) << "a table is half staged";
+    f.permReset();
+    f.steps(3);
+    EXPECT_FALSE(f.worker->permissionStagingForTest()) << "the reset discarded the staged chunks";
+    EXPECT_EQ(f.worker->permissionResetsForTest(), 1u);
+}
+
+// ── #216: the worker answers what the gateway's auth gate answers ──
+// A table over (slot state x lag level).  The retriable answers of the lag levels stay first for every state (they say
+// nothing about the session); at level Current an Unbound slot (announced, never bound: AwaitingFirst / AwaitingFinal)
+// answers AuthenticationFailed (44) and asks for the session's end - ONCE; a password-change slot answers
+// PasswordChangeRequired (47); Deny stays 45; a table that grants the topic serves.
+// Mutations: m1 (Unbound answers 45) -> red; m2 (the password-change bind is not honoured: the slot stays Unbound or
+// Deny) -> red; m4 (a second produce sends a second signal) -> the signal-count assertion red.
+TEST(WorkerAuthStateRegression, TheWorkerAnswersTheGatewaysCodesPerSlotStateAndLagLevelRegression) {
+    Fixture f;
+    constexpr int64_t kUnbound = 11, kPasswordChange = 12, kDeny = 13, kTable = 14;
+    f.announce(kUnbound, false, pc::kClientVersionAuth);                       // announced, never bound
+    f.announce(kPasswordChange, false, pc::kClientVersionAuth);
+    f.bind(kPasswordChange, PermissionShipper::kPasswordChangeTable, 1);
+    f.announce(kDeny, false, pc::kClientVersionAuth);
+    f.bind(kDeny, PermissionShipper::kDenyTable, 1);
+    f.announce(kTable, false, pc::kClientVersionAuth);
+    f.chunk(kTable, 1, 0, 1, bitsFor({1}, 1), /*last=*/true);                  // WRITE on topic 1
+    int64_t corr = 100;
+    const auto code = [&](int64_t sid) {
+        f.produce(sid, ++corr, 1);
+        EXPECT_TRUE(f.awaitAck(corr));
+        return f.acks[corr].errorCode;
+    };
+    const auto c44 = static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed);
+    const auto c45 = static_cast<int16_t>(pc::ErrorCode::NotAuthorized);
+    const auto c47 = static_cast<int16_t>(pc::ErrorCode::PasswordChangeRequired);
+    const auto c48 = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+
+    for (const int64_t level : {int64_t{1}, int64_t{2}}) {   // RefuseAll, DeferDenials
+        f.securityLag(level);
+        EXPECT_EQ(code(kUnbound), c48) << "level " << level;
+        EXPECT_EQ(code(kPasswordChange), c48) << "level " << level;
+        EXPECT_EQ(code(kDeny), c48) << "level " << level;
+        EXPECT_EQ(code(kTable), level == 1 ? c48 : 0) << "level " << level << ": DeferDenials serves what it allows";
+    }
+    EXPECT_EQ(f.worker->unauthSignalsForTest(), 0u) << "a retriable answer says nothing about the session";
+
+    f.securityLag(0);   // Current: the verdicts
+    EXPECT_EQ(code(kUnbound), c44);
+    EXPECT_EQ(f.worker->unauthSignalsForTest(), 1u);
+    EXPECT_EQ(code(kUnbound), c44) << "still unauthenticated";
+    EXPECT_EQ(f.worker->unauthSignalsForTest(), 1u) << "one signal per session state, not one per produce";
+    EXPECT_EQ(code(kPasswordChange), c47);
+    EXPECT_EQ(code(kPasswordChange), c47) << "the session is kept: asked again, answered again";
+    EXPECT_EQ(code(kDeny), c45);
+    EXPECT_EQ(code(kTable), 0);
+    EXPECT_EQ(f.worker->unauthSignalsForTest(), 1u) << "no signal for a password-change, deny or granted session";
+    EXPECT_EQ(f.worker->workerUnauthenticatedForTest(), 2u);
+    EXPECT_EQ(f.worker->workerPasswordChangeRefusalsForTest(), 2u);
+    EXPECT_EQ(f.log->logEndOffset(), 2) << "only the granted produces (levels DeferDenials and Current) were appended";
+
+    // The password change lifts: the ordinary bind replaces the password-change state.
+    f.chunk(kPasswordChange, 2, 0, 1, bitsFor({1}, 1), /*last=*/true);
+    EXPECT_EQ(code(kPasswordChange), 0);
+    // A bind is a new state: an unbound session that is bound and later unbound again would signal again; here the
+    // never-bound session is bound to deny and answers 45 (it is no longer "never authenticated").
+    f.bind(kUnbound, PermissionShipper::kDenyTable, 3);
+    EXPECT_EQ(code(kUnbound), c45);
 }

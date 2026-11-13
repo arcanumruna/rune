@@ -97,6 +97,16 @@ them in `RUNE_PEERS` (7th and 8th segments, only after every node runs this vers
 | `RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND` | unlimited | Cleaner I/O throttle (positive bytes per second). |
 | `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` | `134217728` (128 MiB) | Memory for the cleaner's dedupe map, in bytes, 1048576 to 4294967296. The offset table is the largest power of two entries that fits, so the table itself stays within this budget. The cleaner's producer tails add up to 25% of the budget (minimum 1024 x 64 B) on top, so the total is at most about 1.25 times this value. |
 
+## Consumer groups
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RUNE_GROUP_MAX_GROUPS` | `10000` | Positive int32. The most consumer groups this broker coordinates at once. A JoinGroup that would create one more is refused; a join to an existing group never is. The refusal is `Throttled (53)` for a client of version 14 or newer (the C++ consumer retries it with a paced, bounded backoff) and the old rule's code below that (final). Room comes back when a group empties. |
+| `RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL` | half of `RUNE_GROUP_MAX_GROUPS` (at least 1) | Positive int32. The most live groups one authenticated principal may have created, so one principal cannot take every slot. A value above `RUNE_GROUP_MAX_GROUPS` is the cap itself (no share). The charge goes to the principal whose join created the group and ends when the group empties and is dropped, even if other principals' members keep the group alive meanwhile. A broker with `RUNE_AUTH=disabled` (or an anonymous session) has no principal: no share applies. The refusal is `Throttled (53)` as above. |
+
+The two refusals are counted per broker (`joinsRefusedGroupCap`, `joinsRefusedPrincipalShare`) and logged at the 1st,
+2nd, 4th, 8th, ... refusal. The per-namespace `max-groups` limit is separate and final (`NamespaceLimitExceeded (52)`).
+
 ## Authentication and TLS
 
 | Variable | Default | Meaning |
@@ -146,7 +156,7 @@ authentication enabled, and with any of these variables set, instead of starting
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RUNE_WORKER_MODE` | `shard` | `shard` or `legacy`. Shard mode (self-contained workers, each with its own ingress, egress and replication) is the default. `legacy` is refused when authentication is on and `RUNE_PEERS` lists more than one broker. |
+| `RUNE_WORKER_MODE` | `shard` | `shard` or `legacy`. Shard mode (self-contained workers, each with its own ingress, egress and replication) is the default. `legacy` is refused when authentication is on and `RUNE_PEERS` lists more than one broker. In `legacy` mode Records are delivered to the egress channel the client declares: a client that cannot be reached there (for example behind NAT) is refused explicitly under authentication (`RecordEgressUnavailable`) and served over the shared dynamic-MDC egress without it. NAT with authentication needs shard mode. |
 | `RUNE_RUNTIME_PLACEMENT` | `fused` | `fused` or `thread`: whether the runtime agent shares the worker thread or has its own. |
 | `RUNE_WORKERS` | `1` | In-process workers per node (at least 1; a bad value reads as 1). With authentication on, at most 252. |
 | `RUNE_WORKER_CORE_BASE` | derived | First CPU of the worker pinning (`-1` = no pinning, `>= 0` = worker `i` on core `base + i`). Unset: Linux shard mode pins to cores `1 + i * W` when the box has them. Unparseable reads as `-1`. |
@@ -163,7 +173,7 @@ authentication enabled, and with any of these variables set, instead of starting
 | `RUNE_IDLE_DOORBELL_MIN_PARK_US` | `1000` | Doorbell minimum park, `1` to `1000000` us; must not exceed the next row. |
 | `RUNE_IDLE_DOORBELL_PARK_US` | `1000` | Doorbell park, `1` to `1000000` us. |
 | `RUNE_FETCH_INTERVAL_US` | `5000` | Follower periodic-fetch backstop cadence. An integer in `[1, 2592000000000]` us; anything else refuses startup. |
-| `RUNE_PER_WORKER_INGRESS` | `false` | `1`/`true`/`TRUE`. Forced on by shard mode. |
+| `RUNE_PER_WORKER_INGRESS` | `false` | `1`/`true`/`TRUE`. Forced on by shard mode. Outside shard mode a broker that can serve TLS (a certificate is loaded or `RUNE_REQUIRE_TLS` is set) refuses to start with it on, because those workers hold no session keys and cannot open an encrypted produce. |
 | `RUNE_PER_WORKER_EGRESS` | `false` | Same. Forced on by shard mode. |
 | `RUNE_PER_WORKER_REPLICATION` | `false` | Same. Forced on by shard mode. |
 

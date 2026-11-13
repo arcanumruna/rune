@@ -5,7 +5,7 @@
 // and a second broker with RUNE_ANONYMOUS_READ on for the Anonymous rows (built when the first such cell runs).
 //
 //   run(op, caller, target, ordinal)      - one sequential cell: the op as the caller, the answer code + frame body
-//   runTwin(op, caller, target, ordinal)  - the same op as the same caller on a truly missing twin (`zz/...`, id 98765)
+//   runTwin(op, caller, target, ordinal)  - the same op, caller and target on a missing twin (`z/...`, dropped ids)
 //
 // Every wait is bounded (AuthRig::dl); no sleeps.
 
@@ -35,7 +35,8 @@ public:
     using Caller = nsmatrix::Caller;
     using Target = nsmatrix::Target;
 
-    static constexpr int32_t kMissingId = 98'765;
+    /// An id far above any id the rig's broker allocates: "not applied here yet" (NotLeader, #988), never "missing".
+    static constexpr int32_t kAboveFrontierId = 98'765;
     static constexpr const char* kTwinNs = "z";
 
     struct Answer {
@@ -95,6 +96,46 @@ public:
     }
     /// Issue #643: run() with the admin thread's catalog / security contents (sameNameSnapshot()) taken right before the
     /// op is issued (after the cell's fresh objects exist) and right after its answer.
+
+    /// #988: the op (Produce, Fetch or GetViewRow) as `caller` on an id 1000 above every id the broker has allocated
+    /// (at or above the applied frontier), sent ONCE (a NotLeader answer is the answer under test, not a retry cue).
+    Answer runAboveFrontier(Op op, Caller caller) {
+        World& w = *main_;
+        const Sess s = sessionFor(w, caller, Target::OwnNs, /*anon=*/false);
+        int32_t top = std::max({w.tOnly, w.vOnly, w.goneT, w.goneV});
+        for (const auto& [ns, id] : w.tid) top = std::max(top, id);
+        for (const auto& [ns, id] : w.vid) top = std::max(top, id);
+        const int32_t id = top + 1000;
+        AuthRig& r = w.r;
+        auto& c = r.c();
+        constexpr int32_t st = AuthRig::stream();
+        Answer a;
+        a.ids = {id};
+        switch (op) {
+            case Op::Produce: {
+                a.corr = c.nextCorrelationId();
+                need(c.produce(r.ch(), st, s.sid, a.corr, id, 0, 1, makeCharBatch(1)), "send Produce");
+                const auto ack = c.awaitProduceResponseUntil(a.corr, AuthRig::dl());
+                a.code = ack ? ack->errorCode : kNoAnswer;
+                break;
+            }
+            case Op::Fetch: {
+                a.corr = c.sendSubscribe(r.ch(), st, s.sid, id, 0);
+                const auto code = c.awaitSubscribeCode(a.corr, AuthRig::dl());
+                a.code = code ? *code : kNoAnswer;
+                break;
+            }
+            case Op::GetViewRow: {
+                a.corr = c.sendGetViewRow(r.ch(), st, s.sid, id, 1);
+                const auto ans = c.awaitViewRowOrError(a.corr, AuthRig::dl());
+                if (ans) a.code = ans->isError ? ans->errorCode : ans->status;
+                break;
+            }
+            default: need(false, "runAboveFrontier: Produce, Fetch or GetViewRow only");
+        }
+        frameOf(w, a, a.corr);
+        return a;
+    }
 
     // ── the timing cells (one node): the caller is root or a/admin, the object is a fresh one of namespace `a` ──
     using RequestId = rune::protocol::RequestId;
@@ -300,7 +341,10 @@ private:
     struct World {
         AuthRig r;
         std::map<std::string, int32_t> tid, vid;   ///< namespace -> its t / v
-        int32_t tOnly = kMissingId, vOnly = kMissingId;
+        int32_t tOnly = kAboveFrontierId, vOnly = kAboveFrontierId;
+        /// The ids of a topic / view created and dropped (the drop applied): the ids of the Missing target and of the
+        /// twin.  An id above the applied frontier is answered NotLeader (#988), so a never-created id is not missing.
+        int32_t goneT = kAboveFrontierId, goneV = kAboveFrontierId;
         /// A logged-in principal's session and when the rig last handed it out (issue #647: the broker reaps a session idle
         /// for 10 s, so session() logs in again after 5 s of idleness - the rule of AuthBroker::freshAdminSid_.  The reap
         /// clock is the broker's steady clock, which a real-broker rig cannot advance, so the age is wall time).
@@ -314,7 +358,7 @@ private:
     struct Sess { int64_t sid = 0; std::string ns; };
     struct Names {
         std::string ns, topic, view, user, role, group, txn, pattern, askedNs;
-        int32_t tid = kMissingId, vid = kMissingId, src = kMissingId;
+        int32_t tid = kAboveFrontierId, vid = kAboveFrontierId, src = kAboveFrontierId;
     };
 
     std::unique_ptr<World> main_, anon_;
@@ -405,6 +449,27 @@ private:
         w.vOnly = w.r.createView(rootSession(w), "b/onlyv", w.tOnly);
         need(w.vOnly >= 0, "view b/onlyv");
     }
+    /// A topic and a view of `default` that are created and then dropped, the drops applied (bounded waits): their ids
+    /// stand for "does not exist" below the applied frontier (#988).
+    void makeGone(World& w) {
+        AuthRig& r = w.r;
+        const int32_t t = r.defineTopic(rootSession(w), "zgone");
+        need(t >= 0, "scratch topic zgone");
+        need(r.c().pollFor(std::chrono::seconds(10), [&] {
+                 const auto ids = r.metadataTopics(rootSession(w));
+                 return std::find(ids.begin(), ids.end(), t) != ids.end();
+             }), "the placement of the scratch topic was never listed");
+        const int32_t v = r.createView(rootSession(w), "zgonev", t);
+        need(v >= 0, "scratch view zgonev");
+        need(r.dropViewCode(rootSession(w), "zgonev") == 0, "drop the scratch view");
+        need(r.dropTopicCode(rootSession(w), "zgone") == 0, "drop the scratch topic");
+        need(r.c().pollFor(std::chrono::seconds(10), [&] {
+                 const auto ids = r.metadataTopics(rootSession(w));
+                 return std::find(ids.begin(), ids.end(), t) == ids.end();
+             }), "the scratch topic's drop was never applied");
+        w.goneT = t;
+        w.goneV = v;
+    }
     /// User x and role r of namespace `ns` (the security ops' targets).
     void makeSecurityTargets(World& w, const std::string& ns) {
         AuthBroker& b = w.r.broker();
@@ -421,6 +486,7 @@ private:
         makeShared(w, "a");
         makeShared(w, "b");
         makeOnly(w);
+        makeGone(w);
         using namespace grants;
         AuthBroker& b = r.broker();
         b.createUser("a/admin", AuthRig::kPw, nsAdminGrants("a"));
@@ -451,6 +517,7 @@ private:
         makeShared(w, "default");
         makeShared(w, "b");
         makeOnly(w);
+        makeGone(w);
         for (const char* ns : {"default", "b"}) makeSecurityTargets(w, ns);
         const int32_t t = w.tid["default"];
         need(w.r.c().pollFor(std::chrono::seconds(10), [&] {   // placed: the anonymous listing names it
@@ -510,10 +577,12 @@ private:
         n.pattern = (op == Op::Revoke ? "d" : "p") + o;
         // A view's source must be readable by the caller: its own namespace's t unless it is root or in the object's.
         const std::string srcNs = s.ns == "default" || s.ns == objNs ? objNs : s.ns;
-        n.src = w.tid.contains(srcNs) ? w.tid[srcNs] : kMissingId;
+        n.src = w.tid.contains(srcNs) ? w.tid[srcNs] : kAboveFrontierId;
         if (twin) {
             // The truly missing twin: namespace `z` never exists and has the same length as `a` / `b`, the ids are
-            // missing, the source is the real cell's.
+            // those of a dropped topic / view, the source is the real cell's.
+            n.tid = w.goneT;
+            n.vid = w.goneV;
             n.ns = n.askedNs = kTwinNs;
             n.topic = std::string(kTwinNs) + "/" + tLocal;
             n.view = std::string(kTwinNs) + "/" + vLocal;
@@ -532,9 +601,12 @@ private:
         // Groups and transactional ids: unqualified in `default`; a Missing target is created unqualified.
         n.group = miss ? "g" + o : q(s.ns, objNs, "g" + o);
         n.txn = miss ? "x" + o : q(s.ns, objNs, "x" + o);
-        if (!miss) {
-            n.tid = t == Target::ForeignNs ? w.tOnly : w.tid.contains(objNs) ? w.tid[objNs] : kMissingId;
-            n.vid = t == Target::ForeignNs ? w.vOnly : w.vid.contains(objNs) ? w.vid[objNs] : kMissingId;
+        if (miss) {
+            n.tid = w.goneT;
+            n.vid = w.goneV;
+        } else {
+            n.tid = t == Target::ForeignNs ? w.tOnly : w.tid.contains(objNs) ? w.tid[objNs] : w.goneT;
+            n.vid = t == Target::ForeignNs ? w.vOnly : w.vid.contains(objNs) ? w.vid[objNs] : w.goneV;
         }
         if (!miss) preCreate(w, op, t, ord, s, objNs, ownNs);
         return n;

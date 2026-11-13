@@ -875,3 +875,30 @@ TEST(DamagedReadsGatewayRegression, WorkerCountsAreSummedAsLatestCumulativeRegre
     report(0, 4);
     EXPECT_EQ(r.gw.damagedReadsTotal(), 7u);
 }
+
+// #880: workers report their cumulative segment-repair counts as SessionSignal SegmentRepair (sessionId = the counter);
+// the gateway sums the latest count of each worker per counter.
+TEST(SegmentRepairGatewayRegression, WorkerCountsAreSummedPerCounterAsLatestCumulativeRegression) {
+    Rig r(2, 2);
+    for (std::size_t c = 0; c < 3; ++c) ASSERT_EQ(r.gw.segmentRepairsTotal(c), 0u);
+    const auto report = [&](int32_t worker, int64_t counter, int64_t count) {
+        rune::node::WorkerReturn ret;
+        ret.type       = rune::node::WorkerReturn::Type::SessionSignal;
+        ret.lastOffset = static_cast<int64_t>(rune::node::SessionSignalKind::SegmentRepair);
+        ret.sessionId  = counter;
+        ret.partition  = worker;
+        ret.baseOffset = count;
+        r.gw.handleWorkerReturnForTest(ret);
+    };
+    report(0, 0, 2);
+    report(1, 0, 3);
+    report(0, 1, 7);
+    report(1, 2, 1);
+    EXPECT_EQ(r.gw.segmentRepairsTotal(0), 5u);
+    EXPECT_EQ(r.gw.segmentRepairsTotal(1), 7u);
+    EXPECT_EQ(r.gw.segmentRepairsTotal(2), 1u);
+    report(0, 0, 4);
+    EXPECT_EQ(r.gw.segmentRepairsTotal(0), 7u) << "a later report replaces the earlier one, it does not add to it";
+    report(0, 3, 99);   // not a counter: ignored
+    EXPECT_EQ(r.gw.segmentRepairsTotal(3), 0u);
+}

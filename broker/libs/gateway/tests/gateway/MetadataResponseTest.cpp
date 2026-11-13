@@ -363,7 +363,7 @@ TEST(MetadataResponseIngressEndpoint, LegacyModeAdvertisesNoEndpoint)
     gw.setWorkerPool(pool.get());
     std::vector<uint8_t> frameCopy;
     gw.setOnEgressFrame([&](int64_t, const uint8_t* buf, std::size_t len) { frameCopy.assign(buf, buf + len); });
-    const int64_t sid = gw.injectTestSession();
+    const int64_t sid = gw.injectTestSession(0, pc::kClientVersionBootstrapChallenge);
     const auto frame = makeMetadataRequestFrame(sid);
     gw.applyMetadataForTest(frame.data(), frame.size());
     auto dec = pc::MetadataResponse::decode(frameCopy.data(), frameCopy.size());
@@ -502,13 +502,100 @@ TEST(MetadataResponseReceiverIdRegression, TheGatewaysOwnRouteIsReceiverZeroRegr
     gw.setWorkerPool(pool.get());   // per-worker ingress NOT active: every produce goes to the gateway
     std::vector<uint8_t> frameCopy;
     gw.setOnEgressFrame([&](int64_t, const uint8_t* buf, std::size_t len) { frameCopy.assign(buf, buf + len); });
-    const int64_t sid = gw.injectTestSession(0, pc::kClientVersion);
+    const int64_t sid = gw.injectTestSession(0, pc::kClientVersionBootstrapChallenge);   // v20 always carries trailers
     const auto frame = makeMetadataRequestFrame(sid);
     gw.applyMetadataForTest(frame.data(), frame.size());
     auto dec = pc::MetadataResponse::decode(frameCopy.data(), frameCopy.size());
     ASSERT_TRUE(dec.has_value());
     for (const auto& p : dec->partitions) EXPECT_EQ(p.ingressReceiverId, 0);
     EXPECT_EQ(frameCopy.size(), rpcLegacySize(dec->brokers, dec->partitions.size())) << "no trailer at all";
+}
+
+// ===========================================================================
+// #361: the coordinator trailer names the cluster's coordinator (the consensus leader).
+// ===========================================================================
+namespace {
+struct CoordRig {
+    LeaderView                        view;
+    std::optional<pc::MetadataResponse::Decoded> captured;
+    std::size_t                       frameSize = 0;
+    ClientGateway                     gw;
+    CoordRig(LeaderView v, int32_t thisNode)
+        : view(std::move(v)),
+          gw(ClientGateway::makeForTestWithLeaderView(acceptAllEgress, [this] { return view; })) {
+        gw.setNodeIdForTest(thisNode);
+        gw.setRoutingImageSnapshot(makeImage({{1, 0}, {1, 1}}));
+        gw.setCommittedMetadataReady(true);
+        gw.setOnEgressFrame([this](int64_t, const uint8_t* buf, std::size_t len) {
+            if (auto dec = pc::MetadataResponse::decode(buf, len)) { captured = std::move(dec); frameSize = len; }
+        });
+    }
+    void ask(int32_t clientVersion) {
+        captured.reset();
+        const int64_t sid = gw.injectTestSession(0, clientVersion);
+        const auto frame = makeMetadataRequestFrame(sid);
+        gw.applyMetadataForTest(frame.data(), frame.size());
+    }
+};
+} // namespace
+
+TEST(MetadataCoordinatorHintRegression, ALeaderAnswersItsOwnIdAFollowerTheLeadersRegression) {
+    {
+        CoordRig leader(LeaderView{/*isLeader=*/true, "", /*leaderNodeId=*/-1}, /*thisNode=*/5);
+        leader.ask(pc::kClientVersionCoordinatorHint);
+        ASSERT_TRUE(leader.captured.has_value());
+        EXPECT_EQ(leader.captured->coordinatorNodeId, 5) << "the leader names itself (its own id, not the view's field)";
+    }
+    {
+        CoordRig follower(LeaderView{/*isLeader=*/false, "rune-1:40200", /*leaderNodeId=*/2}, /*thisNode=*/5);
+        follower.ask(pc::kClientVersionCoordinatorHint);
+        ASSERT_TRUE(follower.captured.has_value());
+        EXPECT_EQ(follower.captured->coordinatorNodeId, 2) << "a follower names the leader it knows";
+    }
+}
+
+TEST(MetadataCoordinatorHintRegression, NoKnownLeaderAnswersMinusOneRegression) {
+    {
+        CoordRig electing(LeaderView{/*isLeader=*/false, "", /*leaderNodeId=*/-1}, 5);
+        electing.ask(pc::kClientVersionCoordinatorHint);
+        ASSERT_TRUE(electing.captured.has_value());
+        EXPECT_EQ(electing.captured->coordinatorNodeId, -1);
+    }
+    {
+        // A leader id without a client endpoint the follower could redirect to is not a usable hint.
+        CoordRig noEndpoint(LeaderView{/*isLeader=*/false, "", /*leaderNodeId=*/2}, 5);
+        noEndpoint.ask(pc::kClientVersionCoordinatorHint);
+        ASSERT_TRUE(noEndpoint.captured.has_value());
+        EXPECT_EQ(noEndpoint.captured->coordinatorNodeId, -1);
+    }
+    {
+        // No leader view at all (a single node without replication): nothing to name.
+        ClientGateway gw = ClientGateway::makeForTest(acceptAllEgress, 1);
+        gw.setRoutingImageSnapshot(makeImage({{1, 0}}));
+        gw.setCommittedMetadataReady(true);
+        std::optional<pc::MetadataResponse::Decoded> cap;
+        gw.setOnEgressFrame([&](int64_t, const uint8_t* b, std::size_t n) { cap = pc::MetadataResponse::decode(b, n); });
+        const int64_t sid = gw.injectTestSession(0, pc::kClientVersionCoordinatorHint);
+        const auto frame = makeMetadataRequestFrame(sid);
+        gw.applyMetadataForTest(frame.data(), frame.size());
+        ASSERT_TRUE(cap.has_value());
+        EXPECT_EQ(cap->coordinatorNodeId, -1);
+    }
+}
+
+TEST(MetadataCoordinatorHintRegression, ASessionBelowV20GetsNoTrailerRegression) {
+    CoordRig follower(LeaderView{/*isLeader=*/false, "rune-1:40200", /*leaderNodeId=*/2}, 5);
+    follower.ask(pc::kClientVersionBootstrapChallenge);
+    ASSERT_TRUE(follower.captured.has_value());
+    EXPECT_EQ(follower.captured->coordinatorNodeId, -1);
+    const std::size_t v19Size = follower.frameSize;
+    std::size_t legacy = pc::MessageHeader::ENCODED_SIZE + 2u + 2u + follower.captured->partitions.size() * 28u;
+    for (const auto& br : follower.captured->brokers) legacy += 4u + 4u + 2u + br.host.size();
+    EXPECT_EQ(v19Size, legacy) << "v19: the byte-identical legacy layout, no trailer at all";
+    follower.ask(pc::kClientVersionCoordinatorHint);
+    ASSERT_TRUE(follower.captured.has_value());
+    EXPECT_EQ(follower.captured->coordinatorNodeId, 2);
+    EXPECT_GT(follower.frameSize, v19Size) << "the v20 frame carries the trailers";
 }
 
 } // namespace

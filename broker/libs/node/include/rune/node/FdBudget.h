@@ -34,7 +34,10 @@
 // kMaxPendingSeals per log) and recover()'s short-lived .index.tmp /
 // directory-fsync fds.  The estimate drives the startup check and (issue #296)
 // the admin thread's DDL admission: a CreateTopic / AlterTopicConfig that would
-// raise it above the soft open-file limit is refused before it is appended.
+// raise it above the soft open-file limit is refused before it is appended.  Every broker hosts every topic, so
+// (issue #612) the limit is the SMALLEST soft limit advertised in the node-control registers by any broker this broker
+// has heard from since it started (and its own): a broker that is down keeps its last value; a broker never heard from
+// is not counted and refuses at its own start when its limit is too low.  Set the same LimitNOFILE on every broker.
 //
 // Deployment: set the hard limit high — systemd `LimitNOFILE=1048576`,
 // Docker `--ulimit nofile=1048576:1048576` (most engines default to ~1M),

@@ -277,7 +277,8 @@ public:
     [[nodiscard]] std::size_t checkpointCountForTest() const noexcept { return checkpoints_.size(); }
     /// Logs out of selection because their last pass could not advance (cleaner thread).
     [[nodiscard]] std::size_t stalledLogsForTest() const noexcept { return stalledPasses_.size(); }
-    /// #840: logs whose cleaner met a damaged batch; each stays out of selection until the broker restarts
+    /// #840: logs whose cleaner met a damaged batch; each stays out of selection until its damaged segment file is
+    /// replaced (a repair, a cleaner or retention removing it) or the broker restarts
     /// (Kafka: LogCleanerManager.uncleanablePartitions).  Cleaner-thread-owned; cold.
     [[nodiscard]] std::size_t uncleanableLogCountForTest() const noexcept { return uncleanable_.size(); }
     /// Range passes started (one per selected log per cycle).  Cleaner-thread-owned; test seam.
@@ -771,10 +772,12 @@ public:
                 std::error_code ec;
                 const auto size  = std::filesystem::file_size(path, ec);
                 const auto mtime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
-                if (!ec) mark = DamageMark{dmg->segBase, size, mtime};   // unreadable now: segBase stays -1 (until restart)
+                if (!ec) mark = DamageMark{dmg->segBase, size, mtime};
+                // (unreadable now: segBase stays -1, held until restart)
             }
             uncleanable_.emplace(best.dir, mark);
-            spdlog::warn("LogCleanerAgent: {} is uncleanable until the damaged segment is gone or the broker restarts (damaged batch in segment {} at byte {})",
+            spdlog::warn("LogCleanerAgent: {} is uncleanable until the damaged segment file is replaced or removed, "
+                         "or the broker restarts (damaged batch in segment {} at byte {})",
                          best.dir, dmg ? dmg->segBase : -1, dmg ? dmg->byteOffset : 0);
         }
 

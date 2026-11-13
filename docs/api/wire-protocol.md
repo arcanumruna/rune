@@ -19,7 +19,7 @@ body; all integers are little-endian. The source of truth is the headers:
 Variable-length fields (strings, byte blobs) follow the fixed part, each with a length prefix.
 
 Capability is negotiated with two numbers in `Connect`/`ConnectResponse`: `clientVersion` (this protocol's client
-announces `17`, `kClientVersion`) and `brokerVersion` (`10`, `kBrokerVersion`). A broker answers a client below a
+announces `20`, `kClientVersion`) and `brokerVersion` (`10`, `kBrokerVersion`). A broker answers a client below a
 feature's version in the older way; an authentication-enabled broker answers a `Connect` below 9
 `ConnectResponse{ProtocolVersion}`.
 
@@ -36,6 +36,7 @@ feature's version in the older way; an authentication-enabled broker answers a `
 | 10 | `TxnOffsetCommit` member block (`generationId`, `memberId` after the entries; KIP-447); `UnstableOffsetCommit` (50). An older broker ignores the block; a broker answers a session below 10 `NotCoordinator` instead of 50. |
 | 11 | Subscription filters: the optional filter trailer on `Subscribe` and `JoinGroup`, the refusal `detail` trailer on their responses (broker version 6). |
 | 17 | Checked writes (broker version 10): the `Produce` `acks` byte carries bit 1 (`View`), `ProduceResponse` carries `assignedBase` and an optional verdict trailer, the `EndTxnResponse` vote trailer, and error codes 55 to 63 exist. A session below 17 is never sent 55 to 63 (it is answered `InvalidRequest`) and keeps the 46-byte `ProduceResponse` and the 26-byte `EndTxnResponse`. |
+| 20 | Coordinator hint (#361): the `MetadataResponse` coordinator trailer (see Metadata coordinator hint). No broker version change. |
 
 ## Frame catalogue
 
@@ -56,7 +57,7 @@ security 64 to 95.
 | 6 | `Ping` | C→B | `echo` |
 | 7 | `Pong` | B→C | `echo` |
 | 8 | `MetadataRequest` | C→B | `topicIds` |
-| 9 | `MetadataResponse` | B→C | `brokers`, `partitions` |
+| 9 | `MetadataResponse` | B→C | `brokers`, `partitions`, `coordinatorNodeId` (v20, optional trailer) |
 | 10 | `HandshakeContinue` | C→B | `handshakeBytes` |
 | 11 | `HandshakeContinueResponse` | B→C | `code`, `handshakeBytes` |
 | 12 | `AuthClientFirst` | C→B | `mechanism`, `username`, `clientNonce` |
@@ -96,7 +97,7 @@ security 64 to 95.
 | 65 | `DefineTopicResponse` | B→C | `topicId`, `version`, `errorCode` |
 | 66 | `GetTopicSchema` | C→B | `topicName`, `requestedFingerprint` (0 = latest; `~0` = the evolving lineage) |
 | 67 | `TopicSchemaResponse` | B→C | `topicId`, `version`, `errorCode`, `descriptorBlob`, `partitionCount`, key features (optional) |
-| 68 | `AlterTopic` | C→B | `topicName`, `expectedVersion`, `opsBlob`, DDL extension |
+| 68 | `AlterTopic` | C→B | `topicName`, `expectedVersion`, `opsBlob` (op types 1 Add, 2 Drop, 3 Rename, 4 SetCompatibility, 5 RetireBelow: `u16 version`, the only op of its request; needs feature level 7), DDL extension |
 | 69 | `AlterTopicResponse` | B→C | `topicId`, `newVersion`, `errorCode` |
 | 70 | `CreateView` | C→B | `viewName`, `keyField`, `persistence`, `planBlob`, DDL extension |
 | 71 | `CreateViewResponse` | B→C | `viewTopicId`, `outputFingerprint`, `errorCode` |
@@ -108,12 +109,14 @@ security 64 to 95.
 | 77 | `AlterView` | C→B | `viewName`, `keyField`, `persistence`, `expectedVersion`, `planBlob`, `planLen` |
 | 78 | `DdlResponse` | B→C | `errorCode`, `objectId`, `newVersion`, `gateTopicId`, `detail` |
 | 79 | `SecurityDdl` | C→B | `ext`, `kind`, `name`, `change`, `passwordIndex`, `terminateSessions`, `verifier`, `granteeKind`, `op`, `resourceType`, `patternKind`, `pattern`, `roleName` |
-| 80 | `SecurityBootstrap` | C→B | `adminName`, `verifier` |
+| 80 | `SecurityBootstrap` | C→B | `adminName`, `verifier`, `fakeSaltSeed`, `nonce`, `mac` (see Bootstrap proof) |
 | 88 | `GetViewRowK` | C→B | `viewTopicId`, `partition`, `requestedFingerprint`, `minOffset`, `key` (1 to 128 bytes) |
 | 89 | `ScanViewRows` | C→B | `viewTopicId`, `limit`, `requestedFingerprint`, `minOffset`, `prefix` (1 to 127 bytes), `resumeToken` (0 or 12 bytes) |
 | 90 | `ScanViewRowsResponse` | B→C | `status`, `rowCount`, `nextToken`, `rows` |
 | 91 | `GetStats` | C→B | `scope` u8 (1 topic partition, 2 view partition), `objectId` i32, `partition` i32 |
 | 92 | `StatsResponse` | B→C | `status` u16, `count` u16, `count` x `(statId u16, value i64)`, `nConstraints` u16, `nConstraints` x `(constraintId u32, rejections u64)` |
+| 102 | `SecurityBootstrapChallengeRequest` | C→B | header only |
+| 103 | `SecurityBootstrapChallenge` | B→C | `challenge` (32 bytes) |
 
 Notes:
 
@@ -127,7 +130,8 @@ Notes:
 - **`ViewRowResponse.status`**: 0 OK, 1 AbsentKey, 2 NotReady, 3 SchemaMismatch, 4 UnknownView, 5 InvalidRequest,
   6 Busy, 7 RowTooLarge, 8 CursorInvalidated (scans, see below), 45 NotAuthorized. A `GetViewRow` on a broker that does not lead the view's source partition, or
   leads it without the controller's read lease, is answered `ErrorResponse` `Redirect` (3, the leader's endpoint) or
-  `NotLeader` (2); both are retriable.
+  `NotLeader` (2); both are retriable. A view id at or above the catalog position the broker has applied (the view was
+  just created through another broker) is answered `NotReady` for every session, with or without authentication.
 - **Internal logs** are read by subscribing to a negative topic id: `__catalog` is `-6` (`kCatalogTopicId`), `__security`
   is `-7` (`kSecurityTopicId`, security admins and brokers only). A stream ends with an 8-byte caught-up marker batch.
 - `Produce.acks`: bit 0 set = all (deferred until the in-sync replicas hold it), clear = leader or none (immediate ack); bit 1 = `View` (client version 17, see Checked writes).
@@ -136,6 +140,9 @@ Notes:
   `1` read committed.
 - A key maps to a partition with FNV-1a 64 over the key bytes (`partitionForKey`, `PartitionHash.h`); an empty key maps
   to partition 0. Broker and client share the header, so they cannot diverge.
+- **`OffsetFetch` with no entries (fetch-all)**: lists every committed offset of the group the caller may READ, or
+  answers the single sentinel result `{topicId -1, partition -1, offset -1, errorCode MessageTooLarge (22)}` when those
+  results do not all fit one answer, never a truncated list. The caller then fetches with listed entries.
 
 ## Record batch (v2)
 
@@ -192,6 +199,42 @@ handshake when one was negotiated) a session whose `authMode` is `Required` runs
 
 Until a session is authenticated, every other request is answered `AuthenticationFailed` (44) and the session ends. See
 [SECURITY.md](../../broker/docs/SECURITY.md) for the throttle, the one-time bootstrap password and revocation.
+
+## Bootstrap proof (client version 19)
+
+`SecurityBootstrap` (80) proves possession of the cluster key with a challenge-response, so a captured frame replays
+nowhere:
+
+1. The client sends `SecurityBootstrapChallengeRequest` (102, a header with the session id and a correlation id) on the
+   session it will bootstrap on. The gateway answers `SecurityBootstrapChallenge` (103): 32 bytes, unique per request
+   (a per-process counter run through a keyed MAC under a random per-process secret) and valid for **one** bootstrap
+   attempt on **that** session. A newer request replaces an older unused challenge; an attempt (accepted or refused)
+   uses the challenge up. 102 is allowed and refused exactly where 80 is (the bootstrap window; the refusal is the
+   same). A client below version 19 is refused both.
+2. The MAC key is a subkey: `HKDF(SHA-512, ikm = cluster master, salt = empty, info = "rune-bootstrap-mac-v2")`, 64
+   bytes. The master is never a MAC key.
+3. The `mac` field of 80 is HMAC-SHA-512 under that subkey over
+   `"rune-bootstrap-v2" | challenge 32 | adminName var16 | verifier | fakeSaltSeed 32 | nonce 16`. The challenge is not
+   on the wire in 80; the gateway knows it. The layout of 80 is unchanged.
+4. The proof binds no clock: the one-use challenge is the freshness. A frame signed for another challenge, another
+   session, another gateway or another process lifetime does not verify; v1 proofs (raw master, `rune-bootstrap-v1`
+   input) are refused.
+
+Every resend of a bootstrap (NotLeader, Redirect, a lost session) sends a new 102 first and signs the frame again for
+the new challenge; the nonce stays the same, so the broker still dedupes the bootstrap on it. The client ends the call
+`BrokerTooOld` against a broker below version 12.
+
+## Metadata coordinator hint (client version 20)
+
+`MetadataResponse` (9) ends with additive trailers after `partitions[]`, each read only when bytes remain, in this
+order: the per-partition worker endpoints (`u16 count`, then a length-prefixed `host:port` per partition), the receiver
+ids (v12), the response-control ports (v16), and, from version 20, the **coordinator trailer**: one `int32` LE, the node
+id of the cluster's coordinator (the consensus leader that the group and transaction coordinator is) as the answering
+node sees it, `-1` when it does not know one. It is written for every session at version 20 or above; whenever it is
+written the three trailers before it are written too (empty strings, zero ids and zero ports when there is nothing to
+say), so a decoder that stops after an earlier trailer is unaffected. A session below 20 keeps the byte-identical older
+frame. The C++ client moves its coordinator route to the named node only while its current coordinator session is silent or
+down; a trailer of 1 to 3 bytes is a torn frame.
 
 ## Filters (client version 11)
 
@@ -321,10 +364,18 @@ while the cluster is below the checked-writes feature level.
   row bytes. The answer is a `ScanViewRowsResponse` (90): `nextToken` is empty when the scan is complete, else 12 bytes to
   send back as `resumeToken`; `rows` is `rowCount` entries of `[length u32][view row]`, each row decoded like a `GetViewRow`
   row. A page is read in one worker step, so it is consistent.
-- **Pages are unordered**: rows come in table order, not key order, and a scan visits each row under the prefix once.
-  An insert or erase under the prefix between two pages invalidates the token: the answer is status 8
-  (`CursorInvalidated`) with no rows, and the client restarts the scan. The C++ `ViewRowResult::kCursorInvalidated` shares
-  the value 8 with the client-side `kNotLeader`; restart on both.
+- **Pages are in hash order, not key order.** The 12-byte token is `[r u32 LE][word u64 LE]`: the position of the last row
+  returned, where `word` is the row's slot word and `r` is the bit reversal of the low 32 bits of its hash. A page returns
+  the rows strictly above the token in `(r, word)` order, so a row's position depends on its key alone. A row that stays
+  under the prefix for the whole scan is returned exactly once whatever is inserted, erased or reorganized between pages; a
+  row inserted or erased during the scan may or may not be returned; no row is returned twice. A scan is not a snapshot
+  and always finishes, whatever the write rate. Rows whose hashes are equal (a 64-bit collision of two wide keys) are
+  returned together on one page; a group that does not fit an empty page is `RowTooLarge`.
+- **A page may hold no rows and still carry a token.** A worker step looks at a bounded number of index slots (4096); when
+  that runs out the page is `Ok` with `rowCount` 0 and a `nextToken` to continue from. Only an empty `nextToken` ends a
+  scan. A token of the wrong length is `InvalidRequest`; status 8 (`CursorInvalidated`) is kept for a malformed token and
+  is no longer answered for a write under the prefix. A token for a prefix with no rows left ends the scan. The C++
+  `ViewRowResult::kCursorInvalidated` shares the value 8 with the client-side `kNotLeader`.
 - **`minOffset`** (both frames, `-1` = none) is the read-your-writes barrier for a write acknowledged with the `ProduceResponse`
   `baseOffset`: the read waits until the view has folded that source offset. A waiting read is held for at most 100 ms and
   is then answered `NotReady`; a worker holds at most 256 reads, and one more is answered `NotReady` at once. Without it a
@@ -392,6 +443,8 @@ topic or view. The leader's owning worker answers, so a read costs about as much
 | 34 | `scanPages` | view | `ScanViewRows` pages served. |
 | 35 | `transientRecordsEvicted` | view | Records a transient source dropped before the view folded them. |
 | 36 | `transientSourceResets` | view | Times the source ring was recreated or cut under the view's cursor. |
+| 21 | `schemaRetiredBelow` | topic | The topic's schema retire floor: records stamped with a version below it are refused (`SchemaVersionRetired`, 67). 1 = nothing retired. Reported for every typed topic. |
+| 0x8000 + V | (`producedAtVersion<V>`) | topic | Records the answering worker accepted at schema version V for the topic (all its partitions of that topic) since it started. Sent for each installed version with a non-zero count, lowest version first until the 64-entry limit; versions of 0x8000 and above are not reported. A version is unused when every partition leader reports no count for it. Ids stay strictly ascending. |
 
 Ids 1 to 31 are topic scope and 32 and up are view scope; new ids are appended. The constraint entries are the per-constraint
 rejection counts of a topic's verdict source, `constraintId = viewObjectId << 16 | ordinal`.
@@ -405,7 +458,7 @@ rejection counts of a topic's verdict source, `constraintId = viewObjectId << 16
 |---|---|---|---|
 | 0 | `OK` |  |  |
 | 1 | `ProtocolVersion` | Client version not supported (also: an authenticated broker refusing a client below 9, or a JoinGroup from a client below 3 or 5). | not retried |
-| 2 | `NotLeader` | This node does not lead the partition, or the catalog leader changed or is catching up. | retried after a metadata refresh |
+| 2 | `NotLeader` | This node does not lead the partition, or the catalog leader changed or is catching up, or the topic id is at or above the catalog position this node has applied (not applied here yet; any session, any id, created or not). | retried after a metadata refresh |
 | 3 | `Redirect` | Carries the leader's client endpoint; re-send there. | followed (DDL: at most 3 hops) |
 | 4 | `SessionExpired` | The session timed out. |  |
 | 5 | `UnknownSession` | The broker has no such session. |  |
@@ -466,6 +519,7 @@ rejection counts of a topic's verdict source, `constraintId = viewObjectId << 16
 | 64 | `LeaseNotFound` | Client 18: no live lease for the key, or a lease at a different version. A session below 18 is answered `InvalidRequest` (39). | per-record verdict of a `View` ack on a lease topic, or a `LeaseKeepAlive` entry |
 | 65 | `LeaseLimitExceeded` | Client 18: the topic's `lease.max_keys` or the namespace's max leases is reached. | per-record verdict of a grant |
 | 66 | `LeaseTtlTooLarge` | Client 18: the requested TTL is above the topic's `lease.max_ttl`. | `Produce` / `LeaseKeepAlive` error |
+| 67 | `SchemaVersionRetired` | A produced record, or a typed open (`GetTopicSchema`), names a schema version below the topic's retire floor (`alter topic .. retire version < N`). Nothing is stored. Sent to every client version: a client that does not know it treats an unknown produce or schema error as terminal. | `Produce` error / `TopicSchemaResponse.errorCode`; terminal |
 
 The broker-internal storage errors (`rune::protocol::ErrorCode`, [`Errors.h`](../../protocol/include/rune/protocol/Errors.h))
 are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRecord`=2, `InvalidRecordBatch`=3,
@@ -478,11 +532,21 @@ are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRe
   `InternalIsr`, `InternalIsrAck`, `OffsetsForLeaderEpochRequest`/`Response`, `ReconcileFetchRequest`/`Response`. Broker to
   broker only; inter-broker frames are sealed with the cluster key
   ([operations](../operations.md#the-cluster-key)).
+- **Segment repair** (`schemaId 112`, templates 17 `RepairFetchRequest` and 18 `RepairFetchResponse`): a replica with a damaged
+  sealed log segment asks a peer for the batches it lacks. Both reuse the `FetchRequest` / `FetchResponse` layouts unchanged (no
+  block-length or schema-version change) and carry their extra facts in fields the layouts do not otherwise use. In the request,
+  `fetchOffset` is the cursor (the first offset wanted), `incarnation` is the asker's attempt id and `lastEpochStartOffset` is
+  the exclusive end of the wanted range. In the response, `errorCode` is the status (0 batches follow, 1 done: no batch below
+  the end remains, 2 refused), `fromOffset` and `logStartOffset` echo the cursor and the attempt id, `highWatermark` is the
+  peer's, and `records` are whole batches whose base offsets lie in the range and below the peer's high watermark. Broker to
+  broker only.
 - **Transaction vote** (cluster plane, `schemaId 112`, hand-rolled little-endian blocks after the 8-byte header): template 15
   `TxnVote`, coordinator to partition leader (40-byte block: `coordinatorNodeId`, `coordinatorEpoch`, `token`, `topicId`,
   `partition`, `producerId`, `producerEpoch`, `leaderEpoch`), and template 16 `TxnVoteResponse`, leader to coordinator (48-byte
   block: `token`, `topicId`, `partition`, `producerId`, `coordinatorEpoch`, `producerEpoch`, `errorCode` for the transport,
-  `code` for the vote, `constraintId`, `failingOffset`).
+  `code` for the vote, `constraintId`, `failingOffset`). While the partition's judge waits on another transaction's rows, the
+  leader answers each pending vote once with an interim: `errorCode` -100, `failingOffset` the holder's producer id, `constraintId`
+  its producer epoch. It is not the answer; the vote follows. A coordinator that predates it sees a transport error and asks again.
 - **Internal ring** (`schemaId 7`, SBE, `schema/rune-internal-ring.xml`): messages between threads of one process
   (`WorkerOp`, `WorkerReturn`, `FlushRequest`, `FlushCompletion`). They never cross a wire.
 - **Conformance vectors**: `protocol/conformance/` holds generated golden vectors for the client frames; see its

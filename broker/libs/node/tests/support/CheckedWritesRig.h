@@ -343,6 +343,12 @@ public:
         const auto it = voteReplies_.find(token);
         return it == voteReplies_.end() ? std::nullopt : std::optional<VoteReply>(it->second);
     }
+    /// #995: the interims (judge waits on another transaction) answered to `token`, as (holder producer id, holder epoch), in order.
+    [[nodiscard]] const std::vector<std::pair<int64_t, int16_t>>& voteInterims(int64_t token) const {
+        static const std::vector<std::pair<int64_t, int16_t>> kNone;
+        const auto it = voteInterims_.find(token);
+        return it == voteInterims_.end() ? kNone : it->second;
+    }
     [[nodiscard]] std::size_t voteRepliesOf(int64_t token) const { return static_cast<std::size_t>(voteReplyCount_.count(token) ? voteReplyCount_.at(token) : 0); }
     /// Passes (the follower fetching every 8th) until the vote is answered.
     [[nodiscard]] bool driveUntilVoted(int64_t token, int cap = 2000) {
@@ -1270,8 +1276,10 @@ public:
         return c;
     }
     /// The same batch the way a gateway routes it: a Produce op on the op ring, answered through the ack sink.
-    /// `importGranted`: the gateway found IMPORT on the topic (kOpFlagImportGranted).
-    int64_t routedFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool importGranted = true) {
+    /// `importGranted`: the gateway found IMPORT on the topic (kOpFlagImportGranted); `importDeferred`: ... and its security view
+    /// is behind, so a missing IMPORT is not a verdict (kOpFlagImportDeferred, #506).
+    int64_t routedFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool importGranted = true,
+                        bool importDeferred = false) {
         const auto bytes = batch(recs, pid, seq, keyShape_);
         WorkerOp op;
         op.type = WorkerOp::Type::Produce; op.topicId = kSrc; op.partition = tuning_.partition;
@@ -1282,6 +1290,7 @@ public:
         op.durabilityTier = replica->durabilityTier();
         op.deferAck = (acks & rune::protocol::client::kAcksWireAll) != 0;
         op.importGranted = importGranted;
+        op.importDeferred = importDeferred;
         op.recordBatchView = std::span<const uint8_t>(bytes);
         EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
         return corr;
@@ -1699,10 +1708,13 @@ private:
     int64_t voteToken_ = 70'000;
     std::map<int64_t, VoteReply> voteReplies_;
     std::map<int64_t, int> voteReplyCount_;
+    std::map<int64_t, std::vector<std::pair<int64_t, int16_t>>> voteInterims_;
     std::map<int64_t, int64_t> markerAnswers_;   ///< ControlRecordAppended: correlation id -> base offset (or -1 - errorCode)
     std::function<void()> everyPass_;
     void noteTxnReturn_(const WorkerReturn& r) {
-        if (r.type == WorkerReturn::Type::TxnVoteResult) {
+        if (r.type == WorkerReturn::Type::TxnVoteResult && r.errorCode == rune::replication::kTxnVoteWaiting) {   // an interim, not an answer
+            voteInterims_[r.correlationId].emplace_back(r.baseOffset, static_cast<int16_t>(r.newNextOffset));
+        } else if (r.type == WorkerReturn::Type::TxnVoteResult) {
             voteReplies_[r.correlationId] = VoteReply{r.errorCode, static_cast<uint16_t>(r.recordCount), static_cast<uint32_t>(r.newNextOffset), r.baseOffset, r.lastOffset};
             ++voteReplyCount_[r.correlationId];
         } else if (r.type == WorkerReturn::Type::TxnVerifyRequest) {

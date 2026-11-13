@@ -12,7 +12,10 @@
   - The qualified form is `ns/name`. Topic, view and group names can never contain `/` (`TopicName.h`), so the form
     is unambiguous. Only the cluster admin may name an object in a namespace other than its session's.
   - An object in another namespace answers exactly like a missing one: same error code, same message, same timing
-    path. Nothing reveals that a name exists elsewhere.
+    path. Nothing reveals that a name exists elsewhere. For an id a broker has not applied yet (at or above its
+    catalog frontier, `nextTopicId`) the answer is the retriable `NotLeader` for every session, so a topic just created
+    in another namespace and an id nobody created answer alike; below the frontier the id is decided and the rule above
+    holds. The frontier is not a secret: a tenant sees the counter in the ids of its own topics.
   - **Indexes are keyed by `(nsId, name)`.** `ObjectIndex::byName` and the schema and view registries, global today,
     take the pair as their key, so the same name in two namespaces is two entries and a lookup can only find an
     object of the namespace it was given.

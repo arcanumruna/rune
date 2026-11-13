@@ -146,6 +146,7 @@ std::string formatSchemaDefinition(const cat::TopicObject& t) {
     const cat::SchemaState& s = *t.schema;
     o << "schema " << t.name << " version " << s.schemaVersion << "\n"
       << "  compatibility " << compatName(s.compat) << "\n"
+      << (s.retiredBelow > 1 ? "  retired below: " + std::to_string(s.retiredBelow) + "\n" : std::string{})
       << "  keyField " << (s.keyField.empty() ? "-" : s.keyField) << "\n"
       << descriptorText(s.evolvingBlob);
     return o.str();
@@ -441,6 +442,8 @@ int cmdQl(const std::vector<std::string>& args, std::istream& in, std::ostream& 
 namespace {
 
 std::string statLabel(uint16_t id) {
+    if (id >= rune::protocol::client::kStatProducedAtVersionBase)   // #419: records accepted at one schema version
+        return "producedAtVersion" + std::to_string(id - rune::protocol::client::kStatProducedAtVersionBase);
     const std::string_view name = rune::protocol::client::statName(static_cast<rune::protocol::client::StatId>(id));
     return name == "unknown" ? "stat" + std::to_string(id) : std::string(name);
 }
@@ -817,6 +820,13 @@ std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st
                 const auto blob = rune::codec::encodeAlterOps({op});
                 const auto r = c.alterTopicAndWait(e.objectName, 0, blob, ddl, t);
                 return failureOf(r.errorCode, r.detail);
+            } else if constexpr (std::is_same_v<T, cat::RetireSchemaVersionsOps>) {   // #419
+                rune::codec::AlterOp op{};
+                op.type = rune::codec::AlterOpType::RetireBelow;
+                op.version = o.below;
+                const auto blob = rune::codec::encodeAlterOps({op});
+                const auto r = c.alterTopicAndWait(e.objectName, 0, blob, ddl, t);
+                return failureOf(r.errorCode, r.detail);
             } else if constexpr (std::is_same_v<T, cat::AlterTopicConfigOps>) {
                 std::vector<rpc::ConfigChangeWire> changes;
                 for (const cat::ConfigChange& ch : o.changes)
@@ -903,7 +913,7 @@ int cmdReplay(const std::vector<std::string>& args, std::ostream& out, std::ostr
                 return 1;
             }
             // A rerun after a crash: this step already applied (same request id) — its original result stands.
-            auto done = reader.state().request(rid);
+            auto done = reader.state().requestOfAnyPrincipal(rid);
             if (done) {
                 ++deduplicated;
             } else {

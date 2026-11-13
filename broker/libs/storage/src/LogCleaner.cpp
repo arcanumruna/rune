@@ -666,7 +666,8 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
 void LogCleaner::noteDamage_(const std::string& dir, int64_t segBase, std::size_t pos) {
     if (damaged_.has_value()) return;
     damaged_ = Damaged{segBase, pos};
-    spdlog::warn("LogCleaner: damaged batch in {} segment {} at byte {}: the log is uncleanable until the damaged segment is gone or the broker restarts",
+    spdlog::warn("LogCleaner: damaged batch in {} segment {} at byte {}: the log is uncleanable until the "
+                 "damaged segment file is replaced or removed, or the broker restarts",
                  dir, segBase, pos);
 }
 
@@ -1131,7 +1132,7 @@ void LogCleaner::compact(Log& log, OffsetMap& map,
     if (mode_ != CleanerTopicMode::Plain) return;   // lease mode runs on the SkimpyOffsetMap engines only: nothing is compacted
     const std::string& dir = log.dir();
     rewriteSegmentsRead_ = 0;
-    if (damaged_.has_value()) return;   // uncleanable until restart
+    if (damaged_.has_value()) return;   // uncleanable for this pass
 
     // Clean up any stale .log.new temp files left by a previous crashed run.
     for (auto& e : std::filesystem::directory_iterator(dir)) {
@@ -1196,7 +1197,7 @@ bool LogCleaner::produceCleanedFile(const std::string& dir,
                                     Offset globalDirtyStart,
                                     int64_t nowNs, int64_t deleteRetentionMs) {
     if (sealedBases.empty()) return false;
-    if (damaged_.has_value()) return false;   // uncleanable until restart
+    if (damaged_.has_value()) return false;   // uncleanable for this pass
 
     // Guard: segBase must be one of the sealed segments in the snapshot AND must
     // be strictly below the active/uncleanable boundary.  We NEVER read segments_
@@ -1254,7 +1255,7 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
 {
     CleanPassResult result{false, activeBase};
     rewriteSegmentsRead_ = 0;
-    if (damaged_.has_value()) return result;   // uncleanable until restart
+    if (damaged_.has_value()) return result;   // uncleanable for this pass
 
     if (sealedBases.empty()) return result;
     if (segBase >= activeBase) return result;
@@ -1428,7 +1429,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
     RangeCleanResult result;
     rewriteSegmentsRead_ = 0;
     result.passEnd = activeBase;   // default: nothing dirty → advance to activeBase
-    if (damaged_.has_value()) return result;   // uncleanable until restart: nothing read, nothing changed
+    if (damaged_.has_value()) return result;   // uncleanable for this pass: nothing read, nothing changed
     // Fix round 2: deferred-install mode collects outputs into result.groups.
     struct DeferredScope {
         std::vector<CleanedGroup>*& slot;
@@ -1995,7 +1996,7 @@ CleanPassResult LogCleaner::produceCleanedGroupBounded(
 {
     CleanPassResult result{false, activeBase};
     rewriteSegmentsRead_ = 0;
-    if (damaged_.has_value()) return result;   // uncleanable until restart
+    if (damaged_.has_value()) return result;   // uncleanable for this pass
     if (group.bases.empty()) return result;
 
     // All bases in the group must be < activeBase.

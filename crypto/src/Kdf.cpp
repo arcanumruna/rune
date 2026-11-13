@@ -139,6 +139,14 @@ std::optional<ClusterKeyMaterial> deriveClusterKey(std::span<const uint8_t> cont
     return m;
 }
 
+bool deriveBootstrapMacKey(std::span<const uint8_t> master, std::span<uint8_t, 64> out) noexcept {
+    if (master.empty() || !hkdf(Digest::Sha512, master, {}, sv("rune-bootstrap-mac-v2"), out)) {
+        secureZero(out);
+        return false;
+    }
+    return true;
+}
+
 std::array<uint8_t, 16> deriveWorkerBindToken(std::span<const uint8_t> c2bKey, int64_t sessionId) noexcept {
     std::array<uint8_t, 16> out{};
     uint8_t salt[8];

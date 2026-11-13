@@ -44,6 +44,11 @@ void secureZero(std::span<uint8_t> buf) noexcept;
 struct ClusterKeyMaterial { std::array<uint8_t, 64> master{}; uint64_t keyId = 0; };
 [[nodiscard]] std::optional<ClusterKeyMaterial> deriveClusterKey(std::span<const uint8_t> fileContents) noexcept;
 
+/// #234 — the ONE derivation of the bootstrap-proof MAC key (broker gateway and client): HKDF(SHA-512, ikm = master,
+/// salt = empty, info = "rune-bootstrap-mac-v2"), 64 B.  The raw master is never used as a MAC key.  False (and `out`
+/// zeroed) on any failure or when `master` is empty.
+[[nodiscard]] bool deriveBootstrapMacKey(std::span<const uint8_t> master, std::span<uint8_t, 64> out) noexcept;
+
 /// I3 — the ONE derivation of a TLS session's worker-bind token (broker gateway and client): HKDF-SHA256(ikm = the
 /// session's client->broker key (32 B), salt = sessionId little-endian (8 B), info = "rune-worker-bind-v1"), 16 B.  The
 /// token never crosses the wire: both ends derive it from the TLS-exported keys.  All-zero on any failure (a zero

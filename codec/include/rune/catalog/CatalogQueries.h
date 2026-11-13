@@ -75,8 +75,8 @@ struct DiffEntry {
 /// The fingerprinted fields that differ, by diff name, in fingerprint order (CatalogFingerprint.h).
 /// Topic: version, partitions, replicationFactor, persistence, config.<field> (TopicConfig member
 /// names), schema (present vs absent), schema.keyField, schema.validate, schema.fields (the live
-/// field set or nextTag), schema.version, schema.compat, schema.descriptor (any other change of
-/// the evolving descriptor).  View: version, view.sinkPartitions, view.persistence,
+/// field set or nextTag), schema.version, schema.compat, schema.retiredBelow (formatVer 5), schema.descriptor (any other
+/// change of the evolving descriptor).  View: version, view.sinkPartitions, view.persistence,
 /// view.keyField, view.sources, view.plan, view.output.  Ids are never fields.
 [[nodiscard]] std::vector<std::string> changedFields(const TopicObject& a, const TopicObject& b);
 [[nodiscard]] std::vector<std::string> changedFields(const ViewObject& a, const ViewObject& b);

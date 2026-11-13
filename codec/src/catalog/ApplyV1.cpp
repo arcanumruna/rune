@@ -356,7 +356,7 @@ Result alterSchema(const CatalogState& s, const CatalogEvent& e, int64_t off, co
     TopicObject next = **t;
     next.schema = SchemaState{.keyField = std::move(keyField), .validate = cur.validate, .evolvingBlob = std::move(*blob),
                               .schemaVersion = static_cast<uint16_t>(cur.schemaVersion + 1), .nextTag = nextTag,
-                              .compat = mode};
+                              .compat = mode, .retiredBelow = cur.retiredBelow};   // the retire floor (v5) survives an ALTER
     next.version = e.newVersion;
     return StagedUpdate{std::move(next)};
 }
@@ -453,10 +453,17 @@ std::optional<std::string> topicConfigError(const TopicConfig& c) {
     return std::nullopt;   // coPartitionGroup, partitionKey: free-form (bounded by the wire's str16)
 }
 
+std::expected<const TopicObject*, ApplyError> liveTopicOf(const CatalogState& s, const CatalogEvent& e, int64_t offset) {
+    return liveTopic(s, e, offset);
+}
+std::optional<ApplyError> schemaVersionErrorOf(const CatalogEvent& e, int64_t offset, const TopicObject& t) {
+    return schemaVersionError(e, offset, t);
+}
+
 std::expected<Staged, ApplyError> ApplyV1::run(const CatalogState& s, const CatalogEvent& e, int64_t offset) {
     if (auto v = wire::validateEvent(e))
         return fail(offset, Code::BadOps, prefix(e) + "invalid event: " + std::string(encodeErrorName(*v)));
-    if (!e.principal.requestId.none() && s.request(e.principal.requestId))
+    if (!e.principal.requestId.none() && s.request(e.principal.authenticated, e.principal.requestId))
         return fail(offset, Code::Precondition, prefix(e) + "requestId " + std::to_string(e.principal.requestId.hi) + ":" +
                                                     std::to_string(e.principal.requestId.lo) + " is already applied");
     return std::visit([&](const auto& o) -> Result {
@@ -540,7 +547,8 @@ Applied ApplyV1::commit(CatalogState& s, const CatalogEvent& e, int64_t offset, 
     }, std::move(st));
 
     s.appliedOffset_ = offset;
-    if (!e.principal.requestId.none()) s.requests_.emplace(e.principal.requestId, r);
+    if (!e.principal.requestId.none())
+        s.requests_[e.principal.requestId].push_back(CatalogState::RequestEntry{e.principal.authenticated, r});
     return a;
 }
 

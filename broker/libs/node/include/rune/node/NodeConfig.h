@@ -38,6 +38,9 @@
 // Consumer groups (all optional):
 //   RUNE_GROUP_MAX_GROUPS           — int32 > 0, the most consumer groups this broker coordinates at once (#214).
 //                                     Default 10000.  A JoinGroup that would create one more group is refused.
+//   RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL — int32 > 0, the most live groups ONE authenticated principal may have created
+//                                     (#617).  Default: half of RUNE_GROUP_MAX_GROUPS (at least 1); a value above the
+//                                     cap is the cap (no share).  Not applied when no principal is authenticated.
 //   RUNE_GROUP_MIN_SESSION_TIMEOUT_MS — int32 ms > 0, default 1000 (#499).  A smaller JoinGroup session timeout is
 //                                     raised to it.
 //   RUNE_GROUP_MAX_SESSION_TIMEOUT_MS — int32 ms > 0, default 1800000 (#213 / #499).  A larger one is lowered to it.
@@ -399,6 +402,11 @@ struct NodeConfig {
     // 10 s default.  0 (default): ClientGateway::kDefaultSessionTimeoutNs; never set in production.
     int64_t testSessionTimeoutMs = 0;
 
+    // TEST-ONLY (#612): when non-zero it replaces the soft RLIMIT_NOFILE this broker reports after its fd step, for
+    // BOTH its own DDL fd-budget admission and the limit it advertises to the cluster.  Lets one node of an
+    // in-process cluster run under a lower limit.  Not read from the environment; never set in production.
+    uint64_t testFdSoftLimitOverride = 0;
+
     // TEST-ONLY (ISR v3 Step 9, R-I1): hold the consensus candidacy from boot even for a Founder/Legacy storage,
     // until the test releases it (BrokerNode::setTestCandidacyHold).  Makes a fresh-cluster formation
     // deterministic: every node decides its storage before anyone stands.  Never set in production.
@@ -562,6 +570,9 @@ struct NodeConfig {
     /// RUNE_GROUP_MAX_GROUPS (#214): the most consumer groups coordinated at once.  0 = the default
     /// (GroupCoordinationService::kDefaultMaxGroups).
     int32_t groupMaxGroups = 0;
+    /// RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL (#617): the most live groups one principal may have created.  0 = half
+    /// of the group cap (at least 1).
+    int32_t groupMaxGroupsPerPrincipal = 0;
     /// RUNE_MAX_NAMESPACES (namespaces Task 7): the cluster-wide namespace cap, `default` included.
     int32_t maxNamespaces = 1024;
     static constexpr int32_t kMaxNamespacesCap = 65535;   ///< a slot index is a uint16_t and 0xFFFF means "no slot"

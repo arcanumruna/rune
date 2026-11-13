@@ -64,6 +64,9 @@ enum class RuneMetric : std::int32_t {
     PeerHelloShed              = 1'000'243,   // monotonic: crypto-costing peer Hellos dropped over the per-peer budget
     DamagedSegments            = 1'000'270,   // gauge: damaged sealed log segments found at boot (every log the node serves)
     DamagedReads               = 1'000'271,   // monotonic: subscription reads that reached damaged stored data
+    SegmentRepairs             = 1'000'272,   // monotonic: damaged sealed segments rebuilt from a peer (#880)
+    SegmentRepairFailures      = 1'000'273,   // monotonic: repair attempts that failed (validation, timeout, begin / commit)
+    SegmentRepairNoPeer        = 1'000'274,   // monotonic: damaged segments no peer could serve (RF 1, every copy damaged)
 };
 
 /// Per-namespace rows (namespaces Phase 2 Task 8): allocated per namespace on the control thread when it is created,
@@ -89,7 +92,7 @@ using M = RuneMetric;
 }  // namespace detail
 
 /// One row per live metric, in type-id order.  The row index is the slot index in BrokerNode::slots_.
-inline constexpr std::array<RuneMetricDef, 35> kRuneMetrics = {{
+inline constexpr std::array<RuneMetricDef, 38> kRuneMetrics = {{
     {detail::M::Role,                      detail::K::Gauge,   "rune-cluster-node-role",                       detail::O::Observer},
     {detail::M::Term,                      detail::K::Gauge,   "rune-cluster-leadership-term",                 detail::O::Observer},
     {detail::M::StuckMarkers,              detail::K::Gauge,   "rune-txn-stuck-markers",                       detail::O::Control},
@@ -125,6 +128,9 @@ inline constexpr std::array<RuneMetricDef, 35> kRuneMetrics = {{
     {detail::M::PeerHelloShed,             detail::K::Counter, "rune-peer-hello-shed",                         detail::O::Control},
     {detail::M::DamagedSegments,           detail::K::Gauge,   "rune-log-damaged-segments",                    detail::O::Control},
     {detail::M::DamagedReads,              detail::K::Counter, "rune-log-damaged-reads",                       detail::O::Control},
+    {detail::M::SegmentRepairs,            detail::K::Counter, "rune-log-segment-repairs",                     detail::O::Control},
+    {detail::M::SegmentRepairFailures,     detail::K::Counter, "rune-log-segment-repair-failures",             detail::O::Control},
+    {detail::M::SegmentRepairNoPeer,       detail::K::Counter, "rune-log-segment-repair-no-peer",              detail::O::Control},
 }};
 
 /// The metric's type id in the metrics file (D61: the enumerator value, equal to the old Aeron counter type id).

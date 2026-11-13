@@ -2715,6 +2715,44 @@ TEST(ViewReadLeaseRegression, PartitionedControllerExLeaderNeverServesAStaleRowR
     zombieViewReadCase(/*zombieIsController=*/true, "vls_ctrl_zombie");
 }
 
+// #507 (3 nodes): a follower that has not applied CREATE VIEW answers GetViewRow for the new view NotReady (retriable),
+// never UnknownView, until its catalog apply lands.  The follower's replication of the catalog is held, the view is
+// created and committed by the other two, and the view's id is at or above the held broker's applied topic frontier.
+// RED before the fix (auth off): the worker answered UnknownView (4), terminal.
+TEST(ViewReadLeaseRegression, AViewTheBrokerHasNotAppliedYetIsNotReadyThenServedRegression) {
+    ThreeNodes c = ThreeNodes::start("g507_unapplied_view");
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    Rig rig(c);
+    const int leader = c.settledLeader();
+    ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("src", 3, true), "define src", leader));
+    const auto si = rig.topicInfo(leader, "src", 30s);
+    ASSERT_TRUE(si.has_value());
+    int held = -1;
+    for (int n = 1; n <= 3 && held < 0; ++n) if (n != leader) held = n;
+    ASSERT_GT(held, 0);
+    ASSERT_TRUE(c.awaitCatalogDigestsEqual(30s)) << "every broker applied the source before the hold";
+    c.node(held).holdCatalogReplicationForTest(true);
+
+    ASSERT_NO_FATAL_FAILURE(rig.must(createViewSender("v", si->id), "create v (a follower holds its apply)", leader));
+    const auto vi = rig.topicInfo(leader, "v", 30s);
+    ASSERT_TRUE(vi.has_value());
+    const int64_t key = 1;
+    for (int i = 0; i < 5; ++i) {
+        const auto r = rig.viewRowFollowing(held, vi->id, static_cast<uint64_t>(key));
+        ASSERT_TRUE(r.answered) << "read " << i << " through the broker that has not applied the view";
+        EXPECT_FALSE(r.firstIsError) << "read " << i << " answered error " << r.firstCode;
+        EXPECT_EQ(r.firstCode, pc::ViewRowResponse::kNotReady)
+            << "read " << i << ": not applied here yet is retriable, never UnknownView (4)";
+    }
+
+    c.node(held).holdCatalogReplicationForTest(false);
+    const auto served = rig.viewRowSettled(held, vi->id, static_cast<uint64_t>(key), 60s);
+    ASSERT_TRUE(served.answered);
+    EXPECT_TRUE(!served.finalIsError || served.finalCode == cRedirect)
+        << "once the apply lands the view answers (AbsentKey: nothing produced), got " << served.finalCode;
+    EXPECT_NE(served.finalCode, pc::ViewRowResponse::kUnknownView);
+}
+
 // ===========================================================================
 // PR #490 adversarial review (#486): a LIVE leader move that drops the old leader from the ISR - here a controlled
 // shutdown of the view source's leader A - while A's metadata apply lags (held).  The controller moves A's leaderships to

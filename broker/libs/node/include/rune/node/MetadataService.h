@@ -175,6 +175,41 @@ public:
     /// The committed cluster feature level.
     [[nodiscard]] int16_t featureLevel() const noexcept { return msm_.featureLevel(); }
 
+    /// #612: the smallest soft open-file limit advertised by the brokers heard from since their current process
+    /// started, and whose it is (ties: the lowest node id).  {0, -1} = none known.  Soft state of the node-control
+    /// registers: a broker not heard from yet (down, or not since this process started) is not counted.
+    struct ClusterFdLimit {
+        uint64_t limit = 0;
+        int32_t  node  = -1;
+    };
+    [[nodiscard]] ClusterFdLimit clusterFdLimit() const noexcept {
+        ClusterFdLimit best;
+        for (const auto& [node, st] : nodeLifecycle_) {
+            if (st.fdLimit <= 0) continue;
+            const uint64_t v = static_cast<uint64_t>(st.fdLimit);
+            if (best.node < 0 || v < best.limit || (v == best.limit && node < best.node)) best = {v, node};
+        }
+        return best;
+    }
+    /// #612: moves whenever any node's advertised limit changes (including the reset of a new process).
+    [[nodiscard]] uint64_t fdLimitsEpoch() const noexcept { return fdLimitsEpoch_; }
+
+    /// #612 (greet): peers whose NEW process registered here and that were not told about this node yet.  A register
+    /// is re-sent only on a controller / term change, so a restarted broker would never learn the limits of the peers
+    /// that kept running: a member that sees a new process of a peer register sends its own register to that peer
+    /// once.  The control thread (ControlledShutdown::serviceGreets_) drains this set.  Soft state, fixed size, no
+    /// allocation: when full the new peer is dropped and counted (the peer learns us at the next register).
+    static constexpr std::size_t kMaxGreetsOwed = 16;
+    [[nodiscard]] std::span<const int32_t> greetsOwed() const noexcept { return {greetOwed_.data(), greetOwedCount_}; }
+    void greetDone(int32_t node) noexcept {
+        for (std::size_t i = 0; i < greetOwedCount_; ++i) {
+            if (greetOwed_[i] != node) continue;
+            greetOwed_[i] = greetOwed_[--greetOwedCount_];
+            return;
+        }
+    }
+    [[nodiscard]] uint64_t greetsDropped() const noexcept { return greetsDropped_; }
+
     // -----------------------------------------------------------------------
     // Re-review 2026-10-04 MEDIUM-B — the COORDINATOR partitions
     // (__consumer_offsets -1, __transaction_state -2) on the controller-ISR
@@ -881,6 +916,7 @@ public:
         bool    completePushed = false;
         int32_t pushedBits     = -1;      ///< member side: last confirmation sent
         int16_t featureLevel   = -1;      ///< D15: the level this process advertised (-1 = none yet)
+        int32_t fdLimit        = 0;       ///< #612: the soft open-file limit this process advertised (0 = unknown)
         std::array<int64_t, 4> superseded{};   ///< recent dead processes (ring)
         /// E2 residual round 5 (R1): the controller's failure detector found
         /// this node DEAD (out of the heartbeat-eligible set): its process
@@ -915,6 +951,7 @@ public:
             catalogHalted  = false;   // Task 11: a new process has a fresh applier
             securityHalted = false;
             featureLevel = -1;   // D15: a new process may be another binary
+            fdLimit = 0;         // #612: a new process may run under another limit
             storageId = 0; storageOrigin = 0;   // ISR v3: a new process re-reports its storage
             confirmed.clear();
             return true;
@@ -938,6 +975,8 @@ public:
             return false;
         }
         NodeLifecycle& st = nodeLifecycle_[m.leaderId];
+        const int32_t fdLimitBefore = st.fdLimit;   // #612
+        const int64_t nonceBefore   = st.nonce;     // #612: a new process of a peer is owed a greet
         const bool wasShutting = st.shutting;
         const bool wasHalted   = st.catalogHalted;
         if (!st.adopt(nonce)) {
@@ -954,12 +993,16 @@ public:
             return false;
         }
         st.capable = true;
+        if (st.nonce != nonceBefore && m.leaderId != selfId_ && (flags & rr::AlterIsrMsg::kNodeShutdown) == 0)
+            markGreetOwed_(m.leaderId);   // #612: a NEW process of a peer: tell it about this node once
         if (wasHalted && !st.catalogHalted) {   // Task 11 fix round 1: a new, healthy process
             ++routingInputsEpoch_;
             spdlog::info("MetadataService[{}]: node {} restarted with a healthy catalog — a placement target again",
                          selfId_, m.leaderId);
         }
         st.featureLevel = static_cast<int16_t>(m.isr[rr::AlterIsrMsg::kNodeFeatureLevelSlot]);   // D15
+        st.fdLimit = std::max(0, m.isr[rr::AlterIsrMsg::kNodeFdLimitSlot]);   // #612
+        if (st.fdLimit != fdLimitBefore) ++fdLimitsEpoch_;
         st.storageId = static_cast<int64_t>(
             (static_cast<uint64_t>(static_cast<uint32_t>(m.isr[rr::AlterIsrMsg::kNodeStorageHiSlot])) << 32) |
             static_cast<uint32_t>(m.isr[rr::AlterIsrMsg::kNodeStorageLoSlot]));
@@ -1005,6 +1048,12 @@ public:
             if (answer) *answer = true;
         }
         return false;
+    }
+    void markGreetOwed_(int32_t node) noexcept {
+        for (std::size_t i = 0; i < greetOwedCount_; ++i)
+            if (greetOwed_[i] == node) return;
+        if (greetOwedCount_ == greetOwed_.size()) { ++greetsDropped_; return; }
+        greetOwed_[greetOwedCount_++] = node;
     }
     void fillNodeControlResponse_(rune::replication::AlterIsrResponseMsg& r, int32_t node, int64_t nonce,
                                   bool complete) const noexcept {
@@ -3441,6 +3490,10 @@ private:
 
     rune::metadata::MetadataStateMachine  msm_;
     uint64_t                              routingInputsEpoch_ = 0;   // see routingVersion()
+    uint64_t                              fdLimitsEpoch_ = 0;        // #612: see fdLimitsEpoch()
+    std::array<int32_t, kMaxGreetsOwed>   greetOwed_{};              // #612: see greetsOwed()
+    std::size_t                           greetOwedCount_ = 0;
+    uint64_t                              greetsDropped_ = 0;
 
     // Last log offset we have read batches from.  Initialized to -1 (nothing applied).
     rune::replication::Offset lastApplied_ = -1;

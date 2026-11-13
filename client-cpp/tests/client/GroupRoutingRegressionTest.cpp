@@ -3850,6 +3850,26 @@ TEST(GroupRoutingRegression, SeedFailoverRetriesEveryBrokerInTurnRegression) {
     (void)n2; (void)p2port;
 }
 
+// #767: the seed's move to a failover candidate is asynchronous.  A candidate whose publication never resolves ends its
+// move as FAILED (the old publication stays) and the next candidate is tried after the gap - as the blocking retarget's
+// false did.  Only the move that completed counts as a failover.
+TEST(ClientRegression, ASeedFailoverMovesToTheNextCandidateWhenTheMoveFailsRegression) {
+    GroupRig r(4345, 4346, failoverOpts());
+    const auto [n2, p2port] = r.addNode(4345);
+    r.gw.moreBrokers = {{1, "rune-unresolvable.invalid", 40201}, {2, "127.0.0.1", p2port}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    r.gw.deadEndpoints = {0};
+    EXPECT_TRUE(driveFor(r, 15s, [&] {
+        return r.client.testSessionStateAt(0) == rc::session::SessionState::Connected &&
+               rc::agent::ClientAgent::sameEndpoint(r.client.testSeedChannel(), udp(p2port));
+    })) << "the seed never reached the second candidate (seed on " << r.client.testSeedChannel() << ")";
+    EXPECT_GE(r.gw.connectsAt[n2], 1);
+    EXPECT_EQ(r.client.testSeedFailovers(), 1u) << "only the move that completed is a failover";
+    EXPECT_FALSE(r.client.testTransport().seedRetargetPending());
+}
+
 // I-3: a shard (reconnectForever) client reaches EVERY broker — n1 refuses connects (retriable), n2
 // is healthy.  RED (re-points on even Backoff entries undone by tickBackoff_'s bootstrap retarget;
 // the old list): it alternates n1 and n0 forever, n2 never tried.

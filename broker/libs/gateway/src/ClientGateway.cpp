@@ -57,6 +57,13 @@
 static_assert(rune::gateway::ClientGateway::kShardMaxSessions ==
                   rune::node::SessionAckSink::kMaxSessions - 1,
               "Task 13: the runtime's shard session cap is a worker ack table's capacity");
+// #442: a permission refresh briefly holds the old ref and the new one, so a full shard session table needs one table
+// of headroom; the worker's table store is the pool's bound (the pool numbers a table, the worker stores it by that
+// id).
+static_assert(rune::gateway::PermissionPool::kMaxTables >= rune::gateway::ClientGateway::kShardMaxSessions + 1,
+              "#442: a refresh briefly holds the old and the new table of a session");
+static_assert(rune::node::kMaxWritePermTables == rune::gateway::PermissionPool::kMaxTables,
+              "#442: the workers' table store is exactly the gateway pool's bound");
 static_assert(rune::gateway::ClientGateway::kWorkerRoutedCap == rune::node::Worker::kRoutedAckBudget,
               "D8c fix round 1: the gateway's per-worker routed cap is the worker's routed ack share");
 static_assert(rune::gateway::ClientGateway::kMaxSessionProduceCredits * 4 <=
@@ -1322,6 +1329,7 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::AlterView:
         case pc::TemplateId::SecurityDdl:
         case pc::TemplateId::SecurityBootstrap:
+        case pc::TemplateId::SecurityBootstrapChallengeRequest:
         case pc::TemplateId::NamespaceDdl:
         case pc::TemplateId::ListNamespaces:
         case pc::TemplateId::NamespaceUsage:
@@ -1442,6 +1450,9 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             break;
         case pc::TemplateId::SecurityBootstrap:
             handleSecurityBootstrap(buf, len);
+            break;
+        case pc::TemplateId::SecurityBootstrapChallengeRequest:
+            handleSecurityBootstrapChallengeRequest(buf, len);
             break;
         // Namespaces Task 7: namespace DDL (81, catalog-routed) and ListNamespaces (82, any broker).
         case pc::TemplateId::NamespaceDdl:
@@ -1689,6 +1700,7 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     for (auto& [w, pub] : s->recordEgressByWorker)
         if (pub) retireRecordEgress_(sid, w, std::move(pub));
     if (s->heldLoginOk.epoch != 0) unlinkHeldLoginOk_(*s);   // issue #202: before the session leaves the table
+    noteStarved_(sid, false);   // #442: a closed session is never re-acquired
     sessions_.remove(sid);                    // releases its (gateway-written) egress publication
     // Task 13: the workers forget it too (its queued acks drop, its
     // publications are released) — retried until every worker has it.
@@ -1697,7 +1709,8 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     // (all workers — its buffered subscribes die with the session).
     for (auto pit = pendingRecordEgress_.begin(); pit != pendingRecordEgress_.end(); ) {
         if (pit->first.first != sid) { ++pit; continue; }
-        abandonRegistration_(pit->second.regId);   // a registration still in flight is released, not leaked
+        if (!pit->second.resolved)   // #745: a found publication is released by the erase below (found only once)
+            abandonRegistration_(pit->second.regId);   // a registration still in flight is released, not leaked
         pit = pendingRecordEgress_.erase(pit);
     }
 
@@ -2041,6 +2054,14 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
         }
         return;
     }
+    if (kind == K::SegmentRepair) [[unlikely]] {   // #880: a worker's cumulative repair count; sessionId = the counter
+        if (ret.partition >= 0 && ret.partition < 4096 && ret.sessionId >= 0 && ret.sessionId < 3) {
+            auto& per = workerSegmentRepairs_[static_cast<std::size_t>(ret.sessionId)];
+            if (per.size() <= static_cast<std::size_t>(ret.partition)) per.resize(static_cast<std::size_t>(ret.partition) + 1, 0);
+            per[static_cast<std::size_t>(ret.partition)] = static_cast<uint64_t>(ret.baseOffset);
+        }
+        return;
+    }
     if (kind == K::UnauthLogSuppressed) [[unlikely]] {   // #145: a worker's cumulative suppressed log lines
         if (ret.partition >= 0 && ret.partition < 4096) {
             if (workerUnauthSuppressed_.size() <= static_cast<std::size_t>(ret.partition))
@@ -2065,6 +2086,30 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
     }
     if (kind == K::FenceAck) [[unlikely]] {                           // issues #109 / #196: the D24 gate's proof
         onEnforceFenceAck_(ret.partition, static_cast<int>(ret.sessionId), static_cast<uint64_t>(ret.baseOffset));
+        return;
+    }
+    if (kind == K::Unauthenticated) [[unlikely]] {   // #216: a worker answered 44 to a session it holds no bind for
+        // The gateway's own state decides, exactly as for the same request on its path (answerGate_, D13): a session
+        // that is still unauthenticated (AwaitingFirst / AwaitingFinal) is ended after its 44 (already sent by the
+        // worker); one that authenticated since, or is gone, is left alone.
+        Session* s = sessions_.find(ret.sessionId);
+        if (s == nullptr || s->auth.index() >= 2 || s->spill.state == SpillState::Closing) return;
+        // A session that never authenticated, with anonymous read on, is turned into the anonymous reader by its first
+        // produce on the gateway path (becomeAnonymousIfAllowed_ at handleProduce, answered 45, the session stays);
+        // do the same here, so the worker path ends the same sessions.  The worker already sent its one 44 (it held no
+        // bind): the one accepted difference.  Its deny bind is shipped by the conversion, so later worker produces
+        // answer 45.  When the anonymous cap is reached the gateway path answers the namespace-limit error and leaves the
+        // session as it is (it does not end it): mirrored, nothing more is sent here.  AwaitingFinal is ended as before.
+        if (std::holds_alternative<rune::gateway::AuthAwaitingFirst>(s->auth)) {
+            if (becomeAnonymousIfAllowed_(*s, pc::TemplateId::Produce)) return;   // cap reached
+            if (std::holds_alternative<rune::gateway::AuthAnonymousRead>(s->auth)) return;
+        }
+        ++authGateRefusals_;
+        if (authGateRefusals_ % 1024 == 1)
+            spdlog::warn("ClientGateway: session {} sent a produce to worker {} before authenticating - answered "
+                         "AuthenticationFailed and ended (D13; refusals so far: {})", ret.sessionId, ret.partition,
+                         authGateRefusals_);
+        closeAfterAnswers_(ret.sessionId);   // its 44 is delivered first, as on the gateway path (#119)
         return;
     }
     if (kind != K::Failed && kind != K::Expire) {
@@ -3727,14 +3772,31 @@ bool ClientGateway::topicAssignable(int32_t topicId) const noexcept
     return true;
 }
 
-pc::ErrorCode ClientGateway::unappliedTopicCode_(int32_t topicId, int32_t partition) const noexcept
+pc::ErrorCode ClientGateway::unappliedTopicCode_(int32_t topicId, [[maybe_unused]] int32_t partition) const noexcept
 {
     using St = rune::gateway::TopicRegistry::TopicState;
     const St st = topicRegistry_ != nullptr ? topicRegistry_->state(topicId) : St::Unknown;
     if (st == St::Dropped) return pc::ErrorCode::UnknownTopic;
     if (st == St::Pending) return pc::ErrorCode::NotLeader;   // applied, waits behind a drop (fix round 1, C1)
-    return placementCommitted_(topicId, partition < 0 ? 0 : partition) ? pc::ErrorCode::NotLeader
-                                                                       : pc::ErrorCode::UnknownTopic;
+    // #988: "not applied here yet" is a fact of the catalog frontier, not of placement: a just-placed foreign id and a
+    // never-created id above the frontier answer alike.
+    return aboveAppliedFrontier_(topicId) ? pc::ErrorCode::NotLeader : pc::ErrorCode::UnknownTopic;
+}
+
+void ClientGateway::setAppliedTopicFrontier(int32_t nextTopicId)
+{
+    if (nextTopicId < appliedTopicFrontier_ && appliedTopicFrontier_ != std::numeric_limits<int32_t>::max()) {
+        ++topicFrontierRegressionsIgnored_;
+        return;
+    }
+    if (nextTopicId == appliedTopicFrontier_) return;   // every applied event reports it: ship only a change
+    appliedTopicFrontier_ = nextTopicId;
+    // #500: the workers answer a produce they would deny NotLeader for an id at or above it.  Shipped after the value
+    // is stored, FIFO behind every permission patch queued by the effects of the event that moved it (the control
+    // thread processes those effect frames before this one).
+    // Same condition as the permission patches: only shard workers enforce, and only on an authenticating broker.
+    if (workerPool_ != nullptr && shardMode_ && authMode_ == rune::gateway::GatewayAuthMode::Required)
+        (void)permissionShipper_.topicFrontier(*workerPool_, nextTopicId);
 }
 
 std::size_t ClientGateway::endTopicSubscriptions(int32_t topicId)
@@ -4538,6 +4600,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         op.baseSequence  = msg.baseSequence;
         op.lastOffsetDelta = lastOffsetDelta;
         op.recordCount   = recordCount;
+        op.importDeferred = !op.importGranted && denialsDeferred_();   // #506: a missing IMPORT is not a verdict while behind
         op.deferAck      = acksAll && static_cast<bool>(replica) && committedMetadataReady_;
         op.minIsr        = cachedMinIsr_;   // the admission policy; the worker gates on its own ISR
         op.enqueuedAtNs  = nowNs_;
@@ -5095,37 +5158,55 @@ void ClientGateway::pollPendingRecordEgress_(int64_t nowNs)
         const int32_t workerId  = it->first.second;
         PendingRecordEgress& pend = it->second;
 
-        std::shared_ptr<aeron::ExclusivePublication> pub;
+        // A registration is found ONCE (Aeron: a second find with the same id throws): the found publication is kept
+        // in the entry and only its connection is polled from then on.
         try {
-            if (pend.regId >= 0) pub = aeron_->findExclusivePublication(pend.regId);
+            if (!pend.resolved && pend.regId >= 0) pend.resolved = aeron_->findExclusivePublication(pend.regId);
         } catch (...) {
-            pub = nullptr;  // ERRORED — treat as failed resolve below
+            pend.resolved = nullptr;  // ERRORED — treat as failed resolve below
             pend.regId = -1;
         }
 
         const bool timedOut =
             (nowNs - pend.requestedAtNs) > connectResolveTimeoutNs_;
 
-        if (pub) {
-            // Resolved: cache on the Session under its worker id and drain waiters.
+        // #745 (legacy mode): a publication to an unreachable declared address (a client behind NAT) resolves at once
+        // but never connects - Records offered into it reach nobody.  It is usable only once the client's
+        // subscription answered it; until then the Subscribe stays parked (the clock runs from the request).
+        if (pend.resolved && pend.resolved->isConnected()) {
+            // Connected: cache on the Session under its worker id and drain waiters.
             // Record-egress lifetime (2026-10-05): a worker gets ONLY the pointer
             // of the pub the Session owns — never one this scope destroys (the
             // old session-gone branch handed the local pub's raw pointer out and
             // then freed it), and a cached pub is never REPLACED (a worker may
             // hold it; it lives until its retire-on-ack release at close).
-            onRecordEgressResolved_(sessionId, workerId, pend, std::move(pub));
+            onRecordEgressResolved_(sessionId, workerId, pend, std::move(pend.resolved));
             it = pendingRecordEgress_.erase(it);
             continue;
         }
-        if (timedOut || pend.regId < 0) {
-            spdlog::warn("ClientGateway: record-egress pub for session {} worker {} did not "
-                         "resolve ({} waiters) — {}",
-                         sessionId, workerId, pend.waiters.size(),
-                         authMode_ == rune::gateway::GatewayAuthMode::Required
-                             ? "retired NotLeader (no shared-egress fallback under authentication)"
-                             : "falling back to MDC");
+        if (timedOut || (pend.regId < 0 && !pend.resolved)) {
+            if (pend.resolved) {
+                ++recordEgressNeverConnected_;
+                spdlog::warn("ClientGateway: record-egress pub for session {} worker {} resolved but never connected "
+                             "(the declared egress channel is unreachable, e.g. a client behind NAT; legacy mode) "
+                             "({} waiters) — {}",
+                             sessionId, workerId, pend.waiters.size(),
+                             authMode_ == rune::gateway::GatewayAuthMode::Required
+                                 ? "retired NotLeader (no shared-egress fallback under authentication)"
+                                 : "falling back to MDC");
+            } else {
+                spdlog::warn("ClientGateway: record-egress pub for session {} worker {} did not "
+                             "resolve ({} waiters) — {}",
+                             sessionId, workerId, pend.waiters.size(),
+                             authMode_ == rune::gateway::GatewayAuthMode::Required
+                                 ? "retired NotLeader (no shared-egress fallback under authentication)"
+                                 : "falling back to MDC");
+            }
             for (const auto& w : pend.waiters) releaseAwaiting_(w, nullptr);
-            abandonRegistration_(pend.regId);   // timed out while still in flight: release it (regId < 0 = nothing)
+            // A found publication is released by dropping it (never handed to a worker, never cached); one still in
+            // flight is abandoned (regId < 0 = nothing registered).
+            if (pend.resolved) pend.resolved.reset();
+            else abandonRegistration_(pend.regId);
             it = pendingRecordEgress_.erase(it);
             continue;
         }
@@ -7554,6 +7635,28 @@ std::size_t ClientGateway::purgeTxnVotes(int32_t olderThan)
 
 void ClientGateway::onTxnVoteResult_(const rune::node::WorkerReturn& ret)
 {
+    if (ret.errorCode == rune::replication::kTxnVoteWaiting) {   // #995: an interim, no answer: the vote stays in flight
+        if (ret.sessionId >= 0) {   // for another node's coordinator: passed over the plane, the remote vote stays owed
+            const auto it = remoteVotes_.find(RemoteVoteKey{static_cast<int32_t>(ret.sessionId), ret.correlationId});
+            if (it == remoteVotes_.end()) return;
+            rune::replication::TxnVoteResponseMsg r = it->second;
+            r.errorCode     = rune::replication::kTxnVoteWaiting;
+            r.code          = 0;
+            r.constraintId  = static_cast<uint32_t>(ret.newNextOffset);
+            r.failingOffset = ret.baseOffset;
+            answerRemoteVote_(static_cast<int32_t>(ret.sessionId), r);
+            return;
+        }
+        const auto it = votesInFlight_.find(ret.correlationId);
+        if (it == votesInFlight_.end() || voteSink_ == nullptr) return;
+        const VoteInFlight v = it->second;   // copied: the sink may send again
+        TxnVoteResult r;
+        r.waiting   = true;
+        r.waitPid   = ret.baseOffset;
+        r.waitEpoch = static_cast<int16_t>(ret.newNextOffset);
+        voteSink_(voteSinkCtx_, v.topicId, v.partition, v.producerId, v.producerEpoch, v.coordinatorEpoch, r);
+        return;
+    }
     if (ret.sessionId >= 0) {   // a vote taken for another node's coordinator: answer it over the plane
         auto it = remoteVotes_.find(RemoteVoteKey{static_cast<int32_t>(ret.sessionId), ret.correlationId});
         if (it == remoteVotes_.end()) {
@@ -7632,6 +7735,16 @@ void ClientGateway::onRemoteTxnVoteResponse(const rune::replication::TxnVoteResp
         it->second.producerEpoch != r.producerEpoch || it->second.coordinatorEpoch != r.coordinatorEpoch) {
         spdlog::debug("ClientGateway: TxnVoteResponse for unknown token={} topic={} partition={}", r.token, r.topicId,
                       r.partition);
+        return;
+    }
+    if (r.errorCode == rune::replication::kTxnVoteWaiting) {   // #995: an interim, no answer: the vote stays in flight
+        if (voteSink_ == nullptr) return;
+        const VoteInFlight w = it->second;   // copied: the sink may send again
+        TxnVoteResult res;
+        res.waiting   = true;
+        res.waitPid   = r.failingOffset;
+        res.waitEpoch = static_cast<int16_t>(r.constraintId);
+        voteSink_(voteSinkCtx_, w.topicId, w.partition, w.producerId, w.producerEpoch, w.coordinatorEpoch, res);
         return;
     }
     const VoteInFlight v = it->second;
@@ -8843,9 +8956,23 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     // Dispatch to the service.  The service encodes the response into scratch_.
     // Capacity is passed so handlers bound-check BEFORE writing each element;
     // the post-write guard below is a final safety net only.
-    const rune::coordination::NsRequestContext nsCtx{sessionNsId_(*session), permsOf_(*session).isRoot(), &namespaces_.registry()};
+    rune::coordination::NsRequestContext nsCtx{sessionNsId_(*session), permsOf_(*session).isRoot(),
+                                               &namespaces_.registry()};
+    // #592: a fetch-all OffsetFetch is filtered by READ INSIDE the coordinator's loop, before its capacity cap (the
+    // filterFetchAllByRead_ pass below stays as the second line of defence).  Auth off / allow-all: no filter.
+    struct ReadCtx {
+        const PermissionTable* perms;
+        const rune::gateway::ObjectIndex* index;
+    } readCtx{&permsOf_(*session), &objectIndex_};
+    if (tid == static_cast<uint16_t>(pc::TemplateId::OffsetFetch) && !readCtx.perms->isAllowAll()) {
+        nsCtx.readFilter = {[](void* c, int32_t topicId) -> bool {
+            const auto* r = static_cast<const ReadCtx*>(c);
+            return !rune::gateway::authorizeTopicId(*r->perms, topicId, rune::security::Operation::Read, *r->index);
+        }, &readCtx};
+    }
     std::size_t encoded = 0;
-    const std::size_t cap = scratch_.size();
+    const std::size_t cap =
+        groupAnswerCapForTest_ != 0 ? std::min(groupAnswerCapForTest_, scratch_.size()) : scratch_.size();
     const auto templateId = static_cast<pc::TemplateId>(tid);
     switch (templateId) {
         case pc::TemplateId::JoinGroup:
@@ -9683,7 +9810,9 @@ bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std
                                   m->change == pc::UserChangeKind::SetPassword && ownUserName_(*session, m->name, pcr->user);
 
     // bootstrapOpen_() walks the account list: evaluated only for the one request that can use it (never per frame).
-    const AuthGate gate = gateFor(session->auth, tid, tid == pc::TemplateId::SecurityBootstrap && bootstrapOpen_(), selfSetPassword);
+    const bool bootstrapTid =
+        tid == pc::TemplateId::SecurityBootstrap || tid == pc::TemplateId::SecurityBootstrapChallengeRequest;
+    const AuthGate gate = gateFor(session->auth, tid, bootstrapTid && bootstrapOpen_(), selfSetPassword);
     if (gate == AuthGate::Allow) {
         // Issue #603: every grant-checked request waits for the view to apply the committed events this broker holds.
         // The login legs answer it themselves (securityUnavailable_: AuthServerFinal 48 + the session's end).
@@ -9769,7 +9898,7 @@ void ClientGateway::setSecurityBehind(bool behind)
 
 int ClientGateway::syncWorkersLag_()
 {
-    const bool deferDenials = authMode_ == rune::gateway::GatewayAuthMode::Required && securityViewBehind_();
+    const bool deferDenials = denialsDeferred_();
     const uint8_t wanted = securityBehind_ ? kLagRefuseAll : (deferDenials ? kLagDeferDenials : uint8_t{0});
     if (workersLag_ == wanted) [[likely]] return 0;
     if (workerPool_ == nullptr) { workersLag_ = wanted; return 0; }
@@ -9811,6 +9940,7 @@ bool ClientGateway::becomeAnonymousIfAllowed_(Session& session, pc::TemplateId t
     const auto* d = namespaces_.registry().byId(rune::catalog::kDefaultNsId);
     if (anonymousRead_ && authMode_ == GatewayAuthMode::Required && tid != pc::TemplateId::AuthClientFirst &&
         tid != pc::TemplateId::AuthClientFinal && tid != pc::TemplateId::SecurityBootstrap &&
+        tid != pc::TemplateId::SecurityBootstrapChallengeRequest &&
         std::holds_alternative<rune::gateway::AuthAwaitingFirst>(session.auth) &&
         (d == nullptr || rune::node::nsFeatureAllowed(d->limits, rune::protocol::kNsFeatureAnonymousRead))) {
         // Namespaces Phase 2 Task 10 (#236, D24): the anonymous cap applies before any namespace limit.
@@ -9818,6 +9948,9 @@ bool ClientGateway::becomeAnonymousIfAllowed_(Session& session, pc::TemplateId t
         session.auth = rune::gateway::AuthAnonymousRead{anonPerms_()};
         session.anonCounted = true;
         ++anonSessions_;
+        // #216: the anonymous reader is not unauthenticated - its produce is answered NotAuthorized (45) on the gateway
+        // path, so the worker must hold a deny bind for it (an Unbound slot would answer 44 and end the session).
+        bindDenyTable_(session);
         if (d != nullptr)
             session.nsGate = rune::catalog::tagOf(d->state);   // namespaces Phase 2 Task 3: the anonymous reader is `default`'s
     }
@@ -9898,8 +10031,36 @@ rune::gateway::PermissionRef ClientGateway::compilePerms_(uint64_t userId, uint3
     // foreign object gets no bits, except for root (ADMIN ON CLUSTER keeps every op in every namespace, #626).
     // Plan D11: the session's namespace name decides whether ADMIN ON NAMESPACE makes it that namespace's admin.
     const rune::catalog::NamespaceRecord* ns = namespaces_.registry().byId(nsId);
-    return permPool_.acquire(rune::security::effectiveGrants(securityView_->state(), userId), nsId, objectIndex_,
-                             ns != nullptr ? std::string_view(ns->name) : std::string_view{});
+    rune::gateway::PermissionRef ref = permPool_.acquire(
+        rune::security::effectiveGrants(securityView_->state(), userId), nsId, objectIndex_,
+        ns != nullptr ? std::string_view(ns->name) : std::string_view{});
+    compileStarved_ = permPool_.lastAcquireWasFull();   // #442: noteStarved_ reads it right after the caller installs
+    return ref;
+}
+
+void ClientGateway::noteStarved_(int64_t sid, bool starved)
+{
+    const auto it = std::ranges::find(poolStarved_, sid);
+    if (!starved) {
+        if (it != poolStarved_.end()) { *it = poolStarved_.back(); poolStarved_.pop_back(); }
+        return;
+    }
+    if (it == poolStarved_.end()) poolStarved_.push_back(sid);
+}
+
+void ClientGateway::reacquireStarved_()
+{
+    // A starved session holds the deny-all ref until its next refresh; once the pool has room, run the ordinary refresh
+    // for a few of them per duty cycle (cold; bounded).  A session that gets a real table leaves the list
+    // (refreshSession_ -> noteStarved_); one that is starved again stays.
+    std::array<int64_t, kStarvedPerCycle> batch{};
+    const std::size_t n = std::min(poolStarved_.size(), batch.size());
+    std::copy_n(poolStarved_.begin(), n, batch.begin());
+    for (std::size_t i = 0; i < n; ++i) {
+        refreshSession_(batch[i]);
+        if (sessions_.find(batch[i]) == nullptr) { noteStarved_(batch[i], false); continue; }
+        if (!std::ranges::contains(poolStarved_, batch[i])) ++poolStarvedReacquired_;
+    }
 }
 
 void ClientGateway::syncPermissionTables_()
@@ -10068,6 +10229,7 @@ bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::D
         case pc::TemplateId::AlterView:
         case pc::TemplateId::SecurityDdl:
         case pc::TemplateId::SecurityBootstrap:
+        case pc::TemplateId::SecurityBootstrapChallengeRequest:
         case pc::TemplateId::NamespaceDdl: {
             pc::DdlResponse r;
             r.sessionId = hdr->sessionId; r.correlationId = hdr->correlationId;
@@ -10534,7 +10696,11 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         spdlog::warn("auth: session {} authenticated over plaintext (no TLS): frames are not integrity-protected",
                      session->sessionId);
     if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user, std::move(loginNonce), ok.nsId};
-    else session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId, ok.nsId), std::move(loginNonce), ok.nsId};
+    else {
+        session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId, ok.nsId), std::move(loginNonce),
+                                          ok.nsId};
+        noteStarved_(session->sessionId, compileStarved_);   // #442
+    }
     session->nsGate = nsTag;
     session->nsId   = ok.nsId;
     session->nsSlot = nsSlots_.slotOf(ok.nsId);   // namespaces Phase 2 Task 8: cached for the hot path
@@ -10560,8 +10726,15 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
 uint64_t ClientGateway::shipPermissions_(const Session& session)
 {
     if (authMode_ != rune::gateway::GatewayAuthMode::Required || !shardMode_ || !workerPool_) return 0;
+    if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session.auth)) {
+        // #216: a one-time-password session produces nothing but is NOT unauthenticated: bound to nothing, so the
+        // worker answers PasswordChangeRequired (47) like the gateway's gate and keeps the session.  The login OK
+        // waits for it.
+        return permissionShipper_.bind(*workerPool_, session.sessionId,
+                                       rune::node::PermissionShipper::kPasswordChangeTable, ++permEpoch_, p->userId);
+    }
     const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth);
-    if (a == nullptr) return 0;   // must-change-password / anonymous: the worker slot stays empty (deny)
+    if (a == nullptr) return 0;   // anonymous / unauthenticated: the worker slot stays Unbound (#216: answered 44)
     const uint64_t epoch = ++permEpoch_;
     // Namespaces Phase 2 (D21): EVERY ship of a session whose namespace is not Active - a login while suspended, a
     // grant change, the must-change-password transition, the suspend itself - binds no WRITE: a ReadOnly namespace's
@@ -10585,8 +10758,31 @@ int ClientGateway::servicePermissionShippingWork_()
 {
     int work = 0;
     syncPermissionTables_();   // issue #259: a freed table's drop (after every rebind away from it)
-    if (!workerPool_) return 0;
+    // #442 part 2: sessions that got the full-pool deny-all ref get their real table once the pool has room.
+    if (!poolStarved_.empty() && permPool_.liveTables() < rune::gateway::PermissionPool::kMaxTables) {
+        reacquireStarved_();
+        ++work;
+    }
+    if (!workerPool_) return work;
     work += syncWorkersLag_();   // #603: in every worker mode (worker-pushed subscriptions pause too)
+    // #442 part 1: a worker that fell a whole queue behind was declared lost by the shipper; reset it (its ring must
+    // take the reset op) and ship the full snapshot at once, before any other item, so it converges on the gateway's
+    // state.
+    if (permissionShipper_.workersLost() != lostWorkersLogged_) [[unlikely]] {
+        spdlog::critical("ClientGateway: {} permission shipper worker(s) fell more than {} items behind and skipped "
+                         "them ({} lost so far); each is reset and resynced from a full snapshot when its ring "
+                         "drains - until then its produces are answered AuthUnavailable and held admin answers go "
+                         "in doubt",
+                         permissionShipper_.lostNow(), rune::node::PermissionShipper::kMaxQueued,
+                         permissionShipper_.workersLost());
+        lostWorkersLogged_ = permissionShipper_.workersLost();
+    }
+    if (permissionShipper_.lostNow() != 0 && permissionShipper_.tryReset(*workerPool_)) {
+        spdlog::info("ClientGateway: a lost permission shipper worker was reset; shipping the permission snapshot "
+                     "({} resync(s) so far)", permissionShipper_.resyncs());
+        shipPermissionSnapshot_();
+        ++work;
+    }
     if (permissionShipper_.pendingUpdates() != 0) work += permissionShipper_.retry(*workerPool_);
     if (!shardMode_) return work;
     if (!objectShipSeqs_.empty()) {   // issue #197: bounded even when an OK is never offered
@@ -10607,6 +10803,30 @@ int ClientGateway::servicePermissionShippingWork_()
         ++work;
     }
     return work;
+}
+
+// #442: a worker was reset - it holds no table and no binding.  Everything it needs, in the order it needs it: every
+// live pool table (WRITE, then IMPORT when it has bits), every session's current bind (a NEW epoch, the same table /
+// deny / suspended choice as a refresh), the lag level, the topic frontier, and - when the D24 gate waits for one - the
+// newest outstanding lifecycle fence again (acks are cumulative per ring, so a worker that already acknowledged it, or
+// a later one, is unaffected).  Every worker receives it; it is idempotent for the healthy ones: a Table for an
+// existing id swaps the same content in (SessionAckSink::installWriteGrants), a Bind rebinds the session to the same
+// table with a newer epoch (SessionAckSink::bindWriteGrants), a level / frontier is monotonic or equal.
+void ClientGateway::shipPermissionSnapshot_()
+{
+    if (!workerPool_ || !shardMode_ || authMode_ != rune::gateway::GatewayAuthMode::Required) return;
+    syncPermissionTables_();   // drain the pool's events first: a Freed after the snapshot would drop a re-created id
+    permPool_.forEachLive([&](uint32_t id, const PermissionTable& t) {
+        (void)permissionShipper_.shipTable(*workerPool_, id, t.writeBits(), t.isAllowAll());
+        if (std::ranges::any_of(t.importBits(), [](uint64_t w) { return w != 0; }))
+            (void)permissionShipper_.shipImportTable(*workerPool_, id, t.importBits());
+    });
+    sessions_.forEach([&](Session& s) { (void)shipPermissions_(s); });   // AuthAuthenticated only; a new epoch each
+    (void)permissionShipper_.securityLag(*workerPool_, workersLag_);
+    if (appliedTopicFrontier_ != std::numeric_limits<int32_t>::max())
+        (void)permissionShipper_.topicFrontier(*workerPool_, appliedTopicFrontier_);
+    for (auto it = pendingEnforce_.rbegin(); it != pendingEnforce_.rend(); ++it)
+        if (it->lifecycle && it->seq != 0) { (void)permissionShipper_.fence(*workerPool_, it->seq); break; }
 }
 
 void ClientGateway::holdLoginOk_(Session& s, uint64_t epoch, int64_t corr, uint8_t flags, std::span<const uint8_t> signature)
@@ -10827,6 +11047,7 @@ void ClientGateway::refreshSession_(int64_t sid)
         const rune::security::UserObject* user = securityView_->state().userById(pcr->userId);
         if (user == nullptr || user->mustChangePassword) return;
         s->auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId, pcr->nsId), pcr->loginNonce, pcr->nsId};
+        noteStarved_(s->sessionId, compileStarved_);   // #442
         (void)shipPermissions_(*s);
         return;
     }
@@ -10834,11 +11055,13 @@ void ClientGateway::refreshSession_(int64_t sid)
     if (a == nullptr) return;
     // Issue #259: a pooled table - compiled only if no session holds the new set yet; the same set = the same table.
     PermissionRef fresh = compilePerms_(a->userId, a->nsId);
+    const bool freshStarved = compileStarved_;   // #442: before anything else can acquire
     if (fresh.id() == a->perms.id() && fresh.id() != PermissionRef::kNoId) return;   // nothing changed for it
     const LiveActions actions = refreshActions(a->perms.table(), fresh.table(), *s, objectIndex_);
     // The old table is held until the rebind is queued: its drop (if this was its last holder) must FOLLOW the bind,
     // or the worker would deny this session between the two.
     const PermissionRef old = std::exchange(a->perms, std::move(fresh));
+    noteStarved_(sid, freshStarved);
     (void)shipPermissions_(*s);   // a revoked WRITE fails the next produce on both paths
     if (!actions.empty()) executeLiveActions_(*s, actions);
 }
@@ -11047,11 +11270,13 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
         // may lag the leader by an apply, so a retry can also look new: then it is still answered right, only charged
         // once on the throttle.
         bool knownRetry = false;
-        if (!m.ext.requestId.none() && securityView_ != nullptr)
-            if (const auto rec = securityView_->state().request(m.ext.requestId))
-                knownRetry = rec->requestFingerprint ==   // #221: the principal the leader will see in meta.authenticated
-                             rune::gateway::securityDdlFingerprint(
-                                 m, ddlMetaOf_(&m.ext, m.sessionId, *session, 0).authenticated);
+        if (!m.ext.requestId.none() && securityView_ != nullptr) {
+            // #221: the record is per principal - the one the leader will see in meta.authenticated.
+            const auto retryMeta = ddlMetaOf_(&m.ext, m.sessionId, *session, 0);
+            if (const auto rec = securityView_->state().request(retryMeta.authenticated, m.ext.requestId))
+                knownRetry = rec->requestFingerprint ==
+                             rune::gateway::securityDdlFingerprint(m, retryMeta.authenticated);
+        }
         if (!ownPassword) denial = std::move(admin);
         else if (admin) {
             proofChecked = true;
@@ -11315,9 +11540,9 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
         noteUnanswerable_(buf, len, "SecurityBootstrap for unknown session");
         return;
     }
-    if (!pc::clientUnderstandsAuth(session->clientVersion)) {
+    if (session->clientVersion < pc::kClientVersionBootstrapChallenge) {
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
-                             "SecurityBootstrap needs client version 9");
+                             "SecurityBootstrap needs client version 19");
         return;
     }
     if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111
@@ -11325,21 +11550,31 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
                              "this broker's security state is not current - retry on another broker");
         return;
     }
+    // #234: the challenge issued on THIS session is used up by this attempt, whatever its outcome (single use).
+    const uint64_t challengeId = std::exchange(session->bootstrapChallengeId, uint64_t{0});
+    std::array<uint8_t, pc::kBootstrapChallengeBytes> challenge{};
+    const bool haveChallenge = challengeId != 0 && bootstrapChallengeOf_(challengeId, challenge);
     // D4: a fresh cluster cannot be hijacked by whoever reaches it first - the request must prove possession of the
-    // cluster key (current or next).  Verified HERE with this thread's own copy of the keys, before the admin thread
-    // is involved; the refusal is explicit, and logged with where it came from.
-    const BootstrapProof proof = verifyBootstrapProof(m, clusterKeys_ ? &*clusterKeys_ : nullptr, bootstrapMacScratch_);
-    if (proof != BootstrapProof::Ok) {
+    // cluster key (current or next) over the challenge this gateway issued on this session (#234).  Verified HERE with
+    // this thread's own copy of the keys, before the admin thread is involved; the refusal is explicit, and logged
+    // with where it came from.
+    const BootstrapProof proof = haveChallenge
+        ? verifyBootstrapProof(m, challenge, clusterKeys_ ? &*clusterKeys_ : nullptr, bootstrapMacScratch_)
+        : BootstrapProof::Mismatch;
+    if (!haveChallenge || proof != BootstrapProof::Ok) {
         ++bootstrapsRefused_;
         if (unauthLog_.due(3)) [[unlikely]]   // X103: an unauthenticated session drives this
-            spdlog::warn("security: bootstrap refused from {}: bad cluster-key proof{}", LogSafeName{session->sourceIdentity},
+            spdlog::warn("security: bootstrap refused from {}: {}{}", LogSafeName{session->sourceIdentity},
+                         !haveChallenge ? "no challenge" : "bad cluster-key proof",
                          proof == BootstrapProof::NoKey ? " (this broker holds no cluster key: authentication is not enabled)" : "");
         pc::DdlResponse r;
         r.sessionId     = m.sessionId;
         r.correlationId = m.correlationId;
         r.errorCode     = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
-        r.detail        = proof == BootstrapProof::NoKey ? "this broker has no cluster key: authentication is not enabled"
-                                                         : "bootstrap proof does not match this cluster's key";
+        r.detail        = !haveChallenge
+            ? "no bootstrap challenge on this session: request one first (client version 19)"
+            : proof == BootstrapProof::NoKey ? "this broker has no cluster key: authentication is not enabled"
+                                             : "bootstrap proof does not match this cluster's key";
         const std::size_t n = r.encode(scratch_.data());
         sendAnswer_(*session, scratch_.data(), n);
         return;
@@ -11358,6 +11593,64 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
         }
     answerAdminSubmit_(buf, len, submitted, "SecurityBootstrap: admin ring full",
                        "SecurityBootstrap: request larger than the admin ring message");
+}
+
+bool ClientGateway::bootstrapChallengeOf_(uint64_t id, std::array<uint8_t, 32>& out)
+{
+    if (!bootstrapChallengeSecretReady_) {
+        if (!rune::crypto::randomBytes(bootstrapChallengeSecret_)) return false;
+        bootstrapChallengeSecretReady_ = true;
+    }
+    uint8_t idBytes[8];
+    for (int i = 0; i < 8; ++i) idBytes[i] = static_cast<uint8_t>(id >> (8 * i));
+    rune::crypto::DigestBytes mac;
+    const std::span<const uint8_t> idSpan(idBytes, 8);
+    if (!rune::crypto::hmac(rune::crypto::Digest::Sha512, bootstrapChallengeSecret_, idSpan, mac) ||
+        mac.size < out.size())
+        return false;
+    std::memcpy(out.data(), mac.bytes.data(), out.size());
+    return true;
+}
+
+// #234: SecurityBootstrapChallengeRequest (102): the gateway answers 32 bytes unique per request, valid for ONE
+// bootstrap
+// attempt on THIS session; a newer request replaces an older unused challenge.  Gated exactly like the bootstrap.
+void ClientGateway::handleSecurityBootstrapChallengeRequest(const uint8_t* buf, std::size_t len)
+{
+    const auto msgOpt = pc::SecurityBootstrapChallengeRequest::decode(buf, len);
+    if (!msgOpt) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                             "SecurityBootstrapChallengeRequest body undecodable");
+        return;
+    }
+    Session* session = sessions_.find(msgOpt->sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "SecurityBootstrapChallengeRequest for unknown session");
+        return;
+    }
+    if (session->clientVersion < pc::kClientVersionBootstrapChallenge) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                             "SecurityBootstrapChallengeRequest needs client version 19");
+        return;
+    }
+    if (securityUnavailable_()) [[unlikely]] {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable),
+                             "this broker's security state is not current - retry on another broker");
+        return;
+    }
+    const uint64_t id = ++bootstrapChallengeCounter_;
+    pc::SecurityBootstrapChallenge ans;
+    ans.sessionId = msgOpt->sessionId;
+    ans.correlationId = msgOpt->correlationId;
+    if (!bootstrapChallengeOf_(id, ans.challenge)) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                             "no randomness for a bootstrap challenge");
+        return;
+    }
+    session->bootstrapChallengeId = id;   // a newer request replaces an older unused challenge
+    ++bootstrapChallengesIssued_;
+    const std::size_t n = ans.encode(scratch_.data());
+    sendAnswer_(*session, scratch_.data(), n);
 }
 
 // ---------------------------------------------------------------------------
@@ -11380,10 +11673,10 @@ uint16_t ClientGateway::viewRowGate_(int32_t viewTopicId, int32_t partition) con
 {
     // Catalog history Task 8 fix round 1 (I5): the C1 gate on view reads (the
     // view's sink topic, spec §5.4).  Dropped → UnknownView (permanent); applied
-    // but waiting behind a drop, placed but not applied here yet, or applied but
-    // not placed → NotReady (retriable: a client that learned the view from
-    // another broker retries).  Never applied here and never placed: no gate —
-    // the worker answers (UnknownView: no plan).
+    // but waiting behind a drop, not applied here yet (an id at or above the applied
+    // catalog frontier, #507), or applied but not placed → NotReady (retriable: a
+    // client that learned the view from another broker retries).  An unknown id
+    // below the frontier: no gate — the worker answers (UnknownView: no plan).
     if (topicRegistry_ == nullptr) return kViewRowNoGate;
     using St = TopicRegistry::TopicState;
     const St st = topicRegistry_->state(viewTopicId);
@@ -11408,7 +11701,8 @@ uint16_t ClientGateway::viewRowGate_(int32_t viewTopicId, int32_t partition) con
         }
         return (src >= 0 && !placementCommitted_(src, partition)) ? pc::ViewRowResponse::kNotReady : kViewRowNoGate;
     }
-    if (st == St::Pending || (st == St::Unknown && placementCommitted_(viewTopicId, 0)) ||
+    // #507: an unknown id at or above the applied catalog frontier is a view this broker has not applied yet.
+    if (st == St::Pending || (st == St::Unknown && aboveAppliedFrontier_(viewTopicId)) ||
         (st == St::Serving && topicRegistry_->placementGated(viewTopicId) &&
          !placementCommitted_(viewTopicId, partition)))
         return pc::ViewRowResponse::kNotReady;
@@ -12620,6 +12914,14 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     resp.brokers       = std::span<const pc::BrokerEntry>(brokers.data(), brokers.size());
     resp.partitions    = std::span<const pc::PartitionEntry>(parts.data(), parts.size());
     resp.clientVersion = session->clientVersion;   // issue #116: the receiver trailer only for sessions >= 12
+    // #361: the coordinator (the consensus leader the group / transaction coordinator is) as this node sees it: this
+    // node's own id when it leads (LeaderView::leaderNodeId is the leader's id as the observer knows it), the leader's
+    // id when a follower knows it AND has an endpoint a client could be redirected to (the same condition under which
+    // redirectToCoordinator_ answers NotCoordinator), else -1.  No leader view (no replication): nothing to name.
+    if (leaderView_) {
+        const LeaderView lv = leaderView_();
+        resp.coordinatorNodeId = lv.isLeader ? thisNodeId_ : (lv.leaderClientEndpoint.empty() ? -1 : lv.leaderNodeId);
+    }
     if (preReceiverKeyMetadataForTest_) [[unlikely]]   // test seam: an old broker's answer (no receiver trailer)
         resp.clientVersion = std::min(resp.clientVersion, pc::kClientVersionReceiverKeys - 1);
 

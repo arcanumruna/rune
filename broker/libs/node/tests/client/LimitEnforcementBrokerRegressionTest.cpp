@@ -129,7 +129,7 @@ TEST(LimitEnforcementTableRegression, UsersRegression) {
     EXPECT_NE(over.detail.find("users"), std::string::npos) << over.detail;
     {   // A client below v14 sees InvalidRequest (39), not 52: the gateway maps the code (the admin thread does not know it).
         AuthWireClient& old = b.wire();
-        const int64_t osid = old.connect(b.channel());   // kClientVersionAuth (9)
+        const int64_t osid = old.connect(b.channel(), pc::kClientVersionAuth);   // below kClientVersionNamespaces
         ASSERT_GT(osid, 0);
         ASSERT_TRUE(old.login(b.channel(), osid, "admin", {kAdminPw, kAdminPw}).ok());
         const auto refusedOld = old.createUser(b.channel(), osid, "u/old", kUserPw);

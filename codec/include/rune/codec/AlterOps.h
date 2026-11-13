@@ -11,7 +11,7 @@ namespace rune::codec {
 
 /// Wire-visible ALTER op kind. Values are fixed and part of the shared
 /// rune-ql / rune-broker contract — do not renumber.
-enum class AlterOpType : uint8_t { Add = 1, Drop = 2, Rename = 3, SetCompatibility = 4 };
+enum class AlterOpType : uint8_t { Add = 1, Drop = 2, Rename = 3, SetCompatibility = 4, RetireBelow = 5 };
 
 /// Schema compatibility mode set by SET_COMPATIBILITY. Values are fixed —
 /// do not renumber.
@@ -26,17 +26,19 @@ struct AlterOp {
     PrimType primType;     // ADD only
     uint16_t fixedLen;     // ADD only (FixedStr width; 0 otherwise)
     CompatMode mode;       // SET_COMPATIBILITY only
+    uint16_t version = 0;  // RETIRE_BELOW only: the floor N of `RETIRE VERSION < N` (never part of a schema evolution)
 };
 
 /// Encode a sequence of ALTER ops to the fixed little-endian wire format:
 ///
 ///   opsCount        u16
 ///   per op:
-///     opType        u8     // 1=ADD, 2=DROP, 3=RENAME, 4=SET_COMPATIBILITY
+///     opType        u8     // 1=ADD, 2=DROP, 3=RENAME, 4=SET_COMPATIBILITY, 5=RETIRE_BELOW
 ///     ADD:          nameLen u16 + name bytes, primType u8, fixedLen u16
 ///     DROP:         nameLen u16 + name bytes
 ///     RENAME:       oldLen  u16 + old bytes, newLen u16 + new bytes
 ///     SET_COMPAT:   mode    u8    // 0=BACKWARD, 1=FORWARD
+///     RETIRE_BELOW: version u16   // 5: versions below it are retired (#419); only ever the one op of a request
 ///
 /// This is the shared wire contract between rune-ql (producer) and
 /// rune-broker (consumer) — the byte layout above is load-bearing and must

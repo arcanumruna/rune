@@ -438,6 +438,7 @@ void BrokerNode::start() {
         uint64_t need = 0;
         const bool fdOk = applyFdLimitAtStartup(config_, bootTopics_, fdErr, &need, &fdSoftLimit_);
         fdNeedAtBoot_ = need;                       // the budget actually applied (no second estimate)
+        if (config_.testFdSoftLimitOverride != 0) fdSoftLimit_ = config_.testFdSoftLimitOverride;   // TEST-ONLY (#612)
         if (!fdOk) {
             spdlog::error("BrokerNode[{}]: {}", config_.nodeId, fdErr);
             throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: " + fdErr);
@@ -2179,6 +2180,17 @@ void BrokerNode::buildGateway() {
             "Records crypto handoff; it cannot serve TLS — use shard mode or disable "
             "per-worker egress");
     }
+    // Issue #532: the ingress twin — no session key handoff outside shard mode, so a sealed produce on a per-worker
+    // ingress stream would be answered InvalidRequest. Refuse to start rather than fail every encrypted produce.
+    if (rune::node::mustRefuseNonShardPerWorkerIngressTls(
+            config_.perWorkerIngressEnabled, config_.shardMode(), config_.requiresClientTls(),
+            brokerHasTlsAtStartup)) {
+        throw std::runtime_error(
+            "BrokerNode[" + std::to_string(nodeId) + "]: RUNE_PER_WORKER_INGRESS=true without "
+            "RUNE_WORKER_MODE=shard refuses to start on a broker with TLS (a certificate is loaded or "
+            "RUNE_REQUIRE_TLS is set): a worker polling its own ingress outside shard mode has no session keys and "
+            "cannot open an encrypted produce; use RUNE_WORKER_MODE=shard or unset RUNE_PER_WORKER_INGRESS");
+    }
 
     // Build the gateway (subscribes on clientChannel).
     try {
@@ -2483,6 +2495,8 @@ void BrokerNode::buildGateway() {
             groupCoordService_->setCoordinatorTermFn(
                 [this]() -> int64_t { return static_cast<int64_t>(leaderObserver_.computeOnControl().term); });
             groupCoordService_->setMaxGroups(config_.groupMaxGroups);   // #214 (0 = the default)
+            // #617 (0 = half the cap)
+            groupCoordService_->setMaxGroupsPerPrincipal(config_.groupMaxGroupsPerPrincipal);
             groupCoordService_->setMinSessionTimeoutMs(config_.groupMinSessionTimeoutMs);   // #499 (0 = the default)
             groupCoordService_->setMaxSessionTimeoutMs(config_.groupMaxSessionTimeoutMs);   // #499 (0 = the default)
             // E2 final fix wave (C1): committed offsets of transient partitions
@@ -3062,6 +3076,7 @@ void BrokerNode::buildGateway() {
                                : storage_.origin == StorageIdentity::Origin::Legacy  ? 2
                                : storage_.origin == StorageIdentity::Origin::Joiner  ? 3 : 4;
             runtimeAgent_->controlledShutdown().setStorage(storage_.id, wire);
+            runtimeAgent_->controlledShutdown().setFdSoftLimit(fdSoftLimit_);   // #612: advertised in every register
             if (storageGate_)
                 runtimeAgent_->controlledShutdown().setStorageOpenFn(
                     [](void* g) noexcept { return static_cast<StorageGate*>(g)->open(); }, storageGate_.get());
@@ -3784,6 +3799,25 @@ int BrokerNode::servicePeerLinks_(int64_t nowNs) {
     return work;
 }
 
+int BrokerNode::serviceClusterFdLimit_() {
+    if (!metadataService_) return 0;
+    if (metadataService_->fdLimitsEpoch() != postedFdLimitsEpoch_) {
+        postedFdLimitsEpoch_ = metadataService_->fdLimitsEpoch();
+        const auto v = metadataService_->clusterFdLimit();
+        // A newer value supersedes an undelivered one; one equal to what the admin thread already holds needs no frame.
+        fdLimitPending_ = v.limit != deliveredFdLimit_.limit || v.node != deliveredFdLimit_.node;
+        pendingFdLimit_ = v;
+    }
+    if (!fdLimitPending_ || !adminWorkerAgent_) return 0;
+    uint8_t buf[kClusterFdLimitWireLen];
+    writeClusterFdLimit(buf, pendingFdLimit_.limit, pendingFdLimit_.node);
+    // Ring full: retried next cycle.
+    if (!adminWorkerAgent_->controlToAdminRing().write(buf, sizeof buf, kMsgClusterFdLimit)) return 0;
+    deliveredFdLimit_ = pendingFdLimit_;
+    fdLimitPending_ = false;
+    return 1;
+}
+
 int BrokerNode::serviceClusterFeatureLevel_() {
     if (metadataService_) {
         const int16_t level = metadataService_->featureLevel();
@@ -3924,12 +3958,19 @@ uint64_t BrokerNode::workerPermissionEpochForTest(int32_t w, int64_t sessionId) 
     return onWorkerThreadForTest(w, [sessionId](auto& worker) -> uint64_t { return worker.permissionEpochForTest(sessionId); });
 }
 
+uint64_t BrokerNode::workerPermBindsUnknownSessionForTest(int32_t w) {
+    return onWorkerThreadForTest(w, [](auto& worker) -> uint64_t { return worker.permBindsUnknownSessionForTest(); });
+}
+
 std::size_t BrokerNode::workerDirectAcksInFlightForTest(int32_t w) {
     return onWorkerThreadForTest(w, [](auto& worker) -> std::size_t { return worker.directAcksInFlightForTest(); });
 }
 
 bool BrokerNode::gatewayHasSessionForTest(int64_t sessionId) {
     return onControlThreadForTest([this, sessionId]() { return gateway_ != nullptr && gateway_->hasSessionForTest(sessionId); });
+}
+void BrokerNode::gatewayGroupAnswerCapForTest(std::size_t bytes) {
+    onControlThreadForTest([this, bytes]() { if (gateway_) gateway_->groupAnswerCapForTest(bytes); return 0; });
 }
 void BrokerNode::forceZeroDerivedBindTokenForTest(bool on) {
     onControlThreadForTest([this, on]() { if (gateway_) gateway_->forceZeroDerivedBindTokenForTest(on); return 0; });
@@ -5164,6 +5205,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     work += serviceAuthMode_(nowNs);   // Authentication Task 9: the dev-mode warning timer + the auth-mode counter
     work += stepSecurityServing_(nowNs);   // issues #15 / #111: serving only while provably current
     work += servicePeerLinks_(nowNs);  // Authentication Task 15: the peer link handshakes + key distribution
+    work += serviceClusterFdLimit_();   // #612: the smallest open-file limit -> the admin thread (DDL admission)
     work += serviceClusterFeatureLevel_();   // checked writes: the committed metadata feature level -> every worker + the admin thread
 
     auto* agent = adminWorkerAgent_.get();
@@ -5251,10 +5293,16 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             if (tid == kA2cCatalogApplied) {
                 int64_t offset = -1;
                 uint64_t digest = 0;
-                if (decodeCatalogApplied(p, n, offset, digest)) {
-                    catalogAppliedValue_ = offset;
-                    publishCatalogMetrics_();
-                    fanoutCatalogMark_(offset);
+                int32_t nextTopicId = 0;
+                if (decodeCatalogApplied(p, n, offset, digest, nextTopicId)) {
+                    // The frame follows the event's own effect frames on this FIFO, so every id below `nextTopicId`
+                    // is already known to the gateway (#988).
+                    if (gateway_) gateway_->setAppliedTopicFrontier(nextTopicId);
+                    if (offset >= 0) {   // -1: an empty catalog booted -- the frontier only
+                        catalogAppliedValue_ = offset;
+                        publishCatalogMetrics_();
+                        fanoutCatalogMark_(offset);
+                    }
                 } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]] {
                     spdlog::error("BrokerNode[{}]: malformed kA2cCatalogApplied (len={}) skipped", config_.nodeId, n);
                 }
@@ -6470,6 +6518,12 @@ void BrokerNode::publishNsSlotMetrics_() noexcept {
     if (damaged != lastDamagedReadsPublished_) {
         lastDamagedReadsPublished_ = damaged;
         controlSet_(RuneMetric::DamagedReads, damaged);
+    }
+    static constexpr RuneMetric kRepairMetrics[3] = {RuneMetric::SegmentRepairs, RuneMetric::SegmentRepairFailures,
+                                                     RuneMetric::SegmentRepairNoPeer};   // #880
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto v = static_cast<std::int64_t>(gateway_->segmentRepairsTotal(i));
+        if (v != lastSegmentRepairPublished_[i]) { lastSegmentRepairPublished_[i] = v; controlSet_(kRepairMetrics[i], v); }
     }
     const auto unauth = static_cast<std::int64_t>(gateway_->unauthLogSuppressedTotal());   // #145
     if (unauth != lastUnauthSuppressedPublished_) {

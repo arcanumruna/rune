@@ -100,6 +100,8 @@ struct Session {
     // never silently start allow-all.  AuthAnonymous is allow-all only on a dev / in-process broker (permsOf_ denies it
     // on an authenticating one).
     SessionAuth                                    auth;
+    // #234: the challenge issued to this session and not yet used (0 = none)
+    uint64_t                                       bootstrapChallengeId = 0;
     // Namespaces Phase 2 Task 3 (D21): the lifecycle gate of this session's namespace (Active = serve everything).  Set
     // at login from the NamespaceMirror and re-set on every record upsert; the per-request check is one byte compare.
     rune::catalog::NsStateTag                      nsGate = rune::catalog::NsStateTag::Active;

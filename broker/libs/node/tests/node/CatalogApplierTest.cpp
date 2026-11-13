@@ -562,9 +562,11 @@ TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToContr
     EXPECT_EQ(dropped.name, "top_players");
     int64_t off = -1;
     uint64_t digest = 0;
-    ASSERT_TRUE(decodeCatalogApplied(frames.back().bytes.data(), frames.back().bytes.size(), off, digest));
+    int32_t frontier = -1;
+    ASSERT_TRUE(decodeCatalogApplied(frames.back().bytes.data(), frames.back().bytes.size(), off, digest, frontier));
     EXPECT_EQ(off, 10);
     EXPECT_EQ(digest, rig.applier.state().digest());
+    EXPECT_EQ(frontier, rig.applier.state().nextTopicId());
 
     // The BOOT sink of the same history posts RECOVERY installs.
     rig.restart();
@@ -743,12 +745,33 @@ TEST(CatalogEffectWireTest, EveryMessageRoundTripsAndAMalformedFrameIsRefused) {
     EXPECT_FALSE(decodeCatalogHalted(h.data(), 10, hm));
 
     uint8_t ap[kCatalogAppliedWireLen];
-    writeCatalogApplied(ap, 9, 0xD1);
+    writeCatalogApplied(ap, 9, 0xD1, 17);
     int64_t off = 0;
     uint64_t dg = 0;
-    ASSERT_TRUE(decodeCatalogApplied(ap, sizeof ap, off, dg));
-    EXPECT_EQ(off, 9); EXPECT_EQ(dg, 0xD1u);
-    EXPECT_FALSE(decodeCatalogApplied(ap, 8, off, dg));
+    int32_t nt = -1;
+    ASSERT_TRUE(decodeCatalogApplied(ap, sizeof ap, off, dg, nt));
+    EXPECT_EQ(off, 9); EXPECT_EQ(dg, 0xD1u); EXPECT_EQ(nt, 17);
+    EXPECT_FALSE(decodeCatalogApplied(ap, 8, off, dg, nt));
+    EXPECT_FALSE(decodeCatalogApplied(ap, sizeof ap - 1, off, dg, nt)) << "the pre-frontier 16-byte frame is refused";
+}
+
+// #988: the applied frame carries the applier's nextTopicId; an empty-catalog boot posts offset -1 with frontier 0;
+// a negative frontier or an offset below -1 is refused.
+TEST(CatalogAppliedWireRegression, TheFrontierRoundTripsAndAShortOrNegativeFrameIsRefusedRegression) {
+    using namespace rune::node;
+    uint8_t ap[kCatalogAppliedWireLen];
+    int64_t off = 0; uint64_t dg = 0; int32_t nt = -1;
+    writeCatalogApplied(ap, -1, 0x5, 0);
+    ASSERT_TRUE(decodeCatalogApplied(ap, sizeof ap, off, dg, nt));
+    EXPECT_EQ(off, -1); EXPECT_EQ(nt, 0);
+    writeCatalogApplied(ap, 4, 0x5, 2147483647);
+    ASSERT_TRUE(decodeCatalogApplied(ap, sizeof ap, off, dg, nt));
+    EXPECT_EQ(nt, 2147483647);
+    writeCatalogApplied(ap, 4, 0x5, -3);
+    EXPECT_FALSE(decodeCatalogApplied(ap, sizeof ap, off, dg, nt));
+    writeCatalogApplied(ap, -2, 0x5, 3);
+    EXPECT_FALSE(decodeCatalogApplied(ap, sizeof ap, off, dg, nt));
+    EXPECT_FALSE(decodeCatalogApplied(ap, 0, off, dg, nt));
 }
 
 // ═══ Fix round 1 ═════════════════════════════════════════════════════════════
@@ -1599,6 +1622,52 @@ TEST(CatalogApplierRegression, NamespaceStateSurvivesBootReplayRegression) {
 // The frozen formatVer-4 script (rune::catalog::testing::goldenScriptV4Lease): 0 plain, 1 lease topic `inst` (+ the lease
 // view `inst.leases`), 2-4 AlterTopicConfig inst (lease.ttl, lease.checkpoint, delete.retention.ms), 5 CreateView inst_ids,
 // 6 DropView inst_ids, 7 DropTopic inst (takes inst.leases along), 8 CreateTopic inst again.
+
+// #988: the `applied` effect carries the applier's nextTopicId and fires AFTER the effects of its event, so when a
+// consumer sees the frontier cover an id, that id's own effect (topicApplied / sinkApplied) has already been posted.
+TEST(CatalogApplierRegression, TheAppliedEffectCarriesTheFrontierAfterTheEventsOwnEffectsRegression) {
+    CatalogRig rig("ap_frontier");
+    rig.appendEvents(0, 11);
+    rig.applier.goLive(rig.rec.liveEffects());
+    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 11);
+    ASSERT_EQ(rig.rec.appliedFrontiers.size(), 11u) << "one `applied` per event, effects or not";
+    int32_t prev = 0;
+    for (std::size_t i = 0; i < rig.rec.appliedFrontiers.size(); ++i) {
+        const int32_t f = rig.rec.appliedFrontiers[i];
+        EXPECT_GE(f, prev) << "the frontier never moves back (event " << i << ")";
+        EXPECT_EQ(rig.rec.appliedMaxIdSeen[i], f - 1 < 0 ? -1 : f - 1)
+            << "at event " << i << " the frontier covers an id whose effect was not posted yet";
+        prev = f;
+    }
+    EXPECT_EQ(rig.rec.appliedFrontiers.back(), rig.applier.state().nextTopicId());
+    EXPECT_GT(rig.applier.state().nextTopicId(), 0);
+}
+
+// #988: the boot posts the frontier too (a checkpointed boot through postBootStash, an empty catalog as -1 / 0).
+TEST(CatalogApplierRegression, TheBootPostsTheFrontierRegression) {
+    CatalogRig rig("ap_frontier_boot");
+    rig.appendEvents(0, 3);
+    rig.applier.goLive(rig.rec.liveEffects());
+    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 3);
+    const int32_t frontier = rig.applier.state().nextTopicId();
+    rig.restart();
+    rig.rec.clear();
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 3);
+    ASSERT_FALSE(rig.rec.appliedFrontiers.empty());
+    EXPECT_EQ(rig.rec.appliedFrontiers.back(), frontier);
+    rig.rec.clear();
+    rig.applier.postBootStash(rig.rec.liveEffects().sink);
+    ASSERT_EQ(rig.rec.appliedFrontiers.size(), 1u);
+    EXPECT_EQ(rig.rec.appliedFrontiers.back(), frontier);
+
+    CatalogRig empty("ap_frontier_empty");
+    empty.restart();
+    ASSERT_EQ(empty.applier.replayLocal(empty.replica(), empty.rec.bootEffects()), 0);
+    empty.applier.postBootStash(empty.rec.liveEffects().sink);
+    ASSERT_EQ(empty.rec.appliedFrontiers.size(), 1u) << "an empty catalog has a frontier (0)";
+    EXPECT_EQ(empty.rec.appliedFrontiers.back(), 0);
+    EXPECT_EQ(empty.rec.appliedOffsets.back(), -1);
+}
 
 namespace {
 void appendLeaseScript(CatalogRig& rig, std::size_t from, std::size_t to) {

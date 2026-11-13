@@ -635,3 +635,160 @@ TEST(CheckedWritesImportGrant, GatewaySetsTheOpFlagOnlyWithTheGrant) {
     EXPECT_NE(routedProduceFlags(r, withGrant) & rune::node::kOpFlagImportGranted, 0);
     EXPECT_EQ(routedProduceFlags(r, writeOnly) & rune::node::kOpFlagImportGranted, 0);
 }
+
+// Issue #506: the gateway marks a produce's missing IMPORT as "not a verdict yet" exactly when the session has no IMPORT AND the
+// security view is behind events this broker holds.  RED before: the flag did not exist (never set).
+TEST(CheckedWritesImportGrant, GatewaySetsImportDeferredOnlyWithoutTheGrantWhileTheViewIsBehindRegression) {
+    FenceRig r(1);
+    (void)r.apply(sec::CreateUserOps{testVerifier(3)}, "i", "CREATE USER i WITH PASSWORD '<redacted>';");
+    for (const auto op : {sec::Operation::Write, sec::Operation::Import})
+        (void)r.apply(sec::GrantOps{sec::GranteeKind::User, topicGrant(op, "events")}, "i", "GRANT ... ON TOPIC events TO USER i;");
+    const int64_t withGrant = r.login("i");
+    const int64_t writeOnly = r.login("w");
+    const auto deferred = [&](int64_t sid) { return (routedProduceFlags(r, sid) & rune::node::kOpFlagImportDeferred) != 0; };
+
+    EXPECT_FALSE(deferred(writeOnly)) << "the view is current: the missing IMPORT is a verdict";
+    r.gw.setSecurityKnownEnd(r.view->appliedOffset() + 2);   // one event held by this broker, not applied
+    ASSERT_EQ(r.gw.workersSecurityLagForTest(), 2u);
+    EXPECT_TRUE(deferred(writeOnly)) << "the view is behind: the missing IMPORT may be a held grant";
+    EXPECT_FALSE(deferred(withGrant)) << "an IMPORT the session holds is never deferred";
+    r.gw.setSecurityKnownEnd(r.view->appliedOffset() + 1);   // caught up
+    EXPECT_FALSE(deferred(writeOnly));
+}
+
+namespace {
+/// Enqueues `op` on worker 0's op ring and returns the `deferAck` flag byte the ring carries.
+uint8_t enqueuedFlags(FenceRig& r, rune::node::WorkerOp op) {
+    const bool lifecycle = op.type == rune::node::WorkerOp::Type::SessionAnnounce;   // the session-lifecycle ring
+    EXPECT_TRUE(r.pool.worker(0).tryEnqueueOp(std::move(op)));
+    int seen = 0;
+    uint8_t flags = 0;
+    (lifecycle ? r.pool.worker(0).sessionRingForDoorbell() : r.pool.worker(0).opRingForDoorbell()).drain([&](int32_t, aeron::concurrent::AtomicBuffer& ab, aeron::util::index_t off, aeron::util::index_t len) {
+        char* c = reinterpret_cast<char*>(ab.buffer()) + off;
+        sbe::MessageHeader mh;
+        mh.wrap(c, 0, 0, static_cast<std::size_t>(len));
+        sbe::WorkerOp d;
+        d.wrapForDecode(c, sbe::MessageHeader::encodedLength(), mh.blockLength(), mh.version(), static_cast<std::size_t>(len));
+        flags = d.deferAck();
+        ++seen;
+    }, 16);
+    EXPECT_EQ(seen, 1);
+    return flags;
+}
+}  // namespace
+
+// Issue #506: the op-ring flag byte.  importDeferred shares bit 0x10 with the SessionAnnounce-only keyPending; each is encoded
+// only for its own op type, so neither reads back as the other.
+TEST(CheckedWritesImportGrant, ImportDeferredSurvivesTheRingAndSharesItsBitWithKeyPendingOnlyAcrossTypesRegression) {
+    FenceRig r(1);
+    using rune::node::WorkerOp;
+    EXPECT_EQ(rune::node::kOpFlagImportDeferred, rune::node::kOpFlagKeyPending);
+    WorkerOp produce; produce.type = WorkerOp::Type::Produce; produce.importDeferred = true;
+    EXPECT_NE(enqueuedFlags(r, produce) & rune::node::kOpFlagImportDeferred, 0) << "a Produce carries it";
+    WorkerOp produceKey; produceKey.type = WorkerOp::Type::Produce; produceKey.keyPending = true;
+    EXPECT_EQ(enqueuedFlags(r, produceKey) & rune::node::kOpFlagImportDeferred, 0) << "keyPending is not a Produce flag";
+    WorkerOp announce; announce.type = WorkerOp::Type::SessionAnnounce; announce.keyPending = true;
+    EXPECT_NE(enqueuedFlags(r, announce) & rune::node::kOpFlagKeyPending, 0) << "a SessionAnnounce keeps keyPending";
+    WorkerOp announceDef; announceDef.type = WorkerOp::Type::SessionAnnounce; announceDef.importDeferred = true;
+    EXPECT_EQ(enqueuedFlags(r, announceDef) & rune::node::kOpFlagKeyPending, 0) << "importDeferred is not an announce flag";
+}
+
+// ── #442: a worker that fell a whole shipper queue behind is LOST; nothing that waits for "every worker has it" is
+// satisfied on its behalf, and the resync (reset + snapshot + the outstanding fence) lets it acknowledge.
+// Mutation m3 (shippedSeq() not frozen while a worker is lost): the object's permissions count as shipped (the other
+// worker alone moves the trim point) -> red.
+TEST(SecurityEnforcementFenceRegression, AFenceIsNeverAcknowledgedOnBehalfOfALostWorkerRegression) {
+    FenceRig r(2);
+    r.gw.setPermissionQueueCapForTest(16);
+    const int64_t ws = r.login("w");
+    const int64_t pre = r.gw.injectTestSession(0);
+    r.gw.authenticateWithGrantsForTest(pre, 77, {sec::GrantSpec{sec::Operation::Write, sec::ResourcePattern{
+        sec::ResourceType::Topic, sec::PatternKind::Prefix, "w."}}});
+    for (int i = 0; i < 3; ++i) r.runAll(1 + i);
+    ASSERT_EQ(r.gw.permissionLostNowForTest(), 0u);
+
+    // Worker 1 stops draining its lifecycle ring (full); logins pile items up behind it until it is lost.
+    rune::node::WorkerOp filler;
+    filler.type = rune::node::WorkerOp::Type::SessionClose;
+    filler.sessionId = INT64_MAX;
+    while (r.pool.worker(1).tryEnqueueOp(filler)) {}
+    int64_t now = 10;
+    for (int i = 0; i < 40; ++i) {
+        (void)r.login("r");
+        (void)r.gw.servicePermissionShippingForTest();
+        r.runWorker(0, ++now);
+    }
+    ASSERT_EQ(r.gw.permissionLostNowForTest(), 1u) << "worker 1 is a whole queue behind";
+    EXPECT_LE(r.gw.permissionPendingUpdatesForTest(), 17u);
+
+    // An object whose permissions must reach every worker first, and a REVOKE whose fence worker 1 cannot see.
+    r.gw.onCatalogObjectApplied(10, "w.t10", false);
+    const int64_t off = r.revoke(sec::Operation::Write, "w");
+    for (int i = 0; i < 20; ++i) {
+        (void)r.gw.servicePermissionShippingForTest();
+        r.runWorker(0, ++now);
+    }
+    EXPECT_GE(r.gw.enforceFenceAckedForTest(0, 1), 1u) << "worker 0 acknowledged the fence";
+    EXPECT_EQ(r.gw.enforceFenceAckedForTest(1, 1), 0u) << "worker 1 never saw it";
+    EXPECT_LT(r.gw.securityEnforcedOffset(), off) << "the revoke is not enforced on behalf of a lost worker";
+    EXPECT_FALSE(r.gw.objectPermissionsShipped(10)) << "shippedSeq() does not move for a worker that skipped items";
+
+    // Worker 1 drains its ring: the gateway resets it, ships the snapshot and re-issues the outstanding fence.
+    bool enforced = false;
+    for (int cycle = 0; cycle < 60 && !enforced; ++cycle) {
+        r.runAll(++now);
+        enforced = r.gw.securityEnforcedOffset() >= off;
+    }
+    EXPECT_TRUE(enforced) << "the resynced worker acknowledged the fence";
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), off);
+    EXPECT_EQ(r.gw.permissionLostNowForTest(), 0u);
+    EXPECT_EQ(r.gw.permissionResyncsForTest(), 1u);
+    EXPECT_EQ(r.pool.worker(1).permissionResetsForTest(), 1u);
+    EXPECT_EQ(r.pool.worker(0).permissionResetsForTest(), 0u);
+    EXPECT_TRUE(r.gw.objectPermissionsShipped(10));
+    (void)ws;
+}
+
+// ── #442 part 2: a session that got the full-pool deny-all ref is re-acquired once the pool has room.
+// Mutation m6 (starved sessions are never re-acquired): the session keeps its deny-all table -> red.
+TEST(PermissionPoolStarvedRegression, AStarvedSessionIsReacquiredWhenASetLeavesRegression) {
+    SecurityEventChain chain;
+    sec::BootstrapOps b; b.verifier = testVerifier(9); b.fakeSaltSeed.fill(7);
+    (void)chain.emit(b, "admin", "BOOTSTRAP", "bootstrap");
+    (void)chain.createUser("r");
+    (void)chain.emit(sec::GrantOps{sec::GranteeKind::User, topicGrant(sec::Operation::Read, "events")}, "r",
+                     "GRANT READ ON TOPIC events TO USER r;");
+    SecurityView view(chain.state());
+    auto gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    gw.setAuthMode(GatewayAuthMode::Required, &view);
+    gw.onCatalogObjectApplied(0, "events", false);
+
+    constexpr uint32_t kMax = PermissionPool::kMaxTables;
+    std::vector<int64_t> fillers;
+    fillers.reserve(kMax);
+    for (uint32_t i = 0; i < kMax; ++i) {   // kMax distinct live sets: the pool is full
+        const int64_t sid = gw.injectTestSession(0);
+        gw.authenticateWithGrantsForTest(sid, 1000 + i, {sec::GrantSpec{sec::Operation::Write, sec::ResourcePattern{
+            sec::ResourceType::Topic, sec::PatternKind::Prefix, "p" + std::to_string(i)}}});
+        fillers.push_back(sid);
+    }
+    ASSERT_EQ(gw.permissionTablesForTest(), kMax);
+    const uint64_t rid = chain.state().userByName(rune::catalog::kDefaultNsId, "r")->objectId;
+    const int64_t sr = gw.injectTestSession(0);
+    gw.authenticateWithGrantsForTest(sr, rid, sec::effectiveGrants(chain.state(), rid));
+    constexpr uint8_t kRead = sec::opBit(sec::Operation::Read);
+    ASSERT_NE(gw.sessionPermissionsForTest(sr), nullptr);
+    EXPECT_FALSE(gw.sessionPermissionsForTest(sr)->allows(0, kRead)) << "the full pool answered deny-all";
+    EXPECT_EQ(gw.poolStarvedForTest(), 1u);
+
+    (void)gw.servicePermissionShippingForTest();
+    EXPECT_FALSE(gw.sessionPermissionsForTest(sr)->allows(0, kRead)) << "still full: nothing to re-acquire into";
+    EXPECT_EQ(gw.poolStarvedReacquiredForTest(), 0u);
+
+    gw.closeSessionForTest(fillers[7]);   // its set's last holder leaves
+    ASSERT_LT(gw.permissionTablesForTest(), kMax);
+    (void)gw.servicePermissionShippingForTest();
+    EXPECT_TRUE(gw.sessionPermissionsForTest(sr)->allows(0, kRead)) << "the starved session holds its real table";
+    EXPECT_EQ(gw.poolStarvedReacquiredForTest(), 1u);
+    EXPECT_EQ(gw.poolStarvedForTest(), 0u);
+}

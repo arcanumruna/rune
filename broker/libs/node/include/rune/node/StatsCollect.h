@@ -58,11 +58,21 @@ private:
     uint16_t           constraintCount_ = 0;
 };
 
-/// Ids 1-20 of one led topic partition; `state` is nullptr for an untyped topic.
+/// Ids 1-21 and 0x8000 + version of one led topic partition; `state` is nullptr for an untyped topic.
 inline void collectTopicPartitionStats(const PartitionWriteState* state, const rune::replication::PartitionReplica& replica,
                                        StatsSink& sink) noexcept {
     using rune::protocol::client::StatId;
     if (state == nullptr) return;
+    // Schema retire (#419), topic-wide: ascending ids, so these come after the verdict ids and are the last that fit.
+    const auto addRetire = [&]() noexcept {
+        if (state->spec == nullptr) return;
+        sink.add(StatId::schemaRetiredBelow, state->spec->retiredBelow());
+        for (std::size_t v = 1; v < state->spec->versionSlots() && v < rune::protocol::client::kStatProducedAtVersionBase; ++v) {
+            const SpecVersion* sv = state->spec->versionFor(static_cast<uint16_t>(v));
+            if (sv == nullptr || sv->producedRecords == 0) continue;
+            if (!sink.add(static_cast<StatId>(rune::protocol::client::kStatProducedAtVersionBase + v), static_cast<int64_t>(sv->producedRecords))) return;
+        }
+    };
     if (const VerdictSource* const judge = state->verdicts; judge != nullptr) {
         const VerdictSourceStats& s = judge->stats();
         sink.add(StatId::rejectionsKeyExists, static_cast<int64_t>(s.rejectionsKeyExists));
@@ -96,6 +106,7 @@ inline void collectTopicPartitionStats(const PartitionWriteState* state, const r
         sink.add(StatId::foldPausedOnTxnLockNs, static_cast<int64_t>(t.foldPausedOnTxnLockNs));
         sink.add(StatId::txnMarkerWithoutVote, static_cast<int64_t>(t.markerWithoutVote));
     }
+    addRetire();
 }
 
 /// Ids 32-36 of one led view partition; 32 only for a unique view.

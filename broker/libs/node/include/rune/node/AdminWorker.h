@@ -333,6 +333,14 @@ public:
     /// control → admin (checked writes): the committed metadata feature level; keeps the maximum.
     void setClusterFeatureLevel(int16_t level) noexcept { if (level > clusterFeatureLevel_) clusterFeatureLevel_ = level; }
     [[nodiscard]] int16_t clusterFeatureLevel() const noexcept { return clusterFeatureLevel_; }
+    /// control → admin (#612): the smallest soft open-file limit any broker advertised and whose it is (0 / -1 = none
+    /// known).  DDL admission uses the smaller of this and the broker's own limit.  The last value wins.
+    void setClusterFdLimit(uint64_t limit, int32_t node) noexcept {
+        clusterFdLimit_ = limit;
+        clusterFdLimitNode_ = node;
+    }
+    [[nodiscard]] uint64_t clusterFdLimit() const noexcept { return clusterFdLimit_; }
+    [[nodiscard]] int32_t clusterFdLimitNode() const noexcept { return clusterFdLimitNode_; }
     [[nodiscard]] int32_t placeableBrokers() const noexcept {
         return placementKnown_ ? placement_.placeable : deps_.brokerCount;
     }
@@ -624,6 +632,8 @@ private:
     int stepBootReconcile_();
     uint64_t                         peerLinkKeysSeen_ = 0;
     int16_t clusterFeatureLevel_ = rune::replication::MetadataFeature::kBase;   // setClusterFeatureLevel
+    uint64_t clusterFdLimit_ = 0;          // setClusterFdLimit (#612)
+    int32_t  clusterFdLimitNode_ = -1;
     PlacementViewMsg placement_{};         // the control thread's placement view (onPlacementView)
     bool             placementKnown_ = false;
 

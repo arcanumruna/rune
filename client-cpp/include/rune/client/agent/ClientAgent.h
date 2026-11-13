@@ -46,6 +46,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -631,16 +632,32 @@ public:
     transport::AeronTransport::OfferResult offerToEndpoint(const std::string& channel, uint8_t* buf,
                                                            std::size_t len, int64_t nowNs,
                                                            uint32_t& sessionIndex) noexcept;
+    /// #767: a seed move (a retarget of the seed's default publication) is asynchronous: it is a state of the
+    /// transport, advanced once per doWork().  Done = already there (nothing to wait for); Pending = started, the
+    /// outcome arrives through takeSeedMoveResult() carrying the returned token; Failed = not started (the old
+    /// publication stays).
+    enum class SeedMove : uint8_t { Done, Pending, Failed };
+    enum class SeedMoveKind : uint8_t { ClientRetarget, Failover, ConnectRedirect, Bootstrap, LastKnownLeader };
+    struct SeedMoveResult {
+        uint64_t     token = 0;
+        SeedMoveKind kind  = SeedMoveKind::ClientRetarget;
+        // false: the new pair did not resolve (the old one stays) or the move was superseded
+        bool         ok    = false;
+    };
+    /// The oldest undelivered move result (every Pending move yields exactly one: success, failure, or superseded).
+    [[nodiscard]] std::optional<SeedMoveResult> takeSeedMoveResult() noexcept;
     /// DR client bug 1 (seed failover): the seed's broker is presumed dead (its
     /// session went silent, or it gave up reconnecting there) — point the seed's
     /// default publication (its control path) at `channel` (a live broker) and
     /// connect FRESH there (a new broker session; every route's cached session is
-    /// re-resolved against where the seed now physically is).  False when the new
-    /// publication did not resolve (the old one stays; the owner tries the next
-    /// candidate).  Agent thread only; cold path.
+    /// re-resolved against where the seed now physically is).  Done = the seed is
+    /// already there (the fresh connect, if any, was requested at once); Pending =
+    /// the move is in flight and the connect follows its success (a Failed result
+    /// leaves the old publication; the owner tries the next candidate); Failed =
+    /// not started.  Agent thread only; cold path.
     /// `connectNow` false (fix round 1 I2, reconnectForeverAfterLive): only re-point
     /// the publication — the machine's own Backoff attempt connects there.
-    bool failoverSeedTo(const std::string& channel, int64_t nowNs, bool connectNow = true) noexcept;
+    SeedMove failoverSeedTo(const std::string& channel, int64_t nowNs, bool connectNow, uint64_t& token) noexcept;
     /// Fix round 1 (C1): how often the seed's default publication moved (any
     /// retarget / failover).  "No route entry" means "led by the broker the seed
     /// PHYSICALLY sits on", so every move must be followed by fresh metadata.
@@ -765,9 +782,24 @@ public:
     [[nodiscard]] const transport::AeronTransport& testTransport() const noexcept { return transport_; }
     /// Test hook (T15a fix1): retarget the seed's default ingress publication, as
     /// the Client's stick-to-leader redirect path does.  Agent thread only.
-    bool testRetargetSeed(const std::string& channel, int32_t responsePort = 0) noexcept {
-        return retarget(channel, responsePort);
+    bool testRetargetSeed(const std::string& channel, int32_t responsePort = 0, uint64_t* tokenOut = nullptr) noexcept {
+        uint64_t token = 0;
+        const bool started = retarget(channel, responsePort, token) != SeedMove::Failed;
+        if (tokenOut != nullptr) *tokenOut = token;
+        return started;
     }
+    /// Test hook (#767): the transport for its stall / clock seams (setDriverStalledForTest, setResolveClock).
+    [[nodiscard]] transport::AeronTransport& testTransportMut() noexcept { return transport_; }
+    /// Test hook (#767): drive the pending seed move to its outcome (the transport's duty cycle + the agent's service
+    /// step, hard-capped); true when no move is pending afterwards.  Agent thread only, Invoker transport.
+    bool testSettleSeedMove(int maxCycles = 4096) noexcept {
+        for (int i = 0; i < maxCycles && pendingMove_.has_value(); ++i) {
+            (void)transport_.dutyCycle();
+            serviceSeedMove_(dutyNowNs_);
+        }
+        return !pendingMove_.has_value();
+    }
+    [[nodiscard]] bool testSeedMovePending() const noexcept { return pendingMove_.has_value(); }
     /// Test hooks (T15a r2-m1): the seed's two Backoff fallbacks, and where the
     /// seed's default publication points now.  Agent thread only.
     bool testRetargetSeedToBootstrap() noexcept { return retargetSeedToBootstrap_(); }
@@ -872,6 +904,9 @@ public:
     [[nodiscard]] uint64_t staleFramesDropped() const noexcept { return staleFramesDropped_; }
     /// F-A C1: session-fatal notices for a session this client already left (dropped, never applied).
     [[nodiscard]] uint64_t staleSessionNotices() const noexcept { return staleSessionNotices_; }
+    /// #12: AuthServerFirst / AuthServerFinal / ErrorResponse frames aimed at a sealed session that its own key did not
+    /// open (a clear or foreign-keyed frame), dropped before any machine call.
+    [[nodiscard]] uint64_t forgedSessionFramesIgnored() const noexcept { return forgedSessionFramesIgnored_; }
     /// #989: sessions resumed because their response pair's gateway publication closed (duty thread only).
     [[nodiscard]] uint64_t responseEgressLosses() const noexcept { return responseEgressLosses_; }
     /// U2: clear UnknownSession notices accepted for an encrypted session (probe nonce echoed) / refused (wrong nonce or session).
@@ -1075,7 +1110,7 @@ private:
     // Seed-transport helpers (agent thread only).  ClientAgent is NOT a SessionIo (issue #178): the only session
     // send path is SessionEndpointIo::sendFrame, which seals per destination.
     // -------------------------------------------------------------------------
-    bool retarget(const std::string& newIngressChannel, int32_t responsePort = 0) noexcept;
+    SeedMove retarget(const std::string& newIngressChannel, int32_t responsePort, uint64_t& token) noexcept;
     [[nodiscard]] std::string ingressChannel() const { return transport_.ingressChannel(); }   // issue #115
 
     // -------------------------------------------------------------------------
@@ -1339,6 +1374,36 @@ private:
     /// the redirect budget).  Agent thread only (cold path).
     bool retargetSeedOnConnectRedirect_(const std::string& endpoint, int32_t responsePort = 0) noexcept;
 
+    /// #767: the ONE move in flight (the transport holds one pending retarget at a time).  Every wrapper captures
+    /// what its post-actions read, so they run at completion exactly as they ran after the blocking retarget.
+    struct PendingSeedMove {
+        uint64_t     token = 0;
+        SeedMoveKind kind  = SeedMoveKind::ClientRetarget;
+        std::string  channel;
+        int32_t      responsePort = 0;
+        std::string  leaving;          // Bootstrap: the channel the seed left (becomes lastKnownLeaderChannel)
+        int32_t      leavingNode = -1; // Bootstrap: the node it was on; LastKnownLeader: lastKnownLeaderNode
+        int32_t      leavingPort = 0;  // Bootstrap: its response port
+        bool         connectNow  = false;   // Failover: a fresh connect follows the move
+    };
+    std::optional<PendingSeedMove> pendingMove_;
+    /// Start `m`'s move: Failed (nothing recorded) or Pending (a move already pending to ANOTHER target is superseded:
+    /// its failed result is published first; one to the SAME target is joined: same token, no result).  `m` carries
+    /// every allocation, so nothing here can throw after the transport has
+    /// begun.
+    SeedMove beginSeedMove_(PendingSeedMove&& m, uint64_t& token) noexcept;
+    /// Once per doWork: advance the transport's retarget and finish the moves it completed (post-actions on success).
+    void serviceSeedMove_(int64_t nowNs) noexcept;
+    /// A request to stay where the seed is, while a move to ANOTHER channel is still resolving: cancel that move (the
+    /// transport keeps the old pair), publish its {token, kind, false} and forget it.  A move to the same channel
+    /// joins instead (beginSeedMove_).
+    void cancelPendingSeedMove_() noexcept;
+    void applySeedMove_(const PendingSeedMove& m, int64_t nowNs) noexcept;
+    void publishSeedMoveResult_(const SeedMoveResult& r) noexcept;
+    static constexpr std::size_t kMaxSeedMoveResults = 8;
+    std::array<SeedMoveResult, kMaxSeedMoveResults> seedMoveResults_{};
+    std::size_t seedMoveResultHead_ = 0, seedMoveResultCount_ = 0;
+
     // ---- Task 1.4: shared produce→leader routing (drain path + redirect resend) --
     // Probe the route slot, resolve its session / pub once, hold if the session is not
     // Connected, else re-stamp the leader sessionId (header offset 8) and offerOn.
@@ -1422,6 +1487,7 @@ private:
     // only on the duty thread / after the runner is joined).
     uint64_t staleFramesDropped_  = 0;
     uint64_t staleSessionNotices_ = 0;   ///< F-A C1 (duty thread only)
+    uint64_t forgedSessionFramesIgnored_ = 0;   ///< #12 (duty thread only)
     uint64_t responseEgressLosses_ = 0;  ///< #989 (duty thread only)
     uint64_t ingressOfferRefused_ = 0;
     uint64_t ingressFatalDropped_ = 0;

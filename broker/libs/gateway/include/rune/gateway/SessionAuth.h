@@ -3,7 +3,8 @@
 // exactly the variables it needs, no scattered booleans).  Owned by the CONTROL thread with its Session.
 //
 //   AuthAwaitingFirst         - the broker requires a login and the session has sent nothing yet (also: the bootstrap
-//                               window, where only SecurityBootstrap is accepted besides AuthClientFirst).
+//                               window, where only SecurityBootstrap (and its challenge request) is accepted besides
+// AuthClientFirst).
 //   AuthAwaitingFinal         - AuthClientFirst answered; the (copied) verifiers of the exchange wait for the proofs.
 //                               ALWAYS two verifier slots (review A, D5/D8): a user with one password, an unknown user
 //                               and an empty name get a deterministic FAKE second slot whose keys nothing matches, so
@@ -85,7 +86,8 @@ enum class AuthGate : uint8_t { Allow, AnswerAuthFailedAndEnd, AnswerPasswordCha
 
 /// THE rule of what a session may send in its auth state (the gate before the dispatch switch).  Session-level
 /// frames (Connect / HandshakeContinue / Keepalive / Ping / Disconnect) are always allowed; AuthAwaitingFirst allows
-/// AuthClientFirst (12) and, while `bootstrapOpen`, SecurityBootstrap (80); AuthAwaitingFinal allows AuthClientFinal
+/// AuthClientFirst (12) and, while `bootstrapOpen`, SecurityBootstrap (80) and SecurityBootstrapChallengeRequest (102,
+/// #234); AuthAwaitingFinal allows AuthClientFinal
 /// (14); anything else there is AuthenticationFailed and the session ends (D13).  AuthPasswordChangeRequired allows a
 /// SecurityDdl only when `isSelfSetPassword` (ALTER USER <self> SET PASSWORD), else PasswordChangeRequired (47) and
 /// the session stays.  AuthAnonymousRead allows the Describe-gated reads (MetadataRequest, GetTopicSchema), else

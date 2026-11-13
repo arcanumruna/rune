@@ -208,9 +208,9 @@ std::string_view errorCodeName(uint16_t code) noexcept {
         "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused",
         "ConstraintViolation", "KeyExists", "KeyNotFound", "AutoIncrementExhausted", "ViewKeyExpressionInvalid",
         "ViewConstraintInvalid", "ViewUniqueInvalid", "TxnTooLarge", "TxnConflict",
-        "LeaseNotFound", "LeaseLimitExceeded", "LeaseTtlTooLarge"};
+        "LeaseNotFound", "LeaseLimitExceeded", "LeaseTtlTooLarge", "SchemaVersionRetired"};
 #ifdef RUNE_CLI_LIVE_ENABLED
-    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::LeaseTtlTooLarge) + 1,
+    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::SchemaVersionRetired) + 1,
                   "errorCodeName: one name per rune::protocol::client::ErrorCode");
     static_assert(static_cast<uint16_t>(rune::protocol::client::ErrorCode::TopicExists) == 25,
                   "errorCodeName: the table is indexed by the enum's values");
@@ -478,6 +478,9 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
                                 case rune::codec::AlterOpType::SetCompatibility:
                                     out << "SET_COMPATIBILITY " << compatName(op.mode);
                                     break;
+                                case rune::codec::AlterOpType::RetireBelow:
+                                    out << "RETIRE VERSION < " << op.version;
+                                    break;
                             }
                             out << "\n";
                         }
@@ -701,7 +704,7 @@ std::optional<cat::RequestRecord> awaitOwnWrite(rc::Client& c, const cat::Reques
             }
             return std::nullopt;
         },
-        [&] { return reader.state().request(rid); }, steadyNowMs,
+        [&] { return reader.state().requestOfAnyPrincipal(rid); }, steadyNowMs,
         [] { std::this_thread::sleep_for(std::chrono::milliseconds(20)); }, deadline, why);
 }
 
@@ -940,7 +943,7 @@ bool QlRun::awaitLastSecurityDdl() {
             lastErrorCode = r.error().brokerErrorCode;
             break;
         }
-        if (reader.state().request(*lastSecurityDdl)) return true;
+        if (reader.state().requestOfAnyPrincipal(*lastSecurityDdl)) return true;
         if (steadyNowMs() >= deadline) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }

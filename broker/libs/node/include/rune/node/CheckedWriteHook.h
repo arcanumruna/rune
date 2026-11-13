@@ -60,6 +60,7 @@ struct WriteFacts {
     bool    transactional      = false;
     bool    atomicBatch        = false;
     bool    importGranted      = false;
+    bool    importDenialDeferred = false;   // #506: the security view is behind: a missing IMPORT is not a verdict
     int64_t producerId         = -1;
     bool    legacyMode         = false;
     bool    levelCheckedWrites = false;
@@ -138,6 +139,7 @@ enum class HookRefusal : uint8_t {
     LeaseSessionUnannounced, LeaseUpdateThenRevoke, LeaseRevokeIndexNotReady, LeaseRevokeBehindUpdate, LeaseRevokeBatchTooLarge,
     LeaseClientVersion, LeaseNeedsView, LeaseInTxn, LeaseBatchTooLarge, LeaseBadRecord, LeaseTtlTooLarge, LeaseViewMemOver,
     LeaseMaxLeases, LeaseFenced,
+    VersionRetired,   ///< a record's schema version is below the topic's retire floor (#419): SchemaVersionRetired, nothing stored
     Count_
 };
 
@@ -165,7 +167,8 @@ struct RequirementVerdict {
     }
     if (t.autoIncrement) {
         if (b.plainUpsert) return refuse(HookRefusal::UpsertOnAutoIncrement);
-        if (b.explicitInsert && !f.importGranted) return {ErrorCode::NotAuthorized, HookRefusal::ImportNotGranted};
+        if (b.explicitInsert && !f.importGranted)
+            return {f.importDenialDeferred ? ErrorCode::AuthUnavailable : ErrorCode::NotAuthorized, HookRefusal::ImportNotGranted};
         if (b.importBadKey) return refuse(HookRefusal::ImportOutOfRange);
         if (b.keyZeroCreate && b.autoIncExhausted) return {ErrorCode::AutoIncrementExhausted, HookRefusal::AutoIncExhausted};
     }
@@ -200,6 +203,8 @@ public:
     template <class LogT>
     [[nodiscard]] rune::storage::HookStaged stage(LogT& log, const uint8_t* batch, std::size_t len) noexcept;
     void onAppended(int64_t base, int64_t last) noexcept;
+    /// #419: adds this batch's records to SpecVersion::producedRecords (onAppended only: a refused batch counts nothing).
+    void countProduced_() noexcept;
     /// The produce failed after stage() took the key-0 batch's ids (its data append was refused or threw): they are burned.
     void onProduceFailed() noexcept {
         if (idsTaken_) {
@@ -238,6 +243,13 @@ private:
     uint32_t             leaseRevokes_ = 0;
     bool                 leaseUntracked_ = false;   // stage() found an update the index cannot track (not ready, or no row): onAppended raises leaseUntrackedThrough
     uint32_t             leaseTouched_ = 0;   // rows stage() recorded in leaseWork->rids; onAppended() writes lastAppended
+    // #419: the accepted records per schema version, for SpecVersion::producedRecords.  The walk keeps one run (the version of the
+    // first versioned record and how many share it); a batch of mixed versions sets mixed_ and onAppended re-walks it (rare).
+    uint16_t             runVersion_ = 0;
+    uint32_t             runCount_   = 0;
+    bool                 mixed_      = false;
+    const uint8_t*       batch_      = nullptr;   // check()'s batch (it outlives the produce call): countProduced_ re-walks it when mixed_
+    std::size_t          batchLen_   = 0;
     int64_t              retryAfterNs_ = 0;
     uint64_t             importMaxN_   = 0;
     uint64_t             assignedBase_ = 0;

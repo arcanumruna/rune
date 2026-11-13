@@ -1003,7 +1003,7 @@ TEST(LeaseCatalogRegression, LeaseOnlyAlterRequestIdRegression) {
         leaseState(s);
         const int64_t at = s.appliedOffset() + 1;
         ASSERT_TRUE(put(s, alter(1, 1)).has_value());
-        const auto rec = s.request(rp::RequestId{7, 1});
+        const auto rec = s.requestOfAnyPrincipal(rp::RequestId{7, 1});
         ASSERT_TRUE(rec.has_value());
         EXPECT_EQ(rec->offset, at);
         EXPECT_EQ(rec->kind, rc::EventKind::AlterTopicConfig);
@@ -1028,6 +1028,6 @@ TEST(LeaseCatalogRegression, LeaseOnlyAlterRequestIdRegression) {
         ASSERT_FALSE(deleting.has_value());
         EXPECT_EQ(deleting.error().code, Code::Precondition);
         EXPECT_TRUE(has(deleting.error().detail, "DELETING")) << deleting.error().detail;
-        EXPECT_FALSE(s.request(rp::RequestId{7, 3}).has_value());
+        EXPECT_FALSE(s.requestOfAnyPrincipal(rp::RequestId{7, 3}).has_value());
     }
 }

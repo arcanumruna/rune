@@ -250,6 +250,10 @@ public:
              ? kOverflowHighWater : static_cast<std::size_t>(kMaxIngressDrainLimit)) * kMaxReturnsPerOp +
         static_cast<std::size_t>(kMaxFragmentLimit) * kMaxReturnsPerOp + kMaxOwedReturnsCeiling;
     static constexpr std::size_t kRetFifoCapacity   = 16384;
+    /// #987: the chunk byte ring behind the return FIFO (power of two): a chunk-carrying answer queued under return-
+    /// ring back-pressure is copied there instead of into an allocated vector.  Full: a chunk-less Throttled refusal.
+    static constexpr std::size_t kRetChunkArenaBytes = std::size_t{8} * 1024 * 1024;
+    static_assert((kRetChunkArenaBytes & (kRetChunkArenaBytes - 1)) == 0, "power of two (O(1) index mask)");
     // D8c fix round 1 (MAJOR-1): the session ack queue (SessionAckSink::
     // kAckCapacity) is split in two STATIC shares.
     //   kAckReserve       — what this worker's own intake may need beyond the
@@ -793,6 +797,9 @@ public:
         return ws != nullptr ? &ws->txn.stats : nullptr;
     }
     [[nodiscard]] int64_t parkedVotesForTest() const noexcept { return parkedVotes_; }
+    /// #995: interim answers sent to pending votes (the judge waits on another transaction), and those held back for want of return room.
+    [[nodiscard]] uint64_t txnVoteInterimsForTest() const noexcept { return txnVoteInterims_; }
+    [[nodiscard]] uint64_t txnVoteInterimsDeferredForTest() const noexcept { return txnVoteInterimsDeferred_; }
     [[nodiscard]] std::size_t voteScansForTest() const noexcept { return voteScans_.size(); }
     void setVerdictAckArenaEntriesForTest(uint32_t entries) { ackSink_->resizeVerdictArenaForTest(entries); }
     [[nodiscard]] const VerdictSourceStats* verdictStatsForTest(int32_t topicId, int32_t partition) const noexcept {
@@ -936,6 +943,19 @@ public:
     [[nodiscard]] uint8_t securityLagForTest() const noexcept { return static_cast<uint8_t>(securityLag_); }
     [[nodiscard]] uint64_t securityLagUnknownForTest() const noexcept { return securityLagUnknown_; }
     [[nodiscard]] uint64_t workerDeniesDeferredForTest() const noexcept { return workerDeniesDeferred_; }
+    /// #500: denials answered NotLeader (an id at or above the applied topic frontier), the worker's copy of the
+    /// frontier, and the frontier ops it ignored.
+    [[nodiscard]] uint64_t workerDeniesUnappliedForTest() const noexcept { return workerDeniesUnapplied_; }
+    [[nodiscard]] int32_t appliedTopicFrontierForTest() const noexcept { return appliedTopicFrontier_; }
+    [[nodiscard]] bool permissionStagingForTest() const noexcept { return permStager_.staging(); }
+    /// #216 probes: produces answered AuthenticationFailed / PasswordChangeRequired; Unauthenticated signals sent.
+    [[nodiscard]] uint64_t workerUnauthenticatedForTest() const noexcept { return workerUnauthenticated_; }
+    [[nodiscard]] uint64_t unauthSignalsForTest() const noexcept { return unauthSignals_; }
+    [[nodiscard]] uint64_t workerPasswordChangeRefusalsForTest() const noexcept {
+        return workerPasswordChangeRefusals_;
+    }
+    [[nodiscard]] uint64_t permissionResetsForTest() const noexcept { return permissionResets_; }
+    [[nodiscard]] uint64_t topicFrontierRejectedForTest() const noexcept { return topicFrontierRejected_; }
     [[nodiscard]] uint64_t securityBehindOpsSeenForTest() const noexcept { return securityBehindOpsSeen_; }
     [[nodiscard]] uint64_t securityBehindRefusalsForTest() const noexcept { return securityBehindRefusals_; }
     /// Test-only (auth Task 18): the shipped permission epoch this worker holds for `sid` (0 = no slot / not enforcing).
@@ -1397,6 +1417,7 @@ public:
             break;
         case WorkerOp::Type::ApplyReplicated:
         case WorkerOp::Type::ReconcileFetchResp:
+        case WorkerOp::Type::RepairFetchResp:
             tailKind = sbe::TailKind::Value::REPLICATED_RECORDS;
             tailSrc  = op.replicatedPayload.records.data();
             tailLen  = op.replicatedPayload.records.size();
@@ -1582,6 +1603,8 @@ public:
            .deferAck(static_cast<std::uint8_t>((op.deferAck ? kOpFlagDeferAck : 0u) |
                                                (op.crcValidated ? kOpFlagCrcValidated : 0u) |
                                                (op.importGranted ? kOpFlagImportGranted : 0u) |
+                                               (op.type == WorkerOp::Type::Produce && op.importDeferred
+                                                    ? kOpFlagImportDeferred : 0u) |
                                                (op.freshCursor ? kOpFlagFreshCursor : 0u) |
                                                (op.type == WorkerOp::Type::PushRead && op.fromEarliest
                                                     ? kOpFlagPushReadFromEarliest : 0u) |
@@ -1843,6 +1866,14 @@ public:
     // (retFifoHighWaterPauses, watched by the DR matrix), TxnReturn emission
     // (S6 emits them; tests drive it directly) and the ingress poll budget.
     [[nodiscard]] std::size_t retFifoSizeForTest() const noexcept { return retFifo_.size(); }
+    /// #987 seams: the chunk byte ring's fill, a smaller ring (only while no return is queued), and the answers refused
+    /// Throttled / queued in an owned vector because the ring was full.
+    [[nodiscard]] std::size_t retChunkArenaUsedForTest() const noexcept { return retFifo_.chunkArenaUsed(); }
+    void setRetChunkArenaBytesForTest(std::size_t bytes) { retFifo_.resetChunkArenaForTest(bytes); }
+    [[nodiscard]] uint64_t retChunkArenaRefusalsForTest() const noexcept { return retChunkArenaRefusals_; }
+    [[nodiscard]] uint64_t retChunkArenaVectorFallbacksForTest() const noexcept {
+        return retChunkArenaVectorFallbacks_;
+    }
     [[nodiscard]] uint64_t    retFifoHighWaterPausesForTest() const noexcept { return retFifoHighWaterPauses_; }
     void enqueueTxnReturnForTest(const TxnReturn& r) { enqueueTxnReturn_(r); }
     [[nodiscard]] int64_t ingressPollBudgetForTest() const noexcept { return ingressPollBudget_(); }
@@ -1927,6 +1958,18 @@ public:
     }
     [[nodiscard]] uint64_t typedRejectsForTest() const noexcept { return typedRejects_; }
     [[nodiscard]] uint64_t typedVersionAheadForTest() const noexcept { return typedVersionAhead_; }
+    /// #419: batches refused SchemaVersionRetired (a record's version below the topic's retire floor).
+    [[nodiscard]] uint64_t typedVersionRetiredForTest() const noexcept { return typedVersionRetired_; }
+    /// #419: write specs that named a retire floor below the one a topic holds (ignored: the floor only moves forward).
+    [[nodiscard]] uint32_t lowerFloorsIgnoredForTest(int32_t topicId) const noexcept {
+        const auto it = writeSpecs_.find(topicId);
+        return it == writeSpecs_.end() ? 0u : it->second->lowerFloorsIgnored();
+    }
+    /// #419: the topic's write spec as this worker holds it (nullptr: none).
+    [[nodiscard]] const TopicWriteSpec* writeSpecForTest(int32_t topicId) const noexcept {
+        const auto it = writeSpecs_.find(topicId);
+        return it == writeSpecs_.end() ? nullptr : it->second.get();
+    }
     [[nodiscard]] uint64_t hookChecksForTest() const noexcept { return hookChecks_; }
     [[nodiscard]] uint64_t hookRefusalsForTest(HookRefusal why) const noexcept { return hookRefusals_[std::to_underlying(why)]; }
     /// The facts of the last write that reached the write hook.
@@ -2085,7 +2128,9 @@ public:
                 if (!replica) continue;
                 const ReplReadScope rs(*replica, replScratch_);
                 work += replica->doWork(nowNs);
+                if (replica->repairEventsPending()) [[unlikely]] noteRepairEvents_(*replica);   // #880
             }
+            if (repairDirty_) [[unlikely]] work += flushRepairSignals_();
             work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
             if (viewSet_ != nullptr) [[unlikely]] {
                 work += viewSet_->drainInstalls();   // Task 19: install runtime-created view plans (own thread)
@@ -2221,7 +2266,9 @@ private:
                 if (!replica) continue;
                 const ReplReadScope rs(*replica, replScratch_);
                 work += replica->doWork(nowNs);
+                if (replica->repairEventsPending()) [[unlikely]] noteRepairEvents_(*replica);   // #880
             }
+            if (repairDirty_) [[unlikely]] work += flushRepairSignals_();
             work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
         }
         if (viewSet_ != nullptr) [[unlikely]] {
@@ -2351,6 +2398,11 @@ private:
     // or a full FIFO (beyond its static bound) is an invariant-violation halt
     // (exit 70) — never a drop, never a retry loop.
     //
+    // #987: a chunk-carrying answer (view row / scan page, stats, lease keepalive / time-to-live / scan) queued under
+    // back-pressure keeps its bytes in the FIFO's preallocated chunk ring (kRetChunkArenaBytes) - enqueueReturnRuns_
+    // - so it allocates nothing.  A full chunk ring answers a chunk-less Throttled (view row, view scan, lease scan)
+    // or, for a type that cannot say it (stats, lease keepalive, lease time-to-live), falls back to an owned vector.
+    //
     // Bypass (L2): enqueueSignal_ for StorageFailure / OwnershipAck / EgressReleased only.
     // Worker-thread only (the producer side of ret_).
     // -----------------------------------------------------------------------
@@ -2456,6 +2508,23 @@ private:
             ret_.abort(idx);
             haltInvariant_("WorkerReturn encode threw", "non-std exception", ret.chunk.size());
         }
+        ret_.commit(idx);
+        return true;
+    }
+    /// #987: tryWriteReturn_ for a return whose chunk is one run of bytes held elsewhere (the return FIFO's chunk
+    /// ring).
+    [[nodiscard]] bool tryWriteReturnGather_(const WorkerReturn& ret, const ChunkRun& run) {
+        aeron::util::index_t idx = -1;
+        const std::size_t n = workerReturnEncodedLength(static_cast<std::size_t>(run.len));
+        try {
+            idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n);
+        } catch (const std::exception& ex) {
+            haltInvariant_("return-ring tryClaim threw (queued chunk)", ex.what(), run.len);
+        } catch (...) {
+            haltInvariant_("return-ring tryClaim threw (queued chunk)", "non-std exception", run.len);
+        }
+        if (idx < 0) return false;
+        encodeWorkerReturnGather(reinterpret_cast<char*>(ret_.base() + idx), n, ret, &run, 1, run.len);
         ret_.commit(idx);
         return true;
     }
@@ -2909,6 +2978,12 @@ private:
         case WorkerOp::Type::ReconcileFetchReq:
             executeReconcileFetchReqWire_(op);
             break;
+        case WorkerOp::Type::RepairFetchReq:
+            executeRepairFetchReqWire_(op);
+            break;
+        case WorkerOp::Type::RepairFetchResp:
+            executeRepairFetchRespWire_(op);
+            break;
         // MEDIUM-2: the controller's AlterIsr answer (cold).
         case WorkerOp::Type::AlterIsrResponse:
             if (auto* rep = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
@@ -3128,6 +3203,25 @@ private:
             return;
         }
         if ((op.isolation() & kPermFlagSecurityBehind) != 0) [[unlikely]] {   // issue #603: in every worker mode
+            if (op.topicId() == kPermLagReset) [[unlikely]] {   // #442: this worker skipped items; resync follows
+                if (ackSink_) ackSink_->resetPermissions();   // every table dropped, every session denied
+                permStager_.discard();                        // a half-staged table never survives
+                securityLag_ = SecurityLag::RefuseAll;        // retriable AuthUnavailable until the snapshot's level
+                ++permissionResets_;                          // (the applied topic frontier is kept: it only grows)
+                return;
+            }
+            if (op.topicId() == kPermLagTopicFrontier) [[unlikely]] {   // #500: the applied topic frontier
+                const auto frontier = op.nextOffset();
+                if (frontier < 0 || frontier > static_cast<int64_t>(INT32_MAX)) {
+                    ++topicFrontierRejected_;   // out of range: ignored (the frontier only ever grows)
+                } else if (appliedTopicFrontier_ != INT32_MAX &&
+                           frontier < static_cast<int64_t>(appliedTopicFrontier_)) {
+                    ++topicFrontierRejected_;   // monotonic: a lower value never moves it back
+                } else {
+                    appliedTopicFrontier_ = static_cast<int32_t>(frontier);
+                }
+                return;
+            }
             const auto level = op.nextOffset();
             if (level > static_cast<int64_t>(kSecurityLagDeferDenials) || level < 0) [[unlikely]] {
                 securityLag_ = SecurityLag::RefuseAll;   // an unknown level fails closed
@@ -4312,6 +4406,31 @@ private:
     /// past the damage) and ONE ErrorResponse{StorageError, correlationId 0} is owed - sent now, else retried every pass
     /// by the owed-error block until it is.
     /// #882: count the failed read and report the cumulative count to the gateway (SessionSignal DamagedRead).
+    /// #880 (cold): fold an owned replica's segment-repair counter movement into this worker's counts.
+    [[gnu::cold]] [[gnu::noinline]] void noteRepairEvents_(rune::replication::PartitionReplica& r) {
+        const auto d = r.takeRepairEvents();
+        repairCounts_[0] += d.completed;
+        repairCounts_[1] += d.failed;
+        repairCounts_[2] += d.noPeer;
+        repairDirty_ = true;
+    }
+    /// #880 (cold): report each changed count to the gateway (SessionSignal SegmentRepair); a full return ring keeps the
+    /// worker dirty and the next pass retries.
+    [[gnu::cold]] [[gnu::noinline]] int flushRepairSignals_() {
+        int sent = 0;
+        bool pending = false;
+        for (int i = 0; i < 3; ++i) {
+            if (repairCounts_[i] == repairSignaled_[i]) continue;
+            if (trySessionSignal_(i, SessionSignalKind::SegmentRepair, static_cast<int64_t>(repairCounts_[i]))) {
+                repairSignaled_[i] = repairCounts_[i];
+                ++sent;
+            } else {
+                pending = true;
+            }
+        }
+        repairDirty_ = pending;
+        return sent;
+    }
     [[gnu::cold]] [[gnu::noinline]] void noteDamagedRead_() {
         ++damagedReads_;
         (void)trySessionSignal_(0, SessionSignalKind::DamagedRead, static_cast<int64_t>(damagedReads_));
@@ -4663,6 +4782,7 @@ private:
                                                 (((op.deferAck() & kOpFlagDeferAck) != 0 && rep != nullptr) ? rune::protocol::client::kAcksWireAll : 0));
         f.crcValidated   = (op.deferAck() & kOpFlagCrcValidated) != 0;
         f.importGranted  = (op.deferAck() & kOpFlagImportGranted) != 0;
+        f.importDeferred = (op.deferAck() & kOpFlagImportDeferred) != 0;   // Produce op: bit 0x10 is not keyPending here
         f.durabilityTier = op.durabilityTier();
         f.enqueuedAtNs   = op.enqueuedAtNs();
         f.fromOp         = true;
@@ -4939,7 +5059,7 @@ private:
             std::memcpy(head.data() + 4 + tokenLen, &page.bytes, 4);
             const uint32_t headLen = 8 + tokenLen;
             const ChunkRun runs[2] = {{head.data(), headLen}, {scanScratch_.data(), page.bytes}};
-            enqueueViewResult_(ret, runs, 2, headLen + page.bytes);
+            enqueueReturnRuns_(ret, runs, 2, headLen + page.bytes);
             return ViewServe::Answered;
         }
         const rune::view::RowLayout*  layout = nullptr;
@@ -4951,7 +5071,7 @@ private:
             ret.errorCode   = static_cast<int16_t>(RS::kOk);
             ret.recordCount = static_cast<int32_t>(layout->rowLen);
             const ChunkRun run{row, layout->rowLen};
-            enqueueViewResult_(ret, &run, 1, layout->rowLen);   // zero-copy gather (hot path)
+            enqueueReturnRuns_(ret, &run, 1, layout->rowLen);   // zero-copy gather (hot path)
             return ViewServe::Answered;
         } else if (rs == WorkerViewSet::RowStatus::NotReady) {
             ret.errorCode = static_cast<int16_t>(RS::kNotReady);
@@ -5037,7 +5157,7 @@ private:
         ret.errorCode   = static_cast<int16_t>(RS::kOk);
         ret.recordCount = static_cast<int32_t>(lk.ref.layout->rowLen);
         const ChunkRun run{row, lk.ref.layout->rowLen};
-        enqueueViewResult_(ret, &run, 1, lk.ref.layout->rowLen);
+        enqueueReturnRuns_(ret, &run, 1, lk.ref.layout->rowLen);
         return ViewServe::Answered;
     }
 
@@ -5088,7 +5208,7 @@ private:
         const auto constraints = sink.constraintBytes();
         const ChunkRun runs[3] = {{stats.data(), static_cast<uint32_t>(stats.size())}, {constraintCount.data(), 2},
                                   {constraints.data(), static_cast<uint32_t>(constraints.size())}};
-        enqueueViewResult_(ret, runs, 3, static_cast<uint32_t>(stats.size() + 2 + constraints.size()));
+        enqueueReturnRuns_(ret, runs, 3, static_cast<uint32_t>(stats.size() + 2 + constraints.size()));
     }
 
     // Issue #82 (VLS A.5.5): per pass, after the view folds: serve the held reads whose fold reached their target;
@@ -5120,7 +5240,7 @@ private:
     // back-pressure fallback (a return already queued, or the ring momentarily
     // full) copies into the owned chunk and queues it — never dropped, never
     // reordered; the common case never allocates.
-    void enqueueViewResult_(WorkerReturn& ret, const ChunkRun* runs, std::size_t nRuns, uint32_t total) {
+    void enqueueReturnRuns_(WorkerReturn& ret, const ChunkRun* runs, std::size_t nRuns, uint32_t total) {
         if (retFifo_.empty()) [[likely]] {
             const std::size_t n = workerReturnEncodedLength(static_cast<std::size_t>(total));
             aeron::util::index_t idx = -1;
@@ -5137,10 +5257,50 @@ private:
                 return;
             }
         }
-        ret.chunk.clear();   // back-pressure fallback (rare): copy + queue
-        for (std::size_t i = 0; i < nRuns; ++i) ret.chunk.insert(ret.chunk.end(), runs[i].data, runs[i].data + runs[i].len);
-        enqueueReturn_(std::move(ret));
+        // Back-pressure (a return already queued, or the ring momentarily full): queue the answer with its bytes in the
+        // preallocated chunk ring - no allocation (#987).  A chunk the return ring could never hold is the same
+        // invariant halt as a claim of it would be.
+        if (workerReturnEncodedLength(static_cast<std::size_t>(total)) > static_cast<std::size_t>(ret_.maxMsgLength()))
+            [[unlikely]] haltInvariant_("queued answer larger than the return ring's max message", "chunk too large",
+                                        total);
+        ret.chunk.clear();
+        switch (retFifo_.pushWithChunk(std::move(ret), runs, nRuns, total)) {
+        case ChunkPush::Ok: return;
+        case ChunkPush::SlotsFull: haltRetFifoFull_();
+        case ChunkPush::ChunkFull: break;
+        }
+        queueChunkFullAnswer_(ret, runs, nRuns, total);   // `ret` is intact: pushWithChunk moves only on Ok
     }
+
+    // #987: the chunk ring is full.  A return type that can say "refused, retry" answers a chunk-less Throttled (the
+    // gateway forwards the status; the client retries a Throttled view read / lease scan with backoff); a type that
+    // cannot (the gateway turns an empty StatsResult into InvalidRequest and an empty LeaseKeepAlive /
+    // LeaseTimeToLive result into Internal) keeps an owned vector chunk - an allocation, only once the 8 MiB ring is
+    // exhausted.
+    [[gnu::cold]] [[gnu::noinline]] void queueChunkFullAnswer_(WorkerReturn& ret, const ChunkRun* runs,
+                                                               std::size_t nRuns, uint32_t /*total*/) {
+        using WT = WorkerReturn::Type;
+        if (ret.type == WT::ViewRowResult || ret.type == WT::ViewScanResult || ret.type == WT::ScanLeasesResult) {
+            ++retChunkArenaRefusals_;
+            if (retChunkArenaRefusals_ % 1024 == 1)
+                spdlog::warn("Worker {}: return chunk ring full ({} B): answer type {} refused Throttled (total {})",
+                             workerId_, retFifo_.chunkArenaCapacity(), static_cast<int>(ret.type),
+                             retChunkArenaRefusals_);
+            ret.chunk.clear();
+            ret.errorCode   = static_cast<int16_t>(rune::protocol::client::ErrorCode::Throttled);
+            ret.recordCount = 0;
+            ret.lastOffset  = 0;   // retry-after 0: the client's own backoff applies
+            ret.isolation   = 0;
+            if (!retFifo_.push(std::move(ret))) [[unlikely]] haltRetFifoFull_();
+            return;
+        }
+        ++retChunkArenaVectorFallbacks_;
+        ret.chunk.clear();
+        for (std::size_t i = 0; i < nRuns; ++i) ret.chunk.insert(ret.chunk.end(), runs[i].data, runs[i].data + runs[i].len);
+        if (!retFifo_.push(std::move(ret))) [[unlikely]] haltRetFifoFull_();
+    }
+    uint64_t retChunkArenaRefusals_        = 0;   ///< #987: answers refused Throttled because the chunk ring was full
+    uint64_t retChunkArenaVectorFallbacks_ = 0;   ///< #987: answers of types that cannot say Throttled, in a vector
 
     // executePushReadWire_ — read a chunk from the log for a push subscription.
     //
@@ -5972,6 +6132,57 @@ private:
     }
 
     // -------------------------------------------------------------------
+    // #880: a peer serves a segment-repair pull / the repairing replica applies a peer's answer, on the OWNING worker
+    // (the replica's log is worker-owned).  Fire-and-forget; the asker's timeout covers a drop.
+    // -------------------------------------------------------------------
+    void executeRepairFetchReqWire_(sbe::WorkerOp& op) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        if (!replica) return;
+        ++followerSideOps_;
+        rune::replication::FetchRequestMsg req;
+        req.leaderEpoch          = static_cast<rune::replication::Epoch>(op.frLeaderEpoch());
+        req.partition            = static_cast<rune::replication::PartitionId>(op.partition());
+        req.followerId           = static_cast<rune::replication::NodeId>(op.frFollowerId());
+        req.fetchOffset          = static_cast<rune::replication::Offset>(op.frFetchOffset());
+        req.maxBytes             = op.frMaxBytes();
+        req.topicId              = op.topicId();
+        req.incarnation          = op.frIncarnation();
+        req.lastEpochStartOffset = op.hwBound();
+        try {
+            replica->onRepairRequest(req);
+        } catch (const std::exception& ex) {
+            spdlog::warn("Worker {}: onRepairRequest threw: {}", workerId_, ex.what());
+        } catch (...) {
+            spdlog::warn("Worker {}: onRepairRequest threw unknown exception", workerId_);
+        }
+    }
+
+    void executeRepairFetchRespWire_(sbe::WorkerOp& op) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        if (!replica) return;
+        ++followerSideOps_;
+        const uint32_t tailLen = op.tailLength();
+        const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
+        rune::replication::FetchResponseMsg msg;
+        msg.leaderEpoch    = op.replLeaderEpoch();
+        msg.partition      = op.replPartition();
+        msg.highWatermark  = op.replHighWatermark();
+        msg.logStartOffset = op.replLogStartOffset();
+        msg.errorCode      = op.replErrorCode();
+        msg.topicId        = op.replTopicId();
+        msg.fromOffset     = op.nextOffset();
+        msg.records = std::span<const uint8_t>(tail ? tail : static_cast<const uint8_t*>(nullptr),
+                                               static_cast<std::size_t>(tailLen));
+        try {
+            replica->applyRepairResponse(msg);
+        } catch (const std::exception& ex) {
+            spdlog::warn("Worker {}: applyRepairResponse threw: {}", workerId_, ex.what());
+        } catch (...) {
+            spdlog::warn("Worker {}: applyRepairResponse threw unknown exception", workerId_);
+        }
+    }
+
+    // -------------------------------------------------------------------
     // Task #13: executeAppendControlRecordWire_ — append a txn COMMIT/ABORT
     // control marker to the worker-owned user partition log (the worker is the
     // sole appender: no race).
@@ -6369,6 +6580,35 @@ private:
                              workerId_, ex.what());
             } catch (...) {
                 spdlog::warn("Worker {}: pollReplTransport ReconcileFetchResp applyReconcileResponse threw unknown",
+                             workerId_);
+            }
+            break;
+        }
+
+        // TemplateId 17 / 18 (#880): a segment-repair pull and its answer (FetchRequest / FetchResponse layouts).  The
+        // request reads the worker-owned log: scratch scope as for a fetch serve.
+        case rr::kRepairFetchReqTemplateId: {
+            const rr::FetchRequestMsg req = rr::FetchRequestMsg::decode(frame, 0, len);
+            const ReplReadScope rs(*replica, replScratch_);
+            try {
+                replica->onRepairRequest(req);
+            } catch (const std::exception& ex) {
+                spdlog::warn("Worker {}: pollReplTransport RepairFetchReq onRepairRequest threw: {}",
+                             workerId_, ex.what());
+            } catch (...) {
+                spdlog::warn("Worker {}: pollReplTransport RepairFetchReq onRepairRequest threw unknown", workerId_);
+            }
+            break;
+        }
+        case rr::kRepairFetchRespTemplateId: {
+            const rr::FetchResponseMsg msg = rr::FetchResponseMsg::decode(frame, 0, len);
+            try {
+                replica->applyRepairResponse(msg);
+            } catch (const std::exception& ex) {
+                spdlog::warn("Worker {}: pollReplTransport RepairFetchResp applyRepairResponse threw: {}",
+                             workerId_, ex.what());
+            } catch (...) {
+                spdlog::warn("Worker {}: pollReplTransport RepairFetchResp applyRepairResponse threw unknown",
                              workerId_);
             }
             break;
@@ -6862,6 +7102,9 @@ private:
     uint64_t                              pushReadErrors_ = 0;   ///< D26: push-read pread failures (answered empty)
     uint64_t                              corruptReads_ = 0;     ///< #839: reads that reached a damaged segment
     uint64_t                              damagedReads_ = 0;     ///< #882: reads failed at damage (SessionSignal)
+    uint64_t                              repairCounts_[3] = {};     ///< #880: cumulative completed / failed / no-peer
+    uint64_t                              repairSignaled_[3] = {};   ///< #880: the values the gateway last accepted
+    bool                                  repairDirty_ = false;      ///< #880: a count is not yet reported
     /// D26: replication read scratch — a fetch serve / owed re-serve / push of
     /// an owned replica preads into it (PartitionReplica::setReadScratch), never
     /// faulting through the segment read map.  maxFetchBytes (1 MiB) + the
@@ -6943,6 +7186,7 @@ private:
     static constexpr std::size_t kMaxVoteScans = 256;
     std::vector<VoteScan> voteScans_;
     int64_t parkedVotes_ = 0;
+    uint64_t txnVoteInterims_ = 0, txnVoteInterimsDeferred_ = 0;   // #995
     std::array<uint8_t, rune::storage::control_record::kTxnJudgeBatchBytes> txnJudgeScratch_{};
     int32_t txnJudgedRecordsMax_ = 4096;
     int64_t  verdictIntervalNs_ = 100'000'000;
@@ -6953,7 +7197,7 @@ private:
     // TxnReturn), O(1) push / pop-front.  While it is non-empty: new ingress
     // polling is gated (G-A6) and the op drain pauses at kOverflowHighWater.
     // Worker-thread only.
-    ReturnFifo<kRetFifoCapacity> retFifo_;
+    ReturnFifo<kRetFifoCapacity> retFifo_{kRetChunkArenaBytes};
     // Passes whose op drain was paused at the high-water mark (DR matrix
     // watches it for ISR-lag interaction in Legacy mode).
     uint64_t retFifoHighWaterPauses_ = 0;
@@ -7028,6 +7272,7 @@ private:
     std::unordered_map<int32_t, std::unique_ptr<TopicWriteSpec>> writeSpecs_;
     uint64_t typedRejects_      = 0;   // batches refused SchemaValidationFailed by checkTypedBatch
     uint64_t typedVersionAhead_ = 0;   // batches answered NotLeader: a record's version has not been installed here yet
+    uint64_t typedVersionRetired_ = 0; // batches answered SchemaVersionRetired: a record's version is below the topic's retire floor (#419)
     uint64_t hookChecks_        = 0;   // CheckedWriteHook::check ran
     WriteFacts lastWriteFacts_{};
     std::unique_ptr<LeaseHookWork> leaseHookWork_;   // lease topics: the produce hook's work area (allocated once, cold)
@@ -7567,6 +7812,8 @@ private:
         case WorkerOp::Type::ReconcileFetchResp:
         case WorkerOp::Type::OffsetsForLeaderEpochResp:
         case WorkerOp::Type::ReconcileFetchReq:
+        case WorkerOp::Type::RepairFetchReq:    // #880
+        case WorkerOp::Type::RepairFetchResp:   // #880
         case WorkerOp::Type::AlterIsrResponse:
         case WorkerOp::Type::AppendControlRecord:
         case WorkerOp::Type::TxnVerifyResult:   // #112: a stale answer is dropped (the client's retry re-verifies)
@@ -8149,7 +8396,7 @@ private:
         ret.recordCount   = count;
         ret.lastOffset    = final ? 1 : 0;
         const ChunkRun run{entries, static_cast<uint32_t>(count) * 12u};
-        enqueueViewResult_(ret, &run, 1, run.len);
+        enqueueReturnRuns_(ret, &run, 1, run.len);
     }
     static void putKaEntry_(uint8_t* p, uint16_t index, uint16_t code, uint64_t ttlMs) noexcept {
         p[0] = static_cast<uint8_t>(index);        p[1] = static_cast<uint8_t>(index >> 8);
@@ -8346,7 +8593,7 @@ private:
             }
         }
         const ChunkRun run{body, 16};
-        enqueueViewResult_(ret, &run, 1, 16);
+        enqueueReturnRuns_(ret, &run, 1, 16);
     }
     // Lease topics Task 13b (spec 8.3): a ScanLeases op - one page of the lease rows in ascending order of the scan hash (lease/LeaseHash.h).
     // topicId = the SOURCE topic; nextOffset = resumeHash, recordCount = maxRows, isolation = first, leaseTail = the key prefix.
@@ -8486,7 +8733,7 @@ private:
         ret.recordCount = static_cast<int32_t>(rows);
         ret.isolation   = (!cut && candidates == hn) ? 1 : 0;   // done: no candidate beyond the page
         const ChunkRun run{sc.page.data(), static_cast<uint32_t>(pos)};
-        enqueueViewResult_(ret, &run, 1, static_cast<uint32_t>(pos));
+        enqueueReturnRuns_(ret, &run, 1, static_cast<uint32_t>(pos));
     }
     static constexpr std::size_t kLeaseEmitReserveBytes = 1u << 20;
 
@@ -8850,6 +9097,8 @@ private:
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             const uint32_t n = op.tailLength();
             const auto* t = reinterpret_cast<const uint8_t*>(op.tail());
+            // #987: not a per-client-request answer (a transaction marker bounced back to the coordinator, only after a
+            // leadership change): it keeps the owned vector chunk.
             if (t && n) ret.chunk.assign(t, t + n);
             enqueueReturn_(ret);
             return;
@@ -9102,8 +9351,38 @@ private:
                 if (t == nullptr) answerVote_(ws, v, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), {}, -1, nowNs, true);
                 else answerVote_(ws, v, 0, t->answer, t->judgeOffset, nowNs, true);
             });
+            if (ws.txn.parkedCount() != 0) work += sendVoteInterims_(ws);
         }
         return work;
+    }
+    /// #995: the votes still parked wait behind a judge paused on another transaction: each is told once per holder (an interim,
+    /// errorCode kTxnVoteWaiting, baseOffset = the holder's producer id, newNextOffset = its epoch), so the coordinator can see a
+    /// cycle of such waits.  The interim is no answer: the vote stays parked.  Never when the return FIFO is past its high water:
+    /// it is asked again on the next pass (the holder is not recorded), counted.  No holder (the pool is full, a capacity stall):
+    /// nothing is sent, and the wait is bounded by the transaction timeout.
+    int sendVoteInterims_(PartitionWriteState& ws) {
+        if (ws.verdicts == nullptr) return 0;
+        return ws.txn.noteJudgeWait(ws.verdicts->pauseHolderPid(), ws.verdicts->pauseHolderEpoch(), [&](const ParkedVote& v) {
+            if (retFifo_.size() >= kOverflowHighWater) {
+                ++txnVoteInterimsDeferred_;
+                return false;
+            }
+            WorkerReturn ret;
+            ret.type          = WorkerReturn::Type::TxnVoteResult;
+            ret.correlationId = v.token;
+            ret.sessionId     = v.originNode;
+            ret.topicId       = ws.spec->topicId;
+            ret.partition     = ws.partition;
+            ret.producerId    = v.producerId;
+            ret.producerEpoch = v.epoch;
+            ret.errorCode     = rune::replication::kTxnVoteWaiting;
+            ret.baseOffset    = ws.verdicts->pauseHolderPid();
+            ret.newNextOffset = static_cast<int64_t>(static_cast<uint16_t>(ws.verdicts->pauseHolderEpoch()));
+            ret.lastOffset    = -1;
+            enqueueReturn_(std::move(ret));
+            ++txnVoteInterims_;
+            return true;
+        });
     }
     /// Demotion, or the state is about to go: every parked vote is answered NotLeader (retriable) and its scan dropped.
     void dropVotes_(PartitionWriteState& ws) {
@@ -9897,7 +10176,7 @@ private:
         sig.errorCode = static_cast<int16_t>(err);
         sig.topicId   = topicId;
         sig.partition = partition;
-        sig.chunk.assign(dir.begin(), dir.end());
+        sig.chunk.assign(dir.begin(), dir.end());   // #987: a once-per-process fail-stop signal, not an answer
         ++storageFailureSignals_;
         enqueueSignal_(sig);
     }
@@ -9970,8 +10249,15 @@ private:
         int flushed = 0;
         while (!retFifo_.empty()) {
             ReturnFifoEntry& e = retFifo_.front();
-            const bool ok = e.tag == ReturnFifoEntry::Tag::Txn ? tryWriteTxnReturn_(e.txn)
-                                                               : tryWriteReturn_(e.worker);
+            bool ok;
+            if (e.tag == ReturnFifoEntry::Tag::Txn) {
+                ok = tryWriteTxnReturn_(e.txn);
+            } else if (e.arenaChunk) [[unlikely]] {   // #987: the chunk is in the byte ring: gather it from there
+                const std::span<const uint8_t> bytes = retFifo_.chunkOf(e);
+                ok = tryWriteReturnGather_(e.worker, ChunkRun{bytes.data(), static_cast<uint32_t>(bytes.size())});
+            } else {
+                ok = tryWriteReturn_(e.worker);
+            }
             if (!ok) break;   // ring still full — stop; retry next cycle
             retFifo_.popFront();
             ++flushed;
@@ -10842,6 +11128,47 @@ private:
         return 1;
     }
 
+    /// #216: a direct-ingress produce of a session that never authenticated: ProduceResponse{AuthenticationFailed}
+    /// (consumed, never appended) and, once per state, the Unauthenticated signal - the gateway ends the session as it
+    /// does for the same request on its own path (D13).
+    [[gnu::cold]] [[gnu::noinline]] int refuseUnauthenticated_(const rune::protocol::client::Produce& msg,
+                                                               uint8_t directAck) {
+        if (workerUnauthenticated_++ % 1024 == 0)
+            spdlog::warn("Worker {}: WorkerIngress: produce refused AuthenticationFailed - the session never "
+                         "authenticated (session={}, topic={}); total {}", workerId_, msg.sessionId, msg.topicId,
+                         workerUnauthenticated_);
+        WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, msg.sessionId, msg.correlationId,
+                                          msg.topicId, msg.partition);
+        ret.directAck = directAck;
+        ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed);
+        enqueueReturn_(ret);
+        if (ackSink_ && ackSink_->markUnauthSignalled(msg.sessionId)) {
+            WorkerReturn sig;
+            sig.type       = WorkerReturn::Type::SessionSignal;
+            sig.sessionId  = msg.sessionId;
+            sig.partition  = workerId_;
+            sig.lastOffset = static_cast<int64_t>(SessionSignalKind::Unauthenticated);
+            ++unauthSignals_;
+            enqueueSignal_(sig);
+        }
+        return 1;
+    }
+    /// #216: a direct-ingress produce of a session that must change its password:
+    /// ProduceResponse{PasswordChangeRequired} (consumed, never appended); the session stays.
+    [[gnu::cold]] [[gnu::noinline]] int refusePasswordChange_(const rune::protocol::client::Produce& msg,
+                                                              uint8_t directAck) {
+        ++workerPasswordChangeRefusals_;
+        WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, msg.sessionId, msg.correlationId,
+                                          msg.topicId, msg.partition);
+        ret.directAck = directAck;
+        ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::PasswordChangeRequired);
+        enqueueReturn_(ret);
+        return 1;
+    }
+    uint64_t workerUnauthenticated_        = 0;   ///< #216: produces answered AuthenticationFailed
+    uint64_t unauthSignals_                = 0;   ///< #216: Unauthenticated signals sent (one per session state)
+    uint64_t workerPasswordChangeRefusals_ = 0;   ///< #216: produces answered PasswordChangeRequired
+
     /// Namespaces Phase 2 (D21): the session's namespace is suspended ReadOnly (the gateway bound it to
     /// suspendedWriteTable()): ProduceResponse{NamespaceSuspended} - InvalidRequest for a client older than 14, as the
     /// gateway path answers - consumed, never appended.
@@ -10871,6 +11198,27 @@ private:
         enqueueReturn_(ret);
         return 1;
     }
+    /// #500: answer a direct-ingress produce the session may not WRITE, for a topic id at or above the applied topic
+    /// frontier: the id is not applied on this broker yet (its bitmap bit cannot exist), so the answer is the retriable
+    /// ProduceResponse{NotLeader} (consumed, never appended), counted, logged rate-limited.
+    [[gnu::cold]] [[gnu::noinline]] int refuseUnapplied_(const rune::protocol::client::Produce& msg,
+                                                         uint8_t directAck) {
+        if (workerDeniesUnapplied_++ % 1024 == 0)
+            spdlog::warn("Worker {}: WorkerIngress: produce refused NotLeader - the topic is not applied here yet "
+                         "(session={}, topic={}, frontier={}); total {}", workerId_, msg.sessionId, msg.topicId,
+                         appliedTopicFrontier_, workerDeniesUnapplied_);
+        WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, msg.sessionId, msg.correlationId,
+                                          msg.topicId, msg.partition);
+        ret.directAck = directAck;
+        ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+        enqueueReturn_(ret);
+        return 1;
+    }
+    /// #500: worker-owned copy of the gateway's applied topic frontier (kPermLagTopicFrontier); INT32_MAX = none.
+    int32_t  appliedTopicFrontier_   = INT32_MAX;
+    uint64_t workerDeniesUnapplied_  = 0;   ///< #500: denials answered NotLeader (id at or above the frontier)
+    uint64_t permissionResets_       = 0;   ///< #442: kPermLagReset ops executed
+    uint64_t topicFrontierRejected_  = 0;   ///< #500: frontier ops ignored (out of range, or below the current value)
     /// #603 / #506: worker-owned copy of the control thread's lag level (kSecurityLag*).
     enum class SecurityLag : uint8_t { Current = 0, RefuseAll = 1, DeferDenials = 2 };
     SecurityLag securityLag_             = SecurityLag::Current;
@@ -11022,6 +11370,7 @@ private:
         // nothing.  A session this worker has no slot for is denied (fail closed), and an Enforcing worker with no
         // sink attached (M4, X012) refuses every frame: it has no grants to consult.
         bool importGranted = true;   // NotEnforcing: nothing is checked
+        bool importDeferred = false; // #506: no IMPORT while the view is behind: not a verdict
         if (const auto* enf = std::get_if<Enforcing>(&enforcement_)) {
             if (enf->sink == nullptr) [[unlikely]] {
                 if (openSeq != 0) commitProduceSeq(openCtx, openSeq);   // consumed (answered)
@@ -11047,12 +11396,22 @@ private:
                 }
                 if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
                 if (grants != nullptr && grants->table == suspendedWriteTable()) return refuseSuspended_(msg, directAck);
+                // #500: an id at or above the applied topic frontier is not applied here yet, so no bitmap can cover
+                // it: retriable NotLeader (the gateway answers the same for every session), never the terminal 45.
+                if (msg.topicId >= appliedTopicFrontier_) [[unlikely]] return refuseUnapplied_(msg, directAck);
                 // Issue #506: the view holds events it has not applied - one may be the grant this frame relies on, so
                 // the denial is not a verdict: retriable AuthUnavailable.  Allowed frames were served above.
                 if (securityLag_ == SecurityLag::DeferDenials) [[unlikely]] {
                     ++workerDeniesDeferred_;
                     return refuseSecurityBehind_(msg, directAck);
                 }
+                // #216: the same answers as the gateway's auth gate (D13): a session that never authenticated (no bind:
+                // the slot is Unbound) hears AuthenticationFailed and its end is requested; one that must change its
+                // password hears PasswordChangeRequired and stays.  A session this worker has no slot for keeps 45.
+                if (grants != nullptr && grants->table == unboundWriteTable()) [[unlikely]]
+                    return refuseUnauthenticated_(msg, directAck);
+                if (grants != nullptr && grants->table == passwordChangeWriteTable()) [[unlikely]]
+                    return refusePasswordChange_(msg, directAck);
                 return refuseNotAuthorized_(msg, directAck);
             }
             // Issue #122: a producer id is honoured only for the principal it was issued to (its owner tag; the
@@ -11063,6 +11422,7 @@ private:
                 return refuseNotAuthorized_(msg, directAck);
             }
             importGranted = allowsImport(*grants, msg.topicId);
+            importDeferred = !importGranted && securityLag_ == SecurityLag::DeferDenials;
         }
 
         // X036: a client never writes a control batch (after the WRITE check, so an unauthorized sender hears 45).
@@ -11101,6 +11461,7 @@ private:
         f.baseSequence  = msg.baseSequence;
         f.producerEpoch = msg.producerEpoch;
         f.importGranted = importGranted;
+        f.importDeferred = importDeferred;
         f.durabilityTier = replica ? replica->durabilityTier() : uint8_t{1};
         f.acks          = msg.acks;
         f.fromOp        = false;   // the poll budget (ingressPollBudget_) reserved its answer
@@ -11275,6 +11636,7 @@ private:
         bool    fromOp        = false;  ///< op-ring produce: reserve a parked answer here
         bool    crcValidated  = false;  ///< the op producer validated this batch's CRC (M-3)
         bool    importGranted = false;  ///< the session holds IMPORT on the topic (or the worker does not enforce)
+        bool    importDeferred = false; ///< #506: no IMPORT while the security view is behind: a missing IMPORT is not a verdict
         uint8_t directAck     = 0;      ///< D8d: direct-budget admission (worker ingress only)
         int64_t enqueuedAtNs  = 0;      ///< gateway enqueue time (op path; latency attribution)
         [[nodiscard]] bool acksAll() const noexcept { return rune::protocol::client::acksAll(acks); }
@@ -11350,6 +11712,7 @@ private:
     [[gnu::cold]] [[gnu::noinline]] void noteHookRefusal_(HookRefusal why, const ProduceFields& f) {
         if (why == HookRefusal::ValidationFailed) ++typedRejects_;
         else if (why == HookRefusal::VersionAhead) ++typedVersionAhead_;
+        else if (why == HookRefusal::VersionRetired) ++typedVersionRetired_;
         if (hookRefusals_[std::to_underlying(why)]++ % 1024 == 0)
             spdlog::warn("Worker {}: produce refused (reason {}) topicId={} partition={}, total {}", workerId_, std::to_underlying(why),
                          f.topicId, f.partition, hookRefusals_[std::to_underlying(why)]);
@@ -11635,7 +11998,7 @@ private:
         LeaseDupAnswer leaseDup;   // a known-old duplicate of a lease batch, answered with its trailers (spec 6.3)
         if (ws != nullptr) [[unlikely]] {
             const WriteFacts factsBase{.acks = acks, .idempotent = f.producerId >= 0, .transactional = txn, .atomicBatch = !txn && (batchAttrs & rune::protocol::batch::kAttrAtomic) != 0,
-                                   .importGranted = f.importGranted, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_(), .txnJudgedRecordsMax = txnJudgedRecordsMax_,
+                                   .importGranted = f.importGranted, .importDenialDeferred = f.importDeferred, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_(), .txnJudgedRecordsMax = txnJudgedRecordsMax_,
                                    .txnRecords = txn && rc != nullptr ? rc->tracker().recordsOf(f.producerId) : 0,
                                    .txnJudged = txn && rc != nullptr && txnJudged_(*ws, rc->tracker().hasIntent(f.producerId), rc->tracker().firstOffsetOf(f.producerId))};
             WriteFacts facts = factsBase;
@@ -11677,7 +12040,10 @@ private:
             }
             if (hook.checked()) ++hookChecks_;
             batchIntent = hook.anyIntent();
-            if (hook.refusal() != HookRefusal::None) [[unlikely]] noteHookRefusal_(hook.refusal(), f);
+            if (hook.refusal() != HookRefusal::None) [[unlikely]] {
+                noteHookRefusal_(hook.refusal(), f);
+                if (hook.refusal() == HookRefusal::ImportNotGranted && facts.importDenialDeferred) ++workerDeniesDeferred_;   // #506
+            }
             if (!outcome.isOK()) [[unlikely]] hook.onProduceFailed();
             if (outcome.error == pc::ErrorCode::Throttled) [[unlikely]] outcome.retryAfterNs = hook.retryAfterNs();
             if (hook.assignedBase() != 0 && ws->assignedBases.wantsGrowth()) [[unlikely]] autoIncGrowDue_ = true;   // P6-8: grown next pass

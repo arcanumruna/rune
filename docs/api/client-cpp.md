@@ -54,6 +54,13 @@ AuthStatus a = client.authStatus();                       // Authenticated, Pass
   sessions, and a client with credentials sends them only over TLS: without `offerCrypto` it throws at construction, and
   `requireCrypto` is forced on. Each session checks the certificate against its own endpoint's host unless
   `cfg.tlsExpectHost` names one.
+- Session notices and login answers are checked against the session. A session-level end notice (`SessionRevoked`,
+  `NamespaceSuspended`, `AuthUnavailable`, an auth-deadline `AuthenticationFailed`) ends a session only when its header
+  names that session's id (id 0 names none); an `AuthServerFirst` / `AuthServerFinal` acts only when it carries the
+  login's correlation id and the session id. On a TLS session, a frame its own keys did not open (a clear frame, or one
+  sealed for another session) never reaches the session machine; the one clear exception is the probe notice that
+  echoes a fresh probe nonce. A plaintext session has no such protection: whoever can read its session id and
+  correlation id can forge anything on it, so credentials travel only over TLS.
 - From a game loop, set `cfg.runnerMode = RunnerMode::Invoker` and call `client.doWork()` once per tick:
 
 ```cpp
@@ -107,15 +114,15 @@ auto users = client.securityUsers(10s);                     // ADMIN on CLUSTER 
 | Call | Purpose |
 |---|---|
 | `securityDdl(plan, ddl, target, token)` / `securityDdlAndWait(plan, ddl, timeout)` | Every security DDL: users, roles, grants, passwords. |
-| `bootstrapSecurity(...)` / `bootstrapSecurityAndWait(adminName, oneTimePassword, clusterKeyFileContents, timeout)` | The one-time first-admin bootstrap of a fresh cluster. The MAC under the cluster key proves possession. |
+| `bootstrapSecurity(...)` / `bootstrapSecurityAndWait(adminName, oneTimePassword, clusterKeyFileContents, timeout)` | The one-time first-admin bootstrap of a fresh cluster. Challenge-response (#234): each attempt asks the gateway for a one-use challenge and signs the frame with a subkey of the cluster key; `BrokerTooOld` against a broker below version 12. |
 | `securityHistory(filter, timeout)` | The replayed `__security` events. |
 | `securityGrantsFor(kind, name, asOf, timeout)` | Effective grants of a user or role, direct and through roles. |
 | `securityUsers(timeout)`, `securityRoles(timeout)` | Current users and roles. |
 | `securityReader()` | The cached reader behind the four calls above. |
 
 Reads of `__security` need `ADMIN` on `CLUSTER`; any other principal gets `Kind::Rejected` with broker code 45.
-`rune::client::security::buildVerifier`, `fillSecurityDdl` and `buildBootstrap` (`security/SecurityDdl.h`) are the low-level
-verifier builders.
+`rune::client::security::buildVerifier`, `fillSecurityDdl`, `buildBootstrap` and `signBootstrap` (`security/SecurityDdl.h`) are the
+low-level builders (a bootstrap frame is built without its MAC and signed once the challenge is known).
 
 ## Topics and DDL
 
@@ -191,7 +198,7 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
 
 - **`Acks`**: `None` (no response, always non-idempotent), `Leader`, `All` (the in-sync replicas hold it). Acked producers
   are **idempotent**: the broker deduplicates a retry by `(producerId, epoch, sequence)`. The durability contract of
-  each level:
+  each level (details and the table in [Acknowledgement levels and durability](#acknowledgement-levels-and-durability)):
   - `None`: no acknowledgement; a record can be lost without the producer knowing.
   - `Leader` (the default, like Kafka `acks=1`): acknowledged once the partition leader has the record. If the leader
     restarts or is lost before its followers replicate the record, an **acknowledged record can be lost**.
@@ -322,6 +329,43 @@ if (r.code() == 55) {
 // character-server, DELETE /character/{id}
 WriteResult d = characters.removeExistingAndWait(id);  // code() 57 (KeyNotFound) -> 404; a delete is never a 55
 ```
+
+### Acknowledgement levels and durability
+
+`ProducerConfig::acks` (default `Acks::Leader`) decides when the broker answers a produce and therefore which
+acknowledged records a broker failure can still take away.
+
+| Level | The ack is sent | An acked record can be lost when |
+|---|---|---|
+| `Acks::None` | Never waited for: the client completes the send locally with offset -1 ("sent, offset unknown"); on the wire it is the same request as `Leader`. | As with `Leader`, and a send that fails is not reported to the producer. |
+| `Acks::Leader` | When the partition leader has appended the record. | The leader fails or restarts before a follower has replicated it. |
+| `Acks::All` | When the partition high watermark has passed the record and the in-sync replica set still has at least `minIsr` members. | Only if more brokers fail than the in-sync set tolerates; see below. |
+
+`Acks::Leader` is like Kafka `acks=1`: the ack means only the partition leader has the record. If that leader fails
+or restarts before a follower has replicated it, the record is **lost although it was acknowledged**. Use `Acks::All`
+when an acknowledged record must survive the loss of one broker.
+
+What `Acks::All` waits for:
+
+- The partition high watermark is the minimum log end offset over the in-sync replicas, so the ack waits until every
+  member of the in-sync set holds the record.
+- `minIsr` (`RUNE_MIN_ISR`, default the cluster majority; see [configuration](../configuration.md)) is checked twice:
+  the leader refuses the produce up front while the in-sync set is smaller than `minIsr` (a retriable
+  `MinIsrViolation`, which the producer re-sends with the same identity), and the ack is only sent while the set is
+  still at least `minIsr` at the moment the high watermark passes the record. A leader left alone in the set never
+  acknowledges `Ok` for a `minIsr` of 2 or more.
+- With `minIsr` 1 (a single node, or `RUNE_MIN_ISR=1`) the in-sync set can shrink to the leader alone and still
+  acknowledge, so one broker failure can lose an acknowledged record exactly as with `Leader`.
+- If the high watermark has not passed the record after the broker's ack timeout (30 s by default), the produce is
+  answered `Internal` (6); the record may still be committed later, so the producer treats it as in doubt and retries
+  it with the same producer id and sequence, which the broker deduplicates.
+
+The topic's durability tier (`tier = leader | majority | strict`, see [QL](ql.md)) is separate from the ack level.
+`strict` adds a local `fsync` before the ack: with `Acks::Leader` the ack waits for the leader's `fsync`, with
+`Acks::All` it waits for the `fsync` and then for the high watermark. The other tiers do not delay the ack for an
+`fsync`, so a record acked under them is not necessarily on disk yet. A tier does not change which brokers must hold
+the record; that is the ack level's job. `Acks::View` (a flag) only adds a wait for the views and does not weaken the
+level it is combined with.
 
 ### Acknowledgements
 
@@ -850,9 +894,10 @@ for (int restarts = 0;;) {                                                      
   reads its own write) and `requestedFingerprint`. `scanView` / `scanViewAndWait(topic, prefix, limit, ViewScanOptions)` reads
   one page of at most `limit` rows (0 = 256; a page also stops at 61,440 row bytes).
 - `ViewScanResult`: `rows`, `nextToken` (empty on the last page; `complete()` is `status == kOk` and no token) and `status`.
-  **Pages are unordered** (table order). A row added or removed under the prefix between pages invalidates the token:
-  `status` is `ViewRowResult::kCursorInvalidated` (8, the same value as `kNotLeader`) and the scan restarts from the first page.
-  A scan sees each row of a quiet prefix once.
+  **Pages are in hash order**, and the token is a stable position, so writes under the prefix between pages never
+  invalidate it: a row that stays under the prefix is returned exactly once, a row added or removed meanwhile may or may not
+  appear, and none appears twice (not a snapshot). A page may hold no rows and still carry a token: loop until
+  `complete()`. `ViewRowResult::kCursorInvalidated` (8, the same value as `kNotLeader`) now only answers a malformed token.
 - With the token form (`scanView`), a `Completions` that polls the result needs `maxResultBytes` of at least 64 KiB, else the page is `ResultTooLarge`.
   The completion's `OpKind` is `GetViewRowK` or `ScanViewRows`; decode a scan's payload with `rune::client::view::decodeScanPayload`.
 - Both calls end `BrokerTooOld` without sending when the seed's `brokerVersion` is below `kBrokerVersionCheckedWrites` (10).

@@ -798,9 +798,10 @@ struct Parser {
     // | "drop" "column" IDENT
     // | "rename" "column" IDENT "to" IDENT
     // | "set" "compatibility" ("backward" | "forward")
+    // | "retire" "version" "<" INTEGER(2..65535)      (#419; the only operation of its statement)
     std::expected<AlterOp, ParseError> parseAlterOp() noexcept {
         if (cur.kind != TK::Ident) {
-            return std::unexpected(err("expected alter operation ('add', 'drop', 'rename', or 'set')"));
+            return std::unexpected(err("expected alter operation ('add', 'drop', 'rename', 'set', or 'retire')"));
         }
 
         if (isKw("add")) {
@@ -817,6 +818,38 @@ struct Parser {
             AlterOp op;
             op.kind = AlterOpKind::Add;
             op.field = std::move(*fd);
+            return op;
+        }
+
+        if (isKw("retire")) {
+            advance();
+            auto ver = expectKeyword("version");
+            if (!ver) return std::unexpected(std::move(ver.error()));
+            if (cur.kind == TK::Le || cur.kind == TK::Eq) {
+                return std::unexpected(err("retire version takes '<' (versions below N are retired), got '" +
+                                           std::string(cur.text) + "'"));
+            }
+            if (cur.kind != TK::Lt) {
+                return std::unexpected(err("expected '<' after 'retire version', got " + got()));
+            }
+            advance();
+            if (cur.kind == TK::Dash) {
+                return std::unexpected(err("a retire version cannot be negative"));
+            }
+            const Token numTok = cur;
+            auto n = parseInt();
+            if (!n) return std::unexpected(std::move(n.error()));
+            if (*n < 2) {
+                return std::unexpected(errAt(numTok, "retire version < " + std::to_string(*n) +
+                                                         " retires nothing: versions start at 1, so the least useful N is 2"));
+            }
+            if (*n > 65535) {
+                return std::unexpected(errAt(numTok, "retire version < " + std::to_string(*n) +
+                                                         " is above the largest schema version (65535)"));
+            }
+            AlterOp op;
+            op.kind = AlterOpKind::RetireBelow;
+            op.retireBelow = static_cast<uint16_t>(*n);
             return op;
         }
 
@@ -944,6 +977,11 @@ struct Parser {
             break;
         }
 
+        for (const auto& op : ad.ops) {
+            if (op.kind == AlterOpKind::RetireBelow && ad.ops.size() > 1) {
+                return std::unexpected(err("retire version must be the only operation of the statement"));
+            }
+        }
         auto semi = expect(TK::Semi, ";");
         if (!semi) return std::unexpected(std::move(semi.error()));
         return Statement(std::in_place_type<AlterTopicDef>, std::move(ad));

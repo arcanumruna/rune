@@ -296,6 +296,14 @@ public:
     virtual bool sendReconcileResponse(
             NodeId /*toPeer*/, const FetchResponseMsg& /*resp*/) { return true; }
 
+    /// #880 (a damaged sealed segment, repaired from a peer): ask `toPeer` for the batches of [fetchOffset,
+    /// lastEpochStartOffset) it holds intact.  Reuses the FetchRequest shape (see kRepairFetchReqTemplateId).  false =
+    /// not sent (a transport without a repair channel): the requester tries the next peer after its timeout.
+    virtual bool sendRepairRequest(NodeId /*toPeer*/, const FetchRequestMsg& /*req*/) { return false; }
+
+    /// #880: the peer's answer.  Reuses the FetchResponse shape.
+    virtual bool sendRepairResponse(NodeId /*toPeer*/, const FetchResponseMsg& /*resp*/) { return false; }
+
     /// (Partition leader → controller) Kafka AlterPartition: propose an ISR
     /// change.  Cold path (ISR changes only).  Default: no controller channel
     /// (false = not sent; a replica with this transport as its ISR channel
@@ -765,6 +773,49 @@ public:
 
     /// Retired reverse-reconcile answer: ignored.
     void applyReconcileResponse(const FetchResponseMsg& resp);
+
+    // -----------------------------------------------------------------------
+    // #880: a damaged sealed segment is rebuilt from an in-sync peer (the wire is documented at
+    // kRepairFetchReqTemplateId).  Both handlers run on the replica's owner thread; the requester state is cold.
+    // -----------------------------------------------------------------------
+
+    /// (Any replica holding the range intact) Serve batches of [req.fetchOffset, req.lastEpochStartOffset) that lie
+    /// below THIS replica's high watermark, from segments not damaged in the range.  Answers Ok + whole batches,
+    /// kRepairDone (no batch below the end remains at or above the cursor) or kRepairRefused (nothing is served).
+    /// Needs no leader state: a follower reads its own log up to its own highWatermark().
+    void onRepairRequest(const FetchRequestMsg& req);
+
+    /// (The replica repairing) The answer to the outstanding repair request; a stale or duplicate answer is ignored.
+    void applyRepairResponse(const FetchResponseMsg& resp);
+
+    /// #880 counters (cumulative, never reset).
+    [[nodiscard]] uint64_t segmentRepairsCompleted() const noexcept { return repairsCompleted_; }
+    /// Attempts that failed validation, timed out, could not begin or could not commit.
+    [[nodiscard]] uint64_t segmentRepairAttemptsFailed() const noexcept { return repairAttemptsFailed_; }
+    /// Rounds in which no peer could serve the damaged range (RF 1, or every copy refused / failed).
+    [[nodiscard]] uint64_t segmentRepairNoPeer() const noexcept { return repairNoPeer_; }
+    /// Repairs dropped before commit because the segment, the role or the epoch changed under them.
+    [[nodiscard]] uint64_t segmentRepairsAborted() const noexcept { return repairsAborted_; }
+    /// Repair requests this replica answered Ok / Done / Refused.
+    [[nodiscard]] uint64_t repairRequestsServed() const noexcept { return repairServed_; }
+    [[nodiscard]] uint64_t repairRequestsRefused() const noexcept { return repairRefused_; }
+    /// #880: the counter movement since the last take (owner thread).  A worker folds it into its cumulative counts and
+    /// reports them to the gateway (`rune-log-segment-repairs`, `-repair-failures`, `-repair-no-peer`).
+    struct RepairEvents { uint64_t completed = 0, failed = 0, noPeer = 0; };
+    [[nodiscard]] bool repairEventsPending() const noexcept {
+        return repairsCompleted_ != repairReported_.completed || repairAttemptsFailed_ != repairReported_.failed ||
+               repairNoPeer_ != repairReported_.noPeer;
+    }
+    RepairEvents takeRepairEvents() noexcept {
+        const RepairEvents d{repairsCompleted_ - repairReported_.completed, repairAttemptsFailed_ - repairReported_.failed,
+                             repairNoPeer_ - repairReported_.noPeer};
+        repairReported_ = {repairsCompleted_, repairAttemptsFailed_, repairNoPeer_};
+        return d;
+    }
+    /// A repair is in flight (fetching or waiting to retry).
+    [[nodiscard]] bool segmentRepairActive() const noexcept {
+        return !std::holds_alternative<RepairIdle>(repairState_);
+    }
 
     // -----------------------------------------------------------------------
     // doWork — single-writer periodic step (no spin, no sleep)
@@ -1358,6 +1409,8 @@ public:
     [[nodiscard]] uint64_t wedgedRefusals() const noexcept { return wedgedRefusals_; }
     /// Follower: the offset it is wedged at (stops fetching it), or -1.
     [[nodiscard]] Offset wedgedAtOffset() const noexcept { return wedgedAtOffset_; }
+    /// #880: probe fetches a follower wedged on the leader's damaged batch sent (one per kCorruptWedgeProbeNs).
+    [[nodiscard]] uint64_t corruptWedgeProbes() const noexcept { return corruptWedgeProbes_; }
     /// F18 (B-1): this node's transport could not hand the follower the batch
     /// whose baseOffset is `batchBase` (it cannot fit one worker-ingress frame on
     /// its own).  Wedges ONLY if that batch is the one at our LEO and the answer
@@ -1876,10 +1929,54 @@ private:
     // F18 unreplicable-batch state (see kErrRecordTooLarge).
     uint64_t recordTooLargeServed_ = 0;
     uint64_t corruptReadsServed_   = 0;   ///< #839: fetches answered kErrCorruptRecord
+    // ---- #880: segment repair requester (cold; the replica's owner thread) ----
+    struct RepairIdle {};
+    struct RepairFetching {
+        rune::storage::Log::SegmentRepair seg;
+        Offset  cursor = 0;            ///< the next offset wanted
+        NodeId  peer = -1;
+        int64_t attempt = 0;           ///< the id of the outstanding request (echoed by the answer)
+        int64_t sentAtNs = 0;          ///< 0 = not sent yet (the transport refused): resent next pass
+        std::vector<NodeId> tried;     ///< peers that failed in this round
+        Role    role = Role::Follower; ///< the role / epoch the attempt began under
+        Epoch   epoch = 0;
+        bool    commitPending = false; ///< Done arrived but the commit found no room: retried next pass
+    };
+    struct RepairBackoff { int64_t untilNs = 0; };
+    std::variant<RepairIdle, RepairFetching, RepairBackoff> repairState_{RepairIdle{}};
+    int64_t  repairNextCheckNs_ = 0;   ///< idle: the next time to look for a damaged segment
+    int64_t  repairAttemptSeq_  = 0;
+    int64_t  repairNoPeerLoggedBase_ = -1;   ///< the segment base the no-peer critical line was last logged for
+    uint64_t repairsCompleted_ = 0, repairAttemptsFailed_ = 0, repairNoPeer_ = 0, repairsAborted_ = 0;
+    uint64_t repairServed_ = 0, repairRefused_ = 0;
+    RepairEvents repairReported_{};   ///< the counters as last taken by takeRepairEvents()
+    /// The duty-pass step: start / time out / abort / retry the repair.  Returns work done.
+    int serviceRepair_(int64_t nowNs);
+    /// Candidate peers for a repair now: a follower -> the leader; a leader -> its in-sync followers in id order.
+    std::vector<NodeId> repairPeers_() const;
+    /// Begin the side file (if none) and send the request for the cursor to `peer`.
+    void startRepairAttempt_(int64_t nowNs, const rune::storage::Log::DamagedSegmentInfo& d, NodeId peer,
+                             std::vector<NodeId> tried);
+    bool sendRepairRequest_(RepairFetching& f);
+    /// The attempt failed: drop the side file, try the next peer, or back off when every peer failed.
+    void failRepairAttempt_(int64_t nowNs, const char* why, bool counted = true);
+    /// No peer can serve segment `base`: counted and logged once per segment.
+    void noteRepairNoPeer_(int64_t base, const char* why);
+    void abortRepair_(const char* why);
+    void commitRepair_(int64_t nowNs, RepairFetching& f);
     uint64_t corruptPushReads_     = 0;   ///< #875: push reads that hit a damaged range
     uint64_t wedgedRefusals_       = 0;
     Offset   wedgedAtOffset_       = -1;
-    void wedgeAt_(Offset at, const char* why);   ///< F18: enter the wedged state (log + count)
+    /// #880: why the follower is wedged.  Only a wedge on the LEADER's damaged copy probes again (the leader may
+    /// repair it); an unreplicable (too large) batch never becomes servable by waiting.
+    enum class WedgeReason : uint8_t { None, TooLarge, CorruptAtLeader, Other };
+    WedgeReason wedgeReason_       = WedgeReason::None;
+    int64_t  wedgeProbeAtNs_       = 0;     ///< when the wedge was entered / last probed (duty clock)
+    bool     wedgeProbeSent_       = false; ///< a probe is out: its answer is the next one that can clear the wedge
+    uint64_t corruptWedgeProbes_   = 0;
+    static constexpr int64_t kCorruptWedgeProbeNs = 1'000'000'000;
+    void wedgeAt_(Offset at, WedgeReason reason, const char* why);   ///< F18: enter the wedged state (log + count)
+    void clearWedge_() noexcept { wedgedAtOffset_ = -1; wedgeReason_ = WedgeReason::None; wedgeProbeSent_ = false; }
     Offset  rtLastHw_ = 0, rtLastLeo_ = 0;
 
     // F3 fix-round-2, item A: count of "batch exceeds even this transport's
@@ -2358,6 +2455,19 @@ public:
         enqueue_(pendingInternalIsrAck_, {to, m});
         return true;
     }
+    bool sendRepairRequest(NodeId toPeer, const FetchRequestMsg& req) override {
+        enqueue_(pendingRepairReqs_, {toPeer, req});
+        return true;
+    }
+    bool sendRepairResponse(NodeId toPeer, const FetchResponseMsg& resp) override {
+        PendingResponse pr;
+        pr.toFollower = toPeer;
+        pr.recordsBuf.assign(resp.records.begin(), resp.records.end());
+        pr.resp = resp;
+        pr.resp.records = std::span<const uint8_t>(pr.recordsBuf.data(), pr.recordsBuf.size());
+        enqueue_(pendingRepairResps_, std::move(pr));
+        return true;
+    }
     bool sendReconcileResponse(
             NodeId toPeer, const FetchResponseMsg& resp) override {
         PendingResponse pr;
@@ -2446,6 +2556,26 @@ public:
             }
         }
 
+        // #880: repair requests → the peer; repair responses → the requester.
+        std::vector<PendingReconcileReq> repReqs;
+        take_(pendingRepairReqs_, repReqs);
+        for (auto& r : repReqs) {
+            auto it = byId_.find(r.to);
+            if (it != byId_.end()) {
+                it->second->onRepairRequest(r.req);
+                ++count;
+            }
+        }
+        std::vector<PendingResponse> repResps;
+        take_(pendingRepairResps_, repResps);
+        for (auto& pr : repResps) {
+            auto it = byId_.find(pr.toFollower);
+            if (it != byId_.end()) {
+                it->second->applyRepairResponse(pr.resp);
+                ++count;
+            }
+        }
+
         // MAJOR-2/3: internal-ISR states / acks → target.
         std::vector<std::pair<NodeId, InternalIsrMsg>> iisr;
         std::vector<std::pair<NodeId, InternalIsrAckMsg>> iack;
@@ -2468,7 +2598,8 @@ public:
         std::lock_guard lk(mu_);
         return pendingRequests_.size() + pendingResponses_.size()
              + pendingEpochReqs_.size() + pendingEpochResps_.size()
-             + pendingReconcileReqs_.size() + pendingReconcileResps_.size();
+             + pendingReconcileReqs_.size() + pendingReconcileResps_.size()
+             + pendingRepairReqs_.size() + pendingRepairResps_.size();
     }
 
 private:
@@ -2497,6 +2628,8 @@ private:
     std::vector<PendingEpochResp> pendingEpochResps_;  ///< DR-BUG-6
     std::vector<PendingReconcileReq> pendingReconcileReqs_;  ///< DR-BUG-6
     std::vector<PendingResponse>  pendingReconcileResps_;    ///< DR-BUG-6
+    std::vector<PendingReconcileReq> pendingRepairReqs_;     ///< #880
+    std::vector<PendingResponse>  pendingRepairResps_;       ///< #880
     std::vector<std::pair<NodeId, InternalIsrMsg>>    pendingInternalIsr_;     ///< MAJOR-2/3
     std::vector<std::pair<NodeId, InternalIsrAckMsg>> pendingInternalIsrAck_;  ///< MAJOR-2/3
 };

@@ -46,12 +46,20 @@ struct CapturingIo : sm::SessionIo {
     }
 };
 
+// An AuthServerFinal as the broker stamps it: this machine's session id and its connect correlation id.
+pc::AuthServerFinal ownFinal(const sm::SessionMachine& m, pc::AuthServerFinal f) {
+    f.sessionId = m.sessionId();
+    f.correlationId = m.correlationId();
+    return f;
+}
+
 struct Server {   // a test SCRAM server over one or two verifiers
     std::vector<rs::Verifier> verifiers;
     std::string snonce = "SRVnonce";
     pc::AuthServerFirst first(const pc::AuthClientFirst& cf, std::string& combined) {
         combined = std::string(cf.clientNonce) + snonce;
         pc::AuthServerFirst sf;
+        sf.sessionId = cf.sessionId; sf.correlationId = cf.correlationId;
         sf.combinedNonce = combined;
         sf.count = static_cast<uint8_t>(verifiers.size());
         for (std::size_t i = 0; i < verifiers.size(); ++i)
@@ -137,7 +145,7 @@ TEST(SessionMachineAuthRegression, FullExchangeReachesConnectedOnlyAfterTheServe
 
     auto sig = rs::serverSignature(cr::Digest::Sha512, srv.verifiers[0].serverKey, am).value();
     const std::string sigStr(reinterpret_cast<const char*>(sig.bytes.data()), sig.size);
-    m.onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0, .serverSignature = sigStr}, 3);
+    m.onAuthServerFinal(ownFinal(m, pc::AuthServerFinal{.errorCode = 0, .serverSignature = sigStr}), 3);
     EXPECT_EQ(m.state(), sm::SessionState::Connected);
     EXPECT_EQ(m.brokerAuthMode(), pc::AuthMode::Required);
     EXPECT_FALSE(m.passwordChangeRequired());
@@ -195,7 +203,7 @@ TEST(SessionMachineAuthRegression, AWrongServerSignatureIsRejectedNeverConnected
     Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
     std::string combined; (void)t.serverFirst(srv, t.clientFirst(), combined);
     const std::string zeros(64, '\0');
-    t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0, .serverSignature = zeros}, 3);
+    t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 0, .serverSignature = zeros}), 3);
     EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
     EXPECT_EQ(t.m->rejectCode(), static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed));
 }
@@ -204,7 +212,7 @@ TEST(SessionMachineAuthRegression, AMissingServerSignatureIsRejectedNeverConnect
     Rig t; t.connectAuthRequired();
     Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
     std::string combined; (void)t.serverFirst(srv, t.clientFirst(), combined);
-    t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0}, 3);   // OK but unsigned
+    t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 0}), 3);   // OK but unsigned
     EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
     EXPECT_EQ(t.m->rejectCode(), 44);
 }
@@ -220,7 +228,7 @@ TEST(SessionMachineAuthRegression, AWrongPasswordIsAnotherProofTheServerRejectsA
     EXPECT_FALSE(rs::verifyClientProof(cr::Digest::Sha512, srv.verifiers[0].storedKey, am, fin.proofs[0]))
         << "the proof of the wrong password must not verify";
     const std::string sig = srv.signature(cf, combined, 0);
-    t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0, .serverSignature = sig}, 3);
+    t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 0, .serverSignature = sig}), 3);
     EXPECT_EQ(t.m->state(), sm::SessionState::Rejected) << "a signature the client's password cannot produce";
 }
 
@@ -241,7 +249,7 @@ TEST(SessionMachineAuthRegression, TwoVerifiersGetTwoProofsAndEitherPasswordWork
             EXPECT_EQ(ok, i == matching) << "exactly the matching verifier's proof verifies (verifier " << i << ")";
         }
         const std::string sig = srv.signature(cf, combined, matching);
-        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0, .serverSignature = sig}, 3);
+        t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 0, .serverSignature = sig}), 3);
         EXPECT_EQ(t.m->state(), sm::SessionState::Connected);
     }
 }
@@ -249,13 +257,13 @@ TEST(SessionMachineAuthRegression, TwoVerifiersGetTwoProofsAndEitherPasswordWork
 TEST(SessionMachineAuthRegression, AuthenticationFailedIsTerminalUnlessRateLimited) {
     {   // 44, retryAfterMs 0 -> Rejected(44)
         Rig t; t.connectAuthRequired();
-        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44}, 3);
+        t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 44}), 3);
         EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
         EXPECT_EQ(t.m->rejectCode(), 44);
     }
     {   // 44 with retryAfterMs before the session was ever Live -> Backoff (Issue #519), not a verdict
         Rig t; t.connectAuthRequired();
-        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 800}, 3);
+        t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 800}), 3);
         EXPECT_EQ(t.m->state(), sm::SessionState::Backoff);
         EXPECT_EQ(t.m->authRetryAfterMs(), 800u);
     }
@@ -272,7 +280,7 @@ TEST(SessionMachineAuthRegression, AuthenticationFailedIsTerminalUnlessRateLimit
         t.m->onConnectResponse(r.code, -1, 43, c1, 11, 0, {}, r.authMode, r.authState);
         ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating);
         const int64_t now = 1'000'000'000;
-        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 800}, now);
+        t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 800}), now);
         EXPECT_EQ(t.m->state(), sm::SessionState::Backoff);
         EXPECT_GE(t.m->nextAttemptNs(), now + 800'000'000LL) << "D27: honour the broker's retryAfterMs";
         const std::size_t before = t.io.frames.size();
@@ -289,7 +297,7 @@ TEST(SessionMachineAuthRegression, AuthenticationFailedIsTerminalUnlessRateLimit
         t.m->forceReconnect(10);
         auto r = authRequired(t.io.lastCorrelation());
         t.m->onConnectResponse(r.code, -1, 43, t.io.lastCorrelation(), 11, 0, {}, r.authMode, r.authState);
-        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44}, 20);
+        t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 44}), 20);
         EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
     }
 }
@@ -368,7 +376,8 @@ TEST(SessionMachineAuthRegression, AnEarnedResumeIsAcceptedAndAnUnearnedOneIsNot
     Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
     std::string combined; auto sf = srv.first(cf, combined);
     m.onAuthServerFirst(sf, 2);
-    m.onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0, .serverSignature = srv.signature(cf, combined, 0)}, 3);
+    m.onAuthServerFinal(ownFinal(m,
+            pc::AuthServerFinal{.errorCode = 0, .serverSignature = srv.signature(cf, combined, 0)}), 3);
     ASSERT_EQ(m.state(), sm::SessionState::Connected);
     EXPECT_TRUE(m.authenticated());
     const int firstsBefore = io.countOf(pc::TemplateId::AuthClientFirst);
@@ -405,7 +414,8 @@ TEST(SessionMachineAuthRegression, NoDataFrameLeavesBeforeConnected) {
                     tid == static_cast<uint16_t>(pc::TemplateId::AuthClientFirst) ||
                     tid == static_cast<uint16_t>(pc::TemplateId::AuthClientFinal)) << "template " << tid;
     }
-    t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0, .serverSignature = srv.signature(cf, combined, 0)}, 3);
+    t.m->onAuthServerFinal(ownFinal(*t.m,
+            pc::AuthServerFinal{.errorCode = 0, .serverSignature = srv.signature(cf, combined, 0)}), 3);
     EXPECT_TRUE(t.m->canSendData());
 }
 
@@ -440,7 +450,7 @@ TEST(SessionMachineAuthRegression, NoCredentialsStillSendsAuthClientFirstAndTheB
     const auto cf0 = pc::AuthClientFirst::decode(t.io.frames.back().data(), t.io.frames.back().size());
     ASSERT_TRUE(cf0.has_value());
     EXPECT_TRUE(cf0->username.empty());
-    t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44}, 3);
+    t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 44}), 3);
     EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
     EXPECT_EQ(t.m->rejectCode(), 44);
 }
@@ -449,7 +459,8 @@ TEST(SessionMachineAuthRegression, AFinalBeforeTheProofWasSentIsRejected) {
     Rig t; t.connectAuthRequired();
     Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
     const std::string sig(64, 'x');
-    t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0, .serverSignature = sig}, 3);   // skipped the server-first
+    t.m->onAuthServerFinal(ownFinal(*t.m,
+            pc::AuthServerFinal{.errorCode = 0, .serverSignature = sig}), 3);   // skipped the server-first
     EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
 }
 
@@ -469,10 +480,120 @@ TEST(SessionMachineAuthRegression, TheMustChangePasswordFlagIsLatchedOnTheConnec
     Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
     std::string combined; auto cf = t.clientFirst();
     (void)t.serverFirst(srv, cf, combined);
-    t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0, .flags = pc::kAuthFlagMustChangePassword,
-                                               .serverSignature = srv.signature(cf, combined, 0)}, 3);
+    t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 0, .flags = pc::kAuthFlagMustChangePassword,
+                                                              .serverSignature = srv.signature(cf, combined, 0)}), 3);
     EXPECT_EQ(t.m->state(), sm::SessionState::Connected);
     EXPECT_TRUE(t.m->passwordChangeRequired());
+}
+
+namespace {
+
+// Review B I3 / I5 and the one-time-password flag are one login state: at most one of {anonymousBootstrap,
+// authenticated}, and a pending password change only on an authenticated session.
+void expectOneLoginState(const sm::SessionMachine& m) {
+    EXPECT_FALSE(m.anonymousBootstrap() && m.authenticated());
+    if (m.passwordChangeRequired()) EXPECT_TRUE(m.authenticated());
+}
+
+// Logs a Rig in on session id 42 with the must-change flag; leaves it Connected.
+void loginMustChange(Rig& t) {
+    t.connectAuthRequired();
+    Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
+    std::string combined; auto cf = t.clientFirst();
+    (void)t.serverFirst(srv, cf, combined);
+    t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 0, .flags = pc::kAuthFlagMustChangePassword,
+                                                              .serverSignature = srv.signature(cf, combined, 0)}), 3);
+}
+
+}  // namespace
+
+TEST(SessionMachineAuthRegression, AuthInfoHasOneStateAtATimeRegression) {
+    Rig t;
+    loginMustChange(t);
+    ASSERT_EQ(t.m->state(), sm::SessionState::Connected);
+    EXPECT_TRUE(t.m->authenticated());
+    EXPECT_TRUE(t.m->passwordChangeRequired());
+    EXPECT_FALSE(t.m->anonymousBootstrap());
+    expectOneLoginState(*t.m);
+    // The link drops and the broker asks for a fresh login: nothing of the old login may survive.
+    t.m->onTransportDisconnected(10);
+    t.m->tick(11);
+    ASSERT_EQ(t.m->state(), sm::SessionState::Connecting);
+    auto r = authRequired(t.io.lastCorrelation());
+    t.m->onConnectResponse(r.code, -1, 42, t.io.lastCorrelation(), 12, 0, {}, r.authMode, r.authState);
+    ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating);
+    EXPECT_FALSE(t.m->authenticated());
+    EXPECT_FALSE(t.m->passwordChangeRequired()) << "a stale one-time-password flag outlived its login";
+    EXPECT_FALSE(t.m->anonymousBootstrap());
+    expectOneLoginState(*t.m);
+    // The same on a machine that accepts an unauthenticated broker: the reconnect lands on Connected without a login
+    // (beginAuth_ is never reached), so nothing of the earlier login may survive there either.
+    {
+        Rig u("ws1", "correct horse battery", /*forever=*/false, /*allowUnauthenticated=*/true);
+        loginMustChange(u);
+        ASSERT_TRUE(u.m->passwordChangeRequired());
+        u.m->onTransportDisconnected(10);
+        u.m->tick(11);
+        ASSERT_EQ(u.m->state(), sm::SessionState::Connecting);
+        u.m->onConnectResponse(0, -1, 42, u.io.lastCorrelation(), 12, 0, {}, pc::AuthMode::DevDisabled,
+                               pc::AuthState::Anonymous);
+        ASSERT_EQ(u.m->state(), sm::SessionState::Connected);
+        EXPECT_FALSE(u.m->authenticated());
+        EXPECT_FALSE(u.m->passwordChangeRequired()) << "a stale one-time-password flag outlived its login";
+        EXPECT_FALSE(u.m->anonymousBootstrap());
+        expectOneLoginState(*u.m);
+    }
+    // A bootstrap-only machine on a Required + Anonymous broker.
+    {
+        CapturingIo io; sm::SessionConfig cfg; cfg.bootstrapOnly = true;
+        sm::SessionMachine m(io, cfg);
+        m.connect(0);
+        m.onConnectResponse(0, -1, 42, io.lastCorrelation(), 1, 0, {}, pc::AuthMode::Required,
+                            pc::AuthState::Anonymous);
+        ASSERT_EQ(m.state(), sm::SessionState::Connected);
+        EXPECT_TRUE(m.anonymousBootstrap());
+        EXPECT_FALSE(m.authenticated());
+        EXPECT_FALSE(m.passwordChangeRequired());
+        expectOneLoginState(m);
+    }
+    // ... and on a Required + MustAuthenticate broker (the reopened bootstrap window).
+    {
+        CapturingIo io; sm::SessionConfig cfg; cfg.bootstrapOnly = true;
+        sm::SessionMachine m(io, cfg);
+        m.connect(0);
+        m.onConnectResponse(0, -1, 42, io.lastCorrelation(), 1, 0, {}, pc::AuthMode::Required,
+                            pc::AuthState::MustAuthenticate);
+        ASSERT_EQ(m.state(), sm::SessionState::Connected);
+        EXPECT_TRUE(m.anonymousBootstrap());
+        EXPECT_FALSE(m.authenticated());
+        EXPECT_FALSE(m.passwordChangeRequired());
+        expectOneLoginState(m);
+    }
+}
+
+TEST(SessionMachineAuthRegression, AnOwnResumeKeepsTheMustChangeFlagRegression) {
+    Rig t;
+    loginMustChange(t);
+    ASSERT_EQ(t.m->state(), sm::SessionState::Connected);
+    t.m->onTransportDisconnected(10);
+    t.m->tick(11);
+    ASSERT_EQ(t.m->state(), sm::SessionState::Connecting);
+    t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 12, 0, {}, pc::AuthMode::Required,
+                           pc::AuthState::ResumedAuthenticated);
+    EXPECT_EQ(t.m->state(), sm::SessionState::Connected);
+    EXPECT_TRUE(t.m->authenticated());
+    EXPECT_TRUE(t.m->passwordChangeRequired()) << "the resumed session is the one that logged in";
+    expectOneLoginState(*t.m);
+}
+
+TEST(SessionMachineAuthRegression, PasswordChangedClearsOnlyTheMustChangeFlagRegression) {
+    Rig t;
+    loginMustChange(t);
+    ASSERT_TRUE(t.m->passwordChangeRequired());
+    t.m->passwordChanged();
+    EXPECT_TRUE(t.m->authenticated());
+    EXPECT_FALSE(t.m->passwordChangeRequired());
+    expectOneLoginState(*t.m);
 }
 
 TEST(SessionMachineAuthRegression, ALoginThatNeverAnswersTimesOutLikeAStuckHandshake) {
@@ -653,7 +774,8 @@ TEST(SessionMachineAuthRegression, ARefusedAuthClientFirstIsResentWhenTheTranspo
     Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
     std::string combined; auto sf = srv.first(cf, combined);
     m.onAuthServerFirst(sf, 6);
-    m.onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0, .serverSignature = srv.signature(cf, combined, 0)}, 7);
+    m.onAuthServerFinal(ownFinal(m,
+            pc::AuthServerFinal{.errorCode = 0, .serverSignature = srv.signature(cf, combined, 0)}), 7);
     EXPECT_EQ(m.state(), sm::SessionState::Connected);
 }
 
@@ -740,7 +862,8 @@ TEST(SessionMachineAuthRegression, OverTlsTheLoginFollowsTheHandshakeAndConnecte
     std::string combined; auto sf = s.first(cf, combined);
     m.onAuthServerFirst(sf, 2);
     EXPECT_EQ(m.state(), sm::SessionState::Authenticating);
-    m.onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0, .serverSignature = s.signature(cf, combined, 0)}, 3);
+    m.onAuthServerFinal(ownFinal(m,
+            pc::AuthServerFinal{.errorCode = 0, .serverSignature = s.signature(cf, combined, 0)}), 3);
     EXPECT_EQ(m.state(), sm::SessionState::Connected);
 }
 
@@ -866,7 +989,7 @@ TEST(ClientAuthUnavailableRegression, BacksOffAndRotatesSeedsRegression) {
     constexpr int16_t kUnavailable = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
     {   // a first connect: a retriable failure the caller sees as 48 - never Rejected / AuthenticationFailed
         Rig t; t.connectAuthRequired();
-        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, 3);
+        t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 48}), 3);
         EXPECT_EQ(t.m->state(), sm::SessionState::Backoff) << "Issue #461: retried within its own budget";
         EXPECT_EQ(t.m->lastConnectError(), kUnavailable);
         EXPECT_EQ(t.m->sessionId(), 0) << "the broker ended that session: never resumed";
@@ -883,7 +1006,7 @@ TEST(ClientAuthUnavailableRegression, BacksOffAndRotatesSeedsRegression) {
         auto r = authRequired(t.io.lastCorrelation());
         t.m->onConnectResponse(r.code, -1, 43, t.io.lastCorrelation(), 11, 0, {}, r.authMode, r.authState);
         ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating);
-        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, 20);
+        t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 48}), 20);
         EXPECT_EQ(t.m->state(), sm::SessionState::Backoff) << "retriable: back off, never Rejected";
         EXPECT_EQ(t.m->sessionId(), 0);
         t.m->tick(t.m->nextAttemptNs());
@@ -933,7 +1056,7 @@ TEST(ClientAuthUnavailableRegression, AFirstConnectRetriesAuthUnavailableWithinI
             auto r = authRequired(corr);
             t.m->onConnectResponse(r.code, -1, 42, corr, ++now, 0, {}, r.authMode, r.authState);
             ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating) << i;
-            t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, ++now);
+            t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 48}), ++now);
         }
         if (i == budget) break;
         ASSERT_EQ(t.m->state(), sm::SessionState::Backoff) << i;
@@ -955,7 +1078,7 @@ TEST(ClientAuthUnavailableRegression, AForeverSessionNeverLiveAlsoRetriesAuthUna
     t.connectAuthRequired();
     ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating);
     ASSERT_FALSE(t.m->everLive());
-    t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, 3);
+    t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 48}), 3);
     EXPECT_EQ(t.m->state(), sm::SessionState::Backoff);
     EXPECT_EQ(t.m->rejectCode(), 0);
 }
@@ -964,7 +1087,7 @@ TEST(ClientAuthRateLimitRegression, ARateLimited44BeforeLiveBacksOffAtLeastRetry
     {
         Rig t; t.connectAuthRequired();
         const int64_t T = 1'000'000'000;
-        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 500}, T);
+        t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 500}), T);
         EXPECT_EQ(t.m->state(), sm::SessionState::Backoff);
         EXPECT_GE(t.m->nextAttemptNs(), T + 500'000'000LL);
         EXPECT_EQ(t.m->rejectCode(), 0);
@@ -978,7 +1101,7 @@ TEST(ClientAuthRateLimitRegression, ARateLimited44BeforeLiveBacksOffAtLeastRetry
             const int64_t corr = t.io.lastCorrelation();
             auto r = authRequired(corr);
             t.m->onConnectResponse(r.code, -1, 42, corr, now, 0, {}, r.authMode, r.authState);
-            t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 500}, now);
+            t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 500}), now);
             if (t.m->state() == sm::SessionState::Backoff) now = t.m->nextAttemptNs();
         }
         EXPECT_EQ(t.m->state(), sm::SessionState::Disconnected);
@@ -987,7 +1110,7 @@ TEST(ClientAuthRateLimitRegression, ARateLimited44BeforeLiveBacksOffAtLeastRetry
     }
     {   // control: a plain 44 stays a verdict
         Rig t; t.connectAuthRequired();
-        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 0}, 3);
+        t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 0}), 3);
         EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
         EXPECT_EQ(t.m->rejectCode(), 44);
     }
@@ -1021,7 +1144,7 @@ TEST(ClientAuthUnavailableRegression, AStaleNoticeNeverEndsTheNewSessionAndRepea
             auto r = authRequired(t.io.lastCorrelation());
             t.m->onConnectResponse(r.code, -1, 100 + i, t.io.lastCorrelation(), ++now, 0, {}, r.authMode, r.authState);
             ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating) << i;
-            t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, ++now);
+            t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 48}), ++now);
             ASSERT_EQ(t.m->state(), sm::SessionState::Backoff) << i << ": never Rejected";
             const int64_t delay = t.m->nextAttemptNs() - now;
             EXPECT_GE(delay, lastDelay) << i << ": the backoff never shrinks";
@@ -1041,7 +1164,7 @@ TEST(SessionMachineAuthRegression, AHaltedBrokerAnswerFailsOverInsteadOfRejectin
     constexpr int16_t kUnavailable = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
     {   // a first login answered 48
         Rig t; t.connectAuthRequired();
-        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, 3);
+        t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 48}), 3);
         EXPECT_EQ(t.m->state(), sm::SessionState::Backoff) << "Issue #461: a bounded retry, then Disconnected";
         EXPECT_EQ(t.m->rejectCode(), 0);
         EXPECT_EQ(t.m->lastConnectError(), kUnavailable);
@@ -1054,7 +1177,7 @@ TEST(SessionMachineAuthRegression, AHaltedBrokerAnswerFailsOverInsteadOfRejectin
         auto r = authRequired(t.io.lastCorrelation());
         t.m->onConnectResponse(r.code, -1, 43, t.io.lastCorrelation(), 11, 0, {}, r.authMode, r.authState);
         ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating);
-        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, 20);
+        t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = 48}), 20);
         EXPECT_EQ(t.m->state(), sm::SessionState::Backoff);
         EXPECT_EQ(t.m->rejectCode(), 0);
         t.m->tick(t.m->nextAttemptNs());
@@ -1133,7 +1256,7 @@ TEST(SessionMachineAuthRegression, LoginAnsweredSessionEndCodeIsRejectedRegressi
             t.connectAuthRequired();
             Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
             std::string combined; (void)t.serverFirst(srv, t.clientFirst(), combined);
-            t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = static_cast<uint16_t>(code)}, 3);
+            t.m->onAuthServerFinal(ownFinal(*t.m, pc::AuthServerFinal{.errorCode = static_cast<uint16_t>(code)}), 3);
             EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
             EXPECT_EQ(t.m->rejectCode(), code);
             EXPECT_TRUE(sm::SessionMachine::nonRetriableConnectError(static_cast<int16_t>(code)));
@@ -1215,4 +1338,102 @@ TEST(SessionMachineAuthRegression, NamesRetiredSealedSessionAllocatesNothingRegr
     const long allocs = alloc_counter::stopThisThread();
     EXPECT_EQ(allocs, 0);
     EXPECT_EQ(hits, 0);
+}
+
+// #12: an AuthServerFinal / AuthServerFirst acts only when it names this login's correlation id AND this session's id.
+// RED (old): any AuthServerFinal{44} reaching an Authenticating machine ended it in Rejected, whoever it named.
+TEST(SessionMachineAuthRegression, AnAuthServerFinalWithAForeignCorrelationIsIgnoredRegression) {
+    Rig t; t.connectAuthRequired();
+    Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
+    std::string combined; auto cf = t.clientFirst();
+    (void)t.serverFirst(srv, cf, combined);
+    const int64_t corr = t.m->correlationId();
+    const int64_t sid  = t.m->sessionId();
+    ASSERT_EQ(sid, 42);
+    const std::pair<int64_t, int64_t> foreign[] = {{sid, corr + 1}, {sid + 1, corr}, {0, corr}, {0, 0}, {sid, 0}};
+    for (const auto& [fs, fc] : foreign) {
+        SCOPED_TRACE("sessionId=" + std::to_string(fs) + " corr=" + std::to_string(fc));
+        t.m->onAuthServerFinal(pc::AuthServerFinal{.sessionId = fs, .correlationId = fc, .errorCode = 44}, 3);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Authenticating);
+        t.m->onAuthServerFinal(pc::AuthServerFinal{.sessionId = fs, .correlationId = fc, .errorCode = 0,
+                                                   .serverSignature = srv.signature(cf, combined, 0)}, 3);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Authenticating) << "a foreign OK is no login either";
+    }
+    t.m->onAuthServerFinal(pc::AuthServerFinal{.sessionId = sid, .correlationId = corr, .errorCode = 0,
+                                               .serverSignature = srv.signature(cf, combined, 0)}, 4);
+    EXPECT_EQ(t.m->state(), sm::SessionState::Connected);
+}
+
+TEST(SessionMachineAuthRegression, AnAuthServerFirstWithAForeignCorrelationIsIgnoredRegression) {
+    Rig t; t.connectAuthRequired();
+    auto cf = t.clientFirst();
+    Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
+    std::string combined; auto sf = srv.first(cf, combined);
+    const int64_t corr = t.m->correlationId();
+    const int64_t sid  = t.m->sessionId();
+    const std::string bad = "someoneElsesNonce" + std::string(cf.clientNonce);
+    const std::pair<int64_t, int64_t> foreign[] = {{sid, corr + 1}, {sid + 1, corr}, {0, corr}, {0, 0}};
+    for (const auto& [fs, fc] : foreign) {
+        SCOPED_TRACE("sessionId=" + std::to_string(fs) + " corr=" + std::to_string(fc));
+        auto forged = sf;
+        forged.combinedNonce = bad;
+        forged.sessionId = fs; forged.correlationId = fc;
+        t.m->onAuthServerFirst(forged, 2);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Authenticating);
+        EXPECT_EQ(t.io.countOf(pc::TemplateId::AuthClientFinal), 0);
+    }
+    // The real server-first still gets its proof: the forged ones did not consume the ScramSentFirst state.
+    (void)t.serverFirst(srv, cf, combined);
+    EXPECT_EQ(t.io.countOf(pc::TemplateId::AuthClientFinal), 1);
+    EXPECT_EQ(t.m->state(), sm::SessionState::Authenticating);
+}
+
+TEST(SessionMachineAuthRegression, ABadNonceWithTheRightIdsStillFailsTheLoginRegression) {
+    Rig t; t.connectAuthRequired();
+    auto cf = t.clientFirst();
+    Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
+    std::string combined; auto sf = srv.first(cf, combined);
+    sf.combinedNonce = "someoneElsesNonce" + std::string(cf.clientNonce);
+    sf.sessionId = t.m->sessionId(); sf.correlationId = t.m->correlationId();
+    t.m->onAuthServerFirst(sf, 2);
+    EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
+}
+
+// #12: a session-level end notice (corr 0) ends the session only when it names THIS session: id 0 and another
+// session's id are ignored.  RED (old): id 0 was "kept" and ended the session.
+TEST(SessionMachineAuthRegression, ASessionEndNoticeNamingNoSessionIsIgnoredRegression) {
+    enum class At { Connected, Authenticating };
+    struct Row { At at; int code; };
+    const Row rows[] = {
+        {At::Connected, 46}, {At::Connected, 51}, {At::Connected, 48},
+        {At::Authenticating, 46}, {At::Authenticating, 51}, {At::Authenticating, 44},
+    };
+    const auto build = [](At at, Rig& t) {
+        if (at == At::Authenticating) {
+            t.connectAuthRequired();
+        } else {
+            t.m->connect(0);
+            t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 1);
+        }
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE("at=" + std::to_string(static_cast<int>(row.at)) + " code=" + std::to_string(row.code));
+        sm::SessionState moved;
+        {   // the reference: the notice naming this session moves the machine (the behaviour that is kept)
+            Rig t("ws1", "correct horse battery", false, /*allowUnauthenticated=*/row.at == At::Connected);
+            build(row.at, t);
+            const sm::SessionState before = t.m->state();
+            t.m->onErrorResponse(static_cast<int16_t>(row.code), "end", 0, 2, t.m->sessionId());
+            moved = t.m->state();
+            ASSERT_NE(moved, before) << "the notice naming the session must still end it";
+        }
+        for (const int64_t named : {int64_t{0}, int64_t{43}}) {
+            SCOPED_TRACE("noticeSessionId=" + std::to_string(named));
+            Rig t("ws1", "correct horse battery", false, /*allowUnauthenticated=*/row.at == At::Connected);
+            build(row.at, t);
+            const sm::SessionState before = t.m->state();
+            t.m->onErrorResponse(static_cast<int16_t>(row.code), "end", 0, 2, named);
+            EXPECT_EQ(t.m->state(), before);
+        }
+    }
 }

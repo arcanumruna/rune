@@ -145,6 +145,15 @@ public:
         writeCatalogTopicApplied(f.data(), topicId, name, partitions, /*rf*/0, /*persistence=*/0, c, /*nsId=*/0, kf);
         node_->postCatalogEffectForTest(kA2cCatalogTopicApplied, std::move(f));
     }
+    /// The applier's `applied` frame (#988): what the applier posts after every event, carrying its nextTopicId.
+    void applyFrontier(int64_t offset, int32_t nextTopicId) {
+        std::vector<uint8_t> f(kCatalogAppliedWireLen);
+        writeCatalogApplied(f.data(), offset, /*digest=*/0, nextTopicId);
+        node_->postCatalogEffectForTest(kA2cCatalogApplied, std::move(f));
+    }
+    int32_t gatewayFrontier() {
+        return node_->onControlThreadForTest([&] { return node_->gatewayForTest()->appliedTopicFrontierForTest(); });
+    }
     void applyDropTopic(int32_t topicId, const std::string& name) {
         std::vector<uint8_t> f(catalogTopicDroppedWireLen(name));
         writeCatalogTopicDropped(f.data(), topicId, name);
@@ -311,6 +320,11 @@ private:
     int64_t                          corr_ = 1'000'000;
 };
 
+/// Bounded wait for the gateway's frontier to read `v` (the control thread drains the admin->control ring).
+bool CatalogEffectsFixtureAwait(SingleNode& n, int32_t v) {
+    return SingleNode::awaitTrue([&] { return n.gatewayFrontier() == v; }, 10s);
+}
+
 constexpr int16_t kUnknownTopic = static_cast<int16_t>(pc::ErrorCode::UnknownTopic);
 constexpr int16_t kNotLeader    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
 
@@ -331,7 +345,33 @@ TEST_P(CatalogEffectsRegression, AppliedTopicIsCreatedAtItsCatalogIdAndPlaced) {
     ASSERT_TRUE(n.awaitServes(5, 10s));
     EXPECT_EQ(n.topicIdForName("later"), 5);
     EXPECT_EQ(n.topicState(3), rune::gateway::TopicRegistry::TopicState::Unknown) << "a never-seen id: a Gap";
-    EXPECT_EQ(n.produceErrorCode(3, 0), kUnknownTopic);
+    n.applyFrontier(1, 6);   // the applier's frame after the second create: ids 0..5 are decided here
+    ASSERT_TRUE(CatalogEffectsFixtureAwait(n, 6));
+    EXPECT_EQ(n.produceErrorCode(3, 0), kUnknownTopic) << "below the frontier: terminal";
+    EXPECT_EQ(n.produceErrorCode(9, 0), kNotLeader) << "at or above the frontier: not applied here yet (#988)";
+}
+
+// #988: the applier's `applied` frame carries its nextTopicId to the gateway: the empty-catalog boot posts frontier 0,
+// a later frame raises it, a lower one never lowers it.  The frame rides the same FIFO as the event's effects,
+// behind them.
+TEST_P(CatalogEffectsRegression, TheFrontierReachesTheGatewayAtBootAndAfterACreateRegression) {
+    SingleNode n("eff_frontier", GetParam());
+    ASSERT_TRUE(CatalogEffectsFixtureAwait(n, 0)) << "the boot posted the empty catalog's frontier";
+    n.applyCreateTopic(0, "events", 1);
+    n.applyFrontier(0, 1);
+    ASSERT_TRUE(CatalogEffectsFixtureAwait(n, 1)) << "after the create";
+    ASSERT_TRUE(n.awaitServes(0, 10s)) << "the frontier covers a topic the gateway knows";
+    n.applyFrontier(1, 1);
+    n.applyCreateTopic(1, "more", 1);
+    n.applyFrontier(2, 2);
+    ASSERT_TRUE(CatalogEffectsFixtureAwait(n, 2));
+    EXPECT_EQ(n.topicState(1) == rune::gateway::TopicRegistry::TopicState::Unknown, false)
+        << "when the frontier covered id 1 the gateway already knew it";
+    n.applyFrontier(3, 1);   // a stale / lower frame
+    n.applyFrontier(4, 3);   // a fence behind it on the same FIFO
+    ASSERT_TRUE(CatalogEffectsFixtureAwait(n, 3)) << "the lower frame was drained before the fence and moved nothing";
+    EXPECT_EQ(n.node()->onControlThreadForTest(
+                  [&] { return n.node()->gatewayForTest()->topicFrontierRegressionsIgnored(); }), 1u);
 }
 
 // Checked writes Part 06: the topic's partitioner reaches the registry, an autoincrement topic's replicas keep the

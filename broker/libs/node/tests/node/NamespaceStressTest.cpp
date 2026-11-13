@@ -67,7 +67,6 @@ constexpr int kSuspended = static_cast<int>(nslc::ErrorCode::NamespaceSuspended)
 constexpr int kLimit = static_cast<int>(nslc::ErrorCode::NamespaceLimitExceeded);
 constexpr int kAuthFailed = static_cast<int>(nslc::ErrorCode::AuthenticationFailed);
 constexpr int kUnknownTopic = static_cast<int>(nslc::ErrorCode::UnknownTopic);
-constexpr int32_t kMissingId = 98'765;
 constexpr int kRestartEvery = 50;
 constexpr std::size_t kMaxNamespaces = 8;
 
@@ -613,7 +612,7 @@ protected:
         std::vector<Obj> objs;
         for (const auto& [l, id] : b.topics) objs.push_back({l, id, false, true});
         for (const auto& [l, id] : b.views) objs.push_back({l, id, true, true});
-        Obj o{"nope" + std::to_string(step), kMissingId, false, false};
+        Obj o{"nope" + std::to_string(step), droppedViewId_, false, false};
         if (!objs.empty() && rnd(100) >= 20) o = objs[rnd(static_cast<uint32_t>(objs.size()))];
         const bool same = a.nsId == b.nsId;
         const bool visible = same && o.exists;
@@ -625,7 +624,7 @@ protected:
                 ASSERT_EQ(got.code, 0) << "own view must be readable";
             } else {
                 ASSERT_NE(got.code, 0) << "a foreign view's row must be hidden (invariant 1)";
-                const Answer twin = probeAs(user, [&](int64_t sid) { return viewRowOf(sid, kMissingId); });
+                const Answer twin = probeAs(user, [&](int64_t sid) { return viewRowOf(sid, droppedViewId_); });
                 ASSERT_EQ(got.code, twin.code) << "hidden view code differs from the missing twin (invariant 2)";
                 ASSERT_EQ(hex(normalized(got, twin)), hex(normalized(twin, got)))
                     << "hidden view answer bytes differ from the missing twin (invariant 2)";
@@ -1117,11 +1116,30 @@ protected:
         }
     }
 
+    /// The id of a view that was created and dropped, the drop applied (bounded waits): the "missing" id of the view
+    /// twin.  A never-allocated id is at or above the applied frontier and is answered NotLeader (#988), not missing.
+    /// Made once, before the seeded sequence, so the sequence stays deterministic.
+    void prepareDroppedViewId() {
+        const int32_t topic = r_.defineTopic(rootSid(), "zgone");
+        ASSERT_GE(topic, 0);
+        ASSERT_TRUE(awaitIds({topic})) << "the scratch topic was never listed";
+        const int32_t view = r_.createView(rootSid(), "zgonev", topic);
+        ASSERT_GE(view, 0);
+        ASSERT_EQ(r_.dropViewCode(rootSid(), "zgonev"), 0);
+        ASSERT_EQ(r_.dropTopicCode(rootSid(), "zgone"), 0);
+        ASSERT_TRUE(awaitIds({}, {topic})) << "the scratch topic's drop was not applied";
+        ASSERT_TRUE(r_.c().pollFor(std::chrono::seconds(10), [&] { return viewRowOf(rootSid(), view).code != 0; }))
+            << "the scratch view's drop was not applied";
+        droppedViewId_ = view;
+    }
+
     void run() {
         const int steps = stepsFromEnv();
         ns_.push_back(NsModel{});
         ns_[0].name = "default";
         rootSid();
+        prepareDroppedViewId();
+        ASSERT_FALSE(HasFatalFailure());
         addUser(ns_[0], "0", "default user");
         ASSERT_FALSE(HasFatalFailure());
         for (int step = 1; step <= steps; ++step) {
@@ -1215,6 +1233,7 @@ protected:
     uint64_t rid_ = 0;
     int sentinels_ = 0;
     Session root_, root2_;
+    int32_t droppedViewId_ = -1;             ///< a created-and-dropped view's id (the missing twin of a view probe)
     int64_t pkeys_ = 0;                      ///< #646: the next unique key of a record produced by id
     std::map<std::string, Session> sess_;
     std::string trace_;

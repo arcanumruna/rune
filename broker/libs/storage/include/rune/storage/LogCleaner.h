@@ -134,9 +134,11 @@ public:
         int64_t     segBase;      ///< base offset of the segment whose walk stopped short
         std::size_t byteOffset;   ///< byte position in that segment's .log where the walk stopped
     };
-    /// Sticky: once a cleaning walk stops before the end of a segment (a batch failing the bounds check or its CRC, or
-    /// trailing bytes shorter than a batch), this cleaner reads and changes nothing more.  The cleaner never installs
-    /// the part it walked: every intact record behind the damage would be dropped.  Cleared only by a restart.
+    /// Sticky for the life of this LogCleaner, which is one pass: once a cleaning walk stops before the end of a
+    /// segment (a batch failing the bounds check or its CRC, or trailing bytes shorter than a batch), this cleaner
+    /// reads and changes nothing more.  The cleaner never installs the part it walked: every intact record behind the
+    /// damage would be dropped.  The agent's per-log mark (LogCleanerAgent::DamageMark) is what persists, until the
+    /// damaged segment file is replaced or the broker restarts.
     [[nodiscard]] bool uncleanable() const noexcept { return damaged_.has_value(); }
     [[nodiscard]] std::optional<Damaged> damage() const noexcept { return damaged_; }
 
@@ -491,7 +493,7 @@ private:
     Offset  verdictMarkerEnd_       = 0;
     Offset  txnJudgeBound_          = 0;
     int64_t rewriteSegmentsRead_    = 0;
-    std::optional<Damaged> damaged_{};   ///< sticky uncleanable state (see uncleanable())
+    std::optional<Damaged> damaged_{};   ///< uncleanable state, kept for this pass only (see uncleanable())
     /// A walk of `segBase` stopped at `pos` short of its end: enter the uncleanable state (first time: log once).
     void noteDamage_(const std::string& dir, int64_t segBase, std::size_t pos);
     uint64_t* deferredSeq_          = nullptr;   ///< non-null = deferred-install mode

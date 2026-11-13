@@ -94,9 +94,37 @@ A topic's schema is one evolving descriptor that carries every field ever declar
   untouched.
 - **Optimistic concurrency**: `AlterTopic.expectedVersion` must equal the topic's current version, else `SchemaConflict`
   (31).
-- A new version never invalidates old data, and a client generated against an older version keeps working: the broker
+- A new version never invalidates old data, and a client generated against an older version keeps working (until the
+  version is retired, below): the broker
   selects the schema version whose fingerprint matches the one the client was compiled with
   (`GetTopicSchema.requestedFingerprint`), and every `send` stamps that version.
+
+### Retiring old versions
+
+Once every producer has moved to a newer build, `alter topic NAME retire version < N` makes the broker refuse the old
+ones. It matters most after a `drop column` done for data reasons: a stale producer would otherwise keep writing the
+dropped field and be accepted.
+
+- **What is refused.** A produced record whose stamped schema version is below `N` is refused with `SchemaVersionRetired`
+  (67), nothing is stored, and the producer's sequence is untouched (the same path as `SchemaValidationFailed`: its next
+  valid batch is accepted). A typed open (`GetTopicSchema`) that resolves, by fingerprint, to a version below `N` is
+  refused with the same code; a request for the current schema is served as ever. The error is terminal for the client,
+  never retried.
+- **What is not touched.** History: stored records of a retired version stay readable by consumers, views, filters, the key
+  index, lease replay, follower catch-up and recovery. Only the produce admission and the typed open look at the floor. A
+  tombstone carries no version and is never refused for one.
+- **Rules.** The floor only moves forward and never passes the current version (`retiredBelow < N <= schemaVersion`),
+  so the current version can never be retired. The topic must be typed. It needs every broker at feature level 7
+  (`kSchemaRetire`); the catalog event is `RetireSchemaVersions` (kind 10, catalog `formatVer` 5).
+- **When it takes effect, and the race.** It takes effect on each broker when that broker applies the catalog event, as
+  every DDL does. A batch from an old producer racing the retire is either appended (it reached the leader's worker
+  before the worker took the new write spec) or refused with `SchemaVersionRetired`; both are explicit answers.
+- **Rolling upgrade: when and how to retire.** Upgrade every producer first. Then read `rune stats topic NAME`: the stat
+  `schemaRetiredBelow` is the current floor, and `producedAtVersion<V>` is the number of records the answering partition
+  leader's worker accepted at schema version V for the topic (all its partitions of that topic) since it started. A version
+  is unused when every partition leader reports no count for it (a count restarts at 0 with the broker, so also check
+  after a leader change). Then `alter topic NAME retire version < N`. Statistics list a version only once it has a
+  non-zero count, lowest first, and versions of 32768 and above are not reported.
 
 ```cpp
 #include <rune/codec/Evolve.h>

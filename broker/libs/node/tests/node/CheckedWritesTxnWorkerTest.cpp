@@ -1788,3 +1788,107 @@ TEST(CheckedWritesTxnWorkerRegression, HoldInsideChainedOrdinarySpansCountsFromT
     EXPECT_TRUE(k.r.driveUntilJudged());
     EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{2, 3, 4}));
 }
+
+// ---------------------------------------------------------------------------
+// #995: a vote parked behind a judge that is paused on another transaction is told so (an interim, TxnVoteResult with errorCode
+// kTxnVoteWaiting naming the holder), once per holder; the coordinator builds its wait-for graph from them.  The interim is no
+// answer: the real vote follows when the judge goes on.
+// ---------------------------------------------------------------------------
+namespace {
+using Holder = std::pair<int64_t, int16_t>;
+}
+
+// The pause on a row a judged, undecided transaction holds: exactly one interim naming the holder, however many passes the pause lasts.
+TEST(CheckedWritesTxnWaitRegression, AVoteBehindARowLockIsToldItsHolderOnceRegression) {
+    Ki k;
+    k.txn(44, {ins(1)});
+    ASSERT_EQ(k.vote(44).code, 0);   // 44 is judged and holds key 1 until its marker
+    k.txn(47, {ins(1)});
+    const int64_t tok = k.r.sendVote(VerdictRig::kSrc, 47, 0);
+    k.r.passes(40);
+    EXPECT_FALSE(k.r.voteReply(tok)) << "the judge cannot judge 47's J while 44 holds key 1";
+    EXPECT_EQ(k.r.voteInterims(tok), (std::vector<Holder>{{44, 0}})) << "one interim, naming 44";
+    k.r.passes(40);
+    EXPECT_EQ(k.r.voteInterims(tok).size(), 1u) << "never one per pass";
+    EXPECT_EQ(k.r.worker->txnVoteInterimsForTest(), 1u);
+    k.r.marker(44, true);
+    ASSERT_TRUE(k.r.driveUntilVoted(tok));
+    EXPECT_EQ(k.r.voteReply(tok)->errorCode, 0);
+    EXPECT_EQ(k.r.voteReply(tok)->code, kKeyExists) << "the real vote follows the interim: 44 inserted key 1 first";
+    EXPECT_EQ(k.r.voteInterims(tok).size(), 1u);
+}
+
+// The holder changes while the vote is pending: one more interim, naming the new holder.
+TEST(CheckedWritesTxnWaitRegression, AChangedHolderIsToldAgainRegression) {
+    Ki k;
+    k.txn(44, {ins(1)});
+    ASSERT_EQ(k.vote(44).code, 0);
+    k.txn(45, {ins(2)});
+    ASSERT_EQ(k.vote(45).code, 0);
+    k.txn(47, {ins(1), ins(2)});
+    const int64_t tok = k.r.sendVote(VerdictRig::kSrc, 47, 0);
+    k.r.passes(40);
+    ASSERT_EQ(k.r.voteInterims(tok), (std::vector<Holder>{{44, 0}}));
+    k.r.marker(44, true);   // 44's rows are free: the judge goes on to 47's second record, which 45 holds
+    k.r.passes(40);
+    EXPECT_FALSE(k.r.voteReply(tok));
+    EXPECT_EQ(k.r.voteInterims(tok), (std::vector<Holder>{{44, 0}, {45, 0}})) << "the new holder, once";
+    k.r.marker(45, true);
+    ASSERT_TRUE(k.r.driveUntilVoted(tok));
+    EXPECT_EQ(k.r.voteReply(tok)->errorCode, 0);
+    EXPECT_EQ(k.r.voteInterims(tok).size(), 2u);
+}
+
+// A vote asked again while the judge is still paused (a coordinator re-ask is a new token) is told too.
+TEST(CheckedWritesTxnWaitRegression, AReaskedVoteIsToldAgainRegression) {
+    Ki k;
+    k.txn(44, {ins(1)});
+    ASSERT_EQ(k.vote(44).code, 0);
+    k.txn(47, {ins(1)});
+    const int64_t first = k.r.sendVote(VerdictRig::kSrc, 47, 0);
+    k.r.passes(40);
+    ASSERT_EQ(k.r.voteInterims(first).size(), 1u);
+    const int64_t again = k.r.sendVote(VerdictRig::kSrc, 47, 0);
+    k.r.passes(40);
+    EXPECT_EQ(k.r.voteInterims(again), (std::vector<Holder>{{44, 0}})) << "the new vote is told the same holder";
+    EXPECT_EQ(k.r.voteInterims(first).size(), 1u) << "the first one is not told twice";
+    k.r.marker(44, true);
+    ASSERT_TRUE(k.r.driveUntilVoted(first));
+    ASSERT_TRUE(k.r.driveUntilVoted(again));
+}
+
+// No single holder: nothing is sent.  With every overlay of the pool Locked, a judgement that finds none free waits (the pool grows
+// by one at the end of the pass); the wait is bounded by the transaction timeout and tells nobody.
+TEST(CheckedWritesTxnWaitRegression, AWaitForAnOverlayNamesNoHolderRegression) {
+    Ki k;
+    for (int64_t pid = 60; pid < 60 + int64_t(rune::view::kTxnOverlaysPerWorker); ++pid) {
+        k.txn(pid, {ins(pid)});
+        ASSERT_EQ(k.vote(pid).code, 0);
+    }
+    ASSERT_EQ(k.r.vs->txnOverlaysForTest().freeCount(), 0u);
+    k.txn(99, {ins(99)});
+    const int64_t tok = k.r.sendVote(VerdictRig::kSrc, 99, 0);
+    ASSERT_TRUE(k.r.driveUntilVoted(tok));
+    EXPECT_EQ(k.stats().txnOverlayWaits, 1u) << "the judgement did wait for an overlay";
+    EXPECT_TRUE(k.r.voteInterims(tok).empty());
+    EXPECT_EQ(k.r.worker->txnVoteInterimsForTest(), 0u);
+}
+
+// The parked-vote table: the holder's own producer is never told; a repeated holder is not told twice; no holder resets.
+TEST(CheckedWritesTxnWaitRegression, TheParkedVoteTableTellsEachVoteOncePerHolderRegression) {
+    TxnJudgeState st;
+    st.reserve();
+    ASSERT_TRUE(st.parkVote(ParkedVote{1, -1, 5, 0}));
+    ASSERT_TRUE(st.parkVote(ParkedVote{2, -1, 6, 0}));
+    std::vector<int64_t> told;
+    const auto tell = [&](const ParkedVote& v) { told.push_back(v.token); return true; };
+    EXPECT_EQ(st.noteJudgeWait(5, 0, tell), 1) << "producer 5 is the holder: only 6 is told";
+    EXPECT_EQ(told, std::vector<int64_t>{2});
+    EXPECT_EQ(st.noteJudgeWait(5, 0, tell), 0) << "the same holder is not told again";
+    EXPECT_EQ(st.noteJudgeWait(6, 0, tell), 1) << "a new holder: producer 5's vote is told, 6 is its own";
+    EXPECT_EQ(told, (std::vector<int64_t>{2, 1}));
+    EXPECT_EQ(st.noteJudgeWait(-1, 0, tell), 0) << "no known holder: nothing sent, the memory resets";
+    EXPECT_EQ(st.noteJudgeWait(5, 0, tell), 1) << "paused on 5 again: told again";
+    EXPECT_EQ(st.noteJudgeWait(7, 3, [](const ParkedVote&) { return false; }), 0) << "a refused interim is not recorded";
+    EXPECT_EQ(st.noteJudgeWait(7, 3, tell), 2) << "so it is asked again";
+}

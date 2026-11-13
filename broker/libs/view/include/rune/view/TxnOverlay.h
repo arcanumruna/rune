@@ -24,8 +24,13 @@ enum class OverlayTable : uint8_t { View = 0, Owners = 1, Contributors = 2, Grou
 class TxnOverlay {
 public:
     void reserve(std::size_t rows, uint32_t maxRowLen);   // cold
-    void bind(uint64_t sourceKey) noexcept { sourceKey_ = sourceKey; }
+    void bind(uint64_t sourceKey) noexcept { sourceKey_ = sourceKey; ownerPid_ = -1; ownerEpoch_ = 0; }
     [[nodiscard]] uint64_t sourceKey() const noexcept { return sourceKey_; }
+    /// #995: the transaction whose rows this overlay holds (cold: set when its judgement begins).  -1 = none known: a pause on
+    /// such an overlay names no holder.
+    void setOwner(int64_t producerId, int16_t producerEpoch) noexcept { ownerPid_ = producerId; ownerEpoch_ = producerEpoch; }
+    [[nodiscard]] int64_t ownerPid() const noexcept { return ownerPid_; }
+    [[nodiscard]] int16_t ownerEpoch() const noexcept { return ownerEpoch_; }
     void clear() noexcept;
     // A put or erase found no free slot since the last clear().
     [[nodiscard]] bool full() const noexcept { return full_; }
@@ -68,6 +73,8 @@ private:
     std::size_t          used_ = 0;
     uint32_t             maxRowLen_ = 0;
     uint64_t             sourceKey_ = 0;
+    int64_t              ownerPid_ = -1;
+    int16_t              ownerEpoch_ = 0;
     bool                 full_ = false;
 };
 
@@ -83,10 +90,15 @@ inline constexpr std::size_t kTxnOverlaysPerWorker = 8;
 // The overlays a worker holds for one source: a record that reads or writes one of their rows waits.
 struct TxnLockSet {
     std::span<const TxnOverlay* const> locked;
+    /// #995: the first overlay a contains() found holding a row since the owner last cleared it: the holder a pause names.
+    mutable const TxnOverlay*          hit = nullptr;
     // `except` is the overlay being chained: a transaction never locks itself.
     [[nodiscard]] bool contains(uint8_t member, OverlayTable table, const ViewKey& key, const TxnOverlay* except = nullptr) const noexcept {
         for (const TxnOverlay* o : locked)
-            if (o != except && o->contains(member, table, key)) return true;
+            if (o != except && o->contains(member, table, key)) {
+                if (hit == nullptr) hit = o;
+                return true;
+            }
         return false;
     }
 };

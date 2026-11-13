@@ -84,6 +84,8 @@ enum class ReplicationTemplateId : uint16_t {
     VerifyTxnPartitionResponse = 14,  // #112: txn coordinator → partition leader (hand-rolled)
     TxnVote                  = 15,  // C18: txn coordinator → partition leader (hand-rolled)
     TxnVoteResponse          = 16,  // C18: partition leader → txn coordinator (hand-rolled)
+    RepairFetchReq           = 17,  // #880: damaged-segment repair pull (req), FetchRequest layout
+    RepairFetchResp          = 18,  // #880: damaged-segment repair pull (resp), FetchResponse layout
 };
 
 // DR-BUG-6: reconcile-pull template ids.  The reconcile request/response reuse
@@ -92,6 +94,29 @@ enum class ReplicationTemplateId : uint16_t {
 // instead of the normal onFetchRequest()/applyReplicated() path.
 inline constexpr uint16_t kReconcileFetchReqTemplateId  = 5;
 inline constexpr uint16_t kReconcileFetchRespTemplateId = 6;
+
+// #880: segment-repair pull template ids.  They reuse the FetchRequest / FetchResponse WIRE LAYOUT unchanged (no block
+// length change, no schema bump) with a DISTINCT templateId, and carry their extra facts in fields the pair leaves
+// unused:
+//   RepairFetchReq  (FetchRequest layout):
+//     fetchOffset          = the cursor: the first offset wanted;
+//     maxBytes             = the most record bytes the asker takes (a first batch larger than it is still served);
+//     incarnation          = the asker's ATTEMPT id (a response whose echo differs is stale and ignored);
+//     lastEpochStartOffset = endOffset: the exclusive upper bound of the wanted range (the damaged segment's end);
+//     leaderEpoch / partition / followerId / topicId as in a fetch; lastFetchedEpoch -1, storageId 0.
+//   RepairFetchResp (FetchResponse layout):
+//     errorCode            = the status: kErrNone (batches follow), kRepairDone, kRepairRefused;
+//     records              = whole batches with base offset in [fromOffset, endOffset);
+//     fromOffset           = the request's cursor, echoed;
+//     logStartOffset       = the request's attempt id, echoed;
+//     highWatermark        = the answering peer's high watermark; leaderEpoch = its epoch.
+inline constexpr uint16_t kRepairFetchReqTemplateId  = 17;
+inline constexpr uint16_t kRepairFetchRespTemplateId = 18;
+/// RepairFetchResp status: no batch below the request's endOffset remains at or above the cursor.
+inline constexpr int16_t kRepairDone    = 1;
+/// RepairFetchResp status: this peer cannot serve the range (not below its high watermark, damaged there, not a
+/// replica of the partition, ...).
+inline constexpr int16_t kRepairRefused = 2;
 
 // ---------------------------------------------------------------------------
 // Internal little-endian helpers (UB-free via memcpy; optimises to mov)
@@ -483,8 +508,11 @@ inline constexpr int16_t kTxnPartitionVerify = 4;
 inline constexpr int16_t kCheckedWrites = 5;
 /// Lease topics: every broker serves lease DDL, the lease write hook and expiry. Lease DDL is refused below it.
 inline constexpr int16_t kLeases = 6;
+/// Schema retire (#419): every broker decodes catalog formatVer 5 (the RetireSchemaVersions event) and its workers refuse a
+/// produce whose record version is below the topic's retire floor.  `alter topic .. retire version < N` is refused below it.
+inline constexpr int16_t kSchemaRetire = 7;
 /// The level this binary supports.
-inline constexpr int16_t kLatest = kLeases;
+inline constexpr int16_t kLatest = kSchemaRetire;
 } // namespace MetadataFeature
 
 struct AlterIsrMsg {
@@ -582,6 +610,9 @@ struct AlterIsrMsg {
     static constexpr int kNodeStorageLoSlot     = 7;
     static constexpr int kNodeStorageHiSlot     = 8;
     static constexpr int kNodeStorageOriginSlot = 9;
+    /// #612: the sender's soft RLIMIT_NOFILE clamped to INT32_MAX; 0 = unknown / an older binary.  Slot 10 is written
+    /// by no other node-control frame (register, shutdown, confirm, halted marks and lineage reports use slots 0-9).
+    static constexpr int kNodeFdLimitSlot = 10;
     static constexpr int32_t kStorageOriginNone      = 0;
     static constexpr int32_t kStorageOriginFounder   = 1;
     static constexpr int32_t kStorageOriginLegacy    = 2;
@@ -1069,11 +1100,20 @@ struct VerifyTxnPartitionResponseMsg : VerifyTxnPartitionMsg {
 //   producerId        : int64 @ +16
 //   coordinatorEpoch  : int32 @ +24
 //   producerEpoch     : int16 @ +28
-//   errorCode         : int16 @ +30   transport: 0, NotLeader or InvalidTxnState
+//   errorCode         : int16 @ +30   transport: 0, NotLeader or InvalidTxnState; kTxnVoteWaiting = an interim (below)
 //   code              : uint16 @ +32  the vote: 0 = yes, else the rejection code   (+34..35 pad)
 //   constraintId      : uint32 @ +36
 //   failingOffset     : int64 @ +40
+//
+// The interim (#995): while the partition's judge is paused on a row a judged, undecided transaction U holds, the leader
+// answers each pending vote once with errorCode = kTxnVoteWaiting, failingOffset = U's producer id and constraintId = U's
+// producer epoch (as uint32); code is 0.  It does not complete the vote: the real answer follows.  The block length is
+// unchanged.  An older coordinator sees a non-zero errorCode (a transport error) and asks again with its backoff.
 // ===========================================================================
+/// errorCode of an interim TxnVoteResponse.  Not a client ErrorCode (those are positive) and not one of the replication
+/// plane's kErr* codes (-1 .. -12): a transport status that no other path produces.
+inline constexpr int16_t kTxnVoteWaiting = -100;
+
 struct TxnVoteMsg {
     static constexpr uint16_t    TEMPLATE_ID  = 15;
     static constexpr uint16_t    BLOCK_LENGTH = 40;

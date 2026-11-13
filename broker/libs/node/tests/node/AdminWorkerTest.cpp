@@ -927,6 +927,69 @@ TEST(AdminWorkerRegression, AnUnknownFdLimitNeverRefusesRegression) {
     EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 0u);
 }
 
+// #612: the budget is the smallest open-file limit in the cluster, not only this broker's own.  The control thread
+// tells the admin thread the smallest limit any broker advertised and whose it is (setClusterFdLimit).
+TEST(AdminWorkerRegression, ADdlAboveAPeersFdBudgetIsRefusedBeforeItIsAppendedRegression) {
+    const uint64_t small = fdNeedBase() + 100;
+    const uint64_t large = 10'000'000;
+    {   // own limit large, a peer's small: refused, naming the peer
+        CatalogDdlRig rig("aw_fd_peer_create", 1, 1, 0, /*fdLimit=*/large);
+        rig.becomeServingLeader();
+        rig.admin().setClusterFdLimit(small, 3);
+        EXPECT_EQ(rig.admin().clusterFdLimit(), small);
+        EXPECT_EQ(rig.admin().clusterFdLimitNode(), 3);
+        const std::size_t events = rig.recordedLog().size();
+        const auto big = defineWith(rig, "big", 1000, 1LL << 20, 10LL << 20);
+        EXPECT_EQ(big.code, 39) << "InvalidRequest: " << big.detail;
+        const std::string want = "above the open-file limit " + std::to_string(small) +
+                                 " of broker 3 (the smallest in the cluster)";
+        EXPECT_NE(big.detail.find(want), std::string::npos) << big.detail;
+        EXPECT_EQ(rig.recordedLog().size(), events) << "nothing appended";
+        EXPECT_EQ(rig.admin().applier().state().topicByName(rune::catalog::kDefaultNsId, "big"), nullptr);
+        EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 1u);
+        EXPECT_EQ(defineWith(rig, "small", 1).code, 0) << "a topic within the smallest budget is admitted";
+    }
+    {   // the cluster limit above the own one: the own limit rules, with the unchanged wording
+        CatalogDdlRig rig("aw_fd_peer_above", 1, 1, 0, /*fdLimit=*/small);
+        rig.becomeServingLeader();
+        rig.admin().setClusterFdLimit(large, 3);
+        const auto big = defineWith(rig, "big", 1000);
+        EXPECT_EQ(big.code, 39) << big.detail;
+        EXPECT_NE(big.detail.find("above its open-file limit " + std::to_string(small)), std::string::npos)
+            << big.detail;
+        EXPECT_EQ(big.detail.find("of broker"), std::string::npos) << big.detail;
+        EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 1u);
+    }
+    {   // an unknown own limit does not hide a known peer limit
+        CatalogDdlRig rig("aw_fd_peer_ownzero", 1, 1, 0, /*fdLimit=*/0);
+        rig.becomeServingLeader();
+        rig.admin().setClusterFdLimit(small, 2);
+        const auto big = defineWith(rig, "big", 1000);
+        EXPECT_EQ(big.code, 39) << big.detail;
+        EXPECT_NE(big.detail.find("of broker 2"), std::string::npos) << big.detail;
+    }
+    {   // both unknown: admitted
+        CatalogDdlRig rig("aw_fd_peer_bothzero", 1, 1, 0, /*fdLimit=*/0);
+        rig.becomeServingLeader();
+        EXPECT_EQ(defineWith(rig, "big", 1000).code, 0);
+        EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 0u);
+    }
+    {   // an ALTER that grows the need: the same table
+        CatalogDdlRig rig("aw_fd_peer_alter", 1, 1, 0, /*fdLimit=*/large);
+        rig.becomeServingLeader();
+        ASSERT_EQ(defineWith(rig, "t", 1, 1LL << 20).code, 0);
+        rig.admin().setClusterFdLimit(small, 3);
+        const std::size_t events = rig.recordedLog().size();
+        const auto a = rig.alterConfig("t", {{rc::ConfigKey::RetentionBytes, 1LL << 30}});
+        EXPECT_EQ(a.code, 39) << a.detail;
+        EXPECT_NE(a.detail.find("of broker 3 (the smallest in the cluster)"), std::string::npos) << a.detail;
+        EXPECT_EQ(rig.recordedLog().size(), events);
+        EXPECT_EQ(rig.alterConfig("t", {{rc::ConfigKey::RetentionBytes, 10LL << 20}}).code, 0) << "within the budget";
+        rig.admin().setClusterFdLimit(0, -1);   // the peer is not known any more
+        EXPECT_EQ(rig.alterConfig("t", {{rc::ConfigKey::RetentionBytes, 1LL << 30}}).code, 0) << "own limit only";
+    }
+}
+
 // ── PR #611 review, adversarial pass (issue #296: DDL admission against the open-file budget) ──────────────────────
 namespace {
 uint64_t needOfOne(int32_t partitions, int64_t segmentBytes, int64_t retentionBytes) {
@@ -1024,4 +1087,142 @@ TEST(PostSecurityResponseDeathRegression, AnAnswerThatCannotBePostedHaltsRegress
             agent.postSecurityResponse(/*session=*/7, /*corr=*/9, /*code=*/0, 0, 0, gateOffset, "ok");
         }, "halting rather than dropping the answer") << "gateOffset " << gateOffset;
     }
+}
+
+// ── schema retire (#419): ALTER TOPIC <t> RETIRE VERSION < N ─────────────────────────────────────────────────────────────
+namespace {
+AlterOp retireOp(uint16_t below) {
+    AlterOp op{}; op.type = AlterOpType::RetireBelow; op.version = below; return op;
+}
+/// A typed "characters" topic with `versions` schema versions, at the retire feature level.
+int32_t retireFixture(CatalogDdlRig& rig, uint16_t versions) {
+    rig.admin().setClusterFeatureLevel(rune::replication::MetadataFeature::kSchemaRetire);
+    rig.becomeServingLeader();
+    const auto d = define(rig, "characters", 2, /*validate=*/true, charsBlob());
+    EXPECT_EQ(d.code, 0);
+    for (uint16_t v = 2; v <= versions; ++v)
+        EXPECT_EQ(rig.alter("characters", {addOp("f" + std::to_string(v), PrimType::Int64)}).code, 0);
+    return d.topicId;
+}
+}  // namespace
+
+TEST(AdminWorkerRegression, RetireIsAcceptedAsAFormatFiveEventAndOnlyTheWriteSpecFollowsRegression) {
+    CatalogDdlRig rig("aw_retire_ok", 1);
+    const int32_t tid = retireFixture(rig, 3);
+    const std::size_t schemaEffects = countEffects(rig, "schemaChanged:");
+    const std::size_t logSize = rig.recordedLog().size();
+    const auto a = rig.alter("characters", {retireOp(3)});
+    ASSERT_EQ(a.code, 0) << a.detail;
+    const auto log = rig.recordedLog();
+    ASSERT_EQ(log.size(), logSize + 1);
+    const auto& ev = log.back().event;
+    EXPECT_EQ(ev.kind, rc::EventKind::RetireSchemaVersions);
+    EXPECT_EQ(ev.formatVer, rc::kFormatV5);
+    EXPECT_EQ(std::get<rc::RetireSchemaVersionsOps>(ev.ops).below, 3);
+    const RegistryEntry* e = rig.schemas().byName("characters");
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->version, 3) << "the current schema version does not move";
+    EXPECT_EQ(e->retiredBelow, 3);
+    EXPECT_EQ(rig.admin().applier().state().topicByTopicId(tid)->schema->retiredBelow, 3);
+    // the effect is the write spec ONLY: no validator re-post, no filter schema (schemaChanged)
+    EXPECT_EQ(countEffects(rig, "schemaChanged:"), schemaEffects);
+    ASSERT_FALSE(rig.writeSpecEffects().empty());
+    EXPECT_EQ(rig.writeSpecEffects().back(), (CatalogDdlRig::FloorPost{tid, 3}));
+    // a later ALTER keeps the floor in the registry and in the write spec the workers get
+    ASSERT_EQ(rig.alter("characters", {addOp("f4", PrimType::Int64)}).code, 0);
+    EXPECT_EQ(rig.schemas().byName("characters")->retiredBelow, 3);
+    EXPECT_EQ(rig.writeSpecEffects().back(), (CatalogDdlRig::FloorPost{tid, 3}));
+    // two retires in sequence
+    EXPECT_EQ(rig.alter("characters", {retireOp(4)}).code, 0);
+    EXPECT_EQ(rig.schemas().byName("characters")->retiredBelow, 4);
+}
+
+TEST(AdminWorkerRegression, RetireRefusalsAnswerWithTheApplyRulesTextAndAppendNothingRegression) {
+    CatalogDdlRig rig("aw_retire_refuse", 1);
+    retireFixture(rig, 3);
+    ASSERT_EQ(rig.alter("characters", {retireOp(2)}).code, 0);
+    const std::size_t logSize = rig.recordedLog().size();
+    struct Case { const char* name; uint16_t below; const char* why; };
+    const Case cases[] = {
+        {"the same floor again", 2, "already retired"},
+        {"a lower floor", 1, "already retired"},
+        {"zero", 0, "already retired"},
+        {"past the current version", 4, "above the current version 3"},
+        {"far past", 60000, "above the current version 3"},
+    };
+    for (const Case& c : cases) {
+        const auto r = rig.alter("characters", {retireOp(c.below)});
+        EXPECT_EQ(r.code, 23) << c.name;   // InvalidSchema, as every schema DDL refusal
+        EXPECT_NE(r.detail.find(c.why), std::string::npos) << c.name << ": " << r.detail;
+    }
+    // combined with another operation: refused whole, text names it
+    const auto combined = rig.alter("characters", {addOp("zzz", PrimType::Int64), retireOp(3)});
+    EXPECT_EQ(combined.code, 23);
+    EXPECT_NE(combined.detail.find("RETIRE VERSION cannot be combined"), std::string::npos) << combined.detail;
+    const auto twice = rig.alter("characters", {retireOp(3), retireOp(3)});
+    EXPECT_EQ(twice.code, 23);
+    EXPECT_NE(twice.detail.find("RETIRE VERSION cannot be combined"), std::string::npos) << twice.detail;
+    // an unknown topic and an untyped one
+    EXPECT_EQ(rig.alter("nope", {retireOp(2)}).code, 7);
+    DefineTopicMsg raw;
+    raw.session = rig.sessionId(); raw.corr = rig.nextCorr(); raw.name = "plain"; raw.partitionCount = 1;
+    raw.meta.sessionId = rig.sessionId(); raw.meta.requestId = rig.freshRequestId();
+    ASSERT_EQ(rig.submitRaw(DdlRequest{std::move(raw)}).code, 0);
+    EXPECT_EQ(rig.alter("plain", {retireOp(2)}).code, 7) << "an untyped topic has no schema";
+    EXPECT_EQ(rig.recordedLog().size(), logSize + 1) << "only the untyped topic's create was appended";
+    EXPECT_EQ(rig.schemas().byName("characters")->retiredBelow, 2) << "no refusal moved the floor";
+}
+
+TEST(AdminWorkerRegression, RetireIsRefusedBelowTheClusterFeatureLevelRegression) {
+    CatalogDdlRig rig("aw_retire_level", 1);
+    rig.admin().setClusterFeatureLevel(rune::replication::MetadataFeature::kLeases);   // one below
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 1, true, charsBlob()).code, 0);
+    ASSERT_EQ(rig.alter("characters", {addOp("score", PrimType::Int64)}).code, 0);
+    const std::size_t logSize = rig.recordedLog().size();
+    const auto r = rig.alter("characters", {retireOp(2)});
+    EXPECT_EQ(r.code, 39);   // InvalidRequest
+    EXPECT_NE(r.detail.find("needs every broker upgraded"), std::string::npos) << r.detail;
+    EXPECT_EQ(rig.recordedLog().size(), logSize) << "no event is written";
+    rig.admin().setClusterFeatureLevel(rune::replication::MetadataFeature::kSchemaRetire);
+    EXPECT_EQ(rig.alter("characters", {retireOp(2)}).code, 0) << "the same statement is fine once the level is reached";
+}
+
+TEST(AdminWorkerRegression, ATypedOpenOfARetiredVersionIsRefusedAndTheCurrentOneIsServedRegression) {
+    CatalogDdlRig rig("aw_retire_open", 1);
+    const int32_t tid = retireFixture(rig, 3);
+    const uint64_t fp1 = rig.schemas().byIdVersion(tid, 1)->fingerprint;
+    const uint64_t fp2 = rig.schemas().byIdVersion(tid, 2)->fingerprint;
+    const uint64_t fp3 = rig.schemas().byIdVersion(tid, 3)->fingerprint;
+    ASSERT_NE(fp1, fp2);
+    ASSERT_NE(fp2, fp3);
+    // before the retire every version opens
+    EXPECT_EQ(rig.getSchema("characters", fp1).code, 0);
+    ASSERT_EQ(rig.alter("characters", {retireOp(3)}).code, 0);
+    EXPECT_EQ(rig.getSchema("characters", fp1).code, 67) << "SchemaVersionRetired";
+    EXPECT_EQ(rig.getSchema("characters", fp2).code, 67);
+    const auto cur = rig.getSchema("characters", fp3);
+    EXPECT_EQ(cur.code, 0);
+    EXPECT_EQ(cur.version, 3);
+    EXPECT_EQ(rig.getSchema("characters").code, 0) << "the latest (fingerprint 0) is served as today";
+    EXPECT_EQ(rig.getSchema("characters", rune::protocol::client::kSchemaLineageFingerprint).code, 0)
+        << "the lineage (every version's fields, for decoding stored records) is still served";
+    // the same answers across a restart (the registry is rebuilt from the log)
+    rig.restart();
+    rig.admin().setClusterFeatureLevel(rune::replication::MetadataFeature::kSchemaRetire);
+    rig.becomeServingLeader();
+    EXPECT_EQ(rig.getSchema("characters", fp1).code, 67);
+    EXPECT_EQ(rig.getSchema("characters", fp3).code, 0);
+}
+
+// Applier: the write spec (the floor) is posted live on apply and again at boot replay.
+TEST(AdminWorkerRegression, TheRetireFloorIsPostedToTheWorkersOnApplyAtBootAndAfterALaterAlterRegression) {
+    CatalogDdlRig rig("aw_retire_boot", 1);
+    const int32_t tid = retireFixture(rig, 3);
+    ASSERT_EQ(rig.alter("characters", {retireOp(2)}).code, 0);
+    EXPECT_EQ(rig.writeSpecEffects().back(), (CatalogDdlRig::FloorPost{tid, 2})) << "on apply";
+    rig.restart();
+    ASSERT_FALSE(rig.bootWriteSpecEffects().empty()) << "the boot replay posts the write spec of every typed topic";
+    EXPECT_EQ(rig.bootWriteSpecEffects().back(), (CatalogDdlRig::FloorPost{tid, 2})) << "at boot replay: the floor is restored";
+    EXPECT_EQ(rig.schemas().byName("characters")->retiredBelow, 2) << "and in the registry";
 }

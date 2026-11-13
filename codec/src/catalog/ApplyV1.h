@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <variant>
 
 namespace rune::catalog {
@@ -18,6 +19,13 @@ struct StagedCreate { StagedObject object; };                                  /
 struct StagedUpdate { StagedObject object; int32_t retiredSinkTopicId = -1; };  // the rest of the puts; AlterView: the old sink
 struct StagedRemove { uint64_t objectId; Tombstone tomb; int32_t droppedTopicId; };   // DropTopic, DropView
 using Staged = std::variant<StagedCreate, StagedUpdate, StagedRemove>;
+
+/// The live topic `e` names (objectId, namespace, name and version chain agree), or the Precondition.  The later
+/// formatVers' object rules reuse it; it is the helper ApplyV1's own table runs.
+[[nodiscard]] std::expected<const TopicObject*, ApplyError> liveTopicOf(const CatalogState& s, const CatalogEvent& e,
+                                                                        int64_t offset);
+/// Precondition if `t` is untyped or its schema version is exhausted; nullopt = fine.
+[[nodiscard]] std::optional<ApplyError> schemaVersionErrorOf(const CatalogEvent& e, int64_t offset, const TopicObject& t);
 
 struct ApplyV1 {
     /// Check every rule of the table against `s` and build the change.  Never mutates `s`.

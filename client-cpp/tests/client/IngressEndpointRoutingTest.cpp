@@ -720,6 +720,31 @@ TEST(IngressEndpointRouting, SubscribeRedirectedToAnUnreachableNodeIsRetriedRegr
     EXPECT_GT(r.gw.metadataRequests, md) << "no metadata asked after the failed retarget";
 }
 
+// #767: the seed's move to a redirect target is asynchronous.  A target that never resolves ends the move as FAILED:
+// the same observable outcome as the old blocking retarget that returned false - the seed keeps its publication, its
+// session and its state (no post-action of a successful move ran), the op takes its retry path (metadata asked,
+// Subscribe re-sent).
+TEST(ClientRegression, ARedirectWhoseTargetNeverResolvesTakesTheFailurePathRegression) {
+    Rig r(3936, 3937, "aeron:ipc", "aeron:ipc", /*realClock=*/true);
+    r.connect();
+    const std::string seedBefore  = r.client.testSeedChannel();
+    const uint64_t    movesBefore = r.client.testSeedMoves();
+    const int         connects    = r.gw.connects;
+    r.gw.subscribeRedirectNext = 1;
+    r.gw.subscribeRedirectTo   = "rune-unresolvable.invalid:40200";
+    const int md = r.gw.metadataRequests;
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.gw.latestSubscription(1, 0) != nullptr || sub.finished(); }))
+        << "the redirected Subscribe was never re-sent";
+    EXPECT_FALSE(sub.finished());
+    EXPECT_GT(r.gw.metadataRequests, md) << "the failure path asks for metadata";
+    EXPECT_FALSE(r.client.testTransport().seedRetargetPending()) << "the move ended";
+    EXPECT_EQ(r.client.testSeedChannel(), seedBefore) << "the old publication stays";
+    EXPECT_EQ(r.client.testSeedMoves(), movesBefore) << "a failed move ran none of a successful move's post-actions";
+    EXPECT_EQ(r.gw.connects, connects) << "no reconnect: the redirect did not move the seed";
+}
+
 // DR-15 review MAJOR-1: only the redirected Subscribe is re-sent.  Another
 // Subscribe still awaiting its own answer is never sent twice (a duplicate would
 // register a second, leaked subscription broker-side).
@@ -867,4 +892,57 @@ TEST(ClientSessionRegression, StaleNoticeAfterAResumeToANewSessionIdLeavesTheSee
     EXPECT_EQ(r.gw.connects, c1) << "a notice for the abandoned session made the client reconnect";
     EXPECT_FALSE(ping.ready()) << ping.describe();
     EXPECT_EQ(appErrors, 0);
+}
+
+// #767 follow-up: a burst of Redirects to ONE leader in one poll pass (N in-flight Subscribes) is ONE seed move: the
+// others join it (no new response subscription per redirect, no abandoned registration), none of them takes the
+// failure path, and every op is re-sent on the new session and completes.
+TEST(ClientRegression, ABurstOfRedirectsToOneLeaderMovesOnceAndResendsEveryOpRegression) {
+    constexpr int N = 8;
+    Rig r(3944, 3945, "aeron:ipc", "aeron:ipc", /*realClock=*/true);
+    r.gw.uniqueSessionIds = true;
+    r.connect();
+    const uint64_t movesBefore    = r.client.testSeedMoves();
+    const uint64_t joinedBefore   = r.client.testTransport().retargetsJoinedForTest();
+    const uint64_t failuresBefore = r.client.testUnreachableRedirects();
+    r.gw.subscribeRedirectNext = N;
+    r.gw.subscribeRedirectTo   = "aeron:ipc";   // a reachable "leader": one seed move + a fresh session
+    std::vector<rc::Subscription> subs;
+    subs.reserve(N);
+    for (int i = 0; i < N; ++i)
+        subs.emplace_back(r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                             [](const rc::Record&) {}));
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribed.size() >= static_cast<std::size_t>(N); }))
+        << "not every Subscribe was re-sent and accepted on the new session (" << r.gw.subscribed.size() << "/" << N
+        << ")";
+    EXPECT_EQ(r.gw.subscribed.size(), static_cast<std::size_t>(N)) << "no duplicate registration broker-side";
+    EXPECT_EQ(r.gw.subscribeRefusals, N);
+    EXPECT_EQ(r.client.testSeedMoves(), movesBefore + 1) << "one seed move for the whole burst";
+    EXPECT_EQ(r.client.testTransport().retargetsJoinedForTest(), joinedBefore + (N - 1));
+    EXPECT_EQ(r.client.testUnreachableRedirects(), failuresBefore) << "no redirect took the failure path";
+    EXPECT_FALSE(r.client.testTransport().seedRetargetPending());
+    for (const auto& s : subs) EXPECT_FALSE(s.finished());
+}
+
+// The same burst toward a target that never resolves: the shared move FAILS once; every op still takes its own part of
+// the failure path (answered for the produce accounting, re-sent after the next metadata answer), the episode's pacing
+// runs once, and the seed keeps its publication.
+TEST(ClientRegression, ABurstOfRedirectsToAnUnreachableLeaderResendsEveryOpRegression) {
+    constexpr int N = 6;
+    Rig r(3946, 3947, "aeron:ipc", "aeron:ipc", /*realClock=*/true);
+    r.connect();
+    const std::string seedBefore = r.client.testSeedChannel();
+    r.gw.subscribeRedirectNext = N;
+    r.gw.subscribeRedirectTo   = "rune-unresolvable.invalid:40200";
+    std::vector<rc::Subscription> subs;
+    subs.reserve(N);
+    for (int i = 0; i < N; ++i)
+        subs.emplace_back(r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                             [](const rc::Record&) {}));
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribed.size() >= static_cast<std::size_t>(N); }))
+        << "not every redirected Subscribe was re-sent (" << r.gw.subscribed.size() << "/" << N << ")";
+    EXPECT_EQ(r.gw.subscribed.size(), static_cast<std::size_t>(N));
+    EXPECT_EQ(r.client.testUnreachableRedirects(), static_cast<uint64_t>(N)) << "one failure body per op";
+    EXPECT_EQ(r.client.testSeedChannel(), seedBefore);
+    for (const auto& s : subs) EXPECT_FALSE(s.finished());
 }

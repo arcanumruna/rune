@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <compare>
 #include <cstdint>
+#include <functional>
+#include <span>
 #include <iterator>
 #include <map>
 #include <optional>
@@ -808,6 +810,79 @@ public:
     /// #839: damage detections since construction (boot recovery, reloadSegments, a cleaner-swap reload); monotonic.
     [[nodiscard]] uint64_t damageDetections() const noexcept { return damageDetections_; }
 
+    // -----------------------------------------------------------------------
+    // #880: repair of a damaged SEALED segment from batches a peer holds intact.
+    //
+    // The repair rebuilds the segment in a side file (<base20>.log.repair): the valid prefix [0, damage.bytePos)
+    // copied from the damaged file, then the peer's batches for [damage.offset, end) appended one validated span at
+    // a time.  commitSegmentRepair() swaps it in with the cleaner's committed-swap protocol (a group of one member):
+    // the side file becomes <base20>.log.<seq>.cleaned (+ its index), the owner switches the in-memory segment to
+    // the opened output and posts the renames to the cleaner thread (runCleanerFileOps); a crash recovers like a
+    // cleaner swap (a leftover .cleaned or .repair is deleted at construction and the segment stays damaged, a
+    // committed .swap is completed).
+    //
+    // Owner-thread cold path, like truncateTo's rebuild.  It writes ONLY side files (never a live segment name), so
+    // it needs no cold-path token; the live-name renames and the destruction of the replaced object stay with the
+    // cleaner.  One repair per log at a time.
+    // -----------------------------------------------------------------------
+    struct SegmentRepair {
+        int64_t  base = 0;           ///< the damaged segment's base offset
+        int64_t  damageOffset = 0;   ///< first offset the repair must supply (damage().offset)
+        int64_t  endOffset = 0;      ///< exclusive end: the next segment's base
+        uint64_t lineage = 0;        ///< the segment's lineage when the repair began (commit checks it)
+    };
+    /// Why appendRepairBatches refused a span (nothing from the span is written).
+    enum class RepairAppendStatus : uint8_t {
+        Ok = 0,
+        NoRepair,      ///< no repair in flight
+        Malformed,     ///< a truncated or impossible batch length
+        BadCrc,        ///< a batch failed its CRC
+        BelowCursor,   ///< a batch starts below the cursor (a duplicate, or before the damage)
+        ReachesEnd,    ///< a batch's last offset is not below the segment's end offset
+        WrongEpoch,    ///< a batch's leader epoch differs from the epoch cache's for its offset
+        IndexRange,    ///< an offset or byte position outside the index's int32 range
+        IoError,       ///< a file write failed
+    };
+    struct RepairAppend { RepairAppendStatus status = RepairAppendStatus::Ok; int64_t cursor = 0; };
+    enum class RepairCommitStatus : uint8_t {
+        Ok = 0,
+        NoRepair,   ///< no repair in flight
+        Rejected,   ///< the owner refused the swap (lineage changed, segment gone / active, ...): originals untouched,
+                    ///< the repair is over (the side files are deleted by the cleaner)
+        Busy,       ///< no room to post the file work: try again; the repair is still in flight
+        IoError,    ///< a side-file operation failed: the repair is over
+    };
+    /// Leader epoch the receiver's epoch cache holds for the offset (-1 = none).
+    using RepairEpochOf = std::function<int32_t(int64_t offset)>;
+    /// Begin repairing the damaged, non-active segment at `base`: creates the side file and copies the CRC-verified
+    /// valid prefix.  nullopt = refused (no such segment, not damaged, active, a repair already in flight, an I/O
+    /// error, or a prefix that no longer verifies): the log is unchanged and no side file is left.  Owner thread.
+    [[nodiscard]] std::optional<SegmentRepair> beginSegmentRepair(int64_t base);
+    /// Validate EVERY batch of `bytes` (whole batches only): CRC, base offset >= the cursor, last offset <
+    /// endOffset, and partitionLeaderEpoch == `epochOf(base offset)` (null `epochOf` skips that one check).  Only a
+    /// fully valid span is written.  Returns the new cursor (the offset after the last batch written; the damage
+    /// offset until a batch is appended); on a refusal the cursor is unchanged.  Owner thread.
+    RepairAppend appendRepairBatches(std::span<const uint8_t> bytes, const RepairEpochOf& epochOf = {});
+    /// fsync the side file, build + write its index, and install it with the committed-swap protocol.  After Ok the
+    /// segment is no longer damaged and reads over its whole range succeed; the file renames follow on the cleaner
+    /// thread.  Owner thread.
+    RepairCommitStatus commitSegmentRepair();
+    /// Drop the repair in flight and delete its side file.  No-op when none.  Owner thread.
+    void abortSegmentRepair() noexcept;
+    /// The base of the segment being repaired, nullopt when no repair is in flight.
+    [[nodiscard]] std::optional<int64_t> segmentRepairBase() const noexcept {
+        return repair_ ? std::optional<int64_t>(repair_->base) : std::nullopt;
+    }
+    /// <base20>.log.repair — the side file of a repair.
+    static std::string repairLogPath(const std::string& dir, int64_t base);
+    /// The lowest damaged, non-active segment: where it starts, where its valid prefix ends and where it ends (the next
+    /// segment's base).  nullopt when none.  Cold, O(segments); owner thread.
+    struct DamagedSegmentInfo { int64_t base = 0; int64_t damageOffset = 0; int64_t endOffset = 0; };
+    [[nodiscard]] std::optional<DamagedSegmentInfo> firstDamagedSegment() const noexcept;
+    /// True while the repair in flight can still be committed: its segment exists, is damaged, is not the active one
+    /// and is the incarnation the repair began on.  False when none is in flight.  Owner thread.
+    [[nodiscard]] bool segmentRepairValid() const noexcept;
+
     /// CP-9 SPSC consumer (owner thread): validate retention proposals; for each
     /// valid one rename its files to *.deleted, erase it from segments_ and
     /// update the sealed snapshot.  Called from NodeRuntimeAgent::doWork (same thread as
@@ -1286,7 +1361,24 @@ private:
     int64_t  cleanerRejectLowWater_ = INT64_MAX;   ///< see takeCleanerRejectLowWater()
     uint32_t cleanerRejectedPass_ = 0;             ///< owner: the last pass a group was rejected from (0 = none)
     /// Validate + install one deferred group (slots [first, first+n)).  Owner thread.
-    bool applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBound);
+    /// `direct` (#880): the group's refs when they do not come from the ring (a segment repair, owner-produced); the
+    /// caller reserved msg room.
+    bool applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBound, const SegRef* direct = nullptr);
+    /// #880: the repair in flight (owner thread).
+    struct RepairState {
+        int fd = -1;
+        std::string path;
+        int64_t base = 0, damageOffset = 0, endOffset = 0;
+        uint64_t lineage = 0;
+        int64_t cursor = 0;      ///< the next offset wanted
+        int64_t written = 0;     ///< bytes in the side file
+        int64_t bytesSince = 0;  ///< bytes since the last index entry (0 = the next batch is indexed)
+        std::vector<uint8_t> idx;
+    };
+    std::optional<RepairState> repair_;
+    uint32_t repairSeq_ = 0;
+    /// Add the batch at `pos` (`total` bytes, base offset `batchBase`) to the index being built in `rs`.
+    bool repairIndexBatch_(RepairState& rs, int64_t batchBase, int64_t total) const noexcept;
     /// Construction: delete uncommitted .cleaned outputs, complete committed .swap files.
     void recoverCleanerSwapFiles();
     /// The single SPSC producer path of the swap ring (n slots, one release-store).

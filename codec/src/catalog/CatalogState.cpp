@@ -11,6 +11,7 @@
 #include "ApplyV2.h"
 #include "ApplyV3.h"
 #include "ApplyV4.h"
+#include "ApplyV5.h"
 
 #include <algorithm>
 #include <exception>
@@ -80,17 +81,31 @@ std::vector<const ViewObject*> CatalogState::views() const {
     for (const auto& [id, v] : views_) out.push_back(&v);
     return out;
 }
-std::optional<RequestRecord> CatalogState::request(const RequestId& requestId) const {
+std::optional<RequestRecord> CatalogState::request(std::string_view principal, const RequestId& requestId) const {
     if (requestId.none()) return std::nullopt;
     auto it = requests_.find(requestId);
     if (it == requests_.end()) return std::nullopt;
-    return it->second;
+    for (const RequestEntry& en : it->second)
+        if (en.principal == principal) return en.rec;
+    return std::nullopt;
+}
+
+std::optional<RequestRecord> CatalogState::requestOfAnyPrincipal(const RequestId& requestId) const {
+    if (requestId.none()) return std::nullopt;
+    auto it = requests_.find(requestId);
+    if (it == requests_.end()) return std::nullopt;
+    const RequestEntry* best = nullptr;
+    for (const RequestEntry& en : it->second)
+        if (!best || en.rec.offset < best->rec.offset) best = &en;
+    return best ? std::optional<RequestRecord>(best->rec) : std::nullopt;
 }
 
 uint64_t layeredFingerprint(const TopicObject& t) noexcept {
-    return ApplyV4::leaseFingerprint(
-        ApplyV3::keyFeaturesFingerprint(fingerprintOf(t), t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{}),
-        t.lease);
+    return ApplyV5::retireFingerprint(
+        ApplyV4::leaseFingerprint(
+            ApplyV3::keyFeaturesFingerprint(fingerprintOf(t), t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{}),
+            t.lease),
+        t.schema ? t.schema->retiredBelow : uint16_t{1});
 }
 
 uint64_t layeredFingerprint(const ViewObject& v) noexcept {
@@ -139,6 +154,7 @@ namespace {
 struct Prepared { StagedV2 staged; uint64_t fingerprint; };
 
 std::expected<StagedV2, ApplyError> runRules(const CatalogState& s, const CatalogEvent& e, int64_t offset) {
+    if (e.formatVer == kFormatV5) return ApplyV5::run(s, e, offset);
     if (e.formatVer == kFormatV4) return ApplyV4::run(s, e, offset);
     if (e.formatVer == kFormatV3) return ApplyV3::run(s, e, offset);
     if (e.formatVer == kFormatV2) return ApplyV2::run(s, e, offset);
@@ -148,6 +164,7 @@ std::expected<StagedV2, ApplyError> runRules(const CatalogState& s, const Catalo
 }
 
 uint64_t stagedFingerprint(const CatalogEvent& e, const StagedV2& st) noexcept {
+    if (e.formatVer == kFormatV5) return ApplyV5::fingerprintOfStaged(e, st);
     if (e.formatVer == kFormatV4) return ApplyV4::fingerprintOfStaged(e, st);
     if (e.formatVer == kFormatV3) return ApplyV3::fingerprintOfStaged(e, st);
     if (e.formatVer == kFormatV2) return ApplyV2::fingerprintOfStaged(e, st);
@@ -163,13 +180,16 @@ std::expected<Prepared, ApplyError> prepare(const CatalogState& s, const Catalog
     ApplyV4::excludeLeaseViews(s, *staged);
     ApplyV3::carryKeyFeatures(s, *staged);
     const uint64_t base = stagedFingerprint(e, *staged);
+    const uint16_t floor = ApplyV5::retiredBelowOf(*staged);
     return Prepared{std::move(*staged),
-                    ApplyV4::leaseFingerprint(ApplyV3::keyFeaturesFingerprint(base, ApplyV3::keyFeaturesOf(*staged)),
-                                              ApplyV4::leaseOf(*staged))};
+                    ApplyV5::retireFingerprint(
+                        ApplyV4::leaseFingerprint(ApplyV3::keyFeaturesFingerprint(base, ApplyV3::keyFeaturesOf(*staged)),
+                                                  ApplyV4::leaseOf(*staged)),
+                        floor)};
 }
 
 std::expected<void, ApplyError> checkFormat(const CatalogEvent& e, int64_t offset) {
-    if (e.formatVer < kFormatV1 || e.formatVer > kFormatV4)
+    if (e.formatVer < kFormatV1 || e.formatVer > kFormatV5)
         return std::unexpected(ApplyError{offset, ApplyError::Code::UnsupportedFormat, 0, 0,
                                           "formatVer " + std::to_string(e.formatVer) + " has no apply rules"});
     return {};
@@ -188,6 +208,8 @@ std::expected<Applied, ApplyError> apply(CatalogState& s, const CatalogEvent& e,
         return std::unexpected(ApplyError{offset, ApplyError::Code::FingerprintMismatch, e.fingerprint, prepared->fingerprint,
                                           std::string(kindName(e.kind)) + " '" + e.objectName + "'"});
     Applied applied = [&] {
+        if (e.formatVer == kFormatV5)
+            return ApplyV5::commit(s, e, offset, prepared->fingerprint, std::move(prepared->staged));
         if (e.formatVer == kFormatV4)
             return ApplyV4::commit(s, e, offset, prepared->fingerprint, std::move(prepared->staged));
         if (e.formatVer == kFormatV3)
@@ -306,6 +328,8 @@ resolveAlterOps(const SchemaState& schema, std::span<const cd::AlterOp> ops) {
         case cd::AlterOpType::SetCompatibility:
             r.mode = op.mode;
             break;
+        case cd::AlterOpType::RetireBelow:   // a RetireSchemaVersions event, never part of a schema evolution
+            return std::unexpected(std::string("RETIRE VERSION cannot be part of a schema evolution"));
         default:
             return std::unexpected("unknown ALTER op type " + std::to_string(static_cast<int>(op.type)));
         }
@@ -370,6 +394,8 @@ unresolveAlterOps(const SchemaState& schema, std::span<const ResolvedAlterOp> op
                 return std::unexpected(std::string("SET COMPATIBILITY: carries fields it does not use"));
             op.mode = r.mode;
             break;
+        case cd::AlterOpType::RetireBelow:
+            return std::unexpected(std::string("RETIRE VERSION cannot be part of a schema evolution"));
         default:
             return std::unexpected("unknown ALTER op type " + std::to_string(static_cast<int>(r.type)));
         }

@@ -794,8 +794,8 @@ TEST(DispatchCheckFrame, UnknownTemplateEightySeven) {
     EXPECT_EQ(fc.templateId, 87u);
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateOneHundredTwo) {   // 96-101 are lease topics (client 18); 99 was the old unknown probe
-    auto buf = makeValidHeaderBuf(102);
+TEST(DispatchCheckFrame, UnknownTemplateOneHundredFour) {   // 96-101 are lease topics (client 18), 102-103 the bootstrap challenge (client 19); 99 was the old unknown probe
+    auto buf = makeValidHeaderBuf(104);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
     EXPECT_EQ(rpc::peekTemplateId(buf.data(), buf.size()), std::nullopt);
@@ -858,7 +858,7 @@ TEST(DispatchPeekTemplateId, NulloptForUnsupportedVersion) {
 TEST(DispatchPeekTemplateId, NulloptForUnknownTemplate) {
     auto buf = makeValidHeaderBuf(0);
     EXPECT_EQ(rpc::peekTemplateId(buf.data(), buf.size()), std::nullopt);
-    auto buf2 = makeValidHeaderBuf(102);
+    auto buf2 = makeValidHeaderBuf(104);
     EXPECT_EQ(rpc::peekTemplateId(buf2.data(), buf2.size()), std::nullopt);
 }
 

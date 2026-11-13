@@ -151,6 +151,19 @@ Design choices copied verbatim:
 - Hot path touches only the in-memory tail. A background archiver hands committed ranges to Aeron Archive (`startRecording`/`getRecordingPosition`), which owns fsync cadence.
 - Periodic **snapshots** capture "state as of offset N" for compacted/state topics and fast recovery: recovery = load newest snapshot + replay tail via `startReplay`, not replay-from-genesis.
 
+### 6.5a Damaged sealed segments and their repair (#880)
+
+A sealed segment with bytes after its last whole, CRC-valid batch is kept on disk, flagged damaged and failed at the
+damage (#839). A replica rebuilds it from a peer without truncating anything: `Log::beginSegmentRepair` copies the segment's
+valid prefix into `<base>.log.repair`, `appendRepairBatches` validates each peer span whole (CRC, base offset at or above the
+cursor, last offset below the segment's end, leader epoch equal to the epoch cache's) before writing it, and
+`commitSegmentRepair` fsyncs the side file, builds its index and installs it through the cleaner's committed-swap group of one
+member (lineage checked, never the active segment). Recovery treats a stray `.repair` like an uncommitted `.cleaned` output
+and completes a committed `.swap`. The replication side (`PartitionReplica::serviceRepair_`) picks the peer (a follower asks
+the leader, a leader its in-sync followers in id order), runs one request at a time over templates 17 / 18, and drops the
+side file when the segment's lineage, the role or the leader epoch changes. The file I/O runs on the replica's owner thread
+like the truncation rebuild; the renames of live names and the destruction of the replaced segment stay with the cleaner.
+
 ### 6.6 Leader-epoch cache & producer-state
 - Per-replica **leader-epoch cache** (`epoch → start offset`) drives correct truncation after failover.
 - **Producer-state snapshots** (producerId → last sequence) enable idempotency and correct recovery.

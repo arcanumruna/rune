@@ -1059,7 +1059,16 @@ void TransactionCoordinationService::sendVote_(const VoteGate& g, VoteTarget& t,
         ? voteFnOverride_(t.topic, t.partition, g.producerId, g.producerEpoch)
         : gateway_->sendTxnVote(t.topicId, t.partition, g.producerId, g.producerEpoch, g.coordinatorEpoch) >= 0;
     t.outstanding = sent;
+    clearWait_(t);   // #995: a re-sent vote starts a new wait
     if (!sent) scheduleVoteResend_(t, nowNs);   // no route / full ring: a transport error, not a no
+}
+
+void TransactionCoordinationService::clearWait_(VoteTarget& t) noexcept
+{
+    if (t.waitPid < 0) return;
+    t.waitPid   = -1;
+    t.waitEpoch = 0;
+    waitGraphDirty_ = true;
 }
 
 void TransactionCoordinationService::scheduleVoteResend_(VoteTarget& t, int64_t fromNs) noexcept
@@ -1073,12 +1082,17 @@ void TransactionCoordinationService::onTxnVoteResult(int32_t topicId, int32_t pa
                                                      const rune::gateway::TxnVoteResult& r) noexcept
 {
     if (!currentEpoch_(coordinatorEpoch)) return;   // an earlier load's vote
+    if (r.waiting) {   // an interim: the vote stays out.  Before the orphan check: an interim for an orphan changes nothing
+        noteVoteWait_(topicId, partition, producerId, producerEpoch, r.waitPid, r.waitEpoch);
+        return;
+    }
     if (voteOrphans_.erase({topicId, partition, producerId, producerEpoch}) != 0) return;   // its gate is gone: not counted
     for (VoteGate& g : voteGates_) {
         if (g.producerId != producerId || g.producerEpoch != producerEpoch) continue;
         for (VoteTarget& t : g.targets) {
             if (t.topicId != topicId || t.partition != partition || !t.outstanding) continue;
             t.outstanding = false;
+            clearWait_(t);   // the real answer ends the wait
             if (r.errorCode != 0) scheduleVoteResend_(t, lastNowNs_);   // NotLeader: asked again
             else if (r.code == 0) t.yes = true;
             else if (!g.hasNo) { g.hasNo = true; g.no = VoteNo{r.code, r.constraintId, r.failingOffset}; }
@@ -1087,15 +1101,120 @@ void TransactionCoordinationService::onTxnVoteResult(int32_t topicId, int32_t pa
     }
 }
 
+std::size_t TransactionCoordinationService::voteWaitEdgesForTest() const noexcept
+{
+    std::size_t n = 0;
+    for (const VoteGate& g : voteGates_)
+        for (const VoteTarget& t : g.targets) n += !t.yes && t.waitPid >= 0;
+    return n;
+}
+
+void TransactionCoordinationService::noteVoteWait_(int32_t topicId, int32_t partition, int64_t producerId,
+                                                   int16_t producerEpoch, int64_t holderPid, int16_t holderEpoch) noexcept
+{
+    for (VoteGate& g : voteGates_) {
+        if (g.producerId != producerId || g.producerEpoch != producerEpoch) continue;
+        for (VoteTarget& t : g.targets) {
+            if (t.topicId != topicId || t.partition != partition || !t.outstanding) continue;
+            if (t.waitPid == holderPid && t.waitEpoch == holderEpoch) return;
+            t.waitPid       = holderPid;
+            t.waitEpoch     = holderEpoch;
+            waitGraphDirty_ = true;
+            return;
+        }
+    }
+}
+
+void TransactionCoordinationService::forgetGate_(int64_t producerId, int16_t producerEpoch) noexcept
+{
+    for (VoteGate& g : voteGates_)
+        for (VoteTarget& t : g.targets)
+            if (t.waitPid == producerId && t.waitEpoch == producerEpoch) clearWait_(t);
+}
+
+// #995: the wait-for graph of the vote gates.  Gate T has an edge to gate U when a target of T that has not voted yes waits on U
+// (its partition leader's judge is paused on rows U's judged transaction holds, TxnVoteResult::waiting) and U has a gate: a
+// holder without a gate is still producing or already decided, which is a delay, not a cycle.  A cycle can only resolve by the
+// transaction timeout, so the gate on it with the latest start (tie: the larger producer id) is made to vote no (TxnConflict, a
+// retriable abort); the usual no-path aborts it, its markers release its rows and the others go on.
+// Safety: an abort the coordinator decides before any commit marker is always safe.  A stale edge can at worst abort a transaction
+// that would have committed once (TxnConflict, retriable), never commit a wrong one; staleness is bounded: an edge is cleared when
+// its target's real answer arrives, when the vote is re-sent and when the holder's gate is removed (forgetGate_).
+// One victim per pass; the flag stays set until a pass finds no cycle.  A pause with no single holder (overlay pool exhausted,
+// capacity) sends no interim and stays bounded by the transaction timeout.
+void TransactionCoordinationService::resolveVoteDeadlocks_() noexcept
+{
+    const std::size_t n = voteGates_.size();
+    // The edges of each gate: the gates its waiting targets name.
+    if (waitEdges_.size() < n) waitEdges_.resize(n);
+    for (std::size_t i = 0; i < n; ++i) waitEdges_[i].clear();
+    for (std::size_t i = 0; i < n; ++i) {
+        const VoteGate& g = voteGates_[i];
+        if (g.hasNo) continue;   // already decided: it leaves this pass
+        for (const VoteTarget& t : g.targets) {
+            if (t.yes || t.waitPid < 0) continue;
+            for (std::size_t j = 0; j < n; ++j) {
+                const VoteGate& h = voteGates_[j];
+                if (j == i || h.hasNo || h.producerId != t.waitPid || h.producerEpoch != t.waitEpoch) continue;
+                waitEdges_[i].push_back(static_cast<uint32_t>(j));
+            }
+        }
+    }
+    // Iterative DFS with colours: 0 white, 1 on the stack, 2 done.
+    waitColour_.assign(n, 0);
+    waitNext_.assign(n, 0);
+    for (std::size_t root = 0; root < n; ++root) {
+        if (waitColour_[root] != 0) continue;
+        waitStack_.clear();
+        waitStack_.push_back(static_cast<uint32_t>(root));
+        waitColour_[root] = 1;
+        while (!waitStack_.empty()) {
+            const uint32_t u = waitStack_.back();
+            if (waitNext_[u] < waitEdges_[u].size()) {
+                const uint32_t v = waitEdges_[u][waitNext_[u]++];
+                if (waitColour_[v] == 0) {
+                    waitColour_[v] = 1;
+                    waitStack_.push_back(v);
+                } else if (waitColour_[v] == 1) {   // a cycle: the stack from v to the top
+                    std::size_t victim = v;
+                    bool        inCycle = false;
+                    for (const uint32_t w : waitStack_) {
+                        inCycle = inCycle || w == v;
+                        if (!inCycle) continue;
+                        const VoteGate& a = voteGates_[w];
+                        const VoteGate& b = voteGates_[victim];
+                        if (a.txnStartNs > b.txnStartNs || (a.txnStartNs == b.txnStartNs && a.producerId > b.producerId)) victim = w;
+                    }
+                    VoteGate& g = voteGates_[victim];
+                    g.hasNo = true;
+                    g.no    = VoteNo{static_cast<uint16_t>(pc::ErrorCode::TxnConflict), 0, -1};
+                    ++txnDeadlocksResolved_;
+                    spdlog::info("transactions: a cycle of lock waits is resolved: producer {} (epoch {}) is aborted (TxnConflict), "
+                                 "it waited on producer {}", g.producerId, g.producerEpoch, voteGates_[v].producerId);
+                    return;   // one victim per pass; waitGraphDirty_ stays set
+                }
+            } else {
+                waitColour_[u] = 2;
+                waitStack_.pop_back();
+            }
+        }
+    }
+    waitGraphDirty_ = false;   // a pass without a cycle
+}
+
 int TransactionCoordinationService::processVoteGates_(int64_t nowNs)
 {
     int work = 0;
+    if (waitGraphDirty_) resolveVoteDeadlocks_();
     for (std::size_t i = 0; i < voteGates_.size();) {
         VoteGate& g = voteGates_[i];
         if (const int16_t stale = staleVoteCode_(g); stale != 0) {   // timed out, fenced or ended: the votes are moot
             sendEndTxnAnswer_(g.sessionId, g.correlationId, stale);
             orphanVotes_(g);
+            const int64_t gonePid = g.producerId;
+            const int16_t goneEpoch = g.producerEpoch;
             voteGates_.erase(voteGates_.begin() + static_cast<std::ptrdiff_t>(i));
+            forgetGate_(gonePid, goneEpoch);
             ++work;
             continue;
         }
@@ -1114,6 +1233,7 @@ int TransactionCoordinationService::processVoteGates_(int64_t nowNs)
         }
         VoteGate done = std::move(g);
         voteGates_.erase(voteGates_.begin() + static_cast<std::ptrdiff_t>(i));
+        forgetGate_(done.producerId, done.producerEpoch);
         orphanVotes_(done);   // a first no leaves the other partitions' votes out
         ++work;
         prepareVoted_(done, !done.hasNo, nowNs);
@@ -1161,6 +1281,7 @@ void TransactionCoordinationService::dropDeferred_()
     for (const VoteGate& g : voteGates_)
         sendEndTxnAnswer_(g.sessionId, g.correlationId, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
     voteGates_.clear();
+    waitGraphDirty_ = false;   // soft state: the gates are gone, so are their edges
     voteCandidatesAtAdd_.clear();
     voteOrphans_.clear();   // the gateway's votes are purged with them
     for (const auto& [pid, a] : awaiting_)
@@ -1607,7 +1728,10 @@ size_t TransactionCoordinationService::handleEndTxn_(
             return 0;
         }
         orphanVotes_(*gate);
+        const int64_t gonePid = gate->producerId;
+        const int16_t goneEpoch = gate->producerEpoch;
         voteGates_.erase(gate);
+        forgetGate_(gonePid, goneEpoch);
     } else if (commit) {
         // A retry of the commit a no aborted (its answer was lost, or its coordinator failed): the same no, from the
         // decision record, once the abort markers landed.

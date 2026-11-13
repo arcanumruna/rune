@@ -12,6 +12,7 @@
 //
 // Per-state data (hard rule 3): std::variant<Mirroring, Halted>.  Cold path (control plane).
 
+#include <rune/crypto/Scram.h>
 #include <rune/security/SecurityState.h>
 
 #include <cstdint>
@@ -37,11 +38,13 @@ public:
     /// ADMIN ON CLUSTER - a fresh cluster, and also a cluster whose last admin was disabled or dropped (the holder of the
     /// cluster key is the root of trust; the bootstrap is still HMAC-gated).  Cached, recomputed once per applied event
     /// (cold), so asking is O(1) per Connect / per gated frame.  A halted mirror is closed (fail closed).
-    /// Review C: the iteration count the FAKE salts of unknown users advertise - the most common count among the real
-    /// accounts' verifiers (4096, the default, when there are none) - so an unknown user's AuthServerFirst is not
-    /// trivially distinguishable by a non-default count.  Cached per applied event like the window.
-    [[nodiscard]] uint32_t fakeIterations() const noexcept { return fakeIterations_; }
     [[nodiscard]] bool bootstrapWindowOpen() const noexcept { return window_ == Window::Open && !halted(); }
+    /// #238: the iteration count the FAKE salts of unknown users advertise - the count of the FIRST Bootstrap's
+    /// verifier, fixed for the life of the cluster (the default, 4096, before any bootstrap) - so it never follows
+    /// the real accounts' counts and an unknown name cannot be told apart by a change of it.
+    [[nodiscard]] uint32_t fakeIterations() const noexcept {
+        return state_.fakeIterations().value_or(rune::crypto::scram::kDefaultIterations);
+    }
 
     /// Apply the admin applier's event at `offset` (its record bytes).  An error (a gap, an undecodable record, an
     /// apply refusal, a fingerprint mismatch) HALTS the mirror and is returned; nothing of that event is applied.
@@ -67,12 +70,8 @@ private:
     [[nodiscard]] rune::security::ApplyError halt_(rune::security::ApplyError error);
 
     enum class Window : uint8_t { Open, Closed };
-    void rebuildDerived_();   // window + the full fake-iteration recount (constructor, Bootstrap, NamespacePurged)
-    void countVerifiers_(const rune::security::UserObject& user, int delta);   // #269: keep iterationCounts_ sorted
-    void pickFakeIterations_();   // the most common count; ties: the smallest
+    void rebuildDerived_();   // the window (constructor, Bootstrap, NamespacePurged)
     Window                          window_ = Window::Closed;
-    uint32_t                        fakeIterations_ = 4096;
-    std::vector<std::pair<uint32_t, std::size_t>> iterationCounts_;   // sorted by count; one entry per distinct n > 0
     uint64_t                        derivedFullRebuilds_ = 0;
     rune::security::SecurityState   state_;
     std::variant<Mirroring, Halted> st_;

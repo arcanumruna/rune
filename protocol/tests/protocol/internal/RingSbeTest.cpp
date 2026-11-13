@@ -416,8 +416,11 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     EXPECT_EQ(sbe::TailKind::get(14), sbe::TailKind::Value::LEASE_REQUEST);
     EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::LEASE_KEEP_ALIVE), "LEASE_KEEP_ALIVE");
     EXPECT_STREQ(sbe::ReturnType::c_str(sbe::ReturnType::Value::SCAN_LEASES_RESULT), "SCAN_LEASES_RESULT");
+    // #880: the segment-repair fetch pair (ops 42-43), appended after the lease ops.
+    EXPECT_EQ(sbe::OpType::get(42), sbe::OpType::Value::REPAIR_FETCH_REQ);
+    EXPECT_EQ(sbe::OpType::get(43), sbe::OpType::Value::REPAIR_FETCH_RESP);
     // The next free values are unassigned.
-    EXPECT_THROW((void)sbe::OpType::get(42), std::runtime_error);
+    EXPECT_THROW((void)sbe::OpType::get(44), std::runtime_error);
     EXPECT_THROW((void)sbe::ReturnType::get(15), std::runtime_error);
     EXPECT_THROW((void)sbe::TailKind::get(15), std::runtime_error);
 }

@@ -595,11 +595,14 @@ struct VoteGate {
     void release(const std::string& topic, int64_t pid) { std::lock_guard<std::mutex> g(mu); held.erase({topic, pid}); }
 };
 
+constexpr uint16_t kTxnConflict = static_cast<uint16_t>(rune::protocol::client::ErrorCode::TxnConflict);
+
 /// T1 and T2 rewrite the same character and the same ledger entry and commit at once, with the votes held so that T1's reaches `character` first
-/// and T2's `ledger` first: each partition judges one and blocks the other.  T1 has the transaction timeout `timeoutMs` and aborts by it within
-/// one pass; T2's timeout is kSurvivorExtra longer, so it outlives T1's locks on any host (#1006: with equal timeouts a slow runner let both
-/// expire) and commits with its rows whole.  No commit hangs.
-void expectOppositeOrderResolvesByTimeout(const char* tag, int32_t timeoutMs) {
+/// and T2's `ledger` first: each partition judges one and blocks the other (#995: a cycle of lock waits).  Both transactions have a ten minute
+/// timeout, so only the detector can end it: each partition's leader tells the coordinator whom its judge waits on, the coordinator aborts the
+/// younger transaction (T2, TxnConflict) at once and T1 commits with its rows whole.  T2's retry then commits too, and a plain write to each partition
+/// is answered (neither judge is left paused).  Nothing waits for a timeout.
+void expectOppositeOrderIsResolvedAtOnce(const char* tag) {
     auto gate = std::make_shared<VoteGate>();
     Shard s(tag, fastBroker, [gate](BrokerNode& n) {
         n.setTxnVoteHoldForTest([gate](std::string_view topic, int32_t, int64_t pid, int16_t) { return gate->holds(topic, pid); });
@@ -612,9 +615,9 @@ void expectOppositeOrderResolvesByTimeout(const char* tag, int32_t timeoutMs) {
     ASSERT_TRUE(c.ok());
     ASSERT_TRUE(plain.put(1, 5, 5).ok());
     std::array<std::unique_ptr<TxnClient>, 2> t;
-    constexpr int32_t kSurvivorExtra = 10'000;
+    constexpr int32_t kTenMinutesMs = 600'000;
     for (std::size_t i = 0; i < t.size(); ++i)   // producerId() is read on this thread
-        t[i] = std::make_unique<TxnClient>(s.b.clientConfig(), "tx-order-" + std::to_string(i), i == 0 ? timeoutMs : timeoutMs + kSurvivorExtra);
+        t[i] = std::make_unique<TxnClient>(s.b.clientConfig(), "tx-order-" + std::to_string(i), kTenMinutesMs);
     const int64_t pid[2] = {t[0]->prod->producerId(), t[1]->prod->producerId()};
     ASSERT_GE(pid[0], 0);
     ASSERT_GE(pid[1], 0);
@@ -622,42 +625,89 @@ void expectOppositeOrderResolvesByTimeout(const char* tag, int32_t timeoutMs) {
         std::lock_guard<std::mutex> g(gate->mu);
         gate->held = {{"ledger", pid[0]}, {"character", pid[1]}};
     }
-    for (std::size_t i = 0; i < t.size(); ++i) {
+    for (std::size_t i = 0; i < t.size(); ++i) {   // T1 starts first: it is the older transaction
         t[i]->begin();
         ASSERT_TRUE(t[i]->rename(c.key(), 5, "n" + std::to_string(i + 1)).ok());
         ASSERT_TRUE(t[i]->put(1, 5, 6 + static_cast<int64_t>(i)).ok());
     }
     std::array<std::optional<rc::TxnCommitResult>, 2> r;
+    std::array<std::string, 2> error;
+    std::chrono::steady_clock::time_point done[2], released;
+    {
+        std::vector<std::jthread> threads;
+        for (std::size_t i = 0; i < t.size(); ++i)
+            threads.emplace_back([&, i] {
+                try { r[i] = t[i]->commit(15s); } catch (const std::exception& e) { error[i] = e.what(); }
+                done[i] = std::chrono::steady_clock::now();
+            });
+        // T1's vote has reached character and T2's ledger: each partition judges its first; then the held votes go out and meet the locks.
+        ASSERT_TRUE(waitFor([&] { return gate->saw("character", pid[0]) && gate->saw("ledger", pid[1]); }, 5s));
+        std::this_thread::sleep_for(20ms);
+        released = std::chrono::steady_clock::now();
+        gate->release();
+    }
+    for (std::size_t i = 0; i < t.size(); ++i)
+        EXPECT_LT(done[i] - released, 10s) << "commit " << i << " waited (" << error[i] << "): nothing may wait for the ten minute timeout";
+    ASSERT_TRUE(r[0] && r[1]) << error[0] << " / " << error[1];
+    EXPECT_TRUE(r[0]->ok) << "T1, the older transaction, commits; it answered " << r[0]->code;
+    EXPECT_FALSE(r[1]->ok) << "T2, the younger, is the victim";
+    EXPECT_EQ(r[1]->code, kTxnConflict) << "a retriable abort, the answer of a lost conflict";
+    EXPECT_GE(s.b.node().txnDeadlocksResolvedForTest(), 1u);
+    // The victim's retry commits on the rows T1 left.
+    t[1]->begin();
+    ASSERT_TRUE(t[1]->rename(c.key(), 5, "n2").ok());
+    ASSERT_TRUE(t[1]->put(1, 5, 7).ok());
+    const rc::TxnCommitResult retry = t[1]->commit(15s);
+    EXPECT_TRUE(retry.ok) << "the retry answered " << retry.code;
+    // Neither partition's judge is left stalled: a plain checked write to each is answered.
+    EXPECT_TRUE(plain.create(6, "after").ok());
+    EXPECT_TRUE(plain.put(9, 6, 1).ok());
+    const auto balance = readRow(*plain.client, balances, balances.keyOf(5));
+    ASSERT_TRUE(balance.has_value());
+    EXPECT_FALSE(readRow(*plain.client, names, names.keyOf("n1")).has_value()) << "the retry renamed T1's name";
+    EXPECT_TRUE(readRow(*plain.client, names, names.keyOf("n2")).has_value());
+    EXPECT_EQ(balances.i(*balance, "balance"), 7) << "the rows are the retry's";
+}
+
+TEST(CheckedWritesTxnBrokerRegression, OppositeOrderLocksAreResolvedAtOnceShardRegression) { expectOppositeOrderIsResolvedAtOnce("cw11_order"); }
+
+/// The other shape: a transaction that touches one partition only (a row conflict on `ledger`) next to one that spans both.  Waiting behind a real
+/// lock is delay, not a cycle: nobody is aborted by the detector, and both commits are answered at once (the one that lost the conflict rule with
+/// a 63, never a wait for the ten minute timeout).
+TEST(CheckedWritesTxnBrokerRegression, ARowConflictOnOnePartitionIsADelayNotACycleShardRegression) {
+    Shard s("cw11_delay");
+    s.setUp();
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    PlainClient plain(s.b.clientConfig(), s.ledgerTopic);
+    const rc::WriteResult c = plain.create(5, "base");
+    ASSERT_TRUE(c.ok());
+    ASSERT_TRUE(plain.put(1, 5, 5).ok());
+    std::array<std::unique_ptr<TxnClient>, 2> t;
+    for (std::size_t i = 0; i < t.size(); ++i) t[i] = std::make_unique<TxnClient>(s.b.clientConfig(), "tx-delay-" + std::to_string(i), 600'000);
+    t[0]->begin();
+    ASSERT_TRUE(t[0]->rename(c.key(), 5, "d1").ok());
+    ASSERT_TRUE(t[0]->put(1, 5, 6).ok());
+    t[1]->begin();
+    ASSERT_TRUE(t[1]->put(1, 5, 7).ok());   // ledger only: its vote is judged on that partition alone
+    std::array<std::optional<rc::TxnCommitResult>, 2> r;
+    std::array<std::string, 2> error;
     const auto t0 = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point done[2];
     {
         std::vector<std::jthread> threads;
         for (std::size_t i = 0; i < t.size(); ++i)
             threads.emplace_back([&, i] {
-                try { r[i] = t[i]->commit(15s); } catch (const std::exception&) {}
+                try { r[i] = t[i]->commit(15s); } catch (const std::exception& e) { error[i] = e.what(); }
                 done[i] = std::chrono::steady_clock::now();
             });
-        // T1's vote has reached character and T2's ledger: each partition judges its first; then the held votes go out and meet the locks.
-        ASSERT_TRUE(waitFor([&] { return gate->saw("character", pid[0]) && gate->saw("ledger", pid[1]); }, 5s));
-        std::this_thread::sleep_for(20ms);
-        gate->release();
     }
-    const auto limit = std::chrono::milliseconds(timeoutMs) + 1500ms;   // the timeout and one pass of the coordinator and the vote retry
-    for (std::size_t i = 0; i < t.size(); ++i) EXPECT_LT(done[i] - t0, limit) << "commit " << i << " waited past the transaction timeout and a pass";
-    const bool first = r[0] && r[0]->ok, second = r[1] && r[1]->ok;
-    EXPECT_FALSE(first) << "T1 (the short timeout) aborts by its timeout";
-    EXPECT_TRUE(second) << "T2 outlives T1's locks and commits";
-    const auto balance = readRow(*plain.client, balances, balances.keyOf(5));
-    ASSERT_TRUE(balance.has_value());
-    const bool one = readRow(*plain.client, names, names.keyOf("n1")).has_value(), two = readRow(*plain.client, names, names.keyOf("n2")).has_value();
-    EXPECT_NE(one, two) << "exactly one of the two names is the character's";
-    EXPECT_EQ(balances.i(*balance, "balance"), one ? 6 : 7) << "the rows are one transaction's";
-    EXPECT_EQ(one ? first : second, true) << "the visible rows are a committed transaction's";
+    for (std::size_t i = 0; i < t.size(); ++i) EXPECT_LT(done[i] - t0, 10s) << "commit " << i << " waited (" << error[i] << ")";
+    ASSERT_TRUE(r[0] && r[1]) << error[0] << " / " << error[1];
+    EXPECT_TRUE(r[0]->ok || r[1]->ok) << "one of them commits";
+    for (std::size_t i = 0; i < t.size(); ++i) EXPECT_TRUE(r[i]->ok || r[i]->code == kTxnConflict) << "commit " << i << " answered " << r[i]->code;
+    EXPECT_EQ(s.b.node().txnDeadlocksResolvedForTest(), 0u) << "no cycle: the detector aborted nobody";
+    EXPECT_TRUE(plain.put(9, 6, 1).ok()) << "the ledger judge is not stalled";
 }
-
-TEST(CheckedWritesTxnBrokerRegression, OppositeOrderLocksResolveByTimeoutShardRegression) { expectOppositeOrderResolvesByTimeout("cw11_order", 200); }
-
-TEST(CheckedWritesTxnBrokerRegression, OppositeOrderLocksResolveByTimeoutFullLengthShardRegression) { expectOppositeOrderResolvesByTimeout("cw11_orderfl", 2'000); }
 
 /// Eight two-topic transactions on unrelated users and accounts, with every character vote held until every ledger vote was judged yes:
 /// each yes holds a transaction overlay until its marker, and the markers wait for the character votes.  No row is shared, so no
@@ -717,7 +767,7 @@ TEST(CheckedWritesTxnBrokerRegression, UnrelatedTransactionsNeverWaitForEachOthe
 }
 
 /// The e2e leg 9b in small (checked_writes_probe txn-run): `workers` workers of `perWorker` producers race `users` users for the same two character names per
-/// transaction, each crediting its own ledger account (two transactions racing on both topics resolve only by the transaction timeout, R11d).
+/// transaction, each crediting its own ledger account (two transactions racing on both topics in opposite lock order are a cycle the coordinator resolves at once, #995).
 /// Per user six commit (the account_stats cap is 12 characters), every other answer is 55, an overdraw of the worker's account is refused by
 /// balances; none fails, none waits for the transaction timeout.  Differences from the probe: the ids are the Shard's, and an `od` character is named per
 /// worker (the probe's is shared).

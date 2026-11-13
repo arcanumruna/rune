@@ -124,10 +124,11 @@ TEST(CatalogV2Regression, V1EventsDecodeWithNsIdZeroAndCannotCarryOneRegression)
 
 // ── the kind table ────────────────────────────────────────────────────────────
 TEST(CatalogV2Regression, KindTableBijectiveRegression) {
-    static_assert(std::variant_size_v<rc::Ops> == 14);
+    static_assert(std::variant_size_v<rc::Ops> == 15);
     for (std::size_t i = 0; i < rc::kKindOfAlt.size(); ++i)
         EXPECT_EQ(rc::altOf(rc::kKindOfAlt[i]), static_cast<int>(i)) << i;
-    EXPECT_EQ(rc::altOf(static_cast<rc::EventKind>(10)), -1);
+    EXPECT_EQ(rc::altOf(static_cast<rc::EventKind>(10)), 14) << "RetireSchemaVersions (formatVer 5) is the last alternative";
+    EXPECT_EQ(rc::altOf(static_cast<rc::EventKind>(11)), -1);
     EXPECT_EQ(rc::altOf(static_cast<rc::EventKind>(37)), -1);
     EXPECT_EQ(rc::altOf(static_cast<rc::EventKind>(0)), -1);
     EXPECT_EQ(rc::altOf(static_cast<rc::EventKind>(31)), -1);
@@ -823,7 +824,7 @@ TEST(NamespaceCatalogV2Regression, RequestIdDedupeSpansNamespaceKindsRegression)
     e.principal.requestId = rc::RequestId{7, 8};
     e.principal.requestFingerprint = 99;
     ASSERT_TRUE(r.go(e).has_value());
-    const auto rec = r.s.request(rc::RequestId{7, 8});
+    const auto rec = r.s.requestOfAnyPrincipal(rc::RequestId{7, 8});
     ASSERT_TRUE(rec.has_value());
     EXPECT_EQ(rec->kind, rc::EventKind::NamespaceCreated);
     EXPECT_EQ(rec->requestFingerprint, 99u);

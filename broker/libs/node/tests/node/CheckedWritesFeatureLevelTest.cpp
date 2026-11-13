@@ -30,8 +30,9 @@ void sendLevel(Worker& w, int16_t level) {
 }
 } // namespace
 
-TEST(CheckedWritesFeatureLevel, LatestIsLeases) {
-    static_assert(mf::kCheckedWrites == 5 && mf::kLeases == 6 && mf::kLatest == mf::kLeases && mf::kTxnPartitionVerify == 4);
+TEST(CheckedWritesFeatureLevel, LatestIsSchemaRetire) {
+    static_assert(mf::kCheckedWrites == 5 && mf::kLeases == 6 && mf::kSchemaRetire == 7 && mf::kLatest == mf::kSchemaRetire &&
+                  mf::kTxnPartitionVerify == 4);
     SUCCEED();
 }
 

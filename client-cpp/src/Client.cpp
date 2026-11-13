@@ -1676,6 +1676,12 @@ bool leaseOpTooOld(rune::client::OpKind op, int32_t brokerVersion) noexcept {
             op == OpKind::ScanLeases) &&
            brokerVersion >= 1 && brokerVersion < rune::protocol::client::kBrokerVersionLeases;
 }
+
+// #234: the bootstrap's challenge-response needs broker >= 12.  `brokerVersion` 0 = unknown: sent.
+bool bootstrapTooOld(rune::client::OpKind op, int32_t brokerVersion) noexcept {
+    return op == rune::client::OpKind::SecurityBootstrap && brokerVersion >= 1 &&
+           brokerVersion < rune::protocol::client::kBrokerVersionBootstrapChallenge;
+}
 }  // namespace
 
 namespace {
@@ -1871,13 +1877,22 @@ OpResult Client::bootstrapSecurity(std::string_view adminName, std::string_view 
     namespace rpc = rune::protocol::client;
     rpc::SecurityBootstrap msg;
     security::VerifierStorage vs;
+    // #234: the MAC covers the gateway's one-use challenge, so it is made on the duty thread when the challenge
+    // arrives; the MAC key (a subkey of the cluster master) rides to it as the op's secret, like a self password.
+    std::array<uint8_t, 64> macKey{};
+    struct WipeKey {
+        std::array<uint8_t, 64>& k;
+        ~WipeKey() { detail::secureZero(k.data(), k.size()); }
+    } wipeKey{macKey};
     security::buildBootstrap(adminName, oneTimePassword, clusterKeyFileContents, cfg_.scramIterations,
-                             cfg_.minPasswordLength, vs, msg);
+                             cfg_.minPasswordLength, vs, msg, macKey);
     std::vector<uint8_t> frame(msg.encodedSize());
     const std::size_t n = msg.encode(frame.data());
     if (n == 0) return OpResult::InvalidArgument;
-    // No DDL extension: the bootstrap's nonce is its identity; a resend carries the same bytes.
-    return issueControl_(OpKind::SecurityBootstrap, target, token, std::span<const uint8_t>(frame.data(), n), 0, 0);
+    // No DDL extension: the bootstrap's nonce is its identity; a resend carries the same bytes (re-signed per
+    // challenge).
+    return issueControl_(OpKind::SecurityBootstrap, target, token, std::span<const uint8_t>(frame.data(), n), 0, 0,
+                         std::span<const uint8_t>(macKey.data(), macKey.size()));
 }
 
 OpResult Client::getViewRow(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint,
@@ -2136,7 +2151,8 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             }
         }
     }
-    if (checkedWritesReadTooOld(h.op, agent_.sessionBrokerVersion(0)) || leaseOpTooOld(h.op, agent_.sessionBrokerVersion(0))) {
+    if (checkedWritesReadTooOld(h.op, agent_.sessionBrokerVersion(0)) ||
+        leaseOpTooOld(h.op, agent_.sessionBrokerVersion(0)) || bootstrapTooOld(h.op, agent_.sessionBrokerVersion(0))) {
         completeCtl_(p, OpStatus::BrokerTooOld, ddlNoValue(p.op));
         return;
     }
@@ -2178,6 +2194,14 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             framePool_.pop_back();
         }
         d.frame.assign(ctlScratch_.begin(), ctlScratch_.end());
+        // #234: every offer asks for a fresh challenge first (same stamps as the frame)
+        if (h.op == OpKind::SecurityBootstrap) {
+            rpc::SecurityBootstrapChallengeRequest rq;
+            rq.sessionId     = machine.sessionId();
+            rq.correlationId = p.corrId;
+            d.challengeFrame.resize(rq.encodedSize());
+            rq.encode(d.challengeFrame.data());
+        }
         if (!endpointPool_.empty()) {   // L22 fix 2: a recycled endpoint string (capacity kept)
             d.endpoint = std::move(endpointPool_.back());
             endpointPool_.pop_back();
@@ -2385,8 +2409,15 @@ void Client::failControlOnSeedLoss_(uint16_t errorCode, std::span<const uint8_t>
 }
 
 transport::AeronTransport::OfferResult Client::offerDdl_(RoutedCtlPending& d, int64_t nowNs, DdlOfferedOn& on) {
+    // #234: a bootstrap starts every attempt, on any node, with a challenge request; its answer triggers the signed
+    // frame.
+    return offerRoutedFrame_(d, d.challengeFrame.empty() ? d.frame : d.challengeFrame, nowNs, on);
+}
+
+transport::AeronTransport::OfferResult Client::offerRoutedFrame_(RoutedCtlPending& d, std::vector<uint8_t>& frame,
+                                                                 int64_t nowNs, DdlOfferedOn& on) {
     uint32_t idx = 0;
-    const auto r = agent_.offerToEndpoint(d.endpoint, d.frame.data(), d.frame.size(), nowNs, idx);
+    const auto r = agent_.offerToEndpoint(d.endpoint, frame.data(), frame.size(), nowNs, idx);
     // #290: the node session is named on a refusal too (its epoch is 0 then) — a Rejected one ends the DDL.
     on = DdlOfferedOn{idx, r == transport::AeronTransport::OfferResult::Accepted ? agent_.connectedEpoch(idx) : 0};
     return r;
@@ -2682,7 +2713,8 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
         if ((p.op == OpKind::DefineTopic && (defineKeyFeaturesTooOld(d->frame, agent_.sessionBrokerVersion(0)) ||
                                          defineLeaseTooOld(d->frame, agent_.sessionBrokerVersion(0)))) ||
             checkedWritesReadTooOld(p.op, agent_.sessionBrokerVersion(0)) ||
-            leaseOpTooOld(p.op, agent_.sessionBrokerVersion(0))) {
+            leaseOpTooOld(p.op, agent_.sessionBrokerVersion(0)) ||
+            bootstrapTooOld(p.op, agent_.sessionBrokerVersion(0))) {
             PendingCtl dead = takeCtl_(i);   // queued before the seed connected: the version is known now
             completeCtl_(dead, OpStatus::BrokerTooOld, ddlNoValue(dead.op));
             ++work;
@@ -3333,8 +3365,8 @@ std::string_view lineageErrorName(uint16_t code) noexcept {
         "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused",
         "ConstraintViolation", "KeyExists", "KeyNotFound", "AutoIncrementExhausted", "ViewKeyExpressionInvalid",
         "ViewConstraintInvalid", "ViewUniqueInvalid", "TxnTooLarge", "TxnConflict",
-        "LeaseNotFound", "LeaseLimitExceeded", "LeaseTtlTooLarge"};
-    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::LeaseTtlTooLarge) + 1,
+        "LeaseNotFound", "LeaseLimitExceeded", "LeaseTtlTooLarge", "SchemaVersionRetired"};
+    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::SchemaVersionRetired) + 1,
                   "lineageErrorName: one name per rune::protocol::client::ErrorCode");
     if (const char* auth = authErrorName(code)) return auth;   // #225: the one source of the 44..48 names
     return code < std::size(kNames) ? kNames[code] : std::string_view("UnknownErrorCode");
@@ -3377,6 +3409,10 @@ TopicHandle Client::rawTopicAndWait(std::string_view name, std::chrono::nanoseco
 TopicSchemaResult Client::resolveOpenTopicFailure(std::string_view name, uint64_t fingerprint, uint16_t code, std::chrono::nanoseconds remaining) {
     constexpr auto kUnknownTopic = static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownTopic);
     const auto refused = [&](uint16_t c) {
+        if (c == static_cast<uint16_t>(rune::protocol::client::ErrorCode::SchemaVersionRetired))   // #419
+            return "openTopic: the schema version this type was generated from is retired on '" + std::string(name) +
+                   "' (error 67 SchemaVersionRetired: versions below the topic's retire floor are refused); regenerate the type "
+                   "from the current schema";
         std::string msg = "openTopic: the broker refused '" + std::string(name) + "' (error " + std::to_string(c);
         if (const char* an = authErrorName(c)) msg += std::string(" ") + an;
         else if (c == kUnknownTopic) msg += " UnknownTopic";
@@ -3906,6 +3942,8 @@ int Client::dutyCycle(int64_t nowNs) {
     int work = agent_.doWork(nowNs);
     // I3': owner releases fenced on the command ring apply once the drain passed them.
     if (!deferredReleases_.empty()) [[unlikely]] work += applyDeferredReleases_(false);
+    // #767: the seed moves the agent finished (a redirect / a failover): what follows a success / a failure.
+    work += serviceSeedMoves_();
     // DR client bug 1: a seed whose broker died moves to a live broker.
     work += driveSeedFailover_(nowNs);
     // Fix round 2 (C-1): every Connected edge of the seed (failover, a resume
@@ -3977,7 +4015,9 @@ int Client::dutyCycle(int64_t nowNs) {
     }
     // #514: a BOUND reader / group fetch on a leader node that went silent (crashed) arms nothing above; the
     // check is one compare per cycle, the scan once per quarter keepalive.
-    if (nowNs >= nextSilentCheckNs_ && (subscriberHub_.homedCount() != 0 || !groupConsumerHub_.empty())) [[unlikely]]
+    // #361: ... and a remote coordinator session (coordinatorInUse_ is asked inside, once per period).
+    if (nowNs >= nextSilentCheckNs_ &&
+        (subscriberHub_.homedCount() != 0 || !groupConsumerHub_.empty() || coordIdx() != 0)) [[unlikely]]
         work += watchSilentLeaders_(nowNs);
 
     // 3b'. F8c C3: control frames the transport refused (Retry), in order.
@@ -5466,6 +5506,56 @@ void Client::onEgressFrame(codec::TemplateId tid,
         break;
     }
 
+    // ---- #234: SecurityBootstrapChallenge (103) - the gateway's one-use challenge for an in-flight bootstrap.  The
+    // MAC
+    //      (made under the op's key, held in PendingCtl::newPassword) is written into the frame, which is then sent.
+    case codec::TemplateId::SecurityBootstrapChallenge: {
+        namespace rpc = rune::protocol::client;
+        using Offer = transport::AeronTransport::OfferResult;
+        const auto opt = rpc::SecurityBootstrapChallenge::decode(buf, len);
+        if (!opt) break;
+        const std::size_t i = findCtl_(opt->correlationId);
+        if (i >= pendingCtl_.size() || pendingCtl_[i].op != OpKind::SecurityBootstrap) break;
+        PendingCtl& p = pendingCtl_[i];
+        auto* d = std::get_if<RoutedCtlPending>(&p.ddl);
+        // Only an in-flight attempt (its challenge request is out) takes a challenge; the key must be the 64-byte one.
+        if (d == nullptr || p.newPassword.view().size() != 64) break;
+        const auto* sent = std::get_if<DdlSent>(&d->retry);
+        const auto* seen = std::get_if<DdlNotLeaderSeen>(&d->retry);
+        if (sent == nullptr && seen == nullptr) break;
+        std::array<uint8_t, 64> key{};
+        std::memcpy(key.data(), p.newPassword.view().data(), key.size());
+        const bool signedOk = security::signBootstrap(key, opt->challenge, d->frame);
+        detail::secureZero(key.data(), key.size());
+        const int64_t nowNs = now();
+        if (!signedOk) {
+            constexpr std::string_view kWhy = "cannot compute the bootstrap MAC";
+            PendingCtl dead = takeCtl_(i);
+            dead.newPassword.wipe();
+            completeCtl_(dead, OpStatus::InvalidArgument, ddlNoValue(dead.op), 0, 0,
+                         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()), kWhy.size()));
+            break;
+        }
+        DdlOfferedOn on;
+        switch (offerRoutedFrame_(*d, d->frame, nowNs, on)) {
+        case Offer::Accepted:
+            if (sent != nullptr) setDdlRetry_(*d, DdlSent{sent->redirects, on});
+            else                 setDdlRetry_(*d, DdlNotLeaderSeen{seen->redirects, seen->budgetEndNs,
+                                                                   seen->backoffNs, on});
+            break;
+        case Offer::Retry:   // re-sent within the budget; the resend asks for a new challenge
+            onDdlNotLeader_(i, "bootstrap challenge received but the request could not be sent", nowNs);
+            break;
+        case Offer::Fatal: {
+            PendingCtl dead = takeCtl_(i);
+            dead.newPassword.wipe();
+            completeCtl_(dead, OpStatus::NotConnected);
+            break;
+        }
+        }
+        break;
+    }
+
     // ---- Namespaces (Task 11): ListNamespacesResponse (83) — the raw frame is the payload (the caller decodes).
     case codec::TemplateId::ListNamespacesResponse: {
         if (len < rune::protocol::client::MessageHeader::ENCODED_SIZE) break;
@@ -6642,77 +6732,138 @@ void Client::redirectBySeed_(int64_t corrId, const std::string& newEndpoint, int
     // production UDP redirects and in-process ipc test redirects.
     const std::string newChannel = toChannel(newEndpoint);  // N2
 
-    // Retarget is noexcept; if it fails the old publication is kept.
-    const bool retargeted = agent_.retarget(newChannel, responsePort);
-
-    if (retargeted) {
-        // MD1 IMPORTANT-2: record the connection's new leader channel so
-        // proactive produce routing compares against the right target.
-        currentLeaderChannel() = newChannel;
-        // CB-5 B FIX (bugs 1-4): a data op (Produce OR Subscribe) was
-        // rejected by a FOLLOWER.  We must:
-        //   (1) reconnect to the leader with a FRESH session (the leader
-        //       has no session for us — submitReconnect forces a new
-        //       ConnectRequest even though we are still logically
-        //       Connected to the follower), and
-        //   (2) resend the affected op(s) — Produce AND Subscribe — but
-        //       only AFTER the new session is Connected (round 4: its handshake done), so they
-        //       carry the leader's freshly assigned sessionId (re-stamped
-        //       into the frame header).  We defer the resend by setting
-        //       redirectPending_; the seed's Connected edge (onSeedConnected_) flushes
-        //       it (see above).  This fixes: subscribe never resent (1),
-        //       stale sessionId (2), resend racing the reconnect (3).
-        //
-        // Stick-to-leader (4): the transport retarget persists and the
-        // new session is the leader's, so every subsequent op reads the
-        // leader session via stateAndSessionId() and lands directly on
-        // the leader without re-redirecting.
-        //
-        // Only initiate ONE reconnect per redirect episode: if a
-        // reconnect is already pending (multiple in-flight ops each
-        // redirected), coalesce — the single deferred resend on the next
-        // Connected edge flushes ALL pending ops.  This prevents
-        // session churn from a burst of redirects.
-        // Coalesce: only initiate ONE reconnect per redirect episode.
-        // Single-owner agent thread → a plain check-and-set (no CAS).
-        if (!redirectPending()) {
-            redirectPending() = true;
-            agent_.submitReconnect();
-        }
-        redirectedResendBackoffNs_ = kRedirectedResendInitNs;  // DR-15: a reachable target
-    } else {
-        // DR-15 (SIGTERM parity, Docker 2026-10-05): the redirect named a node
-        // that is unreachable right now (it just stopped — its host is gone).
-        // Never terminal: stay on the current node, ask for metadata, and
-        // re-send the pending Subscribes on the answer (the cluster moves on;
-        // the next answer redirects to the live leader or serves it).  The
-        // redirected Produce stays in flight — its attempt timer re-offers it
-        // (no redirect budget spent: nothing was re-sent).
-        if ((unreachableRedirects_++ & 1023u) == 0)
-            std::fprintf(stderr, "rune-client: redirect target %s unreachable — staying, asking for metadata "
-                         "(%llu so far)\n", newEndpoint.c_str(),
-                         static_cast<unsigned long long>(unreachableRedirects_));
-        // Review M1: still an answer for the produce's in-flight accounting.
-        producerHub_.noteRedirectAnswer(corrId);
-        // Review MAJOR-1: only THIS Subscribe is re-sent (never the others,
-        // which still await their own answer — a duplicate would register a
-        // second subscription broker-side).
-        if (subscriberHub_.isPending(corrId) &&
-            std::find(redirectedSubscribes_.begin(), redirectedSubscribes_.end(), corrId) ==
-                redirectedSubscribes_.end()) {  // re-review NEW-M1: once per pending resend
+    // Retarget is noexcept; if it fails the old publication is kept.  #767: the move is asynchronous: Done / Failed
+    // act now, Pending records the redirect and takeSeedMoveResult() (serviceSeedMoves_) finishes it, the same two
+    // bodies.
+    uint64_t token = 0;
+    const agent::ClientAgent::SeedMove mv = agent_.retarget(newChannel, responsePort, token);
+    if (mv == agent::ClientAgent::SeedMove::Pending) {
+        // The same target as the move a redirect is already waiting on (a burst of redirects to one leader): the move
+        // is shared.  This op is not failed by it; it only joins the record, so the moved / failed body runs once for
+        // the move and the per-op part (the failure path's own bookkeeping) once per op.
+        if (pendingRedirect_ && pendingRedirect_->token == token) {
             try {
-                redirectedSubscribes_.push_back(corrId);
+                pendingRedirect_->joined.push_back(JoinedRedirect{corrId, newEndpoint});
             } catch (...) {
-                // allocation failure (cold path): it times out as before
+                // allocation failure (cold path): this op takes its own bookkeeping now, as a superseded one would
+                onSeedRedirectFailed_(corrId, newEndpoint, /*superseded=*/true);
+            }
+            return;
+        }
+        // A redirect pending on ANOTHER move is superseded by this one (the agent abandons its move): its failure body
+        // runs now, for its own ops only; the newer move is untouched.
+        if (pendingRedirect_) {
+            PendingRedirect old = std::move(*pendingRedirect_);
+            pendingRedirect_.reset();
+            for (const JoinedRedirect& j : old.joined) onSeedRedirectFailed_(j.corrId, j.endpoint, /*superseded=*/true);
+            onSeedRedirectFailed_(old.corrId, old.endpoint, /*superseded=*/true);
+        }
+        pendingRedirect_ = PendingRedirect{token, corrId, newEndpoint, newChannel, {}};
+        return;
+    }
+    if (mv == agent::ClientAgent::SeedMove::Failed) onSeedRedirectFailed_(corrId, newEndpoint, /*superseded=*/false);
+    else onSeedRedirectMoved_(newChannel);
+}
+
+void Client::onSeedRedirectMoved_(const std::string& newChannel) {
+    // MD1 IMPORTANT-2: record the connection's new leader channel so
+    // proactive produce routing compares against the right target.
+    currentLeaderChannel() = newChannel;
+    // CB-5 B FIX (bugs 1-4): a data op (Produce OR Subscribe) was
+    // rejected by a FOLLOWER.  We must:
+    //   (1) reconnect to the leader with a FRESH session (the leader
+    //       has no session for us — submitReconnect forces a new
+    //       ConnectRequest even though we are still logically
+    //       Connected to the follower), and
+    //   (2) resend the affected op(s) — Produce AND Subscribe — but
+    //       only AFTER the new session is Connected (round 4: its handshake done), so they
+    //       carry the leader's freshly assigned sessionId (re-stamped
+    //       into the frame header).  We defer the resend by setting
+    //       redirectPending_; the seed's Connected edge (onSeedConnected_) flushes
+    //       it (see above).  This fixes: subscribe never resent (1),
+    //       stale sessionId (2), resend racing the reconnect (3).
+    //
+    // Stick-to-leader (4): the transport retarget persists and the
+    // new session is the leader's, so every subsequent op reads the
+    // leader session via stateAndSessionId() and lands directly on
+    // the leader without re-redirecting.
+    //
+    // Only initiate ONE reconnect per redirect episode: if a
+    // reconnect is already pending (multiple in-flight ops each
+    // redirected), coalesce — the single deferred resend on the next
+    // Connected edge flushes ALL pending ops.  This prevents
+    // session churn from a burst of redirects.
+    // Coalesce: only initiate ONE reconnect per redirect episode.
+    // Single-owner agent thread → a plain check-and-set (no CAS).
+    if (!redirectPending()) {
+        redirectPending() = true;
+        agent_.submitReconnect();
+    }
+    redirectedResendBackoffNs_ = kRedirectedResendInitNs;  // DR-15: a reachable target
+}
+
+void Client::onSeedRedirectFailed_(int64_t corrId, const std::string& newEndpoint, bool superseded) {
+    // DR-15 (SIGTERM parity, Docker 2026-10-05): the redirect named a node
+    // that is unreachable right now (it just stopped — its host is gone).
+    // Never terminal: stay on the current node, ask for metadata, and
+    // re-send the pending Subscribes on the answer (the cluster moves on;
+    // the next answer redirects to the live leader or serves it).  The
+    // redirected Produce stays in flight — its attempt timer re-offers it
+    // (no redirect budget spent: nothing was re-sent).
+    if ((unreachableRedirects_++ & 1023u) == 0)
+        std::fprintf(stderr, "rune-client: redirect target %s unreachable — staying, asking for metadata "
+                     "(%llu so far)\n", newEndpoint.c_str(),
+                     static_cast<unsigned long long>(unreachableRedirects_));
+    // Review M1: still an answer for the produce's in-flight accounting.
+    producerHub_.noteRedirectAnswer(corrId);
+    // Review MAJOR-1: only THIS Subscribe is re-sent (never the others,
+    // which still await their own answer — a duplicate would register a
+    // second subscription broker-side).
+    if (subscriberHub_.isPending(corrId) &&
+        std::find(redirectedSubscribes_.begin(), redirectedSubscribes_.end(), corrId) ==
+            redirectedSubscribes_.end()) {  // re-review NEW-M1: once per pending resend
+        try {
+            redirectedSubscribes_.push_back(corrId);
+        } catch (...) {
+            // allocation failure (cold path): it times out as before
+        }
+    }
+    // #767: a superseded redirect only answers for its own op; the episode's pacing belongs to the newer move
+    // (its success reconnects and re-sends every pending Subscribe; its failure paces here).
+    if (superseded) return;
+    // Review M3: paced — the re-send waits for a fresh metadata answer
+    // AND a doubling backoff (100 ms .. 2 s); never a tight redirect loop.
+    redirectMetaSeen_       = metadataResponses_;
+    nextRedirectedResendNs_ = now() + redirectedResendBackoffNs_;
+    redirectedResendBackoffNs_ = std::min<int64_t>(redirectedResendBackoffNs_ * 2, kRedirectedResendMaxNs);
+    requestMetadataNow_();
+}
+
+int Client::serviceSeedMoves_() {
+    int work = 0;
+    while (const auto r = agent_.takeSeedMoveResult()) {
+        ++work;
+        if (pendingRedirect_ && pendingRedirect_->token == r->token) {
+            PendingRedirect p = std::move(*pendingRedirect_);
+            pendingRedirect_.reset();
+            if (r->ok) {
+                onSeedRedirectMoved_(p.channel);   // once for the move: the joined ops need nothing of their own
+            } else {
+                for (const JoinedRedirect& j : p.joined)
+                    onSeedRedirectFailed_(j.corrId, j.endpoint, /*superseded=*/true);
+                onSeedRedirectFailed_(p.corrId, p.endpoint, /*superseded=*/false);   // the episode's pacing, once
             }
         }
-        // Review M3: paced — the re-send waits for a fresh metadata answer
-        // AND a doubling backoff (100 ms .. 2 s); never a tight redirect loop.
-        redirectMetaSeen_       = metadataResponses_;
-        nextRedirectedResendNs_ = now() + redirectedResendBackoffNs_;
-        redirectedResendBackoffNs_ = std::min<int64_t>(redirectedResendBackoffNs_ * 2, kRedirectedResendMaxNs);
-        requestMetadataNow_();
+        // A failover attempt may share the move with a redirect (both to the same channel): each record whose token
+        // matches finishes.
+        if (pendingFailover_ && pendingFailover_->token == r->token) {
+            PendingFailover p = std::move(*pendingFailover_);
+            pendingFailover_.reset();
+            if (r->ok) onSeedFailoverMoved_(p.target, p.connectNow, p.attempt);
+            else onSeedFailoverFailed_();
+        }
     }
+    return work;
 }
 
 int Client::retryRedirectedSubscribes_(int64_t nowNs) {
@@ -6780,6 +6931,14 @@ int Client::watchSilentLeaders_(int64_t nowNs) {
     uint64_t silent = agent_.leaderSessionsSilentMask(nowNs);
     if (agent_.seedSilent(nowNs) && (subscriberHub_.usesSession(0) || groupConsumerHub_.fetchUses(0))) {
         scheduleMetadataRefresh();   // #514 (seed): idempotent while armed
+        return 1;
+    }
+    // #361: a remote coordinator session that went silent while something uses the coordinator: ask for metadata, whose
+    // answer names the new coordinator (onMetadataResponse).  Idempotent while armed, level-triggered.  A session that
+    // is not Connected asks nothing here: syncCoordinatorSession_ paces its give-up and its metadata refresh (a growing
+    // grace); an answer that arrives anyway may still move the route (coordinatorSuspect_).
+    if (coordinatorSilent_(nowNs) && coordinatorInUse_()) {
+        scheduleMetadataRefresh();
         return 1;
     }
     if (silent == 0) [[likely]] return 0;
@@ -7443,6 +7602,26 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         if (groupConsumerHub_.fetchWaitsForSession()) scheduleMetadataRefresh();
     }
 
+    // #361: the answer names the cluster's coordinator.  A coordinator session that is silent or down (and something
+    // uses it) is left for the named node at once, not after the stale-session detection; a healthy coordinator is
+    // never moved by metadata (a lagging follower's answer must not cause a rejoin: its own NotCoordinator answer is
+    // the authority), and a wrong hint corrects itself (the named node answers NotCoordinator{real one}; an
+    // unreachable one is given up by syncCoordinatorSession_).  An answer from the coordinator's own session proves it
+    // alive.  An answer naming the same node (the election has not finished) moves nothing: the refresh stays armed by
+    // watchSilentLeaders_ (level-triggered, backoff-paced).
+    if (resp.coordinatorNodeId >= 0 && coordinatorInUse_() && coordinatorSuspect_(now()) &&
+        resp.sessionId != coordSessionId_()) {
+        const std::string& hostPort = metadataCache_.endpointFor(resp.coordinatorNodeId);
+        if (!hostPort.empty()) {
+            // The response port of that node was learnt from this same answer (the per-broker loop above).
+            try {
+                if (moveCoordinatorTo_(toChannel(hostPort))) ++coordinatorMetadataMoves_;
+            } catch (...) {
+                // allocation failure (cold path): the refresh stays armed, the next answer retries
+            }
+        }
+    }
+
     // F14: a fresh cluster view - txn requests waiting for the coordinator to be re-discovered
     // (NotCoordinator) back off and re-send.
     producerHub_.onCoordinatorMoved();
@@ -7458,9 +7637,15 @@ void Client::onCoordinatorRedirect_(const std::string& message) {
     // MAJOR-1: "the seed" means where the seed PHYSICALLY is (its default
     // publication), not its bootstrap identity — a seed a data-op redirect moved
     // to L that hears NotCoordinator{bootstrap} must route to the bootstrap.
+    (void)moveCoordinatorTo_(channel);
+}
+
+// The route move of onCoordinatorRedirect_ (a NotCoordinator answer) and of a metadata answer naming the coordinator
+// (#361): false = nothing moved.  Agent / duty thread.
+bool Client::moveCoordinatorTo_(const std::string& channel) {
     const auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_);
     const std::string& current = rm == nullptr ? agent_.seedChannel() : rm->channel;
-    if (agent::ClientAgent::sameEndpoint(channel, current)) return;
+    if (agent::ClientAgent::sameEndpoint(channel, current)) return false;
     // r2 LOW-3: a coordinator whose session was Rejected / Closed is not
     // re-followed until fresh metadata arrives (the member waits its join
     // deadline, the txn op its retry) — never a 100 ms move/fallback loop.
@@ -7468,7 +7653,7 @@ void Client::onCoordinatorRedirect_(const std::string& message) {
         if (metadataResponses_ == coordRejected_->meta &&
             agent::ClientAgent::sameEndpoint(channel, coordRejected_->channel)) {
             scheduleMetadataRefresh();
-            return;
+            return false;
         }
         coordRejected_.reset();
     }
@@ -7480,6 +7665,29 @@ void Client::onCoordinatorRedirect_(const std::string& message) {
     groupConsumerHub_.onCoordinatorMoved();   // members -> Rejoining (there)
     producerHub_.onCoordinatorMoved();        // Phase 2b F: AwaitCoordinator requests re-send
     syncCoordinatorSession_();                // already connected: they join at once
+    return true;
+}
+
+// #361: the remote coordinator's session is silent (Connected, nothing heard for two keepalives: a live node answers
+// every Ping) or not Connected.  The seed route is never suspect here: the seed has its own failover (#514 / DR).
+bool Client::coordinatorSuspect_(int64_t nowNs) const noexcept {
+    const auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_);
+    if (rm == nullptr) return false;
+    return agent_.sessionMachineAt(rm->idx).state() != session::SessionState::Connected || coordinatorSilent_(nowNs);
+}
+
+// #361: the remote coordinator's session is Connected but silent for two keepalives (a live node answers every Ping).
+bool Client::coordinatorSilent_(int64_t nowNs) const noexcept {
+    const auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_);
+    if (rm == nullptr) return false;
+    const session::SessionMachine& m = agent_.sessionMachineAt(rm->idx);
+    return m.state() == session::SessionState::Connected && m.silentLongerThan(nowNs, 2 * m.keepaliveIntervalNs());
+}
+
+// #361: something depends on the coordinator session: a group member, a transactional producer, or a pending
+// coordinator request.
+bool Client::coordinatorInUse_() const noexcept {
+    return !groupConsumerHub_.empty() || producerHub_.coordinatorInUse();
 }
 
 uint64_t Client::staleLossesAt_(uint32_t idx) const noexcept {
@@ -7785,6 +7993,8 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
             seedFailover_ = SeedFailoverStopped{};
             return 1;
         }
+        // #767: a move still resolving decides the attempt (its result paces the next one): never start another.
+        if (pendingFailover_) return 0;
         // I2: a reconnectForeverAfterLive machine owns its attempt schedule (its
         // capped-exponential Backoff): the failover never connects by itself — it
         // only re-points the seed's publication at the next candidate while the
@@ -7907,19 +8117,43 @@ bool Client::startSeedFailoverAttempt_(SeedFailingOver& f, int64_t nowNs, bool c
     f.gapNs       = std::min(f.gapNs * 2, kSeedFailoverMaxGapNs);
     const int64_t connectNs = cfg_.connectTimeoutMs > 0 ? nsAfter(0, cfg_.connectTimeoutMs) : kSeedFailoverAttemptMaxNs;
     f.attemptDeadlineNs = nowNs + std::min(connectNs, kSeedFailoverAttemptMaxNs);
-    if (target.empty() || !agent_.failoverSeedTo(target, nowNs, connectNow)) {
+    uint64_t token = 0;
+    const agent::ClientAgent::SeedMove mv =
+        target.empty() ? agent::ClientAgent::SeedMove::Failed : agent_.failoverSeedTo(target, nowNs, connectNow, token);
+    if (mv == agent::ClientAgent::SeedMove::Failed) {
         f.attemptDeadlineNs = f.notBeforeNs;  // did not resolve: the next candidate after the gap
         return false;
     }
+    if (mv == agent::ClientAgent::SeedMove::Pending) {
+        // #767: the move is in flight; its result (serviceSeedMoves_) runs what follows a success / a failure.  A
+        // pending attempt this one supersedes is simply replaced: its (failed) result carries a stale token.
+        try {
+            pendingFailover_ = PendingFailover{token, target, connectNow, f.attempt};
+        } catch (...) {
+            // allocation failure (cold path): the move completes unobserved; the attempt deadline paces the next one
+            pendingFailover_.reset();
+        }
+        return true;
+    }
+    onSeedFailoverMoved_(target, connectNow, f.attempt);
+    return true;
+}
+
+void Client::onSeedFailoverMoved_(const std::string& target, bool connectNow, uint32_t attempt) noexcept {
     if (connectNow) ++seedFailoverConnects_;
     if ((seedFailovers_++ & 63u) == 0)
         std::fprintf(stderr, "rune-client: seed broker presumed dead (no answer / gave up) — seed moved to %s "
-                     "(attempt %u, %llu so far)\n", target.c_str(), f.attempt,
+                     "(attempt %u, %llu so far)\n", target.c_str(), attempt,
                      static_cast<unsigned long long>(seedFailovers_));
     // The leader of what the seed's broker led must be learnt from a live broker
     // now (C1: the seed moved — fan out).
     requestMetadataNow_();
-    return true;
+}
+
+void Client::onSeedFailoverFailed_() noexcept {
+    // The new publication did not resolve: the next candidate after the gap (only the CURRENT attempt's record reaches
+    // here, so a newer attempt's deadline is never reset by a superseded one).
+    if (auto* f = std::get_if<SeedFailingOver>(&seedFailover_)) f->attemptDeadlineNs = f->notBeforeNs;
 }
 
 void Client::resendAllInFlightViaRoute_() noexcept {

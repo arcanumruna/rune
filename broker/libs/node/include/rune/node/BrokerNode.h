@@ -561,6 +561,14 @@ public:
                     spdlog::error("AdminWorkerAgent: malformed kMsgClusterFeatureLevel (len={}) refused", n);
                 return;
             }
+            if (tid == kMsgClusterFdLimit) {   // #612
+                uint64_t limit = 0;
+                int32_t node = -1;
+                if (decodeClusterFdLimit(p, n, limit, node)) worker_.setClusterFdLimit(limit, node);
+                else if (badControlFrames_++ % 1024 == 0)
+                    spdlog::error("AdminWorkerAgent: malformed kMsgClusterFdLimit (len={}) refused", n);
+                return;
+            }
             if (tid == kMsgCatalogReadPaused) {   // Task 12 fix round 0
                 CatalogReadPausedMsg m;
                 if (decodeCatalogReadPaused(p, n, m)) worker_.catalogReadPaused(m);
@@ -1371,9 +1379,9 @@ private:
             postCatalog_(kA2cViewUninstall, kViewUninstallWireLen,
                          [&](uint8_t* p) { writeViewUninstall(p, viewTopicId); });
         };
-        fx.applied = [this](int64_t offset, uint64_t digest) {
+        fx.applied = [this](int64_t offset, uint64_t digest, int32_t nextTopicId) {
             postCatalog_(kA2cCatalogApplied, kCatalogAppliedWireLen,
-                         [&](uint8_t* p) { writeCatalogApplied(p, offset, digest); });
+                         [&](uint8_t* p) { writeCatalogApplied(p, offset, digest, nextTopicId); });
         };
         fx.halted = [this](const rune::catalog::ApplyError& err) {
             std::string detail = std::string{rune::catalog::applyErrorName(err.code)} + ": " + err.detail;
@@ -1818,6 +1826,8 @@ public:
     /// I-C test seams (control thread): force the gateway's TLS-derived worker bind token to all-zero; the connects that
     /// failed on it; the keyReady announce waves that landed.
     void forceZeroDerivedBindTokenForTest(bool on);
+    /// #592: cap the gateway's group answers at `bytes` (0 = its scratch size), so a small fetch-all overflows.
+    void gatewayGroupAnswerCapForTest(std::size_t bytes);
     [[nodiscard]] uint64_t gatewayBindTokenDeriveFailuresForTest();
     [[nodiscard]] uint64_t gatewayCryptoKeyAnnouncesForTest();
     [[nodiscard]] uint64_t gatewayNotAuthorizedForTest();
@@ -1831,6 +1841,8 @@ public:
     [[nodiscard]] int64_t securityAppliedOffsetOnControlForTest();
     /// The shipped permission epoch worker `w` holds for `sessionId` (0: none), read ON that worker's thread.
     [[nodiscard]] uint64_t workerPermissionEpochForTest(int32_t w, int64_t sessionId);
+    /// Permission binds worker `w` dropped because the session was unknown to it (read ON that worker's thread).
+    [[nodiscard]] uint64_t workerPermBindsUnknownSessionForTest(int32_t w);
     /// Shard-produce frames worker `w` admitted and has not yet answered (read ON that worker's thread): 0 once every
     /// received frame was answered (the broker-side answered == received).
     [[nodiscard]] std::size_t workerDirectAcksInFlightForTest(int32_t w);
@@ -1910,6 +1922,36 @@ public:
     void holdCatalogReplicationForTest(bool on) {
         onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdCatalogReplicationForTest(on); return 0; });
     }
+    /// #442 seams (control thread): the permission shipper's queue cap, the workers it declared lost, and a
+    /// worker's lifecycle ring filled to the brim (nothing drains it while the worker's hold lasts).
+    template <class = void>
+    void setPermissionQueueCapForTest(std::size_t n) {
+        onControlThreadForTest([this, n]() { if (gateway_) gateway_->setPermissionQueueCapForTest(n); return 0; });
+    }
+    template <class = void>
+    [[nodiscard]] uint64_t permissionWorkersLostForTest() {
+        return static_cast<uint64_t>(onControlThreadForTest([this]() {
+            return gateway_ ? static_cast<int64_t>(gateway_->permissionWorkersLostForTest()) : int64_t{0}; }));
+    }
+    template <class = void>
+    [[nodiscard]] uint64_t permissionResyncsForTest() {
+        return static_cast<uint64_t>(onControlThreadForTest([this]() {
+            return gateway_ ? static_cast<int64_t>(gateway_->permissionResyncsForTest()) : int64_t{0}; }));
+    }
+    template <class = void>
+    [[nodiscard]] int64_t permissionLostNowForTest() {
+        return onControlThreadForTest([this]() {
+            return gateway_ ? static_cast<int64_t>(gateway_->permissionLostNowForTest()) : int64_t{0}; });
+    }
+    template <class = void>
+    void fillWorkerLifecycleRingForTest(int32_t w) {
+        onControlThreadForTest([this, w]() {
+            if (!workerPool_ || w < 0 || w >= workerPool_->workerCount()) return 0;
+            WorkerOp filler; filler.type = WorkerOp::Type::SessionClose; filler.sessionId = INT64_MAX;
+            while (workerPool_->worker(w).tryEnqueueOp(filler)) {}
+            return 0;
+        });
+    }
     /// Issue #197 seam (CONTROL thread): hold / release the gateway's permission shipper (queued, never sent while held;
     /// releasing ships the backlog at once).
     template <class = void>   // instantiated after onControlThreadForTest is defined
@@ -1920,6 +1962,12 @@ public:
     template <class = void>   // instantiated after onControlThreadForTest is defined
     uint64_t permissionShipsForTest() {
         return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->permissionShipsForTest() : 0; });
+    }
+    /// Issue #995 probe (CONTROL thread): the cycles of lock waits this broker's transaction coordinator has resolved (it counts
+    /// only while it is the coordinator).
+    template <class = void>   // instantiated after onControlThreadForTest is defined
+    uint64_t txnDeadlocksResolvedForTest() {
+        return onControlThreadForTest([this]() -> uint64_t { return txnCoordService_ ? txnCoordService_->txnDeadlocksResolvedForTest() : 0; });
     }
     /// Issue #189 seam (CONTROL thread): forget every login-throttle entry of this broker's gateway.
     template <class = void>   // instantiated after onControlThreadForTest is defined
@@ -2014,6 +2062,14 @@ public:
     }
     /// The DdlAnswerGate's hold cap (a DDL OK for a not-yet-serving topic is answered Internal "in doubt" after it).
     static constexpr int64_t kDdlAnswerMaxHoldNs = 5'000'000'000LL;
+    /// #612: the smallest advertised open-file limit and whose it is, as this broker's admin thread holds it (read ON
+    /// the admin thread); {0, -1} = none known.
+    [[nodiscard]] std::pair<uint64_t, int32_t> clusterFdLimitForTest() {
+        return onAdminThreadForTest([this]() -> std::pair<uint64_t, int32_t> {
+            const auto& w = adminWorkerAgent_->worker();
+            return {w.clusterFdLimit(), w.clusterFdLimitNode()};
+        });
+    }
     /// Task 22: DDL events this broker's admin thread appended (read ON the admin thread).
     [[nodiscard]] uint64_t catalogEventsAppendedForTest() {
         return onAdminThreadForTest([this]() -> uint64_t { return adminWorkerAgent_->worker().eventsAppended(); });
@@ -2557,6 +2613,7 @@ private:
     // duty cycle) drives it, distributes newly established keys and publishes counters 233 / 234.
     void buildPeerLinks_();
     int  servicePeerLinks_(int64_t nowNs);
+    int  serviceClusterFdLimit_();   // control thread, every duty cycle: post a changed smallest open-file limit (#612)
     int  serviceClusterFeatureLevel_();   // control thread, every duty cycle: post a changed metadata feature level, pump the fanout
     void publishPeerLinkMetrics_() noexcept;
     static uint64_t onPeerLinkEstablishedThunk_(void* self, int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs);
@@ -2855,6 +2912,10 @@ private:
     std::unique_ptr<PeerLinkAgent>   peerLinkAgent_;               // control thread (null: no peer links)
     PeerLinkFanout                   peerLinkFanout_;              // control thread: keys -> workers + admin, over rings
     ClusterFeatureLevelFanout        clusterLevelFanout_;          // control thread: the metadata feature level -> workers + admin
+    uint64_t                         postedFdLimitsEpoch_ = 0;     // control thread (#612): last epoch seen
+    MetadataService::ClusterFdLimit  deliveredFdLimit_{};          // control thread (#612): last value delivered
+    MetadataService::ClusterFdLimit  pendingFdLimit_{};            // control thread (#612): changed, not delivered yet
+    bool                             fdLimitPending_ = false;
     int16_t                          postedClusterLevel_ = -1;     // control thread: the last level handed to clusterLevelFanout_
     // Task 16 (D34): the inter-broker frame crypto of a transport this broker builds - PeerSealed for Enabled with more
     // than one peer (sender id: consensus 0, legacy replication 1, admin plane 2, worker w -> 3 + w), else PeerPlain.
@@ -3049,6 +3110,7 @@ private:
     uint64_t                                              nsSlotAssignFailures_ = 0;   // a bug if ever non-zero
     std::int64_t                                          lastNsMismatchPublished_ = 0;
     std::int64_t                                          lastDamagedReadsPublished_ = 0;   // #882
+    std::int64_t                                          lastSegmentRepairPublished_[3] = {};   // #880
     std::int64_t                                          lastUnauthSuppressedPublished_ = 0;   // #145
     void bootAssignNsSlots_();                                                   // startup thread: from the booted catalog
     void onNsUpserted_(const rune::catalog::NamespaceRecord& rec);               // control thread: assign / refresh + broadcast

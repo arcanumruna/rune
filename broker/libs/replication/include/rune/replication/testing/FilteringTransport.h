@@ -99,6 +99,22 @@ public:
         pendingReconcileResps_.push_back(std::move(pr));
         return true;
     }
+    // #880: segment-repair pull, peer-routed like the reconcile pair.
+    bool sendRepairRequest(NodeId toPeer, const FetchRequestMsg& req) override {
+        if (isolated_.count(toPeer) || isolated_.count(req.followerId)) return false;
+        pendingRepairReqs_.push_back({toPeer, req});
+        return true;
+    }
+    bool sendRepairResponse(NodeId toPeer, const FetchResponseMsg& resp) override {
+        if (isolated_.count(toPeer)) return false;
+        PendingResponse pr;
+        pr.toFollower = toPeer;
+        pr.recordsBuf.assign(resp.records.begin(), resp.records.end());
+        pr.resp = resp;
+        pr.resp.records = std::span<const uint8_t>(pr.recordsBuf.data(), pr.recordsBuf.size());
+        pendingRepairResps_.push_back(std::move(pr));
+        return true;
+    }
 
     // Deliver all pending messages.
     int pump(int64_t nowNs) {
@@ -173,13 +189,34 @@ public:
             }
         }
 
+        // #880: repair requests -> the peer; repair responses -> the requester.
+        std::vector<PendingReconcileReq> repReqs;
+        repReqs.swap(pendingRepairReqs_);
+        for (auto& r : repReqs) {
+            auto it = replicas_.find(r.to);
+            if (it != replicas_.end() && it->second != nullptr) {
+                it->second->onRepairRequest(r.req);
+                ++count;
+            }
+        }
+        std::vector<PendingResponse> repResps;
+        repResps.swap(pendingRepairResps_);
+        for (auto& pr : repResps) {
+            auto it = replicas_.find(pr.toFollower);
+            if (it != replicas_.end() && it->second != nullptr) {
+                it->second->applyRepairResponse(pr.resp);
+                ++count;
+            }
+        }
+
         return count;
     }
 
     [[nodiscard]] std::size_t pendingCount() const noexcept {
         return pendingRequests_.size() + pendingResponses_.size()
              + pendingEpochReqs_.size() + pendingEpochResps_.size()
-             + pendingReconcileReqs_.size() + pendingReconcileResps_.size();
+             + pendingReconcileReqs_.size() + pendingReconcileResps_.size()
+             + pendingRepairReqs_.size() + pendingRepairResps_.size();
     }
 
     [[nodiscard]] NodeId currentLeaderId() const noexcept {
@@ -209,6 +246,8 @@ private:
     std::vector<PendingEpochResp> pendingEpochResps_;   ///< DR-BUG-6
     std::vector<PendingReconcileReq> pendingReconcileReqs_;  ///< DR-BUG-6
     std::vector<PendingResponse>  pendingReconcileResps_;    ///< DR-BUG-6
+    std::vector<PendingReconcileReq> pendingRepairReqs_;     ///< #880
+    std::vector<PendingResponse>  pendingRepairResps_;       ///< #880
 };
 
 } // namespace rune::replication::test

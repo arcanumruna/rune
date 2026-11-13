@@ -754,6 +754,8 @@ rune::node::SecurityDdlMsg asPrincipal(rune::node::SecurityDdlMsg m, const std::
 }
 }
 
+// #221: the recorded request ids are per principal.  B sending A's recorded id is a new request of B's, answered
+// exactly as with a fresh id; the id never reveals that A recorded it.
 TEST(SecurityWritePathRegression, DedupeIsPerPrincipalRegression) {
     SecurityDdlRig rig("dedupe_principal");
     rig.becomeServingLeader();
@@ -763,48 +765,42 @@ TEST(SecurityWritePathRegression, DedupeIsPerPrincipalRegression) {
     const auto again = rig.ddl(mA);   // a retry by the same principal still works
     EXPECT_EQ(again.code, 0) << again.detail;
     EXPECT_EQ(again.objectId, a.objectId);
-    EXPECT_EQ(again.version, a.version);
-    EXPECT_EQ(again.gateOffset, a.gateOffset);
-    const auto b = rig.ddl(asPrincipal(mA, "bob"));
-    EXPECT_EQ(b.code, kInvalidRequest);
-    EXPECT_EQ(b.detail, "requestId reused for a different statement");
-    EXPECT_NE(b.objectId, a.objectId) << "never A's result";
-    auto mC = asPrincipal(mA, "carol");
-    mC.denial = "not authorized: ADMIN on CLUSTER";
-    const auto c = rig.ddl(mC);
-    EXPECT_EQ(c.code, kNotAuthorized);
-    EXPECT_EQ(c.detail, "not authorized: ADMIN on CLUSTER");
-    EXPECT_EQ(c.objectId, 0u);
+    // B sends the SAME (id, CREATE USER x): the answer is what B gets for the statement with a FRESH id.
+    const auto onRecorded = rig.ddl(asPrincipal(mA, "bob"));
+    const auto onFresh = rig.ddl(rig.createUser("x", "a long enough password", "bob"));
+    EXPECT_EQ(onRecorded.code, onFresh.code);
+    EXPECT_EQ(onRecorded.detail, onFresh.detail);
+    EXPECT_EQ(onRecorded.objectId, onFresh.objectId);
+    EXPECT_EQ(onRecorded.version, onFresh.version);
+    EXPECT_EQ(onRecorded.code, kInvalidRequest) << "the 'user exists' refusal";
+    EXPECT_NE(onRecorded.detail.find("already exists"), std::string::npos) << onRecorded.detail;
+    EXPECT_NE(onRecorded.detail, "requestId reused for a different statement");
+    EXPECT_NE(onRecorded.objectId, a.objectId) << "never A's result";
+    // B then uses the id for another statement: it is B's new request and applies.
+    auto mB = rig.createUser("y", "another long password", "bob");
+    mB.meta.requestId = mA.meta.requestId;
+    const auto b = rig.ddl(mB);
+    EXPECT_EQ(b.code, 0) << b.detail;
+    EXPECT_NE(rig.state().userByName(rune::catalog::kDefaultNsId, "y"), nullptr);
+    // A's retry still gets A's original result.
+    const auto aRetry = rig.ddl(mA);
+    EXPECT_EQ(aRetry.code, 0) << aRetry.detail;
+    EXPECT_EQ(aRetry.objectId, a.objectId);
+    EXPECT_EQ(aRetry.version, a.version);
+    EXPECT_EQ(aRetry.gateOffset, a.gateOffset);
     const auto events = rig.recordedEvents();
-    ASSERT_EQ(events.size(), 1u) << "exactly one event for the request id";
-    EXPECT_EQ(events[0].event.principal.authenticated, "alice");
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_EQ(events[0].event.principal.authenticated, "alice") << "the event for x carries principal A only";
+    EXPECT_EQ(events[1].event.principal.authenticated, "bob");
 }
 
+// B unauthorized for the statement: the same denial as for a FRESH request id - a recorded id is not observable.
 TEST(SecurityWritePathRegression, AnotherPrincipalLearnsNothingFromARecordedRequestIdRegression) {
     SecurityDdlRig rig("dedupe_nothing");
     rig.becomeServingLeader();
     const auto mA = rig.createRole("s1");
     const auto a = rig.ddl(mA);
     ASSERT_EQ(a.code, 0) << a.detail;
-    ASSERT_NE(a.objectId, 0u);
-    // B guesses A's statement, then a different valid one on the same id: the two answers are identical.
-    const auto guess = rig.ddl(asPrincipal(mA, "bob"));
-    auto other = rig.createRole("s2");
-    other.meta.requestId = mA.meta.requestId;
-    const auto miss = rig.ddl(asPrincipal(other, "bob"));
-    EXPECT_EQ(guess.code, miss.code);
-    EXPECT_EQ(guess.detail, miss.detail);
-    EXPECT_EQ(guess.objectId, miss.objectId);
-    EXPECT_EQ(guess.version, miss.version);
-    EXPECT_EQ(guess.gateOffset, miss.gateOffset);
-    for (const auto* r : {&guess, &miss}) {
-        EXPECT_EQ(r->code, kInvalidRequest);
-        EXPECT_EQ(r->detail, "requestId reused for a different statement");
-        EXPECT_EQ(r->objectId, 0u);
-        EXPECT_EQ(r->version, 0u);
-        EXPECT_NE(r->gateOffset, a.gateOffset);
-    }
-    // B unauthorized for the statement: the same denial as for a FRESH request id - a recorded id is not observable.
     const std::string denial = "not authorized: ADMIN on CLUSTER";
     auto denied = asPrincipal(mA, "bob");
     denied.denial = denial;
@@ -818,6 +814,7 @@ TEST(SecurityWritePathRegression, AnotherPrincipalLearnsNothingFromARecordedRequ
     EXPECT_EQ(onRecorded.version, onFresh.version);
     EXPECT_EQ(onRecorded.gateOffset, onFresh.gateOffset);
     EXPECT_EQ(onRecorded.code, kNotAuthorized);
+    EXPECT_EQ(onRecorded.detail, denial);
     const auto events = rig.recordedEvents();
     ASSERT_EQ(events.size(), 1u) << "exactly one event, for the first request id";
     EXPECT_EQ(events[0].event.principal.authenticated, "admin");

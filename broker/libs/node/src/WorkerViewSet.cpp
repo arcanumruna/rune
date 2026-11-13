@@ -966,6 +966,12 @@ WorkerViewSet::ScanPage WorkerViewSet::scanPage(int32_t viewTopicId, int32_t par
             used += 4 + rowLen;
             ++page.rows;
             return true;
+        },
+        // Rows with equal hash-order positions (a 64-bit hash collision) are returned together or not at all.
+        [&](std::size_t group) noexcept {
+            const bool fit = page.rows + group <= maxRows && used + group * (4 + rowLen) <= budget;
+            if (!fit) tooLarge = page.rows == 0;
+            return fit;
         });
     page.bytes = static_cast<uint32_t>(used);
     if (scan == rune::view::PrefixScan::CursorGone) {

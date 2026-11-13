@@ -469,28 +469,47 @@ TEST(AuthGatesRegression, ServerSideLoginCostIsMicrosecondsNotMillisecondsRegres
     EXPECT_LT(usec[50], 2000.0) << "far below the 5 ms gate: no PBKDF2 on the control thread";
 }
 
-// Review C: an unknown user's fake salts advertise the iteration count of the MOST COMMON real account, so a cluster
-// that raised its count is not trivially distinguishable (a fake at 4096 would stand out).
-TEST(AuthLoginRegression, FakeSaltsAdvertiseTheMostCommonRealIterationCountRegression) {
+// Review C / #238: an unknown user's fake salts advertise the iteration count of the FIRST bootstrap's verifier, fixed
+// for the life of the cluster: the same (salt, count) for the same unknown name before and after the real accounts'
+// mode changes, so a probe pair cannot tell a fake name from a real one.
+TEST(AuthLoginRegression, FakeSaltsAdvertiseTheBootstrapIterationCountForeverRegression) {
     namespace sec = rune::security;
     SecurityEventChain chain;
-    sec::BootstrapOps b; b.verifier = scramVerifierOf(kTestAdminPassword, 9); b.fakeSaltSeed.fill(0x42);   // 4096, one account
+    sec::BootstrapOps b; b.verifier = scramVerifierOf(kTestAdminPassword, 9, 8192); b.fakeSaltSeed.fill(0x42);   // 8192
     (void)chain.emit(b, "admin", "BOOTSTRAP", "bootstrap");
     for (const char* name : {"ws1", "ws2", "ws3"})
-        (void)chain.emit(sec::CreateUserOps{scramVerifierOf(kTestPasswordA, 1, 8192)}, name, std::string("CREATE USER ") + name + " WITH PASSWORD '<redacted>';");
+        (void)chain.emit(sec::CreateUserOps{scramVerifierOf(kTestPasswordA, 1, 4096)}, name, std::string("CREATE USER ") + name + " WITH PASSWORD '<redacted>';");
     Rig rig(std::move(chain));
-    EXPECT_EQ(rig.view.fakeIterations(), 8192u) << "3 accounts at 8192 beat 1 at 4096";
-    const auto unknown = rig.login("nobody", {"x", "x"});
+    EXPECT_EQ(rig.view.fakeIterations(), 8192u) << "the bootstrap's count, not the 4096 of the three accounts";
+    const auto before = rig.login("nobody", {"x", "x"});
+    ASSERT_FALSE(before.firstBytes.empty());
+    const auto u0 = pc::AuthServerFirst::decode(before.firstBytes.data(), before.firstBytes.size());
+    ASSERT_TRUE(u0.has_value());
+    EXPECT_EQ(u0->salts[0].iterations, 8192u);
+    EXPECT_EQ(u0->salts[1].iterations, 8192u);
+    // five more accounts at another count: the real mode changes, the advertised count does not
+    for (const char* name : {"n1", "n2", "n3", "n4", "n5"}) {
+        const auto ev = rig.chain.emit(sec::CreateUserOps{scramVerifierOf(kTestPasswordA, 1, 16384)}, name,
+                                       std::string("CREATE USER ") + name + " WITH PASSWORD '<redacted>';");
+        const auto bytes = sec::encode(ev);
+        ASSERT_TRUE(bytes.has_value());
+        ASSERT_TRUE(rig.view.onApplied(rig.view.appliedOffset() + 1, *bytes).has_value());
+    }
+    EXPECT_EQ(rig.view.fakeIterations(), 8192u);
+    const auto after = rig.login("nobody", {"x", "x"});
+    ASSERT_FALSE(after.firstBytes.empty());
+    const auto u1 = pc::AuthServerFirst::decode(after.firstBytes.data(), after.firstBytes.size());
+    ASSERT_TRUE(u1.has_value());
+    for (int i = 0; i < 2; ++i) {
+        EXPECT_EQ(u1->salts[i].iterations, 8192u);
+        EXPECT_EQ(u1->salts[i].salt, u0->salts[i].salt) << "byte-identical salt for the same unknown name";
+    }
     const auto real = rig.login("ws1", {kTestPasswordA, ""});
-    ASSERT_FALSE(unknown.firstBytes.empty());
-    ASSERT_FALSE(real.firstBytes.empty());
-    const auto u = pc::AuthServerFirst::decode(unknown.firstBytes.data(), unknown.firstBytes.size());
     const auto r = pc::AuthServerFirst::decode(real.firstBytes.data(), real.firstBytes.size());
-    EXPECT_EQ(u->salts[0].iterations, 8192u);
-    EXPECT_EQ(u->salts[1].iterations, 8192u);
-    EXPECT_EQ(r->salts[0].iterations, 8192u);
-    EXPECT_EQ(r->salts[1].iterations, 8192u) << "the one-password user's pad uses it too";
-    EXPECT_EQ(Rig().view.fakeIterations(), 4096u) << "the default when the accounts use it";
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->salts[0].iterations, 4096u) << "a real account keeps its own count";
+    EXPECT_EQ(r->salts[1].iterations, 8192u) << "the one-password user's pad uses the pinned count";
+    EXPECT_EQ(Rig().view.fakeIterations(), 4096u) << "the bootstrap of the default accounts advertises the default";
 }
 
 // Issue #130: the throttle was checked only at the first leg, so N sessions that all sent AuthClientFirst before any

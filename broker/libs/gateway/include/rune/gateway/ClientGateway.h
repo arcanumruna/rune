@@ -162,6 +162,10 @@ struct TxnVoteResult {
     uint16_t code          = 0;    ///< 0 = yes
     uint32_t constraintId  = 0;
     int64_t  failingOffset = -1;
+    /// #995: an interim, not an answer: the partition's judge waits on the transaction (waitPid, waitEpoch); the vote stays out.
+    bool     waiting       = false;
+    int64_t  waitPid       = -1;
+    int16_t  waitEpoch     = 0;
 };
 using TxnVoteSink = void (*)(void* ctx, int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch,
                              int32_t coordinatorEpoch, const TxnVoteResult&) noexcept;
@@ -435,6 +439,8 @@ public:
     /// proof (D4) is verified with it.  Unset (InProcessUnauthenticated / dev): every bootstrap is refused.
     void setClusterKeys(rune::peerlink::ClusterKeys keys) { clusterKeys_ = std::move(keys); }
     [[nodiscard]] uint64_t bootstrapsRefused() const noexcept { return bootstrapsRefused_; }
+    /// #234: bootstrap challenges issued (answers to SecurityBootstrapChallengeRequest).
+    [[nodiscard]] uint64_t bootstrapChallengesIssued() const noexcept { return bootstrapChallengesIssued_; }
     /// X103: log lines the 1/1024 limiter swallowed (require-TLS refusals, bad bootstrap proofs, login failures).
     [[nodiscard]] uint64_t unauthLogSuppressed() const noexcept { return unauthLog_.suppressed(); }
     /// #145: unauthenticated-sender log lines suppressed node-wide: this gateway's own plus the cumulative counts the
@@ -470,6 +476,8 @@ public:
     [[nodiscard]] uint64_t loginsAbandoned() const noexcept { return loginsAbandoned_; }
     [[nodiscard]] uint64_t bindTokenDeriveFailures() const noexcept { return bindTokenDeriveFailures_; }
     [[nodiscard]] uint64_t cryptoKeyAnnounces() const noexcept { return cryptoKeyAnnounces_; }
+    /// #592 test seam (control thread): cap a group answer below the scratch size (0 = the scratch size).
+    void groupAnswerCapForTest(std::size_t bytes) noexcept { groupAnswerCapForTest_ = bytes; }
     void forceZeroDerivedBindTokenForTest(bool on) noexcept { forceZeroDerivedBindTokenForTest_ = on; }   ///< #132: first legs never finished
     /// The SecurityView applied the event at `offset` (BrokerNode calls this right after the view did) - authentication
     /// Task 14, D25: Refresh -> every affected user's authenticated session recompiles its permission table, ends what
@@ -535,6 +543,13 @@ public:
         return (ring == 0 ? opFenceAcked_ : lifeFenceAcked_)[static_cast<std::size_t>(worker)];
     }
     [[nodiscard]] std::size_t permissionPendingUpdatesForTest() const noexcept { return permissionShipper_.pendingUpdates(); }
+    /// #442 seams: the shipper's queue cap, lost / resynced workers, the pool-starved sessions re-acquired.
+    void setPermissionQueueCapForTest(std::size_t n) noexcept { permissionShipper_.setMaxQueuedForTest(n); }
+    [[nodiscard]] std::size_t permissionLostNowForTest() const noexcept { return permissionShipper_.lostNow(); }
+    [[nodiscard]] uint64_t permissionWorkersLostForTest() const noexcept { return permissionShipper_.workersLost(); }
+    [[nodiscard]] uint64_t permissionResyncsForTest() const noexcept { return permissionShipper_.resyncs(); }
+    [[nodiscard]] uint64_t poolStarvedReacquiredForTest() const noexcept { return poolStarvedReacquired_; }
+    [[nodiscard]] std::size_t poolStarvedForTest() const noexcept { return poolStarved_.size(); }
     /// PR #528 review (issue #197): how many objects still owe a permission ship before their DDL OK (bounded).
     [[nodiscard]] std::size_t objectShipSeqsForTest() const noexcept { return objectShipSeqs_.size(); }
     /// Issue #197 test seam: hold the permission shipper (queue, send nothing); releasing ships the backlog at once.
@@ -573,6 +588,7 @@ public:
         if (s == nullptr) return;
         s->auth = rune::gateway::AuthAuthenticated{userId, "u" + std::to_string(userId),
                                                     permPool_.acquire(std::move(grants), nsId, objectIndex_), {}, nsId};
+        noteStarved_(sid, permPool_.lastAcquireWasFull());
         (void)shipPermissions_(*s);
     }
     int servicePermissionShippingForTest() { return servicePermissionShipping_(); }
@@ -627,6 +643,14 @@ public:
     [[nodiscard]] uint64_t damagedReadsTotal() const noexcept {
         uint64_t n = inlineDamagedReads_;
         for (const uint64_t w : workerDamagedReads_) n += w;
+        return n;
+    }
+    /// #880: segment repairs, summed over every worker's cumulative count (SessionSignal SegmentRepair): counter 0 =
+    /// repairs completed, 1 = attempts failed, 2 = damaged segments no peer could serve.
+    [[nodiscard]] uint64_t segmentRepairsTotal(std::size_t counter) const noexcept {
+        uint64_t n = 0;
+        if (counter < 3)
+            for (const uint64_t w : workerSegmentRepairs_[counter]) n += w;
         return n;
     }
     /// Namespaces Phase 2 Task 14 (D28): the node's limit aggregator (control thread, the gateway's own thread).  Worker usage
@@ -1546,6 +1570,19 @@ public:
     /// plan reached every worker's install ring (or the view was dropped).
     void noteViewSinkAwaitingPlan(int32_t viewTopicId);
     void noteViewPlanDelivered(int32_t viewTopicId);
+    /// #988 - control thread: the catalog's nextTopicId on this broker (topics and view sinks share one dense id
+    /// counter), fed after every applied event once that event's own effects are processed.  An id at or above it is
+    /// "not applied here yet" (retriable for every session); an id below it is decided here.  Monotonic: a lower value
+    /// is ignored and counted.  The default (INT32_MAX) means "nothing is above": a rig without a feed keeps the
+    /// terminal answers.
+    void setAppliedTopicFrontier(int32_t nextTopicId);
+    [[nodiscard]] int32_t appliedTopicFrontierForTest() const noexcept { return appliedTopicFrontier_; }
+    [[nodiscard]] uint64_t topicFrontierRegressionsIgnored() const noexcept { return topicFrontierRegressionsIgnored_; }
+    /// #500 test seam: the frontiers still queued in the permission shipper (held), each with the number of other
+    /// permission items queued before it.
+    [[nodiscard]] std::vector<std::pair<int32_t, std::size_t>> queuedTopicFrontiersForTest() const {
+        return permissionShipper_.queuedFrontiersForTest();
+    }
     /// Task 22 fix round 1 (C1) — control thread (cold): a view's sink topic id →
     /// its source topic (plan.sourceTopicId[0]).  GetViewRow is answered only on
     /// the broker that leads (source, partition); the view partition IS the source
@@ -1735,6 +1772,9 @@ public:
         case pc::TemplateId::AlterView:        handleAlterView(buf, len); break;
         case pc::TemplateId::SecurityDdl:      handleSecurityDdl(buf, len); break;
         case pc::TemplateId::SecurityBootstrap: handleSecurityBootstrap(buf, len); break;
+        case pc::TemplateId::SecurityBootstrapChallengeRequest:
+            handleSecurityBootstrapChallengeRequest(buf, len);
+            break;
         case pc::TemplateId::NamespaceDdl:     handleNamespaceDdl(buf, len); break;
         case pc::TemplateId::ListNamespaces:   handleListNamespaces(buf, len); break;
         case pc::TemplateId::NamespaceUsage:   handleNamespaceUsage(buf, len); break;
@@ -2103,6 +2143,7 @@ private:
     /// F1: the held SubscribeResponse{OK} of `subId` (its egress resolved) - and the lineage note it owes.
     void sendOwedSubscribeOk_(int64_t subId);
     uint64_t subscribesWithoutRecordEgress_ = 0;   ///< issue #118: subscriptions retired for want of their own egress
+    uint64_t recordEgressNeverConnected_ = 0;      ///< #745: record-egress pubs that resolved but never connected
 
     // Hybrid egress: a Subscribe deferred until its session's per-consumer UNICAST
     // Records publication resolves (NON-BLOCKING — never sleeps on the control
@@ -2123,6 +2164,10 @@ private:
     struct PendingRecordEgress {
         int64_t regId         = -1;  // addExclusivePublication registration (in flight)
         int64_t requestedAtNs = 0;   // for the resolve timeout
+        /// #745: the publication once the registration resolved, held here (never on the Session, never handed to a
+        /// worker) until the client's subscription answers it (isConnected); a declared channel nothing answers (a
+        /// client behind NAT) takes the failed-resolve path at the resolve timeout.
+        std::shared_ptr<aeron::ExclusivePublication> resolved;
         std::vector<BufferedSubscribe> waiters;
     };
     // (sessionId, ownerWorkerId) → in-flight record-egress pub resolve + its
@@ -2229,6 +2274,11 @@ private:
     // Authentication Task 10: SecurityDdl (79) and SecurityBootstrap (80).
     void handleSecurityDdl      (const uint8_t* buf, std::size_t len);
     void handleSecurityBootstrap(const uint8_t* buf, std::size_t len);
+    /// #234: SecurityBootstrapChallengeRequest (102) -> SecurityBootstrapChallenge (103).
+    void handleSecurityBootstrapChallengeRequest(const uint8_t* buf, std::size_t len);
+    /// #234: the challenge for `id`: the first 32 bytes of HMAC-SHA-512(per-process secret, id as 8 LE bytes).  The
+    /// secret is drawn on first use; false (and not ready) when no randomness is available.
+    [[nodiscard]] bool bootstrapChallengeOf_(uint64_t id, std::array<uint8_t, 32>& out);
     // Namespaces Task 7: NamespaceDdl (81) and ListNamespaces (82).
     void handleNamespaceDdl     (const uint8_t* buf, std::size_t len);
     void handleListNamespaces   (const uint8_t* buf, std::size_t len);
@@ -2828,6 +2878,7 @@ private:
     std::vector<uint64_t>   workerNsSlotMismatches_;   ///< cumulative, per worker (SessionSignal NsSlotMismatch)
     uint64_t                inlineDamagedReads_ = 0;   ///< #882: inline-path subscriptions failed at damaged data
     std::vector<uint64_t>   workerDamagedReads_;       ///< #882: cumulative, per worker (SessionSignal DamagedRead)
+    std::vector<uint64_t>   workerSegmentRepairs_[3];   ///< #880: cumulative, per counter, per worker
     std::vector<uint64_t>   workerUnauthSuppressed_;   ///< #145: cumulative, per worker (UnauthLogSuppressed)
     /// One array index and a compare; counts a mismatch.
     [[nodiscard]] bool nsTagMatches_(const Session& s) noexcept {
@@ -2879,6 +2930,13 @@ private:
     uint8_t  workersLag_     = 0;               ///< #603 / #506: the lag level last shipped to the workers
     uint64_t securityBehindRefusals_ = 0;       ///< #603: requests answered 48 for it
     uint64_t deniesDeferredViewBehind_ = 0;     ///< #506: denials answered 48 while the view held unapplied events
+    int32_t  appliedTopicFrontier_ = std::numeric_limits<int32_t>::max();   ///< #988: see setAppliedTopicFrontier
+    uint64_t topicFrontierRegressionsIgnored_ = 0;
+    /// #988: the id is at or above the catalog frontier this broker has applied - created on a broker that is ahead, or
+    /// never created.  The one test for "not applied here yet"; placement no longer decides it.
+    [[nodiscard]] bool aboveAppliedFrontier_(int32_t topicId) const noexcept {
+        return topicId >= appliedTopicFrontier_;
+    }
     /// #603 / #506: ship the lag level to the workers when it changed (1 = behind and refusing everything, 2 = the view
     /// holds unapplied events: denials deferred, 0 = current) - leaving level 1 once every event pending at the clear
     /// is enforced (#608).  Every other transition ships at once, FIFO behind every queued permission item.
@@ -2887,6 +2945,10 @@ private:
     /// correlation id).  Cold.
     void answerSecurityBehind_(Session& session, const rune::protocol::client::MessageHeader& hdr, const uint8_t* buf,
                                std::size_t len);
+    /// #506: a denial is not a verdict yet: Required mode and the view is behind events this broker already holds.
+    [[nodiscard]] bool denialsDeferred_() const noexcept {
+        return authMode_ == rune::gateway::GatewayAuthMode::Required && securityViewBehind_();
+    }
     /// #205: the view has not applied every event this broker knows exists.
     [[nodiscard]] bool securityViewBehind_() const noexcept {
         return securityView_ != nullptr && securityKnownEnd_ > securityView_->appliedOffset() + 1;
@@ -3008,6 +3070,7 @@ private:
     uint64_t bindTokenDeriveFailures_ = 0;
     uint64_t cryptoKeyAnnounces_      = 0;   ///< keyReady (second-wave) announces that landed on every worker
     bool     forceZeroDerivedBindTokenForTest_ = false;
+    std::size_t groupAnswerCapForTest_ = 0;   ///< #592 test seam
     // ── authentication Task 14: live security changes ──
     uint64_t sessionsRevoked_ = 0;
     int64_t  securityEnforcedOffset_ = -1;       ///< every event <= this is enforced here (see securityEnforcedOffset())
@@ -3053,6 +3116,12 @@ private:
     uint64_t sessionScansForTest_ = 0;     ///< #266: whole-table walks made by reapExpired
     uint64_t authGateRefusals_ = 0;
     uint64_t bootstrapsRefused_ = 0;
+    // #234: the bootstrap challenges (control thread only).  A challenge never repeats within a process (the counter)
+    // and cannot be predicted (the secret); a restarted broker has a new secret.
+    std::array<uint8_t, 32> bootstrapChallengeSecret_{};
+    bool bootstrapChallengeSecretReady_ = false;
+    uint64_t bootstrapChallengeCounter_ = 0;
+    uint64_t bootstrapChallengesIssued_ = 0;
     std::optional<rune::peerlink::ClusterKeys> clusterKeys_;
     std::vector<uint8_t> bootstrapMacScratch_;   // reused MAC input (capacity persists)
 
@@ -3101,6 +3170,18 @@ private:
     // Authentication Task 13 (D30): WRITE bitmaps to every worker; a login's AuthServerFinal{OK} waits for its epoch.
     rune::node::PermissionShipper permissionShipper_;
     uint64_t permEpoch_ = 0;
+    /// #442 part 2: the sessions whose last permission acquire hit the full pool (they hold the deny-all ref), deduped,
+    /// removed at session close.  Bounded by the session table.  The service step re-acquires up to kStarvedPerCycle of
+    /// them per duty cycle while the pool has room.
+    static constexpr std::size_t kStarvedPerCycle = 16;
+    std::vector<int64_t> poolStarved_;
+    uint64_t poolStarvedReacquired_ = 0;
+    bool     compileStarved_ = false;   ///< the last compilePerms_ got the full-pool deny-all ref
+    void noteStarved_(int64_t sid, bool starved);
+    void reacquireStarved_();
+    /// #442 part 1: a worker was lost and reset: re-ship everything it needs (tables, binds, lag, frontier, fence).
+    void shipPermissionSnapshot_();
+    uint64_t lostWorkersLogged_ = 0;
     /// Issue #197: (object id, the shipper seq that must be shipped before that object's DDL OK may leave).  Cold, DDL rate.
     std::vector<std::pair<int32_t, uint64_t>> objectShipSeqs_;
     /// Issue #202: the sessions whose login OK is held (`Session::heldLoginOk`), oldest first; epochs only grow, so they are
@@ -3374,9 +3455,9 @@ private:
     [[nodiscard]] bool placementCommitted_(int32_t topicId, int32_t partition,
                                            const RoutedEntry* routed = nullptr) const noexcept;
     /// C1 generalized: the code for a topic id this broker has not applied —
-    /// NotLeader (retriable) when its placement is already committed (a producer
-    /// learned it from another broker, this one applies it next), UnknownTopic
-    /// otherwise and always for a Dropped id.
+    /// NotLeader (retriable) for an id at or above the applied catalog frontier
+    /// (#988: created on a broker that is ahead, or never created - the two answer
+    /// alike), UnknownTopic below it and always for a Dropped id.
     /// Fix round 1 (I5): the C1 gate on a view read — a ViewRowResponse status
     /// to answer, or kViewRowNoGate (forward to the worker).
     static constexpr uint16_t kViewRowNoGate = 0xFFFF;
@@ -3853,6 +3934,28 @@ public:
     }
     /// Issue #118: subscriptions retired because they had no record egress of their own under authentication.
     [[nodiscard]] uint64_t subscribesWithoutRecordEgressForTest() const noexcept { return subscribesWithoutRecordEgress_; }
+    [[nodiscard]] uint64_t recordEgressNeverConnected() const noexcept { return recordEgressNeverConnected_; }
+    /// Test-only (#745): the pending record-egress entry of (sid, worker) holds a resolved publication.
+    [[nodiscard]] bool pendingRecordEgressResolvedForTest(int64_t sid, int32_t worker) const {
+        const auto it = pendingRecordEgress_.find({sid, worker});
+        return it != pendingRecordEgress_.end() && it->second.resolved != nullptr;
+    }
+    /// Test-only (#745): the session caches a record-egress publication for `worker`.
+    [[nodiscard]] bool recordEgressCachedForTest(int64_t sid, int32_t worker) {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr) return false;
+        const auto it = s->recordEgressByWorker.find(worker);
+        return it != s->recordEgressByWorker.end() && it->second != nullptr;
+    }
+    /// Test-only (#745): the record of a plain subscription whose Subscribe the test then forwards (the Subscribe
+    /// handler creates it in production); `okOwed` as under authentication.
+    void addSubscriptionRecordForTest(int64_t subId, int64_t sessionId, int32_t topicId, int32_t partition,
+                                      int64_t subscribeCorrId, bool okOwed) {
+        Subscription sub;
+        sub.subscriptionId = subId; sub.sessionId = sessionId; sub.topicId = topicId; sub.partition = partition;
+        sub.subscribeCorrId = subscribeCorrId; sub.okOwed = okOwed;
+        subscriptions_.emplace(subId, std::move(sub));
+    }
 private:
     int64_t                                 lastFlushNs_ = 0;
 

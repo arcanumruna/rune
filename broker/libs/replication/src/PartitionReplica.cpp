@@ -565,7 +565,7 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     followerHw_ = 0;
     hwLearnedEpoch_ = -1;     // catalog Task 12 re-review F2: a new leader (even same epoch) must answer first
     followerSync_.reset();    // new leadership epoch → bootstrap fetch state afresh
-    wedgedAtOffset_ = -1;     // F18: a new leadership may serve it (re-evaluated)
+    clearWedge_();            // F18: a new leadership may serve it (re-evaluated)
     stampEpochOnLog_(-1);
     // Drop a phantom epoch entry (assigned at becomeLeader at our LEO, never
     // appended in): our lastFetchedEpoch must name the epoch of our last record.
@@ -881,7 +881,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         followerHw_ = committedHw;
         hwLearnedEpoch_ = epoch_;   // our own committed HW as the demoted leader
         followerSync_.reset();    // self-demotion → bootstrap fetch state afresh
-        wedgedAtOffset_ = -1;     // F18
+        clearWedge_();            // F18
         followerSlots_.resetLeadership();
         clearPublishedFollowerPositions_();
         if (fsLogEnabled()) {
@@ -1375,6 +1375,8 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // Review C1: no apply between a divergence truncation and its durable history.
     if (awaitEsFetch_) [[unlikely]] { ++appliesDroppedAwaitEs_; return; }
     ++rtApplies_;
+    const bool probeAnswer = wedgeProbeSent_;   // #880: any answer consumes the outstanding probe
+    wedgeProbeSent_ = false;
     rtApplyBytes_ += static_cast<int64_t>(resp.records.size());
     FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplFetchRespApply,
                              static_cast<uint32_t>(cfg_.partitionId));
@@ -1392,14 +1394,16 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         if (resp.errorCode == kErrRecordTooLarge) {
             followerSync_.forceBehind();
             if (role_ == Role::Follower && resp.leaderEpoch >= epoch_)
-                wedgeAt_(logEndOffset_(), "the leader cannot fit it in one replication frame");
+                wedgeAt_(logEndOffset_(), WedgeReason::TooLarge,
+                         "the leader cannot fit it in one replication frame");
         }
         // #839: the leader's stored copy of the batch at our LEO is damaged — never retriable here: Behind, then wedge
         // (same rules as above: a stale-epoch answer never wedges).
         if (resp.errorCode == kErrCorruptRecord) {
             followerSync_.forceBehind();
             if (role_ == Role::Follower && resp.leaderEpoch >= epoch_)
-                wedgeAt_(logEndOffset_(), "the leader's stored copy of this batch is corrupt");
+                wedgeAt_(logEndOffset_(), WedgeReason::CorruptAtLeader,
+                         "the leader's stored copy of this batch is corrupt");
         }
         // KIP-320/595: our (fetchOffset, lastFetchedEpoch) is off the leader's
         // lineage — KIP-279 truncation, then re-fetch.
@@ -1459,6 +1463,14 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // epoch adoption here — once we follow that epoch, our fetch (validated by
     // its leader) brings the data.
     if (resp.leaderEpoch > epoch_) return;
+    // #880: an OK answer without data to a follower wedged on the leader's damaged batch: the leader's log ends at our
+    // LEO now (it was truncated), so the offset is no longer unservable.  (A data answer moves our LEO: doWork clears.)
+    if (probeAnswer && wedgeReason_ == WedgeReason::CorruptAtLeader && role_ == Role::Follower &&
+        resp.records.empty()) {
+        spdlog::info("PartitionReplica[node={} topic={} part={}]: the leader answered offset {} without data (its log "
+                     "ends there): the wedge is cleared", cfg_.selfId, cfg_.topicId, cfg_.partitionId, wedgedAtOffset_);
+        clearWedge_();
+    }
     // E2 final fix wave (C1 multi-node): this ring now follows the current
     // leadership's data lineage (reported if it is ever promoted).
     if (memoryBacked_ && role_ == Role::Follower) lineageSrcEpoch_ = epoch_;
@@ -1720,10 +1732,13 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
 
 // F18: enter the wedged state at `at` (idempotent per offset): no further fetch
 // or epoch probe (doWork), so the leader's existing lag check evicts us.
-void PartitionReplica::wedgeAt_(Offset at, const char* why)
+void PartitionReplica::wedgeAt_(Offset at, WedgeReason reason, const char* why)
 {
     if (wedgedAtOffset_ == at) return;
     wedgedAtOffset_ = at;
+    wedgeReason_    = reason;
+    wedgeProbeAtNs_ = lastKnownNowNs_;
+    wedgeProbeSent_ = false;
     ++wedgedRefusals_;
     spdlog::error("PartitionReplica[node={} topic={} part={}]: follower WEDGED at offset {} — "
                   "the batch there is unreplicable ({}); stopped fetching it, leaving the ISR "
@@ -1735,7 +1750,7 @@ void PartitionReplica::onUnapplicableBatch(Offset batchBase, Epoch leaderEpoch)
 {
     if (role_ != Role::Follower || leaderEpoch < epoch_) return;   // stale / not a follower
     if (batchBase != logEndOffset_()) return;   // not the batch we need: never wedge (B-1)
-    wedgeAt_(batchBase, "it cannot fit one frame of this node's worker ingress ring");
+    wedgeAt_(batchBase, WedgeReason::Other, "it cannot fit one frame of this node's worker ingress ring");
 }
 
 // Spec §3.5.2: the follower knows its leader — unicast.  Before the leader is
@@ -1971,6 +1986,273 @@ void PartitionReplica::onReconcileRequest(const FetchRequestMsg&)
 void PartitionReplica::applyReconcileResponse(const FetchResponseMsg&)
 {
     // Retired DR-BUG-6 reverse reconcile (see onReconcileRequest).
+}
+
+// ---------------------------------------------------------------------------
+// #880: segment repair.  Responder (onRepairRequest) + requester (serviceRepair_ / applyRepairResponse).
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int64_t kRepairCheckEveryNs = 1'000'000'000LL;   // idle: look for a damaged segment this often (cold)
+constexpr int64_t kRepairTimeoutNs    = 2'000'000'000LL;   // an unanswered request: next peer
+constexpr int64_t kRepairBackoffNs    = 1'000'000'000LL;   // every peer failed: wait before another round
+}  // namespace
+
+void PartitionReplica::onRepairRequest(const FetchRequestMsg& req)
+{
+    if (req.topicId != cfg_.topicId || req.partition != cfg_.partitionId) return;
+    if (req.followerId == cfg_.selfId) return;
+    // The asker must be a replica of this partition: a repair serves committed bytes to the replica set only.
+    const bool known = std::find(configuredReplicas_.begin(), configuredReplicas_.end(), req.followerId) !=
+                       configuredReplicas_.end();
+    const Offset hw = highWatermark();
+    auto answer = [&](int16_t status, std::span<const uint8_t> records) {
+        FetchResponseMsg r{};
+        r.leaderEpoch    = epoch_;
+        r.partition      = cfg_.partitionId;
+        r.highWatermark  = hw;
+        r.logStartOffset = req.incarnation;     // the asker's attempt id, echoed
+        r.errorCode      = status;
+        r.topicId        = cfg_.topicId;
+        r.records        = records;
+        r.fromOffset     = req.fetchOffset;     // the cursor, echoed
+        if (status == kRepairRefused) ++repairRefused_; else ++repairServed_;
+        // Not owed: the asker's timeout moves it on to the next peer.
+        (void)onTransport([&](auto& t) { return t.sendRepairResponse(req.followerId, r); });
+    };
+    if (!known || memoryBacked_ || diskLog_ == nullptr) return answer(kRepairRefused, {});
+    const Offset from = req.fetchOffset;
+    const Offset end  = req.lastEpochStartOffset;
+    if (from < 0 || end < 0) return answer(kRepairRefused, {});
+    if (from >= end) return answer(kRepairDone, {});
+    // Only committed bytes: never above THIS replica's high watermark.  hw < end means the range is not fully
+    // committed here: serve what is below it, then refuse (the asker tries another peer).
+    const Offset bound = std::min(end, hw);
+    if (from >= bound) return answer(kRepairRefused, {});
+    int64_t frame = std::numeric_limits<int64_t>::max();
+    onTransport([&](auto& t) { frame = t.maxFetchRecordsBytes(); });
+    const int64_t cap = std::min<int64_t>(req.maxBytes > 0 ? req.maxBytes : cfg_.maxFetchBytes, frame);
+    const std::size_t kOverhead = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+    Offset cur = from;
+    for (int hop = 0; hop < 64; ++hop) {   // one pass per segment the range crosses
+        if (diskLog_->damageAt(cur)) return answer(kRepairRefused, {});
+        rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
+        const rune::storage::LogReadView v =
+            readLog_(cur, static_cast<int32_t>(std::min<int64_t>(cap, INT32_MAX)), &st);
+        if (v.empty()) {
+            if (st != rune::storage::ReadIntoStatus::Absent) return answer(kRepairRefused, {});   // damaged / failed
+            // Nothing at or after `cur` in that segment: continue at the next segment's base.
+            Offset nextBase = -1;
+            for (int64_t b : diskLog_->segmentBaseOffsets()) if (b > cur) { nextBase = b; break; }
+            if (nextBase < 0 || nextBase >= bound) return answer(bound == end ? kRepairDone : kRepairRefused, {});
+            cur = nextBase;
+            continue;
+        }
+        std::size_t pos = 0, start = 0, served = 0;
+        bool stopped = false, crossesEnd = false;
+        Offset viewEnd = cur;
+        while (pos + kOverhead <= v.len) {
+            rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
+            const int32_t total = r.totalLength();
+            if (total <= 0 || pos + static_cast<std::size_t>(total) > v.len) break;
+            const Offset base = r.baseOffset();
+            const Offset last = base + r.lastOffsetDelta();
+            viewEnd = std::max(viewEnd, last + 1);
+            if (base < from) { pos += static_cast<std::size_t>(total); continue; }   // below the cursor: never served
+            if (base >= bound) { stopped = true; break; }
+            if (last >= end) { stopped = true; crossesEnd = true; break; }   // this copy's batching crosses the end
+            if (served > 0 && served + static_cast<std::size_t>(total) > static_cast<std::size_t>(cap)) break;
+            if (static_cast<int64_t>(total) > frame) return answer(kRepairRefused, {});   // cannot be framed
+            if (served == 0) start = pos;
+            pos += static_cast<std::size_t>(total);
+            served = pos - start;
+        }
+        if (served > 0) return answer(kErrNone, std::span<const uint8_t>(v.data + start, served));
+        if (crossesEnd) return answer(kRepairRefused, {});
+        // The next batch at or above the cursor is at or above the bound: nothing below the end remains here.
+        if (stopped) return answer(bound == end ? kRepairDone : kRepairRefused, {});
+        if (viewEnd <= cur) return answer(kRepairRefused, {});   // no progress: never loop
+        cur = viewEnd;   // every batch of this view lay below the cursor: read on
+    }
+    return answer(kRepairRefused, {});
+}
+
+std::vector<NodeId> PartitionReplica::repairPeers_() const
+{
+    std::vector<NodeId> out;
+    if (role_ == Role::Leader) {
+        if (isrManager_ != nullptr)
+            for (NodeId id : isrManager_->isr()) if (id != cfg_.selfId) out.push_back(id);
+        std::sort(out.begin(), out.end());
+    } else if (leaderId_ >= 0 && leaderId_ != cfg_.selfId) {
+        out.push_back(leaderId_);
+    }
+    return out;
+}
+
+void PartitionReplica::noteRepairNoPeer_(int64_t base, const char* why)
+{
+    if (repairNoPeerLoggedBase_ == base) return;
+    repairNoPeerLoggedBase_ = base;
+    ++repairNoPeer_;
+    spdlog::critical("PartitionReplica[node={} topic={} part={}]: damaged segment {} cannot be repaired from a peer "
+                     "({}); it stays damaged (reads at the damage fail) until an operator restores it",
+                     cfg_.selfId, cfg_.topicId, cfg_.partitionId, base, why);
+}
+
+bool PartitionReplica::sendRepairRequest_(RepairFetching& f)
+{
+    FetchRequestMsg req{};
+    req.leaderEpoch          = epoch_;
+    req.partition            = cfg_.partitionId;
+    req.followerId           = cfg_.selfId;
+    req.fetchOffset          = f.cursor;
+    req.maxBytes             = cfg_.maxFetchBytes;
+    req.topicId              = cfg_.topicId;
+    req.incarnation          = f.attempt;
+    req.lastEpochStartOffset = f.seg.endOffset;
+    const bool sent = onTransport([&](auto& t) { return t.sendRepairRequest(f.peer, req); });
+    f.sentAtNs = sent ? std::max<int64_t>(lastKnownNowNs_, 1) : 0;   // 0 = resend next pass
+    return sent;
+}
+
+void PartitionReplica::startRepairAttempt_(int64_t nowNs, const rune::storage::Log::DamagedSegmentInfo& d, NodeId peer,
+                                           std::vector<NodeId> tried)
+{
+    const auto rep = diskLog_->beginSegmentRepair(d.base);
+    if (!rep) {
+        ++repairAttemptsFailed_;
+        spdlog::warn("PartitionReplica[node={} topic={} part={}]: cannot begin the repair of segment {}",
+                     cfg_.selfId, cfg_.topicId, cfg_.partitionId, d.base);
+        repairState_ = RepairBackoff{nowNs + kRepairBackoffNs};
+        return;
+    }
+    RepairFetching f;
+    f.seg     = *rep;
+    f.cursor  = rep->damageOffset;
+    f.peer    = peer;
+    f.attempt = ++repairAttemptSeq_;
+    f.role    = role_;
+    f.epoch   = epoch_;
+    tried.push_back(peer);
+    f.tried   = std::move(tried);
+    repairState_ = std::move(f);
+    (void)sendRepairRequest_(std::get<RepairFetching>(repairState_));
+}
+
+void PartitionReplica::abortRepair_(const char* why)
+{
+    diskLog_->abortSegmentRepair();
+    ++repairsAborted_;
+    spdlog::info("PartitionReplica[node={} topic={} part={}]: segment repair dropped ({}); it starts over",
+                 cfg_.selfId, cfg_.topicId, cfg_.partitionId, why);
+    repairState_ = RepairIdle{};
+    repairNextCheckNs_ = 0;
+}
+
+void PartitionReplica::failRepairAttempt_(int64_t nowNs, const char* why, bool counted)
+{
+    RepairFetching f = std::move(std::get<RepairFetching>(repairState_));
+    diskLog_->abortSegmentRepair();
+    if (counted) ++repairAttemptsFailed_;
+    spdlog::warn("PartitionReplica[node={} topic={} part={}]: segment {} repair from peer {} failed: {}",
+                 cfg_.selfId, cfg_.topicId, cfg_.partitionId, f.seg.base, f.peer, why);
+    const auto d = diskLog_->firstDamagedSegment();
+    if (!d) { repairState_ = RepairIdle{}; repairNextCheckNs_ = 0; return; }
+    NodeId next = -1;
+    for (NodeId id : repairPeers_())
+        if (std::find(f.tried.begin(), f.tried.end(), id) == f.tried.end()) { next = id; break; }
+    if (next >= 0) { startRepairAttempt_(nowNs, *d, next, std::move(f.tried)); return; }
+    noteRepairNoPeer_(d->base, "every peer refused or failed");
+    repairState_ = RepairBackoff{nowNs + kRepairBackoffNs};
+}
+
+void PartitionReplica::commitRepair_(int64_t nowNs, RepairFetching& f)
+{
+    const int64_t base = f.seg.base;
+    switch (diskLog_->commitSegmentRepair()) {
+    case rune::storage::Log::RepairCommitStatus::Ok:
+        ++repairsCompleted_;
+        spdlog::warn("PartitionReplica[node={} topic={} part={}]: damaged segment {} repaired from peer {}",
+                     cfg_.selfId, cfg_.topicId, cfg_.partitionId, base, f.peer);
+        repairState_ = RepairIdle{};
+        repairNextCheckNs_ = 0;   // the next damaged segment, if any, now
+        break;
+    case rune::storage::Log::RepairCommitStatus::Busy:
+        f.commitPending = true;   // no room to post the file work: retried next pass
+        break;
+    case rune::storage::Log::RepairCommitStatus::IoError:
+        ++repairAttemptsFailed_;
+        repairState_ = RepairBackoff{nowNs + kRepairBackoffNs};
+        break;
+    case rune::storage::Log::RepairCommitStatus::Rejected:
+    case rune::storage::Log::RepairCommitStatus::NoRepair:
+    default:
+        ++repairsAborted_;   // the segment changed under the repair: the next pass starts over
+        repairState_ = RepairIdle{};
+        repairNextCheckNs_ = 0;
+        break;
+    }
+}
+
+int PartitionReplica::serviceRepair_(int64_t nowNs)
+{
+    if (memoryBacked_ || diskLog_ == nullptr) return 0;
+    if (std::holds_alternative<RepairIdle>(repairState_)) {
+        if (nowNs < repairNextCheckNs_) return 0;
+        repairNextCheckNs_ = nowNs + kRepairCheckEveryNs;
+        const auto d = diskLog_->firstDamagedSegment();
+        if (!d) return 0;
+        if (d->endOffset > highWatermark()) return 0;   // only committed bytes: waits until the HW passes the segment
+        const std::vector<NodeId> peers = repairPeers_();
+        if (peers.empty()) {
+            noteRepairNoPeer_(d->base, role_ == Role::Leader ? "no in-sync follower" : "no known leader");
+            return 0;
+        }
+        startRepairAttempt_(nowNs, *d, peers.front(), {});
+        return 1;
+    }
+    if (const auto* b = std::get_if<RepairBackoff>(&repairState_)) {
+        if (nowNs >= b->untilNs) { repairState_ = RepairIdle{}; repairNextCheckNs_ = 0; }
+        return 0;
+    }
+    RepairFetching& f = std::get<RepairFetching>(repairState_);
+    // Abort conditions: the segment's lineage changed (cleaner swap, truncation), it was deleted (retention) or is no
+    // longer sealed, the role or epoch changed, or the peer is no longer a source (a leader's follower left the ISR).
+    if (!diskLog_->segmentRepairValid()) { abortRepair_("the segment changed or is gone"); return 1; }
+    if (role_ != f.role || epoch_ != f.epoch) { abortRepair_("the role or the leader epoch changed"); return 1; }
+    const std::vector<NodeId> peers = repairPeers_();
+    if (std::find(peers.begin(), peers.end(), f.peer) == peers.end()) {
+        abortRepair_("the peer is no longer a source");
+        return 1;
+    }
+    if (f.commitPending) { commitRepair_(nowNs, f); return 1; }
+    if (f.sentAtNs == 0) { (void)sendRepairRequest_(f); return 1; }
+    if (nowNs - f.sentAtNs >= kRepairTimeoutNs) { failRepairAttempt_(nowNs, "timed out"); return 1; }
+    return 0;
+}
+
+void PartitionReplica::applyRepairResponse(const FetchResponseMsg& resp)
+{
+    auto* fp = std::get_if<RepairFetching>(&repairState_);
+    if (fp == nullptr || fp->commitPending) return;   // none outstanding: a late or duplicate answer
+    RepairFetching& f = *fp;
+    if (resp.topicId != cfg_.topicId || resp.partition != cfg_.partitionId) return;
+    if (resp.logStartOffset != f.attempt) return;   // an answer to an earlier attempt or request: stale
+    if (resp.fromOffset != f.cursor) return;        // not the request in flight (a duplicate, reordered)
+    const int64_t now = std::max<int64_t>(lastKnownNowNs_, 1);
+    if (resp.errorCode == kRepairRefused) { failRepairAttempt_(now, "the peer refused", /*counted=*/false); return; }
+    if (resp.errorCode == kRepairDone) { commitRepair_(now, f); return; }
+    if (resp.errorCode != kErrNone) { failRepairAttempt_(now, "an unexpected status"); return; }
+    if (resp.records.empty()) { failRepairAttempt_(now, "an empty answer"); return; }
+    const auto got = diskLog_->appendRepairBatches(
+        resp.records, [this](int64_t off) { return epochCache_.epochForOffset(off); });
+    if (got.status != rune::storage::Log::RepairAppendStatus::Ok) {
+        failRepairAttempt_(now, "the peer's batches failed validation");
+        return;
+    }
+    f.cursor  = got.cursor;
+    f.attempt = ++repairAttemptSeq_;
+    (void)sendRepairRequest_(f);
 }
 
 // ---------------------------------------------------------------------------
@@ -2659,6 +2941,9 @@ int PartitionReplica::doWork(int64_t nowNs)
     // F27 F3: owed DR frames (epoch answers, reconcile pull / answer) — any role.
     work += retryOwedDrSends_();
 
+    // #880: rebuild a damaged sealed segment from an in-sync peer (cold; idle when nothing is damaged).
+    work += serviceRepair_(nowNs);
+
     // Leader-epoch restart fence: a refused leadership asks for a new epoch.
     if (staleLead_.pending) [[unlikely]] work += requestLeaderEpochBump_(nowNs);
     if (report_.pending) [[unlikely]] work += sendLeaderlessReport_(nowNs);
@@ -2761,7 +3046,7 @@ int PartitionReplica::doWork(int64_t nowNs)
         // F18 (I-1): a wedge is bound to the offset — a truncation that moved our
         // LEO clears it (time-independent: no timer).  While wedged the follower
         // sends NOTHING (no fetch, no keepalive), so the leader's lag check evicts it.
-        if (wedgedAtOffset_ >= 0 && wedgedAtOffset_ != logEndOffset_()) wedgedAtOffset_ = -1;
+        if (wedgedAtOffset_ >= 0 && wedgedAtOffset_ != logEndOffset_()) clearWedge_();
         // Fix round 5: a deferred divergence truncation completes as soon as the
         // log cleaner has performed its posted renames (event-driven, no wait).
         if (followerSync_.truncatePending() && !memoryBacked_ && diskLog_ != nullptr &&
@@ -2785,7 +3070,16 @@ int PartitionReplica::doWork(int64_t nowNs)
                                 std::holds_alternative<Refused>(divergenceGuard_);   // (wedge cleared above if LEO moved)
             const FollowerSync::State fsPrev = followerSync_.state();
             const bool fsWasArmed = followerSync_.fetchArmed();
-            const FollowerSync::Action act = wedged
+            // #880: a follower wedged on the LEADER's damaged copy asks again once a period: the leader may have
+            // repaired the segment since.  One ordinary data fetch at the LEO (the answer is not liveness while the
+            // copy is damaged, so this never keeps the follower in the ISR); every other pass stays silent.
+            const bool probe = wedgeReason_ == WedgeReason::CorruptAtLeader && wedgedAtOffset_ >= 0 &&
+                               !std::holds_alternative<Refused>(divergenceGuard_) &&
+                               nowNs - wedgeProbeAtNs_ >= kCorruptWedgeProbeNs;
+            if (probe) { wedgeProbeAtNs_ = nowNs; wedgeProbeSent_ = true; ++corruptWedgeProbes_; }
+            const FollowerSync::Action act = probe
+                ? FollowerSync::Action{true, true}
+                : wedged
                 ? FollowerSync::Action{false, false}       // wedged: no fetch, no liveness
                 : followerSync_.decide(nowNs, cfg_.fetchIntervalNs, keepaliveNs, kFetchResendNs);
             if (act.emit) {
@@ -3930,7 +4224,7 @@ void PartitionReplica::onTransientApplyRefused_(int64_t rc, std::size_t frameByt
                           "RUNE_TRANSIENT_LOG_RING_BYTES) — it cannot be replicated here (refusals={})",
                           cfg_.selfId, cfg_.topicId, cfg_.partitionId, at, frameBytes,
                           memLog_->capacityBytes(), transientApplyTooLargeRefusals_);
-        wedgeAt_(at, "larger than this node's transient ring");
+        wedgeAt_(at, WedgeReason::Other, "larger than this node's transient ring");
         return;
     }
     ++transientApplyFullRefusals_;

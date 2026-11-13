@@ -16,6 +16,9 @@
 // after the schema in every CreateTopic body (the byte is always written), and the lease.* AlterTopicConfig keys (7..12).
 // The broker picks the version by feature level; kCurrentFormatVer stays formatVer 2.
 //
+// formatVer 5 (schema retire, #419) is formatVer 4 plus ONE new kind, RetireSchemaVersions (10): body `u16 below`.  The kind
+// is valid only in formatVer 5 (a v1..v4 event of kind 10 is an unknown kind); every other body is byte-identical to v4.
+//
 // formatVer-1 layout (all little-endian, written and read byte-wise — host-endian independent):
 //   u16 formatVer | u16 kind | u64 objectId | u32 prevVersion | u32 newVersion |
 //   i64 timestampMs | u64 fingerprint |
@@ -52,6 +55,8 @@ enum class EventKind : uint16_t {
     CreateTopic = 1, DropTopic = 2, AlterTopicConfig = 3,
     CreateSchema = 4, AlterSchema = 5, SetCompatibility = 6,
     CreateView = 7, AlterView = 8, DropView = 9,
+    // formatVer 5 only: raises a typed topic's retire floor (versions below `below` are refused at produce and open).
+    RetireSchemaVersions = 10,
     // formatVer 2 (namespaces): the subject namespace is the event's nsId.
     NamespaceCreated = 32, NamespaceLimitsSet = 33, NamespaceStateChanged = 34, NamespaceDeleted = 35,
     NamespaceDeleteStep = 36,
@@ -60,8 +65,10 @@ inline constexpr uint16_t kFormatV1          = 1;
 inline constexpr uint16_t kFormatV2          = 2;
 inline constexpr uint16_t kFormatV3          = 3;
 inline constexpr uint16_t kFormatV4          = 4;
+inline constexpr uint16_t kFormatV5          = 5;
 inline constexpr uint16_t kCurrentFormatVer  = kFormatV2;
-/// Kinds 32..63 are reserved: formatVer 1 refuses all of them, formatVer 2..4 accept 32..36 and refuse 37..63.
+/// Kinds 32..63 are reserved: formatVer 1 refuses all of them, formatVer 2..5 accept 32..36 and refuse 37..63.
+/// Kind 10 (RetireSchemaVersions) is valid only in formatVer 5.
 inline constexpr uint16_t kReservedKindFirst = 32;
 inline constexpr uint16_t kReservedKindLast  = 63;
 inline constexpr uint16_t kLastNamespaceKind = 36;
@@ -133,6 +140,12 @@ struct SetCompatibilityOps {
     rune::codec::CompatMode mode = rune::codec::CompatMode::Backward;
     bool operator==(const SetCompatibilityOps&) const = default;
 };
+/// formatVer 5: versions below `below` of the typed topic are retired.  The apply rule (ApplyV5) bounds it:
+/// floor < below <= the topic's current schema version.
+struct RetireSchemaVersionsOps {
+    uint16_t below = 0;
+    bool operator==(const RetireSchemaVersionsOps&) const = default;
+};
 struct CreateViewOps { ViewDef view;            bool operator==(const CreateViewOps&) const = default; };
 struct AlterViewOps  { ViewDef view;            bool operator==(const AlterViewOps&) const = default; };   // a FRESH sink (ruling 4)
 struct DropViewOps   { int32_t viewTopicId = -1; bool operator==(const DropViewOps&) const = default; };
@@ -154,20 +167,21 @@ struct NamespaceDeletedOps      { bool operator==(const NamespaceDeletedOps&) co
 struct NamespaceDeleteStepOps   { uint8_t step = 0;
                                   bool operator==(const NamespaceDeleteStepOps&) const = default; };
 
-/// The body of each event kind.  Alternative order is NOT the kind number any more (kinds 10..31 are unused):
+/// The body of each event kind.  Alternative order is NOT the kind number any more (kinds 11..31 are unused):
 /// kKindOfAlt / altOf below are the one mapping, and the ops tag byte on the wire is the KIND.
 using Ops = std::variant<CreateTopicOps, DropTopicOps, AlterTopicConfigOps, CreateSchemaOps,
                          AlterSchemaOps, SetCompatibilityOps, CreateViewOps, AlterViewOps, DropViewOps,
                          NamespaceCreatedOps, NamespaceLimitsSetOps, NamespaceStateChangedOps, NamespaceDeletedOps,
-                         NamespaceDeleteStepOps>;
+                         NamespaceDeleteStepOps, RetireSchemaVersionsOps>;
 
-inline constexpr std::array<EventKind, 14> kKindOfAlt = {
+inline constexpr std::array<EventKind, 15> kKindOfAlt = {
     EventKind::CreateTopic, EventKind::DropTopic, EventKind::AlterTopicConfig, EventKind::CreateSchema,
     EventKind::AlterSchema, EventKind::SetCompatibility, EventKind::CreateView, EventKind::AlterView,
     EventKind::DropView, EventKind::NamespaceCreated, EventKind::NamespaceLimitsSet,
-    EventKind::NamespaceStateChanged, EventKind::NamespaceDeleted, EventKind::NamespaceDeleteStep};
+    EventKind::NamespaceStateChanged, EventKind::NamespaceDeleted, EventKind::NamespaceDeleteStep,
+    EventKind::RetireSchemaVersions};
 
-/// The Ops alternative index of `k`; -1 for a kind that has none (10..31, 37 and up).
+/// The Ops alternative index of `k`; -1 for a kind that has none (11..31, 37 and up).
 [[nodiscard]] constexpr int altOf(EventKind k) noexcept {
     for (std::size_t i = 0; i < kKindOfAlt.size(); ++i)
         if (kKindOfAlt[i] == k) return static_cast<int>(i);
@@ -185,7 +199,7 @@ constexpr bool kindTableBijective() noexcept {
     return true;
 }
 }
-static_assert(std::variant_size_v<Ops> == 14 && kKindOfAlt.size() == 14, "one Ops alternative per EventKind 1..9, 32..36");
+static_assert(std::variant_size_v<Ops> == 15 && kKindOfAlt.size() == 15, "one Ops alternative per EventKind 1..10, 32..36");
 static_assert(detail::kindTableBijective(), "kKindOfAlt must be a bijection onto the Ops alternatives");
 static_assert(detail::kOpsAt<EventKind::CreateTopic, CreateTopicOps> &&
               detail::kOpsAt<EventKind::DropTopic, DropTopicOps> &&
@@ -200,7 +214,8 @@ static_assert(detail::kOpsAt<EventKind::CreateTopic, CreateTopicOps> &&
               detail::kOpsAt<EventKind::NamespaceLimitsSet, NamespaceLimitsSetOps> &&
               detail::kOpsAt<EventKind::NamespaceStateChanged, NamespaceStateChangedOps> &&
               detail::kOpsAt<EventKind::NamespaceDeleted, NamespaceDeletedOps> &&
-              detail::kOpsAt<EventKind::NamespaceDeleteStep, NamespaceDeleteStepOps>,
+              detail::kOpsAt<EventKind::NamespaceDeleteStep, NamespaceDeleteStepOps> &&
+              detail::kOpsAt<EventKind::RetireSchemaVersions, RetireSchemaVersionsOps>,
               "kKindOfAlt must list each kind at the index of its Ops alternative");
 
 /// Until authentication exists: session id, client name and source address.  Afterwards
@@ -262,9 +277,9 @@ inline constexpr std::size_t kMaxListCount  = 0xFFFF;
 enum class EncodeError : uint8_t {
     FieldTooLong,      // a string / blob (or the ops blob) exceeds its length prefix's width
     TooManyElements,   // a list exceeds its u16 count
-    UnknownFormatVer,  // formatVer not 1..4                 (decode: UnknownFormatVer)
-    ReservedKind,      // v1: kind in [32, 63]; v2..v4: [37, 63] (decode: ReservedKind)
-    UnknownKind,       // kind not 1..9 and not reserved    (decode: UnknownKind)
+    UnknownFormatVer,  // formatVer not 1..5                 (decode: UnknownFormatVer)
+    ReservedKind,      // v1: kind in [32, 63]; v2..v5: [37, 63] (decode: ReservedKind)
+    UnknownKind,       // kind not 1..9 (10 in v5) and not reserved (decode: UnknownKind)
     KindOpsMismatch,   // kind != kindOf(ops)               (decode: KindOpsMismatch)
     BadEnum,           // an enum field outside its range, or a v1 event with nsId != 0 (decode: BadEnum)
     NeedsFormatV3,     // a v1 / v2 event with non-default keyFeatures (a decoder never produces one)
@@ -275,7 +290,7 @@ enum class EncodeError : uint8_t {
 /// Clears `out` and encodes into it, reusing its capacity.  On error `out` is left empty.
 [[nodiscard]] std::expected<void, EncodeError> encodeInto(const CatalogEvent& e, std::vector<uint8_t>& out);
 [[nodiscard]] std::expected<std::vector<uint8_t>, EncodeError> encode(const CatalogEvent& e);
-/// Bounds-checked decode of one formatVer-1, -2, -3 or -4 event; the same validation as encode, plus the
+/// Bounds-checked decode of one formatVer-1, -2, -3, -4 or -5 event; the same validation as encode, plus the
 /// byte-level refusals (Truncated, TrailingBytes, a bool byte other than 0/1 → BadEnum).
 [[nodiscard]] std::expected<CatalogEvent, DecodeError> decode(std::span<const uint8_t> bytes) noexcept;
 [[nodiscard]] std::string_view kindName(EventKind k) noexcept;

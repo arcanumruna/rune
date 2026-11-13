@@ -275,6 +275,9 @@ public:
                          int32_t coordinatorEpoch, const rune::gateway::TxnVoteResult& r) noexcept;
     [[nodiscard]] std::size_t voteGatesForTest() const noexcept { return voteGates_.size(); }
     [[nodiscard]] std::size_t voteOrphansForTest() const noexcept { return voteOrphans_.size(); }
+    /// #995: the cycles of lock waits resolved (a victim aborted at once), and the wait-for edges the vote gates hold now.
+    [[nodiscard]] uint64_t txnDeadlocksResolvedForTest() const noexcept { return txnDeadlocksResolved_; }
+    [[nodiscard]] std::size_t voteWaitEdgesForTest() const noexcept;
     [[nodiscard]] std::size_t voteCandidateTxnsForTest() const noexcept { return voteCandidatesAtAdd_.size(); }
     /// Task 10 round 5: an asynchronously appended marker landed.
     void onControlMarkerLanded(int32_t topicId, int32_t partition, int64_t producerId,
@@ -445,6 +448,8 @@ private:
         bool        outstanding = false;   ///< a vote is out: its answer is awaited
         int64_t     dueNs       = 0;       ///< not outstanding and not yes: (re-)sent from this time on
         int64_t     backoffNs   = 0;
+        int64_t     waitPid     = -1;      ///< #995: the leader's judge waits on this transaction (-1 = none): a wait-for edge
+        int16_t     waitEpoch   = 0;
     };
     struct VoteCandidates {   ///< the candidates of an Ongoing transaction, noted at AddPartitions
         int64_t                 producerId    = -1;
@@ -465,6 +470,12 @@ private:
         VoteNo                  no{};
     };
     std::vector<VoteGate> voteGates_;
+    uint64_t              txnDeadlocksResolved_ = 0;
+    bool                  waitGraphDirty_       = false;   ///< a wait-for edge changed: look for a cycle
+    // resolveVoteDeadlocks_'s scratch, kept so a pass allocates only while the gate count grows
+    std::vector<std::vector<uint32_t>> waitEdges_;
+    std::vector<uint8_t>               waitColour_;
+    std::vector<uint32_t>              waitNext_, waitStack_;
     std::map<rune::transaction::TransactionalId, VoteCandidates, std::less<>> voteCandidatesAtAdd_;
     /// Votes still out in the gateway whose gate is gone (first no, timeout, takeover by an abort), by (topic id,
     /// partition, pid, epoch).  The gateway answers each exactly once; a new gate for the key waits for that answer
@@ -497,6 +508,13 @@ private:
     bool startVoteGate_(const rune::protocol::client::EndTxn& msg, int64_t nowNs);
     void sendVote_(const VoteGate& g, VoteTarget& t, int64_t nowNs);
     void scheduleVoteResend_(VoteTarget& t, int64_t fromNs) noexcept;
+    /// #995: an interim answer: the target's partition waits on (holderPid, holderEpoch).
+    void noteVoteWait_(int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch, int64_t holderPid,
+                       int16_t holderEpoch) noexcept;
+    void clearWait_(VoteTarget& t) noexcept;
+    /// #995: the gate of (producerId, producerEpoch) was removed: no target waits on it any more.
+    void forgetGate_(int64_t producerId, int16_t producerEpoch) noexcept;
+    void resolveVoteDeadlocks_() noexcept;
     int  processVoteGates_(int64_t nowNs);
     /// The gate decided: PrepareCommit (all yes) or PrepareAbort (a no, whose code is the answer).
     void prepareVoted_(VoteGate& g, bool commit, int64_t nowNs);

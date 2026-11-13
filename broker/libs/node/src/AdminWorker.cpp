@@ -75,6 +75,7 @@ constexpr uint16_t kNotAuthorized        = 45;
 constexpr uint16_t kViewKeyExpressionInvalid = 59;   // only to clients >= kClientVersionCheckedWrites; the gateway answers older ones 39
 constexpr uint16_t kViewConstraintInvalid    = 60;
 constexpr uint16_t kViewUniqueInvalid        = 61;
+constexpr uint16_t kSchemaVersionRetired = 67;   // #419: a typed open of a version below the retire floor (no client version gate)
 constexpr uint16_t kNamespaceLimitExceeded = 52;   // only to clients >= kClientVersionNamespaces; older get 39
 
 /// A malformed request carries no meta: it is treated as id-less (pre-v8) — it is
@@ -735,6 +736,14 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
         unknown();
         return;
     }
+    // #419: a typed open that resolves to a version below the retire floor is refused (the CURRENT version never is: the floor
+    // never passes it).  TopicSchemaResponse has no text field, so the refusal is logged with its text and answered by its code.
+    if (e->version < named->retiredBelow) {
+        spdlog::info("GetTopicSchema: schema version {} of {} is retired (versions below {})", e->version,
+                     quotedName(msg.name), named->retiredBelow);
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kSchemaVersionRetired, {}, std::nullopt, -1);
+        return;
+    }
     // The wire blob is the MATERIALIZED-as-of-version descriptor (its fingerprint
     // is e->fingerprint), never the evolving blob; the partition count is the
     // topic's (the latest entry).
@@ -1028,7 +1037,7 @@ void AdminWorker::startNext_(int64_t nowNs) {
     // 3. Dedupe (F14) on (requestId, statement fingerprint).
     const uint64_t fp = requestFingerprint(req);
     if (!meta.requestId.none()) {
-        if (const auto rec = state.request(meta.requestId)) {
+        if (const auto rec = state.request(meta.authenticated, meta.requestId)) {
             if (rec->requestFingerprint == fp) {
                 answerOk_(req, *rec);   // a retry of a committed DDL: its ORIGINAL result
             } else if (const auto* denied = std::get_if<NamespaceDdlMsg>(&req);
@@ -1124,7 +1133,15 @@ TopicSpec fdSpecOf(int32_t partitions, const rune::protocol::TopicConfig& c) {
 }  // namespace
 
 std::optional<std::string> AdminWorker::fdBudgetRefusal_(const cat::CatalogEvent& e, const cat::CatalogState& s) const {
-    if (deps_.fdLimit == 0) return std::nullopt;   // unknown limit: never refuse
+    // #612: the budget is the smallest open-file limit known in the cluster: this broker's own, or the smallest a
+    // peer advertised (every broker hosts the topic).  0 = unknown = never refuse.
+    uint64_t limit = deps_.fdLimit;
+    int32_t  who   = -1;   // -1 = this broker
+    if (clusterFdLimit_ != 0 && (limit == 0 || clusterFdLimit_ < limit)) {
+        limit = clusterFdLimit_;
+        who   = clusterFdLimitNode_;
+    }
+    if (limit == 0) return std::nullopt;   // unknown limit: never refuse
     const bool create = std::holds_alternative<cat::CreateTopicOps>(e.ops);
     const auto* alter = std::get_if<cat::AlterTopicConfigOps>(&e.ops);
     if (!create && alter == nullptr) return std::nullopt;   // views own no log; drops only lower the need
@@ -1152,9 +1169,12 @@ std::optional<std::string> AdminWorker::fdBudgetRefusal_(const cat::CatalogEvent
         after = fdNeedAdd(after, t == altered ? newTerm : term);
     }
     if (create) after = fdNeedAdd(after, newTerm);
-    if (after <= deps_.fdLimit) return std::nullopt;
+    if (after <= limit) return std::nullopt;
+    const std::string limitText = who >= 0 ? "the open-file limit " + std::to_string(limit) + " of broker " +
+                                                 std::to_string(who) + " (the smallest in the cluster)"
+                                           : "its open-file limit " + std::to_string(limit);
     return std::string(create ? "CREATE TOPIC" : "ALTER TOPIC") + " would raise this broker's estimated open-file need to " +
-           std::to_string(after) + ", above its open-file limit " + std::to_string(deps_.fdLimit) + " (now " +
+           std::to_string(after) + ", above " + limitText + " (now " +
            std::to_string(before) + "); raise LimitNOFILE / --ulimit nofile, or use fewer partitions, a larger "
            "segment.bytes or a smaller retention.bytes";
 }
@@ -1216,7 +1236,8 @@ bool AdminWorker::advance_(int64_t nowNs) {
         // The answer is what the applied event recorded.
         const DdlMeta& meta = metaOf(a->req);
         std::optional<cat::RequestRecord> rec =
-            meta.requestId.none() ? recordOfLastApplied_(a->offset) : applier_.state().request(meta.requestId);
+            meta.requestId.none() ? recordOfLastApplied_(a->offset)
+                                  : applier_.state().request(meta.authenticated, meta.requestId);
         DdlRequest req = std::move(a->req);
         const int64_t offset = a->offset;
         inFlight_ = Idle{};
@@ -1465,7 +1486,8 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
     // leader's wall clock when the event is built for its append).
     const DdlMeta& meta = metaOf(req);
     const int64_t session = std::visit([](const auto& m) { return m.session; }, req);
-    b->formatVer                 = clusterFeatureLevel_ >= rune::replication::MetadataFeature::kLeases          ? cat::kFormatV4
+    b->formatVer                 = clusterFeatureLevel_ >= rune::replication::MetadataFeature::kSchemaRetire    ? cat::kFormatV5
+                                 : clusterFeatureLevel_ >= rune::replication::MetadataFeature::kLeases          ? cat::kFormatV4
                                  : clusterFeatureLevel_ >= rune::replication::MetadataFeature::kCheckedWrites ? cat::kFormatV3
                                                                                                               : cat::kCurrentFormatVer;
     b->statement                 = meta.statement;
@@ -1491,6 +1513,7 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
         case cat::EventKind::CreateSchema:
         case cat::EventKind::AlterSchema:
         case cat::EventKind::SetCompatibility:
+        case cat::EventKind::RetireSchemaVersions:
             return Rejected(reject(kInvalidSchema, why));
         case cat::EventKind::CreateTopic:
             if (std::get<cat::CreateTopicOps>(b->ops).schema) return Rejected(reject(kInvalidSchema, why));
@@ -1774,6 +1797,16 @@ AdminWorker::Built AdminWorker::buildAlter_(const AlterTopicMsg& m, const cat::C
     e.objectId    = t->objectId;
     e.prevVersion = t->version;
     e.newVersion  = t->version + 1;
+    // #419: `RETIRE VERSION < N` is the one operation of its request, a RetireSchemaVersions event (formatVer 5).  The apply
+    // rule's dry run (buildEvent_'s preview) answers the floor and upper-bound refusals with the rule's own text.
+    for (const auto& op : *ops) {
+        if (op.type != rune::codec::AlterOpType::RetireBelow) continue;
+        if (ops->size() != 1) return Rejected(reject(kInvalidSchema, "RETIRE VERSION cannot be combined with other operations", topicId, cur));
+        if (clusterFeatureLevel_ < rune::replication::MetadataFeature::kSchemaRetire)
+            return Rejected(reject(kInvalidRequest, "RETIRE VERSION needs every broker upgraded (cluster feature level 7)", topicId, cur));
+        e.ops = cat::RetireSchemaVersionsOps{op.version};
+        return e;
+    }
     bool onlySetCompat = true;
     rune::codec::CompatMode mode = t->schema->compat;
     for (const auto& op : *ops) {

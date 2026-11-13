@@ -34,13 +34,14 @@ struct TopicDef {
 struct ParseError { std::size_t line = 0; std::size_t col = 0; std::string message; };
 
 enum class Compatibility { Backward, Forward };
-enum class AlterOpKind { Add, Drop, Rename, SetCompatibility };
+enum class AlterOpKind { Add, Drop, Rename, SetCompatibility, RetireBelow };
 struct AlterOp {
     AlterOpKind kind = AlterOpKind::Add;
     FieldDef field;          // used by Add
     std::string name;        // used by Drop (column to drop) / Rename (old name)
     std::string newName;     // used by Rename (new name)
     Compatibility mode = Compatibility::Backward;  // used by SetCompatibility
+    uint16_t retireBelow = 0;                      // used by RetireBelow: `retire version < N`, N in 2..65535 (#419)
 };
 struct AlterTopicDef { std::string name; std::vector<AlterOp> ops; };
 

@@ -90,7 +90,11 @@ public:
     [[nodiscard]] bool isNsAdmin(uint64_t userId, uint32_t nsId, std::string_view nsName) const;
     [[nodiscard]] int64_t appliedOffset() const noexcept { return appliedOffset_; }   // -1 = nothing applied
     [[nodiscard]] uint64_t nextObjectId() const noexcept { return nextObjectId_; }    // users and roles share one counter
-    [[nodiscard]] std::optional<RequestRecord> request(const RequestId&) const;
+    /// The record of the applied event that carried `id` and was authenticated as `principal`; exact match on both.
+    [[nodiscard]] std::optional<RequestRecord> request(std::string_view principal, const RequestId& id) const;
+    /// The record of `id` with the LOWEST offset over all principals (deterministic), for a reader of the log that
+    /// looks for its own id (the CLI); never used to answer a client.
+    [[nodiscard]] std::optional<RequestRecord> requestOfAnyPrincipal(const RequestId& id) const;
     /// A copy of every member EXCEPT the request dedupe table (left empty), built member by member: the table only
     /// grows, so copying it is the cost this avoids.  For dry runs only (the leader's last-admin guard); the result has
     /// no dedupe history and must never be used as a replica's state.
@@ -103,6 +107,11 @@ public:
     /// D8: the cluster-wide key of the fake salts, set by the FIRST Bootstrap event and never changed
     /// (a later Bootstrap keeps it).  nullopt before any bootstrap.  Covered by digest(), not by fingerprints.
     [[nodiscard]] const std::optional<std::array<uint8_t, kFakeSaltSeedBytes>>& fakeSaltSeed() const noexcept { return fakeSaltSeed_; }
+    /// #238: the iteration count the fake salts of unknown users advertise: the iteration count of the FIRST Bootstrap's
+    /// verifier, set once together with the seed and never changed (a later Bootstrap keeps it).  nullopt before any
+    /// bootstrap.  NOT covered by digest(): it is a pure function of the same first Bootstrap event the seed comes from
+    /// (which the digest already covers), so the digest and the golden files are unchanged.
+    [[nodiscard]] const std::optional<uint32_t>& fakeIterations() const noexcept { return fakeIterations_; }
 private:
     friend struct ApplyV1;
     friend struct ApplyV2;
@@ -110,8 +119,10 @@ private:
     std::map<uint64_t, UserObject> users_; std::map<uint64_t, RoleObject> roles_;
     std::map<SecKey, uint64_t, SecKeyLess> userNames_, roleNames_;
     std::vector<Tombstone> tombstones_;
-    std::unordered_map<RequestId, RequestRecord, rune::catalog::RequestIdHash> requests_;
+    struct RequestEntry { std::string principal; RequestRecord rec; };   // one per principal that recorded the id
+    std::unordered_map<RequestId, std::vector<RequestEntry>, rune::catalog::RequestIdHash> requests_;
     std::optional<std::array<uint8_t, kFakeSaltSeedBytes>> fakeSaltSeed_;
+    std::optional<uint32_t> fakeIterations_;
     uint64_t nextObjectId_ = 1; int64_t appliedOffset_ = -1;
 };
 

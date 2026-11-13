@@ -119,7 +119,8 @@ TEST(SecurityViewRegression, AnAdminReportedHaltStopsTheMirrorToo) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Issue #269: the fake-iteration mode is kept incrementally; a user event never recounts every user.
+// Issue #269 / #238: a user event never rebuilds the derived data; the fake iteration count is the one pinned by the
+// first Bootstrap.
 // ---------------------------------------------------------------------------------------------------------------------
 namespace {
 using rune::node::test::SecurityEventChain;
@@ -135,19 +136,6 @@ sec::GrantSpec topicGrant(sec::Operation op, const std::string& name) {
     return sec::GrantSpec{op, sec::ResourcePattern{sec::ResourceType::Topic, sec::PatternKind::Exact, name}};
 }
 
-/// The brute-force answer: the most common verifier iteration count over all users; ties: the smallest count; no
-/// verifier at all: 4096.
-uint32_t bruteForceFakeIterations(const sec::SecurityState& st) {
-    std::map<uint32_t, std::size_t> counts;
-    for (const auto& [id, u] : st.users())
-        for (const auto& v : u.verifiers) ++counts[v.iterations];
-    uint32_t best = 4096;
-    std::size_t bestN = 0;
-    for (const auto& [it, n] : counts)
-        if (n > bestN) { best = it; bestN = n; }
-    return best;
-}
-
 /// Apply the chain's latest event to the view at its offset.
 void applyLatest(SecurityEventChain& chain, SecurityView& view, const sec::SecurityEvent& ev) {
     const auto bytes = sec::encode(ev);
@@ -158,14 +146,14 @@ void applyLatest(SecurityEventChain& chain, SecurityView& view, const sec::Secur
 }
 }  // namespace
 
-TEST(SecurityViewRegression, FakeIterationsMatchesAFullRecountAfterEveryEventRegression) {
+TEST(SecurityViewRegression, FakeIterationsStayThePinnedBootstrapCountAfterEveryEventRegression) {
     SecurityEventChain chain;
     SecurityView view{sec::SecurityState{}};
     sec::BootstrapOps b;
     b.verifier = verifierWith(1, 4096);
     b.fakeSaltSeed.fill(7);
     applyLatest(chain, view, chain.emit(b, "admin", "BOOTSTRAP", "bootstrap"));
-    ASSERT_EQ(view.fakeIterations(), bruteForceFakeIterations(chain.state()));
+    ASSERT_EQ(view.fakeIterations(), 4096u);
 
     std::mt19937_64 rng(0x269);   // fixed seed
     const uint32_t kCounts[] = {4096, 5000, 6000, 7000};
@@ -233,7 +221,7 @@ TEST(SecurityViewRegression, FakeIterationsMatchesAFullRecountAfterEveryEventReg
         }
         if (::testing::Test::HasFatalFailure()) return;
         ++applied;
-        ASSERT_EQ(view.fakeIterations(), bruteForceFakeIterations(view.state())) << "after event " << applied;
+        ASSERT_EQ(view.fakeIterations(), 4096u) << "after event " << applied;
     }
     EXPECT_GE(applied, 2000);
     EXPECT_FALSE(view.halted());
@@ -262,5 +250,64 @@ TEST(SecurityViewRegression, UserEventsDoNotRebuildTheDerivedCountsRegression) {
         applyLatest(chain, view, ev);
     }
     EXPECT_EQ(view.derivedFullRebuildsForTest(), rebuilds) << "no user / grant event recounts the users";
-    EXPECT_EQ(view.fakeIterations(), bruteForceFakeIterations(view.state()));
+    EXPECT_EQ(view.fakeIterations(), 4096u);
+}
+
+// Issue #238: the iteration count advertised for an unknown name is the one of the FIRST Bootstrap's verifier, fixed
+// for the life of the cluster; no later change of the real accounts' counts moves it.
+TEST(SecurityViewRegression, FakeIterationsDoNotChangeWhenTheRealModeChangesRegression) {
+    SecurityEventChain chain;
+    SecurityView view{sec::SecurityState{}};
+    std::vector<std::vector<uint8_t>> log;   // the record bytes, in offset order
+    auto step = [&](const sec::SecurityEvent& ev) {
+        const auto bytes = sec::encode(ev);
+        ASSERT_TRUE(bytes.has_value());
+        log.push_back(*bytes);
+        const auto applied = view.onApplied(static_cast<int64_t>(log.size()) - 1, *bytes);
+        ASSERT_TRUE(applied.has_value()) << (applied ? "" : applied.error().detail);
+    };
+    EXPECT_EQ(view.fakeIterations(), 4096u) << "before any bootstrap: the default";
+    sec::BootstrapOps b;
+    b.verifier = verifierWith(1, 8192);
+    b.fakeSaltSeed.fill(7);
+    step(chain.emit(b, "admin", "BOOTSTRAP", "bootstrap"));
+    ASSERT_EQ(view.fakeIterations(), 8192u);
+    for (int i = 0; i < 3; ++i) {
+        const std::string n = "a" + std::to_string(i);
+        step(chain.emit(sec::CreateUserOps{verifierWith(static_cast<uint8_t>(10 + i), 4096)}, n,
+                                            "CREATE USER " + n + ";"));
+    }
+    EXPECT_EQ(view.fakeIterations(), 8192u) << "3 users at 4096 do not move it";
+    for (int i = 0; i < 5; ++i) {
+        const std::string n = "b" + std::to_string(i);
+        step(chain.emit(sec::CreateUserOps{verifierWith(static_cast<uint8_t>(20 + i), 16384)}, n,
+                                            "CREATE USER " + n + ";"));
+    }
+    EXPECT_EQ(view.fakeIterations(), 8192u) << "5 users at 16384 do not move it";
+    for (int i = 0; i < 3; ++i) {
+        const std::string n = "a" + std::to_string(i);
+        step(chain.emit(sec::DropUserOps{}, n, "DROP USER " + n + ";"));
+    }
+    for (int i = 0; i < 5; ++i) {
+        const std::string n = "b" + std::to_string(i);
+        step(chain.emit(sec::AlterUserOps{sec::SetPassword{verifierWith(static_cast<uint8_t>(30 + i), 5000), false}},
+                                            n, "ALTER USER " + n + ";"));
+    }
+    EXPECT_EQ(view.fakeIterations(), 8192u) << "dropping users and altering passwords do not move it";
+    // every admin gone, a SECOND bootstrap with another count: still the first one
+    step(chain.emit(sec::AlterUserOps{sec::DisableUser{}}, "admin", "ALTER USER admin DISABLE;"));
+    sec::BootstrapOps b2;
+    b2.verifier = verifierWith(2, 20000);
+    b2.fakeSaltSeed.fill(9);
+    step(chain.emit(b2, "admin2", "BOOTSTRAP", "bootstrap"));
+    EXPECT_EQ(view.fakeIterations(), 8192u) << "a later Bootstrap never moves it";
+
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    // The restart twin: a fresh view replaying the same log reaches the same value, and so does one booted from the
+    // final state.
+    SecurityView replay{sec::SecurityState{}};
+    for (std::size_t i = 0; i < log.size(); ++i) ASSERT_TRUE(replay.onApplied(static_cast<int64_t>(i), log[i]).has_value());
+    EXPECT_EQ(replay.fakeIterations(), 8192u);
+    EXPECT_EQ(SecurityView{chain.state()}.fakeIterations(), 8192u);
+    EXPECT_EQ(chain.state().fakeIterations(), std::optional<uint32_t>{8192});
 }

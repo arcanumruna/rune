@@ -36,8 +36,9 @@ Kinds:
 | `CreateView` | 7 | `createView` |
 | `AlterView` | 8 | `alterView` (a fresh output topic under the same object id) |
 | `DropView` | 9 | `drop view` |
+| `RetireSchemaVersions` | 10 | `alter topic ... retire version < N` (`formatVer` 5 only) |
 
-Kinds 32 to 36 are the namespace kinds of `formatVer` 2 and 3 (`NamespaceCreated` 32, `NamespaceLimitsSet` 33,
+Kind 10 exists only in `formatVer` 5; a `formatVer` 1 to 4 event of kind 10 is an unknown kind (`UnknownKind`). Kinds 32 to 36 are the namespace kinds of `formatVer` 2 to 5 (`NamespaceCreated` 32, `NamespaceLimitsSet` 33,
 `NamespaceStateChanged` 34, `NamespaceDeleted` 35, `NamespaceDeleteStep` 36). Kinds 37 to 63 are reserved for later
 features; `formatVer` 1 refuses all of 32 to 63.
 
@@ -98,6 +99,13 @@ created, and there is no way to alter the partition count, so the key field, its
 `Modulo` needs `autoIncrement`, and an `AlterTopicConfig` on an autoincrement topic keeps retention at -1. The golden
 `codec/tests/catalog/golden/v3/autoinc.rcat` pins five events (two creates, an `AlterSchema`, an `AlterTopicConfig`, and a
 three-partition `uint32` create).
+
+**`formatVer` 5** (schema retire, #419) is `formatVer` 4 byte for byte plus one kind, `RetireSchemaVersions` (10), whose body is
+`u16 below`. The apply rule: the topic is live and typed, `below` is above the topic's current retire floor (`retiredBelow`,
+default 1) and no higher than its current schema version, else `Precondition` ("versions below N are already retired" / "version N is
+above the current version V"). It changes only `retiredBelow` and the topic's catalog version. The floor is hashed into the object
+fingerprint and the state digest only when it is not 1, so every log without a retire keeps its digests; an `AlterSchema` or
+`SetCompatibility` carries the floor over. The leader writes `formatVer` 5 once the cluster feature level is 7 (`kSchemaRetire`).
 
 **`formatVer` rules.** The apply rules of a `formatVer` are frozen and never edited. A rule change
 ships under a new `formatVer`, and old events keep replaying under their own rules. A reader that
@@ -188,11 +196,10 @@ Every DDL is answered. No request is silently dropped.
 A DDL carries a 128-bit request id that stays the same across every resend. The leader answers a
 retry of a DDL that already applied with the original result, and answers `InvalidRequest` if the
 same id arrives with a different statement.
-A request id recorded by one principal is not a retry for another: a different principal that sends it is
-answered `requestId reused for a different statement` (or its own denial, if it may not run the statement) and
-never the recorded result. Whether an id is recorded is therefore visible to a principal that guesses it; ids are
-a random 64-bit client instance id plus a counter. The leader's request fingerprint includes the authenticated
-principal (issue #221).
+Recorded request ids are kept per principal: a request id recorded by one principal is not a retry for another.
+A different principal that sends that id is processed as a new request of its own, so whether an id is recorded is
+not visible to another principal. The leader's request fingerprint includes the authenticated principal (issue
+#221).
 Requests of an authenticated principal recorded before the upgrade no longer dedupe: a retry that spans the
 upgrade is answered `requestId reused for a different statement` although the statement applied. Requests made
 with authentication off (an empty principal) are unaffected.

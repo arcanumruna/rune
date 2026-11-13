@@ -14,6 +14,9 @@
 //  BR5T-6:  reap loop is bounded (single-writer, finishes in O(n))
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/TopicRegistry.h>
+#include <rune/node/ReplicaRegistry.h>
+#include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/GroupMessages.h>
@@ -1092,6 +1095,230 @@ TEST_F(RecordEgressLifetimeTwoWorkerRegression, CloseReleasesTheInFlightEgressPu
     EXPECT_EQ(gw_->pendingConnectCount(), before + 2) << "both workers' registrations are queued for release";
     expectReleased(reg0, before);
     expectReleased(reg1, before);
+}
+
+// ===========================================================================
+// #745: a legacy-mode record-egress publication counts as usable only once it is CONNECTED.  A publication to a
+// declared channel nothing answers (a client behind NAT) RESOLVES at once but never connects: the Subscribe used to be
+// forwarded on it and the worker's Records went nowhere, silently.  Now the Subscribe stays parked and, at the resolve
+// timeout (measured from the request), takes the failed-resolve path: retired explicitly under authentication, the
+// shared dynamic-MDC egress without it.  Real driver; the declared channel is TEST-NET-1 (never reachable) or an IPC
+// channel with a listening subscription (reachable).  The injected clock decides every timeout.
+// ===========================================================================
+class LegacyRecordEgressConnectRegression : public RecordEgressLifetimeRegression {
+protected:
+    static constexpr int64_t kPastResolveTimeoutNs = 60'000'000'000LL;
+    const std::string kUnreachable = "aeron:udp?endpoint=192.0.2.1:40200";   // TEST-NET-1: never answers
+    const std::string kReachable   = "aeron:ipc";                            // answered by a local subscription
+
+    TempDir                              regDir_{"reg_"};
+    std::unique_ptr<TopicRegistry>       registry_;
+    rune::replication::InMemoryTransport transport_;
+    rune::node::ReplicaRegistry          replicas_;
+    std::vector<pc::ErrorResponse>       errors_;
+    std::shared_ptr<aeron::Subscription> listener_;
+    int64_t                              listenerReg_ = -1;
+    int64_t                              t0_          = 0;
+
+    // Gateway wired to a 1-worker pool and a 1-topic registry (`partitions` partitions).
+    void setup(bool auth, int32_t partitions = 1) {
+        t0_ = wallNowNs() + 3'600'000'000'000LL;   // an hour ahead of the wall clock the helpers pump with: no reaping
+        rune::node::TopicSpec ts;
+        ts.name = "events"; ts.partitionCount = partitions; ts.topicId = 0;
+        registry_ = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{ts}, regDir_.path.string());
+        gw_->setTopicRegistry(registry_.get());
+        gw_->setWorkerPool(&pool_);
+        gw_->setPerWorkerEgressActive(true);
+        for (int32_t p = 0; p < partitions; ++p) {
+            rune::replication::PartitionConfig c;
+            c.topicId = 0; c.partitionId = p; c.selfId = 1; c.minIsr = 1;
+            c.replicaLagMaxOffset = 1'000'000'000; c.replicaLagMaxMs = 600'000;
+            auto rep = std::make_unique<rune::replication::PartitionReplica>(
+                c, rune::replication::Role::Leader, 1, std::vector<int32_t>{1}, std::vector<int32_t>{1},
+                registry_->log(0, p), &transport_);
+            rep->setExternalFollowerFlush(true);
+            replicas_.add(0, p, std::move(rep));
+        }
+        gw_->setReplicaRegistry(&replicas_);
+        gw_->setOnEgressFrame([this](int64_t, const uint8_t* b, std::size_t n) {
+            const auto hdr = pc::MessageHeader::decode(b, n);
+            if (hdr && hdr->templateId == static_cast<uint16_t>(pc::TemplateId::ErrorResponse))
+                if (auto e = pc::ErrorResponse::decode(b, n)) errors_.push_back(*e);
+            if (hdr && hdr->templateId == static_cast<uint16_t>(pc::TemplateId::SubscribeResponse))
+                if (auto sr = pc::SubscribeResponse::decode(b, n); sr && sr->errorCode != 0) {
+                    pc::ErrorResponse e;
+                    e.correlationId = sr->correlationId;
+                    e.code          = sr->errorCode;
+                    errors_.push_back(e);
+                }
+        });
+        if (auth) gw_->setAuthMode(GatewayAuthMode::Required, nullptr);
+    }
+    [[nodiscard]] int errorOn(int64_t corr) const {
+        for (const auto& e : errors_) if (e.correlationId == corr) return e.code;
+        return -1;
+    }
+    int64_t session(const std::string& channel) { return gw_->injectTestSessionOnChannel(channel, t0_); }
+    void listen() { listenerReg_ = aeron_->addSubscription(kReachable, 0); }   // the injected session's stream id is 0
+    void subscribe(int64_t sid, int64_t subId, int32_t partition, int64_t corr, bool okOwed) {
+        gw_->addSubscriptionRecordForTest(subId, sid, 0, partition, corr, okOwed);
+        gw_->setNowForTest(t0_);   // the registration's request time (the resolve timeout runs from it)
+        gw_->forwardSubscribeForTest(subId, sid, 0, partition, 0, 0, false, false, corr);
+    }
+    // One poll cycle at a clock inside the resolve timeout: the conductor, then the gateway's record-egress poll.
+    void cycle(int64_t atNs) {
+        invokeConductor();
+        if (listenerReg_ >= 0 && !listener_) listener_ = aeron_->findSubscription(listenerReg_);
+        gw_->pollPendingRecordEgressForTest(atNs);
+    }
+    // Bounded, sleep-free: cycle until `done` (iteration cap AND a 10 s deadline).
+    template <class Done> bool settle(Done&& done) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        for (int i = 0; i < 20'000'000 && std::chrono::steady_clock::now() < deadline; ++i) {
+            cycle(t0_ + 1);
+            if (done()) return true;
+            std::this_thread::yield();
+        }
+        return false;
+    }
+    // The registration resolved and (old behaviour) was forwarded at once, or (new) is held unconnected.
+    bool resolvedOrForwarded(int64_t sid, int64_t subId) {
+        return gw_->pendingRecordEgressResolvedForTest(sid, 0) || !gw_->subscriptionAwaitsEgressForTest(subId);
+    }
+    rune::node::Worker& worker() { return pool_.worker(pool_.ownerWorkerId(0, 0)); }
+};
+
+TEST_F(LegacyRecordEgressConnectRegression, ASubscribeIsNotForwardedOnAnUnconnectedRecordEgressRegression) {
+    setup(/*auth=*/true);
+    const std::size_t before = gw_->pendingConnectCount();
+    const int64_t sid = session(kUnreachable);
+    subscribe(sid, 41, 0, /*corr=*/77, /*okOwed=*/true);
+    const int64_t regId = gw_->recordEgressRegIdForTest(sid, 0);
+    ASSERT_GE(regId, 0);
+
+    ASSERT_TRUE(settle([&] { return resolvedOrForwarded(sid, 41); })) << "the registration never resolved";
+    ASSERT_TRUE(gw_->pendingRecordEgressResolvedForTest(sid, 0))
+        << "an unconnected publication must be held, not forwarded on";
+    for (int i = 0; i < 200; ++i) cycle(t0_ + 1);
+    worker().doWork(1);
+    EXPECT_TRUE(gw_->subscriptionAwaitsEgressForTest(41)) << "still parked: the client never answered the channel";
+    EXPECT_TRUE(worker().subscriptionsForTest().empty()) << "nothing reaches the worker";
+    EXPECT_FALSE(gw_->recordEgressCachedForTest(sid, 0));
+    EXPECT_EQ(errorOn(77), -1) << "no answer before the timeout";
+
+    cycle(t0_ + kPastResolveTimeoutNs);   // the resolve timeout, measured from the request
+    gw_->pumpRetryQueuesForTest();
+    worker().doWork(2);
+    EXPECT_EQ(gw_->recordEgressNeverConnected(), 1u);
+    EXPECT_EQ(gw_->subscribesWithoutRecordEgressForTest(), 1u);
+    EXPECT_EQ(errorOn(77), static_cast<int>(pc::ErrorCode::RecordEgressUnavailable))
+        << "the explicit answer, the same as a failed resolve";
+    EXPECT_EQ(gw_->subscriptionCount(), 0u);
+    EXPECT_EQ(gw_->pendingRecordEgressCountForTest(), 0u);
+    EXPECT_FALSE(gw_->recordEgressCachedForTest(sid, 0)) << "no publication cached on the session";
+    EXPECT_TRUE(worker().subscriptionsForTest().empty());
+    expectReleased(regId, before);
+}
+
+TEST_F(LegacyRecordEgressConnectRegression, AnUnconnectedRecordEgressWithoutAuthFallsBackToTheSharedEgressRegression) {
+    setup(/*auth=*/false);
+    const std::size_t before = gw_->pendingConnectCount();
+    const int64_t sid = session(kUnreachable);
+    subscribe(sid, 42, 0, /*corr=*/78, /*okOwed=*/false);
+    const int64_t regId = gw_->recordEgressRegIdForTest(sid, 0);
+    ASSERT_GE(regId, 0);
+
+    ASSERT_TRUE(settle([&] { return resolvedOrForwarded(sid, 42); })) << "the registration never resolved";
+    ASSERT_TRUE(gw_->pendingRecordEgressResolvedForTest(sid, 0)) << "an unconnected publication must be held";
+    worker().doWork(1);
+    EXPECT_TRUE(worker().subscriptionsForTest().empty()) << "nothing reaches the worker before the timeout";
+
+    cycle(t0_ + kPastResolveTimeoutNs);
+    gw_->pumpRetryQueuesForTest();
+    worker().doWork(2);
+    EXPECT_EQ(gw_->recordEgressNeverConnected(), 1u);
+    EXPECT_EQ(gw_->subscribesWithoutRecordEgressForTest(), 0u) << "no refusal without authentication";
+    ASSERT_EQ(worker().subscriptionsForTest().size(), 1u) << "forwarded after the timeout";
+    EXPECT_EQ(worker().subscriptionsForTest()[0].egressPub, nullptr) << "with the shared dynamic-MDC egress";
+    EXPECT_FALSE(gw_->recordEgressCachedForTest(sid, 0)) << "the unconnected publication is never cached";
+    EXPECT_EQ(gw_->pendingRecordEgressCountForTest(), 0u);
+    expectReleased(regId, before);
+}
+
+// The reachable channel: the publication connects, the Subscribe is forwarded with it; a second Subscribe of the same
+// worker takes the cached fast path.
+#define RUNE_REACHABLE_BODY(AUTH)                                                                                      \
+    setup(AUTH, /*partitions=*/2);                                                                                     \
+    listen();                                                                                                          \
+    const int64_t sid = session(kReachable);                                                                           \
+    subscribe(sid, 43, 0, /*corr=*/79, /*okOwed=*/AUTH);                                                               \
+    ASSERT_TRUE(settle([&] { return !gw_->subscriptionAwaitsEgressForTest(43); }))                                     \
+        << "a connected publication must release the Subscribe";                                                       \
+    EXPECT_EQ(gw_->recordEgressNeverConnected(), 0u);                                                                  \
+    EXPECT_TRUE(gw_->recordEgressCachedForTest(sid, 0)) << "the per-session publication is cached";                   \
+    subscribe(sid, 44, 1, /*corr=*/80, /*okOwed=*/AUTH);                                                               \
+    EXPECT_FALSE(gw_->subscriptionAwaitsEgressForTest(44)) << "the cached publication forwards at once";             \
+    worker().doWork(1);                                                                                                \
+    ASSERT_EQ(worker().subscriptionsForTest().size(), 2u);                                                             \
+    EXPECT_NE(worker().subscriptionsForTest()[0].egressPub, nullptr);                                                  \
+    EXPECT_EQ(worker().subscriptionsForTest()[0].egressPub, worker().subscriptionsForTest()[1].egressPub);             \
+    EXPECT_EQ(gw_->subscribesWithoutRecordEgressForTest(), 0u);                                                        \
+    EXPECT_EQ(errorOn(79), -1)
+
+TEST_F(LegacyRecordEgressConnectRegression, AReachableDeclaredChannelStillGetsItsOwnRecordEgressRegression) {
+    RUNE_REACHABLE_BODY(true);
+}
+
+TEST_F(LegacyRecordEgressConnectRegression, AReachableDeclaredChannelWithoutAuthStillGetsItsOwnRecordEgressRegression) {
+    RUNE_REACHABLE_BODY(false);
+}
+
+TEST_F(LegacyRecordEgressConnectRegression, ASessionClosedWhileItsRecordEgressIsUnconnectedLeaksNothingRegression) {
+    setup(/*auth=*/true);
+    const std::size_t before = gw_->pendingConnectCount();
+    const int64_t sid = session(kUnreachable);
+    subscribe(sid, 45, 0, /*corr=*/81, /*okOwed=*/true);
+    const int64_t regId = gw_->recordEgressRegIdForTest(sid, 0);
+    ASSERT_GE(regId, 0);
+    ASSERT_TRUE(settle([&] { return resolvedOrForwarded(sid, 45); })) << "the registration never resolved";
+    ASSERT_TRUE(gw_->pendingRecordEgressResolvedForTest(sid, 0));
+
+    gw_->closeSessionForTest(sid);
+    gw_->pumpRetryQueuesForTest();
+    worker().doWork(1);
+    EXPECT_EQ(gw_->pendingRecordEgressCountForTest(), 0u);
+    EXPECT_EQ(gw_->subscriptionCount(), 0u);
+    EXPECT_TRUE(worker().subscriptionsForTest().empty()) << "nothing forwarded for a closed session";
+    EXPECT_EQ(gw_->retiringRecordEgressCountForTest(), 0u)
+        << "the publication never went to a worker: nothing to retire";
+    EXPECT_EQ(gw_->recordEgressNeverConnected(), 0u) << "a close is not a connect failure";
+    expectReleased(regId, before);
+}
+
+TEST_F(LegacyRecordEgressConnectRegression, TwoSubscribesParkedOnOneUnconnectedEgressAreReleasedTogetherRegression) {
+    setup(/*auth=*/false, /*partitions=*/2);
+    const std::size_t before = gw_->pendingConnectCount();
+    const int64_t sid = session(kUnreachable);
+    subscribe(sid, 51, 0, /*corr=*/82, /*okOwed=*/false);
+    subscribe(sid, 52, 1, /*corr=*/83, /*okOwed=*/false);
+    const int64_t regId = gw_->recordEgressRegIdForTest(sid, 0);
+    ASSERT_EQ(gw_->pendingRecordEgressCountForTest(), 1u) << "one pending publication per (session, worker)";
+    ASSERT_EQ(gw_->pendingEgressWaitersForTest(), 2);
+    ASSERT_TRUE(settle([&] { return resolvedOrForwarded(sid, 51); })) << "the registration never resolved";
+    ASSERT_TRUE(gw_->pendingRecordEgressResolvedForTest(sid, 0));
+    EXPECT_TRUE(gw_->subscriptionAwaitsEgressForTest(51));
+    EXPECT_TRUE(gw_->subscriptionAwaitsEgressForTest(52));
+
+    cycle(t0_ + kPastResolveTimeoutNs);   // both leave the one waiter list in this one poll
+    EXPECT_FALSE(gw_->subscriptionAwaitsEgressForTest(51));
+    EXPECT_FALSE(gw_->subscriptionAwaitsEgressForTest(52));
+    gw_->pumpRetryQueuesForTest();
+    worker().doWork(1);
+    ASSERT_EQ(worker().subscriptionsForTest().size(), 2u);
+    EXPECT_EQ(worker().subscriptionsForTest()[0].subscriptionId, 51) << "in order";
+    EXPECT_EQ(worker().subscriptionsForTest()[1].subscriptionId, 52);
+    EXPECT_EQ(gw_->recordEgressNeverConnected(), 1u) << "one publication, one count";
+    expectReleased(regId, before);
 }
 } // namespace
 } // namespace rune::gateway

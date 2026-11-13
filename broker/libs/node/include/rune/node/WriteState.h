@@ -41,7 +41,8 @@ inline constexpr uint32_t kNoKeyOffset = 0xFFFFFFFF;
 /// bit2 autoIncrement], then, with autoIncrement only, [partitioner u8][autoIncrementMax u64][autoIncrementReserve u32]
 /// [partitionCount i32] (26 bytes in all); or, with bit3 (lease; never with autoIncrement), the 39-byte LeaseSpec block
 /// (rune::protocol::encodeLeaseSpec) at byte 9, then [leaseViewTopicId i32] at byte 48 (52 bytes in all).  Bit 4 (leaseTransient: the lease
-/// topic's catalog persistence is Transient) is legal ONLY with bit 3; the length is unchanged.  Bits 5-7 are refused.
+/// topic's catalog persistence is Transient) is legal ONLY with bit 3; the length is unchanged.  Bit 5 (retire floor, #419) appends a
+/// trailing [retiredBelow u16] (the schema retire floor, >= 2) to any of the three forms: 2 bytes longer.  Bits 6-7 are refused.
 struct TopicWriteSpecWire {
     int32_t              topicId        = -1;
     uint16_t             keyFieldId     = kNoKeyField;   ///< the key field's durable tag; kNoKeyField = a keyless topic
@@ -57,14 +58,19 @@ struct TopicWriteSpecWire {
     std::optional<rune::protocol::LeaseSpec> lease;      ///< a lease topic's spec; rides the wire as flags bit 3 + 39 bytes
     bool                 leaseTransient = false;         ///< a lease topic whose catalog persistence is Transient; flags bit 4, legal only with bit 3
     int32_t              leaseViewTopicId = -1;          ///< a lease topic: the sink topic id of its lease view (`<topic>.leases`), from the catalog; rides after the LeaseSpec block
+    uint16_t             retiredBelow   = 1;             ///< the schema retire floor (1 = nothing retired); flags bit 5 + a trailing u16 when above 1
     bool operator==(const TopicWriteSpecWire&) const = default;
 };
 inline constexpr std::size_t kTopicWriteSpecWireLen = 9;
 inline constexpr std::size_t kTopicWriteSpecAutoIncWireLen = 26;
 inline constexpr std::size_t kTopicWriteSpecLeaseWireLen = 9 + rune::protocol::kLeaseSpecBytes + 4;   // 52
+inline constexpr std::size_t kTopicWriteSpecRetireWireLen = 2;   ///< the trailing retire floor (flags bit 5)
+/// The longest write spec frame: the widest base form plus the retire floor.
+inline constexpr std::size_t kTopicWriteSpecMaxWireLen = kTopicWriteSpecLeaseWireLen + kTopicWriteSpecRetireWireLen;
 
 [[nodiscard]] constexpr std::size_t topicWriteSpecWireLen(const TopicWriteSpecWire& w) noexcept {
-    return w.lease ? kTopicWriteSpecLeaseWireLen : w.autoIncrement ? kTopicWriteSpecAutoIncWireLen : kTopicWriteSpecWireLen;
+    return (w.lease ? kTopicWriteSpecLeaseWireLen : w.autoIncrement ? kTopicWriteSpecAutoIncWireLen : kTopicWriteSpecWireLen) +
+           (w.retiredBelow > 1 ? kTopicWriteSpecRetireWireLen : 0);
 }
 
 /// Writes topicWriteSpecWireLen(w) bytes; 0 when `out` is too small.
@@ -76,7 +82,8 @@ inline std::size_t encodeTopicWriteSpec(const TopicWriteSpecWire& w, std::span<u
     std::memcpy(out.data() + 4, &w.keyFieldId, 2);
     out[6] = static_cast<uint8_t>(w.keyType);
     out[7] = w.keyWidth;
-    out[8] = static_cast<uint8_t>((w.legacyValidate ? 1 : 0) | (w.keyIndex ? 2 : 0) | (w.autoIncrement ? 4 : 0) | (w.lease ? 8 : 0) | (w.leaseTransient ? 0x10 : 0));
+    out[8] = static_cast<uint8_t>((w.legacyValidate ? 1 : 0) | (w.keyIndex ? 2 : 0) | (w.autoIncrement ? 4 : 0) | (w.lease ? 8 : 0) | (w.leaseTransient ? 0x10 : 0) | (w.retiredBelow > 1 ? 0x20 : 0));
+    if (w.retiredBelow > 1) std::memcpy(out.data() + len - kTopicWriteSpecRetireWireLen, &w.retiredBelow, 2);
     if (w.lease) {
         rune::protocol::encodeLeaseSpec(*w.lease, out.data() + 9);
         std::memcpy(out.data() + 9 + rune::protocol::kLeaseSpecBytes, &w.leaseViewTopicId, 4);
@@ -91,13 +98,15 @@ inline std::size_t encodeTopicWriteSpec(const TopicWriteSpecWire& w, std::span<u
 }
 
 [[nodiscard]] inline std::optional<TopicWriteSpecWire> decodeTopicWriteSpec(std::span<const uint8_t> in) noexcept {
-    if (in.size() != kTopicWriteSpecWireLen && in.size() != kTopicWriteSpecAutoIncWireLen &&
-        in.size() != kTopicWriteSpecLeaseWireLen)
+    if (in.size() < kTopicWriteSpecWireLen) return std::nullopt;
+    const bool hasRetire = (in[8] & 0x20) != 0;
+    const std::size_t baseLen = in.size() - (hasRetire ? kTopicWriteSpecRetireWireLen : 0);
+    if (baseLen != kTopicWriteSpecWireLen && baseLen != kTopicWriteSpecAutoIncWireLen && baseLen != kTopicWriteSpecLeaseWireLen)
         return std::nullopt;
     const bool autoInc  = (in[8] & 4) != 0;
     const bool hasLease = (in[8] & 8) != 0;
-    if ((in[8] & 0xE0) != 0 || ((in[8] & 0x10) != 0 && !hasLease) || (autoInc && hasLease) || autoInc != (in.size() == kTopicWriteSpecAutoIncWireLen) ||
-        hasLease != (in.size() == kTopicWriteSpecLeaseWireLen))
+    if ((in[8] & 0xC0) != 0 || ((in[8] & 0x10) != 0 && !hasLease) || (autoInc && hasLease) || autoInc != (baseLen == kTopicWriteSpecAutoIncWireLen) ||
+        hasLease != (baseLen == kTopicWriteSpecLeaseWireLen))
         return std::nullopt;
     TopicWriteSpecWire w;
     std::memcpy(&w.topicId, in.data(), 4);
@@ -107,6 +116,10 @@ inline std::size_t encodeTopicWriteSpec(const TopicWriteSpecWire& w, std::span<u
     w.legacyValidate = (in[8] & 1) != 0;
     w.keyIndex       = (in[8] & 2) != 0;
     w.leaseTransient = (in[8] & 0x10) != 0;
+    if (hasRetire) {
+        std::memcpy(&w.retiredBelow, in.data() + baseLen, 2);
+        if (w.retiredBelow < 2) return std::nullopt;   // bit 5 means a floor above 1
+    }
     if (hasLease) {
         rune::protocol::LeaseSpec spec{};
         if (!rune::protocol::decodeLeaseSpec(in.data() + 9, rune::protocol::kLeaseSpecBytes, spec)) return std::nullopt;
@@ -132,6 +145,7 @@ inline std::size_t encodeTopicWriteSpec(const TopicWriteSpecWire& w, std::span<u
     w.topicId        = t.topicId;
     w.legacyValidate = t.schema->validate;
     w.keyIndex       = t.schema->keyFeatures.keyIndex;
+    w.retiredBelow   = t.schema->retiredBelow;
     w.lease          = t.lease;
     w.leaseTransient = t.lease.has_value() && t.persistence == rune::catalog::Persistence::Transient;
     if (t.lease) w.leaseViewTopicId = leaseViewTopicId;
@@ -177,6 +191,9 @@ struct SpecVersion {
     rune::codec::Descriptor descriptor;
     uint32_t                keyValueOffset = kNoKeyOffset;   ///< record byte offset of the key field's value (4 + its block offset)
     uint32_t                installSeq = 0;   ///< TopicWriteSpec::installSeq_ at this install (never 0, never reused): the lease cover cache's key
+    /// Records accepted at this version since this process started (#419; worker-owned, bumped on the accepted produce path by
+    /// CheckedWriteHook::onAppended through a const spec).  Read by GetStats.
+    mutable uint64_t        producedRecords = 0;
 };
 
 class TopicWriteSpec {
@@ -204,9 +221,23 @@ public:
     /// The topic's evolving descriptor (every field ever declared), from the FilterSchema op; the key index decodes each writer version through it.
     std::optional<rune::codec::Descriptor> evolving;
 
+    /// The lookup of every NON-produce path (the lease writer and replay, the key index, follower apply, the tests): a version
+    /// below the retire floor is served as ever, because stored records of a retired version stay readable (#419).
     [[nodiscard]] const SpecVersion* versionFor(uint16_t version) const noexcept {
         return version < versions_.size() ? versions_[version].get() : nullptr;
     }
+    /// The lookup of the PRODUCE admission ONLY (checkTypedRecord): nullptr for a version below the retire floor, for one that is
+    /// not installed and for one above the highest installed.  One unsigned compare, as versionFor has: `version - retiredBelow_`
+    /// wraps for a version below the floor, so it is out of the span too.  produceSpan_ = versions_.size() - retiredBelow_ (0 when
+    /// the floor is at or past the size); both move only in installVersion and setFacts.
+    [[nodiscard]] const SpecVersion* produceVersionFor(uint16_t version) const noexcept {
+        const uint16_t i = static_cast<uint16_t>(version - retiredBelow_);
+        return i < produceSpan_ ? versions_[version].get() : nullptr;
+    }
+    /// The schema retire floor: versions below it are refused at produce (1 = nothing retired).
+    [[nodiscard]] uint16_t retiredBelow() const noexcept { return retiredBelow_; }
+    /// A write spec that named a floor below the one held was ignored this many times (the floor only moves forward).
+    [[nodiscard]] uint32_t lowerFloorsIgnored() const noexcept { return lowerFloorsIgnored_; }
     [[nodiscard]] const rune::codec::Validator* validatorFor(uint16_t version) const noexcept {
         const SpecVersion* sv = versionFor(version);
         return sv != nullptr ? &sv->validator : nullptr;
@@ -216,6 +247,8 @@ public:
         return sv != nullptr ? &sv->descriptor : nullptr;
     }
     [[nodiscard]] uint16_t maxVersion() const noexcept { return maxVersion_; }
+    /// One past the highest version slot (installed or not): iterate 1..versionSlots() with versionFor.
+    [[nodiscard]] std::size_t versionSlots() const noexcept { return versions_.size(); }
     [[nodiscard]] bool hasFacts() const noexcept { return hasFacts_; }
 
     /// Cold.  Installs (or replaces) one schema version's validator and descriptor.
@@ -231,7 +264,10 @@ public:
         // A lease index has one row column per field id of leaseLayoutSource(): a version holding an id the merged source lacks
         // makes its layout stale.  This is the single bump for SchemaUpdate (FilterSchema bumps through the same test).
         if (lease && layoutLacks(materialized)) ++leaseLayoutGen;
-        if (versions_.size() <= version) versions_.resize(static_cast<std::size_t>(version) + 1);
+        if (versions_.size() <= version) {
+            versions_.resize(static_cast<std::size_t>(version) + 1);
+            updateProduceSpan_();
+        }
         auto sv = std::make_unique<SpecVersion>(SpecVersion{rune::codec::Validator(materialized), std::move(materialized), kNoKeyOffset, ++installSeq_});
         setKeyOffset_(*sv);
         versions_[version] = std::move(sv);
@@ -294,6 +330,12 @@ public:
         partitionCount = w.partitionCount;
         lease          = w.lease;
         leaseTransient = w.leaseTransient && w.lease.has_value();
+        if (w.retiredBelow > retiredBelow_) {   // the floor only moves forward
+            retiredBelow_ = w.retiredBelow;
+            updateProduceSpan_();
+        } else if (w.retiredBelow < retiredBelow_) {
+            ++lowerFloorsIgnored_;
+        }
         hasFacts_      = true;
         uint32_t erased = 0;
         for (auto& sv : versions_) {
@@ -305,6 +347,9 @@ public:
     }
 
 private:
+    void updateProduceSpan_() noexcept {
+        produceSpan_ = versions_.size() > retiredBelow_ ? static_cast<uint16_t>(versions_.size() - retiredBelow_) : uint16_t{0};
+    }
     void markRefused_(uint16_t version, bool refused) {
         if (!refused && version >= refused_.size()) return;
         if (refused_.size() <= version) refused_.resize(static_cast<std::size_t>(version) + 1, 0);
@@ -320,6 +365,9 @@ private:
     std::vector<std::unique_ptr<SpecVersion>> versions_;   // index = schema version; grown only by installVersion
     std::vector<uint8_t> refused_;   // index = schema version; 1 = installVersion / setFacts refused it (cold-grown)
     uint16_t maxVersion_ = 0;
+    uint16_t retiredBelow_ = 1;      // the schema retire floor (never lowered)
+    uint16_t produceSpan_  = 0;      // versions_.size() - retiredBelow_ (0 when the floor is at or past the size)
+    uint32_t lowerFloorsIgnored_ = 0;
     uint32_t installSeq_ = 0;   // bumped by every successful installVersion (a replaced version gets a new number)
     bool     hasFacts_   = false;
 };
@@ -366,7 +414,10 @@ struct DeferredTxn {
     int64_t     holdFrom = INT64_MAX;   ///< below firstOffset: an applied ordinary span holds it (the coverage never splits that span)
 };
 /// `judgeOffset`: the J the vote waits for; -1 while the worker's vote-time scan runs (only the worker answers those).
-struct ParkedVote { int64_t token = 0; int32_t originNode = -1; int64_t producerId = -1; int16_t epoch = -1; int64_t judgeOffset = -1; int64_t receivedNs = 0; int64_t first = -1; };
+/// `waitPid` / `waitEpoch` (#995): the holder of the last interim sent for this vote (waitPid -1 = none sent, or the judge is no
+/// longer paused on a known holder): a pause sends one interim per vote and holder, never one per pass.
+struct ParkedVote { int64_t token = 0; int32_t originNode = -1; int64_t producerId = -1; int16_t epoch = -1; int64_t judgeOffset = -1; int64_t receivedNs = 0; int64_t first = -1;
+                    int64_t waitPid = -1; int16_t waitEpoch = 0; };
 
 /// The transactions of one source between their TxnJudge record and their marker, in judge-offset order.  Everything is reserved
 /// by reserve(); no call allocates after it.  A full table refuses the record (nullptr): the judge waits there, never a verdict.
@@ -534,6 +585,25 @@ public:
         parked_.resize(kept);
         return n;
     }
+    /// #995: the judge is paused on (holderPid, holderEpoch) (holderPid -1: on no known holder).  fn(const ParkedVote&) is asked, once per
+    /// vote and holder, to send the interim; it returns whether it did (a refused one is asked again).  A vote of the holder's own
+    /// producer is never told (its own previous transaction's rows).  Returns the interims sent.
+    template <class Fn>
+    int noteJudgeWait(int64_t holderPid, int16_t holderEpoch, Fn&& fn) noexcept {
+        int n = 0;
+        for (ParkedVote& v : parked_) {
+            if (holderPid < 0 || v.producerId == holderPid) {
+                v.waitPid = -1;
+                continue;
+            }
+            if (v.waitPid == holderPid && v.waitEpoch == holderEpoch) continue;
+            if (!fn(static_cast<const ParkedVote&>(v))) continue;
+            v.waitPid   = holderPid;
+            v.waitEpoch = holderEpoch;
+            ++n;
+        }
+        return n;
+    }
     /// fn(const ParkedVote&) for the scanning votes (J -1) of the producer's transaction from `first`, which leave the park; `bindTo` >= 0 binds them to that J instead.
     template <class Fn>
     int takeScanning(int64_t producerId, int64_t first, int64_t bindTo, Fn&& fn) noexcept {
@@ -644,7 +714,8 @@ struct PartitionWriteState {
     }
 };
 
-enum class TypedCheck : uint8_t { Accept, Reject, VersionAhead };
+/// VersionRetired: the record's version is below the topic's retire floor (#419); definite, never retriable.
+enum class TypedCheck : uint8_t { Accept, Reject, VersionAhead, VersionRetired };
 
 namespace detail {
 [[nodiscard]] inline uint16_t le16(const char* p) noexcept {
@@ -656,7 +727,8 @@ namespace detail {
 /// validates fully (UTF-8, wire key = key field); below it only a topic created with `validate` checks, as before.
 /// A tombstone (empty or null value) is never decoded: its key must be the key field's width.  A record of a version
 /// above the highest installed one is VersionAhead (retriable: the version's SchemaUpdate has not landed here yet)
-/// when the fixed block its header declares fits in the value; otherwise Reject.
+/// when the fixed block its header declares fits in the value; otherwise Reject.  A version below the retire floor is
+/// VersionRetired (version 0 never existed: Reject; a tombstone carries no version and is never refused for one).
 [[nodiscard]] inline TypedCheck checkTypedRecord(const TopicWriteSpec& spec, const rune::protocol::RecordSpan& r, int16_t level) noexcept {
     const bool checked = level >= rune::replication::MetadataFeature::kCheckedWrites;
     if (!checked && !spec.legacyValidate) return TypedCheck::Accept;
@@ -667,8 +739,10 @@ namespace detail {
     }
     if (r.value.size() < 4) return TypedCheck::Reject;
     const uint16_t v = detail::le16(r.value.data() + 2);
-    const SpecVersion* sv = spec.versionFor(v);
+    const SpecVersion* sv = spec.produceVersionFor(v);   // the produce admission: the one lookup that honours the retire floor
     if (sv == nullptr) {
+        // Version 0 never existed (versions start at 1): it stays a Reject, not a retired version.
+        if (v != 0 && v < spec.retiredBelow()) return TypedCheck::VersionRetired;   // before the VersionAhead / refused-version classification
         if (v <= spec.maxVersion()) return TypedCheck::Reject;
         // #868: a version not installed here yet is retriable only when the header can be a record at all (the fixed
         // block it declares fits in the value); text or other garbage is refused for good, not retried to the timeout.

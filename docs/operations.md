@@ -36,7 +36,10 @@ Container requirements: `--shm-size=256m` (the default 64 MB is too small), the 
 low-latency mode: the Docker bridge adds about 35 µs at p50, and published ports make p99 about 10x worse; Linux only in
 practice; on a bridge, publish the client port and the node's shard block `8200 + 192n` to `8200 + 192n + 191`; the derived response-control ports sit inside that block), and a
 file-descriptor hard limit that covers the partitions (the broker raises its soft limit to the hard limit and refuses to start when the hard
-limit is below the estimated need; see SELF-HOSTING, "Open-file limit").
+limit is below the estimated need; see SELF-HOSTING, "Open-file limit"). DDL admission uses the smallest soft limit
+advertised by any broker this broker has heard from since it started; a broker that is down keeps its last value, and a
+broker never heard from is not counted and refuses at its own start when its limit is too low. Set the same
+`LimitNOFILE` on every broker.
 
 Firewall: allow inbound UDP on the client port, each worker's ingress port and the response-control ports (gateway and
 workers) from clients. The per-worker egress control ports are needed only when authentication is off.
@@ -118,6 +121,11 @@ Two fixed costs set the resident floor of a node, before any topic or view:
 - **Failover.** Killing a leader triggers re-election among the survivors. An acked `acks=all` produce answered
   `NotLeader` or `Internal`, or not at all, is *in doubt*; the client retries it with the same producer id, epoch and
   sequence and the broker deduplicates.
+- **Durability of acked records.** What an acknowledged produce survives depends on the producer's ack level: with
+  `Acks::Leader` (the client default) a record acked by a leader that then fails or restarts before a follower
+  replicated it is lost; `Acks::All` with `RUNE_MIN_ISR` of at least 2 survives the loss of any single broker. The
+  per-level contract is in
+  [Acknowledgement levels and durability](api/client-cpp.md#acknowledgement-levels-and-durability).
 - **View reads after a failover.** A view row is served only by the leader of its source partition, and only while that
   broker holds a read lease from the controller (renewed every 20 ms, about 120 ms long). A leader cut off from the
   controller stops serving view rows once its lease runs out, before any other broker can take its partitions, and answers
@@ -153,6 +161,12 @@ rune namespace delete a --broker rune-1:40200 --user admin --password-file admin
 - **Foreign objects answer exactly like missing ones**: same error code and message, so a name in another namespace is
   never revealed. A namespace admin sees only its own namespace in `rune namespace list`.
 - **Anonymous read is off by default.** Only a cluster admin turns it on, and only for `default`.
+- A broker coordinates at most `RUNE_GROUP_MAX_GROUPS` groups, and one authenticated principal may have created at most
+  `RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL` of them (default half the cap; [configuration](configuration.md#consumer-groups)).
+  A join that would create a group past either is answered `Throttled (53)`: the C++ client (version 14 and newer)
+  re-joins with a paced, bounded backoff, an older client gets the old refusal code and fails. The share is charged to
+  the creating principal until the group empties, and a broker with authentication off has no share. Watch for repeated
+  refusals in the log (`refused - this broker coordinates its maximum` / `already created its share`).
 - Consumer groups and transactions work in every namespace: the same group id or transactional id in two namespaces
   is two groups or two producers, with independent offsets, membership and fencing.
 - The data lives under `<data>/ns-<nsId>/topics/<name>/`. A cluster with namespaces is a new cluster; there is no
@@ -280,6 +294,9 @@ sampling the file; the broker keeps no history.
 | 1000243 | `rune-peer-hello-shed` | counter | control | Peer-link Hello / HelloV2 frames dropped because the sending peer had used its one crypto-costing Hello answer for this duty cycle (a flood, or a legitimate initiator retrying in the same cycle as a forged one). A sustained rise means an off-path Hello flood; the real initiator re-sends every 200 ms and still links. |
 | 1000270 | `rune-log-damaged-segments` | gauge | control | Sealed log segments found damaged at boot, summed over every log the node serves: bytes after the last whole batch of a segment below the recovery point. They stay on disk and reads that reach them fail (see Damaged log segments). Set once at start; damage that readers reach later is counted by `rune-log-damaged-reads`. |
 | 1000271 | `rune-log-damaged-reads` | counter | control | Subscription reads that reached a damaged or unreadable stored batch since the node started. Each one fails its subscription with `StorageError`. A value above 0 means clients are reading into damage found at boot or later. |
+| 1000272 | `rune-log-segment-repairs` | counter | control | Damaged sealed segments rebuilt from an in-sync peer since the node started, summed over the node's workers (see Damaged log segments). |
+| 1000273 | `rune-log-segment-repair-failures` | counter | control | Segment repair attempts that failed: the peer's batches failed validation, a request timed out, or the repair could not begin or commit. The replica tries the next peer or backs off, so a nonzero value is not by itself a problem; a value that keeps rising with `rune-log-segment-repairs` flat is. |
+| 1000274 | `rune-log-segment-repair-no-peer` | counter | control | Damaged sealed segments no peer could repair: replication factor 1, no known leader or in-sync follower, or every copy refused or failed. Counted once per segment; the segment stays damaged and needs an operator. |
 
 Per-namespace metrics (one series per namespace on this node, allocated when the namespace is created and freed when it is
 erased; the key is the namespace id and the slot's owner tag is the namespace id too):
@@ -384,8 +401,28 @@ segment as it is. A sealed segment whose bytes after the last whole, CRC-valid b
   or subscription that reaches it gets `StorageError (26)` ("the stored batch is corrupt (damaged log segment)") and the client
   fails that subscription with `CorruptBatch`; records before the damage and in later segments are served.
 - **Replication.** A leader asked to fetch the damaged range answers `kErrCorruptRecord` (-12). The follower stops at its log end
-  and leaves the in-sync set; nothing is repaired automatically.
-- **Cleaner.** The log cleaner refuses a log that has a damaged segment until an operator acts.
+  and leaves the in-sync set. While stopped it sends nothing except one fetch at its log end per second: once the leader has
+  repaired its copy (below) that fetch is answered with data, and the follower catches up and rejoins the in-sync set within a
+  second of the repair, with no restart. A batch that is too large for one replication frame is a different stop and is not
+  retried.
+- **Automatic repair.** A replica whose partition has a damaged sealed segment rebuilds it from a peer that holds the range
+  intact, while it keeps its log length, its place in the in-sync set and its leadership. A follower asks the leader; a
+  leader asks its in-sync followers in id order. The replica copies the valid prefix of the segment into a side file, fetches
+  the batches it lacks, checks every one (CRC, offset range, leader epoch) and swaps the file in with the same crash-safe
+  swap the cleaner uses (a crash leaves either the damaged segment or the repaired one). A peer serves only committed bytes
+  from segments that are not damaged in the range, so a segment is repaired only once its end is at or below the replica's
+  high watermark. The counters `rune-log-segment-repairs` (completed), `rune-log-segment-repair-failures` (attempts that
+  failed validation, timed out or could not commit) and `rune-log-segment-repair-no-peer` (a damaged segment no peer could
+  serve) show it; the log lines `damaged segment <base> repaired from peer <n>` and, at critical level, `cannot be repaired
+  from a peer` name the segment. Reads over the repaired range succeed at once; a subscription that already failed with
+  `CorruptBatch` stays failed and its client re-subscribes. A compacted topic is compacted again after the repair,
+  without a restart: the repair swaps in a new segment file and the cleaner agent notices that the damaged file is gone.
+- **What still needs an operator.** A topic of replication factor 1; a segment every copy of which is damaged; a system log
+  (below), which stops the node at boot and is restored by wiping that node and letting it resync; and a range above the high
+  watermark. For these the segment stays damaged exactly as before: `rune-log-segment-repair-no-peer` rises once per segment
+  and the critical line is logged once.
+- **Cleaner.** The log cleaner skips a log that has a damaged segment until that segment file is replaced (a repair, or
+  the cleaner or retention removing it) or the broker restarts.
 - **Retention.** Retention deletes the damaged segment whole, once it ages out. The size accounting counts only its valid prefix.
 - **System logs refuse to start.** Damage in `__catalog`, `__security`, `__consumer_offsets`, `__transaction_state` or
   `__cluster_metadata` stops the node at boot: it logs `system log <dir> has a damaged segment at offset <o> - refusing to
@@ -482,8 +519,14 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
     abort marker then finalizes the result in one step. Counters are ids 11 to 20 of `rune stats topic <t>`: `txnVotesYes`,
     `txnVotesNo`, one counter each for 55, 56, 57 and 62 (`TxnConflict` no votes count only in `txnVotesNo`), `txnVoteLatencyNsMax` and `txnVoteLatencyNsTotal`.
   - **Lock pause.** While a transaction holds a row locked, the verdicts of other writers' records that touch the row wait for its
-    marker; the time is `foldPausedOnTxnLockNs`. A distributed lock wait ends at the transaction timeout at the latest, when the
-    coordinator aborts the transaction. A judgement never waits for another transaction's marker to free an overlay: the worker adds
+    marker; the time is `foldPausedOnTxnLockNs`. A distributed lock wait is a cycle when two transactions hold rows on two
+    partitions in opposite order. A partition whose judge is paused on a transaction's rows tells the coordinator which transaction
+    (once per pending vote and holder); the coordinator keeps that as a wait-for edge, and when the edges of its committing
+    transactions form a cycle it aborts the one with the latest start (the larger producer id on a tie) at once. That transaction's
+    commit fails with `TxnConflict` (63), a retriable abort, and the others go on; each one is an info log line on the coordinator
+    ("a cycle of lock waits is resolved"). Waiting behind a lock that is not part of a cycle is a delay, and nobody is aborted. What stays bounded by the
+    transaction timeout: a pause with no single holder (a full overlay pool, a capacity stall), and a wait of a transaction behind
+    its own producer's previous one. A judgement never waits for another transaction's marker to free an overlay: the worker adds
     one when every overlay holds a lock, and drops it again once it is free and the pool has not grown for 10 s.
   - **`txnMarkerWithoutVote`** counts markers that arrived for a transaction nobody asked a vote for. It stays 0; a non-zero
     value is a coordinator bug.
@@ -557,6 +600,9 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
 
 ## Upgrades
 
+- **Metadata feature level 7 (`kSchemaRetire`)** gates `alter topic .. retire version < N`: the statement is refused
+  (`InvalidRequest`, "needs every broker upgraded") until every broker runs this build, and the catalog then writes
+  `formatVer` 5 events. See [schema evolution](api/codec.md#retiring-old-versions) for when to retire and the stats to check first.
 - Upgrade **brokers before clients**: a new client defining a transient topic against an older broker silently gets a
   disk topic.
 - A client older than version 9 is refused at the connect on an authenticated cluster; a client older than version 8 cannot

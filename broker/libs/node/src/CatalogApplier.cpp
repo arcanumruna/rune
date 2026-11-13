@@ -53,6 +53,7 @@ TopicSchema topicSchemaOf(const cat::TopicObject& t) {
     ts.topicName      = t.name;
     ts.persistence    = persistenceOf(t.persistence);
     ts.nsId           = t.nsId;
+    ts.retiredBelow   = s.retiredBelow;
     return ts;
 }
 
@@ -243,7 +244,10 @@ void CatalogApplier::postBootStash(const CatalogEffects& sink) const {
             if (sink.sinkApplied) sink.sinkApplied(sinkSpecOf(*v, state_));
             if (sink.viewInstalled) sink.viewInstalled(*v);
         }
-        if (sink.applied) sink.applied(lastApplied_.offset, state_.digest());
+        if (sink.applied) sink.applied(lastApplied_.offset, state_.digest(), state_.nextTopicId());
+    } else if (sink.applied) {
+        // An empty catalog still has a frontier (0): every topic id is "not applied here yet" (#988).
+        sink.applied(-1, state_.digest(), state_.nextTopicId());
     }
     if (const Halted* h = std::get_if<Halted>(&st_); h != nullptr && sink.halted) sink.halted(h->error);
 }
@@ -285,7 +289,7 @@ void CatalogApplier::emitFinalState_() {
         if (sink->sinkApplied) sink->sinkApplied(sinkSpecOf(*v, state_));
         if (sink->viewInstalled) sink->viewInstalled(*v);
     }
-    if (sink->applied) sink->applied(lastApplied_.offset, state_.digest());
+    if (sink->applied) sink->applied(lastApplied_.offset, state_.digest(), state_.nextTopicId());
 }
 
 bool CatalogApplier::goLive(LiveEffects live) {
@@ -503,7 +507,7 @@ bool CatalogApplier::applyRecord_(int64_t offset, std::span<const uint8_t> bytes
     if (live && sink != nullptr) {
         effects_(*sink, *ev, *a);
         if (a->nsErased && sink->namespaceErased) sink->namespaceErased(a->nsId);   // last: after the drops' own effects
-        if (sink->applied) sink->applied(offset, state_.digest());
+        if (sink->applied) sink->applied(offset, state_.digest(), state_.nextTopicId());
     }
     return true;
 }
@@ -513,7 +517,8 @@ void CatalogApplier::project_(const cat::CatalogEvent& e, const cat::Applied& a)
     case cat::EventKind::CreateTopic:
     case cat::EventKind::CreateSchema:
     case cat::EventKind::AlterSchema:
-    case cat::EventKind::SetCompatibility: {
+    case cat::EventKind::SetCompatibility:
+    case cat::EventKind::RetireSchemaVersions: {   // #419: the registry entry of the (unchanged) current version takes the new floor
         const cat::TopicObject* t = state_.topicByObjectId(e.objectId);
         if (t != nullptr && t->schema) schemas_->applyRecord(topicSchemaOf(*t));
         return;
@@ -602,6 +607,12 @@ void CatalogApplier::effects_(const CatalogEffects& sink, const cat::CatalogEven
     case cat::EventKind::SetCompatibility:
         if (const cat::TopicObject* t = state_.topicByObjectId(e.objectId); t && t->schema && sink.schemaChanged)
             sink.schemaChanged(*t, t->schema->schemaVersion);   // only the version this event created or changed
+        return;
+    case cat::EventKind::RetireSchemaVersions:
+        // Only the workers' produce admission follows (the write spec carries the floor): no validator re-post, no filter
+        // schema - the descriptors are unchanged and stored old-version records stay readable.
+        if (const cat::TopicObject* t = state_.topicByObjectId(e.objectId); t && t->schema && sink.writeSpecChanged)
+            sink.writeSpecChanged(*t);
         return;
     case cat::EventKind::CreateView:
     case cat::EventKind::AlterView: {

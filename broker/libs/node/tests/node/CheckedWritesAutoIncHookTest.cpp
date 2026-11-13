@@ -220,6 +220,44 @@ TEST(CheckedWritesAutoIncHook, ExplicitInsertWithoutImportIsNotAuthorized) {
     EXPECT_EQ(rig.tlog.log.logEndOffset(), 0);
 }
 
+// Issue #506: while the security view is behind, a missing IMPORT may be a grant that is committed but not applied here:
+// the denial is the retriable AuthUnavailable, never the terminal NotAuthorized.  Same refusal reason either way.
+TEST(CheckedWritesAutoIncRegression, ImportDenialIsRetriableWhileTheViewIsBehindRegression) {
+    {   // deferred: retriable, nothing appended
+        Rig rig;
+        rig.facts.importGranted = false;
+        rig.facts.importDenialDeferred = true;
+        const Outcome o = rig.write(rig.batchOf({Rec{5}}));
+        EXPECT_EQ(o.code, ErrorCode::AuthUnavailable);
+        EXPECT_EQ(o.why, HookRefusal::ImportNotGranted);
+        EXPECT_EQ(rig.tlog.log.logEndOffset(), 0);
+    }
+    {   // not deferred: the verdict
+        Rig rig;
+        rig.facts.importGranted = false;
+        rig.facts.importDenialDeferred = false;
+        const Outcome o = rig.write(rig.batchOf({Rec{5}}));
+        EXPECT_EQ(o.code, ErrorCode::NotAuthorized);
+        EXPECT_EQ(o.why, HookRefusal::ImportNotGranted);
+    }
+    {   // granted: no refusal either way
+        Rig rig;
+        rig.facts.importGranted = true;
+        rig.facts.importDenialDeferred = true;
+        const Outcome o = rig.write(rig.batchOf({Rec{5}}));
+        EXPECT_EQ(o.code, ErrorCode::OK);
+        EXPECT_EQ(o.why, HookRefusal::None);
+    }
+    {   // a batch without an explicit insert: the flag changes nothing
+        Rig rig;
+        rig.facts.importGranted = false;
+        rig.facts.importDenialDeferred = true;
+        const Outcome o = rig.write(rig.creates(2));
+        EXPECT_EQ(o.code, ErrorCode::OK);
+        EXPECT_EQ(o.why, HookRefusal::None);
+    }
+}
+
 TEST(CheckedWritesAutoIncHook, ImportAboveTheReservationAppendsItFirst) {
     Rig rig;
     rig.state.autoInc = AutoIncState{};

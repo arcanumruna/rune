@@ -469,6 +469,8 @@ GroupVerdict classifyGroupAnswer_(rpc::ErrorCode ec) noexcept {
     // Namespaces Phase 2: a suspended namespace / a limit is an admin's act too.
     case rpc::ErrorCode::NamespaceSuspended:
     case rpc::ErrorCode::NamespaceLimitExceeded: return GroupVerdict::Refuse;    // re-sending fails the same way
+    // #617: the group cap; room comes back when a group empties
+    case rpc::ErrorCode::Throttled:           return GroupVerdict::Backoff;
     default:                                  return GroupVerdict::Backoff;   // Internal, NotLeader, unknown, ...
     }
 }

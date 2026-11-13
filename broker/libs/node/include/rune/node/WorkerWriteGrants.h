@@ -14,12 +14,13 @@
 //   (a Table / Patch item whose op `topicId` is kPermBitmapImport carries the IMPORT bitmap of the table instead of the
 //   WRITE one; a table without such an item denies IMPORT everywhere)
 //   kPermFlagBind   session `sessionId` now uses table `nextOffset` (-1 = deny everything, -2 = its namespace is
-//                   suspended ReadOnly: deny everything, answered NamespaceSuspended); correlationId = epoch,
+//                   suspended ReadOnly: deny everything, answered NamespaceSuspended, -3 = it must change its password
+//                   first: deny everything, answered PasswordChangeRequired); correlationId = epoch,
 //                   producerId = the principal (#122);
 //   kPermFlagDrop   table `sessionId` is freed: every slot still pointing at it is reset to deny, its bits cleared.
 //   kPermFlagFence / kPermFlagSecurityBehind: no table (see below).
-// A session announced without grantAll starts denied: every produce from it is answered NotAuthorized until its bind
-// arrives (default deny).
+// A session announced without grantAll starts UNBOUND (#216): it never authenticated, so a produce from it is answered
+// AuthenticationFailed (and the session ended) until its bind arrives (default deny).
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -42,10 +43,23 @@ struct WritePermTable {
 /// suspended ReadOnly - so the worker's cold refusal answers NamespaceSuspended instead of NotAuthorized.
 [[nodiscard]] inline const WritePermTable* suspendedWriteTable() noexcept { static const WritePermTable t{}; return &t; }
 
+/// #216: the state of a session that was announced and never bound (AwaitingFirst / AwaitingFinal at the gateway - they
+/// ship no bind): denies like denyWriteTable(), but its address says WHY, so the worker answers AuthenticationFailed
+/// (44) and asks for the session's end, as the gateway does (D13), instead of the terminal NotAuthorized.  The
+/// default of a slot.
+[[nodiscard]] inline const WritePermTable* unboundWriteTable() noexcept { static const WritePermTable t{}; return &t; }
+/// #216: the session authenticated with a one-time password and must change it first (bind -3): denies, answered
+/// PasswordChangeRequired (47) like the gateway's gate, the session kept.
+[[nodiscard]] inline const WritePermTable* passwordChangeWriteTable() noexcept {
+    static const WritePermTable t{};
+    return &t;
+}
+
 struct WriteGrantSlot {
-    const WritePermTable* table    = denyWriteTable();   ///< never null
+    const WritePermTable* table    = unboundWriteTable();   ///< never null
     uint32_t              ownerTag = 0;   ///< issue #122: pidOwnerTag(the session's principal)
     uint64_t              epoch    = 0;   ///< the bind epoch this slot holds
+    bool                  unauthSignalled = false;   ///< #216: the one Unauthenticated signal of this state was sent
 };
 
 /// The hot-path check.
@@ -89,6 +103,17 @@ inline constexpr uint8_t kSecurityLagDeferDenials = 2;
 /// SESSION_PERMISSIONS `topicId` of a Table / Patch item: which bitmap of the table it carries.
 inline constexpr int32_t kPermBitmapWrite  = 0;
 inline constexpr int32_t kPermBitmapImport = 1;
+/// #500: `topicId` of a kPermFlagSecurityBehind item that carries the broker's applied topic FRONTIER (the catalog's
+/// nextTopicId, in `nextOffset`) instead of a lag level.  The lag-level item carries kPermBitmapWrite (0) here, so the
+/// two never alias.  A worker answers a produce it would deny for a topic id at or above the frontier NotLeader (not
+/// applied here yet), never the terminal NotAuthorized.
+inline constexpr int32_t kPermLagTopicFrontier = 2;
+/// A kPermFlagSecurityBehind item whose `topicId` is kPermLagReset is a RESET: the control thread's shipper queue
+/// overflowed for this worker (it was a whole queue behind and skipped items), so everything it knows about tables and
+/// bindings may be stale.  The worker drops every table, denies every session, discards a half-staged table and refuses
+/// every produce (retriable AuthUnavailable) until the snapshot that follows ends with a lag level.  Distinct from the
+/// lag-level item (kPermBitmapWrite) and the frontier item (kPermLagTopicFrontier).
+inline constexpr int32_t kPermLagReset = 3;
 /// The worker's table store bound (== gateway PermissionPool::kMaxTables).
 inline constexpr std::size_t kMaxWritePermTables = 4096;
 
@@ -146,6 +171,11 @@ public:
         state_ = NoUpdate{};
         if (!ok) { reason_ = "table id beyond the store"; ++dropped_; return PermApply::Violation; }
         return PermApply::Applied;
+    }
+    /// #442: forget a half-staged table (a reset: the chunks that follow belong to a snapshot, never to it).
+    void discard() noexcept {
+        if (auto* st = std::get_if<Staging>(&state_)) spare_ = std::move(st->words);
+        state_ = NoUpdate{};
     }
     /// Why the last Violation was returned (a static string; meaningful only after a Violation).
     [[nodiscard]] const char* violationReason() const noexcept { return reason_; }

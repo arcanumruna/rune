@@ -12,6 +12,7 @@
 // leader via counters (not logs)?" — it exercises exactly the publish path
 // (BrokerNode) and the read path (MetricsReader) that rune_role uses.
 // ---------------------------------------------------------------------------
+#include <limits>
 #include <rune/aeronutil/testing/FreePort.h>
 #include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
@@ -207,7 +208,7 @@ TEST(RoleCounterPublishTest, CatalogApplyMetricsReadableFromMetricsFileRegressio
     ASSERT_NE(agent, nullptr);
     node.onAdminThreadForTest([agent] {
         const LiveEffects live = agent->catalogLiveEffects();
-        live.sink.applied(5, 0xABCD);
+        live.sink.applied(5, 0xABCD, std::numeric_limits<int32_t>::max());
         return 0;
     });
     EXPECT_TRUE(await(5, 0)) << "applied=" << applied << " halted=" << halted;

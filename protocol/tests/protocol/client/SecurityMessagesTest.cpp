@@ -111,12 +111,15 @@ TEST(SecurityMessagesRegression, BootstrapRoundTripsAndMacInputIsStable) {
     ASSERT_TRUE(d);
     EXPECT_EQ(d->adminName, "admin"); EXPECT_EQ(d->verifier, b.verifier); EXPECT_EQ(d->nonce, b.nonce); EXPECT_EQ(d->mac, b.mac); EXPECT_EQ(d->fakeSaltSeed, b.fakeSaltSeed);
 
+    std::array<uint8_t, pc::kBootstrapChallengeBytes> ch{};
+    for (std::size_t i = 0; i < ch.size(); ++i) ch[i] = static_cast<uint8_t>(0xC0 + i);
     std::vector<uint8_t> in;
-    pc::bootstrapMacInput(b, in);
-    // "rune-bootstrap-v1" | 05 00 "admin" | 10 00 salt | 00 10 00 00 | 64x'a' | 64x'b' | nonce 16
+    pc::bootstrapMacInput(b, ch, in);
+    // "rune-bootstrap-v2" | challenge 32 | 05 00 "admin" | 10 00 salt | 00 10 00 00 | 64x'a' | 64x'b' | nonce 16
     std::vector<uint8_t> want;
     auto app = [&](std::string_view s) { want.insert(want.end(), s.begin(), s.end()); };
-    app("rune-bootstrap-v1");
+    app("rune-bootstrap-v2");
+    want.insert(want.end(), ch.begin(), ch.end());
     want.push_back(5); want.push_back(0); app("admin");
     want.push_back(16); want.push_back(0); app(kSalt);
     want.push_back(0x00); want.push_back(0x10); want.push_back(0); want.push_back(0);   // 4096 LE
@@ -124,17 +127,21 @@ TEST(SecurityMessagesRegression, BootstrapRoundTripsAndMacInputIsStable) {
     for (std::size_t i = 0; i < 32; ++i) want.push_back(static_cast<uint8_t>(0x40 + i));   // fakeSaltSeed (D8)
     for (std::size_t i = 0; i < 16; ++i) want.push_back(static_cast<uint8_t>(0x10 + i));
     EXPECT_EQ(in, want);
-    EXPECT_EQ(in.size(), 17u + 2 + 5 + 2 + 16 + 4 + 64 + 64 + 32 + 16);
+    EXPECT_EQ(in.size(), 17u + 32 + 2 + 5 + 2 + 16 + 4 + 64 + 64 + 32 + 16);
 
     b.mac.fill(0);   // the MAC is not part of its own input
-    std::vector<uint8_t> in2; pc::bootstrapMacInput(b, in2);
+    std::vector<uint8_t> in2; pc::bootstrapMacInput(b, ch, in2);
     EXPECT_EQ(in, in2);
     b.nonce[0] ^= 1;
-    pc::bootstrapMacInput(b, in2);
+    pc::bootstrapMacInput(b, ch, in2);
     EXPECT_NE(in, in2) << "the nonce is covered";
+    b.nonce[0] ^= 1;
+    auto ch2 = ch; ch2[31] ^= 1;
+    pc::bootstrapMacInput(b, ch2, in2);
+    EXPECT_NE(in, in2) << "the challenge is covered";
     // reuse keeps capacity (zero steady-state allocation)
     const auto cap = in.capacity();
-    pc::bootstrapMacInput(b, in);
+    pc::bootstrapMacInput(b, ch, in);
     EXPECT_EQ(in.capacity(), cap);
 }
 
@@ -163,10 +170,11 @@ TEST(SecurityMessagesRegression, BootstrapMacCoversTheFakeSaltSeedRegression) {
     pc::SecurityBootstrap b; b.adminName = "admin"; b.verifier = verifier();
     b.fakeSaltSeed.fill(0x33);
     std::vector<uint8_t> a, c;
-    pc::bootstrapMacInput(b, a);
+    const std::array<uint8_t, pc::kBootstrapChallengeBytes> ch{};
+    pc::bootstrapMacInput(b, ch, a);
     for (std::size_t i = 0; i < b.fakeSaltSeed.size(); ++i) {   // every seed byte is covered
         auto b2 = b; b2.fakeSaltSeed[i] ^= 1;
-        pc::bootstrapMacInput(b2, c);
+        pc::bootstrapMacInput(b2, ch, c);
         ASSERT_EQ(a.size(), c.size());
         EXPECT_NE(a, c) << "seed byte " << i;
     }
@@ -194,4 +202,30 @@ TEST(SecurityMessagesRegression, OutOfRangeGrantEnumBytesDoNotDecodeRegression) 
     top.granteeKind = 1; top.op = 8; top.resourceType = 5; top.patternKind = 1;
     std::size_t n = top.encode(buf);
     EXPECT_TRUE(pc::SecurityDdl::decode(buf, n));
+}
+
+TEST(SecurityMessagesRegression, BootstrapChallengeTemplatesRoundTripAndRefuseTruncationRegression) {
+    pc::SecurityBootstrapChallengeRequest rq; rq.sessionId = 7; rq.correlationId = 9;
+    std::vector<uint8_t> a(rq.encodedSize());
+    ASSERT_EQ(rq.encode(a.data()), a.size());
+    ASSERT_EQ(a.size(), 24u);
+    auto dr = pc::SecurityBootstrapChallengeRequest::decode(a.data(), a.size());
+    ASSERT_TRUE(dr);
+    EXPECT_EQ(dr->sessionId, 7); EXPECT_EQ(dr->correlationId, 9);
+    for (std::size_t cut = 0; cut < a.size(); ++cut)
+        EXPECT_FALSE(pc::SecurityBootstrapChallengeRequest::decode(a.data(), cut)) << "request cut " << cut;
+
+    pc::SecurityBootstrapChallenge ch; ch.sessionId = 7; ch.correlationId = 9;
+    for (std::size_t i = 0; i < ch.challenge.size(); ++i) ch.challenge[i] = static_cast<uint8_t>(i + 1);
+    std::vector<uint8_t> b(ch.encodedSize());
+    ASSERT_EQ(ch.encode(b.data()), b.size());
+    ASSERT_EQ(b.size(), 24u + pc::kBootstrapChallengeBytes);
+    auto dc = pc::SecurityBootstrapChallenge::decode(b.data(), b.size());
+    ASSERT_TRUE(dc);
+    EXPECT_EQ(dc->sessionId, 7); EXPECT_EQ(dc->correlationId, 9); EXPECT_EQ(dc->challenge, ch.challenge);
+    for (std::size_t cut = 0; cut < b.size(); ++cut)
+        EXPECT_FALSE(pc::SecurityBootstrapChallenge::decode(b.data(), cut)) << "challenge cut " << cut;
+    // a request never decodes as a challenge and vice versa
+    EXPECT_FALSE(pc::SecurityBootstrapChallenge::decode(a.data(), a.size()));
+    EXPECT_FALSE(pc::SecurityBootstrapChallengeRequest::decode(b.data(), b.size()));
 }

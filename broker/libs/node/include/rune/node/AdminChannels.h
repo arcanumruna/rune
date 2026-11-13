@@ -97,6 +97,9 @@ enum : int32_t {
     kMsgNsReapResult             = 36,
     // Checked writes Part 02 - control -> admin on controlToAdminRing: the committed metadata feature level, [level:i16].
     kMsgClusterFeatureLevel      = 37,
+    // #612 - control -> admin on controlToAdminRing: the smallest soft open-file limit any broker advertised and
+    // whose it is, [limit:u64][node:i32].
+    kMsgClusterFdLimit           = 38,
 };
 
 /// kMsgPlacementView: [placeable:i32][haltedCount:u16][halted ids: i32 * haltedCount].
@@ -236,6 +239,20 @@ inline void writeClusterFeatureLevel(uint8_t* p, int16_t level) noexcept { admin
 [[nodiscard]] inline bool decodeClusterFeatureLevel(const uint8_t* p, std::size_t n, int16_t& level) noexcept {
     if (n != kClusterFeatureLevelWireLen) return false;
     level = static_cast<int16_t>(admin_wire::getU16(p));
+    return true;
+}
+
+/// kMsgClusterFdLimit (#612): [limit:u64][node:i32]; limit 0 / node -1 = none known.
+inline constexpr std::size_t kClusterFdLimitWireLen = 12;
+inline void writeClusterFdLimit(uint8_t* p, uint64_t limit, int32_t node) noexcept {
+    std::memcpy(p, &limit, 8);
+    admin_wire::putI32(p + 8, node);
+}
+[[nodiscard]] inline bool decodeClusterFdLimit(const uint8_t* p, std::size_t n, uint64_t& limit,
+                                               int32_t& node) noexcept {
+    if (n != kClusterFdLimitWireLen) return false;
+    std::memcpy(&limit, p, 8);
+    node = admin_wire::getI32(p + 8);
     return true;
 }
 
@@ -1551,7 +1568,7 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
 //   kA2cCatalogTopicConfig  : [topicId:i32][count:u16][(key:u8, value:i64) * count]
 //   kA2cViewUninstall       : [viewTopicId:i32]
 //   kA2cCatalogHalted       : [offset:i64][expected:u64][actual:u64][detail bytes (rest)]
-//   kA2cCatalogApplied      : [offset:i64][digest:u64]
+//   kA2cCatalogApplied      : [offset:i64][digest:u64][nextTopicId:i32]   (offset -1: an empty catalog booted)
 // ===========================================================================
 namespace admin_wire {
 inline void putI16(uint8_t* p, int16_t v) { std::memcpy(p, &v, 2); }
@@ -1891,16 +1908,19 @@ inline void writeCatalogHalted(uint8_t* p, int64_t offset, uint64_t expected, ui
     return true;
 }
 
-inline constexpr std::size_t kCatalogAppliedWireLen = 8 + 8;
-inline void writeCatalogApplied(uint8_t* p, int64_t offset, uint64_t digest) noexcept {
+inline constexpr std::size_t kCatalogAppliedWireLen = 8 + 8 + 4;
+inline void writeCatalogApplied(uint8_t* p, int64_t offset, uint64_t digest, int32_t nextTopicId) noexcept {
     admin_wire::putI64(p, offset);
     admin_wire::putU64(p + 8, digest);
+    admin_wire::putI32(p + 16, nextTopicId);
 }
-[[nodiscard]] inline bool decodeCatalogApplied(const uint8_t* buf, std::size_t len, int64_t& offset, uint64_t& digest) noexcept {
+[[nodiscard]] inline bool decodeCatalogApplied(const uint8_t* buf, std::size_t len, int64_t& offset, uint64_t& digest,
+                                               int32_t& nextTopicId) noexcept {
     if (len != kCatalogAppliedWireLen) return false;
     offset = admin_wire::getI64(buf);
     digest = admin_wire::getU64(buf + 8);
-    return offset >= 0;
+    nextTopicId = admin_wire::getI32(buf + 16);
+    return offset >= -1 && nextTopicId >= 0;
 }
 
 // ─── `__security` effects (authentication Task 9; D29) ───────────────────────────────────────────────────────────

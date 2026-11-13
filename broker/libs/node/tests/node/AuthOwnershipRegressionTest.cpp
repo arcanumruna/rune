@@ -175,7 +175,8 @@ void unauthenticatedWorkerIngressRow(AuthRig& r) {
     ASSERT_TRUE(r.c().produce(worker, r.stream(), anon, corr, r.orders, 0, 1, makeCharBatch(1)));
     const auto ack = r.c().awaitProduceResponseUntil(corr, AuthRig::dl());
     ASSERT_TRUE(ack.has_value()) << "the unauthenticated produce was not answered";
-    EXPECT_EQ(ack->errorCode, kNotAuthorized) << "a worker-ingress produce of an unauthenticated session";
+    EXPECT_EQ(ack->errorCode, static_cast<int>(pc::ErrorCode::AuthenticationFailed))
+        << "a worker-ingress produce of an unauthenticated session (#216: 44, as on the gateway path)";
     EXPECT_EQ(r.logEnd(r.orders), leo) << "the unauthenticated produce was appended";
     EXPECT_EQ(r.produceAs(w, r.orders, -1, 0, -1, false, "after", &worker).code, kOk) << "the writer is untouched";
     EXPECT_EQ(r.logEnd(r.orders), leo + 1);

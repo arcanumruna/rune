@@ -15,7 +15,7 @@ using wire::Writer;
 static_assert(kMaxStr16Bytes == 0xFFFF && kMaxStr32Bytes == 0xFFFF'FFFF && kMaxListCount == 0xFFFF,
               "formatVer-1 wire widths are frozen: u16 / u32 length prefixes, u16 list counts (formatVer 2 keeps them)");
 
-// ── THE validation (formatVer 1..4) ───────────────────────────────────────────
+// ── THE validation (formatVer 1..5) ───────────────────────────────────────────
 // One set of value rules, run by BOTH directions: encodeInto refuses exactly what decode
 // refuses, so no event the decoder would reject can ever be appended to __catalog.
 // (Byte-level refusals — Truncated, TrailingBytes, a bool byte other than 0/1 — have no
@@ -44,15 +44,18 @@ constexpr bool validCompatMode(rune::codec::CompatMode m) noexcept {
 constexpr bool validNsStateTag(NsStateTag t) noexcept { return static_cast<uint8_t>(t) <= static_cast<uint8_t>(NsStateTag::Deleting); }
 
 std::optional<Violation> checkFormatVer(uint16_t v) noexcept {
-    if (v != kFormatV1 && v != kFormatV2 && v != kFormatV3 && v != kFormatV4) return Violation::UnknownFormatVer;
+    if (v != kFormatV1 && v != kFormatV2 && v != kFormatV3 && v != kFormatV4 && v != kFormatV5) return Violation::UnknownFormatVer;
     return std::nullopt;
 }
 /// formatVer 1 refuses the whole reserved range 32..63; formatVer 2 accepts the namespace kinds 32..36 and
-/// refuses 37..63.  Anything else outside 1..9 is unknown.
+/// refuses 37..63.  Anything else outside 1..9 (and 10 in formatVer 5) is unknown.
 std::optional<Violation> checkKind(uint16_t formatVer, uint16_t k) noexcept {
     if (k >= kReservedKindFirst && k <= kReservedKindLast) {
         if (formatVer >= kFormatV2 && k <= kLastNamespaceKind) return std::nullopt;
         return Violation::ReservedKind;
+    }
+    if (k == static_cast<uint16_t>(EventKind::RetireSchemaVersions)) {   // valid only in formatVer 5
+        return formatVer >= kFormatV5 ? std::nullopt : std::optional<Violation>(Violation::UnknownKind);
     }
     if (k < static_cast<uint16_t>(EventKind::CreateTopic) || k > static_cast<uint16_t>(EventKind::DropView))
         return Violation::UnknownKind;
@@ -218,6 +221,8 @@ void putOps(Writer& w, const Ops& ops, uint16_t formatVer) {
             w.e8(o.to);
         } else if constexpr (std::is_same_v<T, NamespaceDeleteStepOps>) {
             w.u8(o.step);
+        } else if constexpr (std::is_same_v<T, RetireSchemaVersionsOps>) {
+            w.u16(o.below);
         } else {   // NamespaceDeletedOps: empty body
             static_assert(std::is_same_v<T, NamespaceDeletedOps>);
         }
@@ -330,6 +335,9 @@ std::expected<Ops, DecodeError> getOps(Reader& r, EventKind kind, uint16_t forma
     case EventKind::NamespaceStateChanged: {
         NamespaceStateChangedOps o; if (!r.e8(o.to)) return std::unexpected(DecodeError::Truncated); return o;
     }
+    case EventKind::RetireSchemaVersions: {
+        RetireSchemaVersionsOps o; if (!r.u16(o.below)) return std::unexpected(DecodeError::Truncated); return o;
+    }
     case EventKind::NamespaceDeleted: return NamespaceDeletedOps{};
     case EventKind::NamespaceDeleteStep: {
         NamespaceDeleteStepOps o; if (!r.u8(o.step)) return std::unexpected(DecodeError::Truncated); return o;
@@ -420,6 +428,7 @@ std::string_view kindName(EventKind k) noexcept {
     case EventKind::NamespaceStateChanged: return "NamespaceStateChanged";
     case EventKind::NamespaceDeleted: return "NamespaceDeleted";
     case EventKind::NamespaceDeleteStep: return "NamespaceDeleteStep";
+    case EventKind::RetireSchemaVersions: return "RetireSchemaVersions";
     }
     return "?";
 }

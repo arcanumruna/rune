@@ -77,8 +77,18 @@ int64_t connect(ShardTestClient& cl, const std::string& ch) {
     return -1;
 }
 
-/// A SecurityBootstrap frame with a MAC under `keyFileContents` (or a garbage MAC when empty).
-std::vector<uint8_t> bootstrapFrame(int64_t sid, int64_t corr, const std::string& keyFileContents, uint8_t nonceSeed) {
+/// A SecurityBootstrap frame with a MAC under `keyFileContents` (or a garbage MAC when empty).  #234: the proof covers
+/// the gateway's one-use challenge, requested on `sid` first (`askChallenge` false: none is requested - for a session
+/// the gate refuses anyway - and the MAC covers an all-zero challenge).
+std::vector<uint8_t> bootstrapFrame(ShardTestClient& cl, const std::string& channel, int64_t sid, int64_t corr,
+                                    const std::string& keyFileContents, uint8_t nonceSeed, bool askChallenge = true) {
+    std::array<uint8_t, pc::kBootstrapChallengeBytes> challenge{};
+    if (askChallenge) {
+        const int64_t cc = cl.sendBootstrapChallengeRequest(channel, kClientStream, sid);
+        const auto a = cl.awaitBootstrapChallenge(cc, std::chrono::steady_clock::now() + 20s);
+        EXPECT_TRUE(a.challenge.has_value()) << "no bootstrap challenge";
+        if (a.challenge) challenge = *a.challenge;
+    }
     Verifier v;
     v.salt.assign(16, 0x11);
     v.stored.fill(0x22);
@@ -95,10 +105,12 @@ std::vector<uint8_t> bootstrapFrame(int64_t sid, int64_t corr, const std::string
     } else {
         const auto key = rune::crypto::deriveClusterKey(std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(keyFileContents.data()), keyFileContents.size()));
+        std::array<uint8_t, 64> subkey{};
+        EXPECT_TRUE(rune::crypto::deriveBootstrapMacKey(key->master, subkey));
         std::vector<uint8_t> input;
-        pc::bootstrapMacInput(m, input);
+        pc::bootstrapMacInput(m, challenge, input);
         rune::crypto::DigestBytes mac;
-        EXPECT_TRUE(rune::crypto::hmac(rune::crypto::Digest::Sha512, key->master, input, mac));
+        EXPECT_TRUE(rune::crypto::hmac(rune::crypto::Digest::Sha512, subkey, input, mac));
         std::memcpy(m.mac.data(), mac.bytes.data(), m.mac.size());
     }
     std::vector<uint8_t> buf(m.encodedSize());
@@ -122,7 +134,7 @@ TEST(AuthBootstrapWindowRegression, ConnectInTheBootstrapWindowIsToldAnonymousAn
     AuthNode n;
     ShardTestClient cl(n.clientDir->path / "wire");
     cl.keepSessionsAlive(true);
-    cl.setClientVersion(pc::kClientVersionAuth);
+    cl.setClientVersion(pc::kClientVersion);
     const int64_t s1 = connect(cl, n.channel());
     ASSERT_GT(s1, 0);
     ASSERT_TRUE(cl.lastConnectResponse().has_value());
@@ -131,7 +143,7 @@ TEST(AuthBootstrapWindowRegression, ConnectInTheBootstrapWindowIsToldAnonymousAn
 
     // Bootstrap with the right proof.
     const int64_t corr = cl.nextCorrelationId();
-    const auto f = bootstrapFrame(s1, corr, kKeyFile, 1);
+    const auto f = bootstrapFrame(cl, n.channel(), s1, corr, kKeyFile, 1);
     ASSERT_TRUE(cl.send(n.channel(), kClientStream, f.data(), f.size()));
     const auto ok = cl.awaitDdl(corr, std::chrono::steady_clock::now() + 20s);
     ASSERT_TRUE(ok.has_value());
@@ -145,7 +157,7 @@ TEST(AuthBootstrapWindowRegression, ConnectInTheBootstrapWindowIsToldAnonymousAn
         << "while an enabled admin exists an anonymous session is not offered the window";
     // ... and the session that was offered the window can send nothing more (a second bootstrap included).
     const int64_t corr2 = cl.nextCorrelationId();
-    const auto again = bootstrapFrame(s1, corr2, kKeyFile, 9);
+    const auto again = bootstrapFrame(cl, n.channel(), s1, corr2, kKeyFile, 9, /*askChallenge=*/false);
     ASSERT_TRUE(cl.send(n.channel(), kClientStream, again.data(), again.size()));
     const auto refused = cl.awaitDdl(corr2, std::chrono::steady_clock::now() + 20s);
     ASSERT_TRUE(refused.has_value());
@@ -157,7 +169,7 @@ TEST(AuthBootstrapWindowRegression, AnAnonymousSessionSendingAnythingButBootstra
     AuthNode n;
     ShardTestClient cl(n.clientDir->path / "wire");
     cl.keepSessionsAlive(true);
-    cl.setClientVersion(pc::kClientVersionAuth);
+    cl.setClientVersion(pc::kClientVersion);
     const int64_t sid = connect(cl, n.channel());
     ASSERT_GT(sid, 0);
     const int64_t corr = cl.nextCorrelationId();
@@ -176,12 +188,12 @@ TEST(AuthBootstrapWindowRegression, ABootstrapWithABadMacIsRefusedAndAppendsNoth
     AuthNode n;
     ShardTestClient cl(n.clientDir->path / "wire");
     cl.keepSessionsAlive(true);
-    cl.setClientVersion(pc::kClientVersionAuth);
+    cl.setClientVersion(pc::kClientVersion);
     const int64_t sid = connect(cl, n.channel());
     ASSERT_GT(sid, 0);
     for (const std::string& key : {std::string{}, kOtherKey}) {   // garbage MAC; a MAC under another cluster's key
         const int64_t corr = cl.nextCorrelationId();
-        const auto f = bootstrapFrame(sid, corr, key, 3);
+        const auto f = bootstrapFrame(cl, n.channel(), sid, corr, key, 3);
         ASSERT_TRUE(cl.send(n.channel(), kClientStream, f.data(), f.size()));
         const auto r = cl.awaitDdl(corr, std::chrono::steady_clock::now() + 20s);
         ASSERT_TRUE(r.has_value());
@@ -192,7 +204,7 @@ TEST(AuthBootstrapWindowRegression, ABootstrapWithABadMacIsRefusedAndAppendsNoth
     EXPECT_FALSE(n.node->securityViewForTest().hasSecurityAdmin);
     // The session is still in the window: a correct proof now works.
     const int64_t corr = cl.nextCorrelationId();
-    const auto f = bootstrapFrame(sid, corr, kKeyFile, 4);
+    const auto f = bootstrapFrame(cl, n.channel(), sid, corr, kKeyFile, 4);
     ASSERT_TRUE(cl.send(n.channel(), kClientStream, f.data(), f.size()));
     const auto ok = cl.awaitDdl(corr, std::chrono::steady_clock::now() + 20s);
     ASSERT_TRUE(ok.has_value());
@@ -205,11 +217,11 @@ TEST(AuthBootstrapWindowRegression, TheWindowReopensWhenTheLastAdminIsDisabledSt
     AuthNode n;
     ShardTestClient cl(n.clientDir->path / "wire");
     cl.keepSessionsAlive(true);
-    cl.setClientVersion(pc::kClientVersionAuth);
+    cl.setClientVersion(pc::kClientVersion);
     int64_t s1 = connect(cl, n.channel());
     ASSERT_GT(s1, 0);
     const int64_t corr = cl.nextCorrelationId();
-    const auto f = bootstrapFrame(s1, corr, kKeyFile, 1);
+    const auto f = bootstrapFrame(cl, n.channel(), s1, corr, kKeyFile, 1);
     ASSERT_TRUE(cl.send(n.channel(), kClientStream, f.data(), f.size()));
     ASSERT_EQ(cl.awaitDdl(corr, std::chrono::steady_clock::now() + 20s)->errorCode, 0);
     const int64_t s2 = connect(cl, n.channel());
@@ -240,7 +252,7 @@ TEST(AuthBootstrapWindowRegression, TheWindowReopensWhenTheLastAdminIsDisabledSt
         << "a reopened window still asks for a login: the other users exist";
     // Still MAC-gated: a bad MAC is refused, the right one accepted.
     const int64_t c2 = cl.nextCorrelationId();
-    const auto bad = bootstrapFrame(s3, c2, kOtherKey, 5);
+    const auto bad = bootstrapFrame(cl, n.channel(), s3, c2, kOtherKey, 5);
     ASSERT_TRUE(cl.send(n.channel(), kClientStream, bad.data(), bad.size()));
     EXPECT_EQ(cl.awaitDdl(c2, std::chrono::steady_clock::now() + 20s)->errorCode, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest));
 }
@@ -253,7 +265,7 @@ void reopenTheWindowWithAUser(AuthNode& n, ShardTestClient& cl) {
     const int64_t s1 = connect(cl, n.channel());
     ASSERT_GT(s1, 0);
     const int64_t corr = cl.nextCorrelationId();
-    const auto f = bootstrapFrame(s1, corr, kKeyFile, 1);
+    const auto f = bootstrapFrame(cl, n.channel(), s1, corr, kKeyFile, 1);
     ASSERT_TRUE(cl.send(n.channel(), kClientStream, f.data(), f.size()));
     ASSERT_EQ(cl.awaitDdl(corr, std::chrono::steady_clock::now() + 20s)->errorCode, 0);
     rune::node::test::SecurityEventChain chain;
@@ -309,7 +321,7 @@ TEST(AuthBootstrapWindowRegression, ACredentialedUserLogsInWhileTheWindowIsReope
     AuthNode n;
     ShardTestClient cl(n.clientDir->path / "wire");
     cl.keepSessionsAlive(true);
-    cl.setClientVersion(pc::kClientVersionAuth);
+    cl.setClientVersion(pc::kClientVersion);
     reopenTheWindowWithAUser(n, cl);
     if (HasFatalFailure()) return;
     const int64_t sid = connect(cl, n.channel());
@@ -334,7 +346,7 @@ TEST(AuthBootstrapWindowAdversarialRegression, TheReopenedWindowGrantsNoAdminDdl
     AuthNode n;
     ShardTestClient cl(n.clientDir->path / "wire");
     cl.keepSessionsAlive(true);
-    cl.setClientVersion(pc::kClientVersionAuth);
+    cl.setClientVersion(pc::kClientVersion);
     reopenTheWindowWithAUser(n, cl);
     if (HasFatalFailure()) return;
     const int64_t applied = n.node->securityViewForTest().appliedOffset;
@@ -375,18 +387,18 @@ TEST(NodeConfigRegression, TheValidatedClusterKeyIsTheOneInUseRegression) {
     }};
     ShardTestClient cl(n.clientDir->path / "wire");
     cl.keepSessionsAlive(true);
-    cl.setClientVersion(pc::kClientVersionAuth);
+    cl.setClientVersion(pc::kClientVersion);
     const int64_t sid = connect(cl, n.channel());
     ASSERT_GT(sid, 0);
     const int64_t c1 = cl.nextCorrelationId();
-    const auto underNew = bootstrapFrame(sid, c1, kOtherKey, 1);
+    const auto underNew = bootstrapFrame(cl, n.channel(), sid, c1, kOtherKey, 1);
     ASSERT_TRUE(cl.send(n.channel(), kClientStream, underNew.data(), underNew.size()));
     const auto refused = cl.awaitDdl(c1, std::chrono::steady_clock::now() + 20s);
     ASSERT_TRUE(refused.has_value());
     EXPECT_EQ(refused->errorCode, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest)) << "the file's NEW content is not the key in use";
     EXPECT_EQ(refused->detail, "bootstrap proof does not match this cluster's key") << "and never the silent 'authentication is not enabled'";
     const int64_t c2 = cl.nextCorrelationId();
-    const auto underStarted = bootstrapFrame(sid, c2, kKeyFile, 2);
+    const auto underStarted = bootstrapFrame(cl, n.channel(), sid, c2, kKeyFile, 2);
     ASSERT_TRUE(cl.send(n.channel(), kClientStream, underStarted.data(), underStarted.size()));
     const auto ok = cl.awaitDdl(c2, std::chrono::steady_clock::now() + 20s);
     ASSERT_TRUE(ok.has_value());

@@ -15,6 +15,7 @@
 #include <atomic>
 #include <memory>
 #include <future>
+#include <map>
 #include <numeric>
 #include <mutex>
 #include <optional>
@@ -544,6 +545,192 @@ TEST(CheckedWritesBrokerRegression, AlterThenProduceNewVersionSucceedsRegression
     }
     EXPECT_EQ(code, kOk);
     EXPECT_LE(b.node().onWorkerThreadForTest(0, [](Worker& w) { return w.typedVersionAheadForTest(); }), 10u);
+}
+
+// ── schema retire (#419) ──────────────────────────────────────────────────────────────────────────────────────────────────
+namespace {
+constexpr uint16_t kSchemaVersionRetired = 67;
+
+/// A matrix record written at schema `version` of a topic whose ALTERs each added one Int64 column: the 28-byte block grows by 8
+/// per version past the first.
+cw::TypedRecord recordAtVersion(uint64_t id, uint16_t version) {
+    cw::Parts p;
+    p.id = id; p.version = version;
+    auto rec = cw::encode(p);
+    if (version == 1) return rec;
+    const std::size_t extra = std::size_t{8} * (version - 1);
+    rec.value = le(28 + extra, 2) + le(version, 2) + rec.value.substr(4, 28) + std::string(extra, '\0') + rec.value.substr(32);
+    return rec;
+}
+
+/// The retire floor `n`'s worker for partition 0 of `topicId` holds (0: no write spec yet).
+int retireFloorOn(BrokerNode& n, int32_t topicId) {
+    const int32_t w = rune::metadata::ShardRouter(n.workerCountForTest()).workerForPartition(topicId, 0);
+    return n.onWorkerThreadForTest(w, [topicId](Worker& wk) {
+        const TopicWriteSpec* spec = wk.writeSpecForTest(topicId);
+        return spec != nullptr ? int{spec->retiredBelow()} : 0;
+    });
+}
+bool awaitFloor(BrokerNode& n, int32_t topicId, int floor) {
+    for (int i = 0; i < 800; ++i) {   // hard cap: 20 s
+        if (retireFloorOn(n, topicId) >= floor) return true;
+        std::this_thread::sleep_for(25ms);
+    }
+    return false;
+}
+
+rc::AlterTopicResult retireBelow(rc::Client& c, const std::string& topic, uint16_t below) {
+    rune::codec::AlterOp op{};
+    op.type = rune::codec::AlterOpType::RetireBelow;
+    op.version = below;
+    return c.alterTopicAndWait(topic, 0, rune::codec::encodeAlterOps({op}), {}, 30s);
+}
+
+/// A produce that waits out the retriable NotLeader (a version or a spec still on its way to the worker).
+uint16_t produceAt(rc::ClientConfig cfg, const std::string& name, int32_t topicId, const cw::TypedRecord& rec, int parts = 1) {
+    uint16_t code = kNotLeader;
+    for (int i = 0; i < 200 && code == kNotLeader; ++i) {
+        code = cwb::produceRaw(cfg, name, topicId, parts, rec.value, keyOf(rec.key));
+        if (code == kNotLeader) std::this_thread::sleep_for(50ms);
+    }
+    return code;
+}
+}  // namespace
+
+TEST(CheckedWritesBrokerRegression, RetireRefusesOldVersionsKeepsHistoryAndSurvivesARestartRegression) {
+    Broker b("cw-retire", OneBroker::Runtime::Shard);
+    rc::Client& c = *b.connectClient();
+    const auto t = cwb::defineTyped(c, "p", 1);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    ASSERT_EQ(c.alterTopicAndWait("p", 0, OneBroker::addColumnOps("extra"), {}, 30s).errorCode, 0);
+    ASSERT_EQ(c.alterTopicAndWait("p", 0, OneBroker::addColumnOps("extra2"), {}, 30s).errorCode, 0);
+    const auto cfg = [&] { return b.clientConfig(); };
+
+    // before the retire: producers on every version of the history are accepted
+    EXPECT_EQ(produceAt(cfg(), "p", t.topicId, recordAtVersion(1, 1)), kOk);
+    EXPECT_EQ(produceAt(cfg(), "p", t.topicId, recordAtVersion(2, 2)), kOk);
+    EXPECT_EQ(produceAt(cfg(), "p", t.topicId, recordAtVersion(3, 3)), kOk);
+    EXPECT_EQ(storedValues(b.node(), t.topicId, 0).size(), 3u);
+
+    // the typed open of every version works before the retire
+    const uint64_t fp1 = rune::codec::fingerprint(cw::matrixDescriptor());
+    EXPECT_EQ(c.getTopicSchemaAndWait("p", fp1, 20s).errorCode, 0);
+
+    const auto retired = retireBelow(c, "p", 3);
+    ASSERT_EQ(retired.errorCode, 0) << retired.detail;
+    ASSERT_TRUE(awaitFloor(b.node(), t.topicId, 3)) << "the owning worker takes the floor from the write spec";
+
+    // after: v1 and v2 are refused with the explicit code and nothing is stored; v3 is accepted
+    EXPECT_EQ(cwb::produceRaw(cfg(), "p", t.topicId, 1, recordAtVersion(4, 1).value, keyOf(recordAtVersion(4, 1).key)), kSchemaVersionRetired);
+    EXPECT_EQ(cwb::produceRaw(cfg(), "p", t.topicId, 1, recordAtVersion(5, 2).value, keyOf(recordAtVersion(5, 2).key)), kSchemaVersionRetired);
+    EXPECT_EQ(produceAt(cfg(), "p", t.topicId, recordAtVersion(6, 3)), kOk);
+    const auto stored = storedValues(b.node(), t.topicId, 0);
+    ASSERT_EQ(stored.size(), 4u) << "history is untouched: the three old records and the new v3 one, no refused batch";
+    EXPECT_EQ(stored[0], recordAtVersion(1, 1).value) << "a consumer still reads the retired v1 record";
+    EXPECT_EQ(stored[1], recordAtVersion(2, 2).value);
+
+    // the typed open: a retired version is refused, the current one is served
+    EXPECT_EQ(c.getTopicSchemaAndWait("p", fp1, 20s).errorCode, kSchemaVersionRetired);
+    const auto latest = c.getTopicSchemaAndWait("p", 0, 20s);
+    EXPECT_EQ(latest.errorCode, 0);
+    EXPECT_EQ(latest.version, 3);
+
+    // GetStats: the floor, and the produce counts per version (this process only)
+    const auto stats = [&](rc::Client& cl) {
+        rc::StatsResult r;
+        for (int i = 0; i < 100; ++i) {
+            r = cl.getStatsAndWait(rune::protocol::client::StatsScope::TopicPartition, t.topicId, 0, 20s);
+            if (r.status == rc::StatsResult::kOk) break;
+            std::this_thread::sleep_for(50ms);
+        }
+        return r;
+    };
+    {
+        const auto r = stats(c);
+        ASSERT_EQ(r.status, rc::StatsResult::kOk);
+        const auto floor = r.get(rune::protocol::client::StatId::schemaRetiredBelow);
+        ASSERT_TRUE(floor.has_value());
+        EXPECT_EQ(*floor, 3);
+        std::map<uint16_t, int64_t> byId(r.stats.begin(), r.stats.end());
+        EXPECT_EQ(byId[0x8001], 1);
+        EXPECT_EQ(byId[0x8002], 1);
+        EXPECT_EQ(byId[0x8003], 2) << "the v3 record before the retire and the one after";
+        EXPECT_EQ(byId.count(0x8004), 0u) << "a version nothing produced at has no count";
+    }
+
+    // restart: the same answers (the floor comes back from the catalog log)
+    b.restart();
+    rc::Client& c2 = *b.connectClient();
+    uint16_t code = kNotLeader;
+    for (int i = 0; i < 200 && (code == kNotLeader || code == cwb::kNotOk); ++i) {
+        code = cwb::produceRaw(cfg(), "p", t.topicId, 1, recordAtVersion(7, 1).value, keyOf(recordAtVersion(7, 1).key));
+        if (code == kNotLeader || code == cwb::kNotOk) std::this_thread::sleep_for(50ms);
+    }
+    EXPECT_EQ(code, kSchemaVersionRetired) << "refused from the first produce after the restart";
+    EXPECT_EQ(produceAt(cfg(), "p", t.topicId, recordAtVersion(8, 3)), kOk);
+    EXPECT_EQ(c2.getTopicSchemaAndWait("p", fp1, 20s).errorCode, kSchemaVersionRetired);
+    const auto after = stats(c2);
+    ASSERT_EQ(after.status, rc::StatsResult::kOk);
+    EXPECT_EQ(after.get(rune::protocol::client::StatId::schemaRetiredBelow), 3);
+    std::map<uint16_t, int64_t> counts(after.stats.begin(), after.stats.end());
+    EXPECT_EQ(counts.count(0x8001), 0u) << "the counts are since this process started";
+    EXPECT_EQ(counts[0x8003], 1);
+    EXPECT_EQ(storedValues(b.node(), t.topicId, 0).size(), 5u) << "history survives the restart";
+}
+
+TEST(CheckedWritesBrokerRegression, ThreeNodesRetireHoldsAcrossALeaderChangeAndACaughtUpFollowerRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    Cluster c = startCluster("cw_retire3");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t ctl = awaitController(c);
+    ASSERT_GT(ctl, 0);
+    auto admin = connectClient(c, quickConfig(c, ctl));
+    rc::TopicOptions to;
+    to.replicationFactor = 3;
+    const auto t = admin->defineTopicAndWait("p", 1, "id", rune::codec::serialize(cw::matrixDescriptor()), rc::Persistence::Disk, to, {}, 60s);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    ASSERT_EQ(admin->alterTopicAndWait("p", 0, OneBroker::addColumnOps("extra"), {}, 30s).errorCode, 0);
+    ASSERT_EQ(admin->alterTopicAndWait("p", 0, OneBroker::addColumnOps("extra2"), {}, 30s).errorCode, 0);
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, t.topicId, 1, leaders, 30s));
+    const int32_t oldLeader = leaders[0];
+    const int32_t catalogLeader = c.catalogLeaderId();
+    // a follower that is neither the partition leader nor the catalog leader is down while the retire is committed
+    int32_t down = 0;
+    for (int id : {1, 2, 3}) if (id != oldLeader && id != catalogLeader) { down = id; break; }
+    if (down == 0) for (int id : {1, 2, 3}) if (id != oldLeader) { down = id; break; }
+    ASSERT_GT(down, 0);
+    int seed = 0;
+    for (int id : {1, 2, 3}) if (id != down) { seed = id; break; }
+    admin->close();
+    admin.reset();
+    c.stop(down);
+    auto retirer = connectClient(c, quickConfig(c, seed));
+    const auto retired = retireBelow(*retirer, "p", 3);
+    ASSERT_EQ(retired.errorCode, 0) << retired.detail;
+    for (int id : {1, 2, 3}) if (id != down) EXPECT_TRUE(awaitFloor(c.node(id), t.topicId, 3)) << "node " << id << " holds the floor";
+    retirer->close();
+    retirer.reset();
+    // the follower that was down catches the retire up from the catalog log
+    c.startNodes({down});
+    EXPECT_TRUE(awaitFloor(c.node(down), t.topicId, 3)) << "the restarted follower holds the floor";
+    // the leader changes: whoever leads now refuses a v1 producer and serves v3
+    c.stop(oldLeader);
+    for (int i = 0; i < 400; ++i) {
+        leaders.clear();
+        if (awaitLeaders(c, t.topicId, 1, leaders, 100ms) && leaders[0] != oldLeader) break;
+    }
+    ASSERT_NE(leaders.empty() ? oldLeader : leaders[0], oldLeader) << "a new leader was elected";
+    const int32_t newLeader = leaders[0];
+    int via = 0;
+    for (int id : {1, 2, 3}) if (id != oldLeader) { via = id; break; }
+    uint16_t refused = kNotLeader;
+    for (int i = 0; i < 200 && (refused == kNotLeader || refused == cwb::kNotOk); ++i) {
+        refused = cwb::produceRaw(quickConfig(c, via), "p", t.topicId, 1, recordAtVersion(1, 1).value, keyOf(recordAtVersion(1, 1).key));
+        if (refused == kNotLeader || refused == cwb::kNotOk) std::this_thread::sleep_for(50ms);
+    }
+    EXPECT_EQ(refused, kSchemaVersionRetired) << "the new leader " << newLeader << " refuses v1";
+    EXPECT_EQ(produceAt(quickConfig(c, via), "p", t.topicId, recordAtVersion(2, 3)), kOk);
 }
 
 TEST(CheckedWritesBrokerRegression, ThreeNodesNewLeaderValidatesRegression) {
@@ -3255,7 +3442,7 @@ TEST(CheckedWritesBrokerRegression, RenameMovesTheRowShardRegression) {
     EXPECT_EQ(readRow(c, view, keyOf("bravo")).status, rc::ViewRowResult::kOk);
 }
 
-TEST(CheckedWritesBrokerRegression, ScanAcrossPagesThenCursorInvalidatedShardRegression) {
+TEST(CheckedWritesBrokerRegression, ScanAcrossPagesThenAWriteKeepsTheCursorShardRegression) {
     Broker b("cw07-pages", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
@@ -3300,12 +3487,57 @@ TEST(CheckedWritesBrokerRegression, ScanAcrossPagesThenCursorInvalidatedShardReg
     ASSERT_TRUE(isOk(w.write(rc::Key(lastOnPage), {})));
     rc::ViewScanOptions resume;
     resume.resumeToken = first.nextToken;
-    const auto stale = c.scanViewAndWait(view, prefix, 100, resume, 10s);
-    EXPECT_EQ(stale.status, rc::ViewRowResult::kCursorInvalidated);
+    const auto rest = c.scanViewAndWait(view, prefix, 100, resume, 10s);
+    EXPECT_EQ(rest.status, rc::ViewRowResult::kOk) << "#573: a write under the prefix no longer invalidates the cursor";
+    for (const uint64_t id : idsOf(cols, rest.rows)) EXPECT_NE(id, lastOnPage) << "the erased row is not returned again";
 
     const auto again = scanRows(c, view, prefix, 100);
     ASSERT_TRUE(again.has_value());
     EXPECT_EQ(again->size(), kTotal - 1);
+}
+
+TEST(CheckedWritesBrokerRegression, AMultiPageScanCompletesWhileAProducerWritesUnderTheSamePrefixShardRegression) {
+    Broker b("cw07-hotscan", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = defineCharacters(c);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    const int32_t view = createView(c, accountCharactersPlan(t.topicId), "characterId");
+    ASSERT_GE(view, 0);
+    const ViewColumns cols(b.node(), "account_characters");
+    rcv::ViewKeyBuilder builder = keyBuilder(b.node(), "account_characters");
+    KeyedSender w(b.clientConfig(), "character", t.topicId, 1, kAllView);
+
+    constexpr uint64_t kTotal = 300;
+    std::vector<std::pair<rc::Key, std::string>> records;
+    for (uint64_t id = 1; id <= kTotal; ++id) records.emplace_back(rc::Key(id), characterValue(id, 42, "c" + std::to_string(id)));
+    ASSERT_TRUE(w.writeAll(records));
+    const std::vector<uint8_t> prefix = bytesOf(builder.setUInt("userId", 42).prefix());
+
+    std::set<uint64_t> erased;
+    std::vector<uint64_t> seenAll;
+    rc::ViewScanOptions opts;
+    bool complete = false;
+    uint64_t nextId = 1000;
+    for (int i = 0; i < 40 && !complete; ++i) {   // hard cap: the old scan restarted forever here
+        const auto page = c.scanViewAndWait(view, prefix, 50, opts, 10s);
+        ASSERT_EQ(page.status, rc::ViewRowResult::kOk) << "page " << i;
+        for (const uint64_t id : idsOf(cols, page.rows)) seenAll.push_back(id);
+        if (page.complete()) { complete = true; break; }
+        opts.resumeToken = page.nextToken;
+        // The producer writes under the same prefix between every two pages: one new row, and one old row erased.
+        ASSERT_TRUE(isOk(w.write(rc::Key(nextId), characterValue(nextId, 42, "n" + std::to_string(nextId)))));
+        ++nextId;
+        const uint64_t victim = 1 + static_cast<uint64_t>(i) * 7 % kTotal;
+        if (erased.insert(victim).second) ASSERT_TRUE(isOk(w.write(rc::Key(victim), {})));
+    }
+    ASSERT_TRUE(complete);
+    const std::set<uint64_t> seen(seenAll.begin(), seenAll.end());
+    EXPECT_EQ(seen.size(), seenAll.size()) << "no row is returned twice";
+    for (uint64_t id = 1; id <= kTotal; ++id) {
+        if (erased.count(id) == 0) EXPECT_TRUE(seen.count(id)) << "row " << id << " stayed under the prefix and was skipped";
+    }
 }
 
 TEST(CheckedWritesBrokerRegression, MinOffsetReadSeesTheWriteShardRegression) {

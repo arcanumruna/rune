@@ -27,7 +27,7 @@ using rune::storage::Log;
 namespace {
 
 constexpr int32_t kTopic = 1;
-constexpr int16_t kOk = 0, kNotLeader = 2, kSchemaValidationFailed = 24;
+constexpr int16_t kOk = 0, kNotLeader = 2, kSchemaValidationFailed = 24, kSchemaVersionRetired = 67;
 
 class NullTransport : public rune::replication::PartitionTransport {
 public:
@@ -84,9 +84,35 @@ struct Rig {
     void sendSpec(const TopicWriteSpecWire& w) {
         WorkerOp op;
         op.type = WorkerOp::Type::WriteSpecUpdate; op.topicId = w.topicId;
-        op.schemaUpdateBlob.resize(kTopicWriteSpecWireLen);
-        ASSERT_EQ(encodeTopicWriteSpec(w, op.schemaUpdateBlob), kTopicWriteSpecWireLen);
+        op.schemaUpdateBlob.resize(topicWriteSpecWireLen(w));
+        ASSERT_EQ(encodeTopicWriteSpec(w, op.schemaUpdateBlob), topicWriteSpecWireLen(w));
         send(std::move(op));
+    }
+    /// Versions 1..`versions` installed and the spec carrying `floor` (the topic's schema after `versions - 1` ALTERs and a retire).
+    void typedWithFloor(uint16_t versions, uint16_t floor) {
+        for (uint16_t v = 1; v <= versions; ++v) sendVersion(matrixDescriptor(v), v);
+        TopicWriteSpecWire w;
+        w.topicId = kTopic; w.keyFieldId = kIdTag; w.keyType = rune::codec::PrimType::UInt64; w.keyWidth = 8; w.legacyValidate = true;
+        w.retiredBelow = floor;
+        sendSpec(w);
+    }
+    /// A batch whose header carries the producer identity the frame carries (the worker refuses a mismatch).
+    static std::vector<uint8_t> idempotentBatchOf(const std::vector<TypedRecord>& records, int64_t producerId, int32_t baseSequence) {
+        rune::protocol::RecordBatchBuilder b(0, 1'000'000);
+        b.setProducerId(producerId); b.setProducerEpoch(0); b.setBaseSequence(baseSequence);
+        for (const auto& r : records) b.append(r.key, r.value, 1'000'000);
+        return b.build();
+    }
+    WorkerOp producerOp(std::vector<uint8_t> batch, int64_t producerId, int32_t baseSequence) {
+        WorkerOp op = produceOp(std::move(batch));
+        op.producerId = producerId; op.producerEpoch = 0; op.baseSequence = baseSequence;
+        return op;
+    }
+    /// The answer of the produce with correlation id `id` (-1: none yet).
+    int16_t answerOf(int64_t id) const {
+        for (const auto& r : returns)
+            if (r.type == WorkerReturn::Type::ProduceResult && r.correlationId == id) return r.errorCode;
+        return int16_t{-1};
     }
     void sendLevel(int16_t level) {
         WorkerOp op;
@@ -333,4 +359,104 @@ TEST(LeaseWorkerRegression, LayoutBreakIsRefusedAndCountedRegression) {
         EXPECT_EQ(r.worker->writeStateForTest(kTopic, 0)->spec->descriptorFor(1), nullptr);
         EXPECT_NE(r.worker->writeStateForTest(kTopic, 0)->spec->descriptorFor(2), nullptr);
     }
+}
+
+// ── schema retire (#419) ──────────────────────────────────────────────────────
+TEST(CheckedWritesWorkerRegression, ARecordBelowTheRetireFloorIsRefusedAndNothingIsAppendedRegression) {
+    Rig r;
+    r.typedWithFloor(4, 3);   // versions 1..4, retired below 3
+    r.sendLevel(5);
+    const int64_t leo = r.log->logEndOffset();
+    EXPECT_EQ(r.produce(validRecord(1, 1)), kSchemaVersionRetired);
+    EXPECT_EQ(r.worker->typedVersionRetiredForTest(), 1u);
+    EXPECT_EQ(r.produce(validRecord(2, 2)), kSchemaVersionRetired);
+    EXPECT_EQ(r.worker->typedVersionRetiredForTest(), 2u);
+    EXPECT_EQ(r.log->logEndOffset(), leo) << "nothing appended";
+    EXPECT_EQ(r.produce(validRecord(3, 3)), kOk);
+    EXPECT_EQ(r.produce(validRecord(4, 4)), kOk);
+    EXPECT_EQ(r.worker->typedVersionRetiredForTest(), 2u);
+    EXPECT_GT(r.log->logEndOffset(), leo);
+    Parts ahead; ahead.version = 5;
+    EXPECT_EQ(r.produce(encode(ahead)), kNotLeader) << "a version above the highest installed is VersionAhead, as before";
+    EXPECT_EQ(r.worker->typedVersionAheadForTest(), 1u);
+    EXPECT_EQ(r.worker->typedVersionRetiredForTest(), 2u);
+    // a mixed batch is refused whole when any record is retired; nothing of it is stored
+    const int64_t mid = r.log->logEndOffset();
+    EXPECT_EQ(r.produce(batchOf({validRecord(5, 3), validRecord(6, 1)})), kSchemaVersionRetired);
+    EXPECT_EQ(r.log->logEndOffset(), mid);
+    EXPECT_EQ(r.worker->typedVersionRetiredForTest(), 3u);
+    EXPECT_FALSE(r.log->read(0, 1 << 20).empty()) << "records stored before stay readable";
+}
+
+TEST(CheckedWritesWorkerRegression, ARetiredIdempotentBatchLeavesTheSequenceIntactRegression) {
+    Rig r;
+    r.typedWithFloor(3, 3);
+    r.sendLevel(5);
+    // The same refusal path as ValidationFailed: refused before the producer state is touched.
+    r.returns.clear();
+    WorkerOp refused = r.producerOp(Rig::idempotentBatchOf({validRecord(1, 1)}, 77, 0), /*producerId=*/77, /*baseSequence=*/0);
+    const int64_t refusedCorr = refused.correlationId;
+    r.send(std::move(refused));
+    EXPECT_EQ(r.answerOf(refusedCorr), kSchemaVersionRetired);
+    EXPECT_EQ(r.log->logEndOffset(), 0);
+    // the producer's next valid batch re-uses sequence 0 and is APPENDED (a consumed sequence would make it a duplicate: no append)
+    r.returns.clear();
+    WorkerOp okFirst = r.producerOp(Rig::idempotentBatchOf({validRecord(2, 3)}, 77, 0), 77, 0);
+    const int64_t c1 = okFirst.correlationId;
+    r.send(std::move(okFirst));
+    EXPECT_EQ(r.answerOf(c1), kOk);
+    EXPECT_EQ(r.log->logEndOffset(), 1) << "appended: the refusal consumed no sequence";
+    r.returns.clear();
+    WorkerOp okNext = r.producerOp(Rig::idempotentBatchOf({validRecord(3, 3)}, 77, 1), 77, 1);
+    const int64_t c2 = okNext.correlationId;
+    r.send(std::move(okNext));
+    EXPECT_EQ(r.answerOf(c2), kOk);
+    EXPECT_EQ(r.log->logEndOffset(), 2) << "the sequence continues at 1";
+    EXPECT_EQ(r.worker->typedVersionRetiredForTest(), 1u);
+}
+
+TEST(CheckedWritesWorkerRegression, AWriteSpecWithALowerFloorIsIgnoredAndCountedRegression) {
+    Rig r;
+    r.typedWithFloor(4, 3);
+    r.sendLevel(5);
+    TopicWriteSpecWire older;   // a re-delivered spec from before the retire
+    older.topicId = kTopic; older.keyFieldId = kIdTag; older.keyType = rune::codec::PrimType::UInt64; older.keyWidth = 8;
+    older.legacyValidate = true; older.retiredBelow = 1;
+    r.sendSpec(older);
+    EXPECT_EQ(r.worker->lowerFloorsIgnoredForTest(kTopic), 1u);
+    ASSERT_NE(r.worker->writeSpecForTest(kTopic), nullptr);
+    EXPECT_EQ(r.worker->writeSpecForTest(kTopic)->retiredBelow(), 3);
+    EXPECT_EQ(r.produce(validRecord(1, 2)), kSchemaVersionRetired) << "still refused";
+    older.retiredBelow = 4;   // a higher floor moves forward
+    r.sendSpec(older);
+    EXPECT_EQ(r.produce(validRecord(1, 3)), kSchemaVersionRetired);
+    EXPECT_EQ(r.produce(validRecord(1, 4)), kOk);
+}
+
+// The race the DDL documents: a batch from an old producer is either appended (it reached the worker before the write-spec
+// op) or refused SchemaVersionRetired (it came after).  The ring is FIFO, so the order decides - driven here in that order.
+TEST(CheckedWritesWorkerRegression, ARetireRacingAnOldVersionBatchIsAppendedOrRefusedNeverLostRegression) {
+    Rig r;
+    r.typedWithFloor(3, 1);   // no floor yet
+    r.sendLevel(5);
+    r.returns.clear();
+    WorkerOp before = r.produceOp(batchOf({validRecord(1, 1)}));
+    const int64_t beforeCorr = before.correlationId;
+    WorkerOp floorOp;
+    floorOp.type = WorkerOp::Type::WriteSpecUpdate; floorOp.topicId = kTopic;
+    TopicWriteSpecWire w;
+    w.topicId = kTopic; w.keyFieldId = kIdTag; w.keyType = rune::codec::PrimType::UInt64; w.keyWidth = 8; w.legacyValidate = true;
+    w.retiredBelow = 3;
+    floorOp.schemaUpdateBlob.resize(topicWriteSpecWireLen(w));
+    ASSERT_EQ(encodeTopicWriteSpec(w, floorOp.schemaUpdateBlob), topicWriteSpecWireLen(w));
+    WorkerOp after = r.produceOp(batchOf({validRecord(2, 1)}));
+    const int64_t afterCorr = after.correlationId;
+    // all three are on the ring before the worker runs a pass
+    ASSERT_TRUE(r.worker->tryEnqueueOp(std::move(before)));
+    ASSERT_TRUE(r.worker->tryEnqueueOp(std::move(floorOp)));
+    ASSERT_TRUE(r.worker->tryEnqueueOp(std::move(after)));
+    r.pass();
+    EXPECT_EQ(r.answerOf(beforeCorr), kOk) << "queued before the write-spec op: appended";
+    EXPECT_EQ(r.answerOf(afterCorr), kSchemaVersionRetired) << "queued after it: refused, explicitly";
+    EXPECT_EQ(r.log->logEndOffset(), 1) << "exactly the first batch is stored";
 }

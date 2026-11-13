@@ -68,7 +68,8 @@ struct FrameCheck {
 //                            namespaces NamespaceDdl=81..NamespaceUsageResponse=85; WorkerBind=86 (WorkerBindAck=87 is
 //                            broker -> client only, unknown here); GetViewRowK=88, ScanViewRows=89,
 //                            ScanViewRowsResponse=90; GetStats=91, StatsResponse=92; 93-95 gap → UnknownTemplate)
-//   lease           96-111 (LeaseKeepAlive=96 .. ScanLeasesResponse=101; 102-111 gap → UnknownTemplate)
+//   lease           96-111 (LeaseKeepAlive=96 .. ScanLeasesResponse=101; SecurityBootstrapChallengeRequest=102,
+//                            SecurityBootstrapChallenge=103; 104-111 gap → UnknownTemplate)
 //
 // Extend this function when future tickets add template ids.
 // ---------------------------------------------------------------------------
@@ -129,6 +130,11 @@ struct FrameCheck {
     // lease topics (client version 18): 96..101 (102-111 gap -> UnknownTemplate)
     if (tid >= static_cast<uint16_t>(TemplateId::LeaseKeepAlive) &&
         tid <= static_cast<uint16_t>(TemplateId::ScanLeasesResponse)) {
+        return true;
+    }
+    // bootstrap challenge (client version 19): 102..103 (104-111 gap -> UnknownTemplate)
+    if (tid >= static_cast<uint16_t>(TemplateId::SecurityBootstrapChallengeRequest) &&
+        tid <= static_cast<uint16_t>(TemplateId::SecurityBootstrapChallenge)) {
         return true;
     }
     return false;

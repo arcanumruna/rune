@@ -16,6 +16,7 @@
 // Deterministic: no Aeron, no sleeps — makeForTest + the apply*ForTest seams
 // (the TopicServabilityTest rig); "committed placement" = the steady-state
 // routing image (committed metadata ready).
+#include <rune/codec/AlterOps.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/node/NamespacePaths.h>
 #include <rune/gateway/SecurityView.h>
@@ -216,8 +217,9 @@ struct GatewayRig {
     }
     /// One well-formed DDL frame of `t` (v8 extension unless the session is pre-v8).
     std::optional<rune::protocol::LeaseSpec> defineLease;   // set: the DefineTopic frame carries this lease (v18)
+    std::vector<uint8_t> alterOps{1, 2, 3};   // the ops blob of an AlterTopic frame (#419: a test may carry a retire statement)
     std::vector<uint8_t> ddlFrame(pc::TemplateId t, int64_t c, bool withExt) {
-        static const std::vector<uint8_t> blob{1, 2, 3};
+        const std::vector<uint8_t>& blob = alterOps;
         pc::DdlExtension ext;
         ext.clientName = "gw-test";
         ext.requestId  = {0x7E57, static_cast<uint64_t>(c)};
@@ -302,7 +304,10 @@ struct GatewayRig {
         s.name = name; s.partitionCount = partitions;
         return registry->createTopicAt(topicId, s);
     }
-    void placeWithoutApply(int32_t topicId, int32_t partitions) { place(topicId, partitions); }
+    void placeWithoutApply(int32_t topicId, int32_t partitions) {
+        place(topicId, partitions);
+        gw.setAppliedTopicFrontier(topicId);   // #988: the catalog applied everything below this id; it is the one in flight
+    }
     void applyWithoutPlacement(int32_t topicId, int32_t partitions) {
         ASSERT_EQ(apply(topicId, partitions, "t" + std::to_string(topicId)), topicId);
     }
@@ -588,7 +593,9 @@ TEST(CatalogGatewayRegression, ViewReadOfAnUnappliedViewIsNotReadyAndOfADroppedV
     EXPECT_EQ(g.viewRowStatus(6), pc::ViewRowResponse::kNotReady) << "applied, not placed: retriable";
     ASSERT_TRUE(g.registry->dropTopic(6));
     EXPECT_EQ(g.viewRowStatus(6), pc::ViewRowResponse::kUnknownView) << "dropped: permanent";
-    EXPECT_EQ(g.viewRowStatus(9), pc::ViewRowResponse::kUnknownView) << "never placed, never applied";
+    EXPECT_EQ(g.viewRowStatus(9), pc::ViewRowResponse::kNotReady)
+        << "never placed, never applied, at or above the applied frontier: not applied here yet (#507)";
+    EXPECT_EQ(g.viewRowStatus(2), pc::ViewRowResponse::kUnknownView) << "below the frontier, never seen: decided here";
 }
 
 // Fix round 1 (I3): a dropped topic's GROUP-created subscriptions go with it —
@@ -1431,4 +1438,32 @@ TEST(CatalogDescribeMaskRegression, TheGatewayStampsTheDescribeMaskOfTheRequests
     EXPECT_EQ(send(pc::TemplateId::DropTopic, viewOnly()), std::nullopt);
     // Dev / in-process: allow-all describes everything, catalog included.
     EXPECT_EQ(send(pc::TemplateId::DefineTopic, PermissionTable::allowAll()), 7);
+}
+
+// #419: `alter topic t retire version < N` is an AlterTopic whose ops are one RetireBelow; the gateway authorizes it as the
+// ALTER of the topic's schema, exactly - no grant weaker than ALTER lets it through, and ALTER alone is enough.
+TEST(CatalogRetireAuthRegression, ARetireStatementNeedsExactlyTheAlterGrantOnTheTopicRegression) {
+    using rune::security::Operation;
+    using rune::security::ResourceType;
+    GatewayRig g;
+    g.gateway().setCatalogRoute(rune::gateway::RouteLocalLeader{});
+    rune::codec::AlterOp op{};
+    op.type = rune::codec::AlterOpType::RetireBelow;
+    op.version = 3;
+    g.alterOps = rune::codec::encodeAlterOps({op});
+
+    for (const Operation weaker : {Operation::Read, Operation::Write, Operation::Create, Operation::Drop, Operation::Describe}) {
+        g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", tableOf({grantOn(weaker, ResourceType::Topic, "t")}), {}});
+        const std::size_t before = g.adminSubmits();
+        const DdlAnswer a = g.sendDdl(pc::TemplateId::AlterTopic);
+        EXPECT_TRUE(a.answered) << static_cast<int>(weaker);
+        EXPECT_EQ(a.code, pc::ErrorCode::NotAuthorized) << static_cast<int>(weaker);
+        EXPECT_EQ(g.adminSubmits(), before) << "a refused retire never reaches the admin thread: " << static_cast<int>(weaker);
+    }
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", tableOf({grantOn(Operation::Alter, ResourceType::Topic, "other")}), {}});
+    EXPECT_EQ(g.sendDdl(pc::TemplateId::AlterTopic).code, pc::ErrorCode::NotAuthorized) << "ALTER on another topic";
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", tableOf({grantOn(Operation::Alter, ResourceType::Topic, "t")}), {}});
+    const std::size_t before = g.adminSubmits();
+    (void)g.sendDdl(pc::TemplateId::AlterTopic);
+    EXPECT_EQ(g.adminSubmits(), before + 1) << "ALTER on the topic is enough: the retire reaches the admin thread";
 }

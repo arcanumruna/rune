@@ -1188,6 +1188,7 @@ TEST(LeaseGatewayRouteRegression, NonNotAuthorizedDenialIsRouteRefusalRegression
     ASSERT_TRUE(g.setup({1}));
     const int64_t v = g.leaseVersion(1);
     const int64_t user = g.authedSession({topicGrant(rs::Operation::Read), topicGrant(rs::Operation::Write)}, 0, 0, /*indexTopic=*/false);
+    g.gw.setAppliedTopicFrontier(kTopic);   // #988: everything below the lease topic is applied; it is the id in flight
     for (const auto& f : {g.kaFrame(1, {{1, v}}, kTopic, user), g.ttlFrame(2, 1, kTopic, user)}) {
         const auto fr = g.send(f);
         ASSERT_EQ(fr.size(), 1u);
@@ -1195,6 +1196,45 @@ TEST(LeaseGatewayRouteRegression, NonNotAuthorizedDenialIsRouteRefusalRegression
     }
     g.settle();
     EXPECT_EQ(g.out.size(), 2u);
+}
+
+// 15b. #988: a topic of another namespace that this broker has PLACED but not applied yet answers exactly like an id
+//     that was never created: both are at or above the applied frontier, both the retriable NotLeader, byte for byte.
+//     Once the apply lands the foreign topic answers the terminal NotAuthorized.
+//     Mutation: unappliedTopicCode_ decides by placement again -> the placed id answers NotLeader, the never-made one
+//     NotAuthorized (red).
+TEST(LeaseGatewayRouteRegression, AJustPlacedForeignTopicAnswersLikeANeverCreatedOneRegression) {
+    GwLease g;
+    ASSERT_TRUE(g.setup({1}));
+    const int64_t v = g.leaseVersion(1);
+    constexpr int32_t kNever = 77;   // above the frontier, never placed
+    const std::vector<rs::GrantSpec> both = {topicGrant(rs::Operation::Read), topicGrant(rs::Operation::Write)};
+    // placed, not applied here
+    const int64_t user = g.authedSession(both, /*nsId=*/1, /*topicNs=*/2, /*indexTopic=*/false);
+    g.gw.setAppliedTopicFrontier(kTopic);   // the catalog applied every id below the lease topic's
+
+    const auto kaPlaced = g.send(g.kaFrame(5, {{1, v}}, kTopic, user));
+    const auto kaNever  = g.send(g.kaFrame(5, {{1, v}}, kNever, user));
+    ASSERT_EQ(kaPlaced.size(), 1u);
+    ASSERT_EQ(kaNever.size(), 1u);
+    EXPECT_EQ(kaPlaced[0], kaNever[0]) << "a just-placed foreign topic is a never-created one, byte for byte";
+    expectErrorFrame(kaPlaced[0], pc::ErrorCode::NotLeader);
+    const auto ttlPlaced = g.send(g.ttlFrame(6, 1, kTopic, user));
+    const auto ttlNever  = g.send(g.ttlFrame(6, 1, kNever, user));
+    ASSERT_EQ(ttlPlaced.size(), 1u);
+    ASSERT_EQ(ttlNever.size(), 1u);
+    EXPECT_EQ(ttlPlaced[0], ttlNever[0]);
+    expectErrorFrame(ttlPlaced[0], pc::ErrorCode::NotLeader);
+
+    // the apply lands (the topic is now indexed in namespace 2, the frontier covers it): the foreign session is refused
+    g.gw.setAppliedTopicFrontier(kTopic + 1);
+    const int64_t user2 = g.authedSession(both, /*nsId=*/1, /*topicNs=*/2);
+    const auto kaApplied = g.send(g.kaFrame(5, {{1, v}}, kTopic, user2));
+    ASSERT_EQ(kaApplied.size(), 1u);
+    const auto k = asKa(kaApplied[0]);
+    ASSERT_TRUE(k.has_value());
+    ASSERT_EQ(k->es.size(), 1u);
+    EXPECT_EQ(k->es[0].code, kNotAuthorized) << "applied and foreign: terminal";
 }
 
 // 16. Led elsewhere with no known endpoint of the leader: the bare NotLeader (no Redirect target to name).

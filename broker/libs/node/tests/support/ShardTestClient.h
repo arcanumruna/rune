@@ -15,6 +15,7 @@
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/MetadataMessages.h>
 #include <rune/protocol/client/PingMessages.h>
+#include <rune/protocol/client/SecurityMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/SchemaMessages.h>
 
@@ -706,6 +707,37 @@ public:
         }
         return anyDdlAnswer_(corr);
     }
+    /// #234: the gateway's answer to a SecurityBootstrapChallengeRequest (102) by correlation id: the 32-byte
+    /// challenge, or
+    /// (a refusal answers a DdlResponse / ErrorResponse instead) the refusal.  Neither by `deadline`: both empty.
+    struct ChallengeOrRefusal {
+        std::optional<std::array<uint8_t, pc::kBootstrapChallengeBytes>> challenge;
+        std::optional<AnyAnswer> refusal;
+    };
+    int64_t sendBootstrapChallengeRequest(const std::string& ch, int32_t stream, int64_t sid) {
+        pc::SecurityBootstrapChallengeRequest m;
+        m.sessionId = sid; m.correlationId = ++corr_;
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    ChallengeOrRefusal awaitBootstrapChallenge(int64_t corr, Clock::time_point deadline) {
+        ChallengeOrRefusal out;
+        if (corr == 0) return out;
+        while (Clock::now() < deadline) {
+            poll_();
+            if (const auto it = challenges_.find(corr); it != challenges_.end()) {
+                out.challenge = it->second;
+                return out;
+            }
+            if (auto a = anyDdlAnswer_(corr)) {
+                out.refusal = AnyAnswer{a->responseTemplate, a->code, a->message};
+                return out;
+            }
+            pause_();
+        }
+        return out;
+    }
     /// How many answers of any kind arrived for `corr` (exactly-once checks).
     [[nodiscard]] std::size_t answersFor(int64_t corr) const {
         std::size_t n = (defines_.contains(corr) ? 1u : 0u) + (alters_.contains(corr) ? 1u : 0u) +
@@ -1153,6 +1185,9 @@ private:
             case pc::TemplateId::AuthServerFinal:
                 authFrames_[{hdr->templateId, hdr->correlationId}] = std::vector<uint8_t>(p, p + n);
                 break;
+            case pc::TemplateId::SecurityBootstrapChallenge:
+                if (auto r = pc::SecurityBootstrapChallenge::decode(p, n)) challenges_[r->correlationId] = r->challenge;
+                break;
             case pc::TemplateId::DdlResponse:
                 if (auto r = pc::DdlResponse::decode(p, n))
                     ddls_[r->correlationId] = DdlAnswer{r->errorCode, r->objectId, r->newVersion, r->gateTopicId,
@@ -1196,6 +1231,8 @@ private:
     std::map<int64_t, std::size_t>                  frameCount_;   // every non-Records frame by corr
     std::map<int64_t, std::vector<uint8_t>>         raw_;       // captureRawAnswers: every answer frame by corr
     std::map<int64_t, DdlAnswer>                    ddls_;      // DdlResponse (78) by corr (Task 11)
+    // #234: SecurityBootstrapChallenge (103) by corr
+    std::map<int64_t, std::array<uint8_t, pc::kBootstrapChallengeBytes>> challenges_;
     std::map<std::pair<uint16_t, int64_t>, std::vector<uint8_t>> authFrames_;   // AuthServerFirst / Final raw bytes (auth Task 11)
     struct ViewRowSeen { uint16_t status = 0; std::vector<uint8_t> row; };
     std::map<int64_t, ViewRowSeen>                  viewRows_;   // ViewRowResponse (status + row bytes) by corr

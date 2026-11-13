@@ -154,7 +154,7 @@ Result deleteStep(const CatalogState& s, const CatalogEvent& e, int64_t off, con
 std::expected<StagedV2, ApplyError> ApplyV2::run(const CatalogState& s, const CatalogEvent& e, int64_t offset) {
     if (auto v = wire::validateEvent(e))
         return fail(offset, Code::BadOps, prefix(e) + "invalid event: " + std::string(encodeErrorName(*v)));
-    if (!e.principal.requestId.none() && s.request(e.principal.requestId))
+    if (!e.principal.requestId.none() && s.request(e.principal.authenticated, e.principal.requestId))
         return fail(offset, Code::Precondition, prefix(e) + "requestId " + std::to_string(e.principal.requestId.hi) + ":" +
                                                     std::to_string(e.principal.requestId.lo) + " is already applied");
     if (isNamespaceKind(e.kind)) {
@@ -237,9 +237,10 @@ Applied ApplyV2::commit(CatalogState& s, const CatalogEvent& e, int64_t offset, 
 
     s.appliedOffset_ = offset;
     if (!e.principal.requestId.none())
-        s.requests_.emplace(e.principal.requestId,
-                            RequestRecord{.offset = offset, .kind = e.kind, .objectId = e.objectId, .newVersion = e.newVersion,
-                                          .topicId = -1, .schemaVersion = 0, .requestFingerprint = e.principal.requestFingerprint});
+        s.requests_[e.principal.requestId].push_back(CatalogState::RequestEntry{
+            e.principal.authenticated,
+            RequestRecord{.offset = offset, .kind = e.kind, .objectId = e.objectId, .newVersion = e.newVersion,
+                          .topicId = -1, .schemaVersion = 0, .requestFingerprint = e.principal.requestFingerprint}});
     return Applied{.kind = e.kind, .objectId = e.objectId, .newVersion = e.newVersion, .fingerprint = fingerprint,
                    .createdTopicId = -1, .droppedTopicId = -1, .nsId = e.nsId, .nsErased = erased};
 }

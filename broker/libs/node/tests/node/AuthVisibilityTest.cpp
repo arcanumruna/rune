@@ -30,8 +30,18 @@ std::vector<uint8_t> body(std::vector<uint8_t> f, const std::string& name = {}) 
 TEST(AuthVisibilityRegression, MissingAndHiddenObjectsAnswerIdenticallyRegression) {
     AuthRig r;
     const int64_t u = r.newUser({exact(SO::Read, ST::Topic, "orders")});   // sees nothing of "secret" / "board"
-    constexpr int32_t kMissing = 98'765;
+    // "Missing" is an id this broker has decided: a topic created and dropped.  An id above the applied topic
+    // frontier is "not applied here yet" for every session (#988): a hidden topic (below it) is told apart from one.
+    const int32_t kMissing = r.defineTopic(r.builder, "vanished");
+    ASSERT_GE(kMissing, 0);
+    ASSERT_EQ(r.dropTopicCode(r.builder, "vanished"), 0);
     ASSERT_NE(r.secret, kMissing);
+    {
+        const auto above = r.rawAnswer(r.c().sendSubscribe(r.ch(), r.stream(), u, 98'765, 0));
+        ASSERT_FALSE(above.empty());
+        EXPECT_EQ(pc::SubscribeResponse::decode(above.data(), above.size())->errorCode,
+                  static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "above the frontier: retriable for every session";
+    }
 
     // Subscribe by id.
     {

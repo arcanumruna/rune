@@ -1,5 +1,6 @@
 // libs/view/include/rune/view/ViewTable.h
 #pragma once
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -100,7 +101,10 @@ struct ViewTableKeys {
 };
 
 enum class PrefixScan : uint8_t { End, Stopped, CursorGone };
-inline constexpr std::size_t kScanTokenBytes = 12;      // [pos u32][version u64], P7-11
+// [r u32 LE][word u64 LE]: the hash-order position of the last row returned
+inline constexpr std::size_t kScanTokenBytes = 12;
+
+struct AlwaysFits { bool operator()(std::size_t) const noexcept { return true; } };
 
 class ViewTable {
 public:
@@ -160,38 +164,164 @@ public:
     bool erase(uint64_t key) noexcept;
     bool erase(const ViewKey& key) noexcept;
 
+    static uint32_t bitreverse32(uint32_t x) noexcept {
+        x = ((x >> 1) & 0x55555555u) | ((x & 0x55555555u) << 1);
+        x = ((x >> 2) & 0x33333333u) | ((x & 0x33333333u) << 2);
+        x = ((x >> 4) & 0x0F0F0F0Fu) | ((x & 0x0F0F0F0Fu) << 4);
+        x = ((x >> 8) & 0x00FF00FFu) | ((x & 0x00FF00FFu) << 8);
+        return (x >> 16) | (x << 16);
+    }
+
     // Prefix index (prefixWidth > 0): each prefix maps to a hashset of the keys of its rows.  Calls visit(key, payload)
-    // for every row under `prefix`; a false return stops BEFORE consuming that row.  `resume` is empty (start of the
-    // prefix's set) or kScanTokenBytes long: CursorGone if the prefix has no set or the token's version is not the
-    // set's current one (any insert or erase under the prefix since).  On Stopped, `next` is the token to resume from.
-    template <class Fn>
+    // for every row under `prefix`; a false return stops BEFORE consuming that row.
+    //
+    // Rows are visited in a total order that does not depend on slots, capacity or a block migration: ascending
+    // (r, word), where r = bitreverse32(low 32 bits of the row's hash) and word is the slot word (the key for a narrow
+    // table, the hash for a wide one).  `resume` is empty (start) or the kScanTokenBytes token an earlier Stopped
+    // returned: [r u32 LE][word u64 LE], meaning "every row at or below (r, word) was returned".  A row that stays
+    // under the prefix for the whole scan is therefore returned exactly once whatever is inserted, erased, grown, shrunk or
+    // migrated meanwhile; a row inserted or erased during the scan may or may not be returned; none is returned twice.
+    // This is not a snapshot.
+    //
+    // Rows whose (r, word) are equal (a 64-bit hash collision of two wide keys) are one group, returned together: for a
+    // group of more than one row `fits(groupSize)` is asked first and a false answer stops BEFORE the whole group (a
+    // group that does not fit an empty page is the caller's kRowTooLarge).  `visit` must then accept every row of a
+    // group `fits` accepted.  A refusal before the very first position (nothing returned, no token) cannot be told
+    // from the start by a token, so the caller treats it as an error, as the worker does with kRowTooLarge.
+    //
+    // One call looks at about kScanSlotBudget slots at most (a probe run is never cut), so a page may carry no rows
+    // and still a token.  End: nothing is left (a set that no longer exists is End, also with a token).
+    // CursorGone only for a token of the wrong length.  On Stopped, `next` is the token to resume from.
+    template <class Fn, class Fits = AlwaysFits>
     PrefixScan scanPrefix(std::span<const uint8_t> prefix, std::span<const uint8_t> resume,
-                          std::span<uint8_t, kScanTokenBytes> next, Fn&& visit) const noexcept {
-        const uint32_t id = findSet(prefix);
-        if (id == kNoSet) return resume.empty() ? PrefixScan::End : PrefixScan::CursorGone;
-        const PrefixSet& s = sets_[id];
-        uint32_t pos = 0;
+                          std::span<uint8_t, kScanTokenBytes> next, Fn&& visit, Fits&& fits = {}) const noexcept {
+        lastScanSlots_ = 0;
+        bool haveLb = false;                 // everything at or below (lbR, lbW) is already returned
+        uint32_t lbR = 0;
+        uint64_t lbW = 0;
         if (!resume.empty()) {
-            uint64_t version;
             if (resume.size() != kScanTokenBytes) return PrefixScan::CursorGone;
-            std::memcpy(&pos, resume.data(), 4);
-            std::memcpy(&version, resume.data() + 4, 8);
-            if (version != s.version) return PrefixScan::CursorGone;
+            std::memcpy(&lbR, resume.data(), 4);
+            std::memcpy(&lbW, resume.data() + 4, 8);
+            haveLb = true;
         }
+        const uint32_t id = findSet(prefix);
+        if (id == kNoSet) return PrefixScan::End;
+        const PrefixSet& s = sets_[id];
         const SetBlock cur = blockOf(s.block);
         const SetBlock old = s.migrating ? blockOf(s.oldBlock) : SetBlock{};
-        for (size_t total = old.cap + cur.cap; pos < total; ++pos) {
-            const SetBlock& b = pos < old.cap ? old : cur;
-            const size_t i = pos < old.cap ? pos : pos - old.cap;
-            if (b.tags[i] == kEmpty) continue;
-            const uint64_t word = b.words[i];
-            const uint8_t* payload = rowAddr(b.rids[i]);
-            const std::span<const uint8_t> key = headerLen_ ? keyOfRow(payload)
-                                                            : std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&word), keyWidth_);
-            if (!visit(key, payload)) {
-                std::memcpy(next.data(), &pos, 4);
-                std::memcpy(next.data() + 4, &s.version, 8);
-                return PrefixScan::Stopped;
+        const unsigned curBits = static_cast<unsigned>(std::countr_zero(cur.cap));
+        const unsigned oldBits = old.cap ? static_cast<unsigned>(std::countr_zero(old.cap)) : 0;
+        const unsigned k = curBits > oldBits ? curBits : oldBits;   // bucket i: the r values whose top k bits are i
+        const unsigned shift = 32 - k;
+        const uint64_t buckets = uint64_t{1} << k;
+
+        // The first bucket that can hold a row above the token.
+        uint64_t i = 0;
+        if (haveLb) {
+            uint64_t sr = lbR;
+            if (lbW == UINT64_MAX) {
+                if (lbR == UINT32_MAX) return PrefixScan::End;
+                ++sr;
+            }
+            i = sr >> shift;
+        }
+
+        const auto above = [&](uint32_t r, uint64_t w) { return !haveLb || r > lbR || (r == lbR && w > lbW); };
+        const auto rOf = [this](uint64_t w) { return bitreverse32(static_cast<uint32_t>(hashOfWord(w))); };
+        // Calls f(r, word, rid) for every entry of bucket `i` in the live blocks (displaced neighbours and, in a
+        // coarser block, the other half-buckets are filtered out by their r).
+        const auto forBucket = [&](uint64_t bucket, auto&& f) noexcept {
+            for (const SetBlock* b : {&cur, &old}) {
+                if (b->cap == 0) continue;
+                const unsigned kb = static_cast<unsigned>(std::countr_zero(b->cap));
+                size_t slot = static_cast<size_t>(bitreverse32(static_cast<uint32_t>(bucket >> (k - kb))) >> (32 - kb));
+                if (kb == 0) slot = 0;
+                const size_t mask = b->cap - 1;
+                for (size_t probes = 0; probes < b->cap; ++probes) {
+                    ++lastScanSlots_;
+                    if (b->tags[slot] == kEmpty) break;
+                    const uint64_t w = b->words[slot];
+                    const uint32_t r = rOf(w);
+                    if ((static_cast<uint64_t>(r) >> shift) == bucket) f(r, w, b->rids[slot]);
+                    slot = (slot + 1) & mask;
+                }
+            }
+        };
+        const auto emit = [&](uint32_t, uint64_t w, uint32_t rid) noexcept {
+            const uint8_t* payload = rowAddr(rid);
+            const std::span<const uint8_t> key =
+                headerLen_ ? keyOfRow(payload) : std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&w), keyWidth_);
+            return visit(key, payload);
+        };
+        const auto stopAt = [&](uint32_t r, uint64_t w) noexcept {
+            std::memcpy(next.data(), &r, 4);
+            std::memcpy(next.data() + 4, &w, 8);
+            return PrefixScan::Stopped;
+        };
+        // The token for a refusal before the group (gr, gw): the last position returned, else the incoming token, else
+        // the position just below the group (saturating).
+        const auto refuse = [&](uint32_t gr, uint64_t gw) noexcept {
+            if (haveLb) return stopAt(lbR, lbW);
+            if (gw > 0) return stopAt(gr, gw - 1);
+            return stopAt(gr > 0 ? gr - 1 : 0, gr > 0 ? UINT64_MAX : 0);
+        };
+
+        struct Ent { uint32_t r; uint64_t w; uint32_t rid; };
+        for (; i < buckets; ++i) {
+            if (lastScanSlots_ >= scanSlotBudget_) return stopAt(static_cast<uint32_t>((i << shift) - 1), UINT64_MAX);
+
+            Ent ents[64];
+            size_t n = 0;
+            bool overflow = false;
+            forBucket(i, [&](uint32_t r, uint64_t w, uint32_t rid) noexcept {
+                if (!above(r, w)) return;
+                if (n < 64) ents[n++] = {r, w, rid}; else overflow = true;
+            });
+            if (!overflow) {
+                for (size_t a = 1; a < n; ++a) {   // insertion sort by (r, word)
+                    const Ent e = ents[a];
+                    size_t j = a;
+                    const auto after = [&](const Ent& x) { return x.r > e.r || (x.r == e.r && x.w > e.w); };
+                    for (; j > 0 && after(ents[j - 1]); --j) ents[j] = ents[j - 1];
+                    ents[j] = e;
+                }
+                for (size_t a = 0; a < n;) {
+                    size_t b = a + 1;
+                    while (b < n && ents[b].r == ents[a].r && ents[b].w == ents[a].w) ++b;
+                    if (b - a > 1 && !fits(b - a)) return refuse(ents[a].r, ents[a].w);
+                    for (size_t x = a; x < b; ++x) {
+                        if (!emit(ents[x].r, ents[x].w, ents[x].rid)) return refuse(ents[a].r, ents[a].w);
+                    }
+                    haveLb = true;
+                    lbR = ents[a].r;
+                    lbW = ents[a].w;
+                    a = b;
+                }
+                continue;
+            }
+            // More than 64 rows in one bucket (only a degenerate hash): repeated min-selection, no allocation.
+            for (;;) {
+                bool found = false;
+                uint32_t mr = 0;
+                uint64_t mw = 0;
+                size_t group = 0;
+                forBucket(i, [&](uint32_t r, uint64_t w, uint32_t) noexcept {
+                    if (!above(r, w)) return;
+                    if (!found || r < mr || (r == mr && w < mw)) { found = true; mr = r; mw = w; group = 1; }
+                    else if (r == mr && w == mw) ++group;
+                });
+                if (!found) break;
+                if (group > 1 && !fits(group)) return refuse(mr, mw);
+                bool refused = false;
+                forBucket(i, [&](uint32_t r, uint64_t w, uint32_t rid) noexcept {
+                    if (refused || r != mr || w != mw) return;
+                    refused = !emit(r, w, rid);
+                });
+                if (refused) return refuse(mr, mw);
+                haveLb = true;
+                lbR = mr;
+                lbW = mw;
             }
         }
         return PrefixScan::End;
@@ -200,6 +330,8 @@ public:
     // Tests only: the size and slot count of the set under `prefix` (0 when it has none), the most entries any one
     // op moved between a set's blocks, and the pool chunks allocated.
     static constexpr size_t kSetMigrate = 256;
+    // Slots one scanPrefix call may look at before it returns an (possibly empty) page and a token.
+    static constexpr size_t kScanSlotBudget = 4096;
     [[nodiscard]] uint32_t prefixSetSizeForTest(std::span<const uint8_t> prefix) const noexcept {
         const uint32_t id = findSet(prefix);
         return id == kNoSet ? 0 : sets_[id].size;
@@ -208,6 +340,13 @@ public:
         const uint32_t id = findSet(prefix);
         return id == kNoSet ? 0 : static_cast<uint32_t>(blockOf(sets_[id].block).cap);
     }
+    [[nodiscard]] bool prefixSetMigratingForTest(std::span<const uint8_t> prefix) const noexcept {
+        const uint32_t id = findSet(prefix);
+        return id != kNoSet && sets_[id].migrating;
+    }
+    void setScanSlotBudgetForTest(size_t slots) noexcept { scanSlotBudget_ = slots; }
+    // Slots the most recent scanPrefix call looked at (0 until the scan reads slots).
+    [[nodiscard]] size_t lastScanSlotsVisitedForTest() const noexcept { return lastScanSlots_; }
     [[nodiscard]] uint32_t maxSetEntriesMovedPerOpForTest() const noexcept { return maxSetMoved_; }
     [[nodiscard]] std::size_t prefixPoolChunksForTest() const noexcept { return poolChunks_.size(); }
 
@@ -488,7 +627,6 @@ private:
     // (backshift deletes) until it drains; lookups probe both blocks meanwhile.
     struct SetBlock { uint8_t* tags = nullptr; uint64_t* words = nullptr; uint32_t* rids = nullptr; size_t cap = 0; };
     struct PrefixSet {
-        uint64_t version   = 0;
         uint32_t block     = 0;
         uint32_t size      = 0;
         uint32_t oldBlock  = 0;   // while migrating
@@ -586,7 +724,8 @@ private:
     std::vector<uint8_t>   blockClass_;        // block id -> class
     std::vector<std::vector<uint32_t>> blockFree_;   // per class
     size_t   chunkBytes_ = 0;
-    uint64_t versionClock_ = 0;                // set versions; seeded from std::random_device
+    mutable size_t lastScanSlots_ = 0;         // tests only
+    size_t scanSlotBudget_ = kScanSlotBudget;  // tests lower it
     size_t   poolBytes_ = 0;                   // bytes of poolChunks_
     uint32_t maxSetMoved_ = 0;
 

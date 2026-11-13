@@ -200,6 +200,13 @@ struct WorkerOp {
         // partition, nextOffset = the leader epoch, correlationId = the lineage token (uint64 bit-cast to int64), hwBound = the
         // lineage generation.  No tail.  (41 = TRANSIENT_LINEAGE.)
         TransientLineage          = 41, ///< control → worker: the committed data lineage of a transient lease partition
+        // #880 (segment repair), Aeron-transport USER partitions: transport -> the owning worker.  RepairFetchReq
+        // reuses fetchRequestPayload (fetchOffset = the cursor, incarnation = the attempt id) + hwBound = the
+        // exclusive end offset; RepairFetchResp reuses replicatedPayload (errorCode = the status, logStartOffset =
+        // the attempt id echoed, records) + nextOffset = the cursor echoed.  Ownership-gated like
+        // ReconcileFetchReq / ReconcileFetchResp.
+        RepairFetchReq            = 42, ///< transport → worker: a peer serves a repair pull
+        RepairFetchResp           = 43, ///< transport → worker: the repairing replica applies a peer's answer
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -395,6 +402,7 @@ struct WorkerOp {
     //   bit 1 (kOpFlagCrcValidated = 0x02) — crcValidated (below; Produce only)
     //   bit 2 (kOpFlagFreshCursor = 0x04)  — freshCursor (PushRead only; E2 M2) / fromEarliest (Subscribe only)
     //   bit 3 (kOpFlagPushReadFromEarliest = 0x08) — fromEarliest (PushRead only; shares the bit with grantAll, SessionAnnounce only)
+    //   bit 4 (kOpFlagImportDeferred = 0x10) — importDeferred (Produce only; shares the bit with keyPending, SessionAnnounce only)
     // Writer: Worker::enqueueOp only.  Readers MUST mask the bit they need
     // (executeProduceWire_ does); `deferAck() != 0` is wrong.  Rename the
     // schema field to `flags` the next time rune-protocol's schema is touched.
@@ -412,6 +420,11 @@ struct WorkerOp {
     // The session may IMPORT into this topic (Produce only; set by ClientGateway::handleProduce from the session's
     // PermissionTable).  Carried over the ring as kOpFlagImportGranted of the wire `deferAck` byte.
     bool importGranted = false;
+
+    // #506: the session holds no IMPORT on the topic AND the gateway's security view is behind events it already holds, so
+    // the missing IMPORT may be a committed-but-unapplied grant: not a verdict (Produce only; set by ClientGateway::handleProduce).
+    // Carried over the ring as kOpFlagImportDeferred of the wire `deferAck` byte.
+    bool importDeferred = false;
 
     // durabilityTier: controls when the ProduceResult ack is emitted.
     //   0 = Leader  — ack immediately after appendNoSync (today's default).
@@ -791,6 +804,7 @@ inline constexpr uint8_t kOpFlagFreshCursor  = 0x04;   ///< WorkerOp::freshCurso
 inline constexpr uint8_t kOpFlagFromEarliest = 0x04;   ///< WorkerOp::fromEarliest (Subscribe only; shares the bit with the PushRead-only freshCursor)
 inline constexpr uint8_t kOpFlagPushReadFromEarliest = 0x08;   ///< WorkerOp::fromEarliest (PushRead only; shares the bit with the SessionAnnounce-only grantAll)
 inline constexpr uint8_t kOpFlagKeyPending   = 0x10;   ///< WorkerOp::keyPending (SessionAnnounce only)
+inline constexpr uint8_t kOpFlagImportDeferred = 0x10;  ///< WorkerOp::importDeferred (Produce only; shares the bit with the SessionAnnounce-only keyPending)
 inline constexpr uint8_t kOpFlagResponseBind = 0x20;   ///< WorkerOp::responseBind (SessionAnnounce only; NAT-safe egress)
 inline constexpr uint8_t kOpFlagSessionEgress = 0x40;  ///< WorkerOp::sessionEgress (Subscribe only; NAT-safe egress)
 inline constexpr uint8_t kOpFlagImportGranted = 0x80;  ///< WorkerOp::importGranted (Produce only)

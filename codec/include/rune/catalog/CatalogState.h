@@ -28,6 +28,9 @@ struct SchemaState {
     uint16_t                nextTag       = 0;
     rune::codec::CompatMode compat        = rune::codec::CompatMode::Backward;
     rune::protocol::TopicKeyFeatures keyFeatures{};
+    /// formatVer 5 (#419): schema versions below this are retired (refused at produce and typed open; history stays
+    /// readable).  1 = nothing retired; it only moves forward and never passes `schemaVersion`.
+    uint16_t                retiredBelow  = 1;
     bool operator==(const SchemaState&) const = default;
 };
 struct TopicObject {
@@ -169,8 +172,13 @@ public:
     [[nodiscard]] uint64_t nextObjectId() const noexcept { return nextObjectId_; }
     [[nodiscard]] int32_t  nextTopicId()  const noexcept { return nextTopicId_; }
     [[nodiscard]] int64_t  appliedOffset() const noexcept { return appliedOffset_; }   // -1 = nothing applied
-    /// The applied event carrying `requestId` (ruling 9, F14) — what its DDL answered.  Cold.
-    [[nodiscard]] std::optional<RequestRecord> request(const RequestId& requestId) const;
+    /// The record of the applied event that carried `requestId` and was authenticated as `principal` (ruling 9, F14)
+    /// — what its DDL answered.  Exact match on both: the same id recorded by another principal is not visible here.
+    /// Cold.
+    [[nodiscard]] std::optional<RequestRecord> request(std::string_view principal, const RequestId& requestId) const;
+    /// The record of `requestId` with the LOWEST offset over all principals (deterministic), for a reader of the log
+    /// that looks for its own id (the CLI); never used to answer a client.
+    [[nodiscard]] std::optional<RequestRecord> requestOfAnyPrincipal(const RequestId& requestId) const;
     /// FNV-1a-64 over exactly: appliedOffset, nextObjectId, nextTopicId, then each live
     /// object's fingerprint (CatalogFingerprint.h) in objectId order, then each tombstone's
     /// in apply order; an object or tombstone of a namespace other than 0 hashes
@@ -194,7 +202,9 @@ private:
     std::map<NsKey, uint64_t, NsKeyLess>          viewNames_;     // live (nsId, view name) → objectId
     std::unordered_map<int32_t, uint64_t>         topicIds_;      // topicId → topic objectId
     std::unordered_map<int32_t, uint64_t>         viewTopicIds_;  // sink topicId → view objectId
-    std::unordered_map<RequestId, RequestRecord, RequestIdHash> requests_;   // {0,0} never stored
+    /// One entry per principal that recorded the id (almost always one).
+    struct RequestEntry { std::string principal; RequestRecord rec; };
+    std::unordered_map<RequestId, std::vector<RequestEntry>, RequestIdHash> requests_;   // {0,0} never stored
     std::vector<Tombstone>                        tombstones_;
     NamespaceRegistry                             namespaces_;
     uint64_t nextObjectId_  = 1;

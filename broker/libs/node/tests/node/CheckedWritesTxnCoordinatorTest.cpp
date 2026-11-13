@@ -1082,3 +1082,180 @@ TEST_F(CheckedWritesTxnCoordinatorRegression, AllYesAndTheTimeoutInOnePassIsNeve
     ASSERT_EQ(answers_.frames.size(), 1u);
     EXPECT_EQ(lastAnswer().errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidTxnState));
 }
+
+// ---------------------------------------------------------------------------
+// #995: a cycle of lock waits.  A partition leader whose judge is paused on a transaction's rows answers each pending vote with an
+// interim naming that holder (TxnVoteResult::waiting); the coordinator keeps the edge on the target and aborts the youngest
+// transaction of a cycle (TxnConflict) at once, instead of leaving it to the transaction timeout.
+// ---------------------------------------------------------------------------
+class TxnVoteDeadlockRegression : public CheckedWritesTxnCoordinatorTest {
+protected:
+    struct Txn {
+        std::string           id;
+        int64_t               pid = -1;
+        int16_t               epoch = 0;
+        std::vector<SentVote> asked;   ///< the votes its EndTxn sent: [cw-0, cw-1]
+    };
+
+    /// `n` transactions "tx1".."txn" on cw-0 and cw-1, their EndTxn(commit) sent in order (so tx1 is the oldest).  With
+    /// `sameStart` they all start at the same time (AddPartitions at one `now`).
+    std::vector<Txn> gates(int n, bool sameStart = false) {
+        std::vector<Txn> t(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            t[static_cast<std::size_t>(i)].id  = "tx" + std::to_string(i + 1);
+            t[static_cast<std::size_t>(i)].pid = initPid(t[static_cast<std::size_t>(i)].id, t[static_cast<std::size_t>(i)].epoch);
+        }
+        const int64_t startAt = now_;
+        for (Txn& x : t) {
+            if (sameStart) now_ = startAt;
+            EXPECT_EQ(addPartitions(x.id, x.pid, x.epoch, {{kCw, 0}, {kCw, 1}}), 0);
+        }
+        for (Txn& x : t) {
+            votes_.clear();
+            EXPECT_EQ(endTxn(x.id, x.pid, x.epoch, true), 0u);
+            x.asked = votes_;
+            EXPECT_EQ(x.asked.size(), 2u);
+        }
+        return t;
+    }
+    /// `on`'s vote at partition `part` of `t` is answered with the interim "my judge waits on `holder`".
+    void waitOn(const Txn& t, int part, int64_t holderPid, int16_t holderEpoch, int32_t coordinatorEpoch = -1) {
+        rune::gateway::TxnVoteResult r;
+        r.waiting = true; r.waitPid = holderPid; r.waitEpoch = holderEpoch;
+        svc_->onTxnVoteResult(kCw, part, t.pid, t.epoch, coordinatorEpoch >= 0 ? coordinatorEpoch : svc_->coordinatorEpoch(), r);
+    }
+    void waitOn(const Txn& t, int part, const Txn& holder) { waitOn(t, part, holder.pid, holder.epoch); }
+    void yes(const Txn& t, int part) { vote(t.asked[static_cast<std::size_t>(part)]); }
+};
+
+TEST_F(TxnVoteDeadlockRegression, ATwoTransactionCycleAbortsTheYoungerAtOnceRegression) {
+    auto t = gates(2);
+    yes(t[0], 0);                 // p answers yes for T1 ...
+    waitOn(t[1], 0, t[0]);        // ... and T2's vote at p waits behind T1's rows
+    yes(t[1], 1);                 // q answers yes for T2 ...
+    waitOn(t[0], 1, t[1]);        // ... and T1's vote at q waits behind T2's rows: a cycle
+    EXPECT_EQ(svc_->voteWaitEdgesForTest(), 2u);
+    (void)svc_->doWork(now_);     // no clock advance: the transaction timeout is 30 s
+    EXPECT_EQ(svc_->txnDeadlocksResolvedForTest(), 1u);
+    EXPECT_EQ(svc_->txnStateForTest("tx2"), tx::TxnState::PrepareAbort) << "the younger transaction is the victim";
+    EXPECT_EQ(svc_->txnStateForTest("tx1"), tx::TxnState::Ongoing);
+    EXPECT_EQ(svc_->voteGatesForTest(), 1u);
+    EXPECT_EQ(svc_->voteWaitEdgesForTest(), 0u) << "the victim's gate is gone, and with it the edge onto it";
+    markerAppends_ = 0;
+    followerFetches();
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(markerAppends_, 2) << "the victim's abort markers go out on both partitions";
+    landMarkers(t[1].pid, {{kCw, 0}, {kCw, 1}});
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    const auto a = lastAnswer();
+    EXPECT_EQ(a.errorCode, static_cast<int16_t>(pc::ErrorCode::TxnConflict));
+    EXPECT_TRUE(a.hasVote);
+    yes(t[0], 1);                 // the partition's judge went on once the victim's markers released its rows
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx1"), tx::TxnState::PrepareCommit);
+}
+
+TEST_F(TxnVoteDeadlockRegression, AThreeTransactionCycleAbortsTheLatestStartRegression) {
+    auto t = gates(3);
+    waitOn(t[0], 0, t[1]);
+    waitOn(t[1], 1, t[2]);
+    waitOn(t[2], 0, t[0]);
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnDeadlocksResolvedForTest(), 1u);
+    EXPECT_EQ(svc_->txnStateForTest("tx3"), tx::TxnState::PrepareAbort);
+    EXPECT_EQ(svc_->txnStateForTest("tx1"), tx::TxnState::Ongoing);
+    EXPECT_EQ(svc_->txnStateForTest("tx2"), tx::TxnState::Ongoing);
+}
+
+TEST_F(TxnVoteDeadlockRegression, ATieOnTheStartTimeAbortsTheLargerProducerIdRegression) {
+    auto t = gates(2, /*sameStart=*/true);
+    ASSERT_NE(t[0].pid, t[1].pid);
+    const Txn& big = t[0].pid > t[1].pid ? t[0] : t[1];
+    const Txn& small = t[0].pid > t[1].pid ? t[1] : t[0];
+    waitOn(t[0], 0, t[1]);
+    waitOn(t[1], 1, t[0]);
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnDeadlocksResolvedForTest(), 1u);
+    EXPECT_EQ(svc_->txnStateForTest(big.id), tx::TxnState::PrepareAbort);
+    EXPECT_EQ(svc_->txnStateForTest(small.id), tx::TxnState::Ongoing);
+}
+
+TEST_F(TxnVoteDeadlockRegression, AChainWithoutACycleAbortsNothingRegression) {
+    auto t = gates(3);
+    waitOn(t[0], 0, t[1]);
+    waitOn(t[1], 1, t[2]);        // T1 -> T2 -> T3, and T3 waits on nobody
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnDeadlocksResolvedForTest(), 0u);
+    EXPECT_EQ(svc_->voteGatesForTest(), 3u);
+    EXPECT_EQ(svc_->txnStateForTest("tx1"), tx::TxnState::Ongoing);
+}
+
+TEST_F(TxnVoteDeadlockRegression, AHolderThatIsNoGateAndASelfEdgeAbortNothingRegression) {
+    auto t = gates(2);
+    waitOn(t[0], 0, 999'999, 3);   // a holder that is still producing, or already decided: delay, not a cycle
+    waitOn(t[1], 1, t[1]);         // its own previous transaction's rows
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnDeadlocksResolvedForTest(), 0u);
+    EXPECT_EQ(svc_->voteGatesForTest(), 2u);
+}
+
+TEST_F(TxnVoteDeadlockRegression, WhenTheHoldersGateEndsTheEdgesOntoItAreClearedRegression) {
+    auto t = gates(2);
+    waitOn(t[0], 0, t[1]);
+    ASSERT_EQ(svc_->voteWaitEdgesForTest(), 1u);
+    ASSERT_EQ(endTxn(t[1].id, t[1].pid, t[1].epoch, false), 0u) << "T2's abort takes its gate away";
+    EXPECT_EQ(svc_->voteGatesForTest(), 1u);
+    EXPECT_EQ(svc_->voteWaitEdgesForTest(), 0u) << "T1 no longer waits on a gate";
+    // T1 may now wait on a later transaction of the same producer without a stale edge making a cycle of it.
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnDeadlocksResolvedForTest(), 0u);
+}
+
+TEST_F(TxnVoteDeadlockRegression, AnInterimForAnOrphanedVoteDoesNotFreeTheOrphanRegression) {
+    auto t = gates(1);
+    ASSERT_EQ(endTxn(t[0].id, t[0].pid, t[0].epoch, false), 0u) << "the abort cancels the gate; its two votes are still out";
+    ASSERT_EQ(svc_->voteOrphansForTest(), 2u);
+    waitOn(t[0], 0, 999'999, 3);
+    EXPECT_EQ(svc_->voteOrphansForTest(), 2u) << "an interim is not the answer";
+    EXPECT_EQ(svc_->voteWaitEdgesForTest(), 0u);
+    yes(t[0], 0);
+    EXPECT_EQ(svc_->voteOrphansForTest(), 1u) << "the real answer frees it";
+}
+
+TEST_F(TxnVoteDeadlockRegression, AnInterimFromAnEarlierCoordinatorEpochIsIgnoredRegression) {
+    auto t = gates(2);
+    waitOn(t[0], 0, t[1].pid, t[1].epoch, svc_->coordinatorEpoch() - 1);
+    EXPECT_EQ(svc_->voteWaitEdgesForTest(), 0u);
+}
+
+TEST_F(TxnVoteDeadlockRegression, ARealAnswerAndAResendClearTheEdgeRegression) {
+    auto t = gates(2);
+    waitOn(t[0], 0, t[1]);
+    ASSERT_EQ(svc_->voteWaitEdgesForTest(), 1u);
+    vote(t[0].asked[0], 0, 0, -1, static_cast<int16_t>(pc::ErrorCode::NotLeader));   // the leader moved: a transport error
+    EXPECT_EQ(svc_->voteWaitEdgesForTest(), 0u) << "the answer ends the wait";
+    votes_.clear();
+    now_ += 2'000'000'000;   // past the resend backoff
+    (void)svc_->doWork(now_);
+    ASSERT_FALSE(votes_.empty()) << "the vote is sent again";
+    EXPECT_EQ(svc_->voteWaitEdgesForTest(), 0u);
+    EXPECT_EQ(svc_->txnDeadlocksResolvedForTest(), 0u);
+}
+
+TEST_F(TxnVoteDeadlockRegression, TwoDisjointCyclesAreResolvedOneVictimPerPassRegression) {
+    auto t = gates(4);
+    waitOn(t[0], 0, t[1]);
+    waitOn(t[1], 1, t[0]);
+    waitOn(t[2], 0, t[3]);
+    waitOn(t[3], 1, t[2]);
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnDeadlocksResolvedForTest(), 1u) << "one victim per pass";
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnDeadlocksResolvedForTest(), 2u) << "the flag stays dirty until a pass finds no cycle";
+    EXPECT_EQ(svc_->txnStateForTest("tx4"), tx::TxnState::PrepareAbort);
+    EXPECT_EQ(svc_->txnStateForTest("tx2"), tx::TxnState::PrepareAbort);
+    EXPECT_EQ(svc_->txnStateForTest("tx1"), tx::TxnState::Ongoing);
+    EXPECT_EQ(svc_->txnStateForTest("tx3"), tx::TxnState::Ongoing);
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnDeadlocksResolvedForTest(), 2u);
+}

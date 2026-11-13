@@ -1359,6 +1359,32 @@ public:
         return sendFetchResponseImpl_(toPeer, resp, /*reconcile=*/true);
     }
 
+    // -----------------------------------------------------------------------
+    // #880: sendRepairRequest / sendRepairResponse — FetchRequest / FetchResponse re-stamped as RepairFetchReq /
+    // RepairFetchResp (the extra facts ride in fields the pair leaves unused: see kRepairFetchReqTemplateId).
+    // -----------------------------------------------------------------------
+    bool sendRepairRequest(rune::replication::NodeId toPeer,
+                           const rune::replication::FetchRequestMsg& req) override
+    {
+        constexpr std::size_t kSize = rune::replication::FetchRequestMsg::TOTAL_SIZE;
+        alignas(8) uint8_t claimBuf[kSize];
+        rune::replication::FetchRequestMsg::encode(
+            claimBuf, 0,
+            req.leaderEpoch, req.partition, req.followerId,
+            req.fetchOffset, req.maxBytes, req.topicId, req.lastFetchedEpoch, req.incarnation,
+            req.storageId, req.lastEpochStartOffset);
+        rune::replication::stampTemplateId(
+            claimBuf, 0, rune::replication::kRepairFetchReqTemplateId);
+        return pubReg_.sendToPeer(toPeer, claimBuf, kSize) > 0;
+    }
+
+    bool sendRepairResponse(rune::replication::NodeId toPeer,
+                            const rune::replication::FetchResponseMsg& resp) override
+    {
+        return sendFetchResponseImpl_(toPeer, resp, /*reconcile=*/false,
+                                      rune::replication::kRepairFetchRespTemplateId);
+    }
+
 private:
     // -----------------------------------------------------------------------
     // dispatchFrame_ — decode the SBE header and fixed fields, apply maxBytes
@@ -1420,6 +1446,7 @@ private:
         switch (templateId) {
             case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchRequest):
             case rr::kReconcileFetchReqTemplateId:
+            case rr::kRepairFetchReqTemplateId:   // #880: the FetchRequest layout
             {
                 if (len < rr::FetchRequestMsg::MIN_SIZE) [[unlikely]] return;
                 topicId = rr::detail::read_le<int32_t>(frame + kHdrSize + 28);
@@ -1452,6 +1479,7 @@ private:
             }
             case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchResponse):
             case rr::kReconcileFetchRespTemplateId:
+            case rr::kRepairFetchRespTemplateId:   // #880: the FetchResponse layout
             {
                 if (len < rr::FetchResponseMsg::MIN_SIZE) [[unlikely]] return;
                 // Generated SBE: topicId @ m_offset+30 (errorCode+2=@28, topicId@30;
@@ -1600,7 +1628,7 @@ private:
 
     bool sendFetchResponseImpl_(rune::replication::NodeId peer,
                                 const rune::replication::FetchResponseMsg& resp,
-                                bool reconcile) noexcept
+                                bool reconcile, uint16_t restampTemplateId = 0) noexcept
     {
         namespace rr = rune::replication;
         static const uint8_t kNoRecords = 0;
@@ -1616,6 +1644,7 @@ private:
         rr::detail::write_le<uint32_t>(prefix + prefixLen - rr::FetchResponseMsg::VAR_HEADER_SIZE,
                                        static_cast<uint32_t>(resp.records.size()));
         if (reconcile) rr::stampTemplateId(prefix, 0, rr::kReconcileFetchRespTemplateId);
+        if (restampTemplateId != 0) rr::stampTemplateId(prefix, 0, restampTemplateId);   // #880
         return pubReg_.sendGatherToPeer(peer, prefix, prefixLen, resp.records) > 0;
     }
 

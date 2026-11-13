@@ -255,8 +255,8 @@ struct ViewRowResult {
     /// with the defaults (5 s each) a read that is never routed ends as kNotLeader or
     /// as a Timeout (the *AndWait form throws), whichever bound is hit first.
     static constexpr uint16_t kNotLeader       = 8;
-    /// A scan's resume token no longer matches its prefix: restart the scan (the broker's ViewRowResponse::kCursorInvalidated).
-    /// Shares the value 8 with kNotLeader: a routing failure of a scan reads the same, and restarting is right for both.
+    /// A scan's resume token is malformed (the broker's ViewRowResponse::kCursorInvalidated); a write under the prefix no longer
+    /// invalidates it.  Shares the value 8 with kNotLeader: a routing failure of a scan reads the same, and restarting is right for both.
     static constexpr uint16_t kCursorInvalidated = 8;
 
     uint16_t              status = kUnknownView;
@@ -685,7 +685,10 @@ public:
     /// Moves the seed's physical ingress channel (the next rebuild() keeps it); applied on the duty thread at the next doWork().
     void testSetSeedIngressChannel(const std::string& channel) { (void)agent_.submitTestSeedIngress(channel); }
     /// Moves the seed to `channel` as a completed failover would (Invoker owner only).
-    bool testRetargetSeed(const std::string& channel) { return agent_.failoverSeedTo(channel, now(), true); }
+    bool testRetargetSeed(const std::string& channel) {
+        uint64_t token = 0;
+        return agent_.failoverSeedTo(channel, now(), true, token) != agent::ClientAgent::SeedMove::Failed;
+    }
     /// Transport rebuilds completed so far (duty thread, or after it stopped).
     [[nodiscard]] uint64_t testTransportRebuilds() const noexcept { return agent_.transportRebuilds(); }
     /// Failed rebuild attempts of the current outage (duty thread, or after it stopped).
@@ -774,6 +777,10 @@ public:
     /// Fix round 5 (N4-I1) test hook: final-leg HandshakeFailed verdicts the agent applied.
     [[nodiscard]] uint64_t testHandshakeFinalLegFailures() const noexcept { return agent_.handshakeFinalLegFailures(); }
     [[nodiscard]] uint64_t testStaleSessionNotices() const noexcept { return agent_.staleSessionNotices(); }
+    /// #12: session notices / auth answers a sealed session ignored because its own key did not open them.
+    [[nodiscard]] uint64_t testForgedSessionFramesIgnored() const noexcept {
+        return agent_.forgedSessionFramesIgnored();
+    }
     /// #989: sessions resumed because their response pair's gateway publication closed.
     [[nodiscard]] uint64_t testResponseEgressLosses() const noexcept { return agent_.responseEgressLosses(); }
     /// Test hook (duty-cycle thread only): the seed session's current broker session id (0 = none).
@@ -863,6 +870,10 @@ public:
     [[nodiscard]] uint32_t testCoordinatorSessionIndex() const noexcept { return coordIdx(); }
     [[nodiscard]] uint64_t testCoordinatorRedirects() const noexcept { return coordinatorRedirects_; }
     [[nodiscard]] uint64_t testCoordinatorFallbacks() const noexcept { return coordinatorFallbacks_; }
+    /// #361: coordinator moves a metadata answer caused (a silent / down coordinator session left for the node the
+    /// answer names), and the stale-session losses (not the client's own stalls) of session `idx`.
+    [[nodiscard]] uint64_t testCoordinatorMetadataMoves() const noexcept { return coordinatorMetadataMoves_; }
+    [[nodiscard]] uint64_t testStaleLossesAt(uint32_t idx) const noexcept { return staleLossesAt_(idx); }
     /// DR client bug 1 (duty thread / after close): seed failovers started (each a
     /// move of the seed to another broker), and the MetadataRequests sent on a
     /// non-seed session because the seed was not Connected.
@@ -875,6 +886,10 @@ public:
     [[nodiscard]] uint64_t testCloseDeadlineHits() const noexcept { return closeDeadlineHits_; }
     [[nodiscard]] uint64_t testMetadataViaOtherSession() const noexcept { return metadataViaOtherSession_; }
     [[nodiscard]] const std::string& testSeedChannel() const noexcept { return agent_.seedChannel(); }
+    /// #767: how often the seed's default publication moved (a completed retarget / failover).
+    [[nodiscard]] uint64_t testSeedMoves() const noexcept { return agent_.seedMoves(); }
+    /// #767 follow-up: redirects whose target could not be reached (the failure body ran).
+    [[nodiscard]] uint64_t testUnreachableRedirects() const noexcept { return unreachableRedirects_; }
     /// Fix round 1 test seam (duty thread / Invoker owner): an urgent metadata ask.
     void testRequestMetadataNow() noexcept { lastUrgentMetadataNs_ = INT64_MIN; requestMetadataNow_(); }
     /// True while a MetadataRequest is unanswered (its answer timer is armed).  Test seam (duty thread).
@@ -1674,6 +1689,8 @@ private:
         int32_t              routeTopic = -1;
         int32_t              routePartition = -1;
         bool                 hinted = false;   // `endpoint` came from the route-hint table and no Redirect was followed yet
+        // #234: non-empty = every offer sends THIS first (a bootstrap's challenge request)
+        std::vector<uint8_t> challengeFrame;
     };
     static constexpr int32_t kRouteAnyPartition = -2;
     /// L22 fix 2: the node that last answered a partition-routed op for (topic, partition) - the next op starts there
@@ -1720,7 +1737,9 @@ private:
         /// own deadline; it never reached a broker.
         struct CtlAwaitingSeed { std::vector<uint8_t> frame; };
         std::variant<std::monostate, RoutedCtlPending, CtlAwaitingSeed> ddl;   // catalog history: a DDL's own state
-        detail::SecretString newPassword;   // review B I4: a self SET PASSWORD's plaintext until its answer (wiped always)
+        /// review B I4: a self SET PASSWORD's plaintext, or a bootstrap's MAC key (#234), until its answer
+        /// (wiped always)
+        detail::SecretString newPassword;
         /// Task 15: a multi-entry LeaseKeepAlive (leaseKeepAliveBatch).  multiCount > 0: each answered entry delivers its own completion
         /// (reserved0 = the entry index, 48 reserved bytes); the op's terminal completion (reserved0 == kLeaseKeepAliveTerminal) carries
         /// 48 x (1 + unanswered entries).  multiBits marks the entries answered so far (a duplicate or out-of-range index is dropped).
@@ -1871,6 +1890,15 @@ private:
     /// NotCoordinator, endpoint}) — the coordinator route follows it (the seed
     /// session never moves).  No-op when it names the current coordinator.
     void onCoordinatorRedirect_(const std::string& message);   // "endpoint[#responsePort]"
+    /// The route move behind onCoordinatorRedirect_ and a metadata answer naming the coordinator (#361): false = nothing
+    /// moved (already there, or a Rejected node not re-followed before fresh metadata).
+    bool moveCoordinatorTo_(const std::string& channel);
+    /// #361: the remote coordinator session is silent (two keepalives) or not Connected (the seed route: false).
+    [[nodiscard]] bool coordinatorSuspect_(int64_t nowNs) const noexcept;
+    /// #361: the remote coordinator session is Connected but silent (two keepalives).
+    [[nodiscard]] bool coordinatorSilent_(int64_t nowNs) const noexcept;
+    /// #361: a group member, a transactional producer or a pending coordinator request depends on the coordinator.
+    [[nodiscard]] bool coordinatorInUse_() const noexcept;
     /// D4: tell the group hub the COORDINATOR session's (connected, sessionId,
     /// episode) if it changed; a coordinator session that (re)connected joins the
     /// members there; one that gave up falls back to the seed.  Called from
@@ -1892,6 +1920,7 @@ private:
     static constexpr int64_t kCoordDownFallbackNs = 5'000'000'000LL;
     int64_t     coordNeverUpGraceNs_ = kMetadataBackoffInitNs;   // grace of a coordinator session never Connected; doubles per give-up
     uint64_t    coordinatorRedirects_ = 0;   // coordinator moves followed
+    uint64_t    coordinatorMetadataMoves_ = 0;   // #361: of those, moves a metadata answer named (the old one was suspect)
     uint64_t    coordinatorFallbacks_ = 0;   // coordinator sessions given up (back to the seed)
     // r2 LOW-3: a coordinator channel whose session was Rejected / Closed, and
     // the metadataResponses_ count then (re-followed only after fresh metadata).
@@ -1942,6 +1971,9 @@ private:
     /// Offer d.frame to d.endpoint's node (the seed when ""); on Accepted, `on`
     /// names the session it went out on.
     transport::AeronTransport::OfferResult offerDdl_(RoutedCtlPending& d, int64_t nowNs, DdlOfferedOn& on);
+    /// The ONE site that offers a routed op's bytes to its node: `frame` to `d.endpoint`, naming the session it rode.
+    transport::AeronTransport::OfferResult offerRoutedFrame_(RoutedCtlPending& d, std::vector<uint8_t>& frame,
+                                                             int64_t nowNs, DdlOfferedOn& on);
     /// Move d to `next`, keeping routedCtlAwaitingResend_ exact.
     void setDdlRetry_(RoutedCtlPending& d, DdlRetry next) noexcept;
     /// routedCtlPending_ / routedCtlAwaitingResend_ for an entry entering (+1) / leaving (-1) the table.
@@ -2170,6 +2202,25 @@ private:
     enum class RedirectFollow : uint8_t { PerPartition, Hold, BySeed };
     [[nodiscard]] RedirectFollow redirectFollowFor_(const std::string& endpoint) const;
     void redirectBySeed_(int64_t corrId, const std::string& newEndpoint, int32_t responsePort = 0);
+    /// #767: the seed move is asynchronous.  The two outcomes of a redirect's move, each exactly once (the code exists
+    /// once, whether the move completed at once or later); `superseded`: a newer redirect replaced it, so only this
+    /// op's own bookkeeping runs.
+    void onSeedRedirectMoved_(const std::string& newChannel);
+    void onSeedRedirectFailed_(int64_t corrId, const std::string& newEndpoint, bool superseded);
+    void onSeedFailoverMoved_(const std::string& target, bool connectNow, uint32_t attempt) noexcept;
+    void onSeedFailoverFailed_() noexcept;
+    /// Finish the seed moves the agent completed (their results carry the token of the move that was started).
+    int  serviceSeedMoves_();
+    /// One redirect waiting on the seed move `token`; further redirects to the SAME target join it (`joined`: their
+    /// own op and endpoint, cold path) - the move's moved / failed body runs once, the per-op part once per op.
+    struct JoinedRedirect { int64_t corrId; std::string endpoint; };
+    struct PendingRedirect {
+        uint64_t token; int64_t corrId; std::string endpoint; std::string channel;
+        std::vector<JoinedRedirect> joined;
+    };
+    std::optional<PendingRedirect> pendingRedirect_;
+    struct PendingFailover { uint64_t token; std::string target; bool connectNow; uint32_t attempt; };
+    std::optional<PendingFailover> pendingFailover_;
     int  releaseHeldRedirectFollows_();
     struct HeldRedirect { int64_t corrId; std::string endpoint; int metaSeen; int32_t responsePort; };
     /// The Redirect message a held entry came from ("endpoint[#responsePort]").

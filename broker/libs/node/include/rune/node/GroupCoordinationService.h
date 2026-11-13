@@ -58,6 +58,7 @@
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -431,6 +432,13 @@ private:
     static void refreshRebalanceTimeout_(rune::coordination::GroupCoordinator& gc) noexcept;
     int32_t         maxGroups_           = kDefaultMaxGroups;   // #214
     uint64_t        joinsRefusedGroupCap_ = 0;
+    /// #617: the per-principal share of the group cap (0 = derive: max(1, maxGroups_ / 2)); the creating principal
+    /// of each coordinated group (only non-zero principals; principal 0 = no authenticated principal, never charged)
+    /// and the number of live groups each principal created.  Control thread only.
+    int32_t         maxGroupsPerPrincipal_ = 0;
+    std::map<std::string, uint64_t, std::less<>> groupCreator_;
+    std::unordered_map<uint64_t, int32_t>        groupsCreatedBy_;
+    uint64_t        joinsRefusedPrincipalShare_ = 0;
     uint64_t        groupsPruned_         = 0;
     ClientVersionFn clientVersionFn_  = nullptr;
     void*           clientVersionCtx_ = nullptr;
@@ -454,7 +462,8 @@ public:
         clientVersionFn_ = fn; clientVersionCtx_ = ctx;
     }
     /// #214: at most this many consumer groups are coordinated at once (RUNE_GROUP_MAX_GROUPS).  A JoinGroup that would
-    /// create one more is refused (InvalidRequest with a detail; ProtocolVersion below 5); a join to an EXISTING group
+    /// create one more is refused (Throttled with a detail from client version 14, #617; the old rule's code below);
+    /// a join to an EXISTING group
     /// is never refused by the cap.  An Empty group holds nothing worth keeping (membership is never persisted, its
     /// committed offsets live in the offsets store) and is dropped on the next doWork.
     static constexpr int32_t kDefaultMaxGroups = 10'000;
@@ -463,6 +472,23 @@ public:
     [[nodiscard]] int32_t maxGroups() const noexcept { return maxGroups_; }
     /// #214: JoinGroups refused because the group cap was reached / empty groups dropped by doWork.
     [[nodiscard]] uint64_t joinsRefusedGroupCap() const noexcept { return joinsRefusedGroupCap_; }
+    /// #617: the most live groups ONE principal may have created (RUNE_GROUP_MAX_GROUPS_PER_PRINCIPAL).  A non-positive
+    /// value = unset = half of the group cap (at least 1); a value above the cap is the cap (no share).  Checked
+    /// only at a join that would CREATE a group; principal 0 (no authenticated principal) is never charged nor
+    /// limited.  The charge follows the CREATOR until the group is dropped, even when other principals' members
+    /// keep it alive.
+    void setMaxGroupsPerPrincipal(int32_t n) noexcept { maxGroupsPerPrincipal_ = n > 0 ? n : 0; }
+    /// The EFFECTIVE share, in [1, maxGroups()].
+    [[nodiscard]] int32_t maxGroupsPerPrincipal() const noexcept {
+        const int32_t v = maxGroupsPerPrincipal_ > 0 ? maxGroupsPerPrincipal_ : maxGroups_ / 2;
+        return std::clamp<int32_t>(v, 1, maxGroups_);
+    }
+    /// #617: JoinGroups refused because the creating principal was at its share.
+    [[nodiscard]] uint64_t joinsRefusedPrincipalShare() const noexcept { return joinsRefusedPrincipalShare_; }
+    [[nodiscard]] int32_t groupsCreatedByForTest(uint64_t principal) const noexcept {
+        const auto it = groupsCreatedBy_.find(principal);
+        return it == groupsCreatedBy_.end() ? 0 : it->second;
+    }
     [[nodiscard]] uint64_t groupsPruned() const noexcept { return groupsPruned_; }
     [[nodiscard]] uint64_t parkRefusalsForTest() const noexcept { return parkRefusals_; }
     [[nodiscard]] uint64_t unstableAnswersForTest() const noexcept { return unstableAnswers_; }
@@ -508,9 +534,11 @@ private:
         const uint64_t gen = (r->leadershipGeneration() << 32) ^ r->logGeneration();
         return offsetsRebuilt_ && wasLeader_ && gen == offsetsGen_ && r->acceptsProduce();
     }
+    uint64_t offsetFetchAllTooLarge_ = 0;    ///< fetch-all answers that were one MessageTooLarge sentinel (#592)
     uint64_t offsetsNotLoadedAnswers_ = 0;   ///< entries answered NotLeader while loading (round 4)
 public:
     [[nodiscard]] uint64_t offsetsNotLoadedAnswersForTest() const noexcept { return offsetsNotLoadedAnswers_; }
+    [[nodiscard]] uint64_t offsetFetchAllTooLargeForTest() const noexcept { return offsetFetchAllTooLarge_; }
 private:
     /// (leadershipGeneration << 32) ^ logGeneration of the offsets replica the
     /// index was rebuilt against (see doWork).

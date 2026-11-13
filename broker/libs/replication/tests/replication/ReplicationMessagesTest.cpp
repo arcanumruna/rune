@@ -1044,6 +1044,28 @@ TEST(CheckedWritesTxnVoteMsg, ResponseRoundTrips) {
     EXPECT_EQ(d.failingOffset, 123456);
 }
 
+// #995: the interim names the holder in the existing fields; the layout and the block length are unchanged, and a decoder that
+// knows nothing of it sees a non-zero errorCode (a transport error), never a vote.
+TEST(CheckedWritesTxnVoteMsgRegression, TheInterimRoundTripsOnTheUnchangedLayoutRegression) {
+    static_assert(TxnVoteResponseMsg::BLOCK_LENGTH == 48, "the interim rides the existing block");
+    static_assert(kTxnVoteWaiting < -12, "below every replication-plane kErr* code (-1 .. -12) and every client ErrorCode");
+    TxnVoteResponseMsg m;
+    m.token = 77; m.topicId = 41; m.partition = 5; m.producerId = 9001; m.coordinatorEpoch = 11; m.producerEpoch = 7;
+    m.errorCode = kTxnVoteWaiting; m.code = 0;
+    m.failingOffset = 0x1234567890LL;                              // the holder's producer id
+    m.constraintId  = static_cast<uint32_t>(static_cast<uint16_t>(int16_t{-3}));   // its producer epoch
+    std::array<uint8_t, TxnVoteResponseMsg::TOTAL_SIZE> b{};
+    ASSERT_EQ(m.encode(b.data(), b.size()), TxnVoteResponseMsg::TOTAL_SIZE);
+    TxnVoteResponseMsg d;
+    ASSERT_TRUE(TxnVoteResponseMsg::decode(b.data(), b.size(), d));
+    EXPECT_EQ(d.errorCode, kTxnVoteWaiting);
+    EXPECT_EQ(d.code, 0);
+    EXPECT_EQ(d.failingOffset, 0x1234567890LL);
+    EXPECT_EQ(static_cast<int16_t>(d.constraintId), int16_t{-3});
+    EXPECT_EQ(d.producerId, 9001);
+    EXPECT_NE(d.errorCode, 0) << "an old decoder sees a transport error";
+}
+
 TEST(CheckedWritesTxnVoteMsg, DecodeRefusesShortAndForeign) {
     // The foreign frames are full-length, valid frames of the other message with only the templateId rewritten,
     // so the template check is the only thing that can refuse them.

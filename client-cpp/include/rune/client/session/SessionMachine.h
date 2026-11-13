@@ -471,22 +471,26 @@ public:
     [[nodiscard]] rune::protocol::client::AuthMode brokerAuthMode() const noexcept { return authInfo_.brokerMode; }
     /// Authentication: AuthServerFinal carried kAuthFlagMustChangePassword (bootstrap one-time password) —
     /// the session is Connected but the broker only accepts a password change on it.
-    [[nodiscard]] bool passwordChangeRequired() const noexcept { return authInfo_.passwordChangeRequired; }
+    [[nodiscard]] bool passwordChangeRequired() const noexcept { return passwordChangeRequiredOf_(); }
     /// Review B I3: this Connected session was earned — a completed login, or the resume of a session this machine
     /// authenticated.  False for a session on a broker that skipped the login (allowUnauthenticatedBroker) and for
     /// a client without credentials.
-    [[nodiscard]] bool authenticated() const noexcept { return authInfo_.authenticated; }
+    [[nodiscard]] bool authenticated() const noexcept {
+        return std::holds_alternative<AuthInfo::Authenticated>(authInfo_.login);
+    }
     /// Review B I5: the broker answered Required + Anonymous (a cluster with no security admin yet): this session may
     /// carry ONLY the bootstrap — the broker answers any other frame AuthenticationFailed and closes it, so the
     /// machine sends no keepalive and the Client no connect-time metadata request on it.  Nothing keeps such a
     /// session alive: the broker's login deadline ends it, and an accepted bootstrap restarts that deadline so its
     /// answer arrives first (#240).
-    [[nodiscard]] bool anonymousBootstrap() const noexcept { return authInfo_.anonymousBootstrap; }
+    [[nodiscard]] bool anonymousBootstrap() const noexcept {
+        return std::holds_alternative<AuthInfo::BootstrapOnly>(authInfo_.login);
+    }
     /// #514: Connected, able to be pinged (not a bootstrap-only session), and no inbound frame for more than `ns`.
     /// A live node answers every keepalive Ping, so silence past two keepalive intervals means it is suspect -
     /// long before the response timeout declares the session stale.
     [[nodiscard]] bool silentLongerThan(int64_t nowNs, int64_t ns) const noexcept {
-        return state_ == SessionState::Connected && !authInfo_.anonymousBootstrap && nowNs - lastActivityNs_ > ns;
+        return state_ == SessionState::Connected && !anonymousBootstrap() && nowNs - lastActivityNs_ > ns;
     }
     [[nodiscard]] int64_t keepaliveIntervalNs() const noexcept { return cfg_.keepaliveIntervalNs; }
 
@@ -529,7 +533,7 @@ public:
     /// The credential changed (the agent already updated the shared secret): the one-time flag is cleared and the
     /// login proof is dropped.
     void passwordChanged() noexcept {
-        authInfo_.passwordChangeRequired = false;
+        if (auto* a = std::get_if<AuthInfo::Authenticated>(&authInfo_.login)) a->mustChangePassword = false;
         // Issue #114: the login's password may be gone (SET replaces every verifier): this session can no longer prove a
         // further own-credential change (the broker answers "log in again") - never sign with a stale salt, which
         // would also cost a PBKDF2 on the duty thread.
@@ -935,6 +939,9 @@ public:
         namespace rpc = rune::protocol::client;
         namespace rs  = rune::crypto::scram;
         if (state_ != SessionState::Authenticating || !scram_) return;
+        // #12: an auth answer acts only when it names this login's connect correlation id AND this session's id
+        // (any UDP sender could otherwise end a login with a bare AuthServerFinal{44}); a foreign one changes nothing.
+        if (sf.correlationId != correlationId_ || sf.sessionId != sessionId_ || sessionId_ == 0) [[unlikely]] return;
         auto* first = std::get_if<ScramSentFirst>(&*scram_);
         if (first == nullptr) return;   // a duplicate AuthServerFirst: the proof already went out
         const std::string_view cn = first->clientNonce;
@@ -996,6 +1003,9 @@ public:
     void onAuthServerFinal(const rune::protocol::client::AuthServerFinal& f, int64_t nowNs) noexcept {
         namespace rpc = rune::protocol::client;
         if (state_ != SessionState::Authenticating || !scram_) return;
+        // #12: an auth answer acts only when it names this login's connect correlation id AND this session's id
+        // (any UDP sender could otherwise end a login with a bare AuthServerFinal{44}); a foreign one changes nothing.
+        if (f.correlationId != correlationId_ || f.sessionId != sessionId_ || sessionId_ == 0) [[unlikely]] return;
         if (f.errorCode != 0) {
             const auto ec = static_cast<rpc::ErrorCode>(f.errorCode);
             if (ec == rpc::ErrorCode::AuthenticationFailed) failAuth_(ec, f.retryAfterMs, nowNs);
@@ -1021,9 +1031,8 @@ public:
             failAuth_(rpc::ErrorCode::AuthenticationFailed, 0, nowNs);   // "broker failed to prove the password"
             return;
         }
-        authInfo_.passwordChangeRequired = (f.flags & rpc::kAuthFlagMustChangePassword) != 0;
+        authInfo_.login                  = AuthInfo::Authenticated{(f.flags & rpc::kAuthFlagMustChangePassword) != 0};
         authInfo_.retryAfterMs           = 0;
-        authInfo_.authenticated          = true;
         authenticatedSessionId_          = sessionId_;   // a later resume of THIS id is this machine's own login
         loginCredential_ = LoginCredential{sessionId_, fin->combinedNonce, fin->salts[static_cast<std::size_t>(matched)],
                                            fin->iterations[static_cast<std::size_t>(matched)]};
@@ -1056,18 +1065,22 @@ public:
 
         if (state_ == SessionState::Connected) {
             // F-A C1 (defence in depth): a session-fatal notice naming ANOTHER session (one this machine already
-            // left) never moves this one.  0 = the notice names no session (kept: the old behaviour).
+            // left) never moves this one.  0 = the notice names no session (kept for the non-terminal SessionExpired /
+            // UnknownSession, which only lead to Resuming).
             if (noticeSessionId != 0 && sessionId_ != 0 && noticeSessionId != sessionId_) return;
+            // #12: a TERMINAL session-level notice (46 / 51 / AuthUnavailable, corr 0) is honoured only when it names
+            // THIS session: id 0 ("names no session") is no longer enough to end it.
+            const bool namesMe = noticeSessionId == sessionId_ && sessionId_ != 0;
             if (ec == rpc::ErrorCode::SessionExpired || ec == rpc::ErrorCode::UnknownSession) {
                 transitionTo(SessionState::Resuming);
                 // doResume fires on the next tick (FIX D: Resuming is a real waiting state).
                 resumeEntryNs_ = nowNs;
-            } else if (ec == rpc::ErrorCode::AuthUnavailable && incomingCorrelationId == 0) {
+            } else if (ec == rpc::ErrorCode::AuthUnavailable && incomingCorrelationId == 0 && namesMe) {
                 // Issues #15 / #111: the broker's security state stayed stale and it ended this session - retriable:
                 // reconnect FRESH elsewhere (the seed failover rotates the candidates), never resume here.
                 onAuthUnavailable_(nowNs);
             } else if ((ec == rpc::ErrorCode::SessionRevoked || ec == rpc::ErrorCode::NamespaceSuspended) &&
-                       incomingCorrelationId == 0) {
+                       incomingCorrelationId == 0 && namesMe) {
                 // Authentication (D26): the session-level ErrorResponse{SessionRevoked, corr 0} — the user was
                 // dropped / disabled — or {NamespaceSuspended 51, corr 0}: a RejectAll suspend of the user's namespace
                 // (client version 14; an older client gets 46).  The broker closes the session:
@@ -1082,7 +1095,7 @@ public:
             // instead of an AuthServerFinal.  Only the answer to THIS episode counts.
             // Review B M2: a SESSION-level refusal (the auth deadline, D13) carries correlation id 0 and names the session.
             const bool sessionLevel = incomingCorrelationId == 0 && ec == rpc::ErrorCode::AuthenticationFailed &&
-                                      (noticeSessionId == 0 || noticeSessionId == sessionId_);
+                                      noticeSessionId == sessionId_ && sessionId_ != 0;   // #12: id 0 names no session
             if (incomingCorrelationId != correlationId_ && !sessionLevel) return;
             if (ec == rpc::ErrorCode::AuthenticationFailed) {
                 failAuth_(ec, /*retryAfterMs=*/0, nowNs);
@@ -1507,13 +1520,15 @@ private:
     void beginAuthOrFinish_(int64_t nowNs, rune::protocol::client::AuthMode mode,
                             rune::protocol::client::AuthState state) noexcept {
         namespace rpc = rune::protocol::client;
+        const bool carriedMustChange = passwordChangeRequired();
         authInfo_.brokerMode = mode;
-        authInfo_.authenticated = false;
-        authInfo_.anonymousBootstrap = mode == rpc::AuthMode::Required && state == rpc::AuthState::Anonymous;
+        authInfo_.login = (mode == rpc::AuthMode::Required && state == rpc::AuthState::Anonymous)
+                              ? AuthInfo::Login{AuthInfo::BootstrapOnly{}}
+                              : AuthInfo::Login{AuthInfo::NoLogin{}};
         const bool credentialed = !cfg_.username.empty();
         if (mode == rpc::AuthMode::Required && state == rpc::AuthState::MustAuthenticate) {
             if (!credentialed && cfg_.bootstrapOnly) {   // issue #121: a reopened bootstrap window
-                authInfo_.anonymousBootstrap = true;
+                authInfo_.login = AuthInfo::BootstrapOnly{};
                 finishConnected_(nowNs);
                 return;
             }
@@ -1523,7 +1538,7 @@ private:
         // Review B I3: a resume is believed only for a session this machine itself authenticated.
         if (credentialed && mode == rpc::AuthMode::Required && state == rpc::AuthState::ResumedAuthenticated &&
             authenticatedSessionId_ != 0 && sessionId_ == authenticatedSessionId_) {
-            authInfo_.authenticated = true;
+            authInfo_.login = AuthInfo::Authenticated{carriedMustChange};
             finishConnected_(nowNs);
             return;
         }
@@ -1556,7 +1571,6 @@ private:
         first.clientFirstBare = rune::crypto::scram::clientFirstBare(cfg_.username, nonce);
         first.clientNonce     = std::move(nonce);
         connectStartNs_       = nowNs;                      // the login has its own connectTimeoutNs
-        authInfo_.passwordChangeRequired = false;
         rpc::AuthClientFirst m;
         m.sessionId     = sessionId_;
         m.correlationId = correlationId_;
@@ -1944,7 +1958,7 @@ private:
         }
 
         // Keepalive cadence (not on a bootstrap-only session: the broker closes it on any other frame).
-        if (!authInfo_.anonymousBootstrap && nowNs - lastKeepaliveSentNs_ >= cfg_.keepaliveIntervalNs) {
+        if (!anonymousBootstrap() && nowNs - lastKeepaliveSentNs_ >= cfg_.keepaliveIntervalNs) {
             lastKeepaliveSentNs_ = nowNs;
 
             // A10: the keepalive is a Ping — the broker touches the session AND
@@ -2128,12 +2142,22 @@ private:
     // What the session learnt about authentication: the broker's mode (latched at the ConnectResponse that
     // decided it), the one-time-password flag of the latest AuthServerFinal, the latest rate-limit.
     struct AuthInfo {
+        /// No login on this session (dev broker, no credentials, a login in flight).
+        struct NoLogin {};
+        /// Review B I5: Required + Anonymous — only the bootstrap may be sent.
+        struct BootstrapOnly {};
+        /// Review B I3: earned by a login (or an earned resume).  `mustChangePassword` is the one-time-password
+        /// flag of the AuthServerFinal that earned it.
+        struct Authenticated { bool mustChangePassword = false; };
+        using Login = std::variant<NoLogin, BootstrapOnly, Authenticated>;
         rune::protocol::client::AuthMode brokerMode = rune::protocol::client::AuthMode::InProcess;
-        bool     passwordChangeRequired = false;
         uint32_t retryAfterMs = 0;
-        bool     authenticated = false;   // review B I3: earned by a login (or an earned resume)
-        bool     anonymousBootstrap = false;   // review B I5: Required + Anonymous — only the bootstrap may be sent
+        Login    login;
     };
+    [[nodiscard]] bool passwordChangeRequiredOf_() const noexcept {
+        const auto* a = std::get_if<AuthInfo::Authenticated>(&authInfo_.login);
+        return a != nullptr && a->mustChangePassword;
+    }
     int64_t     authenticatedSessionId_ = 0;   // the broker session id this machine logged in on (0 = none)
     // Issue #114: the login that authenticated `sessionId` - what signOwnCredentialChange proves with.  Replaced by
     // every login; used only while that session is the current one.

@@ -76,6 +76,14 @@ inline SecurityBootstrap bootstrap() {
     for (std::size_t i = 0; i < m.mac.size(); ++i) m.mac[i] = static_cast<uint8_t>(0x80 + i);
     return m;
 }
+inline SecurityBootstrapChallengeRequest bootstrapChallengeRequest() {
+    SecurityBootstrapChallengeRequest m; m.sessionId = kSession; m.correlationId = kCorr; return m;
+}
+inline SecurityBootstrapChallenge bootstrapChallenge() {
+    SecurityBootstrapChallenge m; m.sessionId = kSession; m.correlationId = kCorr;
+    for (std::size_t i = 0; i < m.challenge.size(); ++i) m.challenge[i] = static_cast<uint8_t>(0xC0 + i);
+    return m;
+}
 inline ConnectResponse connectResponseV9() {
     ConnectResponse m; m.sessionId = kSession; m.correlationId = kCorr; m.code = 0; m.leaderMemberId = 2;
     m.assignedSessionId = static_cast<int64_t>(0xDEADBEEFULL);

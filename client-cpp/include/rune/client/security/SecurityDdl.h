@@ -53,13 +53,23 @@ void buildVerifier(std::string_view password, uint32_t iterations, uint32_t minP
 void fillSecurityDdl(const rune::ql::SecurityPlan& plan, uint32_t iterations, uint32_t minPasswordLength,
                      VerifierStorage& vs, rune::protocol::client::SecurityDdl& msg);
 
-/// D4: a ready SecurityBootstrap — verifier of `oneTimePassword`, a random 32-byte fakeSaltSeed (D8), a random
-/// nonce, and the HMAC-SHA-512 over bootstrapMacInput() under the cluster key derived from the key FILE contents
-/// (D32: at least 32 bytes, else std::invalid_argument).  `vs` backs msg.verifier; `adminName` must outlive the
-/// encode.
+/// D4 / #234: a SecurityBootstrap with everything but its MAC — verifier of `oneTimePassword`, a random 32-byte
+/// fakeSaltSeed (D8), a random nonce, `mac` zero.  The proof is challenge-response: the gateway issues a one-use
+/// challenge per attempt (SecurityBootstrapChallengeRequest 102 -> 103), so the MAC cannot be made here.  `macKey`
+/// receives the bootstrap MAC subkey (deriveBootstrapMacKey of the cluster master derived from the key FILE contents;
+/// D32: at least 32 bytes, else std::invalid_argument); the master itself is wiped.  signBootstrap() signs an encoded
+/// frame with it once the challenge is known.  `vs` backs msg.verifier; `adminName` must outlive the encode.
 void buildBootstrap(std::string_view adminName, std::string_view oneTimePassword,
                     std::span<const uint8_t> clusterKeyFileContents, uint32_t iterations,
-                    uint32_t minPasswordLength, VerifierStorage& vs, rune::protocol::client::SecurityBootstrap& msg);
+                    uint32_t minPasswordLength, VerifierStorage& vs, rune::protocol::client::SecurityBootstrap& msg,
+                    std::array<uint8_t, 64>& macKey);
+
+/// #234: writes the HMAC-SHA-512 over bootstrapMacInput(frame decoded as a SecurityBootstrap, challenge) under `macKey`
+/// into the frame's last 64 bytes (the MAC is the frame's last field).  False when the frame is not an encodable
+/// SecurityBootstrap or the HMAC fails; the temporaries are wiped.
+[[nodiscard]] bool signBootstrap(std::span<const uint8_t, 64> macKey,
+                                 std::span<const uint8_t, rune::protocol::client::kBootstrapChallengeBytes> challenge,
+                                 std::span<uint8_t> frame);
 
 } // namespace security
 } // namespace rune::client

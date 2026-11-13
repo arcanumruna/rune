@@ -22,6 +22,7 @@ bool isTopicKind(EventKind k) noexcept {
     switch (k) {
     case EventKind::CreateTopic: case EventKind::DropTopic: case EventKind::AlterTopicConfig:
     case EventKind::CreateSchema: case EventKind::AlterSchema: case EventKind::SetCompatibility:
+    case EventKind::RetireSchemaVersions:
         return true;
     default:
         return false;
@@ -34,6 +35,7 @@ bool isViewKind(EventKind k) noexcept {
 bool isSchemaEvent(const CatalogEvent& e) noexcept {
     switch (e.kind) {
     case EventKind::CreateSchema: case EventKind::AlterSchema: case EventKind::SetCompatibility:
+    case EventKind::RetireSchemaVersions:
         return true;
     case EventKind::CreateTopic: {
         const auto* o = std::get_if<CreateTopicOps>(&e.ops);
@@ -165,6 +167,7 @@ void schemaFields(const SchemaState& a, const SchemaState& b, std::vector<std::s
     if (fieldsDiffer) out.emplace_back("schema.fields");
     if (a.schemaVersion != b.schemaVersion) out.emplace_back("schema.version");
     if (a.compat != b.compat) out.emplace_back("schema.compat");
+    if (a.retiredBelow != b.retiredBelow) out.emplace_back("schema.retiredBelow");
     if (descriptorOther) out.emplace_back("schema.descriptor");
 }
 

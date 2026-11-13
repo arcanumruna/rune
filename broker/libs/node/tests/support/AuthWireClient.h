@@ -61,7 +61,7 @@ public:
     [[nodiscard]] const std::optional<pc::ConnectResponse>& lastConnect() const noexcept { return cl_.lastConnectResponse(); }
 
     /// One Connect (retried until `within` while the broker's UDP link warms up).  -1 = refused / no answer.
-    int64_t connect(const std::string& channel, int32_t clientVersion = pc::kClientVersionAuth,
+    int64_t connect(const std::string& channel, int32_t clientVersion = pc::kClientVersion,
                     std::chrono::milliseconds within = std::chrono::seconds{30}) {
         cl_.setClientVersion(clientVersion);
         const auto deadline = Clock::now() + within;
@@ -160,7 +160,7 @@ public:
     }
 
     Login connectAndLogin(const std::string& channel, const std::string& user, const std::string& password,
-                          int32_t clientVersion = pc::kClientVersionAuth) {
+                          int32_t clientVersion = pc::kClientVersion) {
         const int64_t sid = connect(channel, clientVersion);
         if (sid <= 0) return {};
         return login(channel, sid, user, {password, password});
@@ -255,22 +255,55 @@ public:
         return securityDdl(channel, m, "GRANT ROLE " + role + " TO " + user + ";");
     }
 
-    /// The encoded SecurityBootstrap `bootstrap` would send (a test keeps the bytes to replay them later).
-    std::vector<uint8_t> bootstrapBytes(int64_t sid, const std::string& keyFileContents, const std::string& adminName,
-                                        const std::string& oneTimePassword, uint8_t seed = 0x40) {
+    /// #234: asks the gateway for a bootstrap challenge on `sid` (SecurityBootstrapChallengeRequest 102 -> 103).
+    /// nullopt =
+    /// refused or unanswered; `refusal` (when given) then carries the answer's code / text.
+    std::optional<std::array<uint8_t, pc::kBootstrapChallengeBytes>>
+    bootstrapChallenge(const std::string& channel, int64_t sid, DdlAnswer* refusal = nullptr) {
+        const auto deadline = Clock::now() + std::chrono::seconds{30};
+        const int64_t corr = cl_.sendBootstrapChallengeRequest(channel, kClientStream, sid);
+        if (corr == 0) { if (refusal) *refusal = {0xFFFF, 0, 0, -1, "send failed"}; return std::nullopt; }
+        const auto a = cl_.awaitBootstrapChallenge(corr, deadline);
+        if (a.challenge) return a.challenge;
+        if (refusal) {
+            if (a.refusal) *refusal = {static_cast<uint16_t>(a.refusal->code), 0, 0, -1, a.refusal->message};
+            else *refusal = {0xFFFF, 0, 0, -1, "no challenge"};
+        }
+        return std::nullopt;
+    }
+    /// Signs `m` (everything but the MAC filled) for `challenge` under the cluster key file's contents: HMAC-SHA-512
+    /// under
+    /// the bootstrap subkey (D4, #234).  False when the key file is unusable.
+    static bool signBootstrapMsg(pc::SecurityBootstrap& m, const std::string& keyFileContents,
+                                 const std::array<uint8_t, pc::kBootstrapChallengeBytes>& challenge) {
+        const auto key = rune::crypto::deriveClusterKey(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(keyFileContents.data()), keyFileContents.size()));
+        std::array<uint8_t, 64> sub{};
+        std::vector<uint8_t> input;
+        pc::bootstrapMacInput(m, challenge, input);
+        rune::crypto::DigestBytes mac;
+        if (!key || !rune::crypto::deriveBootstrapMacKey(key->master, sub) ||
+            !rune::crypto::hmac(rune::crypto::Digest::Sha512, sub, input, mac))
+            return false;
+        std::memcpy(m.mac.data(), mac.bytes.data(), m.mac.size());
+        return true;
+    }
+
+    /// The encoded SecurityBootstrap `bootstrap` would send, signed for a challenge requested on `sid` (a test keeps
+    /// the
+    /// bytes to replay them later; the challenge is single use and belongs to `sid`).  Empty when no challenge came.
+    std::vector<uint8_t> bootstrapBytes(const std::string& channel, int64_t sid, const std::string& keyFileContents,
+                                        const std::string& adminName, const std::string& oneTimePassword,
+                                        uint8_t seed = 0x40) {
+        const auto challenge = bootstrapChallenge(channel, sid);
+        if (!challenge) return {};
         const Verifier v = verifierOf(oneTimePassword);
         pc::SecurityBootstrap m;
         m.sessionId = sid; m.correlationId = cl_.nextCorrelationId(); m.adminName = adminName; m.verifier = v.wire();
         for (std::size_t i = 0; i < m.fakeSaltSeed.size(); ++i) m.fakeSaltSeed[i] = static_cast<uint8_t>(seed + i);
         if (!rune::crypto::randomBytes(std::span<uint8_t>(m.nonce.data(), m.nonce.size())))
             throw std::runtime_error("AuthWireClient: no randomness for the client nonce");
-        const auto key = rune::crypto::deriveClusterKey(std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(keyFileContents.data()), keyFileContents.size()));
-        std::vector<uint8_t> input;
-        pc::bootstrapMacInput(m, input);
-        rune::crypto::DigestBytes mac;
-        if (!key || !rune::crypto::hmac(rune::crypto::Digest::Sha512, key->master, input, mac)) return {};
-        std::memcpy(m.mac.data(), mac.bytes.data(), m.mac.size());
+        if (!signBootstrapMsg(m, keyFileContents, *challenge)) return {};
         std::vector<uint8_t> b(m.encodedSize());
         b.resize(m.encode(b.data()));
         return b;
@@ -293,19 +326,17 @@ public:
     /// SecurityBootstrap with a MAC under the cluster key file's contents (D4).  The answer is a DdlResponse.
     DdlAnswer bootstrap(const std::string& channel, int64_t sid, const std::string& keyFileContents,
                         const std::string& adminName, const std::string& oneTimePassword, uint8_t seed = 0x40) {
+        DdlAnswer refused;
+        // #234: the proof covers the gateway's challenge
+        const auto challenge = bootstrapChallenge(channel, sid, &refused);
+        if (!challenge) return refused;
         const Verifier v = verifierOf(oneTimePassword);
         pc::SecurityBootstrap m;
         m.sessionId = sid; m.correlationId = cl_.nextCorrelationId(); m.adminName = adminName; m.verifier = v.wire();
         for (std::size_t i = 0; i < m.fakeSaltSeed.size(); ++i) m.fakeSaltSeed[i] = static_cast<uint8_t>(seed + i);
         if (!rune::crypto::randomBytes(std::span<uint8_t>(m.nonce.data(), m.nonce.size())))
             throw std::runtime_error("AuthWireClient: no randomness for the client nonce");
-        const auto key = rune::crypto::deriveClusterKey(std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(keyFileContents.data()), keyFileContents.size()));
-        std::vector<uint8_t> input;
-        pc::bootstrapMacInput(m, input);
-        rune::crypto::DigestBytes mac;
-        if (!key || !rune::crypto::hmac(rune::crypto::Digest::Sha512, key->master, input, mac)) return {0xFFFF, 0, 0, -1, "no mac"};
-        std::memcpy(m.mac.data(), mac.bytes.data(), m.mac.size());
+        if (!signBootstrapMsg(m, keyFileContents, *challenge)) return {0xFFFF, 0, 0, -1, "no mac"};
         std::vector<uint8_t> b(m.encodedSize());
         b.resize(m.encode(b.data()));
         const auto deadline = Clock::now() + std::chrono::seconds{30};

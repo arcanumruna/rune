@@ -541,6 +541,8 @@ public:
         case WorkerOp::Type::ReconcileFetchResp:
         case WorkerOp::Type::OffsetsForLeaderEpochResp:
         case WorkerOp::Type::ReconcileFetchReq:
+        case WorkerOp::Type::RepairFetchReq:
+        case WorkerOp::Type::RepairFetchResp:
         case WorkerOp::Type::AlterIsrResponse:
         case WorkerOp::Type::AppendControlRecord:
         case WorkerOp::Type::TxnVerifyResult:   // F15-FU1 (#112)

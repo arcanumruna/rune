@@ -543,6 +543,8 @@ struct MetadataResponseDecoded {
     // Using the protocol-layer Decoded type directly for zero re-implementation.
     std::vector<BrokerEntryView>    brokers;
     std::vector<PartitionEntryView> partitions;
+    /// v20 (#361): the node the answering broker sees as the coordinator (the consensus leader); -1 = not known.
+    int32_t                         coordinatorNodeId = -1;
 };
 
 /// Encode a MetadataRequest frame into buf[0..cap-1].
@@ -577,6 +579,7 @@ inline std::optional<MetadataResponseDecoded> decodeMetadataResponse(
     MetadataResponseDecoded result;
     result.sessionId     = opt->sessionId;
     result.correlationId = opt->correlationId;
+    result.coordinatorNodeId = opt->coordinatorNodeId;
 
     result.brokers.reserve(opt->brokers.size());
     for (const auto& b : opt->brokers) {

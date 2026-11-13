@@ -208,6 +208,8 @@ Log::~Log() {
         std::error_code ec;
         if (std::filesystem::is_directory(dir_, ec)) (void)checkpointRecoveryPoint();   // dir removed: nothing to persist
     }
+    // #880: a repair side file is deleted at the next construction.
+    if (repair_ && repair_->fd >= 0) { ::close(repair_->fd); repair_->fd = -1; }
     if (rpFd_ >= 0) { ::close(rpFd_); rpFd_ = -1; }
     if (dirFd_ >= 0) { ::close(dirFd_); dirFd_ = -1; }
     // The background thread has been stopped by the owner before Log destruction,
@@ -2453,7 +2455,7 @@ bool Log::cleanerOpApplies_(SegMap::iterator it, uint64_t lineage) noexcept {
     return true;
 }
 
-bool Log::applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBound) {
+bool Log::applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBound, const SegRef* direct) {
     // Fix round 4 — the OWNER does NO filesystem operation here.  The cleaner
     // wrote, verified and fsynced the complete output AND opened it (head.
     // prebuilt: fds + index mmap, trusted).  The owner validates metadata,
@@ -2465,7 +2467,10 @@ bool Log::applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBo
     //   - before the cleaner's renames: originals + .cleaned on disk → the
     //     .cleaned is deleted, the uncompacted originals are used (no loss);
     //   - mid-rename: a .swap is completed;  - after: compacted.
-    const SegRef head = swapRing_[first & kSwapRingMask];
+    auto refAt = [&](std::size_t k) -> const SegRef& {
+        return direct ? direct[k] : swapRing_[(first + k) & kSwapRingMask];
+    };
+    const SegRef head = refAt(0);
     const int64_t b1 = head.base;
     auto reject = [&](RejectReason why) {
         ++cleanerGroupsRejected_;
@@ -2486,7 +2491,7 @@ bool Log::applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBo
     auto cur = it;
     int64_t membersMaxTs = INT64_MIN;
     for (std::size_t k = 0; k < n; ++k, ++cur) {
-        const SegRef ref = swapRing_[(first + k) & kSwapRingMask];
+        const SegRef ref = refAt(k);
         if (cur == segments_.end() || cur->first != ref.base) return reject(RejectReason::NotContiguous);
         if (std::next(cur) == segments_.end()) return reject(RejectReason::Active);
         if (ref.lineage != kAnyLineage && cur->second->tsLineage() != ref.lineage)
@@ -2790,18 +2795,20 @@ std::unique_ptr<LogSegment> Log::openCleanedOutput(int64_t base, uint64_t seq, i
 void Log::recoverCleanerSwapFiles() {
     // Fix round 2 crash recovery (construction, before segment discovery).
     //   *.cleaned : an UNCOMMITTED cleaner output — delete (originals intact).
+    //   *.repair  : an UNCOMMITTED segment repair side file (#880) — delete (the damaged segment stays).
     //   *.swap    : a COMMITTED swap <b1>.log.<end>.swap replacing [b1, end) —
     //               delete every remaining segment in (b1, end) and b1's index,
     //               then rename it over <b1>.log (idempotent if re-run).
     std::vector<std::filesystem::path> cleaned, swaps;
     for (auto& e : std::filesystem::directory_iterator(dir_)) {
         const auto ext = e.path().extension();
-        if (ext == ".cleaned") cleaned.push_back(e.path());
+        // #880: a repair side file is uncommitted too.
+        if (ext == ".cleaned" || ext == ".repair") cleaned.push_back(e.path());
         else if (ext == ".swap") swaps.push_back(e.path());
     }
     std::error_code ec;
     for (const auto& p : cleaned) {
-        spdlog::warn("Log {}: removing uncommitted cleaner output {}", dir_, p.filename().string());
+        spdlog::warn("Log {}: removing uncommitted cleaner output / segment repair {}", dir_, p.filename().string());
         std::filesystem::remove(p, ec);
     }
     for (const auto& p : swaps) {
@@ -2830,6 +2837,228 @@ void Log::recoverCleanerSwapFiles() {
         std::filesystem::rename(p, logPathForBase(b1), ec);
         if (ec) fatalHalt("Log: cannot complete compaction swap " + p.string() + ": " + ec.message());
     }
+}
+
+// ---------------------------------------------------------------------------
+// #880: repair of a damaged sealed segment (see Log.h).
+// ---------------------------------------------------------------------------
+std::string Log::repairLogPath(const std::string& dir, int64_t base) {
+    std::string s = std::to_string(base);
+    if (s.size() < 20) s = std::string(20 - s.size(), '0') + s;
+    return dir + "/" + s + ".log.repair";
+}
+
+namespace {
+bool writeAllFd(int fd, const uint8_t* p, std::size_t n, int64_t at) noexcept {
+    while (n > 0) {
+        const ssize_t w = ::pwrite(fd, p, n, static_cast<off_t>(at));
+        if (w < 0) { if (errno == EINTR) continue; return false; }
+        if (w == 0) return false;
+        p += w; n -= static_cast<std::size_t>(w); at += w;
+    }
+    return true;
+}
+bool writeFileSynced(const std::string& path, const std::vector<uint8_t>& bytes, unsigned mode) noexcept {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+    if (fd < 0) return false;
+    const bool ok = writeAllFd(fd, bytes.data(), bytes.size(), 0) && ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+}
+void fsyncDir(const std::string& dir) noexcept {
+    const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dfd >= 0) { (void)::fsync(dfd); ::close(dfd); }
+}
+}  // namespace
+
+bool Log::repairIndexBatch_(RepairState& rs, int64_t batchBase, int64_t total) const noexcept {
+    if (rs.bytesSince == 0 || rs.bytesSince >= kDefaultIndexIntervalBytes) {
+        const int64_t rel = batchBase - rs.base;
+        if (rs.written > INT32_MAX || rel < 0 || rel > INT32_MAX) return false;
+        if (static_cast<int64_t>(rs.idx.size()) + 8 <= static_cast<int64_t>(indexMaxBytes_)) {
+            const int32_t r32 = static_cast<int32_t>(rel);
+            const int32_t p32 = static_cast<int32_t>(rs.written);
+            const std::size_t at = rs.idx.size();
+            rs.idx.resize(at + 8);
+            std::memcpy(rs.idx.data() + at, &r32, 4);
+            std::memcpy(rs.idx.data() + at + 4, &p32, 4);
+        }
+        rs.bytesSince = 0;
+    }
+    rs.bytesSince += total;
+    return true;
+}
+
+std::optional<Log::SegmentRepair> Log::beginSegmentRepair(int64_t base) {
+    if (repair_) return std::nullopt;
+    auto it = segments_.find(base);
+    if (it == segments_.end() || !it->second || !it->second->damaged()) return std::nullopt;
+    auto nx = std::next(it);
+    if (nx == segments_.end()) return std::nullopt;   // the active segment is never repaired
+    const LogSegment::SegmentDamage dmg = *it->second->damage();
+    RepairState rs;
+    rs.base = base;
+    rs.damageOffset = dmg.offset;
+    rs.endOffset = nx->first;
+    rs.lineage = it->second->tsLineage();
+    rs.cursor = dmg.offset;
+    rs.path = repairLogPath(dir_, base);
+    const int src = ::open(it->second->logPath().c_str(), O_RDONLY | O_CLOEXEC);
+    if (src < 0) return std::nullopt;
+    rs.fd = ::open(rs.path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, fileMode_);
+    auto fail = [&]() -> std::optional<SegmentRepair> {
+        ::close(src);
+        if (rs.fd >= 0) { ::close(rs.fd); std::error_code ec; std::filesystem::remove(rs.path, ec); }
+        return std::nullopt;
+    };
+    if (rs.fd < 0) return fail();
+    // Copy the valid prefix [0, bytePos) whole batch by whole batch, CRC-verifying each (a prefix that rotted since
+    // recovery must not be carried into the new file) and indexing it exactly as the cleaner indexes its output.
+    constexpr std::size_t kChunk = std::size_t{1} << 20;
+    std::vector<uint8_t> buf;
+    int64_t readAt = 0;
+    std::size_t pos = 0;
+    const int64_t overhead = rune::protocol::batch::kRecordBatchOverhead;
+    while (readAt < dmg.bytePos || pos < buf.size()) {
+        if (readAt < dmg.bytePos) {   // top the buffer up
+            const std::size_t want = static_cast<std::size_t>(std::min<int64_t>(dmg.bytePos - readAt, kChunk));
+            const std::size_t at = buf.size();
+            buf.resize(at + want);
+            const ssize_t got = ::pread(src, buf.data() + at, want, static_cast<off_t>(readAt));
+            if (got <= 0) return fail();
+            buf.resize(at + static_cast<std::size_t>(got));
+            readAt += got;
+        }
+        std::size_t used = pos;
+        while (used + static_cast<std::size_t>(overhead) <= buf.size()) {
+            rune::protocol::RecordBatchReader r(buf.data() + used, buf.size() - used);
+            const int32_t total = r.totalLength();
+            if (total < overhead) return fail();
+            if (used + static_cast<std::size_t>(total) > buf.size()) break;   // the rest arrives with the next chunk
+            if (!r.ensureValid()) return fail();
+            if (!repairIndexBatch_(rs, r.baseOffset(), total)) return fail();
+            if (!writeAllFd(rs.fd, buf.data() + used, static_cast<std::size_t>(total), rs.written)) return fail();
+            rs.written += total;
+            used += static_cast<std::size_t>(total);
+        }
+        const bool madeProgress = used > pos;
+        buf.erase(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(used));
+        pos = 0;
+        if (!madeProgress && readAt >= dmg.bytePos) return fail();   // a partial batch inside the "valid" prefix
+    }
+    if (rs.written != dmg.bytePos) return fail();
+    ::close(src);
+    SegmentRepair out{base, dmg.offset, rs.endOffset, rs.lineage};
+    repair_ = std::move(rs);
+    return out;
+}
+
+Log::RepairAppend Log::appendRepairBatches(std::span<const uint8_t> bytes, const RepairEpochOf& epochOf) {
+    if (!repair_) return {RepairAppendStatus::NoRepair, 0};
+    RepairState& rs = *repair_;
+    auto refuse = [&](RepairAppendStatus s) { return RepairAppend{s, rs.cursor}; };
+    const int64_t overhead = rune::protocol::batch::kRecordBatchOverhead;
+    // Validate the WHOLE span first; write only if every batch passes.
+    int64_t cursor = rs.cursor;
+    std::size_t pos = 0;
+    while (pos < bytes.size()) {
+        if (pos + static_cast<std::size_t>(overhead) > bytes.size()) return refuse(RepairAppendStatus::Malformed);
+        rune::protocol::RecordBatchReader r(bytes.data() + pos, bytes.size() - pos);
+        const int32_t total = r.totalLength();
+        if (total < overhead || pos + static_cast<std::size_t>(total) > bytes.size())
+            return refuse(RepairAppendStatus::Malformed);
+        if (!r.ensureValid()) return refuse(RepairAppendStatus::BadCrc);
+        const int64_t first = r.baseOffset();
+        const int64_t last = first + r.lastOffsetDelta();
+        if (first < cursor || last < first) return refuse(RepairAppendStatus::BelowCursor);
+        if (last >= rs.endOffset) return refuse(RepairAppendStatus::ReachesEnd);
+        if (epochOf && r.partitionLeaderEpoch() != epochOf(first)) return refuse(RepairAppendStatus::WrongEpoch);
+        cursor = last + 1;
+        pos += static_cast<std::size_t>(total);
+    }
+    if (bytes.empty()) return {RepairAppendStatus::Ok, rs.cursor};
+    // Index first (on a copy of the cursor state): a refusal must leave the repair untouched.
+    RepairState staged;
+    staged.base = rs.base; staged.written = rs.written; staged.bytesSince = rs.bytesSince;
+    pos = 0;
+    while (pos < bytes.size()) {
+        rune::protocol::RecordBatchReader r(bytes.data() + pos, bytes.size() - pos);
+        const int32_t total = r.totalLength();
+        if (!repairIndexBatch_(staged, r.baseOffset(), total)) return refuse(RepairAppendStatus::IndexRange);
+        staged.written += total;
+        pos += static_cast<std::size_t>(total);
+    }
+    if (!writeAllFd(rs.fd, bytes.data(), bytes.size(), rs.written)) return refuse(RepairAppendStatus::IoError);
+    rs.written = staged.written;
+    rs.bytesSince = staged.bytesSince;
+    rs.idx.insert(rs.idx.end(), staged.idx.begin(), staged.idx.end());
+    rs.cursor = cursor;
+    return {RepairAppendStatus::Ok, cursor};
+}
+
+Log::RepairCommitStatus Log::commitSegmentRepair() {
+    if (!repair_) return RepairCommitStatus::NoRepair;
+    // Room for SwapAccepted + one Dispose; the repair stays in flight.
+    if (!msgRoom_(2)) return RepairCommitStatus::Busy;
+    RepairState rs = std::move(*repair_);
+    repair_.reset();
+    auto drop = [&](RepairCommitStatus s) {
+        if (rs.fd >= 0) ::close(rs.fd);
+        std::error_code ec;
+        std::filesystem::remove(rs.path, ec);
+        return s;
+    };
+    const uint32_t seq = 0x80000000u | ++repairSeq_;   // the high bit keeps it apart from the cleaner's counter
+    const std::string cleaned = cleanedLogPath(dir_, rs.base, seq);
+    const std::string cleanedIdx = cleanedIndexPath(dir_, rs.base, seq);
+    if (::fsync(rs.fd) != 0) return drop(RepairCommitStatus::IoError);
+    ::close(rs.fd);
+    rs.fd = -1;
+    std::error_code ec;
+    if (!writeFileSynced(cleanedIdx, rs.idx, fileMode_)) return drop(RepairCommitStatus::IoError);
+    std::filesystem::rename(rs.path, cleaned, ec);
+    if (ec) { std::filesystem::remove(cleanedIdx, ec); return drop(RepairCommitStatus::IoError); }
+    fsyncDir(dir_);
+    std::unique_ptr<LogSegment> out;
+    try {
+        out = openCleanedOutput(rs.base, seq, rs.cursor);
+    } catch (...) {
+        std::filesystem::remove(cleaned, ec);
+        std::filesystem::remove(cleanedIdx, ec);
+        return RepairCommitStatus::IoError;
+    }
+    // The owner's O(1) install, shared with the cleaner: validates the segment still exists with the same lineage, is
+    // not active, has no flush in flight, ends at or below the recovery point; a refusal posts the output's deletion.
+    const SegRef ref{rs.base, rs.lineage, rs.cursor, seq, 1, true, out.release(), 0};
+    const bool ok = applyCleanedGroup_(0, 1, INT64_MAX, &ref);
+    publishSealedSnapshotFrom_(rs.base);
+    return ok ? RepairCommitStatus::Ok : RepairCommitStatus::Rejected;
+}
+
+std::optional<Log::DamagedSegmentInfo> Log::firstDamagedSegment() const noexcept {
+    for (auto it = segments_.begin(); it != segments_.end(); ++it) {
+        auto nx = std::next(it);
+        if (nx == segments_.end()) break;   // the active segment is never damaged
+        if (it->second && it->second->damaged())
+            return DamagedSegmentInfo{it->first, it->second->damage()->offset, nx->first};
+    }
+    return std::nullopt;
+}
+
+bool Log::segmentRepairValid() const noexcept {
+    if (!repair_) return false;
+    const auto it = segments_.find(repair_->base);
+    if (it == segments_.end() || !it->second || !it->second->damaged()) return false;
+    if (std::next(it) == segments_.end()) return false;
+    return it->second->tsLineage() == repair_->lineage;
+}
+
+void Log::abortSegmentRepair() noexcept {
+    if (!repair_) return;
+    if (repair_->fd >= 0) ::close(repair_->fd);
+    std::error_code ec;
+    std::filesystem::remove(repair_->path, ec);
+    repair_.reset();
 }
 
 Log::SwapSpan Log::ownerSwapSpan_() const noexcept {

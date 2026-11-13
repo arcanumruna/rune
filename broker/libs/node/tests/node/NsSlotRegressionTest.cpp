@@ -26,6 +26,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -477,14 +478,208 @@ TEST(NsSlotRegression, ANewOwnerOfASlotGetsItsOwnDeletingRegression) {
     StubPool pool(1);
     f.post(NsSlotAssign{1, 101, rune::protocol::NamespaceLimits{}});
     f.post(Throttle{1, 101, ThrottleKind::NsDeleting, 0});
+    (void)f.pump(pool);   // #1020: the first owner is delivered, else its Release would cancel its unseen entries
+    ASSERT_EQ(f.pendingForTest(), 0u);
     f.post(NsSlotRelease{1, 101});
     f.post(NsSlotAssign{1, 202, rune::protocol::NamespaceLimits{}});
     f.post(Throttle{1, 202, ThrottleKind::NsDeleting, 0});
     f.post(Throttle{1, 202, ThrottleKind::NsDeleting, 0});
-    EXPECT_EQ(f.pendingForTest(), 5u) << "assign, deleting, release, assign, deleting";
+    EXPECT_EQ(f.pendingForTest(), 3u) << "release, assign, deleting";
     EXPECT_EQ(f.deletingDedupsForTest(), 1u);
     for (int i = 0; i < kPumpCap && f.pendingForTest() != 0; ++i) (void)f.pump(pool);
     EXPECT_EQ(f.pendingForTest(), 0u);
     EXPECT_EQ(pool.w[0].slots.nsIdAt(1), 202u);
     EXPECT_EQ(pool.w[0].throttles, 2u) << "one NsDeleting per slot owner reached the worker";
+}
+
+// ---- #1020: the ordered FIFO edits unseen entries in place, so it cannot fill during one ring stall ---------------
+namespace {
+
+/// A worker that records every ordered op it accepts and applies it like Worker::applyNsSlotAssign_ / Release_ /
+/// applyNsThrottle_ do (place on a new owner, a tag mismatch is counted and not applied; NsDeleting is sticky).
+struct ModelWorker {
+    struct Seen { WorkerOp::Type type; uint32_t nsId; uint64_t maxTopics; uint16_t slot; };
+    bool full = false;
+    NsSlotTable slots{8};
+    std::array<uint64_t, 8> maxTopics{};
+    std::array<bool, 8> deleting{};
+    uint64_t mismatches = 0;
+    std::vector<Seen> log;
+    EnqueueResult enqueueOp(WorkerOp op) {
+        if (full) return EnqueueResult::Full;
+        const auto slot = static_cast<uint16_t>(op.topicId);
+        const auto nsId = static_cast<uint32_t>(op.nextOffset);
+        uint64_t mt = 0;
+        switch (op.type) {
+        case WorkerOp::Type::NsSlotAssign: {
+            rune::protocol::NamespaceLimits l;
+            (void)rune::protocol::decodeLimits(op.schemaUpdateBlob.data(), op.schemaUpdateBlob.size(), l);
+            mt = l.maxTopics;
+            if (slots.nsIdAt(slot) != nsId) {
+                if (!slots.place(slot, nsId)) { ++mismatches; break; }
+                deleting[slot] = false;
+            }
+            slots.setLimits(slot, l);
+            maxTopics[slot] = l.maxTopics;
+            break;
+        }
+        case WorkerOp::Type::NsSlotRelease:
+            if (!slots.release(slot, nsId)) { ++mismatches; break; }
+            deleting[slot] = false;
+            break;
+        case WorkerOp::Type::NsThrottle:
+            if (!slots.matches(slot, nsId)) { ++mismatches; break; }
+            if (static_cast<ThrottleKind>(op.partition) == ThrottleKind::NsDeleting) deleting[slot] = true;
+            break;
+        default: break;
+        }
+        log.push_back(Seen{op.type, nsId, mt, slot});
+        return EnqueueResult::Enqueued;
+    }
+};
+struct ModelPool {
+    std::vector<ModelWorker> w;
+    explicit ModelPool(int n) : w(static_cast<std::size_t>(n)) {}
+    int32_t workerCount() const noexcept { return static_cast<int32_t>(w.size()); }
+    ModelWorker& worker(int32_t i) { return w[static_cast<std::size_t>(i)]; }
+};
+rune::protocol::NamespaceLimits limitsOf(uint64_t maxTopics) {
+    rune::protocol::NamespaceLimits l;
+    l.maxTopics = maxTopics;
+    return l;
+}
+void drain(NsSlotFanout& f, ModelPool& pool) {
+    for (auto& wk : pool.w) wk.full = false;
+    for (int i = 0; i < 64 && (f.pendingForTest() != 0 || f.dirtyForTest(0) != 0); ++i) (void)f.pump(pool);
+}
+
+}  // namespace
+
+TEST(NsSlotFanoutRegression, RepeatedLimitChangesDuringARingStallNeverFillTheFifoRegression) {
+    NsSlotFanout f;
+    f.configure(8, 3);
+    ModelPool pool(3);
+    pool.w[1].full = true;
+    for (uint16_t s = 1; s <= 3; ++s) f.post(NsSlotAssign{s, 100u + s, limitsOf(1)});
+    (void)f.pump(pool);   // worker 0 gets the first assign; worker 1's ring refuses and the FIFO stalls there
+    for (uint64_t i = 2; i <= 10'000; ++i) {
+        for (uint16_t s = 1; s <= 3; ++s) f.post(NsSlotAssign{s, 100u + s, limitsOf(i)});
+        ASSERT_LE(f.pendingForTest(), 4u) << "step " << i;
+    }
+    EXPECT_EQ(f.orderedOverflowsForTest(), 0u);
+    drain(f, pool);
+    for (auto& wk : pool.w)
+        for (uint16_t s = 1; s <= 3; ++s) {
+            EXPECT_EQ(wk.slots.nsIdAt(s), 100u + s);
+            EXPECT_EQ(wk.maxTopics[s], 10'000u) << "slot " << s << ": the LAST limits";
+            uint64_t last = 0;
+            for (const auto& e : wk.log) if (e.type == WorkerOp::Type::NsSlotAssign && e.slot == s) last = e.maxTopics;
+            EXPECT_EQ(last, 10'000u);
+        }
+}
+
+TEST(NsSlotFanoutRegression, SlotReuseDuringARingStallNeverFillsTheFifoRegression) {
+    NsSlotFanout f;
+    f.configure(8, 2);
+    ModelPool pool(2);
+    pool.w[1].full = true;
+    constexpr uint32_t kCycles = 10'000;
+    for (uint32_t i = 1; i <= kCycles; ++i) {
+        f.post(NsSlotAssign{1, 1000u + i, limitsOf(i)});
+        f.post(Throttle{1, 1000u + i, ThrottleKind::NsDeleting, 0});
+        f.post(NsSlotRelease{1, 1000u + i});
+        ASSERT_LE(f.pendingForTest(), 4u) << "cycle " << i;
+    }
+    f.post(NsSlotAssign{1, 99'999u, limitsOf(7)});
+    EXPECT_EQ(f.orderedOverflowsForTest(), 0u);
+    drain(f, pool);
+    for (auto& wk : pool.w) {
+        ASSERT_FALSE(wk.log.empty());
+        EXPECT_EQ(wk.log.back().type, WorkerOp::Type::NsSlotAssign);
+        EXPECT_EQ(wk.log.back().nsId, 99'999u);
+        for (const auto& e : wk.log) EXPECT_EQ(e.nsId, 99'999u) << "an op of a cancelled owner reached a worker";
+        EXPECT_EQ(wk.mismatches, 0u);
+        EXPECT_FALSE(wk.deleting[1]);
+        EXPECT_EQ(wk.slots.nsIdAt(1), 99'999u);
+    }
+}
+
+TEST(NsSlotFanoutRegression, APartlyDeliveredAssignIsNeverEditedRegression) {
+    NsSlotFanout f;
+    f.configure(8, 3);
+    ModelPool pool(3);
+    pool.w[1].full = true;
+    f.post(NsSlotAssign{1, 101u, limitsOf(1)});
+    (void)f.pump(pool);                       // worker 0 has L1; worker 1 refuses
+    ASSERT_EQ(pool.w[0].log.size(), 1u);
+    f.post(NsSlotAssign{1, 101u, limitsOf(2)});
+    EXPECT_EQ(f.pendingForTest(), 2u) << "the partly delivered entry is not edited: a second entry is queued";
+    drain(f, pool);
+    ASSERT_EQ(pool.w[0].log.size(), 2u);
+    EXPECT_EQ(pool.w[0].log[0].maxTopics, 1u);
+    EXPECT_EQ(pool.w[0].log[1].maxTopics, 2u);
+    for (auto& wk : pool.w) {
+        EXPECT_EQ(wk.maxTopics[1], 2u);
+        EXPECT_EQ(wk.slots.nsIdAt(1), 101u);
+    }
+    // A fresh owner released after it was announced (by an earlier Assign) still gets its Release.
+    pool.w[1].full = true;
+    f.post(NsSlotAssign{1, 101u, limitsOf(3)});   // unseen refresh of an owner the workers already know
+    f.post(NsSlotRelease{1, 101u});               // must NOT cancel: the workers hold the owner
+    drain(f, pool);
+    for (auto& wk : pool.w) EXPECT_EQ(wk.slots.nsIdAt(1), NsSlotTable::kFreeSlot) << "the Release was lost";
+}
+
+TEST(NsSlotFanoutRegression, ModelCheckedRandomPostsAndRingRefusalsConvergeRegression) {
+    constexpr uint32_t kSlotCap = 6;   // slots 1..5 are usable
+    constexpr int kWorkers = 3;
+    for (uint64_t seed = 1; seed <= 20; ++seed) {
+        std::mt19937_64 rng(seed * 0x9E3779B97F4A7C15ULL);
+        NsSlotFanout f;
+        f.configure(kSlotCap, kWorkers);
+        ModelPool pool(kWorkers);
+        struct Truth { uint32_t ns = NsSlotTable::kFreeSlot; uint64_t maxTopics = 0; bool deleting = false; };
+        std::array<Truth, kSlotCap> truth{};
+        uint32_t nextNs = 100;
+        uint64_t nextLimit = 1;
+        std::size_t maxPending = 0;
+        for (int step = 0; step < 20'000; ++step) {
+            const auto slot = static_cast<uint16_t>(1 + rng() % (kSlotCap - 1));
+            Truth& t = truth[slot];
+            switch (rng() % 4) {
+            case 0:   // a new owner on a free slot, or a limits change of the owner
+                if (t.ns == NsSlotTable::kFreeSlot) { t = Truth{nextNs++, nextLimit, false}; }
+                else t.maxTopics = nextLimit;
+                f.post(NsSlotAssign{slot, t.ns, limitsOf(nextLimit++)});
+                break;
+            case 1:
+                if (t.ns != NsSlotTable::kFreeSlot) {
+                    t.deleting = true;
+                    f.post(Throttle{slot, t.ns, ThrottleKind::NsDeleting, 0});
+                }
+                break;
+            case 2:
+                if (t.ns != NsSlotTable::kFreeSlot) { f.post(NsSlotRelease{slot, t.ns}); t = Truth{}; }
+                break;
+            default: break;
+            }
+            if (rng() % 5 == 0) pool.w[rng() % kWorkers].full = (rng() % 3) != 0;   // mostly refusing
+            if (rng() % 3 == 0) (void)f.pump(pool);
+            maxPending = std::max(maxPending, f.pendingForTest());
+            ASSERT_EQ(f.orderedOverflowsForTest(), 0u) << "seed " << seed << " step " << step;
+        }
+        drain(f, pool);
+        ASSERT_EQ(f.pendingForTest(), 0u) << "seed " << seed;
+        EXPECT_LE(maxPending, std::size_t{6} * kSlotCap + 16);
+        for (int w = 0; w < kWorkers; ++w) {
+            const ModelWorker& wk = pool.w[static_cast<std::size_t>(w)];
+            EXPECT_EQ(wk.mismatches, 0u) << "seed " << seed << " worker " << w;
+            for (uint16_t s = 1; s < kSlotCap; ++s) {
+                EXPECT_EQ(wk.slots.nsIdAt(s), truth[s].ns) << "seed " << seed << " worker " << w << " slot " << s;
+                if (truth[s].ns == NsSlotTable::kFreeSlot) continue;
+                EXPECT_EQ(wk.maxTopics[s], truth[s].maxTopics) << "seed " << seed << " worker " << w << " slot " << s;
+                EXPECT_EQ(wk.deleting[s], truth[s].deleting) << "seed " << seed << " worker " << w << " slot " << s;
+            }
+        }
+    }
 }

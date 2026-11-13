@@ -113,6 +113,26 @@ TEST(AdminChannelsRegression, ClusterFeatureLevelMessageRoundTripsRegression) {
     EXPECT_EQ(kMsgClusterFeatureLevel, 37);
 }
 
+TEST(AdminChannelsRegression, ClusterFdLimitMessageRoundTripsRegression) {
+    uint8_t wire[kClusterFdLimitWireLen];
+    writeClusterFdLimit(wire, 4096, 3);
+    uint64_t limit = 0;
+    int32_t node = 0;
+    ASSERT_TRUE(decodeClusterFdLimit(wire, sizeof wire, limit, node));
+    EXPECT_EQ(limit, 4096u);
+    EXPECT_EQ(node, 3);
+    writeClusterFdLimit(wire, UINT64_MAX, -1);   // the extremes survive
+    ASSERT_TRUE(decodeClusterFdLimit(wire, sizeof wire, limit, node));
+    EXPECT_EQ(limit, UINT64_MAX);
+    EXPECT_EQ(node, -1);
+    EXPECT_EQ(kClusterFdLimitWireLen, 12u);
+    uint8_t longer[kClusterFdLimitWireLen + 1] = {};
+    for (const std::size_t n : {std::size_t{0}, std::size_t{1}, kClusterFdLimitWireLen - 1, kClusterFdLimitWireLen + 1})
+        EXPECT_FALSE(decodeClusterFdLimit(longer, n, limit, node)) << n << "-byte frame is refused";
+    EXPECT_EQ(kMsgClusterFdLimit, 38);
+    EXPECT_NE(kMsgClusterFdLimit, kMsgClusterFeatureLevel);
+}
+
 TEST(CheckedWritesSpecFanoutRegression, SpecFrameRoundTripsRegression) {
     TopicWriteSpecWire w;
     w.topicId = 44; w.keyFieldId = 2; w.keyType = rune::codec::PrimType::FixedStr; w.keyWidth = 12; w.legacyValidate = true;

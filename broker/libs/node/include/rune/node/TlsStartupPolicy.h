@@ -74,6 +74,18 @@ namespace rune::node {
     return perWorkerEgress && !shardMode && (requireTls || brokerHasTls);
 }
 
+// Issue #532: the ingress twin of the egress refusal above.  Outside shard mode no SessionAnnouncer runs, so a worker
+// polling its own ingress never receives a session's c2b key; it decodes a sealed produce as plaintext and answers
+// InvalidRequest, so every encrypted produce on that stream fails.  Refuse the combination at startup (legacy mode gets
+// no crypto wiring for it) whenever a client could end up with an encrypted session: require_tls forces crypto, or the
+// broker has a certificate/key loaded and a client that offers crypto gets it.
+[[nodiscard]] inline bool mustRefuseNonShardPerWorkerIngressTls(bool perWorkerIngress,
+                                                                bool shardMode,
+                                                                bool requireTls,
+                                                                bool brokerHasTls) noexcept {
+    return perWorkerIngress && !shardMode && (requireTls || brokerHasTls);
+}
+
 // Ingress twin (auth fix program M4 / X012): with authentication Enabled, a worker polling its own ingress outside
 // shard mode would take Produce frames with no gateway authn/authz and no crypto entries.  Shard mode is the only
 // per-worker ingress that carries an ack sink (the worker enforces WRITE and decrypts); a non-shard one must not start.

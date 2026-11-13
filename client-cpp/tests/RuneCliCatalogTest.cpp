@@ -811,3 +811,28 @@ TEST(RuneCliCatalogRegression, FormatLeaseTopicRegression) {
     ASSERT_NE(players, nullptr);
     EXPECT_EQ(rune::cli::formatTopicDefinition(*players).find("lease"), std::string::npos);
 }
+
+// ── schema retire (#419) ─────────────────────────────────────────────────────
+
+TEST(RuneCliCatalogRegression, RetireVersionIsPlannedAsOneRetireOperationAndABadOneIsRefusedRegression) {
+    std::string out, err;
+    EXPECT_EQ(runCli({"ql", "-e", "alter topic t retire version < 3;", "--dry-run"}, &out, &err), 0) << err;
+    EXPECT_NE(out.find("RETIRE VERSION < 3"), std::string::npos) << out;
+    EXPECT_EQ(runCli({"ql", "-e", "alter topic t retire version < 1;", "--dry-run"}, &out, &err), 1);
+    EXPECT_NE(err.find("retires nothing"), std::string::npos) << err;
+    EXPECT_EQ(runCli({"ql", "-e", "alter topic t retire version < 3, add column x int32;", "--dry-run"}, &out, &err), 1);
+    EXPECT_NE(err.find("only operation"), std::string::npos) << err;
+}
+
+TEST(RuneCliCatalogRegression, TheSchemaDefinitionShowsTheRetireFloorOnlyWhenThereIsOneRegression) {
+    cat::TopicObject t;
+    t.name = "t";
+    cat::SchemaState s;
+    s.keyField = "id";
+    s.schemaVersion = 4;
+    s.evolvingBlob = rune::codec::serialize(rune::codec::DescriptorBuilder("t", 1).add("id", rune::codec::PrimType::Int64, 1, true).build());
+    t.schema = s;
+    EXPECT_EQ(rune::cli::formatSchemaDefinition(t).find("retired below"), std::string::npos) << "a floor of 1 prints nothing";
+    t.schema->retiredBelow = 3;
+    EXPECT_NE(rune::cli::formatSchemaDefinition(t).find("retired below: 3"), std::string::npos);
+}

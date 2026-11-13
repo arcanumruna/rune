@@ -208,17 +208,43 @@ TEST(CatalogApplyV1Regression, RequestIdsAreRecordedAndADuplicateIsRefused) {
     e.principal.requestId = rid;
     e.principal.requestFingerprint = 0xF1;
     ASSERT_TRUE(rc::apply(s, e, 0));
-    auto r = s.request(rid);
+    auto r = s.requestOfAnyPrincipal(rid);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->offset, 0); EXPECT_EQ(r->objectId, 1u); EXPECT_EQ(r->topicId, 0); EXPECT_EQ(r->schemaVersion, 1);
     EXPECT_EQ(r->requestFingerprint, 0xF1u) << "F14: the dedupe key carries the statement fingerprint";
-    EXPECT_FALSE(s.request(rc::RequestId{.hi = 0xC11F, .lo = 77}).has_value()) << "all 128 bits are the key";
+    EXPECT_FALSE(s.requestOfAnyPrincipal(rc::RequestId{.hi = 0xC11F, .lo = 77}).has_value()) << "all 128 bits are the key";
     auto again = stamped(s, createOps(1, false), "y", 2, 0, 1);
     again.principal.requestId = rid;
     auto a = rc::apply(s, again, 1);
     ASSERT_FALSE(a.has_value());
     EXPECT_EQ(a.error().code, rc::ApplyError::Code::Precondition);
-    EXPECT_FALSE(s.request(rc::RequestId{}).has_value()) << "requestId {0,0} (pre-v8 clients) is never recorded";
+    EXPECT_FALSE(s.requestOfAnyPrincipal(rc::RequestId{}).has_value()) << "requestId {0,0} (pre-v8 clients) is never recorded";
+}
+
+TEST(CatalogApplyV1Regression, TwoPrincipalsMayRecordTheSameRequestIdRegression) {
+    rc::CatalogState s;
+    const rc::RequestId rid{.hi = 0xC11E, .lo = 78};
+    auto e1 = stamped(s, createOps(0, true), "x", 1, 0, 1);
+    e1.principal.authenticated = "a"; e1.principal.requestId = rid; e1.principal.requestFingerprint = 0xA1;
+    ASSERT_TRUE(rc::apply(s, e1, 0));
+    auto e2 = stamped(s, createOps(1, false), "y", 2, 0, 1);
+    e2.principal.authenticated = "b"; e2.principal.requestId = rid; e2.principal.requestFingerprint = 0xB2;
+    ASSERT_TRUE(rc::apply(s, e2, 1)) << "another principal's record of the id does not make it 'already applied'";
+    const auto ra = s.request("a", rid);
+    const auto rb = s.request("b", rid);
+    ASSERT_TRUE(ra.has_value()); ASSERT_TRUE(rb.has_value());
+    EXPECT_EQ(ra->offset, 0); EXPECT_EQ(ra->objectId, 1u); EXPECT_EQ(ra->requestFingerprint, 0xA1u);
+    EXPECT_EQ(rb->offset, 1); EXPECT_EQ(rb->objectId, 2u); EXPECT_EQ(rb->requestFingerprint, 0xB2u);
+    EXPECT_FALSE(s.request("c", rid).has_value());
+    const auto any = s.requestOfAnyPrincipal(rid);
+    ASSERT_TRUE(any.has_value());
+    EXPECT_EQ(any->offset, 0) << "the lowest offset";
+    auto e3 = stamped(s, createOps(2, false), "z", 3, 0, 1);
+    e3.principal.authenticated = "a"; e3.principal.requestId = rid;
+    auto r3 = rc::apply(s, e3, 2);
+    ASSERT_FALSE(r3.has_value());
+    EXPECT_EQ(r3.error().code, rc::ApplyError::Code::Precondition);
+    EXPECT_NE(r3.error().detail.find("already applied"), std::string::npos);
 }
 
 TEST(CatalogApplyV1Regression, FingerprintCoversEveryDefinitionField) {
@@ -473,7 +499,7 @@ TEST(CatalogApplyV1Regression, OffsetsMustAdvanceAndUnknownFormatsHaveNoRules) {
     auto stale = rc::apply(s, e, 2);
     ASSERT_FALSE(stale.has_value());
     EXPECT_EQ(stale.error().code, rc::ApplyError::Code::Precondition);
-    auto v2 = e; v2.formatVer = 5;   // 1..4 have rules; 5 does not
+    auto v2 = e; v2.formatVer = 6;   // 1..5 have rules; 6 does not
     auto u = rc::apply(s, v2, 3);
     ASSERT_FALSE(u.has_value());
     EXPECT_EQ(u.error().code, rc::ApplyError::Code::UnsupportedFormat);
@@ -563,12 +589,12 @@ TEST(CatalogApplyV1Regression, RequestRecordsNameTheAnswerOfEveryKind) {
     ASSERT_TRUE(rc::apply(s, withId(stamped(s, rc::SetCompatibilityOps{cd::CompatMode::Forward}, "src", 1, 1, 2), 1), 3));
     ASSERT_TRUE(rc::apply(s, withId(stamped(s, rc::AlterViewOps{viewOver({"src"}, 3)}, "v", 3, 1, 2), 2), 4));
     ASSERT_TRUE(rc::apply(s, withId(stamped(s, rc::DropTopicOps{1}, "u", 2, 1, 2), 3), 5));
-    auto r1 = s.request({1, 1}); ASSERT_TRUE(r1);
+    auto r1 = s.requestOfAnyPrincipal({1, 1}); ASSERT_TRUE(r1);
     EXPECT_EQ(r1->kind, rc::EventKind::SetCompatibility); EXPECT_EQ(r1->topicId, 0); EXPECT_EQ(r1->schemaVersion, 2);
     EXPECT_EQ(r1->newVersion, 2u); EXPECT_EQ(r1->offset, 3);
-    auto r2 = s.request({1, 2}); ASSERT_TRUE(r2);
+    auto r2 = s.requestOfAnyPrincipal({1, 2}); ASSERT_TRUE(r2);
     EXPECT_EQ(r2->topicId, 3) << "AlterView answers the fresh sink"; EXPECT_EQ(r2->schemaVersion, 0);
-    auto r3 = s.request({1, 3}); ASSERT_TRUE(r3);
+    auto r3 = s.requestOfAnyPrincipal({1, 3}); ASSERT_TRUE(r3);
     EXPECT_EQ(r3->topicId, 1) << "a drop answers the retired topic id"; EXPECT_EQ(r3->objectId, 2u);
 }
 

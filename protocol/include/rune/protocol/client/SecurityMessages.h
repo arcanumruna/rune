@@ -20,9 +20,13 @@
 //                           kSecurityDdlFlagCredentialProof
 //   verifier                salt var16 | iterations u32 | storedKey 64 raw bytes | serverKey 64 raw bytes
 //   SecurityBootstrap (80)  header | adminName var16 | verifier | fakeSaltSeed 32 | nonce 16 | mac 64   (D4, D8)
+//                           the mac covers a one-use challenge that is NOT on the wire in 80 (#234, client version 19)
+//   SecurityBootstrapChallengeRequest (102)  header only (BODY_FIXED 0): "give me a challenge for this session"
+//   SecurityBootstrapChallenge (103)         header | challenge 32 raw bytes
 //   Grant / Revoke enum bytes are range-checked on decode (SecurityTypes.h).
 
 #include <array>
+#include <span>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -49,6 +53,7 @@ inline constexpr std::size_t kVerifierKeyBytes     = 64;   // SHA-512 StoredKey 
 inline constexpr std::size_t kBootstrapSeedBytes   = 32;   // the cluster-wide fake-salt seed (D8), replicated in the Bootstrap event
 inline constexpr std::size_t kBootstrapNonceBytes  = 16;
 inline constexpr std::size_t kBootstrapMacBytes    = 64;   // HMAC-SHA-512
+inline constexpr std::size_t kBootstrapChallengeBytes = 32;   // #234: the gateway's one-use bootstrap challenge
 inline constexpr std::size_t kSecurityPatternMax   = 249;  // a topic / view / group name bound
 inline constexpr std::size_t kCredentialProofBytes = 64;   // SCRAM-SHA-512 ClientProof size
 
@@ -112,6 +117,55 @@ struct SecurityBootstrap {
     [[nodiscard]] std::size_t encodedSize() const noexcept;
     std::size_t encode(uint8_t* buf) const noexcept;
     static std::optional<SecurityBootstrap> decode(const uint8_t* buf, std::size_t avail) noexcept;
+};
+
+/// #234 (102): asks the gateway for a bootstrap challenge on `sessionId` (header only).
+struct SecurityBootstrapChallengeRequest {
+    int64_t sessionId = 0, correlationId = 0;
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::SecurityBootstrapChallengeRequest);
+    static constexpr uint16_t BODY_FIXED  = 0;
+
+    [[nodiscard]] std::size_t encodedSize() const noexcept { return MessageHeader::ENCODED_SIZE + BODY_FIXED; }
+    std::size_t encode(uint8_t* buf) const noexcept {
+        return detail::putAuthHeader(buf, TEMPLATE_ID, BODY_FIXED, sessionId, correlationId);
+    }
+    static std::optional<SecurityBootstrapChallengeRequest> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        std::size_t pos = 0;
+        auto h = detail::getAuthHeader(buf, avail, TEMPLATE_ID, BODY_FIXED, pos);
+        if (!h) return std::nullopt;
+        SecurityBootstrapChallengeRequest m;
+        m.sessionId = h->sessionId; m.correlationId = h->correlationId;
+        return m;
+    }
+};
+
+/// #234 (103): the gateway's answer to 102: 32 bytes unique per request, valid for ONE bootstrap on that session.
+struct SecurityBootstrapChallenge {
+    int64_t sessionId = 0, correlationId = 0;
+    std::array<uint8_t, kBootstrapChallengeBytes> challenge{};
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::SecurityBootstrapChallenge);
+    static constexpr uint16_t BODY_FIXED  = 0;
+
+    [[nodiscard]] std::size_t encodedSize() const noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + kBootstrapChallengeBytes;
+    }
+    std::size_t encode(uint8_t* buf) const noexcept {
+        std::size_t pos = detail::putAuthHeader(buf, TEMPLATE_ID, BODY_FIXED, sessionId, correlationId);
+        std::memcpy(buf + pos, challenge.data(), challenge.size()); pos += challenge.size();
+        return pos;
+    }
+    static std::optional<SecurityBootstrapChallenge> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        std::size_t pos = 0;
+        auto h = detail::getAuthHeader(buf, avail, TEMPLATE_ID, BODY_FIXED, pos);
+        if (!h) return std::nullopt;
+        if (pos + kBootstrapChallengeBytes > avail) return std::nullopt;
+        SecurityBootstrapChallenge m;
+        m.sessionId = h->sessionId; m.correlationId = h->correlationId;
+        std::memcpy(m.challenge.data(), buf + pos, m.challenge.size());
+        return m;
+    }
 };
 
 namespace detail {
@@ -383,16 +437,20 @@ inline std::optional<SecurityBootstrap> SecurityBootstrap::decode(const uint8_t*
     return m;
 }
 
-/// The bytes the bootstrap MAC covers (D4): "rune-bootstrap-v1" | adminName var16 | salt var16 |
-/// iterations u32 | storedKey | serverKey | fakeSaltSeed 32 | nonce.  ONE definition (CLI + gateway).  `out` is
-/// cleared and refilled (its capacity persists).
-inline void bootstrapMacInput(const SecurityBootstrap& b, std::vector<uint8_t>& out) {
-    constexpr std::string_view kTag = "rune-bootstrap-v1";
+/// The bytes the bootstrap MAC covers (D4, #234): "rune-bootstrap-v2" | challenge 32 | adminName var16 | salt var16 |
+/// iterations u32 | storedKey | serverKey | fakeSaltSeed 32 | nonce.  The challenge is the gateway's one-use value for
+/// this session (it is not on the wire in 80).  ONE definition (client + gateway).  `out` is cleared and refilled (its
+/// capacity persists).
+inline void bootstrapMacInput(const SecurityBootstrap& b, std::span<const uint8_t, kBootstrapChallengeBytes> challenge,
+                              std::vector<uint8_t>& out) {
+    constexpr std::string_view kTag = "rune-bootstrap-v2";
     out.clear();
     if (!fitsVarLen16(b.adminName.size()) || !detail::verifierFits(b.verifier)) return;   // not encodable: empty input
-    out.resize(kTag.size() + 2u + b.adminName.size() + detail::verifierEncodedSize(b.verifier) + b.fakeSaltSeed.size() + b.nonce.size());
+    out.resize(kTag.size() + kBootstrapChallengeBytes + 2u + b.adminName.size() +
+               detail::verifierEncodedSize(b.verifier) + b.fakeSaltSeed.size() + b.nonce.size());
     uint8_t* p = out.data();
     std::memcpy(p, kTag.data(), kTag.size()); p += kTag.size();
+    std::memcpy(p, challenge.data(), challenge.size()); p += challenge.size();
     p += putVarStr(p, b.adminName);
     p += detail::putVerifier(p, b.verifier);   // salt var16 | iterations u32 | storedKey | serverKey
     std::memcpy(p, b.fakeSaltSeed.data(), b.fakeSaltSeed.size()); p += b.fakeSaltSeed.size();

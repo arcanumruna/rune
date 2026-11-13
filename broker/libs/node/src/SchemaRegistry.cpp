@@ -35,6 +35,7 @@ void SchemaRegistry::applyRecord(const TopicSchema& ts) {
     e.topicName      = ts.topicName;
     e.persistence    = ts.persistence;
     e.nsId           = ts.nsId;
+    e.retiredBelow   = ts.retiredBelow;
 
     // Index by the TOPIC name — every byName() caller (GetTopicSchema,
     // DefineTopic's TopicExists check, AlterTopic) passes the name the client
