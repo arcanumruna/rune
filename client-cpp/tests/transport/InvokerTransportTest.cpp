@@ -1547,6 +1547,52 @@ TEST(AeronTransportRegression, ReleasingAResponsePublicationRetiresAndDrainsAgai
     t.stop();
 }
 
+// #1004: a response-pair slot that is reused starts in AwaitImage again.  The old pair's image was seen (the egress
+// state moved past AwaitImage); after the release and a reuse by a pair whose gateway has no image yet, the loss check
+// must not fire from the OLD image.
+TEST(AeronTransportRegression, AReusedResponseSlotStartsInAwaitImageAgainRegression) {
+    FastLingerEnv env;
+    const uint16_t gwPort = rune::client::testing::allocFreeUdpPort(), gwResp = rune::client::testing::allocFreeUdpPort();
+    Config c = responseConfig(loopback(gwPort), gwResp, 3710);
+    Transport t{c};
+    t.start();
+    const uint16_t wPort = rune::client::testing::allocFreeUdpPort(), wResp = rune::client::testing::allocFreeUdpPort();
+    const std::string worker = loopback(wPort);
+    const auto respCtl = rune::client::transport::responseControlChannelFor(worker, wResp);
+    ASSERT_TRUE(respCtl.has_value());
+    const Transport::PubHandle h = t.responsePublicationHandle(worker, 3711, *respCtl);
+    ASSERT_NE(h, Transport::kNoPub);
+    RawServer srv(c.dataDir, worker, 3711, wResp, c.egressStreamId);
+    ASSERT_TRUE(pairRoundTrip(t, srv, h));
+    EXPECT_FALSE(t.responseEgressLost(h)) << "the image is connected: AwaitImage -> Connected, nothing lost";
+    const int32_t sub = t.responseSubSlotForTest(h);
+    ASSERT_GE(sub, 0);
+
+    t.releaseResponsePublication(h);
+    ASSERT_TRUE(pumpBoth(t, srv, [&] {
+        t.poll([](const uint8_t*, std::size_t) {}, 10);
+        return t.subSlotFreeForTest(sub);
+    }));
+
+    // Reuse: a worker nobody serves, so the new pair's response subscription never gets an image.
+    const std::string worker2 = loopback(rune::client::testing::allocFreeUdpPort());
+    const auto respCtl2 = rune::client::transport::responseControlChannelFor(worker2, rune::client::testing::allocFreeUdpPort());
+    ASSERT_TRUE(respCtl2.has_value());
+    const Transport::PubHandle h2 = t.responsePublicationHandle(worker2, 3712, *respCtl2);
+    ASSERT_EQ(h2, h);
+    ASSERT_EQ(t.responseSubSlotForTest(h2), sub) << "the test needs the SAME subscription slot";
+    const uint8_t frame[] = {1};
+    ASSERT_TRUE(pumpUntil(t, [&] {
+        (void)t.offerOn(h2, frame, sizeof frame);
+        return t.publicationResponseCorrelated(h2);
+    })) << "the reused pair never became ready";
+    for (int i = 0; i < 200; ++i) {
+        t.dutyCycle();
+        ASSERT_FALSE(t.responseEgressLost(h2)) << "a reused slot reported a loss from its old image (iteration " << i << ")";
+    }
+    t.stop();
+}
+
 // releasePublication on a slot that is still registering parks the registration (it used to leave it alone).
 TEST(AeronTransportRegression, ReleasingAResolvingPublicationLeavesNoOrphanRegression) {
     FastLingerEnv env;
