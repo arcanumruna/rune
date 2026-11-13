@@ -1775,8 +1775,9 @@ if(BUILD_TESTING)
         # (F7; the blocking catalogHistory / catalogAsOf / catalogDiff run against
         # a real BrokerNode in the broker's rune_client_broker_tests).
         add_executable(rune_client_catalog_tests tests/catalog/CatalogReaderTest.cpp)
-        target_include_directories(rune_client_catalog_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
-        target_link_libraries(rune_client_catalog_tests PRIVATE rune_client_api GTest::gtest_main)
+        # #944: the CLI's stats commands (QlEngine.h is internal) against the same fake and catalog feed.
+        target_include_directories(rune_client_catalog_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/src/cli)
+        target_link_libraries(rune_client_catalog_tests PRIVATE rune_cli_lib rune_client_api GTest::gtest_main)
         if(UNIX AND NOT APPLE AND UUID_LIB_INVOKER)
             target_link_libraries(rune_client_catalog_tests PRIVATE ${UUID_LIB_INVOKER})
         endif()

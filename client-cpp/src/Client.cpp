@@ -3118,7 +3118,10 @@ Client::AndWaitEnd Client::andWaitCore_(const char* what, std::chrono::nanosecon
                                std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    issueDeadline - std::chrono::steady_clock::now()));
     if (cfg_.runnerMode == RunnerMode::Invoker) {
-        w = q.waitFor(kToken, left, done, [this] { return doWork(); });
+        w = q.waitFor(kToken, left, done, [this] {
+            if (waitPumpHook_) waitPumpHook_();
+            return doWork();
+        });
     } else {
         w = q.waitFor(kToken, left, done);
     }

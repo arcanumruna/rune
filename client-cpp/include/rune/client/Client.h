@@ -884,6 +884,11 @@ public:
     [[nodiscard]] uint64_t testSeedFailoverConnects() const noexcept { return seedFailoverConnects_; }
     /// DR client bug 2 (after close): close() drains cut short by closeTimeoutMs.
     [[nodiscard]] uint64_t testCloseDeadlineHits() const noexcept { return closeDeadlineHits_; }
+    /// Test hook: called once per iteration of an Invoker-mode blocking wait (the `*AndWait` calls and the catalog /
+    /// security refresh behind `constraintName`), before the client's own doWork().  It lets a test pump a fake
+    /// broker (or change state) from inside the blocking call.  App thread only; unset by default (one null check
+    /// per iteration).  Thread mode: only the event-log refresh calls it; the `*AndWait` calls park on the queue.
+    void setWaitPumpHookForTest(std::function<void()> hook) { waitPumpHook_ = std::move(hook); }
     [[nodiscard]] uint64_t testMetadataViaOtherSession() const noexcept { return metadataViaOtherSession_; }
     [[nodiscard]] const std::string& testSeedChannel() const noexcept { return agent_.seedChannel(); }
     /// #767: how often the seed's default publication moved (a completed retarget / failover).
@@ -1839,6 +1844,7 @@ private:
     static constexpr int64_t kDefaultCloseTimeoutMs = 65'000;
     static constexpr int64_t kMaxCloseTimeoutMs     = 365LL * 24 * 3600 * 1000;   // fix round 1 (I5): one year
     uint64_t closeDeadlineHits_ = 0;   ///< close() drains cut short by closeTimeoutMs (test hook)
+    std::function<void()> waitPumpHook_;   ///< setWaitPumpHookForTest(); app thread only
     void releaseCq_(Completions& q) noexcept;
     void applyCqAdd_(detail::CompletionRing* ring);
     void applyCqRelease_(CqRef ref, detail::CompletionRing* ring, uint64_t prodIssued);

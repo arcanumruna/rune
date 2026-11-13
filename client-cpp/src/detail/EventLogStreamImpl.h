@@ -540,6 +540,7 @@ CatalogResult<void> EventLogStream<P>::refresh(std::chrono::milliseconds timeout
     const int64_t deadline = now() + std::chrono::duration_cast<std::chrono::nanoseconds>(timeout).count();
     int idle = 0;
     auto pump = [&] {
+        if (client_.waitPumpHook_) client_.waitPumpHook_();   // test seam (Client::setWaitPumpHookForTest)
         if (invoker) {
             if (client_.doWork() > 0) idle = 0;
             else if (++idle > 64) std::this_thread::sleep_for(std::chrono::microseconds(50));

@@ -16,9 +16,14 @@
 #include <rune/catalog/CatalogReplayer.h>
 #include <rune/catalog/testing/GoldenScript.h>
 #include <rune/client/Client.h>
+#include <rune/client/ConstraintNames.h>
 #include <rune/client/catalog/CatalogReader.h>
+#include <rune/codec/Serialize.h>
+#include <rune/codec/ViewPlanAuthored.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/StatsMessages.h>
+#include "QlEngine.h"
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -1025,6 +1030,220 @@ TEST(CatalogReaderRegression, ConstraintNameMissWithoutACatalogAnswerIsNoneWithi
     const uint64_t after = r.client.catalogReader().stats().subscribes;
     EXPECT_EQ(r.client.constraintName(0), std::nullopt);
     EXPECT_EQ(r.client.catalogReader().stats().subscribes, after) << "the key index never refreshes";
+}
+
+namespace {
+constexpr char kStatsView[] = "account_stats";
+
+/// A source topic `character` and a view `account_stats` (key userId) with the check `max_characters`; its constraint
+/// id is (viewObjectId << 16) | 1.
+std::vector<rcat::CatalogEvent> viewWithAConstraintScript(uint64_t& viewObjectId) {
+    rcat::testing::golden_detail::ScriptBuilder b;
+    rcat::CreateTopicOps t;
+    t.partitions = 1; t.replicationFactor = 1;
+    b.createTopic("character", std::move(t), "CREATE TOPIC character");
+    rune::view::ViewPlan plan;
+    plan.viewName = kStatsView;
+    plan.key      = "userId";
+    plan.sources.push_back({-1, "userId"});
+    plan.output.push_back({"userId", rune::codec::PrimType::UInt64, 0, "userId", rune::view::MergeRule::Replace});
+    plan.constraints.push_back({"max_characters", {}});
+    rune::codec::DescriptorBuilder out(kStatsView);
+    out.add("userId", rune::codec::PrimType::UInt64, 1, true);
+    rcat::ViewDef v;
+    v.sinkPartitions = 1; v.keyField = "userId"; v.sourceNames = {"character"};
+    v.normalizedPlanBlob   = rune::view::serializeAuthored(plan);
+    v.outputDescriptorBlob = rune::codec::serialize(out.build());
+    b.createView(kStatsView, std::move(v), "CREATE VIEW account_stats");
+    viewObjectId = b.state().viewByName(0, kStatsView)->objectId;
+    return std::move(b).take();
+}
+}  // namespace
+
+// A miss that the catalog refresh resolves: the blocking refresh is answered INSIDE the call (the wait pump hook
+// drives the fake broker), the name comes back, and exactly one refresh was sent.
+TEST(CatalogReaderRegression, ConstraintNameMissThenRefreshResolvesRegression) {
+    Rig r(invokerCfg(4058, 4059)); r.connect();
+    uint64_t viewId = 0;
+    CatalogFeed feed(r.gw, viewWithAConstraintScript(viewId));
+    int pumps = 0;
+    r.client.setWaitPumpHookForTest([&] { ++pumps; r.gw.pump(); });
+    const uint32_t id = static_cast<uint32_t>(viewId << 16) | 1u;
+    ASSERT_TRUE(r.client.catalogReader().state().viewByObjectId(viewId) == nullptr) << "the cache starts empty: a miss";
+    const uint64_t before = r.client.catalogReader().stats().subscribes;
+    const auto name = r.client.constraintName(id, std::chrono::seconds(30));
+    ASSERT_TRUE(name.has_value()) << "the refresh did not resolve the miss";
+    EXPECT_EQ(name->view, kStatsView);
+    EXPECT_EQ(name->constraint, "max_characters");
+    EXPECT_EQ(r.client.catalogReader().stats().subscribes, before + 1) << "exactly one refresh was sent";
+    EXPECT_EQ(feed.subscribeFromOffsets().size(), 1u);
+    EXPECT_GT(pumps, 0) << "the answer came through the hook";
+    const uint64_t after = r.client.catalogReader().stats().subscribes;
+    EXPECT_TRUE(r.client.constraintName(id, std::chrono::seconds(30)).has_value());
+    EXPECT_EQ(r.client.catalogReader().stats().subscribes, after) << "a hit never refreshes";
+}
+
+// ---- #944: the CLI's stats label pass must not read the objects the stats were read for after the catalog refresh ----
+namespace {
+constexpr int32_t kPoisonedId = 987654;
+
+/// `character` (2 partitions) plus, with `withView`, `account_stats` (check `max_characters`), and, with `alter`, the
+/// same view altered to carry a second check `max_level` (so its ordinal 2 misses a cache holding only the first).
+std::vector<rcat::CatalogEvent> statsScript(bool withView, bool alter, uint64_t& viewObjectId) {
+    rcat::testing::golden_detail::ScriptBuilder b;
+    rcat::CreateTopicOps t;
+    t.partitions = 2; t.replicationFactor = 1;
+    b.createTopic("character", std::move(t), "CREATE TOPIC character");
+    auto viewDef = [](std::vector<const char*> checks) {
+        rune::view::ViewPlan plan;
+        plan.viewName = kStatsView;
+        plan.key      = "userId";
+        plan.sources.push_back({-1, "userId"});
+        plan.output.push_back({"userId", rune::codec::PrimType::UInt64, 0, "userId", rune::view::MergeRule::Replace});
+        for (const char* c : checks) plan.constraints.push_back({c, {}});
+        rune::codec::DescriptorBuilder out(kStatsView);
+        out.add("userId", rune::codec::PrimType::UInt64, 1, true);
+        rcat::ViewDef v;
+        v.sinkPartitions = 2; v.keyField = "userId"; v.sourceNames = {"character"};
+        v.normalizedPlanBlob   = rune::view::serializeAuthored(plan);
+        v.outputDescriptorBlob = rune::codec::serialize(out.build());
+        return v;
+    };
+    if (withView) {
+        b.createView(kStatsView, viewDef({"max_characters"}), "CREATE VIEW account_stats");
+        viewObjectId = b.state().viewByName(0, kStatsView)->objectId;
+    }
+    if (alter) b.alterView(kStatsView, viewDef({"max_characters", "max_level"}), "ALTER VIEW account_stats");
+    return std::move(b).take();
+}
+
+/// A StatsResponse carrying one constraint (id -> rejections) and no stat.
+std::vector<uint8_t> oneConstraintStats(uint32_t constraintId, uint64_t rejections, int64_t sessionId, int64_t corr) {
+    std::vector<uint8_t> cons(pc::StatsResponse::kConstraintBytes);
+    pc::detail::putLE32(cons.data(), 0, constraintId);
+    pc::detail::putLE64(cons.data(), 4, rejections);
+    pc::StatsResponse m;
+    m.sessionId = sessionId; m.correlationId = corr; m.status = 0; m.count = 0;
+    m.constraintCount = 1; m.constraintBytes = cons;
+    std::vector<uint8_t> out(m.encodedSize());
+    m.encode(out.data());
+    return out;
+}
+
+/// Records every GetStats (scope, objectId, partition) and answers it with the one constraint `constraintId`
+/// (rejections 10 + partition) - except a ViewPartition read, which has none.
+struct StatsFake {
+    struct Seen { pc::StatsScope scope; int32_t objectId; int32_t partition; };
+    std::vector<Seen> seen;
+    StatsFake(Rig& r, uint32_t constraintId) {
+        r.gw.templateHandlers[pc::GetStats::TEMPLATE_ID] = [this, &r, constraintId](int ep, const uint8_t* f, std::size_t n) {
+            const auto m = pc::GetStats::decode(f, n);
+            ASSERT_TRUE(m.has_value());
+            seen.push_back({m->scope, m->objectId, m->partition});
+            std::vector<uint8_t> resp;
+            if (m->scope == pc::StatsScope::ViewPartition) {
+                pc::StatsResponse e;
+                e.sessionId = m->sessionId; e.correlationId = m->correlationId; e.status = 0;
+                resp.resize(e.encodedSize());
+                e.encode(resp.data());
+            } else {
+                resp = oneConstraintStats(constraintId, 10 + static_cast<uint64_t>(m->partition), m->sessionId, m->correlationId);
+            }
+            r.gw.send(ep, resp.data(), resp.size());
+        };
+    }
+};
+}  // namespace
+
+// topicStats: the constraint id misses the cache, the label pass refreshes the catalog, the history under the cache is
+// replaced (the old snapshot is freed) and the caller's `t` is overwritten from inside that refresh - what a freed
+// object looks like to a stale pointer.  Both partitions must still be read for the REAL topic id and carry the right
+// label; only a command that finishes every read of `t` before the label pass survives.
+TEST(CatalogReaderRegression, StatsLabelPassSurvivesACatalogRefreshRegression) {
+    Rig r(invokerCfg(4060, 4061)); r.connect();
+    uint64_t viewId = 0;
+    const auto withoutView = statsScript(false, false, viewId);
+    const auto withView    = statsScript(true, false, viewId);
+    ASSERT_NE(viewId, 0u);
+    CatalogFeed feed(r.gw, withoutView);
+    auto first = refreshOnce(r, r.client.catalogReader(), 5'000'000'000);
+    ASSERT_TRUE(first.has_value() && first->has_value());
+    const rcat::TopicObject* cached = r.client.catalogReader().state().topicByName(0, "character");
+    ASSERT_NE(cached, nullptr);
+    rcat::TopicObject t = *cached;   // the caller's object: the hook overwrites it from inside the refresh
+    const int32_t realTopicId = t.topicId;
+    ASSERT_EQ(t.partitions, 2);
+    const uint32_t constraintId = static_cast<uint32_t>(viewId << 16) | 1u;
+    ASSERT_FALSE(rc::resolveConstraintName(r.client.catalogReader().state(), r.client.catalogReader().events(), constraintId));
+    feed.replaceHistory(withView);   // the broker's history changes: the next refresh drops the cache and re-reads from 0
+    StatsFake fake(r, constraintId);
+    const std::size_t subscribesBefore = feed.subscribeFromOffsets().size();
+    bool poisoned = false;
+    r.client.setWaitPumpHookForTest([&] {
+        r.gw.pump();
+        if (!poisoned && feed.subscribeFromOffsets().size() > subscribesBefore) {   // the label pass's refresh has started
+            poisoned = true;
+            t.topicId = kPoisonedId;
+        }
+    });
+    auto out = rune::cli::engine::topicStats(r.client, t, -1);
+    ASSERT_TRUE(out.has_value()) << out.error();
+    ASSERT_EQ(out->size(), 2u);
+    ASSERT_EQ(fake.seen.size(), 2u);
+    for (std::size_t p = 0; p < 2; ++p) {
+        EXPECT_EQ(fake.seen[p].scope, pc::StatsScope::TopicPartition);
+        EXPECT_EQ(fake.seen[p].objectId, realTopicId) << "partition " << p << " was read for a topic id the refresh overwrote";
+        EXPECT_EQ(fake.seen[p].partition, static_cast<int32_t>(p));
+        ASSERT_EQ((*out)[p].constraintLabels.size(), 1u);
+        EXPECT_EQ((*out)[p].constraintLabels[0], "account_stats.max_characters");
+        ASSERT_EQ((*out)[p].result.constraints.size(), 1u);
+        EXPECT_EQ((*out)[p].result.constraints[0].rejections, 10u + p);
+    }
+    EXPECT_TRUE(poisoned) << "the label pass refreshed the catalog (the hook ran inside it)";
+}
+
+// viewStats: the same, for a view whose second constraint only the refreshed catalog knows.
+TEST(CatalogReaderRegression, ViewStatsLabelPassSurvivesACatalogRefreshRegression) {
+    Rig r(invokerCfg(4062, 4063)); r.connect();
+    uint64_t viewId = 0, viewId2 = 0;
+    const auto before = statsScript(true, false, viewId);
+    const auto after  = statsScript(true, true, viewId2);
+    ASSERT_EQ(viewId, viewId2);
+    CatalogFeed feed(r.gw, before);
+    auto first = refreshOnce(r, r.client.catalogReader(), 5'000'000'000);
+    ASSERT_TRUE(first.has_value() && first->has_value());
+    const rcat::ViewObject* cached = r.client.catalogReader().state().viewByName(0, kStatsView);
+    ASSERT_NE(cached, nullptr);
+    rcat::ViewObject v = *cached;
+    const int32_t realViewTopic = v.def.viewTopicId;
+    const uint32_t constraintId = static_cast<uint32_t>(viewId << 16) | 2u;
+    ASSERT_FALSE(rc::resolveConstraintName(r.client.catalogReader().state(), r.client.catalogReader().events(), constraintId));
+    feed.replaceHistory(after);
+    StatsFake fake(r, constraintId);
+    const std::size_t subscribesBefore = feed.subscribeFromOffsets().size();
+    bool poisoned = false;
+    r.client.setWaitPumpHookForTest([&] {
+        r.gw.pump();
+        if (!poisoned && feed.subscribeFromOffsets().size() > subscribesBefore) {
+            poisoned = true;
+            v.def.viewTopicId = kPoisonedId;
+        }
+    });
+    auto out = rune::cli::engine::viewStats(r.client, r.client.catalogReader().state(), v, -1);
+    ASSERT_TRUE(out.has_value()) << out.error();
+    ASSERT_EQ(out->size(), 2u);
+    int viewReads = 0;
+    for (const auto& s : fake.seen)
+        if (s.scope == pc::StatsScope::ViewPartition) {
+            ++viewReads;
+            EXPECT_EQ(s.objectId, realViewTopic) << "a view partition was read for an id the refresh overwrote";
+        }
+    EXPECT_EQ(viewReads, 2);
+    for (std::size_t p = 0; p < 2; ++p) {
+        ASSERT_EQ((*out)[p].constraintLabels.size(), 1u);
+        EXPECT_EQ((*out)[p].constraintLabels[0], "account_stats.max_level");
+    }
+    EXPECT_TRUE(poisoned);
 }
 
 // ---- Adversarial review of batch C9 (#600): the sink-partition rule on every view-definition entry point. ----
