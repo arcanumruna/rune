@@ -13,6 +13,11 @@
 
 namespace rune::protocol::client {
 
+/// The largest topic descriptor a client may receive or a broker may accept on the define path (bytes).  A broker's own
+/// bound (derived from its admin request ring, minus the define request's fixed framing) never exceeds it, and it leaves
+/// room for the four system columns a lease topic's stored descriptor gains; a client sizes its schema read from it.
+inline constexpr std::size_t kMaxTopicDescriptorBytes = 128u << 10;
+
 // ---------------------------------------------------------------------------
 // Catalog history (client version 8) — the DDL extension trailer.
 //

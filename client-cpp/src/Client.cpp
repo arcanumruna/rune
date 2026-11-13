@@ -3321,10 +3321,14 @@ DefineTopicResult Client::defineTopicAndWait(std::string_view name, uint32_t par
     return result;
 }
 
+// A GetTopicSchema completion: the descriptor (up to the broker's bound), then the key-features block and the lease block.
+static constexpr uint32_t kSchemaResultCapBytes = static_cast<uint32_t>(
+    rune::protocol::client::kMaxTopicDescriptorBytes + rune::protocol::kTopicKeyFeaturesWireLen + kSchemaLeaseBlockBytes);
+
 TopicSchemaResult Client::openLeaseSchemaAndWait(std::string_view name, uint64_t requestedFingerprint,
                                                  std::chrono::nanoseconds timeout) {
     TopicSchemaResult result;
-    andWait_("openLeaseTopic()", timeout, 64u << 10,
+    andWait_("openLeaseTopic()", timeout, kSchemaResultCapBytes,
              [&](Completions& q, Token t) { return openLeaseTopicSchema(name, requestedFingerprint, q, t); },
              [&](const Completion& c, std::span<const uint8_t> p) {
                  if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("openLeaseTopic()", c, p);
@@ -3461,7 +3465,7 @@ TopicSchemaResult Client::resolveOpenTopicFailure(std::string_view name, uint64_
 TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, uint64_t requestedFingerprint,
                                                 std::chrono::nanoseconds timeout) {
     TopicSchemaResult result;
-    andWait_("getTopicSchema()", timeout, 64u << 10,
+    andWait_("getTopicSchema()", timeout, kSchemaResultCapBytes,
              [&](Completions& q, Token t) { return getTopicSchema(name, requestedFingerprint, q, t); },
              [&](const Completion& c, std::span<const uint8_t> p) {
                  if (c.status != OpStatus::BrokerError) throwForStatus_("getTopicSchema()", c, p);

@@ -23,6 +23,7 @@
 
 #include <rune/node/CatalogApplier.h>   // leaseViewSinkValid (the one fail-closed rule for a lease view sink)
 #include <rune/node/OneToOneByteRing.h>
+#include <rune/protocol/client/SchemaMessages.h>   // kMaxTopicDescriptorBytes
 #include <rune/protocol/CatalogTypes.h>
 #include <rune/protocol/LeaseSpec.h>
 #include <rune/protocol/NamespaceLimits.h>   // NamespaceDdlMsg (namespaces Task 7)
@@ -2031,6 +2032,9 @@ inline constexpr std::size_t kDefineTopicFixedBytes =
     1 + rune::protocol::kLeaseSpecBytes;   // lease topics: [hasLease u8][LeaseSpec]
 inline constexpr std::size_t kMaxDescriptorViaRequestRing =
     static_cast<std::size_t>(kAdminRequestRingBytes) / 8 - kDefineTopicFixedBytes;
+static_assert(kMaxDescriptorViaRequestRing + 128 <= rune::protocol::client::kMaxTopicDescriptorBytes,
+              "the client's schema-read bound must cover every descriptor the broker accepts, a lease topic's four "
+              "system columns included");
 static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing) <=
                   static_cast<std::size_t>(kAdminToControlRingBytes) / 8,
               "every descriptor the admin request ring can deliver must fit one "

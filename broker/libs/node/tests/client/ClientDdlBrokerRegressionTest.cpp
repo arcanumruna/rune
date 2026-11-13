@@ -9,6 +9,9 @@
 #include "client/OneBroker.h"
 #include "support/CatalogBrokerCluster.h"
 
+#include <rune/codec/Descriptor.h>
+#include <rune/codec/Serialize.h>
+#include <rune/node/AdminChannels.h>
 #include <rune/protocol/client/SchemaMessages.h>
 
 #include <gtest/gtest.h>
@@ -58,6 +61,38 @@ TEST(ClientDdlBrokerRegression, EveryDdlAndWaitRoundTripsThroughARealBroker) {
         EXPECT_FALSE(ids[i].none()) << i;
         EXPECT_EQ(log[i].event.principal.requestId, ids[i]) << "event " << i;
     }
+}
+
+// A typed descriptor of `fields` String columns with fixed-width names (so its size is linear in `fields`).
+static std::vector<uint8_t> wideDescriptor(const std::string& topic, std::size_t fields) {
+    rune::codec::DescriptorBuilder d(topic, 1);
+    d.add("id", rune::codec::PrimType::Int64, 1, /*isKey=*/true);
+    for (std::size_t i = 0; i < fields; ++i) {
+        std::string n = "f" + std::to_string(i);
+        n.resize(48, 'x');
+        d.add(std::move(n), rune::codec::PrimType::String);
+    }
+    return rune::codec::serialize(d.build());
+}
+
+TEST(ClientDdlBrokerRegression, GetTopicSchemaReturnsADescriptorJustUnderTheBrokerBoundRegression) {
+    constexpr std::size_t bound = rune::node::kMaxDescriptorViaRequestRing;
+    static_assert(bound > (64u << 10), "the bound must exceed the old 64 KiB cap for this to be a regression test");
+    const std::size_t s100 = wideDescriptor("big", 100).size();
+    const std::size_t per  = (wideDescriptor("big", 200).size() - s100) / 100;
+    const std::size_t n    = 100 + (bound - 512 - s100) / per;
+    const auto blob = wideDescriptor("big", n);
+    ASSERT_GT(blob.size(), 64u << 10);
+    ASSERT_LE(blob.size(), bound);
+    ASSERT_GT(blob.size() + 1024, bound) << "within 1 KiB under the broker's bound";
+
+    OneBroker b("cb_bigschema");
+    auto client = b.connectClient();
+    const auto created = client->defineTopicAndWait("big", 1, "id", blob, rune::client::Persistence::Disk, {}, {}, 30s);
+    ASSERT_EQ(created.errorCode, 0) << created.detail << " (descriptor " << blob.size() << " bytes)";
+    const auto got = client->getTopicSchemaAndWait("big", 30s);
+    EXPECT_EQ(got.errorCode, 0);
+    EXPECT_EQ(got.descriptorBlob, blob) << "the whole descriptor, byte for byte (" << blob.size() << " bytes)";
 }
 
 TEST(ClientDdlBrokerRegression, InvalidRequestDetailFromTheBrokerReachesTheCaller) {
