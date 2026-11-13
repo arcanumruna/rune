@@ -611,6 +611,12 @@ int runAiVerify() {
             if (set[i].finished()) { fail("CHECKED-WRITES-AI-VERIFY", "partition " + std::to_string(i) + " ended: broker code " + std::to_string(set[i].brokerErrorCode())); return 1; }
         std::lock_guard<std::mutex> g(mu);
         if (!malformed.empty() || seen == expected) break;
+        // An id nobody was answered with, or one delivered more often than answered, can only grow: stop now, the report below names it.
+        const bool extra = std::any_of(seen.begin(), seen.end(), [&](const auto& kv) {
+            const auto it = expected.find(kv.first);
+            return it == expected.end() || kv.second > it->second;
+        });
+        if (extra) break;
     }
     std::this_thread::sleep_for(5s);   // a quiet window: a stray or duplicate record lands now
     std::lock_guard<std::mutex> g(mu);
