@@ -51,6 +51,14 @@ inline bool anyWorkerHasValidator(BrokerNode& n, int32_t topicId) {
     return any;
 }
 
+/// Produce requests the node's workers answered as duplicates from the producer dedup state, summed over its workers.
+inline uint64_t produceDuplicateAnswers(BrokerNode& n) {
+    uint64_t sum = 0;
+    for (int32_t w = 0; w < n.workerCountForTest(); ++w)
+        sum += n.onWorkerThreadForTest(w, [](Worker& wk) { return wk.produceDuplicateAnswersForTest(); });
+    return sum;
+}
+
 inline int32_t catalogTopicId(BrokerNode& n, const std::string& name) {
     return n.onAdminThreadForTest([&n, &name]() -> int32_t {
         const auto* t = n.adminWorkerAgentForTest()->worker().applier().state().topicByName(rune::catalog::kDefaultNsId, name);

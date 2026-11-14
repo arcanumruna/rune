@@ -3138,6 +3138,10 @@ TEST(CheckedWritesBrokerRegression, LostAckRetryAcrossFailoverReturnsTheSameIdsT
         ASSERT_TRUE(r.ok());
         ASSERT_EQ(r.key(), static_cast<uint64_t>(i));
     }
+    const auto survivorsDuplicateAnswers = [&] {
+        return cwb::produceDuplicateAnswers(c.node(seed)) + cwb::produceDuplicateAnswers(c.node(follower));
+    };
+    const uint64_t duplicatesBefore = survivorsDuplicateAnswers();
     client->dropProduceAcksForTest(1);
     constexpr int64_t kMarker = 4242;
     std::optional<rc::WriteResult> retried;
@@ -3158,6 +3162,8 @@ TEST(CheckedWritesBrokerRegression, LostAckRetryAcrossFailoverReturnsTheSameIdsT
     EXPECT_TRUE(retried->ok()) << "status " << static_cast<int>(retried->status()) << " code " << retried->code();
     EXPECT_EQ(retried->key(), assigned) << "the retry on the new leader answers the id the old leader assigned";
     EXPECT_EQ(assigned, 4u);
+    EXPECT_GE(survivorsDuplicateAnswers(), duplicatesBefore + 1)
+        << "the retry was answered from the dedup state of a node that survived";
 
     ASSERT_TRUE(awaitLeaders(c, topicId, 1, leaders, 60s));
     auto reader = connectClient(c, patientConfig(c, seed));

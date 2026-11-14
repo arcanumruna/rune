@@ -596,6 +596,8 @@ public:
     [[nodiscard]] uint64_t pushReadsForTest() const noexcept { return pushReads_; }
     [[nodiscard]] uint64_t getViewRowsForTest() const noexcept { return getViewRows_; }
     [[nodiscard]] uint64_t getStatsForTest() const noexcept { return getStats_; }
+    /// Produce requests this worker answered as duplicates from the producer dedup state (a retry the log already held).
+    [[nodiscard]] uint64_t produceDuplicateAnswersForTest() const noexcept { return produceDuplicateAnswers_; }
     [[nodiscard]] uint64_t getViewRowKsForTest() const noexcept { return getViewRowKs_; }
     [[nodiscard]] uint64_t scanViewRowsForTest() const noexcept { return scanViewRows_; }
 
@@ -7241,6 +7243,7 @@ private:
     uint64_t    pushReads_ = 0;            // F15 S4: PushRead ops executed (R-1 / R-3 tests)
     uint64_t    getViewRows_ = 0;          // Task 20: GetViewRow ops executed
     uint64_t    getStats_ = 0;             // checked writes Part 08: GetStats ops executed
+    uint64_t    produceDuplicateAnswers_ = 0;   // test seam: produce requests answered as duplicates (worker-owned)
     std::array<uint8_t, rune::protocol::client::StatsResponse::kMaxEncodedSize> statsScratch_{};   // one GetStats answer: the stat entries, then the constraint entries
     uint64_t    getViewRowKs_ = 0;         // checked writes Part 07: GetViewRowK ops executed
     uint64_t    scanViewRows_ = 0;         // checked writes Part 07: ScanViewRows ops executed
@@ -12103,6 +12106,8 @@ private:
                 *mem, psm_, acksAll, isrSize, minIsr, helperTier, crcPreverified);
             if (outcome.logFull) [[unlikely]] noteTransientFull_(f.topicId, f.partition, outcome.error);
         }
+
+        if (outcome.isDuplicate) ++produceDuplicateAnswers_;
 
         // A duplicate answers its ORIGINAL base offset (-1 for a KNOWN-OLD
         // duplicate, EOS-OOS: OK, offset unknown — Kafka DUPLICATE_SEQUENCE_NUMBER)
