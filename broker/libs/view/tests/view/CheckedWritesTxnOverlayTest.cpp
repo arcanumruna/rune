@@ -10,7 +10,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -527,4 +529,206 @@ TEST(CheckedWritesTxnOverlayRegression, ChainedPreparesThenDirectApplyEqualSeque
             EXPECT_EQ(drained(chained.blocks, chained.agg.blockRow.rowLen), seq[3]) << "seed " << seed;
         }
     }
+}
+
+// ---- chained-vs-sequential oracle for the projection kinds and unique claims (#956) -------------------------------
+namespace {
+
+enum class ProjKind { Plain, Keyed, OwnerMapped, Unique };
+
+rune::codec::Descriptor codedSource() {
+    return rune::codec::DescriptorBuilder("coded", 1)
+        .addFixedStr("code", 16, 1, true).add("gender", PrimType::UInt16).build();
+}
+void putU16(std::vector<uint8_t>& rec, const rune::codec::Descriptor& d, const char* field, uint16_t v) {
+    const auto* f = d.find(field);
+    rec[4 + f->offset] = uint8_t(v);
+    rec[4 + f->offset + 1] = uint8_t(v >> 8);
+}
+std::vector<uint8_t> codedRecord(const rune::codec::Descriptor& d, const std::string& code, uint16_t gender) {
+    std::vector<uint8_t> rec(4 + d.blockLength, 0);
+    rec[0] = uint8_t(d.blockLength); rec[1] = uint8_t(d.blockLength >> 8); rec[2] = uint8_t(d.version);
+    const auto* cf = d.find("code");
+    for (size_t i = 0; i < code.size(); ++i) rec[4 + cf->offset + i] = uint8_t(code[i]);
+    putU16(rec, d, "gender", gender);
+    return rec;
+}
+
+// One projection view of the given kind over its own tables.
+struct OracleRig {
+    ProjKind kind;
+    rune::codec::Descriptor src;
+    CompileResult comp;
+    std::optional<KeyedFoldSpec> spec;
+    VersionDescriptorCache vdc;
+    std::optional<ViewTable> table, owners;
+    std::optional<UniqueClaims> claims;
+    PrimType keyType;
+    Prospect p;
+    TxnOverlay chain;
+
+    static CompileResult compileKind(ProjKind k, const rune::codec::Descriptor& s) {
+        ViewPlan v;
+        v.viewName = "oracle_view";
+        v.sources = {{5, k == ProjKind::Keyed ? "code" : "characterId"}};
+        if (k == ProjKind::Plain) {
+            v.key = "characterId";
+        } else if (k == ProjKind::Keyed) {
+            v.keyComponents = {{"code", 0, "code"}};
+        } else {
+            v.unicodeVersion = rune::codec::kUnicodeVersion;
+            v.unique = k == ProjKind::Unique;
+            v.keyComponents = {{"name", 1, "nameKey"}};
+            if (k == ProjKind::OwnerMapped) v.keyComponents.push_back({"characterId", 0, "characterId"});
+            else v.output.push_back({"characterId", PrimType::UInt64, 0, "characterId", MergeRule::Replace});
+        }
+        v.output.push_back({"gender", PrimType::UInt16, 0, "gender", MergeRule::Replace});
+        const rune::codec::Descriptor* srcs[] = {&s};
+        return compileView(v, srcs, kViewTopic).value();
+    }
+    explicit OracleRig(ProjKind k)
+        : kind(k), src(k == ProjKind::Keyed ? codedSource() : charSource()), comp(compileKind(k, src)), vdc(src),
+          keyType(k == ProjKind::Keyed ? PrimType::FixedStr : PrimType::UInt64) {
+        spec = buildKeyedFoldSpec(comp.plan, src);
+        if (k == ProjKind::Plain) {
+            table.emplace(comp.rowLayout, 256, 1u << 16);
+        } else {
+            table.emplace(comp.rowLayout, 256, 1u << 16,
+                          ViewTableKeys{uint8_t(spec->keyWidth), uint8_t(spec->prefixWidth), 7});
+            if (spec->ownerMapped) {
+                RowLayout l;
+                l.rowLen = spec->keyWidth;
+                owners.emplace(l, 256, 1u << 16, ViewTableKeys{spec->wireKeyWidth, 0, 7});
+            }
+            if (k == ProjKind::Unique)
+                claims.emplace(spec->keyWidth, spec->wireKeyWidth, comp.rowLayout.rowLen, keyType, 7, 256, 1u << 16);
+        }
+        p.reserve(comp.rowLayout, nullptr);
+        chain.reserve(4096, 256);
+    }
+    [[nodiscard]] bool isOwnerMapped() const { return spec && spec->ownerMapped; }
+    [[nodiscard]] std::vector<ViewTable*> tables() {
+        std::vector<ViewTable*> t{&*table};
+        if (owners) t.push_back(&*owners);
+        if (claims) { t.push_back(&claims->indexTable()); t.push_back(&claims->extrasTable()); }
+        return t;
+    }
+    PrepareStatus prepare(const SourceRecord& rec, TxnOverlay* ch, bool apply) {
+        ProjectionFold f{comp.plan, comp.rowLayout, vdc, *table, keyType, spec ? &*spec : nullptr,
+                         owners ? &*owners : nullptr, claims ? &*claims : nullptr};
+        const PrepareStatus st = prepareProjection(f, rec, p, ch);
+        if (apply && st == PrepareStatus::Ok) applyProjection(f, rec, p);
+        return st;
+    }
+};
+
+struct OracleRecord { std::string key, value; };
+
+// A random record over a small key space, so keys repeat, update, delete and (unique) collide.
+OracleRecord randomRecord(const OracleRig& r, std::mt19937_64& rng) {
+    const bool tombstone = rng() % 5 == 0;
+    const uint16_t gender = uint16_t(1 + rng() % 4);
+    const auto asString = [](const std::vector<uint8_t>& b) { return std::string(b.begin(), b.end()); };
+    if (r.kind == ProjKind::Keyed) {
+        const std::string code = "k" + std::to_string(rng() % 12);
+        std::string wire = code;
+        wire.resize(16, '\0');
+        return {wire, tombstone ? std::string() : asString(codedRecord(r.src, code, gender))};
+    }
+    const uint64_t id = rng() % 12;
+    const std::string wire = asString(keyBytes(id));
+    if (tombstone) return {wire, std::string()};
+    static const char* const kNames[] = {"a", "A", "b", "B", "c", "d", "Ab", "aB"};
+    const std::string name = kNames[rng() % (r.kind == ProjKind::Unique ? 6 : 8)];
+    std::vector<uint8_t> v = character(r.src, id, name);
+    putU16(v, r.src, "gender", gender);
+    return {wire, asString(v)};
+}
+
+using Drained = std::map<std::pair<int, std::vector<uint8_t>>, std::vector<uint8_t>>;   // {deleted, key bytes} -> row
+Drained drainedKeyed(ViewTable& t) {
+    Drained d;
+    const uint32_t rowLen = t.rowLen();
+    t.drainDirtyKeyed([&](uint32_t, const uint8_t* row, bool deleted, std::span<const uint8_t> key) {
+        d[{deleted ? 1 : 0, std::vector<uint8_t>(key.begin(), key.end())}] =
+            deleted ? std::vector<uint8_t>() : std::vector<uint8_t>(row, row + rowLen);
+    });
+    return d;
+}
+
+// Both rigs start from the same stored rows, then the same records go through a chain on one and one by one on the
+// other: every record's prospect agrees, the chain leaves the tables alone, and applying the records afterwards leaves
+// the same table bytes.
+void chainedEqualsSequential(ProjKind kind) {
+    for (uint64_t seed = 1; seed <= 20; ++seed) {
+        SCOPED_TRACE("seed " + std::to_string(seed));
+        std::mt19937_64 rng(seed);
+        OracleRig chained(kind), sequential(kind);
+        if (kind == ProjKind::Unique) ASSERT_TRUE(sequential.claims.has_value());
+        for (int i = 0; i < 12; ++i) {
+            const OracleRecord o = randomRecord(chained, rng);
+            const SourceRecord rec{o.key, o.value, i, 0, nullptr};
+            for (OracleRig* g : {&chained, &sequential}) ASSERT_EQ(g->prepare(rec, nullptr, true), PrepareStatus::Ok);
+        }
+        for (std::size_t t = 0; t < chained.tables().size(); ++t)
+            ASSERT_EQ(drainedKeyed(*chained.tables()[t]), drainedKeyed(*sequential.tables()[t]))
+                << "seeded table " << t;
+        std::vector<std::size_t> sizes;
+        for (ViewTable* t : chained.tables()) sizes.push_back(t->size());
+
+        std::vector<OracleRecord> records;
+        for (int i = 0; i < 200; ++i) {
+            records.push_back(randomRecord(chained, rng));
+            const SourceRecord rec{records.back().key, records.back().value, 12 + i, 0, nullptr};
+            const PrepareStatus cs = chained.prepare(rec, &chained.chain, false);
+            const PrepareStatus ss = sequential.prepare(rec, nullptr, false);
+            ASSERT_EQ(cs, PrepareStatus::Ok) << "record " << i;
+            ASSERT_EQ(ss, PrepareStatus::Ok) << "record " << i;
+            const Prospect &c = chained.p, &sq = sequential.p;
+            ASSERT_EQ(c.op, sq.op) << "record " << i;
+            ASSERT_EQ(c.rowCount, sq.rowCount) << "record " << i;
+            ASSERT_EQ(c.ownerOp, sq.ownerOp) << "record " << i;
+            for (uint8_t j = 0; j < sq.rowCount; ++j) {
+                EXPECT_TRUE(c.rows[j].key == sq.rows[j].key) << "record " << i << " row " << int(j);
+                EXPECT_EQ(c.rows[j].removed, sq.rows[j].removed) << "record " << i << " row " << int(j);
+                EXPECT_EQ(c.rows[j].existed, sq.rows[j].existed) << "record " << i << " row " << int(j);
+                EXPECT_EQ(c.rows[j].ownedByOther, sq.rows[j].ownedByOther) << "record " << i << " row " << int(j);
+                EXPECT_EQ(c.rows[j].promoted, sq.rows[j].promoted) << "record " << i << " row " << int(j);
+                ASSERT_EQ(c.rows[j].image != nullptr, sq.rows[j].image != nullptr)
+                    << "record " << i << " row " << int(j);
+                if (sq.rows[j].image != nullptr)
+                    EXPECT_EQ(std::memcmp(c.rows[j].image, sq.rows[j].image, chained.comp.rowLayout.rowLen), 0)
+                        << "record " << i << " row " << int(j);
+            }
+            ASSERT_EQ(sequential.prepare(rec, nullptr, true), PrepareStatus::Ok);
+        }
+        for (std::size_t t = 0; t < sizes.size(); ++t) {
+            EXPECT_EQ(chained.tables()[t]->size(), sizes[t]) << "the chain wrote table " << t;
+            EXPECT_FALSE(chained.tables()[t]->hasDirty()) << "the chain dirtied table " << t;
+        }
+
+        for (std::size_t i = 0; i < records.size(); ++i) {
+            const SourceRecord rec{records[i].key, records[i].value, int64_t(12 + i), 0, nullptr};
+            ASSERT_EQ(chained.prepare(rec, nullptr, true), PrepareStatus::Ok) << "record " << i;
+        }
+        for (std::size_t t = 0; t < chained.tables().size(); ++t) {
+            EXPECT_EQ(chained.tables()[t]->size(), sequential.tables()[t]->size()) << "table " << t;
+            EXPECT_EQ(drainedKeyed(*chained.tables()[t]), drainedKeyed(*sequential.tables()[t])) << "table " << t;
+        }
+    }
+}
+
+}  // namespace
+
+TEST(CheckedWritesTxnOverlayRegression, PlainProjectionChainedEqualsSequentialRegression) {
+    chainedEqualsSequential(ProjKind::Plain);
+}
+TEST(CheckedWritesTxnOverlayRegression, KeyedProjectionChainedEqualsSequentialRegression) {
+    chainedEqualsSequential(ProjKind::Keyed);
+}
+TEST(CheckedWritesTxnOverlayRegression, OwnerMappedProjectionChainedEqualsSequentialRegression) {
+    chainedEqualsSequential(ProjKind::OwnerMapped);
+}
+TEST(CheckedWritesTxnOverlayRegression, UniqueClaimsChainedEqualsSequentialRegression) {
+    chainedEqualsSequential(ProjKind::Unique);
 }
