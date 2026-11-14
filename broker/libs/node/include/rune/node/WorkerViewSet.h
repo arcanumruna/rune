@@ -429,6 +429,8 @@ public:
     /// Test seam: this worker's catalog position is at least `through` (a cluster test cannot hold one node's catalog back).
     void raiseCatalogThroughForTest(int64_t through) noexcept { catalogThrough_ = std::max(catalogThrough_, through); }
     [[nodiscard]] int64_t catalogThroughForTest() const noexcept { return catalogThrough_; }
+    /// How many retained plan records installRetainedPlan_ decoded (one per judge and template change).
+    [[nodiscard]] uint64_t retainedPlanDecodesForTest() const noexcept { return retainedPlanDecodes_; }
     /// A replacement plan of this object builds as a candidate in some judge.
     [[nodiscard]] bool candidateForTest(uint64_t viewObjectId) const noexcept {
         return std::any_of(verdictSources_.begin(), verdictSources_.end(), [&](const auto& kv) { return kv.second->candidateForTest(viewObjectId); });
@@ -1016,6 +1018,7 @@ private:
     struct RefusedPlan { uint64_t viewObjectId, fingerprint; };
     std::vector<RefusedPlan> refusedPlans_;   // the catalog installs this worker refused: the log never installs them instead, and the sync keeps their object's logged member (object 0: a later good install of the object ended that keep)
     std::vector<uint64_t> unreadablePlans_;   // retained plans whose decode failure was logged
+    uint64_t retainedPlanDecodes_ = 0;        // test seam: decode attempts of retained plan records
     void noteRefused_(uint64_t viewObjectId, uint64_t fingerprint) {
         if (std::none_of(refusedPlans_.begin(), refusedPlans_.end(), [&](const RefusedPlan& r) { return r.fingerprint == fingerprint; })) refusedPlans_.push_back({viewObjectId, fingerprint});
     }

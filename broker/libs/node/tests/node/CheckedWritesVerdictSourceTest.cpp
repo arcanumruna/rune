@@ -684,6 +684,55 @@ TEST(CheckedWritesVerdictSourceRegression, RetireIsPerPartitionRegression) {
     EXPECT_TRUE(vs.verdictSource(5, 1) == nullptr || vs.verdictSource(5, 1)->judgedThrough() >= log[1].next);
 }
 
+// Two partitions of one source, both judges waiting for the same plan whose type-20 record is unreadable: each judge
+// decodes it once (the attempt is per judge), and the critical line is logged once for the fingerprint.
+TEST(CheckedWritesVerdictSourceRegression, TwoJudgesWaitingForOneUnreadablePlanDecodeOnceEachAndLogOnceRegression) {
+    std::ostringstream out;
+    const auto saved = spdlog::default_logger();
+    spdlog::set_default_logger(std::make_shared<spdlog::logger>(
+        "cw-unreadable", std::make_shared<spdlog::sinks::ostream_sink_mt>(out)));
+    struct Restore { std::shared_ptr<spdlog::logger> l; ~Restore() { spdlog::set_default_logger(l); } } restore{saved};
+    ViewSnapshotChannel channel;
+    const std::string dir =
+        (std::filesystem::temp_directory_path() / ("rune-cw-unreadable-" + std::to_string(::getpid()))).string();
+    struct Cleanup {
+        std::string d;
+        ~Cleanup() { std::error_code ec; std::filesystem::remove_all(d, ec); }
+    } cleanup{dir};
+    WorkerViewSet vs(channel, dir);
+    constexpr uint64_t kObject = 7, kFingerprint = 0x1234;
+    const std::vector<uint8_t> garbage{0xff, 0x01, 0x02, 0x03};   // no plan version starts with 0xff
+    Log log[2];
+    TopicWriteSpec spec;
+    PartitionWriteState st[2];
+    for (int p = 0; p < 2; ++p) {
+        st[p].spec = &spec;
+        log[p].control();
+        log[p].data({{1, 1}, {2, 1}});
+        st[p].constraintSets.onChange(0, setOf(1, {{kObject, kFingerprint}}));   // names a member nobody has installed
+        st[p].retainedPlans.onRecord(0, kObject, kFingerprint, VerdictViewKind::TestReject, garbage, garbage, garbage);
+    }
+    const auto drive = [&](int p) {
+        auto readRange = [&](int64_t from, int64_t) { return log[p].read(from); };
+        vs.driveFolds(5, p, readRange, log[p].next, rune::view::kNoSkip, 200'000'000, nullptr, 1, true, {}, &st[p],
+                      vs.ensureVerdictSource(5, p, st[p]));
+    };
+    for (int p = 0; p < 2; ++p) vs.ensureVerdictSource(5, p, st[p])->bindLeader(nullptr, 1, 0);
+    for (int i = 0; i < 200; ++i) { drive(0); drive(1); }
+    for (int p = 0; p < 2; ++p) {
+        ASSERT_NE(vs.verdictSource(5, p), nullptr);
+        EXPECT_TRUE(vs.verdictSource(5, p)->waitingForInstall())
+            << "partition " << p << " keeps waiting: the plan is unreadable";
+    }
+    EXPECT_EQ(vs.retainedPlanDecodesForTest(), 2u) << "one decode attempt per judge, not one per pass";
+    const std::string logged = out.str();
+    std::size_t lines = 0;
+    const std::string needle = "VERDICT-PLAN-UNREADABLE";
+    for (std::size_t at = logged.find(needle); at != std::string::npos && lines < 1000; at = logged.find(needle, at + 1))
+        ++lines;
+    EXPECT_EQ(lines, 1u) << "one critical line for the fingerprint:\n" << logged;
+}
+
 // A judge that activates past a drop (a new leadership above the covered offset) finds a leaving member no logged set names any
 // more: activation retires it, so neither the member nor its retiring template lingers.
 TEST(CheckedWritesVerdictSourceRegression, ActivationRetiresALeavingMemberNoSetNamesRegression) {

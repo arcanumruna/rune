@@ -1422,6 +1422,7 @@ void WorkerViewSet::installRetainedPlan_(int32_t srcTopicId, VerdictSource& judg
     if (catalogBehind_(srcTopicId, judge, write)) return;
     judge.retainedTriedEpoch = verdictEpoch_;   // decoded once per judge and template change, whatever comes of it
     judge.retainedTriedFingerprint = r->planFingerprint;
+    ++retainedPlanDecodes_;
     std::optional<rune::view::CompiledViewPlan> plan = rune::view::deserializeCompiledViewPlan(r->plan);
     rune::codec::Descriptor outDesc, srcDesc;
     rune::view::RowLayout layout;
