@@ -1026,3 +1026,51 @@ TEST(ClientDdlSuspectRegression, ABootstrapOpIsNotAskedAtTheSuspectEdgeRegressio
         EXPECT_EQ(t, pc::SecurityBootstrapChallengeRequest::TEMPLATE_ID) << "the signed bootstrap frame was sent";
     EXPECT_FALSE(f.ready());
 }
+
+// The seed, asked at the suspect edge, is the new leader and answers the op itself: no Redirect, NotLeader or session
+// loss would drop the route hint naming the silent node, so asking the seed drops it: the next op starts on the seed.
+TEST(ClientDdlSuspectRegression, SuspectEdgeDropsTheRouteHintOfTheSilentNodeRegression) {
+    Suspect s(4582, 4583, 1);
+    const int A = s.ep(0);
+    const OpKit kit = viewKit();
+    int phase = 0;   // 0: learn the hint through the seed's Redirect; 1: A goes silent, the seed answers; 2: the seed
+    s.on(kit.tid, [&](int ep, const pc::MessageHeader& h) {
+        if (ep == 0) {
+            if (phase == 0) s.redirect(0, s.ch(0), h);
+            else kit.answerOk(s.r, 0, h, 7);
+        } else if (ep == A) {
+            if (phase == 0) kit.answerOk(s.r, A, h, 5);
+            else s.r.gw.noPongEndpoints.insert(A);   // swallowed, and silent from now on
+        }
+    });
+    test_support::TestCq cq(s.r.client);
+    auto f1 = cq.issue([&](rc::Completions& q, rc::Token t) { return kit.issue(s.r.client, q, t); });
+    ASSERT_TRUE(f1.accepted());
+    ASSERT_TRUE(s.until([&] { return f1.ready(); }, 400)) << "the first op never completed";
+    ASSERT_TRUE(f1.ok()) << f1.describe();
+    EXPECT_EQ(s.r.client.routeHintLearned(), 1u) << "the Redirect to A is remembered";
+    EXPECT_EQ(s.r.client.routeHintHits(), 0u);
+    EXPECT_EQ(s.r.client.routeHintCleared(), 0u);
+
+    phase = 1;
+    auto f2 = cq.issue([&](rc::Completions& q, rc::Token t) { return kit.issue(s.r.client, q, t); });
+    ASSERT_TRUE(f2.accepted());
+    ASSERT_TRUE(s.until([&] { return f2.ready(); }, 400)) << "the second op never completed";
+    ASSERT_TRUE(f2.ok()) << f2.describe();
+    EXPECT_EQ(f2.outcome().c.value, 7) << "the seed answered the copy";
+    EXPECT_EQ(s.r.client.routeHintHits(), 1u) << "the second op started on the remembered node";
+    EXPECT_EQ(s.count(A), 2) << "the first op's frame and the second's";
+    EXPECT_EQ(s.r.client.routeHintCleared(), 1u) << "asking the seed must drop the hint of the silent node";
+
+    phase = 2;
+    const int seedBefore = s.count(0), nodeBefore = s.count(A);
+    auto f3 = cq.issue([&](rc::Completions& q, rc::Token t) { return kit.issue(s.r.client, q, t); });
+    ASSERT_TRUE(f3.accepted());
+    ASSERT_TRUE(s.until([&] { return f3.ready(); }, 400)) << "the third op never completed";
+    ASSERT_TRUE(f3.ok()) << f3.describe();
+    EXPECT_EQ(s.count(0), seedBefore + 1) << "the third op is first offered to the seed";
+    EXPECT_EQ(s.count(A), nodeBefore) << "the third op must not start on the silent node";
+    EXPECT_EQ(s.r.client.routeHintHits(), 1u);
+    EXPECT_EQ(s.r.client.routeHintCleared(), 1u);
+    EXPECT_EQ(s.r.client.testPendingControlOps(), 0u);
+}

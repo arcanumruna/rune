@@ -1161,7 +1161,7 @@ public:
     /// callback (Thread mode: the latest values the duty thread published on its status ring).
     [[nodiscard]] uint64_t routeHintHits() const;      ///< ops that started on a remembered leader
     [[nodiscard]] uint64_t routeHintLearned() const;   ///< hints stored from a followed Redirect
-    [[nodiscard]] uint64_t routeHintCleared() const;   ///< hints dropped (NotLeader, Redirect from a hinted node, lost session)
+    [[nodiscard]] uint64_t routeHintCleared() const;   ///< hints dropped (NotLeader, Redirect from a hinted node, lost or silent session)
     [[nodiscard]] uint64_t ctlRedirectsFollowed() const;   ///< Redirects followed by routed control ops
 
     OpResult dropTopic(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token);

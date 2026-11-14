@@ -98,7 +98,8 @@ A routed op follows its node session: a Redirect moves it, a NotLeader resends i
 that left its connect episode (the stale timeout) re-sends it toward the seed with the same requestId. Since #893 an op
 in flight on a node session that is merely silent (no Pong for more than two keepalive intervals) is also offered once
 per session episode to a live seed (`Client::askSeedAtSuspectEdge_`); the op stays where it is, and the seed's answer
-decides (a Redirect to another node is followed, one to the node the op is already on is ignored).
+decides (a Redirect to another node is followed, one to the node the op is already on is ignored). Asking the seed also drops the route hint naming that node, so a
+seed that answers the op itself does not leave later ops starting on the silent node.
 
 ### 2.1 Producer (`producer/`)
 Tier-1 producer with a **zero per-send heap allocation** fast path. App threads

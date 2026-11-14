@@ -2635,6 +2635,10 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                     agent_.connectedEpoch(0) != 0 && !agent_.seedSilent(nowNs) &&
                     askSeedAtSuspectEdge_(*d, nowNs)) {
                     d->suspectAsked = *on;
+                    // The seed may answer this op itself (it is the new leader): then no Redirect, NotLeader or session
+                    // loss would drop the hint, and every later op would start on the silent node.  Drop it now; a
+                    // node that is only slow is learnt again from the next Redirect (one extra round trip).
+                    forgetRouteHint_(*d);
                     ++work;
                 }
                 ++i;
