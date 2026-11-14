@@ -45,6 +45,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <memory_resource>
 #include <set>
 #include <memory>
 #include <optional>
@@ -142,6 +143,11 @@ public:
         : isr_(follower ? std::vector<rune::replication::NodeId>{1, 2} : std::vector<rune::replication::NodeId>{1}),
           rollBytes_(rollBytes), tuning_(tuning), viewDir_(rigTmpPath("views")), logDir_(rigTmpPath("log")) {
         vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string(), tuning_.hashSeed);
+        // Reusable buffers: the produce frame, the answers and ack order, and the acks' map nodes (a window around
+        // produceBytes, pass and collect must not allocate in the rig; a test that outgrows them only allocates again).
+        frameBuf_.reserve(1u << 16);
+        produceAnswers.reserve(1u << 16);
+        ackOrder_.reserve(1u << 16);
         open();
     }
     ~VerdictRig() {
@@ -163,6 +169,7 @@ public:
     /// typed() for a source whose key is `s`, with the write spec's key.index flag `enabled`.  A restart brings the topic back the same way.
     void createKeyIndex(KeyShape s = {}, bool enabled = true) {
         keyShape_ = s;
+        keyWidth_ = keyWidthOf(s);
         keyIndexOn_ = enabled;
         typedWith_(5, s, enabled);
     }
@@ -819,6 +826,7 @@ private:
     }
     void typedWith_(int16_t level, const KeyShape& shape, bool keyIndex) {
         keyShape_ = shape;
+        keyWidth_ = keyWidthOf(shape);
         WorkerOp l;
         l.type = WorkerOp::Type::ClusterFeatureLevel; l.nextOffset = level;
         send(std::move(l));
@@ -1173,6 +1181,7 @@ public:
     /// Drives until the consumer has nothing more to deliver, then returns what it got so far (cumulative).
     const Inbox& collect(int64_t subId) {
         Inbox& box = inboxes_[subId];
+        if (box.records.capacity() == 0) { box.records.reserve(1u << 19); box.frames.reserve(1u << 16); }   // no growth inside a window
         if (kinds_.at(subId) == SubKind::PushRead) {
             for (int iter = 0;; ++iter) {
                 if (iter == kCollectMaxPasses) { ADD_FAILURE() << "collect(" << subId << "): no quiescence after " << kCollectMaxPasses << " PushReads"; break; }
@@ -1183,7 +1192,8 @@ public:
                 op.replica = replica.get(); op.logPtr = log.get();
                 EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
                 const int64_t before = cursors_[subId];
-                std::vector<uint8_t> chunk;
+                std::vector<uint8_t>& chunk = chunkBuf_;
+                chunk.clear();
                 int64_t next = before;
                 now += 1'000'000;
                 worker->doWork(now);
@@ -1207,9 +1217,11 @@ public:
             if (iter == kCollectMaxPasses) { ADD_FAILURE() << "collect(" << subId << "): no quiescence after " << kCollectMaxPasses << " passes"; break; }
             const int work = pass();
             const std::size_t before = box.frames.size();
-            sub_->poll(aeron::FragmentAssembler([&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len, aeron::Header&) {
+            // One pointer is captured: a handler wider than std::function's inline storage would allocate on every poll.
+            struct Poll { VerdictRig* self; Inbox* box; int64_t subId; } poll{this, &box, subId};
+            sub_->poll(aeron::FragmentAssembler([p = &poll](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len, aeron::Header&) {
                 const auto dec = rune::protocol::client::Records::decode(reinterpret_cast<const uint8_t*>(buf.buffer() + off), static_cast<std::size_t>(len));
-                if (dec && dec->subscriptionId == subId) absorb_(box, dec->recordBatch.data(), dec->recordBatch.size());
+                if (dec && dec->subscriptionId == p->subId) p->self->absorb_(*p->box, dec->recordBatch.data(), dec->recordBatch.size());
             }).handler(), 64);
             if (work == 0 && box.frames.size() == before && worker->subscriptionPositionForTest(subId) >= deliverable_() && delivered_()) break;
         }
@@ -1271,11 +1283,11 @@ public:
         m.sessionId = kAckSession; m.correlationId = c; m.topicId = kSrc; m.partition = tuning_.partition; m.partitionKnown = 1;
         m.acks = acks; m.producerId = pid; m.producerEpoch = epoch; m.baseSequence = seq;
         m.recordBatch = std::span<const uint8_t>(bytes);
-        std::vector<uint8_t> f(m.encodedSize()); m.encode(f.data());
-        if (ackEncrypted_) f = sealC2b_(f);
-        aeron::concurrent::AtomicBuffer ab(f.data(), static_cast<aeron::util::index_t>(f.size()));
+        frameBuf_.resize(m.encodedSize()); m.encode(frameBuf_.data());
+        if (ackEncrypted_) frameBuf_ = sealC2b_(frameBuf_);
+        aeron::concurrent::AtomicBuffer ab(frameBuf_.data(), static_cast<aeron::util::index_t>(frameBuf_.size()));
         int64_t pos;
-        for (int i = 0; (pos = ackPub_->offer(ab, 0, static_cast<aeron::util::index_t>(f.size()))) < 0 && pos >= aeron::ADMIN_ACTION && i < kMaxPass; ++i) pass();   // back-pressure / admin: let the worker drain
+        for (int i = 0; (pos = ackPub_->offer(ab, 0, static_cast<aeron::util::index_t>(frameBuf_.size()))) < 0 && pos >= aeron::ADMIN_ACTION && i < kMaxPass; ++i) pass();   // back-pressure / admin: let the worker drain
         EXPECT_GT(pos, 0) << "the produce frame was refused: " << pos;
         return c;
     }
@@ -1547,11 +1559,16 @@ private:
     /// Every egress frame the worker published has been read off the image.
     [[nodiscard]] bool delivered_() const {
         if (!sub_ || !egress_ || egress_->pub() == nullptr) return true;
-        const auto image = sub_->imageBySessionId(egress_->pub()->sessionId());
-        return image != nullptr && image->position() == egress_->pub()->position();
+        // The image is looked up once per egress session: imageBySessionId allocates a handle on every call.
+        const int32_t session = egress_->pub()->sessionId();
+        if (egressImage_ == nullptr || egressImageSession_ != session || egressImage_->isClosed()) {
+            egressImage_ = sub_->imageBySessionId(session);
+            egressImageSession_ = session;
+        }
+        return egressImage_ != nullptr && egressImage_->position() == egress_->pub()->position();
     }
     void absorb_(Inbox& box, const uint8_t* data, std::size_t len) {
-        const uint32_t kw = keyWidthOf(keyShape_), idBytes = std::min<uint32_t>(kw, 8);
+        const uint32_t kw = keyWidth_, idBytes = std::min<uint32_t>(kw, 8);   // cached: building the descriptor allocates
         for (std::size_t pos = 0; pos + 12 <= len;) {
             rune::protocol::RecordBatchReader r(data + pos, len - pos);
             const int32_t total = r.totalLength();
@@ -1633,7 +1650,11 @@ private:
     std::unique_ptr<WorkerIngress> ackIngress_;
     std::shared_ptr<aeron::Subscription> ackSub_;
     std::shared_ptr<aeron::ExclusivePublication> ackPub_;
-    std::map<int64_t, Ack> acksSeen_;
+    std::vector<uint8_t> frameBuf_, chunkBuf_;   // produceBytes' frame and a PushRead chunk, reused
+    static constexpr std::size_t kAcksPoolBytes = 1u << 21;
+    std::unique_ptr<std::byte[]> acksPool_{new std::byte[kAcksPoolBytes]};   // the first acks' map nodes (heap again only past it)
+    std::pmr::monotonic_buffer_resource acksMem_{acksPool_.get(), kAcksPoolBytes, std::pmr::new_delete_resource()};
+    std::pmr::map<int64_t, Ack> acksSeen_{&acksMem_};
     std::vector<int64_t> ackOrder_;
     static constexpr uint8_t kC2bPrefix[4] = {9, 8, 7, 6}, kB2cPrefix[4] = {1, 2, 3, 4};
     bool ackEncrypted_ = false;
@@ -1707,6 +1728,9 @@ private:
     bool recovering_ = false;   ///< the views of a restarted node load their checkpoints; cleared once restart() delivered the boot mark
     bool lastInstallRecovery_ = false;   ///< the recovery flag of the last install frame sendInstall_ encoded
     KeyShape keyShape_;
+    mutable std::shared_ptr<aeron::Image> egressImage_;   // delivered_()'s cached image of the egress publication
+    mutable int32_t egressImageSession_ = -1;
+    uint32_t keyWidth_ = keyWidthOf(KeyShape{});   // keyWidthOf(keyShape_), kept for absorb_
     std::optional<rune::codec::Descriptor> customSrc_;   ///< useSource(): the source's schema
     std::vector<WorkerReturn> viewAnswers_;
     std::vector<WorkerReturn> statsAnswers_;

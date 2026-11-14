@@ -374,22 +374,26 @@ static void runSteadyStateAutoIncCreates(int measuredBatches, int warmupRecords)
         }
         return recs;
     };
+    // The window covers the produce submit, the worker's passes, the rig's own pass (acks) and the Raw collect.
+    // The frame bytes are built outside it.
     const auto drive = [&](int round, int records) -> uint64_t {
         const int producer = round % kProducers;
-        (void)r.produceFrame(recordsOf(records, round), kAllView, 100 + producer, seq[producer]);
+        const std::vector<uint8_t> frame = VerdictRig::batch(recordsOf(records, round), 100 + producer, seq[producer]);
+        const int32_t base = seq[producer];
         seq[producer] += records;
         uint64_t allocs = 0;
         {
             rune::testing::AllocWindow w;
+            (void)r.produceBytes(frame, kAllView, 100 + producer, base);
             for (int i = 0; i < 3; ++i) {
                 r.now += 1'000'000;
                 r.worker->doWork(r.now);
                 r.worker->drainReturnView([](WorkerReturn&&) {});
             }
+            r.passes(1);
+            if (round % 50 == 0) (void)r.collect(raw);
             allocs = w.count();
         }
-        r.passes(1);
-        if (round % 50 == 0) (void)r.collect(raw);
         return allocs;
     };
 
