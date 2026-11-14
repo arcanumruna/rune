@@ -439,8 +439,9 @@ segment as it is. A sealed segment whose bytes after the last whole, CRC-valid b
   checked write never gets a verdict until the segment is repaired or retention deletes it. Watch the gauge
   `rune-log-damaged-segments` and the `DAMAGED` log lines.
 - **Transactions and idempotent produce.** The read-committed state (open transactions, aborted ranges) and the producer state
-  are not rebuilt past the damage: read_committed reads and idempotent or transactional produces on that partition wait
-  (a produce is answered with a retriable error) until the segment is repaired, truncated or retained away. The rebuild resumes
+  are not rebuilt past the damage: read_committed reads and every acknowledged produce on that partition wait
+  (`acks=Leader` and `acks=All` are idempotent; the produce is answered with a retriable error, an `acks=None` produce still
+  appends) until the segment is repaired, truncated or retained away. The rebuild resumes
   by itself once the damage is gone.
 - **Upgrade.** A data directory written before the recovery-point file existed has no recovery point: an old torn tail in a
   sealed segment then counts as damage at the first start after the upgrade, where it used to be cut silently, and readers
