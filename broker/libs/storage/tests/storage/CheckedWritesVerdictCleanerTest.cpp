@@ -69,6 +69,26 @@ void change(Log& log, int64_t off, bool nonEmpty) {
     log.append(b, off);
 }
 
+void changeOf(Log& log, int64_t off, const std::vector<cr::ChangeMember>& ms) {
+    std::vector<uint8_t> b(cr::changeBatchBytes(ms.size()));
+    (void)cr::buildConstraintSetChange(b, 1, -1, ms);
+    stampBase(b, off);
+    log.append(b, off);
+}
+// A retained verdict-plan record (type 20) of the member (objectId, fingerprint, kind).
+void plan(Log& log, int64_t off, uint64_t objectId, uint64_t fingerprint, uint8_t kind) {
+    const std::vector<uint8_t> blob(40, 0x11);
+    std::vector<uint8_t> b(cr::verdictPlanBatchBytes(cr::verdictPlanPayloadBytes(blob.size(), blob.size(), blob.size())));
+    (void)cr::buildVerdictPlan(b, cr::VerdictPlanHeader{objectId, fingerprint, kind}, blob, blob, blob);
+    stampBase(b, off);
+    log.append(b, off);
+}
+constexpr cr::ChangeMember kA{7, 3, 99};
+constexpr cr::ChangeMember kB{8, 3, 100};
+void pads(Log& log, int64_t from, int64_t to) {
+    for (int64_t o = from; o < to; ++o) data(log, o, "pad" + std::to_string(o), "p");
+}
+
 void txnJudge(Log& log, int64_t off, int64_t producerId, int64_t first) {
     std::vector<uint8_t> b(cr::kTxnJudgeBatchBytes);
     (void)cr::buildTxnJudge(b, cr::TxnJudgeRecord{producerId, 0, first});
@@ -419,30 +439,341 @@ TEST(CheckedWritesVerdictCleaner, ChangeRecordsAreAlwaysKept) {
     std::filesystem::remove_all(dir);
 }
 
-TEST(CheckedWritesVerdictCleaner, VerdictPlanRecordsAreAlwaysKept) {
+// #942: a verdict-plan record (type 20) goes once its member left below the published bound W (or a later record of the same
+// member supersedes it): stamped by the first pass, dropped at the delete horizon.  (Replaces VerdictPlanRecordsAreAlwaysKept.)
+constexpr int64_t kT0 = 1'000'000;
+
+TEST(CheckedWritesVerdictCleanerRegression, VerdictPlanOfAMemberThatLeftBelowWIsDroppedRegression) {
     const auto dir = tempDir();
     {
         Log log(dir.string(), 1);
         log.recover();
-        const std::vector<uint8_t> blob(40, 0x11);
-        std::vector<uint8_t> plan(cr::verdictPlanBatchBytes(cr::verdictPlanPayloadBytes(blob.size(), blob.size(), blob.size())));
-        ASSERT_EQ(cr::buildVerdictPlan(plan, cr::VerdictPlanHeader{7, 99, 2}, blob, blob, blob), plan.size());
-        stampBase(plan, 0);
-        log.append(plan, 0);
+        plan(log, 0, kA.viewObjectId, kA.planFingerprint, kA.kind);
         change(log, 1, true);
-        for (int64_t o = 2; o < 5; ++o) data(log, o, "pad" + std::to_string(o), "p");
-        change(log, 5, false);   // the member left here, long below W
+        pads(log, 2, 5);
+        change(log, 5, false);   // the member left here, below W
         marker(log, 6, 2, 6, {});
-        for (int64_t o = 7; o < 12; ++o) data(log, o, "pad" + std::to_string(o), "p");
+        pads(log, 7, 12);
         marker(log, 12, 6, 12, {});
-        VerdictCleanState s;
-        EXPECT_TRUE(s.keepsControlRecord(0, cr::kVerdictPlan));
-        for (int pass = 0; pass < 4; ++pass) clean(log, Path::Range, kMax, 13, kMax, 1'000'000 + pass * 2000);
-        EXPECT_TRUE(hasBatchAt(log, 0));
+        clean(log, Path::Range, kMax, 13, kMax, kT0);
+        EXPECT_TRUE(hasBatchAt(log, 0)) << "stamped by the first pass, not yet dropped";
+        clean(log, Path::Range, kMax, 13, kMax, kT0 + 5000);
+        EXPECT_FALSE(hasBatchAt(log, 0)) << "dropped at the horizon";
         EXPECT_TRUE(hasBatchAt(log, 1));
         EXPECT_TRUE(hasBatchAt(log, 5));
     }
     std::filesystem::remove_all(dir);
+}
+
+TEST(CheckedWritesVerdictCleanerRegression, VerdictPlanOfALiveMemberIsKeptRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), 1);
+        log.recover();
+        plan(log, 0, kA.viewObjectId, kA.planFingerprint, kA.kind);
+        change(log, 1, true);
+        pads(log, 2, 5);
+        marker(log, 5, 2, 5, {});
+        pads(log, 6, 12);
+        marker(log, 12, 5, 12, {});
+        for (int pass = 0; pass < 4; ++pass) clean(log, Path::Range, kMax, 13, kMax, kT0 + pass * 5000);
+        EXPECT_TRUE(hasBatchAt(log, 0));
+        EXPECT_TRUE(hasBatchAt(log, 1));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(CheckedWritesVerdictCleanerRegression, VerdictPlanIsKeptWhileItsLeaveIsNotBelowWRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), 1);
+        log.recover();
+        plan(log, 0, kA.viewObjectId, kA.planFingerprint, kA.kind);
+        change(log, 1, true);
+        pads(log, 2, 5);
+        change(log, 5, false);
+        marker(log, 6, 2, 6, {});
+        pads(log, 7, 12);
+        marker(log, 12, 6, 12, {});
+        for (int pass = 0; pass < 2; ++pass) clean(log, Path::Range, /*W=*/5, 13, kMax, kT0 + pass * 5000);
+        EXPECT_TRUE(hasBatchAt(log, 0)) << "the leave at 5 is not below W = 5";
+        clean(log, Path::Range, /*W=*/6, 13, kMax, kT0 + 10000);
+        EXPECT_TRUE(hasBatchAt(log, 0)) << "stamped";
+        clean(log, Path::Range, 6, 13, kMax, kT0 + 20000);
+        EXPECT_FALSE(hasBatchAt(log, 0)) << "the leave is below W = 6: dropped";
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(CheckedWritesVerdictCleanerRegression, VerdictPlanOfAReplacedFingerprintIsDroppedAndTheNewOneKeptRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), 1);
+        log.recover();
+        const cr::ChangeMember a2{kA.viewObjectId, kA.kind, 100};
+        plan(log, 0, kA.viewObjectId, kA.planFingerprint, kA.kind);
+        changeOf(log, 1, {kA});
+        pads(log, 2, 4);
+        plan(log, 4, a2.viewObjectId, a2.planFingerprint, a2.kind);
+        changeOf(log, 5, {a2});
+        marker(log, 6, 2, 6, {});
+        pads(log, 7, 12);
+        marker(log, 12, 6, 12, {});
+        clean(log, Path::Range, kMax, 13, kMax, kT0);
+        clean(log, Path::Range, kMax, 13, kMax, kT0 + 5000);
+        EXPECT_FALSE(hasBatchAt(log, 0)) << "the replaced fingerprint's plan";
+        EXPECT_TRUE(hasBatchAt(log, 4)) << "the live plan";
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(CheckedWritesVerdictCleanerRegression, ADuplicateVerdictPlanRecordIsDroppedAndTheLatestKeptRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), 1);
+        log.recover();
+        plan(log, 0, kA.viewObjectId, kA.planFingerprint, kA.kind);
+        plan(log, 1, kA.viewObjectId, kA.planFingerprint, kA.kind);
+        changeOf(log, 2, {kA});
+        pads(log, 3, 5);
+        marker(log, 5, 3, 5, {});
+        pads(log, 6, 12);
+        marker(log, 12, 5, 12, {});
+        clean(log, Path::Range, kMax, 13, kMax, kT0);
+        clean(log, Path::Range, kMax, 13, kMax, kT0 + 5000);
+        EXPECT_FALSE(hasBatchAt(log, 0)) << "the earlier duplicate";
+        EXPECT_TRUE(hasBatchAt(log, 1)) << "the latest record of the member";
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(CheckedWritesVerdictCleanerRegression, ARejoinedMembersLaterPlanIsKeptRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), 1);
+        log.recover();
+        plan(log, 0, kA.viewObjectId, kA.planFingerprint, kA.kind);
+        changeOf(log, 1, {kA});
+        data(log, 2, "pad2", "p");
+        changeOf(log, 3, {});
+        data(log, 4, "pad4", "p");
+        plan(log, 5, kA.viewObjectId, kA.planFingerprint, kA.kind);
+        changeOf(log, 6, {kA});
+        marker(log, 7, 3, 7, {});
+        pads(log, 8, 13);
+        marker(log, 13, 7, 13, {});
+        clean(log, Path::Range, kMax, 14, kMax, kT0);
+        clean(log, Path::Range, kMax, 14, kMax, kT0 + 5000);
+        EXPECT_FALSE(hasBatchAt(log, 0)) << "superseded by the re-join's own plan";
+        EXPECT_TRUE(hasBatchAt(log, 5));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(CheckedWritesVerdictCleanerRegression, AVerdictPlanWithNoChangeAboveItIsKeptRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), 1);
+        log.recover();
+        plan(log, 0, kA.viewObjectId, kA.planFingerprint, kA.kind);
+        pads(log, 1, 4);
+        marker(log, 4, 1, 4, {});
+        pads(log, 5, 10);
+        marker(log, 10, 4, 10, {});
+        for (int pass = 0; pass < 4; ++pass) clean(log, Path::Range, kMax, 11, kMax, kT0 + pass * 5000);
+        EXPECT_TRUE(hasBatchAt(log, 0)) << "its change is not in the log yet";
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(CheckedWritesVerdictCleanerRegression, ARejoinWithoutANewPlanRecordKeepsTheOldOneRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), 1);
+        log.recover();
+        plan(log, 0, kA.viewObjectId, kA.planFingerprint, kA.kind);
+        changeOf(log, 1, {kA});
+        data(log, 2, "pad2", "p");
+        changeOf(log, 3, {});
+        pads(log, 4, 6);
+        changeOf(log, 6, {kA});   // re-joined without a second plan record
+        marker(log, 7, 2, 7, {});
+        pads(log, 8, 13);
+        marker(log, 13, 7, 13, {});
+        for (int pass = 0; pass < 4; ++pass) clean(log, Path::Range, kMax, 14, kMax, kT0 + pass * 5000);
+        EXPECT_TRUE(hasBatchAt(log, 0)) << "the member is in the last set";
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(CheckedWritesVerdictCleanerRegression,
+     AVerdictPlanIsKeptWhenTheWorkerPublishedNoLimitButTheMarkersDoNotCoverTheLeaveRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), 1);
+        log.recover();
+        plan(log, 0, kA.viewObjectId, kA.planFingerprint, kA.kind);
+        changeOf(log, 1, {kA});
+        pads(log, 2, 4);
+        plan(log, 4, kB.viewObjectId, kB.planFingerprint, kB.kind);
+        changeOf(log, 5, {kB});   // A left here
+        marker(log, 6, 2, 4, {}); // the markers cover only up to 4
+        pads(log, 7, 12);
+        for (int pass = 0; pass < 2; ++pass) clean(log, Path::Range, kMax, 12, kMax, kT0 + pass * 5000);
+        EXPECT_TRUE(hasBatchAt(log, 0)) << "no published limit, but the verdicts of [4, 5] are not out yet";
+        marker(log, 12, 4, 8, {});
+        data(log, 13, "pad13", "p");
+        clean(log, Path::Range, kMax, 14, kMax, kT0 + 10000);
+        EXPECT_TRUE(hasBatchAt(log, 0)) << "stamped";
+        clean(log, Path::Range, kMax, 14, kMax, kT0 + 20000);
+        EXPECT_FALSE(hasBatchAt(log, 0)) << "the markers now cover past the leave";
+        EXPECT_TRUE(hasBatchAt(log, 4)) << "B is live";
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(CheckedWritesVerdictCleanerRegression, ADuplicatePlanAtOrAboveTheCleanBoundaryKeepsTheEarlierOneRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), 1);
+        log.recover();
+        plan(log, 0, kA.viewObjectId, kA.planFingerprint, kA.kind);
+        changeOf(log, 1, {kA});
+        pads(log, 2, 4);
+        plan(log, 4, kA.viewObjectId, kA.planFingerprint, kA.kind);   // the duplicate
+        marker(log, 5, 2, 5, {});
+        pads(log, 6, 12);
+        marker(log, 12, 5, 12, {});
+        for (int pass = 0; pass < 2; ++pass) clean(log, Path::Range, /*W=*/4, 13, kMax, kT0 + pass * 5000);
+        EXPECT_TRUE(hasBatchAt(log, 0)) << "the duplicate at 4 is not below W = 4: it could still be cut away";
+        clean(log, Path::Range, /*W=*/5, 13, kMax, kT0 + 10000);
+        clean(log, Path::Range, 5, 13, kMax, kT0 + 20000);
+        EXPECT_FALSE(hasBatchAt(log, 0)) << "the duplicate is below W = 5";
+        EXPECT_TRUE(hasBatchAt(log, 4));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// ---- #942 at unit level: VerdictCleanState alone ------------------------------------------------------------
+
+namespace {
+void feedPlan(VerdictCleanState& s, int64_t off, const cr::ChangeMember& m) { s.onVerdictPlan(off, m.viewObjectId, m.planFingerprint, m.kind); }
+void feedChange(VerdictCleanState& s, int64_t off, std::vector<cr::ChangeMember> ms) {
+    s.onConstraintSetChange(off, std::span<const cr::ChangeMember>(ms.data(), ms.size()));
+}
+}  // namespace
+
+// A bounded pass calls markRemovalsBelow once per group with its own pass end: the plan goes only below its own pass end.
+TEST(CheckedWritesVerdictCleanerRegression, ABoundedPassDropsAPlanOnlyBelowItsOwnPassEndRegression) {
+    VerdictCleanState s;   // unit level: the test file has no helper that drives two groups of one pass
+    feedPlan(s, 0, kA);
+    feedChange(s, 1, {kA});
+    feedChange(s, 5, {});
+    s.onVerdictMarker(6, 2, 20, {});
+    s.finish(0, kMax, kMax);
+    s.markRemovalsBelow(5);
+    EXPECT_TRUE(s.keepsControlRecord(0, cr::kVerdictPlan)) << "the leave at 5 is not below this group's pass end";
+    s.markRemovalsBelow(6);
+    EXPECT_FALSE(s.keepsControlRecord(0, cr::kVerdictPlan)) << "a later group's pass end is past the leave";
+}
+
+TEST(CheckedWritesVerdictCleanerRegression, VerdictPlanRuleTableRegression) {
+    VerdictCleanState s;
+    auto removable = [&](int64_t off, int64_t removalsBelow) {
+        s.markRemovalsBelow(removalsBelow);
+        return s.planRemovable(off);
+    };
+    // no rewrite set the clean boundary yet
+    feedPlan(s, 0, kA);
+    feedChange(s, 1, {kA});
+    feedChange(s, 5, {});
+    s.onVerdictMarker(6, 2, 20, {});
+    s.finish(0, /*publishedBound=*/kMax, kMax);   // own = kNone (emptied, covered): cleanLimit_ = kMax
+    EXPECT_FALSE(s.planRemovable(0)) << "removalsBelow_ not set yet";
+    EXPECT_FALSE(removable(7, 100)) << "an offset that is no plan record";
+    EXPECT_FALSE(removable(0, 5)) << "L == removalsBelow";
+    EXPECT_TRUE(removable(0, 6)) << "L one below removalsBelow";
+    // L == cleanLimit: the published bound caps it
+    s.clear();
+    feedPlan(s, 0, kA);
+    feedChange(s, 1, {kA});
+    feedChange(s, 5, {});
+    s.onVerdictMarker(6, 2, 20, {});
+    s.finish(0, /*publishedBound=*/5, kMax);
+    ASSERT_EQ(s.cleanLimit(), 5);
+    EXPECT_FALSE(removable(0, 100)) << "L == cleanLimit";
+    s.clear();
+    feedPlan(s, 0, kA);
+    feedChange(s, 1, {kA});
+    feedChange(s, 5, {});
+    s.onVerdictMarker(6, 2, 20, {});
+    s.finish(0, 6, kMax);
+    EXPECT_TRUE(removable(0, 100)) << "L one below cleanLimit";
+    EXPECT_FALSE(removable(0, 5)) << "but L == removalsBelow";
+    // the member is in the latest set: never removable by (a), even when an earlier change lacked it
+    s.clear();
+    feedPlan(s, 0, kA);
+    feedChange(s, 1, {kA});
+    feedChange(s, 3, {});
+    feedChange(s, 6, {kA});
+    s.onVerdictMarker(7, 2, 30, {});
+    s.finish(0, kMax, kMax);
+    EXPECT_FALSE(removable(0, 100));
+    // the trailing run starts after the LAST change naming the member
+    s.clear();
+    feedPlan(s, 0, kA);
+    feedChange(s, 1, {kA});
+    feedChange(s, 3, {kB});
+    feedChange(s, 5, {kA});
+    feedChange(s, 8, {kB});
+    s.onVerdictMarker(9, 2, 30, {});
+    s.finish(0, kMax, kMax);
+    EXPECT_FALSE(removable(0, 8)) << "L is 8";
+    EXPECT_TRUE(removable(0, 9));
+    // no change above the plan
+    s.clear();
+    feedChange(s, 0, {kA});
+    feedPlan(s, 1, kA);
+    s.finish(0, kMax, kMax);
+    EXPECT_FALSE(removable(1, 100));
+    // a change fed through the old bool overload names every member
+    s.clear();
+    feedPlan(s, 0, kA);
+    s.onConstraintSetChange(1, true);
+    s.onConstraintSetChange(5, false);
+    s.finish(0, kMax, kMax);
+    EXPECT_FALSE(removable(0, 100)) << "unknown members: never removable";
+    // kind and fingerprint each make a different member
+    for (const cr::ChangeMember other : {cr::ChangeMember{kA.viewObjectId, uint8_t(kA.kind + 1), kA.planFingerprint},
+                                         cr::ChangeMember{kA.viewObjectId, kA.kind, kA.planFingerprint + 1},
+                                         cr::ChangeMember{kA.viewObjectId + 1, kA.kind, kA.planFingerprint}}) {
+        s.clear();
+        feedPlan(s, 0, kA);
+        feedChange(s, 1, {other});
+        s.finish(0, kMax, kMax);
+        EXPECT_TRUE(removable(0, 100)) << "the change names a different member: L is 1";
+    }
+    // a duplicate below the bound, one at the bound
+    s.clear();
+    feedPlan(s, 0, kA);
+    feedPlan(s, 4, kA);
+    feedChange(s, 5, {kA});
+    s.finish(0, kMax, kMax);
+    EXPECT_FALSE(removable(0, 4)) << "the duplicate is at the bound";
+    EXPECT_TRUE(removable(0, 5));
+    EXPECT_FALSE(removable(4, 100)) << "the latest record of the member";
+    // the published bound caps the duplicate too, below what a rewrite may reach
+    s.clear();
+    feedPlan(s, 0, kA);
+    feedPlan(s, 4, kA);
+    feedChange(s, 5, {kA});
+    s.finish(0, /*publishedBound=*/4, kMax);
+    EXPECT_FALSE(removable(0, 100)) << "capped by cleanLimit_ = 4, which a published bound alone could not tell";
+    // clear() resets the plans and the changes
+    s.clear();
+    EXPECT_FALSE(removable(0, 100));
+    s.finish(0, kMax, kMax);
+    EXPECT_TRUE(s.keepsControlRecord(0, cr::kVerdictPlan));
 }
 
 TEST(CheckedWritesVerdictCleanerRegression, MarkerKeptUntilEveryReplicaFetchedItRegression) {

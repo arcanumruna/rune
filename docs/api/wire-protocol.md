@@ -304,7 +304,8 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
   | | 4 + n | `outLen`, then the output descriptor |
   | | 4 + n | `srcLen`, then the source descriptor |
 
-  The cleaner keeps type-20 records. Consumers never receive them.
+  The cleaner drops a type-20 record once its member (`viewObjectId`, `kind`, `planFingerprint`) has left the logged set below
+  the verdict bound, or a later type-20 record of the same member below that bound replaces it. Consumers never receive them.
 - **Reservation record** (type 16): the payload is `[version u8][reservedThroughN u64]`. An autoincrement leader appends
   it before it hands out ids above the last reserved `n`; a new leader starts above the highest one it reads. Every reader
   skips it, so it never reaches a consumer.

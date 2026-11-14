@@ -21,6 +21,7 @@
 #include <iomanip>
 #include <limits>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -185,7 +186,7 @@ bool isControlBatch(const rune::protocol::RecordBatchReader& r) {
 }
 // The validity gate of a cleaner walk (#804).  A checked-writes control record (no producer id, control bit) is validated ONCE, by
 // parseControl, whose result `ctl` the caller reuses; every other batch (data, a transaction marker) by ensureValid.  A control
-// batch parseControl refuses (type 20 and above, or a damaged one) falls back to ensureValid: only a CRC-damaged one stops the walk.
+// batch parseControl refuses (a damaged one, or type 21 and above) falls back to ensureValid: only a CRC-damaged one stops the walk.
 bool validateBatch(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t total,
                    std::optional<rune::storage::control_record::ControlRecord>& ctl) {
     ctl.reset();
@@ -345,7 +346,15 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
                         uint32_t id = 0;
                         int64_t catalogThrough = 0;
                         uint16_t count = 0;
-                        if (cr::parseConstraintSetChange(*c, id, catalogThrough, wire, count)) verdicts.onConstraintSetChange(base, count != 0);
+                        if (cr::parseConstraintSetChange(*c, id, catalogThrough, wire, count))
+                            verdicts.onConstraintSetChange(base, std::span<const cr::ChangeMember>(wire.data(), count));
+                        break;
+                    }
+                    case cr::kVerdictPlan: {   // #942: an unparsable plan record is never removable (nothing is fed)
+                        cr::VerdictPlanHeader h{};
+                        std::span<const uint8_t> planBlob, outDesc, srcDesc;
+                        if (cr::parseVerdictPlan(*c, h, planBlob, outDesc, srcDesc))
+                            verdicts.onVerdictPlan(base, h.viewObjectId, h.planFingerprint, h.kind);
                         break;
                     }
                     case cr::kReservation:   // only one the leader's scan reads as a reservation (a bad payload must not outrank it)

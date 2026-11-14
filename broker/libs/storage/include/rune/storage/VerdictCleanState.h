@@ -8,12 +8,15 @@
 //   - drops a verdict marker once it is superseded and every record it lists is gone (markerRemovable).
 // Constraint-set changes (type 18) are always kept; of the reservations (16) only the highest seen and any above it (Part 06); a
 // txn judge (19) only at or above the bound the owning worker published (Part 11: no member checkpoint may need it any more below).
+// A verdict-plan record (20, #942) goes once its member (object, kind, fingerprint) left the logged set below the pass's bound, or
+// a later record of the same member below that bound supersedes it (planRemovable).
 //
 // Cleaner thread only (cold).  clear() keeps the capacity for reuse across passes.
 #include "rune/storage/ControlRecordLayout.h"
 #include "rune/storage/RejectedOffsetIndex.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <limits>
 #include <span>
@@ -35,6 +38,9 @@ public:
         removalsBelow_ = std::numeric_limits<int64_t>::min();
         listed_.clear();
         highestReservation_ = std::numeric_limits<int64_t>::min();
+        plans_.clear();
+        changes_.clear();
+        members_.clear();
     }
 
     // ---- pre-pass feed (offset order) -------------------------------------
@@ -46,7 +52,23 @@ public:
         for (const auto& e : entries) listed_.push_back(e.offset);
         events_.push_back(Event{markerOffset, fromOffset, control_record::closesCoverage(entries.size()) ? finalThrough : 0, true});   // a full marker adds no coverage
     }
-    void onConstraintSetChange(int64_t offset, bool nonEmpty) { events_.push_back(Event{offset, nonEmpty ? 1 : 0, 0, false}); }
+    /// A change fed without its members (a test, an old caller): it counts as naming every member, so it never makes a plan removable.
+    void onConstraintSetChange(int64_t offset, bool nonEmpty) {
+        assert(changes_.empty() || offset > changes_.back().offset);
+        changes_.push_back(ChangeSet{offset, 0, 0, false});
+        events_.push_back(Event{offset, nonEmpty ? 1 : 0, 0, false});
+    }
+    void onConstraintSetChange(int64_t offset, std::span<const control_record::ChangeMember> members) {
+        assert(changes_.empty() || offset > changes_.back().offset);
+        changes_.push_back(ChangeSet{offset, static_cast<uint32_t>(members_.size()), static_cast<uint16_t>(members.size()), true});
+        for (const auto& m : members) members_.push_back(Member{m.viewObjectId, m.planFingerprint, m.kind});
+        events_.push_back(Event{offset, members.empty() ? 0 : 1, 0, false});
+    }
+    /// A verdict-plan record (type 20) of one member, at `offset`.
+    void onVerdictPlan(int64_t offset, uint64_t objectId, uint64_t fingerprint, uint8_t kind) {
+        assert(plans_.empty() || offset > plans_.back().offset);
+        plans_.push_back(PlanRecord{offset, objectId, fingerprint, kind});
+    }
     void onReservation(int64_t offset) noexcept { highestReservation_ = std::max(highestReservation_, offset); }
 
     /// End of the pre-pass: the coverage, whether a rejected record lies in the pass [dirtyStart, cleanLimit), and the
@@ -113,17 +135,47 @@ public:
     /// Part 11: a TxnJudge below `bound` is judged and finalized under every member's checkpoint (0, the default: keep every one).
     /// Not reset by clear(): the cleaner sets it per pass.
     void setTxnJudgeBound(int64_t bound) noexcept { txnJudgeBound_ = bound; }
-    /// Type 18 and 20 are always kept; 16 follows keepsReservation, 19 the txn judge bound; a verdict marker (17) only goes through
-    /// markerRemovable.
+    /// Type 18 is always kept; 16 follows keepsReservation, 19 the txn judge bound, 20 planRemovable; a verdict marker (17) only goes
+    /// through markerRemovable.
     [[nodiscard]] bool keepsControlRecord(int64_t offset, int16_t type) const noexcept {
         namespace cr = control_record;
         if (type == cr::kReservation) return keepsReservation(offset);
         if (type == cr::kTxnJudge) return offset >= txnJudgeBound_;
         if (type == cr::kVerdictMarker) return !markerRemovable(offset);
+        if (type == cr::kVerdictPlan) return !planRemovable(offset);
         return true;
+    }
+    /// #942: may the plan record at `offset` go?  Over what the pre-pass saw, with bound = min(removalsBelow_, cleanLimit_):
+    ///  (a) LEFT: a seen change lies above it, the LAST seen change does not name its member, and the first change of the trailing
+    ///      run of changes (above it) that do not name the member is below the bound - the judge's leaveOffsetOf < W rule;
+    ///  (b) DUPLICATE: a later plan record of the same member lies below the bound.
+    /// A change fed without members counts as naming every member.  Evaluated lazily: markRemovalsBelow moves with each group.
+    [[nodiscard]] bool planRemovable(int64_t offset) const noexcept {
+        const auto at = std::find_if(plans_.begin(), plans_.end(), [&](const PlanRecord& p) { return p.offset == offset; });
+        if (at == plans_.end()) return false;
+        const int64_t bound = std::min(removalsBelow_, cleanLimit_);
+        if (bound == std::numeric_limits<int64_t>::min()) return false;   // no rewrite set the clean boundary yet
+        for (auto later = at + 1; later != plans_.end(); ++later)
+            if (later->offset < bound && sameMember(*at, *later)) return true;
+        if (changes_.empty() || changes_.back().offset <= offset || namesMember(changes_.back(), *at)) return false;
+        std::size_t first = changes_.size() - 1;   // the first change of the trailing run that does not name the member
+        while (first > 0 && changes_[first - 1].offset > offset && !namesMember(changes_[first - 1], *at)) --first;
+        return changes_[first].offset < bound;
     }
 
 private:
+    struct PlanRecord { int64_t offset; uint64_t objectId; uint64_t fingerprint; uint8_t kind; };
+    struct Member { uint64_t objectId; uint64_t fingerprint; uint8_t kind; };
+    struct ChangeSet { int64_t offset; uint32_t first; uint16_t count; bool membersKnown; };   // members_[first, +count)
+    static bool sameMember(const PlanRecord& a, const PlanRecord& b) noexcept {
+        return a.objectId == b.objectId && a.fingerprint == b.fingerprint && a.kind == b.kind;
+    }
+    [[nodiscard]] bool namesMember(const ChangeSet& c, const PlanRecord& p) const noexcept {
+        if (!c.membersKnown) return true;
+        return std::any_of(members_.begin() + c.first, members_.begin() + c.first + c.count, [&](const Member& m) {
+            return m.objectId == p.objectId && m.fingerprint == p.fingerprint && m.kind == p.kind;
+        });
+    }
     struct Marker { int64_t offset, finalThrough, lastListed; std::size_t listedAt, listedCount; };   // listed_[listedAt, +listedCount)
     struct Event { int64_t at, a, b; bool marker; };   // marker: a = fromOffset, b = finalThrough; change: a = nonEmpty
     std::vector<int64_t> rejected_;                    // ascending
@@ -136,6 +188,9 @@ private:
     int64_t removalsBelow_ = std::numeric_limits<int64_t>::min();
     int64_t highestReservation_ = std::numeric_limits<int64_t>::min();
     int64_t txnJudgeBound_ = 0;
+    std::vector<PlanRecord> plans_;                    // ascending offset
+    std::vector<ChangeSet> changes_;                   // ascending offset
+    std::vector<Member> members_;                      // every change's members, in change order
 };
 
 }  // namespace rune::storage
