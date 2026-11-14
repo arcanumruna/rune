@@ -93,6 +93,13 @@ Connected, while a group member, a transactional producer or a coordinator reque
 counts these). A healthy coordinator is never moved by metadata: its own `NotCoordinator` answer stays the authority, and
 a wrong hint corrects itself that way.
 
+#### Routed control ops (DDL, view reads, lease ops)
+A routed op follows its node session: a Redirect moves it, a NotLeader resends it inside a retry budget, and a session
+that left its connect episode (the stale timeout) re-sends it toward the seed with the same requestId. Since #893 an op
+in flight on a node session that is merely silent (no Pong for more than two keepalive intervals) is also offered once
+per session episode to a live seed (`Client::askSeedAtSuspectEdge_`); the op stays where it is, and the seed's answer
+decides (a Redirect to another node is followed, one to the node the op is already on is ignored).
+
 ### 2.1 Producer (`producer/`)
 Tier-1 producer with a **zero per-send heap allocation** fast path. App threads
 call `send()`/`flush()` → write a compact `SEND_RECORD` into the ring (the

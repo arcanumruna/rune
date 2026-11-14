@@ -769,8 +769,12 @@ public:
     }
     /// #514 (seed): the seed session is Connected but has heard nothing for more than two of its keepalive intervals
     /// (a live node answers each Ping).  Duty thread only.
-    [[nodiscard]] bool seedSilent(int64_t nowNs) const noexcept {
-        const session::SessionMachine& m = seedSession().machine;
+    [[nodiscard]] bool seedSilent(int64_t nowNs) const noexcept { return sessionSilent(0, nowNs); }
+    /// #893: session `index` is Connected but has heard nothing for more than two of its keepalive intervals (the
+    /// seed is index 0).  An out-of-range index is not silent.  Duty thread only.
+    [[nodiscard]] bool sessionSilent(uint32_t index, int64_t nowNs) const noexcept {
+        if (index >= sessions_.size()) return false;
+        const session::SessionMachine& m = sessions_[index]->machine;
         return m.silentLongerThan(nowNs, 2 * m.keepaliveIntervalNs());
     }
     /// T15b: the seed session's machine (read-only; duty thread only).

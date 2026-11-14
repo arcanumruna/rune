@@ -18,6 +18,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -640,4 +641,388 @@ TEST(ClientDdlRedirectRegression, BrokerSilentlyForgetsTheSessionAndNeverReaccep
     EXPECT_EQ(cq.timesCompleted(f.token()), 1);
     EXPECT_EQ(r.client.testRoutedCtlAwaitingResend(), 0);
     EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+}
+
+// ===========================================================================
+// #893: a routed control op in flight on a node session that has gone silent (no Pong for more than two keepalive
+// intervals, long before the stale-session timeout) is also offered ONCE to the seed, which names the current leader.
+// responseTimeoutNs is 60 s and the op deadline 120 s of injected time: only the suspect edge can explain a second
+// arrival at the seed.  "Arrivals" = the frames the fake gateway received on one endpoint.  No wall-clock waits: every
+// loop is capped and advances the injected clock.
+// ===========================================================================
+namespace {
+constexpr int64_t kSuspectKaNs   = 50'000'000;   // keepalive interval
+constexpr int64_t kSuspectStepNs = 5'000'000;    // injected time per pass
+
+rc::ClientConfig suspectCfg(int32_t in, int32_t eg) {
+    rc::ClientConfig c = invokerCfg(in, eg);
+    c.keepaliveIntervalNs = kSuspectKaNs;
+    c.responseTimeoutNs   = 60'000'000'000LL;
+    c.ddlTimeoutMs        = 120'000;
+    c.traceDdlRetries     = true;
+    return c;
+}
+
+/// What one op kind needs from the shared scenarios: how to issue it, its template, and an Ok answer.
+struct OpKit {
+    const char*                                                        name;
+    uint16_t                                                           tid;
+    std::function<rc::OpResult(rc::Client&, rc::Completions&, rc::Token)> issue;
+    std::function<void(Rig&, int ep, const pc::MessageHeader&, int64_t value)> answerOk;
+};
+
+OpKit dropKit() {
+    return {"DropTopic", pc::DropTopic::TEMPLATE_ID,
+            [](rc::Client& c, rc::Completions& q, rc::Token t) { return c.dropTopic("t", {}, q, t); },
+            [](Rig& r, int ep, const pc::MessageHeader& h, int64_t value) {
+                pc::DdlResponse resp; resp.sessionId = h.sessionId; resp.correlationId = h.correlationId;
+                resp.objectId = static_cast<int32_t>(value); resp.newVersion = 3;
+                r.gw.sendDdlResponse(ep, resp);
+            }};
+}
+OpKit viewKit() {
+    return {"GetViewRow", pc::GetViewRow::TEMPLATE_ID,
+            [](rc::Client& c, rc::Completions& q, rc::Token t) { return c.getViewRow(0x40000007, 101, 0, q, t); },
+            [](Rig& r, int ep, const pc::MessageHeader& h, int64_t value) {
+                const std::vector<uint8_t> row(static_cast<std::size_t>(value), 7);
+                pc::ViewRowResponse resp;
+                resp.sessionId = h.sessionId; resp.correlationId = h.correlationId;
+                resp.status = pc::ViewRowResponse::kOk; resp.rowLen = static_cast<uint32_t>(row.size());
+                resp.rowBytes = row.data(); resp.rowBytesLen = static_cast<uint32_t>(row.size());
+                std::vector<uint8_t> out(resp.encodedSize());
+                const std::size_t n = resp.encode(out.data());
+                r.gw.send(ep, out.data(), n);
+            }};
+}
+OpKit leaseKit() {
+    return {"LeaseKeepAlive", pc::LeaseKeepAlive::TEMPLATE_ID,
+            [](rc::Client& c, rc::Completions& q, rc::Token t) {
+                static const uint8_t kKey[] = {1, 2, 3, 4, 5, 6, 7, 8};
+                return c.leaseKeepAlive(1, 0, std::span<const uint8_t>(kKey, sizeof kKey), 1, 0, q, t);
+            },
+            [](Rig& r, int ep, const pc::MessageHeader& h, int64_t value) {
+                pc::LeaseKeepAliveResponse resp;
+                const std::vector<pc::LeaseKeepAliveResponse::Entry> es{{0, 0, static_cast<uint64_t>(value)}};
+                resp.sessionId = h.sessionId; resp.correlationId = h.correlationId; resp.final = 1; resp.entries = es;
+                std::vector<uint8_t> out(resp.encodedSize());
+                const std::size_t n = resp.encode(out.data());
+                r.gw.send(ep, out.data(), n);
+            }};
+}
+
+struct Suspect {
+    Rig                                    r;
+    std::vector<std::pair<std::string, int>> nodes;   // (channel, endpoint)
+    std::vector<Arrival>                   at;
+    std::vector<int64_t>                   atNs;
+    int                                    redirectNotes = 0;   // followed Redirects (traceDdlRetries), accumulated
+    Suspect(int32_t in, int32_t eg, int nodeCount) : r(suspectCfg(in, eg)) {
+        r.gw.uniqueSessionIds = true;
+        r.gw.replyPongs       = true;
+        for (int i = 0; i < nodeCount; ++i) {
+            std::string ch = udp(rune::client::testing::allocFreeUdpPort());
+            const int ep = r.gw.addNode(ch, in);
+            nodes.emplace_back(std::move(ch), ep);
+        }
+        r.connect();
+    }
+    [[nodiscard]] const std::string& ch(std::size_t i) const { return nodes[i].first; }
+    [[nodiscard]] int                ep(std::size_t i) const { return nodes[i].second; }
+    [[nodiscard]] int count(int endpoint) const {
+        int n = 0;
+        for (const Arrival& a : at) n += a.ep == endpoint ? 1 : 0;
+        return n;
+    }
+    /// The nth (0-based) arrival at `endpoint`, or nullptr.
+    [[nodiscard]] const Arrival* nth(int endpoint, int n) const {
+        for (const Arrival& a : at) if (a.ep == endpoint && n-- == 0) return &a;
+        return nullptr;
+    }
+    /// Installs the recording handler for `tid`; `fn(endpoint, header)` answers (or not).
+    template <class F> void on(uint16_t tid, F fn) {
+        r.gw.templateHandlers[tid] = [this, tid, fn](int endpoint, const uint8_t* f, std::size_t len) {
+            const auto h = pc::MessageHeader::decode(f, len);
+            ASSERT_TRUE(h.has_value());
+            RequestId id{};
+            if (tid == pc::DropTopic::TEMPLATE_ID) {
+                const auto m = pc::DropTopic::decode(f, len);
+                ASSERT_TRUE(m.has_value());
+                id = m->ext.requestId;
+            }
+            at.push_back(Arrival{endpoint, h->sessionId, h->correlationId, id});
+            atNs.push_back(g_now);
+            fn(endpoint, *h);
+        };
+    }
+    void redirect(int from, const std::string& to, const pc::MessageHeader& h) {
+        r.answerError(from, pc::ErrorCode::Redirect, to, h.sessionId, h.correlationId);
+    }
+    /// Advances `passes` capped passes of injected time until `pred` holds.
+    template <class P> bool until(P&& pred, int maxPasses) {
+        for (int i = 0; i < maxPasses; ++i) {
+            if (pred()) return true;
+            r.passes(1, kSuspectStepNs);
+        }
+        return pred();
+    }
+    void run(int intervals) { r.passes(static_cast<int>(intervals * kSuspectKaNs / kSuspectStepNs), kSuspectStepNs); }
+    int followedRedirects() {
+        std::vector<rc::Client::DdlRetryNote> notes;
+        (void)r.client.takeDdlRetryNotes(notes);
+        for (const auto& n : notes) redirectNotes += n.kind == rc::Client::DdlRetryNote::Kind::Redirect ? 1 : 0;
+        return redirectNotes;
+    }
+};
+
+// Scenario 1: the seed redirects the op to node A; A swallows it and stops answering Pongs; the seed then names node
+// C: the op is asked at the seed within three keepalive intervals of the silence and follows it to C.
+void runSilentNodeFollowsSeedToNewLeader(const OpKit& kit, int32_t in, int32_t eg) {
+    SCOPED_TRACE(kit.name);
+    Suspect s(in, eg, 2);
+    const int A = s.ep(0), C = s.ep(1);
+    int seedN = 0;
+    s.on(kit.tid, [&](int ep, const pc::MessageHeader& h) {
+        if (ep == 0) s.redirect(0, ++seedN == 1 ? s.ch(0) : s.ch(1), h);
+        else if (ep == A) s.r.gw.noPongEndpoints.insert(A);   // swallowed, and silent from now on
+        else if (ep == C) kit.answerOk(s.r, C, h, 77);
+    });
+    test_support::TestCq cq(s.r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return kit.issue(s.r.client, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(s.until([&] { return s.count(A) == 1; }, 400)) << "the op never reached node A";
+    const int64_t tSilent = g_now;
+    const uint64_t staleBefore = s.r.client.testStaleLossesAt(1);
+    ASSERT_TRUE(s.until([&] { return s.count(0) >= 2; }, 200))
+        << "the seed was never asked: nothing reaches it before the 60 s stale timeout";
+    EXPECT_LE(g_now - tSilent, 3 * kSuspectKaNs) << "asked later than three keepalive intervals after the silence";
+    ASSERT_TRUE(s.until([&] { return f.ready(); }, 400)) << "the op never completed";
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(s.count(0), 2) << "the seed is asked exactly once";
+    EXPECT_EQ(s.count(A), 1);
+    EXPECT_EQ(s.count(C), 1);
+    for (const Arrival& x : s.at) {
+        EXPECT_EQ(x.id, s.at[0].id) << "the same requestId on every arrival";
+        EXPECT_EQ(x.corr, s.at[0].corr) << "the same corrId on every arrival";
+    }
+    s.run(10);
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+    EXPECT_EQ(s.r.client.testRoutedCtlAwaitingResend(), 0);
+    EXPECT_EQ(s.r.client.testPendingControlOps(), 0u);
+    EXPECT_EQ(s.r.client.testStaleLossesAt(1), staleBefore) << "node A's session was never declared stale";
+}
+} // namespace
+
+TEST(ClientDdlSuspectRegression, ADdlOnASilentNodeAsksTheSeedAndFollowsItToTheNewLeaderRegression) {
+    runSilentNodeFollowsSeedToNewLeader(dropKit(), 4560, 4561);
+}
+
+TEST(ClientDdlSuspectRegression, AViewReadOnASilentNodeAsksTheSeedRegression) {
+    runSilentNodeFollowsSeedToNewLeader(viewKit(), 4562, 4563);
+}
+
+TEST(ClientDdlSuspectRegression, ALeaseOpOnASilentNodeAsksTheSeedRegression) {
+    runSilentNodeFollowsSeedToNewLeader(leaseKit(), 4564, 4565);
+}
+
+// The seed still names the silent node (it is slow, not dead): the copy changes nothing.  `laterHops` real Redirect
+// hops follow once A answers; the ignored Redirect must not have used one of the kMaxDdlRedirects hops.
+namespace {
+void runSeedStillNamesTheSilentNode(int laterHops, int32_t in, int32_t eg) {
+    SCOPED_TRACE(laterHops);
+    Suspect s(in, eg, 3);
+    const int A = s.ep(0), C = s.ep(1), D = s.ep(2);
+    const OpKit kit = dropKit();
+    s.on(kit.tid, [&](int ep, const pc::MessageHeader& h) {
+        if (ep == 0) s.redirect(0, s.ch(0), h);   // the original AND the copy: "A leads"
+        else if (ep == A) s.r.gw.noPongEndpoints.insert(A);
+        else if (ep == C) s.redirect(C, s.ch(2), h);
+        else if (ep == D) kit.answerOk(s.r, D, h, 9);
+    });
+    test_support::TestCq cq(s.r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return kit.issue(s.r.client, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(s.until([&] { return s.count(0) >= 2; }, 400)) << "the seed was never asked";
+    const int hopsBefore = s.followedRedirects();
+    ASSERT_EQ(hopsBefore, 1) << "only the original seed -> A Redirect was followed";
+    s.run(20);
+    EXPECT_EQ(s.count(0), 2) << "the seed is asked once per session episode, not every cycle";
+    EXPECT_EQ(s.count(A), 1) << "the seed's Redirect to the node the op is already on is ignored";
+    EXPECT_EQ(s.followedRedirects(), 1);
+    EXPECT_FALSE(f.ready()) << "the op failed or completed without an answer: " << f.describe();
+    EXPECT_EQ(s.r.client.testRoutedCtlAwaitingResend(), 0);
+    // A wakes up and answers.
+    const Arrival a0 = *s.nth(A, 0);
+    pc::MessageHeader h; h.sessionId = a0.sid; h.correlationId = a0.corr;
+    if (laterHops == 0) kit.answerOk(s.r, A, h, 5);
+    else                s.redirect(A, s.ch(1), h);   // A -> C -> D answers Ok: two later hops, three in all
+    ASSERT_TRUE(s.until([&] { return f.ready(); }, 400)) << "the op never completed";
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(f.outcome().c.value, laterHops == 0 ? 5 : 9);
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+    EXPECT_EQ(s.r.client.testPendingControlOps(), 0u);
+}
+} // namespace
+
+TEST(ClientDdlSuspectRegression, ASeedThatStillNamesTheSilentNodeChangesNothingRegression) {
+    runSeedStillNamesTheSilentNode(0, 4566, 4567);
+}
+
+// Two later real hops (A -> C -> D) make three in all = kMaxDdlRedirects: they all fit only if the ignored Redirect
+// used no hop (with it the fourth would fail the op).
+TEST(ClientDdlSuspectRegression, AnIgnoredSeedRedirectUsesNoHopRegression) {
+    runSeedStillNamesTheSilentNode(2, 4568, 4569);
+}
+
+// The silent node answers late, after the op followed the seed to C: its answer completes the op once; C's later
+// answer is dropped.
+TEST(ClientDdlSuspectRegression, ALateAnswerFromTheSilentNodeCompletesTheOpOnceRegression) {
+    Suspect s(4570, 4571, 2);
+    const int A = s.ep(0), C = s.ep(1);
+    const OpKit kit = dropKit();
+    int seedN = 0;
+    s.on(kit.tid, [&](int ep, const pc::MessageHeader& h) {
+        if (ep == 0) s.redirect(0, ++seedN == 1 ? s.ch(0) : s.ch(1), h);
+        else if (ep == A) s.r.gw.noPongEndpoints.insert(A);
+        // C holds its answer
+    });
+    test_support::TestCq cq(s.r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return kit.issue(s.r.client, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(s.until([&] { return s.count(C) == 1; }, 400)) << "the op never followed the seed to C";
+    ASSERT_FALSE(f.ready());
+    const Arrival a0 = *s.nth(A, 0);
+    const Arrival c0 = *s.nth(C, 0);
+    pc::MessageHeader ha; ha.sessionId = a0.sid; ha.correlationId = a0.corr;
+    kit.answerOk(s.r, A, ha, 11);
+    ASSERT_TRUE(s.until([&] { return f.ready(); }, 200));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(f.outcome().c.value, 11);
+    pc::MessageHeader hc; hc.sessionId = c0.sid; hc.correlationId = c0.corr;
+    kit.answerOk(s.r, C, hc, 22);
+    s.run(10);
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1) << "C's later answer is dropped";
+    EXPECT_EQ(f.outcome().c.value, 11);
+    EXPECT_EQ(s.r.client.testPendingControlOps(), 0u);
+    EXPECT_EQ(s.r.client.testRoutedCtlAwaitingResend(), 0);
+}
+
+// A silent seed is not asked (a copy offered onto it is swallowed); un-silenced, it is asked within three intervals.
+TEST(ClientDdlSuspectRegression, ASilentSeedIsNotAskedRegression) {
+    Suspect s(4572, 4573, 1);
+    const int A = s.ep(0);
+    const OpKit kit = dropKit();
+    s.on(kit.tid, [&](int ep, const pc::MessageHeader& h) {
+        if (ep == 0) s.redirect(0, s.ch(0), h);
+        else if (ep == A) {   // A and the seed both stop answering Pongs
+            s.r.gw.noPongEndpoints.insert(A);
+            s.r.gw.noPongEndpoints.insert(0);
+        }
+    });
+    test_support::TestCq cq(s.r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return kit.issue(s.r.client, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(s.until([&] { return s.count(A) == 1; }, 400));
+    s.run(10);
+    EXPECT_EQ(s.count(0), 1) << "a silent seed was asked";
+    EXPECT_FALSE(f.ready());
+    s.r.gw.noPongEndpoints.erase(0);   // only the seed comes back
+    const int64_t tBack = g_now;
+    ASSERT_TRUE(s.until([&] { return s.count(0) >= 2; }, 200)) << "the live seed was never asked";
+    EXPECT_LE(g_now - tBack, 3 * kSuspectKaNs);
+}
+
+// An op the seed itself took is never asked at this edge, silent seed or not.
+TEST(ClientDdlSuspectRegression, AnOpInFlightOnTheSeedSessionIsNotAskedTwiceRegression) {
+    Suspect s(4574, 4575, 0);
+    const OpKit kit = dropKit();
+    s.on(kit.tid, [&](int, const pc::MessageHeader&) {});   // the seed swallows it
+    test_support::TestCq cq(s.r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return kit.issue(s.r.client, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(s.until([&] { return s.count(0) == 1; }, 400));
+    s.run(20);
+    EXPECT_EQ(s.count(0), 1) << "a live seed was offered a second copy";
+    s.r.gw.noPongEndpoints.insert(0);
+    s.run(10);
+    EXPECT_EQ(s.count(0), 1) << "a silent seed was offered a second copy";
+    EXPECT_FALSE(f.ready());
+}
+
+// The seed's transport refuses the copy for some cycles: the op stays in flight on A unchanged, and the copy goes out
+// exactly once when the offer is accepted.
+TEST(ClientDdlSuspectRegression, ASeedRefusingTheCopyIsAskedAgainNextCycleRegression) {
+    Suspect s(4576, 4577, 1);
+    const int A = s.ep(0);
+    const OpKit kit = dropKit();
+    s.on(kit.tid, [&](int ep, const pc::MessageHeader& h) {
+        if (ep == 0) s.redirect(0, s.ch(0), h);
+        else if (ep == A) {
+            s.r.gw.noPongEndpoints.insert(A);
+            s.r.client.testForceIngressOffers(Offer::Retry, 8);   // the seed's transport refuses the next offers
+        }
+    });
+    test_support::TestCq cq(s.r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return kit.issue(s.r.client, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(s.until([&] { return s.count(A) == 1; }, 400));
+    ASSERT_TRUE(s.until([&] { return s.count(0) >= 2; }, 400))
+        << "the copy never went out once the offers were accepted";
+    s.run(20);
+    EXPECT_EQ(s.count(0), 2) << "exactly one copy";
+    EXPECT_EQ(s.count(A), 1);
+    EXPECT_EQ(s.followedRedirects(), 1);
+    EXPECT_FALSE(f.ready());
+}
+
+// A's session is lost and re-established (a new episode): the op is offered on it again, goes silent again, and the
+// seed is asked once more - once per episode, never twice in one.
+TEST(ClientDdlSuspectRegression, AReconnectedNodeSessionMayBeAskedAgainRegression) {
+    Suspect s(4578, 4579, 1);
+    const int A = s.ep(0);
+    const OpKit kit = dropKit();
+    s.on(kit.tid, [&](int ep, const pc::MessageHeader& h) {
+        if (ep == 0) s.redirect(0, s.ch(0), h);
+        else if (ep == A) s.r.gw.noPongEndpoints.insert(A);   // silent again on every episode
+    });
+    test_support::TestCq cq(s.r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return kit.issue(s.r.client, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(s.until([&] { return s.count(0) >= 2; }, 400)) << "the first episode never asked the seed";
+    s.run(10);
+    ASSERT_EQ(s.count(0), 2) << "asked twice in one episode";
+    const int64_t firstSid = s.nth(A, 0)->sid;
+    s.r.gw.expireSession(firstSid);   // A's session dies; it reconnects (a new episode)
+    ASSERT_TRUE(s.until([&] { return s.count(0) >= 3; }, 400))
+        << "the lost session's op was never re-sent toward the seed";
+    ASSERT_TRUE(s.until([&] { return s.count(A) >= 2; }, 400)) << "the op never reached A's new session";
+    ASSERT_TRUE(s.until([&] { return s.count(0) >= 4; }, 400)) << "the second episode never asked the seed";
+    s.run(20);
+    EXPECT_EQ(s.count(0), 4) << "asked twice in the second episode";
+    EXPECT_EQ(s.count(A), 2);
+    EXPECT_FALSE(f.ready());
+}
+
+// A bootstrap's challenge exchange is per node: a bootstrap in flight on a silent node is never asked at the suspect
+// edge (the copy would be the signed frame, answered against a challenge the seed never issued for this node).
+TEST(ClientDdlSuspectRegression, ABootstrapOpIsNotAskedAtTheSuspectEdgeRegression) {
+    Suspect s(4580, 4581, 1);
+    const int A = s.ep(0);
+    s.on(pc::SecurityBootstrapChallengeRequest::TEMPLATE_ID, [&](int ep, const pc::MessageHeader& h) {
+        if (ep == 0) s.redirect(0, s.ch(0), h);
+        else if (ep == A) s.r.gw.noPongEndpoints.insert(A);   // swallowed, silent from now on
+    });
+    const std::string keyFile = std::string(64, 'a') + "\n";
+    const std::vector<uint8_t> keyBytes(keyFile.begin(), keyFile.end());
+    test_support::TestCq cq(s.r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return s.r.client.bootstrapSecurity("admin", "a one-time password 24", keyBytes, q, t);
+    });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(s.until([&] { return s.count(A) == 1; }, 400)) << "the challenge request never reached node A";
+    s.run(20);
+    EXPECT_EQ(s.count(0), 1) << "the seed was asked about a bootstrap";
+    EXPECT_EQ(s.count(A), 1);
+    for (const uint16_t t : s.r.gw.bootstrapOrder)
+        EXPECT_EQ(t, pc::SecurityBootstrapChallengeRequest::TEMPLATE_ID) << "the signed bootstrap frame was sent";
+    EXPECT_FALSE(f.ready());
 }

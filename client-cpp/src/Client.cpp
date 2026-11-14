@@ -2423,6 +2423,13 @@ transport::AeronTransport::OfferResult Client::offerRoutedFrame_(RoutedCtlPendin
     return r;
 }
 
+bool Client::askSeedAtSuspectEdge_(RoutedCtlPending& d, int64_t nowNs) {
+    uint32_t idx = 0;
+    // An empty endpoint is the seed session; d.endpoint, d.hinted and the retry state are not touched.
+    return agent_.offerToEndpoint(std::string{}, d.frame.data(), d.frame.size(), nowNs, idx) ==
+           transport::AeronTransport::OfferResult::Accepted;
+}
+
 void Client::failDdl_(std::size_t i, uint16_t code, std::string_view detail, int64_t value, int64_t aux) {
     PendingCtl p = takeCtl_(i);   // removed first: the delivery may issue a new op
     // GetViewRow's errorCode namespace is the ViewRowResponse status, where 2 is
@@ -2472,9 +2479,20 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view message, int64_t now
     // request out (a duplicate answer) — its own pump / deadline ends it.
     int redirects = 0;
     std::optional<DdlNotLeaderSeen> nl;
-    if (const auto* st = std::get_if<DdlSent>(&d.retry)) redirects = st->redirects;
-    else if (const auto* n = std::get_if<DdlNotLeaderSeen>(&d.retry)) { redirects = n->redirects; nl = *n; }
+    const DdlOfferedOn* cur = nullptr;   // the session the in-flight frame rides
+    if (const auto* st = std::get_if<DdlSent>(&d.retry)) { redirects = st->redirects; cur = &st->on; }
+    else if (const auto* n = std::get_if<DdlNotLeaderSeen>(&d.retry)) {
+        redirects = n->redirects; nl = *n; cur = &n->on;
+    }
     else return;
+    // #893: the seed's answer to the copy offered at the suspect edge, naming the node the op is ALREADY in flight on
+    // (it is slow, not gone): only that node and the seed hold the frame and a node never redirects to itself, so this
+    // is the seed's answer.  Nothing changes: no hop, no second frame to that node.  The same endpoint test the
+    // agent's session lookup uses.
+    if (cur->sessionIndex != 0 && cur->sessionIndex == d.suspectAsked.sessionIndex &&
+        cur->sessionEpoch == d.suspectAsked.sessionEpoch &&
+        agent::ClientAgent::sameEndpoint(toChannel(std::string(endpoint)), d.endpoint))
+        return;
     if (++redirects > kMaxDdlRedirects) {
         const std::string why = "redirected more than " + std::to_string(kMaxDdlRedirects) + " times";
         failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::Redirect), why, ddlNoValue(p.op));
@@ -2606,6 +2624,19 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                                                    DdlResendCause::SessionLost});
                 ++work;
             } else {
+                // #893: the op's node session is suspect (silent for more than two keepalive intervals, long before
+                // the stale timeout): ask the seed once per session episode.  The op stays where it is; the seed's
+                // answer decides (a Redirect to another node is followed, one to this node is ignored).  Cheapest
+                // tests first.
+                if (on->sessionIndex != 0 && d->challengeFrame.empty() &&
+                    !(d->suspectAsked.sessionIndex == on->sessionIndex &&
+                      d->suspectAsked.sessionEpoch == on->sessionEpoch) &&
+                    agent_.sessionSilent(on->sessionIndex, nowNs) &&
+                    agent_.connectedEpoch(0) != 0 && !agent_.seedSilent(nowNs) &&
+                    askSeedAtSuspectEdge_(*d, nowNs)) {
+                    d->suspectAsked = *on;
+                    ++work;
+                }
                 ++i;
                 continue;
             }

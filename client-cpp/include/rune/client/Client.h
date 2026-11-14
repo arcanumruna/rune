@@ -1699,6 +1699,8 @@ private:
         bool                 hinted = false;   // `endpoint` came from the route-hint table and no Redirect was followed yet
         // #234: non-empty = every offer sends THIS first (a bootstrap's challenge request)
         std::vector<uint8_t> challengeFrame;
+        /// #893: the session episode during which this op's frame was also offered to the seed (once per episode).
+        DdlOfferedOn         suspectAsked{};
     };
     static constexpr int32_t kRouteAnyPartition = -2;
     /// L22 fix 2: the node that last answered a partition-routed op for (topic, partition) - the next op starts there
@@ -1983,6 +1985,9 @@ private:
     /// The ONE site that offers a routed op's bytes to its node: `frame` to `d.endpoint`, naming the session it rode.
     transport::AeronTransport::OfferResult offerRoutedFrame_(RoutedCtlPending& d, std::vector<uint8_t>& frame,
                                                              int64_t nowNs, DdlOfferedOn& on);
+    /// #893: offer ONE extra copy of `d.frame` to the seed (the op, its endpoint, its retry state and its route hints
+    /// stay as they are); true when the seed's transport took it.
+    bool askSeedAtSuspectEdge_(RoutedCtlPending& d, int64_t nowNs);
     /// Move d to `next`, keeping routedCtlAwaitingResend_ exact.
     void setDdlRetry_(RoutedCtlPending& d, DdlRetry next) noexcept;
     /// routedCtlPending_ / routedCtlAwaitingResend_ for an entry entering (+1) / leaving (-1) the table.
