@@ -1645,6 +1645,25 @@ int VerdictSource::dropRetired_(PartitionWriteState& state) {
     return static_cast<int>(before - members_.size());
 }
 
+int VerdictSource::releaseLeftMembersOnDemotion() noexcept {
+    if (members_.empty()) return 0;
+    const std::size_t before = members_.size();
+    std::array<int32_t, kMaxVerdictViewsPerSource> gone{};
+    std::size_t n = 0;
+    std::erase_if(members_, [&](const Member& m) {
+        if (!m.retiring && !m.leaving) return false;   // a live member (or a candidate) stays: it is not leaving
+        if (n < gone.size()) gone[n++] = m.inst->plan.viewTopicId;
+        return true;
+    });
+    if (members_.size() == before) return 0;
+    if (hooks_.retired != nullptr)
+        for (std::size_t i = 0; i < n; ++i) hooks_.retired(hooks_.ctx, gone[i], partition_);
+    reindex_();
+    recomputeCap_();
+    if (generation_ != kUnbound) needsActivation_ = true;   // a later leadership never judges with a stale active_
+    return static_cast<int>(before - members_.size());
+}
+
 int64_t VerdictSource::requestChange(const ConstraintSet& next, bool refresh) {
     if (state_ == nullptr || generation_ == kUnbound || needsActivation_) return kChangeDeferred;
     if (!refresh && next.sameMembers(state_->constraintSets.latest())) return kChangeUnchanged;

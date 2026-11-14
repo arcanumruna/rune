@@ -343,6 +343,10 @@ public:
         releaseTxnOverlays(txn);
         if (generation_ != kUnbound) needsActivation_ = true;
     }
+    /// #938: the worker stopped leading this partition.  A member that is leaving or retiring judges nothing on a
+    /// follower, so it is given back now (the owner erases what no judge holds); a later leadership that still has
+    /// records below the member's drop to judge gets the plan back from the log's own plan record.
+    int releaseLeftMembersOnDemotion() noexcept;
     [[nodiscard]] int32_t partition() const noexcept { return partition_; }
     [[nodiscard]] bool stalled() const noexcept { return stalled_; }
     /// #874: the judge stalled because its source log is damaged at a cursor it must read (a new leadership clears it).

@@ -377,6 +377,10 @@ public:
         return work + finishRetired_();
     }
 
+    /// Erases the retiring instances / templates no judge holds any more.  driveFolds does it for a leader pass; the worker calls
+    /// this once per view pass so a partition that only follows (or a worker with no leader partition) drains too (#938).
+    int drainRetired() { return finishRetired_(); }
+
     /// The judge of a verdict source (nullptr = none).  Created by the first drive that needs one.
     [[nodiscard]] VerdictSource* verdictSource(int32_t srcTopicId, int32_t partition) const noexcept {
         const auto it = verdictSources_.find(instKey(srcTopicId, partition));

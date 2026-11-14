@@ -8170,7 +8170,10 @@ private:
             }
             if (replica->role() != rune::replication::Role::Leader) {
                 if (PartitionWriteState* w = writeOf_(replica); w != nullptr) {
-                    if (w->verdicts != nullptr) w->verdicts->releaseDemoted(w->txn);   // T7 N3: a demoted judge is not driven
+                    if (w->verdicts != nullptr) {
+                        w->verdicts->releaseDemoted(w->txn);   // T7 N3: a demoted judge is not driven
+                        (void)w->verdicts->releaseLeftMembersOnDemotion();   // #938
+                    }
                     // A lease partition that stopped leading gives its event buffer back (re-reserved on the next leader pass).
                     if (w->leaseEvents.buf.capacity() != 0) [[unlikely]]
                         viewSet_->releaseLeaseEvents(topicId, static_cast<int32_t>(replica->partitionId()), *w);
@@ -8222,6 +8225,7 @@ private:
                                       replica->leadershipGeneration(), hwConfirmed, NsTag{mem->nsSlot(), mem->nsId()}, replica);
             }
         }
+        work += viewSet_->drainRetired();   // #938: a follower-only worker drains its retired members too
         return work;
     }
 

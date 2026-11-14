@@ -554,3 +554,70 @@ TEST(CheckedWritesConstraintChangeRegression, RestartWhileACandidateBuildsKeepsT
     ASSERT_TRUE(fifth);
     EXPECT_EQ(fifth->verdicts, (std::vector<std::tuple<uint16_t, uint16_t, uint32_t>>{{0, 55, static_cast<uint32_t>(kStatsObj << 16) | 1}})) << "the new plan judges after the restart";
 }
+
+// #938: a demoted judge gives its leaving / retiring members back: nothing drives it on a follower.
+TEST(CheckedWritesConstraintChangeRegression, ADemotedJudgeGivesItsRetiringMemberBackRegression) {
+    Cw c;
+    int32_t topic = 0;
+    dropInFlight(c, &topic);
+    ASSERT_EQ(c.r.vs->retiringVerdictTemplatesForTest(), 1u);
+    ASSERT_TRUE(c.judge()->hasView(topic));
+    c.r.demote();
+    c.r.passes(10);
+    EXPECT_EQ(c.r.vs->retiringVerdictTemplatesForTest(), 0u) << "the retiring template stayed on a follower";
+    EXPECT_FALSE(c.judge()->hasView(topic)) << "the judge still holds the member";
+    EXPECT_EQ(c.r.vs->instanceForTest(topic, c.r.partition()), nullptr) << "the instance stayed";
+}
+
+// The records below the drop that no marker covered yet get the same verdicts after a demotion and re-promotion, and
+// the retiring member goes again once W passes the drop.
+TEST(CheckedWritesConstraintChangeRegression, ARePromotedJudgeStillJudgesBelowTheDropRegression) {
+    std::vector<std::tuple<std::size_t, uint16_t, uint32_t>> expected;
+    {
+        Cw twin;
+        dropInFlight(twin);
+        twin.r.followerFetch();
+        ASSERT_TRUE(twin.r.driveUntilJudged(twin.r.dataEnd()));
+        expected = verdictsOf(twin.r);
+    }
+    ASSERT_FALSE(expected.empty());
+    Cw c;
+    dropInFlight(c);
+    c.r.demote();
+    c.r.passes(10);
+    c.r.promote();
+    c.r.followerFetch();
+    const int64_t end = c.r.dataEnd();
+    ASSERT_TRUE(c.r.driveUntilJudged(end)) << "the re-promoted judge never finished";
+    c.r.followerFetch();
+    c.r.passes(10);
+    EXPECT_EQ(verdictsOf(c.r), expected) << "the re-promoted judge judged differently from the one never demoted";
+    EXPECT_GT(c.committed(), c.dropOf(kNameObj));
+    EXPECT_EQ(c.r.vs->retiringVerdictTemplatesForTest(), 0u) << "released again once W passed the drop";
+}
+
+// A live member is not leaving: it survives a demotion and re-promotion with no rebuild.
+TEST(CheckedWritesConstraintChangeRegression, ADemotedJudgeKeepsItsLiveMembersRegression) {
+    Cw c;
+    c.create(CV::CharacterName);
+    const int32_t topic = c.r.constrained.at(CV::CharacterName).topicId;
+    c.append(kFirst);
+    ASSERT_TRUE(c.r.driveUntilJudged());
+    const ViewFoldCounters* fc = c.r.vs->foldCounters(topic, c.r.partition());
+    ASSERT_NE(fc, nullptr);
+    const uint64_t discards = fc->checkpointDiscards;
+    const std::size_t members = c.judge()->memberCountForTest();
+    c.r.demote();
+    c.r.passes(10);
+    EXPECT_EQ(c.judge()->memberCountForTest(), members) << "a live member was given back";
+    c.r.promote();
+    c.r.passes(20);
+    c.append(kSecond);
+    c.r.followerFetch();
+    ASSERT_TRUE(c.r.driveUntilJudged(c.r.dataEnd()));
+    EXPECT_EQ(c.judge()->memberCountForTest(), members);
+    EXPECT_NE(c.r.vs->instanceForTest(topic, c.r.partition()), nullptr);
+    ASSERT_NE(c.r.vs->foldCounters(topic, c.r.partition()), nullptr);
+    EXPECT_EQ(c.r.vs->foldCounters(topic, c.r.partition())->checkpointDiscards, discards) << "rebuilt";
+    EXPECT_FALSE(verdictsOf(c.r).empty()) << "the live member still judges";
+}
