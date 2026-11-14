@@ -19,6 +19,7 @@
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/testing/DamageSegmentForTest.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
 
@@ -1182,6 +1183,35 @@ TEST(PsmRebuildRegression, CorruptLengthAfterValidBatchesFailsTheProof) {
         ProducerStateManager m;
         EXPECT_FALSE(m.rebuildFromLog(0, log, log.logEndOffset(), 0))
             << "unreadable stored batches were skipped and the producer state reported PROVEN";
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// #879: a damaged sealed segment exposes only its valid prefix, so readView is empty at the damage.  That is unreadable bytes, never a
+// compaction gap: the rebuild must fail the proof, not skip to the next segment with the damaged range's producer state missing.
+TEST(PsmRebuildRegression, ProducerStateRebuildFailsAtADamagedSegmentRegression) {
+    const std::string dir = tmpPath("psm_damaged_seg");
+    std::filesystem::create_directories(dir);
+    {
+        rune::storage::Log log(dir, 400);
+        log.recover();
+        for (int i = 0; i < 40; ++i) {
+            rune::protocol::RecordBatchBuilder b(log.logEndOffset(), 1000);
+            b.setProducerId(911); b.setProducerEpoch(0); b.setBaseSequence(i);
+            b.append("k", "v", 1000);
+            ASSERT_GE(log.append(b.build(), log.logEndOffset()), 0);
+        }
+        ASSERT_GE(log.segmentBaseOffsets().size(), 4u);
+        {   // control: the undamaged log rebuilds
+            ProducerStateManager ok;
+            ASSERT_TRUE(ok.rebuildFromLog(0, log, log.logEndOffset(), 0));
+        }
+        ASSERT_GE(rune::storage::testing::damageSecondBatchOfSegment(dir, 1), 0);
+        ASSERT_TRUE(log.reloadSegments());
+        ASSERT_EQ(log.damagedSegmentCount(), 1u);
+        ProducerStateManager m;
+        EXPECT_FALSE(m.rebuildFromLog(0, log, log.logEndOffset(), 0))
+            << "the damaged range was skipped as a compaction gap: its producer state is silently missing";
     }
     std::filesystem::remove_all(dir);
 }

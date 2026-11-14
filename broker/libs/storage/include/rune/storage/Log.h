@@ -622,6 +622,8 @@ public:
         /// The segment's written bytes: data == nullptr with written > 0 is an
         /// UNREADABLE segment (its mapping failed) — never "walked" (D30 MAJOR-2).
         std::size_t    written = 0;
+        /// #839: the segment is flagged damaged: `size` ends at the damage, the bytes after it are unreadable, never a gap.
+        bool           damaged = false;
     };
     [[nodiscard]] SegmentBytes segmentBytesAt(int64_t segmentBase);
     int64_t totalBytes() const;

@@ -3,7 +3,9 @@
 // of the lowest-base segment is flipped, and it is started again: boot recovery keeps the bytes, flags the segment and
 // counts it (the gauge's value).  A subscription from 0 gets every record below the damage, then ends CorruptBatch
 // (StorageError on the wire, naming the subscription); a subscription from the next segment reads to the end; the log
-// still appends; and a second restart sees the same damage.  Every wait has a hard cap.
+// #879: an acked (idempotent) produce is NOT acked while the damage stands (the producer-state and read-committed builds
+// stall at the damage, fail closed), an un-acked (acks=None) produce still lands at the old log end; and a second restart
+// sees the same damage.  Every wait has a hard cap.
 #include "client/OneBroker.h"
 #include "MetricsTestReader.h"
 
@@ -131,7 +133,8 @@ std::unique_ptr<rc::Client> openClient(OneBroker& broker, const rc::TopicSpec& t
 }
 
 /// One record at a time (one batch each: segment 0 holds several batches); returns its base offset or -1.
-int64_t produceOne(rc::Client& client, rc::Producer& prod, rc::Completions& cq, const rc::TopicHandle& topic, int k) {
+int64_t produceOne(rc::Client& client, rc::Producer& prod, rc::Completions& cq, const rc::TopicHandle& topic, int k,
+                   int ackPolls = 20'000) {
     const std::string v = std::string(64, static_cast<char>('a' + k % 26));
     rc::SendResult r = rc::SendResult::BackPressured;
     for (int spin = 0; spin < 100'000 && r == rc::SendResult::BackPressured; ++spin) {
@@ -144,7 +147,7 @@ int64_t produceOne(rc::Client& client, rc::Producer& prod, rc::Completions& cq, 
     prod.flush();
     int64_t base = -1;
     bool got = false;
-    for (int i = 0; i < 20'000 && !got; ++i) {
+    for (int i = 0; i < ackPolls && !got; ++i) {
         (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) {
             if (d.token == static_cast<rc::Token>(k + 1)) { got = true; base = d.status == rc::OpStatus::Ok ? d.value : -1; }
         });
@@ -234,14 +237,43 @@ TEST(CorruptSegmentBrokerRegression, RealClientFailsCorruptBatchAndReadsPastTheD
         for (std::size_t i = 0; i < got.size(); ++i) EXPECT_EQ(got[i], dmg.nextBase + static_cast<int64_t>(i));
         EXPECT_FALSE(sub.finished());
     }
-    {   // the log still appends
+    {   // #879: an acked (idempotent) produce waits while the damage stands: the producer-state build fails closed at the damage
         rc::ProducerConfig pc;
         pc.acks     = rc::Acks::Leader;
         pc.lingerUs = 0;
         rc::Producer prod = reader->producer(pc);
         rc::Completions cq(*reader);
-        EXPECT_EQ(produceOne(*reader, prod, cq, reader->topic(spec.name), kRecords), kRecords)
-            << "the next record lands at the old log end";
+        EXPECT_EQ(produceOne(*reader, prod, cq, reader->topic(spec.name), kRecords, /*ackPolls=*/2000), -1)
+            << "an acked produce was acknowledged on a partition with a damaged segment";
+        prod.close();
+    }
+    {   // the log itself still appends: a non-idempotent acks=None produce lands at the old log end
+        rc::ProducerConfig pc;
+        pc.acks     = rc::Acks::None;
+        pc.lingerUs = 0;
+        rc::Producer prod = reader->producer(pc);
+        rc::Completions cq(*reader);
+        const std::string v(64, 'z');
+        rc::SendResult r = rc::SendResult::BackPressured;
+        for (int spin = 0; spin < 100'000 && r == rc::SendResult::BackPressured; ++spin) {
+            r = prod.trySend(reader->topic(spec.name), rc::Key(static_cast<uint64_t>(kRecords)),
+                             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()), cq,
+                             static_cast<rc::Token>(kRecords + 1));
+            if (r == rc::SendResult::BackPressured) std::this_thread::yield();
+        }
+        ASSERT_EQ(r, rc::SendResult::Ok);
+        prod.flush();
+        Collected tail;
+        rc::SubscribeOptions o;
+        o.from = rc::From::offset(kRecords);
+        rc::Subscription sub = reader->subscribe(reader->topic(spec.name), 0, o, [&tail](const rc::Record& rec) {
+            std::lock_guard<std::mutex> g(tail.mu);
+            tail.offsets.push_back(rec.offset);
+        });
+        for (int i = 0; i < 5000 && tail.snapshot().empty(); ++i) std::this_thread::sleep_for(1ms);
+        const auto got = tail.snapshot();
+        ASSERT_FALSE(got.empty()) << "the acks=None record never reached the log";
+        EXPECT_EQ(got.front(), kRecords) << "the record lands at the old log end";
         prod.close();
     }
     reader->close();

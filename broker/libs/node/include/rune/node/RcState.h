@@ -652,6 +652,8 @@ public:
     [[nodiscard]] const rune::transaction::AbortedTxnIndex& aborted() const noexcept { return aborted_; }
     [[nodiscard]] uint64_t    scanSteps() const noexcept { return scanSteps_; }
     [[nodiscard]] uint64_t    unreadableStalls() const noexcept { return unreadableStalls_; }
+    /// #879: passes stalled at the end of the valid prefix of a damaged segment.
+    [[nodiscard]] uint64_t    damagedStalls() const noexcept { return damagedStalls_; }
     [[nodiscard]] std::size_t maxStepBytes() const noexcept { return maxStepBytes_; }
     [[nodiscard]] uint64_t    tailGrowths() const noexcept { return tailGrowths_; }
     [[nodiscard]] uint64_t    scannedBytes() const noexcept { return scannedBytes_; }
@@ -770,6 +772,12 @@ private:
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
     }
+    // Fail closed: the build stays Scanning and retries on a doubling pass-count backoff (<= 1024 passes).
+    void stall_(Scanning& s) noexcept {
+        s.stalled   = true;
+        s.stallNext = scanSteps_ + s.stallGap;
+        s.stallGap  = std::min<uint64_t>(s.stallGap * 2, 1024);
+    }
     std::size_t step_(Scanning& s, rune::storage::Log& log, int32_t budget) {
         ++scanSteps_;
         // I-C: retention runs on this thread between passes and may delete the
@@ -791,13 +799,20 @@ private:
                 // is served past it) and retry next pass.
                 // Re-review M2: retried on a doubling pass-count backoff (<= 1024
                 // passes), never every pass (each retry is an mmap + allocations).
-                s.stalled   = true;
-                s.stallNext = scanSteps_ + s.stallGap;
-                s.stallGap  = std::min<uint64_t>(s.stallGap * 2, 1024);
+                stall_(s);
                 if (unreadableStalls_++ % 64 == 0)
                     spdlog::error("RcState: segment {} has {} B that cannot be mapped — read_committed build "
                                   "stalled (fail closed; retried with backoff, {} stall(s))",
                                   s.segBase, m.written, unreadableStalls_);
+            } else if (m.damaged && s.bytePos >= m.size) {
+                // #879: the end of a damaged segment's valid prefix (also its first batch: size 0).  What lies behind it
+                // (abort markers, open transactions, producer state) is unreadable, never a gap: never skipped.  Stall until
+                // a repair, a truncation below the damage or retention changes the segment (gen) or the log start.
+                stall_(s);
+                if (damagedStalls_++ % 64 == 0)
+                    spdlog::error("RcState: segment {} is damaged — read_committed build stalled (fail closed until the "
+                                  "segment is repaired, truncated or retained away; {} stall(s))",
+                                  s.segBase, damagedStalls_);
             } else if (m.data == nullptr || s.bytePos >= m.size) {
                 // This segment is walked (or gone / empty): the next one.
                 s.stalled = false;
@@ -1086,6 +1101,7 @@ private:
     uint64_t    readAheadSkippedByIssuer_ = 0;
     uint64_t    residencyGrowths_         = 0;
     uint64_t    scanSteps_        = 0;
+    uint64_t    damagedStalls_ = 0;      ///< #879: passes stalled at a damaged segment's valid prefix end
     uint64_t    unreadableStalls_ = 0;   ///< D30 MAJOR-2: passes stalled on an unmappable segment
     std::size_t maxStepBytes_     = 0;
     uint64_t    tailGrowths_      = 0;

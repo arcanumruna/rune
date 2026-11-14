@@ -508,6 +508,11 @@ public:
         const RcState* rc = rcFor_(topicId, partition);
         return rc ? rc->statusCode() : kRcNone;
     }
+    /// #879: passes the build stalled at a damaged segment's valid prefix end.
+    [[nodiscard]] uint64_t rcDamagedStallsForTest(int32_t topicId, int32_t partition) const {
+        const RcState* rc = rcFor_(topicId, partition);
+        return rc ? rc->damagedStalls() : 0;
+    }
     [[nodiscard]] const void* rcVerdictHooksCtxForTest(int32_t topicId, int32_t partition) const {
         const RcState* rc = rcFor_(topicId, partition);
         return rc ? rc->verdictHooksCtxForTest() : nullptr;

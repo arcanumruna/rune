@@ -16,6 +16,7 @@
 #include <rune/transaction/ControlMarker.h>
 
 #include <rune/storage/Log.h>
+#include <spdlog/spdlog.h>
 #include <rune/storage/LogReadView.h>
 // rune-protocol RecordBatch: little-endian field accessors (unified).
 #include <rune/protocol/BatchRebuild.h>
@@ -371,6 +372,13 @@ void ReadCommittedView::rebuild(rune::storage::Log* log, int64_t hw)
     while (cursor < end) {
         const rune::storage::LogReadView v = log->readView(cursor, kChunkBytes);
         if (v.empty()) {
+            // #879: a damaged segment's tail (its markers are unknowable) is no gap: stop the scan here, never skip to the next
+            // segment.  This no-worker-pool path returns void; the worker-owned RcState build is the production path and stalls
+            // (fails closed) at the damage.
+            if (log->damageAt(cursor)) {
+                spdlog::error("ReadCommittedView: rebuild stopped at the damaged log range at offset {}", cursor);
+                break;
+            }
             // A gap (e.g. compaction emptied a segment): resume at the next
             // segment base above the cursor.  Cold (rebuild is not a hot path).
             int64_t next = -1;

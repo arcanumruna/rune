@@ -33,6 +33,7 @@
 #include <arpa/inet.h>
 #include <aeronmd/aeronmd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -1379,4 +1380,174 @@ TEST(RecordsPushRegression, CorruptBatchCauseEncodesStorageErrorRegression) {
         ASSERT_TRUE(other.has_value());
         EXPECT_EQ(other->code, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
     }
+}
+
+// ===========================================================================
+// #879 — the read_committed build never walks past a damaged segment: the bytes behind the end of its valid prefix (abort markers,
+// open transactions, producer state) are unreadable, not a gap.  The build stalls (fail closed) until the damage is gone.
+// ===========================================================================
+namespace {
+constexpr int64_t kRcDmgSeg = 2048;
+enum class RcKind { Filler, Txn, Commit, Abort };
+void rcPut(rune::storage::Log& log, int64_t& next, RcKind k, int64_t pid = 0) {
+    std::vector<uint8_t> bytes;
+    if (k == RcKind::Commit || k == RcKind::Abort) {
+        bytes = rune::transaction::ControlMarker::build(
+            pid, 0, k == RcKind::Commit ? rune::transaction::ControlType::Commit : rune::transaction::ControlType::Abort, 0);
+        for (int i = 0; i < 8; ++i) bytes[static_cast<std::size_t>(i)] = static_cast<uint8_t>(static_cast<uint64_t>(next) >> (8 * i));
+    } else {
+        rune::protocol::RecordBatchBuilder b(next, 1000 + next);
+        if (k == RcKind::Txn) { b.setTransactional(true); b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(0); }
+        b.append("k", "v" + std::to_string(next), 1000 + next);
+        bytes = b.build();
+    }
+    ASSERT_GE(log.append(bytes, next), 0);
+    ++next;
+}
+void rcFillToSegments(rune::storage::Log& log, int64_t& next, std::size_t segs) {
+    for (int i = 0; i < 4000 && log.segmentBaseOffsets().size() < segs; ++i) rcPut(log, next, RcKind::Filler);
+}
+std::string rcSegmentFile(const std::filesystem::path& dir, std::size_t idx) {
+    std::vector<std::string> files;
+    for (const auto& e : std::filesystem::directory_iterator(dir))
+        if (e.path().extension() == ".log") files.push_back(e.path().string());
+    std::sort(files.begin(), files.end());
+    return idx < files.size() ? files[idx] : std::string{};
+}
+// Flip a record byte of the `batchIdx`-th batch of segment file `segIdx`; returns that batch's first offset.
+int64_t rcDamageBatch(const std::filesystem::path& dir, std::size_t segIdx, std::size_t batchIdx) {
+    const std::string f = rcSegmentFile(dir, segIdx);
+    const auto starts = corruptutil::batchStarts(f);
+    if (f.empty() || batchIdx >= starts.size()) return -1;
+    const int64_t base = corruptutil::batchBaseAt(f, starts[batchIdx]);
+    corruptutil::xorByteAt(f, starts[batchIdx] + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead));
+    return base;
+}
+// txn 7 (data + ABORT marker) lies in the damaged tail of segment 0 behind one valid filler batch; later segments exist.
+// Returns the damage offset.
+int64_t rcDamagedTxnLog(rune::storage::Log& log, const std::filesystem::path& dir) {
+    log.recover();
+    log.setDeferSealSync(false);
+    int64_t next = 0;
+    rcPut(log, next, RcKind::Filler);
+    rcPut(log, next, RcKind::Txn, 7);
+    rcPut(log, next, RcKind::Abort, 7);
+    rcFillToSegments(log, next, 3);
+    log.sync();
+    const int64_t d = rcDamageBatch(dir, 0, 1);
+    if (d < 0 || !log.reloadSegments() || log.damagedSegmentCount() != 1u) return -1;
+    return d;
+}
+struct RcDriver {
+    rune::node::RcState rc;
+    rune::node::RcFacts facts{.leader = true, .logGeneration = 1, .leadershipGeneration = 1, .epoch = 1};
+    RcDriver() { rc.reserve(8); }
+    // At most `cap` passes; true when the build is Ready.
+    bool run(rune::storage::Log& log, int cap) {
+        for (int i = 0; i < cap && !rc.ready(); ++i) (void)rc.advance(facts, &log, 1 << 20);
+        return rc.ready();
+    }
+};
+}  // namespace
+
+TEST_F(TxnRcRegression, ReadCommittedBuildStallsAtADamagedSegmentRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), kRcDmgSeg);
+    const int64_t D = rcDamagedTxnLog(log, dir);
+    ASSERT_EQ(D, 1);
+    NullTransportRc t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &log, &t);
+    rep.onLeaderLogAppended();
+    ASSERT_GT(rep.highWatermark(), 3);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3012);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3012);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(rcSubscribeOp(1, &rep, /*read_committed*/1)));
+    Collector c;
+    for (int i = 0; i < 400; ++i) { w.doWork(1); sub->poll(c.fa.handler(), 64); }
+    EXPECT_NE(w.rcStatusForTest(10, 0), Worker::kRcReady) << "the build walked past the damaged tail and went Ready";
+    EXPECT_GT(w.rcDamagedStallsForTest(10, 0), 0u);
+    EXPECT_TRUE(c.baseOffsets.empty()) << "read_committed delivered " << c.baseOffsets.size() << " batch(es) from a build that must not be Ready";
+    std::filesystem::remove_all(dir);
+}
+
+TEST(RcDamagedSegmentRegression, ReadCommittedBuildStallsWhenTheDamageIsAtTheFirstBatchOfASegmentRegression) {
+    const auto dir = std::filesystem::temp_directory_path() / ("rune_rcdmg_first_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    {
+        rune::storage::Log log(dir.string(), kRcDmgSeg);
+        log.recover();
+        log.setDeferSealSync(false);
+        int64_t next = 0;
+        rcPut(log, next, RcKind::Txn, 7);
+        rcFillToSegments(log, next, 2);
+        rcPut(log, next, RcKind::Abort, 7);
+        rcFillToSegments(log, next, 3);
+        log.sync();
+        ASSERT_GE(rcDamageBatch(dir, 1, 0), 0);   // byte 0 of the sealed segment 1
+        ASSERT_TRUE(log.reloadSegments());
+        ASSERT_EQ(log.damagedSegmentCount(), 1u);
+        RcDriver d;
+        EXPECT_FALSE(d.run(log, 300)) << "the build walked past a segment damaged at its first batch";
+        EXPECT_GT(d.rc.damagedStalls(), 0u);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(RcDamagedSegmentRegression, ReadCommittedBuildScansTheValidPrefixOfADamagedSegmentRegression) {
+    const auto dir = std::filesystem::temp_directory_path() / ("rune_rcdmg_prefix_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    {
+        rune::storage::Log log(dir.string(), kRcDmgSeg);
+        log.recover();
+        log.setDeferSealSync(false);
+        int64_t next = 0;
+        rcPut(log, next, RcKind::Txn, 5);        // @0
+        rcPut(log, next, RcKind::Abort, 5);      // @1 : txn 5 wholly inside the valid prefix
+        rcPut(log, next, RcKind::Txn, 6);        // @2 : open at the end of the prefix
+        rcPut(log, next, RcKind::Filler);        // @3 : damaged
+        rcPut(log, next, RcKind::Commit, 6);     // @4 : unreadable
+        rcFillToSegments(log, next, 3);
+        log.sync();
+        ASSERT_EQ(rcDamageBatch(dir, 0, 3), 3);
+        ASSERT_TRUE(log.reloadSegments());
+        ASSERT_EQ(log.damagedSegmentCount(), 1u);
+        RcDriver d;
+        EXPECT_FALSE(d.run(log, 300));
+        EXPECT_GT(d.rc.damagedStalls(), 0u);
+        EXPECT_EQ(d.rc.aborted().ranges().size(), 1u) << "the abort inside the valid prefix is in the state";
+        EXPECT_TRUE(d.rc.isAborted(5, 0));
+        EXPECT_EQ(d.rc.tracker().openCount(), 1u) << "txn 6 (open at the end of the prefix) is tracked";
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(RcDamagedSegmentRegression, ReadCommittedBuildResumesWhenTheDamageIsGoneRegression) {
+    const auto dir = std::filesystem::temp_directory_path() / ("rune_rcdmg_resume_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    {
+        rune::storage::Log log(dir.string(), kRcDmgSeg);
+        const int64_t D = rcDamagedTxnLog(log, dir);   // unit level: truncating below the damage is the cheapest way to remove it
+        ASSERT_EQ(D, 1);
+        RcDriver d;
+        ASSERT_FALSE(d.run(log, 300));
+        ASSERT_GT(d.rc.damagedStalls(), 0u);
+        ASSERT_TRUE(log.truncateTo(D));
+        ASSERT_EQ(log.damagedSegmentCount(), 0u);
+        EXPECT_TRUE(d.run(log, 5000)) << "the build did not resume after the damage was truncated away";
+        EXPECT_EQ(d.rc.tracker().openCount(), 0u);
+        EXPECT_EQ(d.rc.lso(log.logEndOffset()), log.logEndOffset());
+    }
+    std::filesystem::remove_all(dir);
 }

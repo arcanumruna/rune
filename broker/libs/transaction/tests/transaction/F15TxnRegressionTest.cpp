@@ -16,6 +16,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/testing/DamageSegmentForTest.h>
 
 #include <gtest/gtest.h>
 
@@ -350,6 +351,46 @@ TEST(ControlBatchRegression, RebuildSpansEverySegment) {
     EXPECT_EQ(tracker.openCount(), 0u) << "the ABORT marker at " << markerOff << " (a later segment) was never scanned";
     ASSERT_EQ(aborted.size(), 1u);
     EXPECT_TRUE(aborted.isAborted(7, 0));
+}
+
+// ===========================================================================
+// #879 — a damaged sealed segment exposes only its valid prefix; the tail (here: transaction T's ABORT marker) is unreadable bytes,
+// never a compaction gap.  The rig-only rebuild stops at the damage; it must not skip to the next segment, whose state would then be
+// applied on top of a hole.
+// ===========================================================================
+
+TEST(ControlBatchRegression, ReadCommittedViewRebuildStopsAtADamagedSegmentRegression) {
+    TmpDir d;
+    rune::storage::Log log(d.path.string(), /*segmentBytes=*/1024);
+    log.recover();
+    appendRaw(log, dataBatch(0, /*pid=*/7, /*transactional=*/true));
+    while (log.segmentBaseOffsets().size() < 2) appendRaw(log, dataBatch(0, -1, false));
+    for (int i = 0; i < 2; ++i) appendRaw(log, dataBatch(0, -1, false));
+    const int64_t markerOff = appendRaw(log, ControlMarker::build(7, 0, ControlType::Abort, 0));   // in segment 1's tail
+    for (int i = 0; i < 2; ++i) appendRaw(log, dataBatch(0, -1, false));
+    while (log.segmentBaseOffsets().size() < 3) appendRaw(log, dataBatch(0, -1, false));
+    appendRaw(log, dataBatch(0, /*pid=*/9, /*transactional=*/true));   // a transaction that exists only in segment 2
+    ASSERT_GE(log.segmentBaseOffsets().size(), 3u);
+    const int64_t end = log.logEndOffset();
+    {   // control: the undamaged log decides T (aborted) and leaves pid 9 open
+        LsoTracker tracker;
+        AbortedTxnIndex aborted;
+        ReadCommittedView view(&tracker, &aborted);
+        view.rebuild(&log, end);
+        ASSERT_EQ(tracker.openCount(), 1u);
+        ASSERT_EQ(aborted.size(), 1u);
+    }
+    const int64_t damageAt = rune::storage::testing::damageSecondBatchOfSegment(d.path.string(), 1);
+    ASSERT_GE(damageAt, 0);
+    ASSERT_LE(damageAt, markerOff) << "precondition: the marker lies in the damaged tail";
+    ASSERT_TRUE(log.reloadSegments());
+    ASSERT_EQ(log.damagedSegmentCount(), 1u);
+    LsoTracker tracker;
+    AbortedTxnIndex aborted;
+    ReadCommittedView view(&tracker, &aborted);
+    view.rebuild(&log, end);
+    EXPECT_EQ(tracker.openCount(), 1u) << "only T (undecided: its marker is unreadable); pid 9 lies behind the damage and must not be fed";
+    EXPECT_EQ(aborted.size(), 0u);
 }
 
 // ===========================================================================

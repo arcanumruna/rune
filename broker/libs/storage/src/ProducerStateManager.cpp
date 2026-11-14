@@ -544,6 +544,9 @@ int64_t nextBaseAfter(InMemoryLog&, int64_t) noexcept { return -1; }
 // One past the last written offset of the segment holding `offset` (-1 = unknown / no segment).
 int64_t segmentEndAt(Log& log, int64_t offset) noexcept { return log.segmentNextOffsetAt(offset); }
 int64_t segmentEndAt(InMemoryLog&, int64_t) noexcept { return -1; }
+// #879: `offset` lies at or past the damage of a damaged sealed segment: the bytes there are unreadable, never a gap.
+bool damagedAt(Log& log, int64_t offset) noexcept { return log.damageAt(offset).has_value(); }
+bool damagedAt(InMemoryLog&, int64_t) noexcept { return false; }
 // Per-step budget of the synchronous rebuildFromLog loop.
 constexpr std::size_t kSyncStepBytes = 4u * 1024u * 1024u;
 } // namespace
@@ -593,6 +596,9 @@ ProducerStateManager::rebuildStep(Rebuild& r, LogT& log, std::size_t budgetBytes
             // Re-review C1: an empty view BELOW the segment's written end means bytes exist that
             // cannot be read (corrupt length, failed mapping) — never a gap: fail the proof.
             if (const int64_t segEnd = segmentEndAt(log, r.next); segEnd > r.next) return S::Failed;
+            // #879: at a damaged segment's damage segmentEndAt IS the damage offset, so the check above passes: the unreadable
+            // tail is no compaction gap (its producer state is unknowable) - fail the proof instead of skipping it.
+            if (damagedAt(log, r.next)) return S::Failed;
             // CP-4: a compaction gap (a sealed segment's superseded tail) — or
             // the end of the data.  Skip to the next segment base.
             const int64_t nb = nextBaseAfter(log, r.next);

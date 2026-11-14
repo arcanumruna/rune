@@ -1981,6 +1981,7 @@ Log::SegmentBytes Log::segmentBytesAt(int64_t segmentBase) {
     SegmentBytes b;
     b.gen = it->second->installGen();
     b.fd  = it->second->logFd();
+    b.damaged = it->second->damaged();
     // Review Md5: the RC scan needs the WHOLE segment (a partial view would read
     // as "walked") — it may map on the owner (cold: RC builds; counted remaps).
     it->second->setOwnerRemap(true);
