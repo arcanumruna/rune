@@ -11,6 +11,7 @@
 #include <rune/view/ViewRow.h>
 
 #include <algorithm>
+#include <cctype>
 #include <initializer_list>
 #include <map>
 #include <set>
@@ -1163,6 +1164,15 @@ public:
     using CV = ConstrainedView;
     explicit ConstraintCellRun(const Cell& c) : c_(c), sc_(scenario09(c.op, c.entity)), r_(/*follower=*/true, /*rollBytes=*/1) {}
 
+    /// Racing: the two producers send different names, so the unique rule never separates them.
+    void racingWithDifferentNames() { differentNames_ = true; }
+    /// The verdict trailer of each of the op's own batches, in the order they were sent (after run()).
+    [[nodiscard]] std::vector<AckTrailer> opVerdicts() const {
+        std::vector<AckTrailer> out;
+        for (const std::size_t k : opSent_) out.push_back(acks_.at(sent_[k].corr).verdicts);
+        return out;
+    }
+
     void run() {
         const Expected ex = expect(c_);
         r_.worker->setVerdictIntervalNs(1'000'000);
@@ -1191,6 +1201,7 @@ public:
         const auto log = r_.readLog();
         CheckedWritesModel model = modelOf_(log);
         collectAcks_();
+        if (c_.timing == Timing::ReplaceDuringWrites) checkReplaceBeforeOp_(log);
 
         checkIndex(r_, model);                                              // (a)
         checkMarkers(model, log, target_);                                  // (b)
@@ -1245,9 +1256,20 @@ private:
         }
         if (c_.op == Op::CDeleteThenReuse) out = {{sc_.op[0]}, {sc_.op[1]}};
         else out = {sc_.op};
-        if (c_.timing == Timing::SelfCollidingBatch)
-            for (auto& b : out) { const std::vector<Char09> again = b; b.insert(b.end(), again.begin(), again.end()); }
+        if (c_.timing == Timing::SelfCollidingBatch)   // the repeat differs in case only: the unique rule lowers names
+            for (auto& b : out) {
+                std::vector<Char09> again = b;
+                for (Char09& x : again) x.name = swapCase_(x.name);
+                b.insert(b.end(), again.begin(), again.end());
+            }
         return out;
+    }
+    static std::string swapCase_(std::string name) {
+        for (char& ch : name) {
+            const auto u = static_cast<unsigned char>(ch);
+            ch = static_cast<char>(std::isupper(u) ? std::tolower(u) : std::toupper(u));
+        }
+        return name;
     }
     void sendOp_(int64_t pid = kOpPid) {
         for (const auto& b : opBatches_()) {
@@ -1334,6 +1356,9 @@ private:
         switch (c_.timing) {
         case Timing::Racing:
             sendOp_(kOpPid);
+            if (differentNames_)   // another name: only the count of U's characters can decide
+                for (Char09& x : sc_.op)
+                    if (!x.del) x.name = "Ynew";
             sendOp_(kOtherPid);
             return;
         case Timing::RetryBeforeJudge: case Timing::RetryAfterJudge: case Timing::RetryAfterWindow: {
@@ -1352,7 +1377,12 @@ private:
             backgroundWrites_();
             r_.replaceConstrainedView(CV::AccountStats, 13);
             fingerprint13_ = r_.fingerprintOf(CV::AccountStats, false);
-            r_.passes(5);
+            // the op follows the swap
+            for (int i = 0; i < VerdictRig::kMaxPass && replaceSwapIn_(r_.readLog()) == nullptr; ++i) {
+                if (i % 8 == 0) r_.followerFetch();
+                r_.pass();
+            }
+            ASSERT_NE(replaceSwapIn_(r_.readLog()), nullptr) << "the replacement plan was never named by a change";
             sendOp_();
             return;
         case Timing::DropDuringWrites:
@@ -1360,11 +1390,14 @@ private:
             r_.passes(5);
             sendOp_();
             return;
-        case Timing::FailoverAppendHw:
+        case Timing::FailoverAppendHw: {
             sendOp_();
             r_.passes(5);
-            lostAndResend_([&] { r_.demote(); }, [&] { r_.failover(); });
+            // a demoted replica reports HW 0: the cut is where the leader's HW stood
+            const int64_t hw = r_.replica->highWatermark();
+            lostAndResend_([&] { r_.demote(); }, [&] { r_.restart(/*reinstall=*/true, hw); });
             return;
+        }
         case Timing::TruncateTail:
             sendOp_();
             r_.passes(5);
@@ -1451,6 +1484,34 @@ private:
         if (c_.entity == Entity::DupExtra && opLeaves) EXPECT_EQ(model.uniqueExtras(), 0u) << "the extra left the name";
     }
 
+    // The change naming the new plan sits below the op's first record: the op meets the new plan.
+    const VerdictRig::RigChange* replaceSwapIn_(const VerdictRig::RigLog& log) const {
+        const uint64_t stats = VerdictRig::objectIdOf(CV::AccountStats);
+        const auto swap = std::find_if(log.changes.begin(), log.changes.end(), [&](const VerdictRig::RigChange& ch) {
+            return std::any_of(ch.members.begin(), ch.members.end(),
+                               [&](const cr::ChangeMember& m) {
+                                   return m.viewObjectId == stats && m.planFingerprint == fingerprint13_;
+                               });
+        });
+        return swap == log.changes.end() ? nullptr : &*swap;
+    }
+    void checkReplaceBeforeOp_(const VerdictRig::RigLog& log) {
+        const uint64_t stats = VerdictRig::objectIdOf(CV::AccountStats);
+        const VerdictRig::RigChange* swap = replaceSwapIn_(log);
+        ASSERT_NE(swap, nullptr) << "the change naming the replacement plan was never logged";
+        EXPECT_TRUE(std::none_of(swap->members.begin(), swap->members.end(),
+                                 [&](const cr::ChangeMember& m) {
+                                     return m.viewObjectId == stats && m.planFingerprint == fingerprint12_;
+                                 }))
+            << "the swap drops the replaced plan";
+        std::size_t opRecords = 0;
+        for (const std::size_t k : opSent_) opRecords += sent_[k].recs.size();
+        ASSERT_GE(log.data.size(), opRecords);
+        // the op is the last thing the cell writes
+        const int64_t opOffset = log.data[log.data.size() - opRecords].offset;
+        EXPECT_LT(swap->offset, opOffset) << "the replace swap landed after the op it is meant to precede";
+    }
+
     // (c) a raw subscription from 0 receives exactly the accepted records, with their intents
     void checkDelivered_(const CheckedWritesModel& model) {
         for (int i = 0; i < VerdictRig::kMaxPass && r_.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady; ++i) r_.pass();
@@ -1520,6 +1581,7 @@ private:
     VerdictRig r_;
     uint32_t members_ = 3;
     int64_t target_ = 0;
+    bool differentNames_ = false;
     uint64_t fingerprint12_ = 0, fingerprint13_ = 0;
     std::vector<Sent> sent_;
     std::vector<std::size_t> opSent_;   ///< indexes into sent_ of the op's own batches
@@ -2298,6 +2360,32 @@ INSTANTIATE_TEST_SUITE_P(Cell11, CheckedWritesMatrix, ::testing::ValuesIn(cellsF
     [](const ::testing::TestParamInfo<Cell>& i) {
         return std::string(nameOf(i.param.op)) + "_" + nameOf(i.param.entity) + "_" + nameOf(i.param.timing);
     });
+
+// Two producers race for the last free slot of U's count with different names: one wins, and the loser is refused by
+// the count rule (account_stats, ordinal 1), not by the unique rule.
+TEST(CheckedWritesMatrixRegression, RacingCreatesWithDifferentNamesDecideByTheCountRuleRegression) {
+    ConstraintCellRun run(Cell{Op::CCreate, Entity::G11Free, Timing::Racing});
+    run.racingWithDifferentNames();
+    run.run();
+    if (::testing::Test::HasFatalFailure()) return;
+    const std::vector<AckTrailer> v = run.opVerdicts();
+    ASSERT_EQ(v.size(), 2u);
+    const auto winners = std::count_if(v.begin(), v.end(), [](const AckTrailer& t) { return t.empty(); });
+    EXPECT_EQ(winners, 1) << "exactly one producer takes the free slot";
+    const AckTrailer count{{0, 55, kStatsCid09}};
+    EXPECT_EQ(std::count(v.begin(), v.end(), count), 1) << "the loser is refused by the count rule (account_stats #1)";
+}
+
+// One batch repeats a create with the name in another case: the unique rule lowers names and refuses the second record.
+TEST(CheckedWritesMatrixRegression, SelfCollidingBatchWithMixedCaseIsRefusedByTheLoweredNameRegression) {
+    ConstraintCellRun run(Cell{Op::CCreate, Entity::G11Free, Timing::SelfCollidingBatch});
+    run.run();
+    if (::testing::Test::HasFatalFailure()) return;
+    const std::vector<AckTrailer> v = run.opVerdicts();
+    ASSERT_EQ(v.size(), 1u);
+    const AckTrailer want{{1, 55, kNameCid09}};
+    EXPECT_EQ(v[0], want) << "\"Xnew\" then \"xNEW\": only the second is refused, by character_name";
+}
 
 // ---- Part 07: keyed views.  Every cell drives the real worker over a source of the shape's schema, folds a keyed view of it and compares the
 // view table, the owner map, point reads and prefix scans with CheckedWritesModel::refoldKeyedView (a group-by view: refoldKeyedAggregate). ----
